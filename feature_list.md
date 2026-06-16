@@ -976,3 +976,31 @@ gaps in the lease protocol's correctness story.
 - **验收:** split-inflight guard 单测(同 part 并发 split 被拒);manager 163 / ps 166 / stream 86
   lib 全绿;split 集成测试绿;coco deep 0 issue。
 - **passes:** completed (2026-06-15) — 级联(真 bug)已修;静默丢写复现不出来 → re-probe deferred。
+
+### MERGE-EC-REPLAY · merge survivor 重启永久 WAL-FAILSTOP(EC log extent committed_end 透传 bug,2026-06-16)
+- **现象:** `autumn-op merge <survivor> <victim>` 后,survivor 分区重启**永久打不开**,无限重试,每次同一处
+  `WAL-FAILSTOP: 1183349 leftover byte(s) at the committed end of log_stream extent 40`(40 = victim 的 3GB EC(3+1)
+  log extent,被 splice 进 survivor)。下游症状:gallery / autumn-op 路由到该分区 NotFound。
+- **根因(实锤,debug 埋点定位):** `StreamClient::read_committed_bytes_from_extent` 正确算出 `committed_end =
+  sealed_length`(3GB),但末尾 `Ok(r) => return Ok(r)` **把 `read_with_layout` 的返回元组整个透传**,而 EC 路径
+  `ec_subrange_read` 的第二元素是 **shard 相对长度(≈ sealed_length/K ≈ 1GB)**。于是 PS WAL replay(用该值作停止
+  边界)只读了 1 个 shard,跨 shard 边界的记录被截断 → WAL-FAILSTOP。merge 的作用只是**把 survivor 的 VP-head replay
+  窗口移到了这个 EC log extent**(victim 自己 VP head 在更后的 extent,从不 replay 它),从而触发这条早已存在的透传 bug。
+  **数据完好(4 shard 都在),纯恢复读长度错误。**
+- **修复:** `read_committed_bytes_from_extent` 的成功分支返回 `(bytes, committed_end)` —— 用本函数算出的权威
+  `committed_end`,而非 `read_with_layout` 的 shard 相对 end。`want` 已 clamp 到 `committed_end - offset`,字节本就正确,
+  错的只是上报的 end。
+- **验收:** stream lib 86 全绿(无回归);**端到端实证**:对真实 wedged 的 part 25 重启,extent 40 replay 读满 3GB
+  成功打开、绑定 listener(9302)、`autumn-op info` 4 分区无 warning、`autumn-client ls` 对 part 25 范围
+  (`.thumb/320/C*`/`F*`)正常返回(数据零丢失)。
+- **passes:** completed (2026-06-16) — 真因(return 值透传)已修 + 端到端救活 part 25。
+- **登记 follow-up(deferred,reproduce-first):**
+  1. **回归测试:** StreamClient 对一个 EC-converted sealed extent 调 `read_committed_bytes_from_extent`,断言返回的
+     `committed_end == sealed_length`(非 shard 长)。当前 stream 集成测试都用裸 `TestConn` 打单 EN、不起 StreamClient+
+     manager,需新建 EC+恢复 infra → 待补。
+  2. **merge eversion desync(本次发现但非本 bug 病因,已 revert 不修):** `compute_merge_streams` /
+     `splice_streams_without_new_tail` 对每个 victim extent 无条件 `ex.eversion += 1`,只改 manager 不下推 EN
+     (实测 extent 40 manager=4 / EN=3)。本次确认它**不导致** WAL-FAILSTOP(读路径 `req.eversion(4) > local(3)` 不触发
+     mismatch),危害未证,merge 区 revert-prone → 按 reproduce-first deferred。修法:已 sealed 的 CoW victim extent 只
+     refs++、不 bump eversion。
+  3. **EC extent manager `sealed` bool:** 本次确认 extent 40 manager 侧 `sealed=true`(我一度误判为 false),不变量正常。

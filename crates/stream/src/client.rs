@@ -2829,7 +2829,20 @@ impl StreamClient {
                 return Ok((Vec::new(), committed_end));
             }
             match self.read_with_layout(extent_id, offset, want, &ex).await {
-                Ok(r) => return Ok(r),
+                // MERGE-EC-REPLAY: return OUR authoritative `committed_end`
+                // (the extent's sealed_length for a sealed extent), NOT
+                // read_with_layout's second element. For an EC-converted extent
+                // `ec_subrange_read` returns a SHARD-relative end
+                // (≈ sealed_length / K); propagating it as the extent's
+                // committed_end made the PS WAL replay — which uses this value
+                // as its stop bound — read only ONE shard's worth of bytes and
+                // trip WAL-FAILSTOP at the shard boundary, permanently wedging
+                // any partition whose VP-head replay window reaches an EC log
+                // extent (e.g. a merge survivor replaying the victim's spliced
+                // extents, which the victim itself never replayed). The read
+                // already clamped `want` to `committed_end - offset`, so the
+                // returned bytes are correct; only the reported end was wrong.
+                Ok((bytes, _read_end)) => return Ok((bytes, committed_end)),
                 Err(e) if attempt == 0 && is_eversion_stale(&e) => {
                     self.invalidate_extent_cache(extent_id);
                     continue;

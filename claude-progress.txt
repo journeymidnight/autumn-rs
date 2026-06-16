@@ -1,102 +1,23 @@
-Date: 2026-06-15
+Date: 2026-06-16
 TaskStatus: completed
-Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5+#3+#6 已完成**:
-  EC-COMMIT-ATOMIC —— commit_shard_local 的 rename(.ec.dat→.dat)↔save_meta
-  崩溃窗,intent marker(rename 前 durable 写,load_extents 三态重放,corrupt-meta
-  绝不 replay,marker 为权威)。reproduce-first(单 EN 集成测试)+ coco 4 轮。
-  #6 后续:split 级联(reproduce-first 抓到)已修 manager 侧 inflight guard。原 #3(EC abandon fence-handover 空操作)、#6(split FREEZE_TTL)。
-  #6 /loop 定论(2026-06-15,证伪):stale-seal 静默丢写 = 结构性不可达(非"未复现"):
-  handle_multi_modify_split 在 Phase-1↔etcd-commit 之间只有 bounded await(pull_vp_refs
-  PS-RPC 10s + 内层 sync etcd 10s + 主 put_msgs_txn F228 10s),每个 kill-timeout 把"慢"
-  转成"失败(Err→不提交→不封)"而非"迟到成功";中间 Phase-1 全同步、无 sleep 代码路径。
-  唯一能让成功 commit 落在 PS 解冻(>=20s split_deadline)之后的是注入 sleep(已删,无代码
-  对应)。残留尾(已登记不修):三个 bounded await 各 ~9s 且都成功 → commit ~27s>20s,三连
-  near-timeout-but-healthy,自然不可复现;真正堵口(manager commit 前 re-validate 冻结)在
-  revert-prone 热 split 区,reproduce-first 下 deferred。PS 端 freeze-held re-check 作 belt-
-  and-braces。无代码改动,仅强化 rpc_handlers.rs 注释判词。
-  之前会话:WAL 自愈环增量 A 全完成 + selfheal_chaos.sh e2e(抓到读路径隔离漏洞)。
-  升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
-
-=== TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
-
-  Already implemented (this session):
-    - SELFHEAL-A3 (recover_partition): 每 chunk 用 committed_end 算 expected,
-      corrupt 信号 = 短读(serving 截断) ‖ decode Err ‖ committed-end 残留。
-      命中 → self_heal_replay_chunk(只 sealed replicated;跳 avali=0 已隔离
-      slot,I2;逐 eligible 副本重读 committed 窗口 decode-check;选第一个干净
-      继续;坏 node 累积;读错误不记坏 I7;全坏/open/EC → fail loud)。纯选择
-      核 select_clean_replica_chunk 单测。修复后 cursor 按 want_full 前进。
-    - SELFHEAL-A5 (manager MSG_REPORT_CORRUPT_REPLICA=0x4C, wire v2): fencing
-      = owner_epoch CAS + eversion CAS + partition→log_stream→extent 归属链;
-      etcd-first + verify-at-apply(F146);拒 open(A4 待做)/EC/最后副本/全
-      非副本(stale layout);清 avali + bump eversion;slot<32 守卫。PS 上报后
-      invalidate_extent_cache。
-    - wire v2: WIRE_VERSION_MIN=MAX=2 + 注册指纹(pre-R3 全停全启规则)。
-    - coco deep 两轮:R1 8 条(P1x4/P2x3/P3),R2 5 条(P0/P1x2/P2x2)全处置:
-      修了 verify-at-apply / 短读检测 / 归属链 / avali 过滤 clean-source /
-      EC 拒 / slot 守卫 / stale-layout 拒 / 日志计数;拒 #7(MIN=MAX 故意)、
-      #1-R2 etcd-CAS(note 33 deferred)、#4-R2 cluster_version 门控(全停全启)。
-    - SELFHEAL-A4 (本会话补): open-tail 内容损坏 → seal_and_roll_tail(复用 F227
-      probe seal-over-reachable,不改 seal 协议)→ 同 pass 重取 sealed + cross-read
-      隔离。!truncated 才封(截断 open tail 仍 fail loud,避免封到 acked 下,coco
-      R1 P0);一 pass 同步隔离不依赖重开(coco R1 P1)。
-  Not implemented (用户确认不需要 / 登记):
-    - SELFHEAL-A6 / 增量 B: 用户 2026-06-14 确认 A4 之后不需要。
-    - 残留:初始 serving read 无 node_id 归因(超时不可归因=I7);A5 etcd blind-put
-      非 CAS(note 33,reproduce-first 再上);open-tail 截断(非内容损坏)仍 fail loud
-      (seal-over-HEALTHY 排除机制动 F227,deferred 到真复现)。
-    - 生产就绪审计剩余(见 project_production_readiness_audit):鉴权/TLS、备份/DR、
-      EC/split 崩溃窗。
-
+Task scope: MERGE-EC-REPLAY —— merge survivor 重启永久 WAL-FAILSTOP 根因定位 + 修复 + 端到端救活。
 Current summary:
-  自愈环增量 A 全闭环(含 A4 open-tail):replay 坏/截断副本自动 failover + 隔离,
-  open-tail 内容损坏 seal-and-roll 后同 pass 隔离,zero 静默丢数据。432 lib 单测绿,
-  workspace build 绿,coco deep 多轮 P0/P1 全处置。A6/增量 B 用户确认不做。
-  SELFHEAL-E2E-CERT(2026-06-15,用户 /loop 选项):自愈环增量 A 端到端 reproduce-first
-  认证完成。无代码改动,纯跑 scripts/selfheal_chaos.sh:3/3 连跑确定性 PASS(S1 翻 slot[0]
-  一字节 → A4 seal-and-roll + A3 跨读 + A5 隔离,12/12 键 byte-exact 零丢失、extent 封、
-  仅坏 slot avali=0;S2 三副本全坏 → open fail-loud 分区不可用)。/data05 TCP 3-EN。
-  F-ioring-lease-4 收尾(2026-06-15,用户 /loop 选项):inode-lease Phase 1 最后一步。
-  现状=代码早已实现(OpenedExtents.lease_epoch 打标 + InvalidationMap + Read 臂
-  cache_is_stale→reload_extents),且 byte-level full-cluster e2e
-  (f_ioring_lease_phase1_e2e.rs::phase1_close_to_open_coherence_e2e:manager+2EN+1PS,
-  seed v1 → writer 覆盖 v2+release → reader poll→reload→读到 v2 + 跨 extent 校验)
-  之前 #[ignore] 从未确认。收尾=运行认证:--ignored 下 3/3 确定性 GREEN。无新代码,
-  仅清理过时判词(test header + feature_list -2/-3 的 "still pending")。Phase 1 全闭环。
-  Phase 2 (单列,未做):F-fuse-lease-*(autumn-fuse 接入 lease)、F-lease-preempt(force-revoke)。
-  Phase 2/3 lease(2026-06-15,用户选项):核对发现已全部实现+提交(F-fuse-lease-1/2
-    commits 1bbd990/770765e、F-lease-preempt 72de2b8、BUG-LEASE-3/4/5 后续)。收尾=
-    跑测试认证:inode_lease 35、ioring-lease 3/4/3/3、fuse 44、bug_lease_3/4 1+2、
-    f_lease_preempt 4、f_fuse_lease_1 6/6(--ignored)、f_fuse_lease_2 2/2(--ignored)全绿。
-    #[ignore] 卫生干净。无代码改动。
-  kvcache get 摸底(2026-06-15):重建 pyo3 autumn 模块(May-21 .so 是 pre-WIRE-v2 指纹→
-    握手挂;maturin develop --release)后跑 bench_zc.py(8 worker,3-EN TCP loopback)。
-    读 ~1.5-1.9 GB/s(64K 1902 / 256K 1937 / 8M 1570),是旧 "246 MB/s wall" 的 ~8×——
-    多-worker BatchClient + ZC-default + fan_out 把单线程 decode 墙拆了。get 健康,不是瓶颈。
-    写是弱侧(~300-490 MB/s = 3 副本持久 put 路径,RTT/pipeline-bound 非带宽)。
-    memory project_kvcache_first_bench 已加 2026-06-15 update。
-  write 路径分析(2026-06-15,用户选项):结论=写弱侧不是 bug,是单机 3 EN 挤一块 NVMe 的
-    3× 写放大(disk-bound)。证据:写不随 client worker 上升反降(8w495→16w361→32w352)=
-    非 pipeline-bound;native perf-check 256KB:1part-1disk 427 → 8part-1disk 834(8× 分区只
-    2× = 分区层下有共享瓶颈)→ 8part--3disk 1851 MB/s(铺到 /data03+05+08,2.2×);834×3≈
-    2.5GB/s ≈ 单块 Intel SSDPF2KX038T1 持续写顶。Python adapter 零开销(495≥native 427)。
-    读不受铺盘影响(读单副本不放大)。生产形态(3disk,8part)loopback = 写 1851 / 读 6969 MB/s。
-    写路径(group-commit + F178 coalescer + F227 all-replica-ACK)正确,无需改。memory 已记。
-  跨主机 perf 矩阵(2026-06-15,用户 provision ::15,用 remote-autumn skill ssh -p2222):
-    cluster 在 ::14(绑 [::14])--3disk 8part,client 在 ::15。两端都要 --features ucx
-    重建(旧二进制无 ucx feature)+ memlock root 可 raise unlimited + UCX_NET_DEVICES=mlx5_1:1
-    + UCX_TLS=rc_mlx5,ud_mlx5,tcp,self。结果(current HEAD 0439733,无回归):
-      4K: TCP w22.7K/r914K  UCX w16K/r849K   (4K 上 TCP 现在略胜 UCX,UCX per-op EP 开销)
-      8M: TCP w277/r5791 MB/s  UCX w1199/r9699 MB/s  (UCX 8M write 4.3× / read 1.7× = 大块真 win)
-    关键变化:跨主机 TCP 已恢复健康(8M read 5791 vs 2026-05-21 记的 601 collapse,~10×;
-    4K read 914K vs doc 15K)——"UCX 55× 碾 TCP"不再成立。原因未定(fabric PFC 调优 vs 本
-    session fan_out 改了 TCP flow 模式),已 flag 不过度归因。docs/perf_tcp_vs_ucx_xhost.md
-    + memory project_ucx_crosshost_wins 已记。
+  真因(debug 埋点实锤,非前两次假设):StreamClient::read_committed_bytes_from_extent 算对了
+  committed_end=sealed_length(3GB),却用 `Ok(r) => return Ok(r)` 把 read_with_layout 的元组整个透传,
+  EC 路径 ec_subrange_read 第二元素是 shard 相对长度(~1GB)→ PS WAL replay 拿它当停止边界,只读 1 个
+  shard,跨 shard 边界记录截断 → WAL-FAILSTOP。merge 只是把 survivor VP-head replay 窗口移到这个 EC log
+  extent(victim 自己从不 replay 它),触发早已存在的透传 bug。数据零丢失。
+  修复:成功分支返回 (bytes, committed_end) 用本函数权威 committed_end。crates/stream/src/client.rs 一处。
+  端到端验证:part 25 重启读满 3GB 打开、绑 9302、autumn-op info 4 分区无 warning、ls 对其范围正常返回。
+  stream lib 86 全绿。
+  走过的弯路(已 revert,登记在 feature_list):
+   - 误判 committed_end 被 clobber 成 1 shard(其实 read_committed 算的是 3GB,被透传丢了)。
+   - 误判 manager `sealed` bool=false(其实 true)。
+   - merge eversion desync(manager=4/EN=3,真实存在但非本 bug 病因,不导致 WAL-FAILSTOP)→ deferred。
+Main gaps:
+  - 回归测试待补(需 StreamClient+manager+EC infra,现有 stream 集成测试用裸 TestConn)。
+  - merge eversion desync 修复 deferred(reproduce-first,危害未证 + merge 区 revert-prone)。
 Next steps:
-  - 用户定调:鉴权/TLS + 备份/DR 均延后,主回性能/功能线。
-  - F260 chained-append 跨主机验收 = 待做。需跨主机 EN 拓扑(PS@::14 + 3 EN@::15,让 PS→EN
-    复制跨 NIC,F260 才能把 writer egress 3×→1×)。当前 all-on-::14 集群 PS→EN 是 loopback,
-    测不出 F260 win。要 split-host 部署:::15 建 autumn-extent-node(--features ucx)+ 手搭
-    跨主机集群 + EN 注册到 ::14 manager(RoCE 地址)。set_append_chain_min_bytes 开关在
-    autumn-ps --append-chain-min-bytes(默认 0=off)。
-  - 性能线现状:read/write 健康,无回归;UCX 大块跨主机 win 已证(8M write 4.3×)。
+  - commit crates/stream/src/client.rs 修复。
+  - (可选)补 EC committed_end 回归测试;评估 merge eversion desync 是否值得修。
+  - 用户需重启 gallery 进程(本任务多次 restart-ps 期间 gallery 掉了)。
