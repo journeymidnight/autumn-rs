@@ -995,9 +995,11 @@ gaps in the lease protocol's correctness story.
   (`.thumb/320/C*`/`F*`)正常返回(数据零丢失)。
 - **passes:** completed (2026-06-16) — 真因(return 值透传)已修 + 端到端救活 part 25。
 - **登记 follow-up(deferred,reproduce-first):**
-  1. **回归测试:** StreamClient 对一个 EC-converted sealed extent 调 `read_committed_bytes_from_extent`,断言返回的
-     `committed_end == sealed_length`(非 shard 长)。当前 stream 集成测试都用裸 `TestConn` 打单 EN、不起 StreamClient+
-     manager,需新建 EC+恢复 infra → 待补。
+  1. **回归测试:** ✅ **DONE (2026-06-16)** — `client::merge_ec_replay_tests::ec_committed_end_is_sealed_length_not_shard_length`
+     (`crates/stream/src/client.rs`)。无需起 manager:`StreamClient::construct`(跳过 acquire_owner_lock)+ 预填
+     `nodes_cache`/`extent_info_cache`,起 4 个进程内 EN 持 RS shard(K=3,M=1),走真实 `read_committed_bytes_from_extent`
+     全量读,断言 `committed_end == sealed_length`(6144,非 shard 长 ~2050)且 bytes 解码回原 payload。已验证:revert 修复
+     (`Ok(r) => return Ok(r)`)后该测试红(committed_end=2050),修复后绿;stream lib 87 全绿。
   2. **merge eversion desync(本次发现但非本 bug 病因,已 revert 不修):** `compute_merge_streams` /
      `splice_streams_without_new_tail` 对每个 victim extent 无条件 `ex.eversion += 1`,只改 manager 不下推 EN
      (实测 extent 40 manager=4 / EN=3)。本次确认它**不导致** WAL-FAILSTOP(读路径 `req.eversion(4) > local(3)` 不触发

@@ -4588,3 +4588,182 @@ fn flatten_hedge(
         Err(_) => Err(anyhow!("hedged read task canceled before completion")),
     }
 }
+
+/// MERGE-EC-REPLAY regression (commit c56a20c, 2026-06-16).
+///
+/// `read_committed_bytes_from_extent` must report the extent's OWN
+/// authoritative `committed_end` (`sealed_length` for a sealed extent),
+/// NOT the second element of `read_with_layout`'s return tuple. For an
+/// EC-converted extent `ec_subrange_read` surfaces a SHARD-relative end
+/// (≈ `sealed_length / K`); the pre-fix `Ok(r) => return Ok(r)` propagated
+/// it verbatim, so the PS WAL replay — which uses this value as its stop
+/// bound — read only ONE shard's worth of bytes and tripped WAL-FAILSTOP
+/// at the shard boundary, permanently wedging recovery of any partition
+/// whose VP-head replay window reached an EC log extent.
+///
+/// This exercises the real read path end-to-end against in-process extent
+/// nodes holding RS shards: it asserts the reported end equals the logical
+/// `sealed_length` (not the per-shard length) AND that the bytes decode to
+/// the original payload (the bug was the END only — bytes were already
+/// clamped correctly).
+#[cfg(test)]
+mod merge_ec_replay_tests {
+    use super::*;
+    use crate::extent_rpc::{
+        rkyv_decode, AllocExtentReq, AllocExtentResp, CommitEcShardReq, CommitEcShardResp,
+        WriteShardReq, WriteShardResp, MSG_ALLOC_EXTENT, MSG_COMMIT_EC_SHARD, MSG_WRITE_SHARD,
+    };
+
+    fn pick_addr() -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let a = l.local_addr().expect("local_addr");
+        drop(l);
+        a
+    }
+
+    async fn start_node(dir: &std::path::Path, addr: std::net::SocketAddr) {
+        let config = crate::ExtentNodeConfig::new(dir.to_path_buf(), 1);
+        let node = crate::ExtentNode::new(config)
+            .await
+            .expect("create ExtentNode");
+        compio::runtime::spawn(async move {
+            let _ = node.serve(addr).await;
+        })
+        .detach();
+        compio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    #[compio::test]
+    async fn ec_committed_end_is_sealed_length_not_shard_length() {
+        const K: usize = 3; // data shards
+        const M: usize = 1; // parity shards
+        const N: usize = K + M;
+        // Logical payload length. `shard_size` ≈ L/K plus a small length-
+        // trailer pad, so each shard is strictly smaller than the logical
+        // length — that gap is exactly what the bug confused for the end.
+        const L: usize = 6144;
+        const EVERSION: u64 = 5; // post-EC target eversion
+        let extent_id: u64 = 70_001;
+        let node_ids: [u64; N] = [1, 2, 3, 4];
+
+        // Bring up N in-process extent nodes.
+        let dirs: Vec<_> = (0..N)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let addrs: Vec<std::net::SocketAddr> = (0..N).map(|_| pick_addr()).collect();
+        for i in 0..N {
+            start_node(dirs[i].path(), addrs[i]).await;
+        }
+
+        // RS-encode a deterministic payload into K data + M parity shards.
+        let payload: Vec<u8> = (0..L).map(|i| (i % 251) as u8).collect();
+        let shards = crate::erasure::ec_encode(&payload, K, M).expect("ec_encode");
+        assert_eq!(shards.len(), N);
+        let shard_size = crate::erasure::shard_size(L, K);
+        assert!(
+            shard_size < L,
+            "shard ({shard_size}) must be strictly smaller than logical ({L})"
+        );
+
+        // Distribute one EC shard per node: alloc → write_shard (prepare) →
+        // commit_ec_shard (commit). Mirrors the manager's EC-convert 2PC.
+        let pool = Rc::new(ConnPool::new());
+        for i in 0..N {
+            let addr = addrs[i].to_string();
+
+            let alloc = pool
+                .call(
+                    &addr,
+                    MSG_ALLOC_EXTENT,
+                    crate::extent_rpc::rkyv_encode(&AllocExtentReq { extent_id }),
+                )
+                .await
+                .expect("alloc_extent RPC");
+            assert_eq!(
+                rkyv_decode::<AllocExtentResp>(&alloc).expect("decode").code,
+                CODE_OK
+            );
+
+            let ws = WriteShardReq {
+                extent_id,
+                shard_index: i as u32,
+                sealed_length: L as u64,
+                eversion: EVERSION,
+                owner_epoch: 0,
+                payload: Bytes::from(shards[i].clone()),
+            };
+            let ws_resp = pool
+                .call(&addr, MSG_WRITE_SHARD, ws.encode())
+                .await
+                .expect("write_shard RPC");
+            assert_eq!(WriteShardResp::decode(ws_resp).expect("decode").code, CODE_OK);
+
+            let cs = CommitEcShardReq {
+                extent_id,
+                sealed_length: L as u64,
+                eversion: EVERSION,
+                owner_epoch: 0,
+            };
+            let cs_resp = pool
+                .call(&addr, MSG_COMMIT_EC_SHARD, cs.encode())
+                .await
+                .expect("commit_ec_shard RPC");
+            assert_eq!(
+                CommitEcShardResp::decode(cs_resp).expect("decode").code,
+                CODE_OK
+            );
+        }
+
+        // Build a StreamClient WITHOUT touching a manager: `construct` skips
+        // `acquire_owner_lock`, and we pre-seed both caches so the read path
+        // never issues a manager RPC.
+        let sc = StreamClient::construct(
+            vec!["127.0.0.1:1".to_string()], // never contacted
+            0,
+            "merge-ec-replay-test".to_string(),
+            0,
+            1 << 30,
+            pool.clone(),
+            StreamClientConfig::default(),
+        );
+        for i in 0..N {
+            sc.nodes_cache
+                .insert(node_ids[i], (addrs[i].to_string(), Vec::<u16>::new()));
+        }
+        sc.extent_info_cache.insert(
+            extent_id,
+            ExtentInfo {
+                extent_id,
+                replicates: node_ids[..K].to_vec(),
+                parity: node_ids[K..].to_vec(),
+                eversion: EVERSION,
+                refs: 1,
+                sealed_length: L as u64,
+                sealed: true,
+                avali: (1u32 << N) - 1, // all slots available
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: true,
+            },
+        );
+
+        // The function under test: a full-extent committed read.
+        let (bytes, committed_end) = sc
+            .read_committed_bytes_from_extent(extent_id, 0, L as u32)
+            .await
+            .expect("read_committed_bytes_from_extent");
+
+        // THE REGRESSION GUARD: the reported committed end must be the
+        // LOGICAL sealed_length, not a shard-relative end. Pre-fix this was
+        // `last_end` from `ec_subrange_read` (≈ shard_size = L/K = 2048).
+        assert_eq!(
+            committed_end, L as u32,
+            "committed_end must equal sealed_length ({L}), not the shard-relative end (~{shard_size}); \
+             a shard-relative end here is the MERGE-EC-REPLAY WAL-FAILSTOP bug"
+        );
+        // And the bytes themselves decode to the original payload — the bug
+        // was the reported END only; `want` was already clamped correctly.
+        assert_eq!(bytes.len(), L, "full logical payload must be returned");
+        assert_eq!(bytes, payload, "decoded EC bytes must match original");
+    }
+}

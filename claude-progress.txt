@@ -15,9 +15,13 @@ Current summary:
    - 误判 manager `sealed` bool=false(其实 true)。
    - merge eversion desync(manager=4/EN=3,真实存在但非本 bug 病因,不导致 WAL-FAILSTOP)→ deferred。
 Main gaps:
-  - 回归测试待补(需 StreamClient+manager+EC infra,现有 stream 集成测试用裸 TestConn)。
+  - 回归测试已补(2026-06-16):client::merge_ec_replay_tests::ec_committed_end_is_sealed_length_not_shard_length。
+    不起 manager —— StreamClient::construct 跳过 acquire_owner_lock + 预填 nodes_cache/extent_info_cache,
+    起 4 个进程内 EN 持 RS shard(3+1),走真实 read_committed_bytes_from_extent 全量读,断言
+    committed_end==sealed_length(6144,非 shard 长 ~2050)且 bytes 解码回原 payload。验证 revert 修复后红、
+    修复后绿;stream lib 87 全绿(原 86 + 本测试)。
   - merge eversion desync 修复 deferred(reproduce-first,危害未证 + merge 区 revert-prone)。
 Next steps:
-  - commit crates/stream/src/client.rs 修复。
-  - (可选)补 EC committed_end 回归测试;评估 merge eversion desync 是否值得修。
+  - commit 回归测试 + ledger。
+  - 评估 merge eversion desync 是否值得修(仍 deferred)。
   - 用户需重启 gallery 进程(本任务多次 restart-ps 期间 gallery 掉了)。
