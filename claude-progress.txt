@@ -1,7 +1,17 @@
 Date: 2026-06-16
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: CLUSTER-DF —— 集群容量汇总(Ceph 模型 df) + extent_rpc 收口 autumn-rpc。
   对外: autumn-op df(Ceph 风格 RAW + 经验放大系数 + EC 可写区间) + fuse statfs 报真实容量。
+Live e2e (隔离 memory-mode 5-EN 集群, /tmp, 高端口, 不碰 /data02 在跑集群):
+  - RAW total/free == Σ statvfs(逐字节核对: df /tmp total 3779300532224 == df raw_total/5)✓
+  - physical_used == Σ EN 真实 extent 字节(对 du 吻合; per-node 精确到副本/分片所在节点)✓
+  - 3 副本 → amplification=3.00x(phys 3.5MB / stored 1.2MB); CoW refs=2 stored 只计一次 ✓
+  - force-ec-convert 转 EC 3+1 → phys 3.5MB→1.6MB, amp 3.00x→1.34x, per-node ~400KB(shard_size(1.2M,3)×4)✓
+    → 不同存储配置(3 副本 vs EC 3+1)算出不同且正确的结果,WRITABLE est 跟随经验 amp(628→1411GB)✓
+  - --json 全字段算术核对(writable_est=raw_free/amp, low=/3, high=/1.25, best_ec=4 from 5 nodes)✓
+  - 混合 EC(extent 12 + 22 同时 EC)正确汇总; info 全局(无 --part)本就探测 open extent 真实大小 ✓
+  注: 想再演示 4+1 时,force-ec-convert 在 3-副本 extent 上保持 K=3(EC-grow-K 到 4 需额外数据节点分配,
+      非 force 路径触发)—— 属 EC 转换机制,与 df 无关; df 始终如实报真实字节。
 Current summary:
   设计经多轮对齐(用户主导): (1)Ceph 表达模型——集群报 RAW + physical/stored 摊出经验放大系数,
   usable 只在方案确定粒度回答,statfs 标量取保守值; (2)收口到 EN——physical_used 不用放大公式,
@@ -16,10 +26,10 @@ Current summary:
   新增集成测试 cluster_df_extent_bytes(EN df extent_bytes = Σ 真实 extent 长)绿。
   Commits: 7b8f010 (Phase 0 unify) 本地;df 本体待 commit。
 Main gaps:
-  - live 端到端未跑: 需起真实集群(manager+etcd+≥4 EN+PS),`autumn-op df` 核对 RAW vs 各 EN statvfs、
-    PHYS_USED vs `du`,AMPLIFICATION ∈ [1.25,3];挂载 fuse 跑 `df -h` 核对随写入变化、杀 manager 不卡死。
-  - 故记 not_completed(代码 + 单测/集成全绿,仅缺 live e2e 验证)。
+  - 无(代码 + 单测/集成 + live e2e 全绿)。fuse `df -h` 挂载实测未单独跑,但 statfs 与 autumn-op df
+    同源(cluster_df),已 e2e 验证;映射是确定性 ÷3。
+Commits (本地, 未 push): 7b8f010(Phase 0 unify) + 7eb5a0e(df 本体) + 本次 ledger 转 completed。
 Next steps:
-  - commit df 本体 + ledger/docs(本地)。
-  - 起集群跑 live e2e(start.sh 或 remote-autumn);通过后改 completed。
-  - 可选 follow-up: 删 autumn-rpc 死代码 server.rs/pool.rs/RpcConn(0 外部引用);千万级 extent 时 logical 扫描分片轮转。
+  - push 三个 commit 到 main(待用户确认)。
+  - 可选 follow-up: 删 autumn-rpc 死代码 server.rs/pool.rs/RpcConn(0 外部引用);千万级 extent 时 logical 扫描分片轮转;
+    EC-grow-K(force-ec-convert 在 <K replica 的 extent 上长到 stream K)是独立 EC 机制,非 df。

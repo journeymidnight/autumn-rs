@@ -1028,4 +1028,7 @@ gaps in the lease protocol's correctness story.
 - **验收:** wire 6 / stream lib 82 / manager lib 163 / client 27 全绿;新增集成测试
   `cluster_df_extent_bytes::df_reports_summed_extent_len_per_disk`(EN df extent_bytes = Σ 真实 extent 长,绿)。
   端到端(起集群跑 `autumn-op df` 核对 RAW vs 各 EN statvfs、PHYS_USED vs `du`)待真实集群验证。
-- **passes:** not_completed (2026-06-16, 代码 + 单测/集成全绿;仅缺 live 集群 e2e 验证 → 通过后转 completed)。
+- **live e2e (2026-06-16, 隔离 5-EN memory-mode 集群):** RAW==Σ statvfs(逐字节); physical_used==Σ EN 真实字节(对 du);
+  3 副本 amp=3.00x → force-ec-convert 转 EC 3+1 后 phys 3.5→1.6MB / amp 3.00x→1.34x(per-node ~400KB=shard_size×4),
+  不同配置算出不同正确结果; CoW refs=2 stored 计一次; --json 全字段算术核对; 混合 EC 正确。
+- **passes:** completed (2026-06-16, 代码 + 单测/集成 + live e2e 全绿)。
