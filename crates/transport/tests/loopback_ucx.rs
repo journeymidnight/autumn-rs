@@ -15,8 +15,8 @@
 //! UCX's close synchronously cancels in-flight ops on the peer's side
 //! of the EP, which races with the peer's pending recv (TCP buffers
 //! bytes in the kernel; UCX RC does not). For path 1/2 in autumn-rs
-//! this is fine: connection pools (autumn-rpc::pool, autumn-stream
-//! conn_pool) reuse one EP per peer address for the life of the
+//! this is fine: connection pools (autumn-stream conn_pool, the
+//! manager's RpcConn map) reuse one EP per peer address for the life of the
 //! process. The full close path (with `ucp_worker_flush` + await) is
 //! tracked in spec §10 as a P3+ follow-up.
 

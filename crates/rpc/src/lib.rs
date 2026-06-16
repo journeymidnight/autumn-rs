@@ -14,7 +14,6 @@ pub mod extent_rpc;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
-pub mod pool;
 
 /// Re-exported so consumers of `RpcClient::call_into_dest(reg: Option<&RegisteredMem>)`
 /// don't need a direct autumn-transport dependency. (Uninhabited stub on

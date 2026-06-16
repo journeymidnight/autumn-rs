@@ -44,8 +44,8 @@
 //! Skipping the close call means each EP stays allocated in its UCX
 //! worker context until the worker is destroyed (`ucp_worker_destroy`,
 //! invoked when the OS thread exits or the process exits). For our
-//! deployment this is fine: connection pools (autumn-rpc::pool,
-//! autumn-stream::conn_pool) reuse one EP per (peer-address, thread)
+//! deployment this is fine: connection pools (autumn-stream::conn_pool,
+//! the manager's RpcConn map) reuse one EP per (peer-address, thread)
 //! pair for the life of the process, so EPs do not accumulate. Long-
 //! running servers reclaim them on normal shutdown via worker destroy.
 

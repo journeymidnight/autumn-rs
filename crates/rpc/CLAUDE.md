@@ -161,56 +161,48 @@ cluster-df. `MSG_CLUSTER_DF = 0x4D` + `ClusterDfReq/Resp/NodeCapWire` live in
     framing only; READ zero-copy needs `call_into_dest` because the value must
     land in a specific caller dest.
 
-### `server.rs`
-- `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`
-- `serve(addr)`: accept loop on dedicated OS thread → dispatch to compio worker threads via `Dispatcher`
-- Each connection: read frames → spawn handler per request → write response
-- Thread-per-core: `std::net::TcpStream` (Send) accepted on accept thread, dispatched to worker, converted to `compio::net::TcpStream` (!Send) on worker
-
-### `pool.rs`
-- `ConnPool`: per-address `Arc<RpcClient>` pool with heartbeat
-  - `connect(addr)`: get or create client (no heartbeat)
-  - `connect_with_heartbeat(addr)`: get or create + start ping loop
-  - `is_healthy(addr)`: check last pong within 8s window
-- Heartbeat: periodic `MSG_TYPE_PING` (0xFF) calls every 2s
+### (removed: `server.rs` / `pool.rs`)
+The generic `RpcServer` (`server.rs`) and `ConnPool` (`pool.rs`) were dead
+code — every component hand-rolls its OWN `serve` + `handle_connection` on
+`autumn_transport::Conn` (EN `extent_node.rs`, manager `rpc_handlers.rs`, PS
+`lib.rs`), and each has its own connection pool (`autumn_stream::ConnPool` in
+`conn_pool.rs`, the manager's `RpcConn` map in `lib.rs`). The audit found 0
+external references to `autumn_rpc::RpcServer` / `autumn_rpc::ConnPool`; both
+were deleted (2026-06-16). autumn-rpc's living surface is the **client + wire**
+half: `RpcClient` (57 refs), `manager_rpc`/`partition_rpc`/`extent_rpc` wire
+schemas (the most-referenced things in the crate), `Frame`/`FrameDecoder`,
+`StatusCode`. `MSG_TYPE_PING` (0xFF) is still reserved; heartbeat lives in the
+per-component pools.
 
 ## Architecture
 
 ```
-Server side:
-  OS thread (accept) → channel → compio Dispatcher → worker threads
-  Each worker: compio Runtime → handle_connection → spawn per-request handlers
+Server side (per-component, NOT in autumn-rpc):
+  each daemon hand-rolls serve(addr) + handle_connection on
+  autumn_transport::Conn — EN true-SQ/CQ loop, manager dispatch,
+  PS partition routing. autumn-rpc provides Frame/FrameDecoder + StatusCode.
 
-Client side:
-  RpcClient = writer Mutex + background reader task
-  Multiplexing: DashMap<req_id, oneshot::Sender>
-  ConnPool = DashMap<SocketAddr, Arc<RpcClient>>
+Client side (autumn-rpc):
+  RpcClient = single writer_task (SQ) + background read_loop (CQ)
+  Multiplexing: RefCell<HashMap<req_id, Pending>>
 ```
 
 ## Usage Pattern
 
 ```rust
-// Server
-let server = RpcServer::new(|msg_type, payload| async move {
-    match msg_type {
-        1 => Ok(handle_append(payload)),
-        _ => Err((StatusCode::InvalidArgument, "unknown".into())),
-    }
-});
-server.serve(addr).await?;
-
-// Client
+// Client (autumn-rpc)
 let client = RpcClient::connect(addr).await?;
 let resp = client.call(1, payload).await?;
+// Servers are hand-rolled per component on autumn_transport::Conn —
+// see crates/stream/src/extent_node.rs / manager/src/rpc_handlers.rs.
 ```
 
 ## Key Design Decisions
 
 1. **10-byte header vs gRPC**: Eliminates HTTP/2 frame (9B) + gRPC envelope (5B) + HEADERS frame (~50B+). ~58B total overhead vs ~200B+ for gRPC.
-2. **std::net accept + compio dispatch**: compio's TcpStream is !Send (Rc<Inner>). Accept with std (Send), dispatch raw fd to worker, convert to compio on worker thread.
-3. **tokio::sync for locking**: tokio::sync::Mutex/mpsc/oneshot are runtime-agnostic futures. Work correctly on compio without needing tokio Runtime.
-4. **req_id=0 for fire-and-forget**: No response routing, handler runs but response is not written.
-5. **MSG_TYPE_PING=0xFF reserved**: Health check protocol built into the framework.
+2. **tokio::sync for locking**: tokio::sync::Mutex/mpsc/oneshot are runtime-agnostic futures. Work correctly on compio without needing tokio Runtime.
+3. **req_id=0 for fire-and-forget**: No response routing, handler runs but response is not written.
+4. **MSG_TYPE_PING=0xFF reserved**: Health-check msg_type; the per-component pools (autumn-stream ConnPool, manager RpcConn map) implement the heartbeat.
 
 ## WIRE-1 — wire-schema fingerprint (2026-06-12)
 
