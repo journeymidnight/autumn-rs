@@ -765,19 +765,19 @@ pub struct ExtDfReq {
     pub disk_ids: Vec<u64>,
 }
 
-/// Disk status from extent node.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtDiskStatus {
-    pub total: u64,
-    pub free: u64,
-    pub online: bool,
-}
-
 /// Df response (extent node → manager).
+///
+/// F-unify: `disk_status` now nests the canonical `extent_rpc::DiskStatus`
+/// (the pure-wire `ExtDiskStatus` mirror was deleted — it had no manager
+/// domain equivalent, so it was pure duplication with twin-drift risk).
+/// `done_tasks` keeps the manager DOMAIN type `MgrRecoveryTaskDone`
+/// (persisted in etcd `recoveryTasks/`, woven into the F207 inflight
+/// ledger) — that is a legitimate domain/wire separation, NOT a mirror,
+/// so it is intentionally preserved. rkyv layout is unchanged either way.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtDfResp {
     pub done_tasks: Vec<MgrRecoveryTaskDone>,
-    pub disk_status: Vec<(u64, ExtDiskStatus)>,
+    pub disk_status: Vec<(u64, crate::extent_rpc::DiskStatus)>,
 }
 
 // --- UpdateStreamEc (FOPS-03) ---

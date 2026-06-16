@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod error;
+pub mod extent_rpc;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
@@ -54,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 2;
-pub const WIRE_VERSION_MAX: u32 = 2;
+pub const WIRE_VERSION_MIN: u32 = 3;
+pub const WIRE_VERSION_MAX: u32 = 3;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -71,6 +72,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // extent_id, eversion, corrupt_node_ids}/Resp. Pre-R3: MIN=MAX=2
     // (same-commit deploy; rkyv has no cross-version decode).
     (2, "5d94c026c08e69ca"),
+    // v3: F-unify — extent_rpc relocated from autumn-stream into autumn-rpc
+    // (single wire-schema home alongside manager_rpc/partition_rpc); the
+    // pure-wire `ExtDiskStatus` mirror deleted, `ExtDfResp.disk_status` now
+    // nests canonical `extent_rpc::DiskStatus`. rkyv layout unchanged, but
+    // the hashed schema file set changed → new fingerprint. Pre-R3: MIN=MAX=3.
+    (3, "f2a5079b44de98d1"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

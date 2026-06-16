@@ -5,7 +5,7 @@
 //! Large-payload RPCs (CopyExtent, WriteShard) use fixed binary headers +
 //! raw payload to avoid serialization copies.
 
-use autumn_rpc::StatusCode;
+use crate::StatusCode;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rkyv::{Archive, Deserialize, Serialize};
 

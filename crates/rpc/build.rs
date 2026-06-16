@@ -14,13 +14,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 fn main() {
-    // extent_rpc lives in the sibling stream crate — workspace-internal
-    // relative read (this repo never publishes crates individually).
+    // All three wire schemas now live in this crate (extent_rpc relocated
+    // from autumn-stream in the F-unify change).
     let files = [
         "src/manager_rpc.rs",
         "src/partition_rpc.rs",
         "src/frame.rs",
-        "../stream/src/extent_rpc.rs",
+        "src/extent_rpc.rs",
     ];
     let mut h = DefaultHasher::new();
     for f in &files {
