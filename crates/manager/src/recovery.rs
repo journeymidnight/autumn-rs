@@ -710,6 +710,20 @@ impl crate::AutumnManager {
     /// full `recovery_done`, and every completion is applied right here,
     /// so nothing is ever stranded in the EN buffer.
     pub(crate) async fn node_health_loop(self) {
+        // cluster-df logical-scan rotation state (persists across ticks). The
+        // logical_stored scan (Σ distinct sealed_length) is O(extents); at
+        // 10M+ extents a single-tick full scan would hold the store borrow for
+        // ~100s of ms, stalling the single-threaded manager loop. Instead we
+        // snapshot the id list once per cycle and process it in bounded chunks
+        // across ticks, committing the new total when the cycle completes (the
+        // committed value is republished every tick until then). A capacity
+        // gauge tolerates the resulting staleness (≤ ~one cycle).
+        const LOGICAL_SCAN_CHUNK: usize = 100_000; // ids per tick
+        let mut logical_committed: u64 = 0;
+        let mut logical_committed_ms: u64 = 0;
+        let mut logical_cycle_ids: Vec<u64> = Vec::new();
+        let mut logical_cursor: usize = 0;
+        let mut logical_partial: u64 = 0;
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
             if !self.leader.get() {
@@ -847,30 +861,48 @@ impl crate::AutumnManager {
                 }
             }
 
-            // cluster-df: publish this tick's RAW + physical snapshot, and
-            // (every ~30 s) re-scan the extent store for logical_stored. The
-            // RAW/physical sum above is cheap (one entry per disk); the
-            // logical scan is read-only O(extents) so it runs at a slower
-            // cadence — df calls and statfs read the cached value, never scan.
+            // cluster-df: publish this tick's RAW + physical snapshot (cheap —
+            // one entry per disk), then drive the chunked logical-scan rotation.
             let now_ms = autumn_common::metrics::unix_time_ms();
-            let last_logical = self.cluster_cap.borrow().logical_last_update_ms;
-            let scan_logical = now_ms.saturating_sub(last_logical) >= 30_000;
-            let (logical_stored, logical_ms) = if scan_logical {
-                let s = self.store.inner.borrow();
-                // Σ distinct extent sealed_length (de-amplified user data).
-                // Skip extents pending physical delete (refs==0 &&
-                // vp_table_refs==0) — they no longer count as stored.
-                let logical: u64 = s
-                    .extents
-                    .values()
-                    .filter(|ex| ex.refs != 0 || ex.vp_table_refs != 0)
-                    .map(|ex| ex.sealed_length)
-                    .fold(0u64, |acc, n| acc.saturating_add(n));
-                (logical, now_ms)
-            } else {
-                let snap = self.cluster_cap.borrow();
-                (snap.logical_stored, snap.logical_last_update_ms)
-            };
+
+            // (1) Start a fresh cycle when idle AND ≥30 s since the last commit:
+            // snapshot the extent id list (one O(N) borrow, just u64 copies).
+            if logical_cycle_ids.is_empty()
+                && now_ms.saturating_sub(logical_committed_ms) >= 30_000
+            {
+                logical_cycle_ids = self.store.inner.borrow().extents.keys().copied().collect();
+                logical_cursor = 0;
+                logical_partial = 0;
+                if logical_cycle_ids.is_empty() {
+                    // Empty cluster — commit 0 now (nothing to chunk through).
+                    logical_committed = 0;
+                    logical_committed_ms = now_ms;
+                }
+            }
+            // (2) Process one bounded chunk of the in-progress cycle. Each id is
+            // re-looked-up (it may have been deleted since the snapshot) and
+            // filtered: skip extents pending physical delete (refs==0 &&
+            // vp_table_refs==0) — they no longer count as stored.
+            if !logical_cycle_ids.is_empty() {
+                let end = (logical_cursor + LOGICAL_SCAN_CHUNK).min(logical_cycle_ids.len());
+                {
+                    let s = self.store.inner.borrow();
+                    for id in &logical_cycle_ids[logical_cursor..end] {
+                        if let Some(ex) = s.extents.get(id) {
+                            if ex.refs != 0 || ex.vp_table_refs != 0 {
+                                logical_partial = logical_partial.saturating_add(ex.sealed_length);
+                            }
+                        }
+                    }
+                }
+                logical_cursor = end;
+                if logical_cursor >= logical_cycle_ids.len() {
+                    // Cycle complete — publish the new total + free the id vec.
+                    logical_committed = logical_partial;
+                    logical_committed_ms = now_ms;
+                    logical_cycle_ids = Vec::new();
+                }
+            }
             {
                 let mut snap = self.cluster_cap.borrow_mut();
                 snap.raw_total = cdf_raw_total;
@@ -878,8 +910,10 @@ impl crate::AutumnManager {
                 snap.physical_used = cdf_physical_used;
                 snap.node_count = cdf_node_count;
                 snap.last_update_ms = now_ms;
-                snap.logical_stored = logical_stored;
-                snap.logical_last_update_ms = logical_ms;
+                // Republish the last fully-committed logical total every tick
+                // (a mid-flight cycle hasn't changed it yet).
+                snap.logical_stored = logical_committed;
+                snap.logical_last_update_ms = logical_committed_ms;
                 snap.per_node = cdf_per_node;
             }
         }
