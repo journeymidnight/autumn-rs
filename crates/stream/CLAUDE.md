@@ -528,10 +528,21 @@ load-bearing constraint.
 |----------|---------|---------|-------|
 | `--ec-convert-parallelism` | `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` | 1 | [1, 16] |
 | `--recovery-parallelism` | `AUTUMN_EXTENT_RECOVERY_PARALLELISM` | 2 | [1, 16] |
+| `--ec-stripe-bytes` | `AUTUMN_EXTENT_EC_STRIPE_BYTES` (test override) | 64 MiB | [1 MiB, 1 GiB] |
 
-Clamps live on `ExtentNodeConfig::with_*` builder methods. The values
-flow through `ExtentNodeConfig` into `ConcurrencyController::new(ec,
+The two parallelism clamps live on `ExtentNodeConfig::with_*` builder methods;
+the values flow through `ExtentNodeConfig` into `ConcurrencyController::new(ec,
 recovery)` at `ExtentNode::new`.
+
+`--ec-stripe-bytes` is the chunked EC-convert stripe size — a process-global
+(all shards share it), set via `set_ec_encode_stripe_bytes` (OnceLock,
+first-call-wins; the binary applies it in `main` before any convert). Precedence
+**flag > env > 64 MiB default** (the env is a test override that the chaos/e2e
+harness uses to force multi-stripe on small extents). Peak EC-convert RAM =
+`(K+M) × stripe`; bigger stripe = fewer `WriteShard` RPCs + `sync_data`s
+(faster convert) at higher peak RAM, smaller = lower RAM at more I/O ops. Max
+1 GiB keeps a single stripe's `WriteShard` well under the frame `payload_len:
+u32` ceiling.
 
 ---
 

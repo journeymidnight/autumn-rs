@@ -1426,23 +1426,39 @@ async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec
 /// RPC path; this constant covers the local-file path on the extent node.
 const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
+static EC_ENCODE_STRIPE_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Set the EC-convert encode/transfer stripe size in bytes
+/// (`autumn-extent-node --ec-stripe-bytes N`). First-call-wins (OnceLock) — the
+/// binary applies it at startup, before any EC convert runs. Clamped to
+/// `[1 MiB, 1 GiB]`: below 1 MiB the per-stripe RPC + `sync_data` overhead
+/// dominates (more, smaller WriteShards); above 1 GiB the peak RAM
+/// `(K+M) × stripe` balloons and a single stripe approaches the frame
+/// `payload_len: u32` ceiling. Returns false if already initialised. Precedence:
+/// this flag > `AUTUMN_EXTENT_EC_STRIPE_BYTES` env (test override) > 64 MiB default.
+pub fn set_ec_encode_stripe_bytes(n: usize) -> bool {
+    EC_ENCODE_STRIPE_BYTES_CELL
+        .set(n.clamp(1024 * 1024, 1024 * 1024 * 1024))
+        .is_ok()
+}
+
 /// EC convert encode/transfer stripe size. The chunked EC convert holds at most
 /// `(K+M)` stripes resident at once (the K data sub-ranges read off the source
 /// extent + the M parity sub-ranges computed from them), so peak RAM is
-/// `(K+M) × EC_ENCODE_STRIPE_BYTES` — independent of extent size (was ~2× the
-/// whole extent for the pre-chunking whole-extent encode). 64 MiB keeps the
-/// peak ~256 MiB at K+M=4 while bounding the per-shard `sync_data` count; it is
-/// also well under the frame `payload_len: u32` ceiling so each stripe's
-/// `WriteShard` is a single in-frame RPC even for >4 GiB shards. Test override
-/// via `AUTUMN_EXTENT_EC_STRIPE_BYTES` to exercise multi-stripe without writing
-/// multi-GiB extents.
+/// `(K+M) × stripe` — independent of extent size (was ~2× the whole extent for
+/// the pre-chunking whole-extent encode). 64 MiB default keeps the peak ~256 MiB
+/// at K+M=4 while bounding the per-shard `sync_data` count; it is also well under
+/// the frame `payload_len: u32` ceiling so each stripe's `WriteShard` is a single
+/// in-frame RPC even for >4 GiB shards. Tunable via `--ec-stripe-bytes`
+/// (`set_ec_encode_stripe_bytes`); `AUTUMN_EXTENT_EC_STRIPE_BYTES` is a test
+/// override to exercise multi-stripe without writing multi-GiB extents.
 fn ec_encode_stripe_bytes() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
+    *EC_ENCODE_STRIPE_BYTES_CELL.get_or_init(|| {
         std::env::var("AUTUMN_EXTENT_EC_STRIPE_BYTES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
+            .map(|n| n.clamp(1024 * 1024, 1024 * 1024 * 1024))
             .unwrap_or(64 * 1024 * 1024)
     })
 }

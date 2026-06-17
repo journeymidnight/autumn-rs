@@ -77,6 +77,10 @@ struct Args {
     recovery_parallelism: Option<usize>,
     /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I). Default 64.
     inflight_cap: Option<usize>,
+    /// Chunked EC-convert stripe size (bytes). `None` = library default
+    /// (64 MiB). Peak EC-convert RAM = `(K+M) × stripe`. Clamped to
+    /// [1 MiB, 1 GiB] by the library.
+    ec_stripe_bytes: Option<usize>,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
@@ -110,6 +114,7 @@ fn parse_args() -> Args {
     let mut ec_convert_parallelism: Option<usize> = None;
     let mut recovery_parallelism: Option<usize> = None;
     let mut inflight_cap: Option<usize> = None;
+    let mut ec_stripe_bytes: Option<usize> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
 
     let args: Vec<String> = std::env::args().collect();
@@ -209,6 +214,11 @@ fn parse_args() -> Args {
                 i += 1;
                 inflight_cap = Some(args[i].parse().expect("--inflight-cap must be a number"));
             }
+            "--ec-stripe-bytes" => {
+                i += 1;
+                ec_stripe_bytes =
+                    Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
+            }
             "--ucx-regpool-cap-bytes" => {
                 i += 1;
                 ucx_regpool_cap_bytes = Some(
@@ -255,6 +265,7 @@ fn parse_args() -> Args {
         ec_convert_parallelism,
         recovery_parallelism,
         inflight_cap,
+        ec_stripe_bytes,
         ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
@@ -384,6 +395,13 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    // Apply the EC-convert stripe size (process-global, first-call-wins) before
+    // any shard runs an EC convert. Flag > env > 64 MiB default.
+    if let Some(n) = args.ec_stripe_bytes {
+        if !autumn_stream::set_ec_encode_stripe_bytes(n) {
+            tracing::warn!(n, "ec-stripe-bytes already set (ignored — first-call-wins)");
+        }
+    }
     // Apply regpool cap BEFORE init_with so the first transport-touch (and
     // thus first TLS pool init) reads the operator's setting.
     if let Some(cap) = args.ucx_regpool_cap_bytes {

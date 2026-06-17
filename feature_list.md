@@ -1086,8 +1086,12 @@ gaps in the lease protocol's correctness story.
     返回 M 个 parity stripe。**字节级等价**于整 extent `ec_encode` 的对应切片(`ec_encode_stripe_matches_whole` 单测证明:
     各尺寸 × 各 stripe 大小,reassemble == whole)→ on-disk shard 布局不变,读路径(ec_subrange_read/ec_read_full)零改。
   - **`handle_convert_to_ec` stripe loop:** 逐 stripe 从本地 `.dat` 读 K 个 data 子区间(尾部零填充)→ 编码 M parity →
-    远端 shard 先发、coordinator 自己 shard 0 最后写。峰值 RAM = (K+M)×`EC_ENCODE_STRIPE_BYTES`(默认 64 MiB → ~256 MiB),
+    远端 shard 先发、coordinator 自己 shard 0 最后写。峰值 RAM = (K+M)×stripe(默认 64 MiB → ~256 MiB),
     与 extent 大小无关;每个 `WriteShard` ≤ frame 上限 → >4 GiB shard 也能转。
+  - **stripe 大小做成 flag(2026-06-17 followup):** `autumn-extent-node --ec-stripe-bytes N`(process-global OnceLock
+    setter `set_ec_encode_stripe_bytes`,main 里 first-call-wins;clamp [1 MiB, 1 GiB])。优先级 **flag > 环境变量
+    `AUTUMN_EXTENT_EC_STRIPE_BYTES`(测试覆盖)> 64 MiB 默认**。大 stripe = WriteShard/fsync 更少(转换更快)但峰值 RAM 更高;
+    无 wire 改动(指纹不变)。live e2e:`--ec-stripe-bytes 16M` → 1 GiB extent 走 ~22 stripe → get-stream sha256 MATCH。
   - **`WriteShardReq.shard_offset: u64`(WIRE v5→v6):** 远端按 offset pwrite 进 `.ec.dat` + per-stripe `sync_data`;
     顺序 await-ack 让 durable 前缀单调增长;coordinator-自己-最后 保留 "coord staging 满 ⇒ 所有 participant 已 durable staged"
     不变量(coordinator_prepared skip + 2PC commit 排序依赖它)。2PC + EC-COMMIT-ATOMIC #5 marker 不变。
