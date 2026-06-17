@@ -547,7 +547,7 @@ pub struct CheckCommitLengthResp {
     pub code: u8,
     pub message: String,
     pub stream_info: Option<MgrStreamInfo>,
-    pub end: u32,
+    pub end: u64,
     pub last_ex_info: Option<MgrExtentInfo>,
 }
 
@@ -572,7 +572,7 @@ pub struct StreamAllocExtentReq {
     ///   takeover / sealed-tail init); the manager derives the seal via
     ///   `compute_commit_seal` (seal-over-reachable). Moot when the tail is
     ///   already sealed (the existing seal is preserved untouched).
-    pub seal_commit: Option<u32>,
+    pub seal_commit: Option<u64>,
     /// F190: per-stream "recently failed" node ids the writer wants the
     /// manager to skip when picking nodes for the new extent. Empty Vec
     /// means "no exclusions" (legacy / cold-start clients). The manager
@@ -629,9 +629,9 @@ pub struct MultiModifySplitReq {
     pub owner_key: String,
     pub owner_epoch: i64,
     pub mid_key: Vec<u8>,
-    pub log_stream_sealed_length: u32,
-    pub row_stream_sealed_length: u32,
-    pub meta_stream_sealed_length: u32,
+    pub log_stream_sealed_length: u64,
+    pub row_stream_sealed_length: u64,
+    pub meta_stream_sealed_length: u64,
 }
 
 // Response: CodeResp
@@ -855,20 +855,20 @@ impl ExtCommitLengthReq {
     }
 }
 
-/// CommitLengthResponse: 5 bytes. [code: u8][length: u32 LE]
+/// CommitLengthResponse: 9 bytes. [code: u8][length: u64 LE]
 pub struct ExtCommitLengthResp {
     pub code: u8,
-    pub length: u32,
+    pub length: u64,
 }
 
 impl ExtCommitLengthResp {
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 5 {
+        if data.len() < 9 {
             return Err("commit_length response too short");
         }
         Ok(Self {
             code: data.get_u8(),
-            length: data.get_u32_le(),
+            length: data.get_u64_le(),
         })
     }
 }
@@ -893,7 +893,7 @@ impl ExtProbeExtentReq {
     }
 }
 
-/// `MSG_PROBE_EXTENT` response: 5 bytes (same shape as
+/// `MSG_PROBE_EXTENT` response: 9 bytes (same shape as
 /// `ExtCommitLengthResp`). `code` is `CODE_OK` / `CODE_NOT_FOUND`.
 pub type ExtProbeExtentResp = ExtCommitLengthResp;
 

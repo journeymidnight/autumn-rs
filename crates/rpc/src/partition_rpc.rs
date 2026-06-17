@@ -158,8 +158,8 @@ pub struct GetRedirectResp {
     /// Byte offset of the VALUE bytes inside the extent (the PS already
     /// skipped the WAL record framing + key, so the client reads value
     /// bytes directly and needs no WAL format knowledge).
-    pub value_offset: u32,
-    pub value_len: u32,
+    pub value_offset: u64,
+    pub value_len: u64,
     /// EN-side eversion fence for the read.
     pub eversion: u64,
     /// Replica addresses (shard-routed) so the client needs no manager
@@ -644,8 +644,8 @@ pub struct GetDiscardsResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct SstLocation {
     pub extent_id: u64,
-    pub offset: u32,
-    pub len: u32,
+    pub offset: u64,
+    pub len: u64,
 }
 
 /// Checkpoint written to metaStream after each flush/compaction.
@@ -653,7 +653,7 @@ pub struct SstLocation {
 pub struct TableLocations {
     pub locs: Vec<SstLocation>,
     pub vp_extent_id: u64,
-    pub vp_offset: u32,
+    pub vp_offset: u64,
     /// F243-merge: source partition's log_stream extent count at flush
     /// time. Used post-merge by `recover_partition` to derive each
     /// source's region (positions [cumsum, cumsum + count)) in the

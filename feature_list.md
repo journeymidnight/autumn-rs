@@ -1044,3 +1044,35 @@ gaps in the lease protocol's correctness story.
 - **验收:** erasure 单测 16(含各尺寸 roundtrip + 缺片重建)/ ec_slice 6 / merge_ec_replay 1 / ec_2pc 5 全绿;stream lib 81。
   **live e2e**:300KB value 写入 → seal → force-ec-convert 3+1 → GET 回读 sha256 **MATCH**(经 ec_subrange_read 新无-trailer 格式)。
 - **passes:** completed (2026-06-16, 代码 + 单测 + live e2e 全绿)。
+
+### U64-OFFSET-WIDEN · extent 字节偏移 u32→u64 + max_extent_size 16 GiB flag(2026-06-17, 无部署前提)
+- **动机:** extent 受 `ReadBytesReq.offset: u32` 限死 4 GiB;`max_extent_size` 写死 3 GiB(lib.rs)。
+  拓到 u64 + 提到 16–32 GiB → 单 extent 更大 → extent 数更少 → 大规模下 manager/etcd 元数据压力更小。
+  用户明确「现在没有任何部署,不需要管兼容」。
+- **改动(编译器驱动级联):**
+  - **wire 热路径(extent_rpc 二进制):** AppendReq.commit / AppendResp.offset+end /
+    ReadBytesReq.offset+length / ReadBytesResp.end / CommitLengthResp.length 全 u32→u64
+    (APPEND_HEADER 28→32, AppendResp 9→17, ReadBytesReq 24→32, ReadBytesResp 5→9, CommitLength 5→9);
+    manager 手镜像 `ExtCommitLengthResp.length` 同步(逐字节 wire-compat,EN↔manager)。
+  - **持久格式:** `ValuePointer` 16→24B(offset/len u64);`partition_rpc::SstLocation.offset/len` +
+    `TableLocations.vp_offset`;SST `MetaBlock.vp_offset`(read_u32→read_u64);`TableMeta.offset/len`;
+    `StreamAllocExtentReq.seal_commit: Option<u64>`;`MultiModifySplitReq.{log,row,meta}_stream_sealed_length`;
+    `GetRedirectResp.value_offset/value_len`。**WAL 记录 `val_len` 保持 u32**(单值 ≤ 4GB 不变量)。
+  - **计数仍 u32:** in_flight / shard 数 / 块内偏移(≤64KB)/ 单值长(≤4GB)。
+  - **EC 读分块修复(coco P1 #4):** `read_with_layout` 对 EC extent 直接走 `ec_subrange_read` 绕过
+    256MiB 分块;16 GiB extent K=3 → shard ~5.33 GiB > frame `payload_len: u32`(≤4GiB)上限。在唯一收口
+    `read_shard_from_addr` 内部按 `read_chunk_bytes`(256MiB)分块,所有 EC 路径自动受界。旧 3GiB 默认
+    shard ~1GiB 不触发,16GiB 默认才暴露 → 本次新增能力的真 bug,已修。
+  - **max_extent_size flag:** `set_max_extent_size_bytes`(OnceLock 默认 16GiB,clamp [1,64]GiB)+
+    `max_extent_size_bytes()`,两处 StreamClient 建点(P-log + P-bulk)都读它;`autumn-ps --max-extent-size-bytes`。
+  - **WIRE fingerprint v4→v5**(MIN=MAX=5,pre-R3 同 commit 部署);registry 注册 `5254fafce73f6ffe`。
+- **兼容范围:** #1/#2/#3/#7(coco 提的旧持久格式/滚动升级)出范围 —— 用户明确不管兼容 + 全停全启
+  rkyv-fail-loud + cluster_version 戳 + WIRE v5 MIN=MAX 强制无 v4/v5 混跑。非渐进迁移。
+- **验收:** `cargo build --workspace` 绿;rpc 30 / manager lib 163 / stream + PS 全单测绿。manager 集成
+  3 个 recovery 测试并发下偶发失败 = 进程级 e2e 资源竞争,git stash 对照 HEAD baseline **相同**偶发
+  (非本次回归;各自单跑全绿)。coco deep 7 项已逐条处置(#4 真 bug 已修,余为兼容/已知区)。
+  **live e2e(隔离 memory-mode 4-EN 集群, /tmp, 端口 19xxx, --cpuset 130-135, 不碰 /data02):**
+  put-stream 4.5 GiB → 单 log_stream extent 实测 **4,831,907,398 字节 > u32::MAX(4,294,967,295)** →
+  get-stream sha256 **MATCH**(后段 chunk VP offset > 4 GiB 走 u64 read);kill -9 PS 重启 → recovery
+  重放 SST(paged u64 vp_offset)+ WAL(u64 record offset)→ 再读 **MATCH**;`--max-extent-size-bytes` flag 生效。
+- **passes:** completed (2026-06-17, 代码 + 单测 + coco + live e2e 全绿)。

@@ -57,8 +57,8 @@ fn is_eversion_stale(err: &anyhow::Error) -> bool {
 #[derive(Debug, Clone)]
 pub struct StaleVpOffset {
     pub extent_id: u64,
-    pub requested_offset: u32,
-    pub requested_length: u32,
+    pub requested_offset: u64,
+    pub requested_length: u64,
     pub sealed_length: u64,
 }
 
@@ -90,8 +90,8 @@ pub async fn read_extent_value_direct(
     addr: &str,
     extent_id: u64,
     eversion: u64,
-    offset: u32,
-    length: u32,
+    offset: u64,
+    length: u64,
 ) -> Result<bytes::Bytes> {
     let req = ReadBytesReq {
         extent_id,
@@ -165,7 +165,7 @@ pub(crate) fn append_chain_min_bytes() -> u32 {
 /// SplitMix64 finalizer over `(extent_id, offset)` — no extra deps, cheap,
 /// and well-mixed so consecutive chunk offsets of one large read stripe
 /// across replicas instead of clustering.
-pub(crate) fn rotated_replica_start(extent_id: u64, offset: u32, n: usize) -> usize {
+pub(crate) fn rotated_replica_start(extent_id: u64, offset: u64, n: usize) -> usize {
     if n <= 1 {
         return 0;
     }
@@ -212,8 +212,8 @@ use futures::{FutureExt, SinkExt, StreamExt};
 #[derive(Debug, Clone)]
 pub struct AppendResult {
     pub extent_id: u64,
-    pub offset: u32,
-    pub end: u32,
+    pub offset: u64,
+    pub end: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -248,22 +248,22 @@ struct StreamTail {
 /// to reach it before the CALLER is acked (ENOSPC-1 P1). `ack` is None in
 /// unit tests that only exercise the cursor arithmetic.
 struct PendingAck {
-    end: u32,
+    end: u64,
     ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
 }
 
 struct StreamAppendState {
     tail: Option<StreamTail>,
-    commit: u32,
-    lease_cursor: u32,
-    pending_acks: std::collections::BTreeMap<u32, PendingAck>,
+    commit: u64,
+    lease_cursor: u64,
+    pending_acks: std::collections::BTreeMap<u64, PendingAck>,
     in_flight: u32,
     poisoned: bool,
-    /// ENOSPC-1 P1: offset of the FIRST failed lease (u32::MAX = none).
+    /// ENOSPC-1 P1: offset of the FIRST failed lease (u64::MAX = none).
     /// Completions at or above this can never join the contiguous prefix
     /// — the hole below them is permanent for this extent — so they are
     /// failed to the caller instead of acked. Reset on a genuine roll.
-    failure_floor: u32,
+    failure_floor: u64,
     /// Set true by `SealCommit` after it drains + reports `commit`; while true,
     /// new `Append`s on the about-to-be-sealed tail are REJECTED (soft error →
     /// caller retries onto the fresh tail). Cleared by `ResetTail`
@@ -306,7 +306,7 @@ impl StreamAppendState {
             pending_acks: std::collections::BTreeMap::new(),
             in_flight: 0,
             poisoned: false,
-            failure_floor: u32::MAX,
+            failure_floor: u64::MAX,
             sealing: false,
             bad_nodes,
             failure_report_tx,
@@ -338,7 +338,7 @@ impl StreamAppendState {
         self.commit = 0;
         self.lease_cursor = 0;
         self.pending_acks.clear();
-        self.failure_floor = u32::MAX;
+        self.failure_floor = u64::MAX;
         self.in_flight = 0;
         self.poisoned = false;
         // ResetTail moves to a fresh tail → un-freeze: the seal→reset window
@@ -373,7 +373,7 @@ impl StreamAppendState {
         self.tail = Some(tail);
     }
 
-    fn lease(&mut self, size: u32) -> (u32, u32) {
+    fn lease(&mut self, size: u64) -> (u64, u64) {
         let offset = self.lease_cursor;
         let end = offset + size;
         self.lease_cursor = end;
@@ -391,8 +391,8 @@ impl StreamAppendState {
     /// acked range. Now acked ⊆ contiguous-commit, always.
     fn ack(
         &mut self,
-        offset: u32,
-        end: u32,
+        offset: u64,
+        end: u64,
         ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
     ) {
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -422,7 +422,7 @@ impl StreamAppendState {
         }
     }
 
-    fn rewind_or_poison(&mut self, offset: u32, size: u32) {
+    fn rewind_or_poison(&mut self, offset: u64, size: u64) {
         self.in_flight = self.in_flight.saturating_sub(1);
         if offset + size == self.lease_cursor {
             self.lease_cursor = offset;
@@ -565,7 +565,7 @@ pub struct StreamClientConfig {
     pub bad_nodes_ttl: Duration,
     pub inflight_cap: usize,
     pub append_fanout_timeout: Duration,
-    pub read_chunk_bytes: u32,
+    pub read_chunk_bytes: u64,
     pub synced_poll: Duration,
     pub synced_timeout: Duration,
 }
@@ -602,7 +602,7 @@ impl StreamClientConfig {
         self
     }
     /// F195: F105 chunk size. 0 → default 256 MiB.
-    pub fn with_read_chunk_bytes(mut self, bytes: u32) -> Self {
+    pub fn with_read_chunk_bytes(mut self, bytes: u64) -> Self {
         self.read_chunk_bytes = if bytes == 0 { 256 * 1024 * 1024 } else { bytes };
         self
     }
@@ -643,8 +643,8 @@ impl StreamClientConfig {
 /// is, not just what the decoded payload happens to be.
 fn ec_slice_decoded(
     full_payload: Vec<u8>,
-    offset: u32,
-    length: u32,
+    offset: u64,
+    length: u64,
     extent_id: u64,
     sealed_length: u64,
 ) -> Result<Vec<u8>> {
@@ -701,7 +701,7 @@ enum StreamSubmitMsg {
     /// the public API's tail-init path when the manager-tracked extent
     /// already has data (`current_commit > 0`); without this the next
     /// append would try to overwrite pre-existing bytes.
-    SeedCursor { cursor: u32 },
+    SeedCursor { cursor: u64 },
     /// Failover seal handshake: the worker DRAINS every in-flight append
     /// (awaits all completions, applying each so `state.commit` reaches its
     /// final contiguous all-replica-acked prefix), then replies with that
@@ -710,7 +710,7 @@ enum StreamSubmitMsg {
     /// safe source — a public-API-tracked value always lags the worker and
     /// races concurrent out-of-order appends + rolls. The drain is bounded by
     /// each append's `append_fanout_timeout`, so it cannot hang.
-    SealCommit { resp: oneshot::Sender<u32> },
+    SealCommit { resp: oneshot::Sender<u64> },
     /// Explicit shutdown.  Dropping the last Sender also exits the worker
     /// via channel close — this variant is kept for symmetry / tests.
     #[allow(dead_code)]
@@ -720,8 +720,8 @@ enum StreamSubmitMsg {
 /// Result of a single in-flight append — produced by the future the worker
 /// pushes into its FuturesUnordered.
 struct InflightResult {
-    offset: u32,
-    end: u32,
+    offset: u64,
+    end: u64,
     extent_id: u64,
     /// Raw oneshot frames from each replica. `Err` slots are RPC/connection
     /// failures; `Ok(f)` slots include protocol-level error frames.
@@ -1187,7 +1187,7 @@ async fn launch_append(
         return;
     }
 
-    let size: u32 = payload_parts.iter().map(|p| p.len() as u32).sum();
+    let size: u64 = payload_parts.iter().map(|p| p.len() as u64).sum();
     let (offset, end) = state.lease(size);
     let header_commit = offset; // Option A: lease-time cursor.
 
@@ -1208,7 +1208,7 @@ async fn launch_append(
     // existing soft-error / seal-and-roll path. Timeout scales by chain
     // depth (the ack traverses every hop).
     let chain_min = append_chain_min_bytes();
-    if chain_min > 0 && size >= chain_min && tail.replica_addrs.len() >= 2 {
+    if chain_min > 0 && size >= chain_min as u64 && tail.replica_addrs.len() >= 2 {
         let head_addr = tail.replica_addrs[0].clone();
         let chain: Vec<String> = tail.replica_addrs[1..].to_vec();
         let mut parts = Vec::with_capacity(2 + payload_parts.len());
@@ -1343,7 +1343,7 @@ pub struct StreamClient {
     current_mgr: Cell<usize>,
     owner_key: String,
     owner_epoch: i64,
-    max_extent_size: u32,
+    max_extent_size: u64,
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
     pool: Rc<ConnPool>,
@@ -1487,7 +1487,7 @@ impl StreamClient {
     pub async fn connect(
         manager_endpoint: &str,
         owner_key: String,
-        max_extent_size: u32,
+        max_extent_size: u64,
         pool: Rc<ConnPool>,
     ) -> Result<Rc<Self>> {
         Self::connect_with_config(
@@ -1504,7 +1504,7 @@ impl StreamClient {
     pub async fn connect_with_config(
         manager_endpoint: &str,
         owner_key: String,
-        max_extent_size: u32,
+        max_extent_size: u64,
         pool: Rc<ConnPool>,
         config: StreamClientConfig,
     ) -> Result<Rc<Self>> {
@@ -1575,7 +1575,7 @@ impl StreamClient {
         manager_endpoint: &str,
         owner_key: String,
         owner_epoch: i64,
-        max_extent_size: u32,
+        max_extent_size: u64,
         pool: Rc<ConnPool>,
     ) -> Result<Rc<Self>> {
         Self::new_with_owner_epoch_and_config(
@@ -1594,7 +1594,7 @@ impl StreamClient {
         manager_endpoint: &str,
         owner_key: String,
         owner_epoch: i64,
-        max_extent_size: u32,
+        max_extent_size: u64,
         pool: Rc<ConnPool>,
         config: StreamClientConfig,
     ) -> Result<Rc<Self>> {
@@ -1623,7 +1623,7 @@ impl StreamClient {
         current_mgr: usize,
         owner_key: String,
         owner_epoch: i64,
-        max_extent_size: u32,
+        max_extent_size: u64,
         pool: Rc<ConnPool>,
         config: StreamClientConfig,
     ) -> Rc<Self> {
@@ -1885,7 +1885,7 @@ impl StreamClient {
             .collect()
     }
 
-    async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
+    async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u64)> {
         let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
             stream_id,
             owner_key: self.owner_key.clone(),
@@ -1917,7 +1917,7 @@ impl StreamClient {
     async fn alloc_new_extent_once(
         &self,
         stream_id: u64,
-        seal_commit: Option<u32>,
+        seal_commit: Option<u64>,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
@@ -1975,7 +1975,7 @@ impl StreamClient {
     async fn alloc_new_extent(
         &self,
         stream_id: u64,
-        seal_commit: Option<u32>,
+        seal_commit: Option<u64>,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         self.retry_manager_call("alloc_new_extent", 20, || {
             self.alloc_new_extent_once(stream_id, seal_commit)
@@ -2023,7 +2023,7 @@ impl StreamClient {
         &self,
         stream_id: u64,
         tx: &mpsc::Sender<StreamSubmitMsg>,
-    ) -> Result<u32> {
+    ) -> Result<u64> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let mut tx_clone = tx.clone();
         tx_clone
@@ -2400,8 +2400,8 @@ impl StreamClient {
     /// min — see `ensure_tail_initialised`). A permanently-dead replica is
     /// reconfigured out of the set by the manager seal + operator
     /// fence/recovery lifecycle, after which all remaining members respond.
-    async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
-        let mut min_len: Option<u32> = None;
+    async fn current_commit(&self, tail: &StreamTail) -> Result<u64> {
+        let mut min_len: Option<u64> = None;
         let mut success: usize = 0;
         let mut locked: usize = 0;
         let total = tail.replica_addrs.len();
@@ -2528,7 +2528,7 @@ impl StreamClient {
             .await
     }
 
-    pub async fn commit_length(&self, stream_id: u64) -> Result<u32> {
+    pub async fn commit_length(&self, stream_id: u64) -> Result<u64> {
         let (_stream, _extent, end) = self.check_commit(stream_id).await?;
         Ok(end)
     }
@@ -2765,9 +2765,9 @@ impl StreamClient {
     pub async fn read_bytes_from_extent(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         for attempt in 0..2 {
             let ex = self.fetch_extent_info(extent_id).await?;
             match self.read_with_layout(extent_id, offset, length, &ex).await {
@@ -2804,12 +2804,12 @@ impl StreamClient {
     pub async fn read_committed_bytes_from_extent(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         for attempt in 0..2 {
             let ex = self.fetch_extent_info(extent_id).await?;
-            let committed_end: u32 = if ex.sealed {
+            let committed_end: u64 = if ex.sealed {
                 if offset as u64 > ex.sealed_length {
                     return Err(anyhow::Error::new(StaleVpOffset {
                         extent_id,
@@ -2818,7 +2818,7 @@ impl StreamClient {
                         sealed_length: ex.sealed_length,
                     }));
                 }
-                ex.sealed_length.min(u32::MAX as u64) as u32
+                ex.sealed_length
             } else {
                 // Open tail: one min-replica probe per call. Replay-only
                 // cadence (one probe per 64 MiB chunk) — not a hot path.
@@ -2871,9 +2871,9 @@ impl StreamClient {
         &self,
         extent_id: u64,
         replica_idx: usize,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32, u64)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64, u64)> {
         let ex = self.fetch_extent_info(extent_id).await?;
         if ex.ec_converted {
             return Err(anyhow!(
@@ -2892,7 +2892,7 @@ impl StreamClient {
                 node_ids.len()
             ));
         }
-        let committed_end: u32 = if ex.sealed {
+        let committed_end: u64 = if ex.sealed {
             if offset as u64 > ex.sealed_length {
                 return Err(anyhow::Error::new(StaleVpOffset {
                     extent_id,
@@ -2901,7 +2901,7 @@ impl StreamClient {
                     sealed_length: ex.sealed_length,
                 }));
             }
-            ex.sealed_length.min(u32::MAX as u64) as u32
+            ex.sealed_length
         } else {
             self.commit_length_for_extent(&ex).await?
         };
@@ -2980,8 +2980,8 @@ impl StreamClient {
     pub async fn read_value_into_pooled(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
     ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
         // F219: both transports use this fast path now. UCX recvs the value into
         // a *registered* buffer (RDMA, no off-wire copy); TCP recvs it into a
@@ -3060,10 +3060,10 @@ impl StreamClient {
     async fn read_with_layout(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
         ex: &ExtentInfo,
-    ) -> Result<(Vec<u8>, u32)> {
+    ) -> Result<(Vec<u8>, u64)> {
         // F210-H1: mirror the F204 `StaleVpOffset` sentinel for the
         // replicated path. Pre-F210-H1 only `ec_slice_decoded` produced
         // it; a VP read on a sealed replicated extent whose offset was
@@ -3097,7 +3097,7 @@ impl StreamClient {
             // 0 — a sealed-empty extent reads to-end as empty, no probe). Only
             // an OPEN extent needs the min-replica commit_length probe.
             let total_end = if ex.sealed {
-                ex.sealed_length as u32
+                ex.sealed_length
             } else {
                 self.commit_length_for_extent(ex).await?
             };
@@ -3116,14 +3116,14 @@ impl StreamClient {
             .checked_add(resolved)
             .ok_or_else(|| anyhow!("read_bytes_from_extent: offset+length overflows u32"))?;
         let mut cur = offset;
-        let mut last_end: u32 = 0;
+        let mut last_end: u64 = 0;
         while cur < stop {
             let want = (stop - cur).min(chunk);
             let (piece, end) = self.read_replicated_with_failover(ex, cur, want).await?;
             if piece.is_empty() {
                 break;
             }
-            let piece_len = piece.len() as u32;
+            let piece_len = piece.len() as u64;
             data.extend_from_slice(&piece);
             cur = cur.saturating_add(piece_len);
             last_end = end;
@@ -3193,9 +3193,9 @@ impl StreamClient {
     async fn read_replicated_with_failover(
         &self,
         ex: &ExtentInfo,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         let addrs = self.replica_addrs_for_extent(ex).await?;
         let n = addrs.len();
         let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
@@ -3277,9 +3277,9 @@ impl StreamClient {
         addrs: &[String],
         start: usize,
         ex: &ExtentInfo,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         use futures::future::{select, Either};
         let n = addrs.len();
         let a0 = addrs[start % n].clone();
@@ -3386,9 +3386,9 @@ impl StreamClient {
     /// `MSG_PROBE_EXTENT` returns the same `(code, length)` shape but
     /// skips the fence interaction entirely — exactly what a read path
     /// needs.
-    async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u32> {
+    async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u64> {
         let addrs = self.replica_addrs_for_extent(ex).await?;
-        let mut min_len: Option<u32> = None;
+        let mut min_len: Option<u64> = None;
         let mut success: usize = 0;
         let total = addrs.len();
         for addr in &addrs {
@@ -3452,9 +3452,61 @@ impl StreamClient {
         addr: &str,
         extent_id: u64,
         eversion: u64,
-        offset: u32,
-        length: u32,
-    ) -> Result<(Vec<u8>, u32)> {
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        // u64-offset widening: a single MSG_READ_BYTES response is framed with
+        // `payload_len: u32` (frame.rs), so a per-RPC read MUST stay under
+        // 4 GiB. With max_extent_size raised to 16 GiB an EC shard is
+        // ~sealed_length/K (≈ 5.33 GiB at 16 GiB / K=3), so a full-shard read
+        // here would overflow the frame length field. EC reads route straight
+        // to ec_subrange_read → here WITHOUT the replicated path's chunking
+        // (read_with_layout only chunks the replicated branch), so this is the
+        // single EC choke point that must bound the per-RPC size. Chunk at
+        // `read_chunk_bytes` (default 256 MiB), exactly like the replicated
+        // path; short read stops early (a shard is shorter than requested).
+        let chunk = self.config.read_chunk_bytes;
+        if length <= chunk {
+            return self
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, offset, length)
+                .await;
+        }
+        let mut data: Vec<u8> = Vec::with_capacity(length as usize);
+        let stop = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("read_shard_from_addr: offset+length overflows u64"))?;
+        let mut cur = offset;
+        let mut last_end: u64 = 0;
+        while cur < stop {
+            let want = (stop - cur).min(chunk);
+            let (piece, end) = self
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, cur, want)
+                .await?;
+            if piece.is_empty() {
+                break;
+            }
+            let piece_len = piece.len() as u64;
+            data.extend_from_slice(&piece);
+            cur = cur.saturating_add(piece_len);
+            last_end = end;
+            if piece_len < want {
+                break;
+            }
+        }
+        Ok((data, last_end))
+    }
+
+    /// Single-RPC shard read (one `MSG_READ_BYTES`). Callers must keep
+    /// `length <= read_chunk_bytes` so the `payload_len: u32` frame field
+    /// never overflows — `read_shard_from_addr` enforces that by chunking.
+    async fn read_shard_chunk_from_addr(
+        &self,
+        addr: &str,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         let req = ReadBytesReq {
             extent_id,
             eversion,
@@ -3513,10 +3565,10 @@ impl StreamClient {
     async fn ec_subrange_read(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
         ex: &ExtentInfo,
-    ) -> Result<(Vec<u8>, u32)> {
+    ) -> Result<(Vec<u8>, u64)> {
         let data_shards = ex.replicates.len();
         if data_shards == 0 {
             return Err(anyhow!("EC extent {extent_id} has no data shards"));
@@ -3558,19 +3610,19 @@ impl StreamClient {
 
         // Build the per-shard (offset, length) plan.
         let span = end_shard - start_shard + 1;
-        let mut shard_plan: Vec<(usize, u32, u32)> = Vec::with_capacity(span);
+        let mut shard_plan: Vec<(usize, u64, u64)> = Vec::with_capacity(span);
         for shard_idx in start_shard..=end_shard {
             let (sh_off, sh_len) = if start_shard == end_shard {
-                ((start % shard_size) as u32, read_len as u32)
+                (start % shard_size, read_len)
             } else if shard_idx == start_shard {
-                let off = (start % shard_size) as u32;
-                let len = (shard_size - start % shard_size) as u32;
+                let off = start % shard_size;
+                let len = shard_size - start % shard_size;
                 (off, len)
             } else if shard_idx == end_shard {
-                let len = (end - shard_idx as u64 * shard_size) as u32;
-                (0, len)
+                let len = end - shard_idx as u64 * shard_size;
+                (0u64, len)
             } else {
-                (0, shard_size as u32)
+                (0u64, shard_size)
             };
             shard_plan.push((shard_idx, sh_off, sh_len));
         }
@@ -3596,7 +3648,7 @@ impl StreamClient {
         // offline (see F200 entry in feature_list.md).
         let mut plan_results: Vec<Option<Vec<u8>>> = vec![None; shard_plan.len()];
         let mut needs_reconstruct: Vec<usize> = Vec::new();
-        let mut last_end: u32 = 0;
+        let mut last_end: u64 = 0;
         for (i, r) in results.into_iter().enumerate() {
             match r {
                 Ok((bytes, end_val)) => {
@@ -3645,7 +3697,7 @@ impl StreamClient {
             // matches what `read_replicated_with_failover` would
             // return for a sealed extent.
             if last_end == 0 {
-                last_end = ex.sealed_length as u32;
+                last_end = ex.sealed_length;
             }
         }
 
@@ -3693,8 +3745,8 @@ impl StreamClient {
         ex: &ExtentInfo,
         addrs: &[String],
         missing_shard_idx: usize,
-        sh_off: u32,
-        sh_len: u32,
+        sh_off: u64,
+        sh_len: u64,
     ) -> Result<Vec<u8>> {
         let data_shards = ex.replicates.len();
         let parity_shards = ex.parity.len();
@@ -3739,7 +3791,7 @@ impl StreamClient {
                 {
                     Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
                         Ok(resp) if resp.code == CODE_OK => {
-                            if resp.payload.len() as u32 != sh_len {
+                            if resp.payload.len() as u64 != sh_len {
                                 Err(anyhow!(
                                     "ec_reconstruct: short read from {addr_clone}: got {} want {sh_len}",
                                     resp.payload.len(),
@@ -3828,10 +3880,10 @@ impl StreamClient {
     async fn ec_read_full_and_slice(
         &self,
         extent_id: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
         ex: &ExtentInfo,
-    ) -> Result<(Vec<u8>, u32)> {
+    ) -> Result<(Vec<u8>, u64)> {
         let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
         // F204: pass extent_id + sealed_length so `ec_slice_decoded`
         // can build a structured `StaleVpOffset` sentinel on
@@ -3845,7 +3897,7 @@ impl StreamClient {
         Ok((bytes, end))
     }
 
-    async fn ec_read_full(&self, extent_id: u64, ex: &ExtentInfo) -> Result<(Vec<u8>, u32)> {
+    async fn ec_read_full(&self, extent_id: u64, ex: &ExtentInfo) -> Result<(Vec<u8>, u64)> {
         let data_shards = ex.replicates.len();
         let parity_shards = ex.parity.len();
         let n = data_shards + parity_shards;
@@ -3853,7 +3905,7 @@ impl StreamClient {
         let addrs = self.replica_addrs_for_extent(ex).await?;
         debug_assert_eq!(addrs.len(), n);
 
-        let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<(Vec<u8>, u32)>)>(n);
+        let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<(Vec<u8>, u64)>)>(n);
 
         let cached_eversion = ex.eversion;
         for (i, addr) in addrs.into_iter().enumerate() {
@@ -3882,7 +3934,7 @@ impl StreamClient {
                 // wedge `ec_read_full` indefinitely. Observed in
                 // production as 162 s VP-resolve latency on a single
                 // Get when one EN was paged out by macOS.
-                let result: Result<(Vec<u8>, u32)> = match pool
+                let result: Result<(Vec<u8>, u64)> = match pool
                     .call_timeout(&addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(5))
                     .await
                 {
@@ -3908,7 +3960,7 @@ impl StreamClient {
         drop(tx);
 
         let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; n];
-        let mut end_val: Option<u32> = None;
+        let mut end_val: Option<u64> = None;
         let mut success = 0usize;
         let mut last_err = anyhow!("no shard responses for extent {}", extent_id);
 
@@ -3979,9 +4031,9 @@ impl StreamClient {
             owner_key: self.owner_key.clone(),
             owner_epoch: self.owner_epoch,
             mid_key,
-            log_stream_sealed_length: sealed_lengths[0] as u32,
-            row_stream_sealed_length: sealed_lengths[1] as u32,
-            meta_stream_sealed_length: sealed_lengths[2] as u32,
+            log_stream_sealed_length: sealed_lengths[0],
+            row_stream_sealed_length: sealed_lengths[1],
+            meta_stream_sealed_length: sealed_lengths[2],
         });
         // Per-call timeout is caller-chosen (#6): the PS split path bounds it
         // SHORT so the whole freeze critical section stays under FREEZE_TTL —
@@ -4088,8 +4140,8 @@ mod pipeline_tests {
     }
 
     fn ack_payload(
-        offset: u32,
-        end: u32,
+        offset: u64,
+        end: u64,
     ) -> (
         oneshot::Receiver<Result<AppendResult>>,
         Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
@@ -4539,7 +4591,7 @@ mod f258_rotation_tests {
     #[test]
     fn deterministic_and_in_range() {
         for eid in [1u64, 42, 7_000_000] {
-            for off in [0u32, 4096, 64 << 20] {
+            for off in [0u64, 4096, 64 << 20] {
                 for n in [1usize, 2, 3, 5] {
                     let a = rotated_replica_start(eid, off, n);
                     let b = rotated_replica_start(eid, off, n);
@@ -4564,7 +4616,7 @@ mod f258_rotation_tests {
         let n = 3usize;
         let mut seen = [0usize; 3];
         for eid in 0..32u64 {
-            for chunk in 0..8u32 {
+            for chunk in 0..8u64 {
                 seen[rotated_replica_start(eid, chunk * (64 << 20), n)] += 1;
             }
         }
@@ -4583,8 +4635,8 @@ mod f258_rotation_tests {
 /// read task was dropped before sending (runtime teardown) — surfaced as a
 /// plain error so the failover loop continues.
 fn flatten_hedge(
-    res: std::result::Result<Result<(Vec<u8>, u32)>, futures::channel::oneshot::Canceled>,
-) -> Result<(Vec<u8>, u32)> {
+    res: std::result::Result<Result<(Vec<u8>, u64)>, futures::channel::oneshot::Canceled>,
+) -> Result<(Vec<u8>, u64)> {
     match res {
         Ok(r) => r,
         Err(_) => Err(anyhow!("hedged read task canceled before completion")),
@@ -4751,7 +4803,7 @@ mod merge_ec_replay_tests {
 
         // The function under test: a full-extent committed read.
         let (bytes, committed_end) = sc
-            .read_committed_bytes_from_extent(extent_id, 0, L as u32)
+            .read_committed_bytes_from_extent(extent_id, 0, L as u64)
             .await
             .expect("read_committed_bytes_from_extent");
 
@@ -4759,7 +4811,7 @@ mod merge_ec_replay_tests {
         // LOGICAL sealed_length, not a shard-relative end. Pre-fix this was
         // `last_end` from `ec_subrange_read` (≈ shard_size = L/K = 2048).
         assert_eq!(
-            committed_end, L as u32,
+            committed_end, L as u64,
             "committed_end must equal sealed_length ({L}), not the shard-relative end (~{shard_size}); \
              a shard-relative end here is the MERGE-EC-REPLAY WAL-FAILSTOP bug"
         );

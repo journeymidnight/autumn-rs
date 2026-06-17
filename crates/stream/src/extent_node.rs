@@ -2261,13 +2261,13 @@ async fn build_append_future(
 
     // 5. Compute per-request offsets + collect payload Bytes for pwritev.
     let n = slots.len();
-    let mut offsets: Vec<u32> = Vec::with_capacity(n);
+    let mut offsets: Vec<u64> = Vec::with_capacity(n);
     let mut bufs: Vec<Bytes> = Vec::with_capacity(n);
     let mut req_ids: Vec<u32> = Vec::with_capacity(n);
     let mut cursor = file_start;
     let mut total_payload: usize = 0;
     for slot in &slots {
-        offsets.push(cursor as u32);
+        offsets.push(cursor as u64);
         cursor += slot.req.payload.len() as u64;
         total_payload += slot.req.payload.len();
         bufs.push(slot.req.payload.clone());
@@ -2365,7 +2365,7 @@ async fn build_append_future(
                 let end = if k + 1 < n {
                     offsets[k + 1]
                 } else {
-                    total_end as u32
+                    total_end
                 };
                 let resp = AppendResp {
                     code: CODE_OK,
@@ -2490,7 +2490,7 @@ fn build_read_future(
             } else {
                 extent.len.load(Ordering::SeqCst)
             };
-            let end = total_len as u32;
+            let end = total_len;
             let read_offset = req.offset as u64;
             let read_size = if req.length == 0 {
                 total_len.saturating_sub(read_offset)
@@ -4107,7 +4107,7 @@ impl ExtentNode {
         Ok(sealed_changed)
     }
 
-    async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
+    async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u64) -> Result<(), String> {
         let f = extent.file_rc();
         f.set_len(commit as u64).await.map_err(|e| e.to_string())?;
         // F152: fsync the truncate. Without this, the kernel may report the
@@ -4146,7 +4146,7 @@ impl ExtentNode {
     pub(crate) async fn truncate_to_commit_ref(
         &self,
         extent: &Rc<ExtentEntry>,
-        commit: u32,
+        commit: u64,
     ) -> Result<(), String> {
         Self::truncate_to_commit(extent, commit).await
     }
@@ -4185,10 +4185,7 @@ impl ExtentNode {
         let mut offset: u64 = 0;
         while offset < total_len {
             let want = chunk.min(total_len - offset);
-            let off_u32: u32 = offset.try_into().map_err(|_| {
-                format!("extent {extent_id} recovery offset {offset} exceeds u32 (>4 GiB)")
-            })?;
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want)
                 .await?;
             if got.is_empty() {
                 break;
@@ -4211,8 +4208,8 @@ impl ExtentNode {
         addr: &str,
         extent_id: u64,
         eversion: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
     ) -> Result<Vec<u8>, String> {
         let req = ReadBytesReq {
             extent_id,
@@ -4489,10 +4486,7 @@ impl ExtentNode {
         let mut offset: u64 = 0;
         while offset < total {
             let want = chunk.min(total - offset);
-            let off_u32: u32 = offset.try_into().map_err(|_| {
-                format!("extent {extent_id} stream offset {offset} exceeds u32 (>4 GiB)")
-            })?;
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want)
                 .await?;
             if got.is_empty() {
                 break;
@@ -5463,7 +5457,7 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(req.extent_id, &msg);
             return Err((StatusCode::Internal, msg));
         }
-        let start_offset = start as u32;
+        let start_offset = start;
         let end = start + data_payload.len() as u64;
         // F178: every append is durable via the per-extent coalescer. See
         // `register_sync_waiter` and the matching block in
@@ -5491,7 +5485,7 @@ impl ExtentNode {
         Ok(AppendResp {
             code: CODE_OK,
             offset: start_offset,
-            end: end as u32,
+            end,
         }
         .encode())
     }
@@ -5554,7 +5548,7 @@ impl ExtentNode {
         } else {
             extent.len.load(Ordering::SeqCst)
         };
-        let end = total_len as u32;
+        let end = total_len;
         let read_offset = req.offset as u64;
         let read_size = if req.length == 0 {
             total_len.saturating_sub(read_offset)
@@ -5710,7 +5704,7 @@ impl ExtentNode {
         };
         Ok(CommitLengthResp {
             code: CODE_OK,
-            length: length as u32,
+            length,
         }
         .encode())
     }
@@ -5776,7 +5770,7 @@ impl ExtentNode {
         };
         Ok(ProbeExtentResp {
             code: CODE_OK,
-            length: length as u32,
+            length,
         }
         .encode())
     }

@@ -54,8 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 4;
-pub const WIRE_VERSION_MAX: u32 = 4;
+pub const WIRE_VERSION_MIN: u32 = 5;
+pub const WIRE_VERSION_MAX: u32 = 5;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -81,6 +81,17 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // real per-disk extent footprint); MSG_CLUSTER_DF (0x4D) +
     // ClusterDfReq/ClusterDfResp/NodeCapWire. Pre-R3: MIN=MAX=4.
     (4, "d96a8af74454f7ef"),
+    // v5: u64-offset widening — every extent byte position on the
+    // read+append path widened u32→u64 so extents can exceed 4 GiB
+    // (AppendReq.commit, AppendResp.offset/end, ReadBytesReq.offset/length,
+    // ReadBytesResp.end, CommitLengthResp.length, ExtCommitLengthResp.length;
+    // rkyv: SstLocation.offset/len, TableLocations.vp_offset, SstLocation,
+    // CheckCommitLengthResp.end, StreamAllocExtentReq.seal_commit,
+    // MultiModifySplitReq.{log,row,meta}_stream_sealed_length,
+    // GetRedirectResp.value_offset/value_len). Companion: max_extent_size
+    // default 3 GiB → 16 GiB (`autumn-ps --max-extent-size-bytes`).
+    // Pre-R3: MIN=MAX=5.
+    (5, "5254fafce73f6ffe"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

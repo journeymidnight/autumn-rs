@@ -995,6 +995,22 @@ cap layered before `account_gc`; it stays for back-compat with the
 | `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger ratio |
 | `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency |
 | `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency |
+| `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold passed to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
+
+**`--max-extent-size-bytes` (u64-offset widening).** The threshold at which a
+stream's tail extent rolls a fresh extent. Raised from a hardcoded 3 GiB to a
+16 GiB default + flag, enabled by widening every extent byte position on the
+read+append path from `u32` to `u64` (wire `AppendReq.commit` /
+`AppendResp.offset/end` / `ReadBytesReq.offset/length` / `CommitLengthResp.length`;
+persisted `ValuePointer` 16→24 B, `SstLocation`, `TableLocations.vp_offset`,
+SST `MetaBlock.vp_offset`, `TableMeta.offset/len`). Bigger extents = fewer
+extents = less manager/etcd metadata pressure at scale. The flag flows through
+`partition_server::set_max_extent_size_bytes` → `max_extent_size_bytes()`,
+read at both `StreamClient::new_with_owner_epoch` sites (P-log + P-bulk). WIRE
+fingerprint bumped to v5 (MIN=MAX=5, same-commit deploy). NOTE: with EC + 16 GiB
+extents a shard exceeds 4 GiB, so `read_shard_from_addr` chunks internally (see
+stream CLAUDE.md note 12) to keep each `MSG_READ_BYTES` under the frame's
+`payload_len: u32` ceiling.
 
 Defaults sized to perf_check baselines. See `feature_list.md` F196
 D-r7-recal entry for the derivation (4K p16 d8: per-partition fg

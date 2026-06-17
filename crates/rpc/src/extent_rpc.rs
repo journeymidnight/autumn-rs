@@ -120,7 +120,7 @@ pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'st
 
 /// Fixed binary header for AppendRequest: 28 bytes + raw payload.
 /// ```text
-/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][owner_epoch: i64 LE]
+/// [extent_id: u64 LE][eversion: u64 LE][commit: u64 LE][owner_epoch: i64 LE]
 /// [payload bytes...]
 /// ```
 ///
@@ -130,12 +130,14 @@ pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'st
 /// sync waiter and awaits coalesced `sync_data`. Pre-F178 this byte
 /// distinguished sync vs. nosync writes; post-F178 there is no nosync
 /// path. Wire format shrinks by 1 byte.
-pub const APPEND_HEADER_LEN: usize = 28;
+// u64-offset widening: commit is a byte position in the extent (up to
+// max_extent_size, now > 4 GiB), so it is u64. Header = 8+8+8(commit)+8 = 32.
+pub const APPEND_HEADER_LEN: usize = 32;
 
 pub struct AppendReq {
     pub extent_id: u64,
     pub eversion: u64,
-    pub commit: u32,
+    pub commit: u64,
     pub owner_epoch: i64,
     pub payload: Bytes,
 }
@@ -145,18 +147,18 @@ impl AppendReq {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN + self.payload.len());
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.eversion);
-        buf.put_u32_le(self.commit);
+        buf.put_u64_le(self.commit);
         buf.put_i64_le(self.owner_epoch);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
 
-    /// Encode only the 28-byte header (for vectored writes — payload sent separately).
-    pub fn encode_header(extent_id: u64, eversion: u64, commit: u32, owner_epoch: i64) -> Bytes {
+    /// Encode only the 32-byte header (for vectored writes — payload sent separately).
+    pub fn encode_header(extent_id: u64, eversion: u64, commit: u64, owner_epoch: i64) -> Bytes {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
         buf.put_u64_le(extent_id);
         buf.put_u64_le(eversion);
-        buf.put_u32_le(commit);
+        buf.put_u64_le(commit);
         buf.put_i64_le(owner_epoch);
         buf.freeze()
     }
@@ -167,7 +169,7 @@ impl AppendReq {
         }
         let extent_id = data.get_u64_le();
         let eversion = data.get_u64_le();
-        let commit = data.get_u32_le();
+        let commit = data.get_u64_le();
         let owner_epoch = data.get_i64_le();
         let payload = data;
         Ok(Self {
@@ -180,95 +182,97 @@ impl AppendReq {
     }
 }
 
-/// Fixed binary AppendResponse: 9 bytes.
+/// Fixed binary AppendResponse: 17 bytes.
 /// ```text
-/// [code: u8][offset: u32 LE][end: u32 LE]
+/// [code: u8][offset: u64 LE][end: u64 LE]
 /// ```
+/// offset/end are byte positions in the extent (u64-offset widening).
 pub struct AppendResp {
     pub code: u8,
-    pub offset: u32,
-    pub end: u32,
+    pub offset: u64,
+    pub end: u64,
 }
 
 impl AppendResp {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(9);
+        let mut buf = BytesMut::with_capacity(17);
         buf.put_u8(self.code);
-        buf.put_u32_le(self.offset);
-        buf.put_u32_le(self.end);
+        buf.put_u64_le(self.offset);
+        buf.put_u64_le(self.end);
         buf.freeze()
     }
 
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 9 {
+        if data.len() < 17 {
             return Err("append response too short");
         }
         Ok(Self {
             code: data.get_u8(),
-            offset: data.get_u32_le(),
-            end: data.get_u32_le(),
+            offset: data.get_u64_le(),
+            end: data.get_u64_le(),
         })
     }
 }
 
 // ── ReadBytes (hot path) ─────────────────────────────────────────────────────
 
-/// ReadBytesRequest: 24 bytes.
+/// ReadBytesRequest: 32 bytes (u64-offset widening — offset/length are byte
+/// positions/spans in the extent, now > 4 GiB).
 /// ```text
-/// [extent_id: u64 LE][eversion: u64 LE][offset: u32 LE][length: u32 LE]
+/// [extent_id: u64 LE][eversion: u64 LE][offset: u64 LE][length: u64 LE]
 /// ```
 pub struct ReadBytesReq {
     pub extent_id: u64,
     pub eversion: u64,
-    pub offset: u32,
-    pub length: u32,
+    pub offset: u64,
+    pub length: u64,
 }
 
 impl ReadBytesReq {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(24);
+        let mut buf = BytesMut::with_capacity(32);
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.eversion);
-        buf.put_u32_le(self.offset);
-        buf.put_u32_le(self.length);
+        buf.put_u64_le(self.offset);
+        buf.put_u64_le(self.length);
         buf.freeze()
     }
 
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 24 {
+        if data.len() < 32 {
             return Err("read_bytes request too short");
         }
         Ok(Self {
             extent_id: data.get_u64_le(),
             eversion: data.get_u64_le(),
-            offset: data.get_u32_le(),
-            length: data.get_u32_le(),
+            offset: data.get_u64_le(),
+            length: data.get_u64_le(),
         })
     }
 }
 
-/// ReadBytesResponse: [code: u8][end: u32 LE][payload bytes...]
+/// ReadBytesResponse: [code: u8][end: u64 LE][payload bytes...]
 pub struct ReadBytesResp {
     pub code: u8,
-    pub end: u32,
+    pub end: u64,
     pub payload: Bytes,
 }
 
 impl ReadBytesResp {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(5 + self.payload.len());
+        let mut buf = BytesMut::with_capacity(9 + self.payload.len());
         buf.put_u8(self.code);
-        buf.put_u32_le(self.end);
+        buf.put_u64_le(self.end);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
 
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 5 {
+        if data.len() < 9 {
             return Err("read_bytes response too short");
         }
         let code = data.get_u8();
-        let end = data.get_u32_le();
+        let end = data.get_u64_le();
         let payload = data;
         Ok(Self { code, end, payload })
     }
@@ -333,28 +337,28 @@ impl CommitLengthReq {
     }
 }
 
-/// CommitLengthResponse: 5 bytes.
-/// [code: u8][length: u32 LE]
+/// CommitLengthResponse: 9 bytes.
+/// [code: u8][length: u64 LE]
 pub struct CommitLengthResp {
     pub code: u8,
-    pub length: u32,
+    pub length: u64,
 }
 
 impl CommitLengthResp {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(5);
+        let mut buf = BytesMut::with_capacity(9);
         buf.put_u8(self.code);
-        buf.put_u32_le(self.length);
+        buf.put_u64_le(self.length);
         buf.freeze()
     }
 
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 5 {
+        if data.len() < 9 {
             return Err("commit_length response too short");
         }
         Ok(Self {
             code: data.get_u8(),
-            length: data.get_u32_le(),
+            length: data.get_u64_le(),
         })
     }
 }
@@ -388,7 +392,7 @@ impl ProbeExtentReq {
     }
 }
 
-/// ProbeExtentResponse: 5 bytes. `[code: u8][length: u32 LE]`. Same shape
+/// ProbeExtentResponse: 9 bytes. `[code: u8][length: u64 LE]`. Same shape
 /// as `CommitLengthResp` — `code` is `CODE_OK` (extent present) or
 /// `CODE_NOT_FOUND` (extent missing locally); `length` carries
 /// `coalescer.last_synced` for open extents or `sealed_length` for sealed.

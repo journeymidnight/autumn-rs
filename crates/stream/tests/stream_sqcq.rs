@@ -224,7 +224,7 @@ fn concurrent_append_preserves_order_within_stream() {
                 );
             }
             let last = results.last().unwrap();
-            let total = (N * PAYLOAD) as u32;
+            let total = (N * PAYLOAD) as u64;
             assert_eq!(last.end, total, "total bytes leased");
 
             let cl = client
@@ -301,7 +301,7 @@ fn worker_handles_back_pressure() {
                 .commit_length(stream_id)
                 .await
                 .expect("commit length");
-            assert_eq!(cl, (N * PAYLOAD) as u32);
+            assert_eq!(cl, (N * PAYLOAD) as u64);
         });
 }
 
@@ -354,7 +354,7 @@ fn cq_advances_commit_on_out_of_order_completion() {
             for r in &results {
                 let _ = r.as_ref().expect("append");
             }
-            let total = (N * PAYLOAD) as u32;
+            let total = (N * PAYLOAD) as u64;
             let cl = client
                 .commit_length(stream_id)
                 .await
@@ -505,7 +505,7 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
             // the same invariant Test 1 checks, but with 3 replicas so the
             // parallel-fanout fast path is exercised.
             results.sort_by_key(|r| r.offset);
-            let total = (N * PAYLOAD) as u32;
+            let total = (N * PAYLOAD) as u64;
             assert_eq!(results[0].offset, 0, "first offset must be 0");
             for w in results.windows(2) {
                 assert_eq!(

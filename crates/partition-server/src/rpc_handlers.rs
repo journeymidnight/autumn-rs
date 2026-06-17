@@ -158,7 +158,7 @@ pub(crate) enum GetOutcome {
     Value(Bytes),
     /// F259: large full-value VP — the caller (handle_get_redirect) sends
     /// a descriptor instead of resolving the bytes through this PS.
-    Redirect { extent_id: u64, value_offset: u32, value_len: u32 },
+    Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
 }
 
 /// MSG_BATCH_GET: N keys on the SAME partition in ONE frame, all
@@ -570,7 +570,7 @@ async fn get_value_inner(
     drop(p);
 
     let vp_t0 = Instant::now();
-    let value = resolve_value(op, raw_value, &sc, req.offset, req.length)
+    let value = resolve_value(op, raw_value, &sc, req.offset as u64, req.length as u64)
         .await
         .map_err(|e| map_storage_error(&e))?;
     let vp_resolve_ns = if is_vp {

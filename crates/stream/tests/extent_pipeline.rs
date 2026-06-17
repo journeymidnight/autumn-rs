@@ -32,20 +32,20 @@ async fn concurrent_appends_preserve_offset_order_per_extent() {
     let payload = vec![0xABu8; payload_len as usize];
     const N: u32 = 200;
 
-    let mut expected_offset: u32 = 0;
+    let mut expected_offset: u64 = 0;
     for _ in 0..N {
         let resp = conn
             .append(2003, 1, expected_offset, 10, payload.clone())
             .await;
         assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.offset, expected_offset, "offsets must be contiguous");
-        assert_eq!(resp.end, expected_offset + payload_len);
+        assert_eq!(resp.end, expected_offset + payload_len as u64);
         expected_offset = resp.end;
     }
 
     let cl = conn.commit_length(2003, 10).await;
     assert_eq!(cl.code, CODE_OK);
-    assert_eq!(cl.length, payload_len * N, "final extent len");
+    assert_eq!(cl.length, (payload_len * N) as u64, "final extent len");
 }
 
 #[compio::test]
@@ -154,10 +154,10 @@ async fn pwritev_batch_still_coalesced() {
     let alloc = conn.alloc_extent(2030).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    let payload_len: u32 = 128;
+    let payload_len: u64 = 128;
     let payload = vec![0x5Au8; payload_len as usize];
 
-    for i in 0..10 {
+    for i in 0..10u64 {
         let resp = conn
             .append(2030, 1, i * payload_len, 10, payload.clone())
             .await;

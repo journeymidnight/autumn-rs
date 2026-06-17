@@ -254,6 +254,17 @@ $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 #   8MiB windows, not Σ SST bytes). Striped keys (put-stream) byte-compare
 #   via `$AC get-stream --out F KEY` (plain `get` returns the 29-byte
 #   stripe meta by design).
+# u64 offset widening — extents may exceed 4 GiB (default seal 16 GiB)
+# PS flag: autumn-ps --max-extent-size-bytes N   (default 16 GiB, clamp [1,64] GiB)
+# Manual check: into ONE partition, put-stream a > 4.3 GiB value (4 MiB chunks
+#   accumulate in one log_stream extent so later chunk VPs sit at byte offset
+#   > u32::MAX). `$AC get-stream --out F KEY` must byte-match (sha256) — this
+#   reads chunks via the now-u64 `ReadBytesReq.offset`. Then kill -9 the PS,
+#   restart, and `get-stream` again must match (recovery replays SST + WAL with
+#   u64 offsets). EC: with 16 GiB extents a shard exceeds 4 GiB, served via
+#   per-shard chunked reads (no `payload_len: u32` overflow). Repro script:
+#   the isolated memory-mode loopback recipe (manager w/o --etcd, 4 single-shard
+#   ENs, 1 PS) used in dev.
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

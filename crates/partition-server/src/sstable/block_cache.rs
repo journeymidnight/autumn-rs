@@ -27,7 +27,7 @@ struct Entry {
 }
 
 struct Inner {
-    map: HashMap<(u64, u32), Entry>,
+    map: HashMap<(u64, u64), Entry>,
     bytes: usize,
     tick: u64,
     hits: u64,
@@ -53,7 +53,7 @@ impl BlockCache {
         }
     }
 
-    pub fn get(&self, key: (u64, u32)) -> Option<Arc<DecodedBlock>> {
+    pub fn get(&self, key: (u64, u64)) -> Option<Arc<DecodedBlock>> {
         let mut g = self.inner.lock();
         g.tick += 1;
         let tick = g.tick;
@@ -71,7 +71,7 @@ impl BlockCache {
         }
     }
 
-    pub fn insert(&self, key: (u64, u32), block: Arc<DecodedBlock>, size: usize) {
+    pub fn insert(&self, key: (u64, u64), block: Arc<DecodedBlock>, size: usize) {
         let mut g = self.inner.lock();
         g.tick += 1;
         let tick = g.tick;
@@ -112,7 +112,7 @@ impl BlockCache {
     /// blocks can't be served for a recycled (extent, offset).
     pub fn invalidate_extent(&self, extent_id: u64) {
         let mut g = self.inner.lock();
-        let keys: Vec<(u64, u32)> = g
+        let keys: Vec<(u64, u64)> = g
             .map
             .keys()
             .filter(|(e, _)| *e == extent_id)
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn bounded_eviction_and_invalidate() {
         let c = BlockCache::new(100);
-        for i in 0..20u32 {
+        for i in 0..20u64 {
             c.insert((1, i), blk(), 10);
         }
         let (bytes, n, _h, _m) = c.stats();

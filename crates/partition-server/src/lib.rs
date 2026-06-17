@@ -80,6 +80,12 @@ static PS_BULK_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLo
 static PS_FLUSH_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MAX_WAL_GAP_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Per-extent seal threshold (bytes) for the per-partition StreamClient.
+/// When a stream's tail extent reaches this size, the next append rolls a
+/// fresh extent. Bigger = fewer extents = less manager/etcd metadata
+/// pressure at scale (the reason for the u64-offset widening). Default
+/// 16 GiB; clamp [1 GiB, 64 GiB].
+static MAX_EXTENT_SIZE_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_MAJOR_COMPACT_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_GC_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -120,6 +126,11 @@ pub fn set_max_imm_depth(n: usize) -> bool {
 pub fn set_max_wal_gap(n: u64) -> bool {
     MAX_WAL_GAP_CELL
         .set(n.clamp(128 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
+        .is_ok()
+}
+pub fn set_max_extent_size_bytes(n: u64) -> bool {
+    MAX_EXTENT_SIZE_BYTES_CELL
+        .set(n.clamp(1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
         .is_ok()
 }
 pub fn set_shutdown_timeout_ms(n: u64) -> bool {
@@ -292,6 +303,16 @@ pub(crate) fn max_wal_gap() -> u64 {
     *MAX_WAL_GAP_CELL.get_or_init(|| DEFAULT)
 }
 
+/// Per-extent seal threshold passed to each partition's `StreamClient`.
+/// Default 16 GiB (was a hardcoded 3 GiB); overridable via
+/// `set_max_extent_size_bytes` (`autumn-ps --max-extent-size-bytes`).
+/// The u64-offset widening lifted the prior 4 GiB `ReadBytesReq.offset`
+/// ceiling so extents can now exceed 4 GiB.
+pub(crate) fn max_extent_size_bytes() -> u64 {
+    const DEFAULT: u64 = 16 * 1024 * 1024 * 1024;
+    *MAX_EXTENT_SIZE_BYTES_CELL.get_or_init(|| DEFAULT)
+}
+
 /// F120-C — graceful shutdown deadline. After SIGTERM, `PartitionServer::
 /// shutdown()` waits at most this many milliseconds for each partition's
 /// drain (rotate active + flush all imm). Range clamped to [1 s, 10 min].
@@ -440,7 +461,9 @@ pub(crate) fn parse_ts(internal_key: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 
 const VALUE_THROTTLE: usize = 4 * 1024;
-const VALUE_POINTER_SIZE: usize = 16;
+// u64-offset widening: VP offset addresses into a log_stream extent that can
+// now exceed 4 GiB, so offset (and len, for headroom) are u64 → 8+8+8 = 24.
+const VALUE_POINTER_SIZE: usize = 24;
 const OP_VALUE_POINTER: u8 = 0x80;
 
 /// BUG-LEASE-2 Phase 2: WAL record op for a fence-floor bump. Emitted into
@@ -492,23 +515,23 @@ pub(crate) const AUTUMN_PS_ZC_RECV_MIN_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
     extent_id: u64,
-    offset: u32,
-    len: u32,
+    offset: u64,
+    len: u64,
 }
 
 impl ValuePointer {
     fn encode(&self) -> [u8; VALUE_POINTER_SIZE] {
         let mut b = [0u8; VALUE_POINTER_SIZE];
         b[0..8].copy_from_slice(&self.extent_id.to_le_bytes());
-        b[8..12].copy_from_slice(&self.offset.to_le_bytes());
-        b[12..16].copy_from_slice(&self.len.to_le_bytes());
+        b[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        b[16..24].copy_from_slice(&self.len.to_le_bytes());
         b
     }
     fn decode(b: &[u8]) -> Self {
         Self {
             extent_id: u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            offset: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            len: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+            offset: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            len: u64::from_le_bytes(b[16..24].try_into().unwrap()),
         }
     }
 }
@@ -651,14 +674,15 @@ impl Memtable {
 #[derive(Clone, Debug)]
 pub(crate) struct TableMeta {
     extent_id: u64,
-    offset: u32,
-    len: u32,
+    // u64-offset widening: SST position/len in the row_stream extent (now > 4 GiB).
+    offset: u64,
+    len: u64,
     estimated_size: u64,
     last_seq: u64,
 }
 
 impl TableMeta {
-    fn loc(&self) -> (u64, u32) {
+    fn loc(&self) -> (u64, u64) {
         (self.extent_id, self.offset)
     }
 }
@@ -720,7 +744,7 @@ pub(crate) struct PartitionData {
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
     vp_extent_id: u64,
-    vp_offset: u32,
+    vp_offset: u64,
     stream_client: Rc<StreamClient>,
     manager_addr: String,
     pool: Rc<ConnPool>,
@@ -1229,7 +1253,7 @@ pub(crate) struct GcAutoParams {
 pub(crate) struct FlushReq {
     pub(crate) imm: Arc<Memtable>,
     pub(crate) vp_eid: u64,
-    pub(crate) vp_off: u32,
+    pub(crate) vp_off: u64,
     pub(crate) row_stream_id: u64,
     pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
 }
@@ -4740,7 +4764,7 @@ async fn partition_thread_main(
         &manager_addr,
         owner_key.clone(),
         owner_epoch,
-        3 * 1024 * 1024 * 1024,
+        max_extent_size_bytes(),
         pool.clone(),
     )
     .await
@@ -6698,7 +6722,7 @@ async fn self_heal_replay_chunk(
     part_sc: &StreamClient,
     eid: u64,
     log_stream_id: u64,
-    buf_base: u32,
+    buf_base: u64,
     want: u32,
     is_final: bool,
     truncated: bool,
@@ -6775,7 +6799,7 @@ async fn self_heal_replay_chunk(
             continue;
         }
         match part_sc
-            .read_committed_from_replica(eid, idx, buf_base, want)
+            .read_committed_from_replica(eid, idx, buf_base, want as u64)
             .await
         {
             Ok((bytes, _end, node_id)) => results.push((node_id, Some(bytes))),
@@ -6840,7 +6864,7 @@ async fn recover_partition(
     Vec<Arc<SstReader>>,
     u64,
     u64,
-    u32,
+    u64,
     bool,
     Memtable,
     HashMap<u64, u64>,
@@ -6849,7 +6873,7 @@ async fn recover_partition(
     let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
     let mut max_seq: u64 = 0;
     let mut recovered_vp_eid: u64 = 0;
-    let mut recovered_vp_off: u32 = 0;
+    let mut recovered_vp_off: u64 = 0;
     let mut detected_overlap = false;
     // BUG-LEASE-2 Phase 2: per-ino fence floors. Seeded from EVERY
     // checkpoint record (max-merge — post-merge both sources' floors
@@ -6894,7 +6918,7 @@ async fn recover_partition(
     let mut chosen_pos: usize = usize::MAX;
     // F243-merge: declared at outer scope so the replay loop can compute
     // per-meta_record source_max_seq below.
-    let mut loc_to_last_seq: HashMap<(u64, u32, u32), u64> = HashMap::new();
+    let mut loc_to_last_seq: HashMap<(u64, u64, u64), u64> = HashMap::new();
 
     if !meta_records.is_empty() {
         // Each meta_record carries a (vp_extent_id, vp_offset) saying
@@ -6929,7 +6953,7 @@ async fn recover_partition(
             };
             // Prefer earlier position; tie-break with smaller offset.
             let cur_off = if chosen_pos == usize::MAX {
-                u32::MAX
+                u64::MAX
             } else {
                 recovered_vp_off
             };
@@ -6942,7 +6966,7 @@ async fn recover_partition(
         // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
         // post-split appear in both partitions' records pointing at the
         // same physical bytes; we keep one entry.
-        let mut seen: HashSet<(u64, u32, u32)> = HashSet::new();
+        let mut seen: HashSet<(u64, u64, u64)> = HashSet::new();
         let mut all_locs: Vec<SstLocation> = Vec::new();
         for r in &meta_records {
             for loc in &r.locs {
@@ -7020,7 +7044,7 @@ async fn recover_partition(
                     tail4.len()
                 ));
             }
-            let meta_len = u32::from_le_bytes(tail4[..4].try_into().unwrap());
+            let meta_len = u32::from_le_bytes(tail4[..4].try_into().unwrap()) as u64;
             if meta_len == 0 || meta_len + 4 > loc.len {
                 return Err(anyhow::anyhow!(
                     "invalid meta_len={meta_len} for SST extent={} offset={} len={}",
@@ -7225,7 +7249,7 @@ async fn recover_partition(
     // each record's insertion AND attributes the duplicate occurrence
     // to the WRONG source region. We replay each extent only at its
     // FIRST occurrence (which has the correct source-region dedup).
-    let replay_extents: Option<Vec<(usize, u64, u32)>> =
+    let replay_extents: Option<Vec<(usize, u64, u64)>> =
         if chosen_pos == usize::MAX && tables.is_empty() {
             // No checkpoint and no SSTs: replay everything from offset 0 of
             // every extent — dedup by first occurrence.
@@ -7236,7 +7260,7 @@ async fn recover_partition(
                     .enumerate()
                     .filter_map(|(pos, &eid)| {
                         if seen.insert(eid) {
-                            Some((pos, eid, 0u32))
+                            Some((pos, eid, 0u64))
                         } else {
                             None
                         }
@@ -7260,7 +7284,7 @@ async fn recover_partition(
                         } else if pos == chosen_pos {
                             Some((pos, eid, recovered_vp_off))
                         } else {
-                            Some((pos, eid, 0u32))
+                            Some((pos, eid, 0u64))
                         }
                     })
                     .collect(),
@@ -7294,8 +7318,8 @@ async fn recover_partition(
             // whole-read this replaced resolved its end from
             // sealed_length / the commit probe, which is exactly what
             // `read_committed_bytes_from_extent` restores per chunk.
-            const REPLAY_CHUNK_BYTES: u32 = 64 * 1024 * 1024;
-            let mut cur_off: u32 = start_off;
+            const REPLAY_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+            let mut cur_off: u64 = start_off;
             let mut carry: Vec<u8> = Vec::new();
             loop {
             let (data, committed_end) = {
@@ -7339,7 +7363,7 @@ async fn recover_partition(
                 // Reached the committed end cleanly, nothing buffered. Done.
                 break;
             }
-            let buf_base = cur_off as usize - carry.len();
+            let buf_base = cur_off - carry.len() as u64;
             // The full committed window this chunk covers (carry prefix + the
             // bytes that SHOULD be readable here) — used as the self-heal re-read
             // length so a truncated serving replica's short `got` doesn't shrink it.
@@ -7377,7 +7401,7 @@ async fn recover_partition(
                     part_sc,
                     eid,
                     log_stream_id,
-                    buf_base as u32,
+                    buf_base,
                     want_full as u32,
                     is_final,
                     short,
@@ -7458,7 +7482,7 @@ async fn recover_partition(
                     continue;
                 }
 
-                let record_extent_off = (buf_base + buf_off) as u32;
+                let record_extent_off = buf_base + buf_off as u64;
                 let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
                     // VP detection: new WAL has VP flag in op; old WAL uses
                     // value size as fallback. F186 fix: V1 envelope adds
@@ -7466,8 +7490,8 @@ async fn recover_partition(
                     // so value bytes are at +22 not +17 from record start.
                     let vp = ValuePointer {
                         extent_id: eid,
-                        offset: record_extent_off + 22 + key.len() as u32,
-                        len: value.len() as u32,
+                        offset: record_extent_off + 22 + key.len() as u64,
+                        len: value.len() as u64,
                     };
                     MemEntry {
                         op: (op & 0x7f) | OP_VALUE_POINTER,
@@ -7492,7 +7516,7 @@ async fn recover_partition(
             // the FULL committed window — not the truncated serving `got`. In the
             // non-healed case `buf.len() == carry_prev + got`, identical to the
             // old `cur_off += got`.
-            cur_off = (buf_base + buf.len()) as u32;
+            cur_off = buf_base + buf.len() as u64;
             if is_final {
                 // Reached the committed end (committed_end-clamped reads, F261).
                 // need_heal already routed an is_final leftover through self-heal
@@ -7831,7 +7855,7 @@ pub(crate) async fn save_table_locs_raw(
     meta_stream_id: u64,
     tables: &[TableMeta],
     vp_extent_id: u64,
-    vp_offset: u32,
+    vp_offset: u64,
     log_extent_count: u32,
     // BUG-LEASE-2 Phase 2: fence-floor snapshot, captured by the caller
     // under the SAME borrow as `tables` (F148-A: snapshot order = publish
@@ -7997,7 +8021,7 @@ pub(crate) async fn sync_partition_vp_refs(part: &Rc<RefCell<PartitionData>>) ->
 // SSTable building
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u32) -> (Vec<u8>, u64) {
+pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u64) -> (Vec<u8>, u64) {
     let mut builder = SstBuilder::new(vp_extent_id, vp_offset);
     let mut last_seq = 0u64;
     imm.for_each(|ikey, me| {
@@ -8041,7 +8065,7 @@ pub(crate) struct FlushOutcome {
     pub new_meta: TableMeta,
     pub reader: SstReader,
     pub vp_eid: u64,
-    pub vp_off: u32,
+    pub vp_off: u64,
     /// F250 diag: `Arc::as_ptr` of the imm this outcome was built from.
     /// `commit_flush_outcome` asserts the popped `front()` matches — a
     /// mismatch means a commit dropped an unflushed imm (data loss).
@@ -8667,7 +8691,7 @@ fn spawn_bulk_thread(
                     &manager_addr,
                     owner_key,
                     owner_epoch,
-                    3 * 1024 * 1024 * 1024,
+                    max_extent_size_bytes(),
                     pool,
                 )
                 .await
@@ -8903,7 +8927,7 @@ async fn do_flush_on_bulk(
     bulk_sc: &Rc<StreamClient>,
     imm: Arc<Memtable>,
     vp_eid: u64,
-    vp_off: u32,
+    vp_off: u64,
     row_stream_id: u64,
 ) -> Result<(TableMeta, SstReader)> {
     let imm_clone = imm.clone();
@@ -8914,7 +8938,7 @@ async fn do_flush_on_bulk(
 
     let append_result = bulk_sc.append(row_stream_id, &sst_bytes).await?;
     let estimated_size = sst_bytes.len() as u64;
-    let sst_len = sst_bytes.len() as u32;
+    let sst_len = sst_bytes.len() as u64;
     // F261: parse the meta then DROP the resident bytes — blocks are
     // served on demand from row_stream through the bounded global cache.
     // (No cache invalidation needed on later GC: extent ids are never

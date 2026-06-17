@@ -456,7 +456,7 @@ fn f099m_recovery_per_shard() {
             let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
 
             let payload = format!("ext-{eid}-data").into_bytes();
-            let plen = payload.len() as u32;
+            let plen = payload.len() as u64;
             let append = AppendReq {
                 extent_id: eid,
                 eversion: 1,
@@ -503,7 +503,7 @@ fn f099m_recovery_per_shard() {
                 .await
                 .expect("rpc ok on owner");
             assert_eq!(cl.code, autumn_rpc::manager_rpc::CODE_OK);
-            let expected_len = format!("ext-{eid}-data").len() as u32;
+            let expected_len = format!("ext-{eid}-data").len() as u64;
             assert_eq!(
                 cl.length, expected_len,
                 "after restart, owner shard must see persisted data for extent {eid}"

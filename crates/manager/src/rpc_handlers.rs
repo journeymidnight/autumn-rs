@@ -1343,10 +1343,10 @@ impl AutumnManager {
     pub(crate) fn compute_commit_seal(
         members: &[(usize, u64)],
         recovering: &std::collections::HashSet<u64>,
-        responses: &std::collections::HashMap<u64, u32>,
+        responses: &std::collections::HashMap<u64, u64>,
         floor: usize,
-    ) -> std::result::Result<(u32, u32), String> {
-        let mut min_len: Option<u32> = None;
+    ) -> std::result::Result<(u64, u32), String> {
+        let mut min_len: Option<u64> = None;
         let mut avali: u32 = 0;
         let mut committed = 0usize;
         let mut reachable = 0usize;
@@ -1435,7 +1435,7 @@ impl AutumnManager {
                 code: CODE_OK,
                 message: String::new(),
                 stream_info: Some(stream.clone()),
-                end: ex.sealed_length as u32,
+                end: ex.sealed_length,
                 last_ex_info: Some(ex.clone()),
             }));
         }
@@ -1460,7 +1460,7 @@ impl AutumnManager {
             .chain(ex.parity.iter().copied())
             .enumerate()
             .collect();
-        let mut responses: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut responses: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for &(_, node_id) in &members {
             if recovering.contains(&node_id) {
                 continue;
@@ -1689,12 +1689,12 @@ impl AutumnManager {
 
         // Assigned exactly once on every branch below (deferred init — no dead
         // default, no `mut` needed).
-        let min_len: Option<u32>;
+        let min_len: Option<u64>;
         let avali: u32;
         if already_sealed {
             // Preserve the existing seal — do not touch sealed_length,
             // eversion, or avali. The new-tail allocation below proceeds.
-            min_len = Some(tail.sealed_length as u32);
+            min_len = Some(tail.sealed_length);
             avali = tail.avali;
         } else if let Some(c) = req.seal_commit {
             // AUTHORITATIVE: the writer supplied its OWN all-replica-acked
@@ -1734,7 +1734,7 @@ impl AutumnManager {
                 .chain(tail.parity.iter().copied())
                 .enumerate()
                 .collect();
-            let mut responses: std::collections::HashMap<u64, u32> =
+            let mut responses: std::collections::HashMap<u64, u64> =
                 std::collections::HashMap::new();
             for &(_, node_id) in &members {
                 if recovering.contains(&node_id) {
@@ -2968,23 +2968,23 @@ impl AutumnManager {
                     &s,
                     survivor_meta.log_stream,
                     victim_meta.log_stream,
-                    req.log_sealed_lengths[0] as u32,
-                    req.log_sealed_lengths[1] as u32,
+                    req.log_sealed_lengths[0],
+                    req.log_sealed_lengths[1],
                     new_tail.clone(),
                 )?;
                 let (row_dup, row_exts) = Self::splice_streams_without_new_tail(
                     &s,
                     survivor_meta.row_stream,
                     victim_meta.row_stream,
-                    req.row_sealed_lengths[0] as u32,
-                    req.row_sealed_lengths[1] as u32,
+                    req.row_sealed_lengths[0],
+                    req.row_sealed_lengths[1],
                 )?;
                 let (meta_dup, meta_exts) = Self::splice_streams_without_new_tail(
                     &s,
                     survivor_meta.meta_stream,
                     victim_meta.meta_stream,
-                    req.meta_sealed_lengths[0] as u32,
-                    req.meta_sealed_lengths[1] as u32,
+                    req.meta_sealed_lengths[0],
+                    req.meta_sealed_lengths[1],
                 )?;
 
                 // Item 3 (uniform CAS): capture each survivor stream's
@@ -5466,9 +5466,9 @@ mod f227_commit_seal_tests {
         let m = members3();
         let rec = HashSet::new();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20_000_000u32);
-        resp.insert(3u64, 20_000_000u32);
-        resp.insert(5u64, 18_000_000u32);
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
+        resp.insert(5u64, 18_000_000u64);
         let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
         assert_eq!(len, 18_000_000, "seal = min over all committed members");
         assert_eq!(avali, 0b111);
@@ -5484,8 +5484,8 @@ mod f227_commit_seal_tests {
         let m = members3();
         let rec: HashSet<u64> = [5u64].into_iter().collect();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20_000_000u32);
-        resp.insert(3u64, 20_000_000u32);
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
         // node 5 deliberately absent (would have reported a short length).
         let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
         assert_eq!(len, 20_000_000);
@@ -5502,8 +5502,8 @@ mod f227_commit_seal_tests {
         let m = members3();
         let rec = HashSet::new();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20_000_000u32);
-        resp.insert(3u64, 20_000_000u32);
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
         // node 5 committed but silent (unreachable).
         let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
         assert_eq!(
@@ -5523,7 +5523,7 @@ mod f227_commit_seal_tests {
         let m = members3();
         let rec = HashSet::new();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20_000_000u32);
+        resp.insert(1u64, 20_000_000u64);
         // nodes 3 and 5 silent → only 1 reachable < floor 2.
         assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_err());
         // floor 1 is satisfied by the single reachable member.
@@ -5545,8 +5545,8 @@ mod f227_commit_seal_tests {
         let m = members3();
         let rec: HashSet<u64> = [5u64].into_iter().collect();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20u32);
-        resp.insert(3u64, 20u32);
+        resp.insert(1u64, 20u64);
+        resp.insert(3u64, 20u64);
         assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 3).is_err());
         assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_ok());
     }

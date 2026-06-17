@@ -797,7 +797,7 @@ pub(crate) async fn background_gc_loop(
                             continue;
                         }
                     };
-                    let sealed_length = info.sealed_length as u32;
+                    let sealed_length = info.sealed_length;
                     if sealed_length == 0 {
                         // F201: empty sealed extent — no live data to
                         // rewrite, just punch. `run_gc` with
@@ -815,7 +815,7 @@ pub(crate) async fn background_gc_loop(
                         continue;
                     }
                     if let Some(mx) = params.max_size {
-                        if (sealed_length as u64) > mx {
+                        if sealed_length > mx {
                             continue;
                         }
                     }
@@ -881,7 +881,7 @@ pub(crate) async fn background_gc_loop(
         // hold through the punch and clear at the bottom.
         for eid in holes {
             let sealed_length = match part_sc.get_extent_info(eid).await {
-                Ok(info) => info.sealed_length as u32,
+                Ok(info) => info.sealed_length,
                 Err(e) => {
                     tracing::warn!("GC extent_info {eid}: {e}");
                     continue;
@@ -1262,12 +1262,12 @@ pub(crate) async fn finish_write_batch(
         // `responders`. The iterator is fully consumed inside insert_batch,
         // so the side effects all happen under the (single) write lock.
         let valid = bd.valid;
-        let mut cumulative: u32 = 0;
+        let mut cumulative: u64 = 0;
         let mut idx: usize = 0;
         let responders_ref = &mut responders;
         let iter = valid.into_iter().filter_map(move |entry| {
             let record_offset = base_offset + cumulative;
-            cumulative += record_sizes[idx];
+            cumulative += record_sizes[idx] as u64;
             idx += 1;
 
             // BUG-LEASE-2 Phase 2: fence-bump records are WAL-only — the
@@ -1299,8 +1299,8 @@ pub(crate) async fn finish_write_batch(
                 // value content end-to-end with V1 records.
                 let vp = ValuePointer {
                     extent_id: extent_id_for_vp,
-                    offset: record_offset + 22 + entry.internal_key.len() as u32,
-                    len: entry.value.len() as u32,
+                    offset: record_offset + 22 + entry.internal_key.len() as u64,
+                    len: entry.value.len() as u64,
                 };
                 MemEntry {
                     op: entry.op | OP_VALUE_POINTER,
@@ -1636,7 +1636,7 @@ pub(crate) async fn do_compact(
     }
 
     let input_tables = tbls.len();
-    let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
+    let compact_keys: HashSet<(u64, u64)> = tbls.iter().map(|t| t.loc()).collect();
 
     let (
         readers,
@@ -2041,7 +2041,7 @@ pub(crate) async fn do_compact(
 
 pub(crate) fn remove_compacted_tables(
     part: &mut PartitionData,
-    compact_keys: &HashSet<(u64, u32)>,
+    compact_keys: &HashSet<(u64, u64)>,
 ) {
     let mut i = 0;
     while i < part.tables.len() {
@@ -2296,8 +2296,8 @@ async fn flush_gc_batch(
         // `finish_write_batch` for the full layout discussion.
         let new_vp = ValuePointer {
             extent_id: result.extent_id,
-            offset: cur_offset + 22 + r.internal_key.len() as u32,
-            len: r.value_len,
+            offset: cur_offset + 22 + r.internal_key.len() as u64,
+            len: r.value_len as u64,
         };
         let mem_entry = MemEntry {
             op: 1 | OP_VALUE_POINTER,
@@ -2306,7 +2306,7 @@ async fn flush_gc_batch(
         };
         let write_size = (r.user_key.len() + r.value_len as usize + 32) as u64;
         insert_items.push((r.internal_key, mem_entry, write_size));
-        cur_offset = cur_offset.saturating_add(r.record_size);
+        cur_offset = cur_offset.saturating_add(r.record_size as u64);
     }
 
     {
@@ -2356,7 +2356,7 @@ fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw
 pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
-    sealed_length: u32,
+    sealed_length: u64,
 ) -> Result<()> {
     let (log_stream_id, rg, part_sc, rate_ctrl) = {
         let p = part.borrow();
@@ -2391,19 +2391,19 @@ pub(crate) async fn run_gc(
 
     let chunk_bytes = gc_read_chunk_bytes();
     let mut moved = 0usize;
-    let mut cur: u32 = 0;
+    let mut cur: u64 = 0;
     let mut carry: Vec<u8> = Vec::new();
     let mut batch = GcWriteBatch::new();
     let mut rate_limiter = GcRateLimiter::new();
 
     while cur < sealed_length {
-        let want = (sealed_length - cur).min(chunk_bytes);
+        let want = (sealed_length - cur).min(chunk_bytes as u64);
         let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
         if chunk.is_empty() {
             break;
         }
         let chunk_len = chunk.len() as u64;
-        cur = cur.saturating_add(chunk.len() as u32);
+        cur = cur.saturating_add(chunk.len() as u64);
 
         let buf: Vec<u8> = if carry.is_empty() {
             chunk
@@ -2989,8 +2989,8 @@ pub(crate) async fn resolve_value(
     op: u8,
     raw_value: Bytes,
     stream_client: &Rc<StreamClient>,
-    offset: u32,
-    length: u32,
+    offset: u64,
+    length: u64,
 ) -> Result<Bytes> {
     if op & OP_VALUE_POINTER != 0 {
         if raw_value.len() < VALUE_POINTER_SIZE {
@@ -3024,8 +3024,8 @@ pub(crate) async fn resolve_value(
 pub(crate) async fn read_value_from_log(
     vp: &ValuePointer,
     stream_client: &Rc<StreamClient>,
-    offset: u32,
-    length: u32,
+    offset: u64,
+    length: u64,
 ) -> Result<Bytes> {
     let (read_off, read_len) = if offset == 0 && length == 0 {
         (vp.offset, vp.len)
@@ -3063,7 +3063,7 @@ pub(crate) async fn read_value_from_log(
     let (data, _) = stream_client
         .read_bytes_from_extent(vp.extent_id, read_off, read_len)
         .await?;
-    if (data.len() as u32) < read_len {
+    if (data.len() as u64) < read_len {
         return Err(anyhow!(
             "logStream value short: need {} bytes, got {}, extent={}, offset={}",
             read_len,

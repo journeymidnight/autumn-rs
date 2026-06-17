@@ -71,7 +71,7 @@ impl TestConn {
         &self,
         extent_id: u64,
         eversion: u64,
-        commit: u32,
+        commit: u64,
         owner_epoch: i64,
         payload: Vec<u8>,
     ) -> AppendResp {
@@ -121,8 +121,8 @@ impl TestConn {
         &self,
         extent_id: u64,
         eversion: u64,
-        offset: u32,
-        length: u32,
+        offset: u64,
+        length: u64,
     ) -> ReadBytesResp {
         let req = ReadBytesReq {
             extent_id,

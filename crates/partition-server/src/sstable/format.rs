@@ -70,7 +70,7 @@ pub struct MetaBlock {
     pub estimated_size: u64,
     pub seq_num: u64,
     pub vp_extent_id: u64,
-    pub vp_offset: u32,
+    pub vp_offset: u64,
     /// Distinct old log extents still referenced by live ValuePointer
     /// entries in this SST.
     pub vp_deps: Vec<u64>,
@@ -171,7 +171,7 @@ impl MetaBlock {
         let estimated_size = read_u64(payload, &mut c)?;
         let seq_num = read_u64(payload, &mut c)?;
         let vp_extent_id = read_u64(payload, &mut c)?;
-        let vp_offset = read_u32(payload, &mut c)?;
+        let vp_offset = read_u64(payload, &mut c)?;
         let vp_dep_count = read_u32(payload, &mut c)? as usize;
         let mut vp_deps = Vec::with_capacity(vp_dep_count);
         for _ in 0..vp_dep_count {

@@ -2716,7 +2716,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         state: &autumn_common::MetadataState,
         src_stream_id: u64,
         dst_stream_id: u64,
-        sealed_length: u32,
+        sealed_length: u64,
     ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
         let src = state
             .streams
@@ -2749,7 +2749,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // stream alloc a fresh tail on init instead of sharing this one.
             if idx == src.extent_ids.len() - 1 && !ex.sealed {
                 ex.sealed = true;
-                ex.sealed_length = sealed_length as u64;
+                ex.sealed_length = sealed_length;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
                 // BUG2 trace (opt-in): split CoW-tail seal. A `sealed_length=0`
                 // here freezes a shared tail that may hold VP/SST-acked data →
@@ -2789,8 +2789,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         state: &autumn_common::MetadataState,
         survivor_stream_id: u64,
         victim_stream_id: u64,
-        survivor_sealed: u32,
-        victim_sealed: u32,
+        survivor_sealed: u64,
+        victim_sealed: u64,
         new_tail: MgrExtentInfo,
     ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
         let survivor = state
@@ -2819,7 +2819,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // way so the seal persists.
             if !ex.sealed {
                 ex.sealed = true;
-                ex.sealed_length = survivor_sealed as u64;
+                ex.sealed_length = survivor_sealed;
                 ex.eversion += 1;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
                 modified_extents.push(ex);
@@ -2840,7 +2840,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // (coco P1, CoW isolation).
             if idx == victim.extent_ids.len() - 1 && !ex.sealed {
                 ex.sealed = true;
-                ex.sealed_length = victim_sealed as u64;
+                ex.sealed_length = victim_sealed;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
             modified_extents.push(ex);
@@ -2872,8 +2872,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         state: &autumn_common::MetadataState,
         survivor_stream_id: u64,
         victim_stream_id: u64,
-        survivor_sealed: u32,
-        victim_sealed: u32,
+        survivor_sealed: u64,
+        victim_sealed: u64,
     ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
         let survivor = state
             .streams
@@ -2899,7 +2899,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // way so the seal persists.
             if !ex.sealed {
                 ex.sealed = true;
-                ex.sealed_length = survivor_sealed as u64;
+                ex.sealed_length = survivor_sealed;
                 ex.eversion += 1;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
                 modified_extents.push(ex);
@@ -2918,7 +2918,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // (coco P1, CoW isolation).
             if idx == victim.extent_ids.len() - 1 && !ex.sealed {
                 ex.sealed = true;
-                ex.sealed_length = victim_sealed as u64;
+                ex.sealed_length = victim_sealed;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
             modified_extents.push(ex);
@@ -3226,7 +3226,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         addr: &str,
         extent_id: u64,
         owner_epoch: i64,
-    ) -> Result<u32, AppError> {
+    ) -> Result<u64, AppError> {
         debug_assert!(
             owner_epoch > 0,
             "commit_length_on_node requires owner_epoch > 0; use probe_extent_on_node for fence-free probes"
@@ -3274,7 +3274,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         &self,
         addr: &str,
         extent_id: u64,
-    ) -> Result<u32, AppError> {
+    ) -> Result<u64, AppError> {
         let base = Self::normalize_endpoint(addr);
         let shard_ports = self.shard_ports_for_addr(&base);
         let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);

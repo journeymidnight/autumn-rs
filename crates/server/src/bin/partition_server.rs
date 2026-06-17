@@ -48,6 +48,10 @@ struct Args {
     ps_flush_inflight_cap: Option<usize>,
     max_imm_depth: Option<usize>,
     max_wal_gap: Option<u64>,
+    /// Per-extent seal threshold (bytes). `None` = library default (16 GiB).
+    /// Clamped to [1 GiB, 64 GiB]. Bigger = fewer extents = less manager/etcd
+    /// metadata pressure at scale (enabled by the u64-offset widening).
+    max_extent_size_bytes: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
     gc_parallelism: Option<usize>,
@@ -117,6 +121,7 @@ fn parse_args() -> Args {
     let mut ps_flush_inflight_cap: Option<usize> = None;
     let mut max_imm_depth: Option<usize> = None;
     let mut max_wal_gap: Option<u64> = None;
+    let mut max_extent_size_bytes: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
     let mut gc_parallelism: Option<usize> = None;
@@ -229,6 +234,11 @@ fn parse_args() -> Args {
             "--max-wal-gap" => {
                 i += 1;
                 max_wal_gap = Some(args[i].parse().expect("--max-wal-gap u64 bytes"));
+            }
+            "--max-extent-size-bytes" => {
+                i += 1;
+                max_extent_size_bytes =
+                    Some(args[i].parse().expect("--max-extent-size-bytes u64 bytes"));
             }
             "--shutdown-timeout-ms" => {
                 i += 1;
@@ -399,6 +409,9 @@ fn parse_args() -> Args {
                 eprintln!("  --read-hedge-ms <MS> F258: hedge delay for replicated sealed-extent");
                 eprintln!("                       reads; 0/default = hedging off (replica");
                 eprintln!("                       rotation is always on)");
+                eprintln!("  --max-extent-size-bytes <N>  Per-extent seal threshold");
+                eprintln!("                       [default: 16 GiB, clamp 1-64 GiB]. Bigger =");
+                eprintln!("                       fewer extents = less manager metadata pressure.");
                 eprintln!(
                     "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
                 );
@@ -451,6 +464,7 @@ fn parse_args() -> Args {
         ps_flush_inflight_cap,
         max_imm_depth,
         max_wal_gap,
+        max_extent_size_bytes,
         shutdown_timeout_ms,
         major_compact_parallelism,
         gc_parallelism,
@@ -508,6 +522,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.max_wal_gap {
         ps::set_max_wal_gap(n);
+    }
+    if let Some(n) = args.max_extent_size_bytes {
+        ps::set_max_extent_size_bytes(n);
     }
     if let Some(n) = args.shutdown_timeout_ms {
         ps::set_shutdown_timeout_ms(n);

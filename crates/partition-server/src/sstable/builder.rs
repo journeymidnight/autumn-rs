@@ -40,7 +40,7 @@ pub struct SstBuilder {
     // Metadata
     seq_num: u64,
     vp_extent_id: u64,
-    vp_offset: u32,
+    vp_offset: u64,
     smallest_key: Vec<u8>,
     biggest_key: Vec<u8>,
     total_raw_bytes: u64,
@@ -53,7 +53,7 @@ pub struct SstBuilder {
 }
 
 impl SstBuilder {
-    pub fn new(vp_extent_id: u64, vp_offset: u32) -> Self {
+    pub fn new(vp_extent_id: u64, vp_offset: u64) -> Self {
         // 1% FPR with a generous initial capacity; bloom will grow dynamically
         SstBuilder {
             blocks: Vec::new(),

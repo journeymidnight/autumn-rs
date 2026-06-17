@@ -24,8 +24,8 @@ pub enum SstSource {
     /// (index/bloom/extremes) stays in memory (~KBs vs ~128 MB).
     Paged {
         extent_id: u64,
-        base_in_extent: u32,
-        len_in_extent: u32,
+        base_in_extent: u64,
+        len_in_extent: u64,
     },
 }
 
@@ -42,13 +42,13 @@ pub struct SstReader {
     pub biggest_key: Vec<u8>,
     seq_num: u64,
     pub vp_extent_id: u64,
-    pub vp_offset: u32,
+    pub vp_offset: u64,
     pub vp_deps: Vec<u64>,
     estimated_size: u64,
     pub discards: HashMap<u64, i64>,
     /// Earliest non-zero expires_at across all entries (0 = no expiring keys).
     pub min_expires_at: u64,
-    sst_base: u32,
+    sst_base: u64,
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
     /// Mutex (not RefCell) so SstReader is Sync and can be shared across
     /// P-log/P-bulk via Arc without the unsafe Rc→Arc transmute that the
@@ -66,7 +66,7 @@ impl SstReader {
     }
 
     /// Open an SSTable starting at `sst_base` within a larger buffer.
-    pub fn open_at(data: Bytes, sst_base: u32) -> Result<Self> {
+    pub fn open_at(data: Bytes, sst_base: u64) -> Result<Self> {
         let base = sst_base as usize;
         if data.len() < base + 8 {
             return Err(anyhow!("SSTable too short at base={sst_base}"));
@@ -77,7 +77,7 @@ impl SstReader {
 
     /// Open from a slice: data[sst_base..sst_base+sst_len].
     #[allow(dead_code)]
-    pub fn open_slice(data: Bytes, sst_base: u32, sst_len: u32) -> Result<Self> {
+    pub fn open_slice(data: Bytes, sst_base: u64, sst_len: u64) -> Result<Self> {
         let base = sst_base as usize;
         let end = base + sst_len as usize;
         if end > data.len() {
@@ -97,8 +97,8 @@ impl SstReader {
     pub fn open_paged_from_meta(
         meta_bytes: &[u8],
         extent_id: u64,
-        base_in_extent: u32,
-        len_in_extent: u32,
+        base_in_extent: u64,
+        len_in_extent: u64,
     ) -> Result<Self> {
         let meta = MetaBlock::decode(meta_bytes)?;
         let bloom = if meta.bloom_data.is_empty() {
@@ -160,7 +160,7 @@ impl SstReader {
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,
-            sst_base: sst_base as u32,
+            sst_base: sst_base as u64,
             block_cache: Mutex::new(vec![None; num_blocks]),
             source: SstSource::Resident(data),
         })
@@ -248,7 +248,7 @@ impl SstReader {
     /// `read_block_via`. `base_in_extent` is where this SST starts inside
     /// `extent_id` on row_stream (`TableMeta.offset`), `len_in_extent` its
     /// byte length (`TableMeta.len`).
-    pub fn into_paged(mut self, extent_id: u64, base_in_extent: u32, len_in_extent: u32) -> Self {
+    pub fn into_paged(mut self, extent_id: u64, base_in_extent: u64, len_in_extent: u64) -> Self {
         self.source = SstSource::Paged {
             extent_id,
             base_in_extent,
@@ -265,7 +265,7 @@ impl SstReader {
     }
 
     /// F261: `(extent_id, base, len)` when paged.
-    pub fn paged_loc(&self) -> Option<(u64, u32, u32)> {
+    pub fn paged_loc(&self) -> Option<(u64, u64, u64)> {
         match self.source {
             SstSource::Paged {
                 extent_id,
@@ -310,7 +310,7 @@ impl SstReader {
         let in_bounds = bo
             .relative_offset
             .checked_add(bo.block_len)
-            .and_then(|e| self.sst_base.checked_add(e))
+            .and_then(|e| self.sst_base.checked_add(e as u64))
             .is_some_and(|end| end <= len_in_extent);
         if !in_bounds {
             return Err(anyhow!(
@@ -324,14 +324,14 @@ impl SstReader {
         }
         let abs = base
             .checked_add(self.sst_base)
-            .and_then(|v| v.checked_add(bo.relative_offset))
-            .ok_or_else(|| anyhow!("paged block {idx}: absolute offset overflows u32"))?;
+            .and_then(|v| v.checked_add(bo.relative_offset as u64))
+            .ok_or_else(|| anyhow!("paged block {idx}: absolute offset overflows u64"))?;
         let key = (extent_id, abs);
         if let Some(b) = cache.get(key) {
             return Ok(b);
         }
         let (raw, _end) = sc
-            .read_bytes_from_extent(extent_id, abs, bo.block_len)
+            .read_bytes_from_extent(extent_id, abs, bo.block_len as u64)
             .await?;
         if raw.len() < bo.block_len as usize {
             return Err(anyhow!(
@@ -428,7 +428,7 @@ impl SstReader {
                 // MetaBlock must not read a neighbour SST's bytes.
                 let in_bounds = self
                     .sst_base
-                    .checked_add(end_rel)
+                    .checked_add(end_rel as u64)
                     .is_some_and(|e| e <= *len_in_extent);
                 if !in_bounds {
                     return Err(anyhow!(
@@ -442,10 +442,10 @@ impl SstReader {
                 }
                 let abs = base_in_extent
                     .checked_add(self.sst_base)
-                    .and_then(|v| v.checked_add(win_start_rel))
-                    .ok_or_else(|| anyhow!("window absolute offset overflows u32"))?;
+                    .and_then(|v| v.checked_add(win_start_rel as u64))
+                    .ok_or_else(|| anyhow!("window absolute offset overflows u64"))?;
                 let (raw, _end) = sc
-                    .read_bytes_from_extent(*extent_id, abs, win_len)
+                    .read_bytes_from_extent(*extent_id, abs, win_len as u64)
                     .await?;
                 if raw.len() != win_len as usize {
                     return Err(anyhow!(
@@ -587,7 +587,8 @@ mod f262_window_tests {
         .unwrap();
         assert_eq!(end, 3.min(n));
         let win = data.slice(
-            (r.sst_base + start_rel) as usize..(r.sst_base + start_rel + len) as usize,
+            r.sst_base as usize + start_rel as usize
+                ..r.sst_base as usize + start_rel as usize + len as usize,
         );
         for idx in 1..end {
             let from_win = r.decode_block_from_window(&win, start_rel, idx).unwrap();
