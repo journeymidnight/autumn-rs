@@ -1,33 +1,48 @@
 Date: 2026-06-17
 TaskStatus: completed
-Task scope: 分块 EC encode + 流式 peer-copy(EC-CHUNKED-CONVERT)。
-  让 16–32 GiB extent 在 EC 下安全:消除 EC convert 的内存峰值(~2× extent)和
-  whole-shard WriteShard 超 frame `payload_len: u32`(4 GiB)上限两个问题。
-  (承接上一任务 u64 offset 拓宽 + max_extent_size 16 GiB,用户追加 "do chunked ec encode and peer copy"。)
+Task scope: 修复分区 merge 泄漏 extent refs 的 bug(MERGE-REFS-LEAK),并提供现网审计工具。
+  起因:用户排查 "EC extent 10 删不掉且 autumn-op info 里看不到"。定位为 merge 路径
+  refs 记账不对称导致的不可见、不可回收孤儿 extent。
 Current summary:
-  - `erasure::ec_encode_stripe`:RS over GF(256) 按 offset 逐字节 → stripe 可独立编码;字节级等价整 extent
-    `ec_encode` 的对应切片(`ec_encode_stripe_matches_whole` 单测证明)→ on-disk shard 布局不变,读路径零改。
-  - `handle_convert_to_ec` 改 stripe loop:逐 stripe 读 K 个 data 子区间(尾零填充)→ 编码 M parity →
-    远端 shard 先发、coordinator shard 0 最后写。峰值 = (K+M)×EC_ENCODE_STRIPE_BYTES(默认 64 MiB → ~256 MiB)。
-  - `WriteShardReq.shard_offset: u64`(WIRE v5→v6,header 36→44):远端按 offset pwrite + per-stripe sync_data;
-    顺序 await-ack 让 durable 前缀单调;coordinator-自己-最后 保留 "coord staging 满 ⇒ 全员 durable staged" 不变量。
-    2PC + EC-COMMIT-ATOMIC #5 marker 不变。
-  - 流式 peer-copy `peer_copy_full_extent_to_dat`:short 时流式拉进临时文件,完整 + fsync 后才原子 rename 覆盖 .dat
-    (coco P1:绝不先 set_len(0) live replica)。删整 Vec 缓冲的 `fetch_full_extent_from_sources`。
-  - coco P1 #2:`write_shard_stripe_local` 加边界 `shard_offset + stripe_len <= sealed_length`(防 sparse 撑爆 + commit 污染)。
-  验收:
-  - cargo build --workspace 绿;rpc 30 / stream 全单测(含 erasure 17 / f119-d / f153 / ec_2pc / merge_ec_replay)/
-    manager lib 163 全绿;新增 stripe==whole 字节级单测。
-  - coco deep:2 项 P1 全修(peer-copy 临时文件原子替换 + 边界校验)。
-  - **live e2e(隔离 4-EN, AUTUMN_EXTENT_EC_STRIPE_BYTES=2MiB 强制多 stripe,不碰 /data02):** put-stream 1.25 GiB
-    → log_stream 在 1 GiB seal → force-ec-convert 走分块 prepare(EN 日志 "(chunked)")→ shard 实测 357,919,062 字节
-    (≈sealed/3,~170 stripes)→ get-stream sha256 **MATCH**(1,342,177,280 字节);open tail 仍复制态。
-  注:F203 后 set-stream-ec 只设策略 + 出 advisory,实际转换走 OP 驱动的 force-ec-convert(e2e 已据此修正)。
-    max_extent_size clamp 下限 1 GiB(seal 需写 > 1 GiB)。
+  - 根因:`compute_merge_streams` / `splice_streams_without_new_tail`(manager/src/lib.rs)
+    对每个 victim extent 无条件 `refs += 1`,而 `apply_merge_mutations` 删除 victim 的 3 个
+    stream 却无对应 `refs -= 1` → 每次 merge 每个 victim extent 泄漏 +1;CoW 共享 extent 还会
+    在 survivor extent_ids 里被重复列举。多轮 split→merge→GC 后 membership 归 0、refs 卡正数
+    → extent_can_delete(refs==0 && vp_table_refs==0)永不成立 → 永久泄漏 + info 不可见
+    (info/handle_stream_info 只渲染 stream 成员 extent)。
+  - 修复:merge 对 victim extent 的 refs 改为成员关系中性 —— 共享则 refs-=1 且 extent_ids
+    去重不重列;独有则 refs 不变(转移)。splice 顺序与 vp_head replay 不变量保持不变。
+  - 测试:修正 2 个把 bug 当预期的旧单测(f181 merge/splice:refs 应为 1,原断言 2);
+    新增 2 个 CoW 共享回归(f_merge_refs_leak_*)。manager lib 165 全绿;cargo build --workspace 绿。
+  - 审计工具 python/audit_extent_refs.py:etcdctl + autumn-op --json info 交叉核对,报告孤儿/
+    refs 不匹配/重复列举(现网准确复现:孤儿 10 与 47、refs+1 的 12/20/33/46、stream 29 重复列 20)。
+现网处置(已执行):
+  - major-compact partition 15/31/42:vp_table_refs(10) 5→3(part 31 的引用被压实丢弃);并暴露出更多
+    历史泄漏 —— compaction 把 +1 泄漏的 extent(12/20/26/46)从 stream 截走后,因 refs 卡正数没被回收,
+    转成孤儿(印证 bug 危害:截出 stream 却减不到 0)。
+  - 按 vp_table_refs 分类 6 个孤儿:extent 10 = LIVE(part 15&42 的活 key 值就在里面,vp_table_refs=3,
+    EC 4 盘,必须保留);extent 12/20/26/46/47 = DEAD(0 stream + 0 vp 引用,3 副本)。
+  - 回收 5 个 DEAD 孤儿:删 etcd extents/{12,20,26,46,47} + unlink 30 个文件(.dat+.meta,3 盘各份)。
+    etcd extent 数 22→17;审计复跑确认 5 个已消失。
+  - 可观测性修复 + 部署:`handle_stream_info` 全量 dump 现包含非成员 extent;`autumn-op info` 增
+    `refs=N (streams=M)` / `vp_table_refs` / `(ORPHAN…)` / `(refs-leak)` 标签。cargo build --release -p
+    autumn-server → `cluster.sh restart-manager`(replay 收敛 stale 内存)。验证:`info` 现在能看到
+    extent 10(标记 ORPHAN, retained by vp_table_refs — live data, refs=2 streams=0 vp_table_refs=3);
+    manager lib 165 单测仍全绿。
+  - 残留 refs 泄漏修复:`python/patch_extent_refs.py`(etcd v3 REST gateway,base64 二进制安全;按
+    root=len-88、refs@root+32 定位 + 校验 + 备份 + readback)。停 manager → patch extent 10 refs 2→0、
+    extent 33 refs 2→1 → 起 manager。审计增强:用 info JSON 的 vp_table_refs 把孤儿分为 DEAD(可回收泄漏)
+    与 RETAINED(活数据,正常)。
+  - 终态:审计 exit=0,"every extent's refs matches its live stream membership";extent 10 = retained
+    orphan(streams=0, vp_table_refs=3, refs=0 准确),info 可见并标注 live data;manager 内存已随重启收敛。
 Main gaps:
-  - 无(代码 + 单测 + coco + live e2e 全绿)。
-  - 真 >12 GiB EC extent(shard > 4 GiB,frame 溢出的极端)未单独 live 复现(代价高);但 frame 上限由分块结构性消除,
-    且 stripe==whole 字节等价 + 1 GiB/170-stripe e2e 已覆盖分块正确性。
-Commits: 待 commit + push 到 main(承接 u64 commit 8c7d2df 之后)。
+  - 无功能/一致性缺口。extent 10 仍是孤儿但属正确的"活数据保留"(vp_table_refs=3);其 key 将来失效 +
+    compaction 后 vp_table_refs→0 会变 DEAD,届时用 python/reclaim 流程回收(无自动触发器,因它不在任何 stream)。
+设计文档:docs/value_stream_design.md(对齐 WAS:log_stream 退化纯 WAL + 大 value 进独立
+  value_stream,单一生命周期 vp_table_refs,回收折进 compaction + vp 侧删除触发,退役独立 GC loop;
+  分 Phase 0 止血 / 1 写路径 / 2 回收折叠 / 3 迁移)。feature_list.md 加 VALUE-STREAM 条目(DESIGN ONLY)。
+Commits: 已提交 + push 到 main(solo-flow):merge refs 修复 + 单测 + 可观测性(handle_stream_info / autumn-op info)
+  + python 审计/修复工具 + value_stream 设计文档 + 文档更新。
 Next steps:
-  - commit + push 到 main(solo-flow 直推)。
+  - 排期 VALUE-STREAM:先落 Phase 0(vp 侧删除触发 + 兜底 sweep,止血 + 终态删除原语)。
+  - 可选:对 merge 修复补跑 coco / code-review。

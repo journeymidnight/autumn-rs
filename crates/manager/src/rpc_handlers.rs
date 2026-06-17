@@ -1163,7 +1163,8 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let s = self.store.inner.borrow();
 
-        let ids = if req.stream_ids.is_empty() {
+        let full_dump = req.stream_ids.is_empty();
+        let ids = if full_dump {
             s.streams.keys().copied().collect::<Vec<_>>()
         } else {
             req.stream_ids
@@ -1171,14 +1172,35 @@ impl AutumnManager {
 
         let mut streams = Vec::new();
         let mut extents = Vec::new();
+        let mut member_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         for id in ids {
             if let Some(st) = s.streams.get(&id) {
                 streams.push((id, st.clone()));
                 for extent_id in &st.extent_ids {
+                    member_ids.insert(*extent_id);
                     if let Some(e) = s.extents.get(extent_id) {
                         extents.push((*extent_id, e.clone()));
                     }
+                }
+            }
+        }
+
+        // Observability: on a full cluster dump (`stream_ids` empty), also
+        // surface extents that exist in the store but are referenced by NO
+        // stream's `extent_ids` — orphan / non-member extents. These are
+        // INVISIBLE pre-this-change because the loop above only walks stream
+        // membership: a log extent GC-punched out of its stream but still
+        // retained by `vp_table_refs` (live-SST ValuePointers — real data
+        // being served) AND a leaked-refs orphan both fall here. Hiding them
+        // hid live data + un-reclaimable leaks from `autumn-op info`. Targeted
+        // stream_ids queries (hot path, client.rs) keep the membership-only
+        // behaviour. `vp_table_refs` is on the wire (MgrExtentInfo) so the CLI
+        // can show WHY a non-member extent is retained.
+        if full_dump {
+            for (eid, e) in s.extents.iter() {
+                if !member_ids.contains(eid) {
+                    extents.push((*eid, e.clone()));
                 }
             }
         }

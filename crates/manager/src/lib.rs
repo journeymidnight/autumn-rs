@@ -2775,7 +2775,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// Order invariant (load-bearing):
     ///   updated.extent_ids = [survivor.existing] + [victim.existing] + [new_tail]
     ///
-    /// Refs++ on every victim extent (CoW transfer). Sealing rules:
+    /// Refs are membership-neutral on victim extents (transfer victim→survivor;
+    /// CoW-shared ⇒ refs-=1 + dedup — see compute_merge_streams). Sealing rules:
     ///   - survivor's old tail (last existing extent) sealed at `survivor_sealed`
     ///     if it was open
     ///   - victim's old tail (last victim extent) sealed at `victim_sealed`
@@ -2826,18 +2827,39 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             }
         }
 
-        // Refs++ on every victim extent + seal victim's tail at victim_sealed.
+        // F-merge-refs-leak: refs is MEMBERSHIP-NEUTRAL for victim extents
+        // (refs == # of streams whose extent_ids list the extent). A victim
+        // extent is one of:
+        //   * CoW-shared (also in the survivor, from a prior split→merge-back):
+        //     the merge collapses the two memberships {survivor, victim} into
+        //     one {survivor}, so refs -= 1 AND the extent is NOT re-listed
+        //     (dedup below). Re-listing would put it twice in the survivor's
+        //     extent_ids, and a later GC `punch_holes` (whose `retain` drops
+        //     ALL occurrences but decrements refs by only 1) could never
+        //     reconcile it.
+        //   * victim-only: its membership simply transfers victim→survivor, so
+        //     refs is UNCHANGED (the +1 for the survivor splice cancels the -1
+        //     for the deleted victim stream).
+        // Pre-fix this did an unconditional `ex.refs += 1` while
+        // apply_merge_mutations deleted the victim stream WITHOUT a
+        // compensating decrement → +1 leak per victim extent per merge,
+        // producing invisible un-reclaimable orphan extents (refs>0, listed in
+        // 0 live streams; `autumn-op info` renders only stream-member extents).
+        let survivor_set: HashSet<u64> = survivor.extent_ids.iter().copied().collect();
         for (idx, &eid) in victim.extent_ids.iter().enumerate() {
             let extent = state
                 .extents
                 .get(&eid)
                 .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
             let mut ex = extent.clone();
-            ex.refs += 1;
+            if survivor_set.contains(&eid) {
+                ex.refs = ex.refs.saturating_sub(1);
+            }
             ex.eversion += 1;
             // Seal the victim's old tail even at 0 (empty) — CoW-shared after
             // the merge splices it onto the survivor, so it must be frozen
-            // (coco P1, CoW isolation).
+            // (coco P1, CoW isolation). The tail is a post-split unique extent,
+            // never in `survivor_set`, so this never collides with the dedup.
             if idx == victim.extent_ids.len() - 1 && !ex.sealed {
                 ex.sealed = true;
                 ex.sealed_length = victim_sealed;
@@ -2846,9 +2868,18 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             modified_extents.push(ex);
         }
 
-        // Splice extent_ids: [survivor.existing] + [victim.existing] + [new_tail].
+        // Splice extent_ids: [survivor.existing] + [victim.existing NOT already
+        // in survivor] + [new_tail]. The dedup keeps each extent listed once;
+        // shared extents stay in their survivor (front) position, preserving
+        // the load-bearing vp_head replay order.
         let mut new_extent_ids = survivor.extent_ids.clone();
-        new_extent_ids.extend(victim.extent_ids.iter().copied());
+        new_extent_ids.extend(
+            victim
+                .extent_ids
+                .iter()
+                .copied()
+                .filter(|e| !survivor_set.contains(e)),
+        );
         new_extent_ids.push(new_tail.extent_id);
 
         let updated = MgrStreamInfo {
@@ -2905,17 +2936,25 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 modified_extents.push(ex);
             }
         }
+        // F-merge-refs-leak: refs is MEMBERSHIP-NEUTRAL for victim extents —
+        // shared (also in survivor) ⇒ refs -= 1 + dedup; victim-only ⇒ refs
+        // unchanged (transfer). See compute_merge_streams for the full
+        // rationale; same leak/fix, just without a fresh tail.
+        let survivor_set: HashSet<u64> = survivor.extent_ids.iter().copied().collect();
         for (idx, &eid) in victim.extent_ids.iter().enumerate() {
             let extent = state
                 .extents
                 .get(&eid)
                 .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
             let mut ex = extent.clone();
-            ex.refs += 1;
+            if survivor_set.contains(&eid) {
+                ex.refs = ex.refs.saturating_sub(1);
+            }
             ex.eversion += 1;
             // Seal the victim's old tail even at 0 (empty) — CoW-shared after
             // the merge splices it onto the survivor, so it must be frozen
-            // (coco P1, CoW isolation).
+            // (coco P1, CoW isolation). The tail is a post-split unique extent,
+            // never in `survivor_set`, so this never collides with the dedup.
             if idx == victim.extent_ids.len() - 1 && !ex.sealed {
                 ex.sealed = true;
                 ex.sealed_length = victim_sealed;
@@ -2924,7 +2963,13 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             modified_extents.push(ex);
         }
         let mut new_extent_ids = survivor.extent_ids.clone();
-        new_extent_ids.extend(victim.extent_ids.iter().copied());
+        new_extent_ids.extend(
+            victim
+                .extent_ids
+                .iter()
+                .copied()
+                .filter(|e| !survivor_set.contains(e)),
+        );
         Ok((
             MgrStreamInfo {
                 stream_id: survivor.stream_id,
@@ -3945,12 +3990,15 @@ mod tests {
             "non-tail survivor extent unchanged → not in modified"
         );
 
+        // F-merge-refs-leak: victim-only extents transfer victim→survivor, so
+        // after the merge they are in exactly ONE stream → refs stays 1 (was
+        // asserted as 2, which baked in the +1 leak that orphaned extents).
         let e20 = modified.iter().find(|e| e.extent_id == 20).unwrap();
-        assert_eq!(e20.refs, 2);
+        assert_eq!(e20.refs, 1);
         assert_eq!(e20.sealed_length, 2048);
 
         let e21 = modified.iter().find(|e| e.extent_id == 21).unwrap();
-        assert_eq!(e21.refs, 2);
+        assert_eq!(e21.refs, 1);
         assert_eq!(e21.sealed_length, 8192);
 
         let e99 = modified.iter().find(|e| e.extent_id == 99).unwrap();
@@ -4000,9 +4048,140 @@ mod tests {
         let (updated, modified) =
             AutumnManager::splice_streams_without_new_tail(&state, 300, 400, 100, 200).unwrap();
         assert_eq!(updated.extent_ids, vec![30, 40]);
+        // F-merge-refs-leak: victim-only extent transfers victim→survivor →
+        // refs stays 1 (was asserted as 2 = the leak).
         let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
-        assert_eq!(e40.refs, 2);
+        assert_eq!(e40.refs, 1);
         assert_eq!(e40.sealed_length, 200);
+    }
+
+    /// F-merge-refs-leak regression: merging back a split (survivor + victim
+    /// CoW-share the pre-split extents) must NOT leak refs and must NOT list a
+    /// shared extent twice. Pre-fix the shared extent got refs += 1 AND a
+    /// duplicate entry in extent_ids; over repeated split→merge cycles it drove
+    /// extents to refs>0 with zero stream membership (invisible orphans).
+    #[test]
+    fn f_merge_refs_leak_cow_shared_extent_dedup_and_refs() {
+        let mut state = autumn_common::MetadataState::default();
+        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+            extent_id: id,
+            replicates: vec![1],
+            parity: vec![],
+            replicate_disks: vec![1],
+            parity_disks: vec![],
+            sealed_length: sealed,
+            sealed: sealed > 0,
+            avali: 1,
+            eversion: 0,
+            refs,
+            vp_table_refs: 0,
+            ec_converted: false,
+        };
+        // Shared ancestor extent 10 is CoW-shared by both children of a prior
+        // split → refs=2. Each child also has its own unique tail (50 / 60).
+        state.extents.insert(10, mk(10, 2, 1024));
+        state.extents.insert(50, mk(50, 1, 0)); // survivor tail (open)
+        state.extents.insert(60, mk(60, 1, 0)); // victim tail (open)
+        state.streams.insert(
+            100,
+            MgrStreamInfo {
+                stream_id: 100,
+                extent_ids: vec![10, 50],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        state.streams.insert(
+            200,
+            MgrStreamInfo {
+                stream_id: 200,
+                extent_ids: vec![10, 60],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let new_tail = mk(99, 1, 0);
+
+        let (updated, modified) =
+            AutumnManager::compute_merge_streams(&state, 100, 200, 4096, 8192, new_tail)
+                .unwrap();
+
+        // Shared extent 10 listed ONCE (front), not duplicated.
+        assert_eq!(updated.extent_ids, vec![10, 50, 60, 99]);
+
+        // Shared extent 10: two memberships {100, 200} collapse to one {100} →
+        // refs 2 → 1.
+        let e10 = modified.iter().find(|e| e.extent_id == 10).unwrap();
+        assert_eq!(e10.refs, 1, "shared extent must drop one membership");
+
+        // Victim-only tail 60: transfers victim→survivor → refs unchanged (1),
+        // sealed at victim_sealed.
+        let e60 = modified.iter().find(|e| e.extent_id == 60).unwrap();
+        assert_eq!(e60.refs, 1);
+        assert_eq!(e60.sealed_length, 8192);
+
+        // Survivor tail 50: sealed at survivor_sealed, refs unchanged (1).
+        let e50 = modified.iter().find(|e| e.extent_id == 50).unwrap();
+        assert_eq!(e50.refs, 1);
+        assert_eq!(e50.sealed_length, 4096);
+
+        // INVARIANT: after merge, every extent's refs == the number of streams
+        // (here only the survivor) whose extent_ids list it, each at most once.
+        let occ = updated.extent_ids.iter().filter(|&&e| e == 10).count();
+        assert_eq!(occ, 1, "no duplicate listing → GC can reconcile refs to 0");
+    }
+
+    /// F-merge-refs-leak regression for the row/meta splice path (no new tail).
+    #[test]
+    fn f_merge_refs_leak_splice_cow_shared_extent_dedup_and_refs() {
+        let mut state = autumn_common::MetadataState::default();
+        let mk = |id: u64, refs: u64| MgrExtentInfo {
+            extent_id: id,
+            replicates: vec![1],
+            parity: vec![],
+            replicate_disks: vec![1],
+            parity_disks: vec![],
+            sealed_length: 0,
+            sealed: false,
+            avali: 1,
+            eversion: 0,
+            refs,
+            vp_table_refs: 0,
+            ec_converted: false,
+        };
+        state.extents.insert(30, mk(30, 2)); // CoW-shared by both
+        state.extents.insert(31, mk(31, 1)); // survivor-only tail
+        state.extents.insert(41, mk(41, 1)); // victim-only tail
+        state.streams.insert(
+            300,
+            MgrStreamInfo {
+                stream_id: 300,
+                extent_ids: vec![30, 31],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        state.streams.insert(
+            400,
+            MgrStreamInfo {
+                stream_id: 400,
+                extent_ids: vec![30, 41],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let (updated, modified) =
+            AutumnManager::splice_streams_without_new_tail(&state, 300, 400, 100, 200).unwrap();
+        assert_eq!(updated.extent_ids, vec![30, 31, 41]);
+        let e30 = modified.iter().find(|e| e.extent_id == 30).unwrap();
+        assert_eq!(e30.refs, 1, "shared extent drops one membership");
+        let e41 = modified.iter().find(|e| e.extent_id == 41).unwrap();
+        assert_eq!(e41.refs, 1);
+        assert_eq!(e41.sealed_length, 200);
     }
 
     #[test]

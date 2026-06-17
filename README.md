@@ -283,6 +283,18 @@ $AO compact PART_ID
 $AO gc PART_ID --ratio 0.4
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
 
+# Extent refcount audit (MERGE-REFS-LEAK): cross-check every extent in etcd
+# against live stream membership. Reports orphan extents (refs>0 but in 0
+# streams -> invisible to `info`, never reclaimed), refs-vs-membership
+# mismatches, and duplicate-in-one-stream listings. Exit code 1 if any found.
+# NOTE: a flagged extent may still hold live data via vp_table_refs>0 — confirm
+# that's 0 (major-compact the owning partitions first) before deleting files.
+python3 python/audit_extent_refs.py     # --manager / --etcd / --op / --etcdctl overridable
+# Repair a leaked refs value (refs != stream membership) — STOP the manager first
+# (e.g. cluster.sh stop-manager), patch etcd, then restart so it replays the fix:
+python3 python/patch_extent_refs.py 10:0 33:1            # dry-run (EID:new_refs)
+python3 python/patch_extent_refs.py 10:0 33:1 --apply   # backs up to /tmp before writing
+
 # Cluster lifecycle helpers
 ./start.sh                               # this repo: 1-host 5-EN dev cluster
 ./stop.sh --wipe                         # tear down + wipe

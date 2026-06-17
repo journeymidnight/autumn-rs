@@ -1049,7 +1049,13 @@ struct InfoExtentView {
     replicas: Vec<u64>,
     parity: Vec<u64>,
     refs: u64,
+    vp_table_refs: u64,
     eversion: u64,
+    /// How many live streams list this extent in `extent_ids`. 0 = orphan
+    /// (not in any stream): either retained-by-vp_table_refs live data, or a
+    /// leaked-refs un-reclaimable extent. `refs` should equal this; a gap is a
+    /// refcount leak (see MERGE-REFS-LEAK).
+    in_streams: usize,
 }
 
 #[derive(Serialize)]
@@ -2542,6 +2548,17 @@ async fn run_info(
         }
     }
 
+    // Per-extent live stream-membership count (how many streams list it in
+    // extent_ids, duplicates counted). 0 = orphan (not in any stream). `refs`
+    // should equal this; a gap is a leaked refcount (MERGE-REFS-LEAK). Computed
+    // before the json/text split so both renderings can flag orphans.
+    let mut stream_member_count: HashMap<u64, usize> = HashMap::new();
+    for (_sid, s) in &streams_sorted {
+        for eid in &s.extent_ids {
+            *stream_member_count.entry(*eid).or_insert(0) += 1;
+        }
+    }
+
     if json_out {
         let nodes_view: Vec<InfoNodeView> = nodes_sorted
             .iter()
@@ -2573,7 +2590,9 @@ async fn run_info(
                     replicas: e.replicates.clone(),
                     parity: e.parity.clone(),
                     refs: e.refs,
+                    vp_table_refs: e.vp_table_refs,
                     eversion: e.eversion,
+                    in_streams: stream_member_count.get(eid).copied().unwrap_or(0),
                 })
                 .collect();
             v.sort_by_key(|e| e.extent_id);
@@ -2704,11 +2723,24 @@ async fn run_info(
             let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
             extents.sort_by_key(|(id, _)| **id);
             for (eid, e) in &extents {
-                let tag = if open_extents.contains(eid) {
-                    " (open)"
-                } else {
-                    ""
-                };
+                let in_streams = stream_member_count.get(*eid).copied().unwrap_or(0);
+                let mut tag = String::new();
+                if open_extents.contains(eid) {
+                    tag.push_str(" (open)");
+                }
+                // Orphan = in no live stream. Distinguish "still holds data"
+                // (vp_table_refs>0 — retained, serving reads) from a pure leak
+                // (vp_table_refs==0 — un-reclaimable, safe to reap). Also flag
+                // a refs vs membership gap (the MERGE-REFS-LEAK signature).
+                if in_streams == 0 {
+                    tag.push_str(if e.vp_table_refs > 0 {
+                        " (ORPHAN: no stream, retained by vp_table_refs — live data)"
+                    } else {
+                        " (ORPHAN: no stream, vp_table_refs=0 — reclaimable leak)"
+                    });
+                } else if e.refs as usize != in_streams {
+                    tag.push_str(" (refs-leak)");
+                }
                 let layout = if e.ec_converted {
                     format!(
                         "EC({}+{}), data={:?}, parity={:?}",
@@ -2725,12 +2757,14 @@ async fn run_info(
                     format!("replicas={:?}", all)
                 };
                 println!(
-                    "  extent {}: size={}{}, {}, refs={}, eversion={}",
+                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}",
                     eid,
                     human_size(e.sealed_length),
                     tag,
                     layout,
                     e.refs,
+                    in_streams,
+                    e.vp_table_refs,
                     e.eversion
                 );
             }

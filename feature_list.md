@@ -1107,3 +1107,60 @@ gaps in the lease protocol's correctness story.
   在 1 GiB 滚动 seal → `force-ec-convert` 走**分块** prepare(EN 日志确认 "(chunked)")→ 单 shard 实测 357,919,062 字节
   (≈sealed/3,~170 stripes)→ get-stream 经 ec_subrange_read 回读 sha256 **MATCH**(1,342,177,280 字节);open tail 仍复制态。
 - **passes:** completed (2026-06-17, 代码 + 单测 + coco + live e2e 全绿)。
+
+### MERGE-REFS-LEAK · 分区 merge 泄漏 extent refs → 不可见、不可回收的孤儿 extent(2026-06-17, 无部署前提)
+- **现场触发:** 排查 "extent 10 一直删不掉、`autumn-op info` 里看不到"。etcd `extents/10`:`refs=2`、
+  `vp_table_refs=5`,但扫遍全部 12 个 live stream 的 `extent_ids` **没有任何一个引用 extent 10**。
+  `python/audit_extent_refs.py` 进一步发现这是系统性问题:孤儿 extent 10 与 47;extent 12/20/33/46 全部
+  `refs` 比真实成员数多 1;stream 29 把 extent 20 列了两次。
+- **根因:** `compute_merge_streams` / `splice_streams_without_new_tail`(`manager/src/lib.rs`)对每个 victim extent
+  无条件 `ex.refs += 1`(为"拼进 survivor"计数),而 `apply_merge_mutations` 随后整体删除 victim 的 3 个 stream
+  (`streams.remove`)**却没有为 victim 的旧成员关系做对应 `refs -= 1`**。净效果:**每次 merge,每个 victim extent
+  refs 泄漏 +1**;CoW 共享 extent(split→merge-back)还会在 survivor 的 `extent_ids` 里被列两次。多轮
+  split→merge→GC 后,extent 被 GC 从 stream 中 punch 干净、membership 归 0,refs 却卡在正数 → `extent_can_delete`
+  (`refs==0 && vp_table_refs==0`)永不成立 → 永久磁盘泄漏;且 `handle_stream_info` 只渲染 stream 成员 extent →
+  `info` 完全看不到(EC 3+1 时每节点一 shard,4 份 `.dat` 各 ~sealed/K)。
+- **改动:** merge 对 victim extent 的 refs 改为**成员关系中性**:
+  - CoW 共享(已在 survivor):`refs -= 1`(两份 {survivor,victim} 合并成一份 {survivor}),且 `extent_ids` **去重不重列**
+    (重列会让后续 GC `punch_holes` 的 `retain` 一次删光所有重复项却只减 1 次 refs,永远对不平)。
+  - victim 独有:成员关系 victim→survivor **转移**,refs 不变(survivor 拼入 +1 抵消 victim stream 删除 -1)。
+  - splice 顺序不变:共享 extent 留在 survivor(前段)位置,保住 vp_head replay 顺序不变量;tail 是 split 后各自独有
+    extent,永不在 `survivor_set` 里,故 seal 块与去重不冲突。
+- **测试:** 修正 2 个把 bug 当预期的旧单测(`f181_compute_merge_streams_extent_ids_order_and_refs` /
+  `f181_splice_streams_without_new_tail_no_e_new`:victim-only extent merge 后只属一个 stream → refs 应为 1,原断言 2);
+  新增 2 个 CoW 共享回归(`f_merge_refs_leak_cow_shared_extent_dedup_and_refs` 及 splice 版):断言共享 extent
+  refs 2→1、`extent_ids` 不重复、victim 独有 extent refs 不变。
+- **可观测性修复(孤儿 extent 在 `autumn-op info` 中不可见):** `handle_stream_info` 原先只遍历
+  `s.streams[*].extent_ids`,refs>0 但 0 stream 成员的孤儿(如 extent 10,被 vp_table_refs 正确保留、
+  仍在服务读)对 `info` 完全隐身 —— 隐藏了活数据与不可回收泄漏。修复:全量 dump(`stream_ids` 空)时
+  追加所有非成员 extent;定向 stream_ids 查询(热路径 client.rs)保持仅成员行为。`autumn-op info`
+  现额外打印 `refs=N (streams=M)`、`vp_table_refs`,并对孤儿/泄漏打标签
+  (`(ORPHAN: …retained by vp_table_refs — live data)` / `(…vp_table_refs=0 — reclaimable leak)` / `(refs-leak)`)。
+- **审计工具:** `python/audit_extent_refs.py`(shell out etcdctl + `autumn-op --json info`,不加新 RPC,符合 ops-in-Python 约定):
+  交叉核对 etcd 全量 extent 与 stream 成员关系,用 info 的 vp_table_refs 把孤儿分为 DEAD(可回收泄漏)与
+  RETAINED(活数据,正常);报告 DEAD 孤儿 / refs 不匹配 / 单 stream 内重复列举;有问题退出码 1。
+- **修复工具:** `python/patch_extent_refs.py`(etcd v3 REST gateway,base64 二进制安全;`ArchivedMgrExtentInfo`
+  定长 88B,root=len-88、refs@root+32,校验 extent_id+当前 refs 后原位改标量 + 备份 + readback;默认 dry-run):
+  把泄漏的 refs 改回真实 stream 成员数。**必须先停 manager**(否则内存会覆盖 etcd patch),patch 后重启 replay 生效。
+- **现网处置(已执行 + 验证):** compact 15/31/42(vp_table_refs(10) 5→3)→ 回收 5 个 DEAD 孤儿(12/20/26/46/47,
+  删 etcd + unlink 30 文件)→ 部署可观测性修复(restart-manager)→ patch extent 10 refs 2→0、33 refs 2→1。
+  终态审计 exit=0,所有 extent refs == stream 成员数;extent 10 = retained orphan(streams=0, vp_table_refs=3,
+  refs=0),info 可见并标注 "live data"。
+- **验收:** `cargo build --workspace` 绿;manager lib 165 全单测绿(163 + 2 新增);审计脚本在现网准确复现 2 孤儿 + 4 不匹配 + 1 重复。
+  此修复只阻止**新增**泄漏;现网已泄漏的孤儿(extent 10/47)需单独处置(先 major-compact 引用方把 `vp_table_refs` 清 0,
+  再由 operator 清 etcd 里泄漏的 `refs`)。
+- **passes:** completed (2026-06-17, 代码 + 单测 + 现网审计复现;现网孤儿清理为后续 OP 步骤)。
+
+### VALUE-STREAM · 大 value 从 log_stream 分离(对齐 WAS,DESIGN ONLY,2026-06-17,未实现)
+- **触发(Trigger):** MERGE-REFS-LEAK 排查暴露的结构问题 —— log_stream 同时兼任 WAL + 大 value 存储,
+  叠加 CoW split 多主,使 GC 结构上无法"拥有"extent 删除(refs/vp_table_refs 双生命周期 + 删除触发只挂 refs 一侧
+  → extent 10 类不可见孤儿);且大 value 留在 WAL 撑大 replay(F120/F261 根因)。
+- **方向(对齐 Azure WAS):** log_stream 退化为纯 WAL(只存小提交记录,truncate-from-head);大 value 移入独立
+  **value_stream**(写一次,WAL 只存 VP,不双写);value extent 唯一生命周期 = vp_table_refs(跨 split 用已有
+  partition_vp_refs 聚合);回收折进 compaction(BlobDB 式碎片迁移)+ vp 侧删除触发,**退役独立 GC loop / punch /
+  双计数赛跑**。避开"value 内联 SST(写放大)"与"split 拷贝 value(split 变重)"两个已否方案。
+- **验收标准(待实现时填):** 写路径不双写大 value;recovery replay 不再流过 value 字节;CoW split 后共享 value
+  extent 在两子分区都 compact 后能自动删除(无 extent 10 类孤儿);compaction 折叠迁移按存活率阈值触发且受 admission
+  限速;旧 log_stream VP 数据迁移(方案 A 一次性 / B 双读过渡)。
+- **设计文档:** `docs/value_stream_design.md`(分阶段:Phase 0 止血 = vp 侧删除触发 + 兜底 sweep,与本重构正交且为终态删除原语;Phase 1 value_stream 写路径;Phase 2 回收折进 compaction;Phase 3 迁移老数据)。
+- **passes:** not_completed(DESIGN ONLY;Phase 0 止血待落,Phase 1-3 待排期)。
