@@ -1,47 +1,33 @@
 Date: 2026-06-17
 TaskStatus: completed
-Task scope: u64 offset 拓宽 + max_extent_size 16 GiB flag。
-  把 stream/storage 层每个 extent 字节位置从 u32 拓到 u64,让单 extent 突破 4 GiB；
-  max_extent_size 从写死 3 GiB 改成默认 16 GiB + `autumn-ps --max-extent-size-bytes` flag。
-  动机:extent 越大→数量越少→大规模下 manager/etcd 元数据压力越小。
-  前提:用户明确「现在没有任何部署,不需要管兼容问题」。
+Task scope: 分块 EC encode + 流式 peer-copy(EC-CHUNKED-CONVERT)。
+  让 16–32 GiB extent 在 EC 下安全:消除 EC convert 的内存峰值(~2× extent)和
+  whole-shard WriteShard 超 frame `payload_len: u32`(4 GiB)上限两个问题。
+  (承接上一任务 u64 offset 拓宽 + max_extent_size 16 GiB,用户追加 "do chunked ec encode and peer copy"。)
 Current summary:
-  编译器驱动的级联改造(改核心类型→迭代 cargo build 修 `as u32` 级联):
-  - wire(extent_rpc 二进制热路径): AppendReq.commit / AppendResp.offset+end /
-    ReadBytesReq.offset+length / ReadBytesResp.end / CommitLengthResp.length 全 u32→u64
-    (header 28→32, AppendResp 9→17, ReadBytesReq 24→32, …);manager 手镜像
-    ExtCommitLengthResp.length 同步(逐字节 wire-compat)。
-  - 持久格式: ValuePointer 16→24B(offset/len u64), partition_rpc SstLocation.offset/len +
-    TableLocations.vp_offset, SST MetaBlock.vp_offset(read_u32→read_u64), TableMeta.offset/len,
-    StreamAllocExtentReq.seal_commit Option<u64>, MultiModifySplitReq.*_sealed_length,
-    GetRedirectResp.value_offset/value_len。WAL 记录 val_len 保持 u32(单值≤4GB 不变量)。
-  - 计数仍 u32(in_flight / shard 数 / 块内偏移≤64KB / 单值长≤4GB)。
-  - manager compute_commit_seal / commit_length_on_node / probe_extent_on_node /
-    compute_duplicate_stream / compute_merge_streams 全 u64;PS recover_partition WAL 重放
-    buf_base/cur_off/record_extent_off u64;reader sst_base u64 + block_cache 键(u64,u64)。
-  - **EC 读分块修复(coco P1 #4)**: read_with_layout 对 EC extent 直接走 ec_subrange_read
-    绕过 256MiB 分块;16GiB extent K=3 → shard ~5.33GiB > frame payload_len:u32(4GiB)上限。
-    在唯一收口点 read_shard_from_addr 内部按 read_chunk_bytes(256MiB)分块,所有 EC 路径自动受界。
-    旧 3GiB 默认 shard ~1GiB 不触发,16GiB 默认才暴露 → 属本次新增能力的真 bug,已修。
-  - WIRE fingerprint v4→v5(MIN=MAX=5,pre-R3 同 commit 部署);registry 注册 5254fafce73f6ffe。
-  - max_extent_size_bytes(): OnceLock 默认 16GiB,clamp[1,64]GiB;两处 StreamClient 建点都读它;
-    autumn-ps 新 --max-extent-size-bytes flag → set_max_extent_size_bytes。
+  - `erasure::ec_encode_stripe`:RS over GF(256) 按 offset 逐字节 → stripe 可独立编码;字节级等价整 extent
+    `ec_encode` 的对应切片(`ec_encode_stripe_matches_whole` 单测证明)→ on-disk shard 布局不变,读路径零改。
+  - `handle_convert_to_ec` 改 stripe loop:逐 stripe 读 K 个 data 子区间(尾零填充)→ 编码 M parity →
+    远端 shard 先发、coordinator shard 0 最后写。峰值 = (K+M)×EC_ENCODE_STRIPE_BYTES(默认 64 MiB → ~256 MiB)。
+  - `WriteShardReq.shard_offset: u64`(WIRE v5→v6,header 36→44):远端按 offset pwrite + per-stripe sync_data;
+    顺序 await-ack 让 durable 前缀单调;coordinator-自己-最后 保留 "coord staging 满 ⇒ 全员 durable staged" 不变量。
+    2PC + EC-COMMIT-ATOMIC #5 marker 不变。
+  - 流式 peer-copy `peer_copy_full_extent_to_dat`:short 时流式拉进临时文件,完整 + fsync 后才原子 rename 覆盖 .dat
+    (coco P1:绝不先 set_len(0) live replica)。删整 Vec 缓冲的 `fetch_full_extent_from_sources`。
+  - coco P1 #2:`write_shard_stripe_local` 加边界 `shard_offset + stripe_len <= sealed_length`(防 sparse 撑爆 + commit 污染)。
   验收:
-  - cargo build --workspace 绿;rpc 30 / manager lib 163 / stream+PS 全单测绿。
-  - manager 集成 3 个 recovery 测试在并发下偶发失败 = 进程级 e2e 资源竞争,已 git stash
-    对照 baseline(HEAD)确认相同 3 个偶发失败 → 非本次回归(单独跑各自全绿)。
-  - coco deep review:7 项,#1/#2/#3/#7 全是「旧持久格式/滚动升级兼容」→ 用户明确不管兼容 +
-    全停全启 rkyv-fail-loud + WIRE v5 MIN=MAX 强制无混跑 → 出范围;#4(EC frame 溢出)真 bug 已修;
-    #5(ZC 读)被 length>read_chunk_bytes 提前 bail 覆盖;#6(EC materialize 内存)= F193 已知 won't-do 区。
-  - **live e2e(隔离 memory-mode 4-EN 集群, /tmp, 高端口 19xxx, --cpuset 130-135, 不碰 /data02)**:
-    put-stream 4.5GiB(1152×4MiB chunk 入单 log_stream extent)→ 单 extent 实际 4,831,907,398 字节
-    > u32::MAX(4,294,967,295)→ get-stream 回读 sha256 **MATCH**(后段 chunk VP offset > 4GiB,
-    走 u64 ReadBytesReq.offset);kill -9 PS 重启 → recovery 重放 SST(paged u64 vp_offset)+ WAL
-    (u64 record offset)→ get-stream 再读 **MATCH**;--max-extent-size-bytes 8GiB flag 生效。
+  - cargo build --workspace 绿;rpc 30 / stream 全单测(含 erasure 17 / f119-d / f153 / ec_2pc / merge_ec_replay)/
+    manager lib 163 全绿;新增 stripe==whole 字节级单测。
+  - coco deep:2 项 P1 全修(peer-copy 临时文件原子替换 + 边界校验)。
+  - **live e2e(隔离 4-EN, AUTUMN_EXTENT_EC_STRIPE_BYTES=2MiB 强制多 stripe,不碰 /data02):** put-stream 1.25 GiB
+    → log_stream 在 1 GiB seal → force-ec-convert 走分块 prepare(EN 日志 "(chunked)")→ shard 实测 357,919,062 字节
+    (≈sealed/3,~170 stripes)→ get-stream sha256 **MATCH**(1,342,177,280 字节);open tail 仍复制态。
+  注:F203 后 set-stream-ec 只设策略 + 出 advisory,实际转换走 OP 驱动的 force-ec-convert(e2e 已据此修正)。
+    max_extent_size clamp 下限 1 GiB(seal 需写 > 1 GiB)。
 Main gaps:
   - 无(代码 + 单测 + coco + live e2e 全绿)。
-  - EC > 12GiB extent 的 frame-溢出修复(read_shard_from_addr 分块)逻辑与既有复制路径同构,
-    单测覆盖 stitch 正确性;触发需 >12GiB EC extent(实测代价高),未单独 live 复现该极端但逻辑直白。
-Commits: 待 commit + push 到 main。
+  - 真 >12 GiB EC extent(shard > 4 GiB,frame 溢出的极端)未单独 live 复现(代价高);但 frame 上限由分块结构性消除,
+    且 stripe==whole 字节等价 + 1 GiB/170-stripe e2e 已覆盖分块正确性。
+Commits: 待 commit + push 到 main(承接 u64 commit 8c7d2df 之后)。
 Next steps:
-  - commit + push 到 main(solo-flow 直推 main)。
+  - commit + push 到 main(solo-flow 直推)。

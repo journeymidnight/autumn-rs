@@ -1076,3 +1076,30 @@ gaps in the lease protocol's correctness story.
   get-stream sha256 **MATCH**(后段 chunk VP offset > 4 GiB 走 u64 read);kill -9 PS 重启 → recovery
   重放 SST(paged u64 vp_offset)+ WAL(u64 record offset)→ 再读 **MATCH**;`--max-extent-size-bytes` flag 生效。
 - **passes:** completed (2026-06-17, 代码 + 单测 + coco + live e2e 全绿)。
+
+### EC-CHUNKED-CONVERT · 分块 EC encode + 流式 peer-copy(2026-06-17, F193 Stage B 落地)
+- **动机:** 16 GiB extent 下 EC convert 两处爆掉:(1)旧 `ec_encode` 整 extent 编码,transient ≈ 2× payload(16G→~32G);
+  (2)更致命——whole-shard `WriteShard` payload = shard ≈ sealed/K(16G/K=3 ≈ 5.33G)> frame `payload_len: u32`(≤4G)上限。
+  F193 Stage B 当年 "won't-do",16 GiB 默认正是它说的 "real EC-convert OOM signal" 触发条件。
+- **改动:**
+  - **`erasure::ec_encode_stripe`:** RS over GF(256) 按 offset 逐字节 → 一个 stripe 可独立编码。给 K 个等长 data stripe 切片
+    返回 M 个 parity stripe。**字节级等价**于整 extent `ec_encode` 的对应切片(`ec_encode_stripe_matches_whole` 单测证明:
+    各尺寸 × 各 stripe 大小,reassemble == whole)→ on-disk shard 布局不变,读路径(ec_subrange_read/ec_read_full)零改。
+  - **`handle_convert_to_ec` stripe loop:** 逐 stripe 从本地 `.dat` 读 K 个 data 子区间(尾部零填充)→ 编码 M parity →
+    远端 shard 先发、coordinator 自己 shard 0 最后写。峰值 RAM = (K+M)×`EC_ENCODE_STRIPE_BYTES`(默认 64 MiB → ~256 MiB),
+    与 extent 大小无关;每个 `WriteShard` ≤ frame 上限 → >4 GiB shard 也能转。
+  - **`WriteShardReq.shard_offset: u64`(WIRE v5→v6):** 远端按 offset pwrite 进 `.ec.dat` + per-stripe `sync_data`;
+    顺序 await-ack 让 durable 前缀单调增长;coordinator-自己-最后 保留 "coord staging 满 ⇒ 所有 participant 已 durable staged"
+    不变量(coordinator_prepared skip + 2PC commit 排序依赖它)。2PC + EC-COMMIT-ATOMIC #5 marker 不变。
+  - **流式 peer-copy(`peer_copy_full_extent_to_dat`):** coordinator 本地 short 时,流式拉进**临时文件**,拿到完整
+    sealed_length + fsync 后才原子 rename 覆盖 `.dat`(coco P1 — 绝不像 `stream_extent_from_sources` 那样先 set_len(0)
+    live replica;那个 dest 是正在重建的节点才行)。删掉整 Vec 缓冲的 `fetch_full_extent_from_sources`。
+  - **coco P1 bounds guard:** `write_shard_stripe_local` 拒绝 `shard_offset + stripe_len > sealed_length`(防 malformed/stale
+    WriteShard 把 `.ec.dat` 撑成超大 sparse → commit 污染 entry.len/sealed_length)。
+- **coco deep:** 2 项 P1 全修(#1 peer-copy 不再毁活副本=改临时文件原子替换;#2 加边界校验)。
+- **验收:** `cargo build --workspace` 绿;rpc 30 / stream 全单测(含 erasure 17 / f119-d / f153 / ec_2pc / merge_ec_replay)
+  / manager lib 163 全绿;新增 `ec_encode_stripe_matches_whole`(stripe==whole 字节级)。
+  **live e2e(隔离 4-EN, `AUTUMN_EXTENT_EC_STRIPE_BYTES=2MiB` 强制多 stripe):** put-stream 1.25 GiB → log_stream extent
+  在 1 GiB 滚动 seal → `force-ec-convert` 走**分块** prepare(EN 日志确认 "(chunked)")→ 单 shard 实测 357,919,062 字节
+  (≈sealed/3,~170 stripes)→ get-stream 经 ec_subrange_read 回读 sha256 **MATCH**(1,342,177,280 字节);open tail 仍复制态。
+- **passes:** completed (2026-06-17, 代码 + 单测 + coco + live e2e 全绿)。

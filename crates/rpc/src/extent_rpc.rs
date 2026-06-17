@@ -753,7 +753,7 @@ impl CopyExtentResp {
 
 // ── WriteShard (binary — large payload) ─────────────────────────────────────
 
-/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE][payload...]
+/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE][shard_offset: u64 LE][payload...]
 ///
 /// `eversion` is the post-EC eversion the manager has decided on. The
 /// receiving extent node bumps `entry.eversion` to this value when it
@@ -765,7 +765,14 @@ impl CopyExtentResp {
 /// `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch` — same
 /// fence model as the append path. `owner_epoch = 0` means "no fence
 /// requested" (pre-F211-D wire-compat).
-pub const WRITE_SHARD_HEADER_LEN: usize = 36;
+///
+/// `shard_offset` (chunked EC convert): the byte offset WITHIN the shard
+/// at which `payload` is written into the staging `.ec.dat`. EC convert
+/// streams a shard as a sequence of stripes (each `payload` ≤ a chunk) so a
+/// single RPC never exceeds the frame `payload_len: u32` ceiling — load-bearing
+/// once an extent (hence a shard) can exceed 4 GiB. `shard_offset = 0` with the
+/// whole shard as `payload` is the degenerate single-stripe form.
+pub const WRITE_SHARD_HEADER_LEN: usize = 44;
 
 pub struct WriteShardReq {
     pub extent_id: u64,
@@ -773,6 +780,7 @@ pub struct WriteShardReq {
     pub sealed_length: u64,
     pub eversion: u64,
     pub owner_epoch: i64,
+    pub shard_offset: u64,
     pub payload: Bytes,
 }
 
@@ -784,6 +792,7 @@ impl WriteShardReq {
         buf.put_u64_le(self.sealed_length);
         buf.put_u64_le(self.eversion);
         buf.put_i64_le(self.owner_epoch);
+        buf.put_u64_le(self.shard_offset);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
@@ -797,6 +806,7 @@ impl WriteShardReq {
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
         let owner_epoch = data.get_i64_le();
+        let shard_offset = data.get_u64_le();
         let payload = data;
         Ok(Self {
             extent_id,
@@ -804,6 +814,7 @@ impl WriteShardReq {
             sealed_length,
             eversion,
             owner_epoch,
+            shard_offset,
             payload,
         })
     }

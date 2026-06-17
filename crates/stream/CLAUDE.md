@@ -1437,17 +1437,44 @@ full `sealed_length` transfer; all-sources-failed → `Err`.
 NOT changed (intentionally): `handle_copy_extent` already serves `[offset, size)`
 ranges (`file_pread_chunked`) and has no production originator (only the
 sibling-shard forward), and the recovery read path is `MSG_READ_BYTES`, not
-`MSG_COPY_EXTENT`. EC recovery (`run_ec_recovery_payload`) and the
-`handle_convert_to_ec` peer-copy still buffer — shard-sized / Stage-B territory
-(the subsequent `ec_encode` holds the full payload regardless). Bounding the EC
-*encode* peak was F193 Stage B — **CLEARED/won't-do** (2026-05-24): the EC-convert
-transient self-decays (Stage A jemalloc) and is concurrency-capped to 1 (F194), so
-the per-chunk `WriteShardReq` wire change isn't worth it. Reopen only on a real
-EC-convert OOM signal.
+`MSG_COPY_EXTENT`. EC recovery (`run_ec_recovery_payload`) still buffers shard-
+sized (≈ `sealed_length / K`).
+
+**F193 Stage B — DONE (chunked EC convert, u64-offset widening follow-up).** The
+"Reopen only on a real EC-convert OOM signal" caveat was triggered by raising
+`max_extent_size` to 16 GiB: the old whole-extent `ec_encode` held ~2× the
+payload (~32 GiB at 16 GiB), AND — independently fatal — a whole shard at
+16 GiB / K=3 is ~5.33 GiB, so the whole-shard `WriteShard` payload overflowed the
+frame `payload_len: u32` (≤ 4 GiB). Both are now fixed by **stripe-wise EC
+convert**: RS over GF(256) is byte-wise per offset (`erasure::ec_encode_stripe`,
+byte-identical to a slice of `ec_encode` — proved by
+`ec_encode_stripe_matches_whole`), so `handle_convert_to_ec` reads the K data
+sub-ranges at shard-offset `s` from the local `.dat`, encodes the M parity
+stripes, and streams each shard's stripe via `WriteShard` carrying a new
+`shard_offset: u64` (WIRE v6). The receiving node `pwrite`s the stripe into
+`.ec.dat` at `shard_offset` + `sync_data`s it (`write_shard_stripe_local`).
+Peak RAM = `(K+M) × EC_ENCODE_STRIPE_BYTES` (64 MiB default → ~256 MiB),
+independent of extent size; each `WriteShard` stays under the frame ceiling.
+Crash-safety preserved: per-stripe `sync_data` + sequential await-ack make the
+durable prefix grow monotonically; the coordinator writes its OWN shard 0 stripe
+LAST per stripe, so `coordinator_prepared` (coord staging == shard_size) ⇒ every
+participant durably staged every stripe; the 2PC commit + EC-COMMIT-ATOMIC #5
+marker are unchanged. `write_shard_stripe_local` bounds `shard_offset +
+stripe_len ≤ sealed_length` (coco P1) so a malformed/stale `WriteShard` can't
+balloon `.ec.dat` into a sparse file that commit would publish. The peer-copy
+(coordinator local short) now streams into a TEMP file via
+`peer_copy_full_extent_to_dat` and atomic-renames over `.dat` only after a full
+copy lands (coco P1 — never `set_len(0)` the live replica before securing a
+complete copy, unlike `stream_extent_from_sources` whose dest is a node being
+rebuilt). `fetch_full_extent_from_sources` (the whole-`Vec` buffering peer-copy)
+was removed. **Test override `AUTUMN_EXTENT_EC_STRIPE_BYTES`** forces multi-stripe
+without writing multi-GiB extents.
 
 **Invariant:** any new full-extent peer-copy-then-writeback path must stream via
-`stream_extent_from_sources` (or an equivalent read-chunk→write-chunk→drop loop),
-never `fetch_full_extent_from_sources` + buffer, unless it is shard-sized.
+`stream_extent_from_sources` / `peer_copy_full_extent_to_dat` (or an equivalent
+read-chunk→write-chunk→drop loop), never buffer the whole extent in a `Vec`,
+unless it is shard-sized. Any new EC encode must be stripe-wise (`ec_encode_stripe`)
+so the transient + the per-RPC `WriteShard` stay bounded regardless of extent size.
 
 ### Recovery over-promised-seal reconciliation (2026-05-30, seed=13 Mode A)
 

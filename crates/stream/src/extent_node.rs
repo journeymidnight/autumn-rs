@@ -1426,6 +1426,27 @@ async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec
 /// RPC path; this constant covers the local-file path on the extent node.
 const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
+/// EC convert encode/transfer stripe size. The chunked EC convert holds at most
+/// `(K+M)` stripes resident at once (the K data sub-ranges read off the source
+/// extent + the M parity sub-ranges computed from them), so peak RAM is
+/// `(K+M) × EC_ENCODE_STRIPE_BYTES` — independent of extent size (was ~2× the
+/// whole extent for the pre-chunking whole-extent encode). 64 MiB keeps the
+/// peak ~256 MiB at K+M=4 while bounding the per-shard `sync_data` count; it is
+/// also well under the frame `payload_len: u32` ceiling so each stripe's
+/// `WriteShard` is a single in-frame RPC even for >4 GiB shards. Test override
+/// via `AUTUMN_EXTENT_EC_STRIPE_BYTES` to exercise multi-stripe without writing
+/// multi-GiB extents.
+fn ec_encode_stripe_bytes() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_EXTENT_EC_STRIPE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
 /// Chunked pread for full-extent reads (recovery / EC convert / etc.).
 /// Single-shot reads <= FILE_IO_CHUNK_BYTES bypass the loop.
 async fn file_pread_chunked(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -4230,39 +4251,11 @@ impl ExtentNode {
         Ok(resp.payload.to_vec())
     }
 
-    async fn fetch_full_extent_from_sources(
-        &self,
-        extent: &ExtentInfo,
-        exclude_node_ids: &[u64],
-    ) -> Result<Vec<u8>, String> {
-        // TODO(F044): nodes_map_from_manager() stubbed
-        let nodes = self
-            .nodes_map_from_manager()
-            .await
-            .map_err(|e| format!("nodes_map: {e}"))?;
-        for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
-            if exclude_node_ids.contains(node_id) {
-                continue;
-            }
-            let Some(addr) = nodes.get(node_id) else {
-                continue;
-            };
-            let copied = Self::copy_bytes_from_source(
-                addr,
-                extent.extent_id,
-                extent.eversion,
-                extent.sealed_length, // F223: chunked fetch of the full sealed extent
-            )
-            .await;
-            if let Ok(payload) = copied {
-                if extent.sealed_length > 0 && payload.len() < extent.sealed_length as usize {
-                    continue;
-                }
-                return Ok(payload);
-            }
-        }
-        Err("no source replica available for copy".to_string())
-    }
+    // (`fetch_full_extent_from_sources` — the whole-extent buffering peer-copy —
+    // was removed once the EC-convert path switched to the streaming
+    // `stream_extent_from_sources` below; recovery / re_avali already used the
+    // streaming form. Its helper `copy_bytes_from_source` survives for the
+    // `[offset, size)` range copy used by `handle_copy_extent`.)
 
     /// F193 Stage C: stream the full sealed extent from a healthy peer straight
     /// into `dest`, chunk-by-chunk (read one `FILE_IO_CHUNK_BYTES` chunk →
@@ -4826,13 +4819,29 @@ impl ExtentNode {
     /// the staging file over it. If the process crashes after prepare
     /// but before commit, the staging file is cleaned up on startup
     /// and the original data remains intact for a retry.
-    async fn write_shard_local(
+    /// Write one shard STRIPE into the staging `.ec.dat` at `shard_offset`
+    /// (chunked EC convert). The shard is streamed as a sequence of stripes so
+    /// no single WriteShard RPC exceeds the frame `payload_len: u32` ceiling —
+    /// load-bearing once a shard can exceed 4 GiB. `shard_offset = 0` with the
+    /// whole shard as `stripe_data` is the degenerate single-stripe form.
+    ///
+    /// Crash-safety: each stripe is `pwrite`'d at its offset and `sync_data`'d
+    /// before the caller's ACK, so the durable prefix grows monotonically as
+    /// the coordinator streams stripes sequentially (await-ack per stripe). The
+    /// staging is renamed over `.dat` only by `commit_shard_local`, which the
+    /// coordinator sends ONLY after every stripe acked (coordinator writes its
+    /// OWN shard last, so coord-staging-full ⇒ all participants durably staged).
+    /// `pwrite`-at-offset is idempotent, so a retry that re-streams from 0
+    /// rewrites the same bytes at the same offsets. No truncate: stripes from
+    /// different offsets coexist; the file grows to `shard_size` at the last.
+    async fn write_shard_stripe_local(
         &self,
         extent_id: u64,
         shard_index: usize,
+        shard_offset: u64,
         sealed_length: u64,
         _new_eversion: u64,
-        shard_data: Bytes,
+        stripe_data: Bytes,
     ) -> Result<(), (StatusCode, String)> {
         let entry = self
             .ensure_extent(extent_id)
@@ -4843,26 +4852,38 @@ impl ExtentNode {
             .disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
         let staging_path = disk.ec_staging_path(extent_id);
-        let shard_len = shard_data.len();
+        let stripe_len = stripe_data.len();
 
-        // Idempotent: if a prior prepare already wrote .ec.dat with
-        // the correct shard size, skip the redundant I/O.
-        if let Ok(meta) = compio::fs::metadata(&staging_path).await {
-            if meta.len() == shard_len as u64 {
-                tracing::info!(
-                    extent_id,
-                    shard_index,
-                    shard_len,
-                    "EC prepare: staging file already exists with correct size, skipping"
-                );
-                // EC-PREPARE-DURABLE (coco P2): the prior prepare may have
-                // crashed AFTER sync_data but BEFORE the parent-dir fsync, so
-                // the staging dirent might still be non-durable. Every prepare
-                // path that returns Ok MUST guarantee the same durable-prepare
-                // semantics — re-fsync the parent dir here too (idempotent).
-                self.fsync_staging_dir(extent_id, &staging_path).await?;
-                return Ok(());
-            }
+        // coco P1 bounds guard: a malformed / stale WriteShard with a huge
+        // `shard_offset` must not create an oversized sparse `.ec.dat` that a
+        // later commit would publish as `.dat` (finish_ec_commit sets
+        // entry.len/sealed_length from the file size). Every legitimate stripe
+        // ends at most at `shard_size = ceil(sealed_length/K) <= sealed_length`
+        // (for any K >= 1), so `shard_offset + stripe_len <= sealed_length` is a
+        // K-free upper bound that never rejects a valid stripe but caps the
+        // staging file at `sealed_length` — keeping finish_ec_commit's
+        // `sealed_length.max(shard_len)` from being polluted. (A tight
+        // `<= ceil(sealed_length/K)` bound would need `data_shards` on the wire;
+        // the loose bound is enough to stop the egregious sparse-file case.)
+        let stripe_end = shard_offset
+            .checked_add(stripe_len as u64)
+            .ok_or_else(|| {
+                (
+                    StatusCode::InvalidArgument,
+                    format!(
+                        "write_shard {extent_id}: shard_offset {shard_offset} + len {stripe_len} \
+                         overflows u64"
+                    ),
+                )
+            })?;
+        if stripe_end > sealed_length {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "write_shard {extent_id}: stripe end {stripe_end} exceeds sealed_length \
+                     {sealed_length} (malformed shard_offset {shard_offset})"
+                ),
+            ));
         }
 
         if let Some(parent) = staging_path.parent() {
@@ -4874,10 +4895,10 @@ impl ExtentNode {
             })?;
         }
 
+        // create+write, NO truncate — earlier stripes must survive this open.
         let staging_file = OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
             .open(&staging_path)
             .await
             .map_err(|e| {
@@ -4886,18 +4907,15 @@ impl ExtentNode {
                 (StatusCode::Internal, msg)
             })?;
 
-        // F171: staging file is local to this function — never aliased
-        // by other tasks (the path is unique per `extent_id`), so a
-        // freshly-created `Rc` suffices. We share via clone for the
-        // sync_data call below.
+        // F171: staging file is local to this function — the path is unique per
+        // `extent_id` and EC convert on this extent is serialised by the
+        // per-extent op-lock, so a freshly-created `Rc` suffices.
         let staging_rc = Rc::new(staging_file);
-        // ENOSPC-1: EC staging writes mark the disk like every other
-        // write path (this was the one family that didn't — a full or
-        // faulted disk kept receiving EC dispatches).
-        file_pwrite_chunked(staging_rc.clone(), 0, shard_data)
+        // ENOSPC-1: EC staging writes mark the disk like every other write path.
+        file_pwrite_chunked(staging_rc.clone(), shard_offset, stripe_data)
             .await
             .map_err(|e| {
-                let msg = format!("write staging {extent_id}/{shard_index}: {e}");
+                let msg = format!("write staging {extent_id}/{shard_index}@{shard_offset}: {e}");
                 self.mark_disk_error_for_extent(extent_id, &msg);
                 (StatusCode::Internal, msg)
             })?;
@@ -4906,17 +4924,18 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(extent_id, &msg);
             (StatusCode::Internal, msg)
         })?;
-        // EC-PREPARE-DURABLE: `sync_data` only makes the staging file's
-        // CONTENT durable — NOT its directory entry. Make the dirent durable
-        // too (see `fsync_staging_dir`).
+        // EC-PREPARE-DURABLE: `sync_data` makes the stripe CONTENT durable; the
+        // parent-dir fsync makes the staging dirent durable (idempotent across
+        // stripes — only the first stripe actually creates the file).
         self.fsync_staging_dir(extent_id, &staging_path).await?;
 
-        tracing::info!(
+        tracing::debug!(
             extent_id,
             shard_index,
-            shard_len,
+            shard_offset,
+            stripe_len,
             sealed_length,
-            "EC prepare: shard written to staging file"
+            "EC prepare: shard stripe written to staging"
         );
         Ok(())
     }
@@ -6511,6 +6530,153 @@ impl ExtentNode {
         .encode())
     }
 
+    /// EC-convert peer-copy: bring the coordinator's local `.dat` up to
+    /// `sealed_length` by streaming a full copy from a healthy peer, WITHOUT
+    /// destroying the live local replica on a short/failed copy.
+    ///
+    /// Unlike `stream_extent_from_sources` (used by recovery, where the dest is
+    /// a node being rebuilt so truncate-then-stream is fine), the EC-convert
+    /// coordinator IS a live replica — we must not `set_len(0)` the live `.dat`
+    /// before a complete copy is secured (coco P1). So we stream into a TEMP
+    /// file (peak = one chunk, via `stream_one_source`) and atomic-rename it
+    /// over `.dat` ONLY after a full `sealed_length` copy lands + fsyncs. On
+    /// "no source held the full length" the live `.dat` is left untouched and we
+    /// fail (the manager retries; a permanent over-seal needs operator/recovery
+    /// reconciliation — EC cannot encode a partial extent). No F227 reconcile-
+    /// down here: a short consensus means EC convert must NOT proceed.
+    async fn peer_copy_full_extent_to_dat(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+        mgr_info: &ExtentInfo,
+        sealed_length: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        let disk = self
+            .disk_for(entry.disk_id)
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let dat_path = disk.extent_path(extent_id);
+        let tmp_path = {
+            let mut s = dat_path.clone().into_os_string();
+            s.push(".peercopy.tmp");
+            PathBuf::from(s)
+        };
+        let nodes = self
+            .nodes_map_from_manager()
+            .await
+            .map_err(|e| (StatusCode::Unavailable, format!("nodes_map: {e}")))?;
+
+        let mut got_full = false;
+        {
+            if let Some(parent) = tmp_path.parent() {
+                compio::fs::create_dir_all(parent).await.map_err(|e| {
+                    (
+                        StatusCode::Internal,
+                        format!("mkdir peercopy {extent_id}: {e}"),
+                    )
+                })?;
+            }
+            let tmp_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::Internal,
+                        format!("create peercopy tmp {extent_id}: {e}"),
+                    )
+                })?;
+            let tmp_rc = Rc::new(tmp_file);
+            for node_id in mgr_info.replicates.iter().chain(mgr_info.parity.iter()) {
+                let Some(addr) = nodes.get(node_id) else {
+                    continue;
+                };
+                let Ok(sock) = parse_addr(addr) else {
+                    continue;
+                };
+                // Reset the TEMP (never the live .dat) before each attempt.
+                if tmp_rc.set_len(0).await.is_err() {
+                    continue;
+                }
+                match Self::stream_one_source(
+                    sock,
+                    addr,
+                    extent_id,
+                    mgr_info.eversion,
+                    sealed_length,
+                    &tmp_rc,
+                )
+                .await
+                {
+                    Ok(w) if w >= sealed_length => {
+                        tmp_rc.sync_data().await.map_err(|e| {
+                            (
+                                StatusCode::Internal,
+                                format!("sync peercopy {extent_id}: {e}"),
+                            )
+                        })?;
+                        got_full = true;
+                        break;
+                    }
+                    Ok(short) => {
+                        tracing::warn!(
+                            extent_id,
+                            node_id,
+                            got = short,
+                            want = sealed_length,
+                            "EC peer-copy source SHORT"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(extent_id, node_id, err = %e, "EC peer-copy source FAILED");
+                    }
+                }
+            }
+        } // tmp_rc dropped (fd closed) before the rename
+
+        if !got_full {
+            let _ = compio::fs::remove_file(&tmp_path).await;
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "peer-copy for extent {extent_id}: no source held the full sealed_length \
+                     {sealed_length} — over-sealed / unrecoverable; live replica left intact"
+                ),
+            ));
+        }
+
+        // Atomic-replace: rename temp → .dat, fsync dir, reopen the handle.
+        compio::fs::rename(&tmp_path, &dat_path).await.map_err(|e| {
+            (
+                StatusCode::Internal,
+                format!("rename peercopy {extent_id}: {e}"),
+            )
+        })?;
+        if let Some(dir) = dat_path.parent() {
+            compio::fs::File::open(dir)
+                .await
+                .map_err(|e| (StatusCode::Internal, format!("open dat dir {extent_id}: {e}")))?
+                .sync_all()
+                .await
+                .map_err(|e| (StatusCode::Internal, format!("fsync dat dir {extent_id}: {e}")))?;
+        }
+        let new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dat_path)
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("reopen {extent_id}: {e}")))?;
+        let len = new_file
+            .metadata()
+            .await
+            .map(|m| m.len())
+            .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
+        entry.replace_file(new_file);
+        entry.len.store(len, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
         let req: ConvertToEcReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -6753,148 +6919,165 @@ impl ExtentNode {
                         ),
                     )
                 })?;
-                let fetched = self
-                    .fetch_full_extent_from_sources(&mgr_info, &[])
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::Unavailable,
-                            format!(
-                                "peer-copy for extent {extent_id} (need {sealed_length}, local has \
-                                 {local_len}): {e}"
-                            ),
-                        )
-                    })?;
-                if (fetched.len() as u64) < sealed_length {
-                    return Err((
-                        StatusCode::FailedPrecondition,
-                        format!(
-                            "peer-copy returned {} bytes < sealed_length={sealed_length} for extent \
-                             {extent_id} — data is unrecoverable; operator intervention required",
-                            fetched.len()
-                        ),
-                    ));
-                }
-                let truncated = Bytes::from(fetched[..sealed_length as usize].to_vec());
-                entry
-                    .file_rc()
-                    .set_len(0)
-                    .await
-                    .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
-                file_pwrite_chunked(entry.file_rc(), 0, truncated)
-                    .await
-                    .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
-                entry
-                    .file_rc()
-                    .sync_data()
-                    .await
-                    .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
-                entry.len.store(sealed_length, Ordering::SeqCst);
+                // Stream the missing extent from a peer chunk-by-chunk into a
+                // TEMP file and atomic-replace `.dat` only after a full copy is
+                // secured — peak = one chunk (load-bearing at 16+ GiB) AND the
+                // live local replica is never destroyed on a short/failed copy
+                // (coco P1). Replaces the old whole-`Vec`
+                // `fetch_full_extent_from_sources` materialization.
+                self.peer_copy_full_extent_to_dat(extent_id, &entry, &mgr_info, sealed_length)
+                    .await?;
                 tracing::info!(
                     extent_id,
                     local_len,
                     sealed_length,
-                    "peer-copied missing tail before EC convert"
+                    "peer-copied missing tail before EC convert (streamed to temp, atomic-replace)"
                 );
             }
 
             if !f128_recovered {
-                let data = file_pread_chunked(entry.file_rc(), 0, sealed_length as usize)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::Internal,
-                            format!("read extent {extent_id}: {e}"),
-                        )
-                    })?;
-
-                // F117: offload RS encode to blocking thread.
-                // F140: also do the `Vec<u8> -> Bytes` conversion inside the
-                // blocking closure (zero-copy via `Bytes::from`) so the per-shard
-                // ~shard_size memcpy that previously ran on the event loop as
-                // `Bytes::copy_from_slice(shard)` per remote target moves off
-                // the runtime. After this, the loop below uses
-                // `shards[i].clone()` which is an O(1) Arc inc.
-                let shards: Vec<Bytes> = compio::runtime::spawn_blocking(move || {
-                    crate::erasure::ec_encode(&data, data_shards, parity_shards)
-                        .map(|vecs| vecs.into_iter().map(Bytes::from).collect())
-                })
-                .await
-                .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
-                .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
-
-                // ── Phase 1 (prepare): write .ec.dat on all nodes ──
-                // Remote nodes first, coordinator (index 0) last.
-                for (i, target_addr) in req.target_addrs.iter().enumerate() {
-                    if i == 0 {
-                        continue;
+                // ── Phase 1 (prepare): CHUNKED RS-encode + streamed fanout ──
+                //
+                // RS over GF(256) is byte-wise per offset, so each shard is
+                // built+distributed one stripe at a time. Peak RAM = (K+M) ×
+                // stripe (was ~2× the whole extent for the old read-all +
+                // ec_encode + whole-shard WriteShard) — AND each stripe's
+                // WriteShard payload stays under the frame `payload_len: u32`
+                // ceiling, so EC convert works for >4 GiB shards (16+ GiB
+                // extents) where a whole-shard WriteShard would overflow.
+                let per_shard = crate::erasure::shard_size(sealed_length as usize, data_shards);
+                let stripe_bytes = ec_encode_stripe_bytes();
+                let mut s = 0usize;
+                while s < per_shard {
+                    let stripe_len = (per_shard - s).min(stripe_bytes);
+                    // Read the K data-shard sub-ranges at shard-offset `s` from
+                    // the local `.dat`. Data shard i covers
+                    // `[i*per_shard, (i+1)*per_shard)` of the original payload;
+                    // bytes past `sealed_length` are zero-padding (the original
+                    // is only `sealed_length` bytes), so a short read is filled
+                    // with zeros — identical to `ec_encode`'s zero-fill.
+                    let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(data_shards);
+                    for i in 0..data_shards {
+                        let start = i * per_shard + s;
+                        let avail = (sealed_length as usize)
+                            .saturating_sub(start)
+                            .min(stripe_len);
+                        let mut buf = vec![0u8; stripe_len];
+                        if avail > 0 {
+                            let read =
+                                file_pread_chunked(entry.file_rc(), start as u64, avail)
+                                    .await
+                                    .map_err(|e| {
+                                        (
+                                            StatusCode::Internal,
+                                            format!("read extent {extent_id} @ {start}: {e}"),
+                                        )
+                                    })?;
+                            let n = read.len().min(stripe_len);
+                            buf[..n].copy_from_slice(&read[..n]);
+                        }
+                        data_bufs.push(buf);
                     }
-                    let ws_req = WriteShardReq {
-                        extent_id,
-                        shard_index: i as u32,
-                        sealed_length,
-                        eversion: new_eversion,
-                        // F211-D Tier 2: owner_epoch threaded from the
-                        // manager (`MgrEcDispatchInflight.owner_epoch` ->
-                        // `ExtConvertToEcReq.owner_epoch`). A fenced ex-coord
-                        // whose 2PC keeps running sends WriteShard with
-                        // the now-stale owner_epoch; remote EN rejects with
-                        // `CODE_LOCKED_BY_OTHER` because
-                        // `auto_abandon_for_fenced_node` has pushed the
-                        // bumped owner_epoch via `MSG_CHECK_COMMIT_LENGTH`
-                        // fence-handover. `req.owner_epoch == 0` keeps the
-                        // pre-Tier-2 no-fence semantics for tests /
-                        // memory-only.
-                        owner_epoch: req.owner_epoch,
-                        payload: shards[i].clone(),
-                    };
-                    let sock = parse_addr(target_addr).map_err(|e| {
-                        (
-                            StatusCode::Internal,
-                            format!("parse addr {target_addr}: {e}"),
-                        )
-                    })?;
-                    match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
-                        Ok(resp_bytes) => {
-                            let resp = WriteShardResp::decode(resp_bytes).map_err(|e| {
-                                (
-                                    StatusCode::Internal,
-                                    format!("decode write_shard resp: {e}"),
-                                )
-                            })?;
-                            if resp.code != CODE_OK {
+
+                    // F117: offload RS to a blocking thread. Move `data_bufs` in
+                    // and hand it back alongside the parity so the fanout below
+                    // doesn't re-clone the data stripes.
+                    let pshards = parity_shards;
+                    let (data_bufs, parity): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                        compio::runtime::spawn_blocking(move || -> std::result::Result<_, String> {
+                            let refs: Vec<&[u8]> =
+                                data_bufs.iter().map(|v| v.as_slice()).collect();
+                            let parity = crate::erasure::ec_encode_stripe(&refs, pshards)
+                                .map_err(|e| e.to_string())?;
+                            Ok((data_bufs, parity))
+                        })
+                        .await
+                        .map_err(|_| {
+                            (
+                                StatusCode::Internal,
+                                "ec_encode_stripe task panicked".to_string(),
+                            )
+                        })?
+                        .map_err(|e| {
+                            (StatusCode::Internal, format!("ec_encode_stripe failed: {e}"))
+                        })?;
+
+                    // Fan the stripe out: REMOTE shards (data 1..K, parity
+                    // K..K+M) first, coordinator's own shard 0 LAST so that
+                    // coord-staging-full ⇒ every participant durably staged
+                    // every stripe (the `coordinator_prepared` skip + 2PC commit
+                    // ordering depend on this). owner_epoch fence as before
+                    // (F211-D Tier 2).
+                    let shard_off = s as u64;
+                    for i in 1..(data_shards + parity_shards) {
+                        let payload: Bytes = if i < data_shards {
+                            Bytes::from(data_bufs[i].clone())
+                        } else {
+                            Bytes::from(parity[i - data_shards].clone())
+                        };
+                        let target_addr = &req.target_addrs[i];
+                        let ws_req = WriteShardReq {
+                            extent_id,
+                            shard_index: i as u32,
+                            sealed_length,
+                            eversion: new_eversion,
+                            owner_epoch: req.owner_epoch,
+                            shard_offset: shard_off,
+                            payload,
+                        };
+                        let sock = parse_addr(target_addr).map_err(|e| {
+                            (
+                                StatusCode::Internal,
+                                format!("parse addr {target_addr}: {e}"),
+                            )
+                        })?;
+                        match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
+                            Ok(resp_bytes) => {
+                                let resp = WriteShardResp::decode(resp_bytes).map_err(|e| {
+                                    (
+                                        StatusCode::Internal,
+                                        format!("decode write_shard resp: {e}"),
+                                    )
+                                })?;
+                                if resp.code != CODE_OK {
+                                    return Err((
+                                        StatusCode::Internal,
+                                        format!(
+                                            "WriteShard to {target_addr} shard {i} @ {shard_off}: code={}",
+                                            code_description(resp.code)
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
                                 return Err((
                                     StatusCode::Internal,
-                                    format!(
-                                        "WriteShard to {target_addr} shard {i}: code={}",
-                                        code_description(resp.code)
-                                    ),
+                                    format!("WriteShard to {target_addr} shard {i} @ {shard_off}: {e}"),
                                 ));
                             }
                         }
-                        Err(e) => {
-                            return Err((
-                                StatusCode::Internal,
-                                format!("WriteShard to {target_addr} shard {i}: {e}"),
-                            ));
-                        }
                     }
+
+                    // Coordinator's own shard 0 stripe, written LAST.
+                    self.write_shard_stripe_local(
+                        extent_id,
+                        0,
+                        shard_off,
+                        sealed_length,
+                        new_eversion,
+                        Bytes::from(data_bufs[0].clone()),
+                    )
+                    .await?;
+
+                    s += stripe_len;
                 }
 
-                // Coordinator writes its own shard LAST. If we crash here,
-                // no .ec.dat on coordinator → next retry re-reads full
-                // data and re-distributes (remote nodes' prepare is
-                // idempotent).
-                self.write_shard_local(
+                tracing::info!(
                     extent_id,
-                    0,
-                    sealed_length,
-                    new_eversion,
-                    shards[0].clone(),
-                )
-                .await?;
-
-                tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
+                    per_shard,
+                    stripe_bytes,
+                    "EC 2PC phase 1 (prepare) complete on all nodes (chunked)"
+                );
             } // !f128_recovered
         }
 
@@ -6985,9 +7168,10 @@ impl ExtentNode {
             }
         }
 
-        self.write_shard_local(
+        self.write_shard_stripe_local(
             req.extent_id,
             req.shard_index as usize,
+            req.shard_offset,
             req.sealed_length,
             req.eversion,
             req.payload,
@@ -8191,6 +8375,7 @@ mod f211d_wire_fence_tests {
             sealed_length: 12345,
             eversion: 7,
             owner_epoch: 99,
+            shard_offset: 7_000_000_000, // > u32::MAX — exercises the u64 offset
             payload: Bytes::from_static(b"shard-bytes"),
         };
         let encoded = original.encode();
@@ -8200,6 +8385,7 @@ mod f211d_wire_fence_tests {
         assert_eq!(decoded.sealed_length, 12345);
         assert_eq!(decoded.eversion, 7);
         assert_eq!(decoded.owner_epoch, 99);
+        assert_eq!(decoded.shard_offset, 7_000_000_000);
         assert_eq!(decoded.payload.as_ref(), b"shard-bytes");
     }
 
@@ -8211,6 +8397,7 @@ mod f211d_wire_fence_tests {
             sealed_length: 0,
             eversion: 1,
             owner_epoch: 0,
+            shard_offset: 0,
             payload: Bytes::new(),
         };
         let decoded = WriteShardReq::decode(original.encode()).unwrap();

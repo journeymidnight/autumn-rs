@@ -4744,6 +4744,7 @@ mod merge_ec_replay_tests {
                 sealed_length: L as u64,
                 eversion: EVERSION,
                 owner_epoch: 0,
+                shard_offset: 0,
                 payload: Bytes::from(shards[i].clone()),
             };
             let ws_resp = pool

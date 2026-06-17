@@ -174,6 +174,8 @@ impl TestConn {
             sealed_length,
             eversion,
             owner_epoch: 0,
+            // whole-shard single-stripe write (offset 0) — the degenerate form.
+            shard_offset: 0,
             payload: Bytes::from(payload),
         };
         let resp = self

@@ -66,6 +66,59 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
     Ok(shards)
 }
 
+/// Stripe-wise parity encode for the chunked EC-convert path.
+///
+/// Reed-Solomon over GF(256) is byte-wise across the data shards at the SAME
+/// offset: `parity[j][b]` depends only on `data[0][b] .. data[K-1][b]`. So a
+/// "stripe" `[s, s+stripe_len)` of every shard can be encoded independently of
+/// the rest of the extent. `data_stripes` holds the K data-shard sub-ranges at
+/// some shard offset `s` (each EXACTLY `stripe_len` bytes — the caller
+/// zero-pads the last data shard's tail). Returns the M parity-shard
+/// sub-ranges for that same offset.
+///
+/// Invariant (proved by `ec_encode_stripe_matches_whole`): concatenating the
+/// stripe outputs over all offsets `s ∈ [0, shard_size)` yields byte-for-byte
+/// the same shards as a single `ec_encode` over the whole payload. So the
+/// chunked write path produces an on-disk EC layout identical to the
+/// whole-extent encode — reads (`ec_subrange_read` / `ec_read_full`) are
+/// unaffected by which encode path wrote the shards.
+pub fn ec_encode_stripe(
+    data_stripes: &[&[u8]],
+    parity_shards: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let data_shards = data_stripes.len();
+    if data_shards == 0 {
+        return Err(anyhow!("data_stripes must be non-empty"));
+    }
+    if parity_shards == 0 {
+        return Err(anyhow!("parity_shards must be > 0 for EC encode"));
+    }
+    let stripe_len = data_stripes[0].len();
+    for (i, d) in data_stripes.iter().enumerate() {
+        if d.len() != stripe_len {
+            return Err(anyhow!(
+                "ec_encode_stripe: data stripe {i} len {} != stripe_len {stripe_len} \
+                 (all data stripes must be equal length)",
+                d.len()
+            ));
+        }
+    }
+    let total_shards = data_shards + parity_shards;
+    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
+    for d in data_stripes {
+        shards.push(d.to_vec());
+    }
+    for _ in 0..parity_shards {
+        shards.push(vec![0u8; stripe_len]);
+    }
+    let rs = ReedSolomon::new(data_shards, parity_shards)
+        .map_err(|e| anyhow!("ReedSolomon::new failed: {e}"))?;
+    rs.encode(&mut shards)
+        .map_err(|e| anyhow!("RS encode failed: {e}"))?;
+    // Keep only the M parity stripes (data stripes are the caller's own slices).
+    Ok(shards.split_off(data_shards))
+}
+
 /// Decode the original payload from `data_shards + parity_shards` shards.
 ///
 /// Up to `parity_shards` elements of `shards` may be `None` (missing/unavailable).
@@ -453,6 +506,65 @@ mod tests {
                 !not_detected,
                 "full payload should NOT trigger F128 detection"
             );
+        }
+    }
+
+    /// The chunked EC-convert path must produce byte-for-byte the same shards
+    /// as the whole-extent `ec_encode`. Encode each stripe with
+    /// `ec_encode_stripe` and assert the reassembled shards equal `ec_encode`.
+    #[test]
+    fn ec_encode_stripe_matches_whole() {
+        for &(payload_len, k, m) in &[
+            (1usize, 2usize, 1usize),
+            (5, 3, 1),
+            (4096, 3, 1),
+            (10_000, 3, 2),
+            (65_537, 4, 1),
+            (1 << 20, 3, 1),
+            ((1 << 20) + 7, 5, 2),
+        ] {
+            // Deterministic pseudo-random payload (no Math.random in tests).
+            let payload: Vec<u8> = (0..payload_len)
+                .map(|i| ((i * 2654435761usize) >> 13) as u8 ^ (i as u8).wrapping_mul(31))
+                .collect();
+            let whole = ec_encode(&payload, k, m).expect("whole encode");
+            let per_shard = shard_size(payload_len, k);
+
+            for &stripe in &[1usize, 7, 1000, per_shard.max(1), per_shard + 5] {
+                // Reassemble shards from stripe encodes.
+                let mut got: Vec<Vec<u8>> = (0..k + m).map(|_| vec![0u8; per_shard]).collect();
+                let mut s = 0usize;
+                while s < per_shard {
+                    let stripe_len = (per_shard - s).min(stripe);
+                    // Build K data stripes (zero-padded past payload).
+                    let data_bufs: Vec<Vec<u8>> = (0..k)
+                        .map(|i| {
+                            let start = i * per_shard + s;
+                            let mut b = vec![0u8; stripe_len];
+                            let avail = payload_len.saturating_sub(start).min(stripe_len);
+                            if avail > 0 {
+                                b[..avail].copy_from_slice(&payload[start..start + avail]);
+                            }
+                            b
+                        })
+                        .collect();
+                    let data_refs: Vec<&[u8]> = data_bufs.iter().map(|v| v.as_slice()).collect();
+                    let parity = ec_encode_stripe(&data_refs, m).expect("stripe encode");
+                    // Place data + parity stripes back at offset s.
+                    for i in 0..k {
+                        got[i][s..s + stripe_len].copy_from_slice(&data_bufs[i]);
+                    }
+                    for j in 0..m {
+                        got[k + j][s..s + stripe_len].copy_from_slice(&parity[j]);
+                    }
+                    s += stripe_len;
+                }
+                assert_eq!(
+                    got, whole,
+                    "stripe={stripe} payload_len={payload_len} k={k} m={m}: reassembled shards \
+                     must equal whole ec_encode"
+                );
+            }
         }
     }
 }

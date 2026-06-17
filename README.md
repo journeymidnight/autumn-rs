@@ -262,9 +262,17 @@ $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 #   reads chunks via the now-u64 `ReadBytesReq.offset`. Then kill -9 the PS,
 #   restart, and `get-stream` again must match (recovery replays SST + WAL with
 #   u64 offsets). EC: with 16 GiB extents a shard exceeds 4 GiB, served via
-#   per-shard chunked reads (no `payload_len: u32` overflow). Repro script:
-#   the isolated memory-mode loopback recipe (manager w/o --etcd, 4 single-shard
-#   ENs, 1 PS) used in dev.
+#   per-shard chunked reads (no `payload_len: u32` overflow). EC convert is
+#   ALSO chunked (stripe-wise encode + offset-tagged WriteShard streaming):
+#   peak RAM = (K+M)x64MiB regardless of extent size. Manual check: seal a
+#   >1 GiB extent (writes roll it), `autumn-op set-stream-ec --stream S --ec
+#   3+1` then `force-ec-convert --extent E`, confirm the EN logs "phase 1
+#   (prepare) complete ... (chunked)" + "phase 2 (commit) complete", then
+#   `get-stream` the value back -> sha256 must match (chunk-encoded shards are
+#   byte-identical to a whole-extent encode). Override stripe size with
+#   AUTUMN_EXTENT_EC_STRIPE_BYTES on the EN to force many stripes on a smaller
+#   extent. Repro script: the isolated memory-mode loopback recipe (manager
+#   w/o --etcd, 4 single-shard ENs, 1 PS) used in dev.
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

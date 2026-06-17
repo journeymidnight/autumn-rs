@@ -54,8 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 5;
-pub const WIRE_VERSION_MAX: u32 = 5;
+pub const WIRE_VERSION_MIN: u32 = 6;
+pub const WIRE_VERSION_MAX: u32 = 6;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -92,6 +92,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // default 3 GiB → 16 GiB (`autumn-ps --max-extent-size-bytes`).
     // Pre-R3: MIN=MAX=5.
     (5, "5254fafce73f6ffe"),
+    // v6: chunked EC convert — WriteShardReq grew `shard_offset: u64`
+    // (header 36→44 B) so an EC shard is streamed as offset-tagged stripes,
+    // keeping each WriteShard under the frame `payload_len: u32` ceiling for
+    // >4 GiB shards (16+ GiB extents) and bounding the encode transient to
+    // (K+M)×stripe instead of ~2× the whole extent. Pre-R3: MIN=MAX=6.
+    (6, "e9fb9f2e6a582867"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
