@@ -4253,6 +4253,110 @@ mod tests {
         assert_eq!(e41.sealed_length, 200);
     }
 
+    // MERGE-REFS-RECOMPUTE reproduction attempt (2026-06-18): the
+    // `refs.saturating_sub(1)` in compute_merge_streams is only dangerous if
+    // `refs` is ALREADY under-counted. This drives realistic split→merge-back
+    // cycles (2-way repeated, then 3-way) through the real compute+apply fns and
+    // asserts `refs == #streams listing the extent` after EVERY step. If the
+    // invariant holds, saturating_sub never fires on an under-counted value →
+    // no reproducible harm → MERGE-REFS-RECOMPUTE is belt-and-braces, defer.
+    // (Also a permanent regression guard against refs/membership drift.)
+    #[test]
+    fn merge_refs_invariant_holds_across_split_merge_cycles() {
+        fn check(state: &autumn_common::MetadataState, label: &str) {
+            for (eid, ex) in &state.extents {
+                let mem = state
+                    .streams
+                    .values()
+                    .filter(|s| s.extent_ids.contains(eid))
+                    .count() as u64;
+                assert_eq!(
+                    ex.refs, mem,
+                    "{label}: extent {eid} refs={} != stream membership={}",
+                    ex.refs, mem
+                );
+            }
+        }
+        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+            extent_id: id,
+            replicates: vec![1],
+            parity: vec![],
+            replicate_disks: vec![1],
+            parity_disks: vec![],
+            sealed_length: sealed,
+            sealed: sealed > 0,
+            avali: 1,
+            eversion: 0,
+            refs,
+            vp_table_refs: 0,
+            ec_converted: false,
+        };
+
+        let mut state = autumn_common::MetadataState::default();
+        state.extents.insert(10, mk(10, 1, 1024)); // shared ancestor
+        state.extents.insert(50, mk(50, 1, 0)); // tail
+        state.streams.insert(
+            100,
+            MgrStreamInfo {
+                stream_id: 100,
+                extent_ids: vec![10, 50],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        check(&state, "init");
+
+        let split = |state: &mut autumn_common::MetadataState, src: u64, dst: u64| {
+            let (dst_stream, modified) =
+                AutumnManager::compute_duplicate_stream(state, src, dst, 1024).unwrap();
+            for ex in &modified {
+                state.extents.insert(ex.extent_id, ex.clone());
+            }
+            state.streams.insert(dst, dst_stream);
+        };
+        let merge = |state: &mut autumn_common::MetadataState, surv: u64, vic: u64, tail: u64| {
+            let new_tail = mk(tail, 1, 0);
+            let (updated, modified) =
+                AutumnManager::compute_merge_streams(state, surv, vic, 4096, 8192, new_tail)
+                    .unwrap();
+            for ex in &modified {
+                state.extents.insert(ex.extent_id, ex.clone());
+            }
+            state.streams.insert(surv, updated);
+            state.streams.remove(&vic);
+        };
+
+        // 5 rounds of 2-way split→merge-back: refs(10) goes 1→2→1 each round.
+        let mut dst = 200u64;
+        let mut tail = 90u64;
+        for _ in 0..5 {
+            split(&mut state, 100, dst);
+            check(&state, "after split");
+            merge(&mut state, 100, dst, tail);
+            check(&state, "after merge-back");
+            dst += 1;
+            tail += 1;
+        }
+
+        // 3-way: split 100 twice (→ shared refs=3), merge both back one at a time.
+        split(&mut state, 100, 700);
+        check(&state, "3way split #1");
+        split(&mut state, 100, 701);
+        check(&state, "3way split #2");
+        merge(&mut state, 100, 700, 95);
+        check(&state, "3way merge #1");
+        merge(&mut state, 100, 701, 96);
+        check(&state, "3way merge #2");
+
+        // Final: the shared ancestor 10 is back to exactly one membership.
+        assert_eq!(state.extents.get(&10).unwrap().refs, 1);
+        assert_eq!(
+            state.streams.values().filter(|s| s.extent_ids.contains(&10)).count(),
+            1
+        );
+    }
+
     #[test]
     fn f181_apply_merge_mutations_drops_victim_entries() {
         let mut state = autumn_common::MetadataState::default();

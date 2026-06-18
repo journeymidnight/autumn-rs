@@ -1223,9 +1223,16 @@ gaps in the lease protocol's correctness story.
   `vp_freed_after_both_children_compact_and_gc` 集成测试覆盖(慢)。
 - **passes:** completed(2026-06-18,代码 + reproduce-first 单测 + 回归 + coco 复审)。
 
-### MERGE-REFS-RECOMPUTE · merge refs 改"从成员关系重算"(消 saturating_sub 脆性,待落)
+### MERGE-REFS-RECOMPUTE · merge refs 改"从成员关系重算"(消 saturating_sub 脆性)
 - **触发:** coco /findbugs P1 + GC-VP-IDENTITY 审计 —— merge 的 `refs.saturating_sub(1)` 在 refs 已欠计时静默到 0,
-  若将来删 vp_table_refs 则直接变物理删除风险。
-- **方向:** `compute_merge_streams` / `splice_streams_without_new_tail` 的 refs 从结果成员关系**重算**(而非增量
-  saturating_sub);recovery 后对 `refs == count(stream.extent_ids 含 eid)` 做一次校验。
-- **passes:** not_completed(下一步;独立于已完成的 GC-VP-IDENTITY)。
+  理论上若 refs 欠计则物理删除风险。
+- **方向(若做):** `compute_merge_streams` / `splice_streams_without_new_tail` 的 refs 从结果成员关系**重算**(而非
+  增量 saturating_sub);recovery 后对 `refs == count(stream.extent_ids 含 eid)` 做一次校验。
+- **复现尝试(2026-06-18,reproduce-first):** `merge_refs_invariant_holds_across_split_merge_cycles`(manager lib)
+  用真实 compute+apply fns 跑 5 轮 2-way split→merge-back + 一次 3-way split→merge,每步断言
+  `refs == #streams listing extent`。**全程不变量成立 → saturating_sub 在真实操作下从不在欠计值上触发 → 复现失败**。
+  且其后果(refs 欠计 → 误删)已被 **EXTENT10 #2 成员检查**(both-zero 但仍在 stream → ERROR 跳过,extent 13 单测)
+  + punch 的成员感知删除 网住。
+- **结论:DEFERRED(防御性,非复现真害)。** 按 memory(reproduce-first / 不凭 coco-arch 在 revert-prone merge 区动刀)
+  缓做;真复现出 saturating_sub 引发实害再落。复现尝试测试保留作 refs/membership 漂移的**永久回归守卫**。
+- **passes:** not_completed(DEFERRED;复现失败 + 后果已网住;回归守卫已加)。
