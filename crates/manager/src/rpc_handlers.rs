@@ -1544,6 +1544,34 @@ impl AutumnManager {
                 }
             };
 
+            // BUG2-IDEMPOTENT-ROLL: the writer pinned `seal_extent_id` = the tail
+            // it captured `seal_commit` for. If that is NO LONGER the current
+            // tail, this is a STALE / RETRIED seal-and-roll: a prior attempt
+            // already sealed that extent + rolled a fresh tail, but its response
+            // was lost so the writer retried with the same `seal_commit`. Sealing
+            // the current FRESH tail at the stale `seal_commit` would over-seal an
+            // extent that does NOT durably hold that many bytes → the extent is
+            // unrecoverable → any partition replaying it WAL-FAILSTOPs and never
+            // opens (chaos seed=603 split-child wedge). Idempotent no-op: return
+            // the current tail untouched (it IS the OPEN extent the first attempt
+            // rolled) so the writer adopts it. `seal_extent_id == 0` = no pinned
+            // target (probe / `None` seal) → fall through to the normal path.
+            //
+            // coco P1: gate on `!tail.sealed`. If the current tail is itself
+            // SEALED (a later op rolled-and-sealed past the first attempt's fresh
+            // tail), returning it would hand the writer a sealed extent as a
+            // "fresh" tail → its appends fail → roll/retry wedge. In that case
+            // fall through to the existing `already_sealed` path, which preserves
+            // the seal AND allocates a NEW open tail to return.
+            if req.seal_extent_id != 0 && tail_id != req.seal_extent_id && !tail.sealed {
+                return Ok(rkyv_encode(&StreamAllocExtentResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    stream_info: Some(stream.clone()),
+                    last_ex_info: Some(tail.clone()),
+                }));
+            }
+
             // F146: refuse-at-start. Symmetric to F138 (apply_recovery_done,
             // mark_extent_available, handle_multi_modify_split) and F145
             // (handle_stream_punch_holes, handle_truncate). Without these

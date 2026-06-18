@@ -1047,6 +1047,26 @@ sufficient (and cheaper than DashMap).
     bool)` pair. **Invariant: never reintroduce a public-API commit-watermark
     cache; the seal length must come from the worker via SealCommit.**
 
+    **BUG2-IDEMPOTENT-ROLL (chaos seed=603, WIRE v8): the SealCommit reply is
+    `(commit, tail_extent_id)`, and that extent id is threaded to the manager as
+    `seal_extent_id` so seal-and-roll is IDEMPOTENT on retry.** `alloc_new_extent`
+    runs under `retry_manager_call` (20×). If an attempt SUCCEEDS on the manager
+    (seals tail T at `commit`, rolls fresh tail T') but its response is LOST
+    (chaos latency), the retry re-sends the SAME `seal_commit` — and the worker,
+    whose cached tail is still T (it never saw the lost ResetTail), re-reports
+    `(commit, T)`. Pre-fix the manager sealed its now-current FRESH tail T' at the
+    stale `commit` → over-sealed T' beyond what any replica durably holds → T'
+    unrecoverable → a split child CoW-sharing the log stream WAL-FAILSTOPs on
+    replay and never opens. Fix: the worker is the ONLY place that knows WHICH
+    extent the drained `commit` belongs to (its cached `state.tail.extent_id`),
+    so `SealCommit` returns it; `seal_commit_watermark` → `(commit, eid)` →
+    `alloc_new_extent(stream, Some(commit), eid)` (the `Some(result.end)`
+    preemptive-roll site passes `result.extent_id`; `None`/probe sites pass `0`).
+    The manager seals ONLY when its current tail still == `seal_extent_id` (and
+    is OPEN), else idempotent no-op. **Invariant: any authoritative
+    (`Some(commit)`) alloc MUST pass the captured tail's `seal_extent_id`; only
+    probe/`None` rolls may pass `0`.** Cross-ref: manager CLAUDE.md note 32a.
+
 21. **`ExtentInfo.sealed` is the authoritative "is sealed" flag — NOT
     `sealed_length > 0`.** Mirrors `MgrExtentInfo.sealed`. An authoritative
     empty seal is `sealed = true, sealed_length = 0` (e.g. a CoW-shared empty

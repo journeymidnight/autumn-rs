@@ -4478,6 +4478,7 @@ mod tests {
                 owner_epoch: rev,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
+                seal_extent_id: 0,
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
@@ -6157,6 +6158,7 @@ mod tests {
                 owner_epoch,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
+                seal_extent_id: 0,
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
@@ -6242,6 +6244,7 @@ mod tests {
                 owner_epoch,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
+                seal_extent_id: 0,
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();

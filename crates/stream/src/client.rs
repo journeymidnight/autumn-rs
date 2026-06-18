@@ -710,7 +710,15 @@ enum StreamSubmitMsg {
     /// safe source — a public-API-tracked value always lags the worker and
     /// races concurrent out-of-order appends + rolls. The drain is bounded by
     /// each append's `append_fanout_timeout`, so it cannot hang.
-    SealCommit { resp: oneshot::Sender<u64> },
+    ///
+    /// BUG2-IDEMPOTENT-ROLL: reply is `(commit, tail_extent_id)` — the worker
+    /// is the only place that authoritatively knows WHICH extent the drained
+    /// `commit` belongs to (its cached tail). The caller threads
+    /// `tail_extent_id` into `alloc_new_extent` as `seal_extent_id` so a retried
+    /// roll seals that exact extent (idempotent), never the freshly-rolled one.
+    SealCommit {
+        resp: oneshot::Sender<(u64, u64)>,
+    },
     /// Explicit shutdown.  Dropping the last Sender also exits the worker
     /// via channel close — this variant is kept for symmetry / tests.
     #[allow(dead_code)]
@@ -885,7 +893,14 @@ async fn stream_worker_loop(
                         in_flight = state.in_flight,
                         "BUG2 SealCommit reply"
                     );
-                    let _ = resp.send(state.commit);
+                    // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside
+                    // the commit so the caller can pin the seal to THIS extent.
+                    let tail_eid = state
+                        .tail
+                        .as_ref()
+                        .map(|t| t.extent.extent_id)
+                        .unwrap_or(0);
+                    let _ = resp.send((state.commit, tail_eid));
                     // Freeze the tail until ResetTail so no append lands past
                     // the just-reported seal point (coco P1).
                     state.sealing = true;
@@ -963,7 +978,14 @@ async fn stream_worker_loop(
                         in_flight = state.in_flight,
                         "BUG2 SealCommit reply"
                     );
-                    let _ = resp.send(state.commit);
+                    // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside
+                    // the commit so the caller can pin the seal to THIS extent.
+                    let tail_eid = state
+                        .tail
+                        .as_ref()
+                        .map(|t| t.extent.extent_id)
+                        .unwrap_or(0);
+                    let _ = resp.send((state.commit, tail_eid));
                     // Freeze the tail until ResetTail so no append lands past
                     // the just-reported seal point (coco P1).
                     state.sealing = true;
@@ -1918,29 +1940,24 @@ impl StreamClient {
         &self,
         stream_id: u64,
         seal_commit: Option<u64>,
+        seal_extent_id: u64,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
         // this set and only blocks allocation if doing so would empty
         // the pool — see `select_nodes` + `handle_stream_alloc_extent`.
         let exclude_node_ids = self.snapshot_bad_nodes(stream_id);
-        // BUG2 trace (opt-in, target `bug2_trace`): which writer asks the
-        // manager to seal-and-roll, and at what commit. `seal_commit=Some(0)`
-        // here is the writer-side origin of an under-seal (the SealCommit
-        // handshake returned a reset/stale worker's `state.commit=0`).
-        tracing::info!(
-            target: "bug2_trace",
-            stream_id,
-            seal_commit = ?seal_commit,
-            owner = %self.owner_key,
-            "BUG2 alloc_new_extent request"
-        );
         let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
             stream_id,
             owner_key: self.owner_key.clone(),
             owner_epoch: self.owner_epoch,
             seal_commit,
             exclude_node_ids,
+            // BUG2-IDEMPOTENT-ROLL: pin the seal to the extent the commit was
+            // captured for (0 = no specific target / probe). Reused verbatim
+            // across retries, so a retried roll seals THAT extent (idempotent),
+            // never the freshly-rolled new tail.
+            seal_extent_id,
         });
         // 30 s — manager seals current tail (3-replica commit_length
         // probe + etcd mirror) and allocs a fresh extent on each new
@@ -1976,9 +1993,14 @@ impl StreamClient {
         &self,
         stream_id: u64,
         seal_commit: Option<u64>,
+        seal_extent_id: u64,
     ) -> Result<(StreamInfo, ExtentInfo)> {
+        // BUG2-IDEMPOTENT-ROLL: `seal_extent_id` is captured ONCE (with
+        // `seal_commit`) and reused across every retry inside
+        // `retry_manager_call`, so a retried roll seals the original tail
+        // (idempotent), never the freshly-rolled new tail.
         self.retry_manager_call("alloc_new_extent", 20, || {
-            self.alloc_new_extent_once(stream_id, seal_commit)
+            self.alloc_new_extent_once(stream_id, seal_commit, seal_extent_id)
         })
         .await
     }
@@ -2004,7 +2026,8 @@ impl StreamClient {
     /// picked up by `ensure_tail_initialised` when the worker later spawns (the
     /// old tail now reports sealed → alloc fresh, the standard path).
     pub async fn seal_and_roll_tail(&self, stream_id: u64) -> Result<()> {
-        self.alloc_new_extent(stream_id, None).await?;
+        // None seal_commit (probe) → seal_extent_id=0 (no specific target).
+        self.alloc_new_extent(stream_id, None, 0).await?;
         Ok(())
     }
 
@@ -2019,11 +2042,15 @@ impl StreamClient {
     /// 0 for a tail where nothing was ever all-acked); the caller passes it to
     /// `alloc_new_extent(.., Some(commit))` so the manager seals
     /// at EXACTLY this value without probing.
+    /// Returns `(commit, tail_extent_id)` — `tail_extent_id` is the extent the
+    /// drained `commit` belongs to (BUG2-IDEMPOTENT-ROLL). Pass it on to
+    /// `alloc_new_extent` as `seal_extent_id` so a retried roll seals THAT
+    /// extent (idempotent), not the freshly-rolled tail.
     async fn seal_commit_watermark(
         &self,
         stream_id: u64,
         tx: &mpsc::Sender<StreamSubmitMsg>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let mut tx_clone = tx.clone();
         tx_clone
@@ -2128,8 +2155,9 @@ impl StreamClient {
                             // clean seal boundary (later-leased appends are
                             // beyond it → re-driven onto the new tail). end > 0
                             // ⇒ the manager trusts it without probing.
-                            if let Ok((_, new_ext)) =
-                                self.alloc_new_extent(stream_id, Some(result.end)).await
+                            if let Ok((_, new_ext)) = self
+                                .alloc_new_extent(stream_id, Some(result.end), result.extent_id)
+                                .await
                             {
                                 if let Ok(replica_addrs) =
                                     self.replica_addrs_for_extent(&new_ext).await
@@ -2174,9 +2202,13 @@ impl StreamClient {
                         }
                         // SealCommit handshake: seal the failed tail at the
                         // worker's TRUE drained commit (no probe → no phantom).
-                        let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
-                        let (_, new_ext) =
-                            self.alloc_new_extent(stream_id, Some(seal_commit)).await?;
+                        // BUG2-IDEMPOTENT-ROLL: pin the seal to the tail the
+                        // commit was captured for, so a retried roll is idempotent.
+                        let (seal_commit, seal_eid) =
+                            self.seal_commit_watermark(stream_id, &tx).await?;
+                        let (_, new_ext) = self
+                            .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                            .await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                         let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                         let new_tail = StreamTail {
@@ -2203,9 +2235,12 @@ impl StreamClient {
                                     "too many extent allocations ({alloc_count}) for single append, giving up"
                                 ));
                             }
-                            let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
-                            let (_, new_ext) =
-                                self.alloc_new_extent(stream_id, Some(seal_commit)).await?;
+                            // BUG2-IDEMPOTENT-ROLL: pin seal to the captured tail.
+                            let (seal_commit, seal_eid) =
+                                self.seal_commit_watermark(stream_id, &tx).await?;
+                            let (_, new_ext) = self
+                                .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                                .await?;
                             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                             let new_tail = StreamTail {
@@ -2255,9 +2290,11 @@ impl StreamClient {
                             "too many extent allocations ({alloc_count}) for single append, giving up: {e}"
                         ));
                     }
-                    let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
+                    // BUG2-IDEMPOTENT-ROLL: pin seal to the captured tail.
+                    let (seal_commit, seal_eid) =
+                        self.seal_commit_watermark(stream_id, &tx).await?;
                     let (_, new_ext) = self
-                        .alloc_new_extent(stream_id, Some(seal_commit))
+                        .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
                         .await
                         .map_err(|alloc_err| {
                             alloc_err
@@ -2303,7 +2340,7 @@ impl StreamClient {
             // so this is NOT a failover seal — we just roll past it. The
             // manager's `already_sealed` short-circuit preserves the existing
             // seal; `seal_commit = None` (no worker commit to claim → probe).
-            let (_, new_ext) = self.alloc_new_extent(stream_id, None).await?;
+            let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
             (
@@ -2355,7 +2392,7 @@ impl StreamClient {
                         error = %e,
                         "BUG#1: open-tail current_commit persistently failed — sealing + rolling to a fresh tail (seal-over-reachable)"
                     );
-                    let (_, new_ext) = self.alloc_new_extent(stream_id, None).await?;
+                    let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
                     let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                     let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                     (
@@ -4457,6 +4494,7 @@ mod f190_wire_compat_tests {
             owner_epoch: 7,
             seal_commit: None,
             exclude_node_ids: Vec::new(),
+                seal_extent_id: 0,
         };
         let bytes = rkyv_encode(&req);
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
@@ -4475,6 +4513,7 @@ mod f190_wire_compat_tests {
             owner_epoch: 0,
             seal_commit: Some(1024),
             exclude_node_ids: vec![3, 5, 9101],
+                seal_extent_id: 0,
         };
         let bytes = rkyv_encode(&req);
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");

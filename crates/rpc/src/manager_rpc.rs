@@ -582,6 +582,21 @@ pub struct StreamAllocExtentReq {
     /// empties the pool, it falls back to the full set rather than
     /// blocking allocation on stale excludes.
     pub exclude_node_ids: Vec<u64>,
+    /// BUG2-IDEMPOTENT-ROLL: the extent id the writer captured `seal_commit`
+    /// for (the tail at SealCommit-handshake time). `0` = no specific target
+    /// (legacy / probe / `None` seal — seal the current tail as before).
+    ///
+    /// Makes seal-and-roll IDEMPOTENT on retry. A retried alloc (first attempt
+    /// succeeded on the manager — sealed the tail + rolled a fresh one — but its
+    /// response was lost) re-sends the SAME `seal_commit` for the SAME old tail.
+    /// Without this the manager would seal the now-current FRESH tail at the
+    /// stale `seal_commit`, over-sealing an extent that does not durably hold
+    /// that many bytes → unrecoverable extent → any partition replaying it
+    /// WAL-FAILSTOPs and never opens (chaos seed=603 split-child wedge). With
+    /// it, the manager seals ONLY when the current tail still equals
+    /// `seal_extent_id`; otherwise the requested target was already sealed/rolled
+    /// → idempotent no-op (return the current tail untouched).
+    pub seal_extent_id: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

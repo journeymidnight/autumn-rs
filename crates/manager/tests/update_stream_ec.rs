@@ -249,6 +249,7 @@ fn update_stream_ec_triggers_conversion() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

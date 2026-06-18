@@ -66,6 +66,7 @@ fn seal_during_active_writes_client_retries() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: None,
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

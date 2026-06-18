@@ -321,6 +321,7 @@ fn stream_manager_alloc_and_truncate_flow() {
                     owner_epoch: lock.owner_epoch,
                     seal_commit: Some(128),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

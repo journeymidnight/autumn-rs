@@ -162,6 +162,7 @@ fn alloc_extent_falls_back_on_dead_node() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: None,
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

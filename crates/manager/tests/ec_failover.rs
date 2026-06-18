@@ -169,6 +169,7 @@ fn ec_2_1_failover_and_recovery() {
                     owner_epoch: client.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

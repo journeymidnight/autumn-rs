@@ -54,8 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 7;
-pub const WIRE_VERSION_MAX: u32 = 7;
+pub const WIRE_VERSION_MIN: u32 = 8;
+pub const WIRE_VERSION_MAX: u32 = 8;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -107,6 +107,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // (Fingerprint updated within the same logical v7 by the coco-P0 follow-up —
     // comment/doc edits only, no wire-layout change; v7 not yet deployed.)
     (7, "96f3131d4e1e0038"),
+    // v8: BUG2-IDEMPOTENT-ROLL — StreamAllocExtentReq grew `seal_extent_id: u64`
+    // (the tail the writer captured `seal_commit` for; 0 = no pinned target).
+    // Makes seal-and-roll idempotent on retry: the manager seals ONLY when the
+    // current tail still equals `seal_extent_id`, else returns the current tail
+    // untouched — so a retried roll never over-seals the freshly-rolled tail
+    // (chaos seed=603 split-child WAL-FAILSTOP wedge). Pre-R3: MIN=MAX=8.
+    (8, "92ea7fc8dd2afaa5"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

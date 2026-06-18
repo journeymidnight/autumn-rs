@@ -354,7 +354,9 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   wedged partition with no part_addr — NOT data loss. DRAIN-GATE before each
 #   run: wait until `ss -tan | grep -c TIME-WAIT` < 4000 (see memory
 #   project_chaos_long_soak_port_exhaustion). seed=583 = the GC stale-cache
-#   big-value-loss regression guard (BUG-GC-STALE-CACHE).
+#   big-value-loss regression guard (BUG-GC-STALE-CACHE); seed=603 (under
+#   AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500, 45s) = the seal-and-roll non-
+#   idempotent-retry split-child-open wedge guard (BUG-IDEMPOTENT-ROLL).
 ```
 
 ## Rolling restart (R0 of docs/rolling_upgrade_design.md)

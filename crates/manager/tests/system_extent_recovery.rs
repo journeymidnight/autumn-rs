@@ -70,6 +70,7 @@ fn extent_recovery_replaces_dead_node() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await
@@ -195,6 +196,7 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(r.end),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await

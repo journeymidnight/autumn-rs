@@ -1528,6 +1528,37 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     PROBE seal — still used for the `None`/new-owner path), 31 (alloc
     already-sealed no-tail-rewrite).
 
+32a. **`handle_stream_alloc_extent` is IDEMPOTENT on retry via
+    `StreamAllocExtentReq.seal_extent_id` (BUG2-IDEMPOTENT-ROLL, chaos
+    seed=603, WIRE v8).** `seal_and_roll` was non-idempotent: the writer
+    captures `seal_commit` (the worker's drained commit) for a specific tail T
+    via the `SealCommit` handshake, then calls `alloc_new_extent(Some(commit))`
+    to seal T + roll a fresh tail T'. If that alloc SUCCEEDS on the manager
+    (seals T, rolls T') but its response is LOST (chaos latency), the writer
+    retries with the SAME `seal_commit` — and the manager, whose current tail is
+    now the fresh OPEN T', would **seal T' at the stale `seal_commit`**,
+    over-sealing an extent that does NOT durably hold that many bytes → T' is
+    unrecoverable → any partition replaying it (a split child CoW-sharing the log
+    stream) hits WAL-FAILSTOP and NEVER opens (its keys unreachable;
+    `mismatches=0`, data not physically lost — it's the seal length that's
+    bogus). Fix: the writer pins `seal_extent_id` = T (the `SealCommit` handshake
+    now returns `(commit, tail_extent_id)`; `seal_commit_watermark` →
+    `alloc_new_extent(stream, Some(commit), seal_extent_id)`), reused verbatim
+    across every `retry_manager_call` attempt. The manager seals ONLY when the
+    current tail still equals `seal_extent_id` AND is OPEN; otherwise (the
+    retried/stale case — T already sealed + rolled) it is an **idempotent no-op**
+    that returns the current tail untouched. **`!tail.sealed` is load-bearing
+    (coco P1):** if the current tail is itself SEALED (a later op rolled+sealed
+    past T'), the no-op would hand a sealed extent back as a "fresh" tail → the
+    writer's appends fail → roll/retry wedge; instead it falls through to the
+    `already_sealed` path which preserves the seal AND allocs a NEW open tail.
+    `seal_extent_id == 0` = no pinned target (probe / `None` seal /
+    `seal_and_roll_tail`) → normal path. Does NOT touch F227 `compute_commit_seal`
+    semantics — purely a retry-idempotency guard. Same non-idempotent-retry
+    family as [[project_split_retry_cascade]]. Cross-ref: notes 28 (F227 lenient
+    seal), 31 (already-sealed no-rewrite), 32 (sealed bool + authoritative
+    seal_commit).
+
 33. **Stream-membership etcd writes value-CAS on `streams/<id>` (Item 3 —
     resurrect-deleted-extent fix).** The manager is single-threaded but handlers
     interleave at every `.await`. `handle_stream_alloc_extent` (adds an extent),

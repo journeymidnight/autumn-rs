@@ -1293,3 +1293,21 @@ gaps in the lease protocol's correctness story.
   (封存时更新旧 tail 缓存为 `sealed=true,len=seal_commit`,GC 见新态且零新增 RPC)待 seed=603 wedge 根因后再上。
 - **passes:** completed(no-refetch 保守跳过;代码 + 单测 + 11-seed 加压 chaos + coco 复审;用户批准"先保守跳过")。
   GC-回收-leak 修法 + seed=603 split-child-open wedge = not_completed(后续两件)。
+
+## BUG-IDEMPOTENT-ROLL — seal-and-roll 重试幂等(2026-06-18,chaos seed=603,WIRE v8)
+- **目标/边界:** 修复 chaos 复现的 split-child-open wedge:split 子分区永远起不来 → key 不可达
+  (mismatches=0;数据没物理丢,在 CoW 共享 stream;是 seal 长度虚高)。
+- **根因:** `alloc_new_extent`(封存+滚动)重试不幂等。写入端为 tail T 抓 `seal_commit`(SealCommit 握手),
+  调 `alloc_new_extent(Some(commit))` 封 T + 滚新 tail T'。若该 alloc 在 manager 成功(封 T、滚 T')但响应丢了
+  (chaos 延迟),写入端用同一 `seal_commit` 重试 → manager 当前 tail 已是全新 OPEN 的 T' → 把 T' 按 stale commit
+  封过头 → T' 永不可恢复 → 任何回放它的分区(CoW 共享 log stream 的 split 子)撞 WAL-FAILSTOP 永不 open。
+- **修法(把封存绑定到具体 extent,幂等):** SealCommit 握手返回 `(commit, tail_extent_id)`;
+  `seal_commit_watermark → alloc_new_extent(stream, Some(commit), seal_extent_id)`(`Some(result.end)` 预滚传
+  `result.extent_id`;probe/`None` 传 0)。manager **仅当当前 tail == `seal_extent_id` 且 OPEN 才封**;否则
+  (重试/已滚走)幂等空操作返回当前 tail。**`!tail.sealed` 闸(coco P1):** 当前 tail 已封则 fall through 到
+  `already_sealed`(保 seal + 分配新 open tail),不把已封 extent 当 fresh tail 返回。不动 F227 lenient-seal 语义。
+  WIRE bump v8(`StreamAllocExtentReq.seal_extent_id: u64`,同版本部署)。
+- **验收标准:** (1) 编译 + stream 82 / PS 167 / rpc 30 单测绿 + WIRE registry test 绿;(2) 修复前(带 refetch
+  触发器)seed 603 3/3 挂;修复后 seed 603 ×5 + 回归(583/58/581/600/601/602/13)= 0 挂(14 次加压 chaos);
+  (3) coco 复审(P1 已修 + 重验)。
+- **passes:** completed(WIRE v8;代码 + 单测 + 14-run 加压 chaos + coco;用户已看 diff 批准提交)。

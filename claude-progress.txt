@@ -1,43 +1,31 @@
 Date: 2026-06-18
 TaskStatus: not_completed
-Task scope: /loop chaos 测试。BUG #1(GC stale-cache fast-punch → big-value 丢数据)已修复 + 提交(no-refetch 保守跳过,
-  用户批准"先保守跳过")。BUG #2(split-child-open wedge,seed 603)+ GC-回收-leak(coco P1)= 后续两件,故 not_completed。
+Task scope: /loop chaos 测试。BUG #1(GC stale-cache fast-punch,数据丢失)+ BUG #2(seal-and-roll 重试不幂等 →
+  split-child-open wedge)均已修复 + 提交。剩 GC-回收-leak(coco P1,deferred)未做,故 not_completed。
 
-== BUG #1 (DONE + COMMITTED) — GC stale-cache fast-punch ==
-  复现:加压 chaos(45s + nemesis 1500ms)seed 583 丢 q000056(mismatches=0,真丢)。
-  根因:GC F201 fast-punch 读 StreamClient::get_extent_info(带缓存);alloc_new_extent 封旧 tail 后只缓存新 tail、
-    不 evict 旧 tail → 旧 tail 残留 pre-seal OPEN 快照(sealed=false,sealed_length=0)→ GC 信陈旧 0 → punch 已封
-    extent(实 7.8MB live VP)→ refs→0 删除 → VP 读 NotFound。
-  修法(no-refetch 保守跳过):authoritative_sealed_length helper(Auto+Force 共用,(eid,sealed_length) 带到 run_gc,
-    无 check/use 再读):sealed 不可变 ⇒ 缓存 sealed=true 可信;读到 !sealed 一律 SKIP(None)——绝不删非权威已封 extent。
-    刻意不 invalidate+refetch(每候选多一次 GC→manager RPC 会移时序、照出 BUG #2)。+ coco P3:Force GC 配额按 validated
-    holes 计数(take 移到 push 后)。
-  验证:PS 167 单测绿;seed 583 修复前必丢、修复后多次过;no-refetch 11 seed 加压全绿(58/581/582/13/600/601/602/
-    604/605/583/603);coco 两轮(P1 closed→P3 fixed;最终 P1=回收 leak 见下,已知接受)。
+== BUG #1 (DONE + COMMITTED 1346e0d) — GC stale-cache fast-punch ==
+  GC F201 fast-punch 信了 StreamClient extent_info 陈旧缓存(alloc 封旧 tail 不 evict)→ 把已封满载 live VP 的
+  extent 当空删掉(seed 583 丢 q000056)。修法:authoritative_sealed_length helper,读到 !sealed 一律 SKIP(no-refetch,
+  数据安全,零新增 RPC,不触发 BUG#2 时序)。验证 11 seed 加压全绿 + coco。
 
-== 待办 1:GC-回收-leak(coco P1,deferred)==
-  no-refetch 跳过的副作用:真已封但卡在 stale-cached-as-open 的 extent 会被永久跳过(无刷新机制)直到 read/EC-invalidate/
-  重启 → GC 回收不及时(浪费空间,非丢数据)。干净修法:封存时更新旧 tail 缓存为 sealed=true,len=seal_commit
-  (alloc_new_extent_once 在 seal_commit=Some(c) 时改 cache,GC 见新态且零新增 RPC,不触发 BUG #2)。
-  待 BUG #2 根因后再上(因为"正常回收需新鲜元数据 → GC RPC → 触发 BUG #2"三者纠缠)。
+== BUG #2 (DONE + COMMITTED 本次) — seal-and-roll 重试不幂等(chaos seed=603,WIRE v8)==
+  根因:alloc_new_extent(Some(commit)) 在 manager 成功(封 T、滚新 OPEN tail T')但响应丢 → 写入端用同一 seal_commit
+    重试 → manager 把当前全新的 T' 按 stale commit 封过头 → T' 永不可恢复 → split 子(CoW 共享 log stream)回放它
+    撞 WAL-FAILSTOP 永不 open → key 不可达(mismatches=0,数据没物理丢)。
+  修法:SealCommit 握手返回 (commit, tail_extent_id);alloc_new_extent(stream, Some(commit), seal_extent_id);
+    manager 仅当当前 tail==seal_extent_id 且 OPEN 才封,否则幂等空操作返回当前 tail;coco P1:!tail.sealed 闸
+    (已封则 fall through already_sealed 分配新 open tail)。WIRE v8。不动 F227 lenient-seal。
+  验证:stream82/PS167/rpc30 单测 + WIRE registry 绿;修复前 seed 603 3/3 挂、修复后 seed 603 ×5 + 回归 0 挂
+    (14 次加压 chaos);coco(P1 已修+重验)。
 
-== 待办 2:BUG #2 — split-child-open wedge(seed 603,NEXT 调查)==
-  现象:加压 chaos seed 603,split part 9001 生成子分区 23,但 "partition 23 has no PS addr" / verify "part 23 not in
-    regions yet" → 子分区 23 永不上线 → 其 ~200 key 不可达(mismatches=0;数据没物理丢,在 CoW 共享 stream 里)。
-  关键事实(reproduce-first 已确认):
-    - baseline(无 BUG#1 修复)PASS seed 603 ×2;BUG#1 的 refetch 版 FAIL ×3;no-refetch 版 PASS ×多次。
-    - ⇒ BUG #2 是 PRE-EXISTING 潜伏 wedge,refetch 版多的 GC→manager RPC 移了时序把它照出来;非 BUG#1 逻辑所致。
-    - 属 BUG#3 routing-wedge / F212 split-child-open / recovery-stuck 家族。timing-sensitive。
-  下一步:用 refetch 版(或加压时序)稳定复现 → 定向 trace 子分区 23 的 region 分配 / PS open / register_partition_addr
-    路径,看为何子 23 永不 open/注册 addr(疑似 split 后右子在被 kill 的 PS 上 open 卡住 / rebalance 未分配)。
-
-== 提交 ==
-  本次 commit:crates/partition-server/src/background.rs(no-refetch GC 修复)+ partition-server/CLAUDE.md(GC-STALE-CACHE
-  note)+ feature_list.md(BUG-GC-STALE-CACHE 条目)+ claude-progress.txt。push 到 main(solo-flow)。
+== 待办(deferred):GC-回收-leak(coco 在 BUG#1 提的 P1)==
+  no-refetch 跳过的副作用:真已封但卡在 stale-cached-as-open 的 extent 会被永久跳过直到缓存刷新 → GC 回收不及时
+  (浪费空间,非丢数据)。干净修法:封存时更新旧 tail 缓存为 sealed=true,len=seal_commit(alloc_new_extent_once
+  在 seal_commit=Some(c) 时改 cache,GC 见新态零新增 RPC)。BUG#2 已修(它曾是不做此修法的理由)→ 现可安全做,但
+  本会话未做,排期后续。
 
 ────────────────────────────────────────────────────────────────────────────────
-PREV(SHIPPED + committed 3309b8b/ed7ac11): 删 vp_table_refs 双计数 Stage 1(extent 留存只看 refs;删除门保留
-  refs==0 && vp_table_refs==0 作冻结升级守卫;机制全删;WIRE v6→v7;验证全绿;coco P0 升级丢数据已修)。
-  Stage 2(未做):迁移后塌缩 extent_can_delete=refs==0 + 版本化解码物理删 vp_table_refs/vp_deps + 清 partitionVpRefs/。
-Backlog(本任务外):note33 extent-state RMW 未 value-CAS;manifest TableLocations 无 CRC;extent unlink 不 fsync 父目录;
-  MERGE-REFS-RECOMPUTE(复现失败,已加回归守卫)。
+PREV(committed 3309b8b/ed7ac11): 删 vp_table_refs 双计数 Stage 1。Stage 2(未做):迁移后塌缩 extent_can_delete=
+  refs==0 + 版本化解码物理删 vp_table_refs/vp_deps + 清 partitionVpRefs/。
+Backlog(本任务外):note33 extent-state RMW 未 value-CAS;manifest TableLocations 无 CRC;extent unlink 不 fsync
+  父目录;MERGE-REFS-RECOMPUTE(复现失败,已加回归守卫)。

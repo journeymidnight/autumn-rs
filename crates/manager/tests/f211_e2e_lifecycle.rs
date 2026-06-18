@@ -289,6 +289,7 @@ fn f211_e2e_fence_triggers_recovery_dispatch() {
                     owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
+                seal_extent_id: 0,
                 }),
             )
             .await
