@@ -133,8 +133,6 @@ pub(crate) async fn dispatch_partition_rpc(
         )),
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
         MSG_DIAG_TRACE_KEY => handle_diag_trace_key(payload, part).await,
-        // F210-C4: manager pull of current vp_refs snapshot.
-        MSG_PULL_VP_REFS => handle_pull_vp_refs(payload, part).await,
         // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
         // removed in F186. Stripe-write is now pure client-side via
         // ClusterClient::put_stream_begin (Ceph striperados pattern).
@@ -1422,9 +1420,8 @@ pub(crate) async fn handle_split_part(
     // commit_length (the call's send) and the manager's commit,
     // `handle_multi_modify_split` has ONLY bounded awaits, each with a kill-
     // timeout that turns slowness into FAILURE (Err -> no commit -> no stale
-    // seal), never late success: pull_and_apply_vp_refs (PS RPC 10 s + its inner
-    // sync etcd txn, F228 10 s) and the main put_msgs_txn (F228 etcd
-    // request_timeout 10 s); Phase-1 compute between them is fully synchronous.
+    // seal), never late success: the main put_msgs_txn (F228 etcd
+    // request_timeout 10 s); Phase-1 compute before it is fully synchronous.
     // No code path sleeps there — the only way to land a SUCCESSFUL commit after
     // the freeze window is the TEMP /tmp/autumn_repro6 sleep (now removed), which
     // models a stall that no real component can both incur AND survive (a real
@@ -1650,57 +1647,6 @@ pub(crate) async fn handle_get_discards(
         code: CODE_OK,
         message: String::new(),
         discards: discards.into_iter().collect(),
-    }))
-}
-
-/// F210-C4: manager pull of the partition's current vp_refs.
-/// Manager invokes this from `handle_multi_modify_split` /
-/// `handle_merge_partitions` BEFORE its atomic etcd txn so the
-/// `apply_partition_vp_refs` diff against `vp_table_refs` is computed
-/// against a fresh snapshot — not the (possibly stale) cached one.
-pub(crate) async fn handle_pull_vp_refs(
-    payload: Bytes,
-    part: &Rc<RefCell<PartitionData>>,
-) -> HandlerResult {
-    use autumn_rpc::partition_rpc::{PullVpRefsReq, PullVpRefsResp};
-    let req: PullVpRefsReq =
-        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    // Single borrow — collect snapshot synchronously. Mirrors the
-    // logic in `collect_partition_vp_refs` (lib.rs:5038).
-    let (part_id, refs) = {
-        let p = part.borrow();
-        let mut counts = std::collections::BTreeMap::<u64, u32>::new();
-        for reader in &p.sst_readers {
-            for &extent_id in &reader.vp_deps {
-                *counts.entry(extent_id).or_insert(0) += 1;
-            }
-        }
-        (p.part_id, counts.into_iter().collect::<Vec<_>>())
-    };
-
-    if part_id != req.part_id {
-        return Ok(partition_rpc::rkyv_encode(&PullVpRefsResp {
-            code: partition_rpc::CODE_NOT_FOUND,
-            message: format!(
-                "partition {} not owned by this PS (this part_id = {})",
-                req.part_id, part_id
-            ),
-            refs: Vec::new(),
-        }));
-    }
-
-    // F210-C4: a successful pull is functionally equivalent to a
-    // successful sync_partition_vp_refs — manager will apply the
-    // snapshot. Clear vp_refs_dirty optimistically; if the manager's
-    // apply fails, the next regular sync (or retry loop) will
-    // re-mark dirty.
-    part.borrow().vp_refs_dirty.set(false);
-
-    Ok(partition_rpc::rkyv_encode(&PullVpRefsResp {
-        code: CODE_OK,
-        message: String::new(),
-        refs,
     }))
 }
 

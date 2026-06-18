@@ -171,23 +171,30 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## SST VP dependency tracking (`vp_deps`, 2026-04-29)
+## SST VP dependency tracking (`vp_deps`) — RETIRED 2026-06-18
 
-Each SST `MetaBlock` now persists `vp_deps: Vec<u64>`: the distinct log extent ids referenced by live `ValuePointer` entries in that SST.
+Each SST `MetaBlock` used to persist `vp_deps: Vec<u64>` (the distinct log
+extent ids referenced by live `ValuePointer` entries in that SST). The PS
+recomputed the per-partition live-SST snapshot (`extent_id -> #SSTs`) after
+recovery / flush / compaction and shipped it to the manager via
+`MSG_SYNC_PARTITION_VP_REFS` so the manager could maintain a `vp_table_refs`
+retention counter.
 
-Rules:
+**That whole mechanism was removed** with the manager-side `vp_table_refs`
+deletion: extent retention is now `refs`-only (stream membership), safe
+because GC's relocate-then-punch invariant guarantees `refs == 0 ⇒ no live
+VP`. The PS no longer computes or syncs `vp_deps`; `collect_partition_vp_refs`,
+`sync_partition_vp_refs*`, the `vp_refs_dirty` GC gate, and `vp_refs_retry_loop`
+are gone. The on-disk `MetaBlock.vp_deps` field + its in-memory mirror
+`SstReader.vp_deps` are kept INERT for one release (no SST-format break yet —
+the builder still writes it, the reader still decodes it, nothing reads it);
+both are removed behind a format-version bump in Stage 2. See manager
+CLAUDE.md "VP lifetime after split".
 
-1. `vp_deps` is an SST-local fact derived while building the SST (`SstBuilder::add` sees `OP_VALUE_POINTER` entries and records their `extent_id`).
-2. `vp_deps` is persisted in rowStream as part of the SST MetaBlock and recovered through `SstReader.vp_deps`.
-3. `vp_deps` is NOT a refcount. The manager-owned aggregate is `MgrExtentInfo.vp_table_refs`, computed from full partition snapshots.
-
-`PartitionData` recomputes and syncs the full live-SST snapshot (`extent_id -> number of live SSTs mentioning it`) at three points:
-
-1. right after recovery/open succeeds
-2. after every successful flush checkpoint (`save_table_locs_raw`)
-3. after every successful compaction checkpoint
-
-This closes the split-lifetime bug where shared SSTs could still contain old `ValuePointer`s after the current log stream had already truncated the underlying extent.
+The split-lifetime correctness this once protected (shared SSTs still holding
+old `ValuePointer`s after a child truncated the log) is now upheld by GC
+relocating live values out before `punch_holes` drops `refs` — verified by
+`crates/manager/tests/system_vp_after_split_gc.rs`.
 
 ## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)
 
@@ -1468,7 +1475,7 @@ post-restart.
    - Hot path uses `insert_batch(iter)` (one write lock per batch of 256 inserts, not 256 locks), and `for_each(closure)` (read lock held for the iteration — used by `build_sst_bytes` and `rotate_active`).
    - The `bytes: AtomicU64` counter is not inside the lock, so `mem_bytes()` and `maybe_rotate` stay lock-free.
 
-10. **Metadata-publish ordering invariant (F148-A)** — `flush_one_imm` (lib.rs) and `do_compact` (background.rs) both publish to `meta_stream` via `save_table_locs_raw` followed by `sync_partition_vp_refs`. They run as separate background tasks on the single-threaded P-log compio runtime and therefore interleave at every `.await` point. Race-free concurrent publishing (i.e. the LATEST persisted meta_stream record always reflects ALL prior in-memory mutations from both publishers) rests on three load-bearing properties — DO NOT violate them in future refactors:
+10. **Metadata-publish ordering invariant (F148-A)** — `flush_one_imm` (lib.rs) and `do_compact` (background.rs) both publish to `meta_stream` via `save_table_locs_raw`. (Pre-2026-06-18 each was followed by a `sync_partition_vp_refs` call; that was removed with the vp_table_refs deletion.) They run as separate background tasks on the single-threaded P-log compio runtime and therefore interleave at every `.await` point. Race-free concurrent publishing (i.e. the LATEST persisted meta_stream record always reflects ALL prior in-memory mutations from both publishers) rests on three load-bearing properties — DO NOT violate them in future refactors:
     - **(P1)** P-log compio runtime is single-threaded.
     - **(P2)** the `borrow_mut` block that captures `tables_snapshot` contains no `.await`.
     - **(P3)** the path `borrow_mut` drop → `rkyv_encode` → `stream_client.append` → mpsc-send-into-per-stream-worker is purely synchronous; the first `.await` is on the per-stream worker's `ack_rx`, *after* the message lands in the FIFO mpsc.

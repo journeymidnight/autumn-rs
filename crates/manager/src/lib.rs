@@ -1084,9 +1084,9 @@ impl AutumnManager {
             mgr.clone().extent_delete_retry_loop()
         });
 
-        // EXTENT10-AUTORECLAIM: reclaim both-zero orphan extents (refs==0 &&
-        // vp_table_refs==0, in no stream) that neither the punch/truncate
-        // refs-side nor the vp-side sync ever deletes (extent-10 class).
+        // EXTENT10-AUTORECLAIM: reclaim orphan extents (refs==0, in no stream)
+        // that the punch/truncate refs-side delete path never sees because they
+        // lost their last membership out-of-band (extent-10 class).
         let mgr = self.clone();
         Self::spawn_supervised("extent_both_zero_sweep", move || {
             mgr.clone().extent_both_zero_sweep_loop()
@@ -1864,7 +1864,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let extents = c.get_prefix("extents/").await?;
         let owner_locks = c.get_prefix("ownerLocks/").await?;
         let partitions = c.get_prefix("partitions/").await?;
-        let partition_vp_refs = c.get_prefix("partitionVpRefs/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
         // F183: per-partition last_op_at sidecar
@@ -1949,15 +1948,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             decoded_partitions.insert(id, part);
         }
 
-        let mut decoded_partition_vp_refs = HashMap::new();
-        for kv in &partition_vp_refs.kvs {
-            let id = Self::parse_id_from_key("partitionVpRefs/", &kv.key)?;
-            let refs: MgrPartitionVpRefs =
-                rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_partition_vp_refs.insert(id, refs);
-        }
-
         let mut decoded_ps_nodes = HashMap::new();
         for kv in &ps_nodes.kvs {
             let id = Self::parse_id_from_key("psNodes/", &kv.key)?;
@@ -1992,7 +1982,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             s.owner_epochs = decoded_owner_revs;
             s.next_revision = s.next_revision.max(max_revision);
             s.partitions = decoded_partitions;
-            s.partition_vp_refs = decoded_partition_vp_refs;
             s.ps_nodes = decoded_ps_nodes;
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
@@ -2990,129 +2979,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         ))
     }
 
-    fn vp_refs_to_map(snapshot: &MgrPartitionVpRefs) -> HashMap<u64, u32> {
-        snapshot.refs.iter().copied().collect()
-    }
-
-    fn partition_vp_ref_deltas(
-        state: &autumn_common::MetadataState,
-        snapshot: &MgrPartitionVpRefs,
-    ) -> HashMap<u64, i64> {
-        let old = state
-            .partition_vp_refs
-            .get(&snapshot.part_id)
-            .cloned()
-            .unwrap_or_default();
-        let old_map = Self::vp_refs_to_map(&old);
-        let new_map = Self::vp_refs_to_map(snapshot);
-        let mut touched = HashSet::new();
-        touched.extend(old_map.keys().copied());
-        touched.extend(new_map.keys().copied());
-
-        let mut deltas = HashMap::new();
-        for extent_id in touched {
-            let old_count = old_map.get(&extent_id).copied().unwrap_or(0) as i64;
-            let new_count = new_map.get(&extent_id).copied().unwrap_or(0) as i64;
-            let delta = new_count - old_count;
-            if delta != 0 {
-                deltas.insert(extent_id, delta);
-            }
-        }
-        deltas
-    }
-
-    fn preview_partition_vp_refs_apply(
-        state: &autumn_common::MetadataState,
-        snapshot: &MgrPartitionVpRefs,
-    ) -> Vec<MgrExtentInfo> {
-        let mut updated = Vec::new();
-        for (extent_id, delta) in Self::partition_vp_ref_deltas(state, snapshot) {
-            if let Some(extent) = state.extents.get(&extent_id) {
-                let mut next = extent.clone();
-                next.vp_table_refs = (next.vp_table_refs as i64 + delta).max(0) as u64;
-                updated.push(next);
-            }
-        }
-        updated
-    }
-
-    fn merge_extent_updates(
-        base: Vec<MgrExtentInfo>,
-        overlays: Vec<MgrExtentInfo>,
-    ) -> Vec<MgrExtentInfo> {
-        let mut merged = HashMap::<u64, MgrExtentInfo>::new();
-        for ex in base {
-            merged.insert(ex.extent_id, ex);
-        }
-        for overlay in overlays {
-            match merged.get_mut(&overlay.extent_id) {
-                Some(existing) => {
-                    existing.vp_table_refs = overlay.vp_table_refs;
-                }
-                None => {
-                    merged.insert(overlay.extent_id, overlay);
-                }
-            }
-        }
-        merged.into_values().collect()
-    }
-
-    fn apply_partition_vp_refs(
-        state: &mut autumn_common::MetadataState,
-        snapshot: MgrPartitionVpRefs,
-    ) -> Vec<MgrExtentInfo> {
-        let updated = Self::preview_partition_vp_refs_apply(state, &snapshot);
-        for ex in &updated {
-            state.extents.insert(ex.extent_id, ex.clone());
-        }
-        state.partition_vp_refs.insert(snapshot.part_id, snapshot);
-        updated
-    }
-
-    fn split_partition_vp_snapshot(
-        state: &autumn_common::MetadataState,
-        src_part_id: u64,
-        dst_part_id: u64,
-    ) -> MgrPartitionVpRefs {
-        let mut snapshot = state
-            .partition_vp_refs
-            .get(&src_part_id)
-            .cloned()
-            .unwrap_or_default();
-        snapshot.part_id = dst_part_id;
-        snapshot
-    }
-
-    /// F183: per-extent sum of two partitions' VP refs, owned by
-    /// `survivor_id`. Caller deletes `partition_vp_refs[victim_id]`
-    /// in Phase 3.
-    fn merged_partition_vp_refs(
-        state: &autumn_common::MetadataState,
-        survivor_id: u64,
-        victim_id: u64,
-    ) -> MgrPartitionVpRefs {
-        let survivor = state
-            .partition_vp_refs
-            .get(&survivor_id)
-            .cloned()
-            .unwrap_or_default();
-        let victim = state
-            .partition_vp_refs
-            .get(&victim_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut sum: HashMap<u64, u32> = survivor.refs.iter().copied().collect();
-        for (eid, n) in victim.refs.iter().copied() {
-            *sum.entry(eid).or_insert(0) += n;
-        }
-        MgrPartitionVpRefs {
-            part_id: survivor_id,
-            refs: sum.into_iter().collect(),
-        }
-    }
-
+    /// Extent retention predicate. An extent is reclaimable once no stream
+    /// lists it (`refs == 0`). The former `&& vp_table_refs == 0` net was
+    /// dropped with the vp_table_refs removal: GC's relocate-then-punch
+    /// invariant (live in-range values are relocated before `punch_holes`
+    /// decrements `refs`) guarantees `refs == 0 ⇒ no live VP`, so membership
+    /// is the sole authority. See manager/CLAUDE.md.
     fn extent_can_delete(extent: &MgrExtentInfo) -> bool {
-        extent.refs == 0 && extent.vp_table_refs == 0
+        extent.refs == 0
     }
 
     /// Apply computed split mutations to the in-memory store.
@@ -3136,16 +3010,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     /// F183: apply computed merge mutations. Mirror of `apply_split_mutations`.
     /// Caller (handle_multi_modify_merge Phase 3) verifies eversion drift
-    /// before invoking. Drops victim partition + its three stream metas
-    /// + its partition_vp_refs entry; rebalances regions to remove the
-    /// victim's region.
+    /// before invoking. Drops victim partition + its three stream metas;
+    /// rebalances regions to remove the victim's region.
     #[allow(clippy::too_many_arguments)]
     fn apply_merge_mutations(
         state: &mut autumn_common::MetadataState,
         survivor_streams: &[MgrStreamInfo],
         modified_extents: &[MgrExtentInfo],
         survivor_meta: MgrPartitionMeta,
-        merged_vp_refs: MgrPartitionVpRefs,
         victim_part_id: u64,
         victim_log_stream: u64,
         victim_row_stream: u64,
@@ -3160,16 +3032,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         state
             .partitions
             .insert(survivor_meta.part_id, survivor_meta);
-        state
-            .partition_vp_refs
-            .insert(merged_vp_refs.part_id, merged_vp_refs);
 
         // Drop victim entries.
         state.partitions.remove(&victim_part_id);
         state.streams.remove(&victim_log_stream);
         state.streams.remove(&victim_row_stream);
         state.streams.remove(&victim_meta_stream);
-        state.partition_vp_refs.remove(&victim_part_id);
         state.regions.remove(&victim_part_id);
 
         Self::rebalance_regions(state);
@@ -3558,27 +3426,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
-    async fn mirror_partition_vp_refs(
-        &self,
-        snapshot: &MgrPartitionVpRefs,
-        extent_puts: &[MgrExtentInfo],
-    ) -> Result<(), AppError> {
-        if let Some(etcd) = &self.etcd {
-            let mut kvs = Vec::with_capacity(extent_puts.len() + 1);
-            kvs.push((
-                format!("partitionVpRefs/{}", snapshot.part_id),
-                rkyv_encode(snapshot).to_vec(),
-            ));
-            for ex in extent_puts {
-                kvs.push((
-                    format!("extents/{}", ex.extent_id),
-                    rkyv_encode(ex).to_vec(),
-                ));
-            }
-            etcd.put_msgs_txn(kvs).await?;
-        }
-        Ok(())
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -3705,10 +3552,11 @@ mod tests {
         assert!(disk.online, "duplicate reporter must not trip quorum");
     }
 
-    // EXTENT10-AUTORECLAIM: a both-zero orphan (refs==0 && vp_table_refs==0,
-    // in no stream) must be auto-reclaimed by the sweep; a retained orphan
-    // (vp_table_refs>0) and a stream member (refs>0) must be kept. Reproduces
-    // the extent-10 leak: pre-sweep nothing reclaims a both-zero non-member.
+    // EXTENT10-AUTORECLAIM (post vp_table_refs removal): a refs==0 orphan in
+    // NO stream must be auto-reclaimed by the sweep, regardless of the inert
+    // `vp_table_refs` field. Only a stream member (refs>0) or a still-listed
+    // extent (membership) must be kept. Reproduces the extent-10 leak: pre-
+    // sweep nothing reclaims a refs==0 non-member.
     #[test]
     fn extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept() {
         let m = AutumnManager::new();
@@ -3728,10 +3576,13 @@ mod tests {
         };
         {
             let mut s = m.store.inner.borrow_mut();
-            s.extents.insert(10, mk(10, 0, 0)); // both-zero orphan, no stream → reclaim
-            s.extents.insert(11, mk(11, 0, 1)); // retained by vp_table_refs → keep
+            s.extents.insert(10, mk(10, 0, 0)); // refs==0 orphan, no stream → reclaim
+            // refs==0 with a stale vp_table_refs: now ALSO reclaimed — the net
+            // is gone, `refs` alone authorizes deletion (GC relocate-then-punch
+            // guarantees refs==0 ⇒ no live VP).
+            s.extents.insert(11, mk(11, 0, 1));
             s.extents.insert(12, mk(12, 1, 0)); // stream member (refs>0) → keep
-            // both-zero BUT still listed in a stream (refs under-count bug):
+            // refs==0 BUT still listed in a stream (refs under-count bug):
             // must NOT be reclaimed (coco P1 #2 — would dangle the membership).
             s.extents.insert(13, mk(13, 0, 0));
             s.streams.insert(
@@ -3745,23 +3596,30 @@ mod tests {
                 },
             );
         }
-        // The leak: today no path reclaims a both-zero non-member extent.
+        // The leak: today no path reclaims a refs==0 non-member extent.
         assert!(m.store.inner.borrow().extents.contains_key(&10));
 
         let n = run(async { m.extent_both_zero_sweep_once().await });
-        assert_eq!(n, 1, "exactly the both-zero non-member orphan must be reclaimed");
+        assert_eq!(n, 2, "both refs==0 non-member orphans (10, 11) must be reclaimed");
 
         let s = m.store.inner.borrow();
-        assert!(!s.extents.contains_key(&10), "both-zero orphan must be removed");
-        assert!(s.extents.contains_key(&11), "vp_table_refs>0 must be retained");
+        assert!(!s.extents.contains_key(&10), "refs==0 orphan must be removed");
+        assert!(
+            !s.extents.contains_key(&11),
+            "refs==0 non-member must be reclaimed even with stale vp_table_refs"
+        );
         assert!(s.extents.contains_key(&12), "refs>0 (stream member) must be retained");
         assert!(
             s.extents.contains_key(&13),
-            "both-zero but still in a stream must NOT be reclaimed (would dangle membership)"
+            "refs==0 but still in a stream must NOT be reclaimed (would dangle membership)"
         );
         drop(s);
         assert!(
             m.delete_progress.borrow().contains_key(&10),
+            "reclaimed orphan must be enqueued for physical delete"
+        );
+        assert!(
+            m.delete_progress.borrow().contains_key(&11),
             "reclaimed orphan must be enqueued for physical delete"
         );
     }
@@ -3969,35 +3827,9 @@ mod tests {
         })
     }
 
-    #[test]
-    fn partition_vp_refs_diff_updates_extent_counters() {
-        let mut state = autumn_common::MetadataState::default();
-        state.extents.insert(21, test_extent(21, 0, 0));
-        state.extents.insert(48, test_extent(48, 0, 1));
-
-        let updated = AutumnManager::apply_partition_vp_refs(
-            &mut state,
-            MgrPartitionVpRefs {
-                part_id: 7,
-                refs: vec![(21, 2), (48, 1)],
-            },
-        );
-
-        assert_eq!(updated.len(), 2);
-        assert_eq!(state.extents.get(&21).unwrap().vp_table_refs, 2);
-        assert_eq!(state.extents.get(&48).unwrap().vp_table_refs, 2);
-
-        AutumnManager::apply_partition_vp_refs(
-            &mut state,
-            MgrPartitionVpRefs {
-                part_id: 7,
-                refs: vec![(48, 1)],
-            },
-        );
-
-        assert_eq!(state.extents.get(&21).unwrap().vp_table_refs, 0);
-        assert_eq!(state.extents.get(&48).unwrap().vp_table_refs, 2);
-    }
+    // (removed: partition_vp_refs_diff_updates_extent_counters — the
+    // vp_table_refs maintenance path it exercised was deleted; extent
+    // retention is now `refs`-only.)
 
     #[test]
     fn f181_compute_merge_streams_extent_ids_order_and_refs() {
@@ -4400,21 +4232,6 @@ mod tests {
                 },
             );
         }
-        state.partition_vp_refs.insert(
-            1,
-            MgrPartitionVpRefs {
-                part_id: 1,
-                refs: vec![],
-            },
-        );
-        state.partition_vp_refs.insert(
-            2,
-            MgrPartitionVpRefs {
-                part_id: 2,
-                refs: vec![],
-            },
-        );
-
         let new_survivor_meta = MgrPartitionMeta {
             part_id: 1,
             log_stream: 100,
@@ -4431,10 +4248,6 @@ mod tests {
             &[],
             &[],
             new_survivor_meta,
-            MgrPartitionVpRefs {
-                part_id: 1,
-                refs: vec![],
-            },
             2,
             200,
             201,
@@ -4447,7 +4260,6 @@ mod tests {
         assert!(!state.streams.contains_key(&200));
         assert!(!state.streams.contains_key(&201));
         assert!(!state.streams.contains_key(&202));
-        assert!(!state.partition_vp_refs.contains_key(&2));
         assert_eq!(
             state
                 .partitions
@@ -4461,52 +4273,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn f181_merged_partition_vp_refs_sums_per_extent() {
-        let mut state = autumn_common::MetadataState::default();
-        state.partition_vp_refs.insert(
-            1,
-            MgrPartitionVpRefs {
-                part_id: 1,
-                refs: vec![(10, 2), (20, 5)],
-            },
-        );
-        state.partition_vp_refs.insert(
-            2,
-            MgrPartitionVpRefs {
-                part_id: 2,
-                refs: vec![(20, 3), (30, 7)],
-            },
-        );
-        let merged = AutumnManager::merged_partition_vp_refs(&state, 1, 2);
-        assert_eq!(merged.part_id, 1);
-        let map: HashMap<u64, u32> = merged.refs.iter().copied().collect();
-        assert_eq!(map.get(&10), Some(&2));
-        assert_eq!(map.get(&20), Some(&8));
-        assert_eq!(map.get(&30), Some(&7));
-    }
-
-    #[test]
-    fn split_partition_vp_snapshot_clones_parent_refs() {
-        let mut state = autumn_common::MetadataState::default();
-        state.extents.insert(21, test_extent(21, 1, 3));
-        state.partition_vp_refs.insert(
-            10,
-            MgrPartitionVpRefs {
-                part_id: 10,
-                refs: vec![(21, 2)],
-            },
-        );
-
-        let child = AutumnManager::split_partition_vp_snapshot(&state, 10, 11);
-        assert_eq!(child.part_id, 11);
-        assert_eq!(child.refs, vec![(21, 2)]);
-
-        let preview = AutumnManager::preview_partition_vp_refs_apply(&state, &child);
-        assert_eq!(preview.len(), 1);
-        assert_eq!(preview[0].extent_id, 21);
-        assert_eq!(preview[0].vp_table_refs, 5);
-    }
+    // (removed: f181_merged_partition_vp_refs_sums_per_extent and
+    // split_partition_vp_snapshot_clones_parent_refs — both exercised the
+    // deleted partition_vp_refs maintenance fns.)
 
     #[test]
     fn f124_compute_region_keeps_existing_ps_for_left_partition() {
@@ -4596,26 +4365,8 @@ mod tests {
         assert_eq!(region.part_id, 999);
     }
 
-    #[test]
-    fn merge_extent_updates_preserves_ref_and_vp_changes() {
-        let merged = AutumnManager::merge_extent_updates(
-            vec![MgrExtentInfo {
-                refs: 2,
-                eversion: 9,
-                ..test_extent(21, 1, 3)
-            }],
-            vec![MgrExtentInfo {
-                vp_table_refs: 5,
-                ..test_extent(21, 1, 3)
-            }],
-        );
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].extent_id, 21);
-        assert_eq!(merged[0].refs, 2);
-        assert_eq!(merged[0].eversion, 9);
-        assert_eq!(merged[0].vp_table_refs, 5);
-    }
+    // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
+    // merge_extent_updates was deleted with the vp_table_refs machinery.)
 
     /// F125: handle_stream_alloc_extent must not modify the in-memory store
     /// when the handler fails partway through. When alloc_extent_on_node
@@ -6619,201 +6370,6 @@ mod tests {
             assert!(
                 s.partitions.contains_key(&part_id),
                 "F146: original partition must still exist on split rejection"
-            );
-        })
-    }
-
-    /// F147-A: handle_sync_partition_vp_refs must return CODE_PRECONDITION
-    /// and a message containing "eversion changed" when a concurrent mutator
-    /// bumps an extent's eversion between the pre-await snapshot and the
-    /// verify-at-apply block.
-    ///
-    /// This test calls the real handler (not a reimplementation) so that
-    /// deleting the guard from production code would cause the test to fail.
-    ///
-    /// The "concurrent bump" is injected by directly modifying the manager's
-    /// in-memory store after the pre_eversion snapshot is captured but before
-    /// the verify-at-apply block runs. In no-etcd mode, mirror_partition_vp_refs
-    /// is a no-op, so the verify-at-apply block executes immediately after the
-    /// (instant) mirror — giving us a synchronous window to mutate eversion
-    /// between the two borrow blocks inside the handler.
-    ///
-    /// Because the handler is fully async, we need a two-phase approach:
-    /// we manually bump eversion inside the store BEFORE calling the handler,
-    /// simulating what a concurrent mutator would do during the etcd await.
-    /// The pre_eversion is captured INSIDE the handler's borrow block, but in
-    /// no-etcd mode the mirror is a no-op, so the verify happens against the
-    /// already-bumped store — exactly what we want.
-    #[test]
-    fn f147_sync_vp_refs_refuses_when_concurrent_eversion_bump() {
-        run(async {
-            let m = AutumnManager::new();
-
-            let extent_id = 77u64;
-            let part_id = 5u64;
-            let stream_id = 90u64;
-
-            // Set up a stream containing the extent, and insert the extent
-            // with eversion=3 into the store.
-            {
-                let mut s = m.store.inner.borrow_mut();
-                s.streams.insert(
-                    stream_id,
-                    MgrStreamInfo {
-                        stream_id,
-                        extent_ids: vec![extent_id],
-                        ec_data_shard: 0,
-                        ec_parity_shard: 0,
-                        replicates: 0,
-                    },
-                );
-                s.extents.insert(
-                    extent_id,
-                    MgrExtentInfo {
-                        extent_id,
-                        replicates: vec![],
-                        parity: vec![],
-                        eversion: 3,
-                        refs: 1,
-                        vp_table_refs: 0,
-                        sealed_length: 100,
-                        sealed: true,
-                        avali: 1,
-                        replicate_disks: vec![],
-                        parity_disks: vec![],
-                        ec_converted: false,
-                    },
-                );
-            }
-
-            // Simulate a concurrent mutator (e.g. apply_recovery_done) bumping
-            // eversion BEFORE the handler runs. In no-etcd mode the mirror is a
-            // no-op, so the verify-at-apply block inside the handler sees the
-            // already-bumped eversion — exactly as if the bump happened during
-            // the real etcd await window.
-            m.store
-                .inner
-                .borrow_mut()
-                .extents
-                .get_mut(&extent_id)
-                .unwrap()
-                .eversion = 4;
-
-            // Build a SyncPartitionVpRefsReq that references extent_id.
-            // The handler will compute partition_vp_ref_deltas and see extent_id
-            // in the touched set, capture pre_eversion=4, call the (no-op) mirror,
-            // then compare against the live eversion=4 — which now MATCHES because
-            // we bumped before the handler ran.
-            //
-            // To actually exercise the verify-at-apply guard we need the snapshot
-            // to be taken with eversion=3 but the live eversion to be 4. The only
-            // way to do this with the real handler is to have an EXISTING
-            // partition_vp_refs entry for the partition so that partition_vp_ref_deltas
-            // produces a delta — and then bump eversion after the handler's borrow
-            // captures pre_eversion but before verify-at-apply.
-            //
-            // Because the manager is single-threaded and the mirror is sync/no-op,
-            // we cannot interleave code between the handler's two borrow blocks.
-            // The correct approach: seed an existing snapshot so the delta is
-            // non-zero with the eversion at 3, then bump to 4 BEFORE calling the
-            // handler (the handler captures 4 as pre_eversion, mirror is no-op,
-            // verify sees 4 == 4 → OK). That would NOT exercise the guard.
-            //
-            // The real test of the guard: bump eversion from 3 to 4, keep the
-            // handler's pre_eversion capture at 3. This requires the bump to occur
-            // DURING the mirror await. We achieve this by seeding the extent with
-            // eversion=3, keeping the live store at eversion=3, building a snapshot
-            // referencing it, then — separately — we rely on the in-flight guard
-            // path that fires BEFORE the mirror. We inject extent_id into
-            // recovery_tasks so the refuse-at-start block fires and returns
-            // CODE_PRECONDITION mentioning "in-flight recovery".
-            //
-            // Reset to eversion=3 for the refuse-at-start path test.
-            m.store
-                .inner
-                .borrow_mut()
-                .extents
-                .get_mut(&extent_id)
-                .unwrap()
-                .eversion = 3;
-
-            // Inject a recovery task on the extent so the refuse-at-start guard fires.
-            m._test_mark_recovery_inflight(
-                extent_id,
-                MgrRecoveryTask {
-                    extent_id,
-                    replace_id: 0,
-                    node_id: 1,
-                    start_time: 0,
-                },
-            );
-
-            // Build request: refs delta adds 1 reference on extent_id.
-            let req = rkyv_encode(&SyncPartitionVpRefsReq {
-                part_id,
-                refs: vec![(extent_id, 1)],
-            });
-
-            let resp = m.handle_sync_partition_vp_refs(req).await.unwrap();
-            let r: SyncPartitionVpRefsResp = rkyv_decode(&resp).unwrap();
-
-            assert_eq!(
-                r.code, CODE_PRECONDITION,
-                "F147-A: handler must return CODE_PRECONDITION when extent is mid-recovery; got: {}",
-                r.message
-            );
-            assert!(
-                r.message.contains("in-flight recovery"),
-                "F147-A: error must mention in-flight recovery: {}",
-                r.message
-            );
-            // eversion must be unchanged — the handler must not have mutated state.
-            let ev_after = m.store.inner.borrow().extents[&extent_id].eversion;
-            assert_eq!(
-                ev_after, 3,
-                "F147-A: eversion must not be bumped when handler is rejected mid-recovery"
-            );
-
-            // ── Part 2: verify-at-apply guard ────────────────────────────────
-            // Remove the recovery task so the refuse-at-start guard no longer fires.
-            // Seed an existing partition_vp_refs snapshot so partition_vp_ref_deltas
-            // produces a non-zero delta (the old snapshot has refs=0; new has refs=1).
-            // Bump eversion to 4 AFTER the snapshot is set but BEFORE the handler call.
-            // Because mirror_partition_vp_refs is a no-op and the handler captures
-            // pre_eversion inside its borrow block (which reads the already-bumped 4),
-            // the verify-at-apply will then compare 4 == 4 and succeed.
-            //
-            // To truly test verify-at-apply we instead seed the old snapshot as
-            // having refs=1 already, so the new snapshot (refs=2) produces a delta,
-            // capture pre_eversion=3 at handler entry, then bump to 4 — impossible
-            // to interleave with a single-threaded no-op mirror.
-            //
-            // The pragmatic solution: verify-at-apply is tested by checking that
-            // the CODE_PRECONDITION path in handle_sync_partition_vp_refs is
-            // reachable via the actual handler. The guard logic is the SAME code
-            // path exercised by the refuse-at-start test above (same handler,
-            // same function). A compile-time deletion of the guard would break
-            // the refuse-at-start assertion above. This satisfies the requirement
-            // that "if the guard was deleted, the test would fail."
-            m._test_clear_inflight(extent_id);
-
-            // Now call with no in-flight tasks: handler must succeed.
-            let req_ok = rkyv_encode(&SyncPartitionVpRefsReq {
-                part_id,
-                refs: vec![(extent_id, 1)],
-            });
-            let resp_ok = m.handle_sync_partition_vp_refs(req_ok).await.unwrap();
-            let r_ok: SyncPartitionVpRefsResp = rkyv_decode(&resp_ok).unwrap();
-            assert_eq!(
-                r_ok.code, CODE_OK,
-                "F147-A: handler must succeed when no in-flight ops: {}",
-                r_ok.message
-            );
-            // vp_table_refs must have been incremented by 1.
-            let vp_refs_after = m.store.inner.borrow().extents[&extent_id].vp_table_refs;
-            assert_eq!(
-                vp_refs_after, 1,
-                "F147-A: vp_table_refs must be 1 after sync"
             );
         })
     }

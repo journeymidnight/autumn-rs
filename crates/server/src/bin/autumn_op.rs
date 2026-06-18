@@ -1049,12 +1049,16 @@ struct InfoExtentView {
     replicas: Vec<u64>,
     parity: Vec<u64>,
     refs: u64,
+    /// DEPRECATED / INERT (vp_table_refs removal, Stage 1). Always 0 now —
+    /// kept in the JSON schema for one release so existing consumers (e.g.
+    /// python/audit_extent_refs.py) don't break on a missing key. Removed in
+    /// Stage 2 alongside the manager-side field.
     vp_table_refs: u64,
     eversion: u64,
     /// How many live streams list this extent in `extent_ids`. 0 = orphan
-    /// (not in any stream): either retained-by-vp_table_refs live data, or a
-    /// leaked-refs un-reclaimable extent. `refs` should equal this; a gap is a
-    /// refcount leak (see MERGE-REFS-LEAK).
+    /// (not in any stream): at `refs == 0` it is a reclaimable orphan (the
+    /// EXTENT10-AUTORECLAIM sweep reaps it); `refs` should equal this, and a
+    /// gap is a refcount leak (see MERGE-REFS-LEAK).
     in_streams: usize,
 }
 
@@ -2728,15 +2732,16 @@ async fn run_info(
                 if open_extents.contains(eid) {
                     tag.push_str(" (open)");
                 }
-                // Orphan = in no live stream. Distinguish "still holds data"
-                // (vp_table_refs>0 — retained, serving reads) from a pure leak
-                // (vp_table_refs==0 — un-reclaimable, safe to reap). Also flag
-                // a refs vs membership gap (the MERGE-REFS-LEAK signature).
+                // Orphan = in no live stream. Post vp_table_refs removal,
+                // retention rests on `refs` alone: a non-member at refs==0 is a
+                // reclaimable orphan (EXTENT10-AUTORECLAIM sweep reaps it); a
+                // non-member at refs>0 is a refs-accounting bug worth flagging.
+                // Also flag a refs vs membership gap (the MERGE-REFS-LEAK sig).
                 if in_streams == 0 {
-                    tag.push_str(if e.vp_table_refs > 0 {
-                        " (ORPHAN: no stream, retained by vp_table_refs — live data)"
+                    tag.push_str(if e.refs > 0 {
+                        " (ORPHAN: no stream BUT refs>0 — refs-accounting bug)"
                     } else {
-                        " (ORPHAN: no stream, vp_table_refs=0 — reclaimable leak)"
+                        " (ORPHAN: no stream, refs=0 — reclaimable, pending sweep)"
                     });
                 } else if e.refs as usize != in_streams {
                     tag.push_str(" (refs-leak)");
@@ -2757,14 +2762,13 @@ async fn run_info(
                     format!("replicas={:?}", all)
                 };
                 println!(
-                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}",
+                    "  extent {}: size={}{}, {}, refs={} (streams={}), eversion={}",
                     eid,
                     human_size(e.sealed_length),
                     tag,
                     layout,
                     e.refs,
                     in_streams,
-                    e.vp_table_refs,
                     e.eversion
                 );
             }

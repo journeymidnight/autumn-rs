@@ -54,8 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 6;
-pub const WIRE_VERSION_MAX: u32 = 6;
+pub const WIRE_VERSION_MIN: u32 = 7;
+pub const WIRE_VERSION_MAX: u32 = 7;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -98,6 +98,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // >4 GiB shards (16+ GiB extents) and bounding the encode transient to
     // (K+M)×stripe instead of ~2× the whole extent. Pre-R3: MIN=MAX=6.
     (6, "e9fb9f2e6a582867"),
+    // v7: vp_table_refs removal (Stage 1) — retired MSG_SYNC_PARTITION_VP_REFS
+    // (0x33) + MSG_PULL_VP_REFS (0x4F) and their req/resp (SyncPartitionVpRefs*,
+    // PullVpRefs*, MgrPartitionVpRefs). MgrExtentInfo.vp_table_refs kept inert
+    // (no rkyv layout change) so persisted `extents/<id>` still decode; extent
+    // retention is now `refs`-only. Pre-R3: MIN=MAX=7.
+    (7, "4263787e9cedcca8"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

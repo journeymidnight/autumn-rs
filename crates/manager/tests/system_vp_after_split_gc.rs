@@ -1,5 +1,8 @@
 //! Data integrity: ValuePointer lifetime after split + GC.
-//! Verifies vp_table_refs protects shared log extents from premature deletion.
+//! Verifies that GC's relocate-then-punch (refs-only retention, post
+//! vp_table_refs removal) never drops a log extent that still holds a live VP:
+//! both split children must keep resolving their large values after one (or
+//! both) child compacts + GCs the CoW-shared log stream.
 
 mod support;
 

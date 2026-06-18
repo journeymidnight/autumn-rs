@@ -1,5 +1,12 @@
 # Value Stream 设计：大 value 从 log_stream 分离（DESIGN，2026-06-17）
 
+> **⚠️ 历史文档(2026-06-18 更新)：本文通篇假设 `vp_table_refs` 双计数存在,
+> 但该机制已被删除** —— extent 留存改为 `refs`(stream 成员)单计数,正确性靠
+> GC relocate-then-punch 不变量(`refs==0 ⇒ 无 live VP`)。见 feature_list.md
+> `VP-TABLE-REFS-REMOVAL` 与 manager CLAUDE.md "VP lifetime after split"。
+> value_stream 重构本身仍是**未实现的设计提案**(评估否决落地);若将来重启,
+> 需按 `refs`-only 模型重写本文的删除/回收所有权部分。
+
 > **状态：设计提案，未实现。** 起因是排查"EC extent 10 删不掉、`autumn-op
 > info` 看不到"的现场问题(见 feature_list.md `MERGE-REFS-LEAK`)。根因不是
 > 单个 bug,而是 **log_stream 同时兼任 WAL 和大 value 存储** 这个结构选择,

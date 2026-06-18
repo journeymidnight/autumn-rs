@@ -71,18 +71,9 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 //                  if the manager-side merge txn rejects the request).
 pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 
-// F210-C4: manager → PS RPC. Manager pulls the partition's current
-// vp_refs snapshot from PS so manager-side merge/split orchestration
-// (`handle_multi_modify_split`, `handle_merge_partitions`) operates on
-// a fresh view of `vp_table_refs` instead of trusting the cached
-// snapshot (which may be stale if a previous PS-initiated sync
-// failed). PS responds with the current `vp_deps` of every live SST,
-// computed under a single `borrow()`. Manager applies via the same
-// `apply_partition_vp_refs` path that handles regular
-// MSG_SYNC_PARTITION_VP_REFS. If PS rejects (CODE_NOT_FOUND for
-// not-owning the partition, CODE_PRECONDITION for ongoing
-// open/recovery), manager aborts the merge/split with FailedPrecondition.
-pub const MSG_PULL_VP_REFS: u8 = 0x4F;
+// 0x4F retired with the vp_table_refs removal (was MSG_PULL_VP_REFS,
+// F210-C4 manager→PS vp_refs pull). Extent retention is now driven by
+// `refs` (stream membership) alone — see manager `extent_can_delete`.
 
 // F216 zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
 // is value-separable for recv-into-registered-dest: a CRC-less frame whose
@@ -553,22 +544,6 @@ pub struct MergeFreezeResp {
     pub message: String,
 }
 
-/// F210-C4: manager → PS pull of the partition's current vp_refs.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct PullVpRefsReq {
-    pub part_id: u64,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct PullVpRefsResp {
-    pub code: u8,
-    pub message: String,
-    /// `(extent_id, count)` pairs — same shape as
-    /// `SyncPartitionVpRefsReq.refs`. Count is the number of live SSTs
-    /// whose `vp_deps` mention this extent within this partition.
-    pub refs: Vec<(u64, u32)>,
-}
-
 // StreamPutReq REMOVED 2026-06-11 with MSG_STREAM_PUT (see the reserved
 // constant note near the msg_type list).
 // F129 PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
@@ -715,9 +690,6 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
-        MSG_PULL_VP_REFS => rkyv_decode::<PullVpRefsReq>(payload)
-            .map(|r| r.part_id)
-            .unwrap_or(0),
         MSG_DIAG_TRACE_KEY => rkyv_decode::<DiagTraceKeyReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -748,7 +720,6 @@ mod msg_type_tests {
             MSG_GET_DISCARDS,
             MSG_MERGE_PART,
             MSG_MERGE_FREEZE,
-            MSG_PULL_VP_REFS,
             MSG_GET_ZC,
             MSG_BATCH_PUT,
             MSG_BATCH_GET,

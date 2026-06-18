@@ -287,8 +287,12 @@ $AO policy-candidates                    # advisory engine output (split/merge/g
 # against live stream membership. Reports orphan extents (refs>0 but in 0
 # streams -> invisible to `info`, never reclaimed), refs-vs-membership
 # mismatches, and duplicate-in-one-stream listings. Exit code 1 if any found.
-# NOTE: a flagged extent may still hold live data via vp_table_refs>0 — confirm
-# that's 0 (major-compact the owning partitions first) before deleting files.
+# NOTE (post vp_table_refs removal, 2026-06-18): extent retention is now
+# `refs`-only. A non-member extent at refs==0 is a reclaimable orphan that the
+# manager's EXTENT10-AUTORECLAIM sweep reaps automatically; a non-member at
+# refs>0 is a refs-accounting bug to investigate, not a "retained-by-vp"
+# false positive. (The old "confirm vp_table_refs==0 before deleting" caveat
+# no longer applies — that counter is gone.)
 python3 python/audit_extent_refs.py     # --manager / --etcd / --op / --etcdctl overridable
 # Repair a leaked refs value (refs != stream membership) — STOP the manager first
 # (e.g. cluster.sh stop-manager), patch etcd, then restart so it replays the fix:

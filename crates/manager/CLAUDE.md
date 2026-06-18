@@ -166,23 +166,39 @@ rkyv blob shape changed; `cluster.sh reset` is the migration path
 
 After split, both left and right partitions initially share the same physical extents. Their `PartitionServer` will detect `has_overlap = true` on open (SSTables contain keys outside the narrowed range). Major compaction cleans up out-of-range keys and frees the shared extents via GC.
 
-### VP lifetime after split (`vp_table_refs`, 2026-04-29)
+### VP lifetime after split (`refs`-only retention, 2026-06-18 — vp_table_refs REMOVED)
 
-Split can duplicate row-stream SST ownership without duplicating the old log extents referenced by the SSTs' embedded `ValuePointer`s. The direct stream-membership refcount `MgrExtentInfo.refs` is therefore insufficient to protect old log extents after split.
+Split can duplicate row-stream SST ownership without duplicating the old log
+extents referenced by the SSTs' embedded `ValuePointer`s. Historically the
+manager guarded those old log extents with a SECOND refcount,
+`vp_table_refs` (indirect retention by live SSTs whose `MetaBlock.vp_deps`
+mentioned the extent), synced from each PS via `MSG_SYNC_PARTITION_VP_REFS`
+and stored as `partitionVpRefs/<part_id>`. Deletion required
+`refs == 0 && vp_table_refs == 0`.
 
-Manager now tracks two independent lifetimes on every extent:
+**That entire mechanism was removed.** Extent retention now rests on `refs`
+(direct stream membership) ALONE. `extent_can_delete(ex) == (ex.refs == 0)`.
 
-- `refs`: direct membership in some stream's `extent_ids`
-- `vp_table_refs`: indirect retention by live SSTables whose `MetaBlock.vp_deps` still mention this extent
+Why it's safe — the load-bearing invariant: **GC relocates every live
+in-range value off a log extent BEFORE `punch_holes` drops its `refs`**
+(relocate-then-punch, made correct by GC-VP-IDENTITY: liveness is full VP
+identity, not just `extent_id`). So `refs == 0 ⇒ no live ValuePointer points
+at the extent`. CoW split keeps both children pointing at the shared log
+extents via `refs` (each child's `log_stream.extent_ids` lists them →
+`compute_duplicate_stream` does `refs += 1`); the extent is freed only once
+BOTH children have GC'd it down to `refs == 0`. No second counter is needed —
+a `vp_table_refs` net only mattered when `refs` accounting was buggy
+(extent-10 class), and the project's stance is to FIX such bugs, not net them
+(MERGE-REFS-LEAK fix + GC-VP-IDENTITY closed the known classes).
 
-The source of truth for indirect retention is `partitionVpRefs/<part_id>` in etcd and `MetadataState.partition_vp_refs` in memory. Each snapshot stores `extent_id -> table_count` for the partition's CURRENT live SST set. The manager updates global `vp_table_refs` by diffing the old snapshot and the new snapshot.
-
-Rules:
-
-1. `MSG_SYNC_PARTITION_VP_REFS` replaces the partition's full snapshot; manager diffs old/new and adjusts `vp_table_refs` on touched extents.
-2. `multi_modify_split` clones the parent snapshot to the right child immediately, because both children still reference the shared SST set until compaction rewrites them.
-3. Extent deletion is allowed only when `refs == 0 && vp_table_refs == 0`.
-4. `vp_table_refs` is manager-owned aggregate state. It must NEVER be written into SST format.
+Removal staging (this is a same-commit, stop-the-world deploy — never a
+rolling one): **Stage 1** ripped out all logic (the sync/pull RPCs, the
+`partition_vp_refs` state + `partitionVpRefs/` load, the maintenance fns, the
+PS `vp_refs_dirty` GC gate) and gated deletion on `refs == 0`, but left the
+inert persisted fields (`MgrExtentInfo.vp_table_refs`, SST `MetaBlock.vp_deps`)
+in place so `extents/<id>` rkyv + SST bytes still decode with no migration.
+**Stage 2** removes those two fields behind a versioned decode + one-time
+rewrite and deletes the stale `partitionVpRefs/` keys.
 
 ## EC Conversion Dispatch (`ec_conversion_dispatch_loop`)
 
@@ -244,7 +260,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
 1. **Etcd-first mutation pattern** — all mutating RPC handlers follow: (1) compute mutations without modifying store, (2) persist to etcd, (3) apply to in-memory store. This ensures manager crash after step 1 but before step 2 leaves etcd and memory consistent. Exception: `register_ps`/`upsert_partition` apply to memory first because `mirror_partition_snapshot` reads from the store (these are idempotent on retry). The old function `duplicate_stream` (which modified state directly) has been replaced by `compute_duplicate_stream` (read-only) + `apply_split_mutations`. **F152 closed the last three handlers that violated this rule:** `handle_create_stream`, `handle_update_stream_ec`, and `handle_register_node` (both re-registration and new-node branches) all moved their `s.streams.insert / s.extents.insert / s.nodes.insert / s.disks.insert` calls to AFTER the corresponding `mirror_*` await. F125 had previously closed the same anti-pattern in `handle_stream_alloc_extent`. Any future RPC handler that mutates persistent state must follow this order.
 
-2. **`compute_duplicate_stream` increments extent `refs`** — this is only the direct stream-membership refcount for CoW. If shared SSTs can retain old log extents via `ValuePointer`, update `partition_vp_refs` / `vp_table_refs` too. Physical extent deletion requires BOTH counters to reach zero.
+2. **`compute_duplicate_stream` increments extent `refs`** — the direct stream-membership refcount for CoW. Both split children list the shared log extents in their own `log_stream.extent_ids`, so `refs` covers them; the extent is freed only when both children GC it back to `refs == 0`. (Pre-2026-06-18 a second `vp_table_refs` counter also gated deletion; it was removed — see "VP lifetime after split". Extent deletion now requires only `refs == 0`, safe because GC relocate-then-punch guarantees `refs == 0 ⇒ no live VP`.)
 
 3. **Owner revision must be validated before any stream mutation** — call `ensure_owner_epoch` at the start of `stream_alloc_extent`, `stream_punch_holes`, `truncate`, `multi_modify_split`. Missing this allows split-brain.
 
@@ -422,28 +438,13 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     other mutator actually changes eversion (all current mutators do).
     Cross-reference: notes 10 (F138), 11 (F139), 12 (F145).
 
-14. **F147-A `handle_sync_partition_vp_refs` refuse-at-start + verify-at-apply.**
-    `MSG_SYNC_PARTITION_VP_REFS` replaces a partition's full VP-ref snapshot and
-    diffs the old/new snapshots to adjust `vp_table_refs` on each touched extent.
-    The handler snapshots the old entry under `borrow_mut`, then may await etcd
-    persistence (`mirror_partition_vp_refs`) before applying the new diff.
-    During that await, a concurrent `apply_recovery_done` or
-    `apply_ec_conversion_done` could bump `ex.eversion` or rewrite
-    `ex.replicates` on a touched extent; the handler's subsequent
-    `vp_table_refs` adjustment would still complete, but the diff-apply
-    diverges between the etcd-persisted state and in-memory state if the
-    manager crashes mid-handler and replays with a stale etcd entry.
-    F147-A adds the same two-stage pattern used by notes 12/13 (F145/F146):
-    (a) **Refuse-at-start**: if any extent mentioned in the new snapshot
-      is currently in `ec_conversion_inflight` or `recovery_tasks`, return
-      `Err(Precondition)` before any await — the PS retries on the next
-      flush cycle.
-    (b) **Verify-at-apply**: after the etcd mirror returns, re-read each
-      touched extent's `eversion` under a fresh `borrow_mut` and compare
-      against the pre-await snapshot. If any eversion changed, return
-      `Err(Precondition)` rather than applying a stale diff; the etcd
-      write is benign (failover replay sees the latest revision per key,
-      and the PS retry produces a fresh correct snapshot).
+14. **F147-A `handle_sync_partition_vp_refs` refuse-at-start + verify-at-apply
+    — REMOVED 2026-06-18 with the vp_table_refs deletion.** The entire
+    VP-ref sync RPC (`MSG_SYNC_PARTITION_VP_REFS`), its handler, and the
+    `vp_table_refs` aggregate it maintained are gone; extent retention is now
+    `refs`-only (see "VP lifetime after split"). The refuse-at-start /
+    verify-at-apply two-stage pattern it pioneered still lives on the paths
+    that remain (notes 12/13 — F145/F146 split/merge, F207 EC/recovery).
     Cross-reference: notes 10 (F138), 11 (F139), 12 (F145), 13 (F146).
 
 15. **F149 leader-fence on every manager etcd write txn.**
@@ -525,7 +526,6 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       ordering. **Order invariant** is load-bearing for vp_head replay
       correctness; tested by `f181_compute_merge_streams_extent_ids_order_and_refs`.
     - `splice_streams_without_new_tail` — row + meta splice (no fresh tail).
-    - `merged_partition_vp_refs` — per-extent sum of two partitions' VP refs.
     - `apply_merge_mutations` — in-memory applier; mirror of `apply_split_mutations`.
 
     **Phases (rpc_handlers.rs):**
@@ -789,7 +789,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       enrol: ConvertToEc / Recovery / Delete (i.e. ops the manager
       dispatches to extent-nodes as RPCs).
     - PS-layer ops (split / merge / punch_holes / truncate /
-      sync_partition_vp_refs / alloc_extent) READ the ledger to
+      alloc_extent) READ the ledger to
       refuse-at-start when a touched extent has a stream-layer op
       in flight, but DO NOT enrol themselves. They're
       partition-scoped, not extent-scoped; enrolling them would
@@ -965,7 +965,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       our acquire succeeds, F207's exclusive ledger CAS + every
       other mutator's `extent_inflight_op` refuse-at-start
       (apply_recovery_done, handle_*_punch_holes, handle_truncate,
-      handle_multi_modify_split / merge, handle_sync_partition_vp_refs,
+      handle_multi_modify_split / merge,
       handle_stream_alloc_extent) freezes `ex.eversion` until our
       apply runs.
     - **F209-E** `crates/manager/tests/f209_apply_done_atomicity.rs`
@@ -1564,17 +1564,18 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
     **FOLLOW-UP (DEFERRED, demonstrated-need only — reproduce-first):** the
     EXTENT-STATE read-modify-write writes (`extents/<id>`: eversion / replicates
-    / avali / vp_table_refs) are NOT value-CAS'd — `handle_multi_modify_split`'s
-    source-tail seal, `handle_sync_partition_vp_refs`, `apply_ec_conversion_done`,
-    `apply_recovery_done`. A reproduce-first reachability investigation (2026-05-31)
+    / avali) are NOT value-CAS'd — `handle_multi_modify_split`'s
+    source-tail seal, `apply_ec_conversion_done`,
+    `apply_recovery_done`. (The former `handle_sync_partition_vp_refs` writer was
+    removed with vp_table_refs.) A reproduce-first reachability investigation (2026-05-31)
     found the extent-state clobber is NOT reproducible and structurally
     near-precluded, so it is NOT worth fixing speculatively in this revert-prone
     area: (a) `apply_recovery_done` reads the extent and writes etcd
     AWAIT-ADJACENTLY (no `.await` between) so the only window is the write's own
     RTT; (b) the F207 ledger serialises recovery/EC per extent and note 31 stops
     alloc rewriting a sealed extent, so a concurrent same-extent writer is
-    near-precluded; (c) split-seal / sync_vp_refs / ec_done have an await gap but
-    are covered before-await by F146 / F147-A / F207+F138 verify-at-apply +
+    near-precluded; (c) split-seal / ec_done have an await gap but
+    are covered before-await by F146 / F207+F138 verify-at-apply +
     ledger; (d) EMPIRICALLY, Item 3's membership CAS measured `cas_conflict=0`
     across all chaos — the etcd-RTT-clobber MECHANISM never fires in the harness,
     so even the shipped membership CAS is a precautionary safety net. The worked
@@ -1886,7 +1887,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       scattered (no choke point) so an incremental manager counter would mean
       6 revert-prone hot-path edits.
     - **logical_stored: a periodic (~30 s) READ-ONLY scan** of `s.extents`,
-      `Σ distinct sealed_length` skipping `refs==0 && vp_table_refs==0`
+      `Σ distinct sealed_length` skipping `refs==0`
       (pending physical delete). Read-only (touches no mutation site); pure
       in-memory CPU (MetadataState is the etcd mirror). Slower cadence than
       the df sum because it's O(extents); df/statfs read the cached value.
@@ -1899,27 +1900,24 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     (note 37) is untouched. Cross-ref: note 25 (single df caller), 7 (df
     call-result vs payload disk_id).
 
-41. **EXTENT10-AUTORECLAIM both-zero sweep (`extent_both_zero_sweep_loop`,
-    2026-06-18).** A `refs==0 && vp_table_refs==0` extent that is in NO stream
-    was never auto-deleted: the refs-side trigger lives in `handle_stream_punch_holes`
-    / `handle_truncate` (act on stream members), and `handle_sync_partition_vp_refs`
-    only DECREMENTS `vp_table_refs`. So when `vp_table_refs` is the LAST counter
-    to reach 0 (compaction dropping the final SST VP after GC punched the extent
-    out of every log_stream), nothing fired the delete — the extent-10
-    retained-orphan class leaked until manual `python/reclaim`. The leader-only
-    sweep (`extent_delete.rs`, 60 s, `spawn_supervised`) reclaims them.
-    **Candidate gate (load-bearing):** `extent_can_delete(ex)` (both-zero) AND
-    the extent is **absent from every stream's `extent_ids`** — NOT a bare
-    `refs==0` (a refs under-count must never let the sweep delete a still-membered
-    extent; a `refs==0`-but-in-a-stream extent is ERROR-logged + skipped). Delete
-    is etcd-first **value-CAS** on the both-zero snapshot (refuses if a concurrent
-    `sync_partition_vp_refs` bumped `vp_table_refs`), then in-memory remove +
-    `enqueue_pending_deletes`. **Safety:** in-no-stream `refs==0` ⇒
-    relocate-then-punch (note GC-VP-IDENTITY in partition-server) moved live
-    values out ⇒ no live VP; `vp_table_refs==0` ⇒ no live SST ref. The gate is
-    `extent_can_delete`, so dropping `vp_table_refs` later collapses it to
-    `refs==0` with no sweep change. **Accepted residuals** (documented, non-loss,
-    same bar as the rest of the extent-state path): reverse-order resurrection via
-    the not-yet-value-CAS'd `mirror_partition_vp_refs` (the DEFERRED note-33
-    extent-state-CAS); non-atomic delete+marker (matches `punch_holes`; F109
+41. **EXTENT10-AUTORECLAIM orphan sweep (`extent_both_zero_sweep_loop`,
+    2026-06-18; gate simplified to `refs==0` the same day with the
+    vp_table_refs removal).** A `refs==0` extent that is in NO stream was never
+    auto-deleted: the refs-side trigger lives in `handle_stream_punch_holes` /
+    `handle_truncate`, which only inspect CURRENT stream members. An extent that
+    lost its last membership out-of-band sat at `refs==0` with no path firing its
+    delete — the extent-10 orphan class, leaked until manual reclaim. (Originally
+    this class arose when `vp_table_refs` was the last counter to reach 0; with
+    that counter gone the sweep's role is unchanged but its gate is `refs==0`.)
+    The leader-only sweep (`extent_delete.rs`, 60 s, `spawn_supervised`) reclaims
+    them. **Candidate gate (load-bearing):** `extent_can_delete(ex)` (now
+    `refs==0`) AND the extent is **absent from every stream's `extent_ids`** —
+    the membership check is NOT redundant with `refs==0`: a refs under-count must
+    never let the sweep delete a still-membered extent (a `refs==0`-but-in-a-stream
+    extent is ERROR-logged + skipped). Delete is etcd-first **value-CAS** on the
+    snapshot (refuses if a concurrent recovery/EC eversion bump or alloc rewrote
+    `extents/<id>`), then in-memory remove + `enqueue_pending_deletes`.
+    **Safety:** in-no-stream `refs==0` ⇒ relocate-then-punch (note GC-VP-IDENTITY
+    in partition-server) moved live values out ⇒ no live VP. **Accepted residual**
+    (documented, non-loss): non-atomic delete+marker (matches `punch_holes`; F109
     node-reconcile backstop). Test: `extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept`.

@@ -29,67 +29,6 @@ impl Drop for SplitInflightGuard {
 }
 
 impl AutumnManager {
-    // ── F210-C4: pull-sync vp_refs from PS ──────────────────────────────
-    //
-    // Before `handle_multi_modify_split` / `handle_merge_partitions`
-    // commit their atomic etcd txn, manager actively pulls the
-    // current vp_refs snapshot from the relevant PS and applies it
-    // via the same path `handle_sync_partition_vp_refs` uses. This
-    // closes the race where a previous PS-initiated sync failed
-    // (PS marked dirty per F210-C4's wrapper), leaving manager's
-    // `vp_table_refs` stale, and a subsequent merge/split would
-    // compute `modified_extents` against that stale view —
-    // potentially under-counting refs and approving deletion of
-    // extents whose live VPs are in a newly-published SST.
-    async fn pull_and_apply_vp_refs(&self, part_id: u64, part_addr: &str) -> Result<(), AppError> {
-        let req = autumn_rpc::partition_rpc::PullVpRefsReq { part_id };
-        let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
-        // 10 s — partition-side handler is a single `borrow()` over
-        // sst_readers' vp_deps; bounded so a wedged PS doesn't make
-        // merge/split hang indefinitely.
-        let resp_bytes = self
-            .conn_pool
-            .call_timeout(
-                part_addr,
-                autumn_rpc::partition_rpc::MSG_PULL_VP_REFS,
-                payload,
-                Duration::from_secs(10),
-            )
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("F210-C4 pull_vp_refs RPC to {part_addr}: {e}"))
-            })?;
-        let resp: autumn_rpc::partition_rpc::PullVpRefsResp =
-            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes).map_err(AppError::Internal)?;
-        if resp.code != autumn_rpc::partition_rpc::CODE_OK {
-            return Err(AppError::Precondition(format!(
-                "F210-C4 pull_vp_refs from {part_addr}: {}",
-                resp.message
-            )));
-        }
-        // Synthesize a SyncPartitionVpRefsReq and feed it through the
-        // existing handler. This re-uses all the F147-A refuse-at-start
-        // checks, verify-BEFORE-mirror (F210-A2), and etcd txn logic.
-        let sync_req = SyncPartitionVpRefsReq {
-            part_id,
-            refs: resp.refs,
-        };
-        let sync_payload = rkyv_encode(&sync_req);
-        let sync_resp_bytes = self
-            .handle_sync_partition_vp_refs(sync_payload)
-            .await
-            .map_err(|(_, msg)| AppError::Internal(msg))?;
-        let sync_resp: SyncPartitionVpRefsResp =
-            rkyv_decode(&sync_resp_bytes).map_err(AppError::Internal)?;
-        if sync_resp.code != CODE_OK {
-            return Err(AppError::Precondition(format!(
-                "F210-C4 apply pulled vp_refs for part {part_id}: {}",
-                sync_resp.message
-            )));
-        }
-        Ok(())
-    }
-
     // ── Serve ──────────────────────────────────────────────────────────
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
@@ -281,7 +220,6 @@ impl AutumnManager {
             MSG_GET_REGIONS => self.handle_get_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
-            MSG_SYNC_PARTITION_VP_REFS => self.handle_sync_partition_vp_refs(payload).await,
             MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
             MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
             MSG_FORCE_EC_CONVERT => self.handle_force_ec_convert(payload).await,
@@ -1188,15 +1126,13 @@ impl AutumnManager {
 
         // Observability: on a full cluster dump (`stream_ids` empty), also
         // surface extents that exist in the store but are referenced by NO
-        // stream's `extent_ids` — orphan / non-member extents. These are
-        // INVISIBLE pre-this-change because the loop above only walks stream
-        // membership: a log extent GC-punched out of its stream but still
-        // retained by `vp_table_refs` (live-SST ValuePointers — real data
-        // being served) AND a leaked-refs orphan both fall here. Hiding them
-        // hid live data + un-reclaimable leaks from `autumn-op info`. Targeted
-        // stream_ids queries (hot path, client.rs) keep the membership-only
-        // behaviour. `vp_table_refs` is on the wire (MgrExtentInfo) so the CLI
-        // can show WHY a non-member extent is retained.
+        // stream's `extent_ids` — orphan / non-member extents. The loop above
+        // only walks stream membership, so these are otherwise invisible. Post
+        // vp_table_refs removal, a non-member extent at `refs == 0` is a
+        // reclaimable orphan awaiting the EXTENT10-AUTORECLAIM sweep (a
+        // `refs > 0` non-member would be a refs-accounting bug worth flagging).
+        // Targeted stream_ids queries (hot path, client.rs) keep the
+        // membership-only behaviour.
         if full_dump {
             for (eid, e) in s.extents.iter() {
                 if !member_ids.contains(eid) {
@@ -2177,7 +2113,7 @@ impl AutumnManager {
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 && ex.vp_table_refs == 0 {
+                            if ex.refs == 1 {
                                 return Err(AppError::Precondition(format!(
                                     "extent {eid} has in-flight recovery; \
                                      defer punch_holes until recovery completes"
@@ -2211,10 +2147,7 @@ impl AutumnManager {
                 // would physically delete (refs would hit 0 and not EC-inflight).
                 for &eid in &removed {
                     if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1
-                            && extent.vp_table_refs == 0
-                            && !ec_inflight_set.contains(&eid)
-                        {
+                        if extent.refs == 1 && !ec_inflight_set.contains(&eid) {
                             let pending_addrs =
                                 Self::snapshot_replica_addrs(&s.nodes, eid, extent);
                             pending_deletes.push(PendingDelete {
@@ -2367,7 +2300,7 @@ impl AutumnManager {
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 && ex.vp_table_refs == 0 {
+                            if ex.refs == 1 {
                                 return Err(AppError::Precondition(format!(
                                     "extent {eid} has in-flight recovery; \
                                      defer truncate until recovery completes"
@@ -2395,10 +2328,7 @@ impl AutumnManager {
                 // F109: build pending_deletes for extents that physically delete.
                 for &eid in &removed {
                     if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1
-                            && extent.vp_table_refs == 0
-                            && !ec_inflight_set.contains(&eid)
-                        {
+                        if extent.refs == 1 && !ec_inflight_set.contains(&eid) {
                             let pending_addrs =
                                 Self::snapshot_replica_addrs(&s.nodes, eid, extent);
                             pending_deletes.push(PendingDelete {
@@ -2521,34 +2451,6 @@ impl AutumnManager {
             }
         };
 
-        // F210-C4: pull-sync vp_refs from the source partition's PS
-        // BEFORE the atomic etcd txn below. Pre-F210-C4 the txn used
-        // the cached `partition_vp_refs[req.part_id]` snapshot, which
-        // could be stale if a previous PS sync_partition_vp_refs
-        // failed. A stale snapshot under-counts `vp_table_refs` on
-        // extents referenced by SSTs that were published since the
-        // last successful sync — `apply_split_mutations` would split
-        // those into left/right children with a wrong count, and a
-        // subsequent `extent_can_delete` check could approve deletion
-        // of an extent whose live VPs are still in some SST. By
-        // pulling here we refresh the manager's view to the
-        // authoritative PS-side state before committing.
-        let part_addr = {
-            let s = self.store.inner.borrow();
-            s.part_addrs.get(&req.part_id).cloned()
-        };
-        if let Some(addr) = part_addr {
-            if let Err(e) = self.pull_and_apply_vp_refs(req.part_id, &addr).await {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: Self::err_to_code(&e),
-                    message: format!("F210-C4 pull_vp_refs pre-split: {e}"),
-                }));
-            }
-        }
-        // If part_addr is unknown (PS hasn't registered yet), skip the
-        // pull — split would fail later for other reasons (no PS to
-        // serve the split children either way).
-
         // Phase 1: Compute all mutations without modifying store
         // (only alloc_ids touches state.next_id, which is safe to waste on failure)
         let out = {
@@ -2558,7 +2460,6 @@ impl AutumnManager {
                 Vec<MgrExtentInfo>,
                 MgrPartitionMeta,
                 MgrPartitionMeta,
-                MgrPartitionVpRefs,
                 HashMap<u64, u64>,
             ), AppError> {
                 Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
@@ -2681,16 +2582,12 @@ impl AutumnManager {
                     end_key: rg.end_key,
                 });
 
-                let right_snapshot = Self::split_partition_vp_snapshot(&s, req.part_id, new_part_id);
-                let vp_extent_puts = Self::preview_partition_vp_refs_apply(&s, &right_snapshot);
-                all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
-
-                Ok((new_streams, all_extents, left, right, right_snapshot, pre_bump_eversion))
+                Ok((new_streams, all_extents, left, right, pre_bump_eversion))
             })()
         };
 
         match out {
-            Ok((new_streams, modified_extents, left, right, right_snapshot, pre_bump_eversion)) => {
+            Ok((new_streams, modified_extents, left, right, pre_bump_eversion)) => {
                 // F210-A2 verify-BEFORE-mirror (was verify-after-mirror at
                 // Phase 3 in the F146 form). If any source-stream extent's
                 // eversion drifted during the Phase-1 awaits, the etcd txn
@@ -2721,7 +2618,7 @@ impl AutumnManager {
                 // separate txn, to prevent orphan streams on crash.)
                 if let Some(etcd) = &self.etcd {
                     let mut kvs =
-                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 5);
+                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 4);
                     for st in &new_streams {
                         kvs.push((
                             format!("streams/{}", st.stream_id),
@@ -2734,10 +2631,6 @@ impl AutumnManager {
                             rkyv_encode(ex).to_vec(),
                         ));
                     }
-                    kvs.push((
-                        format!("partitionVpRefs/{}", right_snapshot.part_id),
-                        rkyv_encode(&right_snapshot).to_vec(),
-                    ));
                     kvs.push((
                         format!("partitions/{}", left.part_id),
                         rkyv_encode(&left).to_vec(),
@@ -2792,8 +2685,6 @@ impl AutumnManager {
                         left,
                         right,
                     );
-                    s.partition_vp_refs
-                        .insert(right_snapshot.part_id, right_snapshot);
                     drop(s);
                     // F183: in-memory last_op_at update (mirror of etcd write above)
                     let now = Self::epoch_seconds();
@@ -2819,10 +2710,8 @@ impl AutumnManager {
     // Inverse of handle_multi_modify_split. Atomically:
     //   - Splices victim's three streams' extent_ids into survivor's
     //   - Allocates a fresh log_stream tail extent (E_new) on K replicas
-    //   - Merges victim's partition_vp_refs snapshot into survivor's
     //   - Widens survivor.rg.end_key to victim.rg.end_key
-    //   - Deletes victim's partitions/streams/regions/partitionVpRefs/
-    //     partitionLastOp keys
+    //   - Deletes victim's partitions/streams/regions/partitionLastOp keys
     //
     // Single-txn etcd commit (F124-style) — crash mid-merge means no state
     // change. F138/F145/F146 inflight checks. F146-style verify-at-apply on
@@ -2849,7 +2738,6 @@ impl AutumnManager {
             new_streams: Vec<MgrStreamInfo>,
             modified_extents: Vec<MgrExtentInfo>,
             survivor_meta: MgrPartitionMeta,
-            merged_vp: MgrPartitionVpRefs,
             victim_part_id: u64,
             victim_log: u64,
             victim_row: u64,
@@ -3032,11 +2920,6 @@ impl AutumnManager {
                 all_extents.extend(row_exts);
                 all_extents.extend(meta_exts);
 
-                let merged_vp =
-                    Self::merged_partition_vp_refs(&s, req.survivor_part_id, req.victim_part_id);
-                let vp_extent_puts = Self::preview_partition_vp_refs_apply(&s, &merged_vp);
-                let all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
-
                 let mut new_survivor_meta = survivor_meta.clone();
                 new_survivor_meta.rg = Some(MgrRange {
                     start_key: s_rg.start_key,
@@ -3047,7 +2930,6 @@ impl AutumnManager {
                     new_streams,
                     modified_extents: all_extents,
                     survivor_meta: new_survivor_meta,
-                    merged_vp,
                     victim_part_id: req.victim_part_id,
                     victim_log: victim_meta.log_stream,
                     victim_row: victim_meta.row_stream,
@@ -3156,7 +3038,7 @@ impl AutumnManager {
         // Phase 2: single fenced etcd txn.
         if let Some(etcd) = &self.etcd {
             let now = Self::epoch_seconds();
-            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 6);
+            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 5);
             for st in &p1.new_streams {
                 kvs.push((
                     format!("streams/{}", st.stream_id),
@@ -3169,10 +3051,6 @@ impl AutumnManager {
                     rkyv_encode(ex).to_vec(),
                 ));
             }
-            kvs.push((
-                format!("partitionVpRefs/{}", p1.merged_vp.part_id),
-                rkyv_encode(&p1.merged_vp).to_vec(),
-            ));
             kvs.push((
                 format!("partitions/{}", p1.survivor_meta.part_id),
                 rkyv_encode(&p1.survivor_meta).to_vec(),
@@ -3195,7 +3073,6 @@ impl AutumnManager {
                 format!("streams/{}", p1.victim_log),
                 format!("streams/{}", p1.victim_row),
                 format!("streams/{}", p1.victim_meta),
-                format!("partitionVpRefs/{}", p1.victim_part_id),
                 format!("regions/{}", p1.victim_part_id),
                 format!("partitionLastOp/{}", p1.victim_part_id),
             ];
@@ -3218,7 +3095,6 @@ impl AutumnManager {
                 &p1.new_streams,
                 &modified_extents,
                 p1.survivor_meta.clone(),
-                p1.merged_vp,
                 p1.victim_part_id,
                 p1.victim_log,
                 p1.victim_row,
@@ -3415,29 +3291,6 @@ impl AutumnManager {
             }));
         }
         to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
-
-        // F210-C4: pull-sync vp_refs from BOTH PSes after freeze
-        // succeeds but BEFORE capturing commit_length / running the
-        // atomic merge txn. Freeze guarantees no new writes can land,
-        // so the pulled snapshot is stable. Without this, the manager's
-        // `partition_vp_refs` for either partition might be stale if a
-        // previous flush/compact sync failed — `apply_merge_mutations`
-        // would compute the merged snapshot against the stale view and
-        // miss vp_table_refs on extents that the survivor/victim's SSTs
-        // actually reference, opening a deletion race after merge.
-        for (addr, pid) in &[
-            (&v_info.part_addr, req.victim_part_id),
-            (&s_info.part_addr, req.survivor_part_id),
-        ] {
-            if let Err(e) = self.pull_and_apply_vp_refs(*pid, addr).await {
-                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
-                return Ok(rkyv_encode(&MergePartitionsResp {
-                    code: Self::err_to_code(&e),
-                    message: format!("F210-C4 pull_vp_refs pre-merge: {e}"),
-                    new_log_tail_extent_id: 0,
-                }));
-            }
-        }
 
         // Capture commit_length on each of the 6 streams. Reuse the
         // existing handle_check_commit_length so we hit the same
@@ -4253,107 +4106,6 @@ impl AutumnManager {
         let _ = req.ps_id; // reserved for future validation
         s.part_addrs.insert(req.part_id, req.address);
         Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
-    }
-
-    pub(crate) async fn handle_sync_partition_vp_refs(&self, payload: Bytes) -> HandlerResult {
-        if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
-        }
-        let req: SyncPartitionVpRefsReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        let snapshot = MgrPartitionVpRefs {
-            part_id: req.part_id,
-            refs: req.refs,
-        };
-        // F147-A: single borrow block — compute deltas once, then (1) check
-        // in-flight guards, (2) build extent_puts, and (3) snapshot pre_eversion.
-        // Pre-F147-A this was two separate borrow blocks each calling
-        // partition_vp_ref_deltas, allocating the HashMap twice.
-        let (extent_puts, pre_eversion) = {
-            let s = self.store.inner.borrow();
-            let deltas = Self::partition_vp_ref_deltas(&s, &snapshot);
-            // Refuse-at-start: if any touched extent is in-flight for another
-            // eversion-bumping operation, concurrent mutators (recovery,
-            // EC conversion) may bump eversion during the etcd await below;
-            // our pre-await blobs in extent_puts would then overwrite fresher
-            // data in etcd (last-writer-wins). PS must retry after the
-            // in-flight op clears.
-            for extent_id in deltas.keys().copied() {
-                // F207-B: read the unified ledger (was F138/F147-A `ec_conversion_inflight`).
-                if matches!(
-                    self.extent_inflight_op(extent_id),
-                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-                ) {
-                    return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                        code: CODE_PRECONDITION,
-                        message: format!(
-                            "extent {extent_id} has in-flight EC conversion; \
-                             defer sync_partition_vp_refs until conversion completes"
-                        ),
-                    }));
-                }
-                // F207-C: Recovery check via the unified ledger.
-                if matches!(
-                    self.extent_inflight_op(extent_id),
-                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
-                ) {
-                    return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                        code: CODE_PRECONDITION,
-                        message: format!(
-                            "extent {extent_id} has in-flight recovery; \
-                             defer sync_partition_vp_refs until recovery completes"
-                        ),
-                    }));
-                }
-            }
-            let puts = Self::preview_partition_vp_refs_apply(&s, &snapshot);
-            let evs: HashMap<u64, u64> = deltas
-                .keys()
-                .filter_map(|&eid| s.extents.get(&eid).map(|ex| (eid, ex.eversion)))
-                .collect();
-            (puts, evs)
-        };
-
-        // F210-A2 verify-BEFORE-mirror (replaces the post-F147-A
-        // verify-after-mirror form). If any touched extent's eversion
-        // drifted between the snapshot above and now, the etcd write
-        // we'd otherwise make is computed from a stale base; refuse
-        // before committing to etcd.
-        {
-            let s = self.store.inner.borrow();
-            for (&extent_id, &pre_ev) in &pre_eversion {
-                if let Some(live) = s.extents.get(&extent_id) {
-                    if live.eversion != pre_ev {
-                        return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "extent {extent_id} eversion changed ({pre_ev} → {}) \
-                                 during vp_refs build; PS must retry",
-                                live.eversion
-                            ),
-                        }));
-                    }
-                }
-            }
-        }
-
-        if let Err(err) = self.mirror_partition_vp_refs(&snapshot, &extent_puts).await {
-            return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
-        }
-        {
-            let mut s = self.store.inner.borrow_mut();
-            Self::apply_partition_vp_refs(&mut s, snapshot);
-        }
-        Ok(rkyv_encode(&SyncPartitionVpRefsResp {
             code: CODE_OK,
             message: String::new(),
         }))

@@ -881,15 +881,15 @@ impl crate::AutumnManager {
             }
             // (2) Process one bounded chunk of the in-progress cycle. Each id is
             // re-looked-up (it may have been deleted since the snapshot) and
-            // filtered: skip extents pending physical delete (refs==0 &&
-            // vp_table_refs==0) — they no longer count as stored.
+            // filtered: skip extents pending physical delete (refs==0) —
+            // they no longer count as stored.
             if !logical_cycle_ids.is_empty() {
                 let end = (logical_cursor + LOGICAL_SCAN_CHUNK).min(logical_cycle_ids.len());
                 {
                     let s = self.store.inner.borrow();
                     for id in &logical_cycle_ids[logical_cursor..end] {
                         if let Some(ex) = s.extents.get(id) {
-                            if ex.refs != 0 || ex.vp_table_refs != 0 {
+                            if ex.refs != 0 {
                                 logical_partial = logical_partial.saturating_add(ex.sealed_length);
                             }
                         }

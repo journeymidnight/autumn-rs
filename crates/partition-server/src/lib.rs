@@ -746,8 +746,6 @@ pub(crate) struct PartitionData {
     vp_extent_id: u64,
     vp_offset: u64,
     stream_client: Rc<StreamClient>,
-    manager_addr: String,
-    pool: Rc<ConnPool>,
     /// F088: sender to the per-partition bulk thread. Always present —
     /// `open_partition` returns Err if P-bulk fails to spawn, so the
     /// partition is never half-opened with no flush channel.
@@ -825,9 +823,9 @@ pub(crate) struct PartitionData {
     /// F162 (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
-    /// `run_gc` could decrement vp_table_refs to 0 (after compaction
-    /// rewrote the SSTs that referenced the extent) and call `punch_holes`,
-    /// causing the manager to enqueue a physical delete. The in-flight
+    /// `run_gc` could relocate the last live value off an extent and call
+    /// `punch_holes` (dropping its `refs` to 0), causing the manager to
+    /// enqueue a physical delete. The in-flight
     /// resolve_value's read RPC arrives at the extent-node which (a) may
     /// have already received MSG_DELETE_EXTENT and respond NotFound — a
     /// spurious user-visible read failure on data that was perfectly valid
@@ -895,16 +893,6 @@ pub(crate) struct PartitionData {
     /// flush failure (same shape as F210-C3 merge error path) and the
     /// split must abort.
     pub(crate) split_drain_ack: std::cell::RefCell<Option<oneshot::Sender<Result<(), String>>>>,
-    /// F210-C4: set to `true` when `sync_partition_vp_refs` failed
-    /// after a meta_stream checkpoint published a new SST set. While
-    /// dirty, `background_gc_loop` skips calls into `punch_holes` /
-    /// `truncate` on log_stream — manager's `vp_table_refs` is stale,
-    /// so an `extent_can_delete` check against it could under-count
-    /// references from SSTs whose `vp_deps` haven't been sync'd, and
-    /// approve a deletion that orphans live VPs. The background
-    /// `vp_refs_retry_loop` periodically retries the sync; on success
-    /// it clears this flag and GC resumes.
-    pub(crate) vp_refs_dirty: Cell<bool>,
     /// F183: per-partition load metrics for the manager's policy engine.
     /// Counters are bumped by `partition_loop` (req on each
     /// dispatch, imm_full each time the imm cap stalls intake). The
@@ -4928,8 +4916,6 @@ async fn partition_thread_main(
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
-        manager_addr: manager_addr.clone(),
-        pool: pool.clone(),
         flush_req_tx: flush_req_tx.clone(),
         row_append_tx: row_append_tx.clone(),
         row_invalidate_tx: row_invalidate_tx.clone(),
@@ -4945,7 +4931,6 @@ async fn partition_thread_main(
         freeze_drain_ack: std::cell::RefCell::new(None),
         frozen_for_split: Cell::new(None),
         split_drain_ack: std::cell::RefCell::new(None),
-        vp_refs_dirty: Cell::new(false),
         metrics: metrics_arc.clone(),
         opened_with_shared: opened_with_shared.clone(),
         // BUG-LEASE-2 Phase 1: in-memory fence floors per ino; restart wipes.
@@ -4953,10 +4938,6 @@ async fn partition_thread_main(
         // + replayed OP_FENCE_BUMP records — floors survive PS restarts.
         fence_floors: RefCell::new(recovered_floors),
     }));
-
-    sync_partition_vp_refs(&part)
-        .await
-        .context("sync partition vp refs after recovery")?;
 
     // Drop the extra clones held locally: the ones stored in PartitionData
     // are the only references. When PartitionData drops, the channels close,
@@ -5001,18 +4982,6 @@ async fn partition_thread_main(
         let conc_for_gc = concurrency_ctrl.clone();
         spawn_failstop(format!("gc[part {part_id}]"), async move {
             background_gc_loop(p, gc_rx, gc_gate_for_loop, conc_for_gc).await;
-        });
-    }
-    // F210-C4: retry loop for failed vp_refs sync. Every 5 s checks the
-    // dirty flag; if set, attempts a fresh `sync_partition_vp_refs`. On
-    // success clears the flag (GC resumes). Bounded backoff isn't
-    // needed because the partition is already gated — GC is paused, so
-    // wasted retries cost only one RPC every 5s.
-    {
-        let p = part.clone();
-        spawn_supervised("ps_vp_refs_retry", move || {
-            let p = p.clone();
-            async move { vp_refs_retry_loop(p).await }
         });
     }
     // F099-K: bind this partition's dedicated TcpListener on THIS
@@ -7896,134 +7865,6 @@ pub(crate) async fn save_table_locs_raw(
     Ok(())
 }
 
-fn collect_partition_vp_refs(readers: &[Arc<SstReader>]) -> Vec<(u64, u32)> {
-    let mut counts = BTreeMap::<u64, u32>::new();
-    for reader in readers {
-        for &extent_id in &reader.vp_deps {
-            *counts.entry(extent_id).or_insert(0) += 1;
-        }
-    }
-    counts.into_iter().collect()
-}
-
-/// F210-C4: background retry task. Every 5 s, if `vp_refs_dirty` is
-/// set, attempts a fresh `sync_partition_vp_refs`. Clears dirty on
-/// success (releases the GC gate). Exits when the partition's
-/// channels close (`flush_tx` upgrade fails — partition torn down).
-pub(crate) async fn vp_refs_retry_loop(part: Rc<RefCell<PartitionData>>) {
-    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-    loop {
-        compio::time::sleep(RETRY_INTERVAL).await;
-        if !part.borrow().vp_refs_dirty.get() {
-            continue;
-        }
-        let part_id = part.borrow().part_id;
-        match sync_partition_vp_refs(&part).await {
-            Ok(()) => {
-                part.borrow().vp_refs_dirty.set(false);
-                tracing::info!(part_id, "F210-C4: vp_refs sync recovered; GC gate released");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    part_id,
-                    error = %e,
-                    "F210-C4: vp_refs sync retry still failing; will retry in 5s"
-                );
-            }
-        }
-    }
-}
-
-/// F210-C4: wrapper around `sync_partition_vp_refs` that converts a
-/// failure into a `vp_refs_dirty` flag set + WARN log, returning Ok.
-/// Used by flush/compact paths so a transient manager unreachability
-/// doesn't fail the flush itself — the SST is durable, only the
-/// vp_refs RPC is pending. The background `vp_refs_retry_loop`
-/// periodically retries until success.
-///
-/// On success: clears `vp_refs_dirty`. On failure: sets it.
-///
-/// IMPORTANT: callers must NOT use this for the INITIAL sync during
-/// `open_partition` — that one needs strict error propagation so a
-/// partition with broken manager link fails to open rather than
-/// silently coming up in a dirty state. open_partition uses the raw
-/// `sync_partition_vp_refs` directly.
-pub(crate) async fn sync_partition_vp_refs_or_mark_dirty(part: &Rc<RefCell<PartitionData>>) {
-    let part_id = part.borrow().part_id;
-    match sync_partition_vp_refs(part).await {
-        Ok(()) => {
-            part.borrow().vp_refs_dirty.set(false);
-        }
-        Err(e) => {
-            part.borrow().vp_refs_dirty.set(true);
-            tracing::warn!(
-                part_id,
-                error = %e,
-                "F210-C4: sync_partition_vp_refs failed; partition marked dirty. \
-                 GC blocked until next successful sync. \
-                 vp_refs_retry_loop will retry."
-            );
-        }
-    }
-}
-
-pub(crate) async fn sync_partition_vp_refs(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
-    let (part_id, refs, manager_addr, pool) = {
-        let p = part.borrow();
-        (
-            p.part_id,
-            collect_partition_vp_refs(&p.sst_readers),
-            p.manager_addr.clone(),
-            p.pool.clone(),
-        )
-    };
-
-    let req = manager_rpc::rkyv_encode(&manager_rpc::SyncPartitionVpRefsReq { part_id, refs });
-    let mut last_err: Option<anyhow::Error> = None;
-    for mgr in manager_addr.split(',') {
-        let mgr = mgr.trim();
-        if mgr.is_empty() {
-            continue;
-        }
-        let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
-        // 30 s — manager replaces the partition's full vp-ref
-        // snapshot (in-memory + etcd mirror) and diffs it to adjust
-        // every touched extent's `vp_table_refs`. Payload scales
-        // with live SST count; bounded so a hung manager doesn't
-        // block the flush/compact follow-up indefinitely.
-        match pool
-            .call_timeout(
-                &mgr_norm,
-                manager_rpc::MSG_SYNC_PARTITION_VP_REFS,
-                req.clone(),
-                Duration::from_secs(30),
-            )
-            .await
-        {
-            Ok(bytes) => {
-                match manager_rpc::rkyv_decode::<manager_rpc::SyncPartitionVpRefsResp>(&bytes) {
-                    Ok(resp) if resp.code == manager_rpc::CODE_OK => return Ok(()),
-                    Ok(resp) => {
-                        last_err = Some(anyhow!(
-                            "sync_partition_vp_refs rejected by {}: {}",
-                            mgr,
-                            resp.message
-                        ));
-                    }
-                    Err(e) => {
-                        last_err = Some(anyhow!("decode sync_partition_vp_refs resp: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow!("no manager addresses to sync vp refs with")))
-}
-
 // ---------------------------------------------------------------------------
 // SSTable building
 // ---------------------------------------------------------------------------
@@ -8270,12 +8111,6 @@ async fn commit_flush_outcome_inner(
         floors_snapshot,
     )
     .await?;
-    // F210-C4: meta_stream checkpoint published; SST is durable. If the
-    // vp_refs sync fails (manager unreachable / NotLeader / transient),
-    // mark dirty + return Ok rather than fail the flush — the SST is
-    // good, the manager just needs to catch up. Background retry +
-    // GC gate prevent erroneous deletion until sync recovers.
-    sync_partition_vp_refs_or_mark_dirty(part).await;
     // F202: tables changed (new SST committed) → refresh the
     // advisory-input metrics so the next report_load_loop tick carries
     // accurate dead-data / minor-compact-pending volumes.
@@ -8399,7 +8234,7 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// loops that re-derive their state each tick (take Clone handles, no moved
 /// channel receiver, no multi-step partition mutation that a mid-panic could
 /// leave half-applied): `heartbeat_loop`, `report_load_loop`,
-/// `region_sync_loop`, `vp_refs_retry_loop`. Mirrors manager F228
+/// `region_sync_loop`. Mirrors manager F228
 /// `spawn_supervised`. Pre-F229 these were bare `spawn(..).detach()`, so a
 /// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
 /// no log on the PS side explaining why).
@@ -11591,8 +11426,6 @@ mod f148_publisher_invariant_tests {
     //!      borrow, drop the borrow.   (synchronous)
     //!   2. `save_table_locs_raw(&snap, ...)`: rkyv_encode + build payload,
     //!      then `stream_client.append.await`.   (synchronous until mpsc send)
-    //!   3. `sync_partition_vp_refs(part).await`: re-reads CURRENT
-    //!      `part.sst_readers` via a fresh borrow.
     //!
     //! Three load-bearing properties make this race-free against a
     //! concurrent publisher (flush vs compact, both running as separate

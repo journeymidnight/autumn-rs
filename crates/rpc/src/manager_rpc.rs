@@ -47,8 +47,8 @@ pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
 // any sealed extents in that stream and convert them on the next tick (~5s).
 pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 
-// Partition→manager sync of live SST VP dependency snapshot.
-pub const MSG_SYNC_PARTITION_VP_REFS: u8 = 0x33;
+// 0x33 retired with the vp_table_refs removal (was
+// MSG_SYNC_PARTITION_VP_REFS, partition→manager VP-dependency sync).
 
 // F183: partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
 pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
@@ -296,9 +296,13 @@ pub struct MgrExtentInfo {
     pub parity: Vec<u64>,
     pub eversion: u64,
     pub refs: u64,
-    /// Number of live SSTables across all partitions whose ValuePointers
-    /// still reference this extent. Distinct from `refs`, which counts
-    /// direct stream membership via `stream.extent_ids`.
+    /// DEPRECATED / INERT (vp_table_refs removal, Stage 1). Formerly the
+    /// count of live SSTables whose ValuePointers referenced this extent —
+    /// an indirect-retention "net" on top of `refs`. Extent retention now
+    /// rests solely on `refs` (stream membership); GC's relocate-then-punch
+    /// invariant guarantees `refs == 0 ⇒ no live VP`. The field is retained
+    /// here only to keep the persisted `extents/<id>` rkyv layout stable
+    /// (no migration yet); nothing reads or writes it. Removed in Stage 2.
     pub vp_table_refs: u64,
     pub sealed_length: u64,
     /// True once this extent has been SEALED (immutable; no more appends).
@@ -359,15 +363,6 @@ pub struct MgrPartitionMeta {
     pub row_stream: u64,
     pub meta_stream: u64,
     pub rg: Option<MgrRange>,
-}
-
-/// Partition-scoped snapshot of live SST VP dependencies.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct MgrPartitionVpRefs {
-    pub part_id: u64,
-    /// extent_id -> number of live SSTs in this partition whose VP deps
-    /// include that extent.
-    pub refs: Vec<(u64, u32)>,
 }
 
 /// Region (partition→PS assignment).
@@ -696,19 +691,6 @@ pub struct RegisterPartitionAddrReq {
     pub address: String,
 }
 // Response: CodeResp
-
-// --- SyncPartitionVpRefs ---
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct SyncPartitionVpRefsReq {
-    pub part_id: u64,
-    pub refs: Vec<(u64, u32)>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct SyncPartitionVpRefsResp {
-    pub code: u8,
-    pub message: String,
-}
 
 // --- ReconcileExtents (F109) ---
 // Extent node calls this on startup (after `load_extents`) with every

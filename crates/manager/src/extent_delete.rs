@@ -78,8 +78,10 @@ pub(crate) struct PendingDelete {
 const MAX_ATTEMPTS: u32 = 60;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// EXTENT10-AUTORECLAIM: how often the leader sweeps for both-zero orphan
-/// extents (`refs == 0 && vp_table_refs == 0` but in NO stream).
+/// EXTENT10-AUTORECLAIM: how often the leader sweeps for orphan extents
+/// (`refs == 0` per `extent_can_delete` but in NO stream). Named "both-zero"
+/// historically (when the gate was `refs==0 && vp_table_refs==0`); since the
+/// vp_table_refs removal the predicate is `refs == 0` alone.
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// F210-G2: backoff cadence for the persisted retry loop. Each
@@ -158,27 +160,22 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// EXTENT10-AUTORECLAIM: reclaim extents that reached both-zero
-    /// (`refs == 0 && vp_table_refs == 0`) but are in NO stream. The refs-side
-    /// delete trigger lives in `punch_holes` / `truncate` (which operate on
-    /// stream members); the vp-side `sync_partition_vp_refs` only DECREMENTS
-    /// `vp_table_refs`. So when the LAST counter to reach 0 is `vp_table_refs`
-    /// (compaction dropping the final SST VP after GC already punched the
-    /// extent out of every log_stream), nothing fires the delete — the
-    /// extent-10 retained-orphan class. Without this sweep it leaks on disk
-    /// until manual reclaim.
+    /// EXTENT10-AUTORECLAIM: reclaim extents that reached `refs == 0`
+    /// (per `extent_can_delete`) but are in NO stream. The normal refs-side
+    /// delete trigger lives in `punch_holes` / `truncate`, which only inspect
+    /// extents that are CURRENT stream members. An extent that lost its last
+    /// stream membership without going through that path (e.g. a born-orphan,
+    /// or a CoW-shared extent whose final referencing stream was rewritten
+    /// out-of-band) sits at `refs == 0` with no path firing its delete — the
+    /// extent-10 orphan class. Without this sweep it leaks on disk until manual
+    /// reclaim.
     ///
-    /// SAFETY — deleting on both-zero is sound:
-    /// - `refs == 0` ⇒ every log_stream relocated its live values out before
-    ///   dropping the extent (relocate-then-punch, made correct by
-    ///   GC-VP-IDENTITY), so no LIVE ValuePointer points here;
-    /// - `vp_table_refs == 0` ⇒ no live SST physically references it.
-    /// A stale `vp_table_refs` could only hide a DEAD reference at `refs == 0`,
-    /// never a live one. (In a bug-free world `refs == 0` alone would suffice;
-    /// the both-zero gate keeps `vp_table_refs` as the net for membership-
-    /// accounting bugs — see extent 10. Drop `vp_table_refs` later and this
-    /// gate collapses to `refs == 0` with no sweep change, via
-    /// `extent_can_delete`.)
+    /// SAFETY — deleting on `refs == 0` is sound: every log_stream relocated
+    /// its live values out before dropping the extent (relocate-then-punch,
+    /// made correct by GC-VP-IDENTITY), so `refs == 0` ⇒ no LIVE ValuePointer
+    /// points here. (This is the same invariant `punch_holes` relies on; the
+    /// former `vp_table_refs == 0` second condition was a net for membership-
+    /// accounting bugs and was removed — `extent_can_delete` is now `refs == 0`.)
     ///
     /// Mirrors `punch_holes`: fenced `extents/<id>` etcd delete → in-memory
     /// remove → `enqueue_pending_deletes` (acquires the F207 Delete marker;
@@ -216,8 +213,8 @@ impl AutumnManager {
                 if stream_members.contains(eid) {
                     tracing::error!(
                         extent_id = *eid,
-                        "both-zero sweep: extent is refs==0 && vp_table_refs==0 yet STILL listed \
-                         in a stream's extent_ids (refs accounting bug) — skipping reclaim, investigate"
+                        "orphan sweep: extent is refs==0 yet STILL listed in a stream's \
+                         extent_ids (refs accounting bug) — skipping reclaim, investigate"
                     );
                     continue;
                 }
@@ -242,27 +239,17 @@ impl AutumnManager {
         for (d, baseline) in candidates {
             let eid = d.extent_id;
             // Value-CAS the `extents/<id>` delete on the snapshot (coco P1):
-            // a concurrent `sync_partition_vp_refs` can bump `vp_table_refs`
-            // 0→1 (rewriting `extents/<id>`) during this await. An unguarded
-            // delete would then drop a just-referenced extent. CAS on the
-            // both-zero snapshot ⇒ if anything changed it since the snapshot,
-            // the txn is refused (Precondition) and we skip — never removing
-            // from memory or enqueuing a physical delete against a record that
-            // is no longer both-zero. (etcd-first; memory-mode skips it.)
+            // a concurrent op (recovery / EC conversion eversion bump, or an
+            // alloc re-adding the extent to a stream) can rewrite `extents/<id>`
+            // during this await. An unguarded delete would then drop a record
+            // that is no longer `refs == 0`. CAS on the snapshot ⇒ if anything
+            // changed it since the snapshot, the txn is refused (Precondition)
+            // and we skip — never removing from memory or enqueuing a physical
+            // delete against a stale record. (etcd-first; memory-mode skips it.)
             // Matches the membership-write CAS pattern (manager note 33).
             //
-            // Accepted residuals (coco P1 #1 / P2 #3), same bar as the rest of
-            // the extent-state path:
-            // - #1 resurrection: this CAS blocks the DANGEROUS order (a sync
-            //   committing its vp_table_refs bump BEFORE our delete → CAS fails
-            //   → skip). The reverse order (our delete commits, then an
-            //   in-flight sync blind-puts `extents/<id>` back via
-            //   `mirror_partition_vp_refs`, which is not yet value-CAS'd) can
-            //   resurrect the etcd record. Fully closing it needs the DEFERRED
-            //   note-33 extent-state-CAS on the sync path (revert-prone, not
-            //   reproduced). It is NON-LOSS here: an in-no-stream extent's SST
-            //   refs are dead (relocate-then-punch, made correct by
-            //   GC-VP-IDENTITY), and it self-heals on the next compaction/sweep.
+            // Accepted residual (coco P2 #3), same bar as the rest of the
+            // extent-state path:
             // - #3 atomicity: the `extents/<id>` delete and the Delete inflight
             //   marker are separate steps (same as `punch_holes`); a crash
             //   between them is reaped by the F109 node-startup reconcile. A
