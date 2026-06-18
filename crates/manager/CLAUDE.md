@@ -1898,3 +1898,28 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     consumer (autumn-op df / fuse statfs). `node_max_free`/ENOSPC-1
     (note 37) is untouched. Cross-ref: note 25 (single df caller), 7 (df
     call-result vs payload disk_id).
+
+41. **EXTENT10-AUTORECLAIM both-zero sweep (`extent_both_zero_sweep_loop`,
+    2026-06-18).** A `refs==0 && vp_table_refs==0` extent that is in NO stream
+    was never auto-deleted: the refs-side trigger lives in `handle_stream_punch_holes`
+    / `handle_truncate` (act on stream members), and `handle_sync_partition_vp_refs`
+    only DECREMENTS `vp_table_refs`. So when `vp_table_refs` is the LAST counter
+    to reach 0 (compaction dropping the final SST VP after GC punched the extent
+    out of every log_stream), nothing fired the delete — the extent-10
+    retained-orphan class leaked until manual `python/reclaim`. The leader-only
+    sweep (`extent_delete.rs`, 60 s, `spawn_supervised`) reclaims them.
+    **Candidate gate (load-bearing):** `extent_can_delete(ex)` (both-zero) AND
+    the extent is **absent from every stream's `extent_ids`** — NOT a bare
+    `refs==0` (a refs under-count must never let the sweep delete a still-membered
+    extent; a `refs==0`-but-in-a-stream extent is ERROR-logged + skipped). Delete
+    is etcd-first **value-CAS** on the both-zero snapshot (refuses if a concurrent
+    `sync_partition_vp_refs` bumped `vp_table_refs`), then in-memory remove +
+    `enqueue_pending_deletes`. **Safety:** in-no-stream `refs==0` ⇒
+    relocate-then-punch (note GC-VP-IDENTITY in partition-server) moved live
+    values out ⇒ no live VP; `vp_table_refs==0` ⇒ no live SST ref. The gate is
+    `extent_can_delete`, so dropping `vp_table_refs` later collapses it to
+    `refs==0` with no sweep change. **Accepted residuals** (documented, non-loss,
+    same bar as the rest of the extent-state path): reverse-order resurrection via
+    the not-yet-value-CAS'd `mirror_partition_vp_refs` (the DEFERRED note-33
+    extent-state-CAS); non-atomic delete+marker (matches `punch_holes`; F109
+    node-reconcile backstop). Test: `extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept`.

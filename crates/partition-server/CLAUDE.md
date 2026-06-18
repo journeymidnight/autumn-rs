@@ -864,6 +864,21 @@ Used by `autumn-client info` to display `discard: N ext / X pending` per log str
      extent is physically freed when refs → 0 across all CoW-shared streams
 ```
 
+**GC-VP-IDENTITY (2026-06-18): liveness is FULL VP identity, not extent_id.**
+A scanned record is the live version of its key ONLY if the current live VP
+matches `extent_id` **AND** `offset` **AND** `len` — i.e. it points at THIS
+record's exact bytes. The pre-fix check compared `vp.extent_id` alone and then
+relocated the *scanned* record's value, so for a key with two large versions in
+the SAME sealed extent (old A@off_a, new B@off_b) GC relocated A's OLD value at
+a fresh seq; once that flushed, scanning B saw the live version pointing
+elsewhere and skipped it → punch dropped B = silent lost-update. The scanned
+record's absolute value offset = `buf_base_offset + record_start + val_off`,
+where `val_off` (V1 `22+key_len` / V0 `17+key_len`) comes from the single source
+of truth `wal_record::value_offset_in_record`. **recovery's VP reconstruction
+(`lib.rs`) uses the SAME helper** (was a hardcoded V1 `+22` that mis-placed V0
+legacy VPs by 5 B — would make this identity check drop live V0 records).
+Regression: `crates/manager/tests/system_gc_multiversion_same_extent.rs`.
+
 Pre-F106 (~commit before this) `run_gc` slurped the entire sealed
 extent into one Vec via `read_bytes_from_extent(eid, 0, sealed_length)`
 and held `borrow_mut()` across the per-record `part_sc.append` await.
