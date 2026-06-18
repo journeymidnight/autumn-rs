@@ -416,6 +416,13 @@ Manager integration tests under `crates/manager/tests/` cover split / merge / ch
 recovery. Some are gated with `#[ignore]` because they take minutes; use
 `cargo test --release -- --ignored` to run the slow set.
 
+GC data-integrity regression (full VP-identity liveness — a superseded older
+version of a key in the same sealed extent must NOT revive over the newer one):
+
+```bash
+cargo test -p autumn-manager --test system_gc_multiversion_same_extent
+```
+
 **Write-pipeline changes (e.g. F256 natural batching) are verified with the perf matrix**
 (`./perf/perf_check.sh --3disk --partitions 8` — builds release, starts a fresh 3-replica
 cluster, runs tcp/ucx × 4K/8M and compares each leg against

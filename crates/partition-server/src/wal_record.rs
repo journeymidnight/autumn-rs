@@ -54,6 +54,25 @@ pub(crate) const PAYLOAD_HEADER: usize = 17;
 #[allow(dead_code)]
 pub(crate) const V1_ENVELOPE_OVERHEAD: usize = 9;
 
+/// Byte offset of `value` within a record, from the record's FIRST on-disk
+/// byte. `first_byte` is V1's `0xff` sentinel or V0's `op`.
+///
+/// SINGLE SOURCE OF TRUTH for the on-disk value position. Used by both
+/// `decode_one` (whose `val_off` drives GC's full-VP-identity liveness) and
+/// recovery's VP reconstruction (`lib.rs`). The two MUST agree: a
+/// `ValuePointer.offset` is reconstructed at recovery and compared at GC, so a
+/// per-version mismatch (e.g. recovery hardcoding the V1 `+22` for a V0 record)
+/// makes GC mis-identify a live V0 record and drop it.
+pub(crate) fn value_offset_in_record(first_byte: u8, key_len: usize) -> usize {
+    if first_byte == V1_SENTINEL {
+        // sentinel(1) + length(4) + PAYLOAD_HEADER + key
+        1 + 4 + PAYLOAD_HEADER + key_len
+    } else {
+        // V0 legacy: PAYLOAD_HEADER + key (no envelope)
+        PAYLOAD_HEADER + key_len
+    }
+}
+
 /// Decoded WAL record — borrows from the input buffer for zero-copy.
 pub(crate) struct DecodedRecord<'a> {
     pub op: u8,
@@ -62,6 +81,11 @@ pub(crate) struct DecodedRecord<'a> {
     pub expires_at: u64,
     /// Total bytes consumed from the input buffer (for cursor advancement).
     pub total: usize,
+    /// Byte offset of `value` within this record (from the record's first
+    /// byte). V1: `5 + PAYLOAD_HEADER + key_len`; V0: `PAYLOAD_HEADER + key_len`.
+    /// Lets GC compute a scanned record's absolute value offset and match it
+    /// against a live `ValuePointer.offset` for full-identity liveness.
+    pub val_off: usize,
 }
 
 /// Outcome of attempting to decode one record at `bytes[cursor..]`.
@@ -134,6 +158,7 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
             value,
             expires_at,
             total,
+            val_off: value_offset_in_record(V1_SENTINEL, key_len),
         })
     } else {
         // V0 legacy: [op][key_len:4][val_len:4][expires_at:8][key][value]
@@ -156,6 +181,7 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
             value,
             expires_at,
             total,
+            val_off: value_offset_in_record(op, key_len),
         })
     }
 }
@@ -223,6 +249,13 @@ mod tests {
                 assert_eq!(r.value, value);
                 assert_eq!(r.expires_at, expires_at);
                 assert_eq!(r.total, buf.len());
+                // val_off must point at the value bytes within the record.
+                assert_eq!(
+                    &buf[r.val_off..r.val_off + value.len()],
+                    value,
+                    "V1 val_off must locate the value"
+                );
+                assert_eq!(r.val_off, value_offset_in_record(V1_SENTINEL, key.len()));
             }
             _ => panic!("V1 round-trip failed for {} bytes", buf.len()),
         }
@@ -262,9 +295,23 @@ mod tests {
                 assert_eq!(r.key, b"key");
                 assert_eq!(r.value, b"value");
                 assert_eq!(r.total, 17 + 3 + 5);
+                // V0 value sits at 17 + key_len (no envelope) — NOT the V1 +22.
+                assert_eq!(r.val_off, 17 + 3);
+                assert_eq!(&buf[r.val_off..r.val_off + 5], b"value");
             }
             _ => panic!("V0 decode failed"),
         }
+    }
+
+    #[test]
+    fn value_offset_matches_envelope() {
+        // V1: sentinel(1) + length(4) + PAYLOAD_HEADER(17) + key.
+        assert_eq!(value_offset_in_record(V1_SENTINEL, 3), 1 + 4 + 17 + 3);
+        assert_eq!(value_offset_in_record(V1_SENTINEL, 0), 1 + 4 + 17);
+        // V0: PAYLOAD_HEADER(17) + key (op byte is never 0xff).
+        assert_eq!(value_offset_in_record(1, 3), 17 + 3);
+        assert_eq!(value_offset_in_record(0x81, 10), 17 + 10);
+        assert_eq!(value_offset_in_record(2, 0), 17);
     }
 
     #[test]

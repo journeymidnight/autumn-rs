@@ -7485,12 +7485,19 @@ async fn recover_partition(
                 let record_extent_off = buf_base + buf_off as u64;
                 let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
                     // VP detection: new WAL has VP flag in op; old WAL uses
-                    // value size as fallback. F186 fix: V1 envelope adds
-                    // 5 bytes (sentinel+length) before the V0 inner header,
-                    // so value bytes are at +22 not +17 from record start.
+                    // value size as fallback. The reconstructed VP.offset MUST
+                    // equal the value's true on-disk offset for BOTH envelope
+                    // formats — GC's full-VP-identity liveness compares the live
+                    // VP.offset against the scanned record's computed offset, so
+                    // a per-version mismatch drops live records. The record's
+                    // first byte (V1 0xff sentinel vs V0 op) selects the layout
+                    // via the shared `value_offset_in_record` helper (was a
+                    // hardcoded V1 `+22`, which mis-placed every V0 VP by 5 B).
+                    let val_off =
+                        crate::wal_record::value_offset_in_record(buf[buf_off], key.len());
                     let vp = ValuePointer {
                         extent_id: eid,
-                        offset: record_extent_off + 22 + key.len() as u64,
+                        offset: record_extent_off + val_off as u64,
                         len: value.len() as u64,
                     };
                     MemEntry {

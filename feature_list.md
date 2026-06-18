@@ -1163,4 +1163,39 @@ gaps in the lease protocol's correctness story.
   extent 在两子分区都 compact 后能自动删除(无 extent 10 类孤儿);compaction 折叠迁移按存活率阈值触发且受 admission
   限速;旧 log_stream VP 数据迁移(方案 A 一次性 / B 双读过渡)。
 - **设计文档:** `docs/value_stream_design.md`(分阶段:Phase 0 止血 = vp 侧删除触发 + 兜底 sweep,与本重构正交且为终态删除原语;Phase 1 value_stream 写路径;Phase 2 回收折进 compaction;Phase 3 迁移老数据)。
-- **passes:** not_completed(DESIGN ONLY;Phase 0 止血待落,Phase 1-3 待排期)。
+- **passes:** not_completed(DESIGN ONLY;经 2026-06-18 评估**否决落地** —— 见 GC-VP-IDENTITY:
+  正确性改走"正确不变量 + 出 bug 修 bug",保留 vp_table_refs(它把 membership-bug 从丢数据降为可恢复孤儿,
+  extent 10 为实证),不做 value_stream;replay 膨胀由 F120/F261 已界定,EC 策略分叉另议)。
+
+### GC-VP-IDENTITY · GC 判活按完整 VP identity(修同-extent 多版本静默丢新值,2026-06-18)
+- **触发(Trigger):** 评估"删 vp_table_refs、删除门改 refs==0"是否安全时,coco /arch 对抗审计发现的独立 P0
+  (与 vp_table_refs 无关)。审计结论:删 vp_table_refs 当前不安全(它依赖的 relocate-then-punch 不变量正被此 P0 破坏);
+  且 extent 10(membership-bug 把活数据弄到 refs=0)证明 vp_table_refs 是必需的网 —— 故决定**保留 vp_table_refs**,先修此 P0。
+- **根因:** `run_gc`/`process_gc_chunk` 判活只比 `vp.extent_id`,relocate 的是被扫描 record 的 value。同一 key 在同一
+  sealed log extent 内有新旧两个大 value(A 旧 off_a / B 新 off_b)时:GC 先扫 A → 当前 live=B、extent_id 匹配 →
+  误判 A live → 以新 seq relocate A 的旧值;A ≥ GC batch cap(或 record_cap=1)→ flush 把 relocate-A 写进 memtable
+  (在扫 B 前)→ 扫 B 时 live 已是 relocate-A(指新 extent)→ skip B → punch X → 新值 B 丢失、旧值 A 复活。
+  静默 lost-update,热路径(大 value overwrite),8MB 同 extent 可靠复现。
+- **改动:**
+  - `wal_record.rs`:`value_offset_in_record(first_byte, key_len)` 作 value 在 record 内偏移的**单一真源**
+    (V1=22+key_len / V0=17+key_len);`DecodedRecord` 增 `val_off`,`decode_one` 两分支用 helper 填。
+  - `background.rs`:`process_gc_chunk` 增参 `buf_base_offset`,判活改**完整 VP identity**
+    (`extent_id && offset==buf_base+record_start+val_off && len==val_len` 才 relocate);`run_gc` 计算
+    `buf_base_offset = cur - carry.len()` 并传入。
+  - `lib.rs` recovery:重建 VP.offset 改用 `value_offset_in_record`(原硬编码 V1 `+22`,对 V0 legacy 错 5 字节,
+    与新 GC identity 不一致会漏 relocate V0 live → 丢数据;coco P1)。
+- **测试:**
+  - reproduce-first 集成测试 `crates/manager/tests/system_gc_multiversion_same_extent.rs`:同 key 两大值同 extent
+    → split 封 X → 小写滚新 tail → compact → GC;**修前 FAIL(读回旧值 'A')、修后 PASS('B')**;并断言 GC 实际
+    punch 了 X(refs<2,coco P2 防假阴性)。
+  - `wal_record` 单测:`value_offset_matches_envelope` + round-trip `val_off` 定位断言(V0/V1)。
+- **验收:** PS lib 167 单测绿;`system_gc_chunked_read` / `system_vp_after_split_gc` 回归绿(genuinely-live 值仍正确
+  relocate,无 over-skip);reproduce-first 修前红/修后绿;coco /findbugs 复审 2 findings 均已处理。
+- **passes:** completed(2026-06-18,代码 + reproduce-first 测试 + 回归 + coco 复审)。
+
+### MERGE-REFS-RECOMPUTE · merge refs 改"从成员关系重算"(消 saturating_sub 脆性,待落)
+- **触发:** coco /findbugs P1 + GC-VP-IDENTITY 审计 —— merge 的 `refs.saturating_sub(1)` 在 refs 已欠计时静默到 0,
+  若将来删 vp_table_refs 则直接变物理删除风险。
+- **方向:** `compute_merge_streams` / `splice_streams_without_new_tail` 的 refs 从结果成员关系**重算**(而非增量
+  saturating_sub);recovery 后对 `refs == count(stream.extent_ids 含 eid)` 做一次校验。
+- **passes:** not_completed(下一步;独立于已完成的 GC-VP-IDENTITY)。

@@ -2403,7 +2403,11 @@ pub(crate) async fn run_gc(
             break;
         }
         let chunk_len = chunk.len() as u64;
-        cur = cur.saturating_add(chunk.len() as u64);
+        // `buf` = carry (the unconsumed record-tail preceding this chunk) ++
+        // chunk, so buf[0] sits at absolute extent offset (read offset -
+        // carry.len()). `cur` is still the read offset here (incremented below).
+        let buf_base_offset = cur - carry.len() as u64;
+        cur = cur.saturating_add(chunk_len);
 
         let buf: Vec<u8> = if carry.is_empty() {
             chunk
@@ -2419,6 +2423,7 @@ pub(crate) async fn run_gc(
             extent_id,
             &rg,
             &part_sc,
+            buf_base_offset,
             &buf,
             &mut moved,
             &mut batch,
@@ -2503,6 +2508,10 @@ async fn process_gc_chunk(
     extent_id: u64,
     rg: &Range,
     part_sc: &Rc<StreamClient>,
+    // Absolute offset in `extent_id` where `buf[0]` sits (carry-tail of the
+    // previous chunk ++ this chunk). Used to compute each scanned record's
+    // absolute value offset for full VP-identity liveness matching.
+    buf_base_offset: u64,
     buf: &[u8],
     moved: &mut usize,
     batch: &mut GcWriteBatch,
@@ -2515,15 +2524,16 @@ async fn process_gc_chunk(
     let mut cursor = 0usize;
     while cursor < buf.len() {
         let record_start = cursor;
-        let (op, key_owned, value_owned, expires_at) =
+        let (op, key_owned, value_owned, expires_at, val_off) =
             match crate::wal_record::decode_one(&buf[cursor..]) {
                 crate::wal_record::DecodeOne::Ok(r) => {
                     let op = r.op;
                     let key = r.key.to_vec();
                     let value = r.value.to_vec();
                     let expires_at = r.expires_at;
+                    let val_off = r.val_off;
                     cursor += r.total;
-                    (op, key, value, expires_at)
+                    (op, key, value, expires_at, val_off)
                 }
                 crate::wal_record::DecodeOne::Incomplete => {
                     // Caller carries this partial record into the next chunk.
@@ -2646,8 +2656,20 @@ async fn process_gc_chunk(
         if cur_op & OP_VALUE_POINTER == 0 || cur_val.len() < VALUE_POINTER_SIZE {
             continue;
         }
+        // Full VP-identity liveness. The scanned record is the LIVE version of
+        // its key ONLY if the current live VP points at THIS record's exact
+        // bytes — extent_id AND absolute offset AND len. Comparing extent_id
+        // alone (the pre-fix bug) misclassifies a SUPERSEDED older version of
+        // the same key that happens to live in the same extent as "live"; GC
+        // then relocates the OLD value with a fresh (higher) seq, reviving it
+        // over the newer version and dropping the newer one on the next punch
+        // (coco /arch P0; regression: tests/system_gc_multiversion_same_extent).
+        let scanned_value_offset = buf_base_offset + record_start as u64 + val_off as u64;
         let vp = ValuePointer::decode(&cur_val);
-        if vp.extent_id != extent_id {
+        if vp.extent_id != extent_id
+            || vp.offset != scanned_value_offset
+            || vp.len != val_len as u64
+        {
             continue;
         }
 
@@ -2694,8 +2716,6 @@ async fn process_gc_chunk(
             expires_at,
             record_size,
         });
-
-        let _ = vp; // length already captured via val_len; vp.len would also work.
 
         if batch.is_full() {
             flush_gc_batch(
