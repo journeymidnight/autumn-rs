@@ -78,10 +78,9 @@ pub(crate) struct PendingDelete {
 const MAX_ATTEMPTS: u32 = 60;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// EXTENT10-AUTORECLAIM: how often the leader sweeps for orphan extents
-/// (`refs == 0` per `extent_can_delete` but in NO stream). Named "both-zero"
-/// historically (when the gate was `refs==0 && vp_table_refs==0`); since the
-/// vp_table_refs removal the predicate is `refs == 0` alone.
+/// EXTENT10-AUTORECLAIM: how often the leader sweeps for both-zero orphan
+/// extents (`refs == 0 && vp_table_refs == 0` per `extent_can_delete`, but in
+/// NO stream).
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// F210-G2: backoff cadence for the persisted retry loop. Each
@@ -160,22 +159,24 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// EXTENT10-AUTORECLAIM: reclaim extents that reached `refs == 0`
-    /// (per `extent_can_delete`) but are in NO stream. The normal refs-side
-    /// delete trigger lives in `punch_holes` / `truncate`, which only inspect
-    /// extents that are CURRENT stream members. An extent that lost its last
-    /// stream membership without going through that path (e.g. a born-orphan,
-    /// or a CoW-shared extent whose final referencing stream was rewritten
-    /// out-of-band) sits at `refs == 0` with no path firing its delete — the
-    /// extent-10 orphan class. Without this sweep it leaks on disk until manual
-    /// reclaim.
+    /// EXTENT10-AUTORECLAIM: reclaim extents that reached both-zero
+    /// (`refs == 0 && vp_table_refs == 0`, per `extent_can_delete`) but are in
+    /// NO stream. The refs-side delete trigger lives in `punch_holes` /
+    /// `truncate`, which only inspect CURRENT stream members. An extent that
+    /// lost its last membership out-of-band sits at `refs == 0` with no path
+    /// firing its delete — the extent-10 orphan class. Without this sweep it
+    /// leaks on disk until manual reclaim.
     ///
-    /// SAFETY — deleting on `refs == 0` is sound: every log_stream relocated
-    /// its live values out before dropping the extent (relocate-then-punch,
-    /// made correct by GC-VP-IDENTITY), so `refs == 0` ⇒ no LIVE ValuePointer
-    /// points here. (This is the same invariant `punch_holes` relies on; the
-    /// former `vp_table_refs == 0` second condition was a net for membership-
-    /// accounting bugs and was removed — `extent_can_delete` is now `refs == 0`.)
+    /// SAFETY — deleting on both-zero is sound:
+    /// - `refs == 0` ⇒ every log_stream relocated its live values out before
+    ///   dropping the extent (relocate-then-punch, made correct by
+    ///   GC-VP-IDENTITY), so no LIVE ValuePointer points here;
+    /// - `vp_table_refs == 0` ⇒ no live SST physically references it.
+    /// The `vp_table_refs == 0` half is now an UPGRADE-SAFETY GUARD (see
+    /// `extent_can_delete`): the maintenance machinery is gone, so for extents
+    /// managed under this build it is always 0, but a legacy `vp_table_refs > 0`
+    /// extent (live VPs the old net protected) is correctly NOT reclaimed here
+    /// until Stage 2's migration clears the field.
     ///
     /// Mirrors `punch_holes`: fenced `extents/<id>` etcd delete → in-memory
     /// remove → `enqueue_pending_deletes` (acquires the F207 Delete marker;
@@ -213,8 +214,8 @@ impl AutumnManager {
                 if stream_members.contains(eid) {
                     tracing::error!(
                         extent_id = *eid,
-                        "orphan sweep: extent is refs==0 yet STILL listed in a stream's \
-                         extent_ids (refs accounting bug) — skipping reclaim, investigate"
+                        "both-zero sweep: extent is refs==0 && vp_table_refs==0 yet STILL listed \
+                         in a stream's extent_ids (refs accounting bug) — skipping reclaim, investigate"
                     );
                     continue;
                 }

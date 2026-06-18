@@ -1243,26 +1243,34 @@ gaps in the lease protocol's correctness story.
   「Client-side complexity first / server complexity compounds」:GC-VP-IDENTITY 已修好 relocate-then-punch
   不变量(`refs==0 ⇒ 无 live VP`),merge refs 会计正确(MERGE-REFS-LEAK 修 + RECOMPUTE 复现失败),
   故 `refs`(stream 成员)单计数已足够,第二计数纯属冗余复杂度。
-- **目标/边界:** 删 vp_table_refs 全部机制;`extent_can_delete` 退化为 `refs == 0`;保持全停全启升级安全
-  (绝不 reset)——分两阶段,Stage 1 不破坏任何持久格式以便先 chaos 验证「refs-only 删除不丢数据」。
+- **目标/边界:** 删 vp_table_refs 全部机制;终态 `extent_can_delete` 退化为 `refs == 0`;保持全停全启升级安全
+  (绝不 reset)。分两阶段:**Stage 1 删机制 + 不破坏持久格式 + 删除门保留 `&& vp_table_refs==0` 作升级守卫**;
+  Stage 2 迁移后才把门塌缩到 `refs==0` 并删字段。
+- **coco P0 修正(关键):** 初版 Stage 1 把删除门直接塌成 `refs==0`,coco /findbugs(GPT-5.5)指出这是**升级丢数据**:
+  全停全启在既有 etcd 上重启,旧版集群可能遗留 `refs==0 && vp_table_refs>0 && 不在任何 stream` 的 retained-by-VP
+  extent(老 net 合法保留的活数据,如 extent 10,本仓 MERGE-REFS-LEAK 实证存在过);`refs==0 ⇒ 无 live VP` 只对
+  **post-GC-VP-IDENTITY 路径达成 refs==0 的 extent**成立,不覆盖老 buggy GC 冻结在 etcd 的状态。违反 memory#1
+  「全停全启安全:持久态改动要么 rkyv 同布局要么带迁移」。修正:Stage 1 只删机制、删除门保留 `&& vp_table_refs==0`
+  作冻结升级守卫(无 maintainer → 新管 extent 恒 0 → 等价 refs==0;老 vp>0 extent 不删,空间泄漏非丢数据,Stage 2 迁移清)。
 - **Stage 1(本次,无格式破坏):**
-  - 删:`MSG_SYNC_PARTITION_VP_REFS`(0x33)/`MSG_PULL_VP_REFS`(0x4F) + req/resp(`SyncPartitionVpRefs*`/
+  - 删(机制):`MSG_SYNC_PARTITION_VP_REFS`(0x33)/`MSG_PULL_VP_REFS`(0x4F) + req/resp(`SyncPartitionVpRefs*`/
     `PullVpRefs*`/`MgrPartitionVpRefs`);manager `partition_vp_refs` state + `partitionVpRefs/` etcd 加载;
     维护 fns(`preview/apply/merged/split_snapshot/merge_extent_updates/mirror_partition_vp_refs/
     partition_vp_ref_deltas/vp_refs_to_map`);`handle_sync_partition_vp_refs` + `pull_and_apply_vp_refs` +
     split/merge 的 pull;PS `vp_refs_dirty` + `vp_refs_retry_loop` + GC dirty-gate + `sync_partition_vp_refs*` +
-    `collect_partition_vp_refs` + `handle_pull_vp_refs`;PS `PartitionData.manager_addr/pool`(随之死代码)。
-  - 改:`extent_can_delete → refs==0`;punch/truncate 的删除门去掉 `&& vp_table_refs==0`;recovery
-    logical_stored skip 改 `refs!=0`;EXTENT10 sweep 门退化(经 `extent_can_delete`,自动);WIRE bump v6→v7
+    `collect_partition_vp_refs` + `handle_pull_vp_refs`;PS `PartitionData.manager_addr/pool`(随之死代码)。WIRE bump v6→v7
     (MIN=MAX=7,registry 记 `4263787e9cedcca8`)。
-  - 保留(inert,Stage 2 再删):`MgrExtentInfo.vp_table_refs` 字段(etcd `extents/<id>` rkyv 布局不变)、
+  - **不改删除语义(升级守卫):**`extent_can_delete` 保持 `refs==0 && vp_table_refs==0`;punch/truncate 门、recovery
+    logical_stored、EXTENT10 sweep、autumn-op 展示/分类**全部不动**(字段变冻结只读,语义对既有数据零变化)。
+  - 保留(Stage 2 再删):`MgrExtentInfo.vp_table_refs` 字段(etcd `extents/<id>` rkyv 布局不变,仍被 `extent_can_delete` 读)、
     SST `MetaBlock.vp_deps`(+`SstReader.vp_deps`,`#[allow(dead_code)]`)。
-- **验收标准:** (1) 全 workspace + tests 编译绿;(2) rpc/common/PS/manager 单测绿(EXTENT10 测试改为断言
-  refs==0 非成员孤儿被回收、含 vp_table_refs>0 者);(3) **chaos/e2e 验证 refs-only 删除不丢数据** ——
+- **验收标准:** (1) 全 workspace + tests 编译绿;(2) rpc/common/PS/manager 单测绿(EXTENT10 测试维持原断言:both-zero
+  非成员孤儿回收、vp_table_refs>0 / refs>0 / 仍在 stream 者保留);(3) **chaos/e2e 验证(机制删除后)删除不丢数据** ——
   `system_vp_after_split_gc`(split+一子 GC,两子仍解析 VP)、`system_split_ref_counting`(共享 extent 两子 GC 后
   refs→0 freed 且数据正确)、`system_gc_multiversion_same_extent`、`system_merge` round-trip/zero-loss 全绿。
   注:`split_merge_split_with_concurrent_writes`(#[ignore] long-running)本分支与 baseline 均 ~7min 不完成
   [EXIT 124],reproduce-first 确认 PRE-EXISTING、非本次回归(同 split/merge 机制已由 f185 + system_split_* 覆盖)。
-- **Stage 2(未做):** 版本化解码迁移物理删除 `MgrExtentInfo.vp_table_refs` + SST `MetaBlock.vp_deps`
-  (MetaBlock 有 VERSION → dual-decode)+ 清理残留 `partitionVpRefs/` etcd key。
-- **passes:** completed(Stage 1;代码 + 单测 + e2e 验证 + 文档)。Stage 2 = not_completed(待排期)。
+- **Stage 2(未做):** 迁移(PS 重扫 SST vp_deps / 强制 major-compact 确认无 live VP → 清 `vp_table_refs`)后,
+  `extent_can_delete` 塌缩 `refs==0`、版本化解码物理删 `MgrExtentInfo.vp_table_refs` + SST `MetaBlock.vp_deps`
+  (MetaBlock 有 VERSION → dual-decode)+ 清残留 `partitionVpRefs/` etcd key。
+- **passes:** completed(Stage 1,含 coco P0 修正;代码 + 单测 + e2e 验证 + 文档)。Stage 2 = not_completed(待排期)。

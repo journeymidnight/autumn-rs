@@ -98,12 +98,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // >4 GiB shards (16+ GiB extents) and bounding the encode transient to
     // (K+M)×stripe instead of ~2× the whole extent. Pre-R3: MIN=MAX=6.
     (6, "e9fb9f2e6a582867"),
-    // v7: vp_table_refs removal (Stage 1) — retired MSG_SYNC_PARTITION_VP_REFS
+    // v7: vp_table_refs removal Stage 1 — retired MSG_SYNC_PARTITION_VP_REFS
     // (0x33) + MSG_PULL_VP_REFS (0x4F) and their req/resp (SyncPartitionVpRefs*,
     // PullVpRefs*, MgrPartitionVpRefs). MgrExtentInfo.vp_table_refs kept inert
-    // (no rkyv layout change) so persisted `extents/<id>` still decode; extent
-    // retention is now `refs`-only. Pre-R3: MIN=MAX=7.
-    (7, "4263787e9cedcca8"),
+    // (no rkyv layout change) so persisted `extents/<id>` still decode; the
+    // deletion gate keeps `refs==0 && vp_table_refs==0` as an upgrade-safety
+    // guard until Stage 2 migrates + collapses it to `refs==0`. Pre-R3: MIN=MAX=7.
+    // (Fingerprint updated within the same logical v7 by the coco-P0 follow-up —
+    // comment/doc edits only, no wire-layout change; v7 not yet deployed.)
+    (7, "96f3131d4e1e0038"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

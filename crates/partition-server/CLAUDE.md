@@ -171,7 +171,7 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## SST VP dependency tracking (`vp_deps`) — RETIRED 2026-06-18
+## SST VP dependency tracking (`vp_deps`) — SYNC RETIRED 2026-06-18
 
 Each SST `MetaBlock` used to persist `vp_deps: Vec<u64>` (the distinct log
 extent ids referenced by live `ValuePointer` entries in that SST). The PS
@@ -180,20 +180,24 @@ recovery / flush / compaction and shipped it to the manager via
 `MSG_SYNC_PARTITION_VP_REFS` so the manager could maintain a `vp_table_refs`
 retention counter.
 
-**That whole mechanism was removed** with the manager-side `vp_table_refs`
-deletion: extent retention is now `refs`-only (stream membership), safe
-because GC's relocate-then-punch invariant guarantees `refs == 0 ⇒ no live
-VP`. The PS no longer computes or syncs `vp_deps`; `collect_partition_vp_refs`,
-`sync_partition_vp_refs*`, the `vp_refs_dirty` GC gate, and `vp_refs_retry_loop`
-are gone. The on-disk `MetaBlock.vp_deps` field + its in-memory mirror
-`SstReader.vp_deps` are kept INERT for one release (no SST-format break yet —
-the builder still writes it, the reader still decodes it, nothing reads it);
-both are removed behind a format-version bump in Stage 2. See manager
-CLAUDE.md "VP lifetime after split".
+**That whole sync/maintenance mechanism was removed** (Stage 1 of the
+`vp_table_refs` removal): the PS no longer computes or syncs `vp_deps` —
+`collect_partition_vp_refs`, `sync_partition_vp_refs*`, the `vp_refs_dirty` GC
+gate, and `vp_refs_retry_loop` are gone, and `MSG_SYNC_PARTITION_VP_REFS` /
+`MSG_PULL_VP_REFS` are retired. The target end-state is `refs`-only retention,
+safe because GC's relocate-then-punch invariant guarantees `refs == 0 ⇒ no live
+VP`. But the manager-side gate is collapsed to `refs == 0` only in **Stage 2**
+(after a migration), NOT now — a cluster upgraded from a pre-removal build may
+hold legacy extents legitimately retained at `refs == 0 && vp_table_refs > 0`,
+so `extent_can_delete` keeps the `&& vp_table_refs == 0` guard meanwhile (see
+manager CLAUDE.md "VP lifetime after split"). The on-disk `MetaBlock.vp_deps`
+field + its in-memory mirror `SstReader.vp_deps` are kept INERT (no SST-format
+break — the builder still writes it, the reader still decodes it, nothing reads
+it); both are removed behind a format-version bump in Stage 2.
 
 The split-lifetime correctness this once protected (shared SSTs still holding
-old `ValuePointer`s after a child truncated the log) is now upheld by GC
-relocating live values out before `punch_holes` drops `refs` — verified by
+old `ValuePointer`s after a child truncated the log) is upheld by GC relocating
+live values out before `punch_holes` drops `refs` — verified by
 `crates/manager/tests/system_vp_after_split_gc.rs`.
 
 ## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)

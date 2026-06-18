@@ -1127,12 +1127,13 @@ impl AutumnManager {
         // Observability: on a full cluster dump (`stream_ids` empty), also
         // surface extents that exist in the store but are referenced by NO
         // stream's `extent_ids` — orphan / non-member extents. The loop above
-        // only walks stream membership, so these are otherwise invisible. Post
-        // vp_table_refs removal, a non-member extent at `refs == 0` is a
-        // reclaimable orphan awaiting the EXTENT10-AUTORECLAIM sweep (a
-        // `refs > 0` non-member would be a refs-accounting bug worth flagging).
-        // Targeted stream_ids queries (hot path, client.rs) keep the
-        // membership-only behaviour.
+        // only walks stream membership, so these are otherwise invisible. A
+        // non-member at `refs==0 && vp_table_refs==0` is reclaimable (the
+        // EXTENT10-AUTORECLAIM sweep reaps it); one with `vp_table_refs>0` is a
+        // legacy extent retained by the upgrade-safety guard (live VPs, Stage-2
+        // migration target). `vp_table_refs` is on the wire (MgrExtentInfo) so
+        // the CLI can show WHY a non-member is retained. Targeted stream_ids
+        // queries (hot path, client.rs) keep the membership-only behaviour.
         if full_dump {
             for (eid, e) in s.extents.iter() {
                 if !member_ids.contains(eid) {
@@ -2113,7 +2114,7 @@ impl AutumnManager {
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 {
+                            if ex.refs == 1 && ex.vp_table_refs == 0 {
                                 return Err(AppError::Precondition(format!(
                                     "extent {eid} has in-flight recovery; \
                                      defer punch_holes until recovery completes"
@@ -2147,7 +2148,10 @@ impl AutumnManager {
                 // would physically delete (refs would hit 0 and not EC-inflight).
                 for &eid in &removed {
                     if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1 && !ec_inflight_set.contains(&eid) {
+                        if extent.refs == 1
+                            && extent.vp_table_refs == 0
+                            && !ec_inflight_set.contains(&eid)
+                        {
                             let pending_addrs =
                                 Self::snapshot_replica_addrs(&s.nodes, eid, extent);
                             pending_deletes.push(PendingDelete {
@@ -2300,7 +2304,7 @@ impl AutumnManager {
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 {
+                            if ex.refs == 1 && ex.vp_table_refs == 0 {
                                 return Err(AppError::Precondition(format!(
                                     "extent {eid} has in-flight recovery; \
                                      defer truncate until recovery completes"
@@ -2328,7 +2332,10 @@ impl AutumnManager {
                 // F109: build pending_deletes for extents that physically delete.
                 for &eid in &removed {
                     if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1 && !ec_inflight_set.contains(&eid) {
+                        if extent.refs == 1
+                            && extent.vp_table_refs == 0
+                            && !ec_inflight_set.contains(&eid)
+                        {
                             let pending_addrs =
                                 Self::snapshot_replica_addrs(&s.nodes, eid, extent);
                             pending_deletes.push(PendingDelete {

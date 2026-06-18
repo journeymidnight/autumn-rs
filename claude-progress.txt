@@ -5,7 +5,12 @@ Task scope: 删除 vp_table_refs 双计数,extent 留存只看 refs(用户指示
   不靠网住」+「client/server complexity」:GC-VP-IDENTITY 已使 relocate-then-punch 成立(refs==0 ⇒ 无 live VP),
   merge refs 会计正确,故 refs 单计数已足够,第二计数纯冗余。分两阶段,本会话交付 Stage 1。
 
-STAGE 1(本次,SHIPPED,无持久格式破坏 —— 为先 chaos 验证"refs-only 删除不丢数据"再做不可逆的 Stage 2):
+coco P0 修正(关键,见下):初版 Stage 1 把删除门塌成 refs==0,coco /findbugs(GPT-5.5)指出是升级丢数据 ——
+  全停全启在既有 etcd 重启,旧版遗留 refs==0 && vp_table_refs>0 && 非成员 的 retained-by-VP extent(活数据,
+  extent 10 实证)会被首轮 sweep 误删;refs==0⇒无 live VP 只对 post-GC-VP-IDENTITY 路径成立。违反 memory#1
+  全停全启升级安全。修正:Stage 1 只删机制,删除门保留 && vp_table_refs==0 作冻结升级守卫;Stage 2 迁移后才塌缩。
+
+STAGE 1(本次,SHIPPED,无持久格式破坏 + 删除语义对既有数据零变化):
   删除的机制(grep 确认 .rs 全清):
     - RPC: MSG_SYNC_PARTITION_VP_REFS(0x33) / MSG_PULL_VP_REFS(0x4F) + SyncPartitionVpRefs*/PullVpRefs*/MgrPartitionVpRefs。
     - manager: partition_vp_refs state + partitionVpRefs/ etcd 加载;维护 fns(preview/apply/merged/split_snapshot/
@@ -13,27 +18,30 @@ STAGE 1(本次,SHIPPED,无持久格式破坏 —— 为先 chaos 验证"refs-onl
       pull_and_apply_vp_refs + split/merge 的 pull;split/merge handler 里 vp 快照 plumbing 全删。
     - PS: vp_refs_dirty + GC dirty-gate;vp_refs_retry_loop;sync_partition_vp_refs(_or_mark_dirty);
       collect_partition_vp_refs;handle_pull_vp_refs;死字段 PartitionData.manager_addr/pool。
-  改动:
-    - extent_can_delete → refs==0;punch/truncate 删除门去掉 && vp_table_refs==0;recovery logical_stored skip 改 refs!=0;
-      EXTENT10 sweep 经 extent_can_delete 自动退化(门 + 成员检查保留);WIRE bump v6→v7(MIN=MAX=7,fp 4263787e9cedcca8)。
-  保留 INERT(Stage 2 再删,故本次零格式破坏、可回滚):
-    - MgrExtentInfo.vp_table_refs(etcd extents/<id> rkyv 布局不变);SST MetaBlock.vp_deps + SstReader.vp_deps(#[allow(dead_code)])。
+    - WIRE bump v6→v7(MIN=MAX=7,fp 4263787e9cedcca8)。
+  删除语义不动(升级守卫):extent_can_delete 保持 refs==0 && vp_table_refs==0;punch/truncate 门、recovery
+    logical_stored、EXTENT10 sweep、autumn-op 展示/分类 全部不动(字段变冻结只读,对既有数据零语义变化)。
+  保留(Stage 2 再删):MgrExtentInfo.vp_table_refs(etcd 布局不变,仍被 extent_can_delete 读);
+    SST MetaBlock.vp_deps + SstReader.vp_deps(#[allow(dead_code)])。
   验证(全绿):
     - cargo build --workspace --tests;rpc 30(含 wire fingerprint registry)、common+PS 167、manager 162 单测。
-    - EXTENT10 单测改为新语义:refs==0 非成员孤儿(含 vp_table_refs>0 者)被回收;refs>0 / 仍在 stream 者保留。
-    - e2e data-safety(refs-only 删除不丢数据的 chaos 闸):
+    - EXTENT10 单测维持原断言:both-zero 非成员孤儿回收;vp_table_refs>0 / refs>0 / 仍在 stream 者保留。
+    - e2e data-safety(机制删除后删除不丢数据的 chaos 闸):
         system_vp_after_split_gc(split+一子 GC,两子仍解析 VP)✓
-        system_split_ref_counting(共享 CoW extent 两子 GC 后 refs→0 freed + 数据正确)✓ ← refs-only 删除安全性主测
+        system_split_ref_counting(共享 CoW extent 两子 GC 后 refs→0 freed + 数据正确)✓
         system_gc_multiversion_same_extent ✓;split large-value/overlap/compact-chain ✓
         system_merge: f185 zero-loss-concurrent-writes ✓ + merge_split_round_trip ✓ + merge_then_split_round_trip ✓
         (split_merge_split_with_concurrent_writes:本分支与 PRE-CHANGE baseline 均不在 ~7min 内完成[EXIT 124];
          reproduce-first 确认是该 #[ignore] long-running chaos 测试 PRE-EXISTING 的慢/卡,非本次回归;同机制 f185 已覆盖)
-  文档:manager/CLAUDE.md(VP-lifetime 段重写为 refs-only;note 2/14/41 + 各处)、partition-server/CLAUDE.md
-    (vp_deps 段标 RETIRED;F148-A publish-ordering)、README(audit_extent_refs NOTE 更新)、feature_list
-    (新增 VP-TABLE-REFS-REMOVAL 条目)、docs/value_stream_design.md(顶部历史 banner)。
+    - coco /findbugs(GPT-5.5)复审:P0(升级丢数据)已按上方修正;P2(autumn-op JSON 暴露 stale vp_table_refs)
+      随删除门保留而自然消解(字段仍有意义 = 迁移阻断标记,审计脚本分类正确)。
+  文档:manager/CLAUDE.md(VP-lifetime 段改为"机制删除 + 守卫保留至 Stage 2";note 2/14/41 + cluster-df + 各处)、
+    partition-server/CLAUDE.md(vp_deps 段 SYNC RETIRED;F148-A publish-ordering)、README(audit NOTE)、
+    feature_list(VP-TABLE-REFS-REMOVAL 条目)、docs/value_stream_design.md(顶部历史 banner)。
 
-STAGE 2(未做,not_completed,待排期):版本化解码迁移物理删除 MgrExtentInfo.vp_table_refs + SST MetaBlock.vp_deps
-  (MetaBlock 有 VERSION → dual-decode)+ 清理残留 partitionVpRefs/ etcd key。需先确认 Stage 1 chaos 长期无回归。
+STAGE 2(未做,not_completed,待排期):迁移(PS 重扫 SST vp_deps / 强制 major-compact 确认无 live VP → 清 vp_table_refs)
+  后,extent_can_delete 塌缩 refs==0、版本化解码物理删除 MgrExtentInfo.vp_table_refs + SST MetaBlock.vp_deps
+  (MetaBlock 有 VERSION → dual-decode)+ 清理残留 partitionVpRefs/ etcd key。需先确认 Stage 1 长期无回归。
 
 Backlog(pre-existing,本任务外):
   - note 33 DEFERRED:extent-state(eversion/replicates)read-modify-write 未 value-CAS(随 vp_table_refs 删除,

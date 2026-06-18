@@ -1084,9 +1084,10 @@ impl AutumnManager {
             mgr.clone().extent_delete_retry_loop()
         });
 
-        // EXTENT10-AUTORECLAIM: reclaim orphan extents (refs==0, in no stream)
-        // that the punch/truncate refs-side delete path never sees because they
-        // lost their last membership out-of-band (extent-10 class).
+        // EXTENT10-AUTORECLAIM: reclaim both-zero orphan extents (refs==0 &&
+        // vp_table_refs==0, in no stream) that the punch/truncate refs-side
+        // delete path never sees because they lost their last membership
+        // out-of-band (extent-10 class).
         let mgr = self.clone();
         Self::spawn_supervised("extent_both_zero_sweep", move || {
             mgr.clone().extent_both_zero_sweep_loop()
@@ -2979,14 +2980,28 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         ))
     }
 
-    /// Extent retention predicate. An extent is reclaimable once no stream
-    /// lists it (`refs == 0`). The former `&& vp_table_refs == 0` net was
-    /// dropped with the vp_table_refs removal: GC's relocate-then-punch
-    /// invariant (live in-range values are relocated before `punch_holes`
-    /// decrements `refs`) guarantees `refs == 0 ⇒ no live VP`, so membership
-    /// is the sole authority. See manager/CLAUDE.md.
+    /// Extent retention predicate. Reclaimable iff no stream lists it
+    /// (`refs == 0`) AND no live SST ValuePointer is recorded against it
+    /// (`vp_table_refs == 0`).
+    ///
+    /// vp_table_refs-removal STAGING NOTE: the vp_table_refs *maintenance*
+    /// machinery (the PS sync/pull RPCs, the manager-side aggregation) is gone,
+    /// so the field is now write-FROZEN — every extent allocated/managed under
+    /// this build has `vp_table_refs == 0`, making this gate effectively
+    /// `refs == 0` for them. The `&& vp_table_refs == 0` clause is RETAINED as
+    /// an UPGRADE-SAFETY GUARD: a cluster upgraded from a pre-removal build may
+    /// hold legacy extents legitimately retained at `refs == 0 && vp_table_refs
+    /// > 0` (live VPs that the old net protected, e.g. extent 10). Collapsing
+    /// to `refs == 0` here would reap them and lose data, because the
+    /// `refs == 0 ⇒ no live VP` invariant only holds for extents that reached
+    /// `refs == 0` under the post-GC-VP-IDENTITY relocate-then-punch path — not
+    /// for state frozen in etcd by an older buggy GC. Stage 2's migration
+    /// (re-confirm no live VP / major-compact, then clear the field) is what
+    /// lets this collapse to `refs == 0`. Until then the guard stays; such
+    /// legacy extents are simply not reclaimed (a bounded space leak, never a
+    /// loss). See manager/CLAUDE.md "VP lifetime after split".
     fn extent_can_delete(extent: &MgrExtentInfo) -> bool {
-        extent.refs == 0
+        extent.refs == 0 && extent.vp_table_refs == 0
     }
 
     /// Apply computed split mutations to the in-memory store.
@@ -3552,11 +3567,11 @@ mod tests {
         assert!(disk.online, "duplicate reporter must not trip quorum");
     }
 
-    // EXTENT10-AUTORECLAIM (post vp_table_refs removal): a refs==0 orphan in
-    // NO stream must be auto-reclaimed by the sweep, regardless of the inert
-    // `vp_table_refs` field. Only a stream member (refs>0) or a still-listed
-    // extent (membership) must be kept. Reproduces the extent-10 leak: pre-
-    // sweep nothing reclaims a refs==0 non-member.
+    // EXTENT10-AUTORECLAIM: a both-zero orphan (refs==0 && vp_table_refs==0,
+    // in no stream) must be auto-reclaimed by the sweep; a retained orphan
+    // (vp_table_refs>0 — the upgrade-safety guard, see extent_can_delete) and a
+    // stream member (refs>0) must be kept. Reproduces the extent-10 leak:
+    // pre-sweep nothing reclaims a both-zero non-member.
     #[test]
     fn extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept() {
         let m = AutumnManager::new();
@@ -3576,13 +3591,10 @@ mod tests {
         };
         {
             let mut s = m.store.inner.borrow_mut();
-            s.extents.insert(10, mk(10, 0, 0)); // refs==0 orphan, no stream → reclaim
-            // refs==0 with a stale vp_table_refs: now ALSO reclaimed — the net
-            // is gone, `refs` alone authorizes deletion (GC relocate-then-punch
-            // guarantees refs==0 ⇒ no live VP).
-            s.extents.insert(11, mk(11, 0, 1));
+            s.extents.insert(10, mk(10, 0, 0)); // both-zero orphan, no stream → reclaim
+            s.extents.insert(11, mk(11, 0, 1)); // retained by vp_table_refs (legacy guard) → keep
             s.extents.insert(12, mk(12, 1, 0)); // stream member (refs>0) → keep
-            // refs==0 BUT still listed in a stream (refs under-count bug):
+            // both-zero BUT still listed in a stream (refs under-count bug):
             // must NOT be reclaimed (coco P1 #2 — would dangle the membership).
             s.extents.insert(13, mk(13, 0, 0));
             s.streams.insert(
@@ -3596,30 +3608,26 @@ mod tests {
                 },
             );
         }
-        // The leak: today no path reclaims a refs==0 non-member extent.
+        // The leak: today no path reclaims a both-zero non-member extent.
         assert!(m.store.inner.borrow().extents.contains_key(&10));
 
         let n = run(async { m.extent_both_zero_sweep_once().await });
-        assert_eq!(n, 2, "both refs==0 non-member orphans (10, 11) must be reclaimed");
+        assert_eq!(n, 1, "exactly the both-zero non-member orphan must be reclaimed");
 
         let s = m.store.inner.borrow();
-        assert!(!s.extents.contains_key(&10), "refs==0 orphan must be removed");
+        assert!(!s.extents.contains_key(&10), "both-zero orphan must be removed");
         assert!(
-            !s.extents.contains_key(&11),
-            "refs==0 non-member must be reclaimed even with stale vp_table_refs"
+            s.extents.contains_key(&11),
+            "vp_table_refs>0 must be retained (upgrade-safety guard for legacy live VPs)"
         );
         assert!(s.extents.contains_key(&12), "refs>0 (stream member) must be retained");
         assert!(
             s.extents.contains_key(&13),
-            "refs==0 but still in a stream must NOT be reclaimed (would dangle membership)"
+            "both-zero but still in a stream must NOT be reclaimed (would dangle membership)"
         );
         drop(s);
         assert!(
             m.delete_progress.borrow().contains_key(&10),
-            "reclaimed orphan must be enqueued for physical delete"
-        );
-        assert!(
-            m.delete_progress.borrow().contains_key(&11),
             "reclaimed orphan must be enqueued for physical delete"
         );
     }

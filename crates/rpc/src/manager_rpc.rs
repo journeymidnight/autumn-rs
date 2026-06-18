@@ -296,13 +296,20 @@ pub struct MgrExtentInfo {
     pub parity: Vec<u64>,
     pub eversion: u64,
     pub refs: u64,
-    /// DEPRECATED / INERT (vp_table_refs removal, Stage 1). Formerly the
-    /// count of live SSTables whose ValuePointers referenced this extent —
-    /// an indirect-retention "net" on top of `refs`. Extent retention now
-    /// rests solely on `refs` (stream membership); GC's relocate-then-punch
-    /// invariant guarantees `refs == 0 ⇒ no live VP`. The field is retained
-    /// here only to keep the persisted `extents/<id>` rkyv layout stable
-    /// (no migration yet); nothing reads or writes it. Removed in Stage 2.
+    /// Count of live SSTables whose ValuePointers referenced this extent — an
+    /// indirect-retention "net" on top of `refs`.
+    ///
+    /// vp_table_refs-removal STAGING (Stage 1): the *maintenance* machinery
+    /// that bumped/decremented this (the PS sync/pull RPCs + manager
+    /// aggregation) is gone, so the field is now WRITE-FROZEN — every extent
+    /// allocated under this build leaves it 0. It is still READ by
+    /// `extent_can_delete` (which keeps `refs == 0 && vp_table_refs == 0`) as an
+    /// UPGRADE-SAFETY GUARD: a cluster upgraded from a pre-removal build may
+    /// hold legacy extents legitimately retained at `refs == 0 && vp_table_refs
+    /// > 0`, and reaping them would lose live data (see manager
+    /// `extent_can_delete`). Kept in the persisted `extents/<id>` rkyv layout so
+    /// existing records decode unchanged. Stage 2's migration clears it and
+    /// removes the field (collapsing the gate to `refs == 0`).
     pub vp_table_refs: u64,
     pub sealed_length: u64,
     /// True once this extent has been SEALED (immutable; no more appends).
