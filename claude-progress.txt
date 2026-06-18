@@ -1,38 +1,35 @@
 Date: 2026-06-18
 TaskStatus: completed
 Task scope: 评估"删 vp_table_refs"→ 审计否决(保留它作 membership-bug 的网,extent 10 实证);
-  正确性靠"正确不变量 + 出 bug 修 bug"。本会话连续交付两个真 data-safety 修复 + 文档,均已 push main。
-  决定不做 value_stream;replay 膨胀由 F120/F261 已界定,EC 策略分叉另议。
+  正确性靠"正确不变量 + 出 bug 修 bug"。本会话交付两个真 data-safety 修复 + 文档,评估并(因复现失败)
+  不做 merge 加固。不做 value_stream;replay 膨胀由 F120/F261 已界定,EC 策略分叉另议。队列已清空。
 
-SHIPPED(均 commit + push 到 main,solo-flow):
+SHIPPED(6 commit,均 push 到 main,solo-flow):
   - bdc0dd7 GC-VP-IDENTITY:GC 判活只比 vp.extent_id → 同 key 同 sealed extent 新旧两大值时 relocate 旧值丢新值
     (静默 lost-update)。修:wal_record value_offset_in_record 单一真源 + DecodedRecord.val_off;
     process_gc_chunk 完整 VP identity;run_gc 传 buf_base_offset;recovery 重建 VP.offset 改用 helper
     (原硬编码 V1 +22 对 V0 错)。测:system_gc_multiversion_same_extent(修前红/修后绿+断言 punch)+ wal_record V0/V1 单测。
   - 125c931 EXTENT10-AUTORECLAIM:both-zero(refs==0&&vp_table_refs==0)且不在任何 stream 的孤儿永不自动删
-    → 加 leader-only extent_both_zero_sweep_loop(extent_delete.rs,60s,spawn_supervised):候选=extent_can_delete
-    且经实际 membership 确认不在任何 stream(coco P1 #2:refs 欠计仍在 stream 则 ERROR 跳过)+ 不在 F207 ledger;
-    value-CAS 删 extents/<id>(coco P1:挡并发 sync bump)→ 内存移除 → enqueue_pending_deletes。
-    安全:not-in-stream + relocate-then-punch(GC-VP-IDENTITY)⇒ 无 live VP;门用 extent_can_delete,将来删
-    vp_table_refs 自动退化 refs==0。测:extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept。
-  - d4fa30d docs:partition-server CLAUDE.md GC 段记 GC-VP-IDENTITY;manager CLAUDE.md 加 note 41(EXTENT10 sweep)。
+    → leader-only extent_both_zero_sweep_loop(extent_delete.rs,60s,spawn_supervised):候选=extent_can_delete
+    + 经实际 membership 确认不在任何 stream(coco P1 #2)+ 不在 F207 ledger;value-CAS 删 extents/<id>
+    (coco P1)→ 内存移除 → enqueue_pending_deletes。测:extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept。
+  - d4fa30d docs:partition-server CLAUDE.md GC 段记 GC-VP-IDENTITY;manager CLAUDE.md note 41(EXTENT10 sweep)。
+  - 2750278 progress 交接。
+  - 1a2d601 MERGE-REFS-RECOMPUTE 复现尝试 + DEFER:merge_refs_invariant_holds_across_split_merge_cycles
+    跑真实 split/merge cycles,refs==membership 全程成立 → 复现失败 → 用户定"不能复现就不做"。测试保留作回归守卫。
 
 接受的并发残留(用户选 A,文档化,非丢数据,同现有 extent-state 路径):
   - EXTENT10 #1 reverse-order resurrection(mirror_partition_vp_refs 未 value-CAS)= DEFERRED note-33 extent-state-CAS;
     在 #2 membership-check + relocate-then-punch 下非丢数据、自愈。
   - EXTENT10 #3 非原子 delete+marker = 同 punch_holes,F109 node-reconcile 兜底(空间泄漏非丢数据)。
-  - coco P3:lib 单测不覆盖 etcd CAS/并发;真覆盖靠后续强化 vp_freed_after_both_children_compact_and_gc 集成测试。
 
-下一步(本会话目标已达成,以下为后续候选):
-  1. MERGE-REFS-RECOMPUTE(feature_list 有条目,not_completed):merge refs 从成员关系重算 + recovery 后 refs 校验,
-     消 saturating_sub 脆性。注意:这是 HARDENING(saturating_sub 当前未复现真害;EXTENT10 #2 + MERGE-REFS-LEAK
-     已挡其后果),且在 revert-prone merge 区 —— 按 memory(reproduce-first / 不凭 coco-arch 在 revert-prone 区动刀)
-     需先注入"refs 欠计→merge"复现真害再动,或判定为防御性而缓做。待用户定。
-  2. (可选)强化 vp_freed 集成测试断言共享 extent 在两 child compact+GC 后自动删(端到端覆盖 EXTENT10)。
-  3. 删 vp_table_refs:当前决定保留;理论上无 bug 则 refs==0 已够,待 #1 全闭(note-33 sync CAS)+ merge 硬化 + chaos
-     证不变量后再议。
+未决/不做:
+  - MERGE-REFS-RECOMPUTE:不做(复现失败,防御性;后果已被 EXTENT10 #2 + punch 成员感知删除网住)。回归守卫已加。
+  - 删 vp_table_refs:不做,保留(membership-bug 的网)。理论上无 bug 则 refs==0 已够,gate 用 extent_can_delete,
+    将来若证不变量铁打可一行退化为 refs==0。
+  - value_stream:不做(评估否决,见 feature_list VALUE-STREAM 标注)。
 
-Backlog(coco 另列,pre-existing,本任务外):
+Backlog(coco 另列,pre-existing,本任务外,均非本会话引入):
   - P1 pull-clears-dirty(handle_pull_vp_refs 乐观清 vp_refs_dirty;F210-C4 同类窗口)。
-  - P1 TOCTOU extent-CAS / mirror_partition_vp_refs 未 value-CAS(= note 33 DEFERRED)。
+  - note 33 DEFERRED:extent-state(eversion/replicates/vp_table_refs)read-modify-write 未 value-CAS。
   - P2 manifest TableLocations 无 CRC;P2 extent unlink 不 fsync parent dir。
