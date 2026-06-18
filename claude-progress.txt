@@ -1,41 +1,33 @@
 Date: 2026-06-18
 TaskStatus: not_completed
-Task scope: 决定不做 value_stream(value log)+ 正确性靠"正确不变量 + 出 bug 修 bug"
-  (保留 vp_table_refs 作 membership-bug 的网,extent 10 为实证)。审计能否删 vp_table_refs →
-  审计发现独立 P0(GC 判活)→ pivot 先修该 P0。本会话已完成 P0 修复。
+Task scope: 决定不删 value_stream 也不删 vp_table_refs(保留它作 membership-bug 的网,extent 10 实证);
+  正确性靠"正确不变量 + 出 bug 修 bug"。本会话连续修两个真 bug:
+  (1) GC-VP-IDENTITY(已提交+推送),(2) EXTENT10-AUTORECLAIM(本段,代码+单测+构建完成,coco 复审中)。
 
-DONE this session(GC-VP-IDENTITY,代码 + reproduce-first 测试 + 回归 + coco 复审):
-  - 根因:run_gc/process_gc_chunk 判活只比 vp.extent_id,relocate 被扫描 record 的 value。
-    同 key 同 sealed extent 内新旧两大 value(A 旧/B 新):扫 A→live=B、extent_id 匹配→relocate A 旧值
-    (新 seq);A≥batch cap/record_cap=1→flush 把 relocate-A 入 memtable(扫 B 前)→扫 B→live=relocate-A
-    (指新 extent)→skip B→punch X→B 丢失、A 复活。静默 lost-update,热路径,8MB 同 extent 可靠复现。
-  - 修复(完整 VP identity + 单一真源 offset):
-    * wal_record.rs:新增 value_offset_in_record(first_byte,key_len)(V1=22+key_len/V0=17+key_len)作单一真源;
-      DecodedRecord 增 val_off,decode_one 两分支用 helper。
-    * background.rs:process_gc_chunk 增参 buf_base_offset;判活改
-      extent_id && offset==buf_base+record_start+val_off && len==val_len 才 relocate;run_gc 传 buf_base_offset
-      = cur - carry.len();删掉无用 `let _ = vp;`。
-    * lib.rs recovery:重建 VP.offset 改用 value_offset_in_record(原硬编码 V1 +22 对 V0 错 5B → 与新 GC
-      identity 不一致会漏 relocate V0 live;coco P1)。
-  - 测试:
-    * crates/manager/tests/system_gc_multiversion_same_extent.rs(reproduce-first):修前 FAIL(读回 'A')、
-      修后 PASS('B');hardened 断言 GC 实际 punch 了 X(refs<2;coco P2 防假阴性)。
-    * wal_record 单测:value_offset_matches_envelope + round-trip val_off(V0/V1)。
-  - 验证:PS lib 167 单测绿;system_gc_chunked_read / system_vp_after_split_gc 回归绿(无 over-skip);
-    reproduce-first 修前红/修后绿。coco /findbugs 复审两轮:第一轮 2 findings(P1 V0 recovery +22 / P2 测试假阴性)
-    均已处理;第二轮(最终确认)进行中(后台 b3auisvi7)。
-  - 账本:feature_list 增 GC-VP-IDENTITY(completed)+ MERGE-REFS-RECOMPUTE(not_completed,下一步);
-    VALUE-STREAM 标"评估否决落地";README Tests 段加 GC 回归测试命令。
+DONE — GC-VP-IDENTITY(已提交 bdc0dd7,push 到 main):
+  GC 判活只比 vp.extent_id → 同 key 同 sealed extent 新旧两大值时 relocate 旧值、丢新值(静默 lost-update)。
+  修:wal_record value_offset_in_record 单一真源 + DecodedRecord.val_off;process_gc_chunk 完整 VP identity
+  (extent_id+offset+len);run_gc 传 buf_base_offset;recovery 重建 VP.offset 改用 helper(原硬编码 V1 +22 对 V0 错)。
+  测:system_gc_multiversion_same_extent(修前红/修后绿 + 断言 punch);wal_record V0/V1 offset 单测。coco clean。
 
-未提交(等最终 coco 确认 + 用户同意再 commit/push;solo-flow 直推 main):
-  M background.rs / lib.rs / wal_record.rs / claude-progress.txt / feature_list.md / README.md
-  ?? crates/manager/tests/system_gc_multiversion_same_extent.rs
+DONE — EXTENT10-AUTORECLAIM(未提交,等 coco 复审 + 用户同意 commit):
+  - 根因:refs==0 && vp_table_refs==0 但不在任何 stream 的 extent 永不自动删(refs 侧触发在 punch/truncate
+    只作用成员;vp 侧 sync 只递减不触发)→ extent-10 类磁盘泄漏,靠手动 python/reclaim。
+  - 改:extent_delete.rs 加 leader-only extent_both_zero_sweep_once/_loop:扫 both-zero(extent_can_delete)且
+    不在 inflight/delete_progress 的 extent → fenced 删 extents/<id> → 内存移除 → enqueue_pending_deletes;
+    start_runtime_tasks spawn_supervised 注册(60s)。安全性:refs==0 ⇒ relocate-then-punch 已搬走 live(经
+    GC-VP-IDENTITY 修正)⇒ 无 live VP;both-zero 门用 extent_can_delete,将来删 vp_table_refs 自动退化 refs==0。
+  - 测:manager lib extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept(both-zero 回收;vp>0/refs>0 保留)。
+  - 验证:manager lib 166 单测绿;cargo build --workspace(除 fuse)绿。coco /findbugs 复审:进行中(bjuy4aqma)。
+  - 账本:feature_list 加 EXTENT10-AUTORECLAIM(completed);progress 本段。
+  - 未提交改动:M extent_delete.rs / M lib.rs / M feature_list.md / M claude-progress.txt
 
 Next steps:
-  1. 读最终 coco 结论;若 clean → commit(GC-VP-IDENTITY)到 main。
+  1. 读 EXTENT10-AUTORECLAIM 的 coco 结论;clean → commit + push 到 main。
   2. MERGE-REFS-RECOMPUTE:merge refs 从成员关系重算 + recovery 后 refs 校验(消 saturating_sub 脆性)。
-  3. (可选)chaos 断言:live VP ⇒ refs>0 / 删除不 orphan live VP。
-  4. 评估删 vp_table_refs(需上述都到位;当前决定:保留)。
+  3. (可选)强化 vp_freed_after_both_children_compact_and_gc 集成测试:断言共享 extent 在两 child compact+GC 后
+     被自动删(端到端覆盖 EXTENT10-AUTORECLAIM)。
+  4. 关于删 vp_table_refs:当前决定保留(网);理论上无 bug 则 refs==0 已够,待 merge 硬化 + chaos 证不变量后再议。
 
 Backlog(coco 另列,pre-existing,本任务外):
   - P1 pull-clears-dirty(handle_pull_vp_refs 乐观清 vp_refs_dirty;F210-C4 同类窗口)。

@@ -1193,6 +1193,36 @@ gaps in the lease protocol's correctness story.
   relocate,无 over-skip);reproduce-first 修前红/修后绿;coco /findbugs 复审 2 findings 均已处理。
 - **passes:** completed(2026-06-18,代码 + reproduce-first 测试 + 回归 + coco 复审)。
 
+### EXTENT10-AUTORECLAIM · both-zero 孤儿自动回收(终结 extent-10 类不可回收孤儿,2026-06-18)
+- **触发:** extent 10 残留问题 —— 一个 `refs==0 && vp_table_refs==0` 但**不在任何 stream** 的 extent
+  永远不会被自动删除:refs 侧触发器在 `punch_holes`/`truncate`(只作用于 stream 成员),vp 侧
+  `sync_partition_vp_refs` 只递减 `vp_table_refs` 从不触发删除。当最后归 0 的是 vp_table_refs
+  (GC 已把它 punch 出所有 log_stream 后,compaction 丢掉最后一个 SST VP),无人删 → 磁盘永久泄漏,
+  靠手动 python/reclaim。
+- **改动:** `extent_delete.rs` 新增 leader-only `extent_both_zero_sweep_once` / `_loop`:扫 `s.extents`,
+  候选 = `extent_can_delete`(both-zero)且 **不在任何 stream 的 extent_ids**(coco P1 #2:不靠 refs==0 当
+  "不在 stream" 的代理;refs 欠计仍在 stream 则 log error 跳过)且不在 F207 ledger / delete_progress;
+  **value-CAS** 删 `extents/<id>`(snapshot 基线,coco P1:挡并发 sync bump vp_table_refs 0→1)→ 内存移除 →
+  `enqueue_pending_deletes`(获 F207 Delete marker;`extent_delete_loop` 发物理 unlink)。
+  `start_runtime_tasks` spawn_supervised 注册(60s tick)。
+- **安全性:** both-zero 删除健全 —— `refs==0`(且经 #2 确认确实不在 stream)⇒ relocate-then-punch
+  (经 GC-VP-IDENTITY 修正)已搬走 live 值 ⇒ 无 live VP;`vp_table_refs==0` ⇒ 无活 SST 物理引用。
+  无 bug 世界里 refs==0 已足够,both-zero 门把 vp_table_refs 当 membership-bug 的网保留;经 `extent_can_delete`,
+  将来删 vp_table_refs 此门自动退化 refs==0,sweep 不变。
+- **接受的残留(coco,与现有 extent-state 路径同一档):**
+  - #1 resurrection:sweep CAS 挡住危险方向(sync 先提交 → CAS 失败 → 跳过);反向(我删后 in-flight sync
+    经未 CAS 的 `mirror_partition_vp_refs` blind-put 复活 etcd 记录)需 DEFERRED 的 note-33 extent-state-CAS
+    (revert-prone、未复现);在 #2 + relocate-then-punch 下该残留 **非丢数据**(不在 stream 的 extent 其 SST 引用是死的),
+    下次 compaction/sweep 自愈。
+  - #3 atomicity:`extents/<id>` 删除与 Delete marker 非同一 txn(同 `punch_holes`);崩溃窗由 F109 node-startup
+    reconcile 兜底 —— 空间泄漏、非丢数据。
+- **测试:** manager lib `extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept`:both-zero 非成员孤儿被回收
+  (移除 + 入 delete_progress);`vp_table_refs>0`、`refs>0`、以及 **both-zero 但仍在 stream**(#2)的 extent 均保留。
+- **验收:** manager lib 166 单测绿;cargo build --workspace(除 fuse)绿;coco /findbugs 三轮(P1 CAS / P1 #2 已修;
+  P1 #1、P2 #3 为文档化接受残留)。注:端到端(GC→compact→retained-orphan→自动删)后续强化
+  `vp_freed_after_both_children_compact_and_gc` 集成测试覆盖(慢)。
+- **passes:** completed(2026-06-18,代码 + reproduce-first 单测 + 回归 + coco 复审)。
+
 ### MERGE-REFS-RECOMPUTE · merge refs 改"从成员关系重算"(消 saturating_sub 脆性,待落)
 - **触发:** coco /findbugs P1 + GC-VP-IDENTITY 审计 —— merge 的 `refs.saturating_sub(1)` 在 refs 已欠计时静默到 0,
   若将来删 vp_table_refs 则直接变物理删除风险。
