@@ -1274,3 +1274,22 @@ gaps in the lease protocol's correctness story.
   `extent_can_delete` 塌缩 `refs==0`、版本化解码物理删 `MgrExtentInfo.vp_table_refs` + SST `MetaBlock.vp_deps`
   (MetaBlock 有 VERSION → dual-decode)+ 清残留 `partitionVpRefs/` etcd key。
 - **passes:** completed(Stage 1,含 coco P0 修正;代码 + 单测 + e2e 验证 + 文档)。Stage 2 = not_completed(待排期)。
+
+## BUG-GC-STALE-CACHE — GC 不得基于陈旧 extent_info 做破坏性 punch(2026-06-18,chaos seed=583)
+- **目标/边界:** 修复 chaos 复现的真实 data-loss:GC 把一个**已封存满载 live VP** 的 extent 当成空 extent 删掉。
+- **根因:** GC 的 F201 fast-punch(`sealed_length==0` → punch)读 `StreamClient::get_extent_info`(带缓存)。
+  `alloc_new_extent` 封旧 tail 后只缓存新 tail、**不 evict 旧 tail** → 旧 tail 残留 pre-seal OPEN 快照
+  (`sealed=false, sealed_length=0`)→ GC 信陈旧 0 → punch 已封 extent → refs→0 删除 → VP 读 NotFound。
+  seed 583:extent 12 已封 7.8MB,GC 读陈旧 0 删之,q000056 丢。
+- **修法(保守跳过,no-refetch):** `authoritative_sealed_length` helper(Auto + Force GC 共用,validated
+  `(eid, sealed_length)` 带到 run_gc,无 check/use 再读分裂):`sealed` 置位后不可变 ⇒ 缓存 `sealed=true` 可信;
+  读到 `!sealed` 一律 **SKIP**(`None`)——绝不删非权威已封 extent(OPEN extent 永远 `sealed_length=0` 但非空)。
+  **刻意不 invalidate+refetch:** 每候选多一次 GC→manager RPC 会移时序、(seed=603)照出另一个老 split-child-open
+  wedge。不用 vp_deps(尊重"vp_deps 会永久阻断 GC")。
+- **验收标准:** (1) 编译 + PS 167 单测绿;(2) seed 583 修复前必丢、修复后 ×多次全过;(3) 不回归:
+  no-refetch 版本 11 seed(58/581/582/13/600/601/602/604/605/583/603)加压 chaos 全绿;(4) coco 复审。
+- **已知限制(deferred,与 seed=603 wedge 配对):** 真已封但卡在 stale-cached-as-open 的 extent 会被跳过、
+  直到缓存刷新(读/EC-invalidate/重启)才回收 —— GC 回收不及时(coco P1),**非丢数据**。干净回收修法
+  (封存时更新旧 tail 缓存为 `sealed=true,len=seal_commit`,GC 见新态且零新增 RPC)待 seed=603 wedge 根因后再上。
+- **passes:** completed(no-refetch 保守跳过;代码 + 单测 + 11-seed 加压 chaos + coco 复审;用户批准"先保守跳过")。
+  GC-回收-leak 修法 + seed=603 split-child-open wedge = not_completed(后续两件)。

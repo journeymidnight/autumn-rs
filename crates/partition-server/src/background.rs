@@ -715,15 +715,42 @@ pub(crate) async fn background_gc_loop(
             .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
         let is_force = matches!(gc_task, GcTask::Force { .. });
-        let mut holes: Vec<u64> = match gc_task {
+        // (extent_id, authoritative sealed_length) — validated ONCE at selection
+        // so the execution loop never re-reads (possibly stale) state before the
+        // destructive punch. See `authoritative_sealed_length`.
+        let mut holes: Vec<(u64, u64)> = match gc_task {
             GcTask::Force { ref extent_ids } => {
                 let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
-                extent_ids
-                    .iter()
-                    .copied()
-                    .filter(|e| idx.contains(e))
-                    .take(MAX_GC_ONCE)
-                    .collect()
+                let mut hs: Vec<(u64, u64)> = Vec::new();
+                let mut skipped = 0usize;
+                // coco P3: count the MAX_GC_ONCE quota by VALIDATED holes, not by
+                // input candidates — i.e. apply `take` AFTER `authoritative_
+                // sealed_length`, not before. Otherwise a transient `None`
+                // (manager RPC hiccup / not-yet-observable seal) on the first
+                // few requested extents consumes the quota and starves the later
+                // valid ones, and Force GC is a one-shot consume (no "later
+                // tick" for the skipped tail).
+                for e in extent_ids.iter().copied().filter(|e| idx.contains(e)) {
+                    if hs.len() >= MAX_GC_ONCE {
+                        break;
+                    }
+                    // Even an operator Force GC must not punch on stale/open
+                    // state: re-validate authoritatively. A skip (None) means the
+                    // seal isn't authoritatively observable yet; the operator can
+                    // re-issue once it is.
+                    if let Some(sealed_length) = authoritative_sealed_length(&part_sc, e).await {
+                        hs.push((e, sealed_length));
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                if skipped > 0 {
+                    tracing::info!(
+                        skipped,
+                        "Force GC: skipped extents not authoritatively sealed yet"
+                    );
+                }
+                hs
             }
             GcTask::Auto(ref params) => {
                 let discards = tick_discards;
@@ -769,25 +796,22 @@ pub(crate) async fn background_gc_loop(
                     if holes.len() >= MAX_GC_ONCE {
                         break;
                     }
-                    let info = match part_sc.get_extent_info(eid).await {
-                        Ok(info) => info,
-                        Err(e) => {
-                            tracing::warn!("GC extent_info {eid}: {e}");
-                            continue;
-                        }
+                    // Authoritative (never stale) sealed state — see
+                    // `authoritative_sealed_length`. `None` ⇒ unsealed/open or
+                    // fetch failed ⇒ NEVER GC (open extents look like
+                    // `sealed_length==0` but are not empty).
+                    let sealed_length = match authoritative_sealed_length(&part_sc, eid).await {
+                        Some(l) => l,
+                        None => continue,
                     };
-                    let sealed_length = info.sealed_length;
                     if sealed_length == 0 {
-                        // F201: empty sealed extent — no live data to
-                        // rewrite, just punch. `run_gc` with
-                        // sealed_length=0 skips the read loop and goes
-                        // straight to flush_gc_batch (no-op) +
-                        // punch_holes. Pre-F201 line 533
-                        // unconditionally skipped these, even when
-                        // they were non-tail. Empty-sealed extents are
-                        // always eligible (they don't read `ratio` /
-                        // `max_size`) — they're a strict win.
-                        holes.push(eid);
+                        // F201: a CONFIRMED sealed-empty extent — no committed
+                        // data to rewrite, just punch. `run_gc` with
+                        // sealed_length=0 skips the read loop and goes straight
+                        // to flush_gc_batch (no-op) + punch_holes. Empty-sealed
+                        // extents are always eligible (they don't read `ratio` /
+                        // `max_size`) — a strict win.
+                        holes.push((eid, sealed_length));
                         continue;
                     }
                     if params.empty_only {
@@ -804,7 +828,7 @@ pub(crate) async fn background_gc_loop(
                     }
                     let ratio = discard_bytes as f64 / sealed_length as f64;
                     if ratio > effective_ratio {
-                        holes.push(eid);
+                        holes.push((eid, sealed_length));
                     }
                 }
                 holes
@@ -820,7 +844,7 @@ pub(crate) async fn background_gc_loop(
             // Evict stale entries (past their own cooldown window).
             gc_failure_cooldown.retain(|_, (t, dur)| now.duration_since(*t) < *dur);
             let initial_len = holes.len();
-            holes.retain(|eid| {
+            holes.retain(|(eid, _)| {
                 gc_failure_cooldown
                     .get(eid)
                     .is_none_or(|(t, dur)| now.duration_since(*t) >= *dur)
@@ -858,14 +882,11 @@ pub(crate) async fn background_gc_loop(
         tracing::info!("GC: starting, extents={:?}", holes);
         // F189-fix MED-4: gc_inflight already latched at top of loop;
         // hold through the punch and clear at the bottom.
-        for eid in holes {
-            let sealed_length = match part_sc.get_extent_info(eid).await {
-                Ok(info) => info.sealed_length,
-                Err(e) => {
-                    tracing::warn!("GC extent_info {eid}: {e}");
-                    continue;
-                }
-            };
+        // `sealed_length` was validated AUTHORITATIVELY at selection
+        // (`authoritative_sealed_length`) and carried here — do NOT re-read it
+        // from the (possibly stale) extent_info cache, or the check/use split
+        // re-opens the seed=583 stale-cache punch on a sealed extent.
+        for (eid, sealed_length) in holes {
             match run_gc(&part, eid, sealed_length).await {
                 Ok(()) => {
                     // F199: success → clear any prior failure stamp so
@@ -2324,6 +2345,58 @@ fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw
     // of the server-side multipart machinery. Stripe-write chunks are
     // now normal Puts under reserved-namespace keys, so each chunk's
     // single-VP discard already covers its bytes via the branch above.
+}
+
+/// Seal state gate for a GC punch decision: returns the `sealed_length` ONLY for
+/// an authoritatively-sealed extent, else `None` (skip — never GC it).
+///
+/// A GC punch is DESTRUCTIVE + irreversible, so it must NEVER fire on stale or
+/// open state. The trap: `StreamClient::alloc_new_extent` caches the NEW tail
+/// after a seal-and-roll but does NOT evict the OLD one, so a now-sealed extent
+/// can linger in `extent_info_cache` as its pre-seal OPEN snapshot
+/// (`sealed=false, sealed_length=0`). The pre-F-fix F201 fast-punch trusted that
+/// stale `sealed_length==0` and punched a sealed extent full of live
+/// ValuePointers as if empty → silent big-value loss (chaos seed=583: extent
+/// sealed at 7.8 MB read back as stale `sealed_length=0`, punched, GET of the
+/// VP'd key returned NotFound).
+///
+/// The gate: `sealed` is IMMUTABLE once set, so a cached `sealed=true` is always
+/// trustworthy; only a `sealed=false` snapshot can be stale. We therefore SKIP
+/// any candidate that reads NOT sealed (`None`) — conservatively refusing to GC
+/// anything not authoritatively known sealed. An OPEN extent always reports
+/// `sealed_length==0` but is NOT empty (its committed length is `last_synced`,
+/// invisible here; it is the live tail or holds uncommitted data), so skipping is
+/// exactly right. A stale `sealed=false` snapshot of a genuinely-sealed extent is
+/// likewise skipped — data-safe (never punched → no loss); it is reclaimed a tick
+/// later once its cache refreshes (a read / EC-invalidate / restart).
+///
+/// We deliberately do NOT `invalidate_extent_cache` + refetch here to "freshen" a
+/// `sealed=false` read: an extra GC→manager RPC per stale candidate shifts P-log
+/// timing and (chaos seed=603) exposed a SEPARATE pre-existing split-child-open
+/// wedge. The conservative skip is data-safe with ZERO added RPCs (one
+/// `get_extent_info` per candidate, same as the pre-fix baseline). Trade-off: a
+/// stale-cached-as-open sealed extent isn't reclaimed until its cache refreshes —
+/// a GC-promptness gap, never a data-loss or correctness gap.
+///
+/// Returns `Some(sealed_length)` for a confirmed-sealed extent (incl. `0` for a
+/// genuinely sealed-empty one — safe to fast-punch). EVERY path that feeds
+/// `run_gc` / `punch_holes` (Auto candidate selection AND Force GC) goes through
+/// this, carrying the validated `(eid, sealed_length)` to execution — so there is
+/// no check/use split where a re-read could resurrect the stale value.
+async fn authoritative_sealed_length(part_sc: &StreamClient, eid: u64) -> Option<u64> {
+    let info = match part_sc.get_extent_info(eid).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("GC extent_info {eid}: {e}");
+            return None;
+        }
+    };
+    // Trust the immutable `sealed` flag; skip anything not authoritatively sealed.
+    // No invalidate+refetch (see doc: avoids the seed=603 timing regression).
+    if !info.sealed {
+        return None;
+    }
+    Some(info.sealed_length)
 }
 
 pub(crate) async fn run_gc(

@@ -338,6 +338,23 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh ucx
 # (F265 notes: manager restart used to black-hole client routing — part_addrs
 #  is in-memory; the PS now re-reports it every ~2s sync tick. Ownership
 #  failback used to wedge forever — owner_epoch now bumps on every acquire.)
+#
+# In-process kill+split+merge+EC+fence chaos (manager + PS in the test process,
+# EN as subprocesses; toxiproxy auto-spawned; needs etcd @127.0.0.1:2379). The
+# zero-data-loss invariant test — finds GC/seal/split data-loss + write-wedge:
+AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 \
+  cargo test -p autumn-manager --test system_chaos \
+  chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored
+#   knobs: AUTUMN_CHAOS_SEED, _DURATION_SECS (30), _NEMESIS_INTERVAL_MS (3000),
+#          _NUM_ENS, _EC_K/_EC_M, _ACTIONS (split,merge,ec,fence,flush,compact,
+#          gc,kill,killfence,partition,latency).
+#   verdict-gate: a real bug = `mismatches>0` OR a not_found that REPRODUCES on
+#   DRAINED ports. A burst of not_found with `mismatches=0` after back-to-back
+#   runs is almost always loopback PORT EXHAUSTION (cumulative TIME-WAIT) — a
+#   wedged partition with no part_addr — NOT data loss. DRAIN-GATE before each
+#   run: wait until `ss -tan | grep -c TIME-WAIT` < 4000 (see memory
+#   project_chaos_long_soak_port_exhaustion). seed=583 = the GC stale-cache
+#   big-value-loss regression guard (BUG-GC-STALE-CACHE).
 ```
 
 ## Rolling restart (R0 of docs/rolling_upgrade_design.md)

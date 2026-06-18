@@ -802,6 +802,36 @@ Targets the **logStream** where large values (ValuePointers) are stored.
      - Push if `discard_bytes / sealed_length > effective_ratio`.
 3. Cap at `MAX_GC_ONCE` (3) per dispatch.
 
+**GC-STALE-CACHE (2026-06-18): a GC punch must NEVER fire on a stale/open
+`extent_info`.** The destructive `sealed_length == 0` → fast-punch branch above
+keys on `get_extent_info(eid)`, which is a CACHED read (`StreamClient.
+extent_info_cache`). `StreamClient::alloc_new_extent` caches the NEW tail after a
+seal-and-roll but does NOT evict the OLD tail, so a now-sealed extent can linger
+in cache as its pre-seal OPEN snapshot (`sealed=false, sealed_length=0`). The
+pre-fix loop trusted that stale `sealed_length==0` and **punched a sealed extent
+full of live ValuePointers as if empty → silent big-value loss** (chaos seed=583:
+extent 12 sealed at 7.8 MB, GC read stale `0`, punched it, GET of the VP'd key
+returned NotFound). Fix (`authoritative_sealed_length` helper, used by BOTH the
+Auto candidate loop AND Force GC, carrying the validated `(eid, sealed_length)` to
+`run_gc` so there is no check/use re-read split): `sealed` is IMMUTABLE once set,
+so a cached `sealed=true` is trustworthy; a candidate that reads NOT sealed is
+SKIPPED (`None`) — conservatively refusing to GC anything not authoritatively
+known sealed (an OPEN extent always reports `sealed_length==0` but is NOT empty —
+its committed length is `last_synced`, invisible here). **Deliberately NO
+invalidate+refetch** here: an extra GC→manager RPC per stale candidate shifts
+P-log timing and (chaos seed=603) EXPOSED a separate pre-existing split-child-open
+wedge (see below). **Known limitation (deferred, paired with the seed=603 wedge):**
+a genuinely-sealed extent stuck stale-cached-as-open is SKIPPED until its cache
+refreshes (read / EC-`invalidate_extent_cache` / restart) — a GC-reclamation
+gap, never a data-loss or correctness gap. The clean reclamation fix (update the
+old tail's cache entry to `sealed=true, len=seal_commit` at authoritative
+seal-and-roll, so GC sees fresh state with NO added RPC) is deferred until the
+seed=603 wedge is root-caused. **seed=603 wedge (OPEN bug, separate):** a split's
+right child sometimes never opens / never registers a PS addr → its keys are
+unreachable (`mismatches=0`; data is NOT lost — it is in the CoW-shared streams).
+Pre-existing + latent (baseline passes seed 603); any GC-timing perturbation
+exposes it.
+
 **F201 multi-tier params** (`GcTask::Auto(GcAutoParams)`):
 - `ratio: Option<f64>` — discard-ratio threshold, default 0.4
 - `max_size: Option<u64>` — only consider extents at most this size
