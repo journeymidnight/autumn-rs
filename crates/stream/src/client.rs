@@ -1986,6 +1986,30 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
         self.extent_info_cache
             .insert(extent.extent_id, extent.clone());
+        // GC-RECLAIM: refresh the OLD tail's cache entry to its post-seal state.
+        // `alloc_new_extent` caches only the NEW tail; pre-this the OLD tail
+        // lingered as its pre-seal OPEN snapshot (`sealed=false, sealed_length=0`)
+        // and GC's authoritative-sealed gate (background.rs
+        // `authoritative_sealed_length`) SKIPS anything not-sealed — so the rolled
+        // extent was never reclaimed until its cache happened to refresh (a read /
+        // EC-invalidate / restart): the coco P1 GC-reclamation leak.
+        //
+        // We INVALIDATE the old tail's cache rather than SYNTHESIZE its sealed
+        // length (coco P1, data-loss): we must NOT write `sealed_length = seal_
+        // commit` locally, because the manager does NOT guarantee it sealed this
+        // extent at exactly `seal_commit` — its `already_sealed` branch IGNORES
+        // `req.seal_commit` and preserves the EXISTING `sealed_length L` (a prior
+        // probe/split/merge seal; `L ≥ acked ≥ seal_commit`). Caching a too-small
+        // `seal_commit < L` would make GC relocate only the first `seal_commit`
+        // bytes yet punch the whole extent → lose committed `[seal_commit, L)`.
+        // Invalidating forces GC's next `get_extent_info` to fetch the
+        // AUTHORITATIVE sealed length from the manager. The extra cache-miss RPC
+        // is safe now: the seed=603 wedge a GC-side refetch would once have
+        // exposed is itself fixed (BUG2-IDEMPOTENT-ROLL), so the timing shift no
+        // longer wedges anything; and it is one-shot (re-cached on the fetch).
+        if seal_commit.is_some() && seal_extent_id != 0 {
+            self.extent_info_cache.remove(&seal_extent_id);
+        }
         Ok((stream, extent))
     }
 

@@ -1311,3 +1311,17 @@ gaps in the lease protocol's correctness story.
   触发器)seed 603 3/3 挂;修复后 seed 603 ×5 + 回归(583/58/581/600/601/602/13)= 0 挂(14 次加压 chaos);
   (3) coco 复审(P1 已修 + 重验)。
 - **passes:** completed(WIRE v8;代码 + 单测 + 14-run 加压 chaos + coco;用户已看 diff 批准提交)。
+
+## GC-RECLAIM-EVICT — close the no-refetch reclamation leak (2026-06-19,coco P1 from BUG-GC-STALE-CACHE)
+- **目标/边界:** 关闭 BUG-GC-STALE-CACHE 的 no-refetch 保守跳过留下的 GC 回收 leak(coco P1):真已封但卡在
+  stale-cached-as-open 的 extent 永远不被 GC 回收(浪费空间,非丢数据)。BUG#2 已修 → 此项解锁。
+- **修法(零合成,evict):** `StreamClient::alloc_new_extent`(seal-and-roll)在 authoritative 路径
+  (`seal_commit=Some(_)` 且 `seal_extent_id != 0`)封旧 tail 后,**evict 旧 tail 的 extent_info_cache**,
+  让 GC 下次 get_extent_info 从 manager 拉权威 sealed 状态 → 正常回收。**不 synthesize `sealed_length=seal_commit`**
+  (coco P1 丢数据:manager already_sealed 分支忽略 req.seal_commit、保留已有 L≥acked≥seal_commit;本地写 c<L 会让 GC
+  只搬前 c 字节却 punch 整个 extent → 丢 [c,L))。多出的 cache-miss RPC 现在安全(它本会照出的 seed=603 wedge 已由
+  BUG2-IDEMPOTENT-ROLL 修掉)。no-refetch 跳过保留作其它 stale-open 来源(probe/split/merge)的数据安全兜底。
+- **验收标准:** (1) 编译 + stream 82 单测;(2) 不回归 BUG#1:seed 583 ×3 加压 chaos 全过(GC 见正确 7.8MB 而非陈旧 0
+  → 不误删 live VP);(3) seed 603 ×2 + 回归(760-763)= 0 挂(共 9 次);(4) coco "未发现问题"。
+- **passes:** completed(evict 版;代码 + 单测 + 9-run 加压 chaos + coco 两轮[v1 synthesize 被 coco P1 否,改 evict]
+  ;用户曾提议做此项)。

@@ -1,7 +1,15 @@
-Date: 2026-06-18
-TaskStatus: not_completed
-Task scope: /loop chaos 测试。BUG #1(GC stale-cache fast-punch,数据丢失)+ BUG #2(seal-and-roll 重试不幂等 →
-  split-child-open wedge)均已修复 + 提交。剩 GC-回收-leak(coco P1,deferred)未做,故 not_completed。
+Date: 2026-06-19
+TaskStatus: completed
+Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC stale-cache fast-punch,数据丢失)、
+  BUG #2(seal-and-roll 重试不幂等 → split-child-open wedge)、GC-回收-leak(coco 在 BUG#1 提的 P1,本次关闭)。
+  代码 + 单测 + 加压 chaos(含多配置 soak)+ coco 全绿。
+
+== GC-RECLAIM-EVICT (DONE + 本次提交) — 关闭 no-refetch 回收 leak ==
+  修法:alloc_new_extent 在 authoritative 封存路径 evict 旧 tail 的 extent_info_cache → GC 下次拉权威 sealed 状态回收。
+    NOT synthesize sealed_length=seal_commit(coco P1:manager already_sealed 保留旧 L≥seal_commit,本地写 c<L 会让 GC
+    搬前 c 删整 extent → 丢 [c,L))。多出的 cache-miss RPC 现安全(seed=603 wedge 已由 BUG2 修)。no-refetch 跳过留作兜底。
+  验证:stream82 单测;seed 583 ×3(不回归 BUG#1,GC 见正确长度不误删)+ 603 ×2 + 760-763 = 9/9 全过;coco 未发现问题
+    (v1 synthesize 被 coco P1 否 → 改 evict)。
 
 == BUG #1 (DONE + COMMITTED 1346e0d) — GC stale-cache fast-punch ==
   GC F201 fast-punch 信了 StreamClient extent_info 陈旧缓存(alloc 封旧 tail 不 evict)→ 把已封满载 live VP 的
@@ -18,11 +26,7 @@ Task scope: /loop chaos 测试。BUG #1(GC stale-cache fast-punch,数据丢失)+
   验证:stream82/PS167/rpc30 单测 + WIRE registry 绿;修复前 seed 603 3/3 挂、修复后 seed 603 ×5 + 回归 0 挂
     (14 次加压 chaos);coco(P1 已修+重验)。
 
-== 待办(deferred):GC-回收-leak(coco 在 BUG#1 提的 P1)==
-  no-refetch 跳过的副作用:真已封但卡在 stale-cached-as-open 的 extent 会被永久跳过直到缓存刷新 → GC 回收不及时
-  (浪费空间,非丢数据)。干净修法:封存时更新旧 tail 缓存为 sealed=true,len=seal_commit(alloc_new_extent_once
-  在 seal_commit=Some(c) 时改 cache,GC 见新态零新增 RPC)。BUG#2 已修(它曾是不做此修法的理由)→ 现可安全做,但
-  本会话未做,排期后续。
+(本会话无遗留 deferred 项 —— GC-回收-leak 已由 GC-RECLAIM-EVICT 关闭,见上。)
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV(committed 3309b8b/ed7ac11): 删 vp_table_refs 双计数 Stage 1。Stage 2(未做):迁移后塌缩 extent_can_delete=

@@ -820,17 +820,31 @@ known sealed (an OPEN extent always reports `sealed_length==0` but is NOT empty 
 its committed length is `last_synced`, invisible here). **Deliberately NO
 invalidate+refetch** here: an extra GC→manager RPC per stale candidate shifts
 P-log timing and (chaos seed=603) EXPOSED a separate pre-existing split-child-open
-wedge (see below). **Known limitation (deferred, paired with the seed=603 wedge):**
-a genuinely-sealed extent stuck stale-cached-as-open is SKIPPED until its cache
-refreshes (read / EC-`invalidate_extent_cache` / restart) — a GC-reclamation
-gap, never a data-loss or correctness gap. The clean reclamation fix (update the
-old tail's cache entry to `sealed=true, len=seal_commit` at authoritative
-seal-and-roll, so GC sees fresh state with NO added RPC) is deferred until the
-seed=603 wedge is root-caused. **seed=603 wedge (OPEN bug, separate):** a split's
-right child sometimes never opens / never registers a PS addr → its keys are
-unreachable (`mismatches=0`; data is NOT lost — it is in the CoW-shared streams).
-Pre-existing + latent (baseline passes seed 603); any GC-timing perturbation
-exposes it.
+wedge (see below). The conservative skip leaves anything not authoritatively
+sealed-in-cache for a later tick (data-safe — never punches it).
+
+**GC-reclamation gap — CLOSED (was deferred, paired with the seed=603 wedge).**
+The skip alone left a genuinely-sealed extent stuck stale-cached-as-open SKIPPED
+until its cache happened to refresh (a read / EC-`invalidate_extent_cache` /
+restart) → its dead bytes never reclaimed (a GC-efficiency leak, never data-loss).
+Now closed at the SOURCE: `StreamClient::alloc_new_extent` (seal-and-roll)
+**evicts the OLD tail from `extent_info_cache`** on the authoritative path
+(`seal_commit = Some(_)`, `seal_extent_id != 0`), so GC's next `get_extent_info`
+fetches the AUTHORITATIVE sealed state from the manager and reclaims it. We
+EVICT, not synthesize `sealed_length = seal_commit` locally (coco P1 data-loss):
+the manager's `already_sealed` branch ignores `req.seal_commit` and keeps the
+existing `L` (a prior probe/split seal, `L ≥ acked ≥ seal_commit`), so a
+synthesized `seal_commit < L` would make GC relocate only the first `seal_commit`
+bytes yet punch the whole extent → lose committed `[seal_commit, L)`. The extra
+cache-miss RPC is safe now that the seed=603 wedge it would once have exposed is
+itself fixed (see manager CLAUDE.md note 32a, BUG2-IDEMPOTENT-ROLL). The
+conservative skip above remains as the data-safe backstop for any OTHER
+stale-open source (probe/split/merge seals that don't go through this client's
+alloc). **seed=603 wedge — FIXED (was a separate OPEN bug):** the split's right
+child never opened because a non-idempotent `alloc_new_extent` retry over-sealed
+the freshly-rolled tail → unrecoverable extent → WAL-FAILSTOP on replay. Fixed
+by pinning the seal to `seal_extent_id` (manager CLAUDE.md note 32a); NOT a
+routing/open bug.
 
 **F201 multi-tier params** (`GcTask::Auto(GcAutoParams)`):
 - `ratio: Option<f64>` — discard-ratio threshold, default 0.4
