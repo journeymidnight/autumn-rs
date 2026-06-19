@@ -49,6 +49,7 @@ cleanup_all() {
 kill_ps() { pkill -9 -f "autumn-ps --psid 1" 2>/dev/null; sleep 2; }
 start_ps() {
     env AUTUMN_DATA_ROOT="$DATA_ROOT" AUTUMN_TRANSPORT=tcp AUTUMN_METRICS=1 \
+        AUTUMN_EXTENT_BASE_PORT=20000 \
         bash "$ROOT/cluster.sh" start-ps > "$WORK/start_ps.log" 2>&1
 }
 
@@ -96,6 +97,7 @@ env AUTUMN_DATA_ROOT="$DATA_ROOT" \
     AUTUMN_BOOTSTRAP_PRESPLIT="1:normal" \
     AUTUMN_TRANSPORT=tcp \
     AUTUMN_METRICS=1 \
+    AUTUMN_EXTENT_BASE_PORT=20000 \
     bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \
     || { echo "cluster start failed"; tail -15 "$WORK/cluster.log"; cleanup_all; exit 1; }
