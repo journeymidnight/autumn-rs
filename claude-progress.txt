@@ -4,6 +4,14 @@ Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC 
   BUG #2(seal-and-roll 重试不幂等 → split-child-open wedge)、GC-回收-leak(coco 在 BUG#1 提的 P1,本次关闭)。
   代码 + 单测 + 加压 chaos(含多配置 soak)+ coco 全绿。
 
+== 全族 chaos 验证矩阵(本会话延伸,全绿)+ selfheal 脚手架修复(commit 53e8d55)==
+  覆盖轴全绿:in-proc system_chaos(6 配置矩阵 + 6 fresh 随机种子 + EC 几何 3/1·2/2·4/2 + 2× 120s
+    深跑 30/19 nemesis 事件,均 "all invariants OK" mismatches=0 not_found=0)、单机 TCP/UCX、跨主机
+    TCP/UCX、kvcache(native wheel 重建 v7→v8,154 轮 PASS)、etcd(551 keys 零丢 + 重选举)、
+    enospc(163 keys,FULL-but-online + 2s 自愈)、selfheal(S1 bit-rot 自愈 12/12 byte-exact + S2 fail-loud)。
+  selfheal 脚手架 BUG(非 autumn bug):selfheal_chaos.sh 没设 AUTUMN_EXTENT_BASE_PORT → EN ctl 端口 :10101
+    撞本机 Ray 的 10100 段 → reproduce 2× root-cause → 加 =20000(对齐 etcd/enospc/kvcache 三脚本)→ 端到端 PASS。
+
 == GC-RECLAIM-EVICT (DONE + 本次提交) — 关闭 no-refetch 回收 leak ==
   修法:alloc_new_extent 在 authoritative 封存路径 evict 旧 tail 的 extent_info_cache → GC 下次拉权威 sealed 状态回收。
     NOT synthesize sealed_length=seal_commit(coco P1:manager already_sealed 保留旧 L≥seal_commit,本地写 c<L 会让 GC
