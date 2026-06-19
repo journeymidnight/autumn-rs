@@ -1325,3 +1325,20 @@ gaps in the lease protocol's correctness story.
   → 不误删 live VP);(3) seed 603 ×2 + 回归(760-763)= 0 挂(共 9 次);(4) coco "未发现问题"。
 - **passes:** completed(evict 版;代码 + 单测 + 9-run 加压 chaos + coco 两轮[v1 synthesize 被 coco P1 否,改 evict]
   ;用户曾提议做此项)。
+
+## CHAOS-ACCOUNTING-CHECKER — storage-accounting invariants in system_chaos (2026-06-19)
+- **目标/边界:** system_chaos 此前只校验用户数据(per-key/range/write-liveness),不校验 storage 会计。
+  新增收尾断言:每 extent `refs == 列它的 stream 数`、`vp_table_refs==0`、无 dangling membership(stream 列了
+  无 ExtentInfo 的 extent)。一次抓 extent-10 orphan 类 + CoW double-free + GC leak 回归。纯 test-harness
+  改动(无生产代码),直接读 manager etcd(extents//streams/)为真相源,不加新 RPC。来源:用户提议
+  extent-10 场景 + coco arch gap 分析(T1a 最高杠杆项)。
+- **设计:** verify 阶段调 `verify_extent_accounting(&etcd_endpoint)`,折进既有 panic 条件。读用
+  **revision-pinned 一致快照**(读 extents/ 取 header.revision,再按同 revision 读 streams/;否则两次独立
+  latest-revision Range 跨 commit 会拼出 phantom 状态误报 — coco P2)。convergence loop(6×2s)兜底任何残留瞬态。
+  非空快照守卫:clean 但 extents/memberships=0 视为失败(测试必有 log/row/meta 流),防 vacuous pass(coco P2)。
+  比较逻辑抽成纯函数 `check_accounting_invariants` + 6 个单测(clean 含 CoW refs=2+pending-delete;
+  orphan/under/over/vp_table_refs/dangling 各触发)。
+- **验收标准:** (1) 编译 + 6 单测绿(证明 checker 对每类违规会 fire,非空跑);(2) e2e:多 seed + EC 几何 +
+  深 split/merge/gc/ec churn,accounting errors=0 且 checked N extents>0 / M memberships>N(证明在校验 CoW 共享
+  extent,refs≥2);(3) coco findbugs(2 个 P2 已修:一致快照 + 非空守卫)。
+- **passes:** completed(代码 + 6 单测 + e2e 多 seed/几何/深 churn 全绿 + coco 2 轮[P2×2 已修];用户选定此方向)。

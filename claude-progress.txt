@@ -12,6 +12,17 @@ Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC 
   selfheal 脚手架 BUG(非 autumn bug):selfheal_chaos.sh 没设 AUTUMN_EXTENT_BASE_PORT → EN ctl 端口 :10101
     撞本机 Ray 的 10100 段 → reproduce 2× root-cause → 加 =20000(对齐 etcd/enospc/kvcache 三脚本)→ 端到端 PASS。
 
+== CHAOS-ACCOUNTING-CHECKER(本次提交)— storage 会计不变量进 system_chaos ==
+  动机:gap 分析(用户 extent-10 提议 + coco arch)发现现有 chaos 只校验用户数据,不校验 storage 会计。
+  新增:system_chaos verify 收尾断言每 extent `refs==列它的 stream 数` + `vp_table_refs==0` + 无 dangling
+  membership。纯 test 改动,读 manager etcd(extents//streams/)为真相源,无新 RPC、无生产代码改动。
+  一次覆盖 extent-10 orphan 类 + CoW double-free + GC leak 回归。
+  关键设计:revision-pinned 一致快照(读 extents/ 取 header.revision,streams/ 按同 rev 读 — 防跨 commit
+  phantom 误报,coco P2)+ 非空守卫(clean 但 0 extent/membership 判失败,防 vacuous pass,coco P2)+
+  纯函数 check_accounting_invariants 抽出 + 6 单测。
+  验证:6 单测(每类违规会 fire)+ 11 e2e(多 seed/EC 几何/深 churn,errors=0 且 memberships>extents 证明在
+  校验 CoW refs≥2 共享 extent)+ coco 2 轮(P2×2 已修)。
+
 == GC-RECLAIM-EVICT (DONE + 本次提交) — 关闭 no-refetch 回收 leak ==
   修法:alloc_new_extent 在 authoritative 封存路径 evict 旧 tail 的 extent_info_cache → GC 下次拉权威 sealed 状态回收。
     NOT synthesize sealed_length=seal_commit(coco P1:manager already_sealed 保留旧 L≥seal_commit,本地写 c<L 会让 GC

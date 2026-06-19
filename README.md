@@ -357,6 +357,13 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   big-value-loss regression guard (BUG-GC-STALE-CACHE); seed=603 (under
 #   AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500, 45s) = the seal-and-roll non-
 #   idempotent-retry split-child-open wedge guard (BUG-IDEMPOTENT-ROLL).
+#   STORAGE-ACCOUNTING invariants (beyond user data): the verify phase also
+#   reads the manager's etcd (extents//streams/) at a single pinned revision and
+#   asserts, for every extent, `refs == #streams listing it` + `vp_table_refs==0`
+#   + no dangling membership — catching the extent-10 orphan / CoW double-free /
+#   GC-leak classes that the per-key/range checkers can't see. Pure-logic unit
+#   tests run in plain `cargo test` (no cluster): `... --test system_chaos
+#   accounting_checker_tests`.
 ```
 
 ## Rolling restart (R0 of docs/rolling_upgrade_design.md)

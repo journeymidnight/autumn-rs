@@ -1656,6 +1656,266 @@ async fn create_stream_kp(mgr: &RpcClient, k: u32, m: u32) -> u64 {
         .stream_id
 }
 
+/// Storage-accounting invariant checker (the extent-10 / orphan-leak class).
+///
+/// The existing chaos checkers (`verify_per_key` / `_range` / `_write_liveness`)
+/// only validate USER DATA. None of them assert STORAGE accounting, so a
+/// refcount leak / orphan extent / dangling stream membership reads-and-writes
+/// perfectly while quietly leaking space or — worse — sitting at a state the
+/// both-zero sweep must skip to avoid data loss. This reads the manager's etcd
+/// state directly (the source of truth, no new RPC) and asserts the invariant
+/// that is true BY CONSTRUCTION on every mutation path:
+///
+///   for every extent E:  E.refs == (number of streams whose extent_ids list E)
+///
+/// because split does `refs += 1` + adds E to the child's `extent_ids`, merge
+/// does `refs -= 1` + removes it, create/alloc set `refs = 1` + add to one
+/// stream, and punch_holes does `refs -= 1` + removes — refs and membership
+/// always move together, in one fenced etcd txn. A POST-SETTLE violation is
+/// therefore a real accounting bug:
+///   - refs >  membership  → over-count → extent never freed (leak)
+///   - refs <  membership  → under-count → premature physical delete risk
+///   - refs >0, membership 0 → orphan (referenced but in no stream) = extent-10
+///   - membership >0, no ExtentInfo → dangling (stream points at a gone extent)
+/// Plus `vp_table_refs == 0` (the post-removal new-build invariant; a non-zero
+/// value is a legacy leak the upgrade-safety guard intentionally won't reap).
+///
+/// CONVERGENCE LOOP: a background GC/split/merge firing during the settle
+/// window touches `streams/<id>` and `extents/<id>` in one atomic txn, so any
+/// single etcd snapshot is internally consistent — but to be robust against
+/// any future multi-txn path (and the etcd read itself racing a commit), we
+/// retry: a transient desync heals within a tick, a REAL leak is permanent.
+/// Clean on ANY attempt ⇒ pass; dirty on ALL attempts ⇒ return the last set.
+/// Returns `(errors, extents_checked, total_memberships)`. The two counts prove
+/// the check is non-vacuous (it actually saw extents + stream memberships, not
+/// an empty etcd snapshot) and are logged at the call site.
+async fn verify_extent_accounting(etcd_endpoint: &str) -> (Vec<String>, usize, usize) {
+    let mut last = (Vec::new(), 0usize, 0usize);
+    for attempt in 0..6 {
+        let snap = accounting_snapshot_errors(etcd_endpoint).await;
+        if snap.0.is_empty() {
+            // Non-vacuity guard (coco P2): the chaos test always has log/row/meta
+            // streams + their extents, so a clean-but-EMPTY snapshot means we
+            // read the wrong/empty etcd or persistence is broken — NOT "all
+            // good". Treat it as a failure rather than a vacuous pass.
+            if snap.1 == 0 || snap.2 == 0 {
+                return (
+                    vec![format!(
+                        "accounting: vacuous snapshot (extents={}, memberships={}) — expected non-empty (log/row/meta streams exist)",
+                        snap.1, snap.2
+                    )],
+                    snap.1,
+                    snap.2,
+                );
+            }
+            return snap;
+        }
+        last = snap;
+        if attempt < 5 {
+            compio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    last
+}
+
+/// Standard etcd prefix range-end (increment the last non-0xff byte). Mirrors
+/// `autumn_etcd`'s private `prefix_range_end` so we can build a revision-pinned
+/// `streams/` Range for the consistent-snapshot read.
+fn prefix_range_end_local(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last < 0xff {
+            *end.last_mut().unwrap() = last + 1;
+            return end;
+        }
+        end.pop();
+    }
+    vec![0] // all-0xff prefix → open-ended range
+}
+
+fn parse_id_after_prefix(key: &[u8], prefix: &str) -> Option<u64> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix(prefix)?
+        .parse()
+        .ok()
+}
+
+/// One read-and-check pass over the manager's etcd `extents/` + `streams/`
+/// prefixes. Returns the list of accounting-invariant violations.
+async fn accounting_snapshot_errors(etcd_endpoint: &str) -> (Vec<String>, usize, usize) {
+    let mut errors = Vec::new();
+    let client = match autumn_etcd::EtcdClient::connect(etcd_endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            errors.push(format!("accounting: etcd connect failed: {e}"));
+            return (errors, 0, 0);
+        }
+    };
+    // CONSISTENT SNAPSHOT (coco P2): read extents/ at the latest revision,
+    // capture that revision, then read streams/ PINNED at the same revision.
+    // Two independent latest-revision Range reads could otherwise straddle a
+    // commit and stitch a phantom "old extents + new streams" state, making the
+    // checker false-positive on refs != membership.
+    let ext_resp = match client.get_prefix("extents/").await {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!("accounting: get_prefix(extents/) failed: {e}"));
+            return (errors, 0, 0);
+        }
+    };
+    let snapshot_rev = ext_resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
+    let stream_req = autumn_etcd::proto::RangeRequest {
+        key: b"streams/".to_vec(),
+        range_end: prefix_range_end_local(b"streams/"),
+        revision: snapshot_rev,
+        ..Default::default()
+    };
+    let stream_resp = match client.range(stream_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!(
+                "accounting: range(streams/ @rev {snapshot_rev}) failed: {e}"
+            ));
+            return (errors, 0, 0);
+        }
+    };
+
+    // Decode into plain tuples, then run the PURE invariant check (unit-tested
+    // below) so the comparison logic is provable without a live cluster.
+    let mut stream_lists: Vec<Vec<u64>> = Vec::new();
+    for kv in &stream_resp.kvs {
+        match rkyv_decode::<MgrStreamInfo>(&kv.value) {
+            Ok(info) => stream_lists.push(info.extent_ids.clone()),
+            Err(e) => errors.push(format!(
+                "accounting: decode {} failed: {e}",
+                String::from_utf8_lossy(&kv.key)
+            )),
+        }
+    }
+    let mut extents: Vec<(u64, u64, u64)> = Vec::new();
+    for kv in &ext_resp.kvs {
+        let eid = match parse_id_after_prefix(&kv.key, "extents/") {
+            Some(v) => v,
+            None => {
+                errors.push(format!(
+                    "accounting: unparseable extent key {}",
+                    String::from_utf8_lossy(&kv.key)
+                ));
+                continue;
+            }
+        };
+        match rkyv_decode::<MgrExtentInfo>(&kv.value) {
+            Ok(info) => extents.push((eid, info.refs, info.vp_table_refs)),
+            Err(e) => errors.push(format!("accounting: decode extents/{eid} failed: {e}")),
+        }
+    }
+    let total_memberships: usize = stream_lists.iter().map(|l| l.len()).sum();
+    let n_extents = extents.len();
+    errors.extend(check_accounting_invariants(&extents, &stream_lists));
+    (errors, n_extents, total_memberships)
+}
+
+/// Pure storage-accounting invariant check (no I/O) — unit-tested below so the
+/// comparison logic is provable without a live cluster. `extents` = (extent_id,
+/// refs, vp_table_refs); `stream_extent_lists` = each stream's `extent_ids`.
+fn check_accounting_invariants(
+    extents: &[(u64, u64, u64)],
+    stream_extent_lists: &[Vec<u64>],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut membership: HashMap<u64, u64> = HashMap::new();
+    for list in stream_extent_lists {
+        for eid in list {
+            *membership.entry(*eid).or_insert(0) += 1;
+        }
+    }
+    let mut existing: HashMap<u64, ()> = HashMap::new();
+    for &(eid, refs, vp_table_refs) in extents {
+        existing.insert(eid, ());
+        let memb = membership.get(&eid).copied().unwrap_or(0);
+        if refs != memb {
+            errors.push(format!(
+                "extent {eid}: refs={refs} != {memb} streams listing it ({})",
+                if memb == 0 {
+                    "ORPHAN-LEAK: referenced but in no stream"
+                } else if refs < memb {
+                    "UNDER-COUNT: premature-delete risk"
+                } else {
+                    "OVER-COUNT: never-freed leak"
+                }
+            ));
+        }
+        if vp_table_refs != 0 {
+            errors.push(format!(
+                "extent {eid}: vp_table_refs={vp_table_refs} (new-build invariant: must be 0)"
+            ));
+        }
+    }
+    for (eid, cnt) in &membership {
+        if !existing.contains_key(eid) {
+            errors.push(format!(
+                "extent {eid}: listed by {cnt} stream(s) but has NO ExtentInfo (dangling membership)"
+            ));
+        }
+    }
+    errors
+}
+
+#[cfg(test)]
+mod accounting_checker_tests {
+    use super::check_accounting_invariants;
+
+    #[test]
+    fn clean_state_incl_cow_shared_and_pending_delete() {
+        // extent 1: refs 1, in 1 stream. extent 10: refs 2, CoW-shared by 2
+        // streams. extent 5: refs 0, in no stream (pending physical delete).
+        let extents = [(1u64, 1u64, 0u64), (10, 2, 0), (5, 0, 0)];
+        let streams = [vec![1u64, 10], vec![10]];
+        assert!(
+            check_accounting_invariants(&extents, &streams).is_empty(),
+            "clean state (incl CoW refs=2 and refs=0 pending-delete) must pass"
+        );
+    }
+
+    #[test]
+    fn orphan_leak_refs_but_no_stream() {
+        let errs = check_accounting_invariants(&[(7u64, 1u64, 0u64)], &[]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("ORPHAN-LEAK"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn under_count_refs_below_membership() {
+        // refs 1 but two streams list it → premature-delete risk.
+        let errs = check_accounting_invariants(&[(3u64, 1u64, 0u64)], &[vec![3], vec![3]]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("UNDER-COUNT"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn over_count_refs_above_membership() {
+        let errs = check_accounting_invariants(&[(4u64, 2u64, 0u64)], &[vec![4]]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("OVER-COUNT"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn vp_table_refs_nonzero_is_flagged() {
+        let errs = check_accounting_invariants(&[(8u64, 1u64, 5u64)], &[vec![8]]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("vp_table_refs=5"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn dangling_membership_stream_points_at_missing_extent() {
+        // stream lists extent 9 but there is no ExtentInfo for it.
+        let errs = check_accounting_invariants(&[], &[vec![9u64]]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("dangling membership"), "{}", errs[0]);
+    }
+}
+
 #[test]
 #[ignore]
 fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
@@ -1952,21 +2212,36 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let liveness_errors = verify_write_liveness(&router, &topo).await;
         eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
 
+        // Storage-accounting invariants (extent-10 / orphan-leak class): refs ==
+        // membership, vp_table_refs == 0, no dangling membership. Read from the
+        // manager's etcd state (source of truth); convergence-looped so a
+        // background GC/split/merge mid-settle heals while a real leak persists.
+        eprintln!("chaos: verifying extent accounting (refs/orphan/leak) via etcd");
+        let (accounting_errors, acct_extents, acct_memberships) =
+            verify_extent_accounting(&etcd_endpoint).await;
+        eprintln!(
+            "chaos: accounting verify: errors={} (checked {acct_extents} extents, {acct_memberships} memberships)",
+            accounting_errors.len()
+        );
+
         if !mismatches.is_empty()
             || !not_found.is_empty()
             || !range_errors.is_empty()
             || !liveness_errors.is_empty()
+            || !accounting_errors.is_empty()
         {
             panic!(
-                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={}\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}",
+                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={}\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}",
                 mismatches.len(),
                 not_found.len(),
                 range_errors.len(),
                 liveness_errors.len(),
+                accounting_errors.len(),
                 mismatches.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 not_found.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 range_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 liveness_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
+                accounting_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
             );
         }
         eprintln!("chaos: all invariants OK ({total} keys)");
