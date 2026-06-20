@@ -1420,3 +1420,15 @@ gaps in the lease protocol's correctness story.
     `cache-control: no-cache`(JSON 端点本就 `no-store`)。每次都拉最新,永不服旧;perf 对测试程序无所谓。
 - **passes:** completed(代码 + build/clippy/test 绿 + 用户 Chrome/Safari 实测通过;gallery 全部 squash 成单 commit,
   缓存策略 = 全 no-cache)。
+
+## EC-DISPATCH-REFACTOR — split the 260-line ec_conversion_dispatch_loop (2026-06-20, 用户要求清理)
+- **目标/边界:** 纯重构(行为零改变),拆掉 ec_conversion_dispatch_loop 的 260 行巨型 loop 体 + 去重 + 删过时注释。
+  用户看了代码觉得乱,确认"一起做"(安全档 + 结构拆分)。revert-prone 区,故重交叉验证。
+- **改动:** (1) loop 体瘦身为 sleep→leader-check→collect_ec_dispatch_candidates(PHASE1)→for dispatch_one_ec_conversion(PHASE2);
+  (2) 新增 `EcDispatchCandidate` struct 取代不透明 3-tuple;(3) 3× 重复的 spawn-detach-drain 抽成 `spawn_drain_stale_ec_marker`
+  helper,顺带把其中 3 个 `let _ =` 吞错换成 warn!(对齐 [[feedback_no_let_underscore_swallow]]);(4) 删 28 行描述已不存在
+  "replay vs fresh"分叉的过时注释;(5) 去掉 target_nodes/target_nodes_clone/extra_disk_ids_clone 冗余 clone(by-value move 进 finalize)。
+- **验收标准:** (1) 编译 + 164 manager lib 单测 0 回归;(2) EC-heavy + recovery-churn chaos(ec,split,merge,gc,kill,killfence,
+  fence,flush,compact)2 seed 全过 + accounting errors=0 + memberships>extents(证明 CoW 共享 extent 经新派发路径);(3) coco
+  无 P0/P1/P2(仅 1 P3:drain 失败日志 debug→warn,已采纳——持久失败要 prod 可见)。
+- **passes:** completed(纯重构;代码 + 164 lib + 2 chaos + coco[仅 P3 已修])。
