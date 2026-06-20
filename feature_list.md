@@ -1342,3 +1342,16 @@ gaps in the lease protocol's correctness story.
   深 split/merge/gc/ec churn,accounting errors=0 且 checked N extents>0 / M memberships>N(证明在校验 CoW 共享
   extent,refs≥2);(3) coco findbugs(2 个 P2 已修:一致快照 + 非空守卫)。
 - **passes:** completed(代码 + 6 单测 + e2e 多 seed/几何/深 churn 全绿 + coco 2 轮[P2×2 已修];用户选定此方向)。
+
+## BUG2-EC-APPLY-FAIL — EC convert apply 失败被吞 → 半永久 wedge (2026-06-20, coco arch 发现 + 复现)
+- **目标/边界:** 修 coco arch gap 分析核实的真 bug:EC convert dispatch loop `let _ = apply_ec_conversion_done(...)`
+  吞错 + 无条件 release marker。
+- **根因:** `recovery.rs:1300` RPC OK 后 `let _ = apply(...).await`(吞错)再 `if rpc_ok { commit_extent_inflight_release }`
+  (无条件)。若 apply 的 etcd txn 失败但**未丢 leadership**(etcd 瞬断/非-fence 错),etcd 留 marker + pre-EC layout,
+  本 leader 却清了内存 marker;ec_conversion_dispatch_loop 是 drain-only(F203 枚举内存 shadow 非重扫 etcd)→ 永不重派
+  → 该 extent manager-pre-EC / EN-post-EC,读永远 EVERSION_MISMATCH 直到 leader failover 重放 etcd marker。
+- **修法:** 抽出 `finalize_ec_dispatch_after_convert`,**仅 apply 返回 Ok 才 release marker**;Err(含 NotLeader/瞬断/
+  NotFound)保留 marker → 下 tick 重派(F119-D/F153 幂等使重发为 no-op)。体现 [[feedback_no_let_underscore_swallow]]。
+- **验收标准:** (1) reproduce-first:对抽出方法写单测,先用旧 buggy 体跑出 RED(apply 失败 marker 被误清),再换 fixed 体 GREEN;
+  (2) 164 lib 单测 0 回归;(3) EC-heavy chaos(ec,split,merge,gc,kill,fence)≥2 seed 全过 + accounting errors=0;(4) coco findbugs。
+- **passes:** completed(代码 + 2 单测[fail-keeps / success-releases,red→green 已验] + 164 lib + 2 EC-heavy chaos + coco "未发现问题")。

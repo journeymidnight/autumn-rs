@@ -1298,26 +1298,68 @@ impl crate::AutumnManager {
                 };
 
                 if rpc_ok {
-                    let _ = self
-                        .apply_ec_conversion_done(
-                            extent_id,
-                            target_nodes_clone,
-                            extra_disk_ids_clone,
-                            data_shards,
-                            new_eversion,
-                        )
-                        .await;
+                    self.finalize_ec_dispatch_after_convert(
+                        extent_id,
+                        target_nodes_clone,
+                        extra_disk_ids_clone,
+                        data_shards,
+                        new_eversion,
+                    )
+                    .await;
                 }
-                // F207-B: on RPC failure the ledger marker stays in place;
-                // the next tick re-dispatches against the SAME assignment
-                // (coordinator's F119-D / F153 make repeated convert calls
-                // idempotent). On RPC success `apply_ec_conversion_done`
-                // already deleted the etcd marker as part of its atomic
-                // put-and-delete txn; we just clear the in-memory shadow
-                // here.
-                if rpc_ok {
-                    self.commit_extent_inflight_release(extent_id);
-                }
+            }
+        }
+    }
+
+    /// Post-RPC finalize after a successful `EXT_MSG_CONVERT_TO_EC`: apply the
+    /// conversion to etcd + memory, then release the in-memory inflight marker.
+    ///
+    /// BUG2-EC-APPLY-FAIL (coco arch, verified 2026-06-19): the in-memory marker
+    /// MUST be released ONLY when `apply_ec_conversion_done` SUCCEEDS. Pre-fix
+    /// this was two unconditional `if rpc_ok` blocks — the apply error was
+    /// swallowed (`let _ =`) and the marker released regardless. If apply's
+    /// `txn_fenced` failed transiently WITHOUT losing leadership (etcd blip,
+    /// non-fence error), etcd kept the marker + pre-EC layout while THIS leader
+    /// dropped the in-memory marker; because `ec_conversion_dispatch_loop` is
+    /// drain-only (F203 — it enumerates the in-memory shadow, not a fresh etcd
+    /// scan), it never re-dispatched, so the extent stayed manager-pre-EC /
+    /// EN-post-EC and every read wedged on `EVERSION_MISMATCH` until a leader
+    /// failover replayed the etcd marker. Keeping the marker on apply-failure
+    /// lets the next tick re-dispatch; F119-D / F153 make repeated convert calls
+    /// idempotent, so a re-dispatch after the EN already converted is a no-op.
+    async fn finalize_ec_dispatch_after_convert(
+        &self,
+        extent_id: u64,
+        target_nodes: Vec<u64>,
+        extra_disk_ids: Vec<u64>,
+        data_shards: usize,
+        new_eversion: u64,
+    ) {
+        match self
+            .apply_ec_conversion_done(
+                extent_id,
+                target_nodes,
+                extra_disk_ids,
+                data_shards,
+                new_eversion,
+            )
+            .await
+        {
+            Ok(()) => {
+                // apply's atomic put_and_delete_txn already removed the etcd
+                // marker; drop the in-memory shadow to match.
+                self.commit_extent_inflight_release(extent_id);
+            }
+            Err(e) => {
+                // Leadership-retained apply failure: keep the marker so the
+                // next dispatch tick re-dispatches (idempotent via F119-D/F153).
+                // A leadership-LOST failure (NotLeader) also keeps it; the new
+                // leader's replay reloads it from etcd either way.
+                tracing::warn!(
+                    extent_id,
+                    error = %e,
+                    "EC apply failed after a successful convert RPC; keeping inflight marker for re-dispatch"
+                );
             }
         }
     }
@@ -1403,5 +1445,105 @@ impl crate::AutumnManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ec_apply_fail_tests {
+    //! BUG2-EC-APPLY-FAIL: `finalize_ec_dispatch_after_convert` must keep the
+    //! in-memory inflight marker when `apply_ec_conversion_done` FAILS, so the
+    //! drain-only dispatch loop re-dispatches on the next tick. Releasing it on
+    //! a leadership-retained apply failure strands the extent manager-pre-EC /
+    //! EN-post-EC → permanent EVERSION_MISMATCH wedge until a failover.
+    //!
+    //! Memory-mode (no etcd): `apply_ec_conversion_done` returns `NotFound`
+    //! for an absent extent BEFORE touching etcd or leadership — a faithful,
+    //! deterministic model of "apply failed while this manager stays leader".
+    use crate::extent_inflight::ExtentOpKind;
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::MgrExtentInfo;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    fn pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
+        MgrExtentInfo {
+            extent_id,
+            replicates: vec![1, 3, 5],
+            parity: vec![],
+            eversion: 3,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length: 4096,
+            sealed: true,
+            avali: 0x7,
+            replicate_disks: vec![10, 30, 50],
+            parity_disks: vec![],
+            ec_converted: false,
+        }
+    }
+
+    /// REPRODUCE: apply fails (extent absent → NotFound, leadership retained).
+    /// The inflight marker MUST survive so the next dispatch tick retries.
+    /// Pre-fix (unconditional release on rpc_ok) this dropped the marker.
+    #[test]
+    fn apply_failure_keeps_inflight_marker_for_redispatch() {
+        block_on(async {
+            let m = AutumnManager::new();
+            let extent_id: u64 = 7001;
+            // Marker present, but NO extent in the store → apply -> NotFound.
+            m._test_mark_ec_inflight(extent_id);
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::ConvertToEc),
+                "precondition: marker must be in flight before finalize"
+            );
+
+            m.finalize_ec_dispatch_after_convert(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+                .await;
+
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::ConvertToEc),
+                "BUG2-EC-APPLY-FAIL: marker MUST be retained when apply fails \
+                 (else the drain-only loop never re-dispatches → permanent wedge)"
+            );
+        });
+    }
+
+    /// CONTROL: apply succeeds (extent present, memory-mode) → marker released.
+    #[test]
+    fn apply_success_releases_inflight_marker() {
+        block_on(async {
+            let m = AutumnManager::new();
+            let extent_id: u64 = 7002;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .insert(extent_id, pre_ec_extent(extent_id));
+            m._test_mark_ec_inflight(extent_id);
+
+            m.finalize_ec_dispatch_after_convert(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+                .await;
+
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                None,
+                "apply success must release the in-memory marker"
+            );
+            // And the extent is now EC-converted in memory.
+            assert!(
+                m.store
+                    .inner
+                    .borrow()
+                    .extents
+                    .get(&extent_id)
+                    .map(|e| e.ec_converted)
+                    .unwrap_or(false),
+                "apply success must flip ec_converted in memory"
+            );
+        });
     }
 }

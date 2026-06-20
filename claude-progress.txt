@@ -23,6 +23,20 @@ Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC 
   验证:6 单测(每类违规会 fire)+ 11 e2e(多 seed/EC 几何/深 churn,errors=0 且 memberships>extents 证明在
   校验 CoW refs≥2 共享 extent)+ coco 2 轮(P2×2 已修)。
 
+== BUG2-EC-APPLY-FAIL(本次提交)— EC convert apply 失败被吞 → 半永久 wedge ==
+  coco arch gap 分析发现 + 核实的真 bug。recovery.rs:1300 `let _ = apply_ec_conversion_done(...)` 吞错 +
+  无条件 release marker;apply 的 etcd txn 失败但未丢 leadership 时,etcd 留 marker+pre-EC、内存清 marker,
+  drain-only dispatch loop 永不重派 → 读 EVERSION_MISMATCH 直到 failover。修:抽 finalize_ec_dispatch_after_convert,
+  仅 apply Ok 才 release,Err 保留 marker 等下 tick 重派(F119-D/F153 幂等)。reproduce-first:抽出方法单测 red→green。
+  验证:2 单测 + 164 lib + 2 EC-heavy chaos(accounting errors=0)+ coco 未发现问题。
+
+== 设计原则:禁止 `let _ =` 隐藏错误(用户 2026-06-20)+ 全仓审计 ==
+  T1b 根因即此。原则记 feedback_no_let_underscore_swallow。3 高危 crate 并行审计:stream 0 BAD(fsync/save_meta
+  已 P0-A/B/D fail-closed)、partition-server 0 BAD、manager 4 BAD(均 recovery.rs,T1b 同类):
+  :860 `let _ = apply_recovery_done`(F222 once-only 恢复完成丢失→槽位卡死节点+marker 卡到 10min sweep);
+  :237/:260/:338 `let _ = etcd.put_and_delete_txn(删 marker)`(Recovery marker etcd 泄漏,违反 I3 原子释放)。
+  下一步:逐个读 + 修这 4 个 BAD(+ 视情况给 ~12 OK-BUT-LOG 加 log)。
+
 == GC-RECLAIM-EVICT (DONE + 本次提交) — 关闭 no-refetch 回收 leak ==
   修法:alloc_new_extent 在 authoritative 封存路径 evict 旧 tail 的 extent_info_cache → GC 下次拉权威 sealed 状态回收。
     NOT synthesize sealed_length=seal_commit(coco P1:manager already_sealed 保留旧 L≥seal_commit,本地写 c<L 会让 GC
