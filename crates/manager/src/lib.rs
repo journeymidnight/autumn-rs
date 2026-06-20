@@ -1139,62 +1139,9 @@ impl AutumnManager {
             };
             let last_op = self.last_op_at.borrow().clone();
             let state_snapshot: autumn_common::MetadataState = (*self.store.inner.borrow()).clone();
-            // F210-F3: prune metrics for partitions that no longer
-            // exist (post-split / merge / PS-evict) and whose latest
-            // bucket has aged past STALE_METRICS_AGE_SEC. Without
-            // this, advisories continued to fire off zombie metrics
-            // for ~indefinite duration after a partition was merged
-            // away.
-            {
-                let mut p = self.policy.borrow_mut();
-                p.prune_stale_metrics(&state_snapshot, now);
-            }
-            let mut cands: Vec<PolicyCandidate> = {
-                let mut p = self.policy.borrow_mut();
-                p.compute_candidates(crate::policy::ComputeArgs {
-                    state: &state_snapshot,
-                    last_op_at: &last_op,
-                    region_owners: &owners,
-                    now,
-                })
-            };
-            // F187: maintenance (GC + COMPACT) advisory pass uses only
-            // the per-partition windowed metrics (no need for state /
-            // owners / last_op_at — `last_gc_at` / `last_compact_at`
-            // come straight from the PS-reported buckets).
-            let mut maint = {
-                let mut p = self.policy.borrow_mut();
-                p.compute_maintenance_advisory(now)
-            };
-            cands.append(&mut maint);
-            // F196 Stage D: hot/cold imbalance advisory. Emits
-            // PolicyCandidate(s) with kind = POLICY_KIND_HOT_COLD; they
-            // ride the same advisory_cache so `client info` renders
-            // them next to SPLIT/MERGE/GC/MAJOR_COMPACT/MINOR_COMPACT/EC.
-            let mut hot_cold = {
-                let mut p = self.policy.borrow_mut();
-                p.compute_hot_cold_advisory(&owners, now)
-            };
-            cands.append(&mut hot_cold);
-            // F202: EC advisory pass. Per-extent, sourced from
-            // `state_snapshot.streams + extents`, not from the
-            // per-partition windowed metrics (EC is not a partition-
-            // level concern). Common-sense filter inside the helper
-            // suppresses extents < `cfg.ec_min_extent_bytes`.
-            let mut ec_adv = {
-                let p = self.policy.borrow();
-                p.compute_ec_advisory(&state_snapshot, now)
-            };
-            cands.append(&mut ec_adv);
-            // Persist the union into the advisory cache so
-            // `MSG_GET_POLICY_CANDIDATES` returns all 7 kinds (split,
-            // merge, gc, major_compact, hot_cold, minor_compact, ec)
-            // in one call.
-            {
-                let mut p = self.policy.borrow_mut();
-                p.advisory_cache = cands.clone();
-                p.advisory_cache_at = now;
-            }
+            // Recompute the full advisory cache for this tick (prune + all five
+            // advisory passes + cache write) under a single policy borrow.
+            let cands = self.recompute_advisory_cache(&state_snapshot, &last_op, &owners, now);
             if !cands.is_empty() {
                 tracing::info!("F183/F187/F202 policy: {} candidate(s)", cands.len());
                 for c in &cands {
@@ -1232,12 +1179,50 @@ impl AutumnManager {
             // surface still depend on them. Keeping the helpers but
             // dropping the in-loop dispatch is the entire point of the
             // mechanism / policy separation.
-            //
-            // Reference: state_snapshot is no longer consumed inside
-            // this tick body; PolicyEngine's compute_*_advisory calls
-            // already captured everything they need.
-            let _ = state_snapshot;
         }
+    }
+
+    /// Recompute the policy advisory cache for one `policy_tick_loop` tick:
+    /// prune stale metrics, run all five advisory passes (split/merge
+    /// candidates, maintenance GC/major+minor-compact, hot/cold, EC), store the
+    /// union into `advisory_cache` (read by `MSG_GET_POLICY_CANDIDATES`), and
+    /// return it for logging. Advisory-only (F203): no etcd write, no
+    /// extent-state mutation, no fencing. All passes run under a SINGLE
+    /// `self.policy` borrow (there is no await), collapsing what were six
+    /// separate borrow scopes in the loop body.
+    fn recompute_advisory_cache(
+        &self,
+        state: &autumn_common::MetadataState,
+        last_op: &HashMap<u64, i64>,
+        owners: &HashMap<u64, u64>,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let mut p = self.policy.borrow_mut();
+        // F210-F3: prune metrics for partitions that no longer exist
+        // (post-split / merge / PS-evict) whose latest bucket has aged past
+        // STALE_METRICS_AGE_SEC — else advisories fire off zombie metrics
+        // indefinitely after a partition is merged away.
+        p.prune_stale_metrics(state, now);
+        let mut cands = p.compute_candidates(crate::policy::ComputeArgs {
+            state,
+            last_op_at: last_op,
+            region_owners: owners,
+            now,
+        });
+        // F187: maintenance (GC + major/minor compact) — windowed metrics only
+        // (`last_gc_at` / `last_compact_at` come from the PS-reported buckets).
+        cands.append(&mut p.compute_maintenance_advisory(now));
+        // F196 Stage D: hot/cold imbalance (kind = POLICY_KIND_HOT_COLD), ridden
+        // on the same advisory_cache for `client info` rendering.
+        cands.append(&mut p.compute_hot_cold_advisory(owners, now));
+        // F202: EC advisory — per-extent, sourced from streams + extents (not
+        // partition-windowed); the helper filters extents < ec_min_extent_bytes.
+        cands.append(&mut p.compute_ec_advisory(state, now));
+        // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 7 kinds
+        // (split, merge, gc, major_compact, hot_cold, minor_compact, ec).
+        p.advisory_cache = cands.clone();
+        p.advisory_cache_at = now;
+        cands
     }
 
     /// F184: auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
