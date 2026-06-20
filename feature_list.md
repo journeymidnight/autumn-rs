@@ -1432,3 +1432,19 @@ gaps in the lease protocol's correctness story.
   fence,flush,compact)2 seed 全过 + accounting errors=0 + memberships>extents(证明 CoW 共享 extent 经新派发路径);(3) coco
   无 P0/P1/P2(仅 1 P3:drain 失败日志 debug→warn,已采纳——持久失败要 prod 可见)。
 - **passes:** completed(纯重构;代码 + 164 lib + 2 chaos + coco[仅 P3 已修])。
+
+## LOOP-CLEANUP-PASS — assess all 9 big background loops, refactor the 3 messy ones (2026-06-20)
+- **目标/边界:** 用户:"检查各个 loop 线代码,如果和上一个(EC dispatch loop)这么乱就一一重构"。对所有 ≥120 行
+  background loop 做 messy-vs-clean-but-long + 重构风险评估(3 个并行 agent 取证),只重构真乱且安全的。
+- **评估结论(9 个大 loop):** 6 个 SKIP——partition_loop(已拆 7 helper,F099-D 热路径)、read_loop(4× "重复"实为
+  per-path cancel/ownership 差异,io_uring+unsafe)、node_health_loop(F222 单 df-caller 不变量,仅 1 处小 dup)、
+  coalescer_loop(durability,note 24 重构曾引 6 bug 已 revert)、background_flush_loop(phase 已抽,claim 不变量易 wedge)、
+  heartbeat_loop(长度是 incident-rationale 注释非死码)。3 个 REFACTOR:
+  - **policy_tick_loop**(commit 16e3af2):6 个 policy-borrow scope 合一 helper recompute_advisory_cache + 删错误的
+    `let _ = state_snapshot`(注释谎称"不再消费",其实被消费)。LOW risk(advisory-only)。164 lib+policy 单测 + coco 绿。
+  - **stream_worker_loop**(commit 0bbb364):~50 行 byte-identical(idle 分支 ≡ select-Left)抽成 apply_stream_submit_msg
+    -> ControlFlow;SQ/CQ select/drain 不动。82 stream 单测(含 pipeline SealCommit/ResetTail 守卫)+ 2 chaos + coco 绿。
+  - **recovery_dispatch_loop**(本次,narrow):删死码 auto_states 快照 + `_is_suspected`/`_is_maintenance`(F211-E 后无用)
+    + 4× dispatch-tail 抽成 dispatch_and_record(保 &Result 透传 = F233 reason 不丢)。**按 agent 建议不做 full phase-split**
+    (limiter-borrow interleaving 比 EC 风险高)。164 lib + 2 recovery-churn chaos + coco 绿。
+- **passes:** completed(3 纯重构全 committed;6 SKIP 有据;每个 = compile + 单测 + 适配 chaos + coco)。

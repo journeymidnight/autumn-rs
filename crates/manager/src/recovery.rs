@@ -460,6 +460,17 @@ impl AutumnManager {
         Ok(())
     }
 
+    /// Dispatch a recovery for `(extent_id, slot → node_id)` and record the
+    /// outcome in the rate limiter (success clears backoff; failure backs off
+    /// `(extent_id, slot)`). Dedups the four byte-identical dispatch tails in
+    /// `recovery_dispatch_loop` (fenced / disk-offline / avali==0 / unhealthy-
+    /// probe). Keeps the `&Result` passthrough so F233's failure reason is never
+    /// dropped (note 30).
+    async fn dispatch_and_record(&self, extent_id: u64, slot: u32, node_id: u64, now_s: i64) {
+        let res = self.dispatch_recovery_task(extent_id, node_id).await;
+        self.record_dispatch_outcome(extent_id, slot, now_s, &res);
+    }
+
     pub(crate) async fn recovery_dispatch_loop(self) {
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
@@ -480,16 +491,12 @@ impl AutumnManager {
             // overrides before the dispatch decision. Cheap.
             self.tick_maintenance_ttl().await;
 
-            // F211-F: snapshot operator overrides + auto-state so the
-            // body's filter is consistent with the policy decision.
+            // F211-F: snapshot operator overrides so the body's fenced-gate
+            // decision is consistent within this tick. (The node auto-state
+            // snapshot was dead — recovery dispatch gates on Fenced only;
+            // Suspected/Maintenance are consulted by the EC dispatch loop, not
+            // here — so it was removed.)
             let overrides = self.node_overrides.borrow().clone();
-            let auto_states: HashMap<u64, crate::node_state::NodeAutoState> = self
-                .node_states
-                .borrow()
-                .snapshot()
-                .into_iter()
-                .map(|(id, st, _)| (id, st))
-                .collect();
             let now_s = Self::epoch_seconds();
 
             // F224: reseed the recovery rate limiter from the inflight
@@ -578,14 +585,6 @@ impl AutumnManager {
                         overrides.get(&node_id).map(|o| o.kind),
                         Some(NODE_OVERRIDE_FENCED)
                     );
-                    let _is_suspected = matches!(
-                        auto_states.get(&node_id).copied(),
-                        Some(crate::node_state::NodeAutoState::Suspected { .. })
-                    );
-                    let _is_maintenance = matches!(
-                        overrides.get(&node_id).map(|o| o.kind),
-                        Some(NODE_OVERRIDE_MAINTENANCE)
-                    );
 
                     // F211-E: under `fenced_only`, the operator must
                     // explicitly fence before we dispatch recovery. The
@@ -600,8 +599,8 @@ impl AutumnManager {
                     // point of fence is to migrate data off). Skip the
                     // disk + probe shortcuts and dispatch immediately.
                     if is_fenced {
-                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
+                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                            .await;
                         continue;
                     }
 
@@ -616,13 +615,8 @@ impl AutumnManager {
                     if let Some(did) = disk_id {
                         if let Some(disk) = disks.get(&did) {
                             if !disk.online {
-                                let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                                self.record_dispatch_outcome(
-                                    ex.extent_id,
-                                    slot as u32,
-                                    now_s,
-                                    &res,
-                                );
+                                self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                                    .await;
                                 continue;
                             }
                         }
@@ -661,8 +655,8 @@ impl AutumnManager {
                                 }
                             }
                         }
-                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
+                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                            .await;
                         continue;
                     }
 
@@ -683,8 +677,8 @@ impl AutumnManager {
                         None => false,
                     };
                     if !healthy {
-                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
+                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                            .await;
                     }
                 }
             }
