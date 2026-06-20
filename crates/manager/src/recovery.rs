@@ -192,8 +192,19 @@ impl AutumnManager {
         // defer the recovery apply. apply_ec_conversion_done would
         // overwrite both ex.replicates (reverting the slot replacement)
         // and ex.eversion (losing the recovery's eversion bump). The
-        // recovery_collect_loop retries on the next 2 s tick after EC
-        // clears. F207-B: reads the unified ledger via `extent_inflight_op`.
+        // Recovery marker is KEPT (we return before any release).
+        // CAVEAT (pre-existing, deferred): under F222 the df handler
+        // mem::take's recovery_done once, so THIS completion is consumed
+        // and NOT re-delivered — the "retry next tick" the old comment
+        // promised does not happen. Convergence is instead via the F208
+        // stale-marker sweep (releases the kept marker, ~10 min ceiling)
+        // followed by recovery_dispatch_loop re-evaluating the now-EC'd
+        // extent's per-slot health and re-recovering any genuinely-missing
+        // shard. A manager-side completion-retry queue would converge
+        // faster but is a new mechanism in a revert-prone path — deferred
+        // until the slow-convergence is reproduced as real harm (F208 +
+        // orphan-reconcile backstop correctness today).
+        // F207-B: reads the unified ledger via `extent_inflight_op`.
         if matches!(
             self.extent_inflight_op(task.extent_id),
             Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
@@ -234,9 +245,29 @@ impl AutumnManager {
             // delete dropped (the backward-compat dual-key path lived in
             // F207-C only).
             if let Some(etcd) = &self.etcd {
-                let _ = etcd
+                // No-swallow: surface the etcd marker-release failure instead
+                // of `let _ =`, but KEEP the original "release in-memory
+                // regardless" behavior (the F209-B design: release now so the
+                // extent isn't blocked, and — in the extent-removed branch —
+                // still run the targeted orphan cleanup below). Only the
+                // swallow is removed. On etcd failure the in-memory marker is
+                // still dropped (next line) and the etcd marker is reclaimed by
+                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
+                // do NOT switch this to `?`: that would skip the in-memory
+                // release + the extent-removed branch's `enqueue_pending_deletes`,
+                // trading a transient-etcd recovery cleanup (already backstopped
+                // by the sweep + node-startup reconcile) for a worse regression.
+                // A proper atomic release-or-retry is a deferred follow-up.
+                if let Err(e) = etcd
                     .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = task.extent_id,
+                        error = %e,
+                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
+                    );
+                }
             }
             self.commit_extent_inflight_release(task.extent_id);
             return Err(AppError::Precondition(format!(
@@ -257,9 +288,29 @@ impl AutumnManager {
         // for that window. Release now, then return.
         if layout_changed.is_none() {
             if let Some(etcd) = &self.etcd {
-                let _ = etcd
+                // No-swallow: surface the etcd marker-release failure instead
+                // of `let _ =`, but KEEP the original "release in-memory
+                // regardless" behavior (the F209-B design: release now so the
+                // extent isn't blocked, and — in the extent-removed branch —
+                // still run the targeted orphan cleanup below). Only the
+                // swallow is removed. On etcd failure the in-memory marker is
+                // still dropped (next line) and the etcd marker is reclaimed by
+                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
+                // do NOT switch this to `?`: that would skip the in-memory
+                // release + the extent-removed branch's `enqueue_pending_deletes`,
+                // trading a transient-etcd recovery cleanup (already backstopped
+                // by the sweep + node-startup reconcile) for a worse regression.
+                // A proper atomic release-or-retry is a deferred follow-up.
+                if let Err(e) = etcd
                     .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = task.extent_id,
+                        error = %e,
+                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
+                    );
+                }
             }
             self.commit_extent_inflight_release(task.extent_id);
             return Err(AppError::Precondition(format!(
@@ -335,9 +386,29 @@ impl AutumnManager {
             // Release Recovery (etcd + in-memory). F207-D removed the
             // legacy-key delete entry.
             if let Some(etcd) = &self.etcd {
-                let _ = etcd
+                // No-swallow: surface the etcd marker-release failure instead
+                // of `let _ =`, but KEEP the original "release in-memory
+                // regardless" behavior (the F209-B design: release now so the
+                // extent isn't blocked, and — in the extent-removed branch —
+                // still run the targeted orphan cleanup below). Only the
+                // swallow is removed. On etcd failure the in-memory marker is
+                // still dropped (next line) and the etcd marker is reclaimed by
+                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
+                // do NOT switch this to `?`: that would skip the in-memory
+                // release + the extent-removed branch's `enqueue_pending_deletes`,
+                // trading a transient-etcd recovery cleanup (already backstopped
+                // by the sweep + node-startup reconcile) for a worse regression.
+                // A proper atomic release-or-retry is a deferred follow-up.
+                if let Err(e) = etcd
                     .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = task.extent_id,
+                        error = %e,
+                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
+                    );
+                }
             }
             self.commit_extent_inflight_release(task.extent_id);
             // Then enqueue Delete (best effort — extent_delete_loop will
@@ -857,7 +928,32 @@ impl crate::AutumnManager {
                 // F222: apply EVERY completed recovery task — the step the
                 // old disk_status_update_loop omitted (it discarded them).
                 for done in df.done_tasks {
-                    let _ = self.apply_recovery_done(done).await;
+                    // No-swallow: never `let _ =` the apply result. A completion
+                    // is delivered exactly once (the EN mem::take's it from
+                    // recovery_done), so on ANY error this completion is gone —
+                    // there is no immediate re-delivery. Convergence for the
+                    // kept-marker cases is via the F208 stale-marker sweep +
+                    // re-dispatch (see the match arms). We surface the error so
+                    // it is never silent; we deliberately do NOT add a
+                    // manager-side completion-retry queue (F208 backstops
+                    // correctness; the slow-convergence harm is bounded and
+                    // unreproduced — a reproduce-first follow-up).
+                    if let Err(e) = self.apply_recovery_done(done).await {
+                        match e {
+                            AppError::Precondition(_) => {
+                                // Benign: stale-discard (layout changed / replace_id
+                                // gone) — marker released, completion correctly
+                                // dropped; OR EC-in-flight defer — marker kept,
+                                // completion dropped (the EN mem::take'd it once),
+                                // convergence via F208 sweep + re-dispatch on the
+                                // EC'd extent. NOT an immediate completion-retry.
+                                tracing::trace!(error = %e, "apply_recovery_done deferred/stale (benign); converges via sweep / re-dispatch");
+                            }
+                            _ => {
+                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained — converges via F208 stale-marker sweep");
+                            }
+                        }
+                    }
                 }
             }
 

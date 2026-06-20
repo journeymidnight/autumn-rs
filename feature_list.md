@@ -1355,3 +1355,25 @@ gaps in the lease protocol's correctness story.
 - **验收标准:** (1) reproduce-first:对抽出方法写单测,先用旧 buggy 体跑出 RED(apply 失败 marker 被误清),再换 fixed 体 GREEN;
   (2) 164 lib 单测 0 回归;(3) EC-heavy chaos(ec,split,merge,gc,kill,fence)≥2 seed 全过 + accounting errors=0;(4) coco findbugs。
 - **passes:** completed(代码 + 2 单测[fail-keeps / success-releases,red→green 已验] + 164 lib + 2 EC-heavy chaos + coco "未发现问题")。
+
+## NO-SWALLOW-AUDIT — 禁止 `let _ =` 隐藏错误 + manager recovery.rs 4 处修复 (2026-06-20, 用户原则)
+- **目标/边界:** 用户定原则"不能用 `let _ =` 隐藏错误"(T1b 即此类)。全仓 3 高危 crate 并行审计 + 修 manager 真问题。
+  记 [[feedback_no_let_underscore_swallow]]。
+- **审计结果:** stream 0 BAD(fsync/save_meta 已 P0-A/B/D fail-closed)、partition-server 0 BAD、manager 4 BAD(均 recovery.rs):
+  - :237/:260/:338 Recovery-marker 释放的 etcd `put_and_delete_txn` 用 `let _ =` 吞错。修(最小忠实):换成
+    `if let Err(e) { warn!() }` 后**仍执行 `commit_extent_inflight_release`**——保留原 F209-B"无论如何释放内存"语义
+    (extent-removed 分支 targeted orphan 清理照跑),只去吞错。etcd 失败时 etcd marker 泄漏由 F208 stale-sweep 回收(~10min)。
+  - :860 `let _ = apply_recovery_done(done)` → 区分良性 Precondition(stale-discard / EC-inflight defer,trace)与真错
+    (etcd/NotLeader,warn);循环逐 completion 继续。
+- **coco 复审(3 轮):** R1 P1=日志文案 "completion will be retried" 不实 → 修文案。R2 P1=我第一版把 :237/:260/:338 改 `?`
+  造成 P2 回归(extent-removed etcd 失败跳过 orphan 清理)+ 放大预存的 EC-defer completion-drop → **改回 log-and-continue**
+  (上方所述);R2 P2 同因,一并消。R3 = 无 P0/P1/P2,仅 2 个 P3 文档/注释准确性(已修:去掉残留"retry next tick"矛盾措辞
+  + 本条目对齐实现)。**核心教训:无吞错修复=换 log 保留原行为,别顺手改 `?`/atomicity(那是 reproduce-first 的另一件事)。**
+- **deferred(诚实记录,reproduce-first):** (1) EC-in-flight defer 的 completion 被 F222 一次性消费后丢弃 → 应做 manager-side
+  completion retry queue 才能不靠 sweep 快速收敛(coco R1/R2 P1,预存非本次引入;F208+reconcile 兜底正确性,未复现真危害);
+  (2) marker-release 的 etcd 失败留 I3 不一致(内存释放/etcd 泄漏)→ 应原子 release-or-retry。两者等复现真危害再修。
+- **验收标准:** (1) 164 manager lib 单测 0 回归(F126/F138/F209 abort-path 全过);(2) recovery-churn chaos
+  (kill,killfence,fence,ec,split,merge,gc)≥2 seed 全过 + accounting errors=0;(3) coco 复审 R3 无 P0/P1/P2。
+- **passes:** completed(代码 + 164 lib + recovery-churn chaos + coco 3 轮收敛到仅 P3 文档,已修)。
+- **deferred(诚实记录):** manager-side completion retry queue(更快收敛,避开 ~10min F208 窗口)— F208 已保证正确性,
+  危害有界未复现,按 reproduce-first 不投机建设。~12 处 OK-BUT-LOG(safe 但静默)留作轻量后续加 log。
