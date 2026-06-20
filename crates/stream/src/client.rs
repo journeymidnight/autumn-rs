@@ -835,6 +835,78 @@ async fn drain_inflight_for_seal(
     }
 }
 
+/// Apply one `StreamSubmitMsg` work item inside `stream_worker_loop`. Returns
+/// `ControlFlow::Break(())` for `Shutdown` (the caller drains inflight + exits),
+/// `Continue(())` otherwise. Extracted because the four work arms (ResetTail /
+/// SeedCursor / SealCommit / Append) were byte-identical between the idle branch
+/// and the `select` Left branch; the SQ/CQ arbitration loop is unchanged.
+async fn apply_stream_submit_msg(
+    state: &mut StreamAppendState,
+    pool: &Rc<ConnPool>,
+    inflight: &mut FuturesUnordered<InflightFut>,
+    msg: StreamSubmitMsg,
+    stream_id: u64,
+    append_timeout: Duration,
+) -> std::ops::ControlFlow<()> {
+    match msg {
+        StreamSubmitMsg::Shutdown => return std::ops::ControlFlow::Break(()),
+        StreamSubmitMsg::ResetTail { tail } => {
+            // Same-extent reload preserves the worker's append-progress state;
+            // different-extent roll resets it. See
+            // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
+            state.apply_reset_tail(tail);
+        }
+        StreamSubmitMsg::SeedCursor { cursor } => {
+            state.commit = cursor;
+            state.lease_cursor = cursor;
+        }
+        StreamSubmitMsg::SealCommit { resp } => {
+            drain_inflight_for_seal(state, inflight).await;
+            // BUG2 trace (opt-in, target `bug2_trace`): the worker's post-drain
+            // `state.commit` IS the authoritative seal length it reports. A
+            // `reported_commit=0` for a `tail_extent` that physically holds acked
+            // data means THIS worker did not own the writes (reset/fresh worker
+            // after invalidate_stream / ResetTail) — the dual-writer under-seal.
+            tracing::info!(
+                target: "bug2_trace",
+                stream_id,
+                reported_commit = state.commit,
+                tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
+                in_flight = state.in_flight,
+                "BUG2 SealCommit reply"
+            );
+            // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside the
+            // commit so the caller can pin the seal to THIS extent.
+            let tail_eid = state
+                .tail
+                .as_ref()
+                .map(|t| t.extent.extent_id)
+                .unwrap_or(0);
+            let _ = resp.send((state.commit, tail_eid));
+            // Freeze the tail until ResetTail so no append lands past the
+            // just-reported seal point (coco P1).
+            state.sealing = true;
+        }
+        StreamSubmitMsg::Append {
+            payload_parts,
+            owner_epoch,
+            ack_tx,
+        } => {
+            launch_append(
+                state,
+                pool,
+                inflight,
+                payload_parts,
+                owner_epoch,
+                ack_tx,
+                append_timeout,
+            )
+            .await;
+        }
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
 async fn stream_worker_loop(
     stream_id: u64,
     mut submit_rx: mpsc::Receiver<StreamSubmitMsg>,
@@ -863,64 +935,22 @@ async fn stream_worker_loop(
         let at_cap = n_inflight >= cap;
 
         if n_inflight == 0 {
-            // Idle: only SQ can progress.
-            match submit_rx.next().await {
-                None => break,
-                Some(StreamSubmitMsg::Shutdown) => break,
-                Some(StreamSubmitMsg::ResetTail { tail }) => {
-                    // Same-extent reload preserves the worker's append-progress
-                    // state; different-extent roll resets it. See
-                    // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
-                    state.apply_reset_tail(tail);
-                }
-                Some(StreamSubmitMsg::SeedCursor { cursor }) => {
-                    state.commit = cursor;
-                    state.lease_cursor = cursor;
-                }
-                Some(StreamSubmitMsg::SealCommit { resp }) => {
-                    drain_inflight_for_seal(&mut state, &mut inflight).await;
-                    // BUG2 trace (opt-in, target `bug2_trace`): the worker's
-                    // post-drain `state.commit` IS the authoritative seal length
-                    // it reports. A `reported_commit=0` for a `tail_extent` that
-                    // physically holds acked data means THIS worker did not own
-                    // the writes (reset/fresh worker after invalidate_stream /
-                    // ResetTail) — the dual-writer under-seal.
-                    tracing::info!(
-                        target: "bug2_trace",
-                        stream_id,
-                        reported_commit = state.commit,
-                        tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
-                        in_flight = state.in_flight,
-                        "BUG2 SealCommit reply"
-                    );
-                    // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside
-                    // the commit so the caller can pin the seal to THIS extent.
-                    let tail_eid = state
-                        .tail
-                        .as_ref()
-                        .map(|t| t.extent.extent_id)
-                        .unwrap_or(0);
-                    let _ = resp.send((state.commit, tail_eid));
-                    // Freeze the tail until ResetTail so no append lands past
-                    // the just-reported seal point (coco P1).
-                    state.sealing = true;
-                }
-                Some(StreamSubmitMsg::Append {
-                    payload_parts,
-                    owner_epoch,
-                    ack_tx,
-                }) => {
-                    launch_append(
-                        &mut state,
-                        &pool,
-                        &mut inflight,
-                        payload_parts,
-                        owner_epoch,
-                        ack_tx,
-                        append_timeout,
-                    )
-                    .await;
-                }
+            // Idle: only SQ can progress. Nothing inflight to drain on exit.
+            let should_break = match submit_rx.next().await {
+                None => true,
+                Some(msg) => apply_stream_submit_msg(
+                    &mut state,
+                    &pool,
+                    &mut inflight,
+                    msg,
+                    stream_id,
+                    append_timeout,
+                )
+                .await
+                .is_break(),
+            };
+            if should_break {
+                break;
             }
             continue;
         }
@@ -943,70 +973,29 @@ async fn stream_worker_loop(
         let cfut = inflight.next();
         futures::pin_mut!(submit_fut);
         match select(submit_fut, Box::pin(cfut)).await {
-            Either::Left((maybe_msg, _cfut_dropped)) => match maybe_msg {
-                None | Some(StreamSubmitMsg::Shutdown) => {
-                    // Drain remaining inflight before exit so callers get
-                    // a final ack (success or connection-closed err).
+            Either::Left((maybe_msg, _cfut_dropped)) => {
+                let should_break = match maybe_msg {
+                    None => true,
+                    Some(msg) => apply_stream_submit_msg(
+                        &mut state,
+                        &pool,
+                        &mut inflight,
+                        msg,
+                        stream_id,
+                        append_timeout,
+                    )
+                    .await
+                    .is_break(),
+                };
+                if should_break {
+                    // Drain remaining inflight before exit so callers get a
+                    // final ack (success or connection-closed err).
                     while let Some(result) = inflight.next().await {
                         apply_completion(&mut state, result);
                     }
                     break;
                 }
-                Some(StreamSubmitMsg::ResetTail { tail }) => {
-                    // Same-extent reload preserves the worker's append-progress
-                    // state; different-extent roll resets it. See
-                    // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
-                    state.apply_reset_tail(tail);
-                }
-                Some(StreamSubmitMsg::SeedCursor { cursor }) => {
-                    state.commit = cursor;
-                    state.lease_cursor = cursor;
-                }
-                Some(StreamSubmitMsg::SealCommit { resp }) => {
-                    drain_inflight_for_seal(&mut state, &mut inflight).await;
-                    // BUG2 trace (opt-in, target `bug2_trace`): the worker's
-                    // post-drain `state.commit` IS the authoritative seal length
-                    // it reports. A `reported_commit=0` for a `tail_extent` that
-                    // physically holds acked data means THIS worker did not own
-                    // the writes (reset/fresh worker after invalidate_stream /
-                    // ResetTail) — the dual-writer under-seal.
-                    tracing::info!(
-                        target: "bug2_trace",
-                        stream_id,
-                        reported_commit = state.commit,
-                        tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
-                        in_flight = state.in_flight,
-                        "BUG2 SealCommit reply"
-                    );
-                    // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside
-                    // the commit so the caller can pin the seal to THIS extent.
-                    let tail_eid = state
-                        .tail
-                        .as_ref()
-                        .map(|t| t.extent.extent_id)
-                        .unwrap_or(0);
-                    let _ = resp.send((state.commit, tail_eid));
-                    // Freeze the tail until ResetTail so no append lands past
-                    // the just-reported seal point (coco P1).
-                    state.sealing = true;
-                }
-                Some(StreamSubmitMsg::Append {
-                    payload_parts,
-                    owner_epoch,
-                    ack_tx,
-                }) => {
-                    launch_append(
-                        &mut state,
-                        &pool,
-                        &mut inflight,
-                        payload_parts,
-                        owner_epoch,
-                        ack_tx,
-                        append_timeout,
-                    )
-                    .await;
-                }
-            },
+            }
             Either::Right((maybe_result, _submit_fut_dropped)) => {
                 if let Some(result) = maybe_result {
                     apply_completion(&mut state, result);
