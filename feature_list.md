@@ -1478,3 +1478,24 @@ gaps in the lease protocol's correctness story.
   copy 出 1 段、reencode 出 3 段);(3) 手动:上传高码率视频 → 每段 content-length < 64MiB;转码中见于
   `/transcoding/` 与前端 Transcoding 面板,完成后入主列表。
 - **passes:** completed(代码 + build/clippy/test 8/8 绿 + ffmpeg 实跑验证;前端面板待用户浏览器实测)。
+
+## CHAOS-INODE-LEASE-FAILLOUD — inode_leases replay fail-loud (2026-06-20, coco round-2 gap, P0)
+- **目标/边界:** 和 coco 讨论(round 2)确认的最高优先级未测 chaos:manager `replay_from_etcd` 对 4 个 sidecar
+  fail-OPEN(warn+skip),其中 **inode_leases(writer lease)= P0 双写风险**。修复 + reproduce-first 测试。
+- **根因:** `inode_leases/<ino>` decode 失败时 warn+continue → 新 leader 无该 writer 记录(且丢 last_version
+  high-water)→ 可对同 inode 授第二 writer,旧 writer 缓存/dirty page 仍活 → 双写损坏。malformed 记录无 TTL 兜底
+  (合法 expired 记录才有)。与 core metadata 的 fail-loud(replay_decode_err)不一致 + 违反 [[feedback_stopworld_restart_primary]]。
+- **修复(精准,非一刀切):** inode_leases decode 失败 → `replay_decode_err`(fail-loud,拒绝 leadership)。
+  coco 同意"只 inode_leases 全局 fail-loud"(无法局部化 + 双写);extent_inflight/node_override 该 per-key quarantine
+  (更大,后续);extentDeleteRetry 保持 warn+skip+metric。coco round-1 又补两点已纳入:**P1** key id 须等于 payload
+  `rec.ino`(install 按 rec.ino,不等会装错 inode + key-inode 无 writer = 双写);**P2** 两阶段(先全量校验进 Vec 再
+  install)使 fail-loud 路径零部分副作用。
+- **验收标准:** (1) reproduce-first:malformed payload → new_with_etcd 返回 Err(red on 旧 warn+skip,green on fix);
+  ino-mismatch → Err;删坏记录后正常起(证明 fail-loud 精准非一刀切);(2) 164 manager lib + 既有 bug_lease/f209
+  lease-replay 测试(合法记录 replay 仍装 writer)全过;(3) coco 复审。
+- **deferred(coco round-2,pre-existing 非本次引入,scope-defer):** (a) replay 非原子——任一 prefix 中途失败留半重放
+  状态(core prefix 同样用 `?`;inode_leases 是 LAST block 故失败点最完整,危害最小);完整修=ReplaySnapshot 两阶段重构
+  整个 replay(大、敏感、revert-prone)。(b) try_become_leader CAS 写 LEADER_KEY(10s lease)后才 replay,replay 失败
+  不 revoke lease → 其它实例等 ~10s——**已是代码内 documented P3**(lib.rs:1538)。两者都 reproduce-first 门槛后再做。
+- **passes:** completed(inode_leases P0;代码 + 2 reproduce 测试 red→green + 164 lib + 既有 lease 测试 + coco 2 轮
+  [round-1 P1/P2 已纳入;round-2 = pre-existing/documented 已论证 scope-defer])。

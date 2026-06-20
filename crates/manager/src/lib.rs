@@ -2146,35 +2146,64 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             }
         }
 
-        // F-ioring-lease-1: install persisted writer leases. Reader
-        // leases are NOT persisted (plan §6.4 — reader subscribe-
-        // reconnect drops every cached version, so losing the reader
-        // set across failover is benign).
+        // F-ioring-lease-1: install persisted writer leases. Reader leases are
+        // NOT persisted (plan §6.4 — reader subscribe-reconnect drops every
+        // cached version, so losing the reader set across failover is benign).
+        //
+        // FAIL-LOUD (chaos-gap round 2, coco P0): an UNDECODABLE persisted
+        // writer lease MUST refuse leadership, never be silently skipped.
+        // A writer lease is the single-writer safety boundary for its inode.
+        // Skipping a malformed one leaves the new leader with no record of that
+        // writer (and no `last_version` high-water), so it would grant a SECOND
+        // writer for the same inode while the old writer's cache / dirty pages
+        // / writeback are still live → double-writer corruption (interleaved
+        // content, version regression, broken invalidation order). Unlike a
+        // legitimately-expired record (which `install_persisted_writer` clamps
+        // to a TTL and the revoke loop later deletes), a skipped malformed
+        // record has NO TTL backstop. So we fail-loud exactly like core
+        // metadata (`replay_decode_err`): refuse to lead rather than serve a
+        // state we cannot prove is single-writer. (extent_inflight / node_override
+        // get per-key quarantine instead — see chaos-gap round 2 — because they
+        // can be localized; a writer lease cannot, so global fail-loud is the
+        // only safe granularity until a per-inode unknown-writer quarantine
+        // exists.)
         {
+            // Two-phase (coco P2): parse + validate EVERY record into a temp Vec
+            // BEFORE touching the registry, so a fail-loud return leaves ZERO
+            // partial in-memory state. (Pre-this-fix the block used warn+continue
+            // and always completed; introducing a mid-loop `?` without two-phase
+            // would let an early valid record install while a later corrupt one
+            // aborts — a stale writer that a subsequent merge-replay never clears.)
+            let mut writers: Vec<autumn_rpc::manager_rpc::MgrInodeLeaseRecord> =
+                Vec::with_capacity(inode_leases_raw.kvs.len());
+            for kv in &inode_leases_raw.kvs {
+                let id = Self::parse_id_from_key(INODE_LEASES_PREFIX, &kv.key).map_err(|e| {
+                    Self::replay_decode_err(format!(
+                        "inode_leases key {}: {e}",
+                        String::from_utf8_lossy(&kv.key)
+                    ))
+                })?;
+                let rec: autumn_rpc::manager_rpc::MgrInodeLeaseRecord =
+                    autumn_rpc::manager_rpc::rkyv_decode(&kv.value).map_err(|e| {
+                        Self::replay_decode_err(format!("inode_leases/{id} payload: {e}"))
+                    })?;
+                // The registry installs by `rec.ino`, NOT the key's id (coco P1):
+                // a key/payload inode mismatch would install the writer under the
+                // wrong inode, leaving the key's inode writer-less → second-writer
+                // hazard. A semantically-corrupt record is as unsafe as an
+                // undecodable one, so it is also fail-loud.
+                if rec.ino != id {
+                    return Err(Self::replay_decode_err(format!(
+                        "inode_leases/{id} payload ino mismatch: rec.ino={}",
+                        rec.ino
+                    )));
+                }
+                writers.push(rec);
+            }
+            // All records valid — now commit to the registry.
             let mut reg = self.inode_leases.borrow_mut();
             let now = Instant::now();
-            for kv in &inode_leases_raw.kvs {
-                let _id = match Self::parse_id_from_key(INODE_LEASES_PREFIX, &kv.key) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "F-ioring-lease-1: replay skipped malformed inode_leases key"
-                        );
-                        continue;
-                    }
-                };
-                let rec: autumn_rpc::manager_rpc::MgrInodeLeaseRecord =
-                    match autumn_rpc::manager_rpc::rkyv_decode(&kv.value) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "F-ioring-lease-1: replay skipped malformed inode_leases payload"
-                            );
-                            continue;
-                        }
-                    };
+            for rec in writers {
                 reg.install_persisted_writer(rec, now);
             }
         }
