@@ -35,7 +35,12 @@ Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC 
   已 P0-A/B/D fail-closed)、partition-server 0 BAD、manager 4 BAD(均 recovery.rs,T1b 同类):
   :860 `let _ = apply_recovery_done`(F222 once-only 恢复完成丢失→槽位卡死节点+marker 卡到 10min sweep);
   :237/:260/:338 `let _ = etcd.put_and_delete_txn(删 marker)`(Recovery marker etcd 泄漏,违反 I3 原子释放)。
-  下一步:逐个读 + 修这 4 个 BAD(+ 视情况给 ~12 OK-BUT-LOG 加 log)。
+  已修(commit ab42dd1)::237/:260/:338 换 `if let Err(e){warn!}` 后保留原"无论如何释放内存"语义(最小忠实,
+  不改控制流);:860 区分良性 Precondition 与真错。coco 3 轮收敛(R2 抓到我误改 `?` 的 P2 回归→改回 log-and-continue;
+  R3 仅 P3 文档已修)。教训:无吞错修复=换 log 别改 `?`/atomicity。2 个 deferred(completion retry queue / 原子 release,
+  reproduce-first)。164 lib + recovery-churn chaos + coco 全过。
+  剩余:~12 OK-BUT-LOG(safe 但静默)留轻量后续;coco 早前 gap 分析的其它项(inode_leases replay 非 fail-loud 等)见
+  feedback_no_let_underscore_swallow / project_chaos_coverage_gaps_20260619。
 
 == GC-RECLAIM-EVICT (DONE + 本次提交) — 关闭 no-refetch 回收 leak ==
   修法:alloc_new_extent 在 authoritative 封存路径 evict 旧 tail 的 extent_info_cache → GC 下次拉权威 sealed 状态回收。
