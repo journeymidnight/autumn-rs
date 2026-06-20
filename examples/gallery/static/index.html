@@ -979,6 +979,17 @@ header .tag {
         </div>
       </div>
 
+      <!-- Transcoding card: in-progress / failed video transcodes. These are
+           held out of /list/ (no HLS playlist yet) and surfaced here instead,
+           polled via /transcoding/ until each one's HLS is ready. -->
+      <div class="card fade-up" id="transcodeCard" hidden>
+        <div class="card-head">
+          <span class="dot"></span> Transcoding
+          <span id="transcodeCount" style="color:var(--text-muted);margin-left:0.4rem"></span>
+        </div>
+        <div class="file-list grid" id="transcodeList"></div>
+      </div>
+
       <!-- Files card -->
       <div class="card fade-up">
         <div class="card-head">
@@ -1053,6 +1064,9 @@ header .tag {
   const progressLabel = $('#progressLabel');
   const fileList = $('#fileList');
   const fileCount = $('#fileCount');
+  const transcodeCard = $('#transcodeCard');
+  const transcodeList = $('#transcodeList');
+  const transcodeCount = $('#transcodeCount');
   const previewArea = $('#previewArea');
   const previewLoader = $('#previewLoader');
   const dlPct = $('#dlPct');
@@ -1315,8 +1329,16 @@ header .tag {
       xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
     }
     xhr.onload = () => {
-      if (xhr.status === 200) onSuccess(xhr.responseText);
-      else onError(xhr.responseText || xhr.statusText);
+      if (xhr.status === 200) {
+        // Video uploads reply with JSON {"name":..,"transcoding":true}; other
+        // files reply with the bare filename. Normalise to the filename.
+        let name = xhr.responseText;
+        try {
+          const j = JSON.parse(xhr.responseText);
+          if (j && typeof j.name === 'string') name = j.name;
+        } catch (_) {}
+        onSuccess(name);
+      } else onError(xhr.responseText || xhr.statusText);
     };
     xhr.onerror = () => onError('network error');
     xhr.open('POST', '/put/', true);
@@ -1346,7 +1368,11 @@ header .tag {
       toast(msg, failed && !completed ? 'error' : 'success');
       // Server records per-put EMA latency/throughput; pull a fresh sample.
       pollMetrics();
-      refreshList(() => { if (firstSuccess) selectFile(firstSuccess); });
+      // A just-uploaded video isn't in /list/ yet (still transcoding) — show it
+      // in the transcoding panel; only auto-select files that actually landed
+      // in the main list.
+      refreshTranscoding();
+      refreshList(() => { if (firstSuccess && files.includes(firstSuccess)) selectFile(firstSuccess); });
     }
 
     function worker() {
@@ -1397,6 +1423,76 @@ header .tag {
     };
     xhr.send();
   }
+
+  // ── Transcoding panel ──
+  // Videos are absent from /list/ until their HLS playlist exists, so an
+  // in-progress (or failed) transcode is surfaced here instead. We poll
+  // /transcoding/ as a whole rather than per-cell: when a name drops out of
+  // the set it finished, so we refresh the main list to reveal the new video.
+  let knownTranscoding = new Set();
+
+  function renderTranscodeCell(item) {
+    const el = document.createElement('div');
+    el.className = 'file-item';
+    el.dataset.name = item.name;
+
+    const thumb = document.createElement('div');
+    thumb.className = 'file-thumb video';
+    if (item.status === 'failed') {
+      thumb.classList.add('failed');
+      thumb.innerHTML = '<span title="transcode failed">&#9888;</span>';
+    } else {
+      thumb.classList.add('transcoding');
+      const label = item.status === 'queued' ? '排队中…' : '转码中…';
+      thumb.innerHTML =
+        '<span class="transcode-spinner"></span>' +
+        '<span class="transcode-label">' + label + '</span>';
+    }
+    el.appendChild(thumb);
+
+    const meta = document.createElement('div');
+    meta.className = 'file-meta';
+    // Only a failed transcode is safe to delete from here — deleting one that's
+    // still running would race the worker. Failed leaves the original in place,
+    // so offer a way to clear it.
+    meta.innerHTML =
+      '<span class="file-name">' + escHtml(item.name) + '</span>' +
+      (item.status === 'failed'
+        ? '<button class="file-del" title="Delete">&times;</button>'
+        : '');
+    el.appendChild(meta);
+    const del = meta.querySelector('.file-del');
+    if (del) del.addEventListener('click', e => { e.stopPropagation(); deleteFile(item.name); });
+    return el;
+  }
+
+  function refreshTranscoding() {
+    fetch('/transcoding/', { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : [])
+      .catch(() => [])
+      .then(items => {
+        if (!Array.isArray(items)) items = [];
+        const names = new Set(items.map(i => i.name));
+        // A name that left the set (and isn't still failed) reached `done`;
+        // pull the main list so the finished video shows up there.
+        let finished = false;
+        knownTranscoding.forEach(n => { if (!names.has(n)) finished = true; });
+        knownTranscoding = names;
+
+        if (!items.length) {
+          transcodeCard.hidden = true;
+          transcodeList.innerHTML = '';
+          transcodeCount.textContent = '';
+        } else {
+          transcodeCard.hidden = false;
+          transcodeCount.textContent = items.length;
+          transcodeList.innerHTML = '';
+          items.forEach(it => transcodeList.appendChild(renderTranscodeCell(it)));
+        }
+        if (finished) refreshList();
+      });
+  }
+  setInterval(refreshTranscoding, 2000);
 
   function renderFileItem(name) {
     const el = document.createElement('div');
@@ -1536,6 +1632,7 @@ header .tag {
         toast('Deleted ' + name, 'success');
         if (activeFile === name) { activeFile = null; showEmpty(); }
         refreshList();
+        refreshTranscoding();
       } else {
         toast('Delete failed: ' + xhr.statusText, 'error');
       }
@@ -2094,6 +2191,7 @@ header .tag {
 
   // ── Init ──
   refreshList();
+  refreshTranscoding();
 })();
 </script>
 </body>

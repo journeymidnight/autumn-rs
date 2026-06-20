@@ -1,7 +1,27 @@
 Date: 2026-06-19
 TaskStatus: completed
-Task scope: FGA-02 — 让 example/gallery 支持 put-stream/get-stream:大视频流式(striped)上传 +
-  get_stream 顺序读回转码源 → 自动 HLS。其余文件类型(图片/PDF/文本)保持内联不变。
+Task scope: FGA-03 — gallery 自适应 HLS 段大小(高码率视频 .ts 不撞 64MB PS inline cap)+ 接上
+  /transcoding/ 前端独立面板(转码中视频不进主 /list/)。详见 feature_list.md FGA-03。
+
+== FGA-03 (DONE, 本次) — 自适应 HLS 段 + 转码中面板 ==
+  根因:transcode 每个 .ts 段 = 单条 inline put 的 KV value,`-hls_time` 写死 20s;高码率源 20s 段 ~106MiB
+    > inline cap 64MiB → put 被 CODE_VALUE_TOO_LARGE 拒 → transcode 永久失败。WARN:
+    `write .hls/…/seg005.ts failed: value 106633036 bytes exceeds … inline cap`。
+  修(examples/gallery/src/main.rs):
+    ① pick_hls_time(ffprobe duration → bytes/sec → seg_secs=48MiB/rate,clamp[2,20]);run_hls_ffmpeg 收 seg_secs
+       参数替换写死的 "20"。普通码率仍满 20s。
+    ② 兜底:copy 后 max_ts_bytes>64MiB(源关键帧比 seg_secs 稀疏时 -c copy 切不动)→ 清产物改 reencode,
+       reencode 加 -force_key_frames expr:gte(t,n_forced*seg_secs) 段边界强插关键帧 → 段可靠受界。
+       与原"copy 失败→reencode"合并进 reencode_reason 分支。
+    ③ HLS 段维持 inline put(未改 striped);视频原件上传仍是 FGA-02 striped,未碰。
+  前端(examples/gallery/static/index.html):新 Transcoding card(空则 hidden),2s 轮询 /transcoding/;name
+    离集合=done→refreshList 刷主列表;failed 留面板带 ⚠+删除。修 uploadOne:视频 /put/ 回 JSON{"name":..},
+    旧码把整段 JSON 当 name;改 parse .name + 只 selectFile 真进 files 的。
+  验证:build 绿 + clippy 0 gallery 警告 + test 8/8(+4 pick_hls_time)+ ffmpeg arg 串实跑(testsrc 复现
+    copy 出 1 段稀疏关键帧、reencode -force_key_frames 出 3 段)。前端面板待用户浏览器实测。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(FGA-02 squash 单 commit 3c3be55):
 
 == FGA-02 (DONE, 本次) — gallery 大视频流式上传 + striped → HLS ==
   改动全在 examples/gallery/src/main.rs + README:

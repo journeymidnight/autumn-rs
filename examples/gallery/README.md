@@ -76,8 +76,16 @@ When a video (`mp4` / `webm` / `ogg` / `mov` / `m4v`) is uploaded:
   - If the source is already compatible with the gallery's MPEG-TS HLS
     output (`h264` video plus copy-safe audio such as `aac` / `mp3` /
     `ac3` / `eac3`), it first tries a lossless `-c copy` passthrough.
-  - Otherwise it falls back to `libx264 / aac, CRF 23, 4-second segments,
-    single bitrate`.
+  - Otherwise it falls back to `libx264 / aac, CRF 23, single bitrate`.
+  - **Segment duration is adaptive, not a fixed 20 s.** Each `.ts` becomes one
+    KV value, so it must stay under the partition server's 64 MiB inline-`put`
+    cap (a fixed 20 s segment on a high-bitrate clip hit ~106 MiB and the
+    upload was rejected with `CODE_VALUE_TOO_LARGE`). The pipeline picks
+    `-hls_time` from the source byte-rate so an average segment targets ~48 MiB
+    (clamped to 2–20 s). `-c copy` can only cut on the source's own keyframes,
+    so if a segment *still* overshoots the cap (sparse keyframes) the pipeline
+    re-encodes with `-force_key_frames` at the segment boundary, which bounds
+    the segment size reliably.
    - Same pass extracts a 0.5 s thumbnail keyframe.
 3. All produced files are written to `.hls/<filename>/...` and
    `.thumb/320/<filename>`.
@@ -90,9 +98,19 @@ Status is exposed at `GET /transcode-status/<filename>`:
 { "status": "queued"  | "transcoding" | "done" | "failed", "error": "…" }
 ```
 
-The frontend polls this once per cell on render, then with 2 / 5 / 10 second
-backoff while in `queued` / `transcoding`. Failed jobs leave the original in
-place so you can re-upload after fixing the issue.
+An in-progress (or failed) video is **not** in `/list/` yet — it has no HLS
+playlist — so it would be invisible in the main grid. Instead the set of
+in-progress transcodes is exposed at `GET /transcoding/`:
+
+```json
+[ { "name": "clip.mp4", "status": "queued" | "transcoding" | "failed" }, … ]
+```
+
+The frontend shows these in a dedicated **Transcoding** card (hidden when
+empty), polling `/transcoding/` every 2 s. When a name drops out of the set it
+finished, so the main file list is refreshed to reveal the new video. Failed
+jobs stay in the card with a ⚠ and a delete button (they leave the original in
+place, so you can clear it or re-upload after fixing the issue).
 
 ## Playback
 
@@ -130,9 +148,19 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
   sleep 1
 done
 
+# 4b. While it's running, the in-progress list surfaces it (the main /list/
+#     does not until the HLS playlist exists)
+curl -sS http://127.0.0.1:5001/transcoding/   # e.g. [{"name":"sample.mp4","status":"transcoding"}]
+
 # 5. Confirm HLS artifacts
 curl -sS http://127.0.0.1:5001/hls/sample.mp4/index.m3u8 | head
 curl -sSI http://127.0.0.1:5001/hls/sample.mp4/seg000.ts | grep -i content-type
+
+# 5b. Every segment must be under the 64 MiB inline cap (adaptive -hls_time).
+#     For a high-bitrate source, segments are shorter than 20 s.
+for seg in $(curl -sS http://127.0.0.1:5001/hls/sample.mp4/index.m3u8 | grep '\.ts$'); do
+  curl -sSI "http://127.0.0.1:5001/hls/sample.mp4/$seg" | grep -i content-length
+done
 
 # 6. Confirm the original was reaped
 curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5001/get/sample.mp4   # expect 404
@@ -141,6 +169,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5001/get/sample.mp4  
 ./cluster.sh stop
 ```
 
-In-browser verification: the file appears with a "转码中…" placeholder while
-ffmpeg runs, swaps to a thumbnail with a play glyph on completion, and plays
+In-browser verification: while ffmpeg runs the video shows in the separate
+**Transcoding** card with a "转码中…" spinner; on completion it leaves that card
+and appears in the main Files grid as a thumbnail with a play glyph, and plays
 in both Chrome (hls.js) and Safari (native HLS).

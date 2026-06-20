@@ -374,11 +374,83 @@ enum HlsEncodeMode {
     Reencode,
 }
 
+// Partition-server inline-`put` cap (mirrors `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT`
+// = 64 MiB). A single KV value over this is rejected with
+// `CODE_VALUE_TOO_LARGE` ("…exceeds the partition server's inline cap"), which
+// is exactly what a fixed-20 s `.ts` segment hit on a high-bitrate source.
+const PS_INLINE_CAP_BYTES: u64 = 64 * 1024 * 1024;
+// Target payload per HLS segment. `-hls_time` is only the *target* duration —
+// `-c copy` cuts on the source's keyframes, so a segment can overshoot to the
+// next keyframe. Aim for 48 MiB (16 MiB of headroom under the cap) and pick the
+// segment seconds from the source byte-rate.
+const HLS_SEGMENT_TARGET_BYTES: f64 = 48.0 * 1024.0 * 1024.0;
+const HLS_TIME_MAX_SECS: f64 = 20.0;
+const HLS_TIME_MIN_SECS: f64 = 2.0;
+
+/// Probe the container duration (seconds) with `ffprobe`. `None` when ffprobe
+/// is missing/errors or the field is absent — the caller then falls back to the
+/// max segment length.
+fn probe_duration_secs(input: &str) -> Option<f64> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let d = String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()?;
+    (d.is_finite() && d > 0.0).then_some(d)
+}
+
+/// Choose `-hls_time` so an average segment lands near
+/// `HLS_SEGMENT_TARGET_BYTES`. Falls back to `HLS_TIME_MAX_SECS` when the
+/// byte-rate is unknown (no duration / empty file), preserving the old 20 s
+/// behaviour for ordinary-bitrate clips.
+fn pick_hls_time(file_bytes: u64, duration_secs: Option<f64>) -> f64 {
+    let dur = match duration_secs {
+        Some(d) => d,
+        None => return HLS_TIME_MAX_SECS,
+    };
+    let bytes_per_sec = file_bytes as f64 / dur;
+    if bytes_per_sec <= 0.0 {
+        return HLS_TIME_MAX_SECS;
+    }
+    (HLS_SEGMENT_TARGET_BYTES / bytes_per_sec).clamp(HLS_TIME_MIN_SECS, HLS_TIME_MAX_SECS)
+}
+
+/// Largest `.ts` segment in `dir` (0 if none). Lets the caller detect a
+/// copy-path segment that still overshot the inline cap because the source's
+/// keyframes are sparser than the requested segment duration.
+fn max_ts_bytes(dir: &std::path::Path) -> u64 {
+    let mut max = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("ts") {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    max = max.max(m.len());
+                }
+            }
+        }
+    }
+    max
+}
+
 fn run_hls_ffmpeg(
     input: &str,
     playlist: &std::path::Path,
     segments: &std::path::Path,
     mode: HlsEncodeMode,
+    seg_secs: f64,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -410,12 +482,29 @@ fn run_hls_ffmpeg(
             cmd.args(["-c:v", "copy", "-c:a", "copy", "-bsf:v", "h264_mp4toannexb"]);
         }
         HlsEncodeMode::Reencode => {
+            // Force a keyframe at every segment boundary so the muxer can cut
+            // exactly on `seg_secs` (the copy path can only cut on the source's
+            // own — possibly sparse — keyframes, which is what lets a segment
+            // overshoot the inline cap). This is what makes the re-encode
+            // fallback reliably produce under-cap segments.
+            let force_kf = format!("expr:gte(t,n_forced*{seg_secs:.3})");
             cmd.args([
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-force_key_frames",
+                force_kf.as_str(),
+                "-c:a",
+                "aac",
+                "-b:a",
                 "128k",
             ]);
         }
     }
+    let hls_time = format!("{seg_secs:.3}");
     let status = cmd
         .args([
             // Paired with `-copyts -start_at_zero` above: don't let the muxer
@@ -425,7 +514,7 @@ fn run_hls_ffmpeg(
             "-muxpreload",
             "0",
             "-hls_time",
-            "20",
+            hls_time.as_str(),
             "-hls_list_size",
             "0",
             "-hls_segment_type",
@@ -474,12 +563,42 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
     let playlist = dir.join("index.m3u8");
     let segments = dir.join("seg%03d.ts");
 
+    // Size each segment from the source byte-rate so no `.ts` exceeds the PS
+    // inline cap (the fixed-20 s default produced a 106 MB segment on a
+    // high-bitrate clip → `put` rejected with `CODE_VALUE_TOO_LARGE`).
+    let file_bytes = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
+    let duration = probe_duration_secs(input_str);
+    let seg_secs = pick_hls_time(file_bytes, duration);
+    tracing::info!(
+        seg_secs,
+        file_mb = file_bytes / (1024 * 1024),
+        duration_secs = duration.unwrap_or(0.0),
+        "transcode: chosen hls segment duration"
+    );
+
     let t1 = Instant::now();
-    if let Err(err) = run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Copy) {
-        tracing::warn!(
-            error = %err,
-            "transcode: hls copy path failed, falling back to re-encode"
-        );
+    // Re-encode when the lossless copy pass fails OR when it produced a segment
+    // that still overshot the inline cap. The latter happens when the source's
+    // keyframes are sparser than `seg_secs` (copy can only cut on a keyframe);
+    // the re-encode pass forces segment-boundary keyframes so it can't recur.
+    let mut reencode_reason: Option<String> = None;
+    if let Err(err) = run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Copy, seg_secs)
+    {
+        reencode_reason = Some(format!("copy path failed: {err}"));
+    } else {
+        let big = max_ts_bytes(dir);
+        if big > PS_INLINE_CAP_BYTES {
+            reencode_reason = Some(format!(
+                "copy produced a {} MiB segment over the {} MiB inline cap (sparse keyframes)",
+                big / (1024 * 1024),
+                PS_INLINE_CAP_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+    if let Some(reason) = reencode_reason {
+        tracing::warn!(reason, "transcode: falling back to hls re-encode");
+        // Wipe the partial/over-cap copy output (segments + playlist); keep the
+        // source so the re-encode pass can read it.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -488,7 +607,7 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
                 }
             }
         }
-        run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Reencode)
+        run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Reencode, seg_secs)
             .context("run ffmpeg hls reencode after copy fallback")?;
     }
     tracing::info!(
@@ -1192,17 +1311,47 @@ async fn list_handler_inner(client: &Client) -> Response<Body> {
                 if s.starts_with(THUMB_PREFIX) || s.starts_with(META_PREFIX) {
                     continue;
                 }
+                // A bare video-ext key is a video original that's still
+                // transcoding (or whose transcode failed): its HLS playlist
+                // isn't present yet, so it doesn't belong in the main list.
+                // Finished videos are surfaced above via their
+                // `.hls/<name>/index.m3u8`; in-progress ones show separately
+                // through the `/transcoding/` endpoint.
+                if is_video_ext(&ext_of(&s)) {
+                    continue;
+                }
                 if seen.insert(s.clone()) {
                     keys.push(s);
                 }
             }
             Response::builder()
                 .header("content-type", "text/plain; charset=utf-8")
+                .header("cache-control", "no-cache")
                 .body(Body::from(keys.join("\n")))
                 .unwrap()
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")),
     }
+}
+
+/// In-progress transcodes (everything in the map that isn't `Done`), as a JSON
+/// array `[{"name":..,"status":"queued|transcoding|failed"}, ...]`. The
+/// frontend renders these in a separate "transcoding" panel (they're hidden
+/// from `/list/` until their HLS is ready) and polls each to completion.
+async fn transcoding_list_handler_inner(transcodes: &TranscodeMap) -> Response<Body> {
+    let items: Vec<String> = transcodes
+        .borrow()
+        .iter()
+        .filter(|(_, s)| !matches!(s, TranscodeStatus::Done))
+        .map(|(name, s)| {
+            format!(
+                r#"{{"name":{},"status":"{}"}}"#,
+                json_string(name),
+                s.as_status_str()
+            )
+        })
+        .collect();
+    json_response(format!("[{}]", items.join(",")))
 }
 
 /// Return a file's metadata as a flat JSON object `{ "<field>": "<value>", ... }`.
@@ -1555,6 +1704,12 @@ async fn main() -> Result<()> {
         })
     });
 
+    let t = SendWrapper::new(transcodes.clone());
+    let transcoding_route = get(move || {
+        let t = t.clone();
+        SendWrapper::new(async move { transcoding_list_handler_inner(&t).await })
+    });
+
     let m = SendWrapper::new(metrics.clone());
     let metrics_route = get(move || {
         let m = m.clone();
@@ -1584,6 +1739,7 @@ async fn main() -> Result<()> {
         .route("/thumb/{name}", thumb_route)
         .route("/hls/{name}/{file}", hls_route)
         .route("/transcode-status/{name}", status_route)
+        .route("/transcoding/", transcoding_route)
         .route("/del/{name}", del_route)
         .route("/list/", list_route)
         .route("/meta/{name}", meta_route)
@@ -1600,7 +1756,51 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_byte_range;
+    use super::{
+        parse_byte_range, pick_hls_time, HLS_SEGMENT_TARGET_BYTES, HLS_TIME_MAX_SECS,
+        HLS_TIME_MIN_SECS, PS_INLINE_CAP_BYTES,
+    };
+
+    #[test]
+    fn hls_time_ordinary_bitrate_keeps_max() {
+        // 100 MiB over 60 s ≈ 1.7 MiB/s → a 20 s segment is ~33 MiB, under the
+        // cap, so keep the full 20 s.
+        let secs = pick_hls_time(100 * 1024 * 1024, Some(60.0));
+        assert_eq!(secs, HLS_TIME_MAX_SECS);
+    }
+
+    #[test]
+    fn hls_time_high_bitrate_shrinks_under_cap() {
+        // The reported failure: ~106 MiB / 20 s ⇒ ~5.3 MiB/s. Reconstruct a
+        // similar rate (1 GiB over 200 s) and confirm the chosen duration keeps
+        // an average segment under the inline cap.
+        let file = 1024u64 * 1024 * 1024;
+        let dur = 200.0;
+        let secs = pick_hls_time(file, Some(dur));
+        assert!(secs < HLS_TIME_MAX_SECS, "expected a reduced duration, got {secs}");
+        assert!(secs >= HLS_TIME_MIN_SECS);
+        let bytes_per_sec = file as f64 / dur;
+        let seg_bytes = secs * bytes_per_sec;
+        // Targets HLS_SEGMENT_TARGET_BYTES and is comfortably below the cap.
+        assert!((seg_bytes - HLS_SEGMENT_TARGET_BYTES).abs() < 1.0);
+        assert!(seg_bytes < PS_INLINE_CAP_BYTES as f64);
+    }
+
+    #[test]
+    fn hls_time_clamps_to_min_for_extreme_bitrate() {
+        // 10 GiB over 30 s is absurdly high; the target duration underflows the
+        // floor, so clamp to the minimum (the re-encode safety net then bounds
+        // the actual segment bytes).
+        let secs = pick_hls_time(10 * 1024 * 1024 * 1024, Some(30.0));
+        assert_eq!(secs, HLS_TIME_MIN_SECS);
+    }
+
+    #[test]
+    fn hls_time_unknown_duration_falls_back_to_max() {
+        assert_eq!(pick_hls_time(500 * 1024 * 1024, None), HLS_TIME_MAX_SECS);
+        // Zero-length / empty file also can't yield a rate → max.
+        assert_eq!(pick_hls_time(0, Some(10.0)), HLS_TIME_MAX_SECS);
+    }
 
     #[test]
     fn parse_open_ended() {

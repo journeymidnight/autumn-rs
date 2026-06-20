@@ -1448,3 +1448,33 @@ gaps in the lease protocol's correctness story.
     + 4× dispatch-tail 抽成 dispatch_and_record(保 &Result 透传 = F233 reason 不丢)。**按 agent 建议不做 full phase-split**
     (limiter-borrow interleaving 比 EC 风险高)。164 lib + 2 recovery-churn chaos + coco 绿。
 - **passes:** completed(3 纯重构全 committed;6 SKIP 有据;每个 = compile + 单测 + 适配 chaos + coco)。
+
+## FGA-03 · gallery 自适应 HLS 段大小(不撞 64MB inline cap)+ 转码中独立面板(2026-06-19)
+- **Trigger / 目标:** 用户上传高码率视频,gallery WARN `write .hls/…/seg005.ts failed: value 106633036 bytes
+  exceeds the partition server's inline cap — use put_stream_begin`。根因:transcode 把每个 HLS `.ts` 段用单条
+  inline `client.put` 写成一个 KV value,而 `-hls_time` 写死 20s;高码率源(~42Mbps)下 20s 段 ≈106MiB >
+  PS inline cap(`AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT`=64MiB)→ `put` 被 `CODE_VALUE_TOO_LARGE` 拒 → transcode
+  永久失败(原件保留但每次重试撞同一面墙)。**用户拍板修法:段大小自适应,而非把段存成 striped**(striped 会让
+  `/hls/` 服务 + 删除都要改;且 106MB 单段对 hls.js 播放体验本身就差)。外加上一轮 diff 的遗留:`/transcoding/`
+  端点已加但前端没接 → 转码中的视频既不在 `/list/` 也无处可见。
+- **设计:**
+  - **自适应 `-hls_time`**(`pick_hls_time`):`ffprobe` 取 duration → `bytes/sec = file_size/duration` →
+    `seg_secs = HLS_SEGMENT_TARGET_BYTES(48MiB)/bytes_per_sec`,clamp `[2, 20]`s。普通码率仍得满 20s(回退值);
+    无 duration / 空文件 → 退回 20s。目标 48MiB 留 16MiB 余量给关键帧对齐溢出。
+  - **再编码兜底**(关键):`-c copy` 只能在源自身关键帧切段,源关键帧比 `seg_secs` 稀疏时段仍可能溢出 cap
+    (已用 6s testsrc 复现:`-hls_time 2` copy 仍出 1 段)。故 copy 后用 `max_ts_bytes(dir)` 检最大 `.ts`,
+    `> 64MiB` 就清掉 copy 产物、改走 reencode,并在 reencode 加 `-force_key_frames expr:gte(t,n_forced*seg_secs)`
+    在段边界强插关键帧 → 段大小可靠受界(testsrc 复现:reencode 出 3 段)。原有"copy 失败→reencode"回退合并进同一
+    `reencode_reason` 分支。
+  - **HLS 段仍走 inline `put`**(未改 striped):自适应 + 兜底已保证段 ≤ cap;`/hls/` 服务 / `cleanup_derived` /
+    `delete_stream` 全不动。视频**原件**上传仍是 striped(FGA-02),本次不碰。
+  - **前端转码中面板:** 新 `Transcoding` card(空则 `hidden`),每 2s 轮询 `/transcoding/`;某 name 离开集合即
+    "done" → `refreshList()` 把成片刷进主列表;failed 留在面板带 ⚠ + 删除按钮。`/list/` 维持不含转码中视频
+    (上轮 diff 已做)。顺带修 `uploadOne`:视频 `/put/` 返回 JSON `{"name":..}` 而非裸文件名,旧码把整段 JSON
+    当 name → `firstSuccess` 是 JSON 串;改为 parse 出 `.name`,且只 `selectFile` 真进了 `files` 的(转码中视频不选)。
+- **验收标准:** (1) `cargo build -p gallery` 绿 + `clippy -p gallery` 0 gallery 警告 + `cargo test -p gallery`
+  8/8(+4 `pick_hls_time`:普通码率保 20s / 高码率缩到目标且 < cap / 极端码率 clamp 到 2s / 无 duration 退 20s);
+  (2) ffmpeg arg 串实跑验证(copy `-hls_time 2.0` + reencode `-force_key_frames` 均被 ffmpeg 接受;testsrc 复现
+  copy 出 1 段、reencode 出 3 段);(3) 手动:上传高码率视频 → 每段 content-length < 64MiB;转码中见于
+  `/transcoding/` 与前端 Transcoding 面板,完成后入主列表。
+- **passes:** completed(代码 + build/clippy/test 8/8 绿 + ffmpeg 实跑验证;前端面板待用户浏览器实测)。
