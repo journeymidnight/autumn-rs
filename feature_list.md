@@ -1499,3 +1499,40 @@ gaps in the lease protocol's correctness story.
   不 revoke lease → 其它实例等 ~10s——**已是代码内 documented P3**(lib.rs:1538)。两者都 reproduce-first 门槛后再做。
 - **passes:** completed(inode_leases P0;代码 + 2 reproduce 测试 red→green + 164 lib + 既有 lease 测试 + coco 2 轮
   [round-1 P1/P2 已纳入;round-2 = pre-existing/documented 已论证 scope-defer])。
+
+## F276 · 读路径主动绕开 Suspected 节点 + EC 主动重建(不等超时)(2026-06-20)
+- **目标/边界:** 用户拍板:节点状态 `Suspected` 时,不光 `alloc_extent`(已做,`select_nodes` 经
+  `online_node_ids` 排除 Suspected)要避开它,**读请求也要路由到别的副本**;EC 情况则**直接从 parity
+  重新计算出数据,不用先读坏分片等 RPC 超时**。范围 = 纯 stream-client 读路径 + 一个客户端侧 suspected 快照;
+  不动 manager 写路径、不加新 wire 类型(复用现有 `MSG_LIST_NODE_STATES`)。
+- **设计决策(用户 2 问已答):** (1) 传播通道 = StreamClient **客户端 poll 现有 RPC**(非折进 ExtentInfo、
+  非复用写路径 bad_nodes);(2) 读语义 = **软降级 + 回退**(suspected 副本排到 try 顺序最后、健康优先,但绝不
+  硬排除——suspected≠死,sealed extent 每副本都有全部已提交字节;视图陈旧/过宽只损延迟不损可用性)。
+- **实现(`crates/stream/src/client.rs`):**
+  - `SuspectedCache{nodes,last_refresh,refreshing}` + `maybe_refresh_suspected()`:读路径(`read_with_layout`
+    入口)触发 **TTL 门控(2s,对齐 df 节奏)+ 非阻塞** 刷新——spawn detached 任务 poll
+    `MSG_LIST_NODE_STATES`(过滤 `NODE_AUTO_STATE_SUSPECTED`)换入快照;当前读用现有(略陈旧)快照,从不等
+    manager RTT。idle StreamClient 不 poll(只在真有读时触发)。poll 失败保留旧快照(失败的 poll 绝不扩大
+    避让集 → 不会 strand 读)。
+  - 纯函数 `replicated_read_order(ex,offset,suspected)`:折叠 F258 rotated start + avali 资格(self-heal I2)
+    + suspected-to-back。空 suspected 集 = 逐字节等同 pre-F276 rotated 走法(热路径不变)。
+    `read_replicated_with_failover` 用它建 try 顺序;hedge 改用 `order[0]/order[1]`(两个健康-优先槽位)。
+  - `ec_subrange_read`:命中数据分片的 node 若 Suspected,**不发**该分片直接读,直接进 `needs_reconstruct`
+    → 现有 `ec_reconstruct_shard_subrange`(读 K 个健康分片 + parity,first-K-wins)立即重算,避免 `join_all`
+    卡在坏分片的 5s 超时上。空快照 = 每分片照常直读(pre-F276)。`ec_reconstruct_shard_subrange` 不改(first-K-
+    wins 本就不等死分片)。
+  - **三条 VP 读路径全覆盖(coco 抓到 v1 只改了 copy path = [[project_vp_read_paths_fragmented]] 陷阱):**
+    ① copy/chunked = `read_replicated_with_failover`;② ZC value 代理 = `read_value_into_pooled`(PS 端 GET
+    快路径,同 `replicated_read_order` 顺序——in-order 读取,排序即可绕开);③ client-direct descriptor =
+    `extent_read_descriptor` 用新 helper `healthy_eligible_slots` **剔除**(非排序)Suspected 地址——外部 SDK
+    自己按 hash 选起点轮转(`crates/client/src/lib.rs`),排序无效,只能剔除;全 Suspected 时保留全部(不 strand)。
+- **验收标准:** (1) `cargo build -p autumn-stream` 绿 + 0 新增 clippy(残留 `offset as u64` 同型 cast 均
+  pre-existing);(2) `cargo test -p autumn-stream --lib` 90/90 绿,含 `f276_suspected_read_tests` 8 个纯函数
+  测试(node_ids 映射 / 空快照保序 / suspected 移到末尾 / 全 suspected 不 strand / avali 隔离槽永不读 / sealed
+  rotated-first suspected 末位 / healthy_eligible 剔除+回退 / healthy_eligible 叠加 avali 隔离);(3) coco review。
+- **passes:** completed(代码 + 90 lib 绿 + 8 新单测)。**coco findbugs deep(GPT-5.5)2 轮**:第 1 轮 2 P2 =
+  VP-读三路径分叉(只改了 copy path,ZC 代理 `read_value_into_pooled` + client-direct `extent_read_descriptor`
+  漏了)——已全修复(见上③ + ZC 路径)。第 2 轮验证 1 P2 = 非阻塞设计下 idle client 首读仍用旧空快照(只损一次
+  首读 timeout,之后自愈)——非 bug,**按文档准确性修复**(README/注释/CLAUDE 改为"稳态自愈、非每读保证";
+  保留非阻塞设计:同步首刷会把 manager RTT 压上读热路径、idle 周期 poll 是刻意避免的 per-partition 流量)。
+  首轮 coco 后端不可达(infra/auth),重跑通过。

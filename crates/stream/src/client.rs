@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -206,6 +206,85 @@ pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
         elig
     }
 }
+
+/// F276: `replicates ++ parity` node ids in slot order — the SAME order that
+/// `replica_addrs_from_cache` resolves addresses in, so a read slot index maps
+/// back to its `node_id` (needed to consult the Suspected snapshot).
+pub(crate) fn replica_node_ids(ex: &ExtentInfo) -> Vec<u64> {
+    ex.replicates.iter().chain(ex.parity.iter()).copied().collect()
+}
+
+/// F276: slot try-order for a REPLICATED read. Starts from the F258 rotated
+/// start, keeps only `avali`-eligible slots, and moves slots whose node the
+/// manager currently believes `Suspected` to the BACK — healthy replicas are
+/// tried first so a flaky node never costs a per-read RPC timeout before
+/// failover. The suspected slots are KEPT (appended, not dropped): a
+/// suspected node is not dead, and every committed byte of a sealed extent is
+/// on every replica, so they remain a correct last-resort. With an empty
+/// `suspected` set (the common case) the result is byte-identical to the
+/// pre-F276 rotated order, so the hot path is unchanged.
+pub(crate) fn replicated_read_order(
+    ex: &ExtentInfo,
+    offset: u64,
+    suspected: &HashSet<u64>,
+) -> Vec<usize> {
+    let n = ex.replicates.len() + ex.parity.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let start = if ex.sealed {
+        rotated_replica_start(ex.extent_id, offset, n)
+    } else {
+        0
+    };
+    let eligible = eligible_replica_slots(ex);
+    let filtered = eligible.len() < n;
+    let node_ids = replica_node_ids(ex);
+    let mut healthy: Vec<usize> = Vec::with_capacity(eligible.len());
+    let mut flaky: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let slot = (start + i) % n;
+        if filtered && !eligible.contains(&slot) {
+            continue; // isolated (avali=0) replica — never serve from it
+        }
+        let nid = node_ids.get(slot).copied().unwrap_or(0);
+        if suspected.contains(&nid) {
+            flaky.push(slot);
+        } else {
+            healthy.push(slot);
+        }
+    }
+    healthy.extend(flaky);
+    healthy
+}
+
+/// F276: eligible replica slots with manager-`Suspected` nodes DROPPED — but
+/// only when at least one healthy eligible slot remains (else fall back to ALL
+/// eligible, never strand). Used by the CLIENT-DIRECT descriptor path
+/// (`extent_read_descriptor`), whose external consumer picks its OWN
+/// hash-rotated start over the returned address list — so merely reordering
+/// (as `replicated_read_order` does for the in-order paths) would NOT route
+/// around a flaky node; the suspected address has to be excluded outright.
+/// Soft hint with the same fallback guarantee: an empty Suspected snapshot
+/// returns exactly `eligible_replica_slots`.
+pub(crate) fn healthy_eligible_slots(ex: &ExtentInfo, suspected: &HashSet<u64>) -> Vec<usize> {
+    let eligible = eligible_replica_slots(ex);
+    if suspected.is_empty() {
+        return eligible;
+    }
+    let node_ids = replica_node_ids(ex);
+    let healthy: Vec<usize> = eligible
+        .iter()
+        .copied()
+        .filter(|&s| !suspected.contains(&node_ids.get(s).copied().unwrap_or(0)))
+        .collect();
+    if healthy.is_empty() {
+        eligible
+    } else {
+        healthy
+    }
+}
+
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
@@ -1401,6 +1480,11 @@ pub struct StreamClient {
     /// clone cheap).
     config: Rc<StreamClientConfig>,
     append_metrics: StreamAppendMetrics,
+    /// F276: lazily-refreshed snapshot of manager-`Suspected` node ids. The
+    /// READ path consults it to route around a flaky node proactively (no
+    /// per-read RPC timeout) and to reconstruct EC shards from parity instead
+    /// of reading a suspected shard. Soft hint only — see `SuspectedCache`.
+    suspected: Rc<RefCell<SuspectedCache>>,
 }
 
 /// F192: payload of one failure-observation event passed from a
@@ -1410,6 +1494,25 @@ struct FailureReport {
     node_id: u64,
     extent_id: u64,
 }
+
+/// F276: client-side snapshot of the manager's `Suspected` node set, consumed
+/// by the READ path. Refreshed lazily + NON-BLOCKING off the read path
+/// (`maybe_refresh_suspected`): the read never waits on a manager RTT, it just
+/// uses the latest snapshot (stale by at most `SUSPECTED_REFRESH_TTL`). This is
+/// a pure soft hint — correctness NEVER depends on it (suspected replicas are
+/// deprioritized, not excluded; EC reads reconstruct from parity). So a stale
+/// or empty snapshot only costs latency on a genuinely-flaky node, never data.
+#[derive(Default)]
+struct SuspectedCache {
+    nodes: HashSet<u64>,
+    last_refresh: Option<Instant>,
+    refreshing: bool,
+}
+
+/// F276: how stale the Suspected snapshot may get before the read path kicks
+/// off a background refresh. 2 s matches the manager's df probe cadence; the
+/// `Suspected` soft-timeout is ~10 s, so a 2 s-stale view is plenty fresh.
+const SUSPECTED_REFRESH_TTL: Duration = Duration::from_secs(2);
 
 impl StreamClient {
     /// Current manager address (round-robin index).
@@ -1660,6 +1763,7 @@ impl StreamClient {
             reporter_part_id: Cell::new(0),
             config,
             append_metrics: StreamAppendMetrics::default(),
+            suspected: Rc::new(RefCell::new(SuspectedCache::default())),
         });
         // F192: spawn the drainer task on the current compio runtime.
         // The Weak<Self> exits the loop when StreamClient is dropped.
@@ -1715,6 +1819,82 @@ impl StreamClient {
                 .insert(id, (node.address, node.shard_ports));
         }
         Ok(())
+    }
+
+    /// F276: cheap, synchronous "does the manager currently believe this node
+    /// Suspected?" read off the cached snapshot. Same-thread `RefCell` borrow,
+    /// no await, no alloc.
+    fn is_node_suspected(&self, node_id: u64) -> bool {
+        self.suspected.borrow().nodes.contains(&node_id)
+    }
+
+    /// F276: kick a NON-BLOCKING refresh of the Suspected snapshot if it's
+    /// older than `SUSPECTED_REFRESH_TTL` and none is already in flight. The
+    /// caller (read path) does NOT await this — it spawns a detached task that
+    /// polls `MSG_LIST_NODE_STATES` and swaps the snapshot in. The current read
+    /// proceeds on the existing (slightly stale) snapshot. Idle StreamClients
+    /// never poll: the refresh only fires while reads are actually happening.
+    ///
+    /// CONSEQUENCE (by design): the avoidance is STEADY-STATE / self-healing,
+    /// not a per-read guarantee. The FIRST read after a node flips to Suspected
+    /// (e.g. on a previously-idle client whose snapshot is still empty) only
+    /// *kicks* this refresh — it uses the old snapshot and can still pay one
+    /// timeout if it lands on the flaky node. Every read after the ~2 s refresh
+    /// routes around it. We accept this over a synchronous first-refresh (which
+    /// would put a manager RTT on the read's critical path) or idle background
+    /// polling (the per-partition manager traffic we deliberately avoid). It
+    /// never regresses the pre-F276 reactive failover.
+    fn maybe_refresh_suspected(&self) {
+        {
+            let c = self.suspected.borrow();
+            if c.refreshing {
+                return;
+            }
+            if let Some(t) = c.last_refresh {
+                if t.elapsed() < SUSPECTED_REFRESH_TTL {
+                    return;
+                }
+            }
+        }
+        let Some(sc) = self.self_weak.upgrade() else {
+            return;
+        };
+        sc.suspected.borrow_mut().refreshing = true;
+        compio::runtime::spawn(async move {
+            let res = sc.fetch_suspected_nodes().await;
+            let mut c = sc.suspected.borrow_mut();
+            c.refreshing = false;
+            c.last_refresh = Some(Instant::now());
+            // On error keep the previous snapshot — a failed poll must never
+            // widen the avoidance set (that could strand reads); stale is fine.
+            if let Ok(set) = res {
+                c.nodes = set;
+            }
+        })
+        .detach();
+    }
+
+    /// F276: one `MSG_LIST_NODE_STATES` poll → the set of node ids the manager
+    /// currently marks `Suspected`. Rotates managers on transport / NotLeader
+    /// failure like every other StreamClient manager call.
+    async fn fetch_suspected_nodes(&self) -> Result<HashSet<u64>> {
+        // 5 s — read-only manager call over in-memory state (matches
+        // refresh_nodes_map). The handler ignores the request payload.
+        let resp_data = self
+            .manager_call(MSG_LIST_NODE_STATES, Bytes::new(), Duration::from_secs(5))
+            .await?;
+        let resp: ListNodeStatesResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
+        if resp.code != CODE_OK {
+            return Err(anyhow!("list_node_states failed: {}", resp.message));
+        }
+        Ok(resp
+            .nodes
+            .iter()
+            .filter(|n| n.auto_state == NODE_AUTO_STATE_SUSPECTED)
+            .map(|n| n.node_id)
+            .collect())
     }
 
     fn replica_addrs_from_cache(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
@@ -3043,6 +3223,12 @@ impl StreamClient {
         if length == 0 {
             return Ok(None);
         }
+        // F276: this ZC value fast path is a READ path too — refresh the
+        // Suspected snapshot (TTL-gated, non-blocking) so it routes around a
+        // flaky node like the copy path, not just the avali-isolated ones
+        // (coco P2: without this the hot GET still hit slot 0 first and paid
+        // the 3 s timeout on a Suspected EN — the VP-read-paths-fragmented trap).
+        self.maybe_refresh_suspected();
         let ex = self.fetch_extent_info(extent_id).await?;
         // EC / chunked / stale-VP-offset → let the copy path handle it.
         if ex.ec_converted
@@ -3052,13 +3238,19 @@ impl StreamClient {
             return Ok(None);
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        // WAL self-heal A1: skip isolated (avali=0) slots on a sealed replicated
-        // extent — exactly like the copy path's `read_replicated_with_failover`.
-        // Without this, the ZC value fast path reads slot 0 first and a
-        // bit-rotted-but-isolated replica returns CODE_OK with corrupt bytes
-        // (no per-VP CRC on this path), so a GET after self-heal would still
-        // serve the bad bytes (the I2 invariant; e2e-caught 2026-06-14).
-        for &slot in &eligible_replica_slots(&ex) {
+        // WAL self-heal A1 + F276: serve only avali-eligible slots, healthy
+        // (non-Suspected) replicas FIRST, rotated start — exactly the copy
+        // path's `replicated_read_order`. avali isolation: a bit-rotted-but-
+        // isolated replica returns CODE_OK with corrupt bytes (no per-VP CRC on
+        // this path), so it must never be read (I2 invariant; e2e 2026-06-14).
+        // Suspected-to-back: a flaky node is tried last so the common case
+        // doesn't pay its timeout. With an empty snapshot this is the prior
+        // eligible-slot order (plus F258 rotation, matching the copy path).
+        let order = {
+            let c = self.suspected.borrow();
+            replicated_read_order(&ex, offset, &c.nodes)
+        };
+        for &slot in &order {
             let addr = &addrs[slot];
             let req = ReadBytesReq {
                 extent_id,
@@ -3114,6 +3306,10 @@ impl StreamClient {
         length: u64,
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u64)> {
+        // F276: refresh the Suspected snapshot in the background (TTL-gated,
+        // non-blocking) so the replica-routing + EC-reconstruct decisions
+        // below see a ~2 s-fresh view of which nodes are flaky.
+        self.maybe_refresh_suspected();
         // F210-H1: mirror the F204 `StaleVpOffset` sentinel for the
         // replicated path. Pre-F210-H1 only `ec_slice_decoded` produced
         // it; a VP read on a sealed replicated extent whose offset was
@@ -3192,6 +3388,11 @@ impl StreamClient {
     /// response so the client can read value bytes straight from an EN
     /// without a manager round-trip of its own.
     pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<(u64, Vec<String>)> {
+        // F276: the external client picks its OWN hash-rotated start over the
+        // returned addrs (crates/client/src/lib.rs), so reordering can't route
+        // around a flaky node — a Suspected address must be EXCLUDED outright
+        // (coco P2). Refresh the snapshot here too (this is a read path).
+        self.maybe_refresh_suspected();
         let ex = self.fetch_extent_info(extent_id).await?;
         // coco P1 (F259): an EC-converted extent holds RS shards, not the
         // full payload — a single-EN raw read would hand the client shard
@@ -3204,14 +3405,17 @@ impl StreamClient {
             ));
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        // WAL self-heal A1: hand the client only ELIGIBLE replicas — an
-        // isolated (avali=0) bit-rotted slot must not be a client-direct read
-        // target either (same I2 invariant as the ZC + copy paths; the client
-        // reads these addrs in order with no per-VP CRC).
-        let filtered: Vec<String> = eligible_replica_slots(&ex)
-            .into_iter()
-            .map(|s| addrs[s].clone())
-            .collect();
+        // WAL self-heal A1 + F276: hand the client only avali-ELIGIBLE replicas
+        // (an isolated bit-rotted slot must not be a client-direct read target
+        // — same I2 invariant as the ZC + copy paths, no per-VP CRC here) AND
+        // drop manager-Suspected replicas (the client hash-rotates, so excluding
+        // is the only effective route-around). `healthy_eligible_slots` keeps
+        // ALL eligible when every one is Suspected — never strand the read.
+        let slots = {
+            let c = self.suspected.borrow();
+            healthy_eligible_slots(&ex, &c.nodes)
+        };
+        let filtered: Vec<String> = slots.into_iter().map(|s| addrs[s].clone()).collect();
         Ok((ex.eversion, filtered))
     }
 
@@ -3249,16 +3453,16 @@ impl StreamClient {
         let addrs = self.replica_addrs_for_extent(ex).await?;
         let n = addrs.len();
         let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
-        let start = if ex.sealed {
-            rotated_replica_start(ex.extent_id, offset, n)
-        } else {
-            0
-        };
 
-        // A1 (self-heal I2): drop avali-isolated slots from the read set on a
-        // sealed replicated extent. In the common case nothing is isolated
-        // (`eligible.len() == n`) and the hot path is unchanged; only when a
-        // slot is actually isolated do we skip the hedge + the bad slot.
+        // A1 (self-heal I2): avali-isolated slots are dropped from the read set
+        // on a sealed replicated extent. F276: among the eligible slots, the
+        // ones whose node the manager believes Suspected are moved to the BACK
+        // so a flaky replica never costs a per-read RPC timeout before failover
+        // — soft hint, they remain a last-resort fallback (suspected != dead,
+        // and every committed byte is on every replica). `replicated_read_order`
+        // folds all three: rotated start, avali eligibility, suspected-to-back.
+        // With an empty Suspected snapshot the order is the pre-F276 rotated
+        // walk, so the hot path is unchanged.
         let eligible = eligible_replica_slots(ex);
         let filtered = eligible.len() < n;
         if filtered {
@@ -3269,10 +3473,22 @@ impl StreamClient {
                 "read: serving from avali-eligible replicas only (some slot isolated)"
             );
         }
+        let order = {
+            let c = self.suspected.borrow();
+            replicated_read_order(ex, offset, &c.nodes)
+        };
+        if order.is_empty() {
+            return Err(last_err);
+        }
 
         let mut from = 0usize;
-        if !filtered && read_hedge_ms() > 0 && ex.sealed && n > 1 {
-            match self.read_hedged_pair(&addrs, start, ex, offset, length).await {
+        // Hedge the two LEADING (healthy-first) slots. Disabled when a slot is
+        // avali-isolated (filtered), same as pre-F276.
+        if !filtered && read_hedge_ms() > 0 && ex.sealed && order.len() > 1 {
+            match self
+                .read_hedged_pair(&addrs, order[0], order[1], ex, offset, length)
+                .await
+            {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     if is_eversion_stale(&e) {
@@ -3282,14 +3498,10 @@ impl StreamClient {
                     self.extent_info_cache.remove(&ex.extent_id);
                 }
             }
-            from = 2; // hedge already consumed rotated replicas 0 and 1
+            from = 2; // hedge already consumed order[0] and order[1]
         }
 
-        for i in from..n {
-            let slot = (start + i) % n;
-            if filtered && !eligible.contains(&slot) {
-                continue; // isolated (avali=0) replica — never serve from it
-            }
+        for &slot in &order[from..] {
             let addr = &addrs[slot];
             match self
                 .read_shard_from_addr(addr, ex.extent_id, ex.eversion, offset, length)
@@ -3325,15 +3537,18 @@ impl StreamClient {
     async fn read_hedged_pair(
         &self,
         addrs: &[String],
-        start: usize,
+        s0: usize,
+        s1: usize,
         ex: &ExtentInfo,
         offset: u64,
         length: u64,
     ) -> Result<(Vec<u8>, u64)> {
         use futures::future::{select, Either};
         let n = addrs.len();
-        let a0 = addrs[start % n].clone();
-        let a1 = addrs[(start + 1) % n].clone();
+        // F276: `s0`/`s1` are the two LEADING slots of the suspected-aware read
+        // order (healthy-first), not necessarily `start`/`start+1`.
+        let a0 = addrs[s0 % n].clone();
+        let a1 = addrs[s1 % n].clone();
         let Some(sc) = self.self_weak.upgrade() else {
             // Client is shutting down — plain single read, no hedge.
             return self
@@ -3677,29 +3892,51 @@ impl StreamClient {
             shard_plan.push((shard_idx, sh_off, sh_len));
         }
 
-        // Parallel scatter. `read_shard_from_addr` borrows `&self`,
-        // which is fine because all futures share the same self
-        // borrow that outlives this `await`.
-        let read_futs: Vec<_> = shard_plan
+        // F276: a data shard whose node the manager believes Suspected is
+        // reconstructed from parity IMMEDIATELY — its direct shard read is NOT
+        // issued, so the `join_all` below never blocks on a flaky node's full
+        // RPC timeout before reconstruction starts (the user's "EC → 直接重新
+        // 计算, 不用等请求超时"). Soft hint: if reconstruction can't gather K
+        // healthy shards it still launches to every peer
+        // (`ec_reconstruct_shard_subrange` races first-K-wins), so a mistaken
+        // Suspected mark only costs a little extra parity traffic, never
+        // correctness. With an empty snapshot every shard is read directly =
+        // pre-F276 behavior.
+        let node_ids = replica_node_ids(ex);
+        let mut plan_results: Vec<Option<Vec<u8>>> = vec![None; shard_plan.len()];
+        let mut needs_reconstruct: Vec<usize> = Vec::new();
+        let mut to_read: Vec<usize> = Vec::with_capacity(shard_plan.len());
+        for (i, &(shard_idx, _, _)) in shard_plan.iter().enumerate() {
+            let nid = node_ids.get(shard_idx).copied().unwrap_or(0);
+            if self.is_node_suspected(nid) {
+                needs_reconstruct.push(i);
+            } else {
+                to_read.push(i);
+            }
+        }
+
+        // Parallel scatter over the non-suspected shards only.
+        // `read_shard_from_addr` borrows `&self`, which is fine because all
+        // futures share the same self borrow that outlives this `await`.
+        let read_futs: Vec<_> = to_read
             .iter()
-            .map(|&(shard_idx, sh_off, sh_len)| {
+            .map(|&i| {
+                let (shard_idx, sh_off, sh_len) = shard_plan[i];
                 let addr = &addrs[shard_idx];
                 self.read_shard_from_addr(addr, extent_id, ex.eversion, sh_off, sh_len)
             })
             .collect();
         let results = futures::future::join_all(read_futs).await;
 
-        // F200: per-plan-entry results. Failed entries get reconstructed
-        // via sub-range RS in a second pass — DO NOT fall back to
-        // `ec_read_full_and_slice` (which would read 4 × full-shard
-        // payloads to decode the whole extent just to slice out the
-        // requested sub-range). The amplification triggered macOS-side
-        // df-probe timeouts under heavy GC fanout, flapping disks
-        // offline (see F200 entry in feature_list.md).
-        let mut plan_results: Vec<Option<Vec<u8>>> = vec![None; shard_plan.len()];
-        let mut needs_reconstruct: Vec<usize> = Vec::new();
+        // F200: failed (or F276 suspected-skipped) entries get reconstructed
+        // via sub-range RS in the pass below — DO NOT fall back to
+        // `ec_read_full_and_slice` (which would read 4 × full-shard payloads to
+        // decode the whole extent just to slice out the requested sub-range).
+        // The amplification triggered macOS-side df-probe timeouts under heavy
+        // GC fanout, flapping disks offline (see F200 entry in feature_list.md).
         let mut last_end: u64 = 0;
-        for (i, r) in results.into_iter().enumerate() {
+        for (k, r) in results.into_iter().enumerate() {
+            let i = to_read[k];
             match r {
                 Ok((bytes, end_val)) => {
                     let want = shard_plan[i].2 as usize;
@@ -4487,6 +4724,122 @@ mod selfheal_avali_filter_tests {
         // Defensive: a sealed extent with EVERY avali bit clear shouldn't
         // happen (seal sets all_bits); never refuse all reads — fall back.
         assert_eq!(eligible_replica_slots(&ext(true, 3, 0)), vec![0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod f276_suspected_read_tests {
+    //! F276: the READ path routes around manager-`Suspected` nodes. Replicated
+    //! reads deprioritize suspected slots to the BACK (healthy-first, never
+    //! dropped); EC reads reconstruct a suspected data shard from parity
+    //! instead of issuing a doomed direct read. These cover the pure decision
+    //! fn `replicated_read_order` + the `replicas ++ parity` slot→node mapping.
+    use super::{
+        healthy_eligible_slots, replica_node_ids, replicated_read_order, rotated_replica_start,
+    };
+    use crate::extent_rpc::ExtentInfo;
+    use std::collections::HashSet;
+
+    fn ext(replicates: Vec<u64>, parity: Vec<u64>, sealed: bool, avali: u32) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: 42,
+            replicates,
+            parity,
+            sealed,
+            avali,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replica_node_ids_is_replicates_then_parity() {
+        let ex = ext(vec![10, 20, 30], vec![40], false, 0);
+        assert_eq!(replica_node_ids(&ex), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn empty_suspected_preserves_rotated_order() {
+        // Common case: an empty Suspected snapshot must reproduce the pre-F276
+        // rotated order exactly (open extent → start 0 → 0,1,2).
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let empty = HashSet::new();
+        assert_eq!(replicated_read_order(&ex, 0, &empty), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn suspected_slot_moves_to_back_preserving_order() {
+        // node 20 (slot 1) suspected → tried last: [0, 2, 1].
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [20].into_iter().collect();
+        assert_eq!(replicated_read_order(&ex, 0, &s), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn all_suspected_still_returns_every_slot() {
+        // Soft hint: never strand a read. Every node suspected → the full set
+        // is still returned (all in the flaky tail), so a stale/over-broad
+        // snapshot degrades latency, never availability.
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [10, 20, 30].into_iter().collect();
+        let order = replicated_read_order(&ex, 0, &s);
+        assert_eq!(order.len(), 3);
+        let set: HashSet<usize> = order.into_iter().collect();
+        assert_eq!(set, [0, 1, 2].into_iter().collect::<HashSet<usize>>());
+    }
+
+    #[test]
+    fn avali_isolated_slot_dropped_then_suspected_ordered() {
+        // Sealed extent, slot 1 avali bit clear → excluded entirely (self-heal
+        // I2), independent of Suspected. Remaining eligible slots {0,2}.
+        let ex = ext(vec![10, 20, 30], vec![], true, 0b101);
+        let empty = HashSet::new();
+        let order = replicated_read_order(&ex, 0, &empty);
+        let set: HashSet<usize> = order.iter().copied().collect();
+        assert_eq!(set, [0, 2].into_iter().collect::<HashSet<usize>>());
+        assert!(!order.contains(&1), "avali-isolated slot must never be read");
+    }
+
+    #[test]
+    fn healthy_eligible_drops_suspected_with_fallback() {
+        // Client-direct path: a Suspected node is EXCLUDED (the client rotates,
+        // so ordering wouldn't route around it).
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [20].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &s), vec![0, 2]);
+        // Empty snapshot → exactly eligible_replica_slots (no behavior change).
+        assert_eq!(
+            healthy_eligible_slots(&ex, &HashSet::new()),
+            vec![0, 1, 2]
+        );
+        // ALL eligible Suspected → fall back to all (never strand the read).
+        let all: HashSet<u64> = [10, 20, 30].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &all), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn healthy_eligible_respects_avali_isolation() {
+        // Sealed, slot 1 avali bit clear → excluded by avali; node 10 (slot 0)
+        // Suspected → excluded by F276; only slot 2 left.
+        let ex = ext(vec![10, 20, 30], vec![], true, 0b101);
+        let s: HashSet<u64> = [10].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &s), vec![2]);
+    }
+
+    #[test]
+    fn suspected_rotated_first_slot_tried_last_on_sealed() {
+        // Sealed extent, all avali set: whichever slot the F258 rotation would
+        // start on, if its node is Suspected it must end up LAST.
+        let ex = ext(vec![10, 20, 30], vec![40], true, 0b1111);
+        let start = rotated_replica_start(ex.extent_id, 0, 4);
+        let node_ids = replica_node_ids(&ex);
+        let s: HashSet<u64> = [node_ids[start]].into_iter().collect();
+        let order = replicated_read_order(&ex, 0, &s);
+        assert_eq!(order.len(), 4);
+        assert_eq!(
+            *order.last().unwrap(),
+            start,
+            "suspected rotated-first slot must be tried last"
+        );
     }
 }
 

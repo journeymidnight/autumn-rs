@@ -226,6 +226,34 @@ was wired only into the copy read path, so the two VP-value fast paths
 still served the bit-rotted-but-isolated replica — now both filter
 `eligible_replica_slots`.
 
+### Read route-around for Suspected nodes (F276)
+
+When the manager marks an EN **Suspected** (df heartbeats lapsed past the soft
+timeout, ~10 s), the READ path proactively avoids it — not just allocation. For
+**replicated** extents the client tries healthy replicas first and only falls
+back to the suspected one if every healthy replica fails (suspected ≠ dead, and a
+sealed extent's committed bytes are on every replica). For **EC** extents a
+suspected data shard is reconstructed straight from parity (read K healthy shards
++ parity) instead of issuing a doomed shard read and waiting for it to time out.
+This is a soft latency optimization layered on the existing failover — correctness
+never depends on it, so a stale view only costs a little extra latency/parity
+traffic, never data.
+
+No new config or wire types: the client polls the existing
+`autumn-op list-node-states` data (`MSG_LIST_NODE_STATES`) in the background,
+TTL-gated at 2 s and never on the read's critical path. Because the refresh is
+non-blocking, the avoidance is a **steady-state, self-healing** optimization, not
+a per-read guarantee: the very first read after a node flips to `Suspected` (e.g.
+on a previously-idle client) uses the current snapshot and only *kicks* the
+refresh, so that one read can still pay a single timeout if it lands on the flaky
+node — every read after the ~2 s refresh routes around it. This never regresses
+the pre-F276 reactive failover; it just removes the repeated per-read timeout
+under sustained load. **Manual check:** on a 3-EN replicated cluster, `kill` one
+EN; after the manager flips it to `Suspected` (`autumn-op info` /
+`list-node-states`) and a couple seconds of read traffic, `get` of keys whose
+extent has a replica on the dead node is served by a healthy replica instead of
+stalling for the per-RPC timeout on every read.
+
 ## CLI cheatsheet
 
 ```bash

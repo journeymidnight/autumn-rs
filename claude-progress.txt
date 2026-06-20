@@ -1,3 +1,32 @@
+Date: 2026-06-20
+TaskStatus: completed
+Task scope: F276 — 读路径主动绕开 Suspected 节点 + EC 主动重建(不等超时)。
+Current summary: alloc_extent 早已排除 Suspected(select_nodes/online_node_ids);本任务把同样的避让
+  扩到 READ 路径(此前读侧对 node 状态零感知,只在 RPC 失败后才 failover,坏节点每读吃一个超时;EC 更糟,
+  先读坏分片等失败再重建)。实现全在 crates/stream/src/client.rs:
+    ① SuspectedCache + maybe_refresh_suspected():读入口(read_with_layout)触发 TTL(2s)门控 + 非阻塞
+       后台 poll 现有 MSG_LIST_NODE_STATES(滤 NODE_AUTO_STATE_SUSPECTED),当前读用略陈旧快照、绝不等
+       manager RTT;idle 不 poll;poll 失败保留旧快照(不扩大避让集 → 不 strand 读)。
+    ② 纯函数 replicated_read_order():F258 rotated start + avali 资格 + suspected-to-back(软降级,健康
+       优先,suspected 副本保留为末位回退;空快照 = 逐字节等同 pre-F276 热路径不变)。hedge 改用两个
+       健康-优先槽位。
+    ③ ec_subrange_read:命中数据分片的 node 若 Suspected,直接进 needs_reconstruct(不发该分片读),
+       现有 ec_reconstruct_shard_subrange(K 健康分片+parity,first-K-wins)立即重算 → 不卡 join_all 5s
+       超时。ec_reconstruct_shard_subrange 不改(first-K-wins 本就不等死分片)。
+    ④ 三条 VP 读路径全覆盖(coco 抓到 v1 只改 copy path):ZC 代理 read_value_into_pooled 用同序;
+       client-direct extent_read_descriptor 用新 helper healthy_eligible_slots 剔除 Suspected(外部 SDK
+       hash 轮转,排序无效)。= [[project_vp_read_paths_fragmented]] 陷阱。
+  设计经用户 2 问确认:传播=客户端 poll 现有 RPC;读语义=软降级+回退。
+Main gaps: 无 wire 变更、无新 CLI/config;纯 client-side 软提示,correctness 不依赖它。
+Next steps: coco findbugs deep 已重跑通过(GPT-5.5,2 P2 全修)。已 commit(solo-flow),**未 push,等用户拍板**。
+  可选后续:cluster 实测 kill-node 后读不停顿(README 已给手动步骤);把 Fenced/Maintenance override 也纳入
+  读侧避让(本次只按用户原话做 Suspected)。
+验收: cargo build -p autumn-stream 绿 + 0 新增 clippy(残留同型 cast 均 pre-existing);
+  cargo test -p autumn-stream --lib 90/90 含 f276_suspected_read_tests 8 个纯函数测试;
+  coco findbugs deep(GPT-5.5)2 P2(VP 三路径分叉)已全修。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(FGA-03):
 Date: 2026-06-19
 TaskStatus: completed
 Task scope: FGA-03 — gallery 自适应 HLS 段大小(高码率视频 .ts 不撞 64MB PS inline cap)+ 接上

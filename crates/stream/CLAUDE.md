@@ -1381,6 +1381,71 @@ sufficient (and cheaper than DashMap).
     owns its own `DiskFS` copy). In-process tests accumulate inert extra
     slots — harmless, render is binary-only.
 
+27. **F276 read-path Suspected avoidance (replicated route-around + EC proactive
+    reconstruct).** `alloc_extent` already excludes manager-`Suspected` nodes
+    (`select_nodes` via `online_node_ids`); F276 extends the SAME avoidance to
+    the READ path, which was previously blind to node status (it only REACTED to
+    an RPC failure — paying a per-read timeout when rotation/`replica[0]` landed
+    on a flaky node, and on EC waiting for a doomed shard read to fail before
+    reconstructing). Mechanism:
+    - **Client-side snapshot, not new wire.** `StreamClient.suspected:
+      Rc<RefCell<SuspectedCache>>` is refreshed by `maybe_refresh_suspected()`
+      (called at the `read_with_layout` entry): TTL-gated (2 s, matches df
+      cadence) + NON-BLOCKING — it spawns a detached task that polls the
+      EXISTING `MSG_LIST_NODE_STATES` (filter `NODE_AUTO_STATE_SUSPECTED`) and
+      swaps the set in; the current read proceeds on the slightly-stale snapshot
+      and NEVER awaits a manager RTT. Idle clients don't poll (fires only while
+      reads happen). A failed poll keeps the prior snapshot — a failed refresh
+      must never WIDEN the avoidance set (that could strand reads).
+    - **Replicated = soft deprioritize (never exclude).** Pure fn
+      `replicated_read_order(ex, offset, suspected)` folds F258 rotated start +
+      `avali` eligibility (self-heal I2) + Suspected-to-BACK. Healthy replicas
+      are tried first; suspected slots are KEPT as a last-resort tail (suspected
+      ≠ dead, and a sealed extent's committed bytes are on EVERY replica). The
+      hedge races `order[0]/order[1]` (the two healthy-first slots).
+      **Invariant: an empty Suspected snapshot reproduces the pre-F276 rotated
+      walk byte-for-byte — the hot path is unchanged.**
+    - **EC = proactive reconstruct (the "不等超时").** In `ec_subrange_read`, a
+      data shard whose node is Suspected is NOT read directly — it goes straight
+      into `needs_reconstruct`, so the `join_all` of direct shard reads never
+      blocks on a flaky node's 5 s timeout before `ec_reconstruct_shard_subrange`
+      (read K healthy shards + parity, first-K-wins) rebuilds it.
+      `ec_reconstruct_shard_subrange` itself is UNCHANGED — first-K-wins already
+      never waits on a dead peer.
+    - **ALL THREE VP read paths covered (the fragmentation trap).** Per
+      `[[project_vp_read_paths_fragmented]]`, a read-side policy must touch the
+      copy path AND both ZC fast paths, or a hot GET silently bypasses it (coco
+      caught the v1 commit covering only the copy path):
+      - copy / chunked — `read_replicated_with_failover` (order above);
+      - ZC value proxy — `read_value_into_pooled` (PS-side GET fast path) — same
+        `replicated_read_order` (reads in-order, returns first OK, so ordering
+        routes around the flaky node);
+      - client-direct descriptor — `extent_read_descriptor` (F259) uses
+        `healthy_eligible_slots` to **DROP** Suspected addresses (NOT reorder):
+        the external SDK picks its own hash-rotated start over the returned list
+        (`crates/client/src/lib.rs`), so ordering wouldn't help — exclusion is
+        the only effective route-around. Keeps ALL eligible when every one is
+        Suspected (never strands).
+    - **Steady-state, not per-read (non-blocking design consequence).** The
+      refresh is fire-and-forget, so the FIRST read after a node flips to
+      Suspected (e.g. an idle client with an empty snapshot) only *kicks* the
+      poll — it uses the old snapshot and can still pay one timeout if it lands
+      on the flaky node; every read after the ~2 s refresh avoids it. This is
+      deliberate: a synchronous first-refresh would put a manager RTT on the
+      read's critical path, and idle background polling is the per-partition
+      manager traffic we avoid. It never regresses the pre-F276 reactive
+      failover — so the README acceptance is "after a couple seconds of read
+      traffic", not "every single read incl. the first" (coco verify-pass P2,
+      resolved as a doc-accuracy fix, design kept).
+    - **Soft hint, correctness-independent.** A stale / over-broad snapshot only
+      costs a little extra latency or parity traffic, never data: replicated
+      reads still fall back to suspected replicas; EC reconstruction falls back
+      to launching every peer if it can't gather K healthy shards. Tests:
+      `client::f276_suspected_read_tests` (6 pure-fn cases incl. all-suspected
+      never strands + avali-isolated never served). Cross-ref: F258 (rotation +
+      hedge), self-heal `eligible_replica_slots` (avali I2), F190 `bad_nodes`
+      (write-path client-learned health — distinct, alloc-only, per-stream).
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)
