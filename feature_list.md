@@ -1377,3 +1377,46 @@ gaps in the lease protocol's correctness story.
 - **passes:** completed(代码 + 164 lib + recovery-churn chaos + coco 3 轮收敛到仅 P3 文档,已修)。
 - **deferred(诚实记录):** manager-side completion retry queue(更快收敛,避开 ~10min F208 窗口)— F208 已保证正确性,
   危害有界未复现,按 reproduce-first 不投机建设。~12 处 OK-BUT-LOG(safe 但静默)留作轻量后续加 log。
+
+## FGA-02 · gallery 大视频流式上传 + striped → HLS(2026-06-19)
+- **目标/边界:** 用户:"让 example/gallery 支持 put-stream / get-stream,可以上传大视频,然后再
+  transcode 自动转成 HLS"。旧 `/put/` 走 `field.bytes()` 把整文件读进内存再 `put` 成单个 KV value
+  → 大视频 OOM + 撞单 value/单 extent 上限。改用 F186 client 流式 API(`put_stream_begin`/`get_stream`/
+  `delete_stream`),仅对**视频**(按 ext)走 striped;图片/PDF/文本保持内联(它们要靠 `/get/` 的
+  `get_range` 做 byte-range)。HLS 转码流程本就存在,本次只补"能把大源文件存进去 + 顺序读回"这一环。
+- **设计:**
+  - 去掉 gallery 冗余的 `Rc<Mutex<ClusterClient>>` → `Rc<ClusterClient>`(client 本就为 Rc 共享并发设计,
+    全 `&self` + RefCell 借用不跨 await)。**去锁是前提**:`PutStreamHandle<'a>` 借 `&ClusterClient`,
+    要在"读浏览器 socket→发 chunk"全程持有它,有外层锁会把其他请求串行堵在慢上传后面。
+  - `/put/` 按 `is_video_ext` 分流:视频 → 先 `cleanup_derived`+`delete_stream` 清旧件,再 `stream_upload()`
+    (`put_stream_begin` → 网络小块攒满 `STRIPE_CHUNK_SIZE`=4MiB 就 `send` → `commit`;出错 `abort`);常驻
+    内存 O(4MiB)、value 无单条上限。非视频 → 原样内联 `put` + meta + thumb 失效。
+  - `download_to_file`(转码源,只被视频转码任务调用)`head`+`get_range` → `get_stream`+`next_chunk` 顺序写
+    临时文件(striped 的 `head` 只返回 28B meta,`get_range` 读的是 meta 字节)。
+  - 删原件(转码完 + `/del/`)`delete` → `delete_stream`(级联删 chunk+meta;inline 退化为普通 delete)。
+  - 全表扫(`/list/` + 启动恢复)用 `is_chunk_key()` 跳过 SDK 的 `\xff\xfe…` chunk 命名空间,否则 chunk key
+    会冒充文件出现在列表。body 上限 1GB → 64GiB(流式内存有界,上限只防病态输入)。
+  - **`/get/{name}` 维持 inline-only(head+get_range)** — 用户拍板。前端视频一律走 HLS、从不 `/get/` 原件,
+    且原件转码后即删;`make_chunk_key`/`StripeMeta` 是 client 的 `pub(crate)`,gallery 无法对 striped 值随机
+    seek,故不在 `/get/` 支持 striped(只会在转码窗口被直接 curl 时返回 28B meta,前端不触发)。
+- **验收标准:** (1) `cargo build -p gallery` 绿 + `clippy -p gallery` 0 gallery 警告 + `cargo test -p gallery`
+  4/4(parse_byte_range 回归);(2) 手动:`cluster.sh start 3` + 跑 gallery,上传大视频 → `/transcode-status`
+  flip 到 done → `/hls/<name>/index.m3u8` 有播放列表 + seg → `/get/<name>` 404(原件已 `delete_stream`);
+  `/list/` 不含 `\xff\xfe` chunk key。
+- **播放修复(2026-06-19,用户报 leeesovle-cat.mp4 看不了;Chrome 不行 / Safari 行):** 两个真 bug,均与
+  storage 无关(ffprobe 证明 18 段连续全 200、有 ENDLIST、源被 ffmpeg 干净解析 → 条带往返字节精确):
+  1. **前端播放器选择写反(Chrome 头号根因)**:`attachHls` 先判 `video.canPlayType('application/vnd.apple.mpegurl')`,
+     而 Chrome 149 对此返回 **"maybe"**(真值)却**不能真正原生解 .m3u8** → 走 `video.src=m3u8`、readyState=4、
+     无 error、currentTime 卡 0 = "看不了";Safari 原生 HLS 是真的所以能播。修:`attachHls` **先 `Hls.isSupported()`
+     用 hls.js,原生仅作 Safari 回退**(标准用法)。用户 Chrome 实测:补丁后走 hls.js、currentTime 推进、seek 150/
+     350s OK。**这是 Chrome 全部视频都播不了的头号原因。**
+  2. **HLS 首帧 PTS≠0(transcode copy 路缺口)**:源 MP4 带 edit-list/起始偏移,`-c copy` 原样保留 → 首段从 1.4s
+     起 → 播放器在 0 处无媒体易卡。修:`run_hls_ffmpeg` 加 `-copyts -start_at_zero`(input)+ `-muxdelay 0
+     -muxpreload 0`(output),copy/reencode 两路都加。实测:`make_zero` 单独无效(只移负);本组合→首帧
+     keyframe@PTS0、从 0 可解码;已 0 起始源不回归。存量文件已就地重 mux 修(源已 reap)。
+  - **缓存:全部 `no-cache`(用户最终决定 — 这是测试程序):** re-transcode/re-upload 复用同名 URL
+    (`index.m3u8`/`segNNN.ts`/`.thumb/...`),长 max-age 会服旧内容。期间试过 mtime→ETag 条件 GET(commit 一度做
+    过,已弃),但用户拍板**测试程序直接全部 no-cache**:`index_handler` / `/get/` / `/hls/` / `/thumb/` 全部
+    `cache-control: no-cache`(JSON 端点本就 `no-store`)。每次都拉最新,永不服旧;perf 对测试程序无所谓。
+- **passes:** completed(代码 + build/clippy/test 绿 + 用户 Chrome/Safari 实测通过;gallery 全部 squash 成单 commit,
+  缓存策略 = 全 no-cache)。

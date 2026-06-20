@@ -25,10 +25,10 @@ if your cluster runs elsewhere.
 
 `GET /get/{name}` parses RFC 7233 byte ranges (`bytes=N-`, `bytes=N-M`,
 `bytes=-N`) and streams the response in 4 MiB chunks back to the client.
-ffmpeg's HTTP demuxer always opens with `Range: bytes=0-`, so chunked
-streaming keeps memory and time-to-first-byte O(chunk) regardless of
-upload size — important for the HLS transcode pipeline below, which reads
-each source MP4 over `http://127.0.0.1:5001/get/...`.
+`/get/` serves the **inline** uploads (images / PDFs / text); chunked
+streaming keeps resident memory O(chunk) regardless of file size. Videos are
+not served here — they're stored striped and the transcoder reads the source
+back over the SDK's `get_stream` (see "Large Videos" / "Video Pipeline").
 
 ## Storage Layout
 
@@ -36,21 +36,42 @@ Files live in the cluster's KV store under these key conventions:
 
 | Key pattern | Holds |
 |---|---|
-| `<filename>` | Original image / PDF / text upload (and a *transient* video original — see below) |
+| `<filename>` | Original image / PDF / text upload (inline value); for a *transient* video original, the 28-byte stripe-meta blob — see below |
+| `\xff\xfe…` (reserved) | Striped video chunks (`autumn-client` F186 `put_stream` namespace; one 4 MiB chunk per key) |
 | `.thumb/320/<filename>` | Cached 320 px-wide JPEG thumbnail |
 | `.hls/<filename>/index.m3u8` | HLS playlist for a transcoded video |
 | `.hls/<filename>/seg000.ts` … | HLS media segments |
 
-Thumbnails and HLS segments are served by dedicated routes
-(`/thumb/<name>`, `/hls/<name>/<segment>`) and hidden from `/list/`.
+Thumbnails, HLS segments, and the reserved stripe-chunk namespace are hidden
+from `/list/`; thumbnails/HLS are served by dedicated routes (`/thumb/<name>`,
+`/hls/<name>/<segment>`).
+
+## Large Videos: Streaming (striped) Upload
+
+Images, PDFs, and text are small, so they're stored as a single inline KV
+value and byte-range-served via `/get/`. **Videos** are different: they can be
+arbitrarily large and are never range-served (the frontend plays them through
+HLS), so the upload handler detects them by extension and streams them with
+`autumn-client`'s F186 striped API:
+
+- `put_stream_begin` opens a handle; the multipart field's network-sized
+  chunks are coalesced into 4 MiB (`STRIPE_CHUNK_SIZE`) pieces and `send`-ed
+  one at a time, then `commit` writes the meta blob (the atomic
+  linearisation point). Resident memory stays O(chunk) and no single KV value
+  has to hold the whole file — that's what makes multi-GiB videos uploadable.
+- The transcoder reads the source back with `get_stream` + `next_chunk`
+  (sequential — exactly the full-file access a transcode download needs).
+- Deleting a video uses `delete_stream`, which cascades through the striped
+  chunks plus the meta blob.
 
 ## Video Pipeline
 
 When a video (`mp4` / `webm` / `ogg` / `mov` / `m4v`) is uploaded:
 
-1. The original bytes are written to `<filename>` so ffmpeg can range-read
-   them via the gallery's own `/get/` route.
-2. A background `compio::runtime::spawn` task kicks off ffmpeg in
+1. The original bytes are streamed into a striped value (see "Large Videos"
+   above) keyed by `<filename>` — bounded memory, no single-value ceiling.
+2. A background `compio::runtime::spawn` task downloads the source to a temp
+   file with `get_stream` + `next_chunk`, then kicks off ffmpeg in
    `spawn_blocking`:
   - If the source is already compatible with the gallery's MPEG-TS HLS
     output (`h264` video plus copy-safe audio such as `aac` / `mp3` /
@@ -60,7 +81,8 @@ When a video (`mp4` / `webm` / `ogg` / `mov` / `m4v`) is uploaded:
    - Same pass extracts a 0.5 s thumbnail keyframe.
 3. All produced files are written to `.hls/<filename>/...` and
    `.thumb/320/<filename>`.
-4. The original `<filename>` key is deleted to reclaim space.
+4. The original is reaped with `delete_stream` (striped chunks + meta blob)
+   to reclaim space.
 
 Status is exposed at `GET /transcode-status/<filename>`:
 

@@ -1,6 +1,39 @@
 Date: 2026-06-19
 TaskStatus: completed
-Task scope: /loop chaos 测试。本会话三项全部修复 + 提交:BUG #1(GC stale-cache fast-punch,数据丢失)、
+Task scope: FGA-02 — 让 example/gallery 支持 put-stream/get-stream:大视频流式(striped)上传 +
+  get_stream 顺序读回转码源 → 自动 HLS。其余文件类型(图片/PDF/文本)保持内联不变。
+
+== FGA-02 (DONE, 本次) — gallery 大视频流式上传 + striped → HLS ==
+  改动全在 examples/gallery/src/main.rs + README:
+  ① 去 gallery 冗余 Rc<Mutex<ClusterClient>> → Rc<ClusterClient>(client 本就为 Rc 共享并发设计;29 处
+     .lock().await 机械去掉)。去锁是前提:PutStreamHandle 借 &ClusterClient 要在"读浏览器 socket→发 chunk"
+     全程持有,有外层锁会串行堵住其他请求。
+  ② /put/ 按 is_video_ext 分流:视频 → cleanup_derived+delete_stream 清旧件 → stream_upload()
+     (put_stream_begin → 网络小块攒满 4MiB(STRIPE_CHUNK_SIZE)就 send → commit;错则 abort);内存 O(4MiB)、
+     value 无单条上限。非视频 → 原样内联 put + meta + thumb 失效。
+  ③ download_to_file(转码源,只被视频转码调用)head+get_range → get_stream+next_chunk 顺序写临时文件
+     (striped 的 head 只返回 28B meta)。
+  ④ 删原件(转码完 + /del/)delete → delete_stream(级联删 chunk+meta;inline 退化普通 delete)。
+  ⑤ 全表扫(/list/ + 启动恢复)用 is_chunk_key() 跳过 SDK 的 \xff\xfe… chunk 命名空间;body 上限 1GB→64GiB。
+  ⑥ /get/ 维持 inline-only(head+get_range)—— 用户拍板。前端视频走 HLS、从不 /get/ 原件,原件转码后即删;
+     make_chunk_key/StripeMeta 是 client pub(crate),gallery 无法对 striped 随机 seek。
+  验证:cargo build -p gallery 绿;clippy -p gallery 0 gallery 警告;cargo test -p gallery 4/4。
+  播放修复(用户报 leeesovle-cat.mp4 看不了;Chrome 不行 / Safari 行)—— 两个真 bug,均与 storage 无关
+  (ffprobe 证明 18 段连续全 200、有 ENDLIST、源被 ffmpeg 干净解析→往返字节精确):
+  ① 前端播放器选择写反(Chrome 头号根因):attachHls 先判 canPlayType('application/vnd.apple.mpegurl'),Chrome 149
+     对此返回 "maybe"(真值)但不能真正原生解 .m3u8 → 走 video.src=m3u8、readyState=4、无 error、currentTime 卡 0
+     = 看不了;Safari 原生 HLS 是真的所以能播。修 index.html attachHls:先 Hls.isSupported() 用 hls.js,原生仅作
+     Safari 回退。用户 Chrome 实测:补丁后走 hls.js、currentTime 推进、seek 150/350s OK。Chrome 全部视频头号原因。
+  ② HLS 首帧 PTS≠0(transcode copy 路缺口):源 MP4 edit-list 偏移被 -c copy 保留 → 首段从 1.4s 起 → 播放器 0 处无
+     媒体易卡。修 run_hls_ffmpeg 加 -copyts -start_at_zero(input)+ -muxdelay 0 -muxpreload 0(output)两路都加。
+     实测:make_zero 单独无效;本组合→首帧 keyframe@PTS0、0 起始源不回归。存量文件已就地重 mux 修。
+  ③ 缓存(用户最终决定 — 测试程序):re-transcode/re-upload 复用同名 URL,长 max-age 会服旧。中途试过 mtime→ETag
+     条件 GET(commit 一度做过,已弃)。用户拍板"测试程序直接全部 no-cache":index/get/hls/thumb 全部
+     cache-control: no-cache(JSON 端点本就 no-store)。永不服旧。整个 gallery 改动 squash 成单 commit、force-push。
+  待办(交给用户):重启 gallery(重建后的二进制)即可在 Chrome 播放;README live e2e。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(committed 7d9dd02 等): /loop chaos 测试。三项修复 + 提交:BUG #1(GC stale-cache fast-punch,数据丢失)、
   BUG #2(seal-and-roll 重试不幂等 → split-child-open wedge)、GC-回收-leak(coco 在 BUG#1 提的 P1,本次关闭)。
   代码 + 单测 + 加压 chaos(含多配置 soak)+ coco 全绿。
 

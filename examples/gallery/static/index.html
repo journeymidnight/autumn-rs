@@ -1126,10 +1126,13 @@ header .tag {
   function attachHls(videoEl, name) {
     detachHls(videoEl);
     const url = hlsUrl(name);
-    if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-      videoEl.src = url;                 // Safari native HLS
-      return;
-    }
+    // Prefer hls.js (MSE) whenever it's available. Chrome reports
+    // canPlayType('application/vnd.apple.mpegurl') === "maybe" but CANNOT
+    // actually demux an .m3u8 natively: setting video.src leaves the element
+    // at readyState 4 / currentTime 0, frozen, with no error — i.e. the video
+    // silently never plays. Native HLS is only correct on browsers that lack
+    // MSE/hls.js (Safari, where Hls.isSupported() is false but native HLS is
+    // real), so test Hls.isSupported() FIRST and fall back to native after.
     if (window.Hls && Hls.isSupported()) {
       const hls = new Hls({ enableWorker: true });
       hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -1141,9 +1144,13 @@ header .tag {
       hls.loadSource(url);
       hls.attachMedia(videoEl);
       videoEl.__hls = hls;
-    } else {
-      videoEl.src = url;                 // last-ditch fallback
+      return;
     }
+    if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+      videoEl.src = url;                 // Safari native HLS
+      return;
+    }
+    videoEl.src = url;                   // last-ditch fallback
   }
 
   function detachHls(videoEl) {
