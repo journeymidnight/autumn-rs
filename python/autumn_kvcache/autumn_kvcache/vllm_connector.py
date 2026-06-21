@@ -292,11 +292,23 @@ def _byte_view(t: "torch.Tensor"):
 class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
     """vLLM `KVConnectorV1` backed by autumn-rs partition layer (Phase 3a)."""
 
-    def __init__(self, vllm_config: Any, role: Any):
+    def __init__(self, vllm_config: Any, role: Any, kv_cache_config: Any = None):
+        # External V1 KV connectors take `kv_cache_config` as a 3rd ctor arg
+        # and MUST forward it to super().__init__() (vLLM >= 0.10-ish enforces
+        # this with a pydantic validation error); older vLLM used the 2-arg
+        # form. Accept both — pass the 3rd arg when present, fall back to the
+        # 2-arg shape on TypeError — so the adapter tracks the pinned vLLM
+        # without a hard version floor (F250-D reconciliation).
         if _VLLM_AVAILABLE:
-            super().__init__(vllm_config=vllm_config, role=role)
+            try:
+                super().__init__(
+                    vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
+                )
+            except TypeError:
+                super().__init__(vllm_config=vllm_config, role=role)
         self._role = role
         self._vllm_config = vllm_config
+        self._kv_cache_config = kv_cache_config
 
         extra = {}
         block_size = 16

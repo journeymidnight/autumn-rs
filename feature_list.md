@@ -202,7 +202,26 @@ Completed 索引表、全部未完成（passes/Status = not_completed）条目�
 - **Out of scope (Phase 3b+):** GPU-resident KV staging buffers + `cudaMemcpyAsync`
   overlap (Phase 3b); per-(block,layer) key merge / RPC coalescing (Phase 3c);
   hybrid-attention multi-pool. Tracked in `docs/autumn_kvcache_plan.md §13.9`.
-- **passes:** not_completed (in progress 2026-06-01)
+- **passes:** completed (2026-06-21). F250-A/B/C 早已实现;F250-D 本次完成 e2e:
+  - **隔离 venv** `/data/f250_vllm_venv` 装 **vLLM 0.23.0 + torch 2.11**(系统 torch 2.9.1/sglang 0.5.10 未动);
+    native `autumn` wheel(maturin cp312,匹配 HEAD)+ `autumn_kvcache` editable 装入。
+  - **真 bug 修复(F250-D reconcile,connector 改动):** vLLM 0.23 要求 external V1 connector `__init__` 收第三参
+    `kv_cache_config` 并转给 `super().__init__()`(否则 pydantic ValidationError "deprecated 2-argument
+    constructor")。`AutumnKVConnector.__init__(vllm_config, role, kv_cache_config=None)` + try/except 向后兼容
+    2 参老版本。这是 connector 唯一改动;其余 scheduler/worker 方法签名与 0.23 `KVConnectorBase_V1` 全对齐
+    (`get_num_new_matched_tokens→(int,bool)`、`build_connector_meta(scheduler_output)`、
+    `request_finished→(bool,dict|None)` 等)。
+  - **两实例 e2e(Qwen3-8B,GPU4:8101 / GPU5:8102)PASS:** inst1 处理 282-token 长 prompt → KV 写入 autumn
+    (log_stream extent 涨到 256.9 KB);**inst2(独立进程/GPU,本地 prefix cache 空)首见同 prompt → 272/282
+    token 从 autumn 跨实例命中**。判据用 vLLM 权威 metric `vllm:external_prefix_cache_hits_total` 0→272 +
+    `vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}` 0→272(注:0.23 的 OpenAI usage 不暴露
+    cached_tokens,external_prefix_cache_* 才是权威信号)。
+  - **无回归:** sglang `test_smoke.py` 全 PASS;F250-C dataplane 在新集群 PASS(同集群重跑因 present-marker
+    残留非幂等报 pre-existence,非代码回归)。connector 模块仍无 vLLM 可 import。
+  - README:新建 `python/autumn_kvcache/README.md`(原 pyproject 引用但缺失),含 "Using autumn-kvcache as
+    vLLM L3" 完整工作流 + 验证 metric + 钉死 vLLM 0.23.0 说明。
+  - 环境坑(记录):Ray 占 10100-10110 撞 EN ctl 口 → `AUTUMN_EXTENT_BASE_PORT=20000`
+    ([[project_bench_env_traps_20260610]]);harness shell errexit+pipefail 吞输出 → 集群起停走脚本文件。
 
 ---
 

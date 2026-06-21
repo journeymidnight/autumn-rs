@@ -1,3 +1,28 @@
+Date: 2026-06-21
+TaskStatus: completed
+Task scope: F250-D — autumn-kvcache vLLM connector 真 e2e(隔离 venv 两实例跨实例 prefix 命中)+ README。
+Result: PASS。inst2(GPU5,本地 cache 空)首见 inst1 存过的 282-token prompt → 272 token 从 autumn 跨实例命中
+  (vllm:external_prefix_cache_hits_total 0→272 + prompt_tokens_by_source{external_kv_transfer} 0→272)。
+  唯一 connector 改动 = __init__ 收 kv_cache_config 第三参(0.23 要求,向后兼容)。sglang smoke 无回归;
+  新建 python/autumn_kvcache/README.md。下一步:commit + coco + 拆 vllm 实例/cluster 释放 GPU。
+Current summary: F250-A/B/C 早已实现(连接器全 KVConnectorBase_V1 方法齐)。本次做 F250-D:
+  ① 隔离 venv /data/f250_vllm_venv 装 vllm 0.23.0 + torch 2.11(不动系统 torch 2.9.1/sglang)。
+  ② 重建 native autumn wheel(maturin, cp312, 匹配 HEAD)装进 venv;装 autumn_kvcache editable。
+  ③ 起 1 个 3-replica TCP cluster(manager 127.0.0.1:9001)——坑:Ray 占 10100-10110 撞 EN ctl 口,
+     用 AUTUMN_EXTENT_BASE_PORT=20000 移到 20001/21001([[project_bench_env_traps_20260610]]);
+     另:harness shell errexit+pipefail 吞输出,集群起停一律走 /tmp/f250_*.sh 脚本文件规避。
+  ④ F250-C dataplane smoke vs live cluster 全 PASS(save/load 字节级往返)。
+  ⑤ 真 bug 修复(F250-D reconcile):vLLM 0.23 要求 external V1 connector __init__ 收第三参
+     kv_cache_config 并转给 super()——连接器原是 2 参 → pydantic ValidationError 起不来。
+     已改 vllm_connector.py:__init__(vllm_config, role, kv_cache_config=None) + try/except 向后兼容
+     2 参老版本。editable 安装即生效。
+  ⑥ 进行中:起两个 vllm serve(Qwen3-8B,GPU4:8101 / GPU5:8102)验证 inst2 跨实例 cached_tokens>0。
+Main gaps: 两实例 e2e 跨实例命中尚未实测通过;README "Using autumn-kvcache as vLLM L3" 待写。
+Next steps: inst1 ready 后跑 /tmp/f250_verify.py;过了写 README + 更新 F250 passes + commit(connector 修复)。
+验收: 见 feature_list F250 acceptance(cross-instance prefix hit cached_tokens>0)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(F276, completed + pushed c7f8d69):
 Date: 2026-06-20
 TaskStatus: completed
 Task scope: F276 — 读路径主动绕开 Suspected 节点 + EC 主动重建(不等超时)。
