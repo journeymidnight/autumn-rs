@@ -1589,3 +1589,31 @@ gaps in the lease protocol's correctness story.
   false-positive marker → 改 ① TTL 饱和到 u64::MAX ② marker 仅在该 req 所有 layer save 成功才发布
   `_save_failed` 门控);R3 收敛仅剩 P2/P3 测试/文档(§6 不证 batch TTL → 加 §6b;README ttl_secs 语义澄清
   marker-admissibility vs layer+grace + lazy 回收)。**未 push(solo-flow,等用户)。**
+
+## F278 · vLLM connector 跨实例正确性(真 e2e 抓 3 个 P0,F250 一直只测 metric)(2026-06-22)
+- **背景/触发:** 用户问"QwenVL 带图 prefix cache 还好用吗" → 跑 F277 验证里那套真 vLLM 2 实例 e2e,但换
+  **Qwen3-VL-4B**(GPU4/5,1-node autumn,driver = 跨实例 image+text)。**抓到 connector 此前跨实例根本产
+  不出正确输出**——F250-D 只看命中 metric(`external_prefix_cache_hits`)从没验证输出 → 全被掩盖。
+- **3 个真 bug(都 pre-existing,已修+e2e 验证):**
+  1. **mm_hash 漏入 key**:vLLM 0.23 per-image hash 在 `request.mm_features[].identifier`,不是旧
+     `mm_hashes`/`mm_hash`。原 `_request_extra_keys` 只读旧名 → 图片身份从不进 key → imageB(同尺寸→同
+     token_ids、异内容)false-hit imageA(delta=80)。修:读 `mm_features[].identifier`(+ coco:无 identifier
+     时回退旧名 + multimodal 不可 key 时告警)。
+  2. **save 根本没跑**:override `bind_connector_metadata` 存 `self._meta` 但没维护基类 `_connector_metadata`
+     → `has_connector_metadata()` 恒 False → attention 装饰器 `maybe_transfer_kv_layer` 跳过每次
+     `save_kv_layer`,而 `wait_for_save`(model runner 直调,不 gated)照写 marker → autumn 里 markers=3
+     layer=0 → 跨实例命中 marker 但 load 全 miss → 垃圾。修:`bind/clear_connector_metadata` 调 `super()`。
+  3. **KV 布局错**:0.23 FlashAttention KV = `(num_blocks,2,block_size,num_kv_heads,head_size)`(2 在中间),
+     按 token 取 `layer[slot//bs,:,slot%bs]`。原码 `reshape(2,-1,...)`(2 当最外)→ 跨 block 打乱 K/V → load
+     垃圾。修:照 0.23 参考 `example_connector.py`(`shared_storage_connector` 在 0.23 已删)用 block_idx/offset。
+- **加固(coco 3 轮):** ① marker 只在该 req **所有 layer** save 成功才发布(`_saved_count==len(kv_caches)`,
+  取代只查失败的 `_save_failed`,能抓 save-never-ran)+ bind 时重置避免跨 step 污染;② key 路径加存储格式版本
+  `_KV_STORAGE_FORMAT="v1"`(`kvc/{t}/vllm/v1/{hash}/{layer}`)→ 连接器升级后旧格式 bytes 永不被新布局误读
+  (纯 cache,版本化即失效=零迁移);③ dataplane 测试 key 断言同步加 v1。
+- **验收标准:** (1) py_compile 绿;(2) **真 vLLM 2 实例 e2e**:inst2 跨实例 load imageA→'red'(=inst1)、
+  text→'Paris'(=inst1)、imageB→'blue'(对且 mm parity delta=0 不 false-hit);autumn markers=3 layer=108
+  (3 prefix×36 层)全在 /vllm/v1/;(3) dataplane e2e 全 12 项 PASS(新 v1 key 断言);(4) coco 收敛。
+- **passes:** completed(3 bug 修复 + 真 vLLM e2e 输出正确性验证 image+text 全对 + dataplane 12/12 +
+  coco findbugs deep 3 轮收敛:R1 3 真 bug 全修、R2 3 项加固(版本/回退/per-step 重置)全采纳、R3 仅剩
+  dataplane key 断言同步已修)。教训:cache e2e 必须验证**输出正确性**非仅命中 metric。与 mm_hash 修复
+  **一起 commit**(用户拍板)。未 push。

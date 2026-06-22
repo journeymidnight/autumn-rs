@@ -1,5 +1,21 @@
 Date: 2026-06-22
 TaskStatus: completed
+Task scope: F278 — vLLM connector 跨实例正确性,真 Qwen3-VL e2e 抓修 3 个 P0(F250 一直只测 metric)。
+Result: PASS。用户问"QwenVL 带图 prefix cache 好用吗"→ 跑真 vLLM 2 实例 e2e(Qwen3-VL-4B,GPU4/5)抓到
+  connector 此前跨实例根本产不出正确输出(F250-D 只看命中 metric 掩盖了)。修 3 个 pre-existing P0:
+  ① mm_hash 漏 key(0.23 在 mm_features[].identifier,非旧 mm_hashes)→ imageB false-hit imageA;
+  ② save 没跑(没维护基类 _connector_metadata → has_connector_metadata False → attention 装饰器跳过
+     save_kv_layer,只剩 marker 无 layer → load 全 miss 垃圾)→ bind/clear 调 super();
+  ③ KV 布局 reshape(2,-1) 打乱 K/V(0.23 是 (num_blocks,2,block_size,..) → layer[slot//bs,:,slot%bs])。
+  加固:marker 仅全 layer save 成功才发(_saved_count==len)+bind 重置;key 加 _KV_STORAGE_FORMAT=v1 防升级
+  误读;dataplane key 断言同步。e2e 修后:inst2 load imageA→red、text→Paris、imageB→blue(对+不 false-hit);
+  autumn markers=3 layer=108 全在 /vllm/v1/;dataplane 12/12;coco 3 轮收敛。教训:cache e2e 必须验输出正确性。
+  与 mm_hash 修复一起 commit(用户拍板),未 push。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(F277, completed + committed d42fc85,未 push):
+Date: 2026-06-22
+TaskStatus: completed
 Task scope: F277 — autumn Python 客户端 put 族 + vLLM/sglang kvcache adapter 接 TTL(默认不过期)。
 Result: PASS。dataplane e2e(新 §6 TTL)绿:ttl_secs=1 store → 立即 is_present/exists 真;sleep 3s 后
   marker 惰性过期(is_present False)、layer 仍在(exists True)= marker-before-layer 不变量成立。

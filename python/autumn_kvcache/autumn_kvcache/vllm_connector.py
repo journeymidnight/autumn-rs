@@ -42,6 +42,14 @@ log = logging.getLogger(__name__)
 # Separate keyspace pool segment from sglang's "kv" (docs §13.3).
 VLLM_POOL_NAME = "vllm"
 
+# Storage-format version baked into the key path. BUMP whenever the saved KV
+# byte layout or key scheme changes (e.g. the 2026-06-22 K/V-layout + mm-hash +
+# save-gate fixes) so a connector upgrade can NEVER load bytes saved by an
+# incompatible older connector under the same content hash — old entries simply
+# never match the new key and lazily expire. kvcache is a pure cache, so
+# invalidation-by-versioning is the correct (zero-migration) upgrade story.
+_KV_STORAGE_FORMAT = "v1"
+
 # When a TTL is configured, the layer pages are written with a longer TTL than
 # the `__present__` marker so the marker ALWAYS expires first. The scheduler
 # admits a load on the marker (`is_present`); if the marker outlived its layers
@@ -132,22 +140,60 @@ def prefix_hash(
 
 
 def _request_extra_keys(request: Any) -> List[str]:
-    """Best-effort LoRA + multimodal context keys from a vLLM request object.
+    """Per-request multimodal + LoRA context keys folded into the prefix hash.
 
-    Field names differ across vLLM versions / between the scheduler `Request`
-    and the `NewRequestData` seen in `scheduled_new_reqs`, so read defensively;
-    parity between the two is validated in F250-D.
+    These MUST disambiguate KV that shares token-ids but differs in content —
+    above all the multimodal case: a VLM splices a *fixed* image-placeholder
+    token id (repeated per patch) into the sequence, so two DIFFERENT images of
+    the same size produce IDENTICAL `prompt_token_ids`. Without the per-image
+    hash here their content hashes collide and one image's KV is served for the
+    other — a silent correctness bug (reproduced live on Qwen3-VL: imageB
+    false-hit imageA's cross-instance KV until this read was fixed). vLLM's own
+    prefix cache disambiguates via BlockHash extra keys; we mirror that.
+
+    vLLM 0.23 carries per-item hashes on `mm_features`
+    (`MultiModalFeatureSpec.identifier` — the encoder-output cache hash, incl.
+    any LoRA prefix); older vLLM exposed `mm_hashes` / `mm_hash`. Both the
+    scheduler `Request` and the `NewRequestData` in `scheduled_new_reqs` expose
+    `mm_features` in the same item order, so save-key == load-key.
     """
-    keys: List[str] = []
+    mm_keys: List[str] = []
+    mm_features = getattr(request, "mm_features", None)
+    if mm_features:
+        try:
+            for feat in mm_features:
+                ident = getattr(feat, "identifier", None) or getattr(feat, "mm_hash", None)
+                if ident:
+                    mm_keys.append("mm:" + str(ident))
+        except TypeError:
+            pass  # not iterable in the expected shape — fall through to fallback
+    if not mm_keys:
+        # `mm_features` absent, OR present but yielded no identifier → fall back
+        # to the older `mm_hashes` / `mm_hash` attribute names. (Don't gate this
+        # on `mm_features` being falsy: a present-but-unkeyable `mm_features`
+        # must still try the old names rather than drop the disambiguator.)
+        mm = getattr(request, "mm_hashes", None) or getattr(request, "mm_hash", None)
+        if mm:
+            if isinstance(mm, (list, tuple)):
+                mm_keys.extend("mm:" + str(x) for x in mm)
+            else:
+                mm_keys.append("mm:" + str(mm))
+    if mm_features and not mm_keys:
+        # A multimodal request we cannot disambiguate: its prefix hash would
+        # collide across DIFFERENT images sharing the same placeholder token
+        # ids (false-alias → wrong output). Surface it loudly — the connector
+        # still caches (best-effort), but this is the signal to add the right
+        # hash source for this vLLM/model shape.
+        log.warning(
+            "multimodal request with no derivable mm hash — external KV prefix "
+            "may alias across different multimodal inputs"
+        )
+    keys: List[str] = list(mm_keys)
+    # LoRA id (0.23's `identifier` already embeds the LoRA prefix; kept for the
+    # text+LoRA case and older vLLM). Read identically on both request shapes.
     lora = getattr(request, "lora_request", None)
     if lora is not None:
         keys.append("lora:" + str(getattr(lora, "lora_int_id", lora)))
-    mm = getattr(request, "mm_hashes", None) or getattr(request, "mm_hash", None)
-    if mm:
-        if isinstance(mm, (list, tuple)):
-            keys.extend("mm:" + str(x) for x in mm)
-        else:
-            keys.append("mm:" + str(mm))
     return keys
 
 
@@ -206,7 +252,9 @@ class _AutumnKVStore:
     PRESENT_MARKER = "__present__"
 
     def _key(self, content_hash: str, layer_name: str) -> bytes:
-        return full_key(self._tenant, f"{content_hash}/{layer_name}", VLLM_POOL_NAME)
+        return full_key(
+            self._tenant, f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}", VLLM_POOL_NAME
+        )
 
     def exists(self, content_hash: str, layer_name: str) -> bool:
         try:
@@ -295,29 +343,46 @@ def _slot_mapping_for_blocks(block_ids: List[int], block_size: int, num_tokens: 
     return slots[:num_tokens]
 
 
-def _extract_layer(kv_layer: "torch.Tensor", slot_mapping, is_mla: bool):
+def _extract_layer(kv_layer: "torch.Tensor", slot_mapping, is_mla: bool, block_size: int):
     """Gather the KV for `slot_mapping` from a paged layer → contiguous tensor.
 
-    Mirrors SharedStorageConnector.extract_kv_from_layer.
+    Mirrors vLLM 0.23's reference `example_connector.extract_kv_from_layer`.
+    LAYOUT (the bug that produced cross-instance garbage before this): the
+    FlashAttention KV cache is `(num_blocks, 2, block_size, num_kv_heads,
+    head_size)` — the `2` (K/V) is the MIDDLE dim, addressed per token as
+    `layer[block_idx, :, offset]` with `block_idx = slot // block_size`,
+    `offset = slot % block_size`. The old `reshape(2, -1, ...)` treated `2` as
+    the OUTERMOST dim, which scrambles K/V across blocks (it round-trips within
+    one instance's identical block_ids but corrupts cross-instance, where
+    block_ids differ). MLA is `(num_pages, page_size, ...)`.
     """
-    num_slots = slot_mapping.shape[0]
+    slot = slot_mapping.to(kv_layer.device)
     if is_mla:
-        return kv_layer.reshape(-1, *kv_layer.shape[2:])[slot_mapping, ...].contiguous()
-    # non-MLA: [2, num_pages*page_size, ...]
-    flat = kv_layer.reshape(2, -1, *kv_layer.shape[3:])
-    return flat[:, slot_mapping, ...].contiguous()
+        num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+        return kv_layer.reshape(num_pages * page_size, -1)[slot, ...].contiguous()
+    block_idxs = slot // block_size
+    offsets = slot % block_size
+    return kv_layer[block_idxs, :, offsets].contiguous()
 
 
-def _inject_layer(kv_layer: "torch.Tensor", value: "torch.Tensor", slot_mapping, is_mla: bool) -> None:
+def _inject_layer(
+    kv_layer: "torch.Tensor", value: "torch.Tensor", slot_mapping, is_mla: bool, block_size: int
+) -> None:
     """Scatter a contiguous KV tensor back into the paged layer at `slot_mapping`.
 
-    Mirrors SharedStorageConnector.inject_kv_into_layer.
+    Mirrors vLLM 0.23's `example_connector.inject_kv_into_layer` (see
+    `_extract_layer` for the layout rationale). `value` is moved to the layer's
+    device (it arrives on CPU from the autumn staging buffer).
     """
+    slot = slot_mapping.to(kv_layer.device)
+    val = value.to(kv_layer.device)
     if is_mla:
-        kv_layer.reshape(-1, *kv_layer.shape[2:])[slot_mapping, ...] = value
+        num_pages, page_size = kv_layer.shape[0], kv_layer.shape[1]
+        kv_layer.reshape(num_pages * page_size, -1)[slot, ...] = val
     else:
-        flat = kv_layer.reshape(2, -1, *kv_layer.shape[3:])
-        flat[:, slot_mapping, ...] = value
+        block_idxs = slot // block_size
+        offsets = slot % block_size
+        kv_layer[block_idxs, :, offsets] = val
 
 
 def _byte_view(t: "torch.Tensor"):
@@ -396,10 +461,13 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._kv_caches: dict = {}
         self._layer_order: List[str] = []
         self._meta: Optional[AutumnConnectorMetadata] = None
-        # req_ids whose layer save FAILED this step — `wait_for_save` must NOT
-        # publish their `__present__` marker (a marker without its layers is a
-        # false positive the scheduler would later admit into a partial load).
-        self._save_failed: set = set()
+        # req_id -> count of layers SUCCESSFULLY saved this step. `wait_for_save`
+        # publishes the `__present__` marker ONLY when a req saved ALL layers
+        # (count == len(kv_caches)). This is the true "marker ⇒ all layers
+        # present" invariant: it catches save-never-ran (count 0), partial
+        # saves, and per-layer failures alike — any of which would otherwise
+        # leave a marker the scheduler admits into a missing/partial load.
+        self._saved_count: dict = {}
         log.info(
             "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s",
             role, self._tenant_suffix, self._block_size, _VLLM_AVAILABLE,
@@ -476,9 +544,26 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
     def bind_connector_metadata(self, connector_metadata: Any) -> None:
         self._meta = connector_metadata
+        # Reset per-step save accounting at the START of each step so a prior
+        # step that didn't reach `wait_for_save` (exception / early clear) can't
+        # leave a stale count that, on req_id reuse, falsely reaches the
+        # all-layers threshold and publishes a marker for an unsaved prefix.
+        self._saved_count = {}
+        # CRITICAL: also set the BASE class's `_connector_metadata` so
+        # `has_connector_metadata()` returns True. The attention decorator
+        # `maybe_transfer_kv_layer` gates `save_kv_layer` on that check — without
+        # it, every SAVE is silently skipped (no layer pages written) while
+        # `wait_for_save` (called ungated by the model runner) still publishes
+        # the marker → markers with no layers → every cross-instance load admits
+        # on the marker then misses all layers → garbage output. Reproduced live
+        # on Qwen3-VL before this fix.
+        if _VLLM_AVAILABLE:
+            super().bind_connector_metadata(connector_metadata)
 
     def clear_connector_metadata(self) -> None:
         self._meta = None
+        if _VLLM_AVAILABLE:
+            super().clear_connector_metadata()
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         """Synchronously load every cached request's KV into the paged cache.
@@ -499,7 +584,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             if _slot_len(rm.slot_mapping) == 0:
                 continue
             for layer_name, kv_layer in self._kv_caches.items():
-                template = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla)
+                template = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla, self._block_size)
                 staging = np.empty(template.numel() * template.element_size(), dtype=np.uint8)
                 ok = self._store.load_layers(rm.content_hash, [layer_name], [staging])[0]
                 if not ok:
@@ -516,7 +601,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                     )
                     continue
                 value = torch.from_numpy(staging).view(template.dtype).reshape(template.shape)
-                _inject_layer(kv_layer, value, rm.slot_mapping, self._is_mla)
+                _inject_layer(kv_layer, value, rm.slot_mapping, self._is_mla, self._block_size)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # Phase 3a loads synchronously in start_load_kv; nothing to await.
@@ -529,31 +614,37 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         for rm in meta.requests:
             if not rm.is_store:
                 continue
-            gathered = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla).detach().cpu()
+            gathered = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla, self._block_size).detach().cpu()
             ok = self._store.save_layers(rm.content_hash, [layer_name], [_byte_view(gathered)])
-            if not ok or not ok[0]:
-                # Any layer failing taints the whole prefix: record it so the
-                # marker is withheld (an all-or-nothing presence guarantee).
-                self._save_failed.add(rm.req_id)
-                log.warning(
-                    "layer save failed req=%s layer=%s — withholding presence marker",
-                    rm.req_id, layer_name,
-                )
+            if ok and ok[0]:
+                self._saved_count[rm.req_id] = self._saved_count.get(rm.req_id, 0) + 1
+            else:
+                # A failed layer simply doesn't count toward the all-layers
+                # total, so wait_for_save withholds the marker for this prefix.
+                log.warning("layer save failed req=%s layer=%s", rm.req_id, layer_name)
 
     def wait_for_save(self) -> None:
         # put_from is awaited inside save_layers (write-through, ACK = durable).
-        # All layers of each store-req are now persisted, so publish the
-        # layer-name-independent completion marker the scheduler probes.
+        # Publish the layer-name-independent completion marker the scheduler
+        # probes — but ONLY for store-reqs that saved EVERY layer.
         meta = self._meta
         if meta is None:
             return
+        expected = len(self._kv_caches)
         for rm in meta.requests:
-            # Gate on save success: a request whose any layer failed
-            # (`_save_failed`) must NOT get a marker — else the next instance
-            # sees a present prefix it can't fully load.
-            if rm.is_store and _slot_len(rm.slot_mapping) > 0 and rm.req_id not in self._save_failed:
+            if not (rm.is_store and _slot_len(rm.slot_mapping) > 0):
+                continue
+            saved = self._saved_count.get(rm.req_id, 0)
+            # "marker ⇒ all layers present": only a fully-saved prefix gets a
+            # marker. `expected == 0` (no kv_caches registered) also withholds.
+            if expected > 0 and saved == expected:
                 self._store.mark_present(rm.content_hash)
-        self._save_failed.clear()
+            else:
+                log.warning(
+                    "withholding presence marker req=%s: saved %d/%d layers",
+                    rm.req_id, saved, expected,
+                )
+        self._saved_count.clear()
 
     def get_finished(self, finished_req_ids: set):
         # No async send/recv in Phase 3a.

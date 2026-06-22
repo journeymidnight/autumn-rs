@@ -26,6 +26,7 @@ import numpy as np
 
 from autumn_kvcache._keys import KEY_NAMESPACE
 from autumn_kvcache.vllm_connector import (
+    _KV_STORAGE_FORMAT,
     VLLM_POOL_NAME,
     _AutumnKVStore,
     align_to_block_size,
@@ -66,7 +67,9 @@ def main() -> int:
 
     # ── 2. key format ────────────────────────────────────────────────────────
     k = store._key("deadbeef", "layer.7")
-    expected = f"{KEY_NAMESPACE}/{tenant}/{VLLM_POOL_NAME}/deadbeef/layer.7".encode()
+    expected = (
+        f"{KEY_NAMESPACE}/{tenant}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
+    )
     assert k == expected, f"key mismatch: {k!r} != {expected!r}"
     log.info("key format OK: %r", k)
 
