@@ -132,6 +132,16 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         default_cap = 16 if transport == "ucx" else 64
         self._max_inflight = int(extra_config.get("max_inflight", default_cap))
         n_workers = max(1, int(extra_config.get("client_workers", 1)))
+        # `ttl_secs` (default 0 = no expiry): relative TTL applied to every L3
+        # page write. Content-addressed keys never invalidate, so a TTL is the
+        # only reclamation knob. sglang manages its own existence (its hash
+        # table + L2), so a missing/expired L3 key is just a clean miss → no
+        # marker-ordering concern (unlike the vLLM connector). A negative value
+        # is a misconfiguration — fail fast rather than silently coercing to 0
+        # (= never expire), which would mask the error.
+        self._ttl_secs = int(extra_config.get("ttl_secs", 0) or 0)
+        if self._ttl_secs < 0:
+            raise ValueError(f"ttl_secs must be non-negative, got {self._ttl_secs}")
         # F216-E "ucx ⟹ zerocopy": the zero-copy data path (MSG_PUT_ZC write +
         # MSG_GET_ZC read for large pages) is now the DEFAULT whenever the
         # transport is UCX — no opt-in flag. BatchClient derives it from the
@@ -222,7 +232,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
-            results = list(self._batch.put_from(full_keys, views))
+            results = list(self._batch.put_from(full_keys, views, self._ttl_secs))
         except Exception as e:  # noqa: BLE001
             log.debug("batch put_from error (n=%d): %r", len(keys), e)
             self._stats["set_error"] += len(keys)
@@ -278,7 +288,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 return False
         try:
             payload = bytes(buf)
-            run(lambda: self._client.put(full, payload))
+            run(lambda: self._client.put(full, payload, self._ttl_secs))
             return True
         except Exception:  # noqa: BLE001
             return False

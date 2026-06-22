@@ -91,6 +91,9 @@ enum Op {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
+        /// Relative TTL in seconds; `0` = no expiry. Converted to an absolute
+        /// `expires_at` at write time via `ClusterClient::ttl_to_expires_at`.
+        ttl_secs: u64,
         handle: PyHandle,
     },
     Get {
@@ -122,6 +125,8 @@ enum Op {
     PutFrom {
         key: Vec<u8>,
         buf: PyBuffer<u8>,
+        /// Relative TTL in seconds; `0` = no expiry.
+        ttl_secs: u64,
         handle: PyHandle,
     },
     GetInto {
@@ -134,6 +139,8 @@ enum Op {
     BatchPutFrom {
         keys: Vec<Vec<u8>>,
         bufs: Vec<PyBuffer<u8>>,
+        /// Relative TTL in seconds; `0` = no expiry. Applies to every key.
+        ttl_secs: u64,
         handle: PyHandle,
     },
     BatchGetInto {
@@ -178,8 +185,21 @@ async fn event_loop(client: ClusterClient, mut rx: UnboundedReceiver<Op>) {
 
 async fn handle_op(client: &ClusterClient, op: Op) {
     match op {
-        Op::Put { key, value, handle } => {
-            match client.put(&key, &value).await {
+        Op::Put { key, value, ttl_secs, handle } => {
+            // TTL path routes through `put_many` of 1: the single-`put` wire
+            // (`PutReq`) carries `expires_at`, but the SDK's ergonomic `put`
+            // does not expose it (it was folded into `put_many` on 2026-06-08),
+            // so a TTL'd single put is a batch of one. `Bytes::from(value)`
+            // moves the owned Vec in — no copy. `ttl_secs == 0` keeps the
+            // untouched no-TTL fast path.
+            let res = if ttl_secs == 0 {
+                client.put(&key, &value).await
+            } else {
+                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
+                let items = [(key.as_slice(), bytes::Bytes::from(value), expires_at)];
+                client.put_many(&items).await.into_iter().next().unwrap_or(Ok(()))
+            };
+            match res {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
             }
@@ -242,13 +262,25 @@ async fn handle_op(client: &ClusterClient, op: Op) {
                 .collect();
             handle.resolve(move |py| Ok(pyo3::types::PyList::new(py, founds)?.into_any().unbind()));
         }
-        Op::PutFrom { key, buf, handle } => {
+        Op::PutFrom { key, buf, ttl_secs, handle } => {
             // SAFETY: buf is held by this Op until handle_op returns; PyBuffer's
             // pinning contract guarantees the pointed-at memory is stable.
             let value = unsafe {
                 std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
             };
-            match client.put(&key, value).await {
+            // No-TTL fast path unchanged. TTL path routes through `put_many` of 1
+            // (the wire form carrying `expires_at`); it copies the pinned bytes
+            // into `Bytes` — the single `put_from` TTL path is low-frequency. The
+            // kvcache ZC write path is `BatchClient.put_from` (run_job
+            // `BatchOp::Put`), which stays zero-copy via `Bytes::from_static`.
+            let res = if ttl_secs == 0 {
+                client.put(&key, value).await
+            } else {
+                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
+                let items = [(key.as_slice(), bytes::Bytes::copy_from_slice(value), expires_at)];
+                client.put_many(&items).await.into_iter().next().unwrap_or(Ok(()))
+            };
+            match res {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
             }
@@ -295,20 +327,38 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             }
             drop(_buf_keepalive);
         }
-        Op::BatchPutFrom { keys, bufs, handle } => {
+        Op::BatchPutFrom { keys, bufs, ttl_secs, handle } => {
             // Pipeline all puts concurrently on this single compio thread. The
             // partition server's group-commit (F099-D) coalesces them at the
             // WAL level — same pattern perf-check uses, just driven from one
             // batch op instead of N Python round-trips.
-            let futs = keys.iter().zip(bufs.iter()).map(|(k, buf)| {
-                // SAFETY: each buf is held in `bufs` for the whole join_all;
-                // PyBuffer pins the underlying memory.
-                let value =
-                    unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count()) };
-                client.put(k, value)
-            });
-            let results = futures::future::join_all(futs).await;
-            let oks: Vec<bool> = results.iter().map(|r| r.is_ok()).collect();
+            let oks: Vec<bool> = if ttl_secs == 0 {
+                let futs = keys.iter().zip(bufs.iter()).map(|(k, buf)| {
+                    // SAFETY: each buf is held in `bufs` for the whole join_all;
+                    // PyBuffer pins the underlying memory.
+                    let value = unsafe {
+                        std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
+                    };
+                    client.put(k, value)
+                });
+                futures::future::join_all(futs).await.iter().map(|r| r.is_ok()).collect()
+            } else {
+                // TTL path: one `put_many` carrying `expires_at` per item. The
+                // pinned pages stay zero-copy via `Bytes::from_static` (bufs
+                // outlive the await; freed at `drop(bufs)` below).
+                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
+                let pitems: Vec<(&[u8], bytes::Bytes, u64)> = keys
+                    .iter()
+                    .zip(bufs.iter())
+                    .map(|(k, buf)| {
+                        let page: &'static [u8] = unsafe {
+                            std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
+                        };
+                        (k.as_slice(), bytes::Bytes::from_static(page), expires_at)
+                    })
+                    .collect();
+                client.put_many(&pitems).await.iter().map(|r| r.is_ok()).collect()
+            };
             handle.resolve(move |py| {
                 Ok(pyo3::types::PyList::new(py, oks)?.into_any().unbind())
             });
@@ -419,16 +469,21 @@ impl Client {
         Ok(fut)
     }
 
+    /// `ttl_secs` (default `0` = no expiry) sets a relative time-to-live in
+    /// seconds; the key is lazily expired on read once it elapses.
+    #[pyo3(signature = (key, value, ttl_secs=0))]
     fn put<'py>(
         &self,
         py: Python<'py>,
         key: &[u8],
         value: &[u8],
+        ttl_secs: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (handle, fut) = make_handle(py)?;
         self.dispatch(Op::Put {
             key: key.to_vec(),
             value: value.to_vec(),
+            ttl_secs,
             handle,
         })?;
         Ok(fut)
@@ -517,12 +572,15 @@ impl Client {
     /// Python `bytes` is allocated.
     ///
     /// Requires `buf` to be C-contiguous. Returns an awaitable that resolves
-    /// to None on success and raises on RPC error.
+    /// to None on success and raises on RPC error. `ttl_secs` (default `0` =
+    /// no expiry) sets a relative time-to-live in seconds.
+    #[pyo3(signature = (key, buf, ttl_secs=0))]
     fn put_from<'py>(
         &self,
         py: Python<'py>,
         key: &[u8],
         buf: PyBuffer<u8>,
+        ttl_secs: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         if !buf.is_c_contiguous() {
             return Err(PyValueError::new_err("buf must be C-contiguous"));
@@ -531,6 +589,7 @@ impl Client {
         self.dispatch(Op::PutFrom {
             key: key.to_vec(),
             buf,
+            ttl_secs,
             handle,
         })?;
         Ok(fut)
@@ -576,12 +635,15 @@ impl Client {
     /// element i is True iff `keys[i]` was stored successfully.
     ///
     /// This is the throughput path for sglang HiCache `batch_set_v1`: a single
-    /// op carrying N pages instead of N separate round-trips.
+    /// op carrying N pages instead of N separate round-trips. `ttl_secs`
+    /// (default `0` = no expiry) applies one relative TTL to every key.
+    #[pyo3(signature = (keys, bufs, ttl_secs=0))]
     fn batch_put_from<'py>(
         &self,
         py: Python<'py>,
         keys: Vec<Vec<u8>>,
         bufs: Vec<PyBuffer<u8>>,
+        ttl_secs: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         if keys.len() != bufs.len() {
             return Err(PyValueError::new_err("keys and bufs must have equal length"));
@@ -592,7 +654,7 @@ impl Client {
             }
         }
         let (handle, fut) = make_handle(py)?;
-        self.dispatch(Op::BatchPutFrom { keys, bufs, handle })?;
+        self.dispatch(Op::BatchPutFrom { keys, bufs, ttl_secs, handle })?;
         Ok(fut)
     }
 
@@ -785,6 +847,9 @@ unsafe impl Send for WorkItem {}
 struct BatchJob {
     op: BatchOp,
     items: Vec<WorkItem>,
+    /// Relative TTL in seconds for a `Put` batch; `0` = no expiry. Ignored by
+    /// `Get`.
+    ttl_secs: u64,
     done: smpsc::Sender<Vec<bool>>,
 }
 
@@ -801,7 +866,7 @@ struct BatchClient {
     is_ucx: bool,
 }
 
-async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize) -> Vec<bool> {
+async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64, cap: usize) -> Vec<bool> {
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
@@ -843,12 +908,19 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
             // keeps alive for the whole batch (until `allow_threads` returns); the
             // `Bytes::from_static` view is consumed within the call and its Drop is a
             // no-op (never frees the page).
+            // `ttl_secs == 0` ⇒ `expires_at = 0` (no expiry), preserving the
+            // prior behaviour. Compute the absolute deadline once for the batch.
+            let expires_at = if ttl_secs == 0 {
+                0
+            } else {
+                ClusterClient::ttl_to_expires_at(ttl_secs)
+            };
             let pitems: Vec<(&[u8], bytes::Bytes, u64)> = items
                 .iter()
                 .map(|it| {
                     let page: &'static [u8] =
                         unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                    (it.key.as_slice(), bytes::Bytes::from_static(page), 0u64)
+                    (it.key.as_slice(), bytes::Bytes::from_static(page), expires_at)
                 })
                 .collect();
             let _ = cap; // unused — put_many no longer takes a concurrency arg
@@ -901,7 +973,7 @@ impl BatchClient {
                                 }
                             };
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, per_worker_cap).await;
+                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap).await;
                                 let _ = job.done.send(res);
                             }
                         });
@@ -930,12 +1002,14 @@ impl BatchClient {
     /// key was found AND its stored size == the buffer length (value copied into
     /// the buffer). Fans across worker threads with the GIL released.
     fn get_into(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Get, keys, bufs, true)
+        self.run_batch(py, BatchOp::Get, keys, bufs, true, 0)
     }
 
-    /// Batched zero-copy put. Returns list[bool] aligned to `keys`.
-    fn put_from(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Put, keys, bufs, false)
+    /// Batched zero-copy put. Returns list[bool] aligned to `keys`. `ttl_secs`
+    /// (default `0` = no expiry) applies one relative TTL to every key.
+    #[pyo3(signature = (keys, bufs, ttl_secs=0))]
+    fn put_from(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>, ttl_secs: u64) -> PyResult<Vec<bool>> {
+        self.run_batch(py, BatchOp::Put, keys, bufs, false, ttl_secs)
     }
 
     fn n_workers(&self) -> usize {
@@ -951,6 +1025,7 @@ impl BatchClient {
         keys: Vec<Vec<u8>>,
         bufs: Vec<PyBuffer<u8>>,
         writable: bool,
+        ttl_secs: u64,
     ) -> PyResult<Vec<bool>> {
         let n = keys.len();
         if bufs.len() != n {
@@ -990,7 +1065,7 @@ impl BatchClient {
             for (wi, chunk) in shards.into_iter().enumerate() {
                 let chunk_len = chunk.len();
                 let (done_tx, done_rx) = smpsc::channel::<Vec<bool>>();
-                let job = BatchJob { op, items: chunk, done: done_tx };
+                let job = BatchJob { op, items: chunk, ttl_secs, done: done_tx };
                 if self.workers[wi].job_tx.unbounded_send(job).is_err() {
                     // Worker dead: synthesize a failed chunk so output stays aligned.
                     let (tx, rx) = smpsc::channel::<Vec<bool>>();

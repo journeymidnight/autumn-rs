@@ -1152,6 +1152,13 @@ impl ClusterClient {
     /// absolute Unix-epoch `expires_at`. `0` is preserved (no expiry).
     /// Used by the single-key `put` ttl convenience and by callers
     /// preparing `put_many` items.
+    ///
+    /// `saturating_add`: an absurdly large `ttl_secs` that would overflow
+    /// `u64` epoch seconds saturates to `u64::MAX`, which the read-path expiry
+    /// check (`expires_at <= now`) treats as "never expires" — the safe reading
+    /// of "expire impossibly far in the future". (Without it, release-mode
+    /// wraparound could flip a huge TTL into instant-expiry or `0`/never; the
+    /// PyO3 `ttl_secs` arg is an unchecked `u64` from Python.)
     pub fn ttl_to_expires_at(ttl_secs: u64) -> u64 {
         if ttl_secs == 0 {
             return 0;
@@ -1160,7 +1167,7 @@ impl ClusterClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + ttl_secs
+            .saturating_add(ttl_secs)
     }
 
     async fn put_opts(

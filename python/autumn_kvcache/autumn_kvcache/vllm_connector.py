@@ -42,6 +42,30 @@ log = logging.getLogger(__name__)
 # Separate keyspace pool segment from sglang's "kv" (docs §13.3).
 VLLM_POOL_NAME = "vllm"
 
+# When a TTL is configured, the layer pages are written with a longer TTL than
+# the `__present__` marker so the marker ALWAYS expires first. The scheduler
+# admits a load on the marker (`is_present`); if the marker outlived its layers
+# the worker would load some layers and silently `continue` past the expired
+# ones, leaving uninitialised KV in the paged cache (a correctness bug). With
+# `layer_ttl = marker_ttl + grace` the invariant "marker present ⇒ all layers
+# present" holds across both the save ordering (marker written last) and the
+# scheduler-probe → worker-load gap. The grace just delays reclamation of
+# already-cold pages; content-addressing makes the lingering harmless.
+#
+# Belt-and-suspenders: the marker is also gated on the layers ACTUALLY saving
+# (see _save_failed / wait_for_save) — so a save failure for ANY reason (the
+# u64 clamp below, a transport error, value-too-large) never publishes a marker
+# without its layers. The grace is the timing guarantee; the gate is the
+# write-success guarantee.
+_TTL_LAYER_GRACE_SECS = 300
+
+# The native `ttl_secs` arg is a Rust `u64`; a Python int above this fails the
+# PyO3 conversion. We saturate (not raise) so an "effectively never expire"
+# TTL is honoured rather than erroring — and, critically, so `marker_ttl + grace`
+# can never exceed u64 and make the LAYER write fail while the marker (smaller
+# TTL) still succeeds. Mirrors the Rust helper's `saturating_add`.
+_U64_MAX = (1 << 64) - 1
+
 # ── defensive vLLM import ────────────────────────────────────────────────────
 # Module must import without vLLM installed (data-plane smoke test + tooling).
 # Catch broad Exception, not just ImportError: a present-but-broken vLLM/torch
@@ -147,10 +171,20 @@ class _AutumnKVStore:
         transport: str = "tcp",
         n_workers: int = 1,
         max_inflight: Optional[int] = None,
+        ttl_secs: int = 0,
     ):
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
         self._tenant = tenant_suffix
+        # Marker TTL = configured ttl_secs; layer TTL = ttl_secs + grace so the
+        # marker always expires first (see _TTL_LAYER_GRACE_SECS). 0 = no expiry.
+        # Both saturate at u64 so a huge "never expire" TTL is honoured and the
+        # layer TTL can never overflow past the marker's (which would fail the
+        # layer write while letting the marker publish — a false-positive marker).
+        self._marker_ttl = min(max(0, int(ttl_secs)), _U64_MAX)
+        self._layer_ttl = (
+            min(self._marker_ttl + _TTL_LAYER_GRACE_SECS, _U64_MAX) if self._marker_ttl else 0
+        )
         transport = (transport or "tcp").lower()
         if transport != "tcp":
             try:
@@ -182,9 +216,15 @@ class _AutumnKVStore:
             return False
 
     def mark_present(self, content_hash: str) -> bool:
-        """Write the completion marker after all layers of a prefix are saved."""
+        """Write the completion marker after all layers of a prefix are saved.
+
+        The marker carries the configured (shorter) TTL so it expires before its
+        layers — see _TTL_LAYER_GRACE_SECS.
+        """
         try:
-            run(lambda: self._client.put(self._key(content_hash, self.PRESENT_MARKER), b"1"))
+            run(lambda: self._client.put(
+                self._key(content_hash, self.PRESENT_MARKER), b"1", self._marker_ttl
+            ))
             return True
         except Exception as e:  # noqa: BLE001
             log.debug("mark_present error: %r", e)
@@ -202,7 +242,7 @@ class _AutumnKVStore:
         """
         keys = [self._key(content_hash, ln) for ln in layer_names]
         try:
-            return list(self._batch.put_from(keys, views))
+            return list(self._batch.put_from(keys, views, self._layer_ttl))
         except Exception as e:  # noqa: BLE001
             log.debug("save_layers put_from error (n=%d): %r", len(keys), e)
             return [False] * len(keys)
@@ -330,12 +370,22 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._tenant_suffix = build_tenant_suffix(tenant_cfg)
         self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))
         transport = (extra.get("transport") or "tcp").lower()
+        # `ttl_secs` (default 0 = no expiry) bounds how long an offloaded prefix
+        # lives in autumn before lazy expiry reclaims it. Content-addressed keys
+        # never invalidate, so a TTL is the only reclamation knob. A negative
+        # value is a misconfiguration — fail fast rather than silently coercing
+        # it to 0 (= never expire), which would mask the error and let storage
+        # grow unbounded.
+        ttl_secs = int(extra.get("ttl_secs", 0) or 0)
+        if ttl_secs < 0:
+            raise ValueError(f"ttl_secs must be non-negative, got {ttl_secs}")
         self._store = _AutumnKVStore(
             endpoint,
             self._tenant_suffix,
             transport=transport,
             n_workers=max(1, int(extra.get("client_workers", 1))),
             max_inflight=extra.get("max_inflight"),
+            ttl_secs=ttl_secs,
         )
 
         # scheduler-side state: req_id -> (content_hash, num_tokens) for cache hits.
@@ -346,6 +396,10 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._kv_caches: dict = {}
         self._layer_order: List[str] = []
         self._meta: Optional[AutumnConnectorMetadata] = None
+        # req_ids whose layer save FAILED this step — `wait_for_save` must NOT
+        # publish their `__present__` marker (a marker without its layers is a
+        # false positive the scheduler would later admit into a partial load).
+        self._save_failed: set = set()
         log.info(
             "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s",
             role, self._tenant_suffix, self._block_size, _VLLM_AVAILABLE,
@@ -449,7 +503,17 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 staging = np.empty(template.numel() * template.element_size(), dtype=np.uint8)
                 ok = self._store.load_layers(rm.content_hash, [layer_name], [staging])[0]
                 if not ok:
-                    log.debug("load miss req=%s layer=%s", rm.req_id, layer_name)
+                    # Anomalous: this request was admitted because the scheduler
+                    # saw the `__present__` marker, so every layer should be
+                    # present. A miss here means a layer expired while its marker
+                    # lived (a TTL grace breach — see _TTL_LAYER_GRACE_SECS) or a
+                    # backend fault. The position keeps its (uninitialised) paged
+                    # KV; surface it loudly rather than swallowing at debug.
+                    log.warning(
+                        "external KV load miss after positive presence: req=%s layer=%s "
+                        "(prefix partially uncached — possible TTL grace breach)",
+                        rm.req_id, layer_name,
+                    )
                     continue
                 value = torch.from_numpy(staging).view(template.dtype).reshape(template.shape)
                 _inject_layer(kv_layer, value, rm.slot_mapping, self._is_mla)
@@ -466,7 +530,15 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             if not rm.is_store:
                 continue
             gathered = _extract_layer(kv_layer, rm.slot_mapping, self._is_mla).detach().cpu()
-            self._store.save_layers(rm.content_hash, [layer_name], [_byte_view(gathered)])
+            ok = self._store.save_layers(rm.content_hash, [layer_name], [_byte_view(gathered)])
+            if not ok or not ok[0]:
+                # Any layer failing taints the whole prefix: record it so the
+                # marker is withheld (an all-or-nothing presence guarantee).
+                self._save_failed.add(rm.req_id)
+                log.warning(
+                    "layer save failed req=%s layer=%s — withholding presence marker",
+                    rm.req_id, layer_name,
+                )
 
     def wait_for_save(self) -> None:
         # put_from is awaited inside save_layers (write-through, ACK = durable).
@@ -476,8 +548,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         if meta is None:
             return
         for rm in meta.requests:
-            if rm.is_store and _slot_len(rm.slot_mapping) > 0:
+            # Gate on save success: a request whose any layer failed
+            # (`_save_failed`) must NOT get a marker — else the next instance
+            # sees a present prefix it can't fully load.
+            if rm.is_store and _slot_len(rm.slot_mapping) > 0 and rm.req_id not in self._save_failed:
                 self._store.mark_present(rm.content_hash)
+        self._save_failed.clear()
 
     def get_finished(self, finished_req_ids: set):
         # No async send/recv in Phase 3a.

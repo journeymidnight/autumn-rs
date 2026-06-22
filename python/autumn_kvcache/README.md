@@ -68,7 +68,23 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /models/Qwen3-8B --served-model-name qwen3 \
 
 `kv_connector_extra_config` keys: `endpoint` (autumn manager `host:port`,
 required), `transport` (`tcp` default, or `ucx`), `client_workers`,
-`max_inflight`.
+`max_inflight`, `ttl_secs`.
+
+**`ttl_secs`** (default `0` = no expiry) is the relative TTL after which an
+offloaded prefix stops being *served*. Content-addressed keys never invalidate,
+so a TTL is the only reclamation knob for a long-running cluster. Two caveats on
+what exactly it bounds:
+
+- The connector writes the per-prefix completion marker with `ttl_secs` and the
+  layer pages with `ttl_secs + grace` (grace = 300 s), so the marker always
+  expires *before* its layers. The scheduler admits a load on the marker; a
+  marker that outlived its layers would let the worker silently load
+  uninitialised KV (a correctness bug). So `ttl_secs` bounds **admissibility**
+  (when the prefix can still be hit); the layer **data** lingers ~`grace`
+  longer before its own lazy expiry.
+- Reclamation is **lazy** (keys are dropped on read after they expire, plus
+  background compaction), not a hard wall-clock free — size capacity planning
+  accordingly.
 
 ### Verifying the cross-instance hit
 
@@ -110,6 +126,13 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
 
 - **Stateless adapter / content-addressed keys** — no invalidation, partition
   is the only persistence path.
+- **TTL reclamation (`ttl_secs`)** — both adapters accept `ttl_secs` in their
+  extra-config (vLLM `kv_connector_extra_config`, sglang
+  `hicache-storage-backend-extra-config`); default `0` = no expiry. The
+  partition layer expires keys lazily on read. The sglang backend just stamps
+  every page (its own L1/L2 + hash manage existence, so an expired L3 key is a
+  clean miss); the vLLM connector additionally keeps the completion marker's TTL
+  shorter than its layers' (see above) to preserve load correctness.
 - **Return fast** — never block past the engine's step budget; the load path is
   synchronous in Phase 3a (per-layer overlap is Phase 3b).
 - **Tenant isolation** — keys carry a tenant suffix derived from model + TP/PP,

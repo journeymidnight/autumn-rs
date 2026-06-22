@@ -1555,3 +1555,37 @@ gaps in the lease protocol's correctness story.
   首读 timeout,之后自愈)——非 bug,**按文档准确性修复**(README/注释/CLAUDE 改为"稳态自愈、非每读保证";
   保留非阻塞设计:同步首刷会把 manager RTT 压上读热路径、idle 周期 poll 是刻意避免的 per-partition 流量)。
   首轮 coco 后端不可达(infra/auth),重跑通过。
+
+## F277 · Python autumn 客户端 put 族 + kvcache adapter 接 TTL(默认不过期)(2026-06-22)
+- **目标/边界:** 用户拍板:autumn **Python 客户端**的 put 族都应支持 TTL,默认不过期;并把 vLLM/sglang
+  两个 kvcache adapter 接上 TTL(content-addressed key 永不失效 → TTL 是唯一回收手段)。范围 = 纯 Python
+  层(`python/src/lib.rs` PyO3 binding + 两个 adapter);**不动** Rust SDK/wire/存储——partition 层 TTL
+  (F085:`expires_at` 全程 + 读路径惰性过期 `rpc_handlers.rs:495/688` + SST `min_expires_at` + 后台清理)、
+  `PutReq.expires_at`/`BatchPutOp.expires_at`、Rust SDK `put_many(&[(k,v,expires_at)])` + `ttl_to_expires_at`
+  均已完整,缺口只在 Python binding 把 `expires_at` 恒写 0。
+- **设计决策(用户 2 问已答):** (1) 范围 = Python 客户端 put 族 + kvcache adapter(不再给 Rust SDK 加回
+  单键便捷 API——`put_with_ttl` 2026-06-08 已有意删除合并进 put_many);(2) Python 端参数形态 = **相对
+  `ttl_secs`**(默认 0/None = 不过期),binding 内用 `ClusterClient::ttl_to_expires_at` 转绝对 `expires_at`。
+- **实现(`python/src/lib.rs`):** `Op::Put/PutFrom/BatchPutFrom` + `BatchJob` + `run_job`/`run_batch` 各
+  加 `ttl_secs: u64`;`Client.put`/`put_from`/`batch_put_from` 与 `BatchClient.put_from` 加 `#[pyo3(signature
+  =(...,ttl_secs=0))]`。`ttl_secs==0` 走原无 TTL 快路径(零行为变更);非 0 时转 `expires_at` 后经
+  `put_many`(承载 expires_at 的 wire 路径)写——kvcache 的 ZC 写路径(`BatchClient.put_from`→`run_job`
+  `BatchOp::Put`)保持 `Bytes::from_static` 零拷贝。
+- **实现(adapter):** vllm `_AutumnKVStore(ttl_secs)`:**marker TTL=ttl_secs、layer TTL=ttl_secs+grace(300s)**
+  → marker 永远先过期,杜绝「marker 在、layer 已过期 → scheduler 命中 → worker 部分层 load miss 静默
+  `continue` → 未初始化 KV 静默错误输出」;`extra_config.ttl_secs` 注入。sglang `AutumnKVCacheStorage`:
+  `ttl_secs` 透传 `batch_set_v1`(put_from)+ `set`(put);自管 existence,过期=干净 miss,无 marker 复杂度。
+- **验收标准:** (1) `cargo check -p autumn-python` 绿(0 新增 warning);(2) 两 adapter `py_compile` 绿;
+  (3) dataplane e2e(`tests/test_vllm_dataplane.py` 新增 §6 TTL):`ttl_secs=1` store save+mark → 立即
+  `is_present`True、`exists(layer)`True;sleep 3s 后 `is_present`False(marker 惰性过期)、`exists(layer)`True
+  (layer grace 存活 → 验证 marker-before-layer 不变量);(4) coco review。
+- **passes:** completed(代码 + cargo check autumn-client/autumn-python 绿 + py_compile 绿;maturin 重建
+  wheel 装进 f250 venv;1-node TCP fresh-cluster dataplane e2e 全 12 项 PASS,含 §6 TTL(ttl_secs=1 → marker 3s
+  后惰性过期、layer grace 存活 = marker-before-layer 不变量成立)+ §6b batch 路径裸 1s TTL(证明
+  BatchClient.put_from 真透传 expires_at,非 grace 掩盖))。**coco findbugs deep(GPT-5.5)3 轮收敛:**
+  R1 3 项(P1 ttl_to_expires_at 整数溢出 → 改 saturating_add;P1 grace 非严格 → 保留 grace+load-miss 改 WARN
+  不静默;P2 负 ttl 静默变永不过期 → 两 adapter fail-fast raise);R2 2 项(grace 重提=已论证 margin 巨大;
+  **新真 bug**:`marker_ttl+300` 可把合法 u64 marker_ttl 顶过 u64::MAX 致 layer 写失败但 marker 仍发布 →
+  false-positive marker → 改 ① TTL 饱和到 u64::MAX ② marker 仅在该 req 所有 layer save 成功才发布
+  `_save_failed` 门控);R3 收敛仅剩 P2/P3 测试/文档(§6 不证 batch TTL → 加 §6b;README ttl_secs 语义澄清
+  marker-admissibility vs layer+grace + lazy 回收)。**未 push(solo-flow,等用户)。**
