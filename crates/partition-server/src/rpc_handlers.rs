@@ -1221,21 +1221,32 @@ pub(crate) async fn handle_split_part(
             format!("split aborted: {what} commit_length failed: {e}"),
         )
     };
+    // commit==0 → seal at sealed_length=0, NOT 1. A frozen tail whose
+    // all-replica commit is 0 (empty — e.g. a tail that just rolled and took
+    // no writes) MUST seal empty: `compute_duplicate_stream` seals an empty
+    // CoW tail as `sealed=true, sealed_length=0` (recoverable — each child
+    // allocs a fresh tail; manager note 32). The OLD `.max(1)` over-sealed an
+    // empty tail at byte 1 → on the child's cold reopen the WAL replay reaches
+    // it, expects 1 byte, finds 0 → WAL-FAILSTOP → child un-openable. Same root
+    // cause + fix as the merge over-seal (commit 80f29aa, handle_merge_partitions
+    // dropped the same `.max(1)`); the empty-log-tail-at-split window is narrow
+    // so this variant wasn't independently reproduced, but the mechanism is
+    // identical and compute_duplicate_stream is symmetric to compute_merge_streams.
+    // The `?` above still aborts on a genuine commit_length Err (unreachable
+    // replica, the F227 hazard documented above), so OK+0 = genuinely empty,
+    // never a masked failure → safe to seal at 0.
     let log_end = part_sc
         .commit_length(log_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "log_stream"))?
-        .max(1);
+        .map_err(|e| unfreeze_on_err(e, "log_stream"))?;
     let row_end = part_sc
         .commit_length(row_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "row_stream"))?
-        .max(1);
+        .map_err(|e| unfreeze_on_err(e, "row_stream"))?;
     let meta_end = part_sc
         .commit_length(meta_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "meta_stream"))?
-        .max(1);
+        .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
 
     // F255 — synchronous P-log → P-bulk barrier. Sent BEFORE
     // `multi_modify_split` so that any failure here is cleanly abortable:
