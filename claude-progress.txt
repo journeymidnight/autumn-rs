@@ -1,3 +1,66 @@
+Date: 2026-06-23
+TaskStatus: completed
+Task scope: 用户要求"压测一小时(大v+小v)+ admin-op churn(split/merge/gc/convert-ec)"。soak 跑满
+  3600s 抓到一个真 P0 → 确定性复现 → 根因 → **修复 + 验证 + coco 通过(未 commit)**,故 completed。
+  驱动脚本全在 /tmp/soak/(env/status/ops/tick/verifier/adminops/watchdog/run_soak/restart_verify/repro)。
+FIX(本会话核心成果)— merge survivor 重启不可开 = `.max(1)` over-seal 空 splice log tail:
+  根因 = crates/manager/src/rpc_handlers.rs handle_merge_partitions(~3352)把每条冻结流的 commit_length
+  捕成 `(resp.end as u64).max(1)`。victim 空 log tail(commit=0)被 .max(1) 顶成 1 → compute_merge_streams
+  把空 extent 封成 sealed_length=1 → 冷重开 survivor WAL 回放读它"要 1 字节实得 0"→ WAL-FAILSTOP → 永久
+  不可开。.max(1) 是 STALE 兜底(note 32 早已让空 tail 封 0、!ex.sealed 闸、无 0-skip),被它遮蔽。
+  修 = 去掉 .max(1) 传真实 commit(含 0)。安全:handle_check_commit_length 副本不可达时返回 Err(已捕获),
+  故 OK+0 = 真空(非被掩盖的失败,split 侧 unwrap_or(0).max(1)→abort 修的是那个 F227 隐患,这里不适用)。
+  验证:把"round 1 即崩"的同一确定性 repro 用修后二进制重跑 → **6/6 轮 open-failures=[]**、survivor 读回
+  byte-exact、log_stream seal 状态干净(无 size=1 雷、无 dangling)、merge 单测 17/17、coco findbugs deep
+  (GPT-5.5)未发现问题。
+FOLLOW-UP(reproduce-first,未做):split 侧 .max(1)(partition-server handle_split_part ~1228/1233/1238)=
+  同一潜在 bug(空 CoW tail 封 1;回放通常跳过故尚未复现)。soak part-93 的 `rowStream extent 157 not found`
+  是另一个(row-stream-checkpoint)侧面,本修未关闭。
+Result: 6-EN TCP /data05、EC-off bootstrap、presplit 8;并发小v(4K inline)+大v(8M VP)perf-check 循环;
+  24 个 durable 已知 key(8×8M+16×2K)散布全 keyspace sha256 连续校验;admin-op 每 ~200s 轮转 split/
+  compact/gc/set-stream-ec+force-ec-convert/merge(靶子随机分散)。**活集群上数据完整性全程满分**
+  (durable 24/24 byte-exact、refcount_leaks=0、orphans=0、0 panic、ACCOUNTING_OK),EC 转换 e2e 真编码
+  (4 extent parity 填充 eversion bump),六类 admin-op 功能均正确。
+🔴 P0(未修,reproduce-first 待办)— 重启后单分区不可开 = 数据不可用:
+  merge 热点 survivor part 93(反复 merge 堆成 63GB/105-SST)在 cluster.sh start(保留数据,非 reset)后
+  **永远开不了**:其持久 meta_stream TableLocations checkpoint 引用 row-stream SST extent=157,但 157 已被
+  GC/compaction 从 manager 回收(当前 manager 元数据干净、无 stream 列 157)。
+    ERROR partition thread failed: read SST from rowStream extent=157 offset=535224764:
+          extent_info failed: extent 157 not found part_id=93  → open 重试 48 次 30s 退避永不成功。
+  活集群期间 part 93 一直可用(走已打开的内存 SstReader),**仅冷重开从持久 stream 时暴露悬挂引用**。
+  影响:9/24 durable key(part 93 range 0x9f–0xff)重启后不可用,其余 9 分区+15 key 正常。值是否真丢
+  (vs 仅 checkpoint 失配可 repair-metastream 修)未定——需查 157 的 SST 数据是否还在 log_stream/其它 SST。
+  类别:checkpoint-before-reclaim 顺序 / GC-vs-checkpoint 竞争(同 GC-stale-cache / manifest-no-CRC 家族)。
+  **原始 soak 日志被 restart 截断,必须 reproduce-first 重跑+保日志再 root-cause,勿凭推断在 revert-prone 区动刀。**
+🟠 次要 finding:重载下 merge 让 survivor 整段 range 读不可用 60–90s(远超标称 ~2s region_sync),还能把并发
+  8M 读 workload 拖死 50min(一个 large perf-check run 卡 age 3003s,按 PID kill);整小时 32 条单发 GET-FAIL
+  全在 merged range、活集群全自愈。
+建议:① accounting checker 增"stream 引用的每个 extent 必须存在"不变量(活集群即可抓);② reproduce-first
+  脚本注入 merge→gc→restart 序列+保 manager/ps 日志定位 157 删除点;③ 修 = checkpoint 必须先于 row-extent
+  reclaim 更新(或 GC relocate-then-punch 时同步刷 TableLocations)。
+REPRODUCED(2026-06-23,/tmp/soak/repro.sh v2,干净集群,ROUND 1 即触发):merge survivor part 15 重启后不可开。
+  首次 repro 踩坑=残留 etcd squatter :2379([[project_clustersh_etcd_clean_broken]])让 repro bootstrap 到 soak
+  的 etcd(18 分区、range 重叠、merge 全失败)→ 只杀我自己的 soak etcd+进程(保 soak 数据)重跑→round1 复现。
+精确根因——同族两变体(merge survivor 冷重开不可开):
+  · soak part 93: rowStream extent 157 not found(meta_stream checkpoint 引用已回收 ROW extent)。
+  · repro part 15: WAL-FAILSTOP log_stream extent 68 got 0 of 1 expected bytes(被 splice 进来的 victim LOG tail
+    被 over-seal:sealed_length≥1 但服务副本 0 持久字节;68 在 manager log 0 次出现=victim 的 log tail 被 merge
+    splice 进 survivor)。
+  两者皆 **split/merge 非幂等+客户端重试** 家族([[project_split_retry_cascade]];manager note 32a
+  BUG2-IDEMPOTENT-ROLL 只修了 split 的 seal_and_roll)。触发链:merge 可用性缺口(survivor F185 freeze-drain
+  切换期不可用 60-90s)→ autuop/客户端重试 merge(repro 日志:merge 15 36→connection error→merge ok)→ splice
+  tail 在 phantom/未静默 commit 上被 over-seal。compute_merge_streams seal 有 !ex.sealed 幂等闸(lib.rs ~2762/
+  2833)非裸双封;错的是捕获的 victim_sealed/survivor_sealed(F185 freeze-drain 连接抖动下未完全静默,或 F227
+  phantom-commit)。
+Next steps(用户定夺):#2 reproduce 已完成(确定性复现+根因+保日志)。#3 fix 高风险——F227 lenient-seal 是用户
+  既定决策、merge handler 被 F138/F145/F146/F149/Item3-CAS 重重保护——需再 trace 一层 victim_sealed 来源+谨慎改
+  +coco+repro 复验,本会话未动刀(遵守 reproduce-first/不盲修)。#1 detector=post-merge restart-openability 断言
+  (accounting checker 看不到 seal-length over-seal),repro 即其体现。
+验收: 见 /tmp/soak/logs/FINDINGS.md + /tmp/soak/repro_out/(round1 保留日志 + REPRODUCED_ps.log) + 本会话记忆
+  [[project_soak_merge_hotspot_unopenable_p0]]。集群:repro 集群留活(part 15 坏)可 inspect。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(F278, completed + committed 1b522fa,未 push):
 Date: 2026-06-22
 TaskStatus: completed
 Task scope: F278 — vLLM connector 跨实例正确性,真 Qwen3-VL e2e 抓修 3 个 P0(F250 一直只测 metric)。

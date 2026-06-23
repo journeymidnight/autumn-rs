@@ -3347,9 +3347,27 @@ impl AutumnManager {
                         format!("commit_length stream {stream_id}: {}", resp.message),
                     ));
                 }
-                // Match the CLI's `.max(1)` — F183's manager treats 0 as
-                // "use the existing sealed_length" / no-op for this stream.
-                Ok::<u64, (StatusCode, String)>((resp.end as u64).max(1))
+                // Pass the REAL committed length, INCLUDING 0. A frozen tail
+                // whose all-replica commit is 0 (empty — e.g. a freshly-rolled
+                // victim log tail that took no writes) MUST seal at
+                // `sealed_length = 0`, not 1. `compute_merge_streams` /
+                // `splice_streams_without_new_tail` seal an empty tail as
+                // `sealed = true, sealed_length = 0` (manager note 32, after the
+                // `&& *_sealed > 0` guard was dropped) → sealed-empty is
+                // recoverable: each child allocs a fresh tail and replay reads 0
+                // bytes there. The OLD `.max(1)` over-sealed an empty spliced
+                // VICTIM log tail at byte 1; on cold reopen the survivor's WAL
+                // replay reaches that extent, expects 1 byte, finds 0, and trips
+                // WAL-FAILSTOP "got 0 of 1 expected bytes" → the merge survivor
+                // is permanently un-openable (reproduced deterministically:
+                // /tmp/soak/repro.sh round 1, survivor part 15, log extent 68).
+                // The stale "0 = no-op / use existing" comment predates note 32;
+                // neither compute fn nor handle_multi_modify_merge special-cases
+                // 0. (handle_check_commit_length already returns Err — caught
+                // above — when a replica is unreachable, so OK+0 = genuinely
+                // empty, never a masked failure: the F227 hazard the split-side
+                // `unwrap_or(0).max(1)` fix addressed does not apply here.)
+                Ok::<u64, (StatusCode, String)>(resp.end as u64)
             }
         };
 
