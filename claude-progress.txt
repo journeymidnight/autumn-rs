@@ -1,3 +1,38 @@
+Date: 2026-06-23 (深夜)
+TaskStatus: completed
+Task scope: 用户"再压测,配合上 chaos"。用官方 system_chaos(真 EN 子进程 kill+restart + split/merge/EC/
+  killfence/fence/gc nemesis + per-key durability + accounting 不变量)验证两个 .max(1) 修复。
+结果:**两个 over-seal 修复在 chaos 下验证通过,无数据丢失,无新 bug**。
+  · 含历史触发该 over-seal 家族的 seed 13/603 在内,3/3 seed(13/603/42,moderate 配置 90s/5s interval)
+    全 PASS:**mismatches=0、not_found=0、accounting errors=0、all invariants OK、0 WAL-FAILSTOP**。
+  · 先用激进配置(240s/2500ms interval/含频繁 kill EN)跑 seed 13/603 失败——但失败 = **verify 期 part_addr
+    路由 wedge**(某分区 listener addr 在最后一波 nemesis 后还没 reconverge,harness verify 在 attempt=0 就放弃),
+    **非 over-seal bug(0 WAL-FAILSTOP)、非数据丢失(mismatches=0)**。诊断确认:同样的 nemesis 集合换成有收敛
+    窗口的 moderate 配置(5s interval),seed 13/603 立即干净通过(not_found=0)→ 那是我配置太猛、nemesis 打到
+    verify 之前不留收敛窗口的 timing 假阳性,不是真 bug。
+教训:chaos nemesis interval 不能压到 verify settle 以下(默认 30s 跑能过;240s+2.5s 间隔会把 part_addr 收敛窗口耗光)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(SECOND SOAK):
+Date: 2026-06-23 (晚)
+TaskStatus: completed
+Task scope: 用户"继续压测一小时+各种op,查还有无 bug"(在两个 .max(1) 修复之后)。
+SECOND SOAK 结果:**两个修复在规模上验证通过 + 数据完整,未发现新产品 bug**(被磁盘填满+我自己的操作失误打断,~30min)。
+  · 用修后二进制起 6-EN/8-presplit 同款 soak。跑 ~30min:全程 admin churn(split/compact/gc/set-stream-ec/
+    force-ec-convert/merge)+ 大小 v 混合负载 + 24 durable key 校验。
+  · **修复验证(核心正面结果)**:把这个被 churn 30min 的集群 cold-restart(等价崩溃重启)→ **0 WAL-FAILSTOP、
+    0 open-failures、10/10 分区全开**(修复前 merge survivor 会 WAL-FAILSTOP 开不了)→ 两个 .max(1) 修复在规模上成立。
+  · **数据完整**:24/24 durable key byte-exact(其中 3 个 part-19 因 95% 磁盘 + 90GB 大分区恢复慢,等 part19 settle 后读回 byte-exact)。
+  · **未发现新 bug**:soak 期间的 DATALOSS 全是已知"大分区在 admin churn/负载下读瞬时不可用"特征(QPS ceiling ~30K +
+    merge 可用性缺口),全部自愈;0 panic、0 WAL-FAILSTOP、0 open-fail。
+  · **环境/操作失误(非产品 bug,自我复盘)**:① 负载配置对磁盘过猛——admin churn 把数据堆进 90GB 大分区,GC 跟不上,
+    /data05 30min 填到 95%,提前收尾;② 清理用 kill 进程组误杀了集群(cluster.sh 把集群进程放在 master 进程组里);
+    ③ 诊断脚本 `cd` 后用相对 `target/release/autumn-client` 路径 3 次→ rc=127 误报"data lost"(实际数据完好,用绝对路径即 21-24/24)。
+  · 清理:停集群 + 杀 etcd + wipe /data05/autumn-soak(1.6TB,释放磁盘)。
+教训:soak 负载要配磁盘配额/限速;清理用 cluster.sh stop 别杀进程组;诊断脚本一律用绝对二进制路径。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV(FIRST SOAK + 两个 .max(1) 修复, committed 80f29aa + 05f0293):
 Date: 2026-06-23
 TaskStatus: completed
 Task scope: 用户要求"压测一小时(大v+小v)+ admin-op churn(split/merge/gc/convert-ec)"。soak 跑满
