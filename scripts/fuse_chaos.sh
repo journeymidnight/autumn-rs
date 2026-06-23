@@ -150,6 +150,14 @@ setsid nohup "$PSBIN" --psid "$VID" --port "$VPORT" --manager "$MGR" \
     > "$WORK/ps${VID}_respawn.log" 2>&1 < /dev/null &
 sleep 6
 
+# NOTE — EN (data-plane) kill+restart is covered by the dedicated
+# `scripts/fuse_en_restart_chaos.sh` (integrity-focused, quick respawn). It is
+# kept SEPARATE because an EN kill stalls in-flight ops for ~30 s (the dead
+# replica isn't fast-failed within the rpc/bridge 30 s window) — fine for a
+# focused check, but it would make THIS continuous-workload harness slow/noisy.
+# Integrity under EN restart is intact (verified there); the stall is an
+# AVAILABILITY characteristic, not data loss. See fuse CLAUDE.md.
+
 # ── F2: manager kill + respawn under live file I/O ─────────────────────────
 MPID=$(pgrep -f autumn-manager-server | head -1)
 MCMD=$(tr '\0' ' ' < "/proc/$MPID/cmdline")

@@ -1,3 +1,29 @@
+Date: 2026-06-23 (EN/PS 重启 测试)
+TaskStatus: completed
+Task scope: 用户"多测试 en ps 重启的情况"(承接 RMW-GET-SWALLOW 修复)。
+结果:**EN 重启 fuse 数据完整性 OK(4 轮×3 EN + remount,6 durable 4K..10M + 4 RMW 镜像 byte-exact);
+  PS 重启 OK(已有 F1 + fuse_rmw_chaos)。新增一个 AVAILABILITY finding(非数据丢失):EN 在线期间发起的
+  op 会 stall ~30s 才 failover**。新增 scripts/fuse_en_restart_chaos.sh 作 EN 重启完整性守卫。未 commit。
+覆盖缺口:fuse_chaos 只 kill PS/manager/fuse,从不重启 EN(数据面);system_chaos 有真 EN kill+restart 但不经
+  fuse 挂载。本次补 fuse 挂载下 EN 重启。
+做法+结论:
+  · 先给 fuse_chaos 加 E1(EN kill,write-during-down + manifest verify)——但 ① 放在 F1 PS-respawn 后 6s,
+    与 PS region reconvergence 混淆;② write-during-EN-down 每 op stall ~30s(daemon 单线程串行化)→ 慢/噪。
+    → 撤掉 E1,改成独立 fast 脚本。
+  · scripts/fuse_en_restart_chaos.sh(从 /tmp/fuse_rmw/en_integrity.sh 提升):EN kill + **2s 快重启** + 健康后
+    verify(durable sha + RMW 镜像)。隔离 correctness(EN 重启是否损坏/丢数据)与 availability(EN-down 慢)。
+    实测 PASS:baseline + after-clean-rmw + r1..r4(每 EN)+ remount 全 integrity OK。
+AVAILABILITY finding(报告用户,未修):EN kill -9 后,仍在飞行/新发的 op 走 dead replica 的 stale conn(或 PS 侧
+  VP resolve / commit-length 探测重试 dead replica)在 30s rpc_timeout 内不被 fast-fail;fuse bridge REPLY_TIMEOUT
+  也是 30s → op 在 ~30s 时 EIO 而非 ms 级 failover;daemon 单线程 → 一个 stalled write 串行化后续写。EN 回来/被标
+  Suspected(F276 读避让只在 ~30s 检测后才生效)后自愈。**非 fuse 专属——任何 client 碰 kill 的 EN stale conn 都中招。**
+  修法 = stream 层 stale-EN-conn 更快 fast-fail(缩短 first-attempt timeout),属共享 conn-pool 路径(revert-prone),
+  reproduce-first 已具备,等用户拍板是否动刀。
+Next steps(用户定夺):commit 守卫脚本+文档(solo-flow);是否追 availability 修(stream 层,谨慎)。
+验收: scripts/fuse_en_restart_chaos.sh PASS;/tmp/fuse_rmw/eni.log + restart_soak.log(慢路证据)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-23 (RMW-GET-SWALLOW)
 TaskStatus: completed
 Task scope: 用户"chaos 测试 fuse,我发现 fuse 经常出问题"。

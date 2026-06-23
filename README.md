@@ -363,6 +363,12 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 #   the untouched bytes of a file on a *successful* write. Single-PS (no
 #   migration) so the verify read can't wedge:
 #   AUTUMN_DATA_ROOT=/data05/autumn-rmw ./scripts/fuse_rmw_chaos.sh
+# Fuse EN (data-plane) restart integrity (2026-06-23): kill+restart each EN;
+#   durable + RMW files stay byte-exact across replica failover + rejoin.
+#   (EN restart is correct; an op issued mid-EN-down stalls ~30s before
+#    failover — availability, not data loss; see fuse CLAUDE.md "Restart
+#    behaviour".):
+#   AUTUMN_DATA_ROOT=/data05/autumn-eni ./scripts/fuse_en_restart_chaos.sh
 # Cross-host chaos (F272, real network ::14+::15, remote via ssh):
 #   ./scripts/crosshost_chaos.sh tcp | ucx
 # Multi-manager HA chaos (F267): leader kill -> standby takeover, PS kill under

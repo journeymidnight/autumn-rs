@@ -645,3 +645,32 @@ on timeout/error it falls back to the benign large default. statfs is rare
 (a `df` invocation) so an inline call is fine; no background cache needed.
 File `size` stays the logical size (replica/EC amplification is transparent to
 the FS layer, matching Ceph/HDFS). inode counts (files/ffree) stay a constant.
+
+## Restart behaviour under chaos — EN vs PS (2026-06-23)
+
+Three restart classes, each with its own harness:
+
+- **PS (partition-server) kill+restart** — `scripts/fuse_chaos.sh` F1. The
+  partition MIGRATES to another PS; file I/O resumes after region
+  reconvergence; synced files stay byte-exact. The RMW-GET-SWALLOW guard
+  (`scripts/fuse_rmw_chaos.sh`) covers the PS-down RMW corruption window.
+- **manager / fuse-daemon kill+restart** — `fuse_chaos.sh` F2/F3.
+- **EN (extent-node, data-plane) kill+restart** —
+  `scripts/fuse_en_restart_chaos.sh`. An EN kill does NOT migrate partitions;
+  the stream layer fails reads/writes over to the surviving replicas.
+  **INTEGRITY is intact** — verified byte-exact across 4 kill+restart rounds
+  (all 3 ENs) + a remount, for 6 durable files (4 KiB..10 MiB incl.
+  multi-extent) + 4 repeatedly-RMW'd files vs a lockstep mirror.
+  **AVAILABILITY caveat (not data loss):** an op issued WHILE an EN is still
+  down stalls ~30 s before failing over. `connect()` gives the fuse
+  `ClusterClient` a 30 s `rpc_timeout`, and the bridge `REPLY_TIMEOUT` is also
+  30 s, so a request riding the dead replica's stale connection (or a PS-side
+  VP resolve / commit-length probe that retries the dead replica up to its own
+  30 s budget) isn't fast-failed within the window → the op EIOs at ~30 s
+  instead of failing over in ms. Because the fuse dispatcher is
+  single-threaded, one stalled write serializes the writes behind it. It
+  self-heals once the EN returns or the manager marks it Suspected (F276 read
+  avoidance only engages AFTER the ~30 s detection). A faster dead-replica
+  fast-fail (shorter first-attempt timeout on a stale EN conn) is a
+  stream-layer change, deliberately NOT done here — reproduce-first + it
+  touches the shared connection-pool path that all clients use.
