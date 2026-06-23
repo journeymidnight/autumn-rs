@@ -206,7 +206,20 @@ pub async fn write_region(
                 let end = (pos + rest.len() as u64).min(cap);
                 let n = (end - pos) as usize;
                 let ck = key::extent_key(ino, fs);
-                let mut val = state.kv_get(&ck).await.unwrap_or_default();
+                // RMW read BARRIER (must mirror `clean_beyond_eof`'s
+                // kv_get_opt): a hard get error (transient RPC / routing /
+                // storage failure) must PROPAGATE, never be swallowed. Treating
+                // the existing extent as empty here zero-fills the untouched
+                // prefix `[fs, pos)` and TRUNCATES the untouched suffix
+                // `[pos+n, …)`, then `put`s the result — fabricating data on a
+                // *successful* write (the one crash/transient window in this
+                // layer that corrupts rather than just loses an un-fsynced
+                // write). Propagate → fuse EIO, the app retries the overwrite;
+                // a genuinely-absent key (`Ok(None)`) is the only case that may
+                // be treated as empty (a mapped extent's key should always
+                // exist, but if it's truly gone there is nothing to preserve —
+                // empty is the safe sparse value).
+                let mut val = state.kv_get_opt(&ck).await?.unwrap_or_default();
                 let in_off = (pos - fs) as usize;
                 if val.len() < in_off + n {
                     val.resize(in_off + n, 0);

@@ -356,7 +356,13 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 #    --release + pip reinstall; a stale wheel mis-encodes requests):
 #   ./scripts/kvcache_chaos.sh
 # Fuse-interface chaos (F273): file workload through the mount under
-#   PS-kill / manager-kill / fuse-kill+remount:  ./scripts/fuse_chaos.sh
+#   PS-kill / manager-kill / fuse-kill+remount + T1 truncate-shrink crash:
+#   ./scripts/fuse_chaos.sh
+# Fuse RMW corruption guard (RMW-GET-SWALLOW, 2026-06-23): partial in-place
+#   overwrite during a PS kill+restart; a swallowed RMW read-error would zero
+#   the untouched bytes of a file on a *successful* write. Single-PS (no
+#   migration) so the verify read can't wedge:
+#   AUTUMN_DATA_ROOT=/data05/autumn-rmw ./scripts/fuse_rmw_chaos.sh
 # Cross-host chaos (F272, real network ::14+::15, remote via ssh):
 #   ./scripts/crosshost_chaos.sh tcp | ucx
 # Multi-manager HA chaos (F267): leader kill -> standby takeover, PS kill under

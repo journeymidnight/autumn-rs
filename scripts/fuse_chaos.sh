@@ -299,6 +299,13 @@ else
     fail "T3: same-path rename destroyed the file"
 fi
 
+# NOTE — RMW (partial in-place overwrite) under PS failover is covered by the
+# DEDICATED, deterministic `scripts/fuse_rmw_chaos.sh` (single-PS, no migration
+# churn, so the verify read can't wedge on part_addr reconvergence the way a
+# kill+respawn in THIS multi-PS harness would). It guards RMW-GET-SWALLOW: a
+# swallowed RMW read-error zero-filling the untouched bytes of a file on a
+# *successful* write. Kept separate on purpose — see fuse CLAUDE.md.
+
 # ── final verification ──────────────────────────────────────────────────────
 total=$(wc -l < "$WORK/manifest.txt")
 say "final verify ($total synced files)"

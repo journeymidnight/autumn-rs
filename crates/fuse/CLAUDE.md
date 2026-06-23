@@ -545,6 +545,29 @@ FABRICATES data; it can only lose a recent un-fsynced write:
   by size), overwritten by a regrowing append (same `[0x03][ino][off]`
   keys), and reaped by unlink / truncate (both PREFIX-scan, not
   size-bounded).
+- **In-place overwrite (RMW) read barrier (RMW-GET-SWALLOW, 2026-06-23)**:
+  a partial write whose offset lands INSIDE an existing extent must
+  read-modify-write that extent's value (`extent::write_region` RMW
+  branch). The existing-value read MUST use the `kv_get_opt` barrier and
+  PROPAGATE a hard error — exactly like `clean_beyond_eof`. Pre-fix it was
+  `kv_get(&ck).await.unwrap_or_default()`, which collapsed a transient
+  RPC/routing/storage error into an EMPTY value; the code then zero-filled
+  the untouched prefix `[start, offset)`, TRUNCATED the untouched suffix,
+  and `put` the result — fabricating zeros / dropping bytes on a
+  *successful* write (the cp-only append workload never hits RMW, so
+  `fuse_chaos` T1–T3 missed it). The corruption is deterministic when the
+  RMW's `get` hard-errors but the following `put` lands: `get`/`put` have
+  SEPARATE 10-refresh (~13 s) retry budgets, so a PS that is briefly
+  unavailable (kill, migration > budget, a single RPC timeout under load)
+  exhausts the `get` while the `put` later succeeds. Fix propagates → fuse
+  EIO (the app retries); only a genuinely-absent key (`Ok(None)`, which a
+  mapped extent should never be) is treated as the safe sparse-empty value.
+  Guarded by the dedicated `scripts/fuse_rmw_chaos.sh` (partial overwrite + PS
+  kill + restart-at-16s so the get's retry budget exhausts while the put lands;
+  asserts the untouched prefix is NEVER zeroed). It is SINGLE-PS on purpose —
+  a kill+respawn in the 2-PS `fuse_chaos.sh` migrates the partition and the
+  post-restart verify read can wedge on part_addr reconvergence, which is
+  unrelated to this bug; single-PS has no migration so the read returns.
 - **Shrink / truncate path (the fixed bug)**: the inode-meta put is the
   COMMIT POINT — it lands BEFORE extents are deleted/shortened. Pre-fix
   the order was inverted: a crash between extent destruction and the meta

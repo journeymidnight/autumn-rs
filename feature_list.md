@@ -480,6 +480,28 @@ gaps in the lease protocol's correctness story.
   文档：fuse CLAUDE.md "Crash-consistency contract" 全节。
 - **passes:** completed (2026-06-12)
 
+### RMW-GET-SWALLOW · fuse 原地覆盖写吞 RMW 读错误 → 成功写却伪造零（2026-06-23）
+- **目标:** 用户"chaos 测试 fuse,fuse 经常出问题"。现有 `fuse_chaos.sh`
+  (cp/append-only) 全绿,但 **RMW（offset 落在已有 extent 内的部分覆盖写）
+  路径从不被覆盖**。审计抓到 `extent.rs:write_region` RMW 分支
+  `state.kv_get(&ck).await.unwrap_or_default()` —— 把 transient/hard get 错误
+  collapse 成空 Vec,随后 zero-fill 未触及前缀 + 截断未触及后缀 + put,
+  在**成功的写**上伪造零/丢字节(违反本层"绝不伪造数据"契约)。
+- **复现(reproduce-first,确定性):** `/tmp/fuse_rmw/repro.sh`。get/put 各有
+  独立 10-refresh(~13s)预算 → kill 持有 PS 让 RMW 的 get 在死亡期耗尽预算
+  硬错,+16s 重启让随后的 put(新预算)落盘。1MiB 文件(pattern A)做
+  256K@256K 部分覆盖:**dd 报 rc=0(成功)但回读 prefix[0,256K) 全零**
+  (nonzero-bytes=0)——伪造零确诊。
+- **修复:** `state.kv_get_opt(&ck).await?.unwrap_or_default()` —— 传播硬错误
+  (→ fuse EIO,app 重试),仅把真实缺失 key(`Ok(None)`,mapped extent 不该
+  出现)当安全稀疏空值。镜像同文件 `clean_beyond_eof` 既有 barrier。
+- **验证:** 修后重跑同 repro → **dd rc=1(EIO) + 文件完好(==A)** = 安全失败;
+  fuse 44 lib 单测绿;coco findbugs deep(GPT-5.5)未发现问题。新增
+  `scripts/fuse_rmw_chaos.sh`(部分覆盖 + PS kill+restart + prefix-never-zeroed
+  断言)作永久回归守卫——**单 PS**(无 migration → verify 读不会卡 part_addr
+  reconvergence;2-PS fuse_chaos 里同招会因 migration churn wedge,故独立成脚本)。
+- **passes:** completed (2026-06-23)
+
 ---
 
 ### ETCD-1 · 生产急修批次 5：etcd 故障 chaos——leaderless 黑洞 + 全队自杀 + 审计日志泄漏（2026-06-12）

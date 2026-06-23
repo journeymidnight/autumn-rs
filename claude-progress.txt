@@ -1,3 +1,30 @@
+Date: 2026-06-23 (RMW-GET-SWALLOW)
+TaskStatus: completed
+Task scope: 用户"chaos 测试 fuse,我发现 fuse 经常出问题"。
+结果:**现有 fuse_chaos.sh 全绿(cp/append-only),但审计 + 确定性复现抓到一个真 P0 数据损坏(fuse RMW 路径),
+  已修 + coco 通过 + 加永久回归守卫(T4)**。未 commit/push(等用户拍板,solo-flow)。
+ROOT CAUSE — fuse 部分覆盖写(RMW)吞 get 错误 → 成功写却伪造零:
+  crates/fuse/src/extent.rs write_region 的 RMW 分支(offset 落在已有 extent 内)用
+  `state.kv_get(&ck).await.unwrap_or_default()` 读现值。transient/hard get 错误被 collapse 成空 Vec →
+  zero-fill 未触及前缀 [start,offset) + 截断未触及后缀 + put → 在**成功的写**上伪造零/丢字节。
+  cp-only 工作负载只走 append("Fresh territory"分支),从不进 RMW → fuse_chaos T1-T3 漏掉这条路径。
+复现(reproduce-first,确定性,/tmp/fuse_rmw/repro.sh):get/put 各有独立 10-refresh(~13s)预算 →
+  kill 持有 PS 让 RMW 的 get 在死亡期耗尽预算硬错,+16s 重启让随后的 put(新预算)落盘。
+  1MiB 文件部分覆盖 256K@256K:**修复前 dd rc=0(成功)但回读 prefix[0,256K) 全零** = 伪造零确诊;
+  **修复后 dd rc=1(EIO) + 文件完好(==A)** = 安全失败(app 重试)。
+FIX:`state.kv_get_opt(&ck).await?.unwrap_or_default()` —— 传播硬错误(→ EIO),仅真实缺失 key(Ok(None),
+  mapped extent 不该出现)当稀疏空值。镜像同文件 clean_beyond_eof 既有 barrier。零热路径开销。
+验证:repro 修后安全(dd EIO+文件完好);fuse 44 lib 单测绿;coco findbugs deep(GPT-5.5)未发现问题;
+  新增 scripts/fuse_rmw_chaos.sh(单 PS,部分覆盖 + PS kill+restart + prefix-never-zeroed 断言)永久守卫。
+  注:先在 2-PS fuse_chaos 里加 T4,但 kill PS 触发 migration → verify 读卡 part_addr reconvergence(非本 bug,
+  是已知 wedge 家族)→ 改成独立单 PS 脚本(无 migration,robust),已撤 fuse_chaos T4。
+教训:cp/append-only chaos 漏 RMW(原地覆盖)路径;read-modify-write 的"读"硬错误必须传播(=clean_beyond_eof 早已确立的
+  barrier),unwrap_or_default 在 RMW 上 = 数据损坏。属 feedback_no_let_underscore_swallow 家族。
+Next steps(用户定夺):commit(solo-flow,不 push);可选:把 RMW 覆盖扩到 system_fuse_read 集成测试。
+验收: 见 feature_list RMW-GET-SWALLOW + /tmp/fuse_rmw/(repro + run1 损坏证据 + run2_fixed 安全)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-23 (深夜)
 TaskStatus: completed
 Task scope: 用户"再压测,配合上 chaos"。用官方 system_chaos(真 EN 子进程 kill+restart + split/merge/EC/
