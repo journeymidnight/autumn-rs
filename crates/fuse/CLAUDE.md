@@ -661,16 +661,29 @@ Three restart classes, each with its own harness:
   **INTEGRITY is intact** — verified byte-exact across 4 kill+restart rounds
   (all 3 ENs) + a remount, for 6 durable files (4 KiB..10 MiB incl.
   multi-extent) + 4 repeatedly-RMW'd files vs a lockstep mirror.
-  **AVAILABILITY caveat (not data loss):** an op issued WHILE an EN is still
-  down stalls ~30 s before failing over. `connect()` gives the fuse
-  `ClusterClient` a 30 s `rpc_timeout`, and the bridge `REPLY_TIMEOUT` is also
-  30 s, so a request riding the dead replica's stale connection (or a PS-side
-  VP resolve / commit-length probe that retries the dead replica up to its own
-  30 s budget) isn't fast-failed within the window → the op EIOs at ~30 s
-  instead of failing over in ms. Because the fuse dispatcher is
-  single-threaded, one stalled write serializes the writes behind it. It
-  self-heals once the EN returns or the manager marks it Suspected (F276 read
-  avoidance only engages AFTER the ~30 s detection). A faster dead-replica
-  fast-fail (shorter first-attempt timeout on a stale EN conn) is a
-  stream-layer change, deliberately NOT done here — reproduce-first + it
-  touches the shared connection-pool path that all clients use.
+
+  **WRITE-availability caveat = CAPACITY, not a failover-latency bug
+  (localized 2026-06-23, reproduce-first via `autumn-client`, no fuse bridge).**
+  An EN kill stalls WRITES only when the cluster has exactly RF (=3) ENs:
+  - **3 ENs, RF=3:** every extent lives on all 3 ENs, and killing 1 leaves 2
+    healthy `< RF` — `select_nodes` cannot form a new 3-replica extent without
+    the dead node, so the F227 all-replica-ACK append never completes and a
+    new-extent alloc keeps falling back to the dead node → a single write
+    WEDGES until the EN returns (measured: one `put` hit the 90 s CLI timeout;
+    effectively unbounded). This is the RF=N-on-N-nodes truth (Ceph/HDFS halt
+    writes too at RF=3 on 3 nodes with one down), NOT an autumn defect.
+  - **5 ENs, RF=3:** killing 1 leaves 4 healthy `≥ RF` → new extents alloc on
+    healthy nodes, the append rolls off the dead-replica extent transparently
+    → **writes never stall** (measured: every put/get < 0.1 s with 1 EN down,
+    PS `retries=0`, no manager Suspected-mark even needed).
+  READS tolerate a down replica at ANY cluster size (min-quorum read), which is
+  why the integrity check above always passed even at 3 ENs.
+
+  CONSEQUENCE for these harnesses: `fuse_chaos.sh` / `fuse_en_restart_chaos.sh`
+  run 3 ENs, so they verify EN-restart INTEGRITY (the EN is respawned quickly,
+  reads work throughout) but DO NOT exercise sustained writes-during-EN-down
+  (that would just hit the RF=3 capacity wedge). To test write availability
+  under EN loss, provision >RF ENs. The single-threaded fuse dispatcher + 30 s
+  bridge `REPLY_TIMEOUT` only AMPLIFY a stall into an EIO; they are not the
+  cause. No stream-layer timeout change is warranted (the "fast-fail the stale
+  EN conn" idea was the wrong diagnosis).

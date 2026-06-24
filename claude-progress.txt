@@ -1,3 +1,23 @@
+Date: 2026-06-24 (EN-down stall 定位)
+TaskStatus: completed
+Task scope: 用户"先复现+定位再说"(EN-down ~30s stall finding)。**定位完成:不是 failover-latency bug,
+  是 RF=N-on-N-nodes 容量耗尽。** reproduce-first via autumn-client(无 fuse bridge),未改生产代码。
+确定性证据(/tmp/fuse_rmw/stall.log vs stall5.log,同脚本仅 NODES 不同):
+  · **3 EN, RF=3**:kill 1 → 剩 2 健康 < RF=3 → select_nodes 无法在不含死节点下组 3 副本新 extent →
+    F227 all-replica-ACK append 永不完成 + 新 extent alloc 退回死节点 → **单次 put 卡满 90s CLI timeout(等价无界)**,直到 EN 回来。
+  · **5 EN, RF=3**:kill 1 → 剩 4 健康 ≥ RF=3 → 新 extent 落健康节点,append 透明 roll off 死副本 extent →
+    **所有 put/get <0.1s,PS retries=0,manager 都没来得及标 Suspected**。零 stall。
+  · READ 任何规模都容忍 1 死副本(min-quorum 读)——所以 eni 完整性测试一直过(读 OK),只有 RF=N 时写卡。
+结论:此前"~30s availability stall"框架不完整——真因是**用恰好 RF 个 EN(3)跑测试 = 节点丢失零写容量**
+  (Ceph/HDFS 在 RF=3/3 节点掉 1 也停写,是副本系统通性,非 autumn bug)。fuse 单线程 dispatcher + 30s bridge
+  REPLY_TIMEOUT 只是把 stall 放大成 EIO,不是病根。**之前设想的"stream 层 fast-fail stale EN conn"是误诊,不做。**
+修正动作:更新 d9adb41 的文档(fuse CLAUDE.md "Restart behaviour" / README / 本文件)——把"~30s stall"
+  改成准确的"RF=N 容量耗尽,>RF 不 stall"。fuse_chaos/fuse_en_restart_chaos 用 3 EN 故只验 EN-restart **完整性**
+  (快重启,读全程 OK),不测 writes-during-EN-down(那只会撞 RF=3 容量墙)。要测写可用性需 provision >RF EN。
+Next steps(用户定夺):commit 文档修正(solo-flow);无代码改动。生产建议:EN 数 > RF。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-23 (EN/PS 重启 测试)
 TaskStatus: completed
 Task scope: 用户"多测试 en ps 重启的情况"(承接 RMW-GET-SWALLOW 修复)。

@@ -365,9 +365,10 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 #   AUTUMN_DATA_ROOT=/data05/autumn-rmw ./scripts/fuse_rmw_chaos.sh
 # Fuse EN (data-plane) restart integrity (2026-06-23): kill+restart each EN;
 #   durable + RMW files stay byte-exact across replica failover + rejoin.
-#   (EN restart is correct; an op issued mid-EN-down stalls ~30s before
-#    failover — availability, not data loss; see fuse CLAUDE.md "Restart
-#    behaviour".):
+#   (EN restart is CORRECT — no data loss. WRITES stall during EN-down ONLY at
+#    exactly RF=3 ENs = capacity exhaustion, NOT a failover-latency bug: with
+#    >RF ENs writes never stall; reads tolerate a down replica at any size.
+#    See fuse CLAUDE.md "Restart behaviour".):
 #   AUTUMN_DATA_ROOT=/data05/autumn-eni ./scripts/fuse_en_restart_chaos.sh
 # Cross-host chaos (F272, real network ::14+::15, remote via ssh):
 #   ./scripts/crosshost_chaos.sh tcp | ucx
