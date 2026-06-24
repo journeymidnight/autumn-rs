@@ -78,7 +78,16 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 
 **Key routing**: `resolve_key(key)` calls `GetRegions()` on the manager, binary-searches sorted partitions by `start_key`, returns `(part_id, ps_addr)`. Connects lazily to PS via `PartitionKvClient`.
 
-### `autumn-op` (`src/bin/autumn_op.rs`)
+### `autumn-op` (`src/bin/autumn_op/`)
+
+**Module layout (split 2026-06-24, behaviour-preserving):** `src/bin/autumn_op/`
+is a directory bin — `main.rs` holds `run()` (the command dispatcher),
+`run_bootstrap` / `run_info`, the format io-helpers, and `main()`; `args.rs`
+holds `Args` / `Command` + the hand-rolled `parse()` and its value-parse helpers
+(`parse_byte_size` / `parse_ec_flag` / `hex_split_ranges` / `fuse_split_ranges` /
+`derive_control_address`) + their unit tests. `usage()` / `parse_admin_flags` /
+`parse_byte_size` / `parse_ec_flag` are private to `args.rs`; the rest is
+`pub(crate)`. Cargo target: `path = "src/bin/autumn_op/main.rs"`.
 
 F211-G + F213 admin / observability CLI. The canonical interface to the manager control plane. The Python policy script (`python/node_policy.py`) shells out to this binary for all RPC traffic — autumn-op is its rkyv codec.
 

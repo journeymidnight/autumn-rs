@@ -22,7 +22,7 @@ path = "src/bin/autumn_client.rs"
 
 [[bin]]
 name = "autumn-op"
-path = "src/bin/autumn_op.rs"
+path = "src/bin/autumn_op/main.rs"
 
 [[bin]]
 name = "autumnfs"
