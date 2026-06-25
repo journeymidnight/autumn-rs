@@ -13,8 +13,16 @@ ROUND 1 COMMIT(d8234e2,已 push):rpc_handlers.rs handle_stream_punch_holes + han
   标签 + pre-F### 考古,留实质。net -26(127/-153)。验证:164/164 + clippy 0 + **coco findbugs deep(GPT-5.5)
   未发现问题** + **system_chaos seed 603(90s,真 EN kill+split/merge/gc):Split+Merge OK,mismatch=0
   not_found=0 accounting=0 all invariants OK**。
-Next(loop 续):② rpc_handlers 其它重复(split/merge Phase-2 verify/kvs builder——但 multi-phase 高风险,
-  逐行验 + chaos);③ 继续别的大文件冗余 + F### 清理;④ 热路径 partition-server/lib.rs 最后。
+ROUND 2 COMMIT(04041c6,已 push):rpc_handlers.rs handle_multi_modify_split + handle_multi_modify_merge 的
+  verify-before-mirror eversion-drift 检测块(borrow store + iterate pre_bump_eversion + 比 live vs expected)
+  → first_eversion_drift(&self, map) -> Option<(eid,expected,live)>。两调用点保留各自 refusal 编码
+  (CodeResp vs MultiModifyMergeResp,响应类型不同必须留调用点)。检测仍在 etcd txn 前、仅 live 存在且
+  eversion!=expected 才拒——语义不变。同删该区 F### 标签(verify rationale / last_op stamp / Phase-3 note)。
+  net ~平(+2;价值=漂移检测单一真源)。验证:164/164 + clippy 0 + **coco findbugs deep(GPT-5.5)未发现问题**
+  + **chaos seed 603(90s):Split+Merge OK,mismatch=0 accounting=0 all invariants OK**。
+Next(loop 续):③ split/merge Phase-2 kvs builder(MEDIUM 风险,split 2 partition vs merge 1+victim delete,
+  发散较大,谨慎或跳);④ 别的大文件冗余 + F### 清理(extent_node eversion-mismatch 编码 / manager lib mirror_*);
+  ⑤ 热路径 partition-server/lib.rs 最后。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
