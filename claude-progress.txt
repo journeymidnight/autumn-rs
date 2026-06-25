@@ -73,10 +73,21 @@ ROUND 9 COMMIT(17a6649,已 push):stream/extent_node.rs——build_read_future �
 教训(loop 选 target):fuse/dispatch.rs + ioring/daemon.rs 不被 system_chaos 覆盖(改了无法满足"每轮 chaos"要求,
   fuse 要 fuse_chaos.sh 慢)→ loop dedup 只在 chaos-validated crate(manager/stream/partition-server/client)做。
   bash classifier 本轮短暂不可用(infra flake),重试即恢复。
-进度:9 轮全绿(R1-R9),manager(rpc_handlers×2+lib×1)+ stream(extent_node×3+client×2)+ partition-server(background+
-  rpc_handlers)+ client SDK(lib×1)。每轮 coco findbugs + chaos seed 603 + F### touched-区清理。累计净删 ~-99 行。
-Next(loop 续):⑩ 继续 chaos-validated crate 找零星 dedup(extent_node 8.8k 还有更多 / manager lib.rs /
-  partition-server background.rs do_compact/run_gc 大函数=拆函数谨慎);热路径大函数 reproduce-first 最后。
+用户方向调整(R10):① AskUserQuestion 选了「F### sweep」,但自动 F### 脚本(第二 pass 的 replace('  ',' ')
+  误伤所有注释缩进,345 行)→ **revert,放弃自动 F### sweep**(太易误伤,逐条手动太多)。
+  ② 用户补充:Giant 函数(do_compact/run_gc/process_gc_chunk/recover_partition)**重点不是拆分,是分析逻辑
+  看是否简洁清晰**。→ loop 转向:读 giant 函数、评估 clarity/conciseness、去重/简化(非机械拆分)。
+ROUND 10 COMMIT(f2806b7,已 push):partition-server/background.rs do_compact 逻辑分析——chunk-finalize 序列
+  (spawn_blocking finish → account_compact → compact_row_append(P-bulk 单写者)→ spawn_blocking SstReader →
+  push TableMeta+reader)在 in-loop emit + final emit **重复近 verbatim(~30 行 ×2)**,仅差 final 先 set_discards。
+  抽 emit_compact_chunk(...)->Result<u64> 单一 helper(in-loop/final/set_discards/post-reset 差异留调用点)。
+  **是去重(简洁)非拆分凑行数;F148-A meta-publish await-ordering 路径不碰**。net -6(逻辑去重是重点非 LOC)。
+  验证:167/167 + clippy 9 不变 + **coco findbugs(GPT-5.5)未发现(逐项核对等价:逻辑顺序/discards 语义/
+  output_bytes/无新 race-leak)** + **chaos seed 603(split/merge/gc 触发 compaction)Split+Merge OK all OK**。
+进度:10 轮全绿(R1-R10)。do_compact 分析剩余 finding(未做,记录):final-emit 后的 defer-discards else-if 分支
+  (~25 行多为冗长道歉式注释,代码≈no-op debug log)可精简注释;loop 内 5× "bump_discards+entries_discarded+++continue"
+  drop-entry 模式(闭包去重有 borrow 摩擦,价值小)。
+Next(loop 续):⑪ 分析 run_gc / process_gc_chunk / recover_partition 逻辑清晰度,去重/简化(非拆分);coco+chaos 每轮。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
