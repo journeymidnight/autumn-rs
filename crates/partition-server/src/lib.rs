@@ -7095,49 +7095,30 @@ async fn recover_partition(
         }
     }
 
-    // Replay logStream.
+    // Replay logStream into the recovered memtable, skipping records already
+    // captured by the loaded SSTs.
     //
-    // F210-C1: the dedup `if ts <= sst_max_seq { continue; }` below is
-    // safe because `partition_loop` now uses `FuturesOrdered`
-    // (was `FuturesUnordered`). Phase 3 (memtable insert) is therefore
-    // strictly in launch order = strictly in seq order; a rotated
-    // active contains a contiguous seq range [start, max_seq], and the
-    // SST flushed from it has the invariant "every seq <= last_seq is
-    // in this SST or an earlier SST".
+    // Dedup is PER SOURCE REGION, not a single global max_seq. A single
+    // max_seq is only sound for a single-partition timeline; post-merge the
+    // spliced log_stream carries records from TWO source partitions whose
+    // PS-seq counters were independent, so a union max would wrongly skip
+    // survivor's post-vp_head tail records whose ts ≤ victim's max but >
+    // survivor's. Per source the dedup IS sound because partition_loop uses
+    // FuturesOrdered — Phase 3 memtable inserts run in strict seq order, so a
+    // flushed SST satisfies "every seq ≤ last_seq is in this SST or an
+    // earlier one" for its OWN source.
     //
-    // F243-merge (THIS FIX): a SINGLE `sst_max_seq` is only sound for a
-    // single-partition timeline. Post-merge the spliced log_stream
-    // carries records from TWO source partitions whose PS-seq counters
-    // were independent; `sst_max_seq` taken as the union max wrongly
-    // skips survivor's post-vp_head tail records whose ts is ≤ victim's
-    // max but > survivor's max. Fix: compute each meta_record's own
-    // source_max_seq and dedup PER EXTENT against the source whose
-    // vp_pos is the largest ≤ this extent's stream position.
-    //
-    // Pre-F210-C1 this used `FuturesUnordered`; see git history /
-    // feature_list F210-C1 for the FU→FO migration rationale.
-    let sst_max_seq = max_seq;
-    let _ = sst_max_seq; // retained for parity; replay now uses per-region dedup
-                         // F243-merge per-source region table.
-                         //
-                         // Each meta_record carries its source partition's log_stream extent
-                         // count at flush time (`log_extent_count`). Sorted by vp_pos, the
-                         // sources' regions in the spliced log_stream are cumulative:
-                         //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
-                         // Records whose vp_extent_id is no longer in the stream (GC'd /
-                         // truncated) are skipped. A record with `log_extent_count == 0` is
-                         // legacy / unset — fall back to a single global dedup (= pre-fix
-                         // behavior) by treating it as covering the whole stream.
-                         //
-                         // For each region, dedup = MAX seq across the source's SSTs (i.e.,
-                         // the F210-C1 invariant: every seq ≤ src_max for THIS source is in
-                         // one of this source's SSTs). Records at pos with ts > src_max
-                         // are unflushed-by-this-source and need re-insert; ts ≤ src_max
-                         // are already covered.
-                         //
-                         // E_new (post-merge new tail) sits past Σ counts → no region maps
-                         // to it → dedup = 0 → replay everything (= post-merge survivor
-                         // writes, all unflushed by definition).
+    // Per-source region table: each meta_record carries its source's
+    // log_stream extent count at flush time (`log_extent_count`). Sorted by
+    // vp_pos, the sources' regions in the spliced log_stream are cumulative:
+    //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
+    // Records whose vp_extent_id is no longer in the stream (GC'd / truncated)
+    // are skipped. A record with log_extent_count == 0 is legacy / unset —
+    // fall back to a single global dedup covering the whole stream. For each
+    // region, dedup = MAX seq across that source's SSTs; records at pos with
+    // ts > src_max need re-insert, ts ≤ src_max are already covered. E_new
+    // (post-merge new tail) sits past Σ counts → no region maps to it →
+    // dedup = 0 → replay everything (post-merge survivor writes).
     struct SourceRegion {
         end_excl: usize, // region = [prev_end, end_excl)
         src_max: u64,
