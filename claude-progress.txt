@@ -23,8 +23,15 @@ BACKLOG(niche,用户暂不修,记录待逐个拍板):#3 format 目录不去重�
   #8 --json info --part 缺→无 JSON+rc0;#10 parse_byte_size 无 u64 上溢检查。
 教训:① cargo clippy 不刷新 target/debug 二进制——CLI smoke 必须先 cargo build(踩过 stale 二进制假阳);② bin 拆 module=改成目录 bin
   (main.rs+子模块)+Cargo path;③ coco inspect 出 bug 不出结构,结构拆分是我的判断;④ 巨型文件先拆 cohesive 块(args/display)再拆大函数。
-Next steps(用户定夺):① 继续拆 autumn_op run()(1066 行→按命令族抽 handler);② 进下一个文件(建议先 autumn_client.rs / manager 控制面等
-  低风险,热路径巨файл 留到流程更熟);③ 每周节奏 + 是否 push(本 4 commit 未 push)。
+RUN() 拆分完成(d2f9080 + 398c201,均 push 前者已 push 后者待定):用 python 脚本(body-brace 匹配 + 统一 dedent +
+  args.json→json,Format 额外传 manager/transport)把 21 个命令臂抽成 cmd_*(client,json,fields) free fn,
+  **run() 1066 → 63 行纯 dispatcher**(每臂一行调用;仅 Info/Bootstrap 委托 run_info/run_bootstrap、RegisterNode stub 例外)。
+  纯代码移动(臂体逐字),build+clippy(-D)+13 单测+dispatch smoke(死 manager 下每命令路由到 manager call)全绿。
+  脚本踩坑:struct-variant 臂 `Command::X { fields } => {` 的 brace 匹配要从 `=> {` 的 body brace 算,别从 pattern brace
+  (第一版漏算损坏 ExtentHealth/AuditLog,git checkout 重做)。后续可把 21 个 cmd_* 挪进 commands.rs 子模块再缩 main.rs 文件体量。
+autumn_op PILOT 全部完成:拆文件(args.rs)+ 6 bug 修复 + run() 1066→63。
+Next steps(用户定夺):① autumn_op 收尾项(cmd_* 挪 commands.rs / display.rs 抽 + run_bootstrap·run_info 也可抽)可选;
+  ② 进下一个文件(autumn_client.rs / manager 控制面等低风险先,热路径巨文件后);③ 每周节奏。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
