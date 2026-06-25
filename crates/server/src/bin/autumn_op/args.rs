@@ -49,6 +49,18 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
+/// The CLI value at `raw[i]`, or print usage + exit. Use for every value that
+/// FOLLOWS a flag (`i` already advanced past the flag) or a required
+/// positional: a bare `raw[i]` panics with "index out of bounds" when the
+/// value was omitted (e.g. a trailing `--reason` or `split` with no PARTID) —
+/// a confusing crash instead of the usage message.
+fn val(raw: &[String], i: usize) -> &str {
+    match raw.get(i) {
+        Some(s) => s.as_str(),
+        None => usage(),
+    }
+}
+
 pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) json: bool,
@@ -211,7 +223,7 @@ pub(crate) fn parse() -> Args {
                         if i >= raw.len() {
                             usage();
                         }
-                        to = Some(raw[i].parse().unwrap_or_else(|_| usage()));
+                        to = Some(val(&raw, i).parse().unwrap_or_else(|_| usage()));
                         i += 1;
                     }
                     _ => break,
@@ -226,7 +238,7 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--node" => {
                         i += 1;
-                        node_filter.push(raw[i].parse().unwrap_or_else(|_| usage()));
+                        node_filter.push(val(&raw, i).parse().unwrap_or_else(|_| usage()));
                         i += 1;
                     }
                     "--all" => {
@@ -253,27 +265,27 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--op" => {
                         i += 1;
-                        op = raw[i].parse().unwrap_or_else(|_| usage());
+                        op = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     "--node" => {
                         i += 1;
-                        node_id = raw[i].parse().unwrap_or_else(|_| usage());
+                        node_id = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     "--since" => {
                         i += 1;
-                        since = raw[i].parse().unwrap_or_else(|_| usage());
+                        since = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     "--until" => {
                         i += 1;
-                        until = raw[i].parse().unwrap_or_else(|_| usage());
+                        until = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     "--limit" => {
                         i += 1;
-                        limit = raw[i].parse().unwrap_or_else(|_| usage());
+                        limit = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     _ => break,
@@ -315,17 +327,17 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--reason" => {
                         i += 1;
-                        reason = raw[i].clone();
+                        reason = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--by" => {
                         i += 1;
-                        by = raw[i].clone();
+                        by = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--expire" => {
                         i += 1;
-                        expire = raw[i].parse().unwrap_or_else(|_| usage());
+                        expire = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
                     _ => break,
@@ -368,7 +380,7 @@ pub(crate) fn parse() -> Args {
                             eprintln!("--part requires a number");
                             usage();
                         }
-                        part = Some(raw[i].parse().unwrap_or_else(|_| {
+                        part = Some(val(&raw, i).parse().unwrap_or_else(|_| {
                             eprintln!("--part requires a number");
                             usage()
                         }));
@@ -401,17 +413,17 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--replication" => {
                         i += 1;
-                        replication = raw[i].clone();
+                        replication = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--presplit" => {
                         i += 1;
-                        presplit = raw[i].clone();
+                        presplit = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--log-ec" => {
                         i += 1;
-                        log_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                        log_ec = Some(parse_ec_flag(val(&raw, i)).unwrap_or_else(|e| {
                             eprintln!("--log-ec: {e}");
                             std::process::exit(1);
                         }));
@@ -419,7 +431,7 @@ pub(crate) fn parse() -> Args {
                     }
                     "--row-ec" => {
                         i += 1;
-                        row_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                        row_ec = Some(parse_ec_flag(val(&raw, i)).unwrap_or_else(|e| {
                             eprintln!("--row-ec: {e}");
                             std::process::exit(1);
                         }));
@@ -442,7 +454,7 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--stream" => {
                         i += 1;
-                        stream_id = Some(raw[i].parse().unwrap_or_else(|_| {
+                        stream_id = Some(val(&raw, i).parse().unwrap_or_else(|_| {
                             eprintln!("--stream requires a numeric stream ID");
                             std::process::exit(1);
                         }));
@@ -450,7 +462,7 @@ pub(crate) fn parse() -> Args {
                     }
                     "--ec" => {
                         i += 1;
-                        ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                        ec = Some(parse_ec_flag(val(&raw, i)).unwrap_or_else(|e| {
                             eprintln!("--ec: {e}");
                             std::process::exit(1);
                         }));
@@ -483,7 +495,7 @@ pub(crate) fn parse() -> Args {
                             eprintln!("--extent requires a number");
                             usage();
                         }
-                        extent_id = Some(raw[i].parse().unwrap_or_else(|_| {
+                        extent_id = Some(val(&raw, i).parse().unwrap_or_else(|_| {
                             eprintln!("--extent requires a number");
                             usage()
                         }));
@@ -504,7 +516,7 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             Command::Split {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
+                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
             }
         }
         "merge" => {
@@ -513,7 +525,7 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             Command::Merge {
-                survivor_part_id: raw[i].parse().expect("SURVIVOR_PART_ID must be a number"),
+                survivor_part_id: val(&raw, i).parse().expect("SURVIVOR_PART_ID must be a number"),
                 victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
             }
         }
@@ -523,7 +535,7 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             Command::Compact {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
+                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
             }
         }
         "gc" => {
@@ -535,7 +547,7 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--ratio" => {
                         i += 1;
-                        ratio = Some(raw[i].parse().unwrap_or_else(|_| {
+                        ratio = Some(val(&raw, i).parse().unwrap_or_else(|_| {
                             eprintln!("--ratio expects a float 0.0..=1.0");
                             std::process::exit(1);
                         }));
@@ -543,7 +555,7 @@ pub(crate) fn parse() -> Args {
                     }
                     "--max-size" => {
                         i += 1;
-                        max_size = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
+                        max_size = Some(parse_byte_size(val(&raw, i)).unwrap_or_else(|e| {
                             eprintln!("--max-size: {e}");
                             std::process::exit(1);
                         }));
@@ -551,7 +563,7 @@ pub(crate) fn parse() -> Args {
                     }
                     "--stream-debt" => {
                         i += 1;
-                        stream_debt = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
+                        stream_debt = Some(parse_byte_size(val(&raw, i)).unwrap_or_else(|e| {
                             eprintln!("--stream-debt: {e}");
                             std::process::exit(1);
                         }));
@@ -569,7 +581,7 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             Command::Gc {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
+                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
                 ratio,
                 max_size,
                 stream_debt,
@@ -581,11 +593,11 @@ pub(crate) fn parse() -> Args {
                 eprintln!("forcegc requires <PARTID> <EXTID>...");
                 std::process::exit(1);
             }
-            let part_id: u64 = raw[i].parse().expect("PARTID must be a number");
+            let part_id: u64 = val(&raw, i).parse().expect("PARTID must be a number");
             i += 1;
             let mut extent_ids = Vec::new();
             while i < raw.len() {
-                extent_ids.push(raw[i].parse::<u64>().expect("EXTID must be a number"));
+                extent_ids.push(val(&raw, i).parse::<u64>().expect("EXTID must be a number"));
                 i += 1;
             }
             if extent_ids.is_empty() {
@@ -614,18 +626,18 @@ pub(crate) fn parse() -> Args {
                 match raw[i].as_str() {
                     "--listen" => {
                         i += 1;
-                        listen = raw[i].clone();
+                        listen = val(&raw, i).to_owned();
                     }
                     "--advertise" => {
                         i += 1;
-                        advertise = raw[i].clone();
+                        advertise = val(&raw, i).to_owned();
                     }
                     "--shard-ports" => {
                         // Comma-separated u16 list. Required for
                         // F099-M multi-shard ENs so the manager can
                         // route per-extent ops to the owning shard.
                         i += 1;
-                        for part in raw[i].split(',') {
+                        for part in val(&raw, i).split(',') {
                             let p = part.trim();
                             if p.is_empty() {
                                 continue;
@@ -669,12 +681,12 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
         match raw[*i].as_str() {
             "--reason" => {
                 *i += 1;
-                reason = raw[*i].clone();
+                reason = val(raw, *i).to_owned();
                 *i += 1;
             }
             "--by" => {
                 *i += 1;
-                by = raw[*i].clone();
+                by = val(raw, *i).to_owned();
                 *i += 1;
             }
             "--force" => {
