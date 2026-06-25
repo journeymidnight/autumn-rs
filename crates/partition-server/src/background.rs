@@ -1613,6 +1613,50 @@ async fn compact_row_append(
         .map_err(|_| anyhow::anyhow!("P-bulk row_append response dropped"))?
 }
 
+/// Finalize one compaction-output chunk: build the SST bytes off the compio
+/// runtime, account the per-partition compact rate, append to row_stream
+/// through P-bulk's single writer, parse the paged SstReader (off-runtime
+/// too), and push `(TableMeta, reader)` into `new_readers`. Returns the
+/// chunk's byte size. Shared by `do_compact`'s in-loop and final chunk
+/// emits — the only difference is that the final caller attaches
+/// `set_discards` to the builder before calling.
+async fn emit_compact_chunk(
+    builder: SstBuilder,
+    row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
+    row_stream_id: u64,
+    rate_ctrl: &crate::RateController,
+    chunk_last_seq: u64,
+    new_readers: &mut Vec<(TableMeta, Arc<SstReader>)>,
+) -> Result<u64> {
+    // Build SST bytes off the compio runtime (spawn_blocking): ~256 MiB
+    // memcpy at max chunk + bloom finalize + meta encode + CRC32C — the same
+    // offload flush_one_imm does via build_sst_bytes (note 17).
+    let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
+        .await
+        .map_err(|_| anyhow!("compact builder finish join failed"))?;
+    let chunk_bytes = sst_bytes.len() as u64;
+    // Sleep BEFORE the append so the counter reflects "intent to write".
+    rate_ctrl.account_compact(chunk_bytes).await;
+    // Route through P-bulk's StreamClient to preserve the single-writer
+    // invariant on row_stream.
+    let result = compact_row_append(row_append_tx, row_stream_id, sst_bytes.clone()).await?;
+    let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
+        .await
+        .map_err(|_| anyhow!("compact SstReader join failed"))??
+        .into_paged(result.extent_id, result.offset, result.end - result.offset);
+    new_readers.push((
+        TableMeta {
+            extent_id: result.extent_id,
+            offset: result.offset,
+            len: result.end - result.offset,
+            estimated_size: chunk_bytes,
+            last_seq: chunk_last_seq,
+        },
+        Arc::new(reader),
+    ));
+    Ok(chunk_bytes)
+}
+
 // clippy false-positive: every `part.borrow_mut()` here is `drop(p)`-ed before
 // the following `.await` (the F148-A publish invariant requires exactly this —
 // no await between the borrow_mut drop and the meta-stream mpsc send). The lint
@@ -1805,45 +1849,15 @@ pub(crate) async fn do_compact(
                 &mut current_builder,
                 SstBuilder::new(compact_vp_eid, compact_vp_off),
             );
-            // F169: build SST bytes off the compio runtime. `builder.finish()`
-            // concatenates all blocks (~256 MiB memcpy at max chunk size) +
-            // bloom-filter finalize + meta encode + CRC32C — typically
-            // 50-100 ms of CPU for a full chunk. flush_one_imm already
-            // wraps this work in spawn_blocking via build_sst_bytes
-            // (per F117 + partition-server/CLAUDE.md note 17); compact's
-            // chunk-emit was the only inline-CPU offender left in the
-            // post-F168 P-log task.
-            let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
-                .await
-                .map_err(|_| anyhow!("compact builder finish join failed"))?;
-            let chunk_bytes = sst_bytes.len() as u64;
-            output_bytes += chunk_bytes;
-            // F196 D-r7: per-partition compact rate cap (replaces
-            // F188's combined PS-wide bg cap). Sleep happens BEFORE the
-            // append so the counter reflects "intent to write" rather
-            // than after-the-fact, matching F141's pattern.
-            rate_ctrl.account_compact(chunk_bytes).await;
-            // F135: route through P-bulk's StreamClient to preserve the
-            // single-writer invariant on row_stream.
-            let result =
-                compact_row_append(&row_append_tx, row_stream_id, sst_bytes.clone()).await?;
-            // F169: SstReader::from_bytes parses the MetaBlock + bloom +
-            // verifies CRC; ~5-10 ms for a max-chunk SST. Off-loaded too.
-            let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
-                .await
-                .map_err(|_| anyhow!("compact SstReader join failed"))??
-                .into_paged(result.extent_id, result.offset, result.end - result.offset);
-            let reader = Arc::new(reader);
-            new_readers.push((
-                TableMeta {
-                    extent_id: result.extent_id,
-                    offset: result.offset,
-                    len: result.end - result.offset,
-                    estimated_size: chunk_bytes,
-                    last_seq: chunk_last_seq,
-                },
-                reader,
-            ));
+            output_bytes += emit_compact_chunk(
+                builder,
+                &row_append_tx,
+                row_stream_id,
+                &rate_ctrl,
+                chunk_last_seq,
+                &mut new_readers,
+            )
+            .await?;
             current_size = 0;
             chunk_last_seq = raw_ts;
         }
@@ -1877,34 +1891,15 @@ pub(crate) async fn do_compact(
             SstBuilder::new(compact_vp_eid, compact_vp_off),
         );
         builder.set_discards(discards.clone());
-        // F169: same spawn_blocking pattern as the in-loop chunk-emit above.
-        let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
-            .await
-            .map_err(|_| anyhow!("compact final builder finish join failed"))?;
-        let chunk_bytes = sst_bytes.len() as u64;
-        output_bytes += chunk_bytes;
-        // F196 D-r7: same per-partition compact rate account as the
-        // per-chunk emit above.
-        rate_ctrl.account_compact(chunk_bytes).await;
-        // F135: route through P-bulk's StreamClient to preserve the
-        // single-writer invariant on row_stream.
-        let result =
-            compact_row_append(&row_append_tx, row_stream_id, sst_bytes.clone()).await?;
-        let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
-            .await
-            .map_err(|_| anyhow!("compact final SstReader join failed"))??
-            .into_paged(result.extent_id, result.offset, result.end - result.offset);
-        let reader = Arc::new(reader);
-        new_readers.push((
-            TableMeta {
-                extent_id: result.extent_id,
-                offset: result.offset,
-                len: result.end - result.offset,
-                estimated_size: chunk_bytes,
-                last_seq: chunk_last_seq,
-            },
-            reader,
-        ));
+        output_bytes += emit_compact_chunk(
+            builder,
+            &row_append_tx,
+            row_stream_id,
+            &rate_ctrl,
+            chunk_last_seq,
+            &mut new_readers,
+        )
+        .await?;
     } else if let Some((_, last_reader)) = new_readers.last() {
         // Loop ended exactly at a chunk boundary. Re-emit the last chunk
         // with discards attached. We do this by reading the just-written
