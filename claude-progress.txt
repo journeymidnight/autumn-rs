@@ -87,7 +87,18 @@ ROUND 10 COMMIT(f2806b7,已 push):partition-server/background.rs do_compact 逻�
 进度:10 轮全绿(R1-R10)。do_compact 分析剩余 finding(未做,记录):final-emit 后的 defer-discards else-if 分支
   (~25 行多为冗长道歉式注释,代码≈no-op debug log)可精简注释;loop 内 5× "bump_discards+entries_discarded+++continue"
   drop-entry 模式(闭包去重有 borrow 摩擦,价值小)。
-Next(loop 续):⑪ 分析 run_gc / process_gc_chunk / recover_partition 逻辑清晰度,去重/简化(非拆分);coco+chaos 每轮。
+ROUND 11 COMMIT(13ea3c6,已 push):giant 函数逻辑分析续——run_gc + process_gc_chunk 读完:**intricate 但复杂度
+  是 GC 正确性内在的(streaming carry / stale-snapshot liveness 重验 / full VP-identity),注释充分,无可安全简化的
+  冗余/convolution → 不动**(分析结论=已清晰)。唯一 clarity wart = do_compact 的 defer-discards else-if 分支:
+  绑 last_reader 仅 `let _ =` 丢弃 + ~17 行注释描述了一个"先说这样做→其实为简单跳过"的**已放弃方案(注释了不存在的代码)**。
+  → 改 `!new_readers.is_empty()` 等价条件(去掉无用绑定 + let _)+ 注释精简到实际决策。行为不变(分支只 debug log)。
+  net -11。验证:167/167 + clippy 9 不变 + **coco findbugs(GPT-5.5)未发现** + **chaos seed 603 Split+Merge OK all OK**。
+观察:process_gc_chunk 11 个参数是 "too many args" smell,但参数都真需要(immutable ctx + mutable 累加器),
+  bundle 成 struct 是中等重构 clarity 收益有限,暂不做。process_gc_chunk:2599 `let _ = expires_at;`(下游真用了,vestigial)
+  太marginal没动。
+进度:11 轮全绿(R1-R11)。giant 函数分析:do_compact(R10 去重 chunk-emit + R11 简化 defer 分支)、run_gc/process_gc_chunk(清晰)。
+Next(loop 续):⑫ 分析 recover_partition(~1.1k,partition-server/lib.rs 最大最 revert-prone)逻辑清晰度——读完评估,
+  有安全去重/简化才动,否则报告"已清晰";coco+chaos 每轮。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
