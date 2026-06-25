@@ -2424,6 +2424,27 @@ impl AutumnManager {
         }
     }
 
+    /// Verify-before-mirror drift check shared by split + merge: re-read the
+    /// live eversion of every source extent snapshotted in `pre_bump_eversion`
+    /// (captured before the Phase-1 awaits) and return the FIRST
+    /// `(extent_id, expected, live)` that drifted, or `None` if all still
+    /// match. The caller encodes its own handler-specific refusal response
+    /// (CodeResp vs MultiModifyMergeResp). Refusing here — before the etcd
+    /// txn — keeps a stale-base mutation from landing durably (committing
+    /// then returning Precondition would leave etcd holding a write that
+    /// replay loads as if successful).
+    fn first_eversion_drift(&self, pre_bump_eversion: &HashMap<u64, u64>) -> Option<(u64, u64, u64)> {
+        let s = self.store.inner.borrow();
+        for (eid, expected) in pre_bump_eversion {
+            if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                if live != *expected {
+                    return Some((*eid, *expected, live));
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) async fn handle_multi_modify_split(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&CodeResp {
@@ -2597,34 +2618,23 @@ impl AutumnManager {
 
         match out {
             Ok((new_streams, modified_extents, left, right, pre_bump_eversion)) => {
-                // F210-A2 verify-BEFORE-mirror (was verify-after-mirror at
-                // Phase 3 in the F146 form). If any source-stream extent's
+                // Verify-BEFORE-mirror: if any source-stream extent's
                 // eversion drifted during the Phase-1 awaits, the etcd txn
-                // we'd otherwise send is computed from a stale base —
-                // refuse before committing to etcd. Pre-F210-A2 we caught
-                // this AFTER the etcd commit, leaving etcd durable but
-                // returning `Precondition` to the client (replay would
-                // load the stale write as if successful).
-                {
-                    let s = self.store.inner.borrow();
-                    for (eid, expected) in &pre_bump_eversion {
-                        if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
-                            if live != *expected {
-                                return Ok(rkyv_encode(&CodeResp {
-                                    code: CODE_PRECONDITION,
-                                    message: format!(
-                                        "extent {eid} eversion drift during split \
-                                         ({expected} -> {live}); retry split"
-                                    ),
-                                }));
-                            }
-                        }
-                    }
+                // we'd otherwise send is computed from a stale base — refuse
+                // before committing to etcd.
+                if let Some((eid, expected, live)) = self.first_eversion_drift(&pre_bump_eversion) {
+                    return Ok(rkyv_encode(&CodeResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {eid} eversion drift during split \
+                             ({expected} -> {live}); retry split"
+                        ),
+                    }));
                 }
 
                 // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
-                // (F124: partitions + regions are included here, not in a
-                // separate txn, to prevent orphan streams on crash.)
+                // (partitions + regions are included here, not in a separate
+                // txn, to prevent orphan streams on crash.)
                 if let Some(etcd) = &self.etcd {
                     let mut kvs =
                         Vec::with_capacity(new_streams.len() + modified_extents.len() + 4);
@@ -2663,7 +2673,7 @@ impl AutumnManager {
                             rkyv_encode(&right_region).to_vec(),
                         ));
                     }
-                    // F183: stamp last_op_at on both children so the
+                    // Stamp last_op_at on both children so the
                     // policy engine's cooldown gate is correct.
                     let now = Self::epoch_seconds();
                     kvs.push((
@@ -2680,8 +2690,8 @@ impl AutumnManager {
                 }
 
                 // Phase 3: Apply to in-memory store AFTER etcd success.
-                // F210-A2: verify moved up before the Phase-2 mirror; here
-                // we only apply (no verify).
+                // Verify moved up before the Phase-2 mirror; here we only
+                // apply (no verify).
                 {
                     let mut s = self.store.inner.borrow_mut();
                     let _ = pre_bump_eversion; // captured for the verify-BEFORE block above
@@ -3021,27 +3031,19 @@ impl AutumnManager {
             e_new.replicate_disks = final_disk_ids;
         }
 
-        // F210-A2 verify-BEFORE-mirror (was verify-after-mirror at
-        // Phase 3 in the F183/F185 form). If any source-stream extent's
-        // eversion drifted during Phase 1.5 awaits (alloc_extent_on_node
-        // for E_new across each replica node), the etcd txn we'd send
-        // is computed from a stale base. Refuse before committing.
-        {
-            let s = self.store.inner.borrow();
-            for (eid, expected) in &p1.pre_bump_eversion {
-                if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
-                    if live != *expected {
-                        return Ok(rkyv_encode(&MultiModifyMergeResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "extent {eid} eversion drift during merge \
-                                 ({expected} -> {live}); retry merge"
-                            ),
-                            new_log_tail_extent_id: 0,
-                        }));
-                    }
-                }
-            }
+        // Verify-BEFORE-mirror: if any source-stream extent's eversion
+        // drifted during the Phase-1.5 awaits (alloc_extent_on_node for
+        // E_new across each replica node), the etcd txn we'd send is
+        // computed from a stale base. Refuse before committing.
+        if let Some((eid, expected, live)) = self.first_eversion_drift(&p1.pre_bump_eversion) {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "extent {eid} eversion drift during merge \
+                     ({expected} -> {live}); retry merge"
+                ),
+                new_log_tail_extent_id: 0,
+            }));
         }
 
         // Phase 2: single fenced etcd txn.
