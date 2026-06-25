@@ -1702,8 +1702,7 @@ async fn process_frames_backpressured(
                 Ok(r) => r,
                 Err(e) => {
                     let req_id = frames[i].req_id;
-                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                    let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                    let bytes = err_bytes(req_id, MSG_APPEND, StatusCode::InvalidArgument, e);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -1728,8 +1727,7 @@ async fn process_frames_backpressured(
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
-                        let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                        let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                        let bytes = err_bytes(req_id, MSG_APPEND, StatusCode::InvalidArgument, e);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -1772,8 +1770,7 @@ async fn process_frames_backpressured(
             let (chain, append_bytes) = match decode_chain_prefix(frames[i - 1].payload.clone()) {
                 Ok(v) => v,
                 Err(e) => {
-                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                    let bytes = Frame::error(req_id, MSG_APPEND_CHAIN, p).encode();
+                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, StatusCode::InvalidArgument, e);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     continue;
                 }
@@ -1781,8 +1778,7 @@ async fn process_frames_backpressured(
             let req = match AppendReq::decode(append_bytes.clone()) {
                 Ok(r) => r,
                 Err(e) => {
-                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                    let bytes = Frame::error(req_id, MSG_APPEND_CHAIN, p).encode();
+                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, StatusCode::InvalidArgument, e);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     continue;
                 }
@@ -1790,8 +1786,7 @@ async fn process_frames_backpressured(
             let extent = match node.get_extent(req.extent_id).await {
                 Ok(e) => e,
                 Err((code, msg)) => {
-                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
-                    let bytes = Frame::error(req_id, MSG_APPEND_CHAIN, p).encode();
+                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, code, &msg);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     continue;
                 }
@@ -1861,11 +1856,12 @@ async fn process_frames_backpressured(
                         vec![Frame::response(req_id, MSG_APPEND_CHAIN, resp.encode()).encode()]
                     }
                     Err(ChainFail::Msg(msg)) => {
-                        let p = autumn_rpc::RpcError::encode_status(
+                        vec![err_bytes(
+                            req_id,
+                            MSG_APPEND_CHAIN,
                             StatusCode::Unavailable,
                             &format!("chain append failed downstream: {msg}"),
-                        );
-                        vec![Frame::error(req_id, MSG_APPEND_CHAIN, p).encode()]
+                        )]
                     }
                 }
             }));
@@ -1874,8 +1870,7 @@ async fn process_frames_backpressured(
                 Ok(r) => r,
                 Err(e) => {
                     let req_id = frames[i].req_id;
-                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                    let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                    let bytes = err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -1900,8 +1895,7 @@ async fn process_frames_backpressured(
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
-                        let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
-                        let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                        let bytes = err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -2006,7 +2000,7 @@ struct ReadSlot {
     req_id: u32,
 }
 
-/// Error-encode a single append slot.
+/// Encode a single error-response frame (`Frame::error` + `encode_status`).
 fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     Frame::error(
         req_id,
