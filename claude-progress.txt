@@ -46,9 +46,19 @@ COMMITS(2 个,均 push):
   ③ 热路径(partition_loop/coalescer/append)+ CAS/guard 区(note33/F139/F145)的 dedup 留作逐行验证的谨慎目标,不抢跑。
 Next steps(用户定夺):① 继续 manager/lib.rs 低风险(mirror_* txn pattern / 验证并删 dead-code);
   ② 谨慎做 rpc_handlers punch_holes/truncate 的 ~40 行 dedup(先逐行验证 note33 CAS + F139/F145 guard 顺序);
-  ③ extent_node.rs DiskFS 路径 dedup **已做(c8aec02)**;剩 stream/client.rs 低风险(eversion-mismatch codec dedup、
-     cache 失效 2-liner→方法、chunked-read loop)+ extent_node eversion-mismatch 错误编码;
+  ③ extent_node.rs DiskFS 路径 dedup **已做(c8aec02)**;stream/client.rs 读失败 eversion-stale/evict policy **已做(84d4f3c)**;
   ④ 热路径(partition-server/lib.rs enqueue 前缀、partition_loop)最后,reproduce-first 心态。
+client.rs 测绘结论(记录,避免重走):chunked-read loop(read_with_layout vs read_shard_from_addr 两循环结构同)抽取
+  需 async-closure-per-chunk(boxed-future 堆分配 / AsyncFnMut lifetime)——加复杂度非减,**不做**;eversion-mismatch
+  DECODE(read_shard_chunk_from_addr vs ec_reconstruct)返回类型/校验/早退 vs match 不同,**不强抽**(只有 2 行
+  EversionStale 构造重复,marginal)。真正干净的只有 5 处 cache-invalidation policy(已抽 read_err_fail_fast)。
+
+NEXT 段 COMMIT(本段 1 个,已 push):
+  · 84d4f3c stream/client.rs:read_replicated_with_failover + read_hedged_pair 的 5 处
+    `if is_eversion_stale(&e){return Err(e)} extent_info_cache.remove(&ex.extent_id)` → read_err_fail_fast(&e,id)->bool
+    (true=fail-fast 传播;false=evict+试下个副本)。早退 `return Err(e)` 留在调用点(显式)。仅这 5 处失败/hedge,
+    2-attempt 重试循环(invalidate_extent_cache)+ EC reconstruct(新建 EversionStale/push needs_reconstruct)不碰。
+    验证 90/90。net +11(21/-10,helper doc 占)。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
