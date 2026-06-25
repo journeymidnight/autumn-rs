@@ -33,10 +33,16 @@ ROUND 4 COMMIT(2c813d1,已 push):stream/extent_node.rs(#2 大文件,热路径)�
   字节级相同。3 个故意留:2 个 build-p-once+per-slot clone(微优化),1 个 build 未编码 Frame(共享 Ok 臂
   Frame::response 形状)。修 err_bytes 过期 doc。net -6。验证:90/90 + clippy 0 + **coco findbugs(GPT-5.5)未发现**
   + **chaos seed 603(90s,kill/unavailable 窗触发这些错误路径):Split+Merge OK mismatch=0 accounting=0 all OK**。
-Next(loop 续):⑤ 别的大文件冗余(stream/client.rs / partition-server/background.rs flush/compact/gc);
-  split/merge Phase-2 kvs builder MEDIUM 风险发散,谨慎或跳;⑥ 热路径 partition-server/lib.rs 最后。
-  剩 rpc_handlers/lib.rs/extent_node.rs 全文件 F### 仍多(只清了 touched 区);可后续专门 F### 清理轮。
-  观察:dedup 渐入佳境后多为 small win(每轮 -6~-26);保持 coco+chaos 每轮绿;若 dedup 枯竭可转 coco inspect 找 messy-logic。
+ROUND 5 COMMIT(dd2ee21,已 push):partition-server/background.rs——background_compact_loop +
+  background_gc_loop 各有字节级相同的嵌套 fn random_delay()→ 提到模块级单一 fn,删两份嵌套。net -2。
+  验证:167/167 + **coco findbugs(GPT-5.5)未发现** + **chaos seed 603 Split+Merge OK all invariants OK**。
+  **coco INSPECT 全文件失败**(GPT-5.5 + GLM-5.1 都 exit=1 在 3.7k 行大文件上——本机 coco 不稳,记忆已知);
+  本轮回退手动 dedup;findbugs 在小 diff 上正常。background.rs 其余无明显大冗余(lookup_in_sst_seq_opt/fullscan
+  是故意不同算法,gc_* 是干净命名 accessor,do_compact/run_gc/process_gc_chunk 是热路径大函数留后)。
+观察:① 干净 dedup 渐枯竭(R4 -6 / R5 -2);剩多为热路径大函数(do_compact/run_gc/partition-server lib.rs)需
+  reproduce-first 谨慎,或全文件 F### 清理(judgment-heavy,量大);② coco inspect 在大文件上不稳,findbugs(小 diff)稳。
+Next(loop 续):⑥ stream/client.rs 或 partition-server 别处找小 dedup;或转「专门 F### 清理轮」(挑一个文件系统性删 F###
+  标签+删纯考古注释,coco+chaos 验零行为变更);⑦ 热路径大函数最后。split/merge Phase-2 kvs builder MEDIUM 跳。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
