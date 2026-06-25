@@ -42,6 +42,20 @@ fn map_storage_error(e: &anyhow::Error) -> (StatusCode, String) {
     (StatusCode::Internal, e.to_string())
 }
 
+/// TiKV-style routing-freshness check shared by the read handlers
+/// (get / head / range / batch_get). `req_epoch == 0` skips the check
+/// (bootstrap / tests / legacy callers). On mismatch returns a
+/// `FailedPrecondition` so the SDK's `Err`-arm refresh+retry engages.
+fn check_region_epoch(part_id: u64, have: u64, req_epoch: u64) -> Result<(), (StatusCode, String)> {
+    if req_epoch != 0 && req_epoch != have {
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!("region epoch stale: part_id={part_id} have={have} got={req_epoch}"),
+        ));
+    }
+    Ok(())
+}
+
 // Per-partition read metrics, tracked in thread-local since partition thread is single-threaded.
 thread_local! {
     static READ_METRICS: RefCell<ReadMetrics> = RefCell::new(ReadMetrics::new());
@@ -177,15 +191,7 @@ pub(crate) async fn handle_batch_get(
     // (without re-decoding for each key).
     {
         let p = part.borrow();
-        if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "region epoch stale: part_id={} have={} got={}",
-                    p.part_id, p.region_epoch, req.region_epoch
-                ),
-            ));
-        }
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
     }
     let mut items: Vec<partition_rpc::BatchGetItem> = Vec::with_capacity(req.keys.len());
     for key in req.keys.into_iter() {
@@ -389,19 +395,7 @@ async fn get_value_inner(
 
     let lookup_t0 = Instant::now();
     let p = part.borrow();
-    // TiKV-style region epoch check. `0` from the client = "skip check"
-    // (bootstrap / tests / legacy callers). On mismatch surface a
-    // FailedPrecondition frame error so the SDK's existing `Err`-arm
-    // refresh+retry path in `call_ps_for_key` engages.
-    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((
-            StatusCode::FailedPrecondition,
-            format!(
-                "region epoch stale: part_id={} have={} got={}",
-                p.part_id, p.region_epoch, req.region_epoch
-            ),
-        ));
-    }
+    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
     if !in_range(&p.rg, &req.key) {
         return Err((
             StatusCode::InvalidArgument,
@@ -606,15 +600,7 @@ pub(crate) async fn handle_head(
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
-    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((
-            StatusCode::FailedPrecondition,
-            format!(
-                "region epoch stale: part_id={} have={} got={}",
-                p.part_id, p.region_epoch, req.region_epoch
-            ),
-        ));
-    }
+    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
     if !in_range(&p.rg, &req.key) {
         return Err((
             StatusCode::InvalidArgument,
@@ -716,24 +702,14 @@ pub(crate) async fn handle_range(
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
-    // F-this: this is the load-bearing check for `range()` correctness
-    // after a split. Pre-this, mismatched-epoch range requests were
-    // silently filtered per-key (`continue` at line 351 below) and
-    // returned a valid-but-partial result with `code:OK` — the gallery
-    // bug. Now any range with a stale snapshot's epoch is rejected
-    // up-front; SDK refreshes + re-runs.
-    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((
-            StatusCode::FailedPrecondition,
-            format!(
-                "region epoch stale: part_id={} have={} got={}",
-                p.part_id, p.region_epoch, req.region_epoch
-            ),
-        ));
-    }
-    // F-this Phase 4: snapshot the PS's authoritative end_key so the
-    // response can carry it as a resume cursor for the SDK. Empty =
-    // unbounded right side (last partition in the keyspace).
+    // Load-bearing for `range()` correctness after a split: without it,
+    // mismatched-epoch range requests are silently filtered per-key and
+    // return a valid-but-partial result with `code:OK` (the gallery bug).
+    // A stale snapshot's epoch is rejected up-front; SDK refreshes + re-runs.
+    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+    // Snapshot the PS's authoritative end_key so the response can carry it
+    // as a resume cursor for the SDK. Empty = unbounded right side (last
+    // partition in the keyspace).
     let cur_end_key = p.rg.end_key.clone();
     if req.limit == 0 {
         return Ok(partition_rpc::rkyv_encode(&RangeResp {
