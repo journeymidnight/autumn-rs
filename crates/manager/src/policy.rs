@@ -503,94 +503,140 @@ impl PolicyEngine {
             let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
             };
-            let recent = &bs[0].1;
-
-            // ── GC advisory ────────────────────────────────────────────
-            // Skip when an inflight GC is already chewing on this
-            // partition; let that complete before re-advising.
-            if recent.gc_inflight == 0
-                && (recent.last_gc_at == 0 || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
-                && bs.iter().all(|(_, l)| l.gc_debt_bytes > cfg.gc_debt_high)
-            {
-                out.push(PolicyCandidate {
-                    kind: POLICY_KIND_GC,
-                    primary_part_id: part_id,
-                    secondary_part_id: 0,
-                    reason: format!(
-                        "gc_debt_bytes>{} ({} MiB) sustained {}m",
-                        cfg.gc_debt_high,
-                        recent.gc_debt_bytes / (1024 * 1024),
-                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
-                    ),
-                    size_bytes: recent.gc_debt_bytes,
-                    req_per_sec: recent.req_per_sec,
-                    imm_full_per_sec: recent.imm_full_per_sec,
-                    same_ps: true,
-                    last_op_at: recent.last_gc_at,
-                });
-            }
-
-            // ── Major-compact advisory ────────────────────────────────
-            if recent.compact_inflight == 0
-                && (recent.last_compact_at == 0
-                    || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
-                && bs
-                    .iter()
-                    .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
-            {
-                out.push(PolicyCandidate {
-                    kind: POLICY_KIND_MAJOR_COMPACT,
-                    primary_part_id: part_id,
-                    secondary_part_id: 0,
-                    reason: format!(
-                        "pending_compaction_bytes>{} ({} MiB) sustained {}m",
-                        cfg.compact_pending_high,
-                        recent.pending_compaction_bytes / (1024 * 1024),
-                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
-                    ),
-                    size_bytes: recent.pending_compaction_bytes,
-                    req_per_sec: recent.req_per_sec,
-                    imm_full_per_sec: recent.imm_full_per_sec,
-                    same_ps: true,
-                    last_op_at: recent.last_compact_at,
-                });
-            }
-
-            // ── F202: Minor-compact advisory ──────────────────────────
-            // Independent from the major path: minor compact addresses
-            // size-tiered write-amp hygiene, not dead-data cleanup.
-            // Common-sense filter: only emit if the PS-side
-            // `minor_compact_pending_bytes` is non-zero (i.e.
-            // `pickup_tables` actually had something to do) so we
-            // don't spam advisories for partitions with no real work.
-            if recent.compact_inflight == 0
-                && recent.minor_compact_pending_bytes > 0
-                && (recent.last_compact_at == 0
-                    || now - recent.last_compact_at >= cfg.minor_compact_cooldown_sec)
-                && bs
-                    .iter()
-                    .all(|(_, l)| l.minor_compact_pending_bytes > cfg.minor_compact_pending_high)
-            {
-                out.push(PolicyCandidate {
-                    kind: POLICY_KIND_MINOR_COMPACT,
-                    primary_part_id: part_id,
-                    secondary_part_id: 0,
-                    reason: format!(
-                        "minor_compact_pending_bytes>{} ({} MiB) sustained {}m",
-                        cfg.minor_compact_pending_high,
-                        recent.minor_compact_pending_bytes / (1024 * 1024),
-                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
-                    ),
-                    size_bytes: recent.minor_compact_pending_bytes,
-                    req_per_sec: recent.req_per_sec,
-                    imm_full_per_sec: recent.imm_full_per_sec,
-                    same_ps: true,
-                    last_op_at: recent.last_compact_at,
-                });
-            }
+            // Three independent maintenance checks per partition, each
+            // emitting at most one candidate. Kept as separate named
+            // sub-checks (NOT one parametrised helper) because the
+            // metric / threshold / reason text differ per kind.
+            out.extend(Self::gc_advisory(part_id, &bs, &cfg, now));
+            out.extend(Self::major_compact_advisory(part_id, &bs, &cfg, now));
+            out.extend(Self::minor_compact_advisory(part_id, &bs, &cfg, now));
         }
 
         out
+    }
+
+    /// GC maintenance sub-check (F187). Emits a `POLICY_KIND_GC`
+    /// candidate when no GC is inflight on the partition, it is outside
+    /// `gc_cooldown_sec`, and ALL recent buckets sustain
+    /// `gc_debt_bytes > gc_debt_high`.
+    fn gc_advisory(
+        part_id: u64,
+        bs: &[&(i64, PartitionLoad)],
+        cfg: &PolicyConfig,
+        now: i64,
+    ) -> Option<PolicyCandidate> {
+        let recent = &bs[0].1;
+        // Skip when an inflight GC is already chewing on this
+        // partition; let that complete before re-advising.
+        if recent.gc_inflight == 0
+            && (recent.last_gc_at == 0 || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
+            && bs.iter().all(|(_, l)| l.gc_debt_bytes > cfg.gc_debt_high)
+        {
+            Some(PolicyCandidate {
+                kind: POLICY_KIND_GC,
+                primary_part_id: part_id,
+                secondary_part_id: 0,
+                reason: format!(
+                    "gc_debt_bytes>{} ({} MiB) sustained {}m",
+                    cfg.gc_debt_high,
+                    recent.gc_debt_bytes / (1024 * 1024),
+                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                ),
+                size_bytes: recent.gc_debt_bytes,
+                req_per_sec: recent.req_per_sec,
+                imm_full_per_sec: recent.imm_full_per_sec,
+                same_ps: true,
+                last_op_at: recent.last_gc_at,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Major-compaction maintenance sub-check (F187). Emits a
+    /// `POLICY_KIND_MAJOR_COMPACT` candidate when no compaction is
+    /// inflight, the partition is outside `compact_cooldown_sec`, and
+    /// ALL recent buckets sustain
+    /// `pending_compaction_bytes > compact_pending_high`.
+    fn major_compact_advisory(
+        part_id: u64,
+        bs: &[&(i64, PartitionLoad)],
+        cfg: &PolicyConfig,
+        now: i64,
+    ) -> Option<PolicyCandidate> {
+        let recent = &bs[0].1;
+        if recent.compact_inflight == 0
+            && (recent.last_compact_at == 0
+                || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
+            && bs
+                .iter()
+                .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
+        {
+            Some(PolicyCandidate {
+                kind: POLICY_KIND_MAJOR_COMPACT,
+                primary_part_id: part_id,
+                secondary_part_id: 0,
+                reason: format!(
+                    "pending_compaction_bytes>{} ({} MiB) sustained {}m",
+                    cfg.compact_pending_high,
+                    recent.pending_compaction_bytes / (1024 * 1024),
+                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                ),
+                size_bytes: recent.pending_compaction_bytes,
+                req_per_sec: recent.req_per_sec,
+                imm_full_per_sec: recent.imm_full_per_sec,
+                same_ps: true,
+                last_op_at: recent.last_compact_at,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Minor-compaction maintenance sub-check (F202). Independent from
+    /// the major path: minor compact addresses size-tiered write-amp
+    /// hygiene, not dead-data cleanup. Common-sense filter: only emit
+    /// when the PS-side `minor_compact_pending_bytes` is non-zero (i.e.
+    /// `pickup_tables` actually had something to do) so we don't spam
+    /// advisories for partitions with no real work. Emits a
+    /// `POLICY_KIND_MINOR_COMPACT` candidate when no compaction is
+    /// inflight, the partition is outside `minor_compact_cooldown_sec`,
+    /// and ALL recent buckets sustain
+    /// `minor_compact_pending_bytes > minor_compact_pending_high`.
+    fn minor_compact_advisory(
+        part_id: u64,
+        bs: &[&(i64, PartitionLoad)],
+        cfg: &PolicyConfig,
+        now: i64,
+    ) -> Option<PolicyCandidate> {
+        let recent = &bs[0].1;
+        if recent.compact_inflight == 0
+            && recent.minor_compact_pending_bytes > 0
+            && (recent.last_compact_at == 0
+                || now - recent.last_compact_at >= cfg.minor_compact_cooldown_sec)
+            && bs
+                .iter()
+                .all(|(_, l)| l.minor_compact_pending_bytes > cfg.minor_compact_pending_high)
+        {
+            Some(PolicyCandidate {
+                kind: POLICY_KIND_MINOR_COMPACT,
+                primary_part_id: part_id,
+                secondary_part_id: 0,
+                reason: format!(
+                    "minor_compact_pending_bytes>{} ({} MiB) sustained {}m",
+                    cfg.minor_compact_pending_high,
+                    recent.minor_compact_pending_bytes / (1024 * 1024),
+                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                ),
+                size_bytes: recent.minor_compact_pending_bytes,
+                req_per_sec: recent.req_per_sec,
+                imm_full_per_sec: recent.imm_full_per_sec,
+                same_ps: true,
+                last_op_at: recent.last_compact_at,
+            })
+        } else {
+            None
+        }
     }
 
     /// F202: EC-conversion advisory. Scans the manager state for
