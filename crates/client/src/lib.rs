@@ -111,6 +111,19 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
     }
 }
 
+/// Shared response-code guard: bail with the mapped `code_to_error` when a
+/// PS (partition-server) response body carries a non-OK application code.
+/// PS-ONLY — `code_to_error` maps `partition_rpc::CODE_*`; manager
+/// responses use a different code space (e.g. `CODE_NOT_LEADER`) and must
+/// NOT be routed here. Borrows `message` so it is only cloned on the
+/// (error) bail path.
+fn check_ps_code(code: u8, message: &str) -> std::result::Result<(), AutumnError> {
+    if code != partition_rpc::CODE_OK {
+        return Err(code_to_error(code, message.to_string()));
+    }
+    Ok(())
+}
+
 /// F225: map an autumn-rpc FRAME-level error (`Err((StatusCode, msg))` returned
 /// by a PS handler — e.g. `handle_split_part`'s overlap precondition) into a
 /// typed `AutumnError`. `ps_call` returns this (wrapped in `anyhow`) instead of
@@ -1213,9 +1226,7 @@ impl ClusterClient {
                 cap: 0, // unknown server-side cap (would need to parse `resp.message`)
             });
         }
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        check_ps_code(resp.code, &resp.message)?;
         Ok(())
     }
 
@@ -1358,9 +1369,7 @@ impl ClusterClient {
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        check_ps_code(resp.code, &resp.message)?;
         Ok(Some(resp.value))
     }
 
@@ -1393,9 +1402,7 @@ impl ClusterClient {
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        check_ps_code(resp.code, &resp.message)?;
         if resp.extent_id == 0 {
             return Ok(Some(bytes::Bytes::from(resp.value)));
         }
@@ -2149,9 +2156,7 @@ impl ClusterClient {
                 }
             };
             let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-            if resp.code != partition_rpc::CODE_OK {
-                return Err(code_to_error(resp.code, resp.message));
-            }
+            check_ps_code(resp.code, &resp.message)?;
 
             let count = resp.entries.len() as u32;
             all_entries.extend(resp.entries);
@@ -2355,9 +2360,7 @@ impl ClusterClient {
             .call_ps_for_part(part_id, MSG_MAINTENANCE, rkyv_encode(&req))
             .await?;
         let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        check_ps_code(resp.code, &resp.message)?;
         Ok(())
     }
 
@@ -2473,9 +2476,7 @@ impl ClusterClient {
             )
             .await?;
         let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        check_ps_code(resp.code, &resp.message)?;
         Ok(())
     }
 }
