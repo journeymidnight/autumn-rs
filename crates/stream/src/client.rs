@@ -2972,6 +2972,22 @@ impl StreamClient {
         self.extent_info_cache.remove(&extent_id);
     }
 
+    /// Read-error policy shared by the replicated failover + hedge paths.
+    /// An `EversionStale` error means the cached `ExtentInfo` is a stale
+    /// GENERATION — the caller must FAIL FAST (returns `true`) so the
+    /// top-level 2-attempt retry refetches it; the cache is left intact
+    /// because every replica reports the same mismatch. Any OTHER error
+    /// means this REPLICA failed; the cached replica layout may be wrong,
+    /// so evict the entry and let the caller try the next replica (returns
+    /// `false`).
+    fn read_err_fail_fast(&self, e: &anyhow::Error, extent_id: u64) -> bool {
+        if is_eversion_stale(e) {
+            return true;
+        }
+        self.extent_info_cache.remove(&extent_id);
+        false
+    }
+
     /// Read bytes from a specific extent.
     /// Pass `length=0` to read from offset to the end of the extent.
     ///
@@ -3491,11 +3507,10 @@ impl StreamClient {
             {
                 Ok(r) => return Ok(r),
                 Err(e) => {
-                    if is_eversion_stale(&e) {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
                         return Err(e);
                     }
                     last_err = e;
-                    self.extent_info_cache.remove(&ex.extent_id);
                 }
             }
             from = 2; // hedge already consumed order[0] and order[1]
@@ -3509,11 +3524,10 @@ impl StreamClient {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    if is_eversion_stale(&e) {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
                         return Err(e);
                     }
                     last_err = e;
-                    self.extent_info_cache.remove(&ex.extent_id);
                 }
             }
         }
@@ -3578,10 +3592,9 @@ impl StreamClient {
                 return match flatten_hedge(res) {
                     Ok(r) => Ok(r),
                     Err(e) => {
-                        if is_eversion_stale(&e) {
+                        if self.read_err_fail_fast(&e, ex.extent_id) {
                             return Err(e);
                         }
-                        self.extent_info_cache.remove(&ex.extent_id);
                         // First failed before the hedge window: sequential
                         // second read (no point hedging a known failure).
                         flatten_hedge(spawn_read(sc, a1).await)
@@ -3599,20 +3612,18 @@ impl StreamClient {
             Either::Left((res0, rx1_pending)) => match flatten_hedge(res0) {
                 Ok(r) => Ok(r),
                 Err(e) => {
-                    if is_eversion_stale(&e) {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
                         return Err(e);
                     }
-                    self.extent_info_cache.remove(&ex.extent_id);
                     flatten_hedge(rx1_pending.await)
                 }
             },
             Either::Right((res1, rx0_pending)) => match flatten_hedge(res1) {
                 Ok(r) => Ok(r),
                 Err(e) => {
-                    if is_eversion_stale(&e) {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
                         return Err(e);
                     }
-                    self.extent_info_cache.remove(&ex.extent_id);
                     flatten_hedge(rx0_pending.await)
                 }
             },
