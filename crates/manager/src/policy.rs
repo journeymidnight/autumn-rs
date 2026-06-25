@@ -311,10 +311,24 @@ pub struct ComputeArgs<'a> {
 
 impl PolicyEngine {
     pub fn compute_candidates(&mut self, args: ComputeArgs<'_>) -> Vec<PolicyCandidate> {
+        let mut out = self.split_candidates(&args);
+        out.extend(self.merge_candidates(&args));
+        self.advisory_cache = out.clone();
+        self.advisory_cache_at = args.now;
+        out
+    }
+
+    /// F183 SPLIT pass — per-partition sliding-window trigger.
+    ///
+    /// For each metrics-tracked partition, requires ALL of the last
+    /// `required_buckets` to show a split trigger (size-hard, sustained
+    /// QPS-over-min-size, or imm-full-high) and the partition to be
+    /// outside its `split_cooldown_sec`. Emits one `POLICY_KIND_SPLIT`
+    /// candidate per qualifying partition.
+    fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
 
-        // ── SPLIT pass ──────────────────────────────────────────────────────
         for (&part_id, window) in self.metrics.iter() {
             let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
@@ -362,8 +376,23 @@ impl PolicyEngine {
                 last_op_at: last_op,
             });
         }
+        out
+    }
 
-        // ── MERGE pass ──────────────────────────────────────────────────────
+    /// F183 MERGE pass — adjacent-pair sliding-window trigger.
+    ///
+    /// Walks partitions sorted by `start_key`; for each adjacent pair
+    /// where `left.end_key == right.start_key`, requires ALL of the last
+    /// `required_buckets` in BOTH windows to qualify as cold (size-low,
+    /// summed-QPS-low, zero imm-full) and the pair to be outside
+    /// `merge_cooldown_sec`. Emits one `POLICY_KIND_MERGE` candidate
+    /// (survivor = left) per qualifying pair; `same_ps` reflects whether
+    /// the pair currently lives on the same PS (cross-PS merges are
+    /// infeasible and flagged in `reason`).
+    fn merge_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = self.config.clone();
+
         // Walk partitions sorted by start_key; for each adjacent pair where
         // left.end_key == right.start_key, check both windows.
         let mut sorted_parts: Vec<(u64, &autumn_rpc::manager_rpc::MgrPartitionMeta)> = args
@@ -449,8 +478,6 @@ impl PolicyEngine {
             });
         }
 
-        self.advisory_cache = out.clone();
-        self.advisory_cache_at = args.now;
         out
     }
 
