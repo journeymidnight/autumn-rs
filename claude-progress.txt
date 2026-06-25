@@ -97,8 +97,19 @@ ROUND 11 COMMIT(13ea3c6,已 push):giant 函数逻辑分析续——run_gc + proc
   bundle 成 struct 是中等重构 clarity 收益有限,暂不做。process_gc_chunk:2599 `let _ = expires_at;`(下游真用了,vestigial)
   太marginal没动。
 进度:11 轮全绿(R1-R11)。giant 函数分析:do_compact(R10 去重 chunk-emit + R11 简化 defer 分支)、run_gc/process_gc_chunk(清晰)。
-Next(loop 续):⑫ 分析 recover_partition(~1.1k,partition-server/lib.rs 最大最 revert-prone)逻辑清晰度——读完评估,
-  有安全去重/简化才动,否则报告"已清晰";coco+chaos 每轮。
+ROUND 12 COMMIT(1fe0150,已 push):recover_partition 逻辑分析(读了前 ~360 行:meta-records union / SST-open /
+  dedup-region setup)——intricate 但复杂度内在(post-merge 多源 dedup / CoW dedup / eversion-retry / 非单调 extent
+  位置),注释足。**清晰 wart = replay-dedup 前导的 dead `let sst_max_seq=max_seq; let _ = sst_max_seq;`**(绑了立刻
+  丢弃从不读;max_seq 直接用别处)+ 挂在 `let _ =` 上的 ~20 行设计注释 + 上方另一段 intro 注释还在描述**已废弃的
+  single-sst_max_seq dedup**("`if ts <= sst_max_seq { continue; }` below"——该代码已不存在,replay 是 per-region)。
+  → 删 dead 绑定 + 两段重叠注释合并成一段描述**实际** per-source-region dedup(+ 为什么:多源独立 PS-seq → union max
+  会跳 survivor tail;FuturesOrdered 给 per-source contiguous-seq 不变量)+ 去 F### 标签。net -19。
+  验证:167/167 + clippy 9 不变 + **coco findbugs(GPT-5.5)未发现(注释+dead-code only 无可执行变更)** +
+  **chaos seed 603(split/merge reopens 驱动 recover_partition)Split+Merge OK all OK**。
+观察:sst_max_seq 还在 lib.rs:5331/5386 两处**别的函数** doc 注释里(也略 stale,引用已废弃 dedup),本轮范围外没动。
+进度:12 轮全绿(R1-R12)。giant 函数分析:do_compact(R10 去重+R11 简化分支)、run_gc/process_gc_chunk(清晰)、
+  recover_partition part-1(R12 去 dead-code+合并注释)。
+Next(loop 续):⑬ 继续读 recover_partition 后半(replay loop ~7180-7560 + 收尾 ~7950)分析清晰度;coco+chaos 每轮。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
