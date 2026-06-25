@@ -1,3 +1,45 @@
+Date: 2026-06-25 (review 战役 — 转向最大文件;manager/lib.rs dedup ×2)
+TaskStatus: completed
+Task scope: 用户"不超过200行的不用处理,开始处理最大的几个文件(冗余/乱代码最多)"。
+  先用 5 个并行 Explore agent 测绘 5 大文件(38K LOC),再挑干净低风险 win 动手。
+  每次重构 build+clippy+**全量 cargo test -p autumn-manager --lib(164/164)**。**已 push origin/main**。
+5 大文件测绘(供后续;LOC + 顶级低风险 win):
+  · partition-server/lib.rs 11,853(热路径,最 revert-prone,167 ps 单测)——agent 头号是 setter dedup
+    (108-196,~22 个 set_*),但我判定 marginal(每 setter 已极简,set_clamped<T:Ord> 几乎不缩短 + f64 不满足 Ord)→ 跳过,over-refactor。
+    真低风险但有价值的:enqueue_put/delete/batch_put 的 region_epoch+range+fence 前缀校验三处重复(6233-6650),
+    但在热写路径——谨慎。其余(partition_loop drain、frame dispatch)= 热路径中风险。
+  · stream/extent_node.rs 8,788(热 append/read/coalescer,note 24 revert-prone,90 stream 单测)——
+    DiskFS 路径构造 4 函数泛化(387-415,低)、eversion-mismatch 错误编码 dedup(低)、build_append_future 前置校验抽取
+    (低但热路径前段)。其余(recovery/re_avali finalize)中风险。
+  · manager/lib.rs 6,595(控制面,164 单测)——**本轮做了 2 个**(见下)。剩:mirror_* txn 构造 pattern(低,DEFER),
+    ConnPool::call / last_op_at_for dead-code(需先验证真未用)。
+  · manager/rpc_handlers.rs 5,660(控制面,164 单测)——agent 头号"leader 前缀 21 处 dedup"**被我否**:每处编码
+    不同 Resp 结构体(RegisterNodeResp/PunchHolesResp/...),只能上 control-flow 宏(藏 early-return)——meaty+opinionated,
+    暂缓。真低风险:punch_holes/truncate 两 handler 的 ~40 行 ref-decrement+pending-delete 块字节级重复(Items 3/7/8)——
+    但在 note33 CAS + F139/F145 guard 的 revert-prone 区,需逐行验证 guard 顺序,留作下个谨慎目标。
+  · stream/client.rs 5,229(StreamClient,部分热路径,90 单测)——eversion-mismatch codec dedup(低)、
+    cache 失效 2-liner→方法(低)、chunked-read loop dedup(低但需 read-path 回归)。EC scatter-gather/apply_completion 高风险。
+COMMITS(2 个,均 push):
+  · 11b88c9 manager/lib.rs:compute_merge_streams + splice_streams_without_new_tail 的两个**字节级重复块**
+    (survivor 旧 tail 封存 + victim-extents 循环含 F-merge-refs-leak refs 处理)→ 抽 seal_survivor_old_tail /
+    splice_victim_extents 两 helper。push 顺序不变;F-merge-refs-leak 完整 rationale 现只在 helper 一处
+    (原 splice 是"see compute_merge_streams"指针)。纯 verbatim 抽取。验证:164/164 含
+    f181_compute_merge_streams_extent_ids_order_and_refs / f_merge_refs_leak_{cow,splice}_* /
+    merge_refs_invariant_holds_across_split_merge_cycles —— 直接钉死两函数 refs/seal/order 行为。net -3(87/-90)。
+  · 269a239 manager/lib.rs:replay_from_etcd 的 5 个 id-map 解码循环(nodes/disks/streams/extents/partitions)
+    → 泛型 Self::replay_decode_id_map::<T>(&kvs, prefix, &mut max_id)。其余前缀(owner_locks/ps_nodes/regions/
+    last_op)真不同保留 inline。net ~平,价值=fail-loud replay_decode_err(note 39 升级安全)集中到一处。
+教训:① Explore agent 会高估/编造 dedup(rpc_handlers "21 处 Bytes dedup" 实际每处 Resp 类型不同;
+  partition setter "head win" 实际 marginal)——动手前必验证实际 pattern;② 大文件最干净的低风险 win 是
+  **泛型函数抽取 / 字节级重复块抽取**(replay 5 循环 / merge 2 块),不是 control-flow 宏(藏 early-return,违保守);
+  ③ 热路径(partition_loop/coalescer/append)+ CAS/guard 区(note33/F139/F145)的 dedup 留作逐行验证的谨慎目标,不抢跑。
+Next steps(用户定夺):① 继续 manager/lib.rs 低风险(mirror_* txn pattern / 验证并删 dead-code);
+  ② 谨慎做 rpc_handlers punch_holes/truncate 的 ~40 行 dedup(先逐行验证 note33 CAS + F139/F145 guard 顺序);
+  ③ extent_node.rs / stream/client.rs 的低风险项(DiskFS 路径、eversion 错误编码、cache 失效);
+  ④ 热路径(partition-server/lib.rs enqueue 前缀、partition_loop)最后,reproduce-first 心态。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-25 (review 战役 — policy.rs compute_* 拆子检查 ×2)
 TaskStatus: completed
 Task scope: 用户"continue"→"Push and continue"(承接 review 战役;next-steps ① policy compute_* 大函数拆子检查)。
