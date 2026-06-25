@@ -106,7 +106,7 @@ ROUND 12 COMMIT(1fe0150,已 push):recover_partition 逻辑分析(读了前 ~360 
   会跳 survivor tail;FuturesOrdered 给 per-source contiguous-seq 不变量)+ 去 F### 标签。net -19。
   验证:167/167 + clippy 9 不变 + **coco findbugs(GPT-5.5)未发现(注释+dead-code only 无可执行变更)** +
   **chaos seed 603(split/merge reopens 驱动 recover_partition)Split+Merge OK all OK**。
-ROUND 13 COMMIT(待 push):recover_partition 逻辑分析收尾 + R12 一致性 follow-up。
+ROUND 13 COMMIT(7b461fa,已 push):recover_partition 逻辑分析收尾 + R12 一致性 follow-up。
   ① 读完 replay loop 全段(7180-7548):intricate 但复杂度内在(CoW-dedup extent 选择 / committed-clamped
   chunked-carry 读含 10-attempt 重试 / 跨副本 self_heal_replay_chunk / fence-bump 绕过 ts-dedup / VP 经
   value_offset_in_record 重建 / corrupt-replica A5 隔离),注释足、无可安全简化的逻辑(R12 已是该函数唯一 wart)。
@@ -118,15 +118,26 @@ ROUND 13 COMMIT(待 push):recover_partition 逻辑分析收尾 + R12 一致性 f
   (确认 5331/5387 注释文字调整,无可执行逻辑/状态机/并发/资源/错误处理变更)** + **chaos seed 603(58s,split/merge
   reopen 驱动 recover_partition):writes acked=10737 reads ok=19391,per-key mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。net -4(5/-4)。
-观察:sst_max_seq 引用现已全清(recover_partition 本体 R12 删,两处别函数 doc R13 修)。**giant 函数分析战役完成**:
-  4 个用户点名函数(do_compact / run_gc / process_gc_chunk / recover_partition)全部读毕分析:do_compact R10 去重
-  chunk-emit + R11 简化 defer 分支;run_gc/process_gc_chunk 清晰(11 参数是真需要的 ctx+累加器,非 smell);
-  recover_partition R12 去 dead-code+合并 stale 注释 + R13 读完 replay loop 确认内在复杂、无further 简化 + 清 doc 引用。
-进度:13 轮全绿(R1-R13),均 push(R13 本轮 push)。chaos-validated crate(manager/stream/partition-server/client)
-  的干净 dedup + giant-函数分析目标已基本枯竭;后续轮若无新目标需用户重新定向(或转 fuse/ioring 非-chaos-validated 区,
-  但那违反"每轮 chaos"约束,需先扩 chaos 覆盖)。
-Next(loop 续):⑭ giant 函数战役已收;chaos-validated 区低风险目标渐尽。候选:(a) 报告战役完成、等用户定向新目标;
-  (b) 转其它大函数(partition_thread_main / build_append_future / handle_split_part 等热路径,reproduce-first 谨慎);
+ROUND 14 COMMIT(待 push):stream/extent_node.rs handle_convert_to_ec(全 crate 最大函数 458 行,EC 2PC 协调器)
+  逻辑分析 + EC-2PC-participant RPC 去重。读完全函数:**intricate 但复杂度内在**(idempotent-skip /
+  coordinator-prepared skip / F128 post-rename 崩溃恢复 / peer-copy / 分条 RS-encode / 2PC commit,每分支注释足),
+  逻辑清晰——与 recover_partition 同结论。唯一真结构冗余:**WriteShard fanout(phase-1)+ CommitEcShard fanout
+  (phase-2)两块 `match rpc_oneshot → decode → code!=OK 拒 → Err 臂` 同形**(仅 Resp 类型 + label 串不同)→ 抽
+  free fn `ec_2pc_participant_rpc(sock, msg, payload, label, decode_code 闭包)`。**消息字节级相同**:label 串
+  ("WriteShard to {addr} shard {i} @ {off}" / "CommitEcShard to {addr} shard {i}")承载 code=/transport 两条,
+  decode-err 串由各站点闭包内保留("decode write_shard resp" / "decode commit_ec resp")。控制流 `?` 早退等价
+  原 `return Err`。in-family 于 R6/R7/R8 的 check_* 抽取。net -4(43/-47;helper +28 但 2PC participant 错误映射
+  现单一真源)。验证:build+clippy(22 warn 不变,changed-code 无新增)+ **90/90 stream 单测** +
+  **coco findbugs deep(GPT-5.5;首跑双模型 transient 失败,重试 OK)未发现** + **chaos seed 603(58s,EC nemesis 驱动
+  handle_convert_to_ec):writes acked=10466 reads ok=19687,per-key mismatch=0 not_found=0、range=0、
+  write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
+观察:giant 函数分析已扩到 stream crate 最大函数(handle_convert_to_ec)——同 recover_partition 结论(内在复杂、
+  注释足),挖出 1 个真 in-family 去重(EC 2PC participant RPC)。sst_max_seq 引用 R12/R13 已全清。
+进度:14 轮全绿(R1-R14),均 push(R14 本轮 push)。已分析的大函数:partition-server(do_compact/run_gc/
+  process_gc_chunk/recover_partition)+ stream(handle_convert_to_ec)。chaos-validated 区干净 dedup 渐尽;
+  仍可继续读其余大函数(stream handle_append/load_extents、ps sync_regions_once/open_partition)分析清晰度。
+Next(loop 续):⑮ 继续大函数分析(候选:stream handle_append 252 行 / load_extents 192 / stream_extent_from_sources 181;
+  ps sync_regions_once 243 / open_partition 215),analyze-for-clarity + 仅抽真 in-family 去重;reproduce-first 谨慎;
   coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────

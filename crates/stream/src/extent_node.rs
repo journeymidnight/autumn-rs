@@ -1366,6 +1366,34 @@ async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -
     }
 }
 
+/// Send an EC 2PC participant control RPC (`WriteShard` / `CommitEcShard`) to a
+/// target node, extract its response code via `decode_code`, and map a transport
+/// error or a non-`CODE_OK` reply into a uniform `Internal` error. `label`
+/// describes the op (e.g. `"WriteShard to <addr> shard <i> @ <off>"`) so both
+/// participant-RPC sites in `handle_convert_to_ec` emit identical messages from
+/// one place.
+async fn ec_2pc_participant_rpc(
+    sock: std::net::SocketAddr,
+    msg_type: u8,
+    payload: Bytes,
+    label: &str,
+    decode_code: impl FnOnce(Bytes) -> std::result::Result<u8, (StatusCode, String)>,
+) -> std::result::Result<(), (StatusCode, String)> {
+    match rpc_oneshot(sock, msg_type, payload).await {
+        Ok(resp_bytes) => {
+            let code = decode_code(resp_bytes)?;
+            if code != CODE_OK {
+                return Err((
+                    StatusCode::Internal,
+                    format!("{label}: code={}", code_description(code)),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err((StatusCode::Internal, format!("{label}: {e}"))),
+    }
+}
+
 /// Set TCP send/recv buffer sizes via setsockopt.
 fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
     use std::os::fd::AsRawFd;
@@ -7035,31 +7063,14 @@ impl ExtentNode {
                                 format!("parse addr {target_addr}: {e}"),
                             )
                         })?;
-                        match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
-                            Ok(resp_bytes) => {
-                                let resp = WriteShardResp::decode(resp_bytes).map_err(|e| {
-                                    (
-                                        StatusCode::Internal,
-                                        format!("decode write_shard resp: {e}"),
-                                    )
-                                })?;
-                                if resp.code != CODE_OK {
-                                    return Err((
-                                        StatusCode::Internal,
-                                        format!(
-                                            "WriteShard to {target_addr} shard {i} @ {shard_off}: code={}",
-                                            code_description(resp.code)
-                                        ),
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                return Err((
-                                    StatusCode::Internal,
-                                    format!("WriteShard to {target_addr} shard {i} @ {shard_off}: {e}"),
-                                ));
-                            }
-                        }
+                        let label =
+                            format!("WriteShard to {target_addr} shard {i} @ {shard_off}");
+                        ec_2pc_participant_rpc(sock, MSG_WRITE_SHARD, ws_req.encode(), &label, |b| {
+                            WriteShardResp::decode(b).map(|r| r.code).map_err(|e| {
+                                (StatusCode::Internal, format!("decode write_shard resp: {e}"))
+                            })
+                        })
+                        .await?;
                     }
 
                     // Coordinator's own shard 0 stripe, written LAST.
@@ -7104,28 +7115,13 @@ impl ExtentNode {
                     format!("parse addr {target_addr}: {e}"),
                 )
             })?;
-            match rpc_oneshot(sock, MSG_COMMIT_EC_SHARD, commit_req.encode()).await {
-                Ok(resp_bytes) => {
-                    let resp = CommitEcShardResp::decode(resp_bytes).map_err(|e| {
-                        (StatusCode::Internal, format!("decode commit_ec resp: {e}"))
-                    })?;
-                    if resp.code != CODE_OK {
-                        return Err((
-                            StatusCode::Internal,
-                            format!(
-                                "CommitEcShard to {target_addr} shard {i}: code={}",
-                                code_description(resp.code)
-                            ),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Err((
-                        StatusCode::Internal,
-                        format!("CommitEcShard to {target_addr} shard {i}: {e}"),
-                    ));
-                }
-            }
+            let label = format!("CommitEcShard to {target_addr} shard {i}");
+            ec_2pc_participant_rpc(sock, MSG_COMMIT_EC_SHARD, commit_req.encode(), &label, |b| {
+                CommitEcShardResp::decode(b)
+                    .map(|r| r.code)
+                    .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))
+            })
+            .await?;
         }
 
         // Coordinator commits itself LAST. After this, the idempotency
