@@ -118,7 +118,7 @@ ROUND 13 COMMIT(7b461fa,已 push):recover_partition 逻辑分析收尾 + R12 一
   (确认 5331/5387 注释文字调整,无可执行逻辑/状态机/并发/资源/错误处理变更)** + **chaos seed 603(58s,split/merge
   reopen 驱动 recover_partition):writes acked=10737 reads ok=19391,per-key mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。net -4(5/-4)。
-ROUND 14 COMMIT(待 push):stream/extent_node.rs handle_convert_to_ec(全 crate 最大函数 458 行,EC 2PC 协调器)
+ROUND 14 COMMIT(1fd8f6a,已 push):stream/extent_node.rs handle_convert_to_ec(全 crate 最大函数 458 行,EC 2PC 协调器)
   逻辑分析 + EC-2PC-participant RPC 去重。读完全函数:**intricate 但复杂度内在**(idempotent-skip /
   coordinator-prepared skip / F128 post-rename 崩溃恢复 / peer-copy / 分条 RS-encode / 2PC commit,每分支注释足),
   逻辑清晰——与 recover_partition 同结论。唯一真结构冗余:**WriteShard fanout(phase-1)+ CommitEcShard fanout
@@ -131,13 +131,28 @@ ROUND 14 COMMIT(待 push):stream/extent_node.rs handle_convert_to_ec(全 crate �
   **coco findbugs deep(GPT-5.5;首跑双模型 transient 失败,重试 OK)未发现** + **chaos seed 603(58s,EC nemesis 驱动
   handle_convert_to_ec):writes acked=10466 reads ok=19687,per-key mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
-观察:giant 函数分析已扩到 stream crate 最大函数(handle_convert_to_ec)——同 recover_partition 结论(内在复杂、
-  注释足),挖出 1 个真 in-family 去重(EC 2PC participant RPC)。sst_max_seq 引用 R12/R13 已全清。
-进度:14 轮全绿(R1-R14),均 push(R14 本轮 push)。已分析的大函数:partition-server(do_compact/run_gc/
-  process_gc_chunk/recover_partition)+ stream(handle_convert_to_ec)。chaos-validated 区干净 dedup 渐尽;
-  仍可继续读其余大函数(stream handle_append/load_extents、ps sync_regions_once/open_partition)分析清晰度。
-Next(loop 续):⑮ 继续大函数分析(候选:stream handle_append 252 行 / load_extents 192 / stream_extent_from_sources 181;
-  ps sync_regions_once 243 / open_partition 215),analyze-for-clarity + 仅抽真 in-family 去重;reproduce-first 谨慎;
+ROUND 15 COMMIT(待 push):大函数清晰度分析 ×3 + handle_append 拒绝响应 boilerplate 抽取。
+  分析:① ps sync_regions_once(243 行)= 6 段不同 pass(fetch+decode/build wanted/drop-for-reload/open-new
+  含 F196 budget+BUG#3 backoff/prune backoff/F265 part_addr self-heal),各段注释足、无重复 pattern → 清晰,不动。
+  ② stream load_extents(192 行)= 每 extent 线性流(owns-check → open .dat → META-FAILCLOSED parse/quarantine →
+  insert → EC-COMMIT-ATOMIC marker replay),崩溃恢复 intricate 但内在,quarantine 动作已是局部闭包 → 清晰,不动。
+  ③ stream handle_append(252 行,非批量 append 路径)= 真有**清晰度问题**:append 协议 10 个 guard 之间散落 10 份
+  字节级相同的 6 行拒绝块 `return Ok(AppendResp{code:X,offset:0,end:0}.encode())`,淹没协议逻辑。
+  → 抽**纯响应构造** free fn `append_reject(code)->HandlerResult`,每 guard 变单行 `return append_reject(CODE_X);`。
+  **零语义风险**(只构造响应字节,不碰 seal/fence/commit/并发逻辑);`return Ok(AppendResp{` 全文件仅此函数有
+  (批量路径用 `let resp_payload=`),success 站点(real offset/end)留 inline。net -35(25/-60)。
+  验证:build+clippy(22 warn 不变,无新增)+ **90/90 stream 单测** + **coco findbugs deep(GPT-5.5)未发现
+  (显式核对全 10 调用点 return 类型/错误码/offset-end 语义一致)** + **chaos seed 603(58s,kill+restart+commit-trunc
+  nemesis 重压 handle_append 各 guard):writes acked=10635 reads ok=19594,mismatch=0 not_found=0、range=0、
+  write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
+观察:本轮印证 directive#4 双结论:多数大函数 analyze 后**清晰即不动**(sync_regions_once/load_extents),个别有真
+  boilerplate(handle_append 的拒绝块)→ 纯构造抽取是 zero-risk 清晰提升(非热路径核心逻辑)。giant 战役已覆盖
+  partition-server 4 函数 + stream 2 函数(handle_convert_to_ec R14 / handle_append R15)。
+进度:15 轮全绿(R1-R15),均 push(R15 本轮 push)。chaos-validated 区 clean dedup 渐尽;follow-up 候选:
+  build_append_future(批量热路径,有同样 AppendResp 拒绝 boilerplate 但用 `let resp_payload=` 形,需 ->Bytes 变体,
+  且是最热路径——reproduce-first,暂缓)。
+Next(loop 续):⑯ 候选:stream stream_extent_from_sources 181 / ps open_partition 215 分析;或报告战役近完成、等用户定向。
+  analyze-for-clarity + 仅抽 zero-risk 构造/in-family 去重;热路径(build_append_future/partition_loop)reproduce-first 暂缓;
   coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────

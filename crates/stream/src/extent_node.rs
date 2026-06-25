@@ -1394,6 +1394,21 @@ async fn ec_2pc_participant_rpc(
     }
 }
 
+/// Build an `AppendResp` rejection frame: a guard rejected the append, so no
+/// bytes were written and `offset`/`end` are 0. Every append-protocol guard in
+/// `handle_append` (quarantine / eversion / seal / owner-epoch fence / commit)
+/// returns one of these — centralising the `offset:0, end:0` boilerplate keeps
+/// each guard a single readable line. `code` is the rejection reason
+/// (`CODE_PRECONDITION` / `CODE_LOCKED_BY_OTHER`).
+fn append_reject(code: u8) -> HandlerResult {
+    Ok(AppendResp {
+        code,
+        offset: 0,
+        end: 0,
+    }
+    .encode())
+}
+
 /// Set TCP send/recv buffer sizes via setsockopt.
 fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
     use std::os::fd::AsRawFd;
@@ -5296,12 +5311,7 @@ impl ExtentNode {
         // META-FAILCLOSED: refuse on a quarantined extent (corrupt `.meta` at
         // load). See build_append_future step 0 + load_extents.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
 
         // Only fetch from manager when local eversion is behind what the client expects.
@@ -5350,33 +5360,18 @@ impl ExtentNode {
         // Validate eversion and sealed state from local atomics.
         let local_eversion = extent.eversion.load(Ordering::SeqCst);
         if local_eversion > req.eversion {
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
         if extent.sealed.load(Ordering::SeqCst)
             || extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
 
         let owner_epoch = extent.owner_epoch.load(Ordering::SeqCst);
         if req.owner_epoch < owner_epoch {
-            return Ok(AppendResp {
-                code: CODE_LOCKED_BY_OTHER,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_LOCKED_BY_OTHER);
         }
         // P0-B durable fence (same as build_append_future): raise the in-memory
         // bar synchronously, then require the fence to be DURABLE before we ACK.
@@ -5396,45 +5391,25 @@ impl ExtentNode {
                 error = %e,
                 "P0-B: durable fence persist failed — rejecting append (fail-closed)"
             );
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
         // P0-B: re-check fencing after the (possibly awaiting) durable step —
         // a higher owner_epoch may have taken over (LockedByOther), or a concurrent
         // seal/EC may have SEALED the extent during the await (CODE_PRECONDITION,
         // mirrors F147-B). owner_epoch and sealed are checked SEPARATELY.
         if req.owner_epoch < extent.owner_epoch.load(Ordering::SeqCst) {
-            return Ok(AppendResp {
-                code: CODE_LOCKED_BY_OTHER,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_LOCKED_BY_OTHER);
         }
         if extent.sealed.load(Ordering::SeqCst)
             || extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
         if start < req.commit as u64 {
-            return Ok(AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode());
+            return append_reject(CODE_PRECONDITION);
         }
         if start > req.commit as u64 {
             // F119-E: confirm with the manager that this extent is NOT
@@ -5468,12 +5443,7 @@ impl ExtentNode {
                     {
                         tracing::error!(extent_id = req.extent_id, error = %e, "P0-A: seal not durable during commit-reconcile reject (disk offline)");
                     }
-                    return Ok(AppendResp {
-                        code: CODE_PRECONDITION,
-                        offset: 0,
-                        end: 0,
-                    }
-                    .encode());
+                    return append_reject(CODE_PRECONDITION);
                 }
             }
             Self::truncate_to_commit(&extent, req.commit)
@@ -5491,12 +5461,7 @@ impl ExtentNode {
                 || extent.sealed_length.load(Ordering::SeqCst) > 0
                 || extent.avali.load(Ordering::SeqCst) > 0
             {
-                return Ok(AppendResp {
-                    code: CODE_PRECONDITION,
-                    offset: 0,
-                    end: 0,
-                }
-                .encode());
+                return append_reject(CODE_PRECONDITION);
             }
             start = extent.len.load(Ordering::SeqCst);
         }
