@@ -3300,6 +3300,22 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     // ── Etcd mirror helpers ────────────────────────────────────────────
 
+    /// Build a `("<prefix>/<id>", rkyv_encode(value))` etcd txn entry.
+    /// Centralizes the key-format + rkyv-encode pattern repeated across the
+    /// mirror_* helpers.
+    fn kv_entry<T>(prefix: &str, id: u64, value: &T) -> (String, Vec<u8>)
+    where
+        T: for<'a> rkyv::Serialize<
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        >,
+    {
+        (format!("{prefix}/{id}"), rkyv_encode(value).to_vec())
+    }
+
     async fn mirror_register_node(
         &self,
         node: &MgrNodeInfo,
@@ -3307,15 +3323,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut kvs = Vec::with_capacity(1 + disks.len());
-            kvs.push((
-                format!("nodes/{}", node.node_id),
-                rkyv_encode(node).to_vec(),
-            ));
+            kvs.push(Self::kv_entry("nodes", node.node_id, node));
             for disk in disks {
-                kvs.push((
-                    format!("disks/{}", disk.disk_id),
-                    rkyv_encode(disk).to_vec(),
-                ));
+                kvs.push(Self::kv_entry("disks", disk.disk_id, disk));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -3324,10 +3334,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     async fn mirror_stream_meta_update(&self, stream: &MgrStreamInfo) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let kvs = vec![(
-                format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
-            )];
+            let kvs = vec![Self::kv_entry("streams", stream.stream_id, stream)];
             etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
@@ -3340,14 +3347,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let kvs = vec![
-                (
-                    format!("streams/{}", stream.stream_id),
-                    rkyv_encode(stream).to_vec(),
-                ),
-                (
-                    format!("extents/{}", extent.extent_id),
-                    rkyv_encode(extent).to_vec(),
-                ),
+                Self::kv_entry("streams", stream.stream_id, stream),
+                Self::kv_entry("extents", extent.extent_id, extent),
             ];
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -3365,7 +3366,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         stream: &MgrStreamInfo,
         sealed_old: Option<&MgrExtentInfo>,
         new_extent: &MgrExtentInfo,
-        // Item 3: `Some(bytes)` = value-CAS the `streams/<id>` write against the
+        // `Some(bytes)` = value-CAS the `streams/<id>` write against the
         // membership baseline the handler read. If a concurrent punch_holes /
         // truncate / another alloc changed the stream during our etcd RTT, the
         // CAS fails → `Precondition` → client retries (instead of overwriting
@@ -3373,20 +3374,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         stream_cas: Option<Vec<u8>>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let mut kvs = vec![(
-                format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
-            )];
+            let mut kvs = vec![Self::kv_entry("streams", stream.stream_id, stream)];
             if let Some(sealed_old) = sealed_old {
-                kvs.push((
-                    format!("extents/{}", sealed_old.extent_id),
-                    rkyv_encode(sealed_old).to_vec(),
-                ));
+                kvs.push(Self::kv_entry("extents", sealed_old.extent_id, sealed_old));
             }
-            kvs.push((
-                format!("extents/{}", new_extent.extent_id),
-                rkyv_encode(new_extent).to_vec(),
-            ));
+            kvs.push(Self::kv_entry("extents", new_extent.extent_id, new_extent));
             let cas: Vec<(String, Vec<u8>)> = stream_cas
                 .map(|v| (format!("streams/{}", stream.stream_id), v))
                 .into_iter()
@@ -3401,21 +3393,15 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         stream: &MgrStreamInfo,
         extent_puts: &[MgrExtentInfo],
         extent_deletes: &[u64],
-        // Item 3: value-CAS baseline for the `streams/<id>` membership write
+        // Value-CAS baseline for the `streams/<id>` membership write
         // (see `mirror_stream_alloc_extent`).
         stream_cas: Option<Vec<u8>>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
-            puts.push((
-                format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
-            ));
+            puts.push(Self::kv_entry("streams", stream.stream_id, stream));
             for ex in extent_puts {
-                puts.push((
-                    format!("extents/{}", ex.extent_id),
-                    rkyv_encode(ex).to_vec(),
-                ));
+                puts.push(Self::kv_entry("extents", ex.extent_id, ex));
             }
             let deletes = extent_deletes
                 .iter()
@@ -3441,10 +3427,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 kvs.push((format!("psNodes/{ps_id}"), addr.into_bytes()));
             }
             for (part_id, part) in partitions {
-                kvs.push((format!("partitions/{part_id}"), rkyv_encode(&part).to_vec()));
+                kvs.push(Self::kv_entry("partitions", part_id, &part));
             }
             for (part_id, region) in regions {
-                kvs.push((format!("regions/{part_id}"), rkyv_encode(&region).to_vec()));
+                kvs.push(Self::kv_entry("regions", part_id, &region));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
