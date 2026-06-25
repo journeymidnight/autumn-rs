@@ -84,6 +84,12 @@ pub(crate) struct CompactStats {
     pub output_bytes: u64,
 }
 
+/// 5-7 s jittered timeout used by the compact + GC background loops to
+/// periodically refresh their maintenance metrics.
+fn random_delay() -> Duration {
+    Duration::from_millis(5_000 + rand_u64() % 2_000)
+}
+
 pub(crate) async fn background_compact_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -101,10 +107,6 @@ pub(crate) async fn background_compact_loop(
     // The timeout branch ONLY refreshes the metric; it no longer fires
     // a compaction off the timer. Actual compactions are triggered via
     // `compact_rx` (scheduler dispatches + manual `client compact`).
-    fn random_delay() -> Duration {
-        Duration::from_millis(5_000 + rand_u64() % 2_000)
-    }
-
     let mut next_minor_delay = random_delay();
 
     loop {
@@ -515,10 +517,6 @@ pub(crate) async fn background_gc_loop(
     // task that fires off the timer ALSO refreshes the metric, but
     // since we're keeping the loop responsive for scheduler dispatches
     // (which use the same channel), the timer can stay short.
-    fn random_delay() -> Duration {
-        Duration::from_millis(5_000 + rand_u64() % 2_000)
-    }
-
     let mut next_auto_delay = random_delay();
 
     loop {
