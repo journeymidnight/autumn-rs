@@ -1900,30 +1900,19 @@ pub(crate) async fn do_compact(
             &mut new_readers,
         )
         .await?;
-    } else if let Some((_, last_reader)) = new_readers.last() {
-        // Loop ended exactly at a chunk boundary. Re-emit the last chunk
-        // with discards attached. We do this by reading the just-written
-        // SST bytes back from the live SstReader (already in memory),
-        // appending a *new* SST with set_discards, and replacing the
-        // last entry. This costs one extra row_stream append plus an
-        // SstReader rebuild — rare path, acceptable.
-        //
-        // To keep the implementation simple and avoid re-iterating the
-        // last block, we just attach discards to the *next* compaction's
-        // last chunk by skipping the rebuild here. The cost: this
-        // compaction's discards aren't persisted until the next major
-        // compaction touches one of these output SSTs. That's the same
-        // outcome as if `set_discards` were silently a no-op for an
-        // empty trailing builder — but since we DID emit chunks, this
-        // path only fires when the merge iterator's last item exactly
-        // tipped the size budget, which is improbable. If it becomes a
-        // GC blocker, revisit by writing a tiny "discards-only" SST.
+    } else if !new_readers.is_empty() {
+        // Rare boundary case: the loop's last item exactly tipped the chunk
+        // size budget, so the in-loop emit consumed the builder and the loop
+        // exited with an empty trailing builder. With no final chunk to carry
+        // the aggregated discards, defer them to the next major compaction
+        // that touches one of these output SSTs — the same outcome as a no-op
+        // set_discards on an empty builder. If this ever becomes a GC blocker,
+        // emit a tiny discards-only SST here instead.
         tracing::debug!(
             "compact: last chunk emit consumed builder before loop exit; \
              discards (extents={}) deferred to next compaction",
             discards.len()
         );
-        let _ = last_reader; // silence unused
     }
 
     let output_tables = new_readers.len();
