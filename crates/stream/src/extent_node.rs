@@ -384,22 +384,27 @@ impl DiskFS {
         (crc32c::crc32c(&extent_id.to_le_bytes()) & 0xFF) as u8
     }
 
-    fn extent_path(&self, extent_id: u64) -> PathBuf {
+    /// Build the on-disk path for one of an extent's files in the hashed
+    /// layout `{base_dir}/{hash:02x}/extent-{id}.{suffix}`
+    /// (hash = `crc32c(id_le) & 0xFF`). Single source of truth for the
+    /// layout shared with `autumn-op format`'s 256 subdirs +
+    /// `remove_extent_files`.
+    fn extent_file_path(&self, extent_id: u64, suffix: &str) -> PathBuf {
         self.base_dir
             .join(format!("{:02x}", Self::hash_byte(extent_id)))
-            .join(format!("extent-{extent_id}.dat"))
+            .join(format!("extent-{extent_id}.{suffix}"))
+    }
+
+    fn extent_path(&self, extent_id: u64) -> PathBuf {
+        self.extent_file_path(extent_id, "dat")
     }
 
     fn meta_path(&self, extent_id: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("{:02x}", Self::hash_byte(extent_id)))
-            .join(format!("extent-{extent_id}.meta"))
+        self.extent_file_path(extent_id, "meta")
     }
 
     fn ec_staging_path(&self, extent_id: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("{:02x}", Self::hash_byte(extent_id)))
-            .join(format!("extent-{extent_id}.ec.dat"))
+        self.extent_file_path(extent_id, "ec.dat")
     }
 
     /// #5 EC-COMMIT-ATOMIC: the commit-intent marker. Written durably BEFORE
@@ -409,9 +414,7 @@ impl DiskFS {
     /// still pre-EC); `load_extents` replays it to write the consistent `.meta`.
     /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
     fn ec_commit_marker_path(&self, extent_id: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("{:02x}", Self::hash_byte(extent_id)))
-            .join(format!("extent-{extent_id}.ec.commit"))
+        self.extent_file_path(extent_id, "ec.commit")
     }
 
     /// F109: unlink the `.dat`, `.meta`, and (F210-D2) `.ec.dat` files
