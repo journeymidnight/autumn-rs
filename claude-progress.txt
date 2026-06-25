@@ -57,10 +57,18 @@ ROUND 7 COMMIT(4d991aa,已 push):stream/client.rs——9 个 manager-RPC wrapper
   stream_info×2/check_commit_length/punch_holes/truncate/extent_info/multi_modify_split。report_corrupt_replica
   用 "refused"(故意不同词)留 inline。net -16。验证:90/90 + clippy 无新增 + **coco findbugs(GPT-5.5)未发现**
   + **chaos seed 603 Split+Merge OK mismatch=0 accounting=0 all OK**。
-进度:7 轮全绿(R1-R7),manager(rpc_handlers×2+lib×1)+ stream(extent_node×2+client×2)+ partition-server(background+
-  rpc_handlers)。每轮 coco findbugs + chaos seed 603 + F### touched-区清理。累计净删 ~-88 行。
-Next(loop 续):⑧ client.rs 别处 / fuse/dispatch.rs(handle_request 巨 match 每臂 reply.send 不易 dedup,但可拆 handle_X
-  子函数=大改谨慎)/ partition-server lib.rs 热路径大函数最后(reproduce-first);或专门 F### 清理轮。
+ROUND 8 COMMIT(db3ddb0,已 push):crates/client/src/lib.rs(ClusterClient SDK)——6 个方法
+  (put_opts/put_zc_opts/delete_opts/range/gc_with_params/maintenance)的相同 guard
+  `if resp.code!=CODE_OK { return Err(code_to_error(resp.code, resp.message)) }` → check_ps_code(code,&str)->Result。
+  借 message(仅错误路 clone)。两个 batch-loop(per-item results[idx]=Err+continue)+ delete(容 NOT_FOUND)留。
+  **coco findbugs 抓 1 个 P3**(我 doc 写 "PS/manager" 误导——code_to_error 是 partition code 空间,manager
+  CODE_NOT_LEADER=5 ≠ partition CODE_VALUE_TOO_LARGE=5)→ 改 doc 为 PS-ONLY + 警告。net -2(6 guard 集中)。
+  验证:27/27 + **coco findbugs(GPT-5.5)1 P3 已采纳** + **chaos seed 603 Split+Merge OK range verify errors=0
+  mismatch=0 accounting=0 all OK**。
+进度:8 轮全绿(R1-R8),manager(rpc_handlers×2+lib×1)+ stream(extent_node×2+client×2)+ partition-server(background+
+  rpc_handlers)+ client SDK(lib×1)。每轮 coco findbugs + chaos seed 603 + F### touched-区清理。累计净删 ~-90 行。
+Next(loop 续):⑨ fuse/dispatch.rs(handle_request 巨 match 不易 dedup,可拆 handle_X 谨慎)/ ioring/daemon.rs(1.8k)/
+  partition-server lib.rs 热路径大函数最后(reproduce-first);或专门 F### 清理轮。dedup 仍有零星小 win(-2~-24)。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
