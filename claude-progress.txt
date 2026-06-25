@@ -41,8 +41,18 @@ ROUND 5 COMMIT(dd2ee21,已 push):partition-server/background.rs——background_
   是故意不同算法,gc_* 是干净命名 accessor,do_compact/run_gc/process_gc_chunk 是热路径大函数留后)。
 观察:① 干净 dedup 渐枯竭(R4 -6 / R5 -2);剩多为热路径大函数(do_compact/run_gc/partition-server lib.rs)需
   reproduce-first 谨慎,或全文件 F### 清理(judgment-heavy,量大);② coco inspect 在大文件上不稳,findbugs(小 diff)稳。
-Next(loop 续):⑥ stream/client.rs 或 partition-server 别处找小 dedup;或转「专门 F### 清理轮」(挑一个文件系统性删 F###
-  标签+删纯考古注释,coco+chaos 验零行为变更);⑦ 热路径大函数最后。split/merge Phase-2 kvs builder MEDIUM 跳。
+ROUND 6 COMMIT(da16a02,已 push):partition-server/rpc_handlers.rs——handle_batch_get/get_value_inner/
+  handle_head/handle_range 各 inline 字节级相同的 region-epoch 检查(`if req.region_epoch!=0 && !=p.region_epoch
+  { return Err((FailedPrecondition, format!("region epoch stale..."))) }`)。4 处同 (StatusCode,String) 返回 →
+  抽 check_region_epoch(part_id,have,req_epoch)->Result<(),(StatusCode,String)>,各站点 `?` 调用。删 get 站点冗余
+  注释 + 删 range 站点 "F-this" 占位标签 + "pre-this" 考古(留 gallery-bug load-bearing 理由)。net -24(R1 后最佳)。
+  验证:167/167 + clippy 9 warning 不变(全 pre-existing)+ **coco findbugs(GPT-5.5)未发现** + **chaos seed 603
+  Split+Merge OK,range verify errors=0(直接相关:handle_range 被 dedup),mismatch=0 accounting=0 all OK**。
+Next(loop 续):⑦ stream/client.rs(5.2k,只做过 eversion policy)/ fuse/dispatch.rs(1.7k)找小 dedup;
+  或「专门 F### 清理轮」(挑一文件系统删标签);⑧ 热路径大函数(do_compact/run_gc/partition-server lib.rs)最后,
+  reproduce-first。split/merge Phase-2 kvs builder MEDIUM 跳。coco inspect 大文件不稳(findbugs 小 diff 稳)。
+进度:6 轮全绿(R1-R6),manager(rpc_handlers×2+lib×1)+ stream(extent_node×2+client×1)+ partition-server(background+
+  rpc_handlers)。每轮 coco findbugs + chaos seed 603 + F### touched-区清理。累计净删 ~-72 行。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
