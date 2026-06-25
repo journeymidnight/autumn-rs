@@ -1250,16 +1250,39 @@ longer safe (new formats may now be emitted/persisted)",
                 .await
                 .context("register node")?;
             let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            // A FAILED registration (follower / non-leader, fenced or
+            // decommissioned address, same-addr-different-disk) returns
+            // code != CODE_OK with node_id=0 and no/partial disk_uuids.
+            // Writing the local format sentinels on that response leaves a
+            // dir that LOOKS formatted (cluster_id present) but the manager
+            // never accepted — the EN then starts on a node/disk the manager
+            // doesn't know about.
+            if resp.code != CODE_OK {
+                bail!("register node failed: code={} {}", resp.code, resp.message);
+            }
 
             let node_id = resp.node_id;
+            // Resolve every requested disk_uuid -> disk_id BEFORE writing any
+            // sentinel: a missing mapping (the manager returned only the
+            // disks it actually accepted) must FAIL, not silently write
+            // disk_id=0 (a pseudo-formatted dir the manager can't route to).
+            // Two passes so a partial failure leaves NO half-written dirs.
+            let uuid_to_id: HashMap<&str, u64> = resp
+                .disk_uuids
+                .iter()
+                .map(|(u, id)| (u.as_str(), *id))
+                .collect();
             let mut disk_assignments: Vec<(String, String, u64)> = Vec::new();
             for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
-                let disk_id = resp
-                    .disk_uuids
-                    .iter()
-                    .find(|(u, _)| u == disk_uuid)
-                    .map(|(_, id)| *id)
-                    .unwrap_or(0);
+                let disk_id = *uuid_to_id.get(disk_uuid.as_str()).ok_or_else(|| {
+                    anyhow!(
+                        "manager did not assign a disk_id for {dir} (uuid {disk_uuid}); \
+                         not writing format sentinels"
+                    )
+                })?;
+                disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
+            }
+            for (dir, disk_uuid, disk_id) in &disk_assignments {
                 // F214-C: cluster_id + disk_uuid sentinel files. The
                 // extent-node binary's startup check reads cluster_id
                 // and cross-checks against the manager; disk_uuid is
@@ -1272,7 +1295,6 @@ longer safe (new formats may now be emitted/persisted)",
                     .with_context(|| format!("write node_id in {dir}"))?;
                 std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
                     .with_context(|| format!("write disk_id in {dir}"))?;
-                disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
             }
 
             if args.json {
@@ -1600,18 +1622,31 @@ async fn run_info(
         .await
         .context("stream info")?;
     let stream_resp: StreamInfoResp = rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
+    // Check the manager's response code BEFORE building the snapshot: a
+    // follower / non-routable manager returns code != CODE_OK with EMPTY
+    // collections, which the renderer would otherwise present as a real,
+    // empty cluster (silent in `--json`, and the exit code stays 0).
+    if stream_resp.code != CODE_OK {
+        bail!("stream info: code={} {}", stream_resp.code, stream_resp.message);
+    }
 
     let nodes_resp_bytes = client
         .mgr_call(MSG_NODES_INFO, Bytes::new())
         .await
         .context("nodes info")?;
     let nodes_resp: NodesInfoResp = rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
+    if nodes_resp.code != CODE_OK {
+        bail!("nodes info: code={} {}", nodes_resp.code, nodes_resp.message);
+    }
 
     let regions_resp_bytes = client
         .mgr_call(MSG_GET_REGIONS, Bytes::new())
         .await
         .context("get regions")?;
     let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
+    if regions_resp.code != CODE_OK {
+        bail!("get regions: code={} {}", regions_resp.code, regions_resp.message);
+    }
 
     // === Build lookup maps ===
     let mut extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
@@ -1654,7 +1689,11 @@ async fn run_info(
 
     let mut open_extents: HashSet<u64> = HashSet::new();
     for (eid, ext) in extent_map.iter_mut() {
-        if ext.sealed_length == 0 {
+        // Authoritative seal STATE is the explicit `sealed` flag, NOT
+        // `sealed_length == 0` (manager note 32): a failover can seal an
+        // EMPTY tail (`sealed = true, sealed_length = 0`). Treating that as
+        // open mislabels it `(open)` and pointlessly probes a sealed extent.
+        if !ext.sealed {
             open_extents.insert(*eid);
             if part.is_some() && !probe_set.contains(eid) {
                 continue;

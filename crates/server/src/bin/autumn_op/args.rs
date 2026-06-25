@@ -752,10 +752,16 @@ pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         return vec![(vec![], vec![])];
     }
     let n = n.min(256); // 1 byte → at most 256 buckets
-    let stride = 256usize / n;
     let mut split_points: Vec<Vec<u8>> = Vec::with_capacity(n - 1);
     for i in 1..n {
-        let byte = (i * stride) as u8; // 0x20, 0x40, ... for N=8
+        // Proportional boundary, NOT a floor stride: `(i * 256) / n` keeps
+        // every bucket within ±1 low-byte even when n does not divide 256.
+        // A `256 / n` floor stride let the LAST bucket absorb the entire
+        // remainder (n=129 → stride=1 → bucket 128 spans [128,256), half the
+        // keyspace — defeating the round-robin spread). Identical to the old
+        // value for divisors of 256 (n=8 → 32,64,…,224), so behaviour for the
+        // common pre-split sizes is unchanged.
+        let byte = ((i * 256) / n) as u8; // 0x20, 0x40, … for N=8
         split_points.push(vec![0x03, 0, 0, 0, 0, 0, 0, 0, byte]);
     }
     let mut ranges = Vec::with_capacity(n);
@@ -993,6 +999,38 @@ mod tests {
         for p in 0..n {
             assert_eq!(*hits.get(&p).unwrap_or(&0), 32, "partition {p}");
         }
+    }
+
+    #[test]
+    fn fuse_split_ranges_non_divisor_n_stays_balanced() {
+        // Reproduce-first guard for the floor-stride skew: with the old
+        // `256 / n` stride, a non-divisor n let the LAST bucket absorb the
+        // whole remainder (n=6 → bucket 5 got 46 inodes vs 42 for the rest).
+        // The proportional `(i*256)/n` boundary keeps every bucket within ±1.
+        let n = 6;
+        let ranges = super::fuse_split_ranges(n);
+        assert_eq!(ranges.len(), n);
+        let mut hits = vec![0usize; n];
+        for ino in 0u64..256 {
+            let mut key = vec![0x03];
+            key.extend_from_slice(&ino.to_be_bytes());
+            key.extend_from_slice(&0u64.to_be_bytes());
+            let idx = ranges
+                .iter()
+                .position(|(s, e)| {
+                    (s.is_empty() || key.as_slice() >= s.as_slice())
+                        && (e.is_empty() || key.as_slice() < e.as_slice())
+                })
+                .unwrap();
+            hits[idx] += 1;
+        }
+        let (min, max) = (*hits.iter().min().unwrap(), *hits.iter().max().unwrap());
+        assert!(
+            max - min <= 1,
+            "non-divisor n=6 must stay balanced; got per-bucket {hits:?} (spread {})",
+            max - min
+        );
+        assert_eq!(hits.iter().sum::<usize>(), 256);
     }
 
     #[test]
