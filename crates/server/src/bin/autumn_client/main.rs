@@ -1,7 +1,7 @@
 #[cfg(unix)]
 extern crate libc;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -239,6 +239,13 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("write thread {tid} connect error: {e}");
+                            // #1: a connect-failed thread MUST still satisfy the
+                            // fixed-size barrier (armed under --ramp-ms), else
+                            // the threads that DID connect wait forever and
+                            // main's join() hangs.
+                            if ramp_ms > 0 {
+                                barrier.wait();
+                            }
                             return (Vec::<f64>::new(), 0u64);
                         }
                     };
@@ -326,9 +333,14 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     }
 
     let total_ops_w = Arc::clone(&total_ops);
+    // #4: stop flag so the progress printer actually exits at end-of-phase
+    // (dropping the JoinHandle does NOT stop the thread — it would keep
+    // printing `[write] ops/s` across the read phase / summary).
+    let stop_w = Arc::new(AtomicBool::new(false));
+    let stop_w_c = Arc::clone(&stop_w);
     let progress_w = std::thread::spawn(move || {
         let mut last = 0u64;
-        loop {
+        while !stop_w_c.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             let cur = total_ops_w.load(Ordering::Relaxed);
             eprint!("\r[write] ops/s={}", cur - last);
@@ -344,7 +356,8 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
             written_per_thread[tid] = written;
         }
     }
-    drop(progress_w);
+    stop_w.store(true, Ordering::Relaxed);
+    let _ = progress_w.join();
     eprintln!();
 
     let write_elapsed = bench_start.elapsed();
@@ -414,6 +427,10 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("read thread {tid} connect error: {e}");
+                            // #1: satisfy the barrier so connected threads don't hang.
+                            if ramp_ms > 0 {
+                                barrier.wait();
+                            }
                             return Vec::<f64>::new();
                         }
                     };
@@ -461,7 +478,11 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                             let t0 = Instant::now();
                             let res = cref.get_many_into(&mut items).await;
                             let el = t0.elapsed();
-                            let n_ok = res.iter().filter(|r| r.is_ok()).count();
+                            // #6: count only keys that actually returned a value
+                            // (Ok(Some)). Ok(None) = key missing — counting it as
+                            // a successful read inflates throughput and hides the
+                            // write+read sanity check perf-check is meant to be.
+                            let n_ok = res.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
                             if n_ok > 0 {
                                 total_ops.fetch_add(n_ok as u64, Ordering::Relaxed);
                                 let per_op_ms =
@@ -483,13 +504,15 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                         let key = key_for_partition(sk, "pc", tid, seq);
                         Some(async move {
                             let t0 = Instant::now();
+                            // #6: a present value is Ok(Some(_)); Ok(None) (missing
+                            // key) must NOT count as a successful read.
                             let ok = if direct_read {
-                                cref.get_direct(key.as_bytes()).await.is_ok()
+                                matches!(cref.get_direct(key.as_bytes()).await, Ok(Some(_)))
                             } else if zc_read {
                                 let mut dest = vec![0u8; value_size];
-                                cref.get_into(key.as_bytes(), &mut dest).await.is_ok()
+                                matches!(cref.get_into(key.as_bytes(), &mut dest).await, Ok(Some(_)))
                             } else {
-                                cref.get(key.as_bytes()).await.is_ok()
+                                matches!(cref.get(key.as_bytes()).await, Ok(Some(_)))
                             };
                             (ok, t0.elapsed())
                         })
@@ -508,9 +531,12 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     }
 
     let total_ops_r = Arc::clone(&total_ops);
+    // #4: stop flag (see write phase) so the read progress printer exits.
+    let stop_r = Arc::new(AtomicBool::new(false));
+    let stop_r_c = Arc::clone(&stop_r);
     let progress_r = std::thread::spawn(move || {
         let mut last = 0u64;
-        loop {
+        while !stop_r_c.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             let cur = total_ops_r.load(Ordering::Relaxed);
             eprint!("\r[read] ops/s={}", cur - last);
@@ -524,7 +550,8 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
             all_read_latencies.extend(lats);
         }
     }
-    drop(progress_r);
+    stop_r.store(true, Ordering::Relaxed);
+    let _ = progress_r.join();
     eprintln!();
 
     let read_elapsed = bench_start.elapsed();
@@ -714,6 +741,12 @@ async fn main() -> Result<()> {
             file,
             chunk_size,
         } => {
+            // #2: reject chunk_size 0 — the chunk loop below would never advance
+            // (end == idx) → an infinite stream of empty chunks, and
+            // `payload.len().div_ceil(chunk_size)` panics on a 0 divisor.
+            if chunk_size == 0 {
+                bail!("--chunk-size must be >= 1");
+            }
             // F129: read full payload (stdin if file = "-"), drive
             // PutBegin → N×Chunk → Commit. The handle owns the cached
             // RpcClient so all chunks land on the same PS connection.
@@ -731,7 +764,7 @@ async fn main() -> Result<()> {
             let mut sent = 0u64;
             let mut idx: usize = 0;
             while idx < payload.len() {
-                let end = (idx + chunk_size).min(payload.len());
+                let end = idx.saturating_add(chunk_size).min(payload.len());
                 let n = handle
                     .send(&payload[idx..end])
                     .await

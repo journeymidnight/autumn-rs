@@ -127,6 +127,17 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
+/// CLI value at `raw[i]` or print usage + exit — for a value that FOLLOWS a
+/// flag (`i` already advanced past it). A bare `raw[i]` panics with "index out
+/// of bounds" when the value was omitted (e.g. a trailing `--manager` /
+/// `perf-check --threads`); this surfaces usage instead. (#3)
+fn val(raw: &[String], i: usize) -> &str {
+    match raw.get(i) {
+        Some(s) => s.as_str(),
+        None => usage(),
+    }
+}
+
 pub(crate) fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = String::from("127.0.0.1:9001");
@@ -138,12 +149,12 @@ pub(crate) fn parse_args() -> Args {
         match raw[i].as_str() {
             "--manager" => {
                 i += 1;
-                manager = raw[i].clone();
+                manager = val(&raw, i).to_owned();
                 i += 1;
             }
             "--transport" => {
                 i += 1;
-                transport = autumn_transport::parse_transport_flag(&raw[i]).unwrap_or_else(|bad| {
+                transport = autumn_transport::parse_transport_flag(val(&raw, i)).unwrap_or_else(|bad| {
                     eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                     std::process::exit(2);
                 });
@@ -152,7 +163,7 @@ pub(crate) fn parse_args() -> Args {
             "--ucx-regpool-cap-bytes" => {
                 i += 1;
                 ucx_regpool_cap_bytes = Some(
-                    raw[i]
+                    val(&raw, i)
                         .parse()
                         .expect("--ucx-regpool-cap-bytes usize"),
                 );
@@ -323,19 +334,19 @@ pub(crate) fn parse_args() -> Args {
                 match raw[i].as_str() {
                     "--prefix" => {
                         i += 1;
-                        prefix = raw[i].clone();
+                        prefix = val(&raw, i).to_owned();
                     }
                     "--start" => {
                         i += 1;
-                        start = raw[i].clone();
+                        start = val(&raw, i).to_owned();
                     }
                     "--limit" => {
                         i += 1;
-                        limit = raw[i].parse().expect("--limit must be a number");
+                        limit = val(&raw, i).parse().expect("--limit must be a number");
                     }
                     _ => {
                         if prefix.is_empty() {
-                            prefix = raw[i].clone();
+                            prefix = val(&raw, i).to_owned();
                         }
                     }
                 }
@@ -383,33 +394,33 @@ pub(crate) fn parse_args() -> Args {
                     }
                     "--threads" | "-t" => {
                         i += 1;
-                        threads = raw[i].parse().expect("--threads must be a number");
+                        threads = val(&raw, i).parse().expect("--threads must be a number");
                     }
                     "--duration" | "-d" => {
                         i += 1;
-                        duration_secs = raw[i].parse().expect("--duration must be a number");
+                        duration_secs = val(&raw, i).parse().expect("--duration must be a number");
                     }
                     "--size" => {
                         i += 1;
-                        value_size = raw[i].parse().expect("--size must be a number");
+                        value_size = val(&raw, i).parse().expect("--size must be a number");
                     }
                     "--nosync" => {
                         warn_nosync_deprecated_once();
                     }
                     "--baseline" => {
                         i += 1;
-                        baseline_file = raw[i].clone();
+                        baseline_file = val(&raw, i).to_owned();
                     }
                     "--threshold" => {
                         i += 1;
-                        threshold = raw[i].parse().expect("--threshold must be a float");
+                        threshold = val(&raw, i).parse().expect("--threshold must be a float");
                     }
                     "--update-baseline" => {
                         update_baseline = true;
                     }
                     "--partitions" => {
                         i += 1;
-                        partitions_meta_from_flag = raw[i]
+                        partitions_meta_from_flag = val(&raw, i)
                             .parse()
                             .expect("--partitions must be a positive integer");
                         if partitions_meta_from_flag == 0 {
@@ -419,7 +430,7 @@ pub(crate) fn parse_args() -> Args {
                     }
                     "--pipeline-depth" => {
                         i += 1;
-                        pipeline_depth = raw[i]
+                        pipeline_depth = val(&raw, i)
                             .parse()
                             .expect("--pipeline-depth must be a positive integer");
                         if pipeline_depth == 0 || pipeline_depth > 256 {
@@ -429,7 +440,7 @@ pub(crate) fn parse_args() -> Args {
                     }
                     "--bulk" => {
                         i += 1;
-                        bulk = raw[i]
+                        bulk = val(&raw, i)
                             .parse()
                             .expect("--bulk must be a non-negative integer");
                     }
@@ -442,21 +453,21 @@ pub(crate) fn parse_args() -> Args {
                         // serialization); threads then warm up (connect) and
                         // align on a barrier before the timed window starts.
                         i += 1;
-                        ramp_ms = raw[i].parse().expect("--ramp-ms must be u64");
+                        ramp_ms = val(&raw, i).parse().expect("--ramp-ms must be u64");
                     }
                     // Migration: print + abort. The three pre-consolidation
                     // flags drove the same path post-SDK-merge.
                     "--batch-put" | "--batch-get" | "--put-many" => {
                         eprintln!(
                             "{}: removed — use --bulk N (one knob driving both phases)",
-                            raw[i]
+                            val(&raw, i)
                         );
                         usage();
                     }
                     "--group-commit-cap" => {
                         i += 1;
                         group_commit_cap =
-                            Some(raw[i].parse().expect("--group-commit-cap must be a u64"));
+                            Some(val(&raw, i).parse().expect("--group-commit-cap must be a u64"));
                     }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
