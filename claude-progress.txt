@@ -1,3 +1,24 @@
+Date: 2026-06-25 (review 战役 — manager 纯拆分,不依赖 coco)
+TaskStatus: completed
+Task scope: 用户"Continue"+"继续纯拆分(不依赖 coco)"+硬性要求"每次重构完都要跑 unit test"
+  (记 feedback_run_unit_tests_after_refactor)。coco 本会话两次卡死(autumn_client findbugs + recovery.rs inspect),
+  本机 coco 不稳,故改纯 behavior-preserving 拆分/dedup,build+clippy(-D)+**全量 cargo test -p autumn-manager --lib(164/164)** 验证。
+COMMITS(2 个,recovery 已 push,policy 待 push):
+  · 2b733d9 recovery.rs:apply_recovery_done 的 **3 个 byte-identical** best-effort marker-release 块(etcd put_and_delete_txn
+    + 同样 10 行 rationale 注释 + warn + commit_extent_inflight_release)→ 抽 release_recovery_marker_best_effort helper。
+    272→198 行(net -48)。成功路径(atomic put+delete,fail-loud `?`)+ 末尾 commit-only release **不动**(语义不同)。
+    验证:recovery 单测(apply_failure_keeps_inflight_marker / apply_success_releases_inflight_marker / f126_*)+ 全量 164/164。
+  · b76a08e policy.rs:4 处 compute_* advisory 的 window 提取前缀(buckets.rev().take(required_buckets).collect()+len 闸)
+    → PartitionMetricsWindow::recent(n)->Option<Vec> 方法(let-else;双窗口 split-pair 用 tuple let-else)。net -10。policy_tests 覆盖。
+教训:① coco 本机不稳时,纯拆分(build+全量单测验证)是不依赖 coco 的安全推进路径;② **优先重构有 unit test 覆盖的代码**
+  (apply_recovery_done/policy compute_* 都被单测覆盖;node_health_loop/recovery_dispatch_loop 需 live cluster 无单测,refactor 风险高,本轮没碰);
+  ③ dedup 只做 **byte-identical** 或前缀完全相同的(recovery 3 块/policy window 前缀);compute_maintenance 的 3 个 arm 结构相似但
+  字段/阈值/filter 不同,抽成闭包重 helper 反而更难读 → 不强行 dedup(避免 over-refactor)。
+Next steps(用户定夺):① 继续纯拆分别的 unit-tested 文件(policy compute_* 大函数可拆子检查 / extent_inflight.rs / inode_lease.rs);
+  ② coco 恢复后回头做控制面 bug-finding(recovery/rpc_handlers);③ 热路径巨文件(partition-server/lib.rs、extent_node.rs)更晚。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-25 (review 战役 — autumn_client 第 2 个文件)
 TaskStatus: completed
 Task scope: 用户"Continue"——战役第 2 个低风险文件 autumn_client.rs(1401 LOC,数据面 CLI:KV ops+benchmark)。
