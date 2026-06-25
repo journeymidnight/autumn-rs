@@ -1,8 +1,19 @@
-Date: 2026-06-25 (review 战役 — 转向最大文件;manager/lib.rs dedup ×2)
+Date: 2026-06-25 (review 战役 — 转向最大文件;manager/lib.rs ×2 + chaos 验证 + extent_node.rs ×1)
 TaskStatus: completed
-Task scope: 用户"不超过200行的不用处理,开始处理最大的几个文件(冗余/乱代码最多)"。
-  先用 5 个并行 Explore agent 测绘 5 大文件(38K LOC),再挑干净低风险 win 动手。
-  每次重构 build+clippy+**全量 cargo test -p autumn-manager --lib(164/164)**。**已 push origin/main**。
+Task scope: 用户"不超过200行的不用处理,开始处理最大的几个文件(冗余/乱代码最多)"→"先搞一次 chaos 防 bug,然后 continue"。
+  先用 5 个并行 Explore agent 测绘 5 大文件(38K LOC),挑干净低风险 win 动手;每次 build+clippy+全量单测;**已 push origin/main**。
+CHAOS 验证(用户要求,跑在 manager 两 dedup 之后):system_chaos(真 EN 子进程 kill+restart + split/merge/EC/fence/gc nemesis
+  + per-key durability + extent accounting 不变量)2 个 merge-family seed 全 PASS:
+  · seed=603(历史 merge over-seal 触发种)90s/5000ms:**显式跑成 Merge OK + Split,accounting errors=0(12 extents,
+    22 memberships)**——memberships(22)>extents(12)= CoW-shared refs≥2 被校验 = 正是我 splice_victim_extents refs 路径;
+    mismatches=0 not_found=0 all invariants OK。
+  · seed=13 90s/5000ms:mismatches=0 not_found=0 accounting errors=0 all invariants OK(本轮 Split 被 EC-inflight 跳过,merge 少)。
+  结论:manager 两 dedup(merge splice + replay decode)在 chaos 下无回归、无数据丢失。+ merge 单测(f_merge_refs_leak_{cow,splice}_*)同绿。
+COMMITS(本段 3 个,均 push):
+  · c8aec02 stream/extent_node.rs(#2 大文件 8.8K):DiskFS 的 extent_path/meta_path/ec_staging_path/ec_commit_marker_path
+    四个**字节级相同**(仅后缀 dat/meta/ec.dat/ec.commit 不同)→ 抽 extent_file_path(id, suffix) 单一真源
+    (hashed 布局 {base}/{hash:02x}/extent-{id}.{suffix},与 autumn-op format 256 子目录 + remove_extent_files 共享)。
+    纯路径字符串、非热路径。验证:build+clippy(0 新增)+ 全量 cargo test -p autumn-stream --lib 90/90。
 5 大文件测绘(供后续;LOC + 顶级低风险 win):
   · partition-server/lib.rs 11,853(热路径,最 revert-prone,167 ps 单测)——agent 头号是 setter dedup
     (108-196,~22 个 set_*),但我判定 marginal(每 setter 已极简,set_clamped<T:Ord> 几乎不缩短 + f64 不满足 Ord)→ 跳过,over-refactor。
@@ -35,7 +46,8 @@ COMMITS(2 个,均 push):
   ③ 热路径(partition_loop/coalescer/append)+ CAS/guard 区(note33/F139/F145)的 dedup 留作逐行验证的谨慎目标,不抢跑。
 Next steps(用户定夺):① 继续 manager/lib.rs 低风险(mirror_* txn pattern / 验证并删 dead-code);
   ② 谨慎做 rpc_handlers punch_holes/truncate 的 ~40 行 dedup(先逐行验证 note33 CAS + F139/F145 guard 顺序);
-  ③ extent_node.rs / stream/client.rs 的低风险项(DiskFS 路径、eversion 错误编码、cache 失效);
+  ③ extent_node.rs DiskFS 路径 dedup **已做(c8aec02)**;剩 stream/client.rs 低风险(eversion-mismatch codec dedup、
+     cache 失效 2-liner→方法、chunked-read loop)+ extent_node eversion-mismatch 错误编码;
   ④ 热路径(partition-server/lib.rs enqueue 前缀、partition_loop)最后,reproduce-first 心态。
 
 ────────────────────────────────────────────────────────────────────────────────
