@@ -27,9 +27,16 @@ ROUND 3 COMMIT(7b319f4,已 push):manager/lib.rs 6 个 mirror_* 的 etcd kv 构�
   CAS 注释标签。net -14;rkyv_encode().to_vec() 14→3。验证:164/164 + clippy 0 + **coco findbugs(GPT-5.5)未发现**
   + **chaos seed 603(90s,每个 mirror_* 都被 create/alloc/punch/truncate/split/merge/register 走到):
   Split+Merge OK,mismatch=0 accounting=0(12ext/22membership) all invariants OK**。
-Next(loop 续):④ 别的大文件冗余(extent_node eversion-mismatch 编码 / stream client / partition-server background.rs);
-  split/merge Phase-2 kvs builder MEDIUM 风险发散,谨慎或跳;⑤ 热路径 partition-server/lib.rs 最后。
-  剩 rpc_handlers F### 仍多(全文件未清,只清了 punch/truncate/split-merge-verify 区);可后续专门 F### 清理轮。
+ROUND 4 COMMIT(2c813d1,已 push):stream/extent_node.rs(#2 大文件,热路径)——已有 err_bytes(req_id,
+  msg_type,code,msg)->Bytes helper(7 个 over-slot 站点在用),但 append/append-chain/read-bytes 的 7 个
+  single-frame 错误路径仍 inline `let p=encode_status; let bytes=Frame::error(...).encode()` → 改用 err_bytes。
+  字节级相同。3 个故意留:2 个 build-p-once+per-slot clone(微优化),1 个 build 未编码 Frame(共享 Ok 臂
+  Frame::response 形状)。修 err_bytes 过期 doc。net -6。验证:90/90 + clippy 0 + **coco findbugs(GPT-5.5)未发现**
+  + **chaos seed 603(90s,kill/unavailable 窗触发这些错误路径):Split+Merge OK mismatch=0 accounting=0 all OK**。
+Next(loop 续):⑤ 别的大文件冗余(stream/client.rs / partition-server/background.rs flush/compact/gc);
+  split/merge Phase-2 kvs builder MEDIUM 风险发散,谨慎或跳;⑥ 热路径 partition-server/lib.rs 最后。
+  剩 rpc_handlers/lib.rs/extent_node.rs 全文件 F### 仍多(只清了 touched 区);可后续专门 F### 清理轮。
+  观察:dedup 渐入佳境后多为 small win(每轮 -6~-26);保持 coco+chaos 每轮绿;若 dedup 枯竭可转 coco inspect 找 messy-logic。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
