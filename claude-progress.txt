@@ -131,7 +131,7 @@ ROUND 14 COMMIT(1fd8f6a,已 push):stream/extent_node.rs handle_convert_to_ec(全
   **coco findbugs deep(GPT-5.5;首跑双模型 transient 失败,重试 OK)未发现** + **chaos seed 603(58s,EC nemesis 驱动
   handle_convert_to_ec):writes acked=10466 reads ok=19687,per-key mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
-ROUND 15 COMMIT(待 push):大函数清晰度分析 ×3 + handle_append 拒绝响应 boilerplate 抽取。
+ROUND 15 COMMIT(99dfdaf,已 push):大函数清晰度分析 ×3 + handle_append 拒绝响应 boilerplate 抽取。
   分析:① ps sync_regions_once(243 行)= 6 段不同 pass(fetch+decode/build wanted/drop-for-reload/open-new
   含 F196 budget+BUG#3 backoff/prune backoff/F265 part_addr self-heal),各段注释足、无重复 pattern → 清晰,不动。
   ② stream load_extents(192 行)= 每 extent 线性流(owns-check → open .dat → META-FAILCLOSED parse/quarantine →
@@ -145,15 +145,31 @@ ROUND 15 COMMIT(待 push):大函数清晰度分析 ×3 + handle_append 拒绝响
   (显式核对全 10 调用点 return 类型/错误码/offset-end 语义一致)** + **chaos seed 603(58s,kill+restart+commit-trunc
   nemesis 重压 handle_append 各 guard):writes acked=10635 reads ok=19594,mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
-观察:本轮印证 directive#4 双结论:多数大函数 analyze 后**清晰即不动**(sync_regions_once/load_extents),个别有真
-  boilerplate(handle_append 的拒绝块)→ 纯构造抽取是 zero-risk 清晰提升(非热路径核心逻辑)。giant 战役已覆盖
-  partition-server 4 函数 + stream 2 函数(handle_convert_to_ec R14 / handle_append R15)。
-进度:15 轮全绿(R1-R15),均 push(R15 本轮 push)。chaos-validated 区 clean dedup 渐尽;follow-up 候选:
-  build_append_future(批量热路径,有同样 AppendResp 拒绝 boilerplate 但用 `let resp_payload=` 形,需 ->Bytes 变体,
-  且是最热路径——reproduce-first,暂缓)。
-Next(loop 续):⑯ 候选:stream stream_extent_from_sources 181 / ps open_partition 215 分析;或报告战役近完成、等用户定向。
-  analyze-for-clarity + 仅抽 zero-risk 构造/in-family 去重;热路径(build_append_future/partition_loop)reproduce-first 暂缓;
-  coco+chaos 每轮不变。
+ROUND 16 COMMIT(待 push):大函数清晰度分析 ×4(清晰即不动)+ manager handle_stream_alloc_extent 拒绝 boilerplate 抽取。
+  分析(均 intricate 但内在复杂、注释足、不动):① ps open_partition(215)= 线性 setup→spawn 线程→await ready→建
+  handle;`*_for_thread` clone + 22-arg partition_thread_main 是搬状态进线程的固有形,非冗余。② stream
+  stream_extent_from_sources(181)= SEED13 over-promised-seal 调和(err_count==0&&unverified==0 守卫),3 个
+  unverified++ skip 各带不同 warn 文案,无干净去重。③ ps sync_regions_once / ④ stream load_extents(R16 复核,R15 已记)。
+  动手:**manager rpc_handlers.rs handle_stream_alloc_extent(全 manager 最大函数 594 行,seal+alloc+roll)**——读完全函数:
+  复杂度内在(F227 lenient seal + BUG2-IDEMPOTENT-ROLL + Item3 membership-CAS + verify-at-apply + fallback alloc,
+  16+ programming notes 覆盖),逻辑清晰。真结构冗余:**16 处 `return Ok(rkyv_encode(&StreamAllocExtentResp{code,
+  message,stream_info:None,last_ex_info:None}))` 拒绝块**淹没 seal/CAS/verify 逻辑 → 抽 `Self::alloc_reject(code,
+  message)`(纯 rkyv 响应构造,同 R15 append_reject)。**零语义风险**:只换 return 尾,seal/fence/CAS/verify 逻辑行
+  一字未动;rkyv 同结构=同字节。idempotent no-op(Some/Some,1557)+ success 尾(无 return)正确保留 inline。
+  16 站点:7 err(Self::err_to_code+to_string)+ 5 not_found + 4 precondition,按缩进/`;` 分组(replace_all 同形块 +
+  个别 edit)。net -65(31/-96)。验证:build+clippy(4 warn 不变,无新增)+ **164/164 manager 单测** +
+  **coco findbugs deep(GPT-5.5)未发现** + **chaos seed 603(58s,每次 extent roll/seal/split 走 handle_stream_alloc_
+  extent):writes acked=10456 reads ok=19482,mismatch=0 not_found=0、range=0、write-liveness=0、accounting=0
+  (6ext/10membership)all invariants OK**。
+观察:directive#4 双结论再印证 + 扩到 manager:多数大函数 analyze 后清晰即不动(open_partition/stream_extent_from_
+  sources/sync_regions_once/load_extents),个别有真拒绝-boilerplate(handle_append R15 / handle_stream_alloc_extent
+  R16)→ 纯响应构造抽取 zero-risk(只碰 return 尾,不碰 guard/seal/CAS 逻辑)。**alloc_reject 关键:虽是最 guard-heavy
+  manager 函数,但抽取不触任何 guard 逻辑,故风险等同 R15。**
+进度:16 轮全绿(R1-R16),均 push(R16 本轮 push)。giant 战役覆盖:partition-server 4 + stream 2(handle_convert_to_ec/
+  handle_append)+ manager 1(handle_stream_alloc_extent)。chaos-validated 区 clean dedup + analyze 目标已基本枯竭。
+Next(loop 续):⑰ 剩余大函数多为 guard-heavy 控制面(handle_multi_modify_merge 388/split 276/force_ec_convert 278/
+  merge_partitions 259/replay_from_etcd 344)——可继续 analyze + 仅抽 zero-risk 拒绝/构造 boilerplate;或报告战役完成、
+  等用户定向(热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓)。coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:

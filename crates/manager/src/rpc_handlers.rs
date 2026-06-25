@@ -1482,14 +1482,24 @@ impl AutumnManager {
         }))
     }
 
+    /// Build a `StreamAllocExtentResp` rejection (no stream/extent payload).
+    /// Every guard in `handle_stream_alloc_extent` (leader / owner-epoch /
+    /// not-found / in-flight / seal-probe / membership-CAS / mirror) returns one
+    /// of these — centralising the `stream_info: None, last_ex_info: None`
+    /// boilerplate keeps each guard a single line. The success + idempotent-no-op
+    /// returns carry `Some(..)` payloads and stay inline.
+    fn alloc_reject(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&StreamAllocExtentResp {
+            code,
+            message,
+            stream_info: None,
+            last_ex_info: None,
+        }))
+    }
+
     pub(crate) async fn handle_stream_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&StreamAllocExtentResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-                stream_info: None,
-                last_ex_info: None,
-            }));
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
         }
 
         let req: StreamAllocExtentReq =
@@ -1502,45 +1512,25 @@ impl AutumnManager {
         let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
             }
 
             let stream = match s.streams.get(&req.stream_id).cloned() {
                 Some(v) => v,
                 None => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_NOT_FOUND,
-                        message: format!("stream {}", req.stream_id),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }))
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id))
                 }
             };
             let tail_id = match stream.extent_ids.last().copied() {
                 Some(v) => v,
                 None => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_NOT_FOUND,
-                        message: format!("tail extent in stream {}", req.stream_id),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }))
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("tail extent in stream {}", req.stream_id))
                 }
             };
             let tail = match s.extents.get(&tail_id).cloned() {
                 Some(v) => v,
                 None => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_NOT_FOUND,
-                        message: format!("extent {tail_id}"),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }))
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("extent {tail_id}"))
                 }
             };
 
@@ -1600,12 +1590,7 @@ impl AutumnManager {
                         "extent {tail_id} has in-flight {op:?}; \
                          defer alloc_extent until it completes"
                     );
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_PRECONDITION,
-                        message: msg,
-                        stream_info: None,
-                        last_ex_info: None,
-                    }));
+                    return Self::alloc_reject(CODE_PRECONDITION, msg);
                 }
             }
 
@@ -1629,12 +1614,7 @@ impl AutumnManager {
             ) {
                 Ok(v) => v,
                 Err(err) => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: Self::err_to_code(&err),
-                        message: err.to_string(),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }))
+                    return Self::alloc_reject(Self::err_to_code(&err), err.to_string())
                 }
             };
             let (extent_id, _) = s.alloc_ids(1);
@@ -1770,12 +1750,7 @@ impl AutumnManager {
                         "seal extent {}: {}",
                         tail.extent_id, reason
                     ));
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: Self::err_to_code(&err),
-                        message: err.to_string(),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }));
+                    return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
                 }
             }
         }
@@ -1787,12 +1762,7 @@ impl AutumnManager {
                     "no available commit length for extent {}",
                     tail.extent_id
                 ));
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
             }
         };
         if !already_sealed {
@@ -1877,12 +1847,7 @@ impl AutumnManager {
                             let err = AppError::Precondition(format!(
                                 "no healthy node available to allocate extent {extent_id}"
                             ));
-                            return Ok(rkyv_encode(&StreamAllocExtentResp {
-                                code: Self::err_to_code(&err),
-                                message: err.to_string(),
-                                stream_info: None,
-                                last_ex_info: None,
-                            }));
+                            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
                         }
                     },
                 }
@@ -1913,12 +1878,7 @@ impl AutumnManager {
             let st = match s.streams.get(&req.stream_id) {
                 Some(v) => v,
                 None => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_NOT_FOUND,
-                        message: format!("stream {}", req.stream_id),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }))
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id))
                 }
             };
             // Item 3: CAS baseline = the stream's current value (etcd holds
@@ -1976,21 +1936,11 @@ impl AutumnManager {
                              retry with fresh snapshot",
                             req.stream_id
                         );
-                        return Ok(rkyv_encode(&StreamAllocExtentResp {
-                            code: CODE_PRECONDITION,
-                            message: msg,
-                            stream_info: None,
-                            last_ex_info: None,
-                        }));
+                        return Self::alloc_reject(CODE_PRECONDITION, msg);
                     }
                 }
                 None => {
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_NOT_FOUND,
-                        message: format!("stream {}", req.stream_id),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }));
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id));
                 }
             }
         }
@@ -2009,12 +1959,7 @@ impl AutumnManager {
                 Some(ex) => ex.eversion,
                 None => {
                     let msg = format!("extent {} was deleted during alloc_extent", tail.extent_id);
-                    return Ok(rkyv_encode(&StreamAllocExtentResp {
-                        code: CODE_PRECONDITION,
-                        message: msg,
-                        stream_info: None,
-                        last_ex_info: None,
-                    }));
+                    return Self::alloc_reject(CODE_PRECONDITION, msg);
                 }
             };
             if live_eversion != expected_eversion {
@@ -2023,12 +1968,7 @@ impl AutumnManager {
                      ({} -> {}); retry with fresh snapshot",
                     tail.extent_id, expected_eversion, live_eversion
                 );
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: CODE_PRECONDITION,
-                    message: msg,
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
+                return Self::alloc_reject(CODE_PRECONDITION, msg);
             }
         }
 
@@ -2047,12 +1987,7 @@ impl AutumnManager {
             )
             .await
         {
-            return Ok(rkyv_encode(&StreamAllocExtentResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-                stream_info: None,
-                last_ex_info: None,
-            }));
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
         }
 
         {
