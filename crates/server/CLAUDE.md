@@ -57,9 +57,11 @@ autumn-ps --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--ad
 **Module layout (split 2026-06-25, behaviour-preserving):** directory bin —
 `args.rs` holds `Command` / `Args` + the hand-rolled `parse_args` and its
 deprecation-warn helpers (`usage` / `warn_*_deprecated_once` private to it);
-`main.rs` holds `key_for_partition`, the bench structs/helpers, and `main()`
-(the dispatcher + put/get/del/ls + the perf-check benchmark). Cargo target:
-`path = "src/bin/autumn_client/main.rs"`.
+`main.rs` holds `key_for_partition`, the bench structs/helpers, `main()` (the
+~240-line dispatcher + the small put/get/del/head/ls arms), and `cmd_perf_check`
+(the ~490-line perf-check benchmark, extracted 2026-06-25 so the
+`Command::PerfCheck` arm is a one-line call; takes `client` + the 12 perf-check
+fields + `manager`). Cargo target: `path = "src/bin/autumn_client/main.rs"`.
 
 Data-plane CLI: KV ops + benchmarks. **F213 split:** all admin / observability subcommands moved to the sibling binary `autumn-op` (see below). `autumn-client op <anything>` and the legacy spellings (`autumn-client split 7`, `autumn-client info`, ...) all print a navigation hint and exit non-zero.
 
