@@ -2010,6 +2010,29 @@ fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     .encode()
 }
 
+/// Build a `CODE_EVERSION_MISMATCH` read response for one slot — the zc head
+/// or a full `ReadBytesResp` frame, matching the connection's `zc` mode.
+/// Typed CODE (not a frame-level error) so the client's
+/// `read_bytes_from_extent` retry self-heals (invalidate cache + refetch)
+/// instead of seeing a generic transport error.
+fn eversion_mismatch_read_resp(req_id: u32, zc: bool) -> Bytes {
+    if zc {
+        zc_read_head(req_id, CODE_EVERSION_MISMATCH, &[])
+    } else {
+        Frame::response(
+            req_id,
+            MSG_READ_BYTES,
+            ReadBytesResp {
+                code: CODE_EVERSION_MISMATCH,
+                end: 0,
+                payload: Bytes::new(),
+            }
+            .encode(),
+        )
+        .encode()
+    }
+}
+
 /// Build the async future that performs ACL + pwritev for a same-extent
 /// APPEND batch. ACL early rejections resolve the future as an immediate
 /// pre-encoded Vec<Bytes> with no I/O.
@@ -2452,23 +2475,7 @@ fn build_read_future(
         // client fails over to a healthy replica.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
             for slot in slots {
-                if zc {
-                    out.push(zc_read_head(slot.req_id, CODE_EVERSION_MISMATCH, &[]));
-                } else {
-                    out.push(
-                        Frame::response(
-                            slot.req_id,
-                            MSG_READ_BYTES,
-                            ReadBytesResp {
-                                code: CODE_EVERSION_MISMATCH,
-                                end: 0,
-                                payload: Bytes::new(),
-                            }
-                            .encode(),
-                        )
-                        .encode(),
-                    );
-                }
+                out.push(eversion_mismatch_read_resp(slot.req_id, zc));
             }
             return out;
         }
@@ -2489,23 +2496,7 @@ fn build_read_future(
             // error, which surfaced as a generic transport error and
             // never triggered the cache refresh.
             if req.eversion < ev {
-                if zc {
-                    out.push(zc_read_head(slot.req_id, CODE_EVERSION_MISMATCH, &[]));
-                } else {
-                    out.push(
-                        Frame::response(
-                            slot.req_id,
-                            MSG_READ_BYTES,
-                            ReadBytesResp {
-                                code: CODE_EVERSION_MISMATCH,
-                                end: 0,
-                                payload: Bytes::new(),
-                            }
-                            .encode(),
-                        )
-                        .encode(),
-                    );
-                }
+                out.push(eversion_mismatch_read_resp(slot.req_id, zc));
                 continue;
             }
 
