@@ -2797,6 +2797,87 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ///
     /// Caller (handle_multi_modify_merge) is responsible for the F138/
     /// F145/F146 inflight checks before calling this.
+    /// Seal the survivor stream's existing tail extent at
+    /// `survivor_sealed` and push the sealed record to `modified_extents`.
+    /// The tail is sealed EVEN WHEN EMPTY (length 0): after the merge it
+    /// is no longer the active tail (a new tail follows) and is CoW-shared,
+    /// so it must be frozen for CoW isolation (coco P1). No-op when the
+    /// survivor has no extents or its tail is already sealed. Shared by
+    /// `compute_merge_streams` + `splice_streams_without_new_tail`.
+    fn seal_survivor_old_tail(
+        state: &autumn_common::MetadataState,
+        survivor: &MgrStreamInfo,
+        survivor_sealed: u64,
+        modified_extents: &mut Vec<MgrExtentInfo>,
+    ) -> Result<(), AppError> {
+        if let Some(&tail_id) = survivor.extent_ids.last() {
+            let extent = state
+                .extents
+                .get(&tail_id)
+                .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
+            let mut ex = extent.clone();
+            if !ex.sealed {
+                ex.sealed = true;
+                ex.sealed_length = survivor_sealed;
+                ex.eversion += 1;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+                modified_extents.push(ex);
+            }
+        }
+        Ok(())
+    }
+
+    /// Splice victim's extents onto the survivor and push each (eversion-
+    /// bumped, tail sealed) record to `modified_extents`.
+    ///
+    /// F-merge-refs-leak: `refs` is MEMBERSHIP-NEUTRAL for victim extents
+    /// (refs == # of streams whose `extent_ids` list the extent). A victim
+    /// extent is one of:
+    ///   * CoW-shared (also in the survivor, from a prior split→merge-back):
+    ///     the merge collapses the two memberships {survivor, victim} into
+    ///     one {survivor}, so refs -= 1 AND the extent is NOT re-listed (the
+    ///     caller's dedup filter drops it). Re-listing would put it twice in
+    ///     the survivor's extent_ids, and a later GC `punch_holes` (whose
+    ///     `retain` drops ALL occurrences but decrements refs by only 1)
+    ///     could never reconcile it.
+    ///   * victim-only: its membership simply transfers victim→survivor, so
+    ///     refs is UNCHANGED (the +1 for the survivor splice cancels the -1
+    ///     for the deleted victim stream).
+    /// Pre-fix this did an unconditional `ex.refs += 1` while
+    /// `apply_merge_mutations` deleted the victim stream WITHOUT a
+    /// compensating decrement → +1 leak per victim extent per merge.
+    ///
+    /// The victim's old tail is sealed even at length 0 (CoW isolation,
+    /// coco P1); it is a post-split unique extent, never in `survivor_set`,
+    /// so this never collides with the dedup. Shared by
+    /// `compute_merge_streams` + `splice_streams_without_new_tail`.
+    fn splice_victim_extents(
+        state: &autumn_common::MetadataState,
+        survivor_set: &HashSet<u64>,
+        victim: &MgrStreamInfo,
+        victim_sealed: u64,
+        modified_extents: &mut Vec<MgrExtentInfo>,
+    ) -> Result<(), AppError> {
+        for (idx, &eid) in victim.extent_ids.iter().enumerate() {
+            let extent = state
+                .extents
+                .get(&eid)
+                .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
+            let mut ex = extent.clone();
+            if survivor_set.contains(&eid) {
+                ex.refs = ex.refs.saturating_sub(1);
+            }
+            ex.eversion += 1;
+            if idx == victim.extent_ids.len() - 1 && !ex.sealed {
+                ex.sealed = true;
+                ex.sealed_length = victim_sealed;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+            }
+            modified_extents.push(ex);
+        }
+        Ok(())
+    }
+
     fn compute_merge_streams(
         state: &autumn_common::MetadataState,
         survivor_stream_id: u64,
@@ -2817,67 +2898,16 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .ok_or_else(|| AppError::NotFound(format!("stream {victim_stream_id}")))?;
 
         let mut modified_extents = Vec::new();
+        Self::seal_survivor_old_tail(state, &survivor, survivor_sealed, &mut modified_extents)?;
 
-        // Seal survivor's existing tail at survivor_sealed (if open).
-        if let Some(&tail_id) = survivor.extent_ids.last() {
-            let extent = state
-                .extents
-                .get(&tail_id)
-                .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
-            let mut ex = extent.clone();
-            // Seal the survivor's old tail even at 0 (empty) — it is no longer
-            // the active tail (new_tail follows) + CoW-shared, so it must be
-            // frozen (coco P1, CoW isolation). Push the modified record either
-            // way so the seal persists.
-            if !ex.sealed {
-                ex.sealed = true;
-                ex.sealed_length = survivor_sealed;
-                ex.eversion += 1;
-                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
-                modified_extents.push(ex);
-            }
-        }
-
-        // F-merge-refs-leak: refs is MEMBERSHIP-NEUTRAL for victim extents
-        // (refs == # of streams whose extent_ids list the extent). A victim
-        // extent is one of:
-        //   * CoW-shared (also in the survivor, from a prior split→merge-back):
-        //     the merge collapses the two memberships {survivor, victim} into
-        //     one {survivor}, so refs -= 1 AND the extent is NOT re-listed
-        //     (dedup below). Re-listing would put it twice in the survivor's
-        //     extent_ids, and a later GC `punch_holes` (whose `retain` drops
-        //     ALL occurrences but decrements refs by only 1) could never
-        //     reconcile it.
-        //   * victim-only: its membership simply transfers victim→survivor, so
-        //     refs is UNCHANGED (the +1 for the survivor splice cancels the -1
-        //     for the deleted victim stream).
-        // Pre-fix this did an unconditional `ex.refs += 1` while
-        // apply_merge_mutations deleted the victim stream WITHOUT a
-        // compensating decrement → +1 leak per victim extent per merge,
-        // producing invisible un-reclaimable orphan extents (refs>0, listed in
-        // 0 live streams; `autumn-op info` renders only stream-member extents).
         let survivor_set: HashSet<u64> = survivor.extent_ids.iter().copied().collect();
-        for (idx, &eid) in victim.extent_ids.iter().enumerate() {
-            let extent = state
-                .extents
-                .get(&eid)
-                .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
-            let mut ex = extent.clone();
-            if survivor_set.contains(&eid) {
-                ex.refs = ex.refs.saturating_sub(1);
-            }
-            ex.eversion += 1;
-            // Seal the victim's old tail even at 0 (empty) — CoW-shared after
-            // the merge splices it onto the survivor, so it must be frozen
-            // (coco P1, CoW isolation). The tail is a post-split unique extent,
-            // never in `survivor_set`, so this never collides with the dedup.
-            if idx == victim.extent_ids.len() - 1 && !ex.sealed {
-                ex.sealed = true;
-                ex.sealed_length = victim_sealed;
-                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
-            }
-            modified_extents.push(ex);
-        }
+        Self::splice_victim_extents(
+            state,
+            &survivor_set,
+            &victim,
+            victim_sealed,
+            &mut modified_extents,
+        )?;
 
         // Splice extent_ids: [survivor.existing] + [victim.existing NOT already
         // in survivor] + [new_tail]. The dedup keeps each extent listed once;
@@ -2929,50 +2959,17 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .ok_or_else(|| AppError::NotFound(format!("stream {victim_stream_id}")))?;
 
         let mut modified_extents = Vec::new();
-        if let Some(&tail_id) = survivor.extent_ids.last() {
-            let extent = state
-                .extents
-                .get(&tail_id)
-                .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
-            let mut ex = extent.clone();
-            // Seal the survivor's old tail even at 0 (empty) — it is no longer
-            // the active tail (new_tail follows) + CoW-shared, so it must be
-            // frozen (coco P1, CoW isolation). Push the modified record either
-            // way so the seal persists.
-            if !ex.sealed {
-                ex.sealed = true;
-                ex.sealed_length = survivor_sealed;
-                ex.eversion += 1;
-                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
-                modified_extents.push(ex);
-            }
-        }
-        // F-merge-refs-leak: refs is MEMBERSHIP-NEUTRAL for victim extents —
-        // shared (also in survivor) ⇒ refs -= 1 + dedup; victim-only ⇒ refs
-        // unchanged (transfer). See compute_merge_streams for the full
-        // rationale; same leak/fix, just without a fresh tail.
+        Self::seal_survivor_old_tail(state, &survivor, survivor_sealed, &mut modified_extents)?;
+
         let survivor_set: HashSet<u64> = survivor.extent_ids.iter().copied().collect();
-        for (idx, &eid) in victim.extent_ids.iter().enumerate() {
-            let extent = state
-                .extents
-                .get(&eid)
-                .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
-            let mut ex = extent.clone();
-            if survivor_set.contains(&eid) {
-                ex.refs = ex.refs.saturating_sub(1);
-            }
-            ex.eversion += 1;
-            // Seal the victim's old tail even at 0 (empty) — CoW-shared after
-            // the merge splices it onto the survivor, so it must be frozen
-            // (coco P1, CoW isolation). The tail is a post-split unique extent,
-            // never in `survivor_set`, so this never collides with the dedup.
-            if idx == victim.extent_ids.len() - 1 && !ex.sealed {
-                ex.sealed = true;
-                ex.sealed_length = victim_sealed;
-                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
-            }
-            modified_extents.push(ex);
-        }
+        Self::splice_victim_extents(
+            state,
+            &survivor_set,
+            &victim,
+            victim_sealed,
+            &mut modified_extents,
+        )?;
+
         let mut new_extent_ids = survivor.extent_ids.clone();
         new_extent_ids.extend(
             victim
