@@ -1,3 +1,26 @@
+Date: 2026-06-25 (review 战役 — policy.rs compute_candidates 拆 split/merge 子检查)
+TaskStatus: completed
+Task scope: 用户"continue"(承接 review 战役;next-steps ① 的首项 = policy compute_* 大函数拆子检查)。
+  纯 behavior-preserving 拆分,build+clippy+**全量 cargo test -p autumn-manager --lib(164/164)** 验证
+  (硬性 [[feedback_run_unit_tests_after_refactor]])。
+COMMIT(1 个,未 push,等用户拍板):
+  · 0d16f35 policy.rs:PolicyEngine::compute_candidates 的两个视觉分隔 pass(SPLIT/MERGE)抽成命名私有 helper:
+    - split_candidates(&self, args) = F183 per-partition SPLIT pass(317-364 体)
+    - merge_candidates(&self, args) = F183 adjacent-pair MERGE pass(366-450 体)
+    compute_candidates 变成小 orchestrator:split 在前 merge 在后(push 顺序不变)+ 保留 advisory_cache/_at 写。
+    两 helper 都是 **只读 &self**(只读 self.metrics+self.config+args)——把每个 pass 的只读性显式化。net +27。
+    cfg.clone() 每 helper 各 clone 一次(2 次/60s tick,可忽略;mirror compute_maintenance 既有写法)。
+  验证:build 绿;clippy policy.rs **0 新增**(残留 3 个 pre-existing 在 inode_lease.rs:739 + lib.rs:169/231,
+    我没碰那两文件);全量 164/164,含 policy_tests 的 split_*/merge_* candidate 专项(钉死 pass 行为)。
+未做(刻意):compute_maintenance 3 arm 仍不 dedup(上轮已评估否决,over-refactor);extent_inflight.rs 看过——
+  已高度 factored(acquire ~28 行 + 一堆小 helper + F208 sweep),无大函数可拆,强拆=over-refactor,跳过。
+  manager CLAUDE.md note 16/18 仍准确(compute_candidates 仍是 public 入口,无架构变更)→ 不更新。
+Next steps(用户定夺):① 继续纯拆分(policy compute_hot_cold_advisory ~170 行可拆 by_ps 建图/维度分析两阶段;
+  inode_lease.rs acquire_with_force_deferred ~166 行最大函数);② coco 恢复后控制面 bug-finding(recovery/rpc_handlers);
+  ③ 热路径巨文件(partition-server/lib.rs、extent_node.rs)更晚;④ 顺手清 3 个 pre-existing clippy(非本次范围)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-25 (review 战役 — manager 纯拆分,不依赖 coco)
 TaskStatus: completed
 Task scope: 用户"Continue"+"继续纯拆分(不依赖 coco)"+硬性要求"每次重构完都要跑 unit test"
