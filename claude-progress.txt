@@ -1,3 +1,33 @@
+Date: 2026-06-25 (代码 review/refactor 战役 — 启动 + autumn_op pilot)
+TaskStatus: completed
+Task scope: 用户"和 coco 合作,通读代码 refactor 必要代码,简化,拆分文件/函数;准备花 2 周 review 所有代码"。
+  用户拍板:① 激进度=**保守**(behavior-preserving 拆分 + 明显净化;行为变更要 reproduce-first;热路径只抽函数不改逻辑);
+  ② 起点=**低风险 pilot 先跑通流程**。
+工作流(已验证可用,本战役标准循环):coco inspect(逐文件挖 bug)/ arch(跨组件)→ 我提拆分/修复 → 应用(纯移动零逻辑变更
+  OR reproduce-first 修复)→ cargo build+clippy(-D warnings)+test+CLI smoke(+热路径 chaos/perf)→ coco findbugs 复核 diff →
+  更新该 crate CLAUDE.md → 一个可 review 的 commit。
+代码地形(战役优先级):113K LOC / 11 crate;**5 个巨型文件占 ~38K(1/3)**:partition-server/lib.rs 11.8K(热路径,最 revert-prone)、
+  stream/extent_node.rs 8.8K(热 append/read+coalescer,note 24 明令 revert-prone)、manager/lib.rs 6.6K、manager/rpc_handlers.rs 5.7K、
+  stream/client.rs 5.2K。大函数:recover_partition ~1.1K、fuse handle_request ~726、partition_thread_main、process_gc_chunk/compact_row_append、
+  handle_convert_to_ec、build_append_future、replay_from_etcd。
+PILOT 完成(autumn_op.rs CLI,3053 LOC,3 commit):
+  · eab8e78 拆分:autumn_op.rs → 目录 bin autumn_op/{main.rs 2051, args.rs 1009}(Args/Command/parse+parse 助手+tests 进 args.rs;
+    Cargo path 改 src/bin/autumn_op/main.rs)。纯代码移动(git 认出 rename),build clean + 12 单测 + CLI smoke。
+  · coco inspect(GPT-5.5)挖到 **10 个真 bug**(非 trick,都符合代码自身不变量)。用户选**修清晰的 6 个**:
+  · 2153d2f 修 5 个:#7 fuse_split_ranges floor-stride 偏斜(非 256 约数尾分区吞 remainder)→ 比例边界 (i*256)/n + reproduce-first 测
+    (n=6 spread 4→1);#4 info 用 sealed_length==0 判 open → 改权威 .sealed(note 32);#6 run_info 不查 resp.code → 三个 resp 全 bail;
+    #1 format 不查 RegisterNodeResp.code 就写哨兵 → bail;#2 disk_id unwrap_or(0) 静默伪格式化 → 先全解析再写(no partial)。coco findbugs 清。
+  · cfbd06c 修 #9:parse() 缺 flag 值/positional 直接 raw[i] 越界 panic → 加 val(raw,i) helper(越界即 usage),热点 flag-dispatch 不动;
+    rebuild 后 15 个缺值用例全 usage(0 panic;stale 二进制还 panic=reproduce 证据),好输入仍 parse。coco findbugs 清。
+BACKLOG(niche,用户暂不修,记录待逐个拍板):#3 format 目录不去重→幽灵磁盘;#5 info probe open-extent 不按 shard 路由(仅 multi-shard);
+  #8 --json info --part 缺→无 JSON+rc0;#10 parse_byte_size 无 u64 上溢检查。
+教训:① cargo clippy 不刷新 target/debug 二进制——CLI smoke 必须先 cargo build(踩过 stale 二进制假阳);② bin 拆 module=改成目录 bin
+  (main.rs+子模块)+Cargo path;③ coco inspect 出 bug 不出结构,结构拆分是我的判断;④ 巨型文件先拆 cohesive 块(args/display)再拆大函数。
+Next steps(用户定夺):① 继续拆 autumn_op run()(1066 行→按命令族抽 handler);② 进下一个文件(建议先 autumn_client.rs / manager 控制面等
+  低风险,热路径巨файл 留到流程更熟);③ 每周节奏 + 是否 push(本 4 commit 未 push)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-24 (EN-down stall 定位)
 TaskStatus: completed
 Task scope: 用户"先复现+定位再说"(EN-down ~30s stall finding)。**定位完成:不是 failover-latency bug,
