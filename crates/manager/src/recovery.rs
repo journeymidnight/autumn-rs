@@ -193,6 +193,33 @@ impl AutumnManager {
         ))
     }
 
+    /// F209-B best-effort Recovery inflight-marker release. Drops the etcd
+    /// `extent_inflight/<id>` marker and the in-memory marker. The etcd delete
+    /// is best-effort: a transient failure is WARN-logged, NOT propagated —
+    /// the in-memory marker is released regardless so the extent isn't blocked,
+    /// and the F208 stale-marker sweep (~10 min ceiling) reclaims the etcd
+    /// marker. Propagating (`?`) would skip the in-memory release + each
+    /// caller's follow-up cleanup (e.g. the extent-removed branch's
+    /// `enqueue_pending_deletes`) — a worse regression than a transient
+    /// recovery-cleanup retry that is already backstopped by the sweep +
+    /// node-startup reconcile. (Dedups the 3 byte-identical release blocks in
+    /// `apply_recovery_done`'s ec-inflight / slot-gone / extent-removed paths.)
+    async fn release_recovery_marker_best_effort(&self, extent_id: u64) {
+        if let Some(etcd) = &self.etcd {
+            if let Err(e) = etcd
+                .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
+                .await
+            {
+                tracing::warn!(
+                    extent_id,
+                    error = %e,
+                    "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
+                );
+            }
+        }
+        self.commit_extent_inflight_release(extent_id);
+    }
+
     pub(crate) async fn apply_recovery_done(
         &self,
         done_task: MgrRecoveryTaskDone,
@@ -255,32 +282,7 @@ impl AutumnManager {
             // attempts to repair this slot. Legacy `recoveryTasks/<id>`
             // delete dropped (the backward-compat dual-key path lived in
             // F207-C only).
-            if let Some(etcd) = &self.etcd {
-                // No-swallow: surface the etcd marker-release failure instead
-                // of `let _ =`, but KEEP the original "release in-memory
-                // regardless" behavior (the F209-B design: release now so the
-                // extent isn't blocked, and — in the extent-removed branch —
-                // still run the targeted orphan cleanup below). Only the
-                // swallow is removed. On etcd failure the in-memory marker is
-                // still dropped (next line) and the etcd marker is reclaimed by
-                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
-                // do NOT switch this to `?`: that would skip the in-memory
-                // release + the extent-removed branch's `enqueue_pending_deletes`,
-                // trading a transient-etcd recovery cleanup (already backstopped
-                // by the sweep + node-startup reconcile) for a worse regression.
-                // A proper atomic release-or-retry is a deferred follow-up.
-                if let Err(e) = etcd
-                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await
-                {
-                    tracing::warn!(
-                        extent_id = task.extent_id,
-                        error = %e,
-                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
-                    );
-                }
-            }
-            self.commit_extent_inflight_release(task.extent_id);
+            self.release_recovery_marker_best_effort(task.extent_id).await;
             return Err(AppError::Precondition(format!(
                 "recovery target {} for extent {} already in extent node list at a different slot; \
                  likely EC conversion completed during recovery — discarding stale apply",
@@ -298,32 +300,7 @@ impl AutumnManager {
         // F208's 10-min sweep, blocking any other op on the extent
         // for that window. Release now, then return.
         if layout_changed.is_none() {
-            if let Some(etcd) = &self.etcd {
-                // No-swallow: surface the etcd marker-release failure instead
-                // of `let _ =`, but KEEP the original "release in-memory
-                // regardless" behavior (the F209-B design: release now so the
-                // extent isn't blocked, and — in the extent-removed branch —
-                // still run the targeted orphan cleanup below). Only the
-                // swallow is removed. On etcd failure the in-memory marker is
-                // still dropped (next line) and the etcd marker is reclaimed by
-                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
-                // do NOT switch this to `?`: that would skip the in-memory
-                // release + the extent-removed branch's `enqueue_pending_deletes`,
-                // trading a transient-etcd recovery cleanup (already backstopped
-                // by the sweep + node-startup reconcile) for a worse regression.
-                // A proper atomic release-or-retry is a deferred follow-up.
-                if let Err(e) = etcd
-                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await
-                {
-                    tracing::warn!(
-                        extent_id = task.extent_id,
-                        error = %e,
-                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
-                    );
-                }
-            }
-            self.commit_extent_inflight_release(task.extent_id);
+            self.release_recovery_marker_best_effort(task.extent_id).await;
             return Err(AppError::Precondition(format!(
                 "replace_id {} not in extent {}",
                 task.replace_id, task.extent_id
@@ -396,32 +373,7 @@ impl AutumnManager {
             };
             // Release Recovery (etcd + in-memory). F207-D removed the
             // legacy-key delete entry.
-            if let Some(etcd) = &self.etcd {
-                // No-swallow: surface the etcd marker-release failure instead
-                // of `let _ =`, but KEEP the original "release in-memory
-                // regardless" behavior (the F209-B design: release now so the
-                // extent isn't blocked, and — in the extent-removed branch —
-                // still run the targeted orphan cleanup below). Only the
-                // swallow is removed. On etcd failure the in-memory marker is
-                // still dropped (next line) and the etcd marker is reclaimed by
-                // the F208 stale-marker sweep (~10 min ceiling). We deliberately
-                // do NOT switch this to `?`: that would skip the in-memory
-                // release + the extent-removed branch's `enqueue_pending_deletes`,
-                // trading a transient-etcd recovery cleanup (already backstopped
-                // by the sweep + node-startup reconcile) for a worse regression.
-                // A proper atomic release-or-retry is a deferred follow-up.
-                if let Err(e) = etcd
-                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
-                    .await
-                {
-                    tracing::warn!(
-                        extent_id = task.extent_id,
-                        error = %e,
-                        "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
-                    );
-                }
-            }
-            self.commit_extent_inflight_release(task.extent_id);
+            self.release_recovery_marker_best_effort(task.extent_id).await;
             // Then enqueue Delete (best effort — extent_delete_loop will
             // pick it up on next tick).
             if let Some(addr) = maybe_addr {
