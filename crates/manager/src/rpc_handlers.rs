@@ -2078,6 +2078,99 @@ impl AutumnManager {
         }))
     }
 
+    /// Refuse a punch_holes / truncate when any to-be-removed extent has a
+    /// stream-layer op in flight: recovery (only when the extent would drop
+    /// to refs==0 — `refs==1 && vp_table_refs==0`) or EC conversion
+    /// (unconditional). `op` names the operation for the error message.
+    /// Pure read over `s`; shared refuse-at-start by
+    /// handle_stream_punch_holes + handle_truncate.
+    fn refuse_if_removed_extent_inflight(
+        s: &autumn_common::MetadataState,
+        removed: &HashSet<u64>,
+        recovery_inflight_set: &HashSet<u64>,
+        ec_inflight_set: &HashSet<u64>,
+        op: &str,
+    ) -> Result<(), AppError> {
+        // If any extent that would drop to refs=0 is currently being
+        // recovered, refuse the entire call.
+        for eid in removed {
+            if recovery_inflight_set.contains(eid) {
+                if let Some(ex) = s.extents.get(eid) {
+                    if ex.refs == 1 && ex.vp_table_refs == 0 {
+                        return Err(AppError::Precondition(format!(
+                            "extent {eid} has in-flight recovery; \
+                             defer {op} until recovery completes"
+                        )));
+                    }
+                }
+            }
+        }
+        // Refuse if any to-be-removed extent is mid-EC.
+        for eid in removed {
+            if ec_inflight_set.contains(eid) {
+                return Err(AppError::Precondition(format!(
+                    "extent {eid} has in-flight EC conversion; \
+                     defer {op} until conversion completes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// For every extent in `removed`, compute its ref-drop effect and build
+    /// `(extent_puts, extent_deletes, pending_deletes)`. An extent dropping
+    /// to refs==0 that is physically deletable (`extent_can_delete`) and not
+    /// EC-inflight goes to `extent_deletes` + gets a `PendingDelete`
+    /// snapshot; otherwise refs is decremented (eversion bumped) into
+    /// `extent_puts`. Pure read over `s` (returns clones). Shared by
+    /// handle_stream_punch_holes + handle_truncate.
+    fn compute_extent_ref_drops(
+        s: &autumn_common::MetadataState,
+        removed: &HashSet<u64>,
+        ec_inflight_set: &HashSet<u64>,
+    ) -> (Vec<MgrExtentInfo>, Vec<u64>, Vec<PendingDelete>) {
+        let mut extent_puts = Vec::new();
+        let mut extent_deletes = Vec::new();
+        let mut pending_deletes = Vec::new();
+
+        // Build pending_deletes snapshot for extents that would physically
+        // delete (refs would hit 0 and not EC-inflight).
+        for &eid in removed {
+            if let Some(extent) = s.extents.get(&eid) {
+                if extent.refs == 1 && extent.vp_table_refs == 0 && !ec_inflight_set.contains(&eid)
+                {
+                    let pending_addrs = Self::snapshot_replica_addrs(&s.nodes, eid, extent);
+                    pending_deletes.push(PendingDelete {
+                        extent_id: eid,
+                        pending_addrs,
+                        attempts: 0,
+                    });
+                }
+            }
+        }
+
+        for extent_id in removed {
+            if let Some(extent) = s.extents.get(extent_id) {
+                let mut new_ext = extent.clone();
+                if new_ext.refs <= 1 {
+                    new_ext.refs = 0;
+                    if Self::extent_can_delete(&new_ext) && !ec_inflight_set.contains(extent_id) {
+                        extent_deletes.push(*extent_id);
+                    } else {
+                        new_ext.eversion += 1;
+                        extent_puts.push(new_ext);
+                    }
+                } else {
+                    new_ext.refs -= 1;
+                    new_ext.eversion += 1;
+                    extent_puts.push(new_ext);
+                }
+            }
+        }
+
+        (extent_puts, extent_deletes, pending_deletes)
+    }
+
     pub(crate) async fn handle_stream_punch_holes(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&PunchHolesResp {
@@ -2090,19 +2183,14 @@ impl AutumnManager {
         let req: PunchHolesReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F207-C: snapshot the ConvertToEc + Recovery sets from the
-        // unified ledger once. Pre-F207 these were `ec_inflight` Ref into
-        // the deleted HashSet + `recovery_inflight` Ref into the deleted
-        // HashMap. Single-threaded compio — snapshot-then-consult preserves
+        // Snapshot the ConvertToEc + Recovery sets from the inflight ledger
+        // once. Single-threaded compio — snapshot-then-consult preserves
         // semantics.
         let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
-        // F210-A1 etcd-first refactor (was: mutate-store then mirror-etcd
-        // then enqueue). The pre-F210-A1 form computed mutations inside a
-        // borrow_mut block — mirror failure (NotLeader / etcd transient)
-        // left in-memory state advanced while etcd was unchanged. note 1's
-        // step 1 says "compute mutations without modifying store". The
-        // closure below now does so by working on clones.
+        // Etcd-first: compute mutations on clones (no store mutation), persist
+        // to etcd, then apply — so a mirror failure (NotLeader / etcd
+        // transient) leaves in-memory state unchanged.
         let out = {
             let guard = self.store.inner.borrow();
             let s: &autumn_common::MetadataState = &guard;
@@ -2112,8 +2200,8 @@ impl AutumnManager {
                     Vec<MgrExtentInfo>,
                     Vec<u64>,
                     Vec<PendingDelete>,
-                    // Item 3: CAS baseline = the stream's value BEFORE this
-                    // punch (etcd currently holds it). The mirror value-CAS's
+                    // CAS baseline = the stream's value BEFORE this punch
+                    // (etcd currently holds it). The mirror value-CAS's
                     // `streams/<id>` against it.
                     Vec<u8>,
                 ),
@@ -2128,7 +2216,7 @@ impl AutumnManager {
                     .clone();
                 let stream_baseline = rkyv_encode(&stream).to_vec();
 
-                // F126: only operate on extents that actually belong to this
+                // Only operate on extents that actually belong to this
                 // stream. Without this, a malformed request could decrement
                 // refs on unrelated streams' extents.
                 let members: HashSet<u64> = stream.extent_ids.iter().copied().collect();
@@ -2137,29 +2225,13 @@ impl AutumnManager {
                     .filter(|id| members.contains(id))
                     .collect();
 
-                // F139 / F207-C: if any extent that would drop to refs=0
-                // is currently being recovered, refuse the entire call.
-                for eid in &removed {
-                    if recovery_inflight_set.contains(eid) {
-                        if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 && ex.vp_table_refs == 0 {
-                                return Err(AppError::Precondition(format!(
-                                    "extent {eid} has in-flight recovery; \
-                                     defer punch_holes until recovery completes"
-                                )));
-                            }
-                        }
-                    }
-                }
-                // F145 / F207-B: refuse if any to-be-removed extent is mid-EC.
-                for eid in &removed {
-                    if ec_inflight_set.contains(eid) {
-                        return Err(AppError::Precondition(format!(
-                            "extent {eid} has in-flight EC conversion; \
-                             defer punch_holes until conversion completes"
-                        )));
-                    }
-                }
+                Self::refuse_if_removed_extent_inflight(
+                    s,
+                    &removed,
+                    &recovery_inflight_set,
+                    &ec_inflight_set,
+                    "punch_holes",
+                )?;
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
@@ -2168,49 +2240,8 @@ impl AutumnManager {
                         "stream cannot be empty after punch holes".to_string(),
                     ));
                 }
-                let mut extent_puts = Vec::new();
-                let mut extent_deletes = Vec::new();
-                let mut pending_deletes = Vec::new();
-
-                // F109: build pending_deletes snapshot for extents that
-                // would physically delete (refs would hit 0 and not EC-inflight).
-                for &eid in &removed {
-                    if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1
-                            && extent.vp_table_refs == 0
-                            && !ec_inflight_set.contains(&eid)
-                        {
-                            let pending_addrs =
-                                Self::snapshot_replica_addrs(&s.nodes, eid, extent);
-                            pending_deletes.push(PendingDelete {
-                                extent_id: eid,
-                                pending_addrs,
-                                attempts: 0,
-                            });
-                        }
-                    }
-                }
-
-                for extent_id in &removed {
-                    if let Some(extent) = s.extents.get(extent_id) {
-                        let mut new_ext = extent.clone();
-                        if new_ext.refs <= 1 {
-                            new_ext.refs = 0;
-                            if Self::extent_can_delete(&new_ext)
-                                && !ec_inflight_set.contains(extent_id)
-                            {
-                                extent_deletes.push(*extent_id);
-                            } else {
-                                new_ext.eversion += 1;
-                                extent_puts.push(new_ext);
-                            }
-                        } else {
-                            new_ext.refs -= 1;
-                            new_ext.eversion += 1;
-                            extent_puts.push(new_ext);
-                        }
-                    }
-                }
+                let (extent_puts, extent_deletes, pending_deletes) =
+                    Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
                 Ok((
                     updated,
                     extent_puts,
@@ -2223,8 +2254,8 @@ impl AutumnManager {
 
         match out {
             Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline)) => {
-                // Step 2: persist to etcd FIRST. Failure → in-memory zero
-                // changes (the closure above produced clones only).
+                // Persist to etcd FIRST. Failure → in-memory zero changes
+                // (the closure above produced clones only).
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(
                         &stream,
@@ -2254,10 +2285,9 @@ impl AutumnManager {
                         s.extents.remove(&eid);
                     }
                 }
-                // F207-C: each enqueue is now an etcd CAS via the unified
-                // ledger; errors are downgraded inside enqueue (with WARN
-                // logging) so a single failed acquire doesn't fail the
-                // whole punch_holes call.
+                // Each enqueue is an etcd CAS via the inflight ledger; errors
+                // are downgraded inside enqueue (WARN-logged) so a single
+                // failed acquire doesn't fail the whole punch_holes call.
                 let _ = self.enqueue_pending_deletes(pending_deletes).await;
                 Ok(rkyv_encode(&PunchHolesResp {
                     code: CODE_OK,
@@ -2285,10 +2315,10 @@ impl AutumnManager {
         let req: TruncateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F207-C: snapshot ConvertToEc + Recovery inflight sets.
+        // Snapshot ConvertToEc + Recovery inflight sets.
         let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
-        // F210-A1 etcd-first refactor (same shape as handle_stream_punch_holes).
+        // Etcd-first (same shape as handle_stream_punch_holes).
         let out = {
             let guard = self.store.inner.borrow();
             let s: &autumn_common::MetadataState = &guard;
@@ -2298,7 +2328,7 @@ impl AutumnManager {
                     Vec<MgrExtentInfo>,
                     Vec<u64>,
                     Vec<PendingDelete>,
-                    // Item 3: CAS baseline (stream value before this truncate).
+                    // CAS baseline (stream value before this truncate).
                     Vec<u8>,
                 ),
                 AppError,
@@ -2327,74 +2357,18 @@ impl AutumnManager {
 
                 let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
 
-                // F139 / F207-C: refuse if any to-be-removed extent is
-                // mid-recovery.
-                for eid in &removed {
-                    if recovery_inflight_set.contains(eid) {
-                        if let Some(ex) = s.extents.get(eid) {
-                            if ex.refs == 1 && ex.vp_table_refs == 0 {
-                                return Err(AppError::Precondition(format!(
-                                    "extent {eid} has in-flight recovery; \
-                                     defer truncate until recovery completes"
-                                )));
-                            }
-                        }
-                    }
-                }
-                // F145 / F207-B: refuse if any to-be-truncated extent is mid-EC.
-                for eid in &removed {
-                    if ec_inflight_set.contains(eid) {
-                        return Err(AppError::Precondition(format!(
-                            "extent {eid} has in-flight EC conversion; \
-                             defer truncate until conversion completes"
-                        )));
-                    }
-                }
+                Self::refuse_if_removed_extent_inflight(
+                    s,
+                    &removed,
+                    &recovery_inflight_set,
+                    &ec_inflight_set,
+                    "truncate",
+                )?;
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
-                let mut extent_puts = Vec::new();
-                let mut extent_deletes = Vec::new();
-                let mut pending_deletes = Vec::new();
-
-                // F109: build pending_deletes for extents that physically delete.
-                for &eid in &removed {
-                    if let Some(extent) = s.extents.get(&eid) {
-                        if extent.refs == 1
-                            && extent.vp_table_refs == 0
-                            && !ec_inflight_set.contains(&eid)
-                        {
-                            let pending_addrs =
-                                Self::snapshot_replica_addrs(&s.nodes, eid, extent);
-                            pending_deletes.push(PendingDelete {
-                                extent_id: eid,
-                                pending_addrs,
-                                attempts: 0,
-                            });
-                        }
-                    }
-                }
-
-                for extent_id in &removed {
-                    if let Some(extent) = s.extents.get(extent_id) {
-                        let mut new_ext = extent.clone();
-                        if new_ext.refs <= 1 {
-                            new_ext.refs = 0;
-                            if Self::extent_can_delete(&new_ext)
-                                && !ec_inflight_set.contains(extent_id)
-                            {
-                                extent_deletes.push(*extent_id);
-                            } else {
-                                new_ext.eversion += 1;
-                                extent_puts.push(new_ext);
-                            }
-                        } else {
-                            new_ext.refs -= 1;
-                            new_ext.eversion += 1;
-                            extent_puts.push(new_ext);
-                        }
-                    }
-                }
+                let (extent_puts, extent_deletes, pending_deletes) =
+                    Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
                 Ok((
                     updated,
                     extent_puts,
