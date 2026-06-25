@@ -52,7 +52,14 @@ autumn-ps --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--ad
   4. `open_partition()` for each assigned partition (replay from streams)
   5. Serves `PartitionKv` gRPC
 
-### `autumn-client` (`src/bin/autumn_client.rs`)
+### `autumn-client` (`src/bin/autumn_client/`)
+
+**Module layout (split 2026-06-25, behaviour-preserving):** directory bin —
+`args.rs` holds `Command` / `Args` + the hand-rolled `parse_args` and its
+deprecation-warn helpers (`usage` / `warn_*_deprecated_once` private to it);
+`main.rs` holds `key_for_partition`, the bench structs/helpers, and `main()`
+(the dispatcher + put/get/del/ls + the perf-check benchmark). Cargo target:
+`path = "src/bin/autumn_client/main.rs"`.
 
 Data-plane CLI: KV ops + benchmarks. **F213 split:** all admin / observability subcommands moved to the sibling binary `autumn-op` (see below). `autumn-client op <anything>` and the legacy spellings (`autumn-client split 7`, `autumn-client info`, ...) all print a navigation hint and exit non-zero.
 

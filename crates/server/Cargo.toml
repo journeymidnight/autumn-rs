@@ -18,7 +18,7 @@ path = "src/bin/partition_server.rs"
 
 [[bin]]
 name = "autumn-client"
-path = "src/bin/autumn_client.rs"
+path = "src/bin/autumn_client/main.rs"
 
 [[bin]]
 name = "autumn-op"
