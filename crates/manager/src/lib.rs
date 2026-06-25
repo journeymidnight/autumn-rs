@@ -1836,6 +1836,34 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         )
     }
 
+    /// Replay helper: decode every `prefix/<id>` kv into a
+    /// `HashMap<u64, T>`, folding each parsed id into `max_id`.
+    /// Centralizes the parse-id → checked-rkyv-decode → max-id → insert
+    /// loop that `replay_from_etcd` runs identically for nodes / disks /
+    /// streams / extents / partitions. The fail-loud
+    /// `replay_decode_err` mapping (note 39 / upgrade safety: a
+    /// layout-mismatched persisted value must refuse leadership, never
+    /// decode to garbage) now lives in this single site.
+    fn replay_decode_id_map<T>(
+        kvs: &[autumn_etcd::proto::KeyValue],
+        prefix: &str,
+        max_id: &mut u64,
+    ) -> Result<HashMap<u64, T>>
+    where
+        T: rkyv::Archive,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    {
+        let mut out = HashMap::new();
+        for kv in kvs {
+            let id = Self::parse_id_from_key(prefix, &kv.key)?;
+            let v: T = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
+            *max_id = (*max_id).max(id);
+            out.insert(id, v);
+        }
+        Ok(out)
+    }
+
     async fn replay_from_etcd(&self) -> Result<()> {
         let etcd = match &self.etcd {
             Some(v) => v,
@@ -1876,37 +1904,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         drop(c);
 
         let mut max_id = 0u64;
-        let mut decoded_nodes = HashMap::new();
-        for kv in &nodes.kvs {
-            let id = Self::parse_id_from_key("nodes/", &kv.key)?;
-            let node: MgrNodeInfo = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_nodes.insert(id, node);
-        }
-
-        let mut decoded_disks = HashMap::new();
-        for kv in &disks.kvs {
-            let id = Self::parse_id_from_key("disks/", &kv.key)?;
-            let disk: MgrDiskInfo = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_disks.insert(id, disk);
-        }
-
-        let mut decoded_streams = HashMap::new();
-        for kv in &streams.kvs {
-            let id = Self::parse_id_from_key("streams/", &kv.key)?;
-            let st: MgrStreamInfo = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_streams.insert(id, st);
-        }
-
-        let mut decoded_extents = HashMap::new();
-        for kv in &extents.kvs {
-            let id = Self::parse_id_from_key("extents/", &kv.key)?;
-            let ex: MgrExtentInfo = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_extents.insert(id, ex);
-        }
+        let decoded_nodes: HashMap<u64, MgrNodeInfo> =
+            Self::replay_decode_id_map(&nodes.kvs, "nodes/", &mut max_id)?;
+        let decoded_disks: HashMap<u64, MgrDiskInfo> =
+            Self::replay_decode_id_map(&disks.kvs, "disks/", &mut max_id)?;
+        let decoded_streams: HashMap<u64, MgrStreamInfo> =
+            Self::replay_decode_id_map(&streams.kvs, "streams/", &mut max_id)?;
+        let decoded_extents: HashMap<u64, MgrExtentInfo> =
+            Self::replay_decode_id_map(&extents.kvs, "extents/", &mut max_id)?;
 
         let mut decoded_owner_revs = HashMap::new();
         let mut max_revision = 0i64;
@@ -1925,14 +1930,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             decoded_owner_revs.insert(owner_key, rev);
         }
 
-        let mut decoded_partitions = HashMap::new();
-        for kv in &partitions.kvs {
-            let id = Self::parse_id_from_key("partitions/", &kv.key)?;
-            let part: MgrPartitionMeta =
-                rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            max_id = max_id.max(id);
-            decoded_partitions.insert(id, part);
-        }
+        let decoded_partitions: HashMap<u64, MgrPartitionMeta> =
+            Self::replay_decode_id_map(&partitions.kvs, "partitions/", &mut max_id)?;
 
         let mut decoded_ps_nodes = HashMap::new();
         for kv in &ps_nodes.kvs {
