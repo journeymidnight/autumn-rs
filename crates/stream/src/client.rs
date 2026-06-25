@@ -1563,6 +1563,17 @@ impl StreamClient {
         }
     }
 
+    /// Shared tail of the manager-RPC wrappers: note the response `code`
+    /// (rotating to the next manager on NOT_LEADER) and bail with
+    /// `"<ctx> failed: <message>"` when it isn't OK.
+    fn check_manager_resp(&self, code: u8, message: &str, ctx: &str) -> Result<()> {
+        self.note_manager_code(code);
+        if code != CODE_OK {
+            return Err(anyhow!("{ctx} failed: {message}"));
+        }
+        Ok(())
+    }
+
     async fn retry_manager_call<F, Fut, T>(&self, label: &str, max_retries: u32, f: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -1810,10 +1821,7 @@ impl StreamClient {
             .await?;
         let resp: NodesInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("nodes_info failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "nodes_info")?;
         for (id, node) in resp.nodes {
             self.nodes_cache
                 .insert(id, (node.address, node.shard_ports));
@@ -1885,10 +1893,7 @@ impl StreamClient {
             .await?;
         let resp: ListNodeStatesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("list_node_states failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "list_node_states")?;
         Ok(resp
             .nodes
             .iter()
@@ -2030,10 +2035,7 @@ impl StreamClient {
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("stream_info failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "stream_info")?;
         let (_, mgr_stream) = resp
             .streams
             .into_iter()
@@ -2090,10 +2092,7 @@ impl StreamClient {
             .await?;
         let resp: CheckCommitLengthResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("check_commit_length failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "check_commit_length")?;
         let stream = resp
             .stream_info
             .map(|s| Self::mgr_to_stream_info(&s))
@@ -2885,10 +2884,7 @@ impl StreamClient {
             .await?;
         let resp: PunchHolesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("punch_holes failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "punch_holes")?;
         resp.stream
             .map(|s| Self::mgr_to_stream_info(&s))
             .ok_or_else(|| anyhow!("punch_holes: missing stream"))
@@ -2907,10 +2903,7 @@ impl StreamClient {
             .await?;
         let resp: TruncateResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("truncate failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "truncate")?;
         resp.updated_stream_info
             .map(|s| Self::mgr_to_stream_info(&s))
             .ok_or_else(|| anyhow!("truncate: missing stream"))
@@ -2926,10 +2919,7 @@ impl StreamClient {
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("stream_info failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "stream_info")?;
         resp.streams
             .into_iter()
             .next()
@@ -2954,10 +2944,7 @@ impl StreamClient {
             .await?;
         let resp: ExtentInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("extent_info failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "extent_info")?;
         let ex = resp
             .extent
             .map(|e| Self::mgr_to_extent_info(&e))
@@ -4344,10 +4331,7 @@ impl StreamClient {
             .manager_call(MSG_MULTI_MODIFY_SPLIT, req, timeout)
             .await?;
         let resp: CodeResp = manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.note_manager_code(resp.code);
-        if resp.code != CODE_OK {
-            return Err(anyhow!("multi_modify_split failed: {}", resp.message));
-        }
+        self.check_manager_resp(resp.code, &resp.message, "multi_modify_split")?;
         Ok(())
     }
 
