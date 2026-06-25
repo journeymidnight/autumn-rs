@@ -106,10 +106,28 @@ ROUND 12 COMMIT(1fe0150,已 push):recover_partition 逻辑分析(读了前 ~360 
   会跳 survivor tail;FuturesOrdered 给 per-source contiguous-seq 不变量)+ 去 F### 标签。net -19。
   验证:167/167 + clippy 9 不变 + **coco findbugs(GPT-5.5)未发现(注释+dead-code only 无可执行变更)** +
   **chaos seed 603(split/merge reopens 驱动 recover_partition)Split+Merge OK all OK**。
-观察:sst_max_seq 还在 lib.rs:5331/5386 两处**别的函数** doc 注释里(也略 stale,引用已废弃 dedup),本轮范围外没动。
-进度:12 轮全绿(R1-R12)。giant 函数分析:do_compact(R10 去重+R11 简化分支)、run_gc/process_gc_chunk(清晰)、
-  recover_partition part-1(R12 去 dead-code+合并注释)。
-Next(loop 续):⑬ 继续读 recover_partition 后半(replay loop ~7180-7560 + 收尾 ~7950)分析清晰度;coco+chaos 每轮。
+ROUND 13 COMMIT(待 push):recover_partition 逻辑分析收尾 + R12 一致性 follow-up。
+  ① 读完 replay loop 全段(7180-7548):intricate 但复杂度内在(CoW-dedup extent 选择 / committed-clamped
+  chunked-carry 读含 10-attempt 重试 / 跨副本 self_heal_replay_chunk / fence-bump 绕过 ts-dedup / VP 经
+  value_offset_in_record 重建 / corrupt-replica A5 隔离),注释足、无可安全简化的逻辑(R12 已是该函数唯一 wart)。
+  深嵌套用的是**有意 de-indent**(chunk loop body 与 `loop {` 同 12-space 缩进)——不值 220 行 whitespace churn。
+  ② 修 R12 残留的 2 处 stale doc 引用:lib.rs:5331(partition_loop FuturesOrdered 设计 doc)+ 5387 两处仍写
+  `if ts <= sst_max_seq { continue; }`(该变量 R12 已删,recovery 现为 per-source `extent_dedup`)→ 改成概念化措辞
+  "per-source dedup(skip a record whose seq is already covered by that source's SSTs)",对 rename 鲁棒。注释 only。
+  验证:build+clippy(23 warn 不变,均 pre-existing)+ **167/167 ps 单测** + **coco findbugs deep(GPT-5.5)未发现
+  (确认 5331/5387 注释文字调整,无可执行逻辑/状态机/并发/资源/错误处理变更)** + **chaos seed 603(58s,split/merge
+  reopen 驱动 recover_partition):writes acked=10737 reads ok=19391,per-key mismatch=0 not_found=0、range=0、
+  write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。net -4(5/-4)。
+观察:sst_max_seq 引用现已全清(recover_partition 本体 R12 删,两处别函数 doc R13 修)。**giant 函数分析战役完成**:
+  4 个用户点名函数(do_compact / run_gc / process_gc_chunk / recover_partition)全部读毕分析:do_compact R10 去重
+  chunk-emit + R11 简化 defer 分支;run_gc/process_gc_chunk 清晰(11 参数是真需要的 ctx+累加器,非 smell);
+  recover_partition R12 去 dead-code+合并 stale 注释 + R13 读完 replay loop 确认内在复杂、无further 简化 + 清 doc 引用。
+进度:13 轮全绿(R1-R13),均 push(R13 本轮 push)。chaos-validated crate(manager/stream/partition-server/client)
+  的干净 dedup + giant-函数分析目标已基本枯竭;后续轮若无新目标需用户重新定向(或转 fuse/ioring 非-chaos-validated 区,
+  但那违反"每轮 chaos"约束,需先扩 chaos 覆盖)。
+Next(loop 续):⑭ giant 函数战役已收;chaos-validated 区低风险目标渐尽。候选:(a) 报告战役完成、等用户定向新目标;
+  (b) 转其它大函数(partition_thread_main / build_append_future / handle_split_part 等热路径,reproduce-first 谨慎);
+  coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:

@@ -5328,8 +5328,9 @@ async fn partition_thread_main(
 ///   - **F210-C1: `FuturesOrdered` (was `FuturesUnordered`) — Phase 3
 ///     runs in launch order = seq order**, guaranteeing that a rotated
 ///     active memtable contains a contiguous seq range. This is what
-///     makes the recovery-time dedup `if ts <= sst_max_seq { continue; }`
-///     sound. Pre-F210-C1 `FuturesUnordered` allowed out-of-order
+///     makes the recovery-time per-source dedup (skip a record whose seq
+///     is already covered by that source's SSTs) sound. Pre-F210-C1
+///     `FuturesUnordered` allowed out-of-order
 ///     Phase 3, so an SST could have `last_seq = 200` while batch A's
 ///     seqs 1-100 were still in-flight; on crash before A's Phase 3,
 ///     replay's dedup silently dropped A. p99 trade-off: head-of-line
@@ -5383,8 +5384,8 @@ async fn partition_loop(
     // FuturesOrdered guarantees Phase 3 (memtable insert) runs in launch
     // order = seq order, so a rotated active memtable always contains a
     // contiguous seq range — the precondition that makes the
-    // recover_partition dedup (`if ts <= sst_max_seq { continue; }`)
-    // sound. See the doc comment above and feature_list.md F210-C1 for
+    // recover_partition per-source dedup (skip records already covered by a
+    // loaded SST) sound. See the doc comment above and feature_list.md F210-C1 for
     // the bug pre-F210-C1 enabled and the perf analysis. (Type: `InflightQueue`.)
     let mut inflight: InflightQueue = InflightQueue::new();
 
