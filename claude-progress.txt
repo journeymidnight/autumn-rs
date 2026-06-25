@@ -1,3 +1,30 @@
+Date: 2026-06-25 (review 战役 — autumn_client 第 2 个文件)
+TaskStatus: completed
+Task scope: 用户"Continue"——战役第 2 个低风险文件 autumn_client.rs(1401 LOC,数据面 CLI:KV ops+benchmark)。
+  完成:拆文件 + perf-check 抽函数 + coco 抓 10 bug 修清晰的 5 个。invariant 保持(0 mgr_call(MSG_)。
+COMMITS(均 push 前,4 个):
+  · 4bec788 拆分:autumn_client.rs → 目录 bin autumn_client/{args.rs(Command/Args/parse_args/warns), main.rs}。
+    val helper 类同 autumn_op。纯移动(git rename)。
+  · 338de4c perf-check 抽函数:~490 行 Command::PerfCheck arm → cmd_perf_check(client, 12 字段, manager);main() 730→241。
+    踩坑:① 插入 fn 要在 `#[compio::main]` 属性**之前**(否则属性脱离 main → async-main 报错);② 重命名 args.manager→manager
+    后 `Arc::new(manager.clone())` 是 Arc<&str> 逃逸到 'static 线程 → 改 manager.to_string()。
+  · 6107182 修 coco 的 5 个 bug:
+    #1(P1)perf-check Barrier 死锁:--ramp-ms 下 connect 失败的线程在 barrier 前 return → 连上的线程永等 + main join 卡死。
+       修:失败线程也 barrier.wait()(读写两阶段)。
+    #3(P2)parse_args flag 缺值 raw[i] 越界 panic(--manager/--transport/ls/perf-check 多处)→ val(raw,i) helper(同 autumn_op #9)。
+       踩坑:sed 漏了**多行** `var = raw[i]\n.parse()`(partitions/pipeline_depth/bulk)+ `raw[i]\n.parse()`(ucx-regpool)——
+       要补 `= raw[i]$` 和 `^\s*raw[i]$` 两个 sed;且 clippy 不刷新二进制,smoke 前必 cargo build。最终 16/16 缺值→usage,0 panic。
+    #2(P2)put-stream --chunk-size 0:loop 不前进(无限空 chunk)+ div_ceil(0) panic → bail + saturating_add。
+    #4(P2)progress 线程 loop{}+drop 不停 → 跨阶段串扰 → AtomicBool stop flag + join。
+    #6(P2)读把 Ok(None)(key 缺失)计成功 → 虚高吞吐+掩盖数据缺失,perf-check 失去 write+read sanity → 只数 Ok(Some(_))。
+  coco findbugs 复核本轮**卡死(~14min 0 输出,infra flake 非 finding)**——杀掉;5 修 build+clippy+#3 smoke 独立验证过,故 commit。
+BACKLOG(autumn_client niche,记录):#5 bulk+direct-read 忽略 direct_read;#7 bulk 部分失败用连续序号重放读错 key(叠加 #6);
+  #8 zc-get 按服务端长度无上限分配易 OOM;#9 total_ops*value_size 无 checked_mul;#10 put/del 跳过 `-` 前缀 key。
+Next steps(用户定夺):① autumn_client niche(#5/#7 是 benchmark 正确性,可一起修);② 进下一个文件
+  (manager 控制面 lib.rs/rpc_handlers.rs 低风险,或热路径巨文件 partition-server/lib.rs、extent_node.rs)。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-25 (代码 review/refactor 战役 — 启动 + autumn_op pilot)
 TaskStatus: completed
 Task scope: 用户"和 coco 合作,通读代码 refactor 必要代码,简化,拆分文件/函数;准备花 2 周 review 所有代码"。
