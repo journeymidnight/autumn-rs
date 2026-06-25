@@ -88,6 +88,11 @@ holds `Args` / `Command` + the hand-rolled `parse()` and its value-parse helpers
 `derive_control_address`) + their unit tests. `usage()` / `parse_admin_flags` /
 `parse_byte_size` / `parse_ec_flag` are private to `args.rs`; the rest is
 `pub(crate)`. Cargo target: `path = "src/bin/autumn_op/main.rs"`.
+`run()` is a thin dispatcher: each command arm calls a `cmd_*(client, json, …)`
+free fn (the read/observability family — `cmd_cluster_version` / `cmd_list_nodes`
+/ `cmd_df` / `cmd_extent_health` / `cmd_list_ec_markers` / `cmd_recovery_stats`
+/ `cmd_audit_log` / `cmd_policy_candidates` — extracted 2026-06-25; the
+admin/mutation arms + `run_bootstrap` / `run_info` remain inline / are next).
 
 F211-G + F213 admin / observability CLI. The canonical interface to the manager control plane. The Python policy script (`python/node_policy.py`) shells out to this binary for all RPC traffic — autumn-op is its rkyv codec.
 

@@ -290,48 +290,7 @@ async fn run(args: Args) -> Result<()> {
     let client = ClusterClient::connect(&args.manager).await?;
     match args.cmd {
         // ---------------- F211 read ----------------
-        Command::ClusterVersion => {
-            let bytes = client
-                .mgr_call(
-                    MSG_GET_CLUSTER_VERSION,
-                    rkyv_encode(&GetClusterVersionReq {}),
-                )
-                .await?;
-            let resp: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("cluster-version: {}", resp.message);
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "cluster_version": resp.cluster_version,
-                        "manager_wire_version_min": resp.wire_version_min,
-                        "manager_wire_version_max": resp.wire_version_max,
-                        "op_wire_version_min": autumn_rpc::WIRE_VERSION_MIN,
-                        "op_wire_version_max": autumn_rpc::WIRE_VERSION_MAX,
-                    }))?
-                );
-            } else {
-                println!("cluster_version: {}", resp.cluster_version);
-                println!(
-                    "manager wire interval: [{}, {}]",
-                    resp.wire_version_min, resp.wire_version_max
-                );
-                println!(
-                    "this autumn-op binary:  [{}, {}]",
-                    autumn_rpc::WIRE_VERSION_MIN,
-                    autumn_rpc::WIRE_VERSION_MAX
-                );
-                if resp.cluster_version < resp.wire_version_max {
-                    println!(
-                        "NOTE: manager binaries support up to v{} — `upgrade-version` can bump \
-once EVERY member runs the new binary",
-                        resp.wire_version_max
-                    );
-                }
-            }
-        }
+        Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
         Command::UpgradeVersion { to } => {
             // Resolve the default target (current+1) from a fresh read so
             // the printed intent matches what the manager will validate.
@@ -376,423 +335,12 @@ longer safe (new formats may now be emitted/persisted)",
                 );
             }
         }
-        Command::ListNodes => {
-            let bytes = client
-                .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
-                .await?;
-            let resp: ListNodeStatesResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("list-nodes: {}", resp.message);
-            }
-            if args.json {
-                let out: Vec<JsonNode> = resp
-                    .nodes
-                    .into_iter()
-                    .map(|n| JsonNode {
-                        node_id: n.node_id,
-                        address: n.address,
-                        auto_state: auto_state_str(n.auto_state).to_string(),
-                        last_heartbeat_secs_ago: n.last_heartbeat_secs_ago,
-                        suspected_age_secs: n.suspected_age_secs,
-                        override_kind: override_str(n.override_kind).to_string(),
-                        override_reason: n.override_reason,
-                        override_set_by: n.override_set_by,
-                        override_set_at: n.override_set_at,
-                        override_expire_at: n.override_expire_at,
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                println!(
-                    "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} REASON",
-                    "ID", "ADDRESS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
-                );
-                for n in resp.nodes {
-                    let hb = if n.last_heartbeat_secs_ago == u64::MAX {
-                        "never".to_string()
-                    } else {
-                        format!("{}s", n.last_heartbeat_secs_ago)
-                    };
-                    println!(
-                        "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} {}",
-                        n.node_id,
-                        n.address,
-                        auto_state_str(n.auto_state),
-                        hb,
-                        n.suspected_age_secs,
-                        override_str(n.override_kind),
-                        n.override_reason,
-                    );
-                }
-            }
-        }
-        Command::Df => {
-            let r = client.cluster_df().await?;
-            let raw_used = r.raw_total.saturating_sub(r.raw_free);
-            // Empirical amplification (physical_used / logical_stored): the
-            // REAL current cold/hot mix, more useful than the theoretical
-            // [1.25, 3] bound. n/a when nothing is stored yet.
-            let amp = if r.logical_stored > 0 {
-                r.physical_used as f64 / r.logical_stored as f64
-            } else {
-                0.0
-            };
-            // Writable logical estimate is a RANGE under EC: best EC shape is
-            // K = min(4, node_count-1) data shards + 1 parity → factor
-            // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
-            // amplification (falls back to the conservative /3).
-            let k = if r.node_count >= 2 {
-                (r.node_count - 1).min(4)
-            } else {
-                0
-            };
-            let best_factor = if k >= 1 {
-                (k as f64 + 1.0) / k as f64
-            } else {
-                3.0
-            };
-            let writable_low = r.raw_free / 3; // conservative: 3-replica
-            let writable_high = (r.raw_free as f64 / best_factor) as u64;
-            let writable_est = if amp > 0.0 {
-                (r.raw_free as f64 / amp) as u64
-            } else {
-                writable_low
-            };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
-            let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
-
-            if args.json {
-                let per_node: Vec<serde_json::Value> = r
-                    .per_node
-                    .iter()
-                    .map(|n| {
-                        serde_json::json!({
-                            "node_id": n.node_id,
-                            "total": n.total,
-                            "free": n.free,
-                            "extent_bytes": n.extent_bytes,
-                            "online": n.online,
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "raw_total": r.raw_total,
-                        "raw_used": raw_used,
-                        "raw_free": r.raw_free,
-                        "physical_used": r.physical_used,
-                        "logical_stored_sealed": r.logical_stored,
-                        "amplification": amp,
-                        "writable_est": writable_est,
-                        "writable_low_3x": writable_low,
-                        "writable_high_ec": writable_high,
-                        "best_ec_data_shards": k,
-                        "node_count_online": r.node_count,
-                        "snapshot_age_secs": snap_age,
-                        "logical_scan_age_secs": logical_age,
-                        "per_node": per_node,
-                    }))?
-                );
-            } else {
-                let amp_str = if amp > 0.0 {
-                    format!("{amp:.2}x")
-                } else {
-                    "n/a".to_string()
-                };
-                println!("=== Cluster df ===");
-                println!(
-                    "RAW:     total={:<10} used={:<10} avail={}",
-                    human_size(r.raw_total),
-                    human_size(raw_used),
-                    human_size(r.raw_free),
-                );
-                println!(
-                    "AUTUMN:  phys_used={:<10} stored(sealed)={:<10} amplification={}",
-                    human_size(r.physical_used),
-                    human_size(r.logical_stored),
-                    amp_str,
-                );
-                println!(
-                    "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",
-                    human_size(writable_est),
-                    human_size(writable_low),
-                    human_size(writable_high),
-                    k,
-                );
-                println!(
-                    "NODES: {} online   (snapshot {}s ago; logical scan {}s ago)",
-                    r.node_count, snap_age, logical_age,
-                );
-                println!(
-                    "  {:<6} {:<10} {:<10} {:<10} ONLINE",
-                    "ID", "TOTAL", "FREE", "PHYS_USED"
-                );
-                for n in &r.per_node {
-                    println!(
-                        "  {:<6} {:<10} {:<10} {:<10} {}",
-                        n.node_id,
-                        human_size(n.total),
-                        human_size(n.free),
-                        human_size(n.extent_bytes),
-                        if n.online { "yes" } else { "no" },
-                    );
-                }
-            }
-        }
-        Command::ExtentHealth {
-            node_filter,
-            include_healthy,
-        } => {
-            let req = ExtentHealthReq {
-                node_id_filter: node_filter,
-                include_healthy,
-            };
-            let bytes = client
-                .mgr_call(MSG_EXTENT_HEALTH_REPORT, rkyv_encode(&req))
-                .await?;
-            let resp: ExtentHealthResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("extent-health: {}", resp.message);
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &resp
-                            .extents
-                            .into_iter()
-                            .map(|e| {
-                                serde_json::json!({
-                                    "extent_id": e.extent_id,
-                                    "eversion": e.eversion,
-                                    "sealed_length": e.sealed_length,
-                                    "ec_converted": e.ec_converted,
-                                    "unhealthy": e.unhealthy,
-                                    "slots": e.slots.into_iter().map(|s| serde_json::json!({
-                                        "slot": s.slot_index,
-                                        "node_id": s.node_id,
-                                        "avali": s.avali,
-                                        "auto_state": auto_state_str(s.auto_state),
-                                        "override": override_str(s.override_kind),
-                                    })).collect::<Vec<_>>(),
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    )?
-                );
-            } else {
-                if resp.extents.is_empty() {
-                    println!("(no extents match filter)");
-                }
-                for e in resp.extents {
-                    println!(
-                        "extent {}  eversion={} sealed={} ec={} unhealthy={}",
-                        e.extent_id, e.eversion, e.sealed_length, e.ec_converted, e.unhealthy
-                    );
-                    for s in e.slots {
-                        println!(
-                            "  slot[{}] node={:<4} avali={:<5} auto={} override={}",
-                            s.slot_index,
-                            s.node_id,
-                            s.avali,
-                            auto_state_str(s.auto_state),
-                            override_str(s.override_kind),
-                        );
-                    }
-                }
-            }
-        }
-        Command::ListEcMarkers => {
-            let bytes = client
-                .mgr_call(
-                    MSG_LIST_EC_INFLIGHT_MARKERS,
-                    rkyv_encode(&ListEcInflightMarkersReq {}),
-                )
-                .await?;
-            let resp: ListEcInflightMarkersResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("list-ec-markers: {}", resp.message);
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &resp
-                            .markers
-                            .into_iter()
-                            .map(|m| {
-                                serde_json::json!({
-                                    "extent_id": m.extent_id,
-                                    "coord_node_id": m.coord_node_id,
-                                    "coord_auto_state": auto_state_str(m.coord_auto_state),
-                                    "coord_override": override_str(m.coord_override_kind),
-                                    "target_nodes": m.target_nodes,
-                                    "data_shards": m.data_shards,
-                                    "new_eversion": m.new_eversion,
-                                    "started_at": m.started_at,
-                                    "age_secs": m.age_secs,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    )?
-                );
-            } else {
-                if resp.markers.is_empty() {
-                    println!("(no inflight EC markers)");
-                }
-                for m in resp.markers {
-                    println!(
-                        "ext={} coord={} ({}/{}) targets={:?} K={} new_ev={} age={}s",
-                        m.extent_id,
-                        m.coord_node_id,
-                        auto_state_str(m.coord_auto_state),
-                        override_str(m.coord_override_kind),
-                        m.target_nodes,
-                        m.data_shards,
-                        m.new_eversion,
-                        m.age_secs,
-                    );
-                }
-            }
-        }
-        Command::RecoveryStats => {
-            let bytes = client
-                .mgr_call(MSG_RECOVERY_STATS, rkyv_encode(&RecoveryStatsReq {}))
-                .await?;
-            let resp: RecoveryStatsResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("recovery-stats: {}", resp.message);
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "global_inflight": resp.global_inflight,
-                        "max_global": resp.max_global,
-                        "max_per_source": resp.max_per_source,
-                        "max_per_target": resp.max_per_target,
-                        "per_source": resp.per_source,
-                        "per_target": resp.per_target,
-                        "backoff_entries": resp.backoff_entries,
-                        "backoff": resp.backoff.iter().map(|b| serde_json::json!({
-                            "extent_id": b.extent_id,
-                            "slot": b.slot,
-                            "consecutive_failures": b.consecutive_failures,
-                            "last_attempt_at": b.last_attempt_at,
-                            "next_retry_at": b.next_retry_at,
-                            "reason": b.reason,
-                        })).collect::<Vec<_>>(),
-                    }))?
-                );
-            } else {
-                println!(
-                    "global: {}/{}  per_source<={}  per_target<={}  backoff_entries={}",
-                    resp.global_inflight,
-                    resp.max_global,
-                    resp.max_per_source,
-                    resp.max_per_target,
-                    resp.backoff_entries,
-                );
-                if !resp.per_source.is_empty() {
-                    println!("per-source:");
-                    for (id, c) in resp.per_source {
-                        println!("  node {:<4} {}", id, c);
-                    }
-                }
-                if !resp.per_target.is_empty() {
-                    println!("per-target:");
-                    for (id, c) in resp.per_target {
-                        println!("  node {:<4} {}", id, c);
-                    }
-                }
-                if !resp.backoff.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    println!("backoff:");
-                    println!(
-                        "  {:<10} {:<4} {:<6} {:<10} reason",
-                        "extent", "slot", "fails", "retry_in"
-                    );
-                    for b in &resp.backoff {
-                        let retry_in = b.next_retry_at - now;
-                        let retry_str = if retry_in <= 0 {
-                            "now".to_string()
-                        } else {
-                            format!("{retry_in}s")
-                        };
-                        println!(
-                            "  {:<10} {:<4} {:<6} {:<10} {}",
-                            b.extent_id, b.slot, b.consecutive_failures, retry_str, b.reason
-                        );
-                    }
-                }
-            }
-        }
-        Command::AuditLog {
-            op,
-            node_id,
-            since,
-            until,
-            limit,
-        } => {
-            let req = QueryAuditLogReq {
-                op_filter: op,
-                node_id_filter: node_id,
-                since_ts_s: since,
-                until_ts_s: until,
-                limit,
-            };
-            let bytes = client
-                .mgr_call(MSG_QUERY_AUDIT_LOG, rkyv_encode(&req))
-                .await?;
-            let resp: QueryAuditLogResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!("audit-log: {}", resp.message);
-            }
-            if args.json {
-                let out: Vec<JsonAudit> = resp
-                    .entries
-                    .into_iter()
-                    .map(|e| JsonAudit {
-                        op: op_name(e.op).to_string(),
-                        node_id: e.node_id,
-                        extent_id: e.extent_id,
-                        by: e.by,
-                        reason: e.reason,
-                        result_code: e.result_code,
-                        result_message: e.result_message,
-                        ts_ns: e.ts_ns,
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                if resp.entries.is_empty() {
-                    println!("(no audit entries match filter)");
-                }
-                for e in resp.entries {
-                    println!(
-                        "{}  op={:<22} node={:<4} ext={:<8} by={:<12} code={} reason={}",
-                        e.ts_ns,
-                        op_name(e.op),
-                        e.node_id,
-                        e.extent_id,
-                        e.by,
-                        e.result_code,
-                        e.reason,
-                    );
-                    if !e.result_message.is_empty() {
-                        println!("    => {}", e.result_message);
-                    }
-                }
-            }
-        }
+        Command::ListNodes => cmd_list_nodes(&client, args.json).await?,
+        Command::Df => cmd_df(&client, args.json).await?,
+        Command::ExtentHealth { node_filter, include_healthy } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
+        Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
+        Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
+        Command::AuditLog { op, node_id, since, until, limit } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
         // ---------------- F211 admin ----------------
         Command::Fence {
             node_id,
@@ -884,84 +432,7 @@ longer safe (new formats may now be emitted/persisted)",
             }
         }
         // ---------------- F213 read ----------------
-        Command::PolicyCandidates => {
-            let cands = client
-                .policy_candidates()
-                .await
-                .map_err(|e| anyhow!("policy_candidates: {e}"))?;
-            if args.json {
-                let out: Vec<_> = cands
-                    .iter()
-                    .map(|c| {
-                        let kind = match c.kind {
-                            POLICY_KIND_SPLIT => "split",
-                            POLICY_KIND_MERGE => "merge",
-                            POLICY_KIND_GC => "gc",
-                            POLICY_KIND_MAJOR_COMPACT => "major",
-                            POLICY_KIND_HOT_COLD => "hotcold",
-                            POLICY_KIND_MINOR_COMPACT => "minor",
-                            POLICY_KIND_EC => "ec",
-                            _ => "?",
-                        };
-                        serde_json::json!({
-                            "kind": kind,
-                            "primary_part_id": c.primary_part_id,
-                            "secondary_part_id": c.secondary_part_id,
-                            "reason": c.reason,
-                            "size_bytes": c.size_bytes,
-                            "req_per_sec": c.req_per_sec,
-                            "imm_full_per_sec": c.imm_full_per_sec,
-                            "same_ps": c.same_ps,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else if cands.is_empty() {
-                println!("(no candidates)");
-            } else {
-                println!(
-                    "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
-                    "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
-                );
-                for c in cands {
-                    let kind = match c.kind {
-                        POLICY_KIND_SPLIT => "split",
-                        POLICY_KIND_MERGE => "merge",
-                        POLICY_KIND_GC => "gc",
-                        POLICY_KIND_MAJOR_COMPACT => "major",
-                        POLICY_KIND_HOT_COLD => "hotcold",
-                        POLICY_KIND_MINOR_COMPACT => "minor",
-                        POLICY_KIND_EC => "ec",
-                        _ => "?",
-                    };
-                    let feas = match c.kind {
-                        POLICY_KIND_GC
-                        | POLICY_KIND_MAJOR_COMPACT
-                        | POLICY_KIND_MINOR_COMPACT
-                        | POLICY_KIND_EC
-                        | POLICY_KIND_HOT_COLD => "n/a",
-                        _ if c.same_ps => "yes",
-                        _ => "no",
-                    };
-                    let secondary = if c.secondary_part_id == 0 {
-                        "-".to_string()
-                    } else {
-                        c.secondary_part_id.to_string()
-                    };
-                    println!(
-                        "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
-                        kind,
-                        c.primary_part_id,
-                        secondary,
-                        c.reason,
-                        format!("{} MB", c.size_bytes / (1024 * 1024)),
-                        c.req_per_sec,
-                        c.imm_full_per_sec,
-                        feas,
-                    );
-                }
-            }
-        }
+        Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
         Command::Info { part, detail } => {
             run_info(&client, args.json, part, detail).await?;
         }
@@ -1331,6 +802,550 @@ longer safe (new formats may now be emitted/persisted)",
         }
     }
     let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+async fn cmd_cluster_version(client: &ClusterClient, json: bool) -> Result<()> {
+                let bytes = client
+                    .mgr_call(
+                        MSG_GET_CLUSTER_VERSION,
+                        rkyv_encode(&GetClusterVersionReq {}),
+                    )
+                    .await?;
+                let resp: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+                if resp.code != CODE_OK {
+                    bail!("cluster-version: {}", resp.message);
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "cluster_version": resp.cluster_version,
+                            "manager_wire_version_min": resp.wire_version_min,
+                            "manager_wire_version_max": resp.wire_version_max,
+                            "op_wire_version_min": autumn_rpc::WIRE_VERSION_MIN,
+                            "op_wire_version_max": autumn_rpc::WIRE_VERSION_MAX,
+                        }))?
+                    );
+                } else {
+                    println!("cluster_version: {}", resp.cluster_version);
+                    println!(
+                        "manager wire interval: [{}, {}]",
+                        resp.wire_version_min, resp.wire_version_max
+                    );
+                    println!(
+                        "this autumn-op binary:  [{}, {}]",
+                        autumn_rpc::WIRE_VERSION_MIN,
+                        autumn_rpc::WIRE_VERSION_MAX
+                    );
+                    if resp.cluster_version < resp.wire_version_max {
+                        println!(
+                            "NOTE: manager binaries support up to v{} — `upgrade-version` can bump \
+    once EVERY member runs the new binary",
+                            resp.wire_version_max
+                        );
+                    }
+                }
+    Ok(())
+}
+
+async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+        .await?;
+    let resp: ListNodeStatesResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("list-nodes: {}", resp.message);
+    }
+    if json {
+        let out: Vec<JsonNode> = resp
+            .nodes
+            .into_iter()
+            .map(|n| JsonNode {
+                node_id: n.node_id,
+                address: n.address,
+                auto_state: auto_state_str(n.auto_state).to_string(),
+                last_heartbeat_secs_ago: n.last_heartbeat_secs_ago,
+                suspected_age_secs: n.suspected_age_secs,
+                override_kind: override_str(n.override_kind).to_string(),
+                override_reason: n.override_reason,
+                override_set_by: n.override_set_by,
+                override_set_at: n.override_set_at,
+                override_expire_at: n.override_expire_at,
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} REASON",
+            "ID", "ADDRESS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
+        );
+        for n in resp.nodes {
+            let hb = if n.last_heartbeat_secs_ago == u64::MAX {
+                "never".to_string()
+            } else {
+                format!("{}s", n.last_heartbeat_secs_ago)
+            };
+            println!(
+                "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} {}",
+                n.node_id,
+                n.address,
+                auto_state_str(n.auto_state),
+                hb,
+                n.suspected_age_secs,
+                override_str(n.override_kind),
+                n.override_reason,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
+    let r = client.cluster_df().await?;
+    let raw_used = r.raw_total.saturating_sub(r.raw_free);
+    // Empirical amplification (physical_used / logical_stored): the
+    // REAL current cold/hot mix, more useful than the theoretical
+    // [1.25, 3] bound. n/a when nothing is stored yet.
+    let amp = if r.logical_stored > 0 {
+        r.physical_used as f64 / r.logical_stored as f64
+    } else {
+        0.0
+    };
+    // Writable logical estimate is a RANGE under EC: best EC shape is
+    // K = min(4, node_count-1) data shards + 1 parity → factor
+    // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
+    // amplification (falls back to the conservative /3).
+    let k = if r.node_count >= 2 {
+        (r.node_count - 1).min(4)
+    } else {
+        0
+    };
+    let best_factor = if k >= 1 {
+        (k as f64 + 1.0) / k as f64
+    } else {
+        3.0
+    };
+    let writable_low = r.raw_free / 3; // conservative: 3-replica
+    let writable_high = (r.raw_free as f64 / best_factor) as u64;
+    let writable_est = if amp > 0.0 {
+        (r.raw_free as f64 / amp) as u64
+    } else {
+        writable_low
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
+    let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
+
+    if json {
+        let per_node: Vec<serde_json::Value> = r
+            .per_node
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "node_id": n.node_id,
+                    "total": n.total,
+                    "free": n.free,
+                    "extent_bytes": n.extent_bytes,
+                    "online": n.online,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "raw_total": r.raw_total,
+                "raw_used": raw_used,
+                "raw_free": r.raw_free,
+                "physical_used": r.physical_used,
+                "logical_stored_sealed": r.logical_stored,
+                "amplification": amp,
+                "writable_est": writable_est,
+                "writable_low_3x": writable_low,
+                "writable_high_ec": writable_high,
+                "best_ec_data_shards": k,
+                "node_count_online": r.node_count,
+                "snapshot_age_secs": snap_age,
+                "logical_scan_age_secs": logical_age,
+                "per_node": per_node,
+            }))?
+        );
+    } else {
+        let amp_str = if amp > 0.0 {
+            format!("{amp:.2}x")
+        } else {
+            "n/a".to_string()
+        };
+        println!("=== Cluster df ===");
+        println!(
+            "RAW:     total={:<10} used={:<10} avail={}",
+            human_size(r.raw_total),
+            human_size(raw_used),
+            human_size(r.raw_free),
+        );
+        println!(
+            "AUTUMN:  phys_used={:<10} stored(sealed)={:<10} amplification={}",
+            human_size(r.physical_used),
+            human_size(r.logical_stored),
+            amp_str,
+        );
+        println!(
+            "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",
+            human_size(writable_est),
+            human_size(writable_low),
+            human_size(writable_high),
+            k,
+        );
+        println!(
+            "NODES: {} online   (snapshot {}s ago; logical scan {}s ago)",
+            r.node_count, snap_age, logical_age,
+        );
+        println!(
+            "  {:<6} {:<10} {:<10} {:<10} ONLINE",
+            "ID", "TOTAL", "FREE", "PHYS_USED"
+        );
+        for n in &r.per_node {
+            println!(
+                "  {:<6} {:<10} {:<10} {:<10} {}",
+                n.node_id,
+                human_size(n.total),
+                human_size(n.free),
+                human_size(n.extent_bytes),
+                if n.online { "yes" } else { "no" },
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_extent_health(client: &ClusterClient, json: bool, node_filter: Vec<u64>, include_healthy: bool) -> Result<()> {
+    let req = ExtentHealthReq {
+        node_id_filter: node_filter,
+        include_healthy,
+    };
+    let bytes = client
+        .mgr_call(MSG_EXTENT_HEALTH_REPORT, rkyv_encode(&req))
+        .await?;
+    let resp: ExtentHealthResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("extent-health: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &resp
+                    .extents
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "extent_id": e.extent_id,
+                            "eversion": e.eversion,
+                            "sealed_length": e.sealed_length,
+                            "ec_converted": e.ec_converted,
+                            "unhealthy": e.unhealthy,
+                            "slots": e.slots.into_iter().map(|s| serde_json::json!({
+                                "slot": s.slot_index,
+                                "node_id": s.node_id,
+                                "avali": s.avali,
+                                "auto_state": auto_state_str(s.auto_state),
+                                "override": override_str(s.override_kind),
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )?
+        );
+    } else {
+        if resp.extents.is_empty() {
+            println!("(no extents match filter)");
+        }
+        for e in resp.extents {
+            println!(
+                "extent {}  eversion={} sealed={} ec={} unhealthy={}",
+                e.extent_id, e.eversion, e.sealed_length, e.ec_converted, e.unhealthy
+            );
+            for s in e.slots {
+                println!(
+                    "  slot[{}] node={:<4} avali={:<5} auto={} override={}",
+                    s.slot_index,
+                    s.node_id,
+                    s.avali,
+                    auto_state_str(s.auto_state),
+                    override_str(s.override_kind),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_list_ec_markers(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(
+            MSG_LIST_EC_INFLIGHT_MARKERS,
+            rkyv_encode(&ListEcInflightMarkersReq {}),
+        )
+        .await?;
+    let resp: ListEcInflightMarkersResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("list-ec-markers: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &resp
+                    .markers
+                    .into_iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "extent_id": m.extent_id,
+                            "coord_node_id": m.coord_node_id,
+                            "coord_auto_state": auto_state_str(m.coord_auto_state),
+                            "coord_override": override_str(m.coord_override_kind),
+                            "target_nodes": m.target_nodes,
+                            "data_shards": m.data_shards,
+                            "new_eversion": m.new_eversion,
+                            "started_at": m.started_at,
+                            "age_secs": m.age_secs,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )?
+        );
+    } else {
+        if resp.markers.is_empty() {
+            println!("(no inflight EC markers)");
+        }
+        for m in resp.markers {
+            println!(
+                "ext={} coord={} ({}/{}) targets={:?} K={} new_ev={} age={}s",
+                m.extent_id,
+                m.coord_node_id,
+                auto_state_str(m.coord_auto_state),
+                override_str(m.coord_override_kind),
+                m.target_nodes,
+                m.data_shards,
+                m.new_eversion,
+                m.age_secs,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_recovery_stats(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_RECOVERY_STATS, rkyv_encode(&RecoveryStatsReq {}))
+        .await?;
+    let resp: RecoveryStatsResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("recovery-stats: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "global_inflight": resp.global_inflight,
+                "max_global": resp.max_global,
+                "max_per_source": resp.max_per_source,
+                "max_per_target": resp.max_per_target,
+                "per_source": resp.per_source,
+                "per_target": resp.per_target,
+                "backoff_entries": resp.backoff_entries,
+                "backoff": resp.backoff.iter().map(|b| serde_json::json!({
+                    "extent_id": b.extent_id,
+                    "slot": b.slot,
+                    "consecutive_failures": b.consecutive_failures,
+                    "last_attempt_at": b.last_attempt_at,
+                    "next_retry_at": b.next_retry_at,
+                    "reason": b.reason,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "global: {}/{}  per_source<={}  per_target<={}  backoff_entries={}",
+            resp.global_inflight,
+            resp.max_global,
+            resp.max_per_source,
+            resp.max_per_target,
+            resp.backoff_entries,
+        );
+        if !resp.per_source.is_empty() {
+            println!("per-source:");
+            for (id, c) in resp.per_source {
+                println!("  node {:<4} {}", id, c);
+            }
+        }
+        if !resp.per_target.is_empty() {
+            println!("per-target:");
+            for (id, c) in resp.per_target {
+                println!("  node {:<4} {}", id, c);
+            }
+        }
+        if !resp.backoff.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            println!("backoff:");
+            println!(
+                "  {:<10} {:<4} {:<6} {:<10} reason",
+                "extent", "slot", "fails", "retry_in"
+            );
+            for b in &resp.backoff {
+                let retry_in = b.next_retry_at - now;
+                let retry_str = if retry_in <= 0 {
+                    "now".to_string()
+                } else {
+                    format!("{retry_in}s")
+                };
+                println!(
+                    "  {:<10} {:<4} {:<6} {:<10} {}",
+                    b.extent_id, b.slot, b.consecutive_failures, retry_str, b.reason
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_audit_log(client: &ClusterClient, json: bool, op: u8, node_id: u64, since: i64, until: i64, limit: u32) -> Result<()> {
+    let req = QueryAuditLogReq {
+        op_filter: op,
+        node_id_filter: node_id,
+        since_ts_s: since,
+        until_ts_s: until,
+        limit,
+    };
+    let bytes = client
+        .mgr_call(MSG_QUERY_AUDIT_LOG, rkyv_encode(&req))
+        .await?;
+    let resp: QueryAuditLogResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("audit-log: {}", resp.message);
+    }
+    if json {
+        let out: Vec<JsonAudit> = resp
+            .entries
+            .into_iter()
+            .map(|e| JsonAudit {
+                op: op_name(e.op).to_string(),
+                node_id: e.node_id,
+                extent_id: e.extent_id,
+                by: e.by,
+                reason: e.reason,
+                result_code: e.result_code,
+                result_message: e.result_message,
+                ts_ns: e.ts_ns,
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        if resp.entries.is_empty() {
+            println!("(no audit entries match filter)");
+        }
+        for e in resp.entries {
+            println!(
+                "{}  op={:<22} node={:<4} ext={:<8} by={:<12} code={} reason={}",
+                e.ts_ns,
+                op_name(e.op),
+                e.node_id,
+                e.extent_id,
+                e.by,
+                e.result_code,
+                e.reason,
+            );
+            if !e.result_message.is_empty() {
+                println!("    => {}", e.result_message);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()> {
+    let cands = client
+        .policy_candidates()
+        .await
+        .map_err(|e| anyhow!("policy_candidates: {e}"))?;
+    if json {
+        let out: Vec<_> = cands
+            .iter()
+            .map(|c| {
+                let kind = match c.kind {
+                    POLICY_KIND_SPLIT => "split",
+                    POLICY_KIND_MERGE => "merge",
+                    POLICY_KIND_GC => "gc",
+                    POLICY_KIND_MAJOR_COMPACT => "major",
+                    POLICY_KIND_HOT_COLD => "hotcold",
+                    POLICY_KIND_MINOR_COMPACT => "minor",
+                    POLICY_KIND_EC => "ec",
+                    _ => "?",
+                };
+                serde_json::json!({
+                    "kind": kind,
+                    "primary_part_id": c.primary_part_id,
+                    "secondary_part_id": c.secondary_part_id,
+                    "reason": c.reason,
+                    "size_bytes": c.size_bytes,
+                    "req_per_sec": c.req_per_sec,
+                    "imm_full_per_sec": c.imm_full_per_sec,
+                    "same_ps": c.same_ps,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if cands.is_empty() {
+        println!("(no candidates)");
+    } else {
+        println!(
+            "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+            "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
+        );
+        for c in cands {
+            let kind = match c.kind {
+                POLICY_KIND_SPLIT => "split",
+                POLICY_KIND_MERGE => "merge",
+                POLICY_KIND_GC => "gc",
+                POLICY_KIND_MAJOR_COMPACT => "major",
+                POLICY_KIND_HOT_COLD => "hotcold",
+                POLICY_KIND_MINOR_COMPACT => "minor",
+                POLICY_KIND_EC => "ec",
+                _ => "?",
+            };
+            let feas = match c.kind {
+                POLICY_KIND_GC
+                | POLICY_KIND_MAJOR_COMPACT
+                | POLICY_KIND_MINOR_COMPACT
+                | POLICY_KIND_EC
+                | POLICY_KIND_HOT_COLD => "n/a",
+                _ if c.same_ps => "yes",
+                _ => "no",
+            };
+            let secondary = if c.secondary_part_id == 0 {
+                "-".to_string()
+            } else {
+                c.secondary_part_id.to_string()
+            };
+            println!(
+                "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                kind,
+                c.primary_part_id,
+                secondary,
+                c.reason,
+                format!("{} MB", c.size_bytes / (1024 * 1024)),
+                c.req_per_sec,
+                c.imm_full_per_sec,
+                feas,
+            );
+        }
+    }
     Ok(())
 }
 
