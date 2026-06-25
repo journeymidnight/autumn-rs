@@ -258,10 +258,7 @@ impl AutumnManager {
     // ── RPC handlers ───────────────────────────────────────────────────
 
     async fn handle_status(&self) -> HandlerResult {
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     /// F214-A: read-only cluster identity. Servable from any replica
@@ -1482,6 +1479,15 @@ impl AutumnManager {
         }))
     }
 
+    /// Build a generic `CodeResp { code, message }` reply — the manager's most
+    /// common response shape. Every handler that returns only a status + message
+    /// (success, not-found, precondition, leader/owner/routable rejects) goes
+    /// through here instead of repeating the `Ok(rkyv_encode(&CodeResp { .. }))`
+    /// boilerplate.
+    fn code_resp(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&CodeResp { code, message }))
+    }
+
     /// Build a `StreamAllocExtentResp` rejection (no stream/extent payload).
     /// Every guard in `handle_stream_alloc_extent` (leader / owner-epoch /
     /// not-found / in-flight / seal-probe / membership-CAS / mirror) returns one
@@ -2382,10 +2388,7 @@ impl AutumnManager {
 
     pub(crate) async fn handle_multi_modify_split(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
 
         let req: MultiModifySplitReq =
@@ -2401,13 +2404,13 @@ impl AutumnManager {
         let _split_guard = {
             let mut inflight = self.split_inflight.borrow_mut();
             if inflight.contains(&req.part_id) {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return Self::code_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "split already in progress for partition {}; retry later",
                         req.part_id
                     ),
-                }));
+                );
             }
             inflight.insert(req.part_id);
             SplitInflightGuard {
@@ -2558,13 +2561,13 @@ impl AutumnManager {
                 // we'd otherwise send is computed from a stale base — refuse
                 // before committing to etcd.
                 if let Some((eid, expected, live)) = self.first_eversion_drift(&pre_bump_eversion) {
-                    return Ok(rkyv_encode(&CodeResp {
-                        code: CODE_PRECONDITION,
-                        message: format!(
+                    return Self::code_resp(
+                        CODE_PRECONDITION,
+                        format!(
                             "extent {eid} eversion drift during split \
                              ({expected} -> {live}); retry split"
                         ),
-                    }));
+                    );
                 }
 
                 // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
@@ -2646,15 +2649,9 @@ impl AutumnManager {
                     self.last_op_at.borrow_mut().insert(right_id, now);
                 }
 
-                Ok(rkyv_encode(&CodeResp {
-                    code: CODE_OK,
-                    message: String::new(),
-                }))
+                Self::code_resp(CODE_OK, String::new())
             }
-            Err(err) => Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            })),
+            Err(err) => Self::code_resp(Self::err_to_code(&err), err.to_string()),
         }
     }
 
@@ -3418,10 +3415,7 @@ impl AutumnManager {
                 .push_with_cap_and_bucket(now, load, cap, bucket_sec);
         }
         drop(p);
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     /// F203: OP-driven per-extent EC convert trigger. Validates the
@@ -3838,18 +3832,12 @@ impl AutumnManager {
         // Fire-and-forget on the wire; reply is technically dropped
         // by the client but we still return a CODE_OK frame so the
         // RpcServer doesn't surface this as an error.
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
 
         let req: RegisterPsReq =
@@ -3864,15 +3852,9 @@ impl AutumnManager {
             .borrow_mut()
             .insert(ps_id, Instant::now());
         if let Err(err) = self.mirror_partition_snapshot().await {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     pub(crate) async fn handle_upsert_partition(&self, payload: Bytes) -> HandlerResult {
@@ -3982,10 +3964,7 @@ impl AutumnManager {
         // never approaches its exit budget while reassignment is
         // impossible anyway.
         if let Err(err) = self.ensure_routable() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
         let req: HeartbeatPsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -3997,17 +3976,11 @@ impl AutumnManager {
             self.ps_last_heartbeat
                 .borrow_mut()
                 .insert(req.ps_id, Instant::now());
-            Ok(rkyv_encode(&CodeResp {
-                code: CODE_OK,
-                message: String::new(),
-            }))
+            Self::code_resp(CODE_OK, String::new())
         } else {
             // Surface eviction so the PS can re-register instead of staying
             // invisible to clients (`ps=unknown` in `info` output).
-            Ok(rkyv_encode(&CodeResp {
-                code: CODE_NOT_FOUND,
-                message: format!("ps {} not registered", req.ps_id),
-            }))
+            Self::code_resp(CODE_NOT_FOUND, format!("ps {} not registered", req.ps_id))
         }
     }
 
@@ -4069,10 +4042,7 @@ impl AutumnManager {
         let mut s = self.store.inner.borrow_mut();
         let _ = req.ps_id; // reserved for future validation
         s.part_addrs.insert(req.part_id, req.address);
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     // ── F211-B / F211-C / F211-H / F211-I admin & health RPCs ──────────────
@@ -4291,10 +4261,7 @@ impl AutumnManager {
 
     pub async fn handle_fence_node(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
         let req: FenceNodeReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -4314,15 +4281,12 @@ impl AutumnManager {
             ts_ns: 0,
         })
         .await;
-        Ok(rkyv_encode(&CodeResp { code, message }))
+        Self::code_resp(code, message)
     }
 
     pub async fn handle_set_node_maintenance(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
         let req: SetNodeMaintenanceReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -4343,10 +4307,7 @@ impl AutumnManager {
                 ts_ns: 0,
             })
             .await;
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: msg,
-            }));
+            return Self::code_resp(CODE_PRECONDITION, msg);
         }
         let ovr = MgrNodeOverride {
             node_id: req.node_id,
@@ -4371,10 +4332,7 @@ impl AutumnManager {
                     ts_ns: 0,
                 })
                 .await;
-                return Ok(rkyv_encode(&CodeResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                }));
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
             }
         }
         self.node_overrides.borrow_mut().insert(req.node_id, ovr);
@@ -4389,18 +4347,12 @@ impl AutumnManager {
             ts_ns: 0,
         })
         .await;
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     pub async fn handle_clear_node_override(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
         let req: ClearNodeOverrideReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -4418,10 +4370,7 @@ impl AutumnManager {
                     ts_ns: 0,
                 })
                 .await;
-                return Ok(rkyv_encode(&CodeResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                }));
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
             }
         }
         self.node_overrides.borrow_mut().remove(&req.node_id);
@@ -4436,10 +4385,7 @@ impl AutumnManager {
             ts_ns: 0,
         })
         .await;
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        Self::code_resp(CODE_OK, String::new())
     }
 
     pub async fn handle_remove_node(&self, payload: Bytes) -> HandlerResult {

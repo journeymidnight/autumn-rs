@@ -145,7 +145,7 @@ ROUND 15 COMMIT(99dfdaf,已 push):大函数清晰度分析 ×3 + handle_append �
   (显式核对全 10 调用点 return 类型/错误码/offset-end 语义一致)** + **chaos seed 603(58s,kill+restart+commit-trunc
   nemesis 重压 handle_append 各 guard):writes acked=10635 reads ok=19594,mismatch=0 not_found=0、range=0、
   write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
-ROUND 16 COMMIT(待 push):大函数清晰度分析 ×4(清晰即不动)+ manager handle_stream_alloc_extent 拒绝 boilerplate 抽取。
+ROUND 16 COMMIT(88b3b93,已 push):大函数清晰度分析 ×4(清晰即不动)+ manager handle_stream_alloc_extent 拒绝 boilerplate 抽取。
   分析(均 intricate 但内在复杂、注释足、不动):① ps open_partition(215)= 线性 setup→spawn 线程→await ready→建
   handle;`*_for_thread` clone + 22-arg partition_thread_main 是搬状态进线程的固有形,非冗余。② stream
   stream_extent_from_sources(181)= SEED13 over-promised-seal 调和(err_count==0&&unverified==0 守卫),3 个
@@ -170,6 +170,32 @@ ROUND 16 COMMIT(待 push):大函数清晰度分析 ×4(清晰即不动)+ manager
 Next(loop 续):⑰ 剩余大函数多为 guard-heavy 控制面(handle_multi_modify_merge 388/split 276/force_ec_convert 278/
   merge_partitions 259/replay_from_etcd 344)——可继续 analyze + 仅抽 zero-risk 拒绝/构造 boilerplate;或报告战役完成、
   等用户定向(热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓)。coco+chaos 每轮不变。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 17 COMMIT(待 push):handle_multi_modify_split 清晰度分析(清晰即不动)+ **manager rpc_handlers.rs 全文件
+  CodeResp boilerplate 抽取(directive#1 大文件去冗余)**。
+  分析:handle_multi_modify_split(276)= 清晰 Phase1(闭包内 compute,零 store 改)/Phase2(单原子 etcd txn,含
+  partitions+regions+lastOp 防 orphan)/Phase3(apply),#6 split-inflight guard + F146 verify-BEFORE-mirror(first_
+  eversion_drift),注释足 → 不动。CodeResp 拒绝在此仅 5 处、稀疏、自解释,非单函数 obscuring。
+  动手:rpc_handlers.rs(5660 LOC,manager 最大文件)有 **24 处** `Ok(rkyv_encode(&CodeResp{code,message}))` 散落
+  全 ~15 handler——manager 最常见响应形,无 helper → 抽 `Self::code_resp(code,message)`(纯 rkyv 构造,同 R16
+  alloc_reject/R15 append_reject 家族)。**零语义风险**:只换响应构造尾,无逻辑改;rkyv 同结构=同字节。其它 Resp
+  类型(StreamAllocExtentResp/UpsertPartitionResp/GetRegionsResp/ReconcileExtentsResp)非 CodeResp,不动。
+  24 站点按 shape×缩进×return/`;` 分组:3 replace_all(OK-8tail×7 / ERR-12return×7 / ERR-16return×2 = 16)+
+  8 个别 edit(OK-16/OK-12 tail / match-arm Err / `{code,message}` 一行 / CODE_PRECONDITION-msg / ps-not-found /
+  2 个多行 format! 消息)。helper body 自身不转(用 `.await;` 锚点排除)。net -54(39/-93)。
+  验证:build+clippy(4 warn 不变,无新增)+ **164/164 manager 单测** + **coco findbugs deep(GPT-5.5)未发现
+  (显式核对返回类型/响应编码/错误码传播/早退/RAII guard/borrow-await 边界/跨 handler 行为均不变)** +
+  **chaos seed 603(58s,register_ps/heartbeat_ps/get_regions/split 等全走 code_resp):writes acked
+  mismatch=0 not_found=0、range=0、write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
+观察:response-boilerplate 整合三件套完成:append_reject(AppendResp,R15)+ alloc_reject(StreamAllocExtentResp,R16)
+  + code_resp(CodeResp,R17)——manager/EN 全部状态响应现走构造 helper,纯构造零风险。CodeResp 是跨 handler(非单
+  giant 函数)的 directive#1 大文件去冗余,与 giant-函数 clarity 分析互补。
+进度:17 轮全绿(R1-R17),均 push(R17 本轮 push)。giant 战役 + response-boilerplate 整合基本收口;chaos-validated
+  区剩余目标多为 guard-heavy 控制面(已 analyze=清晰)或热路径 reproduce-first 暂缓。
+Next(loop 续):⑱ 候选:其它 Resp 类型若也散落(UpsertPartitionResp 等,但每种仅 2-3 处,稀疏,价值低)可顺手;
+  或继续 analyze 剩余 guard-heavy 大函数(merge/force_ec/replay_from_etcd)报清晰;或报告战役收口、等用户定向新方向。
+  热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓。coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
