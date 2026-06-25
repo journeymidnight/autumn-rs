@@ -1,3 +1,23 @@
+Date: 2026-06-25 (review 战役 — /loop 自驱:coco review + 每轮 chaos + 删 F### 注释)
+TaskStatus: completed
+LOOP 设定(用户 /loop 动态模式,3 条累积指令):① coco 参与 review,逐一处理冗余/逻辑混乱文件;
+  ② 每轮重跑 chaos 保证稳定性;③ 清理时删 F### 这类 feature-number 标签,只留必要注释(实质 what/why)。
+  每轮流程:挑一个冗余/乱文件 → dedup/简化 + 删 F### 标签(保留实质注释)→ coco findbugs 评 diff →
+  build+clippy+全量单测 → system_chaos(merge/split/gc 种)→ commit+push → 下一轮。
+  F### 删除解释(待用户确认):删 "F###:"/Item-N 标签 + "pre-F### 曾是 X" 考古;保留 invariant/结构说明
+  (etcd-first、CAS baseline、refuse 理由)。CLAUDE.md/feature_list.md 是文档不算"注释",不动。
+ROUND 1 COMMIT(d8234e2,已 push):rpc_handlers.rs handle_stream_punch_holes + handle_truncate 的两段
+  重复块(recovery+EC inflight refuse + ref-drop loop)→ refuse_if_removed_extent_inflight +
+  compute_extent_ref_drops 两 helper(纯读 s,全在既有只读 out 闭包内,不碰 CAS baseline/mirror/apply →
+  refuse 顺序/push 顺序/membership-CAS/etcd-first 全保)。op-name 参数化错误信息一致。同时删该区 F###/Item-N
+  标签 + pre-F### 考古,留实质。net -26(127/-153)。验证:164/164 + clippy 0 + **coco findbugs deep(GPT-5.5)
+  未发现问题** + **system_chaos seed 603(90s,真 EN kill+split/merge/gc):Split+Merge OK,mismatch=0
+  not_found=0 accounting=0 all invariants OK**。
+Next(loop 续):② rpc_handlers 其它重复(split/merge Phase-2 verify/kvs builder——但 multi-phase 高风险,
+  逐行验 + chaos);③ 继续别的大文件冗余 + F### 清理;④ 热路径 partition-server/lib.rs 最后。
+
+────────────────────────────────────────────────────────────────────────────────
+PREV:
 Date: 2026-06-25 (review 战役 — 转向最大文件;manager/lib.rs ×2 + chaos 验证 + extent_node.rs ×1)
 TaskStatus: completed
 Task scope: 用户"不超过200行的不用处理,开始处理最大的几个文件(冗余/乱代码最多)"→"先搞一次 chaos 防 bug,然后 continue"。
