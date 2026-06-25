@@ -240,6 +240,15 @@ impl PartitionMetricsWindow {
             self.buckets.pop_front();
         }
     }
+
+    /// The most-recent `n` buckets (newest-first), or `None` when the window
+    /// holds fewer than `n` (insufficient history → the caller skips the
+    /// advisory). Dedups the `buckets.iter().rev().take(n)` + length-guard
+    /// preamble shared by every `compute_*` advisory.
+    fn recent(&self, n: usize) -> Option<Vec<&(i64, PartitionLoad)>> {
+        let bs: Vec<_> = self.buckets.iter().rev().take(n).collect();
+        (bs.len() >= n).then_some(bs)
+    }
 }
 
 #[derive(Default)]
@@ -307,15 +316,9 @@ impl PolicyEngine {
 
         // ── SPLIT pass ──────────────────────────────────────────────────────
         for (&part_id, window) in self.metrics.iter() {
-            let bs: Vec<&(i64, PartitionLoad)> = window
-                .buckets
-                .iter()
-                .rev()
-                .take(cfg.required_buckets)
-                .collect();
-            if bs.len() < cfg.required_buckets {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
-            }
+            };
 
             let last_op = args.last_op_at.get(&part_id).copied().unwrap_or(0);
             if args.now - last_op < cfg.split_cooldown_sec {
@@ -390,13 +393,12 @@ impl PolicyEngine {
                 Some(w) => w,
                 None => continue,
             };
-            let lbs: Vec<&(i64, PartitionLoad)> =
-                lw.buckets.iter().rev().take(cfg.required_buckets).collect();
-            let rbs: Vec<&(i64, PartitionLoad)> =
-                rw.buckets.iter().rev().take(cfg.required_buckets).collect();
-            if lbs.len() < cfg.required_buckets || rbs.len() < cfg.required_buckets {
+            let (Some(lbs), Some(rbs)) = (
+                lw.recent(cfg.required_buckets),
+                rw.recent(cfg.required_buckets),
+            ) else {
                 continue;
-            }
+            };
 
             let last_op_l = args.last_op_at.get(&left_id).copied().unwrap_or(0);
             let last_op_r = args.last_op_at.get(&right_id).copied().unwrap_or(0);
@@ -471,15 +473,9 @@ impl PolicyEngine {
         let cfg = self.config.clone();
 
         for (&part_id, window) in self.metrics.iter() {
-            let bs: Vec<&(i64, PartitionLoad)> = window
-                .buckets
-                .iter()
-                .rev()
-                .take(cfg.required_buckets)
-                .collect();
-            if bs.len() < cfg.required_buckets {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
-            }
+            };
             let recent = &bs[0].1;
 
             // ── GC advisory ────────────────────────────────────────────
@@ -696,15 +692,9 @@ impl PolicyEngine {
         // ps_id -> Vec<(part_id, min_req, max_req, min_size, max_size)>
         let mut by_ps: HashMap<u64, Vec<(u64, u32, u32, u64, u64)>> = HashMap::new();
         for (&part_id, window) in self.metrics.iter() {
-            let bs: Vec<&(i64, PartitionLoad)> = window
-                .buckets
-                .iter()
-                .rev()
-                .take(cfg.required_buckets)
-                .collect();
-            if bs.len() < cfg.required_buckets {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
-            }
+            };
             let ps_id = match region_owners.get(&part_id) {
                 Some(p) => *p,
                 None => continue,
