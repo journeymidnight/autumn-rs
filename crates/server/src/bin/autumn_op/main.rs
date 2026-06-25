@@ -291,50 +291,7 @@ async fn run(args: Args) -> Result<()> {
     match args.cmd {
         // ---------------- F211 read ----------------
         Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
-        Command::UpgradeVersion { to } => {
-            // Resolve the default target (current+1) from a fresh read so
-            // the printed intent matches what the manager will validate.
-            let bytes = client
-                .mgr_call(
-                    MSG_GET_CLUSTER_VERSION,
-                    rkyv_encode(&GetClusterVersionReq {}),
-                )
-                .await?;
-            let cur: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if cur.code != CODE_OK {
-                bail!("upgrade-version: read current failed: {}", cur.message);
-            }
-            let target = to.unwrap_or(cur.cluster_version + 1);
-            let bytes = client
-                .mgr_call(
-                    MSG_BUMP_CLUSTER_VERSION,
-                    rkyv_encode(&BumpClusterVersionReq { to: target }),
-                )
-                .await?;
-            let resp: BumpClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if resp.code != CODE_OK {
-                bail!(
-                    "upgrade-version to {} REFUSED (cluster_version stays {}): {}",
-                    target,
-                    resp.cluster_version,
-                    resp.message
-                );
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "cluster_version": resp.cluster_version,
-                    }))?
-                );
-            } else {
-                println!(
-                    "cluster_version bumped: {} -> {} — rollback to older binaries is no \
-longer safe (new formats may now be emitted/persisted)",
-                    cur.cluster_version, resp.cluster_version
-                );
-            }
-        }
+        Command::UpgradeVersion { to } => cmd_upgrade_version(&client, args.json, to).await?,
         Command::ListNodes => cmd_list_nodes(&client, args.json).await?,
         Command::Df => cmd_df(&client, args.json).await?,
         Command::ExtentHealth { node_filter, include_healthy } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
@@ -342,95 +299,10 @@ longer safe (new formats may now be emitted/persisted)",
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
         Command::AuditLog { op, node_id, since, until, limit } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
         // ---------------- F211 admin ----------------
-        Command::Fence {
-            node_id,
-            reason,
-            by,
-            force,
-        } => {
-            if reason.is_empty() || by.is_empty() {
-                bail!("--reason and --by are required");
-            }
-            let req = FenceNodeReq {
-                node_id,
-                reason,
-                set_by: by,
-                force,
-            };
-            let bytes = client.mgr_call(MSG_FENCE_NODE, rkyv_encode(&req)).await?;
-            let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            print_code(args.json, "fence-node", &resp);
-        }
-        Command::Maintenance {
-            node_id,
-            reason,
-            by,
-            expire,
-        } => {
-            if by.is_empty() {
-                bail!("--by is required");
-            }
-            let req = SetNodeMaintenanceReq {
-                node_id,
-                reason,
-                set_by: by,
-                expire_at: expire,
-            };
-            let bytes = client
-                .mgr_call(MSG_SET_NODE_MAINTENANCE, rkyv_encode(&req))
-                .await?;
-            let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            print_code(args.json, "maintenance", &resp);
-        }
-        Command::Unfence { node_id, by } => {
-            if by.is_empty() {
-                bail!("--by is required");
-            }
-            let req = ClearNodeOverrideReq {
-                node_id,
-                set_by: by,
-            };
-            let bytes = client
-                .mgr_call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
-                .await?;
-            let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            print_code(args.json, "unfence", &resp);
-        }
-        Command::Remove { node_id, by } => {
-            if by.is_empty() {
-                bail!("--by is required");
-            }
-            let req = RemoveNodeReq {
-                node_id,
-                set_by: by,
-            };
-            let bytes = client.mgr_call(MSG_REMOVE_NODE, rkyv_encode(&req)).await?;
-            let resp: RemoveNodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "code": resp.code,
-                        "message": resp.message,
-                        "blocking_extent_ids": resp.blocking_extent_ids,
-                        "blocking_marker_extent_ids": resp.blocking_marker_extent_ids,
-                    }))?
-                );
-            } else if resp.code == CODE_OK {
-                println!("remove: ok");
-            } else {
-                println!("remove: code={} {}", resp.code, resp.message);
-                if !resp.blocking_extent_ids.is_empty() {
-                    println!("  blocking extents: {:?}", resp.blocking_extent_ids);
-                }
-                if !resp.blocking_marker_extent_ids.is_empty() {
-                    println!("  blocking markers: {:?}", resp.blocking_marker_extent_ids);
-                }
-            }
-            if resp.code != CODE_OK {
-                std::process::exit(2);
-            }
-        }
+        Command::Fence { node_id, reason, by, force } => cmd_fence(&client, args.json, node_id, reason, by, force).await?,
+        Command::Maintenance { node_id, reason, by, expire } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
+        Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
+        Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         // ---------------- F213 read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
         Command::Info { part, detail } => {
@@ -445,361 +317,18 @@ longer safe (new formats may now be emitted/persisted)",
         } => {
             run_bootstrap(&client, args.json, &replication, &presplit, log_ec, row_ec).await?;
         }
-        Command::SetStreamEc {
-            stream_id,
-            ec_data,
-            ec_parity,
-        } => {
-            let req_bytes = rkyv_encode(&UpdateStreamEcReq {
-                stream_id,
-                ec_data_shard: ec_data,
-                ec_parity_shard: ec_parity,
-            });
-            let mut attempt = 0u32;
-            loop {
-                let resp_bytes = client
-                    .mgr_call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
-                    .await
-                    .context("update stream EC")?;
-                let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                if resp.code == CODE_OK {
-                    if args.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "code": resp.code,
-                                "stream_id": stream_id,
-                                "ec_data": ec_data,
-                                "ec_parity": ec_parity,
-                            }))?
-                        );
-                    } else {
-                        println!(
-                            "stream {} EC updated to {}+{}; conversion will run on next manager tick (~5s)",
-                            stream_id, ec_data, ec_parity
-                        );
-                    }
-                    break;
-                }
-                if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                    attempt += 1;
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
-            }
-        }
-        Command::ForceEcConvert { extent_id } => {
-            let req = rkyv_encode(&ForceEcConvertReq { extent_id });
-            let resp_bytes = client
-                .mgr_call(MSG_FORCE_EC_CONVERT, req)
-                .await
-                .context("force-ec-convert")?;
-            let resp: ForceEcConvertResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code != CODE_OK {
-                bail!("force-ec-convert: code={} {}", resp.code, resp.message);
-            }
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "code": resp.code,
-                        "extent_id": extent_id,
-                        "message": resp.message,
-                    }))?
-                );
-            } else {
-                println!("{}", resp.message);
-            }
-        }
-        Command::Split { part_id } => {
-            client
-                .split(part_id)
-                .await
-                .map_err(|e| anyhow!("split: {e}"))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "part_id": part_id,
-                    }))?
-                );
-            } else {
-                println!("split ok");
-            }
-        }
-        Command::Merge {
-            survivor_part_id,
-            victim_part_id,
-        } => {
-            eprintln!(
-                "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
-                 before continuing. The CLI will FLUSH both, then issue the manager merge. \
-                 The survivor's PS picks up the wider range on the next region_sync (~2 s)."
-            );
-            client
-                .merge_partitions(survivor_part_id, victim_part_id)
-                .await
-                .map_err(|e| anyhow!("merge: {e}"))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "survivor": survivor_part_id,
-                        "victim": victim_part_id,
-                    }))?
-                );
-            } else {
-                println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
-            }
-        }
-        Command::Compact { part_id } => {
-            client
-                .compact(part_id)
-                .await
-                .map_err(|e| anyhow!("compact: {e}"))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "part_id": part_id,
-                    }))?
-                );
-            } else {
-                println!("compact triggered for partition {part_id}");
-            }
-        }
-        Command::Gc {
-            part_id,
-            ratio,
-            max_size,
-            stream_debt,
-            empty_only,
-        } => {
-            let params = autumn_client::GcAutoParams {
-                ratio,
-                max_size,
-                stream_debt,
-                empty_only,
-            };
-            client
-                .gc_with_params(part_id, params.clone())
-                .await
-                .map_err(|e| anyhow!("gc: {e}"))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "part_id": part_id,
-                        "ratio": params.ratio,
-                        "max_size": params.max_size,
-                        "stream_debt": params.stream_debt,
-                        "empty_only": params.empty_only,
-                    }))?
-                );
-            } else {
-                println!(
-                    "gc triggered for partition {part_id} (ratio={:?} max_size={:?} stream_debt={:?} empty_only={})",
-                    params.ratio, params.max_size, params.stream_debt, params.empty_only
-                );
-            }
-        }
-        Command::ForceGc {
-            part_id,
-            extent_ids,
-        } => {
-            client
-                .force_gc(part_id, extent_ids.clone())
-                .await
-                .map_err(|e| anyhow!("forcegc: {e}"))?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "part_id": part_id,
-                        "extents": extent_ids,
-                    }))?
-                );
-            } else {
-                println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
-            }
-        }
+        Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
+        Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
+        Command::Split { part_id } => cmd_split(&client, args.json, part_id).await?,
+        Command::Merge { survivor_part_id, victim_part_id } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id).await?,
+        Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
+        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, part_id, ratio, max_size, stream_debt, empty_only).await?,
+        Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, part_id, extent_ids).await?,
         Command::RegisterNode => {
             // Already handled by the pre-connect stub above.
             unreachable!("Command::RegisterNode handled before connect");
         }
-        Command::Format {
-            listen,
-            advertise,
-            dirs,
-            shard_ports,
-        } => {
-            // F214-C: fetch the manager's cluster_id BEFORE touching
-            // any disk. Failure here means the manager is not yet
-            // leader (retries internally) or has never bootstrapped
-            // (fatal — operator must start the manager first).
-            let cluster_id = fetch_cluster_id(&client).await?;
-
-            // For each dir, decide whether to fresh-format or reuse
-            // existing. Refuse on cluster_id mismatch — that's the
-            // "wrong cluster" diagnostic.
-            let mut disk_uuids = Vec::new();
-            let mut freshly_formatted: Vec<bool> = Vec::with_capacity(dirs.len());
-            for dir in &dirs {
-                std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
-                match read_existing_format(dir)? {
-                    Some((existing_cid, existing_did)) if existing_cid == cluster_id => {
-                        // Idempotent path — already formatted for this
-                        // cluster. Reuse the disk_uuid so the manager's
-                        // re-register branch returns the existing
-                        // disk_id without allocating a fresh one.
-                        if !args.json {
-                            println!(
-                                "{dir}: already formatted (cluster_id matches), reusing disk_uuid={existing_did}"
-                            );
-                        }
-                        disk_uuids.push(existing_did);
-                        freshly_formatted.push(false);
-                    }
-                    Some((existing_cid, _)) => {
-                        // Different cluster — refuse rather than risk
-                        // joining a disk to the wrong cluster.
-                        bail!(
-                            "{dir} is already formatted for cluster {existing_cid}, \
-                             but the manager at {} reports cluster {}. \
-                             Wipe the dir or point at the original cluster.",
-                            args.manager,
-                            cluster_id
-                        );
-                    }
-                    None => {
-                        // Fresh dir — full format: 256 hash subdirs +
-                        // fresh disk_uuid.
-                        let uuid = format_disk(dir)?;
-                        if !args.json {
-                            println!("formatted {dir}: disk_uuid={uuid}");
-                        }
-                        disk_uuids.push(uuid);
-                        freshly_formatted.push(true);
-                    }
-                }
-            }
-
-            // F214-C: register against the manager. Re-register branch
-            // (existing address known) returns the existing node_id +
-            // matching disk_ids, so idempotency holds end-to-end.
-            // F099-M: pass `shard_ports` so the manager routes
-            // per-extent operations to the owning shard via
-            // `extent_id % shard_count`. Empty vec = single-shard EN
-            // (manager routes everything to `advertise`).
-            // F191 control-plane port. Under UCX a second ucp_listener on the
-            // same RoCE device can't bind ("Device is busy"), so the extent
-            // node serves control RPCs on the data listener instead. Register
-            // an empty control_address so the manager's DF falls back to the
-            // data address (manager treats "" as "use addr"). TCP keeps the
-            // separate control port for HoL isolation.
-            let control_address = if args.transport == TransportKind::Ucx {
-                String::new()
-            } else {
-                derive_control_address(&advertise)
-            };
-            let resp_bytes = client
-                .mgr_call(
-                    MSG_REGISTER_NODE,
-                    rkyv_encode(&RegisterNodeReq {
-                        addr: advertise.clone(),
-                        disk_uuids: disk_uuids.clone(),
-                        shard_ports: shard_ports.clone(),
-                        control_address,
-                    }),
-                )
-                .await
-                .context("register node")?;
-            let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            // A FAILED registration (follower / non-leader, fenced or
-            // decommissioned address, same-addr-different-disk) returns
-            // code != CODE_OK with node_id=0 and no/partial disk_uuids.
-            // Writing the local format sentinels on that response leaves a
-            // dir that LOOKS formatted (cluster_id present) but the manager
-            // never accepted — the EN then starts on a node/disk the manager
-            // doesn't know about.
-            if resp.code != CODE_OK {
-                bail!("register node failed: code={} {}", resp.code, resp.message);
-            }
-
-            let node_id = resp.node_id;
-            // Resolve every requested disk_uuid -> disk_id BEFORE writing any
-            // sentinel: a missing mapping (the manager returned only the
-            // disks it actually accepted) must FAIL, not silently write
-            // disk_id=0 (a pseudo-formatted dir the manager can't route to).
-            // Two passes so a partial failure leaves NO half-written dirs.
-            let uuid_to_id: HashMap<&str, u64> = resp
-                .disk_uuids
-                .iter()
-                .map(|(u, id)| (u.as_str(), *id))
-                .collect();
-            let mut disk_assignments: Vec<(String, String, u64)> = Vec::new();
-            for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
-                let disk_id = *uuid_to_id.get(disk_uuid.as_str()).ok_or_else(|| {
-                    anyhow!(
-                        "manager did not assign a disk_id for {dir} (uuid {disk_uuid}); \
-                         not writing format sentinels"
-                    )
-                })?;
-                disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
-            }
-            for (dir, disk_uuid, disk_id) in &disk_assignments {
-                // F214-C: cluster_id + disk_uuid sentinel files. The
-                // extent-node binary's startup check reads cluster_id
-                // and cross-checks against the manager; disk_uuid is
-                // used by re-formats to preserve idempotency.
-                std::fs::write(format!("{dir}/cluster_id"), &cluster_id)
-                    .with_context(|| format!("write cluster_id in {dir}"))?;
-                std::fs::write(format!("{dir}/disk_uuid"), disk_uuid)
-                    .with_context(|| format!("write disk_uuid in {dir}"))?;
-                std::fs::write(format!("{dir}/node_id"), node_id.to_string())
-                    .with_context(|| format!("write node_id in {dir}"))?;
-                std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
-                    .with_context(|| format!("write disk_id in {dir}"))?;
-            }
-
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "node_id": node_id,
-                        "cluster_id": cluster_id,
-                        "listen": listen,
-                        "advertise": advertise,
-                        "disks": disk_assignments.iter()
-                            .map(|(d, u, id)| serde_json::json!({
-                                "dir": d, "uuid": u, "disk_id": id,
-                            }))
-                            .collect::<Vec<_>>(),
-                    }))?
-                );
-            } else {
-                println!("node registered: node_id={node_id}");
-                println!("cluster_id={cluster_id}");
-                for (dir, _u, disk_id) in &disk_assignments {
-                    println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
-                }
-                println!("\nFormat complete.");
-                println!("listen={listen}, advertise={advertise}");
-                println!("Start the extent node with:");
-                println!(
-                    "  autumn-extent-node --port {} --manager {} --data {}",
-                    listen.split(':').next_back().unwrap_or("9101"),
-                    args.manager,
-                    dirs.join(",")
-                );
-            }
-        }
+        Command::Format { listen, advertise, dirs, shard_ports } => cmd_format(&client, args.json, listen, advertise, dirs, shard_ports, &args.manager, args.transport).await?,
     }
     let _ = std::io::stdout().flush();
     Ok(())
@@ -1345,6 +874,485 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                 feas,
             );
         }
+    }
+    Ok(())
+}
+
+async fn cmd_upgrade_version(client: &ClusterClient, json: bool, to: Option<u32>) -> Result<()> {
+                // Resolve the default target (current+1) from a fresh read so
+                // the printed intent matches what the manager will validate.
+                let bytes = client
+                    .mgr_call(
+                        MSG_GET_CLUSTER_VERSION,
+                        rkyv_encode(&GetClusterVersionReq {}),
+                    )
+                    .await?;
+                let cur: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+                if cur.code != CODE_OK {
+                    bail!("upgrade-version: read current failed: {}", cur.message);
+                }
+                let target = to.unwrap_or(cur.cluster_version + 1);
+                let bytes = client
+                    .mgr_call(
+                        MSG_BUMP_CLUSTER_VERSION,
+                        rkyv_encode(&BumpClusterVersionReq { to: target }),
+                    )
+                    .await?;
+                let resp: BumpClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+                if resp.code != CODE_OK {
+                    bail!(
+                        "upgrade-version to {} REFUSED (cluster_version stays {}): {}",
+                        target,
+                        resp.cluster_version,
+                        resp.message
+                    );
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "cluster_version": resp.cluster_version,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "cluster_version bumped: {} -> {} — rollback to older binaries is no \
+    longer safe (new formats may now be emitted/persisted)",
+                        cur.cluster_version, resp.cluster_version
+                    );
+                }
+    Ok(())
+}
+
+async fn cmd_fence(client: &ClusterClient, json: bool, node_id: u64, reason: String, by: String, force: bool) -> Result<()> {
+    if reason.is_empty() || by.is_empty() {
+        bail!("--reason and --by are required");
+    }
+    let req = FenceNodeReq {
+        node_id,
+        reason,
+        set_by: by,
+        force,
+    };
+    let bytes = client.mgr_call(MSG_FENCE_NODE, rkyv_encode(&req)).await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "fence-node", &resp);
+    Ok(())
+}
+
+async fn cmd_maintenance(client: &ClusterClient, json: bool, node_id: u64, reason: String, by: String, expire: u64) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = SetNodeMaintenanceReq {
+        node_id,
+        reason,
+        set_by: by,
+        expire_at: expire,
+    };
+    let bytes = client
+        .mgr_call(MSG_SET_NODE_MAINTENANCE, rkyv_encode(&req))
+        .await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "maintenance", &resp);
+    Ok(())
+}
+
+async fn cmd_unfence(client: &ClusterClient, json: bool, node_id: u64, by: String) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = ClearNodeOverrideReq {
+        node_id,
+        set_by: by,
+    };
+    let bytes = client
+        .mgr_call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
+        .await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "unfence", &resp);
+    Ok(())
+}
+
+async fn cmd_remove(client: &ClusterClient, json: bool, node_id: u64, by: String) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = RemoveNodeReq {
+        node_id,
+        set_by: by,
+    };
+    let bytes = client.mgr_call(MSG_REMOVE_NODE, rkyv_encode(&req)).await?;
+    let resp: RemoveNodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "message": resp.message,
+                "blocking_extent_ids": resp.blocking_extent_ids,
+                "blocking_marker_extent_ids": resp.blocking_marker_extent_ids,
+            }))?
+        );
+    } else if resp.code == CODE_OK {
+        println!("remove: ok");
+    } else {
+        println!("remove: code={} {}", resp.code, resp.message);
+        if !resp.blocking_extent_ids.is_empty() {
+            println!("  blocking extents: {:?}", resp.blocking_extent_ids);
+        }
+        if !resp.blocking_marker_extent_ids.is_empty() {
+            println!("  blocking markers: {:?}", resp.blocking_marker_extent_ids);
+        }
+    }
+    if resp.code != CODE_OK {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+async fn cmd_set_stream_ec(client: &ClusterClient, json: bool, stream_id: u64, ec_data: u32, ec_parity: u32) -> Result<()> {
+    let req_bytes = rkyv_encode(&UpdateStreamEcReq {
+        stream_id,
+        ec_data_shard: ec_data,
+        ec_parity_shard: ec_parity,
+    });
+    let mut attempt = 0u32;
+    loop {
+        let resp_bytes = client
+            .mgr_call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
+            .await
+            .context("update stream EC")?;
+        let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code == CODE_OK {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "code": resp.code,
+                        "stream_id": stream_id,
+                        "ec_data": ec_data,
+                        "ec_parity": ec_parity,
+                    }))?
+                );
+            } else {
+                println!(
+                    "stream {} EC updated to {}+{}; conversion will run on next manager tick (~5s)",
+                    stream_id, ec_data, ec_parity
+                );
+            }
+            break;
+        }
+        if resp.code == CODE_NOT_LEADER && attempt < 60 {
+            attempt += 1;
+            compio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
+    }
+    Ok(())
+}
+
+async fn cmd_force_ec_convert(client: &ClusterClient, json: bool, extent_id: u64) -> Result<()> {
+    let req = rkyv_encode(&ForceEcConvertReq { extent_id });
+    let resp_bytes = client
+        .mgr_call(MSG_FORCE_EC_CONVERT, req)
+        .await
+        .context("force-ec-convert")?;
+    let resp: ForceEcConvertResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("force-ec-convert: code={} {}", resp.code, resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "extent_id": extent_id,
+                "message": resp.message,
+            }))?
+        );
+    } else {
+        println!("{}", resp.message);
+    }
+    Ok(())
+}
+
+async fn cmd_split(client: &ClusterClient, json: bool, part_id: u64) -> Result<()> {
+    client
+        .split(part_id)
+        .await
+        .map_err(|e| anyhow!("split: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "part_id": part_id,
+            }))?
+        );
+    } else {
+        println!("split ok");
+    }
+    Ok(())
+}
+
+async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, victim_part_id: u64) -> Result<()> {
+    eprintln!(
+        "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
+         before continuing. The CLI will FLUSH both, then issue the manager merge. \
+         The survivor's PS picks up the wider range on the next region_sync (~2 s)."
+    );
+    client
+        .merge_partitions(survivor_part_id, victim_part_id)
+        .await
+        .map_err(|e| anyhow!("merge: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "survivor": survivor_part_id,
+                "victim": victim_part_id,
+            }))?
+        );
+    } else {
+        println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
+    }
+    Ok(())
+}
+
+async fn cmd_compact(client: &ClusterClient, json: bool, part_id: u64) -> Result<()> {
+    client
+        .compact(part_id)
+        .await
+        .map_err(|e| anyhow!("compact: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "part_id": part_id,
+            }))?
+        );
+    } else {
+        println!("compact triggered for partition {part_id}");
+    }
+    Ok(())
+}
+
+async fn cmd_gc(client: &ClusterClient, json: bool, part_id: u64, ratio: Option<f64>, max_size: Option<u64>, stream_debt: Option<u64>, empty_only: bool) -> Result<()> {
+    let params = autumn_client::GcAutoParams {
+        ratio,
+        max_size,
+        stream_debt,
+        empty_only,
+    };
+    client
+        .gc_with_params(part_id, params.clone())
+        .await
+        .map_err(|e| anyhow!("gc: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "part_id": part_id,
+                "ratio": params.ratio,
+                "max_size": params.max_size,
+                "stream_debt": params.stream_debt,
+                "empty_only": params.empty_only,
+            }))?
+        );
+    } else {
+        println!(
+            "gc triggered for partition {part_id} (ratio={:?} max_size={:?} stream_debt={:?} empty_only={})",
+            params.ratio, params.max_size, params.stream_debt, params.empty_only
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_ids: Vec<u64>) -> Result<()> {
+    client
+        .force_gc(part_id, extent_ids.clone())
+        .await
+        .map_err(|e| anyhow!("forcegc: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "part_id": part_id,
+                "extents": extent_ids,
+            }))?
+        );
+    } else {
+        println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
+    }
+    Ok(())
+}
+
+async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertise: String, dirs: Vec<String>, shard_ports: Vec<u16>, manager: &str, transport: TransportKind) -> Result<()> {
+    // F214-C: fetch the manager's cluster_id BEFORE touching
+    // any disk. Failure here means the manager is not yet
+    // leader (retries internally) or has never bootstrapped
+    // (fatal — operator must start the manager first).
+    let cluster_id = fetch_cluster_id(&client).await?;
+
+    // For each dir, decide whether to fresh-format or reuse
+    // existing. Refuse on cluster_id mismatch — that's the
+    // "wrong cluster" diagnostic.
+    let mut disk_uuids = Vec::new();
+    let mut freshly_formatted: Vec<bool> = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
+        match read_existing_format(dir)? {
+            Some((existing_cid, existing_did)) if existing_cid == cluster_id => {
+                // Idempotent path — already formatted for this
+                // cluster. Reuse the disk_uuid so the manager's
+                // re-register branch returns the existing
+                // disk_id without allocating a fresh one.
+                if !json {
+                    println!(
+                        "{dir}: already formatted (cluster_id matches), reusing disk_uuid={existing_did}"
+                    );
+                }
+                disk_uuids.push(existing_did);
+                freshly_formatted.push(false);
+            }
+            Some((existing_cid, _)) => {
+                // Different cluster — refuse rather than risk
+                // joining a disk to the wrong cluster.
+                bail!(
+                    "{dir} is already formatted for cluster {existing_cid}, \
+                     but the manager at {} reports cluster {}. \
+                     Wipe the dir or point at the original cluster.",
+                    manager,
+                    cluster_id
+                );
+            }
+            None => {
+                // Fresh dir — full format: 256 hash subdirs +
+                // fresh disk_uuid.
+                let uuid = format_disk(dir)?;
+                if !json {
+                    println!("formatted {dir}: disk_uuid={uuid}");
+                }
+                disk_uuids.push(uuid);
+                freshly_formatted.push(true);
+            }
+        }
+    }
+
+    // F214-C: register against the manager. Re-register branch
+    // (existing address known) returns the existing node_id +
+    // matching disk_ids, so idempotency holds end-to-end.
+    // F099-M: pass `shard_ports` so the manager routes
+    // per-extent operations to the owning shard via
+    // `extent_id % shard_count`. Empty vec = single-shard EN
+    // (manager routes everything to `advertise`).
+    // F191 control-plane port. Under UCX a second ucp_listener on the
+    // same RoCE device can't bind ("Device is busy"), so the extent
+    // node serves control RPCs on the data listener instead. Register
+    // an empty control_address so the manager's DF falls back to the
+    // data address (manager treats "" as "use addr"). TCP keeps the
+    // separate control port for HoL isolation.
+    let control_address = if transport == TransportKind::Ucx {
+        String::new()
+    } else {
+        derive_control_address(&advertise)
+    };
+    let resp_bytes = client
+        .mgr_call(
+            MSG_REGISTER_NODE,
+            rkyv_encode(&RegisterNodeReq {
+                addr: advertise.clone(),
+                disk_uuids: disk_uuids.clone(),
+                shard_ports: shard_ports.clone(),
+                control_address,
+            }),
+        )
+        .await
+        .context("register node")?;
+    let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    // A FAILED registration (follower / non-leader, fenced or
+    // decommissioned address, same-addr-different-disk) returns
+    // code != CODE_OK with node_id=0 and no/partial disk_uuids.
+    // Writing the local format sentinels on that response leaves a
+    // dir that LOOKS formatted (cluster_id present) but the manager
+    // never accepted — the EN then starts on a node/disk the manager
+    // doesn't know about.
+    if resp.code != CODE_OK {
+        bail!("register node failed: code={} {}", resp.code, resp.message);
+    }
+
+    let node_id = resp.node_id;
+    // Resolve every requested disk_uuid -> disk_id BEFORE writing any
+    // sentinel: a missing mapping (the manager returned only the
+    // disks it actually accepted) must FAIL, not silently write
+    // disk_id=0 (a pseudo-formatted dir the manager can't route to).
+    // Two passes so a partial failure leaves NO half-written dirs.
+    let uuid_to_id: HashMap<&str, u64> = resp
+        .disk_uuids
+        .iter()
+        .map(|(u, id)| (u.as_str(), *id))
+        .collect();
+    let mut disk_assignments: Vec<(String, String, u64)> = Vec::new();
+    for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
+        let disk_id = *uuid_to_id.get(disk_uuid.as_str()).ok_or_else(|| {
+            anyhow!(
+                "manager did not assign a disk_id for {dir} (uuid {disk_uuid}); \
+                 not writing format sentinels"
+            )
+        })?;
+        disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
+    }
+    for (dir, disk_uuid, disk_id) in &disk_assignments {
+        // F214-C: cluster_id + disk_uuid sentinel files. The
+        // extent-node binary's startup check reads cluster_id
+        // and cross-checks against the manager; disk_uuid is
+        // used by re-formats to preserve idempotency.
+        std::fs::write(format!("{dir}/cluster_id"), &cluster_id)
+            .with_context(|| format!("write cluster_id in {dir}"))?;
+        std::fs::write(format!("{dir}/disk_uuid"), disk_uuid)
+            .with_context(|| format!("write disk_uuid in {dir}"))?;
+        std::fs::write(format!("{dir}/node_id"), node_id.to_string())
+            .with_context(|| format!("write node_id in {dir}"))?;
+        std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
+            .with_context(|| format!("write disk_id in {dir}"))?;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node_id": node_id,
+                "cluster_id": cluster_id,
+                "listen": listen,
+                "advertise": advertise,
+                "disks": disk_assignments.iter()
+                    .map(|(d, u, id)| serde_json::json!({
+                        "dir": d, "uuid": u, "disk_id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("node registered: node_id={node_id}");
+        println!("cluster_id={cluster_id}");
+        for (dir, _u, disk_id) in &disk_assignments {
+            println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
+        }
+        println!("\nFormat complete.");
+        println!("listen={listen}, advertise={advertise}");
+        println!("Start the extent node with:");
+        println!(
+            "  autumn-extent-node --port {} --manager {} --data {}",
+            listen.split(':').next_back().unwrap_or("9101"),
+            manager,
+            dirs.join(",")
+        );
     }
     Ok(())
 }
