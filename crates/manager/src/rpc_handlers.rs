@@ -1488,6 +1488,14 @@ impl AutumnManager {
         Ok(rkyv_encode(&CodeResp { code, message }))
     }
 
+    /// Build a `ForceEcConvertResp { code, message }` reply — the only response
+    /// shape `handle_force_ec_convert` emits (idempotent-OK / out-of-policy
+    /// precondition / not-leader / error). Same role as `code_resp`, distinct
+    /// wire type.
+    fn force_ec_resp(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&ForceEcConvertResp { code, message }))
+    }
+
     /// Build a `StreamAllocExtentResp` rejection (no stream/extent payload).
     /// Every guard in `handle_stream_alloc_extent` (leader / owner-epoch /
     /// not-found / in-flight / seal-probe / membership-CAS / mirror) returns one
@@ -3431,10 +3439,7 @@ impl AutumnManager {
     /// return CODE_PRECONDITION with a descriptive message.
     pub(crate) async fn handle_force_ec_convert(&self, payload: Bytes) -> HandlerResult {
         if !self.leader.get() {
-            return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: CODE_NOT_LEADER,
-                message: "not leader".to_string(),
-            }));
+            return Self::force_ec_resp(CODE_NOT_LEADER, "not leader".to_string());
         }
         let req: ForceEcConvertReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -3446,18 +3451,15 @@ impl AutumnManager {
         // later).
         match self.extent_inflight_op(extent_id) {
             Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_OK,
-                    message: "already pending dispatch".to_string(),
-                }));
+                return Self::force_ec_resp(CODE_OK, "already pending dispatch".to_string());
             }
             Some(other) => {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "extent {extent_id} has in-flight {other:?}; retry after it completes"
                     ),
-                }));
+                );
             }
             None => {}
         }
@@ -3469,25 +3471,25 @@ impl AutumnManager {
             let ex = match s.extents.get(&extent_id) {
                 Some(e) => e.clone(),
                 None => {
-                    return Ok(rkyv_encode(&ForceEcConvertResp {
-                        code: CODE_PRECONDITION,
-                        message: format!("extent {extent_id} not found"),
-                    }));
+                    return Self::force_ec_resp(
+                        CODE_PRECONDITION,
+                        format!("extent {extent_id} not found"),
+                    );
                 }
             };
             if ex.sealed_length == 0 {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "extent {extent_id} not sealed (sealed_length=0); use GC for empty slots"
                     ),
-                }));
+                );
             }
             if ex.ec_converted {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_OK,
-                    message: format!("extent {extent_id} already ec_converted"),
-                }));
+                return Self::force_ec_resp(
+                    CODE_OK,
+                    format!("extent {extent_id} already ec_converted"),
+                );
             }
             let stream = s
                 .streams
@@ -3496,12 +3498,12 @@ impl AutumnManager {
             let stream = match stream {
                 Some(s) => s.clone(),
                 None => {
-                    return Ok(rkyv_encode(&ForceEcConvertResp {
-                        code: CODE_PRECONDITION,
-                        message: format!(
+                    return Self::force_ec_resp(
+                        CODE_PRECONDITION,
+                        format!(
                             "extent {extent_id} is not on an EC-policy stream (set-stream-ec first)"
                         ),
-                    }));
+                    );
                 }
             };
             let node_addrs: HashMap<u64, String> = s
@@ -3525,10 +3527,10 @@ impl AutumnManager {
             match node_addrs.get(&nid) {
                 Some(addr) => target_addrs.push(addr.clone()),
                 None => {
-                    return Ok(rkyv_encode(&ForceEcConvertResp {
-                        code: CODE_PRECONDITION,
-                        message: format!("target node {nid} not in nodes map"),
-                    }));
+                    return Self::force_ec_resp(
+                        CODE_PRECONDITION,
+                        format!("target node {nid} not in nodes map"),
+                    );
                 }
             }
         }
@@ -3549,13 +3551,13 @@ impl AutumnManager {
                 pool.into_iter().take(extra_needed).collect()
             };
             if extra_candidates.len() < extra_needed {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "not enough nodes for EC {data_shards}+{parity_shards} ({} of {total_shards} available)",
                         target_nodes.len() + extra_candidates.len()
                     ),
-                }));
+                );
             }
             for node in &extra_candidates {
                 match self.alloc_extent_on_node(&node.address, extent_id).await {
@@ -3564,10 +3566,10 @@ impl AutumnManager {
                         extra_disk_ids.push(disk_id);
                     }
                     Err(e) => {
-                        return Ok(rkyv_encode(&ForceEcConvertResp {
-                            code: CODE_ERROR,
-                            message: format!("alloc_extent_on_node({}): {e}", node.address),
-                        }));
+                        return Self::force_ec_resp(
+                            CODE_ERROR,
+                            format!("alloc_extent_on_node({}): {e}", node.address),
+                        );
                     }
                 }
             }
@@ -3618,22 +3620,22 @@ impl AutumnManager {
         let live_eversion = match live_eversion {
             Some(v) => v,
             None => {
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "extent {extent_id} removed during force-ec-convert (concurrent gc)"
                     ),
-                }));
+                );
             }
         };
         if live_eversion != pre_eversion {
-            return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: CODE_PRECONDITION,
-                message: format!(
+            return Self::force_ec_resp(
+                CODE_PRECONDITION,
+                format!(
                     "extent {extent_id} eversion changed during force-ec-convert \
                      (pre={pre_eversion}, live={live_eversion}); retry to pick up new state"
                 ),
-            }));
+            );
         }
 
         let new_eversion = live_eversion + 1;
@@ -3691,22 +3693,22 @@ impl AutumnManager {
             )
             .await
         {
-            return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: match &e {
+            return Self::force_ec_resp(
+                match &e {
                     AppError::Precondition(_) => CODE_PRECONDITION,
                     AppError::NotLeader => CODE_NOT_LEADER,
                     _ => CODE_ERROR,
                 },
-                message: format!("acquire marker: {e}"),
-            }));
+                format!("acquire marker: {e}"),
+            );
         }
 
-        Ok(rkyv_encode(&ForceEcConvertResp {
-            code: CODE_OK,
-            message: format!(
+        Self::force_ec_resp(
+            CODE_OK,
+            format!(
                 "marker persisted for extent {extent_id}; next ec dispatch tick (~5s) will convert"
             ),
-        }))
+        )
     }
 
     /// F203: external policy controller — return the manager's most

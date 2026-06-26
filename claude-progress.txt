@@ -172,7 +172,7 @@ Next(loop 续):⑰ 剩余大函数多为 guard-heavy 控制面(handle_multi_modi
   等用户定向(热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓)。coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────
-ROUND 17 COMMIT(待 push):handle_multi_modify_split 清晰度分析(清晰即不动)+ **manager rpc_handlers.rs 全文件
+ROUND 17 COMMIT(d9491af,已 push):handle_multi_modify_split 清晰度分析(清晰即不动)+ **manager rpc_handlers.rs 全文件
   CodeResp boilerplate 抽取(directive#1 大文件去冗余)**。
   分析:handle_multi_modify_split(276)= 清晰 Phase1(闭包内 compute,零 store 改)/Phase2(单原子 etcd txn,含
   partitions+regions+lastOp 防 orphan)/Phase3(apply),#6 split-inflight guard + F146 verify-BEFORE-mirror(first_
@@ -196,6 +196,28 @@ ROUND 17 COMMIT(待 push):handle_multi_modify_split 清晰度分析(清晰即不
 Next(loop 续):⑱ 候选:其它 Resp 类型若也散落(UpsertPartitionResp 等,但每种仅 2-3 处,稀疏,价值低)可顺手;
   或继续 analyze 剩余 guard-heavy 大函数(merge/force_ec/replay_from_etcd)报清晰;或报告战役收口、等用户定向新方向。
   热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓。coco+chaos 每轮不变。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 18 COMMIT(待 push):handle_force_ec_convert 清晰度分析 + force_ec_resp 响应 boilerplate 抽取。
+  分析:handle_force_ec_convert(278,F203 OP-driven EC 触发器)= 清晰逻辑流(inflight 检查 → 单 borrow 取 state+
+  EC-stream → target-node 推导含 shuffle fallback → F209-D verify-BEFORE-acquire → 统一 inflight marker CAS),
+  注释足 → 不动。**14 处 `Ok(rkyv_encode(&ForceEcConvertResp{code,message}))`**(ForceEcConvertResp 结构=
+  {code,message},与 CodeResp 同形但独立 wire 类型)→ 抽 `Self::force_ec_resp(code,message)`(纯构造,同 R16/R17)。
+  零语义风险:只换响应尾;14 站点全唯一(消息各异),逐个 edit;helper body 不转。
+  **net ~平(+2;58/-56)** —— 14 中 7 个多行 format! 消息主导,struct→helper 调用行数近持平,本轮价值=一致性/集中化
+  (非行数),诚实记录:response-boilerplate dedup 已进入"行数中性、仅剩一致性收益"的长尾。
+  验证:build+clippy(4 warn 不变)+ **164/164 manager 单测** + **coco findbugs deep(GPT-5.5)未发现** +
+  **chaos seed 603(58s):mismatch=0 not_found=0、range=0、write-liveness=0、accounting=0(5ext/8membership)
+  all invariants OK**。
+观察:{code,message} 响应类型有长尾(ForceEcConvert/ReportCorruptReplica/MergePartitions/CheckCommitLength/...
+  多个结构同形但独立 wire 类型)。每个抽 per-type helper 价值递减(本轮已行数中性)。**结论:dense 响应-boilerplate
+  已收口(append/alloc/code/force_ec 四 helper);剩余 per-type 是稀疏/行数中性长尾,不值逐个扫。** 真正的根因冗余是
+  "多个同形 {code,message} wire 类型",但合并 wire 类型涉及 client decode 侧=语义改动,保守不做。
+进度:18 轮全绿(R1-R18),均 push(R18 本轮 push)。giant-函数 clarity 分析 + dense 响应-boilerplate 整合均已收口。
+  chaos-validated 区清晰目标基本枯竭:剩余大函数 analyze=清晰、boilerplate 长尾行数中性、热路径 reproduce-first 暂缓。
+Next(loop 续):⑲ **campaign 收口信号明确**——建议向用户报告并请其定向新方向(如:授权热路径 build_append_future/
+  partition_loop 的 reproduce-first 工作 / 扩 chaos 覆盖到 fuse·ioring 后再清那些 crate / 转性能或新 feature)。
+  若 loop 续跑无新方向:仅在发现 genuine non-trivial 冗余/混乱时动手,否则记 analyze=清晰避免行数中性 churn。coco+chaos 不变。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
