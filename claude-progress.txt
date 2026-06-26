@@ -886,3 +886,10 @@ PREV(committed 3309b8b/ed7ac11): 删 vp_table_refs 双计数 Stage 1。Stage 2(�
   refs==0 + 版本化解码物理删 vp_table_refs/vp_deps + 清 partitionVpRefs/。
 Backlog(本任务外):note33 extent-state RMW 未 value-CAS;manifest TableLocations 无 CRC;extent unlink 不 fsync
   父目录;MERGE-REFS-RECOMPUTE(复现失败,已加回归守卫)。
+
+ROUND 28 — fuzz round + 教训记录(无 code 改动)。fuzz-monitor 模式:试 3-min soak(seed 7, AUTUMN_CHAOS_DURATION_SECS=180)
+  → **预期内命中已知环境 artifact**:loopback 端口耗尽([[project_chaos_long_soak_port_exhaustion]])——180s 持续负载
+  churn 穿 ~55k 端口范围,TIME-WAIT 飙到 21902 → verify 阶段 EADDRNOTAVAIL(os err 99)→ not_found=398(假阴,非丢数据)。
+  确认非 main 回归:drain-gate TIME-WAIT<4000 后,**seed 7 @ 默认 30s 干净通过**(mismatch=0 not_found=0 accounting=0
+  all invariants OK)。**教训:此 loopback 测试机不能跑 >~60s chaos soak(无 drain-gate+连接复用前),future fuzz 轮
+  应变 SEED @ 默认 30s,不要拉长 duration。** main 在 EN-kill(603/42/7)+ PS-failover + inode-lease 全 chaos 场景健康。
