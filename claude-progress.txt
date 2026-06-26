@@ -220,7 +220,7 @@ Next(loop 续):⑲ **campaign 收口信号明确**——建议向用户报告并
   若 loop 续跑无新方向:仅在发现 genuine non-trivial 冗余/混乱时动手,否则记 analyze=清晰避免行数中性 churn。coco+chaos 不变。
 
 ────────────────────────────────────────────────────────────────────────────────
-ROUND 19 COMMIT(待 push):replay_from_etcd 分析 + **真·结构去重(非行数中性 boilerplate)**。
+ROUND 19 COMMIT(47beda7,已 push):replay_from_etcd 分析 + **真·结构去重(非行数中性 boilerplate)**。
   R18 收口后用户无新方向、loop 同 prompt 再触发→按既定策略"只动 genuine non-trivial 冗余"。检查 manager/lib.rs 最大
   函数 replay_from_etcd(344):多数 per-prefix decode loop 各异(id-map 已用 replay_decode_id_map / inode_leases 是
   fail-loud 两阶段 / failed_deletes 独有),清晰。**真冗余 = node_override(1990-2008)+ decommissioned(2009-2027)两段
@@ -240,6 +240,25 @@ ROUND 19 COMMIT(待 push):replay_from_etcd 分析 + **真·结构去重(非行�
 Next(loop 续):⑳ campaign 深度收口。建议同 R18-Next:报告并请用户定向(热路径 reproduce-first 授权 / fuse·ioring 扩
   chaos / 转 perf·feature)。无新方向则继续"只动 genuine 结构冗余,否则 analyze=清晰"——但此类目标已个位数,可能多为
   no-change analysis 轮。coco+chaos 不变。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 20 COMMIT(待 push):mirror_* 族分析(已 well-factored,不动)+ **真·跨函数结构去重:split+merge 的 eversion 快照**。
+  分析:mirror_* 6 helper(R3 kv_entry 后已 well-factored,6-26 行)——唯一重复是 stream_cas 构造(2 处 4 行,trivial,
+  按既定 bar 不抽)。handle_multi_modify_merge(388,最大未读 handler)= 清晰 Phase1(闭包+Phase1Result struct)/1.5
+  (alloc fallback)/2(原子 etcd txn,uniform-CAS survivor baselines)/3(apply),注释足,MultiModifyMergeResp 仅 5 处稀疏。
+  真冗余 = **split(2509-2521)+ merge(2786-2798)的 pre_bump_eversion 快照两段字节级同构**(F146 verify-at-apply
+  baseline:遍历 stream-id 切片 → 取每 stream 的 extent_ids → 取 extent.eversion → 插 HashMap),仅 stream-id 切片不同
+  (split 3 流 / merge all_streams 6 流)→ 抽 `Self::snapshot_stream_extent_eversions(state, stream_ids)`,与既有
+  first_eversion_drift(R2,verify 侧)配对。两 13 行块 → 单一真源。net +1(27/-26,doc 占;**结构消除重复**)。
+  验证:build+clippy(4 warn 不变)+ **164/164 manager 单测(含 split/merge 回归套)** + **coco findbugs deep(GPT-5.5)
+  未发现(调用点行为与内联一致)** + **chaos seed 603(58s,Split+Merge nemesis 直接走两快照点):mismatch=0
+  not_found=0、range=0、write-liveness=0、accounting=0(6ext/10membership)all invariants OK**。注:本轮改动**直接被
+  chaos 覆盖**(split+merge),非 R19 replay 的旁路验证。
+观察:R20 再得一个 genuine 跨函数结构去重(eversion 快照 split↔merge),且直接 chaos-validated。split/merge 族现共享
+  compute_*/splice_*/first_eversion_drift/snapshot_stream_extent_eversions 多个 helper,verify-at-apply 两侧均单一真源。
+进度:20 轮全绿(R1-R20),均 push(R20 本轮 push)。
+Next(loop 续):㉑ genuine 结构冗余已个位数且零散。继续按既定策略:挖到 genuine 非平凡结构去重就动(coco+chaos),
+  否则 analyze=清晰报告、不造 churn。强烈建议用户定向(热路径 reproduce-first 授权 / fuse·ioring 扩 chaos / perf·feature)。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:

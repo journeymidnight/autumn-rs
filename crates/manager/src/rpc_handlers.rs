@@ -2373,6 +2373,28 @@ impl AutumnManager {
         }
     }
 
+    /// Snapshot `extent_id -> eversion` over every extent of `stream_ids`'
+    /// streams — the F146 verify-at-apply BASELINE both split and merge capture
+    /// in Phase 1 (before the Phase-2 etcd await). `first_eversion_drift` is the
+    /// matching verify side: after the await it refuses if any of these
+    /// eversions moved (a concurrent recovery / EC / punch / truncate).
+    fn snapshot_stream_extent_eversions(
+        state: &autumn_common::MetadataState,
+        stream_ids: &[u64],
+    ) -> HashMap<u64, u64> {
+        let mut m = HashMap::new();
+        for &sid in stream_ids {
+            if let Some(stream) = state.streams.get(&sid) {
+                for &eid in &stream.extent_ids {
+                    if let Some(ex) = state.extents.get(&eid) {
+                        m.insert(eid, ex.eversion);
+                    }
+                }
+            }
+        }
+        m
+    }
+
     /// Verify-before-mirror drift check shared by split + merge: re-read the
     /// live eversion of every source extent snapshotted in `pre_bump_eversion`
     /// (captured before the Phase-1 awaits) and return the FIRST
@@ -2506,19 +2528,10 @@ impl AutumnManager {
 
                 // F146: snapshot pre-mutation eversions so Phase-3 can verify
                 // no concurrent mutator ran during Phase-2's etcd await.
-                let pre_bump_eversion: HashMap<u64, u64> = {
-                    let mut m = HashMap::new();
-                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
-                        if let Some(stream) = s.streams.get(&sid) {
-                            for &eid in &stream.extent_ids {
-                                if let Some(ex) = s.extents.get(&eid) {
-                                    m.insert(eid, ex.eversion);
-                                }
-                            }
-                        }
-                    }
-                    m
-                };
+                let pre_bump_eversion = Self::snapshot_stream_extent_eversions(
+                    &s,
+                    &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream],
+                );
 
                 let (start, end) = s.alloc_ids(4);
                 let new_log_stream = start;
@@ -2783,19 +2796,7 @@ impl AutumnManager {
                     }
                 }
 
-                let pre_bump_eversion: HashMap<u64, u64> = {
-                    let mut m = HashMap::new();
-                    for &sid in &all_streams {
-                        if let Some(stream) = s.streams.get(&sid) {
-                            for &eid in &stream.extent_ids {
-                                if let Some(ex) = s.extents.get(&eid) {
-                                    m.insert(eid, ex.eversion);
-                                }
-                            }
-                        }
-                    }
-                    m
-                };
+                let pre_bump_eversion = Self::snapshot_stream_extent_eversions(&s, &all_streams);
 
                 let (new_tail_id, _) = s.alloc_ids(1);
                 // Pick K replica nodes for E_new (replication factor matches
