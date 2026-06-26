@@ -984,3 +984,17 @@ ROUND 36 — partition_loop 谨慎评估(授权 A 第 3 候选)→ **正确不�
   做)+ R35 build_append_future batch-reject(纯去重,做)+ R36 partition_loop(无纯去重,正确不动)。其余热路径(stream
   client append_payload_segments=retry loop 有意分歧;F178 coalescer=note24 revert 史不碰;ps-conn handle_connection=
   控制循环)均非纯去重目标。热路径 behavior-preserving 去重substantially 完成。
+
+ROUND 37 — PutResp 快评(授权 A 最后一个热路径响应类型)→ **无 production 去重**(R30 deferral 是误判)。8 个 PutResp 站点:
+  · 1403 = 唯一 production success-ack(WriteResponder::send_ok,{CODE_OK,"",key},已极简单一站点)。
+  · 10200/10289/10418/10732/10843/11171/11264 = **全在 #[cfg(test)] mod tests(始于 8835)内**,各 `let put` 解码后
+    模拟 Phase-3 success 响应(7 处测试 sim,散在不同 test 场景)。R30 误以为是 8 处热路径 reject;实为 1 prod + 7 test。
+  test-sim 不值抽 helper(test 代码、散、directive#1 针对 production 大文件冗余)。**结论:PutResp 无 production dedup。**
+  无 code 改动;HEAD=R36(5a1a4da,即 R35 代码+R36 doc)已 chaos-validated。
+进度:24 轮代码全绿(R1-R21+R29+R34+R35)。**授权 A 热路径 behavior-preserving 去重完整收口**:
+  · 响应构造:append_reject(AppendResp 单,R15)+ batch_append_reject(AppendResp 批,R35)+ code_resp(CodeResp,R17/R29)
+    + PutResp(1 prod 已极简,无需抽)。
+  · admission:admit_region_range(enqueue region+range,R34)。
+  · partition_loop(R36)= 无纯去重正确不动;append_payload_segments(retry,有意分歧);F178 coalescer(note24 不碰)。
+  **热路径 A 工作 = 2 个 genuine 纯去重交付(R34/R35)+ 系统确认其余无 clean dedup。待用户新方向(更多 A 具体目标 / B
+  fuse·ioring 扩 chaos / C perf·feature)。**
