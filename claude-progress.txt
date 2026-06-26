@@ -1082,3 +1082,20 @@ ROUND 45(3b8d2e2,已 push;NEGATIVE RESULT—实验→实测拒绝→revert,只�
   下一步 R46:EN 热路径响应构造实质收口。候选方向(reassess):① 谨慎探 PS 热路径(workload 真正落点;但 partition_loop 最
   revert-prone,ps_bench 是工具)找可测 win;② 或诚实报告 EN perf 收敛 + 向用户请新方向(更多 perf 具体目标 / feature / B 扩 chaos)。
   绝不 speculative——R45 已示范"实测拒绝即 revert",不在热路径为 unmeasurable/negative 改动留代码。
+
+ROUND 46 — NO-CODE 分析轮(PS 热路径响应构造 read-only 分析 → 确认无安全可测 R44-style win;perf 收敛)。
+  分析 PS 响应构造:① handle_get(rpc_handlers.rs:253)= **rkyv** `rkyv_encode(&GetResp{value:value.into()})`——代码注释明写
+  "the rkyv encode below still copies once (unavoidable for the wire archive)";dispatch(lib.rs:4167/4212/4251)`Frame::response
+  (req_id,msg_type,p).encode()` 再把 rkyv archive 拷进 frame buf。**双拷贝**(rkyv-archive 拷 + rkyv→frame 拷)同 R44 形状,
+  **但关键差异**:EN 的 ReadBytesResp/AppendResp 是**手写 binary**(R44 能直接重建 frame 一次);PS 的 GetResp/PutResp 是 **rkyv**,
+  消 rkyv→frame 中间拷需 rkyv-serialize-into-frame 手术(对齐问题 + rkyv 版本特定)= 高风险,且 R45 已证小值复杂 framing 消拷反 regress。
+  ② PS 团队**已建零拷贝逃生路 MSG_GET_ZC**(ps_zc_head 手写 head + raw value,≥64K kvcache 用)——正是 large-value 那个 matters 的 case。
+  ③ PutResp 同 rkyv(tiny struct,双小 alloc),同样需 rkyv 手术不值。④ ps_bench **需完整 cluster**(cluster.sh start,非 standalone
+  如 extent_bench)→ PS-internal 改动在 sandbox **不可靠 A/B**(记忆:cluster bench 非 production-representative + TIME-WAIT/UCX flap/
+  stale-binary 坑)。⑤ partition_loop 并发逻辑=最 revert-prone,不碰。
+  **结论:response-construction 热路径 perf 收敛**。EN 手写 binary 那个干净 win 已 banked(R44);PS rkyv 路径双拷贝是 rkyv 固有,
+  零拷贝逃生路(MSG_GET_ZC)已为 matters 的 case 建好;进一步消拷贝要么 rkyv 手术(风险+R45 反例)要么 PS-internal(不可靠 A/B+revert-prone)。
+  无 code 改动(同 R22/R23 no-code 分析轮);HEAD=R45(e21a588)code 与已 chaos-validated 一致,跳过 chaos。
+进度:perf C 方向交付总结:**R44 = 唯一干净安全可测 win(read +1-2%,已 push)**;R45 = EN 边界(零拷贝 regress 小读);R46 = PS 边界
+  (rkyv 固有双拷贝 + ZC 逃生路已建 + 不可靠 A/B)。response-construction 热路径**实质收敛**。进一步 perf 需用户决策(riskier PS 手术 /
+  pivot 回 review-dedup mandate / B 扩 chaos / 具体目标)——这是真正的用户 fork,非 sensible-default 可定。AskUserQuestion 上浮。
