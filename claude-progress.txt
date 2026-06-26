@@ -1039,3 +1039,26 @@ ROUND 43 COMMIT(03dddda,已 push):perf 测量地基。survey benches:fsync_isola
 进度:perf 方向启动。下一步 R44:code 分析 append(build_append_future/handle_connection)+ read(build_read_future)热路径找
   genuine CPU/alloc 低效(消除 hot-loop 分配/拷贝优先),A/B extent_bench 测,correctness 用 stream 单测+chaos 验。绝不
   speculative 改(jemalloc/F193 回归教训)——要么 A/B 可测的真 win,要么 sound alloc/复杂度论证。
+
+ROUND 44 COMMIT(8d8997e,已 push):**首个 perf 优化交付——read/append 响应帧单次分配(消除 per-read 4KB 拷贝)**。
+  code 分析定位:非-zc read 响应路径 **双拷贝** value——build_read_future 先 `ReadBytesResp{payload}.encode()`(把 value
+  copy 进 BytesMut(9+len)),再 `Frame::response(...).encode()`(把整个 buf 含 value extend_from_slice 进 frame buf + CRC)
+  = 每读 2 次 full-payload memcpy(extent_bench Read 走 MSG_READ_BYTES 非-zc=正中此路径)。append 同形(中间 17B AppendResp alloc)。
+  修复:`Frame::encode_response_with(req_id,msg_type,payload_len,write_payload)`——payload 经闭包**直接写进 frame buf 一次**
+  (header→payload→CRC,字节级等价 `response(...).encode()`),read 省掉中间 ReadBytesResp 拷贝(value 只 copy 1 次),append
+  省掉中间 alloc。**风险类别=纯响应字节构造(wire 编码,非并发/durability/fence)**,同 R15-17 response-boilerplate 家族零语义风险。
+  **A/B(extent_bench loopback TCP sandbox,仅相对值)**:baseline 2 runs <1% noise;改后 read **6 个 config + 3 mixed 全 +1~2%**
+  (稳定跨 2 runs),append 中性(写路 overlayfs 噪声大,无回归)。**真·A/B-可测 win 高于噪声底**(非 speculative)。
+  coco findbugs(GPT-5.5)1 P2:`debug_assert_eq!` 长度契约 release 编译掉=隐形 footgun → **采纳**:升级为 release-active
+  `assert_eq!`(1 次整数比较,relative 省下的 memcpy 面前免费;长度契约违背=畸形帧 desync peer,正是 CRC 机制防的损坏类,
+  应 fail-loud)。重测确认 assert 不吃 win(仍 +0.6~3.2%)。coco 的 `as u32` 溢出点=**pre-existing**(`Frame::encode` 本就
+  `len+4 as u32`;read payload 受上游 256MiB chunk 限),忠实镜像非新引入,不单点非对称改。
+  WIRE_FINGERPRINT:frame.rs 是 hashed wire-schema 源,新增方法→指纹变;**字节兼容(无 wire-layout 变)→ v8 指纹原地更新**
+  (同 logical 版本,镜像 v7 先例 "fingerprint updated within same logical v7, no wire-layout change"),不 bump v9(避免误报 wire 不兼容)。
+  验证:**31/31 rpc lib(含新 byte-identity 测 encode_response_with_matches_response_encode)+ 90/90 stream lib** +
+  **chaos seed 603(83s,真 EN kill+split/merge/gc):Split+Merge OK,writes acked=10105 reads ok=26841,mismatch=0 not_found=0
+  range=0 write-liveness=0 accounting=0(11ext/11membership)all invariants OK**。net +101/-20(helper+test+2 call sites+fingerprint)。
+进度:perf C 首个交付(R44)。read 热路径 ~1-2% A/B-measured(消 4KB memcpy)。诚实标注:绝对 production 影响需 hardware perf_check。
+  下一步 R45 候选:① 继续 code-level 找 genuine CPU/alloc 低效(zc read 已最优;非-zc read 现单拷贝;append 响应已单 alloc;
+  可看 frame decode CRC 路径 / AppendReq decode / handle_connection drain)——但 EN 热路径已高度优化,剩余多 sub-noise;
+  ② 或扩到 PS 热路径(partition_loop / ps_bench)找可测 win;③ 无可测真 win 则诚实报告 perf 收口、等用户新方向。绝不 speculative。
