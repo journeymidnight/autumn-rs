@@ -63,18 +63,18 @@ fn main() {
             let req = AppendReq {
                 extent_id,
                 eversion: 1,
-                commit: i * payload.len() as u32,
+                commit: i as u64 * payload.len() as u64,
                 owner_epoch: 1,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();
         }
-        let warmup_commit = 500 * payload.len() as u32;
+        let warmup_commit = 500u64 * payload.len() as u64;
 
         // Sequential
         let start = Instant::now();
         for i in 0..ops {
-            let commit = warmup_commit + (i as u32) * payload.len() as u32;
+            let commit = warmup_commit + (i as u64) * payload.len() as u64;
             let req = AppendReq {
                 extent_id,
                 eversion: 1,

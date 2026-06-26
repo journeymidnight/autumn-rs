@@ -140,7 +140,7 @@ async fn run_bench() {
         assert_eq!(r.code, CODE_OK, "alloc read extent failed: {}", r.message);
 
         let payload = Bytes::from(vec![0xCDu8; 4096]);
-        let mut commit = 0u32;
+        let mut commit = 0u64;
         for _ in 0..read_blocks {
             let req = AppendReq {
                 extent_id: read_extent_id,
@@ -182,7 +182,7 @@ async fn run_bench() {
         assert_eq!(r.code, CODE_OK, "alloc mixed extent failed: {}", r.message);
 
         let payload = Bytes::from(vec![0xEEu8; 4096]);
-        let mut commit = 0u32;
+        let mut commit = 0u64;
         for _ in 0..mixed_prefill {
             let req = AppendReq {
                 extent_id: mixed_extent_id,
@@ -311,7 +311,7 @@ async fn bench_read(
                 let req = ReadBytesReq {
                     extent_id,
                     eversion: 1,
-                    offset: (block * 4096) as u32,
+                    offset: (block * 4096) as u64,
                     length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
@@ -331,7 +331,7 @@ async fn bench_read(
                     let req = ReadBytesReq {
                         extent_id,
                         eversion: 1,
-                        offset: (block * 4096) as u32,
+                        offset: (block * 4096) as u64,
                         length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
@@ -454,7 +454,7 @@ async fn bench_mixed(
                 let req = ReadBytesReq {
                     extent_id,
                     eversion: 1,
-                    offset: (block * 4096) as u32,
+                    offset: (block * 4096) as u64,
                     length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
@@ -476,7 +476,7 @@ async fn bench_mixed(
                     let req = ReadBytesReq {
                         extent_id,
                         eversion: 1,
-                        offset: (block * 4096) as u32,
+                        offset: (block * 4096) as u64,
                         length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
