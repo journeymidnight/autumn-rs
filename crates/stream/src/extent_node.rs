@@ -1394,6 +1394,15 @@ async fn ec_2pc_participant_rpc(
     }
 }
 
+/// Build a generic `CodeResp { code, message }` reply — the extent node's most
+/// common response shape (re_avali / delete / recovery / convert status returns).
+/// Centralises the `Ok(rkyv_encode(&CodeResp { .. }))` boilerplate so each
+/// handler guard / success arm is a single readable line. Mirrors the manager's
+/// `code_resp` helper.
+fn code_resp(code: u8, message: String) -> HandlerResult {
+    Ok(rkyv_encode(&CodeResp { code, message }))
+}
+
 /// Build an `AppendResp` rejection frame: a guard rejected the append, so no
 /// bytes were written and `offset`/`end` are 0. Every append-protocol guard in
 /// `handle_append` (quarantine / eversion / seal / owner-epoch fence / commit)
@@ -6033,24 +6042,21 @@ impl ExtentNode {
         let task = req.task;
 
         if self.manager_endpoint.is_none() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: "manager endpoint is not configured".to_string(),
-            }));
+            return code_resp(CODE_PRECONDITION, "manager endpoint is not configured".to_string());
         }
 
         if self.recovery_inflight.contains_key(&task.extent_id) {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: format!("extent {} recovery already running", task.extent_id),
-            }));
+            return code_resp(
+                CODE_PRECONDITION,
+                format!("extent {} recovery already running", task.extent_id),
+            );
         }
 
         if self.extents.contains_key(&task.extent_id) {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: format!("extent {} already exists", task.extent_id),
-            }));
+            return code_resp(
+                CODE_PRECONDITION,
+                format!("extent {} already exists", task.extent_id),
+            );
         }
 
         self.recovery_inflight.insert(task.extent_id, task.clone());
@@ -6089,10 +6095,7 @@ impl ExtentNode {
         })
         .detach();
 
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        code_resp(CODE_OK, String::new())
     }
 
     /// F109: unlink the physical extent files after the manager has
@@ -6127,13 +6130,10 @@ impl ExtentNode {
         // retries up to 60× (~2 min); orphan-reconcile (F113) is the backstop
         // if that budget exhausts before recovery completes.
         if self.recovery_inflight.contains_key(&req.extent_id) {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: format!(
-                    "extent {} recovery in flight; delete deferred",
-                    req.extent_id
-                ),
-            }));
+            return code_resp(
+                CODE_PRECONDITION,
+                format!("extent {} recovery in flight; delete deferred", req.extent_id),
+            );
         }
 
         // F210-D1: try-acquire the per-extent mutating-op lock. If held
@@ -6157,13 +6157,13 @@ impl ExtentNode {
         let _op_guard = match op_lock.try_lock() {
             Some(g) => g,
             None => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
+                return code_resp(
+                    CODE_PRECONDITION,
+                    format!(
                         "extent {} has in-flight mutating op (convert/re_avali); delete deferred",
                         req.extent_id
                     ),
-                }));
+                );
             }
         };
 
@@ -6200,15 +6200,9 @@ impl ExtentNode {
                     shard_idx = self.shard_idx,
                     "delete_extent: unlinked .dat + .meta",
                 );
-                Ok(rkyv_encode(&CodeResp {
-                    code: CODE_OK,
-                    message: String::new(),
-                }))
+                code_resp(CODE_OK, String::new())
             }
-            Some(e) => Ok(rkyv_encode(&CodeResp {
-                code: CODE_ERROR,
-                message: e.to_string(),
-            })),
+            Some(e) => code_resp(CODE_ERROR, e.to_string()),
         }
     }
 
@@ -6240,10 +6234,7 @@ impl ExtentNode {
         let extent = match self.get_extent(req.extent_id).await {
             Ok(v) => v,
             Err(_) => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_NOT_FOUND,
-                    message: format!("extent {} not found", req.extent_id),
-                }));
+                return code_resp(CODE_NOT_FOUND, format!("extent {} not found", req.extent_id));
             }
         };
 
@@ -6251,16 +6242,13 @@ impl ExtentNode {
         let extent_info = match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => ex,
             Ok(None) => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_NOT_FOUND,
-                    message: format!("extent {} not found in manager", req.extent_id),
-                }));
+                return code_resp(
+                    CODE_NOT_FOUND,
+                    format!("extent {} not found in manager", req.extent_id),
+                );
             }
             Err(e) => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_ERROR,
-                    message: e,
-                }));
+                return code_resp(CODE_ERROR, e);
             }
         };
         // F143: fsync on 0→sealed transition.
@@ -6272,23 +6260,20 @@ impl ExtentNode {
             .apply_extent_meta_durable(req.extent_id, &extent, &extent_info)
             .await
         {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_ERROR,
-                message: format!(
-                    "re_avali: seal not durable for extent {}: {e}",
-                    req.extent_id
-                ),
-            }));
+            return code_resp(
+                CODE_ERROR,
+                format!("re_avali: seal not durable for extent {}: {e}", req.extent_id),
+            );
         }
 
         if req.eversion < extent_info.eversion {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_PRECONDITION,
-                message: format!(
+            return code_resp(
+                CODE_PRECONDITION,
+                format!(
                     "eversion too low: got {}, expect >= {}",
                     req.eversion, extent_info.eversion
                 ),
-            }));
+            );
         }
 
         // F206: RE_AVALI is a replicated-extent repair primitive. For an
@@ -6303,18 +6288,12 @@ impl ExtentNode {
         // self-heal pre-F206 buggy `avali` values via mark_extent_available
         // on the next 2 s tick.
         if extent_info.ec_converted {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_OK,
-                message: String::new(),
-            }));
+            return code_resp(CODE_OK, String::new());
         }
 
         let local_len = extent.len.load(Ordering::SeqCst);
         if local_len >= extent_info.sealed_length {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_OK,
-                message: String::new(),
-            }));
+            return code_resp(CODE_OK, String::new());
         }
 
         // F210-E1: gate cross-extent re_avali concurrency through the
@@ -6344,10 +6323,7 @@ impl ExtentNode {
         {
             Ok(n) => n,
             Err(err) => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_ERROR,
-                    message: err,
-                }));
+                return code_resp(CODE_ERROR, err);
             }
         };
         extent
@@ -6370,19 +6346,13 @@ impl ExtentNode {
                 "P0-A: re_avali post-repair save_meta failed — disk OFFLINE, returning CODE_ERROR",
             );
             self.mark_disk_error_for_extent(req.extent_id, &e);
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_ERROR,
-                message: format!(
-                    "re_avali: seal meta not durable for extent {}: {e}",
-                    req.extent_id
-                ),
-            }));
+            return code_resp(
+                CODE_ERROR,
+                format!("re_avali: seal meta not durable for extent {}: {e}", req.extent_id),
+            );
         }
 
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        code_resp(CODE_OK, String::new())
     }
 
     async fn handle_copy_extent(&self, payload: Bytes) -> HandlerResult {
@@ -6762,10 +6732,7 @@ impl ExtentNode {
                     ),
                 ));
             }
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_OK,
-                message: String::new(),
-            }));
+            return code_resp(CODE_OK, String::new());
         }
 
         // F194: gate cross-extent EC convert concurrency. Acquired AFTER
@@ -7096,10 +7063,7 @@ impl ExtentNode {
 
         tracing::info!(extent_id, new_eversion, "EC 2PC phase 2 (commit) complete");
 
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
+        code_resp(CODE_OK, String::new())
     }
 
     async fn handle_write_shard(&self, payload: Bytes) -> HandlerResult {

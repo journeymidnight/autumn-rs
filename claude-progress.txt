@@ -893,3 +893,18 @@ ROUND 28 — fuzz round + 教训记录(无 code 改动)。fuzz-monitor 模式:�
   确认非 main 回归:drain-gate TIME-WAIT<4000 后,**seed 7 @ 默认 30s 干净通过**(mismatch=0 not_found=0 accounting=0
   all invariants OK)。**教训:此 loopback 测试机不能跑 >~60s chaos soak(无 drain-gate+连接复用前),future fuzz 轮
   应变 SEED @ 默认 30s,不要拉长 duration。** main 在 EN-kill(603/42/7)+ PS-failover + inode-lease 全 chaos 场景健康。
+
+ROUND 29 COMMIT(待 push):**genuine dedup 复活——R22/23 的"井干"结论被修正**。回归 directive#4(分析未读 giant 函数)读
+  handle_re_avali(171,sealed-replica 修复路径)= 清晰线性(forward-shard / op-lock / get_extent / mgr-info /
+  apply_meta_durable fail-closed / eversion / F206 EC 短路 / already-up-to-date / recovery permit / stream_extent_from_
+  sources / sync+save_meta fail-closed),不动。但发现:**manager R17 抽了 code_resp,stream crate 从没查过**——
+  extent_node.rs 有 **20 处** `Ok(rkyv_encode(&CodeResp{code,message}))` 散落 re_avali/require_recovery/delete_extent/
+  convert_to_ec handlers,无 helper → 抽 free fn `code_resp(code,message)`(同 manager R17 形)。纯 rkyv 构造零语义风险。
+  20 站点:7 CODE_OK(3 组 replace_all)+ 13 unique-message(逐个 edit,含 5 多行 format!)。**net -36(53/-89)真减行**。
+  验证:build+clippy(22 warn 不变)+ **90/90 stream 单测** + **coco findbugs deep(GPT-5.5)未发现** +
+  **chaos seed 603(58s,EN kill 走 re_avali/recovery/delete):mismatch=0 not_found=0、range=0、write-liveness=0、
+  accounting=0(5ext/8membership)all invariants OK**。
+教训:R22/23 宣告"井干"过早——只查了 manager 的 code_resp,漏了 stream crate 同形 20 处。**应跨所有 chaos-validated
+  crate 系统查同一 pattern**(append_reject/code_resp/alloc_reject 类响应构造)。下轮:查 partition-server/client 是否也有
+  未抽的 CodeResp/Resp 构造 boilerplate。
+进度:22 轮代码全绿(R1-R21 + R29),R22-R28 分析/fuzz。
