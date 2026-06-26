@@ -1049,15 +1049,9 @@ impl ClusterClient {
                 Ok(b) => return Ok(b),
                 Err(e) => {
                     last_err = Some(e.to_string());
-                    if attempt >= MAX_PS_REFRESHES {
+                    if !self.refresh_and_backoff(&mut attempt).await {
                         break;
                     }
-                    attempt += 1;
-                    let sleep = refresh_backoff(attempt);
-                    if !sleep.is_zero() {
-                        compio::time::sleep(sleep).await;
-                    }
-                    let _ = self.refresh_regions().await;
                 }
             }
         }
@@ -1065,6 +1059,25 @@ impl ClusterClient {
             "ps_call after {attempt} refreshes: {}",
             last_err.unwrap_or_else(|| "unknown".to_string())
         )))
+    }
+
+    /// One routing-retry step shared by all four PS-call loops
+    /// (`call_ps_for_key` / `call_ps_for_part` / `get_into` / `get_range_into`):
+    /// if the `MAX_PS_REFRESHES` budget is spent return `false` (the caller
+    /// breaks out of its loop); otherwise bump `attempt`, TiKV-style back off,
+    /// refresh the region cache, and return `true` to retry against the
+    /// (possibly re-resolved) routing.
+    async fn refresh_and_backoff(&self, attempt: &mut u32) -> bool {
+        if *attempt >= MAX_PS_REFRESHES {
+            return false;
+        }
+        *attempt += 1;
+        let sleep = refresh_backoff(*attempt);
+        if !sleep.is_zero() {
+            compio::time::sleep(sleep).await;
+        }
+        let _ = self.refresh_regions().await;
+        true
     }
 
     /// Resolve part_id to ps_addr, call PS, retry with TiKV-style
@@ -1117,15 +1130,9 @@ impl ClusterClient {
                         Ok(ae) => last_err = Some(ae.to_string()),
                         Err(other) => last_err = Some(other.to_string()),
                     }
-                    if attempt >= MAX_PS_REFRESHES {
+                    if !self.refresh_and_backoff(&mut attempt).await {
                         break;
                     }
-                    attempt += 1;
-                    let sleep = refresh_backoff(attempt);
-                    if !sleep.is_zero() {
-                        compio::time::sleep(sleep).await;
-                    }
-                    let _ = self.refresh_regions().await;
                 }
             }
         }
@@ -1319,15 +1326,9 @@ impl ClusterClient {
                 }
                 Err(e) => last_err = Some(e.to_string()),
             }
-            if attempt >= MAX_PS_REFRESHES {
+            if !self.refresh_and_backoff(&mut attempt).await {
                 break;
             }
-            attempt += 1;
-            let sleep = refresh_backoff(attempt);
-            if !sleep.is_zero() {
-                compio::time::sleep(sleep).await;
-            }
-            let _ = self.refresh_regions().await;
         }
         Err(AutumnError::ConnectionError(format!(
             "put_zc after {attempt} refreshes: {}",
@@ -1524,15 +1525,9 @@ impl ClusterClient {
                 }
                 Err(e) => last_err = Some(e.to_string()),
             }
-            if attempt >= MAX_PS_REFRESHES {
+            if !self.refresh_and_backoff(&mut attempt).await {
                 break;
             }
-            attempt += 1;
-            let sleep = refresh_backoff(attempt);
-            if !sleep.is_zero() {
-                compio::time::sleep(sleep).await;
-            }
-            let _ = self.refresh_regions().await;
         }
         Err(AutumnError::ConnectionError(format!(
             "get_range_into after {attempt} refreshes: {}",

@@ -242,7 +242,7 @@ Next(loop 续):⑳ campaign 深度收口。建议同 R18-Next:报告并请用户
   no-change analysis 轮。coco+chaos 不变。
 
 ────────────────────────────────────────────────────────────────────────────────
-ROUND 20 COMMIT(待 push):mirror_* 族分析(已 well-factored,不动)+ **真·跨函数结构去重:split+merge 的 eversion 快照**。
+ROUND 20 COMMIT(6541833,已 push):mirror_* 族分析(已 well-factored,不动)+ **真·跨函数结构去重:split+merge 的 eversion 快照**。
   分析:mirror_* 6 helper(R3 kv_entry 后已 well-factored,6-26 行)——唯一重复是 stream_cas 构造(2 处 4 行,trivial,
   按既定 bar 不抽)。handle_multi_modify_merge(388,最大未读 handler)= 清晰 Phase1(闭包+Phase1Result struct)/1.5
   (alloc fallback)/2(原子 etcd txn,uniform-CAS survivor baselines)/3(apply),注释足,MultiModifyMergeResp 仅 5 处稀疏。
@@ -259,6 +259,25 @@ ROUND 20 COMMIT(待 push):mirror_* 族分析(已 well-factored,不动)+ **真·�
 进度:20 轮全绿(R1-R20),均 push(R20 本轮 push)。
 Next(loop 续):㉑ genuine 结构冗余已个位数且零散。继续按既定策略:挖到 genuine 非平凡结构去重就动(coco+chaos),
   否则 analyze=清晰报告、不造 churn。强烈建议用户定向(热路径 reproduce-first 授权 / fuse·ioring 扩 chaos / perf·feature)。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 21 COMMIT(待 push):转 client SDK(client/lib.rs)——**真·4-site 字节级结构去重:路由-重试 backoff+refresh 尾**。
+  分析:call_ps_for_key(数据路径)vs call_ps_for_part(admin 路径)看似同构但**有意分歧**(F225:admin 路径短路
+  deterministic 错误 PreconditionFailed/InvalidArgument/ValueTooLarge,数据路径绝不短路因 FailedPrecondition=stale
+  epoch 必 refresh;payload 闭包 vs 固定;resolve_key vs resolve_part)→ 整体合并会 conflate 故意差异,**不合并**
+  (同 rpc_handlers "21 leader 前缀" 否决教训)。**但**4 个路由-重试 loop(call_ps_for_key/part/get_into/get_range_into)
+  的 backoff+refresh **尾**字节级相同(仅缩进 20 vs 12):`if attempt>=MAX{break} attempt+=1; refresh_backoff; sleep;
+  refresh_regions`。→ 抽 `refresh_and_backoff(&mut attempt)->bool`(budget 用尽→false 调用方 break;否则 bump+backoff+
+  refresh→true)。**只抽真正相同的尾,故意分歧的 resolve/payload/错误分类全留各调用点**。2 组 replace_all(20-space×2 +
+  12-space×2)。net -5(23/-28)——真减行(4-site 去重 helper 摊销),给路由-重试步骤命名。
+  验证:build+clippy(2 warn 无新增)+ **27/27 client 单测** + **coco findbugs deep(GPT-5.5)未发现** +
+  **chaos seed 603(58s,workload SDK 走 call_ps_*;split/merge 触发 refresh-retry 即 refresh_and_backoff):mismatch=0
+  not_found=0、range=0、write-liveness=0、accounting=0(5ext/8membership)all invariants OK**。
+观察:R21 = 迄今最干净的尾期去重(4-site 字节级、net 真负、直接 chaos-validated、命名清晰),且**正确识别 call_ps_for_key/part
+  的"看似 dup 实为有意分歧"不强合**(避免 conflate 教训)。client SDK 路由-重试族现共享 refresh_and_backoff 单一真源。
+进度:21 轮全绿(R1-R21),均 push(R21 本轮 push)。
+Next(loop 续):㉒ 继续按既定策略挖 genuine 结构去重(coco+chaos),否则 analyze=清晰。建议用户定向(热路径 reproduce-first
+  授权 / fuse·ioring 扩 chaos / perf·feature)。client SDK 其余(range/batch_put/get_many fan_out 已是 F245 单一真源)。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
