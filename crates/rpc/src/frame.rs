@@ -129,6 +129,50 @@ impl Frame {
         buf.freeze()
     }
 
+    /// Build + encode a response frame in ONE allocation, writing the payload
+    /// straight into the frame buffer via `write_payload` (which must append
+    /// exactly `payload_len` bytes), then appending the CRC32C trailer.
+    ///
+    /// Byte-for-byte identical to `Frame::response(req_id, msg_type, payload)
+    /// .encode()`, but without the intermediate payload `Bytes`: the standard
+    /// two-step `Resp::encode()` (alloc + fill a payload buffer) followed by
+    /// `Frame::encode()` (alloc the frame buffer + copy the payload into it)
+    /// pays two allocations and copies the payload twice. On the read hot path
+    /// the payload IS the value, so that second copy is a full per-read memcpy
+    /// of the data; this builds the framed bytes once and copies the payload at
+    /// most once.
+    pub fn encode_response_with<F: FnOnce(&mut BytesMut)>(
+        req_id: u32,
+        msg_type: u8,
+        payload_len: usize,
+        write_payload: F,
+    ) -> Bytes {
+        let on_wire_len = payload_len + 4;
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + on_wire_len);
+        buf.put_u32_le(req_id);
+        buf.put_u8(msg_type);
+        buf.put_u8(FLAG_RESPONSE | FLAG_CRC);
+        buf.put_u32_le(on_wire_len as u32);
+        let payload_start = buf.len();
+        write_payload(&mut buf);
+        // Release-enforced (not debug-only): a `write_payload` that appends a
+        // different count than `payload_len` would emit a frame whose header
+        // `payload_len`, actual payload, and CRC-trailer position disagree —
+        // a malformed frame that desyncs the peer's `FrameDecoder` (the exact
+        // stream-corruption class the per-frame CRC exists to prevent). Fail
+        // loud rather than ship a silently-bad frame. The check is one integer
+        // compare — negligible next to the payload memcpy this method saves.
+        assert_eq!(
+            buf.len() - payload_start,
+            payload_len,
+            "encode_response_with: write_payload appended {} bytes, expected {payload_len}",
+            buf.len() - payload_start,
+        );
+        let crc = crc32c::crc32c(&buf[payload_start..]);
+        buf.put_u32_le(crc);
+        buf.freeze()
+    }
+
     /// Encode only the header into a fixed-size array (for vectored writes).
     /// Always sets FLAG_CRC — the caller MUST follow the header bytes with the
     /// payload AND a 4-byte CRC trailer (use `compute_payload_crc`). The
@@ -349,6 +393,30 @@ mod tests {
         // FLAG_CRC set on every encoded frame.
         assert_eq!(decoded.flags & FLAG_CRC, FLAG_CRC);
         assert_eq!(decoded.payload, Bytes::from_static(b"hello world"));
+    }
+
+    #[test]
+    fn encode_response_with_matches_response_encode() {
+        // Byte-for-byte identical to the two-step `response(...).encode()`,
+        // for an empty payload, a tiny payload, and a large one.
+        for payload in [
+            Bytes::new(),
+            Bytes::from_static(b"\x00abcdefgh"),
+            Bytes::from(vec![0xCD; 4096]),
+        ] {
+            let want = Frame::response(7, 2, payload.clone()).encode();
+            let got = Frame::encode_response_with(7, 2, payload.len(), |b| {
+                b.extend_from_slice(&payload);
+            });
+            assert_eq!(got, want, "payload len {}", payload.len());
+
+            // And it still decodes (CRC verified) back to the payload.
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&got);
+            let decoded = decoder.try_decode().unwrap().unwrap();
+            assert!(decoded.is_response());
+            assert_eq!(decoded.payload, payload);
+        }
     }
 
     #[test]

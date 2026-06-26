@@ -113,7 +113,11 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // current tail still equals `seal_extent_id`, else returns the current tail
     // untouched — so a retried roll never over-seals the freshly-rolled tail
     // (chaos seed=603 split-child WAL-FAILSTOP wedge). Pre-R3: MIN=MAX=8.
-    (8, "92ea7fc8dd2afaa5"),
+    // (Fingerprint updated within the same logical v8 by the read-response
+    // single-alloc perf change — added `Frame::encode_response_with` (an
+    // additive encoder producing byte-identical frames, no wire-layout change);
+    // v8 not yet deployed.)
+    (8, "738fb894e793877e"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

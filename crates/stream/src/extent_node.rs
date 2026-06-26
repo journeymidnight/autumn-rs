@@ -2400,6 +2400,7 @@ async fn build_append_future(
         // so there is no post-write save_meta here. The data write above is
         // durable via the coalescer; the fence was durable before we got here.
 
+        use bytes::BufMut;
         req_ids
             .into_iter()
             .enumerate()
@@ -2409,12 +2410,16 @@ async fn build_append_future(
                 } else {
                     total_end
                 };
-                let resp = AppendResp {
-                    code: CODE_OK,
-                    offset: offsets[k],
-                    end,
-                };
-                Frame::response(req_id, MSG_APPEND, resp.encode()).encode()
+                let offset = offsets[k];
+                // One allocation per response: the AppendResp payload
+                // (`[code:1][offset:8 LE][end:8 LE]`, 17 bytes) is written
+                // directly into the frame buffer instead of through an
+                // intermediate `AppendResp::encode()` Bytes.
+                Frame::encode_response_with(req_id, MSG_APPEND, 17, |b| {
+                    b.put_u8(CODE_OK);
+                    b.put_u64_le(offset);
+                    b.put_u64_le(end);
+                })
             })
             .collect()
     })
@@ -2539,19 +2544,23 @@ fn build_read_future(
                 let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
                 match result {
                     Ok(_) => {
-                        out.push(
-                            Frame::response(
-                                slot.req_id,
-                                MSG_READ_BYTES,
-                                ReadBytesResp {
-                                    code: CODE_OK,
-                                    end,
-                                    payload: Bytes::from(buf),
-                                }
-                                .encode(),
-                            )
-                            .encode(),
-                        );
+                        // Build the framed ReadBytesResp in ONE allocation. The
+                        // old `ReadBytesResp{..}.encode()` then `Frame::encode()`
+                        // pair copied the value payload twice (once into the resp
+                        // buffer, once into the frame); this copies it once. The
+                        // payload layout `[code:1][end:8 LE][value]` matches
+                        // `ReadBytesResp::encode`.
+                        use bytes::BufMut;
+                        out.push(Frame::encode_response_with(
+                            slot.req_id,
+                            MSG_READ_BYTES,
+                            9 + buf.len(),
+                            |b| {
+                                b.put_u8(CODE_OK);
+                                b.put_u64_le(end);
+                                b.extend_from_slice(&buf);
+                            },
+                        ));
                     }
                     Err(e) => {
                         out.push(err_bytes(
