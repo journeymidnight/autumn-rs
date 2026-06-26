@@ -922,3 +922,19 @@ ROUND 30 — 跨 crate response-boilerplate 系统清查(R29 教训的 follow-up
   验证:**chaos fresh seed 99 @30s 验 R29 代码(5340552):all invariants OK(400 keys,3ext/3membership)**——R29 改动在
   新 nemesis 调度下稳。
 进度:22 轮代码全绿(R1-R21+R29)。response-boilerplate campaign 真正收口(R29 修正了 R22/23 过早"井干"+R30 系统确认)。
+
+ROUND 31 — 系统扫 dense Resp 构造(>=5/file)区分 net-reduction vs line-neutral,**彻底确认 response-pattern 收口**。
+  扫所有 chaos-validated crate:manager/rpc_handlers 有 9 个 dense Resp 类型(ReportCorruptReplicaResp 11 / RegisterNode 8 /
+  MergePartitions 7 / CheckCommitLength 7 / CreateStream 6 / AcquireLease 6 / UpdateStreamEc 5 / ReleaseLease 5 /
+  MultiModifyMerge 5);ps/lib.rs PutResp 8(热路径+key 字段)。
+  **关键判据(R29 教训精炼)**:per-type {code,message} helper 是否 genuine = 看 single-line vs multi-line message 占比。
+  · code_resp(manager R17 net-54 / stream R29 net-36)= single-line 主导(CODE_OK/String::new/短消息)→ 真减行,做。
+  · ReportCorruptReplicaResp 11 处 = **6 处多行 format!** 主导 → 抽取 ~行数中性(同 force_ec_resp R18 net+2)→ **不做**。
+  · RegisterNode/MergePartitions/CheckCommitLength/CreateStream/Lease 类 = 有额外字段(node_id/length/stream_id/lease/
+    new_tail_extent_id)非 clean {code,message},部分在 merge/split/lease revert-prone 区 → **不做**。
+  · PutResp = 热路径 + key 字段 → defer。
+  **结论:net-reduction response dedup 已全做完(code_resp manager+stream)。R29 是最后一个 genuine。剩余 dense Resp
+  是 line-neutral 尾(多行消息主导)或额外字段类——按 R18/R22 教训正确不抽(别造行数中性/net-negative churn)。**
+  本轮系统判据 distinguishing net-reduction↔line-neutral,非 R22/23 那种过早"井干"——是有数据支撑的收口确认。
+进度:22 轮代码全绿(R1-R21+R29)。response-pattern campaign 经 R29(修正)+R30(CodeResp 跨 crate)+R31(全 dense 类型
+  net-reduction vs line-neutral 判据)三轮系统确认,真正收口。
