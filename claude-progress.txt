@@ -971,3 +971,16 @@ ROUND 35 COMMIT(待 push):**授权热路径 A 续——build_append_future(EN �
 进度:24 轮代码全绿(R1-R21+R29+R34+R35)。**授权热路径去重 2 个完成**(R34 enqueue admission / R35 build_append_future
   batch-reject,均 reproduce-first 全套验证+双 chaos seed+coco)。剩余热路径候选:partition_loop(group-commit 核心,
   最敏感,若用户继续 A 再谨慎评估有无 pure 去重);F178 coalescer(note 24 已 revert 史,不碰)。
+
+ROUND 36 — partition_loop 谨慎评估(授权 A 第 3 候选)→ **正确不动**(无 clearly-pure 去重)。读完全函数(5351-5691,340 行):
+  group-commit SQ/CQ 派发循环,已高度 well-factored(handle_completion/handle_incoming_req/start_write_batch/
+  try_complete_freeze_drain/drain_and_shutdown/check_freeze_ttls 都已抽 helper)。残留重复是**控制流**:
+  `handle_completion(...).await; if locked_by_other.get(){break}`(~5 处)+ `handle_incoming_req + None=>break`(~3 处),
+  嵌在不同 select 臂里、break 目标还不同(`break 'outer` vs `break`)→ **非 clearly-pure**(抽取会改 group-commit 核心的
+  break 控制流,边际收益)。无 response-construction boilerplate(响应经 WriteResponder 在 handle_completion/start_write_
+  batch 发,不在 loop 内联)。**判断:最敏感函数只在 clearly-pure 时动,此处只有控制流残留→不动**(知道何时不碰)。
+  无 code 改动;HEAD=R35(3470c68)已 chaos-validated(603+7),不重跑。
+进度:24 轮代码全绿(R1-R21+R29+R34+R35)+ R36 分析。**授权 A 的 3 个热路径候选已全部处理**:R34 enqueue admission(纯去重,
+  做)+ R35 build_append_future batch-reject(纯去重,做)+ R36 partition_loop(无纯去重,正确不动)。其余热路径(stream
+  client append_payload_segments=retry loop 有意分歧;F178 coalescer=note24 revert 史不碰;ps-conn handle_connection=
+  控制循环)均非纯去重目标。热路径 behavior-preserving 去重substantially 完成。
