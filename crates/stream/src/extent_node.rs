@@ -2085,6 +2085,29 @@ fn eversion_mismatch_read_resp(req_id: u32, zc: bool) -> Bytes {
     }
 }
 
+/// Reject an entire same-extent append batch with `code` (no bytes written →
+/// offset/end = 0): encode the `AppendResp` once and fan it out to every slot's
+/// `req_id`. Every fail-closed guard in `build_append_future` (quarantine /
+/// eversion / seal / owner-epoch fence / commit-reconcile) returns one of these
+/// — the batched analog of `append_reject`. Pure response construction; touches
+/// none of the seal/fence/commit logic.
+fn batch_append_reject(
+    slots: Vec<AppendSlot>,
+    code: u8,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
+    let resp_payload = AppendResp {
+        code,
+        offset: 0,
+        end: 0,
+    }
+    .encode();
+    let out: Vec<Bytes> = slots
+        .into_iter()
+        .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+        .collect();
+    Box::pin(async move { out })
+}
+
 /// Build the async future that performs ACL + pwritev for a same-extent
 /// APPEND batch. ACL early rejections resolve the future as an immediate
 /// pre-encoded Vec<Bytes> with no I/O.
@@ -2113,17 +2136,7 @@ async fn build_append_future(
     // open/owner_epoch=0 would let a stale lower-epoch writer bypass the fence
     // and ghost-append. Refuse until manager recovery rebuilds it.
     if extent.corrupt_meta.load(Ordering::SeqCst) {
-        let resp_payload = AppendResp {
-            code: CODE_PRECONDITION,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_PRECONDITION);
     }
 
     // 1. Eversion refresh: if ANY req.eversion > local, refresh from manager.
@@ -2175,34 +2188,14 @@ async fn build_append_future(
         || extent.sealed_length.load(Ordering::SeqCst) > 0
         || extent.avali.load(Ordering::SeqCst) > 0;
     if sealed || slots.iter().any(|s| local_eversion > s.req.eversion) {
-        let resp_payload = AppendResp {
-            code: CODE_PRECONDITION,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_PRECONDITION);
     }
 
     // 3. OwnerEpoch fencing: the first request's owner_epoch governs the batch.
     let first = &slots[0].req;
     let owner_epoch = extent.owner_epoch.load(Ordering::SeqCst);
     if first.owner_epoch < owner_epoch {
-        let resp_payload = AppendResp {
-            code: CODE_LOCKED_BY_OTHER,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_LOCKED_BY_OTHER);
     }
     // 3b. P0-B durable fence. Two coupled guarantees:
     //   (i) raise the in-memory bar SYNCHRONOUSLY (monotonic fetch_max) so a
@@ -2234,17 +2227,7 @@ async fn build_append_future(
             error = %e,
             "P0-B: durable fence persist failed — rejecting append (fail-closed)"
         );
-        let resp_payload = AppendResp {
-            code: CODE_PRECONDITION,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_PRECONDITION);
     }
     // P0-B: re-check fencing AFTER the (possibly awaiting) durable step. The
     // `ensure_fence_durable` await is a new yield point; during it a concurrent
@@ -2255,49 +2238,19 @@ async fn build_append_future(
     // landed during our await. (owner_epoch and sealed are CHECKED
     // SEPARATELY — they are independent concerns: fencing vs seal state.)
     if first_revision < extent.owner_epoch.load(Ordering::SeqCst) {
-        let resp_payload = AppendResp {
-            code: CODE_LOCKED_BY_OTHER,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_LOCKED_BY_OTHER);
     }
     if extent.sealed.load(Ordering::SeqCst)
         || extent.sealed_length.load(Ordering::SeqCst) > 0
         || extent.avali.load(Ordering::SeqCst) > 0
     {
-        let resp_payload = AppendResp {
-            code: CODE_PRECONDITION,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_PRECONDITION);
     }
 
     // 4. Commit reconciliation.
     let mut file_start = extent.len.load(Ordering::SeqCst);
     if file_start < first.commit as u64 {
-        let resp_payload = AppendResp {
-            code: CODE_PRECONDITION,
-            offset: 0,
-            end: 0,
-        }
-        .encode();
-        let out: Vec<Bytes> = slots
-            .into_iter()
-            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-            .collect();
-        return Box::pin(async move { out });
+        return batch_append_reject(slots, CODE_PRECONDITION);
     }
     if file_start > first.commit as u64 {
         // F119-E / F123: before truncating, confirm with manager that this
@@ -2322,17 +2275,7 @@ async fn build_append_future(
                 {
                     tracing::error!(extent_id, error = %e, "P0-A: seal not durable during commit-reconcile reject (disk offline)");
                 }
-                let resp_payload = AppendResp {
-                    code: CODE_PRECONDITION,
-                    offset: 0,
-                    end: 0,
-                }
-                .encode();
-                let out: Vec<Bytes> = slots
-                    .into_iter()
-                    .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-                    .collect();
-                return Box::pin(async move { out });
+                return batch_append_reject(slots, CODE_PRECONDITION);
             }
         }
         if let Err(e) = node.truncate_to_commit_ref(&extent, first.commit).await {
@@ -2353,17 +2296,7 @@ async fn build_append_future(
             || extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
-            let resp_payload = AppendResp {
-                code: CODE_PRECONDITION,
-                offset: 0,
-                end: 0,
-            }
-            .encode();
-            let out: Vec<Bytes> = slots
-                .into_iter()
-                .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
-                .collect();
-            return Box::pin(async move { out });
+            return batch_append_reject(slots, CODE_PRECONDITION);
         }
         file_start = extent.len.load(Ordering::SeqCst);
     }

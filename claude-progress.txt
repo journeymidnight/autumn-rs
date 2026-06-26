@@ -955,3 +955,19 @@ ROUND 34 COMMIT(待 push):**用户定向 A——授权热路径 reproduce-first*
 进度:23 轮代码全绿(R1-R21+R29+R34)。**首个授权热路径去重完成**(reproduce-first 纪律:全套单测+双 chaos seed+coco,
   behavior-preserving,BUG-LEASE-2 顺序完整)。剩余热路径候选:build_append_future/partition_loop(更 revert-prone,
   若用户继续 A 可逐个谨慎做)。
+
+ROUND 35 COMMIT(待 push):**授权热路径 A 续——build_append_future(EN 最 revert-prone 批量 append 快路)batch-reject 去重**。
+  分析全函数(2102-2488):9 处 fail-closed guard(quarantine/eversion/seal/owner-epoch fence×2/commit×3)各自
+  `AppendResp{code,0,0}.encode() → slots.map(Frame::response(req_id)) → collect → Box::pin` **11 行字节级相同**
+  (仅 code:CODE_PRECONDITION×7 / CODE_LOCKED_BY_OTHER×2 不同)→ 抽 `batch_append_reject(slots,code)->Pin<Box<dyn
+  Future<Vec<Bytes>>>>`(R15 append_reject 的批量版)。**纯响应构造零语义风险**:9 个 guard 条件全 inline 不动,只换
+  reject 尾;err_bytes 变体(eversion-refresh/truncate-fail)+ success 路径(走 req_ids 非 slots)+ 在-future 错误
+  路径都不碰。2 组 replace_all(8-space PRECONDITION×5 + LOCKED×2)+ 2 个别 edit(16/12-space)。net -67(32/-99)真减行。
+  **coco 抓到 1 个 P3**:helper 插入把 build_append_future 原 doc 注释挤到 batch_append_reject 上(误绑定)→ 修:doc 移回
+  async fn 紧邻上方,helper 只留自己 doc → **re-coco 未发现问题**。
+  **热路径重点验证**:build+clippy(22 warn 不变)+ **90/90 stream 单测(含 SQ/CQ append 测)** + **coco findbugs deep
+  (GPT-5.5)P3 修后未发现** + **chaos seed 603 + fresh seed 7 双跑(build_append_future 每 EN 写都走 + kill 触发
+  seal/fence/commit-reconcile reject 路径):两个 all invariants OK mismatch=0 accounting=0**。
+进度:24 轮代码全绿(R1-R21+R29+R34+R35)。**授权热路径去重 2 个完成**(R34 enqueue admission / R35 build_append_future
+  batch-reject,均 reproduce-first 全套验证+双 chaos seed+coco)。剩余热路径候选:partition_loop(group-commit 核心,
+  最敏感,若用户继续 A 再谨慎评估有无 pure 去重);F178 coalescer(note 24 已 revert 史,不碰)。
