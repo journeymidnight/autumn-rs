@@ -6231,6 +6231,42 @@ pub(crate) fn check_and_bump_fence(
     Ok(false)
 }
 
+/// region-epoch + in_range admission shared by `enqueue_put` /
+/// `enqueue_put_zc` / `enqueue_delete`. Returns `Some(rejection)` for the FIRST
+/// failing check — stale region epoch → `FailedPrecondition`, out-of-range key
+/// → `InvalidArgument` — or `None` if admitted. The caller sends the rejection
+/// on its own single `resp_tx` and returns, which keeps the exact
+/// region → range → value-too-large → fence admission order (BUG-LEASE-2 P1 #1:
+/// a mis-routed key must be refused BEFORE the fence floor is raised/persisted).
+/// `enqueue_batch_put` keeps its own region check + per-op range (it records
+/// accumulator statuses, not a single resp).
+fn admit_region_range(
+    region_epoch: u64,
+    key: &[u8],
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    part_rg: Option<&Range>,
+) -> Option<(StatusCode, String)> {
+    if region_epoch != 0 && region_epoch != part_region_epoch {
+        return Some((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, region_epoch
+            ),
+        ));
+    }
+    if let Some(rg) = part_rg {
+        if !in_range(rg, key) {
+            return Some((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+    }
+    None
+}
+
 fn enqueue_put(
     req: PartitionRequest,
     pending: &mut Vec<WriteRequest>,
@@ -6251,27 +6287,17 @@ fn enqueue_put(
 ) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
-            if put_req.region_epoch != 0 && put_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((
-                    StatusCode::FailedPrecondition,
-                    format!(
-                        "region epoch stale: part_id={} have={} got={}",
-                        part_id_for_err, part_region_epoch, put_req.region_epoch
-                    ),
-                )));
+            // region-epoch + in_range admission BEFORE value-too-large + fence
+            // (BUG-LEASE-2 P1 #1: a mis-routed key must not raise the floor).
+            if let Some(err) = admit_region_range(
+                put_req.region_epoch,
+                &put_req.key,
+                part_region_epoch,
+                part_id_for_err,
+                part_rg,
+            ) {
+                let _ = req.resp_tx.send(Err(err));
                 return;
-            }
-            // BUG-LEASE-2 Phase 2 (coco P1 #1): range admission BEFORE
-            // the fence check — a mis-routed key must be rejected
-            // without raising (and durably persisting) the floor.
-            if let Some(rg) = part_rg {
-                if !in_range(rg, &put_req.key) {
-                    let _ = req.resp_tx.send(Err((
-                        StatusCode::InvalidArgument,
-                        "key is out of range".to_string(),
-                    )));
-                    return;
-                }
             }
             // F129: regular `Put` rejects values exceeding the inline
             // cap. Caller should retry via PutBegin/Chunk/Commit.
@@ -6488,28 +6514,21 @@ fn enqueue_put_zc(
         )));
         return;
     };
-    if meta.region_epoch != 0 && meta.region_epoch != part_region_epoch {
-        let _ = req.resp_tx.send(Err((
-            StatusCode::FailedPrecondition,
-            format!(
-                "region epoch stale: part_id={} have={} got={}",
-                part_id_for_err, part_region_epoch, meta.region_epoch
-            ),
-        )));
-        return;
-    }
-    // Zero-copy slices of the frame payload (Bytes refcount, no memcpy).
+    // Zero-copy slice of the frame payload (Bytes refcount, no memcpy);
+    // `value_offset` was validated by `parse_put_zc_meta` above, so hoisting
+    // this above the epoch check is side-effect-free.
     let key = req.payload.slice(PUT_ZC_HEADER_LEN..meta.value_offset);
-    // BUG-LEASE-2 Phase 2 (coco P1 #1): range admission BEFORE the fence
-    // check — mirrors enqueue_put.
-    if let Some(rg) = part_rg {
-        if !in_range(rg, &key) {
-            let _ = req.resp_tx.send(Err((
-                StatusCode::InvalidArgument,
-                "key is out of range".to_string(),
-            )));
-            return;
-        }
+    // region-epoch + in_range admission BEFORE value-too-large + fence
+    // (BUG-LEASE-2 P1 #1: a mis-routed key must not raise the floor).
+    if let Some(err) = admit_region_range(
+        meta.region_epoch,
+        &key,
+        part_region_epoch,
+        part_id_for_err,
+        part_rg,
+    ) {
+        let _ = req.resp_tx.send(Err(err));
+        return;
     }
     // F216-E W1: a LARGE value was recv'd straight into a registered PooledBuf
     // by the ps-conn (zc_value = a Bytes aliasing it, no off-wire copy); use it
@@ -6587,25 +6606,17 @@ fn enqueue_delete(
 ) {
     match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
         Ok(del_req) => {
-            if del_req.region_epoch != 0 && del_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((
-                    StatusCode::FailedPrecondition,
-                    format!(
-                        "region epoch stale: part_id={} have={} got={}",
-                        part_id_for_err, part_region_epoch, del_req.region_epoch
-                    ),
-                )));
+            // region-epoch + in_range admission BEFORE the fence check
+            // (BUG-LEASE-2 P1 #1: a mis-routed key must not raise the floor).
+            if let Some(err) = admit_region_range(
+                del_req.region_epoch,
+                &del_req.key,
+                part_region_epoch,
+                part_id_for_err,
+                part_rg,
+            ) {
+                let _ = req.resp_tx.send(Err(err));
                 return;
-            }
-            // Range admission BEFORE the fence check (coco P1 #1 rule).
-            if let Some(rg) = part_rg {
-                if !in_range(rg, &del_req.key) {
-                    let _ = req.resp_tx.send(Err((
-                        StatusCode::InvalidArgument,
-                        "key is out of range".to_string(),
-                    )));
-                    return;
-                }
             }
             if let Some(floors_cell) = fence_floors {
                 let bump = {

@@ -938,3 +938,20 @@ ROUND 31 — 系统扫 dense Resp 构造(>=5/file)区分 net-reduction vs line-n
   本轮系统判据 distinguishing net-reduction↔line-neutral,非 R22/23 那种过早"井干"——是有数据支撑的收口确认。
 进度:22 轮代码全绿(R1-R21+R29)。response-pattern campaign 经 R29(修正)+R30(CodeResp 跨 crate)+R31(全 dense 类型
   net-reduction vs line-neutral 判据)三轮系统确认,真正收口。
+
+ROUND 34 COMMIT(待 push):**用户定向 A——授权热路径 reproduce-first**。做了我反复 flag 的 enqueue admission preamble 去重。
+  分析 4 个 enqueue(put/put_zc/delete/batch_put):region_epoch + in_range admission 在 put(6254-75)/put_zc(6491-
+  6513)/delete(6590-6609)**字节级相同**(仅字段源不同);**batch_put 有意分歧**(region check 同,但 in_range 是 per-op
+  记 accum status 而非 send Err)→ 同 call_ps_for_key/part 教训,**不并 batch**。抽纯 fn `admit_region_range(region_epoch,
+  key,part_region_epoch,part_id_for_err,part_rg)->Option<(StatusCode,String)>`(返回首个失败 check 的 rejection 或 None;
+  调用方仍自己 send+return,**保持 region→range→value-too-large→fence 精确顺序**,BUG-LEASE-2 P1#1 不变量完整)。
+  put_zc 的 key slice 原在 region↔range 之间→上提到 epoch check 前(value_offset 已被 parse_put_zc_meta 验证,O(1)
+  refcount 无副作用,behavior-preserving)。net +11(doc 注释占;调用点其实更短+命名意图清晰;单一真源=correctness-
+  sensitive 热路径 admission 一处改)——区别于 R22 audit(8 字段 positional 更差)的 net-negative,此处是 genuine logic-dedup。
+  **热路径重点验证**:build+clippy(23 warn 不变)+ **167/167 ps 单测(含 enqueue_put_accepts_value_at_inline_cap +
+  rejects_oversized_value——确认 value-too-large 仍在 region+range 之后正确触发,顺序完整)** + **coco findbugs deep
+  (GPT-5.5)未发现** + **chaos seed 603 + fresh seed 42 双跑(admit_region_range 每写都走 + split/merge epoch churn +
+  fence):两个 all invariants OK mismatch=0 accounting=0**。
+进度:23 轮代码全绿(R1-R21+R29+R34)。**首个授权热路径去重完成**(reproduce-first 纪律:全套单测+双 chaos seed+coco,
+  behavior-preserving,BUG-LEASE-2 顺序完整)。剩余热路径候选:build_append_future/partition_loop(更 revert-prone,
+  若用户继续 A 可逐个谨慎做)。
