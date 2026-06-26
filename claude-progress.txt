@@ -908,3 +908,17 @@ ROUND 29 COMMIT(待 push):**genuine dedup 复活——R22/23 的"井干"结论�
   crate 系统查同一 pattern**(append_reject/code_resp/alloc_reject 类响应构造)。下轮:查 partition-server/client 是否也有
   未抽的 CodeResp/Resp 构造 boilerplate。
 进度:22 轮代码全绿(R1-R21 + R29),R22-R28 分析/fuzz。
+
+ROUND 30 — 跨 crate response-boilerplate 系统清查(R29 教训的 follow-up)+ R29 fresh-seed 验证。
+  系统查 partition-server + client 是否也有未抽的 CodeResp/Resp 构造 boilerplate(R29 发现 stream 漏抽,本轮确保无其它漏网):
+  · partition-server/rpc_handlers.rs:MaintenanceResp/HeadResp/GetRedirectResp 各≤3、RangeResp/GetResp×2、无 CodeResp
+    = 稀疏,无 dense 单类型 boilerplate → 干净。
+  · partition-server/lib.rs:PutResp×8——但 PutResp={code,message,**key**}(3 字段,key 各异)且全在**写热路径**
+    (enqueue_put/group-commit responder/partition_loop)→ 非 clean {code,message} 且热路径,**正确 defer**。
+  · client/lib.rs:0 个 server CodeResp(SDK 是 decode 侧,用 AutumnError)→ 干净。
+  **结论:CodeResp response-boilerplate 现已跨所有 chaos-validated crate 抽净(manager R17 + stream R29;ps 热路径/稀疏、
+  client SDK 侧)。R29 是此 pattern 最后一个 genuine。** 其它 helper(append_reject/alloc_reject/force_ec_resp/
+  refresh_and_backoff/replay/eversion-snapshot)都是 crate/函数特定,无跨 crate 扩散。
+  验证:**chaos fresh seed 99 @30s 验 R29 代码(5340552):all invariants OK(400 keys,3ext/3membership)**——R29 改动在
+  新 nemesis 调度下稳。
+进度:22 轮代码全绿(R1-R21+R29)。response-boilerplate campaign 真正收口(R29 修正了 R22/23 过早"井干"+R30 系统确认)。
