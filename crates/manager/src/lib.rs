@@ -1864,6 +1864,39 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(out)
     }
 
+    /// Replay a `node_override`-shaped etcd prefix (`MgrNodeOverride` values
+    /// keyed by node id) into `out`: clear, then per key parse the id (fail-loud
+    /// via `?`) and rkyv-decode the value — a malformed payload is SKIPPED with a
+    /// WARN (these are per-node localizable, so a bad one is dropped, not fatal —
+    /// unlike core metadata, which fails loud via `replay_decode_id_map`).
+    /// `label` names the prefix in the skip warning. Shared by `node_override/`
+    /// and `decommissioned/`.
+    fn replay_node_override_map(
+        kvs: &[autumn_etcd::proto::KeyValue],
+        prefix: &str,
+        label: &str,
+        out: &mut HashMap<u64, MgrNodeOverride>,
+    ) -> Result<()> {
+        out.clear();
+        for kv in kvs {
+            let id = Self::parse_id_from_key(prefix, &kv.key)?;
+            let ovr: MgrNodeOverride = match rkyv_decode(&kv.value) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        node_id = id,
+                        error = %e,
+                        "F211-C: skipping malformed {} entry",
+                        label
+                    );
+                    continue;
+                }
+            };
+            out.insert(id, ovr);
+        }
+        Ok(())
+    }
+
     async fn replay_from_etcd(&self) -> Result<()> {
         let etcd = match &self.etcd {
             Some(v) => v,
@@ -1987,44 +2020,18 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // Maintenance). Overrides survive leader failover so the new
         // leader's `recovery_dispatch_loop` (F211-E) sees the same
         // Fenced set as the deposed leader.
-        {
-            let mut overrides = self.node_overrides.borrow_mut();
-            overrides.clear();
-            for kv in &node_override_raw.kvs {
-                let id = Self::parse_id_from_key(NODE_OVERRIDE_PREFIX, &kv.key)?;
-                let ovr: MgrNodeOverride = match rkyv_decode(&kv.value) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            node_id = id,
-                            error = %e,
-                            "F211-C: skipping malformed node_override entry"
-                        );
-                        continue;
-                    }
-                };
-                overrides.insert(id, ovr);
-            }
-        }
-        {
-            let mut decom = self.decommissioned.borrow_mut();
-            decom.clear();
-            for kv in &decommissioned_raw.kvs {
-                let id = Self::parse_id_from_key(DECOMMISSIONED_PREFIX, &kv.key)?;
-                let ovr: MgrNodeOverride = match rkyv_decode(&kv.value) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            node_id = id,
-                            error = %e,
-                            "F211-C: skipping malformed decommissioned entry"
-                        );
-                        continue;
-                    }
-                };
-                decom.insert(id, ovr);
-            }
-        }
+        Self::replay_node_override_map(
+            &node_override_raw.kvs,
+            NODE_OVERRIDE_PREFIX,
+            "node_override",
+            &mut self.node_overrides.borrow_mut(),
+        )?;
+        Self::replay_node_override_map(
+            &decommissioned_raw.kvs,
+            DECOMMISSIONED_PREFIX,
+            "decommissioned",
+            &mut self.decommissioned.borrow_mut(),
+        )?;
         // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
         // every replayed PS. Pre-F210-G1 the map was empty post-failover,
         // and the liveness loop's `None` arm treated unknown PSes as

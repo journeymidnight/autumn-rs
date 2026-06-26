@@ -198,7 +198,7 @@ Next(loop 续):⑱ 候选:其它 Resp 类型若也散落(UpsertPartitionResp 等
   热路径 build_append_future/partition_loop 仍 reproduce-first 暂缓。coco+chaos 每轮不变。
 
 ────────────────────────────────────────────────────────────────────────────────
-ROUND 18 COMMIT(待 push):handle_force_ec_convert 清晰度分析 + force_ec_resp 响应 boilerplate 抽取。
+ROUND 18 COMMIT(4574547,已 push):handle_force_ec_convert 清晰度分析 + force_ec_resp 响应 boilerplate 抽取。
   分析:handle_force_ec_convert(278,F203 OP-driven EC 触发器)= 清晰逻辑流(inflight 检查 → 单 borrow 取 state+
   EC-stream → target-node 推导含 shuffle fallback → F209-D verify-BEFORE-acquire → 统一 inflight marker CAS),
   注释足 → 不动。**14 处 `Ok(rkyv_encode(&ForceEcConvertResp{code,message}))`**(ForceEcConvertResp 结构=
@@ -218,6 +218,28 @@ ROUND 18 COMMIT(待 push):handle_force_ec_convert 清晰度分析 + force_ec_res
 Next(loop 续):⑲ **campaign 收口信号明确**——建议向用户报告并请其定向新方向(如:授权热路径 build_append_future/
   partition_loop 的 reproduce-first 工作 / 扩 chaos 覆盖到 fuse·ioring 后再清那些 crate / 转性能或新 feature)。
   若 loop 续跑无新方向:仅在发现 genuine non-trivial 冗余/混乱时动手,否则记 analyze=清晰避免行数中性 churn。coco+chaos 不变。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 19 COMMIT(待 push):replay_from_etcd 分析 + **真·结构去重(非行数中性 boilerplate)**。
+  R18 收口后用户无新方向、loop 同 prompt 再触发→按既定策略"只动 genuine non-trivial 冗余"。检查 manager/lib.rs 最大
+  函数 replay_from_etcd(344):多数 per-prefix decode loop 各异(id-map 已用 replay_decode_id_map / inode_leases 是
+  fail-loud 两阶段 / failed_deletes 独有),清晰。**真冗余 = node_override(1990-2008)+ decommissioned(2009-2027)两段
+  字节级同构 loop**:同 decode MgrNodeOverride 进 HashMap<u64,_>,clear→parse_id(`?` fail-loud)→rkyv_decode
+  (warn+skip,localizable 非 fatal)→insert,仅(目标 map / prefix const / warn label)不同 → 抽 `replay_node_override_map
+  (kvs,prefix,label,&mut out)`(与 replay_decode_id_map 并列;后者 fail-loud 不同语义故独立)。两 loop→单一真源。
+  warn 消息从字面 "...node_override entry" → "...{} entry"+label 渲染**字节级相同**(标准 tracing 位置格式参数)。
+  net +7(45/-38;doc 注释占增量,**结构上消除重复**=真价值,非 R15-18 的行数中性响应 boilerplate)。
+  验证:build+clippy(4 warn 不变)+ **164/164 manager 单测** + **coco findbugs deep(GPT-5.5)未发现(显式核对 fail-loud
+  parse_id / warn+skip decode / clear+insert 顺序 / borrow_mut 生命周期 / 每调用点 prefix+label+map 正确)** +
+  **chaos seed 603(58s)mismatch=0 accounting=0(6ext/10membership)all invariants OK**。注:replay node_override 路径
+  需 manager-HA failover+持久 override 才直接触发(seed 603=EN-kill 不直接走);本轮为纯 behavior-preserving 抽取,
+  靠 build+coco+types+164 单测 验证语义,chaos 验证无旁路回归。
+观察:R19 证明 dense response-boilerplate 收口后,仍有零星 genuine 结构冗余(同构 loop)值得抽——但已是个位数、需逐函数
+  挖,边际递减。replay_from_etcd 其余 prefix loop 各异(非冗余)。
+进度:19 轮全绿(R1-R19),均 push(R19 本轮 push)。
+Next(loop 续):⑳ campaign 深度收口。建议同 R18-Next:报告并请用户定向(热路径 reproduce-first 授权 / fuse·ioring 扩
+  chaos / 转 perf·feature)。无新方向则继续"只动 genuine 结构冗余,否则 analyze=清晰"——但此类目标已个位数,可能多为
+  no-change analysis 轮。coco+chaos 不变。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
