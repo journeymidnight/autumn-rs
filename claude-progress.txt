@@ -297,6 +297,14 @@ Next(loop 续):㉓ **强烈建议用户定向**——good-dedup 井干,继续同
   方向选项:(A) 授权热路径 reproduce-first(enqueue preamble / build_append_future / partition_loop);(B) fuse·ioring
   扩 chaos 后清那两 crate;(C) 转 perf 调优 / 新 feature / 指定文件。无方向则 analyze-only 报告、绝不造 net-negative churn。
 
+ROUND 23 — NO-CODE(第 2 连续 no-change)。扫 manager/recovery.rs(1538 LOC:node_health_loop 233 / recovery_dispatch_
+  loop 212 / apply_recovery_done 190 / dispatch_recovery_task 171 / dispatch_one_ec_conversion 117)——intricate 单一用途
+  recovery/EC dispatch 循环,F207/F222/F224 不变量 load-bearing = revert-prone 高风险区,无低风险 byte-identical 重复块可抽。
+  确认 good-dedup 井干。**收尾决定:cadence 延长到 1800s 收束**,停止每 4 分钟 churn;无新方向则保持 analyze-only,
+  绝不在 recovery/CAS/热路径 高风险区为边际去重动刀。等用户定向(A 热路径授权 / B fuse·ioring 扩 chaos / C perf·feature·指定文件)。
+进度:21 轮代码全绿(R1-R21,均 push)+ R22/R23 no-code 分析(井干确认)。campaign 在 chaos-validated crates 上的
+  behavior-preserving 去重/分析**实质完成**。
+
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
 Date: 2026-06-25 (review 战役 — 转向最大文件;manager/lib.rs ×2 + chaos 验证 + extent_node.rs ×1)
