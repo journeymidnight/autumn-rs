@@ -998,3 +998,18 @@ ROUND 37 — PutResp 快评(授权 A 最后一个热路径响应类型)→ **无
   · partition_loop(R36)= 无纯去重正确不动;append_payload_segments(retry,有意分歧);F178 coalescer(note24 不碰)。
   **热路径 A 工作 = 2 个 genuine 纯去重交付(R34/R35)+ 系统确认其余无 clean dedup。待用户新方向(更多 A 具体目标 / B
   fuse·ioring 扩 chaos / C perf·feature)。**
+
+ROUND 39 — fuse/ioring crate 侦察(read-only,为 B 决策提供信息;无 code 改动)。
+  发现:① **fuse/ioring 有自己的快单测**(autumn-fuse 44 / autumn-ioring 68,秒过)+ #[ignore] e2e(system_ioring_fuse.rs
+  607 / f_fuse_lease_*/f_ioring_lease_* 需 FUSE+binaries)→ **纯 behavior-preserving 去重可用单测+coco 验证,不必先扩 chaos**
+  (修正了 B"chaos first"的前提:对 pure dedup 而言单测足够)。
+  ② **但 fuse/ioring 缺 dense response-boilerplate**(dispatch.rs 仅 2 reply.error;daemon.rs 仅 2 send_resp)——不是其它
+  crate 那种 CodeResp/AppendResp 密集模板。结构是大 dispatch/service 函数:**ioring daemon service_sqe 527 行**(io_uring
+  SQE 核心 handler)+ fuse dispatch.rs 1680 LOC(opcode match)。→ 清理 fuse/ioring 不是快速 boilerplate sweep,是
+  **深度 giant-函数分析**(recover_partition 那种)。
+  最大未审文件:ioring/daemon.rs 1787(service_sqe 527)/ fuse/dispatch.rs 1680 / fuse/extent.rs 539 / ioring/ring.rs 522 /
+  fuse_write.rs 509 / handshake.rs 490 / fuse_read.rs 468。
+  **B 决策信息**:可行(单测验证),但是深度分析工作非快速去重。等用户确认是否投入 fuse/ioring 清理(原 B / 单测验证的轻量版 /
+  先扩 chaos),还是 C(perf·feature)/ 更多 A。
+进度:24 轮代码全绿 + R36/37/39 分析。behavior-preserving 去重(chaos-validated crates + 授权热路径)完成;fuse/ioring 已侦察,
+  待用户定夺是否扩展到这俩 crate。
