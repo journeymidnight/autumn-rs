@@ -1013,3 +1013,16 @@ ROUND 39 — fuse/ioring crate 侦察(read-only,为 B 决策提供信息;无 cod
   先扩 chaos),还是 C(perf·feature)/ 更多 A。
 进度:24 轮代码全绿 + R36/37/39 分析。behavior-preserving 去重(chaos-validated crates + 授权热路径)完成;fuse/ioring 已侦察,
   待用户定夺是否扩展到这俩 crate。
+
+ROUND 40 — ioring daemon service_sqe(527 行 SQE handler)read-only 分析 → **clear,无 pure dedup**。
+  大 opcode dispatcher(Nop/Open/Read/Write/Close...),每臂是 distinct operation(Open ~170 行带 lease/refcount/extent-load/
+  rollback),非重复块。重复子模式仅:17 个 `Cqe::err(sqe.user_data, errno)` 返回(已极简,Cqe::err 是 helper,errno 各异,
+  无可抽)+ error→errno 映射(msg.contains ENOENT?ENOENT:EIO)**只 1 处不重复**。子操作已委托 fuse_read/fuse_write/lease
+  helper。→ 已 well-factored,intricate 但内在复杂(同 recover_partition 类),不动。
+  **结合 R39+R40 结论:fuse/ioring 没有 low-hanging dedup fruit**——无 dense response-boilerplate(R39),最大函数 service_sqe
+  已 well-factored 无重复块(R40)。这俩 crate 比 manager/stream(有 dense boilerplate)更已-factored。
+  **对 B 的最终判断:B"clean those crates"部分 yield 低(无明显冗余可清);B 的真正价值在"扩 chaos 覆盖到 fuse/ioring"
+  (测试投资,非去重)。** behavior-preserving 去重 mandate 在所有大 crate 上实质完成。
+进度:24 轮代码全绿 + 多轮分析。**清理冗余 mandate 实质完成**:chaos-validated crates(R1-R21/R29)+ 授权热路径(R34/R35)
+  + fuse/ioring 侦察确认无 low-hanging dedup(R39/R40)。下一步真正有价值的是 B-扩chaos(测试项目)或 C(perf/feature),
+  都需用户明确定向。fuzz-monitor 待命。
