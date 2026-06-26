@@ -2550,6 +2550,15 @@ fn build_read_future(
                         // buffer, once into the frame); this copies it once. The
                         // payload layout `[code:1][end:8 LE][value]` matches
                         // `ReadBytesResp::encode`.
+                        //
+                        // A fully zero-copy 3-segment form (head + value-alias +
+                        // CRC trailer, like the ZC path) was measured and REJECTED
+                        // for this small-read path: at 4 KiB the saved memcpy is
+                        // cheaper than the cost it adds — tripling the iovec count
+                        // in `write_vectored_all` plus a per-read trailer alloc —
+                        // and regressed batched reads 2-5% (extent_bench d=16/64).
+                        // Zero-copy only pays off once the value memcpy dominates
+                        // (>= 64 KiB), which is exactly the UCX `zc` branch above.
                         use bytes::BufMut;
                         out.push(Frame::encode_response_with(
                             slot.req_id,
