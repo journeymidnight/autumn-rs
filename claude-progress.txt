@@ -1026,3 +1026,16 @@ ROUND 40 — ioring daemon service_sqe(527 行 SQE handler)read-only 分析 → 
 进度:24 轮代码全绿 + 多轮分析。**清理冗余 mandate 实质完成**:chaos-validated crates(R1-R21/R29)+ 授权热路径(R34/R35)
   + fuse/ioring 侦察确认无 low-hanging dedup(R39/R40)。下一步真正有价值的是 B-扩chaos(测试项目)或 C(perf/feature),
   都需用户明确定向。fuzz-monitor 待命。
+
+──────────────── C 方向:PERF 热路径优化(用户 R42 选 "Perf: hot-path optimization")────────────────
+ROUND 43 COMMIT(03dddda,已 push):perf 测量地基。survey benches:fsync_isolated/ps_bench/ps_read_bench/transport_bench
+  编译过;extent_bench(8 err)+ append_bench(2 err)bit-rot(u32→u64 offset widening)→ **修好**(append 3 处 / extent
+  `0u32`→`0u64`×2 + `(block*4096) as u32`→u64×4)。两者 standalone(in-process EN over loopback,无需 cluster)。
+  **EN 热路径 baseline(sandbox loopback,非 production-representative——绝对值需 perf_check@hardware;但 CPU-path 改动的
+  相对 A/B 可用)**:4KB Append depth=1 42.7 / d=32 217 / **d=64 327.7 MB/s(~84K ops/s)**;4KB Read d=1 303 / **d=64
+  517 MB/s**;Mixed 1w+1r 118K ops/s。bench-only 改动(不碰 production),compile+run 验证,无需 chaos。
+  **约束**:perf/flamegraph **不可用**→优化靠 code-level 分析找真 CPU/alloc 低效,extent_bench A/B 测量;production 绝对
+  影响需用户在 hardware 跑 perf_check 验证(诚实标注)。
+进度:perf 方向启动。下一步 R44:code 分析 append(build_append_future/handle_connection)+ read(build_read_future)热路径找
+  genuine CPU/alloc 低效(消除 hot-loop 分配/拷贝优先),A/B extent_bench 测,correctness 用 stream 单测+chaos 验。绝不
+  speculative 改(jemalloc/F193 回归教训)——要么 A/B 可测的真 win,要么 sound alloc/复杂度论证。
