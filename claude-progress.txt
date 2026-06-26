@@ -261,7 +261,7 @@ Next(loop 续):㉑ genuine 结构冗余已个位数且零散。继续按既定�
   否则 analyze=清晰报告、不造 churn。强烈建议用户定向(热路径 reproduce-first 授权 / fuse·ioring 扩 chaos / perf·feature)。
 
 ────────────────────────────────────────────────────────────────────────────────
-ROUND 21 COMMIT(待 push):转 client SDK(client/lib.rs)——**真·4-site 字节级结构去重:路由-重试 backoff+refresh 尾**。
+ROUND 21 COMMIT(ee6363e,已 push):转 client SDK(client/lib.rs)——**真·4-site 字节级结构去重:路由-重试 backoff+refresh 尾**。
   分析:call_ps_for_key(数据路径)vs call_ps_for_part(admin 路径)看似同构但**有意分歧**(F225:admin 路径短路
   deterministic 错误 PreconditionFailed/InvalidArgument/ValueTooLarge,数据路径绝不短路因 FailedPrecondition=stale
   epoch 必 refresh;payload 闭包 vs 固定;resolve_key vs resolve_part)→ 整体合并会 conflate 故意差异,**不合并**
@@ -278,6 +278,24 @@ ROUND 21 COMMIT(待 push):转 client SDK(client/lib.rs)——**真·4-site 字�
 进度:21 轮全绿(R1-R21),均 push(R21 本轮 push)。
 Next(loop 续):㉒ 继续按既定策略挖 genuine 结构去重(coco+chaos),否则 analyze=清晰。建议用户定向(热路径 reproduce-first
   授权 / fuse·ioring 扩 chaos / perf·feature)。client SDK 其余(range/batch_put/get_many fan_out 已是 F245 单一真源)。
+
+────────────────────────────────────────────────────────────────────────────────
+ROUND 22 — NO-CODE 分析轮(评估 2 个候选,均**正确否决**;无改动,HEAD 仍 ee6363e=R21)。
+  hunt:① 评估 manager F211-C audit-entry 构造(7 处 MgrAuditEntry{op,node_id,extent_id:0,by,reason,result_code,
+  result_message,ts_ns:0} 散落 fence/maintenance/clear/remove)→ 抽 audit_node_op(6 参) helper:**实做后 REVERT**——
+  net +12(6 positional 参 wrap 行数≈struct)且**positional 参丢失 named-field 自解释性**(by/reason/code/message 不如
+  `result_code:`/`result_message:` 清晰)= net-negative 重构;named struct 重复在此**更可读**(extent_id:0/ts_ns:0 显而易见)。
+  ② lease handlers(acquire/release/heartbeat)leader-gate(`if etcd&&!leader { return XxxLeaseResp{NOT_LEADER,...,lease:None} }`)
+  = 跨不同 Resp 类型的 struct 字面量、named-field 清晰 → 同 audit/force_ec 边际类,不抽。lease 各 handler 实质 registry/
+  persist 逻辑各异,无 LOGIC dup。
+  **结论(重要判断)**:GOOD-dedup(重复 LOGIC/loop,helper 既减行又保/增清晰——R19/R20/R21 那种)井已干。剩余"重复"是:
+  (a) struct 字面量(named-field 往往更清晰,别抽成 positional helper);(b) 有意分歧(call_ps_for_key/part);
+  (c) 热路径(enqueue admission preamble region_epoch+in_range+value-too-large+fence 3 处,BUG-LEASE-2 ordering load-bearing,
+  reproduce-first 待用户授权)。**知道何时不抽 = 本阶段的判断力**。跳过 chaos(无 code 改动,R21 seed-603 已绿于此 HEAD code)。
+进度:21 轮代码全绿 + R22 no-code 分析(R1-R21 均 push;R22 仅进度文档)。
+Next(loop 续):㉓ **强烈建议用户定向**——good-dedup 井干,继续同 prompt 多半是 no-change 分析轮或 net-negative 风险。
+  方向选项:(A) 授权热路径 reproduce-first(enqueue preamble / build_append_future / partition_loop);(B) fuse·ioring
+  扩 chaos 后清那两 crate;(C) 转 perf 调优 / 新 feature / 指定文件。无方向则 analyze-only 报告、绝不造 net-negative churn。
 
 ────────────────────────────────────────────────────────────────────────────────
 PREV:
