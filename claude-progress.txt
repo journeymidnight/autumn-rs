@@ -1062,3 +1062,23 @@ ROUND 44 COMMIT(8d8997e,已 push):**首个 perf 优化交付——read/append �
   下一步 R45 候选:① 继续 code-level 找 genuine CPU/alloc 低效(zc read 已最优;非-zc read 现单拷贝;append 响应已单 alloc;
   可看 frame decode CRC 路径 / AppendReq decode / handle_connection drain)——但 EN 热路径已高度优化,剩余多 sub-noise;
   ② 或扩到 PS 热路径(partition_loop / ps_bench)找可测 win;③ 无可测真 win 则诚实报告 perf 收口、等用户新方向。绝不 speculative。
+
+ROUND 45(3b8d2e2,已 push;NEGATIVE RESULT—实验→实测拒绝→revert,只留 guard 注释)。
+  先验证安全路径已枯竭:① AppendReq::decode 已 zero-copy(get_*_le cursor advance + payload=data slice,value 不拷);
+  ② FrameDecoder::try_decode 提取 zero-copy(split_to+freeze 共享 BytesMut,slice CRC 剥离);**唯一 ingress 拷贝=feed 的
+  extend_from_slice**(把 read buf 拷进 decoder accumulator)——但直读进 accumulator 与 compio owned-buffer + SQE-stability
+  不变量冲突(CLAUDE.md 明列 load-bearing:512KiB buf NEVER dropped mid-flight),改 = 高风险重写共享 wire infra,**不碰**。
+  **R45 实验**:非-zc read 成功响应 → **零 value 拷贝**(3 段 vectored:head + value-alias + CRC trailer,镜像 UCX ZC 路径但
+  保留 frame CRC,crc32c_append 增量算)。byte-identity 单测过(0/1/9/4096/65537 全 wire-identical + decode 回原值)+ 91/91 lib。
+  **A/B(extent_bench,R44 baseline 2 runs vs R45 2 runs)→ 一致 REGRESSION**:read d=16 -1.9%/-4.7%,d=64 -0.3%/-3.7%,
+  mixed -2.0~-3.4%(d=1 ~平因无 batching)。**物理解释**:4KB 省下的 memcpy(~0.2µs)<付出的代价——write_vectored_all 的 iovec
+  从 N→3N(d=64 批=192 iovec)的 kernel per-iovec 开销 + per-read CRC-trailer 小 alloc。**零拷贝只在 value memcpy 占主导(≥64K)
+  才赢——正是 UCX ZC 路径 gate 在 64K 的原因**;非-zc 小读 R44 单拷贝是 sweet spot。
+  **纪律生效:A/B 实测拒绝 → 全 revert**(代码回 R44 字节级一致,90 tests)。只留 build_read_future 调用点 9 行 guard 注释
+  (记录"零拷贝在此实测 regress,别重试",同 note24 "ATTEMPTED+REVERTED" 模式,防 future rework)。comment-only=binary logic
+  与已 chaos-validated 的 R44 一致 → 跳过 chaos(同 R22/R23 no-code 先例)。
+进度:R44 banked 一个干净 read win(单拷贝);R45 实测确认进一步消拷贝在小读 regress(确认 ZC-gating@64K 设计正确)。
+  **EN read 响应路径 perf 收敛**:小读单拷贝(R44)+ 大读 zero-copy(UCX ZC 路径)各自最优;ingress 拷贝不安全不碰。
+  下一步 R46:EN 热路径响应构造实质收口。候选方向(reassess):① 谨慎探 PS 热路径(workload 真正落点;但 partition_loop 最
+  revert-prone,ps_bench 是工具)找可测 win;② 或诚实报告 EN perf 收敛 + 向用户请新方向(更多 perf 具体目标 / feature / B 扩 chaos)。
+  绝不 speculative——R45 已示范"实测拒绝即 revert",不在热路径为 unmeasurable/negative 改动留代码。
