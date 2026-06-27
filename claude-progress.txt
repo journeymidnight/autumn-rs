@@ -1176,3 +1176,7 @@ R55 enrichment+2-random:**ps_kill_migrates_partitions PASS**(ps_failover 第 2 �
   all invariants OK(acked=11699 fail=37,reads=20825 miss=80,mismatch=0 not_found=0,5ext/8mem)+ seed=740230020(45s)PASS all invariants
   OK(acked=11562 fail=0,reads=21173 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。累积 system_chaos 全绿 17 distinct + 2 ps_failover 场景。
   **fuzz-monitor 9 轮全绿(R47-R55):覆盖=EN-kill+split/merge/EC/gc/fence(17 种)+ PS-failover×2 + 防御 guard defer。系统广覆盖稳定。**
+R56 2-random+EC-shape enrichment:seed=895118600(EC 3+1 默认,45s)PASS all invariants OK(acked=11513 fail=43,reads=21017 miss=99,
+  mismatch=0 not_found=0,7ext/10mem)+ **seed=729700583(EC 3+2,K=3 M=2 ENs=6,45s)PASS all invariants OK**(acked=11405 fail=0,
+  reads=21209 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。**首次跑 EC M=2(2-parity)erasure-coding 路径=新覆盖维度**(优于纯新 seed)。
+  累积 system_chaos 全绿 19 distinct(EC 3+1×18 + EC 3+2×1)+ 2 ps_failover 场景。10 轮全绿。
