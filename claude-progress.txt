@@ -1180,3 +1180,6 @@ R56 2-random+EC-shape enrichment:seed=895118600(EC 3+1 默认,45s)PASS all invar
   mismatch=0 not_found=0,7ext/10mem)+ **seed=729700583(EC 3+2,K=3 M=2 ENs=6,45s)PASS all invariants OK**(acked=11405 fail=0,
   reads=21209 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。**首次跑 EC M=2(2-parity)erasure-coding 路径=新覆盖维度**(优于纯新 seed)。
   累积 system_chaos 全绿 19 distinct(EC 3+1×18 + EC 3+2×1)+ 2 ps_failover 场景。10 轮全绿。
+R57 2-random+EC-shape:seed=667235513(EC 3+1,45s)PASS all invariants OK(acked=8019 fail=44,reads=25797 miss=110,mismatch=0 not_found=0,
+  5ext/8mem)+ **seed=1019830334(EC 4+1,K=4 M=1 ENs=6,45s)PASS all invariants OK**(acked=11897 fail=0,reads=20655 miss=0[干净],mismatch=0
+  not_found=0,3ext/3mem)。**首次跑 EC 4+1(宽 data-shard)路径**。至此 3 种 EC 形状全覆盖(3+1/3+2/4+1)。累积 system_chaos 全绿 21 distinct。11 轮全绿。
