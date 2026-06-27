@@ -1126,3 +1126,6 @@ ROUND 47 — 回归 review/dedup mandate;**definitive 扫描确认全库 review/
 R47 seed=31337(45s):PASS all invariants OK(acked=11817/fail=0,reads=20903/miss=0,3ext/3mem;Merge skip 分区不足)。+ 抓修 stale-debug-bin wire-fraud 坑。
 R48 seed=1234(45s):PASS all invariants OK(acked=10517/fail=1233[kill 窗预期丢,durability-checker 正确 drop],reads=20869/miss=0,5ext/5mem;
   Split skip=ec-convert-inflight-on-ext12 precondition[正确非 bug],Merge skip 分区不足)。R44 code 又一鲜种稳定,无回归。
+**用户指令(R49):每次 chaos 测 2 个随机 seed**(bash `(RANDOM<<15)|RANDOM` 生成 ~30-bit 随机种,每轮 2 个,各跑 system_chaos)。
+R49 2-random:seed=1040510550(40s)PASS all invariants OK(acked=7951,reads=25256,mismatch=0 not_found=0;Split skip=overlapping-keys precondition[正确])
+  + seed=849156670(40s)PASS all invariants OK(acked=11629,reads=20388,mismatch=0 not_found=0)。两随机种全绿,R44 code 无回归。
