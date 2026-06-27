@@ -1172,3 +1172,7 @@ R54 2-random:seed=608624491(45s)PASS all invariants OK(acked=11381 fail=44,reads
   日志现 compaction truncate defer "extent 16 in-flight recovery" = **预期 F139/F146 guard**[recovery-inflight 时 truncate 正确退避,非 bug])
   + seed=481303235(45s)PASS all invariants OK(acked=11700 fail=43,reads=22280 miss=91,mismatch=0 not_found=0,9ext/11mem)。
   累积 system_chaos 全绿 15 distinct。系统稳;多轮持续全绿,各防御 guard(EC-inflight/recovery-inflight defer)均被覆盖并正确退避。
+R55 enrichment+2-random:**ps_kill_migrates_partitions PASS**(ps_failover 第 2 场景,至此 2 个 ps_failover 场景全验)+ seed=840559175(45s)PASS
+  all invariants OK(acked=11699 fail=37,reads=20825 miss=80,mismatch=0 not_found=0,5ext/8mem)+ seed=740230020(45s)PASS all invariants
+  OK(acked=11562 fail=0,reads=21173 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。累积 system_chaos 全绿 17 distinct + 2 ps_failover 场景。
+  **fuzz-monitor 9 轮全绿(R47-R55):覆盖=EN-kill+split/merge/EC/gc/fence(17 种)+ PS-failover×2 + 防御 guard defer。系统广覆盖稳定。**
