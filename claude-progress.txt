@@ -1183,3 +1183,27 @@ R56 2-random+EC-shape enrichment:seed=895118600(EC 3+1 默认,45s)PASS all invar
 R57 2-random+EC-shape:seed=667235513(EC 3+1,45s)PASS all invariants OK(acked=8019 fail=44,reads=25797 miss=110,mismatch=0 not_found=0,
   5ext/8mem)+ **seed=1019830334(EC 4+1,K=4 M=1 ENs=6,45s)PASS all invariants OK**(acked=11897 fail=0,reads=20655 miss=0[干净],mismatch=0
   not_found=0,3ext/3mem)。**首次跑 EC 4+1(宽 data-shard)路径**。至此 3 种 EC 形状全覆盖(3+1/3+2/4+1)。累积 system_chaos 全绿 21 distinct。11 轮全绿。
+R58 SOAK(短 fuzz 饱和后 pivot 到 5min soak 求 cumulative/leak 覆盖,TIME-WAIT 预检 43<4000 安全)——**FAILED,首个非全绿,正调查**:
+  seed=61878720 @300s:**Merge 真触发了**(merge 9001 <- 20——短 45s 跑从来 skip merge"分区不足",soak 是首次实际跑 merge 路径!);
+  10s settle 后 verify:**part_id=9001(merge survivor)无 part_addr → try_client_for 5s 重试后仍 ROUTE FAILED → 标 wedged → 全 400 key not_found,
+  mismatches=0**(=路由/可达性失败,非 per-key 数据损坏;数据在盘上)。manager 是 in-process 不被 kill(只 kill EN),故非 F265 manager-restart
+  part_addr 丢——是 **merge survivor 的 part_addr 在 settle 后仍未出现**。reproduce-first 诊断中:重跑 seed=61878720 @300s + AUTUMN_TEST_
+  ROUTER_RETRIES=300(verify 重试 5s→30s)——若**过**=merge survivor part_addr re-register 慢于 15s settle(loaded soak 收敛慢=verify-timing/
+  收敛窗问题,非 wedge);若**仍失败**=genuine 永久 merge wedge(真 bug,深查 F185 merge handler + F265 part_addr self-heal)。
+  **3 次 300s soak 全失败(seed=61878720 确定性复现):①TIME-WAIT=43 clean-start(R58 原跑)②back-to-back ③TIME-WAIT drain 后 clean-start +
+  60s verify 窗——全 part_id=9001(merge survivor)no part_addr,not_found=400,mismatch=0(=可达性失败非数据损坏,数据在盘)。**
+  **关键混淆:run②③显示 loopback 端口耗尽 signature**——`toxiproxy bind: address already in use`(NetworkPartition 无法恢复)+ 多个无关
+  op(Gc/EcConvert/Split/Flush)全 30s TIMED OUT="PS/orchestration wedged"。**端口压力在单次 300s run 内累积**(loopback chaos 连接 churn
+  大;run③ clean-start 仍在 run 内出现 bind 失败)。run① 的端口 signature **未知**(saved 输出被 grep 过滤掉了 bind/timeout 行)。
+  **诊断混淆未解**:9001 每次同分区、同 merge 序列后确定性 unrouteable → 倾向 merge-survivor reopen 是真薄弱点(open_partition step0=
+  无限 5s-backoff commit_length 检查,在 bind/register part_addr 之前;若 reopen 卡在 commit_length[killed EN / recovery-stuck 类]则 9001 永
+  无 part_addr)。但 run②③的端口耗尽噪声盖过,**无法在 in-process loopback+toxiproxy 300s harness 上干净隔离 genuine merge bug vs 端口 artifact**。
+  **RESOLVED——memory [[project_chaos_long_soak_port_exhaustion]] 已明确分类此情形(我 over-investigated,应在 run1 后用 verdict gate 短路)**:
+  该 memory 的 point(c)= "WITHIN-run on high-throughput 300s exhausts ports at verify reconnect burst";**权威 verdict gate:mismatch=0
+  (即便 not_found>0)= port/connect artifact,NEVER data loss**。我 3 次 soak 全 mismatch=0 → 按既定 gate = **端口耗尽 harness artifact,非
+  product bug**。"merge survivor unrouteable" 是 verify-reconnect-burst 端口耗尽的症状(survivor reopen 无法穿过端口耗尽/partitioned 集群
+  重连副本/重注册 part_addr),非 merge bug;300s 恰是首个长到能触发 merge 的 duration(45s skip),故"看起来像 merge bug"但实为同一 artifact。
+  **教训:invariant FAIL 时先查 verdict gate(mismatch=0=artifact)再决定深挖——本可在 run1 后短路,不必烧 3× 300s soak。**
+  **结论:in-process loopback+toxiproxy harness 结构性撑不住干净 300s soak;真 soak 需 cluster.sh 多主机(无 loopback 端口天花板)或
+  cap DURATION≤90-120s(但 90-120s 又很少触发 merge)。11 轮 45s short-fuzz(在端口天花板下,全 mismatch=0)覆盖仍有效且是 in-process 的上限。**
+  **回归 45s short-fuzz 模式(clean、有效);soak 留给真 cluster。上浮用户告知发现 + 选项。**
