@@ -1133,3 +1133,30 @@ R50 2-random(80s 求 merge 覆盖):seed=247340680 PASS all invariants OK(Split O
   not_found=0,9ext/11mem[memberships>extents=CoW-shared refs 已校验]) + seed=589525836 PASS all invariants OK(acked=14055,reads=24764,
   mismatch=0 not_found=0,5ext/8mem)。**注:80s 仍 Merge skip"分区不足"**(splits 被 overlapping-keys precondition 挡,攒不够分区)→ 真 merge
   覆盖需换 test/config 非仅 duration。累积全绿 seed:603(多次)/31337/1234/1040510550/849156670/247340680/589525836=7 distinct,系统稳。
+
+──────────────── R51:正式补全 giant 热函数 clarity 分析(用户"formally close the gap"——R47 曾 over-claim"全库 giant 分析尽",实则 2 个未做 dedicated 轮)────────────────
+用户问"hot path 大文件大函数都处理完了吗"→ 诚实核查发现:热路径大文件已 swept(R34 admit_region_range/R35 batch_append_reject/R44
+  response 单 alloc/R7 client),热写读函数已分析(build_append_future R35+R44 / build_read_future R44+R45 / enqueue_* R34 / handle_append R15),
+  giant intricate loop 已分析留(partition_loop R36 / partition_thread_main R16 inherent / coalescer note24 off-limits),**但 handle_ps_connection
+  (~230)+ handle_incoming_req(~256)无 dedicated 轮**。本轮 read-only 正式分析这 2 个:
+  **① handle_ps_connection(4469-4698,PS conn SQ/CQ loop)**:intricate 但注释充分(每分支记 WHY:d=1 fast-path rationale / `inflight.is_empty()`
+    guard load-bearing / `at_cap||n==1` 跳 select / FU-wrapper-drop 安全)。唯一结构重复=`PsReadBurst::Data` handler 尾(feed→drain_zc_writes→
+    push_frames_to_inflight→spawn_ps_read)在 n_inflight==0 臂 + race-Left 臂各一次,**但二者不同**(idle 臂含 d=1 fast-path inline,race 臂是简版),
+    公共尾需穿 8 个 mutable ref(decoder/reader/req_tx/part/owner_part/inflight/tx_bufs/cap)→ 8-arg helper 在**最 revert-prone io_uring-SQE-
+    stability 代码**(read_fut/buf lifecycle load-bearing,"NEVER dropped mid-flight")。→ **analyzed=CLEAR,不抽**(同 partition_loop R36 + EN
+    handle_connection 结论:高-arg borrow-threading helper 在 revert-prone hot loop 风险>收益)。
+  **② handle_incoming_req(5936-6193,PS 请求 dispatcher)**:清晰(metrics bump→frozen-reject→epoch snapshot→msg_type match)。2 处重复:
+    (a) frozen-reject 4 臂(PUT/PUT_ZC/DELETE/BATCH_PUT,同 CODE_UNAVAILABLE 消息,不同 Resp 类型+key 提取)=cross-wire-type struct 字面量=
+    R18/R22 "leave" 类(只有重复消息串可抽 const,trivial);(b) 4 个 enqueue 臂(**已验签名全同**:req,pending,part_region_epoch,part_id_for_err,
+    Option<&RefCell<HashMap>>,Option<&Range>)仅 enqueue fn 不同→ fn-pointer match 可 collapse(-24 行)**但 lateral**(fn-pointer 间接 ≈ 显式臂,
+    显式臂 self-documenting:msg_type→handler 一眼可见;BUG-LEASE-2 borrow-scoping 注释也依赖显式臂)→ 按 R18/R22"leave lateral/line-neutral"=
+    **不抽**。→ **analyzed=CLEAR**,两重复簇都是既定"leave"类。
+  **结论:R51 正式补全——全部 giant 热函数现已 dedicated 分析,全 CLEAR/intricate-inherent,无 dedup 值得 risk/churn**(与 R36/R18/R22 既定判断
+    一致)。**热路径大文件大函数=已处理完**(swept dedup + 安全抽取已做;intricate loop 分析后正确留;2 个 conn/dispatch 函数本轮补全=clear)。
+    诚实修正 R47 "全库 giant 分析尽"的 over-claim(当时漏了这 2 个,现真正补上)。无 production code 改动(纯分析,同 R22/R23/R36)。
+**用户指令:每次 chaos 测 2 个随机 seed**(本轮亦跑,directive#2):
+R51 2-random:seed=590967239(45s)PASS all invariants OK(acked=12322,reads=21303,mismatch=0 not_found=0;Split skip overlap[正确])
+  + seed=366852622(45s)PASS all invariants OK(acked=11596,reads=20381,mismatch=0 not_found=0)。累积全绿 9 distinct seed,系统稳。
+进度:R51 = 正式补全 giant 热函数 clarity 分析(handle_ps_connection + handle_incoming_req 本轮 dedicated,全 CLEAR/leave,诚实修正 R47
+  over-claim)+ 2-random chaos 全绿。**hot path 大文件大函数=确实处理完**(swept dedup + 安全抽取 + 全 giant 函数 dedicated 分析,intricate
+  正确留)。回 fuzz-monitor 模式(R52:2 新随机 seed system_chaos)。
