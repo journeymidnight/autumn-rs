@@ -1129,3 +1129,7 @@ R48 seed=1234(45s):PASS all invariants OK(acked=10517/fail=1233[kill 窗预期�
 **用户指令(R49):每次 chaos 测 2 个随机 seed**(bash `(RANDOM<<15)|RANDOM` 生成 ~30-bit 随机种,每轮 2 个,各跑 system_chaos)。
 R49 2-random:seed=1040510550(40s)PASS all invariants OK(acked=7951,reads=25256,mismatch=0 not_found=0;Split skip=overlapping-keys precondition[正确])
   + seed=849156670(40s)PASS all invariants OK(acked=11629,reads=20388,mismatch=0 not_found=0)。两随机种全绿,R44 code 无回归。
+R50 2-random(80s 求 merge 覆盖):seed=247340680 PASS all invariants OK(Split OK+skip[overlap 正确],acked=13981,reads=26710,mismatch=0
+  not_found=0,9ext/11mem[memberships>extents=CoW-shared refs 已校验]) + seed=589525836 PASS all invariants OK(acked=14055,reads=24764,
+  mismatch=0 not_found=0,5ext/8mem)。**注:80s 仍 Merge skip"分区不足"**(splits 被 overlapping-keys precondition 挡,攒不够分区)→ 真 merge
+  覆盖需换 test/config 非仅 duration。累积全绿 seed:603(多次)/31337/1234/1040510550/849156670/247340680/589525836=7 distinct,系统稳。
