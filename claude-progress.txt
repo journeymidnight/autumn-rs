@@ -1164,3 +1164,7 @@ R52 enrichment+2-random:**ps_kill_during_write_storm PASS**(PS-failover/迁移�
   + seed=856436312(45s)PASS all invariants OK(acked=10957 fail=0,reads=21799 miss=0[干净跑],mismatch=0 not_found=0)
   + seed=80383544(45s)PASS all invariants OK(acked=11388 fail=0,reads=21399 miss=0,mismatch=0 not_found=0)。
   累积 system_chaos 全绿 11 distinct + ps_failover 场景已验。系统稳。
+R53 2-random:seed=722366295(45s)PASS all invariants OK(acked=11359 fail=44,reads=21901 miss=113,mismatch=0 not_found=0,10ext/11mem;
+  日志现 GC punch_holes defer "extent 12 in-flight EC conversion" = **预期 F138/F145 guard**[EC-inflight 时 GC 正确退避 30s cooldown,非 bug])
+  + seed=904415445(45s)PASS all invariants OK(acked=11516 fail=0,reads=20809 miss=0[干净],mismatch=0 not_found=0,5ext/5mem)。
+  累积 system_chaos 全绿 13 distinct。系统稳。
