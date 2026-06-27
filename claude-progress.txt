@@ -1121,3 +1121,8 @@ ROUND 47 — 回归 review/dedup mandate;**definitive 扫描确认全库 review/
 进度:**review/dedup mandate 全库实质完成**(R1-R47:chaos-validated crates 干净 dedup+giant-clarity 尽,fuse/ioring 确认 well-factored)。
   perf C 交付 1 win(R44)。继续模式=**chaos fuzz-monitor**(轮换鲜种每轮稳定性回归,longer cadence 省 cycle),仅在出现 genuine 目标/
   回归或需新方向时上浮用户。绝不制造 churn。下一步 R48:轮换下一鲜种(如 7/13/42/99/256/1234/2024)继续 fuzz 覆盖。
+
+──────────────── CHAOS FUZZ-MONITOR LOG(dedup 井干后的 directive#2 持续稳定性覆盖;HEAD=R44 code,每轮轮换鲜种)────────────────
+R47 seed=31337(45s):PASS all invariants OK(acked=11817/fail=0,reads=20903/miss=0,3ext/3mem;Merge skip 分区不足)。+ 抓修 stale-debug-bin wire-fraud 坑。
+R48 seed=1234(45s):PASS all invariants OK(acked=10517/fail=1233[kill 窗预期丢,durability-checker 正确 drop],reads=20869/miss=0,5ext/5mem;
+  Split skip=ec-convert-inflight-on-ext12 precondition[正确非 bug],Merge skip 分区不足)。R44 code 又一鲜种稳定,无回归。
