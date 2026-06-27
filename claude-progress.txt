@@ -1168,3 +1168,7 @@ R53 2-random:seed=722366295(45s)PASS all invariants OK(acked=11359 fail=44,reads
   日志现 GC punch_holes defer "extent 12 in-flight EC conversion" = **预期 F138/F145 guard**[EC-inflight 时 GC 正确退避 30s cooldown,非 bug])
   + seed=904415445(45s)PASS all invariants OK(acked=11516 fail=0,reads=20809 miss=0[干净],mismatch=0 not_found=0,5ext/5mem)。
   累积 system_chaos 全绿 13 distinct。系统稳。
+R54 2-random:seed=608624491(45s)PASS all invariants OK(acked=11381 fail=44,reads=22209 miss=111,mismatch=0 not_found=0,10ext/12mem;
+  日志现 compaction truncate defer "extent 16 in-flight recovery" = **预期 F139/F146 guard**[recovery-inflight 时 truncate 正确退避,非 bug])
+  + seed=481303235(45s)PASS all invariants OK(acked=11700 fail=43,reads=22280 miss=91,mismatch=0 not_found=0,9ext/11mem)。
+  累积 system_chaos 全绿 15 distinct。系统稳;多轮持续全绿,各防御 guard(EC-inflight/recovery-inflight defer)均被覆盖并正确退避。
