@@ -1099,3 +1099,25 @@ ROUND 46 — NO-CODE 分析轮(PS 热路径响应构造 read-only 分析 → 确
 进度:perf C 方向交付总结:**R44 = 唯一干净安全可测 win(read +1-2%,已 push)**;R45 = EN 边界(零拷贝 regress 小读);R46 = PS 边界
   (rkyv 固有双拷贝 + ZC 逃生路已建 + 不可靠 A/B)。response-construction 热路径**实质收敛**。进一步 perf 需用户决策(riskier PS 手术 /
   pivot 回 review-dedup mandate / B 扩 chaos / 具体目标)——这是真正的用户 fork,非 sensible-default 可定。AskUserQuestion 上浮。
+  **用户选 "Back to review/dedup + chaos"**(perf 关闭,R44 win 已 banked)。
+
+ROUND 47 — 回归 review/dedup mandate;**definitive 扫描确认全库 review/dedup 实质完成** + 鲜种 chaos 回归 + 抓修 stale-debug-binary 坑。
+  ① **codebase-wide 扫描**:全库 >80 行 production 函数仅 1 个未分析(autumn_op/main.rs cmd_df 115,CLI display,低价值);其余 >80 行
+  全是 test 或已分析(R10-R20 giant 函数全覆盖)。本轮再扫:client.rs(最大非-test fn ~40-46,well-factored,同 R7)、PS rpc_handlers/
+  background(全 ≤52,多已分析)、**fuse/dispatch.rs(1680 LOC 但 production 最大 fn=compute_release_action 17 行,其余全 test)**、
+  fuse/extent.rs(最大 20)、ioring/ring.rs(最大 12)——**全 well-factored 无 giant**。结论:**review/dedup + giant-clarity mandate
+  全库实质完成**(chaos-validated crates R1-R23 + fuse/ioring 本轮确认)。继续找 dedup = 制造 net-negative churn(R18/R22/R23 明禁)。
+  ② **dedup 井干后,per-round 价值 = directive#2 连续 chaos 稳定性/fuzz 覆盖**(用户保留的 "+chaos")。鲜种 31337(45s)轮换覆盖新 nemesis
+  调度:writes acked=11817 failed=0,reads ok=20903 miss=0,mismatch=0 not_found=0 range=0 write-liveness=0 accounting=0(3ext/3mem)
+  all invariants OK(本种 Merge 因分区不足 skip,Split 跑了)。**R44 code 鲜种下稳定**。
+  ③ **抓修 stale-debug-binary 坑**(操作教训):首跑 chaos 31337 在 setup `autumn-op format` 2.93s panic = `wire-version fraud: peer
+  claims v8 fp 738... but registered 92ea...`。根因=**R44 的 debug bins 在 fingerprint 更新前构建**(`cargo build --bins` 那步 frame.rs
+  已含 encode_response_with→fp=738,但 lib.rs registry 还是 92ea,binary 自相矛盾;R44 chaos 603 当时过是因 manager 也同样 738/92ea→fp
+  相等 fast-path),R47 test binary 重编为 738/738 但 stale debug autumn-op 仍 738/92ea→检查 manager(claims 738)时其 registry 说 v8=92ea
+  →fraud。**修复=`cargo build --bins` 重建 debug 子进程二进制**(current source 一致:fp 738=registry 738,31/31 rpc 测已证)→ chaos 过。
+  教训:**任何 WIRE_FINGERPRINT-affecting 改动(wire-schema 源编辑)后,跑 system_chaos 前必重建 debug bins**(target/debug,system_chaos
+  用之),否则 format 时 wire-version fraud。= [[project_clustersh_uses_stale_release_binaries]] 的 debug-binary + fingerprint 变体。
+  无 production code 改动(分析+chaos+stale-binary 修);HEAD=62b3958(R46 docs)。
+进度:**review/dedup mandate 全库实质完成**(R1-R47:chaos-validated crates 干净 dedup+giant-clarity 尽,fuse/ioring 确认 well-factored)。
+  perf C 交付 1 win(R44)。继续模式=**chaos fuzz-monitor**(轮换鲜种每轮稳定性回归,longer cadence 省 cycle),仅在出现 genuine 目标/
+  回归或需新方向时上浮用户。绝不制造 churn。下一步 R48:轮换下一鲜种(如 7/13/42/99/256/1234/2024)继续 fuzz 覆盖。
