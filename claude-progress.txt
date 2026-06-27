@@ -1160,3 +1160,7 @@ R51 2-random:seed=590967239(45s)PASS all invariants OK(acked=12322,reads=21303,m
 进度:R51 = 正式补全 giant 热函数 clarity 分析(handle_ps_connection + handle_incoming_req 本轮 dedicated,全 CLEAR/leave,诚实修正 R47
   over-claim)+ 2-random chaos 全绿。**hot path 大文件大函数=确实处理完**(swept dedup + 安全抽取 + 全 giant 函数 dedicated 分析,intricate
   正确留)。回 fuzz-monitor 模式(R52:2 新随机 seed system_chaos)。
+R52 enrichment+2-random:**ps_kill_during_write_storm PASS**(PS-failover/迁移路径,首次纳入 fuzz 覆盖;deterministic 非 seed 化,boot 220)
+  + seed=856436312(45s)PASS all invariants OK(acked=10957 fail=0,reads=21799 miss=0[干净跑],mismatch=0 not_found=0)
+  + seed=80383544(45s)PASS all invariants OK(acked=11388 fail=0,reads=21399 miss=0,mismatch=0 not_found=0)。
+  累积 system_chaos 全绿 11 distinct + ps_failover 场景已验。系统稳。
