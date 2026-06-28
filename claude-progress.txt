@@ -1214,6 +1214,31 @@ R61 — **fuzz-monitor 抓到 GENUINE 可复现 accounting bug(seed=769351064)**
   **严重度升级**:复现实例是良性空间泄漏,但**同根因有数据丢失变体**(split 丢 refs increment→过早 delete→CoW child 丢数据)→修复更值得做(关的不只泄漏)。
   **修复**:给所有 PS-op 的 extents/<id> 写(punch/truncate refs 减、split refs 加+tail seal、merge refs splice)加 value-CAS baseline,败者 Precondition→fresh-read
   重试重算。=note33 文档化方案扩到 refs 路径(原 note33 只列 eversion/replicates/avali,refs 是同类)。已上浮用户系统分析 + 升级后的修复建议。
+  **用户:"so fix it"→ FIX 交付(2 步,各独立验证;最 revert-prone CAS/refs 区,谨慎增量):**
+  **Step1(139b023)punch_holes/truncate**:compute_extent_ref_drops 多返回 per-extent extents/<id> CAS baselines(put+delete 两路);
+  mirror_stream_extent_mutation 加 extent_cas 到 txn compare set。败者 Precondition→PS GC fresh-read 重试。验证:build+164/164 单测 +
+  **seed 769351064 ×4 全 PASS(accounting=0;修前 3/4 FAIL)**=复现 bug 已修。
+  **Step2(35acdfe)split+merge**:系统分析的 DATA-LOSS 变体(split∥punch / split∥split 丢 refs increment→过早 delete→CoW child 丢数据;跨分区因
+  per-partition gc_gate 只串行同分区)。修:split/merge Phase-2 txn 给每个 modified extent 加 extents/<id> CAS(baseline=pre-mutation 值,因 compute
+  helper 取 &state 返回 clone,in-memory 仍是原值=etcd baseline)。split put_msgs_txn→put_delete_txn_cas(创建新 stream 无需 stream CAS);merge 扩
+  现有 survivor_stream_baselines CAS。验证:build+164/164(含 f181/f_merge_refs_leak/merge_refs_invariant_holds_across_split_merge_cycles)+
+  chaos sweep 603(**Merge OK=无 spurious CAS 冲突**)+769351064(仍修)+2 随机,全 accounting=0。
+  **关键:无 spurious 冲突**(baseline 字节匹配 etcd,同 note33 membership CAS 性质:rkyv 确定+etcd-first 保 extents/<id>==in-memory)。
+  **coco-review(GPT-5.5,139b023^..工作树=完整 fix delta)→ 3 findings,全 triage 为不可达/已覆盖/既有残留(无 code 改;加 2 处"为何不 CAS"注释防再被 flag):**
+  · **(上一轮 coco P1,已修)merge Step-2 在 Phase-2(alloc await 后)从当前内存重建 extent CAS baseline,而 modified_extents 取自 Phase-1 快照**——
+    并发 punch 在 await 中改了值→baseline=已改值→CAS 通过→clobber;或 extent 被删→s.extents None→跳过 CAS→stale PUT 复活。**修:Phase1Result
+    加 extent_baselines 字段,在 Phase-1 一致快照里捕获(随 modified_extents),Phase-2 用 cas.extend(p1.extent_baselines)。** split 无此 bug
+    (无 Phase-1.5 await,唯一 await=Phase-2 etcd 写本身,Phase-2 capture 与 modified_extents 间零 await=一致;我 compaction 前误判它有=被 stale
+    "Phase-1 awaits"注释带偏,grep 证 split 仅 1 个 .await)。
+  · **#1 P1 split 不 CAS 读到的源 stream membership**:**不可达**——源分区 frozen_for_split + 持 gc_gate+compact_gate 贯穿 multi_modify_split
+    (PS 侧 F210-C2+F140),源 stream 不能并发变;唯一可达=另一 CoW-share 分区 GC 共享 extent(已被 extent CAS 抓)。coco 只看 manager 没看 PS 协调。
+  · **#2 P1 merge 删 victim stream 前不 CAS victim membership**:**已覆盖**——victim frozen_for_merge→无并发 alloc(coco 的 orphan-via-alloc 场景被排除);
+    唯一可达=GC punch,而 splice_victim_extents 把**每个** victim extent baseline 进 extent_baselines→punch 的 refs-- 写触发 extent CAS→merge 重试;
+    survivor 侧 punch 触发 survivor_stream_baselines。零缺口。
+  · **#3 P2 merge CAS 失败泄漏已分配 new_tail**:**既有 accepted residual**(note33:CAS 败孤儿 extent 文件→F109 reconcile 回收);非本次引入
+    (merge 改前已有 survivor CAS→已有此路径);安全清理无法区分 CAS-fail vs etcd-timeout(误删已提交 new_tail 风险),F109 兜底正确。
+  **最终 chaos sweep(4 seed 全 PASS,accounting=0/mismatch=0/not_found=0):603 merge(Split OK,无 spurious CAS 冲突)+ 769351064(复现 bug 仍修)+
+  随机 798196734 + 1030911149。** fuzz-monitor 抓真 bug→系统分析(发现 data-loss 变体)→修全类→coco 复审(确认无新可达 bug)→广 chaos→push。完整闭环。
 R55 enrichment+2-random:**ps_kill_migrates_partitions PASS**(ps_failover 第 2 场景,至此 2 个 ps_failover 场景全验)+ seed=840559175(45s)PASS
   all invariants OK(acked=11699 fail=37,reads=20825 miss=80,mismatch=0 not_found=0,5ext/8mem)+ seed=740230020(45s)PASS all invariants
   OK(acked=11562 fail=0,reads=21173 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。累积 system_chaos 全绿 17 distinct + 2 ps_failover 场景。

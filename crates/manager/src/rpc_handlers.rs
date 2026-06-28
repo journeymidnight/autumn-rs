@@ -2686,9 +2686,21 @@ impl AutumnManager {
                     // pre-mutation value here = the etcd baseline. Without this,
                     // a concurrent cross-partition punch/truncate on a CoW-shared
                     // extent could lose the refs increment -> refs too low ->
-                    // premature delete -> data loss. (Split creates NEW streams,
-                    // so no streams/<id> CAS is needed; the extents/<id> CAS is
-                    // the missing guard.) Same class as compute_extent_ref_drops.
+                    // premature delete -> data loss. Same class as
+                    // compute_extent_ref_drops.
+                    //
+                    // No source streams/<id> CAS is needed even though split
+                    // READS the source membership to derive the right streams:
+                    // the source partition is frozen_for_split AND holds
+                    // gc_gate+compact_gate through this whole multi_modify_split
+                    // (PS-side F210-C2 + F140), so its streams cannot mutate
+                    // concurrently. The ONLY reachable race is a DIFFERENT
+                    // CoW-sharing partition (from a prior split) GC'ing a shared
+                    // extent — that partition isn't frozen — and this extent CAS
+                    // catches exactly that. (Split also has no Phase-1.5 await,
+                    // so capturing the baseline here, with no await since
+                    // modified_extents was computed, is consistent — unlike merge
+                    // which must capture in Phase-1 before its alloc await.)
                     let extent_cas: Vec<(String, Vec<u8>)> = {
                         let s = self.store.inner.borrow();
                         modified_extents
@@ -2782,6 +2794,16 @@ impl AutumnManager {
             // during merge's etcd RTT makes the merge fail+retry instead of
             // resurrecting the concurrently-removed extent.
             survivor_stream_baselines: Vec<(String, Vec<u8>)>,
+            // Value-CAS baseline for each EXISTING modified extent (the
+            // refs-spliced / tail-sealed ones), captured from the SAME Phase-1
+            // snapshot `modified_extents` was computed against — NOT re-read at
+            // Phase 2 (after the Phase-1.5 alloc await), which would capture a
+            // value a concurrent punch/truncate already mutated and let the
+            // merge clobber it (coco P1). A concurrently-deleted extent has no
+            // etcd value here so its CAS fails -> merge retries (no resurrect).
+            // The freshly-created new_tail has no pre-existing baseline and is
+            // intentionally absent (it is a create, not a CAS'd update).
+            extent_baselines: Vec<(String, Vec<u8>)>,
         }
 
         let phase1: Result<Phase1Result, AppError> = {
@@ -2937,6 +2959,20 @@ impl AutumnManager {
                 all_extents.extend(row_exts);
                 all_extents.extend(meta_exts);
 
+                // Capture extent CAS baselines from THIS Phase-1 snapshot (the
+                // value `modified_extents` was computed against). compute_* read
+                // `s` and returned clones, so `s.extents` still holds the
+                // pre-mutation value. The new_tail (just-built, not yet in
+                // `s.extents`) has no baseline and is correctly skipped.
+                let extent_baselines: Vec<(String, Vec<u8>)> = all_extents
+                    .iter()
+                    .filter_map(|ex| {
+                        s.extents.get(&ex.extent_id).map(|orig| {
+                            (format!("extents/{}", ex.extent_id), rkyv_encode(orig).to_vec())
+                        })
+                    })
+                    .collect();
+
                 let mut new_survivor_meta = survivor_meta.clone();
                 new_survivor_meta.rg = Some(MgrRange {
                     start_key: s_rg.start_key,
@@ -2956,6 +2992,7 @@ impl AutumnManager {
                     new_tail_replicas: target_replicas as u32,
                     pre_bump_eversion,
                     survivor_stream_baselines,
+                    extent_baselines,
                 })
             })()
         };
@@ -3090,25 +3127,25 @@ impl AutumnManager {
             // committed on a survivor stream during this RTT makes the merge
             // fail+retry (CODE_PRECONDITION) instead of overwriting it with the
             // stale spliced membership (resurrecting a removed extent).
+            // CAS = survivor-stream membership baselines + each modified extent's
+            // baseline. Both were captured from the Phase-1 snapshot (NOT re-read
+            // here after the Phase-1.5 await), so a concurrent punch/truncate/
+            // split that mutated or deleted a CoW-shared extent during the await
+            // makes this txn fail+retry instead of clobbering it / resurrecting
+            // a deleted extent (coco P1). Same lost-update class the
+            // compute_extent_ref_drops CAS closes for punch/truncate.
+            //
+            // The deleted VICTIM streams need no membership CAS: the victim is
+            // frozen_for_merge (F185) so no concurrent alloc can ADD an extent
+            // to it (coco's orphan-via-alloc scenario is precluded). The only
+            // reachable concurrent victim mutation is a GC punch/truncate, which
+            // ALSO writes the affected extents/<id> (refs-- or delete) — and
+            // splice_victim_extents baselines EVERY victim extent into
+            // extent_baselines, so that write trips the extent CAS above ->
+            // merge retries. (Survivor-side concurrent punches trip
+            // survivor_stream_baselines.) No victim membership CAS adds coverage.
             let mut cas = p1.survivor_stream_baselines.clone();
-            // Also value-CAS each modified extent against its pre-splice value.
-            // The compute helpers (seal_survivor_old_tail / splice_victim_extents)
-            // read `state` and return clones, so the in-memory store still holds
-            // the pre-mutation value here — that's the etcd baseline. Without
-            // this, a concurrent punch/truncate/split on a CoW-shared extent
-            // (refs-spliced here) could lose an update (orphan-leak, or refs
-            // too low -> premature delete). Same class as compute_extent_ref_drops.
-            {
-                let s = self.store.inner.borrow();
-                for ex in &modified_extents {
-                    if let Some(orig) = s.extents.get(&ex.extent_id) {
-                        cas.push((
-                            format!("extents/{}", ex.extent_id),
-                            rkyv_encode(orig).to_vec(),
-                        ));
-                    }
-                }
-            }
+            cas.extend(p1.extent_baselines.clone());
             etcd.put_delete_txn_cas(kvs, deletes, cas)
                 .await
                 .map_err(|e| Self::err_to_status(&e))?;
