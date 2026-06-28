@@ -1386,3 +1386,12 @@ FIX TICK(继续上轮调查→root-cause 确认 + 修复 split_then_ps_crash wed
     drain(可达 60s),慢机器上 800ms 不够→PS1 仍活→same-id split-brain 复现→又 flaky。修:helper 改返回 (ShutdownFlag, JoinHandle),测试用 `ps1_join.join()` 确定性
     等 PS1 线程退出(非固定 sleep)。** 修后 3/3 PASS(8.36s,更稳更快)。全 manager 测试编译通过。
   **教训叠加:连"修复"本身也别用 timing 假设(固定 sleep 同 drop≠crash 一样脆)——coco 当场指出。**
+
+PATTERN-SWEEP TICK(查上轮 bug 类是否成片:grep drop(ps)≠crash + ps_id-reuse latent 模式):
+  **发现该模式广泛存在(~8 个 test 文件:multi_split_chain 82、crash_mid_flush 71/72、crash_mid_compact 75/76、concurrent_write_crash 97、
+    ps_recovery 51/61、delete_tombstone、bulk_verification、integration——全是 drop(ps1)+start_partition_server(同 ps_id, ps2))。**
+  **但全是 LATENT 非 active**:逐个跑——multi_split_chain(含 split,最像 compound)2/2 PASS(27s);crash_mid_flush 2/2、crash_mid_compact 2/2、
+    concurrent_write_crash 2/2、ps_recovery 2/2 全 PASS。**只有 split_then_ps_crash 会 active wedge**(它 split 后立刻 takeover-GET 的结构让 PS1 lingering 线程真去抢 owner_epoch)。
+  **纪律决定:不 churn-fix 这些 PASS 的测试**(复现=真实危害非机制单测;no defensive fix for non-manifesting issue;coco"未来可能挂"不算 bug)。
+    新 helper start_partition_server_stoppable + memory 已文档化该模式+正解(serve_until_shutdown 真 crash),将来谁 flaky 直接套。
+  **结论:bug 类已查清——模式广但只一个 active(已修)。verdict gate + reproduce-first 正确应用:测了是否 active manifest(不是),正确决定不修 PASS 的。**
