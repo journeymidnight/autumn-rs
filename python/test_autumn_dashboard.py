@@ -114,8 +114,14 @@ def _fake_op_factory():
                 "per_node": [{"node_id": 1, "total": 1 << 40, "free": 1 << 39, "extent_bytes": 1 << 38, "online": True}],
             }
         if args == ["info"]:
+            # Real wire shape (verified e2e 2026-06-28): partitions carry
+            # `ps_addr` (per-partition listener address, F099-K) + `live_size`
+            # (authoritative total bytes), NOT an integer `ps_id`.
             return {"nodes": [], "extents": [], "streams": [],
-                    "partitions": [{"part_id": 9001, "ps_id": 1}, {"part_id": 9002, "ps_id": 2}]}
+                    "partitions": [
+                        {"part_id": 9001, "ps_addr": "10.0.0.1:9301", "live_size": 1 << 30},
+                        {"part_id": 9002, "ps_addr": "10.0.0.2:9302", "live_size": 1 << 29},
+                    ]}
         if args == ["policy-candidates"]:
             return [
                 {"kind": "split", "primary_part_id": 9001, "secondary_part_id": 0, "reason": "qps high"},
@@ -123,8 +129,10 @@ def _fake_op_factory():
             ]
         if args[:2] == ["info", "--part"]:
             pid = int(args[2])
+            # Real wire: PartitionLoad.size_bytes is SST-flushed bytes and is 0
+            # before the first flush — the render must fall back to topo live_size.
             return {"part_id": pid, "req_per_sec": 20000 if pid == 9001 else 100,
-                    "p99_us": 500, "size_bytes": 1 << 30, "gc_debt_bytes": 1 << 20,
+                    "p99_us": 500, "size_bytes": 0, "gc_debt_bytes": 1 << 20,
                     "pending_compaction_bytes": 0, "gc_inflight": 0, "compact_inflight": 0,
                     "sealed_log_extent_count": 3}
         raise d.OpError(f"unexpected op call: {args}")
@@ -150,6 +158,21 @@ def test_render_dashboard_includes_capacity_partitions_advisories():
     assert out.index("9001") < out.index("9002")
     assert "policy advisories (2)" in out
     assert "split" in out and "extent 50" in out
+    # e2e regression: PS column reads `ps_addr`, SIZE falls back to topo
+    # live_size when the detail size_bytes is 0 (1 GiB → "1.0G").
+    assert "10.0.0.1:9301" in out
+    assert "1.0G" in out
+
+
+def test_render_amp_shows_na_when_zero():
+    # The manager sets amplification=0 when no sealed logical data has been
+    # measured yet; render must show "n/a", not a misleading "0.00x".
+    state = {"df": {"raw_total": 100, "raw_used": 50, "raw_free": 50,
+                    "physical_used": 10, "logical_stored_sealed": 0, "amplification": 0},
+             "partitions": [], "candidates": [], "errors": []}
+    out = d.render_dashboard(state)
+    assert "amp n/a" in out
+    assert "0.00x" not in out
 
 
 def test_gather_records_errors_without_crashing():

@@ -1312,3 +1312,25 @@ TASK① coco arch-review DONE + TRIAGED(GPT-5.5 arch,8 findings:3 P0/2 P1/2 P2/1
   **coco 正向确认**(.meta 原子写 / append fsync coalescer / owner_epoch durable-before-ACK / lease fence WAL / GC-VP-identity / EC marker 原子)= 与既知一致。
   **价值:外部 arch 审计独立确认"已知 residual frontier=fencing 语义 + 2 个 deferred(#3 lease-preempt / #4 extent-CAS)",零 new 惊喜=成熟度强信号。** 按纪律不做 speculative 防御修复
   (每个"修"都拿罕见/不可达窗换真复杂度或 spurious 行为);#3/#4 已 reproduce-first 门控的 deferred。无 code 改动。
+
+════════════════════════════════════════════════════════════════════════════════
+DASHBOARD E2E(用户 "go" → 真 cluster.sh 集群验证 python/autumn_dashboard.py;TASK② 此前唯一待办)。
+环境处理(踩到的坑全避开):① cluster.sh 用 STALE release bin→先 cargo build --release --workspace;② EN control port=data+1000=10101-03
+  被 Ray 占→AUTUMN_EXTENT_BASE_PORT=20000(ctl 21001-03 避开);③ 隔离 DATA_ROOT=/tmp/autumn-dash-e2e(绝不碰已有集群/etcd,绝不 reset);
+  ④ pkill -f 自杀坑(命令行含 autumn-* 字串→pkill 杀掉自己 shell,exit 144)→改用 cluster.sh stop(pidfile);⑤ tcp transport 避开 UCX flap。
+集群:3 EN(:20001-3)+ manager :9001 + 4 partition(presplit 4,ids 13/20/27/34)+ PS per-partition listener :9301+。
+**先静态核对真 wire**(autumn-op --json 字段 vs dashboard .get(...)):df/info/info--detail/policy-candidates 全字段名核对。
+**dashboard 模式 live(加 ~30K ops/s perf-check 负载)**:✓ 正确渲染——capacity(raw 9.6T/10.3T physical/logical/amp + per-node)+ per-partition
+  IOPS 表(负载中实测 ~6500 IOPS/分区,按 IOPS 排序最热在前)+ advisories(none,符合预期——无 30min 窗负载)。
+**control 模式 live**:✓ header(dry-run/enable 白名单/interval/cooldown/max-actions)+ 轮询 policy-candidates + "0 advisories none actionable"(空 advisory 符合预期)。
+**actuation wire 全验(controller --apply 发的真命令,e2e 跑通)**:gc 13✓ / compact 13✓ / split 13→分区 4→5(新 38)✓ / merge 13←38→5→4✓
+  (merge 还顺带在真集群验了本会话的 merge extent-CAS 修复——manager log 零 CAS 冲突/panic/错误)。force-ec-convert 未验(bootstrap 3+0 非 EC;wire 同型)。
+**e2e 抓到 2 真 field-name bug + 1 显示 bug + 1 潜在 bug(dashboard 当初按假设字段名写,没跑过真 binary)——已修+回归测试:**
+  · **PS 列 "-"**:info 分区用 `ps_addr`(监听地址 "127.0.0.1:9301",F099-K)不是 `ps_id`/`ps`→列空。修:读 ps_addr(ps_id/ps 作 fallback)+ 列宽 PS_ADDR<16。
+  · **SIZE 列 0B**:detail `size_bytes`=SST flush 字节,首次 flush 前=0;info topo 有 `live_size`(真总字节 2.8G)。修:size_bytes or topo.live_size。
+  · **amp 0.00x 误导**:logical=0 时 manager 把 amp 设 0 哨兵→显示 "0.00x" 误导。修:amp>0 才 "{:.2f}x" 否则 "n/a"(对齐 autumn-op 文本路径)。
+  · **潜在:capacity 行整行可能变空**:旧 `f"...amp {amp:.2f}x" if isinstance(amp,..) else ""`——amp 非数字时整行渲染成 ""。重写为先算 amp_str 再拼,行恒渲染。
+**修后 live 复跑**:✓ PS_ADDR 列填真地址(9306/9303/9304/9302)、SIZE 显 2.8G/2.7G、amp 11.87x(seal/scan 已跑 logical=2.8G)。
+**单测**:fixture 更新成真 wire 形(ps_addr+live_size;detail size_bytes=0 触发 fallback)+ 新增 amp-n/a 回归 → 15/15 过(原 14+1)。
+**教训:cache/dashboard e2e 必须验真 wire(非仅单测)**——[[project_kvcache_vlm_mmhash_unverified]] 同纪律(只看 metric/假设字段名会掩盖跨实例错)。
+集群已 cluster.sh stop + 清 DATA_ROOT(无残留)。文件:dashboard 3 fix + test 更新 + DASHBOARD.md(标 e2e-validated + 真 wire 字段 + 真渲染样例)。

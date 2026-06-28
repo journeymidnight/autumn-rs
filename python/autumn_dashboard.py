@@ -154,12 +154,16 @@ def render_dashboard(state: Dict[str, Any], now: Optional[float] = None) -> str:
         raw_used = df.get("raw_used", 0)
         raw_free = df.get("raw_free", 0)
         amp = df.get("amplification") or df.get("amp") or 0
+        # amp==0 is the manager's "no sealed logical data measured yet"
+        # sentinel (df sets it when logical_stored==0); show n/a like the
+        # autumn-op text path instead of a misleading "0.00x".
+        amp_str = f"{amp:.2f}x" if isinstance(amp, (int, float)) and amp > 0 else "n/a"
         lines.append(
             f"capacity: raw {fmt_bytes(raw_used)}/{fmt_bytes(raw_total)} ({pct(raw_used, raw_total)}) used"
             f"  free {fmt_bytes(raw_free)}"
             f"  physical {fmt_bytes(df.get('physical_used'))}"
             f"  logical {fmt_bytes(df.get('logical_stored_sealed'))}"
-            f"  amp {amp:.2f}x" if isinstance(amp, (int, float)) else ""
+            f"  amp {amp_str}"
         )
         per_node = df.get("per_node") or []
         if per_node:
@@ -179,16 +183,23 @@ def render_dashboard(state: Dict[str, Any], now: Optional[float] = None) -> str:
     if parts:
         lines.append("")
         lines.append(
-            f"{'PART':>7} {'PS':>4} {'IOPS':>8} {'p99us':>7} {'SIZE':>8} "
+            f"{'PART':>7} {'PS_ADDR':<16} {'IOPS':>8} {'p99us':>7} {'SIZE':>8} "
             f"{'GCdebt':>8} {'COMPACT':>8} {'INFL':>5} {'SEALEXT':>7}"
         )
         for p in parts:
             topo = p.get("_topo", {})
-            ps = topo.get("ps_id", topo.get("ps", "-"))
+            # The `info` partitions array identifies the serving PS by its
+            # per-partition listener ADDRESS (`ps_addr`, F099-K), not an
+            # integer id — ps_id/ps are accepted as forward-compat fallbacks.
+            ps = topo.get("ps_addr") or topo.get("ps_id") or topo.get("ps") or "-"
+            # The F203 PartitionLoad `size_bytes` is SST-flushed bytes and reads
+            # 0 until the first flush; the topology row's `live_size` is the
+            # authoritative total (log_stream + SSTs), so fall back to it.
+            size_b = p.get("size_bytes") or topo.get("live_size") or 0
             infl = ("g" if p.get("gc_inflight") else "-") + ("c" if p.get("compact_inflight") else "-")
             lines.append(
-                f"{p.get('part_id'):>7} {str(ps):>4} {p.get('req_per_sec', 0):>8} "
-                f"{p.get('p99_us', 0):>7} {fmt_bytes(p.get('size_bytes')):>8} "
+                f"{p.get('part_id'):>7} {str(ps):<16} {p.get('req_per_sec', 0):>8} "
+                f"{p.get('p99_us', 0):>7} {fmt_bytes(size_b):>8} "
                 f"{fmt_bytes(p.get('gc_debt_bytes')):>8} "
                 f"{fmt_bytes(p.get('pending_compaction_bytes')):>8} {infl:>5} "
                 f"{p.get('sealed_log_extent_count', 0):>7}"

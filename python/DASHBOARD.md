@@ -29,26 +29,35 @@ Shows, per refresh:
   bytes, the empirical amplification factor — from `autumn-op df`
   (`MSG_CLUSTER_DF`).
 - **Node health** — per-node online flag, free/total, on-disk extent bytes.
-- **Per-partition table** — sorted by IOPS (hottest first): `req_per_sec`
-  (IOPS), `p99_us` latency, `size_bytes`, `gc_debt_bytes`,
-  `pending_compaction_bytes`, gc/compact inflight flags, sealed-log-extent
-  count — from `autumn-op info --part P --detail` (`MSG_GET_PARTITION_DETAIL`).
+- **Per-partition table** — sorted by IOPS (hottest first): `PS_ADDR` (the
+  serving partition's listener address, from `info`'s `ps_addr`), `req_per_sec`
+  (IOPS), `p99_us` latency, SIZE (the detail `size_bytes` when flushed, else the
+  topology `live_size`), `gc_debt_bytes`, `pending_compaction_bytes`, gc/compact
+  inflight flags, sealed-log-extent count — from `autumn-op info` +
+  `autumn-op info --part P --detail` (`MSG_GET_PARTITION_DETAIL`).
 - **Policy advisories** — pending split/merge/gc/compact/ec/hotcold candidates
   from `autumn-op policy-candidates` (`MSG_GET_POLICY_CANDIDATES`).
 
-```
-═══ autumn-rs cluster dashboard ═══  00:00:01
-capacity: raw 512.0G/1.0T (50%) used  free 512.0G  physical 256.0G  logical 128.0G  amp 2.00x
-  nodes: n1[on 512.0G/1.0T ext=256.0G]
+Real-wire example (e2e-validated against a live `cluster.sh` cluster,
+2026-06-28 — 4 partitions, 3 ENs, under ~30K ops/s write load):
 
-   PART   PS     IOPS   p99us     SIZE   GCdebt  COMPACT  INFL SEALEXT
-   9001    1    20000     500     1.0G     1.0M       0B    --       3
-   9002    2      100     500     1.0G     1.0M       0B    --       3
-
-policy advisories (2):
-  split  part 9001          qps high
-  ec     extent 50          sealed 128M
 ```
+═══ autumn-rs cluster dashboard ═══  07:03:43
+capacity: raw 9.6T/10.3T (93%) used  free 723.4G  physical 33.2G  logical 2.8G  amp 11.87x
+  nodes: n3[on 241.1G/3.4T ext=11.1G]  n5[on 241.1G/3.4T ext=11.1G]  n1[on 241.1G/3.4T ext=11.1G]
+
+   PART PS_ADDR              IOPS   p99us     SIZE   GCdebt  COMPACT  INFL SEALEXT
+     13 127.0.0.1:9306       6562       0     2.8G       0B       0B    --       0
+     27 127.0.0.1:9303       6534       0     2.8G       0B       0B    --       0
+     34 127.0.0.1:9304       6485       0     2.7G       0B       0B    --       0
+     20 127.0.0.1:9302       6448       0     2.7G       0B       0B    --       0
+
+policy advisories: (none)
+```
+
+Advisories render as `<kind> <target> <reason>`, e.g. `split  part 9001  qps high`
+or `ec  extent 50  sealed 128M`, when the manager's policy engine has candidates
+(needs sustained load over its sliding window — none on a freshly-loaded cluster).
 
 ## Auto-policy controller
 
