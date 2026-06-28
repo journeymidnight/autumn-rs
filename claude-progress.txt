@@ -1413,3 +1413,7 @@ ROTATION TICK(clean):6 个 untested in-process system_* 全 PASS(--test-threads=
   bulk_verification 2/2、delete_tombstone 3/3、extent_failover 2/2、split_large_values 1/1、split_ref_counting 1/1、split_writes 1/1。
   无新发现(global BlockCache 修复后跨测试隔离稳;这批都过严格 --test-threads=1)。剩余 untested:system_putstream(7 ignored,待查 setup)、
   chaos_inode_lease_replay_failclosed、f109/f211/f250/f_fuse_lease(待查 bins/etcd 需求)、manager_failover(需 etcd)。coverage rotation 易测部分近穷尽。
+
+ROTATION TICK(clean,find-rate=0 第2轮)→易测覆盖穷尽,PIVOT 回 campaign 核心(coco review 大文件挖 latent bug):
+  6 个 0-ignored untested(f109/f211_node_lifecycle/f211_e2e_lifecycle/gc_chunked_read/gc_multiversion_same_extent/update_stream_ec)24 测 --test-threads=1 全 PASS,无新发现。
+  **决定:test-rotation 连 2 tick 0 find + 易测全绿 → 不再 grind #[ignore](需 etcd/bins)。转 coco 审高风险大 production 文件找 latent bug(campaign 本意)。**
