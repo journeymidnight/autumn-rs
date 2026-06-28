@@ -1003,33 +1003,27 @@ pub(crate) async fn handle_split_part(
         }
     }
 
-    // F140 + F196 D-r7 + F255: drain in-flight compact + GC before
-    // commit_length. Three gates, acquired outer→inner:
-    //   1. **Per-partition `compact_gate`** (F255) — serializes vs
-    //      `background_compact_loop`'s `do_compact` on THIS partition.
-    //      The PS-wide `ConcurrencyController.acquire_compact` permit
-    //      (default max=4) does NOT serialize same-partition: pre-F255
-    //      split could acquire one permit while a concurrent do_compact
-    //      on the same partition held another and emit `compact_row_append`
-    //      RowAppendReqs that raced the seal (coco /findbugs v3, 2026-06-02).
+    // Drain in-flight compaction + GC before commit_length. Two gates,
+    // acquired outer→inner:
+    //   1. **Per-partition `maintenance_gate`** — serializes vs the merged
+    //      `background_maintenance_loop` on THIS partition. It runs compaction
+    //      and GC on ONE task and acquires this gate around BOTH, so holding it
+    //      means neither a `do_compact` (`compact_row_append` racing the
+    //      row_stream seal) NOR a `run_gc` (log_stream append racing the log
+    //      seal) is in flight. Unifies the former compact_gate (F255) + gc_gate
+    //      (F140); the PS-wide `acquire_compact` permit (default max=4) does NOT
+    //      serialize same-partition (coco /findbugs v3, 2026-06-02), hence the
+    //      dedicated per-partition gate.
     //   2. **PS-wide `concurrency.acquire_compact`** (F196 D-r7) — caps
-    //      cross-partition peak RAM. Inner to the per-partition gate so
-    //      same-partition exclusion happens first.
-    //   3. **Per-partition `gc_gate`** (F140) — serializes vs `run_gc`'s
-    //      log_stream append on THIS partition.
-    // All three RAII-held through `multi_modify_split` AND the F255
-    // P-bulk barrier ACK below.
-    let (compact_gate, concurrency, gc_gate) = {
+    //      cross-partition peak RAM. Inner to the gate.
+    // Both RAII-held through `multi_modify_split` AND the F255 P-bulk barrier
+    // ACK below.
+    let (maintenance_gate, concurrency) = {
         let p = part.borrow();
-        (
-            p.compact_gate.clone(),
-            p.concurrency_ctrl.clone(),
-            p.gc_gate.clone(),
-        )
+        (p.maintenance_gate.clone(), p.concurrency_ctrl.clone())
     };
-    let _local_compact_gate = compact_gate.acquire().await;
+    let _local_maintenance_gate = maintenance_gate.acquire().await;
     let _compact_permit = concurrency.acquire_compact().await;
-    let _gc_permit = gc_gate.acquire().await;
 
     // Fetch authoritative range from the manager. PartitionData.rg is set
     // at open_partition and is NOT refreshed by sync_regions_once for an
@@ -1072,7 +1066,7 @@ pub(crate) async fn handle_split_part(
 
     // F262: async window scan over the (paged) SSTs — snapshot readers +
     // sc under one brief borrow, drop, await (note 15). Reader set is
-    // stable: this path holds compact_gate.
+    // stable: this path holds maintenance_gate.
     let (uuk_readers, uuk_sc) = {
         let p = part.borrow();
         (p.sst_readers.to_vec(), p.stream_client.clone())

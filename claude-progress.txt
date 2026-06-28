@@ -1,5 +1,5 @@
-Date: 2026-06-28 (F1 GC-crash data-loss 修复 — 用户分 2 小步;Step 1 完成)
-TaskStatus: not_completed
+Date: 2026-06-28 (F1 GC-crash data-loss 修复 — 完成:Step1 合并+floor guard、F1 复现验证、Step2 gate 合一)
+TaskStatus: completed
 Task scope: 修 F1(GC punch 掉 recovery 仍要 replay 的 log extent → crash 后数据丢失)。
   与用户深聊定方案:① GC 必须只 punch "recovery replay 起点之前"的 extent(replay floor =
   min over 所有 live SST 的 vp_head 在 log_extent_ids 的 stream 位置 = recover_partition 的 chosen_pos);
@@ -32,8 +32,20 @@ F1 复现验证完成(用户"先看F1消失"):F1 是 deterministic(代码可证�
   全 e2e 受控崩溃(SIGKILL 卡 punch 后 checkpoint 前)按前期调查不成比例贵;且有守卫后 GC 根本不会 punch
   vp_head extent(从根上关掉 punch 路径),故"复现不出来"正是 bug 已消失的预期结果。验证:ps lib 173/173
   (167+6),chaos 603 复跑全绿(纯抽取 behavior-preserving)。COMMIT 待 push。
-Next steps: Step 2(合 compact_gate+gc_gate→maintenance_gate,改 split 那 3 行 + 字段)→ 再测。
-  P2#3 留作可选 knob(别为边际延迟复杂化单 task)。
+STEP 2 完成(本次):合 compact_gate(F255)+ gc_gate(F140)→ 单个 maintenance_gate。
+  合并后 GC 与 compaction 同 task 不会互相 race,gate 唯一职责是 maintenance-loop vs split(split
+  在 partition_loop 另一个 task)互斥;merged-loop 的 compaction 段和 GC 段都拿这一把(一次只跑一种,
+  故持有它=两种活都静默),split 拿它替代原来两把。GC 段也调整为 gate-first(maintenance_gate→acquire_gc),
+  使 maintenance_gate 成为唯一最外层锁、锁图 maintenance_gate→{acquire_compact|acquire_gc} 显然无环。
+  改:PartitionData 字段二合一、open_partition 建一把、spawn 传一把、background.rs 4 处 acquire、
+  rpc_handlers handle_split_part 三锁→两锁(maintenance_gate→acquire_compact)、清理 stale 注释。
+  验证:build+clippy 干净、ps lib 173/173、chaos 603+13 全绿(Split/Merge OK,mismatch/not_found/range/
+  write-liveness/accounting 全 0)。
+F1 全部完成(Step1 36b4522 + 验证 93be2ad + Step2 待 commit,均 push)。P2#3(GC 等 compaction permit
+  的延迟耦合)留作可选 knob,未做(单 task 串行的预期后果,非正确性)。
+独立遗留(非 F1):F2(compaction publish-before-durable——GC+compact 现已同 task 串行,并发-GC 角度关闭;
+  meta append-then-truncate 崩溃窗仍在)、F3(recovery union 所有 meta locs)、F4(decode 失败静默回退 manifest,
+  缺 per-record CRC/generation)。reproduce-first-gated 若要做。详见 [[project_coco_arch_ps_gc_checkpoint_triage]]。
 ────────────────────────────────────────────────────────────────────────────────
 Date: 2026-06-25 (review 战役 — /loop 自驱:coco review + 每轮 chaos + 删 F### 注释)
 TaskStatus: completed

@@ -142,16 +142,17 @@ pub(crate) async fn background_maintenance_loop(
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
     mut gc_rx: mpsc::Receiver<GcTask>,
-    gc_gate: std::sync::Arc<crate::CompactionGate>,
+    maintenance_gate: std::sync::Arc<crate::CompactionGate>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
 ) {
     // Compaction + GC folded onto ONE task (was background_compact_loop +
     // background_gc_loop). Single task => they are STRUCTURALLY serialized, so
     // GC never reads `sst_readers` while a compaction is mid-publish: the
     // recovery replay floor it computes always matches the durable checkpoint
-    // recovery would load, with NO GC-vs-compaction gate. Each still acquires
-    // its own gate vs SPLIT (compaction -> compact_gate F255, GC -> gc_gate
-    // F140); split runs on partition_loop, a different task. See lock notes.
+    // recovery would load, with NO GC-vs-compaction gate. Both sections still
+    // acquire the single per-partition `maintenance_gate` vs SPLIT (which runs
+    // on partition_loop, a different task, and must see no compact_row_append
+    // nor log_stream GC append in flight while it seals). See lock notes.
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
     const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
@@ -322,14 +323,11 @@ pub(crate) async fn background_maintenance_loop(
                     continue;
                 }
 
-                // F255: per-partition compact_gate FIRST — serializes vs
-                // `handle_split_part` on this partition (split holds this
-                // gate from before commit_length through multi_modify_split
-                // so no `compact_row_append` from us can race the seal).
-                let _local_gate = {
-                    let g = part.borrow().compact_gate.clone();
-                    g.acquire().await
-                };
+                // Per-partition maintenance_gate FIRST — serializes vs
+                // `handle_split_part` on this partition (split holds this gate
+                // from before commit_length through multi_modify_split so no
+                // `compact_row_append` from us can race the seal).
+                let _local_gate = maintenance_gate.acquire().await;
                 // F104: PS-wide concurrency permit — limits cross-partition
                 // peak RAM (each do_compact holds ~2x SST bytes).
                 let _permit = concurrency_ctrl.acquire_compact().await;
@@ -411,11 +409,8 @@ pub(crate) async fn background_maintenance_loop(
                     let tbls = part.borrow().tables.clone();
                     if !tbls.is_empty() {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
-                        // F255: per-partition compact_gate (see main arm above).
-                        let _local_gate = {
-                            let g = part.borrow().compact_gate.clone();
-                            g.acquire().await
-                        };
+                        // Per-partition maintenance_gate (see main arm above).
+                        let _local_gate = maintenance_gate.acquire().await;
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -496,11 +491,8 @@ pub(crate) async fn background_maintenance_loop(
                     let tbls = part.borrow().tables.clone();
                     let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
                     if compact_tbls.len() >= 2 {
-                        // F255: per-partition compact_gate (see main arm above).
-                        let _local_gate = {
-                            let g = part.borrow().compact_gate.clone();
-                            g.acquire().await
-                        };
+                        // Per-partition maintenance_gate (see main arm above).
+                        let _local_gate = maintenance_gate.acquire().await;
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -604,7 +596,7 @@ pub(crate) async fn background_maintenance_loop(
                     chosen
                 };
                 // F189-fix MED-4: latch gc_inflight=1 at the very top of the
-                // loop iteration, not after gc_gate. The scheduler reads
+                // loop iteration, not after maintenance_gate. The scheduler reads
                 // gc_inflight to gate duplicate dispatches; without the early
                 // latch, a slow get_stream_info / get_extent_info (manager
                 // RPC) leaves the flag at 0 for seconds and the scheduler
@@ -862,17 +854,20 @@ pub(crate) async fn background_maintenance_loop(
                 }
 
                 // F196 D-r6: PS-wide GC concurrency cap (via the unified
-                // AdmissionController). Acquired BEFORE the per-partition
-                // gc_gate so multiple partitions on the same PS don't all
+                // AdmissionController). Acquired AFTER the per-partition
+                // maintenance_gate so multiple partitions on the same PS don't all
                 // enter run_gc together — each holds ~64 MiB chunk buffer +
                 // rewrite staging. Default 1 (full serialization), tunable
                 // via `--gc-parallelism`.
+                // Per-partition maintenance_gate FIRST (gate-before-permit, the
+                // same outer→inner order as compaction/split, so maintenance_gate
+                // is the universal outermost lock → acyclic). handle_split_part
+                // can then wait for no log_stream GC append in-flight when it
+                // seals. Held around the holes-processing loop below; the
+                // read-only candidate selection above ran without it.
+                let _gc_permit = maintenance_gate.acquire().await;
+                // PS-wide gc concurrency cap (cross-partition RAM).
                 let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
-                // F140: acquire gc_gate around the actual run_gc calls so that
-                // handle_split_part can wait for no log_stream appends in-flight.
-                // Gate is held only for the holes-processing loop, not for the
-                // preceding read-only get_stream_info / get_extent_info RPCs.
-                let _gc_permit = gc_gate.acquire().await;
                 tracing::info!("GC: starting, extents={:?}", holes);
                 // F189-fix MED-4: gc_inflight already latched at top of loop;
                 // hold through the punch and clear at the bottom.
@@ -2994,7 +2989,7 @@ pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
 
 /// F262: async window scan over the (paged) readers — SST side only, no
 /// materialization. Caller snapshots `readers` + `sc` under a brief borrow,
-/// DROPS it, then awaits (note 15). The split path holds `compact_gate`,
+/// DROPS it, then awaits (note 15). The split path holds `maintenance_gate`,
 /// so the reader set is stable across the scan. Returns the newest
 /// (first-occurrence, newest-first reader order) version per user key.
 ///

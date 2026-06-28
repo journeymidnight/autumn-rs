@@ -795,25 +795,20 @@ pub(crate) struct PartitionData {
     /// `handle_incoming_req`, so its parking happens on the loop's
     /// active stack and the next iteration's top check fires naturally.
     pub(crate) split_wake_tx: mpsc::UnboundedSender<()>,
-    /// F140: per-partition gate shared with background_gc_loop.
-    /// `handle_split_part` acquires this to ensure `run_gc` has no
-    /// log_stream append in-flight when commit_length is read. This is
-    /// split-vs-gc *synchronization*, NOT a resource cap. PS-wide
-    /// compact / gc concurrency limits live in `io_bucket` (F196 D-r6).
-    pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
-    /// F255 — per-partition compact gate (max_parallel=1). `handle_split_part`
-    /// MUST acquire this in addition to the PS-wide
-    /// `ConcurrencyController.acquire_compact` permit, so that no
-    /// `do_compact` is concurrently running on THIS partition while split's
-    /// barrier + commit_length + multi_modify_split window is open. Pre-F255
-    /// only the PS-wide permit was held; with `--major-compact-parallelism`
-    /// default 4, a do_compact on partition P could keep its permit while
-    /// split on partition P acquired a different permit and proceeded —
-    /// the concurrent compaction's `compact_row_append` would then race the
-    /// pre-seal commit_length, producing the same orphan-SST-past-sealed-
-    /// length class the F255 barrier is meant to close (coco /findbugs
-    /// 2026-06-02 v3 review).
-    pub(crate) compact_gate: std::sync::Arc<CompactionGate>,
+    /// Per-partition maintenance gate (max_parallel=1) — split-vs-background
+    /// *synchronization*, NOT a resource cap (PS-wide compact/gc concurrency
+    /// caps live on `concurrency_ctrl`). Unifies the former `compact_gate`
+    /// (F255) + `gc_gate` (F140): now that compaction and GC run on ONE task
+    /// (`background_maintenance_loop`), they can't race each other, so a single
+    /// gate suffices. `handle_split_part` MUST acquire it before reading
+    /// commit_length so that neither a `do_compact` (`compact_row_append`
+    /// racing the row_stream seal) NOR a `run_gc` (log_stream append racing the
+    /// log seal) is in flight during split's barrier + commit_length +
+    /// multi_modify_split window. The merged loop acquires it around BOTH its
+    /// compaction and GC sections (one at a time), so holding it = both kinds
+    /// quiesced. Acquisition order is gate-first everywhere (maintenance_gate →
+    /// PS-wide acquire_compact/acquire_gc), keeping the lock graph acyclic.
+    pub(crate) maintenance_gate: std::sync::Arc<CompactionGate>,
     /// F196 D-r7: per-partition rate controller. Fresh `Arc` per
     /// partition — fg/compact/gc rates are isolated; a hot partition's
     /// fg pressure cannot consume a cold sibling's budget. fg-aware
@@ -1179,7 +1174,7 @@ mod f162_reader_pin_tests {
 
     /// F162: writer pin already held — second writer also blocked.
     /// (Should not happen in production since GC serialises per-extent
-    /// via the gc_gate, but the protocol is correct either way.)
+    /// via the maintenance_gate, but the protocol is correct either way.)
     #[test]
     fn writer_pin_exclusive() {
         let pin = std::rc::Rc::new(AtomicI64::new(0));
@@ -4897,15 +4892,11 @@ async fn partition_thread_main(
         "open_partition: ready"
     );
 
-    // F140: per-partition gc_gate — background_gc_loop acquires this around
-    // the actual run_gc calls; handle_split_part acquires it before reading
-    // commit_length so no log_stream append can race the seal.
-    let gc_gate = CompactionGate::new(1);
-    // F255: per-partition compact_gate — background_compact_loop acquires
-    // this around each `do_compact`; handle_split_part acquires it BEFORE
-    // commit_length so no `compact_row_append` can race the row_stream
-    // seal (see field doc on PartitionData.compact_gate).
-    let compact_gate = CompactionGate::new(1);
+    // Per-partition maintenance gate — the merged background_maintenance_loop
+    // acquires it around each do_compact AND each run_gc; handle_split_part
+    // acquires it before reading commit_length so neither a compact_row_append
+    // nor a log_stream GC append can race the seal. See field doc.
+    let maintenance_gate = CompactionGate::new(1);
 
     let part = Rc::new(RefCell::new(PartitionData {
         part_id,
@@ -4932,8 +4923,7 @@ async fn partition_thread_main(
         row_invalidate_tx: row_invalidate_tx.clone(),
         imm_drained_tx,
         split_wake_tx,
-        gc_gate: gc_gate.clone(),
-        compact_gate: compact_gate.clone(),
+        maintenance_gate: maintenance_gate.clone(),
         rate_ctrl: rate_ctrl.clone(),
         concurrency_ctrl: concurrency_ctrl.clone(),
         partition_budget: partition_budget.clone(),
@@ -4983,10 +4973,10 @@ async fn partition_thread_main(
     {
         // Compaction + GC share ONE task (background_maintenance_loop) so they
         // are structurally serialized — see the fn-level note + the GC replay-
-        // floor guard. Split (partition_loop) still fences via compact_gate /
-        // gc_gate, which the merged loop acquires per work kind.
+        // floor guard. Split (partition_loop) fences via the single
+        // maintenance_gate, which the merged loop acquires around each work kind.
         let p = part.clone();
-        let gc_gate_for_loop = gc_gate.clone();
+        let gate_for_loop = maintenance_gate.clone();
         let conc_for_maint = concurrency_ctrl.clone();
         spawn_failstop(format!("maintenance[part {part_id}]"), async move {
             background_maintenance_loop(
@@ -4994,7 +4984,7 @@ async fn partition_thread_main(
                 p,
                 compact_rx,
                 gc_rx,
-                gc_gate_for_loop,
+                gate_for_loop,
                 conc_for_maint,
             )
             .await;
@@ -8634,7 +8624,7 @@ async fn flush_worker_loop(
     // F255: priority-bias `row_invalidate_rx` over flush/row_append so a
     // barrier sent inside `handle_split_part`'s critical section is picked
     // up ahead of any incidental late-arriving append (defensive — at the
-    // time of the barrier, frozen_for_split + compact_gate + gc_gate have
+    // time of the barrier, frozen_for_split + maintenance_gate have
     // already halted upstream producers, so the queue is normally empty,
     // but the bias keeps the design race-free under future refactors that
     // might relax those gates).
