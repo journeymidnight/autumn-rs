@@ -171,6 +171,14 @@ pub const MSG_REPORT_CORRUPT_REPLICA: u8 = 0x4C;
 // single point-estimate is left to the display layer.
 pub const MSG_CLUSTER_DF: u8 = 0x4D;
 
+/// Dashboard-oriented compact cluster overview (observability batch 2).
+/// Returns a per-partition rollup (range / ps / live_size / extent count) and a
+/// per-node extent count WITHOUT the giant per-extent array that `MSG_STREAM_INFO`
+/// (full dump) ships — so a web dashboard scales to 数千 partition / 数万 extent
+/// (browser payload + refresh cost bounded by PARTITION count, not extent count).
+/// Per-partition extents are fetched lazily via scoped `MSG_STREAM_INFO`.
+pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -957,6 +965,12 @@ pub struct PartitionLoad {
     pub part_id: u64,
     pub size_bytes: u64,
     pub req_per_sec: u32,
+    /// Real write throughput: value bytes/sec ingested by Put (the bytes/sec
+    /// companion to req_per_sec's IOPS).
+    pub write_bytes_per_sec: u64,
+    /// Real read throughput: value bytes/sec served by GET (resolved-value path;
+    /// large-VP client-direct reads from the EN are not counted here).
+    pub read_bytes_per_sec: u64,
     pub imm_full_per_sec: u32,
     pub p99_us: u32,
     /// F187: Σ reclaimable bytes on still-live sealed log_stream extents.
@@ -1178,6 +1192,64 @@ pub struct GetPartitionDetailResp {
     pub load: PartitionLoad,
     /// Unix-epoch seconds of the bucket this load was stamped at.
     pub bucket_ts: i64,
+}
+
+// ── Dashboard cluster overview (MSG_GET_CLUSTER_OVERVIEW) ──────────────────
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetClusterOverviewReq {}
+
+/// One compact partition row (no per-extent detail; that is lazy).
+/// `live_size` sums the partition's distinct extents' `sealed_length`
+/// (manager-authoritative, NO extent-node probe) — open-tail bytes are
+/// excluded, so it is an overview estimate; the per-partition detail
+/// (`info --part P`) probes for the exact figure.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PartitionOverview {
+    pub part_id: u64,
+    /// The serving PS INSTANCE id. Distinct from `ps_addr`, which under F099-K
+    /// is the partition's OWN listener (`base_port + ord`) — many partitions on
+    /// ONE PS each get a different `ps_addr`, so PS-count must group by `ps_id`.
+    pub ps_id: u64,
+    pub ps_addr: String,
+    pub range_start: Vec<u8>,
+    pub range_end: Vec<u8>,
+    pub live_size: u64,
+    pub total_extents: u32,
+    pub log_stream: u64,
+    pub row_stream: u64,
+    pub meta_stream: u64,
+    /// Latest reported IOPS (PartitionLoad.req_per_sec) from the manager's
+    /// policy window; 0 if the PS hasn't reported load yet. Cheap (already in
+    /// memory) so the overview can show per-partition IOPS + a cluster sum
+    /// without per-partition detail RPCs.
+    pub req_per_sec: u64,
+    /// Latest reported write / read throughput (bytes/sec) from the policy window.
+    pub write_bytes_per_sec: u64,
+    pub read_bytes_per_sec: u64,
+}
+
+/// Per-node rollup — the one thing a client can't compute without the full
+/// extent array: how many extent shards this node hosts (replicates ∪ parity).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeOverview {
+    pub node_id: u64,
+    pub address: String,
+    pub extent_count: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterOverviewResp {
+    pub code: u8,
+    pub message: String,
+    pub partitions: Vec<PartitionOverview>,
+    pub nodes: Vec<NodeOverview>,
+    /// Cluster-aggregate IOPS = Σ partitions' latest req_per_sec.
+    pub total_req_per_sec: u64,
+    /// Cluster-aggregate write / read throughput (bytes/sec).
+    pub total_write_bytes_per_sec: u64,
+    pub total_read_bytes_per_sec: u64,
+    /// Distinct serving PS instances (by `ps_id`, NOT `ps_addr`).
+    pub ps_count: u32,
 }
 
 // ── Extent msg_type constants (needed by manager for node calls) ──────────

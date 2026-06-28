@@ -1007,6 +1007,14 @@ pub struct PartitionMetrics {
     /// real FG storm). The scheduler now diffs against this monotonic
     /// counter instead, so it sees true delta over its own interval.
     pub req_count_monotonic: std::sync::atomic::AtomicU64,
+    /// Value bytes written this interval (Put values, accumulated per batch in
+    /// `start_write_batch`). `report_load_loop` swaps it to 0 every interval and
+    /// divides by the interval for `write_bytes_per_sec` — real write throughput,
+    /// the bytes/sec companion to `req_count`'s IOPS.
+    pub write_bytes: std::sync::atomic::AtomicU64,
+    /// Value bytes READ this interval (GET-served value lengths, accumulated in
+    /// the read path). Swapped → `read_bytes_per_sec`.
+    pub read_bytes: std::sync::atomic::AtomicU64,
     pub imm_full_count: std::sync::atomic::AtomicU64,
     /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
     /// after each flush + memtable rotate (cheap; under borrow_mut).
@@ -3034,12 +3042,17 @@ impl PartitionServer {
     }
 
     async fn report_load_loop(&self) {
-        // F196: 5 s → 30 s. Manager aggregates into 60 s buckets and
-        // the policy window only inspects the last 5 buckets (5 min);
-        // 5 s upload was over-sampling by ~6× with no advisory benefit.
-        // At 30 s cadence each bucket still gets ≥1 sample and req/s
-        // is averaged over the 30 s window before the bucket close.
-        const REPORT_INTERVAL_SECS: u64 = 30;
+        // Cadence history: 5 s (orig) → 30 s (F196: policy was the ONLY
+        // consumer and only needs ≤6 buckets, so 5 s over-sampled ~6× with no
+        // advisory benefit) → 5 s (RESTORED: the web dashboard is now a
+        // consumer and wants near-real-time IOPS / throughput, which 30 s makes
+        // impossible — a finished upload's window rolls to 0 before you see it).
+        // The policy engine is UNAFFECTED: it buckets independently by
+        // `bucket_sec` and same-bucket reports REPLACE (F210-F2), so a finer
+        // report cadence just gives the latest in-bucket rate; the scheduler
+        // uses `req_count_monotonic` (never reset) for its own diff. Cost: one
+        // report RPC per PS per 5 s carrying ALL partitions — trivial.
+        const REPORT_INTERVAL_SECS: u64 = 5;
         let mut ticker = compio::time::interval(Duration::from_secs(REPORT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
         loop {
@@ -3051,6 +3064,8 @@ impl PartitionServer {
                     .map(|(part_id, handle)| {
                         use std::sync::atomic::Ordering::Relaxed;
                         let req = handle.metrics.req_count.swap(0, Relaxed);
+                        let write_bytes = handle.metrics.write_bytes.swap(0, Relaxed);
+                        let read_bytes = handle.metrics.read_bytes.swap(0, Relaxed);
                         let imm_full = handle.metrics.imm_full_count.swap(0, Relaxed);
                         let size_bytes = handle.metrics.size_bytes.load(Relaxed);
                         // F187: maintenance debt + inflight + last-run timestamps.
@@ -3076,6 +3091,8 @@ impl PartitionServer {
                             part_id: *part_id,
                             size_bytes,
                             req_per_sec: (req / REPORT_INTERVAL_SECS) as u32,
+                            write_bytes_per_sec: write_bytes / REPORT_INTERVAL_SECS,
+                            read_bytes_per_sec: read_bytes / REPORT_INTERVAL_SECS,
                             imm_full_per_sec: (imm_full / REPORT_INTERVAL_SECS) as u32,
                             p99_us: 0,
                             gc_debt_bytes,
