@@ -243,6 +243,8 @@ impl AutumnManager {
             MSG_REPORT_CORRUPT_REPLICA => self.handle_report_corrupt_replica(payload).await,
             // ── cluster-df: aggregate capacity summary ──────────────────
             MSG_CLUSTER_DF => self.handle_cluster_df().await,
+            // ── dashboard compact overview (no per-extent array) ────────
+            MSG_GET_CLUSTER_OVERVIEW => self.handle_get_cluster_overview().await,
             // ── F-ioring-lease-1: inode-level lease + close-to-open ─────
             MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
             MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
@@ -3857,6 +3859,128 @@ impl AutumnManager {
             message: String::new(),
             load,
             bucket_ts,
+        }))
+    }
+
+    /// Dashboard compact overview: per-partition rollup (range / ps / live_size
+    /// / extent count) + per-node extent-shard count, computed entirely from
+    /// in-memory state with NO extent-node probe and NO per-extent array on the
+    /// wire. Bounded by partition + node count, so a web dashboard scales to
+    /// 数千 partition / 数万 extent. Leader-gated (a follower's `regions` /
+    /// `extents` are replay-stale; the dashboard should scrape the leader).
+    pub(crate) async fn handle_get_cluster_overview(&self) -> HandlerResult {
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&GetClusterOverviewResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                partitions: Vec::new(),
+                nodes: Vec::new(),
+                total_req_per_sec: 0,
+                total_write_bytes_per_sec: 0,
+                total_read_bytes_per_sec: 0,
+                ps_count: 0,
+            }));
+        }
+        let s = self.store.inner.borrow();
+        // Latest reported load per partition (policy window; defaults if no report).
+        let pol = self.policy.borrow();
+        // (req_per_sec, write_bytes_per_sec, read_bytes_per_sec)
+        let load_of = |pid: u64| -> (u64, u64, u64) {
+            pol.metrics
+                .get(&pid)
+                .and_then(|w| w.buckets.back())
+                .map(|(_, l)| (l.req_per_sec as u64, l.write_bytes_per_sec, l.read_bytes_per_sec))
+                .unwrap_or((0, 0, 0))
+        };
+
+        // Per-node extent-shard count = how many extents list the node in
+        // replicates ∪ parity (the one fact a client can't derive without the
+        // full extent array). One pass over all extents.
+        let mut node_ext: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for e in s.extents.values() {
+            for nid in e.replicates.iter().chain(e.parity.iter()) {
+                *node_ext.entry(*nid).or_insert(0) += 1;
+            }
+        }
+        let mut nodes: Vec<NodeOverview> = s
+            .nodes
+            .values()
+            .map(|n| NodeOverview {
+                node_id: n.node_id,
+                address: n.address.clone(),
+                extent_count: node_ext.get(&n.node_id).copied().unwrap_or(0),
+            })
+            .collect();
+        nodes.sort_by_key(|n| n.node_id);
+
+        // Per-partition rollup. live_size = Σ distinct extents' sealed_length
+        // over the partition's 3 streams (manager-authoritative; open-tail
+        // bytes excluded — the per-partition detail probes for the exact size).
+        let partitions: Vec<PartitionOverview> = s
+            .regions
+            .values()
+            .map(|r| {
+                let ps_addr = s
+                    .part_addrs
+                    .get(&r.part_id)
+                    .or_else(|| s.ps_nodes.get(&r.ps_id))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let mut live_size = 0u64;
+                for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+                    if let Some(st) = s.streams.get(&sid) {
+                        for eid in &st.extent_ids {
+                            if seen.insert(*eid) {
+                                if let Some(e) = s.extents.get(eid) {
+                                    live_size = live_size.saturating_add(e.sealed_length);
+                                }
+                            }
+                        }
+                    }
+                }
+                let (range_start, range_end) = r
+                    .rg
+                    .as_ref()
+                    .map(|g| (g.start_key.clone(), g.end_key.clone()))
+                    .unwrap_or_default();
+                PartitionOverview {
+                    part_id: r.part_id,
+                    ps_addr,
+                    range_start,
+                    range_end,
+                    live_size,
+                    total_extents: seen.len() as u32,
+                    log_stream: r.log_stream,
+                    row_stream: r.row_stream,
+                    meta_stream: r.meta_stream,
+                    req_per_sec: load_of(r.part_id).0,
+                    write_bytes_per_sec: load_of(r.part_id).1,
+                    read_bytes_per_sec: load_of(r.part_id).2,
+                    ps_id: r.ps_id,
+                }
+            })
+            .collect();
+
+        let total_req_per_sec = partitions.iter().map(|p| p.req_per_sec).sum();
+        let total_write_bytes_per_sec = partitions.iter().map(|p| p.write_bytes_per_sec).sum();
+        let total_read_bytes_per_sec = partitions.iter().map(|p| p.read_bytes_per_sec).sum();
+        let ps_count = s
+            .regions
+            .values()
+            .map(|r| r.ps_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u32;
+
+        Ok(rkyv_encode(&GetClusterOverviewResp {
+            code: CODE_OK,
+            message: String::new(),
+            partitions,
+            nodes,
+            total_req_per_sec,
+            total_write_bytes_per_sec,
+            total_read_bytes_per_sec,
+            ps_count,
         }))
     }
 

@@ -589,6 +589,13 @@ async fn get_value_inner(
         m.maybe_report();
     });
 
+    // Read-throughput accounting: bytes the PS actually served (resolved-value
+    // path only; large-VP Redirect is read directly from the EN, not here).
+    part.borrow()
+        .metrics
+        .read_bytes
+        .fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
     Ok(GetOutcome::Value(value))
 }
 

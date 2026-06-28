@@ -644,6 +644,9 @@ load_cluster_config() {
 
 do_start() {
     local replicas="${1:-1}"
+    # fresh=1 ONLY from `reset` — the explicit "wipe + fresh cluster" path.
+    # `start` / `restart` pass 0 and MUST NEVER clean etcd (data-safety).
+    local fresh="${2:-0}"
     [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas >= 1 )) || die "replicas must be a positive integer"
 
     # Stop any leftover processes from a previous run to avoid port conflicts
@@ -702,10 +705,19 @@ do_start() {
         echo "[cluster] etcd cluster: $etcd_n members ($ETCD_ENDPOINTS)"
     fi
 
-    # Clean etcd data on fresh start (no bootstrap marker = fresh cluster)
+    # DATA-SAFETY: clean etcd ONLY on an explicit `reset` (fresh=1). `start` /
+    # `restart` MUST NEVER wipe etcd.
+    #
+    # History (the bug this fixes): the wipe used to be gated on the presence of
+    # the LOCAL `$DATA_ROOT/bootstrapped` marker file — "no marker = fresh
+    # cluster = clean etcd". But `restart` also routes through `do_start`, so any
+    # time that marker was missing or desynced from etcd (tmpfs cleared on
+    # reboot, a prior `clean`, a DATA_ROOT mismatch, a manual rm), a bare
+    # `restart` SILENTLY deleted all cluster data. `restart` must be a pure
+    # stop+start; only `reset`/`clean` may destroy data, and they say so.
     local bootstrap_marker="$DATA_ROOT/bootstrapped"
-    if [[ ! -f "$bootstrap_marker" ]]; then
-        echo "[cluster] cleaning etcd (fresh start)"
+    if [[ "$fresh" == "1" ]]; then
+        echo "[cluster] cleaning etcd (reset — fresh cluster, all data wiped)"
         etcdctl del "" --prefix >/dev/null 2>&1 || true
     fi
 
@@ -766,9 +778,24 @@ do_start() {
 
     launch_ps
 
-    # bootstrap (create streams + partitions) — only on a fresh data dir
-    if [[ -f "$bootstrap_marker" ]]; then
-        echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
+    # bootstrap (create streams + partitions) — only when the cluster has never
+    # been bootstrapped. AUTHORITATIVE check = does etcd already hold cluster
+    # metadata (`streams/` keys, written by bootstrap). The local marker file
+    # alone is unreliable: a `restart` whose marker was lost must NOT
+    # re-bootstrap on top of live etcd data (that would create duplicate
+    # streams/partitions over the preserved data). etcd is the source of truth;
+    # the marker is just a fast-path hint we self-heal here.
+    local etcd_bootstrapped=0
+    if etcdctl get "streams/" --prefix --keys-only 2>/dev/null | grep -q .; then
+        etcd_bootstrapped=1
+    fi
+    if [[ -f "$bootstrap_marker" || "$etcd_bootstrapped" == "1" ]]; then
+        if [[ ! -f "$bootstrap_marker" ]]; then
+            echo "[cluster] etcd already bootstrapped (marker was missing) — preserving data, re-creating marker"
+            mkdir -p "$DATA_ROOT" && touch "$bootstrap_marker"
+        else
+            echo "[cluster] skipping bootstrap (already done — preserving data; use 'reset' for a fresh cluster)"
+        fi
         # Give PS a moment to sync regions and re-bind listeners on restart.
         wait_port "$PS_BASE_PORT" ps 60
     else
@@ -1094,11 +1121,11 @@ fi
 export CLUSTER_MODE="$MODE"
 
 case "$CMD" in
-    start)        do_start "$REPLICAS" ;;
+    start)        do_start "$REPLICAS" 0 ;;
     stop)         do_stop ;;
-    restart)      do_stop; do_start "$REPLICAS" ;;
+    restart)      do_stop; do_start "$REPLICAS" 0 ;;
     clean)        do_clean ;;
-    reset)        do_clean; do_start "$REPLICAS" ;;
+    reset)        do_clean; do_start "$REPLICAS" 1 ;;
     status)       do_status ;;
     logs)         do_logs ;;
     # F102: per-process control for recovery testing. Args inherit the

@@ -305,8 +305,8 @@ async fn run(args: Args) -> Result<()> {
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         // ---------------- F213 read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
-        Command::Info { part, detail } => {
-            run_info(&client, args.json, part, detail).await?;
+        Command::Info { part, detail, full } => {
+            run_info(&client, args.json, part, detail, full).await?;
         }
         // ---------------- F213 admin ----------------
         Command::Bootstrap {
@@ -1344,7 +1344,17 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
         for (dir, _u, disk_id) in &disk_assignments {
             println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
         }
-        println!("\nFormat complete.");
+        // Don't claim "Format complete" when every dir was just REUSED — the
+        // idempotent re-register path formats nothing. Report accurately.
+        let n_fresh = freshly_formatted.iter().filter(|&&f| f).count();
+        let n_reused = freshly_formatted.len() - n_fresh;
+        if n_fresh == 0 {
+            println!("\nReuse complete ({n_reused} dir(s) already formatted; nothing to format).");
+        } else if n_reused == 0 {
+            println!("\nFormat complete ({n_fresh} dir(s) formatted).");
+        } else {
+            println!("\nFormat complete ({n_fresh} formatted, {n_reused} reused).");
+        }
         println!("listen={listen}, advertise={advertise}");
         println!("Start the extent node with:");
         println!(
@@ -1552,11 +1562,236 @@ async fn run_bootstrap(
 // F213 info (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
+/// Scalable compact cluster overview (the DEFAULT `info`). One
+/// `MSG_GET_CLUSTER_OVERVIEW` RPC: per-partition rollup (range / ps /
+/// live_size / extent count, range-sorted) + per-node extent-shard count —
+/// NO per-extent array, NO per-PS discard probe. Bounded by partition + node
+/// count, so it scales to 数千 partition / 数万 extent. Per-partition extents
+/// are fetched lazily via `info --part P` (scoped).
+async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_GET_CLUSTER_OVERVIEW, rkyv_encode(&GetClusterOverviewReq {}))
+        .await
+        .context("cluster overview")?;
+    let resp: GetClusterOverviewResp = rkyv_decode(&bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("cluster overview: code={} {}", resp.code, resp.message);
+    }
+    let mut parts = resp.partitions;
+    // Global key-range order: "" (−∞) first, then by raw start bytes.
+    parts.sort_by(|a, b| {
+        (!a.range_start.is_empty(), &a.range_start).cmp(&(!b.range_start.is_empty(), &b.range_start))
+    });
+    // PS-instance count comes from the manager (distinct ps_id). NOT distinct
+    // ps_addr — under F099-K each partition has its OWN listener (base_port+ord),
+    // so one PS process serving N partitions exposes N addresses.
+    let ps_count = resp.ps_count;
+    let key_s = |k: &[u8]| String::from_utf8_lossy(k).into_owned();
+
+    if json_out {
+        let pj: Vec<_> = parts
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "part_id": p.part_id,
+                    "ps_id": p.ps_id,
+                    "ps_addr": p.ps_addr,
+                    "range_start": key_s(&p.range_start),
+                    "range_end": key_s(&p.range_end),
+                    "live_size": p.live_size,
+                    "total_extents": p.total_extents,
+                    "req_per_sec": p.req_per_sec,
+                    "write_bytes_per_sec": p.write_bytes_per_sec,
+                    "read_bytes_per_sec": p.read_bytes_per_sec,
+                    "log_stream_id": p.log_stream,
+                    "row_stream_id": p.row_stream,
+                    "meta_stream_id": p.meta_stream,
+                })
+            })
+            .collect();
+        let nj: Vec<_> = resp
+            .nodes
+            .iter()
+            .map(|n| serde_json::json!({
+                "node_id": n.node_id, "address": n.address, "extent_count": n.extent_count,
+            }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "part_count": parts.len(),
+                "ps_count": ps_count,
+                "total_req_per_sec": resp.total_req_per_sec,
+                "total_write_bytes_per_sec": resp.total_write_bytes_per_sec,
+                "total_read_bytes_per_sec": resp.total_read_bytes_per_sec,
+                "partitions": pj,
+                "nodes": nj,
+            }))?
+        );
+    } else {
+        println!("cluster overview: {} partitions across {} PS", parts.len(), ps_count);
+        for p in &parts {
+            println!(
+                "  part {:>6}  ps {:<20}  {:>10}  {:>3} ext  [{}, {})",
+                p.part_id,
+                p.ps_addr,
+                human_size(p.live_size),
+                p.total_extents,
+                key_s(&p.range_start),
+                if p.range_end.is_empty() { "+∞".into() } else { key_s(&p.range_end) },
+            );
+        }
+        println!("nodes:");
+        for n in &resp.nodes {
+            println!("  node {:>4} {:<20} {} extent shards", n.node_id, n.address, n.extent_count);
+        }
+    }
+    Ok(())
+}
+
+/// Scoped per-partition view (`info --part P`, no `--detail`): one
+/// `MSG_GET_REGIONS` (cheap) to resolve the partition's 3 streams + ps + range,
+/// then a SCOPED `MSG_STREAM_INFO` (only those streams) so the extent list is
+/// bounded by THIS partition — never a full-cluster extent pull. Emits the
+/// partition's `extents` array (the dashboard's lazy drawer source).
+async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) -> Result<()> {
+    let regions_bytes = client.mgr_call(MSG_GET_REGIONS, Bytes::new()).await.context("get regions")?;
+    let regions_resp: GetRegionsResp = rkyv_decode(&regions_bytes).map_err(decode_err)?;
+    if regions_resp.code != CODE_OK {
+        bail!("get regions: code={} {}", regions_resp.code, regions_resp.message);
+    }
+    let regions: std::collections::HashMap<u64, MgrRegionInfo> =
+        regions_resp.regions.into_iter().collect();
+    let part_addrs: std::collections::HashMap<u64, String> =
+        regions_resp.part_addrs.into_iter().collect();
+    let ps_details: std::collections::HashMap<u64, MgrPsDetail> =
+        regions_resp.ps_details.into_iter().collect();
+    let r = regions
+        .get(&pid)
+        .ok_or_else(|| anyhow!("partition {pid} not found"))?;
+
+    let si_bytes = client
+        .mgr_call(
+            MSG_STREAM_INFO,
+            rkyv_encode(&StreamInfoReq {
+                stream_ids: vec![r.log_stream, r.row_stream, r.meta_stream],
+            }),
+        )
+        .await
+        .context("stream info (scoped)")?;
+    let si: StreamInfoResp = rkyv_decode(&si_bytes).map_err(decode_err)?;
+    if si.code != CODE_OK {
+        bail!("stream info: code={} {}", si.code, si.message);
+    }
+    let extent_map: std::collections::HashMap<u64, MgrExtentInfo> = si.extents.into_iter().collect();
+    let stream_map: std::collections::HashMap<u64, MgrStreamInfo> = si.streams.into_iter().collect();
+
+    // Resolve EN node addresses (cheap, one RPC) so we can PROBE open extents
+    // for their live length. An OPEN (unsealed) extent's manager `sealed_length`
+    // is 0, so without a probe the tail log/row/meta extents render as 0B — which
+    // is wrong (the log tail holds the live WAL). Sealed/EC extents need no probe.
+    let node_map: std::collections::HashMap<u64, String> =
+        match client.mgr_call(MSG_NODES_INFO, Bytes::new()).await {
+            Ok(nb) => match rkyv_decode::<NodesInfoResp>(&nb) {
+                Ok(nr) => nr.nodes.into_iter().map(|(id, n)| (id, n.address)).collect(),
+                Err(_) => Default::default(),
+            },
+            Err(_) => Default::default(),
+        };
+
+    let ps_addr = part_addrs
+        .get(&pid)
+        .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+        .cloned()
+        .unwrap_or_default();
+    let key_s = |k: &[u8]| String::from_utf8_lossy(k).into_owned();
+    let (rs, re) = r
+        .rg
+        .as_ref()
+        .map(|g| (key_s(&g.start_key), key_s(&g.end_key)))
+        .unwrap_or_default();
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut extents_json = Vec::new();
+    let mut live_size = 0u64;
+    for (role, sid) in [("log", r.log_stream), ("row", r.row_stream), ("meta", r.meta_stream)] {
+        if let Some(st) = stream_map.get(&sid) {
+            for eid in &st.extent_ids {
+                if !seen.insert(*eid) {
+                    continue;
+                }
+                if let Some(e) = extent_map.get(eid) {
+                    // Sealed → authoritative sealed_length. Open → probe the EN
+                    // for the live length (else it shows 0B, see node_map note).
+                    let mut sz = e.sealed_length;
+                    if !e.sealed {
+                        if let Some(addr) = e.replicates.first().and_then(|nid| node_map.get(nid)) {
+                            if let Ok(enc) = client.get_ps_client(addr).await {
+                                let req = ExtProbeExtentReq { extent_id: *eid };
+                                if let Ok(rb) = enc
+                                    .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
+                                    .await
+                                {
+                                    if let Ok(pr) = ExtProbeExtentResp::decode(rb) {
+                                        sz = pr.length as u64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    live_size = live_size.saturating_add(sz);
+                    let replicas: Vec<u64> = e.replicates.iter().chain(e.parity.iter()).copied().collect();
+                    extents_json.push(serde_json::json!({
+                        "extent_id": *eid,
+                        "role": role,
+                        "size": sz,
+                        "open": !e.sealed,
+                        "ec": e.ec_converted,
+                        "ec_shape": if e.ec_converted { Some(format!("{}+{}", e.replicates.len(), e.parity.len())) } else { None },
+                        "replicas": replicas,
+                        "refs": e.refs,
+                        "eversion": e.eversion,
+                    }));
+                } else {
+                    extents_json.push(serde_json::json!({
+                        "extent_id": *eid, "role": role, "missing": true,
+                    }));
+                }
+            }
+        }
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "part_id": pid,
+                "ps_addr": ps_addr,
+                "range_start": rs,
+                "range_end": re,
+                "live_size": live_size,
+                "total_extents": seen.len(),
+                "log_stream_id": r.log_stream,
+                "row_stream_id": r.row_stream,
+                "meta_stream_id": r.meta_stream,
+                "extents": extents_json,
+            }))?
+        );
+    } else {
+        println!("partition {pid} on {ps_addr}  [{rs}, {re})  {} ({} ext)", human_size(live_size), seen.len());
+        for e in &extents_json {
+            println!("  {}", e);
+        }
+    }
+    Ok(())
+}
+
 async fn run_info(
     client: &ClusterClient,
     json_out: bool,
     part: Option<u64>,
     detail: bool,
+    full: bool,
 ) -> Result<()> {
     // F203: `--detail` prints PartitionLoad snapshot for `part`.
     if detail {
@@ -1577,6 +1812,8 @@ async fn run_info(
                 "bucket_ts": resp.bucket_ts,
                 "size_bytes": l.size_bytes,
                 "req_per_sec": l.req_per_sec,
+                "write_bytes_per_sec": l.write_bytes_per_sec,
+                "read_bytes_per_sec": l.read_bytes_per_sec,
                 "imm_full_per_sec": l.imm_full_per_sec,
                 "p99_us": l.p99_us,
                 "gc_debt_bytes": l.gc_debt_bytes,
@@ -1634,7 +1871,17 @@ async fn run_info(
         return Ok(());
     }
 
-    // === Fetch manager data ===
+    // Big-cluster routing: default `info` = scalable compact overview;
+    // `info --part P` = scoped single-partition view (+extents). Only the
+    // explicit `--full` falls through to the legacy complete dump below.
+    if !full {
+        if let Some(pid) = part {
+            return run_partition_info(client, json_out, pid).await;
+        }
+        return run_overview(client, json_out).await;
+    }
+
+    // === Fetch manager data (legacy full dump, `--full` only) ===
     let stream_resp_bytes = client
         .mgr_call(
             MSG_STREAM_INFO,

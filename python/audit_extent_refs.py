@@ -72,7 +72,10 @@ def op_info(op_bin, manager):
     extents, each carrying `refs` + `vp_table_refs`, so we can classify orphans
     as retained-by-live-data vs reclaimable-dead without extra RPCs.
     """
-    out = sh([op_bin, "--manager", manager, "--json", "info"])
+    # `info --full`: default `info` is now the SCALABLE compact overview (no
+    # per-extent/stream arrays); the audit needs the complete dump (streams +
+    # all extents incl. orphans), which `--full` preserves.
+    out = sh([op_bin, "--manager", manager, "--json", "info", "--full"])
     doc = json.loads(out)
     streams = doc.get("streams") or []
     extents = {e["extent_id"]: e for e in (doc.get("extents") or [])}

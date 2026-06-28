@@ -1088,6 +1088,12 @@ pub(crate) async fn start_write_batch(
     // `value.len()` bytes to the CRC compute (the dominant cost); keys
     // and headers are tens of bytes per record, negligible.
     let total_value_bytes: u64 = valid.iter().map(|e| e.value.len() as u64).sum();
+    // Write-throughput accounting: accumulate value bytes once per batch (P-log
+    // thread, no contention). report_load_loop swaps this for write_bytes_per_sec.
+    part.borrow()
+        .metrics
+        .write_bytes
+        .fetch_add(total_value_bytes, std::sync::atomic::Ordering::Relaxed);
 
     let (segments, record_sizes) = if total_value_bytes >= PHASE1_OFFLOAD_THRESHOLD {
         // F177: big-batch path — move encode inputs into spawn_blocking.

@@ -116,6 +116,10 @@ pub(crate) enum Command {
     Info {
         part: Option<u64>,
         detail: bool,
+        /// `--full`: the legacy complete dump (all nodes/streams/extents +
+        /// per-PS discard probes). Default `info` is now the SCALABLE compact
+        /// overview (per-partition rollup, no per-extent array) for big clusters.
+        full: bool,
     },
     PolicyCandidates,
     // F213 cluster / partition admin (migrated from autumn-client)
@@ -372,6 +376,7 @@ pub(crate) fn parse() -> Args {
         "info" => {
             let mut part: Option<u64> = None;
             let mut detail = false;
+            let mut full = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--part" => {
@@ -390,6 +395,10 @@ pub(crate) fn parse() -> Args {
                         detail = true;
                         i += 1;
                     }
+                    "--full" => {
+                        full = true;
+                        i += 1;
+                    }
                     other => {
                         eprintln!("unknown info flag: {other}");
                         usage();
@@ -400,7 +409,7 @@ pub(crate) fn parse() -> Args {
                 eprintln!("--detail requires --part <PID>");
                 usage();
             }
-            Command::Info { part, detail }
+            Command::Info { part, detail, full }
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
         // F213 admin
