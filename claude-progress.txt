@@ -1339,3 +1339,17 @@ REGRESSION TICK (loop steady-state,无 chaos-path code 改动):2 随机 seed sys
   587153178(split+gc+flush+latency+netpart;acked=13466,mismatch=0,accounting=0,10ext/12mem)+
   342064767(2× kill-restart+fence+compact;acked=11166 clean,mismatch=0,not_found=0,accounting=0,4ext/4mem)。
   两大交付(refs-leak fix + dashboard e2e)后无 rust chaos-path 改动→纯 regression insurance。fuzz/dashboard 均已穷尽,新价值需用户换方向。
+
+COVERAGE-ROTATION TICK(不重复同一 kill_split_merge,转去跑没跑过的 EC/recovery/failover system 测试=campaign 标的"新价值方向"):
+  ✓ ec_failover(ec_2_1_failover_and_recovery)+ system_extent_recovery(2 测)全过。
+  ✗ **system_compound_failures::split_then_ps_crash_data_survives 复现性 wedge(4/4)**——PUT 卡在
+    `alloc_new_extent failed after 20 retries`→`put failed after 30 retries`,~311s 耗尽 retry budget。reproduce-first:
+    · **PRE-EXISTING 非本会话 regression**:在 session-start 6dfc503(本会话 extent-CAS 前)同样 wedge;且逻辑上不可能是我改的——
+      wedge 在 split 前的初始写(line~42),我的改动在 split/merge/punch/truncate(line~47 后才跑)。
+    · **几乎确定非 production harm = harness/timing**:本会话真 cluster.sh e2e(3EN ~30K ops/s 真写)正常;兄弟 2-EN 测
+      ec_failover+system_extent_recovery 过;system_chaos(5EN)过。只有这一个 2-EN 测 wedge→核心 alloc 健康,问题是此测特定序列
+      (23 写+flush+split+PS-crash+PS2-takeover)。候选因素:用了 plain pick_addr()(ephemeral≥10000)而非 F270 pick_stable_port_pair()。
+    · 已存 memory [[project_compound_split_ps_crash_wedge]](防未来误判成新 regression / 防 #[ignore] 偷懒)+ 上浮用户。
+    · **未 speculative 深挖/patch**(复现=真实危害非机制单测;真 e2e+兄弟测证明 alloc 工作)。root-cause=聚焦任务(manager
+      handle_stream_alloc_extent/select_nodes Online-gating + memory-mode harness 里 EN df-flip-to-Online timing),等用户定优先级。
+  **教训:轮换 chaos 覆盖面比重复同一 seed 有价值**——这次轮换立刻挖出一个被窄 fuzz 漏掉的 pre-existing wedge。
