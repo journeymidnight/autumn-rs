@@ -1178,6 +1178,26 @@ R59 2-random(coco+dashboard 两任务后回归):seed=967111425(45s)PASS all inva
 R60 2-random+EC-shape:seed=1000523108(EC 3+1,45s)PASS all invariants OK(acked=11257 fail=0,reads=21736 miss=0[干净],mismatch=0 not_found=0,5ext/5mem)
   + **seed=737407288(EC 4+2 双 parity,K=4 M=2 ENs=7,45s)PASS all invariants OK**(acked=11849 fail=0,reads=20732 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。
   **首次跑 EC 4+2(双 parity)路径**。至此 4 种 EC 形状全覆盖(3+1/3+2/4+1/4+2)。累积 system_chaos 全绿 25 distinct。系统稳。
+R61 — **fuzz-monitor 抓到 GENUINE 可复现 accounting bug(seed=769351064)**!seed1=769351064 FAIL `accounting_errors=1`,seed2=447681404 PASS。
+  **非端口 artifact**(45s run,mismatch=0 not_found=0 range=0 liveness=0,唯 accounting=1;非 not_found-flood)。reproduce-first:同 seed 4 跑
+  = FAIL/PASS/FAIL/FAIL = **3/4 复现**(过 verdict-gate ≥2/N 阈值=genuine 非 transient)。具体错误:**`extent 14: refs=1 != 0 streams listing it
+  (ORPHAN-LEAK: referenced but in no stream)`**——extent 14 的 ExtentInfo.refs=1 但无任何 stream 在 extent_ids 列它=引用但无 stream=泄漏
+  (refs>0 永不被 both-zero sweep[note41 只收 refs==0] reclaim→若 genuine 则永久泄漏)。**mismatch=0=空间泄漏类非数据丢失。** accounting checker
+  retry 6×2s=10s 仍 FAIL(非 2s 短瞬态)。**关键未决:永久泄漏(真 bug)vs 慢-deferred-reconcile 超 10s 窗**(delete/punch 被 in-flight
+  recovery/EC defer[F139/F146 guard],30-60s 周期重试)。诊断中:临时把 checker 窗 6→30(60s)+ per-attempt log,看 extent 14 是否在 60s 内
+  reconcile(慢-deferred=test-harness 窗短)或持续(永久泄漏=真 refs-accounting bug,可能=coco #4 / manager note33 deferred extent-state-CAS
+  gap 的首次复现——note33 明说"apply CAS ONLY if extent-state clobber actually reproduced")。诊断 + root-cause 后上浮用户。**注:checker 窗改是
+  临时诊断,事后 revert。**
+  **诊断决定性结果:extent 14 orphan-leak 跨全部 30 attempt(~60s)持续不愈 = PERMANENT 永久泄漏(非慢-deferred-reconcile)。** checker 窗诊断已 revert(test 干净)。
+  **ROOT CAUSE 已确认(读 rpc_handlers compute_extent_ref_drops 2101-2116 + persist 路径)**:refs 减是 etcd-first compute-then-await-then-apply——
+  两个并发 punch_holes/truncate 作用于 split 产生的**两个 CoW-shared stream**(extent 14 refs=2,被 A、B 两 stream 列),都读到 s.extents[14]={refs:2}
+  (任一 apply 前),都算 new_ext{refs:1},都 put extents/14。txn **只 CAS streams/<id>**(A、B 不同 stream→无冲突),**extents/<id> 写不 CAS**→第二个
+  clobber 第一个,**丢一次 refs 减**→refs=1 memb=0→永久 orphan-leak。**= manager note33 / coco #4 的 deferred extent-state-CAS gap 的首次复现**
+  (note33 当年因"不可复现+结构近-precluded"deferred,明说"apply CAS ONLY if reproduced";现已复现,deferral 前提被证伪)。**严重度:mismatch=0=空间泄漏
+  非数据丢失(泄漏 extent 的 data 已无 stream 引用,无 key 指向),中等。** **修复已文档化-ready**(note33:punch/truncate txn 给 extents/<id> 加 value-CAS
+  baseline→败者 Precondition→fresh-read 重试→refs:0→delete)。**但在最 revert-prone 的 CAS/refs 区**,且 feedback_repro_accounting_not_harm 提醒
+  低危害 bug 修复别在热路径自产 bug。**=用户决策点:apply 文档化 CAS 修复(reproduce-first 已完成,note33 ready,但需谨慎实现+coco review)vs 记为
+  已复现-低危害-known。上浮用户。** fuzz-monitor("我曾以为 maximal/saturated")抓到真 bug=继续跑 fuzz 的 vindication。
 R55 enrichment+2-random:**ps_kill_migrates_partitions PASS**(ps_failover 第 2 场景,至此 2 个 ps_failover 场景全验)+ seed=840559175(45s)PASS
   all invariants OK(acked=11699 fail=37,reads=20825 miss=80,mismatch=0 not_found=0,5ext/8mem)+ seed=740230020(45s)PASS all invariants
   OK(acked=11562 fail=0,reads=21173 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。累积 system_chaos 全绿 17 distinct + 2 ps_failover 场景。
