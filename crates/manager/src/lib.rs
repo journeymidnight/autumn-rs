@@ -3403,6 +3403,13 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // Value-CAS baseline for the `streams/<id>` membership write
         // (see `mirror_stream_alloc_extent`).
         stream_cas: Option<Vec<u8>>,
+        // Per-extent value-CAS baselines (`extents/<id>` == pre-mutation value).
+        // Closes the lost-refs-update race when the SAME CoW-shared extent is
+        // mutated concurrently via two different streams: the membership CAS
+        // above only guards `streams/<id>`, which never conflicts across
+        // different streams, so the shared `extents/<id>` write needs its own
+        // compare. See `compute_extent_ref_drops`.
+        extent_cas: Vec<(String, Vec<u8>)>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
@@ -3414,10 +3421,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 .iter()
                 .map(|id| format!("extents/{id}"))
                 .collect::<Vec<_>>();
-            let cas: Vec<(String, Vec<u8>)> = stream_cas
+            let mut cas: Vec<(String, Vec<u8>)> = stream_cas
                 .map(|v| (format!("streams/{}", stream.stream_id), v))
                 .into_iter()
                 .collect();
+            cas.extend(extent_cas);
             etcd.put_delete_txn_cas(puts, deletes, cas).await?;
         }
         Ok(())

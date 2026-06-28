@@ -2077,10 +2077,28 @@ impl AutumnManager {
         s: &autumn_common::MetadataState,
         removed: &HashSet<u64>,
         ec_inflight_set: &HashSet<u64>,
-    ) -> (Vec<MgrExtentInfo>, Vec<u64>, Vec<PendingDelete>) {
+    ) -> (
+        Vec<MgrExtentInfo>,
+        Vec<u64>,
+        Vec<PendingDelete>,
+        // Per-extent value-CAS baseline (`extents/<id>` == its value BEFORE this
+        // refs-drop). The refs RMW reads `extent`, decrements, and writes
+        // `extents/<id>` — but the txn historically value-CAS'd only
+        // `streams/<id>` (membership). When the SAME CoW-shared extent (refs>=2
+        // from a prior split) is punched/truncated CONCURRENTLY via two
+        // DIFFERENT streams, both read the same refs and the second
+        // `extents/<id>` write clobbered the first → a lost decrement leaves an
+        // orphan (refs>0, in no stream) — and the symmetric lost-INCREMENT (a
+        // racing split) would drop refs too low → premature delete → data loss.
+        // CASing `extents/<id>` against this baseline makes the losing op fail
+        // with Precondition and retry on a fresh read. Reproduced by
+        // system_chaos seed 769351064 (extent 14 orphan-leak).
+        Vec<(String, Vec<u8>)>,
+    ) {
         let mut extent_puts = Vec::new();
         let mut extent_deletes = Vec::new();
         let mut pending_deletes = Vec::new();
+        let mut extent_cas: Vec<(String, Vec<u8>)> = Vec::new();
 
         // Build pending_deletes snapshot for extents that would physically
         // delete (refs would hit 0 and not EC-inflight).
@@ -2100,6 +2118,13 @@ impl AutumnManager {
 
         for extent_id in removed {
             if let Some(extent) = s.extents.get(extent_id) {
+                // Capture the pre-drop value as the `extents/<id>` CAS baseline
+                // for BOTH the put (refs decremented) and delete (refs->0) paths
+                // — a delete must also fail if a concurrent split bumped refs.
+                extent_cas.push((
+                    format!("extents/{extent_id}"),
+                    rkyv_encode(extent).to_vec(),
+                ));
                 let mut new_ext = extent.clone();
                 if new_ext.refs <= 1 {
                     new_ext.refs = 0;
@@ -2117,7 +2142,7 @@ impl AutumnManager {
             }
         }
 
-        (extent_puts, extent_deletes, pending_deletes)
+        (extent_puts, extent_deletes, pending_deletes, extent_cas)
     }
 
     pub(crate) async fn handle_stream_punch_holes(&self, payload: Bytes) -> HandlerResult {
@@ -2153,6 +2178,10 @@ impl AutumnManager {
                     // (etcd currently holds it). The mirror value-CAS's
                     // `streams/<id>` against it.
                     Vec<u8>,
+                    // Per-extent `extents/<id>` CAS baselines (see
+                    // compute_extent_ref_drops) — guards the shared extent
+                    // write against a concurrent CoW-stream punch/split.
+                    Vec<(String, Vec<u8>)>,
                 ),
                 AppError,
             > {
@@ -2189,7 +2218,7 @@ impl AutumnManager {
                         "stream cannot be empty after punch holes".to_string(),
                     ));
                 }
-                let (extent_puts, extent_deletes, pending_deletes) =
+                let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
                     Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
                 Ok((
                     updated,
@@ -2197,12 +2226,13 @@ impl AutumnManager {
                     extent_deletes,
                     pending_deletes,
                     stream_baseline,
+                    extent_cas,
                 ))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline, extent_cas)) => {
                 // Persist to etcd FIRST. Failure → in-memory zero changes
                 // (the closure above produced clones only).
                 if let Err(err) = self
@@ -2211,6 +2241,7 @@ impl AutumnManager {
                         &extent_puts,
                         &extent_deletes,
                         Some(stream_baseline),
+                        extent_cas,
                     )
                     .await
                 {
@@ -2279,6 +2310,9 @@ impl AutumnManager {
                     Vec<PendingDelete>,
                     // CAS baseline (stream value before this truncate).
                     Vec<u8>,
+                    // Per-extent `extents/<id>` CAS baselines (see
+                    // compute_extent_ref_drops).
+                    Vec<(String, Vec<u8>)>,
                 ),
                 AppError,
             > {
@@ -2316,7 +2350,7 @@ impl AutumnManager {
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
-                let (extent_puts, extent_deletes, pending_deletes) =
+                let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
                     Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
                 Ok((
                     updated,
@@ -2324,18 +2358,20 @@ impl AutumnManager {
                     extent_deletes,
                     pending_deletes,
                     stream_baseline,
+                    extent_cas,
                 ))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline, extent_cas)) => {
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(
                         &stream,
                         &extent_puts,
                         &extent_deletes,
                         Some(stream_baseline),
+                        extent_cas,
                     )
                     .await
                 {
