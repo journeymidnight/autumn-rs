@@ -1449,3 +1449,11 @@ F1 reproduce-first 调查(用户默认)→ **F1 从 coco-hypothesis ELEVATED 到
   **FIX = GC checkpoint-before-punch**(rotate active→flush→等 save_table_locs_raw durable→再 punch;LSM "manifest durable before delete",coco 方案 A)。成本:每次 GC punch 一次 flush(可接受,GC 后台)。
   **未修:revert-prone GC/recovery 区 + Items 2/4 硬教训要求先 RUNTIME 复现。runtime repro 需 CONTROLLED crash(SIGKILL 子进程 autumn-ps,GC punch 后 checkpoint 前——in-process harness 做不到 crash-without-flush)。** memory [[project_coco_arch_ps_gc_checkpoint_triage]] 已 ELEVATED + MEMORY.md 已记。
   **上浮用户:这是本会话最强的 production data-loss 发现(code-confirmed)。荐下一步:建 controlled-crash repro(兼做 fix 回归测试)→确认→修 checkpoint-before-punch(care+coco);或用户基于 code-confirmation greenlight 修。绝不在无 runtime repro 下 autonomous 动 GC sequencing(纪律)。**
+
+F1 reproduce-first 可行性调查(用户默认建 repro)→ 发现 repro 成本远超预期 + fix 有并发风险,决策权归用户:
+  · **runtime repro 不成比例地贵**:(a) in-process harness 根本无法 crash-without-checkpoint(PS 线程不能 SIGKILL;graceful shutdown 会 flush checkpoint 关掉窗口);
+    (b) cluster.sh repro 需 cheaply-sealed extent,但 GC 只打 SEALED extent,max_extent_size clamp=[1GB,64GB]无 test override→封一个 extent 要写 ~1GB,且 cluster.sh 无此 knob;
+    (c) split 廉价封 extent 但使其 CoW-shared(refs≥2)→punch 一个 child 后物理保留→dangling VP 仍能 resolve→丢失被掩盖,repro 失效。
+  · **fix(checkpoint-before-punch)有真并发 subtleties**:run_gc(P-log 上,持 gc_gate+borrow_mut)触发 flush 并 await——正是 Items 2/4 revert 教训警告的 borrow-across-await/flush 协调形态。
+  · **F1 是 DETERMINISTIC code-confirmed**(顺序逻辑 gap 非 race,代码读即证),但 empirical repro 贵且非永久回归测试,fix 动 revert-prone GC 并发。
+  **决策权归用户(真 cost/risk tradeoff):(a) 投入贵的 cluster repro(1GB fill,需改 cluster.sh 传 --max-extent-size);(b) greenlight 我谨慎实现 fix(release borrow_mut 再 await flush + 现有 GC 测试防 deadlock/回归 + 聚焦 ordering 测试 + coco 审并发)——这是真正修掉数据丢失的最高效路径;(c) 留作已文档化 code-confirmed bug 待专门 session。** 荐 (b)。memory [[project_coco_arch_ps_gc_checkpoint_triage]] 已含完整分析。
