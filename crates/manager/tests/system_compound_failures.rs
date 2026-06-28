@@ -34,7 +34,7 @@ fn split_then_ps_crash_data_survives() {
 
         // PS1 writes data, flushes, and splits
         let ps1_addr = pick_addr();
-        start_partition_server(81, mgr_addr, ps1_addr);
+        let (ps1_shutdown, ps1_join) = start_partition_server_stoppable(81, mgr_addr, ps1_addr);
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
         for c in b'b'..=b'x' {
@@ -86,8 +86,18 @@ fn split_then_ps_crash_data_survives() {
             .clone();
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
 
-        // PS1 "crashes"
+        // PS1 "crashes" — actually STOP the server thread (drain + heartbeat
+        // + listeners gone), not just drop the client. Dropping only the
+        // RpcClient leaves PS1's detached server running under ps_id 81, which
+        // then split-brains the PS2 takeover (same ps_id) and wedges PS2's
+        // open/serve of the split children.
         drop(ps1);
+        ps1_shutdown.shutdown();
+        // Deterministically wait for PS1's server thread to FULLY exit (drain +
+        // heartbeat/listeners gone) before the takeover PS reuses ps_id 81. A
+        // fixed sleep would be unreliable on a slow machine where the graceful
+        // drain runs long — leaving PS1 alive to split-brain PS2 (coco P2).
+        ps1_join.join().expect("PS1 server thread join");
 
         // PS2 takes over with the same ps_id
         let ps2_addr = pick_addr();

@@ -148,6 +148,53 @@ pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketA
     std::thread::sleep(Duration::from_millis(300));
 }
 
+/// Like `start_partition_server`, but returns a `ShutdownFlag`: calling
+/// `.shutdown()` makes the PS drain and STOP its thread (heartbeat loop +
+/// per-partition listeners gone) via `serve_until_shutdown` — i.e. a REAL
+/// crash. Plain `start_partition_server` spawns a detached thread that serves
+/// forever; dropping the test's `RpcClient` to it only closes the client, so
+/// the server keeps running + heartbeating. A test that then reuses the same
+/// `ps_id` for a takeover PS gets a same-id split-brain (both servers contest
+/// the per-partition owner_epoch), which wedges the new PS's open/serve. Use
+/// this helper whenever a test must actually take a PS down before another PS
+/// reuses its `ps_id`.
+///
+/// Returns `(ShutdownFlag, JoinHandle)`. After `.shutdown()`, JOIN the handle
+/// before reusing the `ps_id` — `serve_until_shutdown` runs a graceful drain
+/// (up to the per-partition shutdown deadline) before the thread exits, so a
+/// fixed sleep is NOT a reliable "PS is down" signal; the join is deterministic.
+pub fn start_partition_server_stoppable(
+    ps_id: u64,
+    mgr_addr: SocketAddr,
+    ps_addr: SocketAddr,
+) -> (ShutdownFlag, std::thread::JoinHandle<()>) {
+    let flag = ShutdownFlag::new();
+    let flag_thread = flag.clone();
+    let handle = std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let advertise = ps_addr.to_string();
+            let ps = PartitionServer::connect_with_advertise_and_port(
+                ps_id,
+                &mgr_addr.to_string(),
+                Some(advertise),
+                ps_addr,
+            )
+            .await
+            .expect("connect partition server");
+            ps.sync_regions_once().await.expect("sync regions");
+            // Bridge the AtomicBool flag to the Future serve_until_shutdown wants.
+            let shutdown = async move {
+                while !flag_thread.is_shutdown() {
+                    compio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            let _ = ps.serve_until_shutdown(ps_addr, shutdown).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    (flag, handle)
+}
+
 // ── Manager RPC helpers ───────────────────────────────────────────────
 
 /// Register an extent node with the manager.

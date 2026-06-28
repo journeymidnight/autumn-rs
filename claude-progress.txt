@@ -1368,3 +1368,21 @@ ROOT-CAUSE TICK(用户再 fire loop;深挖上轮的 split_then_ps_crash wedge—
   **已修正 memory(上轮"alloc-at-writes/harness"→实为"PS2-takeover verify-GET wedge/recovery-open")。已 revert 所有实验改动(3-EN+DIAG),测试 pristine。**
   **下一步(需用户 go-ahead;聚焦、动 PS recovery 敏感路径):仪表化 PS2 open_partition/recover_partition 找哪个 await 卡(sealed CoW tail commit_length retry?owner_epoch fence?under-seal?)。** reproduce-first 已完成;未 speculative 深修。
   **教训复盘:第一轮"alloc-at-initial-writes/harness/capacity"诊断是错的——仪表化才看清是 PS2-takeover recovery wedge。验证假设别停在第一个似是而非的解释(capacity 假设被 3-EN 实验当场 refuted)。**
+
+FIX TICK(继续上轮调查→root-cause 确认 + 修复 split_then_ps_crash wedge;在纪律内:test-harness 修复用既有 API,非 prod-code speculative):
+  **关键转折:别盲目仪表化 PS recovery——先查"测试怎么 crash PS1"。** 发现:`start_partition_server` spawn **detached thread** 跑 ps.serve()
+    永不退;`drop(ps1)` 只 drop 测试的 **RpcClient**,PS1 server 线程照常 serve+heartbeat。然后 PS2 用**同一 ps_id=81** 启动→
+    **两个 PartitionServer 同 ps_id 抢 per-partition owner_epoch(F267 "partition/<id>" 锁)→ PS2 open/serve split 子分区卡住→对 PS2 的 verify GET hang。**
+    (passing `system_ps_failover` 测试有显式注释"can't kill the thread"并绕开;split_then_ps_crash 天真地以为 drop=crash。)
+  **= 确认是 TEST-HARNESS crash-sim 缺陷,非 production failover bug。** 生产里 crash 的 PS = 死进程;测试的 lingering-PS split-brain 在生产不存在。**prod-harm 问题 RESOLVED:非真 bug。**
+  **修复(已验证 PASS,test-only,surgical):** 新 helper `start_partition_server_stoppable`(tests/support/mod.rs)返回 ShutdownFlag,
+    `.shutdown()` 驱动 `serve_until_shutdown`(F120-C)→ PS drain+线程退出+heartbeat/listener 消失=真 crash。split_then_ps_crash 用它
+    +.shutdown()+800ms settle 再让 PS2 接管。**测试 9s PASS(原 311s wedge),3/3 稳定。全 manager 测试编译通过(helper 是 ADDITIVE,30 个其他 start_partition_server 调用方不动)。**
+  **调查弧线复盘(教训:别停在第一个似是而非诊断,逐个用实验证伪):** timing-sensitive→wedge 点会移动。
+    tight timing 早暴露成 `alloc_new_extent 20 retries`@writes→我先猜 capacity 欠配(加 3 EN **当场 refuted**)+ephemeral pick_addr 端口(兄弟测同用 **refuted**)→
+    DIAG 仪表化看清:writes+flush+split(code=0)+regions 全过,hang 在对 PS2 verify GET→再 reframe 成"PS2 recovery wedge 可能真 failover bug"→
+    查"怎么 crash PS1"才挖到 split-brain 真因。**真因在每个症状的上游。**
+  memory 已更新(localized→RESOLVED)。**coco-review(GPT-5.5)抓到 1 个真 P2(同我刚修的 bug 类!):固定 800ms sleep 不可靠——serve_until_shutdown 有 graceful
+    drain(可达 60s),慢机器上 800ms 不够→PS1 仍活→same-id split-brain 复现→又 flaky。修:helper 改返回 (ShutdownFlag, JoinHandle),测试用 `ps1_join.join()` 确定性
+    等 PS1 线程退出(非固定 sleep)。** 修后 3/3 PASS(8.36s,更稳更快)。全 manager 测试编译通过。
+  **教训叠加:连"修复"本身也别用 timing 假设(固定 sleep 同 drop≠crash 一样脆)——coco 当场指出。**
