@@ -1417,3 +1417,11 @@ ROTATION TICK(clean):6 个 untested in-process system_* 全 PASS(--test-threads=
 ROTATION TICK(clean,find-rate=0 第2轮)→易测覆盖穷尽,PIVOT 回 campaign 核心(coco review 大文件挖 latent bug):
   6 个 0-ignored untested(f109/f211_node_lifecycle/f211_e2e_lifecycle/gc_chunked_read/gc_multiversion_same_extent/update_stream_ec)24 测 --test-threads=1 全 PASS,无新发现。
   **决定:test-rotation 连 2 tick 0 find + 易测全绿 → 不再 grind #[ignore](需 etcd/bins)。转 coco 审高风险大 production 文件找 latent bug(campaign 本意)。**
+
+PIVOT TICK: coco arch 审 STREAM 层(client.rs/extent_node.rs commit/seal/owner_epoch/recovery/EC)→ 4 findings,逐条对照代码+CLAUDE.md triage:
+  · **F1(P0)commit_length_for_extent majority-min 截 WAL 尾 = NOT A BUG**:F227 scope 注释明确这是 DELIBERATE(read-path 不 seal/truncate,worst=short-read-as-error 非 loss,all-replica 会是可用性回归);all-replica-ACK 下 acked 前缀在每个 committed member;partial-record 由 WAL-FAILSTOP 兜。coco 漏看 scope 注释。
+  · **F2(P0)append 不查 recovery_inflight(delete 查=F139)= NEAR-PRECLUDED**:recovery/re_avali 只作用 SEALED extent(append step3 拒),recovering node 在 apply_recovery_done 前不在 client append membership。理论。
+  · **F3(P0)EC participant 只 check owner_epoch 不 fetch_max+persist(append 路径有 note23)= REAL 不对称,reproduce-first-gated**:harm 需 manager-failover-mid-EC 竞态;在 prod-readiness EC-crash-window "先复现再修" frontier;F153 mutex+F198 marker+F149 fence 兜。
+  · **F4(P1).ec.commit marker 无 magic/CRC(read_ec_commit_marker 任意 16B 当 Valid)= REAL gap(代码证实)**:同 META-FAILCLOSED/EC-COMMIT-ATOMIC 的 fail-open→fail-closed 主题(.meta 有 magic+CRC,marker 没);最 tractable(加 magic+eid+CRC,Corrupt→quarantine);reproduce-first-compatible;migration bounded(marker transient)。
+  **结论:无 NEW reproducible bug(2 not-bug + 2 EC-crash-window reproduce-first-gated frontier,已在 prod-readiness 已知列表)= 成熟度信号(同前 manager-arch review)。**
+  **纪律:未 autonomous 修——F3/F4 在 revert-prone EC commit/fence 区(note24 coalescer/Items 2/4 多次 revert 教训)+ prod-readiness 明确 reproduce-first-gate。上浮用户,F4(marker CRC)荐为最低风险 reproduce-first 候选(若用户 greenlight EC-area 修)。** memory [[project_coco_arch_streamlayer_triage]] 已存。
