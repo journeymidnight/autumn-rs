@@ -806,8 +806,13 @@ pub(crate) struct PartitionData {
     /// log seal) is in flight during split's barrier + commit_length +
     /// multi_modify_split window. The merged loop acquires it around BOTH its
     /// compaction and GC sections (one at a time), so holding it = both kinds
-    /// quiesced. Acquisition order is gate-first everywhere (maintenance_gate →
-    /// PS-wide acquire_compact/acquire_gc), keeping the lock graph acyclic.
+    /// quiesced. Lock order: compaction/split are gate-first (maintenance_gate →
+    /// acquire_compact — compaction MUST match split or acquire_compact ↔
+    /// maintenance_gate would cycle); GC is permit-first (acquire_gc →
+    /// maintenance_gate) so a GC queued on the global gc permit doesn't hold
+    /// this gate and block a same-partition split. Acyclic either way because
+    /// acquire_gc is GC-exclusive: acquire_gc → maintenance_gate →
+    /// acquire_compact has no back-edge.
     pub(crate) maintenance_gate: std::sync::Arc<CompactionGate>,
     /// F196 D-r7: per-partition rate controller. Fresh `Arc` per
     /// partition — fg/compact/gc rates are isolated; a hot partition's

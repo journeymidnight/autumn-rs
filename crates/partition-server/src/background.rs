@@ -859,15 +859,24 @@ pub(crate) async fn background_maintenance_loop(
                 // enter run_gc together — each holds ~64 MiB chunk buffer +
                 // rewrite staging. Default 1 (full serialization), tunable
                 // via `--gc-parallelism`.
-                // Per-partition maintenance_gate FIRST (gate-before-permit, the
-                // same outer→inner order as compaction/split, so maintenance_gate
-                // is the universal outermost lock → acyclic). handle_split_part
-                // can then wait for no log_stream GC append in-flight when it
-                // seals. Held around the holes-processing loop below; the
-                // read-only candidate selection above ran without it.
-                let _gc_permit = maintenance_gate.acquire().await;
-                // PS-wide gc concurrency cap (cross-partition RAM).
+                // PS-wide gc concurrency cap FIRST (cross-partition RAM), THEN
+                // the per-partition maintenance_gate. Permit-before-gate is
+                // deliberate (coco): a GC queued on the global gc permit must NOT
+                // hold this partition's maintenance_gate while it waits, or it
+                // needlessly blocks a same-partition split. Safe despite the
+                // asymmetry with compaction/split (which are gate-first): GC uses
+                // `acquire_gc`, split/compaction use `acquire_compact`, so GC
+                // never shares a PS-wide permit with them — the wait-for graph
+                // acquire_gc → maintenance_gate → acquire_compact stays acyclic.
+                // (Compaction MUST stay gate-first to match split's
+                // maintenance_gate → acquire_compact, else AC↔MG would cycle; GC
+                // has no such constraint, so permit-first is both safe and
+                // avoids the split-blocking.)
                 let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
+                // maintenance_gate held around the holes-processing loop below
+                // (the read-only candidate selection above ran without it) so
+                // handle_split_part sees no log_stream GC append in-flight.
+                let _gc_permit = maintenance_gate.acquire().await;
                 tracing::info!("GC: starting, extents={:?}", holes);
                 // F189-fix MED-4: gc_inflight already latched at top of loop;
                 // hold through the punch and clear at the bottom.

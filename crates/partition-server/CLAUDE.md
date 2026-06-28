@@ -1257,10 +1257,15 @@ loop runs only one of the two at a time. It is RAII-held through
 `multi_modify_split` + the F255 P-bulk barrier ACK, then `acquire_compact`
 (PS-wide RAM cap) is acquired inner. This unifies the former dual gates
 (`compact_gate` F255 + `gc_gate` F140), valid now that compaction and GC are on
-one task and can't race each other. **Lock order is gate-first everywhere**
-(maintenance_gate → acquire_compact / acquire_gc), so `maintenance_gate` is the
-universal outermost lock and the graph maintenance_gate → {acquire_compact |
-acquire_gc} is trivially acyclic.
+one task and can't race each other. **Lock order:** compaction/split are
+gate-first (`maintenance_gate` → `acquire_compact`); GC is **permit-first**
+(`acquire_gc` → `maintenance_gate`) so a GC queued on the global gc permit
+doesn't hold the gate and block a same-partition split (coco). Acyclic either
+way because GC uses `acquire_gc` (GC-exclusive) and split/compaction use
+`acquire_compact`: the wait-for graph `acquire_gc → maintenance_gate →
+acquire_compact` has no back-edge. (Compaction MUST stay gate-first to match
+split, else `acquire_compact ↔ maintenance_gate` cycles; GC has no such
+constraint.)
 
 ## Crash Recovery (`open_partition`)
 

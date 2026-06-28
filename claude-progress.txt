@@ -35,8 +35,10 @@ F1 复现验证完成(用户"先看F1消失"):F1 是 deterministic(代码可证�
 STEP 2 完成(本次):合 compact_gate(F255)+ gc_gate(F140)→ 单个 maintenance_gate。
   合并后 GC 与 compaction 同 task 不会互相 race,gate 唯一职责是 maintenance-loop vs split(split
   在 partition_loop 另一个 task)互斥;merged-loop 的 compaction 段和 GC 段都拿这一把(一次只跑一种,
-  故持有它=两种活都静默),split 拿它替代原来两把。GC 段也调整为 gate-first(maintenance_gate→acquire_gc),
-  使 maintenance_gate 成为唯一最外层锁、锁图 maintenance_gate→{acquire_compact|acquire_gc} 显然无环。
+  故持有它=两种活都静默),split 拿它替代原来两把。GC 段保持 permit-first(acquire_gc→maintenance_gate)
+  ——coco P2 抓到我一度改成 gate-first 会让"排队等全局 gc permit 的 GC"持 gate 阻塞同分区 split(可用性
+  回归),已撤回;GC 用 acquire_gc、split/compaction 用 acquire_compact,acquire_gc→maintenance_gate→
+  acquire_compact 无环(compaction 必须 gate-first 匹配 split,否则 AC↔MG 成环)。
   改:PartitionData 字段二合一、open_partition 建一把、spawn 传一把、background.rs 4 处 acquire、
   rpc_handlers handle_split_part 三锁→两锁(maintenance_gate→acquire_compact)、清理 stale 注释。
   验证:build+clippy 干净、ps lib 173/173、chaos 603+13 全绿(Split/Merge OK,mismatch/not_found/range/
