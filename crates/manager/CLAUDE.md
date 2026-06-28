@@ -1605,27 +1605,66 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     **Validated:** merge-heavy chaos 8/8, merges succeed with 0 spurious CAS
     conflicts (rkyv baseline byte-matches etcd).
 
-    **FOLLOW-UP (DEFERRED, demonstrated-need only — reproduce-first):** the
-    EXTENT-STATE read-modify-write writes (`extents/<id>`: eversion / replicates
-    / avali) are NOT value-CAS'd — `handle_multi_modify_split`'s
-    source-tail seal, `apply_ec_conversion_done`,
-    `apply_recovery_done`. (The former `handle_sync_partition_vp_refs` writer was
-    removed with vp_table_refs.) A reproduce-first reachability investigation (2026-05-31)
-    found the extent-state clobber is NOT reproducible and structurally
-    near-precluded, so it is NOT worth fixing speculatively in this revert-prone
-    area: (a) `apply_recovery_done` reads the extent and writes etcd
-    AWAIT-ADJACENTLY (no `.await` between) so the only window is the write's own
-    RTT; (b) the F207 ledger serialises recovery/EC per extent and note 31 stops
-    alloc rewriting a sealed extent, so a concurrent same-extent writer is
-    near-precluded; (c) split-seal / ec_done have an await gap but
-    are covered before-await by F146 / F207+F138 verify-at-apply +
-    ledger; (d) EMPIRICALLY, Item 3's membership CAS measured `cas_conflict=0`
-    across all chaos — the etcd-RTT-clobber MECHANISM never fires in the harness,
-    so even the shipped membership CAS is a precautionary safety net. The worked
-    CAS example (`apply_recovery_done`: capture `rkyv_encode(extent_as_read)` →
+    **EXTENT-STATE `refs` CAS — SHIPPED for all PS-op writers (was the deferred
+    follow-up; the `refs` sub-dimension WAS reproduced, 2026-06-28).** The
+    `refs` extent-state read-modify-write on the four PS-op handlers now
+    value-CAS's `extents/<id>` against its pre-mutation baseline:
+    `handle_stream_punch_holes` / `handle_truncate` (via
+    `compute_extent_ref_drops` returning per-extent CAS baselines for both the
+    put and delete paths — 139b023) and `handle_multi_modify_split` /
+    `handle_multi_modify_merge` (each modified extent's baseline added to the
+    Phase-2 txn — 35acdfe + b05eab1). What flipped this from "deferred /
+    near-precluded" to "ship it": a chaos fuzz-monitor REPRODUCED the clobber
+    (seed 769351064, 3/4 FAIL) — a concurrent cross-partition punch on a
+    CoW-shared extent during another PS-op's etcd RTT lost a `refs` decrement →
+    orphan-leak (`refs > 0`, in no stream); the systematic study found
+    DATA-LOSS variants too (split∥punch / split∥split lose a `refs` INCREMENT →
+    `refs` too low → premature extent delete → a CoW child loses data;
+    cross-partition because the per-partition `gc_gate` only serialises
+    same-partition split-vs-GC). Post-fix: seed 769351064 ×4 + 603 + randoms,
+    accounting errors = 0.
+
+    **Split vs merge capture asymmetry (load-bearing — coco P1, b05eab1).**
+    `handle_multi_modify_merge` MUST capture each extent's CAS baseline in
+    **Phase 1** (carried in `Phase1Result.extent_baselines`), not in Phase 2,
+    because merge has a **Phase-1.5 `alloc_extent_on_node` await** for the new
+    tail: a Phase-2 capture (after that await) would read an already-mutated
+    value (CAS passes → clobber) or a deleted extent (`s.extents.get` None → CAS
+    skipped → stale PUT resurrects). `handle_multi_modify_split` captures in
+    **Phase 2** and that is correct: its ONLY await is the Phase-2 etcd write
+    itself (no Phase-1.5 alloc — split is CoW, it shares extents), so there is
+    ZERO await between `modified_extents` being computed and the baseline
+    capture → consistent.
+
+    **Why the STREAM-membership of split-source / merge-victim is intentionally
+    NOT CAS'd (coco re-review triage, 2026-06-28).** A coco /findbugs pass
+    flagged that split reads the source stream membership (to derive the right
+    child) and merge deletes the victim stream membership without CAS'ing
+    either. Both are NOT reachable harms once the PS-side coordination is
+    accounted for (coco saw only manager code): the split source partition is
+    `frozen_for_split` AND holds `gc_gate` + `compact_gate` through the whole
+    `multi_modify_split` (PS-side F210-C2 + F140) so its streams cannot mutate
+    concurrently (the only reachable race — a DIFFERENT CoW-sharing partition
+    GC'ing a shared extent — is caught by the `refs` extent CAS above); the
+    merge victim is `frozen_for_merge` so no concurrent alloc can ADD an extent
+    (orphan-via-alloc precluded), and `splice_victim_extents` baselines EVERY
+    victim extent, so the only reachable victim mutation (a GC punch) trips the
+    extent CAS via its `refs`-- write. Inline "why no membership CAS" comments
+    at both Phase-2 sites prevent re-litigation.
+
+    **STILL DEFERRED (reproduce-first — NOT reproduced):** the
+    eversion / replicates / avali extent-state writes on the STREAM-LAYER
+    appliers — `apply_ec_conversion_done`, `apply_recovery_done`, and
+    `handle_multi_modify_split`'s source-tail *eversion bump* — remain
+    un-CAS'd. The 2026-05-31 reachability investigation still holds for these:
+    (a) `apply_recovery_done` reads + writes etcd AWAIT-ADJACENTLY (window =
+    write RTT only); (b) the F207 ledger serialises recovery/EC per extent and
+    note 31 stops alloc rewriting a sealed extent; (c) split-seal / ec_done
+    await gaps are covered before-await by F146 / F207+F138 verify-at-apply.
+    The worked CAS example (`apply_recovery_done`: capture
+    `rkyv_encode(extent_as_read)` →
     `put_delete_txn_cas([extents/<id>=new], [inflight_key], [extents/<id>=baseline])`)
-    + the generalized multi-key `put_delete_txn_cas` are kept ready; apply them
-    ONLY if an extent-state clobber is ever actually reproduced. Cross-ref:
+    is kept ready; apply ONLY if one of these is ever reproduced. Cross-ref:
     notes 13 (F146 verify-at-apply — the weaker before-await form), 15 (F149
     leader fence — the txn already carries it), 32 (sealed state).
 
