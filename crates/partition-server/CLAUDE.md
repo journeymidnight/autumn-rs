@@ -22,7 +22,8 @@ Partition threads — 2 OS threads per partition:
 │     • partition_loop (request dispatch + group-commit SQ/CQ)
 │     • fd-drain task: fd_rx.next() → compio::TcpStream → spawn ps-conn task
 │     • ps-conn task × K (one per live client connection, all on this runtime)
-│     • background_flush_loop, background_compact_loop, background_gc_loop
+│     • background_flush_loop, background_maintenance_loop (compaction + GC
+│       on ONE task — see "GC/compaction merged loop" below)
 │     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
 │     • dedicated StreamClient + ConnPool for log_stream/meta_stream
 │     • F099-D: write loop inlined into partition_loop (no spawn/oneshot)
@@ -783,6 +784,40 @@ Without this cap, `autumn-op compact ALL` against an N-partition PS
 would launch N concurrent `do_compact` calls each holding ~2× SST bytes
 in memory, multiplying per-partition peak by N.
 
+## GC/compaction merged loop (`background_maintenance_loop`)
+
+Compaction and GC run on ONE P-log task (`background_maintenance_loop`),
+replacing the former separate `background_compact_loop` + `background_gc_loop`.
+A unified `select` waits on `compact_rx` / `gc_rx` + two **deadline** timers
+(independent per-kind metric-refresh cadence); whichever fires runs its work to
+completion before the next select, so compaction and GC are **structurally
+serialized** — never concurrent. This is load-bearing for the GC replay-floor
+guard below (GC never observes `sst_readers` mid-compaction-publish). They share
+one `maintenance_gate` vs split (see "Split serialisation"). Each section still
+acquires its PS-wide cap (`acquire_compact` / `acquire_gc`) inner to the gate.
+Flush stays a separate loop — it only ADDS forward-vp_head SSTs, which can't
+lower the replay floor, so it needs no serialization with GC.
+
+### GC WAL replay-floor guard (F1 — never punch what recovery replays)
+
+GC `punch_holes` removes an extent from `log_stream.extent_ids`. If it punches
+an extent that crash recovery still replays from (`recover_partition` replays
+the log from `chosen_pos` = the MIN stream-position over all live SSTs'
+vp_heads), a crash before the next checkpoint loses un-flushed writes (small
+inline values not yet in any SST, or — if the vp_head extent itself is punched —
+`chosen_pos==MAX` → no replay at all). Relocating live large VPs (seq+1) is fine;
+the danger is punching the replay window.
+
+**Guard** (`gc_replay_floor` / `gc_extent_punchable`, used by the GC section for
+BOTH Auto and Force): compute `replay_floor_pos = min` stream-position
+(FIRST-occurrence index into `log_extent_ids`, matching recovery's
+`first_pos_by_eid` for CoW-shared post-split/merge extents) over the live SSTs'
+vp_heads, then only punch NON-EMPTY extents STRICTLY BEFORE it (empty
+`sealed_length==0` extents always eligible). The floor == recovery's `chosen_pos`
+exactly; the single-task merge makes the in-memory `sst_readers` it reads match
+the durable checkpoint recovery loads. `floor=0` (protect all non-empty) when no
+vp_head resolves. Regression: `background::gc_replay_floor_tests`.
+
 ## GC (Garbage Collection)
 
 Targets the **logStream** where large values (ValuePointers) are stored.
@@ -1045,9 +1080,9 @@ CAS is the right primitive.
 | `background::do_compact` (chunk emit + final emit) | `rate_ctrl.account_compact(chunk_bytes)` |
 | `background::flush_gc_batch` (write side) | `rate_ctrl.account_gc(batch_bytes)` |
 | `background::run_gc` (chunk read side) | `rate_ctrl.account_gc(chunk_len)` |
-| `background::background_compact_loop` | `concurrency_ctrl.acquire_compact()` |
-| `background::background_gc_loop` | `concurrency_ctrl.acquire_gc()` (in addition to per-partition F140 `gc_gate`) |
-| `rpc_handlers::handle_split_part` | `concurrency_ctrl.acquire_compact()` + per-partition F140 `gc_gate.acquire()` |
+| `background::background_maintenance_loop` (compaction section) | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_compact()` |
+| `background::background_maintenance_loop` (GC section) | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_gc()` |
+| `rpc_handlers::handle_split_part` | `maintenance_gate.acquire()` + `concurrency_ctrl.acquire_compact()` |
 
 F141's per-partition `GcRateLimiter` survives as a deprecated inner
 cap layered before `account_gc`; it stays for back-compat with the
@@ -1212,21 +1247,20 @@ gets opened by `sync_regions_once`, where `open_partition` evaluates
 overlap against its (correct) authoritative range and likewise sets
 `has_overlap = 1`.
 
-**F140 split serialisation (dual-gate pattern):** `handle_split_part`
-acquires two gates before calling `flush_memtable_locked` / `commit_length`:
-
-1. `compact_gate` (PS-wide, same `Arc` held by `background_compact_loop`) —
-   ensures no `RowAppendReq` is in-flight on P-bulk when row_stream's tail is
-   sealed (`do_compact` holds this gate for its full duration and awaits every
-   `compact_row_append` oneshot before releasing).
-2. `gc_gate` (per-partition, new in F140) — ensures `run_gc` has no
-   `log_stream` append in-flight. `background_gc_loop` acquires `gc_gate`
-   around the `for eid in holes` block (not the preceding read-only RPC calls).
-
-Both are held through `multi_modify_split` and released RAII on return.
-Acquisition order is always compact→gc. `PartitionData` stores both `Arc`s so
-`handle_split_part` (which only receives `part: &Rc<RefCell<PartitionData>>`)
-can clone and acquire them without extra parameters.
+**Split serialisation (single `maintenance_gate`):** `handle_split_part`
+acquires ONE per-partition gate before `flush_memtable_locked` / `commit_length`:
+`maintenance_gate` (held by `background_maintenance_loop` around BOTH its
+compaction and GC sections). Holding it guarantees neither a `do_compact`
+(`compact_row_append` racing the row_stream seal) NOR a `run_gc` (log_stream
+append racing the log seal) is in flight while split seals — because the merged
+loop runs only one of the two at a time. It is RAII-held through
+`multi_modify_split` + the F255 P-bulk barrier ACK, then `acquire_compact`
+(PS-wide RAM cap) is acquired inner. This unifies the former dual gates
+(`compact_gate` F255 + `gc_gate` F140), valid now that compaction and GC are on
+one task and can't race each other. **Lock order is gate-first everywhere**
+(maintenance_gate → acquire_compact / acquire_gc), so `maintenance_gate` is the
+universal outermost lock and the graph maintenance_gate → {acquire_compact |
+acquire_gc} is trivially acyclic.
 
 ## Crash Recovery (`open_partition`)
 
