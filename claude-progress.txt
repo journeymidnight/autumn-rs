@@ -1353,3 +1353,18 @@ COVERAGE-ROTATION TICK(不重复同一 kill_split_merge,转去跑没跑过的 EC
     · **未 speculative 深挖/patch**(复现=真实危害非机制单测;真 e2e+兄弟测证明 alloc 工作)。root-cause=聚焦任务(manager
       handle_stream_alloc_extent/select_nodes Online-gating + memory-mode harness 里 EN df-flip-to-Online timing),等用户定优先级。
   **教训:轮换 chaos 覆盖面比重复同一 seed 有价值**——这次轮换立刻挖出一个被窄 fuzz 漏掉的 pre-existing wedge。
+
+ROOT-CAUSE TICK(用户再 fire loop;深挖上轮的 split_then_ps_crash wedge——root-cause≠speculative-fix,在纪律内):
+  **DIAG 仪表化定位(wedge 点随 timing 移动=timing-sensitive fragility,非单一固定点):**
+  · 原症状 `alloc_new_extent failed after 20 retries`/`put failed` = TIGHT(无仪表)timing 把 wedge 提前暴露在初始写。
+  · 仪表化(略慢)timing 下:写 b..x 全过 + flush + **split code=0** + get_regions len=2 + drop ps1 + start ps2 + 等 6s 全过,
+    然后卡在**对 PS2 的第一个 verify GET(psr_get line~113)**=**PS2 接管后无法 serve split 子分区**(读 hang)。
+  · 加第 3 个 EN(RF 仍 2)**不修**→非 capacity 欠配(我第一个假设,refuted);plain pick_addr ephemeral 端口也非因(兄弟测同样用)。
+  **= PS-crash-after-split → new-PS-takeover recovery/open 路径**,连到已知 recovery-stuck/split-child-open 家族
+    ([[project_recovery_stuck_blocks_alloc]] / [[project_split_underseal_vp_past_sealed]])。PS2 接管两个子分区(left 901 + 新 right,CoW 共享 extent),
+    open/serve 其中之一卡住。
+  **prod-harm 未定(别假设无害)**:上轮我猜"harness/timing 非 prod harm"——但本会话 live cluster.sh e2e 做 split+merge 时**没有** PS-crash-post-split,
+    从未跑这条 failover 路径。PS 崩在 split 刚完→接管 serve 不了,是**合理的真实 failover 场景**。timing-sensitive+6dfc503-repro→可能长期 env-dependent-flaky(CI timing 或许过)。
+  **已修正 memory(上轮"alloc-at-writes/harness"→实为"PS2-takeover verify-GET wedge/recovery-open")。已 revert 所有实验改动(3-EN+DIAG),测试 pristine。**
+  **下一步(需用户 go-ahead;聚焦、动 PS recovery 敏感路径):仪表化 PS2 open_partition/recover_partition 找哪个 await 卡(sealed CoW tail commit_length retry?owner_epoch fence?under-seal?)。** reproduce-first 已完成;未 speculative 深修。
+  **教训复盘:第一轮"alloc-at-initial-writes/harness/capacity"诊断是错的——仪表化才看清是 PS2-takeover recovery wedge。验证假设别停在第一个似是而非的解释(capacity 假设被 3-EN 实验当场 refuted)。**
