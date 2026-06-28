@@ -1429,3 +1429,14 @@ PIVOT TICK: coco arch 审 STREAM 层(client.rs/extent_node.rs commit/seal/owner_
 REGRESSION TICK(用户 re-fire 未 greenlight F4→honor cadence,不 autonomous 动 EC):2 随机 seed system_chaos 全 PASS——
   1012847626(acked=11110 clean,accounting=0,mismatch=0)+ 808849969(acked=13386 fail=699,accounting=0,mismatch=0,not_found=0)。无 rust code 改动→纯 regression。
   **F4(EC marker magic/CRC)仍待用户 greenlight(我已明确"说 do F4 才做",尊重之);runway 穷尽,等用户决策 EC 硬化或新方向。**
+
+PIVOT TICK(c):用户未 greenlight F4→coco arch 审 NON-EC partition-server background.rs(写/flush/compact/GC 路径)。5 findings:
+  · **F5 flushing_imm_ptrs Mode-B 泄漏=已覆盖**(3 层释放,coco 未留 finding)= 既有硬化确认。
+  · **F1-F4 耦合成 1 个 crash-consistency 关切(publish-before-durable + recovery checkpoint),部分代码证实,reachability 不定→reproduce-first-gated 未修:**
+    - F3 recovery UNION 所有 meta checkpoint locs(lib.rs:6961 dedup)=CONFIRMED(merge CoW 故意);但 save_table_locs_raw append-then-truncate,中间崩留 2 checkpoint 也被 union→复活 compact 掉的 SST。
+    - F3 安全 IFF replay supersede 复活的 SST——recovery 取 EARLIEST vp_head(6952 min),replay 重建所有 post-checkpoint VP,MVCC 盖过旧 SST。
+    - **F1 破坏该安全**:recovery SKIP vp_head extent 缺失的(6939-6944 None=>continue)。GC run_gc relocate 到 tail+插 active,然后立刻 punch_holes(2492/2521)——在下次 flush 推进 durable checkpoint 之前。崩在 punch 后 checkpoint 前→老 checkpoint vp_head 被 punch→SKIP→replay 起点后移→漏搬迁值 + union 复活的旧 SST 不再被 supersede→dangling VP/丢。
+    - F2=compaction 同窗(do_compact 内存 swap tables/readers 早于 save_table_locs_raw durable,并发 GC 看未 checkpoint discard map punch)。
+    - F4=decode_last_table_locations 跳过 decode-fail 的 meta record fallback 旧 checkpoint=静默 manifest rollback(同 WAL-FAILSTOP/META-FAILCLOSED 主题,meta record 无 per-record CRC/generation)。
+  **未修:reachability 取决于 GC 是否 punch 当前 on-disk checkpoint vp_head 引用的 extent(GC 打 OLD high-discard sealed,通常在 vp_head 之前=replay 范围外=无害);静态不可解,chaos 25+ seed 全绿=窗口窄。revert-prone PS recovery/GC 区,纪律 reproduce-first+不凭 coco-arch 动刀。** memory [[project_coco_arch_ps_gc_checkpoint_triage]]。
+  **上浮用户:这是一个 coherent crash-consistency 关切(比 EC 更涉数据可达性),值得 reproduce-first 调查(注入 punch-before-checkpoint 崩溃 / append-truncate-间崩溃→验 dangling-VP/复活)。待用户决定优先级。**
