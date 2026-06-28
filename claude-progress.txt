@@ -1334,3 +1334,8 @@ DASHBOARD E2E(用户 "go" → 真 cluster.sh 集群验证 python/autumn_dashboar
 **单测**:fixture 更新成真 wire 形(ps_addr+live_size;detail size_bytes=0 触发 fallback)+ 新增 amp-n/a 回归 → 15/15 过(原 14+1)。
 **教训:cache/dashboard e2e 必须验真 wire(非仅单测)**——[[project_kvcache_vlm_mmhash_unverified]] 同纪律(只看 metric/假设字段名会掩盖跨实例错)。
 集群已 cluster.sh stop + 清 DATA_ROOT(无残留)。文件:dashboard 3 fix + test 更新 + DASHBOARD.md(标 e2e-validated + 真 wire 字段 + 真渲染样例)。
+
+REGRESSION TICK (loop steady-state,无 chaos-path code 改动):2 随机 seed system_chaos 全 PASS —
+  587153178(split+gc+flush+latency+netpart;acked=13466,mismatch=0,accounting=0,10ext/12mem)+
+  342064767(2× kill-restart+fence+compact;acked=11166 clean,mismatch=0,not_found=0,accounting=0,4ext/4mem)。
+  两大交付(refs-leak fix + dashboard e2e)后无 rust chaos-path 改动→纯 regression insurance。fuzz/dashboard 均已穷尽,新价值需用户换方向。
