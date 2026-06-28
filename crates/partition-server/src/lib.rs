@@ -4981,18 +4981,23 @@ async fn partition_thread_main(
         });
     }
     {
-        let p = part.clone();
-        let conc_for_compact = concurrency_ctrl.clone();
-        spawn_failstop(format!("compact[part {part_id}]"), async move {
-            background_compact_loop(part_id, p, compact_rx, conc_for_compact).await;
-        });
-    }
-    {
+        // Compaction + GC share ONE task (background_maintenance_loop) so they
+        // are structurally serialized — see the fn-level note + the GC replay-
+        // floor guard. Split (partition_loop) still fences via compact_gate /
+        // gc_gate, which the merged loop acquires per work kind.
         let p = part.clone();
         let gc_gate_for_loop = gc_gate.clone();
-        let conc_for_gc = concurrency_ctrl.clone();
-        spawn_failstop(format!("gc[part {part_id}]"), async move {
-            background_gc_loop(p, gc_rx, gc_gate_for_loop, conc_for_gc).await;
+        let conc_for_maint = concurrency_ctrl.clone();
+        spawn_failstop(format!("maintenance[part {part_id}]"), async move {
+            background_maintenance_loop(
+                part_id,
+                p,
+                compact_rx,
+                gc_rx,
+                gc_gate_for_loop,
+                conc_for_maint,
+            )
+            .await;
         });
     }
     // F099-K: bind this partition's dedicated TcpListener on THIS

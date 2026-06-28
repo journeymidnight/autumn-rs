@@ -1,3 +1,30 @@
+Date: 2026-06-28 (F1 GC-crash data-loss 修复 — 用户分 2 小步;Step 1 完成)
+TaskStatus: not_completed
+Task scope: 修 F1(GC punch 掉 recovery 仍要 replay 的 log extent → crash 后数据丢失)。
+  与用户深聊定方案:① GC 必须只 punch "recovery replay 起点之前"的 extent(replay floor =
+  min over 所有 live SST 的 vp_head 在 log_extent_ids 的 stream 位置 = recover_partition 的 chosen_pos);
+  ② 串行 GC vs compaction(compaction 是唯一删 SST、可能抬高 floor 的 op;flush 只加 forward-vp_head
+  SST,不动 min,无需管)→ 用户选"合并到一个 compio task"做结构性串行(比 gate 锁图更简单)。
+  分 2 小步(各自可独立 revert):Step 1=合并循环(gate 不动);Step 2=合 compact_gate+gc_gate→
+  maintenance_gate。
+STEP 1 完成(本次):
+  · background.rs floor guard:GcRecv 工作段算 replay_floor_pos(FIRST-occurrence pos_by_eid,
+    与 recover_partition 一致;coco P1 抓到我最初用 collect()=last-occurrence 的 CoW-dup bug,已修),
+    holes 后置过滤掉 sealed_length>0 且 pos>=floor 的 extent(empty 豁免;Auto+Force 都过滤)。
+  · 合并 background_compact_loop+background_gc_loop → background_maintenance_loop:统一 select
+    (compact_rx/gc_rx + 两个 deadline 定时器),body 逐字节 verbatim 搬迁(Python 脚本搬+rustfmt),
+    只 wrapper 新写。GC 不再需要 compact_gate(结构性串行);compaction 段仍持 compact_gate、GC 段
+    持 gc_gate(各自 vs split,split 在 partition_loop 另一个 task)。spawn 点改为 1 个 maintenance task。
+  · 死锁分析:4 把 async 锁(compact_gate/gc_gate per-part + acquire_compact/acquire_gc PS-wide);
+    merged-loop 单 task 永不同时持两族;wait-for 图 compact_gate→acquire_compact→gc_gate +
+    acquire_gc→gc_gate,gc_gate 是汇点无环 → 无死锁。
+  · coco findbugs(GPT-5.5):P1#1 first-occurrence(已修);P1#2 flush-window=误报(加 SST 到 min 不抬 floor);
+    P2#3 GC 等 compaction permit 的延迟耦合=真但小(单 task 串行的预期后果,背景任务有界延迟,非正确性)。
+  · 验证:build+clippy 干净、ps lib 167/167、chaos seed 603+13 全绿(Split/Merge OK,mismatch=0
+    not_found=0 range=0 write-liveness=0 accounting=0),P1#1 修复后 603 复跑仍全绿。
+Next steps: Step 2(合 compact_gate+gc_gate→maintenance_gate,改 split 那 3 行 + 字段)→ 再测;
+  然后按用户计划"尝试复现 F1"(若 floor 逻辑对,bug 应已不在)。P2#3 留作可选 knob(别为边际延迟复杂化单 task)。
+────────────────────────────────────────────────────────────────────────────────
 Date: 2026-06-25 (review 战役 — /loop 自驱:coco review + 每轮 chaos + 删 F### 注释)
 TaskStatus: completed
 LOOP 设定(用户 /loop 动态模式,3 条累积指令):① coco 参与 review,逐一处理冗余/逻辑混乱文件;

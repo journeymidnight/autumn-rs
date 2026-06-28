@@ -90,54 +90,78 @@ fn random_delay() -> Duration {
     Duration::from_millis(5_000 + rand_u64() % 2_000)
 }
 
-pub(crate) async fn background_compact_loop(
+pub(crate) async fn background_maintenance_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
-    // F196 D-r7: PS-wide compact concurrency permit lives on the
-    // ConcurrencyController. Same Arc as PartitionData.concurrency_ctrl.
+    mut gc_rx: mpsc::Receiver<GcTask>,
+    gc_gate: std::sync::Arc<crate::CompactionGate>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
 ) {
-    // F188: short timer kept to refresh `pending_compaction_bytes` for
-    // the maintenance scheduler — it polls metrics on the main thread,
-    // but the metric is recomputed only inside this loop (where we hold
-    // a `borrow()` on `PartitionData`). Without periodic refresh the
-    // scheduler would see a stale 0 and never dispatch.
-    //
-    // The timeout branch ONLY refreshes the metric; it no longer fires
-    // a compaction off the timer. Actual compactions are triggered via
-    // `compact_rx` (scheduler dispatches + manual `client compact`).
-    let mut next_minor_delay = random_delay();
+    // Compaction + GC folded onto ONE task (was background_compact_loop +
+    // background_gc_loop). Single task => they are STRUCTURALLY serialized, so
+    // GC never reads `sst_readers` while a compaction is mid-publish: the
+    // recovery replay floor it computes always matches the durable checkpoint
+    // recovery would load, with NO GC-vs-compaction gate. Each still acquires
+    // its own gate vs SPLIT (compaction -> compact_gate F255, GC -> gc_gate
+    // F140); split runs on partition_loop, a different task. See lock notes.
+    const MAX_GC_ONCE: usize = 3;
+    const GC_DISCARD_RATIO: f64 = 0.4;
+    const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+    const GC_FAILURE_COOLDOWN_SOFT: Duration = Duration::from_secs(30);
+    let mut gc_failure_cooldown: std::collections::HashMap<u64, (Instant, Duration)> =
+        std::collections::HashMap::new();
+
+    // Independent deadline timers per kind (deadline, NOT per-iteration
+    // duration) so a busy compaction stream does not keep resetting the
+    // gc_debt refresh timer and vice-versa. Both timeout arms refresh metrics
+    // only (F188/F203 demoted them off the dispatch path).
+    let mut next_compact_at = Instant::now() + random_delay();
+    let mut next_gc_at = Instant::now() + random_delay();
 
     loop {
         use std::future::Future;
         use std::pin::Pin;
         use std::task::Poll;
 
-        enum CompactSelected {
-            Recv(Option<bool>),
-            Timeout,
+        enum Sel {
+            CompactRecv(Option<bool>),
+            GcRecv(Option<GcTask>),
+            CompactTimeout,
+            GcTimeout,
         }
 
-        let task = {
-            let mut recv_fut = std::pin::pin!(compact_rx.next());
-            let mut sleep_fut = std::pin::pin!(compio::time::sleep(next_minor_delay));
-
+        let now = Instant::now();
+        let compact_sleep = next_compact_at.saturating_duration_since(now);
+        let gc_sleep = next_gc_at.saturating_duration_since(now);
+        let sel = {
+            let mut crecv = std::pin::pin!(compact_rx.next());
+            let mut grecv = std::pin::pin!(gc_rx.next());
+            let mut csleep = std::pin::pin!(compio::time::sleep(compact_sleep));
+            let mut gsleep = std::pin::pin!(compio::time::sleep(gc_sleep));
             std::future::poll_fn(|cx| {
-                if let Poll::Ready(v) = Pin::new(&mut recv_fut).poll(cx) {
-                    return Poll::Ready(CompactSelected::Recv(v));
+                if let Poll::Ready(v) = Pin::new(&mut crecv).poll(cx) {
+                    return Poll::Ready(Sel::CompactRecv(v));
                 }
-                if let Poll::Ready(()) = Pin::new(&mut sleep_fut).poll(cx) {
-                    return Poll::Ready(CompactSelected::Timeout);
+                if let Poll::Ready(v) = Pin::new(&mut grecv).poll(cx) {
+                    return Poll::Ready(Sel::GcRecv(v));
+                }
+                if let Poll::Ready(()) = Pin::new(&mut csleep).poll(cx) {
+                    return Poll::Ready(Sel::CompactTimeout);
+                }
+                if let Poll::Ready(()) = Pin::new(&mut gsleep).poll(cx) {
+                    return Poll::Ready(Sel::GcTimeout);
                 }
                 Poll::Pending
             })
             .await
         };
 
-        match task {
-            CompactSelected::Recv(None) => break,
-            CompactSelected::Recv(Some(first)) => {
+        match sel {
+            // Either channel closing = partition shutdown -> exit the task.
+            Sel::CompactRecv(None) | Sel::GcRecv(None) => break,
+            Sel::CompactRecv(Some(first)) => {
+                next_compact_at = Instant::now() + random_delay();
                 // F189-fix HIGH-1: futures::channel::mpsc capacity is
                 // `buffer + num_senders`, so cap=1 with 2 senders
                 // (PartitionData clone + PartitionHandle clone) admits
@@ -303,10 +327,9 @@ pub(crate) async fn background_compact_loop(
                 refresh_f202_metrics(&part);
                 stamp_last_compact();
                 clear_compact_inflight();
-                next_minor_delay = random_delay();
             }
-            CompactSelected::Timeout => {
-                next_minor_delay = random_delay();
+            Sel::CompactTimeout => {
+                next_compact_at = Instant::now() + random_delay();
 
                 // F187: refresh pending_compaction_bytes every periodic
                 // tick — independent of whether we end up compacting.
@@ -472,149 +495,399 @@ pub(crate) async fn background_compact_loop(
                     }
                 }
             }
-        }
-    }
-}
+            Sel::GcRecv(Some(first)) => {
+                next_gc_at = Instant::now() + random_delay();
+                let gc_task: GcTask = {
+                    // F189-fix HIGH-1: drain backlogged sends (cap=1 +
+                    // 2 senders ⇒ up to 3 messages can accumulate). Any
+                    // queued Force unions its extents into the chosen
+                    // task; multiple Autos collapse to a single Auto.
+                    use futures::stream::StreamExt;
+                    // F189-fix-r2 LOW: when an Auto is queued behind a
+                    // Force (or vice versa), keep BOTH semantics by
+                    // promoting to Force with the operator's explicit
+                    // extents — and let the auto-discard scan still run
+                    // by tagging the Force with a `..Default::default()`-
+                    // style flag we don't have. Compromise: under Force,
+                    // also union the auto-eligible extents we'd pick from
+                    // the discards map. Cheap because we'll iterate
+                    // sst_readers anyway. For now, the simpler middle
+                    // ground is to flip the merged result to `Auto` when
+                    // EITHER input was Auto so the threshold-based scan
+                    // covers both extent sets — Force's explicit list is
+                    // handled by promoting matched-Force-extents into
+                    // Auto-pick at run time. The cleanest implementation
+                    // would carry both lists; we accept one Auto extra
+                    // tick rather than touching the GcTask enum shape.
+                    //
+                    // Net behavior: Force + Auto in the drain → run
+                    // Force this tick; the dropped Auto is dispatched
+                    // again on the next scheduler tick (5 s later) since
+                    // the cooldown stamp from this run sets last_gc_at
+                    // and the scheduler re-evaluates urgency next tick.
+                    // Acceptable.
+                    let mut chosen = first;
+                    while let Some(Some(more)) = gc_rx.next().now_or_never() {
+                        chosen = match (chosen, more) {
+                            (
+                                GcTask::Force { mut extent_ids },
+                                GcTask::Force {
+                                    extent_ids: more_eids,
+                                },
+                            ) => {
+                                for e in more_eids {
+                                    if !extent_ids.contains(&e) {
+                                        extent_ids.push(e);
+                                    }
+                                }
+                                GcTask::Force { extent_ids }
+                            }
+                            (GcTask::Force { extent_ids }, GcTask::Auto(_)) => {
+                                GcTask::Force { extent_ids }
+                            }
+                            (GcTask::Auto(_), GcTask::Force { extent_ids }) => {
+                                GcTask::Force { extent_ids }
+                            }
+                            // F201: when two Auto ticks coalesce, keep the
+                            // most-recent params (the operator's latest
+                            // intent supersedes anything queued behind it).
+                            (GcTask::Auto(_), GcTask::Auto(p2)) => GcTask::Auto(p2),
+                        };
+                    }
+                    chosen
+                };
+                // F189-fix MED-4: latch gc_inflight=1 at the very top of the
+                // loop iteration, not after gc_gate. The scheduler reads
+                // gc_inflight to gate duplicate dispatches; without the early
+                // latch, a slow get_stream_info / get_extent_info (manager
+                // RPC) leaves the flag at 0 for seconds and the scheduler
+                // queues redundant Auto tasks behind us. The cleanup at every
+                // exit path (continue + loop end) clears it back to 0.
+                let metrics = part.borrow().metrics.clone();
+                metrics
+                    .gc_inflight
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                let clear_inflight = |m: &PartitionMetrics| {
+                    m.gc_inflight.store(0, std::sync::atomic::Ordering::Relaxed);
+                };
 
-pub(crate) async fn background_gc_loop(
-    part: Rc<RefCell<PartitionData>>,
-    mut gc_rx: mpsc::Receiver<GcTask>,
-    // F140 per-partition split-vs-gc sync (unchanged).
-    gc_gate: std::sync::Arc<crate::CompactionGate>,
-    // F196 D-r7: PS-wide GC concurrency permit lives on the
-    // ConcurrencyController.
-    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
-) {
-    const MAX_GC_ONCE: usize = 3;
-    const GC_DISCARD_RATIO: f64 = 0.4;
-    // F199 + F201: per-extent failure cooldown. F199 introduced a
-    // single 300 s window covering "hard" faults (broken EC layout,
-    // dead node, etc.) so repeated 5-7 s ticks didn't keep
-    // hammering doomed `ec_read_full_and_slice` fall-backs. F201
-    // splits this into two windows by error class:
-    //
-    //   - Hard fault (300 s): network/disk timeout, decode error,
-    //     EC shards genuinely unreachable. Retrying every 5-7 s
-    //     wastes IO with no chance of success until upstream heals.
-    //   - Recoverable race (30 s): `precondition failed` or
-    //     `eversion mismatch`. Typical cause is a concurrent EC
-    //     conversion holding `ec_conversion_inflight` (F138/F145) →
-    //     manager refuses `punch_holes` with CODE_PRECONDITION.
-    //     The competing operation completes in seconds; a 5 min
-    //     suppression is far too long for what is, by construction,
-    //     a transient cooperative race. 30 s ≪ 300 s but still
-    //     long enough to absorb the typical EC-convert window
-    //     (a few seconds) plus a few `ec_conversion_dispatch_loop`
-    //     ticks (5 s each).
-    const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
-    const GC_FAILURE_COOLDOWN_SOFT: Duration = Duration::from_secs(30);
-    // (Instant, Duration) lets each entry carry its own cooldown so
-    // a soft+hard mix on the same partition uses the right window
-    // per extent.
-    let mut gc_failure_cooldown: std::collections::HashMap<u64, (Instant, Duration)> =
-        std::collections::HashMap::new();
-    // F188: short timer for `gc_debt_bytes` metric refresh. The Auto
-    // task that fires off the timer ALSO refreshes the metric, but
-    // since we're keeping the loop responsive for scheduler dispatches
-    // (which use the same channel), the timer can stay short.
-    let mut next_auto_delay = random_delay();
+                let (log_stream_id, readers_snapshot, part_sc) = {
+                    let p = part.borrow();
+                    (
+                        p.log_stream_id,
+                        p.sst_readers.clone(),
+                        p.stream_client.clone(),
+                    )
+                };
 
-    loop {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::Poll;
+                // F189-fix-r2 MEDIUM: stamp last_gc_at on EVERY early-continue
+                // path so the scheduler's cooldown gate engages. Round-2 audit
+                // caught that get_stream_info-failure and extent_ids<2 paths
+                // skipped the stamp, letting the scheduler re-dispatch every
+                // 5 s during transient manager/extent-node hiccups OR for
+                // partitions that legitimately have <2 log_stream extents
+                // (single-extent → no GC possible). Stamp BEFORE clearing
+                // inflight so the scheduler's tuple-read sees both updates.
+                let stamp_last_gc = || {
+                    metrics.last_gc_at.store(
+                        crate::now_secs() as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                };
 
-        enum GcSel {
-            Recv(Option<GcTask>),
-            Timeout,
-        }
-
-        let task = {
-            let mut recv_fut = std::pin::pin!(gc_rx.next());
-            let mut sleep_fut = std::pin::pin!(compio::time::sleep(next_auto_delay));
-
-            std::future::poll_fn(|cx| {
-                if let Poll::Ready(v) = Pin::new(&mut recv_fut).poll(cx) {
-                    return Poll::Ready(GcSel::Recv(v));
+                let stream_info = match part_sc.get_stream_info(log_stream_id).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("GC get_stream_info: {e}");
+                        stamp_last_gc();
+                        clear_inflight(&metrics);
+                        continue;
+                    }
+                };
+                let extent_ids = stream_info.extent_ids;
+                if extent_ids.len() < 2 {
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
                 }
-                if let Poll::Ready(()) = Pin::new(&mut sleep_fut).poll(cx) {
-                    return Poll::Ready(GcSel::Timeout);
-                }
-                Poll::Pending
-            })
-            .await
-        };
 
-        // F203: GcSel::Timeout no longer dispatches `GcTask::Auto`.
-        // The PS maintenance_scheduler_loop is gone; auto GC is no
-        // longer a kernel-level policy. The timer arm now refreshes
-        // `gc_debt_bytes` (so the manager's advisory window stays
-        // fresh between explicit dispatches) and loops back to
-        // wait. Explicit `Maintenance(MAINTENANCE_AUTO_GC | FORCE_GC)`
-        // RPCs from `client gc` are the only dispatch trigger.
-        let gc_task: GcTask = match task {
-            GcSel::Recv(None) => break,
-            GcSel::Recv(Some(first)) => {
-                // F189-fix HIGH-1: drain backlogged sends (cap=1 +
-                // 2 senders ⇒ up to 3 messages can accumulate). Any
-                // queued Force unions its extents into the chosen
-                // task; multiple Autos collapse to a single Auto.
-                use futures::stream::StreamExt;
-                // F189-fix-r2 LOW: when an Auto is queued behind a
-                // Force (or vice versa), keep BOTH semantics by
-                // promoting to Force with the operator's explicit
-                // extents — and let the auto-discard scan still run
-                // by tagging the Force with a `..Default::default()`-
-                // style flag we don't have. Compromise: under Force,
-                // also union the auto-eligible extents we'd pick from
-                // the discards map. Cheap because we'll iterate
-                // sst_readers anyway. For now, the simpler middle
-                // ground is to flip the merged result to `Auto` when
-                // EITHER input was Auto so the threshold-based scan
-                // covers both extent sets — Force's explicit list is
-                // handled by promoting matched-Force-extents into
-                // Auto-pick at run time. The cleanest implementation
-                // would carry both lists; we accept one Auto extra
-                // tick rather than touching the GcTask enum shape.
+                let sealed_extents = &extent_ids[..extent_ids.len() - 1];
+
+                // WAL replay floor = min stream position over all live SSTs' vp_heads
+                // (mirrors recover_partition's chosen_pos, lib.rs). Everything from
+                // here forward is the log_stream window recovery replays to rebuild
+                // un-flushed writes; punching an extent at/after it would remove
+                // records recovery needs — un-flushed small values that aren't in any
+                // SST yet, or the vp_head extent itself (→ chosen_pos==MAX → no replay
+                // at all). Only extents strictly BEFORE the floor are fully flushed
+                // and safe to reclaim (their small values are in SSTs; their live VPs
+                // were relocated to the tail with a fresh seq, which recovery replays
+                // and MVCC-supersedes the stale SST VP). Readers whose vp_head extent
+                // is already gone are skipped (recovery skips them too). No live SST
+                // resolvable (e.g. nothing flushed) ⇒ floor 0 ⇒ protect every
+                // non-empty extent, since recovery would replay all from offset 0.
+                // Running on the SAME task as compaction (the only op that REMOVES
+                // SSTs and could raise this floor) means `readers_snapshot` matches
+                // the durable checkpoint recovery would load, so this floor ==
+                // recovery's. (Flush only ADDS forward-vp_head SSTs, which never
+                // lower the min, so it can't move the floor under us.)
                 //
-                // Net behavior: Force + Auto in the drain → run
-                // Force this tick; the dropped Auto is dispatched
-                // again on the next scheduler tick (5 s later) since
-                // the cooldown stamp from this run sets last_gc_at
-                // and the scheduler re-evaluates urgency next tick.
-                // Acceptable.
-                let mut chosen = first;
-                while let Some(Some(more)) = gc_rx.next().now_or_never() {
-                    chosen = match (chosen, more) {
-                        (
-                            GcTask::Force { mut extent_ids },
-                            GcTask::Force {
-                                extent_ids: more_eids,
-                            },
-                        ) => {
-                            for e in more_eids {
-                                if !extent_ids.contains(&e) {
-                                    extent_ids.push(e);
+                // FIRST occurrence per extent_id — a CoW-shared extent can appear
+                // twice in the spliced log_extent_ids post split/merge, and
+                // recover_partition keys replay-start off the FIRST occurrence
+                // (`first_pos_by_eid`, lib.rs). A last-occurrence map here would put
+                // the floor LATER than recovery's start and wrongly free an extent
+                // recovery still replays.
+                let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
+                for (pos, &eid) in extent_ids.iter().enumerate() {
+                    pos_by_eid.entry(eid).or_insert(pos);
+                }
+                let replay_floor_pos = readers_snapshot
+                    .iter()
+                    .filter_map(|r| pos_by_eid.get(&r.vp_extent_id).copied())
+                    .min()
+                    .unwrap_or(0);
+
+                // F187: refresh gc_debt_bytes from current discards, regardless of
+                // whether this tick will actually punch anything. The aggregate is
+                // sum(reclaimable bytes on still-live sealed log_stream extents) —
+                // exactly what an operator would call "GC debt".
+                let mut tick_discards = get_discards(&readers_snapshot);
+                valid_discard(&mut tick_discards, sealed_extents);
+                let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
+                metrics
+                    .gc_debt_bytes
+                    .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
+
+                let is_force = matches!(gc_task, GcTask::Force { .. });
+                // (extent_id, authoritative sealed_length) — validated ONCE at selection
+                // so the execution loop never re-reads (possibly stale) state before the
+                // destructive punch. See `authoritative_sealed_length`.
+                let mut holes: Vec<(u64, u64)> = match gc_task {
+                    GcTask::Force { ref extent_ids } => {
+                        let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
+                        let mut hs: Vec<(u64, u64)> = Vec::new();
+                        let mut skipped = 0usize;
+                        // coco P3: count the MAX_GC_ONCE quota by VALIDATED holes, not by
+                        // input candidates — i.e. apply `take` AFTER `authoritative_
+                        // sealed_length`, not before. Otherwise a transient `None`
+                        // (manager RPC hiccup / not-yet-observable seal) on the first
+                        // few requested extents consumes the quota and starves the later
+                        // valid ones, and Force GC is a one-shot consume (no "later
+                        // tick" for the skipped tail).
+                        for e in extent_ids.iter().copied().filter(|e| idx.contains(e)) {
+                            if hs.len() >= MAX_GC_ONCE {
+                                break;
+                            }
+                            // Even an operator Force GC must not punch on stale/open
+                            // state: re-validate authoritatively. A skip (None) means the
+                            // seal isn't authoritatively observable yet; the operator can
+                            // re-issue once it is.
+                            if let Some(sealed_length) =
+                                authoritative_sealed_length(&part_sc, e).await
+                            {
+                                hs.push((e, sealed_length));
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                        if skipped > 0 {
+                            tracing::info!(
+                                skipped,
+                                "Force GC: skipped extents not authoritatively sealed yet"
+                            );
+                        }
+                        hs
+                    }
+                    GcTask::Auto(ref params) => {
+                        let discards = tick_discards;
+
+                        // F201: candidate set is ALL sealed (non-tail) extents,
+                        // not just those with non-zero discard. Empty sealed
+                        // extents (sealed_length == 0, allocated but never
+                        // received data before stream_alloc_extent sealed them
+                        // via commit_length capture) never appear in any SST's
+                        // `discards` map, so the pre-F201 code path (which
+                        // built `candidates` from `discards.keys()`) never even
+                        // considered them — they stayed pinned in `extent_ids`
+                        // forever. We now iterate every sealed extent, sorted
+                        // by reclaimable bytes desc (zero-discard extents land
+                        // last but still reachable).
+                        let mut candidates: Vec<u64> = sealed_extents.to_vec();
+                        candidates.sort_by(|a, b| {
+                            let da = discards.get(a).copied().unwrap_or(0);
+                            let db = discards.get(b).copied().unwrap_or(0);
+                            db.cmp(&da)
+                        });
+
+                        // F201: resolve effective filter parameters. If the
+                        // caller asked for `empty_only`, short-circuit other
+                        // filters. Else apply `ratio` (default 0.4) optionally
+                        // halved when stream-level dead bytes cross
+                        // `stream_debt`, plus `max_size` upper bound.
+                        let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
+                        let stream_debt_hit =
+                            params.stream_debt.is_some_and(|hw| stream_dead >= hw);
+                        let effective_ratio = if params.empty_only {
+                            f64::INFINITY // ratio gate unreachable
+                        } else {
+                            let r = params.ratio.unwrap_or(GC_DISCARD_RATIO);
+                            if stream_debt_hit {
+                                r * 0.5
+                            } else {
+                                r
+                            }
+                        };
+
+                        let mut holes = Vec::new();
+                        for eid in candidates {
+                            if holes.len() >= MAX_GC_ONCE {
+                                break;
+                            }
+                            // Authoritative (never stale) sealed state — see
+                            // `authoritative_sealed_length`. `None` ⇒ unsealed/open or
+                            // fetch failed ⇒ NEVER GC (open extents look like
+                            // `sealed_length==0` but are not empty).
+                            let sealed_length =
+                                match authoritative_sealed_length(&part_sc, eid).await {
+                                    Some(l) => l,
+                                    None => continue,
+                                };
+                            if sealed_length == 0 {
+                                // F201: a CONFIRMED sealed-empty extent — no committed
+                                // data to rewrite, just punch. `run_gc` with
+                                // sealed_length=0 skips the read loop and goes straight
+                                // to flush_gc_batch (no-op) + punch_holes. Empty-sealed
+                                // extents are always eligible (they don't read `ratio` /
+                                // `max_size`) — a strict win.
+                                holes.push((eid, sealed_length));
+                                continue;
+                            }
+                            if params.empty_only {
+                                continue;
+                            }
+                            if let Some(mx) = params.max_size {
+                                if sealed_length > mx {
+                                    continue;
                                 }
                             }
-                            GcTask::Force { extent_ids }
+                            let discard_bytes = discards.get(&eid).copied().unwrap_or(0);
+                            if discard_bytes <= 0 {
+                                continue;
+                            }
+                            let ratio = discard_bytes as f64 / sealed_length as f64;
+                            if ratio > effective_ratio {
+                                holes.push((eid, sealed_length));
+                            }
                         }
-                        (GcTask::Force { extent_ids }, GcTask::Auto(_)) => {
-                            GcTask::Force { extent_ids }
-                        }
-                        (GcTask::Auto(_), GcTask::Force { extent_ids }) => {
-                            GcTask::Force { extent_ids }
-                        }
-                        // F201: when two Auto ticks coalesce, keep the
-                        // most-recent params (the operator's latest
-                        // intent supersedes anything queued behind it).
-                        (GcTask::Auto(_), GcTask::Auto(p2)) => GcTask::Auto(p2),
-                    };
+                        holes
+                    }
+                };
+
+                // WAL replay-floor guard (applies to BOTH Auto and Force — even an
+                // operator Force must not punch the replay window; compact first to
+                // advance the floor). Never punch a NON-EMPTY extent at/after the
+                // replay floor (see floor computation above). Empty (sealed_length==0)
+                // extents carry no committed data and stay eligible.
+                {
+                    let before = holes.len();
+                    holes.retain(|(eid, sealed_length)| {
+                        *sealed_length == 0
+                            || pos_by_eid
+                                .get(eid)
+                                .is_none_or(|&pos| pos < replay_floor_pos)
+                    });
+                    if holes.len() < before {
+                        tracing::info!(
+                    protected = before - holes.len(),
+                    replay_floor_pos,
+                    "GC: skipping extents inside the WAL replay window (recovery would replay them)"
+                );
+                    }
                 }
-                chosen
+
+                // F199: filter against the per-extent failure cooldown. Force
+                // tasks bypass the cooldown (operator override), Auto tasks
+                // respect it. Stale entries (older than the cooldown window)
+                // are evicted lazily to keep the map bounded.
+                if !is_force {
+                    let now = Instant::now();
+                    // Evict stale entries (past their own cooldown window).
+                    gc_failure_cooldown.retain(|_, (t, dur)| now.duration_since(*t) < *dur);
+                    let initial_len = holes.len();
+                    holes.retain(|(eid, _)| {
+                        gc_failure_cooldown
+                            .get(eid)
+                            .is_none_or(|(t, dur)| now.duration_since(*t) >= *dur)
+                    });
+                    if holes.len() < initial_len {
+                        tracing::info!(
+                            skipped = initial_len - holes.len(),
+                            remaining = holes.len(),
+                            "F199+F201: GC skipping recently-failed extents (cooldown active)"
+                        );
+                    }
+                }
+
+                if holes.is_empty() {
+                    // F189-fix HIGH-2 + r2: same stamp-then-clear rationale as
+                    // the early-exit paths above. Cooldown engages even when
+                    // there's nothing to punch.
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+
+                // F196 D-r6: PS-wide GC concurrency cap (via the unified
+                // AdmissionController). Acquired BEFORE the per-partition
+                // gc_gate so multiple partitions on the same PS don't all
+                // enter run_gc together — each holds ~64 MiB chunk buffer +
+                // rewrite staging. Default 1 (full serialization), tunable
+                // via `--gc-parallelism`.
+                let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
+                // F140: acquire gc_gate around the actual run_gc calls so that
+                // handle_split_part can wait for no log_stream appends in-flight.
+                // Gate is held only for the holes-processing loop, not for the
+                // preceding read-only get_stream_info / get_extent_info RPCs.
+                let _gc_permit = gc_gate.acquire().await;
+                tracing::info!("GC: starting, extents={:?}", holes);
+                // F189-fix MED-4: gc_inflight already latched at top of loop;
+                // hold through the punch and clear at the bottom.
+                // `sealed_length` was validated AUTHORITATIVELY at selection
+                // (`authoritative_sealed_length`) and carried here — do NOT re-read it
+                // from the (possibly stale) extent_info cache, or the check/use split
+                // re-opens the seed=583 stale-cache punch on a sealed extent.
+                for (eid, sealed_length) in holes {
+                    match run_gc(&part, eid, sealed_length).await {
+                        Ok(()) => {
+                            // F199: success → clear any prior failure stamp so
+                            // a transient EC fall-back hiccup doesn't suppress
+                            // the next legitimate GC need.
+                            gc_failure_cooldown.remove(&eid);
+                        }
+                        Err(e) => {
+                            let dur = classify_gc_failure_cooldown(
+                                &e,
+                                GC_FAILURE_COOLDOWN_SOFT,
+                                GC_FAILURE_COOLDOWN,
+                            );
+                            tracing::error!(
+                                extent_id = eid,
+                                cooldown_secs = dur.as_secs(),
+                                "GC run_gc extent: {e}"
+                            );
+                            gc_failure_cooldown.insert(eid, (Instant::now(), dur));
+                        }
+                    }
+                }
+                // F189-fix HIGH-2 + r2: stamp BEFORE clear so the scheduler
+                // doesn't see (inflight=0, last_gc_at=stale) and re-dispatch.
+                stamp_last_gc();
+                clear_inflight(&metrics);
+                drop(_gc_permit);
             }
-            GcSel::Timeout => {
-                next_auto_delay = random_delay();
+            Sel::GcTimeout => {
+                next_gc_at = Instant::now() + random_delay();
                 // F203: refresh `gc_debt_bytes` metric without
                 // dispatching. `report_load_loop` and any external
                 // policy controller queries see fresh debt without
@@ -640,278 +913,8 @@ pub(crate) async fn background_gc_loop(
                             .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                continue;
-            }
-        };
-
-        // F189-fix MED-4: latch gc_inflight=1 at the very top of the
-        // loop iteration, not after gc_gate. The scheduler reads
-        // gc_inflight to gate duplicate dispatches; without the early
-        // latch, a slow get_stream_info / get_extent_info (manager
-        // RPC) leaves the flag at 0 for seconds and the scheduler
-        // queues redundant Auto tasks behind us. The cleanup at every
-        // exit path (continue + loop end) clears it back to 0.
-        let metrics = part.borrow().metrics.clone();
-        metrics
-            .gc_inflight
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        let clear_inflight = |m: &PartitionMetrics| {
-            m.gc_inflight.store(0, std::sync::atomic::Ordering::Relaxed);
-        };
-
-        let (log_stream_id, readers_snapshot, part_sc) = {
-            let p = part.borrow();
-            (
-                p.log_stream_id,
-                p.sst_readers.clone(),
-                p.stream_client.clone(),
-            )
-        };
-
-        // F189-fix-r2 MEDIUM: stamp last_gc_at on EVERY early-continue
-        // path so the scheduler's cooldown gate engages. Round-2 audit
-        // caught that get_stream_info-failure and extent_ids<2 paths
-        // skipped the stamp, letting the scheduler re-dispatch every
-        // 5 s during transient manager/extent-node hiccups OR for
-        // partitions that legitimately have <2 log_stream extents
-        // (single-extent → no GC possible). Stamp BEFORE clearing
-        // inflight so the scheduler's tuple-read sees both updates.
-        let stamp_last_gc = || {
-            metrics.last_gc_at.store(
-                crate::now_secs() as i64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        };
-
-        let stream_info = match part_sc.get_stream_info(log_stream_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("GC get_stream_info: {e}");
-                stamp_last_gc();
-                clear_inflight(&metrics);
-                continue;
-            }
-        };
-        let extent_ids = stream_info.extent_ids;
-        if extent_ids.len() < 2 {
-            stamp_last_gc();
-            clear_inflight(&metrics);
-            continue;
-        }
-
-        let sealed_extents = &extent_ids[..extent_ids.len() - 1];
-
-        // F187: refresh gc_debt_bytes from current discards, regardless of
-        // whether this tick will actually punch anything. The aggregate is
-        // sum(reclaimable bytes on still-live sealed log_stream extents) —
-        // exactly what an operator would call "GC debt".
-        let mut tick_discards = get_discards(&readers_snapshot);
-        valid_discard(&mut tick_discards, sealed_extents);
-        let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
-        metrics
-            .gc_debt_bytes
-            .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
-
-        let is_force = matches!(gc_task, GcTask::Force { .. });
-        // (extent_id, authoritative sealed_length) — validated ONCE at selection
-        // so the execution loop never re-reads (possibly stale) state before the
-        // destructive punch. See `authoritative_sealed_length`.
-        let mut holes: Vec<(u64, u64)> = match gc_task {
-            GcTask::Force { ref extent_ids } => {
-                let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
-                let mut hs: Vec<(u64, u64)> = Vec::new();
-                let mut skipped = 0usize;
-                // coco P3: count the MAX_GC_ONCE quota by VALIDATED holes, not by
-                // input candidates — i.e. apply `take` AFTER `authoritative_
-                // sealed_length`, not before. Otherwise a transient `None`
-                // (manager RPC hiccup / not-yet-observable seal) on the first
-                // few requested extents consumes the quota and starves the later
-                // valid ones, and Force GC is a one-shot consume (no "later
-                // tick" for the skipped tail).
-                for e in extent_ids.iter().copied().filter(|e| idx.contains(e)) {
-                    if hs.len() >= MAX_GC_ONCE {
-                        break;
-                    }
-                    // Even an operator Force GC must not punch on stale/open
-                    // state: re-validate authoritatively. A skip (None) means the
-                    // seal isn't authoritatively observable yet; the operator can
-                    // re-issue once it is.
-                    if let Some(sealed_length) = authoritative_sealed_length(&part_sc, e).await {
-                        hs.push((e, sealed_length));
-                    } else {
-                        skipped += 1;
-                    }
-                }
-                if skipped > 0 {
-                    tracing::info!(
-                        skipped,
-                        "Force GC: skipped extents not authoritatively sealed yet"
-                    );
-                }
-                hs
-            }
-            GcTask::Auto(ref params) => {
-                let discards = tick_discards;
-
-                // F201: candidate set is ALL sealed (non-tail) extents,
-                // not just those with non-zero discard. Empty sealed
-                // extents (sealed_length == 0, allocated but never
-                // received data before stream_alloc_extent sealed them
-                // via commit_length capture) never appear in any SST's
-                // `discards` map, so the pre-F201 code path (which
-                // built `candidates` from `discards.keys()`) never even
-                // considered them — they stayed pinned in `extent_ids`
-                // forever. We now iterate every sealed extent, sorted
-                // by reclaimable bytes desc (zero-discard extents land
-                // last but still reachable).
-                let mut candidates: Vec<u64> = sealed_extents.to_vec();
-                candidates.sort_by(|a, b| {
-                    let da = discards.get(a).copied().unwrap_or(0);
-                    let db = discards.get(b).copied().unwrap_or(0);
-                    db.cmp(&da)
-                });
-
-                // F201: resolve effective filter parameters. If the
-                // caller asked for `empty_only`, short-circuit other
-                // filters. Else apply `ratio` (default 0.4) optionally
-                // halved when stream-level dead bytes cross
-                // `stream_debt`, plus `max_size` upper bound.
-                let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
-                let stream_debt_hit = params.stream_debt.is_some_and(|hw| stream_dead >= hw);
-                let effective_ratio = if params.empty_only {
-                    f64::INFINITY // ratio gate unreachable
-                } else {
-                    let r = params.ratio.unwrap_or(GC_DISCARD_RATIO);
-                    if stream_debt_hit {
-                        r * 0.5
-                    } else {
-                        r
-                    }
-                };
-
-                let mut holes = Vec::new();
-                for eid in candidates {
-                    if holes.len() >= MAX_GC_ONCE {
-                        break;
-                    }
-                    // Authoritative (never stale) sealed state — see
-                    // `authoritative_sealed_length`. `None` ⇒ unsealed/open or
-                    // fetch failed ⇒ NEVER GC (open extents look like
-                    // `sealed_length==0` but are not empty).
-                    let sealed_length = match authoritative_sealed_length(&part_sc, eid).await {
-                        Some(l) => l,
-                        None => continue,
-                    };
-                    if sealed_length == 0 {
-                        // F201: a CONFIRMED sealed-empty extent — no committed
-                        // data to rewrite, just punch. `run_gc` with
-                        // sealed_length=0 skips the read loop and goes straight
-                        // to flush_gc_batch (no-op) + punch_holes. Empty-sealed
-                        // extents are always eligible (they don't read `ratio` /
-                        // `max_size`) — a strict win.
-                        holes.push((eid, sealed_length));
-                        continue;
-                    }
-                    if params.empty_only {
-                        continue;
-                    }
-                    if let Some(mx) = params.max_size {
-                        if sealed_length > mx {
-                            continue;
-                        }
-                    }
-                    let discard_bytes = discards.get(&eid).copied().unwrap_or(0);
-                    if discard_bytes <= 0 {
-                        continue;
-                    }
-                    let ratio = discard_bytes as f64 / sealed_length as f64;
-                    if ratio > effective_ratio {
-                        holes.push((eid, sealed_length));
-                    }
-                }
-                holes
-            }
-        };
-
-        // F199: filter against the per-extent failure cooldown. Force
-        // tasks bypass the cooldown (operator override), Auto tasks
-        // respect it. Stale entries (older than the cooldown window)
-        // are evicted lazily to keep the map bounded.
-        if !is_force {
-            let now = Instant::now();
-            // Evict stale entries (past their own cooldown window).
-            gc_failure_cooldown.retain(|_, (t, dur)| now.duration_since(*t) < *dur);
-            let initial_len = holes.len();
-            holes.retain(|(eid, _)| {
-                gc_failure_cooldown
-                    .get(eid)
-                    .is_none_or(|(t, dur)| now.duration_since(*t) >= *dur)
-            });
-            if holes.len() < initial_len {
-                tracing::info!(
-                    skipped = initial_len - holes.len(),
-                    remaining = holes.len(),
-                    "F199+F201: GC skipping recently-failed extents (cooldown active)"
-                );
             }
         }
-
-        if holes.is_empty() {
-            // F189-fix HIGH-2 + r2: same stamp-then-clear rationale as
-            // the early-exit paths above. Cooldown engages even when
-            // there's nothing to punch.
-            stamp_last_gc();
-            clear_inflight(&metrics);
-            continue;
-        }
-
-        // F196 D-r6: PS-wide GC concurrency cap (via the unified
-        // AdmissionController). Acquired BEFORE the per-partition
-        // gc_gate so multiple partitions on the same PS don't all
-        // enter run_gc together — each holds ~64 MiB chunk buffer +
-        // rewrite staging. Default 1 (full serialization), tunable
-        // via `--gc-parallelism`.
-        let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
-        // F140: acquire gc_gate around the actual run_gc calls so that
-        // handle_split_part can wait for no log_stream appends in-flight.
-        // Gate is held only for the holes-processing loop, not for the
-        // preceding read-only get_stream_info / get_extent_info RPCs.
-        let _gc_permit = gc_gate.acquire().await;
-        tracing::info!("GC: starting, extents={:?}", holes);
-        // F189-fix MED-4: gc_inflight already latched at top of loop;
-        // hold through the punch and clear at the bottom.
-        // `sealed_length` was validated AUTHORITATIVELY at selection
-        // (`authoritative_sealed_length`) and carried here — do NOT re-read it
-        // from the (possibly stale) extent_info cache, or the check/use split
-        // re-opens the seed=583 stale-cache punch on a sealed extent.
-        for (eid, sealed_length) in holes {
-            match run_gc(&part, eid, sealed_length).await {
-                Ok(()) => {
-                    // F199: success → clear any prior failure stamp so
-                    // a transient EC fall-back hiccup doesn't suppress
-                    // the next legitimate GC need.
-                    gc_failure_cooldown.remove(&eid);
-                }
-                Err(e) => {
-                    let dur = classify_gc_failure_cooldown(
-                        &e,
-                        GC_FAILURE_COOLDOWN_SOFT,
-                        GC_FAILURE_COOLDOWN,
-                    );
-                    tracing::error!(
-                        extent_id = eid,
-                        cooldown_secs = dur.as_secs(),
-                        "GC run_gc extent: {e}"
-                    );
-                    gc_failure_cooldown.insert(eid, (Instant::now(), dur));
-                }
-            }
-        }
-        // F189-fix HIGH-2 + r2: stamp BEFORE clear so the scheduler
-        // doesn't see (inflight=0, last_gc_at=stale) and re-dispatch.
-        stamp_last_gc();
-        clear_inflight(&metrics);
-        drop(_gc_permit);
     }
 }
 
@@ -2664,10 +2667,12 @@ async fn process_gc_chunk(
             // is staged.
             let p = part.borrow();
             let appeared_in_mem = p.active.seek_user_key(&user_key).is_some()
-                || p.imm.iter().rev().any(|m| m.seek_user_key(&user_key).is_some());
+                || p.imm
+                    .iter()
+                    .rev()
+                    .any(|m| m.seek_user_key(&user_key).is_some());
             let snapshot_stale = p.sst_readers.len() != readers.len()
-                || p
-                    .sst_readers
+                || p.sst_readers
                     .iter()
                     .zip(readers.iter())
                     .any(|(a, b)| !Arc::ptr_eq(a, b));
