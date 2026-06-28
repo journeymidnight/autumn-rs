@@ -1440,3 +1440,12 @@ PIVOT TICK(c):用户未 greenlight F4→coco arch 审 NON-EC partition-server ba
     - F4=decode_last_table_locations 跳过 decode-fail 的 meta record fallback 旧 checkpoint=静默 manifest rollback(同 WAL-FAILSTOP/META-FAILCLOSED 主题,meta record 无 per-record CRC/generation)。
   **未修:reachability 取决于 GC 是否 punch 当前 on-disk checkpoint vp_head 引用的 extent(GC 打 OLD high-discard sealed,通常在 vp_head 之前=replay 范围外=无害);静态不可解,chaos 25+ seed 全绿=窗口窄。revert-prone PS recovery/GC 区,纪律 reproduce-first+不凭 coco-arch 动刀。** memory [[project_coco_arch_ps_gc_checkpoint_triage]]。
   **上浮用户:这是一个 coherent crash-consistency 关切(比 EC 更涉数据可达性),值得 reproduce-first 调查(注入 punch-before-checkpoint 崩溃 / append-truncate-间崩溃→验 dangling-VP/复活)。待用户决定优先级。**
+
+F1 reproduce-first 调查(用户默认)→ **F1 从 coco-hypothesis ELEVATED 到 CODE-CONFIRMED data-loss bug(全路径追踪,尚未 runtime 复现):**
+  1. run_gc(background.rs:2496-2523):flush_gc_batch 后立刻 punch_holes,中间无 checkpoint。注释只论 DATA durability(value bytes 在 log durable),漏了 RECOVERABILITY。
+  2. flush_gc_batch(2265-2293)新 VP 用与原 record 相同的 internal_key/seq——relocated WAL 记录 same-seq。
+  3. 崩在下次 checkpoint 前→recovery:checkpoint vp_head→E1 缺失(被 punch)→skip(6939-6944)→chosen_pos==MAX;tables 非空⇒else{None}(7265)⇒不 replay(7269 if-let-Some 跳过)。即便 replay,same-seq relocated record 被 SST max_seq DEDUP 跳过。
+  4. ⇒ SST 的 VP→punched-E1 成 live 版本→GET NotFound = 静默数据丢失。可达(GC 正常会 punch 仍锚定 vp_head 的旧 high-discard extent);25+ chaos seed 漏掉(workload-specific 窗口;in-process harness 无法 crash-without-checkpoint)。
+  **FIX = GC checkpoint-before-punch**(rotate active→flush→等 save_table_locs_raw durable→再 punch;LSM "manifest durable before delete",coco 方案 A)。成本:每次 GC punch 一次 flush(可接受,GC 后台)。
+  **未修:revert-prone GC/recovery 区 + Items 2/4 硬教训要求先 RUNTIME 复现。runtime repro 需 CONTROLLED crash(SIGKILL 子进程 autumn-ps,GC punch 后 checkpoint 前——in-process harness 做不到 crash-without-flush)。** memory [[project_coco_arch_ps_gc_checkpoint_triage]] 已 ELEVATED + MEMORY.md 已记。
+  **上浮用户:这是本会话最强的 production data-loss 发现(code-confirmed)。荐下一步:建 controlled-crash repro(兼做 fix 回归测试)→确认→修 checkpoint-before-punch(care+coco);或用户基于 code-confirmation greenlight 修。绝不在无 runtime repro 下 autonomous 动 GC sequencing(纪律)。**
