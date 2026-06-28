@@ -90,6 +90,53 @@ fn random_delay() -> Duration {
     Duration::from_millis(5_000 + rand_u64() % 2_000)
 }
 
+/// WAL replay floor for GC — returns `(floor_pos, pos_by_eid)`.
+///
+/// `floor_pos` is the minimum stream position (FIRST-occurrence index into
+/// `log_extent_ids`) over the live SSTs' vp_head extent ids — i.e. exactly
+/// `recover_partition`'s replay start (`chosen_pos`). GC must never punch a
+/// non-empty extent at/after it, or a crash before the next checkpoint loses
+/// the WAL recovery replays from there (the F1 data-loss bug).
+///
+/// Details that are load-bearing:
+/// - **FIRST occurrence**, not last: a CoW-shared extent repeats in the spliced
+///   `log_extent_ids` after split/merge, and `recover_partition` keys off the
+///   first occurrence (`first_pos_by_eid`). A last-occurrence floor would land
+///   LATER than recovery's start and wrongly free an extent recovery replays.
+/// - **vp_heads that no longer resolve** (extent already gone from the stream)
+///   are skipped — recovery skips them too.
+/// - **floor 0** when none resolve (nothing flushed yet, or all vp_head extents
+///   gone): protect every non-empty extent, matching recovery's replay-from-0
+///   path and its `chosen_pos==MAX` no-replay fallback.
+pub(crate) fn gc_replay_floor(
+    log_extent_ids: &[u64],
+    sst_vp_extent_ids: impl IntoIterator<Item = u64>,
+) -> (usize, HashMap<u64, usize>) {
+    let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        pos_by_eid.entry(eid).or_insert(pos);
+    }
+    let floor = sst_vp_extent_ids
+        .into_iter()
+        .filter_map(|eid| pos_by_eid.get(&eid).copied())
+        .min()
+        .unwrap_or(0);
+    (floor, pos_by_eid)
+}
+
+/// Whether a sealed extent is safe for GC to punch (the F1 guard): an empty
+/// extent (`sealed_length == 0`, no committed data) always is; a non-empty one
+/// only if it sits STRICTLY BEFORE the replay floor, so the WAL replay window
+/// at/after the floor — including the vp_head extent itself — is never truncated.
+pub(crate) fn gc_extent_punchable(
+    eid: u64,
+    sealed_length: u64,
+    pos_by_eid: &HashMap<u64, usize>,
+    replay_floor_pos: usize,
+) -> bool {
+    sealed_length == 0 || pos_by_eid.get(&eid).is_none_or(|&pos| pos < replay_floor_pos)
+}
+
 pub(crate) async fn background_maintenance_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -613,40 +660,19 @@ pub(crate) async fn background_maintenance_loop(
 
                 let sealed_extents = &extent_ids[..extent_ids.len() - 1];
 
-                // WAL replay floor = min stream position over all live SSTs' vp_heads
-                // (mirrors recover_partition's chosen_pos, lib.rs). Everything from
-                // here forward is the log_stream window recovery replays to rebuild
-                // un-flushed writes; punching an extent at/after it would remove
-                // records recovery needs — un-flushed small values that aren't in any
-                // SST yet, or the vp_head extent itself (→ chosen_pos==MAX → no replay
-                // at all). Only extents strictly BEFORE the floor are fully flushed
-                // and safe to reclaim (their small values are in SSTs; their live VPs
-                // were relocated to the tail with a fresh seq, which recovery replays
-                // and MVCC-supersedes the stale SST VP). Readers whose vp_head extent
-                // is already gone are skipped (recovery skips them too). No live SST
-                // resolvable (e.g. nothing flushed) ⇒ floor 0 ⇒ protect every
-                // non-empty extent, since recovery would replay all from offset 0.
-                // Running on the SAME task as compaction (the only op that REMOVES
-                // SSTs and could raise this floor) means `readers_snapshot` matches
-                // the durable checkpoint recovery would load, so this floor ==
-                // recovery's. (Flush only ADDS forward-vp_head SSTs, which never
-                // lower the min, so it can't move the floor under us.)
-                //
-                // FIRST occurrence per extent_id — a CoW-shared extent can appear
-                // twice in the spliced log_extent_ids post split/merge, and
-                // recover_partition keys replay-start off the FIRST occurrence
-                // (`first_pos_by_eid`, lib.rs). A last-occurrence map here would put
-                // the floor LATER than recovery's start and wrongly free an extent
-                // recovery still replays.
-                let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
-                for (pos, &eid) in extent_ids.iter().enumerate() {
-                    pos_by_eid.entry(eid).or_insert(pos);
-                }
-                let replay_floor_pos = readers_snapshot
-                    .iter()
-                    .filter_map(|r| pos_by_eid.get(&r.vp_extent_id).copied())
-                    .min()
-                    .unwrap_or(0);
+                // WAL replay-floor guard (F1): GC must NEVER punch a log extent
+                // at/after the floor — recovery replays the log_stream from there
+                // forward, so punching it drops records recovery needs (un-flushed
+                // small values not yet in any SST, or the vp_head extent itself →
+                // chosen_pos==MAX → no replay at all). Only extents strictly BEFORE
+                // the floor are fully flushed and safe to reclaim. Running on the
+                // SAME task as compaction (the only op that REMOVES SSTs and could
+                // raise the floor) means `readers_snapshot` matches the durable
+                // checkpoint recovery loads, so this floor == recovery's chosen_pos.
+                // (Flush only ADDS forward-vp_head SSTs, which never lower the min.)
+                // See `gc_replay_floor` for the first-occurrence / floor-0 details.
+                let (replay_floor_pos, pos_by_eid) =
+                    gc_replay_floor(&extent_ids, readers_snapshot.iter().map(|r| r.vp_extent_id));
 
                 // F187: refresh gc_debt_bytes from current discards, regardless of
                 // whether this tick will actually punch anything. The aggregate is
@@ -792,10 +818,7 @@ pub(crate) async fn background_maintenance_loop(
                 {
                     let before = holes.len();
                     holes.retain(|(eid, sealed_length)| {
-                        *sealed_length == 0
-                            || pos_by_eid
-                                .get(eid)
-                                .is_none_or(|&pos| pos < replay_floor_pos)
+                        gc_extent_punchable(*eid, *sealed_length, &pos_by_eid, replay_floor_pos)
                     });
                     if holes.len() < before {
                         tracing::info!(
@@ -3756,5 +3779,83 @@ mod lookup_block_boundary_tests {
 
         // A key that does not exist must still return None.
         assert!(lookup_in_sst(&reader, b"zzzzzz").is_none());
+    }
+}
+
+#[cfg(test)]
+mod gc_replay_floor_tests {
+    //! F1 regression: GC must never punch a log_stream extent that crash
+    //! recovery still replays. These pin the floor computation (== recovery's
+    //! `chosen_pos`) and the punch guard.
+    use super::{gc_extent_punchable, gc_replay_floor};
+
+    #[test]
+    fn floor_is_min_first_occurrence_position() {
+        let log = [10u64, 11, 12, 13];
+        let (floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(floor, 1);
+        assert_eq!(pos.get(&10), Some(&0));
+        assert_eq!(pos.get(&13), Some(&3));
+    }
+
+    #[test]
+    fn floor_takes_min_over_multiple_vp_heads() {
+        let log = [10u64, 11, 12, 13];
+        // earliest position among {13, 11, 12} is 11's (pos 1).
+        assert_eq!(gc_replay_floor(&log, [13u64, 11, 12]).0, 1);
+    }
+
+    #[test]
+    fn floor_uses_first_occurrence_for_cow_shared_extent() {
+        // coco-P1 regression: post split/merge the spliced log_stream repeats a
+        // CoW-shared extent (11). recover_partition replays from the FIRST
+        // occurrence (pos 1). A last-occurrence floor would be 3, wrongly
+        // freeing extent 12 (pos 2) that recovery still replays.
+        let log = [10u64, 11, 12, 11, 13];
+        assert_eq!(
+            gc_replay_floor(&log, [11u64]).0,
+            1,
+            "must be first occurrence of 11, not 3"
+        );
+    }
+
+    #[test]
+    fn floor_zero_protects_all_when_nothing_resolves() {
+        let log = [10u64, 11, 12];
+        // No SSTs at all (nothing flushed) → recovery replays from 0.
+        assert_eq!(gc_replay_floor(&log, std::iter::empty()).0, 0);
+        // vp_head points at an extent already gone from the stream.
+        assert_eq!(gc_replay_floor(&log, [99u64]).0, 0);
+    }
+
+    #[test]
+    fn floor_skips_unresolvable_vp_heads_like_recovery() {
+        let log = [10u64, 11, 12, 13];
+        // 99 is gone; 12 resolves at pos 2 → min over resolvable = 2.
+        assert_eq!(gc_replay_floor(&log, [99u64, 12]).0, 2);
+    }
+
+    #[test]
+    fn guard_punches_only_below_floor_protects_replay_window() {
+        // The F1 scenario: floor sits at the vp_head extent 11 (pos 1). Without
+        // the guard GC would punch 11 (the vp_head extent) and 12 (after it) —
+        // both have high discard — and a crash before the next checkpoint would
+        // then lose the WAL recovery replays from 11 forward. With the guard
+        // only the fully-flushed extent 10 and the empty extent 13 are punched.
+        let log = [10u64, 11, 12, 13];
+        let (floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(floor, 1);
+        let candidates = [
+            (10u64, 1_000u64), // before floor, non-empty → punchable
+            (11, 1_000),       // AT floor (vp_head extent) → PROTECTED
+            (12, 1_000),       // after floor → PROTECTED
+            (13, 0),           // empty → punchable regardless
+        ];
+        let punchable: Vec<u64> = candidates
+            .iter()
+            .filter(|(eid, sl)| gc_extent_punchable(*eid, *sl, &pos, floor))
+            .map(|(eid, _)| *eid)
+            .collect();
+        assert_eq!(punchable, vec![10, 13]);
     }
 }

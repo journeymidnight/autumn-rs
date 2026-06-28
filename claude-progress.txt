@@ -22,8 +22,18 @@ STEP 1 完成(本次):
     P2#3 GC 等 compaction permit 的延迟耦合=真但小(单 task 串行的预期后果,背景任务有界延迟,非正确性)。
   · 验证:build+clippy 干净、ps lib 167/167、chaos seed 603+13 全绿(Split/Merge OK,mismatch=0
     not_found=0 range=0 write-liveness=0 accounting=0),P1#1 修复后 603 复跑仍全绿。
-Next steps: Step 2(合 compact_gate+gc_gate→maintenance_gate,改 split 那 3 行 + 字段)→ 再测;
-  然后按用户计划"尝试复现 F1"(若 floor 逻辑对,bug 应已不在)。P2#3 留作可选 knob(别为边际延迟复杂化单 task)。
+  · COMMIT 36b4522(已 push)。
+F1 复现验证完成(用户"先看F1消失"):F1 是 deterministic(代码可证、非 race),把守卫逻辑抽成纯函数
+  gc_replay_floor / gc_extent_punchable + 6 个确定性单测精确复现 F1 危险条件并证守卫挡住:
+  · guard_punches_only_below_floor_protects_replay_window —— vp_head extent(11)+ 其后(12)被保护,
+    无守卫则两者都被 punch → crash recovery 丢数据;只有 floor 之前(10)+ empty(13)被 punch。
+  · floor_uses_first_occurrence_for_cow_shared_extent —— 钉 coco-P1 的 CoW-dup first-occurrence。
+  · 另 4 个:min/多 vp_head/floor-0-protect-all/skip-unresolvable == recover_partition chosen_pos 语义。
+  全 e2e 受控崩溃(SIGKILL 卡 punch 后 checkpoint 前)按前期调查不成比例贵;且有守卫后 GC 根本不会 punch
+  vp_head extent(从根上关掉 punch 路径),故"复现不出来"正是 bug 已消失的预期结果。验证:ps lib 173/173
+  (167+6),chaos 603 复跑全绿(纯抽取 behavior-preserving)。COMMIT 待 push。
+Next steps: Step 2(合 compact_gate+gc_gate→maintenance_gate,改 split 那 3 行 + 字段)→ 再测。
+  P2#3 留作可选 knob(别为边际延迟复杂化单 task)。
 ────────────────────────────────────────────────────────────────────────────────
 Date: 2026-06-25 (review 战役 — /loop 自驱:coco review + 每轮 chaos + 删 F### 注释)
 TaskStatus: completed
