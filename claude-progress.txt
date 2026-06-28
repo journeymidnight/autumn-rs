@@ -1198,6 +1198,22 @@ R61 — **fuzz-monitor 抓到 GENUINE 可复现 accounting bug(seed=769351064)**
   baseline→败者 Precondition→fresh-read 重试→refs:0→delete)。**但在最 revert-prone 的 CAS/refs 区**,且 feedback_repro_accounting_not_harm 提醒
   低危害 bug 修复别在热路径自产 bug。**=用户决策点:apply 文档化 CAS 修复(reproduce-first 已完成,note33 ready,但需谨慎实现+coco review)vs 记为
   已复现-低危害-known。上浮用户。** fuzz-monitor("我曾以为 maximal/saturated")抓到真 bug=继续跑 fuzz 的 vindication。
+  **用户:"系统研究 ref leak 根因 + 还有其他类似引起条件吗"→ SYSTEMATIC STUDY DONE:**
+  **根因(一句)**:extents/<id>(含 refs)被 PS 层 op(punch_holes/truncate/split/merge)read-modify-write **但不 value-CAS extents/<id>**,且这些 PS-op
+  **互不排斥**(只 stream 层 ConvertToEc/Recovery/Delete 进 F207 ledger;PS-op 只 READ ledger 拒 EC/recovery/delete,彼此不拒)。已有的 streams/<id>
+  membership CAS 救不了——两个 op 经**不同 stream**碰**同一 CoW-shared extent**(无 streams/<id> 冲突),共享的是 extents/<id> 写→后者 clobber 前者→丢一次 refs 更新。
+  **完整触发条件类**(都需 CoW-shared extent[prior split 致 refs≥2],两 op 经不同 stream/partition,无 ledger gate):
+   ① punch∥punch / punch∥truncate / truncate∥truncate(−1,−1)→丢 decrement→refs 偏高→orphan-leak=**已复现,空间泄漏(无数据丢失)**
+   ② **split∥punch/truncate(+1,−1):若 +1 丢→refs 偏低→过早 delete→数据丢失**(结构可达,未复现)
+   ③ **split∥split(+1,+1)丢一个→refs 偏低→过早 delete→数据丢失**(更罕见)
+   ④ merge∥{punch/split}(splice ±1)丢→泄漏或数据丢失
+  **跨分区是关键**:per-partition gc_gate/compact_gate 只串行化**同分区** split-vs-GC;CoW-shared extent 跨两分区(parent+child),
+  GC-punch(P1)∥GC-punch(P2)[已复现] 或 new-split(P1)∥GC-punch(P2)[数据丢失变体] **不串行**(不同分区/gate/stream)→manager 单线程 handler 在 await 处 stale-read 交错。
+  **已保护**:任何含 ConvertToEc/Recovery/Delete 的 pair(PS-op `extent_inflight_op` 拒 Precondition);eversion verify-at-apply(F146)对 snapshot-then-await
+  handler 有效,但 punch/truncate 无 extents/<id> verify(=deferred gap),且两并发 punch 都 bump eversion 到同 N+1,eversion 检查也分不开→唯 extents/<id> CAS 稳。
+  **严重度升级**:复现实例是良性空间泄漏,但**同根因有数据丢失变体**(split 丢 refs increment→过早 delete→CoW child 丢数据)→修复更值得做(关的不只泄漏)。
+  **修复**:给所有 PS-op 的 extents/<id> 写(punch/truncate refs 减、split refs 加+tail seal、merge refs splice)加 value-CAS baseline,败者 Precondition→fresh-read
+  重试重算。=note33 文档化方案扩到 refs 路径(原 note33 只列 eversion/replicates/avali,refs 是同类)。已上浮用户系统分析 + 升级后的修复建议。
 R55 enrichment+2-random:**ps_kill_migrates_partitions PASS**(ps_failover 第 2 场景,至此 2 个 ps_failover 场景全验)+ seed=840559175(45s)PASS
   all invariants OK(acked=11699 fail=37,reads=20825 miss=80,mismatch=0 not_found=0,5ext/8mem)+ seed=740230020(45s)PASS all invariants
   OK(acked=11562 fail=0,reads=21173 miss=0[干净],mismatch=0 not_found=0,3ext/3mem)。累积 system_chaos 全绿 17 distinct + 2 ps_failover 场景。
