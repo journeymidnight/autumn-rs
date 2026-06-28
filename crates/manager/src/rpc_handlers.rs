@@ -2679,7 +2679,28 @@ impl AutumnManager {
                         format!("partitionLastOp/{}", right.part_id),
                         now.to_le_bytes().to_vec(),
                     ));
-                    etcd.put_msgs_txn(kvs)
+                    // Value-CAS each modified extent against its pre-split value.
+                    // Split increments refs on CoW-shared extents (and seals the
+                    // source tail); compute_duplicate_stream reads `state` and
+                    // returns clones, so the in-memory store still holds the
+                    // pre-mutation value here = the etcd baseline. Without this,
+                    // a concurrent cross-partition punch/truncate on a CoW-shared
+                    // extent could lose the refs increment -> refs too low ->
+                    // premature delete -> data loss. (Split creates NEW streams,
+                    // so no streams/<id> CAS is needed; the extents/<id> CAS is
+                    // the missing guard.) Same class as compute_extent_ref_drops.
+                    let extent_cas: Vec<(String, Vec<u8>)> = {
+                        let s = self.store.inner.borrow();
+                        modified_extents
+                            .iter()
+                            .filter_map(|ex| {
+                                s.extents.get(&ex.extent_id).map(|orig| {
+                                    (format!("extents/{}", ex.extent_id), rkyv_encode(orig).to_vec())
+                                })
+                            })
+                            .collect()
+                    };
+                    etcd.put_delete_txn_cas(kvs, Vec::new(), extent_cas)
                         .await
                         .map_err(|e| Self::err_to_status(&e))?;
                 }
@@ -3069,7 +3090,26 @@ impl AutumnManager {
             // committed on a survivor stream during this RTT makes the merge
             // fail+retry (CODE_PRECONDITION) instead of overwriting it with the
             // stale spliced membership (resurrecting a removed extent).
-            etcd.put_delete_txn_cas(kvs, deletes, p1.survivor_stream_baselines.clone())
+            let mut cas = p1.survivor_stream_baselines.clone();
+            // Also value-CAS each modified extent against its pre-splice value.
+            // The compute helpers (seal_survivor_old_tail / splice_victim_extents)
+            // read `state` and return clones, so the in-memory store still holds
+            // the pre-mutation value here — that's the etcd baseline. Without
+            // this, a concurrent punch/truncate/split on a CoW-shared extent
+            // (refs-spliced here) could lose an update (orphan-leak, or refs
+            // too low -> premature delete). Same class as compute_extent_ref_drops.
+            {
+                let s = self.store.inner.borrow();
+                for ex in &modified_extents {
+                    if let Some(orig) = s.extents.get(&ex.extent_id) {
+                        cas.push((
+                            format!("extents/{}", ex.extent_id),
+                            rkyv_encode(orig).to_vec(),
+                        ));
+                    }
+                }
+            }
+            etcd.put_delete_txn_cas(kvs, deletes, cas)
                 .await
                 .map_err(|e| Self::err_to_status(&e))?;
         }
