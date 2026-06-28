@@ -1224,5 +1224,24 @@ TASK② DELIVERED(python/autumn_dashboard.py + test + DASHBOARD.md):
   · **架构=纯逻辑(parse/decide/render)与 I/O(shell-out)分离 → 可无 cluster 单测**。**14 个单测全过**(candidate→cmd 映射含 EC-extent-in-secondary
     / decide 优先级+cooldown+cap / dry-run vs apply / refusal 非致命 / gather / render)。CLI smoke 过(--help / 示例 render / 缺 binary 优雅降级)。
   验证:python3 test_autumn_dashboard.py = 14/14;无 Rust 改动(纯新增 python 文件)。**待真 cluster e2e**(cluster.sh 起集群后 dashboard/control 对接)。
-TASK① coco arch-review:后台跑中(GPT-5.5 arch 模式,聚焦数据损坏/崩溃一致性:commit/seal、fencing、CoW split/merge survivor reopen+part_addr、
-  GC relocate-then-punch、recovery/EC crash 窗、fsync coalescer、inode-lease)。结果待出→triage findings(reproduce-first,coco 可能窄/trick 需甄别)。
+TASK① coco arch-review DONE + TRIAGED(GPT-5.5 arch,8 findings:3 P0/2 P1/2 P2/1 P3)。**结论:无 NEW reproduce-first-actionable 数据损坏 bug;
+  全部映射到 not-reachable / 跨层-fence-coco-看漏 / 已知-deferred-reproduce-first-gated / designed-crash-window / 架构选择。** 逐条 triage(已核代码):
+  · **#1 P0 region_epoch=0 skip-check bypass**:**不可达 production**——data 路径 cache miss 经 resolve_key→refresh_regions 先刷新,合法 cached
+    region epoch≥1(manager bootstrap=1);0 仅 test/bench sentinel。coco 没追到 resolver refresh-on-miss 在 epoch stamp 前。不修(无可复现 harm)。
+  · **#2 P0 PS reassignment 不 bump region_epoch→双写**:**被 owner_epoch 防住**——PS2 open_partition 调 acquire_partition_owner_epoch
+    ("partition/{pid}",lib.rs:3417)bump owner_epoch;PS1 append 撞 EN `owner_epoch<owner_epoch→CODE_LOCKED_BY_OTHER`(extent_node:2197)
+    自我驱逐。coco 把 region_epoch(路由新鲜度)与 ownership(owner_epoch)混淆,孤立看 region_epoch 漏了 stream 层 fence。双写到不了存储。
+  · **#3 P0 inode heartbeat etcd persist 失败仍返 OK→failover 双 writer**:**真但窄窗=显式 deferred 的 lease-preemption 边界**(note34 L18/
+    F-lease-preempt)。新 leader clamp 到 persisted deadline + BUG-LEASE-2 fence_floors(新 writer 首写 bump floor→旧 writer stale-epoch 写被拒)
+    兜底;残留=旧写抢在新 writer 首次 fence-bump 前的子窗。fail-close heartbeat 非干净修(Ok(false)=良性 CAS 冲突;Err 转 fail 会 spurious halt)。reproduce-first 门控。
+  · **#4 P1 alloc/seal 只 CAS streams/<id> 不 CAS extents/<tail>**:**正是 manager note33 文档化的 DEFERRED follow-up**(2026-05-31 reproduce-first
+    查证 near-precluded,"apply ONLY if reproduced")。coco 重新发现已知-deferred。
+  · **#5 P1 flush publish 早于 durable checkpoint**:**designed crash 窗**(PS checkpoint-publication-invariant)——崩溃→recovery 从上个 checkpoint
+    + WAL replay 重建;orphan SST 无害;save 失败下个成功 checkpoint 自愈。
+  · **#6 P2 append 无 server-side 幂等(producer seq)**:**架构选择**——partition 层 MVCC seq 去重 + 系统显式接受 at-least-once 不确定写
+    (feedback_chaos_timeout_uncertain)。不同架构非 bug。
+  · **#7 P2 split freeze 多 await 近超时可超 freeze 窗**:**被 F255 invariant 8 bound**(send 5s+ack 10s 计时器 <FREEZE_TTL 30s)。coco 引的 20s/27s 可能旧注释。
+  · **#8 P3 part_addrs stale**:**可用性问题非 correctness**(F265 self-heal;correctness 靠 owner_epoch/region_epoch fence)。coco 自己也承认仅与 #1#2 叠加才危险(而 #1#2 已防住)。
+  **coco 正向确认**(.meta 原子写 / append fsync coalescer / owner_epoch durable-before-ACK / lease fence WAL / GC-VP-identity / EC marker 原子)= 与既知一致。
+  **价值:外部 arch 审计独立确认"已知 residual frontier=fencing 语义 + 2 个 deferred(#3 lease-preempt / #4 extent-CAS)",零 new 惊喜=成熟度强信号。** 按纪律不做 speculative 防御修复
+  (每个"修"都拿罕见/不可达窗换真复杂度或 spurious 行为);#3/#4 已 reproduce-first 门控的 deferred。无 code 改动。
