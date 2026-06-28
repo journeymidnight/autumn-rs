@@ -1207,3 +1207,22 @@ R58 SOAK(短 fuzz 饱和后 pivot 到 5min soak 求 cumulative/leak 覆盖,TIME-
   **结论:in-process loopback+toxiproxy harness 结构性撑不住干净 300s soak;真 soak 需 cluster.sh 多主机(无 loopback 端口天花板)或
   cap DURATION≤90-120s(但 90-120s 又很少触发 merge)。11 轮 45s short-fuzz(在端口天花板下,全 mismatch=0)覆盖仍有效且是 in-process 的上限。**
   **回归 45s short-fuzz 模式(clean、有效);soak 留给真 cluster。上浮用户告知发现 + 选项。**
+
+════════════════════════════════════════════════════════════════════════════════
+用户新方向(2 件):① coco arch-review 找 latent bug;② Python dashboard + 自动 policy controller(显示集群状态/每分区 IOPS/吞吐/容量 + 自动跑 ec/split/merge)。
+TASK② DELIVERED(python/autumn_dashboard.py + test + DASHBOARD.md):
+  设计:沿用 node_policy.py 的"shell out 到 autumn-op --json"模式(wire 定义单一真源 manager_rpc.rs;Python 不重实现 rkyv)。纯 stdlib 无 pip。
+  **是 F203 设计的 external policy loop**(manager 纯 mechanism 只 emit advisory;controller 外部 decide+actuate)。
+  · **dashboard 模式**:live 刷新——cluster 容量(autumn-op df:raw/free/physical/logical/amp + per-node)+ 节点健康 + per-partition 表
+    (autumn-op info --part P --detail:req_per_sec=IOPS/p99_us/size/gc_debt/pending_compaction/inflight,按 IOPS 排序最热在前)+ policy advisories
+    (autumn-op policy-candidates)。--once / --no-detail。
+  · **control 模式(auto-policy)**:轮询 policy-candidates,按 kind actuate——split→split P / merge→merge S V / ec→force-ec-convert --extent
+    (EC candidate 的 extent 在 secondary_part_id,primary=0,已验 policy.rs)/ gc→gc P / major|minor→compact P / hotcold=advisory-only。
+    **安全**:默认 dry-run(--apply 才真动)、--enable 白名单、--max-actions/tick 限速、per-(kind,target) cooldown(默认 300s)、优先级
+    split→gc→minor→major→ec→merge(auto-split-before-merge:split 是 relief valve,merge 集中负载放最后)、manager 拒绝=inflight 良性下轮重试
+    (controller 无自有编排态;依赖 manager 自身 crash-safe+幂等 F149/F207/F185)。
+  · **架构=纯逻辑(parse/decide/render)与 I/O(shell-out)分离 → 可无 cluster 单测**。**14 个单测全过**(candidate→cmd 映射含 EC-extent-in-secondary
+    / decide 优先级+cooldown+cap / dry-run vs apply / refusal 非致命 / gather / render)。CLI smoke 过(--help / 示例 render / 缺 binary 优雅降级)。
+  验证:python3 test_autumn_dashboard.py = 14/14;无 Rust 改动(纯新增 python 文件)。**待真 cluster e2e**(cluster.sh 起集群后 dashboard/control 对接)。
+TASK① coco arch-review:后台跑中(GPT-5.5 arch 模式,聚焦数据损坏/崩溃一致性:commit/seal、fencing、CoW split/merge survivor reopen+part_addr、
+  GC relocate-then-punch、recovery/EC crash 窗、fsync coalescer、inode-lease)。结果待出→triage findings(reproduce-first,coco 可能窄/trick 需甄别)。
