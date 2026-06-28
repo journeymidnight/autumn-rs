@@ -1425,3 +1425,7 @@ PIVOT TICK: coco arch 审 STREAM 层(client.rs/extent_node.rs commit/seal/owner_
   · **F4(P1).ec.commit marker 无 magic/CRC(read_ec_commit_marker 任意 16B 当 Valid)= REAL gap(代码证实)**:同 META-FAILCLOSED/EC-COMMIT-ATOMIC 的 fail-open→fail-closed 主题(.meta 有 magic+CRC,marker 没);最 tractable(加 magic+eid+CRC,Corrupt→quarantine);reproduce-first-compatible;migration bounded(marker transient)。
   **结论:无 NEW reproducible bug(2 not-bug + 2 EC-crash-window reproduce-first-gated frontier,已在 prod-readiness 已知列表)= 成熟度信号(同前 manager-arch review)。**
   **纪律:未 autonomous 修——F3/F4 在 revert-prone EC commit/fence 区(note24 coalescer/Items 2/4 多次 revert 教训)+ prod-readiness 明确 reproduce-first-gate。上浮用户,F4(marker CRC)荐为最低风险 reproduce-first 候选(若用户 greenlight EC-area 修)。** memory [[project_coco_arch_streamlayer_triage]] 已存。
+
+REGRESSION TICK(用户 re-fire 未 greenlight F4→honor cadence,不 autonomous 动 EC):2 随机 seed system_chaos 全 PASS——
+  1012847626(acked=11110 clean,accounting=0,mismatch=0)+ 808849969(acked=13386 fail=699,accounting=0,mismatch=0,not_found=0)。无 rust code 改动→纯 regression。
+  **F4(EC marker magic/CRC)仍待用户 greenlight(我已明确"说 do F4 才做",尊重之);runway 穷尽,等用户决策 EC 硬化或新方向。**
