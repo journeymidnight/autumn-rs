@@ -227,6 +227,17 @@ pub(crate) fn global_block_cache() -> &'static std::sync::Arc<crate::sstable::Bl
     })
 }
 
+/// Clear the process-global SST block cache. Diagnostic / test-harness use
+/// only: the cache keys on `(extent_id, offset)` and assumes extent ids are
+/// globally unique within the process (true for one production cluster). A
+/// test harness that spins up multiple independent clusters in one process
+/// reuses low extent ids, so it must clear the cache between clusters or a
+/// prior cluster's block can be served for this cluster's same-id extent
+/// (surfacing as `stale_vp_offset_past_sealed_length`).
+pub fn clear_global_block_cache() {
+    global_block_cache().clear();
+}
+
 pub(crate) fn ps_inflight_cap() -> usize {
     *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
 }

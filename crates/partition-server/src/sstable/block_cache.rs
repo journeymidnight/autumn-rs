@@ -125,6 +125,18 @@ impl BlockCache {
         }
     }
 
+    /// Drop ALL cached blocks. The cache is keyed by `(extent_id, offset)` and
+    /// relies on extent ids being globally unique within a process (true for a
+    /// production cluster). A test harness that runs multiple independent
+    /// clusters in one process reuses low extent ids, so a fresh cluster must
+    /// start from an empty cache or it can be served a prior cluster's block
+    /// for the same `(extent_id, offset)`. Diagnostic / test use only.
+    pub fn clear(&self) {
+        let mut g = self.inner.lock();
+        g.map.clear();
+        g.bytes = 0;
+    }
+
     pub fn stats(&self) -> (usize, usize, u64, u64) {
         let g = self.inner.lock();
         (g.bytes, g.map.len(), g.hits, g.misses)
