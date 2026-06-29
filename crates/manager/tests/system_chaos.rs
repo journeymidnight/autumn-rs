@@ -177,10 +177,6 @@ impl Lcg {
             .wrapping_add(1442695040888963407);
         self.state
     }
-    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
-        let i = (self.next() as usize) % xs.len();
-        xs[i]
-    }
     fn range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next() % (hi - lo)
     }
@@ -1182,12 +1178,29 @@ async fn nemesis_loop(
     actions: Vec<Action>,
     mut lcg: Lcg,
 ) {
+    // Shuffled round-robin over the FULL action set (not a per-interval random
+    // pick): every action is ATTEMPTED at least once per cycle (cycle length =
+    // actions.len()), in per-seed-deterministic shuffled order. This guarantees
+    // a single run can't miss any of split / merge / ec / gc / kill / fence
+    // (user rule: every chaos run exercises the full set), while preserving
+    // random ordering across cycles. (Completion still depends on cluster state
+    // — e.g. merge needs ≥2 adjacent partitions with no in-flight recovery — but
+    // the path is always attempted.) Refill + reshuffle when the cycle drains.
+    let mut pending: Vec<Action> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         compio::time::sleep(Duration::from_millis(interval_ms)).await;
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let action = lcg.pick(&actions);
+        if pending.is_empty() {
+            pending = actions.clone();
+            // Fisher-Yates with the LCG keeps per-seed determinism.
+            for i in (1..pending.len()).rev() {
+                let j = (lcg.next() as usize) % (i + 1);
+                pending.swap(i, j);
+            }
+        }
+        let action = pending.pop().expect("pending refilled when empty");
         // Bound every nemesis action: split/merge/EC orchestration RPCs are
         // unbounded, so if a PS partition is wedged (e.g. stuck on an F227
         // all-replica op after a node kill+restart whose behind replica was
