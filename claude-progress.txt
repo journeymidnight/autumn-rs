@@ -78,7 +78,12 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     验证:e2e churned index reconcile clean+no-op repair + 专测注入伪 stats(确定性非 flaky 竞态)→reconcile 检出+repair 治愈。
     两 e2e 全绿 + 单测 20/20。
 
+  · F-MEM-10 TTL-nemesis index-reconcile(e2e,本会话):plan §16 验收。TTL 过期删 doc/posting/vector/vptr 但不减 stats
+    →BM25 stats 漂移(autumn-memory 特有;split/compaction 对纯 KV 的存活由分区层 range-scan chaos 已覆盖全客户端)。
+    e2e:3 永久+2 短TTL(1 带向量),过期后 reconcile 检出漂移(recount 3 vs stats 5)且向量腿一致(posting+vptr 原子过期
+    →0 orphan/dangling/dup/malformed),repair 治愈,search 只返存活。加 ScoredDoc: Debug。3/3 e2e 绿。
+
 Next steps:
   1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
   2. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。
-  3. 可选:reconcile/repair 暴露到 PyO3(Python ops cron);CJK bigram 精度;split/compaction nemesis 下的 index-reconcile。
+  3. 可选:reconcile/repair 暴露到 PyO3(Python ops cron);CJK bigram 精度。

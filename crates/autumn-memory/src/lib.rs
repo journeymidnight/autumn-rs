@@ -270,6 +270,7 @@ impl MemoryStore {
 }
 
 /// A scored hit from a lexical/vector memory search.
+#[derive(Debug, Clone)]
 pub struct ScoredDoc {
     pub id: String,
     pub text: String,

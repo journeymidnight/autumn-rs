@@ -202,3 +202,79 @@ fn e2e_reconcile_repairs_stats_drift() {
             println!("autumn-memory e2e: reconcile detect+repair OK (agent={agent})");
         });
 }
+
+/// TTL nemesis (plan §16): a memory's TTL expiry removes its doc + postings +
+/// vector + vptr, but NOTHING decrements `meta/stats` on expiry — so the BM25
+/// corpus stats drift. `reconcile` must DETECT that drift (recount < stats)
+/// while the vector legs stay consistent (posting + vptr expire together), and
+/// `repair_stats` must heal it. (Split / compaction survival of these plain KV
+/// keys is covered by the partition layer's own range-scan chaos tests for all
+/// clients — autumn-memory keys are not special there — so this nemesis focuses
+/// on the autumn-memory-specific TTL-drift case.)
+#[test]
+#[ignore = "needs a live autumn cluster (set AUTUMN_MEMORY_E2E_MANAGER); ~7s (TTL wait)"]
+fn e2e_reconcile_heals_ttl_drift() {
+    use std::time::Duration;
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async {
+            let agent = unique_agent();
+            let mem = MemoryStore::connect(&manager_addr(), "__am_e2e", agent.as_str())
+                .await
+                .expect("connect");
+
+            // 3 permanent docs + 2 short-TTL docs (one with a vector).
+            for id in ["p1", "p2", "p3"] {
+                mem.index_memory(id, "permanent gravity fact", b"", None)
+                    .await
+                    .expect("index permanent");
+            }
+            mem.index_memory("e1", "ephemeral lunar note", b"", Some(3))
+                .await
+                .expect("index e1");
+            mem.index_vector("e1", &[1.0, 0.0, 0.0], Some(3)).await.expect("vec e1");
+            mem.index_memory("e2", "ephemeral solar note", b"", Some(3))
+                .await
+                .expect("index e2");
+
+            let r0 = mem.reconcile().await.expect("reconcile pre");
+            assert_eq!(r0.docs, 5, "5 docs before expiry: {r0:?}");
+            assert!(r0.stats_consistent(), "consistent before expiry: {r0:?}");
+            // e1's vector was actually written (guards against a false-positive
+            // where the vector never landed).
+            assert_eq!(r0.ivf_postings, 1, "e1 vector present before expiry: {r0:?}");
+            assert_eq!(r0.vptrs, 1, "e1 vptr present before expiry: {r0:?}");
+
+            // wait out the TTL (server enforces expiry on read).
+            std::thread::sleep(Duration::from_secs(6));
+
+            let r1 = mem.reconcile().await.expect("reconcile post");
+            assert_eq!(r1.docs, 3, "expired e1,e2 gone from recount: {r1:?}");
+            assert_eq!(r1.stats_docs, 5, "stats still count the expired docs: {r1:?}");
+            assert!(!r1.stats_consistent(), "TTL expiry drifted stats: {r1:?}");
+            // the vector leg expired ATOMICALLY with its doc: the posting AND the
+            // vptr are gone (not merely structurally consistent — that would also
+            // hold if neither expired), so no orphan/dangling either.
+            assert_eq!(r1.ivf_postings, 0, "e1 vector posting expired: {r1:?}");
+            assert_eq!(r1.vptrs, 0, "e1 vptr expired: {r1:?}");
+            assert_eq!(r1.orphan_ivf, 0, "{r1:?}");
+            assert_eq!(r1.dangling_vptr, 0, "{r1:?}");
+            assert_eq!(r1.duplicate_ivf, 0, "{r1:?}");
+            assert_eq!(r1.malformed_vptr, 0, "{r1:?}");
+
+            // repair heals the drift.
+            assert_eq!(mem.repair_stats().await.expect("repair").0, 3);
+            assert!(mem.reconcile().await.expect("reconcile healed").is_clean(), "clean after repair");
+
+            // search still serves the survivors, not the expired entries.
+            let hits = mem.search_lexical("gravity", 10).await.expect("search");
+            assert!(hits.iter().any(|h| h.id == "p1"), "permanent docs still found: {hits:?}");
+            let gone = mem.search_lexical("lunar", 10).await.expect("search expired");
+            assert!(!gone.iter().any(|h| h.id == "e1"), "expired doc not found: {gone:?}");
+
+            for id in ["p1", "p2", "p3"] {
+                let _ = mem.delete_memory(id).await;
+            }
+            println!("autumn-memory e2e: reconcile heals TTL drift OK (agent={agent})");
+        });
+}
