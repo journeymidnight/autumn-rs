@@ -117,7 +117,10 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // single-alloc perf change — added `Frame::encode_response_with` (an
     // additive encoder producing byte-identical frames, no wire-layout change);
     // v8 not yet deployed.)
-    (8, "738fb894e793877e"),
+    // (Fingerprint updated again within v8 by the io_uring-daemon removal —
+    // a comment edit in `manager_rpc.rs` only, no wire-layout change; v8 not
+    // yet deployed, so updated in place rather than bumped.)
+    (8, "ba19149e1ed99c41"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
