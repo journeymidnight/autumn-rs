@@ -182,8 +182,10 @@ def main(argv: Optional[list] = None) -> None:
 
     MCP hosts launch servers as child processes, typically passing config via
     the `env` block of their server config, so env vars are the primary source;
-    CLI flags override. Lexical search needs no embedder; the default server
-    therefore runs with no external embeddings endpoint.
+    CLI flags override. Lexical (BM25) search needs no embedder, so the default
+    server runs with no external endpoint. Set --embed-url + --embed-model (or
+    AUTUMN_MEMORY_EMBED_URL / _MODEL) to enable the vector/hybrid legs against an
+    OpenAI-compatible /embeddings endpoint (sglang / vLLM / OpenAI).
     """
     import argparse
 
@@ -194,18 +196,46 @@ def main(argv: Optional[list] = None) -> None:
     p.add_argument("--transport", default=os.environ.get("AUTUMN_MEMORY_TRANSPORT") or None)
     p.add_argument("--default-ttl", type=int, default=int(os.environ.get("AUTUMN_MEMORY_TTL", "0")))
     p.add_argument("--name", default=os.environ.get("AUTUMN_MEMORY_NAME", "autumn-memory"))
+    p.add_argument("--embed-url", default=os.environ.get("AUTUMN_MEMORY_EMBED_URL") or None)
+    p.add_argument("--embed-model", default=os.environ.get("AUTUMN_MEMORY_EMBED_MODEL") or None)
+    # search mode: 'auto' = hybrid iff an embedder is configured, else lexical.
+    # Forcing 'lexical' keeps `search` available even if the embedding endpoint
+    # is down (hybrid/vector make every query depend on that endpoint).
+    p.add_argument(
+        "--default-mode",
+        choices=("auto", "lexical", "hybrid", "vector"),
+        default=os.environ.get("AUTUMN_MEMORY_DEFAULT_MODE", "auto"),
+    )
     args = p.parse_args(argv)
+
+    # fail fast on a half-configured embedder rather than silently degrading to
+    # lexical (a misconfig that's hard to notice — search quality just looks off)
+    if bool(args.embed_url) != bool(args.embed_model):
+        p.error("--embed-url and --embed-model must be set together (or via AUTUMN_MEMORY_EMBED_URL/_MODEL)")
+
+    has_embed = bool(args.embed_url and args.embed_model)
+    mode = args.default_mode
+    if mode == "auto":
+        mode = "hybrid" if has_embed else "lexical"
+    # validate config BEFORE connecting (AutumnMemory connects on construct)
+    if mode in ("hybrid", "vector") and not has_embed:
+        p.error(f"--default-mode {mode} requires an embedder (set --embed-url/--embed-model)")
+
+    embed = None
+    if has_embed:
+        from autumn_memory import http_embedder
+
+        embed = http_embedder(args.embed_url, args.embed_model)
 
     mem = AutumnMemory(
         args.manager,
         args.tenant,
         args.agent,
+        embed=embed,
         default_ttl=args.default_ttl,
         transport=args.transport,
     )
-    # lexical-only by default (no embedder wired here); a richer entry point can
-    # construct AutumnMemory(embed=...) and call build_server itself.
-    server = build_server(mem, name=args.name, default_mode="lexical")
+    server = build_server(mem, name=args.name, default_mode=mode)
     server.run()  # stdio transport
 
 

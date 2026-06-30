@@ -304,9 +304,17 @@ bash python/autumn_memory_mcp/tests/run_mcp_test.sh
 bash python/autumn_memory_langgraph/tests/run_store_test.sh
 #   → "LANGGRAPH STORE OK: BaseStore surface ..." and "===== lg-store-test exit: 0 ====="
 
+# Embedder client (OpenAI-compatible /embeddings; mock server, no cluster needed):
+bash python/autumn_memory/tests/run_embedder_test.sh
+#   → "EMBEDDER OK: ..." and "===== embedder-test exit: 0 ====="
+
 # Launch the stdio server for a real host (config via env or CLI flags):
 AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
   python -m autumn_memory_mcp             # or the `autumn-memory-mcp` console script
+# Enable semantic (vector/hybrid) search by pointing at an OpenAI-compatible
+# /embeddings endpoint (sglang / vLLM / OpenAI):
+#   AUTUMN_MEMORY_EMBED_URL=http://127.0.0.1:30000/v1 \
+#   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
 ## CLI cheatsheet

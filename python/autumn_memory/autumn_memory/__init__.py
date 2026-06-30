@@ -21,7 +21,9 @@ from typing import Any, Callable, Optional
 
 import autumn  # the PyO3 binding — provides `autumn.Memory`
 
-__all__ = ["AutumnMemory"]
+from .embedder import http_embed_many, http_embedder
+
+__all__ = ["AutumnMemory", "http_embedder", "http_embed_many"]
 
 Embedder = Callable[[str], "list[float]"]
 
@@ -89,11 +91,19 @@ class AutumnMemory:
 
     def remember(self, doc_id: str, text: str, meta: Any = None, ttl: Optional[int] = None) -> None:
         """Index a searchable memory: BM25 always; also the vector leg iff an
-        embedder is configured."""
+        embedder is configured.
+
+        The embedding (which may hit a remote endpoint and fail) is computed
+        BEFORE any KV write, so an embedder failure leaves nothing persisted —
+        no doc/BM25 record without the caller knowing the write didn't happen.
+        """
         meta_b = b"" if meta is None else json.dumps(meta).encode("utf-8")
-        self._m.index_memory(doc_id, text, meta_b, ttl)
+        vec = None
         if self._embed is not None:
-            self._m.index_vector(doc_id, [float(x) for x in self._embed(text)], ttl)
+            vec = [float(x) for x in self._embed(text)]
+        self._m.index_memory(doc_id, text, meta_b, ttl)
+        if vec is not None:
+            self._m.index_vector(doc_id, vec, ttl)
 
     def get(self, doc_id: str):
         """Fetch one indexed memory by id → ``{"id", "text", "meta"}`` or
