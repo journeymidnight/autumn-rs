@@ -244,6 +244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-memory"
+version = "0.1.0"
+dependencies = [
+ "autumn-client",
+ "bytes",
+ "compio",
+]
+
+[[package]]
 name = "autumn-partition-server"
 version = "0.1.0"
 dependencies = [

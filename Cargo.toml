@@ -11,6 +11,7 @@ members = [
   "crates/transport",
   "crates/transport/ucx-sys-mini",
   "crates/fuse",
+  "crates/autumn-memory",
   "examples/gallery",
 ]
 default-members = [
@@ -23,6 +24,7 @@ default-members = [
   "crates/server",
   "crates/client",
   "crates/fuse",
+  "crates/autumn-memory",
 ]
 exclude = ["python"]
 resolver = "2"

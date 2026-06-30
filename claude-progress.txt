@@ -1,6 +1,28 @@
 Date: 2026-06-30
 TaskStatus: completed
-Task scope: (progress log cleared — clean slate; prior history in git)
-Current summary: -
-Main gaps: -
-Next steps: -
+Task scope: 实现 autumn-memory Phase 1(AI agent memory 后端,docs/autumn_memory_plan.md)。
+  核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。
+
+Current summary (Phase 1 完成,e2e 绿):
+  · crates/autumn-memory(over autumn-client::ClusterClient,!Send/compio)。值=opaque bytes。
+  · keys.rs:mem/ 命名空间(plan §6)+ episodic/fact/shared + doc/idx/stats(BM25) + ivf/ivf_meta(IVF)。percent-encode 防前缀伪造。
+  · MemoryStore:
+    - episodic:append_event/recent_events(newest-first)/replay_session(chronological)。
+    - fact(LangGraph BaseStore):put/get/delete/list_facts + 每-key TTL。
+    - BM25-on-KV 词法腿:idx/{term}/{doc}=空值 posting(keys-only 发现),doc/{id}=权威 IndexedDoc(commit point 自校验),
+      meta/stats 单写者,Okapi BM25。index_memory/delete_memory/search_lexical。
+    - SPFresh-IVF-on-KV 向量腿:ivf/{centroid:4BE}/{vec}=归一化向量,ivf_meta/centroids manifest,k-means(确定性),
+      冷启落桶0+暴力兜底。index_vector/train_centroids(写新桶删旧桶)/search_vector(probe+cosine rerank)。
+      关键:cosine 检索必须归一化向量。
+    - hybrid:search_hybrid(BM25+IVF 两腿,RRF k=60 融合)。
+  · 18/18 纯单测绿。e2e(tests/e2e.rs #[ignore])= episodic→fact→BM25→IVF→hybrid 全流程,
+    against 隔离最小集群(tests/run_e2e.sh:memory-only manager + 1 EN cpuset0 + 1 PS,loopback,免 etcd)= **绿**。
+  · 顺带修了 main 上的 wire-fingerprint 回归(52e895d,a8e12ee 改 manager_rpc.rs 注释引起)。
+
+Main gaps: 无(Phase 1 验收达成)。
+
+Next steps (Phase 2):
+  1. Python PyO3 binding over Rust MemoryStore(给 Hermes/LangGraph 适配用)。
+  2. Hermes MemoryProvider 适配器(plan §10/§13:initialize/sync_turn/prefetch + memory_search/store 工具)。
+  3. MCP server(通用触达)。
+  4. 检索增强:embedder 接 sglang、stemming/CJK 分词、stats delta-log(多写者)、孤儿 posting reconcile。

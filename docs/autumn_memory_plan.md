@@ -42,6 +42,8 @@
 
 ## 3. 架构:纯客户端库 + 可选无状态 gateway
 
+**实现语言(2026-06-30 用户定):核心 = Rust crate `crates/autumn-memory`**(直接基于 `autumn-client::ClusterClient`),框架适配器(Hermes/LangGraph/Mem0)= **薄 Python**,经 PyO3 binding over Rust core 调用。核心逻辑(key schema、召回 BM25/IVF 打分)在 Rust 里可复用且快;Python 仅绑定层。
+
 ```
 ┌─ 多个 agent(同一 sglang 之上)─────────────────────────────┐
 │  agent 进程 = 框架 + 内嵌适配器(薄)                          │
@@ -280,10 +282,10 @@ turbopuffer/Qdrant/sqlite-vec 全不自带 embedding(都「自带向量」)。�
 - **可信单组织**:可跳过,先用前缀约定起 Phase 1。
 - **多客户/多租户 SaaS**:**必须先做**——否则只是「组织」非「隔离」,不可对外宣称多租户。属 [[project_production_readiness_audit]]「鉴权/TLS+授权」。
 
-**Phase 1(MVP,单 feature)**:框架无关 `autumn-memory` 核心库
-- 情景日志读写(append + 前缀扫回放)+ 事实 KV(point-get + 前缀 list + TTL)
-- 召回 **单腿起步**:纯词法(sidecar FTS5,零 embedder)**或** 纯向量(暴力 ≤10^5,sglang embedder)
-- 验收:单 agent 写入→回放→事实读写→单腿召回 e2e 绿
+**Phase 1(MVP,单 feature)**:框架无关 `autumn-memory` 核心库 = **Rust crate `crates/autumn-memory`**(over ClusterClient)
+- ✅ 情景日志读写(append + 前缀扫回放,newest-first key)+ 事实 KV(point-get + 前缀 list + TTL,LangGraph BaseStore 模型)+ key schema(percent-encode,prefix 隔离)+ 5/5 纯单测绿
+- ⏳ 召回 **单腿起步**:纯词法(暴力,零 embedder)**或** 纯向量(暴力 ≤10^5,sglang embedder)— 下一迭代
+- ⏳ 验收:单 agent 写入→回放→事实读写→单腿召回 **e2e against live cluster 绿** — 下一迭代
 
 **Phase 2(验两端)**:
 - **Hermes MemoryProvider** 插件(initialize/sync_turn/prefetch)→ Hermes + vLLM/SGLang e2e(顺带 kvcache L3 闭环)

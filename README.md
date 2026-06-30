@@ -254,6 +254,30 @@ EN; after the manager flips it to `Suspected` (`autumn-op info` /
 extent has a replica on the dead node is served by a healthy replica instead of
 stalling for the per-RPC timeout on every read.
 
+## autumn-memory (AI agent memory backend)
+
+`crates/autumn-memory` is a pure client-side library (no daemon) that turns the
+cluster into an AI-agent-memory backend — episodic logs, fact KV (LangGraph
+`BaseStore` model), and posting-on-KV retrieval (BM25 lexical + SPFresh-IVF
+vector + hybrid RRF). Design: [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md);
+crate guide: [`crates/autumn-memory/CLAUDE.md`](crates/autumn-memory/CLAUDE.md).
+
+**Manual verification (Phase 1):**
+
+```bash
+cargo build --workspace                    # build the debug binaries first
+cargo test -p autumn-memory                # 18 pure unit tests (keys / BM25 / IVF / RRF)
+
+# Full e2e against an ISOLATED throwaway cluster (memory-only manager, 1 EN,
+# 1 PS, loopback, no etcd — does not touch any other cluster; tears down after):
+bash crates/autumn-memory/tests/run_e2e.sh
+#   → "===== e2e exit: 0 =====" and "test e2e_full_surface ... ok"
+
+# Or run the e2e against an already-running cluster:
+AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
+  cargo test -p autumn-memory --test e2e -- --ignored --nocapture
+```
+
 ## CLI cheatsheet
 
 ```bash
