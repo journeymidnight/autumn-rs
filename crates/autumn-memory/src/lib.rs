@@ -173,13 +173,19 @@ impl MemoryStore {
         Ok(out)
     }
 
-    /// Point-get each key, skipping any that vanished (deleted/expired) between
-    /// the scan and the get — near-real-time recall semantics (plan §8.5 #8).
+    /// Point-get each key (BATCHED), skipping any that vanished (deleted/expired)
+    /// between the scan and the get — near-real-time recall semantics (plan
+    /// §8.5 #8). `get_many` keeps input order, so episodic newest-first /
+    /// chronological ordering from the scan is preserved.
     async fn get_values(&self, key_list: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, AutumnError> {
+        if key_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key_refs: Vec<&[u8]> = key_list.iter().map(|k| k.as_slice()).collect();
         let mut out = Vec::with_capacity(key_list.len());
-        for k in key_list {
-            if let Some(v) = self.client.get(k).await? {
-                out.push(v);
+        for v in self.client.get_many(&key_refs).await {
+            if let Some(b) = v? {
+                out.push(b);
             }
         }
         Ok(out)
@@ -259,10 +265,12 @@ impl MemoryStore {
     ) -> Result<Vec<(String, Vec<u8>)>, AutumnError> {
         let prefix = keys::fact_prefix(&self.tenant, &self.agent, namespace);
         let key_list = self.scan_keys(&prefix, limit).await?;
+        let key_refs: Vec<&[u8]> = key_list.iter().map(|k| k.as_slice()).collect();
+        let vals = self.client.get_many(&key_refs).await; // batched (was serial)
         let mut out = Vec::with_capacity(key_list.len());
-        for k in &key_list {
-            if let Some(v) = self.client.get(k).await? {
-                out.push((keys::fact_key_name(k, &prefix), v));
+        for (k, v) in key_list.iter().zip(vals) {
+            if let Some(b) = v? {
+                out.push((keys::fact_key_name(k, &prefix), b));
             }
         }
         Ok(out)
@@ -410,35 +418,61 @@ impl MemoryStore {
             }
         }
 
-        // fetch each candidate doc; score with BM25 over its CURRENT term map
+        // Fetch + score candidate docs in BOUNDED CHUNKS. Batching the
+        // per-candidate gets fixes the recall P99 bottleneck (a common term has
+        // a long posting list → was hundreds of serial round-trips), but an
+        // UNBOUNDED `get_many` over EVERY candidate would pull all their bodies
+        // into one frame (OOM / frame-limit at scale, since BM25 has no early
+        // termination). So chunk: one `MSG_BATCH_GET` per RECALL_GET_CHUNK
+        // candidates, score the chunk, keep only a streaming top-k → memory +
+        // frame size stay bounded. Result i ⇔ chunk[i]; a per-key error still
+        // propagates (matches the old `?`).
+        const RECALL_GET_CHUNK: usize = 256;
+        let cand_list: Vec<(String, Vec<String>)> = cands.into_iter().collect();
+        let trim_at = top_k.saturating_mul(8).max(64);
+        let by_score =
+            |a: &ScoredDoc, b: &ScoredDoc| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal);
+
         let mut scored: Vec<ScoredDoc> = Vec::new();
-        for (doc_id, terms) in cands {
-            let dkey = keys::doc_key(&self.tenant, &self.agent, &doc_id);
-            let doc = match self.client.get(&dkey).await? {
-                Some(b) => match recall::IndexedDoc::decode(&b) {
-                    Some(d) => d,
-                    None => continue,
-                },
-                None => continue,
-            };
-            let mut score = 0.0f32;
-            for term in &terms {
-                if let Some(&tf) = doc.terms.get(term) {
-                    let dft = *df.get(term).unwrap_or(&1);
-                    score += recall::bm25_term(tf, dft, n_docs, doc.doc_len, avgdl);
+        for chunk in cand_list.chunks(RECALL_GET_CHUNK) {
+            let dkeys: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(doc_id, _)| keys::doc_key(&self.tenant, &self.agent, doc_id))
+                .collect();
+            let key_refs: Vec<&[u8]> = dkeys.iter().map(|k| k.as_slice()).collect();
+            let vals = self.client.get_many(&key_refs).await;
+            for ((doc_id, terms), val) in chunk.iter().zip(vals) {
+                let doc = match val? {
+                    Some(b) => match recall::IndexedDoc::decode(&b) {
+                        Some(d) => d,
+                        None => continue,
+                    },
+                    None => continue, // vanished between scan and get
+                };
+                let mut score = 0.0f32;
+                for term in terms {
+                    if let Some(&tf) = doc.terms.get(term) {
+                        let dft = *df.get(term).unwrap_or(&1);
+                        score += recall::bm25_term(tf, dft, n_docs, doc.doc_len, avgdl);
+                    }
+                }
+                if score > 0.0 {
+                    scored.push(ScoredDoc {
+                        id: doc_id.clone(),
+                        text: doc.text,
+                        meta: doc.meta,
+                        score,
+                    });
                 }
             }
-            if score > 0.0 {
-                scored.push(ScoredDoc {
-                    id: doc_id,
-                    text: doc.text,
-                    meta: doc.meta,
-                    score,
-                });
+            // keep only the best top_k seen so far (a streaming top-k is exact:
+            // a doc trimmed here ranked below the kept top_k and can't re-enter).
+            if scored.len() > trim_at {
+                scored.sort_by(by_score);
+                scored.truncate(top_k);
             }
         }
-        scored
-            .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(by_score);
         scored.truncate(top_k);
         Ok(scored)
     }

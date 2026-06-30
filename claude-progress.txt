@@ -101,6 +101,13 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
      + --is-embedding --mem-fraction-static 0.12;详见 memory project_sglang_embedder_recipe。后台进程会被 sandbox 杀(exit144)
      →一次前台 run 内起 sglang 子进程。
 
+  · F-MEM-12 recall P99 实测 + 批量取(本会话,plan §13):bench_recall.py/run_recall_bench.sh。bench 揭示 search_lexical
+     逐候选串行 get(常见词长 posting→数百串行 RTT)。修:search_lexical/get_values/list_facts 用 get_many 批取(保序);
+     coco P2:无界 batch 全候选→一帧装所有正文(规模 OOM/帧上限,BM25 无早停)→改 256 分块 + 流式 top-k(内存/帧有界)。
+     **release recall P99 ≈23.5ms** @2000 docs(debug 231ms 是构建开销,别引用 debug 性能)。loopback 收益小但跨主机=必需
+     (O(候选)串行 RTT→每分块一 batch)。coco P1 /tmp guard 加固 + P3 参数校验。3/3 e2e + 20/20 单测绿。
+
 所有门控+实质工作完成。剩余仅可选边际:
 Next steps:
-  1. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST);prefetch P99 实测(plan §13)。
+  1. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查 + 批量取;多词 query 的 per-term posting scan 并发;
+     无状态治理 gateway(REST)。
