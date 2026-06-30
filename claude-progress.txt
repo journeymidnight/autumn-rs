@@ -70,7 +70,15 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     定位回收;delete_memory 无条件调 delete_vector(可能只有向量没 BM25)。_resolve(F-MEM-3)仍是过期/在途竞态的兜底。
     验证:e2e(删 d1 后 search_vector 不再返 d1)exit 0 + 单测 vptr 不在 ivf/ 扫描区 20/20 绿。
 
+  · F-MEM-9 index reconcile/repair + 多写者 stats 定调(lib/keys/e2e,本会话):plan §16 验收工具=index-reconcile。
+    reproduce-first 定调多写者 stats RMW 竞态:真实但低危害(只歪 idf/avgdl 评分,不改命中哪些 doc——posting/doc 都按 doc
+    无跨doc竞态)+ 需非主流多进程同agent拓扑→拒绝热路径预防(per-writer shard/服务端原子)=热路径/服务端复杂度。
+    定调=热路径容忍 drift,离热路径 detect+repair。reconcile()只读审计(recount vs meta/stats;IVF posting↔vptr 交叉=
+    orphan_ivf/dangling_vptr;is_clean)+ repair_stats()按 recount 重写。新增 ivf_vptr_prefix/vec_id key helper。
+    验证:e2e churned index reconcile clean+no-op repair + 专测注入伪 stats(确定性非 flaky 竞态)→reconcile 检出+repair 治愈。
+    两 e2e 全绿 + 单测 20/20。
+
 Next steps:
   1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
-  2. 检索增强:stats delta-log(多写者并发安全);CJK bigram 精度细化(可选)。
-  3. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。
+  2. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。
+  3. 可选:reconcile/repair 暴露到 PyO3(Python ops cron);CJK bigram 精度;split/compaction nemesis 下的 index-reconcile。

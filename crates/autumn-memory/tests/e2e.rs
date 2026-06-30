@@ -135,6 +135,18 @@ fn e2e_full_surface() {
                 .expect("search after delete");
             assert!(!after.iter().any(|p| p.0 == "d1"), "d1 IVF posting reaped: {after:?}");
 
+            // ---- index-reconcile (plan §16 acceptance): after inserts, a
+            // delete (d1), and CJK docs, the index is internally consistent —
+            // stats match a full recount, and every IVF posting has a live
+            // reverse pointer (no orphan/dangling vectors).
+            let rep = mem.reconcile().await.expect("reconcile");
+            assert!(rep.is_clean(), "index reconcile clean: {rep:?}");
+            assert_eq!(rep.docs, 4, "live docs = d2,d3,zh1,zh2: {rep:?}");
+            assert_eq!(rep.ivf_postings, 2, "vectors d2,d3 (d1 reaped): {rep:?}");
+            // repair is a no-op on an already-consistent index
+            assert_eq!(mem.repair_stats().await.expect("repair"), (4, rep.sum_doc_len));
+            assert!(mem.reconcile().await.expect("reconcile2").is_clean());
+
             // ---- best-effort cleanup
             for id in ["d1", "d2", "d3", "zh1", "zh2"] {
                 let _ = mem.delete_memory(id).await;
@@ -142,5 +154,51 @@ fn e2e_full_surface() {
             mem.delete_fact("profile", "name").await.ok();
 
             println!("autumn-memory e2e: full surface OK (agent={agent})");
+        });
+}
+
+/// Reconcile DETECTS multi-writer `meta/stats` drift and `repair_stats` heals
+/// it. We inject the drift deterministically (clobber the stats key via the raw
+/// client) instead of racing two writers, so the test isn't flaky. This is the
+/// deliberate answer to the stats RMW race: tolerate it on the hot path, detect
+/// + repair off it (plan §16).
+#[test]
+#[ignore = "needs a live autumn cluster (set AUTUMN_MEMORY_E2E_MANAGER)"]
+fn e2e_reconcile_repairs_stats_drift() {
+    use autumn_client::ClusterClient;
+    use std::rc::Rc;
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async {
+            let agent = unique_agent();
+            let client = Rc::new(ClusterClient::connect(&manager_addr()).await.expect("connect"));
+            let mem = MemoryStore::with_client(client.clone(), "__am_e2e", agent.clone());
+
+            for (i, id) in ["a", "b", "c"].iter().enumerate() {
+                mem.index_memory(id, &format!("doc number {i} some content"), b"", None)
+                    .await
+                    .expect("index");
+            }
+            assert!(mem.reconcile().await.expect("rec").stats_consistent(), "consistent after writes");
+
+            // inject drift: claim 1 doc when there are 3 (a lost-update would
+            // look like this).
+            let skey = autumn_memory::keys::stats_key("__am_e2e", &agent);
+            let mut bogus = [0u8; 16];
+            bogus[..8].copy_from_slice(&1u64.to_le_bytes());
+            client.put(&skey, &bogus).await.expect("inject drift");
+
+            let drift = mem.reconcile().await.expect("rec drift");
+            assert!(!drift.stats_consistent(), "drift detected: {drift:?}");
+            assert_eq!(drift.docs, 3, "recount sees all 3: {drift:?}");
+            assert_eq!(drift.stats_docs, 1, "stored stat is the bogus 1: {drift:?}");
+
+            assert_eq!(mem.repair_stats().await.expect("repair").0, 3, "repaired to 3");
+            assert!(mem.reconcile().await.expect("rec healed").is_clean(), "clean after repair");
+
+            for id in ["a", "b", "c"] {
+                let _ = mem.delete_memory(id).await;
+            }
+            println!("autumn-memory e2e: reconcile detect+repair OK (agent={agent})");
         });
 }

@@ -263,15 +263,27 @@ pub fn ivf_centroids_key(tenant: &str, agent: &str) -> Vec<u8> {
     v
 }
 
+/// Prefix covering ALL of an agent's reverse pointers — the reconcile scan.
+pub fn ivf_vptr_prefix(tenant: &str, agent: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(b"ivf_meta/vptr/");
+    v
+}
+
 /// Reverse pointer `vec_id -> centroid` (value = 4-byte BE centroid) so deletion
 /// can reap a vector's IVF posting in O(1) — no full-bucket scan. Lives under
 /// `ivf_meta/` (NOT the `ivf/` posting range), so it is invisible to bucket /
 /// rebuild scans (`ivf_all_prefix`).
 pub fn ivf_vptr_key(tenant: &str, agent: &str, vec_id: &str) -> Vec<u8> {
-    let mut v = agent_prefix(tenant, agent);
-    v.extend_from_slice(b"ivf_meta/vptr/");
+    let mut v = ivf_vptr_prefix(tenant, agent);
     v.extend_from_slice(q(vec_id).as_bytes());
     v
+}
+
+/// Recover `vec_id` from a vptr key given the vptr prefix.
+pub fn ivf_vptr_vec_id(key: &[u8], vptr_prefix: &[u8]) -> String {
+    let tail = &key[vptr_prefix.len().min(key.len())..];
+    unq(&String::from_utf8_lossy(tail))
 }
 
 #[cfg(test)]

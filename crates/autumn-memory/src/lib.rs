@@ -41,9 +41,15 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Decode a 4-byte BE centroid id from a `vptr` value (None if malformed).
+/// Decode a `vptr` value (exactly 4 BE bytes) into a centroid id. Strict on
+/// length — a vptr we wrote is always 4 bytes, so anything else is corruption
+/// and must be surfaced (None), not silently truncated.
 fn read_u32(b: &[u8]) -> Option<u32> {
-    b.get(..4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+    if b.len() == 4 {
+        Some(u32::from_be_bytes(b.try_into().unwrap()))
+    } else {
+        None
+    }
 }
 
 /// Per-`(tenant, agent)` handle onto agent memory backed by autumn.
@@ -672,6 +678,168 @@ impl MemoryStore {
             .map(|(id, _)| id)
             .collect();
         Ok(top_k_sorted(recall::rrf_fuse(&[lex, vec], 60.0), top_k))
+    }
+}
+
+/// Snapshot of an agent's index integrity (plan §16 acceptance: index-reconcile).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Live `doc/{id}` records counted by a full scan.
+    pub docs: u64,
+    /// Σ of live docs' `doc_len` (recount).
+    pub sum_doc_len: u64,
+    /// `meta/stats` n_docs as currently stored.
+    pub stats_docs: u64,
+    /// `meta/stats` sum_doc_len as currently stored.
+    pub stats_sum_doc_len: u64,
+    /// IVF vector postings counted by a full scan (ACTUAL postings, not unique
+    /// ids — a `vec_id` with copies in two buckets counts as 2).
+    pub ivf_postings: u64,
+    /// reverse pointers (`ivf_meta/vptr/*`) counted by a full scan.
+    pub vptrs: u64,
+    /// IVF postings whose `vec_id` has NO reverse pointer — unreapable orphans
+    /// (the `index_vector` double-fault residual, F-MEM-4). Should be 0.
+    pub orphan_ivf: u64,
+    /// extra IVF postings beyond one per `vec_id` — e.g. a `train_centroids`
+    /// crash that wrote the new-bucket posting but didn't delete the old one.
+    /// Should be 0.
+    pub duplicate_ivf: u64,
+    /// reverse pointers whose pointed-to bucket holds no posting — dangling
+    /// (e.g. a compensated/partial write left the vptr but not the posting).
+    pub dangling_vptr: u64,
+    /// reverse-pointer values that failed to decode (not exactly 4 bytes) —
+    /// corruption. Should be 0.
+    pub malformed_vptr: u64,
+}
+
+impl ReconcileReport {
+    /// `meta/stats` exactly matches the recount (no multi-writer drift).
+    pub fn stats_consistent(&self) -> bool {
+        self.docs == self.stats_docs && self.sum_doc_len == self.stats_sum_doc_len
+    }
+    /// Every STRUCTURAL invariant holds: stats match + no orphan / duplicate /
+    /// dangling / malformed vectors. NOTE: this is structural integrity, NOT
+    /// centroid-assignment optimality — a `train_centroids` crash after the
+    /// manifest write but before re-bucketing a vector can leave a posting in a
+    /// now-suboptimal bucket (an ANN-recall quality issue, not corruption; the
+    /// vector still exists and is reaped/found correctly). Re-running
+    /// `train_centroids` re-establishes optimal buckets; a dedicated
+    /// `stale_bucket` check (decode every posting + recompute nearest) is a
+    /// future enhancement, deliberately omitted here to keep the audit O(ids).
+    pub fn is_clean(&self) -> bool {
+        self.stats_consistent()
+            && self.orphan_ivf == 0
+            && self.duplicate_ivf == 0
+            && self.dangling_vptr == 0
+            && self.malformed_vptr == 0
+    }
+}
+
+impl MemoryStore {
+    // -- index reconcile / repair (plan §16 acceptance) ----------------------
+    // An OFF-hot-path integrity audit. This is also the deliberate answer to the
+    // multi-writer `meta/stats` RMW race: rather than serialize the hot write
+    // path (per-writer shards / server atomics — rejected as hot-path/server
+    // complexity for a LOW-harm, idf/avgdl-only score-skew that needs a
+    // non-primary multi-process-same-agent topology), tolerate the drift and
+    // detect + `repair_stats` it here.
+
+    /// Recount live docs + Σ doc_len from the authoritative `doc/{id}` records
+    /// (the BM25-stats ground truth). Scans `doc/` only — no IVF work.
+    async fn recount_doc_stats(&self) -> Result<(u64, u64), AutumnError> {
+        let doc_keys = self.scan_keys(&keys::doc_prefix(&self.tenant, &self.agent), None).await?;
+        let (mut docs, mut sum_len) = (0u64, 0u64);
+        for k in &doc_keys {
+            if let Some(b) = self.client.get(k).await? {
+                if let Some(d) = recall::IndexedDoc::decode(&b) {
+                    docs += 1;
+                    sum_len += d.doc_len as u64;
+                }
+            }
+        }
+        Ok((docs, sum_len))
+    }
+
+    /// Audit this agent's index integrity: recount doc stats vs `meta/stats`,
+    /// and cross-check IVF postings against their reverse pointers. Read-only.
+    /// Structural integrity only — see [`ReconcileReport::is_clean`] on the
+    /// centroid-assignment boundary.
+    pub async fn reconcile(&self) -> Result<ReconcileReport, AutumnError> {
+        let mut r = ReconcileReport::default();
+
+        // 1. docs vs stats
+        let (docs, sum_len) = self.recount_doc_stats().await?;
+        r.docs = docs;
+        r.sum_doc_len = sum_len;
+        let (sd, ss) = self.read_stats().await?;
+        r.stats_docs = sd;
+        r.stats_sum_doc_len = ss;
+
+        // 2. IVF postings: vec_id -> the bucket(s) it has a posting in. Do NOT
+        //    fold to one centroid — duplicate postings (same id in two buckets,
+        //    e.g. a train-crash residual) must be counted, not hidden.
+        let all = keys::ivf_all_prefix(&self.tenant, &self.agent);
+        let post_keys = self.scan_keys(&all, None).await?;
+        let mut ivf: HashMap<String, Vec<u32>> = HashMap::new();
+        for k in &post_keys {
+            if let (Some(vid), Some(c)) =
+                (keys::ivf_all_vec_id(k, &all), keys::ivf_all_centroid(k, &all))
+            {
+                ivf.entry(vid).or_default().push(c);
+            }
+        }
+        r.ivf_postings = ivf.values().map(|v| v.len() as u64).sum();
+        r.duplicate_ivf = ivf.values().filter(|v| v.len() > 1).map(|v| v.len() as u64 - 1).sum();
+
+        // 3. reverse pointers: vec_id -> centroid (from the vptr value)
+        let vpre = keys::ivf_vptr_prefix(&self.tenant, &self.agent);
+        let vptr_keys = self.scan_keys(&vpre, None).await?;
+        let mut vptr: HashMap<String, u32> = HashMap::new();
+        for k in &vptr_keys {
+            let vid = keys::ivf_vptr_vec_id(k, &vpre);
+            match self.client.get(k).await? {
+                Some(b) => match read_u32(&b) {
+                    Some(c) => {
+                        vptr.insert(vid, c);
+                    }
+                    None => r.malformed_vptr += 1, // present but undecodable = corruption
+                },
+                None => {} // vanished between scan and get — not an inconsistency
+            }
+        }
+        r.vptrs = vptr.len() as u64;
+
+        // 4. cross-check: every posting's id must have a vptr; every vptr's
+        //    bucket must hold a posting for that id.
+        for (vid, centroids) in &ivf {
+            if !vptr.contains_key(vid) {
+                r.orphan_ivf += centroids.len() as u64;
+            }
+        }
+        for (vid, c) in &vptr {
+            if !ivf.get(vid).map(|cs| cs.contains(c)).unwrap_or(false) {
+                r.dangling_vptr += 1;
+            }
+        }
+        Ok(r)
+    }
+
+    /// Rewrite `meta/stats` from a fresh doc recount, healing multi-writer
+    /// drift. Returns the repaired `(n_docs, sum_doc_len)`.
+    ///
+    /// MUST run in a maintenance window with NO concurrent writer for this
+    /// `(tenant, agent)`: it is itself a read(recount)-then-write, with no CAS,
+    /// so a write landing between the recount and the put would be clobbered.
+    /// (Scans `doc/` only — independent of IVF size.)
+    pub async fn repair_stats(&self) -> Result<(u64, u64), AutumnError> {
+        let (docs, sum_len) = self.recount_doc_stats().await?;
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&docs.to_le_bytes());
+        buf[8..].copy_from_slice(&sum_len.to_le_bytes());
+        self.client
+            .put(&keys::stats_key(&self.tenant, &self.agent), &buf)
+            .await?;
+        Ok((docs, sum_len))
     }
 }
 

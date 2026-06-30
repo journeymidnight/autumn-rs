@@ -88,6 +88,34 @@ mem/{tenant}/shared/{namespace}/{key}                cross-agent shared
 - Pagination resumes EXCLUSIVELY via the successor of the last key
   (`last_key ++ 0x00`).
 
+## Index reconcile / repair (`reconcile` / `repair_stats`, plan §16)
+
+An OFF-hot-path integrity audit + heal (the plan's per-phase acceptance tool):
+
+- `reconcile() -> ReconcileReport` (read-only): recounts live `doc/{id}` records
+  vs `meta/stats`, and cross-checks IVF postings against their `vptr`s. Counts
+  ACTUAL postings (never folds by id) so it flags `duplicate_ivf` (same id in
+  two buckets — a train-crash residual), `orphan_ivf` (posting whose id has no
+  vptr), `dangling_vptr` (vptr whose bucket has no posting), `malformed_vptr`
+  (value ≠ 4 bytes). `is_clean()` = stats match + all four counts 0. SCOPE:
+  STRUCTURAL integrity only, NOT centroid-assignment optimality — a train-crash
+  mid-migration can leave a posting in a now-suboptimal bucket (ANN-recall
+  quality, not corruption; re-run `train_centroids` to heal). A `stale_bucket`
+  check (decode every posting + recompute nearest) is a deliberate O(ids) →
+  O(postings·k) follow-up, omitted to keep the audit cheap.
+- `repair_stats()`: rewrites `meta/stats` from a fresh `doc/` recount (no IVF
+  scan). MUST run in a writer-quiesced maintenance window — it is itself a
+  read-then-write with no CAS, so a concurrent write would be clobbered.
+
+This is the deliberate answer to the **multi-writer `meta/stats` RMW race**:
+`update_stats` is read-modify-write, so two processes writing the SAME agent
+concurrently can lose a stats update. The harm is LOW — it skews only idf /
+avgdl (BM25 scores), never which docs are found (postings + doc records are
+per-doc, no cross-doc race) — and it needs a non-primary multi-process-same-
+agent topology. So rather than serialize the hot write path (per-writer shards
+or a server-side atomic increment — rejected as hot-path / server complexity),
+we **tolerate the drift and detect + `repair_stats` it off the hot path**.
+
 ## Multi-tenant isolation (plan §9.5)
 
 Key prefix `mem/{tenant}/{agent}/` is ORGANIZATION, not security — a client
@@ -96,7 +124,8 @@ in autumn (Phase 0, plan §16); a single trusted org can run on prefixes alone.
 
 ## Tests
 
-`cargo test -p autumn-memory` — pure key-schema unit tests in `keys.rs`
-(percent round-trip, fact-key round-trip, newest-first ordering, ts round-trip,
-prefix isolation). The async store ops are exercised e2e against a live cluster
-(next iteration).
+`cargo test -p autumn-memory --lib` — pure unit tests (key-schema round-trips +
+prefix isolation in `keys.rs`; tokenizer incl. plural-fold + CJK in `recall.rs`;
+BM25 monotonicity; vector cosine / kmeans / IVF in `vector.rs`). The async store
+ops + reconcile/repair are exercised e2e against a live cluster (`tests/e2e.rs`
++ the isolated-cluster harness `tests/run_e2e.sh`).
