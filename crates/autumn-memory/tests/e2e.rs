@@ -94,6 +94,15 @@ fn e2e_full_surface() {
             let mat = mem.search_lexical("mat", 10).await.expect("search mat");
             assert_eq!(mat.first().map(|h| h.id.as_str()), Some("d1"), "mat -> d1 only");
 
+            // ---- CJK unigram tokenization (Chinese): a single-character query
+            // matches a longer doc through the full posting path (CJK term bytes
+            // percent-encoded in the posting key, scanned, scored).
+            mem.index_memory("zh1", "我喜欢猫", b"", None).await.expect("index zh1");
+            mem.index_memory("zh2", "狗很可爱", b"", None).await.expect("index zh2");
+            let zh = mem.search_lexical("猫", 10).await.expect("search 猫");
+            let zids: Vec<&str> = zh.iter().map(|h| h.id.as_str()).collect();
+            assert!(zids.contains(&"zh1") && !zids.contains(&"zh2"), "猫 -> zh1 only: {zids:?}");
+
             // ---- SPFresh-IVF-on-KV vector recall (caller-supplied vectors)
             mem.index_vector("d1", &[1.0, 0.0, 0.0], None).await.expect("vec d1");
             mem.index_vector("d2", &[0.0, 1.0, 0.0], None).await.expect("vec d2");
@@ -116,7 +125,7 @@ fn e2e_full_surface() {
             assert!(hy.iter().any(|p| p.0 == "d1"), "d1 wins both legs: {hy:?}");
 
             // ---- best-effort cleanup
-            for id in ["d1", "d2", "d3"] {
+            for id in ["d1", "d2", "d3", "zh1", "zh2"] {
                 let _ = mem.delete_memory(id).await;
             }
             mem.delete_fact("profile", "name").await.ok();

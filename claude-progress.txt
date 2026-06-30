@@ -58,8 +58,12 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     验证:mock /embeddings server(免集群)证请求形状/批序/鉴权头/url-join/单文本 hook(run_embedder_test.sh)= EMBEDDER OK。
   · F-MEM-7 Hermes 适配器:DEFERRED——Hermes 闭源 in-tree(PyPI 的 hermes 是无关包),拿不到真 MemoryProvider ABC;
     按纪律不凭 plan 表伪造 ABC 自测;等真接口再做。
+  · F-MEM-8 CJK 分词(recall.rs,本会话):之前 CJK 整段当一个词(无空格边界)→"我喜欢猫"存成单个4字词,查"猫"永不中。
+    加 is_cjk(Han+假名+谚文+扩展)+ tokenize 把每个 CJK 码点当独立 term(unigram),Latin 段照旧 lowercase+stopword+复数归一。
+    unigram 非 bigram:单字查询可中(中文单字常是整词)+ doc_len 跨脚本可比(无长度归一偏置);短语精度交给 hybrid 向量腿。
+    验证:单测 cjk_unigram_tokenization(中/日/韩拆分+混合 Latin+CJK+tf 累加)20/20 绿 + e2e(查"猫"中"我喜欢猫"不中"狗很可爱")exit 0。
 
 Next steps:
   1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
-  2. 检索增强:CJK 分词、stats delta-log(多写者)、F-MEM-4 孤儿向量回收。
+  2. 检索增强:stats delta-log(多写者并发安全)、F-MEM-4 孤儿向量回收;CJK bigram 精度细化(可选)。
   3. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。

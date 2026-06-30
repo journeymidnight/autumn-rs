@@ -43,8 +43,11 @@ Posting-on-KV done directly (no brute-force MVP — user directive 2026-06-30):
 - Query: tokenize → per-term keys-only scan → fetch candidate docs → Okapi
   BM25 (`bm25_term`, k1=1.2 b=0.75) over each doc's current term map → top-k.
   `df` ≈ posting count (stale-orphan over-count is bounded; idf robust).
-- Tokenizer: lowercase + maximal-alphanumeric runs + small stopword set
-  (CJK/segmentation = follow-up). Values are opaque `meta` bytes.
+- Tokenizer: lowercase + maximal-alphanumeric runs + small stopword set +
+  conservative plural folding; **CJK** (Han / kana / Hangul) is tokenized per
+  codepoint (unigram) so single-character queries match (在中文里单字常是整词,
+  如 猫/狗) without Latin-vs-CJK length-norm skew — bigram precision is a future
+  refinement. Values are opaque `meta` bytes.
 
 Values are **opaque bytes** — the caller/adapter chooses the encoding (JSON,
 rkyv, …); the core never imposes one.

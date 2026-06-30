@@ -19,8 +19,7 @@ const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
 /// A minimal English stopword set (kept small — over-pruning hurts recall on
-/// short agent-memory snippets). CJK / other scripts tokenize per maximal
-/// alphanumeric run; proper segmentation is a follow-up.
+/// short agent-memory snippets).
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been", "to", "of",
     "in", "on", "for", "with", "as", "at", "by", "it", "its", "this", "that", "these", "those",
@@ -31,12 +30,56 @@ pub(crate) fn is_stopword(t: &str) -> bool {
     STOPWORDS.contains(&t)
 }
 
-/// Tokenize into lowercase alphanumeric terms, dropping stopwords.
+/// CJK & kana/hangul codepoint blocks (Han, Hiragana, Katakana, Hangul + their
+/// extensions). These scripts have no whitespace word boundaries, so a
+/// maximal-alphanumeric run would swallow a whole sentence into one term. We
+/// tokenize them per **codepoint** (unigram): each character is its own term.
+/// That keeps single-character queries working (in Chinese a lone character is
+/// often a full word — 猫 = cat, 狗 = dog) and keeps `doc_len` honest (no
+/// Latin-vs-CJK length-norm skew); the hybrid vector leg supplies phrase-level
+/// precision. Bigram segmentation is a future precision refinement.
+///
+/// NOTE: the index is a DERIVED artifact — the authoritative `doc/{id}` record
+/// keeps the original `text`, so changing this tokenizer never loses data; a
+/// deployed corpus is brought current by re-running `index_memory` (reindex).
+///
+/// This block test is intentionally AND-ed with `is_alphanumeric()` at the call
+/// site so kana-block punctuation / combining marks (・ U+30FB, the combining
+/// sound marks U+3099/309A, …) are NOT emitted as standalone terms.
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x1100..=0x11FF |    // Hangul Jamo
+        0x3040..=0x30FF |    // Hiragana + Katakana
+        0x3130..=0x318F |    // Hangul Compatibility Jamo
+        0x31F0..=0x31FF |    // Katakana Phonetic Extensions
+        0x3400..=0x4DBF |    // CJK Unified Ideographs Ext A
+        0x4E00..=0x9FFF |    // CJK Unified Ideographs
+        0xA960..=0xA97F |    // Hangul Jamo Extended-A
+        0xAC00..=0xD7AF |    // Hangul Syllables (+ Jamo Extended-B tail)
+        0xF900..=0xFAFF |    // CJK Compatibility Ideographs
+        0xFF66..=0xFF9D |    // Halfwidth Katakana
+        0x20000..=0x2A6DF |  // CJK Unified Ideographs Ext B
+        0x2A700..=0x2EBEF |  // CJK Unified Ideographs Ext C..F
+        0x2F800..=0x2FA1F |  // CJK Compatibility Ideographs Supplement
+        0x30000..=0x323AF)   // CJK Unified Ideographs Ext G..H
+}
+
+/// Tokenize into lowercase alphanumeric terms (dropping stopwords + plural-
+/// folding), with CJK codepoints emitted as individual unigram terms.
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
-        if ch.is_alphanumeric() {
+        // Require alphanumeric so kana-block punctuation / combining marks fall
+        // through to the separator branch instead of becoming bogus terms.
+        if is_cjk(ch) && ch.is_alphanumeric() {
+            // flush the pending Latin/alnum run, then emit this CJK char as its
+            // own term (no case-fold / no plural-fold — neither applies to CJK).
+            if !cur.is_empty() {
+                push_term(&mut out, std::mem::take(&mut cur));
+            }
+            out.push(ch.to_string());
+        } else if ch.is_alphanumeric() {
             for lc in ch.to_lowercase() {
                 cur.push(lc);
             }
@@ -232,6 +275,29 @@ mod tests {
         assert_eq!(fold_plural("chaos"), "chaos");
         // verb forms are intentionally untouched (no run/running mismatch)
         assert_eq!(tokenize("running"), vec!["running"]);
+    }
+
+    #[test]
+    fn cjk_unigram_tokenization() {
+        // a CJK run becomes per-character terms (not one swallowed token), so a
+        // single-character query can match a longer doc.
+        assert_eq!(tokenize("我喜欢猫"), vec!["我", "喜", "欢", "猫"]);
+        assert_eq!(query_terms("猫"), vec!["猫"]);
+        let (tf, len) = term_freqs("我喜欢猫");
+        assert_eq!(len, 4);
+        assert_eq!(tf.get("猫"), Some(&1));
+        // mixed Latin + CJK: Latin runs stay whole + lowercased, CJK splits
+        assert_eq!(tokenize("AI很强mode"), vec!["ai", "很", "强", "mode"]);
+        // Japanese kana + Korean hangul also split per codepoint
+        assert_eq!(tokenize("ねこ"), vec!["ね", "こ"]);
+        assert_eq!(tokenize("고양이"), vec!["고", "양", "이"]);
+        // repeated CJK char accumulates term frequency
+        assert_eq!(term_freqs("猫猫狗").0.get("猫"), Some(&2));
+        // kana-block PUNCTUATION (・ U+30FB) is a separator, not a term — it
+        // must not pollute candidates (coco P2)
+        assert_eq!(tokenize("東京・大阪"), vec!["東", "京", "大", "阪"]);
+        // halfwidth katakana is covered too (coco P3)
+        assert_eq!(tokenize("ｱｲｳ"), vec!["ｱ", "ｲ", "ｳ"]);
     }
 
     #[test]
