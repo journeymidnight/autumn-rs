@@ -41,6 +41,11 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Decode a 4-byte BE centroid id from a `vptr` value (None if malformed).
+fn read_u32(b: &[u8]) -> Option<u32> {
+    b.get(..4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+}
+
 /// Per-`(tenant, agent)` handle onto agent memory backed by autumn.
 ///
 /// Construct one per agent identity. Clone is cheap (`Rc` client); the append
@@ -343,8 +348,13 @@ impl MemoryStore {
             .await
     }
 
-    /// Remove an indexed memory document and its postings.
+    /// Remove an indexed memory document and its postings (both legs: BM25
+    /// postings + doc record, AND the IVF vector posting via `delete_vector`).
     pub async fn delete_memory(&self, doc_id: &str) -> Result<(), AutumnError> {
+        // reap the vector leg first — unconditional, since a doc may have a
+        // vector but no BM25 record (vector-only caller); the BM25 reap below
+        // early-returns when there's no doc record.
+        self.delete_vector(doc_id).await?;
         let dkey = keys::doc_key(&self.tenant, &self.agent, doc_id);
         let doc = match self.client.get(&dkey).await? {
             Some(b) => match recall::IndexedDoc::decode(&b) {
@@ -476,9 +486,54 @@ impl MemoryStore {
             Some(c) if !c.cs.is_empty() => vector::nearest(&nv, &c.cs) as u32,
             _ => 0,
         };
+        let ttl = self.ttl(ttl);
+        let vptr = keys::ivf_vptr_key(&self.tenant, &self.agent, doc_id);
+        // Re-index that lands in a different bucket: reap the prior posting so
+        // exactly ONE IVF copy exists per id — this keeps `delete_vector`'s
+        // vptr-based reap exact (one pointer, one posting).
+        if let Some(b) = self.client.get(&vptr).await? {
+            if let Some(old) = read_u32(&b) {
+                if old != centroid {
+                    let old_pk = keys::ivf_posting_key(&self.tenant, &self.agent, old, doc_id);
+                    self.client.delete(&old_pk).await?;
+                }
+            }
+        }
         let key = keys::ivf_posting_key(&self.tenant, &self.agent, centroid, doc_id);
-        self.put_kv(&key, &vector::encode_vec(&nv), self.ttl(ttl))
-            .await
+        self.put_kv(&key, &vector::encode_vec(&nv), ttl).await?;
+        // The posting + vptr are two non-atomic writes. If the vptr write fails
+        // we'd leave a posting that the vptr-based `delete_vector` can never find
+        // (a silent, unreapable orphan), so compensate: undo the posting and
+        // surface an error — better a failed index than an orphan. (same TTL on
+        // vptr → it expires with its vector, so no orphan vptr either.) Residual:
+        // only a double-fault (vptr write AND this compensating delete both fail)
+        // leaves an orphan, and that is still correctness-backstopped by the
+        // resolver dropping hits whose doc record is gone.
+        if let Err(e) = self.put_kv(&vptr, &centroid.to_be_bytes(), ttl).await {
+            self.client.delete(&key).await?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Reap a doc's IVF vector posting (and its reverse pointer). The
+    /// `vptr/{id}` -> centroid pointer locates the bucket in O(1) (no scan).
+    /// No-op if the id has no vector. `delete_memory` calls this so deleting a
+    /// memory reaps BOTH legs; usable on its own for vector-only callers.
+    ///
+    /// Note `train_centroids` re-buckets every IVF posting it scans WITHOUT
+    /// checking doc existence — it never reaps a deleted vector — so this
+    /// vptr-based reap is the only reaper for delete-orphans.
+    pub async fn delete_vector(&self, doc_id: &str) -> Result<(), AutumnError> {
+        let vptr = keys::ivf_vptr_key(&self.tenant, &self.agent, doc_id);
+        if let Some(b) = self.client.get(&vptr).await? {
+            if let Some(centroid) = read_u32(&b) {
+                let pk = keys::ivf_posting_key(&self.tenant, &self.agent, centroid, doc_id);
+                self.client.delete(&pk).await?;
+            }
+            self.client.delete(&vptr).await?;
+        }
+        Ok(())
     }
 
     /// (Re)train IVF centroids with k-means over the current vectors and
@@ -526,6 +581,10 @@ impl MemoryStore {
             let nc = vector::nearest(v, &cs) as u32;
             let nk = keys::ivf_posting_key(&self.tenant, &self.agent, nc, vid);
             self.put_kv(&nk, &vector::encode_vec(v), 0).await?;
+            // keep the reverse pointer accurate after re-bucketing (so a later
+            // delete reaps the posting from its CURRENT bucket).
+            let vptr = keys::ivf_vptr_key(&self.tenant, &self.agent, vid);
+            self.put_kv(&vptr, &nc.to_be_bytes(), 0).await?;
             if nc != *oc {
                 let ok = keys::ivf_posting_key(&self.tenant, &self.agent, *oc, vid);
                 self.client.delete(&ok).await?;

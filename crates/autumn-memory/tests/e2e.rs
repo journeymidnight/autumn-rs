@@ -124,6 +124,17 @@ fn e2e_full_surface() {
             assert!(!hy.is_empty(), "hybrid returns fused results");
             assert!(hy.iter().any(|p| p.0 == "d1"), "d1 wins both legs: {hy:?}");
 
+            // ---- F-MEM-4: deleting a memory reaps its IVF vector posting
+            // (not just doc + BM25), so it no longer surfaces in vector search.
+            // (train_centroids never reaps a deleted vector — it re-buckets
+            // every posting it scans — so the vptr-based reap is the reaper.)
+            mem.delete_memory("d1").await.expect("delete d1");
+            let after = mem
+                .search_vector(&[0.95, 0.05, 0.0], 3, 4)
+                .await
+                .expect("search after delete");
+            assert!(!after.iter().any(|p| p.0 == "d1"), "d1 IVF posting reaped: {after:?}");
+
             // ---- best-effort cleanup
             for id in ["d1", "d2", "d3", "zh1", "zh2"] {
                 let _ = mem.delete_memory(id).await;

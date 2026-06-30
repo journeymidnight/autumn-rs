@@ -263,6 +263,17 @@ pub fn ivf_centroids_key(tenant: &str, agent: &str) -> Vec<u8> {
     v
 }
 
+/// Reverse pointer `vec_id -> centroid` (value = 4-byte BE centroid) so deletion
+/// can reap a vector's IVF posting in O(1) — no full-bucket scan. Lives under
+/// `ivf_meta/` (NOT the `ivf/` posting range), so it is invisible to bucket /
+/// rebuild scans (`ivf_all_prefix`).
+pub fn ivf_vptr_key(tenant: &str, agent: &str, vec_id: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(b"ivf_meta/vptr/");
+    v.extend_from_slice(q(vec_id).as_bytes());
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +319,10 @@ mod tests {
         assert_eq!(ivf_all_vec_id(&pk, &all).as_deref(), Some("vec-9"));
         // the centroid manifest key is NOT caught by the `ivf/` bucket scan
         assert!(!ivf_centroids_key("acme", "agent-1").starts_with(&all));
+        // the reverse pointer is under ivf_meta/ — also OUT of the bucket scan
+        // (so train's ivf_all_prefix scan never mistakes a vptr for a posting)
+        let vptr = ivf_vptr_key("acme", "agent-1", "vec-9");
+        assert!(!vptr.starts_with(&all), "vptr must not be in the ivf/ scan range");
     }
 
     #[test]

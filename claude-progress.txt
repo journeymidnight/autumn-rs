@@ -63,7 +63,14 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     unigram 非 bigram:单字查询可中(中文单字常是整词)+ doc_len 跨脚本可比(无长度归一偏置);短语精度交给 hybrid 向量腿。
     验证:单测 cjk_unigram_tokenization(中/日/韩拆分+混合 Latin+CJK+tf 累加)20/20 绿 + e2e(查"猫"中"我喜欢猫"不中"狗很可爱")exit 0。
 
+  · F-MEM-4 向量孤儿回收(recall/lib/keys,本会话):delete 之前只回收 doc+BM25 不回收 IVF posting→删过的向量永远残留
+    (关键:train_centroids 扫到每个 posting 都重新分桶,从不查 doc 是否还在→它根本不回收删除孤儿,vptr 才是唯一回收者)。
+    加 ivf_meta/vptr/{id}→centroid(4BE)反向指针(在 ivf_meta/ 下不在 ivf/ 扫描区,train 不会误当 posting)。
+    index_vector 写 vptr+移桶时回收旧桶(每 id 恰一份 IVF 副本);train re-bucket 更新 vptr;delete_vector 用 vptr O(1)
+    定位回收;delete_memory 无条件调 delete_vector(可能只有向量没 BM25)。_resolve(F-MEM-3)仍是过期/在途竞态的兜底。
+    验证:e2e(删 d1 后 search_vector 不再返 d1)exit 0 + 单测 vptr 不在 ivf/ 扫描区 20/20 绿。
+
 Next steps:
   1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
-  2. 检索增强:stats delta-log(多写者并发安全)、F-MEM-4 孤儿向量回收;CJK bigram 精度细化(可选)。
+  2. 检索增强:stats delta-log(多写者并发安全);CJK bigram 精度细化(可选)。
   3. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。

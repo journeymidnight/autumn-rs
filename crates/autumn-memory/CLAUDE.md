@@ -76,12 +76,15 @@ mem/{tenant}/shared/{namespace}/{key}                cross-agent shared
 - Recall/list is **near-real-time / eventually consistent**, NOT a snapshot:
   `get_values` skips keys that vanished (deleted/expired) between the scan and
   the get. Main-record point-get is the correctness boundary.
-- This boundary extends to the **vector leg**: `delete_memory` reaps the
-  `doc/{id}` record + BM25 postings but not the IVF posting `ivf/{c}/{id}`
-  (centroid unknown at delete time), so a vector/hybrid hit may name a deleted
-  id. A resolver MUST drop hits whose `doc/{id}` is gone (`get_memory` → None) —
-  the MCP server's `_resolve` does (coco P2). Reaping the orphan IVF posting is
-  index hygiene, tracked as F-MEM-4; `train_centroids` is the full reaper today.
+- **Vector leg**: `delete_memory` reaps BOTH legs — BM25 postings + `doc/{id}`,
+  AND the IVF posting `ivf/{c}/{id}` via `delete_vector`, located in O(1) by the
+  reverse pointer `ivf_meta/vptr/{id} -> centroid` (F-MEM-4). `train_centroids`
+  re-buckets every posting it scans WITHOUT checking doc existence, so it never
+  reaps a deleted vector — the vptr reap is the only reaper. `index_vector`
+  keeps exactly one IVF copy per id (reaps the old bucket on a move) and keeps
+  vptr current; `train` updates vptr on re-bucket. Belt-and-suspenders: a
+  resolver should still drop a hit whose `doc/{id}` is gone (`get_memory` →
+  None) — the MCP `_resolve` does — covering any in-flight/expiry race.
 - Pagination resumes EXCLUSIVELY via the successor of the last key
   (`last_key ++ 0x00`).
 
