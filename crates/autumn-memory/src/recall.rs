@@ -52,8 +52,38 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 
 fn push_term(out: &mut Vec<String>, t: String) {
     if !t.is_empty() && !is_stopword(&t) {
-        out.push(t);
+        out.push(fold_plural(&t));
     }
+}
+
+/// Conservative English plural folding so a query token matches its plural
+/// (and vice-versa): "cats"->"cat", "boxes"->"box", "categories"->"category".
+/// Deliberately does NOT touch verb forms (no -ing/-ed) — a naive verb stem
+/// like "running"->"runn" would just MISS "run", so it would hurt, not help.
+/// Index + query both run through `tokenize`, so the folding stays symmetric.
+/// (Full Porter/Snowball via `rust-stemmers` is a possible follow-up.)
+fn fold_plural(t: &str) -> String {
+    let n = t.len();
+    if n < 4 || !t.ends_with('s') {
+        return t.to_string();
+    }
+    // "-ies" -> "-y"  (categories -> category)
+    if n >= 5 && t.ends_with("ies") {
+        return format!("{}y", &t[..n - 3]);
+    }
+    // keep genuine non-plural -s endings (class, bus, axis, gas, chaos, ...)
+    if matches!(&t[n - 2..], "ss" | "us" | "is" | "as" | "os") {
+        return t.to_string();
+    }
+    // "-es" after a sibilant -> strip "es" (boxes->box, wishes->wish, buzzes->buzz)
+    if n >= 5 && t.ends_with("es") {
+        let stem = &t[..n - 2];
+        if stem.ends_with(['s', 'x', 'z']) || stem.ends_with("ch") || stem.ends_with("sh") {
+            return stem.to_string();
+        }
+    }
+    // plain plural -s (cats->cat, dogs->dog, errors->error)
+    t[..n - 1].to_string()
 }
 
 /// Term frequencies + total token count (doc_len) for a document.
@@ -184,6 +214,24 @@ mod tests {
         // punctuation / digits split into runs
         assert_eq!(tokenize("err-code 42x ok"), vec!["err", "code", "42x", "ok"]);
         assert!(tokenize("the and is").is_empty());
+    }
+
+    #[test]
+    fn plural_folding() {
+        // plurals fold to singular so "cat" matches "cats" (the e2e gotcha)
+        assert_eq!(tokenize("cats"), vec!["cat"]);
+        assert_eq!(tokenize("dogs chase cats"), vec!["dog", "chase", "cat"]);
+        assert_eq!(fold_plural("boxes"), "box");
+        assert_eq!(fold_plural("wishes"), "wish");
+        assert_eq!(fold_plural("categories"), "category");
+        assert_eq!(fold_plural("errors"), "error");
+        // non-plural -s endings and short words are preserved
+        assert_eq!(fold_plural("class"), "class");
+        assert_eq!(fold_plural("bus"), "bus");
+        assert_eq!(fold_plural("cat"), "cat"); // too short / already singular
+        assert_eq!(fold_plural("chaos"), "chaos");
+        // verb forms are intentionally untouched (no run/running mismatch)
+        assert_eq!(tokenize("running"), vec!["running"]);
     }
 
     #[test]

@@ -76,13 +76,12 @@ fn e2e_full_surface() {
             assert!(mem.get_fact("profile", "lang").await.expect("get").is_none());
 
             // ---- BM25-on-KV lexical recall
-            // NB: the tokenizer does NOT stem, so a query token must match the
-            // stored token exactly ("cat" != "cats"). Both d1 and d2 contain
-            // the literal "cat".
+            // Plural folding makes the query "cat" match d1 ("cat") AND d2
+            // ("cats" -> "cat"); d3 has neither.
             mem.index_memory("d1", "the cat sat on the mat", b"", None)
                 .await
                 .expect("index d1");
-            mem.index_memory("d2", "a cat and a dog play in the yard", b"", None)
+            mem.index_memory("d2", "dogs chase cats in the yard", b"", None)
                 .await
                 .expect("index d2");
             mem.index_memory("d3", "quantum error correction codes", b"", None)
