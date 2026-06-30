@@ -425,6 +425,22 @@ impl MemoryStore {
         scored.truncate(top_k);
         Ok(scored)
     }
+
+    /// Fetch a single indexed memory by id — the authoritative `doc/{id}`
+    /// record (`text`, opaque `meta`). `None` if it was never indexed, was
+    /// deleted/expired, or its record is unreadable. This is the point-get that
+    /// backs an MCP `fetch` / "open this search hit" affordance: `search_*`
+    /// returns ids+scores, `get_memory` resolves an id to its content.
+    pub async fn get_memory(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, AutumnError> {
+        let dkey = keys::doc_key(&self.tenant, &self.agent, doc_id);
+        Ok(match self.client.get(&dkey).await? {
+            Some(b) => recall::IndexedDoc::decode(&b).map(|d| (d.text, d.meta)),
+            None => None,
+        })
+    }
 }
 
 impl MemoryStore {

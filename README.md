@@ -262,11 +262,19 @@ cluster into an AI-agent-memory backend — episodic logs, fact KV (LangGraph
 vector + hybrid RRF). Design: [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md);
 crate guide: [`crates/autumn-memory/CLAUDE.md`](crates/autumn-memory/CLAUDE.md).
 
-**Manual verification (Phase 1):**
+The Python stack sits on the Rust core: `autumn.Memory` (PyO3 binding,
+`python/src/memory.rs`) → `autumn_memory.AutumnMemory` (ergonomic layer:
+JSON + an optional text-embedder hook, `python/autumn_memory`) → framework
+shells. First shell: a **stdio MCP server** (`python/autumn_memory_mcp`) that
+any MCP host (Claude Desktop / Cursor / Cline / ChatGPT Developer Mode) spawns
+per session — `search`/`fetch`/`add`/`update`/`delete` + episodic + fact tools;
+lexical (BM25) search needs no embedder.
+
+**Manual verification (Phase 1 — Rust core):**
 
 ```bash
 cargo build --workspace                    # build the debug binaries first
-cargo test -p autumn-memory                # 18 pure unit tests (keys / BM25 / IVF / RRF)
+cargo test -p autumn-memory                # 19 pure unit tests (keys / BM25 / IVF / RRF)
 
 # Full e2e against an ISOLATED throwaway cluster (memory-only manager, 1 EN,
 # 1 PS, loopback, no etcd — does not touch any other cluster; tears down after):
@@ -276,6 +284,25 @@ bash crates/autumn-memory/tests/run_e2e.sh
 # Or run the e2e against an already-running cluster:
 AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
   cargo test -p autumn-memory --test e2e -- --ignored --nocapture
+```
+
+**Manual verification (Phase 2 — Python binding + MCP server):**
+
+```bash
+# Ergonomic layer (autumn.Memory + AutumnMemory) against an isolated cluster,
+# with a fake embedder so the vector/hybrid legs also run (builds a throwaway
+# venv + cluster, tears down):
+bash python/autumn_memory/tests/run_smoke.sh
+#   → "ERG SMOKE OK: AutumnMemory full surface (json + embedder hook)"
+
+# MCP server driven through a REAL MCP client over the SDK in-memory transport
+# (full tool surface: search/fetch/add/update/delete + episodic + facts):
+bash python/autumn_memory_mcp/tests/run_mcp_test.sh
+#   → "MCP INPROC OK: full tool surface ..." and "===== mcp-test exit: 0 ====="
+
+# Launch the stdio server for a real host (config via env or CLI flags):
+AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
+  python -m autumn_memory_mcp             # or the `autumn-memory-mcp` console script
 ```
 
 ## CLI cheatsheet

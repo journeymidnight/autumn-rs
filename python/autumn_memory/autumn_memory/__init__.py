@@ -56,6 +56,8 @@ class AutumnMemory:
             autumn.set_transport(transport)
         self._m = autumn.Memory.connect(manager, tenant, agent, default_ttl)
         self._embed = embed
+        self._tenant = tenant
+        self._agent = agent
 
     # -- episodic ------------------------------------------------------------
 
@@ -92,6 +94,15 @@ class AutumnMemory:
         self._m.index_memory(doc_id, text, meta_b, ttl)
         if self._embed is not None:
             self._m.index_vector(doc_id, [float(x) for x in self._embed(text)], ttl)
+
+    def get(self, doc_id: str):
+        """Fetch one indexed memory by id → ``{"id", "text", "meta"}`` or
+        ``None`` (deleted / expired / never indexed). Backs an MCP ``fetch``."""
+        r = self._m.get_memory(doc_id)
+        if r is None:
+            return None
+        text, meta = r
+        return {"id": doc_id, "text": text, "meta": _decode_meta(meta)}
 
     def forget(self, doc_id: str) -> None:
         self._m.delete_memory(doc_id)

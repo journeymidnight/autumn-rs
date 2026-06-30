@@ -255,6 +255,27 @@ impl Memory {
         })
     }
 
+    /// Fetch one indexed memory by id → `(text, meta)` tuple, or `None`.
+    fn get_memory(&self, py: Python<'_>, doc_id: String) -> PyResult<PyObject> {
+        let r: Option<(String, Vec<u8>)> = self.run(py, move |s, tx| {
+            Box::pin(async move {
+                let _ = tx.send(s.get_memory(&doc_id).await.map_err(|e| e.to_string()));
+            })
+        })?;
+        Ok(match r {
+            Some((text, meta)) => PyTuple::new(
+                py,
+                &[
+                    text.into_pyobject(py)?.into_any(),
+                    PyBytes::new(py, &meta).into_any(),
+                ],
+            )?
+            .into_any()
+            .unbind(),
+            None => py.None(),
+        })
+    }
+
     /// Returns a list of `(doc_id, text, meta, score)` tuples.
     fn search_lexical(&self, py: Python<'_>, query: String, top_k: usize) -> PyResult<PyObject> {
         let r: Vec<ScoredDoc> = self.run(py, move |s, tx| {

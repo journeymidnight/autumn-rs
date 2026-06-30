@@ -27,8 +27,25 @@ Phase 2a 完成(Python PyO3 binding):python/src/memory.rs 的 `Memory` pyclass(�
   验证:cargo build python crate 绿;maturin develop 建 wheel(CPython 3.12);**Python 运行时 e2e 全过**
   (隔离 venv + 隔离集群,autumn.Memory 真调全 surface;脚本 python/tests/run_memory_e2e.sh)。
 
-Next steps (Phase 2 续):
-  1. Hermes MemoryProvider 适配器(plan §10/§13:initialize/sync_turn/prefetch + memory_search/store 工具;
-     独立 plugin repo hermes-memory-autumn)。embedder 接 sglang(向量腿/hybrid 用)。
-  2. MCP server(stdio,通用触达)。
-  3. 检索增强:stemming/CJK 分词、stats delta-log(多写者)、孤儿 posting reconcile。
+Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
+  · 复数归一(0d295f8):tokenizer 安全 plural-fold(cat~cats),不碰动词形态;e2e 验证。
+  · AutumnMemory 便利层(24af6ec,python/autumn_memory):autumn.Memory binding 之上的核心 Python 库——
+    JSON 事件/事实 + **可选 text embedder hook**(向量/hybrid 腿取文本,caller 插 sglang embedder;无则纯 BM25)。
+    append/replay/recent、put/get/list/delete_fact、remember/forget/train/search(lexical|vector|hybrid|auto)。
+    run_smoke.sh:隔离 venv+集群+fake embedder 全 surface 绿。这是所有框架 adapter 的地基。
+  · F-MEM-3 stdio MCP server(python/autumn_memory_mcp,本会话):FastMCP stdio server(host 按 session 派子进程,
+    非 daemon)over AutumnMemory。工具:ChatGPT 认的 search+fetch 对(search 把每个 hit 的 text 从权威 doc 记录
+    解析出来→结果自包含)+ 写 add/update/delete + episodic + facts。async 工具把阻塞核心调用 offload 到线程
+    (event loop 不阻塞)。lexical 模式零 embedder。为 fetch 在 Rust 核心 + PyO3 + AutumnMemory.get 加了
+    get_memory(doc_id) 点查(读权威 doc/{id} 记录)。验证:真 MCP client over SDK in-memory transport 跑全工具面
+    against 隔离集群(python/autumn_memory_mcp/tests/run_mcp_test.sh)= **MCP INPROC OK, exit 0**;核心单测 19/19 绿。
+    coco review(GPT-5.5)两条都真:P1 新包漏声明 autumn-memory 依赖→已加;P2 删了向量索引文档后 vector/hybrid
+    search 出"幽灵结果"(delete 只 reap doc+BM25 不 reap IVF posting)→在检索边界修(_resolve 把 doc 记录已消失的
+    hit 丢弃,§8.5 doc=正确性边界),并把 coco 场景变成回归测试(删 v1→hybrid 不返 v1/无空文本/fetch v1 报错)。
+    更深的孤儿向量 posting 回收=纯索引卫生(正确性已被边界兜住)→记为 F-MEM-4 follow-up(reproduce-first,不塞进本提交)。
+
+Next steps:
+  1. Hermes MemoryProvider 适配器(需真 Hermes ABC + Hermes 装上;基于 AutumnMemory)。
+  2. LangGraph BaseStore 适配器(pip langgraph)。
+  3. 真 embedder(接 sglang /embeddings)。
+  4. 检索增强:CJK 分词、stats delta-log(多写者)、孤儿 reconcile。

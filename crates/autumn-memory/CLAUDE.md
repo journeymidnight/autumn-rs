@@ -4,9 +4,10 @@
 
 Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
-The Rust crate is the reusable core; thin adapters (a PyO3 binding for the
-Hermes `MemoryProvider` / LangGraph `BaseStore` Python plugins, a Rust MCP
-server, CLI memory ops) sit ON it. Design + rationale:
+The Rust crate is the reusable core; thin adapters sit ON it — a PyO3 binding
+(`autumn.Memory`) → the `autumn_memory.AutumnMemory` ergonomic layer → framework
+shells (a **stdio MCP server** `python/autumn_memory_mcp`; planned Hermes
+`MemoryProvider` / LangGraph `BaseStore`). Design + rationale:
 `docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
@@ -18,7 +19,7 @@ server, CLI memory ops) sit ON it. Design + rationale:
 |---|---|---|
 | **episodic** | `append_event` / `recent_events` / `replay_session` | append-only, newest-first by key order |
 | **facts** | `put_fact` / `get_fact` / `delete_fact` / `list_facts` | point-get + namespace-prefix-list (LangGraph `BaseStore`), per-key TTL |
-| **lexical recall (BM25-on-KV)** ✅ | `index_memory` / `delete_memory` / `search_lexical` | `recall.rs` |
+| **lexical recall (BM25-on-KV)** ✅ | `index_memory` / `delete_memory` / `search_lexical` / `get_memory` | `recall.rs` |
 | **vector recall (SPFresh-IVF-on-KV)** ✅ | `index_vector` / `train_centroids` / `search_vector` | `vector.rs` |
 | **hybrid (RRF)** ✅ | `search_hybrid` | `recall::rrf_fuse` |
 
@@ -72,6 +73,12 @@ mem/{tenant}/shared/{namespace}/{key}                cross-agent shared
 - Recall/list is **near-real-time / eventually consistent**, NOT a snapshot:
   `get_values` skips keys that vanished (deleted/expired) between the scan and
   the get. Main-record point-get is the correctness boundary.
+- This boundary extends to the **vector leg**: `delete_memory` reaps the
+  `doc/{id}` record + BM25 postings but not the IVF posting `ivf/{c}/{id}`
+  (centroid unknown at delete time), so a vector/hybrid hit may name a deleted
+  id. A resolver MUST drop hits whose `doc/{id}` is gone (`get_memory` → None) —
+  the MCP server's `_resolve` does (coco P2). Reaping the orphan IVF posting is
+  index hygiene, tracked as F-MEM-4; `train_centroids` is the full reaper today.
 - Pagination resumes EXCLUSIVELY via the successor of the last key
   (`last_key ++ 0x00`).
 
