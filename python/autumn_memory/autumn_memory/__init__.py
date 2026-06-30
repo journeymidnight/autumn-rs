@@ -144,5 +144,19 @@ class AutumnMemory:
             return [{"id": i, "score": s} for i, s in self._m.search_hybrid(query, qv, k, nprobe)]
         raise ValueError(f"unknown search mode {mode!r}")
 
+    # -- ops: index integrity ------------------------------------------------
+
+    def reconcile(self) -> dict:
+        """Audit this agent's index integrity (read-only). Returns a dict with
+        doc/stats recounts + IVF posting/vptr cross-checks; ``is_clean`` is the
+        single bool. See ``repair_stats`` to heal stats drift."""
+        return self._m.reconcile()
+
+    def repair_stats(self) -> tuple:
+        """Heal `meta/stats` drift (e.g. from TTL expiry or concurrent writers)
+        by rewriting it from a fresh doc recount. Run in a maintenance window
+        with no concurrent writer. Returns ``(n_docs, sum_doc_len)``."""
+        return self._m.repair_stats()
+
     def close(self) -> None:
         self._m.close()

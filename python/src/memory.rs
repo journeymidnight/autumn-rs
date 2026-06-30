@@ -11,13 +11,13 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
-use autumn_memory::{MemoryStore, ScoredDoc};
+use autumn_memory::{MemoryStore, ReconcileReport, ScoredDoc};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::future::LocalBoxFuture;
 use futures::StreamExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 /// A unit of work for the memory worker: given the store, produce a future that
 /// computes a result and sends it back over the job's own result channel.
@@ -371,6 +371,42 @@ impl Memory {
             })
         })?;
         id_score_list(py, r)
+    }
+
+    // -- index reconcile / repair (ops) --------------------------------------
+
+    /// Audit index integrity. Returns a dict of the `ReconcileReport` fields
+    /// plus `stats_consistent` / `is_clean`.
+    fn reconcile(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let r: ReconcileReport = self.run(py, move |s, tx| {
+            Box::pin(async move {
+                let _ = tx.send(s.reconcile().await.map_err(|e| e.to_string()));
+            })
+        })?;
+        let d = PyDict::new(py);
+        d.set_item("docs", r.docs)?;
+        d.set_item("sum_doc_len", r.sum_doc_len)?;
+        d.set_item("stats_docs", r.stats_docs)?;
+        d.set_item("stats_sum_doc_len", r.stats_sum_doc_len)?;
+        d.set_item("ivf_postings", r.ivf_postings)?;
+        d.set_item("vptrs", r.vptrs)?;
+        d.set_item("orphan_ivf", r.orphan_ivf)?;
+        d.set_item("duplicate_ivf", r.duplicate_ivf)?;
+        d.set_item("dangling_vptr", r.dangling_vptr)?;
+        d.set_item("malformed_vptr", r.malformed_vptr)?;
+        d.set_item("stats_consistent", r.stats_consistent())?;
+        d.set_item("is_clean", r.is_clean())?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Rewrite `meta/stats` from a fresh doc recount. MUST run with no
+    /// concurrent writer for this (tenant, agent). Returns `(n_docs, sum_len)`.
+    fn repair_stats(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.run(py, move |s, tx| {
+            Box::pin(async move {
+                let _ = tx.send(s.repair_stats().await.map_err(|e| e.to_string()));
+            })
+        })
     }
 }
 

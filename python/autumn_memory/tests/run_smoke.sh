@@ -86,8 +86,16 @@ mem.train(3, 25, 7)
 hy = mem.search("dog", 3, mode="hybrid")                              # auto would also be hybrid
 assert any(h["id"] == "d2" for h in hy), hy                          # d2 = dogs+cats
 
+# index integrity audit (reconcile/repair ops surfaced to Python)
+rec = mem.reconcile()
+assert rec["is_clean"], rec
+assert rec["docs"] == 3 and rec["ivf_postings"] == 3, rec            # 3 docs, 3 vectors
+
 for d in ("d1", "d2", "d3"): mem.forget(d)
+r2 = mem.reconcile()                                                  # all reaped -> empty + clean
+assert r2["docs"] == 0 and r2["ivf_postings"] == 0 and r2["is_clean"], r2
+assert mem.repair_stats() == (0, 0), "repair idempotent on empty"
 mem.close()
-print("ERG SMOKE OK: AutumnMemory full surface (json + embedder hook)")
+print("ERG SMOKE OK: AutumnMemory full surface (json + embedder hook + reconcile/repair)")
 PY
 RC=$?; echo "===== erg-smoke exit: $RC ====="; exit $RC

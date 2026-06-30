@@ -83,7 +83,11 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     e2e:3 永久+2 短TTL(1 带向量),过期后 reconcile 检出漂移(recount 3 vs stats 5)且向量腿一致(posting+vptr 原子过期
     →0 orphan/dangling/dup/malformed),repair 治愈,search 只返存活。加 ScoredDoc: Debug。3/3 e2e 绿。
 
+  · reconcile/repair PyO3 reach(本会话):autumn.Memory.reconcile()(→dict+is_clean)/repair_stats() + AutumnMemory
+    同名方法,run_smoke.sh 验证(3 docs/3 vecs clean→forget 全部→0/0 clean→repair 幂等)。Python ops cron 可审计/治愈。
+
+非门控实质工作已完成。剩余均门控/边际:
 Next steps:
   1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
-  2. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证)。
-  3. 可选:reconcile/repair 暴露到 PyO3(Python ops cron);CJK bigram 精度。
+  2. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证;需 sglang)。
+  3. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST)。
