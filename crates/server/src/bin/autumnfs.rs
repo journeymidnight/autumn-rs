@@ -1,8 +1,8 @@
 //! `autumnfs` — standalone CLI for poking at the autumn-rs FUSE filesystem
 //! without mounting it.
 //!
-//! Skips the `autumn-fuse` kernel mount and the `autumn-ioring-daemon` SHM
-//! ring; talks directly to the autumn-rs cluster via [`autumn_client::ClusterClient`]
+//! Skips the `autumn-fuse` kernel mount; talks directly to the
+//! autumn-rs cluster via [`autumn_client::ClusterClient`]
 //! using the [`autumn_fuse::key`] + [`autumn_fuse::schema`] modules — the same
 //! KV layout the fuse mount uses, so a write here is visible to a fuse mount
 //! pointed at the same cluster and vice versa.

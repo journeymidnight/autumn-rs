@@ -3,8 +3,8 @@
 //! `MSG_HEARTBEAT_LEASE` / `MSG_POLL_INVALIDATIONS`).
 //!
 //! Wraps the rkyv encode/decode + manager round-trip into typed
-//! methods so callers (autumn-ioring daemon AND autumn-fuse mount)
-//! keep their Open/Close paths small. Defines the per-process
+//! methods so the autumn-fuse mount keeps its Open/Close paths
+//! small. Defines the per-process
 //! `DaemonClientId` (one UUID per session; reused for every RPC so
 //! the manager's lease state stays stable across reconnects).
 //!
@@ -15,11 +15,11 @@
 //! writer slot), `LeaseError::NotLeader` (transient), or
 //! `LeaseError::Manager` (other).
 //!
-//! **History**: lived in `autumn-ioring::lease` for
-//! F-ioring-lease-1 through F-ioring-lease-4; moved here in
-//! F-fuse-lease-1 so autumn-fuse can call it without pulling in
-//! the heavy `autumn-ioring` daemon feature.
-//! `autumn-ioring::lease` re-exports from this module.
+//! **History**: originated for the io_uring daemon lease work
+//! (F-ioring-lease-1..4), moved into the SDK in F-fuse-lease-1 so
+//! autumn-fuse could call it directly. The io_uring daemon (and its
+//! `autumn-ioring::lease` re-export) was removed 2026-06-30;
+//! autumn-fuse is now the sole consumer.
 
 use anyhow::Result;
 use crate::ClusterClient;

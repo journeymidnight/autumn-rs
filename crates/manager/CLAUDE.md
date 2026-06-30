@@ -1669,7 +1669,13 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     leader fence — the txn already carries it), 32 (sealed state).
 
 34. **F-ioring-lease-1 InodeLease registry (Phase 1 ground floor for
-    autumn-fuse + autumn-ioring-daemon coherence).** JuiceFS-style
+    autumn-fuse coherence).** **NOTE (2026-06-30): the io_uring daemon
+    — the original second consumer of this registry — was removed; the
+    manager-side registry + 4 RPCs + client `lease.rs` helpers STAY (now
+    serve autumn-fuse only). Daemon-side invariants L14–L18 below
+    described `crates/ioring/src/bin/daemon.rs`, which no longer exists;
+    they are kept as design rationale for the F-fuse-lease consumer.**
+    JuiceFS-style
     inode-level lease served by the manager; same etcd backing as
     `acquire_owner_lock`. Daemons appear as `MgrClientId { kind, uuid,
     host }` — `host` is diagnostic only, identity is `(kind, uuid)`.

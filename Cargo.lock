@@ -219,25 +219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "autumn-ioring"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "autumn-client",
- "autumn-fuse",
- "autumn-rpc",
- "autumn-transport",
- "bytes",
- "clap",
- "compio",
- "futures",
- "libc",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "autumn-manager"
 version = "0.1.0"
 dependencies = [
@@ -246,7 +227,6 @@ dependencies = [
  "autumn-common",
  "autumn-etcd",
  "autumn-fuse",
- "autumn-ioring",
  "autumn-partition-server",
  "autumn-rpc",
  "autumn-stream",

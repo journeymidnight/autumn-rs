@@ -40,7 +40,7 @@ use autumn_rpc::manager_rpc::{
     LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
-use autumn_ioring::lease::{
+use autumn_client::lease::{
     self, apply_invalidation, cache_is_stale, DaemonClientId, InvalidationMap,
 };
 

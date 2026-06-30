@@ -19,9 +19,9 @@ futures = "0.3"
 thiserror.workspace = true
 tracing.workspace = true
 # F-fuse-lease-1: inode-lease helpers (DaemonClientId UUID, typed
-# acquire/release/heartbeat/poll_invalidations) used by autumn-fuse
-# AND autumn-ioring. Pulled into the SDK so both consumers depend
-# only on autumn-client + autumn-rpc, no cross-feature wiring.
+# acquire/release/heartbeat/poll_invalidations) used by autumn-fuse.
+# Pulled into the SDK so the consumer depends only on
+# autumn-client + autumn-rpc, no cross-feature wiring.
 uuid = { workspace = true }
 
 [lints]

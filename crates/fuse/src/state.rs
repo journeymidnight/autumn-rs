@@ -14,8 +14,8 @@ use autumn_client::ClusterClient;
 use crate::schema::{InodeState, ROOT_INO};
 
 /// F-fuse-lease-1: per-inode lease bookkeeping on the fuse mount side.
-/// Mirrors `autumn-ioring`'s `SessionLease` shape so the same
-/// `apply_invalidation` / `cache_is_stale` helpers work both sides.
+/// The `apply_invalidation` / `cache_is_stale` helpers operate on this
+/// shape (a writer-XOR-readers lease keyed per inode).
 #[derive(Clone, Debug)]
 pub struct FuseLease {
     /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE`, pinned at first Open.

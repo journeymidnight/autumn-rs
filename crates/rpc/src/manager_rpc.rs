@@ -131,9 +131,10 @@ pub const MSG_GET_CLUSTER_ID: u8 = 0x45;
 //
 // JuiceFS-style single-writer / many-reader leases on each fuse inode,
 // served by the manager (same etcd backing as owner locks). The lease
-// service is shared between autumn-fuse and autumn-ioring-daemon; both
-// daemons appear as `MgrClientId` to the manager and the protocol is
-// identical for either kind. See docs/autumn_fs_lease_plan.md.
+// service is consumed by autumn-fuse (the io_uring daemon, the original
+// second consumer, was removed 2026-06-30). Clients appear as
+// `MgrClientId` to the manager, so the protocol stays daemon-kind-
+// agnostic for any future consumer. See docs/autumn_fs_lease_plan.md.
 pub const MSG_ACQUIRE_LEASE: u8 = 0x46;
 pub const MSG_RELEASE_LEASE: u8 = 0x47;
 pub const MSG_HEARTBEAT_LEASE: u8 = 0x48;

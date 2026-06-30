@@ -1,5 +1,5 @@
 //! F-ioring-lease-2 — daemon-side client surface end-to-end. Drives
-//! the `autumn_ioring::lease` helpers (used inside the daemon's
+//! the `autumn_client::lease` helpers (used inside the daemon's
 //! Open/Close arms) against an in-process AutumnManager + the real
 //! `ClusterClient::mgr_call_retry` transport.
 //!
@@ -28,7 +28,7 @@ use autumn_rpc::manager_rpc::{
     MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
-use autumn_ioring::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
+use autumn_client::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
 
 fn pick_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

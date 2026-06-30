@@ -242,8 +242,8 @@ pub fn invalidate_kernel_cache_for_events(
 
 /// F-fuse-lease-1 + F-fuse-lease-2: per-mount background tasks.
 /// Spawn ONCE on the compio runtime right after `FsState::new`
-/// (before the dispatch loop). Mirrors `autumn-ioring`'s
-/// `session_heartbeat_loop` + `session_invalidation_poll_loop`:
+/// (before the dispatch loop). The two tasks are a lease heartbeat
+/// loop + an invalidation poll loop:
 ///
 /// - heartbeat: TTL/6 = 5s tick; renews every held lease;
 ///   `HeartbeatResult::NotHeld` drops the entry (the mount's open
@@ -358,9 +358,8 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                             "F-fuse-lease-1: overflow sentinel; wholesale invalidating mount"
                         );
                         // Best-effort release of every held lease
-                        // BEFORE we drop the local bookkeeping —
-                        // mirrors autumn-ioring's pattern. Without
-                        // this the manager would keep those writer
+                        // BEFORE we drop the local bookkeeping.
+                        // Without this the manager would keep those writer
                         // leases until TTL (~30s) and block other
                         // clients. Partial recovery from coco P1
                         // #3 — a full "revoked-state-aware
@@ -780,8 +779,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 // F-fuse-lease-1: AcquireLease BEFORE bumping the
                 // local open_count so a conflicting writer surfaces
                 // as `EBUSY` (mapped to ErrorKind::Other in
-                // `err_to_errno`). Refcount the lease per-mount —
-                // same pattern as autumn-ioring's `held_leases`.
+                // `err_to_errno`). Refcount the lease per-mount.
                 let req_mode = lease_mode_for_open(flags);
                 let mut needs_acquire = false;
                 {

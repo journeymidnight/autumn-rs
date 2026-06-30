@@ -23,7 +23,7 @@ use autumn_rpc::manager_rpc::{
     LEASE_MODE_WRITE,
 };
 
-use autumn_ioring::lease::{self, DaemonClientId};
+use autumn_client::lease::{self, DaemonClientId};
 
 fn pick_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
