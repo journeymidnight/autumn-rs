@@ -86,6 +86,21 @@ def main():
     print(f"  worst-term '{COMMON[0]}' (longest postings): "
           f"P50={common_lat[25]:.1f}ms  P99={common_lat[-1]:.1f}ms")
 
+    # MULTI-WORD queries (realistic prefetch = the last user message → several
+    # terms, union of posting lists + per-term sequential posting scans).
+    mw_queries = []
+    for i in range(q):
+        terms = [COMMON[i % len(COMMON)], MID[(i * 3) % len(MID)],
+                 MID[(i * 7 + 1) % len(MID)], RARE[(i * 5) % len(RARE)]]
+        mw_queries.append(" ".join(terms))
+    mw_lat = []
+    for query in mw_queries:
+        t = time.monotonic()
+        mem.search(query, 5, mode="lexical")
+        mw_lat.append((time.monotonic() - t) * 1000.0)
+    print(f"  multi-word (4 terms) over {q}: P50={pct(mw_lat,50):.1f}ms  "
+          f"P90={pct(mw_lat,90):.1f}ms  P99={pct(mw_lat,99):.1f}ms  max={max(mw_lat):.1f}ms")
+
     for i in range(n):
         if i < 5 or i % 500 == 0:
             pass  # leave the corpus; unique agent, harness tears the cluster down
