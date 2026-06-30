@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autumn-memory-langgraph"
+version = "0.1.0"
+description = "A LangGraph BaseStore backed by autumn-memory (autumn-rs)"
+requires-python = ">=3.10"
+# `langgraph` provides the BaseStore ABC; `autumn-memory` is the ergonomic
+# layer over the `autumn` PyO3 binding (built from python/ via maturin).
+dependencies = ["langgraph>=0.2", "autumn-memory", "anyio>=4"]
+
+[tool.setuptools.packages.find]
+include = ["autumn_memory_langgraph*"]

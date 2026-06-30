@@ -300,6 +300,10 @@ bash python/autumn_memory/tests/run_smoke.sh
 bash python/autumn_memory_mcp/tests/run_mcp_test.sh
 #   → "MCP INPROC OK: full tool surface ..." and "===== mcp-test exit: 0 ====="
 
+# LangGraph BaseStore adapter (get/put/search/filter/query/list_namespaces/delete/ttl):
+bash python/autumn_memory_langgraph/tests/run_store_test.sh
+#   → "LANGGRAPH STORE OK: BaseStore surface ..." and "===== lg-store-test exit: 0 ====="
+
 # Launch the stdio server for a real host (config via env or CLI flags):
 AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
   python -m autumn_memory_mcp             # or the `autumn-memory-mcp` console script

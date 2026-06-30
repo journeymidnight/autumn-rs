@@ -6,9 +6,9 @@ Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
 The Rust crate is the reusable core; thin adapters sit ON it — a PyO3 binding
 (`autumn.Memory`) → the `autumn_memory.AutumnMemory` ergonomic layer → framework
-shells (a **stdio MCP server** `python/autumn_memory_mcp`; planned Hermes
-`MemoryProvider` / LangGraph `BaseStore`). Design + rationale:
-`docs/autumn_memory_plan.md`.
+shells: a **stdio MCP server** (`python/autumn_memory_mcp`) and a **LangGraph
+`BaseStore`** (`python/autumn_memory_langgraph`); Hermes `MemoryProvider`
+planned. Design + rationale: `docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
 — drive its async methods on a compio runtime.

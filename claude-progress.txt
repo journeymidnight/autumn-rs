@@ -43,9 +43,15 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     search 出"幽灵结果"(delete 只 reap doc+BM25 不 reap IVF posting)→在检索边界修(_resolve 把 doc 记录已消失的
     hit 丢弃,§8.5 doc=正确性边界),并把 coco 场景变成回归测试(删 v1→hybrid 不返 v1/无空文本/fetch v1 报错)。
     更深的孤儿向量 posting 回收=纯索引卫生(正确性已被边界兜住)→记为 F-MEM-4 follow-up(reproduce-first,不塞进本提交)。
+  · F-MEM-5 LangGraph BaseStore 适配器(python/autumn_memory_langgraph,本会话):AutumnStore(BaseStore) over
+    AutumnMemory(纯客户端)。只实现唯一抽象面 batch/abatch,具体 get/put/search/delete/list_namespaces 都走它。
+    namespace tuple↔单个 percent-encoded fact-namespace;value 套 envelope{value,created_at,updated_at} 保 Item 时间戳
+    (更新保 created_at);保留 namespace registry(facts API 只能列单一精确 namespace)支持前缀 search/list_namespaces。
+    search=前缀扫+精确 filter+词法 query 排序;list_namespaces 支持 prefix/suffix(* 通配)+max_depth;TTL 分钟→秒。
+    限制(已记录非 bug):index= 语义嵌入路径、refresh_ttl 未接。验证:public BaseStore 全面功能测 against 隔离集群
+    (python/autumn_memory_langgraph/tests/run_store_test.sh)= **LANGGRAPH STORE OK, exit 0**。
 
 Next steps:
   1. Hermes MemoryProvider 适配器(需真 Hermes ABC + Hermes 装上;基于 AutumnMemory)。
-  2. LangGraph BaseStore 适配器(pip langgraph)。
-  3. 真 embedder(接 sglang /embeddings)。
-  4. 检索增强:CJK 分词、stats delta-log(多写者)、孤儿 reconcile。
+  2. 真 embedder(接 sglang /embeddings)→打通 AutumnMemory 向量/hybrid 腿 + MCP/LangGraph 的语义检索。
+  3. 检索增强:CJK 分词、stats delta-log(多写者)、F-MEM-4 孤儿向量回收。
