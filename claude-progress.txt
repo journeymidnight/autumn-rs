@@ -86,8 +86,14 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
   · reconcile/repair PyO3 reach(本会话):autumn.Memory.reconcile()(→dict+is_clean)/repair_stats() + AutumnMemory
     同名方法,run_smoke.sh 验证(3 docs/3 vecs clean→forget 全部→0/0 clean→repair 幂等)。Python ops cron 可审计/治愈。
 
-非门控实质工作已完成。剩余均门控/边际:
-Next steps:
-  1. Hermes MemoryProvider 适配器(F-MEM-7,gated:需真 Hermes ABC)。
-  2. 真集群语义 e2e:接真 sglang embedder 跑 MCP/LangGraph hybrid 检索 P99(plan §13 prefetch 验证;需 sglang)。
-  3. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST)。
+  · F-MEM-7 Hermes 适配器 UNBLOCKED+DONE(本会话):用户确认可 clone Hermes。真源 github.com/NousResearch/hermes-agent
+    (ABC agent/memory_provider.py),clone 到 /data/dongmao_dev/hermes-agent。python/hermes_memory_autumn/autumn/=用户插件
+    over AutumnMemory:实现真 ABC(抽象 name/is_available/initialize/get_tool_schemas + 覆盖 sync_turn[append+index,后台队列非阻塞]
+    /queue_prefetch+prefetch[后台召回→缓存块]/handle_tool_call[memory_search/store]/on_memory_write[镜像 MEMORY.md/USER.md]
+    /on_session_end/system_prompt_block/shutdown)。namespace=(user_id,agent_identity);非主上下文(cron/subagent)只读。
+    验证:in-process 测 against 真 ABC(从 Hermes checkout 加载)+ 隔离集群,全生命周期绿(HERMES PROVIDER OK)。
+
+Next steps(用户已解门控 sglang+hermes):
+  1. 真集群语义 e2e:本机 sglang(8×H200,~14GB 空闲/卡)起 embedding server(bge-m3,多语种含 CJK),
+     接 embedder client 跑真模型 hybrid 检索(MCP/LangGraph/Hermes)。HF 可达,sglang 0.5.10 已装。
+  2. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST)。

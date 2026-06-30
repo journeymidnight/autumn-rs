@@ -265,10 +265,19 @@ crate guide: [`crates/autumn-memory/CLAUDE.md`](crates/autumn-memory/CLAUDE.md).
 The Python stack sits on the Rust core: `autumn.Memory` (PyO3 binding,
 `python/src/memory.rs`) → `autumn_memory.AutumnMemory` (ergonomic layer:
 JSON + an optional text-embedder hook, `python/autumn_memory`) → framework
-shells. First shell: a **stdio MCP server** (`python/autumn_memory_mcp`) that
-any MCP host (Claude Desktop / Cursor / Cline / ChatGPT Developer Mode) spawns
-per session — `search`/`fetch`/`add`/`update`/`delete` + episodic + fact tools;
-lexical (BM25) search needs no embedder.
+shells:
+
+- **stdio MCP server** (`python/autumn_memory_mcp`) — any MCP host (Claude
+  Desktop / Cursor / Cline / ChatGPT Developer Mode) spawns it per session;
+  `search`/`fetch`/`add`/`update`/`delete` + episodic + fact tools.
+- **LangGraph `BaseStore`** (`python/autumn_memory_langgraph`) — drop-in
+  long-term store: get/put/search(+filter ops)/list_namespaces.
+- **Hermes `MemoryProvider`** (`python/hermes_memory_autumn`) — a Hermes Agent
+  memory plugin: sync_turn / prefetch recall / memory tools / built-in-write
+  mirror.
+
+Lexical (BM25) search needs no embedder; the vector / hybrid legs use the
+optional embedder.
 
 **Manual verification (Phase 1 — Rust core):**
 
@@ -307,6 +316,12 @@ bash python/autumn_memory_langgraph/tests/run_store_test.sh
 # Embedder client (OpenAI-compatible /embeddings; mock server, no cluster needed):
 bash python/autumn_memory/tests/run_embedder_test.sh
 #   → "EMBEDDER OK: ..." and "===== embedder-test exit: 0 ====="
+
+# Hermes MemoryProvider adapter, driven against the REAL Hermes ABC (clone it
+# first) — register/init/sync_turn→prefetch recall/tools/built-in-write mirror:
+git clone https://github.com/NousResearch/hermes-agent /data/dongmao_dev/hermes-agent
+bash python/hermes_memory_autumn/tests/run_hermes_test.sh
+#   → "HERMES PROVIDER OK: real MemoryProvider ABC ..." and "===== hermes-test exit: 0 ====="
 
 # Launch the stdio server for a real host (config via env or CLI flags):
 AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
