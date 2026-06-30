@@ -93,7 +93,14 @@ Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
     /on_session_end/system_prompt_block/shutdown)。namespace=(user_id,agent_identity);非主上下文(cron/subagent)只读。
     验证:in-process 测 against 真 ABC(从 Hermes checkout 加载)+ 隔离集群,全生命周期绿(HERMES PROVIDER OK)。
 
-Next steps(用户已解门控 sglang+hermes):
-  1. 真集群语义 e2e:本机 sglang(8×H200,~14GB 空闲/卡)起 embedding server(bge-m3,多语种含 CJK),
-     接 embedder client 跑真模型 hybrid 检索(MCP/LangGraph/Hermes)。HF 可达,sglang 0.5.10 已装。
-  2. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST)。
+  · F-MEM-11 真模型语义 e2e DONE(本会话):run_real_embed.sh 起本机 sglang(gte-Qwen2-1.5B,dim1536,GPU7)+ 隔离集群,
+     跑 AutumnMemory 向量/hybrid + Hermes provider against 真 embedder。关键=无词法重叠的语义命中:"a small furry pet
+     that purrs"→cat;"databases consistent when servers crash"→consensus;CJK"可爱的宠物"→"小猫在阳光下睡觉"。
+     Hermes 向量工具路径(coco P1#1)真模型验证。REAL EMBED OK + HERMES PROVIDER OK。
+     sglang 配方:FLASHINFER_DISABLE_VERSION_CHECK=1 + 去掉 --trust-remote-code(gte-Qwen2 自定义 tokenizer 引用已删模块)
+     + --is-embedding --mem-fraction-static 0.12;详见 memory project_sglang_embedder_recipe。后台进程会被 sandbox 杀(exit144)
+     →一次前台 run 内起 sglang 子进程。
+
+所有门控+实质工作完成。剩余仅可选边际:
+Next steps:
+  1. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查;无状态治理 gateway(REST);prefetch P99 实测(plan §13)。

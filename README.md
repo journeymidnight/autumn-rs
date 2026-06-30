@@ -323,6 +323,13 @@ git clone https://github.com/NousResearch/hermes-agent /data/dongmao_dev/hermes-
 bash python/hermes_memory_autumn/tests/run_hermes_test.sh
 #   → "HERMES PROVIDER OK: real MemoryProvider ABC ..." and "===== hermes-test exit: 0 ====="
 
+# Real-model semantic e2e: starts a local sglang embedding server + cluster and
+# checks semantic recall with NO lexical overlap (needs a free GPU + a venv from
+# the run above). The harness keeps sglang as a child of the one run.
+EMBED_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct EMBED_GPU=7 \
+  bash python/autumn_memory/tests/run_real_embed.sh
+#   → "REAL EMBED OK: vector + hybrid semantic recall ..." and "===== real-embed-test exit: 0 ====="
+
 # Launch the stdio server for a real host (config via env or CLI flags):
 AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
   python -m autumn_memory_mcp             # or the `autumn-memory-mcp` console script
