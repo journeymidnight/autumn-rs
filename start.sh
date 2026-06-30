@@ -300,6 +300,22 @@ wait_port 9001 manager
 # 3. extent-nodes (format + launch)
 # ============================================================
 
+# Wait until the manager actually wins etcd leadership before proceeding.
+# A blind `sleep 10` races the election: not-leader-yet → bootstrap later
+# fails with `create stream: not leader`; won-early → wasted time.
+# `policy-candidates` is leader-gated (CODE_NOT_LEADER on a follower) and is
+# only answered AFTER replay_from_etcd completes, so exit 0 == "leader, ready".
+printf '[start] waiting for manager leadership'
+for ((i=1; i<=60; i++)); do
+    if "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" policy-candidates >/dev/null 2>&1; then
+        echo " — ready (${i}s)"
+        break
+    fi
+    printf '.'
+    sleep 1
+    (( i == 60 )) && die "manager did not become leader within 60s — check $LOG_DIR/manager.log and that etcd is listening on :2379"
+done
+
 log "3/5  $N_EN extent-nodes"
 for ((i=0; i<N_EN; i++)); do
     idx=$((i + 1))
@@ -344,8 +360,19 @@ done
 # allocate extents on it before it's truly serving — PS later opens the
 # partition, commit_length probes the assigned EN, gets `0/3 committed
 # members reachable`, and retries forever.
-log "  waiting for $N_EN EN(s) to be online in manager (10s)..."
-sleep 10
+# Wait until the manager reports all ENs as df-online (NodeAutoState::Online),
+# not merely registered. A freshly-registered EN sits in `Suspend` until its
+# first successful df probe; bootstrapping against a not-yet-df'd EN makes the
+# PS later wedge on `0/3 committed members reachable`. (Blind `sleep 10` raced
+# this — list-nodes col 3 is the AUTO state.)
+log "  waiting for $N_EN EN(s) to be df-online in manager..."
+for ((i=1; i<=60; i++)); do
+    online=$("$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" list-nodes 2>/dev/null \
+                 | awk '$3=="Online"{c++} END{print c+0}')
+    (( online >= N_EN )) && { log "  $online/$N_EN EN(s) df-online (${i}s)"; break; }
+    sleep 1
+    (( i == 60 )) && die "only ${online:-0}/$N_EN EN(s) df-online after 60s — check $LOG_DIR/node*.log + manager df health"
+done
 
 log "4/5  partition-server on $BIND_HOST:$PS_PORT"
 start_proc ps "$PS" \
