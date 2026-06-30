@@ -17,6 +17,7 @@ pyo3 = { version = "0.24", features = ["extension-module"] }
 autumn-client = { path = "../crates/client" }
 autumn-rpc = { path = "../crates/rpc" }
 autumn-transport = { path = "../crates/transport" }
+autumn-memory = { path = "../crates/autumn-memory" }
 compio = { version = "0.18", features = ["runtime", "time"] }
 futures = "0.3"
 bytes = "1"

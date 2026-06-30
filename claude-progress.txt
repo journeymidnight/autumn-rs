@@ -1,6 +1,8 @@
 Date: 2026-06-30
-TaskStatus: completed
-Task scope: 实现 autumn-memory Phase 1(AI agent memory 后端,docs/autumn_memory_plan.md)。
+TaskStatus: not_completed
+Task scope: 实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
+  现 Phase 2(Python binding + Hermes 适配)进行中:Phase 2a(Python PyO3 binding)已完成。
+  Phase 1 原始记录如下。
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。
 
 Current summary (Phase 1 完成,e2e 绿):
@@ -19,10 +21,14 @@ Current summary (Phase 1 完成,e2e 绿):
     against 隔离最小集群(tests/run_e2e.sh:memory-only manager + 1 EN cpuset0 + 1 PS,loopback,免 etcd)= **绿**。
   · 顺带修了 main 上的 wire-fingerprint 回归(52e895d,a8e12ee 改 manager_rpc.rs 注释引起)。
 
-Main gaps: 无(Phase 1 验收达成)。
+Phase 2a 完成(Python PyO3 binding):python/src/memory.rs 的 `Memory` pyclass(同步阻塞 façade:
+  专用 compio worker 线程持 !Send MemoryStore + 闭包-job 通道,Python 方法发 job 阻塞等结果、等待放 GIL)。
+  16 方法(connect/close + episodic/fact/BM25/IVF/hybrid 全覆盖)。注册进 `autumn` 模块。
+  验证:cargo build python crate 绿;maturin develop 建 wheel(CPython 3.12);**Python 运行时 e2e 全过**
+  (隔离 venv + 隔离集群,autumn.Memory 真调全 surface;脚本 python/tests/run_memory_e2e.sh)。
 
-Next steps (Phase 2):
-  1. Python PyO3 binding over Rust MemoryStore(给 Hermes/LangGraph 适配用)。
-  2. Hermes MemoryProvider 适配器(plan §10/§13:initialize/sync_turn/prefetch + memory_search/store 工具)。
-  3. MCP server(通用触达)。
-  4. 检索增强:embedder 接 sglang、stemming/CJK 分词、stats delta-log(多写者)、孤儿 posting reconcile。
+Next steps (Phase 2 续):
+  1. Hermes MemoryProvider 适配器(plan §10/§13:initialize/sync_turn/prefetch + memory_search/store 工具;
+     独立 plugin repo hermes-memory-autumn)。embedder 接 sglang(向量腿/hybrid 用)。
+  2. MCP server(stdio,通用触达)。
+  3. 检索增强:stemming/CJK 分词、stats delta-log(多写者)、孤儿 posting reconcile。

@@ -27,6 +27,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod memory;
+
 // ── PyHandle: asyncio.Future bridge ─────────────────────────────────────────
 
 struct PyHandle {
@@ -1095,6 +1097,7 @@ impl BatchClient {
 fn autumn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<BatchClient>()?;
+    m.add_class::<memory::Memory>()?;
     m.add_function(wrap_pyfunction!(set_transport, m)?)?;
     Ok(())
 }
