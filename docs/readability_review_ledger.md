@@ -24,7 +24,7 @@ Rules per chunk:
 | 3 | crates/rpc | 6579 | done | f833d1d (client.rs read_loop dedup), f89802c (bench dedup) |
 | 4 | crates/transport (+ucx-sys-mini) | 4140 | done | 0fe3e72 (endpoint/lib/listener dedup), 63dcc34 (regpool dead branch + bench/test dedup) |
 | 5 | crates/client | 3966 | done | c66d555 (NOT_LEADER loop ×4, fail_slots ×8, GetStream ctor, lease_call ×4) |
-| 6 | crates/stream — server side (extent node) | ~9000 | todo | |
+| 6 | crates/stream — server side (extent node) | ~9000 | done | 9bc0408 (read_plan/committed_length_value/wrong_shard_err dedup + clippy sweep; conn_pool+erasure clean) |
 | 7 | crates/stream — client side (StreamClient) | ~9000 | todo | |
 | 8 | crates/partition-server — core write/read path | ~11000 | todo | |
 | 9 | crates/partition-server — flush/compact/GC/split | ~11400 | todo | |
@@ -62,3 +62,18 @@ Status values: todo | in_progress | done
 - transport skipped-as-not-worth-it: regpool warn-once latch duplicated at 2
   cold sites (borderline); pre-existing ucx-build clippy nits (vec_box on the
   deliberate stable-address Slot pool, u32→u32 FFI casts) left alone.
+- extent_node.rs DEFERRED (needs a dedicated session + chaos validation, per
+  the note-24 reverted-refactor history — do NOT do these in a casual pass):
+  - The append validation protocol (corrupt_meta gate → eversion refresh →
+    seal check → P0-B durable fence + recheck → commit reconcile + F146/F147-B
+    recheck) exists TWICE: build_append_future (hot, ~2200-2360) and
+    handle_append (single-op/test-only reference, ~5330-5490). Guard fixes
+    have had to land twice (F146 vs F147-B). Extraction shape: an
+    `append_fence_and_reconcile(extent, owner_epoch, commit) -> AppendGate`
+    helper; callers map to their response forms. handle_append is NOT
+    production-reachable (process_frames_backpressured handles MSG_APPEND
+    before dispatch()), so the hot copy is the only perf-sensitive one.
+  - handle_convert_to_ec is ~420 lines with 3 clean seams (setup+lock /
+    stripe-encode-fanout / phase-2 commit loop).
+- stream conn_pool.rs: `is_healthy` only checks pool presence, not
+  `is_closed()` — arguably misleading name (public API; left alone).

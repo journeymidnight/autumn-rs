@@ -36,6 +36,16 @@ Current summary:
     - put_zc_opts/get_range_into 各自的重试循环保留(调用原语不同:call_vectored/
       call_into_dest;refresh_and_backoff 已共享)——刻意不强行统一。
     验证:client 27/27 + memory 20/20 + fuse 44/44 + workspace 绿;client clippy 清。
+  · Chunk 6 stream server 侧(extent_node 8652 行等)done,commit 9bc0408 pushed:
+    - read_plan():读路径 eversion 门+长度语义双拷贝(批量热路径 build_read_future
+      vs 单发 handle_read_bytes,F119-C/P0-C 修过两遍)收敛为一个纯函数(无 await,
+      原子 load 数不变);committed_length_value()(commit_length/probe 注释自称
+      identical 的块);wrong_shard_err()(F099-M 拒绝 4 处);clippy --fix 清 22 警告
+      (21 个 wire-v5 加宽残留的同型转换 + erasure div_ceil)。
+    - conn_pool/erasure 读毕干净。extent_node 子代理审出的大项(append 协议双拷贝、
+      convert_to_ec 420 行拆分)刻意延后(热路径 fencing/commit-truncation,
+      note 24 有 revert 前科)→ ledger findings log 记录了提取形状。
+    验证:autumn-stream 全部 15 个测试套件绿(90 lib + 集成);workspace 绿;clippy 清。
 
 Main gaps / risks:
   · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
@@ -43,7 +53,9 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 6/7 stream(18k 行,分 server 侧 extent_node 与 client 侧 StreamClient 两迭代;
-     autumn-stream 有 22 条 clippy 警告可顺带清)。
+  1. Chunk 7 stream client 侧(client.rs 5224 行 StreamClient)。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
+  3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +
+     handle_convert_to_ec 拆分——需专门会话+chaos 验证(note 24 revert 教训),
+     不在 readability loop 里顺手做。
