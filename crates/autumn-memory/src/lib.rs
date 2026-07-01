@@ -78,6 +78,25 @@ impl MemoryStore {
         Ok(Self::with_client(Rc::new(client), tenant, agent))
     }
 
+    /// F-AUTHZ-1: connect a client bound to `credential` and build a store for
+    /// `(tenant, agent)`. Use against an authz-enabled cluster — the client
+    /// AUTH_HELLOs each PS connection with a short-TTL token (auto-minted +
+    /// renewed) scoped to the tenant's granted `mem/{tenant}/` prefix. The
+    /// `tenant` here MUST be the same tenant the credential was created for, so
+    /// the token's `allowed_prefixes` cover this store's `mem/{tenant}/` keys.
+    pub async fn connect_with_credential(
+        manager: &str,
+        tenant: impl Into<String>,
+        agent: impl Into<String>,
+        credential: Vec<u8>,
+    ) -> Result<Self, AutumnError> {
+        let tenant = tenant.into();
+        let client = ClusterClient::connect_with_credential(manager, tenant.clone(), credential)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        Ok(Self::with_client(Rc::new(client), tenant, agent))
+    }
+
     /// Build a store reusing an existing (already-connected) client.
     pub fn with_client(
         client: Rc<ClusterClient>,
