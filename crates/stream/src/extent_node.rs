@@ -2085,6 +2085,70 @@ fn eversion_mismatch_read_resp(req_id: u32, zc: bool) -> Bytes {
     }
 }
 
+/// A read's serving plan, computed from the extent's local state — the ONE
+/// place holding the eversion gate + logical-length semantics for reads.
+/// Shared by the batched hot path (`build_read_future`) and the single-op
+/// `handle_read_bytes` so the two can never drift (the F119-C and P0-C fixes
+/// each previously had to land twice). Pure computation, no awaits.
+///
+/// Returns `None` when `req.eversion` is stale → the caller answers
+/// CODE_EVERSION_MISMATCH. F119-C: `req.eversion < ev` is enforced
+/// UNCONDITIONALLY (no `> 0` skip) — a stale-cached eversion=0, populated
+/// while the extent was open, must be rejected after split/EC bump it, and it
+/// must be a typed RESPONSE (not a frame error) so the client's retry loop
+/// invalidates its cache and re-routes through the EC path.
+///
+/// Returns `Some((end, read_offset, read_size))` otherwise. P0-C: a
+/// sealed-EMPTY extent (sealed=true, sealed_length=0) has logical length 0 —
+/// never serve residual/ghost `.dat` bytes past its (0) seal point (also
+/// stops recovery's `length=0` read from copying ghost bytes to a fresh
+/// replica). Normal sealed / EC extents keep `extent.len`: a replicated
+/// sealed extent has len==sealed_length, and EC shard reads carry explicit
+/// per-shard lengths, so clamping to the logical `sealed_length` there would
+/// be wrong.
+fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Option<(u64, u64, u64)> {
+    let ev = extent.eversion.load(Ordering::SeqCst);
+    if req.eversion < ev {
+        return None;
+    }
+    let total_len = if extent.sealed.load(Ordering::SeqCst)
+        && extent.sealed_length.load(Ordering::SeqCst) == 0
+    {
+        0
+    } else {
+        extent.len.load(Ordering::SeqCst)
+    };
+    let read_offset = req.offset;
+    let read_size = if req.length == 0 {
+        total_len.saturating_sub(read_offset)
+    } else {
+        req.length.min(total_len.saturating_sub(read_offset))
+    };
+    Some((total_len, read_offset, read_size))
+}
+
+/// The authoritative committed length reported to a length probe — shared by
+/// `handle_commit_length` and `handle_probe_extent` (their length-source
+/// semantics must stay identical so the `info` CLI display matches what a
+/// real owner sees).
+///
+/// P0-C (coco review #3 issue 3): a sealed extent's authoritative length is
+/// `sealed_length` — INCLUDING 0 for a sealed-EMPTY extent. Decide "is
+/// sealed" via the explicit flag OR a positive length, not `sealed_length >
+/// 0` (which fell through to `last_synced`, and after a restart
+/// `Coalescer::new(len)` seeds last_synced from the file size, so
+/// residual/ghost `.dat` bytes would be reported as a non-zero commit
+/// boundary for a sealed-empty extent). Open extents report the fsync
+/// high-water.
+fn committed_length_value(entry: &ExtentEntry) -> u64 {
+    let sealed_len = entry.sealed_length.load(Ordering::SeqCst);
+    if entry.sealed.load(Ordering::SeqCst) || sealed_len > 0 {
+        sealed_len
+    } else {
+        entry.coalescer.last_synced.load(Ordering::SeqCst)
+    }
+}
+
 /// Reject an entire same-extent append batch with `code` (no bytes written →
 /// offset/end = 0): encode the `AppendResp` once and fan it out to every slot's
 /// `req_id`. Every fail-closed guard in `build_append_future` (quarantine /
@@ -2249,10 +2313,10 @@ async fn build_append_future(
 
     // 4. Commit reconciliation.
     let mut file_start = extent.len.load(Ordering::SeqCst);
-    if file_start < first.commit as u64 {
+    if file_start < first.commit {
         return batch_append_reject(slots, CODE_PRECONDITION);
     }
-    if file_start > first.commit as u64 {
+    if file_start > first.commit {
         // F119-E / F123: before truncating, confirm with manager that this
         // extent is NOT sealed. A stale writer's low `header.commit` would
         // otherwise silently shrink a sealed extent.
@@ -2309,7 +2373,7 @@ async fn build_append_future(
     let mut cursor = file_start;
     let mut total_payload: usize = 0;
     for slot in &slots {
-        offsets.push(cursor as u64);
+        offsets.push(cursor);
         cursor += slot.req.payload.len() as u64;
         total_payload += slot.req.payload.len();
         bufs.push(slot.req.payload.clone());
@@ -2472,45 +2536,11 @@ fn build_read_future(
 
         for slot in slots {
             let req = slot.req;
-            let ev = extent.eversion.load(Ordering::SeqCst);
-            // F119-C: see handle_read_bytes — drop the `req.eversion > 0`
-            // skip so a stale-cached eversion=0 (populated when the extent
-            // was open) gets rejected as CODE_EVERSION_MISMATCH after
-            // split / EC bump it past 0. Also: return a CODE_EVERSION_MISMATCH
-            // RESPONSE (not a frame-level error) so the client's
-            // `read_shard_from_addr` recognises it via `resp.code ==
-            // CODE_EVERSION_MISMATCH` and the top-level
-            // `read_bytes_from_extent` retry loop self-heals via
-            // `invalidate_extent_cache` + refetch + EC re-route. Pre-fix
-            // this batched path emitted a `FailedPrecondition` frame
-            // error, which surfaced as a generic transport error and
-            // never triggered the cache refresh.
-            if req.eversion < ev {
+            // Eversion gate + length semantics live in `read_plan` (shared
+            // with handle_read_bytes — see its doc for F119-C / P0-C).
+            let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
                 out.push(eversion_mismatch_read_resp(slot.req_id, zc));
                 continue;
-            }
-
-            // P0-C (coco review #3 issue 1): a sealed-EMPTY extent
-            // (sealed=true, sealed_length=0) has logical length 0 — never serve
-            // residual / ghost `.dat` bytes past its (0) seal point (also stops
-            // recovery's `length=0` read from copying ghost bytes to a fresh
-            // replica). Normal sealed / EC extents keep `extent.len`: a
-            // replicated sealed extent has len==sealed_length, and EC shard
-            // reads carry explicit per-shard lengths, so clamping to the logical
-            // `sealed_length` there would be wrong.
-            let total_len = if extent.sealed.load(Ordering::SeqCst)
-                && extent.sealed_length.load(Ordering::SeqCst) == 0
-            {
-                0
-            } else {
-                extent.len.load(Ordering::SeqCst)
-            };
-            let end = total_len;
-            let read_offset = req.offset as u64;
-            let read_size = if req.length == 0 {
-                total_len.saturating_sub(read_offset)
-            } else {
-                (req.length as u64).min(total_len.saturating_sub(read_offset))
             };
 
             // F171: clone the file Rc once per slot; same rationale as
@@ -3811,22 +3841,27 @@ impl ExtentNode {
         }
     }
 
+    /// F099-M wrong-shard rejection: hot-path RPCs (append/read/
+    /// commit_length/probe/synced_length) must hit the owning shard. A
+    /// wrong-shard request signals a client routing bug — surface it as
+    /// FailedPrecondition so the client logs it instead of silently
+    /// succeeding on the wrong shard.
+    fn wrong_shard_err(&self, extent_id: u64) -> (StatusCode, String) {
+        (
+            StatusCode::FailedPrecondition,
+            format!(
+                "extent {} belongs to shard {} not shard {} (shard_count={})",
+                extent_id,
+                extent_id % self.shard_count as u64,
+                self.shard_idx,
+                self.shard_count,
+            ),
+        )
+    }
+
     async fn get_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, (StatusCode, String)> {
-        // F099-M: hot-path RPCs (append/read/commit_length) must hit the
-        // owning shard. A wrong-shard request signals a client routing
-        // bug — surface it as FailedPrecondition so the client logs it
-        // instead of silently succeeding on the wrong shard.
         if !self.owns_extent(extent_id) {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} belongs to shard {} not shard {} (shard_count={})",
-                    extent_id,
-                    extent_id % self.shard_count as u64,
-                    self.shard_idx,
-                    self.shard_count,
-                ),
-            ));
+            return Err(self.wrong_shard_err(extent_id));
         }
         self.extents
             .get(&extent_id)
@@ -4137,7 +4172,7 @@ impl ExtentNode {
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u64) -> Result<(), String> {
         let f = extent.file_rc();
-        f.set_len(commit as u64).await.map_err(|e| e.to_string())?;
+        f.set_len(commit).await.map_err(|e| e.to_string())?;
         // F152: fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
         // node crashes after `set_len` but before any subsequent must_sync
@@ -4151,7 +4186,7 @@ impl ExtentNode {
         // file size IS the data we need durable, and subsequent appends
         // will sync content separately.
         f.sync_data().await.map_err(|e| e.to_string())?;
-        extent.len.store(commit as u64, Ordering::SeqCst);
+        extent.len.store(commit, Ordering::SeqCst);
         // Bug fix: align the coalescer's view with the actual file
         // length post-truncate. `last_synced` is what `MSG_COMMIT_LENGTH`
         // and `MSG_PROBE_EXTENT` return; if we leave it at the
@@ -4162,11 +4197,11 @@ impl ExtentNode {
         extent
             .coalescer
             .last_synced
-            .store(commit as u64, Ordering::SeqCst);
+            .store(commit, Ordering::SeqCst);
         extent
             .coalescer
             .pending_fsync
-            .store(commit as u64, Ordering::SeqCst);
+            .store(commit, Ordering::SeqCst);
         Ok(())
     }
 
@@ -5368,10 +5403,10 @@ impl ExtentNode {
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
-        if start < req.commit as u64 {
+        if start < req.commit {
             return append_reject(CODE_PRECONDITION);
         }
-        if start > req.commit as u64 {
+        if start > req.commit {
             // F119-E: confirm with the manager that this extent is NOT
             // sealed before truncating. Otherwise a stale-PS append with
             // a low `header.commit` would silently shrink an extent the
@@ -5485,51 +5520,16 @@ impl ExtentNode {
             .encode());
         }
 
-        // Use local extent state for eversion checks (no manager RPC needed on reads).
-        // Returning a typed CODE_EVERSION_MISMATCH (rather than an Err
-        // status) lets the StreamClient distinguish "stale cache —
-        // refetch ExtentInfo and retry" from generic transport errors.
-        // Critical post-EC-conversion: a stale-cache client would
-        // otherwise drive 3-replica failover-with-timeout against
-        // shrunken shard files (see plan: ec-http-...-smooth-tome.md).
-        //
-        // F119-C: enforce req.eversion < ev unconditionally — the prior
-        // `req.eversion > 0` skip silently let through a stale-cached
-        // eversion=0 (populated when the extent was open via
-        // load_stream_tail / alloc_new_extent_once). After split bumped
-        // ev to 1 and EC conversion bumped ev to 2 + shrunk the on-disk
-        // file to shard_size, a cross-shard sub-range read (e.g. a 14 MB
-        // VP straddling shards 0/1) silently truncated to the bytes
-        // remaining in shard 0. The client now correctly sees
-        // EVERSION_MISMATCH on attempt 0, invalidates the cache, and the
-        // retry routes through ec_subrange_read.
-        let ev = extent.eversion.load(Ordering::SeqCst);
-        if req.eversion < ev {
+        // Eversion gate + length semantics live in `read_plan` (shared with
+        // the batched build_read_future — see its doc for F119-C / P0-C and
+        // why the mismatch is a typed RESPONSE, not an Err status).
+        let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
             return Ok(ReadBytesResp {
                 code: CODE_EVERSION_MISMATCH,
                 end: 0,
                 payload: Bytes::new(),
             }
             .encode());
-        }
-
-        // P0-C (coco review #3 issue 1): sealed-EMPTY extent ⇒ logical length 0
-        // (never serve residual/ghost bytes; also stops a `length=0` recovery
-        // read from copying them). Mirror of build_read_future. Normal sealed /
-        // EC reads keep extent.len (see that fn for why).
-        let total_len = if extent.sealed.load(Ordering::SeqCst)
-            && extent.sealed_length.load(Ordering::SeqCst) == 0
-        {
-            0
-        } else {
-            extent.len.load(Ordering::SeqCst)
-        };
-        let end = total_len;
-        let read_offset = req.offset as u64;
-        let read_size = if req.length == 0 {
-            total_len.saturating_sub(read_offset)
-        } else {
-            (req.length as u64).min(total_len.saturating_sub(read_offset))
         };
 
         // Chunk pread to dodge the per-syscall INT_MAX cap on macOS /
@@ -5559,16 +5559,7 @@ impl ExtentNode {
 
         // F099-M: commit_length is a hot-path RPC; reject wrong-shard.
         if !self.owns_extent(req.extent_id) {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} belongs to shard {} not shard {} (shard_count={})",
-                    req.extent_id,
-                    req.extent_id % self.shard_count as u64,
-                    self.shard_idx,
-                    self.shard_count,
-                ),
-            ));
+            return Err(self.wrong_shard_err(req.extent_id));
         }
 
         let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
@@ -5665,19 +5656,7 @@ impl ExtentNode {
         // `sealed_length` for sealed extents (set in
         // `apply_extent_meta_durable`), so the EC-shard-size confusion
         // doesn't recur.
-        // P0-C (coco review #3 issue 3): a sealed extent's authoritative length
-        // is `sealed_length` — INCLUDING 0 for a sealed-EMPTY extent. Decide
-        // "is sealed" via the explicit flag OR a positive length, not
-        // `sealed_length > 0` (which fell through to `last_synced`, and after a
-        // restart `Coalescer::new(len)` seeds last_synced from the file size, so
-        // residual/ghost `.dat` bytes would be reported as a non-zero commit
-        // boundary for a sealed-empty extent).
-        let sealed_len = entry.sealed_length.load(Ordering::SeqCst);
-        let length = if entry.sealed.load(Ordering::SeqCst) || sealed_len > 0 {
-            sealed_len
-        } else {
-            entry.coalescer.last_synced.load(Ordering::SeqCst)
-        };
+        let length = committed_length_value(&entry);
         Ok(CommitLengthResp {
             code: CODE_OK,
             length,
@@ -5708,16 +5687,7 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
         if !self.owns_extent(req.extent_id) {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} belongs to shard {} not shard {} (shard_count={})",
-                    req.extent_id,
-                    req.extent_id % self.shard_count as u64,
-                    self.shard_idx,
-                    self.shard_count,
-                ),
-            ));
+            return Err(self.wrong_shard_err(req.extent_id));
         }
 
         let entry = match self.extents.get(&req.extent_id) {
@@ -5731,19 +5701,7 @@ impl ExtentNode {
             }
         };
 
-        // P0-C (coco review #3 issue 3): a sealed extent's authoritative length
-        // is `sealed_length` — INCLUDING 0 for a sealed-EMPTY extent. Decide
-        // "is sealed" via the explicit flag OR a positive length, not
-        // `sealed_length > 0` (which fell through to `last_synced`, and after a
-        // restart `Coalescer::new(len)` seeds last_synced from the file size, so
-        // residual/ghost `.dat` bytes would be reported as a non-zero commit
-        // boundary for a sealed-empty extent).
-        let sealed_len = entry.sealed_length.load(Ordering::SeqCst);
-        let length = if entry.sealed.load(Ordering::SeqCst) || sealed_len > 0 {
-            sealed_len
-        } else {
-            entry.coalescer.last_synced.load(Ordering::SeqCst)
-        };
+        let length = committed_length_value(&entry);
         Ok(ProbeExtentResp {
             code: CODE_OK,
             length,
@@ -5772,16 +5730,7 @@ impl ExtentNode {
 
         // F099-M: hot-path RPC; reject wrong-shard.
         if !self.owns_extent(req.extent_id) {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} belongs to shard {} not shard {} (shard_count={})",
-                    req.extent_id,
-                    req.extent_id % self.shard_count as u64,
-                    self.shard_idx,
-                    self.shard_count,
-                ),
-            ));
+            return Err(self.wrong_shard_err(req.extent_id));
         }
 
         let entry = self.extents.get(&req.extent_id).ok_or_else(|| {

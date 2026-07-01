@@ -9,7 +9,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 /// `ec_decode`. (A 4-byte length trailer in the last data shard used to round
 /// `shard_size` up by 4; it was removed as redundant with `sealed_length`.)
 pub fn shard_size(payload_len: usize, data_shards: usize) -> usize {
-    ((payload_len + data_shards - 1) / data_shards).max(1)
+    payload_len.div_ceil(data_shards).max(1)
 }
 
 /// Encode a payload into `data_shards + parity_shards` equal-length byte slices.

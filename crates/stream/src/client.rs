@@ -169,7 +169,7 @@ pub(crate) fn rotated_replica_start(extent_id: u64, offset: u64, n: usize) -> us
     if n <= 1 {
         return 0;
     }
-    let mut x = extent_id ^ ((offset as u64) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut x = extent_id ^ (offset << 32) ^ 0x9e37_79b9_7f4a_7c15;
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -3043,7 +3043,7 @@ impl StreamClient {
         for attempt in 0..2 {
             let ex = self.fetch_extent_info(extent_id).await?;
             let committed_end: u64 = if ex.sealed {
-                if offset as u64 > ex.sealed_length {
+                if offset > ex.sealed_length {
                     return Err(anyhow::Error::new(StaleVpOffset {
                         extent_id,
                         requested_offset: offset,
@@ -3126,7 +3126,7 @@ impl StreamClient {
             ));
         }
         let committed_end: u64 = if ex.sealed {
-            if offset as u64 > ex.sealed_length {
+            if offset > ex.sealed_length {
                 return Err(anyhow::Error::new(StaleVpOffset {
                     extent_id,
                     requested_offset: offset,
@@ -3236,7 +3236,7 @@ impl StreamClient {
         // EC / chunked / stale-VP-offset → let the copy path handle it.
         if ex.ec_converted
             || length > self.config.read_chunk_bytes
-            || (ex.sealed && offset as u64 > ex.sealed_length)
+            || (ex.sealed && offset > ex.sealed_length)
         {
             return Ok(None);
         }
@@ -3326,7 +3326,7 @@ impl StreamClient {
         // `if start > full_payload.len()` semantics — only fires when
         // the extent has a recorded `sealed_length`, since pre-seal
         // there's no authoritative bound to check against.
-        if ex.sealed && offset as u64 > ex.sealed_length {
+        if ex.sealed && offset > ex.sealed_length {
             return Err(anyhow::Error::new(StaleVpOffset {
                 extent_id,
                 requested_offset: offset,
@@ -3844,16 +3844,16 @@ impl StreamClient {
         // wrapping `read_len`, we fall through to ec_read_full_and_slice
         // which returns an explicit Err.
         let read_len = if length == 0 {
-            sealed_length.saturating_sub(offset as u64)
+            sealed_length.saturating_sub(offset)
         } else {
-            length as u64
+            length
         };
 
         if read_len == 0 {
             return Ok((Vec::new(), 0));
         }
 
-        let start = offset as u64;
+        let start = offset;
         let end = start + read_len;
 
         let start_shard = (start / shard_size) as usize;
