@@ -24,7 +24,16 @@ Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租�
       authz OPT-IN(无signing key则关,fuse/kvcache/dev零影响)。
     · 验收单测:KDC端到端 mint→publish config→verify→过期失败→改字节失败→delete停续期(rpc_handlers::authz_kdc_tests)+disabled-when-no-key。
       manager lib 169/169 绿;rpc lib +10 cap_token 绿;workspace build 绿。coco review 进行中。
-  **Stage 2/3 未开始。** 详见 feature_list F-AUTHZ-1。
+  **Stage 2 (PS 强制) 完成 + pushed(ef1dff3 wire+module;1063693 集成;bd271b9 e2e 测试):**
+    · wire:StatusCode::PermissionDenied(=7,附加,wire-stable)+ partition_rpc MSG_AUTH_HELLO(0x55)+AuthHelloReq/Resp。指纹 v9→v10(MIN=MAX=10)。
+    · crates/partition-server/authz.rs:AuthzState(Arc:enabled AtomicBool 快门 + RwLock<Arc<AuthzInner>> kid→VerifyingKey keyring/protected/skew;install 跳 disabled kid,enabled 最后发布)+
+      BoundPrincipal + verify_auth_hello + authz_check(check_key:protected⇒需token+未过期+starts_with allowed;unprotected⇒放行;check_range:整扫区间⊆单 allowed prefix,空prefix gated⇒拒;PUT_ZC key 走二进制 meta 无 value copy;解码失败⇒放行由 handler 拒)。6 单测。
+    · 集成:AuthzState 上 PartitionServer→partition_thread_main→每 ps-conn task;per-conn principal 由 AUTH_HELLO 首帧绑;authz_gate 在每帧派发顶端(路由前)push_one_frame+d1_fast_path(push_frames 透传);enabled 关时单 atomic load 零成本;drain_zc_writes 在 authz 开时跳过(大 PUT_ZC 走普通路径统一强制)。
+    · config poll:fetch_authz_config_once(manager MSG_GET_AUTHZ_CONFIG,非leader-gate,transport失败rotate)→install;finish_connect 初次同步取(serve 前武装)+ authz_config_poll_loop(5s,spawn_supervised)。
+    · client:AutumnError::PermissionDenied(terminal 不重试)+ StatusCode 映射。
+    · e2e 测试:真 TCP handle_ps_connection(mock req_rx)驱动 AUTH_HELLO→授权GET/PUT过→跨租户拒(PermissionDenied)→匿名拒 protected→非protected放行。
+      PS lib 181/181、rpc 43、client 27、manager 169、workspace 全绿。coco review 进行中。
+  **Stage 3 未开始**(client 发 AUTH_HELLO+token+自动续期、principal 分区连接池、autumn-memory 透传凭据、autumn-op gen-signing-key/tenant-create/mint-token、跨租户真集群 e2e)。详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。

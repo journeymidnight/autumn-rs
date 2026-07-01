@@ -161,9 +161,17 @@ per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）�
   admin RPC（leader + admin token gated，etcd-first）；binary CLI（opt-in，无 signing key 则关）。
   验收单测 `authz_kdc_tests`：mint→publish config→验签→过期失败→改字节失败→delete 停续期 + disabled-when-no-key。
   manager lib 169/169、rpc lib +10、workspace 全绿。
-- **Stage 2 — PS 强制**：poll `GET_AUTHZ_CONFIG` 缓存公钥/protected；`MSG_AUTH_HELLO`
-  首帧验签绑 principal；两 choke point + Range 区间 + batch 逐 op + exp 每请求；
-  EN 大值走 PS proxy。测：跨租户拒、匿名拒、非 protected 放行。
+- **Stage 2 — PS 强制 ✅ 完成（2026-07-01，commit ef1dff3 + 1063693 + bd271b9）**：
+  `StatusCode::PermissionDenied`(=7,附加 wire-stable) + `MSG_AUTH_HELLO`(0x55) +
+  AuthHelloReq/Resp（wire v9→v10）。`partition-server/authz.rs`：AuthzState（Arc，enabled
+  AtomicBool 快门 + RwLock<Arc<AuthzInner>> kid→VerifyingKey keyring/protected/skew）+
+  verify_auth_hello + authz_check（check_key + check_range 整扫区间 ⊆ 单 allowed prefix +
+  PUT_ZC 走二进制 meta 无 value copy）。连接层强制：authz_gate 在每帧派发**顶端（路由前）**，
+  在 push_one_frame + d1_fast_path（push_frames 透传）；per-conn principal 由 AUTH_HELLO 首帧绑；
+  enabled 关时单 atomic load 零成本；authz 开时 drain_zc_writes 跳过（大 PUT_ZC 走普通路径统一强制）。
+  config poll（fetch_authz_config_once → install；finish_connect 初次同步取 + 5s poll loop）。
+  client：AutumnError::PermissionDenied（terminal）。真连接 e2e：AUTH_HELLO 绑 → 授权过 →
+  跨租户拒 → 匿名拒 → 非 protected 放行。PS 181/181、rpc/client/manager 全绿。
 - **Stage 3 — client + 工具**：SDK 持 token + 自动续期（后台）+ 连接池按 principal；
   autumn-memory 透传租户凭据；`autumn-op gen-signing-key / tenant-create / mint-token`；
   cluster.sh 分发。e2e：两租户互隔离 + 非 `mem/` 不受影响 + 续期无感 + kid 轮换。
