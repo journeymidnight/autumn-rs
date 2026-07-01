@@ -1755,6 +1755,12 @@ pub struct PartitionServer {
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
     pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
+    /// F-AUTHZ-1: shared data-plane authz runtime (public keys + protected
+    /// prefixes), refreshed by the main-thread `authz_config_poll_loop` and read
+    /// by every connection task. `Arc` because connection tasks run on the
+    /// partition OS threads. Opt-in: disabled until the manager reports a
+    /// signing key via `MSG_GET_AUTHZ_CONFIG`.
+    pub(crate) authz: std::sync::Arc<crate::authz::AuthzState>,
     /// BUG #3 reopen-thrash hardening: per-partition open-failure backoff.
     /// When `open_partition` fails (e.g. a transient listener-bind
     /// EADDRINUSE during split/merge region churn), retrying it every
@@ -2671,6 +2677,7 @@ impl PartitionServer {
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
+                            authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
                         };
                         return Ok(server);
@@ -2769,6 +2776,19 @@ impl PartitionServer {
         // in `background_compact_loop`'s timer arm).
 
         server.sync_regions_once().await?;
+
+        // F-AUTHZ-1: load the authz config BEFORE serving so enforcement is
+        // armed for the first connection. Best-effort — a fetch failure (manager
+        // briefly unreachable) leaves authz disabled and the poll loop retries
+        // within 5 s; the normal startup order (manager up first) makes this
+        // succeed. Availability wins over a cold-start fail-closed here, per the
+        // trusted-internal-net threat model.
+        if let Err(e) = server.fetch_authz_config_once().await {
+            tracing::warn!(
+                ps_id = server.ps_id,
+                "F-AUTHZ-1: initial authz config fetch failed ({e:#}); will retry via poll loop"
+            );
+        }
 
         Ok(server)
     }
@@ -3145,6 +3165,59 @@ impl PartitionServer {
             tracing::debug!("PS {} region_sync_loop: syncing", self.ps_id);
             if let Err(e) = self.sync_regions_once().await {
                 tracing::warn!("PS {} region sync failed: {e:#}", self.ps_id);
+            }
+        }
+    }
+
+    /// F-AUTHZ-1: fetch + install the data-plane authz config from the manager.
+    /// `MSG_GET_AUTHZ_CONFIG` is NOT leader-gated (it's static local config on
+    /// every manager), so any reachable manager answers; a transport failure
+    /// rotates to the next manager. Best-effort: a failed fetch keeps the prior
+    /// cached config (manager down → keep enforcing on the cache).
+    pub async fn fetch_authz_config_once(&self) -> Result<()> {
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_AUTHZ_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .context("get authz config")?;
+        let resp: manager_rpc::GetAuthzConfigResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
+            return Err(anyhow!("get_authz_config failed: {}", resp.message));
+        }
+        let was = self.authz.is_enabled();
+        self.authz.install(&resp);
+        if resp.enabled != was {
+            tracing::info!(
+                ps_id = self.ps_id,
+                enabled = resp.enabled,
+                keys = resp.public_keys.len(),
+                protected = resp.protected_prefixes.len(),
+                "F-AUTHZ-1: authz config updated"
+            );
+        }
+        Ok(())
+    }
+
+    /// F-AUTHZ-1: periodic authz-config refresh (mirrors `region_sync_loop`).
+    /// The config rarely changes (key rotation / protected-prefix edits), so a
+    /// 5 s cadence is ample; the initial load happens synchronously in
+    /// `finish_connect` so enforcement is armed before the first connection.
+    async fn authz_config_poll_loop(&self) {
+        let mut ticker = compio::time::interval(Duration::from_secs(5));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(e) = self.fetch_authz_config_once().await {
+                tracing::debug!("PS {} authz config poll failed: {e:#}", self.ps_id);
             }
         }
     }
@@ -3536,6 +3609,9 @@ impl PartitionServer {
         // inside the thread from process-global setters).
         let concurrency_for_thread = self.concurrency_ctrl.clone();
         let partition_budget_for_thread = self.partition_budget.clone();
+        // F-AUTHZ-1: share the authz runtime with the partition thread's
+        // connection tasks (they enforce per-request; the main thread refreshes).
+        let authz_for_thread = self.authz.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
         // is moved into the partition thread and threaded into PartitionData.
@@ -3584,6 +3660,7 @@ impl PartitionServer {
                         concurrency_for_thread,
                         partition_budget_for_thread,
                         opened_with_for_thread,
+                        authz_for_thread,
                     )
                     .await
                     {
@@ -3827,6 +3904,14 @@ impl PartitionServer {
         spawn_supervised("ps_region_sync", move || {
             let s = s.clone();
             async move { s.region_sync_loop().await }
+        });
+
+        // F-AUTHZ-1: refresh the data-plane authz config from the manager (key
+        // rotation / protected-prefix edits) on a 5 s cadence.
+        let s_authz = self.clone();
+        spawn_supervised("ps_authz_config", move || {
+            let s = s_authz.clone();
+            async move { s.authz_config_poll_loop().await }
         });
 
         // F099-K: region_sync_loop above drives all open/close of partition
@@ -4296,6 +4381,85 @@ async fn delegate_round_trip(
     resp_frame.encode()
 }
 
+/// F-AUTHZ-1: current unix seconds for token `exp` / `nbf` checks.
+fn authz_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// F-AUTHZ-1 connection-layer gate. Runs at the TOP of every frame dispatch,
+/// before routing. Handles `MSG_AUTH_HELLO` (verify + bind `*principal`) and,
+/// when authz is enabled, the per-request key-prefix + `exp` check.
+///
+/// Returns `Some(reply_bytes)` when the frame was HANDLED here — an AUTH_HELLO
+/// response or a `PermissionDenied` rejection — so the caller emits `reply` and
+/// does NOT dispatch the frame to serve/delegate. `None` = admit as usual.
+///
+/// Synchronous (no I/O): `*principal` is mutated only here, before any await in
+/// the calling dispatch fn, so the `&mut` borrow never spans an await.
+fn authz_gate(
+    msg_type: u8,
+    payload: &Bytes,
+    req_id: u32,
+    authz: &crate::authz::AuthzState,
+    principal: &mut Option<crate::authz::BoundPrincipal>,
+) -> Option<Bytes> {
+    if msg_type == MSG_AUTH_HELLO {
+        // When authz is OFF, accept AUTH_HELLO as a no-op (nothing is enforced;
+        // the token is simply unused) so an authz-aware client works against a
+        // non-authz PS. We can't verify without keys, and don't need to.
+        if !authz.is_enabled() {
+            let resp = AuthHelloResp {
+                code: StatusCode::Ok as u8,
+                message: String::new(),
+            };
+            return Some(
+                Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+            );
+        }
+        let now = authz_now_secs();
+        let snap = authz.snapshot();
+        let resp = match partition_rpc::rkyv_decode::<AuthHelloReq>(payload) {
+            Ok(req) => match crate::authz::verify_auth_hello(&req.token, &snap, now) {
+                Ok(p) => {
+                    *principal = Some(p);
+                    AuthHelloResp {
+                        code: StatusCode::Ok as u8,
+                        message: String::new(),
+                    }
+                }
+                Err(reject) => AuthHelloResp {
+                    code: StatusCode::PermissionDenied as u8,
+                    message: reject.label().to_string(),
+                },
+            },
+            Err(e) => AuthHelloResp {
+                code: StatusCode::InvalidArgument as u8,
+                message: format!("bad AUTH_HELLO: {e}"),
+            },
+        };
+        return Some(
+            Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+        );
+    }
+    // Fast path: no enforcement configured (single relaxed atomic load).
+    if !authz.is_enabled() {
+        return None;
+    }
+    let snap = authz.snapshot();
+    let now = authz_now_secs();
+    if let Some((code, msg)) =
+        crate::authz::authz_check(msg_type, payload, principal.as_ref(), &snap, now)
+    {
+        return Some(
+            Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg)).encode(),
+        );
+    }
+    None
+}
+
 /// F099-I — push ONE frame onto `inflight`, encoded into a
 /// LocalBoxFuture<(Bytes, Option<Bytes>)>.  Shared by `push_frames_to_inflight`
 /// (slow-path drain) and any caller that already has a single frame in hand.
@@ -4303,6 +4467,7 @@ async fn delegate_round_trip(
 /// Misrouted frames synth an error frame with no mpsc hop.  Caller must
 /// have checked `frame.req_id != 0`; fire-and-forget frames are the
 /// caller's responsibility to skip (matches pre-F099-I semantics).
+#[allow(clippy::too_many_arguments)]
 fn push_one_frame_to_inflight(
     frame: Frame,
     req_tx: &mpsc::Sender<PartitionRequest>,
@@ -4318,11 +4483,21 @@ fn push_one_frame_to_inflight(
     inflight: &mut FuturesUnordered<
         futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
     >,
+    // F-AUTHZ-1: connection authz runtime + per-connection bound principal.
+    authz: &crate::authz::AuthzState,
+    principal: &mut Option<crate::authz::BoundPrincipal>,
 ) {
     use futures::FutureExt;
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let payload = frame.payload;
+    // F-AUTHZ-1: AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
+    // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
+    // ready completion; it never reaches serve/delegate.
+    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
+        inflight.push(async move { (reply, None) }.boxed_local());
+        return;
+    }
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
@@ -4385,6 +4560,7 @@ fn push_one_frame_to_inflight(
 /// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
 /// completion before pushing more.  Drained completions go into `tx_bufs`
 /// so the caller's next `write_vectored_all` flushes them.
+#[allow(clippy::too_many_arguments)]
 async fn push_frames_to_inflight(
     decoder: &mut FrameDecoder,
     req_tx: &mpsc::Sender<PartitionRequest>,
@@ -4395,6 +4571,9 @@ async fn push_frames_to_inflight(
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
+    // F-AUTHZ-1: threaded into push_one_frame_to_inflight for the per-frame gate.
+    authz: &crate::authz::AuthzState,
+    principal: &mut Option<crate::authz::BoundPrincipal>,
 ) -> Result<()> {
     loop {
         match decoder.try_decode().map_err(|e| anyhow!(e))? {
@@ -4407,7 +4586,9 @@ async fn push_frames_to_inflight(
                         break;
                     }
                 }
-                push_one_frame_to_inflight(frame, req_tx, part, owner_part, inflight);
+                push_one_frame_to_inflight(
+                    frame, req_tx, part, owner_part, inflight, authz, principal,
+                );
             }
             Some(_) => continue, // req_id == 0 fire-and-forget
             None => break,
@@ -4437,10 +4618,18 @@ async fn d1_fast_path_round_trip(
     req_tx: &mpsc::Sender<PartitionRequest>,
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
+    // F-AUTHZ-1: connection authz runtime + per-connection bound principal.
+    authz: &crate::authz::AuthzState,
+    principal: &mut Option<crate::authz::BoundPrincipal>,
 ) -> (Bytes, Option<Bytes>) {
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let payload = frame.payload;
+    // F-AUTHZ-1: AUTH_HELLO bind / per-request gate (synchronous, before the
+    // first await). A handled frame returns its reply directly.
+    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
+        return (reply, None);
+    }
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
@@ -4506,6 +4695,9 @@ async fn handle_ps_connection(
     // would fall back to the req_tx delegate.
     part: Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
+    // F-AUTHZ-1: shared authz runtime (public keys + protected prefixes),
+    // refreshed by the main-thread poll loop. Disabled → zero hot-path cost.
+    authz: std::sync::Arc<crate::authz::AuthzState>,
 ) -> Result<()> {
     use futures::future::{select, Either, LocalBoxFuture};
 
@@ -4513,6 +4705,9 @@ async fn handle_ps_connection(
 
     let (reader, mut writer) = conn.into_split();
     let mut decoder = FrameDecoder::new();
+    // F-AUTHZ-1: per-connection principal, bound by a successful MSG_AUTH_HELLO
+    // first frame. `None` = anonymous (denied on protected prefixes only).
+    let mut principal: Option<crate::authz::BoundPrincipal> = None;
 
     let cap = ps_conn_inflight_cap();
     // F216 R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_ZC
@@ -4560,16 +4755,24 @@ async fn handle_ps_connection(
                     // before the normal decode buffers them. May push write
                     // replies onto `inflight`, which disables the d=1 fast path
                     // below (guarded by is_empty()).
-                    drain_zc_writes(
-                        &mut decoder,
-                        &mut reader,
-                        &req_tx,
-                        owner_part,
-                        &mut inflight,
-                        &mut tx_bufs,
-                        cap,
-                    )
-                    .await?;
+                    // F-AUTHZ-1: when authz is ON, skip the ZC-recv fast path so
+                    // large MSG_PUT_ZC flows through the normal FrameDecoder path
+                    // where `push_one_frame_to_inflight`'s gate enforces the key
+                    // prefix uniformly (the ZC path bypasses that dispatch). The
+                    // perf cost (a value copy on large authz-gated writes) is
+                    // acceptable — large writes are rare on the `mem/` workload.
+                    if !authz.is_enabled() {
+                        drain_zc_writes(
+                            &mut decoder,
+                            &mut reader,
+                            &req_tx,
+                            owner_part,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
+                        )
+                        .await?;
+                    }
 
                     // F099-I-fix — d=1 fast path: when this read yielded exactly
                     // one full frame and nothing else is pending, run the
@@ -4591,8 +4794,15 @@ async fn handle_ps_connection(
                         if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
                             // Engage fast path.
                             PS_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (head, value) =
-                                d1_fast_path_round_trip(frame, &req_tx, &part, owner_part).await;
+                            let (head, value) = d1_fast_path_round_trip(
+                                frame,
+                                &req_tx,
+                                &part,
+                                owner_part,
+                                &authz,
+                                &mut principal,
+                            )
+                            .await;
                             // F216 R4: MSG_GET_ZC returns a separate value iovec
                             // — write [head, value] vectored; everything else is
                             // a single frame via write_all (no regression).
@@ -4620,6 +4830,8 @@ async fn handle_ps_connection(
                                 &part,
                                 owner_part,
                                 &mut inflight,
+                                &authz,
+                                &mut principal,
                             );
                         }
                         if let Some(second) = more {
@@ -4630,6 +4842,8 @@ async fn handle_ps_connection(
                                     &part,
                                     owner_part,
                                     &mut inflight,
+                                    &authz,
+                                    &mut principal,
                                 );
                             }
                         }
@@ -4643,6 +4857,8 @@ async fn handle_ps_connection(
                         &mut inflight,
                         &mut tx_bufs,
                         cap,
+                        &authz,
+                        &mut principal,
                     )
                     .await?;
                     read_fut = Some(spawn_ps_read(reader, buf));
@@ -4691,16 +4907,20 @@ async fn handle_ps_connection(
                         decoder.feed(&buf[..n]);
                         // F216-E W1 / F219: recv large MSG_PUT_ZC values into
                         // pooled buffers first (UCX registered / TCP owned read).
-                        drain_zc_writes(
-                            &mut decoder,
-                            &mut reader,
-                            &req_tx,
-                            owner_part,
-                            &mut inflight,
-                            &mut tx_bufs,
-                            cap,
-                        )
-                        .await?;
+                        // F-AUTHZ-1: skip when authz is ON (see the idle-branch
+                        // note) so large PUT_ZC is enforced on the normal path.
+                        if !authz.is_enabled() {
+                            drain_zc_writes(
+                                &mut decoder,
+                                &mut reader,
+                                &req_tx,
+                                owner_part,
+                                &mut inflight,
+                                &mut tx_bufs,
+                                cap,
+                            )
+                            .await?;
+                        }
                         push_frames_to_inflight(
                             &mut decoder,
                             &req_tx,
@@ -4709,6 +4929,8 @@ async fn handle_ps_connection(
                             &mut inflight,
                             &mut tx_bufs,
                             cap,
+                            &authz,
+                            &mut principal,
                         )
                         .await?;
                         read_fut = Some(spawn_ps_read(reader, buf));
@@ -4765,6 +4987,8 @@ async fn partition_thread_main(
     // and doesn't drop+reopen a partition whose in-memory state is
     // already correct.
     opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    // F-AUTHZ-1: shared authz runtime for this partition's connection tasks.
+    authz: std::sync::Arc<crate::authz::AuthzState>,
 ) -> Result<()> {
     // F196 D-r7: per-partition rate controller. Built inside the
     // partition thread; each partition gets its own Mutex/state.
@@ -5262,6 +5486,8 @@ async fn partition_thread_main(
         // F216 (Option B): the accept task hands each ps-conn task a clone of
         // `part` so it can serve GET reads locally in its own FU.
         let part_for_accept = part.clone();
+        // F-AUTHZ-1: each ps-conn task gets a clone of the shared authz runtime.
+        let authz_for_accept = authz.clone();
         spawn_failstop(format!("accept[part {part_id}]"), async move {
             let mut shutdown_rx = shutdown_rx;
             use futures::future::{select, Either};
@@ -5284,9 +5510,16 @@ async fn partition_thread_main(
                         }
                         let req_tx_conn = req_tx_for_accept.clone();
                         let part_conn = part_for_accept.clone();
+                        let authz_conn = authz_for_accept.clone();
                         compio::runtime::spawn(async move {
-                            if let Err(e) =
-                                handle_ps_connection(conn, req_tx_conn, Some(part_conn), part_id).await
+                            if let Err(e) = handle_ps_connection(
+                                conn,
+                                req_tx_conn,
+                                Some(part_conn),
+                                part_id,
+                                authz_conn,
+                            )
+                            .await
                             {
                                 tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
                             }
@@ -10216,6 +10449,7 @@ mod f099j_tests {
                     req_tx,
                     None,
                     /*owner_part=*/ 7,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
                 )
                 .await
             });
@@ -10308,7 +10542,7 @@ mod f099j_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 1).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 1, std::sync::Arc::new(crate::authz::AuthzState::new())).await
             });
 
             // Simulated merged_loop: echo every Put.
@@ -10488,6 +10722,7 @@ mod f099k_tests {
                                                 tx,
                                                 None,
                                                 owner_part,
+                                                std::sync::Arc::new(crate::authz::AuthzState::new()),
                                             )
                                             .await;
                                         })
@@ -10751,6 +10986,7 @@ mod f099i_tests {
                     req_tx,
                     None,
                     /*owner_part=*/ 7,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
                 )
                 .await
             });
@@ -10841,7 +11077,7 @@ mod f099i_tests {
             let cur = Rc::new(Cell::new(0usize));
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 9).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 9, std::sync::Arc::new(crate::authz::AuthzState::new())).await
             });
 
             let peak_c = peak.clone();
@@ -11008,7 +11244,7 @@ mod f099i_tests {
                     let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4096);
 
                     let conn_handle = compio::runtime::spawn(async move {
-                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5)
+                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5, std::sync::Arc::new(crate::authz::AuthzState::new()))
                             .await
                     });
 
@@ -11188,6 +11424,7 @@ mod f099i_tests {
                     req_tx,
                     None,
                     /*owner_part=*/ 11,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
                 )
                 .await
             });
@@ -11284,7 +11521,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 13).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 13, std::sync::Arc::new(crate::authz::AuthzState::new())).await
             });
 
             let loop_handle = compio::runtime::spawn(async move {

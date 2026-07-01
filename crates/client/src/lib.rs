@@ -53,12 +53,20 @@ pub enum AutumnError {
     /// lease was revoked. The caller must stop writing under this lease
     /// and re-acquire.
     Fenced(String),
+    /// F-AUTHZ-1: the PS refused this request — the connection is not
+    /// authorized for the key range (no valid capability token, key outside the
+    /// granted prefixes, or the token expired). TERMINAL: retrying / refreshing
+    /// routing won't help; the caller must (re-)authenticate with a token that
+    /// grants the key. Distinct from `NotFound` so a denied key isn't mistaken
+    /// for an absent one.
+    PermissionDenied(String),
 }
 
 impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AutumnError::NotFound => write!(f, "key not found"),
+            AutumnError::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
@@ -137,6 +145,10 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
             StatusCode::NotFound => AutumnError::NotFound,
             StatusCode::InvalidArgument => AutumnError::InvalidArgument(message),
             StatusCode::FailedPrecondition => AutumnError::PreconditionFailed(message),
+            // F-AUTHZ-1: TERMINAL — not in any retry set (refresh/retry can't
+            // grant access), so it propagates to the caller instead of burning
+            // the routing-refresh budget.
+            StatusCode::PermissionDenied => AutumnError::PermissionDenied(message),
             // Unavailable is transient (overloaded / draining) → keep retryable.
             StatusCode::Unavailable => AutumnError::ConnectionError(message),
             // Ok-as-error / Internal / AlreadyExists: surface as ServerError
