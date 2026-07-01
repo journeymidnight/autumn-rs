@@ -54,6 +54,22 @@ Current summary:
     - 刻意跳过:两处 chunked-read 循环骨架(需单态 async-closure 泛型才 alloc 等价)。
     验证:stream 15 套件绿;PS lib 182/182 ×3(首跑 1 例未捕获名的 one-off flake,
     基线也复跑 5 次全绿=既有时序敏感,已记 ledger);workspace 绿。
+  · Chunk 8+9 partition-server(22k 行)done,commit 8437622 pushed:
+    - sst_lookup_paged_retry()(F261 补偿重试 get/head 双拷贝合一,borrow 改块级
+      作用域=note-15 惯用法词法化,crate 的 RefCell-across-await lint 5→4 低于基线);
+      sst_readers_changed()(4 处指针相等谓词);record_read 闭包(get_value_inner
+      内 5 处 READ_METRICS);死代码处置(全 workspace 验证零非测试调用者):
+      cfg(test) 门控 decode_records_with_offsets/lookup_in_sst(保留=F250 回归测试
+      的参考实现,repoint 需要活 StreamClient)/BlockCache 两方法(其 F261 文档
+      声称的生产调用者从不存在,已改)/同步 TableIterator+MergeIterator;
+      删除 AsyncMergeIterator::seek、SstReader::is_paged/paged_loc(零调用者)、
+      PartitionServer 死字段 server_owner_key/server_revision(F267 后遗留,
+      acquire RPC 本身保留);clippy --fix 清 9 项。
+    - 刻意不动(agent 确认+ledger 记录):save_table_locs_raw 双份 7 参调用=
+      F148-A 无 await 不变量的安全形态;do_compact 4 处 continue 小重复;
+      长函数(maintenance_loop/recover_partition/partition_thread_main)无干净缝。
+    验证:PS lib 182/182;workspace check 0 警告(除 server bin 1 个 unused import,
+    chunk 13 处理);PS clippy 仅剩 4 个既有保守 lint(已记 ledger)。
 
 Main gaps / risks:
   · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
@@ -61,9 +77,9 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 8/9 partition-server(22k 行,两迭代:core 写/读路径,flush/compact/GC/split;
-     test-only 死函数 decode_records_with_offsets/lookup_in_sst/block_cache 两方法
-     考虑 #[cfg(test)] 门控)。
+  1. Chunk 10-12 manager(40k 行,预计 2-3 迭代,agent 扫 + 安全项落地)。
+  2. 然后 13 server(8k,含 autumn_client bin 一个 unused import)、14 fuse、
+     15 autumn-memory、16 gallery、17 python。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
   3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +

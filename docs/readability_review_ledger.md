@@ -26,8 +26,8 @@ Rules per chunk:
 | 5 | crates/client | 3966 | done | c66d555 (NOT_LEADER loop ×4, fail_slots ×8, GetStream ctor, lease_call ×4) |
 | 6 | crates/stream — server side (extent node) | ~9000 | done | 9bc0408 (read_plan/committed_length_value/wrong_shard_err dedup + clippy sweep; conn_pool+erasure clean) |
 | 7 | crates/stream — client side (StreamClient) | ~9000 | done | 38403c8 (committed_end_for_read, parse_read_bytes_resp ×3, build_stream_tail ×6) |
-| 8 | crates/partition-server — core write/read path | ~11000 | todo | |
-| 9 | crates/partition-server — flush/compact/GC/split | ~11400 | todo | |
+| 8 | crates/partition-server — core write/read path + sstable + dead code | ~11000 | done | 8437622 (F261 retry dedup, sst_readers_changed ×4, record_read ×5, dead-code gate/delete, clippy sweep) |
+| 9 | crates/partition-server — flush/compact/GC/split | ~11400 | done | covered by the same full-crate review as chunk 8; remaining findings deliberately skipped with reasons in findings log (safe-form duplication kept; no clean seams in the long loops) |
 | 10 | crates/manager — core (lib, stream mgmt) | ~13000 | todo | |
 | 11 | crates/manager — partition mgmt + authz + lease | ~13000 | todo | |
 | 12 | crates/manager — rest (recovery, EC, tools) | ~13000 | todo | |
@@ -89,3 +89,16 @@ Status values: todo | in_progress | done
 - PS lib test suite showed a 1/182 one-off flake (name not captured; 8
   subsequent runs + 5 baseline runs all green) — pre-existing timing
   sensitivity, watch for recurrence.
+- PS remaining clippy await_holding_refcell_ref ×4 (pre-existing, down from
+  5): rpc_handlers get_value_inner re-borrow p across resolve_value drop
+  path, handle_range, handle_batch_get ~703, background.rs:2659 (GC) — all
+  are the documented drop-before-await idiom the lexical lint can't see
+  through; each should be block-scoped like get_value_inner/handle_head now
+  are IF touched for other reasons (background 2659 is GC = revert-prone,
+  leave unless reproduced issue).
+- PS chunk 9 remaining (agent-reviewed, apply next): do_compact
+  bump-discards `continue` ×4 (macro-awkward, skip); the duplicated
+  save_table_locs_raw 7-arg call sites are the SAFE form (F148-A no-await
+  invariant) — deliberately NOT deduped; overlong background_maintenance_loop
+  /recover_partition/partition_thread_main have no clean safe seams (agent
+  confirmed) — leave.
