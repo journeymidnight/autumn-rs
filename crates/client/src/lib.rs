@@ -347,6 +347,34 @@ pub struct GetManyItem<'a> {
 /// the routing caches and `Cell` for the manager round-robin index.
 /// Borrows are deliberately scoped: every `borrow()` / `borrow_mut()` is
 /// released before any `.await`.
+/// F-AUTHZ-1: re-mint a token when it has less than this many seconds of life
+/// left, so connections are (re-)bound to a fresh token before the current one
+/// expires — the PS never sees an expired token in normal operation.
+const TOKEN_RENEW_MARGIN_SECS: u64 = 300;
+
+/// F-AUTHZ-1: current unix seconds.
+fn client_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// F-AUTHZ-1: a minted capability token + its expiry (unix seconds).
+struct CachedToken {
+    bytes: Vec<u8>,
+    exp: u64,
+}
+
+/// F-AUTHZ-1: the client's tenant identity (permanent credential) + the current
+/// short-TTL token minted from it. One `ClusterClient` = one principal (the
+/// design: `MemoryStore` is per-`(tenant, agent)`, each with its own client).
+struct ClientAuth {
+    tenant: String,
+    credential: Vec<u8>,
+    token: Option<CachedToken>,
+}
+
 pub struct ClusterClient {
     /// Manager addresses (comma-separated on construction).
     manager_addrs: Vec<String>,
@@ -398,6 +426,11 @@ pub struct ClusterClient {
     /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
     /// disables fast-fail (every attempt uses the full `rpc_timeout`).
     first_attempt_timeout: Cell<Option<Duration>>,
+    /// F-AUTHZ-1: optional tenant credential + cached token. `None` = anonymous
+    /// (no AUTH_HELLO sent — the pre-authz behavior; works against non-authz
+    /// clusters). When `Some`, every fresh PS connection sends AUTH_HELLO with a
+    /// (lazily minted, auto-renewed) token before use.
+    auth: RefCell<Option<ClientAuth>>,
 }
 
 /// Default per-call timeout for cluster RPCs. Generous enough to cover
@@ -563,6 +596,7 @@ impl ClusterClient {
             part_addrs: RefCell::new(HashMap::new()),
             rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
+            auth: RefCell::new(None),
         };
 
         // Try connecting to each manager until one responds
@@ -777,6 +811,83 @@ impl ClusterClient {
     }
 
     /// Get or create a PS RPC connection. Auto-reconnects on failure.
+    /// F-AUTHZ-1: set this client's tenant credential. Enables authz — every
+    /// fresh PS connection AUTH_HELLOs with a (lazily minted, auto-renewed)
+    /// token scoped to the tenant's granted prefixes. Anonymous (no credential,
+    /// the default) works unchanged against non-authz clusters. Clears cached PS
+    /// connections so they rebind under the new identity.
+    pub fn set_tenant_credential(&self, tenant: impl Into<String>, credential: Vec<u8>) {
+        *self.auth.borrow_mut() = Some(ClientAuth {
+            tenant: tenant.into(),
+            credential,
+            token: None,
+        });
+        self.ps_conns.borrow_mut().clear();
+    }
+
+    /// F-AUTHZ-1: convenience — connect + set the tenant credential in one call.
+    pub async fn connect_with_credential(
+        manager: &str,
+        tenant: impl Into<String>,
+        credential: Vec<u8>,
+    ) -> Result<Self> {
+        let c = Self::connect(manager).await?;
+        c.set_tenant_credential(tenant, credential);
+        Ok(c)
+    }
+
+    /// F-AUTHZ-1: return a currently-valid token, minting/renewing via
+    /// `MSG_MINT_TOKEN` when there is none or it's within
+    /// `TOKEN_RENEW_MARGIN_SECS` of expiry. On a renewal (a prior token existed),
+    /// drops cached PS connections so they rebind under the fresh token.
+    async fn ensure_token(&self) -> Result<Vec<u8>> {
+        // Fast path: a cached token with comfortable life left.
+        {
+            let auth = self.auth.borrow();
+            let a = auth
+                .as_ref()
+                .ok_or_else(|| anyhow!("no tenant credential set"))?;
+            if let Some(t) = &a.token {
+                if t.exp > client_now_secs().saturating_add(TOKEN_RENEW_MARGIN_SECS) {
+                    return Ok(t.bytes.clone());
+                }
+            }
+        }
+        // Mint / renew. Scoped borrow (nothing held across the await).
+        let (tenant, credential) = {
+            let auth = self.auth.borrow();
+            let a = auth
+                .as_ref()
+                .ok_or_else(|| anyhow!("no tenant credential set"))?;
+            (a.tenant.clone(), a.credential.clone())
+        };
+        let req = rkyv_encode(&MintTokenReq { tenant, credential });
+        let resp_bytes = self
+            .mgr_call_retry(MSG_MINT_TOKEN, req, self.manager_addrs.len().max(1) as u32)
+            .await
+            .context("mint token")?;
+        let resp: MintTokenResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("mint token rejected: {}", resp.message));
+        }
+        let renewed = {
+            let mut auth = self.auth.borrow_mut();
+            let a = auth
+                .as_mut()
+                .ok_or_else(|| anyhow!("no tenant credential set"))?;
+            let renewed = a.token.is_some();
+            a.token = Some(CachedToken {
+                bytes: resp.token.clone(),
+                exp: resp.exp,
+            });
+            renewed
+        };
+        if renewed {
+            self.ps_conns.borrow_mut().clear();
+        }
+        Ok(resp.token)
+    }
+
     pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
         {
             let conns = self.ps_conns.borrow();
@@ -788,6 +899,23 @@ impl ClusterClient {
         let client = RpcClient::connect(addr)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
+        // F-AUTHZ-1: bind this connection's principal via AUTH_HELLO before it's
+        // cached/used. Only when a tenant credential is configured; anonymous
+        // clients never send it (and non-authz PSes accept it as a no-op OK).
+        if self.auth.borrow().is_some() {
+            let token = self.ensure_token().await?;
+            let resp_bytes = client
+                .call(MSG_AUTH_HELLO, rkyv_encode(&AuthHelloReq { token }))
+                .await
+                .with_context(|| format!("AUTH_HELLO to PS {ps_addr}"))?;
+            let resp: AuthHelloResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code != StatusCode::Ok as u8 {
+                return Err(anyhow!(
+                    "AUTH_HELLO rejected by PS {ps_addr}: {}",
+                    resp.message
+                ));
+            }
+        }
         self.ps_conns
             .borrow_mut()
             .insert(ps_addr.to_string(), client.clone());
@@ -2819,6 +2947,7 @@ mod first_attempt_timeout_tests {
                 part_addrs: RefCell::new(HashMap::new()),
                 rpc_timeout: Cell::new(rpc),
                 first_attempt_timeout: Cell::new(first),
+                auth: RefCell::new(None),
             }
         });
         cluster
