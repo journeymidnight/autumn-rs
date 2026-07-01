@@ -180,6 +180,24 @@ pub const MSG_CLUSTER_DF: u8 = 0x4D;
 /// Per-partition extents are fetched lazily via scoped `MSG_STREAM_INFO`.
 pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
 
+// ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ──────────────────────────────
+//
+// The manager (leader) is a KDC: it holds an Ed25519 signing private key + a
+// tenant account DB, mints short-TTL capability tokens, and publishes its
+// PUBLIC keys so the PS (KV layer) can verify locally without ever calling
+// back. See docs/data_plane_authz_design.md.
+//
+// Client → manager: authenticate with a permanent tenant credential, get a
+// short-TTL signed token (renewed in the background before exp).
+pub const MSG_MINT_TOKEN: u8 = 0x4F;
+// PS → manager (poll, cached): fetch the public keys + protected prefixes so
+// the PS can verify tokens + know which key ranges to enforce.
+pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
+// admin → manager (low-frequency, admin-token gated): create/delete a tenant
+// account (credential_hash + allowed_prefixes) in the KDC's account DB.
+pub const MSG_TENANT_CREATE: u8 = 0x51;
+pub const MSG_TENANT_DELETE: u8 = 0x52;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1834,4 +1852,95 @@ pub struct MgrInodeLeaseRecord {
     /// Unix seconds. The persisted deadline survives leader failover so
     /// the new leader's TTL revoke loop fires on the correct schedule.
     pub expires_at: i64,
+}
+
+// ── F-AUTHZ-1 wire + persisted types (manager-as-KDC) ─────────────────────────
+
+/// Persisted tenant account in etcd (`tenantAccount/<tenant>`). Replayed on
+/// leader failover. Holds only the credential HASH (never the credential) +
+/// the key prefixes this tenant may access.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrTenantAccount {
+    pub tenant: String,
+    /// SHA-256 of the tenant's permanent credential. Verified (constant-time)
+    /// at mint time; the raw credential is never stored.
+    pub credential_hash: [u8; 32],
+    /// Key prefixes this tenant may access. Each MUST end with `b'/'`.
+    pub allowed_prefixes: Vec<Vec<u8>>,
+}
+
+/// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. `admin_token`
+/// is checked (constant-time) against the manager's configured admin token
+/// (admin_auth_design.md Option A). Returns the freshly-generated permanent
+/// credential (shown once; the manager stores only its hash).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TenantCreateReq {
+    pub admin_token: String,
+    pub tenant: String,
+    pub allowed_prefixes: Vec<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TenantCreateResp {
+    pub code: u8,
+    pub message: String,
+    /// The generated permanent credential (raw bytes). Empty on error.
+    pub credential: Vec<u8>,
+}
+
+/// `MSG_TENANT_DELETE` — admin removes a tenant account (stops renewal; the
+/// tenant's current token still works until it expires). Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TenantDeleteReq {
+    pub admin_token: String,
+    pub tenant: String,
+}
+
+/// `MSG_MINT_TOKEN` — client authenticates with its permanent credential and
+/// receives a short-TTL signed capability token.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MintTokenReq {
+    pub tenant: String,
+    pub credential: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MintTokenResp {
+    pub code: u8,
+    pub message: String,
+    /// The signed capability token (`cap_token` wire bytes). Empty on error.
+    pub token: Vec<u8>,
+    /// Token expiry (unix seconds) — lets the client schedule background renew
+    /// without parsing the opaque token.
+    pub exp: u64,
+}
+
+/// One published verification key. The PS builds its verify-keyring from these.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AuthzPublicKey {
+    pub kid: u32,
+    /// 32-byte Ed25519 public key.
+    pub ed25519_pub: Vec<u8>,
+    /// Disabled keys are published (so the PS learns to reject their `kid`) but
+    /// never used to sign new tokens — this is emergency bulk revocation.
+    pub disabled: bool,
+}
+
+/// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached). Request payload is empty.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetAuthzConfigResp {
+    pub code: u8,
+    pub message: String,
+    /// Authz turned on at the manager (a signing key was configured)? When
+    /// false the PS does not enforce (opt-in; fuse/kvcache/dev unaffected).
+    pub enabled: bool,
+    pub public_keys: Vec<AuthzPublicKey>,
+    /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
+    /// key outside every protected prefix is not gated.
+    pub protected_prefixes: Vec<Vec<u8>>,
+    /// The TTL the manager mints tokens with (seconds) — advisory, lets the PS
+    /// size its clock-skew leeway / the client its renew cadence.
+    pub token_ttl_secs: u64,
+    /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
+    pub clock_skew_secs: u64,
 }

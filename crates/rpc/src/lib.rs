@@ -8,6 +8,7 @@
 //! [req_id: u32 LE][msg_type: u8][flags: u8][payload_len: u32 LE][payload]
 //! ```
 
+pub mod cap_token;
 pub mod client;
 pub mod error;
 pub mod extent_rpc;
@@ -54,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 8;
-pub const WIRE_VERSION_MAX: u32 = 8;
+pub const WIRE_VERSION_MIN: u32 = 9;
+pub const WIRE_VERSION_MAX: u32 = 9;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -121,6 +122,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // a comment edit in `manager_rpc.rs` only, no wire-layout change; v8 not
     // yet deployed, so updated in place rather than bumped.)
     (8, "ba19149e1ed99c41"),
+    // v9: F-AUTHZ-1 data-plane authz — new `cap_token.rs` (Ed25519 capability
+    // token layout, added to the fingerprint hash set) + manager_rpc gained
+    // MSG_MINT_TOKEN (0x4F) / MSG_GET_AUTHZ_CONFIG (0x50) / MSG_TENANT_CREATE
+    // (0x51) / MSG_TENANT_DELETE (0x52) and their req/resp + MgrTenantAccount /
+    // AuthzPublicKey. Pre-R3: MIN=MAX=9 (same-commit deploy; rkyv has no
+    // cross-version decode).
+    (9, "839d196b5be56249"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -21,6 +21,10 @@ fn main() {
         "src/partition_rpc.rs",
         "src/frame.rs",
         "src/extent_rpc.rs",
+        // F-AUTHZ-1: the capability-token layout is wire schema (exchanged over
+        // MINT_TOKEN + AUTH_HELLO). Hash it so any CapClaims change bumps the
+        // fingerprint, exactly like the other wire-schema files.
+        "src/cap_token.rs",
     ];
     let mut h = DefaultHasher::new();
     for f in &files {
