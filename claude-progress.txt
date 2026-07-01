@@ -46,6 +46,14 @@ Current summary:
       convert_to_ec 420 行拆分)刻意延后(热路径 fencing/commit-truncation,
       note 24 有 revert 前科)→ ledger findings log 记录了提取形状。
     验证:autumn-stream 全部 15 个测试套件绿(90 lib + 集成);workspace 绿;clippy 清。
+  · Chunk 7 stream client 侧(client.rs 5224 行)done,commit 38403c8 pushed:
+    - committed_end_for_read()(读侧 committed 界限双拷贝);parse_read_bytes_resp()
+      (ReadBytesResp 解码+EversionStale 哨兵映射 ×3,哨兵检测是类型级 downcast,
+      诊断字符串仅错误路径构造);build_stream_tail()(append 重试路径 6 处 roll/reset
+      的 StreamTail 纯构造提取,状态机转移一行未动)。
+    - 刻意跳过:两处 chunked-read 循环骨架(需单态 async-closure 泛型才 alloc 等价)。
+    验证:stream 15 套件绿;PS lib 182/182 ×3(首跑 1 例未捕获名的 one-off flake,
+    基线也复跑 5 次全绿=既有时序敏感,已记 ledger);workspace 绿。
 
 Main gaps / risks:
   · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
@@ -53,7 +61,9 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 7 stream client 侧(client.rs 5224 行 StreamClient)。
+  1. Chunk 8/9 partition-server(22k 行,两迭代:core 写/读路径,flush/compact/GC/split;
+     test-only 死函数 decode_records_with_offsets/lookup_in_sst/block_cache 两方法
+     考虑 #[cfg(test)] 门控)。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
   3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +

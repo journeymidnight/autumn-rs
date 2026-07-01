@@ -25,7 +25,7 @@ Rules per chunk:
 | 4 | crates/transport (+ucx-sys-mini) | 4140 | done | 0fe3e72 (endpoint/lib/listener dedup), 63dcc34 (regpool dead branch + bench/test dedup) |
 | 5 | crates/client | 3966 | done | c66d555 (NOT_LEADER loop ×4, fail_slots ×8, GetStream ctor, lease_call ×4) |
 | 6 | crates/stream — server side (extent node) | ~9000 | done | 9bc0408 (read_plan/committed_length_value/wrong_shard_err dedup + clippy sweep; conn_pool+erasure clean) |
-| 7 | crates/stream — client side (StreamClient) | ~9000 | todo | |
+| 7 | crates/stream — client side (StreamClient) | ~9000 | done | 38403c8 (committed_end_for_read, parse_read_bytes_resp ×3, build_stream_tail ×6) |
 | 8 | crates/partition-server — core write/read path | ~11000 | todo | |
 | 9 | crates/partition-server — flush/compact/GC/split | ~11400 | todo | |
 | 10 | crates/manager — core (lib, stream mgmt) | ~13000 | todo | |
@@ -77,3 +77,15 @@ Status values: todo | in_progress | done
     stripe-encode-fanout / phase-2 commit loop).
 - stream conn_pool.rs: `is_healthy` only checks pool presence, not
   `is_closed()` — arguably misleading name (public API; left alone).
+- stream client.rs skipped-as-not-worth-it: the 2 chunked-read loops
+  (read_with_layout / read_shard_from_addr) share a ~22-line skeleton but a
+  shared helper needs a monomorphized async-closure generic to stay
+  alloc-identical — complexity > win. Manager RPC wrappers already factored
+  via manager_call + check_manager_resp.
+- partition-server test-only fns confirmed (chunk 8/9 to act):
+  decode_records_with_offsets (lib.rs:7932), lookup_in_sst
+  (background.rs:2942), block_cache.rs invalidate_extent+stats — all only
+  called from tests; consider #[cfg(test)] gating rather than deletion.
+- PS lib test suite showed a 1/182 one-off flake (name not captured; 8
+  subsequent runs + 5 baseline runs all green) — pre-existing timing
+  sensitivity, watch for recurrence.
