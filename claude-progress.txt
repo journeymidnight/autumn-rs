@@ -32,7 +32,9 @@ Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租�
     · config poll:fetch_authz_config_once(manager MSG_GET_AUTHZ_CONFIG,非leader-gate,transport失败rotate)→install;finish_connect 初次同步取(serve 前武装)+ authz_config_poll_loop(5s,spawn_supervised)。
     · client:AutumnError::PermissionDenied(terminal 不重试)+ StatusCode 映射。
     · e2e 测试:真 TCP handle_ps_connection(mock req_rx)驱动 AUTH_HELLO→授权GET/PUT过→跨租户拒(PermissionDenied)→匿名拒 protected→非protected放行。
-      PS lib 181/181、rpc 43、client 27、manager 169、workspace 全绿。coco review 进行中。
+      PS lib 182/182、rpc 43、client 27、manager 169、workspace 全绿。coco review(GPT-5.5)5 findings 全修(bd5015d,pushed):
+      P1 冷启动 fail-open(config 在 sync_regions_once 前取);P1 aud 校验(GetAuthzConfigResp.cluster_id → verify_auth_hello 拒 aud!=cluster_id,防跨集群共享 key 重放);
+      P1 disabled-kid 撤销活连接(BoundPrincipal 存 kid,每请求 keys.contains_key(kid));P2 client PermissionDenied terminal(call_ps_for_key 短路);P2 AUTH_HELLO 解码前 16KiB 上限。
   **Stage 3 未开始**(client 发 AUTH_HELLO+token+自动续期、principal 分区连接池、autumn-memory 透传凭据、autumn-op gen-signing-key/tenant-create/mint-token、跨租户真集群 e2e)。详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
