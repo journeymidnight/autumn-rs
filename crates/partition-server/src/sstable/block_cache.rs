@@ -107,9 +107,13 @@ impl BlockCache {
         }
     }
 
-    /// F261: drop every cached block belonging to `extent_id` — called when
-    /// row_stream extents are truncated/punched after compaction so stale
-    /// blocks can't be served for a recycled (extent, offset).
+    /// Drop every cached block belonging to `extent_id`. TEST-ONLY: production
+    /// never invalidates per-extent — extent ids are globally unique within a
+    /// process, so a punched/truncated extent's `(extent_id, offset)` keys are
+    /// never reused (cross-cluster test reuse is handled by `clear`). (An
+    /// earlier F261 doc claimed a compaction-time caller; that wiring never
+    /// existed.)
+    #[cfg(test)]
     pub fn invalidate_extent(&self, extent_id: u64) {
         let mut g = self.inner.lock();
         let keys: Vec<(u64, u64)> = g
@@ -137,6 +141,8 @@ impl BlockCache {
         g.bytes = 0;
     }
 
+    /// TEST-ONLY diagnostic snapshot: `(bytes, entries, hits, misses)`.
+    #[cfg(test)]
     pub fn stats(&self) -> (usize, usize, u64, u64) {
         let g = self.inner.lock();
         (g.bytes, g.map.len(), g.hits, g.misses)

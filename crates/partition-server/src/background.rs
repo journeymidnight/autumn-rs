@@ -2704,11 +2704,7 @@ async fn process_gc_chunk(
                     .iter()
                     .rev()
                     .any(|m| m.seek_user_key(&user_key).is_some());
-            let snapshot_stale = p.sst_readers.len() != readers.len()
-                || p.sst_readers
-                    .iter()
-                    .zip(readers.iter())
-                    .any(|(a, b)| !Arc::ptr_eq(a, b));
+            let snapshot_stale = crate::sst_readers_changed(&p.sst_readers, &readers);
             drop(p);
             if appeared_in_mem || snapshot_stale {
                 continue;
@@ -2939,6 +2935,10 @@ pub(crate) async fn lookup_in_sst_via(
     Ok(None)
 }
 
+/// TEST-ONLY reference implementation of the SST point lookup (incl. the F250
+/// next-block hop) — the production paths are its specialised siblings
+/// `lookup_in_sst_seq_opt` / `lookup_in_sst_via`, which mirror this logic.
+#[cfg(test)]
 pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     if !reader.bloom_may_contain(user_key) {
         return None;

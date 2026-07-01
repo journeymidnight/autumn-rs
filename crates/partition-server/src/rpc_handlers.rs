@@ -208,7 +208,7 @@ pub(crate) async fn handle_batch_get(
             offset: 0,
             length: 0,
         });
-        match get_value(Bytes::from(inner), part).await {
+        match get_value(inner, part).await {
             Ok(GetOutcome::Value(v)) => items.push(partition_rpc::BatchGetItem {
                 status: 0,
                 value: v.to_vec(),
@@ -385,6 +385,49 @@ async fn get_value(
 /// the proxy path (the client falls back / retries and sees the
 /// rewritten VP).
 #[allow(clippy::await_holding_refcell_ref)]
+/// F261 paged SST point-lookup with the compaction-truncate retry — shared by
+/// `get_value_inner` and `handle_head` (the two MUST stay in sync).
+///
+/// A snapshot reader's backing row extent can be TRUNCATED by a compaction
+/// that completes during our block read (paged readers hold metadata only,
+/// not bytes). On a read error, if the live `sst_readers` set changed since
+/// the snapshot, retry ONCE against the fresh set — the key (if it exists)
+/// is in the compaction's output SSTs. Unchanged set or second failure = a
+/// real read error, surfaced as Internal (coco P0: NEVER a false NotFound).
+///
+/// Borrows `part` internally and releases before every await (note 15);
+/// returns with NO borrow held.
+async fn sst_lookup_paged_retry(
+    part: &Rc<RefCell<PartitionData>>,
+    key: &[u8],
+) -> Result<Option<(u8, Bytes, u64)>, (StatusCode, String)> {
+    let mut attempt = 0u32;
+    'sst_lookup: loop {
+        attempt += 1;
+        // Borrow scoped to the snapshot — released before any await.
+        let (readers, sc) = {
+            let p = part.borrow();
+            (p.sst_readers.to_vec(), p.stream_client.clone())
+        };
+        let cache = crate::global_block_cache().clone();
+        for reader in readers.iter().rev() {
+            match lookup_in_sst_via(reader, key, &sc, &cache).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => {
+                    let changed =
+                        crate::sst_readers_changed(&part.borrow().sst_readers, &readers);
+                    if attempt == 1 && changed {
+                        continue 'sst_lookup;
+                    }
+                    return Err((StatusCode::Internal, format!("sst block read: {e}")));
+                }
+            }
+        }
+        return Ok(None);
+    }
+}
+
 async fn get_value_inner(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -394,106 +437,79 @@ async fn get_value_inner(
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let lookup_t0 = Instant::now();
-    let p = part.borrow();
-    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
-    if !in_range(&p.rg, &req.key) {
-        return Err((
-            StatusCode::InvalidArgument,
-            "key is out of range".to_string(),
-        ));
-    }
-
-    // Track where the key was found.
-    let mut source = 0u8; // 0=miss, 1=mem, 2=imm, 3=sst
-    let found: Option<(u8, Bytes, u64)> = lookup_in_memtable(&p.active, &req.key)
-        .inspect(|_r| {
-            source = 1;
-        })
-        .or_else(|| {
-            for imm in p.imm.iter().rev() {
-                if let Some(r) = lookup_in_memtable(imm, &req.key) {
-                    source = 2;
-                    return Some(r);
+    // Borrow scoped to the epoch/range check + memtable lookups — released
+    // before any await (note 15). `source` tracks where the key was found:
+    // 0=miss, 1=mem, 2=imm, 3=sst.
+    let mut source = 0u8;
+    let mut found: Option<(u8, Bytes, u64)> = {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+        lookup_in_memtable(&p.active, &req.key)
+            .inspect(|_r| {
+                source = 1;
+            })
+            .or_else(|| {
+                for imm in p.imm.iter().rev() {
+                    if let Some(r) = lookup_in_memtable(imm, &req.key) {
+                        source = 2;
+                        return Some(r);
+                    }
                 }
-            }
-            None
-        })
-        ;
+                None
+            })
+    };
     // F261: the SST lookup may FETCH blocks from row_stream (paged
-    // readers) — snapshot the reader set + stream client, DROP the
-    // borrow, then await (note 15: never hold a RefCell borrow across an
-    // await). Mirrors handle_batch_get's snapshot-then-serve pattern.
-    // The re-borrow below may observe post-split state for the pin /
-    // redirect section — same relaxation batch_get already accepts.
-    let mut p = p;
-    let mut found = found;
+    // readers) — `sst_lookup_paged_retry` snapshots the reader set, drops
+    // the borrow across its awaits (note 15), and handles the
+    // compaction-truncate single retry. The re-borrow below may observe
+    // post-split state for the pin / redirect section — same relaxation
+    // batch_get already accepts.
     if found.is_none() {
-        // coco P2 (F261): a snapshot reader's backing row extent can be
-        // TRUNCATED by a compaction that completes during our block read
-        // (paged readers hold metadata only, not bytes). On a read error,
-        // if the live sst_readers set changed since the snapshot, retry
-        // ONCE against the fresh set — the key (if it exists) is in the
-        // compaction's output SSTs. Unchanged set or second failure =
-        // a real read error, surfaced as Internal (never false NotFound).
-        let mut attempt = 0u32;
-        'sst_lookup: loop {
-            attempt += 1;
-            let readers: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
-            let sc = p.stream_client.clone();
-            drop(p);
-            let cache = crate::global_block_cache().clone();
-            for reader in readers.iter().rev() {
-                match lookup_in_sst_via(reader, &req.key, &sc, &cache).await {
-                    Ok(Some(r)) => {
-                        source = 3;
-                        found = Some(r);
-                        break;
-                    }
-                    Ok(None) => {}
-                    // coco P0: surface block-read failures as a retryable
-                    // error — NEVER a false NotFound.
-                    Err(e) => {
-                        p = part.borrow();
-                        let readers_changed = p.sst_readers.len() != readers.len()
-                            || p
-                                .sst_readers
-                                .iter()
-                                .zip(readers.iter())
-                                .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
-                        if attempt == 1 && readers_changed {
-                            continue 'sst_lookup;
-                        }
-                        return Err((StatusCode::Internal, format!("sst block read: {e}")));
-                    }
-                }
-            }
-            p = part.borrow();
-            break;
+        if let Some(r) = sst_lookup_paged_retry(part, &req.key).await? {
+            source = 3;
+            found = Some(r);
         }
     }
+    let p = part.borrow();
     let lookup_ns = lookup_t0.elapsed().as_nanos() as u64;
 
-    let (op, raw_value, expires_at) = match found {
-        Some(v) => v,
-        None => {
-            READ_METRICS.with(|m| {
-                let mut m = m.borrow_mut();
-                m.ops += 1;
-                m.lookup_ns += lookup_ns;
-                m.not_found += 1;
-                m.maybe_report();
-            });
-            return Ok(GetOutcome::NotFound);
-        }
-    };
-    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
+    // One read-metrics record per outcome. `source` 0 = counted as
+    // not_found (miss, tombstone/expired, or pinned-away); vp fields only
+    // accumulate on the resolved-VP outcome.
+    let record_read = |source: u8, is_vp: bool, vp_resolve_ns: u64| {
         READ_METRICS.with(|m| {
             let mut m = m.borrow_mut();
             m.ops += 1;
             m.lookup_ns += lookup_ns;
-            m.not_found += 1;
+            if is_vp {
+                m.vp_resolve_ns += vp_resolve_ns;
+                m.vp_resolve_count += 1;
+            }
+            match source {
+                1 => m.found_in_mem += 1,
+                2 => m.found_in_imm += 1,
+                3 => m.found_in_sst += 1,
+                _ => m.not_found += 1,
+            }
             m.maybe_report();
         });
+    };
+
+    let (op, raw_value, expires_at) = match found {
+        Some(v) => v,
+        None => {
+            record_read(0, false, 0);
+            return Ok(GetOutcome::NotFound);
+        }
+    };
+    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
+        record_read(0, false, 0);
         return Ok(GetOutcome::NotFound);
     }
 
@@ -515,13 +531,7 @@ async fn get_value_inner(
                 // GC has acquired the writer pin on this extent — the bytes
                 // are about to be deleted. Surface as NotFound rather than
                 // racing the punch_holes RPC.
-                READ_METRICS.with(|m| {
-                    let mut m = m.borrow_mut();
-                    m.ops += 1;
-                    m.lookup_ns += lookup_ns;
-                    m.not_found += 1;
-                    m.maybe_report();
-                });
+                record_read(0, false, 0);
                 return Ok(GetOutcome::NotFound);
             }
         }
@@ -536,18 +546,7 @@ async fn get_value_inner(
     {
         let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
         if vp.len as usize >= 64 * 1024 {
-            READ_METRICS.with(|m| {
-                let mut m = m.borrow_mut();
-                m.ops += 1;
-                m.lookup_ns += lookup_ns;
-                match source {
-                    1 => m.found_in_mem += 1,
-                    2 => m.found_in_imm += 1,
-                    3 => m.found_in_sst += 1,
-                    _ => m.not_found += 1,
-                }
-                m.maybe_report();
-            });
+            record_read(source, false, 0);
             // _vp_pin drops at return — the client's direct read is
             // deliberately unprotected: a GC punch in the window turns
             // into a failed EN read -> client proxy fallback (never a
@@ -572,22 +571,7 @@ async fn get_value_inner(
     };
     // _vp_pin guard drops here, releasing the pin.
 
-    READ_METRICS.with(|m| {
-        let mut m = m.borrow_mut();
-        m.ops += 1;
-        m.lookup_ns += lookup_ns;
-        if is_vp {
-            m.vp_resolve_ns += vp_resolve_ns;
-            m.vp_resolve_count += 1;
-        }
-        match source {
-            1 => m.found_in_mem += 1,
-            2 => m.found_in_imm += 1,
-            3 => m.found_in_sst += 1,
-            _ => m.not_found += 1,
-        }
-        m.maybe_report();
-    });
+    record_read(source, is_vp, vp_resolve_ns);
 
     // Read-throughput accounting: bytes the PS actually served (resolved-value
     // path only; large-VP Redirect is read directly from the EN, not here).
@@ -606,17 +590,18 @@ pub(crate) async fn handle_head(
     let req: HeadReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-    let p = part.borrow();
-    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
-    if !in_range(&p.rg, &req.key) {
-        return Err((
-            StatusCode::InvalidArgument,
-            "key is out of range".to_string(),
-        ));
-    }
-
-    let found = lookup_in_memtable(&p.active, &req.key)
-        .or_else(|| {
+    // Borrow scoped to the epoch/range check + memtable lookups — released
+    // before any await (note 15).
+    let mut found = {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+        lookup_in_memtable(&p.active, &req.key).or_else(|| {
             for imm in p.imm.iter().rev() {
                 if let Some(r) = lookup_in_memtable(imm, &req.key) {
                     return Some(r);
@@ -624,47 +609,12 @@ pub(crate) async fn handle_head(
             }
             None
         })
-        ;
-    // F261: paged SST lookup awaits — snapshot + drop borrow (note 15).
-    let mut found = found;
+    };
+    // F261: paged SST lookup awaits — `sst_lookup_paged_retry` snapshots +
+    // drops the borrow (note 15) and runs the same compaction-truncate
+    // single retry as get_value_inner.
     if found.is_none() {
-        // coco P2 (F261): same compaction-truncate retry as get_value_inner
-        // — readers-changed → retry once against the fresh set.
-        let mut p = p;
-        let mut attempt = 0u32;
-        'sst_lookup: loop {
-            attempt += 1;
-            let readers: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
-            let sc = p.stream_client.clone();
-            drop(p);
-            let cache = crate::global_block_cache().clone();
-            for reader in readers.iter().rev() {
-                match lookup_in_sst_via(reader, &req.key, &sc, &cache).await {
-                    Ok(Some(r)) => {
-                        found = Some(r);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let q = part.borrow();
-                        let readers_changed = q.sst_readers.len() != readers.len()
-                            || q
-                                .sst_readers
-                                .iter()
-                                .zip(readers.iter())
-                                .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
-                        if attempt == 1 && readers_changed {
-                            p = q;
-                            continue 'sst_lookup;
-                        }
-                        return Err((StatusCode::Internal, format!("sst block read: {e}")));
-                    }
-                }
-            }
-            break;
-        }
-    } else {
-        drop(p);
+        found = sst_lookup_paged_retry(part, &req.key).await?;
     }
 
     let (op, raw_value, expires_at) = match found {
@@ -688,7 +638,7 @@ pub(crate) async fn handle_head(
     }
 
     let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-        ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len as u64
+        ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len
     } else {
         raw_value.len() as u64
     };
@@ -803,12 +753,7 @@ pub(crate) async fn handle_range(
             Ok(entries) => break entries,
             Err(e) => {
                 let q = part.borrow();
-                let readers_changed = q.sst_readers.len() != full_snap.len()
-                    || q
-                        .sst_readers
-                        .iter()
-                        .zip(full_snap.iter())
-                        .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
+                let readers_changed = crate::sst_readers_changed(&q.sst_readers, &full_snap);
                 drop(q);
                 if attempt == 1 && readers_changed {
                     continue;
@@ -1362,7 +1307,7 @@ pub(crate) async fn handle_split_part(
             .multi_modify_split(
                 mid.clone(),
                 req.part_id,
-                [log_end as u64, row_end as u64, meta_end as u64],
+                [log_end, row_end, meta_end],
                 SPLIT_CALL_TIMEOUT,
             )
             .await

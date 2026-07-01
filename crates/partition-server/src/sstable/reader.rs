@@ -266,22 +266,6 @@ impl SstReader {
         self
     }
 
-    pub fn is_paged(&self) -> bool {
-        matches!(self.source, SstSource::Paged { .. })
-    }
-
-    /// F261: `(extent_id, base, len)` when paged.
-    pub fn paged_loc(&self) -> Option<(u64, u64, u64)> {
-        match self.source {
-            SstSource::Paged {
-                extent_id,
-                base_in_extent,
-                len_in_extent,
-            } => Some((extent_id, base_in_extent, len_in_extent)),
-            SstSource::Resident(_) => None,
-        }
-    }
-
     /// F261: block read that works for BOTH modes. Resident → the sync path;
     /// paged → bounded global cache, miss fetched from row_stream via `sc`
     /// (rides the F258 replica rotation). The await happens with NO RefCell

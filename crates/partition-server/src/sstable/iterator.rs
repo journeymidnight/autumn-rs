@@ -117,6 +117,9 @@ impl BlockIterator {
 // TableIterator: iterates all entries in an SSTable across blocks
 // ---------------------------------------------------------------------------
 
+/// TEST-ONLY sync iterator over a Resident SST — production iteration is
+/// F262's `AsyncTableIterator` (works on Resident AND Paged sources).
+#[cfg(test)]
 pub struct TableIterator {
     reader: Arc<SstReader>,
     block_idx: usize,
@@ -124,6 +127,7 @@ pub struct TableIterator {
     err: Option<anyhow::Error>,
 }
 
+#[cfg(test)]
 impl TableIterator {
     pub fn new(reader: Arc<SstReader>) -> Self {
         TableIterator {
@@ -433,13 +437,6 @@ impl AsyncMergeIterator {
         }
         Ok(())
     }
-
-    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
-        for it in self.iters.iter_mut() {
-            it.seek(target).await?;
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,10 +453,13 @@ impl AsyncMergeIterator {
 // internal keys sort higher-seq-first, taking the minimum internal key across
 // all iterators naturally gives us the newest version.
 
+/// TEST-ONLY sync merge — production merges via `AsyncMergeIterator`.
+#[cfg(test)]
 pub struct MergeIterator {
     iters: Vec<TableIterator>,
 }
 
+#[cfg(test)]
 impl MergeIterator {
     pub fn new(iters: Vec<TableIterator>) -> Self {
         MergeIterator { iters }

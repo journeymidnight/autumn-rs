@@ -239,6 +239,22 @@ pub fn clear_global_block_cache() {
     global_block_cache().clear();
 }
 
+/// F261 staleness predicate: has the live `sst_readers` set changed since a
+/// pre-await snapshot was taken? Shared by every snapshot-then-await reader
+/// (GET / HEAD / range scan retry loops, GC's re-check) so the "compaction
+/// republished the readers during my block read" detection can never drift
+/// between them. Pointer equality per slot — publishes always swap `Arc`s.
+pub(crate) fn sst_readers_changed(
+    live: &[std::sync::Arc<crate::sstable::SstReader>],
+    snap: &[std::sync::Arc<crate::sstable::SstReader>],
+) -> bool {
+    live.len() != snap.len()
+        || live
+            .iter()
+            .zip(snap.iter())
+            .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b))
+}
+
 pub(crate) fn ps_inflight_cap() -> usize {
     *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
 }
@@ -944,6 +960,7 @@ pub(crate) struct PartitionData {
 /// ALREADY-MEASURED per-batch end-to-end ns from `WriteLoopMetrics`
 /// (zero new hot-path timing), GET adds one `Instant` pair per request
 /// (same cost class as the F183 `req_count` add).
+#[derive(Default)]
 pub struct LatHist {
     pub buckets: [std::sync::atomic::AtomicU64; LAT_BUCKET_BOUNDS_NS.len()],
     pub sum_ns: std::sync::atomic::AtomicU64,
@@ -966,15 +983,6 @@ pub const LAT_BUCKET_BOUNDS_NS: [u64; 9] = [
     250_000_000,
 ];
 
-impl Default for LatHist {
-    fn default() -> Self {
-        Self {
-            buckets: Default::default(),
-            sum_ns: Default::default(),
-            count: Default::default(),
-        }
-    }
-}
 
 impl LatHist {
     /// Record `n` observations of `ns` each (a group-committed batch's
@@ -1727,9 +1735,6 @@ pub struct PartitionServer {
     /// clients stayed unroutable for 20+ minutes (manager-HA chaos H1).
     current_mgr: Rc<Cell<usize>>,
     pool: Rc<ConnPool>,
-    /// Server-level owner key and owner_epoch for split coordination.
-    server_owner_key: String,
-    server_revision: Rc<Cell<i64>>,
     /// F099-K — base TCP port. The first partition opened binds
     /// `base_port + 1`; subsequent partitions bind `base_port + 2`,
     /// `base_port + 3`, ... (monotonically increasing, tracked via
@@ -2662,8 +2667,6 @@ impl PartitionServer {
                             manager_addrs: mgr_addrs,
                             current_mgr: Rc::new(Cell::new(connected_idx)),
                             pool,
-                            server_owner_key: owner_key,
-                            server_revision: Rc::new(Cell::new(resp.owner_epoch)),
                             // F099-K — placeholders; populated by
                             // `bind_listen_addr` (called from
                             // `serve()` or `connect_with_advertise_and_port`).
@@ -7598,7 +7601,7 @@ async fn recover_partition(
             // to self-heal (a clean replica has the bytes) / fail-loud instead.
             let rem = committed_end.saturating_sub(cur_off);
             let expected = REPLAY_CHUNK_BYTES.min(rem) as usize;
-            let is_final = (rem as u64) <= REPLAY_CHUNK_BYTES as u64;
+            let is_final = rem <= REPLAY_CHUNK_BYTES;
             let short = got < expected;
             if rem == 0 && carry.is_empty() {
                 // Reached the committed end cleanly, nothing buffered. Done.
@@ -7929,9 +7932,11 @@ pub(crate) fn decode_records_chunk(
     Ok((out, cursor))
 }
 
+// F158: same shape as decode_records_full but preserves the record-start
+// offset so callers can compute the recovered VP head. TEST-ONLY today —
+// production replay tracks offsets inline.
+#[cfg(test)]
 pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
-    // F158: same shape as decode_records_full but preserves the
-    // record-start offset so callers can compute the recovered VP head.
     let mut out = Vec::new();
     let mut cursor = 0usize;
     let mut skipped: usize = 0;
@@ -8247,7 +8252,7 @@ async fn run_flush_async_phase_inner(
     // F178 Phase 2 durability barrier — see flush_one_imm history comment.
     if snap_vp_off > 0 && snap_vp_eid != 0 {
         part_sc
-            .await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
+            .await_log_synced_to(snap_vp_eid, snap_vp_off)
             .await?;
     }
 
