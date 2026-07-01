@@ -1,6 +1,7 @@
 // F195: `background` module made public so the autumn-ps binary can
 // reach its `set_*` setters (`set_gc_*`; `set_min_pipeline_batch` was
 // removed by F256). The module's internal symbols stay `pub(crate)`/private.
+pub mod authz;
 pub mod background;
 mod rpc_handlers;
 mod sstable;

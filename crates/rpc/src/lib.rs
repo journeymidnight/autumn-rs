@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 9;
-pub const WIRE_VERSION_MAX: u32 = 9;
+pub const WIRE_VERSION_MIN: u32 = 10;
+pub const WIRE_VERSION_MAX: u32 = 10;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -129,6 +129,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // AuthzPublicKey. Pre-R3: MIN=MAX=9 (same-commit deploy; rkyv has no
     // cross-version decode).
     (9, "839d196b5be56249"),
+    // v10: F-AUTHZ-1 Stage 2 (PS enforcement) — partition_rpc gained
+    // MSG_AUTH_HELLO (0x55) + AuthHelloReq/AuthHelloResp (per-connection token
+    // bind). StatusCode::PermissionDenied (7) was also added but error.rs is
+    // not in the fingerprint set, so only the partition_rpc addition bumps it.
+    // Pre-R3: MIN=MAX=10 (same-commit deploy).
+    (10, "1378369d1af1d2fb"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

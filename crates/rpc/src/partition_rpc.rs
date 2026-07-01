@@ -137,6 +137,29 @@ pub const MSG_BATCH_GET: u8 = 0x54;
 /// MSG_GET / MSG_GET_ZC proxy path, which re-resolves through the PS.
 pub const MSG_GET_REDIRECT: u8 = 0x56;
 
+/// F-AUTHZ-1: first-frame connection authentication. The client sends a signed
+/// Ed25519 capability token (see `crate::cap_token`); the PS verifies it once
+/// against its cached public keys and binds the connection's `{allowed_prefixes,
+/// exp}` principal. Subsequent per-request enforcement is a byte `starts_with`
+/// + `exp` check with no re-verify. AUTH_HELLO is OPTIONAL (a connection that
+/// never sends it is anonymous → denied on protected prefixes only). It carries
+/// no `part_id` — it's connection-level, handled before the routing check.
+pub const MSG_AUTH_HELLO: u8 = 0x55;
+
+/// `MSG_AUTH_HELLO` request — the opaque capability token bytes.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AuthHelloReq {
+    pub token: Vec<u8>,
+}
+
+/// `MSG_AUTH_HELLO` response. `code == CODE_OK` binds the principal; otherwise
+/// `message` carries the reject reason (`cap_token::AuthReject` label).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AuthHelloResp {
+    pub code: u8,
+    pub message: String,
+}
+
 /// F259 response for `MSG_GET_REDIRECT` (rkyv).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetRedirectResp {
@@ -724,6 +747,7 @@ mod msg_type_tests {
             MSG_BATCH_PUT,
             MSG_BATCH_GET,
             MSG_GET_REDIRECT,
+            MSG_AUTH_HELLO,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

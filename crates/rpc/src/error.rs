@@ -13,6 +13,12 @@ pub enum StatusCode {
     Internal = 4,
     Unavailable = 5,
     AlreadyExists = 6,
+    /// F-AUTHZ-1: the caller's connection is not authorized for the key range
+    /// (no valid capability token, or the key falls outside its granted
+    /// prefixes, or the token expired). Distinct from NotFound so a rogue
+    /// client can't blind-retry-amplify a denied key as if it were absent.
+    /// Appended (discriminant 7) so all prior codes stay wire-stable.
+    PermissionDenied = 7,
 }
 
 impl StatusCode {
@@ -25,6 +31,7 @@ impl StatusCode {
             4 => Self::Internal,
             5 => Self::Unavailable,
             6 => Self::AlreadyExists,
+            7 => Self::PermissionDenied,
             _ => Self::Internal,
         }
     }
