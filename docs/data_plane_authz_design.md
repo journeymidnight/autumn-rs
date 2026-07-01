@@ -111,10 +111,16 @@ protected_prefixes:[mem/]}` → 本地缓存。manager 宕机 → 用缓存继�
   会扫进 `mem/other/`）；分页 resume cursor 也锁在授权子区间内。
 - **Batch 跨前缀**：逐 op 检查，denied 返回明确 `PermissionDenied`（**不折成 NotFound**，
   否则盲重试放大）；或预扫整批、任一 denied 整批拒不入队。
-- **EN 大值直读旁路（必须堵）**：`MSG_GET_REDIRECT` 返回的 descriptor 是**可猜的物理坐标
-  不是 capability**，rogue client 能直连 EN 绕过 PS。MVP：**protected(`mem/`) 大值读走 PS
-  proxy**（不走 EN direct；agent-memory 值多数小，可接受）。后续优化：PS 授权后签发短 TTL
-  EN-read-capability，EN 验。
+- **EN 大值直读旁路（对 autumn-memory 本就不存在，零成本）**：`MSG_GET`（`get`/`get_many`）
+  **恒走 PS**（`handle_get` 传 `redirect=false`）；只有 `get_direct` / `MSG_GET_REDIRECT` 走
+  EN 直读，且它是**显式 opt-in + ≥64 KiB 才给 descriptor**（失败自动 fallback 到 proxy get）。
+  **autumn-memory 只用 `get`/`get_many` → `mem/` 的读全部过 PS**，天然没有旁路、无 PS-proxy
+  额外成本（不是新增开销，是现状）。当 authz 开启时，`handle_get_redirect` 顺带做同样的前缀
+  检查、并对 protected 前缀直接拒发 descriptor（近零开销，因为默认关 + autumn-memory 不用）。
+  **残留（降级为 known-gap，非 MVP 阻塞）**：rogue client 可**绕过 PS 直连 EN 发
+  `MSG_READ_BYTES`**、靠枚举/猜 `(extent_id, offset)` 读原始字节（与客户端 redirect 开关无关）。
+  该 opt-in 直读路径非 `mem/` 负载（fuse/kvcache）才用；MVP 靠部署（EN 读端口不对租户 client
+  暴露）兜底，后续用 PS 签发短 TTL EN-read-capability（EN 验）彻底堵。
 - **allowed_prefixes 规范化**：必须以 `/` 结尾（防 `mem/ac` 误匹配 `mem/acme/`），mint 用
   `keys::q` 生成。
 - **opt-in + default-deny**：PS 没配到任何公钥 → 不强制（fuse/kvcache/dev 零影响）；配了 →
