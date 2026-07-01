@@ -117,10 +117,11 @@ protected_prefixes:[mem/]}` → 本地缓存。manager 宕机 → 用缓存继�
   **autumn-memory 只用 `get`/`get_many` → `mem/` 的读全部过 PS**，天然没有旁路、无 PS-proxy
   额外成本（不是新增开销，是现状）。当 authz 开启时，`handle_get_redirect` 顺带做同样的前缀
   检查、并对 protected 前缀直接拒发 descriptor（近零开销，因为默认关 + autumn-memory 不用）。
-  **残留（降级为 known-gap，非 MVP 阻塞）**：rogue client 可**绕过 PS 直连 EN 发
-  `MSG_READ_BYTES`**、靠枚举/猜 `(extent_id, offset)` 读原始字节（与客户端 redirect 开关无关）。
-  该 opt-in 直读路径非 `mem/` 负载（fuse/kvcache）才用；MVP 靠部署（EN 读端口不对租户 client
-  暴露）兜底，后续用 PS 签发短 TTL EN-read-capability（EN 验）彻底堵。
+  **残留旁路 = 明确接受、不做（WON'T-DO，见「非目标」）**：rogue client 可**绕过 PS 直连 EN 发
+  `MSG_READ_BYTES`**、靠枚举/猜 `(extent_id, offset)` 读原始字节（EN 只认坐标、不认 tenant/key，
+  且读路径只校验 `eversion` 不做授权；owner_epoch fence 只挡写不挡读）。**决策（用户 2026-07-01）**：
+  可信内网 + **只读**（EN 只吐字节、改不了别租户数据）+ 需先猜中有效 extent 坐标 → 风险可接受，
+  **不实现 EN-read-capability**。运维上 EN 数据端口本就只在数据面子网、只对 PS 开放。
 - **allowed_prefixes 规范化**：必须以 `/` 结尾（防 `mem/ac` 误匹配 `mem/acme/`），mint 用
   `keys::q` 生成。
 - **opt-in + default-deny**：PS 没配到任何公钥 → 不强制（fuse/kvcache/dev 零影响）；配了 →
@@ -140,6 +141,12 @@ protected_prefixes:[mem/]}` → 本地缓存。manager 宕机 → 用缓存继�
 
 TLS/mTLS；per-user RBAC/角色/ACL 表；抗被攻破的 manager；抗 MITM/抓包重放；
 per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）。
+
+**EN 直连绕过 PS 的大值直读旁路 —— 明确接受、不做（WON'T-DO，用户 2026-07-01）。**
+理由：威胁模型是可信内网，且该旁路**只读**（EN 只吐字节、无法写/改别租户数据），
+攻击者还得先猜中有效 `(extent_id, offset, length)` 坐标。风险与「可信内网」前提一致，
+**不上 EN-read-capability**（那会给 EN 加验签逻辑 + 引出「谁签」的对称困境，成本不匹配收益）。
+若某天威胁模型升级（不可信读者接入数据面），再把它作为独立 feature 重启。
 
 ## 实现阶段
 
