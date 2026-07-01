@@ -111,6 +111,13 @@ impl AuthzKeyring {
 
 /// Decode exactly 64 hex chars into a 32-byte seed.
 fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
+    // ASCII-guard BEFORE the byte-index slicing below (coco P3): a 64-BYTE seed
+    // containing a multi-byte UTF-8 char would make `&s[i*2..i*2+2]` slice mid-
+    // char and panic; we want a diagnosable Err (fail-loud via Result), not a
+    // crash. ASCII ⇒ 1 byte per char ⇒ the slicing is always on char boundaries.
+    if !s.is_ascii() {
+        return Err("seed must be ASCII hex".to_string());
+    }
     if s.len() != 64 {
         return Err(format!("seed must be 64 hex chars, got {}", s.len()));
     }
@@ -188,6 +195,11 @@ mod tests {
             "1 0000000000000000000000000000000000000000000000000000000000000001 bogus"
         )
         .is_err());
+        // 64-BYTE but non-ASCII seed (62 ascii + one 2-byte 'é') — must Err, not
+        // panic on a mid-char slice (coco P3).
+        let non_ascii_seed = format!("1 {}é", "a".repeat(62));
+        assert_eq!(non_ascii_seed.split_whitespace().nth(1).unwrap().len(), 64);
+        assert!(AuthzKeyring::from_file_contents(&non_ascii_seed).is_err());
         // empty
         assert!(AuthzKeyring::from_file_contents("# only comments\n\n").is_err());
         // all disabled → cannot mint

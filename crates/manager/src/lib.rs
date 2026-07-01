@@ -817,6 +817,14 @@ pub struct AutumnManager {
     /// `MgrTenantAccount`). Replayed on leader failover; mutated only via the
     /// admin RPCs. Stores the credential HASH, never the raw credential.
     pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, MgrTenantAccount>>>,
+    /// F-AUTHZ-1: serializes the tenant create/delete critical section
+    /// (build → etcd write → in-memory apply). Handlers are spawned per-frame
+    /// and interleave at the etcd await, and a tenant account's value is a
+    /// NON-idempotent freshly-generated secret — without this, two concurrent
+    /// same-tenant ops could commit to etcd in one order but apply to memory in
+    /// the other, leaving the live leader's in-memory hash out of sync with
+    /// etcd (coco P1). Low-frequency admin path → a global async mutex is free.
+    pub(crate) tenant_admin_lock: Rc<futures::lock::Mutex<()>>,
 }
 
 impl Default for AutumnManager {
@@ -885,6 +893,7 @@ impl AutumnManager {
             token_ttl_secs: Rc::new(Cell::new(3600)),
             clock_skew_secs: Rc::new(Cell::new(60)),
             tenant_accounts: Rc::new(RefCell::new(HashMap::new())),
+            tenant_admin_lock: Rc::new(futures::lock::Mutex::new(())),
         }
     }
 
@@ -920,14 +929,19 @@ impl AutumnManager {
         *self.protected_prefixes.borrow_mut() = prefixes;
     }
 
-    /// F-AUTHZ-1: set the minted-token TTL in seconds (clamped ≥ 60).
+    /// F-AUTHZ-1: set the minted-token TTL in seconds. Clamped to
+    /// [60, 30 days] — the design wants short TTLs (prod hours); the 30-day
+    /// ceiling both discourages long-lived bearer tokens and prevents an absurd
+    /// value from overflowing `now + ttl` (coco P2). 30-day cap is generous.
     pub fn set_token_ttl_secs(&self, secs: u64) {
-        self.token_ttl_secs.set(secs.max(60));
+        self.token_ttl_secs.set(secs.clamp(60, 30 * 24 * 3600));
     }
 
-    /// F-AUTHZ-1: set the advertised clock-skew leeway in seconds.
+    /// F-AUTHZ-1: set the advertised clock-skew leeway in seconds. Capped at 1 h
+    /// (design suggests 30-120 s; the cap bounds `exp + skew` against wrap and a
+    /// misconfigured huge leeway that would neuter expiry).
     pub fn set_clock_skew_secs(&self, secs: u64) {
-        self.clock_skew_secs.set(secs);
+        self.clock_skew_secs.set(secs.min(3600));
     }
 
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).

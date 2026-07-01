@@ -355,7 +355,9 @@ impl AutumnManager {
         };
 
         let now = Self::epoch_seconds().max(0) as u64;
-        let exp = now + self.token_ttl_secs.get();
+        // saturating_add so a (clamped, but defensively) large TTL can't wrap
+        // now+ttl into a past exp (coco P2).
+        let exp = now.saturating_add(self.token_ttl_secs.get());
         let claims = autumn_rpc::cap_token::CapClaims {
             ver: autumn_rpc::cap_token::CAP_VER,
             typ: autumn_rpc::cap_token::CAP_TYP.to_string(),
@@ -478,7 +480,11 @@ impl AutumnManager {
             credential_hash: crate::authz::credential_hash(&cred),
             allowed_prefixes,
         };
-        // etcd-first, then in-memory (Programming Note 1). F149-fenced txn.
+        // Serialize the whole write critical section (etcd → memory apply) so a
+        // concurrent same-tenant op can't commit to etcd in one order but apply
+        // to memory in the other (coco P1). etcd-first (Programming Note 1),
+        // F149-fenced txn.
+        let _admin = self.tenant_admin_lock.lock().await;
         let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd
@@ -521,6 +527,9 @@ impl AutumnManager {
                 )
             }
         }
+        // Same serialization as tenant-create (coco P1): create/delete of the
+        // same tenant must not reorder between etcd and memory.
+        let _admin = self.tenant_admin_lock.lock().await;
         let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {

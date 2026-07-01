@@ -37,6 +37,16 @@ pub const CAP_VER: u32 = 1;
 /// `token.len() - SIG_LEN` (no length prefix needed — the signature is fixed).
 pub const SIG_LEN: usize = 64;
 
+/// Hard upper bound on a wire token, enforced at the TOP of `verify_token`
+/// BEFORE any decode. `verify_token` runs on the PS data-plane verify path
+/// against UNAUTHENTICATED input, and decoding claims allocates a `String` +
+/// `Vec<Vec<u8>>` — without this cap an attacker could send a large,
+/// bytecheck-valid-but-unsigned claims blob to force allocation + CPU before
+/// the signature check rejects it (remote resource exhaustion, coco P1). A
+/// legitimate token is ~300 bytes (small claims + 64 B sig); 8 KiB is very
+/// generous (room for ~100+ prefixes) while bounding the untrusted work.
+pub const MAX_CAP_TOKEN_LEN: usize = 8 * 1024;
+
 /// Claims of an Ed25519-signed capability token.
 ///
 /// rkyv gives a deterministic byte layout, but correctness does NOT rely on
@@ -152,7 +162,9 @@ pub fn verify_token(
     now: u64,
     skew: u64,
 ) -> Result<CapClaims, AuthReject> {
-    if token.len() <= SIG_LEN {
+    // Bound the UNAUTHENTICATED input BEFORE any allocation/decode (coco P1
+    // DoS): reject too-short (no room for a sig) or absurdly large tokens.
+    if token.len() <= SIG_LEN || token.len() > MAX_CAP_TOKEN_LEN {
         return Err(AuthReject::Malformed);
     }
     let (cb, sigb) = token.split_at(token.len() - SIG_LEN);
@@ -174,11 +186,13 @@ pub fn verify_token(
     vk.verify_strict(&msg, &sig)
         .map_err(|_| AuthReject::BadSignature)?;
 
-    // Time window (with skew leeway). Distinct rejects for metrics.
-    if now + skew < claims.nbf {
+    // Time window (with skew leeway). `saturating_add` so a huge exp/skew
+    // can't wrap (coco P2) — a saturated bound just means "always in window
+    // on that side", never a silent wrap into the opposite verdict.
+    if now.saturating_add(skew) < claims.nbf {
         return Err(AuthReject::NotYetValid);
     }
-    if claims.exp + skew < now {
+    if claims.exp.saturating_add(skew) < now {
         return Err(AuthReject::Expired);
     }
     Ok(claims)
@@ -318,6 +332,32 @@ mod tests {
         let token = sign_claims(&sk, &claims_at(now, 3600)).unwrap();
         let err = verify_token(&token[..SIG_LEN], |_| Some(vk), now, 60).unwrap_err();
         assert_eq!(err, AuthReject::Malformed);
+    }
+
+    #[test]
+    fn oversize_token_rejected_before_decode() {
+        let vk = sk_from_seed(7).verifying_key();
+        // A blob larger than the cap is rejected as Malformed WITHOUT decoding
+        // (coco P1 DoS guard). Also assert a legit token is well under the cap.
+        let big = vec![0u8; MAX_CAP_TOKEN_LEN + 1];
+        assert_eq!(
+            verify_token(&big, |_| Some(vk), 1_000_000, 60).unwrap_err(),
+            AuthReject::Malformed
+        );
+        let token = sign_claims(&sk_from_seed(7), &claims_at(1_000_000, 3600)).unwrap();
+        assert!(token.len() < MAX_CAP_TOKEN_LEN);
+    }
+
+    #[test]
+    fn huge_ttl_and_skew_do_not_overflow() {
+        let sk = sk_from_seed(7);
+        let vk = sk.verifying_key();
+        // exp = now + u64::MAX would wrap without saturating_add; a token with a
+        // saturated exp verifies fine, and a huge skew never wraps a verdict.
+        let mut claims = claims_at(1_000_000, 0);
+        claims.exp = u64::MAX;
+        let token = sign_claims(&sk, &claims).unwrap();
+        assert!(verify_token(&token, |_| Some(vk), 2_000_000, u64::MAX).is_ok());
     }
 
     #[test]
