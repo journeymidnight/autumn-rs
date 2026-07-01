@@ -9,9 +9,22 @@ Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租�
     EN 直连大值直读旁路=明确接受不做(WON'T-DO,用户 2026-07-01):可信内网+只读+需猜坐标→风险可接受,不上 EN-read-capability。
     详见 docs/data_plane_authz_design.md(source of truth)。
   **首版已撤(2026-07-01)**:早期 manager token_hash→prefixes 注册表 + PS poll 做强制(etcd-RBAC 中心存储形态),
-    用户否("auth 在 KV 层做")→ git checkout 撤掉,wire 回 v8。工作区干净,只剩设计文档 + ledger。
-  实现未开始。分 3 stage:① KDC(manager 签名+账户库+MINT_TOKEN+GET_AUTHZ_CONFIG)② PS 强制 ③ client 自动续期+工具+e2e。
-  详见 feature_list F-AUTHZ-1。
+    用户否("auth 在 KV 层做")→ git checkout 撤掉,wire 回 v8。
+  分 3 stage:① KDC(manager 签名+账户库+MINT_TOKEN+GET_AUTHZ_CONFIG)② PS 强制 ③ client 自动续期+工具+e2e。
+  **Stage 1 (KDC) 完成 + pushed(2 commit:c56acf4 rpc crypto核心+wire types;22debd7 manager KDC):**
+    · crates/rpc/cap_token.rs:Ed25519 CapClaims + sign_claims/verify_token(verify_strict,验携带的claims字节非重编码,
+      checked-rkyv解untrusted,AuthReject分类expired/not-yet-valid/bad-sig/unknown-kid,DOMAIN分离)。加入wire指纹→v9(MIN=MAX=9)。10单测绿。
+    · crates/rpc/manager_rpc.rs:MSG_MINT_TOKEN(0x4F)/GET_AUTHZ_CONFIG(0x50)/TENANT_CREATE(0x51)/TENANT_DELETE(0x52)+req/resp+MgrTenantAccount+AuthzPublicKey。
+    · crates/manager/authz.rs:AuthzKeyring(解析--auth-signing-key-file "<kid> <hex32seed> [disabled]",fail-loud,active=最高enabled kid,
+      published派生pubkey无drift)+credential_hash(SHA-256)+ct_eq常量时间。
+    · manager lib:tenantAccount/ etcd前缀+tenant_accounts map+authz config字段/setter+replay(string-keyed,fail-loud)。
+    · rpc_handlers:handle_mint_token(leader-only,验cred常量时间,unknown-tenant/wrong-cred同opaque错)/get_authz_config(不leader-gate,静态本地配置)/
+      tenant_create+delete(leader+admin-token gated,etcd-first)。dispatch已接。
+    · manager binary:--auth-signing-key-file(启用authz)+--admin-token+--auth-protected-prefix(可重复,默认mem/)+--auth-token-ttl-secs+--auth-clock-skew-secs。
+      authz OPT-IN(无signing key则关,fuse/kvcache/dev零影响)。
+    · 验收单测:KDC端到端 mint→publish config→verify→过期失败→改字节失败→delete停续期(rpc_handlers::authz_kdc_tests)+disabled-when-no-key。
+      manager lib 169/169 绿;rpc lib +10 cap_token 绿;workspace build 绿。coco review 进行中。
+  **Stage 2/3 未开始。** 详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。

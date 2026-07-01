@@ -150,15 +150,17 @@ per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）�
 
 ## 实现阶段
 
-> 注：进行中的旧「Stage A（manager 存 `token_hash→prefixes` 供 PS poll 做强制）」
-> **语义需改**：注册表保留，但角色从「PS 每请求查的强制表」变为「KDC 签发时用的账户库」
-> （credential_hash + prefixes），并新增签名私钥 + `MINT_TOKEN` + 公钥发布；
-> `GET_TENANT_POLICIES`（供 PS 强制）废弃，换 `GET_AUTHZ_CONFIG`（公钥 + protected）。
-
-- **Stage 1 — KDC（manager）**：Ed25519 keypair（`--auth-signing-key-file` 私钥，
-  多 kid）；租户账户库（etcd `tenantAccount/`，F149-fenced）+ `tenant-create/delete`
-  admin RPC（Option A admin token 保护）；`MSG_MINT_TOKEN`（验 cred → 签 token）；
-  `MSG_GET_AUTHZ_CONFIG`（公钥集 + protected）。测：mint→验签→过期。
+- **Stage 1 — KDC（manager）✅ 完成（2026-07-01，commit c56acf4 + 22debd7）**：
+  `crates/rpc/cap_token.rs` = Ed25519 token 编解码（`CapClaims` + `sign_claims`/
+  `verify_token`，`verify_strict`、验携带的 claims 字节非重编码、untrusted 走 checked-rkyv、
+  `AuthReject` 分类、`DOMAIN` 分离；进 wire 指纹 → v9，MIN=MAX=9；10 单测）。manager 侧：
+  `authz.rs` keyring（`--auth-signing-key-file`，多 kid，fail-loud 解析，active=最高 enabled kid，
+  published 从种子派生公钥无 drift）+ SHA-256 凭据哈希 + 常量时间比较；etcd `tenantAccount/` 账户库
+  （F149-fenced，fail-loud replay）；`MSG_MINT_TOKEN`（leader-only，常量时间验 cred，unknown-tenant/
+  wrong-cred 同 opaque 错）/ `MSG_GET_AUTHZ_CONFIG`（不 leader-gate，静态本地配置）/ `tenant-create/delete`
+  admin RPC（leader + admin token gated，etcd-first）；binary CLI（opt-in，无 signing key 则关）。
+  验收单测 `authz_kdc_tests`：mint→publish config→验签→过期失败→改字节失败→delete 停续期 + disabled-when-no-key。
+  manager lib 169/169、rpc lib +10、workspace 全绿。
 - **Stage 2 — PS 强制**：poll `GET_AUTHZ_CONFIG` 缓存公钥/protected；`MSG_AUTH_HELLO`
   首帧验签绑 principal；两 choke point + Range 区间 + batch 逐 op + exp 每请求；
   EN 大值走 PS proxy。测：跨租户拒、匿名拒、非 protected 放行。
