@@ -21,7 +21,7 @@ Rules per chunk:
 |---|-------|-------|--------|-----------|
 | 1 | crates/common | 601 | done (no changes needed — logic already clear) | |
 | 2 | crates/etcd | 1329 | done (no changes needed — logic already clear) | |
-| 3 | crates/rpc | 6579 | in_progress | |
+| 3 | crates/rpc | 6579 | done | f833d1d (client.rs read_loop dedup), f89802c (bench dedup) |
 | 4 | crates/transport (+ucx-sys-mini) | 4140 | todo | |
 | 5 | crates/client | 3966 | todo | |
 | 6 | crates/stream — server side (extent node) | ~9000 | todo | |
@@ -40,4 +40,22 @@ Rules per chunk:
 Status values: todo | in_progress | done
 
 ## Findings log (cross-chunk issues found while reviewing)
-- (none yet)
+- Wire-fingerprinted files (rpc: manager_rpc/partition_rpc/extent_rpc/frame/
+  cap_token): edits force a wire-version registry decision, so low-value
+  cleanups are deferred until those files are next touched for real work:
+  - cap_token.rs:140+183 — signer & verifier both hand-build
+    `CAP_DOMAIN ‖ claims_bytes`; factor a shared `signing_input()` to make
+    the "single source of truth" claim structural.
+  - extent_rpc.rs:470 — `rkyv_encode/rkyv_decode` byte-identical duplicates of
+    manager_rpc.rs:204 (partition_rpc already re-exports; extent_rpc should too).
+  - partition_rpc.rs:331 — `parse_put_zc_meta` dead `.ok()?` on infallible
+    fixed-slice try_into after the length guard.
+- rpc CLAUDE.md drift (doc-only, not fixed in this logic pass): mentions
+  `writer_task_handles_2048_concurrent_vectored` test that no longer exists;
+  says MAX_PAYLOAD_LEN=512MB but code says u32::MAX.
+- Pre-existing dead code flagged by cargo check (chunk 8/9 material):
+  partition-server `decode_records_with_offsets`, `lookup_in_sst`,
+  `invalidate_extent`/`stats` methods; server bin unused imports
+  `MergeIterator`/`TableIterator`; fields `server_owner_key`/`server_revision`
+  never read.
+- transport regpool.rs:141 — clippy manual_range_contains (chunk 4).

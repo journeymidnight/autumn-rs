@@ -1,163 +1,32 @@
 Date: 2026-07-01
-TaskStatus: completed
-Task scope: F-AUTHZ-1 服务端数据面 key-range 授权(多租户隔离,plan §9.5/§16 Phase 0)—— **端到端完成 + pushed**。
-  三 stage 全绿+coco 全处置:Stage 1 KDC(manager)、Stage 2 PS 强制、Stage 3 client+工具。
-  跨租户真集群 e2e 通过(run_authz_e2e.sh:"AUTHZ E2E OK")。Stage 3 coco 12 findings 全修(4c56861):
-  ①缓存连接续期(get_ps_client 顶端 ensure_token)②NOT_LEADER 轮转(client mint_token/tenant_create/tenant_delete 中心化)
-  ③AUTH_HELLO call_timeout ④身份切换 auth_gen 守卫 ⑤⑥⑦autumn-op 走中心方法 ⑧rm-rf 守卫 ⑨端口预检 ⑩secret 文件输入 ⑪⑫CLI 校验。
-  wire v10。全部 pushed 到 main(最后 4c56861)。以下为分阶段历史:
-  威胁模型=可信内网(防流氓/误用/测试 client,不防 MITM/不防被攻破的 manager),无 TLS。
-  **设计定稿(2026-07-01,多轮 user+coco 讨论)= manager-as-KDC(签发) + PS 在 KV 层强制,非对称 Ed25519**:
-    manager(leader) 持签名私钥 + 租户账户库(tenant→credential_hash+prefixes),验永久凭据签短TTL token,支持自动续期;
-    PS 只持公钥,AUTH_HELLO 每连接验一次签,每请求 starts_with+exp,从不回调 manager。撤销=短TTL+kid轮换+停续期。
-    性能:每请求 ~ns(验签摊到 per-connection);无新增 proxy 成本(autumn-memory 只用 get/get_many,恒走 PS)。
-    EN 直连大值直读旁路=明确接受不做(WON'T-DO,用户 2026-07-01):可信内网+只读+需猜坐标→风险可接受,不上 EN-read-capability。
-    详见 docs/data_plane_authz_design.md(source of truth)。
-  **首版已撤(2026-07-01)**:早期 manager token_hash→prefixes 注册表 + PS poll 做强制(etcd-RBAC 中心存储形态),
-    用户否("auth 在 KV 层做")→ git checkout 撤掉,wire 回 v8。
-  分 3 stage:① KDC(manager 签名+账户库+MINT_TOKEN+GET_AUTHZ_CONFIG)② PS 强制 ③ client 自动续期+工具+e2e。
-  **Stage 1 (KDC) 完成 + pushed(2 commit:c56acf4 rpc crypto核心+wire types;22debd7 manager KDC):**
-    · crates/rpc/cap_token.rs:Ed25519 CapClaims + sign_claims/verify_token(verify_strict,验携带的claims字节非重编码,
-      checked-rkyv解untrusted,AuthReject分类expired/not-yet-valid/bad-sig/unknown-kid,DOMAIN分离)。加入wire指纹→v9(MIN=MAX=9)。10单测绿。
-    · crates/rpc/manager_rpc.rs:MSG_MINT_TOKEN(0x4F)/GET_AUTHZ_CONFIG(0x50)/TENANT_CREATE(0x51)/TENANT_DELETE(0x52)+req/resp+MgrTenantAccount+AuthzPublicKey。
-    · crates/manager/authz.rs:AuthzKeyring(解析--auth-signing-key-file "<kid> <hex32seed> [disabled]",fail-loud,active=最高enabled kid,
-      published派生pubkey无drift)+credential_hash(SHA-256)+ct_eq常量时间。
-    · manager lib:tenantAccount/ etcd前缀+tenant_accounts map+authz config字段/setter+replay(string-keyed,fail-loud)。
-    · rpc_handlers:handle_mint_token(leader-only,验cred常量时间,unknown-tenant/wrong-cred同opaque错)/get_authz_config(不leader-gate,静态本地配置)/
-      tenant_create+delete(leader+admin-token gated,etcd-first)。dispatch已接。
-    · manager binary:--auth-signing-key-file(启用authz)+--admin-token+--auth-protected-prefix(可重复,默认mem/)+--auth-token-ttl-secs+--auth-clock-skew-secs。
-      authz OPT-IN(无signing key则关,fuse/kvcache/dev零影响)。
-    · 验收单测:KDC端到端 mint→publish config→verify→过期失败→改字节失败→delete停续期(rpc_handlers::authz_kdc_tests)+disabled-when-no-key。
-      manager lib 169/169 绿;rpc lib +10 cap_token 绿;workspace build 绿。coco review 进行中。
-  **Stage 2 (PS 强制) 完成 + pushed(ef1dff3 wire+module;1063693 集成;bd271b9 e2e 测试):**
-    · wire:StatusCode::PermissionDenied(=7,附加,wire-stable)+ partition_rpc MSG_AUTH_HELLO(0x55)+AuthHelloReq/Resp。指纹 v9→v10(MIN=MAX=10)。
-    · crates/partition-server/authz.rs:AuthzState(Arc:enabled AtomicBool 快门 + RwLock<Arc<AuthzInner>> kid→VerifyingKey keyring/protected/skew;install 跳 disabled kid,enabled 最后发布)+
-      BoundPrincipal + verify_auth_hello + authz_check(check_key:protected⇒需token+未过期+starts_with allowed;unprotected⇒放行;check_range:整扫区间⊆单 allowed prefix,空prefix gated⇒拒;PUT_ZC key 走二进制 meta 无 value copy;解码失败⇒放行由 handler 拒)。6 单测。
-    · 集成:AuthzState 上 PartitionServer→partition_thread_main→每 ps-conn task;per-conn principal 由 AUTH_HELLO 首帧绑;authz_gate 在每帧派发顶端(路由前)push_one_frame+d1_fast_path(push_frames 透传);enabled 关时单 atomic load 零成本;drain_zc_writes 在 authz 开时跳过(大 PUT_ZC 走普通路径统一强制)。
-    · config poll:fetch_authz_config_once(manager MSG_GET_AUTHZ_CONFIG,非leader-gate,transport失败rotate)→install;finish_connect 初次同步取(serve 前武装)+ authz_config_poll_loop(5s,spawn_supervised)。
-    · client:AutumnError::PermissionDenied(terminal 不重试)+ StatusCode 映射。
-    · e2e 测试:真 TCP handle_ps_connection(mock req_rx)驱动 AUTH_HELLO→授权GET/PUT过→跨租户拒(PermissionDenied)→匿名拒 protected→非protected放行。
-      PS lib 182/182、rpc 43、client 27、manager 169、workspace 全绿。coco review(GPT-5.5)5 findings 全修(bd5015d,pushed):
-      P1 冷启动 fail-open(config 在 sync_regions_once 前取);P1 aud 校验(GetAuthzConfigResp.cluster_id → verify_auth_hello 拒 aud!=cluster_id,防跨集群共享 key 重放);
-      P1 disabled-kid 撤销活连接(BoundPrincipal 存 kid,每请求 keys.contains_key(kid));P2 client PermissionDenied terminal(call_ps_for_key 短路);P2 AUTH_HELLO 解码前 16KiB 上限。
-  **Stage 3 (client + 工具) 完成 + pushed(afcabc4 tooling;a2ec39f client SDK;ef4669c memory+e2e):**
-    · autumn-op 工具:gen-signing-key(本地离线,OsRng seed→keyfile 行,pubkey 到 stderr)/tenant-create/tenant-delete/mint-token(包装 KDC RPC,hex 编解码)。
-    · client SDK:ClientAuth(tenant+credential+cached token)字段;set_tenant_credential/connect_with_credential;ensure_token(懒 MSG_MINT_TOKEN,exp 前 300s 自动续,续期驱逐旧 PS 连接);get_ps_client 连后发 MSG_AUTH_HELLO 绑 principal 再缓存;匿名(无 cred)不发 AUTH_HELLO 兼容非-authz 集群。AutumnError::PermissionDenied。
-    · autumn-memory:MemoryStore::connect_with_credential(tenant scope=mem/{tenant}/)。
-    · 跨租户真集群 e2e(tests/authz_e2e.rs + run_authz_e2e.sh,隔离 authz 集群 19300+,memory-only):
-      验证全链(manager 铸→client AUTH_HELLO→PS 强制):acme 读写 mem/acme/ 通、mem/other/ 拒(读+写)、非-protected 放行、other 对称隔离、匿名 protected 拒、MemoryStore 透传。**"AUTHZ E2E OK" 通过(exit 0)。**
-  **cluster.sh 集成(2026-07-01 补)**:launch_manager 加 env→flag 翻译(AUTUMN_AUTH_SIGNING_KEY_FILE /
-    AUTUMN_ADMIN_TOKEN_FILE / AUTUMN_AUTH_PROTECTED_PREFIXES / AUTUMN_AUTH_TOKEN_TTL_SECS,全 opt-in,不设=完全无影响;
-    误配 fail-fast)。manager 二进制加 --admin-token-file(daemon secret 不上 argv,与 autumn-op 一致);
-    authz e2e 改走 --admin-token-file 复跑绿。README 加 Data-plane authz 使用节(gen-key→cluster.sh 起→tenant-create→SDK 用→运维)。
-  **F-AUTHZ-1 端到端完成**(server KDC + PS 强制 + client token 路径 + 工具,真二进制验证)。Stage 3 coco 12 findings 全修(4c56861,e2e 复跑仍绿)+ pushed。详见 feature_list F-AUTHZ-1。
-  --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
-  实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
-  核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。
+TaskStatus: not_completed
+Task scope: 全库可读性 review(/loop 任务)——逐 crate 审查并**简化代码逻辑本身**
+  (用户明确:不是加注释,是让逻辑更直白;不用 coco),直到 17 个 chunk 全覆盖。
+  账本 = docs/readability_review_ledger.md(chunk 表 + findings log)。
+  规则:行为保持不变、性能中性(热路径分配/锁/syscall 数不变)、
+  每 chunk 全量 `cargo test -p <crate> --lib` 绿、逐 chunk commit+push main。
+  wire-fingerprint 文件(rpc 的 manager/partition/extent_rpc、frame、cap_token)
+  编辑即强制 wire-version registry 决策 → 低价值清理记入 findings log 延后。
 
-Current summary (Phase 1 完成,e2e 绿):
-  · crates/autumn-memory(over autumn-client::ClusterClient,!Send/compio)。值=opaque bytes。
-  · keys.rs:mem/ 命名空间(plan §6)+ episodic/fact/shared + doc/idx/stats(BM25) + ivf/ivf_meta(IVF)。percent-encode 防前缀伪造。
-  · MemoryStore:
-    - episodic:append_event/recent_events(newest-first)/replay_session(chronological)。
-    - fact(LangGraph BaseStore):put/get/delete/list_facts + 每-key TTL。
-    - BM25-on-KV 词法腿:idx/{term}/{doc}=空值 posting(keys-only 发现),doc/{id}=权威 IndexedDoc(commit point 自校验),
-      meta/stats 单写者,Okapi BM25。index_memory/delete_memory/search_lexical。
-    - SPFresh-IVF-on-KV 向量腿:ivf/{centroid:4BE}/{vec}=归一化向量,ivf_meta/centroids manifest,k-means(确定性),
-      冷启落桶0+暴力兜底。index_vector/train_centroids(写新桶删旧桶)/search_vector(probe+cosine rerank)。
-      关键:cosine 检索必须归一化向量。
-    - hybrid:search_hybrid(BM25+IVF 两腿,RRF k=60 融合)。
-  · 18/18 纯单测绿。e2e(tests/e2e.rs #[ignore])= episodic→fact→BM25→IVF→hybrid 全流程,
-    against 隔离最小集群(tests/run_e2e.sh:memory-only manager + 1 EN cpuset0 + 1 PS,loopback,免 etcd)= **绿**。
-  · 顺带修了 main 上的 wire-fingerprint 回归(52e895d,a8e12ee 改 manager_rpc.rs 注释引起)。
+Current summary:
+  · Chunk 1 common(601 行)+ Chunk 2 etcd(1329 行):读毕,逻辑本已清晰,无改动(done)。
+  · Chunk 3 rpc(6579 行)done,2 commit 均 pushed:
+    - f833d1d client.rs:read_loop 四段近重复 ZC 分支(UCX/TCP × into-dest/into-pooled)
+      合一(zc_fast_path + recv_value_ucx + ValueRecv);send_vectored 死 v1 分支删除
+      (FLAG_CRC 恒真);await_response/with_timeout/register_and_submit 三组重复收敛。
+      clippy 抓到我引入的 RefMut-across-await(match 临时量生命周期延长,F108 类)已修
+      (先 let 绑定再 match)。43/43 测试绿(default + --features ucx),workspace check 绿。
+    - f89802c ps_read_bench 三份复制的 driver 收敛为 drive() + 两个 read_loop。
+  · 子代理审了 wire 文件:manager_rpc/build.rs 干净;cap_token/extent_rpc/partition_rpc
+    三个低价值 finding 记入 ledger findings log(等下次真编辑时顺带)。
 
-Phase 2a 完成(Python PyO3 binding):python/src/memory.rs 的 `Memory` pyclass(同步阻塞 façade:
-  专用 compio worker 线程持 !Send MemoryStore + 闭包-job 通道,Python 方法发 job 阻塞等结果、等待放 GIL)。
-  16 方法(connect/close + episodic/fact/BM25/IVF/hybrid 全覆盖)。注册进 `autumn` 模块。
-  验证:cargo build python crate 绿;maturin develop 建 wheel(CPython 3.12);**Python 运行时 e2e 全过**
-  (隔离 venv + 隔离集群,autumn.Memory 真调全 surface;脚本 python/tests/run_memory_e2e.sh)。
+Main gaps / risks:
+  · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
+    TCP 路径有测试覆盖。若跑真集群 chaos/perf 出现 ZC 读异常,先查 f833d1d。
+  · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
-Phase 2b 进行中(已完成几块,都 committed + e2e/smoke 绿):
-  · 复数归一(0d295f8):tokenizer 安全 plural-fold(cat~cats),不碰动词形态;e2e 验证。
-  · AutumnMemory 便利层(24af6ec,python/autumn_memory):autumn.Memory binding 之上的核心 Python 库——
-    JSON 事件/事实 + **可选 text embedder hook**(向量/hybrid 腿取文本,caller 插 sglang embedder;无则纯 BM25)。
-    append/replay/recent、put/get/list/delete_fact、remember/forget/train/search(lexical|vector|hybrid|auto)。
-    run_smoke.sh:隔离 venv+集群+fake embedder 全 surface 绿。这是所有框架 adapter 的地基。
-  · F-MEM-3 stdio MCP server(python/autumn_memory_mcp,本会话):FastMCP stdio server(host 按 session 派子进程,
-    非 daemon)over AutumnMemory。工具:ChatGPT 认的 search+fetch 对(search 把每个 hit 的 text 从权威 doc 记录
-    解析出来→结果自包含)+ 写 add/update/delete + episodic + facts。async 工具把阻塞核心调用 offload 到线程
-    (event loop 不阻塞)。lexical 模式零 embedder。为 fetch 在 Rust 核心 + PyO3 + AutumnMemory.get 加了
-    get_memory(doc_id) 点查(读权威 doc/{id} 记录)。验证:真 MCP client over SDK in-memory transport 跑全工具面
-    against 隔离集群(python/autumn_memory_mcp/tests/run_mcp_test.sh)= **MCP INPROC OK, exit 0**;核心单测 19/19 绿。
-    coco review(GPT-5.5)两条都真:P1 新包漏声明 autumn-memory 依赖→已加;P2 删了向量索引文档后 vector/hybrid
-    search 出"幽灵结果"(delete 只 reap doc+BM25 不 reap IVF posting)→在检索边界修(_resolve 把 doc 记录已消失的
-    hit 丢弃,§8.5 doc=正确性边界),并把 coco 场景变成回归测试(删 v1→hybrid 不返 v1/无空文本/fetch v1 报错)。
-    更深的孤儿向量 posting 回收=纯索引卫生(正确性已被边界兜住)→记为 F-MEM-4 follow-up(reproduce-first,不塞进本提交)。
-  · F-MEM-5 LangGraph BaseStore 适配器(python/autumn_memory_langgraph,本会话):AutumnStore(BaseStore) over
-    AutumnMemory(纯客户端)。只实现唯一抽象面 batch/abatch,具体 get/put/search/delete/list_namespaces 都走它。
-    namespace tuple↔单个 percent-encoded fact-namespace;value 套 envelope{value,created_at,updated_at} 保 Item 时间戳
-    (更新保 created_at);保留 namespace registry(facts API 只能列单一精确 namespace)支持前缀 search/list_namespaces。
-    search=前缀扫+精确 filter+词法 query 排序;list_namespaces 支持 prefix/suffix(* 通配)+max_depth;TTL 分钟→秒。
-    限制(已记录非 bug):index= 语义嵌入路径、refresh_ttl 未接。验证:public BaseStore 全面功能测 against 隔离集群
-    (python/autumn_memory_langgraph/tests/run_store_test.sh)= **LANGGRAPH STORE OK, exit 0**。
-
-  · F-MEM-6 embedder 客户端(python/autumn_memory/autumn_memory/embedder.py,本会话):OpenAI 兼容 /embeddings 客户端
-    (sglang/vLLM/OpenAI)。http_embedder(单文本 hook 给 AutumnMemory(embed=))+ http_embed_many(批)。stdlib only
-    (urllib,无新依赖);url-join 容错;Authorization 取 arg/AUTUMN_EMBED_API_KEY/OPENAI_API_KEY;按 index 重排。
-    从 autumn_memory 导出。MCP server main() 加 --embed-url/--embed-model(+env)→设了就建 embedder 走 hybrid,否则 lexical。
-    验证:mock /embeddings server(免集群)证请求形状/批序/鉴权头/url-join/单文本 hook(run_embedder_test.sh)= EMBEDDER OK。
-  · F-MEM-7 Hermes 适配器:DEFERRED——Hermes 闭源 in-tree(PyPI 的 hermes 是无关包),拿不到真 MemoryProvider ABC;
-    按纪律不凭 plan 表伪造 ABC 自测;等真接口再做。
-  · F-MEM-8 CJK 分词(recall.rs,本会话):之前 CJK 整段当一个词(无空格边界)→"我喜欢猫"存成单个4字词,查"猫"永不中。
-    加 is_cjk(Han+假名+谚文+扩展)+ tokenize 把每个 CJK 码点当独立 term(unigram),Latin 段照旧 lowercase+stopword+复数归一。
-    unigram 非 bigram:单字查询可中(中文单字常是整词)+ doc_len 跨脚本可比(无长度归一偏置);短语精度交给 hybrid 向量腿。
-    验证:单测 cjk_unigram_tokenization(中/日/韩拆分+混合 Latin+CJK+tf 累加)20/20 绿 + e2e(查"猫"中"我喜欢猫"不中"狗很可爱")exit 0。
-
-  · F-MEM-4 向量孤儿回收(recall/lib/keys,本会话):delete 之前只回收 doc+BM25 不回收 IVF posting→删过的向量永远残留
-    (关键:train_centroids 扫到每个 posting 都重新分桶,从不查 doc 是否还在→它根本不回收删除孤儿,vptr 才是唯一回收者)。
-    加 ivf_meta/vptr/{id}→centroid(4BE)反向指针(在 ivf_meta/ 下不在 ivf/ 扫描区,train 不会误当 posting)。
-    index_vector 写 vptr+移桶时回收旧桶(每 id 恰一份 IVF 副本);train re-bucket 更新 vptr;delete_vector 用 vptr O(1)
-    定位回收;delete_memory 无条件调 delete_vector(可能只有向量没 BM25)。_resolve(F-MEM-3)仍是过期/在途竞态的兜底。
-    验证:e2e(删 d1 后 search_vector 不再返 d1)exit 0 + 单测 vptr 不在 ivf/ 扫描区 20/20 绿。
-
-  · F-MEM-9 index reconcile/repair + 多写者 stats 定调(lib/keys/e2e,本会话):plan §16 验收工具=index-reconcile。
-    reproduce-first 定调多写者 stats RMW 竞态:真实但低危害(只歪 idf/avgdl 评分,不改命中哪些 doc——posting/doc 都按 doc
-    无跨doc竞态)+ 需非主流多进程同agent拓扑→拒绝热路径预防(per-writer shard/服务端原子)=热路径/服务端复杂度。
-    定调=热路径容忍 drift,离热路径 detect+repair。reconcile()只读审计(recount vs meta/stats;IVF posting↔vptr 交叉=
-    orphan_ivf/dangling_vptr;is_clean)+ repair_stats()按 recount 重写。新增 ivf_vptr_prefix/vec_id key helper。
-    验证:e2e churned index reconcile clean+no-op repair + 专测注入伪 stats(确定性非 flaky 竞态)→reconcile 检出+repair 治愈。
-    两 e2e 全绿 + 单测 20/20。
-
-  · F-MEM-10 TTL-nemesis index-reconcile(e2e,本会话):plan §16 验收。TTL 过期删 doc/posting/vector/vptr 但不减 stats
-    →BM25 stats 漂移(autumn-memory 特有;split/compaction 对纯 KV 的存活由分区层 range-scan chaos 已覆盖全客户端)。
-    e2e:3 永久+2 短TTL(1 带向量),过期后 reconcile 检出漂移(recount 3 vs stats 5)且向量腿一致(posting+vptr 原子过期
-    →0 orphan/dangling/dup/malformed),repair 治愈,search 只返存活。加 ScoredDoc: Debug。3/3 e2e 绿。
-
-  · reconcile/repair PyO3 reach(本会话):autumn.Memory.reconcile()(→dict+is_clean)/repair_stats() + AutumnMemory
-    同名方法,run_smoke.sh 验证(3 docs/3 vecs clean→forget 全部→0/0 clean→repair 幂等)。Python ops cron 可审计/治愈。
-
-  · F-MEM-7 Hermes 适配器 UNBLOCKED+DONE(本会话):用户确认可 clone Hermes。真源 github.com/NousResearch/hermes-agent
-    (ABC agent/memory_provider.py),clone 到 /data/dongmao_dev/hermes-agent。python/hermes_memory_autumn/autumn/=用户插件
-    over AutumnMemory:实现真 ABC(抽象 name/is_available/initialize/get_tool_schemas + 覆盖 sync_turn[append+index,后台队列非阻塞]
-    /queue_prefetch+prefetch[后台召回→缓存块]/handle_tool_call[memory_search/store]/on_memory_write[镜像 MEMORY.md/USER.md]
-    /on_session_end/system_prompt_block/shutdown)。namespace=(user_id,agent_identity);非主上下文(cron/subagent)只读。
-    验证:in-process 测 against 真 ABC(从 Hermes checkout 加载)+ 隔离集群,全生命周期绿(HERMES PROVIDER OK)。
-
-  · F-MEM-11 真模型语义 e2e DONE(本会话):run_real_embed.sh 起本机 sglang(gte-Qwen2-1.5B,dim1536,GPU7)+ 隔离集群,
-     跑 AutumnMemory 向量/hybrid + Hermes provider against 真 embedder。关键=无词法重叠的语义命中:"a small furry pet
-     that purrs"→cat;"databases consistent when servers crash"→consensus;CJK"可爱的宠物"→"小猫在阳光下睡觉"。
-     Hermes 向量工具路径(coco P1#1)真模型验证。REAL EMBED OK + HERMES PROVIDER OK。
-     sglang 配方:FLASHINFER_DISABLE_VERSION_CHECK=1 + 去掉 --trust-remote-code(gte-Qwen2 自定义 tokenizer 引用已删模块)
-     + --is-embedding --mem-fraction-static 0.12;详见 memory project_sglang_embedder_recipe。后台进程会被 sandbox 杀(exit144)
-     →一次前台 run 内起 sglang 子进程。
-
-  · F-MEM-12 recall P99 实测 + 批量取(本会话,plan §13):bench_recall.py/run_recall_bench.sh。bench 揭示 search_lexical
-     逐候选串行 get(常见词长 posting→数百串行 RTT)。修:search_lexical/get_values/list_facts 用 get_many 批取(保序);
-     coco P2:无界 batch 全候选→一帧装所有正文(规模 OOM/帧上限,BM25 无早停)→改 256 分块 + 流式 top-k(内存/帧有界)。
-     **release recall P99 ≈23.5ms** @2000 docs(debug 231ms 是构建开销,别引用 debug 性能)。loopback 收益小但跨主机=必需
-     (O(候选)串行 RTT→每分块一 batch)。coco P1 /tmp guard 加固 + P3 参数校验。3/3 e2e + 20/20 单测绿。
-
-所有门控+实质工作完成。剩余仅可选边际:
 Next steps:
-  1. 可选边际:CJK bigram 精度;reconcile stale_bucket 检查 + 批量取;多词 query 的 per-term posting scan 并发;
-     无状态治理 gateway(REST)。
+  1. Chunk 4 transport(4140 行,含 regpool.rs:141 clippy manual_range_contains)。
+  2. Chunk 5 client(3966 行)。
+  3. 之后按 ledger 顺序 6-17;dead code(partition-server decode_records_with_offsets/
+     lookup_in_sst 等)在对应 chunk 处理。
