@@ -28,9 +28,9 @@ Rules per chunk:
 | 7 | crates/stream — client side (StreamClient) | ~9000 | done | 38403c8 (committed_end_for_read, parse_read_bytes_resp ×3, build_stream_tail ×6) |
 | 8 | crates/partition-server — core write/read path + sstable + dead code | ~11000 | done | 8437622 (F261 retry dedup, sst_readers_changed ×4, record_read ×5, dead-code gate/delete, clippy sweep) |
 | 9 | crates/partition-server — flush/compact/GC/split | ~11400 | done | covered by the same full-crate review as chunk 8; remaining findings deliberately skipped with reasons in findings log (safe-form duplication kept; no clean seams in the long loops) |
-| 10 | crates/manager — core (lib, stream mgmt) | ~13000 | todo | |
-| 11 | crates/manager — partition mgmt + authz + lease | ~13000 | todo | |
-| 12 | crates/manager — rest (recovery, EC, tools) | ~13000 | todo | |
+| 10 | crates/manager — src reviewed (2 agents, full src) + fence dedup + dead code | 21164 src | done | ea118a8 |
+| 11 | crates/manager — remaining agent findings to apply | — | in_progress | pending: place_extents_with_fallback ×3 (rpc_handlers 1189/2101/3281), policy classify_band ×2 (policy.rs 822-861), optional extent_delete ship_deletes ×2 |
+| 12 | crates/manager — tests/ (18.6k, 57 files) light dedup skim | ~18600 | todo | support/mod.rs harness is the only priority target |
 | 13 | crates/server (binaries) | 8170 | todo | |
 | 14 | crates/fuse | 4731 | todo | |
 | 15 | crates/autumn-memory | 2334 | todo | |

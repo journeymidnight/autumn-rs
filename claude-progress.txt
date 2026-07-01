@@ -70,6 +70,14 @@ Current summary:
       长函数(maintenance_loop/recover_partition/partition_thread_main)无干净缝。
     验证:PS lib 182/182;workspace check 0 警告(除 server bin 1 个 unused import,
     chunk 13 处理);PS clippy 仅剩 4 个既有保守 lint(已记 ledger)。
+  · Chunk 10 manager src(21k 行,两个 agent 全量审毕)第一批落地,commit ea118a8:
+    - diagnose_post_txn_fence()(F149 fence-vs-CAS 诊断双拷贝合一)+
+      empty_extra_cmp_err() ×3;死代码删除(全 workspace 验证):
+      build_extent_inflight_release_op(唯一调用点即弃值)、inflight_snapshot_three
+      (文档声称的调用者实为另一函数)、LeaseRegistry snapshot/snapshot_for、
+      push_with_cap;inode_lease doc 注释错位修复;clippy --fix 3 项。
+    验证:manager lib 169/169 + etcd 真集群 system_split_ref_counting 绿
+    (split txn/mirror/owner-lock 全走重构后的 fence 路径);workspace 绿;clippy 清。
 
 Main gaps / risks:
   · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
@@ -77,8 +85,15 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 10-12 manager(40k 行,预计 2-3 迭代,agent 扫 + 安全项落地)。
-  2. 然后 13 server(8k,含 autumn_client bin 一个 unused import)、14 fuse、
+  1. Chunk 11 manager 剩余项落地(ledger 表 11 行有精确坐标):
+     place_extents_with_fallback ×3(rpc_handlers 1189/2101/3281 附近,
+     shuffled-fallback walk,差异=extent-id 参数+耗尽时的 reject 类型,池构建留原地);
+     policy.rs classify_band ×2(822-861,纯函数);可选 extent_delete ship_deletes。
+     agent 审定干净/勿动:replay 三内联循环(语义各异)、mirror_* 家族、
+     multi_modify_split/merge 长函数(Phase 注释已分段,勿再提取)、
+     leader-gate 前导 15+ 处(各 Resp 类型不同,helper 不 type-clean)。
+  2. Chunk 12 manager tests/ 轻扫(support/mod.rs 优先)。
+  3. 然后 13 server(8k,autumn_client bin 有 unused import `Args`)、14 fuse、
      15 autumn-memory、16 gallery、17 python。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
