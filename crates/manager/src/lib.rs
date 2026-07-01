@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod authz;
 pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
@@ -60,6 +61,12 @@ pub const CLUSTER_VERSION_KEY: &str = "autumn-rs/cluster_version";
 /// ephemeral, and a manager failover invalidates every reader's cache
 /// per plan §6.4).
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
+
+/// F-AUTHZ-1: etcd prefix for the KDC tenant account DB
+/// (`tenantAccount/<tenant>` → rkyv'd `MgrTenantAccount`). Replayed on leader
+/// failover; the credential HASH is stored, never the raw credential. The
+/// tenant name is a string suffix (percent-encoded segment), not a u64 id.
+pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 
 /// ENOSPC-1: default allocation free-space floor — a node whose best
 /// disk has less free than this is soft-avoided by `select_nodes`.
@@ -792,6 +799,24 @@ pub struct AutumnManager {
     /// `crates/manager/src/inode_lease.rs` and
     /// `docs/autumn_fs_lease_plan.md`.
     pub(crate) inode_leases: crate::inode_lease::SharedRegistry,
+    /// F-AUTHZ-1: the manager's Ed25519 signing keyring (KDC private
+    /// material), loaded once from `--auth-signing-key-file`. `None` = authz
+    /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
+    pub(crate) authz_keyring: Rc<RefCell<Option<crate::authz::AuthzKeyring>>>,
+    /// F-AUTHZ-1: admin token gating the tenant-create/delete RPCs
+    /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
+    pub(crate) admin_token: Rc<RefCell<Option<String>>>,
+    /// F-AUTHZ-1: key prefixes under which the PS applies default-DENY (e.g.
+    /// `mem/`). Published in `GET_AUTHZ_CONFIG`. Each ends with `/`.
+    pub(crate) protected_prefixes: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// F-AUTHZ-1: TTL (seconds) minted tokens get. Default 3600 (1 h).
+    pub(crate) token_ttl_secs: Rc<Cell<u64>>,
+    /// F-AUTHZ-1: clock-skew leeway (seconds) advertised to the PS. Default 60.
+    pub(crate) clock_skew_secs: Rc<Cell<u64>>,
+    /// F-AUTHZ-1: tenant account DB (etcd `tenantAccount/<tenant>` →
+    /// `MgrTenantAccount`). Replayed on leader failover; mutated only via the
+    /// admin RPCs. Stores the credential HASH, never the raw credential.
+    pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, MgrTenantAccount>>>,
 }
 
 impl Default for AutumnManager {
@@ -853,6 +878,13 @@ impl AutumnManager {
                     crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64,
                 ),
             ))),
+            // F-AUTHZ-1: authz OFF unless the binary loads a signing-key file.
+            authz_keyring: Rc::new(RefCell::new(None)),
+            admin_token: Rc::new(RefCell::new(None)),
+            protected_prefixes: Rc::new(RefCell::new(Vec::new())),
+            token_ttl_secs: Rc::new(Cell::new(3600)),
+            clock_skew_secs: Rc::new(Cell::new(60)),
+            tenant_accounts: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -863,6 +895,39 @@ impl AutumnManager {
     pub fn set_report_disk_failure_config(&self, window: Duration, quorum: usize) {
         self.report_disk_failure_window.set(window);
         self.report_disk_failure_quorum.set(quorum.max(1));
+    }
+
+    /// F-AUTHZ-1: install the KDC signing keyring (parsed by the binary from
+    /// `--auth-signing-key-file`). Its presence ENABLES data-plane authz.
+    pub fn set_authz_keyring(&self, keyring: crate::authz::AuthzKeyring) {
+        *self.authz_keyring.borrow_mut() = Some(keyring);
+    }
+
+    /// F-AUTHZ-1: set the admin token gating tenant-create/delete
+    /// (`--admin-token`). Without it those admin RPCs are refused.
+    pub fn set_admin_token(&self, token: String) {
+        *self.admin_token.borrow_mut() = Some(token);
+    }
+
+    /// F-AUTHZ-1: set the protected (default-DENY) key prefixes
+    /// (`--auth-protected-prefix`, repeatable). Each is normalized to end `/`.
+    pub fn set_protected_prefixes(&self, mut prefixes: Vec<Vec<u8>>) {
+        for p in &mut prefixes {
+            if p.last() != Some(&b'/') {
+                p.push(b'/');
+            }
+        }
+        *self.protected_prefixes.borrow_mut() = prefixes;
+    }
+
+    /// F-AUTHZ-1: set the minted-token TTL in seconds (clamped ≥ 60).
+    pub fn set_token_ttl_secs(&self, secs: u64) {
+        self.token_ttl_secs.set(secs.max(60));
+    }
+
+    /// F-AUTHZ-1: set the advertised clock-skew leeway in seconds.
+    pub fn set_clock_skew_secs(&self, secs: u64) {
+        self.clock_skew_secs.set(secs);
     }
 
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
@@ -1934,6 +1999,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let cluster_version_kv = c.get(CLUSTER_VERSION_KEY.as_bytes()).await?;
         // F-ioring-lease-1: persisted writer leases.
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
+        // F-AUTHZ-1: persisted tenant account DB.
+        let tenant_account_raw = c.get_prefix(TENANT_ACCOUNT_PREFIX).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -2032,6 +2099,27 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             "decommissioned",
             &mut self.decommissioned.borrow_mut(),
         )?;
+        // F-AUTHZ-1: replay the KDC tenant account DB. String-keyed (tenant
+        // name), so we can't use replay_node_override_map (u64 id); mirror the
+        // ownerLocks/ inline pattern. A malformed account is fail-loud (a bad
+        // authz record must not silently start the KDC half-armed — it would
+        // let a tenant that should have prefixes mint with none / stale ones).
+        {
+            let mut accts = self.tenant_accounts.borrow_mut();
+            accts.clear();
+            for kv in &tenant_account_raw.kvs {
+                let raw = str::from_utf8(&kv.key)
+                    .map_err(|e| anyhow::anyhow!("non-utf8 tenantAccount key: {e}"))?;
+                let tenant = raw
+                    .strip_prefix(TENANT_ACCOUNT_PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("invalid tenantAccount key: {raw}"))?
+                    .to_string();
+                let acct: MgrTenantAccount = rkyv_decode(&kv.value).map_err(|e| {
+                    anyhow::anyhow!("F-AUTHZ-1: malformed tenantAccount/{tenant}: {e}")
+                })?;
+                accts.insert(tenant, acct);
+            }
+        }
         // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
         // every replayed PS. Pre-F210-G1 the map was empty post-failover,
         // and the liveness loop's `None` arm treated unknown PSes as

@@ -50,6 +50,21 @@ struct Args {
     min_alloc_free_bytes: Option<u64>,
     /// F211-I audit-log retention (days). `None` = default 90; 0 = off.
     audit_retention_days: Option<u64>,
+    /// F-AUTHZ-1: path to the Ed25519 signing-key file (KDC private material).
+    /// `None` = data-plane authz DISABLED (opt-in). Format: one key per line,
+    /// `<kid> <hex-32-byte-seed> [disabled]`. Generate via
+    /// `autumn-op gen-signing-key`.
+    auth_signing_key_file: Option<String>,
+    /// F-AUTHZ-1: admin token gating `tenant-create` / `tenant-delete`
+    /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
+    admin_token: Option<String>,
+    /// F-AUTHZ-1: protected (default-DENY) key prefixes, repeatable. `mem/` is
+    /// the default when authz is enabled and none is given.
+    auth_protected_prefixes: Vec<String>,
+    /// F-AUTHZ-1: minted-token TTL in seconds. `None` = library default 3600.
+    auth_token_ttl_secs: Option<u64>,
+    /// F-AUTHZ-1: clock-skew leeway in seconds. `None` = library default 60.
+    auth_clock_skew_secs: Option<u64>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +79,11 @@ fn parse_args() -> Args {
     let mut metrics_listen: Option<String> = None;
     let mut min_alloc_free_bytes: Option<u64> = None;
     let mut audit_retention_days: Option<u64> = None;
+    let mut auth_signing_key_file: Option<String> = None;
+    let mut admin_token: Option<String> = None;
+    let mut auth_protected_prefixes: Vec<String> = Vec::new();
+    let mut auth_token_ttl_secs: Option<u64> = None;
+    let mut auth_clock_skew_secs: Option<u64> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -137,6 +157,29 @@ fn parse_args() -> Args {
                 audit_retention_days =
                     Some(raw[i].parse().expect("--audit-retention-days must be a number"));
             }
+            // ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ────────────
+            "--auth-signing-key-file" => {
+                i += 1;
+                auth_signing_key_file = Some(raw[i].clone());
+            }
+            "--admin-token" => {
+                i += 1;
+                admin_token = Some(raw[i].clone());
+            }
+            "--auth-protected-prefix" => {
+                i += 1;
+                auth_protected_prefixes.push(raw[i].clone());
+            }
+            "--auth-token-ttl-secs" => {
+                i += 1;
+                auth_token_ttl_secs =
+                    Some(raw[i].parse().expect("--auth-token-ttl-secs must be a number"));
+            }
+            "--auth-clock-skew-secs" => {
+                i += 1;
+                auth_clock_skew_secs =
+                    Some(raw[i].parse().expect("--auth-clock-skew-secs must be a number"));
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -154,6 +197,11 @@ fn parse_args() -> Args {
         metrics_listen,
         min_alloc_free_bytes,
         audit_retention_days,
+        auth_signing_key_file,
+        admin_token,
+        auth_protected_prefixes,
+        auth_token_ttl_secs,
+        auth_clock_skew_secs,
     }
 }
 
@@ -208,6 +256,48 @@ async fn main() -> Result<()> {
     if let Some(v) = args.audit_retention_days {
         manager.set_audit_retention_days(v);
         tracing::info!(audit_retention_days = v, "audit retention configured");
+    }
+
+    // F-AUTHZ-1: data-plane authz (opt-in). Loading a signing-key file ENABLES
+    // it; without the flag the manager is not a KDC and PSes don't enforce.
+    if let Some(path) = &args.auth_signing_key_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read --auth-signing-key-file {path}"))?;
+        let keyring = autumn_manager::authz::AuthzKeyring::from_file_contents(&text)
+            .map_err(|e| anyhow::anyhow!("parse --auth-signing-key-file {path}: {e}"))?;
+        manager.set_authz_keyring(keyring);
+        // Protected prefixes: use the given ones, else default to `mem/`.
+        let prefixes: Vec<Vec<u8>> = if args.auth_protected_prefixes.is_empty() {
+            vec![b"mem/".to_vec()]
+        } else {
+            args.auth_protected_prefixes
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        };
+        manager.set_protected_prefixes(prefixes.clone());
+        if let Some(v) = args.auth_token_ttl_secs {
+            manager.set_token_ttl_secs(v);
+        }
+        if let Some(v) = args.auth_clock_skew_secs {
+            manager.set_clock_skew_secs(v);
+        }
+        if let Some(tok) = &args.admin_token {
+            manager.set_admin_token(tok.clone());
+        }
+        tracing::info!(
+            protected_prefixes = ?prefixes
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>(),
+            admin_token_set = args.admin_token.is_some(),
+            "F-AUTHZ-1: data-plane authz ENABLED (manager is a KDC)"
+        );
+    } else if args.admin_token.is_some() || !args.auth_protected_prefixes.is_empty() {
+        tracing::warn!(
+            "F-AUTHZ-1: --admin-token / --auth-protected-prefix given without \
+             --auth-signing-key-file; authz stays DISABLED (no signing key)"
+        );
     }
 
     if args.policy_fast_mode {

@@ -250,6 +250,11 @@ impl AutumnManager {
             MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
             MSG_HEARTBEAT_LEASE => self.handle_heartbeat_lease(payload).await,
             MSG_POLL_INVALIDATIONS => self.handle_poll_invalidations(payload).await,
+            // ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ────────────
+            MSG_MINT_TOKEN => self.handle_mint_token(payload).await,
+            MSG_GET_AUTHZ_CONFIG => self.handle_get_authz_config().await,
+            MSG_TENANT_CREATE => self.handle_tenant_create(payload).await,
+            MSG_TENANT_DELETE => self.handle_tenant_delete(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -290,6 +295,240 @@ impl AutumnManager {
             wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
             cluster_version: self.cluster_version.get(),
         }))
+    }
+
+    // ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ─────────────────────────
+
+    /// `MSG_MINT_TOKEN` — a client authenticates with its permanent tenant
+    /// credential and receives a short-TTL signed capability token. Leader-only:
+    /// the tenant account DB is authoritative only on the leader (replayed on
+    /// promotion); a follower's copy may be stale/empty.
+    async fn handle_mint_token(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MintTokenResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                token: Vec::new(),
+                exp: 0,
+            }));
+        }
+        let req: MintTokenReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Authz must be enabled (a signing key was configured) and have an
+        // enabled signing key. No awaits below → the keyring borrow is safe.
+        let kr = self.authz_keyring.borrow();
+        let (kid, sk) = match kr.as_ref().and_then(|k| k.active()) {
+            Some(v) => v,
+            None => {
+                return Ok(rkyv_encode(&MintTokenResp {
+                    code: CODE_ERROR,
+                    message: "authz not enabled / no signing key on this manager".to_string(),
+                    token: Vec::new(),
+                    exp: 0,
+                }));
+            }
+        };
+
+        // Verify the credential (constant-time). A missing tenant and a wrong
+        // credential return the SAME opaque error (don't reveal which).
+        let allowed_prefixes = {
+            let accts = self.tenant_accounts.borrow();
+            match accts.get(&req.tenant) {
+                Some(acct)
+                    if crate::authz::ct_eq_32(
+                        &crate::authz::credential_hash(&req.credential),
+                        &acct.credential_hash,
+                    ) =>
+                {
+                    acct.allowed_prefixes.clone()
+                }
+                _ => {
+                    return Ok(rkyv_encode(&MintTokenResp {
+                        code: CODE_PRECONDITION,
+                        message: "tenant or credential invalid".to_string(),
+                        token: Vec::new(),
+                        exp: 0,
+                    }));
+                }
+            }
+        };
+
+        let now = Self::epoch_seconds().max(0) as u64;
+        let exp = now + self.token_ttl_secs.get();
+        let claims = autumn_rpc::cap_token::CapClaims {
+            ver: autumn_rpc::cap_token::CAP_VER,
+            typ: autumn_rpc::cap_token::CAP_TYP.to_string(),
+            kid,
+            iss: "autumn-mgr".to_string(),
+            aud: self.cluster_id.borrow().clone(),
+            iat: now,
+            nbf: now,
+            exp,
+            allowed_prefixes,
+        };
+        match autumn_rpc::cap_token::sign_claims(sk, &claims) {
+            Ok(token) => Ok(rkyv_encode(&MintTokenResp {
+                code: CODE_OK,
+                message: String::new(),
+                token,
+                exp,
+            })),
+            Err(e) => Ok(rkyv_encode(&MintTokenResp {
+                code: CODE_ERROR,
+                message: format!("sign failed: {e}"),
+                token: Vec::new(),
+                exp: 0,
+            })),
+        }
+    }
+
+    /// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached) to learn the public keys
+    /// + protected prefixes. NOT leader-gated: the config is static local
+    /// (same key file on every manager via cluster.sh distribution), and the PS
+    /// must be able to fetch it even while an election is in progress.
+    async fn handle_get_authz_config(&self) -> HandlerResult {
+        let kr = self.authz_keyring.borrow();
+        let (enabled, public_keys) = match kr.as_ref() {
+            Some(k) => (true, k.published()),
+            None => (false, Vec::new()),
+        };
+        Ok(rkyv_encode(&GetAuthzConfigResp {
+            code: CODE_OK,
+            message: String::new(),
+            enabled,
+            public_keys,
+            protected_prefixes: self.protected_prefixes.borrow().clone(),
+            token_ttl_secs: self.token_ttl_secs.get(),
+            clock_skew_secs: self.clock_skew_secs.get(),
+        }))
+    }
+
+    /// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. Leader-only,
+    /// admin-token gated. Returns the freshly-generated permanent credential
+    /// (shown once; only its SHA-256 hash is stored).
+    async fn handle_tenant_create(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&TenantCreateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        let req: TenantCreateReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Admin-token gate (admin_auth_design.md Option A). Fail-closed: refuse
+        // if no admin token is configured; constant-time compare otherwise.
+        match self.admin_token.borrow().as_ref() {
+            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
+            Some(_) => {
+                return Ok(rkyv_encode(&TenantCreateResp {
+                    code: CODE_PRECONDITION,
+                    message: "admin token invalid".to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+            None => {
+                return Ok(rkyv_encode(&TenantCreateResp {
+                    code: CODE_ERROR,
+                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+        }
+
+        if req.tenant.is_empty() {
+            return Ok(rkyv_encode(&TenantCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "tenant must be non-empty".to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        if req.allowed_prefixes.is_empty() {
+            return Ok(rkyv_encode(&TenantCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "at least one allowed_prefix required".to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        // Normalize each prefix to end with '/' (unforgeable segment boundary).
+        let mut allowed_prefixes = req.allowed_prefixes.clone();
+        for p in &mut allowed_prefixes {
+            if p.is_empty() {
+                return Ok(rkyv_encode(&TenantCreateResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: "empty allowed_prefix".to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+            if p.last() != Some(&b'/') {
+                p.push(b'/');
+            }
+        }
+
+        // Fresh 32-byte credential from the OS CSPRNG (returned once).
+        let mut cred = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut cred);
+        }
+        let acct = MgrTenantAccount {
+            tenant: req.tenant.clone(),
+            credential_hash: crate::authz::credential_hash(&cred),
+            allowed_prefixes,
+        };
+        // etcd-first, then in-memory (Programming Note 1). F149-fenced txn.
+        let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, rkyv_encode(&acct).to_vec())])
+                .await
+            {
+                return Ok(rkyv_encode(&TenantCreateResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+        }
+        self.tenant_accounts
+            .borrow_mut()
+            .insert(req.tenant.clone(), acct);
+        Ok(rkyv_encode(&TenantCreateResp {
+            code: CODE_OK,
+            message: String::new(),
+            credential: cred.to_vec(),
+        }))
+    }
+
+    /// `MSG_TENANT_DELETE` — admin removes a tenant account (stops renewal; the
+    /// tenant's current token still works until it expires). Leader-only,
+    /// admin-token gated.
+    async fn handle_tenant_delete(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: TenantDeleteReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        match self.admin_token.borrow().as_ref() {
+            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
+            Some(_) => return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string()),
+            None => {
+                return Self::code_resp(
+                    CODE_ERROR,
+                    "admin RPCs disabled (no --admin-token configured)".to_string(),
+                )
+            }
+        }
+        let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.tenant_accounts.borrow_mut().remove(&req.tenant);
+        Self::code_resp(CODE_OK, String::new())
     }
 
     /// R1: read the persisted cluster_version. Servable from any replica,
@@ -5752,6 +5991,184 @@ mod split_inflight_guard_tests {
         );
         // The guard set is untouched by the refused call (still just our entry).
         assert!(m.split_inflight.borrow().contains(&99));
+    }
+}
+
+#[cfg(test)]
+mod authz_kdc_tests {
+    //! F-AUTHZ-1 Stage 1 acceptance: drive the KDC handlers end-to-end in
+    //! memory mode (leader=true, no etcd) — tenant-create → mint → publish
+    //! config → verify → expiry-fail → byte-flip-fail → delete-stops-renewal.
+    use super::*;
+    use crate::AutumnManager;
+    use autumn_rpc::cap_token::{public_key_from_seed, verify_token, AuthReject};
+    use ed25519_dalek::VerifyingKey;
+
+    /// A one-key signing file: kid=1, seed = 0x00..01.
+    fn keyfile() -> String {
+        "1 0000000000000000000000000000000000000000000000000000000000000001".to_string()
+    }
+
+    fn seed_1() -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[31] = 1;
+        s
+    }
+
+    /// Build a kid→VerifyingKey resolver from a published config (what a PS does).
+    fn resolver<'a>(cfg: &'a GetAuthzConfigResp) -> impl Fn(u32) -> Option<VerifyingKey> + 'a {
+        move |kid| {
+            cfg.public_keys
+                .iter()
+                .find(|k| k.kid == kid && !k.disabled)
+                .and_then(|k| {
+                    let arr: [u8; 32] = k.ed25519_pub.as_slice().try_into().ok()?;
+                    VerifyingKey::from_bytes(&arr).ok()
+                })
+        }
+    }
+
+    #[test]
+    fn kdc_mint_verify_expiry_byteflip() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = AutumnManager::new(); // memory mode → leader = true
+            mgr.set_authz_keyring(
+                crate::authz::AuthzKeyring::from_file_contents(&keyfile()).unwrap(),
+            );
+            mgr.set_admin_token("admin-secret".to_string());
+            mgr.set_protected_prefixes(vec![b"mem/".to_vec()]);
+            mgr.set_token_ttl_secs(3600);
+            let cluster_id = mgr.cluster_id.borrow().clone();
+
+            // ── (1) tenant-create (admin) ──────────────────────────────
+            let ok_create = rkyv_encode(&TenantCreateReq {
+                admin_token: "admin-secret".to_string(),
+                tenant: "acme".to_string(),
+                allowed_prefixes: vec![b"mem/acme/".to_vec()],
+            });
+            let resp: TenantCreateResp =
+                rkyv_decode(&mgr.handle_tenant_create(ok_create).await.unwrap()).unwrap();
+            assert_eq!(resp.code, CODE_OK, "{}", resp.message);
+            let cred = resp.credential;
+            assert_eq!(cred.len(), 32);
+
+            // wrong admin token → refused
+            let bad_admin = rkyv_encode(&TenantCreateReq {
+                admin_token: "wrong".to_string(),
+                tenant: "acme2".to_string(),
+                allowed_prefixes: vec![b"mem/acme2/".to_vec()],
+            });
+            let r: TenantCreateResp =
+                rkyv_decode(&mgr.handle_tenant_create(bad_admin).await.unwrap()).unwrap();
+            assert_ne!(r.code, CODE_OK);
+
+            // ── (2) mint a token with the credential ───────────────────
+            let mint = rkyv_encode(&MintTokenReq {
+                tenant: "acme".to_string(),
+                credential: cred.clone(),
+            });
+            let mresp: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint).await.unwrap()).unwrap();
+            assert_eq!(mresp.code, CODE_OK, "{}", mresp.message);
+            assert!(!mresp.token.is_empty());
+            let exp = mresp.exp;
+
+            // wrong credential → refused (same opaque error as unknown tenant)
+            let mint_bad = rkyv_encode(&MintTokenReq {
+                tenant: "acme".to_string(),
+                credential: vec![9u8; 32],
+            });
+            let mr: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_bad).await.unwrap()).unwrap();
+            assert_ne!(mr.code, CODE_OK);
+            let mint_unknown = rkyv_encode(&MintTokenReq {
+                tenant: "ghost".to_string(),
+                credential: cred.clone(),
+            });
+            let mru: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_unknown).await.unwrap()).unwrap();
+            assert_ne!(mru.code, CODE_OK);
+
+            // ── (3) publish config → verify token (what a PS does) ─────
+            let cfg: GetAuthzConfigResp =
+                rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.public_keys.len(), 1);
+            assert_eq!(cfg.protected_prefixes, vec![b"mem/".to_vec()]);
+            assert_eq!(
+                cfg.public_keys[0].ed25519_pub,
+                public_key_from_seed(&seed_1()).to_vec()
+            );
+
+            let rk = resolver(&cfg);
+            let claims = verify_token(&mresp.token, &rk, exp - 1, cfg.clock_skew_secs)
+                .expect("token should verify");
+            assert_eq!(claims.aud, cluster_id, "aud must equal cluster_id");
+            assert_eq!(claims.allowed_prefixes, vec![b"mem/acme/".to_vec()]);
+            assert_eq!(claims.kid, 1);
+            assert_eq!(claims.exp, exp);
+
+            // ── (4) expiry-fail: now past exp + skew leeway ────────────
+            let err = verify_token(
+                &mresp.token,
+                &rk,
+                exp + cfg.clock_skew_secs + 1,
+                cfg.clock_skew_secs,
+            )
+            .unwrap_err();
+            assert_eq!(err, AuthReject::Expired);
+
+            // ── (5) byte-flip-fail: tamper the signature ───────────────
+            let mut tampered = mresp.token.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x01;
+            let err = verify_token(&tampered, &rk, exp - 1, cfg.clock_skew_secs).unwrap_err();
+            assert_eq!(err, AuthReject::BadSignature);
+
+            // ── (6) tenant-delete stops future renewal ─────────────────
+            let del = rkyv_encode(&TenantDeleteReq {
+                admin_token: "admin-secret".to_string(),
+                tenant: "acme".to_string(),
+            });
+            let dresp: CodeResp =
+                rkyv_decode(&mgr.handle_tenant_delete(del).await.unwrap()).unwrap();
+            assert_eq!(dresp.code, CODE_OK);
+            let mint_after_del = rkyv_encode(&MintTokenReq {
+                tenant: "acme".to_string(),
+                credential: cred,
+            });
+            let mr2: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_after_del).await.unwrap()).unwrap();
+            assert_ne!(mr2.code, CODE_OK, "deleted tenant must not renew");
+        });
+    }
+
+    #[test]
+    fn kdc_disabled_when_no_signing_key() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = AutumnManager::new();
+            // No keyring set → authz disabled.
+            let cfg: GetAuthzConfigResp =
+                rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
+            assert!(!cfg.enabled);
+            assert!(cfg.public_keys.is_empty());
+            // mint refused (no signing key), tenant-create refused (no admin token).
+            let mint = rkyv_encode(&MintTokenReq {
+                tenant: "acme".to_string(),
+                credential: vec![1u8; 32],
+            });
+            let mr: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint).await.unwrap()).unwrap();
+            assert_ne!(mr.code, CODE_OK);
+            let tc = rkyv_encode(&TenantCreateReq {
+                admin_token: "x".to_string(),
+                tenant: "acme".to_string(),
+                allowed_prefixes: vec![b"mem/acme/".to_vec()],
+            });
+            let r: TenantCreateResp =
+                rkyv_decode(&mgr.handle_tenant_create(tc).await.unwrap()).unwrap();
+            assert_ne!(r.code, CODE_OK);
+        });
     }
 }
 // end of rpc_handlers.rs
