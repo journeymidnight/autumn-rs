@@ -23,7 +23,7 @@ Rules per chunk:
 | 2 | crates/etcd | 1329 | done (no changes needed — logic already clear) | |
 | 3 | crates/rpc | 6579 | done | f833d1d (client.rs read_loop dedup), f89802c (bench dedup) |
 | 4 | crates/transport (+ucx-sys-mini) | 4140 | done | 0fe3e72 (endpoint/lib/listener dedup), 63dcc34 (regpool dead branch + bench/test dedup) |
-| 5 | crates/client | 3966 | todo | |
+| 5 | crates/client | 3966 | done | c66d555 (NOT_LEADER loop ×4, fail_slots ×8, GetStream ctor, lease_call ×4) |
 | 6 | crates/stream — server side (extent node) | ~9000 | todo | |
 | 7 | crates/stream — client side (StreamClient) | ~9000 | todo | |
 | 8 | crates/partition-server — core write/read path | ~11000 | todo | |
