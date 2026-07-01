@@ -19,6 +19,15 @@ Current summary:
     - f89802c ps_read_bench 三份复制的 driver 收敛为 drive() + 两个 read_loop。
   · 子代理审了 wire 文件:manager_rpc/build.rs 干净;cap_token/extent_rpc/partition_rpc
     三个低价值 finding 记入 ledger findings log(等下次真编辑时顺带)。
+  · Chunk 4 transport(4140 行)done,2 commit pushed:
+    - 0fe3e72 endpoint.rs 四处 Pending-completion 重复→await_pending()+ucx_recv 薄包装;
+      lib.rs 双份 getifaddrs walk→all_ifaddrs();listener/sockaddr 双份 sockaddr 转换
+      →from_ucx_storage;regpool clippy nit。
+    - 63dcc34 regpool Drop 恒真死分支删除;transport_bench 3 份 client 协议+3 份 server
+      drain 收敛(send_warm_timed/read_count/drain_n/drain_registered,删死参 _mode);
+      tests/common round_trip_at 合并。
+    验证:8/8 transport 测试套件绿(含 RoCE 上真 UCX loopback+cancel-safety 两测,
+    正是重构的路径)+ bench 冒烟 TCP+UCX 全列有数;rpc 43/43 两 feature;workspace 绿。
 
 Main gaps / risks:
   · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
@@ -26,7 +35,6 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 4 transport(4140 行,含 regpool.rs:141 clippy manual_range_contains)。
-  2. Chunk 5 client(3966 行)。
-  3. 之后按 ledger 顺序 6-17;dead code(partition-server decode_records_with_offsets/
+  1. Chunk 5 client(3966 行)。
+  2. 之后按 ledger 顺序 6-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。

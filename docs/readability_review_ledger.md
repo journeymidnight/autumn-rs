@@ -22,7 +22,7 @@ Rules per chunk:
 | 1 | crates/common | 601 | done (no changes needed — logic already clear) | |
 | 2 | crates/etcd | 1329 | done (no changes needed — logic already clear) | |
 | 3 | crates/rpc | 6579 | done | f833d1d (client.rs read_loop dedup), f89802c (bench dedup) |
-| 4 | crates/transport (+ucx-sys-mini) | 4140 | todo | |
+| 4 | crates/transport (+ucx-sys-mini) | 4140 | done | 0fe3e72 (endpoint/lib/listener dedup), 63dcc34 (regpool dead branch + bench/test dedup) |
 | 5 | crates/client | 3966 | todo | |
 | 6 | crates/stream — server side (extent node) | ~9000 | todo | |
 | 7 | crates/stream — client side (StreamClient) | ~9000 | todo | |
@@ -58,4 +58,7 @@ Status values: todo | in_progress | done
   `invalidate_extent`/`stats` methods; server bin unused imports
   `MergeIterator`/`TableIterator`; fields `server_owner_key`/`server_revision`
   never read.
-- transport regpool.rs:141 — clippy manual_range_contains (chunk 4).
+- transport regpool.rs:141 — clippy manual_range_contains (fixed in 0fe3e72).
+- transport skipped-as-not-worth-it: regpool warn-once latch duplicated at 2
+  cold sites (borderline); pre-existing ucx-build clippy nits (vec_box on the
+  deliberate stable-address Slot pool, u32→u32 FFI casts) left alone.
