@@ -245,10 +245,19 @@ fn check_range(
 /// error frame and skips serve/delegate), `None` to admit.
 ///
 /// A frame that fails to decode returns `None` (admit) — the real handler will
-/// reject it with `InvalidArgument`; both use the same `rkyv_decode`, so a
-/// frame that fails here fails there too (no bypass). Non-data-plane msg_types
-/// (maintenance / split / merge / diag / AUTH_HELLO) are not key-scoped and
-/// return `None` here (admin auth is a separate concern).
+/// reject it with `InvalidArgument`. This is safe because the gate and the
+/// handler extract the key with the SAME decode (`rkyv_decode` for the rkyv
+/// requests, `parse_put_zc_meta` for `MSG_PUT_ZC`): a payload that fails to
+/// parse here fails identically in the handler, so no bytes are ever served.
+///
+/// **INVARIANT (load-bearing — an authz bypass = cross-tenant data exposure):
+/// every client data-plane msg_type that carries a USER KEY must have an arm
+/// here that extracts the key and calls `check_key` / `check_range`.** The
+/// catch-all `_ => None` admits ungated, which is correct ONLY for
+/// non-key-scoped ops (maintenance / split / merge / discards / diag — admin
+/// auth is a separate concern) and `AUTH_HELLO` (handled by the connection
+/// loop). Adding a new keyed read/write RPC without an arm here silently lets
+/// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
 pub fn authz_check(
     msg_type: u8,
     payload: &[u8],
@@ -305,9 +314,10 @@ pub fn authz_check(
             }
             None
         }
-        // AUTH_HELLO is handled by the connection loop (binds the principal),
-        // never reaches here. Maintenance / split / merge / discards / diag are
-        // not key-scoped data-plane ops.
+        // Catch-all = ADMIT ungated. Correct ONLY for non-key-scoped ops
+        // (maintenance / split / merge / discards / diag) and AUTH_HELLO (bound
+        // by the connection loop). A new KEYED data RPC landing here is an authz
+        // bypass — see the INVARIANT on this fn's doc comment.
         _ => {
             debug_assert_ne!(msg_type, MSG_AUTH_HELLO);
             None

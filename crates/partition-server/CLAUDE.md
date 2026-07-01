@@ -1333,6 +1333,55 @@ eviction (network blip, etcd lease hiccup) self-heals. Pre-F111 the
 manager silently returned `CODE_OK` for unknown ps_id, so the running
 PS never noticed it had been evicted.
 
+## Data-plane authz enforcement (F-AUTHZ-1, `authz.rs`)
+
+The PS is the KV-layer enforcement point for multi-tenant `mem/` isolation
+(design: `docs/data_plane_authz_design.md`). It holds ONLY the manager's PUBLIC
+keys (fetched via `MSG_GET_AUTHZ_CONFIG`, cached in `PartitionServer.authz:
+Arc<AuthzState>`, refreshed by `authz_config_poll_loop`, 5 s). It verifies a
+capability token ONCE per connection and enforces a byte prefix + `exp` check
+per request — it NEVER calls the manager to enforce.
+
+**OPT-IN.** `AuthzState.is_enabled()` is a single relaxed `AtomicBool` load;
+false (no signing key configured cluster-wide) ⇒ the whole gate is skipped, so
+fuse / kvcache / dev pay nothing. `enabled` flips true only after the config
+poll installs a keyring.
+
+**ONE choke point: `authz_gate` (lib.rs), at the TOP of every frame dispatch,
+BEFORE routing.** Called from exactly two places — `push_one_frame_to_inflight`
+(the canonical dispatch; also covers `push_frames_to_inflight` + the idle-branch
+direct pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
+- handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
+  `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`
+  (`handle_ps_connection` local; `&mut` threaded into both dispatch fns). When
+  authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works
+  against a non-authz PS.
+- else runs `authz_check(msg_type, payload, principal, …)`: per the request's
+  user key(s), `check_key` (protected prefix ⇒ require an unexpired token whose
+  `allowed_prefixes` covers the key; kid still in the live keyring) / `check_range`
+  (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied`
+  frame is emitted and the frame NEVER reaches serve/delegate.
+
+**`drain_zc_writes` is SKIPPED when authz is ON.** The ZC write-recv fast path
+bypasses the `authz_gate` dispatch, so with authz on a large `MSG_PUT_ZC` is
+left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
+enforces uniformly (one value copy — acceptable, large writes are rare on
+`mem/`). Never re-enable it under authz without moving the key check into it.
+
+**Two load-bearing INVARIANTS (breaking either = silent cross-tenant exposure):**
+1. Any new frame-dispatch path (a new local-serve fast path, a new inline
+   handler off the ps-conn task) MUST route through `authz_gate` before serving
+   — the gate is the only enforcement point.
+2. Any new client data-plane msg_type that carries a USER KEY MUST get an arm in
+   `authz_check` that extracts the key and calls `check_key`/`check_range`. The
+   catch-all `_ => None` admits ungated (correct only for non-keyed admin ops).
+
+Wire: `MSG_AUTH_HELLO` (0x55) + `AuthHelloReq/Resp`; `StatusCode::PermissionDenied`
+(7). Client side: SDK auto-mints/renews the token and AUTH_HELLOs each PS
+connection (`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDenied`
+is terminal (not retried). Cross-tenant e2e: `crates/autumn-memory/tests/
+run_authz_e2e.sh`.
+
 ## region_epoch check (TiKV-style, 2026-05-16)
 
 Each `PartitionData` carries `region_epoch: u64`, populated at open
