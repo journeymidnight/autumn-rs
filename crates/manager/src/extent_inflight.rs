@@ -19,7 +19,6 @@
 //! See `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for the
 //! full plan and PS-layer ↔ stream-layer interaction model.
 
-use autumn_etcd::proto::RequestOp;
 use autumn_etcd::Cmp;
 use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrEcDispatchInflight, MgrRecoveryTask};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -238,17 +237,10 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// Build the etcd delete op for the marker on `extent_id`. Caller
-    /// appends this to its own op's apply-done txn batch so release is
-    /// atomic with the state mutation (invariant I3).
-    pub(crate) fn build_extent_inflight_release_op(&self, extent_id: u64) -> RequestOp {
-        let key = Self::extent_inflight_key(extent_id);
-        autumn_etcd::Op::delete(key.as_bytes())
-    }
-
-    /// In-memory companion to `build_extent_inflight_release_op`. Call
-    /// AFTER your apply-done etcd txn has succeeded (etcd-first invariant
-    /// per `crates/manager/CLAUDE.md` programming note 1).
+    /// In-memory release of the inflight marker. Call AFTER the apply-done
+    /// etcd txn (which deletes `extent_inflight_key(extent_id)`) has
+    /// succeeded (etcd-first invariant per `crates/manager/CLAUDE.md`
+    /// programming note 1).
     pub(crate) fn commit_extent_inflight_release(&self, extent_id: u64) {
         self.inflight.borrow_mut().remove(&extent_id);
     }
@@ -290,35 +282,6 @@ impl AutumnManager {
             }
         }
         (ec, rec)
-    }
-
-    /// F207-C helper: ec + recovery + delete snapshot. Used by
-    /// `handle_multi_modify_merge` which today consults all three sets.
-    pub(crate) fn inflight_snapshot_three(
-        &self,
-    ) -> (
-        std::collections::HashSet<u64>,
-        std::collections::HashSet<u64>,
-        std::collections::HashSet<u64>,
-    ) {
-        let mut ec = std::collections::HashSet::new();
-        let mut rec = std::collections::HashSet::new();
-        let mut del = std::collections::HashSet::new();
-        for (id, r) in self.inflight.borrow().iter() {
-            match r.kind() {
-                Some(ExtentOpKind::ConvertToEc) => {
-                    ec.insert(*id);
-                }
-                Some(ExtentOpKind::Recovery) => {
-                    rec.insert(*id);
-                }
-                Some(ExtentOpKind::Delete) => {
-                    del.insert(*id);
-                }
-                _ => {}
-            }
-        }
-        (ec, rec, del)
     }
 
     /// Test-only convenience: simulate that `extent_id` is in flight with

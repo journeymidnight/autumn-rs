@@ -2032,7 +2032,7 @@ impl AutumnManager {
         };
         if !already_sealed {
             tail.sealed = true;
-            tail.sealed_length = sealed_len as u64;
+            tail.sealed_length = sealed_len;
             tail.eversion += 1;
             tail.avali = avali;
         }

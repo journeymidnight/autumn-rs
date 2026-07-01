@@ -1360,14 +1360,12 @@ impl crate::AutumnManager {
     /// candidate set shrinks. Idempotent.
     async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let del_op = self.build_extent_inflight_release_op(extent_id);
             // Use `put_and_delete_txn` (one-element delete list) so the F149
             // fence applies. A `false` return from the underlying CAS is
             // impossible here (no extra_cmp); only NotLeader can happen and
             // bubbles up.
             etcd.put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
                 .await?;
-            let _ = del_op; // silence unused (kept for symmetry with apply path)
         }
         self.commit_extent_inflight_release(extent_id);
         Ok(())

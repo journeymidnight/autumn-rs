@@ -151,12 +151,19 @@ impl EtcdMirror {
         if resp.succeeded {
             return Ok(true);
         }
+        self.diagnose_post_txn_fence().await?;
+        Ok(false)
+    }
 
-        // Distinguish fence-failure from extra_cmp-failure by reading the
-        // current leader-key value. If it still matches our instance_id, the
-        // fence held and only a business CAS failed (e.g., create_revision==0
-        // refused because the key already exists). If it differs (or is
-        // gone), we have been deposed.
+    /// Shared post-txn fence diagnosis: a fenced txn came back
+    /// `succeeded == false` — distinguish fence-failure from
+    /// extra_cmp-failure by reading the current leader-key value. If it
+    /// still matches our instance_id, the fence held and only a business
+    /// CAS failed (e.g., create_revision==0 refused because the key already
+    /// exists) — returns `Ok(())` and the caller decides how to surface the
+    /// soft-fail. If it differs (or is gone), we have been deposed —
+    /// flips `leader`/`displaced` and returns `Err(NotLeader)`.
+    async fn diagnose_post_txn_fence(&self) -> Result<(), AppError> {
         let got = {
             self.client
                 .get(LEADER_KEY.as_bytes())
@@ -168,19 +175,23 @@ impl EtcdMirror {
             .first()
             .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
             .unwrap_or(false);
-
         if !still_leader {
             // etcd-chaos D1: a DIFFERENT holder = true displacement (our
             // state can be superseded); a missing key = lease expiry with
             // no successor — leaderless, not displaced.
-            if got.kvs.first().is_some() {
+            if !got.kvs.is_empty() {
                 self.displaced.set(true);
             }
             self.leader.set(false);
             return Err(AppError::NotLeader);
         }
+        Ok(())
+    }
 
-        Ok(false)
+    /// A fenced txn with NO extra_cmp returned `succeeded == false` even
+    /// though the fence held — only possible on a server-side anomaly.
+    fn empty_extra_cmp_err() -> AppError {
+        AppError::Internal("etcd txn rejected with empty extra_cmp".to_string())
     }
 
     /// F265: fenced txn whose success value is the txn's COMMIT REVISION
@@ -222,28 +233,10 @@ impl EtcdMirror {
                 })?;
             return Ok(rev);
         }
-        // Same fence-vs-anomaly diagnosis as `txn_fenced`.
-        let got = {
-            self.client
-                .get(LEADER_KEY.as_bytes())
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        };
-        let still_leader = got
-            .kvs
-            .first()
-            .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
-            .unwrap_or(false);
-        if !still_leader {
-            if got.kvs.first().is_some() {
-                self.displaced.set(true);
-            }
-            self.leader.set(false);
-            return Err(AppError::NotLeader);
-        }
-        Err(AppError::Internal(
-            "etcd txn rejected with empty extra_cmp".to_string(),
-        ))
+        // Same fence-vs-anomaly diagnosis as `txn_fenced`; there is no
+        // extra_cmp here, so a held fence means a server-side anomaly.
+        self.diagnose_post_txn_fence().await?;
+        Err(Self::empty_extra_cmp_err())
     }
 
     async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<(), AppError> {
@@ -256,12 +249,7 @@ impl EtcdMirror {
             .collect::<Vec<_>>();
         match self.txn_fenced(vec![], ops, vec![]).await? {
             true => Ok(()),
-            // No extra_cmp was supplied, so a `false` here would mean etcd
-            // returned `succeeded=false` despite an empty compare list — that
-            // can only happen on a server-side bug. Surface as Internal.
-            false => Err(AppError::Internal(
-                "etcd txn rejected with empty extra_cmp".to_string(),
-            )),
+            false => Err(Self::empty_extra_cmp_err()),
         }
     }
 
@@ -285,9 +273,7 @@ impl EtcdMirror {
         );
         match self.txn_fenced(vec![], ops, vec![]).await? {
             true => Ok(()),
-            false => Err(AppError::Internal(
-                "etcd txn rejected with empty extra_cmp".to_string(),
-            )),
+            false => Err(Self::empty_extra_cmp_err()),
         }
     }
 

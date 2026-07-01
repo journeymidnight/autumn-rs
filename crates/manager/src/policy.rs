@@ -208,9 +208,6 @@ impl PartitionMetricsWindow {
     pub fn push(&mut self, ts: i64, load: PartitionLoad) {
         self.push_with_cap_and_bucket(ts, load, POLICY_WINDOW_BUCKETS, POLICY_BUCKET_SEC);
     }
-    pub fn push_with_cap(&mut self, ts: i64, load: PartitionLoad, cap: usize) {
-        self.push_with_cap_and_bucket(ts, load, cap, POLICY_BUCKET_SEC);
-    }
     /// F210-F2: snap `ts` to a `bucket_sec` boundary. If the previous
     /// entry shares that snapped bucket, REPLACE its load (last-wins
     /// within a bucket). Pre-F210-F2 every PS `report_load_loop` tick

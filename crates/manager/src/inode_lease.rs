@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use autumn_rpc::manager_rpc::{
-    MgrClientId, MgrInodeLeaseInfo, MgrInodeLeaseRecord, MgrInvalidation,
+    MgrClientId, MgrInodeLeaseRecord, MgrInvalidation,
     LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED,
     LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
@@ -364,16 +364,6 @@ impl LeaseRegistry {
         if version > *slot {
             *slot = version;
         }
-    }
-
-    fn snapshot(&self, ino: u64) -> Option<MgrInodeLeaseInfo> {
-        let s = self.inodes.get(&ino)?;
-        Some(MgrInodeLeaseInfo {
-            ino,
-            version: s.version,
-            writer_present: s.writer.is_some(),
-            ttl_secs: self.ttl_secs(),
-        })
     }
 
     /// `mode = LEASE_MODE_READ` or `LEASE_MODE_WRITE`. `now` is the
@@ -732,19 +722,18 @@ impl LeaseRegistry {
         HeartbeatOutcome::NotHeld
     }
 
-    /// Drain a client's invalidation queue. Returns the (possibly
-    /// empty) batch. `overflowed=true` if any events were dropped due
-    /// to overflow since the last poll — F-ioring-lease-3's poller
-    /// will then surface the loss to the client which invalidates
-    /// every cached inode (plan §6.4).
     // ── BUG-LEASE-4 (P1 #4, 2026-06-06) — deferred-push 2PC ────
-
     // (see `DeferredPushes` below for the public type;
     //  `acquire_with_force_deferred` / `flush_deferred_pushes` /
     //  `revert_writer_acquire` cooperate to ensure no phantom
     //  LeaseRevoked / WillRevokeIn events land in client inboxes
     //  when the manager's etcd persist fails.)
 
+    /// Drain a client's invalidation queue. Returns the (possibly
+    /// empty) batch. `overflowed=true` if any events were dropped due
+    /// to overflow since the last poll — F-ioring-lease-3's poller
+    /// will then surface the loss to the client which invalidates
+    /// every cached inode (plan §6.4).
     pub fn drain_invalidations(&mut self, client: &MgrClientId) -> (Vec<MgrInvalidation>, bool) {
         let me = ClientKey::from_wire(client);
         let Some(inbox) = self.inboxes.get_mut(&me) else {
@@ -929,10 +918,6 @@ impl LeaseRegistry {
             version,
             kind: reason.wire_kind(),
         });
-    }
-
-    pub fn snapshot_for(&self, ino: u64) -> Option<MgrInodeLeaseInfo> {
-        self.snapshot(ino)
     }
 
     /// Build the persistence record for a writer-held inode.
