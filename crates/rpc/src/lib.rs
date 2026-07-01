@@ -134,7 +134,10 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // bind). StatusCode::PermissionDenied (7) was also added but error.rs is
     // not in the fingerprint set, so only the partition_rpc addition bumps it.
     // Pre-R3: MIN=MAX=10 (same-commit deploy).
-    (10, "1378369d1af1d2fb"),
+    // (Fingerprint updated in place within v10 — coco Stage-2 fix added
+    // GetAuthzConfigResp.cluster_id so the PS can enforce token aud == cluster_id;
+    // v10 not yet deployed, so no bump.)
+    (10, "64554258323fbe51"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

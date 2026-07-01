@@ -1943,4 +1943,9 @@ pub struct GetAuthzConfigResp {
     pub token_ttl_secs: u64,
     /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
     pub clock_skew_secs: u64,
+    /// This cluster's `cluster_id` = the token `aud` the manager mints with. The
+    /// PS enforces `token.aud == cluster_id` at AUTH_HELLO so a token minted for
+    /// another cluster (that happens to share signing keys) can't be replayed
+    /// here. Empty = unknown (manager not yet bootstrapped) → PS skips the check.
+    pub cluster_id: String,
 }

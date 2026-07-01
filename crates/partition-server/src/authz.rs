@@ -36,6 +36,10 @@ pub struct AuthzInner {
     pub protected_prefixes: Vec<Vec<u8>>,
     /// Clock-skew leeway (seconds) applied to token `exp`.
     pub clock_skew_secs: u64,
+    /// This cluster's id = the required token `aud`. A token whose `aud` differs
+    /// (minted for another cluster that shares signing keys) is rejected at
+    /// AUTH_HELLO. Empty = unknown → the aud check is skipped (degraded).
+    pub cluster_id: String,
 }
 
 impl AuthzInner {
@@ -44,6 +48,7 @@ impl AuthzInner {
             keys: HashMap::new(),
             protected_prefixes: Vec::new(),
             clock_skew_secs: 60,
+            cluster_id: String::new(),
         }
     }
 }
@@ -108,6 +113,7 @@ impl AuthzState {
             keys,
             protected_prefixes: resp.protected_prefixes.clone(),
             clock_skew_secs: resp.clock_skew_secs,
+            cluster_id: resp.cluster_id.clone(),
         });
         *self.inner.write() = inner;
         // Publish `enabled` AFTER the config is in place so a concurrent reader
@@ -122,24 +128,38 @@ pub struct BoundPrincipal {
     pub allowed_prefixes: Vec<Vec<u8>>,
     /// Token expiry (unix seconds).
     pub exp: u64,
+    /// The kid this token was verified against. Re-checked against the live
+    /// keyring on EVERY request so a disabled/rotated-out kid revokes even
+    /// already-bound long connections (coco P1: `install` drops disabled kids,
+    /// but the per-request check is what enforces it on live connections).
+    pub kid: u32,
 }
 
 /// Verify an `AUTH_HELLO` token against the cached public keys → the bound
-/// principal, or a reject reason. `now`/skew gate `nbf`/`exp` at bind time.
+/// principal, or a reject reason (string, for the AuthHelloResp message /
+/// metrics). `now`/skew gate `nbf`/`exp`; the `aud` must equal this cluster's id
+/// (when known) so a token minted for another cluster can't be replayed here.
 pub fn verify_auth_hello(
     token: &[u8],
     inner: &AuthzInner,
     now: u64,
-) -> Result<BoundPrincipal, AuthReject> {
+) -> Result<BoundPrincipal, String> {
     let claims = verify_token(
         token,
         |kid| inner.keys.get(&kid).copied(),
         now,
         inner.clock_skew_secs,
-    )?;
+    )
+    .map_err(|r: AuthReject| r.label().to_string())?;
+    // aud must match this cluster (defends cross-cluster replay when signing
+    // keys are shared). Skipped only when this PS doesn't know its cluster_id.
+    if !inner.cluster_id.is_empty() && claims.aud != inner.cluster_id {
+        return Err("wrong_audience".to_string());
+    }
     Ok(BoundPrincipal {
         allowed_prefixes: claims.allowed_prefixes,
         exp: claims.exp,
+        kid: claims.kid,
     })
 }
 
@@ -166,6 +186,11 @@ fn check_key(
         Some(p) => p,
         None => return denied("protected key requires a capability token (no AUTH_HELLO on this connection)"),
     };
+    if !inner.keys.contains_key(&p.kid) {
+        // kid disabled / rotated out since this connection bound — revoke it
+        // (coco P1: closes the "emergency bulk revocation misses live conns" gap).
+        return denied("signing key disabled/rotated; re-authenticate");
+    }
     if now > p.exp.saturating_add(inner.clock_skew_secs) {
         return denied("capability token expired; re-authenticate");
     }
@@ -202,6 +227,9 @@ fn check_range(
         Some(p) => p,
         None => return denied("protected range requires a capability token (no AUTH_HELLO on this connection)"),
     };
+    if !inner.keys.contains_key(&p.kid) {
+        return denied("signing key disabled/rotated; re-authenticate");
+    }
     if now > p.exp.saturating_add(inner.clock_skew_secs) {
         return denied("capability token expired; re-authenticate");
     }
@@ -296,10 +324,14 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     fn inner_with(prefixes: Vec<Vec<u8>>) -> AuthzInner {
+        // Include kid 1 so a principal bound to kid 1 passes the revocation check.
+        let mut keys = HashMap::new();
+        keys.insert(1u32, SigningKey::from_bytes(&[1u8; 32]).verifying_key());
         AuthzInner {
-            keys: HashMap::new(),
+            keys,
             protected_prefixes: prefixes,
             clock_skew_secs: 60,
+            cluster_id: String::new(),
         }
     }
 
@@ -307,6 +339,7 @@ mod tests {
         BoundPrincipal {
             allowed_prefixes: vec![b"mem/acme/".to_vec()],
             exp: 1_000_000,
+            kid: 1,
         }
     }
 
@@ -410,30 +443,51 @@ mod tests {
             keys,
             protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
+            cluster_id: "cluster-x".to_string(),
         };
         let now = 1_000_000;
-        let claims = CapClaims {
+        let mk = |aud: &str| CapClaims {
             ver: CAP_VER,
             typ: CAP_TYP.to_string(),
             kid: 1,
             iss: "autumn-mgr".to_string(),
-            aud: "cluster-x".to_string(),
+            aud: aud.to_string(),
             iat: now,
             nbf: now,
             exp: now + 3600,
             allowed_prefixes: vec![b"mem/acme/".to_vec()],
         };
-        let token = sign_claims(&sk, &claims).unwrap();
+        let token = sign_claims(&sk, &mk("cluster-x")).unwrap();
         let p = verify_auth_hello(&token, &inner, now).unwrap();
         assert_eq!(p.allowed_prefixes, vec![b"mem/acme/".to_vec()]);
         assert_eq!(p.exp, now + 3600);
+        assert_eq!(p.kid, 1);
         // wrong kid (not in keyring) → reject
         let inner2 = AuthzInner {
             keys: HashMap::new(),
             protected_prefixes: vec![],
             clock_skew_secs: 60,
+            cluster_id: "cluster-x".to_string(),
         };
         assert!(verify_auth_hello(&token, &inner2, now).is_err());
+        // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
+        let cross = sign_claims(&sk, &mk("cluster-OTHER")).unwrap();
+        assert!(verify_auth_hello(&cross, &inner, now).is_err());
+    }
+
+    #[test]
+    fn disabled_kid_revokes_live_connection() {
+        // A principal bound to kid 1, then kid 1 is rotated out of the keyring
+        // (disabled) → every subsequent request on that live connection denies.
+        let inner_disabled = AuthzInner {
+            keys: HashMap::new(), // kid 1 no longer present
+            protected_prefixes: vec![b"mem/".to_vec()],
+            clock_skew_secs: 60,
+            cluster_id: String::new(),
+        };
+        let p = acme(); // kid 1
+        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner_disabled, 999_000).is_some());
+        assert!(check_range(b"mem/acme/", Some(&p), &inner_disabled, 999_000).is_some());
     }
 
     #[test]
@@ -460,6 +514,7 @@ mod tests {
             protected_prefixes: vec![b"mem/".to_vec()],
             token_ttl_secs: 3600,
             clock_skew_secs: 45,
+            cluster_id: "cluster-abc".to_string(),
         });
         assert!(st.is_enabled());
         let snap = st.snapshot();
@@ -467,5 +522,6 @@ mod tests {
         assert!(!snap.keys.contains_key(&2)); // disabled kid excluded
         assert_eq!(snap.protected_prefixes, vec![b"mem/".to_vec()]);
         assert_eq!(snap.clock_skew_secs, 45);
+        assert_eq!(snap.cluster_id, "cluster-abc");
     }
 }

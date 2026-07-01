@@ -2775,20 +2775,22 @@ impl PartitionServer {
         // minor compact (mechanism-level must-cleanup paths preserved
         // in `background_compact_loop`'s timer arm).
 
-        server.sync_regions_once().await?;
-
-        // F-AUTHZ-1: load the authz config BEFORE serving so enforcement is
-        // armed for the first connection. Best-effort — a fetch failure (manager
-        // briefly unreachable) leaves authz disabled and the poll loop retries
-        // within 5 s; the normal startup order (manager up first) makes this
-        // succeed. Availability wins over a cold-start fail-closed here, per the
-        // trusted-internal-net threat model.
+        // F-AUTHZ-1: load the authz config BEFORE `sync_regions_once` — the
+        // latter opens partitions + starts their accept loops, so fetching after
+        // it left a cold-start fail-open window where connections were served
+        // with authz still disabled (coco P1). Best-effort: a fetch failure
+        // (manager briefly unreachable) leaves authz disabled and the poll loop
+        // retries within 5 s; the normal startup order (manager up first) makes
+        // this succeed before any listener binds. Availability wins over a
+        // cold-start fail-closed here, per the trusted-internal-net threat model.
         if let Err(e) = server.fetch_authz_config_once().await {
             tracing::warn!(
                 ps_id = server.ps_id,
                 "F-AUTHZ-1: initial authz config fetch failed ({e:#}); will retry via poll loop"
             );
         }
+
+        server.sync_regions_once().await?;
 
         Ok(server)
     }
@@ -4419,6 +4421,21 @@ fn authz_gate(
                 Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
             );
         }
+        // Bound the UNAUTHENTICATED AUTH_HELLO payload BEFORE the outer rkyv
+        // decode (coco P2): a legit token is <= MAX_CAP_TOKEN_LEN (8 KiB) plus a
+        // tiny rkyv envelope, so 16 KiB is generous. Without this cap the outer
+        // `rkyv_decode::<AuthHelloReq>` would copy/allocate an attacker-sized
+        // token before verify_token's own 8 KiB cap could reject it.
+        const AUTH_HELLO_MAX_PAYLOAD: usize = 16 * 1024;
+        if payload.len() > AUTH_HELLO_MAX_PAYLOAD {
+            let resp = AuthHelloResp {
+                code: StatusCode::InvalidArgument as u8,
+                message: "AUTH_HELLO too large".to_string(),
+            };
+            return Some(
+                Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+            );
+        }
         let now = authz_now_secs();
         let snap = authz.snapshot();
         let resp = match partition_rpc::rkyv_decode::<AuthHelloReq>(payload) {
@@ -4430,9 +4447,9 @@ fn authz_gate(
                         message: String::new(),
                     }
                 }
-                Err(reject) => AuthHelloResp {
+                Err(reason) => AuthHelloResp {
                     code: StatusCode::PermissionDenied as u8,
-                    message: reject.label().to_string(),
+                    message: reason,
                 },
             },
             Err(e) => AuthHelloResp {
@@ -12143,6 +12160,7 @@ mod authz_enforcement_tests {
             protected_prefixes: vec![b"mem/".to_vec()],
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
+            cluster_id: "cluster-test".to_string(),
         });
         std::sync::Arc::new(st)
     }

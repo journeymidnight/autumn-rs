@@ -1060,7 +1060,20 @@ impl ClusterClient {
             {
                 Ok(b) => return Ok(b),
                 Err(e) => {
-                    last_err = Some(e.to_string());
+                    // F-AUTHZ-1: PermissionDenied is TERMINAL on the data path —
+                    // refreshing routing can't grant access, so surface it
+                    // immediately instead of burning MAX_PS_REFRESHES and masking
+                    // it as ConnectionError (coco P2). Unlike call_ps_for_part we
+                    // do NOT short-circuit PreconditionFailed / InvalidArgument
+                    // here: on the data path a FailedPrecondition is usually a
+                    // stale region_epoch that MUST refresh + retry.
+                    match e.downcast::<AutumnError>() {
+                        Ok(AutumnError::PermissionDenied(msg)) => {
+                            return Err(AutumnError::PermissionDenied(msg));
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
                     if !self.refresh_and_backoff(&mut attempt).await {
                         break;
                     }

@@ -403,6 +403,7 @@ impl AutumnManager {
             protected_prefixes: self.protected_prefixes.borrow().clone(),
             token_ttl_secs: self.token_ttl_secs.get(),
             clock_skew_secs: self.clock_skew_secs.get(),
+            cluster_id: self.cluster_id.borrow().clone(),
         }))
     }
 
