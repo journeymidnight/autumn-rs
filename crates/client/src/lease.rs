@@ -116,6 +116,22 @@ pub enum LeaseError {
 
 const RETRY: u32 = 3;
 
+/// One manager lease RPC round-trip: send via `mgr_call_retry`, decode, and
+/// map transport/decode failures to `LeaseError::Transport`. The caller
+/// matches its own response codes.
+async fn lease_call<R>(
+    cluster: &ClusterClient,
+    msg_type: u8,
+    payload: bytes::Bytes,
+    decode: impl Fn(&[u8]) -> Result<R, String>,
+) -> Result<R, LeaseError> {
+    let bytes = cluster
+        .mgr_call_retry(msg_type, payload, RETRY)
+        .await
+        .map_err(|e| LeaseError::Transport(e.to_string()))?;
+    decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))
+}
+
 /// Acquire a `(mode = LEASE_MODE_READ | LEASE_MODE_WRITE)` lease on
 /// `ino`. The manager auto-rotates / reconnects internally
 /// (`mgr_call_retry`). On WRITE conflict, returns
@@ -169,12 +185,8 @@ async fn acquire_inner(
         mode,
         force,
     };
-    let bytes = cluster
-        .mgr_call_retry(MSG_ACQUIRE_LEASE, rkyv_encode(&req), RETRY)
-        .await
-        .map_err(|e| LeaseError::Transport(e.to_string()))?;
     let resp: AcquireLeaseResp =
-        rkyv_decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))?;
+        lease_call(cluster, MSG_ACQUIRE_LEASE, rkyv_encode(&req), rkyv_decode).await?;
     match resp.code {
         CODE_OK => Ok(AcquireResult::Granted(
             resp.lease.expect("CODE_OK must carry lease"),
@@ -252,12 +264,8 @@ pub async fn release(
         client: client.as_wire().clone(),
         ino,
     };
-    let bytes = cluster
-        .mgr_call_retry(MSG_RELEASE_LEASE, rkyv_encode(&req), RETRY)
-        .await
-        .map_err(|e| LeaseError::Transport(e.to_string()))?;
     let resp: ReleaseLeaseResp =
-        rkyv_decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))?;
+        lease_call(cluster, MSG_RELEASE_LEASE, rkyv_encode(&req), rkyv_decode).await?;
     match resp.code {
         CODE_OK => Ok(resp.new_version),
         CODE_NOT_LEADER => Err(LeaseError::NotLeader),
@@ -280,12 +288,8 @@ pub async fn heartbeat(
         client: client.as_wire().clone(),
         ino,
     };
-    let bytes = cluster
-        .mgr_call_retry(MSG_HEARTBEAT_LEASE, rkyv_encode(&req), RETRY)
-        .await
-        .map_err(|e| LeaseError::Transport(e.to_string()))?;
     let resp: HeartbeatLeaseResp =
-        rkyv_decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))?;
+        lease_call(cluster, MSG_HEARTBEAT_LEASE, rkyv_encode(&req), rkyv_decode).await?;
     match resp.code {
         CODE_OK => Ok(HeartbeatResult::Renewed(
             resp.lease.expect("CODE_OK must carry lease"),
@@ -310,12 +314,8 @@ pub async fn poll_invalidations(
     let req = PollInvalidationsReq {
         client: client.as_wire().clone(),
     };
-    let bytes = cluster
-        .mgr_call_retry(MSG_POLL_INVALIDATIONS, rkyv_encode(&req), RETRY)
-        .await
-        .map_err(|e| LeaseError::Transport(e.to_string()))?;
     let resp: PollInvalidationsResp =
-        rkyv_decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))?;
+        lease_call(cluster, MSG_POLL_INVALIDATIONS, rkyv_encode(&req), rkyv_decode).await?;
     match resp.code {
         CODE_OK => Ok(resp.events),
         CODE_NOT_LEADER => Err(LeaseError::NotLeader),

@@ -301,6 +301,19 @@ pub(crate) fn refresh_backoff(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(2000))
 }
 
+/// Write `err()` into every result slot named by `idxs` — the per-group
+/// failure fan-out used by the batched APIs (`get_many` / `batch_put`): one
+/// RPC failure fails every item that rode in that group's frame.
+fn fail_slots<T>(
+    results: &mut [std::result::Result<T, AutumnError>],
+    idxs: impl Iterator<Item = usize>,
+    err: impl Fn() -> AutumnError,
+) {
+    for i in idxs {
+        results[i] = Err(err());
+    }
+}
+
 // ── Range scan result ───────────────────────────────────────────────────────
 
 pub struct RangeResult {
@@ -527,70 +540,82 @@ impl ClusterClient {
         }
     }
 
-    /// cluster-df: fetch the aggregate cluster capacity summary
-    /// (`MSG_CLUSTER_DF`). Shared by `autumn-op df` and the FUSE statfs
-    /// background refresh. A follower answers `CODE_NOT_LEADER`; only the
-    /// leader's `node_health_loop` maintains the snapshot, so we round-robin
-    /// to the next manager on that (mgr_call_retry only rotates on transport
-    /// errors — NOT_LEADER comes back as a successful response body).
-    pub async fn cluster_df(&self) -> Result<ClusterDfResp> {
-        let req = rkyv_encode(&ClusterDfReq {});
+    /// Call a LEADER-ONLY manager RPC. `mgr_call_retry` walks managers on
+    /// transport errors, but a follower answers a SUCCESSFUL response whose
+    /// body carries `CODE_NOT_LEADER` — so this also rotates + retries on
+    /// that, up to `leader_rotations` times. `decode` parses the response
+    /// into `(application_code, value)`; the value is returned once a
+    /// non-NOT_LEADER response arrives (callers still check their own
+    /// non-OK codes).
+    async fn mgr_call_leader<R>(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        ctx: &str,
+        transport_retries: u32,
+        leader_rotations: u32,
+        decode: impl Fn(&[u8]) -> Result<(u8, R)>,
+    ) -> Result<R> {
         let mut attempt = 0u32;
         loop {
-            let bytes = self.mgr_call_retry(MSG_CLUSTER_DF, req.clone(), 3).await?;
-            let resp: ClusterDfResp = rkyv_decode(&bytes).map_err(|e| anyhow!("{e}"))?;
-            if resp.code == CODE_NOT_LEADER {
+            let bytes = self
+                .mgr_call_retry(msg_type, payload.clone(), transport_retries)
+                .await
+                .with_context(|| ctx.to_string())?;
+            let (code, resp) = decode(&bytes)?;
+            if code == CODE_NOT_LEADER {
                 attempt += 1;
-                if attempt > 3 {
-                    return Err(anyhow!("cluster_df: no leader available"));
+                if attempt > leader_rotations {
+                    return Err(anyhow!("{ctx}: no leader available"));
                 }
                 self.rotate_manager();
                 compio::time::sleep(Duration::from_millis(300)).await;
                 continue;
             }
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(anyhow!("cluster_df failed: {}", resp.message));
-            }
             return Ok(resp);
         }
     }
 
+    /// cluster-df: fetch the aggregate cluster capacity summary
+    /// (`MSG_CLUSTER_DF`). Shared by `autumn-op df` and the FUSE statfs
+    /// background refresh. Leader-only (only the leader's `node_health_loop`
+    /// maintains the snapshot).
+    pub async fn cluster_df(&self) -> Result<ClusterDfResp> {
+        let req = rkyv_encode(&ClusterDfReq {});
+        let resp: ClusterDfResp = self
+            .mgr_call_leader(MSG_CLUSTER_DF, req, "cluster_df", 3, 3, |b| {
+                let r: ClusterDfResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                Ok((r.code, r))
+            })
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("cluster_df failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
     /// F-AUTHZ-1: mint a short-TTL capability token for `tenant` from its
-    /// permanent `credential`. Mint is leader-only, so this rotates managers on
-    /// `CODE_NOT_LEADER` (mgr_call_retry only rotates on transport errors —
-    /// NOT_LEADER comes back as a successful response body, same as cluster_df).
-    /// Returns `(token_bytes, exp_unix_secs)`.
+    /// permanent `credential`. Leader-only. Returns `(token_bytes, exp_unix_secs)`.
     pub async fn mint_token(&self, tenant: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
         let req = rkyv_encode(&MintTokenReq {
             tenant: tenant.to_string(),
             credential,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
-        let mut attempt = 0u32;
-        loop {
-            let bytes = self
-                .mgr_call_retry(MSG_MINT_TOKEN, req.clone(), managers)
-                .await
-                .context("mint token")?;
-            let resp: MintTokenResp = rkyv_decode(&bytes).map_err(decode_err)?;
-            if resp.code == CODE_NOT_LEADER {
-                attempt += 1;
-                if attempt > managers + 2 {
-                    return Err(anyhow!("mint_token: no leader available"));
-                }
-                self.rotate_manager();
-                compio::time::sleep(Duration::from_millis(300)).await;
-                continue;
-            }
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(anyhow!("mint token rejected: {}", resp.message));
-            }
-            return Ok((resp.token, resp.exp));
+        let resp: MintTokenResp = self
+            .mgr_call_leader(MSG_MINT_TOKEN, req, "mint token", managers, managers + 2, |b| {
+                let r: MintTokenResp = rkyv_decode(b).map_err(decode_err)?;
+                Ok((r.code, r))
+            })
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("mint token rejected: {}", resp.message));
         }
+        Ok((resp.token, resp.exp))
     }
 
     /// F-AUTHZ-1: create/rotate a tenant account (admin). Returns the permanent
-    /// credential. Leader-only → rotates managers on `CODE_NOT_LEADER`.
+    /// credential. Leader-only.
     pub async fn tenant_create(
         &self,
         tenant: &str,
@@ -603,58 +628,49 @@ impl ClusterClient {
             allowed_prefixes,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
-        let mut attempt = 0u32;
-        loop {
-            let bytes = self
-                .mgr_call_retry(MSG_TENANT_CREATE, req.clone(), managers)
-                .await
-                .context("tenant-create")?;
-            let resp: TenantCreateResp = rkyv_decode(&bytes).map_err(decode_err)?;
-            if resp.code == CODE_NOT_LEADER {
-                attempt += 1;
-                if attempt > managers + 2 {
-                    return Err(anyhow!("tenant-create: no leader available"));
-                }
-                self.rotate_manager();
-                compio::time::sleep(Duration::from_millis(300)).await;
-                continue;
-            }
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(anyhow!("tenant-create rejected: {}", resp.message));
-            }
-            return Ok(resp.credential);
+        let resp: TenantCreateResp = self
+            .mgr_call_leader(
+                MSG_TENANT_CREATE,
+                req,
+                "tenant-create",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: TenantCreateResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("tenant-create rejected: {}", resp.message));
         }
+        Ok(resp.credential)
     }
 
-    /// F-AUTHZ-1: delete a tenant account (admin). Leader-only → rotates on
-    /// `CODE_NOT_LEADER`.
+    /// F-AUTHZ-1: delete a tenant account (admin). Leader-only.
     pub async fn tenant_delete(&self, tenant: &str, admin_token: &str) -> Result<()> {
         let req = rkyv_encode(&TenantDeleteReq {
             admin_token: admin_token.to_string(),
             tenant: tenant.to_string(),
         });
         let managers = self.manager_addrs.len().max(1) as u32;
-        let mut attempt = 0u32;
-        loop {
-            let bytes = self
-                .mgr_call_retry(MSG_TENANT_DELETE, req.clone(), managers)
-                .await
-                .context("tenant-delete")?;
-            let resp: CodeResp = rkyv_decode(&bytes).map_err(decode_err)?;
-            if resp.code == CODE_NOT_LEADER {
-                attempt += 1;
-                if attempt > managers + 2 {
-                    return Err(anyhow!("tenant-delete: no leader available"));
-                }
-                self.rotate_manager();
-                compio::time::sleep(Duration::from_millis(300)).await;
-                continue;
-            }
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(anyhow!("tenant-delete rejected: {}", resp.message));
-            }
-            return Ok(());
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_TENANT_DELETE,
+                req,
+                "tenant-delete",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("tenant-delete rejected: {}", resp.message));
         }
+        Ok(())
     }
 
     /// Call manager with retry and round-robin on NotLeader/connection error.
@@ -1982,7 +1998,7 @@ impl ClusterClient {
                 keys: keys_payload,
             });
             let resp_bytes = match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_GET, payload.into())
+                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_GET, payload)
                 .await
             {
                 Ok(b) => b,
@@ -1998,27 +2014,25 @@ impl ClusterClient {
                 }
                 Err(e) => {
                     let s = e.to_string();
-                    for (idx, _) in group.iter() {
-                        results[*idx] = Err(AutumnError::ConnectionError(s.clone()));
-                    }
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ConnectionError(s.clone())
+                    });
                     continue;
                 }
             };
             let resp: partition_rpc::BatchGetResp = match rkyv_decode(&resp_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    for (idx, _) in group.iter() {
-                        results[*idx] = Err(AutumnError::ServerError(e.clone()));
-                    }
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ServerError(e.clone())
+                    });
                     continue;
                 }
             };
             if resp.code != partition_rpc::CODE_OK {
-                let code = resp.code;
-                let msg = resp.message;
-                for (idx, _) in group.iter() {
-                    results[*idx] = Err(code_to_error(code, msg.clone()));
-                }
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    code_to_error(resp.code, resp.message.clone())
+                });
                 continue;
             }
             if resp.items.len() != group.len() {
@@ -2027,9 +2041,9 @@ impl ClusterClient {
                     resp.items.len(),
                     group.len()
                 );
-                for (idx, _) in group.iter() {
-                    results[*idx] = Err(AutumnError::ServerError(mismatch.clone()));
-                }
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    AutumnError::ServerError(mismatch.clone())
+                });
                 continue;
             }
             for ((idx, _), item) in group.iter().zip(resp.items.into_iter()) {
@@ -2114,7 +2128,7 @@ impl ClusterClient {
                 ops,
             });
             let resp_bytes = match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload.into())
+                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload)
                 .await
             {
                 Ok(b) => b,
@@ -2138,27 +2152,25 @@ impl ClusterClient {
                 }
                 Err(e) => {
                     let s = e.to_string();
-                    for (idx, _, _, _) in group.iter() {
-                        results[*idx] = Err(AutumnError::ConnectionError(s.clone()));
-                    }
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ConnectionError(s.clone())
+                    });
                     continue;
                 }
             };
             let resp: partition_rpc::BatchPutResp = match rkyv_decode(&resp_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    for (idx, _, _, _) in group.iter() {
-                        results[*idx] = Err(AutumnError::ServerError(e.clone()));
-                    }
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ServerError(e.clone())
+                    });
                     continue;
                 }
             };
             if resp.code != partition_rpc::CODE_OK {
-                let code = resp.code;
-                let msg = resp.message;
-                for (idx, _, _, _) in group.iter() {
-                    results[*idx] = Err(code_to_error(code, msg.clone()));
-                }
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    code_to_error(resp.code, resp.message.clone())
+                });
                 continue;
             }
             if resp.statuses.len() != group.len() {
@@ -2167,9 +2179,9 @@ impl ClusterClient {
                     resp.statuses.len(),
                     group.len()
                 );
-                for (idx, _, _, _) in group.iter() {
-                    results[*idx] = Err(AutumnError::ServerError(mismatch.clone()));
-                }
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    AutumnError::ServerError(mismatch.clone())
+                });
                 continue;
             }
             for ((idx, _, _, _), status) in group.iter().zip(resp.statuses.iter()) {
@@ -2538,31 +2550,21 @@ impl ClusterClient {
             Some(b) => b,
             None => return Ok(None),
         };
-        let key_vec = key.to_vec();
-        match StripeMeta::try_decode(&blob) {
-            Some(meta) => Ok(Some(GetStream {
-                cluster: self,
-                user_key: key_vec,
-                inline: None,
-                striped: Some(meta),
-                cursor: 0,
-                next_chunk_index: 0,
-                pending_buf: Vec::new(),
-                pending_pos: 0,
-                yield_size: chunk_size_hint.max(1),
-            })),
-            None => Ok(Some(GetStream {
-                cluster: self,
-                user_key: key_vec,
-                inline: Some(blob),
-                striped: None,
-                cursor: 0,
-                next_chunk_index: 0,
-                pending_buf: Vec::new(),
-                pending_pos: 0,
-                yield_size: chunk_size_hint.max(1),
-            })),
-        }
+        let (inline, striped) = match StripeMeta::try_decode(&blob) {
+            Some(meta) => (None, Some(meta)),
+            None => (Some(blob), None),
+        };
+        Ok(Some(GetStream {
+            cluster: self,
+            user_key: key.to_vec(),
+            inline,
+            striped,
+            cursor: 0,
+            next_chunk_index: 0,
+            pending_buf: Vec::new(),
+            pending_pos: 0,
+            yield_size: chunk_size_hint.max(1),
+        }))
     }
 
     /// F186 — Cascade-delete a striped value: read meta, delete all
