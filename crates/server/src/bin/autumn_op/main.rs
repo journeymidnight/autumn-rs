@@ -284,6 +284,11 @@ async fn run(args: Args) -> Result<()> {
         );
         std::process::exit(1);
     }
+    // F-AUTHZ-1: gen-signing-key is LOCAL (no manager) — handle it BEFORE
+    // connecting so key generation works offline (and never needs a cluster).
+    if let Command::GenSigningKey { kid } = &args.cmd {
+        return cmd_gen_signing_key(*kid);
+    }
     // Select the process-global transport before connecting. Without this an
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
@@ -329,8 +334,157 @@ async fn run(args: Args) -> Result<()> {
             unreachable!("Command::RegisterNode handled before connect");
         }
         Command::Format { listen, advertise, dirs, shard_ports } => cmd_format(&client, args.json, listen, advertise, dirs, shard_ports, &args.manager, args.transport).await?,
+        // ---------------- F-AUTHZ-1 tooling ----------------
+        Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
+        Command::TenantCreate { tenant, prefixes, admin_token } => cmd_tenant_create(&client, args.json, tenant, prefixes, admin_token).await?,
+        Command::TenantDelete { tenant, admin_token } => cmd_tenant_delete(&client, args.json, tenant, admin_token).await?,
+        Command::MintToken { tenant, credential } => cmd_mint_token(&client, args.json, tenant, credential).await?,
     }
     let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// Lowercase hex encode.
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+/// Decode an ASCII hex string into bytes.
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    if !s.is_ascii() || s.len() % 2 != 0 {
+        bail!("expected an even-length ASCII hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
+}
+
+/// F-AUTHZ-1: generate an Ed25519 signing key locally. Prints the keyfile line
+/// (`<kid> <hex-seed>`) to STDOUT (redirect into `--auth-signing-key-file`); the
+/// derived public key + guidance go to STDERR so they don't pollute the file.
+fn cmd_gen_signing_key(kid: u32) -> Result<()> {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let public = autumn_rpc::cap_token::public_key_from_seed(&seed);
+    println!("{} {}", kid, hex_encode(&seed));
+    eprintln!("# F-AUTHZ-1 signing key kid={kid}");
+    eprintln!("# public_key = {}", hex_encode(&public));
+    eprintln!("# The stdout line (kid + hex seed) is the SECRET keyfile line — give");
+    eprintln!("# it to the manager via --auth-signing-key-file and keep it protected.");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// F-AUTHZ-1: create/rotate a tenant account. Returns the permanent credential.
+async fn cmd_tenant_create(
+    client: &ClusterClient,
+    json: bool,
+    tenant: String,
+    prefixes: Vec<String>,
+    admin_token: String,
+) -> Result<()> {
+    let allowed_prefixes: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
+    let req = rkyv_encode(&TenantCreateReq {
+        admin_token,
+        tenant: tenant.clone(),
+        allowed_prefixes,
+    });
+    let resp_bytes = client
+        .mgr_call(MSG_TENANT_CREATE, req)
+        .await
+        .context("tenant-create")?;
+    let resp: TenantCreateResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("tenant-create: code={} {}", resp.code, resp.message);
+    }
+    let cred = hex_encode(&resp.credential);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tenant": tenant,
+                "credential": cred,
+            }))?
+        );
+    } else {
+        println!("tenant '{tenant}' created");
+        println!("credential: {cred}");
+        eprintln!("# ^ hand this credential to the tenant; it is shown ONCE (manager stores only its SHA-256 hash).");
+    }
+    Ok(())
+}
+
+/// F-AUTHZ-1: remove a tenant account (stops renewal; current token still works
+/// until it expires).
+async fn cmd_tenant_delete(
+    client: &ClusterClient,
+    json: bool,
+    tenant: String,
+    admin_token: String,
+) -> Result<()> {
+    let req = rkyv_encode(&TenantDeleteReq {
+        admin_token,
+        tenant: tenant.clone(),
+    });
+    let resp_bytes = client
+        .mgr_call(MSG_TENANT_DELETE, req)
+        .await
+        .context("tenant-delete")?;
+    let resp: CodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("tenant-delete: code={} {}", resp.code, resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "tenant": tenant, "deleted": true })
+        );
+    } else {
+        println!("tenant '{tenant}' deleted");
+    }
+    Ok(())
+}
+
+/// F-AUTHZ-1: mint a short-TTL capability token from a tenant credential.
+async fn cmd_mint_token(
+    client: &ClusterClient,
+    json: bool,
+    tenant: String,
+    credential_hex: String,
+) -> Result<()> {
+    let credential = hex_decode(&credential_hex).context("--credential")?;
+    let req = rkyv_encode(&MintTokenReq {
+        tenant: tenant.clone(),
+        credential,
+    });
+    let resp_bytes = client
+        .mgr_call(MSG_MINT_TOKEN, req)
+        .await
+        .context("mint-token")?;
+    let resp: MintTokenResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("mint-token: code={} {}", resp.code, resp.message);
+    }
+    let token = hex_encode(&resp.token);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tenant": tenant,
+                "token": token,
+                "exp": resp.exp,
+            }))?
+        );
+    } else {
+        println!("{token}");
+        eprintln!("# token for '{tenant}', exp={} (unix seconds)", resp.exp);
+    }
     Ok(())
 }
 

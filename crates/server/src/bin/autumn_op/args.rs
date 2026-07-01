@@ -173,6 +173,30 @@ pub(crate) enum Command {
         /// `extent_id % shard_count`.
         shard_ports: Vec<u16>,
     },
+    // ── F-AUTHZ-1 data-plane authz tooling ──────────────────────────────────
+    /// Generate an Ed25519 signing key (LOCAL — no manager). Prints the keyfile
+    /// line (`<kid> <hex-seed>`) to stdout; redirect to `--auth-signing-key-file`.
+    GenSigningKey {
+        kid: u32,
+    },
+    /// Create/rotate a tenant account (admin — needs `--admin-token`). Returns
+    /// the tenant's permanent credential (shown once).
+    TenantCreate {
+        tenant: String,
+        prefixes: Vec<String>,
+        admin_token: String,
+    },
+    /// Remove a tenant account (admin). Its current token still works until exp.
+    TenantDelete {
+        tenant: String,
+        admin_token: String,
+    },
+    /// Mint a short-TTL capability token from a tenant credential. Prints the
+    /// token (hex) to stdout.
+    MintToken {
+        tenant: String,
+        credential: String,
+    },
 }
 
 pub(crate) fn parse() -> Args {
@@ -371,6 +395,103 @@ pub(crate) fn parse() -> Args {
             i += 1;
             let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
             Command::Remove { node_id, by }
+        }
+        // ── F-AUTHZ-1 tooling ────────────────────────────────────────────
+        "gen-signing-key" => {
+            let mut kid: u32 = 1;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--kid" => {
+                        i += 1;
+                        kid = val(&raw, i).parse().unwrap_or_else(|_| usage());
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            Command::GenSigningKey { kid }
+        }
+        "tenant-create" => {
+            let mut tenant = String::new();
+            let mut prefixes: Vec<String> = Vec::new();
+            let mut admin_token = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--tenant" => {
+                        i += 1;
+                        tenant = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--prefix" => {
+                        i += 1;
+                        prefixes.push(val(&raw, i).to_owned());
+                        i += 1;
+                    }
+                    "--admin-token" => {
+                        i += 1;
+                        admin_token = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if tenant.is_empty() || prefixes.is_empty() {
+                usage();
+            }
+            Command::TenantCreate {
+                tenant,
+                prefixes,
+                admin_token,
+            }
+        }
+        "tenant-delete" => {
+            let mut tenant = String::new();
+            let mut admin_token = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--tenant" => {
+                        i += 1;
+                        tenant = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--admin-token" => {
+                        i += 1;
+                        admin_token = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if tenant.is_empty() {
+                usage();
+            }
+            Command::TenantDelete {
+                tenant,
+                admin_token,
+            }
+        }
+        "mint-token" => {
+            let mut tenant = String::new();
+            let mut credential = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--tenant" => {
+                        i += 1;
+                        tenant = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--credential" => {
+                        i += 1;
+                        credential = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if tenant.is_empty() || credential.is_empty() {
+                usage();
+            }
+            Command::MintToken { tenant, credential }
         }
         // F213 read
         "info" => {
