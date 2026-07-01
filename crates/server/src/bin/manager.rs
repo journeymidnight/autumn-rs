@@ -166,6 +166,21 @@ fn parse_args() -> Args {
                 i += 1;
                 admin_token = Some(raw[i].clone());
             }
+            // Read the admin token from a FILE — preferred over --admin-token,
+            // which leaks the secret via ps / /proc/<pid>/cmdline on a
+            // long-lived daemon. Trailing newline trimmed. cluster.sh passes
+            // this form (AUTUMN_ADMIN_TOKEN_FILE).
+            "--admin-token-file" => {
+                i += 1;
+                let path = raw[i].clone();
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read --admin-token-file {path}: {e}"));
+                let tok = text.trim_end_matches(['\n', '\r']).to_string();
+                if tok.is_empty() {
+                    panic!("--admin-token-file {path} is empty");
+                }
+                admin_token = Some(tok);
+            }
             "--auth-protected-prefix" => {
                 i += 1;
                 auth_protected_prefixes.push(raw[i].clone());

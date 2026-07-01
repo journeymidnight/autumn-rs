@@ -46,6 +46,10 @@ Task scope: F-AUTHZ-1 服务端数据面 key-range 授权(多租户隔离,plan �
     · autumn-memory:MemoryStore::connect_with_credential(tenant scope=mem/{tenant}/)。
     · 跨租户真集群 e2e(tests/authz_e2e.rs + run_authz_e2e.sh,隔离 authz 集群 19300+,memory-only):
       验证全链(manager 铸→client AUTH_HELLO→PS 强制):acme 读写 mem/acme/ 通、mem/other/ 拒(读+写)、非-protected 放行、other 对称隔离、匿名 protected 拒、MemoryStore 透传。**"AUTHZ E2E OK" 通过(exit 0)。**
+  **cluster.sh 集成(2026-07-01 补)**:launch_manager 加 env→flag 翻译(AUTUMN_AUTH_SIGNING_KEY_FILE /
+    AUTUMN_ADMIN_TOKEN_FILE / AUTUMN_AUTH_PROTECTED_PREFIXES / AUTUMN_AUTH_TOKEN_TTL_SECS,全 opt-in,不设=完全无影响;
+    误配 fail-fast)。manager 二进制加 --admin-token-file(daemon secret 不上 argv,与 autumn-op 一致);
+    authz e2e 改走 --admin-token-file 复跑绿。README 加 Data-plane authz 使用节(gen-key→cluster.sh 起→tenant-create→SDK 用→运维)。
   **F-AUTHZ-1 端到端完成**(server KDC + PS 强制 + client token 路径 + 工具,真二进制验证)。Stage 3 coco 12 findings 全修(4c56861,e2e 复跑仍绿)+ pushed。详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);

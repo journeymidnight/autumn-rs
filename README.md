@@ -339,6 +339,49 @@ AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
 #   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
+## Data-plane authz (multi-tenant isolation, F-AUTHZ-1)
+
+Server-side key-range authorization for the `mem/` namespace
+(`docs/data_plane_authz_design.md`): the manager acts as a KDC that mints
+short-TTL Ed25519 capability tokens; the PS verifies them per connection
+(`AUTH_HELLO`) and enforces per request. **OPT-IN** — with no signing key
+configured nothing changes (fuse / kvcache / perf-check / chaos all run
+authz-off, anonymous, zero hot-path cost).
+
+```bash
+# 0) One-shot cross-tenant e2e against an ISOLATED throwaway authz cluster
+#    (gen key → manager with authz → two tenants → verify isolation):
+bash crates/autumn-memory/tests/run_authz_e2e.sh
+#   → "AUTHZ E2E OK: cross-tenant isolation + anon deny + ungated + MemoryStore pass-through"
+
+# 1) Generate a signing key (LOCAL, no cluster needed) + an admin token file:
+./target/release/autumn-op gen-signing-key --kid 1 > /path/signing.key
+printf '%s' "$(openssl rand -hex 24)" > /path/admin.token
+
+# 2) Start the cluster with authz enabled (cluster.sh env→flag translation;
+#    protected prefixes default to mem/ when unset):
+AUTUMN_AUTH_SIGNING_KEY_FILE=/path/signing.key \
+AUTUMN_ADMIN_TOKEN_FILE=/path/admin.token \
+  bash cluster.sh start 4
+
+# 3) Create a tenant (admin; credential printed ONCE — hand it to the tenant):
+AO="./target/release/autumn-op --manager 127.0.0.1:9001"
+$AO tenant-create --tenant acme --prefix mem/acme/ --admin-token-file /path/admin.token
+
+# 4) Use it from the SDK / autumn-memory (auto-mints + renews tokens,
+#    AUTH_HELLOs each PS connection):
+#      ClusterClient::connect_with_credential(mgr, "acme", credential)
+#      MemoryStore::connect_with_credential(mgr, "acme", agent, credential)
+#    Cross-tenant / anonymous access to mem/ now fails with PermissionDenied;
+#    keys outside mem/ are ungated.
+
+# Ops: mint a token by hand / revoke a tenant:
+$AO mint-token --tenant acme --credential-file /path/acme.cred
+$AO tenant-delete --tenant acme --admin-token-file /path/admin.token   # stops renewal; token dies at exp
+# Key rotation: add a higher kid line to signing.key, restart the manager,
+# wait a TTL, then mark the old line "disabled" (PS rejects it per request).
+```
+
 ## CLI cheatsheet
 
 ```bash

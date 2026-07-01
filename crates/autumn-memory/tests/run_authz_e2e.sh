@@ -46,11 +46,13 @@ wait_port() { for _ in $(seq 1 "${2:-20}"); do ss -ltn 2>/dev/null | grep -q ":$
   || { echo "[authz-e2e] FAIL gen-signing-key"; exit 1; }
 echo "[authz-e2e] signing key: $(cat "$WORK/signing.key" | cut -c1-8)…"
 
-# 2) manager (memory-only) WITH authz enabled.
+# 2) manager (memory-only) WITH authz enabled. Admin token via FILE (the
+#    production form cluster.sh uses — secrets never on argv).
+printf '%s' "$ADMIN_TOKEN" >"$WORK/admin.token"
 echo "[authz-e2e] manager (authz-enabled) on $MGR"
 "$BIN/autumn-manager-server" --port "$((PB + 1))" --listen 127.0.0.1 \
   --auth-signing-key-file "$WORK/signing.key" \
-  --admin-token "$ADMIN_TOKEN" \
+  --admin-token-file "$WORK/admin.token" \
   --auth-protected-prefix "mem/" \
   >"$WORK/mgr.log" 2>&1 &
 PIDS+=($!); wait_port "$((PB + 1))" 20 || { echo "[authz-e2e] FAIL manager"; tail -8 "$WORK/mgr.log"; exit 1; }

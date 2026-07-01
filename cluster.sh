@@ -579,6 +579,37 @@ launch_manager() {
             || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
         mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
     fi
+    # F-AUTHZ-1: data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
+    # with no env set, no flags are passed and authz stays OFF (zero impact on
+    # every existing flow: perf_check, chaos, fuse, kvcache). To enable:
+    #   AUTUMN_AUTH_SIGNING_KEY_FILE=/path/key   (generate: autumn-op gen-signing-key)
+    #   AUTUMN_ADMIN_TOKEN_FILE=/path/token      (gates tenant-create/delete; file,
+    #                                             not argv — /proc leak)
+    #   AUTUMN_AUTH_PROTECTED_PREFIXES=mem/      (comma-separated; default mem/)
+    #   AUTUMN_AUTH_TOKEN_TTL_SECS=3600          (optional)
+    if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
+        [[ -r "$AUTUMN_AUTH_SIGNING_KEY_FILE" ]] \
+            || die "AUTUMN_AUTH_SIGNING_KEY_FILE '$AUTUMN_AUTH_SIGNING_KEY_FILE' is not readable"
+        mgr_extra="$mgr_extra --auth-signing-key-file $AUTUMN_AUTH_SIGNING_KEY_FILE"
+        if [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
+            [[ -r "$AUTUMN_ADMIN_TOKEN_FILE" ]] \
+                || die "AUTUMN_ADMIN_TOKEN_FILE '$AUTUMN_ADMIN_TOKEN_FILE' is not readable"
+            mgr_extra="$mgr_extra --admin-token-file $AUTUMN_ADMIN_TOKEN_FILE"
+        fi
+        if [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
+            local _pfx
+            for _pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES//,/ }; do
+                mgr_extra="$mgr_extra --auth-protected-prefix $_pfx"
+            done
+        fi
+        if [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]]; then
+            [[ "$AUTUMN_AUTH_TOKEN_TTL_SECS" =~ ^[0-9]+$ ]] \
+                || die "AUTUMN_AUTH_TOKEN_TTL_SECS must be a non-negative integer (got '$AUTUMN_AUTH_TOKEN_TTL_SECS')"
+            mgr_extra="$mgr_extra --auth-token-ttl-secs $AUTUMN_AUTH_TOKEN_TTL_SECS"
+        fi
+    elif [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
+        die "AUTUMN_ADMIN_TOKEN_FILE / AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — authz needs a signing key (autumn-op gen-signing-key)"
+    fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
         --transport "$TRANSPORT" $mgr_extra
