@@ -1,6 +1,11 @@
-Date: 2026-06-30
-TaskStatus: not_completed
-Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租户隔离,plan §9.5/§16 Phase 0)。
+Date: 2026-07-01
+TaskStatus: completed
+Task scope: F-AUTHZ-1 服务端数据面 key-range 授权(多租户隔离,plan §9.5/§16 Phase 0)—— **端到端完成 + pushed**。
+  三 stage 全绿+coco 全处置:Stage 1 KDC(manager)、Stage 2 PS 强制、Stage 3 client+工具。
+  跨租户真集群 e2e 通过(run_authz_e2e.sh:"AUTHZ E2E OK")。Stage 3 coco 12 findings 全修(4c56861):
+  ①缓存连接续期(get_ps_client 顶端 ensure_token)②NOT_LEADER 轮转(client mint_token/tenant_create/tenant_delete 中心化)
+  ③AUTH_HELLO call_timeout ④身份切换 auth_gen 守卫 ⑤⑥⑦autumn-op 走中心方法 ⑧rm-rf 守卫 ⑨端口预检 ⑩secret 文件输入 ⑪⑫CLI 校验。
+  wire v10。全部 pushed 到 main(最后 4c56861)。以下为分阶段历史:
   威胁模型=可信内网(防流氓/误用/测试 client,不防 MITM/不防被攻破的 manager),无 TLS。
   **设计定稿(2026-07-01,多轮 user+coco 讨论)= manager-as-KDC(签发) + PS 在 KV 层强制,非对称 Ed25519**:
     manager(leader) 持签名私钥 + 租户账户库(tenant→credential_hash+prefixes),验永久凭据签短TTL token,支持自动续期;
@@ -41,7 +46,7 @@ Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租�
     · autumn-memory:MemoryStore::connect_with_credential(tenant scope=mem/{tenant}/)。
     · 跨租户真集群 e2e(tests/authz_e2e.rs + run_authz_e2e.sh,隔离 authz 集群 19300+,memory-only):
       验证全链(manager 铸→client AUTH_HELLO→PS 强制):acme 读写 mem/acme/ 通、mem/other/ 拒(读+写)、非-protected 放行、other 对称隔离、匿名 protected 拒、MemoryStore 透传。**"AUTHZ E2E OK" 通过(exit 0)。**
-  **F-AUTHZ-1 端到端完成**(server KDC + PS 强制 + client token 路径 + 工具,真二进制验证)。coco Stage-3 review 进行中。详见 feature_list F-AUTHZ-1。
+  **F-AUTHZ-1 端到端完成**(server KDC + PS 强制 + client token 路径 + 工具,真二进制验证)。Stage 3 coco 12 findings 全修(4c56861,e2e 复跑仍绿)+ pushed。详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。
