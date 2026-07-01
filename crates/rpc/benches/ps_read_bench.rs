@@ -115,90 +115,81 @@ async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
     }
 }
 
+/// Bench driver: spawn `conns` request loops built by `mk_task` (each gets the
+/// shared byte counter + deadline), await them all, return MB/s.
+async fn drive<F, Fut>(conns: usize, dur: Duration, mk_task: F) -> f64
+where
+    F: Fn(Rc<Cell<u64>>, Instant) -> Fut,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let bytes = Rc::new(Cell::new(0u64));
+    let deadline = Instant::now() + dur;
+    let mut tasks = Vec::new();
+    for _ in 0..conns {
+        tasks.push(compio::runtime::spawn(mk_task(bytes.clone(), deadline)));
+    }
+    let t0 = Instant::now();
+    for t in tasks {
+        t.await;
+    }
+    bytes.get() as f64 / t0.elapsed().as_secs_f64() / 1e6
+}
+
+/// Loop ZC reads (`call_into_pooled`, recv-into-registered) until the deadline.
+async fn zc_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
+    while Instant::now() < deadline {
+        match c
+            .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
+            .await
+        {
+            Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Loop plain reads (regular `call`, recv into the decode buffer) until the
+/// deadline. Mirrors the pre-F216-E read path.
+async fn plain_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
+    // msg_type 2 ≠ MSG_READ_BYTES_ZC → server replies with a regular framed
+    // response.
+    const MSG_GET: u8 = 2;
+    while Instant::now() < deadline {
+        match c.call(MSG_GET, Bytes::from_static(b"r")).await {
+            Ok(resp) => b.set(b.get() + resp.len() as u64),
+            Err(_) => break,
+        }
+    }
+}
+
 /// One RpcClient, `conns` concurrent call_into_pooled loops (PS-style: a single
 /// connection / read_loop multiplexing N in-flight reads).
 async fn client_shared(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
     let client = RpcClient::connect(addr).await.expect("connect");
-    let bytes = Rc::new(Cell::new(0u64));
-    let deadline = Instant::now() + dur;
-    let mut tasks = Vec::new();
-    for _ in 0..conns {
-        let c = client.clone();
-        let b = bytes.clone();
-        tasks.push(compio::runtime::spawn(async move {
-            while Instant::now() < deadline {
-                match c
-                    .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
-                    .await
-                {
-                    Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
-                    Err(_) => break,
-                }
-            }
-        }));
-    }
-    let t0 = Instant::now();
-    for t in tasks {
-        t.await;
-    }
-    bytes.get() as f64 / t0.elapsed().as_secs_f64() / 1e6
+    drive(conns, dur, |b, deadline| {
+        zc_read_loop(client.clone(), b, deadline)
+    })
+    .await
 }
 
 /// `conns` RpcClients (N connections / N read_loops), one read loop each.
 async fn client_perconn(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
-    let bytes = Rc::new(Cell::new(0u64));
-    let deadline = Instant::now() + dur;
-    let mut tasks = Vec::new();
-    for _ in 0..conns {
-        let b = bytes.clone();
-        tasks.push(compio::runtime::spawn(async move {
-            let c = RpcClient::connect(addr).await.expect("connect");
-            while Instant::now() < deadline {
-                match c
-                    .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
-                    .await
-                {
-                    Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
-                    Err(_) => break,
-                }
-            }
-        }));
-    }
-    let t0 = Instant::now();
-    for t in tasks {
-        t.await;
-    }
-    bytes.get() as f64 / t0.elapsed().as_secs_f64() / 1e6
+    drive(conns, dur, |b, deadline| async move {
+        let c = RpcClient::connect(addr).await.expect("connect");
+        zc_read_loop(c, b, deadline).await;
+    })
+    .await
 }
 
 /// Non-ZC: one RpcClient, `conns` concurrent regular `call`s — the response
 /// value is recv'd into the FrameDecoder buffer (a copy off the wire) and
-/// returned as a `Bytes` slice. No recv-into-registered, no memh. Mirrors the
-/// pre-F216-E read path. (msg_type 2 ≠ MSG_READ_BYTES_ZC → server replies with
-/// a regular framed response.)
+/// returned as a `Bytes` slice. No recv-into-registered, no memh.
 async fn client_nozc(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
-    const MSG_GET: u8 = 2;
     let client = RpcClient::connect(addr).await.expect("connect");
-    let bytes = Rc::new(Cell::new(0u64));
-    let deadline = Instant::now() + dur;
-    let mut tasks = Vec::new();
-    for _ in 0..conns {
-        let c = client.clone();
-        let b = bytes.clone();
-        tasks.push(compio::runtime::spawn(async move {
-            while Instant::now() < deadline {
-                match c.call(MSG_GET, Bytes::from_static(b"r")).await {
-                    Ok(resp) => b.set(b.get() + resp.len() as u64),
-                    Err(_) => break,
-                }
-            }
-        }));
-    }
-    let t0 = Instant::now();
-    for t in tasks {
-        t.await;
-    }
-    bytes.get() as f64 / t0.elapsed().as_secs_f64() / 1e6
+    drive(conns, dur, |b, deadline| {
+        plain_read_loop(client.clone(), b, deadline)
+    })
+    .await
 }
 
 fn main() {
