@@ -108,17 +108,7 @@ impl UcxListener {
                     if st != ucs_status_t::UCS_OK {
                         return Err(ucs_err(st, "ucp_listener_query"));
                     }
-                    let bytes = std::slice::from_raw_parts(
-                        &q.sockaddr as *const _ as *const u8,
-                        std::mem::size_of::<libc::sockaddr_storage>(),
-                    );
-                    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        &mut storage as *mut _ as *mut u8,
-                        bytes.len(),
-                    );
-                    sockaddr::from_storage(&storage)
+                    sockaddr::from_ucx_storage(&q.sockaddr)
                 };
                 Ok((l, local))
             })
@@ -158,19 +148,7 @@ impl UcxListener {
                 tracing::warn!(status = st, "ucp_conn_request_query failed; peer=0.0.0.0:0");
                 "0.0.0.0:0".parse().unwrap()
             } else {
-                // ucx_sys_mini::sockaddr_storage and libc::sockaddr_storage
-                // have identical layout; transmute via raw bytes.
-                let bytes = std::slice::from_raw_parts(
-                    &q.client_address as *const _ as *const u8,
-                    std::mem::size_of::<libc::sockaddr_storage>(),
-                );
-                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut storage as *mut _ as *mut u8,
-                    bytes.len(),
-                );
-                sockaddr::from_storage(&storage)
+                sockaddr::from_ucx_storage(&q.client_address)
             }
         };
 

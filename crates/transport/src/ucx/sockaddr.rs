@@ -19,6 +19,23 @@ pub(crate) fn to_storage(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::so
     (storage, sa.len())
 }
 
+/// Decode a UCX-returned sockaddr (ucx-sys-mini's `sockaddr_storage`, layout-
+/// identical to libc's) into a `SocketAddr` via a raw byte copy.
+///
+/// # Safety
+/// `src` must be a sockaddr_storage-layout value (the compile-time size check
+/// below catches passing a smaller type).
+pub(crate) unsafe fn from_ucx_storage<T>(src: &T) -> SocketAddr {
+    debug_assert!(std::mem::size_of::<T>() >= std::mem::size_of::<libc::sockaddr_storage>());
+    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+    std::ptr::copy_nonoverlapping(
+        src as *const T as *const u8,
+        &mut storage as *mut _ as *mut u8,
+        std::mem::size_of::<libc::sockaddr_storage>(),
+    );
+    from_storage(&storage)
+}
+
 /// Best-effort decode of a `sockaddr_storage` back to `SocketAddr`. Falls back
 /// to `0.0.0.0:0` if the family is unknown — should not happen in practice.
 pub(crate) fn from_storage(storage: &libc::sockaddr_storage) -> SocketAddr {

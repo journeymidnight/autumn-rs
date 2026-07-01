@@ -152,48 +152,55 @@ pub fn check_listen_addr(addr: SocketAddr, kind: TransportKind) -> io::Result<()
     Ok(())
 }
 
-fn find_netdev_owning_ip(ip: &std::net::IpAddr) -> io::Result<String> {
-    // /sys/class/net/<dev> doesn't carry IP info; walk via iproute's
-    // documented pattern of reading each netdev's IPs via getifaddrs.
-    // We can avoid the nix dep by parsing /proc/net/{fib_trie,if_inet6}
-    // but getifaddrs via libc is simpler and we already pull libc.
+/// All `(netdev name, IP)` pairs on this host, via one getifaddrs walk.
+/// (`/sys/class/net/<dev>` doesn't carry IP info; getifaddrs via libc is
+/// simpler than parsing /proc/net/{fib_trie,if_inet6} and we already pull
+/// libc.) Cold path — deployment diagnostics only.
+fn all_ifaddrs() -> io::Result<Vec<(String, std::net::IpAddr)>> {
+    let mut out = Vec::new();
     unsafe {
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut head) != 0 {
             return Err(io::Error::last_os_error());
         }
         let mut cur = head;
-        let result = loop {
-            if cur.is_null() {
-                break None;
-            }
+        while !cur.is_null() {
             let ifa = &*cur;
             if !ifa.ifa_addr.is_null() {
-                let family = (*ifa.ifa_addr).sa_family as i32;
-                let matched = match (ip, family) {
-                    (std::net::IpAddr::V4(v4), libc::AF_INET) => {
+                let ip = match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
                         let sa = ifa.ifa_addr as *const libc::sockaddr_in;
                         let raw = u32::from_be((*sa).sin_addr.s_addr);
-                        raw == u32::from(*v4)
+                        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(raw)))
                     }
-                    (std::net::IpAddr::V6(v6), libc::AF_INET6) => {
+                    libc::AF_INET6 => {
                         let sa = ifa.ifa_addr as *const libc::sockaddr_in6;
-                        (*sa).sin6_addr.s6_addr == v6.octets()
+                        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                            (*sa).sin6_addr.s6_addr,
+                        )))
                     }
-                    _ => false,
+                    _ => None,
                 };
-                if matched {
+                if let Some(ip) = ip {
                     let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
                         .to_string_lossy()
                         .into_owned();
-                    break Some(name);
+                    out.push((name, ip));
                 }
             }
             cur = ifa.ifa_next;
-        };
+        }
         libc::freeifaddrs(head);
-        result.ok_or_else(|| io::Error::other(format!("ip {ip} not found on any local netdev")))
     }
+    Ok(out)
+}
+
+fn find_netdev_owning_ip(ip: &std::net::IpAddr) -> io::Result<String> {
+    all_ifaddrs()?
+        .into_iter()
+        .find(|(_, a)| a == ip)
+        .map(|(name, _)| name)
+        .ok_or_else(|| io::Error::other(format!("ip {ip} not found on any local netdev")))
 }
 
 fn roce_candidates() -> Vec<(String, std::net::IpAddr)> {
@@ -221,36 +228,15 @@ fn roce_candidates() -> Vec<(String, std::net::IpAddr)> {
 }
 
 fn netdev_ips(target_dev: &str) -> Vec<std::net::IpAddr> {
-    let mut out = Vec::new();
-    unsafe {
-        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 {
-            return out;
-        }
-        let mut cur = head;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_addr.is_null() {
-                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                if name == target_dev {
-                    let family = (*ifa.ifa_addr).sa_family as i32;
-                    if family == libc::AF_INET {
-                        let sa = ifa.ifa_addr as *const libc::sockaddr_in;
-                        let raw = u32::from_be((*sa).sin_addr.s_addr);
-                        out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(raw)));
-                    } else if family == libc::AF_INET6 {
-                        let sa = ifa.ifa_addr as *const libc::sockaddr_in6;
-                        out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                            (*sa).sin6_addr.s6_addr,
-                        )));
-                    }
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(head);
-    }
-    out
+    all_ifaddrs()
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .filter(|(name, _)| name == target_dev)
+                .map(|(_, ip)| ip)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn is_link_local(ip: &std::net::IpAddr) -> bool {

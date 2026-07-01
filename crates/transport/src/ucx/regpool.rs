@@ -138,7 +138,7 @@ const NUM_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize; // 
 /// guard) always pass a valid class.
 #[inline]
 fn class_index(class: usize) -> usize {
-    debug_assert!(class >= MIN_CLASS && class <= MAX_CLASS && class.is_power_of_two());
+    debug_assert!((MIN_CLASS..=MAX_CLASS).contains(&class) && class.is_power_of_two());
     (class.trailing_zeros() - MIN_CLASS_SHIFT) as usize
 }
 

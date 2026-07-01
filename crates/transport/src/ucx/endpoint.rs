@@ -472,6 +472,44 @@ impl compio::io::AsyncWrite for UcxWriteHalf {
 
 // ---- Internals ----
 
+/// Await a `PtrStatus::Pending` nbx request: install the cancel-safe
+/// `InflightSlot` guard, inline-spin the worker up to `spin_iters` (0 = no
+/// spin) so fast completions skip the eventfd wakeup, then park on the slot.
+/// Returns the callback's `(status, length)`; the guard is dropped before
+/// returning so the slot is back in the pool when the caller chains ops.
+async fn await_pending(
+    req: *mut c_void,
+    slot: *mut Slot,
+    spin_iters: usize,
+) -> (ucs_status_t::Type, usize) {
+    let worker = with_thread_ctx(|c| c.worker);
+    // Guard owns slot + request from here; its Drop frees both on normal
+    // return AND on early-drop (cancel path).
+    let guard = InflightSlot {
+        request: req,
+        worker,
+        slot,
+        cleaned_up: Cell::new(false),
+    };
+    for _ in 0..spin_iters {
+        if unsafe { (*slot).is_done() } {
+            break;
+        }
+        unsafe {
+            ucp_worker_progress(worker);
+        }
+    }
+    // Wait for completion (resolves immediately if the spin caught it).
+    WaitSlot {
+        slot: slot as *const Slot,
+    }
+    .await;
+    let status = unsafe { (*slot).status.get() };
+    let length = unsafe { (*slot).length.get() };
+    drop(guard);
+    (status, length)
+}
+
 async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
     let buf = ManuallyDrop::new(buf);
     let len = buf.buf_len();
@@ -502,34 +540,7 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
             )
         }
         PtrStatus::Pending(req) => {
-            let worker = with_thread_ctx(|c| c.worker);
-            // Guard owns slot + request from here; its Drop frees both on
-            // normal return AND on early-drop (cancel path).
-            let guard = InflightSlot {
-                request: req,
-                worker,
-                slot,
-                cleaned_up: Cell::new(false),
-            };
-            // Inline busy-poll: drain the worker for up to SPIN_ITERS so
-            // fast completions skip the eventfd-driven progress task wakeup.
-            for _ in 0..SPIN_ITERS {
-                if unsafe { (*slot).is_done() } {
-                    break;
-                }
-                unsafe {
-                    ucp_worker_progress(worker);
-                }
-            }
-            // Wait for completion (resolves immediately if spin caught it).
-            WaitSlot {
-                slot: slot as *const Slot,
-            }
-            .await;
-            let status = unsafe { (*slot).status.get() };
-            // Drop guard NOW so the slot is back in the pool before the
-            // caller chains another op (improves pool hit rate).
-            drop(guard);
+            let (status, _) = await_pending(req, slot, SPIN_ITERS).await;
             if status == ucs_status_t::UCS_OK {
                 BufResult(Ok(len), ManuallyDrop::into_inner(buf))
             } else {
@@ -562,19 +573,7 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
             Err(ucs_err(st, "ucp_ep_flush_nbx"))
         }
         PtrStatus::Pending(req) => {
-            let worker = with_thread_ctx(|c| c.worker);
-            let guard = InflightSlot {
-                request: req,
-                worker,
-                slot,
-                cleaned_up: Cell::new(false),
-            };
-            WaitSlot {
-                slot: slot as *const Slot,
-            }
-            .await;
-            let status = unsafe { (*slot).status.get() };
-            drop(guard);
+            let (status, _) = await_pending(req, slot, 0).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(())
             } else {
@@ -626,28 +625,7 @@ async fn ucx_recv_raw(
             Err(ucs_err(st, "ucp_stream_recv_nbx"))
         }
         PtrStatus::Pending(req) => {
-            let worker = with_thread_ctx(|c| c.worker);
-            let guard = InflightSlot {
-                request: req,
-                worker,
-                slot,
-                cleaned_up: Cell::new(false),
-            };
-            for _ in 0..SPIN_ITERS {
-                if unsafe { (*slot).is_done() } {
-                    break;
-                }
-                unsafe {
-                    ucp_worker_progress(worker);
-                }
-            }
-            WaitSlot {
-                slot: slot as *const Slot,
-            }
-            .await;
-            let status = unsafe { (*slot).status.get() };
-            let n = unsafe { (*slot).length.get() };
-            drop(guard);
+            let (status, n) = await_pending(req, slot, SPIN_ITERS).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(n)
             } else {
@@ -657,6 +635,11 @@ async fn ucx_recv_raw(
     }
 }
 
+/// Recv into an owned compio buffer (copy-out path, no memh) — a thin wrapper
+/// over `ucx_recv_raw`. On cancel the `ManuallyDrop` deliberately leaks the
+/// buffer: the guard's drain normally makes freeing safe, but its SPIN_CAP
+/// bail-out can return while UCX still holds the pointer, so leaking is the
+/// only always-safe choice for an owned buffer.
 async fn ucx_recv<B: IoBufMut>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
     let mut buf = ManuallyDrop::new(buf);
     let cap = buf.buf_capacity();
@@ -664,63 +647,11 @@ async fn ucx_recv<B: IoBufMut>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
         return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
     }
     let ptr = buf.as_uninit().as_mut_ptr() as *mut c_void;
-
-    let slot = slot_acquire();
-
-    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
-    params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-        | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL) as u32;
-    params.cb.recv_stream = Some(cb_recv);
-    params.user_data = slot as *mut c_void;
-
-    let mut got: usize = 0;
-    let r = unsafe { ucp_stream_recv_nbx(ep, ptr, cap, &mut got, &params) };
-    match classify_ptr(r) {
-        PtrStatus::Done => {
-            unsafe { slot_release(slot) };
-            unsafe { buf.set_len(got) };
-            BufResult(Ok(got), ManuallyDrop::into_inner(buf))
+    match ucx_recv_raw(ep, ptr, cap, ptr::null_mut()).await {
+        Ok(n) => {
+            unsafe { buf.set_len(n) };
+            BufResult(Ok(n), ManuallyDrop::into_inner(buf))
         }
-        PtrStatus::Err(st) => {
-            unsafe { slot_release(slot) };
-            BufResult(
-                Err(ucs_err(st, "ucp_stream_recv_nbx")),
-                ManuallyDrop::into_inner(buf),
-            )
-        }
-        PtrStatus::Pending(req) => {
-            let worker = with_thread_ctx(|c| c.worker);
-            let guard = InflightSlot {
-                request: req,
-                worker,
-                slot,
-                cleaned_up: Cell::new(false),
-            };
-            for _ in 0..SPIN_ITERS {
-                if unsafe { (*slot).is_done() } {
-                    break;
-                }
-                unsafe {
-                    ucp_worker_progress(worker);
-                }
-            }
-            WaitSlot {
-                slot: slot as *const Slot,
-            }
-            .await;
-            let status = unsafe { (*slot).status.get() };
-            let n = unsafe { (*slot).length.get() };
-            drop(guard);
-            if status == ucs_status_t::UCS_OK {
-                unsafe { buf.set_len(n) };
-                BufResult(Ok(n), ManuallyDrop::into_inner(buf))
-            } else {
-                BufResult(
-                    Err(ucs_err(status, "ucp_stream_recv cb")),
-                    ManuallyDrop::into_inner(buf),
-                )
-            }
-        }
+        Err(e) => BufResult(Err(e), ManuallyDrop::into_inner(buf)),
     }
 }
