@@ -271,7 +271,11 @@ impl RpcClient {
         let req_id = self.next_req_id();
         let frame = Frame::request(req_id, msg_type, payload);
         let rx = self.send_frame(frame).await?;
+        Self::await_response(rx).await
+    }
 
+    /// Await a queued request's response frame and unwrap the error envelope.
+    async fn await_response(rx: oneshot::Receiver<Frame>) -> Result<Bytes, RpcError> {
         let resp = rx.await.map_err(|_| RpcError::ConnectionClosed)?;
         if resp.is_error() {
             let (code, message) = RpcError::decode_status(&resp.payload);
@@ -303,7 +307,6 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let frame = Frame::request(req_id, msg_type, payload);
         let (meta_tx, meta_rx) = oneshot::channel();
         let into = IntoDest {
             dest,
@@ -311,19 +314,10 @@ impl RpcClient {
             reg: reg.map_or(std::ptr::null(), |r| r as *const _),
             meta_tx,
         };
-        // Insert BEFORE submit — same ordering invariant as send_frame.
-        self.pending
-            .borrow_mut()
-            .insert(req_id, Pending::IntoDest(into));
-        let bytes = frame.encode();
-        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
-            self.pending.borrow_mut().remove(&req_id);
-            return Err(e);
-        }
-        match meta_rx.await {
-            Ok(res) => res,
-            Err(_) => Err(RpcError::ConnectionClosed),
-        }
+        let bytes = Frame::request(req_id, msg_type, payload).encode();
+        self.register_and_submit(req_id, Pending::IntoDest(into), bytes)
+            .await?;
+        meta_rx.await.map_err(|_| RpcError::ConnectionClosed)?
     }
 
     /// F216-E cancel-safe zero-copy read: send a request whose value response
@@ -344,20 +338,11 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let frame = Frame::request(req_id, msg_type, payload);
         let (meta_tx, meta_rx) = oneshot::channel();
-        self.pending
-            .borrow_mut()
-            .insert(req_id, Pending::IntoPooled(meta_tx));
-        let bytes = frame.encode();
-        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
-            self.pending.borrow_mut().remove(&req_id);
-            return Err(e);
-        }
-        match meta_rx.await {
-            Ok(res) => res,
-            Err(_) => Err(RpcError::ConnectionClosed),
-        }
+        let bytes = Frame::request(req_id, msg_type, payload).encode();
+        self.register_and_submit(req_id, Pending::IntoPooled(meta_tx), bytes)
+            .await?;
+        meta_rx.await.map_err(|_| RpcError::ConnectionClosed)?
     }
 
     /// Send a request frame and return the oneshot receiver for the response.
@@ -376,20 +361,9 @@ impl RpcClient {
         }
         let req_id = frame.req_id;
         let (tx, rx) = oneshot::channel();
-
-        // Borrow scoped: insert → drop. Ordering: pending-insert BEFORE submit
-        // so that when reader_task sees the response it can dispatch
-        // immediately (no race window where response lands first).
-        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
-
         let bytes = frame.encode();
-        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
-            // submit failed (writer_task exited / channel closed) — remove
-            // the pending entry so we don't leak it.
-            self.pending.borrow_mut().remove(&req_id);
-            return Err(e);
-        }
-
+        self.register_and_submit(req_id, Pending::Frame(tx), bytes)
+            .await?;
         Ok(rx)
     }
 
@@ -401,12 +375,23 @@ impl RpcClient {
         payload_parts: Vec<Bytes>,
     ) -> Result<Bytes, RpcError> {
         let rx = self.send_vectored(msg_type, payload_parts).await?;
-        let resp = rx.await.map_err(|_| RpcError::ConnectionClosed)?;
-        if resp.is_error() {
-            let (code, message) = RpcError::decode_status(&resp.payload);
-            return Err(RpcError::status(code, message));
+        Self::await_response(rx).await
+    }
+
+    /// Race `fut` against a timer; a timeout surfaces as `Unavailable`.
+    async fn with_timeout<T>(
+        fut: impl std::future::Future<Output = Result<T, RpcError>>,
+        timeout: Duration,
+    ) -> Result<T, RpcError> {
+        let timer_fut = compio::time::sleep(timeout);
+        futures::pin_mut!(fut, timer_fut);
+        match futures::future::select(fut, timer_fut).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(RpcError::Status {
+                code: crate::error::StatusCode::Unavailable,
+                message: format!("RPC timed out after {:?}", timeout),
+            }),
         }
-        Ok(resp.payload)
     }
 
     /// Send a request and wait for the response with a timeout.
@@ -416,16 +401,7 @@ impl RpcClient {
         payload: Bytes,
         timeout: Duration,
     ) -> Result<Bytes, RpcError> {
-        let call_fut = self.call(msg_type, payload);
-        let timer_fut = compio::time::sleep(timeout);
-        futures::pin_mut!(call_fut, timer_fut);
-        match futures::future::select(call_fut, timer_fut).await {
-            futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right(_) => Err(RpcError::Status {
-                code: crate::error::StatusCode::Unavailable,
-                message: format!("RPC timed out after {:?}", timeout),
-            }),
-        }
+        Self::with_timeout(self.call(msg_type, payload), timeout).await
     }
 
     /// Send a vectored request and return the receiver for the response,
@@ -450,22 +426,17 @@ impl RpcClient {
         let hdr = Frame::encode_request_header(req_id, msg_type, inner_payload_len as u32);
 
         let (tx, rx) = oneshot::channel();
-        // Insert BEFORE submit — see comment in send_frame.
+        // Insert BEFORE submit — see register_and_submit for the rationale.
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
 
-        let v1 = (hdr[5] & crate::frame::FLAG_CRC) != 0;
-        let extra = if v1 { 1 } else { 0 };
-        let mut bufs: Vec<Bytes> = Vec::with_capacity(1 + payload_parts.len() + extra);
+        // F163: compute CRC32C over the multi-segment payload BEFORE moving
+        // the parts into bufs (compute_payload_crc takes &[Bytes]). The header
+        // always announces FLAG_CRC, so the trailer is always appended.
+        let crc = crate::frame::compute_payload_crc(&payload_parts);
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(2 + payload_parts.len());
         bufs.push(Bytes::copy_from_slice(&hdr));
-        if v1 {
-            // F163: compute CRC32C over the multi-segment payload BEFORE
-            // moving the parts into bufs (compute_payload_crc takes &[Bytes]).
-            let crc = crate::frame::compute_payload_crc(&payload_parts);
-            bufs.extend(payload_parts);
-            bufs.push(Bytes::copy_from_slice(&crc));
-        } else {
-            bufs.extend(payload_parts);
-        }
+        bufs.extend(payload_parts);
+        bufs.push(Bytes::copy_from_slice(&crc));
 
         if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
             self.pending.borrow_mut().remove(&req_id);
@@ -482,16 +453,7 @@ impl RpcClient {
         payload_parts: Vec<Bytes>,
         timeout: Duration,
     ) -> Result<Bytes, RpcError> {
-        let call_fut = self.call_vectored(msg_type, payload_parts);
-        let timer_fut = compio::time::sleep(timeout);
-        futures::pin_mut!(call_fut, timer_fut);
-        match futures::future::select(call_fut, timer_fut).await {
-            futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right(_) => Err(RpcError::Status {
-                code: crate::error::StatusCode::Unavailable,
-                message: format!("RPC timed out after {:?}", timeout),
-            }),
-        }
+        Self::with_timeout(self.call_vectored(msg_type, payload_parts), timeout).await
     }
 
     /// Send a fire-and-forget frame (no response expected).
@@ -529,6 +491,29 @@ impl RpcClient {
         }
         self.next_id.set(id.wrapping_add(1));
         id
+    }
+
+    /// Insert a pending entry, then queue the frame bytes for the writer_task,
+    /// rolling the entry back if the submit fails.
+    ///
+    /// Ordering invariant: pending-insert happens BEFORE submit so the
+    /// read_loop can dispatch a response the moment it arrives (no window
+    /// where the response lands and finds no entry). Callers must check
+    /// `self.closed` first, in the same sync block — see `send_frame`.
+    async fn register_and_submit(
+        &self,
+        req_id: u32,
+        entry: Pending,
+        bytes: Bytes,
+    ) -> Result<(), RpcError> {
+        self.pending.borrow_mut().insert(req_id, entry);
+        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
+            // submit failed (writer_task exited / channel closed) — remove
+            // the pending entry so we don't leak it.
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Push a SubmitMsg onto the writer_task's queue.
@@ -633,240 +618,160 @@ async fn read_loop(
 
         decoder.feed(&buf[..n]);
 
-        // Peek so a `call_into_dest` value-response can be recv'd straight
-        // into the caller's registered dest (UCX) before try_decode would
-        // buffer the whole payload. (Inner `break`s for "wait for more
-        // bytes" / try_decode None still exit this loop, same as for `loop`.)
+        // Peek the next frame header so a ZC value-response can be recv'd
+        // straight into its destination instead of accumulating in the
+        // FrameDecoder. (Inner `break`s mean "wait for more bytes" — they
+        // exit this while back to the socket read above.)
         while let Some((req_id, _mt, _flags, payload_len)) = decoder.peek_header() {
-            let is_into = matches!(pending.borrow().get(&req_id), Some(Pending::IntoDest(_)));
+            let payload_len = payload_len as usize;
 
-            if is_into && reader.is_ucx() {
-                // ── UCX zero-copy recv-into-dest ──
-                // Value frame is CRC-less: payload = [ZC meta][value]. Need header
-                // + meta buffered to parse the meta prefix; else read more.
-                if (payload_len as usize) < ZC_META_LEN
-                    || decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN
-                {
-                    if (payload_len as usize) < ZC_META_LEN {
-                        // Malformed value frame — fail this request + close.
-                        if let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id)
-                        {
-                            let _ = into.meta_tx.send(Err(RpcError::status(
-                                crate::error::StatusCode::Internal,
-                                "zc value frame shorter than meta",
-                            )));
-                        }
-                        return Err(RpcError::status(
+            // Does a `call_into_dest` / `call_into_pooled` caller await this
+            // req_id? (Checked without removing: the entry must stay pending
+            // if we `break` to wait for more bytes.)
+            let zc_pending = matches!(
+                pending.borrow().get(&req_id),
+                Some(Pending::IntoDest(_) | Pending::IntoPooled(_))
+            );
+
+            // ZC responses bypass FrameDecoder accumulation: always on UCX
+            // (the value lands zero-copy in its dest); on TCP only when the
+            // value is large enough to beat the batch-decoding normal path
+            // (small values fall through to finish_into_*_from_frame below).
+            let zc_fast_path = zc_pending
+                && (reader.is_ucx()
+                    || (payload_len >= ZC_META_LEN
+                        && payload_len - ZC_META_LEN >= TCP_RECV_INTO_POOLED_MIN_BYTES));
+
+            if zc_fast_path {
+                // Malformed value frame — payload can't even hold the ZC meta
+                // (only reachable on UCX; the TCP gate above already requires
+                // payload_len >= ZC_META_LEN): fail the caller + connection.
+                if payload_len < ZC_META_LEN {
+                    let err = || {
+                        RpcError::status(
                             crate::error::StatusCode::Internal,
                             "zc value frame shorter than meta",
-                        ));
+                        )
+                    };
+                    match pending.borrow_mut().remove(&req_id) {
+                        Some(Pending::IntoDest(into)) => {
+                            let _ = into.meta_tx.send(Err(err()));
+                        }
+                        Some(Pending::IntoPooled(tx)) => {
+                            let _ = tx.send(Err(err()));
+                        }
+                        _ => unreachable!("zc_pending checked above"),
                     }
+                    return Err(err());
+                }
+                if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
                     break; // need more bytes for the meta prefix
                 }
-                let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id) else {
-                    unreachable!("is_into checked above");
-                };
+
+                // Consume header + meta; the next `value_len` wire bytes are
+                // the raw value (its prefix may already be buffered).
                 decoder.consume(crate::frame::HEADER_LEN);
                 let mut meta = [0u8; ZC_META_LEN];
                 let got = decoder.drain_into(&mut meta);
                 debug_assert_eq!(got, ZC_META_LEN);
                 let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
-                let value_len = payload_len as usize - ZC_META_LEN;
-                if value_len > into.dest_cap {
-                    let _ = into.meta_tx.send(Err(RpcError::status(
-                        crate::error::StatusCode::InvalidArgument,
-                        "zc value larger than dest buffer",
-                    )));
-                    return Err(RpcError::status(
-                        crate::error::StatusCode::InvalidArgument,
-                        "zc value larger than dest buffer",
-                    ));
-                }
-                // SAFETY: caller holds the backing buffer alive until meta_tx
-                // fires (it awaits the receiver); same compio thread.
-                let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
-                let reg = if into.reg.is_null() {
-                    None
-                } else {
-                    Some(unsafe { &*into.reg })
-                };
-                // Drain the value's already-buffered prefix, then recv the rest
-                // straight into dest (zero-copy via memh when reg is Some).
-                let mut filled = decoder.drain_into(dest);
-                while filled < value_len {
-                    match reader.recv_into(&mut dest[filled..], reg).await {
-                        Ok(0) => {
-                            let _ = into.meta_tx.send(Err(RpcError::ConnectionClosed));
-                            return Ok(());
+                let value_len = payload_len - ZC_META_LEN;
+
+                // Bind the removed entry BEFORE matching: a `match` on the
+                // `borrow_mut()` temporary would hold the RefMut across the
+                // awaits in the arms below and panic any concurrent `send_*`
+                // on this thread (the F108 class).
+                let entry = pending.borrow_mut().remove(&req_id);
+                match entry {
+                    Some(Pending::IntoDest(into)) => {
+                        if value_len > into.dest_cap {
+                            let err = || {
+                                RpcError::status(
+                                    crate::error::StatusCode::InvalidArgument,
+                                    "zc value larger than dest buffer",
+                                )
+                            };
+                            let _ = into.meta_tx.send(Err(err()));
+                            return Err(err());
                         }
-                        Ok(k) => filled += k,
-                        Err(e) => {
-                            let _ = into.meta_tx.send(Err(e.into()));
-                            return Err(RpcError::ConnectionClosed);
+                        // SAFETY: caller holds the dest buffer alive until
+                        // meta_tx fires (it awaits the receiver); same compio
+                        // thread; no per-call timeout (see call_into_dest).
+                        let dest =
+                            unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
+                        let reg = if into.reg.is_null() {
+                            None
+                        } else {
+                            Some(unsafe { &*into.reg })
+                        };
+                        let end = if reader.is_ucx() {
+                            // Zero-copy via memh when reg is Some.
+                            recv_value_ucx(&mut reader, &mut decoder, dest, reg).await
+                        } else {
+                            // TCP: drain the buffered prefix, then one owned
+                            // read straight into the caller dest (single copy).
+                            let filled = decoder.drain_into(dest);
+                            match unsafe {
+                                reader
+                                    .read_exact_into_raw(into.dest, filled, value_len)
+                                    .await
+                            } {
+                                Ok(()) => ValueRecv::Done,
+                                Err(e) => ValueRecv::Failed(e),
+                            }
+                        };
+                        match end {
+                            ValueRecv::Done => {
+                                let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
+                            }
+                            ValueRecv::PeerClosed => {
+                                let _ = into.meta_tx.send(Err(RpcError::ConnectionClosed));
+                                return Ok(());
+                            }
+                            ValueRecv::Failed(e) => {
+                                let _ = into.meta_tx.send(Err(e.into()));
+                                return Err(RpcError::ConnectionClosed);
+                            }
                         }
                     }
+                    Some(Pending::IntoPooled(tx)) => {
+                        // READ_LOOP acquires + owns the buffer: on caller-cancel
+                        // the send below fails and `pb` drops → pool (no leak);
+                        // the cancellable caller never owns the in-flight buffer.
+                        let mut pb = autumn_transport::regpool_acquire(value_len);
+                        if reader.is_ucx() {
+                            let (dest, reg) = pb.dest_and_reg();
+                            match recv_value_ucx(&mut reader, &mut decoder, dest, reg).await {
+                                ValueRecv::Done => {}
+                                ValueRecv::PeerClosed => {
+                                    let _ = tx.send(Err(RpcError::ConnectionClosed));
+                                    return Ok(());
+                                }
+                                ValueRecv::Failed(e) => {
+                                    let _ = tx.send(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            }
+                        } else {
+                            // TCP: drain the buffered prefix, then one owned
+                            // read into the pool buffer (single copy).
+                            let filled = {
+                                let (dest, _reg) = pb.dest_and_reg();
+                                decoder.drain_into(dest)
+                            };
+                            match reader.read_exact_into_pooled(pb, filled, value_len).await {
+                                Ok(p) => pb = p,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            }
+                        }
+                        let _ = tx.send(Ok((pb, code)));
+                    }
+                    _ => unreachable!("zc_pending checked above"),
                 }
-                // F219: ZC value crc removed — value integrity is the transport's
-                // job (UCX ICRC / TCP kernel checksum).
-                let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
                 continue;
-            }
-
-            // ── call_into_pooled: read_loop owns the dest (cancel-safe) ──
-            let is_pooled = matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)));
-            if is_pooled && reader.is_ucx() {
-                if (payload_len as usize) < ZC_META_LEN
-                    || decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN
-                {
-                    if (payload_len as usize) < ZC_META_LEN {
-                        if let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
-                        {
-                            let _ = tx.send(Err(RpcError::status(
-                                crate::error::StatusCode::Internal,
-                                "zc value frame shorter than meta",
-                            )));
-                        }
-                        return Err(RpcError::status(
-                            crate::error::StatusCode::Internal,
-                            "zc value frame shorter than meta",
-                        ));
-                    }
-                    break; // need more bytes for the meta prefix
-                }
-                let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id) else {
-                    unreachable!("is_pooled checked above");
-                };
-                decoder.consume(crate::frame::HEADER_LEN);
-                let mut meta = [0u8; ZC_META_LEN];
-                let _ = decoder.drain_into(&mut meta);
-                let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
-                let value_len = payload_len as usize - ZC_META_LEN;
-                // READ_LOOP acquires + owns the buffer. On caller-cancel the
-                // send below fails and `pb` drops → pool (no leak); the buffer
-                // is never owned by the cancellable caller.
-                let mut pb = autumn_transport::regpool_acquire(value_len);
-                let (dest, reg) = pb.dest_and_reg();
-                let mut filled = decoder.drain_into(dest);
-                let mut recv_err: Option<RpcError> = None;
-                while filled < value_len {
-                    match reader.recv_into(&mut dest[filled..], reg).await {
-                        Ok(0) => {
-                            let _ = tx.send(Err(RpcError::ConnectionClosed));
-                            return Ok(());
-                        }
-                        Ok(k) => filled += k,
-                        Err(e) => {
-                            recv_err = Some(e.into());
-                            break;
-                        }
-                    }
-                }
-                if let Some(e) = recv_err {
-                    let _ = tx.send(Err(e));
-                    return Err(RpcError::ConnectionClosed);
-                }
-                // F219: ZC value crc removed (transport integrity covers it).
-                // (`dest`/`reg` borrows of `pb` end at the recv loop above — NLL
-                // lets `pb` move into the send below; no explicit drop needed.)
-                let _ = tx.send(Ok((pb, code)));
-                continue;
-            }
-
-            // ── call_into_pooled on TCP: recv the large value straight into a
-            //    read_loop-owned PooledBuf (compio owned read), skipping the
-            //    FrameDecoder accumulation + finish_into_pooled_from_frame copy.
-            //    Only the kernel→userspace copy remains (TCP can't be true ZC).
-            //    Small values (< threshold) fall through to the normal decode
-            //    path — finish_into_pooled_from_frame still serves them. ──
-            if is_pooled && !reader.is_ucx() {
-                let value_len = (payload_len as usize).saturating_sub(ZC_META_LEN);
-                if (payload_len as usize) >= ZC_META_LEN
-                    && value_len >= TCP_RECV_INTO_POOLED_MIN_BYTES
-                {
-                    // Need header + meta buffered to parse the meta prefix.
-                    if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
-                        break; // wait for the next read to accumulate the meta
-                    }
-                    let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id) else {
-                        unreachable!("is_pooled checked above");
-                    };
-                    decoder.consume(crate::frame::HEADER_LEN);
-                    let mut meta = [0u8; ZC_META_LEN];
-                    let _ = decoder.drain_into(&mut meta);
-                    let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
-                    // READ_LOOP owns the buffer (cancel-safe). Drain the buffered
-                    // value prefix, then recv the remainder off the wire.
-                    let mut pb = autumn_transport::regpool_acquire(value_len);
-                    let filled = {
-                        let (dest, _reg) = pb.dest_and_reg();
-                        decoder.drain_into(dest)
-                    };
-                    match reader.read_exact_into_pooled(pb, filled, value_len).await {
-                        Ok(p) => pb = p,
-                        Err(e) => {
-                            let _ = tx.send(Err(e.into()));
-                            return Err(RpcError::ConnectionClosed);
-                        }
-                    }
-                    // F219: ZC value crc removed (transport integrity covers it).
-                    let _ = tx.send(Ok((pb, code)));
-                    continue;
-                }
-                // else: small value → normal decode path below.
-            }
-
-            // ── call_into_dest on TCP (F219): recv the large value straight into
-            //    the CALLER's dest (compio owned read over a raw-ptr buffer),
-            //    skipping the FrameDecoder accumulation + finish_into_dest memcpy.
-            //    Same cancel contract as the UCX call_into_dest path (dest
-            //    outlives the call; no per-call timeout — get_into honours this).
-            //    Small values fall through to finish_into_dest_from_frame. ──
-            if is_into && !reader.is_ucx() {
-                let value_len = (payload_len as usize).saturating_sub(ZC_META_LEN);
-                if (payload_len as usize) >= ZC_META_LEN
-                    && value_len >= TCP_RECV_INTO_POOLED_MIN_BYTES
-                {
-                    if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
-                        break; // wait for the meta prefix
-                    }
-                    let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id) else {
-                        unreachable!("is_into checked above");
-                    };
-                    decoder.consume(crate::frame::HEADER_LEN);
-                    let mut meta = [0u8; ZC_META_LEN];
-                    let _ = decoder.drain_into(&mut meta);
-                    let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
-                    if value_len > into.dest_cap {
-                        let _ = into.meta_tx.send(Err(RpcError::status(
-                            crate::error::StatusCode::InvalidArgument,
-                            "zc value larger than dest buffer",
-                        )));
-                        return Err(RpcError::status(
-                            crate::error::StatusCode::InvalidArgument,
-                            "zc value larger than dest buffer",
-                        ));
-                    }
-                    // SAFETY: caller holds `dest` alive until meta_tx fires (it
-                    // awaits the receiver); same compio thread; no per-call timeout.
-                    let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
-                    let filled = decoder.drain_into(dest);
-                    // Recv the remainder straight into the caller dest (single copy).
-                    match unsafe {
-                        reader
-                            .read_exact_into_raw(into.dest, filled, value_len)
-                            .await
-                    } {
-                        Ok(()) => {
-                            let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
-                        }
-                        Err(e) => {
-                            let _ = into.meta_tx.send(Err(e.into()));
-                            return Err(RpcError::ConnectionClosed);
-                        }
-                    }
-                    continue;
-                }
-                // else: small value → normal decode path below.
             }
 
             // ── normal path: full frame decode ──
@@ -876,15 +781,15 @@ async fn read_loop(
                         let _ = tx.send(frame);
                     }
                     Some(Pending::IntoDest(into)) => {
-                        // TCP / non-UCX: the whole [meta][value] frame was
-                        // decoded; copy the value into dest (one memcpy — TCP
-                        // always pays the kernel copy anyway).
+                        // Small-value TCP path: the whole [meta][value] frame
+                        // was decoded; copy the value into dest (one memcpy —
+                        // TCP always pays the kernel copy anyway).
                         finish_into_dest_from_frame(into, &frame.payload);
                     }
                     Some(Pending::IntoPooled(tx)) => {
-                        // TCP / non-UCX: copy the value into a (plain) pool
-                        // buffer and hand it back. The read_loop owns it until
-                        // the send; on caller-cancel it drops → pool.
+                        // Small-value TCP path: copy the value into a (plain)
+                        // pool buffer and hand it back. The read_loop owns it
+                        // until the send; on caller-cancel it drops → pool.
                         finish_into_pooled_from_frame(tx, &frame.payload);
                     }
                     None => {
@@ -899,6 +804,35 @@ async fn read_loop(
             }
         }
     }
+}
+
+/// How a ZC value recv ended.
+enum ValueRecv {
+    Done,
+    /// Peer closed the connection mid-value.
+    PeerClosed,
+    /// Transport error mid-value.
+    Failed(std::io::Error),
+}
+
+/// UCX ZC value recv: drain the value's already-buffered prefix out of the
+/// decoder, then recv the remainder straight into `dest` (zero-copy via memh
+/// when `reg` is Some). `dest.len()` is the exact value length.
+async fn recv_value_ucx(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    dest: &mut [u8],
+    reg: Option<&autumn_transport::RegisteredMem>,
+) -> ValueRecv {
+    let mut filled = decoder.drain_into(dest);
+    while filled < dest.len() {
+        match reader.recv_into(&mut dest[filled..], reg).await {
+            Ok(0) => return ValueRecv::PeerClosed,
+            Ok(k) => filled += k,
+            Err(e) => return ValueRecv::Failed(e),
+        }
+    }
+    ValueRecv::Done
 }
 
 /// Complete a `call_into_dest` from a fully-decoded value frame (TCP /
