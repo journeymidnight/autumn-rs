@@ -36,6 +36,40 @@ fn is_eversion_stale(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EversionStale>())
 }
 
+/// Decode a `MSG_READ_BYTES` response and map its two error codes — the ONE
+/// place that turns `CODE_EVERSION_MISMATCH` into the `EversionStale`
+/// sentinel (which the top-level read retry recognises via
+/// `is_eversion_stale` to invalidate the extent cache and refetch) and any
+/// other non-OK code into an error. Shared by the replicated chunk read and
+/// both EC shard-read paths so the sentinel mapping can never drift.
+/// `shard`/`ctx` only shape the diagnostic strings (built on error paths
+/// only); callers handle the OK payload themselves.
+fn parse_read_bytes_resp(
+    resp_bytes: Bytes,
+    addr: &str,
+    extent_id: u64,
+    shard: Option<usize>,
+    ctx: &'static str,
+) -> Result<ReadBytesResp> {
+    let resp = ReadBytesResp::decode(resp_bytes)
+        .map_err(|e| anyhow!("decode ReadBytesResp from {addr}: {e}"))?;
+    let site = || match shard {
+        Some(i) => format!("{ctx} shard {i} from {addr} extent={extent_id}"),
+        None => format!("{ctx} from {addr} extent={extent_id}"),
+    };
+    if resp.code == CODE_EVERSION_MISMATCH {
+        return Err(anyhow::Error::new(EversionStale).context(site()));
+    }
+    if resp.code != CODE_OK {
+        return Err(anyhow!(
+            "{}: code={}",
+            site(),
+            crate::extent_rpc::code_description(resp.code)
+        ));
+    }
+    Ok(resp)
+}
+
 /// F204: structured sentinel for "VP points past manager-recorded
 /// `sealed_length`" — historical data corruption from the
 /// pre-2026-04-27 `handle_stream_alloc_extent` race against EC
@@ -2068,6 +2102,21 @@ impl StreamClient {
         })
     }
 
+    /// Build a worker `StreamTail` for a freshly-allocated / rolled extent:
+    /// resolve the replica addresses (may lazily refresh the nodes cache) and
+    /// capture the matching replica node ids. Every roll/reset site must
+    /// construct the tail through here so the addr ↔ node-id pairing stays
+    /// consistent with the extent it was built from.
+    async fn build_stream_tail(&self, extent: ExtentInfo) -> Result<StreamTail> {
+        let replica_addrs = self.replica_addrs_for_extent(&extent).await?;
+        let replica_node_ids = Self::replica_node_ids_for(&extent);
+        Ok(StreamTail {
+            extent,
+            replica_addrs,
+            replica_node_ids,
+        })
+    }
+
     /// F190: chained `replicates ++ parity` node ids — same index order as
     /// `replica_addrs_from_cache`. Used to populate `StreamTail.replica_node_ids`.
     fn replica_node_ids_for(ex: &ExtentInfo) -> Vec<u64> {
@@ -2351,15 +2400,7 @@ impl StreamClient {
                                 .alloc_new_extent(stream_id, Some(result.end), result.extent_id)
                                 .await
                             {
-                                if let Ok(replica_addrs) =
-                                    self.replica_addrs_for_extent(&new_ext).await
-                                {
-                                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-                                    let new_tail = StreamTail {
-                                        extent: new_ext,
-                                        replica_addrs,
-                                        replica_node_ids,
-                                    };
+                                if let Ok(new_tail) = self.build_stream_tail(new_ext).await {
                                     let mut tx_clone = tx.clone();
                                     let _ = tx_clone
                                         .send(StreamSubmitMsg::ResetTail { tail: new_tail })
@@ -2401,13 +2442,7 @@ impl StreamClient {
                         let (_, new_ext) = self
                             .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
                             .await?;
-                        let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
-                        let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-                        let new_tail = StreamTail {
-                            extent: new_ext,
-                            replica_addrs,
-                            replica_node_ids,
-                        };
+                        let new_tail = self.build_stream_tail(new_ext).await?;
                         let mut tx_clone = tx.clone();
                         tx_clone
                             .send(StreamSubmitMsg::ResetTail { tail: new_tail })
@@ -2433,13 +2468,7 @@ impl StreamClient {
                             let (_, new_ext) = self
                                 .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
                                 .await?;
-                            let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
-                            let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-                            let new_tail = StreamTail {
-                                extent: new_ext,
-                                replica_addrs,
-                                replica_node_ids,
-                            };
+                            let new_tail = self.build_stream_tail(new_ext).await?;
                             let mut tx_clone = tx.clone();
                             tx_clone
                                 .send(StreamSubmitMsg::ResetTail { tail: new_tail })
@@ -2492,13 +2521,7 @@ impl StreamClient {
                             alloc_err
                                 .context(format!("alloc_new_extent failed after append error: {e}"))
                         })?;
-                    let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
-                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-                    let new_tail = StreamTail {
-                        extent: new_ext,
-                        replica_addrs,
-                        replica_node_ids,
-                    };
+                    let new_tail = self.build_stream_tail(new_ext).await?;
                     let mut tx_clone = tx.clone();
                     tx_clone
                         .send(StreamSubmitMsg::ResetTail { tail: new_tail })
@@ -2533,16 +2556,7 @@ impl StreamClient {
             // manager's `already_sealed` short-circuit preserves the existing
             // seal; `seal_commit = None` (no worker commit to claim → probe).
             let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
-            let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
-            let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-            (
-                StreamTail {
-                    extent: new_ext,
-                    replica_addrs,
-                    replica_node_ids,
-                },
-                0,
-            )
+            (self.build_stream_tail(new_ext).await?, 0)
         } else {
             // Open tail. Determine its committed length to seed the worker
             // cursor. F227: a failure here must NEVER seed 0 — pre-F227
@@ -2585,16 +2599,7 @@ impl StreamClient {
                         "BUG#1: open-tail current_commit persistently failed — sealing + rolling to a fresh tail (seal-over-reachable)"
                     );
                     let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
-                    let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
-                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
-                    (
-                        StreamTail {
-                            extent: new_ext,
-                            replica_addrs,
-                            replica_node_ids,
-                        },
-                        0,
-                    )
+                    (self.build_stream_tail(new_ext).await?, 0)
                 }
             }
         };
@@ -2975,6 +2980,34 @@ impl StreamClient {
         false
     }
 
+    /// The committed byte bound a reader may trust for `ex` — shared by
+    /// `read_committed_bytes_from_extent` and `read_committed_from_replica`
+    /// so their committed-end semantics can never drift. Sealed →
+    /// `sealed_length`, first guarding a stale VP whose offset lies past the
+    /// seal (the F204 `stale_vp_offset_past_sealed_length` wire-contract
+    /// sentinel); open tail → one min-replica `commit_length` probe per call
+    /// (replay-only cadence, one probe per chunk — not a hot path).
+    async fn committed_end_for_read(
+        &self,
+        ex: &ExtentInfo,
+        offset: u64,
+        length: u64,
+    ) -> Result<u64> {
+        if ex.sealed {
+            if offset > ex.sealed_length {
+                return Err(anyhow::Error::new(StaleVpOffset {
+                    extent_id: ex.extent_id,
+                    requested_offset: offset,
+                    requested_length: length,
+                    sealed_length: ex.sealed_length,
+                }));
+            }
+            Ok(ex.sealed_length)
+        } else {
+            self.commit_length_for_extent(ex).await
+        }
+    }
+
     /// Read bytes from a specific extent.
     /// Pass `length=0` to read from offset to the end of the extent.
     ///
@@ -3042,21 +3075,7 @@ impl StreamClient {
     ) -> Result<(Vec<u8>, u64)> {
         for attempt in 0..2 {
             let ex = self.fetch_extent_info(extent_id).await?;
-            let committed_end: u64 = if ex.sealed {
-                if offset > ex.sealed_length {
-                    return Err(anyhow::Error::new(StaleVpOffset {
-                        extent_id,
-                        requested_offset: offset,
-                        requested_length: length,
-                        sealed_length: ex.sealed_length,
-                    }));
-                }
-                ex.sealed_length
-            } else {
-                // Open tail: one min-replica probe per call. Replay-only
-                // cadence (one probe per 64 MiB chunk) — not a hot path.
-                self.commit_length_for_extent(&ex).await?
-            };
+            let committed_end = self.committed_end_for_read(&ex, offset, length).await?;
             let want = length.min(committed_end.saturating_sub(offset));
             if want == 0 {
                 return Ok((Vec::new(), committed_end));
@@ -3125,19 +3144,7 @@ impl StreamClient {
                 node_ids.len()
             ));
         }
-        let committed_end: u64 = if ex.sealed {
-            if offset > ex.sealed_length {
-                return Err(anyhow::Error::new(StaleVpOffset {
-                    extent_id,
-                    requested_offset: offset,
-                    requested_length: length,
-                    sealed_length: ex.sealed_length,
-                }));
-            }
-            ex.sealed_length
-        } else {
-            self.commit_length_for_extent(&ex).await?
-        };
+        let committed_end = self.committed_end_for_read(&ex, offset, length).await?;
         let node_id = node_ids[replica_idx];
         let want = length.min(committed_end.saturating_sub(offset));
         if want == 0 {
@@ -3780,18 +3787,7 @@ impl StreamClient {
             .pool
             .call_timeout(addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(3))
             .await?;
-        let resp = ReadBytesResp::decode(resp_bytes)
-            .map_err(|e| anyhow!("decode ReadBytesResp from {addr}: {e}"))?;
-        if resp.code == CODE_EVERSION_MISMATCH {
-            return Err(anyhow::Error::new(EversionStale)
-                .context(format!("read_bytes from {addr} extent={extent_id}")));
-        }
-        if resp.code != CODE_OK {
-            return Err(anyhow!(
-                "read_bytes error from {addr}: code={}",
-                crate::extent_rpc::code_description(resp.code)
-            ));
-        }
+        let resp = parse_read_bytes_resp(resp_bytes, addr, extent_id, None, "read_bytes")?;
         Ok((resp.payload.to_vec(), resp.end))
     }
 
@@ -4074,8 +4070,15 @@ impl StreamClient {
                     )
                     .await
                 {
-                    Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
-                        Ok(resp) if resp.code == CODE_OK => {
+                    Ok(resp_bytes) => {
+                        parse_read_bytes_resp(
+                            resp_bytes,
+                            &addr_clone,
+                            extent_id,
+                            Some(i),
+                            "ec_reconstruct",
+                        )
+                        .and_then(|resp| {
                             if resp.payload.len() as u64 != sh_len {
                                 Err(anyhow!(
                                     "ec_reconstruct: short read from {addr_clone}: got {} want {sh_len}",
@@ -4084,18 +4087,8 @@ impl StreamClient {
                             } else {
                                 Ok(resp.payload.to_vec())
                             }
-                        }
-                        Ok(resp) if resp.code == CODE_EVERSION_MISMATCH => {
-                            Err(anyhow::Error::new(EversionStale)
-                                .context(format!("ec_reconstruct shard {i} from {addr_clone}")))
-                        }
-                        Ok(resp) => Err(anyhow!(
-                            "ec_reconstruct read_bytes from {}: code={}",
-                            addr_clone,
-                            crate::extent_rpc::code_description(resp.code)
-                        )),
-                        Err(e) => Err(anyhow!("decode ReadBytesResp from {addr_clone}: {e}")),
-                    },
+                        })
+                    }
                     Err(e) => Err(anyhow!(e)),
                 };
                 let _ = futures::SinkExt::send(&mut tx_clone, (i, result)).await;
@@ -4223,19 +4216,10 @@ impl StreamClient {
                     .call_timeout(&addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(5))
                     .await
                 {
-                    Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
-                        Ok(resp) if resp.code == CODE_OK => Ok((resp.payload.to_vec(), resp.end)),
-                        Ok(resp) if resp.code == CODE_EVERSION_MISMATCH => {
-                            Err(anyhow::Error::new(EversionStale)
-                                .context(format!("ec_read_full shard {i} from {addr}")))
-                        }
-                        Ok(resp) => Err(anyhow!(
-                            "read_bytes from {}: code={}",
-                            addr,
-                            crate::extent_rpc::code_description(resp.code)
-                        )),
-                        Err(e) => Err(anyhow!("decode ReadBytesResp from {addr}: {e}")),
-                    },
+                    Ok(resp_bytes) => {
+                        parse_read_bytes_resp(resp_bytes, &addr, extent_id, Some(i), "ec_read_full")
+                            .map(|resp| (resp.payload.to_vec(), resp.end))
+                    }
                     Err(e) => Err(anyhow!(e)),
                 };
                 let _ = futures::SinkExt::send(&mut tx, (i, result)).await;
