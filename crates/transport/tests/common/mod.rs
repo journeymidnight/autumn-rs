@@ -8,27 +8,23 @@ use compio::BufResult;
 use std::net::SocketAddr;
 
 pub async fn ping_pong_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
-    let mut listener = t.bind(addr).await.unwrap();
-    let bound = listener.local_addr().unwrap();
-    let server = compio::runtime::spawn(async move {
-        let (c, _) = listener.accept().await.unwrap();
-        echo_n(c, 1024).await;
-    });
-    let c = t.connect(bound).await.unwrap();
-    write_then_read(c, 1024).await;
-    let _ = server.await;
+    round_trip_at(t, addr, 1024).await;
 }
 
 pub async fn large_payload_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
-    const N: usize = 2 * 1024 * 1024;
+    round_trip_at(t, addr, 2 * 1024 * 1024).await;
+}
+
+/// One echo round trip of `n` bytes through a fresh listener + connection.
+async fn round_trip_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr, n: usize) {
     let mut listener = t.bind(addr).await.unwrap();
     let bound = listener.local_addr().unwrap();
     let server = compio::runtime::spawn(async move {
         let (c, _) = listener.accept().await.unwrap();
-        echo_n(c, N).await;
+        echo_n(c, n).await;
     });
     let c = t.connect(bound).await.unwrap();
-    write_then_read(c, N).await;
+    write_then_read(c, n).await;
     let _ = server.await;
 }
 

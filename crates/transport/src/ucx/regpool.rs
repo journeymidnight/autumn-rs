@@ -414,10 +414,11 @@ impl Drop for PooledBuf {
                     None
                 } else {
                     // Eviction: keep `registered_bytes` in lockstep with what's
-                    // actually pinned. Non-ucx builds register nothing, so this
-                    // is a no-op there.
+                    // actually pinned. Every slab reaching here on a ucx build
+                    // is registered (unregistered fallbacks returned early
+                    // above); non-ucx builds compile this block out.
                     #[cfg(feature = "ucx")]
-                    if slab.reg.is_some() {
+                    {
                         p.registered_bytes = p.registered_bytes.saturating_sub(class);
                         REGISTERED_BYTES_GAUGE
                             .fetch_sub(class as u64, Ordering::Relaxed);
