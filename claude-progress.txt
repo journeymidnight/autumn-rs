@@ -1,8 +1,18 @@
 Date: 2026-06-30
 TaskStatus: not_completed
-Task scope: 实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
-  现 Phase 2(Python binding + Hermes 适配)进行中:Phase 2a(Python PyO3 binding)已完成。
-  Phase 1 原始记录如下。
+Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租户隔离,plan §9.5/§16 Phase 0)。
+  威胁模型=可信内网(防流氓/误用/测试 client,不防 MITM/不防被攻破的 manager),无 TLS。
+  **设计定稿(2026-07-01,多轮 user+coco 讨论)= manager-as-KDC(签发) + PS 在 KV 层强制,非对称 Ed25519**:
+    manager(leader) 持签名私钥 + 租户账户库(tenant→credential_hash+prefixes),验永久凭据签短TTL token,支持自动续期;
+    PS 只持公钥,AUTH_HELLO 每连接验一次签,每请求 starts_with+exp,从不回调 manager。撤销=短TTL+kid轮换+停续期。
+    性能:每请求 ~ns(验签摊到 per-connection);唯一真成本=protected 大值走 PS proxy(agent-memory 罕见,可优化)。
+    EN 大值直读旁路必须堵(descriptor 是可猜坐标非 capability)。详见 docs/data_plane_authz_design.md(source of truth)。
+  **首版已撤(2026-07-01)**:早期 manager token_hash→prefixes 注册表 + PS poll 做强制(etcd-RBAC 中心存储形态),
+    用户否("auth 在 KV 层做")→ git checkout 撤掉,wire 回 v8。工作区干净,只剩设计文档 + ledger。
+  实现未开始。分 3 stage:① KDC(manager 签名+账户库+MINT_TOKEN+GET_AUTHZ_CONFIG)② PS 强制 ③ client 自动续期+工具+e2e。
+  详见 feature_list F-AUTHZ-1。
+  --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
+  实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。
 
 Current summary (Phase 1 完成,e2e 绿):
