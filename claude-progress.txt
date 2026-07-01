@@ -35,7 +35,13 @@ Task scope: 当前活跃 = F-AUTHZ-1 服务端数据面 key-range 授权(多租�
       PS lib 182/182、rpc 43、client 27、manager 169、workspace 全绿。coco review(GPT-5.5)5 findings 全修(bd5015d,pushed):
       P1 冷启动 fail-open(config 在 sync_regions_once 前取);P1 aud 校验(GetAuthzConfigResp.cluster_id → verify_auth_hello 拒 aud!=cluster_id,防跨集群共享 key 重放);
       P1 disabled-kid 撤销活连接(BoundPrincipal 存 kid,每请求 keys.contains_key(kid));P2 client PermissionDenied terminal(call_ps_for_key 短路);P2 AUTH_HELLO 解码前 16KiB 上限。
-  **Stage 3 未开始**(client 发 AUTH_HELLO+token+自动续期、principal 分区连接池、autumn-memory 透传凭据、autumn-op gen-signing-key/tenant-create/mint-token、跨租户真集群 e2e)。详见 feature_list F-AUTHZ-1。
+  **Stage 3 (client + 工具) 完成 + pushed(afcabc4 tooling;a2ec39f client SDK;ef4669c memory+e2e):**
+    · autumn-op 工具:gen-signing-key(本地离线,OsRng seed→keyfile 行,pubkey 到 stderr)/tenant-create/tenant-delete/mint-token(包装 KDC RPC,hex 编解码)。
+    · client SDK:ClientAuth(tenant+credential+cached token)字段;set_tenant_credential/connect_with_credential;ensure_token(懒 MSG_MINT_TOKEN,exp 前 300s 自动续,续期驱逐旧 PS 连接);get_ps_client 连后发 MSG_AUTH_HELLO 绑 principal 再缓存;匿名(无 cred)不发 AUTH_HELLO 兼容非-authz 集群。AutumnError::PermissionDenied。
+    · autumn-memory:MemoryStore::connect_with_credential(tenant scope=mem/{tenant}/)。
+    · 跨租户真集群 e2e(tests/authz_e2e.rs + run_authz_e2e.sh,隔离 authz 集群 19300+,memory-only):
+      验证全链(manager 铸→client AUTH_HELLO→PS 强制):acme 读写 mem/acme/ 通、mem/other/ 拒(读+写)、非-protected 放行、other 对称隔离、匿名 protected 拒、MemoryStore 透传。**"AUTHZ E2E OK" 通过(exit 0)。**
+  **F-AUTHZ-1 端到端完成**(server KDC + PS 强制 + client token 路径 + 工具,真二进制验证)。coco Stage-3 review 进行中。详见 feature_list F-AUTHZ-1。
   --- 以下为已完成的 autumn-memory 任务历史(12 feature 全绿+pushed)---
   实现 autumn-memory(docs/autumn_memory_plan.md)。Phase 1 完成(commit dc7698e);
   核心 RUST(crates/autumn-memory)。用户定:跳过暴力 MVP,直接做真 posting-on-KV(BM25 + SPFresh-IVF)。

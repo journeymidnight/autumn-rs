@@ -1,6 +1,7 @@
 # 数据面 key-range 授权（服务端 authz）设计
 
-> 状态：**设计定稿（2026-07-01）**，实现待动手。经与用户 + coco 多轮讨论收敛。
+> 状态：**实现端到端完成（2026-07-01）** —— Stage 1 KDC + Stage 2 PS 强制 + Stage 3 client/工具，
+> 真二进制跨租户 e2e 通过（见文末「状态」）。设计经与用户 + coco 多轮讨论收敛。
 > 满足 plan §9.5 / §16 Phase 0 的多租户隔离。区别于（从未落地的）
 > `admin_auth_design.md` 里的「管理操作鉴权」。
 
@@ -172,9 +173,19 @@ per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）�
   config poll（fetch_authz_config_once → install；finish_connect 初次同步取 + 5s poll loop）。
   client：AutumnError::PermissionDenied（terminal）。真连接 e2e：AUTH_HELLO 绑 → 授权过 →
   跨租户拒 → 匿名拒 → 非 protected 放行。PS 181/181、rpc/client/manager 全绿。
-- **Stage 3 — client + 工具**：SDK 持 token + 自动续期（后台）+ 连接池按 principal；
-  autumn-memory 透传租户凭据；`autumn-op gen-signing-key / tenant-create / mint-token`；
-  cluster.sh 分发。e2e：两租户互隔离 + 非 `mem/` 不受影响 + 续期无感 + kid 轮换。
+- **Stage 3 — client + 工具 ✅ 完成（2026-07-01，commit afcabc4 + a2ec39f + ef4669c）**：
+  `autumn-op gen-signing-key`（本地离线，OsRng seed→keyfile 行）`/tenant-create/tenant-delete/mint-token`
+  （包装 KDC RPC，hex 编解码）；client SDK 持 credential（`set_tenant_credential`/`connect_with_credential`），
+  `ensure_token`=懒 MSG_MINT_TOKEN + exp 前 300s 自动续 + 续期驱逐旧 PS 连接，`get_ps_client` 连后发
+  AUTH_HELLO 绑 principal 再缓存（匿名兼容非-authz 集群），`AutumnError::PermissionDenied`；
+  `MemoryStore::connect_with_credential`。**跨租户真集群 e2e**（`tests/authz_e2e.rs` + `run_authz_e2e.sh`，
+  隔离 authz 集群 19300+，memory-only）验证全链（manager 铸→client AUTH_HELLO→PS 强制）：本前缀读写通、
+  跨租户拒（读+写）、非-protected 放行、other 对称隔离、匿名 protected 拒、MemoryStore 透传 —— **"AUTHZ E2E OK"，exit 0**。
+  （kid 轮换机制已在 Stage 1/2 支持：多 kid keyfile + published disabled 位 + PS per-request kid-revocation；未单列 e2e。）
+
+## 状态
+**F-AUTHZ-1 端到端完成（2026-07-01）** = server KDC（Stage 1）+ PS 强制（Stage 2）+ client token 路径 + 工具（Stage 3），
+真二进制跨租户 e2e 通过。两轮 coco（Stage 1/2）全处置。
 
 ## 参照
 FoundationDB tenant authorization（非对称 JWT，storage 层验，不可撤销靠短 TTL）；
