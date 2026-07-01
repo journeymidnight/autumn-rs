@@ -390,20 +390,11 @@ async fn cmd_tenant_create(
     admin_token: String,
 ) -> Result<()> {
     let allowed_prefixes: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
-    let req = rkyv_encode(&TenantCreateReq {
-        admin_token,
-        tenant: tenant.clone(),
-        allowed_prefixes,
-    });
-    let resp_bytes = client
-        .mgr_call(MSG_TENANT_CREATE, req)
-        .await
-        .context("tenant-create")?;
-    let resp: TenantCreateResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-    if resp.code != CODE_OK {
-        bail!("tenant-create: code={} {}", resp.code, resp.message);
-    }
-    let cred = hex_encode(&resp.credential);
+    // Leader-only RPC with manager rotation on CODE_NOT_LEADER lives in the SDK.
+    let credential = client
+        .tenant_create(&tenant, allowed_prefixes, &admin_token)
+        .await?;
+    let cred = hex_encode(&credential);
     if json {
         println!(
             "{}",
@@ -428,18 +419,7 @@ async fn cmd_tenant_delete(
     tenant: String,
     admin_token: String,
 ) -> Result<()> {
-    let req = rkyv_encode(&TenantDeleteReq {
-        admin_token,
-        tenant: tenant.clone(),
-    });
-    let resp_bytes = client
-        .mgr_call(MSG_TENANT_DELETE, req)
-        .await
-        .context("tenant-delete")?;
-    let resp: CodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-    if resp.code != CODE_OK {
-        bail!("tenant-delete: code={} {}", resp.code, resp.message);
-    }
+    client.tenant_delete(&tenant, &admin_token).await?;
     if json {
         println!(
             "{}",
@@ -459,31 +439,20 @@ async fn cmd_mint_token(
     credential_hex: String,
 ) -> Result<()> {
     let credential = hex_decode(&credential_hex).context("--credential")?;
-    let req = rkyv_encode(&MintTokenReq {
-        tenant: tenant.clone(),
-        credential,
-    });
-    let resp_bytes = client
-        .mgr_call(MSG_MINT_TOKEN, req)
-        .await
-        .context("mint-token")?;
-    let resp: MintTokenResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-    if resp.code != CODE_OK {
-        bail!("mint-token: code={} {}", resp.code, resp.message);
-    }
-    let token = hex_encode(&resp.token);
+    let (token_bytes, exp) = client.mint_token(&tenant, credential).await?;
+    let token = hex_encode(&token_bytes);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "tenant": tenant,
                 "token": token,
-                "exp": resp.exp,
+                "exp": exp,
             }))?
         );
     } else {
         println!("{token}");
-        eprintln!("# token for '{tenant}', exp={} (unix seconds)", resp.exp);
+        eprintln!("# token for '{tenant}', exp={exp} (unix seconds)");
     }
     Ok(())
 }

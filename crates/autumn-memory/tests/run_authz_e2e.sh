@@ -17,8 +17,22 @@ MGR="127.0.0.1:$((PB + 1))"
 EN_PORT=$((PB + 101))
 PS_PORT=$((PB + 201))
 ADMIN_TOKEN="authz-e2e-admin-secret"
+# Safety (coco): the `rm -rf "$WORK"` below must never nuke $HOME / the repo / /.
+# Require a non-empty path under /tmp with no '..'.
+case "$WORK" in
+  /tmp/?*) : ;;
+  *) echo "[authz-e2e] refusing unsafe AM_WORK='$WORK' (must be /tmp/<name>)"; exit 2 ;;
+esac
+case "$WORK" in *..*) echo "[authz-e2e] AM_WORK must not contain '..'"; exit 2 ;; esac
 for b in autumn-manager-server autumn-op autumn-extent-node autumn-ps; do
   [ -x "$BIN/$b" ] || { echo "[authz-e2e] FAIL: missing $BIN/$b — run: cargo build --workspace"; exit 2; }
+done
+# Test isolation (coco): refuse to start if our ports are already taken — else we
+# might connect to a stale/foreign cluster and think we succeeded.
+for port in "$((PB + 1))" "$EN_PORT" "$PS_PORT"; do
+  if ss -ltn 2>/dev/null | grep -q ":$port\b"; then
+    echo "[authz-e2e] port $port already in use — set AM_PORT_BASE to a free base"; exit 2
+  fi
 done
 rm -rf "$WORK"; mkdir -p "$WORK/en0" "$WORK/ps1"
 PIDS=()

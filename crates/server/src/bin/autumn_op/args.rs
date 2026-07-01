@@ -61,6 +61,19 @@ fn val(raw: &[String], i: usize) -> &str {
     }
 }
 
+/// F-AUTHZ-1: read a secret (admin token / tenant credential) from a file,
+/// trimming a trailing newline. Preferred over passing secrets on argv, which
+/// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
+fn read_secret_file(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
+        Err(e) => {
+            eprintln!("autumn-op: cannot read secret file {path}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) json: bool,
@@ -432,10 +445,19 @@ pub(crate) fn parse() -> Args {
                         admin_token = val(&raw, i).to_owned();
                         i += 1;
                     }
+                    // Read the admin token from a FILE (avoids leaking it via
+                    // argv / ps / /proc/<pid>/cmdline). Preferred over --admin-token.
+                    "--admin-token-file" => {
+                        i += 1;
+                        admin_token = read_secret_file(val(&raw, i));
+                        i += 1;
+                    }
                     _ => break,
                 }
             }
-            if tenant.is_empty() || prefixes.is_empty() {
+            // Validate at parse time (fail-fast, coco P3): the RPC needs a
+            // non-empty admin token; catch a missing --admin-token[-file] here.
+            if tenant.is_empty() || prefixes.is_empty() || admin_token.is_empty() {
                 usage();
             }
             Command::TenantCreate {
@@ -459,10 +481,15 @@ pub(crate) fn parse() -> Args {
                         admin_token = val(&raw, i).to_owned();
                         i += 1;
                     }
+                    "--admin-token-file" => {
+                        i += 1;
+                        admin_token = read_secret_file(val(&raw, i));
+                        i += 1;
+                    }
                     _ => break,
                 }
             }
-            if tenant.is_empty() {
+            if tenant.is_empty() || admin_token.is_empty() {
                 usage();
             }
             Command::TenantDelete {
@@ -483,6 +510,12 @@ pub(crate) fn parse() -> Args {
                     "--credential" => {
                         i += 1;
                         credential = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    // Read the (long-lived) credential from a FILE instead of argv.
+                    "--credential-file" => {
+                        i += 1;
+                        credential = read_secret_file(val(&raw, i));
                         i += 1;
                     }
                     _ => break,

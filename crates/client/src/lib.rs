@@ -431,6 +431,11 @@ pub struct ClusterClient {
     /// clusters). When `Some`, every fresh PS connection sends AUTH_HELLO with a
     /// (lazily minted, auto-renewed) token before use.
     auth: RefCell<Option<ClientAuth>>,
+    /// F-AUTHZ-1: bumped by `set_tenant_credential`. `get_ps_client` captures it
+    /// before the AUTH_HELLO await and refuses to CACHE a connection if the
+    /// identity changed mid-connect — so a principal switch can't leave a
+    /// wrong-identity-bound connection in the pool (coco P2).
+    auth_gen: Cell<u64>,
 }
 
 /// Default per-call timeout for cluster RPCs. Generous enough to cover
@@ -550,6 +555,108 @@ impl ClusterClient {
         }
     }
 
+    /// F-AUTHZ-1: mint a short-TTL capability token for `tenant` from its
+    /// permanent `credential`. Mint is leader-only, so this rotates managers on
+    /// `CODE_NOT_LEADER` (mgr_call_retry only rotates on transport errors —
+    /// NOT_LEADER comes back as a successful response body, same as cluster_df).
+    /// Returns `(token_bytes, exp_unix_secs)`.
+    pub async fn mint_token(&self, tenant: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
+        let req = rkyv_encode(&MintTokenReq {
+            tenant: tenant.to_string(),
+            credential,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let mut attempt = 0u32;
+        loop {
+            let bytes = self
+                .mgr_call_retry(MSG_MINT_TOKEN, req.clone(), managers)
+                .await
+                .context("mint token")?;
+            let resp: MintTokenResp = rkyv_decode(&bytes).map_err(decode_err)?;
+            if resp.code == CODE_NOT_LEADER {
+                attempt += 1;
+                if attempt > managers + 2 {
+                    return Err(anyhow!("mint_token: no leader available"));
+                }
+                self.rotate_manager();
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                return Err(anyhow!("mint token rejected: {}", resp.message));
+            }
+            return Ok((resp.token, resp.exp));
+        }
+    }
+
+    /// F-AUTHZ-1: create/rotate a tenant account (admin). Returns the permanent
+    /// credential. Leader-only → rotates managers on `CODE_NOT_LEADER`.
+    pub async fn tenant_create(
+        &self,
+        tenant: &str,
+        allowed_prefixes: Vec<Vec<u8>>,
+        admin_token: &str,
+    ) -> Result<Vec<u8>> {
+        let req = rkyv_encode(&TenantCreateReq {
+            admin_token: admin_token.to_string(),
+            tenant: tenant.to_string(),
+            allowed_prefixes,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let mut attempt = 0u32;
+        loop {
+            let bytes = self
+                .mgr_call_retry(MSG_TENANT_CREATE, req.clone(), managers)
+                .await
+                .context("tenant-create")?;
+            let resp: TenantCreateResp = rkyv_decode(&bytes).map_err(decode_err)?;
+            if resp.code == CODE_NOT_LEADER {
+                attempt += 1;
+                if attempt > managers + 2 {
+                    return Err(anyhow!("tenant-create: no leader available"));
+                }
+                self.rotate_manager();
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                return Err(anyhow!("tenant-create rejected: {}", resp.message));
+            }
+            return Ok(resp.credential);
+        }
+    }
+
+    /// F-AUTHZ-1: delete a tenant account (admin). Leader-only → rotates on
+    /// `CODE_NOT_LEADER`.
+    pub async fn tenant_delete(&self, tenant: &str, admin_token: &str) -> Result<()> {
+        let req = rkyv_encode(&TenantDeleteReq {
+            admin_token: admin_token.to_string(),
+            tenant: tenant.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let mut attempt = 0u32;
+        loop {
+            let bytes = self
+                .mgr_call_retry(MSG_TENANT_DELETE, req.clone(), managers)
+                .await
+                .context("tenant-delete")?;
+            let resp: CodeResp = rkyv_decode(&bytes).map_err(decode_err)?;
+            if resp.code == CODE_NOT_LEADER {
+                attempt += 1;
+                if attempt > managers + 2 {
+                    return Err(anyhow!("tenant-delete: no leader available"));
+                }
+                self.rotate_manager();
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                return Err(anyhow!("tenant-delete rejected: {}", resp.message));
+            }
+            return Ok(());
+        }
+    }
+
     /// Call manager with retry and round-robin on NotLeader/connection error.
     pub async fn mgr_call_retry(
         &self,
@@ -597,6 +704,7 @@ impl ClusterClient {
             rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
             auth: RefCell::new(None),
+            auth_gen: Cell::new(0),
         };
 
         // Try connecting to each manager until one responds
@@ -822,6 +930,8 @@ impl ClusterClient {
             credential,
             token: None,
         });
+        // Bump the identity generation + drop cached PS conns so they rebind.
+        self.auth_gen.set(self.auth_gen.get().wrapping_add(1));
         self.ps_conns.borrow_mut().clear();
     }
 
@@ -861,15 +971,7 @@ impl ClusterClient {
                 .ok_or_else(|| anyhow!("no tenant credential set"))?;
             (a.tenant.clone(), a.credential.clone())
         };
-        let req = rkyv_encode(&MintTokenReq { tenant, credential });
-        let resp_bytes = self
-            .mgr_call_retry(MSG_MINT_TOKEN, req, self.manager_addrs.len().max(1) as u32)
-            .await
-            .context("mint token")?;
-        let resp: MintTokenResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(anyhow!("mint token rejected: {}", resp.message));
-        }
+        let (token, exp) = self.mint_token(&tenant, credential).await?;
         let renewed = {
             let mut auth = self.auth.borrow_mut();
             let a = auth
@@ -877,18 +979,29 @@ impl ClusterClient {
                 .ok_or_else(|| anyhow!("no tenant credential set"))?;
             let renewed = a.token.is_some();
             a.token = Some(CachedToken {
-                bytes: resp.token.clone(),
-                exp: resp.exp,
+                bytes: token.clone(),
+                exp,
             });
             renewed
         };
         if renewed {
             self.ps_conns.borrow_mut().clear();
         }
-        Ok(resp.token)
+        Ok(token)
     }
 
     pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
+        // F-AUTHZ-1: renew the token BEFORE serving a cached connection so a
+        // long-lived client rebinds before the current token expires —
+        // `ensure_token` clears `ps_conns` on renewal, dropping stale-token
+        // connections so the cache lookup below misses and rebinds (coco P1).
+        let authed = self.auth.borrow().is_some();
+        let token = if authed {
+            Some(self.ensure_token().await?)
+        } else {
+            None
+        };
+        let gen = self.auth_gen.get();
         {
             let conns = self.ps_conns.borrow();
             if let Some(c) = conns.get(ps_addr) {
@@ -899,21 +1012,29 @@ impl ClusterClient {
         let client = RpcClient::connect(addr)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
-        // F-AUTHZ-1: bind this connection's principal via AUTH_HELLO before it's
-        // cached/used. Only when a tenant credential is configured; anonymous
-        // clients never send it (and non-authz PSes accept it as a no-op OK).
-        if self.auth.borrow().is_some() {
-            let token = self.ensure_token().await?;
-            let resp_bytes = client
-                .call(MSG_AUTH_HELLO, rkyv_encode(&AuthHelloReq { token }))
-                .await
-                .with_context(|| format!("AUTH_HELLO to PS {ps_addr}"))?;
+        // Bind this connection's principal via AUTH_HELLO before it's cached.
+        if let Some(token) = token {
+            let hello = rkyv_encode(&AuthHelloReq { token });
+            // Bounded by rpc_timeout so a hung AUTH_HELLO can't wedge connect
+            // (coco P2) — mirrors ps_call_with_timeout.
+            let resp_bytes = match self.rpc_timeout.get() {
+                None => client.call(MSG_AUTH_HELLO, hello).await,
+                Some(t) => client.call_timeout(MSG_AUTH_HELLO, hello, t).await,
+            }
+            .with_context(|| format!("AUTH_HELLO to PS {ps_addr}"))?;
             let resp: AuthHelloResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
             if resp.code != StatusCode::Ok as u8 {
                 return Err(anyhow!(
                     "AUTH_HELLO rejected by PS {ps_addr}: {}",
                     resp.message
                 ));
+            }
+            // Identity-switch guard (coco P2): if `set_tenant_credential` ran
+            // during the connect + AUTH_HELLO await, this conn is bound to the
+            // OLD principal — serve this in-flight call but DON'T cache it, so a
+            // later call rebinds under the new identity.
+            if self.auth_gen.get() != gen {
+                return Ok(client);
             }
         }
         self.ps_conns
@@ -2948,6 +3069,7 @@ mod first_attempt_timeout_tests {
                 rpc_timeout: Cell::new(rpc),
                 first_attempt_timeout: Cell::new(first),
                 auth: RefCell::new(None),
+                auth_gen: Cell::new(0),
             }
         });
         cluster
