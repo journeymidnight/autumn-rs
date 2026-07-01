@@ -12110,3 +12110,263 @@ mod bug_lease_2_fence_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod authz_enforcement_tests {
+    //! F-AUTHZ-1 Stage 2: end-to-end connection-layer enforcement over a real
+    //! TCP `handle_ps_connection`, using the mock req_rx loop (part=None). Drives
+    //! a signed AUTH_HELLO + cross-tenant requests and asserts admit/deny.
+    use super::*;
+    use autumn_rpc::cap_token::{sign_claims, CapClaims, CAP_TYP, CAP_VER};
+    use autumn_rpc::manager_rpc::{AuthzPublicKey, GetAuthzConfigResp};
+    use ed25519_dalek::SigningKey;
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// An enabled AuthzState with one signing key (kid 1) + protected `mem/`.
+    fn enabled_authz(sk: &SigningKey) -> std::sync::Arc<crate::authz::AuthzState> {
+        let st = crate::authz::AuthzState::new();
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![AuthzPublicKey {
+                kid: 1,
+                ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                disabled: false,
+            }],
+            protected_prefixes: vec![b"mem/".to_vec()],
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+        });
+        std::sync::Arc::new(st)
+    }
+
+    fn mint(sk: &SigningKey, allowed: Vec<Vec<u8>>) -> Vec<u8> {
+        let now = now_secs();
+        sign_claims(
+            sk,
+            &CapClaims {
+                ver: CAP_VER,
+                typ: CAP_TYP.to_string(),
+                kid: 1,
+                iss: "autumn-mgr".to_string(),
+                aud: "cluster-test".to_string(),
+                iat: now,
+                nbf: now,
+                exp: now + 3600,
+                allowed_prefixes: allowed,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Send one request frame, read one response frame back.
+    async fn round_trip(
+        wr: &mut (impl compio::io::AsyncWrite + Unpin),
+        rd: &mut (impl compio::io::AsyncRead + Unpin),
+        decoder: &mut FrameDecoder,
+        req_id: u32,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> Frame {
+        let frame = Frame::request(req_id, msg_type, payload).encode();
+        let BufResult(r, _) = wr.write_all(frame).await;
+        r.expect("write");
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            if let Some(f) = decoder.try_decode().expect("decode") {
+                return f;
+            }
+            let BufResult(n, back) = rd.read(buf).await;
+            buf = back;
+            let n = n.expect("read");
+            assert!(n > 0, "EOF before response");
+            decoder.feed(&buf[..n]);
+        }
+    }
+
+    #[test]
+    fn auth_hello_then_cross_tenant_deny_and_anonymous_deny() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let sk = SigningKey::from_bytes(&[11u8; 32]);
+            let authz = enabled_authz(&sk);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = compio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+            let conn = compio::runtime::spawn(async move {
+                let _ = handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None, // reads delegate to the mock loop below
+                    7,
+                    authz,
+                )
+                .await;
+            });
+            // Mock partition loop: any ADMITTED request gets a canned OK
+            // (GetResp for reads, PutResp for writes). A denied request never
+            // reaches here — the authz gate short-circuits it on the conn task.
+            let loop_h = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let bytes = if req.msg_type == MSG_GET {
+                        partition_rpc::rkyv_encode(&GetResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            value: b"ok".to_vec(),
+                        })
+                    } else {
+                        let put: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
+                        partition_rpc::rkyv_encode(&PutResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            key: put.key,
+                        })
+                    };
+                    let _ = req.resp_tx.send(Ok(bytes));
+                }
+            });
+
+            let (mut rd, mut wr) = client.into_split();
+            let mut dec = FrameDecoder::new();
+
+            // (1) AUTH_HELLO with tenant acme's token → OK, binds principal.
+            let token = mint(&sk, vec![b"mem/acme/".to_vec()]);
+            let hello = partition_rpc::rkyv_encode(&AuthHelloReq { token });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_AUTH_HELLO, hello).await;
+            assert!(!f.is_error(), "AUTH_HELLO should succeed");
+            let resp: AuthHelloResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
+            assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
+
+            // (2) GET mem/acme/doc → authorized → delegates → GetResp OK.
+            let g = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/acme/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET, g).await;
+            assert!(!f.is_error(), "authorized GET should pass");
+
+            // (3) GET mem/other/doc → cross-tenant → DENIED at the gate.
+            let g2 = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/other/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET, g2).await;
+            assert!(f.is_error(), "cross-tenant GET must be denied");
+            let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+
+            // (4) PUT mem/acme/x → authorized write passes the gate.
+            let put = partition_rpc::rkyv_encode(&PutReq {
+                part_id: 7,
+                key: b"mem/acme/x".to_vec(),
+                value: b"v".to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 4, MSG_PUT, put).await;
+            assert!(!f.is_error(), "authorized PUT should pass");
+
+            // (5) PUT mem/other/x → cross-tenant write DENIED.
+            let put2 = partition_rpc::rkyv_encode(&PutReq {
+                part_id: 7,
+                key: b"mem/other/x".to_vec(),
+                value: b"v".to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 5, MSG_PUT, put2).await;
+            assert!(f.is_error(), "cross-tenant PUT must be denied");
+            let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+
+            // (6) non-protected key without auth → allowed (ungated namespace).
+            let g3 = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"fuse/inode/1".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET, g3).await;
+            assert!(!f.is_error(), "non-protected key should pass ungated");
+
+            drop(wr);
+            drop(rd);
+            let _ = conn.await;
+            let _ = loop_h.await;
+        });
+    }
+
+    #[test]
+    fn anonymous_connection_denied_on_protected() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let sk = SigningKey::from_bytes(&[12u8; 32]);
+            let authz = enabled_authz(&sk);
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = compio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+            let conn = compio::runtime::spawn(async move {
+                let _ = handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    7,
+                    authz,
+                )
+                .await;
+            });
+            let loop_h = compio::runtime::spawn(async move {
+                // Should never be reached for the protected GET.
+                while let Some(req) = req_rx.next().await {
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&GetResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        value: vec![],
+                    })));
+                }
+            });
+            let (mut rd, mut wr) = client.into_split();
+            let mut dec = FrameDecoder::new();
+            // No AUTH_HELLO → anonymous. GET on protected mem/ → denied.
+            let g = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/acme/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET, g).await;
+            assert!(f.is_error(), "anonymous protected GET must be denied");
+            let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+            drop(wr);
+            drop(rd);
+            let _ = conn.await;
+            let _ = loop_h.await;
+        });
+    }
+}
