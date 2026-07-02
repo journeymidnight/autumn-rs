@@ -120,26 +120,51 @@ so one member survives node loss. Clusterless sanity check (no docker/kubectl):
 `bash deploy/validate.sh`. Design + scaling + addressing + storage details:
 `docs/k8s_deploy.md`.
 
-### Mount autumn-fuse
+### Start the fuse daemon
 
 autumn-fuse is a **consumer** — a POSIX filesystem client that runs on the
 application node and talks to a *running* cluster's manager; it is not part of
-cluster deployment. `fuse_start.sh` is the bare-metal mount helper (it mounts,
-verifies the daemon actually came up, and clears a stale mount):
+cluster deployment. Start it directly:
 
 ```bash
-cargo build --release -p autumn-fuse
-./fuse_start.sh                                     # mount /mnt/dongmao-share against 127.0.0.1:9001
-# knobs: MANAGER=host:9001  TRANSPORT=tcp|ucx  MOUNTPOINT=/path  LOG_DIR=/path  BIN=./target/release
+cargo build --release -p autumn-fuse        # add --features ucx for a UCX cluster
+MP=/mnt/autumn
+mkdir -p "$MP"
 
-MP=/mnt/dongmao-share
-ls "$MP"; echo hi > "$MP"/x; cat "$MP"/x            # → hi
-fusermount3 -u "$MP"                                # unmount (needs `fuse3` package)
+# --transport MUST match the cluster's transport: the fuse daemon is a data-plane
+# client (process-global), so a tcp fuse cannot reach a ucx cluster.
+nohup ./target/release/autumn-fuse \
+    --manager 127.0.0.1:9001 \
+    --mountpoint "$MP" \
+    --transport tcp \
+    > /tmp/autumn-fuse.log 2>&1 &
+
+# Verify it actually mounted — a bad --manager / transport mismatch makes the
+# daemon exit within ~1 s, and without this check you'd think it succeeded.
+sleep 1
+mountpoint -q "$MP" && echo "mounted" || { echo "FAILED — see log:"; tail -20 /tmp/autumn-fuse.log; }
+
+ls "$MP"; echo hi > "$MP"/x; cat "$MP"/x      # → hi
+fusermount3 -u "$MP"                          # unmount (needs the `fuse3` package)
 ```
 
-Inside Kubernetes, mount by running autumn-fuse as a privileged per-node
-DaemonSet pointing at the `autumn-manager` Service — a consumer workload,
-deployed onto app nodes, separate from the storage StatefulSets.
+If a previous daemon died it can leave a stale mount (`ls` reports "Transport
+endpoint is not connected"); clear it before re-mounting with
+`fusermount3 -u "$MP"` (or `umount -l "$MP"`).
+
+**UCX (RDMA):** with `--transport ucx`, export the UCX env before launching (the
+UCX C library reads it directly): a positive `UCX_TLS` list — never `^` negation —
+and a pinned RoCE device, e.g.
+
+```bash
+export UCX_TLS=rc_mlx5,ud_mlx5,posix,cma,tcp,self
+export UCX_NET_DEVICES=mlx5_1:1               # verify: scripts/check_roce.sh --listen-candidates
+ulimit -l unlimited                           # ibv_reg_mr pins registered buffers
+```
+
+**In Kubernetes**, run autumn-fuse as a privileged per-node DaemonSet (mounts
+`/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
+nodes, separate from the storage StatefulSets.
 
 ## Binaries
 
