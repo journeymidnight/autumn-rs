@@ -1,5 +1,5 @@
 Date: 2026-07-01
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: 全库可读性 review(/loop 任务)——逐 crate 审查并**简化代码逻辑本身**
   (用户明确:不是加注释,是让逻辑更直白;不用 coco),直到 17 个 chunk 全覆盖。
   账本 = docs/readability_review_ledger.md(chunk 表 + findings log)。
@@ -101,10 +101,23 @@ Main gaps / risks:
     TCP 路径有测试覆盖。若跑真集群 chaos/perf 出现 ZC 读异常,先查 f833d1d。
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
+  · Chunk 17 python done,commit 553fc34:kvcache 删 2 个零引用死函数
+    (run_sharded_on_loops/tenant_prefix)+ 死字段 _zc;batch_get_v1/set_v1
+    13 行同形收敛为 _batch_v1;py_compile 全绿。adapters/memory/mcp/ops 脚本
+    agent 审定干净。记录未改的行为怪癖(sglang transport 回退不重置、
+    dashboard --no-detail 空转)→ ledger findings log。
+
+**任务完成(2026-07-02)**:17/17 chunk 全覆盖。产出=14 个 refactor/docs commit
+(f833d1d..553fc34),全部 pushed main。每步全量测试绿(rpc 43×2feature、
+transport 8 套件含真 UCX/RoCE、stream 15 套件、PS 182、manager 169+etcd 真集群
+system 测试、client 27、fuse 44、memory 20、python py_compile)。workspace
+0 警告;各 crate 自身 clippy 清(PS 4 个既有保守 lint 已记账)。
+延后项全部记录在 docs/readability_review_ledger.md findings log(含理由与
+精确坐标):wire-fingerprint 文件三项、extent_node append 协议双拷贝(需
+chaos 验证专门会话)、manager 测试 32 文件前导整合、跨二进制 CLI 共享形等。
+
 Next steps:
-  1. Chunk 17 python(5.8k:binding + autumn_memory + mcp/langgraph/hermes
-     adapters + kvcache)——最后一块。
-  2. 完成后:总结 + 停 loop(PushNotification 通知)。
+  (无 —— 本任务闭环。后续可选:ledger findings log 里的专门会话项。)
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
   3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +

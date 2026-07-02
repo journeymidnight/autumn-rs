@@ -35,11 +35,25 @@ Rules per chunk:
 | 14 | crates/fuse | 4731 | done | ded2d65 (dead sync_task.rs module deleted, needs_reload wired into Open arm, 4 dead fns, PREFIX_EXTENT rename, apply_time ×2) |
 | 15 | crates/autumn-memory | 2334 | done | ded2d65 (clean per agent; 1 clippy if-let) |
 | 16 | examples/gallery | 1837 | done | reviewed (agent): only D3 base_meta_fields ×2 — example-code, logged as optional |
-| 17 | python/ (bindings + memory + adapters) | 5762 | todo | |
+| 17 | python/ (bindings + memory + adapters) | 5762 | done | 553fc34 (2 dead fns + dead _zc field + batch v1 dedup; adapters/memory/mcp/ops scripts agent-verified clean) |
 
 Status values: todo | in_progress | done
 
+**ALL 17 CHUNKS DONE (2026-07-02).** Remaining work lives only in the findings
+log below: deferred items with documented reasons (wire-fingerprint files,
+extent_node append-protocol dedup needing chaos validation, the 32-file test
+prologue consolidation, cross-binary CLI shapes, and assorted logged-optional
+items).
+
 ## Findings log (cross-chunk issues found while reviewing)
+- python logged-not-changed: sglang_backend transport-fallback asymmetry
+  (failed set_transport('ucx') leaves transport=='ucx' → default_cap 16 on
+  TCP fallback; vllm_connector resets — behavior quirk, decide + fix
+  deliberately); autumn_dashboard_web --no-detail flag is a no-op
+  (with_detail stored, never read); node_policy._op duplicates
+  autumn_dashboard.make_op (~26 lines — import instead); render_dashboard
+  3-section split; setup dup between vllm_connector/sglang_backend (diffs
+  are load-bearing, low value).
 - DEDICATED-SESSION item (mechanical, zero prod risk, big win): manager test
   suite consolidation. (A) the ~20-line single-partition 2-node cluster
   prologue is copy-pasted across 32 test files — `setup_two_node_infra` was
