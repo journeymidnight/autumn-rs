@@ -2,8 +2,8 @@
 //!
 //! `autumn-op` is the canonical operator interface. It speaks rkyv over
 //! the manager RPC framing and prints either human-readable or
-//! `--json` output (the Python policy script in `python/node_policy.py`
-//! consumes the JSON form).
+//! `--json` output (the Python ops tooling in `python/` consumes the
+//! JSON form).
 //!
 //! Two command families:
 //!   * F211 node-lifecycle: list-nodes / extent-health / list-ec-markers

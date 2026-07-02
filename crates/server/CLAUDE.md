@@ -106,7 +106,7 @@ admin/mutation families). `cmd_format` also takes `manager` + `transport`
 body is its original arm verbatim, only `args.json`->`json`); a follow-up may
 move the `cmd_*` set into a `commands.rs` submodule.
 
-F211-G + F213 admin / observability CLI. The canonical interface to the manager control plane. The Python policy script (`python/node_policy.py`) shells out to this binary for all RPC traffic — autumn-op is its rkyv codec.
+F211-G + F213 admin / observability CLI. The canonical interface to the manager control plane. The Python ops tooling (e.g. `python/dashboard/`) shells out to this binary for all RPC traffic — autumn-op is its rkyv codec.
 
 ```
 autumn-op [--manager 127.0.0.1:9001] [--json] <COMMAND>

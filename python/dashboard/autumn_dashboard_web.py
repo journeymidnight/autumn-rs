@@ -2,7 +2,7 @@
 """autumn-rs web dashboard.
 
 A browser UI over the same `autumn-op --json` control plane that
-`autumn_dashboard.py` (console) and `node_policy.py` use. Renders the
+`autumn_dashboard.py` (console) uses. Renders the
 cluster as a PS -> Partition -> Extents hierarchy and (in "danger" mode)
 lets an operator actuate policy ops (split / merge / gc / compact / flush /
 force-ec-convert) per target, apply individual advisories, or run the
@@ -23,7 +23,7 @@ Design notes:
     validates args are integers (never trust the client for a mutation).
 
 Usage:
-    python3 python/autumn_dashboard_web.py [--manager H:P] [--bin PATH]
+    python3 python/dashboard/autumn_dashboard_web.py [--manager H:P] [--bin PATH]
                                            [--host 127.0.0.1] [--port 8799]
 
 Then open http://127.0.0.1:8799 .

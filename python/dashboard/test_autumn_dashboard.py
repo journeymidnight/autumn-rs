@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for autumn_dashboard.py pure logic (no live cluster needed).
 
-Run: python3 -m pytest python/test_autumn_dashboard.py   (or: python3 python/test_autumn_dashboard.py)
+Run: python3 -m pytest python/dashboard/test_autumn_dashboard.py   (or: python3 python/dashboard/test_autumn_dashboard.py)
 """
 import time
 

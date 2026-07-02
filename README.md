@@ -122,7 +122,7 @@ fusermount3 -u /mnt/autumn   # unmount (needs `fuse3` package)
 | `autumn-fuse` | — | FUSE mount of the KV namespace |
 
 `autumn-client --help` / `autumn-op --help` lists subcommands. The wire schema for autumn-op
-is stable; the Python policy controller in `python/node_policy.py` shells out to it.
+is stable; the Python ops tooling (e.g. `python/dashboard/`) shells out to it.
 
 ### Cluster capacity — `autumn-op df`
 

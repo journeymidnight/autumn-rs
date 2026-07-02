@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """autumn_dashboard.py — cluster dashboard + auto-policy controller for autumn-rs.
 
-Like `node_policy.py`, this shells out to the `autumn-op --json` Rust binary
+This shells out to the `autumn-op --json` Rust binary
 rather than re-implementing the rkyv wire codec in Python — the wire schema
 stays in exactly one place (`crates/rpc/src/manager_rpc.rs`) and upgrades are
 "bump the binary". Two modes:

@@ -1,7 +1,7 @@
 # autumn-rs cluster dashboard + auto-policy controller
 
-`python/autumn_dashboard.py` — a live cluster dashboard and an external
-auto-policy controller. Like `node_policy.py`, it **shells out to the
+`python/dashboard/autumn_dashboard.py` — a live cluster dashboard and an external
+auto-policy controller. It **shells out to the
 `autumn-op --json` Rust binary** instead of re-implementing the rkyv wire codec
 in Python, so the wire schema lives in exactly one place
 (`crates/rpc/src/manager_rpc.rs`) and upgrades are just "rebuild the binary".
@@ -14,13 +14,13 @@ running manager (`--manager HOST:PORT`, or `AUTUMN_MANAGER`, default
 
 ```bash
 # live, auto-refreshing every 2s (Ctrl-C to exit)
-python3 python/autumn_dashboard.py dashboard
+python3 python/dashboard/autumn_dashboard.py dashboard
 
 # one-shot snapshot (good for logs / cron / piping)
-python3 python/autumn_dashboard.py --manager host:9001 dashboard --once
+python3 python/dashboard/autumn_dashboard.py --manager host:9001 dashboard --once
 
 # skip the per-partition detail RPCs (topology + capacity only) on huge clusters
-python3 python/autumn_dashboard.py dashboard --no-detail
+python3 python/dashboard/autumn_dashboard.py dashboard --no-detail
 ```
 
 Shows, per refresh:
@@ -68,16 +68,16 @@ split/merge/ec. This controller is the external policy loop that *decides* and
 
 ```bash
 # DRY-RUN by default — prints what it WOULD do, touches nothing
-python3 python/autumn_dashboard.py control
+python3 python/dashboard/autumn_dashboard.py control
 
 # actually actuate, every 30s, EC + maintenance only (conservative)
-python3 python/autumn_dashboard.py control --apply --enable ec,gc,major,minor
+python3 python/dashboard/autumn_dashboard.py control --apply --enable ec,gc,major,minor
 
 # full auto: split/merge/ec/gc/compact, 2 actions/tick, 5-min per-target cooldown
-python3 python/autumn_dashboard.py control --apply --interval 30 --max-actions 2 --cooldown 300
+python3 python/dashboard/autumn_dashboard.py control --apply --interval 30 --max-actions 2 --cooldown 300
 
 # one cycle then exit (cron / k8s CronJob)
-python3 python/autumn_dashboard.py control --apply --once
+python3 python/dashboard/autumn_dashboard.py control --apply --once
 ```
 
 Each tick it polls `policy-candidates` and, for the enabled kinds, actuates:
@@ -110,13 +110,13 @@ Safety:
 
 ## Tests
 
-`python/test_autumn_dashboard.py` unit-tests all the pure logic (candidate →
+`python/dashboard/test_autumn_dashboard.py` unit-tests all the pure logic (candidate →
 command mapping incl. EC's extent-in-`secondary`, decide priority/cooldown/cap,
 dry-run vs apply, refusal handling, gather + render) against a fully mocked
 `autumn-op`, so no live cluster is needed:
 
 ```bash
-python3 python/test_autumn_dashboard.py        # 14 tests, stdlib-only runner
+python3 python/dashboard/test_autumn_dashboard.py        # 14 tests, stdlib-only runner
 # or, if pytest is available:
-python3 -m pytest python/test_autumn_dashboard.py
+python3 -m pytest python/dashboard/test_autumn_dashboard.py
 ```
