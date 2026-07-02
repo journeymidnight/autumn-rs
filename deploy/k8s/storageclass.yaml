@@ -1,0 +1,29 @@
+# Local-disk StorageClass for extent nodes.
+#
+# autumn provides its OWN durability (RF=3 + EC across nodes), so EN data belongs
+# on LOCAL disk (local NVMe), NOT a self-replicating network volume: a network PV
+# would double-replicate (autumn 3× × EBS/Ceph 3×) and add a network hop under
+# the storage system. Consequence — an EN pod is PINNED to the node whose local
+# volume it holds (WaitForFirstConsumer binds the volume on the node the pod
+# lands on, after anti-affinity has placed it). If that node is permanently lost
+# the EN's local data goes with it, but autumn's RF=3 keeps the data available on
+# the other ENs and the manager re-replicates. That is the intended failure model
+# (same as the bare-metal /data* NVMe layout).
+#
+# Backend here: rancher.io/local-path (dynamic hostPath provisioner) — it ships
+# pre-installed on kind/minikube; on other clusters install it once:
+#   kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
+# For dedicated production NVMe, prefer STATIC local volumes instead — set
+#   provisioner: kubernetes.io/no-provisioner
+# and pre-create one PV per node/disk with nodeAffinity (example in
+# docs/k8s_deploy.md). reclaimPolicy: Retain so a deleted PVC never auto-wipes
+# extent data.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: autumn-en-local
+  labels:
+    app.kubernetes.io/name: autumn
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain

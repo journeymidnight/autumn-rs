@@ -86,6 +86,14 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
+        # etcd is the opposite of the EN: NETWORK durable storage on purpose.
+        # storageClassName omitted → the cluster's DEFAULT class, which on a
+        # cloud is network block storage (EBS / PD / Azure Disk). That lets a
+        # SINGLE etcd member survive node loss cheaply: if the node dies the pod
+        # reschedules (same AZ) and the volume re-attaches, no 3-member quorum
+        # needed. Metadata is small, so 1Gi + one member is the resource-saving
+        # choice. For control-plane HA instead, use 3 replicas (each still on its
+        # own network volume) and the multi-member --initial-cluster.
         resources:
           requests:
             storage: 1Gi

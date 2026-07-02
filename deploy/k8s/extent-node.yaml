@@ -153,6 +153,10 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
+        # Local disk — autumn replicates across ENs itself (RF=3), so extent data
+        # must NOT sit on a self-replicating network volume. See storageclass.yaml
+        # for the pin-to-node / RF=3-handles-node-loss model.
+        storageClassName: autumn-en-local
         resources:
           requests:
             storage: 20Gi     # tune to your dataset; extents land here

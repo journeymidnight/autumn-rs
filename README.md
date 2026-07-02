@@ -113,9 +113,12 @@ kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=3
 kubectl -n autumn get pods        # etcd / manager / en-0..2 / ps-0 Running+Ready
 ```
 
-Clusterless sanity check (no docker/kubectl needed): `bash deploy/validate.sh`.
-Design + scaling + addressing constraints (stable per-EN ClusterIPs, leader-gated
-manager Service, in-cluster clients only in v1): `docs/k8s_deploy.md`.
+Storage: ENs use **local disk** (`autumn-en-local` StorageClass; autumn does its
+own RF=3, so a self-replicating network volume would double-replicate — pod pins
+to node, RF=3 handles node loss); etcd uses the **default network class** (EBS/PD)
+so one member survives node loss. Clusterless sanity check (no docker/kubectl):
+`bash deploy/validate.sh`. Design + scaling + addressing + storage details:
+`docs/k8s_deploy.md`.
 
 ### Mount autumn-fuse
 

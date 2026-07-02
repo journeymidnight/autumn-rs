@@ -9,6 +9,7 @@ kind: Kustomization
 
 resources:
   - namespace.yaml
+  - storageclass.yaml
   - configmap.yaml
   - etcd.yaml
   - manager.yaml

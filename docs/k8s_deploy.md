@@ -45,15 +45,65 @@ Two constraints work in our favor:
 | Manifest | Kind(s) | Notes |
 |---|---|---|
 | `namespace.yaml` | Namespace `autumn` | |
+| `storageclass.yaml` | StorageClass `autumn-en-local` | local disk for ENs (see Storage) |
 | `configmap.yaml` | ConfigMap | shared env; `AUTUMN_EXPECT_NODES` MUST equal EN replicas |
-| `etcd.yaml` | StatefulSet + headless Service | 1 member default; PVC 1Gi |
+| `etcd.yaml` | StatefulSet + headless Service | 1 member; PVC 1Gi on default (network) class |
 | `manager.yaml` | StatefulSet + ClusterIP + headless Services | leader-gated readiness |
-| `extent-node.yaml` | StatefulSet + headless + N per-pod ClusterIP Services | PVC 20Gi/pod |
-| `partition-server.yaml` | StatefulSet + headless Service | advertises pod IP |
+| `extent-node.yaml` | StatefulSet + headless + N per-pod ClusterIP Services | PVC 20Gi/pod on local disk |
+| `partition-server.yaml` | StatefulSet + headless Service | advertises pod IP; no PVC |
 | `bootstrap-job.yaml` | Job | guarded, run-once |
 
 Apply order does not matter — each role's entrypoint waits for the manager
 leader (and the bootstrap Job also waits for `AUTUMN_EXPECT_NODES` ENs Online).
+
+## Storage
+
+The two stateful roles have opposite storage needs, so they use opposite classes.
+
+**Extent nodes → LOCAL disk** (`storageClassName: autumn-en-local`, see
+`storageclass.yaml`). autumn already replicates across ENs itself (RF=3 + EC), so
+extent data must not sit on a *self-replicating* network volume — that would
+double-replicate (autumn 3× × EBS/Ceph 3× = 9×) and add a network hop under the
+storage system. `volumeBindingMode: WaitForFirstConsumer` binds the local volume
+on the node the pod lands on, which **pins the EN pod to that node**. If the node
+is permanently lost the EN's local copy goes with it, but RF=3 keeps the data on
+the other ENs and the manager re-replicates — the same failure model as the
+bare-metal `/data*` NVMe layout. `reclaimPolicy: Retain` so a deleted PVC never
+auto-wipes extents.
+
+The shipped class uses the `rancher.io/local-path` dynamic provisioner
+(pre-installed on kind/minikube). For **dedicated production NVMe**, use static
+`local` volumes instead — one PV per node/disk, pinned by nodeAffinity:
+
+```yaml
+# storageclass.yaml → change the provisioner:
+#   provisioner: kubernetes.io/no-provisioner
+# then pre-create one PV per EN disk:
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: autumn-en-node1-nvme0 }
+spec:
+  capacity: { storage: 3Ti }
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: autumn-en-local
+  local: { path: /mnt/nvme0/autumn }          # the disk mount on that node
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: ["node1"] }
+```
+
+**etcd → NETWORK durable storage** (the cluster default class — EBS / PD / Azure
+Disk on a cloud; `storageClassName` deliberately omitted). This lets a **single**
+etcd member survive node loss cheaply: if the node dies the pod reschedules
+(same AZ) and the network volume re-attaches — no 3-member quorum needed. etcd
+metadata is small (1Gi), so one member on a network volume is the resource-saving
+choice. For control-plane HA instead, run 3 replicas (each on its own network
+volume) with the multi-member `--initial-cluster`.
+
+The PS uses no PVC — its local state (WAL) is recoverable from the streams on
+restart, so the pod's ephemeral filesystem is fine.
 
 ## Build the image
 

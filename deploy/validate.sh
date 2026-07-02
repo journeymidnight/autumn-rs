@@ -52,16 +52,21 @@ def bad(m):
 def ok(m):
     print(f"  OK  {m}")
 
-# index services + workloads
+# index services + workloads + storageclasses
 services = {}       # name -> doc
 workloads = []      # (kind, doc)
+storageclasses = set()
+CLUSTER_SCOPED = ("Namespace", "StorageClass", "ClusterRole", "ClusterRoleBinding")
 for f, d in docs:
     kind = d.get("kind"); name = (d.get("metadata") or {}).get("name")
     if not d.get("apiVersion") or not kind:
         bad(f"{f}: missing apiVersion/kind"); continue
     if kind != "Namespace" and not name:
         bad(f"{f}: missing metadata.name")
-    if kind == "Namespace":
+    if kind == "StorageClass":
+        storageclasses.add(name)
+    # Cluster-scoped kinds have no namespace — skip the namespace check.
+    if kind in CLUSTER_SCOPED:
         continue
     ns = (d.get("metadata") or {}).get("namespace")
     if ns != "autumn":
@@ -70,6 +75,20 @@ for f, d in docs:
         services[name] = d
     if kind in ("StatefulSet", "Job", "Deployment"):
         workloads.append((kind, d))
+
+# volumeClaimTemplate storageClassName (when set) must resolve to a StorageClass
+# shipped in the base (an omitted class = cluster default, which is allowed).
+for kind, d in workloads:
+    if kind != "StatefulSet":
+        continue
+    for vct in (d["spec"].get("volumeClaimTemplates") or []):
+        scn = (vct.get("spec") or {}).get("storageClassName")
+        if scn is None:
+            ok(f"{d['metadata']['name']}: PVC uses the cluster default StorageClass")
+        elif scn in storageclasses:
+            ok(f"{d['metadata']['name']}: PVC storageClassName '{scn}' is defined")
+        else:
+            bad(f"{d['metadata']['name']}: PVC storageClassName '{scn}' not defined in the base")
 
 # selector.matchLabels subset of template labels (k8s rejects otherwise)
 for kind, d in workloads:
