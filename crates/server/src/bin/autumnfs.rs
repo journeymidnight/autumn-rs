@@ -222,7 +222,7 @@ fn now_ts() -> (i64, u32) {
 fn new_file_meta() -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: (libc::S_IFREG | 0o644),
+        mode: ((libc::S_IFREG as u32) | 0o644),
         uid: 0,
         gid: 0,
         size: 0,
@@ -241,7 +241,7 @@ fn new_file_meta() -> InodeMeta {
 fn new_dir_meta() -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: (libc::S_IFDIR | 0o755),
+        mode: ((libc::S_IFDIR as u32) | 0o755),
         uid: 0,
         gid: 0,
         size: 0,
@@ -352,9 +352,9 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
 }
 
 fn print_long_entry(name: &str, m: &InodeMeta) {
-    let kind = if m.mode & libc::S_IFMT == libc::S_IFDIR {
+    let kind = if m.mode & (libc::S_IFMT as u32) == (libc::S_IFDIR as u32) {
         'd'
-    } else if m.mode & libc::S_IFMT == libc::S_IFLNK {
+    } else if m.mode & (libc::S_IFMT as u32) == (libc::S_IFLNK as u32) {
         'l'
     } else {
         '-'
@@ -367,11 +367,11 @@ fn print_long_entry(name: &str, m: &InodeMeta) {
 }
 
 fn is_dir(m: &InodeMeta) -> bool {
-    m.mode & libc::S_IFMT == libc::S_IFDIR
+    m.mode & (libc::S_IFMT as u32) == (libc::S_IFDIR as u32)
 }
 
 fn is_reg(m: &InodeMeta) -> bool {
-    m.mode & libc::S_IFMT == libc::S_IFREG
+    m.mode & (libc::S_IFMT as u32) == (libc::S_IFREG as u32)
 }
 
 // ─── stat ───────────────────────────────────────────────────────────────────
