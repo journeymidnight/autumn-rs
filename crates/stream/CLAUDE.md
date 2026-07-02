@@ -301,7 +301,7 @@ The `StreamClient` computes `commit = min(commit_length on all replicas)` before
 **F227: all-replica, no quorum.** This is a WAS stream layer: the append path is all-replica-ACK (`apply_completion` acks only when every replica wrote), so the committed length must be derived from ALL replicas, not a quorum subset. A subset `min` can sit BELOW the acked length (include a short / catching-up replica → the next append's `header.commit` truncates acked data on the up-to-date replicas → silent loss) or ABOVE it (exclude a member → keep un-acked data). The majority-quorum was the bug, not the fix. F227 changes:
 - `current_commit` requires ALL replicas to respond (else `Err`); `ensure_tail_initialised` propagates that `Err` instead of the old `unwrap_or(0)` — seeding cursor 0 made the next append's `header.commit=0` truncate EVERY replica to 0 (catastrophic). `Ok(0)` (genuinely empty extent) still seeds nothing.
 - `await_extent_synced_to` (flush barrier) requires ALL replicas synced past `vp_offset` (was `⌊N/2⌋+1` of `last_synced`); on a healthy cluster this is already satisfied because the append acked all-replicas.
-- Manager-side seal/commit (`handle_stream_alloc_extent` / `handle_check_commit_length`) take `min` over the REACHABLE COMMITTED members only (catching-up = in-flight Recovery, excluded), requiring only `floor` of them to respond — **lenient seal-over-reachable, NOT strict-all-committed** (an EN can be down at seal time; the all-replica APPEND is the guarantee, not a strict seal). Do NOT revert to strict. See `crates/manager/CLAUDE.md` note 28 + the "F227 — the seal must be lenient" section in the top-level `README.md`.
+- Manager-side seal/commit (`handle_stream_alloc_extent` / `handle_check_commit_length`) take `min` over the REACHABLE COMMITTED members only (catching-up = in-flight Recovery, excluded), requiring only `floor` of them to respond — **lenient seal-over-reachable, NOT strict-all-committed** (an EN can be down at seal time; the all-replica APPEND is the guarantee, not a strict seal). Do NOT revert to strict. See `crates/manager/CLAUDE.md` note 28 + the F227 seal-lenient note in `docs/ops.md` (WAL self-heal section).
 
 F156's stated worry ("commit at a position only one replica holds") was really a durability concern (operating at RF=1), conflated with commit-length correctness; under all-replica-ACK the committed prefix is on every replica, so `min` over the reachable committed members is always ≥ acked. Liveness when a node is down is handled by the manager seal + operator fence → recovery (reconfigure the dead member out), not by lowering a quorum threshold. **Truncation of beyond-commit bytes stays correct — those are un-acked and must be removed; do not add a floor that keeps them.**
 
@@ -1434,9 +1434,10 @@ sufficient (and cheaper than DashMap).
       deliberate: a synchronous first-refresh would put a manager RTT on the
       read's critical path, and idle background polling is the per-partition
       manager traffic we avoid. It never regresses the pre-F276 reactive
-      failover — so the README acceptance is "after a couple seconds of read
-      traffic", not "every single read incl. the first" (coco verify-pass P2,
-      resolved as a doc-accuracy fix, design kept).
+      failover — so the documented acceptance (docs/ops.md, Read route-around)
+      is "after a couple seconds of read traffic", not "every single read incl.
+      the first" (coco verify-pass P2, resolved as a doc-accuracy fix, design
+      kept).
     - **Soft hint, correctness-independent.** A stale / over-broad snapshot only
       costs a little extra latency or parity traffic, never data: replicated
       reads still fall back to suspected replicas; EC reconstruction falls back

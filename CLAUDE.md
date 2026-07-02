@@ -32,9 +32,9 @@
     - 定义 feature（目标/边界/验收）
     - 开发实现
     - 执行测试验证
-    - 更新 `autumn-rs/README.md`（手动测试或使用说明）
+    - 更新 `docs/ops.md`（手动测试/运维步骤）；若用户可见的用法变化，同步更新 `README.md`
     - 提交 git commit，作为该 feature 的完成点
-11. `autumn-rs/README.md` 必须持续维护，确保人工手动验证步骤始终可执行。
+11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不再堆放验证步骤（2026-07-02 重写）。
 12. 每个feature和BUG都用coco 做review, 但是coco有时候会提出纯理论过于窄或者trick的情况，
 
 
@@ -236,7 +236,7 @@ Split is **Copy-on-Write** at the stream level:
 |--------|-------------|---------|
 | `autumn-manager-server` | 9001 | Control plane: stream + partition management |
 | `autumn-extent-node` | 9101 | Data plane: raw extent storage on local disk |
-| `autumn-ps` | 9201 | Partition server: KV API |
+| `autumn-ps` | 9201 (binary default; deployments use 9301 — cluster.sh/autumn-deploy/k8s) | Partition server: KV API |
 | `autumn-client` | — | Admin CLI (bootstrap, put, get, del, head, ls, split, set-stream-ec, info) |
 | `autumn-stream-cli` | — | Low-level stream layer CLI (create-stream, append, read) |
 

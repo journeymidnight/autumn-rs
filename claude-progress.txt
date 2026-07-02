@@ -1,58 +1,35 @@
 Date: 2026-07-02
 TaskStatus: completed
-Task scope: 部署方案 — 除 cluster.sh/start.sh/stop.sh 临时单机方式外,新增两套正式部署:
-  (1) F-BM-1 物理机部署(单机+多机),替代 start.sh/stop.sh;形态经用户确认 =
-      topology 配置 + bash 部署器(autumn-deploy) + systemd(双后端,macOS 走 process)。
-  (2) F-K8S-1 Kubernetes 部署(Dockerfile + kustomize manifests)。
-  cluster.sh 保留但重定位为 dev/chaos/perf 测试 harness(chaos 需要裸进程 kill 语义)。
+Task scope: README.md 全部重写为用户导向(项目介绍/重要特性/用法,吸引人来用),
+  卖点定调 = **AI 架构存储 all-in-one**(从存储数据模型到 kvcache 到 agent memory
+  一套引擎全覆盖);移出的运维/验证内容进新的 docs/ops.md;CLAUDE.md 规则 11 改为
+  指向 docs/ops.md。(用户指示 2026-07-02;英文 README。)
 
 Current summary:
-  已完成实现 + 本地验证,待 coco review 收尾后提交:
-  · F-BM-1 bare-metal(deploy/baremetal/):
-    - topology.conf(多机例子)+ topology-singlehost.conf(单机,替代 start.sh)。
-    - autumn-deploy: 声明式拓扑 → check/deploy/start/stop/restart/status/destroy。
-      双服务后端(auto): Linux+systemd+root → 渲染 systemd unit(Restart=on-failure/
-      LimitMEMLOCK=infinity/TimeoutStopSec=70);否则 process 后端(nohup+pidfile,
-      = cluster.sh 进程语义,macOS/容器/非 root)。bring-up 顺序 + 守卫移植 cluster.sh:
-      等 etcd 端口 → 等 manager leader → 幂等 format → 等 N EN Online →
-      streams-guarded bootstrap → PS + wait_ps_ready(路由就绪)。
-    - **本地端到端验证通过(process 后端,隔离高端口+独立 etcd 12379,不碰 live 集群)**:
-      check/start(有序拉起)/put-get 回环/幂等 restart(bootstrap 跳过+数据存活)/
-      restart ps/destroy --wipe 全绿;live d02 集群未受影响。
-    - systemd unit 渲染经 `systemd-analyze verify` 通过(修了 %q 逗号转义 bug)。
-    - 修复的真实 bug: ①单 member etcd 缺 peer flags → 默认 2380 撞机(改统一完整形式
-      + ETCD_CLIENT/PEER_BASE_PORT 可配,支持同机多集群);②process 后端 $! 抓子 shell
-      非二进制 PID(cd 前台+nohup 单独后台);③bootstrap 守卫 grep '"stream_id"' 需
-      `info --full`(默认 info 无 streams 数组);④bash>=4 守卫(macOS 3.2)。
-  · F-K8S-1(deploy/docker/ + deploy/k8s/):
-    - Dockerfile(多阶段,rust:1.93 构建 -p autumn-server → debian-slim,5 二进制)+
-      entrypoint.sh(manager|extent-node|ps|bootstrap 角色分发 + DNS→IP 解析(getent,
-      因二进制只收 IP 字面量)+ env→flag + bootstrap 守卫 info --full)。.dockerignore。
-    - kustomize base: namespace/configmap/etcd(STS)/manager(STS+ClusterIP 发现 Service
-      leader-gated readiness 只路由 leader + headless 治理 Service)/extent-node(STS +
-      每 pod 稳定 ClusterIP Service 暴露 9101+10101,因 EN 身份=advertise 地址不重注册)/
-      partition-server(STS,advertise pod IP,因 PS 每次开分区重注册)/bootstrap Job(守卫)。
-    - deploy/validate.sh: 无集群交叉校验(YAML + selector⊆template + serviceName headless +
-      每 pod EN Service 覆盖 + 端口 + kustomization 引用 + 角色 arg 对齐 entrypoint)。**VALIDATION OK**。
-    - 修复: manager STS serviceName 必须 headless(拆 ClusterIP 发现 + headless 治理两 Service)。
-  · 清理: 删 start.sh/stop.sh(git rm);cluster.sh 头注 + README + CLAUDE.md 标注其
-    测试 harness 定位;fuse_start.sh 注释更新;README 新增 Deployment 章节(表格 + 单机
-    Quick Start + Kubernetes 子节);docs/baremetal_deploy.md + docs/k8s_deploy.md。
-  · feature_list.md 加 F-K8S-1 + F-BM-1(passes:false,待验证收尾改 true)。
-
-  · coco findbugs(GPT-5.5)9 项全 triage + 修复 + 重跑 e2e 绿(见 feature_list F-BM-1/F-K8S-1)。
-    关键:P1 process 后端重复 start 孤儿(refuse-if-running 守卫)、P1 半 bootstrap 误判
-    (streams+partition 双检 + WARN,不改跳过决策以免重复 stream)、P2 zombie 卡 70s +
-    PID 复用误杀(移植 cluster.sh zombie 感知 + ps args cmdline 守卫)、P2 systemd
-    WorkingDirectory 缺失、P2 多核 cpuset 拒绝、P3 metrics 端口/latest 文档/README cwd。
+  · README.md 792 行 → 164 行,全新英文重写:AI all-in-one hook + 三接口分层
+    ASCII 图(fuse 文件/kvcache 推理缓存/agent memory 都压在同一 partition+stream
+    数据面上)+ Highlights(AI 面 3 条 + 引擎面 6 条,带实测数字:UCX 跨主机 8M 读
+    ~4.6× TCP、recall P99 ≈25ms)+ Quick start(autumn-deploy 单机)+ Using it
+    (KV/FUSE/kvcache/memory 各一个最小示例,MCP 一行启动)+ Deployment 表 +
+    Documentation map + License(Apache-2.0,与 LICENSE 核对过)。
+  · 新建 docs/ops.md(650 行,14 章 + TOC):README-only 内容原样迁移 —— fuse
+    runbook、autumn-op df、Prometheus /metrics、ENOSPC、WAL self-heal(含 F227
+    seal-lenient 锚点)、F276 读绕行、autumn-memory 验证 harness、authz setup、
+    CLI cheatsheet、chaos 目录、rolling restart + R1、测试矩阵、inode-lease。
+    内容守恒抽查 10/10 关键块保留;唯一删除 = audit_extent_refs.py/
+    patch_extent_refs.py 块(两脚本已不存在于仓库,坏引用;refs 审计现由
+    chaos STORAGE-ACCOUNTING 不变量覆盖,ops.md 有注)。
+  · CLAUDE.md:规则 11 改为「docs/ops.md 必须持续维护手动验证步骤;README 保持
+    用户导向(卖点=AI all-in-one)」;规则 10 第 4 步同步;Binary 表 autumn-ps
+    端口注明 9201=二进制默认/9301=部署约定(消除 README/部署文档矛盾)。
+  · 修 5 处指向已删 README 章节的陈旧引用:stream CLAUDE.md:304(F227 seal-
+    lenient → ops.md)、:1437(README acceptance → ops.md)、manager
+    CLAUDE.md:691(OP-driven → python/dashboard/DASHBOARD.md)、:1327、:1378。
+  · 验证:README+ops.md 引用的所有仓库路径逐一存在;无 stale README 章节引用;
+    deploy/validate.sh 仍绿;ops.md 14 章节覆盖迁移表全部行。
 
 Main gaps / risks:
-  · systemd 后端 + 多机 SSH 路径未在真机跑(本沙箱无 systemd PID1);unit 渲染经
-    systemd-analyze verify 通过,真机步骤写入 docs/baremetal_deploy.md 手动验证。
-  · k8s 无 docker/kubectl 工具链;manifest 走 deploy/validate.sh(VALIDATION OK)+
-    docs/k8s_deploy.md 的 kind 手动验证路径。
-  · 已知限制(文档记录):bootstrap 非幂等(半失败窗口极小,与 cluster.sh 同,真修=
-    二进制内幂等 bootstrap,未来工作);多机 etcd 的 manager 端点单 IP 解析(默认单 member)。
+  (无。纯文档重组,未动代码;历史内容在 git + docs/ops.md 双重保留。)
 
 Next steps:
-  (无 —— 本任务闭环;已 commit + push main。)
+  (无 —— 本任务闭环;commit + push main。)

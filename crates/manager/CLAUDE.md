@@ -688,8 +688,8 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `MSG_GET_PARTITION_DETAIL` RPCs are the external-policy
       surface.
 
-    See `README.md` for the OP-driven workflow + cron + bash MVP
-    controller example.
+    See `python/dashboard/DASHBOARD.md` for the OP-driven workflow +
+    cron + controller usage.
 
     **Stage 1 only** — advisory is purely informational. `last_op_at`
     and `auto_dispatch_*` paths are NOT touched (those would be Stage
@@ -1323,8 +1323,8 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     never drops acked data — no matter which members are down at seal time.
 
     **The seal MUST stay lenient — do NOT revert it to strict
-    (user decision 2026-05-29; see the "F227 — the seal must be lenient"
-    section in the top-level `README.md`).** You
+    (user decision 2026-05-29; see the F227 seal-lenient note in
+    `docs/ops.md`, WAL self-heal section).** You
     seal precisely BECAUSE a node went down; requiring every committed
     member to respond would block the seal forever (that was bug #3's
     seal-wedge). The pre-F227 majority-quorum + min-over-responders was a
@@ -1375,7 +1375,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `rpc_handlers::f227_commit_seal_tests`. Cross-ref: notes 21 (F207
     ledger = the catching-up signal), 23/24 (F211/F214 fence → recovery
     lifecycle that reconfigures dead members out);
-    top-level `README.md` "F227 — the seal must be lenient" section.
+    the F227 seal-lenient note in `docs/ops.md` (WAL self-heal section).
 
 29. **F228 background-loop resilience — bound every await (1A) + supervise
     every loop (1C).** The node_health_loop production freeze (note 25 / the
