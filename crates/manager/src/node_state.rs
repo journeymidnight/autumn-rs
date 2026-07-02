@@ -13,8 +13,7 @@
 //! reads to bump owner-lock revisions, and F211-E reads to gate recovery.
 //!
 //! This is the "manager provides facts, operator policy script decides"
-//! split — see `docs/superpowers/plans/2026-05-17-f211-operator-driven-node-lifecycle.md`
-//! for the design rationale and the HDFS decommission analogue.
+//! split (F211 design; HDFS decommission analogue).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

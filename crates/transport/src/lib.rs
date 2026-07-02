@@ -1,6 +1,4 @@
-//! autumn-transport — pluggable transport for autumn-rs (TCP today, UCX optional).
-//!
-//! See `docs/superpowers/specs/2026-04-23-ucx-transport-design.md` (F100-UCX).
+//! autumn-transport — pluggable transport for autumn-rs (TCP today, UCX optional; F100-UCX).
 //!
 //! ## Why enum dispatch instead of trait objects
 //!

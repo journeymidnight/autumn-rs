@@ -1,8 +1,6 @@
 //! F183 policy engine: per-partition load metrics window + split/merge
 //! candidate computation. Stage 1 ships advisory only; auto-trigger is
 //! gated behind feature flags in Stage 2/3.
-//!
-//! See `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

@@ -577,8 +577,8 @@ pub(crate) struct MemEntry {
 
 // F099-C: single-writer (P-log) BTreeMap under parking_lot::RwLock.
 //
-// Motivation (see docs/superpowers/specs/2026-04-20-perf-r4-ceiling-diagnosis.md
-// §Section 3): the previous crossbeam SkipMap paid full lock-free bookkeeping
+// Motivation (F099-C perf diagnosis): the previous crossbeam SkipMap paid
+// full lock-free bookkeeping
 // (epoch pinning + tagged atomic pointer loads + CAS splice retries + refcount
 // drops) on every insert, which accounted for ~28 % of the P-log thread's CPU
 // budget at the 60–65 k write ceiling. autumn-rs's write path has exactly one
@@ -1624,9 +1624,9 @@ impl WriteLoopMetrics {
 // still runs on the same runtime as partition_loop, so the request
 // handoff is a same-thread mpsc + oneshot with no eventfd/futex wake.
 //
-// See `docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md` §2.3
-// (per-partition P-log utilization after F099-J saturated under 256 × d=1;
-// F099-K fans the load out across N P-log threads).
+// (F099-H kernel-RTT diagnosis: per-partition P-log utilization after
+// F099-J saturated under 256 × d=1; F099-K fans the load out across N
+// P-log threads.)
 
 /// A request dispatched from a ps-conn task (running on P-log runtime)
 /// into `partition_loop` for write group-commit or for inline
@@ -5219,10 +5219,10 @@ async fn partition_thread_main(
     // F099-D: the write loop is NO LONGER a separate compio task. Writes
     // are serviced inline by `partition_loop` below, collapsing the
     // old `partition_thread_main → spawn_write_request → handle_put →
-    // write_tx.send → background_write_loop_r1` chain into one task. See
-    // F099-A flame graph analysis (docs/superpowers/specs/2026-04-20-*.md
-    // §Section 3/4) for why this collapse matters (~30 % of P-log CPU on
-    // 256 × d=1 came from spawn + inner oneshot + Waker cascade).
+    // write_tx.send → background_write_loop_r1` chain into one task. The
+    // F099-A flame graph analysis showed why this collapse matters (~30 %
+    // of P-log CPU on 256 × d=1 came from spawn + inner oneshot + Waker
+    // cascade).
     // F270: created BEFORE the flush spawn — the flush loop shares the
     // poison flag so a fence rejection inside the flush path (P-bulk
     // append / commit_length barrier hitting CODE_LOCKED_BY_OTHER after
