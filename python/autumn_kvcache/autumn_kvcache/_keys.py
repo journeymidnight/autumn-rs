@@ -61,15 +61,6 @@ def full_key(tenant_suffix: str, content_hash: str, pool: str) -> bytes:
     return f"{KEY_NAMESPACE}/{tenant_suffix}/{pool}/{content_hash}".encode("utf-8")
 
 
-def tenant_prefix(tenant_suffix: str) -> bytes:
-    """Prefix covering ALL of a tenant's keys, across every pool.
-
-    NOTE: this spans both the sglang (`kv`) and vLLM (`vllm`) pools — use
-    `pool_prefix` for a debug clear that must not cross pools.
-    """
-    return f"{KEY_NAMESPACE}/{tenant_suffix}/".encode("utf-8")
-
-
 def pool_prefix(tenant_suffix: str, pool: str) -> bytes:
     """Prefix covering one tenant's keys within a single pool.
 

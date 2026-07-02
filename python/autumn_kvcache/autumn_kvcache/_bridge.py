@@ -77,17 +77,3 @@ async def _wrap_thunk(thunk):
     return await thunk()
 
 
-def run_sharded_on_loops(loops, thunks):
-    """Run thunks[i] on loops[i] CONCURRENTLY, block for all, return results.
-
-    Each (loop, thunk) pair runs on its own loop thread, so K shards' awaits
-    + completion callbacks proceed in parallel. The blocking `.result()`
-    waits release the GIL, and the heavy per-page memcpy happens in Rust on
-    each client's compio thread — so this actually scales with K (unlike a
-    single shared loop). Results are returned in input order.
-    """
-    futs = [
-        asyncio.run_coroutine_threadsafe(_wrap_thunk(t), loop)
-        for loop, t in zip(loops, thunks)
-    ]
-    return [f.result() for f in futs]

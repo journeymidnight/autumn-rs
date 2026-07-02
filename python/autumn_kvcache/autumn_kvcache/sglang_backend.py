@@ -150,7 +150,6 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         # pages are large so reads cross the ZC size threshold and writes are
         # always ZC on UCX — both win at this size; see UCX_ZC_READ_MIN_BYTES.)
         self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight))
-        self._zc = (transport == "ucx")
         # Low-frequency v0 / batch_exists / clear paths use a regular async
         # Client on its own loop thread.
         self._loop0 = new_loop()
@@ -213,33 +212,43 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     # ── v1 zero-copy hot path ──────────────────────────────────────────────
 
-    def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
+    def _batch_v1(self, keys, host_indices, transfer, verb, err_stat, stat_of):
+        """Shared v1 transfer shape for batch_get_v1 / batch_set_v1: resolve
+        page views, run `transfer(full_keys, views)`, account per-result via
+        `stat_of(ok)`; any exception fails the whole batch under `err_stat`.
+        """
         full_keys = [self._full_key(k) for k in keys]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
-            results = list(self._batch.get_into(full_keys, views))
+            results = list(transfer(full_keys, views))
         except Exception as e:  # noqa: BLE001
-            log.debug("batch get_into error (n=%d): %r", len(keys), e)
-            self._stats["get_error"] += len(keys)
+            log.debug("batch %s error (n=%d): %r", verb, len(keys), e)
+            self._stats[err_stat] += len(keys)
             return [False] * len(keys)
         for ok in results:
-            self._stats["get_hit" if ok else "get_miss"] += 1
+            self._stats[stat_of(ok)] += 1
         return results
 
+    def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
+        return self._batch_v1(
+            keys,
+            host_indices,
+            self._batch.get_into,
+            "get_into",
+            "get_error",
+            lambda ok: "get_hit" if ok else "get_miss",
+        )
+
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
-        full_keys = [self._full_key(k) for k in keys]
-        try:
-            starts = _page_start_indices(keys, host_indices)
-            views = [self._page_view(s) for s in starts]
-            results = list(self._batch.put_from(full_keys, views, self._ttl_secs))
-        except Exception as e:  # noqa: BLE001
-            log.debug("batch put_from error (n=%d): %r", len(keys), e)
-            self._stats["set_error"] += len(keys)
-            return [False] * len(keys)
-        for ok in results:
-            self._stats["set_ok" if ok else "set_error"] += 1
-        return results
+        return self._batch_v1(
+            keys,
+            host_indices,
+            lambda fk, views: self._batch.put_from(fk, views, self._ttl_secs),
+            "put_from",
+            "set_error",
+            lambda ok: "set_ok" if ok else "set_error",
+        )
 
     def batch_exists(self, keys, extra_info=None) -> int:
         """Return contiguous-prefix length (NOT per-key list).
