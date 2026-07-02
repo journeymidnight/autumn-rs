@@ -866,6 +866,29 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
 // F213 helpers (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
+/// Assemble `split_points.len() + 1` contiguous `(start_key, end_key)`
+/// ranges from ordered split points — first range starts unbounded (`[]`),
+/// last ends unbounded. Shared tail of `hex_split_ranges` /
+/// `fuse_split_ranges` (only their split-point construction differs).
+fn ranges_from_split_points(split_points: Vec<Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let n = split_points.len() + 1;
+    let mut ranges = Vec::with_capacity(n);
+    for i in 0..n {
+        let start_key = if i == 0 {
+            vec![]
+        } else {
+            split_points[i - 1].clone()
+        };
+        let end_key = if i == n - 1 {
+            vec![]
+        } else {
+            split_points[i].clone()
+        };
+        ranges.push((start_key, end_key));
+    }
+    ranges
+}
+
 pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     if n <= 1 {
         return vec![(vec![], vec![])];
@@ -881,21 +904,7 @@ pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         split_points.push(hex_str.into_bytes());
     }
 
-    let mut ranges = Vec::new();
-    for i in 0..n {
-        let start_key = if i == 0 {
-            vec![]
-        } else {
-            split_points[i - 1].clone()
-        };
-        let end_key = if i == n - 1 {
-            vec![]
-        } else {
-            split_points[i].clone()
-        };
-        ranges.push((start_key, end_key));
-    }
-    ranges
+    ranges_from_split_points(split_points)
 }
 
 /// Split keys aimed at the autumn-fuse keyspace
@@ -939,21 +948,7 @@ pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         let byte = ((i * 256) / n) as u8; // 0x20, 0x40, … for N=8
         split_points.push(vec![0x03, 0, 0, 0, 0, 0, 0, 0, byte]);
     }
-    let mut ranges = Vec::with_capacity(n);
-    for i in 0..n {
-        let start_key = if i == 0 {
-            vec![]
-        } else {
-            split_points[i - 1].clone()
-        };
-        let end_key = if i == n - 1 {
-            vec![]
-        } else {
-            split_points[i].clone()
-        };
-        ranges.push((start_key, end_key));
-    }
-    ranges
+    ranges_from_split_points(split_points)
 }
 
 fn parse_byte_size(s: &str) -> Result<u64> {

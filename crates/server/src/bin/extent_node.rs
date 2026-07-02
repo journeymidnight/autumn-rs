@@ -648,14 +648,16 @@ fn main() -> Result<()> {
         joins.push(join);
     }
 
-    // Park forever. Any shard failure has already called process::exit(1)
-    // from inside the shard thread; reaching the end of this loop would
-    // mean every shard returned Ok cleanly (impossible in steady state —
-    // accept_loop runs an infinite loop).
-    for (idx, j) in joins.into_iter().enumerate() {
+    // Park on shard 0's join handle. Any shard failure has already called
+    // process::exit(1) from inside its own thread, so a join RETURNING (even
+    // Ok) is itself anomalous — accept_loop runs an infinite loop — and we
+    // fail-stop on it. (Only shard 0 is awaited: another shard exiting
+    // cleanly without process::exit would go unnoticed, same as the previous
+    // loop form, which also never reached index 1.)
+    if let Some(j) = joins.into_iter().next() {
         let _ = j.join();
         tracing::error!(
-            shard_idx = idx,
+            shard_idx = 0,
             "extent-node shard join returned — fail-stop \
              (shard should have called process::exit on its own)"
         );

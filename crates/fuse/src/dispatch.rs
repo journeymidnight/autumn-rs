@@ -520,33 +520,27 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     // Re-fetch after truncate
                     meta = get_inode(state, ino).await?;
                 }
-                if let Some(t) = atime {
+                // Resolve a SetAttr time (explicit timestamp or "now") into
+                // the meta's secs/nsecs pair — identical for atime and mtime.
+                fn apply_time(t: fuser::TimeOrNow, secs: &mut i64, nsecs: &mut u32) {
                     match t {
                         fuser::TimeOrNow::SpecificTime(st) => {
                             let d = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                            meta.atime_secs = d.as_secs() as i64;
-                            meta.atime_nsecs = d.subsec_nanos();
+                            *secs = d.as_secs() as i64;
+                            *nsecs = d.subsec_nanos();
                         }
                         fuser::TimeOrNow::Now => {
                             let (s, ns) = now_ts();
-                            meta.atime_secs = s;
-                            meta.atime_nsecs = ns;
+                            *secs = s;
+                            *nsecs = ns;
                         }
                     }
                 }
+                if let Some(t) = atime {
+                    apply_time(t, &mut meta.atime_secs, &mut meta.atime_nsecs);
+                }
                 if let Some(t) = mtime {
-                    match t {
-                        fuser::TimeOrNow::SpecificTime(st) => {
-                            let d = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                            meta.mtime_secs = d.as_secs() as i64;
-                            meta.mtime_nsecs = d.subsec_nanos();
-                        }
-                        fuser::TimeOrNow::Now => {
-                            let (s, ns) = now_ts();
-                            meta.mtime_secs = s;
-                            meta.mtime_nsecs = ns;
-                        }
-                    }
+                    apply_time(t, &mut meta.mtime_secs, &mut meta.mtime_nsecs);
                 }
                 let (s, ns) = now_ts();
                 meta.ctime_secs = s;
@@ -875,15 +869,11 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 // acquire was issued this call (refcount > 1, no
                 // revoke); keep the cached entry as-is in that
                 // case (matches pre-fix behavior).
-                let needs_reload = if acquired_version > 0 {
-                    state
-                        .inodes
-                        .get(&ino)
-                        .map(|is| is.cached_version < acquired_version)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+                let needs_reload = state
+                    .inodes
+                    .get(&ino)
+                    .map(|is| inode_cache_needs_reload(is.cached_version, acquired_version))
+                    .unwrap_or(false);
                 if needs_reload {
                     tracing::info!(
                         ino,

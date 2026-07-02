@@ -152,18 +152,6 @@ impl FsState {
         self.client.get(k).await.map_err(|e| anyhow!("KV get: {e}"))
     }
 
-    /// Get a sub-range of a value from the KV store.
-    pub async fn kv_get_range(&mut self, k: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
-        match self
-            .client
-            .get_range(k, offset, length)
-            .await
-            .map_err(|e| anyhow!("KV get_range: {e}"))?
-        {
-            Some(v) => Ok(v),
-            None => Err(anyhow!("not found")),
-        }
-    }
 
     /// Put a key-value pair into the KV store.
     ///
@@ -213,12 +201,6 @@ impl FsState {
             }
             _ => autumn_client::WriteLease::ANON,
         }
-    }
-
-    /// F178: alias for `kv_put`. See `kv_put` doc — no semantic difference
-    /// post-F178 since every write is durable.
-    pub async fn kv_put_sync(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
-        self.kv_put(k, v).await
     }
 
     /// Delete a key from the KV store.

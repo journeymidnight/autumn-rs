@@ -851,14 +851,14 @@ impl MemoryStore {
         let mut vptr: HashMap<String, u32> = HashMap::new();
         for k in &vptr_keys {
             let vid = keys::ivf_vptr_vec_id(k, &vpre);
-            match self.client.get(k).await? {
-                Some(b) => match read_u32(&b) {
+            // A key that vanished between scan and get is not an inconsistency.
+            if let Some(b) = self.client.get(k).await? {
+                match read_u32(&b) {
                     Some(c) => {
                         vptr.insert(vid, c);
                     }
                     None => r.malformed_vptr += 1, // present but undecodable = corruption
-                },
-                None => {} // vanished between scan and get — not an inconsistency
+                }
             }
         }
         r.vptrs = vptr.len() as u64;

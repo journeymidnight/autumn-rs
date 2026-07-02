@@ -222,7 +222,7 @@ fn now_ts() -> (i64, u32) {
 fn new_file_meta() -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: (libc::S_IFREG | 0o644) as u32,
+        mode: (libc::S_IFREG | 0o644),
         uid: 0,
         gid: 0,
         size: 0,
@@ -241,7 +241,7 @@ fn new_file_meta() -> InodeMeta {
 fn new_dir_meta() -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: (libc::S_IFDIR | 0o755) as u32,
+        mode: (libc::S_IFDIR | 0o755),
         uid: 0,
         gid: 0,
         size: 0,
@@ -258,6 +258,20 @@ fn new_dir_meta() -> InodeMeta {
 }
 
 // ─── ls ─────────────────────────────────────────────────────────────────────
+
+/// Advance a paginated range-scan cursor: `Some(next_start)` = the last
+/// returned key with its final byte bumped (so the boundary entry isn't
+/// re-emitted), or `None` when the page came back short (scan complete) or
+/// the last key is empty. Shared by ls / cat / rm's extent walks.
+fn next_range_cursor(entries: &[autumn_client::RangeEntry], page: u32) -> Option<Vec<u8>> {
+    if entries.len() < page as usize {
+        return None;
+    }
+    let mut start = entries.last()?.key.clone();
+    let b = start.last_mut()?;
+    *b = b.wrapping_add(1);
+    Some(start)
+}
 
 async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
     let (ino, _, _, meta) = resolve(cluster, path).await?;
@@ -280,7 +294,6 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
             .range(&prefix, &start, PAGE)
             .await
             .map_err(|e| anyhow!("dirent range: {e}"))?;
-        let count = resp.entries.len();
         for entry in &resp.entries {
             let (parent, name_bytes) = match key::parse_dirent_key(&entry.key) {
                 Some(v) => v,
@@ -330,26 +343,18 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
                 println!("{name}{suffix}");
             }
         }
-        if count < PAGE as usize {
-            break;
-        }
-        // Advance start cursor past the last returned key.
-        let last_key = &resp.entries.last().unwrap().key;
-        start = last_key.clone();
-        // Bump the last byte so we don't re-emit the boundary entry.
-        if let Some(b) = start.last_mut() {
-            *b = b.wrapping_add(1);
-        } else {
-            break;
+        match next_range_cursor(&resp.entries, PAGE) {
+            Some(next) => start = next,
+            None => break,
         }
     }
     Ok(())
 }
 
 fn print_long_entry(name: &str, m: &InodeMeta) {
-    let kind = if m.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
+    let kind = if m.mode & libc::S_IFMT == libc::S_IFDIR {
         'd'
-    } else if m.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32 {
+    } else if m.mode & libc::S_IFMT == libc::S_IFLNK {
         'l'
     } else {
         '-'
@@ -362,11 +367,11 @@ fn print_long_entry(name: &str, m: &InodeMeta) {
 }
 
 fn is_dir(m: &InodeMeta) -> bool {
-    m.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+    m.mode & libc::S_IFMT == libc::S_IFDIR
 }
 
 fn is_reg(m: &InodeMeta) -> bool {
-    m.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    m.mode & libc::S_IFMT == libc::S_IFREG
 }
 
 // ─── stat ───────────────────────────────────────────────────────────────────
@@ -469,7 +474,6 @@ async fn read_file_to_writer(
             .range(&prefix, &start, PAGE)
             .await
             .map_err(|e| anyhow!("extent range: {e}"))?;
-        let count = resp.entries.len();
         for entry in &resp.entries {
             let (_, off) = match key::parse_extent_key(&entry.key) {
                 Some(v) => v,
@@ -494,15 +498,9 @@ async fn read_file_to_writer(
             out.write_all(&v).context("write extent to output")?;
             written += v.len() as u64;
         }
-        if count < PAGE as usize {
-            break;
-        }
-        let last_key = &resp.entries.last().unwrap().key;
-        start = last_key.clone();
-        if let Some(b) = start.last_mut() {
-            *b = b.wrapping_add(1);
-        } else {
-            break;
+        match next_range_cursor(&resp.entries, PAGE) {
+            Some(next) => start = next,
+            None => break,
         }
     }
     // Truncate trailing zeros if extents overshot meta.size (shouldn't happen
@@ -686,22 +684,15 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
                 .range(&prefix, &start, PAGE)
                 .await
                 .map_err(|e| anyhow!("extent range: {e}"))?;
-            let count = resp.entries.len();
-            for entry in &resp.entries {
+                for entry in &resp.entries {
                 cluster
                     .delete(&entry.key)
                     .await
                     .map_err(|e| anyhow!("delete extent: {e}"))?;
             }
-            if count < PAGE as usize {
-                break;
-            }
-            let last_key = &resp.entries.last().unwrap().key;
-            start = last_key.clone();
-            if let Some(b) = start.last_mut() {
-                *b = b.wrapping_add(1);
-            } else {
-                break;
+            match next_range_cursor(&resp.entries, PAGE) {
+                Some(next) => start = next,
+                None => break,
             }
         }
     }

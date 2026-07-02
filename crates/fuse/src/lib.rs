@@ -18,7 +18,6 @@ pub mod read;
 #[cfg(feature = "fuse")]
 pub mod state;
 #[cfg(feature = "fuse")]
-pub mod sync_task;
 #[cfg(feature = "fuse")]
 pub mod write;
 

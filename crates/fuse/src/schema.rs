@@ -128,10 +128,6 @@ impl WriteBuffer {
             len: 0,
         }
     }
-
-    pub fn reset(&mut self) {
-        self.len = 0;
-    }
 }
 
 /// Per-inode runtime state (compio thread-local, not persisted).

@@ -16,7 +16,7 @@
 
 const PREFIX_INODE: u8 = 0x01;
 const PREFIX_DIRENT: u8 = 0x02;
-const PREFIX_CHUNK: u8 = 0x03;
+const PREFIX_EXTENT: u8 = 0x03;
 const PREFIX_SUPER: u8 = 0x04;
 
 /// Encode inode metadata key: `[0x01][ino BE]`
@@ -28,6 +28,7 @@ pub fn inode_key(ino: u64) -> Vec<u8> {
 }
 
 /// Decode inode number from an inode key.
+#[cfg(test)]
 pub fn parse_inode_key(key: &[u8]) -> Option<u64> {
     if key.len() == 9 && key[0] == PREFIX_INODE {
         Some(u64::from_be_bytes(key[1..9].try_into().unwrap()))
@@ -71,7 +72,7 @@ pub fn parse_dirent_key(key: &[u8]) -> Option<(u64, &[u8])> {
 /// `MAX_EXTENT`).
 pub fn extent_key(ino: u64, logical_off: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
-    key.push(PREFIX_CHUNK);
+    key.push(PREFIX_EXTENT);
     key.extend_from_slice(&ino.to_be_bytes());
     key.extend_from_slice(&logical_off.to_be_bytes());
     key
@@ -81,14 +82,14 @@ pub fn extent_key(ino: u64, logical_off: u64) -> Vec<u8> {
 /// `[0x03][ino BE]`.
 pub fn extent_prefix(ino: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(9);
-    key.push(PREFIX_CHUNK);
+    key.push(PREFIX_EXTENT);
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }
 
 /// Parse an extent key → (ino, logical_off).
 pub fn parse_extent_key(key: &[u8]) -> Option<(u64, u64)> {
-    if key.len() == 17 && key[0] == PREFIX_CHUNK {
+    if key.len() == 17 && key[0] == PREFIX_EXTENT {
         let ino = u64::from_be_bytes(key[1..9].try_into().unwrap());
         let logical_off = u64::from_be_bytes(key[9..17].try_into().unwrap());
         Some((ino, logical_off))

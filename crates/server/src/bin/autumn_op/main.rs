@@ -355,7 +355,7 @@ fn hex_encode(b: &[u8]) -> String {
 
 /// Decode an ASCII hex string into bytes.
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if !s.is_ascii() || s.len() % 2 != 0 {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
         bail!("expected an even-length ASCII hex string");
     }
     (0..s.len())
@@ -1321,7 +1321,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
     // any disk. Failure here means the manager is not yet
     // leader (retries internally) or has never bootstrapped
     // (fatal — operator must start the manager first).
-    let cluster_id = fetch_cluster_id(&client).await?;
+    let cluster_id = fetch_cluster_id(client).await?;
 
     // For each dir, decide whether to fresh-format or reuse
     // existing. Refuse on cluster_id mismatch — that's the
@@ -1856,7 +1856,7 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                                     .await
                                 {
                                     if let Ok(pr) = ExtProbeExtentResp::decode(rb) {
-                                        sz = pr.length as u64;
+                                        sz = pr.length;
                                     }
                                 }
                             }
@@ -2102,7 +2102,7 @@ async fn run_info(
                             .await
                         {
                             if let Ok(resp) = ExtProbeExtentResp::decode(resp_bytes) {
-                                ext.sealed_length = resp.length as u64;
+                                ext.sealed_length = resp.length;
                             }
                         }
                     }

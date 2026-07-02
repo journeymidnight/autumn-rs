@@ -44,7 +44,7 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
 
 
 mod args;
-use args::{parse_args, Args, Command};
+use args::{parse_args, Command};
 
 // ---------------------------------------------------------------------------
 // Benchmark helpers
@@ -224,7 +224,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
             .map(|i| (i % 256) as u8)
             .collect::<Vec<u8>>();
         let depth = pipeline_depth;
-        let bulk = bulk;
+
         let barrier = Arc::clone(&barrier);
         let handle = std::thread::spawn(move || {
             if ramp_ms > 0 {
@@ -411,8 +411,6 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         let deadline = Arc::clone(&deadline);
         let total_ops = Arc::clone(&total_ops);
         let depth = pipeline_depth;
-        let bulk = bulk;
-        let value_size = value_size;
         let barrier = Arc::clone(&barrier);
         let handle = std::thread::spawn(move || {
             if ramp_ms > 0 {
