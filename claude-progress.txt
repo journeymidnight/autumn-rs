@@ -70,6 +70,19 @@ Current summary:
       长函数(maintenance_loop/recover_partition/partition_thread_main)无干净缝。
     验证:PS lib 182/182;workspace check 0 警告(除 server bin 1 个 unused import,
     chunk 13 处理);PS clippy 仅剩 4 个既有保守 lint(已记 ledger)。
+  · Chunk 13-16 done(server/fuse/memory/gallery),commit ded2d65:
+    - server:extent_node never_loop 死循环形改 if-let 停车(deny-level lint);
+      op/args split-ranges 尾部 ×2→ranges_from_split_points;autumnfs 分页游标
+      ×3→next_range_cursor;perf-check 3 处冗余重绑定;deferred 项记 ledger
+      (跨二进制共享形、run_info 拆分、perf-check 安全缝)。
+    - fuse:死模块 sync_task.rs 删除(main.rs 持有真 sync 循环,CLAUDE.md 表
+      已改);Open arm 接线 inode_cache_needs_reload()(helper 一直存在、被测试、
+      文档声称已接线——现在为真);删 4 个死 fn;PREFIX_CHUNK→PREFIX_EXTENT
+      (F247 改名遗漏);SetAttr apply_time ×2 合一。fuse 44/44 绿。
+    - memory:1 个 clippy if-let;agent 审定 keys/recall/vector 干净
+      (q/unq、BM25 数学都是单拷贝)。20/20 绿。
+    - gallery:agent 审毕,仅 D3(示例代码,记 optional)。
+    验证:workspace check 0 警告;各 crate 自身 clippy 清(PS 4 个既有保守 lint 除外)。
   · Chunk 11+12 done:7adec55(place_extents_with_fallback ×3 合一 +
     classify_hot_cold_band ×2 泛型合一;169/169 绿)+ 602a532(tests support
     4 个死 helper 删除;system_split_writes 冒烟绿)。32 文件集群前导样板
@@ -89,10 +102,9 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 13 server(8k,autumn_client bin 有 unused import `Args`)。
-  2. Chunk 14 fuse(4.7k)、15 autumn-memory(2.3k)、16 gallery(1.8k)、
-     17 python(5.8k)——预计 1-2 迭代收尾。
-  3. 全部完成后:总结 + 停 loop(PushNotification 通知)。
+  1. Chunk 17 python(5.8k:binding + autumn_memory + mcp/langgraph/hermes
+     adapters + kvcache)——最后一块。
+  2. 完成后:总结 + 停 loop(PushNotification 通知)。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
   3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +

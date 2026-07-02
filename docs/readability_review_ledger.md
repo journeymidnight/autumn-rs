@@ -31,10 +31,10 @@ Rules per chunk:
 | 10 | crates/manager — src reviewed (2 agents, full src) + fence dedup + dead code | 21164 src | done | ea118a8 |
 | 11 | crates/manager — remaining agent findings | — | done | 7adec55 (place_extents_with_fallback ×3, classify_hot_cold_band ×2) |
 | 12 | crates/manager — tests/ light dedup skim | ~18600 | done | 602a532 (4 dead harness helpers deleted); BIG deferred item: 32-file cluster-prologue consolidation, see findings log |
-| 13 | crates/server (binaries) | 8170 | todo | |
-| 14 | crates/fuse | 4731 | todo | |
-| 15 | crates/autumn-memory | 2334 | todo | |
-| 16 | examples/gallery | 1837 | todo | |
+| 13 | crates/server (binaries) | 8170 | done | ded2d65 (never_loop fix, split-ranges tail ×2, range-cursor ×3, rebindings; deferred items in findings log) |
+| 14 | crates/fuse | 4731 | done | ded2d65 (dead sync_task.rs module deleted, needs_reload wired into Open arm, 4 dead fns, PREFIX_EXTENT rename, apply_time ×2) |
+| 15 | crates/autumn-memory | 2334 | done | ded2d65 (clean per agent; 1 clippy if-let) |
+| 16 | examples/gallery | 1837 | done | reviewed (agent): only D3 base_meta_fields ×2 — example-code, logged as optional |
 | 17 | python/ (bindings + memory + adapters) | 5762 | todo | |
 
 Status values: todo | in_progress | done
@@ -49,6 +49,16 @@ Status values: todo | in_progress | done
   (~40 copies / 17 files) -> ps_split(ps, part_id). (C) sibling-region
   discovery (~30 copies / 13 files) -> sibling_part_id/region_rg. Also:
   integration.rs:~1131 reimplements support::get_regions inline.
+- server/fuse/gallery deferred-or-skipped (agent findings, apply when touching
+  those files anyway): op/main.rs stream_replicates ×2 + policy_kind_str ×2 +
+  ps_addr resolution ×4 + NOT_LEADER retry ×4; cross-binary shapes needing a
+  shared-crate home (--transport arm ×5, regpool-cap ×3, cpuset ×2, memlock
+  raise ×2, metrics publisher ×2); perf-check safe seams (progress-printer
+  thread ×2, evaluate_baseline extraction — do NOT merge the measured fan_out
+  bodies); run_info (~570 ln) 3-way split; op/main.rs 2 deep-nested probe
+  loops; fuse extent.rs D1 scan_extent_starts ×2 (pure extraction, flagged
+  fine but left — flush-adjacent); fuse read.rs read() kept as documented
+  test/fallback; gallery D3.
 - manager skipped-as-defensible (agent-confirmed author tradeoffs): the
   gc/major/minor advisory triplication in policy.rs (author comment rejects
   parametrization — fields differ per kind); extent_delete ship_deletes ×2

@@ -476,7 +476,7 @@ flush_buffer(ino):
 | `read.rs` | 分块读取 + 组装 |
 | `write.rs` | 1MB 写缓冲 + flush 逻辑 |
 | `cache.rs` | inode 缓存管理 |
-| `sync_task.rs` | 30s 周期脏 inode sync |
+| `main.rs` (periodic_sync) | 30s 周期脏 inode sync(曾有独立 sync_task.rs 模块,从未被接线,已删) |
 
 ---
 
