@@ -1,42 +1,42 @@
 #!/usr/bin/env bash
-# fuse_start.sh — mount the autumn-fuse filesystem against a running cluster.
+# fuse_start.sh — mount the autumn-fuse filesystem against a RUNNING cluster.
 #
-# Accepts the SAME env vars as deploy/baremetal (BIND_HOST/TRANSPORT/WORK), so one
-# the mount:
-#   BIND_HOST  → MANAGER  ($BIND_HOST:9001)   default 127.0.0.1
-#   WORK       → LOG_DIR  ($WORK/logs)        default /var/lib/autumn-rs
+# This is a CONSUMER-side tool, NOT a cluster launcher. autumn-fuse is one of the
+# three client interfaces (fuse / kvcache / client) built on top of the partition
+# layer; it runs where the APPLICATION runs (e.g. the sglang/vLLM inference / GPU
+# nodes), mounts a POSIX filesystem, and reads/writes through the cluster's
+# manager. The storage cluster is deployed separately — bare-metal via
+# deploy/baremetal/autumn-deploy, Kubernetes via deploy/k8s/. (Inside k8s, mount
+# by running autumn-fuse as a privileged per-node DaemonSet; this script is the
+# bare-metal equivalent.)
+#
+# Knobs — all standalone, no coupling to any cluster-launch script:
+#   MANAGER    manager address        default 127.0.0.1:9001 (host:port; bracket IPv6)
 #   TRANSPORT  tcp | ucx — MUST match the cluster's transport. The fuse daemon is
 #              a DATA-PLANE client (ClusterClient reads/writes extents over this
 #              transport), process-global, so a tcp fuse can't reach a ucx cluster.
-# Explicit overrides still win:
-#   MANAGER    full manager addr (overrides BIND_HOST-derived)
-#   LOG_DIR    full log dir       (overrides WORK-derived)
-#   MOUNTPOINT default /mnt/dongmao-share
-#   BIN        default ./target/release
-#   UCX_NET_DEVICES  default mlx5_1:1 (only when ucx; verify with
-#                    scripts/check_roce.sh --listen-candidates)
+#   MOUNTPOINT mount path             default /mnt/dongmao-share
+#   LOG_DIR    daemon log dir         default /tmp/autumn-fuse
+#   BIN        binary dir             default ./target/release
+#   UCX_NET_DEVICES  RoCE device (ucx only)  default mlx5_1:1
+#                    (verify with scripts/check_roce.sh --listen-candidates)
 #
 # Examples:
-#   ./fuse_start.sh                                            # local tcp cluster
-#   WORK=/var/lib/autumn-rs-d02 BIND_HOST='[fdbd:dc62:3:302::14]' \
-#     TRANSPORT=ucx ./fuse_start.sh                            # matches the same
-#                                                              # WORK/BIND_HOST/TRANSPORT
-#                                                              # you gave autumn-deploy
+#   ./fuse_start.sh                                                    # local tcp cluster
+#   MANAGER='[fdbd:dc62:3:302::14]:9001' TRANSPORT=ucx ./fuse_start.sh # remote ucx cluster
 set -euo pipefail
 
-BIND_HOST="${BIND_HOST:-127.0.0.1}"
-WORK="${WORK:-/var/lib/autumn-rs}"
-MANAGER="${MANAGER:-${BIND_HOST}:9001}"
+MANAGER="${MANAGER:-127.0.0.1:9001}"
 TRANSPORT="${TRANSPORT:-tcp}"
 MOUNTPOINT="${MOUNTPOINT:-/mnt/dongmao-share}"
-LOG_DIR="${LOG_DIR:-${WORK}/logs}"
+LOG_DIR="${LOG_DIR:-/tmp/autumn-fuse}"
 BIN="${BIN:-./target/release}"
 
-# UCX env — same rationale as the deploy path: positive TLS list (union of cross-host
-# RoCE + same-host shm + tcp fallback; NEVER use `^` negation), pinned RoCE
-# device (auto-select hangs with many devices), raised memlock for ibv_reg_mr.
-# UCX_* are read by the UCX C library directly (not autumn rust) — script is the
-# right place per the "config via flags not env in rust" rule.
+# UCX env — the UCX C library reads UCX_* directly (not autumn rust), so setting
+# them here is the right layer (config via flags, not env, in rust). Positive TLS
+# list (cross-host RoCE + same-host shm + tcp fallback; NEVER `^` negation),
+# pinned RoCE device (auto-select hangs with many devices), raised memlock for
+# ibv_reg_mr.
 if [[ "$TRANSPORT" == "ucx" ]]; then
     export UCX_TLS="${UCX_TLS:-rc_mlx5,ud_mlx5,posix,cma,tcp,self}"
     export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_1:1}"

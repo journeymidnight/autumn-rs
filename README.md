@@ -119,20 +119,24 @@ manager Service, in-cluster clients only in v1): `docs/k8s_deploy.md`.
 
 ### Mount autumn-fuse
 
+autumn-fuse is a **consumer** — a POSIX filesystem client that runs on the
+application node and talks to a *running* cluster's manager; it is not part of
+cluster deployment. `fuse_start.sh` is the bare-metal mount helper (it mounts,
+verifies the daemon actually came up, and clears a stale mount):
+
 ```bash
-mkdir -p /mnt/autumn
-nohup ./target/release/autumn-fuse \
-    --manager 127.0.0.1:9001 \
-    --mountpoint /mnt/autumn \
-    --transport tcp \
-    > /var/lib/autumn-rs/logs/fuse.log 2>&1 &
+cargo build --release -p autumn-fuse
+./fuse_start.sh                                     # mount /mnt/dongmao-share against 127.0.0.1:9001
+# knobs: MANAGER=host:9001  TRANSPORT=tcp|ucx  MOUNTPOINT=/path  LOG_DIR=/path  BIN=./target/release
 
-ls /mnt/autumn               # empty dir
-echo hi > /mnt/autumn/x
-cat /mnt/autumn/x            # → hi
-
-fusermount3 -u /mnt/autumn   # unmount (needs `fuse3` package)
+MP=/mnt/dongmao-share
+ls "$MP"; echo hi > "$MP"/x; cat "$MP"/x            # → hi
+fusermount3 -u "$MP"                                # unmount (needs `fuse3` package)
 ```
+
+Inside Kubernetes, mount by running autumn-fuse as a privileged per-node
+DaemonSet pointing at the `autumn-manager` Service — a consumer workload,
+deployed onto app nodes, separate from the storage StatefulSets.
 
 ## Binaries
 
