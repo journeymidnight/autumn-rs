@@ -1,0 +1,100 @@
+# Control plane. Stateless (all state in etcd), so a rescheduled pod with a new
+# IP is fine. The readiness probe is LEADER-GATED (`autumn-op info` only answers
+# on the leader), so the ClusterIP Service routes ONLY to the current leader —
+# clients never have to handle NOT_LEADER rotation in-cluster. Scale replicas to
+# 3 for HA (etcd leader-election picks one; the others stay Ready=false until
+# they win).
+# Discovery Service (ClusterIP). Leader-gated readiness (below) means only the
+# current leader is an endpoint here, so anything resolving `autumn-manager`
+# reaches the leader directly — no NOT_LEADER rotation needed in-cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-manager
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+  ports:
+    - name: rpc
+      port: 9001
+      targetPort: 9001
+---
+# Headless governing Service — StatefulSet pod identity/DNS. Not used for
+# discovery (managers coordinate via etcd, not peer DNS); it just satisfies the
+# StatefulSet serviceName contract.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-manager-peers
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+  ports:
+    - name: rpc
+      port: 9001
+      targetPort: 9001
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: autumn-manager
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+spec:
+  serviceName: autumn-manager-peers
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: manager
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: manager
+          image: autumn-rs:latest
+          imagePullPolicy: IfNotPresent
+          args: ["manager"]
+          envFrom:
+            - configMapRef: { name: autumn-config }
+          ports:
+            - { name: rpc, containerPort: 9001 }
+          readinessProbe:
+            # Leader-gated: `info` returns non-zero on a follower (NOT_LEADER),
+            # so only the leader becomes a Service endpoint.
+            exec:
+              command:
+                - autumn-op
+                - --manager
+                - 127.0.0.1:9001
+                - --transport
+                - tcp
+                - info
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 4
+          livenessProbe:
+            tcpSocket: { port: 9001 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }

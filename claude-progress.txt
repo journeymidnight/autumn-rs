@@ -1,125 +1,58 @@
-Date: 2026-07-01
+Date: 2026-07-02
 TaskStatus: completed
-Task scope: 全库可读性 review(/loop 任务)——逐 crate 审查并**简化代码逻辑本身**
-  (用户明确:不是加注释,是让逻辑更直白;不用 coco),直到 17 个 chunk 全覆盖。
-  账本 = docs/readability_review_ledger.md(chunk 表 + findings log)。
-  规则:行为保持不变、性能中性(热路径分配/锁/syscall 数不变)、
-  每 chunk 全量 `cargo test -p <crate> --lib` 绿、逐 chunk commit+push main。
-  wire-fingerprint 文件(rpc 的 manager/partition/extent_rpc、frame、cap_token)
-  编辑即强制 wire-version registry 决策 → 低价值清理记入 findings log 延后。
+Task scope: 部署方案 — 除 cluster.sh/start.sh/stop.sh 临时单机方式外,新增两套正式部署:
+  (1) F-BM-1 物理机部署(单机+多机),替代 start.sh/stop.sh;形态经用户确认 =
+      topology 配置 + bash 部署器(autumn-deploy) + systemd(双后端,macOS 走 process)。
+  (2) F-K8S-1 Kubernetes 部署(Dockerfile + kustomize manifests)。
+  cluster.sh 保留但重定位为 dev/chaos/perf 测试 harness(chaos 需要裸进程 kill 语义)。
 
 Current summary:
-  · Chunk 1 common(601 行)+ Chunk 2 etcd(1329 行):读毕,逻辑本已清晰,无改动(done)。
-  · Chunk 3 rpc(6579 行)done,2 commit 均 pushed:
-    - f833d1d client.rs:read_loop 四段近重复 ZC 分支(UCX/TCP × into-dest/into-pooled)
-      合一(zc_fast_path + recv_value_ucx + ValueRecv);send_vectored 死 v1 分支删除
-      (FLAG_CRC 恒真);await_response/with_timeout/register_and_submit 三组重复收敛。
-      clippy 抓到我引入的 RefMut-across-await(match 临时量生命周期延长,F108 类)已修
-      (先 let 绑定再 match)。43/43 测试绿(default + --features ucx),workspace check 绿。
-    - f89802c ps_read_bench 三份复制的 driver 收敛为 drive() + 两个 read_loop。
-  · 子代理审了 wire 文件:manager_rpc/build.rs 干净;cap_token/extent_rpc/partition_rpc
-    三个低价值 finding 记入 ledger findings log(等下次真编辑时顺带)。
-  · Chunk 4 transport(4140 行)done,2 commit pushed:
-    - 0fe3e72 endpoint.rs 四处 Pending-completion 重复→await_pending()+ucx_recv 薄包装;
-      lib.rs 双份 getifaddrs walk→all_ifaddrs();listener/sockaddr 双份 sockaddr 转换
-      →from_ucx_storage;regpool clippy nit。
-    - 63dcc34 regpool Drop 恒真死分支删除;transport_bench 3 份 client 协议+3 份 server
-      drain 收敛(send_warm_timed/read_count/drain_n/drain_registered,删死参 _mode);
-      tests/common round_trip_at 合并。
-    验证:8/8 transport 测试套件绿(含 RoCE 上真 UCX loopback+cancel-safety 两测,
-    正是重构的路径)+ bench 冒烟 TCP+UCX 全列有数;rpc 43/43 两 feature;workspace 绿。
-  · Chunk 5 client(3966 行)done,commit c66d555 pushed:
-    - NOT_LEADER 旋转循环 ×4(cluster_df/mint_token/tenant_create/tenant_delete)
-      →mgr_call_leader(各调用点重试次数保持原值);get_many/batch_put 整组失败
-      扇出循环 ×8→fail_slots;get_stream 双份 GetStream 构造合一;lease.rs 四个
-      RPC 的 transport/decode 样板→lease_call;删两处 useless .into()。
-    - put_zc_opts/get_range_into 各自的重试循环保留(调用原语不同:call_vectored/
-      call_into_dest;refresh_and_backoff 已共享)——刻意不强行统一。
-    验证:client 27/27 + memory 20/20 + fuse 44/44 + workspace 绿;client clippy 清。
-  · Chunk 6 stream server 侧(extent_node 8652 行等)done,commit 9bc0408 pushed:
-    - read_plan():读路径 eversion 门+长度语义双拷贝(批量热路径 build_read_future
-      vs 单发 handle_read_bytes,F119-C/P0-C 修过两遍)收敛为一个纯函数(无 await,
-      原子 load 数不变);committed_length_value()(commit_length/probe 注释自称
-      identical 的块);wrong_shard_err()(F099-M 拒绝 4 处);clippy --fix 清 22 警告
-      (21 个 wire-v5 加宽残留的同型转换 + erasure div_ceil)。
-    - conn_pool/erasure 读毕干净。extent_node 子代理审出的大项(append 协议双拷贝、
-      convert_to_ec 420 行拆分)刻意延后(热路径 fencing/commit-truncation,
-      note 24 有 revert 前科)→ ledger findings log 记录了提取形状。
-    验证:autumn-stream 全部 15 个测试套件绿(90 lib + 集成);workspace 绿;clippy 清。
-  · Chunk 7 stream client 侧(client.rs 5224 行)done,commit 38403c8 pushed:
-    - committed_end_for_read()(读侧 committed 界限双拷贝);parse_read_bytes_resp()
-      (ReadBytesResp 解码+EversionStale 哨兵映射 ×3,哨兵检测是类型级 downcast,
-      诊断字符串仅错误路径构造);build_stream_tail()(append 重试路径 6 处 roll/reset
-      的 StreamTail 纯构造提取,状态机转移一行未动)。
-    - 刻意跳过:两处 chunked-read 循环骨架(需单态 async-closure 泛型才 alloc 等价)。
-    验证:stream 15 套件绿;PS lib 182/182 ×3(首跑 1 例未捕获名的 one-off flake,
-    基线也复跑 5 次全绿=既有时序敏感,已记 ledger);workspace 绿。
-  · Chunk 8+9 partition-server(22k 行)done,commit 8437622 pushed:
-    - sst_lookup_paged_retry()(F261 补偿重试 get/head 双拷贝合一,borrow 改块级
-      作用域=note-15 惯用法词法化,crate 的 RefCell-across-await lint 5→4 低于基线);
-      sst_readers_changed()(4 处指针相等谓词);record_read 闭包(get_value_inner
-      内 5 处 READ_METRICS);死代码处置(全 workspace 验证零非测试调用者):
-      cfg(test) 门控 decode_records_with_offsets/lookup_in_sst(保留=F250 回归测试
-      的参考实现,repoint 需要活 StreamClient)/BlockCache 两方法(其 F261 文档
-      声称的生产调用者从不存在,已改)/同步 TableIterator+MergeIterator;
-      删除 AsyncMergeIterator::seek、SstReader::is_paged/paged_loc(零调用者)、
-      PartitionServer 死字段 server_owner_key/server_revision(F267 后遗留,
-      acquire RPC 本身保留);clippy --fix 清 9 项。
-    - 刻意不动(agent 确认+ledger 记录):save_table_locs_raw 双份 7 参调用=
-      F148-A 无 await 不变量的安全形态;do_compact 4 处 continue 小重复;
-      长函数(maintenance_loop/recover_partition/partition_thread_main)无干净缝。
-    验证:PS lib 182/182;workspace check 0 警告(除 server bin 1 个 unused import,
-    chunk 13 处理);PS clippy 仅剩 4 个既有保守 lint(已记 ledger)。
-  · Chunk 13-16 done(server/fuse/memory/gallery),commit ded2d65:
-    - server:extent_node never_loop 死循环形改 if-let 停车(deny-level lint);
-      op/args split-ranges 尾部 ×2→ranges_from_split_points;autumnfs 分页游标
-      ×3→next_range_cursor;perf-check 3 处冗余重绑定;deferred 项记 ledger
-      (跨二进制共享形、run_info 拆分、perf-check 安全缝)。
-    - fuse:死模块 sync_task.rs 删除(main.rs 持有真 sync 循环,CLAUDE.md 表
-      已改);Open arm 接线 inode_cache_needs_reload()(helper 一直存在、被测试、
-      文档声称已接线——现在为真);删 4 个死 fn;PREFIX_CHUNK→PREFIX_EXTENT
-      (F247 改名遗漏);SetAttr apply_time ×2 合一。fuse 44/44 绿。
-    - memory:1 个 clippy if-let;agent 审定 keys/recall/vector 干净
-      (q/unq、BM25 数学都是单拷贝)。20/20 绿。
-    - gallery:agent 审毕,仅 D3(示例代码,记 optional)。
-    验证:workspace check 0 警告;各 crate 自身 clippy 清(PS 4 个既有保守 lint 除外)。
-  · Chunk 11+12 done:7adec55(place_extents_with_fallback ×3 合一 +
-    classify_hot_cold_band ×2 泛型合一;169/169 绿)+ 602a532(tests support
-    4 个死 helper 删除;system_split_writes 冒烟绿)。32 文件集群前导样板
-    整合记 ledger 为专门会话项。
-  · Chunk 10 manager src(21k 行,两个 agent 全量审毕)第一批落地,commit ea118a8:
-    - diagnose_post_txn_fence()(F149 fence-vs-CAS 诊断双拷贝合一)+
-      empty_extra_cmp_err() ×3;死代码删除(全 workspace 验证):
-      build_extent_inflight_release_op(唯一调用点即弃值)、inflight_snapshot_three
-      (文档声称的调用者实为另一函数)、LeaseRegistry snapshot/snapshot_for、
-      push_with_cap;inode_lease doc 注释错位修复;clippy --fix 3 项。
-    验证:manager lib 169/169 + etcd 真集群 system_split_ref_counting 绿
-    (split txn/mirror/owner-lock 全走重构后的 fence 路径);workspace 绿;clippy 清。
+  已完成实现 + 本地验证,待 coco review 收尾后提交:
+  · F-BM-1 bare-metal(deploy/baremetal/):
+    - topology.conf(多机例子)+ topology-singlehost.conf(单机,替代 start.sh)。
+    - autumn-deploy: 声明式拓扑 → check/deploy/start/stop/restart/status/destroy。
+      双服务后端(auto): Linux+systemd+root → 渲染 systemd unit(Restart=on-failure/
+      LimitMEMLOCK=infinity/TimeoutStopSec=70);否则 process 后端(nohup+pidfile,
+      = cluster.sh 进程语义,macOS/容器/非 root)。bring-up 顺序 + 守卫移植 cluster.sh:
+      等 etcd 端口 → 等 manager leader → 幂等 format → 等 N EN Online →
+      streams-guarded bootstrap → PS + wait_ps_ready(路由就绪)。
+    - **本地端到端验证通过(process 后端,隔离高端口+独立 etcd 12379,不碰 live 集群)**:
+      check/start(有序拉起)/put-get 回环/幂等 restart(bootstrap 跳过+数据存活)/
+      restart ps/destroy --wipe 全绿;live d02 集群未受影响。
+    - systemd unit 渲染经 `systemd-analyze verify` 通过(修了 %q 逗号转义 bug)。
+    - 修复的真实 bug: ①单 member etcd 缺 peer flags → 默认 2380 撞机(改统一完整形式
+      + ETCD_CLIENT/PEER_BASE_PORT 可配,支持同机多集群);②process 后端 $! 抓子 shell
+      非二进制 PID(cd 前台+nohup 单独后台);③bootstrap 守卫 grep '"stream_id"' 需
+      `info --full`(默认 info 无 streams 数组);④bash>=4 守卫(macOS 3.2)。
+  · F-K8S-1(deploy/docker/ + deploy/k8s/):
+    - Dockerfile(多阶段,rust:1.93 构建 -p autumn-server → debian-slim,5 二进制)+
+      entrypoint.sh(manager|extent-node|ps|bootstrap 角色分发 + DNS→IP 解析(getent,
+      因二进制只收 IP 字面量)+ env→flag + bootstrap 守卫 info --full)。.dockerignore。
+    - kustomize base: namespace/configmap/etcd(STS)/manager(STS+ClusterIP 发现 Service
+      leader-gated readiness 只路由 leader + headless 治理 Service)/extent-node(STS +
+      每 pod 稳定 ClusterIP Service 暴露 9101+10101,因 EN 身份=advertise 地址不重注册)/
+      partition-server(STS,advertise pod IP,因 PS 每次开分区重注册)/bootstrap Job(守卫)。
+    - deploy/validate.sh: 无集群交叉校验(YAML + selector⊆template + serviceName headless +
+      每 pod EN Service 覆盖 + 端口 + kustomization 引用 + 角色 arg 对齐 entrypoint)。**VALIDATION OK**。
+    - 修复: manager STS serviceName 必须 headless(拆 ClusterIP 发现 + headless 治理两 Service)。
+  · 清理: 删 start.sh/stop.sh(git rm);cluster.sh 头注 + README + CLAUDE.md 标注其
+    测试 harness 定位;fuse_start.sh 注释更新;README 新增 Deployment 章节(表格 + 单机
+    Quick Start + Kubernetes 子节);docs/baremetal_deploy.md + docs/k8s_deploy.md。
+  · feature_list.md 加 F-K8S-1 + F-BM-1(passes:false,待验证收尾改 true)。
+
+  · coco findbugs(GPT-5.5)9 项全 triage + 修复 + 重跑 e2e 绿(见 feature_list F-BM-1/F-K8S-1)。
+    关键:P1 process 后端重复 start 孤儿(refuse-if-running 守卫)、P1 半 bootstrap 误判
+    (streams+partition 双检 + WARN,不改跳过决策以免重复 stream)、P2 zombie 卡 70s +
+    PID 复用误杀(移植 cluster.sh zombie 感知 + ps args cmdline 守卫)、P2 systemd
+    WorkingDirectory 缺失、P2 多核 cpuset 拒绝、P3 metrics 端口/latest 文档/README cwd。
 
 Main gaps / risks:
-  · UCX recv 路径无本地测试(需 RoCE 集群);read_loop 重构按构造保持行为,
-    TCP 路径有测试覆盖。若跑真集群 chaos/perf 出现 ZC 读异常,先查 f833d1d。
-  · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
-
-  · Chunk 17 python done,commit 553fc34:kvcache 删 2 个零引用死函数
-    (run_sharded_on_loops/tenant_prefix)+ 死字段 _zc;batch_get_v1/set_v1
-    13 行同形收敛为 _batch_v1;py_compile 全绿。adapters/memory/mcp/ops 脚本
-    agent 审定干净。记录未改的行为怪癖(sglang transport 回退不重置、
-    dashboard --no-detail 空转)→ ledger findings log。
-
-**任务完成(2026-07-02)**:17/17 chunk 全覆盖。产出=14 个 refactor/docs commit
-(f833d1d..553fc34),全部 pushed main。每步全量测试绿(rpc 43×2feature、
-transport 8 套件含真 UCX/RoCE、stream 15 套件、PS 182、manager 169+etcd 真集群
-system 测试、client 27、fuse 44、memory 20、python py_compile)。workspace
-0 警告;各 crate 自身 clippy 清(PS 4 个既有保守 lint 已记账)。
-延后项全部记录在 docs/readability_review_ledger.md findings log(含理由与
-精确坐标):wire-fingerprint 文件三项、extent_node append 协议双拷贝(需
-chaos 验证专门会话)、manager 测试 32 文件前导整合、跨二进制 CLI 共享形等。
+  · systemd 后端 + 多机 SSH 路径未在真机跑(本沙箱无 systemd PID1);unit 渲染经
+    systemd-analyze verify 通过,真机步骤写入 docs/baremetal_deploy.md 手动验证。
+  · k8s 无 docker/kubectl 工具链;manifest 走 deploy/validate.sh(VALIDATION OK)+
+    docs/k8s_deploy.md 的 kind 手动验证路径。
+  · 已知限制(文档记录):bootstrap 非幂等(半失败窗口极小,与 cluster.sh 同,真修=
+    二进制内幂等 bootstrap,未来工作);多机 etcd 的 manager 端点单 IP 解析(默认单 member)。
 
 Next steps:
-  (无 —— 本任务闭环。后续可选:ledger findings log 里的专门会话项。)
-  2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
-     lookup_in_sst 等)在对应 chunk 处理。
-  3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +
-     handle_convert_to_ec 拆分——需专门会话+chaos 验证(note 24 revert 教训),
-     不在 readability loop 里顺手做。
+  (无 —— 本任务闭环;已 commit + push main。)

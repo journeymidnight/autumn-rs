@@ -1,0 +1,732 @@
+#!/usr/bin/env bash
+# autumn-deploy — bare-metal deployer for autumn-rs (single-host + multi-host).
+#
+# Reads a declarative topology.conf, distributes the binaries, and manages the
+# cluster as either systemd services (Linux, production) or backgrounded
+# processes (macOS / containers / non-root — the same semantics start.sh had).
+# It replaces the ad-hoc start.sh / stop.sh. cluster.sh stays as the
+# dev/chaos/perf TEST harness (it needs raw process kill/restart for fault
+# injection); autumn-deploy is the deployment path.
+#
+#   ./autumn-deploy -t topology.conf check
+#   ./autumn-deploy -t topology.conf deploy
+#   ./autumn-deploy -t topology.conf start
+#   ./autumn-deploy -t topology.conf status
+#   ./autumn-deploy -t topology.conf restart [etcd|manager|en|ps]
+#   ./autumn-deploy -t topology.conf stop
+#   ./autumn-deploy -t topology.conf destroy [--wipe]
+#
+# Bring-up ordering + guards (idempotent format, streams-guarded bootstrap,
+# wait-for-leader, wait-for-Online) are ported from cluster.sh's proven do_start.
+
+set -euo pipefail
+
+# Needs bash >= 4 (associative arrays, mapfile). macOS ships bash 3.2 as
+# /bin/bash — install a modern bash (`brew install bash`) and either run it
+# explicitly (`/opt/homebrew/bin/bash autumn-deploy ...`) or ensure it precedes
+# /bin/bash in PATH so this `#!/usr/bin/env bash` picks it up.
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo "[autumn-deploy] ERROR: bash >= 4 required (found $BASH_VERSION)." >&2
+    echo "  macOS: brew install bash, then run with that bash." >&2
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BIN_SRC="${AUTUMN_BIN_SRC:-$REPO_ROOT/target/release}"   # freshly built binaries
+SERVER_BINS=(autumn-manager-server autumn-extent-node autumn-ps autumn-client autumn-op)
+
+log()  { echo "[autumn-deploy] $*" >&2; }
+die()  { echo "[autumn-deploy] ERROR: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# args
+# ---------------------------------------------------------------------------
+TOPOLOGY=""
+CMD=""
+declare -a EXTRA=()
+while (( $# > 0 )); do
+    case "$1" in
+        -t|--topology) TOPOLOGY="$2"; shift 2 ;;
+        check|deploy|start|stop|restart|status|destroy) CMD="$1"; shift ;;
+        *) EXTRA+=("$1"); shift ;;
+    esac
+done
+[[ -n "$CMD" ]] || die "usage: autumn-deploy -t <topology.conf> <check|deploy|start|stop|restart|status|destroy>"
+[[ -n "$TOPOLOGY" ]] || TOPOLOGY="$SCRIPT_DIR/topology.conf"
+[[ -f "$TOPOLOGY" ]] || die "topology file not found: $TOPOLOGY"
+
+# ---------------------------------------------------------------------------
+# load + validate topology
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC1090
+source "$TOPOLOGY"
+
+: "${DEPLOY_DIR:?topology must set DEPLOY_DIR}"
+: "${DATA_ROOT:?topology must set DATA_ROOT}"
+TRANSPORT="${TRANSPORT:-tcp}"
+SERVICE_BACKEND="${SERVICE_BACKEND:-auto}"
+SSH_USER="${SSH_USER:-$(id -un)}"
+SSH_OPTS="${SSH_OPTS:-}"
+MANAGER_PORT="${MANAGER_PORT:-9001}"
+EN_BASE_PORT="${EN_BASE_PORT:-9101}"
+PS_BASE_PORT="${PS_BASE_PORT:-9301}"
+PS_PORT_STRIDE="${PS_PORT_STRIDE:-200}"
+# etcd port bases (member m: client CLIENT_BASE+m*10, peer PEER_BASE+m*10).
+# Override to run multiple isolated clusters on one host.
+ETCD_CLIENT_BASE_PORT="${ETCD_CLIENT_BASE_PORT:-2379}"
+ETCD_PEER_BASE_PORT="${ETCD_PEER_BASE_PORT:-2380}"
+BIN_DIR="$DEPLOY_DIR/bin"
+
+case "$TRANSPORT" in tcp|ucx) ;; *) die "TRANSPORT must be tcp or ucx" ;; esac
+[[ "${#ETCD_HOSTS[@]}" -ge 1 ]]    || die "ETCD_HOSTS is empty"
+[[ "${#MANAGER_HOSTS[@]}" -ge 1 ]] || die "MANAGER_HOSTS is empty"
+[[ "${#EN_NODES[@]}" -ge 1 ]]      || die "EN_NODES is empty"
+[[ "${#PS_HOSTS[@]}" -ge 1 ]]      || die "PS_HOSTS is empty"
+
+# v1 supports single-shard extent nodes only. A multi-core AUTUMN_EXTENT_CPUSET
+# makes the EN bind K shard ports, but the `autumn-op format` call below
+# registers only the base port (no --shard-ports), so the manager would route
+# per-extent ops to the wrong shard. Reject it (use cluster.sh for multi-shard).
+if [[ -n "${AUTUMN_EXTENT_CPUSET:-}" ]]; then
+    _cpu_n=0
+    for _seg in ${AUTUMN_EXTENT_CPUSET//,/ }; do
+        if [[ "$_seg" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            _cpu_n=$(( _cpu_n + BASH_REMATCH[2] - BASH_REMATCH[1] + 1 ))
+        elif [[ "$_seg" =~ ^[0-9]+$ ]]; then
+            _cpu_n=$(( _cpu_n + 1 ))
+        fi
+    done
+    (( _cpu_n <= 1 )) || die "AUTUMN_EXTENT_CPUSET='$AUTUMN_EXTENT_CPUSET' spans $_cpu_n cores; autumn-deploy v1 is single-shard EN only (multi-shard needs --shard-ports registration — use cluster.sh)"
+fi
+
+# Derived address lists (MANAGER_LIST / MANAGER_FIRST / ETCD_ENDPOINTS) are
+# built by build_addr_lists() near the bottom, after the helper functions it
+# needs are defined.
+
+# ---------------------------------------------------------------------------
+# address helpers
+# ---------------------------------------------------------------------------
+bracket_ip_static() {
+    local ip="$1"
+    if [[ "$ip" == *:* && "$ip" != \[* ]]; then echo "[$ip]"; else echo "$ip"; fi
+}
+
+# host with brackets stripped, for SSH / port checks
+plain_host() { local h="$1"; h="${h#[}"; h="${h%]}"; echo "$h"; }
+
+is_local() {
+    local h; h="$(plain_host "$1")"
+    [[ "$h" == "127.0.0.1" || "$h" == "::1" || "$h" == "localhost" || "$h" == "$(hostname)" ]]
+}
+
+# Run a command string on a host (local = bash -c, remote = ssh).
+on_host() {
+    local host; host="$(plain_host "$1")"; shift
+    local cmd="$1"
+    if is_local "$host"; then
+        bash -c "$cmd"
+    else
+        # shellcheck disable=SC2086
+        ssh $SSH_OPTS "${SSH_USER}@${host}" "$cmd"
+    fi
+}
+
+# Copy a local file to host:dest.
+copy_to_host() {
+    local src="$1" host; host="$(plain_host "$2")"; local dest="$3"
+    if is_local "$host"; then
+        [[ "$src" == "$dest" ]] || { mkdir -p "$(dirname "$dest")"; cp -f "$src" "$dest"; }
+    else
+        # shellcheck disable=SC2086
+        scp $SSH_OPTS -q "$src" "${SSH_USER}@${host}:${dest}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# service backend  (systemd vs process), detected + cached per host
+# ---------------------------------------------------------------------------
+declare -A _BACKEND_CACHE=()
+
+host_backend() {
+    local host="$1"
+    if [[ "$SERVICE_BACKEND" != "auto" ]]; then echo "$SERVICE_BACKEND"; return; fi
+    local key; key="$(plain_host "$host")"
+    if [[ -n "${_BACKEND_CACHE[$key]:-}" ]]; then echo "${_BACKEND_CACHE[$key]}"; return; fi
+    local b
+    # systemd iff booted-with-systemd AND we can manage units (root, or a
+    # passwordless sudo). Otherwise fall back to the process backend.
+    if on_host "$host" '[ -d /run/systemd/system ] && { [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; }' 2>/dev/null; then
+        b="systemd"
+    else
+        b="process"
+    fi
+    _BACKEND_CACHE[$key]="$b"
+    echo "$b"
+}
+
+# sudo prefix on a systemd host when not already root.
+_sudo_prefix() {
+    local host="$1"
+    if on_host "$host" '[ "$(id -u)" = 0 ]' 2>/dev/null; then echo ""; else echo "sudo "; fi
+}
+
+# Write a systemd unit file on a host.
+write_unit() {
+    local host="$1" name="$2" content="$3"
+    local sp; sp="$(_sudo_prefix "$host")"
+    local path="/etc/systemd/system/${name}.service"
+    if is_local "$host"; then
+        printf '%s' "$content" | ${sp}tee "$path" >/dev/null
+    else
+        # shellcheck disable=SC2086
+        printf '%s' "$content" | ssh $SSH_OPTS "${SSH_USER}@$(plain_host "$host")" "${sp}tee '$path' >/dev/null"
+    fi
+}
+
+# Render + start one service instance.
+#   svc_start <host> <inst> <workdir> <bin> <arg>...
+svc_start() {
+    local host="$1" inst="$2" workdir="$3" bin="$4"; shift 4
+    local backend; backend="$(host_backend "$host")"
+    local -a argv=("$bin" "$@")
+    if [[ "$backend" == "systemd" ]]; then
+        # systemd parses ExecStart with ITS OWN rules, not a shell. Do NOT
+        # shell-quote: printf %q escapes the comma in a manager list to "\,",
+        # which systemd passes through literally and corrupts the address. Our
+        # argv contains no spaces (IPs / ports / paths), so a plain space-join
+        # is the correct systemd form.
+        local q="${argv[*]}"
+        local unit
+        unit="$(cat <<UNIT
+[Unit]
+Description=autumn-rs ${inst}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${workdir}
+ExecStart=${q}
+Restart=on-failure
+RestartSec=2
+# RDMA (UCX) pins registered buffers via ibv_reg_mr against RLIMIT_MEMLOCK;
+# harmless for TCP. See cluster.sh's rationale.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+TimeoutStopSec=70
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+)"
+        # WorkingDirectory must exist before start, else systemd fails the unit
+        # (e.g. after `destroy --wipe` deleted DATA_ROOT but the binaries remain,
+        # so do_start skips redeploy).
+        on_host "$host" "mkdir -p '$workdir'"
+        write_unit "$host" "autumn-$inst" "$unit"
+        local sp; sp="$(_sudo_prefix "$host")"
+        on_host "$host" "${sp}systemctl daemon-reload && ${sp}systemctl enable --now autumn-$inst"
+    else
+        local pidf="$DATA_ROOT/pids/$inst.pid" logf="$DATA_ROOT/logs/$inst.log"
+        local q; printf -v q '%q ' "${argv[@]}"
+        # Refuse to start over a live instance: a second start would fail to bind
+        # and overwrite the pidfile with the dead new PID, orphaning the old
+        # process (which `destroy --wipe` would then leave running while deleting
+        # its data). A zombie (Z) is treated as gone. cd runs in the foreground;
+        # nohup (which execs the binary on Linux and macOS) is backgrounded
+        # alone, so $! is the binary's PID — the one svc_stop must signal.
+        local out
+        out="$(on_host "$host" "
+            if [ -f '$pidf' ]; then
+                oldpid=\$(cat '$pidf' 2>/dev/null)
+                if [ -n \"\$oldpid\" ] && kill -0 \"\$oldpid\" 2>/dev/null; then
+                    st=\$(ps -o stat= -p \"\$oldpid\" 2>/dev/null | tr -d ' ')
+                    case \"\$st\" in Z*) : ;; *) echo \"__RUNNING__ \$oldpid\"; exit 0 ;; esac
+                fi
+            fi
+            mkdir -p '$DATA_ROOT/pids' '$DATA_ROOT/logs' '$workdir'
+            cd '$workdir'; nohup $q >'$logf' 2>&1 & echo \$! > '$pidf'")"
+        if [[ "$out" == *__RUNNING__* ]]; then
+            die "$inst already running on $host (pid ${out##*__RUNNING__ }); 'stop' or 'restart' first"
+        fi
+    fi
+}
+
+svc_stop() {
+    local host="$1" inst="$2"
+    local backend; backend="$(host_backend "$host")"
+    if [[ "$backend" == "systemd" ]]; then
+        local sp; sp="$(_sudo_prefix "$host")"
+        on_host "$host" "${sp}systemctl stop autumn-$inst 2>/dev/null; ${sp}systemctl disable autumn-$inst 2>/dev/null" || true
+    else
+        local pidf="$DATA_ROOT/pids/$inst.pid"
+        # SIGTERM, wait up to 70s (PS drains imm to row_stream), then SIGKILL.
+        # Guards ported from cluster.sh's proc_alive: (a) a zombie (Z) is "gone"
+        # — kill -0 succeeds on a corpse but kill -9 is a no-op, so waiting would
+        # burn the full 70s; (b) a stale pidfile whose PID was reused by an
+        # UNRELATED process (its `ps args` names neither autumn nor etcd) is not
+        # ours — skip the kill instead of signalling a stranger.
+        on_host "$host" "
+            if [ -f '$pidf' ]; then
+                pid=\$(cat '$pidf' 2>/dev/null)
+                if [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null; then
+                    args=\$(ps -o args= -p \"\$pid\" 2>/dev/null)
+                    st=\$(ps -o stat= -p \"\$pid\" 2>/dev/null | tr -d ' ')
+                    case \"\$st\" in Z*) mine=0 ;; *)
+                        case \"\$args\" in *autumn*|*etcd*) mine=1 ;; *) mine=0 ;; esac ;;
+                    esac
+                    if [ \"\$mine\" = 1 ]; then
+                        kill \"\$pid\" 2>/dev/null || true
+                        i=0
+                        while kill -0 \"\$pid\" 2>/dev/null && [ \$i -lt 700 ]; do
+                            st2=\$(ps -o stat= -p \"\$pid\" 2>/dev/null | tr -d ' ')
+                            case \"\$st2\" in Z*) break ;; esac
+                            sleep 0.1; i=\$((i+1))
+                        done
+                        st3=\$(ps -o stat= -p \"\$pid\" 2>/dev/null | tr -d ' ')
+                        case \"\$st3\" in Z*) : ;; *) kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true ;; esac
+                    fi
+                fi
+                rm -f '$pidf'
+            fi" || true
+    fi
+}
+
+svc_status() {
+    local host="$1" inst="$2"
+    local backend; backend="$(host_backend "$host")"
+    if [[ "$backend" == "systemd" ]]; then
+        on_host "$host" "systemctl is-active autumn-$inst 2>/dev/null" || echo "inactive"
+    else
+        local pidf="$DATA_ROOT/pids/$inst.pid"
+        on_host "$host" "if [ -f '$pidf' ] && kill -0 \$(cat '$pidf') 2>/dev/null; then echo active; else echo inactive; fi" 2>/dev/null || echo "inactive"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# instance derivation
+# ---------------------------------------------------------------------------
+# etcd:    inst=etcd$m  host=ETCD_HOSTS[m]  cport=2379+m*10 pport=2380+m*10
+# manager: inst=manager$m host=MANAGER_HOSTS[m] port=MANAGER_PORT
+# en:      inst=en$i    host + dirs from EN_NODES[i]  port=EN_BASE_PORT+i
+# ps:      inst=ps$i    host=PS_HOSTS[i]  psid=i+1  port=PS_BASE_PORT+i*STRIDE
+
+en_host()  { echo "${EN_NODES[$1]%%|*}"; }
+en_dirs()  { echo "${EN_NODES[$1]#*|}"; }              # comma-separated
+en_port()  { echo "$(( EN_BASE_PORT + $1 ))"; }
+ps_port()  { echo "$(( PS_BASE_PORT + $1 * PS_PORT_STRIDE ))"; }
+
+# etcd initial-cluster string (multi-member).
+etcd_initial_cluster() {
+    local ic="" m pport
+    for (( m = 0; m < ${#ETCD_HOSTS[@]}; m++ )); do
+        pport=$(( ETCD_PEER_BASE_PORT + m * 10 ))
+        ic+="${ic:+,}etcd$m=http://$(plain_host "${ETCD_HOSTS[$m]}"):$pport"
+    done
+    echo "$ic"
+}
+
+# ---------------------------------------------------------------------------
+# wait helpers  (run from the deploy host, over the network)
+# ---------------------------------------------------------------------------
+op() { "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" --transport "$TRANSPORT" "$@"; }
+
+wait_manager_leader() {
+    log "waiting for manager leadership at $MANAGER_LIST"
+    local i
+    for (( i = 0; i < 120; i++ )); do
+        if op info >/dev/null 2>&1; then log "manager leader ready"; return 0; fi
+        sleep 1
+    done
+    die "manager not answering leader-gated info"
+}
+
+wait_nodes_online() {
+    local want="$1" i n
+    log "waiting for $want extent node(s) Online"
+    for (( i = 0; i < 60; i++ )); do
+        n="$(op list-nodes 2>/dev/null | grep -c Online || true)"
+        (( n >= want )) && { log "$n node(s) Online"; return 0; }
+        sleep 5
+    done
+    die "only ${n:-0}/$want extent node(s) Online"
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+do_check() {
+    log "topology: $TOPOLOGY"
+    log "transport=$TRANSPORT  backend(request)=$SERVICE_BACKEND  deploy_dir=$DEPLOY_DIR"
+    # local binaries present?
+    local b
+    for b in "${SERVER_BINS[@]}"; do
+        [[ -x "$BIN_SRC/$b" ]] || die "missing binary $BIN_SRC/$b — run: cargo build --release -p autumn-server"
+    done
+    log "local binaries: OK ($BIN_SRC)"
+    # port collisions on the same host
+    _check_port_collisions
+    # per-host reachability + backend + etcd presence
+    local -A seen=()
+    local host
+    for host in "${ETCD_HOSTS[@]}" "${MANAGER_HOSTS[@]}" "${PS_HOSTS[@]}"; do
+        seen["$(plain_host "$host")"]=1
+    done
+    local i
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do seen["$(plain_host "$(en_host "$i")")"]=1; done
+    for host in "${!seen[@]}"; do
+        if on_host "$host" 'true' 2>/dev/null; then
+            log "host $host: reachable, backend=$(host_backend "$host")"
+        else
+            die "host $host: unreachable (ssh $SSH_USER@$host failed)"
+        fi
+    done
+    for host in "${ETCD_HOSTS[@]}"; do
+        on_host "$host" 'command -v etcd >/dev/null 2>&1 || [ -x '"'$BIN_DIR/etcd'"' ]' 2>/dev/null \
+            || log "WARN: etcd not found on $host (install etcd >=3.5 in PATH or $BIN_DIR)"
+    done
+    log "check OK"
+}
+
+_check_port_collisions() {
+    local -A used=()
+    local i host port key
+    # ETCD client ports
+    for (( i = 0; i < ${#ETCD_HOSTS[@]}; i++ )); do
+        key="$(plain_host "${ETCD_HOSTS[$i]}"):$(( ETCD_CLIENT_BASE_PORT + i * 10 ))"
+        [[ -n "${used[$key]:-}" ]] && die "port collision at $key"; used[$key]=etcd$i
+    done
+    for (( i = 0; i < ${#MANAGER_HOSTS[@]}; i++ )); do
+        key="$(plain_host "${MANAGER_HOSTS[$i]}"):$MANAGER_PORT"
+        [[ -n "${used[$key]:-}" ]] && die "port collision at $key (manager$i vs ${used[$key]})"; used[$key]=manager$i
+    done
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do
+        key="$(plain_host "$(en_host "$i")"):$(en_port "$i")"
+        [[ -n "${used[$key]:-}" ]] && die "port collision at $key (en$i vs ${used[$key]})"; used[$key]=en$i
+    done
+    for (( i = 0; i < ${#PS_HOSTS[@]}; i++ )); do
+        key="$(plain_host "${PS_HOSTS[$i]}"):$(ps_port "$i")"
+        [[ -n "${used[$key]:-}" ]] && die "port collision at $key (ps$i vs ${used[$key]})"; used[$key]=ps$i
+    done
+}
+
+do_deploy() {
+    do_check
+    local -A seen=()
+    local host i
+    for host in "${ETCD_HOSTS[@]}" "${MANAGER_HOSTS[@]}" "${PS_HOSTS[@]}"; do seen["$(plain_host "$host")"]="$host"; done
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do seen["$(plain_host "$(en_host "$i")")"]="$(en_host "$i")"; done
+    for host in "${seen[@]}"; do
+        log "deploy → $host:$BIN_DIR"
+        on_host "$host" "mkdir -p '$BIN_DIR' '$DATA_ROOT'"
+        local b
+        for b in "${SERVER_BINS[@]}"; do copy_to_host "$BIN_SRC/$b" "$host" "$BIN_DIR/$b"; done
+    done
+    log "deploy OK — binaries staged on all hosts"
+}
+
+_start_etcd() {
+    local m host cport pport data ic
+    ic="$(etcd_initial_cluster)"
+    for (( m = 0; m < ${#ETCD_HOSTS[@]}; m++ )); do
+        host="${ETCD_HOSTS[$m]}"; cport=$(( ETCD_CLIENT_BASE_PORT + m * 10 )); pport=$(( ETCD_PEER_BASE_PORT + m * 10 ))
+        data="$DATA_ROOT/etcd$m"
+        local ph; ph="$(plain_host "$host")"
+        local etcd_bin; etcd_bin="etcd"
+        on_host "$host" "command -v etcd >/dev/null 2>&1 || [ -x '$BIN_DIR/etcd' ]" 2>/dev/null \
+            || die "etcd not found on $host"
+        on_host "$host" "command -v etcd >/dev/null 2>&1" 2>/dev/null || etcd_bin="$BIN_DIR/etcd"
+        # Always pass the peer + initial-cluster flags (a 1-member initial
+        # cluster is valid). Omitting them makes etcd default the peer URL to
+        # :2380, which ignores ETCD_PEER_BASE_PORT and collides with any other
+        # etcd on the host — the exact failure that breaks multi-cluster hosts.
+        # On restart of an existing data-dir etcd ignores --initial-cluster*.
+        svc_start "$host" "etcd$m" "$DATA_ROOT" "$etcd_bin" \
+            --name "etcd$m" --data-dir "$data" \
+            --listen-client-urls "http://0.0.0.0:$cport" \
+            --advertise-client-urls "http://$ph:$cport" \
+            --listen-peer-urls "http://0.0.0.0:$pport" \
+            --initial-advertise-peer-urls "http://$ph:$pport" \
+            --initial-cluster "$ic" --initial-cluster-state new
+    done
+    # Surface an etcd bind failure now (else it only shows up as a 120s
+    # manager-leader timeout).
+    for (( m = 0; m < ${#ETCD_HOSTS[@]}; m++ )); do
+        wait_tcp "${ETCD_HOSTS[$m]}" "$(( ETCD_CLIENT_BASE_PORT + m * 10 ))" 40 "etcd$m"
+    done
+}
+
+# Poll a host:port until it accepts a TCP connection (bash /dev/tcp, no nc dep).
+wait_tcp() {
+    local host; host="$(plain_host "$1")"; local port="$2" tries="${3:-40}" name="${4:-$1:$2}"
+    local i
+    for (( i = 0; i < tries; i++ )); do
+        if on_host "$host" "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then return 0; fi
+        sleep 0.5
+    done
+    die "$name did not open $host:$port in time"
+}
+
+_start_managers() {
+    local m host
+    local -a extra=()
+    [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && extra+=(--policy-fast-mode)
+    [[ "${AUTUMN_METRICS:-0}" == "1" ]] && extra+=(--metrics-port 9591)
+    if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
+        extra+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
+        [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && extra+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
+        local p; for p in ${AUTUMN_AUTH_PROTECTED_PREFIXES:-}; do extra+=(--auth-protected-prefix "$p"); done
+        [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]] && extra+=(--auth-token-ttl-secs "$AUTUMN_AUTH_TOKEN_TTL_SECS")
+    fi
+    for (( m = 0; m < ${#MANAGER_HOSTS[@]}; m++ )); do
+        host="${MANAGER_HOSTS[$m]}"
+        svc_start "$host" "manager$m" "$DATA_ROOT" "$BIN_DIR/autumn-manager-server" \
+            --port "$MANAGER_PORT" --etcd "$ETCD_ENDPOINTS" \
+            --listen "$(plain_host "$host")" --transport "$TRANSPORT" \
+            ${extra[@]:+"${extra[@]}"}
+    done
+    wait_manager_leader
+}
+
+_format_and_start_ens() {
+    local i host dirs port ph
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do
+        host="$(en_host "$i")"; dirs="$(en_dirs "$i")"; port="$(en_port "$i")"; ph="$(plain_host "$host")"
+        # Ensure dirs exist, then idempotently format (F214-C: re-running on a
+        # formatted dir reuses disk_uuid + re-registers same node).
+        local dirs_sp="${dirs//,/ }"
+        on_host "$host" "mkdir -p $dirs_sp"
+        log "format en$i ($host:$port, dirs=$dirs)"
+        on_host "$host" "'$BIN_DIR/autumn-op' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format --listen ':$port' --advertise '$(bracket_ip_static "$host"):$port' $dirs_sp"
+        svc_start "$host" "en$i" "$DATA_ROOT" "$BIN_DIR/autumn-extent-node" \
+            --port "$port" --data "$dirs" --manager "$MANAGER_FIRST" \
+            --listen "$ph" --transport "$TRANSPORT" --cpuset "${AUTUMN_EXTENT_CPUSET:-0}"
+    done
+    sleep 3
+}
+
+_bootstrap() {
+    # Guard: bootstrap is NOT idempotent (a second run creates duplicate
+    # streams/partitions). Skip if streams already exist — same semantics as
+    # cluster.sh's etcd streams/ check. Only `info --full` emits the streams
+    # array (with "stream_id") + the partitions array (with "part_id").
+    local info; info="$(op --json info --full 2>/dev/null || true)"
+    if grep -q '"stream_id"' <<<"$info"; then
+        if grep -q '"part_id"' <<<"$info"; then
+            log "already bootstrapped (streams + partition exist) — skipping"
+        else
+            # Streams but no partition = a bootstrap that died mid-way (bootstrap
+            # creates streams, then upserts the partition). We do NOT re-run
+            # (that would create duplicate streams), but this is not a healthy
+            # cluster — surface it loudly for manual repair.
+            log "WARN: streams exist but NO partition — cluster looks HALF-bootstrapped."
+            log "WARN: not re-running bootstrap (would duplicate streams). Inspect 'autumn-op info --full' and repair."
+        fi
+        return 0
+    fi
+    wait_nodes_online "${#EN_NODES[@]}"
+    local n=${#EN_NODES[@]}
+    local meta_repl=$(( n >= 3 ? 3 : n ))
+    local ec_default=""
+    (( n == 4 )) && ec_default="3+1"
+    (( n >= 5 )) && ec_default="4+1"
+    local log_ec row_ec
+    case "${EC_LOG:-}" in off) log_ec="" ;; ?*) log_ec="$EC_LOG" ;; *) log_ec="$ec_default" ;; esac
+    case "${EC_ROW:-}" in off) row_ec="" ;; ?*) row_ec="$EC_ROW" ;; *) row_ec="$ec_default" ;; esac
+    local -a args=(--replication "${REPLICATION:-${meta_repl}+0}")
+    [[ -n "$log_ec" ]] && args+=(--log-ec "$log_ec")
+    [[ -n "$row_ec" ]] && args+=(--row-ec "$row_ec")
+    [[ -n "${PRESPLIT:-}" ]] && args+=(--presplit "${PRESPLIT}:hexstring")
+    log "bootstrap ${args[*]}"
+    op bootstrap "${args[@]}"
+}
+
+# PS AUTUMN_* → flag table (same subset as the container entrypoint).
+_ps_tunable_args() {
+    local -a pairs=(
+        "AUTUMN_GROUP_COMMIT_CAP:--group-commit-cap"
+        "AUTUMN_PS_INFLIGHT_CAP:--ps-inflight-cap"
+        "AUTUMN_PS_FLUSH_INFLIGHT_CAP:--flush-inflight-cap"
+        "AUTUMN_PS_BULK_INFLIGHT_CAP:--ps-bulk-inflight-cap"
+        "AUTUMN_PS_MAX_IMM_DEPTH:--max-imm-depth"
+        "AUTUMN_PS_MAX_WAL_GAP:--max-wal-gap"
+        "AUTUMN_PS_SHUTDOWN_TIMEOUT_MS:--shutdown-timeout-ms"
+        "AUTUMN_PS_MAJOR_COMPACT_PARALLELISM:--major-compact-parallelism"
+        "AUTUMN_PS_GC_PARALLELISM:--gc-parallelism"
+        "AUTUMN_PS_CONN_INFLIGHT_CAP:--conn-inflight-cap"
+        "AUTUMN_PS_FG_RATE_BYTES_PER_SEC:--fg-rate-bytes-per-sec"
+        "AUTUMN_PS_FG_IOPS_PER_SEC:--fg-iops-per-sec"
+        "AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC:--admission-compact-rate-bytes-per-sec"
+        "AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC:--admission-gc-rate-bytes-per-sec"
+        "AUTUMN_PS_FG_SATURATED_THRESHOLD:--fg-saturated-threshold"
+        "AUTUMN_PS_FG_QPS_QUOTA:--fg-qps-quota"
+        "AUTUMN_PS_GC_DEBT_HIGH_BYTES:--gc-debt-high-bytes"
+        "AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES:--compact-pending-high-bytes"
+        "AUTUMN_PS_GC_COOLDOWN_SECS:--gc-cooldown-secs"
+        "AUTUMN_PS_COMPACT_COOLDOWN_SECS:--compact-cooldown-secs"
+        "AUTUMN_READ_HEDGE_MS:--read-hedge-ms"
+        "AUTUMN_APPEND_CHAIN_MIN_BYTES:--append-chain-min-bytes"
+        "AUTUMN_SST_BLOCK_CACHE_BYTES:--sst-block-cache-bytes"
+        "AUTUMN_PS_GC_READ_CHUNK_BYTES:--gc-read-chunk-bytes"
+        "AUTUMN_PS_GC_BATCH_RECORDS:--gc-batch-records"
+        "AUTUMN_PS_GC_BATCH_BYTES:--gc-batch-bytes"
+        "AUTUMN_PS_GC_RATE_BYTES_PER_SEC:--gc-rate-bytes-per-sec"
+    )
+    local pair name flag
+    for pair in "${pairs[@]}"; do
+        name="${pair%%:*}"; flag="${pair#*:}"
+        [[ -n "${!name:-}" ]] && printf '%s\n%s\n' "$flag" "${!name}"
+    done
+}
+
+_start_ps() {
+    local i host port ph psid
+    local -a tun=()
+    mapfile -t tun < <(_ps_tunable_args)
+    for (( i = 0; i < ${#PS_HOSTS[@]}; i++ )); do
+        host="${PS_HOSTS[$i]}"; port="$(ps_port "$i")"; ph="$(plain_host "$host")"; psid=$(( i + 1 ))
+        local -a inst_args=("${tun[@]}")
+        # Per-instance metrics port so multiple PS on one host don't all bind
+        # 9701 (their data ports are already strided by PS_PORT_STRIDE).
+        [[ "${AUTUMN_METRICS:-0}" == "1" ]] && inst_args+=(--metrics-port "$(( 9701 + i ))")
+        svc_start "$host" "ps$i" "$DATA_ROOT" "$BIN_DIR/autumn-ps" \
+            --psid "$psid" --port "$port" --manager "$MANAGER_LIST" \
+            --listen "$ph" --advertise "$(bracket_ip_static "$host"):$port" \
+            --transport "$TRANSPORT" ${inst_args[@]:+"${inst_args[@]}"}
+    done
+    wait_ps_ready
+}
+
+# Wait until at least one partition is served with a registered PS address.
+# On (re)start the PS re-opens partitions and re-registers their per-partition
+# addresses; until it does, a client GetRegions can return a range with no
+# routable PS ("key is out of range"). Poll info for a partition that has both
+# a part_id and a non-empty ps_addr.
+wait_ps_ready() {
+    local i out
+    for (( i = 0; i < 60; i++ )); do
+        out="$(op --json info 2>/dev/null || true)"
+        if grep -q '"part_id"' <<<"$out" && grep -Eq '"ps_addr": "[0-9[]' <<<"$out"; then
+            log "partition(s) served — PS ready"
+            return 0
+        fi
+        sleep 1
+    done
+    log "WARN: PS partitions not fully registered after 60s (routing may be briefly stale)"
+}
+
+do_start() {
+    # binaries must be staged; deploy is idempotent so run it if bin dir is empty.
+    if ! on_host "${MANAGER_HOSTS[0]}" "[ -x '$BIN_DIR/autumn-manager-server' ]" 2>/dev/null; then
+        log "binaries not staged — running deploy first"
+        do_deploy
+    fi
+    _start_etcd
+    _start_managers
+    _format_and_start_ens
+    _bootstrap
+    _start_ps
+    log "cluster started."
+    log "  manager(s): $MANAGER_LIST"
+    log "  data plane: $BIN_SRC/autumn-client --manager $MANAGER_LIST put mykey /path"
+    log "  op plane:   $BIN_SRC/autumn-op --manager $MANAGER_LIST info"
+}
+
+# Stop in reverse dependency order.
+do_stop() {
+    local role="${EXTRA[0]:-}"
+    local i
+    if [[ -z "$role" || "$role" == "ps" ]]; then
+        for (( i = ${#PS_HOSTS[@]} - 1; i >= 0; i-- )); do svc_stop "${PS_HOSTS[$i]}" "ps$i"; done
+    fi
+    if [[ -z "$role" || "$role" == "en" ]]; then
+        for (( i = ${#EN_NODES[@]} - 1; i >= 0; i-- )); do svc_stop "$(en_host "$i")" "en$i"; done
+    fi
+    if [[ -z "$role" || "$role" == "manager" ]]; then
+        for (( i = ${#MANAGER_HOSTS[@]} - 1; i >= 0; i-- )); do svc_stop "${MANAGER_HOSTS[$i]}" "manager$i"; done
+    fi
+    if [[ -z "$role" || "$role" == "etcd" ]]; then
+        for (( i = ${#ETCD_HOSTS[@]} - 1; i >= 0; i-- )); do svc_stop "${ETCD_HOSTS[$i]}" "etcd$i"; done
+    fi
+    log "stopped${role:+ ($role)}"
+}
+
+do_restart() {
+    local role="${EXTRA[0]:-}"
+    case "$role" in
+        etcd)    do_stop etcd; _start_etcd ;;
+        manager) do_stop manager; _start_managers ;;
+        en)      do_stop en; _format_and_start_ens ;;
+        ps)      do_stop ps; _start_ps ;;
+        "")      do_stop; do_start ;;
+        *)       die "restart: unknown role '$role' (etcd|manager|en|ps)" ;;
+    esac
+}
+
+do_status() {
+    local i host
+    for (( i = 0; i < ${#ETCD_HOSTS[@]}; i++ )); do
+        printf '  %-10s %-22s %s\n' "etcd$i" "${ETCD_HOSTS[$i]}:$(( ETCD_CLIENT_BASE_PORT + i * 10 ))" "$(svc_status "${ETCD_HOSTS[$i]}" "etcd$i")"
+    done
+    for (( i = 0; i < ${#MANAGER_HOSTS[@]}; i++ )); do
+        printf '  %-10s %-22s %s\n' "manager$i" "${MANAGER_HOSTS[$i]}:$MANAGER_PORT" "$(svc_status "${MANAGER_HOSTS[$i]}" "manager$i")"
+    done
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do
+        printf '  %-10s %-22s %s\n' "en$i" "$(en_host "$i"):$(en_port "$i")" "$(svc_status "$(en_host "$i")" "en$i")"
+    done
+    for (( i = 0; i < ${#PS_HOSTS[@]}; i++ )); do
+        printf '  %-10s %-22s %s\n' "ps$i" "${PS_HOSTS[$i]}:$(ps_port "$i")" "$(svc_status "${PS_HOSTS[$i]}" "ps$i")"
+    done
+}
+
+do_destroy() {
+    do_stop
+    local wipe=0
+    [[ "${EXTRA[0]:-}" == "--wipe" ]] && wipe=1
+    if (( wipe )); then
+        local -A seen=(); local host i
+        for host in "${ETCD_HOSTS[@]}" "${MANAGER_HOSTS[@]}" "${PS_HOSTS[@]}"; do seen["$(plain_host "$host")"]=1; done
+        for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do seen["$(plain_host "$(en_host "$i")")"]=1; done
+        for host in "${!seen[@]}"; do
+            log "wipe $host:$DATA_ROOT"
+            on_host "$host" "rm -rf '$DATA_ROOT'" || true
+        done
+        # EN data dirs may live outside DATA_ROOT.
+        for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do
+            local en_dirs_sp; en_dirs_sp="$(en_dirs "$i" | tr ',' ' ')"
+            on_host "$(en_host "$i")" "rm -rf $en_dirs_sp" || true
+        done
+        log "destroyed + wiped"
+    else
+        log "destroyed (data preserved; --wipe to delete)"
+    fi
+}
+
+# Build the derived address lists now that all helpers are defined.
+build_addr_lists() {
+    local m
+    # Manager endpoint list (full list → PS + clients rotate on NOT_LEADER).
+    MANAGER_LIST=""
+    for (( m = 0; m < ${#MANAGER_HOSTS[@]}; m++ )); do
+        MANAGER_LIST+="${MANAGER_LIST:+,}$(bracket_ip_static "${MANAGER_HOSTS[$m]}"):$MANAGER_PORT"
+    done
+    # EN takes a SINGLE manager address (its background calls don't comma-split).
+    MANAGER_FIRST="$(bracket_ip_static "${MANAGER_HOSTS[0]}"):$MANAGER_PORT"
+    # etcd endpoint list for managers (client ports 2379 + m*10).
+    ETCD_ENDPOINTS=""
+    for (( m = 0; m < ${#ETCD_HOSTS[@]}; m++ )); do
+        ETCD_ENDPOINTS+="${ETCD_ENDPOINTS:+,}$(bracket_ip_static "${ETCD_HOSTS[$m]}"):$(( ETCD_CLIENT_BASE_PORT + m * 10 ))"
+    done
+}
+build_addr_lists
+
+case "$CMD" in
+    check)   do_check ;;
+    deploy)  do_deploy ;;
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_restart ;;
+    status)  do_status ;;
+    destroy) do_destroy ;;
+esac

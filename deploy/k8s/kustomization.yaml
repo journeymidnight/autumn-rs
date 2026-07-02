@@ -1,0 +1,26 @@
+# kubectl apply -k deploy/k8s
+#
+# Applies namespace + ConfigMap + etcd + manager + extent-node + partition-server
+# + the one-shot bootstrap Job. Ordering is handled by the entrypoints' wait
+# loops (each role waits for the manager leader; bootstrap also waits for
+# AUTUMN_EXPECT_NODES extent nodes Online), so apply order does not matter.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - etcd.yaml
+  - manager.yaml
+  - extent-node.yaml
+  - partition-server.yaml
+  - bootstrap-job.yaml
+
+# Override the image tag centrally, e.g.:
+#   images:
+#     - name: autumn-rs
+#       newTag: v1.2.3
+images:
+  - name: autumn-rs
+    newName: autumn-rs
+    newTag: latest

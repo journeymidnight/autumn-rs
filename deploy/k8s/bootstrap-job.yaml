@@ -1,0 +1,32 @@
+# One-shot cluster bootstrap (create streams + initial partition). `autumn-op
+# bootstrap` is NOT idempotent — a second run creates DUPLICATE streams — so
+# this runs as a Job (not a Deployment) and the entrypoint guards it: it skips
+# if streams already exist (leader-gated `info --full`). The Job waits for the
+# manager leader + AUTUMN_EXPECT_NODES extent nodes Online before creating
+# streams. Safe to re-apply; converges to a single bootstrap.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: autumn-bootstrap
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 10
+  # Reap the finished Job automatically 5 min after completion.
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: autumn-rs:latest
+          imagePullPolicy: IfNotPresent
+          args: ["bootstrap"]
+          envFrom:
+            - configMapRef: { name: autumn-config }

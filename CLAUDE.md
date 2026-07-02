@@ -257,6 +257,25 @@ cargo test -p autumn-manager
 cargo test --workspace
 ```
 
+## Deployment (F-K8S-1 / F-BM-1, 2026-07-02)
+
+Three ways to bring up a cluster — do NOT conflate them:
+
+| Path | Purpose | Location |
+|---|---|---|
+| `deploy/baremetal/autumn-deploy` | **deploy** on physical servers (single/multi-host); systemd on Linux, backgrounded-process backend on macOS/containers/non-root | `deploy/baremetal/` + `docs/baremetal_deploy.md` |
+| `deploy/k8s/` (+ `deploy/docker/`) | **deploy** on Kubernetes (one image, kustomize base, guarded bootstrap Job) | `deploy/k8s/` + `docs/k8s_deploy.md` |
+| `cluster.sh`, `scripts/*_chaos.sh` | dev/chaos/perf **TEST harness** — needs raw process kill/restart for fault injection; NOT a deployment tool | repo root |
+
+`start.sh` / `stop.sh` were deleted (superseded by autumn-deploy's single-host
+topology). env→flag translation stays in the shell layer (entrypoint.sh /
+autumn-deploy), never in Rust ([[feedback_no_env_in_rs]]). Deploy-critical
+binary facts: no DNS (SocketAddr::parse only — the shell resolves names to IPs);
+EN identity = advertise address, never re-registered (needs a stable IP →
+per-pod ClusterIP in k8s); PS re-registers per-partition addrs on open (pod IP
+is safe); `format` idempotent, `bootstrap` NOT (streams-guarded). Validate
+manifests clusterless with `bash deploy/validate.sh`.
+
 ## Key External Dependencies
 
 - `compio`: completion-based I/O runtime (thread-per-core, replaces tokio)

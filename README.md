@@ -63,34 +63,59 @@ cargo build --release -p autumn-server --features ucx
 ```
 See `crates/transport/CLAUDE.md` for the UCX runtime selection rules.
 
-## Quick Start (single-host dev cluster)
+## Deployment
 
-The repo ships `start.sh` / `stop.sh` for a 1-host cluster (etcd + manager + 5 ENs + 1 PS,
-data on local NVMes). Edit `DATA_DIRS` at the top of `start.sh` to match your disks; defaults
-target `/data{03,05,06,07,08}/autumn-rs`.
+autumn ships two deployment paths plus a test harness — pick by what you're doing:
+
+| Path | Use it for | Where |
+|---|---|---|
+| **`deploy/baremetal/autumn-deploy`** | production + single-host dev on physical servers (systemd on Linux, backgrounded process on macOS/containers) | `deploy/baremetal/`, `docs/baremetal_deploy.md` |
+| **`deploy/k8s/`** | Kubernetes (Dockerfile + kustomize manifests) | `deploy/k8s/`, `docs/k8s_deploy.md` |
+| **`cluster.sh`** | dev / chaos / perf **testing** only (raw process kill/restart for fault injection) | repo root — NOT a deployment tool |
+
+### Quick Start (single-host, replaces the old start.sh/stop.sh)
+
+`deploy/baremetal/autumn-deploy` reads a declarative topology and manages the cluster.
+The single-host example brings up etcd + manager + 3 ENs + 1 PS on the loopback:
 
 ```bash
-./start.sh                   # bring up the cluster, run bootstrap
-./target/release/autumn-op --manager 127.0.0.1:9001 info   # 5 nodes online, 1 partition
-./target/release/autumn-op --manager 127.0.0.1:9001 df     # cluster capacity (Ceph `ceph df` style)
+cargo build --release -p autumn-server
+cd deploy/baremetal
+# Edit topology-singlehost.conf's EN_NODES data dirs for your disks (defaults to /tmp).
+./autumn-deploy -t topology-singlehost.conf start     # ordered bring-up + bootstrap
+./autumn-deploy -t topology-singlehost.conf status
 
 # Basic KV
-AC="./target/release/autumn-client --manager 127.0.0.1:9001"
+AC="../../target/release/autumn-client --manager 127.0.0.1:9001"
 echo hello | $AC put mykey /dev/stdin
-$AC get mykey                                              # → hello
+$AC get mykey                                          # → hello
 
-./stop.sh                    # graceful shutdown
-./stop.sh --wipe             # shutdown + wipe data (clean re-bootstrap)
+./autumn-deploy -t topology-singlehost.conf stop           # graceful, keep data
+./autumn-deploy -t topology-singlehost.conf destroy --wipe # stop + wipe
 ```
 
-Env knobs (set before `./start.sh`):
-- `TRANSPORT=ucx` — use UCX instead of TCP (cluster must be UCX-built)
-- `EN_BASE_PORT=NNNNN` — move EN ports if 18101+ conflicts on your host
-- `WORK=/some/path` — override etcd + log + PS-local dir (default `/var/lib/autumn-rs`)
+On a host without systemd (macOS, containers, non-root), `autumn-deploy` auto-selects a
+**process backend** (backgrounded process + pidfile) — the same semantics the old
+`start.sh` had. On Linux with systemd + root/sudo it renders **systemd units**
+(`Restart=on-failure`, `LimitMEMLOCK=infinity`, boot-time enable). See
+`docs/baremetal_deploy.md` for multi-host topology, the SSH model, and the addressing rules.
 
-For full-feature multi-node / EC / chaos / per-process control use `cluster.sh` instead —
-it's a richer driver (auto-EC bootstrap, per-process kill/restart, affinity layout, presplit
-support). See `cluster.sh --help` and the test harness in `crates/manager/tests/support/`.
+### Kubernetes
+
+`deploy/k8s/` is a kustomize base (etcd + manager + extent-nodes + PS + a guarded
+bootstrap Job); one image (`deploy/docker/Dockerfile`) serves every role.
+
+```bash
+docker build -f deploy/docker/Dockerfile -t autumn-rs:latest .   # from repo root
+kind load docker-image autumn-rs:latest                          # or push to a registry
+kubectl apply -k deploy/k8s
+kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=300s
+kubectl -n autumn get pods        # etcd / manager / en-0..2 / ps-0 Running+Ready
+```
+
+Clusterless sanity check (no docker/kubectl needed): `bash deploy/validate.sh`.
+Design + scaling + addressing constraints (stable per-EN ClusterIPs, leader-gated
+manager Service, in-cluster clients only in v1): `docs/k8s_deploy.md`.
 
 ### Mount autumn-fuse
 
@@ -457,10 +482,10 @@ python3 python/audit_extent_refs.py     # --manager / --etcd / --op / --etcdctl 
 python3 python/patch_extent_refs.py 10:0 33:1            # dry-run (EID:new_refs)
 python3 python/patch_extent_refs.py 10:0 33:1 --apply   # backs up to /tmp before writing
 
-# Cluster lifecycle helpers
-./start.sh                               # this repo: 1-host 5-EN dev cluster
-./stop.sh --wipe                         # tear down + wipe
-./cluster.sh start 3                     # richer driver: 3-replica cluster + auto-EC
+# Cluster lifecycle (subshells so cwd stays at the repo root for ./cluster.sh)
+(cd deploy/baremetal && ./autumn-deploy -t topology-singlehost.conf start)         # deploy path
+(cd deploy/baremetal && ./autumn-deploy -t topology-singlehost.conf destroy --wipe) # tear down + wipe
+./cluster.sh start 3                     # TEST harness only: 3-replica + auto-EC + chaos hooks
 ```
 
 ## Chaos

@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autumn-config
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+data:
+  # Shared env consumed by deploy/docker/entrypoint.sh (env→flag translation
+  # lives in the entrypoint; the Rust binaries take only CLI flags).
+  AUTUMN_TRANSPORT: "tcp"
+  # Service names (resolved to ClusterIPs by the entrypoint — the binaries do
+  # not resolve DNS themselves).
+  AUTUMN_ETCD_ENDPOINTS: "autumn-etcd:2379"
+  AUTUMN_MANAGER: "autumn-manager:9001"
+  # Bootstrap waits for this many extent nodes Online before creating streams.
+  # MUST equal the extent-node StatefulSet replica count.
+  AUTUMN_EXPECT_NODES: "3"
+  # EC + replication defaults follow cluster.sh (auto by node count). To force:
+  # AUTUMN_REPLICATION: "3+0"
+  # AUTUMN_EC_LOG: "off"
+  # AUTUMN_EC_ROW: "off"
+  # AUTUMN_BOOTSTRAP_PRESPLIT: "8"

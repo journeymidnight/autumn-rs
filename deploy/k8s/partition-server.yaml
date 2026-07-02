@@ -1,0 +1,71 @@
+# Partition layer (KV API). Unlike the extent-node, the PS re-registers each
+# partition's address with the manager on every partition open, so a rescheduled
+# pod with a NEW IP heals its own routing — the PS can safely advertise its pod
+# IP directly (no per-pod Service needed). Per-partition listener ports are
+# DYNAMIC (base + monotonic ordinal), so they are NOT enumerated in a Service;
+# in-cluster clients reach them over flat pod networking. This is why v1 clients
+# must run INSIDE the cluster (see docs/k8s_deploy.md).
+#
+# psid is derived from the pod ordinal (autumn-ps-0 → psid 1) by the entrypoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-ps
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: partition-server
+spec:
+  clusterIP: None            # headless — StatefulSet serviceName + pod DNS
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: partition-server
+  ports:
+    - name: rpc
+      port: 9301
+      targetPort: 9301
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: autumn-ps
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: partition-server
+spec:
+  serviceName: autumn-ps
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: partition-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: partition-server
+    spec:
+      # PS drains active+imm to row_stream on SIGTERM (can take seconds per
+      # partition); give it room before SIGKILL. Matches --shutdown-timeout.
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: partition-server
+          image: autumn-rs:latest
+          imagePullPolicy: IfNotPresent
+          args: ["ps"]
+          envFrom:
+            - configMapRef: { name: autumn-config }
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: rpc, containerPort: 9301 }
+          readinessProbe:
+            tcpSocket: { port: 9301 }
+            initialDelaySeconds: 8
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "2", memory: "2Gi" }

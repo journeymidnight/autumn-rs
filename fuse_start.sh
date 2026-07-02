@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fuse_start.sh — mount the autumn-fuse filesystem against a running cluster.
 #
-# Accepts the SAME env vars as start.sh, so one set drives both the cluster and
+# Accepts the SAME env vars as deploy/baremetal (BIND_HOST/TRANSPORT/WORK), so one
 # the mount:
 #   BIND_HOST  → MANAGER  ($BIND_HOST:9001)   default 127.0.0.1
 #   WORK       → LOG_DIR  ($WORK/logs)        default /var/lib/autumn-rs
@@ -21,7 +21,7 @@
 #   WORK=/var/lib/autumn-rs-d02 BIND_HOST='[fdbd:dc62:3:302::14]' \
 #     TRANSPORT=ucx ./fuse_start.sh                            # matches the same
 #                                                              # WORK/BIND_HOST/TRANSPORT
-#                                                              # you gave start.sh
+#                                                              # you gave autumn-deploy
 set -euo pipefail
 
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
@@ -32,7 +32,7 @@ MOUNTPOINT="${MOUNTPOINT:-/mnt/dongmao-share}"
 LOG_DIR="${LOG_DIR:-${WORK}/logs}"
 BIN="${BIN:-./target/release}"
 
-# UCX env — same rationale as start.sh: positive TLS list (union of cross-host
+# UCX env — same rationale as the deploy path: positive TLS list (union of cross-host
 # RoCE + same-host shm + tcp fallback; NEVER use `^` negation), pinned RoCE
 # device (auto-select hangs with many devices), raised memlock for ibv_reg_mr.
 # UCX_* are read by the UCX C library directly (not autumn rust) — script is the

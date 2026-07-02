@@ -1,0 +1,91 @@
+# etcd control-plane store. Single member by default (bump replicas to 3 for a
+# fault-tolerant control plane and set --initial-cluster accordingly — see
+# docs/k8s_deploy.md). autumn stores all cluster metadata here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-etcd
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+spec:
+  # Headless: gives each etcd pod a stable DNS name (autumn-etcd-0.autumn-etcd)
+  # for peer discovery, and doubles as the client endpoint (the entrypoint
+  # resolves it to a member IP; any member serves client requests).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: peer
+      port: 2380
+      targetPort: 2380
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: autumn-etcd
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+spec:
+  serviceName: autumn-etcd
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: etcd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: etcd
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: etcd
+          # Pin to a 3.5.x etcd (autumn needs etcd v3 API >= 3.5).
+          image: quay.io/coreos/etcd:v3.5.11
+          command: ["/usr/local/bin/etcd"]
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/run/etcd/data
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(POD_IP):2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://$(POD_IP):2380
+            # Single-member initial cluster. For a 3-member etcd, replace with
+            # the explicit member list (see docs/k8s_deploy.md).
+            - --initial-cluster=$(POD_NAME)=http://$(POD_IP):2380
+            - --initial-cluster-state=new
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: client, containerPort: 2379 }
+            - { name: peer, containerPort: 2380 }
+          readinessProbe:
+            tcpSocket: { port: 2379 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/run/etcd }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

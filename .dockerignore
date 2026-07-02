@@ -1,0 +1,9 @@
+# Keep the docker build context small: target/ alone is tens of GB.
+target/
+.git/
+python/**/__pycache__/
+python/**/*.egg-info/
+python/target/
+docs/
+perf/
+scripts/perf_r2_svgs/

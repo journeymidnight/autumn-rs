@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# cluster.sh — dev cluster management for autumn-rs
+# cluster.sh — dev/chaos/perf TEST harness for autumn-rs.
+#
+# NOT a deployment tool. For deploying autumn (single-host or multi-host,
+# physical servers) use deploy/baremetal/autumn-deploy; for Kubernetes use
+# deploy/k8s/. cluster.sh is kept because the chaos/perf suites (scripts/*.sh,
+# the perf-check skill) depend on its RAW process kill/restart semantics for
+# fault injection — the deploy path deliberately hides processes behind
+# systemd/pidfiles, which is wrong for chaos testing. Keep them separate.
 #
 # Usage:
 #   ./cluster.sh start [N]      # start N extent-node cluster (default 1, e.g. 3, 4, 5)
