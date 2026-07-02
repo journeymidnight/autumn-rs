@@ -681,12 +681,6 @@ pub async fn psr_gc(router: &PsRouter, part_id: u64) {
     ps_gc(&c, part_id).await;
 }
 
-/// Routed `ps_delete` — F099-K aware.
-pub async fn psr_delete(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::DeleteResp {
-    let c = router.client_for(part_id).await;
-    ps_delete(&c, part_id, key).await
-}
-
 /// Routed `ps_head` — F099-K aware.
 pub async fn psr_head(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
     let c = router.client_for(part_id).await;
@@ -722,38 +716,6 @@ pub async fn write_sequential_keys(
         keys.push(key);
     }
     keys
-}
-
-/// Verify all keys exist with their deterministic values via `ps_get`.
-pub async fn verify_sequential_keys(ps: &RpcClient, part_id: u64, keys: &[String]) -> usize {
-    for key in keys {
-        let expected_val = format!("val-{key}");
-        let resp = ps_get(ps, part_id, key.as_bytes()).await;
-        assert_eq!(
-            resp.value,
-            expected_val.as_bytes(),
-            "key {key} has wrong value"
-        );
-    }
-    keys.len()
-}
-
-/// Verify all keys via routed `psr_get` (for post-split partitions).
-pub async fn verify_sequential_keys_routed(
-    router: &PsRouter,
-    part_id: u64,
-    keys: &[String],
-) -> usize {
-    for key in keys {
-        let expected_val = format!("val-{key}");
-        let resp = psr_get(router, part_id, key.as_bytes()).await;
-        assert_eq!(
-            resp.value,
-            expected_val.as_bytes(),
-            "key {key} has wrong value (routed)"
-        );
-    }
-    keys.len()
 }
 
 // ── Common setup patterns ─────────────────────────────────────────────
@@ -796,21 +758,6 @@ pub async fn register_two_nodes(
 ) {
     register_node(mgr, &n1_addr.to_string(), &format!("uuid-{}", base_id)).await;
     register_node(mgr, &n2_addr.to_string(), &format!("uuid-{}", base_id + 1)).await;
-}
-
-/// Full partition setup: manager + 2 extent nodes + 3 streams + partition.
-/// Returns (mgr_addr, ps_addr, n1_dir, n2_dir, part_id).
-pub async fn setup_full_partition(
-    mgr: &RpcClient,
-    mgr_addr: SocketAddr,
-    part_id: u64,
-    ps_id: u64,
-) -> SocketAddr {
-    let (log, row, meta) = create_three_streams(mgr).await;
-    upsert_partition(mgr, part_id, log, row, meta, b"a", b"z").await;
-    let ps_addr = pick_addr();
-    start_partition_server(ps_id, mgr_addr, ps_addr);
-    ps_addr
 }
 
 // ── Polling helper ────────────────────────────────────────────────────
