@@ -29,8 +29,8 @@ Rules per chunk:
 | 8 | crates/partition-server — core write/read path + sstable + dead code | ~11000 | done | 8437622 (F261 retry dedup, sst_readers_changed ×4, record_read ×5, dead-code gate/delete, clippy sweep) |
 | 9 | crates/partition-server — flush/compact/GC/split | ~11400 | done | covered by the same full-crate review as chunk 8; remaining findings deliberately skipped with reasons in findings log (safe-form duplication kept; no clean seams in the long loops) |
 | 10 | crates/manager — src reviewed (2 agents, full src) + fence dedup + dead code | 21164 src | done | ea118a8 |
-| 11 | crates/manager — remaining agent findings to apply | — | in_progress | pending: place_extents_with_fallback ×3 (rpc_handlers 1189/2101/3281), policy classify_band ×2 (policy.rs 822-861), optional extent_delete ship_deletes ×2 |
-| 12 | crates/manager — tests/ (18.6k, 57 files) light dedup skim | ~18600 | todo | support/mod.rs harness is the only priority target |
+| 11 | crates/manager — remaining agent findings | — | done | 7adec55 (place_extents_with_fallback ×3, classify_hot_cold_band ×2) |
+| 12 | crates/manager — tests/ light dedup skim | ~18600 | done | 602a532 (4 dead harness helpers deleted); BIG deferred item: 32-file cluster-prologue consolidation, see findings log |
 | 13 | crates/server (binaries) | 8170 | todo | |
 | 14 | crates/fuse | 4731 | todo | |
 | 15 | crates/autumn-memory | 2334 | todo | |
@@ -40,6 +40,20 @@ Rules per chunk:
 Status values: todo | in_progress | done
 
 ## Findings log (cross-chunk issues found while reviewing)
+- DEDICATED-SESSION item (mechanical, zero prod risk, big win): manager test
+  suite consolidation. (A) the ~20-line single-partition 2-node cluster
+  prologue is copy-pasted across 32 test files — `setup_two_node_infra` was
+  built for it but only 2 files adopted it (it splits the sync/async boundary
+  awkwardly); reshape into `setup_single_partition(part_id, ps_id, base_id)
+  -> Cluster{mgr, ps, addrs, dirs}` and migrate. (B) split-trigger block
+  (~40 copies / 17 files) -> ps_split(ps, part_id). (C) sibling-region
+  discovery (~30 copies / 13 files) -> sibling_part_id/region_rg. Also:
+  integration.rs:~1131 reimplements support::get_regions inline.
+- manager skipped-as-defensible (agent-confirmed author tradeoffs): the
+  gc/major/minor advisory triplication in policy.rs (author comment rejects
+  parametrization — fields differ per kind); extent_delete ship_deletes ×2
+  (6 lines, below bar); lease writer-clear+bump ×3 (5 lines, fencing-
+  sensitive); node_health_loop seam extraction (mutates many accumulators).
 - Wire-fingerprinted files (rpc: manager_rpc/partition_rpc/extent_rpc/frame/
   cap_token): edits force a wire-version registry decision, so low-value
   cleanups are deferred until those files are next touched for real work:

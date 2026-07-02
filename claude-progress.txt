@@ -70,6 +70,10 @@ Current summary:
       长函数(maintenance_loop/recover_partition/partition_thread_main)无干净缝。
     验证:PS lib 182/182;workspace check 0 警告(除 server bin 1 个 unused import,
     chunk 13 处理);PS clippy 仅剩 4 个既有保守 lint(已记 ledger)。
+  · Chunk 11+12 done:7adec55(place_extents_with_fallback ×3 合一 +
+    classify_hot_cold_band ×2 泛型合一;169/169 绿)+ 602a532(tests support
+    4 个死 helper 删除;system_split_writes 冒烟绿)。32 文件集群前导样板
+    整合记 ledger 为专门会话项。
   · Chunk 10 manager src(21k 行,两个 agent 全量审毕)第一批落地,commit ea118a8:
     - diagnose_post_txn_fence()(F149 fence-vs-CAS 诊断双拷贝合一)+
       empty_extra_cmp_err() ×3;死代码删除(全 workspace 验证):
@@ -85,16 +89,10 @@ Main gaps / risks:
   · 大 chunk(stream 18k、partition-server 22k、manager 40k)尚未开始。
 
 Next steps:
-  1. Chunk 11 manager 剩余项落地(ledger 表 11 行有精确坐标):
-     place_extents_with_fallback ×3(rpc_handlers 1189/2101/3281 附近,
-     shuffled-fallback walk,差异=extent-id 参数+耗尽时的 reject 类型,池构建留原地);
-     policy.rs classify_band ×2(822-861,纯函数);可选 extent_delete ship_deletes。
-     agent 审定干净/勿动:replay 三内联循环(语义各异)、mirror_* 家族、
-     multi_modify_split/merge 长函数(Phase 注释已分段,勿再提取)、
-     leader-gate 前导 15+ 处(各 Resp 类型不同,helper 不 type-clean)。
-  2. Chunk 12 manager tests/ 轻扫(support/mod.rs 优先)。
-  3. 然后 13 server(8k,autumn_client bin 有 unused import `Args`)、14 fuse、
-     15 autumn-memory、16 gallery、17 python。
+  1. Chunk 13 server(8k,autumn_client bin 有 unused import `Args`)。
+  2. Chunk 14 fuse(4.7k)、15 autumn-memory(2.3k)、16 gallery(1.8k)、
+     17 python(5.8k)——预计 1-2 迭代收尾。
+  3. 全部完成后:总结 + 停 loop(PushNotification 通知)。
   2. 之后按 ledger 顺序 8-17;dead code(partition-server decode_records_with_offsets/
      lookup_in_sst 等)在对应 chunk 处理。
   3. 延后项(ledger findings log):extent_node append 协议双拷贝合一 +
