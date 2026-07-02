@@ -1184,35 +1184,20 @@ impl AutumnManager {
         }
         let mut fallback_iter = fallback_nodes.into_iter();
 
-        let mut node_ids = Vec::with_capacity(selected.len());
-        let mut disk_ids = Vec::with_capacity(selected.len());
-        for n in &selected {
-            let mut candidate = n.clone();
-            let (node_id, disk) = loop {
-                match self
-                    .alloc_extent_on_node(&candidate.address, extent_id)
-                    .await
-                {
-                    Ok(disk) => break (candidate.node_id, disk),
-                    Err(_) => match fallback_iter.next() {
-                        Some(alt) => candidate = alt,
-                        None => {
-                            let err = AppError::Precondition(format!(
-                                "no healthy node available to allocate extent {extent_id} for new stream"
-                            ));
-                            return Ok(rkyv_encode(&CreateStreamResp {
-                                code: Self::err_to_code(&err),
-                                message: err.to_string(),
-                                stream: None,
-                                extent: None,
-                            }));
-                        }
-                    },
-                }
-            };
-            node_ids.push(node_id);
-            disk_ids.push(disk);
-        }
+        let Some((node_ids, disk_ids)) = self
+            .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
+            .await
+        else {
+            let err = AppError::Precondition(format!(
+                "no healthy node available to allocate extent {extent_id} for new stream"
+            ));
+            return Ok(rkyv_encode(&CreateStreamResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+                extent: None,
+            }));
+        };
 
         let stream = MgrStreamInfo {
             stream_id,
@@ -1762,6 +1747,41 @@ impl AutumnManager {
         }))
     }
 
+    /// F144-style placement walk shared by `handle_create_stream` /
+    /// `handle_stream_alloc_extent` / `handle_multi_modify_merge`: try
+    /// `alloc_extent_on_node` on each selected node, walking the (shuffled)
+    /// fallback pool on failure. Returns the placed `(node_ids, disk_ids)`,
+    /// or `None` when the pool is exhausted — the caller emits its own typed
+    /// reject response. Fallback-pool CONSTRUCTION stays at each call site
+    /// (their filters differ, e.g. the F190 exclude set).
+    async fn place_extents_with_fallback(
+        &self,
+        selected: &[MgrNodeInfo],
+        fallback_iter: &mut std::vec::IntoIter<MgrNodeInfo>,
+        extent_id: u64,
+    ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let mut node_ids = Vec::with_capacity(selected.len());
+        let mut disk_ids = Vec::with_capacity(selected.len());
+        for n in selected {
+            let mut candidate = n.clone();
+            let (node_id, disk) = loop {
+                match self
+                    .alloc_extent_on_node(&candidate.address, extent_id)
+                    .await
+                {
+                    Ok(disk) => break (candidate.node_id, disk),
+                    Err(_) => match fallback_iter.next() {
+                        Some(alt) => candidate = alt,
+                        None => return None,
+                    },
+                }
+            };
+            node_ids.push(node_id);
+            disk_ids.push(disk);
+        }
+        Some((node_ids, disk_ids))
+    }
+
     pub(crate) async fn handle_stream_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
@@ -2068,8 +2088,6 @@ impl AutumnManager {
         let _ = sealed_len;
 
         // Allocate new extent on nodes with fallback
-        let mut node_ids = Vec::with_capacity(selected.len());
-        let mut disk_ids = Vec::with_capacity(selected.len());
         let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
         // F190: prefer fallbacks not in the writer's recent-failure set; fall
         // back to the unfiltered set if the exclusion would empty the iter.
@@ -2098,28 +2116,15 @@ impl AutumnManager {
         }
         let mut fallback_iter = fallback_nodes.into_iter();
 
-        for n in &selected {
-            let mut candidate = n.clone();
-            let (node_id, disk) = loop {
-                match self
-                    .alloc_extent_on_node(&candidate.address, extent_id)
-                    .await
-                {
-                    Ok(disk) => break (candidate.node_id, disk),
-                    Err(_) => match fallback_iter.next() {
-                        Some(alt) => candidate = alt,
-                        None => {
-                            let err = AppError::Precondition(format!(
-                                "no healthy node available to allocate extent {extent_id}"
-                            ));
-                            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
-                        }
-                    },
-                }
-            };
-            node_ids.push(node_id);
-            disk_ids.push(disk);
-        }
+        let Some((node_ids, disk_ids)) = self
+            .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
+            .await
+        else {
+            let err = AppError::Precondition(format!(
+                "no healthy node available to allocate extent {extent_id}"
+            ));
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+        };
 
         let new_extent = MgrExtentInfo {
             extent_id,
@@ -3276,34 +3281,19 @@ impl AutumnManager {
             fallback_nodes.shuffle(&mut rand::thread_rng());
         }
         let mut fallback_iter = fallback_nodes.into_iter();
-        let mut final_node_ids: Vec<u64> = Vec::with_capacity(p1.selected_nodes.len());
-        let mut final_disk_ids: Vec<u64> = Vec::with_capacity(p1.selected_nodes.len());
-        for n in &p1.selected_nodes {
-            let mut candidate = n.clone();
-            let (node_id, disk_id) = loop {
-                match self
-                    .alloc_extent_on_node(&candidate.address, p1.new_tail_id)
-                    .await
-                {
-                    Ok(disk) => break (candidate.node_id, disk),
-                    Err(_) => match fallback_iter.next() {
-                        Some(alt) => candidate = alt,
-                        None => {
-                            return Ok(rkyv_encode(&MultiModifyMergeResp {
-                                code: CODE_PRECONDITION,
-                                message: format!(
-                                    "no healthy node available to allocate E_new {}",
-                                    p1.new_tail_id
-                                ),
-                                new_log_tail_extent_id: 0,
-                            }));
-                        }
-                    },
-                }
-            };
-            final_node_ids.push(node_id);
-            final_disk_ids.push(disk_id);
-        }
+        let Some((final_node_ids, final_disk_ids)) = self
+            .place_extents_with_fallback(&p1.selected_nodes, &mut fallback_iter, p1.new_tail_id)
+            .await
+        else {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "no healthy node available to allocate E_new {}",
+                    p1.new_tail_id
+                ),
+                new_log_tail_extent_id: 0,
+            }));
+        };
 
         // Patch E_new with the actual node/disk ids (Phase 1's selected_nodes
         // may have been replaced via fallback walk).

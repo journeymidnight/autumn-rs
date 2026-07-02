@@ -752,6 +752,42 @@ impl PolicyEngine {
     /// (via `MSG_GET_POLICY_CANDIDATES`) renders them next to SPLIT /
     /// MERGE / GC / COMPACT advisories. A matching `WARN` line is also
     /// emitted to `manager.log` for at-a-glance operator awareness.
+    /// F210-F4 hot/cold band classification for ONE dimension (qps or size).
+    /// Hot = own window MAX equals the PS's hottest AND own MIN is still
+    /// within the band of it (sustained-high across its buckets); symmetric
+    /// on cold. Returns sorted `(hot, cold)` part-id lists; both empty when
+    /// the dimension didn't fire. `parts` tuples are
+    /// `(part_id, min_req, max_req, min_size, max_size)` — the accessors
+    /// select which pair this dimension reads.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_hot_cold_band<T: Copy + PartialOrd>(
+        parts: &[(u64, u32, u32, u64, u64)],
+        fire: bool,
+        min_of: impl Fn(&(u64, u32, u32, u64, u64)) -> T,
+        max_of: impl Fn(&(u64, u32, u32, u64, u64)) -> T,
+        hottest: T,
+        coldest: T,
+        hot_min: T,
+        cold_max: T,
+    ) -> (Vec<u64>, Vec<u64>) {
+        if !fire {
+            return (Vec::new(), Vec::new());
+        }
+        let mut hot: Vec<u64> = parts
+            .iter()
+            .filter(|t| min_of(t) >= hot_min && max_of(t) == hottest)
+            .map(|t| t.0)
+            .collect();
+        let mut cold: Vec<u64> = parts
+            .iter()
+            .filter(|t| max_of(t) <= cold_max && min_of(t) == coldest)
+            .map(|t| t.0)
+            .collect();
+        hot.sort_unstable();
+        cold.sort_unstable();
+        (hot, cold)
+    }
+
     pub fn compute_hot_cold_advisory(
         &mut self,
         region_owners: &HashMap<u64, u64>,
@@ -817,45 +853,27 @@ impl PolicyEngine {
             // symmetric on cold. Excludes rotating hotspots that would
             // otherwise appear on BOTH lists in the same advisory.
             let qps_band = HOT_COLD_BAND_DIVISOR.max(1);
-            let qps_hot_min = qps_hottest / qps_band;
-            let qps_cold_max = qps_coldest.saturating_mul(qps_band);
-            let (qps_hot, qps_cold) = if qps_fire {
-                let mut hot: Vec<u64> = parts
-                    .iter()
-                    .filter(|t| t.1 >= qps_hot_min && t.2 == qps_hottest)
-                    .map(|t| t.0)
-                    .collect();
-                let mut cold: Vec<u64> = parts
-                    .iter()
-                    .filter(|t| t.2 <= qps_cold_max && t.1 == qps_coldest)
-                    .map(|t| t.0)
-                    .collect();
-                hot.sort_unstable();
-                cold.sort_unstable();
-                (hot, cold)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (qps_hot, qps_cold) = Self::classify_hot_cold_band(
+                &parts,
+                qps_fire,
+                |t| t.1,
+                |t| t.2,
+                qps_hottest,
+                qps_coldest,
+                qps_hottest / qps_band,
+                qps_coldest.saturating_mul(qps_band),
+            );
             let size_band = HOT_COLD_BAND_DIVISOR.max(1) as u64;
-            let size_hot_min = size_hottest / size_band;
-            let size_cold_max = size_coldest.saturating_mul(size_band);
-            let (size_hot, size_cold) = if size_fire {
-                let mut hot: Vec<u64> = parts
-                    .iter()
-                    .filter(|t| t.3 >= size_hot_min && t.4 == size_hottest)
-                    .map(|t| t.0)
-                    .collect();
-                let mut cold: Vec<u64> = parts
-                    .iter()
-                    .filter(|t| t.4 <= size_cold_max && t.3 == size_coldest)
-                    .map(|t| t.0)
-                    .collect();
-                hot.sort_unstable();
-                cold.sort_unstable();
-                (hot, cold)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (size_hot, size_cold) = Self::classify_hot_cold_band(
+                &parts,
+                size_fire,
+                |t| t.3,
+                |t| t.4,
+                size_hottest,
+                size_coldest,
+                size_hottest / size_band,
+                size_coldest.saturating_mul(size_band),
+            );
             // F210-F4: if the band filter dropped every candidate on a
             // triggering dimension, suppress the advisory for that
             // dimension. Without this we'd still log a fire WARN but
