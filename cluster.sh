@@ -680,11 +680,19 @@ save_cluster_config() {
     {
         printf 'REPLICAS=%s\n' "$REPLICAS"
         printf 'CLUSTER_MODE=%s\n' "$MODE"
-        # `|| true`: with zero AUTUMN_* vars in the env, grep exits 1 and
+        # Persist the EFFECTIVE transport: AUTUMN_TRANSPORT is unset early (so
+        # children never read it), which used to silently drop `ucx` from the
+        # snapshot — a later bare `start-ps`/`start-node`/`start-manager` then
+        # relaunched that component as TCP against a UCX cluster (coco P1,
+        # 2026-07-03). load_cluster_config restores it.
+        printf 'TRANSPORT=%q\n' "$TRANSPORT"
+        # `|| true`: with zero matching vars in the env, grep exits 1 and
         # pipefail+set -e would abort do_start right here (config written
         # truncated, "cluster ready" banner never printed) — only ever
         # surfaced on a bare `bash cluster.sh restart N` with a clean env.
-        env | { grep -E '^AUTUMN_' || true; } | sort | while IFS='=' read -r k v; do
+        # UCX_* is persisted alongside AUTUMN_* so subcommands relaunch with
+        # the exact same (explicit or derived) UCX env.
+        env | { grep -E '^(AUTUMN_|UCX_)' || true; } | sort | while IFS='=' read -r k v; do
             printf 'export %s=%q\n' "$k" "$v"
         done
     } > "$CONFIG_FILE"
