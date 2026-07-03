@@ -150,6 +150,261 @@ fn print_bench_summary(
 // along with the `format` subcommand.)
 
 // ---------------------------------------------------------------------------
+// YCSB-equivalent mixed workload
+// ---------------------------------------------------------------------------
+
+/// Gray et al. Zipfian generator (YCSB default, theta ≈ 0.99). Maps a uniform
+/// `u` in [0,1) to an item index in [0, n) with a power-law skew — index 0 is
+/// hottest. Setup is O(n) (computes zeta(n)); cheap per-draw.
+struct Zipf {
+    n: f64,
+    theta: f64,
+    alpha: f64,
+    zetan: f64,
+    eta: f64,
+    n_minus_1: u64,
+}
+
+impl Zipf {
+    fn new(n: u64, theta: f64) -> Self {
+        let nf = n as f64;
+        let zeta = |m: f64| -> f64 {
+            let mut s = 0.0;
+            let mut i = 1.0;
+            while i <= m {
+                s += 1.0 / i.powf(theta);
+                i += 1.0;
+            }
+            s
+        };
+        let zeta2 = zeta(2.0);
+        let zetan = zeta(nf);
+        let alpha = 1.0 / (1.0 - theta);
+        let eta = (1.0 - (2.0 / nf).powf(1.0 - theta)) / (1.0 - zeta2 / zetan);
+        Zipf { n: nf, theta, alpha, zetan, eta, n_minus_1: n.saturating_sub(1) }
+    }
+    fn pick(&self, u: f64) -> u64 {
+        let uz = u * self.zetan;
+        if uz < 1.0 {
+            return 0;
+        }
+        if uz < 1.0 + 0.5f64.powf(self.theta) {
+            return 1;
+        }
+        let ret = (self.n * (self.eta * u - self.eta + 1.0).powf(self.alpha)) as u64;
+        ret.min(self.n_minus_1)
+    }
+}
+
+/// (p50, p95, p99) in the units of `v`. Sorts `v` in place.
+fn pcts(v: &mut [f64]) -> (f64, f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    let idx = |p: f64| ((n - 1) as f64 * p) as usize;
+    (v[idx(0.50)], v[idx(0.95)], v[idx(0.99)])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_ycsb(
+    client: &ClusterClient,
+    threads: usize,
+    duration_secs: u64,
+    value_size: usize,
+    partitions_flag: usize,
+    pipeline_depth: usize,
+    read_ratio: f64,
+    zipfian: bool,
+    records: u64,
+    rmw: bool,
+    manager: &str,
+) -> Result<()> {
+    use futures::stream::StreamExt;
+    use rand::{Rng, SeedableRng};
+
+    let depth = pipeline_depth.max(1);
+    let records = records.max(1);
+    let partitions = client.all_partitions_with_range().await?;
+    if partitions.is_empty() {
+        bail!("no partitions found, run bootstrap first");
+    }
+    if partitions.len() != partitions_flag {
+        eprintln!(
+            "warning: --partitions={} but cluster has {} partitions; using cluster value",
+            partitions_flag,
+            partitions.len()
+        );
+    }
+    let workload = if rmw {
+        "F (read-modify-write)".to_string()
+    } else {
+        format!("read_ratio={read_ratio}")
+    };
+    println!(
+        "==> ycsb: {threads} threads, {duration_secs}s, {value_size}B records, \
+         {records} keys/thread, dist={}, workload {workload}",
+        if zipfian { "zipfian" } else { "uniform" }
+    );
+
+    // Each thread owns one partition's key range and its own [0,records) keyspace.
+    let start_keys: Vec<Vec<u8>> = (0..threads)
+        .map(|tid| partitions[tid % partitions.len()].2.clone())
+        .collect();
+    let mgr = Arc::new(manager.to_string());
+
+    // ---- LOAD phase (YCSB load): insert `records` keys per thread ----
+    let load_ops = Arc::new(AtomicU64::new(0));
+    let load_start = Instant::now();
+    let mut load_handles = Vec::new();
+    for (tid, sk) in start_keys.iter().cloned().enumerate() {
+        let mgr = Arc::clone(&mgr);
+        let load_ops = Arc::clone(&load_ops);
+        let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
+        load_handles.push(std::thread::spawn(move || {
+            compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
+                let client = match ClusterClient::connect(&mgr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("ycsb load thread {tid} connect error: {e}");
+                        return;
+                    }
+                };
+                let cref = &client;
+                let skref = sk.as_slice();
+                let vref = value_bytes.as_slice();
+                let mut id = 0u64;
+                let futs = std::iter::from_fn(move || {
+                    if id >= records {
+                        return None;
+                    }
+                    let key = key_for_partition(skref, "ycsb", tid, id);
+                    id += 1;
+                    Some(async move { cref.put(key.as_bytes(), vref).await.is_ok() })
+                });
+                let mut s = autumn_client::fan_out(futs, depth);
+                let mut n = 0u64;
+                while let Some((_, ok)) = s.next().await {
+                    if ok {
+                        n += 1;
+                    }
+                }
+                load_ops.fetch_add(n, Ordering::Relaxed);
+            })
+        }));
+    }
+    for h in load_handles {
+        let _ = h.join();
+    }
+    let load_el = load_start.elapsed().as_secs_f64().max(1e-9);
+    let loaded = load_ops.load(Ordering::Relaxed);
+    println!(
+        "LOAD: {loaded} keys in {load_el:.1}s = {:.0} ops/s",
+        loaded as f64 / load_el
+    );
+
+    // ---- RUN phase: one mixed loop, read_ratio reads / rest updates ----
+    let run_ops = Arc::new(AtomicU64::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let run_start = Instant::now();
+    let mut run_handles = Vec::new();
+    for (tid, sk) in start_keys.iter().cloned().enumerate() {
+        let mgr = Arc::clone(&mgr);
+        let run_ops = Arc::clone(&run_ops);
+        let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
+        run_handles.push(std::thread::spawn(move || -> (Vec<f64>, Vec<f64>) {
+            compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
+                let client = match ClusterClient::connect(&mgr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("ycsb run thread {tid} connect error: {e}");
+                        return (Vec::new(), Vec::new());
+                    }
+                };
+                let cref = &client;
+                let skref = sk.as_slice();
+                let vref = value_bytes.as_slice();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(0x59CB_0000 ^ tid as u64);
+                let zipf = if zipfian { Some(Zipf::new(records, 0.99)) } else { None };
+                let mut read_lats: Vec<f64> = Vec::new();
+                let mut write_lats: Vec<f64> = Vec::new();
+                let futs = std::iter::from_fn(move || {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    let is_read = rng.gen::<f64>() < read_ratio;
+                    let id = match &zipf {
+                        Some(z) => z.pick(rng.gen::<f64>()),
+                        None => rng.gen_range(0..records),
+                    };
+                    let key = key_for_partition(skref, "ycsb", tid, id);
+                    Some(async move {
+                        let t0 = Instant::now();
+                        // kind: 0=read (read latency), 1=write/rmw (write latency)
+                        if rmw {
+                            let _ = cref.get(key.as_bytes()).await;
+                            let ok = cref.put(key.as_bytes(), vref).await.is_ok();
+                            (1u8, ok, t0.elapsed())
+                        } else if is_read {
+                            let ok = cref.get(key.as_bytes()).await.is_ok();
+                            (0u8, ok, t0.elapsed())
+                        } else {
+                            let ok = cref.put(key.as_bytes(), vref).await.is_ok();
+                            (1u8, ok, t0.elapsed())
+                        }
+                    })
+                });
+                let mut s = autumn_client::fan_out(futs, depth);
+                let mut n = 0u64;
+                while let Some((_, (kind, ok, el))) = s.next().await {
+                    if ok {
+                        n += 1;
+                        let ms = el.as_secs_f64() * 1000.0;
+                        if kind == 0 {
+                            read_lats.push(ms);
+                        } else {
+                            write_lats.push(ms);
+                        }
+                    }
+                }
+                run_ops.fetch_add(n, Ordering::Relaxed);
+                (read_lats, write_lats)
+            })
+        }));
+    }
+    let mut all_read: Vec<f64> = Vec::new();
+    let mut all_write: Vec<f64> = Vec::new();
+    for h in run_handles {
+        if let Ok((r, w)) = h.join() {
+            all_read.extend(r);
+            all_write.extend(w);
+        }
+    }
+    let run_el = run_start.elapsed().as_secs_f64().max(1e-9);
+    let total = run_ops.load(Ordering::Relaxed);
+    println!(
+        "\nRUN: {total} ops in {run_el:.1}s = {:.0} ops/s",
+        total as f64 / run_el
+    );
+    if !all_read.is_empty() {
+        let (p50, p95, p99) = pcts(&mut all_read);
+        println!(
+            "  read : {} ops  p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms",
+            all_read.len()
+        );
+    }
+    if !all_write.is_empty() {
+        let (p50, p95, p99) = pcts(&mut all_write);
+        println!(
+            "  {} : {} ops  p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms",
+            if rmw { "rmw  " } else { "write" },
+            all_write.len()
+        );
+    }
+    Ok(())
+}
+
 // Main
 // ---------------------------------------------------------------------------
 
@@ -916,6 +1171,21 @@ async fn main() -> Result<()> {
             direct_read,
         } => cmd_perf_check(
             &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, &args.manager,
+        )
+        .await?,
+
+        Command::Ycsb {
+            threads,
+            duration_secs,
+            value_size,
+            partitions,
+            pipeline_depth,
+            read_ratio,
+            zipfian,
+            records,
+            rmw,
+        } => cmd_ycsb(
+            &client, threads, duration_secs, value_size, partitions, pipeline_depth, read_ratio, zipfian, records, rmw, &args.manager,
         )
         .await?,
     }

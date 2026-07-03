@@ -88,6 +88,28 @@ pub(crate) enum Command {
         /// read) instead of get/get_into.
         direct_read: bool,
     },
+    /// YCSB-equivalent mixed-workload benchmark. Unlike perf-check (pure
+    /// write phase then pure read phase), this runs ONE mixed loop with a
+    /// configurable read/write ratio and key-access distribution — so it
+    /// reproduces the standard YCSB workloads:
+    ///   A=--read-ratio 0.5   B=--read-ratio 0.95   C=--read-ratio 1.0
+    ///   D=--read-ratio 0.95 (read-latest ≈ zipfian)   F=--rmw
+    /// A LOAD phase inserts `records` keys per thread first (YCSB "load").
+    Ycsb {
+        threads: usize,
+        duration_secs: u64,
+        value_size: usize,
+        partitions: usize,
+        pipeline_depth: usize,
+        /// Fraction of RUN-phase ops that are reads (rest are updates).
+        read_ratio: f64,
+        /// true = zipfian (hot-key skew, YCSB default); false = uniform.
+        zipfian: bool,
+        /// Keyspace size PER THREAD (YCSB recordcount, scoped per partition).
+        records: u64,
+        /// Workload F: each op is a read-modify-write (get then put).
+        rmw: bool,
+    },
 }
 
 pub(crate) struct Args {
@@ -119,6 +141,8 @@ fn usage() -> ! {
     eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
+    eprintln!("  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]");
+    eprintln!("                                    YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN");
     eprintln!();
     eprintln!("Operator / admin commands moved to `autumn-op` (F213):");
     eprintln!("  bootstrap, set-stream-ec, force-ec-convert, split, merge,");
@@ -489,6 +513,83 @@ pub(crate) fn parse_args() -> Args {
                 bulk,
                 ramp_ms,
                 direct_read,
+            }
+        }
+        "ycsb" => {
+            let mut threads = 32usize;
+            let mut duration_secs = 30u64;
+            let mut value_size = 1024usize; // YCSB default record ~1 KiB
+            let mut partitions: usize = 1;
+            let mut pipeline_depth: usize = 16;
+            let mut read_ratio = 0.5f64; // workload A
+            let mut zipfian = true; // YCSB default distribution
+            let mut records: u64 = 100_000; // per-thread keyspace
+            let mut rmw = false;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--threads" | "-t" => {
+                        i += 1;
+                        threads = val(&raw, i).parse().expect("--threads must be a number");
+                    }
+                    "--duration" | "-d" => {
+                        i += 1;
+                        duration_secs = val(&raw, i).parse().expect("--duration must be a number");
+                    }
+                    "--size" => {
+                        i += 1;
+                        value_size = val(&raw, i).parse().expect("--size must be a number");
+                    }
+                    "--partitions" => {
+                        i += 1;
+                        partitions = val(&raw, i).parse().expect("--partitions must be >= 1");
+                    }
+                    "--pipeline-depth" => {
+                        i += 1;
+                        pipeline_depth = val(&raw, i).parse().expect("--pipeline-depth must be >= 1");
+                    }
+                    "--read-ratio" => {
+                        i += 1;
+                        read_ratio = val(&raw, i).parse().expect("--read-ratio must be a float");
+                        if !(0.0..=1.0).contains(&read_ratio) {
+                            eprintln!("--read-ratio must be in [0.0, 1.0]");
+                            usage();
+                        }
+                    }
+                    "--key-dist" => {
+                        i += 1;
+                        match val(&raw, i) {
+                            "zipfian" => zipfian = true,
+                            "uniform" => zipfian = false,
+                            o => {
+                                eprintln!("--key-dist must be zipfian|uniform, got {o}");
+                                usage();
+                            }
+                        }
+                    }
+                    "--records" => {
+                        i += 1;
+                        records = val(&raw, i).parse().expect("--records must be a number");
+                    }
+                    "--rmw" => {
+                        rmw = true;
+                    }
+                    other => {
+                        eprintln!("unknown ycsb flag: {other}");
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            Command::Ycsb {
+                threads,
+                duration_secs,
+                value_size,
+                partitions,
+                pipeline_depth,
+                read_ratio,
+                zipfian,
+                records,
+                rmw,
             }
         }
         other => {

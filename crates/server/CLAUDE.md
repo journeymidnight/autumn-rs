@@ -78,9 +78,8 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 | `del <KEY>` | Delete key |
 | `head <KEY>` | Show key metadata (length) |
 | `ls [--prefix P] [--start S] [--limit N]` | List/scan keys |
-| `wbench [--threads 4] [--duration 10] [--size 8192]` | Concurrent write benchmark; outputs write_result.json |
-| `rbench [--threads 40] [--duration 10] <RESULT_FILE>` | Concurrent read benchmark using keys from write_result.json |
-| `perf-check [--threads N] [--baseline FILE] [--threshold T] [--update-baseline] [--partitions N] [--pipeline-depth K] [--group-commit-cap N]` | Regression-gated bench: compares against a JSON baseline, fails if throughput < threshold. |
+| `perf-check [--threads N] [--baseline FILE] [--threshold T] [--update-baseline] [--partitions N] [--pipeline-depth K] [--group-commit-cap N]` | Regression-gated bench: PURE write phase then PURE read phase, compares against a JSON baseline, fails if throughput < threshold. (Superseded the removed `wbench`/`rbench` pair.) |
+| `ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian\|uniform] [--records 100000] [--rmw]` | YCSB-equivalent MIXED workload: a LOAD phase then one mixed R/W run at the given read ratio + key distribution. Reproduces YCSB A (0.5) / B (0.95) / C (1.0) / D (0.95 ≈ zipfian read-latest) / F (`--rmw`). Keys are partition-local per thread; zipfian skew is per-thread. NOT the reference Java YCSB — same workload defs, our own driver. |
 | `op <subcmd> ...` | Stub: prints a hint pointing at `autumn-op <subcmd>` and exits 1. No subprocess fork. |
 
 **Architectural rule (F213):** `autumn-client` MUST NOT call `mgr_call(MSG_*)` for admin / observability RPCs. Greppable invariant — `grep -cE 'mgr_call\(MSG_' crates/server/src/bin/autumn_client.rs` must be 0. If future autumn-client functionality requires op data, do not add direct manager calls — open a separate proposal for shared-library extraction or subprocess delegation.
