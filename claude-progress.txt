@@ -1,44 +1,43 @@
 Date: 2026-07-03
 TaskStatus: not_completed
-Task scope: 25 随机 seed chaos 扫测 → 本地 perf check → 跨机 perf check。
-  chaos 与 perf 的"执行"都完成;TaskStatus=not_completed 因为跨机 perf 发现了
-  一个真实的 UCX ZC-read 客户端回归(P1,修复=下一个任务,reproduce-first 已备齐)。
+Task scope: 修"UCX ZC-read 回归"(用户指示"开始修 regpool")。结果:**回归前提被推翻**,
+  真正根因已定性但修复(涉及 UCX wireup / 热路径)需用户选方案 → not_completed,
+  交接材料齐全。
 
 Current summary:
-  · chaos 扫测:25/25 随机 seed 全 PASS(45s/1500ms 激进档,五项不变量全 0 错,
-    零假阳性;seed 清单在上一版进度与 git 历史)。docs/ops.md 过时 etcd 说明已修
-    (commit c3674d2)。
-  · 本地 perf(--3disk p8):写侧全绿(tcp-4k 94K、8m 261 ops/s);tcp-8m PASS
-    (读 1122 ops/s=9.2GB/s)。tcp-4k 读 255K vs 5-21 基线 1.37M —— **A/B 判环境**
-    (pre-readability a7deb3f 同箱 211K,与 HEAD 相同):箱子 6-17 起多租户
-    (194 ray:: 进程 + sglang 满核)。loopback ucx-8m 停摆 = 宿主级 loopback-UCX
-    旧病(旧代码同样停摆),非代码。磁盘 dd 直写 3.2-3.6GB/s 健康。
-    两个环境坑已沉淀:Ray 占 EN 控制端口 10101+(→AUTUMN_EXTENT_BASE_PORT=20000,
-    已写进 perf-check skill 预检)+ 基线对多租户箱已过时(勿擅自 --update-baseline)。
-  · 跨机 perf(集群本机::14,客户端 ::15;远端无外网→git bundle scp 同步到 c3674d2,
-    scp 预编译 ucx 客户端):
-    - tcp-4k:写 14.2K/读 17.7K ops/s(均高于 6-07 参考 9.7K/15.6K)
-    - tcp-8m:写 241MB/s(≈参考)、读 1066MB/s(参考 193-601 → 1.8-5.5×,ZC 红利)
-    - ucx-4k:写 71.8K/读 435K ops/s,p99 1.1ms(优异)
-    - ucx-8m:写 1716MB/s 健康;**读 = 回归**(见下)
-  · **发现 P1 回归(OPEN)**:跨机 UCX ZC-read(8M)客户端侧 ~3×。
-    暖集群同服务器 A/B(只换客户端):a7deb3f 129.7 ops/s / f833d1d 151.5(无罪)
-    / 63dcc34 82.6 / HEAD 41.6(p95 9-17s stall 尾)。写侧各版本相同;ucx-4k 完美
-    → 锁定 ≥64K ZC 读路径,f833d1d 之后、疑似多提交累积。
-    头号嫌疑:63dcc34 删除 regpool Drop"恒真死分支"(regpool=ZC 读注册缓冲池;
-    若该分支实际归还缓冲 → 池耗尽 → 等待注册缓冲 = 全部症状)。
-    详见 memory project_ucx_zc_read_regression_readability(含完整 repro 命令;
-    旧客户端二进制留在 ::15 /tmp/ac-{old,f833,63dc,head})。
+  · regpool 无罪:63dcc34 的 Drop"恒真死分支"逐行核对确为恒真(ucx 下未注册 slab
+    入口 early-return,驱逐臂必然已注册),行为中性。
+  · "客户端版本 3× 回归"被推翻:fresh 集群 + 同实例交错复测,f833d1d/9bc0408/
+    38403c8/HEAD 读全部相等(59-66 ops/s)。此前 151-vs-42 是重尾双峰分布的采样
+    噪声(教训:双峰 stall 分布必须同集群交错多样本才能下版本结论)。
+    readability 系列全线无罪(0fe3e72/63dcc34/ded2d65 逐行核对均中性)。
+  · **真根因(统一解释读 stall + 写 wedge,证据链闭环)**:并发 wireup 竞态产生
+    罕见"死 UCX endpoint"(首个 RPC 永不完成),新 ep 中招率今晚 ~4-6%:
+    - 读:client-direct EN ZC 读超时 = 3s(stream/client.rs:137/:3274)+ 静默重试
+      → 延迟量化在 3.0-3.3s(两连丢 6.2s)→ 并发下 8M 读吞吐塌;t1+暖连接完全
+      干净(p50 3.9ms,单流 2.1GB/s)。
+    - 写:append 扇出有 F121 超时→soft error→alloc_new_extent 逃生,但持续 8M 写
+      下逃生循环空转(roll→新 extent→新 EN ep→再骰到死 ep)→ 表观"永久写 wedge"
+      (~5-6 轮 bench 后触发,对应 extent roll 密集期)。
+    - RoCE 硬件计数器两端全平(无重传/乱序/CNP 增量)→ 非丢包/非 PFC/非带宽争用。
+    - TCP 同数据同集群完全干净(跨机 8M 读 1066MB/s)→ UCX 专属。
+    - 版本无关(a7deb3f 同样中招);6-25 参考 2761MB/s 不可复现的最大嫌疑 =
+      sglang/NCCL 今晚 00:41 起在同批 mlx5 设备上的 devx 同租
+      (project_ucx_client_thread_livelock 家族,"失败握手 ep 有界泄漏"残留)。
+  · 已清理:两端 bench 进程/临时文件、A/B worktrees、perf 集群已停。
+    repro kit:::15 /tmp/ac-{old,f833,63dc,3840,9bc0,head} 六个版本客户端 +
+    memory project_ucx_zc_read_regression_readability 里的单 op 探针/兜底命令。
 
-Main gaps / risks:
-  · P1 回归待修(专门会话):先单独 revert 63dcc34 的 regpool hunk 做 A/B;
-    注意与既有的跨机 p95~3.3s stall 家族(旧代码也有)区分,勿混为一谈。
-    修复后跑 30s 窗口 + 每点 fresh 集群(老化集群上 8M bench 会写停摆卡窗口)。
-  · 远端 ::15 无外网(github/crates.io 均不通),同步代码用 git bundle + scp。
-  · 本地 5-21 基线是否按多租户现实重录 —— 需用户决策。
+Main gaps / risks(= 交接的修复菜单,需用户定):
+  1. 便宜+安全:ZC 读超时重试加 warn 日志(现在全静默,今晚为此付出数小时;
+     fail-loud 原则)。append 扇出超时循环也应有可辨识日志。
+  2. 根修:wireup 竞态 —— UCX 层面(串行化/预热首用 ep?升级 UCX?CM 配置),
+     宿主级问题(livelock memory:UCX 1.16/1.20 都塌),需专门会话。
+  3. 3s 读超时常数本身没毛病(恢复机制工作正常),别动。
+  4. 注意 bench 卫生:老化集群(≥3 轮 8M bench)会进 wedge 循环 → 每 ≤3 轮 reset。
 
 Next steps:
-  1. 修 UCX ZC-read 回归(reproduce-first 材料齐;从 63dcc34 regpool hunk 开始)。
-  2. 修复后重跑跨机 ucx-8m 确认恢复 ~130+ ops/s(或更高),再看是否连带改善
-    旧 stall 家族。
-  3. 与用户定基线重录策略。
+  1. 用户选修复方案(建议先做 #1 日志,repro 前后对比验证)。
+  2. sglang 停/在时各测一轮单 op 探针,量化 devx 同租的放大系数(需与租户协调)。
+  3. 若做根修:reproduce-first 材料已备;wireup 涉及 transport 热路径,须 coco +
+     真集群 A/B(参照 feedback_reproduce_before_fixing_mechanism_bugs)。
