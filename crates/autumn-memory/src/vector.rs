@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn vec_codec_roundtrip() {
-        let v = vec![1.5f32, -2.0, 0.0, 3.14159];
+        let v = vec![1.5f32, -2.0, 0.0, 3.25];
         assert_eq!(decode_vec(&encode_vec(&v)), Some(v));
         assert!(decode_vec(&[0, 0]).is_none());
     }

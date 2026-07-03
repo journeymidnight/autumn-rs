@@ -23,11 +23,12 @@
 //! it for synchronous Python callers.
 
 pub mod keys;
+mod graph;
 mod recall;
 mod vector;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -764,6 +765,21 @@ pub struct ReconcileReport {
     /// reverse-pointer values that failed to decode (not exactly 4 bytes) —
     /// corruption. Should be 0.
     pub malformed_vptr: u64,
+    /// graph node records counted by a full `node/` scan.
+    pub nodes: u64,
+    /// forward graph edges counted by a full `edge/` scan.
+    pub edges: u64,
+    /// reverse-edge markers (`redge/*`) counted by a full scan.
+    pub redges: u64,
+    /// forward edges whose `src` or `dst` node record is absent — dangling
+    /// (e.g. a node deleted without reaping an incident edge). Should be 0.
+    pub dangling_edge: u64,
+    /// reverse markers with no matching forward edge — orphan hint (e.g. an
+    /// `add_edge` crash after the redge write, or a partial delete). Should be 0.
+    pub orphan_redge: u64,
+    /// forward edges with no matching reverse marker — the reverse index is
+    /// missing an entry, so `in_edges` would miss it. Should be 0.
+    pub missing_redge: u64,
 }
 
 impl ReconcileReport {
@@ -786,6 +802,9 @@ impl ReconcileReport {
             && self.duplicate_ivf == 0
             && self.dangling_vptr == 0
             && self.malformed_vptr == 0
+            && self.dangling_edge == 0
+            && self.orphan_redge == 0
+            && self.missing_redge == 0
     }
 }
 
@@ -875,6 +894,44 @@ impl MemoryStore {
                 r.dangling_vptr += 1;
             }
         }
+
+        // 5. graph integrity: node ids, forward edges, reverse markers, and the
+        //    two directional cross-checks (edge endpoints exist; fwd<->redge
+        //    agree). Same shape as the IVF orphan/dangling checks above.
+        let node_all = keys::node_prefix(&self.tenant, &self.agent);
+        let node_ids: HashSet<String> = self
+            .scan_keys(&node_all, None)
+            .await?
+            .iter()
+            .map(|k| keys::node_id_name(k, &node_all))
+            .collect();
+        r.nodes = node_ids.len() as u64;
+
+        let eall = keys::edge_all_prefix(&self.tenant, &self.agent);
+        let mut fwd: HashSet<(String, String, String)> = HashSet::new();
+        for k in &self.scan_keys(&eall, None).await? {
+            if let Some((src, et, dst)) = keys::edge_all_parse(k, &eall) {
+                if !node_ids.contains(&src) || !node_ids.contains(&dst) {
+                    r.dangling_edge += 1;
+                }
+                fwd.insert((src, et, dst));
+            }
+        }
+        r.edges = fwd.len() as u64;
+
+        let rall = keys::redge_all_prefix(&self.tenant, &self.agent);
+        let mut rev: HashSet<(String, String, String)> = HashSet::new();
+        for k in &self.scan_keys(&rall, None).await? {
+            if let Some((dst, et, src)) = keys::redge_all_parse(k, &rall) {
+                if !fwd.contains(&(src.clone(), et.clone(), dst.clone())) {
+                    r.orphan_redge += 1;
+                }
+                rev.insert((src, et, dst));
+            }
+        }
+        r.redges = rev.len() as u64;
+        r.missing_redge = fwd.iter().filter(|e| !rev.contains(*e)).count() as u64;
+
         Ok(r)
     }
 
@@ -894,6 +951,287 @@ impl MemoryStore {
             .put(&keys::stats_key(&self.tenant, &self.agent), &buf)
             .await?;
         Ok((docs, sum_len))
+    }
+}
+
+/// A node in the generic memory graph.
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub id: String,
+    pub kind: String,
+    pub attrs: Vec<u8>,
+}
+
+/// A directed, typed edge `src --etype--> dst` with opaque `attrs` bytes.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    pub src: String,
+    pub etype: String,
+    pub dst: String,
+    pub attrs: Vec<u8>,
+}
+
+/// Edge direction for `neighbors` / `bfs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    /// Follow outgoing edges (`src -> dst`).
+    Out,
+    /// Follow incoming edges (`dst <- src`).
+    In,
+}
+
+impl MemoryStore {
+    // -- generic graph: nodes + typed edges as adjacency lists ---------------
+    // Traversal is prefix range-scan on the ordered KV: out-edges scan
+    // `edge/{src}/`, in-edges scan `redge/{dst}/`. The forward `edge/*` record
+    // is authoritative; the `redge/*` marker is a derived reverse index (a
+    // hint) validated against the forward edge at read time — the same
+    // "posting = candidate, authoritative record = correctness boundary"
+    // contract as the BM25 leg (plan §8.5). Domain-agnostic: node ids / edge
+    // types are opaque strings, attrs opaque bytes.
+
+    /// Upsert a node: authoritative `node/{id}` record + `nidx/{kind}/{id}`
+    /// by-kind index marker. Re-`put_node`ing with a different `kind` leaves a
+    /// stale `nidx` marker under the OLD kind (a discardable hint; `delete_node`
+    /// clears the current one) — callers that re-kind should `delete_node` first.
+    pub async fn put_node(
+        &self,
+        id: &str,
+        kind: &str,
+        attrs: &[u8],
+        ttl: Option<u64>,
+    ) -> Result<(), AutumnError> {
+        let ttl = self.ttl(ttl);
+        let rec = graph::NodeRecord {
+            kind: kind.to_string(),
+            attrs: attrs.to_vec(),
+        };
+        self.put_kv(&keys::node_key(&self.tenant, &self.agent, id), &rec.encode(), ttl)
+            .await?;
+        self.put_kv(&keys::nidx_key(&self.tenant, &self.agent, kind, id), &[], ttl)
+            .await
+    }
+
+    /// Fetch a node record, or `None` if it does not exist / fails to decode.
+    pub async fn get_node(&self, id: &str) -> Result<Option<GraphNode>, AutumnError> {
+        let key = keys::node_key(&self.tenant, &self.agent, id);
+        Ok(self.client.get(&key).await?.and_then(|b| {
+            graph::NodeRecord::decode(&b).map(|r| GraphNode {
+                id: id.to_string(),
+                kind: r.kind,
+                attrs: r.attrs,
+            })
+        }))
+    }
+
+    /// Delete a node together with ALL its incident edges (both directions).
+    /// Bounded by the node's degree (out-scan `edge/{id}/` + in-scan
+    /// `redge/{id}/`) — potentially many point-deletes for a hub node.
+    pub async fn delete_node(&self, id: &str) -> Result<(), AutumnError> {
+        // Outgoing edges: drop each forward edge + its reverse marker.
+        let sp = keys::edge_src_prefix(&self.tenant, &self.agent, id);
+        for k in self.scan_keys(&sp, None).await? {
+            if let Some((etype, dst)) = keys::edge_parse_tail(&k, &sp) {
+                self.client.delete(&k).await?;
+                self.client
+                    .delete(&keys::redge_key(&self.tenant, &self.agent, id, &etype, &dst))
+                    .await?;
+            }
+        }
+        // Incoming edges: drop the forward edge (by rebuilding its key) + marker.
+        let rp = keys::redge_dst_prefix(&self.tenant, &self.agent, id);
+        for k in self.scan_keys(&rp, None).await? {
+            if let Some((etype, src)) = keys::redge_parse_tail(&k, &rp) {
+                self.client
+                    .delete(&keys::edge_key(&self.tenant, &self.agent, &src, &etype, id))
+                    .await?;
+                self.client.delete(&k).await?;
+            }
+        }
+        // The by-kind index marker (need the kind — read the record first).
+        if let Some(node) = self.get_node(id).await? {
+            self.client
+                .delete(&keys::nidx_key(&self.tenant, &self.agent, &node.kind, id))
+                .await?;
+        }
+        self.client
+            .delete(&keys::node_key(&self.tenant, &self.agent, id))
+            .await
+    }
+
+    /// Add a directed edge. Writes the reverse marker FIRST (the hint), then the
+    /// authoritative forward edge (the commit point) — a crash in between leaves
+    /// only a dangling `redge`, dropped by `in_edges` validation and surfaced by
+    /// `reconcile`. Idempotent: deterministic keys, retry never duplicates.
+    pub async fn add_edge(
+        &self,
+        src: &str,
+        etype: &str,
+        dst: &str,
+        attrs: &[u8],
+        ttl: Option<u64>,
+    ) -> Result<(), AutumnError> {
+        let ttl = self.ttl(ttl);
+        self.put_kv(&keys::redge_key(&self.tenant, &self.agent, src, etype, dst), &[], ttl)
+            .await?;
+        self.put_kv(&keys::edge_key(&self.tenant, &self.agent, src, etype, dst), attrs, ttl)
+            .await
+    }
+
+    /// Remove a directed edge: authoritative forward key first (so reads stop
+    /// seeing it), then the reverse marker.
+    pub async fn delete_edge(&self, src: &str, etype: &str, dst: &str) -> Result<(), AutumnError> {
+        self.client
+            .delete(&keys::edge_key(&self.tenant, &self.agent, src, etype, dst))
+            .await?;
+        self.client
+            .delete(&keys::redge_key(&self.tenant, &self.agent, src, etype, dst))
+            .await
+    }
+
+    /// Outgoing edges of `src` (optionally filtered to one `etype`). Forward
+    /// edges are authoritative — no validation needed.
+    pub async fn out_edges(
+        &self,
+        src: &str,
+        etype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Edge>, AutumnError> {
+        let scan_prefix = match etype {
+            Some(t) => keys::edge_src_type_prefix(&self.tenant, &self.agent, src, t),
+            None => keys::edge_src_prefix(&self.tenant, &self.agent, src),
+        };
+        // Parse (etype, dst) relative to the src prefix regardless of filter.
+        let src_prefix = keys::edge_src_prefix(&self.tenant, &self.agent, src);
+        let key_list = self.scan_keys(&scan_prefix, limit).await?;
+        let key_refs: Vec<&[u8]> = key_list.iter().map(|k| k.as_slice()).collect();
+        let vals = self.client.get_many(&key_refs).await;
+        let mut out = Vec::with_capacity(key_list.len());
+        for (k, v) in key_list.iter().zip(vals) {
+            // A key that vanished between scan and get is simply skipped.
+            let attrs = match v? {
+                Some(b) => b,
+                None => continue,
+            };
+            if let Some((et, dst)) = keys::edge_parse_tail(k, &src_prefix) {
+                out.push(Edge {
+                    src: src.to_string(),
+                    etype: et,
+                    dst,
+                    attrs,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Incoming edges of `dst` (optionally filtered to one `etype`). Reverse
+    /// markers are hints — each is validated against its authoritative forward
+    /// edge (a vanished/dangling marker is dropped); attrs come from the forward
+    /// edge value.
+    pub async fn in_edges(
+        &self,
+        dst: &str,
+        etype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Edge>, AutumnError> {
+        let scan_prefix = match etype {
+            Some(t) => keys::redge_dst_type_prefix(&self.tenant, &self.agent, dst, t),
+            None => keys::redge_dst_prefix(&self.tenant, &self.agent, dst),
+        };
+        let dst_prefix = keys::redge_dst_prefix(&self.tenant, &self.agent, dst);
+        let key_list = self.scan_keys(&scan_prefix, limit).await?;
+        let parsed: Vec<(String, String)> = key_list
+            .iter()
+            .filter_map(|k| keys::redge_parse_tail(k, &dst_prefix))
+            .collect();
+        let fwd_keys: Vec<Vec<u8>> = parsed
+            .iter()
+            .map(|(et, src)| keys::edge_key(&self.tenant, &self.agent, src, et, dst))
+            .collect();
+        let refs: Vec<&[u8]> = fwd_keys.iter().map(|k| k.as_slice()).collect();
+        let vals = self.client.get_many(&refs).await;
+        let mut out = Vec::with_capacity(parsed.len());
+        for ((et, src), v) in parsed.into_iter().zip(vals) {
+            if let Some(attrs) = v? {
+                out.push(Edge {
+                    src,
+                    etype: et,
+                    dst: dst.to_string(),
+                    attrs,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Neighboring node ids in `dir` (optionally filtered to one `etype`).
+    pub async fn neighbors(
+        &self,
+        id: &str,
+        dir: Dir,
+        etype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>, AutumnError> {
+        Ok(match dir {
+            Dir::Out => self
+                .out_edges(id, etype, limit)
+                .await?
+                .into_iter()
+                .map(|e| e.dst)
+                .collect(),
+            Dir::In => self
+                .in_edges(id, etype, limit)
+                .await?
+                .into_iter()
+                .map(|e| e.src)
+                .collect(),
+        })
+    }
+
+    /// List node ids of a given `kind` (prefix scan of `nidx/{kind}/`).
+    pub async fn nodes_by_kind(
+        &self,
+        kind: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>, AutumnError> {
+        let prefix = keys::nidx_kind_prefix(&self.tenant, &self.agent, kind);
+        let key_list = self.scan_keys(&prefix, limit).await?;
+        Ok(key_list.iter().map(|k| keys::nidx_id_name(k, &prefix)).collect())
+    }
+
+    /// Bounded breadth-first traversal from `start` following `dir` edges
+    /// (optionally one `etype`). Returns `(node_id, depth)` in BFS order,
+    /// including `start` at depth 0. Stops at `max_depth` (edges) or once
+    /// `max_nodes` are collected — the guards against unbounded fan-out.
+    pub async fn bfs(
+        &self,
+        start: &str,
+        dir: Dir,
+        etype: Option<&str>,
+        max_depth: u32,
+        max_nodes: usize,
+    ) -> Result<Vec<(String, u32)>, AutumnError> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+        let mut out: Vec<(String, u32)> = Vec::new();
+        visited.insert(start.to_string());
+        queue.push_back((start.to_string(), 0));
+        while let Some((node, depth)) = queue.pop_front() {
+            out.push((node.clone(), depth));
+            if out.len() >= max_nodes {
+                break;
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for nb in self.neighbors(&node, dir, etype, None).await? {
+                if visited.insert(nb.clone()) {
+                    queue.push_back((nb, depth + 1));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

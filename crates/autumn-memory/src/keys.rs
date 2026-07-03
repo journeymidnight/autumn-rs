@@ -286,6 +286,155 @@ pub fn ivf_vptr_vec_id(key: &[u8], vptr_prefix: &[u8]) -> String {
     unq(&String::from_utf8_lossy(tail))
 }
 
+// --------------------------------------------------- graph: nodes + edges ---
+// A generic node/edge graph as adjacency lists. Every component is a string, so
+// (like the BM25 posting keys) each is `q()`-encoded and `/`-separated — a `/`
+// inside any component is escaped and can never forge a separator. Four
+// families, none a byte-prefix of another's scan range (`node/` vs `nidx/` vs
+// `edge/` vs `redge/` diverge in their first 1-3 bytes):
+//   node/{id}                 -> NodeRecord (authoritative)
+//   nidx/{kind}/{id}          -> existence marker (list nodes by kind)
+//   edge/{src}/{type}/{dst}   -> edge attrs (authoritative forward edge)
+//   redge/{dst}/{type}/{src}  -> existence marker (reverse index / hint)
+
+/// Split a key tail (after `prefix`) into its first two `q()`-encoded, `/`-
+/// separated components. Safe because `q` escapes any `/` inside a component,
+/// so the FIRST literal `/` is always the true separator.
+fn split2(key: &[u8], prefix: &[u8]) -> Option<(String, String)> {
+    let tail = key.get(prefix.len()..)?;
+    let s = std::str::from_utf8(tail).ok()?;
+    let slash = s.find('/')?;
+    Some((unq(&s[..slash]), unq(&s[slash + 1..])))
+}
+
+/// Prefix covering ALL of an agent's node records — the reconcile scan.
+pub fn node_prefix(tenant: &str, agent: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(b"node/");
+    v
+}
+
+/// Key for one node record (authoritative).
+pub fn node_key(tenant: &str, agent: &str, id: &str) -> Vec<u8> {
+    let mut v = node_prefix(tenant, agent);
+    v.extend_from_slice(q(id).as_bytes());
+    v
+}
+
+/// Recover a node id from a node key given the node prefix.
+pub fn node_id_name(key: &[u8], node_prefix: &[u8]) -> String {
+    let tail = &key[node_prefix.len().min(key.len())..];
+    unq(&String::from_utf8_lossy(tail))
+}
+
+/// Prefix covering one kind's node index.
+pub fn nidx_kind_prefix(tenant: &str, agent: &str, kind: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(format!("nidx/{}/", q(kind)).as_bytes());
+    v
+}
+
+/// Existence marker: node `id` has kind `kind` (empty value).
+pub fn nidx_key(tenant: &str, agent: &str, kind: &str, id: &str) -> Vec<u8> {
+    let mut v = nidx_kind_prefix(tenant, agent, kind);
+    v.extend_from_slice(q(id).as_bytes());
+    v
+}
+
+/// Recover the node id from a nidx key given its kind prefix.
+pub fn nidx_id_name(key: &[u8], kind_prefix: &[u8]) -> String {
+    let tail = &key[kind_prefix.len().min(key.len())..];
+    unq(&String::from_utf8_lossy(tail))
+}
+
+/// Prefix covering ALL of an agent's forward edges — the reconcile scan.
+pub fn edge_all_prefix(tenant: &str, agent: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(b"edge/");
+    v
+}
+
+/// Prefix covering all of `src`'s outgoing edges.
+pub fn edge_src_prefix(tenant: &str, agent: &str, src: &str) -> Vec<u8> {
+    let mut v = edge_all_prefix(tenant, agent);
+    v.extend_from_slice(format!("{}/", q(src)).as_bytes());
+    v
+}
+
+/// Prefix covering `src`'s outgoing edges of one type.
+pub fn edge_src_type_prefix(tenant: &str, agent: &str, src: &str, etype: &str) -> Vec<u8> {
+    let mut v = edge_src_prefix(tenant, agent, src);
+    v.extend_from_slice(format!("{}/", q(etype)).as_bytes());
+    v
+}
+
+/// Forward edge key `edge/{src}/{type}/{dst}` (value = edge attrs; authoritative).
+pub fn edge_key(tenant: &str, agent: &str, src: &str, etype: &str, dst: &str) -> Vec<u8> {
+    let mut v = edge_src_type_prefix(tenant, agent, src, etype);
+    v.extend_from_slice(q(dst).as_bytes());
+    v
+}
+
+/// Recover `(etype, dst)` from a forward-edge key given its `src` prefix.
+pub fn edge_parse_tail(key: &[u8], src_prefix: &[u8]) -> Option<(String, String)> {
+    split2(key, src_prefix)
+}
+
+/// Recover `(src, etype, dst)` from a forward-edge key given the ALL prefix.
+pub fn edge_all_parse(key: &[u8], all_prefix: &[u8]) -> Option<(String, String, String)> {
+    let tail = key.get(all_prefix.len()..)?;
+    let s = std::str::from_utf8(tail).ok()?;
+    let mut it = s.splitn(3, '/');
+    let src = it.next()?;
+    let etype = it.next()?;
+    let dst = it.next()?;
+    Some((unq(src), unq(etype), unq(dst)))
+}
+
+/// Prefix covering ALL of an agent's reverse-edge markers — the reconcile scan.
+pub fn redge_all_prefix(tenant: &str, agent: &str) -> Vec<u8> {
+    let mut v = agent_prefix(tenant, agent);
+    v.extend_from_slice(b"redge/");
+    v
+}
+
+/// Prefix covering all of `dst`'s incoming edges (reverse markers).
+pub fn redge_dst_prefix(tenant: &str, agent: &str, dst: &str) -> Vec<u8> {
+    let mut v = redge_all_prefix(tenant, agent);
+    v.extend_from_slice(format!("{}/", q(dst)).as_bytes());
+    v
+}
+
+/// Prefix covering `dst`'s incoming edges of one type.
+pub fn redge_dst_type_prefix(tenant: &str, agent: &str, dst: &str, etype: &str) -> Vec<u8> {
+    let mut v = redge_dst_prefix(tenant, agent, dst);
+    v.extend_from_slice(format!("{}/", q(etype)).as_bytes());
+    v
+}
+
+/// Reverse-edge marker `redge/{dst}/{type}/{src}` (empty value; a hint).
+pub fn redge_key(tenant: &str, agent: &str, src: &str, etype: &str, dst: &str) -> Vec<u8> {
+    let mut v = redge_dst_type_prefix(tenant, agent, dst, etype);
+    v.extend_from_slice(q(src).as_bytes());
+    v
+}
+
+/// Recover `(etype, src)` from a reverse-edge key given its `dst` prefix.
+pub fn redge_parse_tail(key: &[u8], dst_prefix: &[u8]) -> Option<(String, String)> {
+    split2(key, dst_prefix)
+}
+
+/// Recover `(dst, etype, src)` from a reverse-edge key given the ALL prefix.
+pub fn redge_all_parse(key: &[u8], all_prefix: &[u8]) -> Option<(String, String, String)> {
+    let tail = key.get(all_prefix.len()..)?;
+    let s = std::str::from_utf8(tail).ok()?;
+    let mut it = s.splitn(3, '/');
+    let dst = it.next()?;
+    let etype = it.next()?;
+    let src = it.next()?;
+    Some((unq(dst), unq(etype), unq(src)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +484,45 @@ mod tests {
         // (so train's ivf_all_prefix scan never mistakes a vptr for a posting)
         let vptr = ivf_vptr_key("acme", "agent-1", "vec-9");
         assert!(!vptr.starts_with(&all), "vptr must not be in the ivf/ scan range");
+    }
+
+    #[test]
+    fn graph_key_roundtrip() {
+        // node id with a slash round-trips and is isolated from other families.
+        let np = node_prefix("acme", "a1");
+        let nk = node_key("acme", "a1", "pkg/mod::Foo");
+        assert!(nk.starts_with(&np));
+        assert_eq!(node_id_name(&nk, &np), "pkg/mod::Foo");
+
+        // forward edge with '/' in src and dst components.
+        let eall = edge_all_prefix("acme", "a1");
+        let sp = edge_src_prefix("acme", "a1", "a/b");
+        let ek = edge_key("acme", "a1", "a/b", "CALLS", "c/d");
+        assert!(ek.starts_with(&sp) && ek.starts_with(&eall));
+        assert_eq!(edge_parse_tail(&ek, &sp), Some(("CALLS".into(), "c/d".into())));
+        assert_eq!(
+            edge_all_parse(&ek, &eall),
+            Some(("a/b".into(), "CALLS".into(), "c/d".into()))
+        );
+        // a src "a/b" edge must not leak into src "a"'s outgoing scan.
+        assert!(!sp.starts_with(&edge_src_prefix("acme", "a1", "a")));
+
+        // reverse edge mirrors, keyed by dst.
+        let rall = redge_all_prefix("acme", "a1");
+        let rdp = redge_dst_prefix("acme", "a1", "c/d");
+        let rk = redge_key("acme", "a1", "a/b", "CALLS", "c/d");
+        assert!(rk.starts_with(&rdp) && rk.starts_with(&rall));
+        assert_eq!(redge_parse_tail(&rk, &rdp), Some(("CALLS".into(), "a/b".into())));
+        assert_eq!(
+            redge_all_parse(&rk, &rall),
+            Some(("c/d".into(), "CALLS".into(), "a/b".into()))
+        );
+
+        // cross-family isolation: no scan range catches another family.
+        assert!(!nk.starts_with(&eall) && !ek.starts_with(&np) && !ek.starts_with(&rall));
+        let nik = nidx_key("acme", "a1", "Function", "a/b");
+        assert!(!nik.starts_with(&np), "nidx must not be caught by the node scan");
+        assert_eq!(nidx_id_name(&nik, &nidx_kind_prefix("acme", "a1", "Function")), "a/b");
     }
 
     #[test]

@@ -278,3 +278,95 @@ fn e2e_reconcile_heals_ttl_drift() {
             println!("autumn-memory e2e: reconcile heals TTL drift OK (agent={agent})");
         });
 }
+
+/// Graph leg: nodes + typed edges as adjacency lists, traversal via range scan.
+/// Build A --CALLS--> B --CALLS--> C, then exercise out/in edges, neighbors,
+/// nodes_by_kind, and a bounded BFS (the `trace_call_path` primitive). Delete an
+/// edge and confirm the reverse index drops it. reconcile stays clean throughout.
+#[test]
+#[ignore = "needs a live autumn cluster (set AUTUMN_MEMORY_E2E_MANAGER)"]
+fn e2e_graph_traversal() {
+    use autumn_memory::Dir;
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async {
+            let agent = unique_agent();
+            let mem = MemoryStore::connect(&manager_addr(), "__am_e2e", agent.as_str())
+                .await
+                .expect("connect");
+
+            for id in ["A", "B", "C"] {
+                mem.put_node(id, "Function", format!("name={id}").as_bytes(), None)
+                    .await
+                    .expect("put_node");
+            }
+            mem.add_edge("A", "CALLS", "B", b"line=10", None).await.expect("edge A->B");
+            mem.add_edge("B", "CALLS", "C", b"line=20", None).await.expect("edge B->C");
+
+            // out / in edges
+            let out_a = mem.out_edges("A", None, None).await.expect("out A");
+            assert_eq!(out_a.len(), 1);
+            assert_eq!((out_a[0].dst.as_str(), out_a[0].attrs.as_slice()), ("B", &b"line=10"[..]));
+            let in_c = mem.in_edges("C", None, None).await.expect("in C");
+            assert_eq!(in_c.len(), 1);
+            assert_eq!(in_c[0].src, "B");
+
+            // neighbors + nodes_by_kind
+            assert_eq!(mem.neighbors("A", Dir::Out, Some("CALLS"), None).await.expect("nb"), vec!["B"]);
+            let mut kinds = mem.nodes_by_kind("Function", None).await.expect("by kind");
+            kinds.sort();
+            assert_eq!(kinds, vec!["A", "B", "C"]);
+
+            // bounded BFS (trace_call_path): A@0, B@1, C@2
+            let path = mem.bfs("A", Dir::Out, Some("CALLS"), 5, 100).await.expect("bfs");
+            assert_eq!(path, vec![("A".into(), 0), ("B".into(), 1), ("C".into(), 2)]);
+
+            assert!(mem.reconcile().await.expect("rec").is_clean(), "graph clean");
+
+            // delete an edge → reverse index must drop it
+            mem.delete_edge("A", "CALLS", "B").await.expect("del edge");
+            assert!(mem.out_edges("A", None, None).await.expect("out A2").is_empty());
+            assert!(mem.in_edges("B", None, None).await.expect("in B2").is_empty());
+            assert!(mem.reconcile().await.expect("rec2").is_clean(), "clean after edge delete");
+
+            for id in ["A", "B", "C"] {
+                let _ = mem.delete_node(id).await;
+            }
+            println!("autumn-memory e2e: graph traversal OK (agent={agent})");
+        });
+}
+
+/// reconcile FLAGS a dangling edge (a forward edge to a non-existent node),
+/// injected via the raw client + `keys::edge_key`, and `is_clean()` goes false.
+#[test]
+#[ignore = "needs a live autumn cluster (set AUTUMN_MEMORY_E2E_MANAGER)"]
+fn e2e_reconcile_flags_dangling_edge() {
+    use autumn_client::ClusterClient;
+    use std::rc::Rc;
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async {
+            let agent = unique_agent();
+            let client = Rc::new(ClusterClient::connect(&manager_addr()).await.expect("connect"));
+            let mem = MemoryStore::with_client(client.clone(), "__am_e2e", agent.clone());
+
+            mem.put_node("real", "Node", b"", None).await.expect("put real");
+            // forward edge real -> ghost, but ghost has no node record.
+            let ek = autumn_memory::keys::edge_key("__am_e2e", &agent, "real", "REF", "ghost");
+            client.put(&ek, b"").await.expect("inject fwd edge");
+            // matching reverse marker so ONLY the missing-node invariant trips.
+            let rk = autumn_memory::keys::redge_key("__am_e2e", &agent, "real", "REF", "ghost");
+            client.put(&rk, b"").await.expect("inject redge");
+
+            let r = mem.reconcile().await.expect("reconcile");
+            assert_eq!(r.dangling_edge, 1, "one dangling edge (ghost node missing): {r:?}");
+            assert_eq!(r.orphan_redge, 0, "reverse marker matches the fwd edge: {r:?}");
+            assert_eq!(r.missing_redge, 0, "fwd edge has its reverse marker: {r:?}");
+            assert!(!r.is_clean(), "not clean with a dangling edge: {r:?}");
+
+            let _ = mem.delete_node("real").await;
+            let _ = client.delete(&ek).await;
+            let _ = client.delete(&rk).await;
+            println!("autumn-memory e2e: reconcile flags dangling edge OK (agent={agent})");
+        });
+}
