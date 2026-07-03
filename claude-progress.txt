@@ -1,39 +1,39 @@
 Date: 2026-07-03
 TaskStatus: completed
-Task scope: 按用户新规则("perf check 前查 CPU;租户在场用 cpuset 躲开")在
-  sglang/Ray 同租的箱子上重跑本地 + 跨机 perf check,并验证 cpuset 隔离对
-  UCX 死 ep stall 的影响。
+Task scope: 修 UCX 8M 读 stall(用户批准路线:先 fix(a) 日志分级,再 #1
+  ping-on-connect;后转 rndv/zcopy 试验)。结果:stall 已由**纯配置修复**
+  (UCX_TLS 去 posix/cma),fix(a) 日志已提交,ping 被证伪撤回。
 
 Current summary:
-  · 规则落地:perf-check skill 预检第 0 步(v2)+ feedback_perf_check_cpu_gate
-    —— 查租户热核 → 集群钉不相交高段核(EN1/2/3=96-103/104-111/112-119,
-    PS=120-151;EN cpuset 长度必须=AUTUMN_EXTENT_SHARDS;UCX 宁宽勿紧),
-    bench 客户端不 pin;核不够才放弃。EN base 20000 照旧(Ray 端口坑)。
-  · 隔离矩阵结果(租户在场、cpuset 隔离,与空箱基线对比仅供参考):
-    - tcp-4k:写 94K 达标;读 453K(不隔离 255K,+78%;空箱基线 1.37M 的 33%,
-      余差=内存带宽/LLC 无法 cpuset 隔离 + 客户端不 pin)
-    - tcp-8m:PASS(写 269 / 读 1144 ops/s = 9.6GB/s)
-    - ucx-4k:吞吐双侧过线(447K 读跨机),仅 p99 尾部涨(1.15-1.35ms)
-    - ucx-8m loopback:124/105 + 多秒 stall,对 cpuset 完全无感 —— loopback
-      posix/cma 是另一个宿主级老病,与跨机 rc_mlx5 问题分开记账
-    - 跨机 ucx-8m:写 260 健康;读 127 ops/s(不隔离 31-42 的 3-4×),但 16-worker
-      并发下 p95 仍 3.2s
-  · **死 ep 根因两层拆解(隔离实验判别)**:
-    ① 租户调度放大层:sglang/Ray 线程在握手窗口抢占集群侧 UCX worker
-      → 串行单 op 探针 4-6% @3.3s;**cpuset 隔离后 0/50 全干净 —— 已治好**
-      (是调度干扰,不是驱动 devx)。
-    ② 本征并发 wireup 竞态层:16 worker 同时建 ep 时仍 ~5% 死 ep(t1 干净/
-      t4+ 出现的梯度),隔离无感 —— 这是真正遗留的 UCX 层问题,静默 3s 重试
-      掩盖它(修复菜单:先加 warn 日志;根修需专门会话)。
-  · 全部数字与判别记录在 memory project_ucx_zc_read_regression_readability。
-    集群已停,两端已清理。
+  · fix(a) 已提交(b4754ae rebase 后):client get_direct 副本 failover +
+    PS ZC 代理读的静默重试按错误分级(超时→warn,预期 failover→debug,
+    全副本失败仅含超时时 warn —— coco P3 采纳)。client 27/27、stream 90/90、
+    clippy 0。**部署当轮即立功**:373 条 warn 把故障点改写为 PS→EN 同机段。
+  · ping-on-connect(#1)完整走了实现→测试→真集群验证→**被证伪→撤回**:
+    探活(MSG_TYPE_PING)全通过而 8M 读依旧卡 → 病灶不是死 endpoint 而是
+    **并发大消息传输**;按"不留未证实机制补丁"原则还原 conn_pool.rs
+    (过程记入 memory 防重走弯路)。
+  · rndv/zcopy 试验矩阵(6 配置 × fresh 集群 × t16 8M bench,指标=PS 超时
+    warn 数/读 ops/s)定谳:
+    baseline(posix,cma) 178/210 · no-cma 197/105 · **no-shm 0/853** ·
+    rndv-put_zcopy 258/25 · rndv-get_zcopy 223/69 · no-zcopy 191/100
+    → **元凶 = posix shm 传输的并发大消息路径**(cma 无辜,rndv/zcopy 无关)。
+  · no-shm(UCX_TLS=rc_mlx5,ud_mlx5,tcp,self)验证:8M 读 960 ops/s(8.05GB/s,
+    p99 122ms,0 stall,超 6-25 参考 2.6×)、4K 读 771K(p99 0.19ms)、8M 写 183;
+    **代价:4K 写 71.8K→13.8K**(posix 曾高效承载 PS→EN 小 append,rc loopback
+    每 append 付延迟,p50 0.84→7.4ms)。大值负载(kvcache/fuse)净赚 4-9×。
+  · 结论已固化:feedback_ucx_tls_positive_list(7-03 修订:RoCE 绑定集群禁加
+    posix/cma;纯 loopback 维持 posix)+ perf-check skill UCX_TLS 段 +
+    project_ucx_zc_read_regression_readability(全 sweep 表)。
+  · PS 双监听代价分析(用户问):**PS 无需双监听** —— 病灶 hop 上 PS 是连接方,
+    传输选择在拨号侧;若未来真要,fd 成本低(TCP 侧)、真实成本在寻址/wire
+    (part_addrs 双地址 + GetRegions + 三个消费者适配)与端口空间×2。已记档。
 
-Main gaps / risks:
-  1. 本征并发 wireup 死 ep(≈5%,3s 静默重试兜底)—— 修复菜单待用户:
-     (a) ZC 读超时重试加 warn(便宜,建议先做);(b) wireup 竞态根修(UCX 层,
-     专门会话);(c) 3s 常数不动。
-  2. loopback ucx-8m 病理未解(posix/cma,老病,影响 loopback bench 而已)。
-  3. 空箱基线 vs 多租户现实的基线策略仍待用户定(勿擅自 --update-baseline)。
+Main gaps / risks(后续可选,无阻塞):
+  1. posix 大消息为何坏未根解(UCX 包/内核/sglang uct 同租;6-25 曾好过)——
+     现已绕开,根查属 UCX 层专门课题。
+  2. no-shm 下 4K 写恢复(append 批量化调优)——仅 4K 写密集负载需要。
+  3. 基线重录策略(多租户+cpuset+新 TLS 三重口径变化)——需用户定。
 
 Next steps:
-  (本任务闭环。后续按用户选择进入修复菜单。)
+  (本任务闭环。可选:用 no-shm 配置重录 ucx 基线;4K 写调优;posix 根查。)
