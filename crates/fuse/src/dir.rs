@@ -3,26 +3,24 @@
 use std::ffi::OsStr;
 
 use anyhow::{anyhow, Result};
-use fuser::FileAttr;
 
-use crate::bridge::ReaddirEntry;
 use crate::key;
 use crate::meta::*;
-use crate::schema::{self, DirentValue, DT_DIR, DT_LNK};
+use crate::schema::{self, DirentValue, InodeMeta, ReaddirEntry, DT_DIR};
 use crate::state::FsState;
 
-/// Lookup a child entry in a directory.
-pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(FileAttr, u64)> {
+/// Lookup a child entry in a directory. Returns `(ino, meta)` — the FUSE
+/// layer converts to `FileAttr` at the reply boundary (F-FS-UNIFY M1).
+pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u64, InodeMeta)> {
     let name_bytes = name.as_encoded_bytes();
     let k = key::dirent_key(parent, name_bytes);
     let v = state.kv_get(&k).await.map_err(|_| anyhow!("ENOENT"))?;
     let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
     let meta = get_inode(state, dirent.child_inode).await?;
-    let attr = inode_to_attr(dirent.child_inode, &meta);
 
     *state.lookup_count.entry(dirent.child_inode).or_insert(0) += 1;
 
-    Ok((attr, dirent.child_inode))
+    Ok((dirent.child_inode, meta))
 }
 
 /// Read directory entries.
@@ -33,7 +31,7 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
         entries.push(ReaddirEntry {
             ino,
             offset: 1,
-            kind: fuser::FileType::Directory,
+            kind: DT_DIR,
             name: ".".into(),
         });
     }
@@ -41,7 +39,7 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
         entries.push(ReaddirEntry {
             ino,
             offset: 2,
-            kind: fuser::FileType::Directory,
+            kind: DT_DIR,
             name: "..".into(),
         });
     }
@@ -68,13 +66,12 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
             Ok(d) => d,
             Err(_) => continue,
         };
-        let kind = dt_to_filetype(dirent.file_type);
         let name = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(name_bytes) };
 
         entries.push(ReaddirEntry {
             ino: dirent.child_inode,
             offset: entry_offset,
-            kind,
+            kind: dirent.file_type,
             name,
         });
     }
@@ -82,8 +79,14 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
     Ok(entries)
 }
 
-/// Create a directory.
-pub async fn mkdir(state: &mut FsState, parent: u64, name: &OsStr, mode: u32) -> Result<FileAttr> {
+/// Create a directory. Returns `(ino, meta)` — the FUSE layer converts to
+/// `FileAttr` at the reply boundary (F-FS-UNIFY M1).
+pub async fn mkdir(
+    state: &mut FsState,
+    parent: u64,
+    name: &OsStr,
+    mode: u32,
+) -> Result<(u64, InodeMeta)> {
     let name_bytes = name.as_encoded_bytes();
     let dk = key::dirent_key(parent, name_bytes);
     if state.kv_exists(&dk).await.unwrap_or(false) {
@@ -111,7 +114,7 @@ pub async fn mkdir(state: &mut FsState, parent: u64, name: &OsStr, mode: u32) ->
     put_inode(state, parent, &parent_meta).await?;
 
     *state.lookup_count.entry(ino).or_insert(0) += 1;
-    Ok(inode_to_attr(ino, &meta))
+    Ok((ino, meta))
 }
 
 /// Remove a directory (must be empty).
@@ -241,10 +244,5 @@ pub async fn rename(
     Ok(())
 }
 
-fn dt_to_filetype(dt: u8) -> fuser::FileType {
-    match dt {
-        DT_DIR => fuser::FileType::Directory,
-        DT_LNK => fuser::FileType::Symlink,
-        _ => fuser::FileType::RegularFile,
-    }
-}
+// F-FS-UNIFY M1: `dt_to_filetype` moved to `attr.rs` (fuse-gated reply
+// boundary) — readdir entries carry the raw `DT_*` byte now.

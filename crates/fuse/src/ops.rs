@@ -355,7 +355,9 @@ impl Filesystem for AutumnFs {
         }) {
             Ok(entries) => {
                 for e in entries {
-                    if reply.add(e.ino, e.offset, e.kind, &e.name) {
+                    // F-FS-UNIFY M1: core entries carry a DT_* byte;
+                    // convert to fuser::FileType at the reply boundary.
+                    if reply.add(e.ino, e.offset, crate::attr::dt_to_filetype(e.kind), &e.name) {
                         break; // buffer full
                     }
                 }

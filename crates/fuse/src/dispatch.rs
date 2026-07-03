@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use autumn_client::lease;
 use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 
+use crate::attr::inode_to_attr;
 use crate::bridge::*;
 use crate::dir;
 use crate::key;
@@ -469,7 +470,11 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             name,
             reply,
         } => {
-            let result = dir::lookup(state, parent, &name).await;
+            // F-FS-UNIFY M1: core returns (ino, meta); convert to the
+            // fuser reply shape at this boundary.
+            let result = dir::lookup(state, parent, &name)
+                .await
+                .map(|(ino, meta)| (inode_to_attr(ino, &meta), ino));
             let _ = reply.send(result);
         }
         FsRequest::Forget { ino, nlookup } => {
@@ -557,7 +562,9 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             mode,
             reply,
         } => {
-            let result = dir::mkdir(state, parent, &name, mode).await;
+            let result = dir::mkdir(state, parent, &name, mode)
+                .await
+                .map(|(ino, meta)| inode_to_attr(ino, &meta));
             let _ = reply.send(result);
         }
         FsRequest::Rmdir {

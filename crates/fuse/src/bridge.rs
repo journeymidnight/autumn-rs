@@ -135,13 +135,10 @@ pub enum FsRequest {
 // FsRequest is Send because all its fields are Send
 unsafe impl Send for FsRequest {}
 
-/// A single readdir entry returned to FUSE.
-pub struct ReaddirEntry {
-    pub ino: u64,
-    pub offset: i64,
-    pub kind: fuser::FileType,
-    pub name: OsString,
-}
+/// A single readdir entry. F-FS-UNIFY M1: the struct moved to the
+/// fuser-free core (`schema::ReaddirEntry`, `kind` = `DT_*` byte);
+/// re-exported here so `bridge::ReaddirEntry` callers keep compiling.
+pub use crate::schema::ReaddirEntry;
 
 /// Simplified statfs data.
 pub struct StatfsData {

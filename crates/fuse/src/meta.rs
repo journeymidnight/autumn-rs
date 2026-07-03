@@ -5,7 +5,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use fuser::FileAttr;
 
 use crate::key;
 use crate::schema::{self, InodeMeta, INODE_ALLOC_BATCH, ROOT_INO};
@@ -16,55 +15,21 @@ use crate::state::FsState;
 // `InodeMeta.mode` is `u32` everywhere, so normalise the libc constants
 // once here and use these `u32` aliases from every call site (meta.rs +
 // dispatch.rs). `#[allow]` covers the host where the cast is a no-op.
+// `pub` (F-FS-UNIFY M1): these are the persisted `InodeMeta.mode` format
+// bits — part of the core's public vocabulary (the fuse-gated `attr.rs`
+// and the M2 PyO3 binding both classify inodes with them).
 #[allow(clippy::unnecessary_cast)]
-pub(crate) const S_IFMT: u32 = libc::S_IFMT as u32;
+pub const S_IFMT: u32 = libc::S_IFMT as u32;
 #[allow(clippy::unnecessary_cast)]
-pub(crate) const S_IFDIR: u32 = libc::S_IFDIR as u32;
+pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
 #[allow(clippy::unnecessary_cast)]
-pub(crate) const S_IFLNK: u32 = libc::S_IFLNK as u32;
+pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
 #[allow(clippy::unnecessary_cast)]
-pub(crate) const S_IFREG: u32 = libc::S_IFREG as u32;
+pub const S_IFREG: u32 = libc::S_IFREG as u32;
 
-/// Convert InodeMeta to fuser::FileAttr.
-pub fn inode_to_attr(ino: u64, meta: &InodeMeta) -> FileAttr {
-    let kind = mode_to_filetype(meta.mode);
-    FileAttr {
-        ino,
-        size: meta.size,
-        blocks: meta.size.div_ceil(512),
-        atime: system_time(meta.atime_secs, meta.atime_nsecs),
-        mtime: system_time(meta.mtime_secs, meta.mtime_nsecs),
-        ctime: system_time(meta.ctime_secs, meta.ctime_nsecs),
-        crtime: system_time(meta.ctime_secs, meta.ctime_nsecs),
-        kind,
-        perm: (meta.mode & 0o7777) as u16,
-        nlink: meta.nlink,
-        uid: meta.uid,
-        gid: meta.gid,
-        rdev: 0,
-        // Optimal-IO hint reported via stat(2) st_blksize. Kept at 1 MiB (not
-        // the 8 MiB MAX_EXTENT) so stdio/cp size their buffers sensibly while
-        // still issuing large reads; FUSE readahead is configured separately.
-        blksize: 1024 * 1024,
-        flags: 0,
-    }
-}
-
-fn system_time(secs: i64, nsecs: u32) -> SystemTime {
-    if secs >= 0 {
-        UNIX_EPOCH + std::time::Duration::new(secs as u64, nsecs)
-    } else {
-        UNIX_EPOCH
-    }
-}
-
-fn mode_to_filetype(mode: u32) -> fuser::FileType {
-    match mode & S_IFMT {
-        m if m == S_IFDIR => fuser::FileType::Directory,
-        m if m == S_IFLNK => fuser::FileType::Symlink,
-        _ => fuser::FileType::RegularFile,
-    }
-}
+// F-FS-UNIFY M1: `inode_to_attr` / `mode_to_filetype` (the InodeMeta →
+// fuser::FileAttr conversions) moved to `attr.rs` — the fuse-gated reply
+// boundary. This module is part of the fuser-free FS core.
 
 /// Current timestamp.
 pub fn now_ts() -> (i64, u32) {

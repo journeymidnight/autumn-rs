@@ -466,22 +466,34 @@ flush_buffer(ino):
 
 ---
 
-## 模块职责
+## 模块职责(F-FS-UNIFY M1 起分两层 feature)
+
+**`core` feature —— fuser-free 文件系统核心**(`--no-default-features
+--features core` 可独立编译,唯一额外依赖 libc;返回裸 `InodeMeta`/`DT_*`,
+供 M2 PyO3 `autumn.Fs` 绑定与 M3 fsspec facade 复用):
 
 | 文件 | 职责 |
 |------|------|
-| `main.rs` | 二进制入口，解析参数，启动 mount |
-| `lib.rs` | FuseConfig, mount() |
-| `schema.rs` | InodeMeta, DirentValue, WriteBuffer 类型定义 |
-| `key.rs` | KV key 编码/解码工具函数 |
-| `bridge.rs` | FsRequest enum, FUSE↔compio channel 桥接 |
-| `ops.rs` | fuser::Filesystem trait 实现 |
-| `dir.rs` | lookup, readdir, mkdir, rmdir, rename |
-| `meta.rs` | getattr, setattr, create, unlink, mknod |
-| `read.rs` | 分块读取 + 组装 |
-| `write.rs` | 1MB 写缓冲 + flush 逻辑 |
-| `cache.rs` | inode 缓存管理 |
-| `main.rs` (periodic_sync) | 30s 周期脏 inode sync(曾有独立 sync_task.rs 模块,从未被接线,已删) |
+| `key.rs` | KV key 编码/解码工具函数(恒编译,无 feature 门)|
+| `schema.rs` | InodeMeta, DirentValue, ReaddirEntry(kind=DT_* byte), WriteBuffer(恒编译)|
+| `meta.rs` | inode 元数据 get/put、alloc_inode(M0 manager 取号)、S_IF* mode 格式常量 |
+| `dir.rs` | lookup/readdir/mkdir/rmdir/rename —— 返回 `(ino, InodeMeta)` / DT_* 条目 |
+| `extent.rs` | 变长 extent 寻址/写/截断/删除 |
+| `read.rs` / `write.rs` | 分块读组装 / 写缓冲 + flush |
+| `state.rs` | FsState(ClusterClient、inode 批次游标、lease 簿记)|
+
+**`fuse` feature(default,含 `core`)—— 内核挂载胶水**:
+
+| 文件 | 职责 |
+|------|------|
+| `main.rs` | 二进制入口 + 30s 周期脏 inode sync |
+| `attr.rs` | **唯一的 core→fuser 转换点**:`inode_to_attr`/`dt_to_filetype`(M1 从 meta/dir 上移)|
+| `bridge.rs` | FsRequest enum, FUSE↔compio channel 桥接(ReaddirEntry 从 schema 再导出)|
+| `ops.rs` | fuser::Filesystem trait 实现(readdir 在 reply 边界做 DT_*→FileType)|
+| `dispatch.rs` | compio 侧派发循环(lookup/mkdir 在此转 FileAttr)|
+
+不变量:core 文件**禁止 import fuser**(`cargo tree --features core` 中
+fuser 计数为 0 是 M1 验收标准);新的 core→fuser 转换一律进 `attr.rs`。
 
 ---
 

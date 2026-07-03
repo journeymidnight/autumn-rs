@@ -104,6 +104,17 @@ pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
 pub const DT_LNK: u8 = 10;
 
+/// A single readdir entry. F-FS-UNIFY M1: lives in the fuser-free core
+/// (`kind` is a `DT_*` byte, not `fuser::FileType`); the FUSE reply
+/// boundary (`ops.rs`) converts via `attr::dt_to_filetype`.
+pub struct ReaddirEntry {
+    pub ino: u64,
+    pub offset: i64,
+    /// `DT_REG` / `DT_DIR` / `DT_LNK`.
+    pub kind: u8,
+    pub name: std::ffi::OsString,
+}
+
 /// Runtime write buffer state for a single inode (compio thread-local).
 pub struct WriteBuffer {
     /// Buffer storage, capacity = [`WRITE_BUF_CAP`].
