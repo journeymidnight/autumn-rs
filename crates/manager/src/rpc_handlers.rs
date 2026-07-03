@@ -255,6 +255,8 @@ impl AutumnManager {
             MSG_GET_AUTHZ_CONFIG => self.handle_get_authz_config().await,
             MSG_TENANT_CREATE => self.handle_tenant_create(payload).await,
             MSG_TENANT_DELETE => self.handle_tenant_delete(payload).await,
+            // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
+            MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -5611,6 +5613,47 @@ impl AutumnManager {
             message: String::new(),
             events: out_events,
         }))
+    }
+
+    /// F-FS-UNIFY M0: grant a batch of fuse-fs inode numbers. See
+    /// `fs_alloc.rs` for the CAS grant loop + migration-floor semantics.
+    pub async fn handle_alloc_inodes(&self, payload: Bytes) -> HandlerResult {
+        let req: AllocInodesReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        if req.count == 0 {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "count must be >= 1".to_string(),
+                base: 0,
+            }));
+        }
+        // Etcd write needs leader status; non-leader rejects with NOT_LEADER
+        // so the client retries against the new leader (same pattern as
+        // MSG_ACQUIRE_LEASE / MSG_ACQUIRE_OWNER_LOCK).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                base: 0,
+            }));
+        }
+        match self.alloc_fs_inodes(req.count as u64, req.floor).await {
+            Ok(base) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_OK,
+                message: String::new(),
+                base,
+            })),
+            Err(AppError::NotLeader) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_NOT_LEADER,
+                message: "deposed during grant".to_string(),
+                base: 0,
+            })),
+            Err(e) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_ERROR,
+                message: format!("alloc_fs_inodes: {e}"),
+                base: 0,
+            })),
+        }
     }
 }
 

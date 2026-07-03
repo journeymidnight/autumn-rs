@@ -144,26 +144,53 @@ pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Resul
 }
 
 /// Allocate a new inode number from the batch allocator.
+///
+/// F-FS-UNIFY M0: batches are granted by the MANAGER
+/// (`ClusterClient::alloc_inodes` — leader-fenced etcd CAS), replacing the
+/// pre-M0 non-CAS read-modify-write on the `[0x04]next_inode` fs KV key,
+/// which handed out duplicate batches under concurrent allocators (two
+/// mounts, or a mount + the Python `autumn.Fs` client).
 pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
     if state.next_inode < state.inode_batch_end {
         let ino = state.next_inode;
         state.next_inode += 1;
         return Ok(ino);
     }
-    // Need to allocate a new batch from KV
+    // Batch refill. The legacy KV counter is passed as the migration FLOOR:
+    // a pre-M0 filesystem stored its cursor there, so the manager's grant
+    // never re-issues an inode below it. Missing/short key → no floor.
     let k = key::next_inode_key();
-    let current = match state.kv_get(&k).await {
+    let floor = match state.kv_get(&k).await {
         Ok(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
-        _ => ROOT_INO + 1, // first allocation starts after root
+        _ => ROOT_INO + 1,
     };
-    let new_end = current + INODE_ALLOC_BATCH;
-    let v = new_end.to_be_bytes();
-    state
-        .kv_put(&k, &v)
+    let base = state
+        .client
+        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor)
         .await
-        .context("persist next_inode counter")?;
-    state.next_inode = current;
-    state.inode_batch_end = new_end;
+        .context("alloc_inodes from manager")?;
+    // Best-effort: keep the legacy KV cursor roughly current so a disaster
+    // rebuild (etcd state lost, fs data preserved) re-migrates from a recent
+    // floor instead of the pre-M0 value. MONOTONIC-GUARDED (coco P2): re-read
+    // and only write when our end is higher, so a slow allocator's smaller
+    // batch can't overwrite a concurrent allocator's larger cursor. A
+    // read↔put race window remains (plain KV, no CAS) — which is why this
+    // key is advisory freshness only, NEVER a trusted disaster floor: a
+    // real etcd-lost recovery must offline-scan max(ino) instead. The
+    // manager counter stays authoritative while etcd lives (grants use
+    // max(counter, floor), so a stale floor can't rewind it).
+    let new_end = base + INODE_ALLOC_BATCH;
+    let cur_cursor = match state.kv_get(&k).await {
+        Ok(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
+        _ => 0,
+    };
+    if new_end > cur_cursor {
+        if let Err(e) = state.kv_put(&k, &new_end.to_be_bytes()).await {
+            tracing::warn!(error = %e, "legacy next_inode cursor update failed (advisory)");
+        }
+    }
+    state.next_inode = base;
+    state.inode_batch_end = base + INODE_ALLOC_BATCH;
     let ino = state.next_inode;
     state.next_inode += 1;
     Ok(ino)

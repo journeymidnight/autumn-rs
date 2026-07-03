@@ -197,6 +197,14 @@ pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
 // account (credential_hash + allowed_prefixes) in the KDC's account DB.
 pub const MSG_TENANT_CREATE: u8 = 0x51;
 pub const MSG_TENANT_DELETE: u8 = 0x52;
+// F-FS-UNIFY M0: fuse-fs inode-number allocation moved into the manager
+// (leader-fenced etcd CAS). The old scheme — every allocator doing a
+// non-CAS read-modify-write on the `[0x04]next_inode` fs KV key — hands
+// out DUPLICATE inode batches under concurrent allocators (two mounts,
+// or a mount + the Python `autumn.Fs` client). The manager is already
+// the grantor of every other monotonic token (owner_epoch, lease_epoch),
+// so inode ranges follow the same pattern.
+pub const MSG_ALLOC_INODES: u8 = 0x53;
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
@@ -1838,6 +1846,35 @@ pub struct PollInvalidationsResp {
     pub code: u8,
     pub message: String,
     pub events: Vec<MgrInvalidation>,
+}
+
+// --- AllocInodes (msg_type = MSG_ALLOC_INODES = 0x53) --------------------
+//
+// F-FS-UNIFY M0: grant a contiguous batch of fuse-fs inode numbers
+// `[base, base + count)`. The manager owns the counter (etcd key
+// `autumn-rs/fs/next_inode`, big-endian u64) and every grant is a
+// leader-fenced etcd CAS txn — concurrent allocators can never receive
+// overlapping ranges, even across a leader transition.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocInodesReq {
+    /// How many inode numbers to allocate (fuse uses INODE_ALLOC_BATCH =
+    /// 1000; a short-lived client may ask for fewer). Must be ≥ 1.
+    pub count: u32,
+    /// Migration floor: the allocator's counter is raised to at least this
+    /// before granting. Pre-M0 filesystems kept the cursor in the fs KV
+    /// superblock key (`[0x04]next_inode`, client-side non-CAS RMW); the
+    /// fuse mount passes that legacy value here on its first batch so an
+    /// existing filesystem migrates without duplicate inodes. 0 = none.
+    pub floor: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocInodesResp {
+    pub code: u8,
+    pub message: String,
+    /// First inode number of the granted range; the caller owns
+    /// `[base, base + count)`. Meaningful iff `code == CODE_OK`.
+    pub base: u64,
 }
 
 /// Persisted shape of a writer lease in etcd (`inode_leases/<ino>`).

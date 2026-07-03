@@ -594,6 +594,26 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// F-FS-UNIFY M0: grant a contiguous batch of fuse-fs inode numbers
+    /// `[base, base + count)` from the manager's crash-safe allocator
+    /// (leader-fenced etcd CAS — concurrent allocators always receive
+    /// disjoint ranges). `floor` is the legacy `[0x04]next_inode` fs KV
+    /// counter value (0 = none): the grant never returns a base below it,
+    /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
+    pub async fn alloc_inodes(&self, count: u32, floor: u64) -> Result<u64> {
+        let req = rkyv_encode(&AllocInodesReq { count, floor });
+        let resp: AllocInodesResp = self
+            .mgr_call_leader(MSG_ALLOC_INODES, req, "alloc_inodes", 3, 3, |b| {
+                let r: AllocInodesResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                Ok((r.code, r))
+            })
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("alloc_inodes failed: {}", resp.message));
+        }
+        Ok(resp.base)
+    }
+
     /// F-AUTHZ-1: mint a short-TTL capability token for `tenant` from its
     /// permanent `credential`. Leader-only. Returns `(token_bytes, exp_unix_secs)`.
     pub async fn mint_token(&self, tenant: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {

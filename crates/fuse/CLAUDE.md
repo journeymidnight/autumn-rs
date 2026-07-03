@@ -141,7 +141,12 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 - rename O(1)：只改目录项
 - hardlink：多目录项指向同一 inode
 - 根 inode = 1 (FUSE_ROOT_ID)
-- inode 分配器存在 KV (`[0x04]next_inode`)，批量预分配 1000 个
+- inode 分配器：**manager 发号**（F-FS-UNIFY M0，`ClusterClient::alloc_inodes`
+  → `MSG_ALLOC_INODES`，leader-fenced etcd CAS），批量预分配 1000 个。
+  旧方案（客户端对 `[0x04]next_inode` KV 做非-CAS 读改写）在并发分配者
+  （双 mount，或 mount + Python `autumn.Fs`）下会重号，已废弃；该 KV key
+  降级为**迁移 floor**（首个批次把旧值传给 manager，保证不重发旧 inode）
+  + 每批 best-effort 回写（灾备重建时的新鲜 floor，advisory-only）。
 
 ### KV Key 编码
 

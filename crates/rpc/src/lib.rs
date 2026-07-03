@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 10;
-pub const WIRE_VERSION_MAX: u32 = 10;
+pub const WIRE_VERSION_MIN: u32 = 11;
+pub const WIRE_VERSION_MAX: u32 = 11;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -138,6 +138,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // GetAuthzConfigResp.cluster_id so the PS can enforce token aud == cluster_id;
     // v10 not yet deployed, so no bump.)
     (10, "64554258323fbe51"),
+    // v11: F-FS-UNIFY M0 — manager_rpc gained MSG_ALLOC_INODES (0x53) +
+    // AllocInodesReq{count, floor}/AllocInodesResp{code, message, base}:
+    // fuse-fs inode-number allocation moved into the manager (leader-fenced
+    // etcd CAS on `autumn-rs/fs/next_inode`), replacing the client-side
+    // non-CAS RMW on the `[0x04]next_inode` fs KV key that duplicated inode
+    // batches under concurrent allocators. Pre-R3: MIN=MAX=11 (same-commit
+    // deploy; rkyv has no cross-version decode).
+    (11, "8a586475b2930f0f"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

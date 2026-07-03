@@ -2010,3 +2010,33 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     migration). **Accepted residual** (documented, non-loss): non-atomic
     delete+marker (matches `punch_holes`; F109 node-reconcile backstop). Test:
     `extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept`.
+
+42. **F-FS-UNIFY M0 fuse-fs inode allocation (`fs_alloc.rs`, `MSG_ALLOC_INODES`
+    = 0x53, WIRE v11).** The manager grants contiguous inode ranges
+    `[base, base+count)` for the fuse filesystem — replacing the client-side
+    non-CAS read-modify-write on the fs KV `[0x04]next_inode` key, which
+    duplicated batches under concurrent allocators (two mounts, or a mount +
+    the Python `autumn.Fs` client; design: `docs/fs_unify_design.md` §6,
+    decision Q2 = manager RPC with CAS). Semantics:
+    - **Etcd mode:** authoritative counter at `autumn-rs/fs/next_inode`
+      (strict BE u64; malformed value → refuse loudly, never guess). Every
+      grant is a read → `txn_fenced` value-CAS loop (F149 leader fence
+      prepended, so a deposed leader's grant loses the txn — no double-grant
+      across a leader transition). First-create uses the create_revision==0
+      pattern (same as owner locks). No in-memory cache: every grant reads
+      etcd fresh, so failover needs no replay hook for this key.
+    - **Memory mode (tests/dev):** `AutumnManager.fs_next_inode` Cell.
+    - **Migration floor:** requests carry the legacy KV counter value; the
+      grant never returns a base below it (`max(cur, floor)`) and the counter
+      never rewinds. The fuse mount passes it on every batch refill and
+      best-effort rewrites the legacy key (advisory freshness for a
+      disaster rebuild where etcd is lost but fs data survives).
+    - This is deliberately NOT `alloc_ids` (note 5): that counter numbers
+      manager ENTITIES (streams/extents/partitions) replayed from etcd
+      prefixes; inode numbers are fs-layer data with their own key.
+    - Handler: `handle_alloc_inodes` (leader-gated like MSG_ACQUIRE_LEASE;
+      count==0 → CODE_INVALID_ARGUMENT). Client: `ClusterClient::
+      alloc_inodes(count, floor)` via `mgr_call_leader`. Tests:
+      `tests/fs_alloc_inodes.rs` (16-way concurrent disjointness + floor
+      monotonicity in memory mode; etcd CAS disjointness + persisted
+      watermark + follower NOT_LEADER refusal), `fs_alloc::tests` unit.
