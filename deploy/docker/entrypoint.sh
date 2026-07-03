@@ -138,6 +138,32 @@ run_extent_node() {
     local adv
     adv="$(resolve_ip "${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}")"
 
+    # Sharding (AUTUMN_EXTENT_SHARDS, default 1). Shard i binds its data
+    # listener at `port + i*stride` and its control listener at
+    # `port+1000 + i*stride` (EN default stride 10 — keep it in sync here).
+    # The manager routes an extent to shard `extent_id % shards` and dials
+    # `advertise_host:shard_port`, so:
+    #   - `format --shard-ports <csv>` MUST register every shard's DATA port,
+    #     or the manager sends all extents to the base port (shard 0 only);
+    #   - the per-pod Service MUST expose every shard's data AND control port.
+    # shards=1 keeps the original single-shard behaviour (no --shard-ports).
+    local shards="${AUTUMN_EXTENT_SHARDS:-1}"
+    [[ "$shards" =~ ^[0-9]+$ && "$shards" -ge 1 ]] \
+        || die "AUTUMN_EXTENT_SHARDS must be a positive integer"
+    local stride=10
+    local cpuset="${AUTUMN_EXTENT_CPUSET:-}"
+    if [[ -z "$cpuset" ]]; then
+        (( shards == 1 )) && cpuset="0" || cpuset="0-$((shards - 1))"
+    fi
+    local -a shard_ports_args=()
+    if (( shards > 1 )); then
+        local csv="" s
+        for (( s = 0; s < shards; s++ )); do
+            csv+="${csv:+,}$(( port + s * stride ))"
+        done
+        shard_ports_args=(--shard-ports "$csv")
+    fi
+
     wait_for_manager "$mgr"
 
     # Idempotent (F214-C): re-running on a formatted dir reuses the stamped
@@ -152,7 +178,8 @@ run_extent_node() {
     local i
     for (( i = 0; i < 30; i++ )); do
         if autumn-op --manager "$mgr" --transport "$TRANSPORT" format \
-            --listen ":$port" --advertise "${adv}:${port}" "${dirs[@]}"; then
+            --listen ":$port" --advertise "${adv}:${port}" \
+            "${shard_ports_args[@]}" "${dirs[@]}"; then
             break
         fi
         (( i == 29 )) && die "autumn-op format failed after 30 attempts"
@@ -163,10 +190,10 @@ run_extent_node() {
     local -a args=(
         --port "$port" --data "$data" --manager "$mgr"
         --listen 0.0.0.0 --transport "$TRANSPORT"
-        # Single shard by default (shard count == cpuset length). Multi-shard
-        # ENs would also need their shard ports in the per-pod Service and
-        # --shard-ports at format time — not wired in v1 (docs/k8s_deploy.md).
-        --cpuset "${AUTUMN_EXTENT_CPUSET:-0}"
+        # Shard count == cpuset length (EN F196). Default cpuset "0" = single
+        # shard; AUTUMN_EXTENT_SHARDS=N gives cores 0..N-1. See the sharding
+        # block above and docs/k8s_deploy.md "Multi-shard extent nodes".
+        --cpuset "$cpuset"
     )
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9601)
     log "exec autumn-extent-node ${args[*]}"

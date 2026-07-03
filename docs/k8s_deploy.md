@@ -179,6 +179,28 @@ overlay must name a class explicitly, as the VKE example does.
   scale throughput.
 - **Managers**: raise `manager.yaml` `replicas` (3 for HA). No other change.
 
+## Multi-shard extent nodes
+
+By default each EN runs **one shard** (`--cpuset 0`) — a single io_uring core
+serves all its extent traffic. Under sustained durable writes (RF=3 + fsync),
+adding partitions scales write throughput until that **one EN core** becomes the
+wall (benchmarked here: write flattens ~65k ops/s past 16 partitions). Giving
+each EN more shards spreads its extents (`shard = extent_id % N`) across N cores.
+
+The entrypoint exposes this via **`AUTUMN_EXTENT_SHARDS`** (default 1). When > 1
+it sizes the EN to cores `0..N-1` and passes `format --shard-ports` so the
+manager can route each extent to the owning shard. Shard `i` binds data port
+`9101 + i*10` and control port `10101 + i*10`, so **every per-pod EN Service
+must expose all N data + N control ports** — otherwise the manager/PS can't
+reach shards 1..N-1. `deploy/overlays/vke` is a worked 4-shard example: it sets
+`AUTUMN_EXTENT_SHARDS: "4"`, patches each `autumn-en-<i>` Service to the 8 ports
+(`9101/9111/9121/9131` + `10101/10111/10121/10131`), and requests 4 CPU per EN.
+
+Copy that pattern for a different shard count (keep the Service port list, the
+`AUTUMN_EXTENT_SHARDS` value, and the CPU request in step). This is the one
+knob that needs a coordinated Service change — the port list is not derivable
+by the manifests from the env var.
+
 ## Using the cluster
 
 v1 clients run **inside** the cluster (they dial per-partition PS pod IPs
