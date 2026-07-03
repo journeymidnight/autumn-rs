@@ -28,6 +28,13 @@ use crate::state::FsState;
 
 /// Write data to a file. Returns bytes written.
 pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
+    // Reject a negative offset (symmetric with `read::prepare`). The kernel FUSE
+    // path never sends one, but a direct core caller (the PyO3 `autumn.Fs`
+    // binding, F-FS-UNIFY M2) could — and `offset as u64` would wrap to a huge
+    // logical offset, poisoning size/extent-key math on flush.
+    if offset < 0 {
+        return Err(anyhow::anyhow!("negative offset"));
+    }
     if data.is_empty() {
         return Ok(0);
     }

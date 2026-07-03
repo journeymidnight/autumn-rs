@@ -495,6 +495,34 @@ flush_buffer(ino):
 不变量:core 文件**禁止 import fuser**(`cargo tree --features core` 中
 fuser 计数为 0 是 M1 验收标准);新的 core→fuser 转换一律进 `attr.rs`。
 
+### F-FS-UNIFY M2 —— PyO3 `autumn.Fs` 绑定复用同一 core
+
+M2 给 core 加了一层 PyO3 绑定(`python/src/fs.rs` 的 `autumn.Fs` 类),让
+Python 直接做 inode 级文件系统操作。**逻辑不在 Python 重写 —— 绑定调用的
+就是 fuse 二进制跑的那份 Rust core**,一处实现两个前端,不会 drift。
+
+为消除 dispatch↔binding 的潜在重复,M2 把原先内联在 `dispatch.rs` 的文件
+create/unlink KV 步骤抽成 core 函数,dispatch 改为调用(M1 同款):
+
+| 新增/改动(core) | 说明 |
+|---|---|
+| `dir::create`(文件)| 从 dispatch Create 抽出;exists→EEXIST、alloc、put inode/dirent、parent mtime、lookup_count++。**不**做 lease、**不**建运行时 InodeState 缓存(那是前端职责)|
+| `dir::unlink`(文件)| 从 dispatch Unlink 抽出;dirent 删除 + nlink-- + `remove_unreachable_inode`(UNLINK-1 墓碑)|
+| `dir::resolve(path)`| 路径→ino 从 ROOT 逐段游走(fuse 内核自带 parent,故只有 Python 面需要);用 `kv_get_opt` 屏障(缺失=None,硬错=Err);`..` 拒绝(精简面不追父指针)|
+| `meta::ensure_root`| 建根 inode(若缺);**fail-loud**(`kv_get_opt`,不再像旧 `init_root` 那样把瞬时错当"已存在"而重建根);**不**本地 seed inode 批次 → 所有 inode 走 M0 manager 发号,对并发写者安全 |
+| `dispatch::init_root`| 改为调 `ensure_root` + 仅在全新 FS 时叠加 fuse 专属的 pre-manager 本地批次 seed(行为对 fuse 不变)|
+| `FsState::new_with_host`| 显式 host(不读 env,[[feedback_no_env_in_rs]]);`new` 保留 env 默认给 fuse 二进制 |
+
+绑定线程模型照搬 `Memory`:一个专属 compio worker 线程独占 `!Send` 的
+`FsState`,Python 同步方法 ship 一个 job 过去并阻塞(GIL 释放)取结果。job
+签名用 HRTB `for<'a> FnOnce(&'a mut FsState) -> LocalBoxFuture<'a,()>`,让
+core op 在其 await 间持有 `&mut`(worker 串行处理,一次一个借用,安全)。
+sync 面是因为 M3 fsspec `AbstractFileSystem` 是同步 API。
+
+M2 边界:lease 三方法(acquire/heartbeat/release)是薄 wrapper;open→acquire
+→heartbeat→release 的 facade 逻辑 + 围栏测试是 M4,fsspec 改写是 M3。
+headless 验收 = `python/tests/run_fs_e2e.sh`(隔离 memory-mode 集群)。
+
 ---
 
 ## 配置

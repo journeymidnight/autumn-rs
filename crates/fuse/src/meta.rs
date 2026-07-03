@@ -79,6 +79,25 @@ pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     }
 }
 
+/// Create the root directory inode (`ROOT_INO`) if it does not exist yet.
+/// Returns `true` iff it created the root (the filesystem was fresh).
+///
+/// Idempotent + fail-loud: a genuinely-absent root is created; a hard KV
+/// error PROPAGATES (never silently recreates the root over a transient
+/// failure via `kv_get`'s absent-vs-error conflation). Does NOT seed the
+/// local inode-alloc cursor — every inode is granted by the manager
+/// (F-FS-UNIFY M0), so this is safe for any co-equal writer (the fuse mount's
+/// `init_root` layers its legacy pre-manager batch seed on top).
+pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
+    let root_key = key::inode_key(ROOT_INO);
+    if state.kv_get_opt(&root_key).await?.is_some() {
+        return Ok(false);
+    }
+    let root_meta = new_dir_meta(0o755, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    put_inode(state, ROOT_INO, &root_meta).await?;
+    Ok(true)
+}
+
 /// Fetch inode metadata from KV store (or cache).
 pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
     // Check cache first

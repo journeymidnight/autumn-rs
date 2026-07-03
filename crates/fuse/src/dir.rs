@@ -6,21 +6,75 @@ use anyhow::{anyhow, Result};
 
 use crate::key;
 use crate::meta::*;
-use crate::schema::{self, DirentValue, InodeMeta, ReaddirEntry, DT_DIR};
+use crate::schema::{self, DirentValue, InodeMeta, ReaddirEntry, DT_DIR, DT_REG, ROOT_INO};
 use crate::state::FsState;
 
-/// Lookup a child entry in a directory. Returns `(ino, meta)` — the FUSE
-/// layer converts to `FileAttr` at the reply boundary (F-FS-UNIFY M1).
-pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u64, InodeMeta)> {
-    let name_bytes = name.as_encoded_bytes();
-    let k = key::dirent_key(parent, name_bytes);
-    let v = state.kv_get(&k).await.map_err(|_| anyhow!("ENOENT"))?;
+/// Look up a child entry WITHOUT touching the FUSE lookup refcount, returning
+/// `Ok(None)` for a genuinely-absent name and `Err` for a hard KV/decode error.
+///
+/// Uses the `kv_get_opt` barrier so a transient KV/routing failure does NOT
+/// masquerade as "not found" — this is the barrier-correct primitive the PyO3
+/// `autumn.Fs` binding (F-FS-UNIFY M2) needs (a false miss would let a facade
+/// wrongly `create`/`rename`-over on a transient error). The FUSE `lookup`
+/// layers the ENOENT mapping + lookup-count bump on top.
+pub async fn lookup_opt(
+    state: &mut FsState,
+    parent: u64,
+    name: &OsStr,
+) -> Result<Option<(u64, InodeMeta)>> {
+    let k = key::dirent_key(parent, name.as_encoded_bytes());
+    let v = match state.kv_get_opt(&k).await? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
     let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
     let meta = get_inode(state, dirent.child_inode).await?;
+    Ok(Some((dirent.child_inode, meta)))
+}
 
-    *state.lookup_count.entry(dirent.child_inode).or_insert(0) += 1;
+/// Lookup a child entry in a directory. Returns `(ino, meta)` — the FUSE
+/// layer converts to `FileAttr` at the reply boundary (F-FS-UNIFY M1). A miss
+/// (or, pre-M2-behavior-preserving, any error mapped by `ops.rs` to ENOENT)
+/// is `Err("ENOENT")`.
+pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u64, InodeMeta)> {
+    match lookup_opt(state, parent, name).await? {
+        Some((ino, meta)) => {
+            *state.lookup_count.entry(ino).or_insert(0) += 1;
+            Ok((ino, meta))
+        }
+        None => Err(anyhow!("ENOENT")),
+    }
+}
 
-    Ok((dirent.child_inode, meta))
+/// Resolve an absolute path to its inode by walking dirents from `ROOT_INO`.
+///
+/// F-FS-UNIFY M2: the FUSE kernel always supplies a parent inode, so the mount
+/// path never needs this; the PyO3 `autumn.Fs` binding (and the M3 fsspec
+/// facade) work in `str` paths and need a path→ino walk. Empty components and
+/// `"."` are skipped. `".."` is rejected — the lean POSIX surface (Q5) does not
+/// track parent pointers, and fsspec normalizes paths before calling us.
+///
+/// Returns `Ok(None)` when a component is genuinely absent (ENOENT); a hard
+/// KV/routing error surfaces as `Err` (via the `kv_get_opt` barrier — a
+/// transient failure must NOT be mistaken for "path does not exist").
+pub async fn resolve(state: &mut FsState, path: &str) -> Result<Option<u64>> {
+    let mut ino = ROOT_INO;
+    for comp in path.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            return Err(anyhow!("unsupported '..' component in path"));
+        }
+        let dk = key::dirent_key(ino, comp.as_bytes());
+        let v = match state.kv_get_opt(&dk).await? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        ino = dirent.child_inode;
+    }
+    Ok(Some(ino))
 }
 
 /// Read directory entries.
@@ -117,6 +171,49 @@ pub async fn mkdir(
     Ok((ino, meta))
 }
 
+/// Create an empty regular file. Returns `(ino, meta)` — the FUSE layer
+/// converts to `FileAttr` and drives the open-lease at the reply boundary;
+/// the PyO3 `autumn.Fs` binding uses the plain `(ino, meta)` directly
+/// (F-FS-UNIFY M2). This is the single source of the file-create KV steps
+/// (`dispatch.rs` Create calls it, then layers on lease acquire + the
+/// FUSE-runtime `InodeState` cache) — no drift between the two front-ends.
+///
+/// NOTE: does NOT acquire a lease and does NOT seed the runtime `InodeState`
+/// cache; those are front-end concerns (fuse Open semantics / M4 facade
+/// lease-on-open).
+pub async fn create(
+    state: &mut FsState,
+    parent: u64,
+    name: &OsStr,
+    mode: u32,
+) -> Result<(u64, InodeMeta)> {
+    let name_bytes = name.as_encoded_bytes();
+    let dk = key::dirent_key(parent, name_bytes);
+    if state.kv_exists(&dk).await.unwrap_or(false) {
+        return Err(anyhow!("EEXIST"));
+    }
+
+    let ino = alloc_inode(state).await?;
+    let meta = new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    put_inode(state, ino, &meta).await?;
+
+    let dirent = DirentValue {
+        child_inode: ino,
+        file_type: DT_REG,
+    };
+    let dv = schema::encode_dirent(&dirent);
+    state.kv_put(&dk, &dv).await?;
+
+    let mut parent_meta = get_inode(state, parent).await?;
+    let (s, ns) = now_ts();
+    parent_meta.mtime_secs = s;
+    parent_meta.mtime_nsecs = ns;
+    put_inode(state, parent, &parent_meta).await?;
+
+    *state.lookup_count.entry(ino).or_insert(0) += 1;
+    Ok((ino, meta))
+}
+
 /// Remove a directory (must be empty).
 pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()> {
     let name_bytes = name.as_encoded_bytes();
@@ -150,6 +247,43 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
     put_inode(state, parent, &parent_meta).await?;
 
     state.inodes.remove(&dirent.child_inode);
+    Ok(())
+}
+
+/// Unlink a regular file (drop one name; reap data when it becomes
+/// unreachable). Single source of the file-unlink KV steps — `dispatch.rs`
+/// Unlink calls this (F-FS-UNIFY M2), as does the PyO3 `autumn.Fs` binding.
+///
+/// UNLINK-1: the `nlink == 0` transition removes the inode's extents through
+/// `extent::remove_unreachable_inode` (tombstoned so a crash mid-removal is
+/// replayed at next mount rather than leaking data KVs forever).
+pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()> {
+    let name_bytes = name.as_encoded_bytes();
+    let dk = key::dirent_key(parent, name_bytes);
+    let v = state.kv_get(&dk).await.map_err(|_| anyhow!("ENOENT"))?;
+    let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+    if dirent.file_type == DT_DIR {
+        return Err(anyhow!("EISDIR"));
+    }
+
+    // Delete dirent, then decrement nlink.
+    state.kv_delete(&dk).await?;
+    let mut meta = get_inode(state, dirent.child_inode).await?;
+    meta.nlink = meta.nlink.saturating_sub(1);
+    if meta.nlink == 0 {
+        // The inode just became UNREACHABLE — remove its data under an intent
+        // tombstone so a crash mid-removal is replayed at next mount instead
+        // of leaking the extents forever.
+        crate::extent::remove_unreachable_inode(state, dirent.child_inode).await?;
+    } else {
+        put_inode(state, dirent.child_inode, &meta).await?;
+    }
+
+    let mut parent_meta = get_inode(state, parent).await?;
+    let (s, ns) = now_ts();
+    parent_meta.mtime_secs = s;
+    parent_meta.mtime_nsecs = ns;
+    put_inode(state, parent, &parent_meta).await?;
     Ok(())
 }
 

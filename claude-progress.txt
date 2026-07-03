@@ -4,7 +4,45 @@ Task scope: all-in-one AI 存储扩展 —— (1) fsspec 让 Python dataset 直�
   autumn load 数据【F-FSSPEC-1 完成】;(2) vLLM 快速加载研究【交付
   docs/model_loading.md】;(3) F-FS-UNIFY 设计(用户批准 Q1/Q2/Q5)+ M0
   分配器【完成】;(4) chaos 测 fuse + fsspec 后 commit & push【全 PASS,
-  已推 main】;(5) 用户"开工"M1【完成,见下】。M2-M4 为后续里程碑。
+  已推 main】;(5) 用户"开工"M1【完成】;(6) M2 PyO3 `autumn.Fs`
+  绑定【完成,见下】。M3(fsspec facade 退役 fs/ 布局)/M4(lease 接线
+  + 围栏 + 跨面测试)为后续里程碑,codebase-memory 已 re-index。
+
+F-FS-UNIFY M2 完成(2026-07-03,用户明确 M2 范围 = 把 M1 解耦的 core 经
+PyO3 暴露给 Python,连接 M1↔M3 的枢纽):
+  · 新 `python/src/fs.rs` 的 `autumn.Fs` 类(与 Client/BatchClient/Memory
+    并列)。sync-blocking façade(照搬 Memory,非 Client 的 async ——
+    因 M3 fsspec AbstractFileSystem 是同步 API):专属 compio worker 独占
+    `!Send` FsState,Python 同步方法 ship job 并阻塞(GIL 释放)取结果。
+    job 用 HRTB `for<'a> FnOnce(&'a mut FsState) -> LocalBoxFuture<'a,()>`
+    让 core op 在 await 间持有 `&mut`(worker 串行,一次一借用,安全;
+    已用 scratchpad 探针先验证该 HRTB 形状可编译再动手)。
+  · API 面 = 设计 §4 全量:resolve/getattr(→dict)/readdir/lookup/mkdir/
+    create/unlink/rmdir/rename/read/write/flush/truncate + lease
+    acquire/heartbeat/release(M2 薄 wrapper;facade lease-on-open 是 M4)。
+  · **反 drift(关键)**:绑定调用的是 fuse 二进制跑的同一份 Rust core,
+    不在 Python 重写。为此把原内联在 dispatch 的文件 create/unlink 抽成
+    core 函数,dispatch 改调(M1 同款):
+      - dir::create / dir::unlink(文件)/ dir::resolve(path→ino,kv_get_opt
+        屏障,`..` 拒绝)
+      - meta::ensure_root(建根 fail-loud,不本地 seed → 全部 inode 走
+        M0 manager 发号,对并发写者安全);dispatch::init_root 改调它 +
+        仅全新 FS 叠加 fuse 专属 pre-manager 本地 seed(fuse 行为不变)
+      - FsState::new_with_host(显式 host,不读 env,[[feedback_no_env_in_rs]])
+  · wheel 依赖 `autumn-fuse { default-features=false, features=["core"] }`
+    (无 fuser/kernel-mount 机器)。
+  · 验收:headless py e2e `python/tests/run_fs_e2e.sh`(隔离 memory-mode
+    集群,无 etcd,自建 wheel+manager+EN+PS 再拆):create/write/flush/read
+    byte-exact(inline + 10 MiB 多 extent + 跨 8 MiB 边界 ranged + EOF 裁剪)、
+    getattr/resolve/readdir/lookup、mkdir/rename/truncate/unlink、lease
+    acquire→heartbeat→release smoke、**CROSS-INSTANCE byte-exact**(一个 Fs
+    写、另一个 Fs 读回 + 提交的 shrink 跨 client 可见)—— exit 0。
+  · 行为保真(dispatch Create/Unlink/init_root 重构):fuse lib 44、
+    f_fuse_lease_1 6/6(含 fuse_create_acquires_writer_lease + 双 mount
+    init_root)+ f_fuse_lease_2 2/2 + system_fuse_read 全绿 --ignored;
+    core-only 构建 fuser 计数=0;workspace 构建;新码 clippy 干净
+    (fs.rs 无警告;存量 doc-comment 警告在未触碰行,不做纯注释 pass)。
+  · coco findbugs(M2 diff)已跑 —— 见文末 coco 段。
 
 F-FS-UNIFY M1 完成(2026-07-03,用户指令"开工"):
   · crates/fuse 拆两层 feature:`core`(fuser-free 文件系统核心 ——
@@ -160,5 +198,35 @@ Main gaps / risks(follow-up,无阻塞):
   3. S3-compatible 网关(可解锁零改码的 runai_streamer)未做 —— 未来选项。
 
 Next steps:
-  等用户 review 代码;通过后再 push(用户明确要求先不 push)。
-  可选:GPU 机验证 Recipe C streaming loader;补 S3 网关。
+  · M2 已完成并全绿(见 F-FS-UNIFY M2 段)。coco findbugs 结果见 coco 段;
+    如有 P0/P1 已 triage+修+复测。
+  · commit M2(反 drift 重构 + PyO3 Fs 绑定 + headless e2e + 文档)。
+  · M3:把 autumn_fsspec 改写成 `autumn.Fs` 之上的 facade(path↔inode、真
+    dirent、extent 读写),退役当前 `fs/` 独立布局;offline+live fsspec 套
+    + datasets round-trip 在新 backing 上绿。
+  · M4:lease 接线(open 拿写租约、心跳续期、release)+ 围栏/一致性测试 +
+    跨面互通(写 via mount / 读 via fsspec byte-identical)。
+  可选(F-FSSPEC-1 遗留):GPU 机验证 Recipe C streaming loader;补 S3 网关。
+
+── coco findbugs(M2 diff,GPT-5.5)4 条,triage + 修 + 复测 ─────────────
+  · P1#1 stale cache(长生命周期 Fs 缓存了 inode 后,别的 client 改+flush →
+    读到 stale size/extent):REAL 但 = **M4 边界**(设计 Q1:写租约 + 读经
+    poll_invalidations/cache_is_stale 一致)。M2 明确只做绑定+headless 正确性。
+    → **不在 M2 修**,在 fs.rs 模块 doc 显式标注该限制 + M4 计划(单 client
+    读自己写、任何 fresh Fs 都一致 —— 正是 e2e cross-instance 覆盖的)。
+  · P1#2 负 offset(write::write 无 read::prepare 那样的负 offset 检查,
+    `offset as u64` 回绕成巨偏移污染 extent key):REAL 且在 M2 范围。
+    → **修**:core write::write 顶部加 `offset<0 → Err`(与 read 对称,护住
+    所有前端);e2e 加 `fs.write(ino,-1,..)` 必抛断言。
+  · P2#3 lookup 把所有 Err→None(吞掉 decode/get_inode/routing 硬错,伪装成
+    不存在):REAL。→ **修**:新增 core `dir::lookup_opt`(kv_get_opt 屏障,
+    absent=Ok(None)/硬错=Err,不碰 lookup_count),`dir::lookup` 改调它(dedup;
+    对 fuse 行为中性 —— ops.rs:73 本就无条件把 lookup 错映射成 ENOENT);绑定
+    lookup 改用 lookup_opt → 硬错抛异常、仅真缺失返回 None。
+  · P2#4 lease refcount 不对称(acquire refcount++ 但 release 无条件释放 +
+    删 entry,acquire×2/release×1 会过早释放丢 fence):REAL。→ **修**:
+    Fs.release 改 refcount-aware(refcount>1 只递减;==1 才 manager release +
+    删 entry;借用在 await 前释放,无 await_holding_refcell_ref);e2e 加
+    acquire×2→release×1 后 heartbeat 仍 True 的断言。
+  复测:fuse lib 44、fuse e2e 6/6+2/2+1/1(--ignored)、M2 headless e2e
+  (含新负 offset + refcount 断言)exit 0、core-only fuser=0、新码 clippy 干净。

@@ -123,6 +123,26 @@ build, the listing path's assumptions changed — re-check `ls`.
 Model loading (materialize-to-local / FUSE-`eager` / streaming loader):
 [`docs/model_loading.md`](model_loading.md).
 
+### `autumn.Fs` — shared inode-layout binding (F-FS-UNIFY M2)
+
+`autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
+`autumn-fuse` mount runs on (inode/dirent/extent layout) — the plumbing that
+lets M3 rewrite `autumn_fsspec` as a facade sharing files with a fuse mount.
+Headless correctness (self-contained isolated memory-mode cluster — builds the
+wheel, boots manager+EN+PS, drives the full `Fs` surface + a cross-instance
+byte-exact check, tears down):
+
+```bash
+cargo build --workspace                    # debug binaries first
+bash python/tests/run_fs_e2e.sh
+#   → "PY M2 CROSS-INSTANCE byte-exact OK", "===== fs-e2e exit: 0 ====="
+```
+
+Behavior-preservation gate for the `dispatch` Create/Unlink/init_root refactor
+(the binding shares those core steps): the fuse e2e suite must stay green —
+`cargo test -p autumn-manager --test system_fuse_read --test f_fuse_lease_1
+--test f_fuse_lease_2 -- --ignored --test-threads=1`.
+
 Chaos (fsspec interface under failover — PS kill→migration, manager
 kill→respawn, final byte-exact verify + write-liveness probe; timeouts are
 dropped as UNCERTAIN, never counted as loss):

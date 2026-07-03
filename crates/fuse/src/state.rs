@@ -100,10 +100,21 @@ pub struct FsState {
 
 impl FsState {
     pub async fn new(manager_addr: &str) -> Result<Self> {
+        // The fuse binary keeps the env-derived hostname default (the daemon
+        // has no CLI flag for it); the PyO3 `autumn.Fs` binding (F-FS-UNIFY
+        // M2) passes an explicit host via `new_with_host` so no env read
+        // leaks into the library path ([[feedback_no_env_in_rs]]).
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
+        Self::new_with_host(manager_addr, host).await
+    }
+
+    /// Connect with an explicit daemon-identity host (no env read). The
+    /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
+    /// lease identity the manager keys its lease registry on.
+    pub async fn new_with_host(manager_addr: &str, host: String) -> Result<Self> {
         let client = ClusterClient::connect(manager_addr)
             .await
             .context("connect to manager")?;
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
         Ok(Self {
             client: Rc::new(client),
             inodes: HashMap::new(),

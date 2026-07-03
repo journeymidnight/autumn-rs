@@ -12,7 +12,7 @@ use crate::dir;
 use crate::key;
 use crate::meta::*;
 use crate::read;
-use crate::schema::{self, DirentValue, InodeState, DT_DIR, DT_REG, INODE_ALLOC_BATCH, ROOT_INO};
+use crate::schema::{InodeState, INODE_ALLOC_BATCH, ROOT_INO};
 use crate::state::{FsState, FuseLease};
 use crate::write;
 
@@ -419,15 +419,14 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
 
 /// Initialize the root inode if it doesn't exist yet.
 pub async fn init_root(state: &mut FsState) -> Result<()> {
-    let root_key = key::inode_key(ROOT_INO);
-    if state.kv_get(&root_key).await.is_ok() {
+    // Root creation is the shared core primitive (`meta::ensure_root`, used by
+    // the PyO3 `autumn.Fs` binding too — F-FS-UNIFY M2); the fuse mount adds
+    // its legacy pre-manager batch seed on a fresh filesystem only.
+    if !ensure_root(state).await? {
         tracing::info!("root inode already exists");
         return Ok(());
     }
-
-    tracing::info!("creating root inode");
-    let root_meta = new_dir_meta(0o755, unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    put_inode(state, ROOT_INO, &root_meta).await?;
+    tracing::info!("created root inode");
 
     // Initialize the inode counter
     let next_ino_key = key::next_inode_key();
@@ -597,27 +596,12 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             reply,
         } => {
             let result = async {
-                let name_bytes = name.as_encoded_bytes();
-                let dk = key::dirent_key(parent, name_bytes);
-                if state.kv_exists(&dk).await.unwrap_or(false) {
-                    return Err(anyhow!("EEXIST"));
-                }
-                let ino = alloc_inode(state).await?;
-                let meta =
-                    new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
-                put_inode(state, ino, &meta).await?;
-                let dirent = DirentValue {
-                    child_inode: ino,
-                    file_type: DT_REG,
-                };
-                let dv = schema::encode_dirent(&dirent);
-                state.kv_put(&dk, &dv).await?;
-                // Update parent mtime
-                let mut parent_meta = get_inode(state, parent).await?;
-                let (s, ns) = now_ts();
-                parent_meta.mtime_secs = s;
-                parent_meta.mtime_nsecs = ns;
-                put_inode(state, parent, &parent_meta).await?;
+                // F-FS-UNIFY M2: the file-create KV steps live in the shared
+                // core (`dir::create`) so the fuse mount and the PyO3
+                // `autumn.Fs` binding never drift. Open semantics — lease
+                // acquire + the runtime `InodeState` cache + the `FileAttr`
+                // reply — stay here at the FUSE reply boundary.
+                let (ino, meta) = dir::create(state, parent, &name, mode).await?;
                 // F-fuse-lease-1 (coco P1 #1 fix): Create produces a
                 // writable fd just like Open. AcquireLease BEFORE
                 // publishing the inode cache so a concurrent Open
@@ -682,7 +666,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         cached_version: acquired_version,
                     },
                 );
-                *state.lookup_count.entry(ino).or_insert(0) += 1;
+                // NOTE: `dir::create` already bumped `lookup_count[ino]`.
                 let attr = inode_to_attr(ino, &meta);
                 Ok((attr, ino)) // fh = ino for simplicity
             }
@@ -694,40 +678,9 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             name,
             reply,
         } => {
-            let result = async {
-                let name_bytes = name.as_encoded_bytes();
-                let dk = key::dirent_key(parent, name_bytes);
-                let v = state.kv_get(&dk).await.map_err(|_| anyhow!("ENOENT"))?;
-                let dirent: DirentValue =
-                    schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
-                if dirent.file_type == DT_DIR {
-                    return Err(anyhow!("EISDIR"));
-                }
-                // Delete dirent
-                state.kv_delete(&dk).await?;
-                // Decrement nlink
-                let mut meta = get_inode(state, dirent.child_inode).await?;
-                meta.nlink = meta.nlink.saturating_sub(1);
-                if meta.nlink == 0 {
-                    // UNLINK-1: the inode just became UNREACHABLE — remove
-                    // its data under an intent tombstone so a crash
-                    // mid-removal is replayed at next mount instead of
-                    // leaking the extents forever. (The residual window is
-                    // the single dirent-delete→tombstone-put gap; pre-fix
-                    // it spanned the whole extent scan + N deletes.)
-                    crate::extent::remove_unreachable_inode(state, dirent.child_inode).await?;
-                } else {
-                    put_inode(state, dirent.child_inode, &meta).await?;
-                }
-                // Update parent mtime
-                let mut parent_meta = get_inode(state, parent).await?;
-                let (s, ns) = now_ts();
-                parent_meta.mtime_secs = s;
-                parent_meta.mtime_nsecs = ns;
-                put_inode(state, parent, &parent_meta).await?;
-                Ok(())
-            }
-            .await;
+            // F-FS-UNIFY M2: shared core owns the file-unlink KV steps
+            // (dirent delete + nlink decrement + tombstoned data reap).
+            let result = dir::unlink(state, parent, &name).await;
             let _ = reply.send(result);
         }
         FsRequest::Open { ino, flags, reply } => {
