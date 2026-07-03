@@ -34,8 +34,11 @@ byte-identical at the corresponding `autumn://` path, and vice versa. (The
 earlier F-FSSPEC-1 adapter used a private, path-keyed `fs/` namespace — separate
 files, no interop; that layout is retired.)
 
-> Write/write fencing across the two surfaces (per-inode leases) lands in M4;
-> M3 delivers shared visibility + byte-identical read/write.
+Concurrent writers to one file (fsspec↔fsspec or fsspec↔fuse mount) are fenced
+by a **per-inode WRITE lease** (F-FS-UNIFY M4) — a write acquires the lease
+(conflict ⇒ `BlockingIOError`), heartbeats it for the duration, and releases on
+close; reads are close-to-open coherent. Single-writer flows (dataset prep,
+uploads) never see a conflict.
 
 ## How it works
 

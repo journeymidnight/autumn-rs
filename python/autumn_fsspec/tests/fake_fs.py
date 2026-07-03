@@ -188,5 +188,8 @@ class FakeFs:
     def release(self, ino):
         pass
 
+    def forget(self, ino):
+        pass
+
     def close(self):
         pass

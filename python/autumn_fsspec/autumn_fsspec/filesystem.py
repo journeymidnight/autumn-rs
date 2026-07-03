@@ -275,14 +275,49 @@ class AutumnFileSystem(AbstractFileSystem):
             raise IsADirectoryError(path)
         return ino
 
+    def _acquire_write(self, ino):
+        """F-FS-UNIFY M4: take the per-inode WRITE lease before mutating `ino`
+        so two writers (fsspec↔fsspec or fsspec↔fuse mount) can't corrupt each
+        other. A conflict (another client holds it) surfaces as BlockingIOError.
+        The binding's background task heartbeats the lease for long writes."""
+        try:
+            self._fs.acquire(ino, "w")
+        except RuntimeError as e:
+            raise BlockingIOError(f"write lease unavailable (another writer?): {e}")
+
+    def _release_write(self, ino):
+        """Release the WRITE lease and evict the inode from the binding cache
+        (close-to-open coherence for the next cross-client read)."""
+        try:
+            self._fs.release(ino)
+        finally:
+            self._fs.forget(ino)
+
+    def _verify_write_lease(self, ino):
+        """Confirm we still hold the WRITE lease before a durable commit. A
+        background invalidation poll can drop it (preemption / a manager blip
+        that released it), after which a write would be UN-fenced — so gate the
+        `flush` on a live heartbeat and raise if it's gone (coco M4 P1)."""
+        try:
+            live = self._fs.heartbeat(ino)
+        except RuntimeError as e:
+            raise IOError(f"write-lease heartbeat failed for inode {ino}: {e}")
+        if not live:
+            raise IOError(f"lost the write lease for inode {ino} (preempted/expired)")
+
     def pipe_file(self, path, value, **kwargs):
         """Write a whole object in one shot (fsspec's ``cat``/``pipe``)."""
         path = self._norm(path)
         ino = self._ensure_file_ino(path)
-        self._fs.truncate(ino, 0)  # clear any prior content (exact overwrite)
-        if value:
-            self._fs.write(ino, 0, bytes(value))
-        self._fs.flush(ino)
+        self._acquire_write(ino)
+        try:
+            self._fs.truncate(ino, 0)  # clear any prior content (exact overwrite)
+            if value:
+                self._fs.write(ino, 0, bytes(value))
+            self._verify_write_lease(ino)  # gate the durable commit on a live lease
+            self._fs.flush(ino)
+        finally:
+            self._release_write(ino)
         self.invalidate_cache(self._parent(path))
 
     def _open(
@@ -452,6 +487,7 @@ class AutumnBufferedFile(AbstractBufferedFile):
         self._append = append
         self._ino = None
         self._off = 0
+        self._lease_held = False
         super().__init__(
             fs,
             path,
@@ -470,11 +506,18 @@ class AutumnBufferedFile(AbstractBufferedFile):
     def _initiate_upload(self):
         f = self.fs
         self._ino = f._ensure_file_ino(f._norm(self.path))
-        if self._append:
-            self._off = int(f._fs.getattr(self._ino)["size"])
-        else:
-            f._fs.truncate(self._ino, 0)  # overwrite: exact-size semantics
-            self._off = 0
+        f._acquire_write(self._ino)  # M4: WRITE lease held across the upload
+        self._lease_held = True
+        try:
+            if self._append:
+                self._off = int(f._fs.getattr(self._ino)["size"])
+            else:
+                f._fs.truncate(self._ino, 0)  # overwrite: exact-size semantics
+                self._off = 0
+        except BaseException:  # init failed after acquire → don't leak the lease
+            self._lease_held = False
+            f._release_write(self._ino)
+            raise
 
     def _upload_chunk(self, final=False):
         data = self.buffer.getvalue()
@@ -482,6 +525,27 @@ class AutumnBufferedFile(AbstractBufferedFile):
             n = self.fs._fs.write(self._ino, self._off, bytes(data))
             self._off += n
         if final:
-            self.fs._fs.flush(self._ino)
+            try:
+                self.fs._verify_write_lease(self._ino)  # gate the durable commit
+                self.fs._fs.flush(self._ino)
+            finally:
+                if self._lease_held:
+                    self._lease_held = False
+                    self.fs._release_write(self._ino)
             self.fs.invalidate_cache(self.fs._parent(self.fs._norm(self.path)))
         return True
+
+    def close(self):
+        # Catch-all so a WRITE lease is never leaked on an error path that
+        # bypassed the final `_upload_chunk` (coco M4 P2: a leaked lease is
+        # heartbeated forever, blocking other writers). Idempotent with the
+        # normal-path release above via the `_lease_held` flag.
+        try:
+            super().close()
+        finally:
+            if self._lease_held and self._ino is not None:
+                self._lease_held = False
+                try:
+                    self.fs._release_write(self._ino)
+                except Exception:
+                    pass

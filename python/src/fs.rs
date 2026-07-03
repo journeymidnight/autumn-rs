@@ -89,6 +89,20 @@ fn ts_to_f64(secs: i64, nsecs: u32) -> f64 {
     secs as f64 + (nsecs as f64) / 1e9
 }
 
+/// True iff a lease entry for `ino` is held AND server-side revoked. A persist
+/// op on a revoked lease must fast-fail (M4 fence — the stale writer's bytes
+/// must not land; the PS would fence them anyway, this just fails early). A
+/// MISSING entry is NOT revoked — anonymous writes without a held lease stay
+/// allowed (M2 semantics); the fsspec facade holds a lease + a heartbeat gate.
+/// The borrow is scoped so callers never hold it across an await.
+fn lease_revoked(st: &FsState, ino: u64) -> bool {
+    st.held_leases
+        .borrow()
+        .get(&ino)
+        .map(|l| l.revoked)
+        .unwrap_or(false)
+}
+
 /// Macro: build a job that runs `$body` (a `Result<$ret, String>` expression
 /// that may `.await`) against `$st: &mut FsState`, ship it to the worker, and
 /// block (GIL released) for the result. `tx`/`rx`/`job` are macro-hygienic.
@@ -139,6 +153,12 @@ impl Fs {
                         let _ = ready_tx.send(Err(format!("ensure_root: {e}")));
                         return;
                     }
+                    // F-FS-UNIFY M4: the same per-session lease background tasks
+                    // the fuse mount runs (headless — no kernel invalidator):
+                    // heartbeat held write leases so a long write doesn't lose
+                    // its lease, and poll invalidations so a preempted lease is
+                    // marked revoked. Spawned on this worker's compio runtime.
+                    autumn_fuse::lease_tasks::spawn_lease_background_tasks(&state, None);
                     let _ = ready_tx.send(Ok(()));
                     // Sequential job processing: one `&mut FsState` borrow at a
                     // time (no concurrent borrow), so core ops that hold `&mut`
@@ -350,27 +370,51 @@ impl Fs {
     /// buffered — call `flush` (or `truncate`) to persist it durably.
     fn write(&self, py: Python<'_>, ino: u64, offset: i64, data: Vec<u8>) -> PyResult<u32> {
         fs_blocking!(self, py, u32, |st| {
-            autumn_fuse::write::write(st, ino, offset, &data)
-                .await
-                .map_err(|e| e.to_string())
+            if lease_revoked(st, ino) {
+                Err(format!("write lease for ino {ino} was revoked"))
+            } else {
+                autumn_fuse::write::write(st, ino, offset, &data)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })
+    }
+
+    /// Drop `ino` from this session's inode cache so the next read reloads
+    /// authoritative metadata + extents from the cluster. The facade calls this
+    /// after releasing a write lease, giving cross-client close-to-open
+    /// coherence (M2's cache is populated only by writes, so a never-written
+    /// inode already reads fresh).
+    fn forget(&self, py: Python<'_>, ino: u64) -> PyResult<()> {
+        fs_blocking!(self, py, (), |st| {
+            st.inodes.remove(&ino);
+            Ok(())
         })
     }
 
     /// Flush inode `ino`'s buffered writes + metadata to the KV store.
     fn flush(&self, py: Python<'_>, ino: u64) -> PyResult<()> {
         fs_blocking!(self, py, (), |st| {
-            autumn_fuse::write::flush_inode(st, ino)
-                .await
-                .map_err(|e| e.to_string())
+            if lease_revoked(st, ino) {
+                Err(format!("write lease for ino {ino} was revoked"))
+            } else {
+                autumn_fuse::write::flush_inode(st, ino)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         })
     }
 
     /// Truncate (grow or shrink) inode `ino` to `size` bytes.
     fn truncate(&self, py: Python<'_>, ino: u64, size: u64) -> PyResult<()> {
         fs_blocking!(self, py, (), |st| {
-            autumn_fuse::write::truncate(st, ino, size)
-                .await
-                .map_err(|e| e.to_string())
+            if lease_revoked(st, ino) {
+                Err(format!("write lease for ino {ino} was revoked"))
+            } else {
+                autumn_fuse::write::truncate(st, ino, size)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         })
     }
 

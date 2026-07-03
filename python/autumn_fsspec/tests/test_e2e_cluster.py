@@ -89,6 +89,20 @@ def test_overwrite_append_exclusive_live(fs):
         fs.open("w/f.bin", "xb")
 
 
+def test_cross_facade_coherence(fs):
+    """F-FS-UNIFY M4: a write through one facade is seen by an INDEPENDENT
+    facade on the same cluster/root — write-lease + forget-on-release give
+    close-to-open coherence over the shared inode layout."""
+    other = AutumnFileSystem(manager=MANAGER, root=ROOT, skip_instance_cache=True)
+    other.pipe_file("coh/x.bin", b"first")
+    assert fs.cat_file("coh/x.bin") == b"first"
+    # overwrite through `other`; `fs` (which never cached this inode — it only
+    # reads) must observe the new bytes + size, not the stale first write.
+    other.pipe_file("coh/x.bin", b"second-and-longer")
+    assert fs.cat_file("coh/x.bin") == b"second-and-longer"
+    assert fs.info("coh/x.bin")["size"] == len(b"second-and-longer")
+
+
 def test_datasets_roundtrip_live(fs):
     ds_mod = pytest.importorskip("datasets")
     so = {"manager": MANAGER, "root": ROOT, "skip_instance_cache": True}

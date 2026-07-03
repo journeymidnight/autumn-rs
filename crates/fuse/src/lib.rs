@@ -21,6 +21,8 @@ pub mod dir;
 #[cfg(feature = "core")]
 pub mod extent;
 #[cfg(feature = "core")]
+pub mod lease_tasks;
+#[cfg(feature = "core")]
 pub mod meta;
 #[cfg(feature = "core")]
 pub mod read;

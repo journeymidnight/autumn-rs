@@ -136,12 +136,20 @@ byte-exact check, tears down):
 cargo build --workspace                    # debug binaries first
 bash python/tests/run_fs_e2e.sh
 #   → "PY M2 CROSS-INSTANCE byte-exact OK", "===== fs-e2e exit: 0 ====="
+
+# M4 — lease fencing + cross-client coherence (two Fs clients):
+bash python/tests/run_fs_lease_e2e.sh
+#   → "PY M4 fencing OK", "PY M4 coherence OK", "===== fs-lease-e2e exit: 0 ====="
 ```
 
-Behavior-preservation gate for the `dispatch` Create/Unlink/init_root refactor
-(the binding shares those core steps): the fuse e2e suite must stay green —
-`cargo test -p autumn-manager --test system_fuse_read --test f_fuse_lease_1
---test f_fuse_lease_2 -- --ignored --test-threads=1`.
+M4 write-fencing: `autumn_fsspec` and a fuse mount both take the same per-inode
+WRITE lease around writes (via `autumn.Fs` / `lease_tasks.rs`), so concurrent
+writers to one inode conflict instead of corrupting each other; reads are
+close-to-open coherent (fresh-read + `forget`-on-release). Behavior-preservation
+gate for the `dispatch` Create/Unlink/init_root refactor + the M4 `lease_tasks`
+extraction (the binding shares those core steps): the fuse e2e suite must stay
+green — `cargo test -p autumn-manager --test system_fuse_read --test
+f_fuse_lease_1 --test f_fuse_lease_2 -- --ignored --test-threads=1`.
 
 Chaos (fsspec interface under failover — PS kill→migration, manager
 kill→respawn, final byte-exact verify + write-liveness probe; timeouts are

@@ -480,6 +480,7 @@ flush_buffer(ino):
 | `dir.rs` | lookup/readdir/mkdir/rmdir/rename —— 返回 `(ino, InodeMeta)` / DT_* 条目 |
 | `extent.rs` | 变长 extent 寻址/写/截断/删除 |
 | `read.rs` / `write.rs` | 分块读组装 / 写缓冲 + flush |
+| `lease_tasks.rs` | per-session lease 后台任务(heartbeat + invalidation poll + revoked 驱逐;M4 从 dispatch 抽出,fuser-free;mount 传真 kernel invalidator、binding 传 None)|
 | `state.rs` | FsState(ClusterClient、inode 批次游标、lease 簿记)|
 
 **`fuse` feature(default,含 `core`)—— 内核挂载胶水**:
@@ -519,9 +520,26 @@ create/unlink KV 步骤抽成 core 函数,dispatch 改为调用(M1 同款):
 core op 在其 await 间持有 `&mut`(worker 串行处理,一次一个借用,安全)。
 sync 面是因为 M3 fsspec `AbstractFileSystem` 是同步 API。
 
-M2 边界:lease 三方法(acquire/heartbeat/release)是薄 wrapper;open→acquire
-→heartbeat→release 的 facade 逻辑 + 围栏测试是 M4,fsspec 改写是 M3。
-headless 验收 = `python/tests/run_fs_e2e.sh`(隔离 memory-mode 集群)。
+### F-FS-UNIFY M4 —— lease 接线 + 跨面围栏(F-FS-UNIFY 完成）
+
+M4 把 per-session lease 后台任务(5s heartbeat 续所有 held lease + 持久
+invalidation long-poll + `LeaseRevoked` 驱逐)从 fuse-gated `dispatch.rs`
+抽到 fuser-free 的 `lease_tasks.rs`(core;`dispatch.rs` 用 `pub use` 再导出,
+mount + 单测引用不变;core feature 因此加 `compio` 依赖供 spawn/timer)。
+- **binding**:connect 后 `spawn_lease_background_tasks(&state, None)`(headless,
+  无 kernel 页缓存驱逐)→ facade 的写租约在长写期间被续、被抢占时标 revoked;
+  `Fs.forget(ino)` 驱逐 inode 缓存;`write` 对 revoked 租约快失败(无租约的
+  匿名写仍放行 = M2 语义)。
+- **facade**(fsspec):写路径 `acquire(WRITE)` 环绕(pipe_file + buffered
+  `_initiate_upload`→final `_upload_chunk` flush+release+forget),冲突抛
+  `BlockingIOError` → 跨面写写围栏;读一致性靠 fresh-read(binding 只在写时
+  缓存 + release 时 forget)+ Q1 只写租约。
+- 验收:`run_fs_lease_e2e.sh`(两 DaemonClientId 写 XOR + 一致性 + forget 驱逐)、
+  `test_cross_facade_coherence`;fuse e2e 抽取后全绿。
+
+M2 边界(现已由 M4 补齐):lease 三方法在 M2 是薄 wrapper;open→acquire→
+heartbeat→release 的 facade 逻辑 + 围栏在 M4 接线。fsspec 改写是 M3。
+headless 验收 = `python/tests/run_fs_e2e.sh` + `run_fs_lease_e2e.sh`。
 
 ---
 

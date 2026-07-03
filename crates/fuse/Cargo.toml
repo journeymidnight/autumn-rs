@@ -11,11 +11,12 @@ required-features = ["fuse"]
 
 [features]
 default = ["fuse"]
-# F-FS-UNIFY M1: the fuser-FREE filesystem core (meta/dir/extent/read/
-# write/state over ClusterClient). libc is the only extra dep (getuid/
-# getgid + the S_IF* mode-bit constants). This is what the PyO3
-# `autumn.Fs` binding (M2) links against — no kernel-mount machinery.
-core = ["dep:libc"]
+# F-FS-UNIFY M1/M4: the fuser-FREE filesystem core (meta/dir/extent/read/
+# write/state over ClusterClient). libc for getuid/getgid + S_IF* mode bits;
+# compio for the M4 `lease_tasks` background heartbeat/poll (the core already
+# runs on a compio runtime via ClusterClient — the binding + fuse mount both
+# provide one). Still no kernel-mount machinery (fuser/clap/crossbeam).
+core = ["dep:libc", "dep:compio"]
 fuse = ["core", "dep:fuser", "dep:clap", "dep:crossbeam-channel", "dep:futures", "dep:compio", "dep:rand", "dep:tracing-subscriber"]
 # Build the mount binary with UCX so `--transport ucx` works against a UCX cluster.
 ucx = ["autumn-transport/ucx", "autumn-client/ucx"]
