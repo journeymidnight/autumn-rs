@@ -1,35 +1,33 @@
-Date: 2026-07-02
+Date: 2026-07-03
 TaskStatus: completed
-Task scope: README.md 全部重写为用户导向(项目介绍/重要特性/用法,吸引人来用),
-  卖点定调 = **AI 架构存储 all-in-one**(从存储数据模型到 kvcache 到 agent memory
-  一套引擎全覆盖);移出的运维/验证内容进新的 docs/ops.md;CLAUDE.md 规则 11 改为
-  指向 docs/ops.md。(用户指示 2026-07-02;英文 README。)
+Task scope: 25 个随机 seed 的 in-process chaos 扫测(system_chaos 零丢数据不变量测试
+  chaos_real_kill_split_merge_ec_fence_no_data_loss),完成后接本地 + 跨机 perf check
+  (perf 阶段进行中,本条目记录 chaos 扫测闭环)。
 
 Current summary:
-  · README.md 792 行 → 164 行,全新英文重写:AI all-in-one hook + 三接口分层
-    ASCII 图(fuse 文件/kvcache 推理缓存/agent memory 都压在同一 partition+stream
-    数据面上)+ Highlights(AI 面 3 条 + 引擎面 6 条,带实测数字:UCX 跨主机 8M 读
-    ~4.6× TCP、recall P99 ≈25ms)+ Quick start(autumn-deploy 单机)+ Using it
-    (KV/FUSE/kvcache/memory 各一个最小示例,MCP 一行启动)+ Deployment 表 +
-    Documentation map + License(Apache-2.0,与 LICENSE 核对过)。
-  · 新建 docs/ops.md(650 行,14 章 + TOC):README-only 内容原样迁移 —— fuse
-    runbook、autumn-op df、Prometheus /metrics、ENOSPC、WAL self-heal(含 F227
-    seal-lenient 锚点)、F276 读绕行、autumn-memory 验证 harness、authz setup、
-    CLI cheatsheet、chaos 目录、rolling restart + R1、测试矩阵、inode-lease。
-    内容守恒抽查 10/10 关键块保留;唯一删除 = audit_extent_refs.py/
-    patch_extent_refs.py 块(两脚本已不存在于仓库,坏引用;refs 审计现由
-    chaos STORAGE-ACCOUNTING 不变量覆盖,ops.md 有注)。
-  · CLAUDE.md:规则 11 改为「docs/ops.md 必须持续维护手动验证步骤;README 保持
-    用户导向(卖点=AI all-in-one)」;规则 10 第 4 步同步;Binary 表 autumn-ps
-    端口注明 9201=二进制默认/9301=部署约定(消除 README/部署文档矛盾)。
-  · 修 5 处指向已删 README 章节的陈旧引用:stream CLAUDE.md:304(F227 seal-
-    lenient → ops.md)、:1437(README acceptance → ops.md)、manager
-    CLAUDE.md:691(OP-driven → python/dashboard/DASHBOARD.md)、:1327、:1378。
-  · 验证:README+ops.md 引用的所有仓库路径逐一存在;无 stale README 章节引用;
-    deploy/validate.sh 仍绿;ops.md 14 章节覆盖迁移表全部行。
+  · 扫测配置:激进档(DURATION=45s, NEMESIS_INTERVAL=1500ms,= seed 583/603 回归同款),
+    其余默认(K=3 M=1 ENs=5,全部 11 种 nemesis 动作)。25 个随机 seed 由 shuf 生成并
+    记录:979809 578352 706409 574262 792262 499835 409033 715330 328074 261886
+    295022 86399 30981 194595 49986 633034 153149 309742 64062 733988 247804
+    18177 753653 122487 902341。
+  · **结果:25/25 全 PASS,零失败零假阳性**。每轮五项校验全过(per-key 400 keys
+    mismatches=0 not_found=0 / range=0 / write-liveness=0 / accounting=0)。
+    单轮 71-93s;写入 acked 6k-14.4k/轮,nemesis events 9-16/轮。
+  · 运行工程:排水门(TIME-WAIT<4000)逐轮生效(峰值 84K,门正常拦截);
+    每轮清理测试泄漏的 /tmp 日志目录(system_chaos.rs:1971 .keep() 泄漏 +
+    本次发现的 EN 数据目录泄漏,含 ANSI-color-in-baseline 的清理坑);
+    结束后 /tmp 新增目录 = 0,无 stray 进程,live d02 集群 etcd 未被触碰
+    (测试自建私有 etcd,已核实 support/mod.rs:859)。
+  · 顺带修复 docs/ops.md 过时说明:该测试并不需要 127.0.0.1:2379 的 etcd
+    (自建私有实例),并补记 toxiproxy/etcd PATH 依赖与 target/debug 前置构建。
+  · 观察(非本次扫测所致):d02 live 集群当前只剩 5 EN + etcd,manager/PS 不在运行
+    (perf 阶段按 perf-check skill 流程重建/重启该 bench 集群)。
 
 Main gaps / risks:
-  (无。纯文档重组,未动代码;历史内容在 git + docs/ops.md 双重保留。)
+  (无 —— 25/25 绿;已知 open 家族 seed=13/15 的 recovery-stuck 写 wedge 未在本次
+   随机样本中出现,该家族仍由 memory project_recovery_stuck_blocks_alloc 跟踪。)
 
 Next steps:
-  (无 —— 本任务闭环;commit + push main。)
+  1. 本地 perf check(perf-check skill;先 cargo build --release --workspace,
+     release 二进制落后于 7-01/02 的 readability 提交)。
+  2. 跨机 perf check(remote-autumn;::15 作 bench client,UCX pin mlx5_1:1)。

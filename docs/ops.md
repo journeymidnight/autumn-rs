@@ -443,7 +443,11 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh ucx
 #  failback used to wedge forever — owner_epoch now bumps on every acquire.)
 #
 # In-process kill+split+merge+EC+fence chaos (manager + PS in the test process,
-# EN as subprocesses; toxiproxy auto-spawned; needs etcd @127.0.0.1:2379). The
+# EN as subprocesses spawned from target/debug — `cargo build --workspace` first).
+# The test provisions its OWN throwaway etcd on random loopback ports (it does
+# NOT use 127.0.0.1:2379 and cannot touch another cluster's etcd); it needs the
+# `etcd`, `toxiproxy-server` and `toxiproxy-cli` binaries in PATH (overrides:
+# AUTUMN_TEST_ETCD_BIN / AUTUMN_TEST_TOXIPROXY_SERVER / _CLI). The
 # zero-data-loss invariant test — finds GC/seal/split data-loss + write-wedge:
 AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 \
   cargo test -p autumn-manager --test system_chaos \
