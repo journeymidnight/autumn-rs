@@ -50,26 +50,33 @@ esac
 unset AUTUMN_TRANSPORT  # don't leak to child processes
 
 # UCX env defaults (2026-07-03; the UCX C library reads UCX_* directly, so the
-# launcher is the right layer — binaries stay env-free). POSITIVE lists only
-# (never `^` negation). The split is by BIND ADDRESS, not intra-vs-cross-host:
-#   - loopback bind (127.0.0.1/::1): no RoCE GID on lo → rc_mlx5 unusable;
-#     posix shm must carry PS→EN appends (69K vs 8.3K write without it).
-#     Loopback UCX 8M stays known-broken (posix large-message stall) — dev only.
-#   - RoCE-bound (any real IP): ONE list serves BOTH intra-host (rc loopback,
-#     8M read 8 GB/s, zero stalls) and cross-host (rc_mlx5) traffic.
-#     Do NOT add posix/cma — the posix large-message path stalls concurrent
-#     ≥64K transfers on the PS→EN hop (3 s timeout storms, apparent write
-#     wedges; rndv/zcopy knobs don't help). Trade-off: 4K write drops vs the
-#     posix era (~72K→14K) while 8M read gains 4-9× — pick posix back ONLY
-#     for a small-write-dominated bench, explicitly, knowing 8M breaks.
-#     NET_DEVICES must be pinned (10-device auto-select hangs); mlx5_1:1 is
-#     this box's bench convention — production should pin a NON-GPU NIC.
-# Callers' explicit UCX_TLS / UCX_NET_DEVICES always win.
+# launcher is the right layer — binaries stay env-free). ONE rule (user
+# decision 2026-07-03): UCX clusters bind a RoCE-attached IP and get
+#   UCX_TLS=rc_mlx5,ud_mlx5,tcp,self  +  a pinned UCX_NET_DEVICES.
+# That single POSITIVE list (never `^` negation) serves BOTH intra-host
+# (rc loopback in the HCA — 8M read 8 GB/s, zero stalls) and cross-host
+# traffic. Do NOT add posix/cma: the posix large-message path stalls
+# concurrent ≥64K transfers on the PS→EN hop (3 s timeout storms, apparent
+# write wedges; rndv/zcopy knobs don't help). NET_DEVICES must be pinned
+# (10-device auto-select hangs); mlx5_1:1 is this box's bench convention —
+# production should pin a NON-GPU NIC.
+#
+# Binding a UCX cluster to loopback is NOT SUPPORTED by default (no RoCE GID
+# on lo → rc unusable; the posix fallback is known-broken for ≥64K). It
+# fails loudly unless the caller EXPLICITLY sets UCX_TLS (legacy escape
+# hatch — the loopback chaos/perf harnesses set posix,cma,tcp,self
+# themselves and keep working). Callers' explicit env always wins.
 apply_ucx_env_defaults() {
     [[ "$TRANSPORT" == "ucx" ]] || return 0
     local plain="${BIND_HOST//[\[\]]/}"
     if [[ "$plain" == "127.0.0.1" || "$plain" == "::1" || "$plain" == "localhost" ]]; then
-        export UCX_TLS="${UCX_TLS:-posix,cma,tcp,self}"
+        if [[ -z "${UCX_TLS:-}" ]]; then
+            die "UCX cluster bound to loopback: 127.0.0.1 is not an RDMA \
+device address — bind a RoCE NIC IP (AUTUMN_BIND_HOST='[fdbd:dc62:3:302::14]' \
+on this box). Legacy shm-only loopback mode requires an explicit \
+UCX_TLS=posix,cma,tcp,self (≥64K transfers are known-broken there)"
+        fi
+        export UCX_TLS
     else
         export UCX_TLS="${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self}"
         export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_1:1}"

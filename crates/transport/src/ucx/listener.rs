@@ -34,6 +34,21 @@ unsafe impl Sync for ConnReqPtr {}
 
 impl UcxListener {
     pub(crate) async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        // 2026-07-03: a loopback bind is not an RDMA device address — rc lanes
+        // can't be established (no RoCE GID on lo) and the shm fallback's
+        // large-message path is known-broken (concurrent ≥64K transfers stall).
+        // The launchers (cluster.sh / autumn-deploy) refuse this configuration;
+        // a hand-launched binary gets this WARN (never a hard failure — the
+        // shm-only legacy mode is deliberately used by the loopback chaos
+        // harnesses, per the warn-not-block rule).
+        if addr.ip().is_loopback() {
+            tracing::warn!(
+                %addr,
+                "UCX listener bound to loopback: not an RDMA device address — \
+                 rc unusable, shm-only mode, ≥64K transfers known-broken; \
+                 bind a RoCE NIC IP for production"
+            );
+        }
         // F264 (UCX chaos): a node restarted within the TIME_WAIT window of
         // its previous incarnation fails `ucp_listener_create` with
         // UCS_ERR_BUSY ("Device is busy") — the killed process's ACCEPTED

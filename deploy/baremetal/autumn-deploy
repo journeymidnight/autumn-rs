@@ -185,27 +185,26 @@ write_unit() {
 }
 
 # UCX env for one instance host (TRANSPORT=ucx only; the UCX C library reads
-# UCX_* from the process env — this launcher is the right layer). POSITIVE
-# lists only. Rule (2026-07-03, see docs/baremetal_deploy.md):
-#   loopback host  → posix,cma,tcp,self   (no RoCE GID on lo; posix carries
-#                                          small appends; 8M UCX known-broken)
-#   real-IP host   → rc_mlx5,ud_mlx5,tcp,self + pinned UCX_NET_DEVICES —
-#     ONE list serves both intra-host (rc loopback) and cross-host traffic.
-#     NEVER add posix/cma: the posix large-message path stalls concurrent
-#     ≥64K transfers (3 s timeout storms / apparent write wedges).
-# Topology may override via UCX_TLS / UCX_NET_DEVICES.
+# UCX_* from the process env — this launcher is the right layer). ONE rule
+# (2026-07-03, see docs/baremetal_deploy.md): UCX topologies use RoCE NIC IPs
+# and every instance gets
+#   UCX_TLS=rc_mlx5,ud_mlx5,tcp,self  +  a pinned UCX_NET_DEVICES.
+# The single POSITIVE list serves both intra-host (rc loopback in the HCA)
+# and cross-host traffic. NEVER add posix/cma: the posix large-message path
+# stalls concurrent ≥64K transfers (3 s timeout storms / write wedges).
+# 127.0.0.1 is not an RDMA device address — a loopback host in a UCX topology
+# is refused unless the topology explicitly sets UCX_TLS (legacy shm-only
+# mode; ≥64K known-broken). Topology overrides always win.
 ucx_env_for_host() {
     local host="$1"
     [[ "$TRANSPORT" == "ucx" ]] || { echo ""; return; }
     local ph; ph="$(plain_host "$host")"
-    local tls dev=""
     if [[ "$ph" == "127.0.0.1" || "$ph" == "::1" || "$ph" == "localhost" ]]; then
-        tls="${UCX_TLS:-posix,cma,tcp,self}"
+        [[ -n "${UCX_TLS:-}" ]] || die "TRANSPORT=ucx with loopback host '$host': 127.0.0.1 is not an RDMA device address — use RoCE NIC IPs in the topology, or set UCX_TLS explicitly (legacy shm-only mode)"
+        echo "UCX_TLS=${UCX_TLS}"
     else
-        tls="${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self}"
-        dev="${UCX_NET_DEVICES:-mlx5_1:1}"
+        echo "UCX_TLS=${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self} UCX_NET_DEVICES=${UCX_NET_DEVICES:-mlx5_1:1}"
     fi
-    echo "UCX_TLS=$tls${dev:+ UCX_NET_DEVICES=$dev}"
 }
 
 # Render + start one service instance.

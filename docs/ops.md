@@ -80,13 +80,14 @@ export UCX_NET_DEVICES=mlx5_1:1               # verify: scripts/check_roce.sh --
 ulimit -l unlimited                           # ibv_reg_mr pins registered buffers
 ```
 
-UCX_TLS rule of thumb: **RoCE-bound cluster (bind to a NIC IP) →
-`rc_mlx5,ud_mlx5,tcp,self`** — one list serves both intra-host (rc loopback)
-and cross-host traffic; **pure-loopback dev cluster (127.0.0.1) →
-`posix,cma,tcp,self`** (no RoCE GID on lo; loopback UCX 8M is known-broken and
-not representative). `cluster.sh` and `deploy/baremetal/autumn-deploy` now
-apply these defaults automatically when `TRANSPORT=ucx` (explicit
-`UCX_TLS`/`UCX_NET_DEVICES` env always wins).
+UCX_TLS rule (one rule, 2026-07-03): UCX clusters bind **RoCE NIC IPs**
+(127.0.0.1 is not an RDMA device address) and use
+`UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` + a pinned `UCX_NET_DEVICES` — the single
+list serves both intra-host (rc loopback in the HCA) and cross-host traffic.
+`cluster.sh` / `autumn-deploy` apply this automatically for `TRANSPORT=ucx`
+and refuse a loopback bind (legacy shm-only loopback needs an explicit
+`UCX_TLS=posix,cma,tcp,self` and has ≥64K transfers known-broken — the
+loopback chaos harnesses set it themselves). Explicit env always wins.
 
 **In Kubernetes**, run autumn-fuse as a privileged per-node DaemonSet (mounts
 `/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
