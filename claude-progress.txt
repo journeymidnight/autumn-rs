@@ -1,33 +1,44 @@
 Date: 2026-07-03
-TaskStatus: completed
-Task scope: 25 个随机 seed 的 in-process chaos 扫测(system_chaos 零丢数据不变量测试
-  chaos_real_kill_split_merge_ec_fence_no_data_loss),完成后接本地 + 跨机 perf check
-  (perf 阶段进行中,本条目记录 chaos 扫测闭环)。
+TaskStatus: not_completed
+Task scope: 25 随机 seed chaos 扫测 → 本地 perf check → 跨机 perf check。
+  chaos 与 perf 的"执行"都完成;TaskStatus=not_completed 因为跨机 perf 发现了
+  一个真实的 UCX ZC-read 客户端回归(P1,修复=下一个任务,reproduce-first 已备齐)。
 
 Current summary:
-  · 扫测配置:激进档(DURATION=45s, NEMESIS_INTERVAL=1500ms,= seed 583/603 回归同款),
-    其余默认(K=3 M=1 ENs=5,全部 11 种 nemesis 动作)。25 个随机 seed 由 shuf 生成并
-    记录:979809 578352 706409 574262 792262 499835 409033 715330 328074 261886
-    295022 86399 30981 194595 49986 633034 153149 309742 64062 733988 247804
-    18177 753653 122487 902341。
-  · **结果:25/25 全 PASS,零失败零假阳性**。每轮五项校验全过(per-key 400 keys
-    mismatches=0 not_found=0 / range=0 / write-liveness=0 / accounting=0)。
-    单轮 71-93s;写入 acked 6k-14.4k/轮,nemesis events 9-16/轮。
-  · 运行工程:排水门(TIME-WAIT<4000)逐轮生效(峰值 84K,门正常拦截);
-    每轮清理测试泄漏的 /tmp 日志目录(system_chaos.rs:1971 .keep() 泄漏 +
-    本次发现的 EN 数据目录泄漏,含 ANSI-color-in-baseline 的清理坑);
-    结束后 /tmp 新增目录 = 0,无 stray 进程,live d02 集群 etcd 未被触碰
-    (测试自建私有 etcd,已核实 support/mod.rs:859)。
-  · 顺带修复 docs/ops.md 过时说明:该测试并不需要 127.0.0.1:2379 的 etcd
-    (自建私有实例),并补记 toxiproxy/etcd PATH 依赖与 target/debug 前置构建。
-  · 观察(非本次扫测所致):d02 live 集群当前只剩 5 EN + etcd,manager/PS 不在运行
-    (perf 阶段按 perf-check skill 流程重建/重启该 bench 集群)。
+  · chaos 扫测:25/25 随机 seed 全 PASS(45s/1500ms 激进档,五项不变量全 0 错,
+    零假阳性;seed 清单在上一版进度与 git 历史)。docs/ops.md 过时 etcd 说明已修
+    (commit c3674d2)。
+  · 本地 perf(--3disk p8):写侧全绿(tcp-4k 94K、8m 261 ops/s);tcp-8m PASS
+    (读 1122 ops/s=9.2GB/s)。tcp-4k 读 255K vs 5-21 基线 1.37M —— **A/B 判环境**
+    (pre-readability a7deb3f 同箱 211K,与 HEAD 相同):箱子 6-17 起多租户
+    (194 ray:: 进程 + sglang 满核)。loopback ucx-8m 停摆 = 宿主级 loopback-UCX
+    旧病(旧代码同样停摆),非代码。磁盘 dd 直写 3.2-3.6GB/s 健康。
+    两个环境坑已沉淀:Ray 占 EN 控制端口 10101+(→AUTUMN_EXTENT_BASE_PORT=20000,
+    已写进 perf-check skill 预检)+ 基线对多租户箱已过时(勿擅自 --update-baseline)。
+  · 跨机 perf(集群本机::14,客户端 ::15;远端无外网→git bundle scp 同步到 c3674d2,
+    scp 预编译 ucx 客户端):
+    - tcp-4k:写 14.2K/读 17.7K ops/s(均高于 6-07 参考 9.7K/15.6K)
+    - tcp-8m:写 241MB/s(≈参考)、读 1066MB/s(参考 193-601 → 1.8-5.5×,ZC 红利)
+    - ucx-4k:写 71.8K/读 435K ops/s,p99 1.1ms(优异)
+    - ucx-8m:写 1716MB/s 健康;**读 = 回归**(见下)
+  · **发现 P1 回归(OPEN)**:跨机 UCX ZC-read(8M)客户端侧 ~3×。
+    暖集群同服务器 A/B(只换客户端):a7deb3f 129.7 ops/s / f833d1d 151.5(无罪)
+    / 63dcc34 82.6 / HEAD 41.6(p95 9-17s stall 尾)。写侧各版本相同;ucx-4k 完美
+    → 锁定 ≥64K ZC 读路径,f833d1d 之后、疑似多提交累积。
+    头号嫌疑:63dcc34 删除 regpool Drop"恒真死分支"(regpool=ZC 读注册缓冲池;
+    若该分支实际归还缓冲 → 池耗尽 → 等待注册缓冲 = 全部症状)。
+    详见 memory project_ucx_zc_read_regression_readability(含完整 repro 命令;
+    旧客户端二进制留在 ::15 /tmp/ac-{old,f833,63dc,head})。
 
 Main gaps / risks:
-  (无 —— 25/25 绿;已知 open 家族 seed=13/15 的 recovery-stuck 写 wedge 未在本次
-   随机样本中出现,该家族仍由 memory project_recovery_stuck_blocks_alloc 跟踪。)
+  · P1 回归待修(专门会话):先单独 revert 63dcc34 的 regpool hunk 做 A/B;
+    注意与既有的跨机 p95~3.3s stall 家族(旧代码也有)区分,勿混为一谈。
+    修复后跑 30s 窗口 + 每点 fresh 集群(老化集群上 8M bench 会写停摆卡窗口)。
+  · 远端 ::15 无外网(github/crates.io 均不通),同步代码用 git bundle + scp。
+  · 本地 5-21 基线是否按多租户现实重录 —— 需用户决策。
 
 Next steps:
-  1. 本地 perf check(perf-check skill;先 cargo build --release --workspace,
-     release 二进制落后于 7-01/02 的 readability 提交)。
-  2. 跨机 perf check(remote-autumn;::15 作 bench client,UCX pin mlx5_1:1)。
+  1. 修 UCX ZC-read 回归(reproduce-first 材料齐;从 63dcc34 regpool hunk 开始)。
+  2. 修复后重跑跨机 ucx-8m 确认恢复 ~130+ ops/s(或更高),再看是否连带改善
+    旧 stall 家族。
+  3. 与用户定基线重录策略。
