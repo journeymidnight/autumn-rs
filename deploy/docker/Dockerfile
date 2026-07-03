@@ -16,6 +16,22 @@ ARG BASE_REGISTRY=
 
 FROM ${BASE_REGISTRY}rust:1.93-bookworm AS builder
 WORKDIR /build
+# Optional crates.io mirror for faster dependency downloads. Empty (default) →
+# official crates.io (unchanged for everyone else). `--build-arg CARGO_MIRROR=
+# rsproxy` switches to ByteDance's rsproxy.cn sparse mirror (fast on a
+# China/Volcengine runner; all deps are crates.io, no git deps). Written to
+# $CARGO_HOME so the repo's own .cargo/config.toml is untouched. Kept before
+# `COPY . .` so it's cached independently of source changes. Re-declared here
+# because a global (pre-FROM) ARG isn't visible to a stage's RUN.
+ARG CARGO_MIRROR=
+RUN if [ "$CARGO_MIRROR" = "rsproxy" ]; then \
+      printf '%s\n' \
+        '[source.crates-io]' \
+        'replace-with = "rsproxy-sparse"' \
+        '[source.rsproxy-sparse]' \
+        'registry = "sparse+https://rsproxy.cn/index/"' \
+        >> "$CARGO_HOME/config.toml"; \
+    fi
 COPY . .
 # -p autumn-server builds exactly the server binaries. It pulls autumn-fuse with
 # default-features = false (key/schema modules only), so no libfuse3-dev is
