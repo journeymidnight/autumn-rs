@@ -49,6 +49,37 @@ patches:
       - op: replace
         path: /spec/replicas
         value: 5
+  # Run 3 partition servers so the 8 presplit partitions fan out across 3 PS
+  # processes on 3 nodes (base ships 1 PS → all 8 partitions on one process,
+  # ~16 partition threads oversubscribing one 12-core node → write tail under
+  # load). rebalance_regions only spreads partitions that exist BEFORE their
+  # PS is assigned, so the 3 PS must be up at bootstrap — a fresh deploy does
+  # that. Anti-affinity spreads the 3 PS onto distinct nodes.
+  - target:
+      kind: StatefulSet
+      name: autumn-ps
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      # Parallel so all 3 PS start + register together (~15s), before the ENs
+      # finish coming Online (~60s) and bootstrap creates the 8 partitions —
+      # otherwise OrderedReady brings PS up one at a time and only ps-0 is
+      # registered at bootstrap, so all 8 partitions land on it.
+      - op: add
+        path: /spec/podManagementPolicy
+        value: Parallel
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: partition-server
   - target:
       kind: ConfigMap
       name: autumn-config
@@ -56,6 +87,12 @@ patches:
       - op: replace
         path: /data/AUTUMN_EXPECT_NODES
         value: "5"
+      # Presplit into 8 partitions at bootstrap so writes fan out across 8
+      # group-commit pipelines instead of serializing on one (the p8 in the
+      # perf-check "p8d8" baseline). Adjust to taste for your workload.
+      - op: add
+        path: /data/AUTUMN_BOOTSTRAP_PRESPLIT
+        value: "8"
   # etcd wants network-durable storage. The base omits storageClassName to inherit
   # the cluster default, but this cluster marks no default — name Volcengine's EBS
   # class explicitly. EBS ESSD has a 20Gi minimum (base 1Gi → InvalidVolumeSize).
