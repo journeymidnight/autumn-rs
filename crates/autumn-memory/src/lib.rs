@@ -22,6 +22,7 @@
 //! compio runtime. A PyO3 binding (for the Hermes / LangGraph adapters) wraps
 //! it for synchronous Python callers.
 
+pub mod embed;
 pub mod keys;
 mod graph;
 mod recall;

@@ -10,6 +10,14 @@ name = "autumn_memory"
 [dependencies]
 autumn-client = { path = "../client" }
 bytes = { workspace = true }
+# Only for the optional static-int8 embedder (`embed` module, `static-embed`
+# feature). The core + default build pull no extra deps.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
+[features]
+default = []
+# Model2Vec static-int8 embedder in `autumn_memory::embed` (needs a tokenizer).
+static-embed = ["dep:tokenizers"]
 
 [dev-dependencies]
 compio = { version = "0.18", features = ["macros"] }

@@ -9,7 +9,7 @@
 //!                                  [--reset] [--mcp]
 //! Then open http://127.0.0.1:5200 .
 
-mod embed;
+use autumn_memory::embed;
 mod store;
 
 use std::collections::HashMap;

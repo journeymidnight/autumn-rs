@@ -252,6 +252,7 @@ dependencies = [
  "autumn-client",
  "bytes",
  "compio",
+ "tokenizers",
 ]
 
 [[package]]
@@ -626,7 +627,6 @@ dependencies = [
  "futures",
  "send_wrapper",
  "serde_json",
- "tokenizers",
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
@@ -1953,7 +1953,6 @@ dependencies = [
  "futures",
  "send_wrapper",
  "serde_json",
- "tokenizers",
  "tracing",
  "tracing-subscriber",
 ]

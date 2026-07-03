@@ -1,24 +1,47 @@
-//! Text→vector embedder for the code index. autumn-memory takes caller-supplied
-//! vectors; this is where they come from.
+//! Optional lightweight text→vector embedder for the vector / hybrid legs.
 //!
-//!   * `Hash`  — default, zero deps. Signed-FNV bag-of-words hashing. Real
-//!               plumbing, weak semantics; makes `cargo run` work with no model.
-//!   * `Static` — Model2Vec-style static int8 lookup table (feature
-//!               `static-embed`): tokenize → int8 row → dequant → mean-pool.
-//!               Real semantics, no service. Build the table with
-//!               `tools/fetch_model.py`.
+//! autumn-memory itself takes caller-supplied vectors (`index_vector` /
+//! `search_vector` want a `&[f32]`) — production feeds them from a shared
+//! sglang/vLLM endpoint. This convenience module gives callers that DON'T want
+//! to stand up a model server a built-in embedder:
 //!
-//! All variants emit an `EMBED_DIM`-length L2-normalized vector.
+//!   * [`HashEmbedder`] — zero-dep, always available. Signed-FNV bag-of-words
+//!     hashing. Deterministic, reproducible; real plumbing, weak semantics.
+//!   * [`StaticTableEmbedder`] — a Model2Vec-style static int8 lookup table
+//!     (feature `static-embed`): tokenize → int8 row lookup → dequant →
+//!     mean-pool. Real semantics, no network, no GPU.
+//!
+//! An enum ([`Embedder`]) dispatches between them; all variants emit an
+//! `EMBED_DIM`-length **L2-normalized** vector so results stay comparable.
 
-use anyhow::Result;
+use std::fmt;
 
+/// Output dimension every embedder honors. 256 matches Model2Vec
+/// `potion-base-8M`, so a static table needs no reprojection.
 pub const EMBED_DIM: usize = 256;
 
+/// Error from the (fallible) static-table embedder — loading a table/tokenizer
+/// or tokenizing. `HashEmbedder` never fails.
+#[derive(Debug)]
+pub struct EmbedError(pub String);
+
+impl fmt::Display for EmbedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for EmbedError {}
+impl From<std::io::Error> for EmbedError {
+    fn from(e: std::io::Error) -> Self {
+        EmbedError(e.to_string())
+    }
+}
+
 fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n > 0.0 {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
         for x in v.iter_mut() {
-            *x /= n;
+            *x /= norm;
         }
     }
     v
@@ -29,6 +52,12 @@ fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
 }
+
+// ---------------------------------------------------------------------------
+// Hash embedder (default, zero deps)
+// ---------------------------------------------------------------------------
+
+pub struct HashEmbedder;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -42,8 +71,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-pub struct HashEmbedder;
-
 impl HashEmbedder {
     pub fn embed(&self, text: &str) -> Vec<f32> {
         let mut acc = vec![0.0f32; EMBED_DIM];
@@ -55,6 +82,10 @@ impl HashEmbedder {
         l2_normalize(acc)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Static int8 table embedder (Model2Vec-style), feature `static-embed`
+// ---------------------------------------------------------------------------
 
 #[cfg(feature = "static-embed")]
 pub struct StaticTableEmbedder {
@@ -68,24 +99,24 @@ pub struct StaticTableEmbedder {
 #[cfg(feature = "static-embed")]
 impl StaticTableEmbedder {
     /// `M2VS` format: [u8;4 "M2VS"][u32 version][u32 vocab][u32 dim][f32 scale][i8 vocab*dim]
-    pub fn load(model_path: &str, tokenizer_path: &str) -> Result<Self> {
+    pub fn load(model_path: &str, tokenizer_path: &str) -> Result<Self, EmbedError> {
         let bytes = std::fs::read(model_path)?;
         if bytes.len() < 20 || &bytes[0..4] != b"M2VS" {
-            anyhow::bail!("{model_path}: not an M2VS table");
+            return Err(EmbedError(format!("{model_path}: not an M2VS table")));
         }
         let rd = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let vocab = rd(8) as usize;
         let dim = rd(12) as usize;
         let scale = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
         if dim != EMBED_DIM {
-            anyhow::bail!("{model_path}: dim {dim} != EMBED_DIM {EMBED_DIM}");
+            return Err(EmbedError(format!("{model_path}: dim {dim} != EMBED_DIM {EMBED_DIM}")));
         }
         let want = 20 + vocab * dim;
         if bytes.len() < want {
-            anyhow::bail!("{model_path}: truncated");
+            return Err(EmbedError(format!("{model_path}: truncated")));
         }
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("tokenizer {tokenizer_path}: {e}"))?;
+            .map_err(|e| EmbedError(format!("tokenizer {tokenizer_path}: {e}")))?;
         Ok(Self {
             vocab,
             dim,
@@ -95,11 +126,11 @@ impl StaticTableEmbedder {
         })
     }
 
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         let enc = self
             .tokenizer
             .encode(text, false)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            .map_err(|e| EmbedError(format!("tokenize: {e}")))?;
         let mut acc = vec![0.0f32; self.dim];
         let mut count = 0usize;
         for &id in enc.get_ids() {
@@ -123,6 +154,10 @@ impl StaticTableEmbedder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The dispatch enum
+// ---------------------------------------------------------------------------
+
 pub enum Embedder {
     Hash(HashEmbedder),
     #[cfg(feature = "static-embed")]
@@ -142,7 +177,7 @@ impl Embedder {
         }
     }
 
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         match self {
             Embedder::Hash(h) => Ok(h.embed(text)),
             #[cfg(feature = "static-embed")]

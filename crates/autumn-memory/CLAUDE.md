@@ -28,6 +28,18 @@ dropped (2026-07-03) once all consumers went Rust. Design + rationale:
 Phase 1 is e2e-validated against a live cluster (`tests/e2e.rs` #[ignore] + the
 isolated-cluster harness `tests/run_e2e.sh`).
 
+## Optional built-in embedder (`embed.rs`)
+
+The vector/hybrid legs take a **caller-supplied** `&[f32]` (production feeds them
+from a shared sglang/vLLM endpoint — deliberately NOT an in-process model, see
+plan §11). For callers that just want a built-in embedder without a model
+server, `autumn_memory::embed` provides one: `HashEmbedder` (zero-dep, signed-FNV
+hashing — always available) and, behind the **`static-embed`** feature,
+`StaticTableEmbedder` (a Model2Vec-style int8 lookup table, needs `tokenizers`).
+`Embedder` dispatches; all emit an `EMBED_DIM`-length L2-normalized vector.
+Errors are a local `EmbedError` (the core takes no `anyhow` dep). The `gallery`-
+style examples (`examples/codebase-memory`, `examples/memory-browser`) use it.
+
 ## Lexical recall — BM25-on-KV (`recall.rs`, plan §7 词法腿)
 
 Posting-on-KV done directly (no brute-force MVP — user directive 2026-06-30):
