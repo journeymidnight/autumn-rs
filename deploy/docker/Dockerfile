@@ -6,7 +6,15 @@
 # One image serves every role; deploy/docker/entrypoint.sh dispatches on its
 # first argument (manager | extent-node | ps | bootstrap). See docs/k8s_deploy.md.
 
-FROM rust:1.93-bookworm AS builder
+# Optional base-image registry prefix. Empty (default) → the official Docker Hub
+# images (docker.io/library/...). Set it to build the base layers through a
+# mirror when docker.io is slow/blocked, e.g. on a China/Volcengine runner:
+#   docker build --build-arg BASE_REGISTRY=docker.m.daocloud.io/library/ ...
+# Must include a trailing slash. Global ARG (declared before the first FROM) so
+# BOTH stages' FROM lines can reference it.
+ARG BASE_REGISTRY=
+
+FROM ${BASE_REGISTRY}rust:1.93-bookworm AS builder
 WORKDIR /build
 COPY . .
 # -p autumn-server builds exactly the server binaries. It pulls autumn-fuse with
@@ -18,7 +26,7 @@ RUN cargo build --release -p autumn-server
 # Runtime: binaries link only libc/libgcc; bookworm-slim provides bash + getent
 # (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The kernel comes
 # from the k8s node and must be >= 5.15 (compio uses io_uring).
-FROM debian:bookworm-slim
+FROM ${BASE_REGISTRY}debian:bookworm-slim
 COPY --from=builder \
     /build/target/release/autumn-manager-server \
     /build/target/release/autumn-extent-node \
