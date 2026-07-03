@@ -1,49 +1,146 @@
 Date: 2026-07-03
 TaskStatus: completed
-Task scope: 修 UCX 8M 读 stall(用户批准路线:先 fix(a) 日志分级,再 #1
-  ping-on-connect;后转 rndv/zcopy 试验)。结果:stall 已由**纯配置修复**
-  (UCX_TLS 去 posix/cma),fix(a) 日志已提交,ping 被证伪撤回。
+Task scope: all-in-one AI 存储扩展 —— (1) fsspec 让 Python dataset 直接从
+  autumn load 数据【F-FSSPEC-1 完成】;(2) vLLM 快速加载研究【交付
+  docs/model_loading.md】;(3) F-FS-UNIFY 设计(用户批准 Q1/Q2/Q5)+ M0
+  分配器【完成】;(4) 用户指令:chaos 测 fuse + fsspec 后 commit & push
+  【三个 chaos 全 PASS,已提交推送】。M1-M4 为 F-FS-UNIFY 后续里程碑
+  (feature_list 追踪,passes:false)。
+
+Chaos 结果(2026-07-03,全部真 kill -9 注入):
+  · fuse_chaos.sh PASS ×2(64/63 文件 byte-exact;F1 杀 PS→迁移、F2 杀
+    manager→respawn、F3 杀 fuse daemon→remount + T1-T3 truncate/grow/
+    unlink;第二遍带全部 coco 修复重跑)—— **M0 分配器在环**:每个 create
+    走 manager 取号,杀 manager 后创建恢复 = M0 实战验证。
+  · fuse_rmw_chaos.sh PASS(EIO + 文件原样 = RMW get-swallow 守卫正确)。
+  · fsspec_chaos.sh PASS(新 harness):573 轮 0 MISMATCH、529 落账文件
+    fresh-process 全 byte-exact + find/info 一致、写活性 OK、两次 failover
+    0 条瞬时错误上浮(SDK 重试全吸收)。超时=UNCERTAIN 规则内建。
+  · 全量测试:fsspec 36/36(27 offline + 9 live)、manager lib 171、
+    fs_alloc e2e(memory+etcd 含 --ignored)、fuse lib 44、rpc 43、client 27。
+
+coco M0-diff 轮(GPT-5.5)6 条全修:P2 makedirs 覆盖同 key 文件 manifest →
+  NotADirectoryError/FileExistsError 语义;P2 subtree_prefixes("") 建
+  `fs/m//` 匹配不到 → 裸命名空间特判;P2 fuse legacy cursor 非单调回写 →
+  read-compare-write 单调守卫 + 文档降级为 advisory-only;P3 autocommit
+  假承诺 → NotImplementedError;P3 CAS 无退避 → 3ms×attempt 线性退避;
+  P3 model_loading.md fuse 命令缺参 → 修正。
+
+F-FS-UNIFY 决策已定 + M0 已完成(2026-07-03):
+  · 用户拍板:Q1=只写租约(读走 poll_invalidations/cache_is_stale epoch 一致,
+    零读 RTT);Q2=方案 B manager AllocInodes RPC,计数器落 etcd 用 CAS;
+    Q5=精简 POSIX 面(file/dir/size/mtime/read/write/rename/unlink)。
+  · **M0 done**:MSG_ALLOC_INODES(0x53,WIRE v11=8a586475b2930f0f,
+    MIN=MAX=11 同 commit 部署)+ crates/manager/src/fs_alloc.rs
+    (leader-fenced etcd value-CAS on autumn-rs/fs/next_inode;严格 BE u64
+    fail-loud;首建走 create_revision==0;memory 模式 Cell;与 alloc_ids
+    分离)+ ClusterClient::alloc_inodes(count, floor)(mgr_call_leader)
+    + fuse meta::alloc_inode 改为 manager 批量取号,旧 [0x04]next_inode
+    值作迁移 floor(永不低于/永不回退)+ 每批 best-effort 回写旧 key
+    (advisory,灾备重建新鲜度)。
+  · 验证:memory e2e(16 路并发批次不相交、floor 单调、count=0 拒绝)+
+    etcd e2e(8 路 CAS 批次不相交、etcd watermark 精确、follower
+    NOT_LEADER 拒发 = 脑裂守卫)+ fuse 回归(lib 44、f_fuse_lease_1 6/6、
+    f_fuse_lease_2 2/2、system_fuse_read,全含 --ignored)+ rpc 43/
+    manager 171/client 27 lib 全绿 + workspace build + 新码 clippy 干净。
+  · 文档同步:crates/manager/CLAUDE.md note 42、crates/fuse/CLAUDE.md
+    分配器段、design doc M0 行、feature_list F-FS-UNIFY。
+  · coco findbugs(M0 diff)后台进行中。
+  · M1(解耦 fuse core)→M2(PyO3 Fs)→M3(fsspec facade)→M4(lease 接线)
+    未动 —— 下一步 M1。
+
+F-FS-UNIFY 设计文档(docs/fs_unify_design.md,已审批;原始提案记录):
+  · 目标:fuse(POSIX mount)与 fsspec(Python)是同一文件系统的两个前端 ——
+    同一 inode 布局、同一 per-inode lease 围栏,而非当前 F-FSSPEC-1 的独立
+    `fs/` 命名空间(不同文件、互不围栏)。
+  · 架构:一个共享 Rust FS core —— 把 crates/fuse 的 meta/dir/extent/read/write
+    从 `fuser` feature 解耦(返回裸 InodeMeta,→FileAttr 转换上移进 dispatch.rs),
+    fuse 二进制与新 PyO3 `autumn.Fs` 绑定共用;autumn_fsspec 重写成 shared inode
+    布局之上的薄 facade(path↔inode、真 dirent、extent 读写)+ open/close 时
+    autumn_client::lease acquire/heartbeat/release。
+  · 关键既有支撑:lease 已是可复用库(autumn_client::lease);namespace core 已
+    ~纯粹(ClusterClient + key/schema,仅 return 边界薄薄耦合 fuser)。
+  · **前置 bug**:inode 分配器(meta.rs:alloc_inode)对 next_inode 计数器是
+    非-CAS RMW → 并发分配者(fuse+fsspec 或双 mount)会重号 → 损坏。须改成
+    crash-safe 多写(manager AllocInodes RPC 或 SDK CAS)。此项独立可先发,
+    也顺带修当前多-mount fuse 的潜在隐患。
+  · 分期 M0(分配器)→M1(解耦 core)→M2(PyO3 Fs)→M3(fsspec facade,退役
+    `fs/` 布局)→M4(lease+围栏+跨面测试)。
+  · 待用户定的开放问题:Q1 只写租约 vs 恒租约;Q2 分配器 manager-RPC vs SDK-CAS;
+    Q5 Python 面 POSIX 语义广度。
 
 Current summary:
-  · fix(a) 已提交(b4754ae rebase 后):client get_direct 副本 failover +
-    PS ZC 代理读的静默重试按错误分级(超时→warn,预期 failover→debug,
-    全副本失败仅含超时时 warn —— coco P3 采纳)。client 27/27、stream 90/90、
-    clippy 0。**部署当轮即立功**:373 条 warn 把故障点改写为 PS→EN 同机段。
-  · ping-on-connect(#1)完整走了实现→测试→真集群验证→**被证伪→撤回**:
-    探活(MSG_TYPE_PING)全通过而 8M 读依旧卡 → 病灶不是死 endpoint 而是
-    **并发大消息传输**;按"不留未证实机制补丁"原则还原 conn_pool.rs
-    (过程记入 memory 防重走弯路)。
-  · rndv/zcopy 试验矩阵(6 配置 × fresh 集群 × t16 8M bench,指标=PS 超时
-    warn 数/读 ops/s)定谳:
-    baseline(posix,cma) 178/210 · no-cma 197/105 · **no-shm 0/853** ·
-    rndv-put_zcopy 258/25 · rndv-get_zcopy 223/69 · no-zcopy 191/100
-    → **元凶 = posix shm 传输的并发大消息路径**(cma 无辜,rndv/zcopy 无关)。
-  · no-shm(UCX_TLS=rc_mlx5,ud_mlx5,tcp,self)验证:8M 读 960 ops/s(8.05GB/s,
-    p99 122ms,0 stall,超 6-25 参考 2.6×)、4K 读 771K(p99 0.19ms)、8M 写 183;
-    **代价:4K 写 71.8K→13.8K**(posix 曾高效承载 PS→EN 小 append,rc loopback
-    每 append 付延迟,p50 0.84→7.4ms)。大值负载(kvcache/fuse)净赚 4-9×。
-  · 结论已固化:feedback_ucx_tls_positive_list(7-03 修订:RoCE 绑定集群禁加
-    posix/cma;纯 loopback 维持 posix)+ perf-check skill UCX_TLS 段 +
-    project_ucx_zc_read_regression_readability(全 sweep 表)。
-  · PS 双监听代价分析(用户问):**PS 无需双监听** —— 病灶 hop 上 PS 是连接方,
-    传输选择在拨号侧;若未来真要,fd 成本低(TCP 侧)、真实成本在寻址/wire
-    (part_addrs 双地址 + GetRegions + 三个消费者适配)与端口空间×2。已记档。
+  · 新增 python/autumn_fsspec/ —— `autumn://` fsspec 文件系统
+    (AutumnFileSystem, AbstractFileSystem)。纯客户端适配器,建在既有 `autumn`
+    PyO3 KV SDK 上,无新 server wire、不绕 partition 数据面
+    ([[feedback_no_parallel_data_plane]] / [[feedback_client_side_complexity_first]])。
+    与 autumn-fuse(原生 mount)互补,作程序化文件面。
+  · On-KV 布局(_layout.py):manifest key `\x01+path` → 小 JSON
+    {t,s,cs,n,m};数据块 `\x02+path+\x00+u64(idx)` → 每块 8 MiB
+    (对齐 autumn-fuse MAX_EXTENT、ZC ≥64K、低于 64 MiB inline-put 上限
+    → 任意大小文件可存,尽管 SDK 只暴露 inline put)。隐式 s3fs 目录 +
+    显式空目录标记。读:多块 batch_get_into 进精确尺寸 buffer(块尺寸由
+    manifest 已知)。
+  · **关键坑(已修)**:autumn `range` 是 KEYS-ONLY 扫描
+    (rpc_handlers.rs range_scan_sst_merge 恒 `value: vec![]`),值永远空。
+    ls 原本从 range 值读 manifest → 真集群 JSONDecodeError。改为:ls 用
+    keys-only range 拿子键,再对直接子节点 manifest 做 pipelined 多 get;
+    info/cat_file 用 get 读 manifest。offline FakeKV 同步改成 range 返回空值,
+    离线用例遂走生产同一路径。
+  · 模型辅助(models.py):upload / materialize(拉到本地供 `vllm serve`)/
+    load_safetensors(bytes 逃生门)。streaming loader 原型(vllm_loader.py):
+    safetensors header 解析 + 逐 tensor ranged fetch(离线已测);vLLM
+    register_model_loader 接线为骨架(**GPU/vLLM 未验证** —— 无 GPU)。
+  · 研究交付:docs/model_loading.md —— fsspec 只喂 HF datasets,不喂
+    transformers/vLLM/SGLang 权重加载(后者要本地路径或专用 streaming loader)。
+    三条实用路径排序:A materialize-to-local(通用/零引擎码)、B FUSE mount +
+    强制 `eager`(躲 mmap-over-FUSE 30-50× 陷阱)、C 自定义 streaming loader
+    走 autumn ZC get_into(吞吐最高,原型)。含 vLLM --load-format 全景 + 来源引用。
 
-Main gaps / risks(后续可选,无阻塞):
-  1. posix 大消息为何坏未根解(UCX 包/内核/sglang uct 同租;6-25 曾好过)——
-     现已绕开,根查属 UCX 层专门课题。
-  2. no-shm 下 4K 写恢复(append 批量化调优)——仅 4K 写密集负载需要。
-  3. 基线重录策略(多租户+cpuset+新 TLS 三重口径变化)——需用户定。
+Verification(真集群 1-node TCP,manager 127.0.0.1:9001):
+  · 构建坑:装着的 `autumn` wheel 陈旧(wire [8,8] vs 集群 [10,10])→ maturin
+    重建 + pip 强装。EN 控制口 10101 撞 Ray → AUTUMN_EXTENT_BASE_PORT=20000
+    ([[project_local_perf_baselines_stale_multitenant]])。
+  · offline 19/19(FakeKV 镜像 keys-only range;含 HF datasets
+    save_to_disk/load_from_disk + load_dataset('json') 往返、safetensors
+    header planner)。
+  · live 9/9(0 B–5 MiB 分块往返含跨块 ranged read、ls/find/rm、覆盖写 reap
+    (3→1 chunk 真集群校验)、跨块 append、xb 独占创建、
+    **datasets 往返打真集群**)。递归 upload/materialize SHA 校验、
+    load_safetensors/iter_tensors 打真 safetensors blob —— smoke 全绿。
+  · 全量 33 passed(offline 24 + live 9)。
 
-补充(同日):UCX_TLS 配置已产品化 —— cluster.sh 按 bind 地址自动推导
-  (loopback→posix,cma,tcp,self;RoCE→rc_mlx5,ud_mlx5,tcp,self+NET_DEVICES pin,
-  显式 env 恒优先;do_start 与 load_cluster_config 两处调用覆盖子命令);
-  autumn-deploy 对 TRANSPORT=ucx 逐 host 推导并注入 systemd Environment=/
-  process env;topology.conf/README/docs/baremetal_deploy.md/docs/ops.md(fuse
-  runbook 的坏组合列表修正)/perf_check.sh(被证伪的 combined 建议改写)全部
-  对齐。验证:三例推导单测、unit 渲染含 Environment 行、validate.sh 绿、
-  零手工 env 的 RoCE ucx 集群子进程 /proc/environ 确认继承 + 8M 读 900 ops/s
-  (7.55GB/s)0 warn。
+coco findbugs(GPT-5.5)两条 P2 全修 + 补测(离线+真集群):
+  (1) xb/ab 写模式原被当普通覆盖 → ab 静默截断、xb 不查存在;改为 xb 抛
+      FileExistsError、ab 从现有 manifest 续写(回读末尾 partial chunk 保
+      uniform-chunk 不变式)。
+  (2) 覆盖写较小内容会遗留旧尾块(manifest 不再引用)→ 加
+      _reap_chunks(path, keep_n, old_n) 定点删 [keep_n, old_n)(pipe_file +
+      buffered writer 两路);coco 建议的 generation 前缀+原子切换更重方案
+      延后(KV put 单键原子;写中读对任何对象存储都是 last-writer-wins)。
+
+用户复审提问("和 fuse 能访问相同文件吗?")→ 发现并修 latent bug:
+  · fsspec 与 fuse 是同一集群的两扇独立门,NOT 同一批文件 —— fuse 按 inode
+    键控([0x03][ino][off]),fsspec 按 path 键控;互不可见(故意:纯客户端
+    不复刻 fuse 的 inode 分配 + lease 协调)。
+  · **但**初版 fsspec 用了 \x01/\x02 前缀,与 fuse 的 inode(0x01)/dirent(0x02)
+    **撞命名空间** —— 共享集群时 fsspec 根 ls(range \x01)会扫进所有 fuse
+    inode。改到保留 `fs/` 命名空间(fs/m/ manifest、fs/d/ chunk;比照 kvcache
+    `kvc/`、memory `doc/`)。真集群验证:注入 fuse 式 0x01/0x02/0x03 键,fsspec
+    ls('') 完全无视之,且 fuse 键原样存活 → 二者可安全共享一集群。
+  · 全量仍 33 passed(含 layout 前缀断言 + fuse 非碰撞断言更新)。
+
+Docs/账本已更新:docs/model_loading.md(新)、python/autumn_fsspec/README.md、
+  docs/ops.md(fsspec 验证段 + wire-mismatch/keys-only-range 提示)、README.md
+  (fsspec 面 + highlights)、feature_list.md(F-FSSPEC-1 passes:true)。
+
+Main gaps / risks(follow-up,无阻塞):
+  1. vLLM 自定义 streaming loader(Recipe C)是原型 —— torch/GPU/vLLM 接线未验证;
+     需 GPU 机验证后才能算 feature 完成。
+  2. 大文件整段 cat_file 会把该 range 全部载入 RAM(调用方决定范围);
+     buffered file 流式读按块,内存有界。极致吞吐走 Recipe C。
+  3. S3-compatible 网关(可解锁零改码的 runai_streamer)未做 —— 未来选项。
 
 Next steps:
-  (本任务闭环。可选:用 no-shm 配置重录 ucx 基线;4K 写调优;posix 根查。)
+  等用户 review 代码;通过后再 push(用户明确要求先不 push)。
+  可选:GPU 机验证 Recipe C streaming loader;补 S3 网关。
