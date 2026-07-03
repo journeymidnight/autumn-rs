@@ -1701,6 +1701,7 @@ impl ClusterClient {
         if n > 0 {
             let start =
                 (resp.extent_id ^ (resp.value_offset as u64) << 32) as usize % n;
+            let mut saw_timeout = false;
             for i in 0..n {
                 let addr = &resp.replica_addrs[(start + i) % n];
                 match autumn_stream::read_extent_value_direct(
@@ -1715,14 +1716,51 @@ impl ClusterClient {
                 {
                     Ok(v) => return Ok(Some(v)),
                     Err(e) => {
-                        tracing::debug!(
-                            extent_id = resp.extent_id,
-                            addr = %addr,
-                            error = %e,
-                            "F259 direct read failed; trying next replica"
-                        );
+                        // A TIMEOUT is a liveness anomaly (dead endpoint /
+                        // stuck peer) that silently costs the op the full RPC
+                        // deadline — surface it at warn (the 2026-07-03 UCX
+                        // dead-ep stalls were invisible precisely because this
+                        // arm was debug-only). Expected failover causes
+                        // (eversion bumped, extent GC'd, fast connect refusal)
+                        // stay at debug so routine EC/GC churn stays quiet.
+                        // "timed out" matches conn_pool's timeout message.
+                        let msg = format!("{e:#}");
+                        if msg.contains("timed out") {
+                            saw_timeout = true;
+                            tracing::warn!(
+                                extent_id = resp.extent_id,
+                                addr = %addr,
+                                error = %msg,
+                                "F259 direct read TIMED OUT; trying next replica"
+                            );
+                        } else {
+                            tracing::debug!(
+                                extent_id = resp.extent_id,
+                                addr = %addr,
+                                error = %msg,
+                                "F259 direct read failed; trying next replica"
+                            );
+                        }
                     }
                 }
+            }
+            // Fell out of the loop: every replica failed. The proxy fallback
+            // below hides that from the caller — leave a trace. Warn only when
+            // a liveness anomaly (timeout) was involved; an all-expected-errors
+            // sweep (eversion bump / EC conversion touching every replica) is
+            // routine and stays at debug (coco P3).
+            if saw_timeout {
+                tracing::warn!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "F259 direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
+                );
+            } else {
+                tracing::debug!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "F259 direct read failed on ALL replicas; falling back to PS proxy"
+                );
             }
         }
         // All replicas failed → proxy fallback re-resolves through the PS

@@ -3281,8 +3281,28 @@ impl StreamClient {
                     self.extent_info_cache.remove(&extent_id);
                     return Ok(None);
                 }
-                Err(_e) => {
+                Err(e) => {
                     // transport/timeout error → evict + try next replica.
+                    // Classify like the client-side direct read (F259): a
+                    // TIMEOUT means the op silently ate the full 3s deadline
+                    // (2026-07-03 UCX dead-ep stalls) — warn; fast transport
+                    // errors (connect refused mid-failover) stay debug.
+                    let msg = format!("{e:#}");
+                    if msg.contains("timed out") {
+                        tracing::warn!(
+                            extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "ZC proxy read TIMED OUT; evicting cache, trying next replica"
+                        );
+                    } else {
+                        tracing::debug!(
+                            extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "ZC proxy read failed; evicting cache, trying next replica"
+                        );
+                    }
                     self.extent_info_cache.remove(&extent_id);
                 }
             }
