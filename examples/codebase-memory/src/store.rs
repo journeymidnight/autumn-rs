@@ -175,6 +175,48 @@ impl Code {
             start = last;
             start.push(0);
         }
-        Ok(json!({"nodes": nodes, "links": links, "counts": counts}))
+
+        // Cap for the 3D viz — a force graph chokes on tens of thousands of
+        // edges. Keep the most-connected nodes (by degree) + edges among them,
+        // then a hard link cap. The legend still shows the full per-kind counts;
+        // `truncated`/`total_*` let the UI say "showing N of M".
+        const MAX_NODES: usize = 1500;
+        const MAX_LINKS: usize = 8000;
+        let total_nodes = nodes.len();
+        let total_links = links.len();
+        let mut truncated = false;
+        if nodes.len() > MAX_NODES {
+            truncated = true;
+            let mut deg: HashMap<String, usize> = HashMap::new();
+            for l in &links {
+                if let Some(s) = l["source"].as_str() {
+                    *deg.entry(s.to_string()).or_default() += 1;
+                }
+                if let Some(t) = l["target"].as_str() {
+                    *deg.entry(t.to_string()).or_default() += 1;
+                }
+            }
+            let keep: HashSet<String> = {
+                let mut ranked: Vec<(String, usize)> = nodes
+                    .iter()
+                    .filter_map(|nd| {
+                        nd["id"].as_str().map(|id| (id.to_string(), deg.get(id).copied().unwrap_or(0)))
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1));
+                ranked.into_iter().take(MAX_NODES).map(|(id, _)| id).collect()
+            };
+            nodes.retain(|nd| nd["id"].as_str().map(|id| keep.contains(id)).unwrap_or(false));
+            links.retain(|l| {
+                keep.contains(l["source"].as_str().unwrap_or(""))
+                    && keep.contains(l["target"].as_str().unwrap_or(""))
+            });
+        }
+        if links.len() > MAX_LINKS {
+            truncated = true;
+            links.truncate(MAX_LINKS);
+        }
+        Ok(json!({"nodes": nodes, "links": links, "counts": counts,
+                  "truncated": truncated, "total_nodes": total_nodes, "total_links": total_links}))
     }
 }

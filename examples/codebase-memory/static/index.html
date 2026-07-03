@@ -297,7 +297,7 @@ async function initGraph(){
   // measured size can lag; fall back to the viewport if it reads 0.
   const w = el.clientWidth || el.parentElement.clientWidth || window.innerWidth - 60;
   const h = el.clientHeight || Math.round(window.innerHeight * 0.7);
-  const big = data.nodes.length > 2500;
+  const big = data.nodes.length > 800;
   Graph = ForceGraph3D()(el)
     .width(w).height(h)
     .graphData(data)
@@ -318,7 +318,7 @@ async function initGraph(){
     .cooldownTicks(big ? 60 : 120)
     .onEngineStop(() => { if(Graph) Graph.zoomToFit(500, 50); })
     .onNodeClick(n => openSym(n.id));
-  if(big) $("legend").insertAdjacentHTML("beforeend", `<div class="k" style="cursor:default;margin-top:6px;color:var(--text-muted)">${data.nodes.length} nodes · narrow with --root for a snappier graph</div>`);
+  if(data.truncated) $("legend").insertAdjacentHTML("beforeend", `<div class="k" style="cursor:default;margin-top:6px;color:var(--text-muted)">showing ${data.nodes.length} of ${data.total_nodes} nodes (most-connected) · narrow with --root</div>`);
   addEventListener("resize", () => { if(Graph){ Graph.width(el.clientWidth); Graph.height(el.clientHeight); } });
 }
 function toggleKind(k){

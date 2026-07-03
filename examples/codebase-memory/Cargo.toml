@@ -20,12 +20,10 @@ serde_json = "1"
 # tree-sitter code parsing (Rust grammar — the example indexes autumn-rs itself).
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
-# Optional Model2Vec-style static int8 embedder (real semantics, no service).
-tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
 [features]
 default = []
-static-embed = ["dep:tokenizers"]
+static-embed = ["autumn-memory/static-embed"]
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
 //! Then open http://127.0.0.1:5100 .
 
-mod embed;
+use autumn_memory::embed;
 mod indexer;
 mod store;
 
@@ -200,6 +200,7 @@ struct Args {
     port: u16,
     no_index: bool,
     reset: bool,
+    reindex: bool,
     mcp: bool,
     embed_model: Option<String>,
     tokenizer: Option<String>,
@@ -243,6 +244,7 @@ fn parse_args() -> Args {
         port: LISTEN_PORT,
         no_index: false,
         reset: false,
+        reindex: false,
         mcp: false,
         embed_model: None,
         tokenizer: None,
@@ -257,6 +259,7 @@ fn parse_args() -> Args {
             "--port" => a.port = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.port),
             "--no-index" => a.no_index = true,
             "--reset" => a.reset = true,
+            "--reindex" => a.reindex = true,
             "--mcp" => a.mcp = true,
             "--embed-model" => a.embed_model = it.next(),
             "--tokenizer" => a.tokenizer = it.next(),
@@ -421,20 +424,36 @@ async fn main() -> Result<()> {
         tracing::info!("reset: deleted {removed} keys under mem/{}/{}/", args.tenant, args.agent);
     }
 
-    let mut files = 0;
-    let mut symbols = 0;
-    let mut edges = 0;
-    if !args.no_index {
+    // Index only when needed. --reset always rebuilds; otherwise, if the agent
+    // already holds symbols we serve the EXISTING index (re-indexing the whole
+    // tree on every startup is slow + pointless). Pass --reindex to force it.
+    let existing = code.stats().await.ok();
+    let already = existing
+        .as_ref()
+        .and_then(|s| s.get("symbols"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut files = 0usize;
+    let mut symbols = 0u64;
+    let mut edges = 0u64;
+    if !args.no_index && (args.reset || args.reindex || already == 0) {
         tracing::info!("indexing {} ...", root.display());
         let (f, s, e) = indexer::index_path(&store, &emb, &root).await?;
         files = f;
-        symbols = s;
-        edges = e;
-        if symbols > 0 {
-            let nlist = (symbols / 20).clamp(1, 64);
-            store.train_centroids(nlist, 25, 7).await?;
+        symbols = s as u64;
+        edges = e as u64;
+        if s > 0 {
+            store.train_centroids((s / 20).clamp(1, 64), 25, 7).await?;
         }
         tracing::info!("indexed {symbols} symbols, {edges} edges from {files} files");
+    } else if already > 0 {
+        symbols = already;
+        edges = existing
+            .as_ref()
+            .and_then(|s| s.get("edges"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        tracing::info!("agent already indexed ({symbols} symbols) — serving it; --reindex to rebuild");
     }
 
     let cfg = json!({
