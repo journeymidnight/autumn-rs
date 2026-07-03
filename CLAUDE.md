@@ -214,8 +214,13 @@ manager's grantor-side state keeps its own `version` field
 
 The extent layer uses a **min-replica consensus** commit protocol instead of a WAL:
 
-1. Before each append, `StreamClient` queries `commit_length` on **all replicas**, takes the **minimum**.
-2. This minimum is sent as `header.commit` in the append request.
+1. `StreamClient` tracks the committed length **locally** (`StreamAppendState.commit`,
+   a plain `u32` updated to `end` on each all-replica ACK — Go's `sc.end` pattern).
+   Each append's `header.commit` is this local lease-time cursor; there is **NO
+   `commit_length` RPC in the hot append path** (stream crate Programming Note 9).
+   The `commit_length`-on-all-replicas round trip (`current_commit`) runs **only**
+   at partition open / tail init and at failover seal — never per append.
+2. `header.commit` (the local cursor) is sent in the append request.
 3. Each `ExtentNode`, on receiving an append, truncates its data file back to `header.commit` if it was ahead — rolling back divergent speculative writes.
 
 This means the data files themselves serve as the journal; no separate WAL file exists in the stream layer.
