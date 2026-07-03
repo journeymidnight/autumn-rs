@@ -105,6 +105,25 @@ streams-guarded `autumn-op bootstrap` → PS → wait a partition is served.** T
 bootstrap guard makes `start` idempotent: on an already-bootstrapped cluster it
 skips bootstrap and preserves data, so `stop` + `start` is a safe restart.
 
+## UCX (TRANSPORT=ucx)
+
+autumn-deploy injects the UCX env into every unit/process automatically
+(explicit `UCX_TLS` / `UCX_NET_DEVICES` in the topology always win):
+
+| host kind | UCX_TLS default | UCX_NET_DEVICES |
+|---|---|---|
+| real IP (RoCE-bound) | `rc_mlx5,ud_mlx5,tcp,self` | `mlx5_1:1` — pin a **non-GPU** NIC for your fleet |
+| loopback (dev) | `posix,cma,tcp,self` | — |
+
+Rules (2026-07-03): POSITIVE lists only (never `^` negation). On a RoCE-bound
+cluster **never add `posix`/`cma`** — the posix shm large-message path stalls
+concurrent ≥64 KiB transfers (3 s timeout storms on reads, apparent write
+wedges); a single rc list serves both intra-host (rc loopback) and cross-host
+traffic. Trade-off: without posix, small (4 KiB) writes are slower than the
+posix era while ≥64 KiB reads gain 4-9× — large-value workloads (kvcache /
+fuse) always want the rc list. Loopback UCX 8 MiB is known-broken either way
+(dev-only, not representative).
+
 ## systemd notes
 
 Rendered units live at `/etc/systemd/system/autumn-<inst>.service` (e.g.

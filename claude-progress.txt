@@ -35,5 +35,15 @@ Main gaps / risks(后续可选,无阻塞):
   2. no-shm 下 4K 写恢复(append 批量化调优)——仅 4K 写密集负载需要。
   3. 基线重录策略(多租户+cpuset+新 TLS 三重口径变化)——需用户定。
 
+补充(同日):UCX_TLS 配置已产品化 —— cluster.sh 按 bind 地址自动推导
+  (loopback→posix,cma,tcp,self;RoCE→rc_mlx5,ud_mlx5,tcp,self+NET_DEVICES pin,
+  显式 env 恒优先;do_start 与 load_cluster_config 两处调用覆盖子命令);
+  autumn-deploy 对 TRANSPORT=ucx 逐 host 推导并注入 systemd Environment=/
+  process env;topology.conf/README/docs/baremetal_deploy.md/docs/ops.md(fuse
+  runbook 的坏组合列表修正)/perf_check.sh(被证伪的 combined 建议改写)全部
+  对齐。验证:三例推导单测、unit 渲染含 Environment 行、validate.sh 绿、
+  零手工 env 的 RoCE ucx 集群子进程 /proc/environ 确认继承 + 8M 读 900 ops/s
+  (7.55GB/s)0 warn。
+
 Next steps:
   (本任务闭环。可选:用 no-shm 配置重录 ucx 基线;4K 写调优;posix 根查。)

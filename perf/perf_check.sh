@@ -102,11 +102,13 @@ ulimit -l unlimited 2>/dev/null || true
 #       vs 8.3K write with shm disabled.
 #     - no IB transports -> worker creation skips all 10 RoCE devices
 #       (cheap creation; high client thread counts stay viable).
-#   cross-host RoCE: posix,cma,rc_mlx5,ud_mlx5,tcp,self
-#     - UCX auto-picks shm intra-host / RDMA cross-host per peer.
-#     - MUST also pin UCX_NET_DEVICES=mlx5_1:1 on both ends (10-device
-#       auto-select hangs) — and that pin breaks loopback (kills
-#       tcp-over-lo), which is why one universal config does not exist.
+#   RoCE-bound cluster: rc_mlx5,ud_mlx5,tcp,self — NEVER add posix/cma
+#     (2026-07-03 sweep: the posix large-message path stalls concurrent
+#     >=64K transfers — 3s timeout storms / apparent write wedges; one rc
+#     list serves BOTH intra-host (rc loopback, 8M read 8 GB/s) and
+#     cross-host traffic. The earlier "combined posix,cma,rc..." advice is
+#     REFUTED.) MUST pin UCX_NET_DEVICES on both ends (auto-select hangs);
+#     cluster.sh now derives these defaults from the bind address.
 : "${UCX_TLS:=posix,cma,tcp,self}"
 export UCX_TLS
 

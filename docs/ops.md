@@ -73,10 +73,20 @@ UCX C library reads it directly): a positive `UCX_TLS` list — never `^` negati
 and a pinned RoCE device, e.g.
 
 ```bash
-export UCX_TLS=rc_mlx5,ud_mlx5,posix,cma,tcp,self
+export UCX_TLS=rc_mlx5,ud_mlx5,tcp,self       # NEVER add posix/cma (2026-07-03: the posix
+                                              # large-message path stalls concurrent >=64K
+                                              # transfers — 3s timeout storms)
 export UCX_NET_DEVICES=mlx5_1:1               # verify: scripts/check_roce.sh --listen-candidates
 ulimit -l unlimited                           # ibv_reg_mr pins registered buffers
 ```
+
+UCX_TLS rule of thumb: **RoCE-bound cluster (bind to a NIC IP) →
+`rc_mlx5,ud_mlx5,tcp,self`** — one list serves both intra-host (rc loopback)
+and cross-host traffic; **pure-loopback dev cluster (127.0.0.1) →
+`posix,cma,tcp,self`** (no RoCE GID on lo; loopback UCX 8M is known-broken and
+not representative). `cluster.sh` and `deploy/baremetal/autumn-deploy` now
+apply these defaults automatically when `TRANSPORT=ucx` (explicit
+`UCX_TLS`/`UCX_NET_DEVICES` env always wins).
 
 **In Kubernetes**, run autumn-fuse as a privileged per-node DaemonSet (mounts
 `/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app

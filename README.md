@@ -148,6 +148,11 @@ recall needs no embedder at all. Design:
 | `cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
 
 UCX (RDMA) builds are opt-in: `cargo build --release -p autumn-server --features ucx`.
+With `TRANSPORT=ucx`, the launchers (`autumn-deploy`, `cluster.sh`) set the UCX env
+automatically — RoCE-bound hosts get `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` plus a pinned
+`UCX_NET_DEVICES` (one list serves intra-host and cross-host; **never add `posix`/`cma`**
+— the posix shm path stalls concurrent ≥64 KiB transfers), loopback dev clusters get
+`posix,cma,tcp,self`. Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
 
 ## Documentation
 

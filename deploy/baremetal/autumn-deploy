@@ -184,12 +184,37 @@ write_unit() {
     fi
 }
 
+# UCX env for one instance host (TRANSPORT=ucx only; the UCX C library reads
+# UCX_* from the process env — this launcher is the right layer). POSITIVE
+# lists only. Rule (2026-07-03, see docs/baremetal_deploy.md):
+#   loopback host  → posix,cma,tcp,self   (no RoCE GID on lo; posix carries
+#                                          small appends; 8M UCX known-broken)
+#   real-IP host   → rc_mlx5,ud_mlx5,tcp,self + pinned UCX_NET_DEVICES —
+#     ONE list serves both intra-host (rc loopback) and cross-host traffic.
+#     NEVER add posix/cma: the posix large-message path stalls concurrent
+#     ≥64K transfers (3 s timeout storms / apparent write wedges).
+# Topology may override via UCX_TLS / UCX_NET_DEVICES.
+ucx_env_for_host() {
+    local host="$1"
+    [[ "$TRANSPORT" == "ucx" ]] || { echo ""; return; }
+    local ph; ph="$(plain_host "$host")"
+    local tls dev=""
+    if [[ "$ph" == "127.0.0.1" || "$ph" == "::1" || "$ph" == "localhost" ]]; then
+        tls="${UCX_TLS:-posix,cma,tcp,self}"
+    else
+        tls="${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self}"
+        dev="${UCX_NET_DEVICES:-mlx5_1:1}"
+    fi
+    echo "UCX_TLS=$tls${dev:+ UCX_NET_DEVICES=$dev}"
+}
+
 # Render + start one service instance.
 #   svc_start <host> <inst> <workdir> <bin> <arg>...
 svc_start() {
     local host="$1" inst="$2" workdir="$3" bin="$4"; shift 4
     local backend; backend="$(host_backend "$host")"
     local -a argv=("$bin" "$@")
+    local ucx_env; ucx_env="$(ucx_env_for_host "$host")"
     if [[ "$backend" == "systemd" ]]; then
         # systemd parses ExecStart with ITS OWN rules, not a shell. Do NOT
         # shell-quote: printf %q escapes the comma in a manager list to "\,",
@@ -207,7 +232,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${workdir}
-ExecStart=${q}
+${ucx_env:+Environment=${ucx_env}
+}ExecStart=${q}
 Restart=on-failure
 RestartSec=2
 # RDMA (UCX) pins registered buffers via ibv_reg_mr against RLIMIT_MEMLOCK;
@@ -246,7 +272,7 @@ UNIT
                 fi
             fi
             mkdir -p '$DATA_ROOT/pids' '$DATA_ROOT/logs' '$workdir'
-            cd '$workdir'; nohup $q >'$logf' 2>&1 & echo \$! > '$pidf'")"
+            cd '$workdir'; nohup ${ucx_env:+env $ucx_env }$q >'$logf' 2>&1 & echo \$! > '$pidf'")"
         if [[ "$out" == *__RUNNING__* ]]; then
             die "$inst already running on $host (pid ${out##*__RUNNING__ }); 'stop' or 'restart' first"
         fi

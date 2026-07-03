@@ -48,6 +48,37 @@ case "$TRANSPORT" in
     *) echo "AUTUMN_TRANSPORT must be 'tcp' or 'ucx', got '$TRANSPORT'" >&2; exit 2 ;;
 esac
 unset AUTUMN_TRANSPORT  # don't leak to child processes
+
+# UCX env defaults (2026-07-03; the UCX C library reads UCX_* directly, so the
+# launcher is the right layer — binaries stay env-free). POSITIVE lists only
+# (never `^` negation). The split is by BIND ADDRESS, not intra-vs-cross-host:
+#   - loopback bind (127.0.0.1/::1): no RoCE GID on lo → rc_mlx5 unusable;
+#     posix shm must carry PS→EN appends (69K vs 8.3K write without it).
+#     Loopback UCX 8M stays known-broken (posix large-message stall) — dev only.
+#   - RoCE-bound (any real IP): ONE list serves BOTH intra-host (rc loopback,
+#     8M read 8 GB/s, zero stalls) and cross-host (rc_mlx5) traffic.
+#     Do NOT add posix/cma — the posix large-message path stalls concurrent
+#     ≥64K transfers on the PS→EN hop (3 s timeout storms, apparent write
+#     wedges; rndv/zcopy knobs don't help). Trade-off: 4K write drops vs the
+#     posix era (~72K→14K) while 8M read gains 4-9× — pick posix back ONLY
+#     for a small-write-dominated bench, explicitly, knowing 8M breaks.
+#     NET_DEVICES must be pinned (10-device auto-select hangs); mlx5_1:1 is
+#     this box's bench convention — production should pin a NON-GPU NIC.
+# Callers' explicit UCX_TLS / UCX_NET_DEVICES always win.
+apply_ucx_env_defaults() {
+    [[ "$TRANSPORT" == "ucx" ]] || return 0
+    local plain="${BIND_HOST//[\[\]]/}"
+    if [[ "$plain" == "127.0.0.1" || "$plain" == "::1" || "$plain" == "localhost" ]]; then
+        export UCX_TLS="${UCX_TLS:-posix,cma,tcp,self}"
+    else
+        export UCX_TLS="${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self}"
+        export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_1:1}"
+    fi
+    echo "[cluster] ucx env: UCX_TLS=$UCX_TLS${UCX_NET_DEVICES:+ UCX_NET_DEVICES=$UCX_NET_DEVICES}"
+}
+# Invoked from do_start and load_cluster_config (NOT here) so it always sees
+# the FINAL BIND_HOST — including the one re-derived from the saved config by
+# per-process subcommands (start-ps / start-node after a RoCE start).
 # F220: base port for the PS per-partition listeners (F099-K binds
 # PS_BASE_PORT + ordinal). Kept clear of the extent-node shard port grid
 # (9100+i + s*SHARD_STRIDE, climbs to ~9253 at 16 shards) so partition
@@ -674,6 +705,7 @@ load_cluster_config() {
     PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
     compute_shard_config
     compute_affinity_decision
+    apply_ucx_env_defaults
 }
 
 # ---------------------------------------------------------------------------
@@ -686,6 +718,7 @@ do_start() {
     # `start` / `restart` pass 0 and MUST NEVER clean etcd (data-safety).
     local fresh="${2:-0}"
     [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas >= 1 )) || die "replicas must be a positive integer"
+    apply_ucx_env_defaults
 
     # Stop any leftover processes from a previous run to avoid port conflicts
     do_stop
