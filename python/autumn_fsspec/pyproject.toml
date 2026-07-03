@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autumn-fsspec"
+version = "0.1.0"
+description = "fsspec filesystem (autumn://) for models, datasets and checkpoints on autumn-rs"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "autumn-rs contributors" }]
+dependencies = [
+  "fsspec>=2023.1.0",
+  # The autumn PyO3 extension. Install via `cd python && maturin develop`
+  # or `pip install autumn` once published. Intentionally NOT pinned — this
+  # adapter tracks whatever local autumn build is on PYTHONPATH.
+  # "autumn",
+]
+
+[project.optional-dependencies]
+datasets = ["datasets>=2.0.0"]
+hf = ["huggingface_hub>=0.20.0"]
+
+# Lets fsspec discover the protocol without importing autumn_fsspec first.
+[project.entry-points."fsspec.specs"]
+autumn = "autumn_fsspec:AutumnFileSystem"
+
+[tool.setuptools.packages.find]
+include = ["autumn_fsspec*"]
+exclude = ["tests*"]

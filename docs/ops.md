@@ -93,6 +93,46 @@ loopback chaos harnesses set it themselves). Explicit env always wins.
 `/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
 nodes, separate from the storage StatefulSets.
 
+## Python fsspec (`autumn://`) verification
+
+`python/autumn_fsspec` is a pure-client fsspec filesystem (chunked large-file
+layout on the KV data plane; complements `autumn-fuse`). It needs the `autumn`
+PyO3 SDK built **from the cluster's commit** — a wheel older than the cluster
+fails connect with `wire-version mismatch` (rebuild: `cd python && maturin build
+--release && pip install --force-reinstall --no-deps target/wheels/autumn-*.whl`).
+
+```bash
+# Offline (no cluster) — full FS surface + a HuggingFace datasets round-trip,
+# over an in-memory fake KV that mirrors the real keys-only `range` contract:
+cd python/autumn_fsspec
+python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py \
+                 tests/test_vllm_loader_offline.py -q
+#   → 19 passed
+
+# Live — against a running cluster (real `autumn` client). Confirms the real
+# range/batch_get_into semantics match the adapter's assumptions:
+AUTUMN_MANAGER=127.0.0.1:9001 python -m pytest tests/test_e2e_cluster.py -q
+#   → 8 passed (0 B–5 MiB chunk round-trips, ls/find/rm, datasets save/load)
+```
+
+Gotcha: autumn's `range` is a **keys-only** scan (never ships values), so
+listing fetches child manifests with a pipelined multi-`get`; `info`/`cat_file`
+read the manifest via `get`. If a `range` value ever looks non-empty in a new
+build, the listing path's assumptions changed — re-check `ls`.
+
+Model loading (materialize-to-local / FUSE-`eager` / streaming loader):
+[`docs/model_loading.md`](model_loading.md).
+
+Chaos (fsspec interface under failover — PS kill→migration, manager
+kill→respawn, final byte-exact verify + write-liveness probe; timeouts are
+dropped as UNCERTAIN, never counted as loss):
+
+```bash
+cargo build --release --workspace       # cluster.sh runs release binaries
+AUTUMN_DATA_ROOT=/data05/autumn-rs bash scripts/fsspec_chaos.sh
+#   → "=== FSSPEC CHAOS PASS ===" (MISMATCH/VERIFY-FAIL lines = corruption = FAIL)
+```
+
 ## Cluster capacity — `autumn-op df`
 
 Ceph-`ceph df`-style aggregate capacity. RAW + autumn `physical_used` are summed
