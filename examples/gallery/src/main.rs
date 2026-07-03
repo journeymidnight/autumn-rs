@@ -104,23 +104,36 @@ const LISTEN_PORT: u16 = 5001;
 // source video to a temp file before transcoding.
 const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
+// Root key namespace for ALL of this example's keys. A shared cluster hosts
+// other apps too (autumn-memory under `mem/`, kvcache under `kvc/`, …), so every
+// gallery key — inline files, the striped-video meta blob, thumbnails, HLS,
+// per-file meta — lives under this prefix, and the two whole-store scans (file
+// list + startup recovery) are scoped to it instead of walking the whole
+// keyspace (which would stall once another app has written many keys).
+const ROOT: &str = "gallery/";
+
 // First two bytes of `autumn_client`'s striped-value chunk namespace (the SDK
 // keys each stripe under `\xff\xfe…` so chunks sort AFTER every normal user
-// key — see F186 in the client crate). A full `range("", "", MAX)` scan sees
-// these internal keys, so the gallery's whole-store scans (file list +
-// startup recovery) must skip them; they are not user-visible files.
+// key — see F186 in the client crate). They fall OUTSIDE the `gallery/` scan
+// range, so the scoped scans never see them; the guard is kept as belt-and-
+// suspenders.
 const CHUNK_NS_PREFIX: &[u8] = b"\xff\xfe";
 
 fn is_chunk_key(key: &[u8]) -> bool {
     key.starts_with(CHUNK_NS_PREFIX)
 }
 
+/// Key for an inline file / the striped-video meta blob (the logical `<name>`).
+fn file_key(name: &str) -> String {
+    format!("{ROOT}{name}")
+}
+
 fn thumb_key(name: &str) -> String {
-    format!("{THUMB_PREFIX}{THUMB_WIDTH}/{name}")
+    format!("{ROOT}{THUMB_PREFIX}{THUMB_WIDTH}/{name}")
 }
 
 fn meta_prefix(name: &str) -> String {
-    format!("{META_PREFIX}{name}/")
+    format!("{ROOT}{META_PREFIX}{name}/")
 }
 
 /// Read image dimensions from the header only (`into_dimensions`, no full
@@ -211,7 +224,7 @@ async fn write_file_meta(client: &Client, name: &str, data: &[u8]) {
 ///
 /// No `uploaded_at`/`transcoded_at` — the original times are unknown.
 async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static str, String)>> {
-    let head = client.head(name.as_bytes()).await.ok()?;
+    let head = client.head(file_key(name).as_bytes()).await.ok()?;
     if head.found {
         let mut fields = vec![
             ("name", name.to_string()),
@@ -225,7 +238,7 @@ async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static
             ),
         ];
         if is_image_ext(&ext_of(name)) {
-            if let Ok(Some(data)) = client.get(name.as_bytes()).await {
+            if let Ok(Some(data)) = client.get(file_key(name).as_bytes()).await {
                 if let Some((w, h)) = image_dims(&data) {
                     fields.push(("width", w.to_string()));
                     fields.push(("height", h.to_string()));
@@ -276,11 +289,11 @@ async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static
 }
 
 fn hls_dir_prefix(name: &str) -> String {
-    format!("{HLS_PREFIX}{name}/")
+    format!("{ROOT}{HLS_PREFIX}{name}/")
 }
 
 fn hls_key(name: &str, file: &str) -> String {
-    format!("{HLS_PREFIX}{name}/{file}")
+    format!("{ROOT}{HLS_PREFIX}{name}/{file}")
 }
 
 fn hls_playlist_key(name: &str) -> String {
@@ -693,7 +706,7 @@ async fn download_to_file(client: &Client, key: &str, dest: &std::path::Path) ->
     use std::io::Write;
 
     let mut stream = client
-        .get_stream(key.as_bytes(), RANGE_CHUNK_BYTES)
+        .get_stream(file_key(key).as_bytes(), RANGE_CHUNK_BYTES)
         .await
         .context("get_stream for download")?
         .ok_or_else(|| anyhow!("key not found: {key}"))?;
@@ -837,7 +850,7 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     // Drop the original; non-fatal if it's already gone (concurrent delete).
     // `delete_stream` cascades through the striped chunks + meta blob (a plain
     // `delete` would only remove the meta, orphaning the chunk-namespace keys).
-    match client.delete_stream(name.as_bytes()).await {
+    match client.delete_stream(file_key(&name).as_bytes()).await {
         Ok(_) | Err(AutumnError::NotFound) => {}
         Err(e) => {
             tracing::warn!("delete original {name} failed: {e}");
@@ -864,7 +877,7 @@ fn spawn_transcode(name: String, client: Client, map: TranscodeMap) {
 /// playlist yet) and re-enqueue them. Best-effort — a failure here only
 /// delays one file's transcode until the next manual re-upload.
 async fn recover_pending_transcodes(client: Client, map: TranscodeMap) {
-    let scan = match client.range(b"", b"", u32::MAX).await {
+    let scan = match client.range(ROOT.as_bytes(), b"", u32::MAX).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("startup scan: {e}");
@@ -874,12 +887,17 @@ async fn recover_pending_transcodes(client: Client, map: TranscodeMap) {
     let mut originals = Vec::new();
     let mut hls_playlists = std::collections::HashSet::new();
     for entry in scan.entries {
-        // Skip striped-value chunk keys (internal to the SDK); the meta blob
-        // at the logical `<name>` key is what we re-enqueue from.
+        // Scoped to `gallery/`; strip the root to recover the logical key
+        // (chunk keys sort outside this range, so the guard rarely fires).
         if is_chunk_key(&entry.key) {
             continue;
         }
-        let key = String::from_utf8_lossy(&entry.key).to_string();
+        let Some(key) = String::from_utf8_lossy(&entry.key)
+            .strip_prefix(ROOT)
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
         if let Some(rest) = key.strip_prefix(HLS_PREFIX) {
             if let Some((name, file)) = rest.rsplit_once('/') {
                 if file == "index.m3u8" {
@@ -958,7 +976,7 @@ async fn stream_upload(
     field: &mut axum::extract::multipart::Field<'_>,
 ) -> Result<u64> {
     let chunk_size = STRIPE_CHUNK_SIZE as usize;
-    let mut handle = client.put_stream_begin(name.as_bytes(), 0);
+    let mut handle = client.put_stream_begin(file_key(name).as_bytes(), 0);
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size);
     let mut kv_ms = 0.0_f64;
 
@@ -1039,7 +1057,7 @@ async fn put_handler_inner(
             // old tail chunks, and stale HLS/thumb would shadow the new
             // transcode. `delete_stream` cascades through any prior chunks.
             cleanup_derived(client, &filename).await;
-            if let Err(e) = client.delete_stream(filename.as_bytes()).await {
+            if let Err(e) = client.delete_stream(file_key(&filename).as_bytes()).await {
                 if !matches!(e, AutumnError::NotFound) {
                     tracing::warn!("clear prior original {filename} failed: {e}");
                 }
@@ -1070,7 +1088,7 @@ async fn put_handler_inner(
         };
         let bytes = data.len() as u64;
         let t0 = Instant::now();
-        let put_res = client.put(filename.as_bytes(), &data).await;
+        let put_res = client.put(file_key(&filename).as_bytes(), &data).await;
         let dt = elapsed_ms(t0);
         if let Err(e) = put_res {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {e}"));
@@ -1155,7 +1173,7 @@ fn stream_kv_range(
             let take = remaining.min(RANGE_CHUNK_BYTES as u64) as u32;
             let t0 = Instant::now();
             let res = client
-                .get_range(name.as_bytes(), off as u32, take)
+                .get_range(file_key(&name).as_bytes(), off as u32, take)
                 .await;
             let dt = elapsed_ms(t0);
             match res {
@@ -1199,7 +1217,7 @@ async fn get_handler_inner(
     // range, and emit a correct `Content-Range` total (Safari rejects
     // `bytes X-Y/*`, see the existing comment retained from the previous
     // implementation).
-    let total_size: u64 = match client.head(name.as_bytes()).await {
+    let total_size: u64 = match client.head(file_key(&name).as_bytes()).await {
         Ok(meta) if meta.found => meta.value_length,
         Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
@@ -1267,7 +1285,7 @@ async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {
     // Try the original first; either way, then sweep derived artifacts.
     // `delete_stream` cascades through the striped chunks (video originals)
     // and falls back to a plain delete for inline values (images/PDFs/text).
-    let original = client.delete_stream(name.as_bytes()).await;
+    let original = client.delete_stream(file_key(&name).as_bytes()).await;
     cleanup_derived(client, &name).await;
     match original {
         Ok(()) => ok_response("OK"),
@@ -1289,16 +1307,21 @@ async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {
 }
 
 async fn list_handler_inner(client: &Client) -> Response<Body> {
-    match client.range(b"", b"", u32::MAX).await {
+    match client.range(ROOT.as_bytes(), b"", u32::MAX).await {
         Ok(result) => {
             let mut seen = std::collections::HashSet::new();
             let mut keys: Vec<String> = Vec::new();
             for e in &result.entries {
-                // Skip striped-value chunk keys (internal to the SDK).
+                // Scoped to `gallery/`; strip the root to recover the logical key.
                 if is_chunk_key(&e.key) {
                     continue;
                 }
-                let s = String::from_utf8_lossy(&e.key).to_string();
+                let Some(s) = String::from_utf8_lossy(&e.key)
+                    .strip_prefix(ROOT)
+                    .map(|x| x.to_string())
+                else {
+                    continue;
+                };
                 if let Some(rest) = s.strip_prefix(HLS_PREFIX) {
                     // Surface video logical names from .hls/<name>/index.m3u8.
                     if let Some((name, file)) = rest.rsplit_once('/') {
@@ -1466,7 +1489,7 @@ async fn transcode_status_handler_inner(
             // upload — caller should poll while we treat it as queued (the
             // startup-recovery path will pick it up; for newly-arrived single
             // requests we don't auto-spawn here to avoid a per-poll race).
-            let head = client.head(name.as_bytes()).await;
+            let head = client.head(file_key(&name).as_bytes()).await;
             match head {
                 Ok(m) if m.found => json_response(TranscodeStatus::Queued.to_json()),
                 _ => error_response(StatusCode::NOT_FOUND, "unknown".into()),
@@ -1486,7 +1509,7 @@ async fn thumb_handler_inner(
     // SVG: no point rasterizing — just serve the original bytes.
     if is_svg_ext(&ext) {
         let t0 = Instant::now();
-        let res = client.get(name.as_bytes()).await;
+        let res = client.get(file_key(&name).as_bytes()).await;
         let dt = elapsed_ms(t0);
         return match res {
             Ok(Some(v)) => {
@@ -1554,7 +1577,7 @@ async fn thumb_handler_inner(
         // Image path still loads the full original — image decoders aren't
         // range-friendly and these payloads are small anyway.
         let t0 = Instant::now();
-        let orig_res = client.get(name.as_bytes()).await;
+        let orig_res = client.get(file_key(&name).as_bytes()).await;
         let dt = elapsed_ms(t0);
         let original = match orig_res {
             Ok(Some(v)) => {
