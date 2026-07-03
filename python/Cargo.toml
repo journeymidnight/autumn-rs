@@ -17,7 +17,6 @@ pyo3 = { version = "0.24", features = ["extension-module"] }
 autumn-client = { path = "../crates/client" }
 autumn-rpc = { path = "../crates/rpc" }
 autumn-transport = { path = "../crates/transport" }
-autumn-memory = { path = "../crates/autumn-memory" }
 # F-FS-UNIFY M2: the fuser-FREE filesystem core (meta/dir/extent/read/write/
 # state) behind the `autumn.Fs` PyO3 binding. `default-features = false` keeps
 # `fuser`/`clap`/kernel-mount machinery out of the wheel — only the shared

@@ -17,7 +17,7 @@ AI-facing surface is a thin client on that single data plane:
    │  autumn-fuse   │   │   autumn-kvcache     │   │      autumn-memory      │
    │  POSIX mount   │   │ sglang / vLLM        │   │ episodic + facts +      │
    │                │   │ HiCache L3 backend   │   │ BM25/vector/hybrid      │
-   └───────┬────────┘   └──────────┬───────────┘   │ MCP·LangGraph·Hermes    │
+   └───────┬────────┘   └──────────┬───────────┘   │ web UI + MCP (examples) │
            │                       │               └───────────┬─────────────┘
            │        ┌──────────────┘                           │
            ▼        ▼                                          ▼
@@ -44,11 +44,11 @@ self-healing extents.
   **HiCache L3** storage-backend API (pure Python adapter, no extra daemon);
   verified end-to-end against real models with correct cross-instance
   prefix-cache hits.
-- **Agent memory** — `autumn-memory`: episodic logs, fact store (LangGraph
-  `BaseStore` model), and retrieval that combines **BM25** (CJK-aware), **IVF
-  vector search**, and **hybrid RRF** — entirely client-side on plain KV. Ships
-  as a stdio **MCP server** (works with any MCP host), a **LangGraph** store,
-  and a **Hermes** memory plugin; recall P99 ≈ 25 ms on the agent turn loop.
+- **Agent memory** — `autumn-memory`: episodic logs, a fact store, an
+  associative graph, and retrieval that combines **BM25** (CJK-aware), **IVF
+  vector search**, and **hybrid RRF** — entirely client-side on plain KV. Two
+  Rust example apps (web UI + **MCP** `--mcp` stdio) sit on it — `codebase-memory`
+  and `memory-browser`; recall P99 ≈ 25 ms on the agent turn loop.
 
 **The engine underneath:**
 - **Fast by construction** — thread-per-core on io_uring (compio), custom binary
@@ -144,19 +144,24 @@ caches survive restarts and are shared across inference instances. Setup +
 design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
 [`docs/hicache_l3_interface.md`](docs/hicache_l3_interface.md).
 
-### Agent memory — MCP / LangGraph / Hermes
+### Agent memory — web UI + MCP
+
+Two Rust example apps sit on `autumn-memory` (an Axum web UI + an MCP `--mcp`
+stdio mode, so any MCP host — Claude Code/Desktop, Cursor — gets the same tools):
+
+- **`examples/codebase-memory`** — index a codebase (autumn-rs itself) and search
+  it (lexical / vector / hybrid) with a call graph you can walk.
+- **`examples/memory-browser`** — general agent memory: remembered notes, facts
+  (with TTL), an episodic timeline, and an associative graph of linked memories.
 
 ```bash
-# Any MCP host (Claude Desktop / Cursor / ChatGPT dev mode) — one stdio server:
-AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
-  python -m autumn_memory_mcp
-# add an OpenAI-compatible /embeddings endpoint for semantic + hybrid recall:
-#   AUTUMN_MEMORY_EMBED_URL=http://127.0.0.1:30000/v1 AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3
+cargo run -p memory-browser -- 127.0.0.1:9001        # web UI at :5200
+claude mcp add memory -- cargo run -q -p memory-browser -- 127.0.0.1:9001 --mcp
 ```
 
-LangGraph agents use `python/autumn_memory_langgraph` (a `BaseStore`); Hermes
-agents drop `python/hermes_memory_autumn` into their plugins dir. Lexical (BM25)
-recall needs no embedder at all. Design:
+Lexical (BM25) recall needs no embedder; vector/hybrid take a caller-supplied
+vector (the examples ship a zero-dep hash embedder + an optional Model2Vec
+static-int8 one). Design:
 [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md).
 
 ## Deployment

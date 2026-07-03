@@ -4,11 +4,12 @@
 
 Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
-The Rust crate is the reusable core; thin adapters sit ON it — a PyO3 binding
-(`autumn.Memory`) → the `autumn_memory.AutumnMemory` ergonomic layer → framework
-shells: a **stdio MCP server** (`python/autumn_memory_mcp`) and a **LangGraph
-`BaseStore`** (`python/autumn_memory_langgraph`); Hermes `MemoryProvider`
-planned. Design + rationale: `docs/autumn_memory_plan.md`.
+Consumers are Rust: two example apps use the crate directly (web UI + MCP) —
+`examples/codebase-memory` (index/search a codebase) and
+`examples/memory-browser` (general agent memory: search / facts / episodic /
+graph). The former Python ergonomic layer + `autumn.Memory` PyO3 binding were
+dropped (2026-07-03) once all consumers went Rust. Design + rationale:
+`docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
 — drive its async methods on a compio runtime.
@@ -22,6 +23,7 @@ planned. Design + rationale: `docs/autumn_memory_plan.md`.
 | **lexical recall (BM25-on-KV)** ✅ | `index_memory` / `delete_memory` / `search_lexical` / `get_memory` | `recall.rs` |
 | **vector recall (SPFresh-IVF-on-KV)** ✅ | `index_vector` / `train_centroids` / `search_vector` | `vector.rs` |
 | **hybrid (RRF)** ✅ | `search_hybrid` | `recall::rrf_fuse` |
+| **graph (adjacency-on-KV)** ✅ | `put_node` / `get_node` / `delete_node` / `add_edge` / `delete_edge` / `out_edges` / `in_edges` / `neighbors` / `nodes_by_kind` / `bfs` | `graph.rs` (codec) + `keys.rs` |
 
 Phase 1 is e2e-validated against a live cluster (`tests/e2e.rs` #[ignore] + the
 isolated-cluster harness `tests/run_e2e.sh`).
@@ -58,7 +60,22 @@ rkyv, …); the core never imposes one.
 mem/{tenant}/{agent}/ep/{session}/{12-byte suffix}   episodic
 mem/{tenant}/{agent}/fact/{namespace}/{key}          fact
 mem/{tenant}/shared/{namespace}/{key}                cross-agent shared
+mem/{tenant}/{agent}/node/{id}                       graph node (authoritative)
+mem/{tenant}/{agent}/nidx/{kind}/{id}                graph by-kind index (marker)
+mem/{tenant}/{agent}/edge/{src}/{type}/{dst}         forward edge (authoritative, attrs)
+mem/{tenant}/{agent}/redge/{dst}/{type}/{src}        reverse edge index (marker/hint)
 ```
+
+Graph families (`graph.rs` + `keys.rs`): a generic node/edge graph as
+**adjacency lists**, so every traversal is a prefix range-scan — `out_edges`
+scans `edge/{src}/`, `in_edges` scans `redge/{dst}/`, `bfs` chains them. All
+components are strings → `q()`-encoded + `/`-separated like the BM25 postings
+(no binary trick). The forward `edge/*` is authoritative; `redge/*` is a derived
+reverse-index hint validated against the forward edge at read time (same
+posting-vs-authoritative contract as BM25). `add_edge` writes `redge` (hint)
+then `edge` (commit); `delete_edge` removes `edge` then `redge`. Domain-agnostic
+(ids / edge-types opaque strings, attrs opaque bytes) — code-graph schema lives
+in the consumer.
 
 - Reserved `mem/` namespace separates these from fuse / kvcache / client keys.
 - Dynamic components are **percent-encoded** (`q`/`unq`) so a `/` inside a
@@ -103,6 +120,12 @@ An OFF-hot-path integrity audit + heal (the plan's per-phase acceptance tool):
   quality, not corruption; re-run `train_centroids` to heal). A `stale_bucket`
   check (decode every posting + recompute nearest) is a deliberate O(ids) →
   O(postings·k) follow-up, omitted to keep the audit cheap.
+- **Graph checks** (same read-only pass): counts `nodes` / `edges` / `redges`,
+  and cross-checks `dangling_edge` (fwd edge whose `src`/`dst` node record is
+  absent), `orphan_redge` (reverse marker with no fwd edge), `missing_redge`
+  (fwd edge with no reverse marker). `is_clean()` additionally requires all
+  three are 0. Cost is proportional to graph size only (empty scans for
+  non-graph agents), so it stays folded into the single `reconcile()`.
 - `repair_stats()`: rewrites `meta/stats` from a fresh `doc/` recount (no IVF
   scan). MUST run in a writer-quiesced maintenance window — it is itself a
   read-then-write with no CAS, so a concurrent write would be clobbered.

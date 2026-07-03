@@ -28,7 +28,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 mod fs;
-mod memory;
 
 // ── PyHandle: asyncio.Future bridge ─────────────────────────────────────────
 
@@ -1098,7 +1097,6 @@ impl BatchClient {
 fn autumn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<BatchClient>()?;
-    m.add_class::<memory::Memory>()?;
     m.add_class::<fs::Fs>()?;
     m.add_function(wrap_pyfunction!(set_transport, m)?)?;
     Ok(())
