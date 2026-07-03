@@ -107,6 +107,7 @@ spec:
         app.kubernetes.io/component: extent-node
     spec:
       terminationGracePeriodSeconds: 30
+      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
       # Spread ENs across nodes so replication-factor copies don't share a
       # failure domain. Preferred (not required) so a single-node dev cluster
       # (kind/minikube) still schedules all replicas. For production add a
@@ -129,12 +130,24 @@ spec:
           envFrom:
             - configMapRef: { name: autumn-config }
           env:
-            # Advertise this pod's own per-pod Service (name == pod name) — the
-            # entrypoint resolves it to the stable ClusterIP.
-            - name: AUTUMN_ADVERTISE_NAME
+            # Advertise this pod's own per-pod Service, by its FULL FQDN. NOT the
+            # bare pod name: Kubernetes writes an /etc/hosts entry mapping the
+            # bare name (== the pod hostname, since the per-pod Service is named
+            # after the pod) to the POD IP, and `getent` consults files before
+            # DNS — so a bare-name lookup returns the ephemeral pod IP and every
+            # pod reschedule registers a phantom node. The FQDN
+            # <pod>.<ns>.svc.cluster.local is not in /etc/hosts, so it resolves
+            # via DNS to the stable per-pod Service ClusterIP.
+            - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AUTUMN_ADVERTISE_NAME
+              value: "$(POD_NAME).$(POD_NAMESPACE).svc.cluster.local"
             - name: AUTUMN_EXTENT_DATA
               value: /data/autumn
           ports:

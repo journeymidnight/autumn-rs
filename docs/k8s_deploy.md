@@ -128,11 +128,44 @@ or `@sha256:…`. Prefer immutable tags in production; treat `latest` as dev-onl
 
 ## Deploy
 
+`deploy/k8s` is a **generic reference** (placeholder image `autumn-rs:latest`,
+3 ENs, no StorageClass/node assumptions). On kind/minikube you can apply it
+directly. On a real cluster, apply a thin **overlay** that layers the
+cluster-specific values instead (see below):
+
 ```bash
-kubectl apply -k deploy/k8s
+kubectl apply -k deploy/k8s              # kind/minikube (after `kind load`)
+# or:
+kubectl apply -k deploy/overlays/vke     # a real cluster (worked example)
 kubectl -n autumn get pods,svc
 kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=300s
 ```
+
+## Per-cluster overlay
+
+Anything that differs between clusters does **not** belong in the base — keep
+`deploy/k8s` generic and put the specifics in an overlay that lists `../../k8s`
+as a resource. `deploy/overlays/vke` is a worked Volcengine (VKE) example;
+copy it for a new cluster and adjust:
+
+| Overlay knob | Why it's cluster-specific |
+|---|---|
+| `images[].newName/newTag` | your registry + immutable tag/digest |
+| `images[]` etcd mirror | nodes may not reach `quay.io` directly (VKE → daocloud mirror) |
+| `nodeSelector` patch | your node pool (VKE pins to kernel-≥5.15 nodes labeled `autumn-node=true`; autumn needs io_uring) |
+| etcd `storageClassName` + size | your network-durable class; mind provider **minimum volume size** (Volcengine EBS ESSD = 20Gi, so the base 1Gi is patched up) |
+| EN `replicas` + `AUTUMN_EXPECT_NODES` + extra `autumn-en-<i>` Services | your sizing (keep the two counts equal; add one per-pod Service per new ordinal) |
+
+Two things that trip up real clusters, already handled in the base so every
+overlay inherits them: **`enableServiceLinks: false`** on all pods (K8s injects
+`AUTUMN_MANAGER_PORT=tcp://…` from the `autumn-manager` Service, colliding with
+the entrypoint's own `AUTUMN_MANAGER_PORT` and panicking the manager), and the
+EN advertising its per-pod Service **FQDN** (a bare name resolves via the pod's
+own `/etc/hosts` to the pod IP → phantom nodes on reschedule).
+
+If your cluster has **no default StorageClass**, the etcd PVC (which omits
+`storageClassName` in the base to inherit the default) stays Pending — the
+overlay must name a class explicitly, as the VKE example does.
 
 ## Scaling
 

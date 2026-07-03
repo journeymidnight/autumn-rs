@@ -1,0 +1,71 @@
+# VKE (Volcengine) overlay — cluster-specific values layered on the generic base.
+#
+#   kubectl apply -k deploy/overlays/vke
+#
+# Everything here differs per cluster and therefore does NOT belong in the base:
+#   - image ref (your registry/tag) + registry mirror for etcd
+#   - node pinning (this cluster's kernel-5.15 node pool, labeled autumn-node=true)
+#   - StorageClass name + min size for etcd (Volcengine EBS ESSD)
+#   - EN replica count / AUTUMN_EXPECT_NODES sizing (5 here vs the base default 3)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s                  # the generic base (deploy/k8s)
+  - en-extra-services.yaml     # per-pod Services for EN ordinals 3 and 4
+
+images:
+  - name: autumn-rs
+    newName: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs
+    newTag: e7d1d1ea83ce0119abc1b4fa82951b54ad320d7a
+  # This cluster's nodes reach the daocloud mirror, not quay.io directly.
+  - name: quay.io/coreos/etcd
+    newName: quay.m.daocloud.io/coreos/etcd
+    newTag: v3.5.11
+
+patches:
+  # Pin all autumn workloads to the 5 kernel-5.15 Ubuntu nodes (autumn-node=true),
+  # keeping them off this cluster's remaining kernel-5.4 veLinux nodes (where
+  # compio's io_uring would need a memlock/IPC_LOCK workaround).
+  - target:
+      kind: StatefulSet
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          autumn-node: "true"
+  - target:
+      kind: Job
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          autumn-node: "true"
+  # Scale to 5 extent nodes (base ships 3). Must keep AUTUMN_EXPECT_NODES in step.
+  - target:
+      kind: StatefulSet
+      name: autumn-en
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 5
+  - target:
+      kind: ConfigMap
+      name: autumn-config
+    patch: |-
+      - op: replace
+        path: /data/AUTUMN_EXPECT_NODES
+        value: "5"
+  # etcd wants network-durable storage. The base omits storageClassName to inherit
+  # the cluster default, but this cluster marks no default — name Volcengine's EBS
+  # class explicitly. EBS ESSD has a 20Gi minimum (base 1Gi → InvalidVolumeSize).
+  - target:
+      kind: StatefulSet
+      name: autumn-etcd
+    patch: |-
+      - op: add
+        path: /spec/volumeClaimTemplates/0/spec/storageClassName
+        value: ebs-ssd
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 20Gi

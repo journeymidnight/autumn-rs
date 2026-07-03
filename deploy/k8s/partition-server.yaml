@@ -49,6 +49,7 @@ spec:
       # PS drains active+imm to row_stream on SIGTERM (can take seconds per
       # partition); give it room before SIGKILL. Matches --shutdown-timeout.
       terminationGracePeriodSeconds: 90
+      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
       containers:
         - name: partition-server
           image: autumn-rs:latest

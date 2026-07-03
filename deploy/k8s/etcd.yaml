@@ -47,6 +47,7 @@ spec:
         app.kubernetes.io/component: etcd
     spec:
       terminationGracePeriodSeconds: 30
+      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
       containers:
         - name: etcd
           # Pin to a 3.5.x etcd (autumn needs etcd v3 API >= 3.5).

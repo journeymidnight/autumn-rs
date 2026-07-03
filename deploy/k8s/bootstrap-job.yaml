@@ -23,6 +23,7 @@ spec:
         app.kubernetes.io/component: bootstrap
     spec:
       restartPolicy: OnFailure
+      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
       containers:
         - name: bootstrap
           image: autumn-rs:latest

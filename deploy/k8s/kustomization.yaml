@@ -17,9 +17,16 @@ resources:
   - partition-server.yaml
   - bootstrap-job.yaml
 
-# Override the image tag centrally, e.g.:
+# This base is a GENERIC reference. Cluster-specific values (image ref, node
+# pinning, StorageClass names/sizes, registry mirrors, replica counts) do NOT
+# belong here — put them in an overlay that lists this dir as its base. See
+# deploy/overlays/vke for a worked Volcengine example, and the "Per-cluster
+# overlay" section of docs/k8s_deploy.md.
+#
+# Override the image centrally (or, preferably, from the overlay):
 #   images:
 #     - name: autumn-rs
+#       newName: <your-registry>/autumn-rs
 #       newTag: v1.2.3
 images:
   - name: autumn-rs

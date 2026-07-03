@@ -69,6 +69,12 @@ spec:
         app.kubernetes.io/component: manager
     spec:
       terminationGracePeriodSeconds: 30
+      # K8s otherwise injects a per-Service env var AUTUMN_MANAGER_PORT (from the
+      # ClusterIP Service `autumn-manager`) shaped like "tcp://<ip>:9001", which
+      # collides with the entrypoint's own AUTUMN_MANAGER_PORT convention (a bare
+      # port number) and panics the server at "--port must be a number". The
+      # binaries take addresses from the ConfigMap + DNS, never service links.
+      enableServiceLinks: false
       containers:
         - name: manager
           image: autumn-rs:latest
