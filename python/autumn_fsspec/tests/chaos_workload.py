@@ -1,9 +1,9 @@
 """fsspec-interface chaos workload (mirrors autumn_kvcache/tests/chaos_workload.py).
 
 Runs a continuous write → readback-verify loop through `AutumnFileSystem`
-(pipe_file / cat_file / ls / rm — the full fsspec → SDK → PS → EN path,
-chunked layout included) against an externally-running cluster, while the
-bash harness (`scripts/fsspec_chaos.sh`) kills PSes / the manager underneath.
+(pipe_file / cat_file / ls / rm — the full fsspec → autumn.Fs → PS → EN path,
+shared inode layout, F-FS-UNIFY M3) against an externally-running cluster, while
+the bash harness (`scripts/fsspec_chaos.sh`) kills PSes / the manager underneath.
 
 Protocol (stdout, line-oriented — the harness greps these):
     OK <r>          round r stored AND a random prior file read back byte-exact

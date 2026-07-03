@@ -1,7 +1,8 @@
-"""Offline unit tests for AutumnFileSystem over an in-memory FakeKV.
+"""Offline unit tests for AutumnFileSystem over an in-memory FakeFs.
 
-Exercises the full filesystem surface (chunking, ranged reads, ls/info,
-mkdir/rm) with no cluster, so it runs anywhere. Run:
+F-FS-UNIFY M3: the facade now sits on the shared inode layout (``autumn.Fs``),
+so offline runs the SAME facade code path as a live cluster, backed by a
+Python inode tree (``FakeFs``). No cluster needed. Run:
 
     cd python/autumn_fsspec && python -m pytest tests/test_fs_offline.py -q
 """
@@ -17,39 +18,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from autumn_fsspec import AutumnFileSystem  # noqa: E402
-from autumn_fsspec import _layout  # noqa: E402
-from fake_kv import FakeKV  # noqa: E402
+from fake_fs import FakeFs  # noqa: E402
 
-CS = 16  # tiny chunk size to exercise multi-chunk paths cheaply
+CS = 16  # tiny block size to exercise multi-block write/read paths cheaply
 
 
-def make_fs(root=""):
+def make_fs(root="", backend=None):
     return AutumnFileSystem(
-        _client=FakeKV(), root=root, chunk_size=CS, skip_instance_cache=True
+        _fs=backend or FakeFs(), root=root, chunk_size=CS, skip_instance_cache=True
     )
-
-
-# ── key layout ──────────────────────────────────────────────────────────────
-
-
-def test_layout_keys_and_prefixes():
-    assert _layout.manifest_key("", "a/b.txt") == b"fs/m/a/b.txt"
-    assert _layout.manifest_key("bkt", "a/b.txt") == b"fs/m/bkt/a/b.txt"
-    assert _layout.chunk_key("", "a", 3) == b"fs/d/a\x00" + (3).to_bytes(8, "big")
-    # children prefix excludes the node itself; root lists all manifests
-    assert _layout.children_prefix("", "dir") == b"fs/m/dir/"
-    assert _layout.children_prefix("", "") == b"fs/m/"
-    # sibling "a" chunks never match "ab"'s chunk prefix
-    assert not _layout.chunk_key("", "ab", 0).startswith(_layout.chunk_prefix("", "a"))
-    # reserved `fs/` namespace — must NOT collide with autumn-fuse's 0x01/0x02
-    # (inode/dirent) keys, so fsspec + a fuse mount can share one cluster
-    for k in (
-        _layout.manifest_key("", "x"),
-        _layout.chunk_key("", "x", 0),
-        _layout.children_prefix("", ""),
-    ):
-        assert k.startswith(b"fs/")
-        assert k[0] not in (0x01, 0x02, 0x03, 0x04)
 
 
 # ── round-trip across size boundaries ───────────────────────────────────────
@@ -66,27 +43,21 @@ def test_write_read_roundtrip(size):
         f.write(data)
 
     assert fs.info("bkt/blob.bin")["size"] == size
+    assert fs.info("bkt/blob.bin")["type"] == "file"
     assert fs.cat_file("bkt/blob.bin") == data
     with fs.open("bkt/blob.bin", "rb") as f:
         assert f.read() == data
 
-    # expected chunk count in the manifest
-    m = fs._get_manifest("bkt/blob.bin")
-    exp_n = 0 if size == 0 else (size + CS - 1) // CS
-    assert m["n"] == exp_n and m["cs"] == CS
-
 
 def test_ranged_reads():
     fs = make_fs()
-    data = bytes(range(256)) * 4  # 1024 bytes, many chunks
+    data = bytes(range(256)) * 4  # 1024 bytes
     fs.pipe_file("d/x.bin", data)
     assert fs.cat_file("d/x.bin", 0, 10) == data[0:10]
     assert fs.cat_file("d/x.bin", 5, 5) == b""
-    assert fs.cat_file("d/x.bin", CS - 3, CS + 3) == data[CS - 3 : CS + 3]  # crosses chunk
+    assert fs.cat_file("d/x.bin", CS - 3, CS + 3) == data[CS - 3 : CS + 3]  # crosses a block
     assert fs.cat_file("d/x.bin", 1000, 2000) == data[1000:]  # clamps to size
-    # negative offsets (fsspec allows) → tail
-    assert fs.cat_file("d/x.bin", -8) == data[-8:]
-    # random-access read via file handle + seek
+    assert fs.cat_file("d/x.bin", -8) == data[-8:]  # negative offset → tail
     with fs.open("d/x.bin", "rb") as f:
         f.seek(500)
         assert f.read(40) == data[500:540]
@@ -104,7 +75,7 @@ def test_write_in_many_small_writes():
 # ── namespace: ls / info / dirs ─────────────────────────────────────────────
 
 
-def test_ls_info_and_implicit_dirs():
+def test_ls_info_and_dirs():
     fs = make_fs()
     fs.pipe_file("models/llama/config.json", b"{}")
     fs.pipe_file("models/llama/model.bin", b"x" * (CS * 2 + 7))
@@ -141,25 +112,24 @@ def test_makedirs_empty_dir_and_missing():
     fs = make_fs()
     fs.makedirs("empty/dir")
     assert fs.isdir("empty/dir")
+    assert fs.isdir("empty")  # a real intermediate directory now exists
     assert fs.ls("empty/dir", detail=False) == []
     with pytest.raises(FileNotFoundError):
         fs.info("does/not/exist")
 
 
 def test_makedirs_never_clobbers_a_file():
-    """coco P2: file + dir manifests share a key — makedirs on an existing
-    FILE must refuse, not overwrite the file's manifest."""
+    """A dir must not overwrite a file at the same path (and vice versa)."""
     fs = make_fs()
     fs.pipe_file("data.bin", b"payload" * 10)
     with pytest.raises(NotADirectoryError):
         fs.makedirs("data.bin", exist_ok=True)
     with pytest.raises(NotADirectoryError):
         fs.mkdir("data.bin")
-    # the file survived untouched
-    assert fs.cat_file("data.bin") == b"payload" * 10
+    assert fs.cat_file("data.bin") == b"payload" * 10  # survived untouched
     assert fs.info("data.bin")["type"] == "file"
 
-    # dir semantics: mkdir on existing dir raises, makedirs(exist_ok) returns
+    # dir semantics: mkdir on existing dir raises; makedirs(exist_ok) returns
     fs.makedirs("d")
     fs.makedirs("d", exist_ok=True)
     with pytest.raises(FileExistsError):
@@ -169,20 +139,15 @@ def test_makedirs_never_clobbers_a_file():
 
 
 def test_rm_root_recursive_clears_namespace():
-    """coco P2: subtree_prefixes at the fs root must match the bare
-    namespace (`fs/m/`), not the nothing-matching `fs/m//`."""
     fs = make_fs()
     fs.pipe_file("a/x.bin", b"1" * (CS + 1))
     fs.pipe_file("b.bin", b"2")
     fs.rm("", recursive=True)
     assert fs.find("") == []
-    # no manifest or chunk keys survive in the namespace
-    assert not any(k.startswith(b"fs/") for k in fs._client.store)
+    assert fs.ls("", detail=False) == []
 
 
 def test_transactions_refused():
-    """coco P3: we don't implement deferred commit — promising it silently
-    would be a lie. autocommit=False must raise."""
     fs = make_fs()
     with pytest.raises(NotImplementedError):
         fs._open("t.bin", mode="wb", autocommit=False)
@@ -196,43 +161,32 @@ def test_rm_file_and_recursive():
 
     fs.rm_file("a/b/c1.bin")
     assert not fs.exists("a/b/c1.bin")
-    # its chunks are gone too (no orphans)
-    assert not any(
-        k.startswith(_layout.chunk_prefix("", "a/b/c1.bin")) for k in fs._client.store
-    )
 
     fs.rm("a/b", recursive=True)
     assert not fs.exists("a/b/c2.bin")
+    assert not fs.exists("a/b")  # the directory itself is gone
     assert fs.exists("a/keep.bin")
-    # only keep.bin's keys survive under a/
-    live = [k for k in fs._client.store if k[1:].startswith(b"a/")]
-    assert all(b"keep.bin" in k for k in live)
 
 
-def _chunk_keys(fs, path):
-    return [k for k in fs._client.store if k.startswith(_layout.chunk_prefix(fs.root, path))]
-
-
-def test_overwrite_reaps_stale_tail_chunks():
+def test_overwrite_shrink_exact():
     fs = make_fs()
-    big = bytes(range(256)) * 4  # 1024 B → many chunks
+    big = bytes(range(256)) * 4  # 1024 B
     fs.pipe_file("d/f.bin", big)
-    n_big = len(_chunk_keys(fs, "d/f.bin"))
-    assert n_big > 1
+    assert fs.info("d/f.bin")["size"] == len(big)
 
-    # overwrite with a smaller value → old higher-index chunks must be reaped
+    # overwrite with a much smaller value → exact size + content, no stale tail
     fs.pipe_file("d/f.bin", b"tiny")
     assert fs.cat_file("d/f.bin") == b"tiny"
-    assert len(_chunk_keys(fs, "d/f.bin")) == 1  # no orphaned tail chunks
+    assert fs.info("d/f.bin")["size"] == 4
 
-    # same via the buffered writer
+    # same via the buffered writer, then overwrite-shrink again
     with fs.open("d/f.bin", "wb") as w:
         w.write(big)
-    assert len(_chunk_keys(fs, "d/f.bin")) == n_big
+    assert fs.info("d/f.bin")["size"] == len(big)
     with fs.open("d/f.bin", "wb") as w:
-        w.write(b"x" * (CS + 1))  # 2 chunks
+        w.write(b"x" * (CS + 1))
     assert fs.cat_file("d/f.bin") == b"x" * (CS + 1)
-    assert len(_chunk_keys(fs, "d/f.bin")) == 2
+    assert fs.info("d/f.bin")["size"] == CS + 1
 
 
 def test_exclusive_create_mode():
@@ -261,10 +215,39 @@ def test_append_mode(tail0):
     assert fs.cat_file("d/fresh.bin") == b"hello"
 
 
+def test_mv_rename():
+    fs = make_fs()
+    fs.pipe_file("src/a.bin", b"payload" * 5)
+    fs.mv("src/a.bin", "dst/b.bin")
+    assert not fs.exists("src/a.bin")
+    assert fs.cat_file("dst/b.bin") == b"payload" * 5
+
+
+def test_virtual_root_on_unwritten_bucket():
+    """coco P2: a `root=` bucket that no write has created yet must still list
+    as an empty root (not FileNotFoundError), without leaking the cluster root."""
+    fs = make_fs(root="tenantX")
+    assert fs.info("")["type"] == "directory"
+    assert fs.ls("", detail=False) == []
+    assert fs.exists("")  # the fs root always "exists"
+
+
+def test_mkdir_create_parents_false():
+    """coco P3: mkdir(create_parents=False) must NOT auto-create parents."""
+    fs = make_fs()
+    with pytest.raises(FileNotFoundError):
+        fs.mkdir("a/b", create_parents=False)  # parent `a` absent
+    fs.mkdir("a")
+    fs.mkdir("a/b", create_parents=False)  # parent exists now → ok
+    assert fs.isdir("a/b")
+    with pytest.raises(FileExistsError):
+        fs.mkdir("a/b", create_parents=False)  # already exists
+
+
 def test_root_bucket_namespacing():
-    fs_a = make_fs(root="tenantA")
-    fs_b = make_fs(root="tenantB")
-    fs_a._client = fs_b._client = FakeKV()  # share one KV, isolate by root
+    backend = FakeFs()  # one shared cluster, isolated by root
+    fs_a = make_fs(root="tenantA", backend=backend)
+    fs_b = make_fs(root="tenantB", backend=backend)
     fs_a.pipe_file("shared.txt", b"A")
     fs_b.pipe_file("shared.txt", b"B")
     assert fs_a.cat_file("shared.txt") == b"A"

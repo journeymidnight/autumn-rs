@@ -1,36 +1,44 @@
-"""``AutumnFileSystem`` — an fsspec filesystem over the autumn KV client.
+"""``AutumnFileSystem`` — an fsspec filesystem over the SHARED autumn inode layout.
 
 Registered under the ``autumn`` protocol, so ``fsspec.filesystem("autumn",
 manager=...)`` and ``autumn://bucket/path`` URLs resolve here, and libraries
 that speak fsspec — HuggingFace ``datasets`` / ``huggingface_hub``, pandas,
 pyarrow — read and write autumn directly.
 
-Design (see ``_layout``): a file is a small JSON *manifest* key plus N *chunk*
-keys of ``chunk_size`` bytes (default 8 MiB, matching autumn-fuse's
-``MAX_EXTENT`` and comfortably under the 64 MiB inline-put cap). Directories
-are implicit (derived from descendant manifests, s3fs-style), with an optional
-explicit marker so empty dirs created via ``makedirs`` still exist.
+F-FS-UNIFY M3: this is a thin facade over ``autumn.Fs`` (the PyO3 binding to
+the shared fuser-free filesystem core, M2) — the SAME inode/dirent/extent layout
+the ``autumn-fuse`` kernel mount uses. A file written here is visible and
+byte-identical through a fuse mount (and vice versa). Real POSIX directories
+(no s3fs-style implicit-dir emulation), real ``readdir`` (no keys-only-range
+manifest dance), shared metadata.
 
-Reads fan a multi-chunk range out through ``batch_get_into`` (pipelined,
-zero-copy-eligible since chunks are ≥ 64 KiB) into exactly-sized buffers whose
-lengths are known from the manifest.
+The retired F-FSSPEC-1 layout (a private ``fs/``-prefixed, path-keyed chunk +
+manifest scheme on the KV client) is GONE — it was deliberately separate from
+the fuse namespace, so the two saw different files. This unifies them.
+
+``autumn.Fs`` is synchronous (a dedicated compio worker owns the connection and
+each method blocks), so this facade needs no asyncio bridge.
 """
 
 from __future__ import annotations
 
 import os
-import time
 
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 
-from . import _bridge, _layout
+# Shared-core constants (mirror crates/fuse schema).
+ROOT_INO = 1
+DT_DIR = 4
+DT_REG = 8
+DT_LNK = 10
 
-DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB — autumn-fuse MAX_EXTENT; ZC-eligible
-_SCAN_PAGE = 1024  # manifests per range() page during listing
+DEFAULT_BLOCK_SIZE = 8 * 1024 * 1024  # 8 MiB — matches autumn-fuse MAX_EXTENT
+# Back-compat alias (was the chunk size of the retired layout).
+DEFAULT_CHUNK_SIZE = DEFAULT_BLOCK_SIZE
 
 
 class AutumnFileSystem(AbstractFileSystem):
-    """fsspec filesystem backed by an autumn cluster.
+    """fsspec filesystem backed by the shared autumn inode layout via ``autumn.Fs``.
 
     Parameters
     ----------
@@ -40,14 +48,17 @@ class AutumnFileSystem(AbstractFileSystem):
         the manager in an ``autumn://`` URL — the netloc/path is the object
         path — so pass it via ``storage_options``.)
     root : str, optional
-        A path prefix ("bucket") transparently prepended to every path. Lets
-        several independent namespaces share one cluster. Default "".
+        A path prefix ("bucket") — really just a subdirectory — transparently
+        prepended to every path so several namespaces can share one cluster.
     transport : str, optional
         ``"ucx"`` | ``"tcp"``. Process-global (``autumn.set_transport``); set it
-        before the first client in the process connects. Default: leave autumn's
-        own default (tcp) untouched.
-    chunk_size : int, optional
-        Bytes per data chunk for files written through this fs. Default 8 MiB.
+        before the first client in the process connects.
+    host : str, optional
+        Daemon lease identity host label (``DaemonClientId::new_fuse``).
+    chunk_size / block_size : int, optional
+        Default write block size for buffered files. Default 8 MiB.
+    _fs : object, optional
+        Injected ``autumn.Fs``-compatible backend (tests / advanced embedding).
     """
 
     protocol = "autumn"
@@ -58,19 +69,20 @@ class AutumnFileSystem(AbstractFileSystem):
         manager=None,
         root="",
         transport=None,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        _client=None,
+        host=None,
+        chunk_size=DEFAULT_BLOCK_SIZE,
+        _fs=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.manager = manager or os.environ.get("AUTUMN_MANAGER")
         self.root = (root or "").strip("/")
-        self.chunk_size = int(chunk_size)
+        self.block_size = int(chunk_size)
 
-        if _client is not None:
-            self._client = _client  # injected (tests / advanced embedding)
+        if _fs is not None:
+            self._fs = _fs  # injected backend (FakeFs offline / advanced embedding)
             return
 
+        self.manager = manager or os.environ.get("AUTUMN_MANAGER")
         if not self.manager:
             raise ValueError(
                 "AutumnFileSystem needs a manager address — pass manager=... in "
@@ -85,7 +97,7 @@ class AutumnFileSystem(AbstractFileSystem):
                 import warnings
 
                 warnings.warn(f"autumn.set_transport({transport!r}) failed: {e!r}")
-        self._client = _bridge.run(lambda: autumn.Client.connect(self.manager))
+        self._fs = autumn.Fs.connect(self.manager, host=host)
 
     # ── path handling ──────────────────────────────────────────────────────
 
@@ -97,121 +109,119 @@ class AutumnFileSystem(AbstractFileSystem):
     def _norm(self, path):
         return self._strip_protocol(path).strip("/")
 
-    # ── KV helpers (all block on the bridge loop) ──────────────────────────
+    def _full(self, path):
+        """fs-relative path → full inode-tree path (with the bucket root)."""
+        p = path.strip("/")
+        if self.root:
+            return f"{self.root}/{p}" if p else self.root
+        return p
 
-    def _get_manifest(self, path):
-        blob = _bridge.run(lambda: self._client.get(_layout.manifest_key(self.root, path)))
-        return None if blob is None else _layout.parse_manifest(blob)
+    def _split(self, path):
+        """fs-relative path → (parent_rel, leaf_name)."""
+        p = path.strip("/")
+        parent, _sep, name = p.rpartition("/")
+        return parent, name
 
-    def _scan_keys(self, prefix):
-        """Yield every KEY under `prefix`, paginated.
+    def _resolve(self, path):
+        """fs-relative path → inode number, or None if absent."""
+        full = self._full(path)
+        if full == "":
+            return ROOT_INO
+        return self._fs.resolve(full)
 
-        autumn's `range` is a keys-only scan (the server never ships values in
-        a range response — rpc_handlers.rs), so listing reads keys here and
-        fetches the manifests it needs with `get`/`_multi_get`."""
-        start = b""
-        while True:
-            batch = _bridge.run(lambda s=start: self._client.range(prefix, s, _SCAN_PAGE))
-            if not batch:
-                return
-            for key, _val in batch:
-                yield bytes(key)
-            if len(batch) < _SCAN_PAGE:
-                return
-            start = bytes(batch[-1][0]) + b"\x00"  # lossless successor cursor
+    def _mkdirs(self, path):
+        """Ensure every component of the (fs-relative) directory `path` exists;
+        return the leaf directory's inode. Missing components are created.
 
-    def _multi_get(self, keys):
-        """Fetch several keys concurrently (one pipelined round of gets on the
-        compio thread). Returns values aligned to `keys` (None for missing)."""
-        if not keys:
-            return []
-        import asyncio
-
-        async def _gather():
-            return await asyncio.gather(*[self._client.get(k) for k in keys])
-
-        return _bridge.run(_gather)
-
-    def _has_children(self, path):
-        prefix = _layout.children_prefix(self.root, path)
-        batch = _bridge.run(lambda: self._client.range(prefix, b"", 1))
-        return len(batch) > 0
+        The ``lookup``→``mkdir`` sequence is not atomic, so a concurrent creator
+        of the same parent (e.g. two writers under a shared new directory) can
+        lose the race; treat ``mkdir``'s EEXIST idempotently by re-looking up."""
+        full = self._full(path)
+        ino = ROOT_INO
+        if full == "":
+            return ino
+        for comp in full.split("/"):
+            if not comp:
+                continue
+            child = self._fs.lookup(ino, comp)
+            if child is None:
+                try:
+                    ino = self._fs.mkdir(ino, comp)
+                except RuntimeError:
+                    child = self._fs.lookup(ino, comp)  # raced → re-resolve
+                    if child is None:
+                        raise
+                    cino, kind = child
+                    if kind != DT_DIR:
+                        raise NotADirectoryError(comp)
+                    ino = cino
+            else:
+                cino, kind = child
+                if kind != DT_DIR:
+                    raise NotADirectoryError(comp)
+                ino = cino
+        return ino
 
     # ── metadata surface ───────────────────────────────────────────────────
+
+    def _info_from_ino(self, name, ino):
+        a = self._fs.getattr(ino)
+        if a["type"] == "directory":
+            return {"name": name, "size": 0, "type": "directory", "mtime": a.get("mtime")}
+        return {
+            "name": name,
+            "size": int(a["size"]),
+            "type": "file",
+            "mtime": a.get("mtime"),
+        }
 
     def info(self, path, **kwargs):
         path = self._norm(path)
         if path == "":
-            return {"name": "", "size": 0, "type": "directory"}
-        m = self._get_manifest(path)
-        if m is not None:
-            if m["t"] == "f":
-                return {
-                    "name": path,
-                    "size": int(m["s"]),
-                    "type": "file",
-                    "chunk_size": int(m["cs"]),
-                    "mtime": m.get("m"),
-                }
-            return {"name": path, "size": 0, "type": "directory"}
-        if self._has_children(path):
-            return {"name": path, "size": 0, "type": "directory"}
-        raise FileNotFoundError(path)
+            # The fs root is a virtual directory that always exists, even before
+            # a `root=` bucket dir has been physically created by a first write.
+            return {"name": "", "size": 0, "type": "directory", "mtime": None}
+        ino = self._resolve(path)
+        if ino is None:
+            raise FileNotFoundError(path)
+        return self._info_from_ino(path, ino)
 
     def ls(self, path, detail=True, **kwargs):
         path = self._norm(path)
-        prefix = _layout.children_prefix(self.root, path)
-        dirs = set()  # child names proven to be directories (have descendants)
-        direct = {}  # child name -> its own manifest key (a file or empty-dir marker)
-        for key in self._scan_keys(prefix):
-            rel = key[len(prefix):].decode("utf-8")
-            if not rel:
-                continue
-            seg, sep, _rest = rel.partition("/")
-            child = f"{path}/{seg}" if path else seg
-            if sep:  # a descendant lives deeper → `child` is a directory
-                dirs.add(child)
-            else:  # `key` is `child`'s own manifest; fetch it to learn type/size
-                direct[child] = key
+        ino = self._resolve(path)
+        if ino is None:
+            # A not-yet-created `root=` bucket lists as an empty root (don't
+            # raise, and don't leak the cluster ROOT).
+            if path == "":
+                return []
+            raise FileNotFoundError(path)
+        a = self._fs.getattr(ino)
+        if a["type"] != "directory":
+            # ls of a file returns just that file (fsspec convention).
+            self_info = self._info_from_ino(path, ino)
+            return [self_info] if detail else [self_info["name"]]
 
-        names = list(direct)
-        blobs = self._multi_get([direct[n] for n in names])
-        children = {}
-        for name, blob in zip(names, blobs):
-            if blob is None:  # raced a delete
-                continue
-            m = _layout.parse_manifest(blob)
-            if m["t"] == "f" and name not in dirs:
-                children[name] = {
-                    "name": name,
-                    "size": int(m["s"]),
-                    "type": "file",
-                    "mtime": m.get("m"),
-                }
+        out = []
+        for name, cino, kind in self._fs.readdir(ino):
+            child = f"{path}/{name}" if path else name
+            if kind == DT_DIR:
+                out.append({"name": child, "size": 0, "type": "directory"})
             else:
-                children[name] = {"name": name, "size": 0, "type": "directory"}
-        for d in dirs:
-            children.setdefault(d, {"name": d, "size": 0, "type": "directory"})
-
-        if not children:
-            # No descendants: `path` is either a file, an empty explicit dir, or
-            # absent. info() distinguishes (and raises FileNotFoundError).
-            self_info = self.info(path) if path else {"name": "", "type": "directory"}
-            if self_info["type"] == "file":
-                return [self_info] if detail else [self_info["name"]]
-            return []
-
-        result = sorted(children.values(), key=lambda d: d["name"])
-        return result if detail else [d["name"] for d in result]
+                out.append(self._info_from_ino(child, cino))
+        out.sort(key=lambda d: d["name"])
+        return out if detail else [d["name"] for d in out]
 
     # ── reads ──────────────────────────────────────────────────────────────
 
     def cat_file(self, path, start=None, end=None, **kwargs):
         path = self._norm(path)
-        m = self._get_manifest(path)
-        if m is None or m["t"] != "f":
+        ino = self._resolve(path)
+        if ino is None:
             raise FileNotFoundError(path)
-        size, cs, n = int(m["s"]), int(m["cs"]), int(m["n"])
+        a = self._fs.getattr(ino)
+        if a["type"] == "directory":
+            raise IsADirectoryError(path)
+        size = int(a["size"])
 
         s = 0 if start is None else (start if start >= 0 else size + start)
         e = size if end is None else (end if end >= 0 else size + end)
@@ -219,79 +229,60 @@ class AutumnFileSystem(AbstractFileSystem):
         e = max(s, min(e, size))
         if e <= s:
             return b""
-
-        first, last = s // cs, (e - 1) // cs
-        idxs = list(range(first, last + 1))
-        sizes = [cs if i < n - 1 else size - (n - 1) * cs for i in idxs]
-        data = self._read_chunks(path, idxs, sizes)
-        off = s - first * cs
-        return data[off : off + (e - s)]
-
-    def _read_chunks(self, path, idxs, sizes):
-        """Fetch `idxs` chunks (each of known exact `sizes`) and concatenate.
-
-        Uses `batch_get_into` — one pipelined, zero-copy-eligible round trip
-        into pre-sized buffers. Any chunk the batch reports as a miss (size
-        drift / transient) falls back to a plain `get`."""
-        keys = [_layout.chunk_key(self.root, path, i) for i in idxs]
-        bufs = [bytearray(sz) for sz in sizes]
-        oks = _bridge.run(lambda: self._client.batch_get_into(keys, bufs))
+        # `Fs.read`'s size arg is u32 (the fuse read-size contract), so a range
+        # larger than 4 GiB (whole-model reads) must be issued in bounded steps
+        # and concatenated — a single `read(ino, s, e - s)` would overflow the
+        # PyO3 u32 conversion. `block_size` (≤ 1 GiB cap) bounds each RPC.
+        step = min(self.block_size, 1 << 30)
         out = bytearray()
-        for j, ok in enumerate(oks):
-            if ok:
-                out += bufs[j]
-                continue
-            v = _bridge.run(lambda k=keys[j]: self._client.get(k))
-            if v is None:
-                raise IOError(f"missing chunk {idxs[j]} of {path!r}")
-            out += bytes(v)
+        off = s
+        while off < e:
+            chunk = self._fs.read(ino, off, min(step, e - off))
+            if not chunk:
+                break  # defensive: EOF short read (shouldn't happen within [s,e))
+            out += chunk
+            off += len(chunk)
         return bytes(out)
 
     # ── writes ─────────────────────────────────────────────────────────────
 
+    def _ensure_file_ino(self, path):
+        """Resolve (or create) the file inode at fs-relative `path`, creating
+        parent directories as needed. Returns the inode; raises if `path` is a
+        directory.
+
+        NOTE (F-FS-UNIFY M4): writes here are NOT yet fenced by a per-inode write
+        lease — two writers (fsspec↔fsspec or fsspec↔fuse mount) to the same
+        inode can interleave truncate/write/flush and lose data or mix content.
+        M3 delivers shared visibility + read/write on one layout; the
+        `acquire`/`heartbeat`/`release` lease wiring around the write lifecycle
+        (and coherence) lands in M4. Single-writer use (datasets prep, uploads)
+        is safe today."""
+        parent, name = self._split(path)
+        if not name:
+            raise IsADirectoryError(path)
+        parent_ino = self._mkdirs(parent)
+        child = self._fs.lookup(parent_ino, name)
+        if child is None:
+            try:
+                return self._fs.create(parent_ino, name)
+            except RuntimeError:
+                child = self._fs.lookup(parent_ino, name)  # raced → re-resolve
+                if child is None:
+                    raise
+        ino, kind = child
+        if kind == DT_DIR:
+            raise IsADirectoryError(path)
+        return ino
+
     def pipe_file(self, path, value, **kwargs):
-        """Write a whole small/medium object in one shot (used by fsspec's
-        `cat`/`pipe`). Splits into chunk_size pieces + writes the manifest."""
+        """Write a whole object in one shot (fsspec's ``cat``/``pipe``)."""
         path = self._norm(path)
-        old_n = self._file_nchunks(path)  # for stale-tail reaping on overwrite
-        cs = self.chunk_size
-        n = 0
-        for off in range(0, len(value), cs):
-            chunk = bytes(value[off : off + cs])
-            key = _layout.chunk_key(self.root, path, n)
-            _bridge.run(lambda k=key, c=chunk: self._client.put(k, c))
-            n += 1
-        self._write_manifest(path, len(value), cs, n)
-        self._reap_chunks(path, n, old_n)
-
-    def _file_nchunks(self, path):
-        """Chunk count of the file currently at `path` (0 if absent/dir)."""
-        m = self._get_manifest(path)
-        return int(m["n"]) if m is not None and m["t"] == "f" else 0
-
-    def _reap_chunks(self, path, keep_n, old_n):
-        """Delete data chunks with index in [keep_n, old_n) — the tail an
-        overwrite left unreferenced. No-op for the common write-once /
-        grow cases (old_n <= keep_n)."""
-        if old_n <= keep_n:
-            return
-        keys = [_layout.chunk_key(self.root, path, i) for i in range(keep_n, old_n)]
-
-        async def _del_all():
-            import asyncio
-
-            await asyncio.gather(*[self._client.delete(k) for k in keys])
-
-        _bridge.run(_del_all)
-
-    def _put_chunk(self, path, idx, data):
-        key = _layout.chunk_key(self.root, path, idx)
-        _bridge.run(lambda: self._client.put(key, bytes(data)))
-
-    def _write_manifest(self, path, size, chunk_size, nchunks):
-        key = _layout.manifest_key(self.root, path)
-        blob = _layout.file_manifest(size, chunk_size, nchunks, time.time())
-        _bridge.run(lambda: self._client.put(key, blob))
+        ino = self._ensure_file_ino(path)
+        self._fs.truncate(ino, 0)  # clear any prior content (exact overwrite)
+        if value:
+            self._fs.write(ino, 0, bytes(value))
+        self._fs.flush(ino)
         self.invalidate_cache(self._parent(path))
 
     def _open(
@@ -305,43 +296,39 @@ class AutumnFileSystem(AbstractFileSystem):
     ):
         path = self._norm(path)
         if "r" in mode:
-            m = self._get_manifest(path)
-            if m is None or m["t"] != "f":
+            ino = self._resolve(path)
+            if ino is None:
                 raise FileNotFoundError(path)
+            a = self._fs.getattr(ino)
+            if a["type"] == "directory":
+                raise IsADirectoryError(path)
             return AutumnBufferedFile(
                 self,
                 path,
                 mode=mode,
-                size=int(m["s"]),
-                block_size=block_size or int(m["cs"]),
+                size=int(a["size"]),
+                block_size=block_size or self.block_size,
                 cache_options=cache_options,
             )
 
-        # Write modes. Honor fsspec/stdio semantics rather than treating every
-        # non-read mode as a plain overwrite:
-        #   xb — exclusive create: fail if the object already exists
-        #   ab — append: continue writing at the end of the existing object
-        #   wb — overwrite (default)
+        # Write modes. Honor fsspec/stdio semantics:
+        #   xb — exclusive create (fail if exists); ab — append; wb — overwrite.
         if not autocommit:
-            # fsspec transactions (`with fs.transaction:`) expect deferred
-            # commit + discard-on-failure. This backend writes chunks to the
-            # final keys as it goes — promising transactional semantics we
-            # don't have would be a silent lie (coco P3).
-            raise NotImplementedError("autumn:// does not support transactions (autocommit=False)")
-        existing = self._get_manifest(path)
-        if "x" in mode and existing is not None:
+            # This backend writes straight to the inode as it goes; promising
+            # deferred-commit transactional semantics we don't have would be a
+            # silent lie.
+            raise NotImplementedError(
+                "autumn:// does not support transactions (autocommit=False)"
+            )
+        if "x" in mode and self._resolve(path) is not None:
             raise FileExistsError(path)
-        append = "a" in mode
-        if append and existing is not None and existing["t"] == "f":
-            # keep the existing chunk_size so the uniform-chunk layout holds
-            block_size = int(existing["cs"])
         return AutumnBufferedFile(
             self,
             path,
             mode=mode,
-            block_size=block_size or self.chunk_size,
+            block_size=block_size or self.block_size,
             cache_options=cache_options,
-            append=append,
+            append=("a" in mode),
         )
 
     # ── namespace mutation ─────────────────────────────────────────────────
@@ -349,52 +336,96 @@ class AutumnFileSystem(AbstractFileSystem):
     def makedirs(self, path, exist_ok=True):
         path = self._norm(path)
         if not path:
-            return
-        # File and dir manifests share one key — an unconditional put would
-        # CLOBBER an existing file's manifest (data invisible + orphan
-        # chunks, coco P2). Check what's there first.
-        existing = self._get_manifest(path)
-        if existing is not None:
-            if existing["t"] == "f":
+            return  # the root always exists
+        ino = self._resolve(path)
+        if ino is not None:
+            if self._fs.getattr(ino)["type"] != "directory":
                 raise NotADirectoryError(path)
             if not exist_ok:
                 raise FileExistsError(path)
-            return  # already a directory
-        key = _layout.manifest_key(self.root, path)
-        _bridge.run(lambda: self._client.put(key, _layout.dir_manifest(time.time())))
+            return
+        self._mkdirs(path)
         self.invalidate_cache(self._parent(path))
 
     def mkdir(self, path, create_parents=True, **kwargs):
-        # POSIX mkdir: an existing target is an error (makedirs is the
-        # exist_ok variant). Implicit dirs mean create_parents is moot.
-        self.makedirs(path, exist_ok=False)
+        # POSIX-ish: an existing target errors (makedirs is the exist_ok variant).
+        if create_parents:
+            self.makedirs(path, exist_ok=False)
+            return
+        # create_parents=False: the parent must already exist; create only the leaf.
+        path = self._norm(path)
+        parent, name = self._split(path)
+        if not name:
+            raise FileExistsError(path)
+        parent_ino = self._resolve(parent)
+        if parent_ino is None:
+            raise FileNotFoundError(parent)
+        if self._fs.getattr(parent_ino)["type"] != "directory":
+            raise NotADirectoryError(parent)
+        existing = self._fs.lookup(parent_ino, name)
+        if existing is not None:
+            raise NotADirectoryError(path) if existing[1] != DT_DIR else FileExistsError(path)
+        self._fs.mkdir(parent_ino, name)
+        self.invalidate_cache(self._parent(path))
 
     def rm_file(self, path):
         path = self._norm(path)
-        _bridge.run(lambda: self._client.batch_delete(_layout.chunk_prefix(self.root, path)))
-        _bridge.run(lambda: self._client.delete(_layout.manifest_key(self.root, path)))
+        parent, name = self._split(path)
+        parent_ino = self._resolve(parent)
+        if parent_ino is None:
+            raise FileNotFoundError(path)
+        self._fs.unlink(parent_ino, name)
         self.invalidate_cache(self._parent(path))
+
+    def _rmtree(self, path, ino):
+        """Recursively remove a directory subtree, children first, then itself."""
+        for name, cino, kind in self._fs.readdir(ino):
+            child = f"{path}/{name}" if path else name
+            if kind == DT_DIR:
+                self._rmtree(child, cino)
+            else:
+                self.rm_file(child)
+        parent, name = self._split(path)
+        parent_ino = self._resolve(parent)
+        if parent_ino is not None and name:  # never remove the fs root itself
+            self._fs.rmdir(parent_ino, name)
 
     def rm(self, path, recursive=False, maxdepth=None):
         paths = path if isinstance(path, list) else [path]
         for p in paths:
             p = self._norm(p)
-            if recursive:
-                meta_pref, data_pref = _layout.subtree_prefixes(self.root, p)
-                _bridge.run(lambda pr=meta_pref: self._client.batch_delete(pr))
-                _bridge.run(lambda pr=data_pref: self._client.batch_delete(pr))
-            self.rm_file(p)
+            ino = self._resolve(p)
+            if ino is None:
+                continue  # already gone
+            if self._fs.getattr(ino)["type"] == "directory":
+                if not recursive:
+                    raise IsADirectoryError(p)
+                self._rmtree(p, ino)
+            else:
+                self.rm_file(p)
         self.invalidate_cache()
 
     def rmdir(self, path):
         self.rm(path, recursive=True)
 
+    def mv(self, path1, path2, recursive=None, maxdepth=None, **kwargs):
+        """Rename within the same cluster via a real inode ``rename`` (atomic
+        dirent swap), instead of fsspec's default copy+delete."""
+        p1, p2 = self._norm(path1), self._norm(path2)
+        op, on = self._split(p1)
+        np_, nn = self._split(p2)
+        op_ino = self._resolve(op)
+        if op_ino is None or not on:
+            raise FileNotFoundError(path1)
+        np_ino = self._mkdirs(np_)
+        self._fs.rename(op_ino, on, np_ino, nn)
+        self.invalidate_cache()
+
     def created(self, path):
         return self.modified(path)
 
     def modified(self, path):
-        info = self.info(path)
-        mtime = info.get("mtime")
+        mtime = self.info(path).get("mtime")
         if mtime is None:
             raise FileNotFoundError(path)
         from datetime import datetime, timezone
@@ -403,15 +434,24 @@ class AutumnFileSystem(AbstractFileSystem):
 
 
 class AutumnBufferedFile(AbstractBufferedFile):
-    """Buffered read/write file. Reads delegate ranged fetches to
-    ``cat_file``; writes accumulate and are emitted as fixed ``chunk_size``
-    chunks so the offset arithmetic in ``cat_file`` stays exact."""
+    """Buffered read/write file over an inode. Reads delegate ranged fetches to
+    ``cat_file``; writes stream sequential blocks straight into the inode via
+    ``Fs.write`` at a running offset (``Fs`` itself coalesces into extents)."""
 
     def __init__(
-        self, fs, path, mode="rb", block_size=None, cache_options=None, size=None, append=False, **kwargs
+        self,
+        fs,
+        path,
+        mode="rb",
+        block_size=None,
+        cache_options=None,
+        size=None,
+        append=False,
+        **kwargs,
     ):
-        self._chunk_size = block_size
         self._append = append
+        self._ino = None
+        self._off = 0
         super().__init__(
             fs,
             path,
@@ -428,45 +468,20 @@ class AutumnBufferedFile(AbstractBufferedFile):
 
     # writes
     def _initiate_upload(self):
-        cs = self._chunk_size
-        old = self.fs._get_manifest(self.path)
-        self._old_n = int(old["n"]) if old is not None and old["t"] == "f" else 0
-        if self._append and old is not None and old["t"] == "f":
-            # Resume at the end of the existing object. Re-load the trailing
-            # partial chunk into the pending buffer so the uniform-chunk-size
-            # invariant (every chunk but the last is exactly `cs`) still holds.
-            size = int(old["s"])
-            full = size // cs
-            tail = size - full * cs
-            if tail:
-                last = self.fs._read_chunks(self.path, [full], [tail])
-                self._pending = bytearray(last)
-                self._nchunks = full
-                self._total = full * cs
-            else:
-                self._pending = bytearray()
-                self._nchunks = full
-                self._total = size
+        f = self.fs
+        self._ino = f._ensure_file_ino(f._norm(self.path))
+        if self._append:
+            self._off = int(f._fs.getattr(self._ino)["size"])
         else:
-            self._pending = bytearray()
-            self._nchunks = 0
-            self._total = 0
+            f._fs.truncate(self._ino, 0)  # overwrite: exact-size semantics
+            self._off = 0
 
     def _upload_chunk(self, final=False):
-        cs = self._chunk_size
-        self._pending += self.buffer.getvalue()
-        while len(self._pending) >= cs:
-            self.fs._put_chunk(self.path, self._nchunks, self._pending[:cs])
-            del self._pending[:cs]
-            self._nchunks += 1
-            self._total += cs
+        data = self.buffer.getvalue()
+        if data:
+            n = self.fs._fs.write(self._ino, self._off, bytes(data))
+            self._off += n
         if final:
-            if self._pending:
-                self.fs._put_chunk(self.path, self._nchunks, self._pending)
-                self._total += len(self._pending)
-                self._nchunks += 1
-                self._pending = bytearray()
-            self.fs._write_manifest(self.path, self._total, cs, self._nchunks)
-            # reap chunks orphaned by an overwrite that shrank the file
-            self.fs._reap_chunks(self.path, self._nchunks, self._old_n)
+            self.fs._fs.flush(self._ino)
+            self.fs.invalidate_cache(self.fs._parent(self.fs._norm(self.path)))
         return True

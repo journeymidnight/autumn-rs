@@ -5,8 +5,34 @@ Task scope: all-in-one AI 存储扩展 —— (1) fsspec 让 Python dataset 直�
   docs/model_loading.md】;(3) F-FS-UNIFY 设计(用户批准 Q1/Q2/Q5)+ M0
   分配器【完成】;(4) chaos 测 fuse + fsspec 后 commit & push【全 PASS,
   已推 main】;(5) 用户"开工"M1【完成】;(6) M2 PyO3 `autumn.Fs`
-  绑定【完成,见下】。M3(fsspec facade 退役 fs/ 布局)/M4(lease 接线
-  + 围栏 + 跨面测试)为后续里程碑,codebase-memory 已 re-index。
+  绑定【完成,已推 main 2a91e51】;(7) M3 fsspec facade 重写到共享 inode
+  布局【完成,见下】。M4(lease 接线 + 围栏 + 跨面测试)为剩余里程碑,
+  codebase-memory 已 re-index。
+
+F-FS-UNIFY M3 完成(2026-07-03,用户"M3 start"):
+  · `autumn_fsspec` 重写成建在 `autumn.Fs`(共享 inode 布局)之上的薄
+    facade —— fsspec 与 fuse mount 现在看见**同一批文件**(同 [0x01]/[0x02]/
+    [0x03] 键),F-FSSPEC-1 的私有 `fs/` chunk+manifest 布局(不同文件、
+    互不可见)退役。
+  · `filesystem.py`:info/ls→resolve+readdir(真 POSIX dirent,不再 keys-only
+    range + manifest multi-get);cat_file→read;写/pipe_file→自动 mkdir 父链
+    + create/resolve + 流式 write + flush(覆盖先 truncate 保精确尺寸);
+    mkdir/rm(递归)/mv→mkdir/unlink+rmdir/rename(原子 dirent 交换)。
+    完全同步(去掉 asyncio 桥 —— Fs 本就同步)。
+  · 退役:删 `_layout.py`、`_bridge.py`、`tests/fake_kv.py`。offline 用纯
+    Python inode 树 `tests/fake_fs.py`(镜像 Fs sync API),让 offline 走与
+    live **同一份 facade 代码**。
+  · 验收:offline 28(test_fs_offline 尺寸边界往返/ranged/负偏移/seek、
+    ls/info/dirs、makedirs-不覆盖文件、rm/递归 rm、覆盖收缩精确、独占创建、
+    跨块 append、mv、root-bucket 隔离;test_datasets_offline save/load +
+    load_dataset('json');test_vllm_loader_offline;test_models_offline
+    upload→materialize SHA 校验走递归 put/get)+ **live 9**(run_fsspec_e2e.sh
+    自建隔离集群:0 B–5 MiB 往返 + 跨 extent ranged、ls/find/rm、覆盖收缩、
+    跨块 append、独占创建、**datasets 往返**)。
+  · 跨面写写围栏(per-inode lease)+ 一致性测试 = M4。
+  · models.py/vllm_loader.py 只用公共面 → 不改;chaos_workload.py 公共面 →
+    仅更注释。README/docs/ops.md/design M3 行/feature_list 同步。
+  · coco findbugs(M3 diff)见文末 coco-M3 段。
 
 F-FS-UNIFY M2 完成(2026-07-03,用户明确 M2 范围 = 把 M1 解耦的 core 经
 PyO3 暴露给 Python,连接 M1↔M3 的枢纽):
@@ -198,14 +224,12 @@ Main gaps / risks(follow-up,无阻塞):
   3. S3-compatible 网关(可解锁零改码的 runai_streamer)未做 —— 未来选项。
 
 Next steps:
-  · M2 已完成并全绿(见 F-FS-UNIFY M2 段)。coco findbugs 结果见 coco 段;
-    如有 P0/P1 已 triage+修+复测。
-  · commit M2(反 drift 重构 + PyO3 Fs 绑定 + headless e2e + 文档)。
-  · M3:把 autumn_fsspec 改写成 `autumn.Fs` 之上的 facade(path↔inode、真
-    dirent、extent 读写),退役当前 `fs/` 独立布局;offline+live fsspec 套
-    + datasets round-trip 在新 backing 上绿。
-  · M4:lease 接线(open 拿写租约、心跳续期、release)+ 围栏/一致性测试 +
-    跨面互通(写 via mount / 读 via fsspec byte-identical)。
+  · M2 已完成推送(2a91e51)。M3 已完成全绿(offline 28 + live 9);coco
+    findbugs(M3)结果见 coco-M3 段,如有 P0/P1 已 triage+修+复测。
+  · commit M3(facade 重写 + 退役 fs/ 布局 + FakeFs + 测试 + 文档)。
+  · M4(剩余里程碑):lease 接线(open 拿写租约、心跳续期、release)+
+    围栏/一致性测试 + 跨面互通(写 via mount / 读 via fsspec byte-identical);
+    并接 M2 fs.rs 标注的 stale-cache 边界(poll_invalidations/cache_is_stale)。
   可选(F-FSSPEC-1 遗留):GPU 机验证 Recipe C streaming loader;补 S3 网关。
 
 ── coco findbugs(M2 diff,GPT-5.5)4 条,triage + 修 + 复测 ─────────────
@@ -230,3 +254,25 @@ Next steps:
     acquire×2→release×1 后 heartbeat 仍 True 的断言。
   复测:fuse lib 44、fuse e2e 6/6+2/2+1/1(--ignored)、M2 headless e2e
   (含新负 offset + refcount 断言)exit 0、core-only fuser=0、新码 clippy 干净。
+
+── coco findbugs(M3 diff,GPT-5.5)6 条,5 修 + 1 定为 M4 边界 ──────────
+  · P1#1 写路径无租约/围栏(pipe_file/buffered write 直接 truncate/write/flush,
+    两个 fsspec 或 fsspec↔fuse 并发写同 inode 会丢写/混内容):REAL 但 =
+    **M4 边界**(设计分期 M4=lease 接线 + 围栏;M3=共享可见性 + 读写)。
+    coco 亦承认"M3 暂不支持则应…"。→ **不在 M3 修**,在 _ensure_file_ino
+    加显式 M4-边界注释(单写者=datasets/upload 今日安全)。
+  · P1#2 cat_file 把整个 e-s 传给 Fs.read(size 是 u32)→ >4 GiB 读(大模型)
+    溢出回归:REAL 在范围。→ **修**:cat_file 改按 min(block_size,1 GiB)
+    分步循环拼接(块内存有界,>4 GiB 可读)。
+  · P2#3 _mkdirs/create 非原子 lookup→mkdir 无 EEXIST 重查(并发建同父目录
+    竞争):→ **修**:_mkdirs + _ensure_file_ino 对 mkdir/create 的 EEXIST
+    幂等(catch→重 lookup→校验类型)。
+  · P2#4 root= 设了但 bucket 目录尚未写创建时 ls("")/info("") 抛
+    FileNotFoundError(API 回归;旧版 fs 根恒存在):→ **修**:虚拟根 ——
+    info("")恒 directory、ls("")在 bucket 不存在时返回 [](不泄露集群 ROOT)。
+  · P3#5 run_fsspec_e2e.sh pip 失败被 tail 掩盖:→ **修**:pip install 落
+    日志 + `||` 守卫(maturin/pytest RC 本就已 `||`/PIPESTATUS 捕获)。
+  · P3#6 mkdir 忽略 create_parents=False:→ **修**:False 时父目录须已存在
+    (缺→FileNotFoundError),只建 leaf。
+  复测:offline 30(+虚拟根 +create_parents=False 两用例)、live 9(fixture
+  1 MiB block + 5 MiB 读已实测 cat_file 循环)全绿。

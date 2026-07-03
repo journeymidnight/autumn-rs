@@ -95,30 +95,30 @@ nodes, separate from the storage StatefulSets.
 
 ## Python fsspec (`autumn://`) verification
 
-`python/autumn_fsspec` is a pure-client fsspec filesystem (chunked large-file
-layout on the KV data plane; complements `autumn-fuse`). It needs the `autumn`
-PyO3 SDK built **from the cluster's commit** — a wheel older than the cluster
-fails connect with `wire-version mismatch` (rebuild: `cd python && maturin build
+`python/autumn_fsspec` is a thin fsspec facade over `autumn.Fs` — the **shared
+inode layout** (F-FS-UNIFY M3), so a file written via fsspec is byte-identical
+through an `autumn-fuse` mount and vice versa. It needs the `autumn` PyO3 SDK
+built **from the cluster's commit** — a wheel older than the cluster fails
+connect with `wire-version mismatch` (rebuild: `cd python && maturin build
 --release && pip install --force-reinstall --no-deps target/wheels/autumn-*.whl`).
 
 ```bash
-# Offline (no cluster) — full FS surface + a HuggingFace datasets round-trip,
-# over an in-memory fake KV that mirrors the real keys-only `range` contract:
+# Offline (no cluster) — a Python inode tree (FakeFs) backs the SAME facade code
+# path; full FS surface + HuggingFace datasets + models upload/materialize:
 cd python/autumn_fsspec
 python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py \
-                 tests/test_vllm_loader_offline.py -q
-#   → 19 passed
+                 tests/test_vllm_loader_offline.py tests/test_models_offline.py -q
+#   → 28 passed
 
-# Live — against a running cluster (real `autumn` client). Confirms the real
-# range/batch_get_into semantics match the adapter's assumptions:
+# Live — self-contained (boots an isolated memory-mode cluster, builds the
+# wheel, runs the live suite against the autumn.Fs backing, tears down):
+cargo build --workspace
+bash python/autumn_fsspec/tests/run_fsspec_e2e.sh
+#   → 9 passed, "===== fsspec-e2e exit: 0 ====="
+
+# or against an already-running cluster:
 AUTUMN_MANAGER=127.0.0.1:9001 python -m pytest tests/test_e2e_cluster.py -q
-#   → 8 passed (0 B–5 MiB chunk round-trips, ls/find/rm, datasets save/load)
 ```
-
-Gotcha: autumn's `range` is a **keys-only** scan (never ships values), so
-listing fetches child manifests with a pipelined multi-`get`; `info`/`cat_file`
-read the manifest via `get`. If a `range` value ever looks non-empty in a new
-build, the listing path's assumptions changed — re-check `ls`.
 
 Model loading (materialize-to-local / FUSE-`eager` / streaming loader):
 [`docs/model_loading.md`](model_loading.md).

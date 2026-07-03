@@ -64,19 +64,16 @@ def test_ls_find_rm(fs):
 
 
 def test_overwrite_append_exclusive_live(fs):
-    from autumn_fsspec import _layout
-
-    def n_chunks(path):
-        return len(list(fs._scan_keys(_layout.chunk_prefix(ROOT, path))))
-
-    # overwrite-shrink must reap stale tail chunks
-    fs.pipe_file("w/f.bin", os.urandom(3 << 20))  # 3 chunks @ 1 MiB
-    assert n_chunks("w/f.bin") == 3
+    # overwrite-shrink must yield the exact new size + content (the inode
+    # truncate reaps the stale tail extents; no manifest/chunk bookkeeping now)
+    big = os.urandom(3 << 20)  # 3 MiB, spans multiple 8 MiB-capped extents
+    fs.pipe_file("w/f.bin", big)
+    assert fs.info("w/f.bin")["size"] == len(big)
+    assert fs.cat_file("w/f.bin") == big
     with fs.open("w/f.bin", "wb") as w:
         w.write(b"small")
     assert fs.cat_file("w/f.bin") == b"small"
     assert fs.info("w/f.bin")["size"] == 5
-    assert n_chunks("w/f.bin") == 1  # stale chunks 1,2 reaped
 
     # append across a chunk boundary
     a1 = os.urandom((1 << 20) - 10)

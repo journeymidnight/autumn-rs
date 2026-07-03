@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from autumn_fsspec import AutumnFileSystem  # noqa: E402
 from autumn_fsspec import vllm_loader as vl  # noqa: E402
-from fake_kv import FakeKV  # noqa: E402
+from fake_fs import FakeFs  # noqa: E402
 
 
 def build_safetensors(tensors):
@@ -54,7 +54,7 @@ def test_parse_and_plan():
 
 
 def test_iter_tensors_over_fs():
-    fs = AutumnFileSystem(_client=FakeKV(), chunk_size=13, skip_instance_cache=True)
+    fs = AutumnFileSystem(_fs=FakeFs(), chunk_size=13, skip_instance_cache=True)
     tensors = {
         "w1": ("F32", [8], os.urandom(32)),
         "w2": ("BF16", [3, 5], os.urandom(30)),

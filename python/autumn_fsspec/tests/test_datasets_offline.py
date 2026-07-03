@@ -15,14 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autumn_fsspec  # noqa: E402,F401  registers the "autumn" protocol
-from fake_kv import FakeKV  # noqa: E402
+from fake_fs import FakeFs  # noqa: E402
 
 datasets = pytest.importorskip("datasets")
 
 
 def test_datasets_save_and_load_roundtrip():
-    kv = FakeKV()  # one shared in-memory cluster for save + load
-    so = {"_client": kv, "skip_instance_cache": True, "chunk_size": 1 << 20}
+    backend = FakeFs()  # one shared in-memory cluster for save + load
+    so = {"_fs": backend, "skip_instance_cache": True, "chunk_size": 1 << 20}
 
     ds = datasets.Dataset.from_dict(
         {
@@ -48,8 +48,8 @@ def test_load_dataset_from_json_data_files():
     entry point (reading raw data files a user uploaded to autumn)."""
     import json
 
-    kv = FakeKV()
-    so = {"_client": kv, "skip_instance_cache": True}
+    backend = FakeFs()
+    so = {"_fs": backend, "skip_instance_cache": True}
     import fsspec
 
     fs = fsspec.filesystem("autumn", **so)
