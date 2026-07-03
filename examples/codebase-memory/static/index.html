@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codebase Memory · autumn</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" media="print" onload="this.media='all'">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg:#0a0a0b; --surface:#131315; --surface-raised:#1a1a1d; --border:#2a2a2e; --border-active:#4a4a50;
+  --text:#e8e6e3; --text-dim:#7a7880; --text-muted:#4a4850; --accent:#c5a05e; --accent-dim:#8a7040;
+  --success:#6fae7f; --radius:6px; --mono:'DM Mono','SF Mono',ui-monospace,monospace;
+  --serif:'Instrument Serif',Georgia,serif; --ease:cubic-bezier(0.4,0,0.2,1);
+  --k-Function:#c5a05e; --k-Method:#d9b978; --k-Struct:#7fa6d0; --k-Enum:#b090c8; --k-Union:#a88fd0;
+  --k-Trait:#cf8f8f; --k-Module:#7fb59a; --k-Type:#8a8a92;
+}
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:2px; }
+button:focus:not(:focus-visible), input:focus:not(:focus-visible) { outline:none; }
+@media (prefers-reduced-motion: reduce) { * { transition-duration:.01ms !important; } }
+html { font-size:15px; }
+body { background:var(--bg); color:var(--text); font-family:var(--mono); font-weight:300; min-height:100vh; overflow-x:hidden; }
+body::before { content:''; position:fixed; inset:0; opacity:.03; pointer-events:none; z-index:9999;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); background-size:256px; }
+.shell { max-width:1240px; margin:0 auto; padding:2.2rem 1.6rem 3rem; }
+
+header { display:flex; align-items:baseline; gap:1rem; flex-wrap:wrap; padding-bottom:1.2rem;
+  border-bottom:1px solid var(--border); margin-bottom:1.5rem; }
+header h1 { font-family:var(--serif); font-weight:400; font-size:2.3rem; letter-spacing:-0.02em; }
+header h1 em { color:var(--accent); font-style:italic; }
+.nav { display:inline-flex; gap:0.2rem; margin-left:0.6rem; }
+.nav button { background:none; border:none; color:var(--text-dim); cursor:pointer; font-family:var(--mono);
+  font-size:0.78rem; padding:0.3rem 0.7rem; border-radius:var(--radius); transition:all .15s var(--ease); }
+.nav button:hover { color:var(--text); }
+.nav button.on { color:var(--accent); background:rgba(197,160,94,0.1); }
+.spacer { flex:1; }
+.meta { display:flex; gap:1.1rem; font-size:0.7rem; color:var(--text-dim); align-items:baseline; font-feature-settings:'tnum' 1; }
+.meta b { color:var(--text); font-weight:500; } .meta .em { color:var(--accent); }
+
+.searchbar { display:flex; gap:0.6rem; margin-bottom:1.4rem; flex-wrap:wrap; }
+.field { flex:1; min-width:260px; position:relative; display:flex; align-items:center; }
+.field svg { position:absolute; left:0.85rem; width:15px; height:15px; color:var(--text-muted); }
+#q { width:100%; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  color:var(--text); font-family:var(--mono); font-size:0.9rem; font-weight:300; padding:0.7rem 0.9rem 0.7rem 2.4rem; transition:border-color .15s; }
+#q::placeholder { color:var(--text-muted); } #q:focus { border-color:var(--border-active); }
+.seg { display:inline-flex; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+.seg button { background:var(--surface); border:none; color:var(--text-dim); cursor:pointer; font-family:var(--mono);
+  font-size:0.72rem; padding:0 0.9rem; transition:all .15s; border-right:1px solid var(--border); }
+.seg button:last-child { border-right:none; } .seg button:hover { color:var(--text); }
+.seg button.on { background:rgba(197,160,94,0.1); color:var(--accent); }
+.kbox { display:flex; align-items:center; gap:0.4rem; color:var(--text-muted); font-size:0.72rem;
+  border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); padding:0 0.7rem; }
+#k { width:34px; background:transparent; border:none; color:var(--text); font-family:var(--mono); font-size:0.8rem; text-align:center; }
+.btn { background:rgba(197,160,94,0.1); border:1px solid var(--accent-dim); color:var(--accent); font-family:var(--mono);
+  font-size:0.78rem; border-radius:var(--radius); padding:0 1.2rem; cursor:pointer; transition:all .15s; }
+.btn:hover { background:rgba(197,160,94,0.18); border-color:var(--accent); }
+
+.grid { display:grid; grid-template-columns:minmax(340px,5fr) minmax(360px,6fr); gap:1.3rem; align-items:start; }
+@media (max-width:880px){ .grid { grid-template-columns:1fr; } }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+.card-head { padding:0.7rem 1rem; border-bottom:1px solid var(--border); font-size:0.62rem; text-transform:uppercase;
+  letter-spacing:0.15em; color:var(--text-dim); display:flex; align-items:center; gap:0.5rem; }
+.card-head .dot { width:5px; height:5px; border-radius:50%; background:var(--accent); opacity:0.7; }
+.card-head .count { margin-left:auto; color:var(--text-muted); letter-spacing:0.08em; }
+
+.results { max-height:70vh; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+.results::-webkit-scrollbar { width:4px; } .results::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+.row { padding:0.75rem 1rem; border-bottom:1px solid var(--border); cursor:pointer; transition:background .12s; }
+.row:last-child { border-bottom:none; } .row:hover { background:var(--surface-raised); }
+.row.active { background:rgba(197,160,94,0.07); box-shadow:inset 2px 0 0 var(--accent); }
+.line1 { display:flex; align-items:baseline; gap:0.5rem; }
+.sym { color:var(--text); font-size:0.86rem; }
+.badge { font-size:0.58rem; text-transform:uppercase; letter-spacing:0.08em; padding:0.1rem 0.4rem; border-radius:3px; border:1px solid currentColor; opacity:0.9; }
+.score { margin-left:auto; font-size:0.66rem; color:var(--success); font-feature-settings:'tnum' 1; }
+.loc { font-size:0.66rem; color:var(--text-muted); margin-top:0.15rem; }
+.snip { font-size:0.68rem; line-height:1.5; color:var(--text-dim); margin-top:0.4rem; white-space:pre-wrap; max-height:3em; overflow:hidden;
+  -webkit-mask-image:linear-gradient(#000 55%,transparent); mask-image:linear-gradient(#000 55%,transparent); }
+.detail-body { padding:1rem; } .detail-head { display:flex; align-items:baseline; gap:0.6rem; flex-wrap:wrap; margin-bottom:0.75rem; }
+.detail-head .sym { font-size:1rem; } .detail-head .loc { margin:0 0 0 auto; }
+pre { background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); padding:0.9rem 1rem; overflow:auto;
+  max-height:46vh; font-size:0.74rem; line-height:1.55; color:#cdd3cf; white-space:pre; scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+pre::-webkit-scrollbar { width:5px; height:5px; } pre::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+.rel-title { font-size:0.6rem; text-transform:uppercase; letter-spacing:0.14em; color:var(--text-dim); margin:1.1rem 0 0.5rem; display:flex; gap:0.5rem; }
+.rel-title .n { color:var(--text-muted); }
+.chips { display:flex; flex-wrap:wrap; gap:0.4rem; }
+.chip { display:inline-flex; align-items:center; gap:0.4rem; font-size:0.72rem; color:var(--text); background:var(--surface-raised);
+  border:1px solid var(--border); border-radius:var(--radius); padding:0.3rem 0.6rem; cursor:pointer; transition:all .12s; }
+.chip:hover { border-color:var(--accent-dim); color:var(--accent); } .chip .dim { color:var(--text-muted); font-size:0.6rem; }
+.empty { padding:3rem 1.5rem; text-align:center; color:var(--text-muted); font-size:0.78rem; line-height:1.7; }
+.empty .big { font-family:var(--serif); font-size:1.4rem; color:var(--text-dim); display:block; margin-bottom:0.4rem; }
+
+/* ── graph view ── */
+#view-graph { display:none; }
+.graph-wrap { position:relative; height:74vh; border:1px solid var(--border); border-radius:var(--radius);
+  overflow:hidden; background:radial-gradient(ellipse at center, #101014, var(--bg)); }
+#graph3d { width:100%; height:100%; }
+.legend { position:absolute; top:12px; left:12px; background:rgba(15,15,18,0.82); backdrop-filter:blur(6px);
+  border:1px solid var(--border); border-radius:var(--radius); padding:0.7rem 0.8rem; max-width:200px; font-size:0.68rem; }
+.legend h4 { font-size:0.58rem; text-transform:uppercase; letter-spacing:0.14em; color:var(--text-dim); margin-bottom:0.5rem; }
+.legend .k { display:flex; align-items:center; gap:0.45rem; cursor:pointer; padding:0.12rem 0; color:var(--text-dim); transition:color .12s; }
+.legend .k:hover { color:var(--text); } .legend .k.off { opacity:0.35; }
+.legend .k .sw { width:8px; height:8px; border-radius:50%; flex:none; }
+.legend .k .c { margin-left:auto; color:var(--text-muted); font-feature-settings:'tnum' 1; }
+.graph-hint { position:absolute; bottom:12px; right:14px; font-size:0.64rem; color:var(--text-muted); }
+.graph-loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--text-dim);
+  font-family:var(--serif); font-size:1.4rem; }
+
+/* ── footer / MCP ── */
+footer { margin-top:2rem; padding-top:1.4rem; border-top:1px solid var(--border); color:var(--text-dim); }
+footer h3 { font-family:var(--serif); font-size:1.25rem; color:var(--text); font-weight:400; margin-bottom:0.5rem; }
+footer h3 em { color:var(--accent); font-style:italic; }
+footer p { font-size:0.76rem; line-height:1.7; max-width:74ch; }
+footer .cmd { display:flex; align-items:center; gap:0.6rem; background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--radius); padding:0.6rem 0.8rem; margin:0.7rem 0; font-size:0.72rem; color:var(--text); overflow-x:auto; }
+footer .cmd code { white-space:pre; } footer .cmd .prompt { color:var(--accent); }
+footer .copy { margin-left:auto; flex:none; background:none; border:1px solid var(--border); color:var(--text-dim);
+  font-family:var(--mono); font-size:0.62rem; border-radius:4px; padding:0.2rem 0.5rem; cursor:pointer; }
+footer .copy:hover { color:var(--accent); border-color:var(--accent-dim); }
+footer .tools { font-size:0.7rem; color:var(--text-muted); margin-top:0.3rem; }
+footer .tools b { color:var(--text-dim); font-weight:400; }
+footer a { color:var(--accent); text-decoration:none; } footer a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>codebase <em>memory</em></h1>
+    <nav class="nav">
+      <button id="nav-search" class="on" onclick="showView('search')">Search</button>
+      <button id="nav-graph" onclick="showView('graph')">Graph</button>
+    </nav>
+    <span class="spacer"></span>
+    <div class="meta">
+      <span><b id="m-sym">…</b> symbols</span>
+      <span><b id="m-edge">…</b> edges</span>
+      <span>embedder <span class="em" id="m-emb">…</span></span>
+    </div>
+  </header>
+
+  <!-- ── Search view ── -->
+  <div id="view-search">
+    <div class="searchbar">
+      <div class="field">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="q" placeholder="search the codebase — e.g. “add a graph edge”, “bm25 scoring”, “range scan”" autofocus>
+      </div>
+      <div class="seg" id="modes"></div>
+      <div class="kbox">k <input id="k" value="12"></div>
+      <button class="btn" onclick="runSearch()">Search</button>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-head"><span class="dot"></span> Results <span class="count" id="rescount"></span></div>
+        <div class="results" id="results"><div class="empty"><span class="big">Search your code</span>Type a query and hit Search. Toggle lexical / vector / hybrid.</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="dot"></span> Symbol</div>
+        <div class="detail-body" id="detail"><div class="empty"><span class="big">Pick a symbol</span>Its source and call graph appear here. Click callers / callees to walk the graph.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Graph view (also hosts the MCP footer, so it shows once, here only) ── -->
+  <div id="view-graph">
+    <div class="graph-wrap">
+      <div id="graph3d"></div>
+      <div class="legend" id="legend"><h4>Node kinds</h4></div>
+      <div class="graph-hint">drag to rotate · scroll to zoom · click a node → source</div>
+      <div class="graph-loading" id="graph-loading">building graph…</div>
+    </div>
+
+    <footer>
+      <h3>Use with <em>Claude</em> via MCP</h3>
+      <p>Give Claude this codebase index as tools. The same binary speaks MCP over stdio with
+         <code>--mcp</code> (no extra process, no Python — it queries this already-indexed agent).
+         Run from the autumn-rs repo root. In <b>Claude Code</b>:</p>
+      <div class="cmd">
+        <code id="mcp-cmd"><span class="prompt">$ </span><span id="mcp-line">claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- 127.0.0.1:9001 --mcp</span></code>
+        <button class="copy" onclick="copyCmd()">copy</button>
+      </div>
+      <p class="tools">Tools exposed: <b>search_code</b> · <b>get_symbol</b> · <b>find_callers</b> · <b>find_callees</b> · <b>trace_call_path</b>.
+         For Claude Desktop, put the same command/args under <code>mcpServers</code> in <code>claude_desktop_config.json</code>.</p>
+    </footer>
+  </div>
+</div>
+
+<script>
+// Load 3d-force-graph from the first CDN that works (unpkg is often blocked in
+// some regions; fastly/jsdelivr mirrors usually aren't).
+(function(){
+  var cdns = [
+    "https://fastly.jsdelivr.net/npm/3d-force-graph",
+    "https://cdn.jsdelivr.net/npm/3d-force-graph",
+    "https://unpkg.com/3d-force-graph"
+  ];
+  var i = 0;
+  (function load(){
+    if(i >= cdns.length) return;
+    var s = document.createElement("script");
+    s.src = cdns[i++]; s.onerror = load;
+    document.head.appendChild(s);
+  })();
+})();
+</script>
+<script>
+const $ = (id) => document.getElementById(id);
+const enc = encodeURIComponent;
+let mode = "lexical", graphInited = false, Graph = null, hidden = {};
+const KINDS = ["Function","Method","Struct","Enum","Union","Trait","Module","Type"];
+const kcol = (k) => (getComputedStyle(document.documentElement).getPropertyValue('--k-'+k).trim() || '#8a8a92');
+async function j(url){ const r = await fetch(url); return r.json(); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function badge(k){ return `<span class="badge" style="color:${kcol(k)}">${esc(k)}</span>`; }
+
+(async () => {
+  const cfg = await j("/config");
+  $("m-sym").textContent = cfg.symbols; $("m-edge").textContent = cfg.edges; $("m-emb").textContent = cfg.embedder;
+  const ag = (cfg.agent && cfg.agent !== "default") ? ` --agent ${cfg.agent}` : "";
+  $("mcp-line").textContent = `claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- ${cfg.manager || "127.0.0.1:9001"}${ag} --mcp`;
+  const seg = $("modes");
+  (cfg.modes || ["lexical"]).forEach((m,i) => {
+    const b = document.createElement("button");
+    b.textContent = m; if(i===0){ b.classList.add("on"); mode=m; }
+    b.onclick = () => { mode=m; seg.querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b)); };
+    seg.appendChild(b);
+  });
+})();
+
+function showView(v){
+  $("view-search").style.display = v==="search" ? "" : "none";
+  $("view-graph").style.display  = v==="graph"  ? "" : "none";
+  $("nav-search").classList.toggle("on", v==="search");
+  $("nav-graph").classList.toggle("on", v==="graph");
+  if(v==="graph" && !graphInited){ graphInited = true; requestAnimationFrame(initGraph); }
+}
+
+// ── Search ──
+$("q").addEventListener("keydown", e => { if(e.key==="Enter") runSearch(); });
+async function runSearch(){
+  const q = $("q").value.trim(); if(!q) return;
+  const k = $("k").value.trim() || "12";
+  $("rescount").textContent = "…";
+  const { hits } = await j(`/search?q=${enc(q)}&mode=${mode}&k=${enc(k)}`);
+  $("rescount").textContent = (hits||[]).length ? `${hits.length} · ${mode}` : "";
+  if(!hits || !hits.length){ $("results").innerHTML = `<div class="empty">No matches for <b>${esc(q)}</b>.</div>`; return; }
+  $("results").innerHTML = hits.map(h => {
+    const snip = (h.source||"").split("\n").slice(0,3).join("\n");
+    const sc = h.score==null ? "" : `<span class="score">${(+h.score).toFixed(3)}</span>`;
+    return `<div class="row" data-id='${esc(JSON.stringify(h.id))}' onclick='openSym(${JSON.stringify(h.id)})'>
+      <div class="line1"><span class="sym">${esc(h.name)}</span>${badge(h.kind)}${sc}</div>
+      <div class="loc">${esc(h.file)}:${esc(h.start)}</div><div class="snip">${esc(snip)}</div></div>`;
+  }).join("");
+}
+async function openSym(id){
+  showView('search');
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("active", r.dataset.id === JSON.stringify(id)));
+  const [sym, callers, callees] = await Promise.all([ j(`/symbol?id=${enc(id)}`), j(`/callers?id=${enc(id)}`), j(`/callees?id=${enc(id)}`) ]);
+  if(sym.error){ $("detail").innerHTML = `<div class="empty">${esc(sym.error)}</div>`; return; }
+  const chips = (arr) => (arr.symbols||[]).length
+    ? arr.symbols.map(s => `<span class="chip" onclick='openSym(${JSON.stringify(s.id)})'>${esc(s.name)}<span class="dim">${esc(s.kind||"")}</span></span>`).join("")
+    : `<span class="empty" style="padding:0;color:var(--text-muted)">none</span>`;
+  $("detail").innerHTML = `
+    <div class="detail-head"><span class="sym">${esc(sym.name)}</span>${badge(sym.kind)}<span class="loc">${esc(sym.file)}:${esc(sym.start)}–${esc(sym.end)}</span></div>
+    <pre>${esc(sym.source)}</pre>
+    <div class="rel-title">↑ Callers <span class="n">${(callers.symbols||[]).length}</span></div><div class="chips">${chips(callers)}</div>
+    <div class="rel-title">↓ Callees <span class="n">${(callees.symbols||[]).length}</span></div><div class="chips">${chips(callees)}</div>`;
+}
+
+// ── Graph ──
+function graphMsg(t){ const el=$("graph-loading"); el.style.display="flex"; el.textContent=t; }
+async function waitForLib(ms){
+  const t0 = Date.now();
+  while(typeof ForceGraph3D === "undefined"){
+    if(Date.now()-t0 > ms) return false;
+    await new Promise(r => setTimeout(r, 150));
+  }
+  return true;
+}
+async function initGraph(){
+  const el = $("graph3d");
+  graphMsg("loading 3d-force-graph…");
+  if(!await waitForLib(9000)){
+    graphMsg("3d-force-graph didn't load — all CDNs (jsdelivr/fastly/unpkg) are blocked or offline. Connect to a network that can reach a CDN, or vendor the library locally.");
+    return;
+  }
+  let data;
+  try { data = await j("/graph"); }
+  catch(e){ graphMsg("failed to load /graph: " + e); return; }
+  const counts = data.counts || {};
+  $("legend").innerHTML = "<h4>Node kinds</h4>" + KINDS.filter(k=>counts[k]).map(k =>
+    `<div class="k" data-k="${k}" onclick="toggleKind('${k}')"><span class="sw" style="background:${kcol(k)}"></span>${k}<span class="c">${counts[k]}</span></div>`).join("");
+  if(!data.nodes || !data.nodes.length){ graphMsg("no symbols indexed for this agent — index a codebase first."); return; }
+  $("graph-loading").style.display = "none";
+  // Explicit size — the container was display:none until this tab opened, so its
+  // measured size can lag; fall back to the viewport if it reads 0.
+  const w = el.clientWidth || el.parentElement.clientWidth || window.innerWidth - 60;
+  const h = el.clientHeight || Math.round(window.innerHeight * 0.7);
+  const big = data.nodes.length > 2500;
+  Graph = ForceGraph3D()(el)
+    .width(w).height(h)
+    .graphData(data)
+    .backgroundColor("#0a0a0b")
+    .nodeLabel(n => `${n.name}  ·  ${n.kind}`)
+    .nodeColor(n => kcol(n.kind))
+    .nodeVisibility(n => !hidden[n.kind])
+    .nodeRelSize(3)
+    .nodeResolution(6)
+    .nodeOpacity(0.9)
+    .linkColor(() => "rgba(120,130,150,0.12)")
+    .linkWidth(0.3)
+    .linkResolution(3)
+    // Settle fast, then FREEZE: a fixed tick budget stops the per-frame physics
+    // (the source of the rAF jank on big graphs), leaving a static, cheap scene.
+    .d3AlphaDecay(0.06)
+    .d3VelocityDecay(0.5)
+    .cooldownTicks(big ? 60 : 120)
+    .onEngineStop(() => { if(Graph) Graph.zoomToFit(500, 50); })
+    .onNodeClick(n => openSym(n.id));
+  if(big) $("legend").insertAdjacentHTML("beforeend", `<div class="k" style="cursor:default;margin-top:6px;color:var(--text-muted)">${data.nodes.length} nodes · narrow with --root for a snappier graph</div>`);
+  addEventListener("resize", () => { if(Graph){ Graph.width(el.clientWidth); Graph.height(el.clientHeight); } });
+}
+function toggleKind(k){
+  hidden[k] = !hidden[k];
+  document.querySelector(`.legend .k[data-k="${k}"]`).classList.toggle("off", hidden[k]);
+  if(Graph) Graph.nodeVisibility(n => !hidden[n.kind]);
+}
+
+function copyCmd(){
+  const t = $("mcp-cmd").textContent.replace(/^\$\s*/, "");
+  navigator.clipboard?.writeText(t);
+  event.target.textContent = "copied";
+  setTimeout(() => event.target.textContent = "copy", 1200);
+}
+</script>
+</body>
+</html>
