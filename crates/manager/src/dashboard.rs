@@ -116,13 +116,14 @@ impl AutumnManager {
             "F-DASH-IN-MGR: embedded dashboard up (open http://{bind}/ )"
         );
         if allow_mutations {
-            // The flag is plumbed for M2/M3; until those land it has no effect
-            // (all mutating endpoints are stubs). Say so rather than let an
-            // operator believe the dashboard is armed (coco P3).
+            // Armed: manual /api/action AND the auto-policy controller (once a
+            // policy is activated + Armed) can mutate the cluster. Surface it as
+            // a security reminder — this port has no per-request auth.
             tracing::warn!(
-                "F-DASH-IN-MGR: --dashboard-allow-mutations is set, but dashboard \
-                 actions + the auto-policy controller are not wired until M2/M3; \
-                 no effect yet"
+                "F-DASH-IN-MGR: --dashboard-allow-mutations is SET — the dashboard's \
+                 manual actions AND the auto-policy controller (when armed) can mutate \
+                 the cluster (split/merge/gc/compact/ec). Keep this port behind a \
+                 trusted network."
             );
         }
         let app = self.dashboard_router(allow_mutations);

@@ -51,4 +51,8 @@ Main gaps / next steps:
   · M4: delete python/dashboard/ (5 files); DASHBOARD.md → docs/ops.md; update README,
     crates/manager/CLAUDE.md (F203 reconciliation note), crates/server/CLAUDE.md, deploy
     k8s/baremetal + cluster.sh env→flag threading (AUTUMN_DASHBOARD=1).
-  · origin/main is at 9f5b3d0 (M0+M1). Push M2 when committed.
+  · LIVE-VERIFIED on remote cluster host (2026-07-04): real 3-EN etcd cluster —
+    dashboard real data; /api/action split → real 1→2 split; ARMED controller
+    AUTO-fired compact (has-overlap) + gc (overwrites); kill -9 leader → new leader
+    replays maintenance/Armed from etcd + keeps actuating. Deferred item CLEARED.
+  · Corrected stale M0 startup WARN ("not wired until M2/M3").
