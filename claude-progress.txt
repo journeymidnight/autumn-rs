@@ -1,5 +1,38 @@
 Date: 2026-07-04
 TaskStatus: completed
+Task scope: F-FLUSH-VPHEAD — flush stamped the output SST vp_head from the LIVE
+  cursor at flush-CLAIM time, not the position at rotate_active. The background
+  flush lags the writer, so foreground writes between an imm's rotation and its
+  claim push the cursor forward → the SST vp_head sits AHEAD of that imm's own
+  content (past acked-but-un-flushed writes) → silent loss on crash. User named
+  the premise ("必需是 rotate 瞬间的位置 / 如果这个前提坏了之前的修复都不对") — it
+  is ALSO what F-COMPACT-VPHEAD's MAX(input vp_heads) rests on, so it was
+  load-bearing for both.
+Current summary: reproduce-first WITH a flush test sync-point (set_flush_test_pause
+  + set_flush_mem_bytes). system_flush_race_vp_head FAILED pre-fix (a-15, an
+  un-flushed tail key, lost = left:[]) and on a fix-reverted control, PASSES
+  post-fix. Fix = rotate_active captures p.vp into PartitionData.imm_vp_heads
+  (ptr-keyed map, same lifecycle as flushing_imm_ptrs); run_flush_async_phase_inner
+  stamps the imm's captured vp for both the SST/meta vp_head AND the F178 sync
+  barrier. Test now waits on flush_commit_count (durable-commit counter), not a
+  sleep. 187 ps --lib + all flush/recovery/compact/gc/split system tests green; 0
+  new clippy. coco findbugs: 5 findings ALL on the test (fix code clean) — fixed
+  false-pass-sleep, pause-leak-on-panic (RAII guard), ignored setter return,
+  imprecise comment; kept drop(ps1) (mirrors crash_mid_compact + proven by
+  deterministic FAIL→PASS).
+Main gaps (deferred, data-safe): recovery seeds p.vp = replay-MIN (backward), so
+  an idle-restarted SINGLE-SST partition's recovered active rotates with a backward
+  vp → GC floor can't advance without a fresh write (the user's original
+  compact-then-forceg-stuck symptom for THAT specific case). Clean fix = seed p.vp
+  = committed log tail at recovery (track the replay end in recover_partition).
+  This is the LAST open item of the vp_head correctness thread.
+Next steps: recovery-seed (p.vp = committed tail) as a separate reproduce-first
+  task if idle-restart GC-reclaim matters; else the vp_head correctness story is
+  complete (flush-tight + compaction-MAX both land on true content boundaries).
+
+============================ prior task history ============================
+Date: 2026-07-04
+TaskStatus: completed
 Task scope: F-COMPACT-VPHEAD — major compaction stamped the output SST vp_head
   (recovery replay-start) from the LIVE write cursor p.vp_*, which sits PAST
   acked-but-un-flushed writes in the active memtable. A major compaction wipes

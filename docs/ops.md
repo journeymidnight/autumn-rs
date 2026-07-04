@@ -347,10 +347,15 @@ un-flushed tail while still advancing it past the fully-merged log region so GC
 can reclaim there. No operator action; automatic. Regression:
 `crates/manager/tests/system_compact_unflushed_vp_head.rs` (writes A→flush,
 B→flush, C→NO flush, major-compact, crash, reopen → all of A/B/C must read back).
-Known residual (deferred): a flush that races foreground writes can stamp its own
-SST `vp_head` slightly ahead of that SST's content, so MAX can over-advance in
-that narrow window — never worse than the pre-fix live-cursor stamp; the clean
-fix records each memtable's content boundary at rotation.
+The MAX above is correct only because each SST's `vp_head` is now its true
+content boundary: a flush stamps the position captured when the memtable was
+FROZEN (`rotate_active`), not the live cursor at flush-claim (which foreground
+writes could push ahead of that SST's content — a flush-race that stranded the
+un-flushed tail before crash). Regression:
+`crates/manager/tests/system_flush_race_vp_head.rs`. Remaining (data-safe,
+GC-efficiency only): an idle partition restarted with un-flushed data can't
+advance its GC floor until a fresh write lands, because recovery seeds the write
+cursor to the replay start (backward), not the log tail.
 
 ## Read route-around for Suspected nodes (F276)
 

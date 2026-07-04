@@ -804,14 +804,42 @@ STRICTLY SAFER than the pre-fix stamp. `log_extent_ids` is now a hard `?` (was
 recovery no-replay branch = loss (coco P1); the abort is before any row_stream
 append so nothing is half-published.
 
-**Known residual (deferred follow-up):** a flush whose claim RACED foreground
-writes stamps its SST vp_head at the live cursor (claim time), slightly AHEAD of
-that SST's own content — so MAX can over-advance in that narrow window. The
-clean fix records each imm's true content boundary at ROTATION (not flush-claim)
-and threads it through the flush; until then MAX is never worse than the pre-fix
-live-cursor stamp (`MAX(inputs) ≤ live cursor` always) and, outside a major
-compaction, the oldest live SST masks the flush-side gap. Regression unit tests:
-`background::compaction_vp_head_tests`.
+The MAX above is only correct if each input SST's vp_head is its TRUE content
+boundary. That premise is now upheld by the flush-tight fix below (it used to be
+the claim-time cursor, which could sit ahead of the SST's content → MAX inherited
+the ahead-ness). Regression unit tests: `background::compaction_vp_head_tests`.
+
+### Flush stamps the imm's ROTATION-time vp_head, not the claim cursor (F-FLUSH-VPHEAD, 2026-07-04)
+
+`run_flush_async_phase_inner` used to snapshot `p.vp_extent_id/vp_offset` (the
+live write cursor) at flush-CLAIM time. But the background flush lags the writer:
+foreground writes that land between an imm's `rotate_active` and its claim push
+the cursor forward, so the flushed SST's vp_head (recovery replay-start) ends up
+AHEAD of that imm's own content — past acked-but-un-flushed writes sitting in the
+active memtable. On crash before they flush, recovery starts past them → silent
+loss. This is *also* the premise the compaction MAX above rests on, so it was
+load-bearing for both. Deterministic repro (flush test sync-point +
+`set_flush_mem_bytes`): `crates/manager/tests/system_flush_race_vp_head.rs`.
+
+Fix: `rotate_active` captures `p.vp_*` at the FREEZE instant (the imm's true
+content boundary) into `PartitionData.imm_vp_heads` (a `RefCell<HashMap<usize,
+(u64,u64)>>` keyed by `Arc::as_ptr`, same lifecycle discipline as
+`flushing_imm_ptrs` — INSERT at push, REMOVE at the single `commit_flush_outcome`
+pop; kept on a flush ERROR since the imm stays queued for retry). The flush reads
+the imm's captured vp instead of the live cursor — for BOTH the stamped SST/meta
+vp_head AND the F178 `await_log_synced_to` durability barrier (now waits for
+exactly the imm's content, not an over-far cursor). Test-only affordances added:
+`set_flush_mem_bytes` (configurable rotation threshold), `set_flush_test_pause`
+(a RocksDB-`SyncPoint`-style hold before the flush claim — one relaxed load per
+flush-wake, never set in production), and `flush_commit_count` (a durable-commit
+counter tests poll instead of sleeping).
+
+Not closed by this: an idle partition RESTARTED with un-flushed data seeds
+`p.vp` = the replay-MIN (backward), so the recovered active memtable's eventual
+rotation captures that backward position — conservative-safe (recovery replays
+more) but it does NOT advance the GC floor without a fresh write. Advancing it
+would seed `p.vp` = the committed log tail at recovery; deferred (data-safe, a GC
+efficiency gap for the idle-restart single-SST case).
 
 ### F104 — Cross-partition compaction concurrency cap
 `PartitionServer` holds an `Arc<CompactionGate>` (lib.rs); each partition's

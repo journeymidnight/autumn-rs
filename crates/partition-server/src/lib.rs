@@ -103,6 +103,18 @@ static PS_GC_DEBT_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLoc
 static PS_COMPACT_PENDING_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_GC_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 static PS_COMPACT_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+/// Memtable rotation threshold. Default `FLUSH_MEM_BYTES`; lowered by tests to
+/// rotate on small writes.
+static FLUSH_MEM_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Test sync-point (RocksDB-`SyncPoint` style): when true, `background_flush_loop`
+/// holds BEFORE claiming any imm, so a test can advance the write cursor between
+/// an imm's rotation and its flush-claim — deterministically reproducing the
+/// flush-race. One relaxed load per flush-wake; only ever set by tests.
+static FLUSH_TEST_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Count of fully-committed flushes (imm popped + meta checkpoint published).
+/// Lets a test wait for a flush to DURABLY complete instead of sleeping. Bumped
+/// once per `commit_flush_outcome` success; read via `flush_commit_count`.
+static FLUSH_COMMITS: AtomicU64 = AtomicU64::new(0);
 
 /// F195: setter for the group-commit request cap. First-call-wins.
 /// `[1, 1_000_000]` clamp matches pre-F195 env-default behavior.
@@ -133,6 +145,27 @@ pub fn set_max_extent_size_bytes(n: u64) -> bool {
     MAX_EXTENT_SIZE_BYTES_CELL
         .set(n.clamp(1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
         .is_ok()
+}
+/// Test/tuning hook: memtable rotation threshold. Clamp [4 KiB, 1 GiB].
+pub fn set_flush_mem_bytes(n: u64) -> bool {
+    FLUSH_MEM_BYTES_CELL
+        .set(n.clamp(4 * 1024, 1024 * 1024 * 1024))
+        .is_ok()
+}
+pub(crate) fn flush_mem_bytes() -> u64 {
+    FLUSH_MEM_BYTES_CELL.get().copied().unwrap_or(FLUSH_MEM_BYTES)
+}
+/// Test sync-point control — see `FLUSH_TEST_PAUSE`. Only tests call this.
+pub fn set_flush_test_pause(paused: bool) {
+    FLUSH_TEST_PAUSE.store(paused, Ordering::Relaxed);
+}
+fn flush_test_paused() -> bool {
+    FLUSH_TEST_PAUSE.load(Ordering::Relaxed)
+}
+/// Number of flushes fully committed (checkpoint published) since process start.
+/// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
+pub fn flush_commit_count() -> u64 {
+    FLUSH_COMMITS.load(Ordering::Relaxed)
 }
 pub fn set_shutdown_timeout_ms(n: u64) -> bool {
     SHUTDOWN_TIMEOUT_MS_CELL
@@ -761,6 +794,18 @@ pub(crate) struct PartitionData {
     ///   — see `FlushStep` docstring for the resulting
     ///   `stale_vp_offset_past_sealed_length` failure mode.)
     flushing_imm_ptrs: RefCell<HashSet<usize>>,
+    /// F-FLUSH-VPHEAD: each queued imm's vp_head, captured at ROTATION time (the
+    /// imm's true log content boundary = the write cursor at the instant it was
+    /// frozen), keyed by `Arc::as_ptr`. The flush stamps THIS onto the SST + meta
+    /// checkpoint — NOT the live cursor `p.vp_*` at flush-claim, which foreground
+    /// writes may have pushed AHEAD of this imm's content between rotation and the
+    /// (lagging background) claim → the SST vp_head overruns the un-flushed tail →
+    /// recovery skips it = loss (`system_flush_race_vp_head`). It is also the
+    /// premise `compaction_output_vp_head`'s MAX rests on. Lifecycle mirrors
+    /// `flushing_imm_ptrs`: INSERT at `rotate_active` (push), REMOVE at
+    /// `commit_flush_outcome` (pop). Never removed on a flush ERROR (the imm stays
+    /// queued for retry and keeps its vp).
+    imm_vp_heads: RefCell<HashMap<usize, (u64, u64)>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
@@ -5179,6 +5224,7 @@ async fn partition_thread_main(
         active: recovered_active,
         imm: VecDeque::new(),
         flushing_imm_ptrs: RefCell::new(HashSet::new()),
+        imm_vp_heads: RefCell::new(HashMap::new()),
         flush_tx,
         compact_tx,
         gc_tx,
@@ -8194,12 +8240,19 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
         return;
     }
     let frozen = std::mem::replace(&mut part.active, Memtable::new());
-    part.imm.push_back(Arc::new(frozen));
+    let arc = Arc::new(frozen);
+    // F-FLUSH-VPHEAD: capture this imm's content boundary = the write cursor at
+    // THIS instant (position after the last record that went into it). The flush
+    // stamps this, NOT the cursor at flush-claim time (which later writes advance).
+    part.imm_vp_heads
+        .borrow_mut()
+        .insert(Arc::as_ptr(&arc) as usize, (part.vp_extent_id, part.vp_offset));
+    part.imm.push_back(arc);
     let _ = part.flush_tx.unbounded_send(());
 }
 
 pub(crate) fn maybe_rotate(part: &mut PartitionData) {
-    if part.active.mem_bytes() >= FLUSH_MEM_BYTES {
+    if part.active.mem_bytes() >= flush_mem_bytes() {
         rotate_active(part);
     }
 }
@@ -8262,10 +8315,20 @@ async fn run_flush_async_phase_inner(
     let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
     let (row_stream_id, snap_vp_eid, snap_vp_off, mut req_tx, part_sc) = {
         let p = part.borrow();
+        // F-FLUSH-VPHEAD: stamp this imm's ROTATION-time content boundary, NOT the
+        // live cursor at claim (foreground writes may have pushed it ahead of this
+        // imm's content). Fallback to the live cursor only if the entry is somehow
+        // absent (never expected — every imm is inserted at rotate_active).
+        let (snap_vp_eid, snap_vp_off) = p
+            .imm_vp_heads
+            .borrow()
+            .get(&src_imm_ptr)
+            .copied()
+            .unwrap_or((p.vp_extent_id, p.vp_offset));
         (
             p.row_stream_id,
-            p.vp_extent_id,
-            p.vp_offset,
+            snap_vp_eid,
+            snap_vp_off,
             p.flush_req_tx.clone(),
             p.stream_client.clone(),
         )
@@ -8386,6 +8449,9 @@ async fn commit_flush_outcome_inner(
                 );
             }
             p.flushing_imm_ptrs.borrow_mut().remove(&ptr);
+            // F-FLUSH-VPHEAD: release the imm's captured vp_head on pop (the only
+            // queue removal). Error paths keep it — the imm stays queued for retry.
+            p.imm_vp_heads.borrow_mut().remove(&ptr);
         }
         // F120-A: wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
@@ -8414,6 +8480,8 @@ async fn commit_flush_outcome_inner(
     // advisory-input metrics so the next report_load_loop tick carries
     // accurate dead-data / minor-compact-pending volumes.
     crate::background::refresh_f202_metrics(part);
+    // Deterministic completion signal for tests (checkpoint now durable).
+    FLUSH_COMMITS.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -8692,6 +8760,12 @@ async fn background_flush_loop(
             }
         } else if flush_rx.next().await.is_none() {
             break;
+        }
+        // TEST SYNC-POINT (F-FLUSH-VPHEAD): hold before claiming any imm so a
+        // test can advance the write cursor between rotation and flush-claim.
+        // Off in production (one relaxed load; only `set_flush_test_pause` sets it).
+        while flush_test_paused() {
+            compio::time::sleep(Duration::from_millis(2)).await;
         }
         let mut inflight: FuturesOrdered<FlushFuture> = FuturesOrdered::new();
         let mut failed = false;
