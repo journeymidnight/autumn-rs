@@ -352,10 +352,13 @@ content boundary: a flush stamps the position captured when the memtable was
 FROZEN (`rotate_active`), not the live cursor at flush-claim (which foreground
 writes could push ahead of that SST's content — a flush-race that stranded the
 un-flushed tail before crash). Regression:
-`crates/manager/tests/system_flush_race_vp_head.rs`. Remaining (data-safe,
-GC-efficiency only): an idle partition restarted with un-flushed data can't
-advance its GC floor until a fresh write lands, because recovery seeds the write
-cursor to the replay start (backward), not the log tail.
+`crates/manager/tests/system_flush_race_vp_head.rs`. And on RESTART, recovery
+seeds the write cursor `p.vp` to the committed log TAIL (not the replay start),
+so the recovered active memtable also rotates with a forward boundary and the GC
+floor advances for an idle-restarted partition — closing the "compact-then-GC
+still won't reclaim" case. Guard:
+`crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
+content boundary on every path (flush, compaction, and recovery).
 
 ## Read route-around for Suspected nodes (F276)
 

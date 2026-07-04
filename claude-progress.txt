@@ -1,5 +1,29 @@
 Date: 2026-07-04
 TaskStatus: completed
+Task scope: F-FLUSH-VPHEAD-b — recovery seeded p.vp to the replay-MIN (backward),
+  so an idle-restarted partition's recovered active memtable rotated with a
+  backward vp_head → GC floor couldn't advance without a fresh write (the user's
+  original compact-then-forceg-stuck symptom). Fix: recover_partition tracks each
+  replayed extent's committed end (at BOTH is_final AND the empty-extent early
+  break — coco P2) and seeds p.vp to the committed log TAIL, kept separate from
+  the replay start.
+Current summary: SAFE (committed-clamped reads ⇒ tail ≥ every replayed record; and
+  the recovered active always flushes INTO an SST holding its data). New guard
+  system_recovery_vp_seed (restart w/ un-flushed data → flush recovered active →
+  restart → nothing lost) green. 187 ps --lib + all flush/recovery/compact/gc/
+  split system tests green; 0 new clippy. coco: P2 empty-tail-not-advancing FIXED;
+  P2 drop(ps)≠crash KEPT (non-graceful REQUIRED — graceful flushes B, skips the
+  path under test).
+Main gaps: NONE for the vp_head correctness thread — it is now complete end to end:
+  flush-tight (rotation boundary) + compaction-MAX + recovery-tail-seed all land on
+  true content boundaries, so recovery never starts past an un-flushed write AND
+  the GC floor advances (compact/gc reclaim works, including idle-restart).
+Next steps: verify the whole vp_head stack on the real cluster (the user's original
+  compact-then-forceg case) if desired; otherwise the thread is closed.
+
+============================ prior task history ============================
+Date: 2026-07-04
+TaskStatus: completed
 Task scope: F-FLUSH-VPHEAD — flush stamped the output SST vp_head from the LIVE
   cursor at flush-CLAIM time, not the position at rotate_active. The background
   flush lags the writer, so foreground writes between an imm's rotation and its

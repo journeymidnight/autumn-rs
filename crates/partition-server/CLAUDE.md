@@ -834,12 +834,18 @@ exactly the imm's content, not an over-far cursor). Test-only affordances added:
 flush-wake, never set in production), and `flush_commit_count` (a durable-commit
 counter tests poll instead of sleeping).
 
-Not closed by this: an idle partition RESTARTED with un-flushed data seeds
-`p.vp` = the replay-MIN (backward), so the recovered active memtable's eventual
-rotation captures that backward position — conservative-safe (recovery replays
-more) but it does NOT advance the GC floor without a fresh write. Advancing it
-would seed `p.vp` = the committed log tail at recovery; deferred (data-safe, a GC
-efficiency gap for the idle-restart single-SST case).
+Companion — recovery seeds `p.vp` = the committed log TAIL (F-FLUSH-VPHEAD-b):
+`recover_partition` used to return the replay-MIN (its `chosen_pos` start) as the
+`p.vp` seed, so an idle-restarted partition's recovered active memtable rotated
+with a BACKWARD vp_head → the GC floor couldn't advance without a fresh write
+(the user's original "compact-then-forceg stuck" symptom for that case). It now
+tracks each replayed extent's committed end (including an empty rolled tail — coco
+P2) and seeds `p.vp` to the TAIL, kept SEPARATE from the replay start (which the
+replay loop still needs). SAFE: reads are committed-clamped, so the tail is ≥
+every replayed record; the recovered active is always flushed INTO an SST that
+contains its data, so even a mis-seed can't strand it. Guard:
+`crates/manager/tests/system_recovery_vp_seed.rs` (restart with un-flushed data →
+flush the recovered active → restart again → nothing lost).
 
 ### F104 — Cross-partition compaction concurrency cap
 `PartitionServer` holds an `Arc<CompactionGate>` (lib.rs); each partition's

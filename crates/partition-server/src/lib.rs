@@ -7605,6 +7605,19 @@ async fn recover_partition(
             None
         };
 
+    // F-FLUSH-VPHEAD (b): p.vp — the write cursor recorded for the recovered
+    // active memtable, which its eventual rotation stamps as the flushed SST's
+    // vp_head — must seed to the committed log TAIL, NOT the replay START
+    // (`recovered_vp_*`, which the replay itself still needs as its start offset).
+    // Seeding the START leaves an idle-restarted partition's recovered-active SST
+    // with a backward vp_head → the GC floor never advances. We advance this to
+    // each replayed extent's committed end, so the LAST (tail) extent wins. SAFE:
+    // reads are committed-clamped, so the tail is ≥ every replayed record — a
+    // flush of the recovered active never stamps a vp_head past its own content.
+    // Defaults to the replay-min for the no-replay branch (empty recovered active
+    // ⇒ no rotation ⇒ the seed is inert there).
+    let mut tail_eid = recovered_vp_eid;
+    let mut tail_off = recovered_vp_off;
     if let Some(extents) = replay_extents {
         for (extent_pos, eid, start_off) in extents {
             let extent_dedup = dedup_at(extent_pos);
@@ -7673,6 +7686,15 @@ async fn recover_partition(
             let short = got < expected;
             if rem == 0 && carry.is_empty() {
                 // Reached the committed end cleanly, nothing buffered. Done.
+                // F-FLUSH-VPHEAD (b): still advance the tail seed here (coco P2) —
+                // an EMPTY tail extent (`committed_end == start_off`, e.g. a
+                // freshly-rolled open tail with no committed data yet) exits on
+                // THIS branch, never reaching the `is_final` update below. `cur_off
+                // == committed_end` here, so this records the true (empty) tail so
+                // the recovered active's flush stamps the newest position and the
+                // GC floor advances past the previous (data-holding) extent.
+                tail_eid = eid;
+                tail_off = cur_off;
                 break;
             }
             let buf_base = cur_off - carry.len() as u64;
@@ -7855,6 +7877,11 @@ async fn recover_partition(
                         carry.len()
                     ));
                 }
+                // F-FLUSH-VPHEAD (b): committed end of this extent. Extents replay
+                // in stream-position order, so the LAST one to land here is the
+                // tail → this converges to the committed log tail.
+                tail_eid = eid;
+                tail_off = cur_off;
                 break;
             }
             } // chunk loop
@@ -7903,8 +7930,12 @@ async fn recover_partition(
         tables,
         sst_readers,
         max_seq,
-        recovered_vp_eid,
-        recovered_vp_off,
+        // F-FLUSH-VPHEAD (b): seed p.vp to the committed log TAIL, not the replay
+        // start — the recovered active memtable holds everything up to the tail,
+        // so its rotation must stamp the tail (advances the GC floor for an
+        // idle-restarted partition) and never a backward position.
+        tail_eid,
+        tail_off,
         detected_overlap,
         active,
         fence_floors,
