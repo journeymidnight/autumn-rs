@@ -4081,34 +4081,42 @@ impl AutumnManager {
     /// last bucket of `PolicyEngine.metrics`, populated by
     /// `MSG_REPORT_PARTITION_LOAD`. Lets `client info --detail`
     /// surface per-partition F202 metrics without a dedicated PS RPC.
-    pub(crate) async fn handle_get_partition_detail(&self, payload: Bytes) -> HandlerResult {
-        // F209-A: followers' `policy.metrics` is empty (only the leader's
-        // policy_tick_loop populates it from MSG_REPORT_PARTITION_LOAD).
-        // Without this gate, querying a follower silently returned
-        // `CODE_OK` + all-zero PartitionLoad — operators couldn't tell
-        // "no metrics yet" from "queried the wrong node".
+    /// Pure builder for one partition's latest cached load metrics. Shared by
+    /// the `MSG_GET_PARTITION_DETAIL` handler and the in-process dashboard
+    /// (`dashboard.rs::partition_detail_json`).
+    ///
+    /// F209-A: followers' `policy.metrics` is empty (only the leader's
+    /// policy_tick_loop populates it from MSG_REPORT_PARTITION_LOAD). Without
+    /// this gate, querying a follower silently returned `CODE_OK` + all-zero
+    /// PartitionLoad — operators couldn't tell "no metrics yet" from "queried
+    /// the wrong node".
+    pub(crate) fn compute_partition_detail_resp(&self, part_id: u64) -> GetPartitionDetailResp {
         if !self.leader.get() {
-            return Ok(rkyv_encode(&GetPartitionDetailResp {
+            return GetPartitionDetailResp {
                 code: CODE_NOT_LEADER,
                 message: "not leader".to_string(),
                 load: PartitionLoad::default(),
                 bucket_ts: 0,
-            }));
+            };
         }
-        let req: GetPartitionDetailReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let p = self.policy.borrow();
-        let bucket = p.metrics.get(&req.part_id).and_then(|w| w.buckets.back());
+        let bucket = p.metrics.get(&part_id).and_then(|w| w.buckets.back());
         let (load, bucket_ts) = match bucket {
             Some((ts, l)) => (l.clone(), *ts),
             None => (PartitionLoad::default(), 0),
         };
-        Ok(rkyv_encode(&GetPartitionDetailResp {
+        GetPartitionDetailResp {
             code: CODE_OK,
             message: String::new(),
             load,
             bucket_ts,
-        }))
+        }
+    }
+
+    pub(crate) async fn handle_get_partition_detail(&self, payload: Bytes) -> HandlerResult {
+        let req: GetPartitionDetailReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        Ok(rkyv_encode(&self.compute_partition_detail_resp(req.part_id)))
     }
 
     /// Dashboard compact overview: per-partition rollup (range / ps / live_size
@@ -4549,13 +4557,16 @@ impl AutumnManager {
     // logs WARN but doesn't surface to the caller (the primary
     // operation already succeeded).
 
-    pub async fn handle_list_node_states(&self, _payload: Bytes) -> HandlerResult {
+    /// Pure builder for the per-node auto-state + override table. Shared by the
+    /// `MSG_LIST_NODE_STATES` handler and the in-process dashboard
+    /// (`dashboard.rs` node `auto_state` merge).
+    pub(crate) fn compute_list_node_states_resp(&self) -> ListNodeStatesResp {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&ListNodeStatesResp {
+            return ListNodeStatesResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
                 nodes: vec![],
-            }));
+            };
         }
         let (nodes_meta, overrides, snapshot) = {
             let s = self.store.inner.borrow();
@@ -4609,11 +4620,15 @@ impl AutumnManager {
             })
             .collect();
         out.sort_by_key(|e| e.node_id);
-        Ok(rkyv_encode(&ListNodeStatesResp {
+        ListNodeStatesResp {
             code: CODE_OK,
             message: String::new(),
             nodes: out,
-        }))
+        }
+    }
+
+    pub async fn handle_list_node_states(&self, _payload: Bytes) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_list_node_states_resp()))
     }
 
     pub async fn handle_extent_health_report(&self, payload: Bytes) -> HandlerResult {

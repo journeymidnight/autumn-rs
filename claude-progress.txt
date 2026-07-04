@@ -42,13 +42,28 @@ Verification (M0):
     timeout in cyper_axum::serve → active Slowloris cut-off not enforced; compensated
     by read-only-default + network-ACL guidance.
 
+M1 COMPLETE (2026-07-04): full read-only data parity.
+  · Extracted handle_get_partition_detail → compute_partition_detail_resp +
+    handle_list_node_states → compute_list_node_states_resp (behavior-preserving,
+    like M0's df/overview).
+  · New crates/manager/src/auto_policy.rs: ported pure fns describe_candidate /
+    candidate_to_cmd / cooldown_key / policy_kind_str (+4 unit tests). M2's
+    leader-fenced controller reuses these (ground floor).
+  · dashboard.rs: /api/partition/<id> real (full extChip contract role/size/open/
+    ec/ec_shape/replicas/refs/eversion/missing + distinct-extent dedup);
+    advisories[] filled from advisory_cache via the ported fns; node auto_state +
+    full NodeStateEntry merge (heartbeat/suspected-age/override) in /api/overview.
+  · coco findbugs on M1: 3 P2 parity regressions, all fixed + verified (extent
+    fields, node fields, cross-stream dedup).
+  · Verified: manager lib 177/177 (hermetic partition_detail_json extent-contract
+    test + 4 auto_policy tests), clippy clean; node-field parity confirmed against
+    a real registered EN. Full LIVE extent parity deferred to the dedicated cluster
+    host (multi-tenant port ranges block a local EN bring-up here).
+
 Main gaps / next steps:
-  · UNCOMMITTED. M0 is a clean checkpoint; awaiting user decision on commit
-    (solo-flow push-to-main) + coco review (rule 12).
-  · M1: full data parity — /api/partition/<id> (extract handle_get_partition_detail
-    to compute_*), advisories with desc/cmd/key (port describe_candidate/
-    candidate_to_cmd), node auto_state from handle_list_node_states, side-by-side
-    parity check vs the Python page on a live cluster.
+  · PUSH BLOCKED: origin/main unreachable via the GitHub proxy (Proxy CONNECT
+    timeout). M0 (6dd270d) + M1 commits are safe locally; push when connectivity
+    returns (`git push origin main`). Commits stack meanwhile.
   · M2: crates/manager/src/auto_policy.rs — ported decide_actions/candidate_to_cmd/
     cooldown_key + unit tests (from test_autumn_dashboard.py); MgrAutoPolicyConfig
     etcd keys (autoPolicy/config,cooldowns) + replay_from_etcd; spawn_supervised

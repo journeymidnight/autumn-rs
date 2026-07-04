@@ -16,8 +16,10 @@ mod rpc_handlers;
 // F-DASH-IN-MGR: embedded web dashboard + (M2+) leader-fenced auto-policy
 // controller, folding the retired standalone Python `python/dashboard/` into
 // the manager process (all-in-one; the controller survives as long as the
-// manager leader does). Hand-rolled HTTP/1.1 on a compio TcpListener.
+// manager leader does). axum over the compio-native cyper_axum::serve.
 mod dashboard;
+// F-DASH-IN-MGR: ported pure decision helpers (M1) → leader-fenced controller (M2).
+mod auto_policy;
 
 pub(crate) use extent_delete::PendingDelete;
 

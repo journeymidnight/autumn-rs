@@ -48,8 +48,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use send_wrapper::SendWrapper;
 
-use autumn_rpc::manager_rpc::{CODE_OK, NodeCapWire};
+use autumn_rpc::manager_rpc::{
+    CODE_OK, NodeCapWire, NodeStateEntry, NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED,
+    NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE,
+};
 
+use crate::auto_policy::{candidate_to_cmd, cooldown_key, describe_candidate, policy_kind_str};
 use crate::AutumnManager;
 
 /// `(epoch_second, rendered_json)` — a 1-second coalescing cache for
@@ -143,12 +147,19 @@ impl AutumnManager {
             })
         });
 
+        // Per-partition detail drawer (on-demand when a partition is expanded).
+        let mgr_pd = SendWrapper::new(self.clone());
+        let partition_route = get(move |Path(id): Path<String>| {
+            let mgr = mgr_pd.clone();
+            SendWrapper::new(async move { partition_detail_response(&mgr, &id) })
+        });
+
         Router::new()
             .route("/", get(index_handler))
             .route("/healthz", get(healthz_handler))
             .route("/api/overview", overview_route)
+            .route("/api/partition/{id}", partition_route)
             // ── stubs (real impls land in later milestones) ──────────────────
-            .route("/api/partition/{id}", get(partition_stub))
             .route("/api/policies", get(policies_stub))
             // The page POSTs to these three (Create/activate/delete policy); they
             // MUST return page-shaped JSON, not a bare 404 that breaks its
@@ -181,6 +192,13 @@ impl AutumnManager {
             (!a.range_start.is_empty(), &a.range_start)
                 .cmp(&(!b.range_start.is_empty(), &b.range_start))
         });
+
+        // Full per-node state (auto_state + heartbeat + suspected-age +
+        // override) so the node-detail drawer has everything the Python
+        // `build_overview` merged from `list-nodes` (coco P2).
+        let node_states = self.compute_list_node_states_resp();
+        let ns_by_id: std::collections::HashMap<u64, &NodeStateEntry> =
+            node_states.nodes.iter().map(|n| (n.node_id, n)).collect();
 
         let mut errors: Vec<String> = Vec::new();
         if df.code != CODE_OK {
@@ -234,6 +252,11 @@ impl AutumnManager {
             .iter()
             .map(|n| {
                 let dn = df_by_node.get(&n.node_id);
+                let ns = ns_by_id.get(&n.node_id);
+                // u64::MAX = "never heartbeated" → null so the page shows "-".
+                let heartbeat = ns
+                    .map(|x| x.last_heartbeat_secs_ago)
+                    .filter(|v| *v != u64::MAX);
                 json!({
                     "node_id": n.node_id,
                     "address": n.address,
@@ -242,6 +265,14 @@ impl AutumnManager {
                     "total": dn.map(|d| d.total),
                     "extent_bytes": dn.map(|d| d.extent_bytes),
                     "online": dn.map(|d| d.online).unwrap_or(false),
+                    "auto_state": ns.map(|x| node_auto_state_str(x.auto_state)).unwrap_or("Online"),
+                    "last_heartbeat_secs_ago": heartbeat,
+                    "suspected_age_secs": ns.map(|x| x.suspected_age_secs),
+                    "override_kind": ns.map(|x| node_override_kind_str(x.override_kind)).unwrap_or("-"),
+                    "override_reason": ns.map(|x| x.override_reason.clone()).unwrap_or_default(),
+                    "override_set_by": ns.map(|x| x.override_set_by.clone()).unwrap_or_default(),
+                    "override_set_at": ns.map(|x| x.override_set_at).unwrap_or(0),
+                    "override_expire_at": ns.map(|x| x.override_expire_at).unwrap_or(0),
                 })
             })
             .collect();
@@ -284,6 +315,27 @@ impl AutumnManager {
             .collect();
         ps_roll_vec.sort_by_key(|v| v.get("ps_id").and_then(|x| x.as_u64()).unwrap_or(0));
 
+        // Pending policy advisories (leader-only `advisory_cache`), rendered
+        // through the M1-ported helpers — M2's controller decides on the SAME
+        // fns. `cmd` is null for advisory-only kinds (hotcold).
+        let advisories: Vec<serde_json::Value> = self
+            .policy
+            .borrow()
+            .advisory_cache
+            .iter()
+            .map(|c| {
+                json!({
+                    "kind": policy_kind_str(c.kind),
+                    "primary_part_id": c.primary_part_id,
+                    "secondary_part_id": c.secondary_part_id,
+                    "reason": c.reason,
+                    "desc": describe_candidate(c),
+                    "cmd": candidate_to_cmd(c),
+                    "key": cooldown_key(c),
+                })
+            })
+            .collect();
+
         json!({
             "ts": ts,
             "df": df_json,
@@ -295,7 +347,130 @@ impl AutumnManager {
             "total_req_per_sec": ov.total_req_per_sec,
             "total_write_bytes_per_sec": ov.total_write_bytes_per_sec,
             "total_read_bytes_per_sec": ov.total_read_bytes_per_sec,
-            "advisories": [],           // M1
+            "advisories": advisories,
+            "errors": errors,
+        })
+        .to_string()
+    }
+
+    /// Build the `/api/partition/<id>` JSON (the per-partition detail drawer),
+    /// byte-compatible with the Python `partition_detail` contract: load metrics
+    /// from the cached `PartitionLoad` + topology/extents read directly from the
+    /// store (the partition's 3 streams). Cheap (O(this partition's extents)) —
+    /// no cache needed (called on-demand when one partition is expanded).
+    fn partition_detail_json(&self, pid: u64) -> String {
+        use serde_json::json;
+
+        let detail = self.compute_partition_detail_resp(pid);
+        let load = &detail.load;
+        let mut errors: Vec<String> = Vec::new();
+        if detail.code != CODE_OK {
+            errors.push(format!("detail: {}", detail.message));
+        }
+
+        let (ps_addr, range_start, range_end, extents, live_size) = {
+            let s = self.store.inner.borrow();
+            match s.regions.get(&pid) {
+                Some(r) => {
+                    let ps_addr = s
+                        .part_addrs
+                        .get(&pid)
+                        .or_else(|| s.ps_nodes.get(&r.ps_id))
+                        .cloned()
+                        .unwrap_or_default();
+                    let (rs, re) = r
+                        .rg
+                        .as_ref()
+                        .map(|g| (g.start_key.clone(), g.end_key.clone()))
+                        .unwrap_or_default();
+                    // Distinct extents across the 3 streams (dedup like
+                    // `autumn-op info --part` — coco P3), each rendered with the
+                    // full `extChip` contract (role/size/open/ec/ec_shape/
+                    // replicas/refs/eversion/missing — coco P1). `role` = the
+                    // stream it belongs to; `ec_shape` = its stream's K+M.
+                    let mut extents: Vec<serde_json::Value> = Vec::new();
+                    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                    let mut live = 0u64;
+                    for (role, sid) in [
+                        ("log", r.log_stream),
+                        ("row", r.row_stream),
+                        ("meta", r.meta_stream),
+                    ] {
+                        let Some(st) = s.streams.get(&sid) else { continue };
+                        let (k, m) = (st.ec_data_shard, st.ec_parity_shard);
+                        for eid in &st.extent_ids {
+                            if !seen.insert(*eid) {
+                                continue; // distinct extents only
+                            }
+                            match s.extents.get(eid) {
+                                Some(e) => {
+                                    live = live.saturating_add(e.sealed_length);
+                                    let replicas: Vec<u64> =
+                                        e.replicates.iter().chain(e.parity.iter()).copied().collect();
+                                    let ec_shape = if e.ec_converted {
+                                        format!("{k}+{m}")
+                                    } else {
+                                        String::new()
+                                    };
+                                    extents.push(json!({
+                                        "extent_id": eid,
+                                        "role": role,
+                                        "size": e.sealed_length,
+                                        "open": !e.sealed,
+                                        "ec": e.ec_converted,
+                                        "ec_shape": ec_shape,
+                                        "replicas": replicas,
+                                        "refs": e.refs,
+                                        "eversion": e.eversion,
+                                        "missing": false,
+                                    }));
+                                }
+                                None => {
+                                    // Referenced by the stream but absent from
+                                    // `extents` — surface it, don't hide it.
+                                    extents.push(json!({
+                                        "extent_id": eid,
+                                        "role": role,
+                                        "size": 0,
+                                        "open": false,
+                                        "ec": false,
+                                        "ec_shape": "",
+                                        "replicas": [],
+                                        "refs": 0,
+                                        "eversion": 0,
+                                        "missing": true,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    (ps_addr, rs, re, extents, live)
+                }
+                None => {
+                    errors.push(format!("partition {pid} not found"));
+                    (String::new(), Vec::new(), Vec::new(), Vec::new(), 0u64)
+                }
+            }
+        };
+
+        // Reported size when the PS has flushed; else the topology rollup.
+        let size_bytes = if load.size_bytes > 0 { load.size_bytes } else { live_size };
+        json!({
+            "part_id": pid,
+            "ps_addr": ps_addr,
+            "range_start": String::from_utf8_lossy(&range_start),
+            "range_end": String::from_utf8_lossy(&range_end),
+            "req_per_sec": load.req_per_sec,
+            "write_bytes_per_sec": load.write_bytes_per_sec,
+            "read_bytes_per_sec": load.read_bytes_per_sec,
+            "p99_us": load.p99_us,
+            "size_bytes": size_bytes,
+            "gc_debt_bytes": load.gc_debt_bytes,
+            "pending_compaction_bytes": load.pending_compaction_bytes,
+            "gc_inflight": load.gc_inflight != 0,
+            "compact_inflight": load.compact_inflight != 0,
+            "sealed_log_extent_count": load.sealed_log_extent_count,
+            "extents": extents,
             "errors": errors,
         })
         .to_string()
@@ -334,15 +509,41 @@ fn overview_cached(mgr: &AutumnManager, cache: &OverviewCache) -> Response<Body>
     json_response(StatusCode::OK, json, "application/json")
 }
 
-// ── stubs (later milestones) ─────────────────────────────────────────────────
-
-async fn partition_stub(Path(_id): Path<String>) -> Response<Body> {
-    json_response(
-        StatusCode::OK,
-        r#"{"extents":[],"errors":["partition detail not implemented until M1"]}"#.to_string(),
-        "application/json",
-    )
+/// `/api/partition/<id>` — parse the id, then render the detail JSON. A bad id
+/// returns page-shaped JSON (not axum's default text 400) so `r.json()` holds.
+fn partition_detail_response(mgr: &AutumnManager, id: &str) -> Response<Body> {
+    match id.parse::<u64>() {
+        Ok(pid) => json_response(StatusCode::OK, mgr.partition_detail_json(pid), "application/json"),
+        Err(_) => json_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"bad partition id","extents":[]}"#.to_string(),
+            "application/json",
+        ),
+    }
 }
+
+/// Node auto-state byte → the string the page shows (matches autumn-op's
+/// `auto_state_str`).
+fn node_auto_state_str(b: u8) -> &'static str {
+    match b {
+        NODE_AUTO_STATE_ONLINE => "Online",
+        NODE_AUTO_STATE_SUSPECTED => "Suspected",
+        NODE_AUTO_STATE_SUSPEND => "Suspend",
+        _ => "Online",
+    }
+}
+
+/// Override-kind byte → the page string (`"-"` = no override; matches
+/// autumn-op's `override_kind_str`).
+fn node_override_kind_str(b: u8) -> &'static str {
+    match b {
+        NODE_OVERRIDE_FENCED => "fenced",
+        NODE_OVERRIDE_MAINTENANCE => "maintenance",
+        _ => "-",
+    }
+}
+
+// ── stubs (later milestones) ─────────────────────────────────────────────────
 
 async fn policies_stub() -> Response<Body> {
     json_response(
@@ -413,5 +614,122 @@ mod tests {
             assert!(v["df"].get(k).is_some(), "df JSON missing key `{k}`");
         }
         assert!(v["errors"].is_array());
+    }
+
+    #[test]
+    fn partition_detail_json_renders_full_extent_contract() {
+        use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrRange, MgrRegionInfo, MgrStreamInfo};
+        let mgr = AutumnManager::new(); // memory mode → leader=true
+        {
+            let mut s = mgr.store.inner.borrow_mut();
+            s.regions.insert(
+                1,
+                MgrRegionInfo {
+                    rg: Some(MgrRange {
+                        start_key: b"a".to_vec(),
+                        end_key: b"z".to_vec(),
+                    }),
+                    part_id: 1,
+                    ps_id: 7,
+                    log_stream: 10,
+                    row_stream: 11,
+                    meta_stream: 12,
+                    region_epoch: 1,
+                },
+            );
+            s.part_addrs.insert(1, "127.0.0.1:9301".to_string());
+            // log stream: an EC-converted sealed extent (100, K+M=3+1) + an open
+            // tail (101). Extent 100 is ALSO listed in the row stream to exercise
+            // the cross-stream dedup path (must appear ONCE, role="log").
+            s.streams.insert(
+                10,
+                MgrStreamInfo {
+                    stream_id: 10,
+                    extent_ids: vec![100, 101],
+                    ec_data_shard: 3,
+                    ec_parity_shard: 1,
+                    replicates: 3,
+                },
+            );
+            s.streams.insert(
+                11,
+                MgrStreamInfo {
+                    stream_id: 11,
+                    extent_ids: vec![100],
+                    ec_data_shard: 0,
+                    ec_parity_shard: 0,
+                    replicates: 1,
+                },
+            );
+            s.streams.insert(
+                12,
+                MgrStreamInfo {
+                    stream_id: 12,
+                    extent_ids: vec![],
+                    ec_data_shard: 0,
+                    ec_parity_shard: 0,
+                    replicates: 1,
+                },
+            );
+            s.extents.insert(
+                100,
+                MgrExtentInfo {
+                    extent_id: 100,
+                    replicates: vec![1, 2, 3],
+                    parity: vec![4],
+                    eversion: 5,
+                    refs: 2,
+                    vp_table_refs: 0,
+                    sealed_length: 8192,
+                    sealed: true,
+                    avali: 0xF,
+                    replicate_disks: vec![],
+                    parity_disks: vec![],
+                    ec_converted: true,
+                },
+            );
+            s.extents.insert(
+                101,
+                MgrExtentInfo {
+                    extent_id: 101,
+                    replicates: vec![1],
+                    parity: vec![],
+                    eversion: 1,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 0,
+                    sealed: false,
+                    avali: 1,
+                    replicate_disks: vec![],
+                    parity_disks: vec![],
+                    ec_converted: false,
+                },
+            );
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&mgr.partition_detail_json(1)).expect("valid JSON");
+        assert_eq!(v["part_id"], 1);
+        assert_eq!(v["ps_addr"], "127.0.0.1:9301");
+        assert_eq!(v["range_start"], "a");
+        assert_eq!(v["range_end"], "z");
+        let exts = v["extents"].as_array().unwrap();
+        assert_eq!(exts.len(), 2, "extent 100 shared across streams must dedup");
+
+        let e100 = exts.iter().find(|e| e["extent_id"] == 100).unwrap();
+        assert_eq!(e100["role"], "log", "first-seen stream wins");
+        assert_eq!(e100["ec"], true);
+        assert_eq!(e100["ec_shape"], "3+1");
+        assert_eq!(e100["open"], false);
+        assert_eq!(e100["size"], 8192);
+        assert_eq!(e100["refs"], 2);
+        assert_eq!(e100["eversion"], 5);
+        assert_eq!(e100["replicas"], serde_json::json!([1, 2, 3, 4])); // replicates ∪ parity
+        assert_eq!(e100["missing"], false);
+
+        let e101 = exts.iter().find(|e| e["extent_id"] == 101).unwrap();
+        assert_eq!(e101["open"], true);
+        assert_eq!(e101["ec"], false);
+        assert_eq!(e101["ec_shape"], "");
+        assert_eq!(e101["replicas"], serde_json::json!([1]));
     }
 }
