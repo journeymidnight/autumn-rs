@@ -167,7 +167,7 @@ footer a { color:var(--accent); text-decoration:none; } footer a:hover { text-de
     <div class="graph-wrap">
       <div id="graph3d"></div>
       <div class="legend" id="legend"><h4>Node kinds</h4></div>
-      <div class="graph-hint">drag to rotate · scroll to zoom · click a node → source</div>
+      <div class="graph-hint">drag · scroll to zoom · click a node → source</div>
       <div class="graph-loading" id="graph-loading">building graph…</div>
     </div>
 
@@ -187,22 +187,33 @@ footer a { color:var(--accent); text-decoration:none; } footer a:hover { text-de
 </div>
 
 <script>
-// Load 3d-force-graph from the first CDN that works (unpkg is often blocked in
-// some regions; fastly/jsdelivr mirrors usually aren't).
-(function(){
-  var cdns = [
-    "https://fastly.jsdelivr.net/npm/3d-force-graph",
-    "https://cdn.jsdelivr.net/npm/3d-force-graph",
-    "https://unpkg.com/3d-force-graph"
-  ];
+// Prefer the 3D (WebGL / three.js) force-graph — it looks best and matches the
+// reference. Fall back to the 2D canvas build automatically when WebGL is
+// unavailable (e.g. hardware acceleration disabled), so the graph is never blank.
+// Try the first CDN that works (unpkg is often blocked; fastly/jsdelivr aren't).
+function loadFirst(urls){
   var i = 0;
   (function load(){
-    if(i >= cdns.length) return;
+    if(i >= urls.length) return;
     var s = document.createElement("script");
-    s.src = cdns[i++]; s.onerror = load;
+    s.src = urls[i++]; s.onerror = load;
     document.head.appendChild(s);
   })();
-})();
+}
+function hasWebGL(){
+  try { var c = document.createElement("canvas");
+    return !!(window.WebGLRenderingContext && (c.getContext("webgl2") || c.getContext("webgl"))); }
+  catch(e){ return false; }
+}
+if(hasWebGL()){
+  loadFirst(["https://fastly.jsdelivr.net/npm/3d-force-graph",
+             "https://cdn.jsdelivr.net/npm/3d-force-graph",
+             "https://unpkg.com/3d-force-graph"]);
+} else {
+  loadFirst(["https://fastly.jsdelivr.net/npm/force-graph",
+             "https://cdn.jsdelivr.net/npm/force-graph",
+             "https://unpkg.com/force-graph"]);
+}
 </script>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -272,7 +283,7 @@ async function openSym(id){
 function graphMsg(t){ const el=$("graph-loading"); el.style.display="flex"; el.textContent=t; }
 async function waitForLib(ms){
   const t0 = Date.now();
-  while(typeof ForceGraph3D === "undefined"){
+  while(typeof ForceGraph3D === "undefined" && typeof ForceGraph === "undefined"){
     if(Date.now()-t0 > ms) return false;
     await new Promise(r => setTimeout(r, 150));
   }
@@ -280,9 +291,9 @@ async function waitForLib(ms){
 }
 async function initGraph(){
   const el = $("graph3d");
-  graphMsg("loading 3d-force-graph…");
+  graphMsg("loading force-graph…");
   if(!await waitForLib(9000)){
-    graphMsg("3d-force-graph didn't load — all CDNs (jsdelivr/fastly/unpkg) are blocked or offline. Connect to a network that can reach a CDN, or vendor the library locally.");
+    graphMsg("force-graph didn't load — all CDNs (jsdelivr/fastly/unpkg) are blocked or offline. Connect to a network that can reach a CDN, or vendor the library locally.");
     return;
   }
   let data;
@@ -298,19 +309,23 @@ async function initGraph(){
   const w = el.clientWidth || el.parentElement.clientWidth || window.innerWidth - 60;
   const h = el.clientHeight || Math.round(window.innerHeight * 0.7);
   const big = data.nodes.length > 800;
-  Graph = ForceGraph3D()(el)
+  const use3d = typeof ForceGraph3D !== "undefined";
+  const FG = use3d ? ForceGraph3D : ForceGraph;
+  // Options common to both the 3D (WebGL) and 2D (canvas) builds.
+  Graph = FG()(el)
     .width(w).height(h)
     .graphData(data)
     .backgroundColor("#0a0a0b")
     .nodeLabel(n => `${n.name}  ·  ${n.kind}`)
     .nodeColor(n => kcol(n.kind))
     .nodeVisibility(n => !hidden[n.kind])
-    .nodeRelSize(3)
-    .nodeResolution(6)
-    .nodeOpacity(0.9)
-    .linkColor(() => "rgba(120,130,150,0.12)")
-    .linkWidth(0.3)
-    .linkResolution(3)
+    .nodeRelSize(use3d ? 3 : 4)
+    // Edges = call relationships. Draw them clearly, with a directional arrow
+    // pointing caller → callee so the call graph is readable.
+    .linkColor(() => "rgba(150,162,186,0.38)")
+    .linkWidth(use3d ? 0.6 : 1)
+    .linkDirectionalArrowLength(use3d ? 2.4 : 3)
+    .linkDirectionalArrowRelPos(1)
     // Settle fast, then FREEZE: a fixed tick budget stops the per-frame physics
     // (the source of the rAF jank on big graphs), leaving a static, cheap scene.
     .d3AlphaDecay(0.06)
@@ -318,6 +333,19 @@ async function initGraph(){
     .cooldownTicks(big ? 60 : 120)
     .onEngineStop(() => { if(Graph) Graph.zoomToFit(500, 50); })
     .onNodeClick(n => openSym(n.id));
+  if(use3d){
+    Graph.nodeResolution(6).nodeOpacity(0.9).linkOpacity(0.5);
+  } else {
+    // 2D fallback: draw the symbol name beside its node once zoomed in (skip on
+    // big graphs / far zoom to keep the canvas cheap).
+    Graph.nodeCanvasObjectMode(() => "after").nodeCanvasObject((n, ctx, scale) => {
+      if(big || scale < 2 || hidden[n.kind]) return;
+      ctx.font = `${11/scale}px "DM Mono", monospace`;
+      ctx.fillStyle = "rgba(230,230,235,0.85)";
+      ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillText(n.name, n.x + 5/scale, n.y);
+    });
+  }
   if(data.truncated) $("legend").insertAdjacentHTML("beforeend", `<div class="k" style="cursor:default;margin-top:6px;color:var(--text-muted)">showing ${data.nodes.length} of ${data.total_nodes} nodes (most-connected) · narrow with --root</div>`);
   addEventListener("resize", () => { if(Graph){ Graph.width(el.clientWidth); Graph.height(el.clientHeight); } });
 }
