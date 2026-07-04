@@ -4,11 +4,11 @@
 
 Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
-Consumers are Rust: two example apps use the crate directly (web UI + MCP) —
-`examples/codebase-memory` (index/search a codebase) and
-`examples/memory-browser` (general agent memory: search / facts / episodic /
-graph). The former Python ergonomic layer + `autumn.Memory` PyO3 binding were
-dropped (2026-07-03) once all consumers went Rust. Design + rationale:
+Consumers are Rust: the `examples/codebase-memory` app uses the crate directly
+(web UI + MCP) to index/search a codebase and walk its call graph. The former
+Python ergonomic layer + `autumn.Memory` PyO3 binding were dropped (2026-07-03)
+once all consumers went Rust; the `examples/memory-browser` app was dropped
+(2026-07-03, user directive — not intuitive). Design + rationale:
 `docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
@@ -38,7 +38,7 @@ hashing — always available) and, behind the **`static-embed`** feature,
 `StaticTableEmbedder` (a Model2Vec-style int8 lookup table, needs `tokenizers`).
 `Embedder` dispatches; all emit an `EMBED_DIM`-length L2-normalized vector.
 Errors are a local `EmbedError` (the core takes no `anyhow` dep). The `gallery`-
-style examples (`examples/codebase-memory`, `examples/memory-browser`) use it.
+style example `examples/codebase-memory` uses it.
 
 ## Lexical recall — BM25-on-KV (`recall.rs`, plan §7 词法腿)
 

@@ -46,9 +46,9 @@ self-healing extents.
   prefix-cache hits.
 - **Agent memory** — `autumn-memory`: episodic logs, a fact store, an
   associative graph, and retrieval that combines **BM25** (CJK-aware), **IVF
-  vector search**, and **hybrid RRF** — entirely client-side on plain KV. Two
-  Rust example apps (web UI + **MCP** `--mcp` stdio) sit on it — `codebase-memory`
-  and `memory-browser`; recall P99 ≈ 25 ms on the agent turn loop.
+  vector search**, and **hybrid RRF** — entirely client-side on plain KV. A
+  Rust example app (web UI + **MCP** `--mcp` stdio) sits on it — `codebase-memory`
+  indexes this repo's own source; recall P99 ≈ 25 ms on the agent turn loop.
 
 **The engine underneath:**
 - **Fast by construction** — thread-per-core on io_uring (compio), custom binary
@@ -146,22 +146,19 @@ design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
 
 ### Agent memory — web UI + MCP
 
-Two Rust example apps sit on `autumn-memory` (an Axum web UI + an MCP `--mcp`
-stdio mode, so any MCP host — Claude Code/Desktop, Cursor — gets the same tools):
-
-- **`examples/codebase-memory`** — index a codebase (autumn-rs itself) and search
-  it (lexical / vector / hybrid) with a call graph you can walk.
-- **`examples/memory-browser`** — general agent memory: remembered notes, facts
-  (with TTL), an episodic timeline, and an associative graph of linked memories.
+**`examples/codebase-memory`** sits on `autumn-memory` (an Axum web UI + an MCP
+`--mcp` stdio mode, so any MCP host — Claude Code/Desktop, Cursor — gets the same
+tools): it indexes a codebase (autumn-rs itself), searches it (lexical / vector /
+hybrid), and renders a call graph you can walk.
 
 ```bash
-cargo run -p memory-browser -- 127.0.0.1:9001        # web UI at :5200
-claude mcp add memory -- cargo run -q -p memory-browser -- 127.0.0.1:9001 --mcp
+cargo run -p codebase-memory -- 127.0.0.1:9001 --root crates/autumn-memory   # web UI at :5180
+claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- 127.0.0.1:9001 --mcp
 ```
 
 Lexical (BM25) recall needs no embedder; vector/hybrid take a caller-supplied
-vector (the examples ship a zero-dep hash embedder + an optional Model2Vec
-static-int8 one). Design:
+vector (`autumn-memory`'s built-in `embed` module ships a zero-dep hash embedder
++ an optional Model2Vec static-int8 one). Design:
 [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md).
 
 ## Deployment

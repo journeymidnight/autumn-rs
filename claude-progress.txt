@@ -1,32 +1,32 @@
 Date: 2026-07-03
 TaskStatus: completed
-Task scope: 把 autumn-memory 的上层消费者全部 Rust 化,删除 Python glue。
-  最终形态:autumn-memory (Rust core) + 两个 Rust example(codebase-memory、memory-browser),
-  各自 Axum 网页 UI + --mcp stdio。Python 侧只保留 autumn 绑定的 Client/BatchClient(供 autumn_kvcache)。
+Task scope: codebase-memory 图可视化修复(空白图 → 可渲染) + 删除 memory-browser example。
+  最终形态:autumn-memory (Rust core) + 唯一 Rust example(codebase-memory),
+  Axum 网页 UI + --mcp stdio。Python 侧只保留 autumn 绑定的 Client/BatchClient(供 autumn_kvcache)。
 
 本轮完成:
-  · F-MEM-13 graph 核心(nodes/edges/adjacency/bfs + reconcile 图完整性):22/22 单测 + e2e 绿。
-  · examples/codebase-memory(Rust):tree-sitter-rust 索引 autumn-rs 自身;网页搜索(词法/向量/混合)
-    + 调用图;3D 图可视化(多 CDN 兜底 + settle-then-freeze physics);--mcp;--reset;
-    key migration 已由用户跑完(gallery 那条无关)。真集群端到端验证过。
-  · examples/memory-browser(Rust,新):通用 agent memory 浏览器 + MCP。4 tab:Search(remember+检索)、
-    Facts(带 TTL)、Timeline(episodic)、Graph(联想图 3D)。--mcp 11 个 tool;--reset;端到端验证过。
-  · gallery namespace 修复:所有 key 挂到 gallery/ 前缀,两处全键扫描收敛到 range("gallery/");
-    migrate_ns.py 迁移脚本(安全白名单,用户已迁移 5563 key,16 个坏 thumbnail 是 extent 43 丢失的旧问题)。
-  · 删除:python/autumn_memory(人体工学层+embedder.py+tests)、examples/hermes_memory_autumn、
-    autumn.Memory PyO3 绑定(python/src/memory.rs + lib.rs 注册 + python/Cargo.toml 的 autumn-memory 依赖)、
-    autumn_memory_langgraph、autumn_memory_mcp。
-  · 文档:README(去掉 Python stack/Hermes,改指 Rust examples)、crates/autumn-memory/CLAUDE.md purpose、
-    feature_list(F-MEM-2/6 标注 REMOVED;新增 F-MEM-14 codebase-memory、F-MEM-15 memory-browser)。
+  · 图空白根因链(codebase-memory Graph tab):
+    (1) showView 用 style.display="" → 回退到 CSS #view-graph{display:none},Graph tab 从不显示
+        (已在上一提交 90dc541 修复为 display:block)。
+    (2) 视图显示后画布仍全黑:3d-force-graph 依赖 WebGL,而 claude-in-chrome 沙盒浏览器 WebGL 被禁用
+        (THREE.WebGLRenderer: could not create WebGL context, Sandboxed=yes)。用户真实 Chrome 支持 WebGL。
+    (3) 边(连线)几乎不可见:linkColor alpha 太低 + 无方向箭头。
+  · 修复方案(codebase-memory static/index.html):
+    - WebGL feature-detect(hasWebGL()):可用 → 3D `3d-force-graph`(最好看,对齐参考 repo);
+      不可用 → 自动回退 2D `force-graph`(纯 canvas,永不空白)。多 CDN 兜底不变。
+    - 方向箭头边(caller→callee)+ 提高 linkColor 透明度,调用图清晰可读。
+    - 2D 回退路径下沙盒内已验证:192 节点 + 521 连线全部渲染,legend 分类计数正确。
+    - 用户真实浏览器将走 3D WebGL 路径(更好看,同样的显眼方向边)。
+  · 删除 examples/memory-browser(用户指令 "不直观"):
+    - 删目录;从 workspace Cargo.toml members 移除;README / crates/autumn-memory/CLAUDE.md 引用清理;
+      feature_list F-MEM-15 状态标注 REMOVED(Python-glue 删除部分仍有效);Graph UI 条目改为 codebase-memory only。
 
 验证:
-  · cargo build/clippy:gallery、codebase-memory、memory-browser 全绿。
-  · autumn 绑定 clippy 绿(移除 Memory 后);cargo build 的 link 报错是 PyO3 extension-module 独立链接
-    的固有现象(maturin 才有 -undefined dynamic_lookup),非真错误。
-  · autumn-memory 22/22 lib 单测绿。
-  · 两个 example 真集群端到端(remember/search/facts/episodic/graph/link/stats + --mcp)全通。
+  · cargo build --workspace 绿;cargo clippy -p codebase-memory 绿;无残留 memory-browser 代码引用。
+  · codebase-memory 真集群(127.0.0.1:9001,--root crates/autumn-memory,agent gtest)端到端:
+    /stats {docs:192,edges:521,is_clean:true};Graph tab 在 Chrome 中渲染 192 节点 + 521 连线(2D 回退路径)。
+  · autumn-memory graph 核心(F-MEM-13)不变,22/22 lib 单测此前已绿。
 
 Main gaps / next steps:
-  · 全部 UNCOMMITTED,等用户决定 commit 划分(建议:graph 核心 / gallery namespace / python glue 删除 /
-    codebase-memory / memory-browser 分开)。
-  · codebase-memory 需重新 build+restart 才能拿到 graph perf/CDN/MCP-footer 修复。
+  · 本轮改动 UNCOMMITTED(index.html 3D/2D 混合渲染 + 删 memory-browser + 文档/账本更新)。
+  · 用户可在真实 Chrome 验证 3D WebGL 效果;若某机器 WebGL 关闭会自动降级 2D,不再空白。

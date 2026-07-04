@@ -14,7 +14,6 @@ members = [
   "crates/autumn-memory",
   "examples/gallery",
   "examples/codebase-memory",
-  "examples/memory-browser",
 ]
 default-members = [
   "crates/common",
