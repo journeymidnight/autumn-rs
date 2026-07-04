@@ -594,6 +594,54 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// F-DASH-IN-MGR M2: read the auto-policy controller state
+    /// (`MSG_AUTOPOLICY_GET`). Leader-routed (rotates on NOT_LEADER).
+    pub async fn auto_policy_get(&self) -> Result<AutoPolicyGetResp> {
+        let req = rkyv_encode(&AutoPolicyGetReq {});
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: AutoPolicyGetResp = self
+            .mgr_call_leader(
+                MSG_AUTOPOLICY_GET,
+                req,
+                "auto_policy_get",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: AutoPolicyGetResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("auto_policy_get failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// F-DASH-IN-MGR M2: apply an auto-policy op (`MSG_AUTOPOLICY_SET`).
+    /// Leader-routed; the manager persists the new config to etcd.
+    pub async fn auto_policy_set(&self, req: AutoPolicySetReq) -> Result<AutoPolicySetResp> {
+        let payload = rkyv_encode(&req);
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: AutoPolicySetResp = self
+            .mgr_call_leader(
+                MSG_AUTOPOLICY_SET,
+                payload,
+                "auto_policy_set",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: AutoPolicySetResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("auto_policy_set failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
     /// F-FS-UNIFY M0: grant a contiguous batch of fuse-fs inode numbers
     /// `[base, base + count)` from the manager's crash-safe allocator
     /// (leader-fenced etcd CAS — concurrent allocators always receive

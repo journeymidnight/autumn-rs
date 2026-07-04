@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 11;
-pub const WIRE_VERSION_MAX: u32 = 11;
+pub const WIRE_VERSION_MIN: u32 = 12;
+pub const WIRE_VERSION_MAX: u32 = 12;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -146,6 +146,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // batches under concurrent allocators. Pre-R3: MIN=MAX=11 (same-commit
     // deploy; rkyv has no cross-version decode).
     (11, "8a586475b2930f0f"),
+    // v12: F-DASH-IN-MGR M2 — manager_rpc gained MSG_AUTOPOLICY_GET (0x54) /
+    // MSG_AUTOPOLICY_SET (0x55) + MgrAutoPolicyEntry / MgrAutoPolicyConfig /
+    // MgrAutoPolicyCooldowns / AutoPolicyLogEntry / AutoPolicyGetReq/Resp /
+    // AutoPolicySetReq/Resp: the in-manager auto-policy controller's headless
+    // control + etcd-persisted config (folded in from the retired Python
+    // dashboard). Pre-R3: MIN=MAX=12 (same-commit deploy; rkyv has no
+    // cross-version decode).
+    (12, "c2ae65efd6e168f6"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

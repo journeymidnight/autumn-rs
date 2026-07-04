@@ -2,77 +2,51 @@ Date: 2026-07-04
 TaskStatus: not_completed
 Task scope: F-DASH-IN-MGR — fold the standalone Python web dashboard + auto-policy
   controller (python/dashboard/) into the autumn-manager binary. All-in-one, HTML
-  embedded via include_str!, and (M2+) the auto-policy loop runs as a leader-fenced
-  manager background task so it survives as long as the leader does (the Python
-  webserver could be killed, stopping all auto-policy). User decision: autoPolicy
-  runs ONLY on the etcd leader. Full plan: docs/dashboard_in_manager_plan.md.
+  embedded via include_str!, the auto-policy loop runs as a leader-fenced manager
+  background task so it survives as long as the leader does. autoPolicy runs ONLY on
+  the etcd leader. Full plan: docs/dashboard_in_manager_plan.md. Milestones M0-M4.
 
-Current summary:
-  · Plan produced by a Fable planning sub-agent + verified against real symbols;
-    4 design forks decided by the user (rollout=on-by-default bound to manager host;
-    one flag arms both loop+UI; retire python/dashboard/ fully; include autumn-op
-    auto-policy subcommands). Design doc: docs/dashboard_in_manager_plan.md.
-  · M0 COMPLETE + verified. New crates/manager/src/dashboard.rs: axum served by the
-    compio-native cyper_axum::serve over a compio TcpListener — SAME HTTP stack as
-    examples/gallery (user decision mid-M0: first shipped hand-rolled, then switched
-    for one web-serving pattern across the repo). send_wrapper::SendWrapper bridges
-    axum's Send bound over the !Send manager (gallery idiom). Under spawn_supervised
-    (F228); include_str! of the copied 29 KB dashboard_web.html. Endpoints: GET /
-    (page), /healthz, /api/overview (read-only, in-process, byte-compatible with the
-    Python build_overview contract), stubs for /api/partition/<id> (M1), /api/policies
-    (M2), POST /api/action (M3). handle_cluster_df + handle_get_cluster_overview
-    refactored to compute_*_resp pure builders (rpc_handlers.rs) reused directly by
-    the dashboard (no self-RPC). Flags --dashboard-port/--dashboard-listen/
-    --dashboard-allow-mutations wired in crates/server/src/bin/manager.rs
-    (start_dashboard before serve()). Deps added to manager crate: axum, cyper-axum,
-    send_wrapper, serde_json (dashboard-only; RPC stays rkyv).
+M0 DONE (pushed, 711ece0): embedded axum dashboard (cyper_axum::serve, gallery stack)
+  in the manager; /api/overview read-only; flags --dashboard-*. 2 coco rounds.
+M1 DONE (pushed, 9f5b3d0): full read-only data parity — /api/partition/<id> (full
+  extChip contract + dedup), advisories[], node auto_state + full NodeStateEntry.
+  auto_policy.rs ported pure fns. coco round (3 parity fixes). 177 tests.
 
-Verification (M0):
-  · cargo check + clippy -p autumn-manager + server bin: clean (0 warnings).
-  · cargo test -p autumn-manager --lib: 172/172 (was 171; +1 overview_json contract
-    test; the 4 hand-rolled-parser tests were removed with the parser).
-  · e2e smoke: memory-mode manager on :19001 + dashboard :18799 — GET / serves the
-    byte-exact 29680-byte page, /api/overview returns python-valid JSON with all
-    contract keys, /healthz 200, unknown 404, POST /api/action 403 read-only; RPC
-    plane concurrently live.
-  · coco findbugs (GPT-5.5) ran on the FIRST (hand-rolled) M0 diff: P1 no read
-    timeout (Slowloris) + P2 unchecked Content-Length arithmetic. The axum switch
-    dissolves both (hyper rejects hostile Content-Length: u64::MAX → 431 no crash;
-    DefaultBodyLimit caps bodies). Residual (documented, = gallery): no header-read
-    timeout in cyper_axum::serve → active Slowloris cut-off not enforced; compensated
-    by read-only-default + network-ACL guidance.
+M2 COMPLETE (2026-07-04, UNCOMMITTED): leader-fenced auto-policy controller + etcd config.
+  · Wire (WIRE v12, fp c2ae65efd6e168f6): MSG_AUTOPOLICY_GET/SET (0x54/0x55) +
+    MgrAutoPolicyConfig/Entry/Cooldowns + Get/Set Req/Resp (manager_rpc.rs).
+  · auto_policy.rs: AutoPolicyMode (Off/DryRun/Armed) state machine, 5 presets,
+    ported decide_actions/kinds_from_switches (+9 unit tests), AutoPolicyState +
+    sanitize_entry (clamp interval/cooldown/max_actions).
+  · Leader-fenced auto_policy_tick_loop (spawn_supervised; leader-only INVARIANT;
+    DEFAULT-OFF; Armed needs --dashboard-allow-mutations else degrades to DryRun;
+    interval + cooldown gating) + in-process actuate_candidate: split→auto_dispatch_split,
+    merge→F185-freeze handle_merge_partitions, gc/compact→PS MSG_MAINTENANCE,
+    ec→handle_force_ec_convert.
+  · etcd persist (autoPolicy/config,cooldowns; F149-fenced; ETCD-FIRST compute→persist→
+    apply + concurrent-update guard) + replay_from_etcd (fail-loud + sanitize).
+  · autopolicy_set (SET_MODE/ACTIVE/UPSERT/DELETE, leader-gated); RPC handle_autopolicy_
+    get/set + dispatch; dashboard /api/policies GET (leader-gated) + POST activate/upsert/
+    delete (allow_mutations-gated); autumn-op auto-policy status|activate <name> [--arm]|
+    deactivate + ClusterClient auto_policy_get/set; bin wires --dashboard-allow-mutations.
+  · coco findbugs (GPT-5.5) on M2: 7 findings ALL fixed (etcd-first, overflow clamp,
+    activate-mode, dashboard leader gate, max_actions truncation, client leader_rotations x2).
 
-M1 COMPLETE (2026-07-04): full read-only data parity.
-  · Extracted handle_get_partition_detail → compute_partition_detail_resp +
-    handle_list_node_states → compute_list_node_states_resp (behavior-preserving,
-    like M0's df/overview).
-  · New crates/manager/src/auto_policy.rs: ported pure fns describe_candidate /
-    candidate_to_cmd / cooldown_key / policy_kind_str (+4 unit tests). M2's
-    leader-fenced controller reuses these (ground floor).
-  · dashboard.rs: /api/partition/<id> real (full extChip contract role/size/open/
-    ec/ec_shape/replicas/refs/eversion/missing + distinct-extent dedup);
-    advisories[] filled from advisory_cache via the ported fns; node auto_state +
-    full NodeStateEntry merge (heartbeat/suspected-age/override) in /api/overview.
-  · coco findbugs on M1: 3 P2 parity regressions, all fixed + verified (extent
-    fields, node fields, cross-stream dedup).
-  · Verified: manager lib 177/177 (hermetic partition_detail_json extent-contract
-    test + 4 auto_policy tests), clippy clean; node-field parity confirmed against
-    a real registered EN. Full LIVE extent parity deferred to the dedicated cluster
-    host (multi-tenant port ranges block a local EN bring-up here).
+Verification (M2):
+  · manager 182 + rpc 43 + client 27 lib tests; 0 clippy warnings; all bins build.
+  · memory-mode e2e: status/activate/deactivate + dashboard /api/policies consistent;
+    default-OFF; activate(no --arm)=dry_run, activate --arm=armed, deactivate=off.
+  · ETCD-FAILOVER acceptance (b), REAL etcd: manager1 activate gc-only --arm → kill -9 →
+    manager2 restarts same etcd → replays active=gc-only mode=armed (crash-safety proven).
+  · Deferred (like M1): live ACTUATION vs a real cluster with partitions+load
+    (multi-tenant box blocks local EN bring-up).
 
 Main gaps / next steps:
-  · PUSH BLOCKED: origin/main unreachable via the GitHub proxy (Proxy CONNECT
-    timeout). M0 (6dd270d) + M1 commits are safe locally; push when connectivity
-    returns (`git push origin main`). Commits stack meanwhile.
-  · M2: crates/manager/src/auto_policy.rs — ported decide_actions/candidate_to_cmd/
-    cooldown_key + unit tests (from test_autumn_dashboard.py); MgrAutoPolicyConfig
-    etcd keys (autoPolicy/config,cooldowns) + replay_from_etcd; spawn_supervised
-    leader-gated loop capped at DryRun; MSG_AUTOPOLICY_GET/SET (wire bump) +
-    autumn-op auto-policy status|activate|deactivate; /api/policies GET/upsert/
-    activate/delete live. INVARIANT: leader-only tick.
-  · M3: --dashboard-allow-mutations gates loop-Armed + /api/action; in-process
-    actuation (auto_dispatch_split, extracted do_merge_partitions F185 path, PS
-    MSG_MAINTENANCE gc/compact, force-ec inner fn); verb-whitelist validation.
-  · M4: delete python/dashboard/ (5 files); DASHBOARD.md → docs/ops.md; update
-    README, crates/manager/CLAUDE.md (F203 reconciliation note), crates/server/
-    CLAUDE.md, deploy k8s/baremetal + cluster.sh env→flag threading.
+  · M2 UNCOMMITTED — commit next (solo-flow push-to-main).
+  · M3: --dashboard-allow-mutations gates POST /api/action (verb whitelist:
+    split/merge/gc/forcegc/compact/force-ec-convert; validate int args); dispatch to the
+    same in-process actuate fns as the loop; read-only default refuses.
+  · M4: delete python/dashboard/ (5 files); DASHBOARD.md → docs/ops.md; update README,
+    crates/manager/CLAUDE.md (F203 reconciliation note), crates/server/CLAUDE.md, deploy
+    k8s/baremetal + cluster.sh env→flag threading (AUTUMN_DASHBOARD=1).
+  · origin/main is at 9f5b3d0 (M0+M1). Push M2 when committed.

@@ -257,6 +257,8 @@ impl AutumnManager {
             MSG_TENANT_DELETE => self.handle_tenant_delete(payload).await,
             // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
+            MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
+            MSG_AUTOPOLICY_SET => self.handle_autopolicy_set(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -3752,6 +3754,43 @@ impl AutumnManager {
             message: String::new(),
             candidates,
         }))
+    }
+
+    // ── F-DASH-IN-MGR M2: auto-policy controller RPCs (headless control) ────
+
+    pub(crate) async fn handle_autopolicy_get(&self, _payload: Bytes) -> HandlerResult {
+        // Leader-only: the live state + action log are leader-local, and the
+        // controller loop only runs on the leader (a follower's replayed config
+        // is stale). Sister to the MSG_GET_POLICY_CANDIDATES gate (F210-F6).
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&AutoPolicyGetResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                mode: 0,
+                active: String::new(),
+                allow_mutations: false,
+                policies: Vec::new(),
+                log: Vec::new(),
+            }));
+        }
+        Ok(rkyv_encode(&self.autopolicy_snapshot()))
+    }
+
+    pub(crate) async fn handle_autopolicy_set(&self, payload: Bytes) -> HandlerResult {
+        let req: AutoPolicySetReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // `autopolicy_set` gates on leader (its etcd write is F149-fenced) and
+        // returns the resulting state; map any AppError to a coded resp.
+        match self.autopolicy_set(req.op, req.mode, req.name, req.entry).await {
+            Ok(resp) => Ok(rkyv_encode(&resp)),
+            Err(e) => Ok(rkyv_encode(&AutoPolicySetResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                mode: 0,
+                active: String::new(),
+                policies: Vec::new(),
+            })),
+        }
     }
 
     /// F210-F1: const-dump of the `POLICY_KIND_*` enum so external

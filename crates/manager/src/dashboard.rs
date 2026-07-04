@@ -49,8 +49,10 @@ use axum::Router;
 use send_wrapper::SendWrapper;
 
 use autumn_rpc::manager_rpc::{
-    CODE_OK, NodeCapWire, NodeStateEntry, NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED,
-    NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE,
+    MgrAutoPolicyEntry, NodeCapWire, NodeStateEntry, AUTOPOLICY_OP_DELETE, AUTOPOLICY_OP_SET_ACTIVE,
+    AUTOPOLICY_OP_SET_MODE, AUTOPOLICY_OP_UPSERT, CODE_OK, NODE_AUTO_STATE_ONLINE,
+    NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED,
+    NODE_OVERRIDE_MAINTENANCE,
 };
 
 use crate::auto_policy::{candidate_to_cmd, cooldown_key, describe_candidate, policy_kind_str};
@@ -154,19 +156,40 @@ impl AutumnManager {
             SendWrapper::new(async move { partition_detail_response(&mgr, &id) })
         });
 
+        // ── auto-policy controller (M2) ──────────────────────────────────
+        // GET is always allowed; the POST mutations require
+        // --dashboard-allow-mutations (checked inside each handler).
+        let mgr_pg = SendWrapper::new(self.clone());
+        let policies_route = get(move || {
+            let mgr = mgr_pg.clone();
+            SendWrapper::new(async move { policies_get_response(&mgr) })
+        });
+        let mgr_pa = SendWrapper::new(self.clone());
+        let policies_activate = post(move |body: axum::body::Bytes| {
+            let mgr = mgr_pa.clone();
+            SendWrapper::new(async move { policies_activate_response(&mgr, &body).await })
+        });
+        let mgr_pu = SendWrapper::new(self.clone());
+        let policies_upsert = post(move |body: axum::body::Bytes| {
+            let mgr = mgr_pu.clone();
+            SendWrapper::new(async move { policies_upsert_response(&mgr, &body).await })
+        });
+        let mgr_px = SendWrapper::new(self.clone());
+        let policies_delete = post(move |body: axum::body::Bytes| {
+            let mgr = mgr_px.clone();
+            SendWrapper::new(async move { policies_delete_response(&mgr, &body).await })
+        });
+
         Router::new()
             .route("/", get(index_handler))
             .route("/healthz", get(healthz_handler))
             .route("/api/overview", overview_route)
             .route("/api/partition/{id}", partition_route)
-            // ── stubs (real impls land in later milestones) ──────────────────
-            .route("/api/policies", get(policies_stub))
-            // The page POSTs to these three (Create/activate/delete policy); they
-            // MUST return page-shaped JSON, not a bare 404 that breaks its
-            // `r.json()` (coco P3). Real controller lands in M2.
-            .route("/api/policies/upsert", post(policies_mutate_stub))
-            .route("/api/policies/activate", post(policies_mutate_stub))
-            .route("/api/policies/delete", post(policies_mutate_stub))
+            .route("/api/policies", policies_route)
+            .route("/api/policies/activate", policies_activate)
+            .route("/api/policies/upsert", policies_upsert)
+            .route("/api/policies/delete", policies_delete)
+            // ── stub (real impl lands in M3) ─────────────────────────────────
             .route("/api/action", post(action_stub))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
     }
@@ -545,13 +568,60 @@ fn node_override_kind_str(b: u8) -> &'static str {
 
 // ── stubs (later milestones) ─────────────────────────────────────────────────
 
-async fn policies_stub() -> Response<Body> {
-    json_response(
-        StatusCode::OK,
-        // Shape the page expects; controller arrives in M2.
-        r#"{"enabled":false,"active":null,"allow_mutations":false,"policies":[],"switch_order":["split","ec","compact","gc","merge"],"log":[]}"#.to_string(),
-        "application/json",
-    )
+/// `GET /api/policies` — the controller state, byte-compatible with the Python
+/// `AutoPolicy.state()` contract the page consumes: `enabled` = mode != Off,
+/// each policy's `switches` as a `{split,ec,compact,gc,merge}` dict, and
+/// `interval`/`cooldown`/`max_actions`.
+fn policies_get_response(mgr: &AutumnManager) -> Response<Body> {
+    use serde_json::json;
+    // Leader-only, like the MSG_AUTOPOLICY_GET handler: a follower's controller
+    // state is replay-stale and its loop doesn't run (coco P2).
+    if !mgr.is_leader() {
+        let body = json!({
+            "enabled": false, "active": "", "allow_mutations": false,
+            "policies": [], "switch_order": ["split", "ec", "compact", "gc", "merge"],
+            "log": [], "error": "not leader — point the dashboard at the leader manager",
+        });
+        return json_response(StatusCode::OK, body.to_string(), "application/json");
+    }
+    let snap = mgr.autopolicy_snapshot();
+    let policies: Vec<serde_json::Value> = snap
+        .policies
+        .iter()
+        .map(|p| {
+            json!({
+                "name": p.name,
+                "desc": p.desc,
+                "builtin": p.builtin,
+                "interval": p.interval_sec,
+                "cooldown": p.cooldown_sec,
+                "max_actions": p.max_actions,
+                "switches": switches_to_dict(&p.switches),
+            })
+        })
+        .collect();
+    let log: Vec<serde_json::Value> = snap
+        .log
+        .iter()
+        .map(|l| json!({ "ts": l.ts, "level": l.level, "msg": l.msg }))
+        .collect();
+    let body = json!({
+        "enabled": snap.mode != 0,          // 0 = Off
+        "active": snap.active,
+        "allow_mutations": snap.allow_mutations,
+        "policies": policies,
+        "switch_order": ["split", "ec", "compact", "gc", "merge"],
+        "log": log,
+    });
+    json_response(StatusCode::OK, body.to_string(), "application/json")
+}
+
+/// [split, ec, compact, gc, merge] Vec → the `{split,ec,…}` dict the page reads.
+fn switches_to_dict(sw: &[bool]) -> serde_json::Value {
+    let g = |i: usize| sw.get(i).copied().unwrap_or(false);
+    serde_json::json!({
+        "split": g(0), "ec": g(1), "compact": g(2), "gc": g(3), "merge": g(4),
+    })
 }
 
 async fn action_stub() -> Response<Body> {
@@ -565,12 +635,99 @@ async fn action_stub() -> Response<Body> {
 /// Shared stub for the three `POST /api/policies/{upsert,activate,delete}` the
 /// page fires. Returns valid page-shaped JSON (not a 404) so the page's
 /// `r.json()` doesn't throw; the real controller lands in M2.
-async fn policies_mutate_stub() -> Response<Body> {
+/// `POST /api/policies/activate` — `{active: name}` selects the active policy;
+/// `{enabled: bool}` starts (Armed) / stops (Off) the controller. Both keys may
+/// be present. Returns the fresh state.
+async fn policies_activate_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
+    if !mgr.dashboard_allow_mutations.get() {
+        return read_only_response();
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    if let Some(active) = v.get("active").and_then(|x| x.as_str()) {
+        if let Err(e) = mgr
+            .autopolicy_set(AUTOPOLICY_OP_SET_ACTIVE, 0, active.to_string(), None)
+            .await
+        {
+            return error_response(&e.to_string());
+        }
+    }
+    if let Some(enabled) = v.get("enabled").and_then(|x| x.as_bool()) {
+        // Start = Armed (2), Stop = Off (0). The loop still degrades Armed→DryRun
+        // if --dashboard-allow-mutations is absent, but we already gated on it.
+        let mode = if enabled { 2 } else { 0 };
+        if let Err(e) = mgr
+            .autopolicy_set(AUTOPOLICY_OP_SET_MODE, mode, String::new(), None)
+            .await
+        {
+            return error_response(&e.to_string());
+        }
+    }
+    policies_get_response(mgr)
+}
+
+/// `POST /api/policies/upsert` — `{name, switches:{split,ec,compact,gc,merge},
+/// interval, cooldown, max_actions}` creates/updates a custom policy.
+async fn policies_upsert_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
+    if !mgr.dashboard_allow_mutations.get() {
+        return read_only_response();
+    }
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return error_response("bad JSON body"),
+    };
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let sw = v.get("switches").cloned().unwrap_or(serde_json::Value::Null);
+    let b = |k: &str| sw.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let entry = MgrAutoPolicyEntry {
+        name: name.clone(),
+        desc: v
+            .get("desc")
+            .and_then(|x| x.as_str())
+            .unwrap_or("custom policy")
+            .to_string(),
+        switches: vec![b("split"), b("ec"), b("compact"), b("gc"), b("merge")],
+        // Clamp BEFORE the u32 cast so a huge value doesn't truncate to 0 (coco
+        // P2); autopolicy_set's sanitize_entry re-clamps as the authority.
+        interval_sec: v.get("interval").and_then(|x| x.as_u64()).unwrap_or(30).max(2),
+        cooldown_sec: v.get("cooldown").and_then(|x| x.as_u64()).unwrap_or(180),
+        max_actions: v.get("max_actions").and_then(|x| x.as_u64()).unwrap_or(2).clamp(1, 100) as u32,
+        builtin: false,
+    };
+    match mgr
+        .autopolicy_set(AUTOPOLICY_OP_UPSERT, 0, name, Some(entry))
+        .await
+    {
+        Ok(_) => policies_get_response(mgr),
+        Err(e) => error_response(&e.to_string()),
+    }
+}
+
+/// `POST /api/policies/delete` — `{name}` removes a custom policy.
+async fn policies_delete_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
+    if !mgr.dashboard_allow_mutations.get() {
+        return read_only_response();
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    match mgr.autopolicy_set(AUTOPOLICY_OP_DELETE, 0, name, None).await {
+        Ok(_) => policies_get_response(mgr),
+        Err(e) => error_response(&e.to_string()),
+    }
+}
+
+fn read_only_response() -> Response<Body> {
     json_response(
-        StatusCode::OK,
-        r#"{"error":"policy controller not implemented until M2"}"#.to_string(),
+        StatusCode::FORBIDDEN,
+        r#"{"error":"server is read-only; relaunch the manager with --dashboard-allow-mutations"}"#.to_string(),
         "application/json",
     )
+}
+
+/// A logical error the page renders as a toast (`r.error`); 200 so the page's
+/// `r.json()` reads the body regardless.
+fn error_response(msg: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": msg }).to_string();
+    json_response(StatusCode::OK, body, "application/json")
 }
 
 fn json_response(status: StatusCode, body: String, content_type: &str) -> Response<Body> {

@@ -135,6 +135,13 @@ pub(crate) enum Command {
         full: bool,
     },
     PolicyCandidates,
+    /// F-DASH-IN-MGR M2: headless control of the in-manager auto-policy
+    /// controller. `action` = status | activate | deactivate.
+    AutoPolicy {
+        action: String,
+        name: String,
+        arm: bool,
+    },
     // F213 cluster / partition admin (migrated from autumn-client)
     Bootstrap {
         replication: String,
@@ -566,6 +573,29 @@ pub(crate) fn parse() -> Args {
             Command::Info { part, detail, full }
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
+        // F-DASH-IN-MGR M2: auto-policy <status|activate <name> [--arm]|deactivate>
+        "auto-policy" | "auto_policy" => {
+            let action = if i < raw.len() {
+                let a = raw[i].clone();
+                i += 1;
+                a
+            } else {
+                "status".to_string()
+            };
+            let mut name = String::new();
+            let mut arm = false;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--arm" => arm = true,
+                    other if !other.starts_with('-') && name.is_empty() => {
+                        name = other.to_string()
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            Command::AutoPolicy { action, name, arm }
+        }
         // F213 admin
         "bootstrap" => {
             let mut replication = String::from("3+0");

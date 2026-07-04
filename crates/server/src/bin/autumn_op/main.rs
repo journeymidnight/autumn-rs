@@ -310,6 +310,9 @@ async fn run(args: Args) -> Result<()> {
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         // ---------------- F213 read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
+        Command::AutoPolicy { action, name, arm } => {
+            cmd_auto_policy(&client, args.json, &action, &name, arm).await?
+        }
         Command::Info { part, detail, full } => {
             run_info(&client, args.json, part, detail, full).await?;
         }
@@ -915,6 +918,123 @@ async fn cmd_audit_log(client: &ClusterClient, json: bool, op: u8, node_id: u64,
             );
             if !e.result_message.is_empty() {
                 println!("    => {}", e.result_message);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F-DASH-IN-MGR M2: headless control of the in-manager auto-policy controller.
+///   auto-policy status
+///   auto-policy activate <name> [--arm]   (select policy; --arm = actuate)
+///   auto-policy deactivate                (mode → Off)
+async fn cmd_auto_policy(
+    client: &ClusterClient,
+    json: bool,
+    action: &str,
+    name: &str,
+    arm: bool,
+) -> Result<()> {
+    match action {
+        "status" => {}
+        "activate" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy activate requires a policy name");
+            }
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_SET_ACTIVE,
+                    mode: 0,
+                    name: name.to_string(),
+                    entry: None,
+                })
+                .await?;
+            // ALWAYS set the mode explicitly so `activate` never silently
+            // inherits a prior Armed/Off (coco P2): --arm → Armed (actuates),
+            // else DryRun (runs + logs "would: …" but never actuates).
+            let mode = if arm { 2 } else { 1 };
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_SET_MODE,
+                    mode,
+                    name: String::new(),
+                    entry: None,
+                })
+                .await?;
+        }
+        "deactivate" => {
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_SET_MODE,
+                    mode: 0, // Off
+                    name: String::new(),
+                    entry: None,
+                })
+                .await?;
+        }
+        other => anyhow::bail!("unknown auto-policy action '{other}' (status|activate|deactivate)"),
+    }
+
+    // Always print the resulting state.
+    let st = client
+        .auto_policy_get()
+        .await
+        .map_err(|e| anyhow!("auto-policy status: {e}"))?;
+    let mode_str = match st.mode {
+        2 => "armed",
+        1 => "dry_run",
+        _ => "off",
+    };
+    if json {
+        let policies: Vec<_> = st
+            .policies
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "desc": p.desc,
+                    "builtin": p.builtin,
+                    "switches": p.switches,
+                    "interval_sec": p.interval_sec,
+                    "cooldown_sec": p.cooldown_sec,
+                    "max_actions": p.max_actions,
+                })
+            })
+            .collect();
+        let log: Vec<_> = st
+            .log
+            .iter()
+            .map(|l| serde_json::json!({ "ts": l.ts, "level": l.level, "msg": l.msg }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": mode_str,
+                "active": st.active,
+                "allow_mutations": st.allow_mutations,
+                "policies": policies,
+                "log": log,
+            }))?
+        );
+    } else {
+        println!(
+            "auto-policy: mode={mode_str}  active={}  allow_mutations={}",
+            if st.active.is_empty() { "(none)" } else { &st.active },
+            st.allow_mutations
+        );
+        println!("  policies:");
+        for p in &st.policies {
+            println!(
+                "    {:<14} {} — {}",
+                p.name,
+                if p.builtin { "preset" } else { "custom" },
+                p.desc
+            );
+        }
+        if !st.log.is_empty() {
+            println!("  recent actions:");
+            for l in st.log.iter().take(10) {
+                println!("    [{}] {}", l.level, l.msg);
             }
         }
     }

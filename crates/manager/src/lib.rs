@@ -730,6 +730,18 @@ pub struct AutumnManager {
     /// `MSG_GET_POLICY_CANDIDATES` and call client subcommands to
     /// act on what they see.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
+    /// F-DASH-IN-MGR M2: in-manager auto-policy controller state — mode +
+    /// active policy + custom policies + cooldowns + rolling action log.
+    /// Config (mode/active/custom) is etcd-persisted (`autoPolicy/config`,
+    /// leader-fenced) + cooldowns (`autoPolicy/cooldowns`), replayed on leader
+    /// promotion so the active policy survives failover. The controller loop
+    /// runs ONLY on the leader and is DEFAULT-OFF (a fresh cluster stays
+    /// pure-mechanism, F203).
+    pub(crate) auto_policy: Rc<RefCell<crate::auto_policy::AutoPolicyState>>,
+    /// F-DASH-IN-MGR M2: whether `--dashboard-allow-mutations` was set. ONE
+    /// flag gates BOTH manual dashboard actions AND the controller leaving
+    /// DryRun (user decision). Set from the bin; default false.
+    pub(crate) dashboard_allow_mutations: Rc<Cell<bool>>,
     /// F192: per-node sliding-window of push-based failure reports from
     /// PSes. Eviction window = `report_disk_failure_window`; quorum
     /// threshold = `report_disk_failure_quorum` distinct
@@ -862,6 +874,8 @@ impl AutumnManager {
             control_pool: Rc::new(ConnPool::new()),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
+            auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
+            dashboard_allow_mutations: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
             // F195 defaults match the pre-F195 env defaults (F192).
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
@@ -1181,6 +1195,11 @@ impl AutumnManager {
         let mgr = self.clone();
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
 
+        // F-DASH-IN-MGR M2: leader-fenced auto-policy controller (DEFAULT-OFF;
+        // ticks + actuates ONLY on the leader; Armed needs --dashboard-allow-mutations).
+        let mgr = self.clone();
+        Self::spawn_supervised("auto_policy", move || mgr.clone().auto_policy_tick_loop());
+
         // F207-D: stale-marker WARN sweep. Iterates the inflight ledger
         // every 5 minutes and logs WARN for any marker > 24h old.
         // Auto-clearing is INTENTIONALLY not done — a stuck marker
@@ -1307,6 +1326,392 @@ impl AutumnManager {
         p.advisory_cache = cands.clone();
         p.advisory_cache_at = now;
         cands
+    }
+
+    // ── F-DASH-IN-MGR M2: auto-policy controller config ──────────────────
+
+    /// Whether manual dashboard actions + the controller's Armed mode are
+    /// honored. Set from the bin (`--dashboard-allow-mutations`).
+    pub fn set_dashboard_allow_mutations(&self, v: bool) {
+        self.dashboard_allow_mutations.set(v);
+    }
+
+    /// Are we the current etcd leader? Used by the dashboard to gate leader-only
+    /// endpoints (the RPC handlers gate via `self.leader.get()` directly).
+    pub(crate) fn is_leader(&self) -> bool {
+        self.leader.get()
+    }
+
+    /// Current controller state for `MSG_AUTOPOLICY_GET` + `/api/policies`.
+    pub(crate) fn autopolicy_snapshot(&self) -> AutoPolicyGetResp {
+        let st = self.auto_policy.borrow();
+        AutoPolicyGetResp {
+            code: CODE_OK,
+            message: String::new(),
+            mode: st.mode.as_u8(),
+            active: st.active.clone(),
+            allow_mutations: self.dashboard_allow_mutations.get(),
+            policies: st.all_policies(),
+            log: st.log.iter().cloned().collect(),
+        }
+    }
+
+    /// Persist the cooldown stamps to etcd `autoPolicy/cooldowns` (leader-fenced,
+    /// best-effort — a lost stamp on failover is bounded by the manager's own
+    /// per-kind cooldowns + inflight flags).
+    pub(crate) async fn autopolicy_persist_cooldowns(&self) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            let cds = self.auto_policy.borrow().to_cooldowns();
+            let value = rkyv_encode(&cds).to_vec();
+            etcd.put_msgs_txn(vec![("autoPolicy/cooldowns".to_string(), value)])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Apply an `AutoPolicySet` op (SET_MODE / SET_ACTIVE / UPSERT / DELETE),
+    /// persist the new config to etcd, and echo the resulting state. Leader-only
+    /// (the etcd write is F149-fenced; a follower fails NotLeader). Shared by the
+    /// `MSG_AUTOPOLICY_SET` handler, the dashboard `/api/policies/*`, and
+    /// `autumn-op auto-policy`.
+    pub(crate) async fn autopolicy_set(
+        &self,
+        op: u8,
+        mode: u8,
+        name: String,
+        entry: Option<MgrAutoPolicyEntry>,
+    ) -> Result<AutoPolicySetResp, AppError> {
+        self.ensure_leader()?;
+
+        // Phase 1 (no await): validate + compute the NEW config on CLONES of the
+        // current state, and claim the update slot. Any validation error returns
+        // before touching shared state or claiming the slot.
+        let (new_mode, new_active, new_custom) = {
+            let mut st = self.auto_policy.borrow_mut();
+            if st.updating {
+                return Err(AppError::Precondition(
+                    "another auto-policy update is in progress; retry".to_string(),
+                ));
+            }
+            let mut new_mode = st.mode;
+            let mut new_active = st.active.clone();
+            let mut new_custom = st.custom.clone();
+            match op {
+                AUTOPOLICY_OP_SET_MODE => {
+                    new_mode = crate::auto_policy::AutoPolicyMode::from_u8(mode);
+                }
+                AUTOPOLICY_OP_SET_ACTIVE => {
+                    // "" = deactivate (no active policy selected).
+                    if !name.is_empty() && st.find_policy(&name).is_none() {
+                        return Err(AppError::NotFound(format!("no such policy '{name}'")));
+                    }
+                    new_active = name;
+                }
+                AUTOPOLICY_OP_UPSERT => {
+                    let mut e = entry.ok_or_else(|| {
+                        AppError::InvalidArgument("upsert requires an entry".to_string())
+                    })?;
+                    if e.name.is_empty() {
+                        return Err(AppError::InvalidArgument("policy name required".to_string()));
+                    }
+                    if crate::auto_policy::is_preset_name(&e.name) {
+                        return Err(AppError::InvalidArgument(format!(
+                            "'{}' is a built-in preset; pick another name",
+                            e.name
+                        )));
+                    }
+                    e.builtin = false;
+                    crate::auto_policy::sanitize_entry(&mut e); // clamp interval/cooldown/max_actions
+                    if let Some(slot) = new_custom.iter_mut().find(|p| p.name == e.name) {
+                        *slot = e;
+                    } else {
+                        new_custom.push(e);
+                    }
+                }
+                AUTOPOLICY_OP_DELETE => {
+                    if crate::auto_policy::is_preset_name(&name) {
+                        return Err(AppError::InvalidArgument(
+                            "cannot delete a built-in preset".to_string(),
+                        ));
+                    }
+                    new_custom.retain(|p| p.name != name);
+                    if new_active == name {
+                        new_active = String::new();
+                        new_mode = crate::auto_policy::AutoPolicyMode::Off;
+                    }
+                }
+                _ => {
+                    return Err(AppError::InvalidArgument(format!(
+                        "unknown autopolicy op {op}"
+                    )))
+                }
+            }
+            st.updating = true; // serialize: no concurrent set until Phase 3 clears it
+            (new_mode, new_active, new_custom)
+        };
+
+        // Phase 2 (await): persist to etcd FIRST (etcd-first pattern, Note 1) — a
+        // failed write must NOT leave the in-memory state (and the actuating
+        // loop) running on an unpersisted config.
+        let cfg = MgrAutoPolicyConfig {
+            ver: 1,
+            mode: new_mode.as_u8(),
+            active: new_active.clone(),
+            policies: new_custom.clone(),
+        };
+        let persist = if let Some(etcd) = &self.etcd {
+            let value = rkyv_encode(&cfg).to_vec();
+            etcd.put_msgs_txn(vec![("autoPolicy/config".to_string(), value)])
+                .await
+        } else {
+            Ok(())
+        };
+
+        // Phase 3 (no await): release the slot; apply ONLY if etcd succeeded.
+        {
+            let mut st = self.auto_policy.borrow_mut();
+            st.updating = false;
+            if persist.is_ok() {
+                st.mode = new_mode;
+                st.active = new_active;
+                st.custom = new_custom;
+            }
+        }
+        persist?; // propagate an etcd failure (in-memory state left unchanged)
+
+        let st = self.auto_policy.borrow();
+        Ok(AutoPolicySetResp {
+            code: CODE_OK,
+            message: String::new(),
+            mode: st.mode.as_u8(),
+            active: st.active.clone(),
+            policies: st.all_policies(),
+        })
+    }
+
+    /// Send a MAINTENANCE op (gc / compact) to a partition's owning PS
+    /// (in-process, same ConnPool as auto_dispatch_*).
+    async fn actuate_maintenance(
+        &self,
+        part_id: u64,
+        op: u8,
+        state: &autumn_common::MetadataState,
+    ) -> Result<()> {
+        let ps_addr = state
+            .part_addrs
+            .get(&part_id)
+            .cloned()
+            .or_else(|| {
+                state
+                    .regions
+                    .get(&part_id)
+                    .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
+            })
+            .ok_or_else(|| anyhow::anyhow!("no address for part {part_id}"))?;
+        let payload = autumn_rpc::partition_rpc::rkyv_encode(
+            &autumn_rpc::partition_rpc::MaintenanceReq {
+                part_id,
+                op,
+                extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_empty_only: false,
+            },
+        );
+        let resp_bytes = self
+            .conn_pool
+            .call_timeout(
+                &ps_addr,
+                autumn_rpc::partition_rpc::MSG_MAINTENANCE,
+                payload,
+                Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let resp: autumn_rpc::partition_rpc::MaintenanceResp =
+            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != autumn_rpc::partition_rpc::CODE_OK {
+            anyhow::bail!("maintenance code {}: {}", resp.code, resp.message);
+        }
+        Ok(())
+    }
+
+    /// Actuate ONE advisory candidate IN-PROCESS (no autumn-op subprocess).
+    /// split → auto_dispatch_split; merge → the F185 freeze-drain handler (NOT
+    /// the F184 flush path — avoids the ~5% loss window); gc/compact → PS
+    /// MSG_MAINTENANCE; ec → handle_force_ec_convert. Every underlying op is
+    /// already crash-safe + idempotent-on-retry (F149 fence / F207 ledger / F185
+    /// freeze), so a refusal is logged + retried next tick.
+    async fn actuate_candidate(
+        &self,
+        cand: &PolicyCandidate,
+        state: &autumn_common::MetadataState,
+    ) -> Result<()> {
+        match cand.kind {
+            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, state).await,
+            POLICY_KIND_MERGE => {
+                let req = MergePartitionsReq {
+                    survivor_part_id: cand.primary_part_id,
+                    victim_part_id: cand.secondary_part_id,
+                };
+                let resp_bytes = self
+                    .handle_merge_partitions(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: MergePartitionsResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("merge code {}: {}", resp.code, resp.message);
+                }
+                Ok(())
+            }
+            POLICY_KIND_GC => {
+                self.actuate_maintenance(
+                    cand.primary_part_id,
+                    autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC,
+                    state,
+                )
+                .await
+            }
+            POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+                self.actuate_maintenance(
+                    cand.primary_part_id,
+                    autumn_rpc::partition_rpc::MAINTENANCE_COMPACT,
+                    state,
+                )
+                .await
+            }
+            POLICY_KIND_EC => {
+                let req = ForceEcConvertReq {
+                    extent_id: cand.secondary_part_id,
+                };
+                let resp_bytes = self
+                    .handle_force_ec_convert(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: ForceEcConvertResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("ec code {}: {}", resp.code, resp.message);
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("candidate kind {} not actionable", cand.kind),
+        }
+    }
+
+    /// The leader-fenced auto-policy controller tick loop (F-DASH-IN-MGR M2).
+    ///
+    /// **INVARIANT (leader-only):** every tick begins with `leader.get()` — no
+    /// candidate read, no decision, no actuation on a follower. DEFAULT-OFF: an
+    /// `Off` mode (fresh cluster) does nothing, preserving F203 pure-mechanism.
+    /// `Armed` actuates ONLY when `--dashboard-allow-mutations` is set, else it
+    /// degrades to DryRun with the reason logged. Registered under
+    /// `spawn_supervised` (F228). Replaces the retired Python `AutoPolicy` loop,
+    /// hosted on the crash-safe leader instead of a killable webserver.
+    async fn auto_policy_tick_loop(self) {
+        loop {
+            compio::time::sleep(Duration::from_secs(1)).await;
+            if !self.leader.get() {
+                continue;
+            }
+            // Resolve the active policy under a short borrow.
+            let (mode, interval, cooldown, max_actions, enabled) = {
+                let st = self.auto_policy.borrow();
+                if st.mode == crate::auto_policy::AutoPolicyMode::Off {
+                    continue;
+                }
+                let Some(pol) = st.find_policy(&st.active) else {
+                    continue; // no active policy selected
+                };
+                let kinds = crate::auto_policy::kinds_from_switches(&pol.switches);
+                if kinds.is_empty() {
+                    continue;
+                }
+                (
+                    st.mode,
+                    // Saturating: never let a huge value wrap i64 negative and
+                    // bypass the cadence gates (coco P1; sanitize also clamps).
+                    pol.interval_sec.min(crate::auto_policy::MAX_INTERVAL_SEC) as i64,
+                    pol.cooldown_sec.min(crate::auto_policy::MAX_COOLDOWN_SEC) as i64,
+                    pol.max_actions as usize,
+                    kinds,
+                )
+            };
+            let now = Self::epoch_seconds();
+            // Re-decide only every `interval_sec` (the 1 s tick is just cadence).
+            let cooling = { now - self.auto_policy.borrow().last_tick_at < interval };
+            if cooling {
+                continue;
+            }
+            self.auto_policy.borrow_mut().last_tick_at = now;
+
+            // Armed requires the process flag; else degrade to DryRun.
+            let armed = mode == crate::auto_policy::AutoPolicyMode::Armed
+                && self.dashboard_allow_mutations.get();
+            let block_note = if mode == crate::auto_policy::AutoPolicyMode::Armed && !armed {
+                " [blocked: --dashboard-allow-mutations not set]"
+            } else {
+                ""
+            };
+
+            let candidates = self.policy.borrow().advisory_cache.clone();
+            let cooldowns = self.auto_policy.borrow().cooldowns.clone();
+            let actions = crate::auto_policy::decide_actions(
+                &candidates,
+                &cooldowns,
+                &enabled,
+                now,
+                cooldown,
+                max_actions,
+            );
+            if actions.is_empty() {
+                continue;
+            }
+            let state_snapshot = self.store.inner.borrow().clone();
+            let mut any_issued = false;
+            for (cand, cmd, key) in actions {
+                if !self.leader.get() {
+                    break; // lost leadership mid-batch — stragglers are F149-fenced anyway
+                }
+                let desc = crate::auto_policy::describe_candidate(&cand);
+                let cmd_str = cmd.join(" ");
+                if !armed {
+                    self.auto_policy.borrow_mut().record(
+                        now,
+                        "would",
+                        format!("would: autumn-op {cmd_str}{block_note} ({desc})"),
+                    );
+                    continue;
+                }
+                match self.actuate_candidate(&cand, &state_snapshot).await {
+                    Ok(()) => {
+                        {
+                            let mut st = self.auto_policy.borrow_mut();
+                            st.cooldowns.insert(key, now);
+                            st.record(now, "issued", format!("autumn-op {cmd_str} ({desc})"));
+                        }
+                        any_issued = true;
+                        tracing::info!("auto-policy issued: autumn-op {cmd_str}");
+                    }
+                    Err(e) => {
+                        self.auto_policy.borrow_mut().record(
+                            now,
+                            "refused",
+                            format!("autumn-op {cmd_str}: {e}"),
+                        );
+                    }
+                }
+            }
+            // Best-effort persist cooldowns once per tick (not per action).
+            if any_issued {
+                if let Err(e) = self.autopolicy_persist_cooldowns().await {
+                    tracing::warn!(error = %e, "auto-policy: cooldown persist failed");
+                }
+            }
+        }
     }
 
     /// F184: auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
@@ -2020,6 +2425,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
         // F-AUTHZ-1: persisted tenant account DB.
         let tenant_account_raw = c.get_prefix(TENANT_ACCOUNT_PREFIX).await?;
+        // F-DASH-IN-MGR M2: auto-policy controller config + cooldowns (single keys)
+        // so the active policy + mode survive leader failover.
+        let autopolicy_config_kv = c.get(b"autoPolicy/config").await?;
+        let autopolicy_cooldowns_kv = c.get(b"autoPolicy/cooldowns").await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -2221,6 +2630,20 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         if let Some(kv) = cluster_version_kv.kvs.first() {
             self.cluster_version
                 .set(Self::parse_cluster_version(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+        // F-DASH-IN-MGR M2: rehydrate the auto-policy controller config +
+        // cooldowns so the active policy + mode + custom policies survive leader
+        // failover (the crash-safety win over the killable Python webserver).
+        // Malformed → fail-loud (note 39) rather than silently reset the policy.
+        if let Some(kv) = autopolicy_config_kv.kvs.first() {
+            let cfg: MgrAutoPolicyConfig =
+                rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
+            self.auto_policy.borrow_mut().load_config(cfg);
+        }
+        if let Some(kv) = autopolicy_cooldowns_kv.kvs.first() {
+            let cds: MgrAutoPolicyCooldowns =
+                rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
+            self.auto_policy.borrow_mut().load_cooldowns(cds);
         }
         // F210-G2: rehydrate `failed_deletes` from the persisted retry
         // prefix. `attempts` + `last_attempt_at` are kept as written so

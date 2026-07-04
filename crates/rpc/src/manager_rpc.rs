@@ -1877,6 +1877,104 @@ pub struct AllocInodesResp {
     pub base: u64,
 }
 
+// --- F-DASH-IN-MGR: auto-policy controller (msg_types 0x54/0x55) -----------
+//
+// The in-manager auto-policy controller, folded in from the retired Python
+// `python/dashboard/`. Config is leader-owned and persisted to etcd
+// (`autoPolicy/config` + `autoPolicy/cooldowns`) so the active policy survives
+// leader failover — the crash-safety win over a killable Python webserver.
+// The controller loop runs ONLY on the leader and is DEFAULT-OFF (a fresh
+// cluster stays pure-mechanism, F203). Built-in presets are compiled-in (never
+// persisted); only custom entries + the (mode, active) selection go to etcd.
+pub const MSG_AUTOPOLICY_GET: u8 = 0x54;
+pub const MSG_AUTOPOLICY_SET: u8 = 0x55;
+
+/// `AutoPolicySetReq.op` values.
+pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
+pub const AUTOPOLICY_OP_SET_ACTIVE: u8 = 1;
+pub const AUTOPOLICY_OP_UPSERT: u8 = 2;
+pub const AUTOPOLICY_OP_DELETE: u8 = 3;
+
+/// One named policy (preset or custom). `switches` is [split, ec, compact, gc,
+/// merge] — a `Vec<bool>` (not a fixed array) for forward-compat; the controller
+/// reads the first 5, absent = false.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyEntry {
+    pub name: String,
+    pub desc: String,
+    pub switches: Vec<bool>,
+    pub interval_sec: u64,
+    pub cooldown_sec: u64,
+    pub max_actions: u32,
+    pub builtin: bool,
+}
+
+/// Persisted controller config (etcd `autoPolicy/config`). Only CUSTOM policies
+/// are stored; presets are compiled-in constants.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyConfig {
+    pub ver: u32,
+    /// 0=Off 1=DryRun 2=Armed (`auto_policy::AutoPolicyMode`).
+    pub mode: u8,
+    /// Active policy name ("" = none selected).
+    pub active: String,
+    pub policies: Vec<MgrAutoPolicyEntry>,
+}
+
+/// Persisted per-target cooldown stamps (etcd `autoPolicy/cooldowns`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyCooldowns {
+    pub entries: Vec<(String, i64)>,
+}
+
+/// One rolling action-log entry (leader-local; served by AutoPolicyGet).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AutoPolicyLogEntry {
+    pub ts: i64,
+    /// "issued" | "would" | "refused" | "error".
+    pub level: String,
+    pub msg: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AutoPolicyGetReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AutoPolicyGetResp {
+    pub code: u8,
+    pub message: String,
+    pub mode: u8,
+    pub active: String,
+    /// Whether the process was started with `--dashboard-allow-mutations`
+    /// (Armed is honored only when true).
+    pub allow_mutations: bool,
+    /// Presets + custom (full list, for display).
+    pub policies: Vec<MgrAutoPolicyEntry>,
+    pub log: Vec<AutoPolicyLogEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AutoPolicySetReq {
+    /// One of `AUTOPOLICY_OP_*`.
+    pub op: u8,
+    /// For SET_MODE.
+    pub mode: u8,
+    /// For SET_ACTIVE / DELETE (and the name of an UPSERT entry).
+    pub name: String,
+    /// For UPSERT.
+    pub entry: Option<MgrAutoPolicyEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AutoPolicySetResp {
+    pub code: u8,
+    pub message: String,
+    /// Resulting state echoed back so callers re-render without a follow-up GET.
+    pub mode: u8,
+    pub active: String,
+    pub policies: Vec<MgrAutoPolicyEntry>,
+}
+
 /// Persisted shape of a writer lease in etcd (`inode_leases/<ino>`).
 /// Reader leases are NOT persisted — they're ephemeral; a manager
 /// failover invalidates all reader caches via the

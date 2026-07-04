@@ -402,6 +402,10 @@ async fn main() -> Result<()> {
     // Spawns its own compio TcpListener task; must be started BEFORE the
     // blocking serve() below. Default bind follows --listen (on-by-default
     // rollout); mutations are OFF unless --dashboard-allow-mutations.
+    // F-DASH-IN-MGR M2: one flag gates BOTH the dashboard's manual actions AND
+    // the auto-policy controller leaving DryRun. Set unconditionally — the
+    // controller loop runs even without --dashboard-port.
+    manager.set_dashboard_allow_mutations(args.dashboard_allow_mutations);
     if let Some(dport) = args.dashboard_port {
         let dhost = args
             .dashboard_listen
