@@ -642,7 +642,10 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # nemesis focused on split/merge/compact/FORCEGC (+ gc/flush/EN-kill). forcegc
 # bypasses the discard-ratio gate to punch specific sealed extents -> the maximal
 # stress on the PS replay-floor guard; a wrong vp_head would let it punch a live
-# extent = loss. Every acked put verified byte-exact per seed:
+# extent = loss. Every acked put verified byte-exact per seed; PLUS a
+# positive-reclaim check (verify_gc_reclaim): a final quiesce -> compact ->
+# force-GC MUST physically DELETE extents (else the floor is stuck), and the
+# punch pass is re-verified loss-free + leak-free:
 ./scripts/vphead_chaos.sh                              # 6 default seeds
 VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 #   (system_chaos's own action name for force GC is `forcegc`; AUTUMN_CHAOS_ACTIONS

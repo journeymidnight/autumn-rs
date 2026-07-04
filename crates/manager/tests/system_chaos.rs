@@ -1805,6 +1805,144 @@ async fn verify_extent_accounting(etcd_endpoint: &str) -> (Vec<String>, usize, u
     last
 }
 
+/// Set of all extent_ids the manager currently tracks in etcd. Used to measure
+/// PHYSICAL reclamation (deleted extents) across the final GC pass.
+async fn read_extent_id_set(etcd_endpoint: &str) -> std::collections::HashSet<u64> {
+    let mut set = std::collections::HashSet::new();
+    let Ok(client) = autumn_etcd::EtcdClient::connect(etcd_endpoint).await else {
+        return set;
+    };
+    let Ok(resp) = client.get_prefix("extents/").await else {
+        return set;
+    };
+    for kv in &resp.kvs {
+        if let Some(eid) = parse_id_after_prefix(&kv.key, "extents/") {
+            set.insert(eid);
+        }
+    }
+    set
+}
+
+/// POSITIVE reclamation check (user ask: "GC 后 extent 确定可以被删除"). After the
+/// workload quiesces, a final flush → major-compact → FORCE-GC pass MUST
+/// physically DELETE extents: the chaos run created dead data (overwritten
+/// versions, out-of-range post-split keys, superseded SSTs), and a working GC +
+/// compaction reclaims it — relocate live VPs off a sealed extent, advance the
+/// replay floor, `punch_holes` → `refs == 0` → the manager deletes the
+/// ExtentInfo + unlinks the files. This is the FLIP SIDE of the no-loss checks:
+/// it catches the OPPOSITE regression — a wrong vp_head PINNING the replay floor
+/// so force-GC protects every extent and nothing is ever deletable (the user's
+/// original "compact-then-forceg won't reclaim" symptom that the vp_head thread
+/// fixed). Callers re-run per-key + accounting AFTER, so the destructive punch
+/// pass is itself proven loss-free + leak-free. Returns
+/// (errors, total_reclaimed, gc_reclaimed).
+async fn verify_gc_reclaim(
+    mgr: &RpcClient,
+    router: &PsRouter,
+    topo: &Topology,
+    etcd_endpoint: &str,
+) -> (Vec<String>, usize, usize) {
+    let mut errors = Vec::new();
+    let before = read_extent_id_set(etcd_endpoint).await;
+    let parts: Vec<u64> = topo.snapshot().iter().map(|p| p.2).collect();
+
+    let maint = |pid: u64, op: u8, extent_ids: Vec<u64>| partition_rpc::MaintenanceReq {
+        part_id: pid,
+        op,
+        extent_ids,
+        gc_ratio: None,
+        gc_max_size: None,
+        gc_stream_debt: None,
+        gc_empty_only: false,
+    };
+
+    // Flush + major-compact everything, twice: advance the replay floor past all
+    // fully-flushed data, drop out-of-range post-split keys + superseded SSTs, and
+    // truncate their row_stream extents. Two rounds so a CoW-shared SST extent
+    // (refs 2 post-split) reaches refs 0 once BOTH children have compacted.
+    for _ in 0..2 {
+        for &pid in &parts {
+            let client = router.client_for(pid).await;
+            for op in [
+                partition_rpc::MAINTENANCE_FLUSH,
+                partition_rpc::MAINTENANCE_COMPACT,
+            ] {
+                let _ = client
+                    .call(
+                        partition_rpc::MSG_MAINTENANCE,
+                        partition_rpc::rkyv_encode(&maint(pid, op, vec![])),
+                    )
+                    .await;
+            }
+        }
+        compio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let mid = read_extent_id_set(etcd_endpoint).await;
+
+    // Force-GC every partition's sealed log extents: relocate live VPs off them +
+    // punch the ones before the replay floor (incl. post-split shared log extents
+    // once both children have compacted). Replay-window extents are SKIPPED
+    // (protected), never punched.
+    let regions = get_regions(mgr).await;
+    for &pid in &parts {
+        let Some(region) = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == pid)
+            .map(|(_, r)| r.clone())
+        else {
+            continue;
+        };
+        let Ok(info_resp) = mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![region.log_stream],
+                }),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Ok(info) = rkyv_decode::<StreamInfoResp>(&info_resp) else {
+            continue;
+        };
+        let Some((_, stream)) = info.streams.first() else {
+            continue;
+        };
+        if stream.extent_ids.len() < 2 {
+            continue;
+        }
+        let sealed: Vec<u64> = stream.extent_ids[..stream.extent_ids.len() - 1].to_vec();
+        let client = router.client_for(pid).await;
+        let _ = client
+            .call(
+                partition_rpc::MSG_MAINTENANCE,
+                partition_rpc::rkyv_encode(&maint(pid, partition_rpc::MAINTENANCE_FORCE_GC, sealed)),
+            )
+            .await;
+    }
+    // The manager's extent_delete_loop is a 2 s sweep; relocation appends + the
+    // refs→0 delete need a few ticks to land.
+    compio::time::sleep(Duration::from_secs(12)).await;
+
+    let after = read_extent_id_set(etcd_endpoint).await;
+    let total_reclaimed = before.difference(&after).count();
+    let gc_reclaimed = mid.difference(&after).count();
+
+    if total_reclaimed == 0 {
+        errors.push(format!(
+            "GC-RECLAIM: the quiesce (flush + major-compact + force-GC) DELETED 0 \
+             extents — reclamation appears STUCK (a pinned replay floor would \
+             protect every extent). before={} mid={} after={}",
+            before.len(),
+            mid.len(),
+            after.len()
+        ));
+    }
+    (errors, total_reclaimed, gc_reclaimed)
+}
+
 /// Standard etcd prefix range-end (increment the last non-0xff byte). Mirrors
 /// `autumn_etcd`'s private `prefix_range_end` so we can build a revision-pinned
 /// `streams/` Range for the consistent-snapshot read.
@@ -2292,13 +2430,6 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let range_errors = verify_per_partition_range(&router, &topo, &expected_snapshot).await;
         eprintln!("chaos: range verify: errors={}", range_errors.len());
 
-        // Post-settle convergence: every partition must still take writes
-        // (catches the recovery-stuck → alloc_extent wedge that read-only
-        // verification can't see — point-gets keep working while writes hang).
-        eprintln!("chaos: verifying write-liveness per partition");
-        let liveness_errors = verify_write_liveness(&router, &topo).await;
-        eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
-
         // Storage-accounting invariants (extent-10 / orphan-leak class): refs ==
         // membership, vp_table_refs == 0, no dangling membership. Read from the
         // manager's etcd state (source of truth); convergence-looped so a
@@ -2311,26 +2442,99 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             accounting_errors.len()
         );
 
+        // POSITIVE reclamation (the flip side of no-loss): a final quiesce →
+        // major-compact → FORCE-GC pass must physically DELETE extents, proving
+        // GC/compaction actually reclaims (the replay floor advances) instead of
+        // protecting everything forever. MUTATING, so it runs AFTER the read-only
+        // verifiers above.
+        eprintln!("chaos: verifying GC reclaim (quiesce → compact → force-GC → delete)");
+        let (reclaim_errors, total_reclaimed, gc_reclaimed) =
+            verify_gc_reclaim(&mgr, &router, &topo, &etcd_endpoint).await;
+        eprintln!(
+            "chaos: gc-reclaim: physically deleted {total_reclaimed} extent(s) \
+             (force-GC step {gc_reclaimed}), errors={}",
+            reclaim_errors.len()
+        );
+
+        // The reclaim pass punched extents (relocate-then-punch) — re-confirm it
+        // lost NOTHING and left the accounting clean (a wrong vp_head would let
+        // force-GC punch a live extent = loss / orphan). The pass ran ~30 s, in
+        // which a background split/merge CONVERGENCE can move keys to a widened
+        // survivor → the settle-time topo goes STALE and `verify_per_key`
+        // mis-routes the read to the old owner (its retry hits the SAME wrong
+        // partition, so it can't self-heal). Refresh routing + settle, then
+        // re-verify; if anything is still off, refresh + retry ONCE more before
+        // declaring a real loss — a mis-route heals on refresh, a real loss
+        // persists across a fresh topo.
+        eprintln!("chaos: post-reclaim re-verify (per-key + accounting)");
+        refresh_topology(&mgr, &topo).await;
+        compio::time::sleep(Duration::from_secs(2)).await;
+        let (_pt, mut mismatches2, mut not_found2) =
+            verify_per_key(&router, &topo, &expected_snapshot).await;
+        if !mismatches2.is_empty() || !not_found2.is_empty() {
+            eprintln!(
+                "chaos: post-reclaim re-verify saw mismatches={} not_found={} — refreshing routing + retrying once (rule out a convergence mis-route)",
+                mismatches2.len(),
+                not_found2.len()
+            );
+            refresh_topology(&mgr, &topo).await;
+            compio::time::sleep(Duration::from_secs(3)).await;
+            let r = verify_per_key(&router, &topo, &expected_snapshot).await;
+            mismatches2 = r.1;
+            not_found2 = r.2;
+        }
+        let (accounting_errors2, _e2, _m2) = verify_extent_accounting(&etcd_endpoint).await;
+        eprintln!(
+            "chaos: post-reclaim: per-key mismatches={} not_found={} | accounting errors={}",
+            mismatches2.len(),
+            not_found2.len(),
+            accounting_errors2.len()
+        );
+
+        // Post-settle write-liveness LAST: every partition must still take writes
+        // (catches the recovery-stuck → alloc_extent wedge that read-only checks
+        // can't see — point-gets keep working while writes hang). It OVERWRITES
+        // real chaos keys with a probe seq, so it MUST run after every per-key
+        // verify (incl. the post-reclaim one) or it poisons them. Running it here
+        // also proves writes still land AFTER the force-GC reclaim pass.
+        eprintln!("chaos: verifying write-liveness per partition (post-reclaim)");
+        let liveness_errors = verify_write_liveness(&router, &topo).await;
+        eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
+
         if !mismatches.is_empty()
             || !not_found.is_empty()
             || !range_errors.is_empty()
             || !liveness_errors.is_empty()
             || !accounting_errors.is_empty()
+            || !reclaim_errors.is_empty()
+            || !mismatches2.is_empty()
+            || !not_found2.is_empty()
+            || !accounting_errors2.is_empty()
         {
             panic!(
-                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={}\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}",
+                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
                 mismatches.len(),
                 not_found.len(),
                 range_errors.len(),
                 liveness_errors.len(),
                 accounting_errors.len(),
+                reclaim_errors.len(),
+                mismatches2.len(),
+                not_found2.len(),
+                accounting_errors2.len(),
                 mismatches.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 not_found.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 range_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 liveness_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 accounting_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
+                reclaim_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
+                mismatches2.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+                not_found2.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+                accounting_errors2.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
             );
         }
-        eprintln!("chaos: all invariants OK ({total} keys)");
+        eprintln!(
+            "chaos: all invariants OK ({total} keys) — reclaimed {total_reclaimed} extent(s) post-quiesce"
+        );
     });
 }

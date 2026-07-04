@@ -86,7 +86,8 @@ for seed in $SEEDS; do
         sp=$(grep -c 'Split OK' "$log" 2>/dev/null || echo 0)
         mg=$(grep -c 'Merge OK' "$log" 2>/dev/null || echo 0)
         cp=$(grep -c 'Compact OK' "$log" 2>/dev/null || echo 0)
-        say "seed $seed PASS  (forcegc=$fg split=$sp merge=$mg compact=$cp $acked)"
+        rc=$(grep -oE 'reclaimed [0-9]+ extent' "$log" | tail -1)
+        say "seed $seed PASS  (forcegc=$fg split=$sp merge=$mg compact=$cp $acked; $rc)"
         PASSED=$((PASSED + 1))
     else
         say "seed $seed FAIL — see $log"
