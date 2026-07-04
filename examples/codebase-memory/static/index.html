@@ -229,8 +229,8 @@ function badge(k){ return `<span class="badge" style="color:${kcol(k)}">${esc(k)
 })();
 
 function showView(v){
-  $("view-search").style.display = v==="search" ? "" : "none";
-  $("view-graph").style.display  = v==="graph"  ? "" : "none";
+  $("view-search").style.display = v==="search" ? "block" : "none";
+  $("view-graph").style.display  = v==="graph"  ? "block" : "none";
   $("nav-search").classList.toggle("on", v==="search");
   $("nav-graph").classList.toggle("on", v==="graph");
   if(v==="graph" && !graphInited){ graphInited = true; requestAnimationFrame(initGraph); }
