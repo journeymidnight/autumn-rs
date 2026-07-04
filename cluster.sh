@@ -1206,10 +1206,32 @@ if [[ "$CMD" == "start" || "$CMD" == "restart" || "$CMD" == "reset" ]]; then
 fi
 export CLUSTER_MODE="$MODE"
 
+# For the etcd-REUSING bring-ups (`start`/`restart`, fresh=0): the preserved etcd
+# holds partitions placed on the LAST run's EN topology. Bringing up a different
+# EN count leaves those partitions pointing at extents on now-absent nodes — the
+# PS then loops forever on `commit_length` (0/R members reachable) and never
+# binds its partition listener. So reuse the EN count from the config snapshot;
+# only `reset` (which wipes etcd) is allowed to pick a new topology. Echoes the
+# effective replica count on stdout; warns on stderr if an explicit N is ignored.
+reuse_replicas() {
+    local n="$REPLICAS"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local snap
+        snap="$(sed -n 's/^REPLICAS=//p' "$CONFIG_FILE" | head -1)"
+        if [[ "$snap" =~ ^[0-9]+$ ]]; then
+            if (( ARG_INT_PROVIDED )) && [[ "$snap" != "$REPLICAS" ]]; then
+                echo "[cluster] $CMD: reusing persisted EN count $snap (ignoring N=$REPLICAS) — etcd is preserved; run 'reset $REPLICAS' to change the topology." >&2
+            fi
+            n="$snap"
+        fi
+    fi
+    printf '%s' "$n"
+}
+
 case "$CMD" in
-    start)        do_start "$REPLICAS" 0 ;;
+    start)        do_start "$(reuse_replicas)" 0 ;;
     stop)         do_stop ;;
-    restart)      do_stop; do_start "$REPLICAS" 0 ;;
+    restart)      do_stop; do_start "$(reuse_replicas)" 0 ;;
     clean)        do_clean ;;
     reset)        do_clean; do_start "$REPLICAS" 1 ;;
     status)       do_status ;;
