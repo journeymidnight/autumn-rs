@@ -233,12 +233,12 @@ function toast(msg,kind="ok"){ const d=document.createElement("div"); d.classNam
   $("#toast").appendChild(d); setTimeout(()=>d.remove(),5000); }
 async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
   const r=await fetch(path,opt); return r.json(); }
-async function act(cmd,label){
-  if(!ALLOW){ toast("Server is read-only — relaunch with --allow-mutations to operate the cluster","bad"); return; }
+async function act(action,label){
+  if(!ALLOW){ toast("Server is read-only — relaunch with --dashboard-allow-mutations to operate the cluster","bad"); return; }
   if(!DANGER){ toast("Turn on the Danger switch first to operate the cluster","bad"); return; }
-  if(!confirm(`Confirm?\n\n  autumn-op ${cmd.join(" ")}\n\n(${label||""})`)) return;
-  const r=await api("/api/action",{cmd});
-  if(r.ok){ toast("Issued: autumn-op "+cmd.join(" "),"ok"); setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600); }
+  if(!confirm(`Confirm?\n\n  ${label||action.action}\n`)) return;
+  const r=await api("/api/action",action);
+  if(r.ok){ toast("Issued: "+(label||action.action),"ok"); setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600); }
   else toast("Failed: "+(r.error||"unknown"),"bad");
 }
 const esc = s => (s==null?"":String(s)).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
@@ -328,7 +328,7 @@ function extChip(e){
   const cls=["ext",e.ec?"ec":"",e.open?"":"sealed"].join(" ");
   const tag=e.ec?`<span class="tag ec">EC ${esc(e.ec_shape||"")}</span>`:`<span class="tag role-${e.role}">${e.role}</span>`;
   const miss=e.missing?`<span class="tag missing">missing</span>`:"";
-  const btn=(DANGER&&!e.ec&&!e.open)?`<button class="btn xs" onclick='event.stopPropagation();act(["force-ec-convert","--extent","${e.extent_id}"],"EC convert extent ${e.extent_id}")'>→EC</button>`:"";
+  const btn=(DANGER&&!e.ec&&!e.open)?`<button class="btn xs" onclick='event.stopPropagation();act({action:"force_ec_convert",extent_id:${e.extent_id}},"EC convert extent ${e.extent_id}")'>→EC</button>`:"";
   // Click-to-expand full extent detail (replica node addresses, refs, eversion).
   const reps=(e.replicas||[]).map(id=>`${id}${nodeAddr(id)?" ("+nodeAddr(id)+")":""}`).join(", ")||"-";
   return `<details class="${cls}" style="display:block">
@@ -353,10 +353,10 @@ async function openDetail(pid){
   const d=await api("/api/partition/"+pid);
   const nxt=NEXT_OF[pid];
   const acts = DANGER ? `<div class="actions">
-      <button class="btn" onclick='act(["split","${pid}"],"split ${pid}")'>Split</button>
-      <button class="btn" onclick='act(["compact","${pid}"],"compact ${pid}")'>Compact</button>
-      <button class="btn" onclick='act(["gc","${pid}"],"GC ${pid}")'>GC</button>
-      ${nxt!=null?`<button class="btn warn" onclick='act(["merge","${pid}","${nxt}"],"merge ${nxt} into ${pid} (adjacent)")'>⤵ Merge #${nxt}</button>`:""}
+      <button class="btn" onclick='act({action:"split",part_id:${pid}},"split ${pid}")'>Split</button>
+      <button class="btn" onclick='act({action:"compact",part_id:${pid}},"compact ${pid}")'>Compact</button>
+      <button class="btn" onclick='act({action:"gc",part_id:${pid}},"GC ${pid}")'>GC</button>
+      ${nxt!=null?`<button class="btn warn" onclick='act({action:"merge",part_id:${pid},victim_part_id:${nxt}},"merge ${nxt} into ${pid} (adjacent)")'>⤵ Merge #${nxt}</button>`:""}
     </div>` : "";
   const inflight = (d.gc_inflight?'<span class="badge">GC…</span> ':"")+(d.compact_inflight?'<span class="badge">compact…</span>':"");
   dr.innerHTML=`<h3>Partition #${pid} <span class="kv" style="font-weight:400">on ${esc(p.ps_addr||"?")}</span></h3>
@@ -403,7 +403,7 @@ async function overview(){
   $("#advcount").textContent = adv.length?`(${adv.length})`:"";
   $("#advisories").innerHTML = adv.length ? adv.map(a=>`
     <div class="adv"><span class="desc">${esc(a.desc)}</span>
-      ${a.cmd?`<button class="btn" onclick='act(${JSON.stringify(a.cmd)},"${esc(a.desc).replace(/"/g,"")}")'>Apply</button>`
+      ${a.action?`<button class="btn" onclick='act(${JSON.stringify(a.action)},"${esc(a.desc).replace(/"/g,"")}")'>Apply</button>`
              :`<span class="kv">advisory-only</span>`}</div>`).join("")
     : '<div class="empty">(none) — no policy advisories</div>';
 }

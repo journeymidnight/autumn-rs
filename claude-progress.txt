@@ -42,10 +42,12 @@ Verification (M2):
     (multi-tenant box blocks local EN bring-up).
 
 Main gaps / next steps:
-  · M2 UNCOMMITTED — commit next (solo-flow push-to-main).
-  · M3: --dashboard-allow-mutations gates POST /api/action (verb whitelist:
-    split/merge/gc/forcegc/compact/force-ec-convert; validate int args); dispatch to the
-    same in-process actuate fns as the loop; read-only default refuses.
+  · M2 committed+pushed (ea9a7be). M3 committed next.
+  · M3 DONE: POST /api/action STRUCTURED body {"action":"split","part_id":7} (no CLI
+    cmd-string; user decision) → actuate_action typed dispatch to same in-process ops as
+    the loop; gated by --dashboard-allow-mutations + leader-only. HTML rewired to send
+    structured action objects. coco: 4 findings (leader gate + merge-same + strict
+    extent_ids fixed; auth/CSRF = documented non-goal). 182 tests, 0 clippy.
   · M4: delete python/dashboard/ (5 files); DASHBOARD.md → docs/ops.md; update README,
     crates/manager/CLAUDE.md (F203 reconciliation note), crates/server/CLAUDE.md, deploy
     k8s/baremetal + cluster.sh env→flag threading (AUTUMN_DASHBOARD=1).

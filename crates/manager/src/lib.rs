@@ -1489,12 +1489,14 @@ impl AutumnManager {
         })
     }
 
-    /// Send a MAINTENANCE op (gc / compact) to a partition's owning PS
-    /// (in-process, same ConnPool as auto_dispatch_*).
+    /// Send a MAINTENANCE op (gc / compact / forcegc) to a partition's owning PS
+    /// (in-process, same ConnPool as auto_dispatch_*). `extent_ids` is used only
+    /// by `MAINTENANCE_FORCE_GC`; gc/compact pass empty.
     async fn actuate_maintenance(
         &self,
         part_id: u64,
         op: u8,
+        extent_ids: Vec<u64>,
         state: &autumn_common::MetadataState,
     ) -> Result<()> {
         let ps_addr = state
@@ -1512,7 +1514,7 @@ impl AutumnManager {
             &autumn_rpc::partition_rpc::MaintenanceReq {
                 part_id,
                 op,
-                extent_ids: vec![],
+                extent_ids,
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
@@ -1571,6 +1573,7 @@ impl AutumnManager {
                 self.actuate_maintenance(
                     cand.primary_part_id,
                     autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC,
+                    vec![],
                     state,
                 )
                 .await
@@ -1579,6 +1582,7 @@ impl AutumnManager {
                 self.actuate_maintenance(
                     cand.primary_part_id,
                     autumn_rpc::partition_rpc::MAINTENANCE_COMPACT,
+                    vec![],
                     state,
                 )
                 .await
@@ -1599,6 +1603,105 @@ impl AutumnManager {
                 Ok(())
             }
             _ => anyhow::bail!("candidate kind {} not actionable", cand.kind),
+        }
+    }
+
+    /// F-DASH-IN-MGR M3: actuate ONE manual dashboard action IN-PROCESS from a
+    /// STRUCTURED request (no CLI command string). `action` is the verb; the
+    /// typed ids carry the target(s). Dispatches to the SAME underlying ops as
+    /// the controller loop (no subprocess, no `autumn-op`). The dashboard
+    /// validates the action + required fields before calling this. Returns a
+    /// short human-readable outcome for the action log.
+    pub(crate) async fn actuate_action(
+        &self,
+        action: &str,
+        part_id: u64,
+        victim_part_id: u64,
+        extent_id: u64,
+        extent_ids: Vec<u64>,
+    ) -> Result<String> {
+        // Leader-only backstop (coco P1): split / gc / compact / forcegc send
+        // straight to the PS and would otherwise skip the leader check that
+        // merge/ec already do — a follower must never dispatch cluster mutations
+        // off its replay-stale metadata (the "only leader mutates" invariant).
+        self.ensure_leader().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let state = self.store.inner.borrow().clone();
+        match action {
+            "split" => {
+                let cand = PolicyCandidate {
+                    kind: POLICY_KIND_SPLIT,
+                    primary_part_id: part_id,
+                    secondary_part_id: 0,
+                    reason: "manual".to_string(),
+                    size_bytes: 0,
+                    req_per_sec: 0,
+                    imm_full_per_sec: 0,
+                    same_ps: false,
+                    last_op_at: 0,
+                };
+                self.auto_dispatch_split(&cand, &state).await?;
+                Ok(format!("split part {part_id} dispatched"))
+            }
+            "merge" => {
+                let req = MergePartitionsReq {
+                    survivor_part_id: part_id,
+                    victim_part_id,
+                };
+                let resp_bytes = self
+                    .handle_merge_partitions(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: MergePartitionsResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("merge: {}", resp.message);
+                }
+                Ok(format!("merge survivor={part_id} victim={victim_part_id} OK"))
+            }
+            "gc" => {
+                self.actuate_maintenance(
+                    part_id,
+                    autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC,
+                    vec![],
+                    &state,
+                )
+                .await?;
+                Ok(format!("gc part {part_id} dispatched"))
+            }
+            "compact" => {
+                self.actuate_maintenance(
+                    part_id,
+                    autumn_rpc::partition_rpc::MAINTENANCE_COMPACT,
+                    vec![],
+                    &state,
+                )
+                .await?;
+                Ok(format!("compact part {part_id} dispatched"))
+            }
+            "forcegc" => {
+                self.actuate_maintenance(
+                    part_id,
+                    autumn_rpc::partition_rpc::MAINTENANCE_FORCE_GC,
+                    extent_ids,
+                    &state,
+                )
+                .await?;
+                Ok(format!("forcegc part {part_id} dispatched"))
+            }
+            "force_ec_convert" => {
+                let req = ForceEcConvertReq { extent_id };
+                let resp_bytes = self
+                    .handle_force_ec_convert(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: ForceEcConvertResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("force_ec_convert: {}", resp.message);
+                }
+                Ok(format!("force_ec_convert extent {extent_id} OK"))
+            }
+            _ => anyhow::bail!("action '{action}' not allowed"),
         }
     }
 

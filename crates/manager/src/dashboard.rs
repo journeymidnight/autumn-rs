@@ -49,13 +49,14 @@ use axum::Router;
 use send_wrapper::SendWrapper;
 
 use autumn_rpc::manager_rpc::{
-    MgrAutoPolicyEntry, NodeCapWire, NodeStateEntry, AUTOPOLICY_OP_DELETE, AUTOPOLICY_OP_SET_ACTIVE,
-    AUTOPOLICY_OP_SET_MODE, AUTOPOLICY_OP_UPSERT, CODE_OK, NODE_AUTO_STATE_ONLINE,
-    NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED,
-    NODE_OVERRIDE_MAINTENANCE,
+    MgrAutoPolicyEntry, NodeCapWire, NodeStateEntry, PolicyCandidate, AUTOPOLICY_OP_DELETE,
+    AUTOPOLICY_OP_SET_ACTIVE, AUTOPOLICY_OP_SET_MODE, AUTOPOLICY_OP_UPSERT, CODE_OK,
+    NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED,
+    NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT,
+    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
 };
 
-use crate::auto_policy::{candidate_to_cmd, cooldown_key, describe_candidate, policy_kind_str};
+use crate::auto_policy::{cooldown_key, describe_candidate, policy_kind_str};
 use crate::AutumnManager;
 
 /// `(epoch_second, rendered_json)` — a 1-second coalescing cache for
@@ -180,6 +181,13 @@ impl AutumnManager {
             SendWrapper::new(async move { policies_delete_response(&mgr, &body).await })
         });
 
+        // Manual per-target actions + advisory Apply (M3).
+        let mgr_action = SendWrapper::new(self.clone());
+        let action_route = post(move |body: axum::body::Bytes| {
+            let mgr = mgr_action.clone();
+            SendWrapper::new(async move { action_response(&mgr, &body).await })
+        });
+
         Router::new()
             .route("/", get(index_handler))
             .route("/healthz", get(healthz_handler))
@@ -189,8 +197,7 @@ impl AutumnManager {
             .route("/api/policies/activate", policies_activate)
             .route("/api/policies/upsert", policies_upsert)
             .route("/api/policies/delete", policies_delete)
-            // ── stub (real impl lands in M3) ─────────────────────────────────
-            .route("/api/action", post(action_stub))
+            .route("/api/action", action_route)
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
     }
 
@@ -353,7 +360,7 @@ impl AutumnManager {
                     "secondary_part_id": c.secondary_part_id,
                     "reason": c.reason,
                     "desc": describe_candidate(c),
-                    "cmd": candidate_to_cmd(c),
+                    "action": candidate_to_action(c),
                     "key": cooldown_key(c),
                 })
             })
@@ -624,12 +631,145 @@ fn switches_to_dict(sw: &[bool]) -> serde_json::Value {
     })
 }
 
-async fn action_stub() -> Response<Body> {
-    json_response(
-        StatusCode::FORBIDDEN,
-        r#"{"ok":false,"error":"mutations not implemented until M3"}"#.to_string(),
-        "application/json",
-    )
+/// Map an advisory candidate to the STRUCTURED `/api/action` payload the page's
+/// `Apply` button sends (or `null` for advisory-only / no target). ec →
+/// `force_ec_convert` on the extent (`secondary_part_id`); merge = survivor
+/// (`primary`) + victim (`secondary`); major/minor → `compact`.
+fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
+    use serde_json::json;
+    match c.kind {
+        POLICY_KIND_EC => {
+            if c.secondary_part_id == 0 {
+                return None;
+            }
+            Some(json!({ "action": "force_ec_convert", "extent_id": c.secondary_part_id }))
+        }
+        POLICY_KIND_SPLIT => Some(json!({ "action": "split", "part_id": c.primary_part_id })),
+        POLICY_KIND_MERGE => {
+            if c.secondary_part_id == 0 {
+                return None;
+            }
+            Some(json!({
+                "action": "merge",
+                "part_id": c.primary_part_id,
+                "victim_part_id": c.secondary_part_id,
+            }))
+        }
+        POLICY_KIND_GC => Some(json!({ "action": "gc", "part_id": c.primary_part_id })),
+        POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+            Some(json!({ "action": "compact", "part_id": c.primary_part_id }))
+        }
+        _ => None, // hotcold / unknown → advisory only
+    }
+}
+
+/// Backend trust boundary: the action must be one of the known verbs and carry
+/// its required typed fields. Never trust the client for a mutation.
+fn validate_action(
+    action: &str,
+    part_id: u64,
+    victim_part_id: u64,
+    extent_id: u64,
+    extent_ids: &[u64],
+) -> Result<(), String> {
+    // part_id / extent_id == 0 means the field was absent (ids are ≥ 1).
+    match action {
+        "split" | "gc" | "compact" => {
+            if part_id == 0 {
+                return Err(format!("{action} requires part_id"));
+            }
+        }
+        "merge" => {
+            if part_id == 0 || victim_part_id == 0 {
+                return Err("merge requires part_id + victim_part_id".to_string());
+            }
+            if part_id == victim_part_id {
+                return Err("merge survivor and victim must differ".to_string());
+            }
+        }
+        "forcegc" => {
+            if part_id == 0 {
+                return Err("forcegc requires part_id".to_string());
+            }
+            if extent_ids.is_empty() {
+                return Err("forcegc requires a non-empty extent_ids".to_string());
+            }
+        }
+        "force_ec_convert" => {
+            if extent_id == 0 {
+                return Err("force_ec_convert requires extent_id".to_string());
+            }
+        }
+        "" => return Err("missing action".to_string()),
+        _ => return Err(format!("action '{action}' not allowed")),
+    }
+    Ok(())
+}
+
+/// `POST /api/action` — actuate a whitelisted cluster op from a STRUCTURED body
+/// (`{"action":"split","part_id":7}`; see the per-action fields in
+/// `validate_action`). Gated by `--dashboard-allow-mutations`; validated;
+/// dispatched in-process to the same ops as the controller loop (no CLI string,
+/// no subprocess).
+async fn action_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
+    if !mgr.dashboard_allow_mutations.get() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            r#"{"ok":false,"error":"server is read-only; relaunch the manager with --dashboard-allow-mutations"}"#.to_string(),
+            "application/json",
+        );
+    }
+    // Leader-only (coco P1): a follower must never dispatch cluster mutations
+    // (its metadata is replay-stale). actuate_action backstops this too.
+    if !mgr.is_leader() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            r#"{"ok":false,"error":"not leader — point the dashboard at the leader manager"}"#.to_string(),
+            "application/json",
+        );
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+    let part_id = v.get("part_id").and_then(|x| x.as_u64()).unwrap_or(0);
+    let victim_part_id = v.get("victim_part_id").and_then(|x| x.as_u64()).unwrap_or(0);
+    let extent_id = v.get("extent_id").and_then(|x| x.as_u64()).unwrap_or(0);
+    // Strict extent_ids: reject any non-positive-integer element rather than
+    // silently dropping it (coco P3) — a partial forcegc would mislead the operator.
+    let mut extent_ids: Vec<u64> = Vec::new();
+    if let Some(arr) = v.get("extent_ids").and_then(|x| x.as_array()) {
+        for (i, x) in arr.iter().enumerate() {
+            match x.as_u64() {
+                Some(id) if id > 0 => extent_ids.push(id),
+                _ => {
+                    let body = serde_json::json!({
+                        "ok": false,
+                        "error": format!("extent_ids[{i}] is not a positive integer"),
+                    })
+                    .to_string();
+                    return json_response(StatusCode::BAD_REQUEST, body, "application/json");
+                }
+            }
+        }
+    }
+
+    if let Err(e) = validate_action(action, part_id, victim_part_id, extent_id, &extent_ids) {
+        let body = serde_json::json!({ "ok": false, "error": e }).to_string();
+        return json_response(StatusCode::BAD_REQUEST, body, "application/json");
+    }
+    match mgr
+        .actuate_action(action, part_id, victim_part_id, extent_id, extent_ids)
+        .await
+    {
+        Ok(out) => {
+            let body = serde_json::json!({ "ok": true, "output": out }).to_string();
+            json_response(StatusCode::OK, body, "application/json")
+        }
+        Err(e) => {
+            // A manager refusal (precondition / inflight) is benign — surface it.
+            let body = serde_json::json!({ "ok": false, "error": e.to_string() }).to_string();
+            json_response(StatusCode::OK, body, "application/json")
+        }
+    }
 }
 
 /// Shared stub for the three `POST /api/policies/{upsert,activate,delete}` the
