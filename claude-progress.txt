@@ -1,5 +1,27 @@
 Date: 2026-07-04
 TaskStatus: completed
+Task scope: F-VPHEAD-CHAOS — multi-seed chaos validating the vp_head thread under
+  real fault injection, ESPECIALLY split/merge/compact/forcegc (user ask). Added
+  Action::ForceGc + do_force_gc to system_chaos.rs (force GC punches every
+  partition's sealed log extents = maximal stress on the PS replay-floor guard;
+  a wrong vp_head would let it punch a live extent = loss). Runner
+  scripts/vphead_chaos.sh sweeps N seeds (real subprocess ENs + etcd + toxiproxy),
+  per-seed byte-exact verification, TIME_WAIT drain-gate.
+Current summary: 6-seed sweep (1/7/42/137/2024/88888, 40s each, actions=split,
+  merge,compact,forcegc,gc,flush,kill) — ALL 6 PASS, ZERO data loss. Every seed
+  fired forcegc(1-2x)+split+merge+compact, ~12-15k acked writes/seed, all four
+  verifiers clean on all 6 (per-key mismatches=0 not_found=0, range=0,
+  write-liveness=0, accounting=0 — "all invariants OK" x6). Chaos accounting unit
+  tests green.
+Main gaps: NONE. The vp_head correctness thread is now proven end to end:
+  reproduce-first fixes (compaction-MAX, flush-tight, recovery-tail-seed) + coco
+  + fable reviews + multi-seed chaos with split/merge/compact/forcegc = no loss.
+Next steps: closed. (Optional: run on the remote 3-EN cluster host for a
+  longer/cross-host soak if desired.)
+
+============================ prior task history ============================
+Date: 2026-07-04
+TaskStatus: completed
 Task scope: F-FLUSH-VPHEAD-b — recovery seeded p.vp to the replay-MIN (backward),
   so an idle-restarted partition's recovered active memtable rotated with a
   backward vp_head → GC floor couldn't advance without a fresh write (the user's

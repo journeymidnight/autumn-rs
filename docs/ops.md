@@ -637,6 +637,16 @@ extent's `refs` against live stream membership.
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
+# vp_head multi-seed chaos (F-COMPACT/FLUSH-VPHEAD): several seeds through the
+# in-process system_chaos harness (real subprocess ENs + etcd + toxiproxy),
+# nemesis focused on split/merge/compact/FORCEGC (+ gc/flush/EN-kill). forcegc
+# bypasses the discard-ratio gate to punch specific sealed extents -> the maximal
+# stress on the PS replay-floor guard; a wrong vp_head would let it punch a live
+# extent = loss. Every acked put verified byte-exact per seed:
+./scripts/vphead_chaos.sh                              # 6 default seeds
+VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
+#   (system_chaos's own action name for force GC is `forcegc`; AUTUMN_CHAOS_ACTIONS
+#    to bisect, e.g. AUTUMN_CHAOS_ACTIONS=split,forcegc)
 # Transport-layer chaos (real cluster.sh cluster; E1 EN kill+respawn, E2 PS
 # kill -> migrate, E3 PS respawn, E4 manager kill+respawn (F265), E5 PS +
 # manager double-kill inside the eviction window -> the interrupted eviction

@@ -97,7 +97,7 @@ struct ChaosConfig {
     num_ens: u32,
     seed: u64,
     /// Comma-separated subset of action names to enable. Empty = all.
-    /// Names: split,merge,ec,fence,flush,compact,gc,kill,killfence,partition,latency
+    /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency
     /// Useful for bisecting which action triggers a failure.
     actions: Vec<Action>,
 }
@@ -135,6 +135,7 @@ impl ChaosConfig {
                     "flush" => Action::Flush,
                     "compact" => Action::Compact,
                     "gc" => Action::Gc,
+                    "forcegc" => Action::ForceGc,
                     "kill" => Action::KillEn,
                     "killfence" => Action::KillThenFence,
                     "partition" => Action::NetworkPartition,
@@ -686,6 +687,7 @@ enum Action {
     Flush,
     Compact,
     Gc,
+    ForceGc,
     KillEn,
     KillThenFence,
     NetworkPartition,
@@ -700,6 +702,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::Flush,
     Action::Compact,
     Action::Gc,
+    Action::ForceGc,
     Action::KillEn,
     Action::KillThenFence,
     Action::NetworkPartition,
@@ -1171,6 +1174,76 @@ async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String,
     Ok(format!("{label} × {}", parts.len()))
 }
 
+/// FORCE GC on every partition's sealed log_stream extents — the maximal stress
+/// on the PS replay-floor guard (the F-COMPACT/FLUSH-VPHEAD vp_head thread). Force
+/// GC bypasses the discard-ratio gate and asks the PS to punch SPECIFIC sealed
+/// extents; a wrong vp_head (compaction MAX / flush rotation-stamp / recovery
+/// tail-seed) would let it punch an extent still inside the replay window → the
+/// un-flushed WAL tail is lost (caught by verify_per_key / _range). The guard must
+/// relocate live VPs out first and SKIP any extent at/after the replay floor —
+/// force GC of a protected extent is a no-op, never a punch.
+async fn do_force_gc(ctx: &NemesisCtx) -> Result<String, String> {
+    let parts = ctx.topo.snapshot();
+    let regions = get_regions(&ctx.mgr).await;
+    let mut requested = 0usize;
+    let mut hit_parts = 0usize;
+    for (_, _, pid) in &parts {
+        let Some(region) = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == *pid)
+            .map(|(_, r)| r.clone())
+        else {
+            continue;
+        };
+        let Ok(info_resp) = ctx
+            .mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![region.log_stream],
+                }),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Ok(info) = rkyv_decode::<StreamInfoResp>(&info_resp) else {
+            continue;
+        };
+        let Some((_, stream)) = info.streams.first() else {
+            continue;
+        };
+        if stream.extent_ids.len() < 2 {
+            continue; // only the open tail — nothing sealed to force-GC
+        }
+        // Every sealed (non-tail) extent. The PS's replay-floor guard decides
+        // which are actually punchable; extents inside the replay window are
+        // SKIPPED (protected), not lost.
+        let sealed: Vec<u64> = stream.extent_ids[..stream.extent_ids.len() - 1].to_vec();
+        let client = ctx.router.client_for(*pid).await;
+        let _ = client
+            .call(
+                partition_rpc::MSG_MAINTENANCE,
+                partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                    part_id: *pid,
+                    op: partition_rpc::MAINTENANCE_FORCE_GC,
+                    extent_ids: sealed.clone(),
+                    gc_ratio: None,
+                    gc_max_size: None,
+                    gc_stream_debt: None,
+                    gc_empty_only: false,
+                }),
+            )
+            .await;
+        requested += sealed.len();
+        hit_parts += 1;
+    }
+    Ok(format!(
+        "forcegc requested {requested} sealed extent(s) across {hit_parts} part(s)"
+    ))
+}
+
 async fn nemesis_loop(
     ctx: Rc<NemesisCtx>,
     stop: Arc<AtomicBool>,
@@ -1222,6 +1295,7 @@ async fn nemesis_loop(
                     do_maintenance(&ctx, partition_rpc::MAINTENANCE_COMPACT, "compact").await
                 }
                 Action::Gc => do_maintenance(&ctx, partition_rpc::MAINTENANCE_AUTO_GC, "gc").await,
+                Action::ForceGc => do_force_gc(&ctx).await,
                 Action::KillEn => do_kill_en(&ctx).await,
                 Action::KillThenFence => do_kill_then_fence(&ctx).await,
                 Action::NetworkPartition => do_network_partition(&ctx).await,
