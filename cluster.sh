@@ -733,6 +733,12 @@ do_start() {
     # `start` / `restart` pass 0 and MUST NEVER clean etcd (data-safety).
     local fresh="${2:-0}"
     [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas >= 1 )) || die "replicas must be a positive integer"
+    # Sync the global to the count we're ACTUALLY launching. The dispatch may pass
+    # a reused/persisted count that differs from the CLI-parsed global REPLICAS
+    # (e.g. a bare `restart` reusing the snapshot). Without this, compute_affinity
+    # and — critically — save_cluster_config would use the stale CLI default (1),
+    # clobbering the persisted topology to 1 even though N ENs are running.
+    REPLICAS="$replicas"
     apply_ucx_env_defaults
 
     # Stop any leftover processes from a previous run to avoid port conflicts
@@ -1206,32 +1212,41 @@ if [[ "$CMD" == "start" || "$CMD" == "restart" || "$CMD" == "reset" ]]; then
 fi
 export CLUSTER_MODE="$MODE"
 
-# For the etcd-REUSING bring-ups (`start`/`restart`, fresh=0): the preserved etcd
-# holds partitions placed on the LAST run's EN topology. Bringing up a different
-# EN count leaves those partitions pointing at extents on now-absent nodes — the
-# PS then loops forever on `commit_length` (0/R members reachable) and never
-# binds its partition listener. So reuse the EN count from the config snapshot;
-# only `reset` (which wipes etcd) is allowed to pick a new topology. Echoes the
-# effective replica count on stdout; warns on stderr if an explicit N is ignored.
-reuse_replicas() {
-    local n="$REPLICAS"
+# For the etcd-REUSING bring-ups (`start`/`restart`, fresh=0), resolve the EN
+# count into $EFF_REPLICAS. The persisted snapshot = the topology etcd's
+# partitions are placed on, so:
+#   - no N (bare `start`/`restart`) → re-launch exactly the persisted count (a
+#     bare bring-up must not shrink to the default 1).
+#   - N >= persisted (`restart 8` on a 5-EN cluster) → GROW: launch N ENs; the
+#     first `persisted` reuse their formatted disks, the extra N-persisted format
+#     fresh. Adding capacity is safe. do_start re-persists N.
+#   - N <  persisted (`restart 3` on a 5-EN cluster) → REFUSE: partitions placed
+#     across `persisted` nodes would be stranded on absent extents (PS loops on
+#     `commit_length`, never binds its listener). Use `reset N` to re-place.
+# MUST run in the MAIN shell BEFORE do_stop — a `die` inside a `$(...)` only kills
+# the subshell, which would leave the cluster stopped on a rejected shrink.
+resolve_replicas() {
+    local snap="$REPLICAS"
     if [[ -f "$CONFIG_FILE" ]]; then
-        local snap
-        snap="$(sed -n 's/^REPLICAS=//p' "$CONFIG_FILE" | head -1)"
-        if [[ "$snap" =~ ^[0-9]+$ ]]; then
-            if (( ARG_INT_PROVIDED )) && [[ "$snap" != "$REPLICAS" ]]; then
-                echo "[cluster] $CMD: reusing persisted EN count $snap (ignoring N=$REPLICAS) — etcd is preserved; run 'reset $REPLICAS' to change the topology." >&2
-            fi
-            n="$snap"
-        fi
+        local s
+        s="$(sed -n 's/^REPLICAS=//p' "$CONFIG_FILE" | head -1)"
+        [[ "$s" =~ ^[0-9]+$ ]] && snap="$s"
     fi
-    printf '%s' "$n"
+    if (( ARG_INT_PROVIDED )); then
+        if (( REPLICAS < snap )); then
+            die "$CMD $REPLICAS would SHRINK below the persisted $snap ENs — partitions placed across $snap nodes would be stranded on absent extents. Keep N >= $snap to grow/same, or run 'reset $REPLICAS' to re-place from a clean etcd."
+        fi
+        (( REPLICAS > snap )) && echo "[cluster] $CMD: growing $snap → $REPLICAS ENs (+$((REPLICAS - snap)); existing extents preserved)." >&2
+        EFF_REPLICAS="$REPLICAS"
+    else
+        EFF_REPLICAS="$snap"
+    fi
 }
 
 case "$CMD" in
-    start)        do_start "$(reuse_replicas)" 0 ;;
+    start)        resolve_replicas; do_start "$EFF_REPLICAS" 0 ;;
     stop)         do_stop ;;
-    restart)      do_stop; do_start "$(reuse_replicas)" 0 ;;
+    restart)      resolve_replicas; do_stop; do_start "$EFF_REPLICAS" 0 ;;
     clean)        do_clean ;;
     reset)        do_clean; do_start "$REPLICAS" 1 ;;
     status)       do_status ;;
