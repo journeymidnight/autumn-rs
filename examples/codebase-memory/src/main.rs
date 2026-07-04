@@ -133,9 +133,6 @@ async fn h_trace(app: &App, p: P) -> Result<Response<Body>, AppError> {
 async fn h_stats(app: &App) -> Result<Response<Body>, AppError> {
     Ok(json_ok(&app.code.stats().await?))
 }
-async fn h_graph(app: &App) -> Result<Response<Body>, AppError> {
-    Ok(json_ok(&app.code.graph().await?))
-}
 async fn h_config(app: &App) -> Result<Response<Body>, AppError> {
     Ok(json_ok(&app.cfg))
 }
@@ -180,7 +177,6 @@ fn router(shared: Shared) -> Router {
         .route("/", get(index_handler))
         .route("/config", get(s!(h_config)))
         .route("/stats", get(s!(h_stats)))
-        .route("/graph", get(s!(h_graph)))
         .route("/search", get(q!(h_search)))
         .route("/symbol", get(q!(h_symbol)))
         .route("/callers", get(q!(h_callers)))
@@ -408,8 +404,6 @@ async fn main() -> Result<()> {
     let code = Code {
         store: store.clone(),
         emb: emb.clone(),
-        tenant: args.tenant.clone(),
-        agent: args.agent.clone(),
     };
 
     // MCP stdio mode: speak JSON-RPC over stdin/stdout against the existing

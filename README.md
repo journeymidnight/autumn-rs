@@ -149,7 +149,8 @@ design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
 **`examples/codebase-memory`** sits on `autumn-memory` (an Axum web UI + an MCP
 `--mcp` stdio mode, so any MCP host — Claude Code/Desktop, Cursor — gets the same
 tools): it indexes a codebase (autumn-rs itself), searches it (lexical / vector /
-hybrid), and renders a call graph you can walk.
+hybrid), and walks the call graph (callers / callees / trace) — in the browser or
+as MCP tools for Claude.
 
 ```bash
 cargo run -p codebase-memory -- 127.0.0.1:9001 --root crates/autumn-memory   # web UI at :5180

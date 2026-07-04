@@ -2,25 +2,19 @@
 //! Search returns symbols with source + location; the graph methods expose the
 //! CALLS/CONTAINS edges as callers / callees / members / a bounded call trace.
 
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Result;
-use autumn_memory::{keys, Dir, MemoryStore};
+use autumn_memory::{Dir, MemoryStore};
 use serde_json::{json, Value};
 
 use crate::embed::Embedder;
 
 const NPROBE: usize = 8;
-pub const KINDS: [&str; 8] = [
-    "Function", "Method", "Struct", "Enum", "Union", "Trait", "Module", "Type",
-];
 
 pub struct Code {
     pub store: Rc<MemoryStore>,
     pub emb: Rc<Embedder>,
-    pub tenant: String,
-    pub agent: String,
 }
 
 impl Code {
@@ -135,88 +129,4 @@ impl Code {
         Ok(json!({"symbols": r.nodes, "edges": r.edges, "docs": r.docs, "is_clean": r.is_clean()}))
     }
 
-    /// The whole graph for the force-directed view: every node (id, name, kind)
-    /// + every edge whose endpoints both still exist (drops dangling edges).
-    /// Nodes come from the per-kind index; edges from ONE `edge/` prefix scan.
-    pub async fn graph(&self) -> Result<Value> {
-        let mut nodes = Vec::new();
-        let mut ids: HashSet<String> = HashSet::new();
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for kind in KINDS {
-            for id in self.store.nodes_by_kind(kind, None).await? {
-                let name = id.rsplit("::").next().unwrap_or(&id).to_string();
-                ids.insert(id.clone());
-                *counts.entry(kind).or_default() += 1;
-                nodes.push(json!({"id": id, "name": name, "kind": kind}));
-            }
-        }
-
-        let client = self.store.client();
-        let prefix = keys::edge_all_prefix(&self.tenant, &self.agent);
-        let mut start: Vec<u8> = Vec::new();
-        let mut links = Vec::new();
-        loop {
-            let res = client.range(&prefix, &start, 1024).await?;
-            let n = res.entries.len();
-            if n == 0 {
-                break;
-            }
-            let last = res.entries[n - 1].key.clone();
-            for e in &res.entries {
-                if let Some((src, etype, dst)) = keys::edge_all_parse(&e.key, &prefix) {
-                    if ids.contains(&src) && ids.contains(&dst) {
-                        links.push(json!({"source": src, "target": dst, "type": etype}));
-                    }
-                }
-            }
-            if n < 1024 {
-                break;
-            }
-            start = last;
-            start.push(0);
-        }
-
-        // Cap for the 3D viz — a force graph chokes on tens of thousands of
-        // edges. Keep the most-connected nodes (by degree) + edges among them,
-        // then a hard link cap. The legend still shows the full per-kind counts;
-        // `truncated`/`total_*` let the UI say "showing N of M".
-        const MAX_NODES: usize = 1500;
-        const MAX_LINKS: usize = 8000;
-        let total_nodes = nodes.len();
-        let total_links = links.len();
-        let mut truncated = false;
-        if nodes.len() > MAX_NODES {
-            truncated = true;
-            let mut deg: HashMap<String, usize> = HashMap::new();
-            for l in &links {
-                if let Some(s) = l["source"].as_str() {
-                    *deg.entry(s.to_string()).or_default() += 1;
-                }
-                if let Some(t) = l["target"].as_str() {
-                    *deg.entry(t.to_string()).or_default() += 1;
-                }
-            }
-            let keep: HashSet<String> = {
-                let mut ranked: Vec<(String, usize)> = nodes
-                    .iter()
-                    .filter_map(|nd| {
-                        nd["id"].as_str().map(|id| (id.to_string(), deg.get(id).copied().unwrap_or(0)))
-                    })
-                    .collect();
-                ranked.sort_by(|a, b| b.1.cmp(&a.1));
-                ranked.into_iter().take(MAX_NODES).map(|(id, _)| id).collect()
-            };
-            nodes.retain(|nd| nd["id"].as_str().map(|id| keep.contains(id)).unwrap_or(false));
-            links.retain(|l| {
-                keep.contains(l["source"].as_str().unwrap_or(""))
-                    && keep.contains(l["target"].as_str().unwrap_or(""))
-            });
-        }
-        if links.len() > MAX_LINKS {
-            truncated = true;
-            links.truncate(MAX_LINKS);
-        }
-        Ok(json!({"nodes": nodes, "links": links, "counts": counts,
-                  "truncated": truncated, "total_nodes": total_nodes, "total_links": total_links}))
-    }
 }
