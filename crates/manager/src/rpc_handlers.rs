@@ -1420,11 +1420,15 @@ impl AutumnManager {
     /// consumer (autumn-op df / fuse statfs) computes the amplification factor
     /// (`physical_used/logical_stored`) and the EC-dependent writable RANGE.
     /// No scan / no compute here (done off the request path); O(per_node).
-    async fn handle_cluster_df(&self) -> HandlerResult {
+    /// Pure builder for the cluster-df capacity snapshot (no encode). Shared by
+    /// the `MSG_CLUSTER_DF` handler and the in-process embedded dashboard
+    /// (`dashboard.rs::overview_json`) so both read the identical facts without
+    /// a self-RPC round-trip.
+    pub(crate) fn compute_cluster_df_resp(&self) -> ClusterDfResp {
         if !self.leader.get() {
             // A follower's snapshot is replay-stale + its node_health_loop
             // doesn't run — answer NOT_LEADER so the caller rotates.
-            return Ok(rkyv_encode(&ClusterDfResp {
+            return ClusterDfResp {
                 code: CODE_NOT_LEADER,
                 message: "not leader".to_string(),
                 raw_total: 0,
@@ -1435,7 +1439,7 @@ impl AutumnManager {
                 last_update_ms: 0,
                 logical_last_update_ms: 0,
                 per_node: Vec::new(),
-            }));
+            };
         }
         let snap = self.cluster_cap.borrow();
         let per_node = snap
@@ -1449,7 +1453,7 @@ impl AutumnManager {
                 online: c.online,
             })
             .collect();
-        Ok(rkyv_encode(&ClusterDfResp {
+        ClusterDfResp {
             code: CODE_OK,
             message: String::new(),
             raw_total: snap.raw_total,
@@ -1460,7 +1464,11 @@ impl AutumnManager {
             last_update_ms: snap.last_update_ms,
             logical_last_update_ms: snap.logical_last_update_ms,
             per_node,
-        }))
+        }
+    }
+
+    async fn handle_cluster_df(&self) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_cluster_df_resp()))
     }
 
     /// F227: nodes with an in-flight Recovery targeting `extent_id`.
@@ -4109,9 +4117,12 @@ impl AutumnManager {
     /// wire. Bounded by partition + node count, so a web dashboard scales to
     /// 数千 partition / 数万 extent. Leader-gated (a follower's `regions` /
     /// `extents` are replay-stale; the dashboard should scrape the leader).
-    pub(crate) async fn handle_get_cluster_overview(&self) -> HandlerResult {
+    /// Pure builder for the cluster overview (no encode). Shared by the
+    /// `MSG_GET_CLUSTER_OVERVIEW` handler and the in-process embedded dashboard
+    /// (`dashboard.rs::overview_json`).
+    pub(crate) fn compute_cluster_overview_resp(&self) -> GetClusterOverviewResp {
         if !self.leader.get() {
-            return Ok(rkyv_encode(&GetClusterOverviewResp {
+            return GetClusterOverviewResp {
                 code: CODE_NOT_LEADER,
                 message: "not leader".to_string(),
                 partitions: Vec::new(),
@@ -4120,7 +4131,7 @@ impl AutumnManager {
                 total_write_bytes_per_sec: 0,
                 total_read_bytes_per_sec: 0,
                 ps_count: 0,
-            }));
+            };
         }
         let s = self.store.inner.borrow();
         // Latest reported load per partition (policy window; defaults if no report).
@@ -4213,7 +4224,7 @@ impl AutumnManager {
             .collect::<std::collections::HashSet<_>>()
             .len() as u32;
 
-        Ok(rkyv_encode(&GetClusterOverviewResp {
+        GetClusterOverviewResp {
             code: CODE_OK,
             message: String::new(),
             partitions,
@@ -4222,7 +4233,11 @@ impl AutumnManager {
             total_write_bytes_per_sec,
             total_read_bytes_per_sec,
             ps_count,
-        }))
+        }
+    }
+
+    pub(crate) async fn handle_get_cluster_overview(&self) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_cluster_overview_resp()))
     }
 
     /// F192: PS pushes a per-replica failure observation; manager

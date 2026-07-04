@@ -65,6 +65,17 @@ struct Args {
     auth_token_ttl_secs: Option<u64>,
     /// F-AUTHZ-1: clock-skew leeway in seconds. `None` = library default 60.
     auth_clock_skew_secs: Option<u64>,
+    /// F-DASH-IN-MGR: embedded web dashboard HTTP port. `None` = disabled
+    /// (no listener). Deploy layer defaults this on (cluster.sh / entrypoint /
+    /// autumn-deploy translate AUTUMN_DASHBOARD=1 → --dashboard-port 8799).
+    dashboard_port: Option<u16>,
+    /// Bind host for the dashboard. `None` = follow `--listen` (reachable
+    /// cluster-wide by default, per the on-by-default rollout decision). Pin to
+    /// 127.0.0.1 to keep the unauthenticated surface loopback-only.
+    dashboard_listen: Option<String>,
+    /// F-DASH-IN-MGR: ARM cluster mutations — manual dashboard actions AND the
+    /// auto-policy controller leaving DryRun. Default OFF = read-only viewer.
+    dashboard_allow_mutations: bool,
 }
 
 fn parse_args() -> Args {
@@ -84,6 +95,9 @@ fn parse_args() -> Args {
     let mut auth_protected_prefixes: Vec<String> = Vec::new();
     let mut auth_token_ttl_secs: Option<u64> = None;
     let mut auth_clock_skew_secs: Option<u64> = None;
+    let mut dashboard_port: Option<u16> = None;
+    let mut dashboard_listen: Option<String> = None;
+    let mut dashboard_allow_mutations = false;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -195,6 +209,18 @@ fn parse_args() -> Args {
                 auth_clock_skew_secs =
                     Some(raw[i].parse().expect("--auth-clock-skew-secs must be a number"));
             }
+            // ── F-DASH-IN-MGR: embedded web dashboard ───────────────────
+            "--dashboard-port" => {
+                i += 1;
+                dashboard_port = Some(raw[i].parse().expect("--dashboard-port must be a port"));
+            }
+            "--dashboard-listen" => {
+                i += 1;
+                dashboard_listen = Some(raw[i].clone());
+            }
+            "--dashboard-allow-mutations" => {
+                dashboard_allow_mutations = true;
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -217,6 +243,9 @@ fn parse_args() -> Args {
         auth_protected_prefixes,
         auth_token_ttl_secs,
         auth_clock_skew_secs,
+        dashboard_port,
+        dashboard_listen,
+        dashboard_allow_mutations,
     }
 }
 
@@ -367,6 +396,18 @@ async fn main() -> Result<()> {
             // control plane. Loud log, keep serving.
             Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
         }
+    }
+
+    // F-DASH-IN-MGR: embedded web dashboard + (M2+) auto-policy controller.
+    // Spawns its own compio TcpListener task; must be started BEFORE the
+    // blocking serve() below. Default bind follows --listen (on-by-default
+    // rollout); mutations are OFF unless --dashboard-allow-mutations.
+    if let Some(dport) = args.dashboard_port {
+        let dhost = args
+            .dashboard_listen
+            .clone()
+            .unwrap_or_else(|| args.bind_host.clone());
+        manager.start_dashboard(dhost, dport, args.dashboard_allow_mutations);
     }
 
     tracing::info!("autumn-manager-server listening on {addr}");

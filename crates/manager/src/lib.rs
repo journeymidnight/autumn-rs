@@ -13,6 +13,12 @@ mod recovery;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
 
+// F-DASH-IN-MGR: embedded web dashboard + (M2+) leader-fenced auto-policy
+// controller, folding the retired standalone Python `python/dashboard/` into
+// the manager process (all-in-one; the controller survives as long as the
+// manager leader does). Hand-rolled HTTP/1.1 on a compio TcpListener.
+mod dashboard;
+
 pub(crate) use extent_delete::PendingDelete;
 
 use std::cell::{Cell, RefCell};

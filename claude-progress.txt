@@ -1,32 +1,63 @@
-Date: 2026-07-03
-TaskStatus: completed
-Task scope: codebase-memory 图可视化修复(空白图 → 可渲染) + 删除 memory-browser example。
-  最终形态:autumn-memory (Rust core) + 唯一 Rust example(codebase-memory),
-  Axum 网页 UI + --mcp stdio。Python 侧只保留 autumn 绑定的 Client/BatchClient(供 autumn_kvcache)。
+Date: 2026-07-04
+TaskStatus: not_completed
+Task scope: F-DASH-IN-MGR — fold the standalone Python web dashboard + auto-policy
+  controller (python/dashboard/) into the autumn-manager binary. All-in-one, HTML
+  embedded via include_str!, and (M2+) the auto-policy loop runs as a leader-fenced
+  manager background task so it survives as long as the leader does (the Python
+  webserver could be killed, stopping all auto-policy). User decision: autoPolicy
+  runs ONLY on the etcd leader. Full plan: docs/dashboard_in_manager_plan.md.
 
-本轮完成:
-  · 图空白根因链(codebase-memory Graph tab):
-    (1) showView 用 style.display="" → 回退到 CSS #view-graph{display:none},Graph tab 从不显示
-        (已在上一提交 90dc541 修复为 display:block)。
-    (2) 视图显示后画布仍全黑:3d-force-graph 依赖 WebGL,而 claude-in-chrome 沙盒浏览器 WebGL 被禁用
-        (THREE.WebGLRenderer: could not create WebGL context, Sandboxed=yes)。用户真实 Chrome 支持 WebGL。
-    (3) 边(连线)几乎不可见:linkColor alpha 太低 + 无方向箭头。
-  · 修复方案(codebase-memory static/index.html):
-    - WebGL feature-detect(hasWebGL()):可用 → 3D `3d-force-graph`(最好看,对齐参考 repo);
-      不可用 → 自动回退 2D `force-graph`(纯 canvas,永不空白)。多 CDN 兜底不变。
-    - 方向箭头边(caller→callee)+ 提高 linkColor 透明度,调用图清晰可读。
-    - 2D 回退路径下沙盒内已验证:192 节点 + 521 连线全部渲染,legend 分类计数正确。
-    - 用户真实浏览器将走 3D WebGL 路径(更好看,同样的显眼方向边)。
-  · 删除 examples/memory-browser(用户指令 "不直观"):
-    - 删目录;从 workspace Cargo.toml members 移除;README / crates/autumn-memory/CLAUDE.md 引用清理;
-      feature_list F-MEM-15 状态标注 REMOVED(Python-glue 删除部分仍有效);Graph UI 条目改为 codebase-memory only。
+Current summary:
+  · Plan produced by a Fable planning sub-agent + verified against real symbols;
+    4 design forks decided by the user (rollout=on-by-default bound to manager host;
+    one flag arms both loop+UI; retire python/dashboard/ fully; include autumn-op
+    auto-policy subcommands). Design doc: docs/dashboard_in_manager_plan.md.
+  · M0 COMPLETE + verified. New crates/manager/src/dashboard.rs: axum served by the
+    compio-native cyper_axum::serve over a compio TcpListener — SAME HTTP stack as
+    examples/gallery (user decision mid-M0: first shipped hand-rolled, then switched
+    for one web-serving pattern across the repo). send_wrapper::SendWrapper bridges
+    axum's Send bound over the !Send manager (gallery idiom). Under spawn_supervised
+    (F228); include_str! of the copied 29 KB dashboard_web.html. Endpoints: GET /
+    (page), /healthz, /api/overview (read-only, in-process, byte-compatible with the
+    Python build_overview contract), stubs for /api/partition/<id> (M1), /api/policies
+    (M2), POST /api/action (M3). handle_cluster_df + handle_get_cluster_overview
+    refactored to compute_*_resp pure builders (rpc_handlers.rs) reused directly by
+    the dashboard (no self-RPC). Flags --dashboard-port/--dashboard-listen/
+    --dashboard-allow-mutations wired in crates/server/src/bin/manager.rs
+    (start_dashboard before serve()). Deps added to manager crate: axum, cyper-axum,
+    send_wrapper, serde_json (dashboard-only; RPC stays rkyv).
 
-验证:
-  · cargo build --workspace 绿;cargo clippy -p codebase-memory 绿;无残留 memory-browser 代码引用。
-  · codebase-memory 真集群(127.0.0.1:9001,--root crates/autumn-memory,agent gtest)端到端:
-    /stats {docs:192,edges:521,is_clean:true};Graph tab 在 Chrome 中渲染 192 节点 + 521 连线(2D 回退路径)。
-  · autumn-memory graph 核心(F-MEM-13)不变,22/22 lib 单测此前已绿。
+Verification (M0):
+  · cargo check + clippy -p autumn-manager + server bin: clean (0 warnings).
+  · cargo test -p autumn-manager --lib: 172/172 (was 171; +1 overview_json contract
+    test; the 4 hand-rolled-parser tests were removed with the parser).
+  · e2e smoke: memory-mode manager on :19001 + dashboard :18799 — GET / serves the
+    byte-exact 29680-byte page, /api/overview returns python-valid JSON with all
+    contract keys, /healthz 200, unknown 404, POST /api/action 403 read-only; RPC
+    plane concurrently live.
+  · coco findbugs (GPT-5.5) ran on the FIRST (hand-rolled) M0 diff: P1 no read
+    timeout (Slowloris) + P2 unchecked Content-Length arithmetic. The axum switch
+    dissolves both (hyper rejects hostile Content-Length: u64::MAX → 431 no crash;
+    DefaultBodyLimit caps bodies). Residual (documented, = gallery): no header-read
+    timeout in cyper_axum::serve → active Slowloris cut-off not enforced; compensated
+    by read-only-default + network-ACL guidance.
 
 Main gaps / next steps:
-  · 本轮改动 UNCOMMITTED(index.html 3D/2D 混合渲染 + 删 memory-browser + 文档/账本更新)。
-  · 用户可在真实 Chrome 验证 3D WebGL 效果;若某机器 WebGL 关闭会自动降级 2D,不再空白。
+  · UNCOMMITTED. M0 is a clean checkpoint; awaiting user decision on commit
+    (solo-flow push-to-main) + coco review (rule 12).
+  · M1: full data parity — /api/partition/<id> (extract handle_get_partition_detail
+    to compute_*), advisories with desc/cmd/key (port describe_candidate/
+    candidate_to_cmd), node auto_state from handle_list_node_states, side-by-side
+    parity check vs the Python page on a live cluster.
+  · M2: crates/manager/src/auto_policy.rs — ported decide_actions/candidate_to_cmd/
+    cooldown_key + unit tests (from test_autumn_dashboard.py); MgrAutoPolicyConfig
+    etcd keys (autoPolicy/config,cooldowns) + replay_from_etcd; spawn_supervised
+    leader-gated loop capped at DryRun; MSG_AUTOPOLICY_GET/SET (wire bump) +
+    autumn-op auto-policy status|activate|deactivate; /api/policies GET/upsert/
+    activate/delete live. INVARIANT: leader-only tick.
+  · M3: --dashboard-allow-mutations gates loop-Armed + /api/action; in-process
+    actuation (auto_dispatch_split, extracted do_merge_partitions F185 path, PS
+    MSG_MAINTENANCE gc/compact, force-ec inner fn); verb-whitelist validation.
+  · M4: delete python/dashboard/ (5 files); DASHBOARD.md → docs/ops.md; update
+    README, crates/manager/CLAUDE.md (F203 reconciliation note), crates/server/
+    CLAUDE.md, deploy k8s/baremetal + cluster.sh env→flag threading.

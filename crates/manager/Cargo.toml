@@ -19,6 +19,15 @@ futures = "0.3"
 rand = "0.8"
 sha2 = "0.10"
 rkyv = { version = "0.8.15", features = ["alloc"] }
+# F-DASH-IN-MGR: embedded web dashboard. Same HTTP stack as `examples/gallery`
+# (axum over the compio-native cyper-axum server; send_wrapper bridges axum's
+# Send bound over the !Send manager state — safe on the single-threaded compio
+# runtime). serde_json is confined to the dashboard's browser-facing JSON,
+# never the rkyv RPC codec.
+axum = "0.8"
+cyper-axum = "0.8"
+send_wrapper = { version = "0.6", features = ["futures"] }
+serde_json = "1"
 tracing.workspace = true
 uuid.workspace = true
 
