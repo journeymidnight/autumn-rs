@@ -1092,15 +1092,21 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `mgr_fence_node` / `mgr_set_node_maintenance` / `mgr_clear_node_override`
     / `mgr_remove_node`. The persistent `MgrNodeOverride` keyed by
     `node_id` is the trigger for cleanup. Effects on `mgr_fence_node`:
-    (i) write `node_override/<id>` (etcd), (ii) bump owner-lock
-    revision for every extent the node touches (defence against
-    revived ghost writes), (iii) `auto_abandon_for_fenced_node`
+    (i) capacity precheck unless `--force`, (ii) write
+    `node_override/<id>` (etcd), (iii) `auto_abandon_for_fenced_node`
     sweeps ConvertToEc markers whose `target_nodes[0] == fenced_node`,
     atomically deletes them + writes `ec_convert_advisory/<id>` for
-    operator follow-up. `mgr_remove_node` has the safe-decommission
-    preconditions: must be Fenced AND no extent / marker still
-    references the node — failure returns `Precondition` with the
-    blocking extent/marker IDs in the response.
+    operator follow-up. (The F211-D "bump owner-lock revision for every
+    extent the node touches" was REMOVED by the BUG #3 Layer B fix —
+    see the comment block + tombstone in `rpc_handlers.rs` near
+    `fence_node_impl`; fencing an EN data node must not fence the PS
+    partition owners. Writer fencing on takeover is `acquire_partition_
+    owner_epoch`'s job, note 35.) `mgr_remove_node` has the
+    safe-decommission preconditions: must be Fenced AND no extent /
+    marker still references the node — failure returns `Precondition`
+    with the blocking extent/marker IDs in the response. An OPEN tail
+    extent's slot counts as a reference, hence the F-FENCE-DRAIN sweep
+    below.
 
     **Recovery dispatch gate (`crates/manager/src/recovery.rs`):**
     `recovery_dispatch_loop` reads `AUTUMN_MGR_RECOVERY_GATE` (default
@@ -1109,6 +1115,55 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `auto_disk` rolls back to the legacy "trigger on disk.online ==
     false" path. This is a backward-incompat default — operators
     that haven't deployed a policy script can flip the env var.
+
+    **F-FENCE-DRAIN (2026-07-04) — fence drains OPEN tails + hard
+    placement exclusion.** Three gaps closed (found live: fenced nodes'
+    shard counts GREW after fencing, and their open tails never drained
+    so `remove` never unblocked):
+    - **Placement hard-exclusion**: `placement_excluded_node_ids()`
+      (lib.rs) = Fenced ∪ Maintenance (overrides) ∪ Suspected
+      (`node_states.suspected_node_ids()`; `Suspend` deliberately NOT
+      included — bootstrap seeds every node Suspend). Threaded as the
+      `hard_excluded` param into `select_nodes` (filtered at the TOP so
+      the count precheck AND the cold-leader degraded fallback both
+      inherit it — unlike the F190 soft exclude, hard-excluded nodes are
+      NEVER backfilled), all three fallback walks (create_stream /
+      alloc / merge Phase 1.5), `dispatch_recovery_task`'s target
+      candidates (a rebuilt replica must not land on a draining node),
+      and `handle_force_ec_convert`'s extra-parity pool. Availability
+      trade-off: a 3-EN RF-3 cluster with one Suspected node refuses new
+      extent allocation until it heals (~2 s df tick) or is fenced.
+    - **Open-tail drain sweep** (`drain_fenced_open_tails`, recovery.rs,
+      runs each recovery tick): recovery only rebuilds SEALED extents
+      (note 31), so an idle partition's open tail on a fenced node never
+      drained. The sweep finds OPEN tails (`!ex.sealed`) with a fenced
+      member, resolves the owning partition (streams → partitions →
+      part_addrs, region/ps_nodes fallback) and sends `MSG_ROLL_TAILS`
+      (partition_rpc 0x57, WIRE v13) to the serving PS with
+      `(stream_id, expected_tail)` pairs; 30 s per-partition cooldown
+      (`roll_tails_cooldown`, in-memory). The PS (`handle_roll_tails`,
+      spawned like SPLIT_PART so its awaits don't block partition_loop)
+      checks idempotency (current tail == expected, else skip), then
+      seals+rolls: log/meta tails via P-log `part_sc.seal_and_roll_tail`
+      (the WAL-self-heal primitive — F227 lenient probe seal, dead
+      replicas don't block; ALL replicas unreachable → loud
+      Precondition, never a silent seal); the ROW tail routes through
+      P-bulk's F255 barrier with the new `seal_and_roll: true` flag
+      (drains inflight to zero first — row_stream single-writer
+      invariant). Once sealed, the next recovery tick's fenced branch
+      rebuilds the extent's fenced slots → `remove` unblocks. Writer
+      compatibility is all existing machinery: `already_sealed` no-op +
+      `seal_extent_id` idempotency + client sealed-tail re-alloc.
+    - **Sealed-empty rebuild**: the dispatch pre-filter keys on
+      `!ex.sealed` (the STATE) instead of `sealed_length == 0`, so an
+      authoritative sealed-EMPTY extent (split/merge tail seal, or an
+      empty tail sealed by this drain) gets its fenced slots rebuilt
+      (EN does the 0-byte copy and sets the sealed flag) instead of
+      referencing the node forever.
+    Follow-up (feature_list): manager-unilateral seal (EN-side seal RPC
+    + append rejection) for the "partition has NO serving PS for a long
+    time" case — deferred until actually hit; the sweep WARNs when it
+    can't resolve a PS address.
 
     **Recovery rate limiter (`crates/manager/src/recovery_rate_limiter.rs`,
     F211-H):** per-source/target/global concurrency caps prevent a

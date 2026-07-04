@@ -1316,6 +1316,13 @@ pub(crate) struct RowAppendReq {
 /// invalidate runs.
 pub(crate) struct RowInvalidateBarrierReq {
     pub(crate) row_stream_id: u64,
+    /// F-FENCE-DRAIN: when true, after draining inflight P-bulk to zero the
+    /// worker SEALS + ROLLS the row_stream tail (`bulk_sc.seal_and_roll_tail`,
+    /// which invalidates internally) instead of only invalidating the cache.
+    /// Used by MSG_ROLL_TAILS to drain a row tail off a fenced node. Split
+    /// (F255) passes `false` — it only needs the invalidate before the manager
+    /// seals the tail itself in `multi_modify_split`.
+    pub(crate) seal_and_roll: bool,
     pub(crate) resp_tx: oneshot::Sender<()>,
 }
 
@@ -6449,6 +6456,21 @@ async fn handle_incoming_req(
             })
             .detach();
         }
+        // F-FENCE-DRAIN: seal + roll open tails off a fenced node. Spawned like
+        // SPLIT_PART so its manager RPCs (get_stream_info + seal_and_roll_tail +
+        // the P-bulk row barrier) don't block partition_loop's group-commit.
+        MSG_ROLL_TAILS => {
+            let part_c = part.clone();
+            let part_sc_c = routing.part_sc.clone();
+            let payload = req.payload;
+            let resp_tx = req.resp_tx;
+            compio::runtime::spawn(async move {
+                let result =
+                    crate::rpc_handlers::handle_roll_tails(payload, &part_c, &part_sc_c).await;
+                let _ = resp_tx.send(result);
+            })
+            .detach();
+        }
         // Reads (GET/HEAD/RANGE/GET_DISCARDS) + low-frequency ops
         // (MAINTENANCE) go inline via dispatch_partition_rpc.
         //
@@ -8982,11 +9004,26 @@ async fn flush_worker_loop(
             while let Some(done) = inflight.next().await {
                 done.send();
             }
-            bulk_sc.invalidate_stream(req.row_stream_id);
-            // ACK after invalidate (the ACK semantics are "by the time you
+            if req.seal_and_roll {
+                // F-FENCE-DRAIN: seal + roll the row tail off a fenced node.
+                // seal_and_roll_tail invalidates the cache internally. Best-
+                // effort: on error (e.g. all replicas unreachable → manager
+                // Precondition) log + still ACK; the manager sweep retries on
+                // its cooldown.
+                if let Err(e) = bulk_sc.seal_and_roll_tail(req.row_stream_id).await {
+                    tracing::warn!(
+                        row_stream_id = req.row_stream_id,
+                        error = %e,
+                        "F-FENCE-DRAIN: row tail seal_and_roll failed (will retry)"
+                    );
+                }
+            } else {
+                bulk_sc.invalidate_stream(req.row_stream_id);
+            }
+            // ACK after invalidate/roll (the ACK semantics are "by the time you
             // receive this, no in-flight P-bulk operation is touching the
             // pre-invalidate bulk_sc state"). Receiver-dropped is treated
-            // as the split aborted; the invalidate stands regardless.
+            // as the caller aborted; the invalidate/roll stands regardless.
             let _ = req.resp_tx.send(());
             continue;
         }
@@ -11933,12 +11970,14 @@ mod f255_invalidate_plumbing_tests {
             let (resp_tx, resp_rx) = oneshot::channel::<()>();
             let req = RowInvalidateBarrierReq {
                 row_stream_id: 42,
+                seal_and_roll: false,
                 resp_tx,
             };
             tx.clone().send(req).await.expect("send");
             let recv = rx.next().await.expect("recv");
             let RowInvalidateBarrierReq {
                 row_stream_id,
+                seal_and_roll: _,
                 resp_tx: recv_resp_tx,
             } = recv;
             assert_eq!(row_stream_id, 42);

@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 12;
-pub const WIRE_VERSION_MAX: u32 = 12;
+pub const WIRE_VERSION_MIN: u32 = 13;
+pub const WIRE_VERSION_MAX: u32 = 13;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -154,6 +154,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // dashboard). Pre-R3: MIN=MAX=12 (same-commit deploy; rkyv has no
     // cross-version decode).
     (12, "c2ae65efd6e168f6"),
+    // v13: F-FENCE-DRAIN — partition_rpc gained MSG_ROLL_TAILS (0x57) +
+    // RollTailsReq{part_id, entries}/RollTailsResp{code, rolled, message}: the
+    // manager's recovery sweep tells a PS to seal+roll open tail extents that
+    // sit on a fenced node (recovery only rebuilds SEALED extents, so an idle
+    // partition's open tail on a fenced node would never drain / block remove).
+    // Pre-R3: MIN=MAX=13 (same-commit deploy; rkyv has no cross-version decode).
+    (13, "87ad9d165bd07e15"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

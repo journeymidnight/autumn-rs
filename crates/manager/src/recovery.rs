@@ -37,6 +37,10 @@ impl AutumnManager {
             None => {}
         }
 
+        // F-FENCE-DRAIN: never rebuild a replica onto a fenced / maintenance /
+        // suspected node — that would just create more work to migrate off.
+        // Captured before the store borrow (disjoint RefCells).
+        let hard_excluded = self.placement_excluded_node_ids();
         let (extent, candidates) = {
             let s = self.store.inner.borrow();
             let extent = s
@@ -51,6 +55,7 @@ impl AutumnManager {
                 .nodes
                 .values()
                 .filter(|n| !occupied.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id))
                 .cloned()
                 .collect::<Vec<_>>();
             all.sort_by_key(|n| n.node_id);
@@ -499,7 +504,17 @@ impl AutumnManager {
                     .extents
                     .values()
                     .filter(|ex| {
-                        if ex.sealed_length == 0 {
+                        // F-FENCE-DRAIN: gate on the authoritative `sealed` STATE,
+                        // NOT `sealed_length == 0`. A sealed-EMPTY extent
+                        // (`sealed = true, sealed_length = 0` — a split/merge tail
+                        // seal, or an open tail sealed by the fence drain) is a
+                        // real recovery candidate: its fenced slots must be
+                        // rebuilt so `remove` can proceed, and EN recovery handles
+                        // the 0-byte copy (`stream_extent_from_sources` returns
+                        // Ok(0) on `total == 0`, then sets the `sealed` flag).
+                        // Open tails (`!sealed`) are still skipped here — they are
+                        // drained by the fence sweep's PS-driven roll first.
+                        if !ex.sealed {
                             return false;
                         }
                         !matches!(
@@ -633,6 +648,127 @@ impl AutumnManager {
                             .await;
                     }
                 }
+            }
+
+            // F-FENCE-DRAIN: seal + roll open tails that sit on a fenced node so
+            // recovery (above) can rebuild them and `remove` can proceed. Runs
+            // each tick after the sealed-extent recovery dispatch.
+            self.drain_fenced_open_tails().await;
+        }
+    }
+
+    /// F-FENCE-DRAIN: find OPEN tail extents (`!sealed`) whose replica set
+    /// includes an operator-Fenced node and ask each owning partition's PS to
+    /// seal + roll them (`MSG_ROLL_TAILS`). Recovery only rebuilds SEALED
+    /// extents, so without this an idle partition's open tail on a fenced node
+    /// never drains and blocks `remove` forever. Maintenance / Suspected nodes
+    /// are NOT drained (they aren't being decommissioned). Per-partition 30 s
+    /// cooldown keeps a repeatedly-failing roll (e.g. all replicas unreachable)
+    /// from hammering the PS every tick.
+    async fn drain_fenced_open_tails(&self) {
+        let now_s = Self::epoch_seconds();
+        let fenced: HashSet<u64> = self
+            .node_overrides
+            .borrow()
+            .iter()
+            .filter(|(_, o)| o.kind == NODE_OVERRIDE_FENCED)
+            .map(|(id, _)| *id)
+            .collect();
+        if fenced.is_empty() {
+            return;
+        }
+        // Snapshot under one store borrow: (part_id, PS addr, [(stream, tail)]).
+        let mut work: Vec<(u64, String, Vec<(u64, u64)>)> = Vec::new();
+        {
+            let s = self.store.inner.borrow();
+            for meta in s.partitions.values() {
+                let mut entries: Vec<(u64, u64)> = Vec::new();
+                for stream_id in [meta.log_stream, meta.row_stream, meta.meta_stream] {
+                    let Some(stream) = s.streams.get(&stream_id) else {
+                        continue;
+                    };
+                    let Some(&tail_id) = stream.extent_ids.last() else {
+                        continue;
+                    };
+                    let Some(ex) = s.extents.get(&tail_id) else {
+                        continue;
+                    };
+                    if ex.sealed {
+                        continue; // only OPEN tails need draining
+                    }
+                    if ex
+                        .replicates
+                        .iter()
+                        .chain(ex.parity.iter())
+                        .any(|n| fenced.contains(n))
+                    {
+                        entries.push((stream_id, tail_id));
+                    }
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+                // Resolve PS addr: per-partition hint first, region fallback.
+                let addr = s.part_addrs.get(&meta.part_id).cloned().or_else(|| {
+                    s.regions
+                        .get(&meta.part_id)
+                        .and_then(|r| s.ps_nodes.get(&r.ps_id).cloned())
+                });
+                match addr {
+                    Some(addr) => work.push((meta.part_id, addr, entries)),
+                    None => tracing::warn!(
+                        part_id = meta.part_id,
+                        "F-FENCE-DRAIN: open tail on fenced node but no PS address to roll it (awaiting reassignment)"
+                    ),
+                }
+            }
+        }
+        for (part_id, addr, entries) in work {
+            // Per-partition 30 s cooldown.
+            {
+                let mut cd = self.roll_tails_cooldown.borrow_mut();
+                if let Some(&last) = cd.get(&part_id) {
+                    if now_s - last < 30 {
+                        continue;
+                    }
+                }
+                cd.insert(part_id, now_s);
+            }
+            let req = autumn_rpc::partition_rpc::RollTailsReq {
+                part_id,
+                entries,
+            };
+            let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+            match self
+                .conn_pool
+                .call_timeout(
+                    &addr,
+                    autumn_rpc::partition_rpc::MSG_ROLL_TAILS,
+                    payload,
+                    Duration::from_secs(30),
+                )
+                .await
+            {
+                Ok(bytes) => {
+                    match autumn_rpc::partition_rpc::rkyv_decode::<
+                        autumn_rpc::partition_rpc::RollTailsResp,
+                    >(&bytes)
+                    {
+                        Ok(resp) if resp.rolled > 0 => tracing::info!(
+                            part_id,
+                            rolled = resp.rolled,
+                            "F-FENCE-DRAIN: rolled open tail(s) off fenced node(s)"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(part_id, error = %e, "F-FENCE-DRAIN: bad RollTailsResp")
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    part_id, addr = %addr, error = %e,
+                    "F-FENCE-DRAIN: roll_tails RPC failed (will retry)"
+                ),
             }
         }
     }

@@ -1140,6 +1140,9 @@ impl AutumnManager {
         // independent RefCell.
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
+        // F-FENCE-DRAIN: Fenced/Maintenance/Suspected nodes are hard-excluded
+        // from allocation AND the fallback walk below.
+        let hard_excluded = self.placement_excluded_node_ids();
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
             let selected =
@@ -1148,6 +1151,7 @@ impl AutumnManager {
                     &s.disks,
                     &online_node_ids,
                     &space_low_node_ids,
+                    &hard_excluded,
                     total_replicas,
                     &[],
                 )
@@ -1179,6 +1183,7 @@ impl AutumnManager {
             s.nodes
                 .values()
                 .filter(|n| !selected_ids.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id)) // F-FENCE-DRAIN
                 .cloned()
                 .collect()
         };
@@ -1806,6 +1811,7 @@ impl AutumnManager {
         // the store. See `handle_create_stream` for the same pattern.
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
+        let hard_excluded = self.placement_excluded_node_ids(); // F-FENCE-DRAIN
         let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
@@ -1906,6 +1912,7 @@ impl AutumnManager {
                 &s.disks,
                 &online_node_ids,
                 &space_low_node_ids,
+                &hard_excluded,
                 data,
                 &req.exclude_node_ids,
             ) {
@@ -2104,9 +2111,13 @@ impl AutumnManager {
         // F190: prefer fallbacks not in the writer's recent-failure set; fall
         // back to the unfiltered set if the exclusion would empty the iter.
         let exclude_set: HashSet<u64> = req.exclude_node_ids.iter().copied().collect();
+        // F-FENCE-DRAIN: hard-exclude fenced/maintenance/suspected at the source
+        // so the `after_exclude.is_empty() → unfiltered` fallback can't re-admit
+        // them either.
         let unfiltered: Vec<MgrNodeInfo> = nodes_map
             .values()
             .filter(|n| !selected_ids.contains(&n.node_id))
+            .filter(|n| !hard_excluded.contains(&n.node_id))
             .cloned()
             .collect();
         let after_exclude: Vec<MgrNodeInfo> = unfiltered
@@ -3040,6 +3051,7 @@ impl AutumnManager {
         // store. Passed into the Phase-1 select_nodes call.
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
+        let hard_excluded = self.placement_excluded_node_ids(); // F-FENCE-DRAIN
 
         // Phase 1: compute under borrow_mut, NO awaits inside.
         // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
@@ -3163,6 +3175,7 @@ impl AutumnManager {
                     &s.disks,
                     &online_node_ids,
                     &space_low_node_ids,
+                    &hard_excluded,
                     target_replicas,
                     &[],
                 )?;
@@ -3285,6 +3298,7 @@ impl AutumnManager {
             s.nodes
                 .values()
                 .filter(|n| !p1_selected_ids.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id)) // F-FENCE-DRAIN
                 .cloned()
                 .collect()
         };
@@ -3941,6 +3955,7 @@ impl AutumnManager {
 
         if total_shards > target_nodes.len() {
             let extra_needed = total_shards - target_nodes.len();
+            let hard_excluded = self.placement_excluded_node_ids(); // F-FENCE-DRAIN
             let extra_candidates: Vec<_> = {
                 use rand::seq::SliceRandom;
                 let s = self.store.inner.borrow();
@@ -3949,6 +3964,7 @@ impl AutumnManager {
                     .nodes
                     .values()
                     .filter(|n| !existing.contains(&n.node_id))
+                    .filter(|n| !hard_excluded.contains(&n.node_id))
                     .cloned()
                     .collect();
                 pool.shuffle(&mut rand::thread_rng());

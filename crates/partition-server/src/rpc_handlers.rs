@@ -235,6 +235,84 @@ pub(crate) async fn handle_batch_get(
 }
 
 /// rkyv-framed GET (generic SDK path).
+/// F-FENCE-DRAIN: seal + roll the requested open tails so a fenced node's
+/// replicas drain. The manager's recovery sweep sends this when an OPEN tail
+/// (`!sealed`) has a replica on a Fenced node — recovery rebuilds only SEALED
+/// extents, so without a roll an idle partition's open tail on a fenced node
+/// never drains and blocks `remove` forever. Log/meta tails roll on P-log's
+/// `part_sc` (the client that owns them); the row tail routes through P-bulk's
+/// `row_invalidate_tx` barrier with `seal_and_roll=true` (row_stream
+/// single-writer invariant — lib.rs note 16). Idempotent: an entry whose
+/// current tail no longer equals the requested `expected_tail` (already rolled
+/// by a natural write or a prior sweep) is skipped. Best-effort: a failed roll
+/// (e.g. all replicas unreachable → manager Precondition) is logged; the sweep
+/// retries on its cooldown.
+pub(crate) async fn handle_roll_tails(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let req: RollTailsReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let (log_id, row_id, meta_id, part_id, row_inv_tx) = {
+        let p = part.borrow();
+        (
+            p.log_stream_id,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.part_id,
+            p.row_invalidate_tx.clone(),
+        )
+    };
+    if req.part_id != part_id {
+        return Ok(partition_rpc::rkyv_encode(&RollTailsResp {
+            code: CODE_NOT_FOUND,
+            rolled: 0,
+            message: format!("partition {} not served here", req.part_id),
+        }));
+    }
+    let mut rolled = 0u32;
+    for (stream_id, expected_tail) in req.entries {
+        // Idempotency: skip if the tail already rolled (current != expected).
+        let cur_tail = match part_sc.get_stream_info(stream_id).await {
+            Ok(info) => info.extent_ids.last().copied().unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(stream_id, error = %e, "roll_tails: get_stream_info failed");
+                continue;
+            }
+        };
+        if cur_tail != expected_tail {
+            continue; // already rolled by a natural write or a prior sweep
+        }
+        if stream_id == row_id {
+            // row_stream single-writer invariant: seal+roll on P-bulk's bulk_sc
+            // via the F255 barrier (drains inflight to zero first).
+            let (tx, rx) = futures::channel::oneshot::channel::<()>();
+            let mut inv_tx = row_inv_tx.clone();
+            let br = crate::RowInvalidateBarrierReq {
+                row_stream_id: row_id,
+                seal_and_roll: true,
+                resp_tx: tx,
+            };
+            if inv_tx.send(br).await.is_ok() && rx.await.is_ok() {
+                rolled += 1;
+            }
+        } else if stream_id == log_id || stream_id == meta_id {
+            match part_sc.seal_and_roll_tail(stream_id).await {
+                Ok(()) => rolled += 1,
+                Err(e) => {
+                    tracing::warn!(stream_id, error = %e, "roll_tails: seal_and_roll_tail failed")
+                }
+            }
+        }
+    }
+    Ok(partition_rpc::rkyv_encode(&RollTailsResp {
+        code: CODE_OK,
+        rolled,
+        message: String::new(),
+    }))
+}
+
 pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
     match get_value(payload, part).await? {
         GetOutcome::NotFound => Ok(partition_rpc::rkyv_encode(&GetResp {
@@ -1196,6 +1274,7 @@ pub(crate) async fn handle_split_part(
     let mut inv_tx = part.borrow().row_invalidate_tx.clone();
     let inv_req = crate::RowInvalidateBarrierReq {
         row_stream_id,
+        seal_and_roll: false, // split: manager seals the tail itself; only invalidate here
         resp_tx: inv_resp_tx,
     };
     // F255 — BOTH the send and the ACK await are bounded. `FREEZE_TTL`

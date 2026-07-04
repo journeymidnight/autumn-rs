@@ -146,6 +146,21 @@ pub const MSG_GET_REDIRECT: u8 = 0x56;
 /// no `part_id` — it's connection-level, handled before the routing check.
 pub const MSG_AUTH_HELLO: u8 = 0x55;
 
+/// F-FENCE-DRAIN: manager → PS "seal + roll these stream tails". The recovery
+/// sweep sends this when it finds an OPEN tail extent (`!sealed`) with a replica
+/// on a Fenced node — recovery only rebuilds SEALED extents, so an idle
+/// partition's open tail on a fenced node would otherwise never drain and block
+/// `remove` forever. The PS routes each `(stream_id, tail_extent_id)` into the
+/// owning partition's writer thread and calls the existing
+/// `StreamClient::seal_and_roll_tail` (WAL self-heal already uses it): the tail
+/// seals via the manager's F227 lenient probe (dead replicas don't block; all
+/// replicas unreachable → the seal Precondition surfaces), a fresh tail rolls on
+/// healthy nodes (Part A placement exclusion keeps it off fenced nodes), and the
+/// next recovery tick rebuilds the now-sealed extent's fenced slots. Idempotent:
+/// `tail_extent_id` is compared against the current tail; a mismatch (already
+/// rolled) is a no-op.
+pub const MSG_ROLL_TAILS: u8 = 0x57;
+
 /// `MSG_AUTH_HELLO` request — the opaque capability token bytes.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AuthHelloReq {
@@ -567,6 +582,25 @@ pub struct MergeFreezeResp {
     pub message: String,
 }
 
+// F-FENCE-DRAIN — manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RollTailsReq {
+    pub part_id: u64,
+    /// `(stream_id, expected_tail_extent_id)` pairs. The PS seals+rolls each
+    /// stream whose current tail still equals `expected_tail_extent_id`
+    /// (idempotent: a stale/already-rolled entry is skipped).
+    pub entries: Vec<(u64, u64)>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RollTailsResp {
+    pub code: u8,
+    /// Number of tails actually sealed+rolled this call (0 if all were stale
+    /// or the partition isn't served here).
+    pub rolled: u32,
+    pub message: String,
+}
+
 // StreamPutReq REMOVED 2026-06-11 with MSG_STREAM_PUT (see the reserved
 // constant note near the msg_type list).
 // F129 PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
@@ -713,6 +747,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_ROLL_TAILS => rkyv_decode::<RollTailsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_DIAG_TRACE_KEY => rkyv_decode::<DiagTraceKeyReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -748,6 +785,7 @@ mod msg_type_tests {
             MSG_BATCH_GET,
             MSG_GET_REDIRECT,
             MSG_AUTH_HELLO,
+            MSG_ROLL_TAILS,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

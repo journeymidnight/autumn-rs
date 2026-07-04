@@ -361,6 +361,68 @@ EN; after the manager flips it to `Suspected` (`autumn-op info` /
 extent has a replica on the dead node is served by a healthy replica instead of
 stalling for the per-RPC timeout on every read.
 
+## Node decommission runbook (fence → drain → remove, F211 + F-FENCE-DRAIN)
+
+Retiring an EN is operator-driven (HDFS-decommission style). The manager never
+auto-removes a node; you fence it, the system drains it, `remove` gates on the
+drain being complete.
+
+```bash
+AO=(./target/release/autumn-op --manager 127.0.0.1:9001)
+
+"${AO[@]}" fence-node 56 --reason "retiring" --by you   # 1. fence
+"${AO[@]}" info                                          # 2. watch shard count → 0
+"${AO[@]}" remove 56 --by you                            # 3. remove (server-side gated)
+```
+
+What fencing triggers (all automatic):
+
+- **No new data**: Fenced (and Maintenance / auto-Suspected) nodes are
+  hard-excluded from every placement path — new extents, fallback walks,
+  recovery targets, EC parity. Unlike soft excludes this is never backfilled;
+  a cluster left with fewer eligible nodes than the replica count refuses
+  allocation loudly rather than placing data on a draining node.
+  (Availability note: a 3-EN RF-3 cluster with one *Suspected* node blocks new
+  extent allocation until it heals — seconds — or is fenced.)
+- **Sealed extents**: the recovery loop (`fenced_only` gate, default) rebuilds
+  every sealed extent's fenced slots onto healthy nodes. Includes sealed-EMPTY
+  extents (0-byte membership swap).
+- **Open tails**: recovery only rebuilds sealed extents, so the manager's drain
+  sweep (every 2 s tick, 30 s per-partition cooldown) asks the owning PS to
+  seal + roll any OPEN tail with a fenced replica (`MSG_ROLL_TAILS`). The old
+  tail seals (F227 lenient probe — a dead fenced replica doesn't block), a
+  fresh tail rolls on healthy nodes, and the next recovery tick rebuilds the
+  now-sealed extent. An idle partition therefore drains with no client writes.
+
+Watching progress:
+
+```bash
+"${AO[@]}" info                       # per-node shard counts → 0 = drained
+"${AO[@]}" extent-health --node 56 --all   # what's left + sealed state per extent
+"${AO[@]}" recovery-stats             # in-flight rebuilds + backoff reasons
+```
+
+`remove <id>` is safe to run early — it refuses with the blocking extent ids
+until the node is fully drained, and prints `remove: ok` only when the manager
+has verified no extent / EC-marker references remain. After remove, the node_id
+is tombstoned (same address cannot re-register); stop the EN process.
+
+Dead-EN notes (fence a node that's already unreachable):
+
+- Everything above still works — seal probes and recovery just skip the dead
+  replica. The failure modes that DON'T self-resolve are loud, never silent:
+  an extent whose replicas are ALL unreachable refuses to seal
+  (`Precondition`, sweep WARNs every cooldown), and a rebuild with no
+  reachable source keeps retrying with the reason visible in
+  `recovery-stats`'s backoff table.
+- A fenced node that is still ALIVE drains faster (it serves as a recovery
+  source). `cluster.sh` is fence-agnostic: `start`/`restart` launch fenced ENs
+  normally (registration is one-time at `format`; only RE-registration of a
+  fenced/removed node is refused).
+- If a partition has no serving PS, its tails can't be rolled until the
+  rebalancer assigns one (the sweep WARNs per cooldown). Manager-unilateral
+  seal is a recorded follow-up, not built.
+
 ## autumn-memory verification
 
 `crates/autumn-memory` turns the cluster into an AI-agent-memory backend

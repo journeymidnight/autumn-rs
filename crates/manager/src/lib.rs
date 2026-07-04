@@ -776,6 +776,11 @@ pub struct AutumnManager {
     /// on release. NOT persisted — limits are advisory, not safety
     /// invariants.
     pub(crate) recovery_limiter: Rc<RefCell<crate::recovery_rate_limiter::RecoveryRateLimiter>>,
+    /// F-FENCE-DRAIN: per-partition last `MSG_ROLL_TAILS` send time (unix secs).
+    /// The open-tail drain sweep in `recovery_dispatch_loop` uses a 30 s
+    /// cooldown so a repeatedly-failing roll doesn't hammer the PS every tick.
+    /// In-memory only (a routing hint; safe to lose on failover).
+    pub(crate) roll_tails_cooldown: Rc<RefCell<HashMap<u64, i64>>>,
     /// F211-I: per-process audit-log sequence counter. Combined with
     /// the unix-nanosecond timestamp to form the `mgr_audit_log/`
     /// suffix so ordering is unique even for concurrent appends.
@@ -889,6 +894,7 @@ impl AutumnManager {
             recovery_limiter: Rc::new(RefCell::new(
                 crate::recovery_rate_limiter::RecoveryRateLimiter::from_env(),
             )),
+            roll_tails_cooldown: Rc::new(RefCell::new(HashMap::new())),
             audit_seq: Rc::new(Cell::new(0)),
             // F214-A: in memory-only mode this serves as the cluster
             // identity. Overwritten by `try_become_leader` /
@@ -2880,6 +2886,27 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
+    /// F-FENCE-DRAIN: node_ids that must NOT receive new extent placements —
+    /// operator-Fenced or -Maintenance (`node_overrides`) plus auto-Suspected
+    /// (`node_states`). Capture this owned set BEFORE any `store.inner` borrow
+    /// (the RefCells are disjoint), mirroring the F214-B `online_node_ids`
+    /// capture pattern, then thread it into `select_nodes` + every fallback walk
+    /// + recovery-target selection so a decommissioning / flaky node never gets
+    /// data we'd immediately have to migrate off.
+    pub(crate) fn placement_excluded_node_ids(&self) -> HashSet<u64> {
+        let mut set: HashSet<u64> = self
+            .node_overrides
+            .borrow()
+            .iter()
+            .filter(|(_, o)| {
+                o.kind == NODE_OVERRIDE_FENCED || o.kind == NODE_OVERRIDE_MAINTENANCE
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        set.extend(self.node_states.borrow().suspected_node_ids());
+        set
+    }
+
     /// F121: pick `count` candidate nodes for a fresh extent allocation.
     ///
     /// Prefers nodes that have **at least one online disk** so the very
@@ -2911,20 +2938,37 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// manager has just won leader election and hasn't run its first
     /// df sweep), the pool widens to honour the existing
     /// "fall-back-to-fresh-node" path in `handle_stream_alloc_extent`.
+    ///
+    /// F-FENCE-DRAIN: `hard_excluded` (Fenced / Maintenance / Suspected, from
+    /// `placement_excluded_node_ids`) is removed from EVERY placement path,
+    /// INCLUDING the cold-leader degraded fallback below — unlike the F190
+    /// `exclude_node_ids` soft hint (which is backfilled when it under-fills),
+    /// a hard-excluded node must never receive a new extent even if that means
+    /// allocation fails loudly (the caller's per-RPC fallback / client retry
+    /// surfaces it) rather than placing data we'd immediately migrate off.
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
         disks: &HashMap<u64, MgrDiskInfo>,
         online_node_ids: &HashSet<u64>,
         space_low_node_ids: &HashSet<u64>,
+        hard_excluded: &HashSet<u64>,
         count: usize,
         exclude_node_ids: &[u64],
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
         use rand::seq::SliceRandom;
-        let all_unfiltered: Vec<MgrNodeInfo> = nodes.values().cloned().collect();
+        // Hard-exclude up front so the count precheck AND the degraded
+        // `pool = all` fallback both inherit it (all downstream pools derive
+        // from `all_unfiltered`).
+        let all_unfiltered: Vec<MgrNodeInfo> = nodes
+            .values()
+            .filter(|n| !hard_excluded.contains(&n.node_id))
+            .cloned()
+            .collect();
         if all_unfiltered.len() < count {
             return Err(AppError::Precondition(format!(
-                "not enough nodes: need {count}, got {}",
-                all_unfiltered.len()
+                "not enough nodes: need {count}, got {} (after excluding {} fenced/maintenance/suspected)",
+                all_unfiltered.len(),
+                hard_excluded.len()
             )));
         }
         let exclude_set: HashSet<u64> = exclude_node_ids.iter().copied().collect();
@@ -6173,7 +6217,7 @@ mod tests {
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), 3, &[])
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), 3, &[])
                     .unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
@@ -6223,7 +6267,7 @@ mod tests {
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), 1, &[])
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), 1, &[])
                     .unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
@@ -6268,7 +6312,7 @@ mod tests {
         let low: HashSet<u64> = [7u64].into_iter().collect();
         for _ in 0..200 {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online, &low, 3, &[]).unwrap();
+                AutumnManager::select_nodes(&nodes, &disks, &online, &low, &HashSet::new(), 3, &[]).unwrap();
             assert!(
                 picked.iter().all(|n| n.node_id != 7),
                 "space-low node 7 picked despite 3 spacious candidates"
@@ -6280,7 +6324,7 @@ mod tests {
         // on a capacity-crunched cluster, not refuse).
         let low2: HashSet<u64> = [5u64, 7].into_iter().collect();
         let picked =
-            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, 3, &[]).unwrap();
+            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, &HashSet::new(), 3, &[]).unwrap();
         assert_eq!(picked.len(), 3);
     }
 

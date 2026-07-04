@@ -210,6 +210,19 @@ impl NodeStateTracker {
             .collect()
     }
 
+    /// F-FENCE-DRAIN: node_ids currently `Suspected` (was verified-alive, now
+    /// flaky). Folded into `placement_excluded_node_ids` so a flapping node
+    /// stops receiving NEW extents until it recovers to `Online` or is fenced.
+    /// `Suspend` (registered-but-never-verified) is deliberately NOT included —
+    /// bootstrap seeds every node `Suspend`, so excluding it would refuse all
+    /// allocation on a fresh cluster.
+    pub fn suspected_node_ids(&self) -> std::collections::HashSet<u64> {
+        self.states
+            .iter()
+            .filter_map(|(id, st)| if st.is_suspected() { Some(*id) } else { None })
+            .collect()
+    }
+
     /// Snapshot: `(node_id, state, last_heartbeat_secs_ago)` for every
     /// tracked node. Used by `mgr_list_node_states` (F211-B).
     pub fn snapshot(&self) -> Vec<(u64, NodeAutoState, Option<u64>)> {
