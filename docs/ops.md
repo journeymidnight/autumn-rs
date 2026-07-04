@@ -140,6 +140,12 @@ bash python/tests/run_fs_e2e.sh
 # M4 — lease fencing + cross-client coherence (two Fs clients):
 bash python/tests/run_fs_lease_e2e.sh
 #   → "PY M4 fencing OK", "PY M4 coherence OK", "===== fs-lease-e2e exit: 0 ====="
+
+# M4 — REAL cross-surface interop (needs /dev/fuse + fusermount3): write through
+# an autumn-fuse kernel mount, read byte-exact via fsspec, and vice versa:
+bash python/autumn_fsspec/tests/run_mount_fsspec_interop.sh
+#   → "PY INTEROP OK: fuse mount + fsspec are one filesystem", exit 0
+#   (skips cleanly if /dev/fuse or fusermount3 is absent)
 ```
 
 M4 write-fencing: `autumn_fsspec` and a fuse mount both take the same per-inode
