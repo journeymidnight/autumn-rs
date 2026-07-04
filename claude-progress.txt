@@ -1,5 +1,42 @@
 Date: 2026-07-04
 TaskStatus: completed
+Task scope: F-COMPACT-VPHEAD — major compaction stamped the output SST vp_head
+  (recovery replay-start) from the LIVE write cursor p.vp_*, which sits PAST
+  acked-but-un-flushed writes in the active memtable. A major compaction wipes
+  every older small-vp_head anchor and stamps all outputs at the live cursor, so
+  recovery (latest checkpoint via decode_last_table_locations + live SST vp_heads
+  — NO old-checkpoint masking) replays from PAST the un-flushed tail → silent
+  data loss on crash. Found while investigating the user's "GC replay-floor stuck
+  at 0 / compact 后 forceg 仍拒绝回收".
+Current summary: reproduce-first. New regression system_compact_unflushed_vp_head
+  FAILED pre-fix (un-flushed key-40 stranded past vp_head → NotFound = left:[]),
+  PASSES post-fix. Fix = background::compaction_output_vp_head stamps the MAX over
+  the INPUT SST vp_heads by stream position (newest input's content boundary) —
+  ADVANCES the GC floor (so GC still reclaims post-split shared extents:
+  system_gc_multiversion_same_extent stays green) while staying ≤ the live cursor
+  = strictly safer than the pre-fix live-cursor stamp. coco findbugs P1
+  (log_extent_ids unwrap_or_default → (0,0) → recovery no-replay branch = loss)
+  FIXED by hard `?` (aborts before any row_stream append; caller logs+retries).
+  187 ps --lib tests + system_crash_mid_compact / ps_recovery / crash_mid_flush /
+  vp_after_split_gc / split_* / gc_chunked_read all green; 0 new clippy warnings.
+Main gaps (deferred follow-ups, NOT done this task):
+  (a) flush stamps the live cursor at CLAIM time, which can be AHEAD of its imm's
+      content when flush races foreground writes → MAX can over-advance in that
+      narrow window (coco P1 residual, documented, MAX ≤ live cursor so never
+      worse than pre-fix). Clean fix = record each imm's content boundary at
+      ROTATION and thread it through the flush (needs an ImmEntry-shaped change;
+      SST vp_head SEMANTICS change ⇒ format version marker for stop-the-world
+      migration).
+  (b) recovery seeds p.vp = replay-min (backward), so an idle-restarted single-SST
+      partition's floor still can't advance without a write+flush — the user's
+      ORIGINAL GC-stuck symptom for that specific case is NOT closed by this fix.
+Next steps: if the user wants full GC-reclaim on idle/restart AND closure of the
+  flush-race residual, do the flush-tight (rotation-boundary) change as a separate
+  reproduce-first task (bigger, touches recovery-critical flush + SST format).
+
+============================ prior task history ============================
+Date: 2026-07-04
+TaskStatus: completed
 Task scope: F-DASH-IN-MGR — fold the standalone Python web dashboard + auto-policy
   controller (python/dashboard/) into the autumn-manager binary. All-in-one, HTML
   embedded via include_str!, the auto-policy loop runs as a leader-fenced manager

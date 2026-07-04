@@ -774,6 +774,45 @@ After minor compaction, `do_compact` is called with `major=false`.
   5. If truncate_id returned: truncate row_stream up to that extent
 ```
 
+### Compaction output vp_head = MAX(input vp_heads), NOT the live cursor (F-COMPACT-VPHEAD, 2026-07-04)
+
+The vp_head a compaction stamps on its output SSTs + meta checkpoint IS
+recovery's replay-start for the merged data. `do_compact` used to stamp it from
+the **live write cursor** `p.vp_extent_id/vp_offset` — which points PAST any
+acked-but-un-flushed write sitting in the active memtable (below the cursor).
+A major compaction replaces the ENTIRE live SST set (each of which carried an
+older, smaller vp_head anchoring the un-flushed log tail) with outputs all
+stamped at the live cursor; recovery reads the LATEST checkpoint
+(`decode_last_table_locations` — only the last record per meta extent, so NO
+old-checkpoint masking) + the live SST vp_heads, and after major compaction ALL
+of them equal the live cursor → replay starts PAST the un-flushed tail → those
+writes are never replayed = **silent data loss on crash**. Directly
+reproducible (no GC / extent-roll needed): `crates/manager/tests/
+system_compact_unflushed_vp_head.rs`.
+
+Fix (`background::compaction_output_vp_head`): stamp the **MAX over the INPUT
+SSTs' vp_heads by STREAM POSITION** (first-occurrence index into
+`log_extent_ids`, matching recovery's `chosen_pos`/`first_pos_by_eid`; extent_id
+order is non-monotonic post-CoW-split so a raw `max(extent_id)` is wrong). The
+merged SST holds every input's data up to the newest input's `last_seq`, so
+recovery only needs the log AFTER the newest input's content = the newest
+input's vp_head (the MAX). This ADVANCES the GC replay floor (so GC can reclaim
+the fully-merged log region — e.g. a post-split shared extent, guarded by
+`system_gc_multiversion_same_extent`) while staying ≤ the live cursor, hence
+STRICTLY SAFER than the pre-fix stamp. `log_extent_ids` is now a hard `?` (was
+`unwrap_or_default()`): a swallowed fetch-failure → empty list → `(0,0)` → the
+recovery no-replay branch = loss (coco P1); the abort is before any row_stream
+append so nothing is half-published.
+
+**Known residual (deferred follow-up):** a flush whose claim RACED foreground
+writes stamps its SST vp_head at the live cursor (claim time), slightly AHEAD of
+that SST's own content — so MAX can over-advance in that narrow window. The
+clean fix records each imm's true content boundary at ROTATION (not flush-claim)
+and threads it through the flush; until then MAX is never worse than the pre-fix
+live-cursor stamp (`MAX(inputs) ≤ live cursor` always) and, outside a major
+compaction, the oldest live SST masks the flush-side gap. Regression unit tests:
+`background::compaction_vp_head_tests`.
+
 ### F104 — Cross-partition compaction concurrency cap
 `PartitionServer` holds an `Arc<CompactionGate>` (lib.rs); each partition's
 `background_compact_loop` calls `gate.acquire().await` BEFORE invoking

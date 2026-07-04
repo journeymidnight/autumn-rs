@@ -137,6 +137,76 @@ pub(crate) fn gc_extent_punchable(
     sealed_length == 0 || pos_by_eid.get(&eid).is_none_or(|&pos| pos < replay_floor_pos)
 }
 
+/// The vp_head a compaction stamps on its output SSTs IS recovery's replay-start
+/// for the merged data. Two forces pull it opposite ways:
+/// - it MUST NOT sit AHEAD of any acked-but-un-flushed write (those live in the
+///   active memtable at log offsets below the live cursor; a vp_head past them
+///   drops them out of the replay window → silent loss — regression
+///   `system_compact_unflushed_vp_head`), yet
+/// - it SHOULD advance as far as the merged data allows, so GC can reclaim the
+///   fully-flushed log region behind it (else post-split shared extents are
+///   pinned forever — `system_gc_multiversion_same_extent`).
+///
+/// The value that satisfies both is the MAX over the INPUT SSTs' OWN vp_heads,
+/// taken by STREAM POSITION (first-occurrence index into `log_extent_ids`,
+/// matching recovery's `chosen_pos` / `first_pos_by_eid`; extent_id order is
+/// non-monotonic after a CoW split so a raw `max(extent_id)` is wrong). The
+/// merged SST contains every input's data up to the newest input's `last_seq`,
+/// so recovery only needs the log AFTER the newest input's content — which is
+/// exactly the newest input's vp_head (the MAX). This advances the floor while
+/// staying ≤ the live cursor, so it is STRICTLY SAFER than the pre-fix stamp of
+/// `p.vp_*` (the live cursor, which sat past the un-flushed tail — the loss the
+/// regression reproduces).
+///
+/// Residual (separate, deferred follow-up): an SST whose flush RACED writes has a
+/// vp_head slightly AHEAD of its own content (the flush snapshots the live cursor
+/// at claim time, not the imm's rotation boundary), so MAX can over-advance in
+/// that narrow case. The clean fix is to record each imm's true content boundary
+/// at rotation; until then MAX is never worse than the pre-fix live-cursor stamp
+/// (MAX(inputs) ≤ live cursor always) and the oldest live SST masks the flush-side
+/// gap outside of a major compaction.
+///
+/// Fallback when no input vp_head resolves in the current log (all zero, or their
+/// extents already gone): replay from the FIRST log extent at offset 0 — the
+/// maximally-conservative safe anchor (recovery replays everything and dedups).
+/// NOT `(0,0)`: with a non-empty output table set that leaves recovery's
+/// `chosen_pos == usize::MAX` on the no-replay branch = loss (see
+/// `recover_partition`'s `replay_extents` selection).
+pub(crate) fn compaction_output_vp_head(
+    input_vp_heads: impl IntoIterator<Item = (u64, u64)>,
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        pos_by_eid.entry(eid).or_insert(pos);
+    }
+    // (position, extent_id, offset) with the LARGEST position, tie-broken by
+    // largest offset — the newest input's content boundary.
+    let mut best: Option<(usize, u64, u64)> = None;
+    for (eid, off) in input_vp_heads {
+        if eid == 0 {
+            continue;
+        }
+        let Some(&pos) = pos_by_eid.get(&eid) else {
+            continue;
+        };
+        let take = match best {
+            None => true,
+            Some((bp, _, boff)) => pos > bp || (pos == bp && off > boff),
+        };
+        if take {
+            best = Some((pos, eid, off));
+        }
+    }
+    match best {
+        Some((_, eid, off)) => (eid, off),
+        None => match log_extent_ids.first() {
+            Some(&eid) => (eid, 0),
+            None => (0, 0),
+        },
+    }
+}
+
 pub(crate) async fn background_maintenance_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -1716,17 +1786,7 @@ pub(crate) async fn do_compact(
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u64)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (
-        readers,
-        row_stream_id,
-        meta_stream_id,
-        compact_vp_eid,
-        compact_vp_off,
-        rg,
-        part_sc,
-        row_append_tx,
-        rate_ctrl,
-    ) = {
+    let (readers, row_stream_id, meta_stream_id, rg, part_sc, row_append_tx, rate_ctrl) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -1738,8 +1798,6 @@ pub(crate) async fn do_compact(
             rds,
             p.row_stream_id,
             p.meta_stream_id,
-            p.vp_extent_id,
-            p.vp_offset,
             p.rg.clone(),
             p.stream_client.clone(),
             p.row_append_tx.clone(),
@@ -1787,11 +1845,26 @@ pub(crate) async fn do_compact(
     // that point at extents already truncated from log_stream. Fetch it
     // once up front (cheap — one StreamInfo RPC).
     let log_stream_id = part.borrow().log_stream_id;
-    let log_extent_ids = part_sc
-        .get_stream_info(log_stream_id)
-        .await
-        .map(|s| s.extent_ids)
-        .unwrap_or_default();
+    // `log_extent_ids` is load-bearing for the output vp_head below, so a fetch
+    // failure MUST NOT be swallowed into an empty list (coco P1): an empty list
+    // makes `compaction_output_vp_head` fall back to `(0, 0)`, and recovery then
+    // takes the no-replay branch (`chosen_pos == usize::MAX` with a non-empty
+    // table set) → the acked-but-un-flushed WAL tail is lost. Abort the
+    // compaction instead — this is BEFORE any row_stream append, so nothing is
+    // half-published; the maintenance loop retries next tick.
+    let log_extent_ids = part_sc.get_stream_info(log_stream_id).await?.extent_ids;
+
+    // The output SSTs' vp_head (recovery replay-start) = MAX over the INPUT
+    // SSTs' vp_heads by stream position (the newest input's content boundary) —
+    // NOT the live write cursor `p.vp_*`. The live cursor sits past the
+    // acked-but-un-flushed tail → those writes fall outside the replay window
+    // and are lost on crash. MAX advances the floor for GC while staying behind
+    // the un-flushed tail. See `compaction_output_vp_head` + regressions
+    // `system_compact_unflushed_vp_head` / `system_gc_multiversion_same_extent`.
+    let (compact_vp_eid, compact_vp_off) = compaction_output_vp_head(
+        readers.iter().map(|r| (r.vp_extent_id, r.vp_offset)),
+        &log_extent_ids,
+    );
 
     let now = now_secs();
     let max_chunk = 2 * MAX_SKIP_LIST as usize;
@@ -3867,5 +3940,71 @@ mod gc_replay_floor_tests {
             .map(|(eid, _)| *eid)
             .collect();
         assert_eq!(punchable, vec![10, 13]);
+    }
+}
+
+#[cfg(test)]
+mod compaction_vp_head_tests {
+    //! Regression: a compaction's output vp_head (recovery replay-start) is the
+    //! MAX over the INPUT SSTs' vp_heads by stream position — the newest input's
+    //! content boundary. It advances the GC floor while staying BEHIND the
+    //! acked-but-un-flushed tail (which the pre-fix live-cursor stamp overran →
+    //! `system_compact_unflushed_vp_head`).
+    use super::compaction_output_vp_head;
+
+    #[test]
+    fn takes_max_first_occurrence_position() {
+        let log = [10u64, 11, 12, 13];
+        // positions: 10→0, 11→1. max over {(10,500),(11,400)} is 11 (pos 1).
+        assert_eq!(
+            compaction_output_vp_head([(10u64, 500u64), (11, 400)], &log),
+            (11, 400)
+        );
+    }
+
+    #[test]
+    fn tie_breaks_by_larger_offset() {
+        let log = [10u64, 11];
+        // same extent 10 (pos 0): the larger offset is the newer boundary.
+        assert_eq!(
+            compaction_output_vp_head([(10u64, 100u64), (10, 900), (10, 400)], &log),
+            (10, 900)
+        );
+    }
+
+    #[test]
+    fn skips_zero_and_unresolvable_vp_heads() {
+        let log = [10u64, 11, 12];
+        // eid 0 = no vp_head; eid 99 = gone from the stream. Only 11 resolves.
+        assert_eq!(
+            compaction_output_vp_head([(0u64, 5u64), (99, 5), (11, 700)], &log),
+            (11, 700)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_first_extent_when_none_resolve() {
+        let log = [10u64, 11, 12];
+        // No input resolves → replay from the first log extent, offset 0
+        // (conservative full replay — NEVER (0,0), the recovery no-replay branch).
+        assert_eq!(
+            compaction_output_vp_head([(0u64, 5u64), (99, 5)], &log),
+            (10, 0)
+        );
+        assert_eq!(compaction_output_vp_head(std::iter::empty(), &log), (10, 0));
+        // Truly empty log (no data): (0,0) is fine — nothing to replay.
+        assert_eq!(compaction_output_vp_head([(11u64, 5u64)], &[]), (0, 0));
+    }
+
+    #[test]
+    fn cow_shared_extent_uses_first_occurrence_position() {
+        // Post split/merge the spliced log_stream repeats a CoW extent (11).
+        // Position keys off the FIRST occurrence (pos 1), matching recovery.
+        let log = [10u64, 11, 12, 11, 13];
+        // inputs at extent 11 (first-occ pos 1) and extent 12 (pos 2): max = 12.
+        assert_eq!(
+            compaction_output_vp_head([(11u64, 400u64), (12, 100)], &log),
+            (12, 100)
+        );
     }
 }

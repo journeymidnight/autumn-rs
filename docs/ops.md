@@ -333,6 +333,25 @@ was wired only into the copy read path, so the two VP-value fast paths
 still served the bit-rotted-but-isolated replica — now both filter
 `eligible_replica_slots`. Design: `docs/wal_selfheal_design.md`.
 
+### Compaction never strands un-flushed writes past the replay-start (F-COMPACT-VPHEAD)
+
+Each SSTable records a `vp_head` = the `log_stream` position recovery replays
+FROM. A major compaction rewrites every SSTable, so whatever `vp_head` it stamps
+becomes the whole partition's replay-start after the next restart. It stamps the
+**MAX over the input SSTs' vp_heads** (the newest input's content boundary), NOT
+the live write cursor — the cursor sits PAST writes that are acked + durable in
+`log_stream` but still only in the active memtable (un-flushed), and stamping it
+would drop those writes out of the replay window (silent loss on a crash between
+the compaction and the next flush). MAX keeps the replay-start behind the
+un-flushed tail while still advancing it past the fully-merged log region so GC
+can reclaim there. No operator action; automatic. Regression:
+`crates/manager/tests/system_compact_unflushed_vp_head.rs` (writes A→flush,
+B→flush, C→NO flush, major-compact, crash, reopen → all of A/B/C must read back).
+Known residual (deferred): a flush that races foreground writes can stamp its own
+SST `vp_head` slightly ahead of that SST's content, so MAX can over-advance in
+that narrow window — never worse than the pre-fix live-cursor stamp; the clean
+fix records each memtable's content boundary at rotation.
+
 ## Read route-around for Suspected nodes (F276)
 
 When the manager marks an EN **Suspected** (df heartbeats lapsed past the soft
