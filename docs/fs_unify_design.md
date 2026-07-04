@@ -294,6 +294,19 @@ manifest fetch); shared files with fuse; POSIX metadata. The current chunked
   datasets/checkpoints use case, so we can keep the facade lean.
 - **Concurrency model:** the core is `!Send` compio-thread-local (like `Client`);
   the PyO3 binding uses the same single-worker-thread bridge — fine.
+- **Preemption (F-lease-preempt) into the FS surfaces — DEFERRED (user, 2026-07-04).**
+  The mechanism is fully built + tested (`lease::acquire_force` /
+  `acquire_with_preempt_wait`; manager `WillRevokeIn` grace → 2PC force-revoke;
+  `bug_lease_4_force_revoke_2pc` / `f_lease_preempt`), and the VICTIM side is
+  already wired in M4 (poll marks `revoked` → write fast-fails + PS epoch fence).
+  Only the PREEMPTOR side is unwired: the fuse mount + `autumn.Fs` use non-force
+  `acquire`, so a WRITE conflict fails immediately (facade → `BlockingIOError`)
+  rather than bounded-wait-then-preempt. Deferred because the target workload is
+  single-writer (dataset prep / model upload / checkpoint) — no contention in the
+  normal case, and mutual `force` writers risk livelock. Wire an opt-in
+  preempt-write entry (`Fs.acquire(ino,"w",preempt_wait_ms=…)` + a facade `force`
+  flag) only when a real "stuck lease blocks the pipeline" need is measured
+  (reproduce-before-fixing).
 
 ---
 
