@@ -498,6 +498,13 @@ _start_managers() {
     local -a extra=()
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && extra+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && extra+=(--metrics-port 9591)
+    # F-DASH-IN-MGR: embedded web dashboard + auto-policy controller, ON by
+    # default (read-only viewer; AUTUMN_DASHBOARD=0 disables;
+    # AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 arms manual actions + the controller).
+    if [[ "${AUTUMN_DASHBOARD:-1}" != "0" ]]; then
+        extra+=(--dashboard-port "${AUTUMN_DASHBOARD_PORT:-8799}")
+        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] && extra+=(--dashboard-allow-mutations)
+    fi
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         extra+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
         [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && extra+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")

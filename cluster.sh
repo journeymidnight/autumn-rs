@@ -619,6 +619,17 @@ launch_manager() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         mgr_extra="$mgr_extra --metrics-port 9591"
     fi
+    # F-DASH-IN-MGR: AUTUMN_DASHBOARD=1 serves the embedded web dashboard +
+    # auto-policy controller from the manager (default port 8799, below the
+    # 10000 ephemeral floor). OPT-IN in the test harness (avoid a surprise port
+    # on a shared box); deploy (autumn-deploy / k8s) enables it by default.
+    # AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 arms manual actions + the controller
+    # (default: read-only viewer). autoPolicy runs ONLY on the leader.
+    if [[ "${AUTUMN_DASHBOARD:-0}" == "1" ]]; then
+        mgr_extra="$mgr_extra --dashboard-port ${AUTUMN_DASHBOARD_PORT:-8799}"
+        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] \
+            && mgr_extra="$mgr_extra --dashboard-allow-mutations"
+    fi
     if [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]]; then
         [[ "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES" =~ ^[0-9]+$ ]] \
             || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"

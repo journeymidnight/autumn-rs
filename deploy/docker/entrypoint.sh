@@ -107,6 +107,14 @@ run_manager() {
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)
+    # F-DASH-IN-MGR: embedded web dashboard + auto-policy controller, ON by
+    # default (read-only viewer, bound to --listen). Set AUTUMN_DASHBOARD=0 to
+    # disable; AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 arms manual actions + the
+    # controller (autoPolicy runs ONLY on the leader).
+    if [[ "${AUTUMN_DASHBOARD:-1}" != "0" ]]; then
+        args+=(--dashboard-port "${AUTUMN_DASHBOARD_PORT:-8799}")
+        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] && args+=(--dashboard-allow-mutations)
+    fi
     [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]] \
         && args+=(--min-alloc-free-bytes "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES")
     # F-AUTHZ-1 (opt-in, same contract as cluster.sh: no key file = authz off)

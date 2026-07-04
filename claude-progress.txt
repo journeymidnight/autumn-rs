@@ -1,5 +1,5 @@
 Date: 2026-07-04
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: F-DASH-IN-MGR — fold the standalone Python web dashboard + auto-policy
   controller (python/dashboard/) into the autumn-manager binary. All-in-one, HTML
   embedded via include_str!, the auto-policy loop runs as a leader-fenced manager

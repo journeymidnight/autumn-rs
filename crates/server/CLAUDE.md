@@ -18,6 +18,14 @@ autumn-manager-server [--port 9001] [--etcd 127.0.0.1:2379,...]
 - With `--etcd`: persistent mode — connects to etcd, replays state on start, runs leader election loop
 - Serves both `StreamManagerService` and `PartitionManagerService` on the same port
 - Also registers gRPC reflection (uses `FILE_DESCRIPTOR_SET` from `autumn-proto`)
+- **`--metrics-port <P>` / `--metrics-listen <H>`**: Prometheus `/metrics` (opt-in).
+- **F-DASH-IN-MGR `--dashboard-port <P>` / `--dashboard-listen <H>` (default =
+  `--listen`) / `--dashboard-allow-mutations`**: the embedded web dashboard +
+  leader-fenced auto-policy controller (folds in the retired `python/dashboard/`).
+  Default read-only; `--dashboard-allow-mutations` arms BOTH the manual `/api/action`
+  buttons AND the controller leaving DryRun. Deploy layer (entrypoint.sh /
+  autumn-deploy / k8s) turns it ON by default via `AUTUMN_DASHBOARD`; cluster.sh is
+  opt-in. autoPolicy runs ONLY on the leader. Runbook: `docs/ops.md`.
 
 ### `autumn-extent-node` (`src/bin/extent_node.rs`)
 
@@ -116,6 +124,7 @@ autumn-op [--manager 127.0.0.1:9001] [--json] <COMMAND>
 | Read / observability | `list-nodes`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
 | Node lifecycle (F211) | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire UNIX_TS]`, `unfence <id> --by ...`, `remove <id> --by ...` |
 | Cluster / partition admin (F213 + F214) | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hexstring]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `merge <SURVIVOR_PARTID> <VICTIM_PARTID>`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format --listen <ADDR> --advertise <ADDR> <DIR>...` |
+| Auto-policy controller (F-DASH-IN-MGR) | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (select policy; `--arm` = Armed/actuate, else DryRun), `auto-policy deactivate` (mode → Off). Leader-routed; the in-manager controller replaces the retired `python/dashboard/` external loop. |
 
 **F214-C**: `register-node` subcommand removed; merged into `format`. The legacy spelling routes to a migration stub that prints + exits 1 BEFORE connecting to the manager. `MSG_REGISTER_NODE` wire RPC unchanged — `format` calls it internally.
 

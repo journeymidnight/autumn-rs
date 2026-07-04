@@ -688,8 +688,18 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `MSG_GET_PARTITION_DETAIL` RPCs are the external-policy
       surface.
 
-    See `python/dashboard/DASHBOARD.md` for the OP-driven workflow +
-    cron + controller usage.
+    **F-DASH-IN-MGR (2026-07-04): the controller is now IN the manager, but
+    this does NOT revert F203's mechanism/policy split.** The retired Python
+    `python/dashboard/` external controller was folded into the manager as
+    `auto_policy.rs` + `auto_policy_tick_loop` (see the F-DASH-IN-MGR note
+    below). Advisory emission (`recompute_advisory_cache`) stays a separable
+    mechanism layer that never self-dispatches; the in-manager controller is a
+    DISTINCT, **leader-fenced, DEFAULT-OFF** module (Off→DryRun→Armed; armed only
+    when an operator selects+enables a policy AND `--dashboard-allow-mutations`
+    is set), so a fresh cluster stays pure-mechanism until armed. What changed is
+    the HOST process (crash-safe leader instead of a killable Python webserver),
+    not the mechanism/policy boundary. Ops runbook: `docs/ops.md` (Web dashboard
+    + auto-policy controller).
 
     **Stage 1 only** — advisory is purely informational. `last_op_at`
     and `auto_dispatch_*` paths are NOT touched (those would be Stage
@@ -2040,3 +2050,50 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `tests/fs_alloc_inodes.rs` (16-way concurrent disjointness + floor
       monotonicity in memory mode; etcd CAS disjointness + persisted
       watermark + follower NOT_LEADER refusal), `fs_alloc::tests` unit.
+
+43. **F-DASH-IN-MGR embedded web dashboard + auto-policy controller
+    (2026-07-04).** The retired Python `python/dashboard/` (a browser UI + an
+    external auto-policy controller that shelled out to `autumn-op --json`) is
+    folded into the manager. Two pieces, both in-process (no subprocess):
+
+    - **Dashboard** (`dashboard.rs`): `axum` served by the compio-native
+      `cyper_axum::serve` over a `compio::net::TcpListener` — the SAME HTTP stack
+      as `examples/gallery` (`send_wrapper::SendWrapper` bridges axum's `Send`
+      bound over the `!Send` manager). The 29 KB page is `include_str!`'d
+      (`dashboard_web.html`). Endpoints (byte-compatible with the retired Python
+      contracts so the page is unchanged): `GET /` + `/healthz`; `/api/overview`
+      (df + nodes + partitions + ps_roll + advisories, 1-s coalescing cache);
+      `/api/partition/<id>`; `/api/policies` GET/POST activate/upsert/delete;
+      `/api/action` (manual mutations). Fed IN-PROCESS via `compute_*_resp` pure
+      builders (extracted from the `handle_*` RPC handlers — no self-RPC). Flags
+      `--dashboard-port` / `--dashboard-listen` (default = `--listen`) /
+      `--dashboard-allow-mutations`. `spawn_supervised` (F228); per-conn detached.
+    - **Auto-policy controller** (`auto_policy.rs` + `auto_policy_tick_loop`):
+      `AutoPolicyMode` state machine (Off/DryRun/Armed), 5 compiled-in presets +
+      custom policies, ported pure `decide_actions`/`candidate_to_cmd`/
+      `cooldown_key`. **INVARIANT: runs ONLY on the leader** (`leader.get()` gate
+      every tick — no candidate read / decision / actuation on a follower).
+      DEFAULT-OFF (fresh cluster is pure-mechanism, F203). `Armed` actuates only
+      with `--dashboard-allow-mutations`, else degrades to DryRun. Actuation is
+      in-process to the SAME ops the mechanism layer exposes: split →
+      `auto_dispatch_split`; merge → the F185 freeze-drain `handle_merge_partitions`
+      (NOT the F184 flush path — avoids the ~5% loss window); gc/compact/forcegc →
+      PS `MSG_MAINTENANCE`; ec → `handle_force_ec_convert`.
+    - **Config = etcd, leader-owned, crash-safe** (the whole point vs the
+      killable Python webserver): `autoPolicy/config` (mode + active + custom
+      policies) + `autoPolicy/cooldowns`, written **etcd-first** (F149-fenced
+      `put_msgs_txn`) by `autopolicy_set` (compute-on-clone → persist → apply +
+      a concurrent-update guard), reloaded by `replay_from_etcd` (fail-loud
+      decode + `sanitize_entry` clamp). Presets are compiled-in, never persisted.
+    - **Headless control**: `MSG_AUTOPOLICY_GET/SET` (0x54/0x55, WIRE v12) +
+      `ClusterClient::auto_policy_get/set` + `autumn-op auto-policy
+      status|activate <name> [--arm]|deactivate`. `/api/action` is STRUCTURED
+      (`{"action":"split","part_id":7}` — no CLI command-string), leader-gated +
+      `--dashboard-allow-mutations`-gated + verb/field-validated.
+
+    **Security posture (documented non-goal):** no per-request auth/TLS on the
+    dashboard port (same as `--metrics-port`); default read-only, mutations
+    opt-in via the flag; pair network exposure with ACLs. On k8s the port rides
+    the leader-gated `autumn-manager` Service. Cross-ref: notes 15 (F149 fence),
+    16/18 (F183/F187/F202 advisory engine), 17 (F185 merge freeze), 29 (F228
+    spawn_supervised).

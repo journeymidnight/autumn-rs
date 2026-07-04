@@ -64,10 +64,13 @@ self-healing extents.
   fail over automatically. All of it is exercised by a battery of chaos suites
   (`docs/ops.md`).
 - **Elastic** — copy-on-write partition split/merge with an advisory engine for
-  split/merge/GC/compaction/EC decisions.
+  split/merge/GC/compaction/EC decisions, plus a built-in **auto-policy
+  controller** that acts on them — leader-fenced and crash-safe (config in etcd,
+  survives failover), default-off until you arm it.
 - **Multi-tenant** — opt-in key-range authorization with short-TTL **Ed25519
   capability tokens** (manager as KDC, enforcement at the KV layer).
-- **Operable** — declarative bare-metal deployer (systemd), Kubernetes
+- **Operable** — an **embedded web dashboard** served by the manager itself (no
+  separate process), declarative bare-metal deployer (systemd), Kubernetes
   manifests, Prometheus `/metrics`, `ceph df`-style capacity accounting,
   rolling restart with convergence gates.
 

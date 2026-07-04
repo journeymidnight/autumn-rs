@@ -33,8 +33,69 @@ and the per-crate `crates/*/CLAUDE.md`.
 | `autumn-stream-cli` | — | Low-level stream debugging |
 | `autumn-fuse` | — | FUSE mount of the KV namespace |
 
-`autumn-client --help` / `autumn-op --help` lists subcommands. The wire schema for autumn-op
-is stable; the Python ops tooling (e.g. `python/dashboard/`) shells out to it.
+`autumn-client --help` / `autumn-op --help` lists subcommands. (The standalone
+Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
+"Web dashboard + auto-policy controller" below.)
+
+## Web dashboard + auto-policy controller (F-DASH-IN-MGR)
+
+The manager serves an embedded web dashboard AND hosts the auto-policy controller
+in-process — one crash-safe, leader-owned process (the retired Python dashboard's
+controller died with its webserver; this one survives as long as the leader does).
+
+```bash
+# Enable from cluster.sh (test harness; opt-in):
+AUTUMN_DASHBOARD=1 ./cluster.sh start 3
+#   → manager serves http://<manager-listen>:8799/   (read-only viewer)
+# Arm manual actions + the controller (default is read-only):
+AUTUMN_DASHBOARD=1 AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 ./cluster.sh start 3
+
+# Deploy (autumn-deploy / k8s / docker) turns it ON by default; disable with
+# AUTUMN_DASHBOARD=0. On k8s it rides the leader-gated Service:
+kubectl -n autumn port-forward svc/autumn-manager 8799:8799   # → http://localhost:8799/
+
+# Direct flags (env→flag is in the shell layer, never Rust):
+autumn-manager-server --etcd … --dashboard-port 8799 [--dashboard-allow-mutations]
+```
+
+The page shows cluster capacity, node health, the PS→partition→extent hierarchy,
+policy advisories, and (armed) per-target action buttons.
+
+**Auto-policy controller** — the manager only *emits* advisories (F203 pure
+mechanism); the controller *decides + actuates* per an active policy. It is
+**leader-only** (never runs on a follower), **DEFAULT-OFF** (a fresh cluster stays
+pure-mechanism until an operator arms it), and a state machine `Off → DryRun →
+Armed`. `Armed` actuates only when `--dashboard-allow-mutations` is set (else it
+degrades to DryRun and logs "would: …"). Config is persisted to etcd
+(`autoPolicy/config` + `autoPolicy/cooldowns`, leader-fenced) so the active policy
+survives leader failover. Headless control:
+
+```bash
+autumn-op auto-policy status                 # mode + active + presets + action log
+autumn-op auto-policy activate gc-only       # select + DryRun (observe, no actuation)
+autumn-op auto-policy activate aggressive --arm   # select + Armed (actuate)
+autumn-op auto-policy deactivate             # mode → Off
+```
+
+Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
+`balanced`, `aggressive`. The dashboard `/api/policies` UI can also create/select
+custom policies (armed only).
+
+**Verify leader-failover of the active policy** (the crash-safety guarantee):
+
+```bash
+# with an etcd-backed cluster + the dashboard armed:
+autumn-op auto-policy activate gc-only --arm       # → mode=armed active=gc-only
+kill -9 <leader-manager-pid>                        # crash the leader
+# after the etcd lease expires (~10 s) a new leader wins + replays from etcd:
+autumn-op auto-policy status                         # → STILL mode=armed active=gc-only
+```
+
+**Security posture (documented non-goal):** the dashboard port has no
+per-request auth/TLS (same as `--metrics-port`). Default is a read-only viewer;
+mutations require `--dashboard-allow-mutations`. When arming a network-reachable
+dashboard, pair it with network ACLs (or `--dashboard-listen 127.0.0.1` +
+tunnel). On k8s, mutations ride the leader-gated Service.
 
 ## Fuse daemon runbook
 
