@@ -302,7 +302,11 @@ pub(crate) async fn background_maintenance_loop(
                     let mut total = 0u64;
                     let mut ok = true;
                     for sid in [log_id, row_id, meta_id] {
-                        match sc.commit_length(sid).await {
+                        // `open_tail_committed_len` returns 0 when the tail is
+                        // SEALED — its length is already in the manager's
+                        // sealed_length sum, so counting it here would
+                        // double-count (a CoW split child / just-sealed tail).
+                        match sc.open_tail_committed_len(sid).await {
                             Ok(len) => total = total.saturating_add(len),
                             Err(_) => {
                                 ok = false;

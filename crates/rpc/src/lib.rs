@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 15;
-pub const WIRE_VERSION_MAX: u32 = 15;
+pub const WIRE_VERSION_MIN: u32 = 16;
+pub const WIRE_VERSION_MAX: u32 = 16;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -176,6 +176,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // log-heavy) partition no longer renders 0 B. Pre-R3: MIN=MAX=15
     // (same-commit deploy; rkyv has no cross-version decode).
     (15, "4bbbbf8faeb05923"),
+    // v16: F-DF-OPENTAIL — ClusterDfResp grew `logical_open_tail: u64` (Σ
+    // PS-reported open-tail committed bytes across partitions). The df
+    // amplification denominator becomes `logical_stored + logical_open_tail`
+    // so an all-open-tail (VP/log-heavy) cluster no longer shows a ~15×
+    // inflated amp (physical counts open bytes, sealed-only logical dropped
+    // them). Pre-R3: MIN=MAX=16 (same-commit deploy; rkyv has no
+    // cross-version decode).
+    (16, "4c2dd28d4b3ff567"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

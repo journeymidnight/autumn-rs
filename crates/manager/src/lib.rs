@@ -574,6 +574,10 @@ pub(crate) struct ClusterCapSnapshot {
     pub last_update_ms: u64,
     /// Read-only Σ distinct sealed_length (de-amplified, sealed-only).
     pub logical_stored: u64,
+    /// F-DF-OPENTAIL: Σ PS-reported open-tail committed bytes across
+    /// partitions (one copy). Refreshed every tick from the policy load
+    /// window (cheap sum). The amp denominator is `logical_stored + this`.
+    pub logical_open_tail: u64,
     pub logical_last_update_ms: u64,
     pub per_node: Vec<(u64, NodeCap)>,
 }

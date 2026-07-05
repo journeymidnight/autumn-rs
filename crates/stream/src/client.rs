@@ -2767,6 +2767,18 @@ impl StreamClient {
         Ok(end)
     }
 
+    /// Committed length of the stream's tail extent, but ONLY when that tail
+    /// is still OPEN (`!sealed`). A SEALED tail's length is already counted in
+    /// the manager's `sealed_length` sum, so returning it here would
+    /// double-count in the overview / cluster-df logical footprint (a
+    /// freshly-reopened CoW split child, or a just-sealed-not-yet-rolled tail,
+    /// has an all-sealed stream and would otherwise be added twice). Returns
+    /// `Ok(0)` for a sealed tail. Used by the PS open-tail size probe.
+    pub async fn open_tail_committed_len(&self, stream_id: u64) -> Result<u64> {
+        let (_stream, extent, end) = self.check_commit(stream_id).await?;
+        Ok(if extent.sealed { 0 } else { end })
+    }
+
     /// F178 Phase 2: query a single replica for `MSG_SYNCED_LENGTH(extent_id)`.
     /// Returns `Ok(Some(synced))` on a success response, `Ok(None)` if the
     /// extent is unknown to that node (CODE_NOT_FOUND or any other non-OK

@@ -236,6 +236,26 @@ follow-up: `PartitionLoad.size_bytes` has no writer (always 0) → the
 policy are inert; reviving it is deferred (feature_list F-PS-SIZE-BYTES-DEAD)
 because it would silently arm size-based auto-policy.
 
+## cluster-df amplification = physical / logical FOOTPRINT (F-DF-OPENTAIL)
+
+`ClusterCapSnapshot.logical_open_tail` (Σ PS-reported `open_tail_bytes` across
+partitions, summed each cluster-df tick from the policy load window) is the
+companion to `logical_stored` (sealed-only). The amplification the consumer
+(`autumn-op df` / dashboard) computes MUST use `physical_used / (logical_stored +
+logical_open_tail)`, NOT sealed-only: `physical_used` (Σ EN `extent_bytes`)
+INCLUDES open-tail bytes — which for a VP workload are largely LIVE large-value
+bytes sitting in the open log tail (the SST holds only pointers) — so a
+sealed-only denominator inflates amp ~15× (a 3-replica cluster showed 45× when
+part 17's 1.6 GB open log was excluded). With the fix amp ≈ the real replication/
+EC factor (~3× / lower). Open tails are refs=1 partition-private, so the sum
+needs no CoW dedup (unlike the per-partition overview, which DOES double-count
+CoW-shared extents across siblings — different view, see F-OVERVIEW-OPENTAIL).
+**Invariant: any physical/logical ratio must compare like scopes — if the
+numerator counts open-tail/replica bytes, the denominator must too.** The
+accurate DEAD-byte (WAL-debt) metric is a separate deferred feature
+(F-DF-WALDEBT) — do NOT approximate it as `footprint − size_bytes` (that
+mis-flags live VP data as debt).
+
 ## EC Conversion Dispatch (`ec_conversion_dispatch_loop`)
 
 Background loop that fires every 5 s. Picks any sealed extent on an EC stream where `ec_converted == false`, sends `EXT_MSG_CONVERT_TO_EC` to the coordinator (first replica), and on success calls `apply_ec_conversion_done` to flip `ec_converted = true` + bump `eversion = pre_ec + 1` in the manager + etcd.

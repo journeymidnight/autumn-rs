@@ -252,6 +252,20 @@ The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` reflects real
 backend capacity (conservatively, at the 3-replica factor) instead of a fixed
 placeholder.
 
+### Amplification in `df` = physical / footprint, not physical / sealed (F-DF-OPENTAIL)
+
+`amplification` = `physical_used / (logical_stored_sealed + logical_open_tail)`
+≈ the real replication/EC factor (~3× for 3-replica, lower with EC). The
+denominator MUST include `logical_open_tail`: `physical_used` counts the
+open-tail bytes (largely LIVE large-value / VP data in the open log tail — the
+SST only holds pointers), so dividing by sealed-only inflates amp ~15× (a
+3-replica cluster read 45× when a partition's data lived in open tails). The
+human `df` prints the breakdown `logical: sealed=… + open_tail=… = footprint …`.
+A high `amp` (>> replication factor) now genuinely means an EC/replication issue,
+not just un-sealed data. (The accurate dead-value / WAL-debt figure — how much of
+the log is overwritten garbage — is a separate deferred metric; do NOT read
+`footprint − data` as debt, it mis-counts live VP data.)
+
 ### Per-partition size in `autumn-op info` (F-OVERVIEW-OPENTAIL)
 
 The cluster overview's per-partition size = the manager's authoritative

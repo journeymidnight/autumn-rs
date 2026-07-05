@@ -515,9 +515,14 @@ partition would render 0 B without this — see manager CLAUDE.md). The refresh:
   `open_tail_probe_inflight` CAS — because it does a `commit_length` on each of
   the 3 stream tails, which is up to 15 s worst-case (all-replica probe) and
   must NEVER stall the shared GC/compaction maintenance task;
-- stores the sum ONLY if all 3 `commit_length`s succeed — a partial 3-tail sum
+- stores the sum ONLY if all 3 probes succeed — a partial 3-tail sum
   (e.g. a briefly-unreachable replica) would misreport, so it keeps the prior
   value on any error. 0 until the first successful probe.
+- uses `StreamClient::open_tail_committed_len` (NOT `commit_length`), which
+  returns 0 when the tail is SEALED — a sealed tail's length is already in the
+  manager's sealed-length sum, so counting it here double-counts (F-DF-OPENTAIL:
+  a freshly-reopened CoW split child / just-sealed-not-yet-rolled tail has an
+  all-sealed stream; part 45 over-reported 147.6 MB vs 94.1 MB before this).
 **Invariant: the probe must stay off the maintenance task's critical path
 (detached + in-flight-guarded) — a blocking `commit_length` here would gate
 GC/compaction on manager/replica latency.** The sibling `size_bytes` gauge is

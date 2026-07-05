@@ -562,11 +562,16 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
 async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     let r = client.cluster_df().await?;
     let raw_used = r.raw_total.saturating_sub(r.raw_free);
-    // Empirical amplification (physical_used / logical_stored): the
-    // REAL current cold/hot mix, more useful than the theoretical
-    // [1.25, 3] bound. n/a when nothing is stored yet.
-    let amp = if r.logical_stored > 0 {
-        r.physical_used as f64 / r.logical_stored as f64
+    // Logical FOOTPRINT = sealed data + open-tail committed bytes (one copy).
+    // physical_used counts open-tail bytes (largely live VP/log data), so amp
+    // MUST divide by the footprint, not sealed-only — else an all-open-tail
+    // (VP/log-heavy) cluster shows a ~15× inflated amp (F-DF-OPENTAIL).
+    let logical_footprint = r.logical_stored.saturating_add(r.logical_open_tail);
+    // Empirical replication/EC amplification (physical_used / logical
+    // footprint): the REAL current cold/hot mix. ~3× for 3-replica, lower with
+    // EC. n/a when nothing is stored yet.
+    let amp = if logical_footprint > 0 {
+        r.physical_used as f64 / logical_footprint as f64
     } else {
         0.0
     };
@@ -620,6 +625,8 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
                 "raw_free": r.raw_free,
                 "physical_used": r.physical_used,
                 "logical_stored_sealed": r.logical_stored,
+                "logical_open_tail": r.logical_open_tail,
+                "logical_footprint": logical_footprint,
                 "amplification": amp,
                 "writable_est": writable_est,
                 "writable_low_3x": writable_low,
@@ -645,10 +652,16 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
             human_size(r.raw_free),
         );
         println!(
-            "AUTUMN:  phys_used={:<10} stored(sealed)={:<10} amplification={}",
+            "AUTUMN:  phys_used={:<10} footprint={:<10} amplification={}",
             human_size(r.physical_used),
-            human_size(r.logical_stored),
+            human_size(logical_footprint),
             amp_str,
+        );
+        println!(
+            "         logical: sealed={} + open_tail={} = footprint {}",
+            human_size(r.logical_stored),
+            human_size(r.logical_open_tail),
+            human_size(logical_footprint),
         );
         println!(
             "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",

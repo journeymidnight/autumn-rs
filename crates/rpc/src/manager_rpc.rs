@@ -1703,10 +1703,18 @@ pub struct ClusterDfResp {
     /// Σ all nodes' `extent_bytes` — exact autumn physical footprint
     /// (replicas + EC shards + open tails, no amplification formula).
     pub physical_used: u64,
-    /// Manager's read-only Σ distinct sealed_length (de-amplified user data;
-    /// sealed-only — excludes un-sealed open-tail bytes, which physical_used
-    /// DOES include, so a hot cluster shows a slightly inflated amplification).
+    /// Manager's read-only Σ distinct sealed_length (de-amplified, sealed-only).
     pub logical_stored: u64,
+    /// F-DF-OPENTAIL: Σ PS-reported open-tail committed bytes across all
+    /// partitions (log + row + meta OPEN tails, one copy — open tails are
+    /// refs=1 partition-private, so no CoW dedup needed). physical_used
+    /// INCLUDES these bytes (they are largely LIVE large-value / VP data
+    /// sitting in the open log tail), so the amplification MUST use
+    /// `logical_stored + logical_open_tail` as the denominator — otherwise a
+    /// partition whose data lives in open tails inflates amp ~15× (physical
+    /// counts the open bytes, sealed-only logical drops them). 0 until the PS
+    /// reports (falls back to sealed-only).
+    pub logical_open_tail: u64,
     /// Online EN count — bounds the best achievable EC shape for the writable
     /// range upper bound (K = min(4, node_count-1)).
     pub node_count: u64,

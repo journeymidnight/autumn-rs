@@ -239,9 +239,13 @@ impl AutumnManager {
             errors.push(format!("overview: {}", ov.message));
         }
 
-        // Empirical amplification = physical / logical (matches autumn-op df).
-        let amp = if df.logical_stored > 0 {
-            df.physical_used as f64 / df.logical_stored as f64
+        // Empirical amplification = physical / logical FOOTPRINT (sealed +
+        // open-tail; matches autumn-op df). Including open-tail is load-bearing:
+        // physical_used counts open-tail bytes (largely live VP/log data), so a
+        // sealed-only denominator inflates amp ~15× (F-DF-OPENTAIL).
+        let logical_footprint = df.logical_stored.saturating_add(df.logical_open_tail);
+        let amp = if logical_footprint > 0 {
+            df.physical_used as f64 / logical_footprint as f64
         } else {
             0.0
         };
@@ -265,6 +269,8 @@ impl AutumnManager {
             "raw_free": df.raw_free,
             "physical_used": df.physical_used,
             "logical_stored_sealed": df.logical_stored,
+            "logical_open_tail": df.logical_open_tail,
+            "logical_footprint": logical_footprint,
             "amplification": amp,
             "node_count_online": df.node_count,
             "per_node": per_node,

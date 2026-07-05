@@ -1092,6 +1092,19 @@ impl crate::AutumnManager {
                     logical_cycle_ids = Vec::new();
                 }
             }
+            // F-DF-OPENTAIL: Σ latest PS-reported open-tail committed bytes
+            // across partitions (cheap — one back()-of-window read per
+            // partition). physical_used INCLUDES these bytes, so the amp
+            // denominator adds them to the sealed logical scan. Open tails are
+            // refs=1 partition-private → simple sum, no CoW dedup.
+            let logical_open_tail: u64 = {
+                let pol = self.policy.borrow();
+                pol.metrics
+                    .values()
+                    .filter_map(|w| w.buckets.back())
+                    .map(|(_, l)| l.open_tail_bytes)
+                    .sum()
+            };
             {
                 let mut snap = self.cluster_cap.borrow_mut();
                 snap.raw_total = cdf_raw_total;
@@ -1102,6 +1115,7 @@ impl crate::AutumnManager {
                 // Republish the last fully-committed logical total every tick
                 // (a mid-flight cycle hasn't changed it yet).
                 snap.logical_stored = logical_committed;
+                snap.logical_open_tail = logical_open_tail;
                 snap.logical_last_update_ms = logical_committed_ms;
                 snap.per_node = cdf_per_node;
             }

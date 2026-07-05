@@ -1,5 +1,39 @@
 Date: 2026-07-05
 TaskStatus: completed
+Task scope: F-DF-OPENTAIL — user "amp 45.18x 放大45倍?": `autumn-op df` showed 45x
+  amplification on a 3-replica cluster. Root cause = same open-tail asymmetry as
+  F-OVERVIEW-OPENTAIL in the df path: physical_used counts open-tail bytes,
+  logical_stored only summed SEALED extents. User corrected a key point: the
+  open-tail LOG bytes are NOT "WAL debt" — large VALUES live in log_stream (SST
+  holds only VP pointers), so they're LIVE logical data that belongs in the
+  denominator. Chosen: #1 + #2 + (b).
+Current summary:
+  #1 (correctness) StreamClient::open_tail_committed_len returns the tail
+     committed length ONLY when !sealed (sealed tail already in the manager
+     sealed sum → double-count). PS open-tail probe uses it instead of
+     commit_length. Fixes a double-count in the SHIPPED overview too: sealed-tail
+     partitions (CoW split child / just-reopened) over-reported — part 45 was
+     147.6 MB, true 94.1 MB.
+  #2 (amp) ClusterDfResp.logical_open_tail (WIRE v16, fp 4c2dd28d4b3ff567) =
+     Σ PS-reported open_tail_bytes across partitions (refs=1 private → simple sum,
+     no CoW dedup); manager sums it per cluster-df tick from the policy window;
+     autumn-op df + dashboard use logical_footprint = sealed + open_tail and
+     amp = physical/footprint; df prints the sealed+open_tail=footprint breakdown.
+  (b) did NOT add a "WAL debt" line — footprint−size_bytes is wrong for VP
+     (size_bytes is SST-only, excludes live VP value bytes). Accurate dead-byte
+     metric (needs open-tail discard tracking) deferred as F-DF-WALDEBT.
+Verification: builds clean, 0 new clippy, rpc 44 wire tests green (v16).
+  LIVE-VERIFIED (same-commit restart 5): df amp 45.18x → 3.00x (phys 5.32 GB /
+  footprint 1.77 GB = sealed 117 MB + open_tail 1.66 GB); WRITABLE(est) 11 GB →
+  155 GB; overview now == info --part to the byte for ALL partitions (part 45
+  147.6 → 94.1 MB, #1 double-count gone).
+Main gaps: NONE for this task. Deferred: F-DF-WALDEBT (accurate dead-value metric
+  incl. open-tail discard).
+Next steps: closed.
+
+============================ prior task history ============================
+Date: 2026-07-05
+TaskStatus: completed
 Task scope: F-PS-SIZE-BYTES-DEAD — user "fix this" on the dead size_bytes gauge
   found during F-OVERVIEW-OPENTAIL. `PartitionMetrics.size_bytes` had NO writer
   (always 0) → Prometheus `autumn_ps_partition_size_bytes` = 0 AND size-based
