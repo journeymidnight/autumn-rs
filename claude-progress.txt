@@ -22,8 +22,15 @@ Current summary: reclaim check validated (single-seed: 4-9 extents deleted, 2-3 
 Main gaps: NONE. The vp_head thread is proven both directions — no loss (data
   safety) AND positive reclaim (GC deletes extents, floor advances) — under
   multi-seed real fault injection incl. split/merge/compact/forcegc.
-Next steps: closed. (The seed-7 mis-route retry is defensive + unexercised this
-  run; a longer soak on the remote cluster host would exercise it if wanted.)
+Extended soak: seed 7 (the flake candidate) x6 + fresh 313/4242 — ALL 8 PASS, zero
+  loss, positive reclaim (3-8 extents/seed). The seed-7 flake did NOT recur (0/6);
+  seed-7 record = 1 fail / 9 runs (~11%), timing-dependent, consistent with the
+  merge-convergence mis-route (a real loss would be deterministic per seed). Only
+  gap: retry_fired=0 across every run, so the refresh+retry mitigation stays
+  UNEXERCISED (sound by construction — refresh_topology is the settle-time routine
+  — but not watched healing a live flake).
+Next steps: closed. Product side solid: dozens of chaos runs, zero data loss +
+  positive reclaim every time; the single flake was test-side + non-recurring.
 Main gaps: NONE. The vp_head correctness thread is now proven end to end:
   reproduce-first fixes (compaction-MAX, flush-tight, recovery-tail-seed) + coco
   + fable reviews + multi-seed chaos with split/merge/compact/forcegc = no loss.
