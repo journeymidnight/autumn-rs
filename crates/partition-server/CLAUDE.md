@@ -948,7 +948,19 @@ cache-miss RPC is safe now that the seed=603 wedge it would once have exposed is
 itself fixed (see manager CLAUDE.md note 32a, BUG2-IDEMPOTENT-ROLL). The
 conservative skip above remains as the data-safe backstop for any OTHER
 stale-open source (probe/split/merge seals that don't go through this client's
-alloc). **seed=603 wedge — FIXED (was a separate OPEN bug):** the split's right
+alloc). **The SPLIT-source case is actually UNREACHABLE, not merely
+backstop-covered (verified reproduce-first 2026-07-05,
+`crates/manager/tests/system_split_forcegc_stale_cache.rs`):** the manager-sealed
+tail is EXCLUDED from `sealed_extents` (it's the last extent) until the source
+allocates a FRESH tail, and that allocation routes through
+`ensure_tail_initialised → load_stream_tail`, which INSERTS the tail into
+`extent_info_cache` with its fresh `sealed` state. So the sealed tail's cache is
+refreshed BEFORE it can ever become a force-GC candidate — a `handle_split_part`
+seal-time `invalidate_extent_cache` would be redundant dead code. (A merge
+SURVIVOR has a brief `frozen_for_merge` window before its region_sync reopen
+where a spliced non-tail old-tail could read stale-open, but the reopen installs
+a fresh StreamClient + cache, so it self-heals within a ~2 s tick — data-safe
+either way.) **seed=603 wedge — FIXED (was a separate OPEN bug):** the split's right
 child never opened because a non-idempotent `alloc_new_extent` retry over-sealed
 the freshly-rolled tail → unrecoverable extent → WAL-FAILSTOP on replay. Fixed
 by pinning the seal to `seal_extent_id` (manager CLAUDE.md note 32a); NOT a

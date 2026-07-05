@@ -1,3 +1,24 @@
+Date: 2026-07-05
+TaskStatus: completed
+Task scope: F-SPLIT-STALECACHE-PROBE — user asked to close the "split-sealed tail
+  cached-as-open → force-GC skips it" GC-promptness gap with a seal-time
+  invalidate_extent_cache. Reproduce-first investigation.
+Current summary: gap is UNREACHABLE for the split source (NOT a fix — no code
+  change). The sealed tail is excluded from sealed_extents (last extent) until the
+  source allocs a fresh tail, and that alloc routes through load_stream_tail which
+  INSERTS the tail's fresh sealed state into extent_info_cache — so the cache is
+  refreshed before the tail can become a force-GC candidate. Proven by a new guard
+  test system_split_forcegc_stale_cache (split → source write → compact → force-GC
+  → shared tail refs drops 2→<2, i.e. reclaimed; stable 2/2). A seal-time evict
+  would be redundant dead code (repo rule: no defensive fixes for unreproducible
+  bugs). Merge survivor has a brief frozen-window but self-heals on reopen.
+  CLAUDE.md note clarified (backstop-covered → unreachable). Existing
+  split/gc tests green.
+Main gaps: NONE. Recommendation stands: don't add the redundant invalidate; the
+  guard test documents + protects the invariant.
+Next steps: closed unless the user wants the belt-and-suspenders invalidate anyway.
+
+============================ prior task history ============================
 Date: 2026-07-04
 TaskStatus: not_completed
 Task scope: F-GC-FLOOR-OBS — make the GC replay-floor protection legible to
