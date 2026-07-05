@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 13;
-pub const WIRE_VERSION_MAX: u32 = 13;
+pub const WIRE_VERSION_MIN: u32 = 14;
+pub const WIRE_VERSION_MAX: u32 = 14;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -161,6 +161,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // partition's open tail on a fenced node would never drain / block remove).
     // Pre-R3: MIN=MAX=13 (same-commit deploy; rkyv has no cross-version decode).
     (13, "87ad9d165bd07e15"),
+    // v14: F-GC-FLOOR-OBS — partition_rpc gained MSG_DIAG_PARTITION_VP (0x58) +
+    // DiagPartitionVpReq{part_id}/DiagPartitionVpResp{code, message,
+    // log_extent_ids, sst_vp_heads, floor_pos, floor_extent_id,
+    // vp_seed_extent_id, vp_seed_offset}: `autumn-op info --part` surfaces the
+    // GC replay floor + per-SST vp_heads so operators can tell a correct
+    // forcegc-protected extent from a bug. Pre-R3: MIN=MAX=14 (same-commit
+    // deploy; rkyv has no cross-version decode).
+    (14, "e9c149b55565f2ad"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

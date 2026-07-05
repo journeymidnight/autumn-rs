@@ -145,8 +145,11 @@ pub(crate) async fn dispatch_partition_rpc(
              routed via handle_incoming_req's MSG_SPLIT_PART arm"
                 .to_string(),
         )),
-        MSG_MAINTENANCE => handle_maintenance(payload, part).await,
+        MSG_MAINTENANCE => handle_maintenance(payload, part, part_sc).await,
         MSG_DIAG_TRACE_KEY => handle_diag_trace_key(payload, part).await,
+        partition_rpc::MSG_DIAG_PARTITION_VP => {
+            handle_diag_partition_vp(payload, part, part_sc).await
+        }
         // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
         // removed in F186. Stripe-write is now pure client-side via
         // ClusterClient::put_stream_begin (Ceph striperados pattern).
@@ -1537,9 +1540,65 @@ pub(crate) async fn handle_split_part(
 pub(crate) async fn handle_maintenance(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
 ) -> HandlerResult {
     let req: MaintenanceReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    if req.op == MAINTENANCE_FORCE_GC {
+        // F-GC-FLOOR-OBS #3: enqueue the Force GC AND return an advisory so the
+        // operator learns SYNCHRONOUSLY (not by grepping the PS log) that a
+        // requested extent sits inside the recovery replay window and will be
+        // PROTECTED (correct, not a bug). The background loop recomputes the
+        // floor authoritatively; this is a best-effort preview over the SAME
+        // helper (`gc_replay_floor`). Task is still enqueued regardless.
+        let (gc_tx, log_stream_id, sst_vp_eids) = {
+            let p = part.borrow();
+            (
+                p.gc_tx.clone(),
+                p.log_stream_id,
+                p.sst_readers
+                    .iter()
+                    .map(|r| r.vp_extent_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let advisory = match part_sc.get_stream_info(log_stream_id).await {
+            Ok(si) => {
+                let ids = si.extent_ids;
+                let (floor_pos, pos_by_eid) =
+                    crate::background::gc_replay_floor(&ids, sst_vp_eids.iter().copied());
+                let floor_eid = ids.get(floor_pos).copied().unwrap_or(0);
+                // A requested extent that resolves at/after the floor position is
+                // protected IF non-empty (matches `gc_extent_punchable`). We don't
+                // probe sealed_length here, so qualify with "non-empty".
+                let protected: Vec<u64> = req
+                    .extent_ids
+                    .iter()
+                    .copied()
+                    .filter(|e| pos_by_eid.get(e).is_some_and(|&pos| pos >= floor_pos))
+                    .collect();
+                if protected.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "advisory: extent(s) {protected:?} resolve AT/BEFORE the recovery replay \
+                         floor (extent {floor_eid}, pos {floor_pos}); if non-empty they will be \
+                         PROTECTED by GC (recovery replays from there) — expected, not a bug. \
+                         Advance the floor: flush + MAJOR-compact past extent {floor_eid}, then retry."
+                    )
+                }
+            }
+            Err(_) => String::new(),
+        };
+        let mut gc_tx = gc_tx;
+        let (code, message) = match gc_tx.try_send(GcTask::Force {
+            extent_ids: req.extent_ids,
+        }) {
+            Ok(()) => (CODE_OK, advisory),
+            Err(_) => (CODE_ERROR, "gc busy".to_string()),
+        };
+        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code, message }));
+    }
     if req.op == MAINTENANCE_FLUSH {
         // Synchronous flush: rotate active memtable and flush all immutables.
         flush_memtable_locked(part)
@@ -1565,12 +1624,7 @@ pub(crate) async fn handle_maintenance(
                 .try_send(GcTask::Auto(params))
                 .map_err(|_| "gc busy")
         }
-        MAINTENANCE_FORCE_GC => p
-            .gc_tx
-            .try_send(GcTask::Force {
-                extent_ids: req.extent_ids,
-            })
-            .map_err(|_| "gc busy"),
+        // MAINTENANCE_FORCE_GC handled above (advisory preview path).
         _ => Err("unknown op"),
     };
     match result {
@@ -1583,6 +1637,62 @@ pub(crate) async fn handle_maintenance(
             message: e.to_string(),
         })),
     }
+}
+
+/// F-GC-FLOOR-OBS #2: snapshot the per-partition GC replay floor + per-SST
+/// vp_heads so `autumn-op info --part` can show WHY a `forcegc` on a given
+/// extent would be protected (correct, not a bug). Read-only; borrows briefly,
+/// then does one `get_stream_info` to resolve the log extent order + floor.
+pub(crate) async fn handle_diag_partition_vp(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let _req: partition_rpc::DiagPartitionVpReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let (log_stream_id, sst_vp_heads, vp_seed_extent_id, vp_seed_offset) = {
+        let p = part.borrow();
+        let heads: Vec<(u64, u64)> = p
+            .sst_readers
+            .iter()
+            .map(|r| (r.vp_extent_id, r.vp_offset))
+            .collect();
+        (p.log_stream_id, heads, p.vp_extent_id, p.vp_offset)
+    };
+    let log_extent_ids = match part_sc.get_stream_info(log_stream_id).await {
+        Ok(s) => s.extent_ids,
+        Err(e) => {
+            return Ok(partition_rpc::rkyv_encode(
+                &partition_rpc::DiagPartitionVpResp {
+                    code: CODE_ERROR,
+                    message: format!("get_stream_info: {e}"),
+                    log_extent_ids: Vec::new(),
+                    sst_vp_heads,
+                    floor_pos: 0,
+                    floor_extent_id: 0,
+                    vp_seed_extent_id,
+                    vp_seed_offset,
+                },
+            ));
+        }
+    };
+    let (floor_pos, _pos_by_eid) = crate::background::gc_replay_floor(
+        &log_extent_ids,
+        sst_vp_heads.iter().map(|(eid, _)| *eid),
+    );
+    let floor_extent_id = log_extent_ids.get(floor_pos).copied().unwrap_or(0);
+    Ok(partition_rpc::rkyv_encode(
+        &partition_rpc::DiagPartitionVpResp {
+            code: CODE_OK,
+            message: String::new(),
+            log_extent_ids,
+            sst_vp_heads,
+            floor_pos: floor_pos as u64,
+            floor_extent_id,
+            vp_seed_extent_id,
+            vp_seed_offset,
+        },
+    ))
 }
 
 pub(crate) async fn handle_diag_trace_key(

@@ -291,6 +291,38 @@ pub struct DiagTraceKeyResp {
     pub sst_last_seqs: Vec<u64>,
 }
 
+/// F-GC-FLOOR-OBS: per-partition GC replay-floor + per-SST vp_head snapshot.
+/// Lets `autumn-op info --part P` show WHY a `forcegc P E` on a given extent
+/// would be protected (extent E sits at/before the recovery replay floor →
+/// correct protection, not a bug) without grepping the PS log.
+pub const MSG_DIAG_PARTITION_VP: u8 = 0x58;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagPartitionVpReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagPartitionVpResp {
+    pub code: u8,
+    pub message: String,
+    /// log_stream extent ids in stream order (index 0 = oldest = position 0).
+    pub log_extent_ids: Vec<u64>,
+    /// Per live SST (oldest..newest by vec order): (vp_extent_id, vp_offset).
+    /// The GC replay floor is the MIN stream-position over these vp_extent_ids.
+    pub sst_vp_heads: Vec<(u64, u64)>,
+    /// GC replay floor = MIN stream-position over the SST vp_heads (0 when
+    /// none resolve). GC never punches a NON-EMPTY extent at/after this.
+    pub floor_pos: u64,
+    /// The log extent id at `floor_pos` (0 if the log is empty).
+    pub floor_extent_id: u64,
+    /// `p.vp` seed = the committed log TAIL; the active memtable's next
+    /// rotation stamps its SST vp_head here (so a fresh flush ADVANCES the
+    /// floor toward this). Contrast with `floor_extent_id` (a lagging SST).
+    pub vp_seed_extent_id: u64,
+    pub vp_seed_offset: u64,
+}
+
 /// Fixed prefix of the MSG_PUT_ZC meta: part_id(8)+region_epoch(8)+
 /// expires_at(8)+key_len(4)+inode_hint(8)+lease_epoch(8).
 /// BUG-LEASE-2 Phase 2 extended this 28 → 44 (the two fence fields);

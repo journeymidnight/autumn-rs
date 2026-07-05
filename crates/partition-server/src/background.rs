@@ -208,7 +208,7 @@ pub(crate) fn compaction_output_vp_head(
 }
 
 pub(crate) async fn background_maintenance_loop(
-    _part_id: u64,
+    part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
     mut gc_rx: mpsc::Receiver<GcTask>,
@@ -224,6 +224,13 @@ pub(crate) async fn background_maintenance_loop(
     // on partition_loop, a different task, and must see no compact_row_append
     // nor log_stream GC append in flight while it seals). See lock notes.
     const MAX_GC_ONCE: usize = 3;
+    // Empty sealed extents (sealed_length == 0) are FREE to reclaim — `run_gc`
+    // skips the read/relocate loop and only calls `punch_holes`. They sort LAST
+    // in the discard-desc candidate order (0 reclaimable bytes), so sharing the
+    // MAX_GC_ONCE budget with big rewrite candidates let them starve forever
+    // under split/merge churn (which mints empty sealed tails in bulk). Give
+    // them their OWN, more generous per-tick budget so they drain promptly.
+    const MAX_GC_EMPTY_ONCE: usize = 32;
     const GC_DISCARD_RATIO: f64 = 0.4;
     const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
     const GC_FAILURE_COOLDOWN_SOFT: Duration = Duration::from_secs(30);
@@ -349,7 +356,7 @@ pub(crate) async fn background_maintenance_loop(
                 if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
                     tracing::info!(
                         "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
-                        _part_id,
+                        part_id,
                         major,
                         tbls.len()
                     );
@@ -407,7 +414,7 @@ pub(crate) async fn background_maintenance_loop(
                     Ok(s) => {
                         tracing::info!(
                             "compact part {}: {}, input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                            _part_id,
+                            part_id,
                             if major { "major" } else { "minor" },
                             s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                             crate::human_size(s.output_bytes)
@@ -490,7 +497,7 @@ pub(crate) async fn background_maintenance_loop(
                             Ok(s) => {
                                 tracing::info!(
                                     "compact part {}: expiry major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                                    _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                                    part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
                                 );
                                 if last_extent != 0 {
@@ -572,7 +579,7 @@ pub(crate) async fn background_maintenance_loop(
                             Ok(s) => {
                                 tracing::info!(
                                     "compact part {}: auto-trim (sst_count was {}), input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                                    _part_id, sst_count,
+                                    part_id, sst_count,
                                     s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
                                 );
@@ -828,8 +835,19 @@ pub(crate) async fn background_maintenance_loop(
                         };
 
                         let mut holes = Vec::new();
+                        // Two INDEPENDENT budgets: expensive rewrite candidates
+                        // (bounded by MAX_GC_ONCE — each holds ~chunk of RAM + moves
+                        // live VPs) vs free empty-sealed reclaims (bounded by the
+                        // larger MAX_GC_EMPTY_ONCE — just punch_holes). Empties sort
+                        // LAST here (0 reclaimable bytes), so we must NOT stop scanning
+                        // when the rewrite budget fills — else split/merge-minted empty
+                        // sealed extents at the tail of the list starve forever.
+                        let mut nonempty_selected = 0usize;
+                        let mut empty_selected = 0usize;
                         for eid in candidates {
-                            if holes.len() >= MAX_GC_ONCE {
+                            if nonempty_selected >= MAX_GC_ONCE
+                                && empty_selected >= MAX_GC_EMPTY_ONCE
+                            {
                                 break;
                             }
                             // Authoritative (never stale) sealed state — see
@@ -845,10 +863,18 @@ pub(crate) async fn background_maintenance_loop(
                                 // F201: a CONFIRMED sealed-empty extent — no committed
                                 // data to rewrite, just punch. `run_gc` with
                                 // sealed_length=0 skips the read loop and goes straight
-                                // to flush_gc_batch (no-op) + punch_holes. Empty-sealed
-                                // extents are always eligible (they don't read `ratio` /
-                                // `max_size`) — a strict win.
-                                holes.push((eid, sealed_length));
+                                // to flush_gc_batch (no-op) + punch_holes. Uses the
+                                // SEPARATE empty budget so it never starves behind big
+                                // rewrite candidates (the split/merge-churn gap).
+                                if empty_selected < MAX_GC_EMPTY_ONCE {
+                                    holes.push((eid, sealed_length));
+                                    empty_selected += 1;
+                                }
+                                continue;
+                            }
+                            // Non-empty rewrite candidate: bounded by MAX_GC_ONCE, but
+                            // `continue` (not `break`) so we keep scanning for empties.
+                            if nonempty_selected >= MAX_GC_ONCE {
                                 continue;
                             }
                             if params.empty_only {
@@ -866,6 +892,7 @@ pub(crate) async fn background_maintenance_loop(
                             let ratio = discard_bytes as f64 / sealed_length as f64;
                             if ratio > effective_ratio {
                                 holes.push((eid, sealed_length));
+                                nonempty_selected += 1;
                             }
                         }
                         holes
@@ -878,16 +905,37 @@ pub(crate) async fn background_maintenance_loop(
                 // replay floor (see floor computation above). Empty (sealed_length==0)
                 // extents carry no committed data and stay eligible.
                 {
-                    let before = holes.len();
+                    let mut protected_eids: Vec<u64> = Vec::new();
                     holes.retain(|(eid, sealed_length)| {
-                        gc_extent_punchable(*eid, *sealed_length, &pos_by_eid, replay_floor_pos)
+                        let keep =
+                            gc_extent_punchable(*eid, *sealed_length, &pos_by_eid, replay_floor_pos);
+                        if !keep {
+                            protected_eids.push(*eid);
+                        }
+                        keep
                     });
-                    if holes.len() < before {
+                    if !protected_eids.is_empty() {
+                        // The extent recovery would replay FROM (floor position).
+                        let floor_extent = extent_ids.get(replay_floor_pos).copied().unwrap_or(0);
+                        // Which live SST's vp_head anchors that floor (the SST
+                        // pinning the window). First match is enough for a hint.
+                        let pinned_by_sst_vp_extent = readers_snapshot
+                            .iter()
+                            .map(|r| r.vp_extent_id)
+                            .find(|eid| pos_by_eid.get(eid).copied() == Some(replay_floor_pos))
+                            .unwrap_or(0);
                         tracing::info!(
-                    protected = before - holes.len(),
-                    replay_floor_pos,
-                    "GC: skipping extents inside the WAL replay window (recovery would replay them)"
-                );
+                            part_id,
+                            protected = ?protected_eids,
+                            floor_extent,
+                            floor_pos = replay_floor_pos,
+                            pinned_by_sst_vp_extent,
+                            "GC: protected extent(s) at/before the recovery replay floor — \
+                             recovery replays log_stream from floor_extent forward, so punching \
+                             them could lose un-flushed writes. This is EXPECTED, not a bug. To \
+                             advance the floor: flush + MAJOR-compact so every live SST's vp_head \
+                             moves past floor_extent, then retry (see `autumn-op info --part`)."
+                        );
                     }
                 }
 

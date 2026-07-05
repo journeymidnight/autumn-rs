@@ -1,4 +1,39 @@
 Date: 2026-07-04
+TaskStatus: not_completed
+Task scope: F-GC-FLOOR-OBS — make the GC replay-floor protection legible to
+  operators so a CORRECT "forcegc skipped, replay_floor_pos=0" isn't mistaken for
+  a bug (user hit it live: forcegc 29/17 12 on CoW-shared extent 12). Four
+  observability additions, zero behavior change to GC/recovery:
+  #1 enrich the GC skip log (part_id + protected extents + floor_extent +
+     pinned-by-SST + plain-language hint);
+  #2 new PS RPC MSG_DIAG_PARTITION_VP (0x58, WIRE v14) → `autumn-op info --part`
+     renders replay_floor + per-SST vp_heads (marks the SST pinning the floor);
+  #3 forcegc returns a synchronous advisory (which requested extents are inside
+     the replay window) instead of skip-only-in-PS-log;
+  #4 dashboard bug: per-partition drawer showed OPEN extents as 0B — now probes
+     the EN for live length (mirrors autumn-op info --part).
+  #5 GC empty-sealed-log-extent reclaim (behavior, not obs): user "频繁 merge/split
+     产生很多空 sealed log，gc 也要 punch". Live-confirmed part 17 extent 38
+     starved (forcegc punched instantly = authoritatively sealed = PRIORITY
+     STARVATION, not stale-cache). Fix: empties get a separate MAX_GC_EMPTY_ONCE=32
+     budget + scan no longer breaks on the MAX_GC_ONCE=3 non-empty cap, so free-to-
+     punch empties at the discard-sorted tail no longer starve behind big rewrite
+     candidates. Latent follow-up (NOT done): split/merge don't evict the PS
+     extent_info_cache, so some empties can be stale-open-skipped until refresh.
+Current summary: implemented + builds clean (autumn-rpc/partition-server/manager/
+  server); WIRE bumped 13→14 (registry recorded, wire test green); rpc +
+  partition-server --lib tests green (lone f099i flake is pre-existing parallel-run
+  noise, passes in isolation). Release binaries rebuilt.
+Main gaps: LIVE VALIDATION on the user's running cluster requires a same-commit
+  restart (WIRE 13→14 ⇒ old op/PS can't talk to a new manager) — not yet done.
+  coco review not yet done. Hence not_completed.
+Next steps: (1) same-commit cluster restart with the new binaries; (2) verify
+  `info --part 17` floor render + `forcegc 17 12` advisory + dashboard part-21
+  extent-33 nonzero + enriched skip log; (3) coco review; (4) docs/ops.md note;
+  (5) commit + flip feature_list/status to completed.
+
+============================ prior task history ============================
+Date: 2026-07-04
 TaskStatus: completed
 Task scope: F-VPHEAD-CHAOS — multi-seed chaos validating the vp_head thread under
   real fault injection, ESPECIALLY split/merge/compact/forcegc (user ask), PLUS a

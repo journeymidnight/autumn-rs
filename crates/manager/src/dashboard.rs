@@ -155,7 +155,7 @@ impl AutumnManager {
         let mgr_pd = SendWrapper::new(self.clone());
         let partition_route = get(move |Path(id): Path<String>| {
             let mgr = mgr_pd.clone();
-            SendWrapper::new(async move { partition_detail_response(&mgr, &id) })
+            SendWrapper::new(async move { partition_detail_response(&mgr, &id).await })
         });
 
         // ── auto-policy controller (M2) ──────────────────────────────────
@@ -389,7 +389,56 @@ impl AutumnManager {
     /// from the cached `PartitionLoad` + topology/extents read directly from the
     /// store (the partition's 3 streams). Cheap (O(this partition's extents)) —
     /// no cache needed (called on-demand when one partition is expanded).
+    /// Sync render (no EN probe) — used by tests. Open extents show the
+    /// manager's `sealed_length` (0). `partition_detail_json_live` probes.
+    #[cfg(test)]
     fn partition_detail_json(&self, pid: u64) -> String {
+        self.partition_detail_value(pid).0.to_string()
+    }
+
+    /// Async render that PROBES open extents for their live length. The
+    /// manager only knows SEALED lengths; an open tail (log/row/meta) holds
+    /// live WAL/SST bytes whose `sealed_length` is 0, so without this probe
+    /// the dashboard shows every open extent as 0B (mirrors the fix already in
+    /// `autumn-op info --part`, `EXT_MSG_PROBE_EXTENT`).
+    async fn partition_detail_json_live(&self, pid: u64) -> String {
+        let (mut value, probes) = self.partition_detail_value(pid);
+        let mut probed_extra = 0u64;
+        for (idx, eid, addr) in probes {
+            if let Ok(len) = self.probe_extent_on_node(&addr, eid).await {
+                if let Some(sz) = value
+                    .get_mut("extents")
+                    .and_then(|e| e.get_mut(idx))
+                    .and_then(|e| e.get_mut("size"))
+                {
+                    probed_extra = probed_extra.saturating_add(len);
+                    *sz = serde_json::json!(len);
+                }
+            }
+        }
+        // Fix the rollup fallback too (used only when the PS hasn't reported a
+        // size): open extents contributed 0 to `live_size` in the sync build.
+        if probed_extra > 0 {
+            if let Some(sb) = value.get("size_bytes").and_then(|v| v.as_u64()) {
+                // size_bytes = max(PS-reported, live_size). Only bump when we're
+                // on the live_size branch (PS-reported already counts open bytes).
+                if let Some(ls) = value.get("live_size_internal").and_then(|v| v.as_u64()) {
+                    if sb == ls {
+                        value["size_bytes"] = serde_json::json!(ls + probed_extra);
+                    }
+                }
+            }
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("live_size_internal");
+        }
+        value.to_string()
+    }
+
+    /// Build the partition-detail JSON `Value` plus the list of OPEN extents
+    /// `(extents-array index, extent_id, first-replica EN address)` that need an
+    /// EN probe to show their live length. Sync (no I/O).
+    fn partition_detail_value(&self, pid: u64) -> (serde_json::Value, Vec<(usize, u64, String)>) {
         use serde_json::json;
 
         let detail = self.compute_partition_detail_resp(pid);
@@ -399,7 +448,7 @@ impl AutumnManager {
             errors.push(format!("detail: {}", detail.message));
         }
 
-        let (ps_addr, range_start, range_end, extents, live_size) = {
+        let (ps_addr, range_start, range_end, extents, live_size, open_probes) = {
             let s = self.store.inner.borrow();
             match s.regions.get(&pid) {
                 Some(r) => {
@@ -422,6 +471,9 @@ impl AutumnManager {
                     let mut extents: Vec<serde_json::Value> = Vec::new();
                     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
                     let mut live = 0u64;
+                    // (index into `extents`, extent_id, EN address) for open,
+                    // non-EC extents whose live length must be probed off an EN.
+                    let mut open_probes: Vec<(usize, u64, String)> = Vec::new();
                     for (role, sid) in [
                         ("log", r.log_stream),
                         ("row", r.row_stream),
@@ -443,6 +495,18 @@ impl AutumnManager {
                                     } else {
                                         String::new()
                                     };
+                                    // Open, non-EC extent: sealed_length is 0 but
+                                    // it holds live bytes — record it for an EN probe.
+                                    if !e.sealed && !e.ec_converted {
+                                        if let Some(addr) = e
+                                            .replicates
+                                            .first()
+                                            .and_then(|nid| s.nodes.get(nid))
+                                            .map(|n| n.address.clone())
+                                        {
+                                            open_probes.push((extents.len(), *eid, addr));
+                                        }
+                                    }
                                     extents.push(json!({
                                         "extent_id": eid,
                                         "role": role,
@@ -475,18 +539,18 @@ impl AutumnManager {
                             }
                         }
                     }
-                    (ps_addr, rs, re, extents, live)
+                    (ps_addr, rs, re, extents, live, open_probes)
                 }
                 None => {
                     errors.push(format!("partition {pid} not found"));
-                    (String::new(), Vec::new(), Vec::new(), Vec::new(), 0u64)
+                    (String::new(), Vec::new(), Vec::new(), Vec::new(), 0u64, Vec::new())
                 }
             }
         };
 
         // Reported size when the PS has flushed; else the topology rollup.
         let size_bytes = if load.size_bytes > 0 { load.size_bytes } else { live_size };
-        json!({
+        let value = json!({
             "part_id": pid,
             "ps_addr": ps_addr,
             "range_start": String::from_utf8_lossy(&range_start),
@@ -496,6 +560,10 @@ impl AutumnManager {
             "read_bytes_per_sec": load.read_bytes_per_sec,
             "p99_us": load.p99_us,
             "size_bytes": size_bytes,
+            // Internal helper for `partition_detail_json_live` to know whether
+            // size_bytes came from the topology rollup (probeable) or the PS
+            // report; removed before the response is serialized.
+            "live_size_internal": live_size,
             "gc_debt_bytes": load.gc_debt_bytes,
             "pending_compaction_bytes": load.pending_compaction_bytes,
             "gc_inflight": load.gc_inflight != 0,
@@ -503,8 +571,8 @@ impl AutumnManager {
             "sealed_log_extent_count": load.sealed_log_extent_count,
             "extents": extents,
             "errors": errors,
-        })
-        .to_string()
+        });
+        (value, open_probes)
     }
 }
 
@@ -542,9 +610,13 @@ fn overview_cached(mgr: &AutumnManager, cache: &OverviewCache) -> Response<Body>
 
 /// `/api/partition/<id>` — parse the id, then render the detail JSON. A bad id
 /// returns page-shaped JSON (not axum's default text 400) so `r.json()` holds.
-fn partition_detail_response(mgr: &AutumnManager, id: &str) -> Response<Body> {
+async fn partition_detail_response(mgr: &AutumnManager, id: &str) -> Response<Body> {
     match id.parse::<u64>() {
-        Ok(pid) => json_response(StatusCode::OK, mgr.partition_detail_json(pid), "application/json"),
+        Ok(pid) => json_response(
+            StatusCode::OK,
+            mgr.partition_detail_json_live(pid).await,
+            "application/json",
+        ),
         Err(_) => json_response(
             StatusCode::BAD_REQUEST,
             r#"{"error":"bad partition id","extents":[]}"#.to_string(),

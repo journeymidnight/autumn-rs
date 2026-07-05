@@ -360,6 +360,47 @@ still won't reclaim" case. Guard:
 `crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
 content boundary on every path (flush, compaction, and recovery).
 
+### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT (F-GC-FLOOR-OBS)
+
+GC protects any NON-EMPTY `log_stream` extent that sits AT/BEFORE the recovery
+replay floor (`MIN` over every live SST's `vp_head` position). If you `forcegc`
+such an extent it is refused — this is the F1 safety guard, **not a bug**: recovery
+replays the log from `floor_extent` forward, so punching it could drop un-flushed
+writes. How to tell CORRECT-protection from a real problem:
+
+- **The PS log** now names it: `GC: protected extent(s) ... part_id=P
+  protected=[E] floor_extent=F floor_pos=N pinned_by_sst_vp_extent=S` — the
+  extent recovery replays FROM is `F`, pinned by SST whose vp_head is `S`.
+- **`autumn-op info --part P`** shows `replay_floor = extent F (pos N)`, the
+  `vp_seed(tail)`, and each SST's `vp_head` (the one that `← pins floor` is the
+  lagging SST). If `floor_extent == the extent you tried to forcegc`, that extent
+  IS the replay start — protection is correct.
+- **`autumn-op forcegc P E`** returns a synchronous advisory when `E` is inside
+  the replay window (which extents, and why), instead of you having to grep the PS
+  log.
+
+To actually reclaim a protected extent, **advance the floor**: run a MAJOR
+compaction (`autumn-op compact P`) so every live SST's `vp_head` moves past that
+extent (a lagging CoW-shared SST from a split is the usual cause), then re-issue
+`forcegc`. If the floor still won't pass it, the partition genuinely still needs
+that extent for replay (its data was all flushed while that extent was the log
+tail) — nothing to reclaim until newer data supersedes it.
+
+### GC auto-reclaims empty sealed log extents from split/merge churn (F-GC-FLOOR-OBS #5)
+
+Frequent split/merge mints **empty sealed** `log_stream` tail extents
+(`sealed_length == 0`). These are free to reclaim (`punch_holes`, no data
+movement) but used to STARVE under Auto GC: candidates sort by reclaimable-bytes
+DESC (empties last) and shared the 3-per-tick rewrite budget with big candidates.
+Auto GC now gives empties a separate, larger per-tick budget (`MAX_GC_EMPTY_ONCE
+= 32`), so they drain on their own within a GC tick or two — no operator action.
+If you see empty sealed log extents lingering (`autumn-op info --part P` → a
+`role:log, open:false, size:0` extent that is NOT the tail), a manual `autumn-op
+forcegc P <extent>` still punches it immediately. NOTE: a split/merge-sealed empty
+can occasionally be stale-cached-as-open on the PS and skipped until its cache
+refreshes (a read / restart) — a `forcegc` that logs "not authoritatively sealed
+yet" is that case; re-issue after a moment.
+
 ## Read route-around for Suspected nodes (F276)
 
 When the manager marks an EN **Suspected** (df heartbeats lapsed past the soft

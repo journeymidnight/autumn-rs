@@ -24,7 +24,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{GetDiscardsReq, GetDiscardsResp, MSG_GET_DISCARDS};
+use autumn_rpc::partition_rpc::{
+    DiagPartitionVpReq, DiagPartitionVpResp, GetDiscardsReq, GetDiscardsResp,
+    MSG_DIAG_PARTITION_VP, MSG_GET_DISCARDS,
+};
 use autumn_transport::TransportKind;
 use bytes::Bytes;
 use serde::Serialize;
@@ -2004,7 +2007,45 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
         }
     }
 
+    // F-GC-FLOOR-OBS #2: ask the PS for the GC replay floor + per-SST vp_heads,
+    // so the operator can see WHY a `forcegc P E` on a given extent is protected
+    // (extent E at/before the floor → correct, not a bug). Best-effort: a PS that
+    // predates this RPC, or is briefly unreachable, just omits the section.
+    let floor: Option<DiagPartitionVpResp> = if ps_addr.is_empty() {
+        None
+    } else {
+        match client.get_ps_client(&ps_addr).await {
+            Ok(psc) => match psc
+                .call_timeout(
+                    MSG_DIAG_PARTITION_VP,
+                    rkyv_encode(&DiagPartitionVpReq { part_id: pid }),
+                    DEFAULT_RPC_TIMEOUT,
+                )
+                .await
+            {
+                Ok(bytes) => rkyv_decode::<DiagPartitionVpResp>(&bytes)
+                    .ok()
+                    .filter(|d| d.code == CODE_OK),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+
     if json_out {
+        let floor_json = floor.as_ref().map(|f| {
+            serde_json::json!({
+                "floor_extent_id": f.floor_extent_id,
+                "floor_pos": f.floor_pos,
+                "vp_seed_extent_id": f.vp_seed_extent_id,
+                "vp_seed_offset": f.vp_seed_offset,
+                "log_extent_ids": f.log_extent_ids,
+                "sst_vp_heads": f.sst_vp_heads
+                    .iter()
+                    .map(|(e, o)| serde_json::json!({"vp_extent_id": e, "vp_offset": o}))
+                    .collect::<Vec<_>>(),
+            })
+        });
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -2017,11 +2058,26 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                 "log_stream_id": r.log_stream,
                 "row_stream_id": r.row_stream,
                 "meta_stream_id": r.meta_stream,
+                "replay_floor": floor_json,
                 "extents": extents_json,
             }))?
         );
     } else {
         println!("partition {pid} on {ps_addr}  [{rs}, {re})  {} ({} ext)", human_size(live_size), seen.len());
+        if let Some(f) = &floor {
+            println!(
+                "  replay_floor = extent {} (pos {})   vp_seed(tail) = extent {} @ {}",
+                f.floor_extent_id, f.floor_pos, f.vp_seed_extent_id, f.vp_seed_offset
+            );
+            for (i, (eid, off)) in f.sst_vp_heads.iter().enumerate() {
+                let pin = if *eid == f.floor_extent_id && f.floor_extent_id != 0 {
+                    "  ← pins floor (forcegc at/before this extent is protected)"
+                } else {
+                    ""
+                };
+                println!("  sst[{i}] vp_head = extent {eid} @ {off}{pin}");
+            }
+        }
         for e in &extents_json {
             println!("  {}", e);
         }
