@@ -2706,7 +2706,9 @@ impl ClusterClient {
 
     /// Trigger compaction on a partition.
     pub async fn compact(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        self.maintenance(part_id, MAINTENANCE_COMPACT, vec![]).await
+        self.maintenance(part_id, MAINTENANCE_COMPACT, vec![])
+            .await
+            .map(|_| ())
     }
 
     /// Trigger automatic GC on a partition.
@@ -2742,18 +2744,23 @@ impl ClusterClient {
     }
 
     /// Force GC of specific extents on a partition.
+    /// Returns the PS-side advisory (empty when all requested extents are
+    /// punchable; non-empty names the extents that fall inside the replay-floor
+    /// window and will be PROTECTED — "flush + MAJOR-compact then retry").
     pub async fn force_gc(
         &self,
         part_id: u64,
         extent_ids: Vec<u64>,
-    ) -> std::result::Result<(), AutumnError> {
+    ) -> std::result::Result<String, AutumnError> {
         self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids)
             .await
     }
 
     /// Trigger flush on a partition.
     pub async fn flush(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        self.maintenance(part_id, MAINTENANCE_FLUSH, vec![]).await
+        self.maintenance(part_id, MAINTENANCE_FLUSH, vec![])
+            .await
+            .map(|_| ())
     }
 
     /// F183: merge two adjacent partitions. Survivor keeps its part_id;
@@ -2827,12 +2834,15 @@ impl ClusterClient {
         Ok(resp.candidates)
     }
 
+    /// Returns the PS-side `MaintenanceResp.message` on success — empty for
+    /// most ops, but FORCE_GC carries a synchronous advisory (which requested
+    /// extents fall inside the replay-floor window and will be PROTECTED).
     async fn maintenance(
         &self,
         part_id: u64,
         op: u8,
         extent_ids: Vec<u64>,
-    ) -> std::result::Result<(), AutumnError> {
+    ) -> std::result::Result<String, AutumnError> {
         let resp_bytes = self
             .call_ps_for_part(
                 part_id,
@@ -2854,7 +2864,7 @@ impl ClusterClient {
             .await?;
         let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         check_ps_code(resp.code, &resp.message)?;
-        Ok(())
+        Ok(resp.message)
     }
 }
 

@@ -1420,7 +1420,7 @@ async fn cmd_gc(client: &ClusterClient, json: bool, part_id: u64, ratio: Option<
 }
 
 async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_ids: Vec<u64>) -> Result<()> {
-    client
+    let advisory = client
         .force_gc(part_id, extent_ids.clone())
         .await
         .map_err(|e| anyhow!("forcegc: {e}"))?;
@@ -1431,10 +1431,14 @@ async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_i
                 "ok": true,
                 "part_id": part_id,
                 "extents": extent_ids,
+                "advisory": advisory,
             }))?
         );
     } else {
         println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
+        if !advisory.is_empty() {
+            println!("  advisory: {advisory}");
+        }
     }
     Ok(())
 }

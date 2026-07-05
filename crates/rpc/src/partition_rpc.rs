@@ -791,6 +791,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_BATCH_GET => rkyv_decode::<BatchGetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_DIAG_PARTITION_VP => rkyv_decode::<DiagPartitionVpReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -818,12 +821,24 @@ mod msg_type_tests {
             MSG_GET_REDIRECT,
             MSG_AUTH_HELLO,
             MSG_ROLL_TAILS,
+            MSG_DIAG_TRACE_KEY,
+            MSG_DIAG_PARTITION_VP,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
                 assert_ne!(all[i], all[j], "msg_type collision at index {} vs {}", i, j);
             }
         }
+    }
+
+    #[test]
+    fn extract_part_id_covers_diag_partition_vp() {
+        // Regression: without the MSG_DIAG_PARTITION_VP arm, extract_part_id
+        // falls to `_ => 0`, so the PS conn layer misroutes the diag frame as
+        // NotFound (0 != owner_part) and `autumn-op info --part` never shows the
+        // replay floor. Assert the arm resolves the real part_id.
+        let payload = rkyv_encode(&DiagPartitionVpReq { part_id: 4242 });
+        assert_eq!(extract_part_id(MSG_DIAG_PARTITION_VP, &payload), 4242);
     }
 }
 
