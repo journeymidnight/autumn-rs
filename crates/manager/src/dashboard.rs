@@ -402,31 +402,48 @@ impl AutumnManager {
     /// the dashboard shows every open extent as 0B (mirrors the fix already in
     /// `autumn-op info --part`, `EXT_MSG_PROBE_EXTENT`).
     async fn partition_detail_json_live(&self, pid: u64) -> String {
-        let (mut value, probes) = self.partition_detail_value(pid);
+        let (mut value, probes, used_topology_fallback) = self.partition_detail_value(pid);
         let mut probed_extra = 0u64;
-        for (idx, eid, addr) in probes {
-            if let Ok(len) = self.probe_extent_on_node(&addr, eid).await {
-                if let Some(sz) = value
-                    .get_mut("extents")
-                    .and_then(|e| e.get_mut(idx))
-                    .and_then(|e| e.get_mut("size"))
-                {
-                    probed_extra = probed_extra.saturating_add(len);
-                    *sz = serde_json::json!(len);
+        for (idx, eid, addrs) in probes {
+            // Try every replica in order; first success wins. Only fall back to
+            // 0B (and note it) when EVERY replica probe fails — a single down
+            // replica[0] no longer hides a healthy sibling's true length.
+            let mut probed = None;
+            for addr in &addrs {
+                if let Ok(len) = self.probe_extent_on_node(addr, eid).await {
+                    probed = Some(len);
+                    break;
+                }
+            }
+            match probed {
+                Some(len) => {
+                    if let Some(sz) = value
+                        .get_mut("extents")
+                        .and_then(|e| e.get_mut(idx))
+                        .and_then(|e| e.get_mut("size"))
+                    {
+                        probed_extra = probed_extra.saturating_add(len);
+                        *sz = serde_json::json!(len);
+                    }
+                }
+                None => {
+                    if let Some(errs) = value.get_mut("errors").and_then(|e| e.as_array_mut()) {
+                        errs.push(serde_json::json!(format!(
+                            "open extent {eid}: all {} replica probe(s) failed (showing 0B)",
+                            addrs.len()
+                        )));
+                    }
                 }
             }
         }
-        // Fix the rollup fallback too (used only when the PS hasn't reported a
-        // size): open extents contributed 0 to `live_size` in the sync build.
-        if probed_extra > 0 {
+        // Add the probed open-extent bytes to the rollup ONLY when size_bytes
+        // came from the topology fallback (PS hasn't reported). A PS-reported
+        // size already counts open bytes; adding probed_extra there double-counts.
+        // Gate on the explicit flag, NOT a `size_bytes == live_size` coincidence
+        // (which double-counted whenever the two happened to be equal).
+        if used_topology_fallback && probed_extra > 0 {
             if let Some(sb) = value.get("size_bytes").and_then(|v| v.as_u64()) {
-                // size_bytes = max(PS-reported, live_size). Only bump when we're
-                // on the live_size branch (PS-reported already counts open bytes).
-                if let Some(ls) = value.get("live_size_internal").and_then(|v| v.as_u64()) {
-                    if sb == ls {
-                        value["size_bytes"] = serde_json::json!(ls + probed_extra);
-                    }
-                }
+                value["size_bytes"] = serde_json::json!(sb.saturating_add(probed_extra));
             }
         }
         if let Some(obj) = value.as_object_mut() {
@@ -436,9 +453,15 @@ impl AutumnManager {
     }
 
     /// Build the partition-detail JSON `Value` plus the list of OPEN extents
-    /// `(extents-array index, extent_id, first-replica EN address)` that need an
-    /// EN probe to show their live length. Sync (no I/O).
-    fn partition_detail_value(&self, pid: u64) -> (serde_json::Value, Vec<(usize, u64, String)>) {
+    /// `(extents-array index, extent_id, ALL replica EN addresses)` that need an
+    /// EN probe to show their live length, plus `used_topology_fallback` — true
+    /// when `size_bytes` came from the topology rollup (the PS hasn't reported a
+    /// size), the ONLY case where the probed open-extent bytes should be added
+    /// to the rollup. Sync (no I/O).
+    fn partition_detail_value(
+        &self,
+        pid: u64,
+    ) -> (serde_json::Value, Vec<(usize, u64, Vec<String>)>, bool) {
         use serde_json::json;
 
         let detail = self.compute_partition_detail_resp(pid);
@@ -473,7 +496,7 @@ impl AutumnManager {
                     let mut live = 0u64;
                     // (index into `extents`, extent_id, EN address) for open,
                     // non-EC extents whose live length must be probed off an EN.
-                    let mut open_probes: Vec<(usize, u64, String)> = Vec::new();
+                    let mut open_probes: Vec<(usize, u64, Vec<String>)> = Vec::new();
                     for (role, sid) in [
                         ("log", r.log_stream),
                         ("row", r.row_stream),
@@ -498,13 +521,20 @@ impl AutumnManager {
                                     // Open, non-EC extent: sealed_length is 0 but
                                     // it holds live bytes — record it for an EN probe.
                                     if !e.sealed && !e.ec_converted {
-                                        if let Some(addr) = e
+                                        // Record EVERY replica addr (not just the
+                                        // first): if replica[0]'s EN is down but a
+                                        // sibling is healthy, the open extent still
+                                        // shows its true length instead of 0B
+                                        // (degraded-replica robustness).
+                                        let addrs: Vec<String> = e
                                             .replicates
-                                            .first()
-                                            .and_then(|nid| s.nodes.get(nid))
-                                            .map(|n| n.address.clone())
-                                        {
-                                            open_probes.push((extents.len(), *eid, addr));
+                                            .iter()
+                                            .filter_map(|nid| {
+                                                s.nodes.get(nid).map(|n| n.address.clone())
+                                            })
+                                            .collect();
+                                        if !addrs.is_empty() {
+                                            open_probes.push((extents.len(), *eid, addrs));
                                         }
                                     }
                                     extents.push(json!({
@@ -549,6 +579,7 @@ impl AutumnManager {
         };
 
         // Reported size when the PS has flushed; else the topology rollup.
+        let used_topology_fallback = load.size_bytes == 0;
         let size_bytes = if load.size_bytes > 0 { load.size_bytes } else { live_size };
         let value = json!({
             "part_id": pid,
@@ -572,7 +603,7 @@ impl AutumnManager {
             "extents": extents,
             "errors": errors,
         });
-        (value, open_probes)
+        (value, open_probes, used_topology_fallback)
     }
 }
 
