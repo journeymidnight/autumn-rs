@@ -252,6 +252,24 @@ The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` reflects real
 backend capacity (conservatively, at the 3-replica factor) instead of a fixed
 placeholder.
 
+### Per-partition size in `autumn-op info` (F-OVERVIEW-OPENTAIL)
+
+The cluster overview's per-partition size = the manager's authoritative
+Σ `sealed_length` **plus** the PS-reported open-tail committed bytes (log + row +
+meta open tails). Without the open-tail term a major-compacted or log-heavy
+partition — whose data lives entirely in OPEN extents (manager `sealed_length` =
+0) — renders `0 B` despite holding GBs. The open-tail bytes come from the PS's
+5 s load report (refreshed by a throttled 30 s probe), so the overview is a
+periodic rollup that can lag a live compaction by a few seconds:
+
+```bash
+autumn-op --manager 127.0.0.1:9001 info            # overview: size incl. open tails
+autumn-op --manager 127.0.0.1:9001 info --part 17  # EXACT size (probes the EN live)
+```
+
+For an idle partition the two match to the byte; for one actively
+GC/compacting they differ transiently — `info --part` is authoritative.
+
 ## Prometheus /metrics
 
 Every server binary takes an opt-in `--metrics-port <PORT>` flag exposing a

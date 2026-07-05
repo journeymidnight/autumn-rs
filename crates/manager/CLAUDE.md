@@ -212,6 +212,30 @@ first post-upgrade sweep → DATA LOSS. So:
   `extent_can_delete` to `refs == 0`, removes both persisted fields behind a
   versioned decode + one-time rewrite, and deletes stale `partitionVpRefs/` keys.
 
+## Cluster overview size = sealed sum + PS-reported open-tail bytes (F-OVERVIEW-OPENTAIL)
+
+`compute_cluster_overview_resp`'s per-partition `live_size` is
+`Σ distinct extents' sealed_length` (manager-authoritative) **plus** the
+latest PS-reported `PartitionLoad.open_tail_bytes` (`open_tail_of(pid)`, read
+from the policy window's newest bucket; 0 → sealed-sum-only fallback). An OPEN
+extent's manager `sealed_length` is 0, so a major-compacted / log-heavy
+partition whose data lives entirely in open tails would otherwise render 0 B
+(user hit it live: part 17 `0 B` in the overview vs `1.5 GB` from
+`info --part 17`'s EN probe). The PS supplies the missing piece because the
+manager cannot know an open tail's live length without an EN probe, and the
+overview is deliberately one-RPC / scalable (no per-partition fan-out) — the PS
+already reports load every 5 s, so the open-tail sum rides that channel for
+free. The number is thus a periodic rollup (same staleness class as
+`req_per_sec`); the exact size is `info --part` (which probes the EN live). The
+dashboard `/api/overview` shares this builder, so it inherits the fix.
+**Invariant: never re-introduce a sealed-length-only `live_size` — an
+all-open-tail partition MUST count its open-tail bytes.** PS side:
+partition-server CLAUDE.md (F-OVERVIEW-OPENTAIL probe). Related dead-gauge
+follow-up: `PartitionLoad.size_bytes` has no writer (always 0) → the
+`autumn_ps_partition_size_bytes` Prometheus gauge + size-based auto-split/merge
+policy are inert; reviving it is deferred (feature_list F-PS-SIZE-BYTES-DEAD)
+because it would silently arm size-based auto-policy.
+
 ## EC Conversion Dispatch (`ec_conversion_dispatch_loop`)
 
 Background loop that fires every 5 s. Picks any sealed extent on an EC stream where `ec_converted == false`, sends `EXT_MSG_CONVERT_TO_EC` to the coordinator (first replica), and on success calls `apply_ec_conversion_done` to flip `ec_converted = true` + bump `eversion = pre_ec + 1` in the manager + etcd.

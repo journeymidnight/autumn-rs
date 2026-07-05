@@ -4228,9 +4228,26 @@ impl AutumnManager {
             .collect();
         nodes.sort_by_key(|n| n.node_id);
 
+        // F-OVERVIEW-OPENTAIL: latest PS-reported open-tail bytes (Σ committed
+        // length on the partition's log/row/meta OPEN tails). The manager's
+        // sealed-length sum below is authoritative for SEALED extents but an
+        // open tail's `sealed_length` is 0, so a compacted / log-heavy
+        // partition whose data lives entirely in open tails would render 0 B.
+        // Adding the PS-reported open-tail bytes makes the overview match what
+        // `autumn-op info --part` gets by probing the EN — without a
+        // per-partition EN probe here (stays one-RPC / scalable). 0 when the
+        // PS hasn't reported yet (falls back to the sealed sum alone).
+        let open_tail_of = |pid: u64| -> u64 {
+            pol.metrics
+                .get(&pid)
+                .and_then(|w| w.buckets.back())
+                .map(|(_, l)| l.open_tail_bytes)
+                .unwrap_or(0)
+        };
+
         // Per-partition rollup. live_size = Σ distinct extents' sealed_length
-        // over the partition's 3 streams (manager-authoritative; open-tail
-        // bytes excluded — the per-partition detail probes for the exact size).
+        // over the partition's 3 streams (manager-authoritative) + the
+        // PS-reported open-tail committed bytes (F-OVERVIEW-OPENTAIL).
         let partitions: Vec<PartitionOverview> = s
             .regions
             .values()
@@ -4254,6 +4271,9 @@ impl AutumnManager {
                         }
                     }
                 }
+                // F-OVERVIEW-OPENTAIL: add the PS-reported open-tail bytes to
+                // the authoritative sealed sum for the displayed size.
+                let live_size = live_size.saturating_add(open_tail_of(r.part_id));
                 let (range_start, range_end) = r
                     .rg
                     .as_ref()

@@ -1,5 +1,44 @@
 Date: 2026-07-05
 TaskStatus: completed
+Task scope: F-OVERVIEW-OPENTAIL — user hit live: `autumn-op info` showed part 17 as
+  "0 B  3 ext" while `info --part 17` reported 1.5 GB ("0B，应该是显示不对").
+Current summary: root cause = `compute_cluster_overview_resp` (manager) sums ONLY
+  each extent's manager-authoritative `sealed_length`, and an OPEN extent's
+  sealed_length is 0. A major-compacted / log-heavy partition whose data lives
+  entirely in open tails renders 0 B. `info --part` probes the EN for open-tail
+  live length; the overview deliberately did not (one-RPC / scalable).
+  User decisions (AskUserQuestion): size = TOTAL EXTENT FOOTPRINT (matches
+  info --part); mechanism = PS REPORTS IT (no per-EN probe in overview).
+  Fix (3 crates, no per-EN probe in the overview):
+   - rpc: `PartitionLoad.open_tail_bytes: u64` (WIRE v15, fp 4bbbbf8faeb05923,
+     MIN=MAX=15 same-commit).
+   - PS: `PartitionMetrics.open_tail_bytes` + `open_tail_probe_inflight`;
+     `background_maintenance_loop` runs a throttled (30 s) NON-BLOCKING probe
+     (detached task does `commit_length` on the 3 stream tails, stores the sum;
+     kept at prior value on any error — detached because commit_length is up to
+     15 s worst-case and must never stall GC/compaction). `report_load_loop`
+     ships it.
+   - manager: overview `live_size = Σ sealed_length + open_tail_of(pid)`
+     (latest window bucket; 0 → sealed-sum-only fallback). Dashboard
+     /api/overview inherits it (same builder).
+  Also FOUND (not fixed — deferred as F-PS-SIZE-BYTES-DEAD): `size_bytes` gauge
+  has no writer → always 0 → Prometheus gauge + size-based auto-split/merge
+  policy see 0. Not fixed alongside because populating it would silently arm
+  size-based auto-policy (behavioral change; needs its own semantic decision).
+Verification: affected crates build clean; 0 new clippy (4 PS RefCell-across-await
+  warns are pre-existing); rpc 44 wire tests green (v15 pinned).
+  LIVE-VERIFIED on the running 5-EN cluster after same-commit `cluster.sh restart 5`
+  (data preserved): part 17 0 B → 1.5 GB (== info --part 17 EN-probe); every
+  partition size now accurate (part 45 1.6 GB → ~147 MB once open-tail bytes
+  counted instead of stale sealed CoW extents). Idle part 17 matches info --part
+  to the byte (combine correct); active part 45 shows expected window-staleness
+  skew vs the live probe. User confirmed manual verification OK.
+Main gaps: NONE for the display fix. Deferred: F-PS-SIZE-BYTES-DEAD (dead
+  size_bytes gauge + broken size-based policy) — needs an explicit go-ahead.
+Next steps: closed. Optional follow-up = revive size_bytes / size-based policy
+  (F-PS-SIZE-BYTES-DEAD) if the user wants it.
+
+============================ prior task history ============================
 Task scope: F-SPLIT-STALECACHE-PROBE — user asked to close the "split-sealed tail
   cached-as-open → force-GC skips it" GC-promptness gap with a seal-time
   invalidate_extent_cache. Reproduce-first investigation.

@@ -243,6 +243,10 @@ pub(crate) async fn background_maintenance_loop(
     // only (F188/F203 demoted them off the dispatch path).
     let mut next_compact_at = Instant::now() + random_delay();
     let mut next_gc_at = Instant::now() + random_delay();
+    // F-OVERVIEW-OPENTAIL: next open-tail size probe (fires immediately on
+    // first iteration, then every SIZE_REFRESH_INTERVAL).
+    let mut next_size_refresh_at = Instant::now();
+    const SIZE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
     loop {
         use std::future::Future;
@@ -257,6 +261,55 @@ pub(crate) async fn background_maintenance_loop(
         }
 
         let now = Instant::now();
+
+        // F-OVERVIEW-OPENTAIL: throttled, NON-BLOCKING open-tail size probe.
+        // Cluster-overview `live_size` = manager sealed-length sum + this. A
+        // `commit_length` on each of the 3 stream tails is up to 15 s
+        // worst-case (all-replica probe), so it runs DETACHED — it must never
+        // stall GC/compaction on this shared maintenance task. Guarded by an
+        // in-flight CAS so slow probes don't pile up. The value is kept at the
+        // prior reading on ANY probe error (a partial 3-tail sum would
+        // misreport, e.g. a briefly-unreachable replica dropping to a tiny
+        // number). Read by report_load_loop → shipped to the manager.
+        if now >= next_size_refresh_at {
+            next_size_refresh_at = now + SIZE_REFRESH_INTERVAL;
+            let (sc, log_id, row_id, meta_id, metrics) = {
+                let p = part.borrow();
+                (
+                    p.stream_client.clone(),
+                    p.log_stream_id,
+                    p.row_stream_id,
+                    p.meta_stream_id,
+                    p.metrics.clone(),
+                )
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            if metrics
+                .open_tail_probe_inflight
+                .compare_exchange(false, true, Relaxed, Relaxed)
+                .is_ok()
+            {
+                compio::runtime::spawn(async move {
+                    let mut total = 0u64;
+                    let mut ok = true;
+                    for sid in [log_id, row_id, meta_id] {
+                        match sc.commit_length(sid).await {
+                            Ok(len) => total = total.saturating_add(len),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        metrics.open_tail_bytes.store(total, Relaxed);
+                    }
+                    metrics.open_tail_probe_inflight.store(false, Relaxed);
+                })
+                .detach();
+            }
+        }
+
         let compact_sleep = next_compact_at.saturating_duration_since(now);
         let gc_sleep = next_gc_at.saturating_duration_since(now);
         let sel = {

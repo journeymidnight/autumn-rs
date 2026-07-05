@@ -502,6 +502,27 @@ pipeline-depth 4, --batch-get 32): 158 K read ops/s baseline →
 p99, not throughput — batching collapses the per-frame
 write_vectored response coalescing.
 
+## Open-tail size probe for the cluster overview (F-OVERVIEW-OPENTAIL)
+
+`background_maintenance_loop` refreshes `PartitionMetrics.open_tail_bytes` — the
+Σ committed length on the partition's log/row/meta OPEN-tail extents — which
+`report_load_loop` ships to the manager in `PartitionLoad.open_tail_bytes`. The
+manager adds it to its authoritative sealed-length sum for the cluster overview
+`live_size` (an open extent's manager `sealed_length` is 0, so an all-open-tail
+partition would render 0 B without this — see manager CLAUDE.md). The refresh:
+- runs at loop top, throttled to every 30 s (`next_size_refresh_at`);
+- is **DETACHED** (`compio::runtime::spawn(...).detach()`) and guarded by an
+  `open_tail_probe_inflight` CAS — because it does a `commit_length` on each of
+  the 3 stream tails, which is up to 15 s worst-case (all-replica probe) and
+  must NEVER stall the shared GC/compaction maintenance task;
+- stores the sum ONLY if all 3 `commit_length`s succeed — a partial 3-tail sum
+  (e.g. a briefly-unreachable replica) would misreport, so it keeps the prior
+  value on any error. 0 until the first successful probe.
+**Invariant: the probe must stay off the maintenance task's critical path
+(detached + in-flight-guarded) — a blocking `commit_length` here would gate
+GC/compaction on manager/replica latency.** The sibling `size_bytes` gauge is
+DEAD (no writer — see the field doc); do not confuse it with `open_tail_bytes`.
+
 ## Read Path: Get
 
 ```

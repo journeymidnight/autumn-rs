@@ -1072,7 +1072,27 @@ pub struct PartitionMetrics {
     pub imm_full_count: std::sync::atomic::AtomicU64,
     /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
     /// after each flush + memtable rotate (cheap; under borrow_mut).
+    ///
+    /// NOTE (2026-07-05): currently DEAD — no writer populates it, so the
+    /// `autumn_ps_partition_size_bytes` gauge and the manager's size-based
+    /// split/merge policy see a constant 0. Reviving it (LSM-resident size)
+    /// is tracked separately; F-OVERVIEW-OPENTAIL uses `open_tail_bytes`
+    /// below for the cluster-overview size fix instead (total extent
+    /// footprint, not LSM-resident).
     pub size_bytes: std::sync::atomic::AtomicU64,
+    /// F-OVERVIEW-OPENTAIL: Σ committed bytes on this partition's three
+    /// stream OPEN-tail extents (log + row + meta). Refreshed by the
+    /// maintenance loop's throttled, non-blocking size probe (a detached
+    /// `commit_length` on each of the 3 tails; kept at the prior value on
+    /// any probe error) and shipped via `report_load_loop`. The manager
+    /// adds it to its authoritative sealed-length sum for the cluster
+    /// overview so an all-open-tail partition doesn't render 0 B. 0 until
+    /// the first refresh completes.
+    pub open_tail_bytes: std::sync::atomic::AtomicU64,
+    /// F-OVERVIEW-OPENTAIL: guards against piling up concurrent open-tail
+    /// size probes (each probe is a detached task; CAS false→true to launch,
+    /// reset to false on completion).
+    pub open_tail_probe_inflight: std::sync::atomic::AtomicBool,
     /// F187: aggregated discard bytes on sealed log_stream extents that
     /// the GC loop would target. Refreshed by the GC loop's read-only
     /// prefix (no extra RPCs) and shipped via report_load_loop. Manager
@@ -3165,6 +3185,9 @@ impl PartitionServer {
                             handle.metrics.minor_compact_pending_bytes.load(Relaxed);
                         let sealed_log_extent_count =
                             handle.metrics.sealed_log_extent_count.load(Relaxed);
+                        // F-OVERVIEW-OPENTAIL gauge (refreshed by the
+                        // maintenance loop; 0 until first probe).
+                        let open_tail_bytes = handle.metrics.open_tail_bytes.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
@@ -3184,6 +3207,7 @@ impl PartitionServer {
                             sst_out_of_range_bytes,
                             minor_compact_pending_bytes,
                             sealed_log_extent_count,
+                            open_tail_bytes,
                         }
                     })
                     .collect()

@@ -1038,6 +1038,17 @@ pub struct PartitionLoad {
     /// `extent_ids[..len-1]` (informational; helps OP correlate
     /// `gc_debt_bytes` against the extent population).
     pub sealed_log_extent_count: u32,
+    /// F-OVERVIEW-OPENTAIL: Σ committed bytes on this partition's three
+    /// stream OPEN-TAIL extents (log + row + meta), as the PS knows them
+    /// locally. An open extent's manager-side `sealed_length` is 0, so the
+    /// manager's authoritative sealed-length sum (the cluster-overview
+    /// `live_size`) excludes exactly these bytes — a fully-compacted or
+    /// log-heavy partition whose data lives entirely in open tails renders
+    /// 0 B without this. The manager adds it to its sealed sum:
+    /// `live_size = Σ sealed_length + open_tail_bytes`, matching what
+    /// `autumn-op info --part` gets by probing the EN. Refreshed on the PS
+    /// maintenance loop (throttled, non-blocking); 0 until first refresh.
+    pub open_tail_bytes: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
