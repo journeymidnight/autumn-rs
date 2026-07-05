@@ -1,5 +1,28 @@
 Date: 2026-07-05
 TaskStatus: completed
+Task scope: F-PS-SIZE-BYTES-DEAD — user "fix this" on the dead size_bytes gauge
+  found during F-OVERVIEW-OPENTAIL. `PartitionMetrics.size_bytes` had NO writer
+  (always 0) → Prometheus `autumn_ps_partition_size_bytes` = 0 AND size-based
+  split/merge policy (policy.rs split_size_*/merge_size_low) ran against 0.
+Current summary: semantic = LSM-RESIDENT (Σ SST tables[].len + active + Σ imm
+  memtables — logical data, the field's doc intent + the right split/merge signal;
+  NOT total footprint incl. the transient log WAL tail). Fix:
+  `PartitionData::lsm_resident_bytes()` (lib.rs, local/cheap, no RPC) stored into
+  metrics.size_bytes on the SAME throttled 30 s maintenance tick as the
+  F-OVERVIEW-OPENTAIL open-tail probe (synchronous, no detach). Stale field doc
+  fixed. NO wire change (size_bytes already existed → PS-only restart).
+  DISTINCT from overview live_size: part 17 = 21 MB size_bytes vs 1.5 GB overview.
+  Policy-activation flagged: size-based split/merge now uses real values, but
+  auto-actuates ONLY under an armed split/merge-enabling policy (aggressive
+  preset); the cluster's armed policy is space-reclaim (GC+EC), unaffected.
+Verification: PS builds clean, 0 new clippy. LIVE-VERIFIED after PS restart:
+  `info --part 17 --detail` size_bytes 0 → 21242193 (~20 MB); overview still 1.5 GB.
+Main gaps: NONE.
+Next steps: closed.
+
+============================ prior task history ============================
+Date: 2026-07-05
+TaskStatus: completed
 Task scope: F-OVERVIEW-OPENTAIL — user hit live: `autumn-op info` showed part 17 as
   "0 B  3 ext" while `info --part 17` reported 1.5 GB ("0B，应该是显示不对").
 Current summary: root cause = `compute_cluster_overview_resp` (manager) sums ONLY

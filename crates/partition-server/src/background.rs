@@ -275,6 +275,15 @@ pub(crate) async fn background_maintenance_loop(
             next_size_refresh_at = now + SIZE_REFRESH_INTERVAL;
             let (sc, log_id, row_id, meta_id, metrics) = {
                 let p = part.borrow();
+                // F-PS-SIZE-BYTES-DEAD: revive the size gauge here (local +
+                // cheap, no RPC — unlike open_tail_bytes below). LSM-resident
+                // size (SST + memtable) drives the Prometheus
+                // `autumn_ps_partition_size_bytes` gauge and the manager's
+                // size-based split/merge policy, both of which read a
+                // constant 0 before this.
+                p.metrics
+                    .size_bytes
+                    .store(p.lsm_resident_bytes(), std::sync::atomic::Ordering::Relaxed);
                 (
                     p.stream_client.clone(),
                     p.log_stream_id,

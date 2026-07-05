@@ -1070,15 +1070,15 @@ pub struct PartitionMetrics {
     /// the read path). Swapped → `read_bytes_per_sec`.
     pub read_bytes: std::sync::atomic::AtomicU64,
     pub imm_full_count: std::sync::atomic::AtomicU64,
-    /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
-    /// after each flush + memtable rotate (cheap; under borrow_mut).
-    ///
-    /// NOTE (2026-07-05): currently DEAD — no writer populates it, so the
-    /// `autumn_ps_partition_size_bytes` gauge and the manager's size-based
-    /// split/merge policy see a constant 0. Reviving it (LSM-resident size)
-    /// is tracked separately; F-OVERVIEW-OPENTAIL uses `open_tail_bytes`
-    /// below for the cluster-overview size fix instead (total extent
-    /// footprint, not LSM-resident).
+    /// LSM-resident bytes: Σ SST `tables[].len` + active memtable + Σ imm
+    /// memtables (`PartitionData::lsm_resident_bytes`). Refreshed on the
+    /// maintenance loop's throttled tick (F-PS-SIZE-BYTES-DEAD, 2026-07-05 —
+    /// was previously DEAD with no writer, so this gauge + the manager's
+    /// size-based split/merge policy read a constant 0). This is the LOGICAL
+    /// data size, NOT the total extent footprint — the cluster-overview
+    /// size uses `open_tail_bytes` + the manager's sealed sum instead
+    /// (F-OVERVIEW-OPENTAIL). Drives the `autumn_ps_partition_size_bytes`
+    /// Prometheus gauge and `policy.rs` split_size_*/merge_size_low.
     pub size_bytes: std::sync::atomic::AtomicU64,
     /// F-OVERVIEW-OPENTAIL: Σ committed bytes on this partition's three
     /// stream OPEN-tail extents (log + row + meta). Refreshed by the
@@ -1150,6 +1150,22 @@ impl PartitionData {
             .entry(eid)
             .or_insert_with(|| std::rc::Rc::new(std::sync::atomic::AtomicI64::new(0)))
             .clone()
+    }
+
+    /// F-PS-SIZE-BYTES-DEAD: LSM-resident data size of this partition —
+    /// Σ SST bytes on row_stream (`tables[].len`) + the active memtable +
+    /// every frozen imm memtable. This is the "how much data does this
+    /// partition hold" measure the size gauge / size-based split-merge
+    /// policy want: the LOGICAL LSM footprint, NOT the total extent
+    /// footprint (which would include the transient log-stream WAL tail that
+    /// GC reclaims — a partition shouldn't be split just because its log tail
+    /// is momentarily large). Cheap + fully local (a borrow + arithmetic, no
+    /// RPC). Lives on the same struct as the fields so it can read the
+    /// module-private memtable `mem_bytes`.
+    pub(crate) fn lsm_resident_bytes(&self) -> u64 {
+        let sst: u64 = self.tables.iter().map(|t| t.len).sum();
+        let imm: u64 = self.imm.iter().map(|m| m.mem_bytes()).sum();
+        sst.saturating_add(self.active.mem_bytes()).saturating_add(imm)
     }
 }
 
