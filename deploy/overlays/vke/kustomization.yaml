@@ -108,6 +108,13 @@ patches:
       - op: add
         path: /data/AUTUMN_EXTENT_SHARDS
         value: "4"
+      # Arm the embedded dashboard's mutations (action buttons + auto-policy
+      # controller leaving DryRun). Safe because the dashboard is exposed ONLY
+      # via internal ClusterIP (autumn-dashboard) — no internet path; reaching
+      # it requires kubectl port-forward access.
+      - op: add
+        path: /data/AUTUMN_DASHBOARD_ALLOW_MUTATIONS
+        value: "1"
   # etcd wants network-durable storage. The base omits storageClassName to inherit
   # the cluster default, but this cluster marks no default — name Volcengine's EBS
   # class explicitly. EBS ESSD has a 20Gi minimum (base 1Gi → InvalidVolumeSize).
