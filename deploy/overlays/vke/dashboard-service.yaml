@@ -1,0 +1,19 @@
+# Internal-only access to the manager's embedded web dashboard (F-DASH-IN-MGR).
+# ClusterIP = reachable in-cluster / via `kubectl port-forward`, NEVER from the
+# internet (no NodePort/LoadBalancer). Selector matches the manager; readiness
+# is leader-gated so this routes to the LEADER (where the dashboard runs).
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-dashboard
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: manager
+  ports:
+    - { name: dashboard, port: 8799, targetPort: 8799 }

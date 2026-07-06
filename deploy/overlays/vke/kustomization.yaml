@@ -13,11 +13,12 @@ kind: Kustomization
 resources:
   - ../../k8s                  # the generic base (deploy/k8s)
   - en-extra-services.yaml     # per-pod Services for EN ordinals 3 and 4
+  - dashboard-service.yaml       # internal-only dashboard access (ClusterIP)
 
 images:
   - name: autumn-rs
     newName: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs
-    newTag: 82d759c6fb1f3559d1d48ea3454ae4c2dfb2f8ad
+    newTag: f824066447d07a5d9b26b7968f156d2b2878738b
   # This cluster's nodes reach the daocloud mirror, not quay.io directly.
   - name: quay.io/coreos/etcd
     newName: quay.m.daocloud.io/coreos/etcd
