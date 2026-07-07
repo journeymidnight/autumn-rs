@@ -1,0 +1,39 @@
+# Hermes agent + autumn memory provider image.
+# Build context = autumn-rs REPO ROOT (needs the Rust workspace for the wheel).
+#   docker build -f examples/hermes-autumn-memory/docker/Dockerfile.hermes \
+#     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
+#     -t <cr>/hermes-autumn:<tag> .
+#
+# TODO(you): pin the exact hermes-agent install (repo tag / pip spec). The
+# MemoryProvider ABC drifts across versions — validate hermes_provider.py hooks
+# against the version you pin here.
+FROM python:3.11-slim
+
+ARG CARGO_MIRROR=
+ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl git build-essential pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+ && pip install --no-cache-dir "maturin>=1,<2"
+
+WORKDIR /src
+COPY . .
+RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
+      printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" >> "$CARGO_HOME/config.toml"; fi
+
+# native autumn client (Client used by the memory glue)
+RUN cd python && maturin build --release --interpreter python3 \
+ && pip install --no-cache-dir target/wheels/autumn-*.whl
+
+# the Hermes agent framework — PIN a version.
+RUN pip install --no-cache-dir "hermes-agent"   # TODO: pin: git+https://github.com/NousResearch/hermes-agent@<tag>
+
+# install our memory provider as the Hermes plugin `autumn`
+RUN mkdir -p "$HERMES_HOME/plugins/autumn" \
+ && cp examples/hermes-autumn-memory/autumn_mem.py examples/hermes-autumn-memory/hermes_provider.py "$HERMES_HOME/plugins/autumn/" \
+ && printf 'from .hermes_provider import AutumnMemoryProvider\n' > "$HERMES_HOME/plugins/autumn/__init__.py"
+
+# TODO(you): the container CMD depends on how you launch hermes-agent
+# (CLI entrypoint / your agent script). Left unset on purpose.

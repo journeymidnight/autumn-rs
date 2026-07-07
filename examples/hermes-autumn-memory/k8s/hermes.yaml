@@ -1,0 +1,29 @@
+# Hermes agent with the autumn MemoryProvider plugin. In the `autumn` namespace
+# so it can dial the manager (memory) + vLLM (inference) internally.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: hermes-agent, namespace: autumn, labels: { app: hermes-agent } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: hermes-agent } }
+  template:
+    metadata: { labels: { app: hermes-agent } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: hermes
+          image: <CR>/hermes-autumn:<tag>     # built from Dockerfile.hermes
+          command: ["bash","-lc"]
+          args:
+            - |
+              # autumn client is IP-only — resolve the manager ClusterIP for memory.
+              export AUTUMN_MEMORY_MANAGER="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              # LLM backend = the vLLM service (OpenAI-compatible).
+              export OPENAI_BASE_URL="http://vllm:8000/v1"
+              export OPENAI_API_KEY="dummy"
+              # TODO(you): launch hermes-agent with the `autumn` plugin enabled.
+              # e.g.  hermes run --model hermes-70b --plugins autumn
+              echo "set AUTUMN_MEMORY_MANAGER=$AUTUMN_MEMORY_MANAGER, vLLM=$OPENAI_BASE_URL"
+              exec sleep infinity   # replace with the real agent launch command
+          env:
+            - { name: AUTUMN_MEMORY_TENANT, value: "default" }

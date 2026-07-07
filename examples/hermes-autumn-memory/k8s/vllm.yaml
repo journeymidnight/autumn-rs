@@ -1,0 +1,89 @@
+# vLLM (32B AWQ, SINGLE GPU, no tensor-parallel) + autumn-kvcache KV offload.
+# Runs in the `autumn` namespace so it can dial the manager/PS pod IPs directly.
+# Fill in <...> placeholders (image tag, HF repo/token) before applying.
+#
+# Single-card: fits a ~32B model in 4-bit AWQ on one A30 (24 GB): ~16 GB weights
+# + ~8 GB KV → no TP, no NCCL, no /dev/shm, no RDMA. Good concurrency for an agent.
+#   - Largest single-card: a 32B-AWQ (Qwen2.5-32B-Instruct-AWQ, etc.).
+#   - For an ACTUAL Hermes model on one card, use Hermes-3-Llama-3.1-8B in BF16
+#     (~16 GB, no quant) — swap `--quantization` out and point at the BF16 repo.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: model-weights, namespace: autumn }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ebs-ssd            # network-durable; weights survive pod moves
+  resources: { requests: { storage: 60Gi } }   # 32B-AWQ ≈ 18GB + margin
+---
+# One-shot: download the weights into the PVC (skip if already present).
+apiVersion: batch/v1
+kind: Job
+metadata: { name: fetch-weights, namespace: autumn }
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: fetch
+          image: python:3.11-slim
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -e
+              test -f /models/llm/config.json && { echo "already present"; exit 0; }
+              pip install -q "huggingface_hub[cli]"
+              huggingface-cli download <HF_AWQ_REPO> \
+                --local-dir /models/llm --local-dir-use-symlinks False
+          env:
+            - { name: HF_TOKEN, value: "<HF_TOKEN_OR_USE_SECRET>" }   # or valueFrom secretKeyRef
+            - { name: HF_ENDPOINT, value: "https://hf-mirror.com" }   # China mirror; drop if not needed
+          volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+        - { name: models, persistentVolumeClaim: { claimName: model-weights } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: vllm, namespace: autumn, labels: { app: vllm } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: vllm } }
+  template:
+    metadata: { labels: { app: vllm } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: <CR>/vllm-autumn-kvcache:<tag>   # built from Dockerfile.vllm-kvcache
+          command: ["bash","-lc"]
+          args:
+            - |
+              # autumn's Rust client is IP-only (no DNS) — resolve the manager ClusterIP.
+              M=$(getent hosts autumn-manager | awk '{print $1}')
+              KVCFG='{"kv_connector":"AutumnKVConnector",
+                      "kv_connector_module_path":"autumn_kvcache.vllm_connector",
+                      "kv_role":"kv_both",
+                      "kv_connector_extra_config":{"endpoint":"'$M':9001","transport":"tcp"}}'
+              exec vllm serve /models/llm \
+                --served-model-name hermes \
+                --quantization awq_marlin \
+                --gpu-memory-utilization 0.90 \
+                --max-model-len 16384 \
+                --port 8000 \
+                --kv-transfer-config "$KVCFG"
+          ports: [{ name: http, containerPort: 8000 }]
+          resources:
+            limits: { nvidia.com/gpu: 1 }     # single card — any GPU node with 1 free A30
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+      volumes:
+        - { name: models, persistentVolumeClaim: { claimName: model-weights } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: vllm, namespace: autumn }
+spec:
+  type: ClusterIP           # internal; front with the hermes agent, not the internet
+  selector: { app: vllm }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
