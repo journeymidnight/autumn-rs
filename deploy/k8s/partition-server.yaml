@@ -64,9 +64,11 @@ spec:
                   fieldPath: status.podIP
           ports:
             - { name: rpc, containerPort: 9301 }
-          readinessProbe:
-            tcpSocket: { port: 9301 }
-            initialDelaySeconds: 8
-            periodSeconds: 5
+          # No readiness probe: F099-K gives each partition its OWN listener
+          # (base_port+ord); a fixed :9301 probe only passes on the PS that
+          # happens to own the base-port partition, so healthy PSes read 0/1
+          # and StatefulSet rollouts never complete. Clients route via the
+          # manager's per-partition part_addrs, not this port — so a probe here
+          # is both wrong and unnecessary.
           resources:
             requests: { cpu: "2", memory: "2Gi" }

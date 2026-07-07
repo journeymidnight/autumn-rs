@@ -1801,6 +1801,43 @@ struct PartitionHandle {
     /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
+    /// F099-K — the port ordinal this partition holds (`port = base_port +
+    /// port_ord`). Freed from the server's `used_port_ords` on drop so a later
+    /// `open_partition` REUSES it (scan-from-base_port+1 allocation).
+    port_ord: u16,
+    /// Clone of `PartitionServer.used_port_ords` so `Drop` can release
+    /// `port_ord` regardless of which path removed this handle.
+    used_port_ords: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+}
+
+impl Drop for PartitionHandle {
+    fn drop(&mut self) {
+        // F099-K: release the port ordinal so a later open reuses it.
+        self.used_port_ords.borrow_mut().remove(&self.port_ord);
+    }
+}
+
+/// F099-K — RAII for the eagerly-reserved port ordinal. If `open_partition`
+/// fails before the `PartitionHandle` (which then owns the free-on-drop) is
+/// built, this frees the ord — otherwise a repeatedly-failing open (BUG #3
+/// reopen-thrash) would leak ords the scan-from-base+1 allocator never reuses.
+/// `commit()` disarms it once the handle takes ownership.
+struct OrdReservation {
+    set: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+    ord: u16,
+    committed: bool,
+}
+impl OrdReservation {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for OrdReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.set.borrow_mut().remove(&self.ord);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,16 +1860,17 @@ pub struct PartitionServer {
     /// clients stayed unroutable for 20+ minutes (manager-HA chaos H1).
     current_mgr: Rc<Cell<usize>>,
     pool: Rc<ConnPool>,
-    /// F099-K — base TCP port. The first partition opened binds
-    /// `base_port + 1`; subsequent partitions bind `base_port + 2`,
-    /// `base_port + 3`, ... (monotonically increasing, tracked via
-    /// `next_port_ord`).
+    /// F099-K — base TCP port. A partition binds `base_port + ord` where
+    /// `ord` is the LOWEST FREE ordinal ≥ 1 (so the first open binds
+    /// `base_port + 1`).
     base_port: Cell<u16>,
-    /// F099-K — monotonic port-ordinal counter, bumped once per
-    /// `open_partition` call. Partitions keep their assigned port
-    /// across region-sync cycles as long as the `PartitionHandle` is
-    /// alive; a port is never reused by a different partition.
-    next_port_ord: Rc<Cell<u16>>,
+    /// F099-K — ordinals currently in use (port = `base_port + ord`).
+    /// `open_partition` picks the LOWEST FREE ord ≥ 1; `PartitionHandle::drop`
+    /// frees it on close so ords are REUSED. Pre-fix this was a monotonic
+    /// counter, which (a) left `base_port + 1` permanently unbound once its
+    /// first partition churned away, and (b) could exhaust the u16 ord space
+    /// on a long-lived, churny PS.
+    used_port_ords: Rc<RefCell<std::collections::BTreeSet<u16>>>,
     /// F099-K — host component for the per-partition advertise
     /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
     /// is not parseable as `host:port`.
@@ -2759,7 +2797,7 @@ impl PartitionServer {
                             // `bind_listen_addr` (called from
                             // `serve()` or `connect_with_advertise_and_port`).
                             base_port: Cell::new(0),
-                            next_port_ord: Rc::new(Cell::new(0)),
+                            used_port_ords: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
                             advertise_host: Rc::new(std::cell::RefCell::new(String::from(
                                 "127.0.0.1",
                             ))),
@@ -3567,7 +3605,7 @@ impl PartitionServer {
     /// Spawn a dedicated OS thread with its own compio runtime for this partition.
     ///
     /// F099-K: the partition thread BINDS its own TcpListener on a unique
-    /// port (`base_port + next_port_ord`) and runs an accept loop on its
+    /// port (`base_port + ord`, lowest free ord) and runs an accept loop on its
     /// own compio runtime, so there is no cross-thread fd handoff. Once
     /// the listener is bound, the partition thread registers its address
     /// with the manager via `MSG_REGISTER_PARTITION_ADDR`, which is then
@@ -3641,15 +3679,26 @@ impl PartitionServer {
             )));
         let opened_with_for_thread = opened_with.clone();
 
-        // F099-K port allocation: reserve the next ordinal eagerly so a
-        // later `open_partition` never collides with this one even if the
-        // actual `bind` below is delayed by the worker thread startup.
-        let ord = self
-            .next_port_ord
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("exhausted partition port ordinal space (u16 overflow)"))?;
-        self.next_port_ord.set(ord);
+        // F099-K port allocation: pick the LOWEST FREE ordinal ≥ 1 (scan from
+        // base_port+1), reusing ords freed by closed partitions
+        // (`PartitionHandle::drop`). Reserve it eagerly (insert now) so a later
+        // `open_partition` never collides with this one even if the actual
+        // `bind` below is delayed by the worker thread startup.
+        let ord = {
+            let mut used = self.used_port_ords.borrow_mut();
+            let ord = (1u16..=u16::MAX)
+                .find(|o| !used.contains(o))
+                .ok_or_else(|| anyhow!("no free partition port ordinal (all 65535 in use)"))?;
+            used.insert(ord);
+            ord
+        };
+        // Free the reserved ord if we bail out before the PartitionHandle
+        // (which owns the free-on-drop) is built.
+        let ord_reservation = OrdReservation {
+            set: self.used_port_ords.clone(),
+            ord,
+            committed: false,
+        };
         // ord is 1-based; cpu pool indexing is 0-based. F122-fix: P-log and
         // P-bulk now pin to different cores — at sustained 4 KB write loads
         // P-bulk's `build_sst_bytes` is CPU-heavy enough to fight P-log for
@@ -3785,6 +3834,8 @@ impl PartitionServer {
             }
         };
 
+        // Handle takes ownership of the ord's free-on-drop; disarm the guard.
+        ord_reservation.commit();
         Ok(PartitionHandle {
             shutdown_tx: Some(shutdown_tx),
             drain_tx: Some(drain_tx),
@@ -3796,6 +3847,8 @@ impl PartitionServer {
             gc_trigger: gc_tx_main,
             opened_with,
             join: Some(join),
+            port_ord: ord,
+            used_port_ords: self.used_port_ords.clone(),
         })
     }
 
