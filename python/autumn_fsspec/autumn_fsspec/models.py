@@ -10,8 +10,9 @@ paths to serve a model that lives in autumn are:
      full local speed. ``materialize()`` below.
   2. **FUSE mount** (``autumn-fuse``) + force the loader's *eager* read
      strategy to dodge the mmap-over-FUSE page-fault penalty. (docs recipe.)
-  3. **Custom vLLM loader** streaming via autumn's zero-copy ``get_into`` — the
-     high-throughput path; prototype in ``vllm_loader.py``.
+  3. **Custom vLLM loader** streaming weights straight from autumn — the
+     high-throughput path; shipped + vLLM-verified as the separate
+     ``autumn_vllm_loader`` package (``--load-format autumn``).
 
 These helpers cover (1) plus a ``load_safetensors`` escape hatch for reading a
 state_dict straight from autumn without any mount.

@@ -17,9 +17,9 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
      speed, zero engine code. `autumn_fsspec.materialize()`.
   2. **FUSE mount + force the loader's *eager* read** — zero copy-out, but you
      MUST avoid the default mmap-over-FUSE path (30–50× slower).
-  3. **Custom vLLM/SGLang streaming loader over autumn's zero-copy `get_into`**
+  3. **Custom vLLM/SGLang streaming loader over autumn's zero-copy `read_into`**
      — highest cold-load throughput; plays to autumn's RDMA/UCX strength.
-     Prototype: `autumn_fsspec.vllm_loader`.
+     Shipped + verified: the `autumn_vllm_loader` package (`--load-format autumn`).
 
 ## Why model load is slow, and how fast loaders win
 
@@ -101,22 +101,26 @@ integration is reported "slow without GDS installed"; benchmark before relying
 on it. **True GDS DMA needs a GDS-native FS (local NVMe / NFSoRDMA / Lustre /
 Weka), not generic FUSE.**
 
-## Recipe C — custom streaming loader (highest throughput; prototype)
+## Recipe C — custom streaming loader (highest throughput; shipped + verified)
 
-Register an out-of-tree vLLM loader whose `BaseModelLoader` reads safetensors
-shards via autumn's zero-copy `get_into` into pinned host buffers, overlapping
-the read with the H2D copy — the Run:ai-streamer pipeline on autumn's transport.
-One implementation serves both vLLM and SGLang (shared loader registry).
+The **`autumn_vllm_loader`** package registers an out-of-tree vLLM loader
+(`@register_model_loader("autumn")`) whose `load_weights` reads safetensors
+shards straight from autumn via the zero-copy `Fs.read_into` seam (+ batched EN
+direct-read), K parallel readers feeding `model.load_weights(...)` — the
+Run:ai-streamer pipeline on autumn's transport. config.json + tokenizer stay on
+vLLM's local `model=` path (the weights-from-a-streaming-backend split, like
+runai_streamer/tensorizer). One implementation serves both vLLM and SGLang
+(shared loader registry).
 
-`autumn_fsspec/vllm_loader.py` implements the **storage-read half** (safetensors
-header parse + per-tensor ranged fetch via `iter_tensors`, offline-tested) and
-sketches the vLLM `register_model_loader` seam. **Status: prototype — the
-torch/GPU/vLLM wiring is unverified here (no GPU in the dev env); validate on a
-GPU box before use.**
+**Verified end-to-end** (vLLM 0.24, 8×H200): loads `gte-Qwen2-1.5B` from autumn,
+embedding **byte-exact vs the default local-disk loader**; over RDMA reaches
+~82% of Run:ai Model Streamer's local-page-cache throughput (F-REDIRECT-BATCH).
+Package: `python/autumn_vllm_loader/` (+ `tests/run_vllm_e2e.sh`).
 
 ```bash
-vllm serve autumn://models/llama-3-8b --load-format autumn \
-    --model-loader-extra-config '{"manager":"mgr:9001"}'
+pip install -e python/autumn_vllm_loader   # env needs the `autumn` SDK + torch + vllm
+vllm serve /path/to/model_dir --load-format autumn \
+    --model-loader-extra-config '{"manager":"mgr:9001","path":"models/llama-3-8b","transport":"ucx","direct_read":true}'
 ```
 
 The alternative zero-engine-code fast path is an **S3-compatible gateway** in

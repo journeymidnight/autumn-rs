@@ -85,9 +85,9 @@ sd = af.load_safetensors("models/llama-3-8b/model-00001-of-00002.safetensors",
                          manager="127.0.0.1:9001")
 ```
 
-`autumn_fsspec.vllm_loader` sketches Path C — a custom vLLM `--load-format
-autumn` streaming loader over autumn's zero-copy reads (prototype; validate on
-a GPU box).
+Path C — a custom vLLM `--load-format autumn` streaming loader over autumn's
+zero-copy reads — ships as the separate **`autumn_vllm_loader`** package,
+verified end-to-end on GPU (byte-exact vs the default loader).
 
 ## Install & test
 
@@ -98,7 +98,6 @@ pip install -e python/autumn_fsspec[datasets]
 # offline (no cluster — a Python inode tree, FakeFs, backs the same facade code):
 python -m pytest python/autumn_fsspec/tests/test_fs_offline.py \
                  python/autumn_fsspec/tests/test_datasets_offline.py \
-                 python/autumn_fsspec/tests/test_vllm_loader_offline.py \
                  python/autumn_fsspec/tests/test_models_offline.py -q
 
 # live (self-contained — boots an isolated cluster, builds the wheel, runs the

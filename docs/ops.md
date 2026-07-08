@@ -201,8 +201,9 @@ connect with `wire-version mismatch` (rebuild: `cd python && maturin build
 # path; full FS surface + HuggingFace datasets + models upload/materialize:
 cd python/autumn_fsspec
 python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py \
-                 tests/test_vllm_loader_offline.py tests/test_models_offline.py -q
-#   → 28 passed
+                 tests/test_models_offline.py -q
+#   (the vLLM loader is now the separate autumn_vllm_loader package — see
+#    docs/model_loading.md Recipe C + python/autumn_vllm_loader/tests/)
 
 # Live — self-contained (boots an isolated memory-mode cluster, builds the
 # wheel, runs the live suite against the autumn.Fs backing, tears down):
