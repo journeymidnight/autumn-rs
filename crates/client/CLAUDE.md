@@ -77,6 +77,26 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
     `read_len ≥ 64 KiB`; else `MSG_GET` + memcpy. NO `concurrency`
     arg — sensible internal default applied.
   Result `i` matches `items[i]`. Each `dest` MUST outlive the call.
+- `get_many_direct(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` —
+  **F-DIRECT-MANY: the EN-DIRECT batch read.** Same dest-based shape as
+  `get_many_into`, but each item whose requested length is ≥ 64 KiB is read
+  STRAIGHT from an extent node (`MSG_GET_REDIRECT` descriptor →
+  `read_extent_value_direct`), taking the PS off the large-value DATA path (a
+  cross-host throughput win — the PS NIC egress leaves the read path). Sub-64 KiB
+  items stay on the plain proxy `get_range` path, so MIXED-SIZE batches route per
+  item. Per item, ANY direct-read failure falls back to the proxy — so it
+  degrades gracefully where ENs aren't client-reachable (one redirect RTT +
+  fallback). Because that reachability is TOPOLOGY-dependent, the DECISION to
+  call this vs `get_many_into` is a deploy flag OWNED BY THE FRONTEND (fuse
+  `--direct-read`, python `BatchClient(direct=…)` / `autumn.Fs.connect(direct_read=…)`),
+  NEVER a hardcoded SDK default. Shares the replica-failover loop with
+  `get_direct` (`read_redirect_replicas`). One extra copy vs `get_many_into`'s
+  recv-into-`dest`: the direct read lands in a read_loop pooled buffer
+  (`call_into_pooled`) then memcpys into `dest` — the pooled recv (not
+  `call_into_dest`) is deliberate, because the direct read carries a 3 s timeout
+  + replica failover that `call_into_dest`'s cancel-safety contract forbids. The
+  copy is the price of failover-safety on the bypass path. Each `dest` MUST
+  outlive the call.
 - `delete_many(keys: &[&[u8]]) → Vec<Result<()>>` /
   `head_many(keys: &[&[u8]]) → Vec<Result<KeyMeta>>` — **F237 batched
   delete / metadata.** Client-side fan-out (no server `MSG_BATCH_*`),

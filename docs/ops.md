@@ -154,6 +154,39 @@ loopback chaos harnesses set it themselves). Explicit env always wins.
 `/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
 nodes, separate from the storage StatefulSets.
 
+### `--direct-read` — bypass the PS for large reads (F-DIRECT-MANY)
+
+Add `--direct-read` to the mount to make whole-extent reads (≥ 64 KiB) read
+STRAIGHT from an extent node instead of proxying through the PS — a cross-host
+throughput win for large-file / model serving (the PS NIC egress leaves the read
+path). **Topology-dependent, default OFF**: the fuse host must be able to reach
+EN *data* ports, which a hardened deploy often keeps on a PS-only subnet. It is
+SAFE to enable even if some ENs are unreachable — every read falls back to the
+PS proxy (one redirect RTT + fallback per extent), so correctness never depends
+on it.
+
+```bash
+nohup ./target/release/autumn-fuse \
+    --manager 127.0.0.1:9001 --mountpoint "$MP" --transport tcp \
+    --direct-read \
+    > /tmp/autumn-fuse.log 2>&1 &
+sleep 1; mountpoint -q "$MP" && echo mounted   # log prints "direct-read enabled ..."
+
+# Byte-identical vs proxy: write a >64 KiB file, read it back, diff.
+head -c 5242880 /dev/urandom > /tmp/blob            # 5 MiB (multi-extent)
+cp /tmp/blob "$MP"/blob
+cmp /tmp/blob "$MP"/blob && echo "direct-read OK: byte-identical"
+```
+
+Verify the bypass actually engaged: with `--direct-read` a large read shows
+`autumn_ps_read_bytes` on the PS staying flat (the value bytes don't traverse
+the PS) while the EN's `MSG_READ_BYTES` traffic rises; without it the PS
+read-bytes counter tracks the read. Same flags exist for the other two
+frontends: python `BatchClient(manager, direct=True)` and the fsspec facade
+`AutumnFileSystem(manager=..., direct_read=True)` (→ `autumn.Fs.connect(...,
+direct_read=True)`). Mixed-size batches route per item — sub-64 KiB values still
+go through the PS.
+
 ## Python fsspec (`autumn://`) verification
 
 `python/autumn_fsspec` is a thin fsspec facade over `autumn.Fs` — the **shared

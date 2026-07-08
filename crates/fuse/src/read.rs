@@ -43,6 +43,10 @@ pub struct ReadPlan {
     pub actual_size: usize,
     pub client: Rc<ClusterClient>,
     pub chunks: Vec<ChunkSpec>,
+    /// F-DIRECT-MANY — captured from `FsState.direct_read` at `prepare` time
+    /// (the spawned `execute` holds no `&FsState`). `true` → the batch read
+    /// bypasses the PS via `get_many_direct`; `false` → PS-proxied `get_many_into`.
+    pub direct_read: bool,
 }
 
 /// One extent slice to fetch: a KV key + the in-extent sub-range
@@ -84,6 +88,7 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
             inline_result: Some(Vec::new()),
             actual_size: 0,
             client: state.client.clone(),
+            direct_read: state.direct_read,
             chunks: Vec::new(),
         });
     }
@@ -104,6 +109,7 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
             inline_result: Some(inline),
             actual_size,
             client: state.client.clone(),
+            direct_read: state.direct_read,
             chunks: Vec::new(),
         });
     }
@@ -132,18 +138,22 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
         inline_result: None,
         actual_size,
         client: state.client.clone(),
+        direct_read: state.direct_read,
         chunks,
     })
 }
 
-/// Phase 2: spawned task — one batched `get_many_into` over all extent slices.
+/// Phase 2: spawned task — one batched read over all extent slices, via
+/// `get_many_into` (PS-proxied ZC, default) or `get_many_direct` (EN-direct,
+/// when the mount's `--direct-read` set `plan.direct_read`).
 ///
 /// Pre-allocates the zero-filled result sized to the WHOLE read span and gives
 /// each extent slice its OWN disjoint `&mut` sub-slice at its absolute
 /// `dest_offset` (gaps between extents are skipped → stay zero, sparse-file
-/// semantics). `get_many_into` writes each successful extent straight into its
-/// slice (ZC for ≥ 64 KiB whole-extent reads); a missing/short extent leaves
-/// zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
+/// semantics). The batch primitive writes each successful extent into its slice
+/// (`get_many_into`: ZC recv-into-dest for ≥ 64 KiB; `get_many_direct`: EN
+/// direct read → copy, per-item PS-proxy fallback); a missing/short extent
+/// leaves zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
 pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     if let Some(inline) = plan.inline_result {
         return Ok(inline);
@@ -178,7 +188,16 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
             dest,
         })
         .collect();
-    let results = client.get_many_into(&mut items).await;
+    // F-DIRECT-MANY: `direct_read` (mount `--direct-read`) sends the ≥ 64 KiB
+    // whole-extent gets STRAIGHT to an EN (`get_many_direct`), bypassing the PS
+    // on the data path; each item falls back to the PS proxy on any direct-read
+    // failure, so it's safe even if some ENs are unreachable. Default OFF ⇒ the
+    // PS-proxied ZC path (`get_many_into`).
+    let results = if plan.direct_read {
+        client.get_many_direct(&mut items).await
+    } else {
+        client.get_many_into(&mut items).await
+    };
     drop(items); // release the &mut borrows of `result`
 
     // Propagate a hard RPC/routing failure (pre-F244 surfaced this at

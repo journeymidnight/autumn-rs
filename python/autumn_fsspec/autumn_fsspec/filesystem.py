@@ -71,12 +71,17 @@ class AutumnFileSystem(AbstractFileSystem):
         transport=None,
         host=None,
         chunk_size=DEFAULT_BLOCK_SIZE,
+        direct_read=False,
         _fs=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.root = (root or "").strip("/")
         self.block_size = int(chunk_size)
+        # F-DIRECT-MANY: opt-in EN direct-read for large-value reads
+        # (bypasses the PS on the data path). Topology-dependent — enable
+        # only when this host can reach EN data ports; default False.
+        self.direct_read = bool(direct_read)
 
         if _fs is not None:
             self._fs = _fs  # injected backend (FakeFs offline / advanced embedding)
@@ -97,7 +102,7 @@ class AutumnFileSystem(AbstractFileSystem):
                 import warnings
 
                 warnings.warn(f"autumn.set_transport({transport!r}) failed: {e!r}")
-        self._fs = autumn.Fs.connect(self.manager, host=host)
+        self._fs = autumn.Fs.connect(self.manager, host=host, direct_read=self.direct_read)
 
     # ── path handling ──────────────────────────────────────────────────────
 

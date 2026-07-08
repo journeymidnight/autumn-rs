@@ -603,11 +603,27 @@ failure. Invariants:
   handle_get_redirect falls back to `handle_get`.
 - Short reads under CODE_OK are FAILURES in `read_extent_value_direct`
   (same "got < need" rule as `read_value_from_log`).
-- Sub-range reads, inline values, small VPs: inline in the response
-  (`extent_id == 0`); `get_value` (non-redirect callers) never yields
-  `GetOutcome::Redirect`.
+- Inline values, small VPs: inline in the response (`extent_id == 0`);
+  `get_value` (non-redirect callers) never yields `GetOutcome::Redirect`.
 Loopback perf: latency win only (TCP 8M read p50 145→46ms, UCX 137→15ms);
 the throughput win is cross-host where PS NIC egress leaves the data path.
+
+**F-DIRECT-MANY — sub-range redirect (batched direct-read).** `get_value_inner`'s
+redirect was whole-value-only (`req.offset==0 && req.length==0`). A batched
+reader like fuse's `read::execute` requests explicit sub-ranges of each extent
+value (F247 whole-extent reads carry `length = extent_len`), so it NEVER
+redirected — every large read proxied through the PS. Now redirect fires for any
+VP sub-range whose CLAMPED requested length `r_len = (req.length==0 ? vp.len-r_off
+: min(req.length, vp.len-r_off))` is ≥ 64 KiB, returning `value_offset =
+vp.offset + req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
+`r_off==0, r_len==vp.len` special case → byte-identical. Sub-ranges past the value
+end (`req.offset > vp.len`) and sub-64 KiB requests fall through to the inline
+`resolve_value` proxy UNCHANGED (the inline response already carries the resolved
+sub-range bytes, so the client copies them straight in). The `_vp_pin` drops at
+return exactly as the whole-value path — a GC punch in the window becomes a failed
+EN read → client proxy fallback. Client side: `ClusterClient::get_many_direct`
+(the batch mirror; see client CLAUDE.md). NO wire-struct change (handler logic
+only) → no WIRE bump.
 
 ### F216-E — UCX end-to-end zero-copy read (MSG_GET_ZC)
 

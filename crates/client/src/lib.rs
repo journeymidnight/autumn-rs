@@ -1765,75 +1765,204 @@ impl ClusterClient {
         if resp.extent_id == 0 {
             return Ok(Some(bytes::Bytes::from(resp.value)));
         }
-        let n = resp.replica_addrs.len();
-        if n > 0 {
-            let start =
-                (resp.extent_id ^ (resp.value_offset as u64) << 32) as usize % n;
-            let mut saw_timeout = false;
-            for i in 0..n {
-                let addr = &resp.replica_addrs[(start + i) % n];
-                match autumn_stream::read_extent_value_direct(
-                    &self.en_pool,
-                    addr,
-                    resp.extent_id,
-                    resp.eversion,
-                    resp.value_offset,
-                    resp.value_len,
-                )
-                .await
-                {
-                    Ok(v) => return Ok(Some(v)),
-                    Err(e) => {
-                        // A TIMEOUT is a liveness anomaly (dead endpoint /
-                        // stuck peer) that silently costs the op the full RPC
-                        // deadline — surface it at warn (the 2026-07-03 UCX
-                        // dead-ep stalls were invisible precisely because this
-                        // arm was debug-only). Expected failover causes
-                        // (eversion bumped, extent GC'd, fast connect refusal)
-                        // stay at debug so routine EC/GC churn stays quiet.
-                        // "timed out" matches conn_pool's timeout message.
-                        let msg = format!("{e:#}");
-                        if msg.contains("timed out") {
-                            saw_timeout = true;
-                            tracing::warn!(
-                                extent_id = resp.extent_id,
-                                addr = %addr,
-                                error = %msg,
-                                "F259 direct read TIMED OUT; trying next replica"
-                            );
-                        } else {
-                            tracing::debug!(
-                                extent_id = resp.extent_id,
-                                addr = %addr,
-                                error = %msg,
-                                "F259 direct read failed; trying next replica"
-                            );
-                        }
-                    }
-                }
-            }
-            // Fell out of the loop: every replica failed. The proxy fallback
-            // below hides that from the caller — leave a trace. Warn only when
-            // a liveness anomaly (timeout) was involved; an all-expected-errors
-            // sweep (eversion bump / EC conversion touching every replica) is
-            // routine and stays at debug (coco P3).
-            if saw_timeout {
-                tracing::warn!(
-                    extent_id = resp.extent_id,
-                    replicas = n,
-                    "F259 direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
-                );
-            } else {
-                tracing::debug!(
-                    extent_id = resp.extent_id,
-                    replicas = n,
-                    "F259 direct read failed on ALL replicas; falling back to PS proxy"
-                );
-            }
+        if let Some(v) = self.read_redirect_replicas(&resp).await {
+            return Ok(Some(v));
         }
         // All replicas failed → proxy fallback re-resolves through the PS
         // (fresh VP after GC rewrite / fresh eversion after EC conversion).
         Ok(self.get(key).await?.map(bytes::Bytes::from))
+    }
+
+    /// Shared EN-direct-read replica loop for `MSG_GET_REDIRECT` descriptors
+    /// (F259 `get_direct` + F-DIRECT-MANY `get_many_direct`). Reads the exact
+    /// byte range `[resp.value_offset, +resp.value_len)` from a replica, trying
+    /// them in a `(extent, value_offset)`-rotated order with failover. Returns
+    /// `Some(value)` on the first success, or `None` when EVERY replica failed
+    /// (or there are none) so the caller can proxy-fall-back. Never a short read
+    /// (`read_extent_value_direct` treats `got < value_len` under CODE_OK as an
+    /// error → next replica → proxy). Caller must have already handled the
+    /// inline (`extent_id == 0`) case.
+    async fn read_redirect_replicas(
+        &self,
+        resp: &GetRedirectResp,
+    ) -> Option<bytes::Bytes> {
+        let n = resp.replica_addrs.len();
+        if n == 0 {
+            return None;
+        }
+        let start = (resp.extent_id ^ (resp.value_offset << 32)) as usize % n;
+        let mut saw_timeout = false;
+        for i in 0..n {
+            let addr = &resp.replica_addrs[(start + i) % n];
+            match autumn_stream::read_extent_value_direct(
+                &self.en_pool,
+                addr,
+                resp.extent_id,
+                resp.eversion,
+                resp.value_offset,
+                resp.value_len,
+            )
+            .await
+            {
+                Ok(v) => return Some(v),
+                Err(e) => {
+                    // A TIMEOUT is a liveness anomaly (dead endpoint /
+                    // stuck peer) that silently costs the op the full RPC
+                    // deadline — surface it at warn (the 2026-07-03 UCX
+                    // dead-ep stalls were invisible precisely because this
+                    // arm was debug-only). Expected failover causes
+                    // (eversion bumped, extent GC'd, fast connect refusal)
+                    // stay at debug so routine EC/GC churn stays quiet.
+                    // "timed out" matches conn_pool's timeout message.
+                    let msg = format!("{e:#}");
+                    if msg.contains("timed out") {
+                        saw_timeout = true;
+                        tracing::warn!(
+                            extent_id = resp.extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "direct read TIMED OUT; trying next replica"
+                        );
+                    } else {
+                        tracing::debug!(
+                            extent_id = resp.extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "direct read failed; trying next replica"
+                        );
+                    }
+                }
+            }
+        }
+        // Fell out of the loop: every replica failed. The proxy fallback the
+        // caller runs hides that — leave a trace. Warn only when a liveness
+        // anomaly (timeout) was involved; an all-expected-errors sweep
+        // (eversion bump / EC conversion touching every replica) is routine
+        // and stays at debug (coco P3).
+        if saw_timeout {
+            tracing::warn!(
+                extent_id = resp.extent_id,
+                replicas = n,
+                "direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
+            );
+        } else {
+            tracing::debug!(
+                extent_id = resp.extent_id,
+                replicas = n,
+                "direct read failed on ALL replicas; falling back to PS proxy"
+            );
+        }
+        None
+    }
+
+    /// F-DIRECT-MANY: read one key's sub-range `[offset, offset+length)`
+    /// (`length == 0` = whole value) STRAIGHT from an EN into `dest`, with a
+    /// proxy fallback — the per-item core of `get_many_direct`. Returns
+    /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or
+    /// `None` if not found. `read_len = length>0 ? length : dest.len()`:
+    /// - `read_len < 64 KiB` (`!zc_worthwhile`): no redirect — a small
+    ///   value/sub-range never bypasses the PS (the redirect RTT + EN connect
+    ///   would cost more than the copy it saves). Plain proxy `get_range` + copy.
+    /// - `read_len >= 64 KiB`: `MSG_GET_REDIRECT`. An inline answer
+    ///   (`extent_id == 0`: the PS declined to redirect — small/non-VP after
+    ///   resolution) is copied straight in; a descriptor drives
+    ///   `read_redirect_replicas`; ALL-replica failure falls back to the proxy
+    ///   ZC path (`get_range_into`). `dest` MUST outlive the call.
+    async fn get_range_direct_into(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        dest: &mut [u8],
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        let read_len = if length > 0 { length as usize } else { dest.len() };
+        if !zc_worthwhile(read_len) {
+            // Small item: straight proxy, no redirect round-trip.
+            return match self.get_range(key, offset, length).await {
+                Ok(Some(v)) => {
+                    let n = v.len().min(dest.len());
+                    dest[..n].copy_from_slice(&v[..n]);
+                    Ok(Some(v.len()))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
+        let key_v = key.to_vec();
+        let resp_bytes = self
+            .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+                rkyv_encode(&GetReq {
+                    part_id,
+                    key: key_v.clone(),
+                    offset,
+                    length,
+                    region_epoch,
+                })
+            })
+            .await?;
+        let resp: GetRedirectResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code == partition_rpc::CODE_NOT_FOUND {
+            return Ok(None);
+        }
+        check_ps_code(resp.code, &resp.message)?;
+        if resp.extent_id == 0 {
+            // Inline (PS declined to redirect) — value already carries the
+            // requested sub-range bytes.
+            let v = &resp.value;
+            let n = v.len().min(dest.len());
+            dest[..n].copy_from_slice(&v[..n]);
+            return Ok(Some(v.len()));
+        }
+        if let Some(v) = self.read_redirect_replicas(&resp).await {
+            let n = v.len().min(dest.len());
+            dest[..n].copy_from_slice(&v[..n]);
+            return Ok(Some(v.len()));
+        }
+        // All replicas failed → proxy ZC fallback re-resolves through the PS.
+        self.get_range_into(key, offset, length, dest).await
+    }
+
+    /// F-DIRECT-MANY: batched client direct-read — the batch mirror of
+    /// `get_direct`, same dest-based shape as `get_many_into`. Each item whose
+    /// requested length is >= 64 KiB is read STRAIGHT from an EN
+    /// (`MSG_GET_REDIRECT` descriptor → `read_extent_value_direct`), taking the
+    /// PS out of the large-value data path; sub-64 KiB items stay on the plain
+    /// proxy `get_range` path (mixed-size batches route per item). Per item,
+    /// ANY direct-read failure falls back to the proxy — so it degrades
+    /// gracefully where ENs aren't client-reachable (one redirect RTT +
+    /// fallback), which is why the DECISION to call this vs `get_many_into` is a
+    /// deploy-topology flag OWNED BY THE FRONTEND (fuse `--direct-read`, python
+    /// `BatchClient(direct=…)`), never a hardcoded SDK default.
+    ///
+    /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
+    /// (`dest[..min(n, dest.len())]` filled), `Ok(None)` = not found, `Err` =
+    /// that item's RPC failed. Each `dest` MUST outlive the call (same
+    /// cancel-safety contract as `get_into`). Concurrency is the shared
+    /// `BATCH_GET_DEFAULT_CONCURRENCY` sliding window (`fan_out_collect`).
+    ///
+    /// The one extra copy vs `get_many_into`'s `MSG_GET_ZC` (which recvs
+    /// straight into `dest`): the direct EN read lands in a read_loop-owned
+    /// pooled buffer (`read_extent_value_direct`), then memcpys into `dest`.
+    /// The pooled recv (not recv-into-`dest`) is deliberate — the direct read
+    /// carries a 3 s timeout + replica failover, which `call_into_dest`'s
+    /// cancel-safety contract (no timeout; `dest` must outlive the recv)
+    /// forbids. The copy is the price of failover-safety on the bypass path;
+    /// the win is the PS NIC egress leaving the large-value data path
+    /// (cross-host).
+    pub async fn get_many_direct(
+        &self,
+        items: &mut [GetManyItem<'_>],
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        let concurrency = BATCH_GET_DEFAULT_CONCURRENCY;
+        let futs = items.iter_mut().map(|it| {
+            let key: &[u8] = it.key;
+            let offset = it.offset;
+            let length = it.length;
+            let dest: &mut [u8] = &mut *it.dest;
+            async move { self.get_range_direct_into(key, offset, length, dest).await }
+        });
+        fan_out_collect(futs, concurrency).await
     }
 
     /// Zero-copy GET: read a key's value straight into `dest` (no

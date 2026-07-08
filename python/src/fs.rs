@@ -122,9 +122,15 @@ impl Fs {
     /// Connect an `Fs` against `manager`. Blocks until the worker has connected
     /// (or raises). `host` seeds the daemon lease identity
     /// (`DaemonClientId::new_fuse`); defaults to a stable label.
+    ///
+    /// F-DIRECT-MANY: `direct_read=True` makes whole-value reads (≥ 64 KiB)
+    /// bypass the PS and read straight from an extent node (`get_many_direct`) —
+    /// a cross-host throughput win for fsspec model/dataset serving. TOPOLOGY-
+    /// DEPENDENT (this host must reach EN data ports), default False; each read
+    /// falls back to the PS proxy on any direct-read failure.
     #[staticmethod]
-    #[pyo3(signature = (manager, host=None))]
-    fn connect(py: Python<'_>, manager: String, host: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (manager, host=None, direct_read=false))]
+    fn connect(py: Python<'_>, manager: String, host: Option<String>, direct_read: bool) -> PyResult<Self> {
         let host = host.unwrap_or_else(|| "autumn-fs-py".to_string());
         let (job_tx, mut job_rx) = unbounded::<FsJob>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -147,6 +153,7 @@ impl Fs {
                             return;
                         }
                     };
+                    state.direct_read = direct_read;
                     // Ensure the shared root inode exists (the fuse mount does
                     // this in its Init; the binding is a co-equal front-end).
                     if let Err(e) = autumn_fuse::meta::ensure_root(&mut state).await {

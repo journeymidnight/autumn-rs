@@ -619,24 +619,36 @@ async fn get_value_inner(
     } else {
         None
     };
-    if redirect_large_vp
-        && is_vp
-        && req.offset == 0
-        && req.length == 0
-        && raw_value.len() >= crate::VALUE_POINTER_SIZE
-    {
+    // F-DIRECT-MANY: redirect a VP read (whole value OR a sub-range) to the
+    // EN when the REQUESTED byte count is >= 64 KiB. `req.offset`/`req.length`
+    // address bytes WITHIN the value (`length == 0` = to end); the descriptor
+    // carries the absolute in-extent range `[vp.offset + req.offset, +req_len)`
+    // so the client reads exactly the requested sub-range straight from a
+    // replica. Whole-value single-key `get_direct` (offset=0,length=0) is the
+    // `req.offset==0 && req_len==vp.len` special case — unchanged. Sub-ranges
+    // past the value end (`req.offset > vp.len`) and sub-64 KiB requests fall
+    // through to the inline proxy resolve below (identical to pre-F-DIRECT-MANY).
+    if redirect_large_vp && is_vp && raw_value.len() >= crate::VALUE_POINTER_SIZE {
         let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
-        if vp.len as usize >= 64 * 1024 {
-            record_read(source, false, 0);
-            // _vp_pin drops at return — the client's direct read is
-            // deliberately unprotected: a GC punch in the window turns
-            // into a failed EN read -> client proxy fallback (never a
-            // torn read; extents are unlinked whole and eversion-fenced).
-            return Ok(GetOutcome::Redirect {
-                extent_id: vp.extent_id,
-                value_offset: vp.offset,
-                value_len: vp.len,
-            });
+        let r_off = req.offset as u64;
+        if r_off <= vp.len {
+            let r_len = if req.length == 0 {
+                vp.len - r_off
+            } else {
+                (req.length as u64).min(vp.len - r_off)
+            };
+            if r_len >= 64 * 1024 {
+                record_read(source, false, 0);
+                // _vp_pin drops at return — the client's direct read is
+                // deliberately unprotected: a GC punch in the window turns
+                // into a failed EN read -> client proxy fallback (never a
+                // torn read; extents are unlinked whole and eversion-fenced).
+                return Ok(GetOutcome::Redirect {
+                    extent_id: vp.extent_id,
+                    value_offset: vp.offset + r_off,
+                    value_len: r_len,
+                });
+            }
         }
     }
     drop(p);

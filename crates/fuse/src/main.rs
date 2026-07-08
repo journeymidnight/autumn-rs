@@ -41,6 +41,17 @@ struct Args {
     /// transport (the ClusterClient talks to the PS over it).
     #[arg(long, default_value = "tcp")]
     transport: String,
+
+    /// F-DIRECT-MANY — read whole extents (≥ 64 KiB) STRAIGHT from an extent
+    /// node, bypassing the PS on the large-value data path (`get_many_direct`).
+    /// A cross-host throughput win for large-file (model) serving: the PS NIC
+    /// egress leaves the read path. TOPOLOGY-DEPENDENT — the fuse host must be
+    /// able to reach EN data ports; default OFF because a common deployment
+    /// keeps EN data ports on a PS-only subnet. Safe to enable even when ENs
+    /// are unreachable: each read falls back to the PS proxy (one redirect RTT
+    /// + fallback per extent).
+    #[arg(long, default_value = "false")]
+    direct_read: bool,
 }
 
 fn main() -> Result<()> {
@@ -120,6 +131,10 @@ fn main() -> Result<()> {
                         return;
                     }
                 };
+                state.direct_read = args.direct_read;
+                if args.direct_read {
+                    tracing::info!("direct-read enabled: whole-extent reads bypass the PS (EN direct)");
+                }
                 tracing::info!("connected to cluster");
 
                 // Bug #1 fix (2026-06-06) — ride out the fresh-bootstrap

@@ -866,9 +866,12 @@ struct BatchClient {
     /// F216-E: captured from the process transport at construction. True ⟹
     /// zero-copy data path (writes always; reads above UCX_ZC_READ_MIN_BYTES).
     is_ucx: bool,
+    /// F-DIRECT-MANY: opt-in EN direct-read for the Get path (`get_many_direct`).
+    /// Topology-dependent (client must reach EN data ports), default OFF.
+    direct: bool,
 }
 
-async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64, cap: usize) -> Vec<bool> {
+async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64, cap: usize, direct: bool) -> Vec<bool> {
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
@@ -891,7 +894,18 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
                 })
                 .collect();
             let _ = cap; // unused — SDK manages internal concurrency
-            let results = client.get_many_into(&mut gitems).await;
+            // F-DIRECT-MANY: `direct` (BatchClient(direct=True)) sends the
+            // ≥ 64 KiB whole-value gets STRAIGHT to an EN (`get_many_direct`),
+            // bypassing the PS on the data path — a cross-host throughput win
+            // for kvcache / fsspec large-tensor serving. TOPOLOGY-DEPENDENT
+            // (the client host must reach EN data ports), so it's an explicit
+            // opt-in, default OFF; each item falls back to the PS proxy on any
+            // direct-read failure. Small values route through the PS regardless.
+            let results = if direct {
+                client.get_many_direct(&mut gitems).await
+            } else {
+                client.get_many_into(&mut gitems).await
+            };
             drop(gitems);
             // Success = the value was found AND its length matches the page size
             // the caller reserved (same contract as the pre-F244 per-item path).
@@ -940,8 +954,8 @@ impl BatchClient {
     /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
     /// rendezvous cliff).
     #[new]
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16))]
-    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize) -> PyResult<Self> {
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false))]
+    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize, direct: bool) -> PyResult<Self> {
         let n_workers = n_workers.max(1);
         // F216-E "ucx ⟹ zerocopy": derive the data path from the process
         // transport (set via set_transport BEFORE construction) — no explicit
@@ -975,7 +989,7 @@ impl BatchClient {
                                 }
                             };
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap).await;
+                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
                                 let _ = job.done.send(res);
                             }
                         });
@@ -989,7 +1003,7 @@ impl BatchClient {
             Ok(workers)
         });
         let workers = result.map_err(PyRuntimeError::new_err)?;
-        Ok(BatchClient { workers, per_worker_cap, is_ucx })
+        Ok(BatchClient { workers, per_worker_cap, is_ucx, direct })
     }
 
     /// Whether this client uses the F216-E zero-copy data path. This is now
@@ -998,6 +1012,13 @@ impl BatchClient {
     /// reads (MSG_GET_ZC) for values ≥ the size threshold. No explicit flag.
     fn zc(&self) -> bool {
         self.is_ucx
+    }
+
+    /// F-DIRECT-MANY: whether the Get path bypasses the PS and reads ≥ 64 KiB
+    /// values straight from an extent node (`BatchClient(direct=True)`).
+    /// Topology-dependent — enable only when this host can reach EN data ports.
+    fn direct(&self) -> bool {
+        self.direct
     }
 
     /// Batched zero-copy get. Returns list[bool] aligned to `keys`: True iff the

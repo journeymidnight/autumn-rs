@@ -1,3 +1,41 @@
+Date: 2026-07-07
+TaskStatus: not_completed
+Task scope: F-DIRECT-MANY — batched client direct-read shared by fuse / kvcache /
+  fsspec. Continues the "autumn-fuse 是否该默认 --direct-read" discussion. F259
+  get_direct only bypasses the PS for a SINGLE whole-value read; the three
+  frontends read in BATCHES via get_many_into (PS-proxied MSG_GET_ZC), so
+  large-file (model) serving never took the PS off the data path.
+Current summary:
+  - PS: extended MSG_GET_REDIRECT (get_value_inner) to redirect VP SUB-RANGES
+    whose clamped requested length >= 64 KiB (was whole-value-only; fuse
+    whole-extent reads carry explicit length so never redirected). Returns
+    value_offset = vp.offset + req.offset, value_len = clamped len. Single-key
+    get_direct (0,0) unchanged. No wire-struct change → NO WIRE bump.
+  - client: get_many_direct (dest-based, mirrors get_many_into) + shared
+    read_redirect_replicas (factored out of get_direct) + get_range_direct_into
+    (per-item core). Per item: >=64 KiB → redirect → EN direct read → copy into
+    dest; inline → copy; ALL-replica-fail → proxy get_range_into. <64 KiB →
+    proxy get_range + copy. Mixed-size batches route per item. One extra copy vs
+    recv-into-dest is the price of failover-safety (pooled recv, not
+    call_into_dest whose cancel-safety forbids timeout+failover).
+  - frontends: opt-in flags, default OFF (topology-dependent, needs EN
+    reachability): fuse --direct-read → FsState.direct_read → ReadPlan →
+    execute; python BatchClient(direct=True); autumn.Fs.connect(direct_read=)
+    (fsspec AutumnFileSystem(direct_read=True) threads here). Safe when ENs
+    unreachable — each item falls back to PS proxy.
+Verification: autumn-client 0 clippy warnings + 27 lib tests green;
+  autumn-partition-server 187 --lib tests green; autumn-server/manager build
+  clean; fuse `core` feature builds (fuse binary + python wheel are
+  Linux/nightly build envs — main.rs/PyO3 changes are trivial flag threading).
+Main gaps: coco review BLOCKED (local coco/traecli 0.200.16 requires a
+  --profile value the coco-review.sh wrapper omits → arg-parse fail for both
+  models, unrelated to the diff; did a manual self-review instead). Live
+  cross-host PS-egress perf verification DEFERRED to a cluster run. Status
+  not_completed until coco + live verify land.
+Next steps: run coco once the wrapper passes --profile; live-verify the
+  cross-host large-file read PS-egress win on a real cluster with --direct-read.
+
+============================ prior task history ============================
 Date: 2026-07-05
 TaskStatus: completed
 Task scope: F-DF-OPENTAIL — user "amp 45.18x 放大45倍?": `autumn-op df` showed 45x

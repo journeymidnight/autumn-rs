@@ -96,6 +96,15 @@ pub struct FsState {
     /// shape as `dispatch::InodeInvalidator`; we don't import
     /// the alias here to avoid a dispatch ↔ state circular dep.
     pub kernel_invalidator: RefCell<Option<Rc<dyn Fn(u64)>>>,
+
+    /// F-DIRECT-MANY — when true, whole-extent reads (≥ 64 KiB) bypass the PS
+    /// and read straight from an extent node (`get_many_direct`); otherwise the
+    /// PS-proxied ZC path (`get_many_into`). Topology-dependent (needs the fuse
+    /// host to reach EN data ports), so DEFAULT FALSE — the fuse binary flips it
+    /// from `--direct-read`; the PyO3 binding leaves it false. Threaded into
+    /// each `ReadPlan` at `prepare` time so the spawned `read::execute` task
+    /// (which holds no `&FsState`) can pick the batch primitive.
+    pub direct_read: bool,
 }
 
 impl FsState {
@@ -127,6 +136,7 @@ impl FsState {
             invalidations: Rc::new(RefCell::new(InvalidationMap::new())),
             notify_inval_failed: Rc::new(RefCell::new(HashSet::new())),
             kernel_invalidator: RefCell::new(None),
+            direct_read: false,
         })
     }
 
