@@ -1,4 +1,28 @@
 Date: 2026-07-08
+TaskStatus: completed
+Task scope: autumn_vllm_loader — the REAL vLLM model loader (was "engine proven,
+  plugin not packaged"). User: "装vllm就行我有gpu" → install vLLM + build the
+  register_model_loader("autumn") plugin + verify end-to-end.
+Current summary: DONE + vLLM-verified. Installed vLLM 0.24.0 in an ISOLATED venv
+  (/root/vllm-venv, torch 2.11+cu130 — does NOT touch the shared system torch that
+  Ray/sglang tenants use). New package python/autumn_vllm_loader:
+  @register_model_loader("autumn") AutumnModelLoader(BaseModelLoader) — load_weights
+  enumerates *.safetensors in an autumn dir, K reader threads (read_into releases
+  the GIL) fill a bounded prefetch queue feeding model.load_weights((name,tensor));
+  config/tokenizer stay on vLLM's local model= path (weights-from-backend split).
+  entry point vllm.general_plugins for import-free discovery. E2E
+  (tests/run_vllm_e2e.sh): local TCP cluster → upload gte-Qwen2-1.5B (7.1GB) to
+  autumn → LLM(load_format="autumn", runner="pooling") → forward → embedding dim
+  1536, finite, norm 1.0, **first5 BIT-IDENTICAL to the default local-disk loader
+  = byte-exact weight load**. Offline unit tests 3/3. get_model_loader("autumn")
+  returns AutumnModelLoader.
+Main gaps: NONE for "is there a vLLM loader" — yes, real + verified. Optional
+  future: H2D-overlap tuning of the vLLM-pull path; GPUDirect(GDR) direct-to-VRAM
+  (box has no nvidia_peermem; not needed for bulk sequential weights).
+Next steps: commit+push the package. Closed.
+
+============================ prior task history ============================
+Date: 2026-07-08
 TaskStatus: not_completed
 Task scope: F-REDIRECT-BATCH — batch the per-extent redirect so a large-file read
   makes ONE PS round-trip per partition instead of ~630, removing the single-PS

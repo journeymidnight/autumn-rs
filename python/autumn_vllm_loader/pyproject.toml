@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autumn-vllm-loader"
+version = "0.1.0"
+description = "vLLM model loader (--load-format autumn) that streams safetensors weights from autumn-rs via the zero-copy Fs.read_into seam"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "autumn-rs contributors" }]
+# Depends on the `autumn` PyO3 extension (Fs.read_into) + torch + vllm at
+# runtime. Intentionally NOT pinned — install into whatever vLLM env is present.
+#   deps: autumn (maturin), torch, vllm
+dependencies = []
+
+# vLLM discovers the loader lazily via this entry point (the `general.plugins`
+# group), so `--load-format autumn` works without an explicit import.
+[project.entry-points."vllm.general_plugins"]
+autumn_loader = "autumn_vllm_loader:register"
+
+[tool.setuptools.packages.find]
+include = ["autumn_vllm_loader*"]
+exclude = ["tests*"]
