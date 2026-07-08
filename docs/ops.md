@@ -1006,3 +1006,35 @@ Phase 1 is complete. Future work tracked under separate features:
 - **F-lease-preempt** — force-revoke / writer revoke protocol so
   "another daemon needs to write NOW" doesn't have to wait for
   the current writer to close.
+
+## Zero-copy model load (F-MODEL-ZC-LOAD + F-REDIRECT-BATCH)
+
+Serve a model that lives in autumn straight into GPU memory via the pinned
+zero-copy read seam (`autumn.Fs.read_into`) + batched EN direct-read, at
+≈Run:ai-Model-Streamer throughput. The loader pipeline: parse the safetensors
+header → per tensor `read_into` a **CUDA-pinned** host buffer (double-buffered)
+→ async H2D overlapped with the next read. Storage reads go direct to the extent
+nodes (`autumn.Fs.connect(direct_read=True)`); descriptors resolve in ONE PS
+round-trip per file (`MSG_GET_REDIRECT_MANY`), so the ~N-extent reads fan across
+all ENs with the PS off the metadata path.
+
+**Build note (UCX):** binaries + wheel need `--features ucx` for
+`--transport ucx`. The wheel MUST be built `--skip-auditwheel` (bundling UCX
+libs segfaults — UCX `dlopen`s its transport modules from the system install;
+the client must link **system** UCX like the daemons).
+
+**A/B vs Model Streamer (intra-host UCX, GPU host):**
+```bash
+# cluster bound to a RoCE NIC IP (NOT loopback), UCX positive-list env from cluster.sh
+AUTUMN_BIND_HOST="[<roce-nic-ip>]" AUTUMN_TRANSPORT=ucx \
+  AUTUMN_DATA_ROOT=/data/autumn-ucx bash cluster.sh start 4
+# client pinned to the SAME NIC (both-ends rule); run on a free GPU
+AUTUMN_MANAGER="[<roce-nic-ip>]:9001" CUDA_VISIBLE_DEVICES=<free-gpu> \
+  UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=mlx5_1:1 \
+  python3 remote_bench.py     # set_transport("ucx"); upload model; A/B loader vs runai
+```
+Expect: **byte-exact** (loaded tensors == safetensors ground truth) and autumn
+EN-direct at ~80% of Model Streamer's local-page-cache number at K≈4 (the fair
+comparison is vs Model-Streamer-from-remote-storage, where autumn/RDMA wins).
+The `Fs.read_into` seam alone (no GPU) is checkable headless with a `bytearray`
+dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n)`.
