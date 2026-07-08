@@ -1,3 +1,29 @@
+Date: 2026-07-08
+TaskStatus: not_completed
+Task scope: F-MODEL-ZC-LOAD — zero-copy model load. Give `autumn.Fs` a pinned
+  zero-copy read (`read_into`) so a thin vLLM streaming loader can hit ≈Run:ai
+  Model-Streamer throughput (pinned host + overlapped H2D; NOT GDR). Built on
+  F-DIRECT-MANY (batched EN direct-read, PS off the data path). User has a GPU
+  (8× H200) so the loader benchmark is verifiable locally.
+Current summary: M1 (the `Fs.read_into` seam) DONE + VERIFIED. `read::execute`
+  was already dest-based → extracted `fill_region`, added `execute_into` (fills a
+  caller buffer, pre-zeroed for sparse/short-extent semantics) + `read_into`
+  (≤1 GiB/call, u32 GetReq cap; caller loops). PyO3 `Fs.read_into(ino, off,
+  PyBuffer)` mirrors `get_into`'s buffer handling (writable/C-contiguous check;
+  Send usize ptr crosses to the worker; the blocking call keeps the buffer alive).
+  Honors `direct_read`. Verified: fuse lib 44/44; scratchpad/verify_read_into.sh
+  all green — 20 MB multi-extent + ranged + EOF short-read, PS-proxy AND EN-direct
+  paths, and 12 MB read straight into a pinned torch buffer → H200 → back
+  byte-exact. Release wheel rebuilt + installed into system python (has torch).
+Main gaps: M2 — the streaming vLLM loader (own package: autumn + torch only,
+  register_model_loader("autumn"), pinned double-buffer + async H2D overlap) and
+  the H200 A/B vs Run:ai Model Streamer (runai-model-streamer IS installed; vLLM
+  is NOT importable here so the register_model_loader wiring is write-not-run).
+Next steps: build the loader + run the H200 throughput A/B vs Model Streamer.
+  Then coco review (confirm the F-DIRECT-MANY traecli --profile block is still
+  present), docs/ops.md verify step, commit.
+
+============================ prior task history ============================
 Date: 2026-07-07
 TaskStatus: not_completed
 Task scope: F-DIRECT-MANY — batched client direct-read shared by fuse / kvcache /

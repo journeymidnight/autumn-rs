@@ -37,7 +37,8 @@ use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::future::LocalBoxFuture;
 use futures::StreamExt;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
@@ -371,6 +372,39 @@ impl Fs {
                 .map_err(|e| e.to_string())
         })?;
         Ok(PyBytes::new(py, &v).into_any().unbind())
+    }
+
+    /// F-MODEL-ZC-LOAD: zero-copy read into a caller buffer. `buf` is a writable,
+    /// C-contiguous Python buffer-protocol object (e.g. a CUDA-pinned host tensor
+    /// `torch.empty(n, dtype=torch.uint8, pin_memory=True)`); the extent data is
+    /// written STRAIGHT into it — no intermediate `bytes` — so a model loader can
+    /// overlap the storage read with the async H2D copy (the Run:ai-Model-Streamer
+    /// pattern). Reads up to `len(buf)` bytes from `offset` (capped at 1 GiB per
+    /// call — the `GetReq` size is u32; loop, advancing `offset`, to fill a bigger
+    /// buffer) and returns the number of bytes written into `buf[0..n]`. Honors the
+    /// connection's `direct_read` (bypasses the PS, reading straight from an EN).
+    fn read_into(&self, py: Python<'_>, ino: u64, offset: i64, buf: PyBuffer<u8>) -> PyResult<usize> {
+        if buf.readonly() {
+            return Err(PyValueError::new_err("buf must be writable"));
+        }
+        if !buf.is_c_contiguous() {
+            return Err(PyValueError::new_err("buf must be C-contiguous"));
+        }
+        let dest_ptr = buf.buf_ptr() as usize;
+        let dest_len = buf.item_count();
+        // This method BLOCKS (recv_block) until the worker finishes, so `buf` — a
+        // parameter on this stack frame — outlives the worker's write into
+        // `dest_ptr`, and the buffer protocol pins the memory. Only the Send
+        // `usize` ptr/len cross to the worker (never the `!Send`-in-spirit view).
+        fs_blocking!(self, py, usize, |st| {
+            // SAFETY: dest_ptr/dest_len come from `buf`, alive on the caller's
+            // stack for this whole blocking call; the worker holds the only
+            // `&mut` to that memory while the caller is parked in `recv_block`.
+            let dest = unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut u8, dest_len) };
+            autumn_fuse::read::read_into(st, ino, offset, dest)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Write `data` at `offset` to inode `ino`; returns bytes written. Data is

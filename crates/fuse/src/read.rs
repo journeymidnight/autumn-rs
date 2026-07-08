@@ -154,22 +154,26 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
 /// (`get_many_into`: ZC recv-into-dest for ≥ 64 KiB; `get_many_direct`: EN
 /// direct read → copy, per-item PS-proxy fallback); a missing/short extent
 /// leaves zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
-pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
-    if let Some(inline) = plan.inline_result {
-        return Ok(inline);
-    }
-    let actual_size = plan.actual_size;
-    let client = plan.client;
-    let mut chunks = plan.chunks;
+/// Carve `region` — already sized to the read span and pre-zeroed by the caller
+/// (sparse-gap / short-extent semantics) — into disjoint per-extent sub-slices
+/// and issue ONE batched read into them. Shared by `execute` (allocates a `Vec`)
+/// and `execute_into` (fills a caller-provided buffer, e.g. a CUDA-pinned host
+/// tensor for the zero-copy `Fs.read_into` model-load seam).
+async fn fill_region(
+    client: Rc<ClusterClient>,
+    mut chunks: Vec<ChunkSpec>,
+    region: &mut [u8],
+    direct_read: bool,
+) -> Result<()> {
     // Sort by destination so the disjoint-slice carve walks forward.
     chunks.sort_by_key(|c| c.dest_offset);
 
-    let mut result = vec![0u8; actual_size];
-    let mut rest = result.as_mut_slice();
+    let mut rest = &mut region[..];
     let mut consumed = 0usize;
     let mut dests: Vec<&mut [u8]> = Vec::with_capacity(chunks.len());
     for c in &chunks {
-        // Skip the gap before this extent (left zero-filled), then carve its slice.
+        // Skip the gap before this extent (left as the caller pre-zeroed it),
+        // then carve its slice.
         let gap = c.dest_offset - consumed;
         let (_, after_gap) = rest.split_at_mut(gap);
         let (head, tail) = after_gap.split_at_mut(c.length as usize);
@@ -188,17 +192,17 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
             dest,
         })
         .collect();
-    // F-DIRECT-MANY: `direct_read` (mount `--direct-read`) sends the ≥ 64 KiB
-    // whole-extent gets STRAIGHT to an EN (`get_many_direct`), bypassing the PS
-    // on the data path; each item falls back to the PS proxy on any direct-read
-    // failure, so it's safe even if some ENs are unreachable. Default OFF ⇒ the
-    // PS-proxied ZC path (`get_many_into`).
-    let results = if plan.direct_read {
+    // F-DIRECT-MANY: `direct_read` sends the ≥ 64 KiB whole-extent gets STRAIGHT
+    // to an EN (`get_many_direct`), bypassing the PS on the data path; each item
+    // falls back to the PS proxy on any direct-read failure, so it's safe even if
+    // some ENs are unreachable. Default OFF ⇒ the PS-proxied ZC path
+    // (`get_many_into`).
+    let results = if direct_read {
         client.get_many_direct(&mut items).await
     } else {
         client.get_many_into(&mut items).await
     };
-    drop(items); // release the &mut borrows of `result`
+    drop(items); // release the &mut borrows of `region`
 
     // Propagate a hard RPC/routing failure (pre-F244 surfaced this at
     // prepare-time as EIO); `Ok(None)` (missing extent) stays sparse-zero-filled.
@@ -207,8 +211,42 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
             return Err(anyhow!("extent read failed: {e}"));
         }
     }
+    Ok(())
+}
 
+pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
+    if let Some(inline) = plan.inline_result {
+        return Ok(inline);
+    }
+    let mut result = vec![0u8; plan.actual_size];
+    fill_region(plan.client, plan.chunks, &mut result, plan.direct_read).await?;
     Ok(result)
+}
+
+/// Zero-copy variant of `execute`: fill a CALLER-PROVIDED buffer (e.g. a
+/// CUDA-pinned host buffer) instead of allocating a `Vec`. Writes the read span
+/// into `dest[0..actual_size]` — pre-zeroing it for sparse / short-extent
+/// semantics, exactly like `execute` — and returns the byte count. `dest` must
+/// be at least `plan.actual_size` long. This is the seam behind `Fs.read_into`
+/// that lets a model loader land extent bytes straight in pinned memory and
+/// overlap the read with the H2D copy (the Run:ai-Model-Streamer pattern).
+pub async fn execute_into(plan: ReadPlan, dest: &mut [u8]) -> Result<usize> {
+    if let Some(inline) = plan.inline_result {
+        let n = inline.len().min(dest.len());
+        dest[..n].copy_from_slice(&inline[..n]);
+        return Ok(n);
+    }
+    let actual_size = plan.actual_size;
+    if dest.len() < actual_size {
+        return Err(anyhow!(
+            "read_into dest too small: {} < {actual_size}",
+            dest.len()
+        ));
+    }
+    let region = &mut dest[..actual_size];
+    region.fill(0);
+    fill_region(plan.client, plan.chunks, region, plan.direct_read).await?;
+    Ok(actual_size)
 }
 
 /// Convenience wrapper for the in-thread (non-spawn) path: prepare + execute.
@@ -216,6 +254,22 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
 pub async fn read(state: &mut FsState, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
     let plan = prepare(state, ino, offset, size).await?;
     execute(plan).await
+}
+
+/// Zero-copy read into a caller buffer (the `Fs.read_into` seam): prepare +
+/// `execute_into`. Reads up to `dest.len()` bytes from `offset` — capped at
+/// 1 GiB per call (the `GetReq` size is u32; callers loop to fill a larger
+/// buffer) — into `dest[0..n]` and returns `n`. Honors `state.direct_read`
+/// (EN-direct when the connection set it).
+pub async fn read_into(
+    state: &mut FsState,
+    ino: u64,
+    offset: i64,
+    dest: &mut [u8],
+) -> Result<usize> {
+    let cap = dest.len().min(1usize << 30);
+    let plan = prepare(state, ino, offset, cap as u32).await?;
+    execute_into(plan, &mut dest[..cap]).await
 }
 
 #[allow(dead_code)]
