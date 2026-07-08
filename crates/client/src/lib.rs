@@ -1954,15 +1954,108 @@ impl ClusterClient {
         &self,
         items: &mut [GetManyItem<'_>],
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        let n = items.len();
+        // Phase A (F-REDIRECT-BATCH) — group the redirect-eligible (read_len
+        // >= 64 KiB) items by owning partition so their descriptors resolve in
+        // ONE round-trip per partition instead of one per item. Small items /
+        // resolve-misses stay ungrouped → per-item proxy path in phase C.
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, it) in items.iter().enumerate() {
+            let read_len = if it.length > 0 { it.length as usize } else { it.dest.len() };
+            if !zc_worthwhile(read_len) {
+                continue;
+            }
+            if let Ok((pid, _addr)) = self.resolve_key(it.key).await {
+                groups.entry(pid).or_default().push(i);
+            }
+        }
+        // Phase B — one MSG_GET_REDIRECT_MANY per partition → descriptors[i].
+        // ANY failure (epoch-stale / conn / decode / len mismatch) leaves this
+        // partition's descriptors None → phase C proxies each item
+        // (call_ps_for_key refreshes routing natively). The batched redirect is
+        // an optimization, never a correctness dependency.
+        let mut descriptors: Vec<Option<GetRedirectResp>> = (0..n).map(|_| None).collect();
+        for (part_id, idxs) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let req_items: Vec<partition_rpc::GetRedirectItem> = idxs
+                .iter()
+                .map(|&i| partition_rpc::GetRedirectItem {
+                    key: items[i].key.to_vec(),
+                    offset: items[i].offset,
+                    length: items[i].length,
+                })
+                .collect();
+            let payload = rkyv_encode(&partition_rpc::GetRedirectManyReq {
+                part_id,
+                region_epoch,
+                items: req_items,
+            });
+            if let Ok(resp_bytes) = self
+                .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
+                .await
+            {
+                if let Ok(resp) =
+                    rkyv_decode::<partition_rpc::GetRedirectManyResp>(&resp_bytes)
+                {
+                    if resp.results.len() == idxs.len() {
+                        for (&i, r) in idxs.iter().zip(resp.results.into_iter()) {
+                            descriptors[i] = Some(r);
+                        }
+                    }
+                }
+            }
+        }
+        // Phase C — fan out: read each item's PRE-RESOLVED descriptor straight
+        // from an EN (no per-item PS RTT), or fall back to the per-item proxy
+        // path when it has no descriptor (small / resolve-miss / batch failure).
         let concurrency = BATCH_GET_DEFAULT_CONCURRENCY;
-        let futs = items.iter_mut().map(|it| {
+        let futs = items.iter_mut().zip(descriptors).map(|(it, desc)| {
             let key: &[u8] = it.key;
             let offset = it.offset;
             let length = it.length;
             let dest: &mut [u8] = &mut *it.dest;
-            async move { self.get_range_direct_into(key, offset, length, dest).await }
+            async move {
+                match desc {
+                    Some(resp) => self.apply_redirect_desc(&resp, key, offset, length, dest).await,
+                    None => self.get_range_direct_into(key, offset, length, dest).await,
+                }
+            }
         });
         fan_out_collect(futs, concurrency).await
+    }
+
+    /// F-REDIRECT-BATCH: read one item using a PRE-RESOLVED redirect descriptor
+    /// (from the batched `MSG_GET_REDIRECT_MANY`) — the descriptor-consuming tail
+    /// of `get_range_direct_into`, factored out so the batch path skips the
+    /// per-item `MSG_GET_REDIRECT` round-trip. Inline (`extent_id == 0`) copies
+    /// straight in; a descriptor drives `read_redirect_replicas`; ALL-replica
+    /// failure falls back to the proxy ZC path (`get_range_into`). Returns
+    /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or `None`.
+    async fn apply_redirect_desc(
+        &self,
+        resp: &GetRedirectResp,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        dest: &mut [u8],
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        if resp.code == partition_rpc::CODE_NOT_FOUND {
+            return Ok(None);
+        }
+        check_ps_code(resp.code, &resp.message)?;
+        if resp.extent_id == 0 {
+            let v = &resp.value;
+            let nn = v.len().min(dest.len());
+            dest[..nn].copy_from_slice(&v[..nn]);
+            return Ok(Some(v.len()));
+        }
+        if let Some(v) = self.read_redirect_replicas(resp).await {
+            let nn = v.len().min(dest.len());
+            dest[..nn].copy_from_slice(&v[..nn]);
+            return Ok(Some(v.len()));
+        }
+        self.get_range_into(key, offset, length, dest).await
     }
 
     /// Zero-copy GET: read a key's value straight into `dest` (no

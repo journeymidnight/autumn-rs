@@ -1,5 +1,31 @@
 Date: 2026-07-08
 TaskStatus: not_completed
+Task scope: F-REDIRECT-BATCH — batch the per-extent redirect so a large-file read
+  makes ONE PS round-trip per partition instead of ~630, removing the single-PS
+  serialization that capped F-MODEL-ZC-LOAD's RDMA loader at 63% of Model Streamer
+  (peaked K=4 then declined on both direct + proxy). Follows the loader thread.
+Current summary: DONE + measured. Wire: MSG_GET_REDIRECT_MANY (0x59) +
+  GetRedirectItem/GetRedirectManyReq/GetRedirectManyResp, WIRE v16→17
+  (fp 55411e9479326ff8, stop-the-world). PS handle_get_redirect_many loops
+  get_value_inner + extent_read_descriptor per item. Client get_many_direct = 3
+  phases (group ≥64KiB by partition → one redirect-many per partition → fan out EN
+  reads on pre-resolved descriptors; per-item proxy fallback intact). Shared by
+  fuse/kvcache/fsspec direct-read. Tests: rpc 44 / client 27 / PS 187 green (WIRE
+  fp test pins v17). Local TCP byte-exact. **H200 UCX re-bench: 63% → 82% of Model
+  Streamer** (EN-direct K=4 3.29→3.75 GB/s, byte-exact). coco (GPT-5.5): 2 findings
+  FIXED — P0 authz (MSG_GET_REDIRECT_MANY added to authz_check keyed allowlist,
+  per-item check_key), P1 batch-OOM (descriptor-lookup failure no longer inlines N
+  large values → fails the batch → client per-item proxy). Re-tested green.
+Main gaps: redeploy the coco-fixed ucx autumn-ps + quick byte-exact re-verify
+  (fixes touch only authz-on + descriptor-failure paths, orthogonal to the measured
+  82% path); docs/ops.md; commit+push. Residual K>4 decline = UCX rendezvous cliff
+  (K×32 in-flight), not the PS — separate lever if the user wants past 82%.
+Next steps: commit+push; redeploy fixed PS + re-verify; docs/ops.md; then closed
+  unless the user wants to chase the UCX-cliff for >82%.
+
+============================ prior task history ============================
+Date: 2026-07-08
+TaskStatus: not_completed
 Task scope: F-MODEL-ZC-LOAD — zero-copy model load. Give `autumn.Fs` a pinned
   zero-copy read (`read_into`) so a thin vLLM streaming loader can hit ≈Run:ai
   Model-Streamer throughput (pinned host + overlapped H2D; NOT GDR). Built on

@@ -129,6 +129,7 @@ pub(crate) async fn dispatch_partition_rpc(
     match msg_type {
         MSG_GET => handle_get(payload, part).await,
         MSG_GET_REDIRECT => handle_get_redirect(payload, part).await,
+        MSG_GET_REDIRECT_MANY => handle_get_redirect_many(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
         partition_rpc::MSG_BATCH_GET => handle_batch_get(payload, part).await,
@@ -394,6 +395,97 @@ pub(crate) async fn handle_get_redirect(
             }
         }
     }
+}
+
+/// F-REDIRECT-BATCH (MSG_GET_REDIRECT_MANY): resolve N redirect descriptors in
+/// ONE PS call — the batch mirror of `handle_get_redirect`. Loops
+/// `get_value_inner` per item (same resolution + `extent_read_descriptor`
+/// lookup + inline fallback as the single handler) and returns one
+/// `GetRedirectResp` per item, in input order. An epoch/range error propagates
+/// as a batch error (`?`) exactly like the single handler — the SDK refreshes +
+/// retries (or falls back per item). The win: the client makes ONE round-trip
+/// per partition instead of one per extent, so a large-file read's ~630 redirect
+/// resolutions no longer serialize on this partition's task.
+pub(crate) async fn handle_get_redirect_many(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: GetRedirectManyReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let not_found = || GetRedirectResp {
+        code: CODE_NOT_FOUND,
+        message: "key not found".to_string(),
+        value: vec![],
+        extent_id: 0,
+        value_offset: 0,
+        value_len: 0,
+        eversion: 0,
+        replica_addrs: vec![],
+    };
+    let inline = |value: Vec<u8>| GetRedirectResp {
+        code: CODE_OK,
+        message: String::new(),
+        value,
+        extent_id: 0,
+        value_offset: 0,
+        value_len: 0,
+        eversion: 0,
+        replica_addrs: vec![],
+    };
+    let mut results = Vec::with_capacity(req.items.len());
+    for item in &req.items {
+        let item_payload = partition_rpc::rkyv_encode(&GetReq {
+            part_id: req.part_id,
+            key: item.key.clone(),
+            offset: item.offset,
+            length: item.length,
+            region_epoch: req.region_epoch,
+        });
+        let resp = match get_value_inner(item_payload, part, true).await? {
+            GetOutcome::NotFound => not_found(),
+            // Inline only ever carries a SMALL value here: get_value_inner
+            // redirects any VP sub-range ≥ 64 KiB, so a Value outcome means the
+            // value is below the redirect threshold (bounded — no batch bloat).
+            GetOutcome::Value(value) => inline(value.into()),
+            GetOutcome::Redirect {
+                extent_id,
+                value_offset,
+                value_len,
+            } => {
+                let sc = part.borrow().stream_client.clone();
+                match sc.extent_read_descriptor(extent_id).await {
+                    Ok((eversion, replica_addrs)) => GetRedirectResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        value: vec![],
+                        extent_id,
+                        value_offset,
+                        value_len,
+                        eversion,
+                        replica_addrs,
+                    },
+                    // Descriptor lookup failed (manager blip / EC-converted /
+                    // cache miss). Do NOT inline the (large) value here — the
+                    // single handler inlines ONE, but a mass descriptor failure
+                    // during a model load would aggregate hundreds of 8 MiB
+                    // values into one GB-scale response frame (coco P1 = OOM /
+                    // over-cap frame). FAIL the batch instead: the client leaves
+                    // this partition's descriptors unset and re-reads each item
+                    // via the per-item proxy path (get_range_direct_into →
+                    // call_ps_for_key, which refreshes). The batched redirect is
+                    // an optimization, never a correctness dependency.
+                    Err(e) => {
+                        return Err((
+                            StatusCode::Unavailable,
+                            format!("redirect descriptor lookup failed: {e}"),
+                        ));
+                    }
+                }
+            }
+        };
+        results.push(resp);
+    }
+    Ok(partition_rpc::rkyv_encode(&GetRedirectManyResp { results }))
 }
 
 /// F216 zero-copy GET (MSG_GET_ZC): returns the response as TWO segments —

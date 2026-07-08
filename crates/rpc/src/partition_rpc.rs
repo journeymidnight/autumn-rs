@@ -197,6 +197,39 @@ pub struct GetRedirectResp {
     pub replica_addrs: Vec<String>,
 }
 
+/// F-REDIRECT-BATCH: resolve MANY redirect descriptors in ONE PS call — the
+/// batch mirror of `MSG_GET_REDIRECT`. A large-file read (model load / dataset
+/// stream) redirects one extent per `MSG_GET_REDIRECT`, funnelling ~630 PS
+/// round-trips through the single owning partition's task; this resolves them
+/// all in one call so the client then fans the EN direct-reads out across all
+/// replicas with the PS out of the metadata loop.
+pub const MSG_GET_REDIRECT_MANY: u8 = 0x59;
+
+/// One item in a `GetRedirectManyReq` — a key + sub-range, same semantics as a
+/// `GetReq`'s `(key, offset, length)` (`length == 0` = whole value).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetRedirectItem {
+    pub key: Vec<u8>,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// F-REDIRECT-BATCH request. All items share `part_id` + `region_epoch` (the
+/// client groups items by owning partition and sends one frame per partition).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetRedirectManyReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub items: Vec<GetRedirectItem>,
+}
+
+/// F-REDIRECT-BATCH response: one `GetRedirectResp` per request item, in input
+/// order (`results.len() == req.items.len()`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetRedirectManyResp {
+    pub results: Vec<GetRedirectResp>,
+}
+
 /// One op inside a `BatchPutReq` / `BatchGetReq`. All ops in a batch
 /// share the parent's `part_id` + `region_epoch`. `expires_at = 0`
 /// means no TTL (matches `PutReq`).
@@ -755,6 +788,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_GET | MSG_GET_ZC | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_DELETE => rkyv_decode::<DeleteReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -819,6 +855,7 @@ mod msg_type_tests {
             MSG_BATCH_PUT,
             MSG_BATCH_GET,
             MSG_GET_REDIRECT,
+            MSG_GET_REDIRECT_MANY,
             MSG_AUTH_HELLO,
             MSG_ROLL_TAILS,
             MSG_DIAG_TRACE_KEY,

@@ -18,9 +18,10 @@ use std::sync::Arc;
 use autumn_rpc::cap_token::{verify_token, AuthReject};
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
-    self, parse_put_zc_meta, BatchGetReq, BatchPutReq, DeleteReq, GetReq, HeadReq, PutReq,
-    RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT, MSG_DELETE, MSG_GET, MSG_GET_REDIRECT,
-    MSG_GET_ZC, MSG_HEAD, MSG_PUT, MSG_PUT_ZC, MSG_RANGE, PUT_ZC_HEADER_LEN,
+    self, parse_put_zc_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
+    HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT, MSG_DELETE, MSG_GET,
+    MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_ZC, MSG_HEAD, MSG_PUT, MSG_PUT_ZC, MSG_RANGE,
+    PUT_ZC_HEADER_LEN,
 };
 use autumn_rpc::StatusCode;
 use ed25519_dalek::VerifyingKey;
@@ -269,6 +270,16 @@ pub fn authz_check(
         MSG_GET | MSG_GET_ZC | MSG_GET_REDIRECT => {
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
+        }
+        // F-REDIRECT-BATCH: carries a USER KEY per item — gate each like MSG_BATCH_GET.
+        MSG_GET_REDIRECT_MANY => {
+            let r = partition_rpc::rkyv_decode::<GetRedirectManyReq>(payload).ok()?;
+            for item in &r.items {
+                if let Some(d) = check_key(&item.key, principal, inner, now) {
+                    return Some(d);
+                }
+            }
+            None
         }
         MSG_HEAD => {
             let r = partition_rpc::rkyv_decode::<HeadReq>(payload).ok()?;
