@@ -103,13 +103,18 @@ Verification: autumn-client 0 clippy warnings + 27 lib tests green;
   autumn-partition-server 187 --lib tests green; autumn-server/manager build
   clean; fuse `core` feature builds (fuse binary + python wheel are
   Linux/nightly build envs — main.rs/PyO3 changes are trivial flag threading).
-Main gaps: coco review BLOCKED (local coco/traecli 0.200.16 requires a
-  --profile value the coco-review.sh wrapper omits → arg-parse fail for both
-  models, unrelated to the diff; did a manual self-review instead). Live
-  cross-host PS-egress perf verification DEFERRED to a cluster run. Status
-  not_completed until coco + live verify land.
-Next steps: run coco once the wrapper passes --profile; live-verify the
-  cross-host large-file read PS-egress win on a real cluster with --direct-read.
+Main gaps: coco findbugs DONE 2026-07-07 (GPT-5.5, deep, HEAD~1..HEAD) →
+  未发现问题 (0 findings; traced sub-range clamp vs get_direct contract, FUSE
+  explicit-range reads, BatchClient whole-value reads, EN short-read/failover
+  → PS proxy fallback; overflow + small-dest-truncation weighed and cleared).
+  Fixed coco-review.sh en route (traecli 0.200.16 repurposed headless -p to
+  -p/--profile → switched to the `coco exec` subcommand, verified). STILL
+  not_completed: fuse binary + python wheel are Linux/nightly build envs
+  (unbuilt locally — trivial flag threading), and cross-host functional +
+  PS-egress perf verification is DEFERRED to a real cluster run.
+Next steps: on a real cluster, build+run the fuse binary with --direct-read
+  (byte-identical read + PS read-bytes-flat check per docs/ops.md), build the
+  python wheel, and measure the cross-host large-file PS-egress win.
 
 ============================ prior task history ============================
 Date: 2026-07-05
