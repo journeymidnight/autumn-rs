@@ -19,15 +19,11 @@ fsspec discover the protocol lazily even without importing this package first.
 from __future__ import annotations
 
 from .filesystem import DEFAULT_CHUNK_SIZE, AutumnBufferedFile, AutumnFileSystem
-from .models import load_safetensors, materialize, upload
 
 __all__ = [
     "AutumnFileSystem",
     "AutumnBufferedFile",
     "DEFAULT_CHUNK_SIZE",
-    "upload",
-    "materialize",
-    "load_safetensors",
 ]
 
 try:

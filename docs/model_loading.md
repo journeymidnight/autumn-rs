@@ -14,7 +14,7 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
   and byte-read API, not a load path.
 - **The three practical ways to serve an autumn-resident model:**
   1. **Materialize to local NVMe → serve unmodified** — universal, full local
-     speed, zero engine code. `autumn_fsspec.materialize()`.
+     speed, zero engine code. `fs.get(src, local, recursive=True)`.
   2. **FUSE mount + force the loader's *eager* read** — zero copy-out, but you
      MUST avoid the default mmap-over-FUSE path (30–50× slower).
   3. **Custom vLLM/SGLang streaming loader over autumn's zero-copy `read_into`**
@@ -70,9 +70,11 @@ no serve-time streaming-from-object-storage path.
 Works with every engine, no engine code, full local-disk speed.
 
 ```python
-import autumn_fsspec as af
-af.upload("/data/hf/Llama-3-8B", "models/llama-3-8b", manager="mgr:9001")   # once
-af.materialize("models/llama-3-8b", "/scratch/llama", manager="mgr:9001")   # per node
+import fsspec
+fs = fsspec.filesystem("autumn", manager="mgr:9001")
+# trailing "/" on both = copy CONTENTS into the dir (put once; get per node)
+fs.put("/data/hf/Llama-3-8B/", "models/llama-3-8b/", recursive=True)   # once
+fs.get("models/llama-3-8b/", "/scratch/llama/", recursive=True)        # per node
 ```
 ```bash
 vllm serve /scratch/llama            # or: python -m sglang.launch_server --model-path /scratch/llama

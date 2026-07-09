@@ -72,17 +72,19 @@ loader). Helpers for the model paths (see `docs/model_loading.md` for the full
 ranked analysis):
 
 ```python
-import autumn_fsspec as af
+import fsspec
+fs = fsspec.filesystem("autumn", manager="127.0.0.1:9001")
 
-af.upload("/local/llama-3-8b", "models/llama-3-8b", manager="127.0.0.1:9001")
+# upload a model into autumn (trailing "/" on both = copy CONTENTS into the dir):
+fs.put("/local/llama-3-8b/", "models/llama-3-8b/", recursive=True)
 
 # Path A — materialize to local NVMe, then serve unmodified (universal):
-af.materialize("models/llama-3-8b", "/scratch/llama", manager="127.0.0.1:9001")
+fs.get("models/llama-3-8b/", "/scratch/llama/", recursive=True)
 #   vllm serve /scratch/llama
 
 # Path B — read a state_dict straight from autumn (no mount, whole file → RAM):
-sd = af.load_safetensors("models/llama-3-8b/model-00001-of-00002.safetensors",
-                         manager="127.0.0.1:9001")
+from safetensors.torch import load as st_load
+sd = st_load(bytes(fs.cat_file("models/llama-3-8b/model-00001-of-00002.safetensors")))
 ```
 
 Path C — a custom vLLM `--load-format autumn` streaming loader over autumn's
@@ -97,8 +99,7 @@ pip install -e python/autumn_fsspec[datasets]
 
 # offline (no cluster — a Python inode tree, FakeFs, backs the same facade code):
 python -m pytest python/autumn_fsspec/tests/test_fs_offline.py \
-                 python/autumn_fsspec/tests/test_datasets_offline.py \
-                 python/autumn_fsspec/tests/test_models_offline.py -q
+                 python/autumn_fsspec/tests/test_datasets_offline.py -q
 
 # live (self-contained — boots an isolated cluster, builds the wheel, runs the
 # live suite against the autumn.Fs backing, tears down):

@@ -198,12 +198,11 @@ connect with `wire-version mismatch` (rebuild: `cd python && maturin build
 
 ```bash
 # Offline (no cluster) — a Python inode tree (FakeFs) backs the SAME facade code
-# path; full FS surface + HuggingFace datasets + models upload/materialize:
+# path; full FS surface + HuggingFace datasets round-trip:
 cd python/autumn_fsspec
-python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py \
-                 tests/test_models_offline.py -q
-#   (the vLLM loader is now the separate autumn_vllm_loader package — see
-#    docs/model_loading.md Recipe C + python/autumn_vllm_loader/tests/)
+python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py -q
+#   (model upload/materialize = plain fsspec fs.put/fs.get; the vLLM loader is the
+#    separate autumn_vllm_loader package — docs/model_loading.md Recipe C)
 
 # Live — self-contained (boots an isolated memory-mode cluster, builds the
 # wheel, runs the live suite against the autumn.Fs backing, tears down):
