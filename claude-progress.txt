@@ -1,3 +1,108 @@
+Date: 2026-07-10
+TaskStatus: completed
+Task scope: F-CHAOS-DECOMMISSION #1 — root-cause + fix the live-fenced-node
+  decommission drain wedge (MSG_REMOVE_NODE never unblocks; kill-first "works").
+RESOLUTION (supersedes the starvation theory below — the EN NEVER hung):
+  Instrumentation (per-second EN liveness tick + stage markers + gdb + on-disk
+  .dat/.meta evidence) proved the "hung" run_recovery_task COMPLETED in <10 ms;
+  the runtime ticked at 1000 ms throughout; the 30s timeout "anomaly" = nothing
+  left to time out (prior trace had no completion marker → success read as hang).
+  REAL ROOT CAUSE, two layers:
+  (L1 harness wiring) every EXT_MSG_DF in system_chaos was BLACK-HOLED:
+    format registers control_address = advertise+1000; harness advertise = the
+    TOXIPROXY port; toxiproxy fronted only the DATA port → node_health_loop
+    (the ONLY drain of EN recovery_done → apply_recovery_done) dialed an
+    unbound port every 2 s for every node, all run. No completion was EVER
+    applied → replicates kept the fenced node → remove blocked forever.
+  (L2 mechanism) lost-completion candidate POISONING: handle_df mem::take's
+    recovery_done before delivery is known (at-most-once). Each 60 s
+    stale-sweep re-dispatch consumed the next candidate (extent 16: node 3
+    @:56, node 5 @+60s, node 9 @+120s — exact sweep cadence), each completed
+    + lost; then ALL candidates refused "extent already exists" forever.
+  The live-vs-SIGKILL contrast was incidental, not causal.
+FIXES (working tree):
+  1) system_chaos bootstrap_en: second toxiproxy proxy en-{i}-ctl
+     (proxy_port+1000 → real_port+1000) + pick_proxy_port_pair; partition
+     nemesis cuts both planes.
+  2) extent_node.rs try_adopt_completed_recovery: require_recovery re-dispatch
+     on an existing local extent ADOPTS (re-reports RecoveryTaskDone) iff the
+     copy is verified complete vs the manager snapshot (same eversion + sealed
+     + full length + !EC + !quarantined); else keeps the refusal. Red-before-
+     green test: system_extent_recovery::
+     lost_recovery_completion_redispatch_adopts_local_copy.
+  3) Kept the 4 earlier latent-bug fixes (30s read bound / sealed-empty
+     short-circuit / 120s recovery stale threshold / NOT_LEADER retry) —
+     correct hardening, none were the cause; comments corrected to the proven
+     narrative.
+VALIDATION: exact repro (seed 1, 12-action set, DECOMMISSION=1) → drains in
+  1 probe (~3 s), test PASSES in 80 s (was 270 s wedge-FAIL); seed 42 + KILL=1
+  variant green; autumn-stream 90 unit + 3/3 system_extent_recovery green.
+DEFERRED (documented in feature_list): at-least-once done-task handoff
+  (DfReq.tasks acks drained ids) — adopt already self-heals a lost response
+  within one sweep cycle.
+NOT committed (user decides commit split).
+
+------------- superseded in-flight notes (kept for history) -------------
+Task scope (original): F-CHAOS-DECOMMISSION — "补齐缺少的场景" (add missing chaos scenarios:
+  forcegc/fence/remove). Enable the dormant nemesis actions + add node-decommission
+  ("remove") chaos coverage of the F211/F-FENCE-DRAIN fence→drain→remove pipeline.
+Current summary: Scenarios ADDED (additive, default-OFF — base test + vphead
+  UNAFFECTED, stay green). (1) Dormant-actions win: fence/killfence/ec/partition/
+  latency are already in the harness (ALL_ACTIONS = harness default) but no script
+  ran them; scripts/decommission_chaos.sh now runs the FULL 12-action set. (2)
+  run_terminal_decommission + AUTUMN_CHAOS_DECOMMISSION=1: terminal one-shot that
+  fences one EN, waits for full drain, MSG_REMOVE_NODE, then existing verify proves
+  no loss. Compiles clean.
+Main gaps: The decommission scenario FOUND A REAL BUG (why status = not_completed;
+  passes:false in feature_list). **Decommissioning a LIVE fenced node STALLS** —
+  fence drains open tails (F-FENCE-DRAIN) but recovery does NOT relocate the fenced
+  node's healthy SEALED replicas while it's alive → MSG_REMOVE_NODE blocks 180s →
+  FAIL. Confirmed by contrast: AUTUMN_CHAOS_DECOMMISSION_KILL=1 (kill the fenced
+  node first) drains in ~3s. Contradicts docs/ops.md decommission runbook + the
+  HDFS live-decommission model. Localized to recovery.rs::recovery_dispatch_loop
+  503-572 (fenced dispatch at 568 fires but rebuild doesn't complete for a
+  live-source extent). FINDING #2 (independent, found validating the full set with
+  decommission OFF): the FULL nemesis set leaves GC reclaim STUCK on ~50% of seeds
+  (seed 42 PASS, seed 1 FAIL on verify_gc_reclaim — flush+major-compact+force-GC
+  deleted 0 extents; NO data loss). The dormant ec/fence churn can pin the GC
+  replay floor (F-GC-FLOOR-OBS behavior). Retracts my "safe by construction" claim.
+  Open Q: floor-protection-correct (verify_gc_reclaim too strict) vs real
+  major-compact-doesn't-advance-floor bug. Full set == harness DEFAULT ALL_ACTIONS
+  that no script ran to green → likely always latent.
+FIX ATTEMPT (2026-07-10, user: "fix #1 and #2"):
+  #2 FIXED + VALIDATED — verify_gc_reclaim now tolerates reclaim=0 when force-GC
+  protected NOTHING (nothing-to-reclaim); fails only on protected+reclaim=0 (real
+  stuck floor). Full-set seeds 1+42 both PASS.
+  #1 NOT FIXED (deeper root cause found via EN instrumentation, but unresolved).
+  The manager "stuck marker" is a SYMPTOM: the fenced-slot dispatch (recovery.rs
+  568) DOES fire + acquires the Recovery marker, but the target EN's
+  run_recovery_task HANGS in the copy path (EN logs: START→resolved→got permit→
+  ensured→got nodes map→trying source node=9, then nothing). Blocking extent is
+  often sealed_length==0 (F-FENCE-DRAIN-rolled empty tail) doing a pointless
+  length==0 read-to-end that parks. DECISIVE: a compiled-in 30s read timeout NEVER
+  fires while the task hangs 60s+ → the EN's single-threaded compio runtime is
+  STARVED (no task incl. the timer polled; F206 failure class). FOUR correct
+  latent-bug fixes landed but NONE resolve the hang: (i) read_bytes_chunk 30s
+  timeout (bounds unbounded rpc_oneshot, F228/F229); (ii) sealed-empty short-circuit
+  in run_recovery_task; (iii) recovery_stale_threshold_secs 120s (extent_inflight);
+  (iv) NOT_LEADER retry in the decommission probe. Unit tests GREEN (stream 90,
+  manager 182); base full-set regression LOSS-FREE (my recovery changes are safe).
+  But 3-seed live-decommission STILL FAILS (all hang 270s).
+Main gaps (UPDATED): #1 is an EN-runtime-starvation / acquire_recovery permit
+  interaction under churn — a deep recovery-subsystem bug needing focused
+  runtime-level investigation (compio task scheduling), NOT more inference in
+  revert-prone code. Stopped per [[feedback_reproduce_before_fixing_mechanism_bugs]].
+Next steps: (a) user decides KEEP (correct+safe latent fixes) vs REVERT the 4
+  recovery changes for a clean follow-up. (b) #1 follow-up: instrument the EN
+  compio runtime to find what starves the single thread during a fenced-node drain
+  (candidate: an EC re_avali / recovery copy of a huge extent tying up the core,
+  per F206) → fix → then live-decommission drains. Repro (STILL FAILS):
+  AUTUMN_CHAOS_SEED=1 AUTUMN_CHAOS_DECOMMISSION=1 AUTUMN_CHAOS_NUM_ENS=6 \
+  AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS=60 cargo test -p autumn-manager --test \
+  system_chaos chaos_real_kill_split_merge_ec_fence_no_data_loss -- --ignored --exact
+NOT committed. #2 fix is green; #1 remains open (scenario gated default-off).
+
+============================ prior task history ============================
 Date: 2026-07-08
 TaskStatus: completed
 Task scope: autumn_vllm_loader — the REAL vLLM model loader (was "engine proven,

@@ -496,6 +496,21 @@ until the node is fully drained, and prints `remove: ok` only when the manager
 has verified no extent / EC-marker references remain. After remove, the node_id
 is tombstoned (same address cannot re-register); stop the EN process.
 
+**Drain-never-completes checklist (F-CHAOS-DECOMMISSION root cause):** the
+drain's last mile is the manager LEARNING that a rebuild finished — the EN
+reports completed recoveries only in its `df` response, and the manager's df
+goes to the node's **control address = advertise_host:(advertise_port+1000)**.
+If anything sits between the manager and an EN (proxy, NAT, port forward), it
+MUST forward the control port alongside the data port, or every df fails
+silently: recoveries complete on the target ENs but are never applied, the
+fenced node's slots never rewrite, and `remove` blocks forever while
+`extent-health` shows the same blocking extents each probe. Symptoms of this
+wiring failure: all nodes stuck in `Suspend` state (`list-nodes`), and
+`recovery-stats` re-dispatching the same extent to a new candidate every
+stale-sweep interval until every candidate refuses `extent already exists`
+(re-dispatch to a candidate holding a verified-complete copy self-heals by
+adopting it — but delivery still needs a working df channel).
+
 Dead-EN notes (fence a node that's already unreachable):
 
 - Everything above still works — seal probes and recovery just skip the dead
@@ -712,6 +727,21 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 #   (system_chaos's own action name for force GC is `forcegc`; AUTUMN_CHAOS_ACTIONS
 #    to bisect, e.g. AUTUMN_CHAOS_ACTIONS=split,forcegc)
+# Full-set + node DECOMMISSION chaos (F-CHAOS-DECOMMISSION): same system_chaos
+# harness but with the FULL nemesis set — including the ones vphead omits:
+# fence (MSG_FENCE_NODE/clear), killfence (kill-then-fence), ec (convert-under-
+# load), partition + latency (toxiproxy net faults). THEN a terminal one-shot:
+# after the nemesis loop stops and the cluster heals, one EN is permanently
+# removed the HDFS way (fence -> F-FENCE-DRAIN + fenced_only recovery relocate
+# every extent off it -> MSG_REMOVE_NODE refuses until fully drained, tombstones
+# the address), and the per-key/range/accounting verify proves NO loss with the
+# node gone. Removal is a TERMINAL one-shot, NOT a per-cycle nemesis action
+# (non-reversible: a permanent node loss injected every cycle would starve the
+# cluster below quorum). Needs 6 ENs (removes 1, must leave >= K+M):
+./scripts/decommission_chaos.sh                        # full set + remove, 3 seeds
+AUTUMN_CHAOS_DECOMMISSION=0 ./scripts/decommission_chaos.sh   # full set, no remove
+#   (any run of the base test can add the terminal remove with
+#    AUTUMN_CHAOS_DECOMMISSION=1 AUTUMN_CHAOS_NUM_ENS=6)
 # Transport-layer chaos (real cluster.sh cluster; E1 EN kill+respawn, E2 PS
 # kill -> migrate, E3 PS respawn, E4 manager kill+respawn (F265), E5 PS +
 # manager double-kill inside the eviction window -> the interrupted eviction

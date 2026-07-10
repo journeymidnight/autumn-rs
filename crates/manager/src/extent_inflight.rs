@@ -420,6 +420,34 @@ impl AutumnManager {
             .max(60)
     }
 
+    /// F-FENCE-DRAIN-2: RECOVERY markers get a SHORTER stale threshold than the
+    /// general (Delete) one. Override with `AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`,
+    /// default 120s, clamped >= 30.
+    ///
+    /// Rationale (found by decommission chaos, 2026-07-10): a fenced node's
+    /// healthy sealed replicas are relocated by `recovery_dispatch_loop`'s
+    /// fenced-slot dispatch. That dispatch acquires a Recovery marker and sends
+    /// REQUIRE_RECOVERY to a target EN; the EN's `run_recovery_task` gives up
+    /// after 10 × 10s = 100s WITHOUT reporting failure back, so the manager's
+    /// marker outlives the dead EN task and — because `dispatch_recovery_task`
+    /// refuses-at-start on any held marker (`extent_inflight_op`) — re-dispatch
+    /// is frozen until this sweep releases it. At the old 600s the drain of a
+    /// live fenced node (hence `remove`) stalled ~10 min per stuck extent
+    /// (chaos: node never reached 0 shards within the test window). 120s is just
+    /// past the EN's own 100s give-up, so a Recovery marker older than this
+    /// definitely has no live EN task behind it; releasing it re-dispatches with
+    /// fresh state (recovery is idempotent + retries — F208 auto-release safety
+    /// argument, and the EN's F139 `recovery_inflight` refuses any genuine
+    /// duplicate). Delete keeps the 600s general threshold (it has its own
+    /// F210-G2 retry queue); ConvertToEc stays WARN-only (F209-C).
+    fn recovery_stale_threshold_secs() -> i64 {
+        std::env::var("AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(120)
+            .max(30)
+    }
+
     /// F208: sweep interval in seconds. Override with env
     /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`. Default 60s.
     /// Clamped to >= 1.
@@ -438,6 +466,11 @@ impl AutumnManager {
     /// see the loop's docstring for the safety argument. Only Recovery
     /// and Delete are auto-released here.
     pub(crate) async fn sweep_stale_inflight_once(&self, now: i64, threshold_secs: i64) -> usize {
+        // F-FENCE-DRAIN-2: Recovery markers release faster (see
+        // `recovery_stale_threshold_secs`). `.min(threshold_secs)` so a caller
+        // (unit test) passing an even-shorter general threshold still wins —
+        // recovery is never released LATER than the general threshold.
+        let recovery_threshold = Self::recovery_stale_threshold_secs().min(threshold_secs);
         // Snapshot stale candidates under a single ledger borrow so we
         // don't hold the borrow across the await.
         let stale: Vec<(u64, ExtentOpKind, i64)> = self
@@ -447,7 +480,11 @@ impl AutumnManager {
             .filter_map(|(eid, rec)| {
                 rec.kind().and_then(|kind| {
                     let age = now - rec.started_at;
-                    if age >= threshold_secs {
+                    let eff_threshold = match kind {
+                        ExtentOpKind::Recovery => recovery_threshold,
+                        _ => threshold_secs,
+                    };
+                    if age >= eff_threshold {
                         Some((*eid, kind, age))
                     } else {
                         None

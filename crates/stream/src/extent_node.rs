@@ -4280,9 +4280,36 @@ impl ExtentNode {
             offset,
             length,
         };
-        let resp_bytes = rpc_oneshot(sock, MSG_READ_BYTES, req.encode())
-            .await
-            .map_err(|e| format!("read_bytes from {addr}: {e}"))?;
+        // F-FENCE-DRAIN-2: BOUND this recovery source read. `rpc_oneshot`
+        // (connect + write + read) is otherwise UNBOUNDED — under chaos churn a
+        // source EN slowed / half-open by a network-partition or latency toxic
+        // (or mid-kill) can park this await indefinitely, pinning a recovery
+        // permit + the manager's Recovery marker for the whole stall. A
+        // timed-out read fails this source so `stream_one_source` falls
+        // through to the next healthy source (or the recovery fails cleanly +
+        // retries). 30 s covers a legit 256 MiB chunk transfer even on a
+        // slow-but-progressing link while capping a genuinely wedged peer.
+        // Mirrors the F228/F229 "bound every await reachable from a loop"
+        // invariant + the F121 append-fanout / F223 chunked-read timeouts.
+        // `extent_info_from_manager` (right below) already bounds its manager
+        // call the same way. (NOTE: this bound was ADDED while chasing the
+        // decommission drain wedge, but was NOT that bug's cause — the wedge
+        // was the lost recovery COMPLETION, see `try_adopt_completed_recovery`
+        // + the system_chaos control-port proxy fix. Kept as a correct
+        // liveness bound in its own right.)
+        let resp_bytes = match compio::time::timeout(
+            std::time::Duration::from_secs(30),
+            rpc_oneshot(sock, MSG_READ_BYTES, req.encode()),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(|e| format!("read_bytes from {addr}: {e}"))?,
+            Err(_) => {
+                return Err(format!(
+                    "read_bytes from {addr}: timed out after 30s (source slow/unreachable)"
+                ))
+            }
+        };
         let resp = ReadBytesResp::decode(resp_bytes).map_err(|e| format!("decode: {e}"))?;
         if resp.code != CODE_OK {
             return Err(format!(
@@ -4651,7 +4678,20 @@ impl ExtentNode {
         // `extent_info.parity` is non-empty.
         let extent = self.ensure_extent(task.extent_id).await?;
 
-        let payload_len = if !extent_info.ec_converted {
+        let payload_len = if !extent_info.ec_converted && extent_info.sealed_length == 0 {
+            // F-FENCE-DRAIN-2: a sealed-EMPTY extent (`sealed_length == 0` — e.g.
+            // an open tail that the fence drain rolled empty, then recovery
+            // rebuilds its fenced slot) has NO bytes to copy: `ensure_extent`
+            // already created the empty local file. SKIP the source read
+            // entirely — a sealed-empty extent needs a 0-byte file marked
+            // sealed, not a `length==0` read-to-end against a peer (a pure
+            // waste that also exposes this recovery to source-side stalls).
+            // Sets the sealed flag below via the same `sealed_length == 0` →
+            // sealed path. This is the common shape in a fenced-node drain:
+            // F-FENCE-DRAIN rolls the victim's open tails empty, then the
+            // fenced-slot dispatch rebuilds them.
+            0
+        } else if !extent_info.ec_converted {
             // Replication recovery — F193 Stage C: stream the full extent from a
             // healthy peer chunk-by-chunk straight into the file (peak = one
             // FILE_IO_CHUNK_BYTES chunk), instead of materializing the whole
@@ -5926,6 +5966,70 @@ impl ExtentNode {
         }))
     }
 
+    /// F-FENCE-DRAIN-3: re-dispatch adopt for a COMPLETED-but-unreported
+    /// recovery. `handle_df` hands `recovery_done` to the manager via
+    /// `std::mem::take` BEFORE knowing the response was delivered (an
+    /// at-most-once handoff): if the df response is lost in transit, the
+    /// completion is gone forever — the manager's Recovery marker ages out
+    /// via the F208 stale sweep and the slot is re-dispatched. Pre-this-fix
+    /// the "extent already exists" refusal then PERMANENTLY poisoned every
+    /// candidate that had already completed once; after every candidate was
+    /// poisoned the fenced slot could never be rebuilt and `MSG_REMOVE_NODE`
+    /// blocked forever (the live-decommission drain wedge — reproduced by
+    /// `system_chaos` + `AUTUMN_CHAOS_DECOMMISSION=1`, where each 60 s
+    /// sweep-release re-dispatched extent 16 to the next candidate until
+    /// nodes 3/5/9 all held complete-but-unadoptable local copies).
+    ///
+    /// Adopt is deliberately NARROW — the bytes of a sealed replicated
+    /// extent are immutable, so a local copy that matches the manager's
+    /// authoritative snapshot (same eversion, sealed, full sealed_length,
+    /// not EC-converted, not quarantined) IS the completed recovery result;
+    /// its `.meta` was made durable by the original run (P0-D fail-closed).
+    /// Everything else (open / partial / stale-eversion / EC-shard local
+    /// state) returns false and keeps the refusal. EC-shard adopt would need
+    /// a `shard_size` comparison against the local shard — deferred until
+    /// reproduced.
+    async fn try_adopt_completed_recovery(
+        &self,
+        task: &crate::extent_rpc::RecoveryTask,
+        entry: &Rc<ExtentEntry>,
+    ) -> bool {
+        let info = match self.extent_info_from_manager(task.extent_id).await {
+            Ok(Some(info)) => info,
+            // Manager unreachable / extent unknown — keep the refusal; the
+            // orphan-reconcile sweep (F109/F113) reaps a truly-deleted extent.
+            _ => return false,
+        };
+        if info.ec_converted || !info.sealed {
+            return false;
+        }
+        if entry.corrupt_meta.load(Ordering::SeqCst) {
+            // META-FAILCLOSED quarantine: never report a quarantined copy
+            // as a healthy recovered replica.
+            return false;
+        }
+        let local_ev = entry.eversion.load(Ordering::SeqCst);
+        let local_len = entry.len.load(Ordering::SeqCst);
+        let local_sealed = entry.sealed.load(Ordering::SeqCst)
+            || entry.sealed_length.load(Ordering::SeqCst) > 0;
+        if !(local_sealed && local_ev == info.eversion && local_len >= info.sealed_length) {
+            return false;
+        }
+        tracing::info!(
+            extent_id = task.extent_id,
+            replace_id = task.replace_id,
+            eversion = local_ev,
+            len = local_len,
+            sealed_length = info.sealed_length,
+            "require_recovery: local copy already complete — adopting (lost-completion re-dispatch)"
+        );
+        self.recovery_done.borrow_mut().push(RecoveryTaskDone {
+            task: task.clone(),
+            ready_disk_id: entry.disk_id,
+        });
+        true
+    }
+
     async fn handle_require_recovery(&self, payload: Bytes) -> HandlerResult {
         let req: RequireRecoveryReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -5952,7 +6056,21 @@ impl ExtentNode {
             );
         }
 
-        if self.extents.contains_key(&task.extent_id) {
+        if let Some(entry) = self
+            .extents
+            .get(&task.extent_id)
+            .map(|v| Rc::clone(v.value()))
+        {
+            // F-FENCE-DRAIN-3: a local copy already exists. If it is a
+            // COMPLETED-but-unreported prior recovery (the df response
+            // carrying its RecoveryTaskDone was lost — see
+            // `try_adopt_completed_recovery`), adopt it: re-report done
+            // instead of refusing. Anything short of a verified-complete
+            // copy keeps the pre-existing refusal — recovery must never
+            // truncate-and-overwrite an existing local extent file.
+            if self.try_adopt_completed_recovery(&task, &entry).await {
+                return code_resp(CODE_OK, String::new());
+            }
             return code_resp(
                 CODE_PRECONDITION,
                 format!("extent {} already exists", task.extent_id),
