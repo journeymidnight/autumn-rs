@@ -439,12 +439,13 @@ read(ino, offset, size):
   4. 多 chunk 并发读 (compio spawn)
 ```
 
-**F-DIRECT-MANY — `--direct-read` 挂载参数（默认关，拓扑相关）。** 挂载时带
-`--direct-read`，`read::execute` 就用 `ClusterClient::get_many_direct` 取代
-`get_many_into`：≥ 64 KiB 的整 extent 读**绕过 PS 直读 EN**（PS 网卡出流量离开
-数据路径，大文件/模型服务跨机吞吐更高）。默认关是因为它**要求 fuse 主机能连到 EN
-数据口**（常见部署把 EN 数据口放在 PS-only 子网）；开了也安全——每项直读失败**逐项
-回退 PS proxy**（一个 redirect RTT + 回退）。落点：`FsState.direct_read`
+**F-DIRECT-MANY — `--direct-read` 挂载参数（默认 ON，2026-07-09 用户指令）。**
+`read::execute` 用 `ClusterClient::get_many_direct` 取代 `get_many_into`：≥ 64 KiB
+的整 extent 读**绕过 PS 直读 EN**（PS 网卡出流量离开数据路径，大文件/模型服务跨机
+吞吐更高）；< 64 KiB 的读仍走 PS proxy（逐项按大小 gate）。默认 ON 是安全的——每项
+直读失败**逐项回退 PS proxy**（authoritative），首次回退 client 打**一次 WARN**
+提示拓扑（EN 不可达）。若部署把 EN 数据口放在 PS-only 子网，用 `--direct-read false`
+关掉以省掉每 extent 一个 redirect RTT。落点：`FsState.direct_read`
 (`main.rs` 从 `--direct-read` 置位；PyO3 `autumn.Fs.connect(direct_read=)` 同一字段)
 → `prepare` 时抓进每个 `ReadPlan.direct_read`（spawned `execute` 不持 `&FsState`）
 → `execute` 据此选 batch 原语。混合大小的一次读天然逐项路由：< 64 KiB 的项仍走 PS。

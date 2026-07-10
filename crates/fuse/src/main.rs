@@ -45,12 +45,12 @@ struct Args {
     /// F-DIRECT-MANY — read whole extents (≥ 64 KiB) STRAIGHT from an extent
     /// node, bypassing the PS on the large-value data path (`get_many_direct`).
     /// A cross-host throughput win for large-file (model) serving: the PS NIC
-    /// egress leaves the read path. TOPOLOGY-DEPENDENT — the fuse host must be
-    /// able to reach EN data ports; default OFF because a common deployment
-    /// keeps EN data ports on a PS-only subnet. Safe to enable even when ENs
-    /// are unreachable: each read falls back to the PS proxy (one redirect RTT
-    /// + fallback per extent).
-    #[arg(long, default_value = "false")]
+    /// egress leaves the read path. Size-gated per read (< 64 KiB stays on the
+    /// PS proxy), and SAFE even when ENs are unreachable — each large read
+    /// falls back to the PS proxy (the client warns once). DEFAULT ON; disable
+    /// with `--direct-read false` on a topology that keeps EN data ports on a
+    /// PS-only subnet (fallback works but wastes one redirect RTT per extent).
+    #[arg(long, default_value = "true")]
     direct_read: bool,
 }
 
@@ -133,7 +133,9 @@ fn main() -> Result<()> {
                 };
                 state.direct_read = args.direct_read;
                 if args.direct_read {
-                    tracing::info!("direct-read enabled: whole-extent reads bypass the PS (EN direct)");
+                    tracing::info!("direct-read ON (default): ≥64 KiB reads go EN-direct, bypassing the PS (falls back to proxy per read if ENs unreachable)");
+                } else {
+                    tracing::info!("direct-read OFF (--direct-read false): all reads via PS proxy");
                 }
                 tracing::info!("connected to cluster");
 

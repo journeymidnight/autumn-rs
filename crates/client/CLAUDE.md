@@ -87,10 +87,15 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   item. Per item, ANY direct-read failure falls back to the proxy — so it
   degrades gracefully where ENs aren't client-reachable (one redirect RTT +
   fallback). Because that reachability is TOPOLOGY-dependent, the DECISION to
-  call this vs `get_many_into` is a deploy flag OWNED BY THE FRONTEND (fuse
-  `--direct-read`, python `BatchClient(direct=…)` / `autumn.Fs.connect(direct_read=…)`),
-  NEVER a hardcoded SDK default. Shares the replica-failover loop with
-  `get_direct` (`read_redirect_replicas`). One extra copy vs `get_many_into`'s
+  call this vs `get_many_into` is a flag OWNED BY THE FRONTEND (fuse
+  `--direct-read`, python `BatchClient(direct=…)` / `autumn.Fs.connect(direct_read=…)` /
+  kvcache `direct_read` / vLLM-loader `direct_read`). The frontends now DEFAULT
+  it ON (2026-07-09, user directive) — safe because it's size-gated (only
+  ≥ 64 KiB reads redirect) AND the proxy fallback is authoritative; the first
+  fallback logs ONE `WARN` (`DIRECT_FALLBACK_WARNED`) so a wrong topology (ENs
+  on a PS-only subnet) surfaces without per-read spam. Disable per-frontend on
+  such a topology to skip the wasted redirect RTT. Shares the replica-failover
+  loop with `get_direct` (`read_redirect_replicas`). One extra copy vs `get_many_into`'s
   recv-into-`dest`: the direct read lands in a read_loop pooled buffer
   (`call_into_pooled`) then memcpys into `dest` — the pooled recv (not
   `call_into_dest`) is deliberate, because the direct read carries a 3 s timeout

@@ -198,6 +198,12 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
     value_size >= UCX_ZC_READ_MIN_BYTES
 }
 
+/// F-DIRECT-MANY: latches after the first direct-read→proxy fallback so the
+/// warning fires exactly once per process (default-ON direct-read on a topology
+/// where ENs aren't client-reachable would otherwise warn on every large read).
+static DIRECT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// F235: default in-flight concurrency for `get_many_into` (sliding-window pipeline
 /// over the per-partition multiplexed connections). Mirrors the stream worker's
 /// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
@@ -1846,11 +1852,25 @@ impl ClusterClient {
                 "direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
             );
         } else {
-            tracing::debug!(
-                extent_id = resp.extent_id,
-                replicas = n,
-                "direct read failed on ALL replicas; falling back to PS proxy"
-            );
+            // F-DIRECT-MANY default-ON: the FIRST proxy fallback WARNS (surfaces
+            // a topology where the ENs aren't client-reachable → direct-read is
+            // silently on the slow proxy path); later ones stay debug to avoid
+            // per-read spam. Correctness is unaffected — the proxy read is
+            // authoritative; this is a perf/topology signal only.
+            if !DIRECT_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "direct-read fell back to PS proxy (ENs not client-reachable?) — \
+                     large reads use the proxy path; pass direct_read=false to disable"
+                );
+            } else {
+                tracing::debug!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "direct read failed on ALL replicas; falling back to PS proxy"
+                );
+            }
         }
         None
     }

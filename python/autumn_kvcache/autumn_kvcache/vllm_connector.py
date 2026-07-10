@@ -218,6 +218,7 @@ class _AutumnKVStore:
         n_workers: int = 1,
         max_inflight: Optional[int] = None,
         ttl_secs: int = 0,
+        direct_read: bool = True,
     ):
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
@@ -241,7 +242,20 @@ class _AutumnKVStore:
         default_cap = 16 if transport == "ucx" else 64
         cap = int(max_inflight) if max_inflight else default_cap
         # Hot-path: GIL-releasing batched client (ZC on UCX for large pages).
-        self._batch = autumn.BatchClient(endpoint, max(1, int(n_workers)), max(1, cap))
+        # F-DIRECT-MANY: direct_read (default ON) sends ≥64 KiB KV-page gets
+        # STRAIGHT to an EN (bypassing the PS); <64 KiB pages stay on the proxy
+        # (size-gated per item), and any direct-read failure falls back to the
+        # proxy (the client warns once). Set direct_read=False in extra_config
+        # on a topology where the vLLM host can't reach EN data ports.
+        self._direct_read = bool(direct_read)
+        log.info(
+            "autumn-kvcache: direct_read=%s (≥64 KiB pages %s)",
+            self._direct_read,
+            "EN-direct" if self._direct_read else "PS-proxy",
+        )
+        self._batch = autumn.BatchClient(
+            endpoint, max(1, int(n_workers)), max(1, cap), self._direct_read
+        )
         # Low-frequency existence probing on its own loop thread.
         self._loop = new_loop()
         self._client = run_on(self._loop, lambda: autumn.Client.connect(endpoint))
@@ -444,6 +458,11 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         ttl_secs = int(extra.get("ttl_secs", 0) or 0)
         if ttl_secs < 0:
             raise ValueError(f"ttl_secs must be non-negative, got {ttl_secs}")
+        # F-DIRECT-MANY: EN-direct reads default ON (topology-dependent, safe —
+        # size-gated + per-item proxy fallback). Accept a JSON bool or a string.
+        direct_read = extra.get("direct_read", True)
+        if isinstance(direct_read, str):
+            direct_read = direct_read.strip().lower() not in ("0", "false", "no", "off")
         self._store = _AutumnKVStore(
             endpoint,
             self._tenant_suffix,
@@ -451,6 +470,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             n_workers=max(1, int(extra.get("client_workers", 1))),
             max_inflight=extra.get("max_inflight"),
             ttl_secs=ttl_secs,
+            direct_read=bool(direct_read),
         )
 
         # scheduler-side state: req_id -> (content_hash, num_tokens) for cache hits.
