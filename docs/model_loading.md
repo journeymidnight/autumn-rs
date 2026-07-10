@@ -6,20 +6,23 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
 
 ## TL;DR
 
-- **fsspec (`autumn://`) feeds HuggingFace `datasets` directly, but does NOT
-  feed model-weight loading.** `transformers.from_pretrained` accepts only a
-  local path or a Hub repo id (it materializes remote repos to a local cache
-  first); vLLM's `runai_streamer` / `tensorizer` accept only `s3://`/`gs://`/
-  `http(s)://`, never arbitrary fsspec. So for **models**, fsspec is a transfer
-  and byte-read API, not a load path.
-- **The three practical ways to serve an autumn-resident model:**
-  1. **Materialize to local NVMe → serve unmodified** — universal, full local
-     speed, zero engine code. `fs.get(src, local, recursive=True)`.
-  2. **FUSE mount + force the loader's *eager* read** — zero copy-out, but you
-     MUST avoid the default mmap-over-FUSE path (30–50× slower).
-  3. **Custom vLLM/SGLang streaming loader over autumn's zero-copy `read_into`**
-     — highest cold-load throughput; plays to autumn's RDMA/UCX strength.
-     Shipped + verified: the `autumn_vllm_loader` package (`--load-format autumn`).
+- **There is NO `autumn://` fsspec surface.** `transformers.from_pretrained`
+  accepts only a local path or a Hub repo id; vLLM's `runai_streamer` /
+  `tensorizer` accept only `s3://`/`gs://`/`http(s)://`, never arbitrary fsspec.
+  autumn's file surface is the programmatic **`autumn.Fs`** binding + the
+  **`autumn-fuse`** mount (byte transfer), and — for weights — the streaming
+  loader below.
+- **The way to serve an autumn-resident model: the `autumn_vllm_loader`
+  streaming loader (`--load-format autumn`)** — reads safetensors shards STRAIGHT
+  from autumn over the **zero-copy `Fs.read_into` seam + batched EN-direct read**,
+  K parallel readers overlapping the storage read with the H2D copy (the
+  Run:ai-Model-Streamer mechanism, on autumn's RDMA/UCX transport). This is what
+  autumn's large-value zero-copy is *for*. Shipped + verified byte-exact;
+  ~82% of Run:ai Model Streamer over RDMA. See **Recipe C** — the recommended path.
+- **Fallbacks when you can't register a loader (other engines, quick tests):**
+  materialize to local NVMe and serve unmodified (Recipe A — `autumn.Fs`
+  download, zero engine code), or a FUSE mount with the loader's *eager* read
+  (Recipe B — never the mmap default, 30–50× slower).
 
 ## Why model load is slow, and how fast loaders win
 
@@ -65,16 +68,31 @@ instances (R-Fork / P2P — fastest of all, but needs a live source replica, not
 a cold start). **TensorRT-LLM** builds a prebuilt engine loaded from local disk;
 no serve-time streaming-from-object-storage path.
 
-## Recipe A — materialize to local, serve unmodified (recommended default)
+## Recipe A — materialize to local, serve unmodified (fallback: any engine, no loader)
 
-Works with every engine, no engine code, full local-disk speed.
+Works with every engine, no engine code, full local-disk speed. Download the
+model dir to local NVMe straight from the `autumn.Fs` API (no mount, no fsspec):
 
 ```python
-import fsspec
-fs = fsspec.filesystem("autumn", manager="mgr:9001")
-# trailing "/" on both = copy CONTENTS into the dir (put once; get per node)
-fs.put("/data/hf/Llama-3-8B/", "models/llama-3-8b/", recursive=True)   # once
-fs.get("models/llama-3-8b/", "/scratch/llama/", recursive=True)        # per node
+import autumn, os
+fs = autumn.Fs.connect("mgr:9001", direct_read=True)   # ≥64 KiB reads go EN-direct
+
+def download(ino, dst):                                  # autumn dir → local dir
+    os.makedirs(dst, exist_ok=True)
+    for name, cino, kind in fs.readdir(ino):             # kind: DT_DIR=4, DT_REG=8
+        p = os.path.join(dst, name)
+        if kind == 4:
+            download(cino, p)
+        else:
+            size, off = fs.getattr(cino)["size"], 0
+            with open(p, "wb") as f:
+                while off < size:
+                    b = fs.read(cino, off, min(8 << 20, size - off))
+                    if not b:
+                        break
+                    f.write(b); off += len(b)
+
+download(fs.resolve("models/llama-3-8b"), "/scratch/llama")
 ```
 ```bash
 vllm serve /scratch/llama            # or: python -m sglang.launch_server --model-path /scratch/llama
@@ -103,7 +121,7 @@ integration is reported "slow without GDS installed"; benchmark before relying
 on it. **True GDS DMA needs a GDS-native FS (local NVMe / NFSoRDMA / Lustre /
 Weka), not generic FUSE.**
 
-## Recipe C — custom streaming loader (highest throughput; shipped + verified)
+## Recipe C — `autumn_vllm_loader` streaming loader (RECOMMENDED — zero-copy, highest throughput)
 
 The **`autumn_vllm_loader`** package registers an out-of-tree vLLM loader
 (`@register_model_loader("autumn")`) whose `load_weights` reads safetensors
@@ -130,27 +148,22 @@ front of autumn + stock `--load-format runai_streamer` (`AWS_ENDPOINT_URL` +
 path-style). Good as a first milestone / A/B baseline; add it if/when an S3
 surface exists.
 
-## Datasets (the part fsspec *does* solve today)
+## Datasets
 
-```python
-import datasets
-so = {"manager": "mgr:9001"}
-datasets.load_dataset("json", data_files="autumn://raw/train.jsonl", storage_options=so)
-ds.save_to_disk("autumn://prepared/ds", storage_options=so)
-datasets.load_from_disk("autumn://prepared/ds", storage_options=so)
-```
-`save_to_disk`/`load_from_disk`/`download_and_prepare` are the reliable
-arbitrary-fsspec paths; `load_dataset(..., storage_options=...)` is marked
-Experimental but works for `data_files`.
+There is no `autumn://` fsspec URL surface (the `autumn_fsspec` facade was
+removed 2026-07-09 — thin wrapper, unused). Load datasets the same way as
+weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
+`datasets` at the local path (`load_dataset(..., data_dir=...)` /
+`load_from_disk(local_path)`).
 
 ## Decision guide
 
 | situation | use |
 |---|---|
-| any engine, node has local NVMe, model reused | **A** (materialize) |
+| **vLLM / SGLang serving an autumn model (the default)** | **C** — `autumn_vllm_loader`, `--load-format autumn` (zero-copy) |
+| other engine / no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
 | want no copy-out / ephemeral nodes | **B** (FUSE + `eager`) |
-| need max cold-load throughput, can ship a loader | **C** (streaming) or S3-gateway + `runai_streamer` |
-| loading a **dataset** (not weights) | fsspec `autumn://` directly |
+| loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |
 
 ### Sources
 vLLM load formats & `register_model_loader`

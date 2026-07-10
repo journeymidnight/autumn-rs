@@ -1,5 +1,12 @@
 # Design: unify `autumn-fuse` + `autumn-fsspec` into one filesystem
 
+> **UPDATE 2026-07-09 — the `autumn_fsspec` facade (M3) was REMOVED** (thin
+> wrapper over `autumn.Fs`, unused; no `autumn://` URL surface anymore). The
+> shared inode core (M1) + the `autumn.Fs` PyO3 binding (M2) + the lease fencing
+> (M4) all STAY — they back `autumn-fuse` and `autumn_vllm_loader`. This doc is
+> kept as the design record of that shared core; the fsspec-facade sections are
+> historical.
+
 **Status: APPROVED 2026-07-03 — decisions locked, implementation started (M0).**
 User decisions on the open questions:
 - **Q1 → option (ii)**: WRITE-only leases; reads stay coherent via

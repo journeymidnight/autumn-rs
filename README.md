@@ -37,9 +37,8 @@ self-healing extents.
 **The AI all-in-one:**
 - **Storage data model** — ordered KV (put/get/delete/range, MVCC, streaming
   put/get for large values) via `autumn-client` CLI or the Rust/Python SDK, plus
-  a **POSIX filesystem** (`autumn-fuse`) and a Python **`autumn://` fsspec**
-  filesystem (`autumn_fsspec`, HuggingFace `datasets`-ready) for models,
-  datasets and checkpoints.
+  a **POSIX filesystem** (`autumn-fuse`) and a programmatic **`autumn.Fs`** Python
+  binding (same shared inode layout) for models, datasets and checkpoints.
 - **Inference KV cache** — `autumn-kvcache` implements the sglang / vLLM
   **HiCache L3** storage-backend API (pure Python adapter, no extra daemon);
   verified end-to-end against real models with correct cross-instance
@@ -121,23 +120,21 @@ cp model.safetensors /mnt/autumn/        # a regular filesystem, backed by the c
 Full runbook (mount verification, stale-mount cleanup, RDMA env, k8s
 DaemonSet): [`docs/ops.md`](docs/ops.md#fuse-daemon-runbook).
 
-### Files — Python fsspec (datasets, checkpoints)
+### Files — programmatic `autumn.Fs` (datasets, checkpoints)
 
-`python/autumn_fsspec` registers an `autumn://` [fsspec](https://filesystem-spec.readthedocs.io/)
-filesystem, so Python data tooling reads the cluster directly — no mount:
+The `autumn` PyO3 extension exposes `autumn.Fs` — the same shared inode layout a
+fuse mount serves, so Python reads/writes the cluster directly without a mount:
 
 ```python
-import autumn_fsspec                 # registers the "autumn" protocol
-import datasets
-so = {"manager": "127.0.0.1:9001"}
-ds = datasets.load_dataset("json", data_files="autumn://raw/train.jsonl", storage_options=so)
-ds.save_to_disk("autumn://prepared/ds", storage_options=so)
+import autumn
+fs = autumn.Fs.connect("127.0.0.1:9001")
+ino = fs.resolve("/models/llama-3-8b")
 ```
 
 Large files are transparently chunked (8 MiB, zero-copy reads). For serving a
 model that lives in autumn (vLLM / SGLang), see
-[`docs/model_loading.md`](docs/model_loading.md) — materialize-to-local,
-FUSE-`eager`, or a streaming loader.
+[`docs/model_loading.md`](docs/model_loading.md) — the `autumn_vllm_loader`
+(`--load-format autumn`) streams weights straight to GPU.
 
 ### Inference KV cache — sglang / vLLM
 

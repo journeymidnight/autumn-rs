@@ -181,50 +181,22 @@ cmp /tmp/blob "$MP"/blob && echo "direct-read OK: byte-identical"
 Verify the bypass actually engaged: with `--direct-read` a large read shows
 `autumn_ps_read_bytes` on the PS staying flat (the value bytes don't traverse
 the PS) while the EN's `MSG_READ_BYTES` traffic rises; without it the PS
-read-bytes counter tracks the read. Same flags exist for the other two
-frontends: python `BatchClient(manager, direct=True)` and the fsspec facade
-`AutumnFileSystem(manager=..., direct_read=True)` (→ `autumn.Fs.connect(...,
-direct_read=True)`). Mixed-size batches route per item — sub-64 KiB values still
-go through the PS.
+read-bytes counter tracks the read. The same flag exists on every direct-read
+frontend, all DEFAULT ON now (2026-07-09): fuse `--direct-read` (default true),
+python `BatchClient(manager, ..., direct=True)`, `autumn.Fs.connect(...,
+direct_read=True)`, kvcache `AutumnKVConnector` (`extra_config.direct_read`),
+`autumn_vllm_loader` (`extra_config.direct_read`). Mixed-size batches route per
+item — sub-64 KiB values still go through the PS; on a topology where ENs aren't
+client-reachable each item falls back to the proxy and the client logs one WARN.
 
-## Python fsspec (`autumn://`) verification
-
-`python/autumn_fsspec` is a thin fsspec facade over `autumn.Fs` — the **shared
-inode layout** (F-FS-UNIFY M3), so a file written via fsspec is byte-identical
-through an `autumn-fuse` mount and vice versa. It needs the `autumn` PyO3 SDK
-built **from the cluster's commit** — a wheel older than the cluster fails
-connect with `wire-version mismatch` (rebuild: `cd python && maturin build
---release && pip install --force-reinstall --no-deps target/wheels/autumn-*.whl`).
-
-```bash
-# Offline (no cluster) — a Python inode tree (FakeFs) backs the SAME facade code
-# path; full FS surface + HuggingFace datasets round-trip:
-cd python/autumn_fsspec
-python -m pytest tests/test_fs_offline.py tests/test_datasets_offline.py -q
-#   (model upload/materialize = plain fsspec fs.put/fs.get; the vLLM loader is the
-#    separate autumn_vllm_loader package — docs/model_loading.md Recipe C)
-
-# Live — self-contained (boots an isolated memory-mode cluster, builds the
-# wheel, runs the live suite against the autumn.Fs backing, tears down):
-cargo build --workspace
-bash python/autumn_fsspec/tests/run_fsspec_e2e.sh
-#   → 9 passed, "===== fsspec-e2e exit: 0 ====="
-
-# or against an already-running cluster:
-AUTUMN_MANAGER=127.0.0.1:9001 python -m pytest tests/test_e2e_cluster.py -q
-```
-
-Model loading (materialize-to-local / FUSE-`eager` / streaming loader):
-[`docs/model_loading.md`](model_loading.md).
-
-### `autumn.Fs` — shared inode-layout binding (F-FS-UNIFY M2)
+## Python `autumn.Fs` — shared inode-layout binding (F-FS-UNIFY M2)
 
 `autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
-`autumn-fuse` mount runs on (inode/dirent/extent layout) — the plumbing that
-lets M3 rewrite `autumn_fsspec` as a facade sharing files with a fuse mount.
-Headless correctness (self-contained isolated memory-mode cluster — builds the
-wheel, boots manager+EN+PS, drives the full `Fs` surface + a cross-instance
-byte-exact check, tears down):
+`autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
+file surface (`autumn_vllm_loader` reads model weights through it). Headless
+correctness (self-contained isolated memory-mode cluster — builds the wheel,
+boots manager+EN+PS, drives the full `Fs` surface + a cross-instance byte-exact
+check, tears down):
 
 ```bash
 cargo build --workspace                    # debug binaries first
@@ -234,32 +206,16 @@ bash python/tests/run_fs_e2e.sh
 # M4 — lease fencing + cross-client coherence (two Fs clients):
 bash python/tests/run_fs_lease_e2e.sh
 #   → "PY M4 fencing OK", "PY M4 coherence OK", "===== fs-lease-e2e exit: 0 ====="
-
-# M4 — REAL cross-surface interop (needs /dev/fuse + fusermount3): write through
-# an autumn-fuse kernel mount, read byte-exact via fsspec, and vice versa:
-bash python/autumn_fsspec/tests/run_mount_fsspec_interop.sh
-#   → "PY INTEROP OK: fuse mount + fsspec are one filesystem", exit 0
-#   (skips cleanly if /dev/fuse or fusermount3 is absent)
 ```
 
-M4 write-fencing: `autumn_fsspec` and a fuse mount both take the same per-inode
-WRITE lease around writes (via `autumn.Fs` / `lease_tasks.rs`), so concurrent
-writers to one inode conflict instead of corrupting each other; reads are
-close-to-open coherent (fresh-read + `forget`-on-release). Behavior-preservation
-gate for the `dispatch` Create/Unlink/init_root refactor + the M4 `lease_tasks`
-extraction (the binding shares those core steps): the fuse e2e suite must stay
-green — `cargo test -p autumn-manager --test system_fuse_read --test
-f_fuse_lease_1 --test f_fuse_lease_2 -- --ignored --test-threads=1`.
-
-Chaos (fsspec interface under failover — PS kill→migration, manager
-kill→respawn, final byte-exact verify + write-liveness probe; timeouts are
-dropped as UNCERTAIN, never counted as loss):
-
-```bash
-cargo build --release --workspace       # cluster.sh runs release binaries
-AUTUMN_DATA_ROOT=/data05/autumn-rs bash scripts/fsspec_chaos.sh
-#   → "=== FSSPEC CHAOS PASS ===" (MISMATCH/VERIFY-FAIL lines = corruption = FAIL)
-```
+M4 write-fencing: `autumn.Fs` clients and a fuse mount both take the same
+per-inode WRITE lease around writes (via `lease_tasks.rs`), so concurrent writers
+to one inode conflict instead of corrupting each other; reads are close-to-open
+coherent (fresh-read + `forget`-on-release). Behavior-preservation gate for the
+`dispatch` Create/Unlink/init_root refactor + the M4 `lease_tasks` extraction
+(the binding shares those core steps): the fuse e2e suite must stay green —
+`cargo test -p autumn-manager --test system_fuse_read --test f_fuse_lease_1
+--test f_fuse_lease_2 -- --ignored --test-threads=1`.
 
 ## Cluster capacity — `autumn-op df`
 
