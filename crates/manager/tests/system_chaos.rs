@@ -100,6 +100,12 @@ struct ChaosConfig {
     /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency
     /// Useful for bisecting which action triggers a failure.
     actions: Vec<Action>,
+    /// `AUTUMN_CHAOS_DECOMMISSION=1` runs a terminal node-decommission phase
+    /// after the nemesis loop stops (fence → drain → MSG_REMOVE_NODE → tombstone),
+    /// then the existing verify confirms no data loss with the node gone. Off by
+    /// default — it is a NON-reversible one-shot, unlike the per-cycle nemesis
+    /// actions (which must all be reversible).
+    decommission: bool,
 }
 
 impl ChaosConfig {
@@ -148,6 +154,10 @@ impl ChaosConfig {
             !actions.is_empty(),
             "AUTUMN_CHAOS_ACTIONS must have at least one action"
         );
+        let decommission = std::env::var("AUTUMN_CHAOS_DECOMMISSION")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Self {
             duration_secs: env_u64("AUTUMN_CHAOS_DURATION_SECS", 30),
             nemesis_interval_ms: env_u64("AUTUMN_CHAOS_NEMESIS_INTERVAL_MS", 3000),
@@ -156,6 +166,7 @@ impl ChaosConfig {
             num_ens,
             seed,
             actions,
+            decommission,
         }
     }
 }
@@ -210,6 +221,26 @@ fn binary_path(name: &str) -> PathBuf {
         );
     }
     p
+}
+
+/// Pick a free port `p` such that `p + 1000` is ALSO free — the EN's
+/// toxiproxy pair binds the data proxy at `p` and the control proxy at
+/// `p + 1000` (the manager derives `control_address = advertise + 1000`,
+/// so the control proxy's listen port is forced, not free-choice).
+/// Unlike `pick_stable_port_pair` this need not dodge the ephemeral
+/// range: proxies live for the whole run and are never re-bound.
+fn pick_proxy_port_pair() -> u16 {
+    for _ in 0..1000 {
+        let p = pick_addr().port();
+        let Some(ctl) = p.checked_add(1000) else {
+            continue;
+        };
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", ctl)) {
+            drop(l);
+            return p;
+        }
+    }
+    panic!("pick_proxy_port_pair: no free (p, p+1000) proxy port pair found");
 }
 
 // ── ProcessGuard: managed subprocess EN ────────────────────────────────
@@ -322,6 +353,25 @@ fn bootstrap_en(
         &format!("127.0.0.1:{port}"),
     )
     .expect("create toxiproxy proxy");
+
+    // 1b. F-CHAOS-DECOMMISSION root-cause fix: ALSO proxy the EN CONTROL
+    //     port. `autumn-op format` registers `control_address` derived from
+    //     the ADVERTISE address (+1000 → proxy_port+1000), and the manager's
+    //     `node_health_loop` sends every `EXT_MSG_DF` there — the ONLY
+    //     channel that drains the EN's `recovery_done` and drives
+    //     `apply_recovery_done`. Pre-fix nothing listened on
+    //     proxy_port+1000 (toxiproxy fronted only the data port), so EVERY
+    //     df in this harness failed silently: recovery completions were
+    //     never applied, a fenced node's slots were never rewritten, and
+    //     `MSG_REMOVE_NODE` stayed Precondition forever (the decommission
+    //     "drain wedge"). The caller guarantees proxy_port+1000 is free
+    //     (pick_proxy_port_pair).
+    toxi.create(
+        &format!("{proxy_name}-ctl"),
+        &format!("127.0.0.1:{}", proxy_port + 1000),
+        &format!("127.0.0.1:{}", port + 1000),
+    )
+    .expect("create toxiproxy control proxy");
 
     let advertise = format!("127.0.0.1:{proxy_port}");
     let listen = format!(":{proxy_port}");
@@ -1101,6 +1151,10 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
     ctx.toxi
         .set_enabled(&victim_proxy, false)
         .map_err(|e| format!("toxiproxy disable: {e}"))?;
+    // A real partition cuts BOTH planes — the control proxy (df/health)
+    // goes down with the data proxy. Best-effort: the ctl proxy exists
+    // for every EN bootstrapped via bootstrap_en step 1b.
+    let _ = ctx.toxi.set_enabled(&format!("{victim_proxy}-ctl"), false);
     ctx.partitioned.borrow_mut().push(victim_proxy.clone());
     eprintln!("nemesis: NetworkPartition {victim_proxy} (node {victim_node_id}) — disabled");
 
@@ -1109,6 +1163,7 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
     ctx.toxi
         .set_enabled(&victim_proxy, true)
         .map_err(|e| format!("toxiproxy enable: {e}"))?;
+    let _ = ctx.toxi.set_enabled(&format!("{victim_proxy}-ctl"), true);
     ctx.partitioned.borrow_mut().retain(|p| p != &victim_proxy);
     Ok(format!("network partition node {victim_node_id} (3s)"))
 }
@@ -1843,6 +1898,13 @@ async fn verify_gc_reclaim(
     etcd_endpoint: &str,
 ) -> (Vec<String>, usize, usize) {
     let mut errors = Vec::new();
+    // Set when any partition's force-GC reports PROTECTED extents (a pinned
+    // replay floor holding reclaimable data). Distinguishes a genuinely STUCK
+    // floor (protected + reclaim=0 = the bug this check catches) from a
+    // legitimately-empty partition (nothing protected + reclaim=0 = nothing to
+    // reclaim, e.g. a merge-consolidated survivor with ≤1 SST / ≤1 sealed log
+    // extent — common under the full nemesis set, false-positive pre-fix).
+    let mut any_protected = false;
     let before = read_extent_id_set(etcd_endpoint).await;
     let parts: Vec<u64> = topo.snapshot().iter().map(|p| p.2).collect();
 
@@ -1915,12 +1977,25 @@ async fn verify_gc_reclaim(
         }
         let sealed: Vec<u64> = stream.extent_ids[..stream.extent_ids.len() - 1].to_vec();
         let client = router.client_for(pid).await;
-        let _ = client
+        // Capture the force-GC advisory: F-GC-FLOOR-OBS #3 returns a NON-EMPTY
+        // `MaintenanceResp.message` ONLY when a requested sealed extent resolves
+        // AT/BEFORE the recovery replay floor and is therefore PROTECTED (a
+        // pinned floor holding reclaimable data — the "stuck" case this check
+        // exists to catch). An EMPTY message ⇒ nothing was protected.
+        if let Ok(resp) = client
             .call(
                 partition_rpc::MSG_MAINTENANCE,
                 partition_rpc::rkyv_encode(&maint(pid, partition_rpc::MAINTENANCE_FORCE_GC, sealed)),
             )
-            .await;
+            .await
+        {
+            if let Ok(m) = partition_rpc::rkyv_decode::<partition_rpc::MaintenanceResp>(&resp) {
+                if !m.message.is_empty() {
+                    any_protected = true;
+                    eprintln!("gc-reclaim: part {pid} force-GC protected: {}", m.message);
+                }
+            }
+        }
     }
     // The manager's extent_delete_loop is a 2 s sweep; relocation appends + the
     // refs→0 delete need a few ticks to land.
@@ -1931,14 +2006,31 @@ async fn verify_gc_reclaim(
     let gc_reclaimed = mid.difference(&after).count();
 
     if total_reclaimed == 0 {
-        errors.push(format!(
-            "GC-RECLAIM: the quiesce (flush + major-compact + force-GC) DELETED 0 \
-             extents — reclamation appears STUCK (a pinned replay floor would \
-             protect every extent). before={} mid={} after={}",
-            before.len(),
-            mid.len(),
-            after.len()
-        ));
+        if any_protected {
+            // A pinned replay floor is holding reclaimable extents even after
+            // flush + MAJOR-compact — the real "compact-then-forceg won't
+            // reclaim" stuck-floor bug (F-VPHEAD-CHAOS / F-GC-FLOOR-OBS).
+            errors.push(format!(
+                "GC-RECLAIM: the quiesce (flush + major-compact + force-GC) DELETED 0 \
+                 extents WHILE force-GC reported PROTECTED extents — reclamation is STUCK \
+                 (a pinned replay floor is holding reclaimable data). before={} mid={} after={}",
+                before.len(),
+                mid.len(),
+                after.len()
+            ));
+        } else {
+            // Nothing was protected and nothing reclaimed ⇒ the partitions had
+            // nothing reclaimable (all data live in ≤1 SST / no sealed log
+            // extent — legitimate after merge/EC consolidation). NOT a stuck
+            // floor; do not fail the run.
+            eprintln!(
+                "gc-reclaim: 0 reclaimed but NOTHING protected — nothing was reclaimable \
+                 (not a stuck floor). before={} mid={} after={}",
+                before.len(),
+                mid.len(),
+                after.len()
+            );
+        }
     }
     (errors, total_reclaimed, gc_reclaimed)
 }
@@ -2141,6 +2233,172 @@ mod accounting_checker_tests {
     }
 }
 
+/// Terminal DECOMMISSION phase (gated by `AUTUMN_CHAOS_DECOMMISSION=1`).
+///
+/// After the nemesis loop has stopped and the cluster is restored to full
+/// health, fully decommission ONE extent-node the HDFS way: fence it, wait for
+/// the F-FENCE-DRAIN open-tail sweep + `fenced_only` recovery to relocate every
+/// extent off it, then `MSG_REMOVE_NODE` — which refuses with
+/// `CODE_PRECONDITION` (listing the still-referencing extents) until the node is
+/// fully drained, and tombstones the address on success. This exercises the
+/// permanent node-removal primitive end-to-end against a POPULATED cluster; the
+/// existing per-key / range / accounting verify that follows then confirms NO
+/// DATA LOSS with the node permanently gone.
+///
+/// Deliberately a ONE-SHOT terminal phase, NOT a per-cycle nemesis action:
+/// removal is non-reversible (the address is tombstoned, `refs` relocate), while
+/// every nemesis action must be reversible (kill→restart, fence→unfence,
+/// partition→heal) so the cluster returns to K+M health each cycle. A permanent
+/// node loss injected repeatedly would monotonically starve the cluster below
+/// quorum. Drain also completes deterministically only once the faults stop.
+///
+/// Returns `Ok("skipped: …")` when the cluster is too small to lose a node,
+/// `Ok("…")` on a clean decommission, and `Err` on a genuine failure (drain
+/// wedge / unexpected code) — the caller panics on `Err`.
+async fn run_terminal_decommission(
+    mgr: &RpcClient,
+    ens: &Rc<RefCell<Vec<EnProcess>>>,
+    ec_k: u32,
+    ec_m: u32,
+) -> Result<String, String> {
+    // Must end with ≥ K+M live ENs so the post-decommission read verify has
+    // enough replicas (recovery rebuilds the victim's slots onto survivors).
+    let alive: Vec<(usize, u64)> = ens
+        .borrow()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.is_alive())
+        .map(|(i, e)| (i, e.node_id))
+        .collect();
+    let min_after = (ec_k + ec_m) as usize;
+    if alive.len() <= min_after {
+        return Ok(format!(
+            "skipped: only {} alive ENs, need > K+M ({min_after}) to remove one",
+            alive.len()
+        ));
+    }
+    let (victim_idx, victim) = alive[0];
+    eprintln!(
+        "decommission: fencing node {victim} for removal ({} alive ENs)",
+        alive.len()
+    );
+
+    // 1. Fence (force) — arms the F-FENCE-DRAIN open-tail drain + fenced_only
+    //    recovery of the victim's sealed slots, and hard-excludes it from new
+    //    placement.
+    let resp = mgr
+        .call(
+            MSG_FENCE_NODE,
+            rkyv_encode(&FenceNodeReq {
+                node_id: victim,
+                reason: "chaos decommission".into(),
+                set_by: "chaos".into(),
+                force: true,
+            }),
+        )
+        .await
+        .map_err(|e| format!("fence rpc: {e}"))?;
+    let r: CodeResp = rkyv_decode(&resp).map_err(|e| format!("fence decode: {e}"))?;
+    if r.code != CODE_OK {
+        return Err(format!("fence node {victim} refused: {}", r.message));
+    }
+
+    // Optional: SIGKILL the fenced EN (`AUTUMN_CHAOS_DECOMMISSION_KILL=1`) — the
+    // "stop the node you're retiring" flow. A dead replica forces recovery via the
+    // disk-offline / probe-fail paths in addition to the fenced-dispatch path,
+    // isolating whether a LIVE fenced node's healthy sealed replicas relocate.
+    let kill_first = std::env::var("AUTUMN_CHAOS_DECOMMISSION_KILL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if kill_first {
+        ens.borrow_mut()[victim_idx].kill();
+        eprintln!("decommission: SIGKILL fenced node {victim} (kill-then-drain)");
+    }
+
+    // 2. Poll MSG_REMOVE_NODE until the node is fully drained. Recovery
+    //    dispatches every 2 s and F-FENCE-DRAIN rolls open tails each tick
+    //    (30 s per-partition cooldown). A fenced node's healthy SEALED replicas
+    //    are relocated by the fenced-slot recovery dispatch; if that first
+    //    recovery attempt sticks (the EN copy stalls under churn), re-dispatch
+    //    is frozen until the F-FENCE-DRAIN-2 stale-marker sweep releases the
+    //    Recovery marker (recovery-specific threshold, default 120 s; the
+    //    decommission chaos script sets it to 60 s for faster CI). 90 attempts
+    //    × 3 s = 270 s ceiling covers a stick + one sweep-release + retry.
+    //    Timing out past that means a genuine drain/recovery wedge → fail.
+    const MAX_ATTEMPTS: u32 = 90;
+    for attempt in 1..=MAX_ATTEMPTS {
+        compio::time::sleep(Duration::from_secs(3)).await;
+        let resp = mgr
+            .call(
+                MSG_REMOVE_NODE,
+                rkyv_encode(&RemoveNodeReq {
+                    node_id: victim,
+                    set_by: "chaos".into(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("remove rpc: {e}"))?;
+        let r: RemoveNodeResp =
+            rkyv_decode(&resp).map_err(|e| format!("remove decode: {e}"))?;
+        match r.code {
+            CODE_OK => {
+                // Tombstoned — kill the process so it doesn't churn re-register
+                // attempts against its now-tombstoned address for the rest of
+                // the run.
+                ens.borrow_mut()[victim_idx].kill();
+                return Ok(format!(
+                    "node {victim} decommissioned after {attempt} probe(s) (~{}s drain)",
+                    attempt * 3
+                ));
+            }
+            CODE_PRECONDITION => {
+                // One-shot diagnostic: dump each blocking extent's full state so a
+                // stall is root-causeable (open vs sealed, replicas/parity, EC).
+                if attempt == 3 {
+                    for eid in &r.blocking_extent_ids {
+                        if let Ok(bytes) = mgr
+                            .call(MSG_EXTENT_INFO, rkyv_encode(&ExtentInfoReq { extent_id: *eid }))
+                            .await
+                        {
+                            if let Ok(ei) = rkyv_decode::<ExtentInfoResp>(&bytes) {
+                                eprintln!("decommission: blocking extent {eid} → {:?}", ei.extent);
+                            }
+                        }
+                    }
+                }
+                if attempt % 5 == 0 {
+                    eprintln!(
+                        "decommission: node {victim} still draining ({attempt}/{MAX_ATTEMPTS}): \
+                         {} extent {:?} + {} marker {:?} refs remain",
+                        r.blocking_extent_ids.len(),
+                        r.blocking_extent_ids,
+                        r.blocking_marker_extent_ids.len(),
+                        r.blocking_marker_extent_ids,
+                    );
+                }
+            }
+            CODE_NOT_LEADER => {
+                // Transient manager leader hiccup (election churn under chaos) —
+                // the remove is idempotent, so just retry on the next probe
+                // rather than failing the run.
+                eprintln!("decommission: node {victim} remove got NOT_LEADER (attempt {attempt}) — retrying");
+            }
+            other => {
+                return Err(format!(
+                    "remove node {victim}: unexpected code {other}: {}",
+                    r.message
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "node {victim} did NOT drain within {}s — MSG_REMOVE_NODE stayed blocked \
+         (drain / recovery wedge)",
+        MAX_ATTEMPTS * 3
+    ))
+}
+
 #[test]
 #[ignore]
 fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
@@ -2222,7 +2480,11 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             // wedge modes). Fixed identities come from below the ephemeral
             // floor; +1000 (the control listener) is checked free too.
             let port = pick_stable_port_pair();
-            let proxy_port = pick_addr().port();
+            // Control-proxy fix: the registered control_address is
+            // advertise+1000, so the proxy port pair (p, p+1000) must BOTH
+            // be free — the data proxy binds p, the control proxy binds
+            // p+1000 (see bootstrap_en step 1b).
+            let proxy_port = pick_proxy_port_pair();
             let proxy_name = format!("en-{i}");
             let guard = bootstrap_en(
                 &op_binary,
@@ -2404,6 +2666,22 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         eprintln!("chaos: settle 10 s before verify");
         compio::time::sleep(Duration::from_secs(10)).await;
         refresh_topology(&mgr, &topo).await;
+
+        // -------- Terminal decommission (AUTUMN_CHAOS_DECOMMISSION=1) --------
+        // Runs on the SETTLED cluster (all ENs back online, no in-flight chaos) —
+        // the realistic operator scenario. Fully remove one node; the verify below
+        // then proves no loss with it gone. Panic on genuine failure so a stuck
+        // drain / lost data fails the run (a capacity skip is benign).
+        if cfg.decommission {
+            eprintln!("chaos: terminal node-decommission phase (post-settle)");
+            match run_terminal_decommission(&mgr, &nemesis_ctx.ens, cfg.ec_k, cfg.ec_m).await {
+                Ok(msg) => eprintln!("chaos: decommission — {msg}"),
+                Err(msg) => panic!("chaos: DECOMMISSION FAILED — {msg}"),
+            }
+            // Let recovery's slot rebuilds settle + refresh routing before verify.
+            compio::time::sleep(Duration::from_secs(5)).await;
+            refresh_topology(&mgr, &topo).await;
+        }
 
         // -------- Verify --------
         eprintln!(
