@@ -18,7 +18,7 @@ resources:
 images:
   - name: autumn-rs
     newName: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs
-    newTag: f824066447d07a5d9b26b7968f156d2b2878738b
+    newTag: c04fd296f6d3188e5d17ee9956568f5f1d416cc9
   # This cluster's nodes reach the daocloud mirror, not quay.io directly.
   - name: quay.io/coreos/etcd
     newName: quay.m.daocloud.io/coreos/etcd
