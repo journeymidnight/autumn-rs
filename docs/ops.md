@@ -251,9 +251,28 @@ SST only holds pointers), so dividing by sealed-only inflates amp ~15× (a
 3-replica cluster read 45× when a partition's data lived in open tails). The
 human `df` prints the breakdown `logical: sealed=… + open_tail=… = footprint …`.
 A high `amp` (>> replication factor) now genuinely means an EC/replication issue,
-not just un-sealed data. (The accurate dead-value / WAL-debt figure — how much of
-the log is overwritten garbage — is a separate deferred metric; do NOT read
-`footprint − data` as debt, it mis-counts live VP data.)
+not just un-sealed data.
+
+### WAL debt (dead large-value bytes) in `df` (F-DF-WALDEBT)
+
+`df` also prints `WAL debt: <bytes> dead (<pct>% of footprint, GC-reclaimable;
+incl. open-tail)` and, in `--json`, `logical_wal_debt` + `wal_debt_ratio`. This is
+the reclaimable garbage in `log_stream` — large values that were overwritten by a
+newer version or deleted, still occupying replicas until GC punches them. It is
+`Σ (sealed-extent dead + OPEN-tail dead)` across partitions:
+
+- **sealed-extent dead** = each partition's `gc_debt_bytes` (already tracked).
+- **open-tail dead** = the discard-map entry for the current OPEN log tail, which
+  `gc_debt_bytes` excludes because GC can't punch an unsealed extent. Pre-F-DF-WALDEBT
+  a log-heavy / all-open-tail partition (data entirely in one open log tail) showed
+  `gc_debt = 0` and looked debt-free even when holding GBs of overwritten garbage;
+  `df` now surfaces it.
+
+Both are DERIVED each PS GC tick from the persisted SST discard maps (no bespoke
+counter, no write-path cost) so they survive PS restart exactly like `gc_debt`.
+Do NOT read `footprint − data` as debt — `size_bytes` is SST-only and excludes
+live VP value bytes, so it would flag a healthy VP partition as ~all-debt. A high
+`wal_debt_ratio` is the signal to run `compact` + `gc`/`forcegc` to reclaim.
 
 ### Per-partition size in `autumn-op info` (F-OVERVIEW-OPENTAIL)
 

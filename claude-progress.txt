@@ -1,3 +1,39 @@
+Date: 2026-07-11
+TaskStatus: completed
+Task scope: F-DF-WALDEBT — accurate WAL-debt (dead-value) metric incl. open-tail
+  discard. User chose option A: ride the ALREADY-PERSISTED SST discard maps, do
+  NOT build a bespoke persisted counter (the restart question the user raised is
+  answered by "derive it, don't persist it" — same lifecycle as gc_debt).
+Current summary: DONE + coco-clean.
+  MECHANISM: gc_debt is DERIVED each GC tick from SST MetaBlock.discard_count
+  maps (get_discards → valid_discard(sealed_extents)); the open tail's dead bytes
+  are the entry valid_discard DROPS (last/open extent). So the "counter" survives
+  restart for free — recovery reloads the discard maps from the meta_stream
+  checkpoint. New PS gauge open_tail_dead_bytes = discards[extent_ids.last()],
+  refreshed BEFORE the <2-extent gate in BOTH GcRecv + GcTimeout paths (the
+  headline all-open-tail case has ONE log extent → a gate-gated refresh would
+  leave it 0). Shipped PartitionLoad.open_tail_dead_bytes (WIRE v17→18, fp
+  dd40c423722d2a44); manager sums Σ(gc_debt+open_tail_dead) → ClusterDfResp.
+  logical_wal_debt; autumn-op df prints "WAL debt: N dead (X% of footprint …)"
+  + --json + dashboard /api + Prometheus gauge.
+  VERIFY: rpc 44 (v18 pinned) / PS 190 (+3 background::wal_debt_tests) / manager
+  182 green; 0 new clippy; workspace+tests build clean.
+  COCO (GPT-5.5, deep, 3 rounds): P1+P2 FIXED, P3 declined. P1 = refresh sat
+  AFTER the <2-extent gate → single-extent all-open-tail case (the headline)
+  never updated (hoisted before gate in both arms). P2 = <2 early-exit left
+  gc_debt stale → new manager sum over-reports logical_wal_debt for a partition
+  reclaimed to one extent (store gc_debt=0 on no-sealed-prefix paths). P3
+  (declined) = cross-partition .sum::<u64>() overflow needs ~18 EB dead cluster-
+  wide (imaginary; sibling logical_open_tail sum is plain .sum() too).
+Main gaps: NONE for the metric. Not covered (acceptable per "estimate" scope):
+  overwritten-but-not-yet-compacted dead values (old VP still live in memtable /
+  un-compacted SST) aren't in a discard map yet — compaction folds them in next
+  pass; figure converges monotonically. Live cross-host df verification (open-
+  tail-only partition shows non-zero WAL debt) DEFERRED to a cluster run (multi-
+  tenant box blocks local EN bring-up).
+Next steps: commit+push. Closed.
+
+============================ prior task history ============================
 Date: 2026-07-10
 TaskStatus: completed
 Task scope: F-CHAOS-DECOMMISSION #1 — root-cause + fix the live-fenced-node

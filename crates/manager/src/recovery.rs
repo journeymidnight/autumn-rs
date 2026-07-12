@@ -1105,6 +1105,18 @@ impl crate::AutumnManager {
                     .map(|(_, l)| l.open_tail_bytes)
                     .sum()
             };
+            // F-DF-WALDEBT: Σ reclaimable dead bytes = sealed (gc_debt) +
+            // open-tail dead, across the same latest-bucket window. gc_debt is
+            // sealed-only, so adding open_tail_dead surfaces the debt a
+            // log-heavy / all-open-tail partition otherwise hides at 0.
+            let logical_wal_debt: u64 = {
+                let pol = self.policy.borrow();
+                pol.metrics
+                    .values()
+                    .filter_map(|w| w.buckets.back())
+                    .map(|(_, l)| l.gc_debt_bytes.saturating_add(l.open_tail_dead_bytes))
+                    .sum()
+            };
             {
                 let mut snap = self.cluster_cap.borrow_mut();
                 snap.raw_total = cdf_raw_total;
@@ -1116,6 +1128,7 @@ impl crate::AutumnManager {
                 // (a mid-flight cycle hasn't changed it yet).
                 snap.logical_stored = logical_committed;
                 snap.logical_open_tail = logical_open_tail;
+                snap.logical_wal_debt = logical_wal_debt;
                 snap.logical_last_update_ms = logical_committed_ms;
                 snap.per_node = cdf_per_node;
             }

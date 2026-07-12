@@ -528,6 +528,31 @@ partition would render 0 B without this — see manager CLAUDE.md). The refresh:
 GC/compaction on manager/replica latency.** The sibling `size_bytes` gauge is
 DEAD (no writer — see the field doc); do not confuse it with `open_tail_bytes`.
 
+### `open_tail_dead_bytes` — WAL debt on the open tail (F-DF-WALDEBT)
+
+`PartitionMetrics.open_tail_dead_bytes` is the dead (overwritten/deleted)
+large-value bytes on the OPEN (last) `log_stream` extent. `gc_debt_bytes` is
+SEALED-only — `valid_discard(sealed_extents)` drops the tail because GC can't
+punch an unsealed extent — so a log-heavy / all-open-tail partition (whole log in
+one open extent) reports `gc_debt=0` while holding real garbage. This gauge
+exposes it; together `gc_debt_bytes + open_tail_dead_bytes` is the partition's
+full reclaimable WAL debt (the two are DISJOINT — the open tail's discard vs the
+sealed prefix's — so no double-count). Shipped via `PartitionLoad.open_tail_dead_bytes`;
+the manager sums `Σ(gc_debt + open_tail_dead)` into `ClusterDfResp.logical_wal_debt`
+for `autumn-op df`. Load-bearing invariants (both regressed once — see
+`background::wal_debt_tests` + the coco-2026-07-11 fixes):
+- It is DERIVED each GC tick via `open_tail_dead_bytes(discards, extent_ids)` (=
+  `discards[extent_ids.last()]`) from the already-persisted SST discard maps —
+  NOT a bespoke counter. So it survives PS restart exactly like `gc_debt` (recovery
+  reloads the discard maps from the meta_stream checkpoint) with zero write-path cost.
+- Refreshed BEFORE the `extent_ids.len() < 2` gate in BOTH the `Sel::GcRecv`
+  dispatch path AND the `Sel::GcTimeout` periodic F203 refresh — the headline
+  all-open-tail case has a SINGLE log extent and would skip the gate, so a
+  gate-gated refresh would leave this 0 exactly where it matters most.
+- The same `<2`-extent early exits store `gc_debt_bytes = 0` (no sealed prefix ⇒
+  0 debt) so a partition GC-reclaimed down to one extent doesn't leave a stale
+  sealed-debt inflating `logical_wal_debt`.
+
 ## Read Path: Get
 
 ```

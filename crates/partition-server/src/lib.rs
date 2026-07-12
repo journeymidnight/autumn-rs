@@ -1100,6 +1100,17 @@ pub struct PartitionMetrics {
     /// `gc_debt_high` for `policy.required_buckets` consecutive ticks
     /// outside the gc cooldown.
     pub gc_debt_bytes: std::sync::atomic::AtomicU64,
+    /// F-DF-WALDEBT: dead (overwritten/deleted) large-value bytes on the OPEN
+    /// log_stream tail extent — the discard-map entry `gc_debt_bytes` EXCLUDES
+    /// because `valid_discard` filters to sealed extents (GC can't punch an
+    /// unsealed tail). Refreshed on the SAME GC tick as `gc_debt_bytes`, from
+    /// the already-persisted SST discard maps (no extra RPC, no write-path
+    /// cost). Survives restart because it rides the meta_stream checkpoint,
+    /// exactly like `gc_debt_bytes` — it is DERIVED each tick, never a bespoke
+    /// counter to persist. For a log-heavy / all-open-tail partition
+    /// `gc_debt_bytes` is 0 while this exposes the real WAL debt. Shipped via
+    /// `report_load_loop`; 0 until the first GC tick.
+    pub open_tail_dead_bytes: std::sync::atomic::AtomicU64,
     /// F187: bytes of SSTable data that compaction would consume on its
     /// next pass — sum of (head-extent table sizes when head-ratio < 30 %)
     /// + (overlap-tagged tables when has_overlap == 1). Refreshed by the
@@ -3106,7 +3117,7 @@ impl PartitionServer {
             .collect();
         drop(parts);
         type Extract = fn(&PartitionMetrics) -> f64;
-        let metrics: [(&str, &str, Extract); 7] = [
+        let metrics: [(&str, &str, Extract); 8] = [
             ("autumn_ps_partition_requests_total", "counter", |m| {
                 m.req_count_monotonic.load(Relaxed) as f64
             }),
@@ -3115,6 +3126,9 @@ impl PartitionServer {
             }),
             ("autumn_ps_partition_gc_debt_bytes", "gauge", |m| {
                 m.gc_debt_bytes.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_open_tail_dead_bytes", "gauge", |m| {
+                m.open_tail_dead_bytes.load(Relaxed) as f64
             }),
             ("autumn_ps_partition_pending_compaction_bytes", "gauge", |m| {
                 m.pending_compaction_bytes.load(Relaxed) as f64
@@ -3242,6 +3256,9 @@ impl PartitionServer {
                         // F-OVERVIEW-OPENTAIL gauge (refreshed by the
                         // maintenance loop; 0 until first probe).
                         let open_tail_bytes = handle.metrics.open_tail_bytes.load(Relaxed);
+                        // F-DF-WALDEBT gauge (refreshed on the GC tick; 0 until first).
+                        let open_tail_dead_bytes =
+                            handle.metrics.open_tail_dead_bytes.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
@@ -3262,6 +3279,7 @@ impl PartitionServer {
                             minor_compact_pending_bytes,
                             sealed_log_extent_count,
                             open_tail_bytes,
+                            open_tail_dead_bytes,
                         }
                     })
                     .collect()

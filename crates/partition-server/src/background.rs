@@ -787,7 +787,28 @@ pub(crate) async fn background_maintenance_loop(
                     }
                 };
                 let extent_ids = stream_info.extent_ids;
+                // F-DF-WALDEBT: refresh the open-tail dead-byte gauge from the
+                // (already-persisted) SST discard maps BEFORE the <2-extent gate.
+                // A log-heavy / all-open-tail partition — the exact case this
+                // metric exists for — commonly has a SINGLE log extent (the open
+                // tail), which continues below and would NEVER refresh if we
+                // waited for the sealed-extent GC path. Computed once here and
+                // reused for gc_debt below (get_discards is snapshot-deterministic).
+                let mut tick_discards = get_discards(&readers_snapshot);
+                metrics.open_tail_dead_bytes.store(
+                    open_tail_dead_bytes(&tick_discards, &extent_ids),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if extent_ids.len() < 2 {
+                    // No sealed extents (only the open tail, or none) ⇒ sealed-only
+                    // gc_debt is definitionally 0. Store it (don't leave the last
+                    // ≥2-extent value stale): the manager now sums gc_debt into
+                    // `logical_wal_debt` for df, and a partition GC-reclaimed down
+                    // to one extent would otherwise over-report debt forever (and
+                    // keep the urgency scheduler re-dispatching a no-op GC).
+                    metrics
+                        .gc_debt_bytes
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     stamp_last_gc();
                     clear_inflight(&metrics);
                     continue;
@@ -809,11 +830,13 @@ pub(crate) async fn background_maintenance_loop(
                 let (replay_floor_pos, pos_by_eid) =
                     gc_replay_floor(&extent_ids, readers_snapshot.iter().map(|r| r.vp_extent_id));
 
-                // F187: refresh gc_debt_bytes from current discards, regardless of
-                // whether this tick will actually punch anything. The aggregate is
-                // sum(reclaimable bytes on still-live sealed log_stream extents) —
-                // exactly what an operator would call "GC debt".
-                let mut tick_discards = get_discards(&readers_snapshot);
+                // F187: refresh gc_debt_bytes from the sealed-only discards.
+                // `tick_discards` was computed once before the gate (and already
+                // yielded open_tail_dead_bytes); filter it to sealed extents in
+                // place so gc_debt = Σ reclaimable bytes on still-live SEALED
+                // log_stream extents — what an operator calls "GC debt". The open
+                // tail's dead bytes were counted above (F-DF-WALDEBT), so the two
+                // gauges stay disjoint (no double-count).
                 valid_discard(&mut tick_discards, sealed_extents);
                 let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
                 metrics
@@ -1114,15 +1137,29 @@ pub(crate) async fn background_maintenance_loop(
                 };
                 if let Ok(stream_info) = part_sc.get_stream_info(log_stream_id).await {
                     let extent_ids = stream_info.extent_ids;
-                    if extent_ids.len() >= 2 {
+                    let mut discards = get_discards(&readers_snapshot);
+                    // F-DF-WALDEBT: refresh open-tail dead bytes on EVERY periodic
+                    // tick, regardless of extent count — this is the idle-refresh
+                    // path (no GC dispatched), and an all-open-tail partition with a
+                    // single log extent would otherwise never update it. `discards`
+                    // is reused for gc_debt below (one get_discards per tick).
+                    metrics.open_tail_dead_bytes.store(
+                        open_tail_dead_bytes(&discards, &extent_ids),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // Always store gc_debt (0 when there is no sealed prefix) so a
+                    // partition reclaimed down to one extent doesn't leave a stale
+                    // sealed-debt inflating the manager's `logical_wal_debt`.
+                    let gc_debt: u64 = if extent_ids.len() >= 2 {
                         let sealed = &extent_ids[..extent_ids.len() - 1];
-                        let mut discards = get_discards(&readers_snapshot);
                         valid_discard(&mut discards, sealed);
-                        let gc_debt: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
-                        metrics
-                            .gc_debt_bytes
-                            .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
-                    }
+                        discards.values().map(|v| (*v).max(0) as u64).sum()
+                    } else {
+                        0
+                    };
+                    metrics
+                        .gc_debt_bytes
+                        .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -2291,6 +2328,22 @@ pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
 pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]) {
     let idx: HashSet<u64> = extent_ids.iter().copied().collect();
     discards.retain(|eid, _| idx.contains(eid));
+}
+
+/// F-DF-WALDEBT: dead bytes on the OPEN (last) log extent, read from the
+/// aggregated discard map. This is precisely the entry `gc_debt` EXCLUDES —
+/// `valid_discard(sealed_extents)` filters to `extent_ids[..len-1]`, dropping
+/// the tail — so `gc_debt_bytes` (sealed) and this (open) are DISJOINT and sum
+/// to the partition's full reclaimable WAL debt. Rides the already-persisted
+/// SST discard maps, so it needs no bespoke counter and survives restart
+/// exactly like `gc_debt`. Returns 0 when the tail has no discard entry (all
+/// live) or there is no extent.
+pub(crate) fn open_tail_dead_bytes(discards: &HashMap<u64, i64>, extent_ids: &[u64]) -> u64 {
+    extent_ids
+        .last()
+        .and_then(|eid| discards.get(eid))
+        .map(|v| (*v).max(0) as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -3976,6 +4029,51 @@ mod lookup_block_boundary_tests {
 
         // A key that does not exist must still return None.
         assert!(lookup_in_sst(&reader, b"zzzzzz").is_none());
+    }
+}
+
+#[cfg(test)]
+mod wal_debt_tests {
+    //! F-DF-WALDEBT: the open-tail dead-byte extraction must read exactly the
+    //! LAST log extent's discard and stay DISJOINT from `gc_debt` (which
+    //! `valid_discard` restricts to the sealed prefix). If these ever
+    //! double-count or the open tail leaks into gc_debt, df's debt figure is
+    //! wrong.
+    use super::{open_tail_dead_bytes, valid_discard};
+    use std::collections::HashMap;
+
+    #[test]
+    fn open_tail_dead_is_last_extent_discard() {
+        // extents [10, 20, 30]; 30 is the open tail.
+        let discards = HashMap::from([(10u64, 100i64), (20, 200), (30, 500)]);
+        let extent_ids = [10u64, 20, 30];
+        assert_eq!(open_tail_dead_bytes(&discards, &extent_ids), 500);
+    }
+
+    #[test]
+    fn open_tail_dead_and_gc_debt_are_disjoint_no_double_count() {
+        let all = HashMap::from([(10u64, 100i64), (20, 200), (30, 500)]);
+        let extent_ids = [10u64, 20, 30];
+        let open = open_tail_dead_bytes(&all, &extent_ids);
+        // gc_debt = sealed prefix only (drops the open tail 30).
+        let mut sealed = all.clone();
+        valid_discard(&mut sealed, &extent_ids[..extent_ids.len() - 1]);
+        let gc_debt: u64 = sealed.values().map(|v| (*v).max(0) as u64).sum();
+        assert_eq!(open, 500);
+        assert_eq!(gc_debt, 300); // 100 + 200, NOT the tail's 500
+        assert_eq!(open + gc_debt, 800); // full WAL debt, each byte once
+    }
+
+    #[test]
+    fn open_tail_dead_zero_when_tail_all_live_or_absent() {
+        // Tail 30 has no discard entry (all live) → 0.
+        let discards = HashMap::from([(10u64, 100i64)]);
+        assert_eq!(open_tail_dead_bytes(&discards, &[10u64, 20, 30]), 0);
+        // No extents at all → 0.
+        assert_eq!(open_tail_dead_bytes(&discards, &[]), 0);
+        // Negative (over-counted) discard clamps to 0, never underflows u64.
+        let neg = HashMap::from([(30u64, -50i64)]);
+        assert_eq!(open_tail_dead_bytes(&neg, &[10u64, 30]), 0);
     }
 }
 

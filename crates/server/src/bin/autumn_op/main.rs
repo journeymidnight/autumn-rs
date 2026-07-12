@@ -602,6 +602,15 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
         .unwrap_or(0);
     let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
     let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
+    // F-DF-WALDEBT: dead (reclaimable) fraction of the footprint = sealed
+    // gc_debt + open-tail dead bytes. Pre-F-DF-WALDEBT a log-heavy /
+    // all-open-tail partition's open-tail debt was invisible (df only had
+    // sealed gc_debt). physical_used carries these bytes until GC punches them.
+    let wal_debt_ratio = if logical_footprint > 0 {
+        r.logical_wal_debt as f64 / logical_footprint as f64
+    } else {
+        0.0
+    };
 
     if json {
         let per_node: Vec<serde_json::Value> = r
@@ -627,6 +636,8 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
                 "logical_stored_sealed": r.logical_stored,
                 "logical_open_tail": r.logical_open_tail,
                 "logical_footprint": logical_footprint,
+                "logical_wal_debt": r.logical_wal_debt,
+                "wal_debt_ratio": wal_debt_ratio,
                 "amplification": amp,
                 "writable_est": writable_est,
                 "writable_low_3x": writable_low,
@@ -662,6 +673,11 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
             human_size(r.logical_stored),
             human_size(r.logical_open_tail),
             human_size(logical_footprint),
+        );
+        println!(
+            "         WAL debt: {} dead ({:.1}% of footprint, GC-reclaimable; incl. open-tail)",
+            human_size(r.logical_wal_debt),
+            wal_debt_ratio * 100.0,
         );
         println!(
             "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",

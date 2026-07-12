@@ -271,6 +271,13 @@ impl AutumnManager {
             "logical_stored_sealed": df.logical_stored,
             "logical_open_tail": df.logical_open_tail,
             "logical_footprint": logical_footprint,
+            // F-DF-WALDEBT: dead (GC-reclaimable) bytes incl. open-tail debt.
+            "logical_wal_debt": df.logical_wal_debt,
+            "wal_debt_ratio": if logical_footprint > 0 {
+                df.logical_wal_debt as f64 / logical_footprint as f64
+            } else {
+                0.0
+            },
             "amplification": amp,
             "node_count_online": df.node_count,
             "per_node": per_node,

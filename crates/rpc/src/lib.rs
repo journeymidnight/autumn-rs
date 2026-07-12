@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 17;
-pub const WIRE_VERSION_MAX: u32 = 17;
+pub const WIRE_VERSION_MIN: u32 = 18;
+pub const WIRE_VERSION_MAX: u32 = 18;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -189,6 +189,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // Same-commit deploy (MIN=MAX=17). Fingerprint filled after the build test
     // reports it.
     (17, "55411e9479326ff8"),
+    // v18: F-DF-WALDEBT — PartitionLoad grew `open_tail_dead_bytes: u64` (dead
+    // large-value bytes on the OPEN log tail, the discard-map entry gc_debt's
+    // sealed-only filter drops) and ClusterDfResp grew `logical_wal_debt: u64`
+    // (Σ gc_debt + open_tail_dead across partitions). `autumn-op df` shows a
+    // dead-vs-live breakdown that includes the open-tail debt gc_debt hid.
+    // Same-commit deploy (MIN=MAX=18).
+    (18, "dd40c423722d2a44"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

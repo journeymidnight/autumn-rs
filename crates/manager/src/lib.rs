@@ -578,6 +578,11 @@ pub(crate) struct ClusterCapSnapshot {
     /// partitions (one copy). Refreshed every tick from the policy load
     /// window (cheap sum). The amp denominator is `logical_stored + this`.
     pub logical_open_tail: u64,
+    /// F-DF-WALDEBT: Σ reclaimable dead bytes across partitions — sealed
+    /// (`PartitionLoad.gc_debt_bytes`) + open-tail (`open_tail_dead_bytes`).
+    /// Refreshed every tick from the same policy load window; the dead fraction
+    /// of the footprint that GC can eventually reclaim.
+    pub logical_wal_debt: u64,
     pub logical_last_update_ms: u64,
     pub per_node: Vec<(u64, NodeCap)>,
 }

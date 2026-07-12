@@ -1049,6 +1049,14 @@ pub struct PartitionLoad {
     /// `autumn-op info --part` gets by probing the EN. Refreshed on the PS
     /// maintenance loop (throttled, non-blocking); 0 until first refresh.
     pub open_tail_bytes: u64,
+    /// F-DF-WALDEBT: dead (overwritten/deleted) large-value bytes on the OPEN
+    /// log_stream tail extent. `gc_debt_bytes` is sealed-only (GC can't punch
+    /// an unsealed tail), so a log-heavy / all-open-tail partition reports
+    /// `gc_debt_bytes = 0` while still holding real dead bytes here. Together
+    /// `gc_debt_bytes + open_tail_dead_bytes` is the partition's full
+    /// reclaimable WAL debt. Refreshed on the PS GC tick from the persisted SST
+    /// discard maps; 0 until the first tick.
+    pub open_tail_dead_bytes: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -1715,6 +1723,14 @@ pub struct ClusterDfResp {
     /// counts the open bytes, sealed-only logical drops them). 0 until the PS
     /// reports (falls back to sealed-only).
     pub logical_open_tail: u64,
+    /// F-DF-WALDEBT: Σ reclaimable DEAD bytes across all partitions — sealed
+    /// (`PartitionLoad.gc_debt_bytes`) + open-tail
+    /// (`PartitionLoad.open_tail_dead_bytes`). The dead fraction of the logical
+    /// footprint; `physical_used` carries these bytes (they occupy replicas
+    /// until GC punches them). Pre-F-DF-WALDEBT a log-heavy partition's
+    /// open-tail dead bytes were invisible (gc_debt is sealed-only). Lets `df`
+    /// print a dead-vs-live breakdown. 0 until the PS reports.
+    pub logical_wal_debt: u64,
     /// Online EN count — bounds the best achievable EC shape for the writable
     /// range upper bound (K = min(4, node_count-1)).
     pub node_count: u64,
