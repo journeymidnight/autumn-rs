@@ -1,3 +1,45 @@
+Date: 2026-07-13
+TaskStatus: completed
+Task scope: F-RECOVERY-UNBOUNDED — bound + parallelize partition recovery. A fable
+  subagent found 3 bugs behind the slow full-takeover reopen the user challenged
+  ("按照设计应该只从 SST 最大 vp_head 开始 replay，否则就一定有BUG"). User: "修复这3点"
+  then "fable subagent也具体看看BUG2如何修复，一定确保这样不会丢失数据".
+Current summary: ALL 3 FIXED + unit-tested; BUG2 fixed via a subagent-designed
+  provably-loss-free path (recovery replay code UNTOUCHED).
+  BUG1 (real unboundedness): F120-B WAL-gap force-rotate measured memtable
+    FOOTPRINT (mem_bytes) — a VP is ~24 B for an 8 MB value, so the 2 GiB gap
+    never tripped on large-value workloads → replay window grew O(dataset). Fix:
+    new Memtable.log_bytes (AtomicU64) tracks the actual appended LOG bytes
+    (value included) from finish_write_batch + GC rewrite + recovery-replay; the
+    gap check now reads log_bytes() not mem_bytes().
+  BUG2 (GC floor too low → disk debt + recovery re-read): NAIVE "MIN→MAX in
+    recover_partition" is UNSAFE (deletes the chosen_pos==MAX no-replay rescue;
+    reopens post-merge q-key loss). Adopted subagent Option C: DON'T touch
+    recover_partition; raise ONLY the GC replay floor to the newest DURABLY-ACKed
+    flush checkpoint vp (PartitionData.durable_ckpt_vp, set ONLY after
+    save_table_locs_raw acks — never from in-memory vp_*/reader-MAX, the loss
+    trap). Recovery-read half self-resolves once GC punches the covered prefix
+    (punched extents' SST vp_heads become unresolvable → recovery Step-2 skips
+    them → chosen_pos lands later). Helper gc_floor_raise_to_durable_ckpt (max,
+    ack-gated, no-op pre-first-flush/unresolvable).
+  BUG3 (×N serial recovery): sync_regions_once opened partitions serially, each
+    open_partition().await blocking on that partition's full recover_partition.
+    Now concurrent via buffer_unordered(OPEN_PARALLELISM=64); gating applied up
+    front with local budget reservation; port-ord + owner-lock already per-part
+    so concurrent opens are race-free.
+  VERIFY: partition-server 193 lib tests green (+3 durable-ckpt floor-raise unit
+    tests in gc_replay_floor_tests); workspace builds minus the pre-existing
+    macFUSE fuser build.rs env failure (unrelated to these changes).
+Main gaps: coco review pending. Reproduce-first system test
+  system_gc_floor_durable_ckpt.rs (subagent Scenarios 1-4, incl. the
+  set_flush_commit_pause durability race) DEFERRED — needs etcd + a new flush
+  sync-point; local multi-tenant box blocks EN bring-up. Live cross-host
+  takeover-timing verification deferred to a cluster run.
+Next steps: coco findbugs on the diff; then (cluster session) add the reproduce-
+  first system test + measure takeover recovery wallclock before/after.
+
+--- prior task ---
+
 Date: 2026-07-11
 TaskStatus: completed
 Task scope: F-DF-WALDEBT — accurate WAL-debt (dead-value) metric incl. open-tail

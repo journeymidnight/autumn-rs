@@ -124,6 +124,37 @@ pub(crate) fn gc_replay_floor(
     (floor, pos_by_eid)
 }
 
+/// F-RECOVERY-UNBOUNDED BUG2 — raise the GC replay floor from the
+/// over-conservative MIN-over-SST-vps (`gc_replay_floor`) up to the position of
+/// the newest DURABLY-ACKed flush checkpoint vp (`durable_vp_eid`), when it
+/// resolves in the current stream. Returns the (possibly raised) floor.
+///
+/// Safe because every log record STRICTLY BELOW a durable checkpoint's vp is in
+/// that checkpoint's persisted SST set (or compaction-dead) — see the
+/// `PartitionData.durable_ckpt_vp` field doc. The vp extent itself sits AT the
+/// returned floor and the strictly-before punch rule (`gc_extent_punchable`)
+/// keeps it live, so recovery's Step-1 checkpoint resolution always succeeds.
+/// `durable_vp_eid == 0` (no flush committed yet this incarnation) or an
+/// unresolvable eid leaves the floor at the conservative MIN.
+///
+/// INVARIANT: `durable_vp_eid` MUST come from the ack-gated `durable_ckpt_vp`
+/// cell — NEVER from in-memory state (`vp_*`, or a MAX over live readers), which
+/// can run ahead of the durable checkpoint and punch a log region whose naming
+/// checkpoint never landed → silent loss.
+pub(crate) fn gc_floor_raise_to_durable_ckpt(
+    min_floor: usize,
+    pos_by_eid: &HashMap<u64, usize>,
+    durable_vp_eid: u64,
+) -> usize {
+    if durable_vp_eid == 0 {
+        return min_floor;
+    }
+    match pos_by_eid.get(&durable_vp_eid) {
+        Some(&p) => min_floor.max(p),
+        None => min_floor,
+    }
+}
+
 /// Whether a sealed extent is safe for GC to punch (the F1 guard): an empty
 /// extent (`sealed_length == 0`, no committed data) always is; a non-empty one
 /// only if it sits STRICTLY BEFORE the replay floor, so the WAL replay window
@@ -827,8 +858,36 @@ pub(crate) async fn background_maintenance_loop(
                 // checkpoint recovery loads, so this floor == recovery's chosen_pos.
                 // (Flush only ADDS forward-vp_head SSTs, which never lower the min.)
                 // See `gc_replay_floor` for the first-occurrence / floor-0 details.
-                let (replay_floor_pos, pos_by_eid) =
+                let (mut replay_floor_pos, pos_by_eid) =
                     gc_replay_floor(&extent_ids, readers_snapshot.iter().map(|r| r.vp_extent_id));
+
+                // F-RECOVERY-UNBOUNDED BUG2: raise the floor to the newest
+                // DURABLY-ACKed flush checkpoint vp. The MIN-over-SST-vps floor
+                // above is over-conservative — it drags back to the OLDEST live
+                // SST's vp_head, pinning GC (and recovery's replay window) far
+                // behind the region that is actually still needed. Every log
+                // record strictly below the durable checkpoint vp is in that
+                // checkpoint's persisted SST set (or compaction-dead), so it is
+                // safe to reclaim. Safety rests on THREE properties:
+                //   (i)  ack-gated — `durable_ckpt_vp` is set only AFTER
+                //        save_table_locs_raw acks, so a crash-time recovery is
+                //        guaranteed to load a checkpoint whose vp/SST set covers
+                //        everything below it (never an in-memory value that ran
+                //        ahead of the durable checkpoint — that would punch a log
+                //        region whose naming checkpoint never landed → loss);
+                //   (ii) the vp extent sits AT the raised floor and the
+                //        strictly-before punch rule (`gc_extent_punchable`)
+                //        protects it, so recovery Step 1 always resolves it;
+                //   (iii) SSTs whose vp extents we punch become unresolvable, and
+                //        recovery's per-SST pass simply skips them (lib.rs Step 2,
+                //        `if let Some(reader_pos) = first_pos_by_eid.get(...)`), so
+                //        `chosen_pos` naturally lands at the first surviving
+                //        position — no recovery-code change needed.
+                // NEVER substitute an in-memory value (p.vp_*, MAX over
+                // readers_snapshot vp_heads): see the `durable_ckpt_vp` field doc.
+                let (dv_eid, _dv_off) = part.borrow().durable_ckpt_vp.get();
+                replay_floor_pos =
+                    gc_floor_raise_to_durable_ckpt(replay_floor_pos, &pos_by_eid, dv_eid);
 
                 // F187: refresh gc_debt_bytes from the sealed-only discards.
                 // `tick_discards` was computed once before the gate (and already
@@ -1508,6 +1567,11 @@ pub(crate) async fn finish_write_batch(
     let mut responders: Vec<crate::WriteResponder> = Vec::new();
     let batch_ops = bd.record_sizes.len() as u64;
     let record_sizes = bd.record_sizes;
+    // F-RECOVERY-UNBOUNDED BUG1: total log_stream bytes this batch appended
+    // (value included) — feeds the memtable's log_bytes counter so the F120-B
+    // WAL-gap force-rotate bounds the true replay window. Computed BEFORE
+    // `record_sizes` is moved into the insert closure below.
+    let batch_log_bytes: u64 = record_sizes.iter().map(|&s| s as u64).sum();
     let base_offset = result.offset;
     let extent_id_for_vp = result.extent_id;
     {
@@ -1576,6 +1640,10 @@ pub(crate) async fn finish_write_batch(
         });
 
         p.active.insert_batch(iter);
+        // F-RECOVERY-UNBOUNDED BUG1: track the un-flushed LOG window (value
+        // included) for the F120-B force-rotate; `mem_bytes` would only see the
+        // ~24-byte VP for large values and never trip the 2 GiB gap.
+        p.active.add_log_bytes(batch_log_bytes);
 
         p.vp_extent_id = result.extent_id;
         p.vp_offset = result.end;
@@ -2566,6 +2634,11 @@ async fn flush_gc_batch(
         p.vp_extent_id = result.extent_id;
         p.vp_offset = result.end;
         p.active.insert_batch(insert_items);
+        // F-RECOVERY-UNBOUNDED BUG1: the GC multi-frag rewrite re-appends live
+        // values to log_stream and seeds them into the active memtable, so they
+        // join the un-flushed LOG window that recovery would replay. Track the
+        // appended bytes for an accurate F120-B force-rotate gap.
+        p.active.add_log_bytes(batch_bytes);
     }
     *moved += n;
 
@@ -4082,7 +4155,7 @@ mod gc_replay_floor_tests {
     //! F1 regression: GC must never punch a log_stream extent that crash
     //! recovery still replays. These pin the floor computation (== recovery's
     //! `chosen_pos`) and the punch guard.
-    use super::{gc_extent_punchable, gc_replay_floor};
+    use super::{gc_extent_punchable, gc_floor_raise_to_durable_ckpt, gc_replay_floor};
 
     #[test]
     fn floor_is_min_first_occurrence_position() {
@@ -4152,6 +4225,60 @@ mod gc_replay_floor_tests {
             .map(|(eid, _)| *eid)
             .collect();
         assert_eq!(punchable, vec![10, 13]);
+    }
+
+    // F-RECOVERY-UNBOUNDED BUG2 — the durable-checkpoint floor raise.
+
+    #[test]
+    fn durable_ckpt_raise_advances_floor_and_frees_covered_prefix() {
+        // Live SST vp_heads span extents 11 (pos 1) .. 14 (pos 4); the
+        // over-conservative MIN floor is 1. The newest DURABLY-ACKed flush
+        // checkpoint's vp is at extent 13 (pos 3): every record below pos 3 is
+        // in that checkpoint's persisted SST set → safe to reclaim. The raise
+        // lifts the floor to 3, so 11 and 12 become punchable while 13 (the vp
+        // extent, AT the floor) and 14 stay protected.
+        let log = [10u64, 11, 12, 13, 14];
+        let (min_floor, pos) = gc_replay_floor(&log, [11u64, 12, 13, 14]);
+        assert_eq!(min_floor, 1, "MIN over SST vp_heads");
+        let raised = gc_floor_raise_to_durable_ckpt(min_floor, &pos, /*durable vp eid*/ 13);
+        assert_eq!(raised, 3);
+        let candidates = [
+            (10u64, 1_000u64), // before raised floor → punchable
+            (11, 1_000),       // now below floor 3 → punchable (was protected at MIN)
+            (12, 1_000),       // now below floor 3 → punchable
+            (13, 1_000),       // AT floor (durable vp extent) → PROTECTED
+            (14, 1_000),       // after floor → PROTECTED
+        ];
+        let punchable: Vec<u64> = candidates
+            .iter()
+            .filter(|(eid, sl)| gc_extent_punchable(*eid, *sl, &pos, raised))
+            .map(|(eid, _)| *eid)
+            .collect();
+        assert_eq!(punchable, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn durable_ckpt_raise_is_noop_before_first_flush_or_when_unresolvable() {
+        let log = [10u64, 11, 12, 13];
+        let (min_floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(min_floor, 1);
+        // (0,0) = no flush committed this incarnation → stay at the MIN floor.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 0), 1);
+        // Durable vp extent already gone from the stream (e.g. post-merge GC) →
+        // conservative: keep the MIN floor, never raise past what resolves.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 99), 1);
+    }
+
+    #[test]
+    fn durable_ckpt_raise_never_lowers_the_min_floor() {
+        // A durable vp that resolves EARLIER than the MIN floor (a stale/older
+        // checkpoint vp) must never pull the floor backward — the raise is a
+        // max, so the more-conservative MIN wins.
+        let log = [10u64, 11, 12, 13];
+        let (min_floor, pos) = gc_replay_floor(&log, [12u64]); // MIN floor = 2
+        assert_eq!(min_floor, 2);
+        // durable vp resolves at pos 1 (< 2) → floor stays 2.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 11), 2);
     }
 }
 

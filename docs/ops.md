@@ -426,6 +426,36 @@ extent (a lagging CoW-shared SST from a split is the usual cause), then re-issue
 that extent for replay (its data was all flushed while that extent was the log
 tail) — nothing to reclaim until newer data supersedes it.
 
+### Recovery is BOUNDED and reopens in parallel (F-RECOVERY-UNBOUNDED)
+
+A partition's reopen time is bounded by the un-flushed **log** window, NOT the
+dataset size — if a full-takeover reopen (all a dead PS's partitions land on one
+survivor) is slow, that's a symptom to investigate, not "the dataset is just big".
+Three properties enforce this (2026-07-13):
+
+- **Bounded replay window (BUG1).** The `MAX_WAL_GAP` (2 GiB) force-rotate now
+  measures the un-flushed **log bytes** (value included), not the memtable
+  footprint. Before the fix, a large-value (VP) workload kept only ~24-byte
+  pointers in the memtable, so the gap never tripped and the log_stream replay
+  window grew with the dataset. If reopen replay is still large, check
+  `autumn-op info --part P` `vp_seed(tail)` vs `replay_floor` spread — a wide
+  spread means flushes are lagging (slow P-bulk / row_stream), not a recovery bug.
+- **Parallel reopen (BUG3).** `sync_regions_once` opens up to 64 partitions
+  concurrently (each recovers on its own OS thread/core). A 32-partition takeover
+  recovers in ~single-partition time, not ×32. In the PS log you'll see all
+  `opening partition P` lines close together, then `partition P opened` as each
+  finishes — interleaved, not strictly sequential.
+- **Tighter GC reclaim (BUG2).** GC may now raise its replay floor to the newest
+  **durably-ACKed flush checkpoint** vp (not just the MIN over all live SSTs'
+  vp_heads), so the fully-flushed prefix `[oldest-SST-vp, newest-flush-vp)` is
+  reclaimable without waiting for a major compaction to advance every SST's
+  vp_head. The recovery replay-start is UNCHANGED (safe by design — the recovery
+  code was deliberately not touched); it self-tightens once GC punches the covered
+  prefix. `autumn-op info --part P` still shows the conservative MIN `replay_floor`
+  (display-only); the effective GC floor can be higher. **No operator action** —
+  this just means less lingering log debt on write-heavy partitions between major
+  compactions.
+
 ### GC auto-reclaims empty sealed log extents from split/merge churn (F-GC-FLOOR-OBS #5)
 
 Frequent split/merge mints **empty sealed** `log_stream` tail extents

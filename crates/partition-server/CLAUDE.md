@@ -958,6 +958,47 @@ exactly; the single-task merge makes the in-memory `sst_readers` it reads match
 the durable checkpoint recovery loads. `floor=0` (protect all non-empty) when no
 vp_head resolves. Regression: `background::gc_replay_floor_tests`.
 
+**F-RECOVERY-UNBOUNDED BUG2 (2026-07-13) — raise the floor to the DURABLY-ACKed
+flush checkpoint vp.** The MIN-over-live-SST-vps floor above is over-conservative:
+it drags the punchable frontier back to the OLDEST live SST's vp_head, so GC can't
+reclaim the fully-covered `[MIN, newest-flush-vp)` region (disk debt) and recovery
+re-reads + CRC-checks it only to discard via dedup. Fix (`gc_floor_raise_to_durable_ckpt`,
+a `max`): after `gc_replay_floor`, raise `replay_floor_pos` to the position of
+`PartitionData.durable_ckpt_vp` when it resolves. `durable_ckpt_vp` is the vp_head
+of the newest FLUSH-published, **durably-ACKed** meta_stream checkpoint of THIS
+incarnation — set ONLY in `commit_flush_outcome_inner` AFTER `save_table_locs_raw`
+returns Ok, `(0,0)` until then, and NOT seeded from the recovered checkpoint at open
+(a fresh incarnation stays at the conservative MIN until its own first flush, which
+also collapses meta_stream to one record → closes the post-merge two-source
+region-shift window). By F-FLUSH-VPHEAD every log record strictly below a durable
+checkpoint vp is in that checkpoint's persisted SST set (or compaction-dead), so
+`[MIN, durable-vp)` is safe to punch.
+
+**Why the value MUST be ack-gated, never in-memory (load-bearing invariant):**
+`commit_flush_outcome_inner` pushes the new SST into `tables`/`sst_readers` BEFORE
+the checkpoint append acks. A floor derived from in-memory state (`p.vp_*`, or a MAX
+over live `sst_readers` vp_heads) could therefore run AHEAD of what a crash-time
+recovery will load — GC punches `[V_old, V_new)`, the process crashes before the
+`V_new` checkpoint acks, recovery loads the `V_old` checkpoint (whose SSTs don't
+cover `[V_old, V_new)`), and those records are in neither the loaded SST set nor the
+(punched) log → **silent loss**. The ack-gated `durable_ckpt_vp` is immune: a crash
+always leaves recovery loading a checkpoint whose SST set covers everything below
+the floor.
+
+**Why `recover_partition` is deliberately NOT changed** (the naive "MIN→MAX replay
+start" is UNSAFE — it deletes the `chosen_pos==usize::MAX` no-replay rescue that is
+the sole anchor when Step-1 checkpoints resolve nothing, and it reopens the
+post-merge q-key loss). The recovery-read half self-resolves for free: once GC
+punches the covered prefix, those extents vanish from `log_extent_ids`, the punched
+SSTs' vp_heads become unresolvable, recovery's Step-2 per-SST pass skips them
+(`if let Some(reader_pos) = first_pos_by_eid.get(...)`), and `chosen_pos` naturally
+lands at the first surviving position ≥ the raised floor. The vp extent sits AT the
+floor and the strictly-before punch rule keeps it live, so Step-1 always resolves it.
+Regression: the `durable_ckpt_raise_*` cases in `background::gc_replay_floor_tests`.
+Recommended cross-host guard (deferred, needs etcd + a `set_flush_commit_pause`
+sync-point): `system_gc_floor_durable_ckpt.rs` (kill+restart across the
+checkpoint-publish window proves K-keys survive).
+
 ## GC (Garbage Collection)
 
 Targets the **logStream** where large values (ValuePointers) are stored.
@@ -1460,6 +1501,27 @@ repaired with a one-off server binary, `repair_metastream`, which appends a new
 strict. Use this path for preserved broken data; keep `recover_partition`
 simple and authoritative.
 
+**F-RECOVERY-UNBOUNDED BUG3 (2026-07-13) — `sync_regions_once` opens partitions
+CONCURRENTLY.** `open_partition().await` spawns the partition's own OS thread (own
+compio runtime + core) and returns only after that thread finishes
+`recover_partition` (log_stream replay) + bind + register (`ready_tx` fires last).
+Awaiting the opens one-at-a-time made a PS that inherits N partitions (a full
+takeover after a sibling PS died) pay ~N× the single-partition recovery wallclock
+(×32 measured on a 32-partition takeover). Since each recovery runs on its own
+thread/core and is latency-bound (per-stream `commit_length` RTTs + SST meta-tail
+reads + chunked log replay), the opens now fan out via
+`futures::stream::iter(to_open).buffer_unordered(OPEN_PARALLELISM=64)` — the waits
+overlap for a ~N× speedup. The gating (already-open / backoff / F196 budget, with a
+LOCAL budget reservation counter so the batch decision stays exact before any
+`inc()`) is applied UP FRONT so the concurrent launch preserves the serial
+semantics; results (insert handle + budget inc + clear/record backoff) are applied
+after `collect`. Concurrency is race-free because port ordinals are reserved
+synchronously per open (`used_port_ords.borrow_mut()` before any await — a later
+open never collides) and owner locks are per-partition keys (`partition/<id>`), so
+no cross-open shared-RefCell borrow is held across an await. `OPEN_PARALLELISM` caps
+only the manager-RPC burst; the live count is already bounded by the per-PS
+partition budget (cpuset_len / 2).
+
 ## Fault Recovery: LockedByOther Self-Eviction
 
 If the `partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
@@ -1693,7 +1755,7 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
 | `MAX_IMM_DEPTH` (F120-A) | 4 | imm queue cap; merged_loop stalls req intake when reached. RocksDB's `max_write_buffer_number`. Env: `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
-| `MAX_WAL_GAP` (F120-B) | 2 GiB | force-rotate active when `active.bytes + Σ imm.bytes` exceeds this. RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
+| `MAX_WAL_GAP` (F120-B) | 2 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. **F-RECOVERY-UNBOUNDED BUG1: measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`** — a VP is ~24 B for an 8 MB value, so a `mem_bytes` gap never tripped on large-value workloads and the replay window grew O(dataset). RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
 | `SHUTDOWN_TIMEOUT_MS` (F120-C) | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env: `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
 | `MAX_SST_BEFORE_AUTO_COMPACT` (F210-E2) | 32 | defensive: `background_compact_loop`'s timeout arm auto-triggers a minor compaction when `sst_readers.len()` exceeds this. Prevents bloom-FPR runaway on partitions where external policy is paused (1% per-SST bloom × N=32 ≈ 28% cumulative miss-path false-positive). Not env-tunable — mechanism-level defensive bound, not a policy knob. |
 
@@ -1717,11 +1779,25 @@ post-restart.
    `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB.
 
 2. **F120-B — WAL-gap forced rotate.** After each iteration of
-   `partition_loop`, compute `gap = active.bytes + Σ imm[i].bytes`.
+   `partition_loop`, compute `gap = active.log_bytes() + Σ imm[i].log_bytes()`.
    If `gap > MAX_WAL_GAP` AND `imm.len() < MAX_IMM_DEPTH`, call
    `rotate_active`. Bounds replay window for workloads that don't fill
    `FLUSH_MEM_BYTES` before triggering rotate (e.g. mostly-large-value
    writes where memtable is light but log_stream grows fast via VPs).
+   **F-RECOVERY-UNBOUNDED BUG1 (2026-07-13): the gap MUST be the un-flushed
+   LOG bytes, not the memtable footprint.** Pre-fix it read `active.mem_bytes()
+   + Σ imm.mem_bytes()`; for a large-value (VP) workload the memtable holds only
+   the ~24-byte ValuePointer while the 8 MB value lives in log_stream, so the gap
+   never approached 2 GiB → active never force-rotated → the un-flushed replay
+   window grew O(dataset) (the real cause of "slow reopen on a big dataset", not
+   the dataset size itself). `Memtable.log_bytes: AtomicU64` tracks the actual
+   appended log bytes (value included), incremented in THREE places — the
+   group-commit Phase 3 (`finish_write_batch`, Σ `record_sizes`), the GC
+   multi-frag rewrite (Σ appended `batch_bytes`), and recovery-replay (per
+   inserted record: `V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + key + value`). It
+   travels with the memtable through `rotate_active` into imm and disappears from
+   the sum when the imm flushes (its bytes are now durable in an SST → no longer
+   need replay). A fresh active starts at 0.
 
 3. **F120-C — graceful shutdown.** New `PartitionServer::shutdown()` sends
    a `oneshot::Sender<()>` per partition through `drain_tx`. The

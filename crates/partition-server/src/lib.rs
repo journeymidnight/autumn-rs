@@ -382,6 +382,19 @@ pub(crate) fn shutdown_timeout_ms() -> u64 {
     *SHUTDOWN_TIMEOUT_MS_CELL.get_or_init(|| 60_000)
 }
 
+/// F-RECOVERY-UNBOUNDED BUG3 — how many partitions `sync_regions_once` opens
+/// CONCURRENTLY. Each `open_partition` spawns the partition's own OS thread
+/// (own compio runtime + core) and returns only after that thread finishes
+/// `recover_partition` (log_stream replay) + bind + register — so opening
+/// serially made a PS that inherits N partitions (e.g. a full takeover after
+/// a sibling PS died) pay ~N× the single-partition recovery wallclock
+/// (measured ×32 on a 32-partition takeover). Recovery is latency-bound and
+/// runs on per-partition threads, so launching the opens concurrently overlaps
+/// the waits. The live partition count is already bounded by the per-PS
+/// partition budget (cpuset_len / 2); this cap only bounds the burst of
+/// manager RPCs (owner-lock / commit_length) a mass reopen fires at once.
+const OPEN_PARALLELISM: usize = 64;
+
 // CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
 // owned by a partition (P-log `part-{id}` and P-bulk `part-{id}-bulk`)
 // pin to the SAME core — P-bulk is mostly idle during P-log's busy
@@ -627,6 +640,14 @@ pub(crate) struct MemEntry {
 pub(crate) struct Memtable {
     data: parking_lot::RwLock<BTreeMap<Vec<u8>, MemEntry>>,
     bytes: AtomicU64,
+    /// F-RECOVERY-UNBOUNDED BUG1: LOG bytes (the actual WAL records appended to
+    /// log_stream for this memtable's entries — VALUE included), tracked
+    /// SEPARATELY from `bytes` (in-memory footprint, which for a large value is
+    /// only the ~24-byte ValuePointer). The F120-B WAL-gap force-rotate must
+    /// bound the recovery REPLAY WINDOW = un-flushed log bytes, so it reads this,
+    /// not `mem_bytes()`. Updated once per group-commit batch via `add_log_bytes`
+    /// (Σ record_sizes = bytes appended to log_stream).
+    log_bytes: AtomicU64,
 }
 
 impl Memtable {
@@ -634,6 +655,7 @@ impl Memtable {
         Self {
             data: parking_lot::RwLock::new(BTreeMap::new()),
             bytes: AtomicU64::new(0),
+            log_bytes: AtomicU64::new(0),
         }
     }
 
@@ -676,6 +698,16 @@ impl Memtable {
     }
     fn mem_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+    /// F-RECOVERY-UNBOUNDED BUG1: accumulate the LOG bytes appended for this
+    /// batch (Σ record_sizes = the log_stream growth). Called once per batch
+    /// from Phase 3 — the value is included, so this tracks the true replay
+    /// window (unlike `mem_bytes`, which only sees the VP for large values).
+    fn add_log_bytes(&self, n: u64) {
+        self.log_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+    fn log_bytes(&self) -> u64 {
+        self.log_bytes.load(Ordering::Relaxed)
     }
 
     fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
@@ -818,6 +850,26 @@ pub(crate) struct PartitionData {
     has_overlap: Cell<u32>,
     vp_extent_id: u64,
     vp_offset: u64,
+    /// F-RECOVERY-UNBOUNDED BUG2 (GC replay-floor tightening): the vp_head of
+    /// the newest FLUSH-published, *durably ACKed* meta_stream checkpoint of
+    /// THIS partition incarnation. `(0,0)` until the first flush commit acks.
+    ///
+    /// Set ONLY after `save_table_locs_raw` returns `Ok` in
+    /// `commit_flush_outcome_inner` — NEVER from in-memory state (`vp_*` or a
+    /// MAX over live readers), and NEVER from a compaction publish (whose
+    /// `compaction_output_vp_head` = MAX(input vp_heads) can regress backward).
+    /// Rationale: `commit_flush_outcome_inner` pushes the new SST into
+    /// `tables`/`sst_readers` BEFORE the checkpoint append acks, so any floor
+    /// derived from in-memory state can run ahead of what a crash-time recovery
+    /// will actually load — GC could punch a log region whose naming checkpoint
+    /// never landed → silent loss. This ack-gated value lets GC raise its
+    /// replay floor to reclaim the fully-covered `[MIN-over-SST-vps, this)`
+    /// region safely (proof: [[gc_replay_floor]] + the F-FLUSH-VPHEAD content-
+    /// boundary invariant). Deliberately NOT seeded from the recovered
+    /// checkpoint at open — a fresh incarnation stays at the conservative MIN
+    /// floor until its own first flush publish (which also collapses meta_stream
+    /// to one record, closing the post-merge two-source region-shift window).
+    durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// F088: sender to the per-partition bulk thread. Always present —
     /// `open_partition` returns Err if P-bulk fails to spawn, so the
@@ -3484,77 +3536,139 @@ impl PartitionServer {
         let now = Instant::now();
 
         // Open new partitions.
-        for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch)) in wanted {
-            if self.partitions.borrow().contains_key(&part_id) {
-                continue;
-            }
-            // BUG #3 hardening: a partition whose open keeps failing (e.g.
-            // transient listener-bind EADDRINUSE during region churn) is in
-            // a backoff window — skip reopening it this tick instead of
-            // thrashing every ~2 s. The window expires and we retry.
-            if let Some(bo) = self.open_backoff.borrow().get(&part_id) {
-                if now < bo.retry_after {
+        //
+        // F-RECOVERY-UNBOUNDED BUG3: open partitions CONCURRENTLY, not
+        // serially. `open_partition().await` returns only after the
+        // partition's own thread has finished `recover_partition` (log_stream
+        // replay) + bind + register, so awaiting them one-at-a-time made a PS
+        // that inherits N partitions pay ~N× the single-partition recovery
+        // wallclock (×32 on a full 32-partition takeover). Each recovery runs
+        // on its own OS thread/core and is latency-bound, so a concurrent
+        // launch overlaps the waits. The gating (already-open / backoff /
+        // budget) is applied UP FRONT, then the opens fan out.
+        //
+        // coco P2 (2026-07-13): the up-front budget RESERVATION counts every
+        // candidate we launch (not just eventual successes), so it is a
+        // conservative concurrency bound — it will never launch more than
+        // `budget.max - current` opens at once (avoiding core over-subscription
+        // when the manager assigned more partitions than cpuset/2). In the
+        // common takeover case `budget.max` (= cpuset/2) holds all this PS's
+        // partitions, so `would_exceed` never trips and every wanted partition
+        // is launched, matching the old serial behavior. The only divergence is
+        // an OVER-subscribed PS where a reserved candidate then fails to open:
+        // its slot is retried on the next ~2 s tick rather than same-tick — a
+        // self-healing conservatism, not a stuck partition. (Full same-tick
+        // slot reuse would need dynamic replenishment; not worth it for an
+        // already-degraded, F196-warned oversubscribed PS.)
+        let mut to_open: Vec<(u64, (Range, u64, u64, u64, u64))> = Vec::new();
+        {
+            let parts = self.partitions.borrow();
+            let backoff = self.open_backoff.borrow();
+            // Reserve budget slots locally so the whole batch is decided
+            // before any `inc()` runs (see the coco P2 note above).
+            let mut reserved = 0usize;
+            for (part_id, tuple) in wanted {
+                if parts.contains_key(&part_id) {
                     continue;
                 }
+                // BUG #3 hardening: a partition whose open keeps failing (e.g.
+                // transient listener-bind EADDRINUSE during region churn) is
+                // in a backoff window — skip reopening it this tick instead of
+                // thrashing every ~2 s. The window expires and we retry.
+                if let Some(bo) = backoff.get(&part_id) {
+                    if now < bo.retry_after {
+                        continue;
+                    }
+                }
+                // F196: refuse to open a NEW partition when the static budget
+                // is exhausted. Manager assigned more partitions than the
+                // operator pre-allocated cores for; leave the slot uncovered
+                // so the operator sees `ps=unknown` in `client info` and can
+                // either grow --cpuset or add more PSes. Existing partitions
+                // are unaffected.
+                if self.partition_budget.would_exceed(reserved + 1) {
+                    tracing::warn!(
+                        ps_id = self.ps_id,
+                        part_id,
+                        current = self.partition_budget.current(),
+                        max = self.partition_budget.max,
+                        "F196: refusing to open partition — PS core budget exhausted (cpuset_len/2). \
+                         Operator must grow --cpuset or migrate this partition to another PS."
+                    );
+                    continue;
+                }
+                reserved += 1;
+                to_open.push((part_id, tuple));
             }
-            // F196: refuse to open a NEW partition when the static budget
-            // is exhausted. Manager assigned more partitions than the
-            // operator pre-allocated cores for; leave the slot uncovered
-            // so the operator sees `ps=unknown` in `client info` and can
-            // either grow --cpuset or add more PSes. Existing partitions
-            // are unaffected.
-            if self.partition_budget.would_exceed(1) {
-                tracing::warn!(
-                    ps_id = self.ps_id,
-                    part_id,
-                    current = self.partition_budget.current(),
-                    max = self.partition_budget.max,
-                    "F196: refusing to open partition — PS core budget exhausted (cpuset_len/2). \
-                     Operator must grow --cpuset or migrate this partition to another PS."
-                );
-                continue;
-            }
-            tracing::info!("PS {} opening partition {part_id}", self.ps_id);
+        }
+
+        if !to_open.is_empty() {
             // BUG #3 hardening: do NOT `?`-propagate an open failure — that
             // aborted the whole sync pass (skipping every other wanted
-            // partition) and retried the failing one every tick. Catch it,
-            // record per-partition backoff, and continue opening the rest.
-            match self
-                .open_partition(
-                    part_id,
-                    rg,
-                    region_epoch,
-                    log_stream_id,
-                    row_stream_id,
-                    meta_stream_id,
+            // partition) and retried the failing one every tick. Each open's
+            // Result is handled independently below.
+            //
+            // coco P1 (2026-07-13): publish each handle into `self.partitions`
+            // AS SOON AS its open completes — NOT after the whole batch via
+            // `.collect()`. `open_partition` returns only once the partition
+            // thread has recovered + bound + REGISTERED its `part_addr` with the
+            // manager, so a completed-but-unpublished partition is ALREADY
+            // serving + routable while the main thread's `self.partitions`
+            // (which `shutdown()` drains and the F265 self-heal / report_load
+            // loops read) doesn't know it. Batching the publish would strand
+            // every fast sibling in that unmanaged window behind one straggler
+            // stuck in `commit_length` retry — on SIGTERM those registered
+            // partitions would skip graceful drain (unflushed imm). Consuming
+            // the completion stream incrementally keeps the opens concurrent
+            // (`buffer_unordered`) while publishing in completion order. No
+            // `self.partitions` borrow is held across the `.next().await`.
+            let mut opens = futures::stream::iter(to_open)
+                .map(
+                    |(part_id, (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch))| async move {
+                        tracing::info!("PS {} opening partition {part_id}", self.ps_id);
+                        let r = self
+                            .open_partition(
+                                part_id,
+                                rg,
+                                region_epoch,
+                                log_stream_id,
+                                row_stream_id,
+                                meta_stream_id,
+                            )
+                            .await;
+                        (part_id, r)
+                    },
                 )
-                .await
-            {
-                Ok(handle) => {
-                    tracing::info!("PS {} partition {part_id} opened", self.ps_id);
-                    self.partitions.borrow_mut().insert(part_id, handle);
-                    // F196: bump budget counter only after a successful insert.
-                    self.partition_budget.inc();
-                    // Open succeeded — clear any backoff state.
-                    self.open_backoff.borrow_mut().remove(&part_id);
-                }
-                Err(e) => {
-                    let mut bk = self.open_backoff.borrow_mut();
-                    let entry = bk.entry(part_id).or_insert(OpenBackoff {
-                        consecutive_failures: 0,
-                        retry_after: now,
-                    });
-                    entry.consecutive_failures += 1;
-                    let shift = (entry.consecutive_failures - 1).min(OPEN_BACKOFF_MAX_SHIFT);
-                    let secs = OPEN_BACKOFF_BASE_SECS
-                        .saturating_mul(1u64 << shift)
-                        .min(OPEN_BACKOFF_CAP_SECS);
-                    entry.retry_after = now + Duration::from_secs(secs);
-                    tracing::warn!(
-                        "PS {} open partition {part_id} failed (attempt {}); backing off {secs}s: {e:#}",
-                        self.ps_id,
-                        entry.consecutive_failures,
-                    );
+                .buffer_unordered(OPEN_PARALLELISM);
+
+            while let Some((part_id, result)) = opens.next().await {
+                match result {
+                    Ok(handle) => {
+                        tracing::info!("PS {} partition {part_id} opened", self.ps_id);
+                        self.partitions.borrow_mut().insert(part_id, handle);
+                        // F196: bump budget counter only after a successful insert.
+                        self.partition_budget.inc();
+                        // Open succeeded — clear any backoff state.
+                        self.open_backoff.borrow_mut().remove(&part_id);
+                    }
+                    Err(e) => {
+                        let mut bk = self.open_backoff.borrow_mut();
+                        let entry = bk.entry(part_id).or_insert(OpenBackoff {
+                            consecutive_failures: 0,
+                            retry_after: now,
+                        });
+                        entry.consecutive_failures += 1;
+                        let shift = (entry.consecutive_failures - 1).min(OPEN_BACKOFF_MAX_SHIFT);
+                        let secs = OPEN_BACKOFF_BASE_SECS
+                            .saturating_mul(1u64 << shift)
+                            .min(OPEN_BACKOFF_CAP_SECS);
+                        entry.retry_after = now + Duration::from_secs(secs);
+                        tracing::warn!(
+                            "PS {} open partition {part_id} failed (attempt {}); backing off {secs}s: {e:#}",
+                            self.ps_id,
+                            entry.consecutive_failures,
+                        );
+                    }
                 }
             }
         }
@@ -5348,6 +5462,9 @@ async fn partition_thread_main(
         has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
+        // F-RECOVERY-UNBOUNDED BUG2: (0,0) = conservative MIN floor until this
+        // incarnation's first flush commit acks (see the field doc).
+        durable_ckpt_vp: Cell::new((0, 0)),
         stream_client: part_sc.clone(),
         flush_req_tx: flush_req_tx.clone(),
         row_append_tx: row_append_tx.clone(),
@@ -6108,9 +6225,18 @@ async fn partition_loop(
         // even when it hasn't reached `FLUSH_MEM_BYTES`. Skipped when
         // imm is already full (rotation would over-cap and `imm_full`
         // back-pressure has already kicked in).
+        //
+        // F-RECOVERY-UNBOUNDED BUG1: the gap MUST be the unflushed LOG bytes
+        // (`log_bytes`, value included), NOT the memtable footprint
+        // (`mem_bytes`). For a large-value (VP) workload the memtable holds only
+        // ~24-byte VPs, so `mem_bytes` would need hundreds of TB of log to reach
+        // 2 GiB and this force-rotate would NEVER fire — leaving the recovery
+        // replay window unbounded (= O(dataset)). `log_bytes` tracks true log
+        // growth, so the rotate fires every ~MAX_WAL_GAP of log and the replay
+        // window (and GC floor) stays bounded regardless of value size.
         {
             let mut p = part.borrow_mut();
-            let gap = p.active.mem_bytes() + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
+            let gap = p.active.log_bytes() + p.imm.iter().map(|m| m.log_bytes()).sum::<u64>();
             if gap > wal_gap_cap && p.imm.len() < imm_cap && !p.active.is_empty() {
                 rotate_active(&mut p);
             }
@@ -7928,6 +8054,14 @@ async fn recover_partition(
                 }
 
                 let record_extent_off = buf_base + buf_off as u64;
+                // F-RECOVERY-UNBOUNDED BUG1: the un-flushed LOG bytes this
+                // replayed record contributes to the recovered active memtable
+                // (value included), so the post-recovery F120-B gap is accurate.
+                // Captured before `value`/`key` are moved into the entry/insert.
+                let log_rec_bytes = crate::wal_record::V1_ENVELOPE_OVERHEAD as u64
+                    + crate::wal_record::PAYLOAD_HEADER as u64
+                    + key.len() as u64
+                    + value.len() as u64;
                 let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
                     // VP detection: new WAL has VP flag in op; old WAL uses
                     // value size as fallback. The reconstructed VP.offset MUST
@@ -7960,6 +8094,11 @@ async fn recover_partition(
 
                 let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
                 active.insert(key, mem_entry, size);
+                // F-RECOVERY-UNBOUNDED BUG1: track the un-flushed LOG bytes of
+                // the recovered active so the post-recovery F120-B force-rotate
+                // gap is accurate (otherwise it seeds at 0 and the first replay
+                // window after a restart can grow unbounded before rotating).
+                active.add_log_bytes(log_rec_bytes);
             }
             carry = buf[consumed..].to_vec();
             // Advance by the full window `buf` covers (= the committed bytes for
@@ -8618,6 +8757,12 @@ async fn commit_flush_outcome_inner(
         floors_snapshot,
     )
     .await?;
+    // F-RECOVERY-UNBOUNDED BUG2: the checkpoint naming (vp_eid, vp_off) is now
+    // DURABLE. By F-FLUSH-VPHEAD every log record strictly below it is in the
+    // just-persisted SST set (or compaction-dead), so GC may safely raise its
+    // replay floor to this position. Set ONLY here — after the ack — never from
+    // in-memory state (see the `durable_ckpt_vp` field doc for the loss trap).
+    part.borrow().durable_ckpt_vp.set((vp_eid, vp_off));
     // F202: tables changed (new SST committed) → refresh the
     // advisory-input metrics so the next report_load_loop tick carries
     // accurate dead-data / minor-compact-pending volumes.
