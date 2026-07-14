@@ -364,7 +364,20 @@ Properties that still hold (unchanged from pre-F210-C1):
 Same FuturesUnordered + select pattern on the bulk thread, cap = 2
 (default, env `AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each
 in-flight flush holds a 128 MB SST buffer, so the cap is deliberately
-small. The benefit is that while one SST is uploading via
+small.
+
+**BUG-FLUSH-TIMEOUT-LEAK (2026-07-14, fixed in the stream crate — no PS code
+change):** `bulk_sc`'s 256 MiB SST `row_stream.append` used to run against the
+stream client's fixed 5 s per-replica deadline (sized for P-log's 4 KiB WAL
+appends). Under load it ALWAYS timed out, the retry sealed-empty + rolled the
+row_stream tail and re-uploaded the same SST, leaking one ~255 MB
+unreclaimable extent per iteration (live cluster: 10.4 TB for 222 GB logical,
+disks full, writes dead). The stream client now derives every append deadline
+from the ACTUAL payload size (256 MiB → ~37 s) and reclaims (punches) a tail
+it sealed at commit=0 when rolling away. See `crates/stream/CLAUDE.md`
+Programming Note 28. P-bulk needs no special `StreamClientConfig` — the
+default config self-adapts per append size (this also covers P-log's
+large-value log_stream appends). The benefit is that while one SST is uploading via
 `row_stream.append`, the next flush can start its `build_sst_bytes`
 `spawn_blocking` — overlapping CPU (build) with network (upload) without
 ballooning peak memory.

@@ -669,7 +669,10 @@ const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
 /// env-default behaviour:
 ///   - `bad_nodes_ttl`: 30 s (F190)
 ///   - `inflight_cap`: 32 per-stream FU cap
-///   - `append_fanout_timeout`: 5 s per-replica append deadline (F121)
+///   - `append_fanout_timeout`: 5 s per-replica append BASE deadline (F121;
+///     BUG-FLUSH-TIMEOUT-LEAK made it a base, not the whole deadline)
+///   - `append_floor_bytes_per_sec`: 8 MiB/s assumed worst-case sustained
+///     all-replica append throughput floor (BUG-FLUSH-TIMEOUT-LEAK)
 ///   - `read_chunk_bytes`: 256 MiB per replicated read chunk (F105)
 ///   - `synced_poll`: 2 ms F178 flush-barrier poll interval
 ///   - `synced_timeout`: 30 s F178 flush-barrier overall timeout
@@ -678,6 +681,27 @@ pub struct StreamClientConfig {
     pub bad_nodes_ttl: Duration,
     pub inflight_cap: usize,
     pub append_fanout_timeout: Duration,
+    /// BUG-FLUSH-TIMEOUT-LEAK: the per-append deadline scales with payload
+    /// size — `deadline = append_fanout_timeout + payload_len / this`
+    /// (see `effective_append_timeout`). The F121 fixed 5 s deadline was
+    /// sized for 4 KiB WAL appends; applied verbatim to a 256 MiB SST
+    /// flush it CANNOT be met under load (live cluster: 788× "append
+    /// timeout after 5s" while every EN had durably written all ~255 MB),
+    /// and each spurious timeout rolled to a fresh extent, leaking the old
+    /// one (10.4 TB for 222 GB logical, 47× amplification).
+    ///
+    /// Why 8 MiB/s: measured healthy bulk write throughput is 277–622 MB/s
+    /// (docs/perf_tcp_vs_ucx_xhost.md — 8 MiB TCP writes 277 MB/s aggregate
+    /// with p99 ALREADY at 6.1 s > the old 5 s deadline; docs/perf_k8s_ycsb.md
+    /// — 8 MB VP writes 584 MB/s at RF=3, EN never disk-saturated on 2–3 GB/s
+    /// NVMe). The floor is ~1.5 orders of magnitude below healthy so it
+    /// tolerates near-full-disk fsync collapse, recovery/GC traffic and
+    /// queueing behind other in-flight bulk appends — the deadline's job is
+    /// to distinguish "dead replica" from "slow but progressing", not to
+    /// estimate typical latency. 4 KiB WAL → +0.5 ms (unchanged); 8 MiB →
+    /// 6 s (matches the measured degraded p99); 256 MiB SST → 37 s; 512 MiB
+    /// compaction output (2 × MAX_SKIP_LIST) → 69 s.
+    pub append_floor_bytes_per_sec: u64,
     pub read_chunk_bytes: u64,
     pub synced_poll: Duration,
     pub synced_timeout: Duration,
@@ -689,10 +713,68 @@ impl Default for StreamClientConfig {
             bad_nodes_ttl: Duration::from_secs(30),
             inflight_cap: 32,
             append_fanout_timeout: Duration::from_secs(5),
+            append_floor_bytes_per_sec: 8 * 1024 * 1024,
             read_chunk_bytes: 256 * 1024 * 1024,
             synced_poll: Duration::from_millis(2),
             synced_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK: hard ceiling on the size-scaled append deadline.
+/// Preserves the F121 dead-replica bound — every append still resolves
+/// (success/error/timeout) within a bounded window, so `drain_inflight_for_seal`
+/// and the failover SealCommit handshake can never hang. 10 min covers a
+/// 4 GiB payload (the frame `payload_len: u32` wire ceiling) at ~7 MiB/s.
+pub(crate) const EFFECTIVE_APPEND_TIMEOUT_CAP: Duration = Duration::from_secs(600);
+
+/// BUG-FLUSH-TIMEOUT-LEAK FIX #1: derive the per-replica append deadline from
+/// the ACTUAL payload size instead of applying one fixed constant to every
+/// append: `deadline = min(base + payload_len / floor_bytes_per_sec, CAP)`.
+/// `base` covers RTT + queueing + fsync latency (the pre-existing 4 KiB-WAL
+/// deadline, F121); the scaled term covers transfer + write time at an assumed
+/// worst-case throughput floor (see `StreamClientConfig::
+/// append_floor_bytes_per_sec` for the derivation of the default floor).
+pub(crate) fn effective_append_timeout(
+    base: Duration,
+    floor_bytes_per_sec: u64,
+    payload_len: u64,
+) -> Duration {
+    // Defensive: a zero floor (should be unreachable — the builder clamps and
+    // the default is 8 MiB/s) degrades to the pre-fix fixed-base behaviour
+    // rather than dividing by zero.
+    if floor_bytes_per_sec == 0 {
+        return base.min(EFFECTIVE_APPEND_TIMEOUT_CAP);
+    }
+    let scaled = Duration::from_secs_f64(payload_len as f64 / floor_bytes_per_sec as f64);
+    base.saturating_add(scaled).min(EFFECTIVE_APPEND_TIMEOUT_CAP)
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK: per-worker snapshot of the two deadline knobs,
+/// threaded from `StreamClientConfig` into `launch_append` so each append's
+/// timeout is derived from ITS payload size (`for_payload`).
+#[derive(Clone, Copy)]
+pub(crate) struct AppendDeadline {
+    pub base: Duration,
+    pub floor_bytes_per_sec: u64,
+}
+
+impl AppendDeadline {
+    pub(crate) fn for_payload(&self, payload_len: u64) -> Duration {
+        effective_append_timeout(self.base, self.floor_bytes_per_sec, payload_len)
+    }
+
+    /// F260 chained append: the ack traverses every hop store-and-forward, so
+    /// the budget is the per-hop (already size-scaled) deadline × hops × 3.
+    ///
+    /// coco P2: the cap is applied AFTER the multiplier. Clamping only inside
+    /// `for_payload` and THEN multiplying blew past it (RF=3 ⇒ 600 s × 9 =
+    /// 90 min), breaking the boundedness the whole fix rests on — EVERY
+    /// `InflightFut` must resolve within `EFFECTIVE_APPEND_TIMEOUT_CAP` or
+    /// `drain_inflight_for_seal` / the SealCommit handshake (note 20) can hang
+    /// for that multiplied window, stalling the roll and the whole stream.
+    pub(crate) fn for_chain(&self, payload_len: u64, hops: u32) -> Duration {
+        (self.for_payload(payload_len) * hops.max(1) * 3).min(EFFECTIVE_APPEND_TIMEOUT_CAP)
     }
 }
 
@@ -703,10 +785,25 @@ impl StreamClientConfig {
         self.bad_nodes_ttl = Duration::from_secs(secs);
         self
     }
-    /// F195: F121 fanout clamp `[200 ms, 60 s]`.
+    /// F195: F121 fanout clamp `[200 ms, 60 s]`. Post-BUG-FLUSH-TIMEOUT-LEAK
+    /// this is the BASE deadline only (the payload-scaled term is added on
+    /// top per append — see `effective_append_timeout`), so the 60 s ceiling
+    /// stays correct: it bounds the size-independent slack, not the transfer
+    /// time of a large payload.
     pub fn with_append_fanout_timeout(mut self, t: Duration) -> Self {
         let ms = t.as_millis().clamp(200, 60_000) as u64;
         self.append_fanout_timeout = Duration::from_millis(ms);
+        self
+    }
+    /// BUG-FLUSH-TIMEOUT-LEAK: assumed worst-case sustained append throughput
+    /// floor for the payload-scaled deadline term. Clamp `[64 KiB/s, 1 GiB/s]`;
+    /// 0 → default (8 MiB/s).
+    pub fn with_append_floor_bytes_per_sec(mut self, bps: u64) -> Self {
+        self.append_floor_bytes_per_sec = if bps == 0 {
+            8 * 1024 * 1024
+        } else {
+            bps.clamp(64 * 1024, 1024 * 1024 * 1024)
+        };
         self
     }
     /// F195: per-stream FU cap. 0 → default 32.
@@ -730,6 +827,114 @@ impl StreamClientConfig {
         let ms = (t.as_millis() as u64).max(100);
         self.synced_timeout = Duration::from_millis(ms);
         self
+    }
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK FIX #1 reproduce-first tests.
+///
+/// Live-cluster evidence for the red state: a PS flush appends ONE ~256 MiB
+/// SST to row_stream; the fixed 5 s F121 deadline (sized for 4 KiB WAL
+/// appends) fired 788× ("append timeout after 5s") while every EN had
+/// durably written all ~255 MB — the client then rolled to a fresh extent
+/// and rewrote the same SST, leaking 255 MB per iteration (10.4 TB of
+/// unreclaimable extents for 222 GB of logical data).
+#[cfg(test)]
+mod append_deadline_tests {
+    use super::*;
+
+    /// coco P2 regression: the F260 chain path multiplies the per-hop deadline by
+    /// hops×3. If the cap is applied only INSIDE `for_payload` (before the
+    /// multiply), a capped 600 s becomes 90 min at RF=3 — breaking the invariant
+    /// every other part of this fix rests on: EVERY `InflightFut` resolves within
+    /// `EFFECTIVE_APPEND_TIMEOUT_CAP`, so `drain_inflight_for_seal` / SealCommit
+    /// can never hang. The cap must come AFTER the multiply.
+    #[test]
+    fn chain_deadline_stays_capped_after_the_hop_multiplier() {
+        let cfg = StreamClientConfig::default();
+        let d = AppendDeadline {
+            base: cfg.append_fanout_timeout,
+            floor_bytes_per_sec: cfg.append_floor_bytes_per_sec,
+        };
+        // A payload big enough that `for_payload` itself saturates the cap.
+        let huge = 64u64 * 1024 * 1024 * 1024; // 64 GiB
+        assert_eq!(d.for_payload(huge), EFFECTIVE_APPEND_TIMEOUT_CAP);
+        for hops in [1u32, 3, 5, 16] {
+            assert!(
+                d.for_chain(huge, hops) <= EFFECTIVE_APPEND_TIMEOUT_CAP,
+                "chain deadline must stay ≤ cap after ×{hops}×3 (was the 90-min bug)"
+            );
+        }
+        // The multiplier still WIDENS a normal 256 MiB SST (store-and-forward
+        // stacks hop latencies) — it just can't escape the cap.
+        let sst = 256u64 * 1024 * 1024;
+        let per_hop = d.for_payload(sst);
+        let chain = d.for_chain(sst, 3);
+        assert!(chain > per_hop, "chain budget must exceed the per-hop budget");
+        assert!(chain <= EFFECTIVE_APPEND_TIMEOUT_CAP);
+    }
+
+    #[test]
+    fn small_wal_append_keeps_base_deadline() {
+        let cfg = StreamClientConfig::default();
+        let d = effective_append_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            4 * 1024,
+        );
+        // The 4 KiB WAL hot path must NOT regress: the scaled term for
+        // 4 KiB at the default floor is ~0.5 ms.
+        assert!(
+            d >= cfg.append_fanout_timeout && d < cfg.append_fanout_timeout + Duration::from_millis(100),
+            "4 KiB deadline should stay ≈ base (5 s), got {d:?}"
+        );
+    }
+
+    #[test]
+    fn bulk_sst_append_deadline_scales_with_payload() {
+        let cfg = StreamClientConfig::default();
+        // FLUSH_MEM_BYTES = 256 MiB (partition-server lib.rs:53): one SST
+        // upload. 3-replica fanout + fsync of 256 MiB cannot finish in 5 s
+        // under load; the deadline must cover payload / assumed-floor.
+        let d_sst = effective_append_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            256 << 20,
+        );
+        let want = cfg.append_fanout_timeout
+            + Duration::from_secs_f64((256u64 << 20) as f64 / cfg.append_floor_bytes_per_sec as f64);
+        assert!(
+            d_sst >= want,
+            "256 MiB SST deadline must be ≥ base + payload/floor ({want:?}), got {d_sst:?}"
+        );
+
+        // do_compact finalizes SSTs at 2 × MAX_SKIP_LIST = 512 MiB — the
+        // deadline must keep scaling, not plateau at a hand-picked constant.
+        let d_compact = effective_append_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            512 << 20,
+        );
+        assert!(
+            d_compact > d_sst,
+            "512 MiB compaction output deadline ({d_compact:?}) must exceed the 256 MiB one ({d_sst:?})"
+        );
+    }
+
+    #[test]
+    fn deadline_stays_bounded_for_any_size() {
+        // F121 dead-replica bound: every append must still resolve within a
+        // bounded window (SealCommit drain depends on it). Even an absurd
+        // payload is capped.
+        let cfg = StreamClientConfig::default();
+        let d = effective_append_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            u64::MAX,
+        );
+        assert!(d <= EFFECTIVE_APPEND_TIMEOUT_CAP, "deadline must be capped, got {d:?}");
+        // Zero floor must not divide-by-zero / produce a degenerate deadline.
+        let z = effective_append_timeout(cfg.append_fanout_timeout, 0, 256 << 20);
+        assert!(z >= cfg.append_fanout_timeout && z <= EFFECTIVE_APPEND_TIMEOUT_CAP);
     }
 }
 
@@ -933,8 +1138,9 @@ async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receive
 /// SealCommit drain: await EVERY in-flight append and apply its completion so
 /// `state.commit` reaches its final contiguous all-replica-acked prefix before
 /// the worker reports the seal watermark. Bounded by each append's
-/// `append_fanout_timeout` (every `InflightFut` resolves within it — success,
-/// error, or timeout), so it cannot hang even if a replica is dead. After this
+/// size-scaled deadline (`effective_append_timeout`, hard-capped at
+/// `EFFECTIVE_APPEND_TIMEOUT_CAP` — every `InflightFut` resolves within it:
+/// success, error, or timeout), so it cannot hang even if a replica is dead. After this
 /// returns, `inflight` is empty and `state.commit` is the exact length to seal
 /// the current tail at: every all-replica-acked byte is included, every
 /// un-acked (failed/timed-out) byte is excluded (those callers retry onto the
@@ -959,7 +1165,7 @@ async fn apply_stream_submit_msg(
     inflight: &mut FuturesUnordered<InflightFut>,
     msg: StreamSubmitMsg,
     stream_id: u64,
-    append_timeout: Duration,
+    append_deadline: AppendDeadline,
 ) -> std::ops::ControlFlow<()> {
     match msg {
         StreamSubmitMsg::Shutdown => return std::ops::ControlFlow::Break(()),
@@ -1012,7 +1218,7 @@ async fn apply_stream_submit_msg(
                 payload_parts,
                 owner_epoch,
                 ack_tx,
-                append_timeout,
+                append_deadline,
             )
             .await;
         }
@@ -1034,7 +1240,12 @@ async fn stream_worker_loop(
     use futures::future::{select, Either};
 
     let cap = config.inflight_cap;
-    let append_timeout = config.append_fanout_timeout;
+    // BUG-FLUSH-TIMEOUT-LEAK FIX #1: the per-append deadline is DERIVED from
+    // each append's payload size (base + len/floor), not one fixed constant.
+    let append_deadline = AppendDeadline {
+        base: config.append_fanout_timeout,
+        floor_bytes_per_sec: config.append_floor_bytes_per_sec,
+    };
     let mut state = StreamAppendState::new(bad_nodes, failure_report_tx, config.bad_nodes_ttl);
     let mut inflight: FuturesUnordered<InflightFut> = FuturesUnordered::new();
 
@@ -1057,7 +1268,7 @@ async fn stream_worker_loop(
                     &mut inflight,
                     msg,
                     stream_id,
-                    append_timeout,
+                    append_deadline,
                 )
                 .await
                 .is_break(),
@@ -1095,7 +1306,7 @@ async fn stream_worker_loop(
                         &mut inflight,
                         msg,
                         stream_id,
-                        append_timeout,
+                        append_deadline,
                     )
                     .await
                     .is_break(),
@@ -1279,9 +1490,11 @@ async fn launch_append(
     payload_parts: Vec<Bytes>,
     owner_epoch: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
-    // F195: F121 per-replica deadline. Passed by the worker loop from
-    // its `config.append_fanout_timeout` snapshot.
-    append_timeout: Duration,
+    // F195 + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
+    // the worker loop from its config snapshot; the actual deadline is
+    // derived per append from the payload size (`for_payload`) so a 4 KiB
+    // WAL record and a 256 MiB SST upload each get a size-appropriate bound.
+    append_deadline: AppendDeadline,
 ) {
     let tail = match &state.tail {
         Some(t) => t.clone(),
@@ -1344,7 +1557,11 @@ async fn launch_append(
         let rx_res = pool.send_vectored(&head_addr, MSG_APPEND_CHAIN, parts).await;
         // Chained acks traverse every hop with store-and-forward latency —
         // budget generously (validated: deep 8M queues stack hop latencies).
-        let chain_timeout = append_timeout * (tail.replica_addrs.len() as u32) * 3;
+        // BUG-FLUSH-TIMEOUT-LEAK: the per-hop budget is already size-scaled.
+        //
+        // coco P2: the cap is applied AFTER the hop multiplier (see `for_chain`).
+        let chain_timeout =
+            append_deadline.for_chain(size, tail.replica_addrs.len() as u32);
         let fut = async move {
             let res = match rx_res {
                 Err(e) => Err(anyhow!("{} chain submit error: {}", head_addr, e)),
@@ -1408,14 +1625,21 @@ async fn launch_append(
     let receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
         join_all(send_futs).await;
 
-    // F121: bound each replica's recv at `append_fanout_timeout`. A
-    // half-open socket whose SubmitMsg landed in the writer_task before
-    // RpcClient.closed flipped will otherwise hang join_all forever
-    // (the response can never arrive — peer is dead). Translating
-    // Elapsed into a regular `replica N rpc error: ... timeout` makes
-    // `apply_completion` classify it as a soft error, which the
-    // public-API retry loop already escalates to alloc_new_extent.
-    let timeout = append_timeout;
+    // F121: bound each replica's recv. A half-open socket whose SubmitMsg
+    // landed in the writer_task before RpcClient.closed flipped will
+    // otherwise hang join_all forever (the response can never arrive — peer
+    // is dead). Translating Elapsed into a regular `replica N rpc error:
+    // ... timeout` makes `apply_completion` classify it as a soft error,
+    // which the public-API retry loop already escalates to alloc_new_extent.
+    //
+    // BUG-FLUSH-TIMEOUT-LEAK FIX #1: the bound is SIZE-SCALED
+    // (base + payload/floor, capped) — the old fixed 5 s deadline, sized for
+    // 4 KiB WAL appends, fired 788× on the live cluster against 256 MiB SST
+    // flush appends that every replica was durably completing, and each
+    // spurious timeout rolled + leaked a ~255 MB extent (47× disk
+    // amplification, total write outage). Boundedness (the F121 dead-replica
+    // requirement) is preserved by EFFECTIVE_APPEND_TIMEOUT_CAP.
+    let timeout = append_deadline.for_payload(size);
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
             match rx_res {
@@ -2240,10 +2464,99 @@ impl StreamClient {
         // `seal_commit`) and reused across every retry inside
         // `retry_manager_call`, so a retried roll seals the original tail
         // (idempotent), never the freshly-rolled new tail.
-        self.retry_manager_call("alloc_new_extent", 20, || {
-            self.alloc_new_extent_once(stream_id, seal_commit, seal_extent_id)
-        })
-        .await
+        let out = self
+            .retry_manager_call("alloc_new_extent", 20, || {
+                self.alloc_new_extent_once(stream_id, seal_commit, seal_extent_id)
+            })
+            .await?;
+        // BUG-FLUSH-TIMEOUT-LEAK FIX #2: a failure-roll that sealed its old
+        // tail at commit=0 abandoned an extent on which NOT ONE byte was ever
+        // all-replica-acked (caller-ack ⊆ contiguous commit, so no VP / SST /
+        // checkpoint can reference it) — yet the extent may physically hold
+        // hundreds of MB of un-acked replica bytes (the live incident: 256 MiB
+        // SST appends that timed out AFTER every EN durably wrote them). Left
+        // in place it is PERMANENTLY unreclaimable: sealed_length=0 keeps it
+        // out of all logical accounting, log-GC punches only extents it holds
+        // discards for, and row-stream `truncate` only advances past extents
+        // holding live tables. Reclaim it NOW (best-effort punch → refs-- →
+        // physical delete at refs=0). Guarded three ways: only the
+        // authoritative empty seal (`Some(0)`) qualifies, only a pinned tail
+        // (`seal_extent_id != 0`), and never the extent the manager just
+        // handed back as the current tail (the BUG2 idempotent-no-op branch).
+        if seal_commit == Some(0) && seal_extent_id != 0 && out.1.extent_id != seal_extent_id {
+            self.reclaim_abandoned_empty_tail(stream_id, seal_extent_id)
+                .await;
+        }
+        Ok(out)
+    }
+
+    /// BUG-FLUSH-TIMEOUT-LEAK FIX #2 — reclaim a rolled-away tail that was
+    /// sealed EMPTY (sealed_length == 0). Best-effort: any failure only delays
+    /// reclamation (WARN), never the roll itself.
+    ///
+    /// Safety argument (data-loss review — this path deletes an extent):
+    /// - We act only on the manager's AUTHORITATIVE post-seal state: the cache
+    ///   entry is invalidated and re-fetched, and we require `sealed == true`
+    ///   AND `sealed_length == 0` (the same immutable-`sealed` gate GC's
+    ///   `authoritative_sealed_length` trusts). If the manager's
+    ///   `already_sealed` branch preserved a PRIOR non-zero seal (the extent
+    ///   holds acked data), `sealed_length != 0` and we do nothing.
+    /// - `sealed_length == 0` under the seal invariants (SealCommit handshake
+    ///   ≥ acked; probe = min over committed members ≥ acked; note 20/22)
+    ///   means NO byte on this extent was ever acked to any caller, so no
+    ///   ValuePointer, SST TableLocation, or checkpoint can reference it —
+    ///   reads of it are impossible by construction. Punching removes only
+    ///   physically-present but logically-nonexistent bytes.
+    /// - CoW safety: `punch_holes` removes the extent from THIS stream and
+    ///   decrements `refs`; a split-shared extent (refs ≥ 2) merely drops our
+    ///   membership — the sibling keeps its reference. Physical delete happens
+    ///   only at refs == 0 via the manager's guarded delete queue.
+    /// - The worker cannot race us: the SealCommit handshake set
+    ///   `sealing = true` (appends rejected) and `ResetTail` to the fresh
+    ///   tail is sent only after `alloc_new_extent` (and this reclaim)
+    ///   returns; the manager rejects any stale-epoch writer via
+    ///   `ensure_owner_epoch`, and in-flight ledger ops (Recovery/EC) make
+    ///   `punch_holes` refuse with Precondition (→ WARN, retry never needed —
+    ///   those ops only run on extents worth keeping).
+    async fn reclaim_abandoned_empty_tail(&self, stream_id: u64, extent_id: u64) {
+        self.invalidate_extent_cache(extent_id);
+        let info = match self.get_extent_info(extent_id).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    stream_id,
+                    extent_id,
+                    error = %e,
+                    "abandoned-tail reclaim: extent_info fetch failed; extent leaks until manual GC"
+                );
+                return;
+            }
+        };
+        if !info.sealed || info.sealed_length != 0 {
+            // Not authoritatively sealed-empty — someone acked/sealed real
+            // data here (or the seal didn't land). Never punch it.
+            return;
+        }
+        match self.punch_holes(stream_id, vec![extent_id]).await {
+            Ok(_) => {
+                // Drop the just-cached sealed-empty entry so later readers
+                // see the extent as gone, not as a stale cached record.
+                self.invalidate_extent_cache(extent_id);
+                tracing::info!(
+                    stream_id,
+                    extent_id,
+                    "reclaimed abandoned empty rolled-away tail extent (BUG-FLUSH-TIMEOUT-LEAK)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream_id,
+                    extent_id,
+                    error = %e,
+                    "abandoned-tail reclaim: punch_holes failed; extent leaks until manual GC"
+                );
+            }
+        }
     }
 
     /// WAL self-heal A4: seal-and-roll the current OPEN tail of `stream_id` via
@@ -2278,8 +2591,8 @@ impl StreamClient {
     /// ONLY safe source for the failover seal length: a value tracked in the
     /// public API always lags the worker's `state.commit` and races concurrent
     /// out-of-order appends + tail rolls (→ phantom seal or acked-data
-    /// truncation). The drain is bounded by each append's
-    /// `append_fanout_timeout`, so it cannot hang. Returns the commit (may be
+    /// truncation). The drain is bounded by each append's size-scaled
+    /// deadline (capped), so it cannot hang. Returns the commit (may be
     /// 0 for a tail where nothing was ever all-acked); the caller passes it to
     /// `alloc_new_extent(.., Some(commit))` so the manager seals
     /// at EXACTLY this value without probing.

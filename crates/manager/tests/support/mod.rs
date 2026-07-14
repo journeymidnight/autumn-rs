@@ -118,6 +118,38 @@ pub fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64
     std::thread::sleep(Duration::from_millis(200));
 }
 
+/// Like `start_extent_node`, but STOPPABLE: `.shutdown()` + join makes the
+/// EN's compio runtime drop (listener + every live connection torn down) —
+/// a real node death as seen by clients (connection refused / closed), used
+/// by BUG-FLUSH-TIMEOUT-LEAK to force the writer's seal-and-roll path.
+pub fn start_extent_node_stoppable(
+    addr: SocketAddr,
+    dir: std::path::PathBuf,
+    disk_id: u64,
+) -> (ShutdownFlag, std::thread::JoinHandle<()>) {
+    let flag = ShutdownFlag::new();
+    let flag_thread = flag.clone();
+    let handle = std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let n = ExtentNode::new(ExtentNodeConfig::new(dir, disk_id))
+                .await
+                .expect("extent node");
+            compio::runtime::spawn(async move {
+                let _ = n.serve(addr).await;
+            })
+            .detach();
+            while !flag_thread.is_shutdown() {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // block_on returns → Runtime drops → detached serve task +
+            // listener + all conn tasks are cancelled and their sockets
+            // closed. Subsequent connects get ECONNREFUSED.
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    (flag, handle)
+}
+
 /// Start a partition server on its own thread.
 ///
 /// F099-K note: `PartitionServer::connect()` implicitly calls

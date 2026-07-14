@@ -1,42 +1,52 @@
 Date: 2026-07-14
 TaskStatus: completed
-Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s. M0-M1c
-  + M2 runbook + M3 reshard chaos ALL shipped. Design:
-  docs/en_dynamic_shard_design.md.
+Task scope: BUG-FLUSH-TIMEOUT-LEAK — live 5-node cluster wedge (10.4 TB leaked
+  for 222 GB logical, 47x amplification, disks full, all writes dead). Two
+  fixes in crates/stream/src/client.rs, reproduce-first.
 
-Current summary (all pushed to origin/main, HEAD e40a8a4):
-  M0 (e3477c6): node_uuid identity (WIRE v19, etcd-reset); coco+fable (12 fixes).
-  M1a (3542970): EN --advertise self-registration; cluster.sh wired.
-  M1b (a802c4f): df identity echo (WIRE v20) -> classify_df_echo Imposter/
-    DriftWarn/Ok; coco P1/P2 -> dropped risky auto-heal write.
-  M1c (26f6378): list-nodes UUID+SHARDS columns (WIRE v21) + reshard runbook
-    (docs/ops.md).
-  M3 (f0e20d8 + e40a8a4): scripts/reshard_chaos.sh — stop-the-world reshard
-    2->4->1, 300 keys (incl 8 KiB large-value VPs). PASSED LOCALLY: shard count
-    verified via list-nodes after each reshard, all 300 keys byte-exact, zero
-    data movement. This validates the full chain: EN self-registers new
-    shard_ports on restart (M1a) -> manager updates routing in place (M0) ->
-    list-nodes shows new count (M1c) -> extents re-owned by extent_id %
-    shard_count with ZERO on-disk movement.
+Current summary (working tree only — NOT committed, per task instruction):
+  FIX #1 (trigger): size-scaled append deadline. `effective_append_timeout` =
+    min(append_fanout_timeout + payload_len / append_floor_bytes_per_sec, 600s).
+    New StreamClientConfig.append_floor_bytes_per_sec (default 8 MiB/s,
+    builder clamp [64 KiB/s, 1 GiB/s]); threaded into launch_append as
+    AppendDeadline::for_payload (chain path scales too). 4 KiB WAL -> 5 s
+    unchanged; 256 MiB SST -> 37 s; 512 MiB compaction -> 69 s. F121
+    boundedness preserved via the 600 s cap.
+  FIX #2 (amplifier): reclaim_abandoned_empty_tail — after a failure-roll
+    alloc_new_extent(stream, Some(0), seal_eid) succeeds, re-fetch the
+    AUTHORITATIVE post-seal ExtentInfo (cache invalidated) and, only if
+    sealed==true && sealed_length==0, best-effort punch_holes the abandoned
+    tail (refs-- -> physical delete). Safety: caller-ack ⊆ commit => a
+    sealed-at-0 extent has no acked byte => no VP/SST/checkpoint reference.
+  Reproduce-first tests (red captured before each fix):
+    - client::append_deadline_tests (red: "256 MiB deadline ... got 5s")
+    - crates/manager/tests/bug_flush_timeout_leak.rs (red: "abandoned empty
+      tail 7 leaked: still a stream member [6, 7, 8, 9]"); new
+      support::start_extent_node_stoppable helper.
+  Green: autumn-stream --lib 99 + --tests all green; autumn-partition-server
+    --lib 195 green; bug_flush_timeout_leak 3/3 stable; f109_physical_deletion,
+    system_extent_failover green. clippy: no new warnings (pre-existing
+    extent_node test + PS RefCell warnings untouched).
+  Known-flaky note: crates/manager/tests/integration.rs recovery-replay tests
+    fail identically on BASELINE (stash-verified, both parallel and serial) on
+    this macOS box — pre-existing environment flakiness, NOT a regression.
+    Also: manager test targets don't build on this mac without a pkg-config
+    shim (fuser dev-dep needs macFUSE); used a fake pkg-config for test runs.
+  Docs: stream CLAUDE.md Programming Note 28 (+ notes 17/20 cross-refs);
+    partition-server CLAUDE.md P-bulk section cross-ref; feature_list.md new
+    open entry F-SEALED-EMPTY-SWEEP (manager backstop sweep for writer-death /
+    punch-failure residuals + pre-fix 40k-extent backlog).
 
-Remote clean-env confirmation: BLOCKED. The remote-autumn host
-  (fdbd:dc62:3:302::15) has NO crates.io egress (index.crates.io:443 times out,
-  git+sparse both) so cargo can't fetch uncached deps (ed25519-dalek/tree-sitter)
-  -> can't build the current workspace there. github works (pull OK). Saved as
-  memory project_remote_host_no_cratesio. Local run on verified-fresh binaries
-  is authoritative for M3.
-
-Main gaps (deferred, NOT functional):
-  - M1c launcher-rewiring: format -> identity-only registration; make EN
-    --advertise REQUIRED; wire entrypoint/autumn-deploy/k8s. Cleanup only (M1a
-    already makes the EN authoritative + F214-B gives "unbooted stays Suspend");
-    changes the operational contract with risk needing a live cluster.
-  - M2 k8s: per-pod ClusterIP + Service port generation (shard_count ports/pod).
-  Both need a real cluster / k8s to validate (remote can't build; local has no
-  k8s). Deferred to a cluster run.
+Main gaps:
+  - F-SEALED-EMPTY-SWEEP (backstop + backlog cleanup) deferred — see
+    feature_list.md.
+  - coco review of this diff not yet run (CLAUDE.md rule 12) — recommended
+    before commit.
+  - Changes intentionally uncommitted; commit + live-cluster validation
+    (re-run a bulk flush under load, verify no 5s timeouts + df shows debt
+    reclaimed) is the next session's step.
 
 Next steps:
-  1. (Optional) run the deferred M1c launcher-rewiring + M2 k8s on a cluster that
-     can build (local box can build; needs k8s for the Service-port part).
-  2. F-EN-DYNSHARD core is complete + validated; feature stays not_completed only
-     for the deploy-layer polish above.
+  1. coco findbugs on the working diff; then commit.
+  2. Deploy to the wedged VKE cluster; the pre-fix ~40k leaked extents need
+     F-SEALED-EMPTY-SWEEP (or a one-off operator script) to drain.

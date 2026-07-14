@@ -1020,10 +1020,11 @@ sufficient (and cheaper than DashMap).
       entry's `is_closed()` is true; `send_vectored` evicts on
       submit error (matches existing `call*` semantics).
     - `launch_append` wraps each per-replica response receiver in
-      `compio::time::sleep + futures::future::select` with
-      `append_fanout_timeout()` (env
-      `AUTUMN_STREAM_APPEND_TIMEOUT_MS`, default 5 s, clamped to
-      [200 ms, 60 s]). Mirrors Go autumn's
+      `compio::time::sleep + futures::future::select` with a bounded
+      deadline (F195 moved it to `StreamClientConfig.append_fanout_timeout`,
+      default 5 s, clamped [200 ms, 60 s]; BUG-FLUSH-TIMEOUT-LEAK note 28
+      made that the BASE of a payload-size-scaled deadline —
+      `effective_append_timeout`). Mirrors Go autumn's
       `streamclient.go:770` `context.WithTimeout(ctx, 5*time.Second)`.
       `Elapsed` translates to a soft error that
       `apply_completion` already classifies, so the existing
@@ -1096,7 +1097,7 @@ sufficient (and cheaper than DashMap).
     (coco confirmed a real data-loss race in the `result.end` shortcut, twice).
     Mechanism: `StreamSubmitMsg::SealCommit { resp }` → the worker
     `drain_inflight_for_seal` (awaits every in-flight append, bounded by each
-    one's `append_fanout_timeout` so it cannot hang) → replies with the final
+    one's size-scaled append deadline — note 28 — so it cannot hang) → replies with the final
     contiguous `state.commit` → sets `sealing = true` (new appends on the
     about-to-be-sealed tail are rejected with a soft error so they retry onto
     the fresh tail; cleared by ResetTail). The 3 failover sites call
@@ -1506,6 +1507,80 @@ sufficient (and cheaper than DashMap).
       never strands + avali-isolated never served). Cross-ref: F258 (rotation +
       hedge), self-heal `eligible_replica_slots` (avali I2), F190 `bad_nodes`
       (write-path client-learned health — distinct, alloc-only, per-stream).
+
+28. **BUG-FLUSH-TIMEOUT-LEAK (live 5-node cluster wedge, 2026-07-14): the
+    append deadline is SIZE-SCALED, and a roll-away that sealed its tail EMPTY
+    reclaims the abandoned extent.** Production incident: P-bulk's 256 MiB SST
+    flush appends (FLUSH_MEM_BYTES) ran against the fixed F121 5 s
+    `append_fanout_timeout` — sized for 4 KiB WAL appends. Under load a
+    3-replica 256 MiB append + fsync cannot finish in 5 s (measured healthy
+    bulk is 277–622 MB/s aggregate, with 8 MiB-write p99 ALREADY at 6.1 s —
+    docs/perf_tcp_vs_ucx_xhost.md:464, docs/perf_k8s_ycsb.md:73), so the
+    client timed out (788×) while every EN durably wrote all ~255 MB; per the
+    ack rule those bytes are correctly EXCLUDED from `state.commit`, the retry
+    sealed the tail at the worker's drained commit (= 0, nothing acked) and
+    rolled to a fresh extent, rewriting the same SST — leaking one 255 MB
+    extent per iteration. The leaked extent was PERMANENTLY unreclaimable:
+    `sealed_length=0` keeps it out of all logical accounting (`autumn-op df`
+    WAL debt 0 while 10.4 TB sat on disk), log-GC punches only extents it
+    holds discards for, row-stream `truncate` only advances past extents
+    holding live SSTs, and F109/F113 orphan-reconcile only reaps extents the
+    manager NO LONGER references (these stayed stream members, refs=1). Death
+    spiral: leak → disks fill → fsync slower → more timeouts →
+    `alloc_new_extent … no healthy node` (10,259×) → total write outage at
+    47× amplification (10.4 TB physical / 222 GB logical). Two fixes:
+    - **FIX #1 — size-scaled deadline** (`effective_append_timeout`,
+      client.rs): per-append `deadline = min(append_fanout_timeout +
+      payload_len / append_floor_bytes_per_sec, 600 s cap)`; threaded from the
+      config snapshot into `launch_append` as `AppendDeadline::for_payload`
+      (the chained path multiplies the scaled value by hop count as before).
+      `append_fanout_timeout` (still clamped [200 ms, 60 s]) is now the BASE
+      (RTT + queueing + fsync slack); the floor default is 8 MiB/s — ~1.5
+      orders below measured healthy bulk throughput, so it distinguishes
+      "dead replica" from "slow but progressing" (4 KiB → 5 s unchanged;
+      8 MiB → 6 s ≈ the measured degraded p99; 256 MiB SST → 37 s; 512 MiB
+      compaction output → 69 s). The 600 s cap preserves the F121
+      dead-replica bound (every InflightFut still resolves → SealCommit
+      drain cannot hang). Tunable: `with_append_floor_bytes_per_sec`
+      [64 KiB/s, 1 GiB/s]. **Invariant: never apply a fixed deadline to an
+      append path whose payload can span 4 KiB–512 MiB; derive from size.**
+    - **FIX #2 — abandoned-tail reclaim** (`reclaim_abandoned_empty_tail`,
+      called from `alloc_new_extent` after a successful roll): when a
+      failure-roll sealed its old tail at commit **0** (`seal_commit ==
+      Some(0)`, pinned `seal_extent_id != 0`, and the manager did NOT hand
+      that same extent back as current tail — the BUG2 idempotent-no-op
+      branch), the client re-fetches the AUTHORITATIVE post-seal
+      `ExtentInfo` (cache invalidated first) and, ONLY if `sealed == true &&
+      sealed_length == 0`, best-effort `punch_holes` the extent out of the
+      stream (refs-- → physical delete at refs 0). Safety: caller-ack ⊆
+      contiguous commit (note 25a), so a sealed-AT-0 extent has NO acked
+      byte ⇒ no VP / SST TableLocation / checkpoint can reference it — the
+      punch removes only physically-present but logically-nonexistent bytes.
+      The authoritative re-check mirrors GC's `authoritative_sealed_length`
+      gate (a preserved prior non-zero seal ⇒ untouched); CoW-shared extents
+      just drop this stream's ref; the worker is quiesced (`sealing=true`
+      until the post-roll ResetTail). NEVER "fix" this leak by counting
+      timed-out bytes as committed (silent-loss trap, notes 20/22/25a) and
+      never punch anything not authoritatively sealed-empty. Reproduce-first
+      tests: `client::append_deadline_tests` (red: 256 MiB deadline was 5 s)
+      + `crates/manager/tests/bug_flush_timeout_leak.rs` (red: abandoned
+      empty tail stayed a stream member `[6, 7, 8, 9]`; green: punched,
+      data-holding extents preserved).
+      **The cap MUST be applied AFTER the F260 chain hop-multiplier, not before
+      (coco P2).** `AppendDeadline::for_chain` = `(for_payload(n) × hops × 3)
+      .min(EFFECTIVE_APPEND_TIMEOUT_CAP)`. Clamping only inside `for_payload`
+      and THEN multiplying blew straight past the cap (RF=3 ⇒ 600 s × 9 =
+      90 min), destroying the boundedness the whole fix rests on: EVERY
+      `InflightFut` must resolve within the cap, or `drain_inflight_for_seal` /
+      the SealCommit handshake (note 20) can hang for that multiplied window —
+      stalling the roll and every later append on the stream. Guard:
+      `chain_deadline_stays_capped_after_the_hop_multiplier` (red-green
+      verified against the pre-fix ordering).
+      Residual: a punch/extent_info failure
+      (manager unreachable) still leaks that one extent — backstop sweep is
+      feature_list `F-SEALED-EMPTY-SWEEP`. Cross-ref notes 17 (F121), 20
+      (SealCommit), 22 (commit preservation), manager note 32a
+      (idempotent roll).
 
 ---
 
