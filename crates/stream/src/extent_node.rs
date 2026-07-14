@@ -936,7 +936,25 @@ async fn coalescer_loop(
             // a wake event on `wake_rx`; the next loop iteration sees
             // `pending > synced` and issues a fresh fsync.
             let snapshot = pending; // already loaded at top of iteration
-            let file_rc = extent.file_rc();
+            // F-EN-FD-LRU: `None` is provably unreachable here — a
+            // pending-fsync extent (`pending > synced`) is NOT `fd_evictable`,
+            // and the writer that registered the waiter held a pinned fd clone
+            // (`strong_count > 1`) through registration until `pending > synced`
+            // took over. Defensive (NEVER panic, NEVER credit durability without
+            // an fsync): if it somehow evicted, fail the waiters so they retry
+            // the append on a fresh tail, and re-park.
+            let Some(file_rc) = extent.resident_file() else {
+                let waiters = {
+                    let mut inner = extent.coalescer.inner.borrow_mut();
+                    std::mem::take(&mut inner.waiters)
+                };
+                for (_, tx) in waiters {
+                    let _ = tx.send(Err(
+                        "fd evicted under pending fsync — retry on a fresh tail".to_string(),
+                    ));
+                }
+                continue;
+            };
             let f: &CompioFile = &file_rc;
             match f.sync_data().await {
                 Ok(_) => {
@@ -1026,7 +1044,24 @@ pub(crate) struct ExtentEntry {
     /// returned and dropped only when the last concurrent reader
     /// releases its clone, so the underlying file handle / fd cannot
     /// dangle. No `unsafe` anywhere in the file-access path.
-    pub(crate) file: RefCell<Rc<CompioFile>>,
+    ///
+    /// F-EN-FD-LRU: now `Option<Rc<CompioFile>>`. `None` = the fd has been
+    /// EVICTED by the sealed-extent fd cache (`FdLru`) to bound open fds on a
+    /// node with many extents. **Only SEALED, idle, UNREFERENCED extents are
+    /// ever evicted** (`fd_evictable`: `sealed && pending_fsync<=last_synced &&
+    /// strong_count==1`). The real invariant is NOT "the write path never sees
+    /// `None`" (an OPEN extent CAN be sealed concurrently, then evicted) — it is:
+    /// every path resolves the fd via `resident_file()` (sync, write/durability
+    /// path) or `ExtentNode::extent_file` (async, read/sealed-op path), holds the
+    /// returned `Rc` for its whole I/O (F171 — so the `strong_count==1` evict
+    /// guard can't yank it mid-op), and treats `None` as "concurrently sealed" →
+    /// a clean `CODE_PRECONDITION` reject, never a panic. Eviction dropping the
+    /// cache's `Rc` is the SAME structural safety as F171's `replace_file`: a
+    /// concurrent holder's `Rc` clone keeps the fd alive until it finishes.
+    pub(crate) file: RefCell<Option<Rc<CompioFile>>>,
+    /// F-EN-FD-LRU: this extent's id — needed to re-open the `.dat` on a cache
+    /// miss (`disk_for(disk_id).extent_path(extent_id)`). Immutable.
+    pub(crate) extent_id: u64,
     pub(crate) len: AtomicU64,
     pub(crate) eversion: AtomicU64,
     pub(crate) sealed_length: AtomicU64,
@@ -1090,16 +1125,188 @@ impl ExtentEntry {
     /// converts don't race on the staging file), but is no longer
     /// load-bearing for memory safety of the replace itself.
     pub(crate) fn replace_file(&self, new_file: CompioFile) {
-        *self.file.borrow_mut() = Rc::new(new_file);
+        // F-EN-FD-LRU: replacing installs a fresh resident fd (EC-commit /
+        // recovery writeback). Sets `Some` — the extent is pinned resident.
+        *self.file.borrow_mut() = Some(Rc::new(new_file));
     }
 
-    /// F171: clone the current file Rc for I/O. Caller's `Rc` keeps
-    /// the underlying fd alive across `.await` boundaries, even if
-    /// another task calls `replace_file` mid-flight (the new file
-    /// handle goes into the RefCell; the old one stays alive in the
-    /// I/O caller's clone until they drop).
-    pub(crate) fn file_rc(&self) -> Rc<CompioFile> {
+    /// F-EN-FD-LRU: SYNC accessor — clone the resident fd if present, else
+    /// `None` (the extent's fd was evicted; by construction it is sealed + idle).
+    /// This REPLACED the old panic-on-`None` `file_rc()` (a coco/subagent
+    /// finding: an accepted append or in-flight `truncate_to_commit` could hit a
+    /// concurrent seal+evict window and PANIC at first poll). Callers on the
+    /// write/durability path resolve once (pinning the `Rc` via F171) and treat
+    /// `None` as "extent was concurrently sealed" → the semantically-correct
+    /// `CODE_PRECONDITION` reject, NOT a panic. Read / sealed-extent background
+    /// ops use the async `ExtentNode::extent_file` (open-on-miss) instead.
+    pub(crate) fn resident_file(&self) -> Option<Rc<CompioFile>> {
         self.file.borrow().clone()
+    }
+
+    /// F-EN-FD-LRU: drop the cached fd (eviction). Safe by the same F171
+    /// reasoning as `replace_file`: a concurrent reader's `Rc` clone keeps the
+    /// underlying fd alive until it finishes; only the cache's reference is
+    /// released here. Callers MUST call `fd_evictable` first.
+    pub(crate) fn evict_file(&self) {
+        *self.file.borrow_mut() = None;
+    }
+
+    /// F-EN-FD-LRU: is this extent's fd safe to evict RIGHT NOW? Three
+    /// conditions, all load-bearing:
+    /// - `sealed` — only sealed extents are ever cached/evicted (open/active
+    ///   extents are pinned; the write/coalescer path assumes them resident);
+    /// - `pending_fsync <= last_synced` — no un-fsynced bytes the coalescer
+    ///   still owes (it would need the fd);
+    /// - `Rc::strong_count == 1` — the cache is the SOLE holder, i.e. NO
+    ///   in-flight I/O holds a clone. This closes the seal-transition panic
+    ///   window: an append/truncate that resolved its fd (holding a clone)
+    ///   before a concurrent seal cannot have its fd yanked mid-op, and the
+    ///   coalescer (whose waiter's writer held a clone through registration,
+    ///   after which `pending > synced` takes over) is likewise never evicted
+    ///   out from under a pending fsync.
+    pub(crate) fn fd_evictable(&self) -> bool {
+        if !self.sealed.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.coalescer.pending_fsync.load(Ordering::Relaxed)
+            > self.coalescer.last_synced.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        // strong_count of the CACHED Rc without cloning (a clone would inflate
+        // it). `None` (already evicted) → not evictable (nothing to do).
+        self.file
+            .borrow()
+            .as_ref()
+            .is_some_and(|rc| Rc::strong_count(rc) == 1)
+    }
+}
+
+/// F-EN-FD-LRU: max resident SEALED-extent fds cached per shard. Open/active
+/// extents are pinned (NOT counted here), so the process fd ceiling is
+/// `fd_cache_cap + Σ(open tails) + sockets`. Default 4096 — well under the
+/// F-EN-NOFILE-raised RLIMIT_NOFILE (65535) with room for open tails + TCP
+/// conns. Set via `--fd-cache-cap` (binary); OnceLock first-call-wins, env-free
+/// per the project's no-env-in-Rust rule (the shell maps env→flag).
+static FD_CACHE_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn fd_cache_cap() -> usize {
+    FD_CACHE_CAP_CELL.get().copied().unwrap_or(4096)
+}
+
+/// Binary override for `fd_cache_cap` (first-call-wins, returns false if already
+/// set). The extent-node binary calls this from CLI parsing before
+/// `ExtentNode::new`. Mirrors `set_ec_encode_stripe_bytes`. Floored at 64: a
+/// tiny cache would churn (and, historically, widened the now-closed
+/// seal-transition eviction window).
+pub fn set_fd_cache_cap(cap: usize) -> bool {
+    FD_CACHE_CAP_CELL.set(cap.max(64)).is_ok()
+}
+
+/// F-EN-FD-LRU — a bounded LRU cache of open file descriptors for SEALED
+/// extents on one shard. Open/active extents are NEVER tracked here (their fd
+/// is pinned resident by `ExtentEntry.file = Some`); only sealed, idle,
+/// unreferenced extents (`fd_evictable`) are cached + evicted. The write /
+/// coalescer / durability path resolves its fd via `resident_file()` and holds
+/// the `Rc` for its whole op, so the `strong_count==1` evict guard never yanks
+/// an fd from under an in-flight write/fsync.
+///
+/// When the number of resident sealed fds exceeds `cap`, the least-recently-used
+/// one's fd is dropped (`ExtentEntry::evict_file`) — re-opened lazily on the
+/// next read via `ExtentNode::extent_file`. Eviction dropping the cache's `Rc`
+/// is the same structural safety as F171's `replace_file`: a concurrent reader
+/// holds its own `Rc` clone across `.await`, so the fd stays alive until the
+/// reader finishes.
+///
+/// Single-threaded per shard (compio thread-per-core) → `Cell`/`RefCell`, no
+/// atomics/locks needed for the LRU bookkeeping.
+pub(crate) struct FdLru {
+    cap: usize,
+    seq: std::cell::Cell<u64>,
+    /// recency index: seq -> extent_id (BTreeMap → O(log n) LRU pop).
+    by_seq: RefCell<std::collections::BTreeMap<u64, u64>>,
+    /// extent_id -> its current seq (for O(log n) re-touch / forget).
+    seq_of: RefCell<HashMap<u64, u64>>,
+    /// clone of the shard's extent map, so eviction can reach a victim entry.
+    extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
+}
+
+impl FdLru {
+    fn new(cap: usize, extents: Rc<DashMap<u64, Rc<ExtentEntry>>>) -> Self {
+        Self {
+            cap: cap.max(1),
+            seq: std::cell::Cell::new(0),
+            by_seq: RefCell::new(std::collections::BTreeMap::new()),
+            seq_of: RefCell::new(HashMap::new()),
+            extents,
+        }
+    }
+
+    /// Record a use of `extent_id`'s (resident, sealed) fd, then evict the
+    /// least-recently-used sealed fds while over `cap`.
+    fn touch(&self, extent_id: u64) {
+        let s = self.seq.get();
+        self.seq.set(s.wrapping_add(1));
+        {
+            let mut seq_of = self.seq_of.borrow_mut();
+            let mut by_seq = self.by_seq.borrow_mut();
+            if let Some(old) = seq_of.insert(extent_id, s) {
+                by_seq.remove(&old);
+            }
+            by_seq.insert(s, extent_id);
+        }
+        self.evict_over_cap();
+    }
+
+    fn evict_over_cap(&self) {
+        // Scan LRU→MRU, evicting the first `fd_evictable` victim each pass;
+        // KEEP non-evictable victims tracked (coco P1: dropping them from
+        // tracking left their fd resident but un-cap-accounted → an fd leak
+        // past `cap`). `skip` counts victims deferred THIS convergence so a
+        // pathological all-non-evictable set terminates (fds temporarily > cap,
+        // but every one is genuinely in-use / pending — bounded by concurrent
+        // ops). No borrow held across `entry` access (evict_file borrows the
+        // entry's RefCell).
+        let mut skip = 0usize;
+        loop {
+            let victim = {
+                let seq_of = self.seq_of.borrow();
+                if seq_of.len() <= self.cap {
+                    return;
+                }
+                // nth(skip): the `skip`-th least-recently-used still-tracked id.
+                self.by_seq.borrow().iter().nth(skip).map(|(&s, &id)| (s, id))
+            };
+            let Some((s, vid)) = victim else { return }; // scanned all → all in-use
+            let evictable = self
+                .extents
+                .get(&vid)
+                .is_some_and(|entry| entry.fd_evictable());
+            if evictable {
+                self.seq_of.borrow_mut().remove(&vid);
+                self.by_seq.borrow_mut().remove(&s);
+                if let Some(entry) = self.extents.get(&vid) {
+                    entry.evict_file();
+                }
+                // indices shifted; restart the LRU scan from the front.
+                skip = 0;
+            } else {
+                // in-use (pending fsync / in-flight I/O clone / not sealed) —
+                // leave it tracked + resident; try the next-oldest.
+                skip += 1;
+            }
+        }
+    }
+
+    /// Stop tracking an extent (on delete). Idempotent.
+    fn forget(&self, extent_id: u64) {
+        if let Some(s) = self.seq_of.borrow_mut().remove(&extent_id) {
+            self.by_seq.borrow_mut().remove(&s);
+        }
+    }
+
+    #[cfg(test)]
+    fn resident_count(&self) -> usize {
+        self.seq_of.borrow().len()
     }
 }
 
@@ -1235,6 +1442,9 @@ impl Drop for RecoveryPermit {
 
 pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
+    /// F-EN-FD-LRU: bounded cache of open fds for SEALED extents (open/active
+    /// extents are pinned). Shares the `extents` map (for eviction). See `FdLru`.
+    fd_lru: Rc<FdLru>,
     /// All disks attached to this node, keyed by disk_id.
     disks: Rc<HashMap<u64, Rc<DiskFS>>>,
     /// Observability batch 1: this shard's /metrics gauge slot (also
@@ -1315,6 +1525,7 @@ impl Clone for ExtentNode {
     fn clone(&self) -> Self {
         Self {
             extents: self.extents.clone(),
+            fd_lru: self.fd_lru.clone(),
             disks: self.disks.clone(),
             metrics_gauges: self.metrics_gauges.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
@@ -1967,7 +2178,21 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
-            inflight.push(build_read_future(extent, slots, false));
+            // F-EN-FD-LRU: resolve (re-open if evicted) the fd here, where we
+            // have the node; pin it into the read future.
+            let file_rc = match node.extent_file(&extent).await {
+                Ok(f) => f,
+                Err(msg) => {
+                    let p = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &msg);
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, p.clone()).encode())
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+            inflight.push(build_read_future(extent, file_rc, slots, false));
         } else if msg_type == MSG_READ_BYTES_ZC {
             // F216-E zero-copy read grouping — mirrors MSG_READ_BYTES but every
             // response (ok + error) is ZC-shaped (`zc_read_head` + value Bytes)
@@ -2017,7 +2242,18 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
-            inflight.push(build_read_future(extent, slots, true));
+            let file_rc = match node.extent_file(&extent).await {
+                Ok(f) => f,
+                Err(_msg) => {
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, &[]))
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+            inflight.push(build_read_future(extent, file_rc, slots, true));
         } else {
             // Control RPC — no hot-path grouping. Build a future that
             // dispatches and encodes one response frame.
@@ -2382,6 +2618,33 @@ async fn build_append_future(
     let total_end = cursor;
     let extent_id = slots[0].req.extent_id;
 
+    // F-EN-FD-LRU (coco/subagent P1 — the seal-transition panic): resolve + PIN
+    // the fd HERE, in the synchronous prologue, while the seal/fence re-checks
+    // above have just established the extent is OPEN — NOT lazily at the returned
+    // future's first poll. Between accept and poll the conn task awaits other
+    // frames' prologues, so a concurrent seal + LRU-evict could set `file = None`
+    // and the old poll-time access would PANIC. Resolving now and MOVING the `Rc`
+    // into the future pins the fd (F171) for the whole write, and holding the
+    // clone makes the extent non-evictable (`fd_evictable` checks
+    // `strong_count == 1`) through the pending_fsync store + waiter register. A
+    // `None` here means the extent was concurrently sealed → reject the batch
+    // with `CODE_PRECONDITION` (the F146/F147-B seal re-checks give the same
+    // answer), never a panic.
+    let file_rc = match extent.resident_file() {
+        Some(f) => f,
+        None => {
+            let p = autumn_rpc::RpcError::encode_status(
+                StatusCode::FailedPrecondition,
+                "extent sealed (fd evicted) — retry on a fresh tail",
+            );
+            let bytes_list: Vec<Bytes> = req_ids
+                .iter()
+                .map(|&id| Frame::error(id, MSG_APPEND, p.clone()).encode())
+                .collect();
+            return Box::pin(async move { bytes_list });
+        }
+    };
+
     // 7. Reserve `extent.len` BEFORE returning the I/O future so overlapping
     //    same-extent futures compute non-overlapping file_starts.
     extent.len.store(total_end, Ordering::SeqCst);
@@ -2391,12 +2654,9 @@ async fn build_append_future(
     let extent_for_io = extent;
     Box::pin(async move {
         let write_t0 = Instant::now();
-        // F171: clone the `Rc<CompioFile>` off the RefCell once. The
-        // future captures this `Rc` so the underlying fd survives any
-        // concurrent `entry.replace_file()` (e.g. EC commit) until our
-        // I/O completes — the old fd lives until the LAST clone drops.
-        // The `RefCell` borrow is released immediately by `.clone()`.
-        let file_rc = extent_for_io.file_rc();
+        // The fd `Rc` (resolved+pinned in the prologue above) is moved into this
+        // future; the write runs on it. It survives any concurrent
+        // `replace_file` / LRU-evict until our I/O completes (F171).
         let mut f: &CompioFile = &file_rc;
         // ENOSPC-1 CORRUPTION FIX: `write_vectored_all_at`, NOT the raw
         // `write_vectored_at`. POSIX pwritev on a nearly-full disk writes
@@ -2514,6 +2774,12 @@ fn zc_read_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
 
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
+    // F-EN-FD-LRU: the fd is resolved ONCE at the call site (which has the
+    // `ExtentNode` + can re-open an evicted sealed extent via `extent_file`) and
+    // passed in; this boxed future is a free fn with no node handle, and holding
+    // the `Rc` pins the fd for the whole read (F171) so a concurrent read's
+    // eviction can't yank it mid-scan.
+    file_rc: std::rc::Rc<CompioFile>,
     slots: Vec<ReadSlot>,
     zc: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
@@ -2543,10 +2809,9 @@ fn build_read_future(
                 continue;
             };
 
-            // F171: clone the file Rc once per slot; same rationale as
-            // build_append_future. The RefCell borrow is released by
-            // `.clone()` before any `.await`.
-            let file_rc = extent.file_rc();
+            // F-EN-FD-LRU: use the caller-resolved, pinned fd for every slot
+            // (was `extent.file_rc()` per slot — now the extent may be an
+            // evicted sealed one, resolved once at the call site).
             let f: &CompioFile = &file_rc;
             if zc {
                 // F216-E: pread straight into a registered, pooled, zeroed-once
@@ -2702,8 +2967,21 @@ impl ExtentNode {
             g
         };
 
+        // F-EN-FD-LRU: build `extents` first so the fd cache can share it (for
+        // eviction reach-through). Both are `Rc`, no cycle (FdLru holds the
+        // DashMap, not the node).
+        let extents: Rc<DashMap<u64, Rc<ExtentEntry>>> = Rc::new(DashMap::new());
+        // coco P1: `fd_cache_cap` is PER SHARD, but `RLIMIT_NOFILE` is
+        // PROCESS-wide. Each shard is a separate `ExtentNode`, so N shards would
+        // hold N × cap sealed fds; clamp the per-shard cap so the process total
+        // stays comfortably under the F-EN-NOFILE 65535 limit (reserve headroom
+        // for open tails + TCP sockets). Floor 64 (matches `set_fd_cache_cap`).
+        let shards = config.shard_count.max(1) as usize;
+        let per_shard_cap = fd_cache_cap().min((60_000 / shards).max(64));
+        let fd_lru = Rc::new(FdLru::new(per_shard_cap, extents.clone()));
         let node = Self {
-            extents: Rc::new(DashMap::new()),
+            extents,
+            fd_lru,
             disks: Rc::new(disk_map),
             metrics_gauges,
             manager_endpoint: config.manager_endpoint,
@@ -2942,6 +3220,7 @@ impl ExtentNode {
             // via the entry; if the entry is gone (concurrent delete),
             // fall back to scanning every disk.
             let entry = self.extents.remove(eid).map(|(_, v)| v);
+            self.fd_lru.forget(*eid); // F-EN-FD-LRU
             if let Some(entry) = entry {
                 if let Some(disk) = self.disks.get(&entry.disk_id) {
                     if let Err(e) = disk.remove_extent_files(*eid).await {
@@ -3023,6 +3302,49 @@ impl ExtentNode {
     /// appends until space frees.
     fn choose_disk(&self) -> Option<Rc<DiskFS>> {
         self.disks.values().find(|d| d.allocatable()).cloned()
+    }
+
+    /// F-EN-FD-LRU: resolve an extent's file handle, re-opening it on a cache
+    /// miss (a SEALED extent whose fd was evicted). Open/active extents hit the
+    /// resident fast path (their fd is pinned, never evicted). Reading a sealed
+    /// extent LRU-`touch`es it so the cache evicts the least-recently-read one
+    /// once over `cap`. The returned `Rc` pins the fd for the caller's I/O
+    /// across `.await` (F171): even if a later read evicts this extent, the
+    /// caller's clone keeps the fd alive until it finishes.
+    ///
+    /// Callers: every read / sealed-extent background op (EC-convert, re_avali,
+    /// copy, recovery, meta-apply fsync). The write / append / coalescer /
+    /// truncate durability path does NOT call this — it uses `file_rc()`
+    /// synchronously (open extents are always resident).
+    async fn extent_file(&self, entry: &Rc<ExtentEntry>) -> Result<Rc<CompioFile>, String> {
+        let sealed = entry.sealed.load(Ordering::Relaxed);
+        if let Some(f) = entry.resident_file() {
+            if sealed {
+                self.fd_lru.touch(entry.extent_id);
+            }
+            return Ok(f);
+        }
+        // Miss — only ever a sealed, evicted extent. Re-open read+write (no
+        // `create`: a missing file means the extent was deleted, which must
+        // surface as an error, not silently resurrect an empty extent).
+        let disk = self.disk_for(entry.disk_id)?;
+        let path = disk.extent_path(entry.extent_id);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| format!("reopen sealed extent {}: {e}", entry.extent_id))?;
+        let rc = Rc::new(file);
+        // Publish the fd. A concurrent reader that also missed may have opened
+        // its own handle — last writer wins the cache slot; both hold valid
+        // `Rc`s over the SAME inode, so no correctness issue (the loser's fd
+        // closes when its clone drops). No borrow is held across the `.await`.
+        *entry.file.borrow_mut() = Some(rc.clone());
+        if sealed {
+            self.fd_lru.touch(entry.extent_id);
+        }
+        Ok(rc)
     }
 
     /// Resolve DiskFS for an extent by its disk_id. Returns error string if disk is unknown.
@@ -3396,7 +3718,18 @@ impl ExtentNode {
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
-                        file: RefCell::new(Rc::new(file)),
+                        // F-EN-FD-LRU: at startup, do NOT keep SEALED extents'
+                        // fds resident — that was the O(all-extents) open-fd
+                        // storm. `file`/`len` were read above; drop the fd for
+                        // sealed (first read re-opens via `extent_file`), keep it
+                        // for OPEN/active extents (pinned). Startup fd peak is now
+                        // ~one-at-a-time + open tails, not the whole extent set.
+                        file: RefCell::new(if meta.sealed {
+                            None
+                        } else {
+                            Some(Rc::new(file))
+                        }),
+                        extent_id,
                         len: AtomicU64::new(len),
                         eversion: AtomicU64::new(meta.eversion),
                         sealed_length: AtomicU64::new(meta.sealed_length),
@@ -3985,7 +4318,9 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
-                file: RefCell::new(Rc::new(file)),
+                // F-EN-FD-LRU: freshly-allocated OPEN extent — pinned resident.
+                file: RefCell::new(Some(Rc::new(file))),
+                extent_id,
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -4136,7 +4471,10 @@ impl ExtentNode {
             // appends); nothing false is persisted, and on restart the OLD
             // (unsealed) `.meta` is the safe state — the manager re-applies the
             // seal on next contact (the F159 ordering invariant).
-            if let Err(e) = extent.file_rc().sync_data().await {
+            // F-EN-FD-LRU: resolve (re-open if the sealed extent was fd-evicted)
+            // before the durability fsync. Fail-closed on a reopen error.
+            let seal_f = self.extent_file(extent).await?;
+            if let Err(e) = seal_f.sync_data().await {
                 tracing::error!(
                     extent_id,
                     sealed_length = ex.sealed_length,
@@ -4171,7 +4509,15 @@ impl ExtentNode {
     }
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u64) -> Result<(), String> {
-        let f = extent.file_rc();
+        // F-EN-FD-LRU (coco/subagent P1): called from the append prologue AFTER
+        // a manager seal-confirm RPC await — a concurrent seal+evict in that
+        // window would panic the old `file_rc()`. `None` = the extent was
+        // concurrently sealed → reject (the caller's F146 re-check handles it);
+        // holding `f` pins the fd (F171 + `fd_evictable` strong_count) for the
+        // set_len + fsync.
+        let Some(f) = extent.resident_file() else {
+            return Err("extent sealed (fd evicted) during commit-reconcile".to_string());
+        };
         f.set_len(commit).await.map_err(|e| e.to_string())?;
         // F152: fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
@@ -4347,6 +4693,10 @@ impl ExtentNode {
             .nodes_map_from_manager()
             .await
             .map_err(|e| format!("nodes_map: {e}"))?;
+        // F-EN-FD-LRU: `dest` may be a SEALED extent (re_avali repair) whose fd
+        // was evicted — resolve (re-open on miss) ONCE and hold it for the whole
+        // rebuild. The held `Rc` pins the fd (F171) across every source attempt.
+        let dest_f = self.extent_file(dest).await?;
         let total = extent.sealed_length;
         // SEED13: per-source failure-reason trace + over-promised-seal
         // reconciliation. Pre-this, every source's error/short was swallowed
@@ -4391,7 +4741,7 @@ impl ExtentNode {
             };
             // Reset before each attempt — a previous source's partial stream
             // must not bleed into this one.
-            if dest.file_rc().set_len(0).await.is_err() {
+            if dest_f.set_len(0).await.is_err() {
                 unverified += 1;
                 tracing::warn!(
                     extent_id = extent.extent_id,
@@ -4407,7 +4757,7 @@ impl ExtentNode {
                 extent.extent_id,
                 extent.eversion,
                 total,
-                &dest.file_rc(),
+                &dest_f,
             )
             .await
             {
@@ -4473,7 +4823,7 @@ impl ExtentNode {
             if let Some((sock, addr, best_len)) = best {
                 // Re-stream the longest copy cleanly — a trailing shorter
                 // attempt above may have left `dest` at a different length.
-                let _ = dest.file_rc().set_len(0).await;
+                let _ = dest_f.set_len(0).await;
                 // coco P0: do NOT swallow a re-stream failure as success. If the
                 // best source fails or short-reads on the re-stream, the recovered
                 // file would be incomplete yet marked recovered — propagate the
@@ -4484,7 +4834,7 @@ impl ExtentNode {
                     extent.extent_id,
                     extent.eversion,
                     best_len,
-                    &dest.file_rc(),
+                    &dest_f,
                 )
                 .await?;
                 if got < best_len {
@@ -4678,6 +5028,9 @@ impl ExtentNode {
         // `extent_info.parity` is non-empty.
         let extent = self.ensure_extent(task.extent_id).await?;
 
+        // F-EN-FD-LRU: resolve (re-open if evicted) + pin the recovery dest fd
+        // once for the writeback + sync below.
+        let rf = self.extent_file(&extent).await?;
         let payload_len = if !extent_info.ec_converted && extent_info.sealed_length == 0 {
             // F-FENCE-DRAIN-2: a sealed-EMPTY extent (`sealed_length == 0` — e.g.
             // an open tail that the fence drain rolled empty, then recovery
@@ -4706,21 +5059,13 @@ impl ExtentNode {
             // decode would be F193 Stage B.
             let payload = self.run_ec_recovery_payload(&task, &extent_info).await?;
             let len = payload.len() as u64;
-            extent
-                .file_rc()
-                .set_len(0)
-                .await
-                .map_err(|e| e.to_string())?;
-            file_pwrite_chunked(extent.file_rc(), 0, Bytes::from(payload))
+            rf.set_len(0).await.map_err(|e| e.to_string())?;
+            file_pwrite_chunked(rf.clone(), 0, Bytes::from(payload))
                 .await
                 .map_err(|e| e.to_string())?;
             len
         };
-        extent
-            .file_rc()
-            .sync_data()
-            .await
-            .map_err(|e| e.to_string())?;
+        rf.sync_data().await.map_err(|e| e.to_string())?;
 
         // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
         // (triggered by handle_re_avali or another append's seal-confirm branch)
@@ -4781,6 +5126,7 @@ impl ExtentNode {
             // for abandoned recovery artifacts.
             self.mark_disk_error_for_extent(task.extent_id, &e.to_string());
             self.extents.remove(&task.extent_id);
+            self.fd_lru.forget(task.extent_id); // F-EN-FD-LRU
             return Err(format!(
                 "recovery of extent {} completed but .meta persist failed (fail-closed): {e}",
                 task.extent_id
@@ -5503,7 +5849,17 @@ impl ExtentNode {
 
         let data_payload = req.payload;
 
-        if let Err(e) = file_pwrite(extent.file_rc(), start, data_payload.clone()).await {
+        // F-EN-FD-LRU: resolve + pin the fd once (reject if concurrently
+        // sealed+evicted); `af` is held through the pwrite AND the
+        // `register_sync_waiter` below, so `fd_evictable`'s `strong_count == 1`
+        // keeps the extent non-evictable across the whole durable-append window.
+        let Some(af) = extent.resident_file() else {
+            return Err((
+                StatusCode::FailedPrecondition,
+                "extent sealed (fd evicted) — retry on a fresh tail".to_string(),
+            ));
+        };
+        if let Err(e) = file_pwrite(af.clone(), start, data_payload.clone()).await {
             let msg = e.to_string();
             self.mark_disk_error_for_extent(req.extent_id, &msg);
             return Err((StatusCode::Internal, msg));
@@ -5576,7 +5932,12 @@ impl ExtentNode {
         // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
-        let data = file_pread_chunked(extent.file_rc(), read_offset, read_size as usize)
+        // F-EN-FD-LRU: re-open on miss for an evicted sealed extent.
+        let rf = self
+            .extent_file(&extent)
+            .await
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let data = file_pread_chunked(rf, read_offset, read_size as usize)
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
@@ -5841,7 +6202,10 @@ impl ExtentNode {
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
-                file: RefCell::new(Rc::new(file)),
+                // F-EN-FD-LRU: freshly-created local extent (copy/recovery) —
+                // pinned resident; it's actively being written.
+                file: RefCell::new(Some(Rc::new(file))),
+                extent_id: req.extent_id,
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -5866,6 +6230,7 @@ impl ExtentNode {
         if let Err(e) = self.save_meta(req.extent_id, &entry).await {
             self.mark_disk_error_for_extent(req.extent_id, &e);
             self.extents.remove(&req.extent_id);
+            self.fd_lru.forget(req.extent_id); // F-EN-FD-LRU
             return Err((StatusCode::Internal, e));
         }
 
@@ -6188,6 +6553,7 @@ impl ExtentNode {
         // Pull the entry out of the map so any later append on this id
         // fails with NotFound rather than racing the unlink.
         let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
+        self.fd_lru.forget(req.extent_id); // F-EN-FD-LRU
 
         // Locate the file. Prefer the in-memory entry's disk_id (exact
         // match for the file that was actually created); fall back to
@@ -6344,8 +6710,10 @@ impl ExtentNode {
                 return code_resp(CODE_ERROR, err);
             }
         };
-        extent
-            .file_rc()
+        // F-EN-FD-LRU: re_avali repairs a SEALED extent — re-open on miss.
+        self.extent_file(&extent)
+            .await
+            .map_err(|e| (StatusCode::Internal, e))?
             .sync_data()
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -6504,7 +6872,13 @@ impl ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        let data = file_pread_chunked(extent.file_rc(), offset, size as usize)
+        // F-EN-FD-LRU: copy serves a range of a (possibly sealed) extent —
+        // re-open on miss.
+        let cf = self
+            .extent_file(&extent)
+            .await
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let data = file_pread_chunked(cf, offset, size as usize)
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
@@ -6929,6 +7303,12 @@ impl ExtentNode {
                 // extents) where a whole-shard WriteShard would overflow.
                 let per_shard = crate::erasure::shard_size(sealed_length as usize, data_shards);
                 let stripe_bytes = ec_encode_stripe_bytes();
+                // F-EN-FD-LRU: EC converts a SEALED source extent — resolve
+                // (re-open on miss) + pin its fd once for the whole stripe scan.
+                let ecf = self
+                    .extent_file(&entry)
+                    .await
+                    .map_err(|e| (StatusCode::Internal, e))?;
                 let mut s = 0usize;
                 while s < per_shard {
                     let stripe_len = (per_shard - s).min(stripe_bytes);
@@ -6947,7 +7327,7 @@ impl ExtentNode {
                         let mut buf = vec![0u8; stripe_len];
                         if avail > 0 {
                             let read =
-                                file_pread_chunked(entry.file_rc(), start as u64, avail)
+                                file_pread_chunked(ecf.clone(), start as u64, avail)
                                     .await
                                     .map_err(|e| {
                                         (
@@ -8410,7 +8790,7 @@ mod p0_fsync_highwater_tests {
     }
 
     async fn pwrite(entry: &Rc<ExtentEntry>, bytes: Vec<u8>, off: u64) {
-        let file_rc = entry.file_rc();
+        let file_rc = entry.resident_file().expect("test extent resident");
         let mut f: &CompioFile = &file_rc;
         let BufResult(wr, _) = f.write_all_at(bytes, off).await;
         wr.expect("pwrite");
@@ -8715,5 +9095,145 @@ mod ec3_fence_handover_tests {
             CODE_LOCKED_BY_OTHER,
             "stale (lower) owner_epoch is rejected"
         );
+    }
+}
+
+/// F-EN-FD-LRU regression tests: the sealed-extent fd cache evicts the
+/// least-recently-used sealed fd, re-opens on access, and never touches
+/// pending-fsync (durability-critical) or open/active extents.
+#[cfg(test)]
+mod fd_lru_tests {
+    use super::*;
+
+    async fn alloc_sealed(node: &ExtentNode, eid: u64) -> Rc<ExtentEntry> {
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+            .await
+            .expect("alloc");
+        let e = node.extents.get(&eid).expect("entry").clone();
+        // Model a sealed, fully-synced extent (alloc seeds pending==synced==0).
+        e.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+        e
+    }
+
+    #[compio::test]
+    async fn evicts_lru_sealed_extent_and_reopens_on_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        for eid in [7401u64, 7402, 7403] {
+            alloc_sealed(&node, eid).await;
+        }
+        let lru = FdLru::new(2, node.extents.clone());
+        lru.touch(7401);
+        lru.touch(7402);
+        assert_eq!(lru.resident_count(), 2);
+        // 7403 pushes over cap → 7401 (LRU) evicted.
+        lru.touch(7403);
+        assert_eq!(lru.resident_count(), 2);
+        assert!(
+            node.extents.get(&7401).unwrap().resident_file().is_none(),
+            "LRU (7401) fd evicted"
+        );
+        assert!(node.extents.get(&7402).unwrap().resident_file().is_some());
+        assert!(node.extents.get(&7403).unwrap().resident_file().is_some());
+
+        // Reading the evicted extent re-opens it via `extent_file`.
+        let e1 = node.extents.get(&7401).unwrap().clone();
+        let f = node.extent_file(&e1).await.expect("reopen");
+        assert!(
+            node.extents.get(&7401).unwrap().resident_file().is_some(),
+            "re-opened on access"
+        );
+        drop(f);
+    }
+
+    #[compio::test]
+    async fn touch_refreshes_recency_so_hot_extent_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        for eid in [7501u64, 7502, 7503] {
+            alloc_sealed(&node, eid).await;
+        }
+        let lru = FdLru::new(2, node.extents.clone());
+        lru.touch(7501);
+        lru.touch(7502);
+        lru.touch(7501); // 7501 is now most-recent; 7502 is LRU
+        lru.touch(7503); // evicts 7502, keeps 7501
+        assert!(
+            node.extents.get(&7502).unwrap().resident_file().is_none(),
+            "7502 (now LRU) evicted"
+        );
+        assert!(
+            node.extents.get(&7501).unwrap().resident_file().is_some(),
+            "re-touched 7501 survives"
+        );
+    }
+
+    #[compio::test]
+    async fn never_evicts_extent_with_pending_fsync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let e1 = alloc_sealed(&node, 7601).await;
+        alloc_sealed(&node, 7602).await;
+        // 7601 has un-synced pending bytes (durability-critical — the coalescer
+        // still needs its resident fd — must NOT be fd-evicted).
+        e1.coalescer
+            .pending_fsync
+            .store(4096, std::sync::atomic::Ordering::SeqCst);
+        let lru = FdLru::new(1, node.extents.clone());
+        lru.touch(7601);
+        lru.touch(7602); // over cap → tries to evict 7601 but it has pending fsync
+        assert!(
+            node.extents.get(&7601).unwrap().resident_file().is_some(),
+            "pending-fsync extent must NOT be fd-evicted"
+        );
+    }
+
+    #[compio::test]
+    async fn never_evicts_while_an_inflight_op_holds_the_fd() {
+        // The seal-transition panic guard: an extent whose fd `Rc` is held by an
+        // in-flight write/read (strong_count > 1) is NOT evictable, even when
+        // sealed + drained + the LRU victim. This is what lets the write path
+        // resolve-and-hold its fd and treat only a pre-resolution `None` as a
+        // reject (never a mid-op yank → panic).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let e1 = alloc_sealed(&node, 7801).await;
+        alloc_sealed(&node, 7802).await;
+        // Simulate an in-flight op on 7801 holding its fd clone.
+        let _held = e1.resident_file().expect("resident");
+        let lru = FdLru::new(1, node.extents.clone());
+        lru.touch(7801);
+        lru.touch(7802); // over cap → 7801 is LRU but NON-evictable (held) → skip → evict 7802
+        assert!(
+            node.extents.get(&7801).unwrap().resident_file().is_some(),
+            "held fd (strong_count>1) must NOT be evicted"
+        );
+        assert!(
+            node.extents.get(&7802).unwrap().resident_file().is_none(),
+            "the unreferenced 7802 was evicted instead"
+        );
+        drop(_held);
+    }
+
+    #[compio::test]
+    async fn forget_drops_tracking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        alloc_sealed(&node, 7701).await;
+        let lru = FdLru::new(4, node.extents.clone());
+        lru.touch(7701);
+        assert_eq!(lru.resident_count(), 1);
+        lru.forget(7701);
+        assert_eq!(lru.resident_count(), 0);
     }
 }

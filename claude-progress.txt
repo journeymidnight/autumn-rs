@@ -44,6 +44,54 @@ Next steps: commit+push (heavy test + earlier BUG1 tests + P3 doc fix). Closed.
 ============================ prior task history ============================
 Date: 2026-07-13
 TaskStatus: completed
+Task scope: F-EN-NOFILE + F-EN-FD-LRU — bound EN open file descriptors. User
+  surfaced it ("EN现在是怎么管理extent的？是一下全部打开吗？是不是应当有LRU？"): yes,
+  load_extents opened ALL extents at startup + kept every fd for process life, no
+  LRU. User then "fix F-EN-NOFILE and F-EN-FD-LRU", chose SEALED-ONLY LRU scope
+  (via AskUserQuestion) to keep the durability path untouched.
+Current summary: BOTH DONE + unit-tested.
+  F-EN-NOFILE (stopgap): EN binary now raises RLIMIT_NOFILE to min(hard,65535)
+    before load_extents (mirrors partition_server.rs; EN only raised MEMLOCK
+    before). Pushes the EMFILE cliff ~64x out.
+  F-EN-FD-LRU (real bound, sealed-only): ExtentEntry.file → RefCell<Option<Rc<
+    CompioFile>>> (+extent_id field); per-shard FdLru (BTreeMap+HashMap exact
+    LRU) caches ONLY sealed-idle fds; async ExtentNode::extent_file accessor
+    (resident fast-path / reopen-on-miss / LRU-touch) at every read + sealed-
+    extent bg op. OPEN/active extents PINNED resident → write/append/coalescer-
+    fsync/fencing/truncate path UNCHANGED (sync file_rc()). load_extents drops
+    sealed fds after reading len → startup fd peak ~one-at-a-time + open tails
+    (was O(all extents)). Eviction == F171 replace_file reader-safety (held Rc
+    keeps fd alive); evict predicate sealed && pending_fsync<=last_synced (never
+    evicts durability-critical pending-fsync). Cap --fd-cache-cap (default 4096;
+    env AUTUMN_EXTENT_FD_CACHE_CAP→flag in entrypoint, no env-read in Rust).
+  Also recorded F-EN-SHARD-AUTO (passes:false) per user — auto shard-count is a
+  deploy/format-layer change (ports stamped in etcd + Service enumeration), not
+  an EN-process change.
+  VERIFY: stream 94 lib tests green (+4 fd_lru_tests); EN binary + stream build
+    clean, 0 clippy. Full-workspace build clean except pre-existing macFUSE
+    fuser build.rs env failure (unrelated).
+Review round (coco findbugs GPT-5.5 + fable subagent): BOTH caught the same
+  reachable SEAL-TRANSITION PANIC in the original panic-on-None file_rc() (an
+  accepted append / in-flight truncate / coalescer meeting a concurrent
+  seal+LRU-evict). FIXED per the subagent's simplification: dropped file_rc();
+  write/durability path resolves once via resident_file(), HOLDS the Rc, rejects
+  None (build_append_future resolves in the sync prologue + moves the Rc into the
+  future); added fd_evictable Rc::strong_count==1 guard (never evict an fd an
+  in-flight op holds). Also fixed coco: evict_over_cap keeps non-evictable
+  victims tracked (fd-leak past cap); per-shard cap clamped min(cap,60000/shards)
+  (RLIMIT_NOFILE is process-wide); cap floor 1→64; rewrote overclaiming docs.
+  Re-verified: stream 95 lib tests green (+5 fd_lru_tests incl. new strong_count
+  guard regression), 0 clippy, clean build.
+Main gaps: NONE for correctness. Live EMFILE-simulation integration test (an EN
+  with >cap extents serving without EMFILE / torn read on eviction) is the
+  recommended cross-host guard — deferred (needs a many-extent cluster).
+Next steps: committed + pushed. (Optional later: cross-host EMFILE test;
+  F-EN-SHARD-AUTO deploy-layer feature.)
+
+--- prior task ---
+
+Date: 2026-07-13
+TaskStatus: completed
 Task scope: F-RECOVERY-UNBOUNDED — bound + parallelize partition recovery. A fable
   subagent found 3 bugs behind the slow full-takeover reopen the user challenged
   ("按照设计应该只从 SST 最大 vp_head 开始 replay，否则就一定有BUG"). User: "修复这3点"

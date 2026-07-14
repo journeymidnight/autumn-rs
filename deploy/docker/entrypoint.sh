@@ -204,6 +204,9 @@ run_extent_node() {
         --cpuset "$cpuset"
     )
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9601)
+    # F-EN-FD-LRU: bound resident sealed-extent fds (default 4096 in the
+    # binary). env→flag in the shell layer, never read in Rust.
+    [[ -n "${AUTUMN_EXTENT_FD_CACHE_CAP:-}" ]] && args+=(--fd-cache-cap "$AUTUMN_EXTENT_FD_CACHE_CAP")
     log "exec autumn-extent-node ${args[*]}"
     exec autumn-extent-node "${args[@]}"
 }

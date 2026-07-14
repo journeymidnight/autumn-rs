@@ -54,7 +54,8 @@ In memory, `ExtentNode` holds a `Rc<DashMap<u64, Rc<ExtentEntry>>>` (single-thre
 
 ```rust
 struct ExtentEntry {
-    file: RefCell<Rc<CompioFile>>, // F171: structural close of file-replace UB
+    file: RefCell<Option<Rc<CompioFile>>>, // F171 UB-safe; F-EN-FD-LRU: None = evicted (sealed only)
+    extent_id: u64,                // F-EN-FD-LRU: for re-open on cache miss
     len: AtomicU64,                // current byte length
     eversion: AtomicU64,           // bumped on seal or eversion change
     sealed_length: AtomicU64,      // 0 = active; >0 = sealed at this length
@@ -89,6 +90,64 @@ Helper signatures (`file_pwrite`, `file_pread`, `file_pwrite_chunked`,
 captures it. The free function `file_ref` was removed — callers use
 `entry.file_rc()` directly. There is no `unsafe` in any file-access path
 on the extent node post-F171.
+
+### F-EN-FD-LRU — bounded fd cache for SEALED extents (2026-07-13)
+
+`ExtentNode::load_extents` used to open EVERY owned extent's `.dat` at startup
+and keep each fd resident for the whole process lifetime (`ExtentEntry.file` was
+`RefCell<Rc<CompioFile>>`, always `Some`). Open fds were **O(all extents on this
+shard)** — a multi-disk node with 16 GiB extents already approached the default
+`RLIMIT_NOFILE` (~1024), and smaller extents (the pre-widening 3 GiB default →
+5× more) blew past it → `EMFILE` in the load loop / on `alloc_new_extent`.
+
+**Two fixes.** (1) **F-EN-NOFILE** (the stopgap, `bin/extent_node.rs`): raise
+`RLIMIT_NOFILE` to 65535 at startup, same as the PS — the EN previously raised
+only `RLIMIT_MEMLOCK`. (2) **F-EN-FD-LRU** (the real bound): a per-shard bounded
+LRU (`FdLru`) caches open fds for **SEALED** extents only; `ExtentEntry.file` is
+now `RefCell<Option<Rc<CompioFile>>>` (`None` = evicted).
+
+Design (sealed-only, so the durability path is untouched). **Two accessors, no
+panic-on-`None`** (a coco + fable-subagent review round replaced the original
+panic-on-`None` `file_rc()` — it had a reachable seal-transition panic; see
+below):
+- **`resident_file() -> Option<Rc>`** (sync): the write/durability path
+  (`build_append_future`, `handle_append`, `truncate_to_commit`, the coalescer)
+  resolves its fd ONCE, HOLDS the `Rc` for the whole op (F171-pins it), and
+  treats `None` as "concurrently sealed" → a clean `CODE_PRECONDITION` reject.
+  `build_append_future` resolves in the **prologue** (while the seal re-checks
+  just proved the extent open) and MOVES the `Rc` into the boxed I/O future —
+  NOT lazily at first poll, which was the panic window.
+- **`ExtentNode::extent_file(entry) -> Result<Rc>`** (async): every read /
+  sealed-extent background op (`build_read_future` — resolved at the call site +
+  passed in; `handle_read_bytes`; `handle_copy_extent`; `handle_convert_to_ec`;
+  `handle_re_avali`; `stream_extent_from_sources`; `run_recovery_task`;
+  `apply_extent_meta_durable`) — resident fast-path (LRU-touch if sealed) or
+  **re-open on miss**. The returned `Rc` pins the fd across `.await`.
+- **Open/active extents are PINNED** (`Some`, not tracked/evicted). Sealed idle
+  extents are the many (long tail); `load_extents` drops a sealed extent's fd
+  after reading `len` → startup fd peak ~one-at-a-time + open tails, not O(all).
+- **Eviction — `fd_evictable()` = `sealed && pending_fsync<=last_synced &&
+  Rc::strong_count(fd)==1`.** The `strong_count==1` guard is load-bearing: it
+  means the cache is the SOLE holder, so an in-flight write/read/fsync that
+  resolved-and-holds its `Rc` can NEVER have its fd yanked mid-op → the
+  seal-transition panic the review found (an accepted append or in-flight
+  `truncate_to_commit`/coalescer meeting a concurrent seal+evict) is closed. Drop
+  == the F171 `replace_file` safety (a holder's clone keeps the fd alive).
+- **`FdLru`**: `BTreeMap<seq,id>` + `HashMap<id,seq>` (O(log n) LRU). Over cap,
+  `evict_over_cap` scans LRU→MRU evicting the first `fd_evictable` victim and
+  KEEPS non-evictable ones tracked (so their resident fd stays cap-accounted —
+  a coco fix). Single-threaded per shard → `Cell`/`RefCell`. Per-shard cap =
+  `min(--fd-cache-cap, 60000/shard_count)` floored at 64 — `RLIMIT_NOFILE` is
+  process-wide but each shard is a separate `ExtentNode`, so the clamp keeps
+  N×cap under the F-EN-NOFILE 65535 (a coco fix). Default cap 4096; env
+  `AUTUMN_EXTENT_FD_CACHE_CAP`→flag (no env read in Rust). Delete → `forget(id)`.
+
+**Invariants:** (1) any file-access on a possibly-SEALED extent uses
+`extent_file()` (open-on-miss); (2) the write/durability path resolves once via
+`resident_file()`, HOLDS the `Rc` for the whole op, and rejects `None` — NEVER
+`.expect()`/panic on it. Tests: `fd_lru_tests` (evict-LRU+reopen, recency,
+never-evict-pending-fsync, **never-evict-while-fd-held** (the strong_count
+guard), forget).
 
 ### Connection Handling & Batch Optimization (R4 step 4.2 v3 — true SQ/CQ)
 

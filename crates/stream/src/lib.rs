@@ -11,5 +11,5 @@ pub use autumn_rpc::extent_rpc;
 pub use client::{read_extent_value_direct, set_append_chain_min_bytes, set_read_hedge_ms, AppendResult, StaleVpOffset, StreamClient};
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
 pub use extent_node::{
-    render_en_metrics, set_ec_encode_stripe_bytes, ExtentNode, ExtentNodeConfig,
+    render_en_metrics, set_ec_encode_stripe_bytes, set_fd_cache_cap, ExtentNode, ExtentNodeConfig,
 };

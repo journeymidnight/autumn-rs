@@ -81,6 +81,9 @@ struct Args {
     /// (64 MiB). Peak EC-convert RAM = `(K+M) × stripe`. Clamped to
     /// [1 MiB, 1 GiB] by the library.
     ec_stripe_bytes: Option<usize>,
+    /// F-EN-FD-LRU: max resident SEALED-extent fds cached per shard. `None` =
+    /// library default (4096). Bounds open fds on a node with many extents.
+    fd_cache_cap: Option<usize>,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
@@ -115,6 +118,7 @@ fn parse_args() -> Args {
     let mut recovery_parallelism: Option<usize> = None;
     let mut inflight_cap: Option<usize> = None;
     let mut ec_stripe_bytes: Option<usize> = None;
+    let mut fd_cache_cap: Option<usize> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
 
     let args: Vec<String> = std::env::args().collect();
@@ -219,6 +223,11 @@ fn parse_args() -> Args {
                 ec_stripe_bytes =
                     Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
             }
+            "--fd-cache-cap" => {
+                i += 1;
+                fd_cache_cap =
+                    Some(args[i].parse().expect("--fd-cache-cap must be a number"));
+            }
             "--ucx-regpool-cap-bytes" => {
                 i += 1;
                 ucx_regpool_cap_bytes = Some(
@@ -266,6 +275,7 @@ fn parse_args() -> Args {
         recovery_parallelism,
         inflight_cap,
         ec_stripe_bytes,
+        fd_cache_cap,
         ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
@@ -402,6 +412,13 @@ fn main() -> Result<()> {
             tracing::warn!(n, "ec-stripe-bytes already set (ignored — first-call-wins)");
         }
     }
+    // F-EN-FD-LRU: apply the sealed-extent fd-cache cap (process-global,
+    // first-call-wins) before ExtentNode::new opens extents.
+    if let Some(n) = args.fd_cache_cap {
+        if !autumn_stream::set_fd_cache_cap(n) {
+            tracing::warn!(n, "fd-cache-cap already set (ignored — first-call-wins)");
+        }
+    }
     // Apply regpool cap BEFORE init_with so the first transport-touch (and
     // thus first TLS pool init) reads the operator's setting.
     if let Some(cap) = args.ucx_regpool_cap_bytes {
@@ -410,6 +427,26 @@ fn main() -> Result<()> {
         }
     }
     let _ = autumn_transport::init_with(args.transport);
+
+    // F-EN-NOFILE: the EN is the fd大户 — `ExtentNode::load_extents` opens every
+    // owned extent's data file at startup and the F-EN-FD-LRU cache keeps up to
+    // `--fd-cache-cap` of them open. The default RLIMIT_NOFILE soft limit (often
+    // 1024) is far too small — a multi-disk node with 16 GiB extents already
+    // approaches it, and smaller extents blow past → EMFILE in the load_extents
+    // open loop / on alloc_new_extent. Raise the soft limit to 65535 (same as
+    // the PS, `partition_server.rs`), clamped to the hard limit. Harmless if
+    // already high. Set BEFORE the shard threads run `load_extents`.
+    #[cfg(unix)]
+    unsafe {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < 65535 {
+            rl.rlim_cur = rl.rlim_max.min(65535);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
 
     // F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
     // RLIMIT_MEMLOCK via ibv_reg_mr. The default soft limit (often 8 MiB) faults
