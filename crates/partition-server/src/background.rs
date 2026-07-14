@@ -1874,7 +1874,7 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 // append immediately, then start a fresh builder. Peak intermediate state
 // is one in-progress `SstBuilder` (≈current_chunk bytes) instead of the
 // full output materialized as IterItem clones. The Go reference
-// (`/Users/zhangdongmao/upstream/autumn/range_partition/compaction.go`
+// (Go autumn `range_partition/compaction.go`
 // `doCompact`, L257-329) uses the same pattern; the Rust port had
 // regressed to a Vec accumulator.
 //

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # crosshost_chaos.sh — CROSS-HOST chaos for tcp|ucx (F272).
 #
-# Topology (real network, two hosts):
-#   LOCAL  (fdbd:dc62:3:302::14): etcd + manager:9001 + EN x2 (21001/21002)
-#                                  + PS1:9301
-#   REMOTE (fdbd:dc62:3:302::15): EN x1 (21003) + PS2:9351   (via ssh)
+# Topology (real network, two hosts — addresses come from the env below):
+#   LOCAL  ($AUTUMN_LOCAL_IP):  etcd + manager:9001 + EN x2 (21001/21002)
+#                               + PS1:9301
+#   REMOTE ($AUTUMN_REMOTE_IP): EN x1 (21003) + PS2:9351   (via ssh)
 # Replication=3 over 3 ENs → EVERY extent spans the wire.
 #
 # Events, while an ACKed-write loop runs locally:
@@ -28,12 +28,20 @@ case "$T" in tcp|ucx) ;; *) echo "usage: $0 tcp|ucx"; exit 2;; esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RA="$ROOT/.claude/skills/remote-autumn/remote-autumn.sh"
-LIP="fdbd:dc62:3:302::14"
-RIP="fdbd:dc62:3:302::15"
+# Cross-host topology + paths are ENVIRONMENT-specific — never hardcode them
+# here (this is a public repo). Supply them via env, e.g.:
+#
+#   export AUTUMN_LOCAL_IP=<this-host-addr>         # v4 or v6 (v6 is bracketed below)
+#   export AUTUMN_REMOTE_IP=<peer-host-addr>
+#   export AUTUMN_REMOTE_ROOT=/path/to/autumn-rs    # repo checkout on the peer
+#   export AUTUMN_LOCAL_DATA=/path/to/en-data       # EN data dir, this host
+#   export AUTUMN_REMOTE_DATA=/path/to/en-data      # EN data dir, peer host
+LIP="${AUTUMN_LOCAL_IP:?set AUTUMN_LOCAL_IP (this host's address)}"
+RIP="${AUTUMN_REMOTE_IP:?set AUTUMN_REMOTE_IP (the peer host's address)}"
 MGR="[$LIP]:9001"
-RROOT="/data/dongmao_dev/autumn-rs"
-LDATA="/data05/autumn-rs-xh"
-RDATA="/data03/autumn-rs-xh"
+RROOT="${AUTUMN_REMOTE_ROOT:?set AUTUMN_REMOTE_ROOT (autumn-rs checkout on the peer)}"
+LDATA="${AUTUMN_LOCAL_DATA:?set AUTUMN_LOCAL_DATA (EN data dir on this host)}"
+RDATA="${AUTUMN_REMOTE_DATA:?set AUTUMN_REMOTE_DATA (EN data dir on the peer)}"
 AC="$ROOT/target/release/autumn-client"
 AO="$ROOT/target/release/autumn-op"
 WORK="$(mktemp -d /tmp/crosshost_chaos.XXXXXX)"

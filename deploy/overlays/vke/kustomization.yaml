@@ -16,9 +16,18 @@ resources:
   - dashboard-service.yaml       # internal-only dashboard access (ClusterIP)
 
 images:
-  - name: autumn-rs
-    newName: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs
-    newTag: c04fd296f6d3188e5d17ee9956568f5f1d416cc9
+  # NOTE: the autumn-rs image is deliberately NOT pinned here — neither the
+  # registry nor the tag. Both are DEPLOYER state, not source:
+  #   - the registry/namespace is a private account (this is a public repo);
+  #   - the tag is a git SHA that changes on every build, so pinning it made
+  #     every single deploy dirty this file.
+  # The manifests keep the base's placeholder `autumn-rs:latest`; the deploy
+  # injects the real image at apply time without touching git — use
+  # `deploy/overlays/vke/deploy.sh` (reads AUTUMN_IMAGE_REPO / AUTUMN_IMAGE_TAG
+  # from the environment). A bare `kubectl apply -k` would ship the
+  # non-existent `autumn-rs:latest` and fail loudly rather than silently
+  # deploying a stale image.
+  #
   # This cluster's nodes reach the daocloud mirror, not quay.io directly.
   - name: quay.io/coreos/etcd
     newName: quay.m.daocloud.io/coreos/etcd

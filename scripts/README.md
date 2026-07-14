@@ -3,7 +3,7 @@
 ## 1) Smoke test (no external etcd dependency)
 
 ```bash
-cd /Users/zhangdongmao/upstream/autumn/autumn-rs
+cd "$(git rev-parse --show-toplevel)"   # repo root
 ./scripts/manual_stream_test.sh smoke
 ```
 
@@ -17,7 +17,7 @@ This runs:
 ## 2) With embedded etcd
 
 ```bash
-cd /Users/zhangdongmao/upstream/autumn/autumn-rs
+cd "$(git rev-parse --show-toplevel)"   # repo root
 ./scripts/manual_stream_test.sh etcd
 ```
 
@@ -27,6 +27,6 @@ Requires:
 ## 3) Run both
 
 ```bash
-cd /Users/zhangdongmao/upstream/autumn/autumn-rs
+cd "$(git rev-parse --show-toplevel)"   # repo root
 ./scripts/manual_stream_test.sh all
 ```

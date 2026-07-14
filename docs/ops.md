@@ -627,7 +627,7 @@ bash python/autumn_memory/tests/run_embedder_test.sh
 
 # Hermes MemoryProvider adapter, driven against the REAL Hermes ABC (clone it
 # first) — register/init/sync_turn→prefetch recall/tools/built-in-write mirror:
-git clone https://github.com/NousResearch/hermes-agent /data/dongmao_dev/hermes-agent
+git clone https://github.com/NousResearch/hermes-agent "${HERMES_DIR:-/tmp/hermes-agent}"
 bash python/hermes_memory_autumn/tests/run_hermes_test.sh
 #   → "HERMES PROVIDER OK: real MemoryProvider ABC ..." and "===== hermes-test exit: 0 ====="
 

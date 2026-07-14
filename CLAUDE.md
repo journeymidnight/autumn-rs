@@ -36,6 +36,7 @@
     - 提交 git commit，作为该 feature 的完成点
 11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不再堆放验证步骤（2026-07-02 重写）。
 12. 每个feature和BUG都用coco 做review, 但是coco有时候会提出纯理论过于窄或者trick的情况，
+13. 如果claude-progress.txt,feature-list太长, 定期清理删除, 保持整洁
 
 
 ### claude-progress.txt 约定
