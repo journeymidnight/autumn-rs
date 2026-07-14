@@ -188,6 +188,10 @@ struct JsonNode {
     override_set_by: String,
     override_set_at: i64,
     override_expire_at: u64,
+    // F-EN-DYNSHARD M1c
+    node_uuid: String,
+    shard_count: usize,
+    shard_ports: Vec<u16>,
 }
 
 #[derive(Serialize)]
@@ -541,13 +545,16 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
                 override_set_by: n.override_set_by,
                 override_set_at: n.override_set_at,
                 override_expire_at: n.override_expire_at,
+                node_uuid: n.node_uuid,
+                shard_count: n.shard_ports.len(),
+                shard_ports: n.shard_ports,
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!(
-            "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} REASON",
-            "ID", "ADDRESS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
+            "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} REASON",
+            "ID", "UUID", "ADDRESS", "SHARDS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
         );
         for n in resp.nodes {
             let hb = if n.last_heartbeat_secs_ago == u64::MAX {
@@ -555,10 +562,18 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
             } else {
                 format!("{}s", n.last_heartbeat_secs_ago)
             };
+            // F-EN-DYNSHARD M1c: short uuid + shard count (verify a reshard took).
+            let uuid_short = if n.node_uuid.is_empty() {
+                "-".to_string()
+            } else {
+                n.node_uuid.chars().take(8).collect::<String>()
+            };
             println!(
-                "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} {}",
+                "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {}",
                 n.node_id,
+                uuid_short,
                 n.address,
+                n.shard_ports.len(),
                 auto_state_str(n.auto_state),
                 hb,
                 n.suspected_age_secs,

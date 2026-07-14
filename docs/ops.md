@@ -603,14 +603,58 @@ manager keys the node by it:
 - **Legacy (uuid-less) nodes are adopted.** A node that first registered before
   M0 (empty UUID) adopts the UUID on its next register at the same address.
 
-M0 is identity plumbing only — the shard COUNT is still frozen at `format` time
-(the EN does not yet re-report its live `shard_ports[]` at startup). Making the
-shard count dynamically changeable + the stop-the-world reshard runbook are
-M1/M2; the full design (including the k8s topology and the reshard steps) is in
+The full design (including the k8s topology and the phased milestones) is in
 [`en_dynamic_shard_design.md`](en_dynamic_shard_design.md). **Deploy note:** the
-`node_uuid` field is in-struct on the persisted `MgrNodeInfo` (WIRE v19) — a
-same-commit stop-world upgrade that requires an **etcd reset** (`cluster.sh
-reset`); there is no rolling upgrade across this change.
+`node_uuid` field is in-struct on the persisted `MgrNodeInfo` — a same-commit
+stop-world upgrade that requires an **etcd reset** (`cluster.sh reset`); there is
+no rolling upgrade across this change.
+
+### Resharding an extent node — changing its shard count (F-EN-DYNSHARD M1)
+
+An EN's shard count = the number of io_uring cores it runs (one shard per core),
+sized by `--cpuset` (`shard_count = cpuset_len`). Each shard `i` listens on
+`--port + i*--shard-stride` and owns the extents where `extent_id % shard_count
+== i`. Because the on-disk layout is hashed by `crc32c(extent_id)` (NOT by
+shard) and all shards share the data dirs, **a reshard moves ZERO bytes on
+disk** — only ownership/routing remaps by the new modulus.
+
+Resharding is **stop-the-world for that node** (design decision #4): the EN
+re-reports its live `shard_ports[]` to the manager on startup (needs
+`--advertise`; the manager keys by `node_uuid` and updates the location in
+place), so a restart with a different core count is the whole mechanism — no
+`autumn-op format` re-run, no data migration.
+
+```bash
+# 1. Note the current shard count.
+autumn-op --manager <MGR> list-nodes        # SHARDS column
+
+# 2. Stop the EN process (SIGTERM). Its extents stay on disk untouched.
+#    (Its slots go Suspected within ~2 s; reads/writes route to replicas.)
+
+# 3. Restart the EN with the NEW core count. `--advertise` MUST be set so it
+#    self-registers the new shard ports. Example: 2 -> 4 shards.
+autumn-extent-node --data <DIRS> --port 9101 --manager <MGR> \
+    --advertise <IP>:9101 --cpuset 0-3        # 4 cores = 4 shards
+
+# 4. Verify the manager picked up the new layout (SHARDS should now read 4,
+#    and the node returns to Online after its first df ~2 s later).
+autumn-op --manager <MGR> list-nodes
+```
+
+Requirements / caveats:
+- **The new shard ports (`port + i*stride`) must be free** on the host. On k8s
+  the pod's Service must expose exactly `shard_count` data+control ports — that
+  Service-port generation is a deploy-layer follow-up (F-EN-DYNSHARD M2); on
+  bare-metal / `cluster.sh` the ports just need to be unbound.
+- **`--advertise` is what enables self-registration.** Without it the EN keeps
+  the `format`-stamped location and the shard count stays frozen (pre-M1
+  behavior). `cluster.sh` passes it automatically.
+- Per-EN: shard count is independent per node — you can reshard one EN without
+  touching the others (its extents remap under the new modulus; siblings are
+  unaffected).
+- A returning EN under its own `node_uuid` reuses its `node_id`; the manager's
+  df-echo check (M1b) WARNs if the stored location drifts and refuses to serve
+  an imposter that reused the node's IP under a different uuid.
 
 ## autumn-memory verification
 

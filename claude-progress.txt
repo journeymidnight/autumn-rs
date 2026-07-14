@@ -1,44 +1,41 @@
 Date: 2026-07-14
 TaskStatus: completed
-Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s via a
-  stable UUID identity decoupled from the network address. M0 + M1a pushed;
-  M1b done this session (ready to commit after coco). Design:
+Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s. M0 +
+  M1a + M1b + M1c(list-nodes) + reshard runbook shipped. Design:
   docs/en_dynamic_shard_design.md.
 
-Current summary:
-  DONE (pushed) — M0 (e3477c6): node_uuid in-struct on MgrNodeInfo +
-    MgrNodeOverride (WIRE v19, etcd-reset); UUID-first handle_register_node;
-    uuid-keyed tombstone survives remove; coco+fable reviewed (7+5 fixes).
-  DONE (pushed) — M1a (3542970): EN `--advertise` (optional, backward-compat) +
-    register_with_manager (retry 30x1s, fail-stop) + read_node_identity/
-    build_register_req; cluster.sh EN launch passes --advertise; manager side
-    unchanged (M0 uuid-match updates location in place = reshard commit point).
-  DONE (this session, ready to commit after coco) — M1b (df-echo self-heal):
-    - WIRE v20 (fp 23a6b7794ff8fb6a): extent_rpc::DfResp + manager_rpc::ExtDfResp
-      += node_uuid/advertise_addr/shard_ports (appended same-order for rkyv
-      cross-decode). MIN=MAX=20, registry updated.
-    - stream::NodeRegistration + ExtentNodeConfig::with_registration threads the
-      EN's identity into shard-0's ExtentNode; handle_df echoes it (empty when
-      --advertise unset). Only shard 0 is dialed by df.
-    - manager node_health_loop (recovery.rs) acts on the echo via PURE
-      classify_df_echo -> DfEchoAction::{Imposter, Heal{addr,ports}, Ok}:
-      Imposter (echo uuid != stored) = pod-IP reuse -> don't heal, mark offline
-      + on_heartbeat_fail + fail df; Heal (uuid match, location drift) ->
-      etcd-first mirror_register_node + in-mem update; empty echo = unspecified,
-      never clear.
-    - 5 df_echo_tests. Tests: manager 193 / stream 96 / EN-bin 2 / rpc 44 green;
-      workspace + all test targets build clean; 0 clippy in touched files.
-    - Docs: feature_list M1b done; design doc §8 M1b done; manager CLAUDE.md
-      note 44 M1b addendum; stream + server CLAUDE.md notes.
+Current summary (all pushed):
+  M0 (e3477c6): node_uuid identity (WIRE v19, etcd-reset); coco+fable reviewed.
+  M1a (3542970): EN --advertise self-registration (retry/fail-stop); cluster.sh
+    wired. Manager unchanged (M0 uuid-match = reshard commit point).
+  M1b (a802c4f): df identity echo (WIRE v20) → classify_df_echo -> Imposter
+    (pod-IP reuse: fail df) / DriftWarn / Ok. coco P1/P2 → dropped the risky
+    auto-heal write (M1a already authoritative); P3 doc fixed.
+  M1c-partial + runbook (THIS session, ready to commit):
+    - autumn-op list-nodes: UUID + SHARDS columns (NodeStateEntry += node_uuid /
+      shard_ports, WIRE v21) — the reshard-verification tool. JSON += node_uuid/
+      shard_count/shard_ports.
+    - docs/ops.md: "Resharding an extent node" runbook (stop-the-world: stop EN
+      → restart with new --cpuset + --advertise → list-nodes shows new SHARDS;
+      zero data movement; per-EN independent). Updated the stale "shard count
+      frozen" M0 paragraph.
+    - rpc 44 (v21) / manager 193 green; all test targets build; 0 clippy.
 
-Main gaps (M1c + beyond, OPEN):
-  - M1c: format -> identity-only registration (stop stamping location); make EN
-    --advertise REQUIRED when --manager given + wire entrypoint/autumn-deploy/k8s
-    launchers; autumn-op list-nodes uuid + shard-count columns.
-  - M2: reshard runbook (docs/ops.md) + k8s per-pod ClusterIP + Service port gen.
-  - M3: reshard e2e/chaos (boot cpuset len 2 -> write -> restart len 4 ->
-    list-nodes shows 4 ports -> read back zero-movement -> restart len 1 -> read).
+Main gaps:
+  - M1c REMAINING (deferred, LOW-PRIORITY cleanup, not functional): format ->
+    identity-only registration; make EN --advertise REQUIRED; rewire entrypoint/
+    autumn-deploy/k8s launchers. Rationale for deferral: M1a already makes the EN
+    the authoritative location source (overwrites shard_ports every boot →
+    reshard works via restart, NO format re-run) and F214-B already gives the
+    "unbooted node stays Suspend" property, so this is cleanup that changes the
+    operational contract with real risk NOT validatable without a live cluster.
+  - M2 deploy: k8s per-pod ClusterIP + Service port generation (shard_count
+    ports per pod). The reshard RUNBOOK (bare-metal) is DONE (ops.md); the k8s
+    Service-port-gen part remains.
+  - M3 chaos: reshard-under-load e2e (needs a LIVE cluster — likely not runnable
+    in this sandbox per env constraints; deferred to a cluster run).
 
 Next steps:
-  1. Triage coco M1b findings, fix P0/P1, commit + push M1b.
-  2. M1c: cmd_format identity-only + required --advertise + launcher wiring.
+  1. Commit + push M1c list-nodes + reshard runbook.
+  2. If continuing: M2 k8s Service-port generation (deploy/k8s), OR pause for a
+     live-cluster run to do M3 reshard chaos + the deferred launcher rewiring.

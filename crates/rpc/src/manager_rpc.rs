@@ -1400,6 +1400,12 @@ pub struct NodeStateEntry {
     pub override_set_by: String,
     pub override_set_at: i64,
     pub override_expire_at: u64,
+    /// F-EN-DYNSHARD M1c: the node's stable identity + the shard ports it last
+    /// registered (`shard_ports.len()` = its shard count). Lets `list-nodes`
+    /// show the identity and verify a reshard took effect. Empty for a pre-M0
+    /// node (impossible on a reset cluster) / legacy single-shard registration.
+    pub node_uuid: String,
+    pub shard_ports: Vec<u16>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
