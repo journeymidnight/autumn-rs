@@ -687,11 +687,22 @@ implementer's choice, the registry test forces correctness either way).
   refused. rpc(44)+manager(188)+stream(96) lib green.
 
 ### M1 — EN startup self-registration + df echo self-heal (shard count becomes dynamic here)
-- **Files**: `crates/server/src/bin/extent_node.rs` (`--advertise` flag;
-  `node_uuid` generate-if-missing in `read_and_verify_cluster_id`'s pass;
-  `register_with_manager` helper called from both the multi-shard shard-0
-  block (`:622`) and `run_single_shard`; UCX empty-control_address logic moved
-  here); `crates/stream/src/extent_node.rs` + config (thread
+
+**M1a — DONE (EN self-registration).** `crates/server/src/bin/extent_node.rs`:
+`--advertise HOST:PORT` (OPTIONAL — backward-compatible; when unset the EN keeps
+the format-stamped location, so existing launchers don't break), validated as
+IP:port with port == `--port`; `read_node_identity` reads the `node_uuid` +
+per-dir `disk_uuid` sentinels (fail-loud, no mint — `format` already stamped
+them in M0); pure `build_register_req` (transport-conditional control_address,
+unit-tested); `register_with_manager` (retry 30×1s through a mid-election
+manager, fail-stop on hard refusal / exhaustion) called from shard 0 + from
+`run_single_shard`, after `verify_manager_cluster_id`, before serving. The
+manager side needs NO change — M0's uuid-match branch already updates location
+in place. `cluster.sh` EN launch passes `--advertise "${BIND_HOST}:$port"`
+(idempotent with `format`'s advertise → exercises the path end-to-end).
+
+**M1b — OPEN (df-echo self-heal + format identity-only).**
+- **Files**: `crates/stream/src/extent_node.rs` + config (thread
   `(node_uuid, advertise, shard_ports)` for the df echo; extend `handle_df`);
   `crates/rpc/src/extent_rpc.rs` (`DfResp` echo fields);
   `crates/manager/src/lib.rs` (`node_health_loop`: compare echo, heal via

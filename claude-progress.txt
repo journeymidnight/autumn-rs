@@ -1,50 +1,47 @@
 Date: 2026-07-14
 TaskStatus: completed
-Task scope: F-EN-DYNSHARD M0 — make the EN shard count dynamically changeable +
-  k8s-ready by giving the EN a STABLE UUID identity decoupled from its network
-  address (mirrors the PS ps_id-vs-address split). M0 = identity plumbing only
-  (no routing/reshard change yet). Locked design (user 2026-07-14): #2→(a) keep
-  extent_id%shard_count + shared dirs (reshard moves ZERO bytes); #4→全停全启;
-  #3→mirror the PS registration model. Pivot: no back-compat, etcd reset OK →
-  node_uuid rides IN-STRUCT on persisted MgrNodeInfo (same-commit stop-world).
-  Authoritative design: docs/en_dynamic_shard_design.md.
+Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s via a
+  stable UUID identity decoupled from the network address. M0 (identity
+  plumbing) DONE + pushed (commit e3477c6). M1a (EN startup self-registration)
+  DONE this session. Design: docs/en_dynamic_shard_design.md.
 
 Current summary:
-  DONE — M0 code + tests + docs, all green, ready to commit.
-    - WIRE v19 (MIN=MAX=19, fp ba8a88d46f0bbc47): RegisterNodeReq.node_uuid +
-      MgrNodeInfo.node_uuid (in-struct, persisted → etcd-reset deploy).
-    - manager handle_register_node REWRITTEN: identity resolved UUID-FIRST
-      (uuid match → same node_id across addr/shard-port change; uuid-less legacy
-      → address match + ADOPT uuid; fresh uuid on recycled IP → new node);
-      zombie/decommission tombstone keyed by the matched node_id (uuid, not IP);
-      updates address/shard_ports/control_address in place on change.
-    - autumn-op format: mints a UUID v4 (reuses per-dir `node_uuid` sentinel if
-      present), passes it on MSG_REGISTER_NODE, writes the sentinel to each dir.
-    - 26 RegisterNodeReq construction sites across 15 files fixed (rkyv full
-      literals, no Default) — incl. the 2 the bulk perl missed on
-      `format!("...{i}...")` braces (stream_sqcq.rs, lib.rs:5095).
-    - 5 acceptance tests `f_en_dynshard_*` in crates/manager/src/lib.rs:
-      uuid-survives-address-change / legacy-adopts-uuid /
-      identity-only-preserves-address / decommissioned-uuid-refused-at-new-addr /
-      recycled-ip-under-fresh-uuid-accepted. ALL GREEN.
-    - Tests: rpc lib 44, manager lib 187 (was 182 + 5), stream lib 96 — all
-      green. Workspace + ALL test targets build clean.
-    - Ledgers/docs: feature_list.md F-EN-DYNSHARD entry (M0 done, M1/M2/M3 open;
-      unblocks F-EN-SHARD-AUTO); docs/ops.md "EN identity is a UUID" subsection.
-    - coco deep review: RUNNING at handoff (background). Address any P0/P1 before
-      or immediately after commit.
+  DONE — M0 (committed e3477c6): node_uuid in-struct on MgrNodeInfo +
+    MgrNodeOverride (WIRE v19, etcd-reset deploy); handle_register_node
+    UUID-first resolution (uuid match keeps node_id + updates location in
+    place; legacy adopt; duplicate-address refused; identity-only preserves
+    location); uuid-keyed tombstone survives remove_node; format mints/atomic-
+    persists a node_uuid sentinel. Reviewed by coco (deep) + fable subagent (7+5
+    findings all fixed). 6 f_en_dynshard_* tests.
+  DONE — M1a (EN startup self-registration, this session, ready to commit):
+    - crates/server/src/bin/extent_node.rs: `--advertise HOST:PORT` (OPTIONAL,
+      backward-compatible — unset = keep format-stamped location); validated
+      IP:port with port==--port. `read_node_identity` reads node_uuid +
+      per-dir disk_uuid sentinels (fail-loud). Pure `build_register_req`
+      (transport-conditional control_address, unit-tested). `register_with_
+      manager` (retry 30x1s through mid-election manager, fail-stop on hard
+      refusal/exhaustion) called from shard 0 + run_single_shard, after
+      verify_manager_cluster_id, before serving.
+    - Manager side needs NO change — M0 uuid-match already updates location in
+      place (the reshard commit point).
+    - cluster.sh EN launch passes --advertise "${BIND_HOST}:$port" (idempotent
+      with format's advertise → exercises the path e2e in dev/chaos harness).
+    - 2 EN-binary unit tests (build_register_req TCP/UCX); workspace builds
+      clean; manager 188 / rpc 44 unchanged; 0 clippy warnings in extent_node.rs;
+      cluster.sh syntax OK.
 
-Main gaps:
-  M1 (EN startup self-register + df-echo self-heal — the milestone that makes the
-    shard COUNT actually dynamic), M2 (deploy: reshard runbook + k8s per-pod
-    ClusterIP + Service port generation), M3 (chaos: reshard under load) — all OPEN.
-  docs/en_dynamic_shard_design.md is still UNCOMMITTED (760-line design, by the
-    fable subagent) — commit it alongside M0.
+Main gaps (M1b + beyond, all OPEN):
+  - M1b: DfResp echo fields (node_uuid/advertise_addr/shard_ports) → WIRE bump;
+    node_health_loop drift-heal (compare echo vs stored MgrNodeInfo, heal via
+    mirror_register_node) + pod-IP-reuse imposter detection (uuid echo != stored
+    → different process on a stale addr → DON'T heal, WARN + treat df as failed);
+    format → identity-only registration (stop stamping location); make
+    --advertise REQUIRED + wire entrypoint/autumn-deploy/k8s launchers.
+  - M2: reshard runbook (docs/ops.md) + k8s per-pod ClusterIP + Service port gen.
+  - M3: reshard e2e/chaos (boot cpuset len 2 → write → restart len 4 →
+    list-nodes shows 4 ports → read back zero-movement → restart len 1 → read).
 
 Next steps:
-  1. Confirm coco findings clean (or fix P0/P1), then commit + push M0 to main
-     (git push origin main — solo flow, no PR).
-  2. Start M1: EN process re-reports address + live shard_ports[] at startup;
-     manager shard_addr_for_extent computes from registered shard_ports; DfResp
-     echo self-heal on node_health_loop. EN location stays etcd-persisted (manager
-     DIALS the EN — in-memory would blackout on manager restart).
+  1. Commit + push M1a (extent_node.rs + cluster.sh + docs).
+  2. M1b: start with DfResp echo fields (extent_rpc.rs) + EN handle_df echo +
+     node_health_loop drift-heal. WIRE bump to v20 (record fingerprint).

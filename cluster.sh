@@ -383,6 +383,7 @@ launch_extent_node() {
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \
+        --advertise "${BIND_HOST}:$port" \
         ${stride_args[@]:+"${stride_args[@]}"} \
         ${metrics_args[@]:+"${metrics_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"}

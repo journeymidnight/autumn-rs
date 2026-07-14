@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use autumn_client::ClusterClient;
 use autumn_rpc::manager_rpc::{
-    rkyv_decode, rkyv_encode, GetClusterIdReq, GetClusterIdResp, CODE_OK, MSG_GET_CLUSTER_ID,
+    rkyv_decode, rkyv_encode, GetClusterIdReq, GetClusterIdResp, RegisterNodeReq, RegisterNodeResp,
+    CODE_NOT_LEADER, CODE_OK, MSG_GET_CLUSTER_ID, MSG_REGISTER_NODE,
 };
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use autumn_transport::TransportKind;
@@ -95,6 +96,14 @@ struct Args {
     /// endpoint is unauthenticated — operators exposing the RPC plane
     /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
     metrics_listen: Option<String>,
+    /// F-EN-DYNSHARD M1: `HOST:PORT` this EN announces to the manager at
+    /// startup (HOST must be an IP — the binary stays DNS-free; the shell
+    /// resolves names). PORT is the shard-0 data port (== `--port`). When set
+    /// (and `--manager` is given), the EN self-registers its live location +
+    /// shard ports on every boot, so a changed shard-port layout (a reshard) or
+    /// a fresh pod IP is picked up automatically. When unset, the EN relies on
+    /// the location `autumn-op format` stamped (the pre-M1 behavior).
+    advertise: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -120,6 +129,7 @@ fn parse_args() -> Args {
     let mut ec_stripe_bytes: Option<usize> = None;
     let mut fd_cache_cap: Option<usize> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
+    let mut advertise: Option<String> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -244,6 +254,10 @@ fn parse_args() -> Args {
                 i += 1;
                 metrics_listen = Some(args[i].clone());
             }
+            "--advertise" => {
+                i += 1;
+                advertise = Some(args[i].clone());
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -279,6 +293,7 @@ fn parse_args() -> Args {
         ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
+        advertise,
     }
 }
 
@@ -394,6 +409,143 @@ fn read_and_verify_cluster_id(data_dirs: &[PathBuf]) -> Result<String> {
         }
     }
     Ok(shared.unwrap())
+}
+
+/// F-EN-DYNSHARD M1: read the identity sentinels `autumn-op format` stamped —
+/// the single `node_uuid` (must agree across every dir) and each dir's
+/// `disk_uuid` (in `--data` order). The EN re-reports these to the manager at
+/// startup (self-registration), so a missing / empty / disagreeing sentinel is
+/// fail-loud (the dir was never formatted, or a mixed / cloned data set).
+fn read_node_identity(data_dirs: &[PathBuf]) -> Result<(String, Vec<String>)> {
+    let mut node_uuid: Option<String> = None;
+    let mut disk_uuids: Vec<String> = Vec::with_capacity(data_dirs.len());
+    for dir in data_dirs {
+        let du = std::fs::read_to_string(dir.join("disk_uuid"))
+            .with_context(|| {
+                format!("read disk_uuid in {} (dir not formatted?)", dir.display())
+            })?
+            .trim()
+            .to_string();
+        if du.is_empty() {
+            anyhow::bail!(
+                "empty disk_uuid in {} — re-run `autumn-op format`",
+                dir.display()
+            );
+        }
+        disk_uuids.push(du);
+
+        let nu = std::fs::read_to_string(dir.join("node_uuid"))
+            .with_context(|| {
+                format!("read node_uuid in {} (dir not formatted?)", dir.display())
+            })?
+            .trim()
+            .to_string();
+        if nu.is_empty() {
+            anyhow::bail!(
+                "empty node_uuid in {} — re-run `autumn-op format`",
+                dir.display()
+            );
+        }
+        match &node_uuid {
+            None => node_uuid = Some(nu),
+            Some(prev) if prev == &nu => {}
+            Some(prev) => anyhow::bail!(
+                "data dirs disagree on node_uuid: {} reports {} but a prior dir reports \
+                 {} — a mixed or cloned data set must not be served by one EN",
+                dir.display(),
+                nu,
+                prev
+            ),
+        }
+    }
+    Ok((node_uuid.unwrap(), disk_uuids))
+}
+
+/// F-EN-DYNSHARD M1: build the self-registration request (pure — no I/O, so the
+/// control_address derivation is unit-testable). UCX serves control RPCs on the
+/// data listener (a second `ucp_listener` on the same RoCE device can't bind),
+/// so it registers an EMPTY control_address → the manager's df falls back to the
+/// data addr. TCP keeps a separate control port for HoL isolation. (This
+/// transport-conditional logic moved here from `autumn-op format`, §2.2.)
+fn build_register_req(
+    advertise: &str,
+    transport: TransportKind,
+    control_port_base: u16,
+    node_uuid: &str,
+    disk_uuids: &[String],
+    shard_ports: &[u16],
+) -> RegisterNodeReq {
+    let control_address = match transport {
+        TransportKind::Ucx => String::new(),
+        _ => {
+            let host = advertise.rsplit_once(':').map_or(advertise, |(h, _)| h);
+            format!("{host}:{control_port_base}")
+        }
+    };
+    RegisterNodeReq {
+        addr: advertise.to_string(),
+        disk_uuids: disk_uuids.to_vec(),
+        shard_ports: shard_ports.to_vec(),
+        control_address,
+        node_uuid: node_uuid.to_string(),
+    }
+}
+
+/// F-EN-DYNSHARD M1: self-register the EN's LIVE location (advertise address +
+/// the shard ports this process actually binds) with the manager at startup.
+/// The manager keys the node by `node_uuid` (M0) and updates the location IN
+/// PLACE — so a changed shard-port layout (a reshard) or a fresh pod IP is
+/// picked up on the next boot without re-running `format`. Retries through a
+/// manager mid-election (30 × 1 s, like PS `register_ps`); fail-stops on a hard
+/// refusal (fenced / decommissioned / cluster mismatch) or on exhaustion — an
+/// EN the manager can't route to must not serve (same rationale as the
+/// multi-shard bind fail-stop).
+async fn register_with_manager(
+    manager: &str,
+    req: &RegisterNodeReq,
+) -> Result<()> {
+    let mut last_err = String::new();
+    for attempt in 1..=30u32 {
+        let step = async {
+            let client = ClusterClient::connect(manager)
+                .await
+                .with_context(|| format!("connect to manager {manager}"))?;
+            let bytes = client
+                .mgr_call(MSG_REGISTER_NODE, rkyv_encode(req))
+                .await
+                .context("register-node RPC")?;
+            let resp: RegisterNodeResp = rkyv_decode(&bytes)
+                .map_err(|e| anyhow::anyhow!("decode RegisterNodeResp: {e}"))?;
+            Ok::<RegisterNodeResp, anyhow::Error>(resp)
+        }
+        .await;
+        match step {
+            Ok(resp) if resp.code == CODE_OK => {
+                tracing::info!(
+                    node_id = resp.node_id,
+                    advertise = %req.addr,
+                    ports = ?req.shard_ports,
+                    "F-EN-DYNSHARD M1: EN self-registered its location with the manager"
+                );
+                return Ok(());
+            }
+            // NOT_LEADER is transient (mid-election) → retry. Any other refusal
+            // (fenced / decommissioned uuid, address conflict, cluster mismatch)
+            // is terminal → fail-stop with the manager's message verbatim.
+            Ok(resp) if resp.code == CODE_NOT_LEADER => {
+                last_err = format!("manager not leader: {}", resp.message);
+            }
+            Ok(resp) => anyhow::bail!(
+                "manager refused EN self-registration: code={} {}",
+                resp.code,
+                resp.message
+            ),
+            Err(e) => last_err = format!("{e:#}"),
+        }
+        tracing::warn!(attempt, error = %last_err, "EN self-register retry");
+        compio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    anyhow::bail!("EN self-registration failed after 30 attempts: {last_err}")
 }
 
 fn main() -> Result<()> {
@@ -522,6 +674,27 @@ fn main() -> Result<()> {
         .map(|i| control_port_base + (i as u16) * args.shard_stride)
         .collect();
 
+    // F-EN-DYNSHARD M1: validate --advertise (optional; enables startup
+    // self-registration). HOST must be an IP (DNS-free per the repo rule — the
+    // shell resolves names) and PORT must equal the shard-0 data port.
+    if let Some(adv) = args.advertise.as_ref() {
+        match adv.parse::<std::net::SocketAddr>() {
+            Ok(sa) if sa.port() == args.port => {}
+            Ok(sa) => {
+                eprintln!(
+                    "error: --advertise port {} must equal --port {} (the shard-0 data port)",
+                    sa.port(),
+                    args.port
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("error: --advertise must be IP:PORT (DNS-free), got {adv:?}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Sibling addresses — used by each shard to forward control-plane RPCs
     // to the owning sibling when a mismatched extent_id arrives. Must use
     // the same bind host so UCX/RoCE connections reach the right address.
@@ -578,6 +751,13 @@ fn main() -> Result<()> {
         let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
         let control_listen_port = control_ports[shard_idx as usize];
+        // F-EN-DYNSHARD M1: shard 0 self-registers the live location. Capture
+        // the full port vector + advertise + control base + transport (unused
+        // by shards > 0).
+        let reg_advertise = args.advertise.clone();
+        let reg_shard_ports = shard_ports.clone();
+        let reg_control_base = control_port_base;
+        let reg_transport = args.transport;
         // F195: capture F194 / F099-I tunable overrides for the thread.
         let ec_par = args.ec_convert_parallelism;
         let rec_par = args.recovery_parallelism;
@@ -622,6 +802,23 @@ fn main() -> Result<()> {
                         if shard_idx == 0 {
                             if let Some(mgr) = manager.as_ref() {
                                 verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+                                // F-EN-DYNSHARD M1: self-register live location +
+                                // shard ports BEFORE any shard serves. Only when
+                                // --advertise is given (else keep the format-stamped
+                                // location, the pre-M1 behavior).
+                                if let Some(adv) = reg_advertise.as_ref() {
+                                    let (node_uuid, disk_uuids) =
+                                        read_node_identity(&data_dirs)?;
+                                    let req = build_register_req(
+                                        adv,
+                                        reg_transport,
+                                        reg_control_base,
+                                        &node_uuid,
+                                        &disk_uuids,
+                                        &reg_shard_ports,
+                                    );
+                                    register_with_manager(mgr, &req).await?;
+                                }
                             }
                         }
 
@@ -722,6 +919,21 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         // F214-D: manager cross-check (skipped when --manager is omitted).
         if let Some(mgr) = args.manager.as_ref() {
             verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+            // F-EN-DYNSHARD M1: self-register live location before serving (a
+            // single-shard node registers `vec![port]`; equivalent routing to
+            // the legacy empty-vec fallback).
+            if let Some(adv) = args.advertise.as_ref() {
+                let (node_uuid, disk_uuids) = read_node_identity(&args.data_dirs)?;
+                let req = build_register_req(
+                    adv,
+                    args.transport,
+                    ctl_port,
+                    &node_uuid,
+                    &disk_uuids,
+                    &[args.port],
+                );
+                register_with_manager(mgr, &req).await?;
+            }
         }
 
         let mut config = ExtentNodeConfig::new_multi(args.data_dirs.clone());
@@ -741,4 +953,46 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         node.serve_with_control(addr, ctl_addr).await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-EN-DYNSHARD M1: the control_address derivation is transport-conditional
+    // (TCP → separate control port; UCX → empty = manager df falls back to the
+    // data addr), and the request must echo the live location + shard ports.
+    #[test]
+    fn build_register_req_tcp_derives_control_address() {
+        let req = build_register_req(
+            "10.0.0.5:9101",
+            TransportKind::Tcp,
+            10101,
+            "uuid-A",
+            &["disk-A".to_string(), "disk-B".to_string()],
+            &[9101, 9111],
+        );
+        assert_eq!(req.addr, "10.0.0.5:9101");
+        assert_eq!(req.control_address, "10.0.0.5:10101");
+        assert_eq!(req.shard_ports, vec![9101u16, 9111]);
+        assert_eq!(req.node_uuid, "uuid-A");
+        assert_eq!(req.disk_uuids, vec!["disk-A".to_string(), "disk-B".to_string()]);
+    }
+
+    #[test]
+    fn build_register_req_ucx_has_empty_control_address() {
+        let req = build_register_req(
+            "10.0.0.5:9101",
+            TransportKind::Ucx,
+            10101,
+            "uuid-A",
+            &["disk-A".to_string()],
+            &[9101],
+        );
+        // UCX can't bind a second listener on the RoCE device → empty control
+        // address → the manager df dials the data addr.
+        assert!(req.control_address.is_empty());
+        assert_eq!(req.addr, "10.0.0.5:9101");
+        assert_eq!(req.shard_ports, vec![9101u16]);
+    }
 }

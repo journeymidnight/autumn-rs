@@ -32,11 +32,12 @@ autumn-manager-server [--port 9001] [--etcd 127.0.0.1:2379,...]
 **Default port**: 9101
 
 ```
-autumn-extent-node --data /path/to/data [,/path/to/data2,...] [--port 9101] [--manager 127.0.0.1:9001]
+autumn-extent-node --data /path/to/data [,/path/to/data2,...] [--port 9101] [--manager 127.0.0.1:9001] [--advertise HOST:PORT]
 ```
 
 - `--data`: directory where extent files are stored (`extent-{id}.dat` + `extent-{id}.meta`). Comma-separated or repeated `--data` flags for multi-disk EN.
 - `--manager`: manager address. F214-D: also used at startup for the cluster_id cross-check.
+- **`--advertise HOST:PORT` (F-EN-DYNSHARD M1, optional):** when set (with `--manager`), the EN **self-registers its live location + shard ports** with the manager at startup (`register_with_manager` from shard 0 / `run_single_shard`, after `verify_manager_cluster_id`, before serving; retry 30×1s, fail-stop on refusal/exhaustion). The manager keys by `node_uuid` (M0) and updates the location IN PLACE, so a changed shard-port layout (a reshard) or a fresh pod IP is picked up on the next boot — the EN, not `format`, is the authoritative source of location. HOST must be an IP (DNS-free); PORT == `--port` (validated). When UNSET, the EN keeps the `format`-stamped location (pre-M1 behavior) — so this is backward-compatible. Reads the `node_uuid` + per-dir `disk_uuid` sentinels (`read_node_identity`, fail-loud). control_address is derived transport-conditionally (TCP → `host:port+1000`; UCX → empty, df falls back to the data addr). **M1a scope**: EN self-register capability; the df-echo self-heal + `format`→identity-only are M1b (feature_list). Test: `build_register_req_*` (EN binary unit tests).
 - **F214-D startup requirements:** each `--data` dir MUST be pre-formatted via `autumn-op format` — the EN refuses to start without the `cluster_id` + `disk_id` sentinel files. Pre-flight checks:
   1. `read_and_verify_cluster_id` (sync, before shard threads): reads `cluster_id` file from each dir, verifies they all agree.
   2. `verify_manager_cluster_id` (async, shard 0 only): fetches the manager's `cluster_id` via `MSG_GET_CLUSTER_ID` and refuses on mismatch.
