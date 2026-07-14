@@ -1,5 +1,37 @@
 Date: 2026-07-14
 TaskStatus: completed
+Task scope: F-EN-FD-LRU chaos test — user "chaos test，尤其测试EN的LRU" (after
+  pulling 0f49369 which added the sealed-only fd LRU). Closes the deferred
+  acceptance: "an EN with >cap owned extents serves the whole set without EMFILE
+  / torn read on eviction."
+Current summary: DONE + RED-GREEN VERIFIED. New in-crate test
+  extent_node::fd_lru_chaos_tests::over_cap_reload_concurrent_churn_bounded_fds_no_torn_read
+  (stream lib 95→96, ~0.3s). Lays down N=150 sealed extents on disk
+  (alloc→append 1500B→durable sealed .meta), RESTARTS via fresh ExtentNode::new
+  (real load_extents marks sealed + drops fds), 8 concurrent readers churn random
+  extents through extent_file (evict/reopen, cap 64<<150) byte-checking; asserts
+  resident fds bounded near cap (EMFILE bound via fd_lru.resident_count()) + no
+  torn read. Reproduce-first: reopen-on-miss NEUTERED → FAILS immediately (reads
+  hit evicted 9000/9041/…); real reopen → PASSES. background.rs/extent_node.rs
+  reverted clean (only the test module added).
+KEY LESSON (reproduce-first caught a vacuous test): a WIRE-level system_chaos
+  draft was silently vacuous — 0 evictions — because a ROLLED extent is NOT
+  sealed on the EN (a plain read never applies the manager seal; only
+  append/re-avali/load_extents do), so the sealed-only LRU never managed it. The
+  red-check (neuter reopen, expect fail) exposed it: the wire test passed WITH
+  reopen broken = it never hit an evicted extent. Pivoted to the in-crate test
+  which seals via apply_extent_meta_durable + reloads via load_extents (the real
+  production path) AND can observe resident_count (the wire path can't).
+Main gaps: NONE for the LRU correctness/fd-bound acceptance. Still deferred: a
+  live multi-disk cross-host EMFILE soak (needs a real many-extent cluster).
+  Also outstanding from the prior owner: F-EN-SHARD-AUTO (passes:false, deploy-
+  layer auto shard-count).
+Next steps: commit+push. Closed.
+
+--- prior task ---
+
+Date: 2026-07-14
+TaskStatus: completed
 Task scope: F-RECOVERY-UNBOUNDED verification — user "git pull, 然后测试修复的
   BUG1/BUG2/BUG3". Closed the two gaps the 2026-07-13 commit (9c36c83) left open:
   coco review PENDING + reproduce-first tests DEFERRED. (Emphasis on BUG2 data

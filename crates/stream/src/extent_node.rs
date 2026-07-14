@@ -9237,3 +9237,170 @@ mod fd_lru_tests {
         assert_eq!(lru.resident_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod fd_lru_chaos_tests {
+    //! F-EN-FD-LRU chaos/stress — closes the deferred acceptance item ("a live EN
+    //! with >cap extents serving without EMFILE / torn read on eviction"). The
+    //! other `fd_lru_tests` drive `FdLru` in isolation with a hand-set cap; this
+    //! drives the PRODUCTION path end to end: write N (>> cap) sealed extents to
+    //! disk, RESTART (`ExtentNode::new` → `load_extents` marks them sealed + drops
+    //! their fds), then hammer them with concurrent `extent_file` reads. Two
+    //! invariants under churn:
+    //!   - resident fds stay BOUNDED near cap (never O(all extents)) — the EMFILE
+    //!     bound the LRU exists to enforce;
+    //!   - every read is byte-exact — eviction never tears a concurrent read
+    //!     (reopen-on-miss returns the right inode; the strong_count guard keeps
+    //!     an in-flight fd alive).
+    //!
+    //! NON-VACUOUS by construction + reproduce-first-checked: the extents are
+    //! sealed on disk, so the reloaded node LRU-manages all N and with cap 64 <<
+    //! N=150 it MUST evict; a run with reopen-on-miss neutered fails here (reads
+    //! genuinely hit evicted extents). An earlier wire-level draft was vacuous —
+    //! rolled extents are never sealed on the EN (a plain read doesn't apply the
+    //! manager's seal), so the sealed-only LRU never touched them.
+    use super::*;
+
+    /// Deterministic, per-index-distinct 1500-byte payload (regenerable for a
+    /// byte-check). 1500 B is a small VP-class value.
+    fn payload(i: usize) -> Vec<u8> {
+        let mut v = vec![0u8; 1500];
+        for (j, b) in v.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(2_654_435_761).wrapping_add(j.wrapping_mul(40_503)) & 0xff) as u8;
+        }
+        v
+    }
+
+    #[compio::test]
+    async fn over_cap_reload_concurrent_churn_bounded_fds_no_torn_read() {
+        // Global fd cache cap = 64 (the setter's minimum). This test is the ONLY
+        // set_fd_cache_cap caller in the crate, so it wins the OnceLock; the other
+        // fd_lru_tests build FdLru with explicit caps and are unaffected. If the
+        // cap failed to take (stayed 4096), the mid-churn bound below fails loudly
+        // (no eviction → residency grows to N), so a wrong cap can't false-pass.
+        set_fd_cache_cap(64);
+        const N: usize = 150; // >> cap ⇒ the reloaded node MUST evict to serve
+        const CAP: usize = 64;
+        const BASE: u64 = 9_000;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        // ── Phase 1: lay down N sealed extents on disk (alloc → append 1500 B →
+        //    durable sealed .meta). This is the on-disk state a restarted EN loads.
+        {
+            let node = ExtentNode::new(ExtentNodeConfig::new(path.clone(), 1))
+                .await
+                .expect("node1");
+            for i in 0..N {
+                let eid = BASE + i as u64;
+                node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+                    .await
+                    .expect("alloc");
+                let ar = AppendResp::decode(
+                    node.handle_append(
+                        AppendReq {
+                            extent_id: eid,
+                            eversion: 1,
+                            commit: 0,
+                            owner_epoch: 0,
+                            payload: Bytes::from(payload(i)),
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(ar.code, CODE_OK, "append {eid} must succeed");
+                // Seal + persist .meta so a reload sees it sealed (LRU-managed).
+                let entry = node.extents.get(&eid).expect("entry").clone();
+                node.apply_extent_meta_durable(
+                    eid,
+                    &entry,
+                    &ExtentInfo {
+                        extent_id: eid,
+                        sealed: true,
+                        sealed_length: 1500,
+                        avali: 1,
+                        eversion: 2,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seal");
+            }
+        }
+
+        // ── Phase 2: RESTART — reload the same dir. load_extents reads N sealed
+        //    .meta, marks each sealed, and DROPS its fd (startup fd peak is
+        //    ~one-at-a-time, NOT O(all extents) — the F-EN-FD-LRU startup win).
+        let node = Rc::new(
+            ExtentNode::new(ExtentNodeConfig::new(path.clone(), 1))
+                .await
+                .expect("node2 reload"),
+        );
+        assert_eq!(node.extents.len(), N, "all {N} extents must reload");
+        assert!(
+            node.fd_lru.resident_count() < N,
+            "post-load resident fds {} must be << N={N} (load_extents drops sealed fds)",
+            node.fd_lru.resident_count()
+        );
+
+        // ── Phase 3: CHAOS — 8 concurrent readers churn random extents through
+        //    extent_file (evict/reopen races on the single shard runtime, a read
+        //    holding its Rc across the pread await while a sibling evicts). Each
+        //    read byte-checks; resident fds stay bounded near cap throughout.
+        let eids: Rc<Vec<u64>> = Rc::new((0..N).map(|i| BASE + i as u64).collect());
+        let mut tasks = Vec::new();
+        for t in 0..8usize {
+            let node = node.clone();
+            let eids = eids.clone();
+            tasks.push(compio::runtime::spawn(async move {
+                for k in 0..300usize {
+                    let i = (t.wrapping_mul(41).wrapping_add(k.wrapping_mul(31))) % eids.len();
+                    let eid = eids[i];
+                    let entry = node.extents.get(&eid).expect("entry").clone();
+                    let f = node
+                        .extent_file(&entry)
+                        .await
+                        .expect("extent_file (reopen-on-miss)");
+                    let got = file_pread(f, 0, 1500).await.expect("pread");
+                    assert_eq!(got, payload(i), "TORN/LOST read of extent {eid} (idx {i})");
+                    // fd bound holds under concurrent churn: cap + in-flight slack
+                    // (≤8 held reads + reopen transients), NEVER growing toward
+                    // O(all)=N. A no-eviction regression makes this blow past.
+                    let resident = node.fd_lru.resident_count();
+                    assert!(
+                        resident <= CAP + 32,
+                        "resident fds {resident} exceeded cap {CAP}+slack mid-churn (fd leak / no eviction?)"
+                    );
+                }
+            }));
+        }
+        // Propagate task panics — compio's spawn wraps the future in catch_unwind,
+        // so a swallowed Result would make a torn read / fd leak a silent
+        // false-positive.
+        for t in tasks {
+            t.await
+                .expect("a reader task panicked (torn read or fd-bound violation)");
+        }
+
+        // Residency stayed bounded far below the N=150 extents that were read —
+        // eviction genuinely happened (not a vacuous all-resident run).
+        assert!(
+            node.fd_lru.resident_count() <= CAP + 32,
+            "post-churn resident fds {} must be bounded (<= cap+slack), not O(all)",
+            node.fd_lru.resident_count()
+        );
+
+        // Final byte-exact sweep of ALL extents — forces a reopen of every one the
+        // churn evicted, confirming no extent was lost/corrupted by the LRU.
+        for (i, &eid) in eids.iter().enumerate() {
+            let entry = node.extents.get(&eid).expect("entry").clone();
+            let f = node.extent_file(&entry).await.expect("extent_file");
+            let got = file_pread(f, 0, 1500).await.expect("pread");
+            assert_eq!(got, payload(i), "post-churn extent {eid} wrong");
+        }
+    }
+}
