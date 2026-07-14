@@ -292,6 +292,53 @@ autumn-op --manager 127.0.0.1:9001 info --part 17  # EXACT size (probes the EN l
 For an idle partition the two match to the byte; for one actively
 GC/compacting they differ transiently — `info --part` is authoritative.
 
+## Tuning `--max-extent-size-bytes` — reclamation granularity vs metadata
+
+`autumn-ps --max-extent-size-bytes` (default **16 GiB**, clamp [1 GiB, 64 GiB])
+is the tail-extent seal threshold. It is set per-PS and applies to **all three
+streams** (log / row / meta) of every partition on that PS. It trades
+**space-reclamation granularity** against **manager/etcd metadata pressure** —
+bigger extents = fewer extents = less metadata, but coarser and more-delayed
+space return to the EN disks.
+
+Why the two streams react differently:
+
+- **`log_stream`** (large values / VP records) reclaims via GC **`punch_holes`**,
+  which is **per-extent** — GC relocates the still-live VPs off an extent, then
+  frees *that specific* extent (not just the oldest). Coarser extents mean GC
+  relocates more bytes per reclaim, but it can still target any sealed extent.
+- **`row_stream`** (SSTables) reclaims **only** via `truncate`, a **prefix**
+  operation: it frees the *oldest* extents, and only once **every** SST inside
+  them has been compacted away (live data merged into newer SSTs). You cannot
+  free a middle extent, and you cannot truncate the current tail. So a partition
+  whose whole row_stream still fits in one 16 GiB extent returns **zero** SST
+  space via truncate until that extent rolls — dead SST bytes accumulate up to
+  ~one extent before any is reclaimed. A full 16 GiB extent holds ~128 × 128 MB
+  SSTs; clearing it takes ~26 minor-compaction rounds (`COMPACT_N=5`/round) plus
+  the matching write amplification.
+
+Pick by workload:
+
+| Workload | row_stream footprint | Recommendation |
+|---|---|---|
+| **Large-value** (fuse / model files / kvcache, most values > 4 KiB) | tiny — SSTs hold only VP pointers + small inline; data lives in log_stream (per-extent GC) | **keep 16 GiB** (or larger). row_stream space-amp is a non-issue; fewer extents wins. |
+| **Small-value, high churn** (all values inline < 4 KiB, heavy overwrite/delete) | row_stream IS the data; dead SST bytes pile up | **lower to 1–4 GiB.** row_stream truncates far sooner; log_stream GC also gets finer-grained. Cost: more extents → more manager/etcd metadata + more append RPCs. |
+| **Mixed / unsure** | — | leave the 16 GiB default; only lower if `autumn-op df` amplification or a partition's `info --part` shows row_stream disk held well above its live size for a sustained period. |
+
+How to see whether it's biting you: `autumn-op df` reports the physical/logical
+amplification; a single partition's held-vs-live gap shows in `autumn-op info
+--part <ID>` (live size probes the EN). If a small-value partition's on-disk
+row_stream sits far above its live SST bytes and stays there across several
+compaction cycles, it is holding an un-truncatable extent's worth of dead SSTs —
+lower `--max-extent-size-bytes` (whole-cluster restart to apply; it is a
+per-process flag, not runtime-tunable). The `--admission-compact-rate-bytes-per-sec`
+knob governs how fast compaction *does* that reclamation work, independently of
+the granularity the extent size sets.
+
+Note: this is a per-PS **restart** flag (no online change); changing it does not
+rewrite existing extents — only new tail rolls use the new size, so the effect
+phases in as old extents are compacted/truncated away.
+
 ## Prometheus /metrics
 
 Every server binary takes an opt-in `--metrics-port <PORT>` flag exposing a
