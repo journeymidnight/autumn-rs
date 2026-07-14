@@ -35,6 +35,12 @@ WORK="$(mktemp -d /tmp/reshard.XXXXXX)"
 FAIL=0
 NKEYS="${RESHARD_NKEYS:-300}"
 EN_PORT=20001
+# Cpuset (=> shard count) for each phase. Defaults use high cores to dodge a
+# busy low-core tenant (Ray) on a shared box; override on a clean/small host,
+# e.g. RESHARD_CPUSET2=0-1 RESHARD_CPUSET4=0-3 RESHARD_CPUSET1=0.
+CPUSET2="${RESHARD_CPUSET2:-180-181}"   # initial 2 shards
+CPUSET4="${RESHARD_CPUSET4:-180-183}"   # reshard to 4
+CPUSET1="${RESHARD_CPUSET1:-180}"       # reshard to 1
 say(){ echo "[reshard $(date +%H:%M:%S)] $*"; }
 fail(){ echo "[reshard $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 
@@ -110,7 +116,7 @@ for i in $(seq 1 35); do b=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|2000[0-
 export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-reshard}"
 rm -rf "$AUTUMN_DATA_ROOT"
 env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp \
-    AUTUMN_EXTENT_SHARDS=2 AUTUMN_EN1_CPUSET=180-181 \
+    AUTUMN_EXTENT_SHARDS=2 AUTUMN_EN1_CPUSET="$CPUSET2" \
     AUTUMN_DATA_ROOT="$AUTUMN_DATA_ROOT" \
     bash "$ROOT/cluster.sh" start 1 > "$WORK/cluster.log" 2>&1
 if ! grep -q "bootstrap succeeded" "$WORK/cluster.log"; then
@@ -134,8 +140,8 @@ sc=$(shard_count); say "shard count before reshard: $sc"
 read_verify baseline
 
 # ============ stop-the-world reshard 2 -> 4, then 4 -> 1 ============
-reshard_to "180-183" 4 "2to4"
-reshard_to "180"     1 "4to1"
+reshard_to "$CPUSET4" 4 "2to4"
+reshard_to "$CPUSET1" 1 "4to1"
 
 # ============================ verdict ============================
 if [ $FAIL -eq 0 ]; then say "PASS — reshard 2->4->1 preserved all $NKEYS keys, zero movement ($WORK)"; else say "FAILED ($WORK)"; fi
