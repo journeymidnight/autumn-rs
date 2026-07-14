@@ -23,6 +23,7 @@ fn register(m: &AutumnManager, addr: &str) -> u64 {
         disk_uuids: vec!["uuid-a".to_string()],
         shard_ports: vec![],
         control_address: String::new(),
+        node_uuid: String::new(),
     };
     let payload = rkyv_encode(&req);
     let resp_bytes = run(m.handle_register_node(payload)).expect("register");
@@ -157,13 +158,15 @@ fn remove_after_fence_succeeds_when_no_refs() {
         disk_uuids: vec!["uuid-a".to_string()],
         shard_ports: vec![],
         control_address: String::new(),
+        node_uuid: String::new(),
     };
-    // Since the tombstone keys by node_id and the in-memory `nodes`
-    // map is also empty, a fresh register at the same addr is allowed
-    // and gets a NEW node_id. The decommissioned tombstone only blocks
-    // re-association with the SAME node_id (the prior_id lookup is
-    // address-based, so an address whose prior_id is decommissioned is
-    // blocked). Verify that branch.
+    // This caller is UUID-LESS (legacy `node_uuid: ""`), so the
+    // F-EN-DYNSHARD tombstone-by-uuid check is skipped (an empty uuid
+    // matches no tombstone), and the removed node is gone from `s.nodes`
+    // — so a fresh register at the same addr is allowed and gets a NEW
+    // node_id. A node carrying its stable `node_uuid` would instead be
+    // refused by the uuid-keyed tombstone (see the manager lib
+    // `f_en_dynshard_decommissioned_uuid_refused_at_new_address` test).
     let resp_bytes = run(m.handle_register_node(rkyv_encode(&req))).expect("re-register");
     let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).expect("decode");
     // After remove, prior nodes entry is gone — register succeeds with
@@ -193,6 +196,7 @@ fn fence_node_then_re_register_refused_before_clear() {
         disk_uuids: vec!["uuid-a".to_string()],
         shard_ports: vec![],
         control_address: String::new(),
+        node_uuid: String::new(),
     };
     let resp_bytes = run(m.handle_register_node(rkyv_encode(&req))).expect("re-register");
     let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).expect("decode");

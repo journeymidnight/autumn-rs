@@ -276,6 +276,13 @@ pub struct MgrNodeInfo {
     /// F191: optional control-plane address. Empty = legacy node;
     /// manager falls back to `address` for DF.
     pub control_address: String,
+    /// F-EN-DYNSHARD M0: stable node identity (UUID v4), decoupled from the
+    /// network address so an EN can change IP / shard-port layout across
+    /// restarts and still be recognised as the SAME node (mirrors the PS's
+    /// `ps_id`-vs-address split). Persisted WITH the node; the manager matches a
+    /// registration by this first (scanning `nodes`), falling back to address
+    /// for uuid-less legacy rows until they adopt. Empty = legacy node.
+    pub node_uuid: String,
 }
 
 /// Disk metadata.
@@ -503,6 +510,15 @@ pub struct RegisterNodeReq {
     /// `host:port + 1000`). Empty = caller wants the manager to fall back
     /// to the data-plane `addr` for DF (legacy / mid-upgrade behaviour).
     pub control_address: String,
+    /// F-EN-DYNSHARD M0: stable node identity (UUID v4), decoupled from the
+    /// network address so a node can change IP / shard-port layout across
+    /// restarts and still be recognised as the SAME node (mirrors the PS's
+    /// `ps_id`-vs-address split). Empty = legacy uuid-less caller (matched by
+    /// address, then adopted). The manager scans `MgrNodeInfo.node_uuid`
+    /// (the identity rides INSIDE the persisted node record — no sidecar
+    /// index); the layout change is a same-commit stop-world deploy requiring
+    /// an etcd reset (repo convention — no rolling upgrade).
+    pub node_uuid: String,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -1344,6 +1360,14 @@ pub struct MgrNodeOverride {
     /// `NodeStateTracker.tick()` automatically clears the override.
     /// `0` = no TTL (Fenced is permanent until explicit clear).
     pub expire_at: u64,
+    /// F-EN-DYNSHARD M0: the fenced/decommissioned node's stable `node_uuid`,
+    /// captured at override time. Load-bearing for the `decommissioned/`
+    /// tombstone: `remove_node` deletes `nodes/<id>`, so after removal the
+    /// node_id→uuid mapping only survives HERE — the re-register zombie check
+    /// scans tombstones by this uuid so a removed node returning under its own
+    /// identity is refused even though its `MgrNodeInfo` is gone. Empty for
+    /// legacy/replayed overrides written before M0 (matches no uuid).
+    pub node_uuid: String,
 }
 
 // --- ListNodeStates (F211-B) ---

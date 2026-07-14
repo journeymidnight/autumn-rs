@@ -228,6 +228,7 @@ fn f099m_register_node_reports_shard_ports() {
                 disk_uuids: vec!["disk-shardtest".to_string()],
                 shard_ports: vec![7001, 7011, 7021, 7031],
                 control_address: String::new(),
+                node_uuid: String::new(),
             };
             let resp = client
                 .call(MSG_REGISTER_NODE, rkyv_encode(&req))
@@ -266,6 +267,7 @@ fn f099m_register_node_reports_shard_ports() {
                 disk_uuids: vec!["disk-legacy".to_string()],
                 shard_ports: vec![],
                 control_address: String::new(),
+                node_uuid: String::new(),
             };
             let resp = client
                 .call(MSG_REGISTER_NODE, rkyv_encode(&req))

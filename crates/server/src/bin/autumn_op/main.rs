@@ -109,6 +109,17 @@ fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
     Ok(Some((cid, did)))
 }
 
+/// Atomically write a sentinel file: write a temp sibling then rename over the
+/// target, so a concurrent / crash-interrupted reader never observes a torn
+/// value. Used for the F-EN-DYNSHARD `node_uuid` identity sentinel, which is
+/// read back verbatim to keep a node's `node_id` stable across re-formats — a
+/// half-written value there would mint a duplicate identity.
+fn write_sentinel_atomic(path: &str, content: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
@@ -1524,6 +1535,56 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
         }
     }
 
+    // F-EN-DYNSHARD M0: resolve the node's stable identity (one node_uuid per
+    // NODE, not per disk) BEFORE registering. Reuse an existing sentinel so a
+    // re-format keeps the same node_id; mint a fresh v4 only when NO dir carries
+    // one. The read is FAIL-LOUD: a NotFound means "to mint", but a
+    // permission/IO/corrupt read must NOT be swallowed as "absent" — that would
+    // mint a NEW identity and create a duplicate node at the same address on the
+    // next register. Disagreeing dirs (a cloned / mixed data set) are refused,
+    // never silently unified.
+    let mut seen_uuids: Vec<String> = Vec::new();
+    for dir in &dirs {
+        let path = format!("{dir}/node_uuid");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let s = s.trim().to_string();
+                if !s.is_empty() && !seen_uuids.contains(&s) {
+                    seen_uuids.push(s);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow!(e)).with_context(|| {
+                    format!(
+                        "read node_uuid sentinel in {dir}; refusing to mint a new \
+                         identity over an unreadable one"
+                    )
+                });
+            }
+        }
+    }
+    if seen_uuids.len() > 1 {
+        bail!(
+            "conflicting node_uuid across --data dirs ({seen_uuids:?}); a mixed or \
+             cloned data set must not be formatted together"
+        );
+    }
+    let node_uuid = seen_uuids
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Persist the identity to EVERY dir (atomic tmp+rename) BEFORE registering.
+    // A crash between a successful register and the sentinel write would
+    // otherwise lose it → the next format mints a fresh uuid → a duplicate node.
+    // Writing it first is safe even if registration then fails: the value is
+    // reused verbatim on the retry (idempotent identity).
+    for dir in &dirs {
+        write_sentinel_atomic(&format!("{dir}/node_uuid"), &node_uuid)
+            .with_context(|| format!("write node_uuid in {dir}"))?;
+    }
+
     // F214-C: register against the manager. Re-register branch
     // (existing address known) returns the existing node_id +
     // matching disk_ids, so idempotency holds end-to-end.
@@ -1550,6 +1611,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
                 disk_uuids: disk_uuids.clone(),
                 shard_ports: shard_ports.clone(),
                 control_address,
+                node_uuid: node_uuid.clone(),
             }),
         )
         .await
@@ -1600,6 +1662,8 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
             .with_context(|| format!("write node_id in {dir}"))?;
         std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
             .with_context(|| format!("write disk_id in {dir}"))?;
+        // F-EN-DYNSHARD M0: the node_uuid sentinel was already persisted (atomic
+        // tmp+rename) to every dir BEFORE registration — nothing to write here.
     }
 
     if json {

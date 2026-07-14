@@ -96,6 +96,7 @@ fn benchmark_append_stream_throughput() {
                     disk_uuids: vec!["disk-bench-1".to_string()],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 }),
             )
             .await
@@ -110,6 +111,7 @@ fn benchmark_append_stream_throughput() {
                     disk_uuids: vec!["disk-bench-2".to_string()],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 }),
             )
             .await

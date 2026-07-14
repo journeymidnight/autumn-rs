@@ -189,6 +189,7 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
             disk_uuids: vec!["uuid-1".to_string()],
             shard_ports: vec![],
             control_address: String::new(),
+            node_uuid: String::new(),
         };
         let bytes = mgr
             .call(MSG_REGISTER_NODE, rkyv_encode(&req))
@@ -220,6 +221,7 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
             disk_uuids: vec!["uuid-1".to_string()],
             shard_ports: vec![],
             control_address: String::new(),
+            node_uuid: String::new(),
         };
         let bytes = mgr
             .call(MSG_REGISTER_NODE, rkyv_encode(&req))

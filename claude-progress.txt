@@ -1,58 +1,50 @@
 Date: 2026-07-14
-TaskStatus: not_completed
-Task scope: (a) de-hardcode the repo (user: the image tag must not live in
-  kustomization.yaml → nor the private registry → nor personal paths); (b) rebuild and
-  redeploy, measuring PS restart/recovery time (the F-RECOVERY-UNBOUNDED acceptance);
-  (c) trim the ledgers per CLAUDE.md rule 13.
+TaskStatus: completed
+Task scope: F-EN-DYNSHARD M0 — make the EN shard count dynamically changeable +
+  k8s-ready by giving the EN a STABLE UUID identity decoupled from its network
+  address (mirrors the PS ps_id-vs-address split). M0 = identity plumbing only
+  (no routing/reshard change yet). Locked design (user 2026-07-14): #2→(a) keep
+  extent_id%shard_count + shared dirs (reshard moves ZERO bytes); #4→全停全启;
+  #3→mirror the PS registration model. Pivot: no back-compat, etcd reset OK →
+  node_uuid rides IN-STRUCT on persisted MgrNodeInfo (same-commit stop-world).
+  Authoritative design: docs/en_dynamic_shard_design.md.
 
 Current summary:
-  DONE — de-hardcoding. Repo now has ZERO of: 40-char image SHAs, the private
-    container registry / account namespace, personal absolute home/data paths,
-    credentials. (This is a PUBLIC repo — none of that belongs in git.)
-    - deploy/overlays/vke/kustomization.yaml: the autumn-rs image (registry AND
-      tag) is no longer committed — both are deployer state. Manifests keep the
-      base placeholder `autumn-rs:latest`; a bare `kubectl apply -k` now fails
-      loudly instead of shipping a stale image.
-    - NEW deploy/overlays/vke/deploy.sh: reads AUTUMN_IMAGE_REPO / AUTUMN_IMAGE_TAG
-      from the env, renders + injects at apply time, so a deploy never dirties git.
-      `--restart` also does the stop-the-world restart (for recovery timing).
-    - scripts/crosshost_chaos.sh: host addrs + 3 paths are now REQUIRED env
-      (AUTUMN_LOCAL_IP / AUTUMN_REMOTE_IP / AUTUMN_REMOTE_ROOT / AUTUMN_LOCAL_DATA /
-      AUTUMN_REMOTE_DATA); no infra values in git.
-    - scripts/README.md, docs/ops.md, feature_list.md, background.rs (comment):
-      personal paths → repo-relative / $HERMES_DIR / neutral.
-  DONE — ledger cleanup (rule 13). feature_list.md 309 → 35 lines: completed
-    features DELETED (not archived; git is the record) — only the 3 OPEN ones
-    remain (F-EN-SHARD-AUTO, F-FENCE-SEAL, F-DIRECT-MANY). docs/feature_list_archive.md
-    (5792 lines) DELETED outright per user. claude-progress.txt trimmed to this
-    single handoff entry (was 742 lines).
-  DONE — image built. CP pipeline autumn-rs run #17 Succeeded on main HEAD
-    0f493696fac55b8fcec5cda01858200a3895fb36 (contains F-RECOVERY-UNBOUNDED +
-    F-EN-NOFILE + F-EN-FD-LRU).
-  DONE (concurrent session) — the two reproduce-first tests this session had
-    DEFERRED are now on main: system_gc_floor_durable_ckpt.rs (F-RECOVERY BUG2
-    GC-floor data-safety, red-green verified) and extent_node::fd_lru_chaos_tests
-    (F-EN-FD-LRU over-cap reload + concurrent churn: bounded fds, no torn read;
-    red-green verified). NOTE: the image above predates the chaos test — it is a
-    test-only addition, so the deployed binary is unaffected.
+  DONE — M0 code + tests + docs, all green, ready to commit.
+    - WIRE v19 (MIN=MAX=19, fp ba8a88d46f0bbc47): RegisterNodeReq.node_uuid +
+      MgrNodeInfo.node_uuid (in-struct, persisted → etcd-reset deploy).
+    - manager handle_register_node REWRITTEN: identity resolved UUID-FIRST
+      (uuid match → same node_id across addr/shard-port change; uuid-less legacy
+      → address match + ADOPT uuid; fresh uuid on recycled IP → new node);
+      zombie/decommission tombstone keyed by the matched node_id (uuid, not IP);
+      updates address/shard_ports/control_address in place on change.
+    - autumn-op format: mints a UUID v4 (reuses per-dir `node_uuid` sentinel if
+      present), passes it on MSG_REGISTER_NODE, writes the sentinel to each dir.
+    - 26 RegisterNodeReq construction sites across 15 files fixed (rkyv full
+      literals, no Default) — incl. the 2 the bulk perl missed on
+      `format!("...{i}...")` braces (stream_sqcq.rs, lib.rs:5095).
+    - 5 acceptance tests `f_en_dynshard_*` in crates/manager/src/lib.rs:
+      uuid-survives-address-change / legacy-adopts-uuid /
+      identity-only-preserves-address / decommissioned-uuid-refused-at-new-addr /
+      recycled-ip-under-fresh-uuid-accepted. ALL GREEN.
+    - Tests: rpc lib 44, manager lib 187 (was 182 + 5), stream lib 96 — all
+      green. Workspace + ALL test targets build clean.
+    - Ledgers/docs: feature_list.md F-EN-DYNSHARD entry (M0 done, M1/M2/M3 open;
+      unblocks F-EN-SHARD-AUTO); docs/ops.md "EN identity is a UUID" subsection.
+    - coco deep review: RUNNING at handoff (background). Address any P0/P1 before
+      or immediately after commit.
 
 Main gaps:
-  NOT DONE — the redeploy + PS-restart timing. kubectl to the VKE API
-  (…:6443) was unreachable the whole session (TCP reset / hang, even with
-  --request-timeout) — a local VPN/network issue, not the cluster. Nothing was
-  applied; the cluster still runs the OLD image.
-  Also open: internal IPv6 ULAs (fdbd:dc62:3:302::14/::15) still appear in 5
-  files (perf docs / doc-comments / cluster.sh examples). NOT personal paths and
-  not credentials (RFC-4193 private, non-routable); left as-is pending a call.
+  M1 (EN startup self-register + df-echo self-heal — the milestone that makes the
+    shard COUNT actually dynamic), M2 (deploy: reshard runbook + k8s per-pod
+    ClusterIP + Service port generation), M3 (chaos: reshard under load) — all OPEN.
+  docs/en_dynamic_shard_design.md is still UNCOMMITTED (760-line design, by the
+    fable subagent) — commit it alongside M0.
 
 Next steps:
-  1. Restore VPN/network to the cluster API, then:
-       export AUTUMN_IMAGE_REPO=<registry>/<ns>/autumn-rs
-       export AUTUMN_IMAGE_TAG=0f493696fac55b8fcec5cda01858200a3895fb36
-       deploy/overlays/vke/deploy.sh --restart
-  2. Measure PS reopen wallclock from the PS logs — the F-RECOVERY-UNBOUNDED
-     acceptance (BUG3: all "opening partition" timestamps should cluster
-     CONCURRENTLY, not serialize; BUG1: per-partition replay no longer scales
-     with dataset size). Baseline to beat: PS loss took ~8-11 min worst case
-     (32 partitions all on ps-2, opened serially).
-  3. Commit the de-hardcoding + ledger cleanup (uncommitted at handoff).
+  1. Confirm coco findings clean (or fix P0/P1), then commit + push M0 to main
+     (git push origin main — solo flow, no PR).
+  2. Start M1: EN process re-reports address + live shard_ports[] at startup;
+     manager shard_addr_for_extent computes from registered shard_ports; DfResp
+     echo self-heal on node_health_loop. EN location stays etcd-persisted (manager
+     DIALS the EN — in-memory would blackout on manager restart).

@@ -2196,3 +2196,47 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     the leader-gated `autumn-manager` Service. Cross-ref: notes 15 (F149 fence),
     16/18 (F183/F187/F202 advisory engine), 17 (F185 merge freeze), 29 (F228
     spawn_supervised).
+
+44. **F-EN-DYNSHARD M0 — the EN is identified by a UUID, resolved UUID-FIRST in
+    `handle_register_node`.** The EN's stable identity is `MgrNodeInfo.node_uuid`
+    (an in-struct persisted field, WIRE v19 — mirrors the PS `ps_id`-vs-address
+    split), NOT its network address. This is the ground floor for making the
+    shard count dynamically changeable (M1) + surviving k8s pod reschedules
+    (fresh IP per restart). Identity resolution order in `handle_register_node`:
+    - **uuid present + matches a node's `node_uuid`** → that `node_id` (the
+      address/`shard_ports`/`control_address` may have CHANGED — the handler
+      updates them IN PLACE, etcd-first, instead of minting a duplicate node);
+    - **uuid present + no uuid match, but the address matches a UUID-LESS
+      (legacy, pre-M0) node** → that node ADOPTS the uuid (one-time migration);
+    - **uuid present + no uuid match + address matches a node with a DIFFERENT
+      non-empty uuid** → REFUSE `CODE_PRECONDITION` (address conflict — one
+      address may host only one node record; two would make one physical EN two
+      failure domains → RF double-placement, and the df loop keeps both Online
+      from the single EN's heartbeat since there is no identity echo until M1);
+    - **uuid present + no address match** → a genuinely NEW node (create);
+    - **uuid-less caller** → legacy address match (re-register), else create.
+    **Tombstone is keyed by the UUID and SURVIVES node deletion (coco/fable
+    P1):** `remove_node` deletes `nodes/<id>`, so a matched-`node_id` check
+    alone would miss a fully-removed node. The fence/remove tombstones therefore
+    carry `MgrNodeOverride.node_uuid`, and a uuid-keyed PRE-check (scan
+    `decommissioned/` + Fenced `node_overrides` by uuid, BEFORE resolution)
+    refuses a fenced/decommissioned node returning under its own identity at ANY
+    address. `handle_clear_node_override` lifts BOTH `node_override/` AND
+    `decommissioned/` so the refusal message has a real remedy. The
+    matched-`node_id` Fenced check is kept for uuid-less legacy registrants.
+    **Recycled pod IP** is legitimate only AFTER the old node is fence+removed
+    (gone from `s.nodes` → the address-conflict refusal falls through to create).
+    **Identity-only re-register** (`req.addr` empty — the M1 `format` re-stamp
+    shape) NEVER touches location: `addr`/`shard_ports`/`control_address` update
+    together and ONLY when `req.addr` is non-empty (empty ports/ctrl mean
+    "unspecified", NOT "clear them" — a torn shard route would black-hole shards
+    1..N). `autumn-op format` mints a UUID v4 once (fail-loud multi-dir sentinel
+    read, atomic persist BEFORE register so a crash can't drift the identity).
+    **M0 is identity plumbing only — the shard COUNT is still frozen at format
+    time; M1 adds the EN startup self-register of live `shard_ports[]` that makes
+    it dynamic.** Same-commit stop-world deploy (etcd reset — no rolling upgrade
+    across the `MgrNodeInfo` / `MgrNodeOverride` layout change).
+    Design: `docs/en_dynamic_shard_design.md`. Tests: `f_en_dynshard_*` (6, lib).
+    Cross-ref: notes 23/24 (F211/F214 node lifecycle — the tombstone + Suspend
+    state this reshapes to uuid-keyed), 35 (F265 owner_epoch — the PS
+    registration model this mirrors for the EN).

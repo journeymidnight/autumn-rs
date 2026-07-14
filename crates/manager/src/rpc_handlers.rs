@@ -867,63 +867,166 @@ impl AutumnManager {
         let req: RegisterNodeReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F211-C #2: zombie defense. Refuse re-registration when the
-        // address is associated with a decommissioned node_id or a
-        // currently-Fenced override. The operator must explicitly
-        // `mgr_clear_node_override` before the node can come back.
-        {
+        // F-EN-DYNSHARD M0: resolve node identity BEFORE any decision. The
+        // `node_uuid` is the STABLE key (mirrors the PS `ps_id`); the address is
+        // just current location. Precedence:
+        //   - uuid in the index          → that node (uuid match, no adopt);
+        //   - new uuid + address matches a UUID-LESS (legacy) node
+        //                                → that node ADOPTS this uuid;
+        //   - new uuid + address matches a node that ALREADY has a (different)
+        //     uuid, or no address match  → a genuinely NEW node (create) — this
+        //     is what lets a fresh node take over a decommissioned node's IP;
+        //   - uuid-less caller           → legacy address match, no adopt.
+        // `addr_conflict` carries the `node_id` currently holding `req.addr`
+        // under a DIFFERENT non-empty uuid (see the create-refusal below).
+        let (matched, adopt, addr_conflict): (Option<u64>, bool, Option<u64>) = {
             let s = self.store.inner.borrow();
-            let prior = s
-                .nodes
+            if !req.node_uuid.is_empty() {
+                if let Some(nid) = s
+                    .nodes
+                    .values()
+                    .find(|n| n.node_uuid == req.node_uuid)
+                    .map(|n| n.node_id)
+                {
+                    (Some(nid), false, None)
+                } else if !req.addr.is_empty() {
+                    // New uuid: ADOPT an existing UUID-LESS (legacy) node at this
+                    // address; a node that already has a (different) uuid means
+                    // the address is claimed by a live node under another
+                    // identity → REFUSE (do not create a second record at one
+                    // address — see the conflict return below).
+                    match s.nodes.values().find(|n| n.address == req.addr) {
+                        Some(n) if n.node_uuid.is_empty() => (Some(n.node_id), true, None),
+                        Some(n) => (None, false, Some(n.node_id)),
+                        None => (None, false, None),
+                    }
+                } else {
+                    (None, false, None)
+                }
+            } else if !req.addr.is_empty() {
+                (
+                    s.nodes
+                        .values()
+                        .find(|n| n.address == req.addr)
+                        .map(|n| n.node_id),
+                    false,
+                    None,
+                )
+            } else {
+                (None, false, None)
+            }
+        };
+
+        // F-EN-DYNSHARD M0 (#1): tombstone-by-UUID. The decommission/fence
+        // tombstone travels with the stable identity even after `remove_node`
+        // deletes `nodes/<id>` (which is why `matched` would be None). Scan the
+        // tombstones by uuid so a removed/fenced node returning under its own
+        // identity — at ANY address — is refused, per the F211 decommission
+        // runbook. Empty tombstone uuids (legacy/pre-M0) match nothing.
+        if !req.node_uuid.is_empty() {
+            let tombstoned = self
+                .decommissioned
+                .borrow()
                 .values()
-                .find(|n| n.address == req.addr)
-                .map(|n| n.node_id);
-            if let Some(pid) = prior {
-                if self.decommissioned.borrow().contains_key(&pid) {
+                .any(|o| o.node_uuid == req.node_uuid)
+                || self
+                    .node_overrides
+                    .borrow()
+                    .values()
+                    .any(|o| o.kind == NODE_OVERRIDE_FENCED && o.node_uuid == req.node_uuid);
+            if tombstoned {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "node_uuid {} was fenced/decommissioned; clear it \
+                         (`autumn-op unfence <id>`) or wipe the data dirs for a \
+                         fresh identity before rejoining",
+                        req.node_uuid
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+        }
+
+        // F-EN-DYNSHARD M0 (#3): never create a SECOND node record at an address
+        // a live node already holds under a different uuid. Two records at one
+        // address make one physical EN look like two failure domains — RF
+        // double-placement — and the df loop (no identity echo until M1) would
+        // keep BOTH Online from the single EN's heartbeat. The recycled-pod-IP
+        // case is legitimate ONLY after the old node is fence+removed (gone from
+        // `s.nodes` → no conflict). Fail loud; the operator removes the old
+        // record first.
+        if let Some(holder) = addr_conflict {
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "address {} is held by node {} under a different uuid; \
+                     fence + remove it before reusing the address",
+                    req.addr, holder
+                ),
+                node_id: 0,
+                disk_uuids: vec![],
+            }));
+        }
+
+        // F211-C #2 zombie defense — UUID-KEYED via the matched node. The
+        // decommission/Fence tombstone travels with the NODE, not the IP: a
+        // recycled pod IP under a fresh uuid is not falsely refused, and a
+        // decommissioned node returning under its own uuid at any address IS.
+        if let Some(pid) = matched {
+            if self.decommissioned.borrow().contains_key(&pid) {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "node {pid} was previously decommissioned; operator must clear tombstone"
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+            if let Some(o) = self.node_overrides.borrow().get(&pid) {
+                if o.kind == NODE_OVERRIDE_FENCED {
                     return Ok(rkyv_encode(&RegisterNodeResp {
                         code: CODE_PRECONDITION,
                         message: format!(
-                            "address {} was previously decommissioned (node {}); operator must clear tombstone",
-                            req.addr, pid
+                            "node {pid} is Fenced; operator must clear override before re-registering"
                         ),
                         node_id: 0,
                         disk_uuids: vec![],
                     }));
                 }
-                if let Some(o) = self.node_overrides.borrow().get(&pid) {
-                    if o.kind == NODE_OVERRIDE_FENCED {
+            }
+        }
+
+        // Re-registration / update path. Reuse the matched node_id + disk_ids
+        // rather than rejecting, so an EN recovers from a restart (possibly at a
+        // new address / shard layout) without a cluster wipe.
+        if let Some(node_id) = matched {
+            let (mut existing_node, existing_disks) = {
+                let s = self.store.inner.borrow();
+                match s.nodes.get(&node_id).cloned() {
+                    Some(n) => {
+                        let disks = n
+                            .disks
+                            .iter()
+                            .filter_map(|did| s.disks.get(did).cloned())
+                            .collect::<Vec<_>>();
+                        (n, disks)
+                    }
+                    None => {
+                        // uuid index points at a node that's gone — stale; the
+                        // caller retries and the create path takes over.
                         return Ok(rkyv_encode(&RegisterNodeResp {
                             code: CODE_PRECONDITION,
-                            message: format!(
-                                "node {} is Fenced; operator must clear override before re-registering",
-                                pid
-                            ),
+                            message: format!("node {node_id} identity index stale; retry"),
                             node_id: 0,
                             disk_uuids: vec![],
                         }));
                     }
                 }
-            }
-        }
+            };
 
-        // Re-registration: if the address is already known, reuse the existing
-        // node_id and disk_ids rather than rejecting. This allows extent nodes
-        // to recover from a restart without requiring a full cluster wipe.
-        let existing = {
-            let s = self.store.inner.borrow();
-            s.nodes.values().find(|n| n.address == req.addr).map(|n| {
-                (
-                    n.clone(),
-                    n.disks
-                        .iter()
-                        .filter_map(|did| s.disks.get(did).cloned())
-                        .collect::<Vec<_>>(),
-                )
-            })
-        };
-
-        if let Some((mut existing_node, existing_disks)) = existing {
-            let node_id = existing_node.node_id;
             let uuid_map: Vec<(String, u64)> = req
                 .disk_uuids
                 .iter()
@@ -935,33 +1038,45 @@ impl AutumnManager {
                 })
                 .collect();
 
-            if uuid_map.is_empty() {
+            if uuid_map.is_empty() && !req.disk_uuids.is_empty() {
                 return Ok(rkyv_encode(&RegisterNodeResp {
                     code: CODE_PRECONDITION,
                     message: format!(
-                        "address {} already registered by node {} with different disks",
-                        existing_node.address, node_id
+                        "node {node_id} matched but no disk_uuid overlaps — cloned identity file?"
                     ),
                     node_id: 0,
                     disk_uuids: vec![],
                 }));
             }
 
-            // Update shard_ports + control_address if the node restarted
-            // with a different config.
-            // F152: etcd-first ordering (CLAUDE.md note 1) — mirror to etcd
-            // BEFORE updating in-memory store. The shard_ports change drives
-            // route resolution; a crash mid-mirror leaves the new leader
-            // routing to the OLD shard layout while the deposed leader's
-            // memory had the new one.
-            // F191: same applies to `control_address` — the manager's DF
-            // probe uses it; updating in-memory before mirror could cause
-            // the new leader to inherit a stale value on replay.
-            if existing_node.shard_ports != req.shard_ports
-                || existing_node.control_address != req.control_address
-            {
-                existing_node.shard_ports = req.shard_ports;
-                existing_node.control_address = req.control_address;
+            // Update location if changed. An identity-only re-register (empty
+            // `addr` — the M1 `format` re-stamp shape) carries NO live location,
+            // so it must not touch address/shard_ports/control_address at all
+            // (an empty `shard_ports`/`control_address` there is "unspecified",
+            // NOT "clear them"). Only a real self-registration (non-empty addr,
+            // which always ships the live ports + ctrl) updates routing. A
+            // reshard rides this path: the EN re-registers with the SAME addr
+            // and NEW shard_ports → `ports_changed` fires.
+            // F152/F191: etcd-first — mirror (node + optional uuid adoption)
+            // BEFORE the in-memory apply; a crash mid-mirror leaves the new
+            // leader routing to the OLD layout, never a half-applied new one.
+            let has_location = !req.addr.is_empty();
+            let addr_changed = has_location && existing_node.address != req.addr;
+            let ports_changed = has_location && existing_node.shard_ports != req.shard_ports;
+            let ctrl_changed = has_location && existing_node.control_address != req.control_address;
+            if addr_changed || ports_changed || ctrl_changed || adopt {
+                if addr_changed {
+                    existing_node.address = req.addr.clone();
+                }
+                if ports_changed {
+                    existing_node.shard_ports = req.shard_ports.clone();
+                }
+                if ctrl_changed {
+                    existing_node.control_address = req.control_address.clone();
+                }
+                if adopt {
+                    existing_node.node_uuid = req.node_uuid.clone();
+                }
                 if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
                     return Ok(rkyv_encode(&RegisterNodeResp {
                         code: Self::err_to_code(&err),
@@ -1022,6 +1137,7 @@ impl AutumnManager {
                 disks: disk_ids,
                 shard_ports: req.shard_ports,
                 control_address: req.control_address,
+                node_uuid: req.node_uuid,
             };
             (node, disk_infos, uuid_map, node_id)
         };
@@ -4899,6 +5015,14 @@ impl AutumnManager {
             .await;
             return Self::code_resp(CODE_PRECONDITION, msg);
         }
+        let node_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
         let ovr = MgrNodeOverride {
             node_id: req.node_id,
             kind: NODE_OVERRIDE_MAINTENANCE,
@@ -4906,6 +5030,7 @@ impl AutumnManager {
             set_by: req.set_by.clone(),
             reason: req.reason.clone(),
             expire_at: req.expire_at,
+            node_uuid,
         };
         let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
         let value = rkyv_encode(&ovr).to_vec();
@@ -4947,8 +5072,16 @@ impl AutumnManager {
         let req: ClearNodeOverrideReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        // F-EN-DYNSHARD M0: also lift the `decommissioned/` tombstone so this is
+        // a REAL remedy for the re-register refusal message (the uuid-keyed
+        // zombie check scans that prefix; without clearing it, a removed node
+        // could never rejoin under its old identity).
+        let tomb_key = format!("{}{}", crate::DECOMMISSIONED_PREFIX, req.node_id);
         if let Some(etcd) = &self.etcd {
-            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+            if let Err(err) = etcd
+                .put_and_delete_txn(Vec::new(), vec![key, tomb_key])
+                .await
+            {
                 self.append_audit(MgrAuditEntry {
                     op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
                     node_id: req.node_id,
@@ -4964,6 +5097,7 @@ impl AutumnManager {
             }
         }
         self.node_overrides.borrow_mut().remove(&req.node_id);
+        self.decommissioned.borrow_mut().remove(&req.node_id);
         self.append_audit(MgrAuditEntry {
             op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
             node_id: req.node_id,
@@ -5027,7 +5161,17 @@ impl AutumnManager {
         if !req.force {
             self.check_capacity_for_fence(req.node_id)?;
         }
-        // Persist the override.
+        // Persist the override. F-EN-DYNSHARD M0: capture the node's stable
+        // uuid so the tombstone-by-uuid re-register check survives a later
+        // `remove_node` (which deletes `nodes/<id>`).
+        let node_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
         let ovr = MgrNodeOverride {
             node_id: req.node_id,
             kind: NODE_OVERRIDE_FENCED,
@@ -5035,6 +5179,7 @@ impl AutumnManager {
             set_by: req.set_by.clone(),
             reason: req.reason.clone(),
             expire_at: 0,
+            node_uuid,
         };
         let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
         let value = rkyv_encode(&ovr).to_vec();
@@ -5169,6 +5314,17 @@ impl AutumnManager {
         // All clear — persist tombstone + delete override + delete
         // nodes/<id> + delete disks/<id>. Single atomic txn.
         let now = Self::epoch_seconds();
+        // F-EN-DYNSHARD M0: capture the uuid BEFORE the `s.nodes.remove` below —
+        // the tombstone is the only place the node_id→uuid mapping survives the
+        // node-record deletion, and the re-register zombie check scans it by uuid.
+        let removed_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
         let tomb = MgrNodeOverride {
             node_id: req.node_id,
             kind: NODE_OVERRIDE_FENCED,
@@ -5176,6 +5332,7 @@ impl AutumnManager {
             set_by: req.set_by.clone(),
             reason: "removed".to_string(),
             expire_at: 0,
+            node_uuid: removed_uuid,
         };
         let tomb_key = format!("{}{}", crate::DECOMMISSIONED_PREFIX, req.node_id);
         let tomb_val = rkyv_encode(&tomb).to_vec();

@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 18;
-pub const WIRE_VERSION_MAX: u32 = 18;
+pub const WIRE_VERSION_MIN: u32 = 19;
+pub const WIRE_VERSION_MAX: u32 = 19;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -196,6 +196,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // dead-vs-live breakdown that includes the open-tail debt gc_debt hid.
     // Same-commit deploy (MIN=MAX=18).
     (18, "dd40c423722d2a44"),
+    // v19: F-EN-DYNSHARD M0 — RegisterNodeReq + MgrNodeInfo grew `node_uuid:
+    // String` (stable node identity decoupled from the address, so an EN can
+    // self-register a changed IP / shard-port layout and stay the same node).
+    // MgrNodeInfo is persisted, so this is a same-commit STOP-THE-WORLD deploy
+    // that requires an etcd reset (no migration). Fingerprint filled after the
+    // build test reports it.
+    (19, "44ac1df3e38f6e77"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

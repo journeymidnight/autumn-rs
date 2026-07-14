@@ -576,6 +576,42 @@ Dead-EN notes (fence a node that's already unreachable):
   rebalancer assigns one (the sweep WARNs per cooldown). Manager-unilateral
   seal is a recorded follow-up, not built.
 
+### EN identity is a UUID, not an address (F-EN-DYNSHARD M0)
+
+An extent node's stable identity is a **UUID**, decoupled from its network
+address — the same split the PS already has (`ps_id` vs advertise address).
+`autumn-op format` mints a UUID v4 once and stamps it into a `node_uuid`
+sentinel file in **every** `--data` dir (reused verbatim on a re-format, so a
+re-format keeps the same `node_id`). It rides on `MSG_REGISTER_NODE`, and the
+manager keys the node by it:
+
+- **IP / shard-port change keeps the `node_id`.** A node that comes back at a
+  different address (k8s pod reschedule) or with a changed shard-port layout is
+  recognised by its UUID — the manager updates the routing address in place
+  instead of minting a duplicate node. `list-nodes` shows the same `node_id`.
+- **The fence / decommission tombstone is keyed by the UUID and survives
+  removal.** A fenced/decommissioned node returning under its own UUID — at
+  *any* address, and even after `remove` deleted its node record — is refused.
+  Clear it with `autumn-op unfence <id>` (which now also lifts the
+  `decommissioned/` tombstone) before it can rejoin, or wipe its data dirs for
+  a fresh identity.
+- **One address hosts exactly one node.** A *different* UUID registering at an
+  address a live node already holds is **refused** (`CODE_PRECONDITION`) — two
+  records at one address would make one physical EN two failure domains. To
+  recycle a pod IP for a genuinely new node, `fence` + `remove` the old node
+  first (freeing its address); the fresh UUID is then accepted.
+- **Legacy (uuid-less) nodes are adopted.** A node that first registered before
+  M0 (empty UUID) adopts the UUID on its next register at the same address.
+
+M0 is identity plumbing only — the shard COUNT is still frozen at `format` time
+(the EN does not yet re-report its live `shard_ports[]` at startup). Making the
+shard count dynamically changeable + the stop-the-world reshard runbook are
+M1/M2; the full design (including the k8s topology and the reshard steps) is in
+[`en_dynamic_shard_design.md`](en_dynamic_shard_design.md). **Deploy note:** the
+`node_uuid` field is in-struct on the persisted `MgrNodeInfo` (WIRE v19) — a
+same-commit stop-world upgrade that requires an **etcd reset** (`cluster.sh
+reset`); there is no rolling upgrade across this change.
+
 ## autumn-memory verification
 
 `crates/autumn-memory` turns the cluster into an AI-agent-memory backend

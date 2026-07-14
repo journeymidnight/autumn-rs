@@ -4015,6 +4015,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         disks: &[MgrDiskInfo],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
+            // F-EN-DYNSHARD M0: `node.node_uuid` (the stable identity) rides
+            // inside the persisted `MgrNodeInfo` — no separate index kv.
             let mut kvs = Vec::with_capacity(1 + disks.len());
             kvs.push(Self::kv_entry("nodes", node.node_id, node));
             for disk in disks {
@@ -4186,6 +4188,7 @@ mod tests {
                 disks: vec![disk_id],
                 shard_ports: vec![],
                 control_address: format!("127.0.0.1:{}", 10100 + node_id),
+                node_uuid: String::new(),
             },
         );
         s.disks.insert(
@@ -4357,6 +4360,7 @@ mod tests {
                 disk_uuids: vec!["d1".to_string()],
                 shard_ports: vec![],
                 control_address: String::new(),
+                node_uuid: String::new(),
             });
             let resp = m.handle_register_node(req).await.unwrap();
             let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
@@ -4367,10 +4371,205 @@ mod tests {
                 disk_uuids: vec!["d2".to_string()],
                 shard_ports: vec![],
                 control_address: String::new(),
+                node_uuid: String::new(),
             });
             let resp2 = m.handle_register_node(req2).await.unwrap();
             let r2: RegisterNodeResp = rkyv_decode(&resp2).unwrap();
             assert_eq!(r2.code, CODE_PRECONDITION);
+        })
+    }
+
+    // --- F-EN-DYNSHARD M0 acceptance matrix: UUID identity vs address ---
+
+    async fn reg_node(
+        m: &AutumnManager,
+        uuid: &str,
+        addr: &str,
+        disk: &str,
+        shard_ports: &[u16],
+        ctrl: &str,
+    ) -> RegisterNodeResp {
+        let req = rkyv_encode(&RegisterNodeReq {
+            addr: addr.to_string(),
+            disk_uuids: vec![disk.to_string()],
+            shard_ports: shard_ports.to_vec(),
+            control_address: ctrl.to_string(),
+            node_uuid: uuid.to_string(),
+        });
+        let resp = m.handle_register_node(req).await.unwrap();
+        rkyv_decode(&resp).unwrap()
+    }
+
+    /// The headline M0 capability: a node keeps its `node_id` across an
+    /// address change because the UUID — not the IP — is its identity. This is
+    /// the k8s reschedule case (pod gets a fresh IP but the same PVC/uuid).
+    #[test]
+    fn f_en_dynshard_uuid_match_survives_address_change() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "10.0.0.1:9100").await;
+            assert_eq!(r1.code, CODE_OK);
+            let nid = r1.node_id;
+
+            // SAME uuid, DIFFERENT address + shard ports (pod rescheduled).
+            let r2 = reg_node(&m, "uuid-A", "10.0.0.2:9111", "disk-A", &[9111], "10.0.0.2:9110").await;
+            assert_eq!(r2.code, CODE_OK);
+            assert_eq!(
+                r2.node_id, nid,
+                "uuid identity must map to the SAME node_id across an address change"
+            );
+            let s = m.store.inner.borrow();
+            let n = &s.nodes[&nid];
+            assert_eq!(n.address, "10.0.0.2:9111", "routing address follows the uuid");
+            assert_eq!(n.shard_ports, vec![9111u16], "shard-port layout updates in place");
+            assert_eq!(n.control_address, "10.0.0.2:9110");
+            assert_eq!(n.node_uuid, "uuid-A");
+        })
+    }
+
+    /// A pre-M0 (uuid-less) node re-registering WITH a uuid at the same
+    /// address ADOPTS that uuid; afterwards the uuid alone (any address)
+    /// resolves to the same node — the legacy→identity migration path.
+    #[test]
+    fn f_en_dynshard_legacy_address_node_adopts_uuid() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 = reg_node(&m, "", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            assert_eq!(r1.code, CODE_OK);
+            let nid = r1.node_id;
+            assert!(m.store.inner.borrow().nodes[&nid].node_uuid.is_empty());
+
+            // Restart WITH a uuid at the same address → adopt (no new node).
+            let r2 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            assert_eq!(r2.code, CODE_OK);
+            assert_eq!(r2.node_id, nid);
+            assert_eq!(m.store.inner.borrow().nodes[&nid].node_uuid, "uuid-A");
+
+            // The uuid is now the stable key — resolves even at a fresh address.
+            let r3 = reg_node(&m, "uuid-A", "10.9.9.9:9101", "disk-A", &[9101], "").await;
+            assert_eq!(r3.node_id, nid, "after adoption the uuid outranks the address");
+        })
+    }
+
+    /// An identity-only re-register (uuid + EMPTY addr/ports/ctrl — the M1
+    /// `format` re-stamp shape) is idempotent and must NEVER clobber ANY live
+    /// routing metadata: empty ports/ctrl mean "unspecified", NOT "clear them".
+    #[test]
+    fn f_en_dynshard_identity_only_reregister_preserves_location() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 =
+                reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101, 9102], "10.0.0.1:10101")
+                    .await;
+            let nid = r1.node_id;
+
+            // uuid + empty addr + empty ports + empty ctrl.
+            let r2 = reg_node(&m, "uuid-A", "", "disk-A", &[], "").await;
+            assert_eq!(r2.code, CODE_OK);
+            assert_eq!(r2.node_id, nid);
+            let s = m.store.inner.borrow();
+            let n = &s.nodes[&nid];
+            assert_eq!(n.address, "10.0.0.1:9101", "empty addr must not clobber address");
+            assert_eq!(
+                n.shard_ports,
+                vec![9101u16, 9102],
+                "empty ports must not clobber shard routing"
+            );
+            assert_eq!(
+                n.control_address, "10.0.0.1:10101",
+                "empty ctrl must not clobber the control address"
+            );
+        })
+    }
+
+    /// The decommission tombstone travels with the UUID, not the IP, and
+    /// survives the node-record deletion that a REAL `remove_node` performs: a
+    /// removed node returning under its OWN uuid at a FRESH address is refused.
+    /// Clearing the tombstone lets it rejoin.
+    #[test]
+    fn f_en_dynshard_decommissioned_uuid_refused_at_new_address() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            let nid = r1.node_id;
+
+            // Reproduce the state a real `remove_node` leaves: the node record is
+            // GONE from `s.nodes`; the `decommissioned` tombstone carries the uuid.
+            m.store.inner.borrow_mut().nodes.remove(&nid);
+            m.decommissioned.borrow_mut().insert(
+                nid,
+                MgrNodeOverride {
+                    node_id: nid,
+                    kind: NODE_OVERRIDE_FENCED,
+                    node_uuid: "uuid-A".to_string(),
+                    ..Default::default()
+                },
+            );
+
+            let r2 = reg_node(&m, "uuid-A", "10.0.0.7:9101", "disk-A", &[9101], "").await;
+            assert_eq!(
+                r2.code, CODE_PRECONDITION,
+                "tombstone is keyed by uuid and survives node deletion — a new IP must not launder it"
+            );
+
+            // Operator lifts the tombstone → the node may rejoin.
+            m.decommissioned.borrow_mut().remove(&nid);
+            let r3 = reg_node(&m, "uuid-A", "10.0.0.7:9101", "disk-A", &[9101], "").await;
+            assert_eq!(r3.code, CODE_OK, "clearing the tombstone re-admits the uuid");
+        })
+    }
+
+    /// The inverse: after the old node is fence+REMOVED (gone from `s.nodes`,
+    /// its address freed), a BRAND-NEW node (fresh uuid) landing on the recycled
+    /// pod IP is accepted as a new node.
+    #[test]
+    fn f_en_dynshard_recycled_ip_under_fresh_uuid_accepted() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            let nid = r1.node_id;
+            // Real recycle: the old record is removed (address freed) first.
+            m.store.inner.borrow_mut().nodes.remove(&nid);
+            m.decommissioned.borrow_mut().insert(
+                nid,
+                MgrNodeOverride {
+                    node_id: nid,
+                    kind: NODE_OVERRIDE_FENCED,
+                    node_uuid: "uuid-A".to_string(),
+                    ..Default::default()
+                },
+            );
+
+            let r2 = reg_node(&m, "uuid-B", "10.0.0.1:9101", "disk-B", &[9101], "").await;
+            assert_eq!(
+                r2.code, CODE_OK,
+                "a fresh uuid on a freed recycled IP is a new node, not the tombstoned one"
+            );
+            assert_ne!(r2.node_id, nid);
+        })
+    }
+
+    /// A DIFFERENT uuid must NOT create a second node record at an address a
+    /// live node already holds (a lost/duplicated `node_uuid` file, or a
+    /// misconfigured second process) — two records at one address would make one
+    /// physical EN two failure domains (RF double-placement). The node's OWN
+    /// uuid re-registering at its own address stays fine.
+    #[test]
+    fn f_en_dynshard_duplicate_address_different_uuid_refused() {
+        run(async {
+            let m = AutumnManager::new();
+            let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            let nid = r1.node_id;
+
+            let r2 = reg_node(&m, "uuid-B", "10.0.0.1:9101", "disk-B", &[9101], "").await;
+            assert_eq!(
+                r2.code, CODE_PRECONDITION,
+                "one address may not host two node records under different uuids"
+            );
+
+            let r3 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
+            assert_eq!(r3.code, CODE_OK, "the address holder re-registering is fine");
+            assert_eq!(r3.node_id, nid);
         })
     }
 
@@ -5094,6 +5293,7 @@ mod tests {
                     disk_uuids: vec![format!("disk-{nid}")],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 });
                 let resp = m.handle_register_node(req).await.unwrap();
                 let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
@@ -6208,6 +6408,7 @@ mod tests {
                     disks: vec![did],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 },
             );
             disks.insert(
@@ -6265,6 +6466,7 @@ mod tests {
                     disks: vec![100 + nid],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 },
             );
         }
@@ -6303,6 +6505,7 @@ mod tests {
                     disks: vec![did],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 },
             );
             disks.insert(

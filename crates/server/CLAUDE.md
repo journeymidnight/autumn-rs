@@ -209,7 +209,7 @@ repair-metastream --manager 127.0.0.1:9001 --meta-stream <ID> \
 
 For a fresh cluster (F214):
 1. Start `autumn-manager-server` first — it CAS-imprints the cluster_id on first leader-promotion.
-2. For each EN: run `autumn-op format --advertise HOST:PORT <DIR>...` BEFORE launching `autumn-extent-node`. `format` fetches the cluster_id, allocates disk_uuid(s), calls `MSG_REGISTER_NODE`, and stamps the per-dir sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`).
+2. For each EN: run `autumn-op format --advertise HOST:PORT <DIR>...` BEFORE launching `autumn-extent-node`. `format` fetches the cluster_id, allocates disk_uuid(s), mints (or reuses the sentinel of) a **`node_uuid`** — the EN's stable identity, decoupled from its address (F-EN-DYNSHARD M0; the manager recognises the node by this UUID across an IP / shard-port change, mirroring the PS `ps_id`-vs-address split) — calls `MSG_REGISTER_NODE` carrying it, and stamps the per-dir sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`, `node_uuid`).
 3. Launch `autumn-extent-node` for each formatted EN. It refuses to start without the sentinel files; on startup it cross-checks the stamped cluster_id against the manager's.
 4. Run `autumn-op bootstrap` to create streams and initial partition.
 5. Start `autumn-ps` with a unique `--psid`.

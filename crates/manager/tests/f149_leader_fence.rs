@@ -58,6 +58,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     disk_uuids: vec!["uuid-149-a".to_string()],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 }),
             )
             .await
@@ -97,6 +98,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     disk_uuids: vec!["uuid-149-b".to_string()],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 }),
             )
             .await
@@ -119,6 +121,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     disk_uuids: vec!["uuid-149-c".to_string()],
                     shard_ports: vec![],
                     control_address: String::new(),
+                    node_uuid: String::new(),
                 }),
             )
             .await
