@@ -2240,3 +2240,34 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     Cross-ref: notes 23/24 (F211/F214 node lifecycle — the tombstone + Suspend
     state this reshapes to uuid-keyed), 35 (F265 owner_epoch — the PS
     registration model this mirrors for the EN).
+
+    **M1a/M1b (shard count becomes dynamic) — the manager side.** M1a is
+    EN-binary-only (the EN self-registers its live location + `shard_ports[]` at
+    startup via `--advertise`; it lands on M0's uuid-match branch → location
+    updated in place → NO manager change, this IS the reshard commit point).
+    **M1b (WIRE v20)** adds the df identity echo: `ExtDfResp` gained `node_uuid`
+    / `advertise_addr` / `shard_ports` (appended to match `extent_rpc::DfResp`),
+    and `node_health_loop` (recovery.rs, the SINGLE df caller — note 25) acts on
+    it via the pure `classify_df_echo(...) -> DfEchoAction`:
+    - **`Imposter`** (echo uuid ≠ the stored uuid for this node_id) → a DIFFERENT
+      process answers at this address (pod-IP reuse). Do NOT heal the location to
+      it — `mark_node_disks_offline` + `on_heartbeat_fail` + treat the df as
+      failed. The real node_id's process is gone (→ Suspected); the new process
+      is its own node_id via its own self-register. A k8s safety net the pre-M1
+      address-only model could not express.
+    - **`DriftWarn`** (uuid matches, location drifted from etcd) → **WARN only,
+      no write**. The design first called for an etcd-first `mirror_register_node`
+      heal, but coco (M1b P1/P2) showed the write clobbers a concurrent
+      register/remove (re-writing the loop-start `nodes` snapshot after an await
+      → could resurrect a deleted node), AND M1a's startup self-register already
+      writes the authoritative location (`register_with_manager` returns Ok only
+      on a committed `CODE_OK`, so the lost-txn drift shape is unreachable — the
+      only residual is hand-edited etcd). So M1b keeps the self-protecting
+      imposter check + a drift WARN; the CAS-safe auto-heal (re-read + verify +
+      `nodes/<id>` value-CAS) is a deferred reproduce-first follow-up. Empty echo
+      fields are "unspecified", never a drift. Tests: `df_echo_tests` (5).
+    Steady state: the EN self-registered at startup, so stored == echo → `Ok`.
+    **M1c (open)**: `format`→identity-only + required `--advertise` + launcher
+    wiring. Cross-ref: note 25 (F222 single df caller — the loop this extends),
+    Item 3 in note 33 (the `streams/`/`extents/` value-CAS pattern a future
+    df-heal write would mirror for `nodes/<id>`).

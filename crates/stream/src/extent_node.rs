@@ -578,6 +578,22 @@ impl DiskFS {
 /// - `new(data_dir, io_mode, disk_id)`: single disk with explicit disk_id (tests, simple deploys).
 /// - `new_multi(data_dirs, io_mode)`: multiple disks; each dir must have a `disk_id` file
 ///   written by `autumn-op format`.
+/// F-EN-DYNSHARD M1b: the EN's own live identity, threaded from the binary into
+/// **shard 0's** `ExtentNode` (the only shard the manager dials for df — the
+/// registered `control_address` is shard 0's control port) so `handle_df` can
+/// ECHO it to the manager. The manager uses the echo to detect pod-IP reuse (a
+/// different process answering at a stored address) and to WARN on stored-
+/// location drift. Sibling shards (1+) carry the default (empty) registration;
+/// their `handle_df` echoes empty, which the manager treats as "no echo" (a df
+/// misrouted to a sibling simply skips the echo checks). Empty/absent when the
+/// EN was launched without `--advertise`.
+#[derive(Clone, Default)]
+pub struct NodeRegistration {
+    pub node_uuid: String,
+    pub advertise_addr: String,
+    pub shard_ports: Vec<u16>,
+}
+
 #[derive(Clone)]
 pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
@@ -609,6 +625,10 @@ pub struct ExtentNodeConfig {
     /// the per-client memory footprint at `cap × avg-frame`. Default
     /// 64 matches the historical env default.
     pub inflight_cap: usize,
+    /// F-EN-DYNSHARD M1b: this EN's own identity to echo in `handle_df`.
+    /// `None` = not self-registered (`--advertise` unset) → the manager skips
+    /// the echo-based drift-heal / imposter checks.
+    pub registration: Option<NodeRegistration>,
 }
 
 impl ExtentNodeConfig {
@@ -623,6 +643,7 @@ impl ExtentNodeConfig {
             ec_convert_parallelism: 1,
             recovery_parallelism: 2,
             inflight_cap: 64,
+            registration: None,
         }
     }
 
@@ -638,6 +659,7 @@ impl ExtentNodeConfig {
             ec_convert_parallelism: 1,
             recovery_parallelism: 2,
             inflight_cap: 64,
+            registration: None,
         }
     }
 
@@ -657,6 +679,21 @@ impl ExtentNodeConfig {
     /// back to default 64 on 0.
     pub fn with_inflight_cap(mut self, n: usize) -> Self {
         self.inflight_cap = if n == 0 { 64 } else { n };
+        self
+    }
+
+    /// F-EN-DYNSHARD M1b: set the EN's own identity to echo in `handle_df`.
+    pub fn with_registration(
+        mut self,
+        node_uuid: impl Into<String>,
+        advertise_addr: impl Into<String>,
+        shard_ports: Vec<u16>,
+    ) -> Self {
+        self.registration = Some(NodeRegistration {
+            node_uuid: node_uuid.into(),
+            advertise_addr: advertise_addr.into(),
+            shard_ports,
+        });
         self
     }
 
@@ -1519,6 +1556,9 @@ pub struct ExtentNode {
     /// FuturesUnordered cap. Read once at construction from
     /// `ExtentNodeConfig.inflight_cap`; immutable after.
     inflight_cap: usize,
+    /// F-EN-DYNSHARD M1b: this EN's own identity, echoed in `handle_df`
+    /// (default/empty when `--advertise` was not passed).
+    registration: Rc<NodeRegistration>,
 }
 
 impl Clone for ExtentNode {
@@ -1540,6 +1580,7 @@ impl Clone for ExtentNode {
             meta_locks: self.meta_locks.clone(),
             concurrency_ctrl: self.concurrency_ctrl.clone(),
             inflight_cap: self.inflight_cap,
+            registration: self.registration.clone(),
         }
     }
 }
@@ -3001,6 +3042,7 @@ impl ExtentNode {
                 config.recovery_parallelism,
             ),
             inflight_cap: config.inflight_cap.max(1),
+            registration: Rc::new(config.registration.unwrap_or_default()),
         };
 
         // Load existing extents from all disks.
@@ -6328,6 +6370,12 @@ impl ExtentNode {
         Ok(rkyv_encode(&DfResp {
             done_tasks,
             disk_status,
+            // F-EN-DYNSHARD M1b: echo our own identity so the manager can
+            // self-heal stored-location drift + detect pod-IP reuse. Empty when
+            // `--advertise` was not passed (test / pre-M1 deployments).
+            node_uuid: self.registration.node_uuid.clone(),
+            advertise_addr: self.registration.advertise_addr.clone(),
+            shard_ports: self.registration.shard_ports.clone(),
         }))
     }
 

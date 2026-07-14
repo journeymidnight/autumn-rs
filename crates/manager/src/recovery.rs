@@ -967,6 +967,67 @@ impl crate::AutumnManager {
                         continue;
                     }
                 };
+                // F-EN-DYNSHARD M1b: act on the df identity echo (pure decision
+                // in `classify_df_echo`).
+                match classify_df_echo(
+                    &node.node_uuid,
+                    &node.address,
+                    &node.shard_ports,
+                    &df.node_uuid,
+                    &df.advertise_addr,
+                    &df.shard_ports,
+                ) {
+                    // A DIFFERENT process answers at this address (pod-IP reuse).
+                    // Do NOT heal the location to it — treat the df as FAILED for
+                    // liveness: the real node_id's process is gone (→ Suspected),
+                    // the new process is its own node_id via its own self-register.
+                    // A k8s safety net the pre-M1 (address-only) system couldn't
+                    // express.
+                    DfEchoAction::Imposter => {
+                        tracing::warn!(
+                            node_id = node.node_id,
+                            stored_uuid = %node.node_uuid,
+                            echo_uuid = %df.node_uuid,
+                            addr = %addr,
+                            "F-EN-DYNSHARD: df echo uuid != stored — a DIFFERENT \
+                             process answers at this address (pod-IP reuse?); NOT \
+                             healing, treating df as failed"
+                        );
+                        Self::mark_node_disks_offline(&self.store, node);
+                        self.node_states.borrow_mut().on_heartbeat_fail(node.node_id);
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
+                        continue;
+                    }
+                    // uuid matches but the echoed location drifted from etcd
+                    // (hand-edited etcd — M1a's startup register makes the
+                    // lost-txn shape unreachable). WARN only: the EN's next boot
+                    // self-register, or an operator, is the authoritative fix. We
+                    // deliberately do NOT auto-write a healed record from the
+                    // loop-start snapshot — that could clobber a concurrent
+                    // register/remove (coco P1). The node stays Online (df
+                    // succeeded — it IS reachable); only the stored routing
+                    // location is stale, which the WARN surfaces.
+                    DfEchoAction::DriftWarn => {
+                        tracing::warn!(
+                            node_id = node.node_id,
+                            stored_addr = %node.address,
+                            echo_addr = %df.advertise_addr,
+                            stored_ports = ?node.shard_ports,
+                            echo_ports = ?df.shard_ports,
+                            "F-EN-DYNSHARD: stored EN location differs from the df echo \
+                             (stale etcd?); re-register the EN or correct etcd — NOT \
+                             auto-healing to avoid clobbering concurrent updates"
+                        );
+                    }
+                    DfEchoAction::Ok => {}
+                }
+
                 // F121: a successful df proves the node reachable — promote
                 // on the call-level signal, not per-payload disk_id (the
                 // wire status keys on the extent-node's local disk_id,
@@ -1595,6 +1656,140 @@ impl crate::AutumnManager {
         }
 
         Ok(())
+    }
+}
+
+/// F-EN-DYNSHARD M1b: what `node_health_loop` should do with a df identity echo.
+pub(crate) enum DfEchoAction {
+    /// No echo (EN not self-registered), or echo agrees with stored state.
+    Ok,
+    /// The echoed `node_uuid` differs from the stored one for this node_id — a
+    /// DIFFERENT process answers at this address (pod-IP reuse). Do NOT heal;
+    /// treat the df as failed for liveness. This is the load-bearing k8s safety
+    /// net (self-PROTECTING, no write).
+    Imposter,
+    /// uuid matches but the echoed location drifted from etcd — WARN only (no
+    /// auto-write; see the note on `classify_df_echo`).
+    DriftWarn,
+}
+
+/// Pure decision for the df identity echo (M1b). `echo_uuid` empty = the EN did
+/// not self-register (`--advertise` unset) → `Ok` (skip all checks). A non-empty
+/// echo uuid that differs from a non-empty stored uuid = `Imposter`. Otherwise
+/// the uuid matches (or the stored uuid is empty — a legacy record) and a
+/// location difference is `DriftWarn`. Empty echo fields are "unspecified",
+/// never a drift.
+///
+/// **Why `DriftWarn`, not an auto-heal write (coco M1b P1/P2 + repo norms):**
+/// the EN's STARTUP self-register (M1a) already writes the authoritative
+/// location to etcd, and `register_with_manager` only returns Ok on a committed
+/// `CODE_OK`, so the "registration txn lost" drift shape the design worried
+/// about cannot occur; the only residual drift source is a hand-edited etcd
+/// value (operator error). Auto-WRITING a healed record from the loop-start
+/// `nodes` snapshot after a `mirror_register_node` await could clobber a
+/// concurrent register / remove (resurrect a deleted node — coco P1), and it
+/// would defend a near-unreachable scenario with a real data-safety risk. So
+/// M1b surfaces drift as a WARN (the operator, or the EN's next boot
+/// self-register, resolves it) and keeps only the self-protecting imposter
+/// check. A CAS-safe auto-heal (re-read + verify + `nodes/<id>` value-CAS) is a
+/// deferred, reproduce-first follow-up (feature_list F-EN-DYNSHARD M1b note).
+pub(crate) fn classify_df_echo(
+    stored_uuid: &str,
+    stored_addr: &str,
+    stored_ports: &[u16],
+    echo_uuid: &str,
+    echo_addr: &str,
+    echo_ports: &[u16],
+) -> DfEchoAction {
+    if echo_uuid.is_empty() {
+        return DfEchoAction::Ok;
+    }
+    if !stored_uuid.is_empty() && echo_uuid != stored_uuid {
+        return DfEchoAction::Imposter;
+    }
+    let addr_drift = !echo_addr.is_empty() && echo_addr != stored_addr;
+    let ports_drift = !echo_ports.is_empty() && echo_ports != stored_ports;
+    if addr_drift || ports_drift {
+        DfEchoAction::DriftWarn
+    } else {
+        DfEchoAction::Ok
+    }
+}
+
+#[cfg(test)]
+mod df_echo_tests {
+    use super::{classify_df_echo, DfEchoAction};
+
+    #[test]
+    fn no_echo_is_ok() {
+        // EN did not self-register (--advertise unset) → skip all checks.
+        assert!(matches!(
+            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "", "", &[]),
+            DfEchoAction::Ok
+        ));
+    }
+
+    #[test]
+    fn matching_echo_is_ok() {
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+            ),
+            DfEchoAction::Ok
+        ));
+    }
+
+    #[test]
+    fn different_uuid_is_imposter() {
+        // Pod-IP reuse: a different process answers at this address.
+        assert!(matches!(
+            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "uuid-B", "10.0.0.1:9101", &[9101]),
+            DfEchoAction::Imposter
+        ));
+    }
+
+    #[test]
+    fn drifted_location_under_same_uuid_warns() {
+        // Address drifted, ports unchanged → DriftWarn.
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+                "uuid-A",
+                "10.0.0.9:9101",
+                &[9101, 9111],
+            ),
+            DfEchoAction::DriftWarn
+        ));
+
+        // Ports drifted (a reshard), address unchanged → DriftWarn.
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101],
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111, 9121],
+            ),
+            DfEchoAction::DriftWarn
+        ));
+    }
+
+    #[test]
+    fn empty_echo_fields_never_flag_drift() {
+        // uuid matches but advertise_addr / shard_ports echo empty → "unspecified",
+        // must NOT be treated as a drift.
+        assert!(matches!(
+            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "uuid-A", "", &[]),
+            DfEchoAction::Ok
+        ));
     }
 }
 

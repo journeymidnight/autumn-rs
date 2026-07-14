@@ -391,6 +391,7 @@ Used to bring a **sealed, replicated** extent's lagging replica up to date (e.g.
 
 - `heartbeat`: streams a "beat" payload every second (keep-alive for the manager).
 - `df`: returns disk space info (currently hardcoded placeholder) + drains `recovery_done` to report completed recovery tasks. This is the mechanism by which the manager learns recovery finished.
+- **F-EN-DYNSHARD M1b — `handle_df` ECHOES the EN's own identity** (`DfResp.node_uuid` / `advertise_addr` / `shard_ports`, from `self.registration`, threaded in via `ExtentNodeConfig::with_registration` from the binary's `--advertise`; empty when unset). The manager's `node_health_loop` uses the echo to self-heal stored-location drift and to detect pod-IP reuse (a different process answering at a stored address → uuid mismatch → refuse to heal + fail the df for liveness). Only shard 0 is dialed by the manager df, so only shard 0's `ExtentNode` carries a non-empty `registration`. See manager CLAUDE.md note 44 (M1b) + `classify_df_echo`.
 
 ### `serve_with_control` is fail-stop on bind conflict — DO NOT add dynamic port fallback
 

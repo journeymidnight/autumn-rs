@@ -845,6 +845,13 @@ pub struct ExtDfReq {
 pub struct ExtDfResp {
     pub done_tasks: Vec<MgrRecoveryTaskDone>,
     pub disk_status: Vec<(u64, crate::extent_rpc::DiskStatus)>,
+    /// F-EN-DYNSHARD M1b: the EN's echoed identity (see `extent_rpc::DfResp`).
+    /// Appended in the SAME order as `DfResp` so the manager decodes the EN's
+    /// `DfResp` bytes into this struct unchanged. Empty when the EN did not
+    /// self-register (`--advertise` unset).
+    pub node_uuid: String,
+    pub advertise_addr: String,
+    pub shard_ports: Vec<u16>,
 }
 
 // --- UpdateStreamEc (FOPS-03) ---

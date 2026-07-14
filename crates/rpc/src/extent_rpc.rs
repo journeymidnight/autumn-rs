@@ -625,11 +625,25 @@ pub struct DfReq {
 }
 
 /// Df response: completed recovery tasks + per-disk stats.
+///
+/// F-EN-DYNSHARD M1b — the trailing three fields ECHO the EN's own live
+/// identity so the manager's `node_health_loop` (the single df caller) can
+/// self-heal stored-location drift and detect pod-IP reuse (a DIFFERENT process
+/// answering at a stored address → `node_uuid` mismatch → refuse to heal). All
+/// three are empty when the EN was not launched with `--advertise` (test /
+/// pre-M1 deployments) → the manager skips the echo checks. Appended (not
+/// inserted) so the rkyv layout stays compatible with `manager_rpc::ExtDfResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
     /// (disk_id, DiskStatus) pairs (HashMap not used for rkyv compat).
     pub disk_status: Vec<(u64, DiskStatus)>,
+    /// F-EN-DYNSHARD M1b: the EN's stable identity (empty = not registered).
+    pub node_uuid: String,
+    /// F-EN-DYNSHARD M1b: the address the EN advertises (empty = not registered).
+    pub advertise_addr: String,
+    /// F-EN-DYNSHARD M1b: the shard ports this EN process actually binds.
+    pub shard_ports: Vec<u16>,
 }
 
 /// RequireRecovery request: start a background recovery task.

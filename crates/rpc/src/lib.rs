@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 19;
-pub const WIRE_VERSION_MAX: u32 = 19;
+pub const WIRE_VERSION_MIN: u32 = 20;
+pub const WIRE_VERSION_MAX: u32 = 20;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -203,6 +203,11 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // that requires an etcd reset (no migration). Fingerprint filled after the
     // build test reports it.
     (19, "44ac1df3e38f6e77"),
+    // v20 — F-EN-DYNSHARD M1b: `DfResp` / `ExtDfResp` gained the EN identity
+    // echo fields (`node_uuid`, `advertise_addr`, `shard_ports`) so the manager
+    // `node_health_loop` can self-heal stored-location drift + detect pod-IP
+    // reuse. Df is NOT persisted, but wire is same-commit either way.
+    (20, "23a6b7794ff8fb6a"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

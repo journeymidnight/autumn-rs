@@ -701,18 +701,39 @@ manager side needs NO change — M0's uuid-match branch already updates location
 in place. `cluster.sh` EN launch passes `--advertise "${BIND_HOST}:$port"`
 (idempotent with `format`'s advertise → exercises the path end-to-end).
 
-**M1b — OPEN (df-echo self-heal + format identity-only).**
-- **Files**: `crates/stream/src/extent_node.rs` + config (thread
-  `(node_uuid, advertise, shard_ports)` for the df echo; extend `handle_df`);
-  `crates/rpc/src/extent_rpc.rs` (`DfResp` echo fields);
-  `crates/manager/src/lib.rs` (`node_health_loop`: compare echo, heal via
-  `mirror_register_node`, WARN on uuid-imposter + treat as df-fail);
-  `crates/server/src/bin/autumn_op/main.rs` (`cmd_format` →
+**M1b — DONE (df-echo self-heal + pod-IP-reuse imposter detection).** WIRE v20:
+`extent_rpc::DfResp` + `manager_rpc::ExtDfResp` gained `node_uuid` /
+`advertise_addr` / `shard_ports` echo fields (appended in the same order so the
+rkyv layout stays cross-decodable). `stream::NodeRegistration` +
+`ExtentNodeConfig::with_registration` thread the EN's own identity into shard
+0's `ExtentNode` (the only shard the manager dials for df); `handle_df` echoes
+them. Manager `node_health_loop` (recovery.rs) acts on the echo via a PURE
+`classify_df_echo(...) -> DfEchoAction::{Imposter, DriftWarn, Ok}`: `Imposter`
+(echo uuid ≠ stored uuid for this node_id → a different process answers at this
+address = pod-IP reuse) → do NOT heal, mark disks offline + `on_heartbeat_fail`
++ treat the df as failed (self-PROTECTING, no write); `DriftWarn` (uuid matches,
+location drifted) → **WARN only**. 5 `df_echo_tests` cover the pure decision.
+
+**Why WARN, not an auto-heal write (coco M1b P1/P2 + repo norms).** The design
+originally called for an etcd-first `mirror_register_node` heal, but coco found
+the write clobbers a concurrent register/remove (it re-writes the loop-start
+`nodes` snapshot after an await → could resurrect a deleted node). Crucially,
+M1a's STARTUP self-register already writes the authoritative location, and
+`register_with_manager` only returns Ok on a committed `CODE_OK`, so the
+"registration txn lost" drift shape is unreachable — the only residual drift is
+hand-edited etcd (operator error). Auto-writing to fix that with a real
+clobber risk is a defensive fix for a near-imaginary bug, so M1b keeps only the
+self-protecting imposter check + a drift WARN (the EN's next boot self-register,
+or the operator, is the fix). A CAS-safe auto-heal (re-read + verify uuid +
+`nodes/<id>` value-CAS) is a deferred, reproduce-first follow-up.
+
+**M1c — OPEN (format identity-only + required --advertise + launcher wiring).**
+- **Files**: `crates/server/src/bin/autumn_op/main.rs` (`cmd_format` →
   identity-only registration; `--shard-ports`/`--listen`/`--advertise`
-  removal stubs); `autumn-op list-nodes` uuid + shard-count display
-  (wire-side response extension).
-- **Wire/etcd**: WIRE bump (DfResp + any response-struct extension); no etcd
-  change.
+  removal stubs); `autumn-op list-nodes` uuid + shard-count display; make EN
+  `--advertise` REQUIRED when `--manager` is given + wire entrypoint /
+  autumn-deploy / k8s launchers.
+- **Wire/etcd**: none (M1b already bumped the wire); no etcd change.
 - **Acceptance**: integration test (etcd-gated, `crates/manager/tests/`):
   boot 1 manager + 1 EN at cpuset len 2 → write via a stream → stop EN →
   restart with cpuset len 4 → `list-nodes` shows 4 ports → read back all data

@@ -799,6 +799,9 @@ fn main() -> Result<()> {
                         // it's the same check for every shard, so doing it
                         // once is sufficient. Skipped when no manager is
                         // configured (test deployments).
+                        // F-EN-DYNSHARD M1b: identity to echo in this shard's
+                        // `handle_df` (only shard 0 is dialed by the manager df).
+                        let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
                         if shard_idx == 0 {
                             if let Some(mgr) = manager.as_ref() {
                                 verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
@@ -818,6 +821,8 @@ fn main() -> Result<()> {
                                         &reg_shard_ports,
                                     );
                                     register_with_manager(mgr, &req).await?;
+                                    reg_for_cfg =
+                                        Some((node_uuid, adv.clone(), reg_shard_ports.clone()));
                                 }
                             }
                         }
@@ -827,6 +832,9 @@ fn main() -> Result<()> {
                             cfg = cfg.with_manager_endpoint(mgr);
                         }
                         cfg = cfg.with_shard(shard_idx, shards_for_thread, siblings);
+                        if let Some((nu, adv, ports)) = reg_for_cfg {
+                            cfg = cfg.with_registration(nu, adv, ports);
+                        }
                         // F195: per-shard tunables.
                         if let Some(n) = ec_par {
                             cfg = cfg.with_ec_convert_parallelism(n);
@@ -917,6 +925,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
             .context("parse control listen address")?;
 
         // F214-D: manager cross-check (skipped when --manager is omitted).
+        let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
         if let Some(mgr) = args.manager.as_ref() {
             verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
             // F-EN-DYNSHARD M1: self-register live location before serving (a
@@ -933,12 +942,18 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
                     &[args.port],
                 );
                 register_with_manager(mgr, &req).await?;
+                reg_for_cfg = Some((node_uuid, adv.clone(), vec![args.port]));
             }
         }
 
         let mut config = ExtentNodeConfig::new_multi(args.data_dirs.clone());
         if let Some(mgr) = args.manager.clone() {
             config = config.with_manager_endpoint(mgr);
+        }
+        // F-EN-DYNSHARD M1b: echo identity in handle_df for the manager's
+        // drift-heal / imposter check.
+        if let Some((nu, adv, ports)) = reg_for_cfg {
+            config = config.with_registration(nu, adv, ports);
         }
         // F195: F194 / F099-I tunables.
         let config = apply_extent_tunables(config, &args);
