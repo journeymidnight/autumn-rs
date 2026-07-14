@@ -1755,7 +1755,7 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
 | `MAX_IMM_DEPTH` (F120-A) | 4 | imm queue cap; merged_loop stalls req intake when reached. RocksDB's `max_write_buffer_number`. Env: `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
-| `MAX_WAL_GAP` (F120-B) | 2 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. **F-RECOVERY-UNBOUNDED BUG1: measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`** — a VP is ~24 B for an 8 MB value, so a `mem_bytes` gap never tripped on large-value workloads and the replay window grew O(dataset). RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
+| `MAX_WAL_GAP` (F120-B) | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. **F-RECOVERY-UNBOUNDED BUG1: measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`** — a VP is ~24 B for an 8 MB value, so a `mem_bytes` gap never tripped on large-value workloads and the replay window grew O(dataset). RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
 | `SHUTDOWN_TIMEOUT_MS` (F120-C) | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env: `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
 | `MAX_SST_BEFORE_AUTO_COMPACT` (F210-E2) | 32 | defensive: `background_compact_loop`'s timeout arm auto-triggers a minor compaction when `sst_readers.len()` exceeds this. Prevents bloom-FPR runaway on partitions where external policy is paused (1% per-SST bloom × N=32 ≈ 28% cumulative miss-path false-positive). Not env-tunable — mechanism-level defensive bound, not a policy knob. |
 
@@ -1788,7 +1788,7 @@ post-restart.
    LOG bytes, not the memtable footprint.** Pre-fix it read `active.mem_bytes()
    + Σ imm.mem_bytes()`; for a large-value (VP) workload the memtable holds only
    the ~24-byte ValuePointer while the 8 MB value lives in log_stream, so the gap
-   never approached 2 GiB → active never force-rotated → the un-flushed replay
+   never approached MAX_WAL_GAP (1 GiB default) → active never force-rotated → the un-flushed replay
    window grew O(dataset) (the real cause of "slow reopen on a big dataset", not
    the dataset size itself). `Memtable.log_bytes: AtomicU64` tracks the actual
    appended log bytes (value included), incremented in THREE places — the

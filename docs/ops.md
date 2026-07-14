@@ -433,7 +433,7 @@ dataset size — if a full-takeover reopen (all a dead PS's partitions land on o
 survivor) is slow, that's a symptom to investigate, not "the dataset is just big".
 Three properties enforce this (2026-07-13):
 
-- **Bounded replay window (BUG1).** The `MAX_WAL_GAP` (2 GiB) force-rotate now
+- **Bounded replay window (BUG1).** The `MAX_WAL_GAP` (1 GiB default) force-rotate now
   measures the un-flushed **log bytes** (value included), not the memtable
   footprint. Before the fix, a large-value (VP) workload kept only ~24-byte
   pointers in the memtable, so the gap never tripped and the log_stream replay

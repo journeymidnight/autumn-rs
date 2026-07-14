@@ -1278,6 +1278,85 @@ pub(crate) fn release_writer_pin(pin: &std::rc::Rc<std::sync::atomic::AtomicI64>
 }
 
 #[cfg(test)]
+mod bug1_wal_gap_tests {
+    //! F-RECOVERY-UNBOUNDED BUG1 (the real unboundedness): the F120-B WAL-gap
+    //! force-rotate MUST measure the appended LOG bytes (value INCLUDED), not the
+    //! memtable footprint. For a large-value (VP) workload the memtable holds only
+    //! ~24-byte pointers, so `mem_bytes` would need hundreds of TB of log to reach
+    //! the `MAX_WAL_GAP` — the rotate would NEVER fire and the un-flushed recovery
+    //! replay window would grow O(dataset). This reproduces the divergence:
+    //! `log_bytes` tracks true log growth (crosses the gap) while `mem_bytes`
+    //! stays VP-sized (never would), so `partition_loop`'s gap check must read
+    //! `log_bytes()`.
+    use super::{max_wal_gap, MemEntry, Memtable, OP_VALUE_POINTER};
+
+    #[test]
+    fn wal_gap_uses_log_bytes_not_mem_bytes_for_large_values() {
+        // The real, shipped threshold (default 1 GiB) — read it rather than
+        // hardcode, so the test can't drift from the config.
+        let wal_gap = max_wal_gap();
+        let value = 8 * 1024 * 1024u64; // 8 MiB large value
+        let iters = wal_gap / value + 8; // comfortably past the gap for any default
+
+        let m = Memtable::new();
+        let mut logged = 0u64;
+        // Mirror finish_write_batch for `iters` × 8 MiB large (VP) writes: each Put
+        // lands a tiny VP entry in the memtable (~24-byte pointer) but appends the
+        // FULL value to the log_stream (WAL).
+        for i in 0..iters {
+            let key = format!("k{i:06}").into_bytes();
+            // Large value → the memtable holds only the VP pointer, not the value.
+            let vp = MemEntry {
+                op: OP_VALUE_POINTER,
+                value: vec![0u8; 24],
+                expires_at: 0,
+            };
+            let mem_size = key.len() as u64 + 24 + 32; // what enqueue accounts for a VP entry
+            m.insert(key, vp, mem_size);
+            let rec = value + 30; // WAL record = header + value, appended to the log
+            m.add_log_bytes(rec);
+            logged += rec;
+        }
+
+        // The memtable FOOTPRINT stays tiny (VP-sized entries) — the OLD (buggy)
+        // signal never trips the rotate even after gigabytes of large values.
+        assert!(
+            m.mem_bytes() < iters * 128,
+            "mem footprint {} must stay VP-sized",
+            m.mem_bytes()
+        );
+        assert!(
+            m.mem_bytes() <= wal_gap,
+            "the pre-BUG1 mem_bytes signal would NEVER reach the MAX_WAL_GAP"
+        );
+
+        // The LOG grew to the full value volume and CROSSES the gap, so the fixed
+        // gap check (reads log_bytes) force-rotates → bounded replay window.
+        assert_eq!(m.log_bytes(), logged);
+        assert!(
+            m.log_bytes() > wal_gap,
+            "log_bytes {} must exceed MAX_WAL_GAP {} so the force-rotate fires",
+            m.log_bytes(),
+            wal_gap
+        );
+
+        // The BUG1 decision in one line: log_bytes crosses the gap, mem_bytes does not.
+        assert!(m.log_bytes() > wal_gap && m.mem_bytes() <= wal_gap);
+    }
+
+    #[test]
+    fn add_log_bytes_is_independent_of_mem_footprint() {
+        // add_log_bytes drives log_bytes() ONLY — never mem_bytes() — so the two
+        // signals are genuinely independent (a refactor that accidentally folded
+        // them back together would regress BUG1).
+        let m = Memtable::new();
+        m.add_log_bytes(1_000_000);
+        assert_eq!(m.log_bytes(), 1_000_000);
+        assert_eq!(m.mem_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
 mod f162_reader_pin_tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -6230,7 +6309,7 @@ async fn partition_loop(
         // (`log_bytes`, value included), NOT the memtable footprint
         // (`mem_bytes`). For a large-value (VP) workload the memtable holds only
         // ~24-byte VPs, so `mem_bytes` would need hundreds of TB of log to reach
-        // 2 GiB and this force-rotate would NEVER fire — leaving the recovery
+        // 1 GiB (MAX_WAL_GAP default) and this force-rotate would NEVER fire — leaving the recovery
         // replay window unbounded (= O(dataset)). `log_bytes` tracks true log
         // growth, so the rotate fires every ~MAX_WAL_GAP of log and the replay
         // window (and GC floor) stays bounded regardless of value size.
