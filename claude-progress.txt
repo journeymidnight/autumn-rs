@@ -25,14 +25,21 @@ Current summary: DONE.
     docs/ops.md / partition-server CLAUDE.md, but the real shipped DEFAULT is
     1 GiB (max_wal_gap() lib.rs:363). Corrected all three; the new test reads
     max_wal_gap() so it can't drift.
-Main gaps: reproduce-first system_gc_floor_durable_ckpt.rs (multi-extent GC +
-  durability race for BUG2 end-to-end) STILL deferred — needs a flush sync-point
-  + >1 GiB writes to roll log extents (min extent clamp is 1 GiB); heavy for a
-  unit-style test. BUG2 is covered by the composition of the unit floor-logic +
-  the existing relocate-then-punch system tests + coco-clean; the heavy test is
-  optional. BUG3 concurrency is structural (per-partition owner-lock + port-ord);
-  no dedicated test added.
-Next steps: commit+push the tests + P3 doc fix. Closed.
+  - HEAVY TEST DONE (2026-07-14, user "开始重型测试"): new reproduce-first
+    system_gc_floor_durable_ckpt.rs (#[ignore], ~95 s). Writes >1 GiB of 8 MiB
+    VP values to roll a real log extent, force-GCs the FIRST extent E0 (holds the
+    oldest live SST's vp_head = the MIN floor → punchable ONLY under the durable-
+    ckpt raise), asserts E0 RECLAIMED (raise fired), then crash + same-id takeover
+    restart asserts ZERO loss (4 cold keys living in E0 relocated-then-punched +
+    recovered via replay, 8 latest hot keys, complete range scan). RED-GREEN
+    verified: with the raise neutered (helper → min_floor) it FAILS at the reclaim
+    assertion; with the fix it PASSES. Genuine discriminator, not a false-positive.
+    (Fixed one test-only timing bug: ps2 connect must retry — recovery replays the
+    surviving ~1 GiB E1 before binding its listener.)
+Main gaps: NONE for BUG2 data safety — now proven end-to-end. BUG3 concurrency is
+  structural (per-partition owner-lock + port-ord); no dedicated test. Live cross-
+  host takeover WALLCLOCK timing still deferred to a real cluster run.
+Next steps: commit+push (heavy test + earlier BUG1 tests + P3 doc fix). Closed.
 
 ============================ prior task history ============================
 Date: 2026-07-13
