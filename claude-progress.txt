@@ -1,41 +1,42 @@
 Date: 2026-07-14
 TaskStatus: completed
-Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s. M0 +
-  M1a + M1b + M1c(list-nodes) + reshard runbook shipped. Design:
+Task scope: F-EN-DYNSHARD — dynamically changeable EN shard count + k8s. M0-M1c
+  + M2 runbook + M3 reshard chaos ALL shipped. Design:
   docs/en_dynamic_shard_design.md.
 
-Current summary (all pushed):
-  M0 (e3477c6): node_uuid identity (WIRE v19, etcd-reset); coco+fable reviewed.
-  M1a (3542970): EN --advertise self-registration (retry/fail-stop); cluster.sh
-    wired. Manager unchanged (M0 uuid-match = reshard commit point).
-  M1b (a802c4f): df identity echo (WIRE v20) → classify_df_echo -> Imposter
-    (pod-IP reuse: fail df) / DriftWarn / Ok. coco P1/P2 → dropped the risky
-    auto-heal write (M1a already authoritative); P3 doc fixed.
-  M1c-partial + runbook (THIS session, ready to commit):
-    - autumn-op list-nodes: UUID + SHARDS columns (NodeStateEntry += node_uuid /
-      shard_ports, WIRE v21) — the reshard-verification tool. JSON += node_uuid/
-      shard_count/shard_ports.
-    - docs/ops.md: "Resharding an extent node" runbook (stop-the-world: stop EN
-      → restart with new --cpuset + --advertise → list-nodes shows new SHARDS;
-      zero data movement; per-EN independent). Updated the stale "shard count
-      frozen" M0 paragraph.
-    - rpc 44 (v21) / manager 193 green; all test targets build; 0 clippy.
+Current summary (all pushed to origin/main, HEAD e40a8a4):
+  M0 (e3477c6): node_uuid identity (WIRE v19, etcd-reset); coco+fable (12 fixes).
+  M1a (3542970): EN --advertise self-registration; cluster.sh wired.
+  M1b (a802c4f): df identity echo (WIRE v20) -> classify_df_echo Imposter/
+    DriftWarn/Ok; coco P1/P2 -> dropped risky auto-heal write.
+  M1c (26f6378): list-nodes UUID+SHARDS columns (WIRE v21) + reshard runbook
+    (docs/ops.md).
+  M3 (f0e20d8 + e40a8a4): scripts/reshard_chaos.sh — stop-the-world reshard
+    2->4->1, 300 keys (incl 8 KiB large-value VPs). PASSED LOCALLY: shard count
+    verified via list-nodes after each reshard, all 300 keys byte-exact, zero
+    data movement. This validates the full chain: EN self-registers new
+    shard_ports on restart (M1a) -> manager updates routing in place (M0) ->
+    list-nodes shows new count (M1c) -> extents re-owned by extent_id %
+    shard_count with ZERO on-disk movement.
 
-Main gaps:
-  - M1c REMAINING (deferred, LOW-PRIORITY cleanup, not functional): format ->
-    identity-only registration; make EN --advertise REQUIRED; rewire entrypoint/
-    autumn-deploy/k8s launchers. Rationale for deferral: M1a already makes the EN
-    the authoritative location source (overwrites shard_ports every boot →
-    reshard works via restart, NO format re-run) and F214-B already gives the
-    "unbooted node stays Suspend" property, so this is cleanup that changes the
-    operational contract with real risk NOT validatable without a live cluster.
-  - M2 deploy: k8s per-pod ClusterIP + Service port generation (shard_count
-    ports per pod). The reshard RUNBOOK (bare-metal) is DONE (ops.md); the k8s
-    Service-port-gen part remains.
-  - M3 chaos: reshard-under-load e2e (needs a LIVE cluster — likely not runnable
-    in this sandbox per env constraints; deferred to a cluster run).
+Remote clean-env confirmation: BLOCKED. The remote-autumn host
+  (fdbd:dc62:3:302::15) has NO crates.io egress (index.crates.io:443 times out,
+  git+sparse both) so cargo can't fetch uncached deps (ed25519-dalek/tree-sitter)
+  -> can't build the current workspace there. github works (pull OK). Saved as
+  memory project_remote_host_no_cratesio. Local run on verified-fresh binaries
+  is authoritative for M3.
+
+Main gaps (deferred, NOT functional):
+  - M1c launcher-rewiring: format -> identity-only registration; make EN
+    --advertise REQUIRED; wire entrypoint/autumn-deploy/k8s. Cleanup only (M1a
+    already makes the EN authoritative + F214-B gives "unbooted stays Suspend");
+    changes the operational contract with risk needing a live cluster.
+  - M2 k8s: per-pod ClusterIP + Service port generation (shard_count ports/pod).
+  Both need a real cluster / k8s to validate (remote can't build; local has no
+  k8s). Deferred to a cluster run.
 
 Next steps:
-  1. Commit + push M1c list-nodes + reshard runbook.
-  2. If continuing: M2 k8s Service-port generation (deploy/k8s), OR pause for a
-     live-cluster run to do M3 reshard chaos + the deferred launcher rewiring.
+  1. (Optional) run the deferred M1c launcher-rewiring + M2 k8s on a cluster that
+     can build (local box can build; needs k8s for the Service-port part).
+  2. F-EN-DYNSHARD core is complete + validated; feature stays not_completed only
+     for the deploy-layer polish above.
