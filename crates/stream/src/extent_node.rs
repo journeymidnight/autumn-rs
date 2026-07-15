@@ -2857,6 +2857,32 @@ fn build_read_future(
             // evicted sealed one, resolved once at the call site).
             let f: &CompioFile = &file_rc;
             if zc {
+                // ZC-EXACT invariant: a ZC read is always an EXACT-length value
+                // read (the VP's `(offset, length)` — callers never pass
+                // length=0/to-end). `read_plan` CLAMPS `read_size` to the local
+                // bytes (correct for the non-ZC scanner path, whose callers
+                // handle short reads), but for ZC a clamp means THIS REPLICA
+                // cannot serve the requested range — answering CODE_OK with a
+                // silently SHORT payload made every ZC consumer responsible for
+                // its own length check (the copy path had one, the ZC proxy
+                // path did not → a truncated value could reach a client).
+                // Reject here — the producer — with CODE_PRECONDITION; clients
+                // treat any non-OK as failover (next replica / copy path).
+                // Under all-replica-ACK a committed VP is on every replica, so
+                // this fires only for a genuinely stale/over-range request or a
+                // diverged replica — never on the healthy path.
+                if req.length > 0 && read_size < req.length {
+                    tracing::warn!(
+                        extent_id = req.extent_id,
+                        offset = req.offset,
+                        want = req.length,
+                        have = read_size,
+                        local_len = end,
+                        "ZC read cannot serve full range; rejecting (no short CODE_OK)"
+                    );
+                    out.push(zc_read_head(slot.req_id, CODE_PRECONDITION, &[]));
+                    continue;
+                }
                 // F216-E: pread straight into a registered, pooled, zeroed-once
                 // slab — no per-op `vec![0u8; read_size]` alloc, no per-op 8 MiB
                 // memset (the pread overwrites it anyway), and the UCX send finds

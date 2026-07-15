@@ -138,6 +138,35 @@ impl TestConn {
         ReadBytesResp::decode(resp).expect("decode ReadBytesResp")
     }
 
+    /// ZC value read (MSG_READ_BYTES_ZC). Returns `(code, payload_bytes)` —
+    /// the payload is copied out of the pooled recv buffer for assertion
+    /// convenience.
+    pub async fn read_bytes_zc(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+    ) -> (u8, Vec<u8>) {
+        let req = ReadBytesReq {
+            extent_id,
+            eversion,
+            offset,
+            length,
+        };
+        let (pb, code) = self
+            .pool
+            .call_into_pooled(
+                &self.addr,
+                MSG_READ_BYTES_ZC,
+                req.encode(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("read_bytes_zc RPC");
+        (code, pb.as_ref().to_vec())
+    }
+
     pub async fn df(&self, tasks: Vec<RecoveryTask>, disk_ids: Vec<u64>) -> DfResp {
         let payload = rkyv_encode(&DfReq { tasks, disk_ids });
         let resp = self

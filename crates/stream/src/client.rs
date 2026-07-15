@@ -3751,31 +3751,11 @@ impl StreamClient {
                 )
                 .await
             {
-                Ok((pb, code)) if code == CODE_OK => {
-                    // F-READ-OPENTAIL-ROTATE defense-in-depth: the EN clamps an
-                    // over-range read to CODE_OK + a SHORT payload (`read_plan`),
-                    // and this ZC fast path — unlike the copy path (background.rs
-                    // `data.len() < read_len`) — has no length check: it hands
-                    // `pb` straight back as the value. Under all-replica-ACK a
-                    // committed VP read is on EVERY replica, so a short read
-                    // never happens; but now that open-tail reads ROTATE across
-                    // replicas (not just the append leader), verify the full
-                    // length came back and otherwise fall to the authoritative
-                    // copy path (its own rotation + failover + loud short-read
-                    // error) rather than silently return a truncated value.
-                    if pb.as_ref().len() == length as usize {
-                        return Ok(Some((pb, length as usize)));
-                    }
-                    tracing::warn!(
-                        extent_id,
-                        addr = %addr,
-                        want = length,
-                        got = pb.as_ref().len(),
-                        "ZC proxy read returned SHORT payload; falling back to copy path"
-                    );
-                    self.extent_info_cache.remove(&extent_id);
-                    return Ok(None);
-                }
+                // EN-side guarantee (ZC-EXACT, extent_node `build_read_future`):
+                // a ZC read that cannot serve the FULL requested range returns a
+                // non-OK code, never CODE_OK + a short payload — so CODE_OK here
+                // implies pb holds exactly `length` bytes.
+                Ok((pb, code)) if code == CODE_OK => return Ok(Some((pb, length as usize))),
                 Ok((_pb, _code)) => {
                     // eversion mismatch / EN-side error → bail to the copy path
                     // (it refetches ExtentInfo + re-routes EC). pb drops → pool.

@@ -90,3 +90,45 @@ async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
         "batch append on a sealed extent must return PRECONDITION"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// ZC-EXACT invariant (F-READ-OPENTAIL-ROTATE root fix, coco P1): a ZC read
+// (MSG_READ_BYTES_ZC) is always an exact-length VP value read — the EN must
+// NEVER answer CODE_OK with a silently SHORT payload. `read_plan` clamps to
+// the local bytes (correct for the non-ZC scanner path), but for ZC an
+// unservable range is a REJECTION (CODE_PRECONDITION), so no ZC consumer
+// needs its own defensive length check and a rotated-to replica that is
+// somehow short can never hand a truncated value to a client.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[compio::test]
+async fn zc_read_rejects_short_range_instead_of_short_ok() {
+    let node_dir = tempfile::tempdir().expect("node tempdir");
+    let addr = pick_addr();
+    start_node(node_dir.path(), addr).await;
+    let conn = TestConn::new(addr);
+
+    let eid = 4001u64;
+    assert_eq!(conn.alloc_extent(eid).await.code, CODE_OK);
+    let w = conn.append(eid, 1, 0, 20, b"0123456789".to_vec()).await;
+    assert_eq!(w.code, CODE_OK);
+    assert_eq!(w.end, 10);
+
+    // Exact in-range ZC read → OK + the full requested bytes.
+    let (code, payload) = conn.read_bytes_zc(eid, 1, 2, 5).await;
+    assert_eq!(code, CODE_OK);
+    assert_eq!(&payload, b"23456", "in-range ZC read returns exact bytes");
+
+    // Over-range ZC read (want 20, extent holds 10) → REJECTED, not OK+short.
+    let (code, payload) = conn.read_bytes_zc(eid, 1, 0, 20).await;
+    assert_eq!(
+        code, CODE_PRECONDITION,
+        "over-range ZC read must be rejected — CODE_OK+short payload would let \
+         a truncated value reach a client (payload len {})",
+        payload.len()
+    );
+
+    // Offset past the end entirely → same rejection.
+    let (code, _p) = conn.read_bytes_zc(eid, 1, 15, 4).await;
+    assert_eq!(code, CODE_PRECONDITION, "past-end ZC read must be rejected");
+}
