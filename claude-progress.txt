@@ -31,10 +31,35 @@ Phase A — LIVE-VALIDATED on VKE (2026-07-15, user-authorized stop-world deploy
     ops @ 7,490 ops/s across all 3 PS (write p99 spike = cold-reopen warmup).
   - F-REGION-REBALANCE Phase A works end-to-end on the live cluster.
 
-NEXT (Phase B, deferred — user sequenced it after Phase A):
-  - dashboard auto-policy `rebalance` kind: POLICY_KIND_REBALANCE=7,
-    compute_rebalance_advisory, actuate_candidate arm, 6th switch, dashboard HTML.
-    Separate WIRE bump (v23) + deploy. Reuses handle_rebalance_regions.
+Phase B — CODE DONE + committed (997f030 after rebase over an unrelated chaos fix),
+pushed. WIRE v22→v23 (fp 6b0224cb5e4f13f3, same-commit).
+  - POLICY_KIND_REBALANCE=7 + policy_kind_names row.
+  - PolicyEngine::compute_rebalance_advisory (cluster-level, one candidate/tick from
+    regions+ps_nodes counts; fires when per-PS spread > rebalance_gap_threshold(2)
+    outside rebalance_cooldown_sec(120s) via last_rebalance_at) → recompute_advisory_cache.
+  - actuate_candidate + actuate_action(dashboard Apply) REBALANCE arms →
+    handle_rebalance_regions(rebalance_max_moves_per_tick=4), bounded/gradual.
+  - 6th switch `rebalance` (SWITCH_ORDER [split,ec,compact,gc,merge,rebalance]);
+    kinds_from_switches/preset[bool;6]/sanitize 6/kind_priority=1/str/describe/
+    candidate_to_cmd/candidate_to_action. ON in balanced+aggressive presets.
+    dashboard HTML toggle + switch_order/switches_to_dict/upsert; autumn-op
+    policy-candidates kind map + feas.
+  - config split: policy DEFINITION persisted (autoPolicy/config rkyv, Vec<bool>
+    forward-compat → old config decodes, sanitize pads rebalance off); 3 thresholds
+    in in-memory PolicyConfig (NOT persisted, like all advisory thresholds).
+  - 4 rebalance_advisory_* tests + updated auto_policy switch tests green; clippy clean.
+  - coco (GPT-5.5 deep): wire MIN=MAX kept (same-commit); dashboard Apply path +
+    CLI kind map/feas wired (P2+P3 fixed).
+
+NEXT: LIVE deploy+validate of Phase B needs USER AUTH (stop-the-world v23 deploy).
+  Validate: arm a policy with rebalance ON → concentrate → advisory fires → armed
+  controller converges gradually; dashboard switch toggles; default-off preserved.
+
+DESIGN Q (user, answered): a policy carries only switches + interval + cooldown +
+  max_actions; per-kind tuning (rebalance max_moves/gap/cooldown, and all other
+  advisory thresholds) is GLOBAL in-memory PolicyConfig, not per-policy. Per-policy
+  params would need MgrAutoPolicyEntry wire fields or a persisted PolicyConfig key —
+  offered as a separate future enhancement.
 
 Prior task (DONE, do not redo): F-EN-DYNSHARD M2 — per-pod EN Services eliminated,
   pod-IP self-register, live-validated (commit fd2bfbf). Rollout exposed the sticky
