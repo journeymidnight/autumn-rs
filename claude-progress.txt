@@ -20,8 +20,13 @@ FINAL RESULT: M2 DONE + LIVE-VALIDATED end-to-end on the VKE cluster.
     assignment is sticky in etcd (parallel restart does NOT re-spread; that needs
     a manager rebalance). Saved to memory [[vke-rolling-restart-concentrates-partitions]].
   - COSMETIC LEFTOVER: all 32 partitions currently serve from ps-2 (ps-0/ps-1
-    idle) — functional (6k/12k ops/s) but not the original 3-way spread; restoring
-    it needs a manager restart / rebalance (not done — cluster is serving fine).
+    idle) — functional (6k/12k ops/s) but not the original 3-way spread.
+    CONFIRMED via rebalance_regions (lib.rs:3309): region→PS assignment is STICKY
+    in etcd — kept for any registered PS, only reassigned when a PS is
+    UNREGISTERED. So NEITHER a PS restart NOR a manager restart re-spreads it
+    (verified: the parallel PS restart left all 32 on ps-2). True re-spread needs
+    cluster.sh reset (destroys data — not on a live cluster) or a future
+    active-rebalance command. Orthogonal to M2; cluster serves fine as-is.
 
 Current summary (code committed fd2bfbf, pushed to main; build in flight):
   - entrypoint.sh run_extent_node: advertise AUTUMN_ADVERTISE_IP (pod IP, IP
