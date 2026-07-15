@@ -259,6 +259,7 @@ impl AutumnManager {
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
             MSG_AUTOPOLICY_SET => self.handle_autopolicy_set(payload).await,
+            MSG_REBALANCE_REGIONS => self.handle_rebalance_regions(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -3894,6 +3895,89 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             new_log_tail_extent_id: mmm_resp.new_log_tail_extent_id,
+        }))
+    }
+
+    /// F-REGION-REBALANCE: actively re-spread partitions across the registered
+    /// PS fleet (most-loaded → least-loaded, bounded by `max_moves`). Leader-
+    /// only. Each move rewrites a region's `ps_id`; the old PS's
+    /// `sync_regions_once` drops the partition and the new PS opens it (the same
+    /// mechanism eviction-driven reassignment already uses). `rg` is unchanged
+    /// so `region_epoch` is NOT bumped — the key RANGE didn't move, only which
+    /// PS serves it; clients re-resolve the partition's listener via the
+    /// refreshed `part_addr`.
+    ///
+    /// Persistence mirrors the eviction path (memory-first, then
+    /// `mirror_partition_snapshot` — the regions/ mirror re-reads the store so
+    /// it captures any concurrent change): apply in-memory, then persist. On a
+    /// mirror failure the in-memory reassignment stands for this leader's life
+    /// but a leader failover replays the (stale) etcd regions — idempotent, the
+    /// operator just re-runs `rebalance`.
+    ///
+    /// SAFETY of moving a partition off a still-LIVE PS (no freeze/drain needed):
+    /// the new PS's `open_partition` acquires the per-partition owner epoch
+    /// (`partition/<id>`) BEFORE it reads `commit_length` — so the old owner is
+    /// fenced (manager equality + EN floor) before the new owner snapshots the
+    /// tail. Any write the old PS durably ack'd happened before that fence and
+    /// is therefore ≤ the new owner's commit_length (no lost update); a write
+    /// the old PS accepted but couldn't ack (its append now fails
+    /// `LockedByOther` → self-eviction) is retried by the client onto the new
+    /// PS. This is exactly the failover/eviction handoff — a pure PS reassignment
+    /// needs no merge-style freeze (data isn't combined; the target reopens from
+    /// the durable streams). `region_epoch` is NOT bumped (the key range is
+    /// unchanged); routing follows the partition's `part_addr`, which we clear
+    /// below so clients stop resolving to the old PS immediately.
+    pub(crate) async fn handle_rebalance_regions(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RebalanceRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                moves: vec![],
+                moved: 0,
+            }));
+        }
+        let req: RebalanceRegionsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Compute + apply in-memory under one borrow (no await inside).
+        let moves = {
+            let mut s = self.store.inner.borrow_mut();
+            let moves = Self::compute_rebalance_moves(&s, req.max_moves);
+            for m in &moves {
+                if let Some(r) = s.regions.get_mut(&m.part_id) {
+                    r.ps_id = m.to_ps;
+                }
+                // Drop the stale per-partition listener addr (registered by the
+                // OLD PS). `GetRegions` filters `part_addrs` only by "region
+                // still exists", and the client prefers `part_addrs[part_id]`
+                // over the PS base address — so without this a refreshed client
+                // keeps routing to the old PS's (soon-closed) listener until the
+                // new PS reopens + re-registers. Removing it makes the client
+                // fall back to the target PS immediately (F265 self-heal then
+                // installs the new addr on the new PS's first sync).
+                s.part_addrs.remove(&m.part_id);
+            }
+            moves
+        };
+
+        if !moves.is_empty() {
+            if let Err(err) = self.mirror_partition_snapshot().await {
+                return Ok(rkyv_encode(&RebalanceRegionsResp {
+                    code: Self::err_to_code(&err),
+                    message: format!("rebalance persist failed: {err}"),
+                    moves: vec![],
+                    moved: 0,
+                }));
+            }
+            tracing::info!("F-REGION-REBALANCE: moved {} partition(s)", moves.len());
+        }
+
+        let moved = moves.len() as u32;
+        Ok(rkyv_encode(&RebalanceRegionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            moves,
+            moved,
         }))
     }
 

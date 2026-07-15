@@ -86,8 +86,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 21;
-pub const WIRE_VERSION_MAX: u32 = 21;
+pub const WIRE_VERSION_MIN: u32 = 22;
+pub const WIRE_VERSION_MAX: u32 = 22;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -243,6 +243,10 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // `shard_ports` so `autumn-op list-nodes` shows identity + shard count
     // (reshard verification). Additive to a non-persisted response struct.
     (21, "a76409bf80fbdb21"),
+    // v22 — F-REGION-REBALANCE: `MSG_REBALANCE_REGIONS` + `RebalanceRegionsReq`
+    // / `RebalanceMove` / `RebalanceRegionsResp` (active region→PS load
+    // rebalance). New msg_type + structs; no persisted-struct change.
+    (22, "57fe8f244d8fd5c1"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

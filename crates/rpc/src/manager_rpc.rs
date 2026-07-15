@@ -1004,6 +1004,39 @@ pub struct MergePartitionsResp {
     pub new_log_tail_extent_id: u64,
 }
 
+// --- F-REGION-REBALANCE: active region→PS load rebalance ---
+//
+// `rebalance_regions` (the eviction path) is STICKY — it keeps a region on its
+// currently-registered PS and only reassigns regions whose PS is unregistered.
+// So after a rolling restart every partition can pile onto whichever PS
+// registered first, and nothing ever re-spreads them (a restart doesn't move a
+// registered PS's regions). This RPC is the active balancer (WAS PM /
+// Bigtable-master / TiKV-PD `balance-region` equivalent): it reassigns
+// partitions from the most-loaded PS to the least-loaded until balanced,
+// bounded by `max_moves` so the partition-reopen storm on the targets is
+// throttled. `max_moves == 0` = as many as needed to balance.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RebalanceRegionsReq {
+    pub max_moves: u32,
+}
+
+/// One reassignment the manager performed: `part_id` moved `from_ps`→`to_ps`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RebalanceMove {
+    pub part_id: u64,
+    pub from_ps: u64,
+    pub to_ps: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RebalanceRegionsResp {
+    pub code: u8,
+    pub message: String,
+    /// The moves applied (empty when already balanced). `moved == moves.len()`.
+    pub moves: Vec<RebalanceMove>,
+    pub moved: u32,
+}
+
 // --- ReportPartitionLoad (PS → manager periodic metrics) ---
 //
 // F202 wire change (backward-incompatible): adds 5 new fields
@@ -1960,6 +1993,9 @@ pub struct AllocInodesResp {
 // persisted); only custom entries + the (mode, active) selection go to etcd.
 pub const MSG_AUTOPOLICY_GET: u8 = 0x54;
 pub const MSG_AUTOPOLICY_SET: u8 = 0x55;
+
+/// F-REGION-REBALANCE: active region→PS load rebalance (leader-only mutation).
+pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;

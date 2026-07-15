@@ -344,6 +344,7 @@ async fn run(args: Args) -> Result<()> {
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id } => cmd_split(&client, args.json, part_id).await?,
         Command::Merge { survivor_part_id, victim_part_id } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id).await?,
+        Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
         Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
         Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, part_id, ratio, max_size, stream_debt, empty_only).await?,
         Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, part_id, extent_ids).await?,
@@ -1416,6 +1417,38 @@ async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, vi
         );
     } else {
         println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
+    }
+    Ok(())
+}
+
+async fn cmd_rebalance(client: &ClusterClient, json: bool, max_moves: u32) -> Result<()> {
+    let moves = client
+        .rebalance_regions(max_moves)
+        .await
+        .map_err(|e| anyhow!("rebalance: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "moved": moves.len(),
+                "moves": moves
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "part_id": m.part_id,
+                        "from_ps": m.from_ps,
+                        "to_ps": m.to_ps,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+    } else if moves.is_empty() {
+        println!("rebalance: already balanced (0 moves)");
+    } else {
+        println!("rebalance: moved {} partition(s):", moves.len());
+        for m in &moves {
+            println!("  part {} : ps {} -> ps {}", m.part_id, m.from_ps, m.to_ps);
+        }
     }
     Ok(())
 }

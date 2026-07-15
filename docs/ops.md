@@ -870,6 +870,7 @@ $AO info                                 # nodes / extents / streams / partition
 $AO bootstrap --replication 3+0 --presplit 8:hexstring
 $AO split PART_ID
 $AO merge SURVIVOR_PART_ID VICTIM_PART_ID
+$AO rebalance [MAX_MOVES]                 # re-spread partitions across PS (F-REGION-REBALANCE)
 $AO compact PART_ID
 $AO gc PART_ID --ratio 0.4
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
@@ -1025,6 +1026,48 @@ writes: 191/191 ACKed keys survived.
 `cluster.sh` provides the manager per-process subcommands for this:
 `start-manager` / `stop-manager` / `restart-manager` (etcd state replay makes
 a manager bounce a safe rolling step).
+
+### Rebalancing region→PS assignment after a restart (F-REGION-REBALANCE)
+
+**Symptom:** after a restart (especially a k8s rolling `kubectl apply`, which
+bounces the PS pods one at a time) `autumn-op info` shows **all partitions
+serving from one PS**, the others idle. This is expected, not a bug: the
+region→PS assignment is **sticky in etcd** — the manager keeps a region on its
+currently-registered PS and only reassigns regions whose PS is *unregistered*.
+An eviction window during the restart (the PS being bounced misses its 10 s
+heartbeat) moves its regions to whichever PS is up; when it comes back its old
+regions are already sticky elsewhere. **A PS restart or a manager restart does
+NOT re-spread them** (both keep the sticky assignment).
+
+**Fix — actively re-spread with one command:**
+
+```bash
+autumn-op --manager <MGR> rebalance            # move as many as needed to balance
+autumn-op --manager <MGR> rebalance 5           # throttle: at most 5 moves this call
+autumn-op --manager <MGR> rebalance --json      # machine-readable {moved, moves[]}
+```
+
+The manager reassigns partitions most-loaded-PS → least-loaded-PS until the
+per-PS count gap is ≤ 1 (count-based, like HBase `SimpleLoadBalancer` / WAS PM /
+TiKV-PD `balance-region`). Each move rewrites the region's `ps_id`; the old PS's
+`region_sync_loop` closes the partition and the new PS opens it (~2 s tick +
+that partition's recover_partition). The key RANGE doesn't change (no
+`region_epoch` bump); clients re-resolve the moved partition's listener via the
+refreshed `part_addr` and the SDK's routing-miss retry absorbs the brief
+per-partition reopen window. **Throttle with `[MAX_MOVES]`** on a large cluster
+so the target PSes aren't hit by a reopen storm all at once — run it a few times,
+or once unbounded on an idle cluster.
+
+Verify:
+
+```bash
+autumn-op --manager <MGR> info | grep '  part' | awk '{print $4}' | sort | uniq -c
+# expect the counts spread across all PS addresses, gap <= 1
+```
+
+Idempotent: re-running on an already-balanced cluster reports `0 moves`. (An
+automatic version — the dashboard auto-policy `rebalance` switch — is
+F-REGION-REBALANCE Phase B, not yet shipped.)
 
 ### cluster_version + wire-version interval (R1)
 

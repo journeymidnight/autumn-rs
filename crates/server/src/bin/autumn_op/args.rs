@@ -40,6 +40,7 @@ fn usage() -> ! {
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID>");
     eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
+    eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
     eprintln!("  compact <PARTID>");
     eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
     eprintln!("  forcegc <PARTID> <EXTID>...");
@@ -168,6 +169,10 @@ pub(crate) enum Command {
     Merge {
         survivor_part_id: u64,
         victim_part_id: u64,
+    },
+    /// F-REGION-REBALANCE: actively re-spread partitions across the PS fleet.
+    Rebalance {
+        max_moves: u32,
     },
     Compact {
         part_id: u64,
@@ -723,6 +728,21 @@ pub(crate) fn parse() -> Args {
                 survivor_part_id: val(&raw, i).parse().expect("SURVIVOR_PART_ID must be a number"),
                 victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
             }
+        }
+        "rebalance" => {
+            // Optional [MAX_MOVES]; absent / 0 = move as many as needed to balance.
+            // Reject trailing tokens — this is a cluster-level mutation, so a
+            // typo'd arg must fail loudly rather than silently move partitions.
+            if i + 1 < raw.len() {
+                eprintln!("rebalance takes at most one arg: [MAX_MOVES]");
+                std::process::exit(1);
+            }
+            let max_moves = if i < raw.len() {
+                val(&raw, i).parse().expect("MAX_MOVES must be a number")
+            } else {
+                0
+            };
+            Command::Rebalance { max_moves }
         }
         "compact" => {
             if i >= raw.len() {

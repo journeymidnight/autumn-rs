@@ -291,6 +291,27 @@ Least-loaded allocation: for each partition, keep the existing PS if it is still
 
 The `rg` refresh on keep is critical: after a split, `multi_modify_split` updates the left partition's key range and calls `rebalance_regions`. Without refreshing `rg`, `GetRegions` would return the stale pre-split range to partition servers.
 
+**`rebalance_regions` is STICKY, not a balancer — `compute_rebalance_moves` is the
+active balancer (F-REGION-REBALANCE).** Because `rebalance_regions` KEEPS a region
+on any still-registered PS, a rolling restart (PS pods bounced one at a time, each
+missing its heartbeat while down) piles every region onto whichever PS stayed up,
+and NOTHING re-spreads them afterward (a PS restart re-registers → keeps the sticky
+assignment; a manager restart replays the same sticky `regions/` from etcd). The
+active balancer is `compute_rebalance_moves(state, max_moves)` (pure, near
+`rebalance_regions`): greedy most-loaded→least-loaded until the per-PS count gap is
+≤ 1, bounded by `max_moves` (0 = unbounded), deterministic (ties by lowest ps_id,
+moves the largest part_id). `handle_rebalance_regions` (MSG_REBALANCE_REGIONS, WIRE
+v22) rewrites each moved region's `ps_id` in-memory then `mirror_partition_snapshot`
+(the eviction path's memory-first-then-mirror idiom — the regions/ mirror re-reads
+the store). `rg` is UNCHANGED so `region_epoch` is NOT bumped (the range didn't move,
+only the serving PS; the PS `sync_regions_once` picks up the `ps_id` change and the
+old PS drops / new PS opens the partition — same mechanism as eviction-driven
+reassignment). Count-based for v1 (HBase `SimpleLoadBalancer`); a req/s-weighted
+variant (WAS PM / TiKV-PD `balance-region`) reuses the same apply path. Exposed as
+`autumn-op rebalance [MAX_MOVES]`; the dashboard auto-policy `rebalance` switch is
+Phase B (deferred). Cross-ref note 35 (F265 sticky region→PS assignment + part_addr
+self-heal), docs/ops.md "Rebalancing region→PS assignment after a restart".
+
 ## PS Liveness Detection
 
 `AutumnManager` tracks `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted to etcd).

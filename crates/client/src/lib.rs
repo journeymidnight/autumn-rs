@@ -3074,6 +3074,26 @@ impl ClusterClient {
         Ok(())
     }
 
+    /// F-REGION-REBALANCE: actively re-spread partitions across the PS fleet
+    /// (most-loaded → least-loaded), bounded by `max_moves` (`0` = as many as
+    /// needed to balance). Returns the reassignments the manager applied.
+    pub async fn rebalance_regions(
+        &self,
+        max_moves: u32,
+    ) -> std::result::Result<Vec<RebalanceMove>, AutumnError> {
+        let req = rkyv_encode(&RebalanceRegionsReq { max_moves });
+        let resp_bytes = self
+            .mgr_call(MSG_REBALANCE_REGIONS, req)
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        let resp: RebalanceRegionsResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(AutumnError::ServerError(resp.message));
+        }
+        Ok(resp.moves)
+    }
+
     /// F183: query the manager's policy-engine advisory cache.
     pub async fn policy_candidates(
         &self,

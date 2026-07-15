@@ -3380,6 +3380,81 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
+    /// F-REGION-REBALANCE: compute the moves that bring the per-PS partition
+    /// COUNT as even as possible — repeatedly reassign one partition from the
+    /// most-loaded registered PS to the least-loaded, stopping when the gap is
+    /// ≤ 1 (perfectly balanced up to the remainder) or `max_moves` is reached
+    /// (`0` = unbounded). Unlike `rebalance_regions` (which keeps a registered
+    /// PS's regions STICKY), this ACTIVELY moves regions off an overloaded PS —
+    /// the WAS-PM / TiKV-PD `balance-region` behaviour.
+    ///
+    /// PURE + DETERMINISTIC (a dry-run matches the applied set): only PS in
+    /// `ps_nodes` participate; ties on load break by lowest `ps_id`; the
+    /// partition moved off the most-loaded PS is its largest `part_id`. The
+    /// caller applies each move by rewriting `regions[part_id].ps_id`.
+    ///
+    /// Count-based (not load/QPS-based) by design for v1 — partition count is
+    /// the coarse-but-robust signal (HBase `SimpleLoadBalancer`); a future
+    /// req/s-weighted variant can reuse the same apply path.
+    fn compute_rebalance_moves(
+        state: &autumn_common::MetadataState,
+        max_moves: u32,
+    ) -> Vec<RebalanceMove> {
+        // Partition ids per REGISTERED PS (a region on an unregistered PS is
+        // the eviction path's job, not ours; it isn't a movable source here).
+        let mut by_ps: HashMap<u64, Vec<u64>> =
+            state.ps_nodes.keys().map(|&id| (id, Vec::new())).collect();
+        for (part_id, region) in &state.regions {
+            if let Some(v) = by_ps.get_mut(&region.ps_id) {
+                v.push(*part_id);
+            }
+        }
+        if by_ps.len() < 2 {
+            return Vec::new(); // nothing to balance across
+        }
+        for v in by_ps.values_mut() {
+            v.sort_unstable(); // largest part_id is popped first (deterministic)
+        }
+        let cap = if max_moves == 0 {
+            usize::MAX
+        } else {
+            max_moves as usize
+        };
+        let mut moves = Vec::new();
+        while moves.len() < cap {
+            // most-loaded (ties → lowest ps_id), least-loaded (ties → lowest ps_id)
+            let most = by_ps
+                .iter()
+                .map(|(id, v)| (v.len(), std::cmp::Reverse(*id)))
+                .max()
+                .map(|(_, r)| r.0);
+            let least = by_ps
+                .iter()
+                .map(|(id, v)| (v.len(), *id))
+                .min_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)))
+                .map(|(_, id)| id);
+            let (Some(most), Some(least)) = (most, least) else {
+                break;
+            };
+            if most == least {
+                break;
+            }
+            let most_n = by_ps[&most].len();
+            let least_n = by_ps[&least].len();
+            if most_n <= least_n + 1 {
+                break; // balanced: gap of 1 is the irreducible remainder
+            }
+            let part_id = by_ps.get_mut(&most).unwrap().pop().unwrap();
+            by_ps.get_mut(&least).unwrap().push(part_id);
+            moves.push(RebalanceMove {
+                part_id,
+                from_ps: most,
+                to_ps: least,
+            });
+        }
+        moves
+    }
+
     fn compute_region_for_partition(
         state: &autumn_common::MetadataState,
         part: &MgrPartitionMeta,
@@ -5270,6 +5345,107 @@ mod tests {
             "new partition should go to least-loaded PS (ps 20 has 0 regions)"
         );
         assert_eq!(region.part_id, 999);
+    }
+
+    // ── F-REGION-REBALANCE: compute_rebalance_moves ──────────────────────────
+
+    /// Build a state with `ps_ids` registered and `assignments` = (part_id, ps_id).
+    fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> autumn_common::MetadataState {
+        let mut state = autumn_common::MetadataState::default();
+        for &id in ps_ids {
+            state.ps_nodes.insert(id, format!("ps{id}:9001"));
+        }
+        for &(part_id, ps_id) in assignments {
+            state.regions.insert(
+                part_id,
+                MgrRegionInfo {
+                    rg: Some(MgrRange {
+                        start_key: vec![],
+                        end_key: vec![],
+                    }),
+                    part_id,
+                    ps_id,
+                    log_stream: part_id,
+                    row_stream: part_id + 1000,
+                    meta_stream: part_id + 2000,
+                    region_epoch: 1,
+                },
+            );
+        }
+        state
+    }
+
+    /// Apply the moves the way the handler does, then return per-PS counts.
+    fn counts_after(
+        state: &autumn_common::MetadataState,
+        moves: &[RebalanceMove],
+    ) -> std::collections::BTreeMap<u64, usize> {
+        let mut regions = state.regions.clone();
+        for m in moves {
+            regions.get_mut(&m.part_id).unwrap().ps_id = m.to_ps;
+        }
+        let mut c: std::collections::BTreeMap<u64, usize> =
+            state.ps_nodes.keys().map(|&id| (id, 0)).collect();
+        for r in regions.values() {
+            *c.get_mut(&r.ps_id).unwrap() += 1;
+        }
+        c
+    }
+
+    #[test]
+    fn rebalance_spreads_all_on_one_ps_evenly() {
+        // The live-cluster symptom: 32 partitions all on ps 3, ps 1/2 idle.
+        let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+        let state = rebal_state(&[1, 2, 3], &assignments);
+        let moves = AutumnManager::compute_rebalance_moves(&state, 0);
+        let c = counts_after(&state, &moves);
+        // 32 / 3 = 10,11,11 — max-min gap must be <= 1.
+        let max = *c.values().max().unwrap();
+        let min = *c.values().min().unwrap();
+        assert!(max - min <= 1, "not balanced: {c:?}");
+        assert_eq!(c.values().sum::<usize>(), 32);
+        // Every move is off the overloaded ps 3 onto a lighter PS.
+        assert!(moves.iter().all(|m| m.from_ps == 3 && m.to_ps != 3));
+    }
+
+    #[test]
+    fn rebalance_respects_max_moves_cap() {
+        let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+        let state = rebal_state(&[1, 2, 3], &assignments);
+        let moves = AutumnManager::compute_rebalance_moves(&state, 5);
+        assert_eq!(moves.len(), 5, "capped at max_moves");
+    }
+
+    #[test]
+    fn rebalance_noop_when_already_balanced() {
+        // 11/11/10 across ps 1/2/3 — gap already 1, nothing to do.
+        let mut assignments = Vec::new();
+        for (i, p) in (100..132).enumerate() {
+            assignments.push((p, [1u64, 2, 3][i % 3]));
+        }
+        let state = rebal_state(&[1, 2, 3], &assignments);
+        let moves = AutumnManager::compute_rebalance_moves(&state, 0);
+        assert!(moves.is_empty(), "already balanced, got {moves:?}");
+    }
+
+    #[test]
+    fn rebalance_is_deterministic() {
+        let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+        let state = rebal_state(&[1, 2, 3], &assignments);
+        let a = AutumnManager::compute_rebalance_moves(&state, 0);
+        let b = AutumnManager::compute_rebalance_moves(&state, 0);
+        assert_eq!(
+            a.iter().map(|m| (m.part_id, m.from_ps, m.to_ps)).collect::<Vec<_>>(),
+            b.iter().map(|m| (m.part_id, m.from_ps, m.to_ps)).collect::<Vec<_>>(),
+            "dry-run must match the applied set"
+        );
+    }
+
+    #[test]
+    fn rebalance_single_ps_is_noop() {
+        let assignments: Vec<(u64, u64)> = (100..110).map(|p| (p, 1)).collect();
+        let state = rebal_state(&[1], &assignments);
+        assert!(AutumnManager::compute_rebalance_moves(&state, 0).is_empty());
     }
 
     // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
