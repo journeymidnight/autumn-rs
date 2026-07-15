@@ -600,7 +600,9 @@ pub struct ExtentNodeConfig {
     disks: Vec<(PathBuf, Option<u64>)>,
     pub manager_endpoint: Option<String>,
     /// F099-M: this shard's index (0..shard_count). Only extents where
-    /// `extent_id % shard_count == shard_idx` are owned by this instance.
+    /// `autumn_rpc::shard_for_extent(extent_id, shard_count) == shard_idx` are
+    /// owned by this instance (F-EN-SHARD-HASH; was a raw `extent_id %
+    /// shard_count`).
     pub shard_idx: u32,
     /// F099-M: total shard count in the extent-node process. 1 = legacy
     /// single-threaded mode; >1 enables per-shard filtering + routing.
@@ -3283,7 +3285,11 @@ impl ExtentNode {
     /// F099-M: does this shard own `extent_id`?
     #[inline]
     pub(crate) fn owns_extent(&self, extent_id: u64) -> bool {
-        self.shard_count <= 1 || (extent_id % self.shard_count as u64) as u32 == self.shard_idx
+        // F-EN-SHARD-HASH: canonical hashed map (was `extent_id % shard_count`,
+        // which aliased bootstrap's contiguous ids onto shard 0). MUST match the
+        // manager / StreamClient `shard_addr_for_extent`.
+        self.shard_count <= 1
+            || autumn_rpc::shard_for_extent(extent_id, self.shard_count) == self.shard_idx
     }
 
     /// F210-D1: look up / create the per-extent mutating-op lock. Held
@@ -3307,7 +3313,7 @@ impl ExtentNode {
         if self.shard_count <= 1 {
             return None;
         }
-        let owner = (extent_id % self.shard_count as u64) as usize;
+        let owner = autumn_rpc::shard_for_extent(extent_id, self.shard_count) as usize;
         self.sibling_addrs.get(owner).map(|s| s.as_str())
     }
 
@@ -4227,7 +4233,7 @@ impl ExtentNode {
             format!(
                 "extent {} belongs to shard {} not shard {} (shard_count={})",
                 extent_id,
-                extent_id % self.shard_count as u64,
+                autumn_rpc::shard_for_extent(extent_id, self.shard_count),
                 self.shard_idx,
                 self.shard_count,
             ),
@@ -4256,7 +4262,7 @@ impl ExtentNode {
             return Err(format!(
                 "ensure_extent on wrong shard: extent {} → shard {}, this is shard {} (count={})",
                 extent_id,
-                extent_id % self.shard_count as u64,
+                autumn_rpc::shard_for_extent(extent_id, self.shard_count),
                 self.shard_idx,
                 self.shard_count,
             ));

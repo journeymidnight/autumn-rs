@@ -5,19 +5,19 @@
 //!
 //!   1. `f099m_shards_serve_disjoint_extents`: an extent-node process
 //!      running with `shard_count=2` serves disjoint extent IDs on
-//!      its two shards (shard 0 owns `extent_id % 2 == 0`, shard 1 owns
-//!      odd IDs). Wrong-shard requests are rejected with
-//!      FailedPrecondition.
+//!      its two shards (ownership = `autumn_rpc::shard_for_extent(id, 2)`,
+//!      the canonical hashed map — F-EN-SHARD-HASH; was `id % 2`). Wrong-shard
+//!      requests are rejected with FailedPrecondition.
 //!
 //!   2. `f099m_register_node_reports_shard_ports`: register-node
 //!      carries `shard_ports`; the manager stores them and
 //!      `nodes_info` returns them so clients can route.
 //!
-//!   3. `f099m_client_routes_by_extent_id_modulo`: client's
-//!      `shard_addr_for_extent` helper maps even extent IDs to
-//!      shard 0's port and odd IDs to shard 1's port. Smoke-test
-//!      through the `StreamClient.append_bytes_to_extent` path — the
-//!      hot path lands on the owning shard's port.
+//!   3. `f099m_client_routes_by_extent_hash`: client's
+//!      `shard_addr_for_extent` helper maps each extent to
+//!      `shard_ports[autumn_rpc::shard_for_extent(id, k)]` (F-EN-SHARD-HASH).
+//!      Smoke-test through the alloc+append path — the hot path lands on the
+//!      owning shard's port (the EN `owns_extent` agrees with the routing).
 //!
 //!   4. `f099m_recovery_per_shard`: after process restart with the
 //!      same data dir + shard_count, each shard only loads its owned
@@ -114,11 +114,10 @@ async fn commit_length_on(
 // Test 1: shards serve disjoint extents
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A 2-shard ExtentNode owns `extent_id % 2 == 0` on shard 0 and odd IDs
-/// on shard 1. Allocating an even ID on shard 0 succeeds; probing
-/// commit_length for the same ID on shard 1 returns FailedPrecondition
-/// (wrong shard). Similarly, allocating an odd ID on shard 1 succeeds;
-/// probing on shard 0 rejects.
+/// A 2-shard ExtentNode owns each extent on `shard_for_extent(id, 2)` (the
+/// canonical hash — F-EN-SHARD-HASH). Extent 100 hashes to shard 0, 101 to
+/// shard 1: allocating 100 on shard 0 succeeds; probing commit_length for 100
+/// on shard 1 returns FailedPrecondition (wrong shard), and vice-versa for 101.
 #[test]
 fn f099m_shards_serve_disjoint_extents() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -128,7 +127,7 @@ fn f099m_shards_serve_disjoint_extents() {
     compio::runtime::Runtime::new()
         .unwrap()
         .block_on(async move {
-            // Alloc extent 100 (even → shard 0). Target shard 0's port.
+            // Alloc extent 100 (hashes to shard 0). Target shard 0's port.
             let r100 = alloc_on(addrs[0], 100).await;
             assert_eq!(
                 r100.code,
@@ -136,7 +135,7 @@ fn f099m_shards_serve_disjoint_extents() {
                 "alloc 100 on shard 0 should succeed"
             );
 
-            // Alloc extent 101 (odd → shard 1). Target shard 1's port.
+            // Alloc extent 101 (hashes to shard 1). Target shard 1's port.
             let r101 = alloc_on(addrs[1], 101).await;
             assert_eq!(
                 r101.code,
@@ -297,38 +296,32 @@ fn f099m_register_node_reports_shard_ports() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Test 3: client routes by extent_id modulo
+// Test 3: client routes by the canonical extent→shard HASH (F-EN-SHARD-HASH)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Exercises the client-side routing helper:
-///   - `shard_addr_for_extent("host:9101", [9101, 9111], 100)` → "host:9101"
-///   - `shard_addr_for_extent("host:9101", [9101, 9111], 101)` → "host:9111"
-///
-/// Then spins a 2-shard node, allocates even + odd extents, and verifies
-/// that the shard_addr_for_extent-routed address actually works end-to-
-/// end: appending to the routed port succeeds.
+/// Exercises the client-side routing helper: `shard_addr_for_extent` MUST
+/// route to `shard_ports[autumn_rpc::shard_for_extent(id, k)]` — the same
+/// hashed map the EN `owns_extent` uses (was a raw `id % k`, which aliased
+/// bootstrap's contiguous ids onto shard 0). Then spins a 2-shard node,
+/// allocates two extents that hash to DIFFERENT shards, and verifies the
+/// routed port actually works end-to-end (the EN accepts the append → its
+/// `owns_extent` agrees with the routing).
 #[test]
-fn f099m_client_routes_by_extent_id_modulo() {
-    // Pure routing unit check.
+fn f099m_client_routes_by_extent_hash() {
+    use autumn_rpc::shard_for_extent;
+
+    // Pure routing check: shard_addr_for_extent wires through shard_for_extent.
     let shard_ports: Vec<u16> = vec![9101, 9111, 9121, 9131];
-    assert_eq!(
-        shard_addr_for_extent("127.0.0.1:9101", &shard_ports, 100),
-        "127.0.0.1:9101",
-        "extent 100 % 4 == 0 → shard 0 = port 9101"
-    );
-    assert_eq!(
-        shard_addr_for_extent("127.0.0.1:9101", &shard_ports, 101),
-        "127.0.0.1:9111",
-        "extent 101 % 4 == 1 → shard 1 = port 9111"
-    );
-    assert_eq!(
-        shard_addr_for_extent("127.0.0.1:9101", &shard_ports, 102),
-        "127.0.0.1:9121",
-    );
-    assert_eq!(
-        shard_addr_for_extent("127.0.0.1:9101", &shard_ports, 103),
-        "127.0.0.1:9131",
-    );
+    let k = shard_ports.len() as u32;
+    for id in [100u64, 101, 102, 103, 200, 201, 999, 123456] {
+        let expect_port = shard_ports[shard_for_extent(id, k) as usize];
+        assert_eq!(
+            shard_addr_for_extent("127.0.0.1:9101", &shard_ports, id),
+            format!("127.0.0.1:{expect_port}"),
+            "extent {id} must route to shard {} port {expect_port}",
+            shard_for_extent(id, k)
+        );
+    }
 
     // Legacy mode: empty shard_ports → address unchanged.
     assert_eq!(
@@ -340,10 +333,17 @@ fn f099m_client_routes_by_extent_id_modulo() {
         "127.0.0.1:9101",
     );
 
-    // End-to-end: spin a 2-shard node, alloc + append on the routed port.
+    // End-to-end: spin a 2-shard node, alloc + append on the routed port for
+    // one extent that hashes to shard 0 and one that hashes to shard 1.
     let tmp = tempfile::tempdir().expect("tempdir");
     let addrs = spawn_sharded_node(tmp.path(), 2, 2);
     let shard_ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
+
+    // Pick two ids that hash to distinct shards (id=200 and the first id after
+    // it landing on the other shard) so the test still exercises BOTH shards.
+    let id_a = 200u64;
+    let shard_a = shard_for_extent(id_a, 2);
+    let id_b = (id_a + 1..).find(|&i| shard_for_extent(i, 2) != shard_a).unwrap();
 
     compio::runtime::Runtime::new()
         .unwrap()
@@ -351,69 +351,43 @@ fn f099m_client_routes_by_extent_id_modulo() {
             let base = format!("127.0.0.1:{}", shard_ports[0]);
             let pool = ConnPool::new();
 
-            // Even extent → shard 0.
-            let even_id = 200u64;
-            let routed = shard_addr_for_extent(&base, &shard_ports, even_id);
-            assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[0]));
+            for (id, payload) in [
+                (id_a, &b"hello-f099m-a"[..]),
+                (id_b, &b"f099m-b-world"[..]),
+            ] {
+                let routed = shard_addr_for_extent(&base, &shard_ports, id);
+                let expect_port = shard_ports[shard_for_extent(id, 2) as usize];
+                assert_eq!(routed, format!("127.0.0.1:{expect_port}"));
 
-            let r = pool
-                .call(
-                    &routed,
-                    MSG_ALLOC_EXTENT,
-                    rkyv_encode(&AllocExtentReq { extent_id: even_id }),
-                )
-                .await
-                .expect("alloc");
-            let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
+                let r = pool
+                    .call(
+                        &routed,
+                        MSG_ALLOC_EXTENT,
+                        rkyv_encode(&AllocExtentReq { extent_id: id }),
+                    )
+                    .await
+                    .expect("alloc");
+                let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
 
-            let append = AppendReq {
-                extent_id: even_id,
-                eversion: 1,
-                commit: 0,
-                owner_epoch: 1,
-                payload: Bytes::from_static(b"hello-f099m-even"),
-            };
-            let r = pool
-                .call(&routed, MSG_APPEND, append.encode())
-                .await
-                .expect("append");
-            let appended = AppendResp::decode(r).expect("decode");
-            assert_eq!(
-                appended.code,
-                autumn_rpc::manager_rpc::CODE_OK,
-                "append must land on owner shard"
-            );
-            assert_eq!(appended.end as usize, b"hello-f099m-even".len());
-
-            // Odd extent → shard 1.
-            let odd_id = 201u64;
-            let routed = shard_addr_for_extent(&base, &shard_ports, odd_id);
-            assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[1]));
-
-            let r = pool
-                .call(
-                    &routed,
-                    MSG_ALLOC_EXTENT,
-                    rkyv_encode(&AllocExtentReq { extent_id: odd_id }),
-                )
-                .await
-                .expect("alloc");
-            let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
-
-            let append = AppendReq {
-                extent_id: odd_id,
-                eversion: 1,
-                commit: 0,
-                owner_epoch: 1,
-                payload: Bytes::from_static(b"odd-f099m-world"),
-            };
-            let r = pool
-                .call(&routed, MSG_APPEND, append.encode())
-                .await
-                .expect("append");
-            let appended = AppendResp::decode(r).expect("decode");
-            assert_eq!(appended.code, autumn_rpc::manager_rpc::CODE_OK);
-            assert_eq!(appended.end as usize, b"odd-f099m-world".len());
+                let append = AppendReq {
+                    extent_id: id,
+                    eversion: 1,
+                    commit: 0,
+                    owner_epoch: 1,
+                    payload: Bytes::copy_from_slice(payload),
+                };
+                let r = pool
+                    .call(&routed, MSG_APPEND, append.encode())
+                    .await
+                    .expect("append");
+                let appended = AppendResp::decode(r).expect("decode");
+                assert_eq!(
+                    appended.code,
+                    autumn_rpc::manager_rpc::CODE_OK,
+                    "append must land on owner shard (owns_extent agrees with routing)"
+                );
+                assert_eq!(appended.end as usize, payload.len());
+            }
         });
 }
 
@@ -444,8 +418,8 @@ fn f099m_recovery_per_shard() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let pool = ConnPool::new();
 
-        for &eid in &[300u64, 301u64] {
-            let shard = (eid % 2) as usize;
+        for &eid in &[300u64, 304u64] {
+            let shard = autumn_rpc::shard_for_extent(eid, 2) as usize;
             let addr = addrs_phase1[shard].to_string();
             let r = pool
                 .call(
@@ -476,8 +450,8 @@ fn f099m_recovery_per_shard() {
         }
 
         // Sanity: commit_length on each extent on its owner shard.
-        for &eid in &[300u64, 301u64] {
-            let shard = (eid % 2) as usize;
+        for &eid in &[300u64, 304u64] {
+            let shard = autumn_rpc::shard_for_extent(eid, 2) as usize;
             let addr = addrs_phase1[shard];
             let cl = commit_length_on(addr, eid).await.expect("rpc ok");
             assert_eq!(cl.code, autumn_rpc::manager_rpc::CODE_OK);
@@ -498,8 +472,8 @@ fn f099m_recovery_per_shard() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         // After restart: commit_length on owner shard must return the
         // saved data length. Cross-shard requests must still be rejected.
-        for &eid in &[300u64, 301u64] {
-            let owner = (eid % 2) as usize;
+        for &eid in &[300u64, 304u64] {
+            let owner = autumn_rpc::shard_for_extent(eid, 2) as usize;
             let other = 1 - owner;
             let cl = commit_length_on(addrs_phase2[owner], eid)
                 .await

@@ -3813,7 +3813,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             return addr.to_string();
         }
         let k = shard_ports.len();
-        let port = shard_ports[(extent_id as usize) % k];
+        // F-EN-SHARD-HASH: canonical hashed extent→shard map (was
+        // `extent_id % k`, which aliased bootstrap's contiguous ids onto shard
+        // 0). MUST match the EN `owns_extent` + StreamClient conn_pool routing.
+        let port = shard_ports[autumn_rpc::shard_for_extent(extent_id, k as u32) as usize];
         let trimmed = Self::normalize_endpoint(addr);
         if let Some(colon) = trimmed.rfind(':') {
             format!("{}:{}", &trimmed[..colon], port)

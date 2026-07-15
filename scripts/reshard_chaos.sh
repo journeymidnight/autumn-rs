@@ -5,8 +5,9 @@
 # A reshard is stop-the-world PER NODE: stop the EN, restart it with a different
 # core count (`--cpuset`), and it self-registers its new `shard_ports[]` (M1a).
 # The manager keys by node_uuid and updates the location in place (M0), so
-# routing (`shard_addr_for_extent` = extent_id % shard_count) remaps — but the
-# on-disk layout is hashed by crc32c(extent_id), NOT by shard, so NO bytes move;
+# routing (`shard_addr_for_extent` = shard_ports[shard_for_extent(extent_id,
+# shard_count)], a splitmix64 hash — F-EN-SHARD-HASH) remaps — but the on-disk
+# layout is hashed by crc32c(extent_id), NOT by shard, so NO bytes move;
 # a different shard just opens the same file.
 #
 # This test proves the correctness half: write a known corpus, then reshard

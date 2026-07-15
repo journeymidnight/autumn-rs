@@ -33,6 +33,37 @@ pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>
 /// Msg type reserved for heartbeat ping/pong.
 pub const MSG_TYPE_PING: u8 = 0xFF;
 
+/// F-EN-SHARD-HASH: the canonical extent → shard-index map. This is the ONE
+/// source of truth shared by the ExtentNode (`owns_extent` + sibling forward)
+/// and the manager / StreamClient shard routing (`shard_addr_for_extent`), so
+/// every layer agrees which shard serves an extent.
+///
+/// A splitmix64 finalizer (same mixer as `rotated_replica_start`) DECORRELATES
+/// the sequential extent ids `autumn-op bootstrap` allocates (7 stream ids per
+/// partition, contiguous) from the shard modulus: a raw `extent_id %
+/// shard_count` aliased every partition's data extents onto shard 0 (their ids
+/// were all ≡ 0 mod the shard count), concentrating all client-direct reads on
+/// one EN data port. The hash spreads them across all shards.
+///
+/// **Changing this remaps ownership of EXISTING extents, so it is a
+/// STOP-THE-WORLD reshard** (every EN shard + the manager must run the same
+/// mapping). It is byte-free — EN shards share the hashed on-disk data dirs, so
+/// only the logical shard→extent ownership re-partitions on restart; no etcd
+/// struct changes, so no reset is needed, just a coordinated restart.
+///
+/// `shard_count <= 1` (legacy single-shard / empty `shard_ports`) → shard 0.
+#[inline]
+pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut z = extent_id.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z % shard_count as u64) as u32
+}
+
 /// WIRE-1: build-time fingerprint of the wire-schema source files
 /// (manager_rpc / partition_rpc / frame / extent_rpc). Same-commit
 /// deploys share it; ANY wire-struct edit changes it. Exchanged via
@@ -269,6 +300,57 @@ compatibility; a mixed deploy decodes garbage silently). Upgrade one step at a \
 time (compat window is N ↔ N-1, docs/rolling_upgrade_design.md §5), or rebuild \
 this binary/wheel from the cluster's commit."
     ))
+}
+
+#[cfg(test)]
+mod shard_for_extent_tests {
+    use super::shard_for_extent;
+
+    #[test]
+    fn legacy_single_shard_is_zero() {
+        for id in [0u64, 1, 7, 12345, u64::MAX] {
+            assert_eq!(shard_for_extent(id, 0), 0);
+            assert_eq!(shard_for_extent(id, 1), 0);
+        }
+    }
+
+    #[test]
+    fn result_is_always_in_range() {
+        for count in [2u32, 3, 4, 8, 16] {
+            for id in 0..1000u64 {
+                assert!(shard_for_extent(id, count) < count);
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic() {
+        assert_eq!(shard_for_extent(999, 4), shard_for_extent(999, 4));
+    }
+
+    #[test]
+    fn bootstrap_contiguous_ids_spread_across_all_shards() {
+        // The regression F-EN-SHARD-HASH fixes: `autumn-op bootstrap` allocates
+        // a contiguous run of stream/extent ids (7 per partition), which under a
+        // raw `id % 4` all aliased onto shard 0. A well-mixed hash must hit every
+        // shard across such a run.
+        let count = 4u32;
+        let mut hit = [0usize; 4];
+        // Simulate 32 partitions × 7 contiguous ids each (ids 100..324).
+        for id in 100u64..324 {
+            hit[shard_for_extent(id, count) as usize] += 1;
+        }
+        for (shard, &n) in hit.iter().enumerate() {
+            assert!(n > 0, "shard {shard} got no extents — aliasing regressed");
+        }
+        // And the raw modulo it replaces DOES alias a strided subset: every 4th
+        // id maps to the same shard under `%`, but not under the hash.
+        let strided: Vec<u32> = (0u64..4).map(|k| shard_for_extent(100 + k * 4, count)).collect();
+        assert!(
+            strided.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "strided ids must NOT all land on one shard under the hash"
+        );
+    }
 }
 
 #[cfg(test)]

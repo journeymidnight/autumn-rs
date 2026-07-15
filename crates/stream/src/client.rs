@@ -279,11 +279,17 @@ pub(crate) fn replicated_read_order(
     if n == 0 {
         return Vec::new();
     }
-    let start = if ex.sealed {
-        rotated_replica_start(ex.extent_id, offset, n)
-    } else {
-        0
-    };
+    // F-READ-OPENTAIL-ROTATE: rotate the start replica for OPEN extents too,
+    // not just sealed ones. This fn is READ-PATH-EXCLUSIVE (the ZC-proxy value
+    // read + the chunked copy read are its only callers), and an open tail's
+    // COMMITTED prefix is on every replica (all-replica-ACK), so a committed VP
+    // read may start from any replica. Pre-fix open tails pinned `start = 0`
+    // (replica[0], the append leader), so every read of a hot open log-tail —
+    // exactly where fresh large values live — piled onto one EN. Appends are
+    // UNAFFECTED (they go through `launch_append`, replica[0]-first, not this
+    // fn). A rotated replica that is momentarily short on an UN-acked tail byte
+    // just fails over to the next slot; it can never be short on committed data.
+    let start = rotated_replica_start(ex.extent_id, offset, n);
     let eligible = eligible_replica_slots(ex);
     let filtered = eligible.len() < n;
     let node_ids = replica_node_ids(ex);
@@ -1832,8 +1838,9 @@ pub struct StreamClient {
     /// heartbeat health checks for extent nodes.
     pool: Rc<ConnPool>,
     /// Node-id → (address, shard_ports) map (refreshed on miss). F099-M:
-    /// `shard_ports` is used to route hot-path RPCs by `extent_id % K`.
-    /// Empty `shard_ports` means legacy single-thread extent-node.
+    /// `shard_ports` routes hot-path RPCs by
+    /// `autumn_rpc::shard_for_extent(extent_id, K)` (F-EN-SHARD-HASH; was
+    /// `extent_id % K`). Empty `shard_ports` means legacy single-thread EN.
     nodes_cache: DashMap<u64, (String, Vec<u16>)>,
     /// Cached ExtentInfo for read path.
     extent_info_cache: DashMap<u64, ExtentInfo>,
@@ -3744,7 +3751,31 @@ impl StreamClient {
                 )
                 .await
             {
-                Ok((pb, code)) if code == CODE_OK => return Ok(Some((pb, length as usize))),
+                Ok((pb, code)) if code == CODE_OK => {
+                    // F-READ-OPENTAIL-ROTATE defense-in-depth: the EN clamps an
+                    // over-range read to CODE_OK + a SHORT payload (`read_plan`),
+                    // and this ZC fast path — unlike the copy path (background.rs
+                    // `data.len() < read_len`) — has no length check: it hands
+                    // `pb` straight back as the value. Under all-replica-ACK a
+                    // committed VP read is on EVERY replica, so a short read
+                    // never happens; but now that open-tail reads ROTATE across
+                    // replicas (not just the append leader), verify the full
+                    // length came back and otherwise fall to the authoritative
+                    // copy path (its own rotation + failover + loud short-read
+                    // error) rather than silently return a truncated value.
+                    if pb.as_ref().len() == length as usize {
+                        return Ok(Some((pb, length as usize)));
+                    }
+                    tracing::warn!(
+                        extent_id,
+                        addr = %addr,
+                        want = length,
+                        got = pb.as_ref().len(),
+                        "ZC proxy read returned SHORT payload; falling back to copy path"
+                    );
+                    self.extent_info_cache.remove(&extent_id);
+                    return Ok(None);
+                }
                 Ok((_pb, _code)) => {
                     // eversion mismatch / EN-side error → bail to the copy path
                     // (it refetches ExtentInfo + re-routes EC). pb drops → pool.
@@ -3939,11 +3970,14 @@ impl StreamClient {
     /// F258 (a) — rotated start replica. Pre-F258 every read walked
     /// `addrs` from index 0, so ALL replicated read IO landed on
     /// replica[0] while the other two replicas' disks + NICs idled.
-    /// For SEALED extents (immutable; all-replica-ACK means every
-    /// committed byte is on every replica) the start index is rotated
-    /// by `(extent_id, offset)` hash — consecutive chunks of the
-    /// chunked large-read path naturally stripe across replicas.
-    /// Open-tail reads keep the legacy replica[0]-first order.
+    /// The start index is rotated by `(extent_id, offset)` hash — so
+    /// consecutive chunks of the chunked large-read path naturally
+    /// stripe across replicas. This applies to SEALED extents (immutable;
+    /// all-replica-ACK ⇒ every committed byte is on every replica) AND —
+    /// F-READ-OPENTAIL-ROTATE — to OPEN tails (their committed prefix is
+    /// likewise on every replica, so a committed VP read starts anywhere;
+    /// was replica[0]-first, which piled hot-tail reads on the append
+    /// leader). Appends are unaffected (they go through `launch_append`).
     ///
     /// F258 (b) — optional hedged read (off by default;
     /// `set_read_hedge_ms`). When enabled and the rotated-first replica
@@ -5266,19 +5300,28 @@ mod f276_suspected_read_tests {
 
     #[test]
     fn empty_suspected_preserves_rotated_order() {
-        // Common case: an empty Suspected snapshot must reproduce the pre-F276
-        // rotated order exactly (open extent → start 0 → 0,1,2).
+        // Common case: an empty Suspected snapshot must reproduce the pure
+        // rotated order (no Suspected reshuffle). F-READ-OPENTAIL-ROTATE: OPEN
+        // extents now rotate too, so the order is the contiguous rotation from
+        // `rotated_replica_start`, NOT a hardcoded [0,1,2].
         let ex = ext(vec![10, 20, 30], vec![], false, 0);
         let empty = HashSet::new();
-        assert_eq!(replicated_read_order(&ex, 0, &empty), vec![0, 1, 2]);
+        let start = rotated_replica_start(ex.extent_id, 0, 3);
+        let expected: Vec<usize> = (0..3).map(|i| (start + i) % 3).collect();
+        assert_eq!(replicated_read_order(&ex, 0, &empty), expected);
     }
 
     #[test]
     fn suspected_slot_moves_to_back_preserving_order() {
-        // node 20 (slot 1) suspected → tried last: [0, 2, 1].
+        // node 20 (slot 1) suspected → tried last; the healthy slots keep their
+        // rotated order (F-READ-OPENTAIL-ROTATE: open extent rotates, so derive
+        // the expectation from `rotated_replica_start` rather than assuming 0).
         let ex = ext(vec![10, 20, 30], vec![], false, 0);
         let s: HashSet<u64> = [20].into_iter().collect();
-        assert_eq!(replicated_read_order(&ex, 0, &s), vec![0, 2, 1]);
+        let start = rotated_replica_start(ex.extent_id, 0, 3);
+        let mut expected: Vec<usize> = (0..3).map(|i| (start + i) % 3).filter(|&s| s != 1).collect();
+        expected.push(1); // suspected slot 1 appended at the back
+        assert_eq!(replicated_read_order(&ex, 0, &s), expected);
     }
 
     #[test]
@@ -5292,6 +5335,26 @@ mod f276_suspected_read_tests {
         assert_eq!(order.len(), 3);
         let set: HashSet<usize> = order.into_iter().collect();
         assert_eq!(set, [0, 1, 2].into_iter().collect::<HashSet<usize>>());
+    }
+
+    #[test]
+    fn open_tail_read_rotates_across_replicas() {
+        // F-READ-OPENTAIL-ROTATE: an OPEN extent's reads must spread the start
+        // replica across offsets (was pinned to replica[0], concentrating all
+        // hot-tail reads on the append leader). Vary the offset and assert every
+        // replica gets picked as the start at least once.
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let empty = HashSet::new();
+        let mut seen_starts = HashSet::new();
+        for off in 0u64..300 {
+            let order = replicated_read_order(&ex, off * (8 << 20), &empty);
+            seen_starts.insert(order[0]);
+        }
+        assert_eq!(
+            seen_starts,
+            [0usize, 1, 2].into_iter().collect::<HashSet<usize>>(),
+            "open-tail reads must rotate across all replicas"
+        );
     }
 
     #[test]
