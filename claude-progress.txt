@@ -39,7 +39,19 @@ Retest (2026-07-14, DONE — image 16ae27f rolled out to VKE, stop-the-world):
   throughput). Prior healthy baseline was 3182 MB/s → now 3949 MB/s, clean.
   Extents now spread across all 5 EN (70/53/63/49/56), not shard-0-aliased.
 
-Next steps (optional, deferred backlog):
-  - F-EN-SHARD-HASH / F-READ-OPENTAIL-ROTATE — fix the underlying load skew
-    (the deadlines + damping only stop the STORM symptom).
-  - F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop.
+F-EN-SHARD-HASH + F-READ-OPENTAIL-ROTATE (2026-07-14, committed b29926a):
+  The load-skew CAUSE behind the read hotspot, now fixed.
+  - F-EN-SHARD-HASH: canonical autumn_rpc::shard_for_extent (splitmix64) routed
+    through all 5 extent→shard sites (EN owns_extent+sibling+2 errmsgs, manager +
+    conn_pool shard_addr_for_extent). Was `id % shard_count` → aliased bootstrap's
+    contiguous ids onto shard 0. Stop-the-world reshard, byte-free, no wire/etcd
+    change. Tests: shard_for_extent_tests + f099m_shards (hash-aware).
+  - F-READ-OPENTAIL-ROTATE: replicated_read_order rotates open-tail reads across
+    replicas (was replica[0]-pinned). Appends unaffected. coco P1: ZC value path
+    now verifies full length (falls to copy path on short read).
+  - 104 stream lib + 48 rpc + 195 PS + 0 clippy; coco P1 fixed + P3 comments synced.
+
+Next steps:
+  1. Push -> CP builds -> rollout (stop-the-world; the reshard needs EN+manager on
+     the new mapping together) -> perf test vs TOS (~/perf_tos_compare.md).
+  2. F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop (still deferred).
