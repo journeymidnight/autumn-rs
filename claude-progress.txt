@@ -51,7 +51,21 @@ F-EN-SHARD-HASH + F-READ-OPENTAIL-ROTATE (2026-07-14, committed b29926a):
     now verifies full length (falls to copy path on short read).
   - 104 stream lib + 48 rpc + 195 PS + 0 clippy; coco P1 fixed + P3 comments synced.
 
-Next steps:
-  1. Push -> CP builds -> rollout (stop-the-world; the reshard needs EN+manager on
-     the new mapping together) -> perf test vs TOS (~/perf_tos_compare.md).
-  2. F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop (still deferred).
+F-CL-PARALLEL (2026-07-15, committed fa722e3): the manager probed the 3 replicas
+  SEQUENTIALLY in commit_length (5s each → 15s = the PS CHECK_COMMIT_LENGTH
+  deadline), so one cold EN timed out the whole partition-open probe under the
+  concurrent-open herd. Fixed: join_all the per-replica probes (both open-path +
+  failover-seal). Validated on redeploy: 15s timeouts 0 (was the storm cause);
+  residual "0/N reachable" retries are EN-binds-late (startup handshake), benign.
+
+DEPLOYED + VALIDATED on VKE (image fa722e3, stop-the-world reshard):
+  - Perf vs TOS: 4KB read 167K/write 82K ops/s (~228×/187×); 8MB read direct
+    5,826 MB/s (~7.6×) / proxy 2,272 (~3.0×) — both JUMPED, ZERO storm; 8MB write
+    ~950 MB/s (~1.06×). ~/perf_tos_compare.md updated.
+  - Reshard byte-free, no data loss (7+ GB partitions intact, put/get round-trip).
+  - Cold-start 15s commit_length timeouts eliminated.
+
+Next steps (deferred backlog):
+  - F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop.
+  - (minor) all 32 partitions land on 1 PS after restart (rebalance quirk,
+    pre-existing, EN-bound perf unaffected); EN binds ~65s into cold start.
