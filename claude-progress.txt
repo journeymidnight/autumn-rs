@@ -1,52 +1,37 @@
 Date: 2026-07-14
 TaskStatus: completed
-Task scope: BUG-FLUSH-TIMEOUT-LEAK — live 5-node cluster wedge (10.4 TB leaked
-  for 222 GB logical, 47x amplification, disks full, all writes dead). Two
-  fixes in crates/stream/src/client.rs, reproduce-first.
+Task scope: BUG-READ-TIMEOUT-STORM — generalize the write-only size-scaled
+  append deadline into a shared IoDeadline primitive and apply it to the READ
+  paths (the 8 MiB direct-read timeout storm: 566-646 "direct read TIMED OUT"
+  under 32 concurrent 8 MiB direct reads on one congested EN).
 
-Current summary (working tree only — NOT committed, per task instruction):
-  FIX #1 (trigger): size-scaled append deadline. `effective_append_timeout` =
-    min(append_fanout_timeout + payload_len / append_floor_bytes_per_sec, 600s).
-    New StreamClientConfig.append_floor_bytes_per_sec (default 8 MiB/s,
-    builder clamp [64 KiB/s, 1 GiB/s]); threaded into launch_append as
-    AppendDeadline::for_payload (chain path scales too). 4 KiB WAL -> 5 s
-    unchanged; 256 MiB SST -> 37 s; 512 MiB compaction -> 69 s. F121
-    boundedness preserved via the 600 s cap.
-  FIX #2 (amplifier): reclaim_abandoned_empty_tail — after a failure-roll
-    alloc_new_extent(stream, Some(0), seal_eid) succeeds, re-fetch the
-    AUTHORITATIVE post-seal ExtentInfo (cache invalidated) and, only if
-    sealed==true && sealed_length==0, best-effort punch_holes the abandoned
-    tail (refs-- -> physical delete). Safety: caller-ack ⊆ commit => a
-    sealed-at-0 extent has no acked byte => no VP/SST/checkpoint reference.
-  Reproduce-first tests (red captured before each fix):
-    - client::append_deadline_tests (red: "256 MiB deadline ... got 5s")
-    - crates/manager/tests/bug_flush_timeout_leak.rs (red: "abandoned empty
-      tail 7 leaked: still a stream member [6, 7, 8, 9]"); new
-      support::start_extent_node_stoppable helper.
-  Green: autumn-stream --lib 99 + --tests all green; autumn-partition-server
-    --lib 195 green; bug_flush_timeout_leak 3/3 stable; f109_physical_deletion,
-    system_extent_failover green. clippy: no new warnings (pre-existing
-    extent_node test + PS RefCell warnings untouched).
-  Known-flaky note: crates/manager/tests/integration.rs recovery-replay tests
-    fail identically on BASELINE (stash-verified, both parallel and serial) on
-    this macOS box — pre-existing environment flakiness, NOT a regression.
-    Also: manager test targets don't build on this mac without a pkg-config
-    shim (fuser dev-dep needs macFUSE); used a fake pkg-config for test runs.
-  Docs: stream CLAUDE.md Programming Note 28 (+ notes 17/20 cross-refs);
-    partition-server CLAUDE.md P-bulk section cross-ref; feature_list.md new
-    open entry F-SEALED-EMPTY-SWEEP (manager backstop sweep for writer-death /
-    punch-failure residuals + pre-fix 40k-extent backlog).
+Current summary (committed 954dc6a):
+  IoDeadline (renamed from AppendDeadline; effective_io_timeout, IO_TIMEOUT_CAP,
+    for_len/for_chain) is now shared by append + read. Reads use SEPARATE params
+    read_base_timeout 3 s + read_floor_bytes_per_sec 4 MiB/s (looser than the
+    8 MiB/s append floor — no RF=3 fsync barrier). 8 MiB read -> 5 s, 256 MiB
+    chunk -> 67 s (< 600 s cap, never binds). Applied at all 5 size-varying read
+    sites (read_extent_value_direct, read_value_into_pooled,
+    read_shard_chunk_from_addr, ec_reconstruct_shard_subrange, ec_read_full).
+  Retry damping on liveness timeout (is_liveness_timeout): read_redirect_replicas
+    (client) + read_value_into_pooled (stream) stop walking replicas after 2
+    timeouts, fall through to the authoritative proxy/copy path. Fast errors keep
+    the full rotation.
+  Append boundedness preserved verbatim (cap + for_chain-caps-after-multiply).
+  Green: 103 stream lib (7 io_deadline_tests) + 27 client + 195 partition-server;
+    0 clippy. coco (GPT-5.5 deep) 3 findings triaged (EC loser-timeout trade-off
+    documented — EC off by default; public-config-field non-issue; test comment
+    clarified). Stream CLAUDE.md note 29; feature_list F-EN-SHARD-HASH +
+    F-READ-OPENTAIL-ROTATE (the underlying load-imbalance CAUSE, deferred).
 
 Main gaps:
-  - F-SEALED-EMPTY-SWEEP (backstop + backlog cleanup) deferred — see
-    feature_list.md.
-  - coco review of this diff not yet run (CLAUDE.md rule 12) — recommended
-    before commit.
-  - Changes intentionally uncommitted; commit + live-cluster validation
-    (re-run a bulk flush under load, verify no 5s timeouts + df shows debt
-    reclaimed) is the next session's step.
+  - The load-imbalance CAUSE (shard-0 aliasing + open-tail replica[0] pinning)
+    is recorded but NOT fixed — deadlines + damping only stop the STORM. See
+    feature_list F-EN-SHARD-HASH / F-READ-OPENTAIL-ROTATE.
+  - F-SEALED-EMPTY-SWEEP (BUG-FLUSH-TIMEOUT-LEAK backstop) still deferred.
 
 Next steps:
-  1. coco findbugs on the working diff; then commit.
-  2. Deploy to the wedged VKE cluster; the pre-fix ~40k leaked extents need
-     F-SEALED-EMPTY-SWEEP (or a one-off operator script) to drain.
+  1. Push -> CP pipeline builds image; rollout to VKE cluster.
+  2. Re-test 8 MiB direct-read (user: "全部修好后，重新测试") — verify the
+     "direct read TIMED OUT" storm is gone and 8 MiB direct read throughput is
+     healthy (no longer 3 s-timeout-polluted).
