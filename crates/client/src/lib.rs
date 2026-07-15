@@ -1798,6 +1798,17 @@ impl ClusterClient {
         }
         let start = (resp.extent_id ^ (resp.value_offset << 32)) as usize % n;
         let mut saw_timeout = false;
+        // BUG-READ-TIMEOUT-STORM: damp the retry on LIVENESS TIMEOUTS. The
+        // pre-fix loop walked ALL replicas at a fresh full (now size-scaled)
+        // deadline on any failure, then the caller ran a full proxy read — so a
+        // transient congestion event on one hot EN (the single-shard/replica[0]
+        // pinning) amplified into 566-646 timeouts + wasted EN egress. Now: on
+        // the FIRST timeout, try at most ONE more replica (the common
+        // single-dead-EN case where a sibling serves at full direct bandwidth);
+        // on the SECOND, stop and let the authoritative PS proxy fallback take
+        // over. FAST errors (eversion bump / GC'd / connect refusal) keep the
+        // full rotation — they're cheap and a sibling usually resolves them.
+        let mut timeouts = 0usize;
         for i in 0..n {
             let addr = &resp.replica_addrs[(start + i) % n];
             match autumn_stream::read_extent_value_direct(
@@ -1823,12 +1834,18 @@ impl ClusterClient {
                     let msg = format!("{e:#}");
                     if msg.contains("timed out") {
                         saw_timeout = true;
+                        timeouts += 1;
                         tracing::warn!(
                             extent_id = resp.extent_id,
                             addr = %addr,
                             error = %msg,
                             "direct read TIMED OUT; trying next replica"
                         );
+                        // Damp: 2 consecutive-ish timeouts = systemic
+                        // congestion; stop gambling deadlines → proxy fallback.
+                        if timeouts >= 2 {
+                            break;
+                        }
                     } else {
                         tracing::debug!(
                             extent_id = resp.extent_id,

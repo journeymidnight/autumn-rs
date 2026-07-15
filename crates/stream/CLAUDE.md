@@ -1582,6 +1582,48 @@ sufficient (and cheaper than DashMap).
       (SealCommit), 22 (commit preservation), manager note 32a
       (idempotent roll).
 
+29. **BUG-READ-TIMEOUT-STORM (2026-07-15) — the READ paths now use the same
+    size-scaled deadline; the write-only `AppendDeadline` was generalized to
+    `IoDeadline`.** Same class of bug as note 28 but on reads: a fixed
+    `Duration::from_secs(3)` (and 5 s on the two EC read sites) applied to an
+    8 MiB transfer stormed under load — 566-646 `direct read TIMED OUT` on the
+    live cluster when 32 concurrent 8 MiB direct reads queued on a congested EN
+    (the single-shard / open-tail-replica[0] pinning, see F-EN-SHARD-HASH /
+    F-READ-OPENTAIL-ROTATE), then a full-replica-walk retry (+ proxy) amplified
+    it. Two-part fix:
+    - **`IoDeadline` (renamed from `AppendDeadline`; `effective_io_timeout`,
+      `IO_TIMEOUT_CAP`) is now shared.** READS use a SEPARATE (base, floor):
+      `read_base_timeout` 3 s (the pre-existing fixed read deadline → every read
+      < ~4 MiB byte-identical to before, zero hot-GET regression) and
+      `read_floor_bytes_per_sec` 4 MiB/s (looser than the 8 MiB/s append floor —
+      a read is one replica's pread + transfer, no RF=3 fsync barrier). 8 MiB
+      read → 5 s; a 256 MiB chunk → 67 s (< the shared 600 s cap — the cap is
+      NEVER binding for reads because every read RPC is chunk-bounded ≤
+      `read_chunk_bytes`; do NOT lower the cap below 67 s). Applied at ALL FIVE
+      size-varying read sites: `read_extent_value_direct` (free fn — no config,
+      uses the shared `pub const DEFAULT_READ_*`), `read_value_into_pooled`,
+      `read_shard_chunk_from_addr` (the single MSG_READ_BYTES choke point for
+      replicated failover AND EC per-shard), `ec_reconstruct_shard_subrange`,
+      `ec_read_full` (scaled by `shard_size(sealed_length, K)`).
+    - **Retry damping on LIVENESS TIMEOUT** (`is_liveness_timeout`): the direct
+      path (`client/src/lib.rs::read_redirect_replicas`) and the ZC proxy path
+      (`read_value_into_pooled`) stop walking replicas after 2 timeouts and fall
+      through to the authoritative proxy / copy path, instead of gambling a full
+      (now larger) deadline per remaining replica. FAST errors (eversion / GC'd
+      / connect-refusal) keep the full rotation (cheap, a sibling resolves them).
+    **INVARIANT: any size-varying network I/O MUST derive its deadline from an
+    `IoDeadline::for_len(len)` (read or write params), NEVER a fixed
+    `Duration::from_secs(N)`.** Control-plane RPCs (commit_length, probe,
+    stream/extent_info, alloc, punch, owner-lock) are fixed-size → a constant is
+    correct there. Append boundedness (note 28: every `InflightFut` resolves
+    within the cap) is preserved verbatim — the rename kept the cap value + the
+    `for_chain`-caps-after-multiply guard. Tests: `io_deadline_tests` (read
+    scaling, floor independence, `is_liveness_timeout` classification, + the
+    append tests unchanged). NOT fixed here: the underlying LOAD imbalance that
+    made reads congest one EN (F-EN-SHARD-HASH shard-0 aliasing +
+    F-READ-OPENTAIL-ROTATE open-tail replica[0] pinning) — deadlines + damping
+    stop the STORM, the hotspot features fix the CAUSE. Cross-ref note 28.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

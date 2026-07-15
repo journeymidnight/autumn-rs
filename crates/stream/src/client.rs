@@ -134,7 +134,20 @@ pub async fn read_extent_value_direct(
         length,
     };
     let (pb, code) = pool
-        .call_into_pooled(addr, MSG_READ_BYTES_ZC, req.encode(), Duration::from_secs(3))
+        // BUG-READ-TIMEOUT-STORM: size-scale the deadline (was a fixed 3 s that
+        // stormed on 8 MiB reads). This free fn holds no StreamClientConfig (the
+        // client-SDK EN-direct path), so it uses the shared `DEFAULT_READ_*`
+        // consts — same source of truth as `StreamClientConfig::default`.
+        .call_into_pooled(
+            addr,
+            MSG_READ_BYTES_ZC,
+            req.encode(),
+            IoDeadline {
+                base: DEFAULT_READ_BASE_TIMEOUT,
+                floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC,
+            }
+            .for_len(length),
+        )
         .await?;
     if code != CODE_OK {
         return Err(anyhow!(
@@ -683,7 +696,7 @@ pub struct StreamClientConfig {
     pub append_fanout_timeout: Duration,
     /// BUG-FLUSH-TIMEOUT-LEAK: the per-append deadline scales with payload
     /// size — `deadline = append_fanout_timeout + payload_len / this`
-    /// (see `effective_append_timeout`). The F121 fixed 5 s deadline was
+    /// (see `effective_io_timeout`). The F121 fixed 5 s deadline was
     /// sized for 4 KiB WAL appends; applied verbatim to a 256 MiB SST
     /// flush it CANNOT be met under load (live cluster: 788× "append
     /// timeout after 5s" while every EN had durably written all ~255 MB),
@@ -703,6 +716,16 @@ pub struct StreamClientConfig {
     /// compaction output (2 × MAX_SKIP_LIST) → 69 s.
     pub append_floor_bytes_per_sec: u64,
     pub read_chunk_bytes: u64,
+    /// BUG-READ-TIMEOUT-STORM: the READ side of the size-scaled I/O deadline
+    /// (`IoDeadline`), SEPARATE from the append side because a read has no
+    /// RF=3 all-replica-fsync barrier — it is one replica's pread + transfer.
+    /// `read_base_timeout` is the size-independent slack (RTT + queueing),
+    /// `read_floor_bytes_per_sec` the assumed worst-case sustained read
+    /// throughput. Default read deadline = `read_base + len / read_floor`,
+    /// clamped to `IO_TIMEOUT_CAP`. See `DEFAULT_READ_*` for the derivation.
+    /// Replaces the hardcoded fixed 3 s that stormed on 8 MiB reads.
+    pub read_base_timeout: Duration,
+    pub read_floor_bytes_per_sec: u64,
     pub synced_poll: Duration,
     pub synced_timeout: Duration,
 }
@@ -715,18 +738,52 @@ impl Default for StreamClientConfig {
             append_fanout_timeout: Duration::from_secs(5),
             append_floor_bytes_per_sec: 8 * 1024 * 1024,
             read_chunk_bytes: 256 * 1024 * 1024,
+            read_base_timeout: DEFAULT_READ_BASE_TIMEOUT,
+            read_floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC,
             synced_poll: Duration::from_millis(2),
             synced_timeout: Duration::from_secs(30),
         }
     }
 }
 
-/// BUG-FLUSH-TIMEOUT-LEAK: hard ceiling on the size-scaled append deadline.
-/// Preserves the F121 dead-replica bound — every append still resolves
-/// (success/error/timeout) within a bounded window, so `drain_inflight_for_seal`
-/// and the failover SealCommit handshake can never hang. 10 min covers a
-/// 4 GiB payload (the frame `payload_len: u32` wire ceiling) at ~7 MiB/s.
-pub(crate) const EFFECTIVE_APPEND_TIMEOUT_CAP: Duration = Duration::from_secs(600);
+/// BUG-FLUSH-TIMEOUT-LEAK: hard ceiling on the size-scaled I/O deadline (shared
+/// by append AND read). Preserves the F121 dead-replica bound — every append
+/// still resolves (success/error/timeout) within a bounded window, so
+/// `drain_inflight_for_seal` and the failover SealCommit handshake can never
+/// hang. 10 min covers a 4 GiB payload (the frame `payload_len: u32` wire
+/// ceiling) at ~7 MiB/s. For READS the cap is never binding: every read RPC is
+/// chunk-bounded to `read_chunk_bytes` (≤ 256 MiB), so the largest scaled read
+/// deadline is `read_base + 256 MiB / read_floor` ≈ 67 s — do NOT lower this cap
+/// to clip that, it would break the legitimate large-chunk read.
+pub(crate) const IO_TIMEOUT_CAP: Duration = Duration::from_secs(600);
+
+/// BUG-READ-TIMEOUT-STORM: default READ-side `IoDeadline` knobs. Exposed as
+/// `pub` so the config-free `read_extent_value_direct` (the client-SDK EN-direct
+/// path, which holds no `StreamClientConfig`) uses the SAME source of truth as
+/// `StreamClientConfig::default()`. Read base 3 s = the pre-existing fixed read
+/// deadline (every read < ~4 MiB stays byte-identical to today → zero hot-GET
+/// regression). Read floor 4 MiB/s (looser than the 8 MiB/s append floor: a read
+/// is one replica's pread + transfer, no fsync barrier) sits ~1.7 orders below
+/// the worst measured wire-bound read throughput (193–601 MB/s cross-host TCP,
+/// docs/perf_tcp_vs_ucx_xhost.md) — it distinguishes a dead replica from
+/// slow-but-progressing under congestion, not typical latency. Resulting 8 MiB
+/// read deadline = 3 + 2 = 5 s (was a fixed 3 s that stormed: 566–646 timeouts
+/// when 32 concurrent 8 MiB direct reads queued on a ~200 MB/s wire).
+pub const DEFAULT_READ_BASE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_READ_FLOOR_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// BUG-READ-TIMEOUT-STORM: is this error a LIVENESS timeout (deadline / connect
+/// timeout — the replica isn't answering) vs a FAST error (NotFound, wrong
+/// shard, eversion-stale, connection refused with a code)? Only a liveness
+/// timeout damps the retry (go to proxy after ≤1 more replica instead of walking
+/// them all at a fresh full deadline); a fast error keeps the full rotation
+/// (cheap, and usually an addressing/GC-churn issue a sibling replica resolves).
+/// Matches the message strings `conn_pool` emits (`"timed out after"`) — the same
+/// contract already relied on at the two damping sites; centralised here.
+pub(crate) fn is_liveness_timeout(err: &anyhow::Error) -> bool {
+    let m = err.to_string();
+    m.contains("timed out after") || m.contains("timed out")
+}
 
 /// BUG-FLUSH-TIMEOUT-LEAK FIX #1: derive the per-replica append deadline from
 /// the ACTUAL payload size instead of applying one fixed constant to every
@@ -735,7 +792,7 @@ pub(crate) const EFFECTIVE_APPEND_TIMEOUT_CAP: Duration = Duration::from_secs(60
 /// deadline, F121); the scaled term covers transfer + write time at an assumed
 /// worst-case throughput floor (see `StreamClientConfig::
 /// append_floor_bytes_per_sec` for the derivation of the default floor).
-pub(crate) fn effective_append_timeout(
+pub(crate) fn effective_io_timeout(
     base: Duration,
     floor_bytes_per_sec: u64,
     payload_len: u64,
@@ -744,37 +801,37 @@ pub(crate) fn effective_append_timeout(
     // the default is 8 MiB/s) degrades to the pre-fix fixed-base behaviour
     // rather than dividing by zero.
     if floor_bytes_per_sec == 0 {
-        return base.min(EFFECTIVE_APPEND_TIMEOUT_CAP);
+        return base.min(IO_TIMEOUT_CAP);
     }
     let scaled = Duration::from_secs_f64(payload_len as f64 / floor_bytes_per_sec as f64);
-    base.saturating_add(scaled).min(EFFECTIVE_APPEND_TIMEOUT_CAP)
+    base.saturating_add(scaled).min(IO_TIMEOUT_CAP)
 }
 
 /// BUG-FLUSH-TIMEOUT-LEAK: per-worker snapshot of the two deadline knobs,
 /// threaded from `StreamClientConfig` into `launch_append` so each append's
-/// timeout is derived from ITS payload size (`for_payload`).
+/// timeout is derived from ITS payload size (`for_len`).
 #[derive(Clone, Copy)]
-pub(crate) struct AppendDeadline {
+pub(crate) struct IoDeadline {
     pub base: Duration,
     pub floor_bytes_per_sec: u64,
 }
 
-impl AppendDeadline {
-    pub(crate) fn for_payload(&self, payload_len: u64) -> Duration {
-        effective_append_timeout(self.base, self.floor_bytes_per_sec, payload_len)
+impl IoDeadline {
+    pub(crate) fn for_len(&self, payload_len: u64) -> Duration {
+        effective_io_timeout(self.base, self.floor_bytes_per_sec, payload_len)
     }
 
     /// F260 chained append: the ack traverses every hop store-and-forward, so
     /// the budget is the per-hop (already size-scaled) deadline × hops × 3.
     ///
     /// coco P2: the cap is applied AFTER the multiplier. Clamping only inside
-    /// `for_payload` and THEN multiplying blew past it (RF=3 ⇒ 600 s × 9 =
+    /// `for_len` and THEN multiplying blew past it (RF=3 ⇒ 600 s × 9 =
     /// 90 min), breaking the boundedness the whole fix rests on — EVERY
-    /// `InflightFut` must resolve within `EFFECTIVE_APPEND_TIMEOUT_CAP` or
+    /// `InflightFut` must resolve within `IO_TIMEOUT_CAP` or
     /// `drain_inflight_for_seal` / the SealCommit handshake (note 20) can hang
     /// for that multiplied window, stalling the roll and the whole stream.
     pub(crate) fn for_chain(&self, payload_len: u64, hops: u32) -> Duration {
-        (self.for_payload(payload_len) * hops.max(1) * 3).min(EFFECTIVE_APPEND_TIMEOUT_CAP)
+        (self.for_len(payload_len) * hops.max(1) * 3).min(IO_TIMEOUT_CAP)
     }
 }
 
@@ -787,7 +844,7 @@ impl StreamClientConfig {
     }
     /// F195: F121 fanout clamp `[200 ms, 60 s]`. Post-BUG-FLUSH-TIMEOUT-LEAK
     /// this is the BASE deadline only (the payload-scaled term is added on
-    /// top per append — see `effective_append_timeout`), so the 60 s ceiling
+    /// top per append — see `effective_io_timeout`), so the 60 s ceiling
     /// stays correct: it bounds the size-independent slack, not the transfer
     /// time of a large payload.
     pub fn with_append_fanout_timeout(mut self, t: Duration) -> Self {
@@ -805,6 +862,30 @@ impl StreamClientConfig {
             bps.clamp(64 * 1024, 1024 * 1024 * 1024)
         };
         self
+    }
+    /// BUG-READ-TIMEOUT-STORM: read-side base deadline. Clamp `[200 ms, 60 s]`
+    /// (same as the append base — bounds the size-independent slack).
+    pub fn with_read_base_timeout(mut self, t: Duration) -> Self {
+        let ms = t.as_millis().clamp(200, 60_000) as u64;
+        self.read_base_timeout = Duration::from_millis(ms);
+        self
+    }
+    /// BUG-READ-TIMEOUT-STORM: read-side throughput floor. Clamp
+    /// `[64 KiB/s, 1 GiB/s]`; 0 → default (4 MiB/s).
+    pub fn with_read_floor_bytes_per_sec(mut self, bps: u64) -> Self {
+        self.read_floor_bytes_per_sec = if bps == 0 {
+            DEFAULT_READ_FLOOR_BYTES_PER_SEC
+        } else {
+            bps.clamp(64 * 1024, 1024 * 1024 * 1024)
+        };
+        self
+    }
+    /// BUG-READ-TIMEOUT-STORM: the read-side `IoDeadline` (base + len/floor).
+    pub(crate) fn read_deadline(&self) -> IoDeadline {
+        IoDeadline {
+            base: self.read_base_timeout,
+            floor_bytes_per_sec: self.read_floor_bytes_per_sec,
+        }
     }
     /// F195: per-stream FU cap. 0 → default 32.
     pub fn with_inflight_cap(mut self, cap: usize) -> Self {
@@ -839,44 +920,99 @@ impl StreamClientConfig {
 /// and rewrote the same SST, leaking 255 MB per iteration (10.4 TB of
 /// unreclaimable extents for 222 GB of logical data).
 #[cfg(test)]
-mod append_deadline_tests {
+mod io_deadline_tests {
     use super::*;
 
+    // BUG-READ-TIMEOUT-STORM: the READ side of IoDeadline.
+    #[test]
+    fn read_deadline_scales_and_keeps_hot_path() {
+        let cfg = StreamClientConfig::default();
+        let d = cfg.read_deadline();
+        // 4 KiB read stays at ~the 3 s base (adds 4 KiB/4 MiB/s ≈ 1 ms — hot GET
+        // path effectively unchanged).
+        let small = d.for_len(4 * 1024);
+        assert!(small >= DEFAULT_READ_BASE_TIMEOUT);
+        assert!(small < DEFAULT_READ_BASE_TIMEOUT + Duration::from_millis(5));
+        // 8 MiB read: base 3 s + 8 MiB / 4 MiB/s = 5 s (was a FIXED 3 s that
+        // stormed — 566-646 timeouts on the live cluster).
+        assert_eq!(d.for_len(8 * 1024 * 1024), Duration::from_secs(5));
+        // A 256 MiB chunk (the read_chunk_bytes ceiling) → 3 + 64 = 67 s,
+        // still well under the shared IO cap — do NOT clip the cap below this.
+        let chunk = d.for_len(256 * 1024 * 1024);
+        assert_eq!(chunk, Duration::from_secs(67));
+        assert!(chunk < IO_TIMEOUT_CAP);
+        // Any size is capped.
+        assert_eq!(d.for_len(u64::MAX), IO_TIMEOUT_CAP);
+    }
+
+    #[test]
+    fn read_and_write_floors_are_independent() {
+        let cfg = StreamClientConfig::default();
+        // Read floor is looser (4 MiB/s) than the write/append floor (8 MiB/s),
+        // because a read has no RF=3 all-replica-fsync barrier.
+        assert_eq!(cfg.read_floor_bytes_per_sec, 4 * 1024 * 1024);
+        assert_eq!(cfg.append_floor_bytes_per_sec, 8 * 1024 * 1024);
+        // 8 MiB: read = 3 s base + 8/4 = 5 s; write = 5 s base + 8/8 = 6 s. The
+        // read's looser floor is more than offset by its smaller base, so a read
+        // deadline is NOT simply "bigger because the floor is looser".
+        let rd = cfg.read_deadline().for_len(8 << 20);
+        let wr = IoDeadline { base: cfg.append_fanout_timeout, floor_bytes_per_sec: cfg.append_floor_bytes_per_sec }.for_len(8 << 20);
+        assert_eq!(rd, Duration::from_secs(5));
+        assert_eq!(wr, Duration::from_secs(6));
+    }
+
+    // BUG-READ-TIMEOUT-STORM: the retry-damping classifier. A liveness timeout
+    // (deadline / connect timeout) damps the walk; a fast error keeps rotating.
+    #[test]
+    fn is_liveness_timeout_classifies_correctly() {
+        assert!(is_liveness_timeout(&anyhow::anyhow!(
+            "call_into_pooled timed out after 5s"
+        )));
+        assert!(is_liveness_timeout(&anyhow::anyhow!("connect 1.2.3.4:9101 timed out after 5s")));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!(
+            "direct read from 1.2.3.4:9101: code=locked"
+        )));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!("NotFound")));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!(
+            "eversion mismatch: cached=1 got=2"
+        )));
+    }
+
     /// coco P2 regression: the F260 chain path multiplies the per-hop deadline by
-    /// hops×3. If the cap is applied only INSIDE `for_payload` (before the
+    /// hops×3. If the cap is applied only INSIDE `for_len` (before the
     /// multiply), a capped 600 s becomes 90 min at RF=3 — breaking the invariant
     /// every other part of this fix rests on: EVERY `InflightFut` resolves within
-    /// `EFFECTIVE_APPEND_TIMEOUT_CAP`, so `drain_inflight_for_seal` / SealCommit
+    /// `IO_TIMEOUT_CAP`, so `drain_inflight_for_seal` / SealCommit
     /// can never hang. The cap must come AFTER the multiply.
     #[test]
     fn chain_deadline_stays_capped_after_the_hop_multiplier() {
         let cfg = StreamClientConfig::default();
-        let d = AppendDeadline {
+        let d = IoDeadline {
             base: cfg.append_fanout_timeout,
             floor_bytes_per_sec: cfg.append_floor_bytes_per_sec,
         };
-        // A payload big enough that `for_payload` itself saturates the cap.
+        // A payload big enough that `for_len` itself saturates the cap.
         let huge = 64u64 * 1024 * 1024 * 1024; // 64 GiB
-        assert_eq!(d.for_payload(huge), EFFECTIVE_APPEND_TIMEOUT_CAP);
+        assert_eq!(d.for_len(huge), IO_TIMEOUT_CAP);
         for hops in [1u32, 3, 5, 16] {
             assert!(
-                d.for_chain(huge, hops) <= EFFECTIVE_APPEND_TIMEOUT_CAP,
+                d.for_chain(huge, hops) <= IO_TIMEOUT_CAP,
                 "chain deadline must stay ≤ cap after ×{hops}×3 (was the 90-min bug)"
             );
         }
         // The multiplier still WIDENS a normal 256 MiB SST (store-and-forward
         // stacks hop latencies) — it just can't escape the cap.
         let sst = 256u64 * 1024 * 1024;
-        let per_hop = d.for_payload(sst);
+        let per_hop = d.for_len(sst);
         let chain = d.for_chain(sst, 3);
         assert!(chain > per_hop, "chain budget must exceed the per-hop budget");
-        assert!(chain <= EFFECTIVE_APPEND_TIMEOUT_CAP);
+        assert!(chain <= IO_TIMEOUT_CAP);
     }
 
     #[test]
     fn small_wal_append_keeps_base_deadline() {
         let cfg = StreamClientConfig::default();
-        let d = effective_append_timeout(
+        let d = effective_io_timeout(
             cfg.append_fanout_timeout,
             cfg.append_floor_bytes_per_sec,
             4 * 1024,
@@ -895,7 +1031,7 @@ mod append_deadline_tests {
         // FLUSH_MEM_BYTES = 256 MiB (partition-server lib.rs:53): one SST
         // upload. 3-replica fanout + fsync of 256 MiB cannot finish in 5 s
         // under load; the deadline must cover payload / assumed-floor.
-        let d_sst = effective_append_timeout(
+        let d_sst = effective_io_timeout(
             cfg.append_fanout_timeout,
             cfg.append_floor_bytes_per_sec,
             256 << 20,
@@ -909,7 +1045,7 @@ mod append_deadline_tests {
 
         // do_compact finalizes SSTs at 2 × MAX_SKIP_LIST = 512 MiB — the
         // deadline must keep scaling, not plateau at a hand-picked constant.
-        let d_compact = effective_append_timeout(
+        let d_compact = effective_io_timeout(
             cfg.append_fanout_timeout,
             cfg.append_floor_bytes_per_sec,
             512 << 20,
@@ -926,15 +1062,15 @@ mod append_deadline_tests {
         // bounded window (SealCommit drain depends on it). Even an absurd
         // payload is capped.
         let cfg = StreamClientConfig::default();
-        let d = effective_append_timeout(
+        let d = effective_io_timeout(
             cfg.append_fanout_timeout,
             cfg.append_floor_bytes_per_sec,
             u64::MAX,
         );
-        assert!(d <= EFFECTIVE_APPEND_TIMEOUT_CAP, "deadline must be capped, got {d:?}");
+        assert!(d <= IO_TIMEOUT_CAP, "deadline must be capped, got {d:?}");
         // Zero floor must not divide-by-zero / produce a degenerate deadline.
-        let z = effective_append_timeout(cfg.append_fanout_timeout, 0, 256 << 20);
-        assert!(z >= cfg.append_fanout_timeout && z <= EFFECTIVE_APPEND_TIMEOUT_CAP);
+        let z = effective_io_timeout(cfg.append_fanout_timeout, 0, 256 << 20);
+        assert!(z >= cfg.append_fanout_timeout && z <= IO_TIMEOUT_CAP);
     }
 }
 
@@ -1138,8 +1274,8 @@ async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receive
 /// SealCommit drain: await EVERY in-flight append and apply its completion so
 /// `state.commit` reaches its final contiguous all-replica-acked prefix before
 /// the worker reports the seal watermark. Bounded by each append's
-/// size-scaled deadline (`effective_append_timeout`, hard-capped at
-/// `EFFECTIVE_APPEND_TIMEOUT_CAP` — every `InflightFut` resolves within it:
+/// size-scaled deadline (`effective_io_timeout`, hard-capped at
+/// `IO_TIMEOUT_CAP` — every `InflightFut` resolves within it:
 /// success, error, or timeout), so it cannot hang even if a replica is dead. After this
 /// returns, `inflight` is empty and `state.commit` is the exact length to seal
 /// the current tail at: every all-replica-acked byte is included, every
@@ -1165,7 +1301,7 @@ async fn apply_stream_submit_msg(
     inflight: &mut FuturesUnordered<InflightFut>,
     msg: StreamSubmitMsg,
     stream_id: u64,
-    append_deadline: AppendDeadline,
+    append_deadline: IoDeadline,
 ) -> std::ops::ControlFlow<()> {
     match msg {
         StreamSubmitMsg::Shutdown => return std::ops::ControlFlow::Break(()),
@@ -1242,7 +1378,7 @@ async fn stream_worker_loop(
     let cap = config.inflight_cap;
     // BUG-FLUSH-TIMEOUT-LEAK FIX #1: the per-append deadline is DERIVED from
     // each append's payload size (base + len/floor), not one fixed constant.
-    let append_deadline = AppendDeadline {
+    let append_deadline = IoDeadline {
         base: config.append_fanout_timeout,
         floor_bytes_per_sec: config.append_floor_bytes_per_sec,
     };
@@ -1492,9 +1628,9 @@ async fn launch_append(
     ack_tx: oneshot::Sender<Result<AppendResult>>,
     // F195 + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
     // the worker loop from its config snapshot; the actual deadline is
-    // derived per append from the payload size (`for_payload`) so a 4 KiB
+    // derived per append from the payload size (`for_len`) so a 4 KiB
     // WAL record and a 256 MiB SST upload each get a size-appropriate bound.
-    append_deadline: AppendDeadline,
+    append_deadline: IoDeadline,
 ) {
     let tail = match &state.tail {
         Some(t) => t.clone(),
@@ -1638,8 +1774,8 @@ async fn launch_append(
     // flush appends that every replica was durably completing, and each
     // spurious timeout rolled + leaked a ~255 MB extent (47× disk
     // amplification, total write outage). Boundedness (the F121 dead-replica
-    // requirement) is preserved by EFFECTIVE_APPEND_TIMEOUT_CAP.
-    let timeout = append_deadline.for_payload(size);
+    // requirement) is preserved by IO_TIMEOUT_CAP.
+    let timeout = append_deadline.for_len(size);
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
             match rx_res {
@@ -3585,6 +3721,8 @@ impl StreamClient {
             let c = self.suspected.borrow();
             replicated_read_order(&ex, offset, &c.nodes)
         };
+        // BUG-READ-TIMEOUT-STORM: damp on liveness timeouts (see below).
+        let mut timeouts = 0usize;
         for &slot in &order {
             let addr = &addrs[slot];
             let req = ReadBytesReq {
@@ -3596,7 +3734,14 @@ impl StreamClient {
             .encode();
             match self
                 .pool
-                .call_into_pooled(addr, MSG_READ_BYTES_ZC, req, Duration::from_secs(3))
+                // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 3 s). `length`
+                // is chunk-bounded ≤ read_chunk_bytes by the caller.
+                .call_into_pooled(
+                    addr,
+                    MSG_READ_BYTES_ZC,
+                    req,
+                    self.config.read_deadline().for_len(length),
+                )
                 .await
             {
                 Ok((pb, code)) if code == CODE_OK => return Ok(Some((pb, length as usize))),
@@ -3613,13 +3758,21 @@ impl StreamClient {
                     // (2026-07-03 UCX dead-ep stalls) — warn; fast transport
                     // errors (connect refused mid-failover) stay debug.
                     let msg = format!("{e:#}");
-                    if msg.contains("timed out") {
+                    self.extent_info_cache.remove(&extent_id);
+                    if is_liveness_timeout(&e) {
+                        timeouts += 1;
                         tracing::warn!(
                             extent_id,
                             addr = %addr,
                             error = %msg,
                             "ZC proxy read TIMED OUT; evicting cache, trying next replica"
                         );
+                        // Damp: after 2 liveness timeouts bail to the chunked
+                        // copy path (it refetches ExtentInfo + re-routes) rather
+                        // than walking every remaining slot at a full deadline.
+                        if timeouts >= 2 {
+                            return Ok(None);
+                        }
                     } else {
                         tracing::debug!(
                             extent_id,
@@ -3628,7 +3781,6 @@ impl StreamClient {
                             "ZC proxy read failed; evicting cache, trying next replica"
                         );
                     }
-                    self.extent_info_cache.remove(&extent_id);
                 }
             }
         }
@@ -4130,7 +4282,15 @@ impl StreamClient {
         };
         let resp_bytes = self
             .pool
-            .call_timeout(addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(3))
+            // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 3 s). This is the
+            // single MSG_READ_BYTES choke point for BOTH replicated failover and
+            // EC per-shard reads; `length` is chunk-bounded ≤ read_chunk_bytes.
+            .call_timeout(
+                addr,
+                MSG_READ_BYTES,
+                req.encode(),
+                self.config.read_deadline().for_len(length),
+            )
             .await?;
         let resp = parse_read_bytes_resp(resp_bytes, addr, extent_id, None, "read_bytes")?;
         Ok((resp.payload.to_vec(), resp.end))
@@ -4389,6 +4549,10 @@ impl StreamClient {
 
         let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
         let cached_eversion = ex.eversion;
+        // BUG-READ-TIMEOUT-STORM: capture the read IoDeadline (Copy) here where
+        // `self.config` is reachable — the per-shard read runs inside a spawned
+        // task that only captures a cloned `pool`, not `self`.
+        let read_dl = self.config.read_deadline();
         for (i, addr) in addrs.iter().enumerate() {
             if i == missing_shard_idx {
                 continue;
@@ -4403,15 +4567,14 @@ impl StreamClient {
                     offset: sh_off,
                     length: sh_len,
                 };
-                // 5 s — same shape as `ec_read_full`. Sub-range size
-                // is `sh_len` (≤ chunk_size, typically 64 MiB), so
-                // 5 s is generous even on a stressed loopback.
+                // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 5 s). Sub-range
+                // is `sh_len` (≤ read_chunk_bytes, typically 64 MiB GC chunks).
                 let result: Result<Vec<u8>> = match pool
                     .call_timeout(
                         &addr_clone,
                         MSG_READ_BYTES,
                         req.encode(),
-                        Duration::from_secs(5),
+                        read_dl.for_len(sh_len),
                     )
                     .await
                 {
@@ -4531,6 +4694,15 @@ impl StreamClient {
         let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<(Vec<u8>, u64)>)>(n);
 
         let cached_eversion = ex.eversion;
+        // BUG-READ-TIMEOUT-STORM: size-scale the per-shard read (was a fixed 5 s
+        // — the worst mismatch in the file: this reads a FULL EC shard,
+        // `sealed_length / K`, hundreds of MiB today). Captured here (Copy)
+        // because the read runs inside a spawned task that captures only `pool`.
+        // NOTE: `ec_read_full`'s per-shard MSG_READ_BYTES is NOT chunked (unlike
+        // `read_shard_from_addr`), so a shard > 4 GiB would also overflow the
+        // frame `payload_len: u32` — a pre-existing hazard, out of scope here.
+        let read_dl = self.config.read_deadline();
+        let shard_len = crate::erasure::shard_size(ex.sealed_length as usize, data_shards) as u64;
         for (i, addr) in addrs.into_iter().enumerate() {
             let mut tx = tx.clone();
             let pool = self.pool.clone();
@@ -4549,16 +4721,27 @@ impl StreamClient {
                     offset: 0,
                     length: 0,
                 };
-                // 5 s per shard — without this, a paged-out / dead EN
-                // can keep its spawned task alive forever, and since
-                // the outer `while rx.next().await` only exits when
-                // either `success >= data_shards` OR all senders
-                // drop, two slow shards in a K=3 EC layout would
-                // wedge `ec_read_full` indefinitely. Observed in
-                // production as 162 s VP-resolve latency on a single
-                // Get when one EN was paged out by macOS.
+                // Size-scaled per-shard deadline (BUG-READ-TIMEOUT-STORM) —
+                // without a bound, a paged-out / dead EN can keep its spawned
+                // task alive forever, and since the outer `while rx.next().await`
+                // only exits when either `success >= data_shards` OR all senders
+                // drop, two slow shards in a K=3 EC layout would wedge
+                // `ec_read_full` indefinitely. Observed in production as 162 s
+                // VP-resolve latency on a single Get when one EN was paged out by
+                // macOS. NOTE: a genuinely-stuck loser now lingers up to
+                // `read_dl.for_len(shard_len)` (≤ 600 s cap) rather than the old
+                // fixed 5 s; acceptable because EC is off by default and a healthy
+                // large-shard read legitimately needs the scaled budget (a 5 s cap
+                // was the read-side of the storm bug). If EC concurrency ever makes
+                // loser accumulation a problem, give losers a separate shorter
+                // deadline — see feature_list note on the trade-off.
                 let result: Result<(Vec<u8>, u64)> = match pool
-                    .call_timeout(&addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(5))
+                    .call_timeout(
+                        &addr,
+                        MSG_READ_BYTES,
+                        req.encode(),
+                        read_dl.for_len(shard_len),
+                    )
                     .await
                 {
                     Ok(resp_bytes) => {
