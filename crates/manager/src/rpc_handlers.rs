@@ -1790,35 +1790,49 @@ impl AutumnManager {
             .enumerate()
             .collect();
         let mut responses: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        for &(_, node_id) in &members {
-            if recovering.contains(&node_id) {
-                continue;
-            }
-            if let Some(n) = nodes.get(&node_id) {
-                // F210-H3 Tier 2: pass `req.owner_epoch` (validated above) so
-                // the EN's fence-handover side-effect fires on first probe.
+        // F-CL-PARALLEL: probe the replicas CONCURRENTLY, not one-at-a-time.
+        // Each `commit_length_on_node` is bounded at 5 s; a SEQUENTIAL 3-replica
+        // loop takes up to 3×5 s = 15 s when a replica is cold/hiccupping —
+        // exactly the PS-side `CHECK_COMMIT_LENGTH` deadline (client.rs:2507),
+        // so ONE slow replica timed out the whole partition-open probe. Seen
+        // live: after a stop-the-world restart the PS opens all partitions
+        // concurrently (F-RECOVERY-UNBOUNDED), firing 32×3 commit_length checks
+        // at once while the ENs are still loading extents — the sequential
+        // fanout amplified each EN hiccup 3×. Concurrent fanout bounds the
+        // handler to max(5 s) = one replica's timeout. The manager is
+        // single-threaded compio, so this just overlaps the 3 network waits on
+        // one thread; per-EN fence side-effects (F210-H3, owner_epoch bump) are
+        // independent across replicas so ordering doesn't matter.
+        let to_probe: Vec<(u64, String)> = members
+            .iter()
+            .filter(|(_, node_id)| !recovering.contains(node_id))
+            .filter_map(|(_, node_id)| nodes.get(node_id).map(|n| (*node_id, n.address.clone())))
+            .collect();
+        let probe_results =
+            futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
+                let r = self
+                    .commit_length_on_node(&addr, ex.extent_id, req.owner_epoch)
+                    .await;
+                (node_id, addr, r)
+            }))
+            .await;
+        for (node_id, addr, r) in probe_results {
+            match r {
+                Ok(v) => {
+                    responses.insert(node_id, v);
+                }
                 // Errors are surfaced at WARN so a silently-routed-to-wrong-
-                // shard misconfiguration (e.g. cluster.sh AUTUMN_EXTENT_SHARDS
-                // mismatching cpuset_len → empty shard_ports list → every
-                // probe lands on shard 0) shows up in the manager log
-                // instead of being swallowed and surfacing only as
-                // "0/N committed members reachable".
-                match self
-                    .commit_length_on_node(&n.address, ex.extent_id, req.owner_epoch)
-                    .await
-                {
-                    Ok(v) => {
-                        responses.insert(node_id, v);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            extent_id = ex.extent_id,
-                            node_id,
-                            addr = %n.address,
-                            error = %e,
-                            "check_commit_length: commit_length_on_node failed"
-                        );
-                    }
+                // shard misconfiguration (e.g. AUTUMN_EXTENT_SHARDS mismatch →
+                // empty shard_ports → every probe lands on shard 0) shows up in
+                // the manager log instead of only as "0/N members reachable".
+                Err(e) => {
+                    tracing::warn!(
+                        extent_id = ex.extent_id,
+                        node_id,
+                        addr = %addr,
+                        error = %e,
+                        "check_commit_length: commit_length_on_node failed"
+                    );
                 }
             }
         }
@@ -2127,19 +2141,28 @@ impl AutumnManager {
                 .collect();
             let mut responses: std::collections::HashMap<u64, u64> =
                 std::collections::HashMap::new();
-            for &(_, node_id) in &members {
-                if recovering.contains(&node_id) {
-                    continue;
-                }
-                if let Some(node) = nodes_map.get(&node_id) {
-                    // F210-H3 Tier 2: pass req.owner_epoch (validated above)
-                    // so the EN's fence-handover side-effect fires.
-                    if let Ok(v) = self
-                        .commit_length_on_node(&node.address, tail.extent_id, req.owner_epoch)
-                        .await
-                    {
-                        responses.insert(node_id, v);
-                    }
+            // F-CL-PARALLEL: probe replicas CONCURRENTLY (same rationale as
+            // handle_check_commit_length) — a sequential 3-replica loop at 5 s
+            // each is a 15 s worst case on a cold/hiccupping EN. F210-H3 fence
+            // side-effects are per-EN independent, so ordering doesn't matter.
+            let to_probe: Vec<(u64, String)> = members
+                .iter()
+                .filter(|(_, node_id)| !recovering.contains(node_id))
+                .filter_map(|(_, node_id)| {
+                    nodes_map.get(node_id).map(|n| (*node_id, n.address.clone()))
+                })
+                .collect();
+            for (node_id, r) in
+                futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
+                    let r = self
+                        .commit_length_on_node(&addr, tail.extent_id, req.owner_epoch)
+                        .await;
+                    (node_id, r)
+                }))
+                .await
+            {
+                if let Ok(v) = r {
+                    responses.insert(node_id, v);
                 }
             }
             // BUG2 trace (opt-in): the per-member commit_length probe results
