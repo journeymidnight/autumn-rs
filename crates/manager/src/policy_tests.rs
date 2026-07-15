@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrStreamInfo, PartitionLoad, POLICY_KIND_EC,
-    POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
-    POLICY_KIND_SPLIT,
+    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrRegionInfo, MgrStreamInfo, PartitionLoad,
+    POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
+    POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
 };
 
 use crate::policy::{
@@ -1070,4 +1070,78 @@ fn ec_advisory_skips_empty_extents() {
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, 0);
     assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
+}
+
+// ── F-REGION-REBALANCE Phase B: compute_rebalance_advisory ───────────────────
+
+fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> MetadataState {
+    let mut state = MetadataState::default();
+    for &id in ps_ids {
+        state.ps_nodes.insert(id, format!("ps{id}:9001"));
+    }
+    for &(part_id, ps_id) in assignments {
+        state.regions.insert(
+            part_id,
+            MgrRegionInfo {
+                rg: Some(MgrRange { start_key: vec![], end_key: vec![] }),
+                part_id,
+                ps_id,
+                log_stream: part_id,
+                row_stream: part_id + 1000,
+                meta_stream: part_id + 2000,
+                region_epoch: 1,
+            },
+        );
+    }
+    state
+}
+
+#[test]
+fn rebalance_advisory_fires_on_concentration() {
+    // 32 partitions all on ps 3, ps 1/2 idle — gap 32 >> threshold.
+    let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+    let state = rebal_state(&[1, 2, 3], &assignments);
+    let mut eng = PolicyEngine::default();
+    let out = eng.compute_rebalance_advisory(&state, 1000);
+    assert_eq!(out.len(), 1, "expected one cluster-level candidate");
+    assert_eq!(out[0].kind, POLICY_KIND_REBALANCE);
+    assert_eq!(out[0].primary_part_id, 0); // cluster-scoped
+    assert_eq!(out[0].secondary_part_id, 0);
+}
+
+#[test]
+fn rebalance_advisory_silent_when_balanced() {
+    // 11/11/10 — gap 1 <= threshold(2), no advisory.
+    let mut assignments = Vec::new();
+    for (i, p) in (100..132).enumerate() {
+        assignments.push((p, [1u64, 2, 3][i % 3]));
+    }
+    let state = rebal_state(&[1, 2, 3], &assignments);
+    let mut eng = PolicyEngine::default();
+    assert!(eng.compute_rebalance_advisory(&state, 1000).is_empty());
+}
+
+#[test]
+fn rebalance_advisory_respects_cooldown() {
+    let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+    let state = rebal_state(&[1, 2, 3], &assignments);
+    let mut eng = PolicyEngine::default();
+    // First fires and stamps last_rebalance_at = 1000.
+    assert_eq!(eng.compute_rebalance_advisory(&state, 1000).len(), 1);
+    // Within the cooldown window → suppressed.
+    assert!(eng.compute_rebalance_advisory(&state, 1000 + 10).is_empty());
+    // After the cooldown → fires again.
+    let later = 1000 + eng.config.rebalance_cooldown_sec + 1;
+    assert_eq!(eng.compute_rebalance_advisory(&state, later).len(), 1);
+}
+
+#[test]
+fn rebalance_advisory_disabled_when_threshold_zero() {
+    let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
+    let state = rebal_state(&[1, 2, 3], &assignments);
+    let mut eng = PolicyEngine::default();
+    let mut cfg = eng.config.clone();
+    cfg.rebalance_gap_threshold = 0;
+    eng.set_config(cfg);
+    assert!(eng.compute_rebalance_advisory(&state, 1000).is_empty());
 }

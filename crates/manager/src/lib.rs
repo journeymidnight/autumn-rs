@@ -1336,8 +1336,11 @@ impl AutumnManager {
         // F202: EC advisory — per-extent, sourced from streams + extents (not
         // partition-windowed); the helper filters extents < ec_min_extent_bytes.
         cands.append(&mut p.compute_ec_advisory(state, now));
-        // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 7 kinds
-        // (split, merge, gc, major_compact, hot_cold, minor_compact, ec).
+        // F-REGION-REBALANCE Phase B: cluster-level region→PS imbalance advisory
+        // (kind = POLICY_KIND_REBALANCE), sourced from regions + ps_nodes.
+        cands.append(&mut p.compute_rebalance_advisory(state, now));
+        // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 8 kinds
+        // (split, merge, gc, major_compact, hot_cold, minor_compact, ec, rebalance).
         p.advisory_cache = cands.clone();
         p.advisory_cache_at = now;
         cands
@@ -1617,6 +1620,24 @@ impl AutumnManager {
                 }
                 Ok(())
             }
+            POLICY_KIND_REBALANCE => {
+                // F-REGION-REBALANCE Phase B: move a BOUNDED batch per tick so a
+                // concentrated cluster converges gradually (the target PSes take
+                // a reopen storm otherwise). The advisory's own cooldown paces
+                // re-emission; this cap paces each actuation.
+                let max_moves = self.policy.borrow().config.rebalance_max_moves_per_tick;
+                let req = RebalanceRegionsReq { max_moves };
+                let resp_bytes = self
+                    .handle_rebalance_regions(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: RebalanceRegionsResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("rebalance code {}: {}", resp.code, resp.message);
+                }
+                Ok(())
+            }
             _ => anyhow::bail!("candidate kind {} not actionable", cand.kind),
         }
     }
@@ -1715,6 +1736,22 @@ impl AutumnManager {
                     anyhow::bail!("force_ec_convert: {}", resp.message);
                 }
                 Ok(format!("force_ec_convert extent {extent_id} OK"))
+            }
+            "rebalance" => {
+                // F-REGION-REBALANCE Phase B: manual dashboard trigger, same
+                // bounded per-tick batch as the armed controller.
+                let max_moves = self.policy.borrow().config.rebalance_max_moves_per_tick;
+                let req = RebalanceRegionsReq { max_moves };
+                let resp_bytes = self
+                    .handle_rebalance_regions(rkyv_encode(&req))
+                    .await
+                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
+                let resp: RebalanceRegionsResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if resp.code != CODE_OK {
+                    anyhow::bail!("rebalance: {}", resp.message);
+                }
+                Ok(format!("rebalance moved {} partition(s)", resp.moved))
             }
             _ => anyhow::bail!("action '{action}' not allowed"),
         }

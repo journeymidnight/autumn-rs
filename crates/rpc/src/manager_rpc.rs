@@ -1175,6 +1175,14 @@ pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
 /// `sealed_length`. Manager emits these from a direct scan of
 /// `s.streams`, NOT from PartitionLoad.
 pub const POLICY_KIND_EC: u8 = 6;
+/// F-REGION-REBALANCE Phase B: CLUSTER-level region→PS load-balance advisory.
+/// Emitted (at most one per tick) when the per-PS partition-count spread exceeds
+/// the configured threshold. `primary_part_id = 0` / `secondary_part_id = 0`
+/// (cluster-scoped, not a single partition/extent); `reason` carries the per-PS
+/// counts + gap. Manager sources it from `regions` + `ps_nodes` directly, NOT
+/// from PartitionLoad. The armed auto-policy controller actuates it via
+/// `MSG_REBALANCE_REGIONS` with a bounded per-tick `max_moves`.
+pub const POLICY_KIND_REBALANCE: u8 = 7;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {
@@ -1235,6 +1243,7 @@ pub fn policy_kind_names() -> Vec<(String, u8)> {
             POLICY_KIND_MINOR_COMPACT,
         ),
         ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
+        ("POLICY_KIND_REBALANCE".to_string(), POLICY_KIND_REBALANCE),
     ]
 }
 

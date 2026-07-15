@@ -81,6 +81,19 @@ Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 `balanced`, `aggressive`. The dashboard `/api/policies` UI can also create/select
 custom policies (armed only).
 
+**Auto-rebalance switch (F-REGION-REBALANCE Phase B).** A 6th policy switch,
+`rebalance`, arms the automatic version of `autumn-op rebalance` (see "Rebalancing
+region→PS assignment" below). When enabled + Armed, the controller emits a
+cluster-level advisory whenever the per-PS partition-count spread exceeds
+`rebalance_gap_threshold` (default 2) and actuates it by moving a bounded batch
+(`rebalance_max_moves_per_tick`, default 4) per tick — gradual convergence, not a
+storm. It is OFF in the conservative presets, ON in `balanced` + `aggressive`.
+Custom-policy switches (incl. `rebalance`) are persisted in `autoPolicy/config`
+(rkyv), so they survive leader failover; a pre-Phase-B config decodes unchanged
+(the `switches` Vec is variable-length — an absent 6th switch reads as off).
+The advisory THRESHOLDS live in the in-memory `PolicyConfig` (compiled defaults +
+runtime override), like every other advisory threshold — not persisted.
+
 **Verify leader-failover of the active policy** (the crash-safety guarantee):
 
 ```bash

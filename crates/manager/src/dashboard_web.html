@@ -198,6 +198,7 @@
           <span class="swbox"><input type="checkbox" id="sw_compact" checked> compact</span>
           <span class="swbox"><input type="checkbox" id="sw_gc" checked> gc</span>
           <span class="swbox"><input type="checkbox" id="sw_merge"> merge</span>
+          <span class="swbox"><input type="checkbox" id="sw_rebalance"> rebalance</span>
         </div>
         <div class="form">
           <label>interval(s) <input type="number" id="np_interval" value="30" min="2"></label>
@@ -409,7 +410,7 @@ async function overview(){
 }
 
 // ── policies / controller ───────────────────────────────────────────────────
-function swLine(sw){ return ["split","ec","compact","gc","merge"].map(k=>`<span class="sw ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
+function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
 async function loadPolicies(){
   const st=await api("/api/policies");
   ALLOW=!!st.allow_mutations;
@@ -435,13 +436,13 @@ async function loadPolicies(){
 }
 async function activate(name){ await api("/api/policies/activate",{active:name}); loadPolicies(); }
 async function toggleCtl(en){
-  if(en && !confirm("Start the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge on the cluster per the active policy.")) return;
+  if(en && !confirm("Start the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
   await api("/api/policies/activate",{enabled:en}); loadPolicies();
 }
 async function delPolicy(name){ if(confirm(`Delete policy "${name}"?`)){ await api("/api/policies/delete",{name}); loadPolicies(); } }
 $("#np_save").onclick=async()=>{
   const name=$("#np_name").value.trim(); if(!name){ toast("Enter a policy name","bad"); return; }
-  const switches={split:$("#sw_split").checked,ec:$("#sw_ec").checked,compact:$("#sw_compact").checked,gc:$("#sw_gc").checked,merge:$("#sw_merge").checked};
+  const switches={split:$("#sw_split").checked,ec:$("#sw_ec").checked,compact:$("#sw_compact").checked,gc:$("#sw_gc").checked,merge:$("#sw_merge").checked,rebalance:$("#sw_rebalance").checked};
   const r=await api("/api/policies/upsert",{name,switches,interval:+$("#np_interval").value,cooldown:+$("#np_cooldown").value,max_actions:+$("#np_max").value});
   if(r.error){ toast(r.error,"bad"); } else { toast("Policy saved: "+name,"ok"); $("#np_name").value=""; loadPolicies(); }
 };

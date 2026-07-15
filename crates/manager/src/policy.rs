@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
     PartitionLoad, PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
-    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE,
+    POLICY_KIND_SPLIT,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -132,6 +133,20 @@ pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
 /// stay silent rather than recommending an action against it.
 pub const HOT_COLD_BAND_DIVISOR: u32 = 2;
 
+/// F-REGION-REBALANCE Phase B: emit a rebalance advisory only when the per-PS
+/// partition-count spread (max − min) EXCEEDS this. `2` gives hysteresis — a
+/// balanced cluster's irreducible remainder gap is ≤ 1, and a transient gap of 2
+/// (one partition mid-reopen) shouldn't trigger a move; a gap of 3+ is a real
+/// imbalance worth correcting.
+pub const REBALANCE_GAP_THRESHOLD: usize = 2;
+/// Cluster-level cooldown between rebalance advisories — each actuation moves a
+/// bounded batch, so re-emit only after the reopen churn settles.
+pub const REBALANCE_COOLDOWN_SEC: i64 = 120;
+/// How many partitions one armed rebalance actuation moves per tick — bounded so
+/// the target PSes aren't hit by a reopen storm; convergence is gradual across
+/// ticks (HBase limits concurrent region moves the same way).
+pub const REBALANCE_MAX_MOVES_PER_TICK: u32 = 4;
+
 /// F184: runtime-configurable policy thresholds. Production uses the
 /// `*_DEFAULT` constants above; tests can lower `required_buckets` and
 /// `tick_interval_sec` to exercise the full policy_tick_loop fast.
@@ -169,6 +184,13 @@ pub struct PolicyConfig {
     /// F202: minimum sealed-extent size below which EC advisory is
     /// suppressed (encode overhead would outweigh the savings).
     pub ec_min_extent_bytes: u64,
+    /// F-REGION-REBALANCE Phase B: fire the rebalance advisory when the per-PS
+    /// partition-count spread exceeds this (0 = disable the advisory entirely).
+    pub rebalance_gap_threshold: usize,
+    /// F-REGION-REBALANCE Phase B: cluster-level rebalance advisory cooldown.
+    pub rebalance_cooldown_sec: i64,
+    /// F-REGION-REBALANCE Phase B: partitions an armed rebalance moves per tick.
+    pub rebalance_max_moves_per_tick: u32,
 }
 
 impl Default for PolicyConfig {
@@ -193,6 +215,9 @@ impl Default for PolicyConfig {
             minor_compact_pending_high: MINOR_COMPACT_PENDING_HIGH,
             minor_compact_cooldown_sec: MINOR_COMPACT_COOLDOWN_SEC,
             ec_min_extent_bytes: EC_MIN_EXTENT_BYTES,
+            rebalance_gap_threshold: REBALANCE_GAP_THRESHOLD,
+            rebalance_cooldown_sec: REBALANCE_COOLDOWN_SEC,
+            rebalance_max_moves_per_tick: REBALANCE_MAX_MOVES_PER_TICK,
         }
     }
 }
@@ -260,6 +285,9 @@ pub struct PolicyEngine {
     /// F196 Stage D: per-PS hot/cold advisory cooldown. Keyed by
     /// `ps_id`; value is the unix-epoch second of the last WARN.
     pub last_hot_cold_at: HashMap<u64, i64>,
+    /// F-REGION-REBALANCE Phase B: cluster-level rebalance advisory cooldown
+    /// stamp (unix-epoch second of the last emission; 0 = never).
+    pub last_rebalance_at: i64,
 }
 
 impl PolicyEngine {
@@ -721,6 +749,61 @@ impl PolicyEngine {
             out.truncate(MAX_EC_ADVISORY_CANDIDATES);
         }
         out
+    }
+
+    /// F-REGION-REBALANCE Phase B: a CLUSTER-level advisory (not per-partition
+    /// or per-extent) — emitted when the per-PS partition-count spread exceeds
+    /// `rebalance_gap_threshold` and we're outside the cluster cooldown. Sourced
+    /// directly from `regions` + `ps_nodes` (the same inputs `compute_rebalance_moves`
+    /// uses), NOT from PartitionLoad windows — partition COUNT is the signal, and
+    /// the manager knows it authoritatively without any PS report. At most ONE
+    /// candidate per tick: `kind = POLICY_KIND_REBALANCE`, primary/secondary = 0
+    /// (cluster-scoped); the armed controller's actuation calls
+    /// `handle_rebalance_regions` with a bounded per-tick `max_moves`.
+    pub fn compute_rebalance_advisory(
+        &mut self,
+        state: &MetadataState,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let cfg = &self.config;
+        if cfg.rebalance_gap_threshold == 0 || state.ps_nodes.len() < 2 {
+            return Vec::new(); // advisory disabled, or nothing to balance across
+        }
+        // Per REGISTERED-PS partition counts (registered PS start at 0).
+        let mut counts: HashMap<u64, usize> =
+            state.ps_nodes.keys().map(|&id| (id, 0usize)).collect();
+        for region in state.regions.values() {
+            if let Some(c) = counts.get_mut(&region.ps_id) {
+                *c += 1;
+            }
+        }
+        let max = counts.values().copied().max().unwrap_or(0);
+        let min = counts.values().copied().min().unwrap_or(0);
+        if max.saturating_sub(min) <= cfg.rebalance_gap_threshold {
+            return Vec::new(); // balanced within the hysteresis band
+        }
+        if now.saturating_sub(self.last_rebalance_at) < cfg.rebalance_cooldown_sec {
+            return Vec::new(); // still cooling down from a recent emission
+        }
+        self.last_rebalance_at = now;
+        let mut sorted: Vec<(u64, usize)> = counts.into_iter().collect();
+        sorted.sort_unstable();
+        vec![PolicyCandidate {
+            kind: POLICY_KIND_REBALANCE,
+            primary_part_id: 0,   // cluster-scoped, not a single partition
+            secondary_part_id: 0,
+            reason: format!(
+                "per-PS partition counts {:?} spread max-min={} > {}",
+                sorted,
+                max - min,
+                cfg.rebalance_gap_threshold,
+            ),
+            size_bytes: 0,
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            same_ps: false,
+            last_op_at: now,
+        }]
     }
 
     /// F196 Stage D — hot/cold imbalance advisory.

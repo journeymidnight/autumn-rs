@@ -1114,6 +1114,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                     POLICY_KIND_HOT_COLD => "hotcold",
                     POLICY_KIND_MINOR_COMPACT => "minor",
                     POLICY_KIND_EC => "ec",
+                    POLICY_KIND_REBALANCE => "rebalance",
                     _ => "?",
                 };
                 serde_json::json!({
@@ -1145,6 +1146,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                 POLICY_KIND_HOT_COLD => "hotcold",
                 POLICY_KIND_MINOR_COMPACT => "minor",
                 POLICY_KIND_EC => "ec",
+                POLICY_KIND_REBALANCE => "rebalance",
                 _ => "?",
             };
             let feas = match c.kind {
@@ -1152,7 +1154,8 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                 | POLICY_KIND_MAJOR_COMPACT
                 | POLICY_KIND_MINOR_COMPACT
                 | POLICY_KIND_EC
-                | POLICY_KIND_HOT_COLD => "n/a",
+                | POLICY_KIND_HOT_COLD
+                | POLICY_KIND_REBALANCE => "n/a", // rebalance is cluster-scoped, no same-PS feasibility
                 _ if c.same_ps => "yes",
                 _ => "no",
             };

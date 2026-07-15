@@ -308,9 +308,22 @@ only the serving PS; the PS `sync_regions_once` picks up the `ps_id` change and 
 old PS drops / new PS opens the partition — same mechanism as eviction-driven
 reassignment). Count-based for v1 (HBase `SimpleLoadBalancer`); a req/s-weighted
 variant (WAS PM / TiKV-PD `balance-region`) reuses the same apply path. Exposed as
-`autumn-op rebalance [MAX_MOVES]`; the dashboard auto-policy `rebalance` switch is
-Phase B (deferred). Cross-ref note 35 (F265 sticky region→PS assignment + part_addr
-self-heal), docs/ops.md "Rebalancing region→PS assignment after a restart".
+`autumn-op rebalance [MAX_MOVES]`. **Phase B (auto-policy):** `POLICY_KIND_REBALANCE`
+(7) + `PolicyEngine::compute_rebalance_advisory` (a CLUSTER-level advisory — ONE
+candidate/tick with primary=secondary=0, sourced from `regions`+`ps_nodes` counts,
+NOT PartitionLoad; fires when the per-PS spread exceeds `rebalance_gap_threshold`
+and outside `rebalance_cooldown_sec`, gated by `PolicyEngine.last_rebalance_at`).
+The armed controller's `actuate_candidate` REBALANCE arm calls
+`handle_rebalance_regions` with `rebalance_max_moves_per_tick` (bounded, gradual —
+convergence across ticks). 6th auto-policy switch `rebalance` (SWITCH_ORDER
+`[split,ec,compact,gc,merge,rebalance]`), ON in `balanced`+`aggressive` presets,
+default OFF; leader-only, preserves F203 mechanism/policy split. The three
+thresholds live in the in-memory `PolicyConfig` (compiled defaults + runtime
+override, NOT persisted — like every advisory threshold); the policy DEFINITION
+(`MgrAutoPolicyEntry.switches` incl. rebalance) IS persisted in `autoPolicy/config`
+(rkyv, variable-length Vec → an old config decodes unchanged, `sanitize_entry` pads
+the absent 6th switch to off). Cross-ref note 35 (F265 sticky region→PS assignment
++ part_addr self-heal), docs/ops.md "Rebalancing region→PS assignment".
 
 ## PS Liveness Detection
 

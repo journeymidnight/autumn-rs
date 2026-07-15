@@ -53,7 +53,7 @@ use autumn_rpc::manager_rpc::{
     AUTOPOLICY_OP_SET_ACTIVE, AUTOPOLICY_OP_SET_MODE, AUTOPOLICY_OP_UPSERT, CODE_OK,
     NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED,
     NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT,
-    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
+    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
 };
 
 use crate::auto_policy::{cooldown_key, describe_candidate, policy_kind_str};
@@ -703,7 +703,7 @@ fn policies_get_response(mgr: &AutumnManager) -> Response<Body> {
     if !mgr.is_leader() {
         let body = json!({
             "enabled": false, "active": "", "allow_mutations": false,
-            "policies": [], "switch_order": ["split", "ec", "compact", "gc", "merge"],
+            "policies": [], "switch_order": ["split", "ec", "compact", "gc", "merge", "rebalance"],
             "log": [], "error": "not leader — point the dashboard at the leader manager",
         });
         return json_response(StatusCode::OK, body.to_string(), "application/json");
@@ -734,17 +734,17 @@ fn policies_get_response(mgr: &AutumnManager) -> Response<Body> {
         "active": snap.active,
         "allow_mutations": snap.allow_mutations,
         "policies": policies,
-        "switch_order": ["split", "ec", "compact", "gc", "merge"],
+        "switch_order": ["split", "ec", "compact", "gc", "merge", "rebalance"],
         "log": log,
     });
     json_response(StatusCode::OK, body.to_string(), "application/json")
 }
 
-/// [split, ec, compact, gc, merge] Vec → the `{split,ec,…}` dict the page reads.
+/// [split, ec, compact, gc, merge, rebalance] Vec → the `{split,ec,…}` dict the page reads.
 fn switches_to_dict(sw: &[bool]) -> serde_json::Value {
     let g = |i: usize| sw.get(i).copied().unwrap_or(false);
     serde_json::json!({
-        "split": g(0), "ec": g(1), "compact": g(2), "gc": g(3), "merge": g(4),
+        "split": g(0), "ec": g(1), "compact": g(2), "gc": g(3), "merge": g(4), "rebalance": g(5),
     })
 }
 
@@ -776,6 +776,8 @@ fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
         POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
             Some(json!({ "action": "compact", "part_id": c.primary_part_id }))
         }
+        // F-REGION-REBALANCE Phase B: cluster-scoped, no target id.
+        POLICY_KIND_REBALANCE => Some(json!({ "action": "rebalance" })),
         _ => None, // hotcold / unknown → advisory only
     }
 }
@@ -817,6 +819,8 @@ fn validate_action(
                 return Err("force_ec_convert requires extent_id".to_string());
             }
         }
+        // F-REGION-REBALANCE Phase B: cluster-scoped, takes no typed fields.
+        "rebalance" => {}
         "" => return Err("missing action".to_string()),
         _ => return Err(format!("action '{action}' not allowed")),
     }
@@ -922,8 +926,9 @@ async fn policies_activate_response(mgr: &AutumnManager, body: &[u8]) -> Respons
     policies_get_response(mgr)
 }
 
-/// `POST /api/policies/upsert` — `{name, switches:{split,ec,compact,gc,merge},
-/// interval, cooldown, max_actions}` creates/updates a custom policy.
+/// `POST /api/policies/upsert` — `{name,
+/// switches:{split,ec,compact,gc,merge,rebalance}, interval, cooldown,
+/// max_actions}` creates/updates a custom policy.
 async fn policies_upsert_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
     if !mgr.dashboard_allow_mutations.get() {
         return read_only_response();
@@ -942,7 +947,7 @@ async fn policies_upsert_response(mgr: &AutumnManager, body: &[u8]) -> Response<
             .and_then(|x| x.as_str())
             .unwrap_or("custom policy")
             .to_string(),
-        switches: vec![b("split"), b("ec"), b("compact"), b("gc"), b("merge")],
+        switches: vec![b("split"), b("ec"), b("compact"), b("gc"), b("merge"), b("rebalance")],
         // Clamp BEFORE the u32 cast so a huge value doesn't truncate to 0 (coco
         // P2); autopolicy_set's sanitize_entry re-clamps as the authority.
         interval_sec: v.get("interval").and_then(|x| x.as_u64()).unwrap_or(30).max(2),
