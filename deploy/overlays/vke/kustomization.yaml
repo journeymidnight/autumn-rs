@@ -12,7 +12,6 @@ kind: Kustomization
 
 resources:
   - ../../k8s                  # the generic base (deploy/k8s)
-  - en-extra-services.yaml     # per-pod Services for EN ordinals 3 and 4
   - dashboard-service.yaml       # internal-only dashboard access (ClusterIP)
 
 images:
@@ -110,10 +109,11 @@ patches:
         path: /data/AUTUMN_BOOTSTRAP_PRESPLIT
         value: "32"
       # Multi-shard extent nodes: 4 io_uring cores per EN (shard = extent_id % 4)
-      # instead of one, to push past the single-EN-core write ceiling. REQUIRES
-      # the per-pod EN Services to expose every shard's data+control port (patch
-      # below) and the entrypoint's AUTUMN_EXTENT_SHARDS→--shard-ports wiring
-      # (deploy/docker/entrypoint.sh). NEEDS a rebuilt image (entrypoint change).
+      # instead of one, to push past the single-EN-core write ceiling.
+      # F-EN-DYNSHARD M2: the EN self-registers all 4 shard ports at startup and
+      # the manager/PS dial the pod IP directly — no per-pod Service port list to
+      # keep in lockstep anymore (the old 8-port patch is gone). Just set the
+      # shard count; the entrypoint sizes the cpuset to 0-3.
       - op: add
         path: /data/AUTUMN_EXTENT_SHARDS
         value: "4"
@@ -124,6 +124,11 @@ patches:
       - op: add
         path: /data/AUTUMN_DASHBOARD_ALLOW_MUTATIONS
         value: "1"
+  # NOTE (F-EN-DYNSHARD M2): the old per-pod EN Service port patch
+  # (`^autumn-en-[0-9]+$` → 8 shard ports) and en-extra-services.yaml are GONE.
+  # ENs advertise their pod IP and self-register every shard port; the manager
+  # dials pod_ip:shard_port directly. Scaling EN replicas = bump replicas +
+  # AUTUMN_EXPECT_NODES only. No Service to touch.
   # etcd wants network-durable storage. The base omits storageClassName to inherit
   # the cluster default, but this cluster marks no default — name Volcengine's EBS
   # class explicitly. EBS ESSD has a 20Gi minimum (base 1Gi → InvalidVolumeSize).
@@ -137,22 +142,3 @@ patches:
       - op: replace
         path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
         value: 20Gi
-  # Multi-shard EN: each per-pod Service (autumn-en-0..4) must expose EVERY
-  # shard's data port (9101 + i*10) and control port (10101 + i*10) for i in
-  # 0..3, or the manager/PS can't reach shards 1-3. Name is a regex so this one
-  # patch hits all five per-pod Services but NOT the headless `autumn-en`.
-  - target:
-      kind: Service
-      name: "^autumn-en-[0-9]+$"
-    patch: |-
-      - op: replace
-        path: /spec/ports
-        value:
-          - { name: data-0, port: 9101,  targetPort: 9101 }
-          - { name: data-1, port: 9111,  targetPort: 9111 }
-          - { name: data-2, port: 9121,  targetPort: 9121 }
-          - { name: data-3, port: 9131,  targetPort: 9131 }
-          - { name: ctrl-0, port: 10101, targetPort: 10101 }
-          - { name: ctrl-1, port: 10111, targetPort: 10111 }
-          - { name: ctrl-2, port: 10121, targetPort: 10121 }
-          - { name: ctrl-3, port: 10131, targetPort: 10131 }

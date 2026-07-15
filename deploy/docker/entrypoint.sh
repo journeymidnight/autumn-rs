@@ -144,21 +144,29 @@ run_extent_node() {
     mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
     [[ "$mgr" == *,* ]] && die "extent-node takes a single manager address, got '$mgr'"
 
-    # Advertise the per-pod Service ClusterIP. Convention: the Service is
-    # named after the pod (autumn-en-0, autumn-en-1, ...), so the default
-    # needs no per-pod config at all.
+    # F-EN-DYNSHARD M2: advertise this pod's OWN IP (Downward-API status.podIP,
+    # passed as AUTUMN_ADVERTISE_IP). The EN self-registers its location under a
+    # stable node_uuid at every startup, so a fresh pod IP on reschedule just
+    # updates the same identity — no per-pod ClusterIP Service, no FQDN, no
+    # phantom-node trap. The pod IP is already an IP literal (no DNS), so we
+    # only bracket it for IPv6. Legacy fallback: a per-pod-Service FQDN via
+    # AUTUMN_ADVERTISE_NAME (resolved to its ClusterIP) still works if set.
     local adv
-    adv="$(resolve_ip "${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}")"
+    if [[ -n "${AUTUMN_ADVERTISE_IP:-}" ]]; then
+        adv="$(bracket_host "${AUTUMN_ADVERTISE_IP}")"
+    else
+        adv="$(resolve_ip "${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}")"
+    fi
 
     # Sharding (AUTUMN_EXTENT_SHARDS, default 1). Shard i binds its data
     # listener at `port + i*stride` and its control listener at
     # `port+1000 + i*stride` (EN default stride 10 — keep it in sync here).
     # The manager routes an extent to shard `extent_id % shards` and dials
-    # `advertise_host:shard_port`. F-EN-DYNSHARD M1a/M1b: the EN binary
+    # `advertise_host:shard_port`. F-EN-DYNSHARD M1a/M1b/M2: the EN binary
     # itself self-registers every shard's data port at startup (via its own
-    # `--advertise`) — no `--shard-ports` flag needed anywhere anymore. The
-    # per-pod Service MUST still expose every shard's data AND control port.
-    # shards=1 keeps the original single-shard behaviour.
+    # `--advertise`) and the manager/PS dial the pod IP directly — no
+    # `--shard-ports` flag and no per-pod Service enumerating shard ports
+    # anywhere anymore. shards=1 keeps the original single-shard behaviour.
     local shards="${AUTUMN_EXTENT_SHARDS:-1}"
     [[ "$shards" =~ ^[0-9]+$ && "$shards" -ge 1 ]] \
         || die "AUTUMN_EXTENT_SHARDS must be a positive integer"

@@ -6,7 +6,8 @@
 #   - every k8s manifest is well-formed (apiVersion/kind/metadata.name)
 #   - StatefulSet/Job selector.matchLabels ⊆ template labels (k8s hard rule)
 #   - each StatefulSet.serviceName resolves to a headless Service
-#   - per-pod EN Services select a real StatefulSet pod-name
+#   - the EN StatefulSet advertises its pod IP (AUTUMN_ADVERTISE_IP ← status.podIP;
+#     F-EN-DYNSHARD M2 — no per-pod ClusterIP Services anymore)
 #   - Service ports line up with the entrypoint's role port defaults
 #   - kustomization.resources all exist; image name matches
 #
@@ -119,7 +120,12 @@ for kind, d in workloads:
         else:
             ok(f"{name}: serviceName '{svc_name}' is a headless Service")
 
-# per-pod EN services must target a real pod ordinal of the EN StatefulSet
+# F-EN-DYNSHARD M2: the EN advertises its OWN pod IP (Downward-API
+# status.podIP) and self-registers under a stable node_uuid — there are NO
+# per-pod ClusterIP Services anymore. Validate the pod-IP wiring instead:
+# the EN StatefulSet must inject AUTUMN_ADVERTISE_IP from status.podIP.
+# (Any leftover per-pod Service is still sanity-checked to target a real
+# ordinal, but it is no longer required.)
 en_ss = next((d for k, d in workloads if k == "StatefulSet" and d["metadata"]["name"] == "autumn-en"), None)
 if en_ss:
     replicas = en_ss["spec"].get("replicas", 1)
@@ -132,10 +138,18 @@ if en_ss:
             bad(f"per-pod Service {s['metadata']['name']} targets '{pod}' outside replicas={replicas}")
         else:
             ok(f"per-pod Service {s['metadata']['name']} → {pod}")
-    covered = {s["spec"]["selector"]["statefulset.kubernetes.io/pod-name"] for s in perpod}
-    for p in valid_pods:
-        if p not in covered:
-            bad(f"pod {p} has no per-pod Service (EN needs a stable ClusterIP per pod)")
+    # EN must advertise its pod IP via the Downward API (the M2 identity model).
+    containers = en_ss["spec"]["template"]["spec"].get("containers", [])
+    adv = None
+    for c in containers:
+        for e in (c.get("env") or []):
+            if e.get("name") == "AUTUMN_ADVERTISE_IP":
+                adv = e
+    fp = (((adv or {}).get("valueFrom") or {}).get("fieldRef") or {}).get("fieldPath")
+    if fp == "status.podIP":
+        ok("autumn-en advertises pod IP (AUTUMN_ADVERTISE_IP ← status.podIP)")
+    else:
+        bad("autumn-en StatefulSet must set AUTUMN_ADVERTISE_IP from fieldRef status.podIP (F-EN-DYNSHARD M2)")
 
 # port defaults must match the entrypoint role ports
 def svc_ports(n):

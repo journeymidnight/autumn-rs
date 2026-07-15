@@ -16,12 +16,16 @@ manifests are shaped around them:
    (IP literals only). The entrypoint resolves Service names to ClusterIPs with
    `getent` and passes IPs as flags. IPv6 pod/Service IPs work (bracketed).
 
-2. **Extent-node identity is its advertise address, fixed for life.** The
-   manager keys an EN on its advertise address and the EN never re-registers a
-   new one. A pod IP changes on reschedule → phantom node. So **each EN gets its
-   own ClusterIP Service** (`autumn-en-<ordinal>`, a stable VIP) and advertises
-   that, not its pod IP. Each per-pod Service exposes **both** ports the manager
-   dials: `9101` (data) and `10101` (control = data+1000, used for df/recovery).
+2. **Extent-node identity is a stable `node_uuid`, not its address**
+   (F-EN-DYNSHARD). The `node_uuid` is minted once at `format` and persisted on
+   the PVC; the EN **self-registers its live pod IP + every shard port at each
+   startup** under that uuid. A pod IP change on reschedule just updates the
+   same identity's location and routing follows — so the EN advertises its
+   **pod IP** (Downward API `status.podIP`), exactly like the PS. The manager
+   and PS dial the registered `pod_ip:shard_port` directly (pod IPs are routable
+   cluster-wide under every CNI). **No per-pod ClusterIP Service exists** — the
+   old `autumn-en-<ordinal>` VIPs and their hand-maintained shard-port lists are
+   deleted, not worked around.
 
 3. **`bootstrap` is not idempotent.** A second run creates duplicate streams. It
    runs as a **Job** (not a Deployment); the entrypoint guards it by checking
@@ -49,7 +53,7 @@ Two constraints work in our favor:
 | `configmap.yaml` | ConfigMap | shared env; `AUTUMN_EXPECT_NODES` MUST equal EN replicas |
 | `etcd.yaml` | StatefulSet + headless Service | 1 member; PVC 1Gi on default (network) class |
 | `manager.yaml` | StatefulSet + ClusterIP + headless Services | leader-gated readiness |
-| `extent-node.yaml` | StatefulSet + headless + N per-pod ClusterIP Services | PVC 20Gi/pod on local disk |
+| `extent-node.yaml` | StatefulSet + headless Service | advertises pod IP; PVC 20Gi/pod on local disk |
 | `partition-server.yaml` | StatefulSet + headless Service | advertises pod IP; no PVC |
 | `bootstrap-job.yaml` | Job | guarded, run-once |
 
@@ -154,14 +158,12 @@ copy it for a new cluster and adjust:
 | `images[]` etcd mirror | nodes may not reach `quay.io` directly (VKE → daocloud mirror) |
 | `nodeSelector` patch | your node pool (VKE pins to kernel-≥5.15 nodes labeled `autumn-node=true`; autumn needs io_uring) |
 | etcd `storageClassName` + size | your network-durable class; mind provider **minimum volume size** (Volcengine EBS ESSD = 20Gi, so the base 1Gi is patched up) |
-| EN `replicas` + `AUTUMN_EXPECT_NODES` + extra `autumn-en-<i>` Services | your sizing (keep the two counts equal; add one per-pod Service per new ordinal) |
+| EN `replicas` + `AUTUMN_EXPECT_NODES` | your sizing (keep the two counts equal; no Services to add — ENs advertise pod IPs) |
 
-Two things that trip up real clusters, already handled in the base so every
-overlay inherits them: **`enableServiceLinks: false`** on all pods (K8s injects
+One thing that trips up real clusters, already handled in the base so every
+overlay inherits it: **`enableServiceLinks: false`** on all pods (K8s injects
 `AUTUMN_MANAGER_PORT=tcp://…` from the `autumn-manager` Service, colliding with
-the entrypoint's own `AUTUMN_MANAGER_PORT` and panicking the manager), and the
-EN advertising its per-pod Service **FQDN** (a bare name resolves via the pod's
-own `/etc/hosts` to the pod IP → phantom nodes on reschedule).
+the entrypoint's own `AUTUMN_MANAGER_PORT` and panicking the manager).
 
 If your cluster has **no default StorageClass**, the etcd PVC (which omits
 `storageClassName` in the base to inherit the default) stays Pending — the
@@ -169,11 +171,12 @@ overlay must name a class explicitly, as the VKE example does.
 
 ## Scaling
 
-- **Extent nodes**: bump `extent-node.yaml` StatefulSet `replicas` to N, add a
-  per-pod `autumn-en-<i>` ClusterIP Service for each new ordinal, and set
-  `AUTUMN_EXPECT_NODES: "N"` in the ConfigMap. Provision **more ENs than the
-  replication factor** — with `#EN == RF` a single EN down wedges writes (can't
-  form a fresh replica set); reads tolerate a down replica at any size.
+- **Extent nodes**: bump `extent-node.yaml` StatefulSet `replicas` to N and set
+  `AUTUMN_EXPECT_NODES: "N"` in the ConfigMap. That's it — ENs advertise their
+  pod IPs and self-register, so there are no per-pod Services to add (F-EN-DYNSHARD
+  M2). Provision **more ENs than the replication factor** — with `#EN == RF` a
+  single EN down wedges writes (can't form a fresh replica set); reads tolerate a
+  down replica at any size.
 - **Partition servers**: raise `partition-server.yaml` `replicas`; each pod's
   `psid` is `ordinal+1`. More partitions (not more workers per PS) is how you
   scale throughput.
@@ -188,19 +191,20 @@ wall (benchmarked here: write flattens ~65k ops/s past 16 partitions). Giving
 each EN more shards spreads its extents (`shard = extent_id % N`) across N cores.
 
 The entrypoint exposes this via **`AUTUMN_EXTENT_SHARDS`** (default 1). When > 1
-it sizes the EN to cores `0..N-1`. F-EN-DYNSHARD M1c: `format` is identity-only
-now — the EN binary itself self-registers all N shard ports at startup (via its
-own `--advertise`), so nothing has to pass `--shard-ports` anywhere. Shard `i`
-binds data port `9101 + i*10` and control port `10101 + i*10`, so **every
-per-pod EN Service must expose all N data + N control ports** — otherwise the
-manager/PS can't reach shards 1..N-1. `deploy/overlays/vke` is a worked 4-shard example: it sets
-`AUTUMN_EXTENT_SHARDS: "4"`, patches each `autumn-en-<i>` Service to the 8 ports
-(`9101/9111/9121/9131` + `10101/10111/10121/10131`), and requests 4 CPU per EN.
+it sizes the EN to cores `0..N-1`. F-EN-DYNSHARD M1c/M2: `format` is
+identity-only now — the EN binary itself self-registers all N shard ports at
+startup (via its own `--advertise`, which now carries the **pod IP**), and the
+manager/PS dial `pod_ip:shard_port` directly. Shard `i` binds data port
+`9101 + i*10` and control port `10101 + i*10`. **There is no Service port list
+to keep in lockstep** — that was the whole point of M2. `deploy/overlays/vke`
+is a worked 4-shard example: it sets `AUTUMN_EXTENT_SHARDS: "4"` and requests 4
+CPU per EN. That's the complete change.
 
-Copy that pattern for a different shard count (keep the Service port list, the
-`AUTUMN_EXTENT_SHARDS` value, and the CPU request in step). This is the one
-knob that needs a coordinated Service change — the port list is not derivable
-by the manifests from the env var.
+Changing the shard count for a **running** cluster is a **stop-the-world reshard**
+(F-EN-DYNSHARD M3, ownership = `extent_id % shard_count` remaps globally): edit
+`AUTUMN_EXTENT_SHARDS`, then restart all ENs together. Zero bytes move on disk
+(the file layout is hash-subdir'd, shard-independent); only routing remaps. See
+the reshard runbook in `docs/ops.md` and `scripts/reshard_chaos.sh`.
 
 ## Using the cluster
 
