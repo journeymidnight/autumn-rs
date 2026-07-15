@@ -30,8 +30,16 @@ Main gaps:
     feature_list F-EN-SHARD-HASH / F-READ-OPENTAIL-ROTATE.
   - F-SEALED-EMPTY-SWEEP (BUG-FLUSH-TIMEOUT-LEAK backstop) still deferred.
 
-Next steps:
-  1. Push -> CP pipeline builds image; rollout to VKE cluster.
-  2. Re-test 8 MiB direct-read (user: "全部修好后，重新测试") — verify the
-     "direct read TIMED OUT" storm is gone and 8 MiB direct read throughput is
-     healthy (no longer 3 s-timeout-polluted).
+Retest (2026-07-14, DONE — image 16ae27f rolled out to VKE, stop-the-world):
+  8 MiB perf-check --direct-read, 32 threads, 32 partitions:
+    write 920 MB/s (RF3 fsync-bound, p99 390 ms);
+    DIRECT READ 3949 MB/s, p50 30 ms / p99 205 ms, 10368 ops, ZERO errors.
+  Storm GONE: 0 "TIMED OUT" / fallback lines across all 3 PS + 5 EN pods AND
+  the client perf pod (previously 566-646 direct-read timeouts + polluted
+  throughput). Prior healthy baseline was 3182 MB/s → now 3949 MB/s, clean.
+  Extents now spread across all 5 EN (70/53/63/49/56), not shard-0-aliased.
+
+Next steps (optional, deferred backlog):
+  - F-EN-SHARD-HASH / F-READ-OPENTAIL-ROTATE — fix the underlying load skew
+    (the deadlines + damping only stop the STORM symptom).
+  - F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop.
