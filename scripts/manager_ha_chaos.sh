@@ -127,11 +127,16 @@ write_liveness() {
     [ $FAIL -eq 0 ] && say "[$tag] write liveness OK"
 }
 
-parts_on() { # parts_on <mgr> <ps_port>
+parts_on() { # parts_on <mgr> <ps_base_port>
+    # Count partitions in the PS band [base, base+50). autumn-op info overview
+    # prints "  part <id>  ps 127.0.0.1:<base+ord>" (space, not "ps=", since the
+    # b01dfa8 dashboard rework), so the old grep -c "ps=127.0.0.1:<base>" matched
+    # NOTHING and undercounted multi-partition PSes. Return 1 on a failed probe.
     local out
     out=$(ao_info "$1")
     [ -n "$out" ] || return 1
-    printf '%s\n' "$out" | grep -c "ps=127.0.0.1:$2" || true
+    printf '%s\n' "$out" | grep -oE 'ps 127\.0\.0\.1:[0-9]+' \
+        | grep -oE '[0-9]+$' | awk -v b="$2" '$1>=b && $1<b+50' | wc -l
 }
 
 # ── background ACKed-write loop ─────────────────────────────────────────────
@@ -177,8 +182,15 @@ verify_seeds "after-leader-kill"
 write_liveness "h1"
 
 # ── H2: kill the holder PS with only manager2 alive ────────────────────────
-p1=$(parts_on 127.0.0.1:9002 9301) || p1=0
-p2=$(parts_on 127.0.0.1:9002 9351) || p2=0
+# Retry until both probe successfully AND total > 0 — a transient info outage on
+# freshly-promoted manager2 must not fold to 0/0 and default-kill PS1.
+p1=""; p2=""
+for _ in $(seq 1 15); do
+    a=$(parts_on 127.0.0.1:9002 9301) && b=$(parts_on 127.0.0.1:9002 9351) \
+        && [ $((a + b)) -gt 0 ] && { p1=$a; p2=$b; break; }
+    sleep 2
+done
+[ -n "$p1" ] || fail "H2: could not determine partition holder (probe failed)"
 if [ "${p1:-0}" -ge "${p2:-0}" ]; then vid=1; vport=9301; sport=9351; else vid=2; vport=9351; sport=9301; fi
 VPID=$(pgrep -f -- "--psid $vid .*--transport $T" | head -1)
 say "H2: holder=PS$vid ($p1/$p2 on 9301/9351); kill -9 pid=${VPID:-?}"

@@ -46,6 +46,16 @@ sleep 5
 
 AOC=(timeout 20 "$AO" --manager "$MGR" --transport tcp)
 
+# Count partitions hosted by the PS whose per-partition band starts at $1.
+# autumn-op info overview prints "  part <id>  ps 127.0.0.1:<base+ord>" (space,
+# not "ps=", since the b01dfa8 dashboard rework) — a bare grep -c "ps=..." matched
+# nothing. Bucket by [base, base+50) (PS1=9301, PS2=9351 are 50 apart).
+# Return 1 (no stdout) on a FAILED/empty probe so callers don't fold a transient
+# info outage into "0 partitions" (which would pick the wrong PS / fake migration).
+parts_on() { local out; out=$("${AOC[@]}" info 2>/dev/null); [ -n "$out" ] || return 1
+    printf '%s\n' "$out" | grep -oE 'ps 127\.0\.0\.1:[0-9]+' \
+        | grep -oE '[0-9]+$' | awk -v b="$1" '$1>=b && $1<b+50' | wc -l; }
+
 # ── workload (python L3 backend) ────────────────────────────────────────────
 say "starting kvcache python workload"
 : > "$WORK/manifest.txt"
@@ -74,7 +84,14 @@ wait_progress() { # wait until OK count grows past current within deadline
 wait_progress "baseline"
 
 # ── K1: kill the partition-holding PS under live kvcache traffic ───────────
-p1=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || p1=0
+# Retry until BOTH bands probe successfully AND at least one holds a partition —
+# never fold a transient probe failure into 0 (would kill the wrong PS).
+p1=""; p2=""
+for _ in $(seq 1 15); do
+    a=$(parts_on 9301) && b=$(parts_on 9351) && [ $((a + b)) -gt 0 ] && { p1=$a; p2=$b; break; }
+    sleep 2
+done
+[ -n "$p1" ] || fail "K1: could not determine partition holder (probe failed)"
 if [ "${p1:-0}" -ge 1 ]; then VID=1; VPORT=9301; else VID=2; VPORT=9351; fi
 VPID=$(pgrep -f -- "--psid $VID .*--transport tcp" | head -1)
 say "K1: kill -9 holder PS$VID pid=${VPID:-?}"

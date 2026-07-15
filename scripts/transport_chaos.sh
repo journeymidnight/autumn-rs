@@ -97,6 +97,26 @@ CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T") # stream ops (12 MiB)
 # output before this, making E2's old migration check pass vacuously.
 AOC=(timeout 20 "$AO" --manager "$MGR" --transport "$T")  # control-plane probes
 
+parts_on() {
+    # Count partitions hosted by the PS whose per-partition listener band
+    # starts at $1 (base port). `autumn-op info` (overview) prints one line
+    # per partition: "  part <id>  ps 127.0.0.1:<base+ord>  ...". Each PS's
+    # partitions land in [base, base+50) (PS1=9301, PS2=9351, 50 apart), so
+    # bucket by that band. A bare `grep -c ps=127.0.0.1:<base>` was WRONG on
+    # two axes: (1) the overview format is "ps <addr>" (space), not
+    # "ps=<addr>", since the b01dfa8 dashboard rework — so it matched NOTHING
+    # (E5/E7 always 0/0, E2's "==0" always vacuously true); (2) a
+    # multi-partition PS binds base+ord ports, so even the right format at a
+    # bare <base> undercounts. Return 1 (no stdout) on a FAILED probe so a
+    # caller distinguishes "probe failed" from a genuine 0 (folding them
+    # picks the wrong E5 victim / fakes convergence — coco P2).
+    local out
+    out=$("${AOC[@]}" info 2>/dev/null)
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out" | grep -oE 'ps 127\.0\.0\.1:[0-9]+' \
+        | grep -oE '[0-9]+$' | awk -v b="$1" '$1>=b && $1<b+50' | wc -l
+}
+
 # ── seed + manifest ─────────────────────────────────────────────────────────
 say "seeding keys"
 mkdir -p "$WORK/seed"
@@ -173,11 +193,11 @@ say "E2: kill -9 PS1 pid=$PS1_PID"
 kill -9 "$PS1_PID"
 deadline=$((SECONDS + 60))
 while [ $SECONDS -lt $deadline ]; do
-    left=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
+    left=$(parts_on 9301) || true
     if [ "${left:-1}" = "0" ]; then break; fi
     sleep 2
 done
-left=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
+left=$(parts_on 9301) || true
 if [ "${left:-1}" != "0" ]; then
     fail "E2: partitions did NOT migrate off PS1 within 60s"
     "${AOC[@]}" info 2>/dev/null | grep "^  part" | head -8
@@ -235,18 +255,6 @@ write_liveness() {
         [ $ok -eq 1 ] || fail "[$tag] write liveness wedged on $k"
     done
     [ $FAIL -eq 0 ] && say "[$tag] write liveness OK"
-}
-
-parts_on() {
-    # Distinguish "probe failed" (return 1, no output) from a genuine 0
-    # count — folding failures into 0 could pick the wrong E5 victim or
-    # fake convergence (coco P2). Probe success = info produced output;
-    # do NOT trust the exit code (non-zero on benign discard-fetch
-    # warnings against ucx partition listeners).
-    local out
-    out=$("${AOC[@]}" info 2>/dev/null)
-    [ -n "$out" ] || return 1
-    printf '%s\n' "$out" | grep -c "ps=127.0.0.1:$1" || true
 }
 
 # ── E4: kill + respawn the manager mid-writes ───────────────────────────────
@@ -341,7 +349,7 @@ for r in $(seq 1 "$ROUNDS"); do
     say "E6.$r: victim=$victim"
     case $victim in
         split)
-            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9]*\)  *ps .*/\1/p' | sort -n)
             if [ "${#CUR[@]}" -gt 0 ]; then
                 tgt="${CUR[$((RANDOM % ${#CUR[@]}))]}"
                 say "E6.$r: split part $tgt (best-effort)"
@@ -350,7 +358,7 @@ for r in $(seq 1 "$ROUNDS"); do
             fi
             ;;
         merge)
-            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9]*\)  *ps .*/\1/p' | sort -n)
             if [ "${#CUR[@]}" -ge 2 ]; then
                 i=$((RANDOM % (${#CUR[@]} - 1)))
                 say "E6.$r: merge ${CUR[$((i+1))]} into ${CUR[$i]} (best-effort)"
@@ -413,7 +421,7 @@ write_liveness "e6"
 # E6's merge ops (F269) can shrink the partition count below the
 # original 4 — adapt: need >= 2; the a-* keys live in the upper-middle
 # band, approximated by the 2/3 index in id (= key) order.
-mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9]*\)  *ps .*/\1/p' | sort -n)
 # High CHAOS_ROUNDS E6 runs can merge the cluster down to a single
 # partition — SELF-PROVISION by splitting it back instead of failing a
 # precondition (15-round tcp soak hit exactly this).
@@ -421,7 +429,7 @@ if [ "${#E7PARTS[@]}" -eq 1 ]; then
     say "E7: only 1 partition left after E6 merges — splitting ${E7PARTS[0]} to provision"
     "${AOC[@]}" split "${E7PARTS[0]}" >/dev/null 2>&1
     for i in $(seq 1 20); do
-        mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+        mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9]*\)  *ps .*/\1/p' | sort -n)
         [ "${#E7PARTS[@]}" -ge 2 ] && break
         sleep 2
     done
@@ -431,7 +439,15 @@ if [ "${#E7PARTS[@]}" -lt 2 ]; then
 else
     SPLIT_PART="${E7PARTS[$(( (${#E7PARTS[@]} * 2) / 3 ))]}"
     # Hosting PS: per-partition port < 9351 ⇒ PS1 band, else PS2 band.
-    SP_PORT=$("${AOC[@]}" info 2>/dev/null | sed -n "s/^  part ${SPLIT_PART}: ps=127.0.0.1:\([0-9]*\).*/\1/p" | head -1)
+    # Retry the hosting-PS resolve — a transient empty `info` must NOT silently
+    # default to PS2 (would kill the wrong PS for "split-PS killed mid-flight").
+    SP_PORT=""
+    for _ in $(seq 1 10); do
+        SP_PORT=$("${AOC[@]}" info 2>/dev/null | sed -n "s/^  part  *${SPLIT_PART}  *ps 127\.0\.0\.1:\([0-9]*\).*/\1/p" | head -1)
+        [ -n "$SP_PORT" ] && break
+        sleep 2
+    done
+    [ -n "$SP_PORT" ] || fail "E7a: could not resolve hosting PS for part $SPLIT_PART"
     if [ -n "$SP_PORT" ] && [ "$SP_PORT" -lt 9351 ]; then SP_PSID=1; SP_BASE=9301; else SP_PSID=2; SP_BASE=9351; fi
     say "E7a: split part $SPLIT_PART (on PS$SP_PSID) + kill PS mid-flight"
     ( "${AOC[@]}" split "$SPLIT_PART" >/dev/null 2>&1 ) &

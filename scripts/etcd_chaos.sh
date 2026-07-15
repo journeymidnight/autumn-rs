@@ -141,7 +141,9 @@ done
 recovered=0
 deadline=$((SECONDS + 120))
 while [ $SECONDS -lt $deadline ]; do
-    if "${AO[@]}" info 2>/dev/null | grep -q "ps="; then recovered=1; break; fi
+    # info overview prints "ps 127.0.0.1:<port>" (space, not "ps="); the old
+    # grep -q "ps=" never matched post-b01dfa8 → false "did not recover".
+    if "${AO[@]}" info 2>/dev/null | grep -qE 'ps 127\.0\.0\.1:[0-9]+'; then recovered=1; break; fi
     sleep 3
 done
 [ "$recovered" = "1" ] && say "D3: control plane recovered" \
@@ -149,7 +151,8 @@ done
 wait_progress "post-recovery"
 
 # control-plane mutation must work again (split = the heaviest etcd txn)
-P=$("${AO[@]}" info 2>/dev/null | grep -oE "part=[0-9]+" | head -1 | cut -d= -f2)
+# overview format: "  part <id>  ps 127.0.0.1:<port>" (no "part=" — b01dfa8 rework)
+P=$("${AO[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9][0-9]*\)  *ps .*/\1/p' | head -1)
 if [ -n "${P:-}" ]; then
     if "${AO[@]}" compact "$P" >/dev/null 2>&1; then
         say "D3: control-plane op (compact part $P) OK"
