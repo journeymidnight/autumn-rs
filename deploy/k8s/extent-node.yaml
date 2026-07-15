@@ -1,8 +1,12 @@
-# Data plane. The manager keys each EN's identity on its advertise address and
-# an EN NEVER re-registers a new address on restart — so the advertise address
-# MUST survive pod rescheduling. A pod IP does not; a per-pod ClusterIP Service
-# does. Each EN therefore gets its OWN ClusterIP Service (autumn-en-<ordinal>),
-# and the entrypoint advertises that stable ClusterIP.
+# Data plane. F-EN-DYNSHARD M0/M1a: the manager keys each EN's identity on a
+# stable node_uuid (persisted on the PVC), NOT the address, and the EN
+# self-registers its live address + shard ports at EVERY startup — so a naked
+# pod IP is now correctness-safe too. We KEEP the per-pod ClusterIP Service
+# (autumn-en-<ordinal>) anyway: a stable advertise address avoids routing churn
+# (the manager's df-echo drift heal firing on every pod reschedule) and gives
+# operators a fixed target. The entrypoint advertises that stable ClusterIP.
+# `autumn-op format` is identity-only (no address); the EN --advertise reports
+# the location.
 #
 # Each per-pod Service exposes BOTH ports the manager dials:
 #   9101  data plane (append/read; PS connects here)

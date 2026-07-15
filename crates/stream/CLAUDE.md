@@ -38,11 +38,11 @@ Each extent file pair:
 
 **Multi-disk usage** (production):
 ```bash
-# Format disks and register with manager
-autumn-client --manager ... format --listen :9101 --advertise host:9101 /disk1 /disk2
+# Format disks + register node IDENTITY (F-EN-DYNSHARD M1c: identity-only, no location)
+autumn-op --manager ... format /disk1 /disk2
 
-# Start node with multiple disks (comma-separated or repeated)
-autumn-extent-node --data /disk1,/disk2 --manager ...
+# Start node — it self-registers its live location via --advertise (required with --manager)
+autumn-extent-node --data /disk1,/disk2 --manager ... --advertise host:9101 --port 9101
 ```
 
 **Single-disk usage** (tests / backward compat):

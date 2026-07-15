@@ -20,8 +20,8 @@ echo "[t] cluster bring-up (2 EN, TCP)"
 "$BIN/autumn-manager-server" --port 19701 --listen 127.0.0.1 >"$WORK/mgr.log" 2>&1 & PIDS+=($!)
 wait_port 19701 20 || { echo FAIL mgr; tail "$WORK/mgr.log"; exit 1; }
 for i in 0 1; do P=$((19731+i*100)); mkdir -p "$WORK/en$i"
-  "$BIN/autumn-op" --manager "$MGR" format --listen ":$P" --advertise "127.0.0.1:$P" "$WORK/en$i" >"$WORK/fmt$i.log" 2>&1 || { echo FAIL fmt$i; cat "$WORK/fmt$i.log"; exit 1; }
-  "$BIN/autumn-extent-node" --data "$WORK/en$i" --port "$P" --manager "$MGR" --cpuset "$i" --listen 127.0.0.1 >"$WORK/en$i.log" 2>&1 & PIDS+=($!)
+  "$BIN/autumn-op" --manager "$MGR" format "$WORK/en$i" >"$WORK/fmt$i.log" 2>&1 || { echo FAIL fmt$i; cat "$WORK/fmt$i.log"; exit 1; }
+  "$BIN/autumn-extent-node" --data "$WORK/en$i" --port "$P" --manager "$MGR" --cpuset "$i" --advertise "127.0.0.1:$P" --listen 127.0.0.1 >"$WORK/en$i.log" 2>&1 & PIDS+=($!)
   wait_port "$P" 20 || { echo FAIL en$i; exit 1; }; done
 sleep 3
 "$BIN/autumn-op" --manager "$MGR" bootstrap --replication 1+0 >"$WORK/bs.log" 2>&1 || { echo FAIL bootstrap; cat "$WORK/bs.log"; exit 1; }

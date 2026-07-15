@@ -158,7 +158,7 @@ fn parse_args() -> Args {
                 let _ = args[i].clone();
                 eprintln!(
                     "error: --disk-id was removed in F214-D. \
-                     Run `autumn-op format --advertise <ADDR> <DIR>...` \
+                     Run `autumn-op format <DIR>...` \
                      first; the EN reads disk_id from each dir's \
                      `disk_id` sentinel file."
                 );
@@ -377,7 +377,7 @@ fn read_and_verify_cluster_id(data_dirs: &[PathBuf]) -> Result<String> {
         if !cid_path.exists() {
             anyhow::bail!(
                 "data dir {} is not formatted (no cluster_id sentinel). \
-                 Run `autumn-op format --advertise <HOST:PORT> {}` first.",
+                 Run `autumn-op format {}` first.",
                 dir.display(),
                 dir.display()
             );
@@ -674,26 +674,55 @@ fn main() -> Result<()> {
         .map(|i| control_port_base + (i as u16) * args.shard_stride)
         .collect();
 
-    // F-EN-DYNSHARD M1: validate --advertise (optional; enables startup
-    // self-registration). HOST must be an IP (DNS-free per the repo rule — the
-    // shell resolves names) and PORT must equal the shard-0 data port.
-    if let Some(adv) = args.advertise.as_ref() {
-        match adv.parse::<std::net::SocketAddr>() {
-            Ok(sa) if sa.port() == args.port => {}
+    // F-EN-DYNSHARD M1c: --advertise is now REQUIRED whenever --manager is
+    // given. `autumn-op format` (M1c) is identity-only — it no longer stamps
+    // a location — so an EN started without --advertise would self-register
+    // NOTHING and sit at an empty location forever (df can never reach it,
+    // stays Suspend, never selected for allocation). `--manager`-less runs
+    // (offline / unit-test invocations) are exempt — there's no registrar to
+    // report to. HOST must be an IP (DNS-free per the repo rule — the shell
+    // resolves names). The advertise PORT is the shard-0 port AS SEEN BY PEERS
+    // — normally == --port, but it MAY differ behind NAT / a proxy (the manager
+    // routes to advertise_host:advertise_port + i*stride while the EN binds
+    // --port + i*stride locally). We warn (not fail) on a mismatch so a bare
+    // typo surfaces without forbidding the legitimate proxy case. `advertise_port`
+    // (Some when --advertise given) drives the REGISTERED shard_ports below.
+    let advertise_port: Option<u16> = match (args.manager.as_ref(), args.advertise.as_ref()) {
+        (Some(_), None) => {
+            eprintln!(
+                "error: --advertise HOST:PORT is required when --manager is given \
+                 (F-EN-DYNSHARD M1c — `autumn-op format` no longer stamps a location; \
+                 the EN self-registers its own address + shard ports at every startup)."
+            );
+            std::process::exit(2);
+        }
+        (_, Some(adv)) => match adv.parse::<std::net::SocketAddr>() {
             Ok(sa) => {
-                eprintln!(
-                    "error: --advertise port {} must equal --port {} (the shard-0 data port)",
-                    sa.port(),
-                    args.port
-                );
-                std::process::exit(2);
+                if sa.port() != args.port {
+                    tracing::warn!(
+                        advertise_port = sa.port(),
+                        listen_port = args.port,
+                        "advertise port differs from --port — assuming NAT/proxy; \
+                         registered shard_ports derive from the advertise port"
+                    );
+                }
+                Some(sa.port())
             }
             Err(e) => {
                 eprintln!("error: --advertise must be IP:PORT (DNS-free), got {adv:?}: {e}");
                 std::process::exit(2);
             }
-        }
-    }
+        },
+        (None, None) => None,
+    };
+    // Peer-reachable (advertise-side) shard ports + control base — what the
+    // manager routes to, distinct from the local bind ports (`shard_ports` /
+    // `control_port_base`, derived from --port). Equal in the common case
+    // (advertise_port == --port), different behind a proxy.
+    let advertise_shard_ports: Vec<u16> = advertise_port
+        .map(|ap| (0..shards).map(|i| ap + (i as u16) * args.shard_stride).collect())
+        .unwrap_or_default();
+    let advertise_control_base: u16 = advertise_port.map_or(0, |ap| ap.saturating_add(1000));
 
     // Sibling addresses — used by each shard to forward control-plane RPCs
     // to the owning sibling when a mismatched extent_id arrives. Must use
@@ -755,8 +784,10 @@ fn main() -> Result<()> {
         // the full port vector + advertise + control base + transport (unused
         // by shards > 0).
         let reg_advertise = args.advertise.clone();
-        let reg_shard_ports = shard_ports.clone();
-        let reg_control_base = control_port_base;
+        // Register the ADVERTISE-side (peer-reachable) ports, NOT the local
+        // bind ports — they differ behind a proxy/NAT (see advertise_port above).
+        let reg_shard_ports = advertise_shard_ports.clone();
+        let reg_control_base = advertise_control_base;
         let reg_transport = args.transport;
         // F195: capture F194 / F099-I tunable overrides for the thread.
         let ec_par = args.ec_convert_parallelism;
@@ -928,21 +959,27 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
         if let Some(mgr) = args.manager.as_ref() {
             verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
-            // F-EN-DYNSHARD M1: self-register live location before serving (a
-            // single-shard node registers `vec![port]`; equivalent routing to
-            // the legacy empty-vec fallback).
+            // F-EN-DYNSHARD M1: self-register live location before serving. A
+            // single-shard node registers `[advertise_port]` — the PEER-reachable
+            // port (== --port normally, but the proxy/NAT port when they differ),
+            // and control = advertise_port + 1000. main() already required
+            // --advertise here, so the parse cannot fail.
             if let Some(adv) = args.advertise.as_ref() {
+                let advertise_port = adv
+                    .parse::<std::net::SocketAddr>()
+                    .expect("--advertise validated in main()")
+                    .port();
                 let (node_uuid, disk_uuids) = read_node_identity(&args.data_dirs)?;
                 let req = build_register_req(
                     adv,
                     args.transport,
-                    ctl_port,
+                    advertise_port.saturating_add(1000),
                     &node_uuid,
                     &disk_uuids,
-                    &[args.port],
+                    &[advertise_port],
                 );
                 register_with_manager(mgr, &req).await?;
-                reg_for_cfg = Some((node_uuid, adv.clone(), vec![args.port]));
+                reg_for_cfg = Some((node_uuid, adv.clone(), vec![advertise_port]));
             }
         }
 

@@ -84,10 +84,13 @@ case "$TRANSPORT" in tcp|ucx) ;; *) die "TRANSPORT must be tcp or ucx" ;; esac
 [[ "${#EN_NODES[@]}" -ge 1 ]]      || die "EN_NODES is empty"
 [[ "${#PS_HOSTS[@]}" -ge 1 ]]      || die "PS_HOSTS is empty"
 
-# v1 supports single-shard extent nodes only. A multi-core AUTUMN_EXTENT_CPUSET
-# makes the EN bind K shard ports, but the `autumn-op format` call below
-# registers only the base port (no --shard-ports), so the manager would route
-# per-extent ops to the wrong shard. Reject it (use cluster.sh for multi-shard).
+# v1 supports single-shard extent nodes only. F-EN-DYNSHARD M1c REMOVED the
+# original blocker (the EN now self-registers all its shard ports at startup,
+# so `format` no longer needs `--shard-ports`), but multi-shard on baremetal is
+# still UNVALIDATED here — the per-shard data + control ports (base+i*10 /
+# base+1000+i*10) must all be reachable, which this tool's firewall/systemd
+# assumptions don't yet cover. Keep the guard until a multi-shard baremetal run
+# is validated (use cluster.sh for multi-shard today).
 if [[ -n "${AUTUMN_EXTENT_CPUSET:-}" ]]; then
     _cpu_n=0
     for _seg in ${AUTUMN_EXTENT_CPUSET//,/ }; do
@@ -97,7 +100,7 @@ if [[ -n "${AUTUMN_EXTENT_CPUSET:-}" ]]; then
             _cpu_n=$(( _cpu_n + 1 ))
         fi
     done
-    (( _cpu_n <= 1 )) || die "AUTUMN_EXTENT_CPUSET='$AUTUMN_EXTENT_CPUSET' spans $_cpu_n cores; autumn-deploy v1 is single-shard EN only (multi-shard needs --shard-ports registration — use cluster.sh)"
+    (( _cpu_n <= 1 )) || die "AUTUMN_EXTENT_CPUSET='$AUTUMN_EXTENT_CPUSET' spans $_cpu_n cores; autumn-deploy v1 is single-shard EN only (multi-shard baremetal unvalidated — use cluster.sh)"
 fi
 
 # Derived address lists (MANAGER_LIST / MANAGER_FIRST / ETCD_ENDPOINTS) are
@@ -525,15 +528,20 @@ _format_and_start_ens() {
     local i host dirs port ph
     for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do
         host="$(en_host "$i")"; dirs="$(en_dirs "$i")"; port="$(en_port "$i")"; ph="$(plain_host "$host")"
-        # Ensure dirs exist, then idempotently format (F214-C: re-running on a
-        # formatted dir reuses disk_uuid + re-registers same node).
+        # Ensure dirs exist, then idempotently format. F-EN-DYNSHARD M1c:
+        # format is IDENTITY-ONLY (no --listen/--advertise) — F214-C
+        # re-run reuses disk_uuid + node_uuid and re-registers the same
+        # identity. The EN process below self-registers the live location.
         local dirs_sp="${dirs//,/ }"
         on_host "$host" "mkdir -p $dirs_sp"
         log "format en$i ($host:$port, dirs=$dirs)"
-        on_host "$host" "'$BIN_DIR/autumn-op' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format --listen ':$port' --advertise '$(bracket_ip_static "$host"):$port' $dirs_sp"
+        on_host "$host" "'$BIN_DIR/autumn-op' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format $dirs_sp"
+        # F-EN-DYNSHARD M1a: --advertise is now REQUIRED with --manager — the
+        # EN self-registers its live address + shard ports at every startup.
         svc_start "$host" "en$i" "$DATA_ROOT" "$BIN_DIR/autumn-extent-node" \
             --port "$port" --data "$dirs" --manager "$MANAGER_FIRST" \
-            --listen "$ph" --transport "$TRANSPORT" --cpuset "${AUTUMN_EXTENT_CPUSET:-0}"
+            --listen "$ph" --advertise "$(bracket_ip_static "$host"):$port" \
+            --transport "$TRANSPORT" --cpuset "${AUTUMN_EXTENT_CPUSET:-0}"
     done
     sleep 3
 }

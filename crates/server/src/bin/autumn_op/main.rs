@@ -28,16 +28,12 @@ use autumn_rpc::partition_rpc::{
     DiagPartitionVpReq, DiagPartitionVpResp, GetDiscardsReq, GetDiscardsResp,
     MSG_DIAG_PARTITION_VP, MSG_GET_DISCARDS,
 };
-use autumn_transport::TransportKind;
 use bytes::Bytes;
 use serde::Serialize;
 
 
 mod args;
-use args::{
-    derive_control_address, fuse_split_ranges, hex_split_ranges, parse, parse_replication,
-    Args, Command,
-};
+use args::{fuse_split_ranges, hex_split_ranges, parse, parse_replication, Args, Command};
 
 fn format_disk(dir: &str) -> Result<String> {
     for byte in 0u8..=255 {
@@ -295,10 +291,11 @@ async fn run(args: Args) -> Result<()> {
     if matches!(args.cmd, Command::RegisterNode) {
         eprintln!(
             "register-node has merged into 'autumn-op format'.\n\
-             Run: autumn-op --manager <ADDR> format --listen :<PORT> \\\n\
-                  --advertise <HOST:PORT> <DIR> [<DIR>...]\n\
-             'format' fetches the cluster_id, registers the node, \
-             and stamps every data dir in one step."
+             Run: autumn-op --manager <ADDR> format <DIR> [<DIR>...]\n\
+             'format' fetches the cluster_id, registers the node IDENTITY \
+             (F-EN-DYNSHARD M1c — no location), and stamps every data dir. \
+             Start `autumn-extent-node --manager <ADDR> --data <DIR>... \
+             --advertise <HOST:PORT>` to self-register the live location."
         );
         std::process::exit(1);
     }
@@ -354,7 +351,7 @@ async fn run(args: Args) -> Result<()> {
             // Already handled by the pre-connect stub above.
             unreachable!("Command::RegisterNode handled before connect");
         }
-        Command::Format { listen, advertise, dirs, shard_ports } => cmd_format(&client, args.json, listen, advertise, dirs, shard_ports, &args.manager, args.transport).await?,
+        Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
         // ---------------- F-AUTHZ-1 tooling ----------------
         Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
         Command::TenantCreate { tenant, prefixes, admin_token } => cmd_tenant_create(&client, args.json, tenant, prefixes, admin_token).await?,
@@ -1498,7 +1495,16 @@ async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_i
     Ok(())
 }
 
-async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertise: String, dirs: Vec<String>, shard_ports: Vec<u16>, manager: &str, transport: TransportKind) -> Result<()> {
+/// F-EN-DYNSHARD M1c: `format` mints/reuses IDENTITY only (`node_uuid` +
+/// per-dir `disk_uuid`) and registers with an EMPTY location — no
+/// `addr`/`shard_ports`/`control_address`. The EN binary's own `--advertise`
+/// self-registers the live address + shard ports at every startup (M1a/M1b),
+/// so format never needs `--listen`/`--advertise`/`--shard-ports` again.
+/// Mirrors Kafka `kafka-storage.sh format` (writes only clusterId/nodeId to
+/// meta.properties, zero network info) and Ceph `ceph-volume prepare` (writes
+/// only the OSD fsid) — mkfs mints identity offline; the daemon reports its
+/// own network location every boot, not the formatting step.
+async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manager: &str) -> Result<()> {
     // F214-C: fetch the manager's cluster_id BEFORE touching
     // any disk. Failure here means the manager is not yet
     // leader (retries internally) or has never bootstrapped
@@ -1600,32 +1606,24 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
             .with_context(|| format!("write node_uuid in {dir}"))?;
     }
 
-    // F214-C: register against the manager. Re-register branch
-    // (existing address known) returns the existing node_id +
-    // matching disk_ids, so idempotency holds end-to-end.
-    // F099-M: pass `shard_ports` so the manager routes
-    // per-extent operations to the owning shard via
-    // `extent_id % shard_count`. Empty vec = single-shard EN
-    // (manager routes everything to `advertise`).
-    // F191 control-plane port. Under UCX a second ucp_listener on the
-    // same RoCE device can't bind ("Device is busy"), so the extent
-    // node serves control RPCs on the data listener instead. Register
-    // an empty control_address so the manager's DF falls back to the
-    // data address (manager treats "" as "use addr"). TCP keeps the
-    // separate control port for HoL isolation.
-    let control_address = if transport == TransportKind::Ucx {
-        String::new()
-    } else {
-        derive_control_address(&advertise)
-    };
+    // F214-C + F-EN-DYNSHARD M1c: register against the manager, IDENTITY
+    // ONLY. `addr`/`shard_ports`/`control_address` are all empty — an
+    // identity-only registration is the M0 `handle_register_node`
+    // "identity-only" branch: the manager allocates node_id + disk_ids
+    // for a fresh node, or (re-format on an existing uuid) returns the
+    // existing node_id + disk map WITHOUT touching any live location the
+    // EN has already self-registered. A never-booted node therefore has
+    // NO location, so df can't reach it — it stays Suspend (F214-B) and
+    // is never selected for allocation until the EN actually starts and
+    // self-registers (M1a/M1b).
     let resp_bytes = client
         .mgr_call(
             MSG_REGISTER_NODE,
             rkyv_encode(&RegisterNodeReq {
-                addr: advertise.clone(),
+                addr: String::new(),
                 disk_uuids: disk_uuids.clone(),
-                shard_ports: shard_ports.clone(),
-                control_address,
+                shard_ports: vec![],
+                control_address: String::new(),
                 node_uuid: node_uuid.clone(),
             }),
         )
@@ -1686,9 +1684,8 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "node_id": node_id,
+                "node_uuid": node_uuid,
                 "cluster_id": cluster_id,
-                "listen": listen,
-                "advertise": advertise,
                 "disks": disk_assignments.iter()
                     .map(|(d, u, id)| serde_json::json!({
                         "dir": d, "uuid": u, "disk_id": id,
@@ -1697,7 +1694,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
             }))?
         );
     } else {
-        println!("node registered: node_id={node_id}");
+        println!("node registered: node_id={node_id}, node_uuid={node_uuid}");
         println!("cluster_id={cluster_id}");
         for (dir, _u, disk_id) in &disk_assignments {
             println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
@@ -1713,11 +1710,12 @@ async fn cmd_format(client: &ClusterClient, json: bool, listen: String, advertis
         } else {
             println!("\nFormat complete ({n_fresh} formatted, {n_reused} reused).");
         }
-        println!("listen={listen}, advertise={advertise}");
+        // F-EN-DYNSHARD M1c: format registered IDENTITY ONLY — the node has
+        // NO location until the EN process itself self-registers via its own
+        // `--advertise` (required whenever `--manager` is given).
         println!("Start the extent node with:");
         println!(
-            "  autumn-extent-node --port {} --manager {} --data {}",
-            listen.split(':').next_back().unwrap_or("9101"),
+            "  autumn-extent-node --manager {} --data {} --advertise <HOST:PORT> [--cpuset <SPEC>]",
             manager,
             dirs.join(",")
         );

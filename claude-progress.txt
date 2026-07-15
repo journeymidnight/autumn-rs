@@ -1,71 +1,44 @@
-Date: 2026-07-14
+Date: 2026-07-15
 TaskStatus: completed
-Task scope: BUG-READ-TIMEOUT-STORM — generalize the write-only size-scaled
-  append deadline into a shared IoDeadline primitive and apply it to the READ
-  paths (the 8 MiB direct-read timeout storm: 566-646 "direct read TIMED OUT"
-  under 32 concurrent 8 MiB direct reads on one congested EN).
+Task scope: F-EN-DYNSHARD M1c — the deferred launcher-rewiring cleanup.
+  Make `autumn-op format` IDENTITY-ONLY (mint node_uuid+disk_uuid, register
+  with EMPTY location); make EN `--advertise` REQUIRED when `--manager` is
+  given (the EN is now the sole location source — no format stamp to fall
+  back on); rewire ALL launchers to pass `--advertise` to the EN binary.
+  Design decision (user, referencing Kafka/Ceph/HDFS): mkfs/format mints
+  identity only; the daemon self-registers its network location every boot.
 
-Current summary (committed 954dc6a):
-  IoDeadline (renamed from AppendDeadline; effective_io_timeout, IO_TIMEOUT_CAP,
-    for_len/for_chain) is now shared by append + read. Reads use SEPARATE params
-    read_base_timeout 3 s + read_floor_bytes_per_sec 4 MiB/s (looser than the
-    8 MiB/s append floor — no RF=3 fsync barrier). 8 MiB read -> 5 s, 256 MiB
-    chunk -> 67 s (< 600 s cap, never binds). Applied at all 5 size-varying read
-    sites (read_extent_value_direct, read_value_into_pooled,
-    read_shard_chunk_from_addr, ec_reconstruct_shard_subrange, ec_read_full).
-  Retry damping on liveness timeout (is_liveness_timeout): read_redirect_replicas
-    (client) + read_value_into_pooled (stream) stop walking replicas after 2
-    timeouts, fall through to the authoritative proxy/copy path. Fast errors keep
-    the full rotation.
-  Append boundedness preserved verbatim (cap + for_chain-caps-after-multiply).
-  Green: 103 stream lib (7 io_deadline_tests) + 27 client + 195 partition-server;
-    0 clippy. coco (GPT-5.5 deep) 3 findings triaged (EC loser-timeout trade-off
-    documented — EC off by default; public-config-field non-issue; test comment
-    clarified). Stream CLAUDE.md note 29; feature_list F-EN-SHARD-HASH +
-    F-READ-OPENTAIL-ROTATE (the underlying load-imbalance CAUSE, deferred).
+Current summary (ready to commit):
+  - args.rs: Command::Format reduced to { dirs }; --listen/--advertise/
+    --shard-ports now hard migration-error stubs (exit 2). Dead
+    derive_control_address fn + 3 tests removed (logic moved to the EN's
+    build_register_req in M1a).
+  - main.rs cmd_format: registers RegisterNodeReq with addr=""/shard_ports=[]/
+    control_address="" (identity only). JSON adds node_uuid.
+  - extent_node.rs: --advertise REQUIRED with --manager; registered shard_ports
+    + control base derived from the ADVERTISE port (peer-reachable), not the
+    bind --port — supports NAT/proxy (warn-not-fail on port mismatch, the
+    toxiproxy case). Both multi-shard + run_single_shard paths.
+  - Launchers wired: cluster.sh, deploy/docker/entrypoint.sh, deploy/baremetal/
+    autumn-deploy, deploy/k8s/extent-node.yaml (comment), + 7 e2e/chaos scripts
+    (run_authz/run_e2e/run_vllm/run_fs/run_fs_lease/run_memory + crosshost_chaos).
+  - coco (deep) 2 P2 fixed: (1) missed e2e/chaos tests using old format syntax +
+    EN missing --advertise (f213_op_bootstrap_e2e.rs + system_chaos.rs); (2)
+    identity-only re-register called on_heartbeat_ok, prematurely flipping a
+    not-yet-booted node Online with a stale location — now gated on !addr.empty().
+  - Green: EN bin 2, manager lib 193, f_en_dynshard 6, df_echo 5, rpc lib 48;
+    workspace + all test targets build clean. deploy/validate.sh k8s OK.
+  - VALIDATED LIVE: reshard_chaos.sh 2→4→1 PASSES on the new identity-only flow
+    (format registers empty → list-nodes shard count comes entirely from the
+    EN's self-register), zero data movement, all 150 keys byte-exact.
 
-Main gaps:
-  - The load-imbalance CAUSE (shard-0 aliasing + open-tail replica[0] pinning)
-    is recorded but NOT fixed — deadlines + damping only stop the STORM. See
-    feature_list F-EN-SHARD-HASH / F-READ-OPENTAIL-ROTATE.
+Main gaps (deferred, unchanged from prior backlog):
+  - M2 k8s Service-port generation (multi-shard needs shard_count data+control
+    ports per pod; kustomize can't loop → a generator/template); needs a live
+    k8s to validate. Only remaining F-EN-DYNSHARD item.
   - F-SEALED-EMPTY-SWEEP (BUG-FLUSH-TIMEOUT-LEAK backstop) still deferred.
+  - Remote host can't build the workspace (no crates.io egress;
+    project_remote_host_no_cratesio) → validate on the local box + scp binaries.
 
-Retest (2026-07-14, DONE — image 16ae27f rolled out to VKE, stop-the-world):
-  8 MiB perf-check --direct-read, 32 threads, 32 partitions:
-    write 920 MB/s (RF3 fsync-bound, p99 390 ms);
-    DIRECT READ 3949 MB/s, p50 30 ms / p99 205 ms, 10368 ops, ZERO errors.
-  Storm GONE: 0 "TIMED OUT" / fallback lines across all 3 PS + 5 EN pods AND
-  the client perf pod (previously 566-646 direct-read timeouts + polluted
-  throughput). Prior healthy baseline was 3182 MB/s → now 3949 MB/s, clean.
-  Extents now spread across all 5 EN (70/53/63/49/56), not shard-0-aliased.
-
-F-EN-SHARD-HASH + F-READ-OPENTAIL-ROTATE (2026-07-14, committed b29926a):
-  The load-skew CAUSE behind the read hotspot, now fixed.
-  - F-EN-SHARD-HASH: canonical autumn_rpc::shard_for_extent (splitmix64) routed
-    through all 5 extent→shard sites (EN owns_extent+sibling+2 errmsgs, manager +
-    conn_pool shard_addr_for_extent). Was `id % shard_count` → aliased bootstrap's
-    contiguous ids onto shard 0. Stop-the-world reshard, byte-free, no wire/etcd
-    change. Tests: shard_for_extent_tests + f099m_shards (hash-aware).
-  - F-READ-OPENTAIL-ROTATE: replicated_read_order rotates open-tail reads across
-    replicas (was replica[0]-pinned). Appends unaffected. coco P1: ZC value path
-    now verifies full length (falls to copy path on short read).
-  - 104 stream lib + 48 rpc + 195 PS + 0 clippy; coco P1 fixed + P3 comments synced.
-
-F-CL-PARALLEL (2026-07-15, committed fa722e3): the manager probed the 3 replicas
-  SEQUENTIALLY in commit_length (5s each → 15s = the PS CHECK_COMMIT_LENGTH
-  deadline), so one cold EN timed out the whole partition-open probe under the
-  concurrent-open herd. Fixed: join_all the per-replica probes (both open-path +
-  failover-seal). Validated on redeploy: 15s timeouts 0 (was the storm cause);
-  residual "0/N reachable" retries are EN-binds-late (startup handshake), benign.
-
-DEPLOYED + VALIDATED on VKE (image fa722e3, stop-the-world reshard):
-  - Perf vs TOS: 4KB read 167K/write 82K ops/s (~228×/187×); 8MB read direct
-    5,826 MB/s (~7.6×) / proxy 2,272 (~3.0×) — both JUMPED, ZERO storm; 8MB write
-    ~950 MB/s (~1.06×). ~/perf_tos_compare.md updated.
-  - Reshard byte-free, no data loss (7+ GB partitions intact, put/get round-trip).
-  - Cold-start 15s commit_length timeouts eliminated.
-
-Next steps (deferred backlog):
-  - F-SEALED-EMPTY-SWEEP — BUG-FLUSH-TIMEOUT-LEAK backstop.
-  - (minor) all 32 partitions land on 1 PS after restart (rebalance quirk,
-    pre-existing, EN-bound perf unaffected); EN binds ~65s into cold start.
+Next steps:
+  - Commit + push M1c to main (solo-flow). Feature_list F-EN-DYNSHARD M1c → DONE.

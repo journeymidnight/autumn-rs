@@ -145,16 +145,8 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // the extent-node spawn.
     {
         let mut cmd = Command::new(AUTUMN_OP_BIN);
-        cmd.args([
-            "--manager",
-            &mgr_addr,
-            "format",
-            "--listen",
-            &format!(":{en_port}"),
-            "--advertise",
-            &en_addr,
-            data_dir.to_str().unwrap(),
-        ]);
+        // F-EN-DYNSHARD M1c: format is identity-only — no location flags.
+        cmd.args(["--manager", &mgr_addr, "format", data_dir.to_str().unwrap()]);
         let stdout = run_or_panic("autumn-op format", cmd);
         let text = String::from_utf8_lossy(&stdout);
         assert!(
@@ -179,6 +171,10 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
                 &en_port.to_string(),
                 "--listen",
                 "127.0.0.1",
+                // F-EN-DYNSHARD M1a/M1c: --advertise is required with --manager;
+                // the EN self-registers its live location (format is identity-only).
+                "--advertise",
+                &en_addr,
                 "--manager",
                 &mgr_addr,
                 "--data",

@@ -16,10 +16,14 @@
 #
 # Addressing model (see docs/k8s_deploy.md):
 #   extent-node  advertises its per-pod Service ClusterIP (Service name ==
-#                pod name). The manager keys EN identity on the advertise
-#                address and an EN never re-registers a new address, so the
-#                address must survive pod rescheduling — a ClusterIP does,
-#                a pod IP does not.
+#                pod name). F-EN-DYNSHARD M0/M1a: the manager keys EN
+#                identity on a stable node_uuid (persisted on the PVC), NOT
+#                the address, and the EN self-registers its live address +
+#                shard ports at EVERY startup — so a naked pod IP would now
+#                also work correctness-wise. The per-pod ClusterIP is kept
+#                anyway: it avoids routing churn (a df-echo drift heal) on
+#                every pod restart and gives operators a stable target.
+#                `format` is identity-only (no address) — see cmd below.
 #   ps           advertises its POD IP. Safe because every partition open
 #                re-registers its address with the manager, so a rescheduled
 #                PS heals its routing automatically. Per-partition listener
@@ -150,33 +154,25 @@ run_extent_node() {
     # listener at `port + i*stride` and its control listener at
     # `port+1000 + i*stride` (EN default stride 10 — keep it in sync here).
     # The manager routes an extent to shard `extent_id % shards` and dials
-    # `advertise_host:shard_port`, so:
-    #   - `format --shard-ports <csv>` MUST register every shard's DATA port,
-    #     or the manager sends all extents to the base port (shard 0 only);
-    #   - the per-pod Service MUST expose every shard's data AND control port.
-    # shards=1 keeps the original single-shard behaviour (no --shard-ports).
+    # `advertise_host:shard_port`. F-EN-DYNSHARD M1a/M1b: the EN binary
+    # itself self-registers every shard's data port at startup (via its own
+    # `--advertise`) — no `--shard-ports` flag needed anywhere anymore. The
+    # per-pod Service MUST still expose every shard's data AND control port.
+    # shards=1 keeps the original single-shard behaviour.
     local shards="${AUTUMN_EXTENT_SHARDS:-1}"
     [[ "$shards" =~ ^[0-9]+$ && "$shards" -ge 1 ]] \
         || die "AUTUMN_EXTENT_SHARDS must be a positive integer"
-    local stride=10
     local cpuset="${AUTUMN_EXTENT_CPUSET:-}"
     if [[ -z "$cpuset" ]]; then
         (( shards == 1 )) && cpuset="0" || cpuset="0-$((shards - 1))"
     fi
-    local -a shard_ports_args=()
-    if (( shards > 1 )); then
-        local csv="" s
-        for (( s = 0; s < shards; s++ )); do
-            csv+="${csv:+,}$(( port + s * stride ))"
-        done
-        shard_ports_args=(--shard-ports "$csv")
-    fi
 
     wait_for_manager "$mgr"
 
-    # Idempotent (F214-C): re-running on a formatted dir reuses the stamped
-    # disk_uuid and re-registers as the same node. Registration is keyed on
-    # the advertise address — stable here by construction (ClusterIP).
+    # F-EN-DYNSHARD M1c: format is IDENTITY-ONLY (no --listen/--advertise) —
+    # idempotent (F214-C): re-running on a formatted dir reuses the stamped
+    # disk_uuid and re-registers the same node identity. The EN process
+    # below self-registers the live location (--advertise) at every startup.
     local -a dirs=()
     local d
     for d in ${data//,/ }; do
@@ -185,9 +181,7 @@ run_extent_node() {
     done
     local i
     for (( i = 0; i < 30; i++ )); do
-        if autumn-op --manager "$mgr" --transport "$TRANSPORT" format \
-            --listen ":$port" --advertise "${adv}:${port}" \
-            "${shard_ports_args[@]}" "${dirs[@]}"; then
+        if autumn-op --manager "$mgr" --transport "$TRANSPORT" format "${dirs[@]}"; then
             break
         fi
         (( i == 29 )) && die "autumn-op format failed after 30 attempts"
@@ -198,6 +192,9 @@ run_extent_node() {
     local -a args=(
         --port "$port" --data "$data" --manager "$mgr"
         --listen 0.0.0.0 --transport "$TRANSPORT"
+        # F-EN-DYNSHARD M1a: self-register the live location + shard ports at
+        # every startup — required now that `format` no longer stamps one.
+        --advertise "${adv}:${port}"
         # Shard count == cpuset length (EN F196). Default cpuset "0" = single
         # shard; AUTUMN_EXTENT_SHARDS=N gives cores 0..N-1. See the sharding
         # block above and docs/k8s_deploy.md "Multi-shard extent nodes".

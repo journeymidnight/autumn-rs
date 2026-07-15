@@ -188,11 +188,12 @@ wall (benchmarked here: write flattens ~65k ops/s past 16 partitions). Giving
 each EN more shards spreads its extents (`shard = extent_id % N`) across N cores.
 
 The entrypoint exposes this via **`AUTUMN_EXTENT_SHARDS`** (default 1). When > 1
-it sizes the EN to cores `0..N-1` and passes `format --shard-ports` so the
-manager can route each extent to the owning shard. Shard `i` binds data port
-`9101 + i*10` and control port `10101 + i*10`, so **every per-pod EN Service
-must expose all N data + N control ports** — otherwise the manager/PS can't
-reach shards 1..N-1. `deploy/overlays/vke` is a worked 4-shard example: it sets
+it sizes the EN to cores `0..N-1`. F-EN-DYNSHARD M1c: `format` is identity-only
+now — the EN binary itself self-registers all N shard ports at startup (via its
+own `--advertise`), so nothing has to pass `--shard-ports` anywhere. Shard `i`
+binds data port `9101 + i*10` and control port `10101 + i*10`, so **every
+per-pod EN Service must expose all N data + N control ports** — otherwise the
+manager/PS can't reach shards 1..N-1. `deploy/overlays/vke` is a worked 4-shard example: it sets
 `AUTUMN_EXTENT_SHARDS: "4"`, patches each `autumn-en-<i>` Service to the 8 ports
 (`9101/9111/9121/9131` + `10101/10111/10121/10131`), and requests 4 CPU per EN.
 

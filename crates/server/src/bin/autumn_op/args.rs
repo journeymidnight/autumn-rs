@@ -44,8 +44,13 @@ fn usage() -> ! {
     eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
     eprintln!("  forcegc <PARTID> <EXTID>...");
     // F214-C: `register-node` removed; `format` is the single per-EN setup.
-    eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
-    eprintln!("                               format dir(s), register node, stamp cluster_id");
+    // F-EN-DYNSHARD M1c: format is IDENTITY-ONLY — it no longer takes a
+    // location (no --listen/--advertise/--shard-ports). The EN binary's own
+    // `--advertise` self-registers the live location at every startup.
+    eprintln!("  format <DIR>...");
+    eprintln!(
+        "                               format dir(s), register node identity, stamp cluster_id"
+    );
     std::process::exit(1);
 }
 
@@ -182,17 +187,14 @@ pub(crate) enum Command {
     // the parser can route the legacy spelling to a migration stub
     // (in run()) instead of failing at parse with "unknown subcommand".
     RegisterNode,
-    Format {
-        listen: String,
-        advertise: String,
-        dirs: Vec<String>,
-        /// F099-M: per-shard listener ports the EN binds. Empty = single-
-        /// shard mode (manager routes everything to `advertise`). Multi-
-        /// shard clusters (AUTUMN_EXTENT_SHARDS>1) MUST pass these so
-        /// the manager can route extent ops to the owning shard by
-        /// `extent_id % shard_count`.
-        shard_ports: Vec<u16>,
-    },
+    /// F-EN-DYNSHARD M1c: format is IDENTITY-ONLY (mints/reuses `node_uuid` +
+    /// per-dir `disk_uuid`, registers with an EMPTY location). It no longer
+    /// carries `listen`/`advertise`/`shard_ports` — the EN binary's own
+    /// `--advertise` self-registers the live address + shard ports at every
+    /// startup (mirrors Kafka `kafka-storage.sh format` / Ceph `ceph-volume
+    /// prepare`: mkfs mints identity only, the daemon reports its own network
+    /// location on every boot). See docs/en_dynamic_shard_design.md §2.2.
+    Format { dirs: Vec<String> },
     // ── F-AUTHZ-1 data-plane authz tooling ──────────────────────────────────
     /// Generate an Ed25519 signing key (LOCAL — no manager). Prints the keyfile
     /// line (`<kid> <hex-seed>`) to stdout; redirect to `--auth-signing-key-file`.
@@ -811,50 +813,36 @@ pub(crate) fn parse() -> Args {
             Command::RegisterNode
         }
         "format" => {
-            let mut listen = String::new();
-            let mut advertise = String::new();
             let mut dirs = Vec::new();
-            let mut shard_ports: Vec<u16> = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--listen" => {
-                        i += 1;
-                        listen = val(&raw, i).to_owned();
-                    }
-                    "--advertise" => {
-                        i += 1;
-                        advertise = val(&raw, i).to_owned();
-                    }
-                    "--shard-ports" => {
-                        // Comma-separated u16 list. Required for
-                        // F099-M multi-shard ENs so the manager can
-                        // route per-extent ops to the owning shard.
-                        i += 1;
-                        for part in val(&raw, i).split(',') {
-                            let p = part.trim();
-                            if p.is_empty() {
-                                continue;
-                            }
-                            let port: u16 = p.parse().expect("--shard-ports entries must be u16");
-                            shard_ports.push(port);
-                        }
+                    // F-EN-DYNSHARD M1c: format is identity-only now — these
+                    // location flags moved to the EN binary itself (its own
+                    // `--advertise`, self-registered at every startup). Hard
+                    // error (not a silent ignore) so a not-yet-updated caller
+                    // fails loudly instead of format silently keying off a
+                    // register that never fires. Same-commit migration
+                    // pattern as `--disk-id` / `--shards` (F214-D / F196).
+                    "--listen" | "--advertise" | "--shard-ports" => {
+                        eprintln!(
+                            "error: format's `{}` was removed in F-EN-DYNSHARD M1c — \
+                             format now registers IDENTITY ONLY (node_uuid + disk_uuids), \
+                             no location. Pass `--advertise HOST:PORT` to \
+                             `autumn-extent-node` itself instead; it self-registers its \
+                             live address + shard ports at every startup.",
+                            raw[i]
+                        );
+                        std::process::exit(2);
                     }
                     _ => dirs.push(raw[i].clone()),
                 }
                 i += 1;
             }
-            if listen.is_empty() || advertise.is_empty() || dirs.is_empty() {
-                eprintln!(
-                    "format requires --listen <ADDR> --advertise <ADDR> [--shard-ports P1,P2,...] <DIR>..."
-                );
+            if dirs.is_empty() {
+                eprintln!("format requires <DIR>...");
                 std::process::exit(1);
             }
-            Command::Format {
-                listen,
-                advertise,
-                dirs,
-                shard_ports,
-            }
+            Command::Format { dirs }
         }
         _ => usage(),
     };
@@ -1037,55 +1025,8 @@ fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
     Ok((k, m))
 }
 
-/// F191: derive default control-plane addr from data-plane host:port by
-/// offsetting the port by +1000. Returns empty on parse failure — the
-/// manager treats empty `control_address` as "fall back to addr".
-pub(crate) fn derive_control_address(advertise: &str) -> String {
-    let Some(colon) = advertise.rfind(':') else {
-        return String::new();
-    };
-    let (host, port_str) = advertise.split_at(colon);
-    let port_str = &port_str[1..];
-    let Ok(port) = port_str.parse::<u16>() else {
-        return String::new();
-    };
-    let Some(ctl_port) = port.checked_add(1000) else {
-        return String::new();
-    };
-    format!("{host}:{ctl_port}")
-}
-
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn derive_control_address_ipv4_offsets_port_by_1000() {
-        assert_eq!(
-            super::derive_control_address("127.0.0.1:9101"),
-            "127.0.0.1:10101"
-        );
-        assert_eq!(
-            super::derive_control_address("10.0.0.42:9201"),
-            "10.0.0.42:10201"
-        );
-    }
-
-    #[test]
-    fn derive_control_address_v6_bracketed_offsets_port_by_1000() {
-        assert_eq!(
-            super::derive_control_address("[fe80::1]:9101"),
-            "[fe80::1]:10101"
-        );
-    }
-
-    #[test]
-    fn derive_control_address_falls_back_to_empty_on_bad_input() {
-        assert_eq!(super::derive_control_address("no-port-here"), "");
-        assert_eq!(super::derive_control_address(""), "");
-        // port overflow → empty
-        assert_eq!(super::derive_control_address("127.0.0.1:65000"), "");
-    }
-
     #[test]
     fn parse_byte_size_accepts_plain_integer() {
         assert_eq!(

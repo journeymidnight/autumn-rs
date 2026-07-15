@@ -111,19 +111,22 @@ wait_nodes() { # wait_nodes <count>
 # ── format + start ENs: 2 local + 1 remote ──────────────────────────────────
 wait_mgr "boot"
 say "formatting + starting ENs (2 local + 1 remote)"
-"${AOC[@]}" format --listen "[$LIP]:21001" --advertise "[$LIP]:21001" "$LDATA/d1" >/dev/null 2>&1 || fail "format local d1"
-"${AOC[@]}" format --listen "[$LIP]:21002" --advertise "[$LIP]:21002" "$LDATA/d2" >/dev/null 2>&1 || fail "format local d2"
-REM "cd $RROOT && timeout 20 ./target/release/autumn-op --manager '$MGR' --transport $T format --listen '[$RIP]:21003' --advertise '[$RIP]:21003' $RDATA/d1 >/dev/null 2>&1 && echo fmt-ok || echo fmt-FAIL" | grep -q fmt-ok || fail "format remote d1"
+"${AOC[@]}" format "$LDATA/d1" >/dev/null 2>&1 || fail "format local d1"
+"${AOC[@]}" format "$LDATA/d2" >/dev/null 2>&1 || fail "format local d2"
+REM "cd $RROOT && timeout 20 ./target/release/autumn-op --manager '$MGR' --transport $T format $RDATA/d1 >/dev/null 2>&1 && echo fmt-ok || echo fmt-FAIL" | grep -q fmt-ok || fail "format remote d1"
 
 start_local_en() { # port datadir logname
+    # F-EN-DYNSHARD M1c: format is identity-only now — the EN self-registers
+    # its live location via --advertise (required with --manager).
     setsid nohup "$ROOT/target/release/autumn-extent-node" \
         --port "$1" --data "$2" --manager "$MGR" --listen "$LIP" \
+        --advertise "[$LIP]:$1" \
         --transport "$T" --cpuset 0-0 > "$WORK/$3" 2>&1 < /dev/null &
 }
 start_remote_en() {
     # ssh can linger after spawning a remote daemon (sshd holds the
     # channel) — background the WHOLE ssh locally and just wait a beat.
-    REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-extent-node --port 21003 --data $RDATA/d1 --manager '$MGR' --listen $RIP --transport $T --cpuset 0-0 > /tmp/xh_en_remote.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
+    REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-extent-node --port 21003 --data $RDATA/d1 --manager '$MGR' --listen $RIP --advertise '[$RIP]:21003' --transport $T --cpuset 0-0 > /tmp/xh_en_remote.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
     sleep 3
 }
 start_local_en 21001 "$LDATA/d1" en1.log

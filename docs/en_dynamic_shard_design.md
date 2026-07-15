@@ -727,13 +727,25 @@ self-protecting imposter check + a drift WARN (the EN's next boot self-register,
 or the operator, is the fix). A CAS-safe auto-heal (re-read + verify uuid +
 `nodes/<id>` value-CAS) is a deferred, reproduce-first follow-up.
 
-**M1c — OPEN (format identity-only + required --advertise + launcher wiring).**
-- **Files**: `crates/server/src/bin/autumn_op/main.rs` (`cmd_format` →
-  identity-only registration; `--shard-ports`/`--listen`/`--advertise`
-  removal stubs); `autumn-op list-nodes` uuid + shard-count display; make EN
-  `--advertise` REQUIRED when `--manager` is given + wire entrypoint /
-  autumn-deploy / k8s launchers.
-- **Wire/etcd**: none (M1b already bumped the wire); no etcd change.
+**M1c — DONE (format identity-only + required --advertise + launcher wiring).**
+- `autumn-op format <DIR>...` is IDENTITY-ONLY: `--listen`/`--advertise`/
+  `--shard-ports` are removed (hard migration-error stubs, F214-D/F196 pattern);
+  it registers with empty `addr`/`shard_ports`/`control_address` (§2.2 as
+  designed). `derive_control_address` deleted (moved to the EN's
+  `build_register_req` in M1a). `list-nodes` uuid + SHARDS columns (WIRE v21).
+- EN `--advertise` is now REQUIRED when `--manager` is given (main() validation,
+  covers both single- and multi-shard paths, before `run_single_shard`) — the EN
+  is the sole location source now, so a `--manager` run without it would
+  self-register nothing. `--manager`-less (offline/test) runs are exempt.
+- Launchers wired: cluster.sh (`format_extent_node` stripped, `launch_extent_node`
+  already passed `--advertise`), entrypoint.sh (docker/k8s), autumn-deploy, and 7
+  e2e/chaos scripts all drop location from `format` and pass `--advertise` to the
+  EN binary. k8s `extent-node.yaml` header comment corrected (identity is now
+  uuid-keyed + self-registering; per-pod ClusterIP KEPT to avoid drift-heal churn).
+- **Validated LIVE**: `reshard_chaos.sh` 2→4→1 PASSES on the new flow — the
+  `list-nodes` shard count now derives entirely from the EN's self-register
+  (format registered empty), proving format→identity-only is end-to-end correct.
+- **Wire/etcd**: none new (v21 was the M1c list-nodes bump); no etcd change.
 - **Acceptance**: integration test (etcd-gated, `crates/manager/tests/`):
   boot 1 manager + 1 EN at cpuset len 2 → write via a stream → stop EN →
   restart with cpuset len 4 → `list-nodes` shows 4 ports → read back all data

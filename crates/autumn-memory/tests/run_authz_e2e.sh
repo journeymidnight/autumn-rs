@@ -59,9 +59,9 @@ PIDS+=($!); wait_port "$((PB + 1))" 20 || { echo "[authz-e2e] FAIL manager"; tai
 
 # 3) EN + bootstrap + PS.
 echo "[authz-e2e] format + launch EN0 on $EN_PORT"
-"$BIN/autumn-op" --manager "$MGR" format --listen ":$EN_PORT" --advertise "127.0.0.1:$EN_PORT" "$WORK/en0" \
+"$BIN/autumn-op" --manager "$MGR" format "$WORK/en0" \
   >"$WORK/format.log" 2>&1 || { echo "[authz-e2e] FAIL format"; cat "$WORK/format.log"; exit 1; }
-"$BIN/autumn-extent-node" --data "$WORK/en0" --port "$EN_PORT" --manager "$MGR" --cpuset 0 --listen 127.0.0.1 \
+"$BIN/autumn-extent-node" --data "$WORK/en0" --port "$EN_PORT" --manager "$MGR" --cpuset 0 --advertise "127.0.0.1:$EN_PORT" --listen 127.0.0.1 \
   >"$WORK/en0.log" 2>&1 &
 PIDS+=($!); wait_port "$EN_PORT" 20 || { echo "[authz-e2e] FAIL EN"; tail -8 "$WORK/en0.log"; exit 1; }
 sleep 3

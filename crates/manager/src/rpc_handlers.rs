@@ -1092,10 +1092,21 @@ impl AutumnManager {
                     .insert(node_id, existing_node.clone());
             }
 
-            // F211-A: re-registration counts as a heartbeat — flip
-            // Suspected → Online so the operator-facing health report
+            // F211-A: a LOCATED re-registration (the EN process itself
+            // self-registering, `req.addr` non-empty) counts as a heartbeat —
+            // flip Suspected → Online so the operator-facing health report
             // reflects the recovery immediately, not on the next df tick.
-            self.node_states.borrow_mut().on_heartbeat_ok(node_id);
+            // F-EN-DYNSHARD M1c: an IDENTITY-ONLY re-register (`req.addr`
+            // empty — the M1c `autumn-op format` idempotent re-run) is NOT
+            // proof the EN is up (format runs BEFORE the EN starts), so it must
+            // NOT bump liveness — else a formatted-but-not-yet-booted node would
+            // flip Online with its stale location and get selected for
+            // allocation → a black-hole until the EN actually self-registers.
+            // It stays Suspend/Suspected until a real self-register or a
+            // successful df (F214-B "unbooted stays Suspend" property).
+            if !req.addr.is_empty() {
+                self.node_states.borrow_mut().on_heartbeat_ok(node_id);
+            }
             return Ok(rkyv_encode(&RegisterNodeResp {
                 code: CODE_OK,
                 message: String::new(),

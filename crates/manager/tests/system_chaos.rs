@@ -291,6 +291,13 @@ impl EnProcess {
             .append(true)
             .open(&self.log_path)
             .expect("open log");
+        // F-EN-DYNSHARD M1a/M1c: the EN self-registers its location now (format
+        // is identity-only). It BINDS its real port (`self.port`) but ADVERTISES
+        // the toxiproxy data port (`self.proxy_port`) — so the manager routes
+        // data → proxy_port and control → proxy_port+1000 (both toxiproxy-fronted),
+        // exactly what `format --advertise proxy_port` did pre-M1c. advertise_port
+        // != --port here is the legitimate proxy case (the EN warns, not fails).
+        let advertise = format!("127.0.0.1:{}", self.proxy_port);
         let child = Command::new(en_binary)
             .args([
                 "--port",
@@ -301,6 +308,8 @@ impl EnProcess {
                 &manager_addr.to_string(),
                 "--listen",
                 "127.0.0.1",
+                "--advertise",
+                &advertise,
                 // F196: cap shard count to 1 (default = cpuset_len; on a
                 // 192-core test box that's 192 listeners per EN × N ENs).
                 // Single-shard is enough for the chaos contract — F099-M
@@ -373,11 +382,10 @@ fn bootstrap_en(
     )
     .expect("create toxiproxy control proxy");
 
-    let advertise = format!("127.0.0.1:{proxy_port}");
-    let listen = format!(":{proxy_port}");
-
-    // 2. autumn-op format <DIR> — talks to manager, allocates uuid,
-    //    stamps sentinel files with the PROXY address. Synchronous.
+    // 2. autumn-op format <DIR> — F-EN-DYNSHARD M1c: IDENTITY-ONLY, no location
+    //    flags. Talks to the manager, allocates node_uuid + disk_uuid(s), stamps
+    //    sentinel files. The EN's own --advertise (EnProcess::restart) reports
+    //    the PROXY address at startup. Synchronous.
     let format_log = log_dir.join(format!("format-{port}.log"));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -389,10 +397,6 @@ fn bootstrap_en(
             "--manager",
             &manager_addr.to_string(),
             "format",
-            "--listen",
-            &listen,
-            "--advertise",
-            &advertise,
             data_dir.to_str().unwrap(),
         ])
         .stdout(Stdio::from(log_file.try_clone().unwrap()))

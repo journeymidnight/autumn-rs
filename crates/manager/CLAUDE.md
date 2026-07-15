@@ -2267,7 +2267,13 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `nodes/<id>` value-CAS) is a deferred reproduce-first follow-up. Empty echo
       fields are "unspecified", never a drift. Tests: `df_echo_tests` (5).
     Steady state: the EN self-registered at startup, so stored == echo → `Ok`.
-    **M1c (open)**: `format`→identity-only + required `--advertise` + launcher
-    wiring. Cross-ref: note 25 (F222 single df caller — the loop this extends),
+    **M1c (DONE)**: `autumn-op format` is now IDENTITY-ONLY (registers with empty
+    `addr`/`shard_ports`/`control_address` — a never-booted node has NO location,
+    stays Suspend, never selected); EN `--advertise` is REQUIRED with `--manager`;
+    all launchers (cluster.sh / entrypoint / autumn-deploy / k8s / e2e) wire
+    `--advertise` to the EN binary. So the identity-only `handle_register_node`
+    branch (M0 point 3) is now the STEADY-STATE format path, and the EN's own
+    startup register is the sole location writer. Validated live (reshard_chaos
+    2→4→1). Cross-ref: note 25 (F222 single df caller — the loop this extends),
     Item 3 in note 33 (the `streams/`/`extents/` value-CAS pattern a future
     df-heal write would mirror for `nodes/<id>`).
