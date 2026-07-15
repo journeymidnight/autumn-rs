@@ -1,93 +1,42 @@
 Date: 2026-07-15
-TaskStatus: completed
-Task scope: F-EN-DYNSHARD M2 — eliminate the per-pod EN ClusterIP Services in
-  k8s and switch the EN to advertise its OWN pod IP (Downward-API status.podIP),
-  relying on M1a startup self-register under a stable node_uuid. Then build the
-  image via the Volcengine CP pipeline and rollout-test on the live VKE cluster.
+TaskStatus: not_completed
+Task scope: F-REGION-REBALANCE — active region→PS load rebalancing. Phase A =
+  manual `autumn-op rebalance` (fix the sticky-assignment concentration the M2
+  rollout exposed: all 32 partitions on one PS). Phase B = dashboard auto-policy
+  rebalance switch (deferred). Then build + deploy on VKE + fix the live 32/0/0.
 
-FINAL RESULT: M2 DONE + LIVE-VALIDATED end-to-end on the VKE cluster.
-  - CP build run e1eafc76 Succeeded → image tag fd2bfbf772...; rolled out via
-    deploy/overlays/vke/deploy.sh; per-pod Services autumn-en-0..4 deleted.
-  - list-nodes: 5 ENs under POD IPs, SHARDS=4 each, Online, stable node_uuids.
-  - Only headless autumn-en Service remains; all ENs bound 4 shards + self-reg'd.
-  - WRITE/READ: 12/12 keys byte-exact; perf-check 16-thread — write 63.5k ops
-    @6350 ops/s (p99 2.7ms), read 134.5k ops @12226 ops/s (p99 1.22ms), all 32
-    partitions × 5 ENs × 4 shards over pod-IP routing. NO per-pod Service exists.
-  - Rollout gotcha (NOT M2): a bare kubectl-apply rolling update concentrated all
-    32 partitions on one oversubscribed PS → cold-start probe storm stalled the
-    first write attempt. Fix = parallel PS delete (user-authorized) → ps-2
-    reopened all 32 cleanly (ENs already stable) → writes work. Region→PS
-    assignment is sticky in etcd (parallel restart does NOT re-spread; that needs
-    a manager rebalance). Saved to memory [[vke-rolling-restart-concentrates-partitions]].
-  - COSMETIC LEFTOVER: all 32 partitions currently serve from ps-2 (ps-0/ps-1
-    idle) — functional (6k/12k ops/s) but not the original 3-way spread.
-    CONFIRMED via rebalance_regions (lib.rs:3309): region→PS assignment is STICKY
-    in etcd — kept for any registered PS, only reassigned when a PS is
-    UNREGISTERED. So NEITHER a PS restart NOR a manager restart re-spreads it
-    (verified: the parallel PS restart left all 32 on ps-2). True re-spread needs
-    cluster.sh reset (destroys data — not on a live cluster) or a future
-    active-rebalance command. Orthogonal to M2; cluster serves fine as-is.
+Phase A — CODE DONE + committed 289965e, pushed:
+  - wire: MSG_REBALANCE_REGIONS (0x56) + RebalanceRegionsReq{max_moves} /
+    RebalanceMove / RebalanceRegionsResp{code,message,moves,moved}; WIRE v21→v22
+    (fp 57fe8f244d8fd5c1, MIN=MAX=22 same-commit deploy).
+  - manager: pure compute_rebalance_moves (greedy most→least-loaded until gap≤1,
+    max_moves-bounded, deterministic, registered-PS-only) + handle_rebalance_regions
+    (leader-gated; apply in-memory + clear moved part_addr + mirror_partition_snapshot).
+    5 unit tests green.
+  - client: ClusterClient::rebalance_regions. autumn-op: `rebalance [MAX_MOVES]`.
+  - docs: ops.md runbook + cheatsheet; feature_list; manager CLAUDE.md.
+  - coco (GPT-5.5 deep): P0 dual-owner = handled by owner_epoch fencing
+    (open_partition acquires epoch BEFORE commit_length, same as failover; coco saw
+    manager code only); P1 wire MIN=MAX kept (matches every prior bump + stop-world
+    model); P1 part_addr staleness FIXED; P2 CLI trailing-arg FIXED.
+  - Build: workspace clean (autumn-fuse macOS link fail is pre-existing, Linux-only).
 
-Current summary (code committed fd2bfbf, pushed to main; build in flight):
-  - entrypoint.sh run_extent_node: advertise AUTUMN_ADVERTISE_IP (pod IP, IP
-    literal → bracket-only, no DNS) instead of resolving a per-pod-Service FQDN;
-    legacy AUTUMN_ADVERTISE_NAME fallback kept. Multi-shard comment updated.
-  - deploy/k8s/extent-node.yaml: DELETED autumn-en-0/1/2 Services; kept headless
-    autumn-en (serviceName only, ports vestigial) + StatefulSet (storage
-    identity). Env AUTUMN_ADVERTISE_NAME FQDN block → AUTUMN_ADVERTISE_IP ←
-    fieldRef status.podIP. Header/scaling comments rewritten.
-  - deploy/overlays/vke: removed en-extra-services.yaml (ordinals 3/4 per-pod
-    Services) + the 8-port `^autumn-en-[0-9]+$` Service patch. Only shard-count
-    env (AUTUMN_EXTENT_SHARDS=4) + CPU request remain.
-  - deploy/validate.sh: replaced the "every EN ordinal needs a per-pod Service"
-    check with the M2 model check (EN StatefulSet must inject AUTUMN_ADVERTISE_IP
-    from fieldRef status.podIP). coco (GPT-5.5 deep) caught this regression (P2).
-  - docs/k8s_deploy.md: constraint #2, components table, scaling, multi-shard all
-    rewritten for the pod-IP self-register model.
+Phase A — LIVE-VALIDATED on VKE (2026-07-15, user-authorized stop-world deploy):
+  - CP build run 3d6c41a0 Succeeded → image 289965e (WIRE v22).
+  - Deployed: apply v22 + coordinated `kubectl delete pod` (all non-etcd) →
+    9/9 converged to v22 in <2 min.
+  - Post-deploy the cluster was again 32-on-one-PS (sticky, as expected).
+  - `autumn-op rebalance` MOVED 21 PARTITIONS → 11/10/11 across all 3 PS (info
+    confirms). Post-rebalance perf-check green: write 10,152 ops + read 82,401
+    ops @ 7,490 ops/s across all 3 PS (write p99 spike = cold-reopen warmup).
+  - F-REGION-REBALANCE Phase A works end-to-end on the live cluster.
 
-Validation done (clusterless):
-  - kubectl kustomize deploy/k8s + deploy/overlays/vke render clean; only the
-    headless autumn-en Service remains; AUTUMN_ADVERTISE_IP ← status.podIP present.
-  - deploy/validate.sh: all k8s manifest/kustomization/role-args checks GREEN
-    (the sole FAIL is `bash -n autumn-deploy`, a PRE-EXISTING macOS bash-3.2
-    false-fail on `${ARR[0]}` syntax — file untouched by M2).
+NEXT (Phase B, deferred — user sequenced it after Phase A):
+  - dashboard auto-policy `rebalance` kind: POLICY_KIND_REBALANCE=7,
+    compute_rebalance_advisory, actuate_candidate arm, 6th switch, dashboard HTML.
+    Separate WIRE bump (v23) + deploy. Reuses handle_rebalance_regions.
 
-CP BUILD: DONE — run e1eafc76 (idx 24) Succeeded; image
-  dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:fd2bfbf772bde36afef947e01b5bcdfa48e275ad
-  (fast: M2 only touched entrypoint.sh → buildkit reused all Rust layers, binaries
-  identical to fa722e3; v21 wire fingerprint a76409bf80fbdb21 unchanged).
-
-ROLLOUT: applied via deploy/overlays/vke/deploy.sh (image + manifests); deleted
-  orphan per-pod Services autumn-en-0..4 (apply doesn't prune); k8s rolling-update
-  swapped all pods to fd2bfbf. All 5 ENs Ready on new image.
-
-M2 VERIFIED (infrastructure — the actual feature):
-  (1) autumn-op list-nodes: all 5 ENs registered under POD IPs
-      (192.168.1.24/2.8/1.129/3.243/0.60 :9101), each SHARDS=4, all Online,
-      stable node_uuids preserved across the ClusterIP→pod-IP address change.
-  (2) per-pod Services autumn-en-0..4 GONE; only headless autumn-en remains.
-  (3) EN logs: all 5 self-registered pod IP + 4 shard ports; all 4 shard
-      listeners bound (9101/9111/9121/9131 + ctrl 10101..10131); no errors.
-  (4) PS→EN pod-IP DATA path works: parts 122 (6.6 GB) + 171 recovered by
-      reading their extents over pod IPs via probe_extent/commit_length quorum.
-
-WRITE TEST: BLOCKED by a PRE-EXISTING (non-M2) operational issue — the rolling
-  update restarted the 3 PS ordinal-descending, so ps-2 re-registered FIRST and
-  grabbed ALL 32 partitions (ps-0/ps-1 got 0). One oversubscribed PS recovering
-  32 partitions floods the 5 ENs with a commit_length probe storm → 2 of 3
-  replica probes time out ("got 1 of 3, need 2") → 96/97 extents transiently
-  unhealthy, recovery stalls, client writes get "connect PS 9301 refused" (the
-  target partition's listener not yet bound). This is the documented single-PS
-  oversubscription (vke overlay comment), NOT M2 — pod-IP resolution WORKS
-  ("1 of 3" reachable, not "0 of 3"; parts opened).
-  REMEDY (needs USER — I'm policy-blocked from killing PS pods I didn't create):
-    kubectl -n autumn delete pod autumn-ps-0 autumn-ps-1 autumn-ps-2
-  → all 3 re-register in parallel → manager spreads the 32 partitions 3-ways
-  (as at bootstrap) → probe storm cut ~3x → recovery completes → writes work.
-  Then re-run: autumn-client perf-check --threads 8 --partitions 32 (in-cluster
-  pod, manager 10.196.60.97:9001) → expect writes+reads across all 4 shards.
-
-Main gaps (deferred, unchanged):
-  - F-SEALED-EMPTY-SWEEP still deferred.
-  - Remote host can't build the workspace (no crates.io egress) — irrelevant here
-    since CP builds in-cloud.
+Prior task (DONE, do not redo): F-EN-DYNSHARD M2 — per-pod EN Services eliminated,
+  pod-IP self-register, live-validated (commit fd2bfbf). Rollout exposed the sticky
+  region→PS concentration that THIS feature (rebalance) fixes.
+  See [[vke-rolling-restart-concentrates-partitions]].
