@@ -2,7 +2,10 @@
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace for the wheel).
 #   docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile.hermes \
 #     --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
+#     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
+#     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
+#     --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
 #     -t <cr>/hermes-autumn:<tag> .
 #
 # TODO(you): pin the exact hermes-agent install (repo tag / pip spec). The
@@ -16,8 +19,20 @@
 ARG BASE_REGISTRY=
 FROM ${BASE_REGISTRY}library/python:3.11-slim
 
+# Mirror knobs (override at build time for China / air-gapped builds):
+#   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror
+#     (e.g. https://rsproxy.cn + https://rsproxy.cn/rustup) — WITHOUT this the
+#     `curl sh.rustup.rs | sh` toolchain download stalls on static.rust-lang.org.
+#   CARGO_MIRROR   : crates.io registry mirror for the wheel build.
+#   PIP_INDEX_URL  : PyPI mirror for pip (default = pypi.org; set a mirror URL).
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_MIRROR=
-ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes \
+    RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
+    PIP_INDEX_URL=${PIP_INDEX_URL}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl git build-essential pkg-config libssl-dev \
