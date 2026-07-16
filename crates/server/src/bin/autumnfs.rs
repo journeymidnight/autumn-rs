@@ -120,6 +120,13 @@ fn main() -> Result<()> {
             .await
             .context("wait for cluster ready")?;
 
+        // Bootstrap the fuse root inode (ino 1) if it's missing — a cluster that
+        // has never mounted the fuse fs or used `autumn.Fs` has no root, so
+        // `resolve()` from ROOT_INO would fail `ENOENT inode 1`. `autumn.Fs` /
+        // the fuse mount call `ensure_root` on connect; autumnfs must too, so it
+        // works standalone against a fresh cluster (e.g. uploading model weights).
+        ensure_root(&cluster).await?;
+
         match args.cmd {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
@@ -255,6 +262,26 @@ fn new_dir_meta() -> InodeMeta {
         inline_data: None,
         symlink_target: None,
     }
+}
+
+/// Create the fuse root inode (ino 1) if it doesn't exist yet — the standalone
+/// equivalent of `autumn_fuse::meta::ensure_root` (which needs an `FsState`).
+/// Idempotent: a no-op when the root already exists.
+async fn ensure_root(cluster: &ClusterClient) -> Result<()> {
+    let rk = key::inode_key(ROOT_INO);
+    if cluster
+        .get(&rk)
+        .await
+        .map_err(|e| anyhow!("root inode get: {e}"))?
+        .is_none()
+    {
+        let meta = new_dir_meta();
+        cluster
+            .put(&rk, &schema::encode_inode_meta(&meta))
+            .await
+            .map_err(|e| anyhow!("root inode put: {e}"))?;
+    }
+    Ok(())
 }
 
 // ─── ls ─────────────────────────────────────────────────────────────────────
