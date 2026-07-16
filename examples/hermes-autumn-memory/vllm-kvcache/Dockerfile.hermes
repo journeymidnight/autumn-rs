@@ -1,13 +1,18 @@
 # Hermes agent + autumn memory provider image.
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace for the wheel).
-#   docker build -f examples/hermes-autumn-memory/docker/Dockerfile.hermes \
+#   docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile.hermes \
+#     --build-arg BASE_REGISTRY=docker.m.daocloud.io/library/ \
 #     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     -t <cr>/hermes-autumn:<tag> .
 #
 # TODO(you): pin the exact hermes-agent install (repo tag / pip spec). The
 # MemoryProvider ABC drifts across versions — validate hermes_provider.py hooks
 # against the version you pin here.
-FROM python:3.11-slim
+#
+# BASE_REGISTRY: prefix for the base image so China / air-gapped builds can pull
+# python from a mirror (e.g. docker.m.daocloud.io/library/). Empty = docker.io direct.
+ARG BASE_REGISTRY=
+FROM ${BASE_REGISTRY}python:3.11-slim
 
 ARG CARGO_MIRROR=
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes

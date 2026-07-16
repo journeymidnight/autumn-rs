@@ -31,6 +31,7 @@ Nothing here touches the server-side structure (`crates/`, `deploy/docker/`).
 ```bash
 # vLLM + autumn (kvcache connector AND weight loader; pinned vLLM 0.23.0; builds the PyO3 wheel)
 docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile \
+  --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
   --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
   --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
   --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
@@ -38,6 +39,7 @@ docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile \
 
 # Hermes agent + memory provider plugin
 docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile.hermes \
+  --build-arg BASE_REGISTRY=docker.m.daocloud.io/library/ \
   --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
   -t <CR>/hermes-autumn:<tag> .
 ```

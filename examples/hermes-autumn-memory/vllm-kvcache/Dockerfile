@@ -2,6 +2,7 @@
 #
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace to build the wheel):
 #   docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile \
+#     --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
@@ -9,8 +10,11 @@
 #
 # Pinned to vLLM 0.23.0 — AutumnKVConnector is verified against it (KVConnectorBase_V1
 # signatures drift across vLLM releases). Bump VLLM_TAG only after re-validating.
+# BASE_REGISTRY: prefix for the base image so China / air-gapped builds can pull
+# vllm-openai from a mirror (e.g. docker.m.daocloud.io/). Empty = docker.io direct.
+ARG BASE_REGISTRY=
 ARG VLLM_TAG=v0.23.0
-FROM vllm/vllm-openai:${VLLM_TAG}
+FROM ${BASE_REGISTRY}vllm/vllm-openai:${VLLM_TAG}
 
 # ── Rust mirror knobs (override at build time for China / air-gapped builds) ──
 #   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : the rustup TOOLCHAIN download mirror
