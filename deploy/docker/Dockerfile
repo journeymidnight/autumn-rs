@@ -51,6 +51,7 @@ COPY --from=builder \
     /build/target/release/autumn-ps \
     /build/target/release/autumn-client \
     /build/target/release/autumn-op \
+    /build/target/release/autumnfs \
     /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
