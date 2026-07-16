@@ -559,6 +559,45 @@ EN; after the manager flips it to `Suspected` (`autumn-op info` /
 extent has a replica on the dead node is served by a healthy replica instead of
 stalling for the per-RPC timeout on every read.
 
+## Stale owner-epoch fence self-heal (BUG-MGR-RETRY-CLASS)
+
+A PS partition whose stream client holds a stale per-partition `owner_epoch`
+(classic cause: a rebalance moved the partition and the old holder kept
+serving, or any newer `acquire_owner_lock` on the same `partition/<id>` key)
+is rejected by the manager with `CODE_PRECONDITION`
+("owner_key=partition/N owner_epoch mismatch, expected X, got Y") on every
+`alloc_new_extent`. Pre-fix symptoms: writes to ONE partition take ~15 s each
+(20×500 ms futile manager retries + open overhead; `autumnfs put` = 45 s for
+3 keys), reads stay fast, PS log shows the same `got Y` number forever.
+
+Post-fix behavior (what to verify):
+1. The first fenced manager call FAILS FAST (log: `"... got a deterministic
+   manager error, failing fast"` + `"stream_alloc_extent fenced
+   (LockedByOther): ..."`) — no 20-retry storm.
+2. The PS poisons the partition (`"F270: ... fenced (LockedByOther) —
+   poisoning partition for fresh-epoch reopen"` or `"LockedByOther detected,
+   poisoning partition"`), its thread exits.
+3. Within one region-sync tick (~2 s) the PS logs
+   `"partition <id> thread exited (fence poison or crash) — dropping handle;
+   region map decides reopen-with-fresh-epoch vs release"`, then either
+   reopens it (still assigned here → fresh epoch, writes succeed) or leaves
+   it closed (rebalanced away → the new owner serves it).
+
+**Manual check** (any cluster): find a partition's owner key epoch, bump it
+behind the PS's back, then write through it:
+```bash
+# bump the epoch for partition/17 behind the serving PS's back (manager CLI
+# acquires the same owner lock the PS holds):
+autumn-stream-cli --manager <mgr:9001> acquire-owner-lock partition/17   # if unavailable,
+# any partition move (autumn-op rebalance 1) exercises the same path on the OLD PS.
+# then:
+time autumn-client --manager <mgr:9001> put <key-in-that-partition> v
+# expect: first write may error/redirect once; within ~2-4 s writes to that
+# partition succeed at normal latency (NOT 15 s each / NOT stuck forever).
+# PS log shows the three-step sequence above, and the "got <epoch>" number
+# CHANGES after the reopen (fresh epoch) instead of repeating.
+```
+
 ## Node decommission runbook (fence → drain → remove, F211 + F-FENCE-DRAIN)
 
 Retiring an EN is operator-driven (HDFS-decommission style). The manager never

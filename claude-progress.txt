@@ -1,3 +1,39 @@
+Date: 2026-07-16
+TaskStatus: not_completed
+Task scope: BUG-MGR-RETRY-CLASS — code-classified StreamClient manager-call
+  retry + owner-epoch-fence self-heal. Live incident: post-rebalance stale
+  owner_epoch (partition/17: manager expected 14396, PS sent 14364 forever) →
+  every alloc_new_extent burned 20×500ms futile retries → autumnfs put 45 s /
+  rm 30 s; the fenced partition NEVER self-healed (safety held, liveness gap).
+
+Code DONE (uncommitted — awaiting team-lead review; do NOT commit before review):
+  - stream client.rs: typed ManagerError{code,ctx,message} from
+    check_manager_resp (+ alloc_new_extent_once inline check routed through
+    it); retry_manager_call classifies — deterministic codes (NOT_FOUND/
+    INVALID_ARGUMENT/PRECONDITION incl. fence/unknown) FAIL FAST unwrapped;
+    transport/NOT_LEADER/CODE_ERROR keep rotate+retry (no double-rotate on
+    NOT_LEADER). Owner fence (CODE_PRECONDITION + matcher) Display carries the
+    load-bearing "LockedByOther" token → F270 poison path.
+  - common store.rs: is_owner_epoch_fence_message NEXT TO ensure_owner_epoch
+    (no new wire code → no WIRE bump) + producer-pairing test.
+  - PS background.rs: is_locked_by_other matches whole anyhow chain ({e:#}) —
+    .context() wraps no longer hide the fence marker.
+  - PS lib.rs LIVENESS: sync_regions_once drops handles whose partition
+    thread is_finished() → region map arbitrates same 2s tick: still-assigned
+    → reopen with FRESH epoch; rebalanced-away → clean release. shutting_down
+    Cell gates the sync tick so shutdown drains can't be resurrected.
+  - Docs: stream CLAUDE.md note 30; PS CLAUDE.md self-eviction section;
+    common CLAUDE.md; feature_list.md BUG-MGR-RETRY-CLASS entry; docs/ops.md.
+  - Tests green: stream 111 (7 new manager_retry_tests), partition-server 196
+    (+fence_classifier_tests), common 13 (+matcher pairing). Workspace builds
+    (autumn-fuse macOS link fail = pre-existing, Linux-only). Clippy: no new
+    warnings.
+Next steps: team-lead review (+coco per repo rule) → commit → live validate on
+  VKE (fenced partition recovers in ~2 s instead of never). Follow-up feature
+  candidate (NOT implemented): two-phase rebalance handoff (drain old owner
+  before new owner opens) to close the dual-owner window itself.
+
+---- Prior task (paused, resume after this bug) ----
 Date: 2026-07-15
 TaskStatus: not_completed
 Task scope: F-REGION-REBALANCE — active region→PS load rebalancing. Phase A =

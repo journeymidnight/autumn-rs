@@ -9,4 +9,4 @@ pub use cpu_pin::{
     set_cpuset,
 };
 pub use error::{AppError, AppResult};
-pub use store::{MetadataState, MetadataStore};
+pub use store::{is_owner_epoch_fence_message, MetadataState, MetadataStore};

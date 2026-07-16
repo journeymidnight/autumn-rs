@@ -1542,6 +1542,39 @@ If the `partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream 
 The main partition loop checks this flag on each request and exits if set.
 This prevents split-brain where two PS nodes serve the same partition.
 
+The classifier `background::is_locked_by_other` matches the "LockedByOther"
+substring across the WHOLE anyhow chain (`{e:#}`, BUG-MGR-RETRY-CLASS —
+plain `{e}` only shows the outermost `.context(...)` and silently hid the
+marker). It fires for BOTH fence layers: the EN's native
+`CODE_LOCKED_BY_OTHER` rejection AND the stream client's typed
+`ManagerError` fence Display for a manager-side `ensure_owner_epoch`
+rejection (stale `owner_epoch` on `alloc_new_extent` etc. — pre-fix that
+burned 20×500 ms of futile manager retries per write instead of poisoning;
+see stream CLAUDE.md Programming Note 30). Either way the poison →
+reopen → fresh-epoch re-acquire path is the ONLY sanctioned recovery: never
+re-acquire a stale epoch in place.
+
+**Liveness closure (BUG-MGR-RETRY-CLASS)**: the poison makes
+`partition_loop` break → `partition_thread_main` returns → the thread's
+`block_on` completes, dropping the runtime (accept loop, ps-conn tasks,
+flush loop) — but the `PartitionHandle` used to SURVIVE in
+`self.partitions`, so when the region map still assigned the partition
+here with an unchanged `(rg, streams, region_epoch)` tuple,
+`sync_regions_once`'s `contains_key` skipped the reopen FOREVER (zombie
+partition; the fencing was safe but not live — the fenced side never
+recovered or exited, the coco-P0-dual-owner review only argued safety).
+Now `sync_regions_once` drops any handle whose partition thread
+`is_finished()` (one atomic load per partition per 2 s tick), making the
+manager's region map the arbiter that same tick:
+- still assigned here → reopen → `acquire_partition_owner_epoch` gets a
+  FRESH epoch → partition resumes ("my token was stale, refresh");
+- moved away (rebalance) → not in `wanted` → stays closed ("I am no
+  longer the owner, release"). Also self-heals a crashed partition
+  thread (previously the same zombie shape).
+Guard: `PartitionServer.shutting_down` (set first thing in `shutdown()`)
+makes `sync_regions_once` a no-op so the dead-thread reopen cannot
+resurrect partitions drained for process exit.
+
 ## F111: Heartbeat must outlive `sync_regions_once`
 
 `finish_connect` spawns `heartbeat_loop` immediately after `register_ps`

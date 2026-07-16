@@ -2043,6 +2043,13 @@ pub struct PartitionServer {
     /// until `retry_after` (exponential backoff, capped); cleared on a
     /// successful open and pruned for partitions no longer assigned.
     open_backoff: Rc<RefCell<HashMap<u64, OpenBackoff>>>,
+    /// BUG-MGR-RETRY-CLASS liveness: set at the top of `shutdown()`.
+    /// Gates `sync_regions_once` so the dead-thread reopen path (below)
+    /// cannot race the graceful drain and resurrect a partition that was
+    /// just drained for process exit. `Cell` suffices — `shutdown()` and
+    /// the region-sync tick both run on the single-threaded main compio
+    /// runtime.
+    shutting_down: Cell<bool>,
 }
 
 /// Per-partition reopen-backoff state (BUG #3 hardening). See
@@ -2950,6 +2957,7 @@ impl PartitionServer {
                             )),
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
+                            shutting_down: Cell::new(false),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -3507,6 +3515,13 @@ impl PartitionServer {
     }
 
     pub async fn sync_regions_once(&self) -> Result<()> {
+        // BUG-MGR-RETRY-CLASS liveness: during graceful shutdown the
+        // region-sync tick must not run — the dead-thread reopen below
+        // would see a freshly-DRAINED partition thread as "dead" and
+        // resurrect it mid-exit.
+        if self.shutting_down.get() {
+            return Ok(());
+        }
         // 10 s — read-only manager call. Bounded so the periodic
         // 2 s region_sync_loop doesn't pile up on a hung manager.
         let resp_data = self
@@ -3578,24 +3593,50 @@ impl PartitionServer {
         // pass reopens with fresh state.
         let current: Vec<u64> = self.partitions.borrow().keys().copied().collect();
         for part_id in current {
-            let drop_for_reload = match wanted.get(&part_id) {
-                None => true,
-                Some(latest) => {
-                    // F212-fix-2: `opened_with` is now Arc<Mutex<_>>;
-                    // lock + clone the tuple, then compare. The lock is
-                    // ~25 ns uncontended and is held only for the
-                    // tuple clone (no I/O between borrow and lock).
-                    let opened = self
-                        .partitions
-                        .borrow()
-                        .get(&part_id)
-                        .map(|h| h.opened_with.lock().clone());
-                    match opened {
-                        Some(prev) => prev != *latest,
-                        None => false,
+            // BUG-MGR-RETRY-CLASS liveness: a handle whose partition THREAD
+            // has exited is a zombie — the thread breaks out of
+            // `partition_loop` on the F270 LockedByOther poison (stale
+            // owner_epoch fence, now also raised for manager-side
+            // `ensure_owner_epoch` rejections) or on a panic, but the map
+            // entry survived, so `contains_key` below skipped the reopen
+            // FOREVER when the region tuple was unchanged (fenced-but-
+            // still-assigned: the live rebalance stale-epoch incident's
+            // liveness gap). Dropping the dead handle makes the manager's
+            // region map the arbiter, same tick: still assigned here →
+            // reopen re-acquires a FRESH owner_epoch and continues; moved
+            // away → stays closed (clean release). `is_finished()` is one
+            // atomic load per partition per 2 s tick.
+            let thread_dead = self
+                .partitions
+                .borrow()
+                .get(&part_id)
+                .is_some_and(|h| h.join.as_ref().is_some_and(|j| j.is_finished()));
+            if thread_dead {
+                tracing::warn!(
+                    "PS {} partition {part_id} thread exited (fence poison or crash) — \
+                     dropping handle; region map decides reopen-with-fresh-epoch vs release",
+                    self.ps_id
+                );
+            }
+            let drop_for_reload = thread_dead
+                || match wanted.get(&part_id) {
+                    None => true,
+                    Some(latest) => {
+                        // F212-fix-2: `opened_with` is now Arc<Mutex<_>>;
+                        // lock + clone the tuple, then compare. The lock is
+                        // ~25 ns uncontended and is held only for the
+                        // tuple clone (no I/O between borrow and lock).
+                        let opened = self
+                            .partitions
+                            .borrow()
+                            .get(&part_id)
+                            .map(|h| h.opened_with.lock().clone());
+                        match opened {
+                            Some(prev) => prev != *latest,
+                            None => false,
+                        }
                     }
-                }
-            };
+                };
             if drop_for_reload {
                 tracing::info!(
                     "PS {} F184 reloading partition {part_id} due to region change",
@@ -4079,6 +4120,12 @@ impl PartitionServer {
     /// by the slowest partition's flush time.
     pub async fn shutdown(&self) -> Result<()> {
         use futures::future::join_all;
+
+        // BUG-MGR-RETRY-CLASS liveness: stop the region-sync tick FIRST so
+        // its dead-thread reopen can't resurrect a partition we are about
+        // to drain (both run on this single-threaded runtime, but drains
+        // await across ticks).
+        self.shutting_down.set(true);
 
         let timeout = Duration::from_millis(shutdown_timeout_ms());
         let part_ids: Vec<u64> = self.partitions.borrow().keys().copied().collect();

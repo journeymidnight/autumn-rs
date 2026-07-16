@@ -1528,8 +1528,21 @@ pub(crate) async fn start_write_batch(
     }))
 }
 
+/// F270 fence classifier — the trigger for poison-and-reopen self-heal.
+/// Matches the "LockedByOther" marker emitted by BOTH fence layers: the
+/// EN's native `CODE_LOCKED_BY_OTHER` rejection (append / commit_length)
+/// and, since BUG-MGR-RETRY-CLASS, the stream client's typed
+/// `ManagerError` Display for a manager-side `ensure_owner_epoch`
+/// rejection (stale owner_epoch on `alloc_new_extent` etc.).
+///
+/// `{e:#}` (anyhow alternate Display) prints the WHOLE context chain —
+/// plain `{e}` shows only the outermost context, so a `.context(...)`
+/// wrap added along the append path (e.g. client.rs "alloc_new_extent
+/// failed after append error: …") would HIDE the marker and silently
+/// downgrade a fence to a generic write error (no poison → no
+/// fresh-epoch reopen).
 pub(crate) fn is_locked_by_other(e: &anyhow::Error) -> bool {
-    format!("{e}").contains("LockedByOther")
+    format!("{e:#}").contains("LockedByOther")
 }
 
 /// Phase 3: given Phase2 result, insert into memtable, reply to callers.
@@ -4345,5 +4358,46 @@ mod compaction_vp_head_tests {
             compaction_output_vp_head([(11u64, 400u64), (12, 100)], &log),
             (12, 100)
         );
+    }
+}
+
+/// BUG-MGR-RETRY-CLASS: the F270 fence classifier must see the WHOLE anyhow
+/// chain — a `.context(...)` wrap added along the append path (e.g. stream
+/// client.rs "alloc_new_extent failed after append error: …") hides the
+/// "LockedByOther" marker from plain `{e}` Display, which only prints the
+/// outermost context. Pre-fix that silently downgraded a fence to a generic
+/// write error: no poison, no fresh-epoch reopen.
+#[cfg(test)]
+mod fence_classifier_tests {
+    use super::is_locked_by_other;
+
+    #[test]
+    fn locked_by_other_survives_context_wrap() {
+        // EN-layer shape (commit_length probe, F270).
+        let en = anyhow::anyhow!(
+            "commit_length on extent 42: only 2/3 replicas responded \
+             (1 rejected LockedByOther — stale owner epoch)"
+        );
+        assert!(is_locked_by_other(&en));
+
+        // Manager-layer shape (typed ManagerError Display) wrapped by the
+        // append path's context — the regression this test pins.
+        let mgr = anyhow::anyhow!(
+            "stream_alloc_extent fenced (LockedByOther): precondition failed: \
+             owner_key=partition/17 owner_epoch mismatch, expected 14396, got 14364"
+        )
+        .context("alloc_new_extent failed after append error: replica timeout");
+        assert!(
+            format!("{mgr}") == "alloc_new_extent failed after append error: replica timeout",
+            "precondition of this test: plain Display hides the marker"
+        );
+        assert!(
+            is_locked_by_other(&mgr),
+            "chain-wide match must survive the context wrap"
+        );
+
+        // Generic errors must not classify.
+        let plain = anyhow::anyhow!("replica 1 rpc error: connection reset");
+        assert!(!is_locked_by_other(&plain));
     }
 }

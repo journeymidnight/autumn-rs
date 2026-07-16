@@ -36,6 +36,90 @@ fn is_eversion_stale(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EversionStale>())
 }
 
+/// BUG-MGR-RETRY-CLASS: typed error for a manager RPC that ANSWERED with a
+/// non-OK code. Pre-fix `check_manager_resp` flattened the code into an
+/// anyhow string, so `retry_manager_call` could not tell a transient
+/// failure (worth rotate+retry) from a deterministic verdict — and blindly
+/// burned 20×500ms per call on owner-epoch fences (the live partition/17
+/// stale-epoch incident: every autumnfs write paid ~15 s in
+/// `alloc_new_extent`). Transport-layer failures (connect/timeout/decode)
+/// stay plain anyhow errors — "has a `ManagerError` in the chain" is
+/// exactly "the manager answered".
+///
+/// Built on error paths only — the OK path never allocates.
+#[derive(Debug)]
+pub struct ManagerError {
+    /// `manager_rpc::CODE_*` from the response.
+    pub code: u8,
+    /// Call-site label, e.g. "stream_alloc_extent" (diagnostics only).
+    ctx: String,
+    /// The manager's message verbatim (e.g. "precondition failed:
+    /// owner_key=partition/17 owner_epoch mismatch, expected 14396, got
+    /// 14364"). Preserved so existing substring classifiers downstream
+    /// ("precondition failed", "not leader") keep working.
+    pub message: String,
+}
+
+impl ManagerError {
+    fn new(code: u8, ctx: &str, message: &str) -> Self {
+        Self {
+            code,
+            ctx: ctx.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// True when the manager rejected us because OUR owner_epoch is stale
+    /// (`ensure_owner_epoch`: a newer acquire bumped the epoch, or the
+    /// owner key is gone). Wire-wise this is just `CODE_PRECONDITION`; the
+    /// message matcher lives NEXT TO the producer in
+    /// `autumn_common::store` (see its doc for why not a new wire code).
+    /// Retrying with the same epoch is mathematically futile — every
+    /// manager consults the same etcd state.
+    pub fn is_owner_fence(&self) -> bool {
+        self.code == manager_rpc::CODE_PRECONDITION
+            && autumn_common::is_owner_epoch_fence_message(&self.message)
+    }
+
+    /// Codes worth another attempt on a rotated / later manager:
+    /// - `CODE_NOT_LEADER`: an alive-but-deposed manager answered; the
+    ///   rotate (done by `note_manager_code`) walks to the real leader.
+    /// - `CODE_ERROR` (`AppError::Internal`): transient manager-side
+    ///   failure (etcd mirror hiccup, node-alloc RPC failure, …).
+    /// Everything else — NOT_FOUND / INVALID_ARGUMENT / PRECONDITION
+    /// (incl. the owner fence) / future codes — is a deterministic verdict
+    /// computed from shared etcd state: every manager gives the same
+    /// answer, so retrying only adds latency. Fail fast and let the
+    /// caller's recovery path act.
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self.code,
+            manager_rpc::CODE_NOT_LEADER | manager_rpc::CODE_ERROR
+        )
+    }
+}
+
+impl std::fmt::Display for ManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_owner_fence() {
+            // The "LockedByOther" token is LOAD-BEARING: the PS's
+            // `is_locked_by_other` classifies on it and poisons the
+            // partition, whose reopen re-acquires a FRESH owner_epoch
+            // (F270) — the same self-heal the EN layer's native
+            // CODE_LOCKED_BY_OTHER rejection triggers. This is what turns
+            // a manager-side fence from "20 futile retries, then hope the
+            // upper layer notices" into an immediate fresh-epoch reopen.
+            write!(f, "{} fenced (LockedByOther): {}", self.ctx, self.message)
+        } else {
+            // Same shape as the pre-typed error string, so log greps and
+            // downstream substring matchers are unaffected.
+            write!(f, "{} failed: {}", self.ctx, self.message)
+        }
+    }
+}
+
+impl std::error::Error for ManagerError {}
+
 /// Decode a `MSG_READ_BYTES` response and map its two error codes — the ONE
 /// place that turns `CODE_EVERSION_MISMATCH` into the `EversionStale`
 /// sentinel (which the top-level read retry recognises via
@@ -1965,12 +2049,14 @@ impl StreamClient {
     }
 
     /// Shared tail of the manager-RPC wrappers: note the response `code`
-    /// (rotating to the next manager on NOT_LEADER) and bail with
-    /// `"<ctx> failed: <message>"` when it isn't OK.
+    /// (rotating to the next manager on NOT_LEADER) and bail with a typed
+    /// `ManagerError` when it isn't OK — `retry_manager_call` and the PS's
+    /// fence classifier downcast/Display it. Non-fence Display keeps the
+    /// pre-typed `"<ctx> failed: <message>"` shape.
     fn check_manager_resp(&self, code: u8, message: &str, ctx: &str) -> Result<()> {
         self.note_manager_code(code);
         if code != CODE_OK {
-            return Err(anyhow!("{ctx} failed: {message}"));
+            return Err(anyhow::Error::new(ManagerError::new(code, ctx, message)));
         }
         Ok(())
     }
@@ -1986,13 +2072,47 @@ impl StreamClient {
             match f().await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    // BUG-MGR-RETRY-CLASS: classify BEFORE burning a retry.
+                    // A `ManagerError` in the chain means the manager
+                    // ANSWERED; a deterministic code (NotFound /
+                    // InvalidArgument / Precondition — incl. the
+                    // owner-epoch fence) reflects shared etcd state, so
+                    // every rotated manager returns the SAME verdict and
+                    // rotate+retry is pure wasted latency (the live
+                    // incident: 20×500ms per write on a permanently stale
+                    // epoch). Fail fast — returned UNWRAPPED (no
+                    // `.context()`) so the fence Display's "LockedByOther"
+                    // marker stays outermost for the PS's poison-and-reopen
+                    // classifier. Transport errors (no ManagerError) and
+                    // NOT_LEADER / CODE_ERROR keep the retry loop.
+                    let (retryable, already_rotated) = match e.downcast_ref::<ManagerError>() {
+                        Some(me) => (
+                            me.is_retryable(),
+                            // NOT_LEADER already rotated in
+                            // `note_manager_code` — don't skip a second
+                            // address by rotating again here.
+                            me.code == manager_rpc::CODE_NOT_LEADER,
+                        ),
+                        None => (true, false),
+                    };
+                    if !retryable {
+                        tracing::warn!(
+                            manager = %addr,
+                            error = %e,
+                            "{} got a deterministic manager error, failing fast",
+                            label,
+                        );
+                        return Err(e);
+                    }
                     attempt += 1;
                     if attempt > max_retries {
                         return Err(
                             e.context(format!("{label} failed after {max_retries} retries"))
                         );
                     }
-                    self.rotate_manager();
+                    if !already_rotated {
+                        self.rotate_manager();
+                    }
                     tracing::warn!(
                         attempt,
                         max_retries,
@@ -2557,9 +2677,13 @@ impl StreamClient {
             .await?;
         let resp: StreamAllocExtentResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        if resp.code != CODE_OK {
-            return Err(anyhow!("stream_alloc_extent failed: {}", resp.message));
-        }
+        // BUG-MGR-RETRY-CLASS: routed through `check_manager_resp` so the
+        // failure keeps its wire code (typed `ManagerError`) for the retry
+        // classifier — this is THE call the live stale-epoch incident burned
+        // 20×500ms on — and so NOT_LEADER now rotates here too (this site
+        // predates `note_manager_code` and never rotated on a deposed
+        // leader; the outer retry loop's blind rotate masked it).
+        self.check_manager_resp(resp.code, &resp.message, "stream_alloc_extent")?;
         let stream = resp
             .stream_info
             .map(|s| Self::mgr_to_stream_info(&s))
@@ -5775,5 +5899,250 @@ mod merge_ec_replay_tests {
         // was the reported END only; `want` was already clamped correctly.
         assert_eq!(bytes.len(), L, "full logical payload must be returned");
         assert_eq!(bytes, payload, "decoded EC bytes must match original");
+    }
+}
+
+/// BUG-MGR-RETRY-CLASS regression tests — manager-call retry policy must be
+/// code-classified, not retry-everything.
+///
+/// Live incident pinned here: PS partition/17 held a permanently stale
+/// owner_epoch (manager expected 14396, client sent 14364 — an etcd-backed
+/// verdict identical on EVERY manager), yet `retry_manager_call` treated the
+/// CODE_PRECONDITION rejection as transient: 20 × (rotate + 500ms sleep) =
+/// 10 s of mathematically-futile retries per `alloc_new_extent`, ≈15 s per
+/// autumnfs write (45 s for a 3-key put). The fix: deterministic codes fail
+/// fast, and an owner-epoch fence carries the "LockedByOther" marker so the
+/// PS's F270 poison-and-reopen self-heal re-acquires a fresh epoch.
+#[cfg(test)]
+mod manager_retry_tests {
+    use super::*;
+
+    /// Client with fake manager addrs — `construct` skips
+    /// `acquire_owner_lock` and the closures under test never do real IO,
+    /// so no manager is contacted (same pattern as merge_ec_replay_tests).
+    fn test_client(n_mgrs: usize) -> Rc<StreamClient> {
+        let addrs = (0..n_mgrs).map(|i| format!("127.0.0.1:{}", i + 1)).collect();
+        StreamClient::construct(
+            addrs,
+            0,
+            "partition/17".to_string(),
+            14364,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        )
+    }
+
+    fn fence_message() -> String {
+        // Exactly the wire shape of the live incident: AppError Display
+        // ("precondition failed: ...") wrapping the store.rs message.
+        "precondition failed: owner_key=partition/17 owner_epoch mismatch, \
+         expected 14396, got 14364"
+            .to_string()
+    }
+
+    #[test]
+    fn fence_display_carries_locked_by_other_marker() {
+        let e = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "stream_alloc_extent",
+            &fence_message(),
+        );
+        assert!(e.is_owner_fence());
+        let shown = e.to_string();
+        // Load-bearing token: the PS `is_locked_by_other` → poison →
+        // fresh-epoch reopen self-heal keys off this substring.
+        assert!(shown.contains("LockedByOther"), "got: {shown}");
+        // The manager's message must survive verbatim for diagnostics and
+        // downstream "precondition failed" matchers.
+        assert!(
+            shown.contains("owner_epoch mismatch, expected 14396, got 14364"),
+            "got: {shown}"
+        );
+        assert!(shown.contains("precondition failed"), "got: {shown}");
+    }
+
+    #[test]
+    fn non_fence_errors_keep_legacy_display_shape() {
+        // Ordinary precondition: NOT a fence, must NOT poison partitions.
+        let e = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "punch_holes",
+            "precondition failed: stream cannot be empty after punch holes",
+        );
+        assert!(!e.is_owner_fence());
+        assert_eq!(
+            e.to_string(),
+            "punch_holes failed: precondition failed: stream cannot be empty after punch holes"
+        );
+
+        let nf = ManagerError::new(manager_rpc::CODE_NOT_FOUND, "stream_info", "not found: stream 7");
+        assert!(!nf.is_owner_fence());
+        assert!(!nf.to_string().contains("LockedByOther"));
+    }
+
+    #[test]
+    fn retryable_classification_per_code() {
+        let m = |code| ManagerError::new(code, "ctx", "msg");
+        assert!(m(manager_rpc::CODE_NOT_LEADER).is_retryable());
+        assert!(m(manager_rpc::CODE_ERROR).is_retryable());
+        assert!(!m(manager_rpc::CODE_NOT_FOUND).is_retryable());
+        assert!(!m(manager_rpc::CODE_INVALID_ARGUMENT).is_retryable());
+        assert!(!m(manager_rpc::CODE_PRECONDITION).is_retryable());
+        assert!(!m(manager_rpc::CODE_REVOKE_PENDING).is_retryable());
+    }
+
+    /// THE regression: a stale-epoch fence must fail after exactly ONE
+    /// attempt — no rotate-and-sleep loop (pre-fix: 20 × 500ms = 10 s).
+    #[compio::test]
+    async fn stale_epoch_fence_fails_fast_without_retries() {
+        let sc = test_client(1);
+        let attempts = Rc::new(Cell::new(0u32));
+        let started = Instant::now();
+
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    // Produce the error through the REAL path so the test
+                    // pins check_manager_resp → ManagerError wiring.
+                    sc2.check_manager_resp(
+                        manager_rpc::CODE_PRECONDITION,
+                        &fence_message(),
+                        "stream_alloc_extent",
+                    )?;
+                    Ok(())
+                }
+            })
+            .await;
+
+        let err = res.expect_err("fence must fail");
+        assert_eq!(attempts.get(), 1, "no retries for a deterministic fence");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "fail-fast path must not sleep (pre-fix: 10 s)"
+        );
+        // Typed code preserved for callers…
+        let me = err
+            .downcast_ref::<ManagerError>()
+            .expect("ManagerError must survive the retry wrapper");
+        assert_eq!(me.code, manager_rpc::CODE_PRECONDITION);
+        assert!(me.is_owner_fence());
+        // …and the fence marker is OUTERMOST (unwrapped), so even the plain
+        // `{e}` Display reaches the PS poison classifier.
+        assert!(format!("{err}").contains("LockedByOther"), "got: {err}");
+    }
+
+    /// Deterministic non-fence codes also fail fast (no 20×500ms).
+    #[compio::test]
+    async fn deterministic_codes_fail_fast() {
+        for (code, msg) in [
+            (manager_rpc::CODE_NOT_FOUND, "not found: stream 7"),
+            (manager_rpc::CODE_INVALID_ARGUMENT, "invalid argument: bad req"),
+            (
+                manager_rpc::CODE_PRECONDITION,
+                "precondition failed: stream cannot be empty after punch holes",
+            ),
+        ] {
+            let sc = test_client(1);
+            let attempts = Rc::new(Cell::new(0u32));
+            let a = attempts.clone();
+            let sc2 = sc.clone();
+            let res: Result<()> = sc
+                .retry_manager_call("test_call", 20, move || {
+                    let a = a.clone();
+                    let sc2 = sc2.clone();
+                    async move {
+                        a.set(a.get() + 1);
+                        sc2.check_manager_resp(code, msg, "test_call")?;
+                        Ok(())
+                    }
+                })
+                .await;
+            let err = res.expect_err("must fail");
+            assert_eq!(attempts.get(), 1, "code {code} must not retry");
+            assert!(
+                !format!("{err:#}").contains("LockedByOther"),
+                "non-fence code {code} must NOT poison partitions: {err:#}"
+            );
+        }
+    }
+
+    /// Transport-layer failures (no ManagerError in the chain) keep the
+    /// rotate-and-retry behavior — the F267 dead-manager escape.
+    #[compio::test]
+    async fn transport_errors_still_rotate_and_retry() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let res: Result<u32> = sc
+            .retry_manager_call("test_call", 5, move || {
+                let a = a.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    if a.get() < 3 {
+                        Err(anyhow!("connection refused"))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res.expect("third attempt succeeds"), 42);
+        assert_eq!(attempts.get(), 3);
+        // Two failures → two rotations (3 managers: 0 → 1 → 2).
+        assert_eq!(sc.current_mgr.get(), 2, "each transport failure rotates");
+    }
+
+    /// NOT_LEADER (rotated by note_manager_code, NOT double-rotated by the
+    /// loop) and CODE_ERROR (rotated by the loop) both retry.
+    #[compio::test]
+    async fn not_leader_and_internal_retry_with_single_rotation() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<u32> = sc
+            .retry_manager_call("test_call", 5, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    match a.get() {
+                        // note_manager_code rotates 0 → 1; the loop must not
+                        // rotate again (would skip an address).
+                        1 => {
+                            sc2.check_manager_resp(
+                                manager_rpc::CODE_NOT_LEADER,
+                                "not leader",
+                                "test_call",
+                            )?;
+                            unreachable!()
+                        }
+                        // internal error: the LOOP rotates 1 → 2.
+                        2 => {
+                            sc2.check_manager_resp(
+                                manager_rpc::CODE_ERROR,
+                                "internal error: etcd mirror failed",
+                                "test_call",
+                            )?;
+                            unreachable!()
+                        }
+                        _ => Ok(7),
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res.expect("third attempt succeeds"), 7);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sc.current_mgr.get(),
+            2,
+            "exactly one rotation per failure (NOT_LEADER must not double-rotate)"
+        );
     }
 }

@@ -621,7 +621,10 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
   `"host1:9001,host2:9001,host3:9001"`.
 - Tries each manager to `acquire_owner_lock`, skipping `NotLeader` responses.
 - All subsequent manager RPCs use `self.manager_addr()` which returns the current leader.
-- On any manager RPC failure, `rotate_manager()` switches to the next address (round-robin).
+- On TRANSPORT failure / NOT_LEADER / CODE_ERROR, `rotate_manager()` switches to the
+  next address (round-robin) and the call is retried; deterministic codes
+  (NotFound / InvalidArgument / Precondition incl. the owner-epoch fence) FAIL FAST
+  via the typed `ManagerError` — see Programming Note 30 (BUG-MGR-RETRY-CLASS).
 - `owner_key` should be unique per logical writer (e.g., `"ps/{ps_id}/partition/{part_id}"`).
 - **Return type change (4.3)**: `connect` / `new_with_owner_epoch` now return `Rc<StreamClient>`.
   The `Rc` is needed so the internal per-stream worker tasks can hold a
@@ -1623,6 +1626,54 @@ sufficient (and cheaper than DashMap).
     made reads congest one EN (F-EN-SHARD-HASH shard-0 aliasing +
     F-READ-OPENTAIL-ROTATE open-tail replica[0] pinning) — deadlines + damping
     stop the STORM, the hotspot features fix the CAUSE. Cross-ref note 28.
+
+30. **BUG-MGR-RETRY-CLASS (live VKE incident, 2026-07-16) — manager-call
+    failures are TYPED (`ManagerError{code, ctx, message}`) and
+    `retry_manager_call` is code-classified; owner-epoch fences self-heal via
+    the F270 poison path instead of burning retries.** The incident: a PS held
+    a permanently stale `owner_epoch` for `partition/17` (manager expected
+    14396, client kept sending 14364), so every `alloc_new_extent` was
+    rejected `CODE_PRECONDITION` ("owner_epoch mismatch") — but
+    `check_manager_resp` flattened the code into an anyhow STRING, so
+    `retry_manager_call` (20×) treated an etcd-backed deterministic verdict as
+    a transient fault: 20 × (rotate + 500 ms) = 10 s of mathematically-futile
+    retries per call (rotating is useless — every manager reads the SAME etcd
+    state; and the deployed cluster has ONE manager, so rotate was a no-op
+    anyway), ≈15 s per autumnfs write (45 s for a 3-key `put`). Three parts:
+    - **`check_manager_resp` (and `alloc_new_extent_once`'s inline check, now
+      routed through it) returns `ManagerError`** — code preserved for
+      `downcast_ref`, Display keeps the legacy `"<ctx> failed: <message>"`
+      shape (non-fence) so log greps / substring matchers are unaffected.
+    - **`retry_manager_call` classifies before retrying**: transport errors
+      (no `ManagerError` in the chain) and `CODE_NOT_LEADER` / `CODE_ERROR`
+      keep rotate+retry (F267 — NOT_LEADER is rotated once by
+      `note_manager_code`, the loop must not double-rotate); NOT_FOUND /
+      INVALID_ARGUMENT / PRECONDITION (incl. fence) / unknown codes fail fast,
+      returned UNWRAPPED (no `.context`) so the Display stays outermost.
+    - **Owner-fence self-heal**: `ManagerError::is_owner_fence`
+      (CODE_PRECONDITION + `autumn_common::is_owner_epoch_fence_message`, the
+      matcher living NEXT TO the `ensure_owner_epoch` producer in
+      common/store.rs — a wire-code alternative would force a WIRE bump for a
+      client⇄manager-only signal) renders Display as `"<ctx> fenced
+      (LockedByOther): …"`. The "LockedByOther" token is LOAD-BEARING: the
+      PS's `is_locked_by_other` (now `{e:#}` chain-wide, so `.context` wraps
+      can't hide the marker) poisons the partition → reopen re-acquires a
+      fresh epoch — the SAME F270 self-heal the EN's native
+      `CODE_LOCKED_BY_OTHER` triggers; the manager layer just lacked the
+      classification. The PS side also closes the LIVENESS gap: a poisoned
+      (or crashed) partition thread's dead handle is now detected by
+      `sync_regions_once` (`is_finished()`) and dropped, so the manager's
+      region map arbitrates the SAME tick — still-assigned → reopen with a
+      fresh epoch; moved-away (rebalance) → clean release. Pre-fix a
+      fenced-but-still-assigned partition was a zombie forever (fencing was
+      safe but not live). **Invariant: a stale owner_epoch must NEVER be
+      silently re-acquired inside StreamClient** — auto-refresh would defeat
+      the fencing (a zombie writer could steal the lock back); recovery is
+      always tear-down-and-reopen at the partition layer, arbitrated by the
+      region map. Tests:
+      `manager_retry_tests` (fail-fast regression, per-code classification,
+      rotation counts), `fence_classifier_tests` (PS, context-wrap
+      regression), `owner_fence_matcher_pairs_with_producer` (common).
 
 ---
 
