@@ -9,12 +9,12 @@
 # Optional base-image registry prefix. Empty (default) → the official Docker Hub
 # images (docker.io/library/...). Set it to build the base layers through a
 # mirror when docker.io is slow/blocked, e.g. on a China/Volcengine runner:
-#   docker build --build-arg BASE_REGISTRY=docker.m.daocloud.io/library/ ...
+#   docker build --build-arg BASE_REGISTRY=docker.m.daocloud.io/ ...   (host only; `library/` is in the FROM)
 # Must include a trailing slash. Global ARG (declared before the first FROM) so
 # BOTH stages' FROM lines can reference it.
 ARG BASE_REGISTRY=
 
-FROM ${BASE_REGISTRY}rust:1.93-bookworm AS builder
+FROM ${BASE_REGISTRY}library/rust:1.93-bookworm AS builder
 WORKDIR /build
 # Optional crates.io mirror for faster dependency downloads. Empty (default) →
 # official crates.io (unchanged for everyone else). Set CARGO_MIRROR to a full
@@ -44,7 +44,7 @@ RUN cargo build --release -p autumn-server
 # Runtime: binaries link only libc/libgcc; bookworm-slim provides bash + getent
 # (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The kernel comes
 # from the k8s node and must be >= 5.15 (compio uses io_uring).
-FROM ${BASE_REGISTRY}debian:bookworm-slim
+FROM ${BASE_REGISTRY}library/debian:bookworm-slim
 COPY --from=builder \
     /build/target/release/autumn-manager-server \
     /build/target/release/autumn-extent-node \
