@@ -1,8 +1,10 @@
 """A Hermes-agent `MemoryProvider` backed by autumn-rs.
 
 This is DEPLOYMENT GLUE, not part of autumn-rs core — the core keeps only the
-Rust `autumn-memory` lib + the `mem/` schema (see autumn_mem.py). Drop this
-package into the Hermes plugins dir (`$HERMES_HOME/plugins/autumn/`).
+Rust `autumn-memory` lib + the `mem/` schema. This single file holds BOTH the
+mem/-schema memory ops (`AutumnMemory`, merged from the former autumn_mem.py —
+hermes is the only consumer) AND the Hermes `MemoryProvider` adapter. Drop it
+into the Hermes plugins dir (`$HERMES_HOME/plugins/autumn/`).
 
 It implements the hooks the real `agent.memory_provider.MemoryProvider` ABC
 exposes (per the pre-refactor reference: initialize / sync_turn /
@@ -18,18 +20,145 @@ Semantic recall is intentionally OFF (lexical-only) — no embedder wired.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import os
+import re
 import threading
+import time
 from typing import Any, Optional
 
 import autumn  # the PyO3 extension (Client)
-from autumn_mem import AutumnMemory
 
 try:  # the real ABC when running inside hermes-agent
     from agent.memory_provider import MemoryProvider as _Base
 except Exception:  # standalone/tooling import must still work
     class _Base:  # minimal shim
         pass
+
+
+# ─── mem/ schema memory ops (merged from the former autumn_mem.py) ────────────
+# hermes is the only consumer, so the (thin) core lives in this one plugin file.
+# The `mem/` key schema is the stable contract — byte-identical to the Rust
+# `autumn-memory` lib (crates/autumn-memory/src/keys.rs, docs/autumn_memory_plan.md §6):
+#   episodic:  mem/{tenant}/{agent}/ep/{session}/{suffix}  suffix = BE(u64_max-ts_ns)++BE(u32_max-ctr)
+#   fact:      mem/{tenant}/{agent}/fact/{namespace}/{key}
+# Every dynamic component is percent-encoded (RFC-3986 unreserved kept).
+# Lexical-only recall for now (no embedder) — swap `search()` for a vector/hybrid
+# leg later without touching the schema.
+_UNRESERVED = re.compile(rb"[A-Za-z0-9\-_.~]")
+_U64_MAX = (1 << 64) - 1
+_U32_MAX = (1 << 32) - 1
+
+
+def q(s: str) -> bytes:
+    """Percent-encode one dynamic key component (byte-identical to Rust `q`)."""
+    out = bytearray()
+    for b in s.encode("utf-8"):
+        if _UNRESERVED.match(bytes([b])):
+            out.append(b)
+        else:
+            out += b"%%%02X" % b
+    return bytes(out)
+
+
+def _unq(b: bytes) -> str:
+    """Inverse of `q` — decode a percent-encoded component."""
+    out = bytearray()
+    i = 0
+    while i < len(b):
+        if b[i] == 0x25 and i + 2 < len(b):  # '%'
+            out.append(int(b[i + 1:i + 3], 16))
+            i += 3
+        else:
+            out.append(b[i])
+            i += 1
+    return out.decode("utf-8", "replace")
+
+
+class AutumnMemory:
+    """Per-(tenant, agent) memory over one autumn `Client`. All methods are async
+    (`autumn.Client` methods return awaitables) — the provider below wraps them
+    with a sync bridge for Hermes' synchronous hooks."""
+
+    def __init__(self, client: Any, tenant: str, agent: str) -> None:
+        self._c = client
+        self._t = q(tenant)
+        self._a = q(agent)
+        # per-process monotonic counter so two events in the same ns still order
+        self._ctr = itertools.count()
+
+    # ---- key builders -----------------------------------------------------
+    def _agent_prefix(self) -> bytes:
+        return b"mem/" + self._t + b"/" + self._a + b"/"
+
+    def _ep_agent_prefix(self) -> bytes:
+        return self._agent_prefix() + b"ep/"
+
+    def _ep_session_prefix(self, session: str) -> bytes:
+        return self._ep_agent_prefix() + q(session) + b"/"
+
+    def _ep_suffix(self, ts_ns: int, ctr: int) -> bytes:
+        return (_U64_MAX - ts_ns).to_bytes(8, "big") + (_U32_MAX - (ctr & _U32_MAX)).to_bytes(4, "big")
+
+    def _fact_prefix(self, namespace: str) -> bytes:
+        return self._agent_prefix() + b"fact/" + q(namespace) + b"/"
+
+    def _fact_key(self, namespace: str, key: str) -> bytes:
+        return self._fact_prefix(namespace) + q(key)
+
+    # ---- episodic ---------------------------------------------------------
+    async def append_event(self, session: str, event: Any) -> None:
+        """Append one event to the session's episodic log (newest sorts first)."""
+        key = self._ep_session_prefix(session) + self._ep_suffix(time.time_ns(), next(self._ctr))
+        await self._c.put(key, json.dumps(event).encode("utf-8"))
+
+    async def recent(self, session: str, k: int = 20) -> list:
+        """The k most-recent events in `session` (inverted-ts ⇒ range is newest-first)."""
+        rows = await self._c.range(self._ep_session_prefix(session), b"", k)
+        return [json.loads(v) for _, v in rows]
+
+    async def replay(self, session: str, limit: int = 200) -> list:
+        """Full session in chronological order (oldest-first)."""
+        rows = await self._c.range(self._ep_session_prefix(session), b"", limit)
+        return [json.loads(v) for _, v in reversed(rows)]
+
+    # ---- facts ------------------------------------------------------------
+    async def put_fact(self, namespace: str, key: str, value: Any) -> None:
+        await self._c.put(self._fact_key(namespace, key), json.dumps(value).encode("utf-8"))
+
+    async def get_fact(self, namespace: str, key: str) -> Optional[Any]:
+        b = await self._c.get(self._fact_key(namespace, key))
+        return None if b is None else json.loads(b)
+
+    async def list_facts(self, namespace: str, limit: int = 200) -> list:
+        rows = await self._c.range(self._fact_prefix(namespace), b"", limit)
+        pfx = self._fact_prefix(namespace)
+        out = []
+        for kbytes, v in rows:
+            name = _unq(kbytes[len(pfx):])
+            out.append((name, json.loads(v)))
+        return out
+
+    # ---- lexical recall (no embedder) -------------------------------------
+    async def search(self, query: str, k: int = 5, *, scan: int = 500) -> list:
+        """Bounded keyword recall over this agent's episodic + fact records (TF score)."""
+        terms = [t for t in re.split(r"\W+", query.lower()) if t]
+        if not terms:
+            return []
+        candidates: list[tuple[str, Any]] = []
+        for _, v in await self._c.range(self._ep_agent_prefix(), b"", scan):
+            candidates.append(("episodic", json.loads(v)))
+        for _, v in await self._c.range(self._agent_prefix() + b"fact/", b"", scan):
+            candidates.append(("fact", json.loads(v)))
+        scored = []
+        for kind, doc in candidates:
+            text = (doc if isinstance(doc, str) else json.dumps(doc, ensure_ascii=False)).lower()
+            score = sum(text.count(t) for t in terms)
+            if score:
+                scored.append((score, kind, doc))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [{"score": s, "kind": kind, "doc": doc} for s, kind, doc in scored[:k]]
 
 
 class _SyncBridge:

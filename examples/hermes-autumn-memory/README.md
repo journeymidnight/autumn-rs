@@ -12,30 +12,32 @@ Hermes agent ──LLM(OpenAI API)──► vLLM (32B-AWQ, single A30)
      ▼                                  ▼
 hermes_provider.AutumnMemoryProvider   autumn cluster (manager/PS/EN)
      │ on autumn.Client + mem/ schema   ▲
-     └── autumn_mem.AutumnMemory ────────┘
+     └── AutumnMemory (same file) ───────┘
 ```
 
 ## Files
 
 | File | Tracked? | What |
 |---|---|---|
-| `autumn_mem.py` | yes | Core memory ops on `autumn.Client` + the `mem/` schema (episodic / facts / **lexical** search). Schema-faithful → interoperable with the Rust lib. |
-| `hermes_provider.py` | yes | Hermes `MemoryProvider` mapping its hooks → `AutumnMemory` (sync bridge). |
+| `hermes_provider.py` | yes | The whole memory plugin in one file: `AutumnMemory` (core mem/-schema ops — episodic / facts / **lexical** search, byte-faithful to the Rust lib) + `AutumnMemoryProvider` (Hermes `MemoryProvider` adapter with a sync bridge). Merged since hermes is the only consumer. |
 | `k8s/vllm.yaml`, `k8s/hermes.yaml` | yes | Manifests (vLLM+kvcache, agent). |
-| `docker/Dockerfile.*` | yes | Image builds (vLLM+kvcache, hermes+provider); context = repo root, `CARGO_MIRROR` arg. |
+| `vllm-kvcache/Dockerfile` | yes | vLLM image (kvcache connector + weight loader); context = repo root, `RUSTUP_DIST_SERVER`/`RUSTUP_UPDATE_ROOT`/`CARGO_MIRROR` build args. |
+| `vllm-kvcache/Dockerfile.hermes` | yes | hermes agent + memory provider image; context = repo root, `CARGO_MIRROR` arg. |
 
 Nothing here touches the server-side structure (`crates/`, `deploy/docker/`).
 
 ## Build (context = repo root)
 
 ```bash
-# vLLM + autumn-kvcache (pinned vLLM 0.23.0; builds the autumn PyO3 wheel)
-docker build -f examples/hermes-autumn-memory/docker/Dockerfile.vllm-kvcache \
+# vLLM + autumn (kvcache connector AND weight loader; pinned vLLM 0.23.0; builds the PyO3 wheel)
+docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile \
+  --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
+  --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
   --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
-  -t <CR>/vllm-autumn-kvcache:<tag> .
+  -t <CR>/vllm-autumn:<tag> .
 
 # Hermes agent + memory provider plugin
-docker build -f examples/hermes-autumn-memory/docker/Dockerfile.hermes \
+docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile.hermes \
   --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
   -t <CR>/hermes-autumn:<tag> .
 ```

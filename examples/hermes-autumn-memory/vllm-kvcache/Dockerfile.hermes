@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir "hermes-agent"   # TODO: pin: git+https://github.
 
 # install our memory provider as the Hermes plugin `autumn`
 RUN mkdir -p "$HERMES_HOME/plugins/autumn" \
- && cp examples/hermes-autumn-memory/autumn_mem.py examples/hermes-autumn-memory/hermes_provider.py "$HERMES_HOME/plugins/autumn/" \
+ && cp examples/hermes-autumn-memory/hermes_provider.py "$HERMES_HOME/plugins/autumn/" \
  && printf 'from .hermes_provider import AutumnMemoryProvider\n' > "$HERMES_HOME/plugins/autumn/__init__.py"
 
 # TODO(you): the container CMD depends on how you launch hermes-agent
