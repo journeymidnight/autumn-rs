@@ -1,7 +1,7 @@
 # Hermes agent + autumn memory provider image.
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace for the wheel).
 #   docker build -f examples/hermes-autumn-memory/vllm-kvcache/Dockerfile.hermes \
-#     --build-arg BASE_REGISTRY=docker.m.daocloud.io/library/ \
+#     --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
 #     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     -t <cr>/hermes-autumn:<tag> .
 #
@@ -9,10 +9,12 @@
 # MemoryProvider ABC drifts across versions — validate hermes_provider.py hooks
 # against the version you pin here.
 #
-# BASE_REGISTRY: prefix for the base image so China / air-gapped builds can pull
-# python from a mirror (e.g. docker.m.daocloud.io/library/). Empty = docker.io direct.
+# BASE_REGISTRY: registry-host prefix so China / air-gapped builds pull the base
+# from a mirror (e.g. docker.m.daocloud.io/). Uniform with the vLLM Dockerfile —
+# just the HOST; the docker-hub namespace (`library/` for official images) is in
+# the FROM. Empty = docker.io direct (`library/python` = the official python).
 ARG BASE_REGISTRY=
-FROM ${BASE_REGISTRY}python:3.11-slim
+FROM ${BASE_REGISTRY}library/python:3.11-slim
 
 ARG CARGO_MIRROR=
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes
