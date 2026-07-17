@@ -658,7 +658,7 @@ fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
     // First call should record a cooldown entry.
-    eng.compute_hot_cold_advisory(&owners, now);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert!(
         eng.last_hot_cold_at.contains_key(&42),
         "hot/cold advisory expected to fire on >{}x imbalance",
@@ -694,7 +694,7 @@ fn hot_cold_advisory_skips_when_hottest_below_floor() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
-    eng.compute_hot_cold_advisory(&owners, now);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert!(
         !eng.last_hot_cold_at.contains_key(&42),
         "advisory must suppress when hottest is below the QPS floor"
@@ -729,14 +729,14 @@ fn hot_cold_advisory_cooldown_dedupes() {
         t0 - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
-    eng.compute_hot_cold_advisory(&owners, t0);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0);
     let first = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     // Tick again well within cooldown — last_hot_cold_at must NOT update.
-    eng.compute_hot_cold_advisory(&owners, t0 + HOT_COLD_COOLDOWN_SEC / 2);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + HOT_COLD_COOLDOWN_SEC / 2);
     let second = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     assert_eq!(first, second, "advisory inside cooldown must not refire");
     // Past cooldown: refires.
-    eng.compute_hot_cold_advisory(&owners, t0 + HOT_COLD_COOLDOWN_SEC + 1);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + HOT_COLD_COOLDOWN_SEC + 1);
     let third = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     assert!(third > first, "advisory past cooldown must refire");
 }
@@ -771,7 +771,7 @@ fn hot_cold_advisory_fires_on_size_imbalance() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
-    eng.compute_hot_cold_advisory(&owners, now);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert!(
         eng.last_hot_cold_at.contains_key(&99),
         "size-only imbalance >{}x should also trigger the advisory",
@@ -809,7 +809,7 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
-    eng.compute_hot_cold_advisory(&owners, now);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert!(
         !eng.last_hot_cold_at.contains_key(&99),
         "size advisory must suppress when hottest size is below the floor"
@@ -845,7 +845,7 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let owners: HashMap<u64, u64> = vec![(300u64, 77u64), (301, 77)].into_iter().collect();
-    let cands = eng.compute_hot_cold_advisory(&owners, now);
+    let cands = eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert_eq!(
         cands.len(),
         1,
@@ -1144,4 +1144,313 @@ fn rebalance_advisory_disabled_when_threshold_zero() {
     cfg.rebalance_gap_threshold = 0;
     eng.set_config(cfg);
     assert!(eng.compute_rebalance_advisory(&state, 1000).is_empty());
+}
+
+// ===========================================================================
+// F-POLICY-SIZE-EST-LIVE — est_live口径 tests (design doc §3.3 D3)
+// ===========================================================================
+
+use crate::policy::{effective_size_bytes, est_live_bytes, partition_sealed_sums};
+
+fn mk_part_streams(
+    state: &mut MetadataState,
+    id: u64,
+    start: &[u8],
+    end: &[u8],
+    log: u64,
+    row: u64,
+    meta: u64,
+) {
+    state.partitions.insert(
+        id,
+        MgrPartitionMeta {
+            part_id: id,
+            log_stream: log,
+            row_stream: row,
+            meta_stream: meta,
+            rg: Some(MgrRange {
+                start_key: start.to_vec(),
+                end_key: end.to_vec(),
+            }),
+        },
+    );
+}
+
+/// Pure-fn arithmetic: additions, per-component subtraction, and the
+/// saturating clamp (stale debts > sealed + open_tail must yield 0, never
+/// wrap), plus the `max` fallback to the LSM-resident metric.
+#[test]
+fn est_live_pure_fn_arithmetic_and_saturation() {
+    let l = PartitionLoad {
+        open_tail_bytes: 2 * GIB,
+        gc_debt_bytes: GIB,
+        open_tail_dead_bytes: GIB / 2,
+        size_bytes: 700 * 1024 * 1024,
+        ..Default::default()
+    };
+    // 10 + 2 − 1 − 0.5 = 10.5 GiB
+    assert_eq!(est_live_bytes(10 * GIB, &l), 10 * GIB + GIB / 2);
+    // effective = max(lsm, est_live)
+    assert_eq!(effective_size_bytes(10 * GIB, &l), 10 * GIB + GIB / 2);
+
+    // Degenerate: debts exceed sealed + open_tail → clamp to 0, and the
+    // effective size falls back to the LSM-resident metric.
+    let stale = PartitionLoad {
+        open_tail_bytes: 0,
+        gc_debt_bytes: 100 * GIB,
+        open_tail_dead_bytes: u64::MAX,
+        size_bytes: 200 * 1024 * 1024,
+        ..Default::default()
+    };
+    assert_eq!(est_live_bytes(GIB, &stale), 0);
+    assert_eq!(effective_size_bytes(GIB, &stale), 200 * 1024 * 1024);
+
+    // Component missing (all-zero PS gauges — e.g. probe never ran):
+    // est_live degrades to the sealed sum alone.
+    let zeroed = PartitionLoad::default();
+    assert_eq!(est_live_bytes(7 * GIB, &zeroed), 7 * GIB);
+
+    // Overflow side: sealed + open_tail saturates instead of wrapping.
+    let huge = PartitionLoad {
+        open_tail_bytes: u64::MAX,
+        ..Default::default()
+    };
+    assert_eq!(est_live_bytes(u64::MAX, &huge), u64::MAX);
+}
+
+/// The sealed sum dedups extents shared across the SAME partition's three
+/// streams (each extent counted once), skips extent ids with no
+/// `MgrExtentInfo`, and yields 0 for a partition with no stream state.
+#[test]
+fn partition_sealed_sums_dedups_and_degrades() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 7, b"a", b"m", 100, 101, 102);
+    mk_extent(&mut state, 1, 4 * GIB, false);
+    mk_extent(&mut state, 2, 2 * GIB, false);
+    // Extent 1 appears in BOTH log and row streams (CoW/splice shape) —
+    // counted once. Extent 999 has no MgrExtentInfo — skipped.
+    mk_stream(&mut state, 100, (0, 0), &[1, 2]);
+    mk_stream(&mut state, 101, (0, 0), &[1, 999]);
+    mk_stream(&mut state, 102, (0, 0), &[]);
+    // Partition 8 exists but references unknown streams → sum 0.
+    mk_part_streams(&mut state, 8, b"m", b"z", 200, 201, 202);
+
+    let sums = partition_sealed_sums(&state);
+    assert_eq!(sums.get(&7).copied(), Some(6 * GIB));
+    assert_eq!(sums.get(&8).copied(), Some(0));
+}
+
+/// The headline fix: a VP-heavy partition (LSM-resident 741 MB, ~55 GiB of
+/// sealed stream bytes) reaches SPLIT_SIZE_HARD under the new口径 — the old
+/// `size_bytes`-only predicate could never fire here.
+#[test]
+fn est_live_vp_load_split_fires_despite_small_lsm() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 17, b"", b"m", 100, 101, 102);
+    mk_extent(&mut state, 1, 30 * GIB, false);
+    mk_extent(&mut state, 2, 25 * GIB, false);
+    mk_stream(&mut state, 100, (0, 0), &[1]);
+    mk_stream(&mut state, 101, (0, 0), &[2]);
+    mk_stream(&mut state, 102, (0, 0), &[]);
+
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        17,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 17,
+            size_bytes: 741 * 1024 * 1024, // LSM-resident: pointers only
+            req_per_sec: 100,              // low QPS — size is the only trigger
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out.len(), 1, "expected exactly the split candidate: {out:?}");
+    assert_eq!(out[0].kind, POLICY_KIND_SPLIT);
+    assert_eq!(out[0].primary_part_id, 17);
+    // The SIZE column (candidate.size_bytes) carries the new口径.
+    assert_eq!(out[0].size_bytes, 55 * GIB);
+    assert!(
+        out[0].reason.contains("est_live"),
+        "reason should expose est_live for DryRun calibration: {}",
+        out[0].reason
+    );
+}
+
+/// gc_debt / open_tail_dead are subtracted: dead bytes must not push a
+/// partition over SPLIT_SIZE_HARD. Part 7 (52 GiB gross − 3 GiB debt =
+/// 49 GiB) stays silent; part 8 (same gross, no debt) fires.
+#[test]
+fn est_live_debt_subtraction_suppresses_split() {
+    let mut state = MetadataState::default();
+    for (pid, log_sid, eid) in [(7u64, 100u64, 1u64), (8, 200, 2)] {
+        let (start, end) = if pid == 7 {
+            (b"a".as_ref(), b"m".as_ref())
+        } else {
+            (b"m".as_ref(), b"z".as_ref())
+        };
+        mk_part_streams(&mut state, pid, start, end, log_sid, log_sid + 1, log_sid + 2);
+        mk_extent(&mut state, eid, 49 * GIB, false);
+        mk_stream(&mut state, log_sid, (0, 0), &[eid]);
+        mk_stream(&mut state, log_sid + 1, (0, 0), &[]);
+        mk_stream(&mut state, log_sid + 2, (0, 0), &[]);
+    }
+
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    fill_window(
+        &mut eng,
+        7,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 7,
+            size_bytes: 500 * 1024 * 1024,
+            open_tail_bytes: 3 * GIB,     // gross 52 GiB > hard...
+            gc_debt_bytes: 2 * GIB,       // ...but 3 GiB of it is dead
+            open_tail_dead_bytes: GIB,    // → est_live 49 GiB < 50 GiB
+            req_per_sec: 100,
+            ..Default::default()
+        },
+        base,
+    );
+    fill_window(
+        &mut eng,
+        8,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 8,
+            size_bytes: 500 * 1024 * 1024,
+            open_tail_bytes: 3 * GIB, // gross 52 GiB, no debt → fires
+            req_per_sec: 100,
+            ..Default::default()
+        },
+        base,
+    );
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out.len(), 1, "only the debt-free partition splits: {out:?}");
+    assert_eq!(out[0].primary_part_id, 8);
+    assert_eq!(out[0].size_bytes, 52 * GIB);
+}
+
+/// The direction fix from the live incident: a partition whose LSM-resident
+/// size is tiny but which carries tens of GiB of VP bytes must NOT surface
+/// as a merge candidate.
+#[test]
+fn est_live_vp_partition_not_a_merge_candidate() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
+    mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202); // adjacent
+    mk_extent(&mut state, 1, 45 * GIB, false); // part 1 carries 45 GiB
+    mk_stream(&mut state, 100, (0, 0), &[1]);
+    mk_stream(&mut state, 101, (0, 0), &[]);
+    mk_stream(&mut state, 102, (0, 0), &[]);
+
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let cold = PartitionLoad {
+        size_bytes: 200 * 1024 * 1024, // both look tiny to the old口径
+        req_per_sec: 1,
+        ..Default::default()
+    };
+    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold.clone(), base);
+    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold, base);
+    let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert!(
+        out.is_empty(),
+        "a 45 GiB-carrying partition must not be a merge candidate: {out:?}"
+    );
+}
+
+/// Degradation: stale debts exceeding the sealed sum clamp est_live to 0 —
+/// the predicate then falls back to the old LSM-resident metric via the
+/// max, so a genuinely-cold pair still merges (no panic, no wraparound,
+/// no false veto).
+#[test]
+fn est_live_underflow_clamps_and_cold_pair_still_merges() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
+    mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
+    mk_extent(&mut state, 1, 100 * 1024 * 1024, false);
+    mk_stream(&mut state, 100, (0, 0), &[1]);
+
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let cold = PartitionLoad {
+        size_bytes: 200 * 1024 * 1024,
+        gc_debt_bytes: 5 * GIB, // stale over-report ≫ sealed sum
+        req_per_sec: 1,
+        ..Default::default()
+    };
+    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold.clone(), base);
+    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold, base);
+    let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert_eq!(out.len(), 1, "cold pair should still merge: {out:?}");
+    assert_eq!(out[0].kind, POLICY_KIND_MERGE);
+}
+
+/// The hot/cold size dimension consumes the same口径: a VP-heavy partition
+/// (tiny LSM-resident, 60 GiB sealed) registers as size-hot.
+#[test]
+fn hot_cold_size_dimension_sees_est_live() {
+    use autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD;
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    fill_window(
+        &mut eng,
+        300,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 300,
+            size_bytes: 1024 * 1024, // 1 MiB LSM-resident
+            ..Default::default()
+        },
+        base,
+    );
+    fill_window(
+        &mut eng,
+        301,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 301,
+            size_bytes: 1,
+            ..Default::default()
+        },
+        base,
+    );
+    let owners: HashMap<u64, u64> = vec![(300u64, 55u64), (301, 55)].into_iter().collect();
+    let sealed: HashMap<u64, u64> = vec![(300u64, 60 * GIB)].into_iter().collect();
+    let cands = eng.compute_hot_cold_advisory(&owners, &sealed, now);
+    assert_eq!(cands.len(), 1, "size-hot via est_live expected: {cands:?}");
+    assert_eq!(cands[0].kind, POLICY_KIND_HOT_COLD);
+    assert_eq!(cands[0].primary_part_id, 300);
+    assert_eq!(cands[0].size_bytes, 60 * GIB, "SIZE column carries the new口径");
 }

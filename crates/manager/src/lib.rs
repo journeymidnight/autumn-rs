@@ -1332,7 +1332,11 @@ impl AutumnManager {
         cands.append(&mut p.compute_maintenance_advisory(now));
         // F196 Stage D: hot/cold imbalance (kind = POLICY_KIND_HOT_COLD), ridden
         // on the same advisory_cache for `client info` rendering.
-        cands.append(&mut p.compute_hot_cold_advisory(owners, now));
+        // F-POLICY-SIZE-EST-LIVE: the size dimension consumes the same
+        // effective-size口径 as split/merge (sealed sums + PS-reported
+        // open-tail/debt gauges), so a VP-heavy partition is visible to it.
+        let sealed_sums = crate::policy::partition_sealed_sums(state);
+        cands.append(&mut p.compute_hot_cold_advisory(owners, &sealed_sums, now));
         // F202: EC advisory — per-extent, sourced from streams + extents (not
         // partition-windowed); the helper filters extents < ec_min_extent_bytes.
         cands.append(&mut p.compute_ec_advisory(state, now));

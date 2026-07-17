@@ -230,11 +230,17 @@ free. The number is thus a periodic rollup (same staleness class as
 dashboard `/api/overview` shares this builder, so it inherits the fix.
 **Invariant: never re-introduce a sealed-length-only `live_size` — an
 all-open-tail partition MUST count its open-tail bytes.** PS side:
-partition-server CLAUDE.md (F-OVERVIEW-OPENTAIL probe). Related dead-gauge
-follow-up: `PartitionLoad.size_bytes` has no writer (always 0) → the
-`autumn_ps_partition_size_bytes` Prometheus gauge + size-based auto-split/merge
-policy are inert; reviving it is deferred (feature_list F-PS-SIZE-BYTES-DEAD)
-because it would silently arm size-based auto-policy.
+partition-server CLAUDE.md (F-OVERVIEW-OPENTAIL probe). Related size-gauge
+history: `PartitionLoad.size_bytes` was long dead (no writer, always 0), but
+F-PS-SIZE-BYTES-DEAD (2026-07-05) revived it — the PS now writes LSM-resident
+bytes (SST + memtable) at `partition-server/background.rs:309`, driving the
+`autumn_ps_partition_size_bytes` Prometheus gauge and the size-based policy.
+BUT LSM-resident ≠ real carried data: values >4 KiB live in log_stream behind
+ValuePointers, invisible to `size_bytes`, so a partition holding 19 GB looks
+like ~700 MB. F-POLICY-SIZE-EST-LIVE therefore feeds every size predicate
+`effective_size_bytes = max(size_bytes, est_live)` (policy.rs `est_live_bytes`),
+where `est_live = Σsealed + open_tail − gc_debt − open_tail_dead`. Do NOT
+reason about split/merge off raw `size_bytes` — it under-counts VP workloads.
 
 ## cluster-df amplification = physical / logical FOOTPRINT (F-DF-OPENTAIL)
 

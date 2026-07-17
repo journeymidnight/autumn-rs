@@ -13,6 +13,20 @@ use autumn_rpc::manager_rpc::{
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+/// F-POLICY-SIZE-EST-LIVE (design doc `docs/key_namespace_split_design.md`
+/// §3.3 D3): the size metric the split/merge/hot-cold predicates compare
+/// against these thresholds is `effective_size_bytes` =
+/// `max(size_bytes, est_live)` — NOT the raw `PartitionLoad.size_bytes`
+/// (LSM-resident bytes: Σ SST len + memtable). For a VP workload
+/// (values > 4 KiB live in log_stream, the LSM holds ~24-40 B pointers)
+/// the LSM-resident figure under-reads real carried bytes by ~60×
+/// (live part 17: 741 MB LSM vs ~45 GB stream bytes), so a
+/// size-only threshold on it never fired for split and mis-flagged the
+/// cluster's LARGEST partition as a merge candidate. The threshold
+/// VALUES below are unchanged — but their physical meaning shifted from
+/// "LSM-resident bytes" to "real carried stream bytes (est_live)";
+/// recalibration is a pending operator decision (design doc §5.1,
+/// DryRun a round of `policy-candidates` first).
 pub const SPLIT_SIZE_HARD: u64 = 50 * GIB;
 pub const SPLIT_SIZE_MIN: u64 = GIB;
 /// F196: recalibrated 50K → 15K. autumn-rs's measured single-partition
@@ -222,6 +236,108 @@ impl Default for PolicyConfig {
     }
 }
 
+/// F-POLICY-SIZE-EST-LIVE: per-partition Σ `sealed_length` over the
+/// partition's three streams' DEDUP'd extents — the manager-authoritative
+/// half of `est_live_bytes`. Mirrors `compute_cluster_overview_resp`'s
+/// `live_size` sealed sum (rpc_handlers.rs, F-OVERVIEW-OPENTAIL), sourced
+/// from `state.partitions` (carries log/row/meta stream ids for every live
+/// partition, present even before a region is assigned). Pure + read-only;
+/// called once per advisory pass on the 60 s policy tick — O(streams +
+/// extents) in-memory CPU, no RPC.
+///
+/// Known over-count (accepted, direction-safe — design doc §3.3): after a
+/// CoW split, extents shared with the SIBLING partition are counted in
+/// full by both children until major compaction drops the shared refs.
+/// Over-estimating only delays merge / hastens split.
+pub fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
+    let mut out = HashMap::with_capacity(state.partitions.len());
+    for p in state.partitions.values() {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut sum = 0u64;
+        for sid in [p.log_stream, p.row_stream, p.meta_stream] {
+            if let Some(st) = state.streams.get(&sid) {
+                for eid in &st.extent_ids {
+                    if seen.insert(*eid) {
+                        if let Some(e) = state.extents.get(eid) {
+                            sum = sum.saturating_add(e.sealed_length);
+                        }
+                    }
+                }
+            }
+        }
+        out.insert(p.part_id, sum);
+    }
+    out
+}
+
+/// F-POLICY-SIZE-EST-LIVE (design doc §3.3 D3): estimated REAL live bytes a
+/// partition carries, VP payload included:
+///
+/// ```text
+/// est_live = Σ sealed_length (3 streams, dedup'd — manager state)
+///          + open_tail_bytes       (PS-reported, F-OVERVIEW-OPENTAIL)
+///          − gc_debt_bytes         (PS-reported, F187: sealed-extent dead bytes)
+///          − open_tail_dead_bytes  (PS-reported, F-DF-WALDEBT: open-tail dead bytes)
+/// ```
+///
+/// All four components already exist — zero wire change, zero PS hot-path
+/// cost. Arithmetic is SATURATING throughout: the sealed sum is a
+/// point-in-time manager snapshot while the three PS gauges refresh on
+/// their own cadences (open_tail 30 s probe, debts each GC tick), so a
+/// just-punched extent can transiently leave debts > sealed + open_tail;
+/// clamping to 0 (instead of wrapping) makes the degenerate value fall
+/// back to `size_bytes` via `effective_size_bytes`'s max.
+///
+/// Known error bars (accepted, documented in the design doc):
+/// - CoW-shared extents double-count across split siblings (see
+///   `partition_sealed_sums`) — over-estimate, direction-safe.
+/// - row_stream garbage (pre-truncate compacted-away SSTs) is NOT
+///   subtracted (only log_stream debt is tracked) — over-estimate,
+///   direction-safe.
+/// - `open_tail_bytes` is 0 until the PS's first successful probe and the
+///   gauges are minutes-stale at worst — matches the policy's 5-minute
+///   sustained window; the `max` in `effective_size_bytes` covers the
+///   under-estimate side.
+/// - `sealed_sum` is a SINGLE current-pass snapshot applied to EVERY bucket
+///   in the sliding window (see the caller in `split_candidates`), so the
+///   size dimension does NOT participate in the "all N buckets must trigger"
+///   debounce — only the PS-reported components (`open_tail`/debts) are
+///   per-bucket. A step change in sealed bytes (a fresh large SST, or a GC
+///   that drops a batch) therefore reaches the size trigger in one tick
+///   instead of a sustained window. ACCEPTED for now because: (a) auto-exec
+///   is off by default (`allow-mutations=0`) so this only affects the
+///   `policy-candidates` DryRun advisory, not real split/merge; (b) sealed is
+///   a slow, near-monotonic variable; (c) split/merge both have cooldowns.
+///   Historising `sealed` per-bucket would push an O(extents) sum onto the
+///   high-frequency `handle_report_partition_load` hot path, which is exactly
+///   what this snapshot-per-pass design avoids. BEFORE arming size-based
+///   auto-exec this MUST be fixed — either historise sealed off the hot path
+///   (a per-partition sealed ring in PolicyEngine, updated each compute tick)
+///   or drop the size dimension out of the debounce entirely (size is a slow
+///   monotonic level, unlike QPS spikes the window exists to filter).
+///   Tracked: F-POLICY-SIZE-EST-LIVE-FOLLOWUP (feature_list). coco P1 2026-07-17.
+pub fn est_live_bytes(sealed_sum: u64, l: &PartitionLoad) -> u64 {
+    sealed_sum
+        .saturating_add(l.open_tail_bytes)
+        .saturating_sub(l.gc_debt_bytes)
+        .saturating_sub(l.open_tail_dead_bytes)
+}
+
+/// The size metric every size predicate (split / merge / hot-cold)
+/// consumes: `max(size_bytes, est_live)`.
+///
+/// Why max on BOTH sides (deviation from the design doc's "est_live alone
+/// for merge", strictly MORE conservative than it): for split, `old ∨ new`
+/// only ADDS candidates (small-value loads keep the exact old trigger);
+/// for merge, requiring `max < threshold` = `old ∧ new` only REMOVES
+/// candidates — so a degraded est_live (open-tail probe not yet run →
+/// open_tail_bytes = 0 → under-estimate) can never flag a partition the
+/// old LSM-resident metric still sees as big. Either metric saying "big"
+/// vetoes a merge and qualifies a split.
+pub fn effective_size_bytes(sealed_sum: u64, l: &PartitionLoad) -> u64 {
+    l.size_bytes.max(est_live_bytes(sealed_sum, l))
+}
+
 #[derive(Default)]
 pub struct PartitionMetricsWindow {
     pub buckets: VecDeque<(i64, PartitionLoad)>,
@@ -351,6 +467,10 @@ impl PolicyEngine {
     fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
+        // F-POLICY-SIZE-EST-LIVE: one sealed-sum snapshot per pass, applied
+        // to every bucket in the window (sealed lengths move slowly relative
+        // to the 5-minute window; the PS-reported components stay per-bucket).
+        let sealed = partition_sealed_sums(args.state);
 
         for (&part_id, window) in self.metrics.iter() {
             let Some(bs) = window.recent(cfg.required_buckets) else {
@@ -362,10 +482,17 @@ impl PolicyEngine {
                 continue;
             }
 
+            let sealed_sum = sealed.get(&part_id).copied().unwrap_or(0);
             // ALL of the last required_buckets must show a trigger.
+            // F-POLICY-SIZE-EST-LIVE: both size comparisons consume
+            // `effective_size_bytes` (max of LSM-resident and est_live) so a
+            // VP-heavy partition whose bytes live in log_stream can reach
+            // the size triggers at all (pre-this, `size_bytes` alone made
+            // SPLIT_SIZE_HARD ≈ 3 TB of real data on a VP workload).
             let all_match = bs.iter().all(|(_, l)| {
-                l.size_bytes > cfg.split_size_hard
-                    || (l.req_per_sec > cfg.split_qps_high && l.size_bytes > cfg.split_size_min)
+                let eff = effective_size_bytes(sealed_sum, l);
+                eff > cfg.split_size_hard
+                    || (l.req_per_sec > cfg.split_qps_high && eff > cfg.split_size_min)
                     || l.imm_full_per_sec > cfg.split_immfull_high
             });
             if !all_match {
@@ -373,17 +500,21 @@ impl PolicyEngine {
             }
 
             let recent = &bs[0].1;
-            let reason = if recent.size_bytes > cfg.split_size_hard {
+            let recent_eff = effective_size_bytes(sealed_sum, recent);
+            // Reason carries BOTH metrics so a DryRun `policy-candidates`
+            // round can calibrate the thresholds under the new口径.
+            let reason = if recent_eff > cfg.split_size_hard {
                 format!(
-                    "size_bytes>{} ({} GiB)",
+                    "size>{} (est_live {} GiB, lsm {} MiB)",
                     cfg.split_size_hard,
-                    recent.size_bytes / GIB
+                    est_live_bytes(sealed_sum, recent) / GIB,
+                    recent.size_bytes / (1024 * 1024),
                 )
             } else if recent.imm_full_per_sec > cfg.split_immfull_high {
                 format!("imm_full_per_sec>{} sustained", cfg.split_immfull_high)
             } else {
                 format!(
-                    "req_per_sec>{} sustained AND size_bytes>{}",
+                    "req_per_sec>{} sustained AND size>{}",
                     cfg.split_qps_high, cfg.split_size_min
                 )
             };
@@ -392,7 +523,8 @@ impl PolicyEngine {
                 primary_part_id: part_id,
                 secondary_part_id: 0,
                 reason,
-                size_bytes: recent.size_bytes,
+                // The SIZE column of `policy-candidates` — the new口径.
+                size_bytes: recent_eff,
                 req_per_sec: recent.req_per_sec,
                 imm_full_per_sec: recent.imm_full_per_sec,
                 same_ps: true, // not meaningful for split
@@ -415,6 +547,12 @@ impl PolicyEngine {
     fn merge_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
+        // F-POLICY-SIZE-EST-LIVE: the smallness check MUST consume
+        // `effective_size_bytes` — the live incident this fixes is the
+        // policy flagging the cluster's LARGEST partition (part 17: 741 MB
+        // LSM-resident vs ~45 GB real stream bytes under a VP workload) as
+        // a merge candidate because `size_bytes` couldn't see the VP bytes.
+        let sealed = partition_sealed_sums(args.state);
 
         // Walk partitions sorted by start_key; for each adjacent pair where
         // left.end_key == right.start_key, check both windows.
@@ -459,9 +597,15 @@ impl PolicyEngine {
                 continue;
             }
 
+            let sealed_l = sealed.get(&left_id).copied().unwrap_or(0);
+            let sealed_r = sealed.get(&right_id).copied().unwrap_or(0);
+            // F-POLICY-SIZE-EST-LIVE: per-side `max(size_bytes, est_live)`
+            // must be small — either metric reading "big" vetoes the pair
+            // (old predicate AND new predicate; strict non-regression for
+            // small-value loads, direction fix for VP loads).
             let all_qualify = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
-                lb.size_bytes < cfg.merge_size_low
-                    && rb.size_bytes < cfg.merge_size_low
+                effective_size_bytes(sealed_l, lb) < cfg.merge_size_low
+                    && effective_size_bytes(sealed_r, rb) < cfg.merge_size_low
                     && (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
                     && lb.imm_full_per_sec == 0
                     && rb.imm_full_per_sec == 0
@@ -479,12 +623,17 @@ impl PolicyEngine {
             };
             let recent_l = &lbs[0].1;
             let recent_r = &rbs[0].1;
+            let eff_l = effective_size_bytes(sealed_l, recent_l);
+            let eff_r = effective_size_bytes(sealed_r, recent_r);
             out.push(PolicyCandidate {
                 kind: POLICY_KIND_MERGE,
                 primary_part_id: left_id, // survivor candidate = left
                 secondary_part_id: right_id,
+                // "size_each": the predicate is PER-SIDE < merge_size_low
+                // (the old "size_sum<" wording misread as a summed check —
+                // design doc §6 correction).
                 reason: format!(
-                    "size_sum<{} qps_sum<{} sustained{}",
+                    "size_each<{} qps_sum<{} sustained{}",
                     cfg.merge_size_low,
                     cfg.merge_qps_low,
                     if !same_ps {
@@ -493,7 +642,7 @@ impl PolicyEngine {
                         ""
                     }
                 ),
-                size_bytes: recent_l.size_bytes + recent_r.size_bytes,
+                size_bytes: eff_l.saturating_add(eff_r),
                 req_per_sec: recent_l.req_per_sec + recent_r.req_per_sec,
                 imm_full_per_sec: 0,
                 same_ps,
@@ -872,6 +1021,7 @@ impl PolicyEngine {
     pub fn compute_hot_cold_advisory(
         &mut self,
         region_owners: &HashMap<u64, u64>,
+        sealed_sums: &HashMap<u64, u64>,
         now: i64,
     ) -> Vec<PolicyCandidate> {
         let mut out: Vec<PolicyCandidate> = Vec::new();
@@ -886,10 +1036,25 @@ impl PolicyEngine {
                 Some(p) => *p,
                 None => continue,
             };
+            // F-POLICY-SIZE-EST-LIVE: the size dimension consumes
+            // `effective_size_bytes` (same口径 as split/merge) so a VP-heavy
+            // partition registers as size-hot even though its LSM-resident
+            // `size_bytes` is tiny (`sealed_sums` from
+            // `partition_sealed_sums(state)`, computed once per tick in
+            // `recompute_advisory_cache`).
+            let sealed_sum = sealed_sums.get(&part_id).copied().unwrap_or(0);
             let min_req = bs.iter().map(|(_, l)| l.req_per_sec).min().unwrap_or(0);
             let max_req = bs.iter().map(|(_, l)| l.req_per_sec).max().unwrap_or(0);
-            let min_size = bs.iter().map(|(_, l)| l.size_bytes).min().unwrap_or(0);
-            let max_size = bs.iter().map(|(_, l)| l.size_bytes).max().unwrap_or(0);
+            let min_size = bs
+                .iter()
+                .map(|(_, l)| effective_size_bytes(sealed_sum, l))
+                .min()
+                .unwrap_or(0);
+            let max_size = bs
+                .iter()
+                .map(|(_, l)| effective_size_bytes(sealed_sum, l))
+                .max()
+                .unwrap_or(0);
             by_ps
                 .entry(ps_id)
                 .or_default()
