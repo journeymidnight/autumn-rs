@@ -1,12 +1,54 @@
 Date: 2026-07-16
 TaskStatus: not_completed
+Task scope: F-KVC-LAYOUT-FP — BUG-KVC-TENANT follow-up: fold the KV *layout*
+  versions into the model fingerprint. vLLM's page layout is an internal
+  detail (no stability contract; README pins 0.23.0 but loader.py:5 already
+  claims "v0.24") → same model on an upgraded vLLM kept the same tenant and
+  could cross-read layout-incompatible bytes (same silent-garbage class).
+  Fact-check vs the task brief: the CONNECTOR-side layout was ALREADY
+  version-gated (_KV_STORAGE_FORMAT="v1" in the key path, F278/1b522fa) —
+  missing were the vLLM-side version, tenant-level split, offline testability,
+  and the bump-invariant cross-refs.
+
+Code DONE (uncommitted — awaiting team-lead review; do NOT commit before review):
+  - _keys.py: VLLM_KV_STORAGE_FORMAT="v1" (moved from vllm_connector so pure
+    tests can pin it) + BUMP-invariant comment (change _extract_layer/
+    _inject_layer/_byte_view/key scheme ⇒ bump).
+  - _identity.py: vllm_runtime_version() (lazy vllm.__version__ →
+    importlib.metadata → None); vllm_identity_sources folds "vllm" (FULL
+    x.y.z — patch releases can change layout; re-warm is one-time/predictable,
+    under-split is silent garbage) + "kv_layout"; gated on non-empty sources
+    so version-only can't mask the unfingerprintable⇒None⇒loud-warning
+    contract.
+  - vllm_connector.py: imports the shared constant; loud warning when vLLM is
+    importable but version undetectable; INVARIANT cross-refs at
+    _extract_layer/_inject_layer. sglang path untouched (byte-identical
+    default tenant re-verified by tests); fingerprint still computed once in
+    __init__ (zero hot-path cost).
+  - tests/test_tenant_identity.py: 23 green (17 prior + 6 new: version split /
+    patch-version split / undetectable degrade / version-only stays None /
+    kv_layout split / pinned "v1"+in-sources). test_smoke/test_vllm_dataplane
+    collection errors are PRE-EXISTING (need numpy + autumn native wheel).
+  - Docs: README (fingerprint list + upgrade note: ANY vLLM version change
+    cold-invalidates the vLLM pool), ops.md, plan doc §13.3,
+    feature_list.md F-KVC-LAYOUT-FP.
+Live impact (deployed cluster): current tenant kvc/model-cfg_456cf7543b98_0_1/
+  (195 keys) goes cold on redeploy — fingerprint gains vllm+kv_layout sources
+  ⇒ new tenant; old keys (ttl=0) need manual batch_delete to reclaim.
+Next steps: team-lead review (+coco per repo rule) → commit → redeploy vLLM
+  hosts, verify startup log shows identity={..., 'vllm': '0.23.0',
+  'kv_layout': 'v1'} and a new tenant; batch_delete the old tenant prefix.
+
+---- Prior task (same package, committed a42c6a1 + deployed; progress notes kept) ----
+Date: 2026-07-16
+TaskStatus: completed
 Task scope: BUG-KVC-TENANT — autumn_kvcache tenant carries no model identity →
   cross-model KV aliasing. Live incident: Qwen2.5-7B + 32B (both served via
   autumn_vllm_loader's fixed /model-cfg dir, shared tokenizer → same content
   hash) landed in ONE tenant kvc/model-cfg_0_1/ and 32B cross-read 7B's KV.
   Same-shape models would have been SILENTLY wrong.
 
-Code DONE (uncommitted — awaiting team-lead review; do NOT commit before review):
+Code DONE (COMMITTED a42c6a1, deployed live; new tenant kvc/model-cfg_456cf7543b98_0_1/ verified working):
   - NEW python/autumn_kvcache/autumn_kvcache/_identity.py (pure, no deps):
     vllm_identity_sources (arch shape + weights source + optional model_id;
     field names verified against vLLM v0.23.0 tag) → 12-hex deterministic

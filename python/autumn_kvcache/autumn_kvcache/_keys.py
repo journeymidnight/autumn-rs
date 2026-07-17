@@ -27,6 +27,28 @@ from __future__ import annotations
 # Reserved namespace prefix shared by all autumn-kvcache adapters.
 KEY_NAMESPACE = "kvc"
 
+# The vLLM connector's OWN storage-format / KV-layout version. It is baked
+# into every vLLM-pool key (`kvc/{tenant}/vllm/{THIS}/{hash}/{layer}`, see
+# `_AutumnKVStore._key`) AND folded into the tenant fingerprint
+# (`_identity.vllm_identity_sources`), so bumping it makes every old entry
+# unreachable twice over — old bytes can NEVER be loaded by an incompatible
+# newer connector under the same content hash; they just stop matching and
+# lazily expire. kvcache is a pure cache, so invalidation-by-versioning is the
+# correct (zero-migration) upgrade story.
+#
+# INVARIANT — BUMP THIS whenever the connector's saved KV byte layout or key
+# scheme changes. Concretely: any change to `vllm_connector._extract_layer` /
+# `_inject_layer` (the serialize/deserialize pair — e.g. the 2026-06-22
+# K/V-dim-order fix), to `_byte_view`, or to how keys are composed. Changing
+# that layout WITHOUT bumping = same failure class as BUG-KVC-TENANT: shapes
+# may still line up, nothing errors, output is silently garbage.
+# `test_tenant_identity.py` pins the current value so a bump is always a
+# deliberate, reviewed act (it cold-invalidates the whole vLLM pool).
+#
+# Lives here (not in `vllm_connector.py`, which imports the `autumn` native
+# module at top level) so the pure offline unit tests can import it.
+VLLM_KV_STORAGE_FORMAT = "v1"
+
 
 def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     """Build the per-tenant key suffix from a model/parallel config.

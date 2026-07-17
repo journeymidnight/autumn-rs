@@ -14,10 +14,14 @@ Fix: derive a deterministic fingerprint from what actually identifies the
 KV bytes — architecture shape (layers / hidden / kv-heads / head-size /
 vocab / dtype / quant / MLA) plus the weights source (`load_format` and, for
 the autumn loader, the autumn weights `path`) plus an optional operator
-`model_id` — and fold it into the tenant suffix. Everything here is pure
-(no vllm/torch/autumn imports) so it is unit-testable offline and, more
-importantly, deterministic across processes: the same deployment MUST map to
-the same tenant or the cache never hits.
+`model_id`, plus the LAYOUT versions (the running vLLM version and the
+connector's own `VLLM_KV_STORAGE_FORMAT`): the page byte layout is an
+internal detail of the vLLM build + this connector, so the same model on a
+different vLLM must not read the old bytes — and fold it into the tenant
+suffix. Everything here is pure at import time (no vllm/torch/autumn module
+imports; the vLLM version is a lazy, guarded lookup) so it is unit-testable
+offline and, more importantly, deterministic across processes: the same
+deployment MUST map to the same tenant or the cache never hits.
 
 Residual collisions this does NOT close (documented, not hidden):
 - same architecture + same weights identity source — e.g. two finetunes
@@ -31,6 +35,8 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any, Dict, Optional
+
+from ._keys import VLLM_KV_STORAGE_FORMAT
 
 # Length of the hex fingerprint folded into the tenant suffix. 12 hex chars
 # = 48 bits — collision-free for any realistic number of co-hosted models,
@@ -64,6 +70,30 @@ def fingerprint_from_sources(sources: Optional[Dict[str, Any]]) -> Optional[str]
     return h.hexdigest()[:FINGERPRINT_HEX_LEN]
 
 
+def vllm_runtime_version() -> Optional[str]:
+    """Best-effort version of the vLLM actually running, None if undetectable.
+
+    Lazy + guarded so this module stays importable (and offline-testable)
+    without vLLM installed. `vllm.__version__` (re-exported from
+    `vllm.version`) is the stable public spelling — verified present in the
+    pinned 0.23.0; package metadata is the fallback for exotic installs.
+    """
+    try:
+        import vllm  # noqa: PLC0415 — deliberate lazy import, vLLM path only
+
+        v = getattr(vllm, "__version__", None)
+        if v:
+            return str(v)
+    except Exception:  # noqa: BLE001 — broken/absent vllm must degrade
+        pass
+    try:
+        from importlib import metadata
+
+        return str(metadata.version("vllm"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
     """Extract model-identity sources from a vLLM `VllmConfig`, defensively.
 
@@ -77,6 +107,11 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
     its `path` is the autumn weights dir, the strongest identity we have).
     Every access is getattr/try-guarded: a missing field degrades to a
     smaller fingerprint, never an exception.
+
+    On top of the config-derived sources, folds in the two layout versions
+    (`vllm` = running vLLM version, `kv_layout` = the connector's
+    `VLLM_KV_STORAGE_FORMAT`) — see the inline comment for why and for the
+    full-version granularity decision.
     """
     src: Dict[str, Any] = {}
     mc = getattr(vllm_config, "model_config", None)
@@ -154,6 +189,34 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
         mid = extra.get("model_id")
         if mid:
             src["model_id"] = str(mid)
+    # ── layout versions (the "same model, incompatible bytes" axis) ─────────
+    # The KV page byte layout is NOT part of the model: it is an internal
+    # implementation detail of (a) the running vLLM build and (b) this
+    # connector's extract/inject code. Either changing without splitting the
+    # tenant is the same failure class as the tenant bug itself: shapes may
+    # happen to line up, nothing errors, output is silently garbage. So both
+    # versions are identity sources.
+    #
+    # FULL vLLM version (not major.minor): vLLM gives no stability contract
+    # for its internal KV-cache tensor layout, and patch releases do touch
+    # block shape / dtype packing / attention-backend selection. The asymmetry
+    # decides it — over-splitting costs ONE predictable cache re-warm per
+    # upgrade (pods restart and lose GPU cache anyway); under-splitting is
+    # silent garbage nobody notices. NOTE the operational consequence: ANY
+    # vLLM version change cold-invalidates the whole vLLM pool (README
+    # upgrade note).
+    #
+    # Gated on `src` being non-empty: versions distinguish nothing BETWEEN
+    # two models on the same stack, so a version-only fingerprint would only
+    # defeat the "unfingerprintable config ⇒ None ⇒ loud connector warning"
+    # contract.
+    if src:
+        ver = vllm_runtime_version()
+        if ver:
+            src["vllm"] = ver
+        # else: the connector warns loudly at init (vllm_connector.__init__) —
+        # this module is log-free/pure by design.
+        src["kv_layout"] = VLLM_KV_STORAGE_FORMAT
     return src
 
 

@@ -36,20 +36,19 @@ import autumn
 
 from ._bridge import new_loop, run, run_on
 from ._identity import tenant_cfg_from_vllm as _tenant_cfg_from_vllm
-from ._keys import build_tenant_suffix, full_key
+from ._keys import VLLM_KV_STORAGE_FORMAT, build_tenant_suffix, full_key
 
 log = logging.getLogger(__name__)
 
 # Separate keyspace pool segment from sglang's "kv" (docs §13.3).
 VLLM_POOL_NAME = "vllm"
 
-# Storage-format version baked into the key path. BUMP whenever the saved KV
-# byte layout or key scheme changes (e.g. the 2026-06-22 K/V-layout + mm-hash +
-# save-gate fixes) so a connector upgrade can NEVER load bytes saved by an
-# incompatible older connector under the same content hash — old entries simply
-# never match the new key and lazily expire. kvcache is a pure cache, so
-# invalidation-by-versioning is the correct (zero-migration) upgrade story.
-_KV_STORAGE_FORMAT = "v1"
+# The connector's own KV-layout / storage-format version. Moved to `_keys.py`
+# (pure, offline-testable + pinned by test_tenant_identity.py) — it is baked
+# into every key path AND the tenant fingerprint. BUMP it whenever
+# `_extract_layer` / `_inject_layer` / `_byte_view` / the key scheme changes;
+# see the invariant comment at its definition.
+_KV_STORAGE_FORMAT = VLLM_KV_STORAGE_FORMAT
 
 # When a TTL is configured, the layer pages are written with a longer TTL than
 # the `__present__` marker so the marker ALWAYS expires first. The scheduler
@@ -381,6 +380,11 @@ def _extract_layer(kv_layer: "torch.Tensor", slot_mapping, is_mla: bool, block_s
     the OUTERMOST dim, which scrambles K/V across blocks (it round-trips within
     one instance's identical block_ids but corrupts cross-instance, where
     block_ids differ). MLA is `(num_pages, page_size, ...)`.
+
+    INVARIANT: this function + `_inject_layer` define the saved byte layout.
+    Change it (or what it assumes about vLLM's paged-cache shape) ⇒ BUMP
+    `VLLM_KV_STORAGE_FORMAT` (`_keys.py`), or an upgraded connector silently
+    reads incompatible old bytes.
     """
     slot = slot_mapping.to(kv_layer.device)
     if is_mla:
@@ -399,6 +403,9 @@ def _inject_layer(
     Mirrors vLLM 0.23's `example_connector.inject_kv_into_layer` (see
     `_extract_layer` for the layout rationale). `value` is moved to the layer's
     device (it arrives on CPU from the autumn staging buffer).
+
+    INVARIANT: layout changes here ⇒ BUMP `VLLM_KV_STORAGE_FORMAT` (`_keys.py`)
+    — see `_extract_layer`.
     """
     slot = slot_mapping.to(kv_layer.device)
     val = value.to(kv_layer.device)
@@ -471,6 +478,19 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "if two different models are served with the same path (e.g. "
                 "autumn_vllm_loader's fixed config dir). Set "
                 "kv_connector_extra_config['model_id'] to disambiguate.",
+                self._tenant_suffix,
+            )
+        identity = getattr(tenant_cfg, "identity_sources", None) or {}
+        if _VLLM_AVAILABLE and identity and "vllm" not in identity:
+            # Should be near-impossible (vLLM imported fine but neither
+            # vllm.__version__ nor package metadata resolved) — but a tenant
+            # that silently drops the version source loses cross-version
+            # layout isolation, so degrade LOUDLY like the fingerprint path.
+            log.warning(
+                "vLLM is importable but its version is undetectable — tenant "
+                "%r carries no vLLM version, so a vLLM upgrade that changes "
+                "the internal KV page layout will NOT invalidate this cache "
+                "(risk: cross-version reads of layout-incompatible KV).",
                 self._tenant_suffix,
             )
         self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))

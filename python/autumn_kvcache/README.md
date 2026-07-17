@@ -79,7 +79,11 @@ short hash of the model's **identity**: architecture shape
 (layers / hidden / kv-heads / head-size / vocab / dtype / quantization / MLA)
 plus the weights source (`load_format`, and for `--load-format autumn` the
 autumn weights `path` from `model_loader_extra_config`), plus `model_id` if
-you set one.
+you set one, plus the **layout versions** — the running **vLLM version**
+(full `x.y.z`: the KV page layout is a vLLM-internal detail with no stability
+contract, patch releases included) and the connector's own storage-format
+version (`VLLM_KV_STORAGE_FORMAT`, bumped whenever the extract/inject byte
+layout changes).
 
 This exists because the model *path* is not an identity: with
 `autumn_vllm_loader` every model is served from the same fixed local config
@@ -91,12 +95,16 @@ distinguish your deployments — e.g. two finetunes with identical architecture
 loaded from the **same** path, or weights overwritten in place at one autumn
 path (don't do that — store new weights at a new path).
 
-> **Upgrade note:** introducing the fingerprint changes every vLLM-pool key,
-> so existing cached prefixes go cold and rebuild on first use (pure cache,
-> content-addressed — no migration needed). Keys written by older connectors
-> stay behind under the old tenant; with `ttl_secs=0` they never expire, so
-> reclaim them manually if you care about the space:
-> `client.batch_delete(b"kvc/<old-tenant>/vllm/")`.
+> **Upgrade note:** any change to the fingerprint inputs — **including every
+> vLLM version change, patch releases too** — moves the tenant, so the whole
+> vLLM pool goes cold and rebuilds on first use (pure cache, content-addressed
+> — no migration needed). This is deliberate: an upgrade already restarts the
+> pods (GPU cache is lost anyway), so the re-warm is a one-time, predictable
+> cost, whereas carrying KV across a layout-incompatible vLLM would be silent
+> garbage. Keys written by older connectors stay behind under the old tenant;
+> with `ttl_secs=0` they never expire, so reclaim them manually if you care
+> about the space: `client.batch_delete(b"kvc/<old-tenant>/vllm/")` (the old
+> tenant is in the previous deployment's startup log).
 
 **`ttl_secs`** (default `0` = no expiry) is the relative TTL after which an
 offloaded prefix stops being *served*. Content-addressed keys never invalidate,

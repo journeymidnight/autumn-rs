@@ -268,3 +268,73 @@ def test_mla_detection_wired_from_use_mla():
     ModelConfig.use_mla."""
     assert tenant_cfg_from_vllm(fake_vllm_config(FakeModelConfig(use_mla=True))).is_mla_model
     assert not tenant_cfg_from_vllm(fake_vllm_config(FakeModelConfig())).is_mla_model
+
+
+# ── layout versions: vLLM version + connector storage format split tenants ──
+# The KV page byte layout is an internal detail of the vLLM build and of the
+# connector's own extract/inject code — the same model on a different layout
+# must not share a tenant (same silent-garbage class as the tenant bug).
+
+from autumn_kvcache import _identity  # noqa: E402 — for monkeypatching
+from autumn_kvcache._keys import VLLM_KV_STORAGE_FORMAT  # noqa: E402
+
+
+def _mk7b():
+    return fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/q")
+
+
+def test_vllm_version_splits_tenant(monkeypatch):
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.23.0")
+    a = _tenant(_mk7b())
+    assert _tenant(_mk7b()) == a  # same version + same config ⇒ stable
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.24.0")
+    assert _tenant(_mk7b()) != a
+
+
+def test_vllm_patch_version_splits_tenant(monkeypatch):
+    """FULL-version granularity: patch releases can change internal KV layout
+    (no stability contract), so 0.23.0 vs 0.23.1 must not share a tenant.
+    Over-splitting = one predictable re-warm per upgrade; under-splitting =
+    silent garbage."""
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.23.0")
+    a = _tenant(_mk7b())
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.23.1")
+    assert _tenant(_mk7b()) != a
+
+
+def test_vllm_version_in_sources_and_undetectable_degrades(monkeypatch):
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.23.0")
+    src = vllm_identity_sources(_mk7b())
+    assert src["vllm"] == "0.23.0"
+    # undetectable version ⇒ key absent (connector warns loudly at init), but
+    # the model-identity fingerprint itself still derives
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: None)
+    src2 = vllm_identity_sources(_mk7b())
+    assert "vllm" not in src2
+    assert fingerprint_from_sources(src2) is not None
+
+
+def test_version_only_config_still_unfingerprintable(monkeypatch):
+    """Versions must not rescue an unfingerprintable config: they distinguish
+    nothing BETWEEN models, and a version-only fingerprint would suppress the
+    connector's loud tenant-collision warning."""
+    monkeypatch.setattr(_identity, "vllm_runtime_version", lambda: "0.23.0")
+    cfg = tenant_cfg_from_vllm(SimpleNamespace())
+    assert cfg.model_fingerprint is None
+    assert cfg.identity_sources == {}
+
+
+def test_kv_layout_version_splits_tenant(monkeypatch):
+    a = _tenant(_mk7b())
+    monkeypatch.setattr(_identity, "VLLM_KV_STORAGE_FORMAT", "v2")
+    assert _tenant(_mk7b()) != a
+
+
+def test_kv_layout_version_pinned_and_in_sources():
+    """Pin the connector storage-format version: it is baked into every
+    vLLM-pool key path AND the tenant fingerprint. Bump it DELIBERATELY —
+    together with an `_extract_layer`/`_inject_layer` layout change — never
+    accidentally: any change cold-invalidates the whole vLLM pool."""
+    assert VLLM_KV_STORAGE_FORMAT == "v1"
+    src = vllm_identity_sources(_mk7b())
+    assert src["kv_layout"] == "v1"

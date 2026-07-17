@@ -833,7 +833,13 @@ vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...` — the
 source + optional `model_id`; see `python/autumn_kvcache/autumn_kvcache/_identity.py`).
 Without it, every model served via `autumn_vllm_loader`'s fixed local config
 dir shared ONE tenant and cross-read KV (live 2026-07: Qwen2.5-7B/32B both
-under `kvc/model-cfg_0_1/`).
+under `kvc/model-cfg_0_1/`). The fingerprint also folds in the two **layout
+versions** — the running vLLM version (full `x.y.z`) and the connector's own
+`VLLM_KV_STORAGE_FORMAT` (`_keys.py`) — so the same model on a
+layout-incompatible stack never shares a tenant. Operational consequence:
+**every vLLM upgrade (patch releases included) moves the tenant and
+cold-invalidates the whole vLLM pool** — expected, one-time re-warm; the old
+tenant's keys need the same manual reclaim as below.
 
 ```bash
 # Offline unit tests (no cluster / engine / native module):
