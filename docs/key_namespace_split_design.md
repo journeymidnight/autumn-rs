@@ -302,6 +302,11 @@ rmtomb 通道要 D1+D6 一起才算闭环，单独 D1 只是缓解（伪造从"�
 规则：新内置应用不登记前缀不得合入 —— 这是主张 1 的制度化，也是
 §3.5 里 policy 层做 per-app 识别的数据基础。
 
+**D7 之后本注册表升格**：从"文档约定"变成 **etcd 落库的运行时
+注册表**（`namespace/<name>`，§3.7 ③）——文档表保留作 convention
+与编码规则的说明，运行时真相在 etcd；"client 裸 key 面"一行随
+D7 消亡（写入必须归属某 namespace）。
+
 ### 3.3 D3（P1 修复）：给 policy 一个看得见 VP 字节的 size 口径
 
 **关键观察：不需要任何新的 PS 侧计量，四个组件都已经在船上**：
@@ -477,12 +482,71 @@ P0 修复的定义从"D1"修正为"D1+D6"；§4 的实施顺序同步更新。
 
 ### 3.7 D7：写入强制归属 namespace（"类 table"，取消裸 key 写面）【已拍板】
 
-**决定（2026-07-16，用户）**："要写入的话，都要写到某一个 namespace
-下面（类似于 table），这可能涉及到 authz，修改 clusterclient。"
-即：**取消"client 裸 key"这个写入面** —— 任何写都必须先指明
-namespace，如同 HBase 必须指明 table。范围按用户原话锚定在
-**写入**（put/delete/batch/stream-put）；读/scan 不设限（运维
-`autumn-op ls`、调试、跨 namespace 巡检都需要裸读，见下"立场"）。
+**决定（2026-07-16，用户，两次细化 + 一次反转）**："要写入的话，
+都要写到某一个 namespace 下面（类似于 table），这可能涉及到 authz，
+修改 clusterclient"；细化："所以 clusterclient 也必须要带上
+namespace"。
+
+**default 兜底的决策轨迹（如实存档，回答"为什么没有 default"）**：
+用户最初细化为"未指明就写到 default namespace"（HBase 式默认值）；
+本文随即给出反对（"兜底把'忘指定'从错误变成静默行为，复活 D7 要
+消灭的模糊性"）+ 复核出的新事实（`meta/stats`/`idx/` 都在
+`mem/{t}/{a}/` 之下 → **现网真正的裸 key 只有 bench/ycsb 的一次性
+数据，根本没有需要 default 承接的东西**；perf-check 又因
+`key_for_partition` 的跨区构造反正要重设计）；用户据此**推翻了
+自己的 default 决定，采纳反对方案**。
+
+最终语义 = **强制归属，且必须显式**：任何写入都归属某个已注册
+namespace；**忘指定 namespace = 报错（fail-loud），不是静默落入
+default**；**`ClusterClient` 类型本身携带 namespace** ——"无归属的
+写"在类型层面表达不出来，连"无 ns 的 connect"都不存在。用户明知
+并接受的代价：每个客户端/工具都必须显式指定。范围按用户原话锚定在
+**写入**（put/batch/stream-put；delete 见 ②）；读/scan 不设限
+（运维 `autumn-op ls`、调试、跨 namespace 巡检都需要裸读，见 ⑤ 的
+例外机制）。
+
+**细化三（2026-07-17，用户）—— 三层模型 + tenant 强制 + 术语规则 +
+principal 改名**：
+
+1. **概念模型定稿为三层**：`{namespace}/{tenant}/{instance}/…`。
+   namespace = 应用族或用户建的命名键空间；**tenant = 归属/授权/
+   presplit 单位，`ClusterClient` 强制携带**；instance = 应用自定义
+   子容器，不进 ClusterClient。对称性是发现的而非发明的：
+   `fs/{tenant}/{volume}`、`mem/{tenant}/{agent}` 已是此形；kvc 缺
+   tenant 层，补齐为 `kvc/{tenant}/{model}/…`（`{model}` = BUG-KVC-
+   TENANT 的模型指纹段，从误名 "tenant_suffix" 归位为 instance）。
+2. **"tenant 是必须的吗"（存档论证）**：反方事实（内网系统）砍掉了
+   计费、敌意租户隔离、WAS-account 成例三个论据；幸存的论据与租户
+   是否真实无关 —— (a) 本集群近期全部事故都是自己人打自己人
+   （7B/32B 串读、rmtomb 通道、perf-check 越界写），**隔离段防的是
+   事故不是敌人**；(b) tenant 可选 = 键空间永远两种布局 + authz 对
+   无 tenant 数据没有可授权前缀 —— 恰是已否决的 default namespace
+   问题下移一层；(c) tenant 段已在生产 key 里（`mem/default/…`），
+   拆掉反而是更大迁移。结论：**结构强制 + 命名自由** —— 布局里永远
+   有 tenant 段、类型上必填；单团队部署把名字约定为 `"default"`，由
+   部署层 env 填充（`mem/` 今天就这么跑，零日常负担）。**内网轻量版
+   明确不建**：per-tenant 配额/计费/生命周期机制 —— tenant 是自由
+   标签，不注册、不占表。
+3. **术语规则（用户原话："namespace 的本质是一个 prefix，但从
+   clusterclient 和命令行都改成 namespace"）**：prefix 是**实现
+   细节，不出现在任何用户面** —— ClusterClient 参数、CLI flag、授权
+   表达全部使用 namespace/tenant 概念（授权 = principal →
+   (namespace, tenant) 对的集合，内部才降为 `allowed_prefixes` 字节
+   前缀）。presplit 的作用单位同样表达为"某 tenant 的某个
+   namespace" = pair 区间 `[ns/tenant/, ns/tenant0)`（§3.8 已修订）。
+   字节序维持 namespace 在外层（`{ns}/{tenant}/`）——"tenant 的
+   namespace"是归属语义的读法，与字节序无关；选外层 namespace 是为
+   与线上 `mem/default/` 现状及已拍板的 `fs/{tenant}/{volume}` 连续。
+4. **principal / tenant 分工改名**：key 段的归属继续叫 **tenant**；
+   持凭据的 authz 身份改叫 **principal**（今天 `autumn-op` 把它也叫
+   tenant，正是混乱之源）。`principal-create` 替代 `tenant-create`
+   （旧名留 alias），**1:1 为默认约定**：`principal-create --tenant
+   acme` = 建同名 principal 并授内置三族 pair
+   （`{fs,kvc,mem}/acme/`）；跨租户/粗粒度授权 = 显式
+   `--grant ns:tenant`。credential 校验随之精确化：connect 时验
+   `{ns}/{tenant}/ ⊆ 某 allowed_prefix`。这同时消解了 D6 接线里被迫
+   发明的 `auth_tenant`/`tenant_suffix` 双命名 —— kvc key 带上
+   tenant 后，principal 名即 key tenant，该补丁退役。
 
 **分层原则（本设计的骨架，先立后破）**：namespace 是
 **SDK + manager 元数据层**的概念，**绝不下渗到 partition/stream 层**
@@ -491,34 +555,71 @@ per-namespace 的 META 表或独立 region 空间（HBase 类比到 API 为止�
 存储层仍是单一全局 range 空间）。这与 §3.5 拒绝"partition 层识别
 app"是同一条原则的两面。
 
-**① ClusterClient API 形态 —— namespace 句柄（HBase `Table` 模式）**：
+**① ClusterClient API 形态 —— 类型自带 namespace 绑定（硬约束），
+无 ns 的 connect 不存在**：
 
 ```rust
-let ns = client.namespace("bench").await?;   // 校验存在 + 绑定（可携带该 ns 的 credential）
-ns.put(key, val).await?;                     // 实际写 key = b"bench/" ++ key
-ns.range(start, limit).await?;               // 扫描区间自动钳在 [bench/, bench0)
+// 每个 ClusterClient 实例都携带一个 NamespaceBinding = (namespace, tenant) ——
+// 没有"无归属"的实例，也没有能构造出它的入口：两个都是必填位置参数，不是 Option。
+// （细化三：术语上 API 只见 namespace/tenant，前缀拼接是 binding 内部实现。）
+pub struct ClusterClient { binding: NamespaceBinding, /* pools… */ }
+
+ClusterClient::connect(mgr, "bench", "default")      // namespace + tenant 都必填；旧单参 connect 不再编译
+ClusterClient::connect_with_credential(mgr, "mem", "acme", cred)
+                                                     // 绑定时即校验 mem/acme/ ⊆ 某 allowed_prefix
+client.rescope("kvc", "acme")?                       // 多 pair 工具：换作用域视图，共享连接池
 ```
 
-- **为什么是句柄而不是连接绑定或每调用传参**：连接绑定（一个
-  client 一个 ns）对单应用（fuse/kvcache）够用但堵死多 ns 工具；
-  每调用传参污染全部签名且易漏传。句柄两者兼得，且是 credential 的
-  天然挂载点（D6：一个 namespace 的 token 就绑在它的句柄上）。
-- **裸 key API 的去向**：`ClusterClient` 的裸 `put/delete` 改为
-  crate-private + `raw_` 前缀，仅供内置应用 crate（fuse/memory 经
-  自己的 key builder）与 admin 工具链使用；对外二进制入口
-  （`autumn-client put` 等）打仓库标准的 migration-error stub。
-- **改动面清单**（全部随 D7 一次改完）：
+- **绑定层选 (a)+(c) 混合，否决纯 (b)**：`ClusterClient` **实例即
+  namespace 作用域**（用户硬约束——类型携带，不是可选参数），
+  `put(key, value)` 签名不变、不出现 ns 参数；`rescope` 返回共享
+  连接池的新作用域视图，保住多 ns 工具（dashboard/迁移工具）。
+  纯 (b)（每调用传 ns）被否：污染全部签名、每个调用点都是漏传点，
+  恰好把"类型层面消灭无归属"的目的做反。
+- **忘指定 = 编译期/参数错误，没有运行时默认**：旧的单参
+  `connect(mgr)` 直接移除（编译不过 = 最响亮的 fail-loud）；脚本面
+  （CLI/PyO3）的 namespace 参数**必填、无缺省值**，缺参报错并提示
+  namespace 列表的查看方式。现网 bench/ycsb 调用方需要一次显式
+  改参 —— 用户已明知并接受这个代价（反正 perf-check 因 key 策略
+  也要动，见 §3.8）。
+- **两种组合模式（关键实现细节，避免内置应用双重前缀）**：
+  - `Prepend`（用户/普通 namespace）：写 key = `ns 前缀 ++ key`，
+    range 自动钳在 `[ns/, ns0)`。
+  - `Assert`（内置族 fs/kvc/mem）：fuse/memory/kvcache 的 key
+    builder（`key.rs`/`keys.rs`/`_keys.py`）今天产出的就是**绝对
+    key**，绑定不再拼前缀，只做 `starts_with(族前缀)` 校验、越界
+    即拒 —— key builder 三件套**零改动**，而 client 类型仍然携带
+    并强制 namespace。
+- **credential 与 binding 是否冗余（正面回答）—— 不冗余，是
+  "可写集合"与"正在写哪个"的关系**：credential（**principal**，
+  细化三改名）授权的 `allowed_prefixes` 是**集合**（一个 principal
+  可同时持有 `mem/acme/` 和 `kvc/acme/` 两个 pair 的授权，cap_token
+  的 `allowed_prefixes: Vec` 本来就是多元素设计），binding
+  (namespace, tenant) 选择本实例**当前作用域**是其中哪一个。从
+  credential 反推作用域在 |allowed_prefixes|≠1 时无解，对无
+  credential 的场景（未启 authz 的 dev 集群、未受保护的 namespace）
+  更无从推起。但两者**应当在同一处绑定**：
+  `connect_with_credential(mgr, ns, tenant, cred)` 在连接时即校验
+  "`{ns}/{tenant}/` ⊆ 某 allowed_prefix"（authz 启用且该 pair 受
+  保护时）—— 配错凭据在 connect 就 fail-fast，而不是第一次写才
+  PermissionDenied。1:1 约定（principal 名 = tenant 名）是内网默认，
+  见细化三第 4 条。
+- **裸 key 写面的去向**：`ClusterClient` 不再有公开裸写；admin/
+  迁移工具经 `raw()` 逃生舱（见 ⑤ 例外设计）。对外 CLI 缺
+  `--namespace` 的 `put`/`del` 打仓库标准的 migration-error
+  （报错并提示如何列出/创建 namespace）—— 没有静默默认。
+- **改动面清单 + 工作量估计**（全部随 D7 一次改完）：
 
-| 面 | 改动 |
-|---|---|
-| `crates/client/src/lib.rs` | `Namespace` 句柄类型（prefix 前置 + range 钳制 + per-ns credential）；裸写降级 `raw_*` |
-| PyO3（`python/src/lib.rs`） | `BatchClient(namespace=…)` / `Autumn.namespace("x")` 句柄 |
-| `autumn.Fs` / fuse mount / `autumnfs` | 无额外改动 —— D1 之后它们的 namespace 就是 `fs/{tenant}/{volume}/`，本来就经 key builder 全前缀化 |
-| kvcache（`_keys.py`）/ memory（`keys.rs`） | 已全前缀化（kvc/、mem/）；内部改走句柄属实现细节 |
-| `autumn-client` CLI | `--namespace`（put/get/del/head/ls） |
-| **perf-check / ycsb（必须重设计，见下）** | `--namespace`（默认 `bench/`）+ key 策略修正 |
-| manager | etcd `namespace/<name>` 注册表 + `MSG_GET_AUTHZ_CONFIG` 响应扩字段带 namespace 清单（wire bump）+ `namespace-create/delete` RPC |
-| PS | 写路径 membership 检查（复用 authz_gate 的前缀匹配基建，见 ②） |
+| 面 | 改动 | 量级 |
+|---|---|---|
+| `crates/client/src/lib.rs` | `NamespaceBinding` 字段 + Prepend/Assert 两模式 + `connect_ns`/`rescope` + credential 同点绑定校验 + `raw()` 逃生舱 | 大（本项主体，F-AUTHZ-1 Stage 3 量级） |
+| PyO3（`python/src/lib.rs`） | `BatchClient(namespace=…, tenant=…)` / `Client.connect(…, namespace=, tenant=)` **必填参数**（无缺省） | 小 |
+| `autumn.Fs` / fuse mount / `autumnfs` | Assert 绑定到 `fs/`；key builder 零改动 | 小 |
+| kvcache（`_keys.py`）/ memory（`keys.rs`） | Assert 绑定到 `kvc/`/`mem/`；builder 零改动 | 小 |
+| `autumn-client` CLI | `--namespace` + `--tenant` **必填**（缺参 = migration-error，无静默默认；用户面无 `--prefix`，细化三术语规则） | 小 |
+| **perf-check / ycsb（必须重设计，见 §3.8）** | key 策略改为"只在本 namespace 的分区集内做 partition-local 构造" | 中 |
+| manager | etcd `namespace/<name>` 注册表 + `MSG_GET_AUTHZ_CONFIG` 扩 namespace 清单（wire bump）+ `namespace-create/delete` RPC | 中 |
+| PS | 写路径 Layer A 检查（复用 authz_gate 前缀匹配基建，见 ②） | 小 |
 
 - **perf-check 的 key 策略在 D7 下是违规的，必须重设计**（复核
   `autumn_client/main.rs:25` 发现）：`key_for_partition` 生成的
@@ -529,6 +630,54 @@ ns.range(start, limit).await?;               // 扫描区间自动钳在 [bench/
   partition-local 构造。这不是附带损伤而是**修正了一个测量缺陷**，
   见 §3.8 的 perf 悖论。
 
+**①b key 字节是否前缀化 —— 显式 namespace 一律前缀化（Prepend/
+Assert，①）；"隐式区间"方案的否决论证存档**：
+
+default 兜底被反转后，"排除法定义的隐式 default"这个难题**随之
+消解** —— 但字节问题对显式 namespace 仍要回答：答案是**每个
+namespace 就是一个真实的 key 前缀**（普通 ns 由绑定 Prepend，
+内置族由 builder 产出 + Assert 校验），元数据式的"隐式区间归属"
+被彻底否决。以下对比原为 default 隐式 vs 前缀化而作，**其论据
+正是促成用户反转的材料，存档**（同时它们也是"永远不要引入
+排除法定义的 namespace"的一般性理由）：
+
+- **authz 单位（隐式：直接不成立）**：cap_token 的授权与 PS 的
+  检查是纯字节 `starts_with`（`authz.rs:198/237` —— check_range
+  要求整扫区间 ⊆ **单个** allowed_prefix，即"前缀是某 AP 的
+  扩展"）。排除法定义的 default 是**区间的并集，不是前缀**，在
+  这套机制里根本表达不出来 —— 隐式 default 永远不可能成为授权/
+  保护单位，除非扩 token 格式到区间列表（新机制，反对）。
+- **namespace-create 的"捕获"脚枪（隐式：致命；这是决定性论据）**：
+  隐式 default 的内容物与显式 namespace 只隔一次
+  `namespace-create` —— 若 default 里已存在以 `abc/` 开头的裸 key，
+  有人创建 namespace `abc/`，**那些 key 静默易主**：新 owner 可读
+  （若受保护则原写者从此被拒），且没有任何机制提示发生了什么。
+  避免它要求 create 前全区间扫描"新前缀下无存量 key"（贵）或者
+  接受静默捕获（不可接受）。前缀化天然免疫：`default/abc/…` 永远
+  不会被 `abc/` 捕获。
+- **Layer A 语义（隐式：退化为空话）**：隐式下任何 key 都"属于"
+  某处（不在显式前缀里就是 default）→ 存在性检查恒真、拒绝不了
+  任何东西。前缀化下，一个不带任何已注册前缀的 key = 有 bug 的
+  client → **fail-loud**。直接受益的例子就是 perf-check 的
+  partition-local key（§3.8）：前缀化会把它写别人分区的行为立刻
+  拒掉；隐式则静默归属、直到撞上受保护前缀才发现。
+- **presplit/边界稳定性（隐式：丑但可用；前缀化：干净）**：隐式
+  default 是 N 段 gap 的并集，且**每次 namespace-create 都改变它
+  的形状**；前缀化 default = `[default/, default0)` 单一区间，
+  SPLITS 语义与任何普通 namespace 完全一致（一条规则，零特例）。
+- **迁移代价（隐式的唯一论据，但在本集群 ≈ 0）**：④ 已核实现网
+  裸 key 只有 bench/ycsb 的一次性数据（可弃），且所有裸 key 写者
+  都是 in-repo 二进制、随停机批次同版本升级 —— "前缀化 = 又一次
+  全量迁移"的担忧在这个集群不成立。诚实代价：default 常驻数据每
+  key 多 8 字节；**假想中**某个持有珍贵裸 key 数据的集群才需要真
+  迁移（本仓库的部署模型本来就是全停全启）。
+
+**结论：前缀化（且最终连 default 本身也被反转掉了）。** 隐式方案
+省下的迁移在本集群约等于零，换来的却是三个永久特例（authz 表达
+不了、Layer A 空转、create 有捕获脚枪）线程般穿过 registry/authz/
+presplit 的每一处。存活下来的规则只有一条：**每个 namespace 就是
+一个真实的 key 前缀，没有任何例外形态。**
+
 **② 与 authz 的关系 —— 合并"身份"，分离"强制"（正面回答"能不能
 合并成一个概念"）**：
 
@@ -537,14 +686,18 @@ ns.range(start, limit).await?;               // 扫描区间自动钳在 [bench/
 一张 etcd 注册表（`namespace/<name>`：前缀、owner tenant（可选）、
 presplit 规格、created_at），PS 一条 poll 通道（现成的
 `MSG_GET_AUTHZ_CONFIG` 扩字段），一族 CLI（`namespace-create` 可
-选 `--with-tenant` 顺手建 owner 账户 = 包装现有 `tenant-create`）。
+选 `--with-tenant` 顺手建 owner principal = 包装 `principal-create`
+（原 `tenant-create`，细化三改名，旧名留 alias））。
 D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
 `owner != None` 的 namespace 自动 protected"取代。
 
 **不该合并的（强制拆两层，这是我坚持的边界）**：
 
-- **Layer A（存在性，D7 本体）**：写 key 必须落在**某个已注册
-  namespace** 的前缀区间内，否则拒（新错误码，语义=NotFound 类）。
+- **Layer A（存在性，D7 本体）**：**put 类**（put/batch-put/
+  stream-put）的 key 必须落在**某个已注册 namespace** 的前缀区间
+  内（default 前缀化后也是普通一员），否则拒（新错误码，语义=
+  NotFound 类）。delete 不检查 —— 它制造不出"无归属数据"，且受
+  保护数据的删除归 Layer B（这也让存量裸 key 清理无需开洞，⑤）。
   这个检查**不需要 token** —— 纯前缀匹配已注册清单，匿名连接也受检。
   开销与 authz_check 同级（短清单前缀匹配 + enabled 快门）。
 - **Layer B（所有权，D6 既有）**：**protected** namespace 还要求
@@ -566,6 +719,22 @@ D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
   bootstrap 预注册**，注册表粒度 = 顶层 family（`fs/` 一行，不是
   每个 volume 一行）——族内的多级结构（tenant/volume、tenant/agent）
   归应用自己管，Layer A 只查顶层归属（清单短、检查快）。
+  **tenant 不注册**（细化三内网轻量版：自由标签、不占表）——
+  (namespace, tenant) pair 是授权与 presplit 的**操作单位**，但不是
+  注册表行；pair 的存在由授权记录（principal 的 grants）和实际
+  key 自证。
+- **保留名与冲突检测**：`fs`、`kvc`、`mem`、`default` 是**保留名**，
+  `namespace-create` 对同名请求直接拒绝（内置三族由 bootstrap 注册
+  且不可删除；`default` 不是 namespace，保留纯为防混淆，见下条）。另加**前缀无关性
+  规则**：新名 X 使得 `X/` 与任何既有 namespace 前缀互为
+  `starts_with` 时拒绝创建（保证所有 namespace 区间两两不交，
+  Layer A/授权/presplit 的前缀匹配才无歧义）。
+- **`default` 的现状（反转后的准确语义）**：default **namespace**
+  已被否决（决策轨迹见本节头部）—— 不存在"未指明落 default"的
+  namespace，未指明 = 报错。今天 `"default"` 只作为**约定俗成的
+  tenant 名**存在（`mem/default/…` 线上现状；单团队集群的部署层
+  默认值，细化三）。它作为 namespace 名被保留（禁止创建）纯为
+  防混淆。
 - **删除**：`namespace-delete` = 前缀 batch_delete（range 扫 +
   批删，慢但低频）+ 摘注册表；**默认拒绝非空删除**（`--force`
   覆盖）。分区不需要同步 merge —— D3 修好后冷分区自然进 merge
@@ -583,10 +752,19 @@ D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
   子段（`autumn-memory/src/keys.rs:174-204`，全部经
   `agent_prefix` 前缀化），不在裸 key 面里，无需迁移。
 - 现网真实的裸 key 只有 bench/perf-check/ycsb 的一次性数据
-  （§1.2 的实测映射也只见这四类）——**可弃**。因此**不设
-  `default/` 兜底 namespace**：兜底会把"忘了指定 namespace"从
-  错误变成静默行为，恰好复活 D7 要消灭的模糊性。存量 bench key
-  随 D1 的停机批次批删；裸 CLI 入口打 migration stub（仓库惯例）。
+  （§1.2 的实测映射也只见这四类）——**可弃**。存量 bench key 随
+  停机批次批删；bench/ycsb 此后使用**显式** namespace（建
+  `bench/`，tenant 约定 `default` 或 `perf`），一次改参 —— 反正
+  perf-check 因 key 策略也必须重设计（§3.8）。未指明
+  namespace/tenant 的写入 = 报错，没有任何静默去向。
+- **kvc key 补 tenant 层（细化三）**：`kvc/{model}/…` →
+  `kvc/{tenant}/{model}/…`，随同一停机批次落地。kvc 是纯缓存
+  （内容寻址，冷失效即迁移完成），当前池仅数个 prompt —— 最低
+  代价时机。附带收益：D6 接线的 `auth_tenant`/`tenant_suffix`
+  双命名退役（principal 名即 key tenant）。
+- （本处原有一段写于 default 反转**之前**的"立场更新"，其内容已被
+  反转事实取代 —— default 兜底的完整决策轨迹统一存档于本节头部，
+  不再在此重复，防止两处轨迹漂移。）
 - **与 D1 同一个停机批次落地**：两者都是 client 可见的 key 面
   破坏性变更，一次停机吃掉两个 break，不分两次。
 
@@ -604,6 +782,24 @@ D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
   Layer B（protected 读也拒，D6 已做）覆盖 —— 存在性层管读没有
   增益只有摩擦。用户原话也只说了"写入"。
 - **反对 3 —— 不与 token 强绑**（②的分层论证）。
+- **反对 4 —— "ClusterClient 必带 namespace"对 admin/诊断路径是
+  过度约束，需要显式例外机制（用户邀请的反对，正面给出）**：
+  `autumn-op` 的全集群巡检（info/ls/policy 证据采集）、
+  `repair-metastream` 类修复工具、以及未来的 namespace 间迁移工具
+  都天然跨 namespace。例外设计：
+  - **读**：本就不设限（D7 范围锚定写入），scoped client 的读被
+    钳在本 ns 区间，`client.raw()` 视图给全区间读 —— 公开但文档
+    标注 admin-only，无需门禁（读的隔离由 Layer B 管，protected
+    读照拒）。
+  - **写**：`raw()` 视图的写**只绕过 client 侧的作用域钳制，不绕
+    过 PS 侧检查** —— Layer A/B 在服务端照常强制。即逃生舱只解
+    "工具要操作多个 namespace"，不解"绕过保护"（想绕 = 拿对应
+    namespace 的 token，没有后门）。
+  - **Layer A 只管 put 类（put/batch-put/stream-put），不管
+    delete**：delete 不可能制造"无归属数据"（Layer A 的目的是防
+    污染），而受保护数据的删除本来就归 Layer B 拒。这个收窄顺带
+    解决存量清理：迁移/清扫工具可以直接批删 legacy 裸 key，无需
+    给 Layer A 开洞。
 - **代价照实记**：≥7 个面的一次性破坏改动 + 一个 wire bump +
   新错误码 + 5 s 传播窗口的新失败模式 + perf-check 重设计。全部
   绑进 D1 的停机批次后，边际运维成本 ≈ 0，但代码量是本 doc 各项
@@ -625,10 +821,14 @@ because 它是 **per-table** 的；autumn 的 presplit 是
 时刻**（D7 给了它生命周期，这正是 HBase `create 'table', SPLITS`
 的形状）：
 
-- `namespace-create --presplit <SPEC>`：在**该 namespace 自己的
-  前缀区间** `[ns/, ns0)` 内按 SPEC 生成切点，逐点调 D4 的
-  `split --at KEY`（对空/新 namespace 就是切空分区 —— D4 已为此
-  放宽 `≥2 keys` 检查）。SPEC 形态：
+- **作用单位 = (namespace, tenant) pair（细化三，用户："presplit
+  也是对 tenant 的某一个 namespace"）**：`namespace-create
+  --presplit <SPEC>` 声明的是该 namespace 的**默认 SPEC**；实际
+  切分在 pair 区间 `[ns/tenant/, ns/tenant0)` 上执行 —— 内网轻量
+  版下 tenant 不注册，所以执行时机是**部署清单声明的初始 pair**
+  或运维显式 `presplit --namespace X --tenant Y`（后者就是在 pair
+  区间内逐点调 D4 的 `split --at KEY`；对空/新 pair 就是切空分区
+  —— D4 已为此放宽 `≥2 keys` 检查）。SPEC 形态：
   - `N:hexstring` —— 均分 hex 字符串空间（bench 类）；
   - `N:inode` —— fuse 族：volume mkfs 时在
     `fs/{t}/{v}/\x03[ino 低字节]` 上切（**mkfs 时 tenant/volume
@@ -639,11 +839,12 @@ because 它是 **per-table** 的；autumn 的 presplit 是
   部署清单（entrypoint/autumn-deploy 的 manifest），每个
   namespace 自带自己的规则 —— **D5a（部署层外露 presplit 模式）
   被本项取代（superseded）**，不再单独做。
-- **kvc 的边界照实承认**：tenant 含模型指纹，namespace-create
-  （kvc/ 族注册）时也不知道 —— per-namespace presplit 对 kvc
-  依旧够不着 tenant 维度。kvc 的摊开 = tenant 首次出现后
-  `split --at`（D4，可由 controller 在观察到新 tenant 前缀时自动
-  执行），加 D3 修好的自动分裂兜底。**presplit 与 split --at 是
+- **kvc 的边界照实承认（细化三后重述）**：kvc 补 tenant 层后，
+  pair `[kvc/acme/, kvc/acme0)` 在部署时已知、可 presplit；但
+  pair **之内**按模型摊开仍够不着 —— `{model}` 是指纹，模型部署
+  时才出现。kvc 的模型级摊开 = 指纹首次出现后 `split --at`（D4，
+  可由 controller 在观察到新 model 前缀时自动执行），加 D3 修好
+  的自动分裂兜底。**presplit 与 split --at 是
   互补而非竞争；两者都以 D3 为前提**（否则糟糕的初始切分永远等
   不到纠正）。
 
@@ -665,8 +866,9 @@ because 它是 **per-table** 的；autumn 的 presplit 是
 - 订正之后，悖论的诚实形态依然成立且值得写：**perf-check 的分布
   假设（构造均匀）≠ 真实负载的分布（fs/kvc 单分区塌缩）**，所以
   绿色的 bench 数字对真实负载没有预测力 —— 与"presplit 方便测试"
-  的预期相反。D7+D8 之后 bench 在自己 namespace 里、真实负载在
-  各自 namespace 里，各自按各自的 SPLITS 分布，**数字第一次可比**。
+  的预期相反。D7+D8 之后 bench 在**显式**的
+  `bench/` namespace 里（tenant 约定 `perf`）、真实负载在各自
+  pair 里，各自按各自的 SPLITS 分布，**数字第一次可比**。
 
 ---
 
@@ -678,14 +880,21 @@ because 它是 **per-table** 的；autumn 的 presplit 是
 | D2 注册表 | 无 | 无 | 文档 |
 | D3 est_live | 无 | 无 | manager 二进制升级即可（全停全启惯例） |
 | D4 split --at | 无 | SPLIT_PART req +1 字段（WIRE bump，MIN=MAX） | same-commit 停机部署（仓库惯例） |
-| D5a presplit 模式外露 | 无 | 无 | entrypoint.sh / autumn-deploy 各一行 + 文档 |
-| D6 authz 彻底启用（fs/、kvc/、mem/ 全部 enforce，已拍板） | etcd `tenantAccount/` 账户 + k8s Secret（签名私钥、各端 credential） | 无（RPC 全部已有） | manager 加 `--auth-signing-key-file` + `--auth-protected-prefix`×3（部署层 env 化）；fuse mount / PyO3 / autumnfs 补 credential 接线；按 mem/→kvc/→fs/ 分前缀灰度，凭据先行（§3.6） |
+| ~~D5a presplit 模式外露~~ | — | — | **被 D8 取代（superseded）**：bootstrap presplit 退役，部署清单按 namespace 声明 SPLITS |
+| D6 authz 彻底启用（fs/、kvc/、mem/ 全部 enforce，已拍板） | etcd `tenantAccount/` 账户 + k8s Secret（签名私钥、各端 credential） | 无（RPC 全部已有） | manager 加 `--auth-signing-key-file`（protected 清单在 D7 后来自 namespace 注册表的 owner 标记）；fuse mount / PyO3 / autumnfs 补 credential 接线；按 mem/→kvc/→fs/ 分前缀灰度，凭据先行（§3.6） |
+| D7 写入强制归属 namespace（已拍板） | etcd `namespace/<name>` 注册表 | `MSG_GET_AUTHZ_CONFIG` 响应扩 namespace 清单 + namespace-create/delete RPC + 新错误码（WIRE bump） | **与 D1 同一停机批次**（两个 key 面破坏一次吃掉）；裸 CLI 写入口打 migration stub；存量 bench 裸 key 批删；perf-check/ycsb key 策略重设计 |
+| D8 per-namespace presplit（已拍板） | 无（复用 D4 split --at + D7 注册表） | 无新增（骑 D4/D7 的变更） | `namespace-create --presplit SPEC`；bootstrap `--presplit N:kind` 退役；fuse 族在 volume mkfs 时切；kvc tenant 维度靠 split --at 事后切 |
 
-推荐实施顺序：**D3 →（校准观察）→ D6-mem（今天就能开）→ D1+D2 →
-D6-fs/kvc → D4 → D5a**。D3 无破坏且 independently valuable；D6 按
-§3.6 的灰度轴拆三步 —— `mem/` 无依赖先开，`kvc/` 等 Python credential
-接线，`fs/` 硬依赖 D1（前缀先于保护）；D1 需要停机窗口，单独排
-（数据盘点已完成，见 §3.1 —— 全部可再生，重灌路径已定）。
+推荐实施顺序：**D3 →（校准观察）→ D6-mem（今天就能开）→ D4
+（split --at，为 D8 备好原语）→【停机批次：D1 + D7 + D2 注册表
+落库】→ D6-fs/kvc → D8（随部署清单 + 后续 namespace-create 生效）**。
+理由：D3 无破坏且 independently valuable，是一切分裂纠错的前提；
+D6-mem 无依赖先开，把 enforcement 跑热；D4 是纯增量 wire 变更，
+先行使 D8 到位即用；**D1 与 D7 是仅有的两个 key 面破坏性变更，
+必须同一停机批次**（一次停机吃掉两个 break，数据盘点已完成——
+全部可再生，重灌路径已定，见 §3.1）；D6-fs/kvc 在前缀 + credential
+接线就绪后按灰度轴推进；D8 本体几乎没有独立代码（= D7 注册表 +
+D4 原语的组合），随清单落地。D5a 已被 D8 取代。
 
 ---
 
@@ -713,6 +922,34 @@ prefix 并启用 enforcement。完整设计（机制盘点、缺口清单、灰�
 client 根本写不进去，"劝阻"问题不复存在（SDK 文档仍应说明这三个
 前缀受保护）。
 
+**已拍板（2026-07-16）— D7 写入强制归属 namespace + D8 per-namespace
+presplit（含两次细化 + 一次反转）**：所有写入必须**显式**归属某个
+namespace；**`ClusterClient` 类型必须携带 namespace**，无参 connect =
+**报错（fail-loud）**，"无归属"在类型层面不可表达。**没有 default 兜底
+namespace**——用户最初细化为"未指明就写 default"，随后据新事实（现网裸
+key 只剩可弃的 bench/ycsb 数据；`meta/stats`/`idx/` 实际在 `mem/` 之下）
+**反转**，采纳"忘指定 = 错误而非静默落 default"（决策轨迹见 §3.7①）。
+排除法定义的区间在 authz 机制里表达不出来（`check_range` 要求整扫区间 ⊆
+单个 allowed_prefix，纯字节 starts_with，authz.rs:198/237），这也从机制
+上支持了"无 default"。presplit 锚点从 bootstrap 移到 namespace-create
+（`bootstrap --presplit` 退役、D5a 被取代）。完整设计 = §3.7 / §3.8。
+
+**已拍板（2026-07-17）— 三层模型 + tenant 强制（内网轻量版）+ 术语
+规则 + principal 改名**：概念模型定稿
+`{namespace}/{tenant}/{instance}`（instance = volume/model/agent，
+归 app 自管）；tenant **结构强制**（ClusterClient/CLI 必填）、
+**命名自由**（部署层默认 `"default"`）、**不建租户机制**（内网：无
+配额/计费/生命周期，tenant 不注册）；kvc key 补 tenant 层
+`kvc/{tenant}/{model}/…`（随停机批次，纯缓存冷失效 = 零迁移）；
+**API/CLI 只讲 namespace/tenant，prefix 是实现细节**（用户原话：
+"namespace 的本质是一个 prefix，但从 clusterclient 和命令行都改成
+namespace"）；授权 = principal → (namespace, tenant) 集合，
+`principal-create` 替代 `tenant-create`（1:1 默认 + `--grant`
+例外）；presplit 单位 = pair `[ns/tenant/, ns/tenant0)`。**原待拍板
+第 4 项（注册表粒度 / CLI 归并形态）随之解决**：注册表仍按
+namespace 一行、tenant 不注册，授权/presplit 操作粒度 = pair，CLI
+归并为 principal-create。完整论证 = §3.7 细化三。
+
 仍待拍板：
 
 1. **D3 之后 SPLIT_SIZE_HARD/MERGE_SIZE_LOW 是否需要重标定**：新口径
@@ -724,6 +961,8 @@ client 根本写不进去，"劝阻"问题不复存在（SDK 文档仍应说明�
 3. **D6 的 token TTL 取值与凭据投递细节**（小时级 vs 天级；k8s
    Secret 的命名/挂载约定）—— 属实施细节，可在 D6-mem 灰度第一步时
    顺手定。
+（原第 4 项"注册表粒度 / CLI 归并形态"已由 2026-07-17 拍板解决，
+见上方已拍板块。）
 
 ---
 
@@ -731,7 +970,9 @@ client 根本写不进去，"劝阻"问题不复存在（SDK 文档仍应说明�
 
 - ✅ "policy 的 size 建立在看不见 VP 数据的指标上，大 value 负载下
   自动分裂/合并失效"——**成立**，机制细节见 §0/§2.2。
-- ✅ kvc key 形态 `kvc/{tenant}/vllm/v1/{hash}/{layer}`、hexstring/fuse
+- ✅ kvc key 形态 `kvc/{tenant}/vllm/v1/{hash}/{layer}`（注：该段当时
+  名为 tenant，实为模型指纹 —— 细化三已归位为 instance，kvc 将补
+  真正的 tenant 层）、hexstring/fuse
   两个 presplit 的切法、部署硬编码 hexstring、fuse key 无前缀、线上
   key→partition 映射——**全部与代码/实测一致**。
 - ✏️ "`size_bytes` 无 writer / 恒 0"（manager CLAUDE.md 原文）——

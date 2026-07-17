@@ -1,6 +1,28 @@
 Date: 2026-07-16
 TaskStatus: not_completed
 
+---- F-KEY-NS design finalization: 三层模型 + tenant 强制 + 术语规则 (2026-07-17) ----
+TaskStatus: completed
+Scope: DESIGN ONLY (per new CLAUDE.md teammate rules: main agent = design).
+  User decisions folded into docs/key_namespace_split_design.md + feature_list:
+  (1) 三层模型 {namespace}/{tenant}/{instance} — instance = volume/model/agent;
+  (2) tenant 结构强制（ClusterClient/CLI 必填）+ 命名自由（部署默认 "default"）
+      + 内网轻量（不建配额/计费/生命周期，tenant 不注册）。论证过程存档于
+      §3.7 细化三（内网事实砍掉计费/敌意租户/WAS 论据；幸存论据=防事故、
+      单一布局、authz 前缀单位）；
+  (3) 术语规则：prefix 是实现细节，API/CLI 只讲 namespace/tenant；授权 =
+      principal → (ns, tenant) 集合；presplit 单位 = pair [ns/tenant/, ns/tenant0)；
+  (4) principal 改名（原 authz "tenant"）：principal-create 替代 tenant-create
+      （alias 保留），1:1 默认约定；
+  (5) kvc key 补 tenant 层 kvc/{tenant}/{model}/…（随 D1 停机批次；纯缓存
+      冷失效=零迁移；D6 的 auth_tenant/tenant_suffix 双命名随之退役）。
+  §5 原待拍板第 4 项（注册表粒度/CLI 归并）随之解决；剩 3 项待拍板。
+  同轮清掉了 doc 里 default 反转的全部残留（§3.7①④、§3.8 尾部、
+  feature_list F-NS-FIRST-CLASS——后者即 coco P3）。
+Next: 实现顺序不变 D4 → 停机批次(D1+D7+D2+kvc-tenant) → D6-fs/kvc → D8。
+  实现按 CLAUDE.md 分工交 teammate（代码=opus，部署=sonnet）。
+
+
 ---- F-AUTHZ-BUILTIN D6-mem/kvc client wiring (2026-07-17) ----
 TaskStatus: completed
 Scope: client-side credential plumbing ONLY (user: 不用管线上，先写代码).
@@ -132,8 +154,34 @@ Update 3 (同日): §5.4 也拍板 —— authz 彻底启用覆盖 fs/kvc/mem（
   新增宽限期=TTL 的控制面依赖）。§4 顺序改 D3→D6-mem→D1+D2→D6-fs/kvc→
   D4→D5a; §5 "client 裸 key 劝阻" 被 D6 消解, 待拍板剩阈值重标定/kvc 分档/
   TTL 取值与 Secret 投递。feature_list 加 F-AUTHZ-BUILTIN 子项。
-Next steps: 用户拍板 §5 剩余项 → 按 D3(F-POLICY-SIZE-EST-LIVE) 先行、
-  D6-mem 次之的顺序实施。
+Update 4 (同日): 两条新拍板 —— D7 写入强制归属 namespace（类 table, 取消裸
+  key 写面; doc 新增 §3.7: SDK Namespace 句柄/Layer A 存在性检查只管写不管读/
+  与 authz 合并身份分离强制/etcd namespace 注册表/不设 default 兜底/与 D1 同
+  停机批次; 反对点写明: namespace 不下渗存储层、不与 token 强绑）+ D8
+  per-namespace presplit（§3.8: 锚点从 bootstrap 移到 namespace-create =
+  HBase per-table SPLITS; bootstrap presplit 退役, D5a superseded; kvc tenant
+  维度仍靠 split --at）。订正 team-lead 两处: meta/stats、idx/ 不是裸键（在
+  mem/{t}/{agent}/ 下, keys.rs:174-204）; perf-check key 是 partition-local
+  构造（key_for_partition = start_key++"!"++tag, main.rs:25）→ 结构性看不见
+  热点且 D7 下会写进他人 namespace 须重设计; 45s put 是 BUG-MGR-RETRY-CLASS
+  不是热点证据。§4 顺序改 D3→D6-mem→D4→【停机: D1+D7+D2】→D6-fs/kvc→D8。
+  feature_list 加 F-NS-FIRST-CLASS/F-PRESPLIT-PER-NS, F-PRESPLIT-DEPLOY-MODE
+  superseded。
+Update 5 (同日): D7 两次细化落档 —— (i) 未指明写入 → default namespace
+  （强制归属但有默认值, HBase 同构; 无参 connect 零改动）; (ii) ClusterClient
+  类型必须携带 namespace（NamespaceBinding 字段; Prepend/Assert 两模式, 内置
+  三族 key builder 零改动; credential 与 ns 同点绑定 fail-fast, 二者不冗余=
+  可写集合 vs 当前作用域）。关键取舍: default **前缀化** 而非隐式（不附和
+  team-lead 的隐式倾向）—— 决定性论据: 隐式 default 的存量 key 会被后来的
+  namespace-create 静默捕获易主; 另 authz 纯 starts_with 表达不了排除法区间
+  (authz.rs:198/237), Layer A 恒真空转; 本集群迁移代价≈0（裸 key 仅可弃
+  bench 数据）。default 语义: 无 owner 不受保护不可删; 保留名 fs/kvc/mem/
+  default + 前缀无关冲突检测; Layer A 收窄为只管 put 类不管 delete（存量
+  清理免开洞）; admin 例外 = raw() 只绕 client 钳制不绕 PS 强制。doc §3.7
+  ①/①b/②/③/④/⑤ + §3.8 + §4 D7 行 + §5 已拍板块全部更新; feature_list
+  F-NS-FIRST-CLASS 重写。注意: doc 已被 team-lead 提交过一版（git M 状态）,
+  本会话工作区改动在其上, 本会话仍不 commit。
+Next steps: 用户拍板 §5 剩余 4 项 → 按 doc §4 顺序实施（D3 先行）。
 
 ---- Concurrent task (same day, separate) ----
 Date: 2026-07-16
