@@ -347,7 +347,7 @@ est_live_bytes(part) =
 
 两个补强：
 
-- **`autumn-op split <PART> --at <KEY>`**（新增，小改动）：操作员/
+- **`autumn-op split <PART> --at …`**（新增，小改动）：操作员/
   controller 指定切点，PS 校验 in-range 后跳过 median 选点直接走既有
   `multi_modify_split`。用途：(a) 对**空或数据極少**的 partition 做
   事后 presplit（tenant 出现后再按 `kvc/{tenant}/vllm/v1/{00→ff}` 切 ——
@@ -355,6 +355,21 @@ est_live_bytes(part) =
   原语。需要 wire 变更（SPLIT_PART req 加 optional key 字段，WIRE bump，
   照例 same-commit 部署）。注意放宽 `user_keys.len() >= 2` 检查仅限
   显式 `--at` 路径（median 路径保持原判定）。
+
+  **CLI 面细化（2026-07-17，用户："指定切点时不应当加上 namespace 和
+  tenant 吗" —— 对，且正是细化三术语规则对本项的落地）**：分两层——
+  - **wire/机制层不带 namespace**：SPLIT_PART 的切点字段保持裸字节
+    key，partition 层继续不认识 namespace（D5 分层不破）；D8 的
+    controller 等程序化调用方直接给裸 key。
+  - **CLI 用户面带**：常规形态 `autumn-op split <PART>
+    --namespace <ns> --tenant <t> --at <pair内后缀>`（含二进制后缀的
+    hex 变体），工具组装切点 = `{ns}/{tenant}/ ++ suffix` 后走同一条
+    wire；**空 suffix = 恰好切在 pair 边界上**（把两个 tenant 分进
+    不同 partition 的常用操作）。组装后除 PS 权威 in-range 校验外，
+    CLI 可先验 pair 与目标 partition 区间相交，给出更可读的错误。
+    裸 key 形态保留为显式标注的逃生舱 flag（与 D7 ⑤ `raw()` 同
+    待遇：admin-only 文档标注，不是常规路径）—— 操作员日常**不该
+    手拼前缀字节**。
 - **字节量中位数（不做，记录理由）**：median-by-key-count 对 fuse 是
   近似字节均衡的（extent 定长 ≤8 MiB）；对混合负载会偏，但修它需要
   SST 侧按 key 累计 VP 字节直方图 —— 在 D3 + `--at` 之后没有剩余的

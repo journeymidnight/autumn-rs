@@ -977,6 +977,58 @@ chaos verify phase's STORAGE-ACCOUNTING invariants (see [Chaos suites](#chaos-su
 — it reads the manager's etcd at a pinned revision and cross-checks every
 extent's `refs` against live stream membership.
 
+## Explicit split point — `autumn-op split --at` (F-SPLIT-AT-KEY / D4)
+
+`split PART_ID` with no extra flags lets the PS pick the median of the live keys
+(legacy). To cut at an **operator-chosen** point — e.g. to pre-split an empty /
+near-empty partition, or split two tenants into different partitions — name the
+point on the CLI. The user-facing form speaks **namespace + tenant**, never raw
+prefix bytes (the partition layer stays namespace-agnostic; the CLI assembles
+the key and the wire carries only raw bytes):
+
+```bash
+# Cut exactly at the pair boundary "kvc/acme/" — splits tenant `acme` (and
+# everything sorting >= it) off into a new partition. Empty/omitted suffix =
+# the boundary itself.
+$AO split PART_ID --namespace kvc --tenant acme --at ""
+
+# Cut inside a pair at a text suffix -> key = "kvc/acme/" ++ "vllm/v1/80".
+$AO split PART_ID --namespace kvc --tenant acme --at vllm/v1/80
+
+# Binary suffix (e.g. an fs inode prefix) via hex -> key = "fs/t1/" ++ 0x0103ff.
+$AO split PART_ID --namespace fs --tenant t1 --at-hex 0103ff
+
+# ADMIN escape hatch only (documented admin-only, like D7 raw()): a whole raw
+# key, no namespace/tenant assembly. Operators should NOT hand-build prefixes.
+$AO split PART_ID --at-raw-hex 6b76632f61636d652f
+```
+
+Rules & behavior:
+- The assembled key must land **strictly inside** the target partition's
+  `[start, end)` (equal to `start`, equal to/`>=` `end`, or out of range are all
+  rejected). The CLI does a friendly pre-check (readable error naming your
+  ns/tenant/suffix); the **PS is the authoritative validator**.
+- With an explicit `--at`, an **empty or near-empty** partition can be split
+  (the `>= 2 keys` gate is skipped) — this is the presplit primitive: cut an
+  empty pair into two empty children. Without `--at`, an empty partition is
+  still refused (`< 2 keys`).
+- `--namespace` / `--tenant` are both-or-neither; `--at` / `--at-hex` require
+  them. `--at-raw-hex` is mutually exclusive with all of the above.
+
+Manual verification (memory-mode loopback recipe, no etcd):
+```bash
+# 1. Bring up a 1-manager / 2-EN / 1-PS loopback cluster (see the dev recipe).
+# 2. Create an EMPTY partition covering the keyspace, then presplit it at a
+#    tenant boundary and confirm the region count goes 1 -> 2 with the new
+#    boundary == the assembled key:
+$AO info --json | jq '.partitions | length'          # -> 1
+$AO split <PART> --namespace kvc --tenant acme --at "" --json
+$AO info --json | jq '.partitions | length'          # -> 2
+$AO info --json | jq -r '.partitions[].start_key'    # one range starts at kvc/acme/
+# 3. Negative: a point outside the range is rejected up front:
+$AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-zero
+```
+
 ## Chaos suites
 
 ```bash

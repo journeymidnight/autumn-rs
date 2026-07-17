@@ -86,8 +86,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 23;
-pub const WIRE_VERSION_MAX: u32 = 23;
+pub const WIRE_VERSION_MIN: u32 = 24;
+pub const WIRE_VERSION_MAX: u32 = 24;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -251,6 +251,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // `policy_kind_names` entry (cluster-level region→PS rebalance advisory kind
     // for the dashboard auto-policy). Additive const + name-map row.
     (23, "6b0224cb5e4f13f3"),
+    // v24 — F-SPLIT-AT-KEY (design doc D4): `SplitPartReq` grew
+    // `at_key: Option<Vec<u8>>` (operator/controller-specified split point;
+    // `None` = legacy median selection). Additive rkyv field on an admin
+    // (region_epoch-exempt) request struct. Pre-R3: MIN=MAX=24 (same-commit
+    // deploy; rkyv has no cross-version decode).
+    (24, "eeaf88720200e4da"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

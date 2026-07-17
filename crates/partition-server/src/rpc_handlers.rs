@@ -1099,6 +1099,17 @@ fn split_freeze_deadline(freeze_ttl: Duration, call_timeout: Duration) -> Durati
         .saturating_sub(Duration::from_secs(2))
 }
 
+/// Render an arbitrary byte string (e.g. a `split --at` key or a partition
+/// range bound, which may contain binary bytes) as lowercase hex for error
+/// messages. Local helper to avoid pulling the `hex` crate into this crate.
+fn hex_str(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 pub(crate) async fn handle_split_part(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -1201,35 +1212,85 @@ pub(crate) async fn handle_split_part(
             })?
     };
 
-    // F262: async window scan over the (paged) SSTs — snapshot readers +
-    // sc under one brief borrow, drop, await (note 15). Reader set is
-    // stable: this path holds maintenance_gate.
-    let (uuk_readers, uuk_sc) = {
-        let p = part.borrow();
-        (p.sst_readers.to_vec(), p.stream_client.clone())
-    };
-    let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc)
-        .await
-        .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
-    // coco P2 (F262): sample the memtable AFTER the (long) SST scan, so
-    // writes that landed during it still count toward the `< 2 keys`
-    // check and the midpoint choice.
-    let uuk_mem_items = collect_mem_items(&part.borrow());
-    let user_keys = finalize_unique_user_keys(&uuk_mem_items, sst_seen)
-        .into_iter()
-        .filter(|k| in_range(&auth_rg, k))
-        .collect::<Vec<_>>();
-    if user_keys.len() < 2 {
-        return Err((
-            StatusCode::FailedPrecondition,
-            format!(
-                "part has fewer than 2 in-range keys (have {}; run major compaction first)",
-                user_keys.len()
-            ),
-        ));
-    }
+    // F-SPLIT-AT-KEY (design doc D4): the split point comes from one of two
+    // sources.
+    //   * EXPLICIT (`req.at_key = Some`): an operator/controller names the
+    //     point. We validate it lies STRICTLY inside the authoritative
+    //     `(start_key, end_key)` and use it verbatim — SKIPPING the (paged) SST
+    //     key scan AND the `>= 2 keys` gate. This is what lets an empty / near-
+    //     empty partition be presplit (cut into two empty children; D8 relies
+    //     on it). The PS stays app-agnostic (D5): `at_key` is an arbitrary byte
+    //     string, no namespace/prefix awareness.
+    //   * IMPLICIT (`req.at_key = None`, legacy): median-by-key-count over the
+    //     live in-range user keys, still gated at `>= 2 keys`.
+    let mid = if let Some(at_key) = req.at_key.clone() {
+        // In-range check is STRICT on both ends:
+        //   at_key <= start_key ⇒ empty/backwards left child ⇒ reject.
+        //   at_key >= end_key   ⇒ empty right child / out of range ⇒ reject
+        //                         (end_key is the exclusive upper bound; an
+        //                          empty end_key means +∞, so only the low
+        //                          bound applies).
+        // `in_range(rg, k)` accepts `k == start_key` (it is the range's own
+        // lower bound), which is NOT a valid split point, so we check the
+        // bounds explicitly here rather than reusing it.
+        // NOTE: this validation runs BEFORE the freeze block below, so there is
+        // no `frozen_for_split` to clear on the reject path; the RAII
+        // maintenance_gate / compact_permit drop on return.
+        if at_key.as_slice() <= auth_rg.start_key.as_slice() {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "split --at key {} is at or below partition start {} \
+                     (must be strictly inside [start, end))",
+                    hex_str(&at_key),
+                    hex_str(&auth_rg.start_key),
+                ),
+            ));
+        }
+        if !auth_rg.end_key.is_empty() && at_key.as_slice() >= auth_rg.end_key.as_slice() {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "split --at key {} is at or above partition end {} \
+                     (must be strictly inside [start, end))",
+                    hex_str(&at_key),
+                    hex_str(&auth_rg.end_key),
+                ),
+            ));
+        }
+        at_key
+    } else {
+        // F262: async window scan over the (paged) SSTs — snapshot readers +
+        // sc under one brief borrow, drop, await (note 15). Reader set is
+        // stable: this path holds maintenance_gate.
+        let (uuk_readers, uuk_sc) = {
+            let p = part.borrow();
+            (p.sst_readers.to_vec(), p.stream_client.clone())
+        };
+        let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc)
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
+        // coco P2 (F262): sample the memtable AFTER the (long) SST scan, so
+        // writes that landed during it still count toward the `< 2 keys`
+        // check and the midpoint choice.
+        let uuk_mem_items = collect_mem_items(&part.borrow());
+        let user_keys = finalize_unique_user_keys(&uuk_mem_items, sst_seen)
+            .into_iter()
+            .filter(|k| in_range(&auth_rg, k))
+            .collect::<Vec<_>>();
+        if user_keys.len() < 2 {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "part has fewer than 2 in-range keys (have {}; run major compaction \
+                     first, or pass an explicit split point via `split --at`)",
+                    user_keys.len()
+                ),
+            ));
+        }
 
-    let mid = user_keys[user_keys.len() / 2].clone();
+        user_keys[user_keys.len() / 2].clone()
+    };
     let (log_stream_id, row_stream_id, meta_stream_id) = {
         let p = part.borrow();
         (p.log_stream_id, p.row_stream_id, p.meta_stream_id)

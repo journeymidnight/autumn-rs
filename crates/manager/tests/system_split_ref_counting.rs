@@ -75,7 +75,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("split");

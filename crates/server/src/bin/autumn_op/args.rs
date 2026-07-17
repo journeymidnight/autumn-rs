@@ -38,7 +38,7 @@ fn usage() -> ! {
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring|N:fuse]");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
-    eprintln!("  split <PARTID>");
+    eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
     eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
     eprintln!("  compact <PARTID>");
@@ -85,6 +85,75 @@ pub(crate) struct Args {
     pub(crate) json: bool,
     pub(crate) transport: TransportKind,
     pub(crate) cmd: Command,
+}
+
+/// F-SPLIT-AT-KEY (D4) — where `autumn-op split` cuts the partition.
+///
+/// The wire (SPLIT_PART) only ever carries a RAW byte key (partition layer is
+/// namespace-agnostic, D5). This enum is the CLI-side INTENT; `resolve_at_key`
+/// lowers it to the raw wire key. Per the §3.4 CLI refinement (细化三 term
+/// rule: prefixes are an implementation detail, the user面 speaks only
+/// namespace/tenant):
+/// - `Median` — no explicit point; PS picks the median (legacy).
+/// - `Namespaced { namespace, tenant, suffix }` — the normal operator form.
+///   The cut key = `"{namespace}/{tenant}/" ++ suffix`. An EMPTY `suffix`
+///   cuts exactly at the pair boundary `"{namespace}/{tenant}/"` (splits two
+///   tenants into different partitions — a common op).
+/// - `Raw(bytes)` — admin-only escape hatch (`--at-raw-hex`); the caller hand-
+///   builds the whole prefix. Same posture as D7 ⑤ `raw()`: documented
+///   admin-only, not the day-to-day path.
+pub(crate) enum SplitPoint {
+    Median,
+    Namespaced {
+        namespace: String,
+        tenant: String,
+        suffix: Vec<u8>,
+    },
+    Raw(Vec<u8>),
+}
+
+impl SplitPoint {
+    /// Lower the CLI intent to the RAW wire key (`None` = PS median).
+    pub(crate) fn resolve_at_key(&self) -> Option<Vec<u8>> {
+        match self {
+            SplitPoint::Median => None,
+            SplitPoint::Namespaced {
+                namespace,
+                tenant,
+                suffix,
+            } => {
+                let mut key = format!("{namespace}/{tenant}/").into_bytes();
+                key.extend_from_slice(suffix);
+                Some(key)
+            }
+            SplitPoint::Raw(bytes) => Some(bytes.clone()),
+        }
+    }
+
+    /// Human-readable rendering of the resolved cut point for messages.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            SplitPoint::Median => "median (PS-selected)".to_string(),
+            SplitPoint::Namespaced {
+                namespace,
+                tenant,
+                suffix,
+            } => {
+                if suffix.is_empty() {
+                    format!("pair boundary {namespace}/{tenant}/")
+                } else {
+                    format!(
+                        "{namespace}/{tenant}/ + suffix 0x{}",
+                        suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    )
+                }
+            }
+            SplitPoint::Raw(bytes) => format!(
+                "raw 0x{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+        }
+    }
 }
 
 pub(crate) enum Command {
@@ -165,6 +234,8 @@ pub(crate) enum Command {
     },
     Split {
         part_id: u64,
+        /// F-SPLIT-AT-KEY (D4): where to cut. See `SplitPoint`.
+        point: SplitPoint,
     },
     Merge {
         survivor_part_id: u64,
@@ -715,9 +786,67 @@ pub(crate) fn parse() -> Args {
                 eprintln!("split requires <PARTID>");
                 std::process::exit(1);
             }
-            Command::Split {
-                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
+            let part_id: u64 = val(&raw, i).parse().expect("PARTID must be a number");
+            i += 1;
+            // F-SPLIT-AT-KEY (D4). CLI user面 speaks namespace/tenant, never
+            // raw prefix bytes (§3.4 CLI refinement / 细化三). Forms:
+            //   split <PART>                                    → median (legacy)
+            //   split <PART> --namespace NS --tenant T [--at S | --at-hex HEX]
+            //        → cut at "NS/T/" ++ suffix; empty/omitted suffix = the
+            //          pair boundary "NS/T/" itself
+            //   split <PART> --at-raw-hex HEX                   → admin escape
+            //        hatch: raw whole key, no ns/tenant assembly
+            let mut namespace: Option<String> = None;
+            let mut tenant: Option<String> = None;
+            let mut suffix: Option<Vec<u8>> = None; // from --at / --at-hex
+            let mut raw_key: Option<Vec<u8>> = None; // from --at-raw-hex
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--namespace" => {
+                        i += 1;
+                        namespace = Some(val(&raw, i).to_owned());
+                        i += 1;
+                    }
+                    "--tenant" => {
+                        i += 1;
+                        tenant = Some(val(&raw, i).to_owned());
+                        i += 1;
+                    }
+                    "--at" => {
+                        if suffix.is_some() {
+                            eprintln!("split: pass only one of --at / --at-hex");
+                            std::process::exit(1);
+                        }
+                        i += 1;
+                        suffix = Some(val(&raw, i).as_bytes().to_vec());
+                        i += 1;
+                    }
+                    "--at-hex" => {
+                        if suffix.is_some() {
+                            eprintln!("split: pass only one of --at / --at-hex");
+                            std::process::exit(1);
+                        }
+                        i += 1;
+                        suffix = Some(parse_hex_key(val(&raw, i)));
+                        i += 1;
+                    }
+                    "--at-raw-hex" => {
+                        if raw_key.is_some() {
+                            eprintln!("split: pass --at-raw-hex only once");
+                            std::process::exit(1);
+                        }
+                        i += 1;
+                        raw_key = Some(parse_hex_key(val(&raw, i)));
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("split: unexpected argument {other:?}");
+                        std::process::exit(1);
+                    }
+                }
             }
+            let point = build_split_point(namespace, tenant, suffix, raw_key);
+            Command::Split { part_id, point }
         }
         "merge" => {
             if i + 1 >= raw.len() {
@@ -900,6 +1029,110 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
     (reason, by, force)
 }
 
+/// F-SPLIT-AT-KEY (D4) / coco P2: a namespace/tenant CLI segment must be a
+/// SINGLE path segment so `{ns}/{tenant}/ ++ suffix` is 1:1 with what the
+/// operator typed. The F-KEY-NS convention pins the charset to `[a-z0-9._-]+`
+/// (non-empty, no `/`). Pure so it is unit-testable; `reject_bad_segment` is
+/// the fail-loud wrapper.
+pub(crate) fn valid_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn reject_bad_segment(kind: &str, s: &str) {
+    if !valid_segment(s) {
+        eprintln!(
+            "split: --{kind} {s:?} is not a valid segment — must be non-empty and \
+             match [a-z0-9._-]+ (no '/'). For a whole raw key use --at-raw-hex."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// F-SPLIT-AT-KEY (D4): validate the split-point flag combination and lift it
+/// into a `SplitPoint`. Exits with a clear message on a contradictory combo
+/// (an operator naming a cut point must fail loudly, not split at garbage).
+///
+/// Rules:
+/// - `--at-raw-hex` is the admin escape hatch and is mutually exclusive with
+///   every ns/tenant/suffix flag.
+/// - `--namespace` and `--tenant` are both-or-neither.
+/// - `--at` / `--at-hex` (the suffix) require `--namespace` + `--tenant`
+///   (a suffix is relative to a pair; a bare suffix is meaningless — use
+///   `--at-raw-hex` for a whole raw key).
+/// - Nothing → `Median`.
+pub(crate) fn build_split_point(
+    namespace: Option<String>,
+    tenant: Option<String>,
+    suffix: Option<Vec<u8>>,
+    raw_key: Option<Vec<u8>>,
+) -> SplitPoint {
+    if let Some(bytes) = raw_key {
+        if namespace.is_some() || tenant.is_some() || suffix.is_some() {
+            eprintln!(
+                "split: --at-raw-hex is an escape hatch and cannot be combined \
+                 with --namespace/--tenant/--at/--at-hex"
+            );
+            std::process::exit(1);
+        }
+        return SplitPoint::Raw(bytes);
+    }
+    match (namespace, tenant) {
+        (Some(namespace), Some(tenant)) => {
+            // coco P2: namespace/tenant MUST be single path segments, else the
+            // (ns, tenant, suffix) triple is not 1:1 with the assembled raw key
+            // — `--tenant acme/prod --at ""` would collide with
+            // `--tenant acme --at prod/` and cut at a boundary the operator did
+            // NOT intend. Enforce the F-KEY-NS charset `[a-z0-9._-]+` (no `/`,
+            // non-empty). A key that genuinely needs other bytes must use the
+            // `--at-raw-hex` escape hatch.
+            reject_bad_segment("namespace", &namespace);
+            reject_bad_segment("tenant", &tenant);
+            SplitPoint::Namespaced {
+                namespace,
+                tenant,
+                // Omitted suffix = empty = cut exactly at the pair boundary.
+                suffix: suffix.unwrap_or_default(),
+            }
+        }
+        (None, None) => {
+            if suffix.is_some() {
+                eprintln!(
+                    "split: --at/--at-hex require --namespace <ns> --tenant <t> \
+                     (a suffix is relative to a namespace/tenant pair). For a \
+                     whole raw key use --at-raw-hex."
+                );
+                std::process::exit(1);
+            }
+            SplitPoint::Median
+        }
+        _ => {
+            eprintln!("split: --namespace and --tenant must be given together");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// F-SPLIT-AT-KEY (D4): decode a `--at-hex <HEX>` value into raw key bytes.
+/// Even-length ASCII hex; exits with a clear message on malformed input (an
+/// operator naming a split point wants to fail loudly, not split at garbage).
+pub(crate) fn parse_hex_key(s: &str) -> Vec<u8> {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
+        eprintln!("--at-hex expects an even-length ASCII hex string, got {s:?}");
+        std::process::exit(1);
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).unwrap_or_else(|_| {
+                eprintln!("--at-hex: bad hex byte {:?}", &s[i..i + 2]);
+                std::process::exit(1);
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // F213 helpers (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
@@ -1047,6 +1280,107 @@ fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use super::SplitPoint;
+
+    // ── F-SPLIT-AT-KEY (D4) CLI split-point assembly ──────────────────────
+
+    #[test]
+    fn split_point_median_resolves_to_none() {
+        assert_eq!(SplitPoint::Median.resolve_at_key(), None);
+    }
+
+    #[test]
+    fn split_point_namespaced_with_suffix_assembles_prefix() {
+        let p = SplitPoint::Namespaced {
+            namespace: "kvc".into(),
+            tenant: "acme".into(),
+            suffix: b"vllm/v1/80".to_vec(),
+        };
+        assert_eq!(
+            p.resolve_at_key().unwrap(),
+            b"kvc/acme/vllm/v1/80".to_vec()
+        );
+    }
+
+    #[test]
+    fn split_point_empty_suffix_is_pair_boundary() {
+        // The common "split two tenants apart" op: empty suffix cuts exactly
+        // at the pair boundary "ns/tenant/".
+        let p = SplitPoint::Namespaced {
+            namespace: "kvc".into(),
+            tenant: "acme".into(),
+            suffix: vec![],
+        };
+        assert_eq!(p.resolve_at_key().unwrap(), b"kvc/acme/".to_vec());
+    }
+
+    #[test]
+    fn split_point_hex_suffix_carries_binary_bytes() {
+        // --at-hex path: a binary suffix (e.g. an fs inode prefix) rides on
+        // the same ns/tenant assembly.
+        let suffix = super::parse_hex_key("0103ff00");
+        assert_eq!(suffix, vec![0x01, 0x03, 0xff, 0x00]);
+        let p = SplitPoint::Namespaced {
+            namespace: "fs".into(),
+            tenant: "t1".into(),
+            suffix,
+        };
+        let mut expected = b"fs/t1/".to_vec();
+        expected.extend_from_slice(&[0x01, 0x03, 0xff, 0x00]);
+        assert_eq!(p.resolve_at_key().unwrap(), expected);
+    }
+
+    #[test]
+    fn valid_segment_enforces_single_path_segment() {
+        // coco P2: the segment charset must be [a-z0-9._-]+ so the
+        // (ns, tenant, suffix) triple is 1:1 with the assembled raw key.
+        assert!(super::valid_segment("kvc"));
+        assert!(super::valid_segment("acme"));
+        assert!(super::valid_segment("default"));
+        assert!(super::valid_segment("model-cfg_456cf7.0"));
+        // Rejected: empty, embedded '/', uppercase, whitespace, other bytes.
+        assert!(!super::valid_segment(""));
+        assert!(!super::valid_segment("acme/prod")); // the collision case
+        assert!(!super::valid_segment("Acme"));
+        assert!(!super::valid_segment("a b"));
+        assert!(!super::valid_segment("a:b"));
+    }
+
+    #[test]
+    fn split_point_raw_escape_hatch_passes_through() {
+        let p = SplitPoint::Raw(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(p.resolve_at_key().unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn build_split_point_classification() {
+        // Nothing → median.
+        assert!(matches!(
+            super::build_split_point(None, None, None, None),
+            SplitPoint::Median
+        ));
+        // ns + tenant, no suffix → pair-boundary namespaced (empty suffix).
+        match super::build_split_point(Some("a".into()), Some("b".into()), None, None) {
+            SplitPoint::Namespaced { suffix, .. } => assert!(suffix.is_empty()),
+            _ => panic!("expected namespaced"),
+        }
+        // ns + tenant + suffix → namespaced with suffix.
+        match super::build_split_point(
+            Some("a".into()),
+            Some("b".into()),
+            Some(b"s".to_vec()),
+            None,
+        ) {
+            SplitPoint::Namespaced { suffix, .. } => assert_eq!(suffix, b"s".to_vec()),
+            _ => panic!("expected namespaced"),
+        }
+        // raw escape hatch alone → raw.
+        assert!(matches!(
+            super::build_split_point(None, None, None, Some(vec![1, 2, 3])),
+            SplitPoint::Raw(_)
+        ));
+    }
+
     #[test]
     fn parse_byte_size_accepts_plain_integer() {
         assert_eq!(

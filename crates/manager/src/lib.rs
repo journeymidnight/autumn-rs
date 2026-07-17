@@ -1896,6 +1896,9 @@ impl AutumnManager {
         let payload =
             autumn_rpc::partition_rpc::rkyv_encode(&autumn_rpc::partition_rpc::SplitPartReq {
                 part_id: cand.primary_part_id,
+                // Advisory auto-split uses the PS median selection (D4 explicit
+                // point is an operator/controller primitive, not the policy path).
+                at_key: None,
             });
         // 60 s — split has to flush memtable + commit_length × 3 + a
         // manager round-trip. PS-side flush can take a few seconds

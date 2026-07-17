@@ -2952,12 +2952,26 @@ impl ClusterClient {
         self.delete(key).await
     }
 
-    /// Trigger partition split.
+    /// Trigger partition split at the PS-chosen median split point (legacy).
     pub async fn split(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.split_at(part_id, None).await
+    }
+
+    /// F-SPLIT-AT-KEY (design doc D4): trigger partition split at an EXPLICIT
+    /// split point. `at_key = Some(key)` makes the PS validate the key lies
+    /// strictly inside the partition's `(start_key, end_key)` and use it
+    /// verbatim as `mid_key` (skipping median selection and the `>= 2 keys`
+    /// gate, so an empty partition can be split). `at_key = None` is identical
+    /// to `split(part_id)`.
+    pub async fn split_at(
+        &self,
+        part_id: u64,
+        at_key: Option<Vec<u8>>,
+    ) -> std::result::Result<(), AutumnError> {
         self.call_ps_for_part(
             part_id,
             MSG_SPLIT_PART,
-            rkyv_encode(&SplitPartReq { part_id }),
+            rkyv_encode(&SplitPartReq { part_id, at_key }),
         )
         .await?;
         Ok(())

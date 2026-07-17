@@ -819,7 +819,7 @@ async fn do_split(ctx: &NemesisCtx) -> Result<String, String> {
     let resp = client
         .call(
             partition_rpc::MSG_SPLIT_PART,
-            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: pid }),
+            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: pid, at_key: None }),
         )
         .await
         .map_err(|e| format!("rpc: {e}"))?;

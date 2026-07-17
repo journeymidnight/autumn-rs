@@ -2,6 +2,12 @@
 
 ## 长任务执行规则 (inherited from monorepo 2026-04-21)
 
+## teammate工作方式
+
+1. 具体代码实现交给teammate opus 4.8实现
+2. main agent主要负责设计
+3. 部署服务(ci,k8s等)交给teammate sonnet检查实施
+
 ### 项目目标
 1. 底层是 `stream layer`，负责分布式文件存储与恢复。
 2. 上层是 `partition layer`，负责 table 管理与有序 KV 存储。

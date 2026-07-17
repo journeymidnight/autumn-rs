@@ -172,7 +172,7 @@ fn merge_split_round_trip_keys_intact() {
         let split_resp_bytes = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 1001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 1001, at_key: None }),
             )
             .await
             .expect("split call");
@@ -400,7 +400,7 @@ fn merge_preserves_value_pointer_resolution() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 4001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 4001, at_key: None }),
             )
             .await
             .expect("split");
@@ -512,7 +512,7 @@ fn merge_then_split_again_round_trip() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 5001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 5001, at_key: None }),
             )
             .await
             .expect("split #1");
@@ -563,7 +563,7 @@ fn merge_then_split_again_round_trip() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1, at_key: None }),
             )
             .await
             .expect("split #2 call");
@@ -641,7 +641,7 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 6001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 6001, at_key: None }),
             )
             .await
             .expect("split");
@@ -1068,7 +1068,7 @@ fn split_merge_split_with_concurrent_writes() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 13001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 13001, at_key: None }),
             )
             .await
             .expect("split #1");
@@ -1127,7 +1127,7 @@ fn split_merge_split_with_concurrent_writes() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1, at_key: None }),
             )
             .await
             .expect("split #2");
@@ -1319,7 +1319,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 14001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 14001, at_key: None }),
             )
             .await
             .expect("split #1");
@@ -1478,7 +1478,7 @@ fn split_merge_split_with_interleaved_writes() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 12001 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 12001, at_key: None }),
             )
             .await
             .expect("split #1");
@@ -1544,7 +1544,7 @@ fn split_merge_split_with_interleaved_writes() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1, at_key: None }),
             )
             .await
             .expect("split #2");
@@ -1663,7 +1663,7 @@ async fn poll_split_succeeds(router: &std::rc::Rc<PsRouter>, part_id: u64) -> bo
         let resp = c
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id, at_key: None }),
             )
             .await;
         if let Ok(bytes) = resp {

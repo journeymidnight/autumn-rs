@@ -1422,14 +1422,24 @@ handle_split_part(req):
          previous split it still spans the pre-split wide range. Picking
          mid_key against the stale rg yields keys outside the manager's
          narrowed range and multi_modify_split rejects them.
-  3. user_keys = unique_user_keys(part).filter(in_range(auth_rg))
-       (returns sorted, dedup, tombstone-/expired-filtered keys; F103
-        adds the auth-rg filter so CoW-shared SSTable keys spanning the
-        old wide range are dropped before mid_key selection)
-  4. If user_keys.len() < 2 → FailedPrecondition (run major compaction)
+  3. mid_key SELECTION — two sources (F-SPLIT-AT-KEY / D4):
+       EXPLICIT (`req.at_key = Some(key)`): validate `key` STRICTLY inside
+         auth_rg `(start, end)` (== start / == end / out-of-range →
+         InvalidArgument), use it verbatim. SKIPS the SST scan (step 3-median)
+         AND the `>= 2 keys` gate (step 4) — so an EMPTY / near-empty partition
+         can be split (D8 presplit primitive). `at_key` is a RAW byte string;
+         the PS is namespace-agnostic (D5) — the CLI assembles `{ns}/{tenant}/
+         ++ suffix`, the wire carries only raw bytes.
+       MEDIAN (`req.at_key = None`, legacy):
+         user_keys = unique_user_keys(part).filter(in_range(auth_rg))
+         (sorted, dedup, tombstone-/expired-filtered; F103 auth-rg filter drops
+          CoW-shared SSTable keys spanning the old wide range)
+  4. MEDIAN path only: if user_keys.len() < 2 → FailedPrecondition (run major
+       compaction, or pass an explicit `split --at` point)
   5. flush_memtable_locked(part): rotate active + flush all imm via
        P-bulk
-  6. mid_key = user_keys[user_keys.len() / 2]
+  6. MEDIAN path: mid_key = user_keys[user_keys.len() / 2]
+       (EXPLICIT path: mid_key = req.at_key, chosen in step 3)
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
        (up to 8 retries, exponential backoff 100ms → 2s)

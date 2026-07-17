@@ -49,7 +49,7 @@ fn split_compact_split_preserves_all_data() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("split1");
@@ -81,7 +81,7 @@ fn split_compact_split_preserves_all_data() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("split2");
@@ -163,7 +163,7 @@ fn split_chain_with_writes_between_splits() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
             )
             .await
             .expect("split1");
@@ -221,7 +221,7 @@ fn split_chain_with_writes_between_splits() {
         let split_resp = right_client
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: right1_id }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: right1_id, at_key: None }),
             )
             .await
             .expect("split2");

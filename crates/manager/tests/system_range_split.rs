@@ -49,7 +49,7 @@ fn range_scan_returns_correct_results_after_split() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("split");
@@ -145,7 +145,7 @@ fn range_scan_with_limit_and_pagination_after_split() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
             )
             .await
             .expect("split");
@@ -237,7 +237,7 @@ fn range_scan_consistent_after_split_compact_split() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 903 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 903, at_key: None }),
             )
             .await
             .expect("split1");
@@ -269,7 +269,7 @@ fn range_scan_consistent_after_split_compact_split() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 903 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 903, at_key: None }),
             )
             .await
             .expect("split2");

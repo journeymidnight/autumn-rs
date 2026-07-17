@@ -391,7 +391,7 @@ fn partition_server_put_get_and_split_flow() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 501 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 501, at_key: None }),
             )
             .await
             .expect("split part");
@@ -1118,7 +1118,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("initial split must succeed");
@@ -1153,7 +1153,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         let split_result = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await;
         // The server should return an error (FailedPrecondition)

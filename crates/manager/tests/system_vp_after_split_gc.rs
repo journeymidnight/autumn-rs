@@ -56,7 +56,7 @@ fn vp_resolvable_after_split_and_one_child_gc() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
             )
             .await
             .expect("split");
@@ -171,7 +171,7 @@ fn vp_freed_after_both_children_compact_and_gc() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902 }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
             )
             .await
             .expect("split");

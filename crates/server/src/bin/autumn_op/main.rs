@@ -33,7 +33,7 @@ use serde::Serialize;
 
 
 mod args;
-use args::{fuse_split_ranges, hex_split_ranges, parse, parse_replication, Args, Command};
+use args::{fuse_split_ranges, hex_split_ranges, parse, parse_replication, Args, Command, SplitPoint};
 
 fn format_disk(dir: &str) -> Result<String> {
     for byte in 0u8..=255 {
@@ -342,7 +342,7 @@ async fn run(args: Args) -> Result<()> {
         }
         Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
-        Command::Split { part_id } => cmd_split(&client, args.json, part_id).await?,
+        Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
         Command::Merge { survivor_part_id, victim_part_id } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
         Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
@@ -1380,9 +1380,45 @@ async fn cmd_force_ec_convert(client: &ClusterClient, json: bool, extent_id: u64
     Ok(())
 }
 
-async fn cmd_split(client: &ClusterClient, json: bool, part_id: u64) -> Result<()> {
+async fn cmd_split(
+    client: &ClusterClient,
+    json: bool,
+    part_id: u64,
+    point: SplitPoint,
+) -> Result<()> {
+    // Lower the CLI intent (ns/tenant/suffix or raw) to the raw wire key.
+    let at_key = point.resolve_at_key();
+
+    // Friendly CLI precheck (UX only — the PS is the authoritative validator).
+    // When an explicit point is given, verify it lands strictly inside the
+    // target partition's [start, end). This turns the PS's hex-only rejection
+    // into a message that names the namespace/tenant/suffix the operator typed.
+    if let Some(key) = &at_key {
+        if let Ok(parts) = client.all_partitions_with_range().await {
+            if let Some((_, _, start, end)) = parts.iter().find(|(pid, _, _, _)| *pid == part_id) {
+                let below_start = key.as_slice() <= start.as_slice();
+                let at_or_above_end = !end.is_empty() && key.as_slice() >= end.as_slice();
+                if below_start || at_or_above_end {
+                    bail!(
+                        "split point {} resolves to key 0x{} which is not strictly inside \
+                         partition {}'s range [0x{}, 0x{}); pick a namespace/tenant/suffix \
+                         that falls inside this partition",
+                        point.describe(),
+                        hex_encode(key),
+                        part_id,
+                        hex_encode(start),
+                        hex_encode(end),
+                    );
+                }
+            }
+            // Partition not found in the map → skip precheck; the PS call below
+            // surfaces the authoritative NotFound.
+        }
+        // GetRegions failed → skip precheck; let the authoritative PS call run.
+    }
+
     client
-        .split(part_id)
+        .split_at(part_id, at_key.clone())
         .await
         .map_err(|e| anyhow!("split: {e}"))?;
     if json {
@@ -1391,8 +1427,13 @@ async fn cmd_split(client: &ClusterClient, json: bool, part_id: u64) -> Result<(
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
                 "part_id": part_id,
+                "split_point": point.describe(),
+                // Echo the resolved raw wire key (hex); null = PS-median.
+                "at_key_hex": at_key.as_ref().map(|k| hex_encode(k)),
             }))?
         );
+    } else if at_key.is_some() {
+        println!("split ok (at {})", point.describe());
     } else {
         println!("split ok");
     }

@@ -124,7 +124,7 @@ fn concurrent_writers_during_split() {
             split_ps
                 .call(
                     partition_rpc::MSG_SPLIT_PART,
-                    partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902 }),
+                    partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
                 )
                 .await
                 .expect("split")

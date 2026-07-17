@@ -606,6 +606,17 @@ pub struct RangeResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct SplitPartReq {
     pub part_id: u64,
+    /// F-SPLIT-AT-KEY (design doc D4): operator/controller-specified split
+    /// point. When `Some(key)`, the PS validates the key lies STRICTLY inside
+    /// the partition's authoritative `(start_key, end_key)` interval and uses
+    /// it verbatim as `mid_key`, SKIPPING both median selection AND the
+    /// `>= 2 keys` gate — so an empty / near-empty partition can be split
+    /// (the D8 per-(namespace,tenant) presplit primitive: cut an empty pair
+    /// into empty children). The key is an ARBITRARY byte string; the PS is
+    /// app-agnostic (D5) — it never inspects namespace/prefix structure.
+    /// `None` = legacy behaviour (median-by-key-count over live user keys,
+    /// which still enforces `>= 2 keys`).
+    pub at_key: Option<Vec<u8>>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
