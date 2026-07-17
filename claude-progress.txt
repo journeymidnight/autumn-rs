@@ -80,6 +80,45 @@ Next steps: team-lead review (+coco per repo rule) → commit → redeploy vLLM
 ---- Concurrent task (same day, separate) ----
 Date: 2026-07-16
 TaskStatus: not_completed
+Task scope: F-KEY-NS design doc — 内置应用 key 命名空间 + 分裂规则（doc only,
+  无代码改动, 未 commit — team-lead 明确指示 doc-only + 待 review）。
+Done: docs/key_namespace_split_design.md（现状/问题分级/三个 size 口径钉死/
+  设计 D1-D5/迁移/待拍板/前期调查订正）; feature_list.md 新增 F-KEY-NS 伞条目
+  （子项 F-POLICY-SIZE-EST-LIVE / F-KEY-NS-FUSE / F-SPLIT-AT-KEY /
+  F-PRESPLIT-DEPLOY-MODE, passes:false）。
+Key findings: size_bytes 已复活（background.rs:309, F-PS-SIZE-BYTES-DEAD
+  2026-07-05）= LSM 常驻字节 → policy 对 VP 负载失明; manager CLAUDE.md
+  "size_bytes always 0" 陈述已过期; info 45.4GB = stream 全 extent 字节含
+  未 GC 死字节; est_live 四组件（sealed 和/open_tail/gc_debt/open_tail_dead）
+  全部已有 → 修口径是 manager-only 零 wire 改动。
+Update (同日, review 后定稿): 用户拍板前缀 = fs/{tenant}/{volume}/（迁移用
+  fs/default/default/）。doc §3.1 重写：per-volume 自持状态不变量 —— ROOT_INO=1
+  per volume（ino 本就 volume 作用域）、next_inode 计数器 per volume（etcd
+  autumn-rs/fs/{t}/{v}/next_inode + KV floor，消灭跨 volume 灾备/删除依赖）、
+  rmtomb/schema 戳进 fs/{t}/{v}/\x04、MSG_ALLOC_INODES 加 volume 字段（WIRE
+  bump = D1 唯一 wire 变更，§4 表已改）；autumnfs 非 CAS race 不被多 volume
+  放大。§5.1 改"已拍板"，其余 3 项保持待拍板。feature_list F-KEY-NS 同步。
+Update 2 (同日): §5.2 也拍板 —— 19GB 迁移走 A 重灌（team-lead 线上 autumnfs ls
+  全树盘点：只有模型权重, qwen32b 19GB 在用 + 旧 qwen 7B 5.5GB 无消费者, 全部
+  hf-mirror 可再生; 旧 7B 不再灌 → 回收 ≈16.5GB EN 空间/RF3, EN 池仅 100GiB）。
+  doc §3.1 迁移段/选项表/§4/§5 + feature_list 已同步; 不写迁移工具。
+Update 3 (同日): §5.4 也拍板 —— authz 彻底启用覆盖 fs/kvc/mem（用户原话
+  "authz彻底都加上吧"）。doc 新增 §3.6 D6：P0 完整闭环 = D1+D6（前缀给可
+  保护性, authz 才把它变成已保护; rmtomb INVARIANT 首次由机制保证）; 机制
+  盘点订正 team-lead 一处（autumn-op 有 gen-signing-key/tenant-create/
+  tenant-delete/mint-token, 不是没有）; 真缺口 = 接线（fuse mount/PyO3/
+  autumnfs credential + 部署层 signing key/prefixes env）; 灰度 = 按前缀
+  mem/→kvc/→fs/ + 凭据先行（无 audit-only, 不补）; 失败模式 = 漏凭据全线
+  写失败(PermissionDenied terminal) + manager 不可达>TTL−300s 拒写（数据面
+  新增宽限期=TTL 的控制面依赖）。§4 顺序改 D3→D6-mem→D1+D2→D6-fs/kvc→
+  D4→D5a; §5 "client 裸 key 劝阻" 被 D6 消解, 待拍板剩阈值重标定/kvc 分档/
+  TTL 取值与 Secret 投递。feature_list 加 F-AUTHZ-BUILTIN 子项。
+Next steps: 用户拍板 §5 剩余项 → 按 D3(F-POLICY-SIZE-EST-LIVE) 先行、
+  D6-mem 次之的顺序实施。
+
+---- Concurrent task (same day, separate) ----
+Date: 2026-07-16
+TaskStatus: not_completed
 Task scope: BUG-MGR-RETRY-CLASS — code-classified StreamClient manager-call
   retry + owner-epoch-fence self-heal. Live incident: post-rebalance stale
   owner_epoch (partition/17: manager expected 14396, PS sent 14364 forever) →
