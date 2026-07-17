@@ -826,6 +826,39 @@ AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
 #   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
+## autumn-kvcache tenant / model identity (BUG-KVC-TENANT)
+
+vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...` — the
+12-hex fingerprint carries the model's real identity (arch shape + weights
+source + optional `model_id`; see `python/autumn_kvcache/autumn_kvcache/_identity.py`).
+Without it, every model served via `autumn_vllm_loader`'s fixed local config
+dir shared ONE tenant and cross-read KV (live 2026-07: Qwen2.5-7B/32B both
+under `kvc/model-cfg_0_1/`).
+
+```bash
+# Offline unit tests (no cluster / engine / native module):
+cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q
+
+# Manual verify on a live deployment: the connector logs its tenant + identity
+# sources at startup — two DIFFERENT models must log two different tenants:
+#   AutumnKVConnector role=... tenant=model-cfg_<fp>_0_1 ... identity={'layers': 64, ...}
+# and the stored keys must not share a tenant prefix:
+#   (autumn-client / python) list keys under kvc/ — one prefix per model.
+
+# Upgrade note: the fingerprint changed every vLLM-pool key → old-tenant keys
+# (e.g. kvc/model-cfg_0_1/vllm/...) are orphaned; with ttl_secs=0 they never
+# expire. Reclaim manually when convenient (venv with the autumn wheel):
+#   python - <<'EOF'
+#   import asyncio, autumn
+#   async def main():
+#       c = await autumn.Client.connect("MGR:9001")
+#       print("deleted:", await c.batch_delete(b"kvc/model-cfg_0_1/vllm/"))
+#   asyncio.run(main())
+#   EOF
+# The load-miss-after-marker warning now states the plausible causes given the
+# TTL config (ttl=0 ⇒ never blames TTL; points at tenant/model mismatch).
+```
+
 ## Data-plane authz setup (F-AUTHZ-1)
 
 Server-side key-range authorization for the `mem/` namespace

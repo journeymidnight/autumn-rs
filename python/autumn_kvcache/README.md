@@ -68,7 +68,35 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /models/Qwen3-8B --served-model-name qwen3 \
 
 `kv_connector_extra_config` keys: `endpoint` (autumn manager `host:port`,
 required), `transport` (`tcp` default, or `ucx`), `client_workers`,
-`max_inflight`, `ttl_secs`.
+`max_inflight`, `ttl_secs`, `model_id` (optional explicit model identity — see
+below).
+
+### Tenant isolation: the model's real identity is part of the key
+
+The tenant segment of every key is
+`{model}_{fingerprint}_{tp_rank}_{tp_size}[...]`, where `fingerprint` is a
+short hash of the model's **identity**: architecture shape
+(layers / hidden / kv-heads / head-size / vocab / dtype / quantization / MLA)
+plus the weights source (`load_format`, and for `--load-format autumn` the
+autumn weights `path` from `model_loader_extra_config`), plus `model_id` if
+you set one.
+
+This exists because the model *path* is not an identity: with
+`autumn_vllm_loader` every model is served from the same fixed local config
+dir, so two different models used to share one tenant and cross-read each
+other's KV (observed live: Qwen2.5-7B and 32B under one tenant; a same-shape
+pair would have been silently wrong). Set
+`kv_connector_extra_config["model_id"]` when even the fingerprint can't
+distinguish your deployments — e.g. two finetunes with identical architecture
+loaded from the **same** path, or weights overwritten in place at one autumn
+path (don't do that — store new weights at a new path).
+
+> **Upgrade note:** introducing the fingerprint changes every vLLM-pool key,
+> so existing cached prefixes go cold and rebuild on first use (pure cache,
+> content-addressed — no migration needed). Keys written by older connectors
+> stay behind under the old tenant; with `ttl_secs=0` they never expire, so
+> reclaim them manually if you care about the space:
+> `client.batch_delete(b"kvc/<old-tenant>/vllm/")`.
 
 **`ttl_secs`** (default `0` = no expiry) is the relative TTL after which an
 offloaded prefix stops being *served*. Content-addressed keys never invalidate,
@@ -135,6 +163,15 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
   shorter than its layers' (see above) to preserve load correctness.
 - **Return fast** — never block past the engine's step budget; the load path is
   synchronous in Phase 3a (per-layer overlap is Phase 3b).
-- **Tenant isolation** — keys carry a tenant suffix derived from model + TP/PP,
-  so different models / parallel layouts never alias.
+- **Tenant isolation** — keys carry a tenant suffix derived from model +
+  model-identity fingerprint (`_identity.py`) + TP/PP, so different models /
+  parallel layouts never alias. The sglang tenant format is unchanged
+  (`model_name` is a real identity there); its escape hatch is
+  `extra_config["model_id"]`.
 - See `docs/autumn_kvcache_plan.md` §13 for the full design.
+
+## Offline unit tests (no cluster, no engine, no native module)
+
+```bash
+cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q
+```

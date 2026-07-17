@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import autumn
 
 from ._bridge import new_loop, run, run_on
+from ._identity import tenant_cfg_from_vllm as _tenant_cfg_from_vllm
 from ._keys import build_tenant_suffix, full_key
 
 log = logging.getLogger(__name__)
@@ -265,6 +266,17 @@ class _AutumnKVStore:
     # is independent of the worker's model-specific layer naming.
     PRESENT_MARKER = "__present__"
 
+    @property
+    def tenant(self) -> str:
+        return self._tenant
+
+    @property
+    def marker_ttl(self) -> int:
+        """Configured marker TTL (0 = never expires) — lets callers reason
+        about whether a marker-present/layer-missing anomaly can possibly be
+        TTL-related (see start_load_kv's miss diagnosis)."""
+        return self._marker_ttl
+
     def _key(self, content_hash: str, layer_name: str) -> bytes:
         return full_key(
             self._tenant, f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}", VLLM_POOL_NAME
@@ -446,7 +458,21 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "AutumnKVConnector requires 'endpoint' in kv_connector_extra_config"
             )
         self._block_size = block_size
-        self._tenant_suffix = build_tenant_suffix(tenant_cfg)
+        # BUG-KVC-TENANT: the tenant MUST carry the model's real identity.
+        # `model_name` alone is the served path, which is a CONSTANT local dir
+        # under autumn_vllm_loader — the fingerprint (arch shape + weights
+        # source, see _identity.py) is what actually separates models.
+        fingerprint = getattr(tenant_cfg, "model_fingerprint", None)
+        self._tenant_suffix = build_tenant_suffix(tenant_cfg, fingerprint)
+        if fingerprint is None:
+            log.warning(
+                "no model-identity fingerprint derivable from vllm_config — "
+                "tenant %r falls back to the model path only and WILL collide "
+                "if two different models are served with the same path (e.g. "
+                "autumn_vllm_loader's fixed config dir). Set "
+                "kv_connector_extra_config['model_id'] to disambiguate.",
+                self._tenant_suffix,
+            )
         self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))
         transport = (extra.get("transport") or "tcp").lower()
         # `ttl_secs` (default 0 = no expiry) bounds how long an offloaded prefix
@@ -489,8 +515,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # leave a marker the scheduler admits into a missing/partial load.
         self._saved_count: dict = {}
         log.info(
-            "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s",
+            "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s identity=%s",
             role, self._tenant_suffix, self._block_size, _VLLM_AVAILABLE,
+            # The raw identity sources behind the tenant fingerprint — logged
+            # so a tenant collision/mismatch is diagnosable from startup logs
+            # alone (the fingerprint itself is an opaque hash).
+            getattr(tenant_cfg, "identity_sources", None),
         )
 
     # ── scheduler side ──────────────────────────────────────────────────────
@@ -610,14 +640,30 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 if not ok:
                     # Anomalous: this request was admitted because the scheduler
                     # saw the `__present__` marker, so every layer should be
-                    # present. A miss here means a layer expired while its marker
-                    # lived (a TTL grace breach — see _TTL_LAYER_GRACE_SECS) or a
-                    # backend fault. The position keeps its (uninitialised) paged
-                    # KV; surface it loudly rather than swallowing at debug.
+                    # present. Diagnose by what is actually POSSIBLE given the
+                    # config (the old message blamed "TTL grace breach"
+                    # unconditionally — misleading at ttl=0, where the real
+                    # cause of the live incident was a tenant/model identity
+                    # collision: another model's marker under the same tenant).
+                    # The position keeps its (uninitialised) paged KV; surface
+                    # it loudly rather than swallowing at debug.
+                    if self._store.marker_ttl > 0:
+                        causes = (
+                            "possible TTL grace breach (layer expired under a "
+                            "live marker), tenant/model identity mismatch, or "
+                            "backend fault"
+                        )
+                    else:
+                        causes = (
+                            "ttl=0 rules out expiry — likely a tenant/model "
+                            "identity mismatch (a DIFFERENT model/engine wrote "
+                            "this tenant, e.g. different layer names/count) or "
+                            "a backend fault"
+                        )
                     log.warning(
-                        "external KV load miss after positive presence: req=%s layer=%s "
-                        "(prefix partially uncached — possible TTL grace breach)",
-                        rm.req_id, layer_name,
+                        "external KV load miss after positive presence: req=%s "
+                        "layer=%s tenant=%s (prefix partially uncached — %s)",
+                        rm.req_id, layer_name, self._store.tenant, causes,
                     )
                     continue
                 value = torch.from_numpy(staging).view(template.dtype).reshape(template.shape)
@@ -672,32 +718,9 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
 
 # ── vllm_config → tenant cfg shim ────────────────────────────────────────────
-
-def _tenant_cfg_from_vllm(vllm_config: Any):
-    """Adapt a VllmConfig into the duck-typed object `build_tenant_suffix` wants."""
-    import types
-
-    model = None
-    tp_rank = tp_size = pp_rank = pp_size = None
-    try:
-        model = getattr(getattr(vllm_config, "model_config", None), "model", None)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        par = getattr(vllm_config, "parallel_config", None)
-        tp_size = getattr(par, "tensor_parallel_size", 1)
-        pp_size = getattr(par, "pipeline_parallel_size", 1)
-        tp_rank = getattr(par, "rank", 0)
-    except Exception:  # noqa: BLE001
-        pass
-    return types.SimpleNamespace(
-        model_name=model,
-        tp_rank=tp_rank or 0,
-        tp_size=tp_size or 1,
-        pp_rank=pp_rank or 0,
-        pp_size=pp_size or 1,
-        is_mla_model=False,
-    )
+# Moved to `_identity.tenant_cfg_from_vllm` (imported above as
+# `_tenant_cfg_from_vllm`) so the pure identity/tenant logic is unit-testable
+# without the `autumn` native module or vllm installed (BUG-KVC-TENANT).
 
 
 def _flatten_block_ids(block_ids: Any) -> List[int]:

@@ -1,5 +1,43 @@
 Date: 2026-07-16
 TaskStatus: not_completed
+Task scope: BUG-KVC-TENANT — autumn_kvcache tenant carries no model identity →
+  cross-model KV aliasing. Live incident: Qwen2.5-7B + 32B (both served via
+  autumn_vllm_loader's fixed /model-cfg dir, shared tokenizer → same content
+  hash) landed in ONE tenant kvc/model-cfg_0_1/ and 32B cross-read 7B's KV.
+  Same-shape models would have been SILENTLY wrong.
+
+Code DONE (uncommitted — awaiting team-lead review; do NOT commit before review):
+  - NEW python/autumn_kvcache/autumn_kvcache/_identity.py (pure, no deps):
+    vllm_identity_sources (arch shape + weights source + optional model_id;
+    field names verified against vLLM v0.23.0 tag) → 12-hex deterministic
+    fingerprint; tenant_cfg_from_vllm moved here (also fixes is_mla_model
+    hardcoded-False → ModelConfig.use_mla).
+  - _keys.py: build_tenant_suffix(cfg, model_fingerprint=None) — fingerprint
+    slots between model and tp/pp; None ⇒ byte-identical legacy format.
+  - vllm_connector.py: tenant = model + fingerprint (loud warn if
+    underivable); identity sources logged at startup; miss-after-marker
+    warning now states causes per TTL config (ttl=0 ⇒ never blames TTL,
+    points at tenant/model mismatch); _AutumnKVStore exposes tenant/marker_ttl.
+  - sglang_backend.py: default tenant UNCHANGED (no sglang invalidation);
+    optional extra_config["model_id"] escape hatch.
+  - __init__.py: lazy re-exports (PEP 562) so pure modules import without the
+    autumn native module → offline unit tests possible.
+  - NEW tests/test_tenant_identity.py: 17 tests green (uv run --with pytest,
+    no cluster/engine/native module). Cluster-required smoke/dataplane tests
+    unchanged (cannot run on this Mac — need 1-node cluster + maturin wheel).
+  - Docs: README (tenant/fingerprint/model_id/upgrade), plan doc §5+§13.3,
+    ops.md verify+cleanup runbook, feature_list.md BUG-KVC-TENANT.
+Residual NOT closed (documented): same-arch finetunes from the SAME local
+  path (no weights_path) still collide → model_id override; weights digest =
+  future work. Upgrade = vLLM-pool cold cache; old kvc/model-cfg_0_1/vllm/*
+  keys (ttl=0) need manual batch_delete to reclaim space (live cluster
+  currently self-consistent per team-lead; NOT touched).
+Next steps: team-lead review (+coco per repo rule) → commit → redeploy vLLM
+  hosts with the new package and verify two models log two tenants.
+
+---- Concurrent task (same day, separate) ----
+Date: 2026-07-16
+TaskStatus: not_completed
 Task scope: BUG-MGR-RETRY-CLASS — code-classified StreamClient manager-call
   retry + owner-epoch-fence self-heal. Live incident: post-rebalance stale
   owner_epoch (partition/17: manager expected 14396, PS sent 14364 forever) →

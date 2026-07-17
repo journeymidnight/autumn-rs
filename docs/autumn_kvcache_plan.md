@@ -105,7 +105,7 @@ autumn-kvcache key = f"kvc/{tenant_suffix}/{pool_name}/{sha256_hex}"
 | 字段 | 来源 | 备注 |
 |---|---|---|
 | `kvc/` | 固定前缀 | 跟其它 autumn 接口（fuse / 普通 client）分命名空间 |
-| `tenant_suffix` | `(model_name, tp_rank, tp_size, pp_rank, pp_size, is_mla_model)` | 抄 `HiCacheFile._get_suffixed_key`；MLA 不带 tp 后缀 |
+| `tenant_suffix` | `(model_name, model_fingerprint, tp_rank, tp_size, pp_rank, pp_size, is_mla_model)` | 抄 `HiCacheFile._get_suffixed_key` + BUG-KVC-TENANT 指纹；MLA 不带 tp 后缀。sglang 路径默认无指纹（格式与旧版完全一致，可选 `extra_config["model_id"]`）；vLLM 路径必须带指纹（见 §13.3） |
 | `pool_name` | 当前固定 `"kv"` | **为 v2 预留位置，避免未来 key 迁移** |
 | `sha256_hex` | sglang controller 已计算好的 chain hash | docs:190–200；backend 不重新 hash |
 
@@ -317,7 +317,8 @@ sglang HiCache L3 是个**同步 storage backend**（`batch_get_v1/batch_set_v1/
 autumn-kvcache (vllm) key = f"kvc/{tenant_suffix}/vllm/{block_hash_hex}/{layer_id}"
 ```
 
-- `kvc/` 固定前缀、`tenant_suffix` 由 `(model, tp_rank, tp_size, pp_rank, pp_size)` 拼（与 sglang 同源，§5）。
+- `kvc/` 固定前缀、`tenant_suffix` 由 `(model, model_fingerprint, tp_rank, tp_size, pp_rank, pp_size)` 拼（与 sglang 同源，§5）。
+- **`model_fingerprint`（BUG-KVC-TENANT，2026-07-16）**：`_identity.py` 从 `VllmConfig` 提取模型真实身份做 12-hex sha256——架构形状（layers/hidden/kv_heads/head/vocab/model_type/dtype/quant/MLA，字段名已对照 vLLM v0.23.0 核实）+ 权重来源（`load_format`；autumn loader 时再加 `model_loader_extra_config["path"]`，即 autumn 里的权重目录）+ 可选 `kv_connector_extra_config["model_id"]`。背景：`autumn_vllm_loader` 把 config/tokenizer 钉死在本地固定目录（如 `/model-cfg`），`model_config.model` 对**所有**这样 serve 的模型都是同一个字符串 → 线上 Qwen2.5-7B/32B 同 tenant 串读 KV（28 层 vs 64 层可见告警；同形状模型则是**无声**错误）。指纹跨进程确定（同部署 → 同 tenant，否则缓存永 miss）。**残留撞车场景**：同架构 + 同权重身份源（同本地路径的两个微调、或在同一 autumn path 原地覆写权重）→ 用 `model_id` 显式区分 / 新权重放新 path。指纹变更 ⇒ vLLM pool 旧 key 全部冷失效（纯缓存，内容寻址，零迁移；`ttl_secs=0` 的旧 key 需手动 `batch_delete` 回收空间）。
 - `vllm` 段对应 §5 的 `pool_name` 预留位（sglang 用 `kv`），天然分流两个框架的 keyspace。
 - `block_hash_hex`：**取 vLLM 自己算好的 block hash**（`BlockHash`，token-ids + LoRA/mm extra key 内容寻址），backend 不重算。
 - `/{layer_id}`：因为 `save_kv_layer` 是逐层的，按 (block,layer) 拆 key 最贴合 overlap 模型（代价是 num_layers× key 数；若 RPC 数成瓶颈，Phase B 再合并为整 block 单 key + 内部 layer offset，先留结构不优化）。

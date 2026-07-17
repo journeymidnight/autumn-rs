@@ -8,8 +8,12 @@ pages into the SAME autumn keyspace:
 
 - `kvc/`           — reserved namespace, distinguishes kvcache keys from
                      autumn-fuse / autumn-client keys on the shared cluster.
-- `tenant_suffix`  — `(model, tp_rank, tp_size, pp_rank, pp_size)` scoping so two
-                     models / parallel ranks never collide.
+- `tenant_suffix`  — `(model, model_fingerprint, tp_rank, tp_size, pp_rank,
+                     pp_size)` scoping so two models / parallel ranks never
+                     collide. The fingerprint (BUG-KVC-TENANT, `_identity.py`)
+                     exists because the model *path* alone is NOT an identity:
+                     `autumn_vllm_loader` deployments serve every model from
+                     the same fixed local config dir.
 - `pool`           — `kv` for sglang, `vllm` for the vLLM connector (separate
                      keyspaces; also the v2 multi-pool reservation slot).
 - `content_hash`   — the engine's own content-addressed hash (sglang chain hash
@@ -24,7 +28,7 @@ from __future__ import annotations
 KEY_NAMESPACE = "kvc"
 
 
-def build_tenant_suffix(cfg) -> str:
+def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     """Build the per-tenant key suffix from a model/parallel config.
 
     Mirrors sglang's `HiCacheFile._get_suffixed_key`
@@ -32,9 +36,18 @@ def build_tenant_suffix(cfg) -> str:
     attributes below (an sglang `HiCacheStorageConfig`, a vLLM-derived shim, or
     a plain namespace), so both adapters share one implementation.
 
-    Format: `{model}` then optionally `_{tp_rank}_{tp_size}` (skipped for MLA
-    models, whose KV is rank-independent) then `_pp{pp_rank}_{pp_size}` (only if
-    pp_size > 1).
+    Format: `{model}` then optionally `_{model_fingerprint}` then optionally
+    `_{tp_rank}_{tp_size}` (skipped for MLA models, whose KV is
+    rank-independent) then `_pp{pp_rank}_{pp_size}` (only if pp_size > 1).
+
+    `model_fingerprint` (BUG-KVC-TENANT, see `_identity.py`) carries the
+    model's REAL identity (architecture shape + weights source). It is
+    REQUIRED on the vLLM connector path, where `model_name` is just the local
+    config-dir path and is constant across models under `autumn_vllm_loader`
+    — without it two different models silently share one tenant and cross-read
+    KV (live incident: Qwen2.5-7B/32B both under `model-cfg_0_1`). When None
+    (sglang default, or an unfingerprintable config) the format is exactly the
+    pre-fingerprint one, so existing sglang tenants are unchanged.
     """
     if cfg is None:
         return "default"
@@ -49,6 +62,8 @@ def build_tenant_suffix(cfg) -> str:
     pp_rank = getattr(cfg, "pp_rank", 0)
     pp_size = getattr(cfg, "pp_size", 1)
     parts = [str(model)]
+    if model_fingerprint:
+        parts.append(str(model_fingerprint))
     if not is_mla:
         parts.append(f"{tp_rank}_{tp_size}")
     if pp_size and pp_size > 1:

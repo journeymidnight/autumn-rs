@@ -24,6 +24,7 @@ from typing import List, Optional
 import autumn
 
 from ._bridge import run, run_on, new_loop
+from ._identity import fingerprint_from_sources
 from ._keys import build_tenant_suffix, full_key, pool_prefix
 
 try:
@@ -108,7 +109,20 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             )
 
         self.storage_config = storage_config
-        self._tenant_suffix = build_tenant_suffix(storage_config)
+        # BUG-KVC-TENANT: on the sglang path `model_name` is the served
+        # `--model-path` — normally a real identity (sglang has no equivalent
+        # of autumn_vllm_loader's fixed config dir), so the default tenant
+        # format is UNCHANGED (no key invalidation for existing sglang
+        # deployments). `HiCacheStorageConfig` carries no architecture info to
+        # fingerprint from, so the escape hatch for deployments where the path
+        # is NOT unique (two finetunes at one path, containers mounting
+        # different weights at the same mount point) is an explicit
+        # extra_config["model_id"], folded in as a fingerprint.
+        model_id = extra_config.get("model_id")
+        fingerprint = (
+            fingerprint_from_sources({"model_id": str(model_id)}) if model_id else None
+        )
+        self._tenant_suffix = build_tenant_suffix(storage_config, fingerprint)
         # Optional transport selection ("tcp" default, or "ucx" for RDMA).
         # Must be set before the first connect; idempotent process-global.
         transport = (extra_config.get("transport") or "tcp").lower()
