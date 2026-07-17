@@ -24,7 +24,7 @@ from typing import List, Optional
 import autumn
 
 from ._bridge import run, run_on, new_loop
-from ._identity import fingerprint_from_sources
+from ._identity import fingerprint_from_sources, read_credential_file as _read_credential_file
 from ._keys import build_tenant_suffix, full_key, pool_prefix
 
 try:
@@ -163,11 +163,30 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         # path is used. (The old extra_config["zc"] opt-in was removed; KV-cache
         # pages are large so reads cross the ZC size threshold and writes are
         # always ZC on UCX — both win at this size; see UCX_ZC_READ_MIN_BYTES.)
-        self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight))
+        # F-AUTHZ-BUILTIN (D6-kvc): same authz wiring as the vLLM connector —
+        # `auth_tenant` + `auth_credential_file` in extra_config, both or
+        # neither, file read fails loudly at startup. Threads to BOTH clients
+        # (authz gates reads on protected prefixes too — a credential-less
+        # probe client would silently turn every hit into a miss).
+        auth_tenant = extra_config.get("auth_tenant")
+        auth_cred_file = extra_config.get("auth_credential_file")
+        if (auth_tenant is None) != (auth_cred_file is None):
+            raise ValueError(
+                "extra_config: auth_tenant and auth_credential_file must be set together"
+            )
+        auth: dict = {}
+        if auth_cred_file:
+            auth = {
+                "tenant": auth_tenant,
+                "credential": _read_credential_file(auth_cred_file),
+            }
+        self._batch = autumn.BatchClient(
+            endpoint, n_workers, max(1, self._max_inflight), **auth
+        )
         # Low-frequency v0 / batch_exists / clear paths use a regular async
         # Client on its own loop thread.
         self._loop0 = new_loop()
-        self._client = run_on(self._loop0, lambda: autumn.Client.connect(endpoint))
+        self._client = run_on(self._loop0, lambda: autumn.Client.connect(endpoint, **auth))
         self._mem_pool_host = None
         self._stats = {
             "get_hit": 0,

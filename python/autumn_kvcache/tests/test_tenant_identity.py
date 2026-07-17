@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from autumn_kvcache._identity import (
     FINGERPRINT_HEX_LEN,
     fingerprint_from_sources,
+    read_credential_file,
     tenant_cfg_from_vllm,
     vllm_identity_sources,
 )
@@ -338,3 +339,41 @@ def test_kv_layout_version_pinned_and_in_sources():
     assert VLLM_KV_STORAGE_FORMAT == "v1"
     src = vllm_identity_sources(_mk7b())
     assert src["kv_layout"] == "v1"
+
+
+# ── F-AUTHZ-BUILTIN: credential file must hex-DECODE to raw bytes ────────────
+# The SDK/manager contract is RAW credential bytes; `autumn-op tenant-create`
+# prints lowercase hex. Passing the ASCII hex through would mint with a wrong
+# credential → PermissionDenied once enforcement is on (coco P1 2026-07-17).
+
+def _write(tmp_path, content: str):
+    p = tmp_path / "cred"
+    p.write_text(content)
+    return str(p)
+
+
+def test_credential_file_bare_hex_decodes_to_raw(tmp_path):
+    raw = bytes(range(32))
+    assert read_credential_file(_write(tmp_path, raw.hex())) == raw
+    # trailing newline tolerated
+    assert read_credential_file(_write(tmp_path, raw.hex() + "\n")) == raw
+
+
+def test_credential_file_accepts_tenant_create_stdout(tmp_path):
+    raw = bytes(range(1, 33))
+    stdout = f"tenant 'hermes' created\ncredential: {raw.hex()}\n"
+    assert read_credential_file(_write(tmp_path, stdout)) == raw
+
+
+def test_credential_file_rejects_non_hex(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        read_credential_file(_write(tmp_path, "not-a-hex-string-zz"))
+
+
+def test_credential_file_rejects_ambiguous_multiline(tmp_path):
+    import pytest
+    raw = bytes(range(32))
+    # two bare-hex lines with no `credential:` marker is ambiguous → reject
+    with pytest.raises(ValueError):
+        read_credential_file(_write(tmp_path, raw.hex() + "\n" + raw.hex()))

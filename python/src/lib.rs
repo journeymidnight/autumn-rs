@@ -434,8 +434,33 @@ impl Client {
     /// Async classmethod: `await Client.connect("127.0.0.1:9001")`.
     /// Spawns the compio worker thread, performs the cluster handshake,
     /// then resolves the returned future with a connected `Client` instance.
+    ///
+    /// F-AUTHZ-BUILTIN (D6-mem wiring): pass `tenant=` + `credential=`
+    /// (bytes, from `autumn-op tenant-create`) to bind the connection to a
+    /// tenant credential — the client then AUTH_HELLOs each PS connection
+    /// with a short-TTL token (auto-minted + renewed by the SDK) scoped to
+    /// the tenant's granted prefixes. Required once `mem/` (or any prefix
+    /// this client writes) is enforcement-enabled; harmless against a
+    /// cluster with authz off. Both-or-neither: a lone tenant or lone
+    /// credential is a config error and fails loudly here rather than as a
+    /// confusing first-write PermissionDenied.
     #[staticmethod]
-    fn connect<'py>(py: Python<'py>, manager: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (manager, tenant=None, credential=None))]
+    fn connect<'py>(
+        py: Python<'py>,
+        manager: String,
+        tenant: Option<String>,
+        credential: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cred_pair = match (tenant, credential) {
+            (Some(t), Some(c)) => Some((t, c)),
+            (None, None) => None,
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "tenant= and credential= must be passed together (both or neither)",
+                ))
+            }
+        };
         let (handle, fut) = make_handle(py)?;
         let (tx, rx) = unbounded::<Op>();
 
@@ -452,6 +477,9 @@ impl Client {
                 rt.block_on(async move {
                     match ClusterClient::connect(&manager).await {
                         Ok(client) => {
+                            if let Some((t, c)) = cred_pair {
+                                client.set_tenant_credential(t, c);
+                            }
                             // Move `tx` into the Python Client object so the
                             // caller can submit further ops; resolve future.
                             handle.resolve(move |py| {
@@ -953,9 +981,31 @@ impl BatchClient {
     /// ClusterClient, and wait until all are ready. `per_worker_cap` bounds the
     /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
     /// rendezvous cliff).
+    /// F-AUTHZ-BUILTIN (D6-kvc wiring): `tenant=` + `credential=` (bytes)
+    /// bind EVERY worker's ClusterClient to the tenant credential — required
+    /// once `kvc/` is enforcement-enabled (the kvcache connector threads these
+    /// from `kv_connector_extra_config`); harmless with authz off. Both or
+    /// neither, validated up front.
     #[new]
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false))]
-    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize, direct: bool) -> PyResult<Self> {
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, tenant=None, credential=None))]
+    fn new(
+        py: Python<'_>,
+        manager: String,
+        n_workers: usize,
+        per_worker_cap: usize,
+        direct: bool,
+        tenant: Option<String>,
+        credential: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let cred_pair = match (tenant, credential) {
+            (Some(t), Some(c)) => Some((t, c)),
+            (None, None) => None,
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "tenant= and credential= must be passed together (both or neither)",
+                ))
+            }
+        };
         let n_workers = n_workers.max(1);
         // F216-E "ucx ⟹ zerocopy": derive the data path from the process
         // transport (set via set_transport BEFORE construction) — no explicit
@@ -967,6 +1017,7 @@ impl BatchClient {
                 let (job_tx, mut job_rx) = unbounded::<BatchJob>();
                 let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
                 let endpoint = manager.clone();
+                let worker_cred = cred_pair.clone();
                 std::thread::Builder::new()
                     .name(format!("autumn-batch-{i}"))
                     .spawn(move || {
@@ -980,6 +1031,9 @@ impl BatchClient {
                         rt.block_on(async move {
                             let client = match ClusterClient::connect(&endpoint).await {
                                 Ok(c) => {
+                                    if let Some((t, cred)) = worker_cred {
+                                        c.set_tenant_credential(t, cred);
+                                    }
                                     let _ = ready_tx.send(Ok(()));
                                     c
                                 }

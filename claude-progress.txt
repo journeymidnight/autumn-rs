@@ -1,5 +1,24 @@
 Date: 2026-07-16
 TaskStatus: not_completed
+
+---- F-AUTHZ-BUILTIN D6-mem/kvc client wiring (2026-07-17) ----
+TaskStatus: completed
+Scope: client-side credential plumbing ONLY (user: 不用管线上，先写代码).
+  PyO3 Client.connect + BatchClient grow (tenant=, credential=) kwargs,
+  both-or-neither validated up front; workers set_tenant_credential after
+  connect. kvcache vLLM connector + sglang backend read auth_tenant /
+  auth_credential_file from extra_config (named auth_* to avoid clashing
+  with the key-namespace tenant_suffix), thread to BatchClient AND the
+  existence-probe Client (authz gates reads on protected prefixes too).
+  hermes provider: AUTUMN_MEMORY_CREDENTIAL_FILE. ops.md: enablement
+  runbook (credentials-first gradual axis; rollback = drop signing key).
+Verify: python/ workspace does NOT compile on local stable rustc
+  (pre-existing: standalone workspace pins compio-buf 0.8.3 needing
+  unstable maybe_uninit_slice; wheel builds in Docker/maturin) — PyO3
+  change validated by rustfmt parse only. kvcache offline tests 23/23.
+  Provider/backends ast-parse clean. NOT live-tested (needs wheel build).
+Next: enablement is an OPS decision (runbook ready); D6-fs waits on D1.
+
 Task scope: F-KVC-LAYOUT-FP — BUG-KVC-TENANT follow-up: fold the KV *layout*
   versions into the model fingerprint. vLLM's page layout is an internal
   detail (no stability contract; README pins 0.23.0 but loader.py:5 already

@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import autumn
 
 from ._bridge import new_loop, run, run_on
-from ._identity import tenant_cfg_from_vllm as _tenant_cfg_from_vllm
+from ._identity import read_credential_file as _read_credential_file, tenant_cfg_from_vllm as _tenant_cfg_from_vllm
 from ._keys import VLLM_KV_STORAGE_FORMAT, build_tenant_suffix, full_key
 
 log = logging.getLogger(__name__)
@@ -219,9 +219,25 @@ class _AutumnKVStore:
         max_inflight: Optional[int] = None,
         ttl_secs: int = 0,
         direct_read: bool = True,
+        auth_tenant: Optional[str] = None,
+        auth_credential: Optional[bytes] = None,
     ):
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
+        # F-AUTHZ-BUILTIN (D6-kvc): authz identity, NOT the key-namespace
+        # tenant — `tenant_suffix` (model fingerprint etc.) picks WHERE keys
+        # live; `auth_tenant`+`auth_credential` prove WHO may write there.
+        # Both-or-neither (the PyO3 layer enforces it too, but failing here
+        # keeps the error at construction, before any worker threads spawn).
+        if (auth_tenant is None) != (auth_credential is None):
+            raise ValueError(
+                "auth_tenant and auth_credential must be passed together"
+            )
+        self._auth = (
+            {"tenant": auth_tenant, "credential": auth_credential}
+            if auth_tenant is not None
+            else {}
+        )
         self._tenant = tenant_suffix
         # Marker TTL = configured ttl_secs; layer TTL = ttl_secs + grace so the
         # marker always expires first (see _TTL_LAYER_GRACE_SECS). 0 = no expiry.
@@ -254,11 +270,16 @@ class _AutumnKVStore:
             "EN-direct" if self._direct_read else "PS-proxy",
         )
         self._batch = autumn.BatchClient(
-            endpoint, max(1, int(n_workers)), max(1, cap), self._direct_read
+            endpoint, max(1, int(n_workers)), max(1, cap), self._direct_read, **self._auth
         )
-        # Low-frequency existence probing on its own loop thread.
+        # Low-frequency existence probing on its own loop thread. The probe
+        # client carries the same credential — authz gates reads on protected
+        # prefixes too, and a credential-less probe would turn every
+        # is_present() into a miss (cache silently dead) once kvc/ is enforced.
         self._loop = new_loop()
-        self._client = run_on(self._loop, lambda: autumn.Client.connect(endpoint))
+        self._client = run_on(
+            self._loop, lambda: autumn.Client.connect(endpoint, **self._auth)
+        )
 
     # Reserved layer-name sentinel marking "all layers for this prefix were
     # saved". The scheduler probes THIS (not a real layer name) so existence
@@ -509,6 +530,21 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         direct_read = extra.get("direct_read", True)
         if isinstance(direct_read, str):
             direct_read = direct_read.strip().lower() not in ("0", "false", "no", "off")
+        # F-AUTHZ-BUILTIN (D6-kvc): authz identity from extra_config —
+        # `auth_tenant` + `auth_credential_file` (path; k8s mounts a Secret).
+        # Required once kvc/ is enforcement-enabled; absent = unauthenticated
+        # (fine while authz is off). File read fails loudly at startup rather
+        # than as a first-write PermissionDenied mid-inference.
+        auth_tenant = extra.get("auth_tenant")
+        auth_cred_file = extra.get("auth_credential_file")
+        if (auth_tenant is None) != (auth_cred_file is None):
+            raise ValueError(
+                "kv_connector_extra_config: auth_tenant and auth_credential_file "
+                "must be set together"
+            )
+        auth_credential: Optional[bytes] = None
+        if auth_cred_file:
+            auth_credential = _read_credential_file(auth_cred_file)
         self._store = _AutumnKVStore(
             endpoint,
             self._tenant_suffix,
@@ -517,6 +553,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             max_inflight=extra.get("max_inflight"),
             ttl_secs=ttl_secs,
             direct_read=bool(direct_read),
+            auth_tenant=auth_tenant,
+            auth_credential=auth_credential,
         )
 
         # scheduler-side state: req_id -> (content_hash, num_tokens) for cache hits.

@@ -257,3 +257,34 @@ def tenant_cfg_from_vllm(vllm_config: Any):
         identity_sources=sources,
         model_fingerprint=fingerprint_from_sources(sources),
     )
+
+
+def read_credential_file(path: str) -> bytes:
+    """Read a tenant credential file -> RAW bytes for the SDK.
+
+    On-disk format = the lowercase hex printed by `autumn-op tenant-create`
+    (either the bare hex, or its `credential: <hex>` stdout line — accepted
+    defensively since "save the output" is the predictable operator move).
+    The SDK/manager contract is RAW credential bytes (`mint-token` hex-decodes
+    before sending; the manager stores the SHA-256 of the raw bytes), so
+    passing the ASCII hex through would mint with a WRONG credential and every
+    protected-prefix op would die with PermissionDenied once enforcement is on
+    (coco P1 2026-07-17). Fail loudly here, at startup, instead.
+    """
+    with open(path, "r", encoding="ascii") as f:
+        lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.lower().startswith("credential:"):
+            hexs = ln.split(":", 1)[1].strip()
+            break
+    else:
+        if len(lines) != 1:
+            raise ValueError(
+                f"credential file {path!r}: expected a single hex line or a "
+                f"'credential: <hex>' line, got {len(lines)} lines"
+            )
+        hexs = lines[0]
+    try:
+        return bytes.fromhex(hexs)
+    except ValueError as e:
+        raise ValueError(f"credential file {path!r}: not valid hex: {e}") from None
