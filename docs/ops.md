@@ -877,6 +877,39 @@ cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_ten
 # TTL config (ttl=0 ⇒ never blames TTL; points at tenant/model mismatch).
 ```
 
+### External hit rate & the kill switch (BUG-KVC-NO-HIT)
+
+The vLLM connector is an **L3 behind vLLM's own local prefix cache** (GPU + host
+RAM). vLLM matches the local cache first and asks the connector only for tokens
+*beyond* the local match, so:
+
+- **same engine, repeated prompt** ⇒ local cache serves it ⇒ external is
+  (correctly) never loaded ⇒ `External prefix cache hit rate: 0.0%`. **Expected,
+  not a bug** — judge the connector by cross-instance / post-restart hit rate.
+- **restarted or different engine, or after local eviction** ⇒ local cache is
+  cold ⇒ the connector loads the prefix from autumn and skips prefill (measured
+  ~3–4× TTFT win on a 1.3 k-token prefix).
+
+The connector also **no longer re-saves a prefix already durable in autumn**: a
+repeat whose KV the local cache served writes nothing (before this fix it
+re-saved every layer every request — the "kvc grows 20 GB while hit rate is 0%,
+prefill stalls" symptom).
+
+Two `kv_connector_extra_config` switches (read once at startup; a change needs a
+vLLM restart), both default on:
+
+```jsonc
+// load-only — serve external hits, never write (drop the write cost, keep reads)
+"kv_connector_extra_config": { "endpoint": "MGR:9001", "enable_save": false }
+// fully disabled — no probe, no load, no save (net-negative kill switch)
+"kv_connector_extra_config": { "endpoint": "MGR:9001", "enabled": false }
+```
+
+Verify on a live deployment: the connector logs `... in LOAD-ONLY mode` or
+`... DISABLED via kv_connector_extra_config` at startup, and a same-prompt
+request on a **freshly restarted** engine should log an external hit and a much
+lower TTFT than the cold-cluster first request.
+
 ## Data-plane authz setup (F-AUTHZ-1)
 
 Server-side key-range authorization for the `mem/` namespace

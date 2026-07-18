@@ -1,5 +1,59 @@
 Date: 2026-07-18
 TaskStatus: completed
+Task scope: BUG-KVC-NO-HIT — autumn KV cache 写了但从不命中 (external hit 恒 0%) +
+  拖慢 prefill + 20GB 写放大。真机复现 (本地 3-EN TCP 集群 + vLLM 0.23 +
+  真 Qwen3-VL-32B-Instruct on H200; 本机 `/data/f250_vllm_venv` 有匹配 wheel,
+  但装的 `autumn` .so 是 6-22 旧的 → 先 `maturin develop --release` 重建才能对齐
+  namespace binding)。
+根因 (逐调用 trace, 非推断):
+  - **0% external hit 是分层设计的正确行为, 不是 bug**。connector 是 vLLM 本地
+    prefix cache (GPU/RAM) 之后的 L3；vLLM 先匹配本地, 只把"本地未命中的残余
+    token"问外部 (远端比本地慢, 不该反选)。同实例重复 prompt 本地全覆盖
+    (`get_num_new_matched_tokens` computed==num_check) → external 结构上永不被
+    LOAD → hit 恒 0%。跨实例/重启 (本地冷) 命中路径本就正确 (实测 fresh 进程
+    wall 0.63s vs cold 2.19s, load_ok=64, 3.4x)。
+  - **真 bug = 冗余重存**: store 路径 (build_connector_meta) 从不检查前缀是否已在
+    autumn, 于是每个本地命中的重复请求把全部 64 层重存一遍 (trace: cold 存 64 层
+    352MB, 每个 warm 又存 64 层) = 20GB 写放大 + 同步 put_from 拖慢 prefill、
+    TTFT 不降。
+修复 (crates 外, `python/autumn_kvcache/autumn_kvcache/vllm_connector.py` 纯 Python,
+  editable install 即时生效, 无需重建 native wheel):
+  - **store-dedup**: gnmt 每请求探一次 presence 并缓存 (即使本地覆盖也探, 那正是
+    重存场景); build_connector_meta 存前若 (a) 本批已排存同 chash 或 (b) gnmt 正
+    命中或 (c) 后端 is_present → 跳过。只信 POSITIVE 缓存, 负判重探 (缩小跨请求
+    窗口); 加 per-batch `scheduled_stores` 集合杀同批并发重存 (coco P2 pass3)。
+  - **kill switch**: `enabled=false` 完整 no-op 且 **不联系后端** (提前 return,
+    `_store=None`, 跳过 endpoint 校验/凭据读/store 构造 → 后端挂了也能起);
+    worker 三入口 (start_load_kv/save_kv_layer/wait_for_save) 加 `if not _enabled`
+    守卫防 config skew 解引用 None。`enable_save=false` load-only (只读命中不写)。
+  - 抽 `_as_bool` 复用 (direct_read + 两开关)。
+Review: coco (GPT-5.5 deep) 三轮。P1: 0 findings。P2/P3 共 10 findings 全评估+修:
+  R1 (4): enabled 仍连后端/构造 store、load-only 无谓 probe、文档漏 probe、未用
+  import → 全修。R2 (5): request_finished 漏清 _reqs_need_load、负判缓存并发重存、
+  worker 解引用 None、缺真 __init__ 测试、README endpoint 措辞 → 全修。R3 (1):
+  同批并发冷前缀重存 → 加 per-batch set 修。
+  **故意未做** (判 over-eng, 记残留): 跨 step 的 in-flight store 去重 (coco 建议
+  `_stores_in_flight`) —— scheduler/worker 是不同进程/实例, 跨界清理复杂且失败会
+  永久跳过存 (cache 永不暖); 残留窗口 = 一次存的时延, 有界、自愈 (marker 落后即
+  dedup)、内容寻址幂等 (同 key 同字节, 不损坏)。
+Verify: 单测全绿 —— 新增 `tests/test_no_hit_dedup.py` (7: cold 存/present dedup/
+  跨实例 load/同批 dedup/disabled noop/load-only/真 __init__ disabled 免 endpoint+
+  免 store & enabled 必须 endpoint) + 既有 identity 27 = 35 passed。真机 e2e 四项
+  PASS: (1) dedup — cold 存 64 层/352MB 一次, warm×2 各存 0 层、wall 1.93→0.24s
+  (~7x, 本地 cache 收益现形); (2) 跨实例 load — fresh 进程 PROBE True/matched 1328/
+  load_ok 64/wall 0.63s; (3) enabled=false noop — probe=save=load=0 且生成正常;
+  (4) enabled=false + DEAD endpoint (127.0.0.1:59999) — 照常起+生成 (证 kill switch
+  免后端)。
+Docs: docs/ops.md ("外部命中语义 + kill switch" 章节) + python/autumn_kvcache/README.md
+  (缓存分层语义、enabled/enable_save 开关、endpoint 措辞) 已更新; feature_list.md
+  BUG-KVC-NO-HIT Status 详注 (仍 passes:false 待线上 redeploy, 部署=用户驱动)。
+Next: 线上 redeploy vLLM 主机 (connector 纯 Python 改动, `autumn` native 未改 →
+  重装 autumn_kvcache 包即可, 无需新 native wheel); 验证 restart 后同 prompt
+  external hit>0 + TTFT 降 + kvc 写入量与复用相称。用户驱动。
+
+---- 上一子交付 ----
+Date: 2026-07-18
+TaskStatus: completed
 Task scope: F-KEY-NS SD-3 = D1 fuse `fs/{tenant}/{volume}/` scoping (main agent 自己实现).
   停机批次第三子交付; 代码 + fable 对抗审 + 活集群测试完成, 待与 SD-1+SD-2 一起
   stop-world cluster reset 部署 (部署=用户驱动, 下一阶段).

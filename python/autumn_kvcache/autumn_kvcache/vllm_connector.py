@@ -103,6 +103,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 # ── content hashing (mirror SharedStorageConnector foldername scheme) ────────
 
+def _as_bool(v: Any, default: bool = True) -> bool:
+    """Coerce a JSON/extra_config value (bool | str | None) to bool.
+
+    `kv_connector_extra_config` values arrive as real bools from a Python dict
+    or as strings from a JSON string on the command line, so accept both. None
+    (key absent) → `default`. Strings: everything except the usual falsey words
+    is True (so a bare `"1"`/`"true"` reads on).
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off")
+    return bool(v)
+
+
 def align_to_block_size(n: int, block_size: int) -> int:
     """Floor `n` to a whole number of blocks."""
     if block_size <= 0:
@@ -493,18 +510,65 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         except Exception as e:  # noqa: BLE001
             log.warning("AutumnKVConnector: partial vllm_config (%r); using defaults", e)
 
-        endpoint = extra.get("endpoint") or extra.get("manager")
-        if not endpoint:
-            raise ValueError(
-                "AutumnKVConnector requires 'endpoint' in kv_connector_extra_config"
-            )
+        # BUG-KVC-NO-HIT kill switches (read once at init; changing them needs a
+        # vLLM restart, same as any engine arg). The connector is a pure cache —
+        # on a workload with NO cross-instance / restart reuse it is net-negative
+        # (every prefill pays a synchronous save that is never read back):
+        #   enabled=False      → complete no-op (no probe, no load, no save) that
+        #                        needs NO working backend — also the fault-
+        #                        isolation switch when autumn is unreachable.
+        #   enable_save=False  → load-only: external HITS still serve (pure win on
+        #                        an already-warm cache) but nothing is written.
+        self._enabled = _as_bool(extra.get("enabled"), True)
+        self._enable_save = _as_bool(extra.get("enable_save"), True)
         self._block_size = block_size
+        self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))
         # BUG-KVC-TENANT: the tenant MUST carry the model's real identity.
         # `model_name` alone is the served path, which is a CONSTANT local dir
         # under autumn_vllm_loader — the fingerprint (arch shape + weights
         # source, see _identity.py) is what actually separates models.
         fingerprint = getattr(tenant_cfg, "model_fingerprint", None)
         self._tenant_suffix = build_tenant_suffix(tenant_cfg, fingerprint)
+        # scheduler + worker state — set BEFORE any early return so every method
+        # is safe to call even on the disabled path.
+        # req_id -> (content_hash, num_tokens) for cache hits.
+        self._reqs_need_load: dict = {}
+        # req_id -> (content_hash, is_present) from the ONE presence probe in
+        # get_num_new_matched_tokens, consumed by build_connector_meta's
+        # store-dedup so it never re-probes (or re-saves) an already-durable
+        # prefix (BUG-KVC-NO-HIT).
+        self._presence: dict = {}
+        # req_id -> block ids recorded at alloc time (authoritative for load).
+        self._alloc_blocks: dict = {}
+        # worker-side state.
+        self._kv_caches: dict = {}
+        self._layer_order: List[str] = []
+        self._meta: Optional[AutumnConnectorMetadata] = None
+        # req_id -> count of layers SUCCESSFULLY saved this step. `wait_for_save`
+        # publishes the `__present__` marker ONLY when a req saved ALL layers
+        # (count == len(kv_caches)) — catches save-never-ran / partial / per-layer
+        # failure alike, any of which would else leave a marker over missing KV.
+        self._saved_count: dict = {}
+
+        if not self._enabled:
+            # True kill switch: skip endpoint validation, credential-file read
+            # and _AutumnKVStore construction (all touch config / the cluster), so
+            # `enabled=false` is a no-op that ALSO isolates a broken backend.
+            # Every scheduler/worker path guards on `self._enabled` (or an empty
+            # meta) and never dereferences `self._store`.
+            self._store = None
+            log.warning(
+                "AutumnKVConnector DISABLED via kv_connector_extra_config "
+                "(enabled=false) — no external KV load/save; backend not contacted"
+            )
+            log.info("AutumnKVConnector role=%s tenant=%s (disabled)", role, self._tenant_suffix)
+            return
+
+        endpoint = extra.get("endpoint") or extra.get("manager")
+        if not endpoint:
+            raise ValueError(
+                "AutumnKVConnector requires 'endpoint' in kv_connector_extra_config"
+            )
         if fingerprint is None:
             log.warning(
                 "no model-identity fingerprint derivable from vllm_config — "
@@ -527,7 +591,6 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "(risk: cross-version reads of layout-incompatible KV).",
                 self._tenant_suffix,
             )
-        self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))
         transport = (extra.get("transport") or "tcp").lower()
         # `ttl_secs` (default 0 = no expiry) bounds how long an offloaded prefix
         # lives in autumn before lazy expiry reclaims it. Content-addressed keys
@@ -540,9 +603,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             raise ValueError(f"ttl_secs must be non-negative, got {ttl_secs}")
         # F-DIRECT-MANY: EN-direct reads default ON (topology-dependent, safe —
         # size-gated + per-item proxy fallback). Accept a JSON bool or a string.
-        direct_read = extra.get("direct_read", True)
-        if isinstance(direct_read, str):
-            direct_read = direct_read.strip().lower() not in ("0", "false", "no", "off")
+        direct_read = _as_bool(extra.get("direct_read"), True)
         # F-AUTHZ-BUILTIN (D6-kvc): authz identity from extra_config —
         # `auth_tenant` + `auth_credential_file` (path; k8s mounts a Secret).
         # Required once kvc/ is enforcement-enabled; absent = unauthenticated
@@ -570,21 +631,11 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             auth_credential=auth_credential,
         )
 
-        # scheduler-side state: req_id -> (content_hash, num_tokens) for cache hits.
-        self._reqs_need_load: dict = {}
-        # req_id -> block ids recorded at alloc time (authoritative for load).
-        self._alloc_blocks: dict = {}
-        # worker-side state.
-        self._kv_caches: dict = {}
-        self._layer_order: List[str] = []
-        self._meta: Optional[AutumnConnectorMetadata] = None
-        # req_id -> count of layers SUCCESSFULLY saved this step. `wait_for_save`
-        # publishes the `__present__` marker ONLY when a req saved ALL layers
-        # (count == len(kv_caches)). This is the true "marker ⇒ all layers
-        # present" invariant: it catches save-never-ran (count 0), partial
-        # saves, and per-layer failures alike — any of which would otherwise
-        # leave a marker the scheduler admits into a missing/partial load.
-        self._saved_count: dict = {}
+        if not self._enable_save:
+            log.warning(
+                "AutumnKVConnector in LOAD-ONLY mode (enable_save=false) — "
+                "external hits still serve, but no KV is written"
+            )
         log.info(
             "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s identity=%s",
             role, self._tenant_suffix, self._block_size, _VLLM_AVAILABLE,
@@ -598,15 +649,34 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
     def get_num_new_matched_tokens(self, request: Any, num_computed_tokens: int):
         """Return (num_external_tokens_loadable, load_is_async)."""
+        if not self._enabled:
+            return 0, False
         token_ids = list(getattr(request, "prompt_token_ids", []) or [])
         num_check = align_to_block_size(max(0, len(token_ids) - 1), self._block_size)
-        if num_check <= num_computed_tokens:
+        if num_check <= 0:
+            return 0, False
+        # The presence probe below has two consumers: an external LOAD (only
+        # possible when there are tokens the local cache is missing,
+        # num_check > num_computed) and the store-dedup (only relevant when
+        # saving is on). If neither applies — load-only mode AND the local cache
+        # already covers the prompt — the probe would be pure wasted remote IO
+        # on the scheduler hot path, so skip it.
+        if num_check <= num_computed_tokens and not self._enable_save:
             return 0, False
         chash = prefix_hash(token_ids, num_check, _request_extra_keys(request))
         # Probe the layer-name-independent completion marker, NOT a specific
         # layer key: the scheduler does not know the worker's model-specific
-        # layer names (register_kv_caches is worker-side only).
-        if self._store.is_present(chash):
+        # layer names (register_kv_caches is worker-side only). Probe ONCE per
+        # request and cache the verdict for build_connector_meta's store-dedup
+        # — crucially even when the LOCAL prefix cache already covers the prompt
+        # (num_check <= num_computed_tokens). That same-instance-repeat case is
+        # exactly what was re-saving all layers every request (BUG-KVC-NO-HIT):
+        # local serves the compute, external is never LOADED (correct — remote
+        # is slower than local), but the prefix is already durable in autumn, so
+        # it must not be re-SAVED either.
+        present = self._store.is_present(chash)
+        self._presence[_req_id(request)] = (chash, present)
+        if present and num_check > num_computed_tokens:
             self._reqs_need_load[_req_id(request)] = (chash, num_check)
             # Phase 3a loads synchronously in start_load_kv → not async.
             return num_check - num_computed_tokens, False
@@ -621,6 +691,14 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
     def build_connector_meta(self, scheduler_output: Any) -> AutumnConnectorMetadata:
         meta = AutumnConnectorMetadata()
+        if not self._enabled:
+            return meta
+        # Prefixes already scheduled to store IN THIS batch. The `__present__`
+        # marker is only published later (worker wait_for_save), so within one
+        # build pass the remote is_present() probe still reads False for every
+        # identical cold-prefix request — without this per-batch set they'd all
+        # be scheduled to save the same KV (concurrent write amplification).
+        scheduled_stores: set = set()
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
             req_id = _req_id(new_req)
             # Prefer alloc-time block ids; fall back to the new-req's own field.
@@ -628,6 +706,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             if not block_ids:
                 block_ids = _flatten_block_ids(getattr(new_req, "block_ids", None))
             token_ids = list(getattr(new_req, "prompt_token_ids", []) or [])
+            probed = self._presence.pop(req_id, None)  # (chash, present) from gnmt
 
             if req_id in self._reqs_need_load:
                 chash, num_tokens = self._reqs_need_load.pop(req_id)
@@ -636,7 +715,27 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 num_tokens = align_to_block_size(max(0, len(token_ids) - 1), self._block_size)
                 if num_tokens <= 0:
                     continue
+                if not self._enable_save:
+                    continue  # load-only mode: never write
                 chash = prefix_hash(token_ids, num_tokens, _request_extra_keys(new_req))
+                # Store-dedup (BUG-KVC-NO-HIT): skip the save when this prefix is
+                # ALREADY durable in autumn. Without it, every request whose KV
+                # the LOCAL prefix cache already served (same-instance repeat)
+                # re-saved all layers → the 20 GB write amplification + the
+                # synchronous-save prefill stall, for zero benefit (the bytes are
+                # already there). Trust only a POSITIVE cached gnmt probe; on a
+                # negative/absent verdict re-probe here so a marker another
+                # (near-concurrent) request published between gnmt and now still
+                # de-dups — else concurrent cold same-prefix requests each re-save.
+                already = (
+                    chash in scheduled_stores  # same batch already saving it
+                    or bool(probed and probed[0] == chash and probed[1])  # positive gnmt probe
+                    or self._store.is_present(chash)  # else ask the backend
+                )
+                if already:
+                    log.debug("skip save req=%s: prefix already present/queued", req_id)
+                    continue
+                scheduled_stores.add(chash)
                 is_store = True
 
             slots = _slot_mapping_for_blocks(block_ids, self._block_size, num_tokens)
@@ -654,7 +753,14 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
     def request_finished(self, request: Any, block_ids: List[int]):
         # Synchronous save (Phase 3a): blocks are free to release immediately.
-        self._alloc_blocks.pop(_req_id(request), None)
+        rid = _req_id(request)
+        self._alloc_blocks.pop(rid, None)
+        # Drop any scheduler state that never reached build_connector_meta
+        # (e.g. a request aborted while queued) so the maps can't grow unbounded
+        # — and a stale `_reqs_need_load` entry can't bind a later request to
+        # this one's content_hash if the engine ever reuses the id.
+        self._presence.pop(rid, None)
+        self._reqs_need_load.pop(rid, None)
         return False, None
 
     # ── worker side ─────────────────────────────────────────────────────────
@@ -696,6 +802,10 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         import numpy as np
         import torch
 
+        # Disabled ⇒ `self._store is None`; also guard here (not just via empty
+        # metadata) so a config-skewed / stale non-empty meta can never deref it.
+        if not self._enabled:
+            return
         meta = self._meta
         if meta is None:
             return
@@ -745,6 +855,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         return None
 
     def save_kv_layer(self, layer_name: str, kv_layer: "torch.Tensor", attn_metadata: Any, **kwargs: Any) -> None:
+        if not self._enabled:  # `self._store is None` when disabled — see start_load_kv
+            return
         meta = self._meta
         if meta is None:
             return
@@ -764,6 +876,8 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # put_from is awaited inside save_layers (write-through, ACK = durable).
         # Publish the layer-name-independent completion marker the scheduler
         # probes — but ONLY for store-reqs that saved EVERY layer.
+        if not self._enabled:  # `self._store is None` when disabled — see start_load_kv
+            return
         meta = self._meta
         if meta is None:
             return

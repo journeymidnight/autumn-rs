@@ -67,9 +67,52 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /models/Qwen3-8B --served-model-name qwen3 \
 ```
 
 `kv_connector_extra_config` keys: `endpoint` (autumn manager `host:port`,
-required), `transport` (`tcp` default, or `ucx`), `client_workers`,
+required unless `enabled=false`), `transport` (`tcp` default, or `ucx`), `client_workers`,
 `max_inflight`, `ttl_secs`, `model_id` (optional explicit model identity — see
-below).
+below), `enabled` / `enable_save` (the kill switches — see next).
+
+### What the external cache does (and does not) speed up
+
+The connector is an **L3** behind vLLM's own local prefix cache (GPU + host
+RAM). vLLM matches the local cache first and asks the connector only for the
+tokens *beyond* the local match, because remote storage is slower than a local
+hit — you would never want to prefer autumn over GPU cache. Concretely:
+
+- **Same engine, repeated prompt** → the local prefix cache serves it, so the
+  external cache is (correctly) never *loaded* and its hit rate is ~0%. This is
+  expected, not a failure.
+- **A *different* engine / a *restarted* engine / after local eviction** → the
+  local cache is cold, so the connector loads the prefix from autumn and skips
+  prefill. This is the whole point (measured: a 1.3 k-token prefix loads in
+  ~0.3 s vs. ~2 s of recompute — a ~3–4× TTFT win on the cold-local path).
+
+So judge the connector by **cross-instance / post-restart** hit rate, not by
+same-instance repeats. It also **never re-saves a prefix that is already durable
+in autumn** (BUG-KVC-NO-HIT): a repeat whose KV the local cache already served
+writes nothing, so it costs neither storage nor prefill time. (It does issue one
+lightweight presence probe per new request to make that de-dup decision; in
+`enable_save=false` load-only mode even that probe is skipped once the local
+cache covers the prompt.)
+
+### Turning it off (`enabled` / `enable_save`)
+
+Both are read once at engine start (changing them needs a restart, same as any
+engine arg), and both default to on:
+
+- **`enable_save`** (default `true`) — set to `false` for **load-only** mode:
+  external hits still serve (pure win on an already-warm cache) but nothing is
+  ever written. Use this when the cache is warm and you only want reads, or to
+  stop paying the write cost on a workload with little reuse.
+- **`enabled`** (default `true`) — set to `false` to make the connector a
+  **complete no-op** (no probe, no load, no save). The one-flag kill switch when
+  the cache is net-negative, without having to drop `--kv-transfer-config`.
+
+```jsonc
+// load-only: serve hits, write nothing
+"kv_connector_extra_config": { "endpoint": "127.0.0.1:9001", "enable_save": false }
+// fully disabled: no-op
+"kv_connector_extra_config": { "endpoint": "127.0.0.1:9001", "enabled": false }
+```
 
 ### Tenant isolation: the model's real identity is part of the key
 
