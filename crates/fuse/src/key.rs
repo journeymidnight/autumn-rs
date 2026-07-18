@@ -111,6 +111,14 @@ pub fn next_inode_key() -> Vec<u8> {
     super_key(b"next_inode")
 }
 
+/// F-KEY-NS SD-3: well-known superblock key holding this volume's on-disk
+/// layout version (`schema::SCHEMA_VERSION`, BE u64). Volume-relative like
+/// every other key, so it lives at `fs/{tenant}/{volume}/[0x04]schema_version`
+/// — each volume stamps + verifies its own layout independently.
+pub fn schema_version_key() -> Vec<u8> {
+    super_key(b"schema_version")
+}
+
 /// UNLINK-1: unlink-intent tombstone `[0x04]rmtomb/[ino BE]`. Written the
 /// moment an inode becomes UNREACHABLE (its last dirent gone) and removed
 /// after its extents + inode key are deleted; the mount-time sweep replays
@@ -156,6 +164,18 @@ mod tests {
     fn inode_key_roundtrip() {
         let key = inode_key(42);
         assert_eq!(parse_inode_key(&key), Some(42));
+    }
+
+    #[test]
+    fn super_keys_are_distinct() {
+        // Both are superblock keys but must not collide with each other or the
+        // rmtomb prefix (all live under 0x04).
+        let ni = next_inode_key();
+        let sv = schema_version_key();
+        assert_ne!(ni, sv);
+        assert!(sv.starts_with(&[PREFIX_SUPER]));
+        assert!(!sv.starts_with(&unlink_tombstone_prefix()));
+        assert_eq!(parse_unlink_tombstone(&sv), None);
     }
 
     #[test]

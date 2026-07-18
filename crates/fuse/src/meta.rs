@@ -89,6 +89,9 @@ pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
 /// (F-FS-UNIFY M0), so this is safe for any co-equal writer (the fuse mount's
 /// `init_root` layers its legacy pre-manager batch seed on top).
 pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
+    // F-KEY-NS SD-3: verify/stamp the volume's layout version BEFORE any
+    // root read/write, so an incompatible layout refuses to mount up front.
+    ensure_schema_version(state).await?;
     let root_key = key::inode_key(ROOT_INO);
     if state.kv_get_opt(&root_key).await?.is_some() {
         return Ok(false);
@@ -96,6 +99,53 @@ pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
     let root_meta = new_dir_meta(0o755, unsafe { libc::getuid() }, unsafe { libc::getgid() });
     put_inode(state, ROOT_INO, &root_meta).await?;
     Ok(true)
+}
+
+/// F-KEY-NS SD-3: verify (or stamp) this volume's on-disk layout version.
+/// Each volume carries its own `[0x04]schema_version` (volume-relative → it
+/// lives at `fs/{tenant}/{volume}/[0x04]schema_version`).
+///
+/// - **absent** → a fresh volume: stamp the current `SCHEMA_VERSION`.
+/// - **present, matches** → OK.
+/// - **present, differs (or malformed)** → FAIL LOUD: refuse to mount a layout
+///   this binary can't interpret rather than silently reading/writing garbage.
+///
+/// Fail-loud on a transient KV error too — `kv_get_opt` propagates hard errors
+/// (never conflates "absent" with "unreachable", which would re-stamp a real
+/// volume as fresh).
+pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
+    let k = key::schema_version_key();
+    match state.kv_get_opt(&k).await? {
+        None => {
+            state
+                .kv_put(&k, &schema::SCHEMA_VERSION.to_be_bytes())
+                .await
+                .context("stamp schema_version on fresh volume")?;
+            Ok(())
+        }
+        Some(v) => {
+            let found: u64 = v
+                .as_slice()
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
+                    anyhow!(
+                        "schema_version holds {} bytes, want 8 (BE u64) — refusing to mount",
+                        v.len()
+                    )
+                })?;
+            if found == schema::SCHEMA_VERSION {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "on-disk fs schema version {} != supported {} — refusing to mount \
+                     (incompatible layout; wipe/re-create this volume or use a matching build)",
+                    found,
+                    schema::SCHEMA_VERSION
+                ))
+            }
+        }
+    }
 }
 
 /// Fetch inode metadata from KV store (or cache).

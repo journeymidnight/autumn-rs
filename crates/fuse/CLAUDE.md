@@ -168,8 +168,13 @@ Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻�
 > 全部 `parse_*` 都保持 RELATIVE、**零改动** —— volume 前缀只活在 KV choke point。
 > 净 wire key = `fs/{tenant}/{volume}/[type][fields]`：一个 mount 只能碰自己的 volume
 > （scope 由构造锁死），写路径被 Layer-A 按 `fs` namespace 门控。每个 volume 有独立的
-> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 `next_inode` floor、独立的 rmtomb 墓碑扫描
+> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 per-volume inode 计数器（manager
+> `alloc_inodes` 收 `FsState::volume_identity()` → etcd `fs/{t}/{v}/next_inode`）、独立的
+> `next_inode` floor、独立的 rmtomb 墓碑扫描、独立的 `[0x04]schema_version` 戳
 > ——天然按前缀隔离。charset 与 ns/tenant 一致：`[a-z0-9._-]+`（`is_valid_volume`）。
+> **schema 版本戳（`schema::SCHEMA_VERSION` = 2, `meta::ensure_schema_version`）**：mount
+> 时（`ensure_root` 入口）缺则戳、有则核对、不符则 **fail-loud 拒挂**（防未来不兼容布局
+> 静默读写坏数据）；v1 = pre-SD-3 裸 key 布局（不戳），v2 = SD-3 `fs/{t}/{v}/` 相对布局。
 
 > **F247 — 变长 extent（取代固定 256 KiB chunk）。** 文件数据不再是固定 256 KiB
 > 块，而是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，

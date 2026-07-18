@@ -99,6 +99,23 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
 
+/// F-KEY-NS SD-3: the on-disk layout version stamped per volume in the
+/// superblock (`[0x04]schema_version`, so it lands at
+/// `fs/{tenant}/{volume}/[0x04]schema_version`).
+///
+/// - **v1** = the pre-SD-3 layout (raw `0x01`–`0x04` keys under a Raw client
+///   binding, single global inode counter). Never actually stamped — v1
+///   volumes carry NO schema_version key.
+/// - **v2** = the SD-3 layout: keys are RELATIVE to `fs/{tenant}/{volume}/`
+///   (the client prepends `fs/{tenant}/`, `FsState.vol` prepends `{volume}/`)
+///   and the inode counter is per-volume.
+///
+/// `meta::ensure_schema_version` stamps a fresh volume with this value and
+/// FAILS LOUD if an existing volume's stamp differs — a future incompatible
+/// layout (v3+) then refuses to mount rather than silently corrupting data.
+/// BUMP this whenever the key layout / value encoding changes incompatibly.
+pub const SCHEMA_VERSION: u64 = 2;
+
 // File type constants (from libc)
 pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
