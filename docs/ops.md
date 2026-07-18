@@ -142,6 +142,18 @@ If a previous daemon died it can leave a stale mount (`ls` reports "Transport
 endpoint is not connected"); clear it before re-mounting with
 `fusermount3 -u "$MP"` (or `umount -l "$MP"`).
 
+**F-KEY-NS SD-3 — the mount is scoped to `fs/{tenant}/{volume}/`.** `autumn-fuse`
+takes `--tenant`/`--volume` (both default `default`), so every inode/dirent/extent
+key lands under `fs/{tenant}/{volume}/`. A `--tenant default --volume default`
+mount, the PyO3 `autumn.Fs.connect(tenant="default", volume="default")` client, and
+`autumnfs --tenant default --volume default` **all see the SAME filesystem** — the
+defaults are chosen so existing single-fs usage is unchanged. Point two mounts at
+DIFFERENT `--volume` to get two isolated filesystems in one cluster. Inode numbers
+are cluster-unique (a single global counter), so the model-weight re-ingest via
+`autumnfs put` and a later fuse mount serving those files never collide; a
+`schema_version` stamp per volume makes a future incompatible layout fail loud
+rather than mount empty.
+
 **UCX (RDMA):** with `--transport ucx`, export the UCX env before launching (the
 UCX C library reads it directly): a positive `UCX_TLS` list — never `^` negation —
 and a pinned RoCE device, e.g.

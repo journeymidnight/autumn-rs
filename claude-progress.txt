@@ -1,41 +1,45 @@
 Date: 2026-07-18
-TaskStatus: not_completed
-Task scope: F-KEY-NS SD-3 = D1 fuse `fs/{tenant}/{volume}/` scoping (main agent 实现,
-  用户："不用 teammate 了" 代码自己写). 停机批次第三子交付, 完成后与 SD-1+SD-2 一起
-  stop-world cluster reset 部署.
-Done (核心增量, 已编译+测试, 待 commit):
-  - **关键设计判定**: fuse 所有 KV 访问都汇聚到 `state.rs` 的 8 个 `kv_*` choke point
-    (kv_get/get_opt/put/put_fenced/delete/delete_fenced/range_keys/exists), 不是走 key
-    builder. 所以 `{volume}/` 前缀只需加在 choke point —— **key.rs 与其 38 处调用点、
-    全部 parse_* 零改动**. (先前把 key.rs 改成 per-builder KeyCodec 是错的层, 已 revert.)
-  - `FsState` 加 `vol: Vec<u8>` (`{volume}/` 字节) + `wire()` helper; 8 个 kv_* 在入口
-    prepend `{volume}/`, `kv_range_keys` 额外把 `{volume}/` 从返回 key 剥回. connect 由
-    `connect_raw` 改 `scoped(fs, tenant)` (client 拥有 `fs/{tenant}/` 半 + 剥回). 净 wire
-    key = `fs/{tenant}/{volume}/[type][fields]`. volume 段 charset `[a-z0-9._-]+` 校验
-    (`is_valid_volume`; ns/tenant 由 client connect 校验).
-  - 前缀 bounded 正确性已核: PS handle_range 按 req.prefix 收窄扫描 (rpc_handlers.rs:1057),
-    readdir/scan_extents 忽略 parsed parent/ino 依赖此收窄 —— 前缀变长不改语义, 仅多一个
-    tenant 上界 cap. 每 volume 独立 root inode / next_inode floor / rmtomb 扫描 (天然按
-    前缀隔离, Piece 5 自动完成).
-  - 挂载接线: fuse binary `--tenant`/`--volume` (默认 default); PyO3 `autumn.Fs.connect
-    (tenant=, volume=)` (默认 default, 与 binary 对齐 → Python 与 mount 见同一 FS); 8 处
-    测试构造点改 scoped. fuse CLAUDE.md KV key 段加 SD-3 scoping 注.
-Verify: `cargo build -p autumn-fuse --features core` 绿; `cargo check -p autumn-fuse`
-  (fuse feature, 含 main.rs binary) 绿; manager 3 个 fuse 测试二进制 (f_fuse_lease_1/2 +
-  system_fuse_read, 均 #[ignore] 集群测) 编译过; fuse core 单测 12 全过. python ext 因
-  预存 compio-buf 0.8.3 unstable (排除工作区, 非本次改动) 本机不可编 —— fs.rs 照 host 参数
-  同型写, 低风险.
-Next (剩余 SD-3):
-  - Piece 3 — per-volume inode 计数器: fuse 调 alloc_inodes 传 volume 身份 (`fs/{t}/{v}/`);
-    manager handle_alloc_inodes 按 volume 键 etcd 计数器 (`autumn-rs/fs/{t}/{v}/next_inode`).
-    wire 字段 AllocInodesReq.volume 已 SD-1 冻结, 无 wire 改动. (当前全局计数器仍正确 ——
-    inode 全局唯一, 只是不 per-volume 密集; per-volume 是最终设计, 一并进本批部署.)
-  - Piece 4 — superblock schema 戳: SCHEMA_VERSION + schema_version_key; mount/ensure_root
-    缺则写、有则读+版本不符 fail-loud.
-  - Piece 8 — 测试: volume scoping 单测 + 集成 (两 volume 隔离 / 前缀正确性).
-  - 然后 review (fable/coco) → 全批 stop-world cluster reset 部署 SD-1+SD-2+SD-3.
-遗留(非阻塞): memory keys.rs / hermes vestigial tenant 参数彻底删; presplit fuse_split_ranges
-  归 D8/部署工具.
+TaskStatus: completed
+Task scope: F-KEY-NS SD-3 = D1 fuse `fs/{tenant}/{volume}/` scoping (main agent 自己实现).
+  停机批次第三子交付; 代码 + fable 对抗审 + 活集群测试完成, 待与 SD-1+SD-2 一起
+  stop-world cluster reset 部署 (部署=用户驱动, 下一阶段).
+Done (7 commit: 46ed227 core + bbb26ed→78a3530 inode + 03b49f5 schema + 9748d3d P0 +
+  47e3159 autumnfs + a0f5774 tests):
+  - **关键设计判定**: fuse 所有 KV 访问汇聚到 `state.rs` 8 个 `kv_*` choke point + read/write
+    两处 batch 数据路径 —— `{volume}/` 只加这些点, **key.rs 与 38 调用点、全部 parse_* 零改动**
+    (先前 per-builder KeyCodec 是错的层, 已 revert). `FsState.vol` + `wire()` prepend `{volume}/`,
+    `kv_range_keys` 剥回; connect `connect_raw`→`scoped(fs, tenant)` (client 拥 `fs/{tenant}/` +
+    剥回). 净 wire key = `fs/{tenant}/{volume}/[type][fields]`. 前缀 bounded 正确性已核
+    (PS handle_range:1057 按 req.prefix 收窄). volume 段校验 `[a-z0-9._-]+`.
+  - schema 戳 (Piece 4): `SCHEMA_VERSION=2` + `ensure_schema_version` (缺戳/符过/不符或坏字节
+    fail-loud, ensure_root 入口 → fuse mount + PyO3 都覆盖).
+  - autumnfs 迁移 (P1-3): client 加 `connect_volume(mgr,ns,tenant,volume)` +
+    `NamespaceBinding::scoped_volume` (client 拥全前缀 `fs/{t}/{v}/` → autumnfs ~30 相对-key op
+    零改动); autumnfs 加 `--tenant/--volume` + inode 改 manager 发号. server CLAUDE.md/ops.md 同步.
+  - 挂载接线: fuse binary + PyO3 `autumn.Fs.connect` + autumnfs 均 `--tenant/--volume` 默认 default
+    → 三者见同一 FS; 8 处 fuse 测试构造点改 scoped.
+**inode 号=全局唯一 (用户拍板 B, 非 per-volume)**: lease/fence 平面按裸 ino key
+  (`AcquireLeaseReq` 无 volume, manager `inode_leases/<ino>`, PS `fence_floors`), per-volume inode
+  会跨 volume 撞车 (fable P1-2)。用户选 B (尊重 v25 冻结, 不动 wire): fuse 传空 volume + 去掉
+  `init_root` 本地 seed → 全 inode 走 manager 全局计数器 (cluster-unique)。per-volume 机制 +
+  冻结的 `AllocInodesReq.volume` 休眠待将来 volume-aware lease; manager `valid_alloc_volume` 校验
+  冻结字段 (P2-4)。数据隔离靠 `{volume}/` key 前缀 (与 ino 无关), 不受影响。
+Review: fable subagent (coco 替代, coco 大 diff 反复 hang) 对抗审 → 1 P0 + 2 P1 + 2 P2 + 文档漂移:
+  - P0 batch 数据路径绕过 volume 前缀 (extent read get_many + write append put_many 只带
+    `fs/{t}/` 缺 `{volume}/`) —— **自查 choke-point 完整性时先发现并修 (9748d3d), fable 确认修得全**.
+  - P1-2 lease ino 冲突 → 拍板 B 全局 inode (上文). P1-3 autumnfs 未迁 → 已迁.
+  - P2-4 volume 校验 → 已加. P2-5 schema v1 guard → reset 部署下 acceptable-risk, 跳过
+    (probe 裸低位 key 路由脆; reset 后无 v1 数据; fail-loud v2→v3+ 仍在). 文档漂移 → 已修.
+Verify: fuse core 13、manager lib 228、client 35、fs_alloc 5 单测 + fs_alloc_inodes 集成;
+  **活本地集群 (manager+2EN+PS) 跑绿**: `system_fuse_ns.rs` cold-remount 读回 (证 P0 修复:
+  batch append 写的 extent 冷重挂 scan 能读回) + 双 volume 隔离 (同 ino=100 各读回自己字节) +
+  既有 f247 全读写截断删 (无回归). workspace check 绿. python ext 因预存 compio-buf unstable 本机
+  不可编 (fs.rs 照 host 参数同型写, 低风险).
+Next: 全批 stop-world cluster reset 部署 SD-1+SD-2+SD-3 (用户驱动) → 活集群验证 (mount ls/cp,
+  autumnfs 重灌 qwen32b, 双 volume 隔离). push 仍 hold (本地 ahead 10).
+遗留(非阻塞): memory keys.rs / hermes vestigial tenant 参数彻底删; presplit fuse_split_ranges 归
+  D8/F-PRESPLIT-PER-NS 部署工具; init_root 非 CAS root-create race 为 M0 既有 (未加剧);
+  autumnfs 不写 schema 戳 (fuse mount 首挂时写); 将来 volume-aware lease = 独立 feature (需 wire).
 
 ---- 上一子交付 ----
 Date: 2026-07-18
