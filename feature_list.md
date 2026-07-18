@@ -44,6 +44,18 @@
 - **运维已知**（本次实测，写进 ops.md）: 带数据的 partition **不能连续分裂** —— CoW 分裂后父子共享 extent，子 partition 的 SST 含越界 key，PS 以 `precondition failed: cannot split: partition has overlapping keys` 拒绝下一次分裂；需 major compact 清掉越界 key 后才能再分（PS 有 has_overlap-major 自动补偿，所以重试也会成功，只是慢）。**正确顺序是"先 presplit 空 keyspace 再灌数据"**。另：大量 split/merge 之后 manager 的 `part_addrs` 会残留过期映射（merge 报 `partition X not served by this P-log`），**并行删除全部 PS pod** 重建即可。
 - **Status**: `passes: false` (2026-07-18) — 线上已用手工 split 临时铺平（fs 8 分区按 ino、kvc 1 分区待模型上线后按 hash 分），代码侧未改。
 
+### BUG-KVC-NO-HIT — autumn KV cache 写了但从不命中（external hit rate 恒 0%），且拖慢 prefill
+- **Trigger** (2026-07-18, SD-1/2/3 上线后 32B 实测): vLLM 自带日志 `Prefix cache hit rate: 73–79%`（本地前缀缓存正常）但 **`External prefix cache hit rate: 0.0%`** —— AutumnKVConnector 从未命中一次。同时 kvc partition (324) `live_size=39.11 GB`，扣掉 CoW 共享基线 19.33 GB ≈ **自身写入 ~20 GB**（32B 每 token KV ≈ 262 KB，十几个 bench 请求就写了 20 GB）。即：**每次 prefill 都把 KV 存进 autumn，但之后一次都读不回来** —— 纯开销、零收益，还占 EN 空间。
+- **实测速度**（H20 ×1, TP=1, Qwen2.5-32B-AWQ, 单并发）:
+  - decode ≈ **54 tok/s**（正常）
+  - **TTFT 随 prompt 线性劣化**: ~50 字符 0.46 s / ~500 字符 1.82 s / ~2000 字符 6.26 s / ~8000 字符 **23.4 s**
+  - vLLM 自报 `Avg prompt throughput` 仅 **100–424 tok/s**（32B-AWQ 在 H20 上 prefill 应是数千 tok/s，低一个数量级）
+  - 同一 prompt 重复请求 TTFT 几乎不降（11.8 → 10.7 → 10.9 s），说明命中路径没生效
+  - 对照：权重加载 18.49 GiB / 18.5 s（≈1 GB/s，EN-direct 读路径正常）→ **不是集群/网络慢**
+- **Scope**: 定位 0% 命中的根因（候选：save 是异步且落后于下次 lookup；save/lookup 的 key 不一致；`PRESENT_MARKER` 探测键与实际写入键不匹配；F-KVC-LAYOUT-FP 改指纹后 tenant 与探测端不一致）；确认 save 是否在 prefill 关键路径上同步阻塞（TTFT 线性劣化 + prompt throughput 低一个数量级高度可疑）；命中前应先能**关掉**（配置开关）以免纯负收益。
+- **Acceptance**: 同 prompt 二次请求 external hit rate > 0 且 TTFT 显著下降；prefill throughput 回到同硬件无 connector 的水平（或差距 < 20%）；kvc 写入量与实际复用相称；提供 `kv_connector_extra_config` 开关一键停用。
+- **Status**: `passes: false` (2026-07-18) — 线上现状：功能可用（不报错、不影响正确性），但**性能上是净负收益**，建议在修复前评估是否临时摘掉 `--kv-transfer-config`。
+
 ### F-AUTUMNFS-SLOW — autumnfs CLI 上传/读取明显偏慢
 - **Trigger** (2026-07-18, 用户线上观察 "明显感觉 autumnfs cli 偏慢"): 19 GB / 5 shard 顺序上传耗时约 7 min（≈45 MB/s），远低于集群实际能力（同集群 perf-check 写吞吐高一个量级）。
 - **Scope**: 定位并消除串行瓶颈。当前实现：`cmd_put` → `write_file_from_reader` 先把**整个文件 `read_to_end` 进内存**，再按 `MAX_EXTENT` 逐块**顺序 `put`**（无 pipeline、无并发、无 ZC）；`ls`/`cat` 因 PS `handle_range` 只回 key，对每个 key 再做一次**串行 `get`**。候选优化：流式分块读（去掉整文件驻留内存）+ `put_many` 批量并发（SDK 已有 `fan_out` 原语）+ 大 value 走 `put_zc`；`ls`/`cat` 改 `get_many_into` 批量取值。
