@@ -191,7 +191,15 @@ impl FsState {
     /// the on-wire key is `fs/{tenant}/{volume}/[type][fields]`. Returns an owned
     /// `Vec` (no borrow of `self` outlives the call), so `&mut self` KV helpers
     /// can build it then hand `&wk` to `self.client`.
-    fn wire(&self, k: &[u8]) -> Vec<u8> {
+    ///
+    /// `pub(crate)` because the BATCH data path bypasses the `kv_*` helpers for
+    /// performance — `read::fill_region`'s `get_many_into`/`get_many_direct` and
+    /// `extent::flush_appends`'s `put_many_fenced` call the client directly, so
+    /// they MUST wire their extent keys here too or the data would land at
+    /// `fs/{tenant}/[0x03]…` (missing `{volume}/`) while the RMW/metadata paths
+    /// use `fs/{tenant}/{volume}/…` — a cross-volume collision + intra-volume
+    /// append-vs-overwrite key mismatch.
+    pub(crate) fn wire(&self, k: &[u8]) -> Vec<u8> {
         [self.vol.as_slice(), k].concat()
     }
 

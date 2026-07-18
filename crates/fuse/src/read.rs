@@ -127,7 +127,14 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
             continue;
         }
         chunks.push(ChunkSpec {
-            key: key::extent_key(ino, start),
+            // F-KEY-NS SD-3: the spawned `execute` reads these via
+            // `get_many_into`/`get_many_direct` DIRECTLY on the client (it holds
+            // no `&FsState`), bypassing the `kv_*` volume-prefix choke point — so
+            // wire the `{volume}/` prefix HERE, in `prepare` (which has `&mut
+            // state`). The client then prepends `fs/{tenant}/`, matching the
+            // write side (kv_put_fenced / flush_appends). Without this, reads
+            // would look up `fs/{tenant}/[0x03]…` and miss every extent.
+            key: state.wire(&key::extent_key(ino, start)),
             offset: (ov_start - start) as u32,
             length: (ov_end - ov_start) as u32,
             dest_offset: (ov_start - offset) as usize,
