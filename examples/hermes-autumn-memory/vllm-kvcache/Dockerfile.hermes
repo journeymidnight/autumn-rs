@@ -29,12 +29,24 @@ ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_MIRROR=
 ARG PIP_INDEX_URL=https://pypi.org/simple
+#   APT_MIRROR     : Debian/Ubuntu apt mirror BASE URL (e.g.
+#     https://mirrors.volces.com or https://mirrors.aliyun.com). Empty =
+#     upstream deb.debian.org (slow from CN build agents — `apt-get update`
+#     dominated the image build). Rewrites both source formats: the one-line
+#     /etc/apt/sources.list (Ubuntu, older Debian) and the deb822
+#     /etc/apt/sources.list.d/*.sources (Debian 12+, which this slim base uses).
+ARG APT_MIRROR=
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH HERMES_HOME=/hermes \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
     RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
     PIP_INDEX_URL=${PIP_INDEX_URL}
 
-RUN apt-get update \
+RUN if [ -n "$APT_MIRROR" ]; then \
+      find /etc/apt \( -name '*.list' -o -name '*.sources' \) -print | while read -r f; do \
+        sed -i -E "s#https?://(deb\.debian\.org|security\.debian\.org|archive\.ubuntu\.com|security\.ubuntu\.com)#${APT_MIRROR}#g" "$f"; \
+      done; \
+    fi \
+ && apt-get update \
  && apt-get install -y --no-install-recommends curl git build-essential pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/* \
  && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \

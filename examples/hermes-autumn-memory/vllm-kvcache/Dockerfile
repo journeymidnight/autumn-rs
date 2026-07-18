@@ -24,13 +24,25 @@ FROM ${BASE_REGISTRY}vllm/vllm-openai:${VLLM_TAG}
 ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_MIRROR=
+#   APT_MIRROR : Debian/Ubuntu apt mirror BASE URL (e.g.
+#     https://mirrors.volces.com or https://mirrors.aliyun.com). Empty =
+#     upstream archive.ubuntu.com (slow from CN build agents — `apt-get update`
+#     dominated the image build). Rewrites both the one-line
+#     /etc/apt/sources.list (this vLLM base is Ubuntu) and deb822
+#     /etc/apt/sources.list.d/*.sources.
+ARG APT_MIRROR=
 ENV CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
     RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
 
 # Rust + maturin to build the `autumn` PyO3 wheel against vLLM's Python.
 # The toolchain download honors RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT above.
-RUN apt-get update \
+RUN if [ -n "$APT_MIRROR" ]; then \
+      find /etc/apt \( -name '*.list' -o -name '*.sources' \) -print | while read -r f; do \
+        sed -i -E "s#https?://(deb\.debian\.org|security\.debian\.org|archive\.ubuntu\.com|security\.ubuntu\.com)#${APT_MIRROR}#g" "$f"; \
+      done; \
+    fi \
+ && apt-get update \
  && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/* \
  && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
