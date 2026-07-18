@@ -1,4 +1,44 @@
 Date: 2026-07-18
+TaskStatus: not_completed
+Task scope: F-KEY-NS SD-3 = D1 fuse `fs/{tenant}/{volume}/` scoping (main agent 实现,
+  用户："不用 teammate 了" 代码自己写). 停机批次第三子交付, 完成后与 SD-1+SD-2 一起
+  stop-world cluster reset 部署.
+Done (核心增量, 已编译+测试, 待 commit):
+  - **关键设计判定**: fuse 所有 KV 访问都汇聚到 `state.rs` 的 8 个 `kv_*` choke point
+    (kv_get/get_opt/put/put_fenced/delete/delete_fenced/range_keys/exists), 不是走 key
+    builder. 所以 `{volume}/` 前缀只需加在 choke point —— **key.rs 与其 38 处调用点、
+    全部 parse_* 零改动**. (先前把 key.rs 改成 per-builder KeyCodec 是错的层, 已 revert.)
+  - `FsState` 加 `vol: Vec<u8>` (`{volume}/` 字节) + `wire()` helper; 8 个 kv_* 在入口
+    prepend `{volume}/`, `kv_range_keys` 额外把 `{volume}/` 从返回 key 剥回. connect 由
+    `connect_raw` 改 `scoped(fs, tenant)` (client 拥有 `fs/{tenant}/` 半 + 剥回). 净 wire
+    key = `fs/{tenant}/{volume}/[type][fields]`. volume 段 charset `[a-z0-9._-]+` 校验
+    (`is_valid_volume`; ns/tenant 由 client connect 校验).
+  - 前缀 bounded 正确性已核: PS handle_range 按 req.prefix 收窄扫描 (rpc_handlers.rs:1057),
+    readdir/scan_extents 忽略 parsed parent/ino 依赖此收窄 —— 前缀变长不改语义, 仅多一个
+    tenant 上界 cap. 每 volume 独立 root inode / next_inode floor / rmtomb 扫描 (天然按
+    前缀隔离, Piece 5 自动完成).
+  - 挂载接线: fuse binary `--tenant`/`--volume` (默认 default); PyO3 `autumn.Fs.connect
+    (tenant=, volume=)` (默认 default, 与 binary 对齐 → Python 与 mount 见同一 FS); 8 处
+    测试构造点改 scoped. fuse CLAUDE.md KV key 段加 SD-3 scoping 注.
+Verify: `cargo build -p autumn-fuse --features core` 绿; `cargo check -p autumn-fuse`
+  (fuse feature, 含 main.rs binary) 绿; manager 3 个 fuse 测试二进制 (f_fuse_lease_1/2 +
+  system_fuse_read, 均 #[ignore] 集群测) 编译过; fuse core 单测 12 全过. python ext 因
+  预存 compio-buf 0.8.3 unstable (排除工作区, 非本次改动) 本机不可编 —— fs.rs 照 host 参数
+  同型写, 低风险.
+Next (剩余 SD-3):
+  - Piece 3 — per-volume inode 计数器: fuse 调 alloc_inodes 传 volume 身份 (`fs/{t}/{v}/`);
+    manager handle_alloc_inodes 按 volume 键 etcd 计数器 (`autumn-rs/fs/{t}/{v}/next_inode`).
+    wire 字段 AllocInodesReq.volume 已 SD-1 冻结, 无 wire 改动. (当前全局计数器仍正确 ——
+    inode 全局唯一, 只是不 per-volume 密集; per-volume 是最终设计, 一并进本批部署.)
+  - Piece 4 — superblock schema 戳: SCHEMA_VERSION + schema_version_key; mount/ensure_root
+    缺则写、有则读+版本不符 fail-loud.
+  - Piece 8 — 测试: volume scoping 单测 + 集成 (两 volume 隔离 / 前缀正确性).
+  - 然后 review (fable/coco) → 全批 stop-world cluster reset 部署 SD-1+SD-2+SD-3.
+遗留(非阻塞): memory keys.rs / hermes vestigial tenant 参数彻底删; presplit fuse_split_ranges
+  归 D8/部署工具.
+
+---- 上一子交付 ----
+Date: 2026-07-18
 TaskStatus: completed
 Task scope: F-KEY-NS SD-2 = D7 client binding + PS Layer-A + kvc/mem key changes,
   改为 **Prepend-only**（用户拍板："转全 Prepend，天然锁 scope"）。

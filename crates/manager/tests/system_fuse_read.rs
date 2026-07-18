@@ -80,7 +80,7 @@ fn f247_variable_length_extents() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 134, 13401).await;
 
-        let mut state = FsState::new(&mgr_addr.to_string())
+        let mut state = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("FsState::new");
         dispatch::init_root(&mut state).await.expect("init_root");

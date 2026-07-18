@@ -116,10 +116,10 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
         // Each "mount" is its own FsState (own ClusterClient + own
         // DaemonClientId UUID). Mirrors two daemons on different
         // hosts mounting the same partition layer.
-        let mut mount_a = FsState::new(&mgr_addr.to_string())
+        let mut mount_a = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount A");
-        let mut mount_b = FsState::new(&mgr_addr.to_string())
+        let mut mount_b = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount B");
         assert_ne!(
@@ -197,10 +197,10 @@ fn fuse_read_only_opens_coexist() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 140, 14001).await;
 
-        let mut mount_a = FsState::new(&mgr_addr.to_string())
+        let mut mount_a = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount A");
-        let mut mount_b = FsState::new(&mgr_addr.to_string())
+        let mut mount_b = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount B");
         dispatch::init_root(&mut mount_a).await.expect("init A");
@@ -243,7 +243,7 @@ fn fuse_refcount_only_last_release_fires_releaselease() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 141, 14101).await;
 
-        let mut mount = FsState::new(&mgr_addr.to_string())
+        let mut mount = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount");
         dispatch::init_root(&mut mount).await.expect("init");
@@ -309,7 +309,7 @@ fn fuse_mode_mismatch_in_same_mount_rejects() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 142, 14201).await;
 
-        let mut mount = FsState::new(&mgr_addr.to_string())
+        let mut mount = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount");
         dispatch::init_root(&mut mount).await.expect("init");
@@ -373,10 +373,10 @@ fn fuse_create_acquires_writer_lease() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 143, 14301).await;
 
-        let mut mount_a = FsState::new(&mgr_addr.to_string())
+        let mut mount_a = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount A");
-        let mut mount_b = FsState::new(&mgr_addr.to_string())
+        let mut mount_b = FsState::new(&mgr_addr.to_string(), "default", "default")
             .await
             .expect("mount B");
         dispatch::init_root(&mut mount_a).await.expect("init A");

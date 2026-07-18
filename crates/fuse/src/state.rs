@@ -105,31 +105,71 @@ pub struct FsState {
     /// each `ReadPlan` at `prepare` time so the spawned `read::execute` task
     /// (which holds no `&FsState`) can pick the batch primitive.
     pub direct_read: bool,
+
+    /// F-KEY-NS SD-3: the `{volume}/` byte prefix prepended to EVERY KV key
+    /// before it reaches the (scoped) client. This mount connects
+    /// `scoped(fs, tenant)`, so the client owns the `fs/{tenant}/` half and
+    /// strips it back off returned range keys; `vol` owns the `{volume}/` half.
+    /// Net wire key = `fs/{tenant}/{volume}/[type][fields]`, so a mount can only
+    /// ever touch its own volume (scope locked by construction) and Layer-A gates
+    /// the writes on the `fs` namespace. The bare `key::*` builders and every
+    /// call site stay unchanged — the volume prefix lives entirely at the KV
+    /// choke point below (`wire` / `kv_*`).
+    vol: Vec<u8>,
+}
+
+/// F-KEY-NS SD-3: a volume segment is embedded verbatim into
+/// `fs/{tenant}/{volume}/`, so an empty segment or one containing `/` would
+/// forge a nested/aliased scope. Enforce the same `[a-z0-9._-]+` charset the
+/// manager uses for namespace names (and the client uses for ns/tenant at
+/// connect). The client validates ns+tenant inside `connect`; the volume is
+/// fuse's to validate.
+fn is_valid_volume(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 impl FsState {
-    pub async fn new(manager_addr: &str) -> Result<Self> {
+    pub async fn new(manager_addr: &str, tenant: &str, volume: &str) -> Result<Self> {
         // The fuse binary keeps the env-derived hostname default (the daemon
         // has no CLI flag for it); the PyO3 `autumn.Fs` binding (F-FS-UNIFY
         // M2) passes an explicit host via `new_with_host` so no env read
         // leaks into the library path ([[feedback_no_env_in_rs]]).
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
-        Self::new_with_host(manager_addr, host).await
+        Self::new_with_host(manager_addr, host, tenant, volume).await
     }
 
     /// Connect with an explicit daemon-identity host (no env read). The
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
-    pub async fn new_with_host(manager_addr: &str, host: String) -> Result<Self> {
-        // F-KEY-NS D7: fuse keys are still raw type-bytes (`0x01`–`0x04`) until
-        // SD-3 migrates them to `fs/{tenant}/{volume}/`, so bind Raw (no client
-        // clamp). SD-3 switches this to `connect(mgr, "fs", tenant)` (Prepend —
-        // key.rs then emits keys RELATIVE to `fs/{tenant}/`).
-        let client = ClusterClient::connect_raw(manager_addr)
+    ///
+    /// F-KEY-NS SD-3: `tenant` + `volume` scope this mount. The client connects
+    /// `scoped(fs, tenant)` (owns + validates the `fs/{tenant}/` half); `volume`
+    /// is fuse's `{volume}/` half, validated here. Every KV key this mount
+    /// writes/reads lands under `fs/{tenant}/{volume}/`.
+    pub async fn new_with_host(
+        manager_addr: &str,
+        host: String,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Self> {
+        if !is_valid_volume(volume) {
+            return Err(anyhow!(
+                "invalid volume {volume:?}: must be non-empty and match [a-z0-9._-]+"
+            ));
+        }
+        // F-KEY-NS SD-3: scoped connect — the client prepends `fs/{tenant}/` to
+        // every key (and strips it off returned range keys), validating the
+        // ns+tenant charset at connect. `vol` below prepends `{volume}/` on top
+        // (see the field doc). The bare `key::*` builders stay relative to
+        // `fs/{tenant}/{volume}/`.
+        let client = ClusterClient::connect(manager_addr, "fs", tenant)
             .await
             .context("connect to manager")?;
         Ok(Self {
             client: Rc::new(client),
+            vol: format!("{volume}/").into_bytes(),
             inodes: HashMap::new(),
             dirty_inodes: HashSet::new(),
             next_inode: ROOT_INO + 1,
@@ -146,6 +186,15 @@ impl FsState {
 
     // ── KV helpers ──────────────────────────────────────────────────────────
 
+    /// F-KEY-NS SD-3: map a bare `key::*` key to the volume-relative wire key by
+    /// prepending `{volume}/`. The scoped client then prepends `fs/{tenant}/`, so
+    /// the on-wire key is `fs/{tenant}/{volume}/[type][fields]`. Returns an owned
+    /// `Vec` (no borrow of `self` outlives the call), so `&mut self` KV helpers
+    /// can build it then hand `&wk` to `self.client`.
+    fn wire(&self, k: &[u8]) -> Vec<u8> {
+        [self.vol.as_slice(), k].concat()
+    }
+
     /// Get a value from the KV store by key.
     pub async fn kv_get(&mut self, k: &[u8]) -> Result<Vec<u8>> {
         // 2026-06-04 fix — was hand-assembling GetReq + `ps_call`, which
@@ -158,9 +207,10 @@ impl FsState {
         // through the standard retry loop (MAX_PS_REFRESHES=10).
         // Same fix applied to kv_get_range / kv_put / kv_delete /
         // kv_range_keys / kv_exists below.
+        let wk = self.wire(k);
         match self
             .client
-            .get(k)
+            .get(&wk)
             .await
             .map_err(|e| anyhow!("KV get: {e}"))?
         {
@@ -174,7 +224,8 @@ impl FsState {
     /// (`clean_beyond_eof`) MUST NOT treat a transient failure as
     /// "already cleaned" (coco P1).
     pub async fn kv_get_opt(&mut self, k: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.client.get(k).await.map_err(|e| anyhow!("KV get: {e}"))
+        let wk = self.wire(k);
+        self.client.get(&wk).await.map_err(|e| anyhow!("KV get: {e}"))
     }
 
 
@@ -188,8 +239,9 @@ impl FsState {
     /// pass-through for callers that explicitly want to read as
     /// "durable Put".
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
+        let wk = self.wire(k);
         self.client
-            .put(k, v)
+            .put(&wk, v)
             .await
             .map_err(|e| anyhow!("KV put: {e}"))
     }
@@ -203,8 +255,9 @@ impl FsState {
         v: &[u8],
         lease: autumn_client::WriteLease,
     ) -> Result<()> {
+        let wk = self.wire(k);
         self.client
-            .put_fenced(k, v, lease)
+            .put_fenced(&wk, v, lease)
             .await
             .map_err(|e| anyhow!("KV put: {e}"))
     }
@@ -230,8 +283,9 @@ impl FsState {
 
     /// Delete a key from the KV store.
     pub async fn kv_delete(&mut self, k: &[u8]) -> Result<()> {
+        let wk = self.wire(k);
         self.client
-            .delete(k)
+            .delete(&wk)
             .await
             .map_err(|e| anyhow!("KV delete: {e}"))
     }
@@ -244,8 +298,9 @@ impl FsState {
         k: &[u8],
         lease: autumn_client::WriteLease,
     ) -> Result<()> {
+        let wk = self.wire(k);
         self.client
-            .delete_fenced(k, lease)
+            .delete_fenced(&wk, lease)
             .await
             .map_err(|e| anyhow!("KV delete: {e}"))
     }
@@ -260,19 +315,42 @@ impl FsState {
         start: &[u8],
         limit: u32,
     ) -> Result<Vec<Vec<u8>>> {
+        // F-KEY-NS SD-3: prepend `{volume}/` to both prefix and start. Every fuse
+        // caller passes a non-empty `start` (== prefix, or an in-scope resume
+        // key), so `wire(start)` correctly seeds the cursor at this volume's
+        // lower bound. The scoped client then prepends `fs/{tenant}/`, clamps at
+        // the tenant boundary, and strips `fs/{tenant}/` off returned keys — so
+        // here each key still carries the `{volume}/` prefix, which we strip back
+        // off to hand callers the bare `[type][fields]` key they parse.
+        let wprefix = self.wire(prefix);
+        let wstart = self.wire(start);
         let r = self
             .client
-            .range(prefix, start, limit)
+            .range(&wprefix, &wstart, limit)
             .await
             .map_err(|e| anyhow!("KV range: {e}"))?;
-        Ok(r.entries.into_iter().map(|e| e.key).collect())
+        let vlen = self.vol.len();
+        Ok(r
+            .entries
+            .into_iter()
+            .map(|e| {
+                if e.key.starts_with(self.vol.as_slice()) {
+                    e.key[vlen..].to_vec()
+                } else {
+                    // Should not happen (PS bounds the scan by the wire prefix,
+                    // which starts with `{volume}/`); pass through defensively.
+                    e.key
+                }
+            })
+            .collect())
     }
 
     /// Check if a key exists (uses Head RPC).
     pub async fn kv_exists(&mut self, k: &[u8]) -> Result<bool> {
+        let wk = self.wire(k);
         let meta = self
             .client
-            .head(k)
+            .head(&wk)
             .await
             .map_err(|e| anyhow!("KV head: {e}"))?;
         Ok(meta.found)

@@ -159,6 +159,18 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 
 Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
 
+> **F-KEY-NS SD-3 — 上表是 RELATIVE key；真实 wire key 带 `fs/{tenant}/{volume}/` 前缀。**
+> 挂载时 `--tenant` / `--volume`（PyO3 `autumn.Fs.connect(tenant=, volume=)`；均默认
+> `default`）确定 scope。`FsState` 用 `scoped(fs, tenant)` 连接 —— **client 负责
+> `fs/{tenant}/` 那一半**（prepend + 把返回 range key 剥回），**`FsState.vol` 负责
+> `{volume}/` 那一半**（`state.rs` 的 8 个 `kv_*` choke point 里 prepend；`kv_range_keys`
+> 额外把 `{volume}/` 从返回 key 剥回）。所以 `key::*` builder 与其 38 处调用点、以及
+> 全部 `parse_*` 都保持 RELATIVE、**零改动** —— volume 前缀只活在 KV choke point。
+> 净 wire key = `fs/{tenant}/{volume}/[type][fields]`：一个 mount 只能碰自己的 volume
+> （scope 由构造锁死），写路径被 Layer-A 按 `fs` namespace 门控。每个 volume 有独立的
+> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 `next_inode` floor、独立的 rmtomb 墓碑扫描
+> ——天然按前缀隔离。charset 与 ns/tenant 一致：`[a-z0-9._-]+`（`is_valid_volume`）。
+
 > **F247 — 变长 extent（取代固定 256 KiB chunk）。** 文件数据不再是固定 256 KiB
 > 块，而是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
 > value ≤ 8 MiB = `MAX_EXTENT`）。顺序写（write-once）合并成接近 8 MiB 的 extent，
