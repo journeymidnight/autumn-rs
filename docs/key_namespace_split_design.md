@@ -1003,3 +1003,155 @@ namespace 一行、tenant 不注册，授权/presplit 操作粒度 = pair，CLI
   成立；**自动执行**还需要三重人工条件（allow-mutations env + arm +
   merge 开关只在 aggressive preset 打开），今天不会自发发生。风险
   实际形态是"错误 advisory 诱导人工误操作 + 该分裂的永远不分裂"。
+
+---
+
+## 7. D1+D7+D2 停机批次实施设计（实施计划，2026-07-17）
+
+Status: 设计定稿，待实现（三个子交付分片，共享一次 wire 冻结 + 一次停机部署）。
+代码定位由三路 Explore 复核确认（fuse / client / manager 各一份，file:line 见下表）。
+
+### 7.0 批次总纲
+
+- **三个子交付，一次 wire，一次停机部署**。§3 的设计决策全部"已拍板"，
+  本节是把它们落成可执行、可分片 review 的实现契约。
+- **落地顺序 = D2 →（wire 冻结）→ D7 → D1**（用户 2026-07-17 拍板"拆成
+  D1/D7/D2 三个子交付"；顺序按依赖排：D7 的 Layer A 要查 D2 注册表、
+  D1 的 `fs/` 要先被注册表预注册）。每个子交付 = opus teammate 实现 +
+  coco review + 一个 commit，全部落在**冻结的 v25 wire 之后**，最后
+  一次 stop-world 同时部署。
+- **wire 冻结策略（关键）**：三个子交付共享一个 wire 版本。为了让它们
+  独立可 review，**SD-1 一次性把整批 wire 全冻结进 v25**（含 D1 的
+  `AllocInodesReq` volume 字段——先冻结、SD-3 才接线），其后 SD-2/SD-3
+  不再动 wire。避免三次 MIN=MAX 连环 bump。
+- **wire bump 机制**（`crates/rpc/src/lib.rs`，复核确认当前 = v24）：
+  改 `WIRE_VERSION_MIN/MAX`（:89-90）`24→25`，在 registry 尾部（:260）
+  追加一行 `(25, "<新fp>")`；测试 `registry_pins_current_schema_to_max_version`
+  (:381-405) 会失败并**打印出要粘贴的新 fp**。同一 commit 同时改结构 +
+  记 fp，MIN=MAX（rkyv 无跨版本解码，停机同版本部署，仓库惯例）。
+
+### 7.1 SD-1：D2 注册表 + 整批 wire 冻结（foundation，先落）
+
+模板全部照抄 **`tenantAccount/` 账户 DB**（F-AUTHZ-1，string-keyed etcd
+前缀 + rkyv 结构 + replay fail-loud），它与 `namespace/<name>` 同构。
+
+| # | 改动 | 抄自 / 改处（file:line） | 量级 |
+|---|---|---|---|
+| A | `MgrNamespace { name, prefix: Vec<u8>, owner_tenant: Option<String>, presplit: Vec<Vec<u8>>, created_at: i64 }` rkyv 结构 | 照 `MgrTenantAccount` `manager_rpc.rs:2114-2122` | 小 |
+| B | `NAMESPACE_PREFIX = "namespace/"` 常量 | 照 `TENANT_ACCOUNT_PREFIX` `lib.rs:78` | 小 |
+| C | 内存影子 `namespaces: Rc<RefCell<HashMap<String, MgrNamespace>>>` + `new()` init | `lib.rs:849` + `lib.rs:929` | 小 |
+| D | replay：`get_prefix("namespace/")` + fail-loud decode block | 插在 `lib.rs:2589` 旁 / 照 `lib.rs:2697-2712` | 小 |
+| E | bootstrap 首任 leader 预注册 `fs/`,`kvc/`,`mem/`（CAS-create 三行保留名） | 照 `imprint_cluster_id`（`try_become_leader`, `lib.rs:2779-2795`）| 小 |
+| F | `MSG_NAMESPACE_CREATE=0x57` / `MSG_NAMESPACE_DELETE=0x58`（下一空号）+ req/resp 结构 | consts `manager_rpc.rs:198-199`；结构照 `manager_rpc.rs:2129-2149` | 小 |
+| G | `handle_namespace_create/delete`（leader+admin 门禁、etcd-first、保留名 fs/kvc/mem/default 拒绝、前缀无关性 disjoint 校验、非空删除默认拒 + `--force`）| 照 `handle_tenant_create/delete` `rpc_handlers.rs:418-547`；dispatch `rpc_handlers.rs:255-259`；`--force` 空检查用 `put_delete_txn_cas` `lib.rs:347` | 中 |
+| H | SDK `namespace_create/delete` + autumn-op CLI arm（`namespace-create --name --presplit --with-tenant`；`--with-tenant` 包装 principal-create）| SDK 照 `client/lib.rs:693-722`；CLI 照 `args.rs:282-286/512-553`,`main.rs:358/404-431`；local-key-gen 型（with-tenant）照 `gen-signing-key` `main.rs:302-304` | 中 |
+| I | **bridge**：`handle_get_authz_config` 把注册表里 `owner_tenant.is_some()` 的 namespace 前缀并入 `protected_prefixes`（§3.7② —— D6 的手工 `--auth-protected-prefix` 清单退役为兜底）| 改 `rpc_handlers.rs:408` | 小 |
+| J | `GetAuthzConfigResp` 加 `namespaces: Vec<Vec<u8>>`（Layer A 数据源，SD-2 消费）| 结构 `manager_rpc.rs:2183-2203` | 小 |
+| K | `AllocInodesReq` 加 `volume`/`namespace` 字段（**只冻结，SD-3 接线**）| 结构 `manager_rpc.rs:1972-1983` | 小 |
+| L | Layer A 拒绝新错误码（语义 = NotFound 类，SD-2 PS 用）| `manager_rpc.rs` 错误码区 | 小 |
+| M | **整批 wire 冻结**：`MIN=MAX=25` + registry 追加一行 | `rpc/lib.rs:89-90` + `:260`；fp 由测试 `:381-405` 打印 | 小 |
+
+SD-1 自成体系可测（注册表 CRUD + 保留名/disjoint + replay round-trip +
+bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注册表/RPC
+本身不依赖它们。
+
+### 7.2 SD-2：D7 client binding + PS Layer A + kvc tenant 层（主体，量级最大）
+
+| # | 改动 | 改处（file:line） |
+|---|---|---|
+| A | `ClusterClient` 加 `binding: NamespaceBinding{namespace,tenant}` 字段 | `client/lib.rs:452` 旁 |
+| B | `connect(mgr,ns,tenant)` 替换单参 `connect(mgr)`（**删除单参 → 编译失败 = 最响亮 fail-loud**）；`connect_with_credential(mgr,ns,tenant,cred)` 在绑定处校验 `{ns}/{tenant}/ ⊆ 某 allowed_prefix` | 替换 `client/lib.rs:782`；扩 `:1029`；与 `set_tenant_credential` `:1017` 同点 |
+| C | **Prepend 模式**（用户 ns）：在每个点操作的 `key.to_vec()` 拦截点前缀化（点操作走 `call_ps_for_key`:1377 / `resolve_key`:1274 一层；批量 `batch_put`:2447 / `get_many*`:2339/1990/2208、流 `put_stream_begin`:2884 显式）| 见 §1 map |
+| D | **range 钳制**：`range()` 把 prefix 拼 `{ns}/{tenant}/`、cursor seed ≥ 下界、加上界 cap `{ns}/{tenant}0`（`0`=0x30 是 `/` 的后继）、返回 `entry.key` 剥掉前缀 | `range` `client/lib.rs:2671`（cursor `:2692`、上界新增、剥前缀 `:2808`）|
+| E | **Assert 模式**（内置族 fs/kvc/mem）：builder 产出绝对 key，binding 不再拼、只 `starts_with` 校验越界即拒 | binding 分支判定 |
+| F | `rescope(ns,tenant)` + `raw()` 逃生舱（**raw() 只绕 client 侧钳制，不绕 PS Layer A/B**）| 新增 |
+| G | **PS Layer A**（新 gate arm）：put/batch-put/stream-put 的 key 必须落在**某个已注册 namespace** 前缀内，否则拒（新错误码，SD-1 L）；纯 `starts_with` 匹配、免 token、匿名连接也受检；数据源 = `GetAuthzConfigResp.namespaces`（SD-1 J）| 复用 `authz.rs:168` `starts_with` 基建；新 arm 近 `authz.rs:244` `authz_check`；PS install `authz.rs:97-123`。**Layer B 零 PS 改动**（PS 已按到达的 `protected_prefixes` 强制）|
+| H | PyO3 `Client.connect` / `BatchClient.__new__` 加**必填** `namespace=`/`tenant=`（与 D6 的 `tenant`(principal)/`credential` **组合不重复**；细化三把旧 `tenant=` kwarg 改名 `principal=`）| `python/src/lib.rs:447-454`,`989-999` |
+| I | autumn-client CLI `--namespace`+`--tenant` **必填**（缺参 = migration-error）；`Ls`/`range` 继承钳制 | `autumn_client/main.rs:967`,`1142-1148` |
+| J | **kvc key 补 tenant 层**：`full_key`/`pool_prefix` 加 `tenant` 参 → `kvc/{tenant}/{model}/{pool}/{hash}`；调用点同改 | `_keys.py:96-98`,`:101-107`；`sglang_backend.py:215-216`,`:355-360`；`vllm_connector.py:300-303` |
+| K | 退役 `auth_tenant`/`tenant_suffix` 双命名（principal 名 = key tenant 后）| `vllm_connector.py:222-241`,`sglang_backend.py:166-185` |
+| L | **perf-check/ycsb key 重设计**：`key_for_partition` 只在本 bench namespace 的分区集内构造（否则前缀化后写进受保护 fs/ 被拒）| `autumn_client/main.rs:14-40` |
+
+**Explorer surfaced 的两处细化（本节定稿）**：
+
+1. **"kvc builder 零改动" 与 细化三 `kvc/{tenant}/{model}` 的表面矛盾 →
+   已澄清**：Assert 指**binding 不再前缀化**（builder 仍产绝对 key），
+   但 **builder 本身要加 tenant 层**（J）。所以 `_keys.py` 是**小改动，
+   非零改动**——§3.7 改动面清单 line 633 "builder 零改动" 只对"binding
+   不双拼前缀"成立，对"builder 产出的绝对 key 形状"不成立。以本节 J 为准。
+2. **F186 条带大 value 的 chunk key 落在 tenant 区间外 → 决定：把 namespace
+   前缀提到 chunk 前缀外层**。现状 `make_chunk_key`（`client/lib.rs:3222`）=
+   `\xff\xfe...` 外层前缀 + user_key，排在所有 user key 之后、落在
+   `[{ns}/{tenant}/, {ns}/{tenant}0)` **之外**。若不处理，Layer A（put 必须
+   落在已注册 namespace）会**拒掉 put-stream 的 chunk 写**。**决定 = chunk
+   key 改为 `{ns}/{tenant}/ ++ \xff\xfe... ++ user_key ++ idx`**（binding 拼
+   在 chunk 前缀之外），使条带 body 落进 tenant 区间：Layer A 放行、authz
+   Layer B 覆盖、presplit 区间涵盖。代价：tenant 内 range 扫描现在会看到本
+   tenant 的 chunk key（`\xff\xfe` 排在 tenant 尾部）——与今天全局 `\xff\xfe`
+   空间同样需要 caller 侧过滤，只是从全局挪进 per-tenant，语义更正确。
+   否决 (c) 把 `\xff\xfe` 登记为豁免内部 namespace：那会让受保护 tenant 的
+   大 value body 失去 per-tenant authz。
+
+### 7.3 SD-3：D1 fuse → `fs/{tenant}/{volume}/`（最后落，含迁移）
+
+| # | 改动 | 改处（file:line） |
+|---|---|---|
+| A | 13 个 key builder/parser 全部穿一个规范化 prefix（`fs/{t}/{v}/`，`[a-z0-9._-]+` 校验）| `key.rs:23-137` |
+| B | 4 个 parser 改为跳过 runtime prefix 长度（不再用绝对偏移；`len==9/17/16` → `len==prefix_len+{9,17,16}`；`parse_dirent_key` 的 `&key[9..]` → `&key[prefix_len+9..]`）| `key.rs:32,58,91,130` |
+| C | prefix 存到 `FsState`，所有 `&mut FsState` fn 读它；`FsState::new_with_host` 从 mount/connect 参数 seed | `state.rs:50-141` |
+| D | 全部 fuse core 调用点传 prefix（seed + cursor-advance 都要用同一 prefix，否则扫描空返回/跨 volume）| `meta.rs`/`dir.rs`/`extent.rs`/`read.rs:130`/`dispatch.rs:209`（清单见 fuse map §B）|
+| E | `ROOT_INO=1` 保留（per-volume 值，映射 `fs/{t}/{v}/\x01[1]`）| `schema.rs:100`；manager 镜像常量 `fs_alloc.rs:34` |
+| F | **per-volume next_inode**：KV floor `next_inode_key()`→`fs/{t}/{v}/\x04next_inode`（随 A）；etcd counter `FS_NEXT_INODE_KEY` 参数化→`autumn-rs/fs/{t}/{v}/next_inode`；memory Cell→map；**接线 SD-1 冻结的 `AllocInodesReq` volume 字段** | KV 随 A；`fs_alloc.rs:32,73-127`；`AllocInodesReq` 消费；`client/lib.rs:657`、`meta.rs:153`、`rpc_handlers.rs:6006` 穿参 |
+| G | **superblock schema 版本戳（net-new）**：`init_root`/`ensure_root` 写 `fs/{t}/{v}/\x04schema_version=2`；mount `Init` + `autumnfs` 启动读+**响亮拒绝**（找不到新前缀但扫得到裸 `\x01`）| `meta.rs:91`,`dispatch.rs:198,221`,`autumnfs.rs:128,270` |
+| H | rmtomb sweep 收敛到 `fs/{t}/{v}/\x04rmtomb/`（随 A，"无条件删"不变量爆炸半径锁死单 volume）| `extent.rs:329-357` |
+| I | `autumnfs` bin（独立重实现）：加 `--tenant/--volume`，prefix 穿进它自己的 resolve/alloc_inode/ensure_root 及全部 `key::` 调用 | `autumnfs.rs`（清单见 fuse map §2b）|
+| J | presplit 工具 `fuse_split_ranges` 把 `fs/{t}/{v}/` 拼到 `vec![0x03,…]` 切点前；改文档 + 字节字面量测试 | `args.rs:1205-1223`,`1438-1545` |
+| K | Python `autumn.Fs`：`connect` 加 `tenant`/`volume` 穿给 `FsState::new_with_host`；key 代码零改（走 Rust core）| `python/src/fs.rs:132-188` |
+| L | fuse mount 的 ClusterClient 用 **Assert 绑定 `fs/`**（依赖 SD-2 binding）| mount 接线 |
+| M | 测试穿 prefix + per-volume counter | `f_fuse_lease_{1,2}.rs`,`system_fuse_read.rs`,`fs_alloc_inodes.rs` |
+
+### 7.4 部署 runbook（一次 stop-world；**cluster reset，不迁移**）
+
+**已拍板（2026-07-17，用户："k8s 线上 autumn 可以 reset cluster，不用迁移"）**：
+线上唯一集群直接 **`cluster.sh reset`**（清 etcd + 清 EN 数据盘）后全新起，
+**不做任何存量数据迁移/批删** —— fuse 里只有可再生模型权重，reset 比"选择性
+重灌 + 批删 legacy 裸 key"更简单、且无半迁移状态风险。§3.1 的 A/B/C 迁移选项
+表就此作废（选了最彻底的 reset，是 A 的极简形态）。步骤：
+
+1. **停全部数据面**（mount/vLLM/hermes），构建 v25 镜像（CP build）。
+2. **`cluster.sh reset`**：清 etcd + 清 EN 数据盘 → 全新集群（所有旧裸 key /
+   旧 fuse 数据随之消失，**无需批删、无需迁移工具**）。
+3. **部署 v25 全体二进制**（manager/PS/EN/client/fuse 同 commit）。首任 leader
+   `seed_builtin_namespaces()` CAS 预注册 `fs/`,`kvc/`,`mem/`（SD-1 E）。
+4. **bootstrap + fresh mkfs fuse 到 `fs/default/default/`**（写 `schema_version=2` 戳）。
+5. **重新上载模型权重**：`autumnfs put` qwen32b（19 GB，hf-mirror 可再生）；旧 7B 不上。
+6. **perf-check/ycsb 配** `bench/` namespace（tenant 约定 `perf`）。
+7. **验收**：schema 戳存在；Layer A 拒未注册前缀的 put；authz gate 住 fs/kvc/mem；
+   kvc 新 key = `kvc/{tenant}/{model}/…`；namespace-create/delete 往返；`autumn-op ls`
+   跨 ns 只读正常。（fuse schema-version fail-loud 读**仍保留为防御** —— reset 场景无
+   旧盘，但防 botched/部分部署下的新旧混读。）
+
+### 7.5 测试计划 + 回滚
+
+- **SD-1**：注册表 CRUD/保留名/disjoint/replay round-trip/bootstrap 预注册单测 +
+  wire fingerprint 测试（`rpc/lib.rs:381-405`）。
+- **SD-2**：binding Prepend/Assert 拼接与 range 钳制单测；PS Layer A 集成（未注册前缀
+  put 被拒、已注册放行、匿名也受检、delete 不受 Layer A）；chunk key 落 tenant 区间的
+  put-stream 集成；kvc 新 key 形状 offline 单测；PyO3 必填参 both-or-neither。
+- **SD-3**：fuse mkfs + 重灌 round-trip；schema 戳 fail-loud（旧盘新码 / 新盘旧码）；
+  per-volume next_inode 隔离（两 volume ino 各自从 1/2 起）；rmtomb sweep 只碰本 volume。
+- **端到端**：namespace-create → 该 ns 内 put → 未注册 put 被 Layer A 拒 →（授权后）
+  authz 放行 → namespace-delete 非空默认拒。
+- **回滚**：stop-world + rkyv fail-loud（manager note 39）；R1 `cluster_version` fail-closed
+  阻止旧二进制读不懂新 etcd 后当选 leader。破坏性结构改动随版本，绝不 reset 之外的滚回。
+
+### 7.6 Explorer 复核对 §3 的三处订正（实现时同步改文档）
+
+- **§3.6 line 460 的 `AUTUMN_AUTH_PROTECTED_PREFIXES` env 不存在于代码**——现状只有
+  可重复 CLI flag `--auth-protected-prefix`（`manager.rs:198-200`，authz 开但未给前缀时
+  默认 `mem/`，`manager.rs:314-322`）。D7 的 bridge（7.1 I）用注册表 owner 标记取代手工
+  清单后，这条 env 的必要性进一步下降；部署层若要 env 需另加接线。
+- **§3.7 改动面清单 line 633 "kvcache builder 零改动" 需订正**为"binding 不前缀化，但
+  builder 加 tenant 层（小改）"（见 7.2 细化 1）。
+- **F186 chunk key 的 namespace 归属**是 §3.7 未覆盖的新决策点，已在 7.2 细化 2 定稿
+  （前缀提到 chunk 外层，落进 tenant 区间）。

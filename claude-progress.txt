@@ -1,5 +1,22 @@
 Date: 2026-07-17
 TaskStatus: completed
+Task scope: F-KEY-NS D1+D7+D2 停机批次实施设计（main agent = 设计）。
+Done: doc §7「停机批次实施设计」写入 —— 三路 Explore（fuse/client/manager）file:line
+  复核确认后，产出三个子交付的具体 change-list、整批 v24→v25 wire 冻结清单、
+  部署 runbook、测试计划、回滚。用户拍板两项：(1) 落地顺序 D2 →(wire 冻结)→ D7 → D1；
+  (2) 线上走 cluster reset，不迁移（§7.4 已按此简化：reset 清 etcd+EN 盘 → 全新起 →
+  预注册 fs/kvc/mem → fresh mkfs → 重新上载 qwen32b 权重，无批删/无迁移工具）。
+  两处 explorer 细化已在 §7 定稿：kvc _keys.py 非零改动（full_key/pool_prefix 加 tenant）；
+  F186 chunk key 由 binding 在叶层 put() 前缀化 → 落进 tenant 区间（Layer A/authz/presplit
+  覆盖）。三处 §3 文档订正记于 §7.6（AUTUMN_AUTH_PROTECTED_PREFIXES env 不存在等）。
+Next: 交 opus teammate 实现 SD-1 = D2 注册表（照抄 tenantAccount/ 模板）+ 整批 wire 冻结
+  （MIN=MAX=25 + namespace-create/delete RPC 0x57/0x58 + GetAuthzConfigResp +namespaces +
+  AllocInodesReq +volume[冻结待 SD-3 接线] + Layer A 错误码）+ bootstrap 预注册 fs/kvc/mem。
+  SD-1 落 → coco → commit（v25 wire 之后 D7/D1 不再动 wire）→ 再 SD-2(D7) → SD-3(D1)。
+
+---- 上一任务 ----
+Date: 2026-07-17
+TaskStatus: completed
 Task scope: F-SPLIT-AT-KEY (design doc D4) — operator/controller-specified split point.
 Current summary (DONE — team-lead reviewed + COMMITTED [feat(split), was 03ddf78,
   amended to fold the valid_segment test]. Two coco passes: teammate deep coco
