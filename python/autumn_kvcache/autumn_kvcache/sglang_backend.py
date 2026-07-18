@@ -295,12 +295,27 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         Matches the HiCacheStorage `batch_exists` contract documented in
         docs/hicache_l3_interface.md:62-64. Uses `head` (metadata-only) so
         admission probing doesn't transfer the value bytes.
+
+        This runs on sglang's ADMISSION path (per request, before prefill), so
+        it must be cheap. The answer is the present prefix FROM key[0], so the
+        overwhelmingly common cold/no-hit case (key[0] absent ⇒ 0) is settled by
+        a single `head` — probe that first and early-out, instead of fanning out
+        one `head` RPC per key (page granularity ⇒ hundreds of keys per prompt;
+        that fan-out measured ~4.8 ms/call and was the entire L3 TTFT overhead).
+        Only when key[0] IS present do we fan out to count how far the prefix
+        reaches (a hit — the case that saves a whole prefill, so worth the RPCs).
         """
+        if not keys:
+            return 0
         full_keys = [self._full_key(k) for k in keys]
         try:
+            if not run(lambda: self._client.head(full_keys[0])):
+                return 0  # cold prefix — one probe, no fan-out
+            if len(full_keys) == 1:
+                return 1
             founds = list(run(lambda: self._client.batch_head(full_keys)))
         except Exception as e:  # noqa: BLE001
-            log.debug("batch_head error (n=%d): %r", len(keys), e)
+            log.debug("batch_exists head error (n=%d): %r", len(keys), e)
             return 0
         # Contiguous-prefix length: stop at the first missing key.
         count = 0
