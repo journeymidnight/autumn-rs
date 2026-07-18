@@ -837,10 +837,13 @@ impl ClusterClient {
     /// counter value (0 = none): the grant never returns a base below it,
     /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
     pub async fn alloc_inodes(&self, count: u32, floor: u64, volume: &[u8]) -> Result<u64> {
-        // F-KEY-NS SD-3: `volume` is the canonicalized `fs/{tenant}/{volume}/`
-        // prefix, so the manager keys the inode counter per-volume (each volume
-        // numbers its inodes from 2, disjoint from every other). Empty = the
-        // legacy single global counter (admin/pre-SD-3 callers).
+        // F-KEY-NS SD-3: `volume` (canonicalized `fs/{tenant}/{volume}/`) would key
+        // the manager's inode counter per-volume — BUT the fuse layer passes EMPTY
+        // today so inodes stay a single cluster-unique GLOBAL counter: the
+        // lease/fence plane keys by bare ino, so per-volume inodes would collide
+        // across volumes (review P1-2). The per-volume path stays wired (frozen
+        // field + manager machinery) but dormant, for a future volume-aware-lease
+        // feature. Empty = the global counter.
         let req = rkyv_encode(&AllocInodesReq {
             count,
             floor,

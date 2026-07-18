@@ -165,13 +165,22 @@ Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻�
 > `fs/{tenant}/` 那一半**（prepend + 把返回 range key 剥回），**`FsState.vol` 负责
 > `{volume}/` 那一半**（`state.rs` 的 8 个 `kv_*` choke point 里 prepend；`kv_range_keys`
 > 额外把 `{volume}/` 从返回 key 剥回）。所以 `key::*` builder 与其 38 处调用点、以及
-> 全部 `parse_*` 都保持 RELATIVE、**零改动** —— volume 前缀只活在 KV choke point。
+> 全部 `parse_*` 都保持 RELATIVE、**零改动** —— volume 前缀活在 KV choke point
+> （`state.rs` 的 8 个 `kv_*`）**外加两处 batch 数据路径**（`read::prepare` 的
+> `ChunkSpec.key` + `extent::flush_appends` 的 append keys；二者为性能直接调
+> `get_many_*`/`put_many_fenced` 绕过 `kv_*`，故也在这两站点 `state.wire()` 补
+> `{volume}/` —— 否则 extent 数据落 `fs/{t}/[0x03]` 缺 volume，见 P0 修复 9748d3d）。
 > 净 wire key = `fs/{tenant}/{volume}/[type][fields]`：一个 mount 只能碰自己的 volume
 > （scope 由构造锁死），写路径被 Layer-A 按 `fs` namespace 门控。每个 volume 有独立的
-> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 per-volume inode 计数器（manager
-> `alloc_inodes` 收 `FsState::volume_identity()` → etcd `fs/{t}/{v}/next_inode`）、独立的
-> `next_inode` floor、独立的 rmtomb 墓碑扫描、独立的 `[0x04]schema_version` 戳
-> ——天然按前缀隔离。charset 与 ns/tenant 一致：`[a-z0-9._-]+`（`is_valid_volume`）。
+> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 `next_inode` floor、独立的 rmtomb 墓碑扫描、
+> 独立的 `[0x04]schema_version` 戳——天然按前缀隔离。charset 与 ns/tenant 一致：
+> `[a-z0-9._-]+`（`is_valid_volume`）。
+> **inode 号是全局唯一（非 per-volume，review P1-2）**：lease/fence 平面按裸 ino 做 key
+> （manager `inode_leases/<ino>`、PS `fence_floors`、`WriteLease.inode_hint`），per-volume
+> inode（每 volume 从 2）会跨 volume 撞车 → 跨 volume 写租约冲突。所以 fuse 给 `alloc_inodes`
+> 传空 volume → manager 全局计数器（cluster-unique）；且 `init_root` 不再本地 seed inode 批次
+> ——全部 inode 走 manager 发号。数据隔离靠 `{volume}/` key 前缀（与 inode 号无关），不受影响。
+> per-volume 计数器机制（+ 冻结的 `AllocInodesReq.volume`）保留休眠，待将来 volume-aware lease。
 > **schema 版本戳（`schema::SCHEMA_VERSION` = 2, `meta::ensure_schema_version`）**：mount
 > 时（`ensure_root` 入口）缺则戳、有则核对、不符则 **fail-loud 拒挂**（防未来不兼容布局
 > 静默读写坏数据）；v1 = pre-SD-3 裸 key 布局（不戳），v2 = SD-3 `fs/{t}/{v}/` 相对布局。

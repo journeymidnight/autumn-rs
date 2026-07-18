@@ -6226,6 +6226,18 @@ impl AutumnManager {
                 base: 0,
             }));
         }
+        // F-KEY-NS SD-3 (review P2-4): the volume is concatenated into an etcd
+        // counter key, so reject anything but empty or a canonical
+        // `ns/tenant/volume/` prefix (prevents forging the global key / churning
+        // another tenant's counter / non-canonical duplicate counters).
+        if !crate::fs_alloc::valid_alloc_volume(&req.volume) {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "volume must be empty or a canonical ns/tenant/volume/ prefix"
+                    .to_string(),
+                base: 0,
+            }));
+        }
         // Etcd write needs leader status; non-leader rejects with NOT_LEADER
         // so the client retries against the new leader (same pattern as
         // MSG_ACQUIRE_LEASE / MSG_ACQUIRE_OWNER_LOCK).

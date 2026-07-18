@@ -9,10 +9,9 @@ use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 use crate::attr::inode_to_attr;
 use crate::bridge::*;
 use crate::dir;
-use crate::key;
 use crate::meta::*;
 use crate::read;
-use crate::schema::{InodeState, INODE_ALLOC_BATCH, ROOT_INO};
+use crate::schema::InodeState;
 use crate::state::{FsState, FuseLease};
 use crate::write;
 
@@ -204,14 +203,16 @@ pub async fn init_root(state: &mut FsState) -> Result<()> {
         return Ok(());
     }
     tracing::info!("created root inode");
-
-    // Initialize the inode counter
-    let next_ino_key = key::next_inode_key();
-    let initial = (ROOT_INO + 1 + INODE_ALLOC_BATCH).to_be_bytes();
-    state.kv_put(&next_ino_key, &initial).await?;
-    state.next_inode = ROOT_INO + 1;
-    state.inode_batch_end = ROOT_INO + 1 + INODE_ALLOC_BATCH;
-
+    // F-KEY-NS SD-3 (review P1-2): do NOT seed a local inode batch here. The
+    // pre-SD-3 mount seeded `[ROOT_INO+1, ROOT_INO+1+INODE_ALLOC_BATCH)` locally
+    // on a fresh FS — but with per-volume filesystems each volume's fresh mount
+    // would seed the SAME low range, and the lease/fence plane keys by BARE ino,
+    // so those low inodes would COLLIDE across volumes (cross-volume write-lease
+    // conflict). Leaving `next_inode == inode_batch_end` (the FsState::new
+    // default) makes the first `alloc_inode` fetch from the manager's GLOBAL
+    // counter, so every file inode is cluster-unique. The PyO3 `autumn.Fs`
+    // front-end already skips the local seed (it calls `ensure_root`, not
+    // `init_root`), so both front-ends now allocate uniformly through the manager.
     Ok(())
 }
 

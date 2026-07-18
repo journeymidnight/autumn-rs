@@ -107,8 +107,11 @@ pub const ROOT_INO: u64 = 1;
 ///   binding, single global inode counter). Never actually stamped — v1
 ///   volumes carry NO schema_version key.
 /// - **v2** = the SD-3 layout: keys are RELATIVE to `fs/{tenant}/{volume}/`
-///   (the client prepends `fs/{tenant}/`, `FsState.vol` prepends `{volume}/`)
-///   and the inode counter is per-volume.
+///   (the client prepends `fs/{tenant}/`, `FsState.vol` prepends `{volume}/`),
+///   with a cluster-unique GLOBAL inode counter (per-volume inode counters are
+///   deferred — the lease/fence plane keys by bare ino, so per-volume inodes
+///   would collide across volumes; see review P1-2). Data isolation comes from
+///   the key prefix, not the inode number.
 ///
 /// `meta::ensure_schema_version` stamps a fresh volume with this value and
 /// FAILS LOUD if an existing volume's stamp differs — a future incompatible

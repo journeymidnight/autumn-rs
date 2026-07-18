@@ -203,19 +203,6 @@ impl FsState {
         [self.vol.as_slice(), k].concat()
     }
 
-    /// F-KEY-NS SD-3: the canonicalized `fs/{tenant}/{volume}/` identity for
-    /// this mount — the scoped client's `fs/{tenant}/` binding prefix plus this
-    /// mount's `{volume}/`. Passed to the manager's `alloc_inodes` so the inode
-    /// counter is keyed per-volume (each volume numbers from 2, disjoint from
-    /// every other). Empty only under a Raw binding (no scoped prefix), where
-    /// the manager falls back to the single global counter.
-    pub fn volume_identity(&self) -> Vec<u8> {
-        match self.client.binding().prefix() {
-            Some(p) => [p, self.vol.as_slice()].concat(),
-            None => Vec::new(),
-        }
-    }
-
     /// Get a value from the KV store by key.
     pub async fn kv_get(&mut self, k: &[u8]) -> Result<Vec<u8>> {
         // 2026-06-04 fix — was hand-assembling GetReq + `ps_call`, which

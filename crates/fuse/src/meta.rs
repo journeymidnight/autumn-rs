@@ -198,13 +198,21 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
         Ok(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
         _ => ROOT_INO + 1,
     };
-    // F-KEY-NS SD-3: the manager keys the inode counter per-volume, so pass
-    // this mount's `fs/{tenant}/{volume}/` identity (the floor is this volume's
-    // own `[0x04]next_inode` migration cursor, read volume-relative above).
-    let vol_id = state.volume_identity();
+    // F-KEY-NS SD-3 (review P1-2): pass an EMPTY volume so the manager grants
+    // from its single GLOBAL inode counter — inodes stay cluster-unique. The
+    // lease/fence plane (manager `inode_leases/<ino>`, PS `fence_floors`,
+    // `WriteLease.inode_hint`) keys by BARE ino, so per-volume inodes (each
+    // volume numbering from 2) would collide across volumes → cross-volume write-
+    // lease conflict/revoke. Global inodes avoid that with ZERO wire change; full
+    // DATA isolation still comes from the `{volume}/` KEY prefix, not the inode
+    // number. The manager's per-volume counter machinery + the frozen
+    // `AllocInodesReq.volume` field stay dormant for a future volume-aware-lease
+    // feature. The `floor` above is this volume's own `[0x04]next_inode` cursor
+    // (read volume-relative) — harmless with a global grant since `max(cur,floor)`
+    // only ever RAISES the shared counter, never rewinds it.
     let base = state
         .client
-        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor, &vol_id)
+        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor, b"")
         .await
         .context("alloc_inodes from manager")?;
     // Best-effort: keep the legacy KV cursor roughly current so a disaster

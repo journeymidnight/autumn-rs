@@ -2174,16 +2174,21 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       across a leader transition). First-create uses the create_revision==0
       pattern (same as owner locks). No in-memory cache: every grant reads
       etcd fresh, so failover needs no replay hook for this key.
-    - **F-KEY-NS SD-3 — the counter is PER-VOLUME.** `AllocInodesReq.volume`
-      (frozen SD-1, wired SD-3) carries the fuse mount's canonicalized
-      `fs/{tenant}/{volume}/` identity; `fs_next_inode_key(volume)` keys the
-      etcd counter at `autumn-rs/fs/{tenant}/{volume}/next_inode` (empty volume
-      → the legacy global `autumn-rs/fs/next_inode`, for pre-SD-3 / admin
-      callers). Each volume numbers its inodes from 2 independently, so two
-      volumes (or two tenants) can never be granted the same inode — matching
-      the per-volume KV prefix `fs/{tenant}/{volume}/` the fuse layer writes
-      under (fuse CLAUDE.md KV-key SD-3 note). The `floor` is the volume's OWN
-      `[0x04]next_inode` migration cursor (read volume-relative by the mount).
+    - **F-KEY-NS SD-3 — per-volume counter machinery present but DORMANT (review
+      P1-2).** `fs_next_inode_key(volume)` CAN key the etcd counter per-volume at
+      `autumn-rs/fs/{tenant}/{volume}/next_inode`, and `valid_alloc_volume`
+      guards `AllocInodesReq.volume` — BUT the fuse layer passes an EMPTY volume,
+      so in production the counter is the single cluster-unique GLOBAL
+      `autumn-rs/fs/next_inode`. Reason: the lease/fence plane (`inode_leases/
+      <ino>`, PS `fence_floors`, `WriteLease.inode_hint`) keys by BARE ino, so
+      per-volume inodes (each volume from 2) would collide across volumes →
+      cross-volume write-lease conflict. Global inodes stay cluster-unique with
+      ZERO wire change (respecting the v25 freeze); data isolation comes from the
+      `{volume}/` KEY prefix, not the inode number. The frozen field + per-volume
+      machinery (+ its unit/integration tests) stay for a future volume-aware-
+      lease feature that keys leases by `(volume, ino)`. NOTE: the fuse mount no
+      longer seeds a local inode batch either (`init_root`) — every inode is
+      granted by the manager so it is cluster-unique.
     - **Memory mode (tests/dev):** `AutumnManager.fs_next_inode`
       `RefCell<HashMap<Vec<u8>, u64>>`, keyed per-volume (empty key = global).
     - **Migration floor:** requests carry the legacy KV counter value; the
@@ -2195,13 +2200,14 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       manager ENTITIES (streams/extents/partitions) replayed from etcd
       prefixes; inode numbers are fs-layer data with their own key.
     - Handler: `handle_alloc_inodes` (leader-gated like MSG_ACQUIRE_LEASE;
-      count==0 → CODE_INVALID_ARGUMENT; passes `req.volume` through). Client:
-      `ClusterClient::alloc_inodes(count, floor, volume)` via `mgr_call_leader`
-      (fuse passes `FsState::volume_identity()`). Tests:
+      count==0 → CODE_INVALID_ARGUMENT; `valid_alloc_volume(req.volume)` →
+      CODE_INVALID_ARGUMENT). Client: `ClusterClient::alloc_inodes(count, floor,
+      volume)` via `mgr_call_leader` (fuse passes EMPTY → global counter; the
+      volume param is the dormant per-volume seam). Tests:
       `tests/fs_alloc_inodes.rs` (16-way concurrent disjointness + floor
-      monotonicity + per-volume independence in memory mode; etcd CAS
-      disjointness + persisted watermark + follower NOT_LEADER refusal),
-      `fs_alloc::tests` unit (per-volume isolation + key shape).
+      monotonicity + per-volume independence [dormant machinery] in memory mode;
+      etcd CAS disjointness + persisted watermark + follower NOT_LEADER refusal),
+      `fs_alloc::tests` unit (per-volume isolation + key shape + volume validation).
 
 43. **F-DASH-IN-MGR embedded web dashboard + auto-policy controller
     (2026-07-04).** The retired Python `python/dashboard/` (a browser UI + an

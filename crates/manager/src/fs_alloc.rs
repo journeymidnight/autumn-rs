@@ -51,6 +51,35 @@ pub(crate) fn fs_next_inode_key(volume: &[u8]) -> Vec<u8> {
     k
 }
 
+/// F-KEY-NS SD-3 (review P2-4): validate `AllocInodesReq.volume` before it is
+/// concatenated into an etcd key (`fs_next_inode_key`). Empty = the global
+/// counter (the only shape the fuse layer sends today — see the client
+/// `alloc_inodes` note). A non-empty value must be the canonical
+/// `ns/tenant/volume/` prefix: exactly 3 non-empty `[a-z0-9._-]+` segments plus a
+/// trailing `/`. Without this, a client could forge the global key
+/// (`volume="fs/"` → `autumn-rs/fs/next_inode`), churn another tenant's counter,
+/// or create a non-canonical duplicate counter (missing trailing `/`) that would
+/// hand out overlapping inode ranges.
+pub(crate) fn valid_alloc_volume(v: &[u8]) -> bool {
+    if v.is_empty() {
+        return true;
+    }
+    let Ok(s) = std::str::from_utf8(v) else {
+        return false;
+    };
+    // "ns/tenant/vol/" splits to ["ns", "tenant", "vol", ""].
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 4 || !parts[3].is_empty() {
+        return false;
+    }
+    parts[..3].iter().all(|seg| {
+        !seg.is_empty()
+            && seg.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+    })
+}
+
 /// First allocatable inode number: fuse's `ROOT_INO` (1) is preassigned to
 /// the filesystem root and never allocated. Kept in sync with
 /// `autumn_fuse::schema::ROOT_INO` by value (a fuse dep here would invert
@@ -220,6 +249,22 @@ mod tests {
         assert_eq!(b1, a1 + 1000);
         let b2 = alloc_from_map(&map, v2, 5, 0);
         assert_eq!(b2, a2 + 1000);
+    }
+
+    #[test]
+    fn valid_alloc_volume_shape() {
+        assert!(valid_alloc_volume(b"")); // global counter
+        assert!(valid_alloc_volume(b"fs/acme/vol0/"));
+        assert!(valid_alloc_volume(b"fs/default/default/"));
+        // wrong segment count / no trailing slash
+        assert!(!valid_alloc_volume(b"fs/")); // would forge the global key
+        assert!(!valid_alloc_volume(b"fs/acme/")); // 2 segments
+        assert!(!valid_alloc_volume(b"fs/acme/vol0")); // missing trailing /
+        assert!(!valid_alloc_volume(b"fs/acme/vol0/extra/")); // 4 segments
+        // bad charset
+        assert!(!valid_alloc_volume(b"fs/Acme/vol0/")); // uppercase
+        assert!(!valid_alloc_volume(b"fs//vol0/")); // empty tenant
+        assert!(!valid_alloc_volume(b"fs/ac me/vol0/")); // space
     }
 
     #[test]
