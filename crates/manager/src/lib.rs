@@ -77,6 +77,53 @@ pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 /// tenant name is a string suffix (percent-encoded segment), not a u64 id.
 pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 
+/// F-KEY-NS D2: etcd prefix for the namespace registry
+/// (`namespace/<name>` → rkyv'd `MgrNamespace`). Replayed on leader failover;
+/// mutated only via the admin namespace-create/delete RPCs. The three built-in
+/// families (`fs`/`kvc`/`mem`) are CAS-preregistered on first leader promotion
+/// (`seed_builtin_namespaces`). See docs/key_namespace_split_design.md §3.7③.
+pub const NAMESPACE_PREFIX: &str = "namespace/";
+
+/// F-KEY-NS D2: the built-in namespace families, CAS-preregistered by the first
+/// leader. `owner_tenant = None` (existence-only until an owner is later
+/// assigned), so they are registered but NOT protected out of the box.
+pub const BUILTIN_NAMESPACES: [&str; 3] = ["fs", "kvc", "mem"];
+
+/// F-KEY-NS D2: names that `namespace-create` refuses. `fs`/`kvc`/`mem` are the
+/// bootstrap-seeded families (created + non-deletable); `default` is reserved
+/// purely to prevent confusion (it is a conventional TENANT name, never a
+/// namespace — see §3.7③).
+pub const RESERVED_NAMESPACE_NAMES: [&str; 4] = ["fs", "kvc", "mem", "default"];
+
+/// F-KEY-NS D2: validate a namespace name — a single path segment matching
+/// `[a-z0-9._-]+` (same charset as the D1 tenant/volume components). Returns the
+/// reason string on rejection. Pure (unit-tested).
+pub(crate) fn validate_namespace_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("namespace name must be non-empty".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "namespace name '{name}' has invalid chars (allowed: [a-z0-9._-])"
+        ));
+    }
+    Ok(())
+}
+
+/// F-KEY-NS D2: prefix-disjointness. A new namespace prefix `new_prefix`
+/// (`name + "/"`) may not be in a `starts_with` relation — in EITHER direction —
+/// with any existing registered prefix, so all namespace intervals stay pairwise
+/// non-overlapping (Layer-A / authz / presplit prefix matching is then
+/// unambiguous). Returns `true` when `new_prefix` CONFLICTS. Pure (unit-tested).
+pub(crate) fn namespace_prefix_conflicts(new_prefix: &[u8], existing: &[&[u8]]) -> bool {
+    existing
+        .iter()
+        .any(|p| new_prefix.starts_with(p) || p.starts_with(new_prefix))
+}
+
 /// ENOSPC-1: default allocation free-space floor — a node whose best
 /// disk has less free than this is soft-avoided by `select_nodes`.
 /// 256 MiB comfortably covers a fresh extent + its metadata while small
@@ -855,6 +902,14 @@ pub struct AutumnManager {
     /// the other, leaving the live leader's in-memory hash out of sync with
     /// etcd (coco P1). Low-frequency admin path → a global async mutex is free.
     pub(crate) tenant_admin_lock: Rc<futures::lock::Mutex<()>>,
+    /// F-KEY-NS D2: namespace registry shadow (etcd `namespace/<name>` →
+    /// `MgrNamespace`). Replayed on leader failover; mutated only via the admin
+    /// namespace-create/delete RPCs + `seed_builtin_namespaces`. Keyed by name.
+    pub(crate) namespaces: Rc<RefCell<HashMap<String, MgrNamespace>>>,
+    /// F-KEY-NS D2: serializes the namespace create/delete critical section
+    /// (build → etcd write → in-memory apply), mirroring `tenant_admin_lock`.
+    /// Low-frequency admin path → a global async mutex is free.
+    pub(crate) namespace_admin_lock: Rc<futures::lock::Mutex<()>>,
 }
 
 impl Default for AutumnManager {
@@ -928,6 +983,10 @@ impl AutumnManager {
             clock_skew_secs: Rc::new(Cell::new(60)),
             tenant_accounts: Rc::new(RefCell::new(HashMap::new())),
             tenant_admin_lock: Rc::new(futures::lock::Mutex::new(())),
+            // F-KEY-NS D2: empty; populated by replay / admin RPCs /
+            // seed_builtin_namespaces on leader promotion.
+            namespaces: Rc::new(RefCell::new(HashMap::new())),
+            namespace_admin_lock: Rc::new(futures::lock::Mutex::new(())),
         }
     }
 
@@ -2220,6 +2279,15 @@ impl AutumnManager {
             tracing::warn!(error = %err, "R1: imprint_cluster_version failed");
         }
 
+        // F-KEY-NS D2: CAS-preregister the built-in namespace families
+        // (`fs`/`kvc`/`mem`). Same best-effort posture as imprint_cluster_id:
+        // a failure logs WARN and the next election retry re-seeds. Idempotent
+        // (CAS create_revision==0 — a namespace already present is left as-is,
+        // preserving any owner assigned later).
+        if let Err(err) = self.seed_builtin_namespaces().await {
+            tracing::warn!(error = %err, "F-KEY-NS: seed_builtin_namespaces failed");
+        }
+
         let mgr = self.clone();
         compio::runtime::spawn(async move {
             mgr.leader_keepalive_loop(lease_id).await;
@@ -2374,6 +2442,69 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
                 }
             }
         }
+    }
+
+    /// F-KEY-NS D2: CAS-preregister the built-in namespace families
+    /// (`fs`/`kvc`/`mem`). Runs on every leader promotion (after replay), same
+    /// idempotent best-effort shape as `imprint_cluster_id`: a family already in
+    /// the registry (loaded by replay or seeded by a prior leader) is left
+    /// untouched so an owner assigned later survives. Memory-only mode inserts
+    /// directly into the in-mem shadow.
+    async fn seed_builtin_namespaces(&self) -> Result<(), AppError> {
+        for name in BUILTIN_NAMESPACES {
+            // Already present (replay / prior seed / a create) → nothing to do.
+            if self.namespaces.borrow().contains_key(name) {
+                continue;
+            }
+            let row = MgrNamespace {
+                name: name.to_string(),
+                prefix: format!("{name}/").into_bytes(),
+                // Existence-only until an owner is explicitly assigned.
+                owner_tenant: None,
+                presplit: Vec::new(),
+                created_at: 0,
+            };
+            let etcd = match &self.etcd {
+                // Memory-only mode: no etcd — just populate the shadow.
+                None => {
+                    self.namespaces
+                        .borrow_mut()
+                        .insert(name.to_string(), row);
+                    continue;
+                }
+                Some(v) => v,
+            };
+            let key = format!("{NAMESPACE_PREFIX}{name}");
+            // CAS-create (create_revision==0) so a promotion storm can't
+            // double-write; a race loser re-reads and installs the winner's row.
+            let cmp = autumn_etcd::Cmp::create_revision(key.as_bytes(), 0);
+            let put = autumn_etcd::Op::put(key.as_bytes(), rkyv_encode(&row).as_ref());
+            match etcd.txn_fenced(vec![cmp], vec![put], vec![]).await? {
+                true => {
+                    self.namespaces
+                        .borrow_mut()
+                        .insert(name.to_string(), row);
+                    tracing::info!(namespace = name, "F-KEY-NS: preregistered built-in namespace");
+                }
+                false => {
+                    // CAS lost — re-read whoever wrote first and install it.
+                    let resp = etcd
+                        .client
+                        .get(key.as_bytes())
+                        .await
+                        .map_err(|e| AppError::Internal(format!("re-get namespace/{name}: {e}")))?;
+                    if let Some(kv) = resp.kvs.first() {
+                        let existing: MgrNamespace = rkyv_decode(&kv.value).map_err(|e| {
+                            AppError::Internal(format!("decode namespace/{name}: {e}"))
+                        })?;
+                        self.namespaces
+                            .borrow_mut()
+                            .insert(name.to_string(), existing);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// R1: validate + persist a cluster_version bump. Refusal reasons are
@@ -2587,6 +2718,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
         // F-AUTHZ-1: persisted tenant account DB.
         let tenant_account_raw = c.get_prefix(TENANT_ACCOUNT_PREFIX).await?;
+        // F-KEY-NS D2: persisted namespace registry.
+        let namespace_raw = c.get_prefix(NAMESPACE_PREFIX).await?;
         // F-DASH-IN-MGR M2: auto-policy controller config + cooldowns (single keys)
         // so the active policy + mode survive leader failover.
         let autopolicy_config_kv = c.get(b"autoPolicy/config").await?;
@@ -2708,6 +2841,51 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     anyhow::anyhow!("F-AUTHZ-1: malformed tenantAccount/{tenant}: {e}")
                 })?;
                 accts.insert(tenant, acct);
+            }
+        }
+        // F-KEY-NS D2: replay the namespace registry. String-keyed (namespace
+        // name), so mirror the tenantAccount/ inline pattern above. A malformed
+        // row is fail-loud (note 39): a bad registry record must not silently
+        // start the manager with a half-populated namespace set — Layer-A / the
+        // authz bridge would then act on it. Fail-loud covers BOTH (a) rkyv
+        // decode failure AND (b) SEMANTIC corruption — the etcd key suffix, the
+        // stored `row.name`, and the stored `row.prefix` must all agree and obey
+        // the namespace naming rules; otherwise `handle_get_authz_config` could
+        // publish e.g. a `bench` row carrying `prefix = mem/` and wrongly
+        // protect/expose another keyspace (coco P2). A leadership-refusing error
+        // is the right response — the operator repairs etcd, not the manager.
+        {
+            let mut ns = self.namespaces.borrow_mut();
+            ns.clear();
+            for kv in &namespace_raw.kvs {
+                let raw = str::from_utf8(&kv.key)
+                    .map_err(|e| anyhow::anyhow!("non-utf8 namespace key: {e}"))?;
+                let name = raw
+                    .strip_prefix(NAMESPACE_PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("invalid namespace key: {raw}"))?
+                    .to_string();
+                let row: MgrNamespace = rkyv_decode(&kv.value)
+                    .map_err(|e| anyhow::anyhow!("F-KEY-NS: malformed namespace/{name}: {e}"))?;
+                // Semantic consistency — the stored fields must match the key and
+                // the naming rules the create path enforces.
+                if let Err(msg) = validate_namespace_name(&name) {
+                    return Err(anyhow::anyhow!("F-KEY-NS: namespace/{name} invalid name: {msg}"));
+                }
+                if row.name != name {
+                    return Err(anyhow::anyhow!(
+                        "F-KEY-NS: namespace/{name} row.name mismatch ('{}' != key '{name}')",
+                        row.name
+                    ));
+                }
+                let expect_prefix = format!("{name}/").into_bytes();
+                if row.prefix != expect_prefix {
+                    return Err(anyhow::anyhow!(
+                        "F-KEY-NS: namespace/{name} row.prefix mismatch (got {:?}, expected {:?})",
+                        row.prefix,
+                        expect_prefix
+                    ));
+                }
+                ns.insert(name, row);
             }
         }
         // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
@@ -4274,6 +4452,37 @@ mod tests {
     // races). False-positive — allow at the module level.
     #![allow(clippy::await_holding_refcell_ref)]
     use super::*;
+
+    // ── F-KEY-NS D2: pure namespace-validation helpers ──────────────────
+    #[test]
+    fn validate_namespace_name_accepts_valid_segments() {
+        for ok in ["bench", "a", "kv-cache", "app.v2", "under_score", "0", "a1._-"] {
+            assert!(validate_namespace_name(ok).is_ok(), "'{ok}' should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_namespace_name_rejects_bad_segments() {
+        // empty, uppercase, path separator, whitespace, other punctuation.
+        for bad in ["", "Bench", "a/b", "a b", "a+b", "a:b", "acme/prod"] {
+            assert!(validate_namespace_name(bad).is_err(), "'{bad}' should be invalid");
+        }
+    }
+
+    #[test]
+    fn namespace_prefix_conflicts_detects_both_directions() {
+        // new is a descendant of an existing prefix.
+        assert!(namespace_prefix_conflicts(b"a/b/", &[b"a/"]));
+        // new is an ancestor of an existing prefix.
+        assert!(namespace_prefix_conflicts(b"a/", &[b"a/b/"]));
+        // identical prefixes conflict.
+        assert!(namespace_prefix_conflicts(b"a/", &[b"a/"]));
+        // sibling single-segment prefixes are disjoint (trailing '/' guarantees it).
+        assert!(!namespace_prefix_conflicts(b"bench/", &[b"kvc/", b"mem/", b"fs/"]));
+        assert!(!namespace_prefix_conflicts(b"f/", &[b"fs/"]));
+        // empty existing set never conflicts.
+        assert!(!namespace_prefix_conflicts(b"anything/", &[]));
+    }
 
     fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> MgrExtentInfo {
         MgrExtentInfo {

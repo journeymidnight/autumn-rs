@@ -655,7 +655,13 @@ impl ClusterClient {
     /// counter value (0 = none): the grant never returns a base below it,
     /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
     pub async fn alloc_inodes(&self, count: u32, floor: u64) -> Result<u64> {
-        let req = rkyv_encode(&AllocInodesReq { count, floor });
+        // F-KEY-NS SD-1: `volume` is wire-frozen but not yet wired (SD-3);
+        // empty = the legacy single global inode counter.
+        let req = rkyv_encode(&AllocInodesReq {
+            count,
+            floor,
+            volume: Vec::new(),
+        });
         let resp: AllocInodesResp = self
             .mgr_call_leader(MSG_ALLOC_INODES, req, "alloc_inodes", 3, 3, |b| {
                 let r: AllocInodesResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
@@ -743,6 +749,70 @@ impl ClusterClient {
             .await?;
         if resp.code != autumn_rpc::manager_rpc::CODE_OK {
             return Err(anyhow!("tenant-delete rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// F-KEY-NS D2: register a namespace (admin). Leader-only. `owner_tenant`
+    /// `Some(_)` marks it protected; `presplit` freezes D8 split points (stored,
+    /// not yet acted upon).
+    pub async fn namespace_create(
+        &self,
+        name: &str,
+        owner_tenant: Option<String>,
+        presplit: Vec<Vec<u8>>,
+        admin_token: &str,
+    ) -> Result<()> {
+        let req = rkyv_encode(&NamespaceCreateReq {
+            admin_token: admin_token.to_string(),
+            name: name.to_string(),
+            owner_tenant,
+            presplit,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: NamespaceCreateResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_CREATE,
+                req,
+                "namespace-create",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: NamespaceCreateResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-create rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// F-KEY-NS D2: delete a namespace registry row (admin). Leader-only. The
+    /// non-empty guard (`--force`) is enforced by the CALLER (autumn-op scans
+    /// the prefix); this only drops the registry row.
+    pub async fn namespace_delete(&self, name: &str, admin_token: &str) -> Result<()> {
+        let req = rkyv_encode(&NamespaceDeleteReq {
+            admin_token: admin_token.to_string(),
+            name: name.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_DELETE,
+                req,
+                "namespace-delete",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-delete rejected: {}", resp.message));
         }
         Ok(())
     }

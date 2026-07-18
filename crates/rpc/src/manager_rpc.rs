@@ -478,6 +478,12 @@ pub const CODE_NOT_LEADER: u8 = 5;
 /// window. Client retries the acquire after that delay (or sooner
 /// if it sees a `WriterClosed` invalidation).
 pub const CODE_REVOKE_PENDING: u8 = 6;
+/// F-KEY-NS D7 Layer-A: a put-class write whose key falls in NO registered
+/// namespace prefix. Semantics = NotFound-class (the target namespace does not
+/// exist). **Defined in SD-1, RETURNED by the PS Layer-A gate in SD-2.** 7/8/9
+/// are already taken by `partition_rpc` (Unavailable / RegionEpochStale /
+/// Fenced), so this is 10 to stay collision-free across both wire modules.
+pub const CODE_NAMESPACE_UNKNOWN: u8 = 10;
 
 // ── StreamManagerService request/response types ────────────────────────────
 
@@ -1980,6 +1986,13 @@ pub struct AllocInodesReq {
     /// fuse mount passes that legacy value here on its first batch so an
     /// existing filesystem migrates without duplicate inodes. 0 = none.
     pub floor: u64,
+    /// F-KEY-NS D1: the per-volume identity (the canonicalized `fs/{tenant}/
+    /// {volume}/` prefix, or empty for the pre-D1 single global counter). SD-1
+    /// FREEZES this field into the wire; `handle_alloc_inodes` IGNORES it for
+    /// now. SD-3 wires the per-volume etcd counter
+    /// (`autumn-rs/fs/{tenant}/{volume}/next_inode`). Empty = legacy global
+    /// counter (existing callers keep encoding unchanged). Additive rkyv field.
+    pub volume: Vec<u8>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -2005,6 +2018,14 @@ pub const MSG_AUTOPOLICY_SET: u8 = 0x55;
 
 /// F-REGION-REBALANCE: active region→PS load rebalance (leader-only mutation).
 pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
+
+// ── F-KEY-NS D2: namespace registry (admin → manager, low-frequency) ──────────
+// admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
+// admin-token gated — same posture as MSG_TENANT_CREATE/DELETE). The registry is
+// the authoritative source for D7 Layer-A (writes must fall in a registered
+// namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md §7.1.
+pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
+pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
 
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
@@ -2148,6 +2169,67 @@ pub struct TenantDeleteReq {
     pub tenant: String,
 }
 
+// ── F-KEY-NS D2: namespace registry types (SD-1) ─────────────────────────────
+
+/// Persisted namespace registry row in etcd (`namespace/<name>`). Replayed on
+/// leader failover. Modelled on `MgrTenantAccount` (string-keyed etcd prefix +
+/// rkyv + fail-loud replay). Registry granularity = top-level family (`fs/` is
+/// ONE row, not one per volume — the app owns the sub-structure; Layer-A only
+/// checks top-level membership). See docs/key_namespace_split_design.md §3.7③.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrNamespace {
+    /// Namespace name (`[a-z0-9._-]+`, single path segment). The etcd key is
+    /// `namespace/<name>`; the stored `prefix` is `name + "/"`.
+    pub name: String,
+    /// The registered key prefix = `name + "/"`. This is the byte prefix
+    /// Layer-A / authz / presplit match against (all namespaces are disjoint).
+    pub prefix: Vec<u8>,
+    /// Owning tenant, if any. `Some(_)` marks the namespace PROTECTED — its
+    /// prefix is bridged into authz `protected_prefixes` (D6). The three
+    /// bootstrap-seeded families (`fs`/`kvc`/`mem`) start `None` (existence-only
+    /// until an owner is later assigned). `None` ⇒ registered but not protected.
+    pub owner_tenant: Option<String>,
+    /// D8 presplit points (raw split keys inside `[prefix, prefix-successor)`).
+    /// SD-1 FREEZES this field + stores it verbatim; CONSUMPTION (looping
+    /// `split --at` at namespace-create) is D8. Empty = no presplit.
+    pub presplit: Vec<Vec<u8>>,
+    /// Unix seconds at creation (diagnostic).
+    pub created_at: i64,
+}
+
+/// `MSG_NAMESPACE_CREATE` — admin registers a new namespace. Leader-only,
+/// admin-token gated (same posture as `TenantCreateReq`). Rejects reserved names
+/// (`fs`/`kvc`/`mem`/`default`) + any name whose `name/` prefix is a
+/// `starts_with` relation with an existing namespace prefix (disjointness).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceCreateReq {
+    pub admin_token: String,
+    pub name: String,
+    /// Optional owner tenant — `Some(_)` makes the namespace protected (bridged
+    /// into authz `protected_prefixes`).
+    pub owner_tenant: Option<String>,
+    /// D8 presplit split points (raw keys). Freeze-only in SD-1 (stored, not
+    /// acted upon). Empty = none.
+    pub presplit: Vec<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceCreateResp {
+    pub code: u8,
+    pub message: String,
+}
+
+/// `MSG_NAMESPACE_DELETE` — admin removes a namespace registry row. Leader-only,
+/// admin-token gated. Refuses the three built-in families. The NON-EMPTY guard
+/// (refuse deleting a namespace whose prefix still holds data unless `--force`)
+/// is enforced CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane
+/// client); this handler only removes the etcd registry row. Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceDeleteReq {
+    pub admin_token: String,
+    pub name: String,
+}
+
 /// `MSG_MINT_TOKEN` — client authenticates with its permanent credential and
 /// receives a short-TTL signed capability token.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -2190,6 +2272,12 @@ pub struct GetAuthzConfigResp {
     /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
     /// key outside every protected prefix is not gated.
     pub protected_prefixes: Vec<Vec<u8>>,
+    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry). This is
+    /// Layer-A's data source (a put-class write must fall in one of these).
+    /// POPULATED by the manager in SD-1; CONSUMED by the PS Layer-A gate in SD-2
+    /// (the PS stores it now, unused). Distinct from `protected_prefixes`, which
+    /// is the OWNED subset (Layer-B). Additive rkyv field (same-commit deploy).
+    pub namespaces: Vec<Vec<u8>>,
     /// The TTL the manager mints tokens with (seconds) — advisory, lets the PS
     /// size its clock-skew leeway / the client its renew cadence.
     pub token_ttl_secs: u64,

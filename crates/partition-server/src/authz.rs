@@ -41,6 +41,11 @@ pub struct AuthzInner {
     /// (minted for another cluster that shares signing keys) is rejected at
     /// AUTH_HELLO. Empty = unknown → the aud check is skipped (degraded).
     pub cluster_id: String,
+    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry). STORED
+    /// in SD-1 (from `GetAuthzConfigResp.namespaces`) but UNUSED — SD-2 wires the
+    /// Layer-A gate (a put-class write must fall in one of these). Keeping it in
+    /// the snapshot now means SD-2 is a gate-only change with no plumbing.
+    pub namespaces: Vec<Vec<u8>>,
 }
 
 impl AuthzInner {
@@ -50,6 +55,7 @@ impl AuthzInner {
             protected_prefixes: Vec::new(),
             clock_skew_secs: 60,
             cluster_id: String::new(),
+            namespaces: Vec::new(),
         }
     }
 }
@@ -115,6 +121,8 @@ impl AuthzState {
             protected_prefixes: resp.protected_prefixes.clone(),
             clock_skew_secs: resp.clock_skew_secs,
             cluster_id: resp.cluster_id.clone(),
+            // F-KEY-NS D7: stored for SD-2's Layer-A gate; unused today.
+            namespaces: resp.namespaces.clone(),
         });
         *self.inner.write() = inner;
         // Publish `enabled` AFTER the config is in place so a concurrent reader
@@ -353,6 +361,7 @@ mod tests {
             protected_prefixes: prefixes,
             clock_skew_secs: 60,
             cluster_id: String::new(),
+            namespaces: Vec::new(),
         }
     }
 
@@ -465,6 +474,7 @@ mod tests {
             protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
+            namespaces: Vec::new(),
         };
         let now = 1_000_000;
         let mk = |aud: &str| CapClaims {
@@ -489,6 +499,7 @@ mod tests {
             protected_prefixes: vec![],
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
+            namespaces: Vec::new(),
         };
         assert!(verify_auth_hello(&token, &inner2, now).is_err());
         // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
@@ -505,6 +516,7 @@ mod tests {
             protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
             cluster_id: String::new(),
+            namespaces: Vec::new(),
         };
         let p = acme(); // kid 1
         assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner_disabled, 999_000).is_some());
@@ -533,6 +545,7 @@ mod tests {
                 },
             ],
             protected_prefixes: vec![b"mem/".to_vec()],
+            namespaces: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 45,
             cluster_id: "cluster-abc".to_string(),

@@ -86,8 +86,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 24;
-pub const WIRE_VERSION_MAX: u32 = 24;
+pub const WIRE_VERSION_MIN: u32 = 25;
+pub const WIRE_VERSION_MAX: u32 = 25;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -257,6 +257,19 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // (region_epoch-exempt) request struct. Pre-R3: MIN=MAX=24 (same-commit
     // deploy; rkyv has no cross-version decode).
     (24, "eeaf88720200e4da"),
+    // v25 — F-KEY-NS D1+D7+D2 stop-world batch wire freeze (SD-1). One bump
+    // covers every struct the batch touches (SD-2/SD-3 add NO further wire):
+    //   • MSG_NAMESPACE_CREATE (0x57) / MSG_NAMESPACE_DELETE (0x58) + the
+    //     NamespaceCreate{Req,Resp} / NamespaceDeleteReq / MgrNamespace structs
+    //     (D2 registry).
+    //   • GetAuthzConfigResp grew `namespaces: Vec<Vec<u8>>` (D7 Layer-A data
+    //     source; PS stores it, consumes it in SD-2).
+    //   • AllocInodesReq grew `volume: Vec<u8>` (D1 per-volume inode counter;
+    //     frozen only, handle_alloc_inodes ignores it — SD-3 wires it).
+    //   • CODE_NAMESPACE_UNKNOWN (10) error code (D7 Layer-A reject; PS returns
+    //     it in SD-2).
+    // Pre-R3: MIN=MAX=25 (same-commit deploy; rkyv has no cross-version decode).
+    (25, "76e8ba557f7fca2d"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

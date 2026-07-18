@@ -29,7 +29,11 @@ use autumn_rpc::manager_rpc::{
 use support::{pick_addr, start_etcd, start_manager};
 
 async fn alloc(mgr: &RpcClient, count: u32, floor: u64) -> AllocInodesResp {
-    let payload = rkyv_encode(&AllocInodesReq { count, floor });
+    let payload = rkyv_encode(&AllocInodesReq {
+        count,
+        floor,
+        volume: Vec::new(),
+    });
     let resp = mgr
         .call(MSG_ALLOC_INODES, payload)
         .await

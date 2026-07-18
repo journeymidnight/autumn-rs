@@ -1,5 +1,26 @@
 Date: 2026-07-17
 TaskStatus: completed
+Task scope: F-KEY-NS SD-1 = D2 注册表 + 整批 wire 冻结（opus teammate 实现，team-lead+用户 review）。
+Done: etcd `namespace/<name>` 注册表（照抄 tenantAccount/ 模板）+ namespace-create/delete
+  RPC(0x57/0x58)+SDK+autumn-op CLI + bootstrap 预注册 fs/kvc/mem + authz bridge（protected =
+  手工清单 ∪ owner'd namespace）+ GET_AUTHZ_CONFIG leader-gate（P1，用户拍板：ensure_leader，
+  PS poll 遇 NOT_LEADER 轮转、不清缓存——PS 侧本就正确，只补注释）。**整批 wire 一次冻结
+  v24→v25 fp 76e8ba557f7fca2d**（namespace RPC + GetAuthzConfigResp.namespaces + AllocInodesReq.volume
+  [冻结待 SD-3] + CODE_NAMESPACE_UNKNOWN=10；SD-2/SD-3 不再动 wire）。coco(GPT-5.5 deep) 3 findings：
+  P2 replay 语义校验已修（key-suffix/name/prefix 必须一致，fail-loud 拒当 leader）、P2 delete
+  非空检查 CLI 侧（manager 无 KV 数据面 client，架构决定，--force 跳过且不批删=reset 部署）、
+  P1 leader-gate 已并入。测试全绿：rpc 48 / manager lib 223 / PS 197 / client 27 / etcd 集成
+  (#[ignore]) 实测通过（bootstrap 持久化→leader 服务→follower 返回 NOT_LEADER→失败切换后
+  继任 leader 服务 rehydrated 注册表）。
+已知遗留（非阻塞）：PS 冷启动首次 fetch_authz_config 若首联 follower，会 WARN+轮转、
+  authz-off 直到 5s poll 命中 leader（既有的"可用性优先"权衡，内网威胁模型下 OK；teammate
+  可按需给首次 fetch 加 retry-with-rotation 关掉 ~5s 窗口）。--with-tenant 目前只置 owner 标记，
+  完整 principal-create 包装延后。
+Next: commit SD-1（本条）→ SD-2（D7 主体）→ SD-3（D1 fuse）→ 一次 stop-world cluster reset 部署。
+
+---- 上一任务 ----
+Date: 2026-07-17
+TaskStatus: completed
 Task scope: F-KEY-NS D1+D7+D2 停机批次实施设计（main agent = 设计）。
 Done: doc §7「停机批次实施设计」写入 —— 三路 Explore（fuse/client/manager）file:line
   复核确认后，产出三个子交付的具体 change-list、整批 v24→v25 wire 冻结清单、

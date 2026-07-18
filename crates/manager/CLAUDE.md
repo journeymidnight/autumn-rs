@@ -2317,3 +2317,34 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     2→4→1). Cross-ref: note 25 (F222 single df caller — the loop this extends),
     Item 3 in note 33 (the `streams/`/`extents/` value-CAS pattern a future
     df-heal write would mirror for `nodes/<id>`).
+
+45. **F-KEY-NS D2 namespace registry (SD-1, WIRE v25).** An etcd string-keyed
+    registry (`namespace/<name>` → rkyv `MgrNamespace{name, prefix, owner_tenant,
+    presplit, created_at}`) modelled 1:1 on the F-AUTHZ-1 `tenantAccount/` DB:
+    in-mem shadow `namespaces: Rc<RefCell<HashMap<String, MgrNamespace>>>`,
+    fail-loud replay in `replay_from_etcd` (a malformed row refuses leadership —
+    note 39), admin-token-gated create/delete (`MSG_NAMESPACE_CREATE=0x57` /
+    `MSG_NAMESPACE_DELETE=0x58`) that are etcd-first + F149-fenced + serialized on
+    a dedicated `namespace_admin_lock` (mirrors `tenant_admin_lock`). The three
+    built-in families (`fs`/`kvc`/`mem`) are CAS-preregistered by the first leader
+    in `seed_builtin_namespaces` (called from `try_become_leader` after
+    `imprint_cluster_version`; same idempotent create_revision==0 best-effort
+    shape as `imprint_cluster_id`, `owner_tenant=None` = existence-only). Create
+    rejects reserved names (`fs`/`kvc`/`mem`/`default`) + names failing the pure
+    `validate_namespace_name` (`[a-z0-9._-]+`) + `namespace_prefix_conflicts`
+    (new `name/` may not be `starts_with`-related to any existing prefix, either
+    direction — pairwise-disjoint intervals). Delete refuses the built-ins; the
+    **non-empty guard is CLIENT-SIDE in `autumn-op`** (range-scan the prefix,
+    `--force` overrides) because the manager has NO KV data-plane client — the
+    handler only drops the registry row.
+    **Bridge (`handle_get_authz_config`, D6/D7):** `GetAuthzConfigResp.namespaces`
+    = every registered prefix (Layer-A data source, PS consumes in SD-2);
+    `protected_prefixes` = the manual `--auth-protected-prefix` list (kept as a
+    union member) ∪ every registry namespace whose `owner_tenant.is_some()`
+    (auto-protected). SD-1 also FREEZES two forward fields with no consumer yet:
+    `AllocInodesReq.volume` (D1 per-volume inode counter — SD-3) and
+    `CODE_NAMESPACE_UNKNOWN=10` (D7 Layer-A reject — SD-2 PS returns it). Tests:
+    `rpc_handlers::namespace_registry_tests` (memory mode) + `lib::tests`
+    (pure helpers) + `tests/namespace_registry_etcd.rs` (`#[ignore]`, etcd
+    replay + bootstrap-persist). Cross-ref: F-AUTHZ-1 (`tenantAccount/` template),
+    note 42 (F-FS-UNIFY `AllocInodesReq`, extended here), note 15 (F149 fence).

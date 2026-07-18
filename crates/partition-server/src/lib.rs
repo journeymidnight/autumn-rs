@@ -3461,11 +3461,17 @@ impl PartitionServer {
         }
     }
 
-    /// F-AUTHZ-1: fetch + install the data-plane authz config from the manager.
-    /// `MSG_GET_AUTHZ_CONFIG` is NOT leader-gated (it's static local config on
-    /// every manager), so any reachable manager answers; a transport failure
-    /// rotates to the next manager. Best-effort: a failed fetch keeps the prior
-    /// cached config (manager down → keep enforcing on the cache).
+    /// F-AUTHZ-1 / F-KEY-NS D2: fetch + install the data-plane authz config from
+    /// the manager. `MSG_GET_AUTHZ_CONFIG` is now **leader-gated** (D2 added the
+    /// leader-maintained namespace registry to the response — a follower's list
+    /// is empty/stale). Rotation + cache-preservation make this safe:
+    ///   - `CODE_NOT_LEADER` → `rotate_manager()` so the next tick reaches the
+    ///     leader, and return `Err` **BEFORE** `install` — the prior cached
+    ///     `AuthzState` is untouched (enforcement keeps running on the last-known
+    ///     config through the election window; NEVER fail-open).
+    ///   - a transport failure likewise returns `Err` before `install` → cache kept.
+    ///   - `install` runs ONLY on `CODE_OK` (a fresh leader response). This is the
+    ///     sole `AuthzState` mutator, so no error path can clear/disable it.
     pub async fn fetch_authz_config_once(&self) -> Result<()> {
         let resp_data = self
             .pool
@@ -12689,11 +12695,53 @@ mod authz_enforcement_tests {
                 disabled: false,
             }],
             protected_prefixes: vec![b"mem/".to_vec()],
+            namespaces: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "cluster-test".to_string(),
         });
         std::sync::Arc::new(st)
+    }
+
+    /// F-KEY-NS D2 (coco P1): `fetch_authz_config_once` installs ONLY on
+    /// `CODE_OK`; a `CODE_NOT_LEADER` (follower) or transport error returns
+    /// BEFORE `install`, so the cached `AuthzState` — the last-known LEADER
+    /// config — keeps enforcing through the election window and NEVER
+    /// fail-opens. This pins the `AuthzState` half of that contract: `install`
+    /// is the sole mutator, so absent a fresh successful install the enabled
+    /// flag + protected prefixes + namespace list are all unchanged.
+    #[test]
+    fn cached_authz_config_survives_absent_a_fresh_install() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let st = crate::authz::AuthzState::new();
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![AuthzPublicKey {
+                kid: 1,
+                ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                disabled: false,
+            }],
+            protected_prefixes: vec![b"mem/".to_vec()],
+            namespaces: vec![b"fs/".to_vec(), b"mem/".to_vec()],
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            cluster_id: "cluster-test".to_string(),
+        });
+        assert!(st.is_enabled());
+        let before = st.snapshot();
+        assert_eq!(before.protected_prefixes, vec![b"mem/".to_vec()]);
+        assert_eq!(before.namespaces, vec![b"fs/".to_vec(), b"mem/".to_vec()]);
+        // The NOT_LEADER / error path performs NO install → the cache is intact.
+        let after = st.snapshot();
+        assert!(
+            st.is_enabled(),
+            "enforcement must not fail-open when no fresh leader config lands"
+        );
+        assert_eq!(after.protected_prefixes, before.protected_prefixes);
+        assert_eq!(after.namespaces, before.namespaces);
+        assert_eq!(after.cluster_id, before.cluster_id);
     }
 
     fn mint(sk: &SigningKey, allowed: Vec<Vec<u8>>) -> Vec<u8> {

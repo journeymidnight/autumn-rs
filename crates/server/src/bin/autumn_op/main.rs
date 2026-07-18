@@ -358,6 +358,9 @@ async fn run(args: Args) -> Result<()> {
         Command::TenantCreate { tenant, prefixes, admin_token } => cmd_tenant_create(&client, args.json, tenant, prefixes, admin_token).await?,
         Command::TenantDelete { tenant, admin_token } => cmd_tenant_delete(&client, args.json, tenant, admin_token).await?,
         Command::MintToken { tenant, credential } => cmd_mint_token(&client, args.json, tenant, credential).await?,
+        // ---------------- F-KEY-NS D2 namespace registry ----------------
+        Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
+        Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
     }
     let _ = std::io::stdout().flush();
     Ok(())
@@ -472,6 +475,87 @@ async fn cmd_mint_token(
     } else {
         println!("{token}");
         eprintln!("# token for '{tenant}', exp={exp} (unix seconds)");
+    }
+    Ok(())
+}
+
+/// F-KEY-NS D2: register a namespace. `--with-tenant` sets the owner (protected);
+/// `--presplit` freezes D8 split points (stored, not acted upon in SD-1).
+async fn cmd_namespace_create(
+    client: &ClusterClient,
+    json: bool,
+    name: String,
+    owner_tenant: Option<String>,
+    presplit: Vec<Vec<u8>>,
+    admin_token: String,
+) -> Result<()> {
+    client
+        .namespace_create(&name, owner_tenant.clone(), presplit.clone(), &admin_token)
+        .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": name,
+                "owner_tenant": owner_tenant,
+                "presplit_points": presplit.len(),
+            }))?
+        );
+    } else {
+        println!("namespace '{name}' created");
+        match &owner_tenant {
+            Some(t) => println!("  owner tenant: {t} (protected)"),
+            None => println!("  owner tenant: none (registered, not protected)"),
+        }
+        if !presplit.is_empty() {
+            println!("  presplit points: {} (stored; applied by D8)", presplit.len());
+        }
+    }
+    Ok(())
+}
+
+/// F-KEY-NS D2: delete a namespace registry row. The non-empty guard is enforced
+/// HERE (client-side): scan the `<name>/` prefix and refuse unless `--force`, since
+/// the manager has no KV data-plane client. `--force` only skips the guard — it
+/// does NOT batch-delete data (deploy is cluster-reset, §7.4; batch-delete tooling
+/// is a later delivery).
+async fn cmd_namespace_delete(
+    client: &ClusterClient,
+    json: bool,
+    name: String,
+    force: bool,
+    admin_token: String,
+) -> Result<()> {
+    let prefix = format!("{name}/").into_bytes();
+    if !force {
+        // One key is enough to prove the namespace is non-empty.
+        let scan = client
+            .range(&prefix, &prefix, 1)
+            .await
+            .with_context(|| format!("scanning namespace '{name}/' for emptiness"))?;
+        if !scan.entries.is_empty() {
+            bail!(
+                "namespace '{name}' is not empty (holds data under '{name}/'); \
+                 re-run with --force to remove the registry row anyway \
+                 (this does NOT delete the data)"
+            );
+        }
+    }
+    client.namespace_delete(&name, &admin_token).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": name,
+                "deleted": true,
+                "forced": force,
+            }))?
+        );
+    } else {
+        println!("namespace '{name}' deleted (registry row removed)");
+        if force {
+            eprintln!("# --force: emptiness check skipped; any data under '{name}/' is untouched.");
+        }
     }
     Ok(())
 }

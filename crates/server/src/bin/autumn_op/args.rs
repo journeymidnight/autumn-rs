@@ -52,6 +52,12 @@ fn usage() -> ! {
     eprintln!(
         "                               format dir(s), register node identity, stamp cluster_id"
     );
+    eprintln!();
+    eprintln!("namespace registry (F-KEY-NS D2, admin — needs --admin-token[-file]):");
+    eprintln!("  namespace-create --name <NS> [--with-tenant <T>] [--presplit <hex,hex,...>] --admin-token <TOK>");
+    eprintln!("                               register a namespace (--with-tenant marks it protected)");
+    eprintln!("  namespace-delete --name <NS> [--force] --admin-token <TOK>");
+    eprintln!("                               remove the registry row (refuses non-empty unless --force)");
     std::process::exit(1);
 }
 
@@ -78,6 +84,39 @@ fn read_secret_file(path: &str) -> String {
             std::process::exit(2);
         }
     }
+}
+
+/// F-KEY-NS D2: parse the `--presplit` value = a comma-separated list of HEX
+/// split points into raw bytes. Empty / whitespace-only → no points. Each token
+/// must be an even-length ASCII hex string (a raw split key). Bad hex → usage().
+/// These are FROZEN for D8 (stored in the registry, not acted upon in SD-1).
+fn parse_hex_split_points(spec: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if !tok.is_ascii() || !tok.len().is_multiple_of(2) {
+            eprintln!("autumn-op: --presplit point '{tok}' must be even-length ASCII hex");
+            usage();
+        }
+        let mut bytes = Vec::with_capacity(tok.len() / 2);
+        let b = tok.as_bytes();
+        let mut j = 0;
+        while j < b.len() {
+            match u8::from_str_radix(&tok[j..j + 2], 16) {
+                Ok(v) => bytes.push(v),
+                Err(_) => {
+                    eprintln!("autumn-op: --presplit point '{tok}' has non-hex chars");
+                    usage();
+                }
+            }
+            j += 2;
+        }
+        out.push(bytes);
+    }
+    out
 }
 
 pub(crate) struct Args {
@@ -294,6 +333,24 @@ pub(crate) enum Command {
     MintToken {
         tenant: String,
         credential: String,
+    },
+    /// F-KEY-NS D2: register a namespace (admin — needs `--admin-token`).
+    /// `--with-tenant <T>` marks it protected (owner tenant = T). `--presplit`
+    /// takes comma-separated hex split points (frozen for D8; stored, not yet
+    /// acted upon).
+    NamespaceCreate {
+        name: String,
+        owner_tenant: Option<String>,
+        presplit: Vec<Vec<u8>>,
+        admin_token: String,
+    },
+    /// F-KEY-NS D2: delete a namespace registry row (admin). Refuses a non-empty
+    /// namespace unless `--force` (the emptiness check is done client-side here,
+    /// scanning the prefix — the manager has no KV data-plane client).
+    NamespaceDelete {
+        name: String,
+        force: bool,
+        admin_token: String,
     },
 }
 
@@ -610,6 +667,93 @@ pub(crate) fn parse() -> Args {
                 usage();
             }
             Command::MintToken { tenant, credential }
+        }
+        // F-KEY-NS D2: namespace registry admin
+        "namespace-create" => {
+            let mut name = String::new();
+            let mut owner_tenant: Option<String> = None;
+            let mut presplit: Vec<Vec<u8>> = Vec::new();
+            let mut admin_token = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--name" => {
+                        i += 1;
+                        name = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    // Convenience: mark the namespace PROTECTED with owner = T.
+                    // (Full --with-tenant principal-create wrapping is deferred
+                    // to a later sub-delivery — this only sets the owner marker.)
+                    "--with-tenant" => {
+                        i += 1;
+                        owner_tenant = Some(val(&raw, i).to_owned());
+                        i += 1;
+                    }
+                    // Comma-separated HEX split points (frozen for D8).
+                    "--presplit" => {
+                        i += 1;
+                        presplit = parse_hex_split_points(val(&raw, i));
+                        i += 1;
+                    }
+                    "--admin-token" => {
+                        i += 1;
+                        admin_token = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--admin-token-file" => {
+                        i += 1;
+                        admin_token = read_secret_file(val(&raw, i));
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if name.is_empty() || admin_token.is_empty() {
+                usage();
+            }
+            Command::NamespaceCreate {
+                name,
+                owner_tenant,
+                presplit,
+                admin_token,
+            }
+        }
+        "namespace-delete" => {
+            let mut name = String::new();
+            let mut force = false;
+            let mut admin_token = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--name" => {
+                        i += 1;
+                        name = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--force" => {
+                        force = true;
+                        i += 1;
+                    }
+                    "--admin-token" => {
+                        i += 1;
+                        admin_token = val(&raw, i).to_owned();
+                        i += 1;
+                    }
+                    "--admin-token-file" => {
+                        i += 1;
+                        admin_token = read_secret_file(val(&raw, i));
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if name.is_empty() || admin_token.is_empty() {
+                usage();
+            }
+            Command::NamespaceDelete {
+                name,
+                force,
+                admin_token,
+            }
         }
         // F213 read
         "info" => {
@@ -1280,7 +1424,21 @@ fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::SplitPoint;
+    use super::{parse_hex_split_points, SplitPoint};
+
+    // ── F-KEY-NS D2 CLI --presplit hex parsing ────────────────────────────
+    #[test]
+    fn parse_hex_split_points_decodes_comma_separated_hex() {
+        assert_eq!(parse_hex_split_points(""), Vec::<Vec<u8>>::new());
+        assert_eq!(parse_hex_split_points("   "), Vec::<Vec<u8>>::new());
+        assert_eq!(parse_hex_split_points("0102"), vec![vec![0x01u8, 0x02]]);
+        assert_eq!(
+            parse_hex_split_points("00,ff, dead"),
+            vec![vec![0x00u8], vec![0xff], vec![0xde, 0xad]]
+        );
+        // trailing/empty segments are skipped, not turned into empty points.
+        assert_eq!(parse_hex_split_points("ab,,cd,"), vec![vec![0xab], vec![0xcd]]);
+    }
 
     // ── F-SPLIT-AT-KEY (D4) CLI split-point assembly ──────────────────────
 

@@ -255,6 +255,9 @@ impl AutumnManager {
             MSG_GET_AUTHZ_CONFIG => self.handle_get_authz_config().await,
             MSG_TENANT_CREATE => self.handle_tenant_create(payload).await,
             MSG_TENANT_DELETE => self.handle_tenant_delete(payload).await,
+            // ── F-KEY-NS D2: namespace registry ─────────────────────────
+            MSG_NAMESPACE_CREATE => self.handle_namespace_create(payload).await,
+            MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
             // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
@@ -391,21 +394,59 @@ impl AutumnManager {
     }
 
     /// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached) to learn the public keys
-    /// + protected prefixes. NOT leader-gated: the config is static local
-    /// (same key file on every manager via cluster.sh distribution), and the PS
-    /// must be able to fetch it even while an election is in progress.
+    /// + protected prefixes + the registered namespace list.
+    ///
+    /// **LEADER-GATED (F-KEY-NS D2, coco P1).** Pre-D2 this was intentionally
+    /// follower-answerable because the response was STATIC local config (the same
+    /// signing-key file on every manager via cluster.sh). D2 folded in DYNAMIC,
+    /// leader-maintained state — the `namespaces` list + the owner-derived
+    /// auto-protected prefixes come from the etcd registry, which only the leader
+    /// replays. A follower's shadow is empty/stale, so answering from it would
+    /// publish an EMPTY namespace list (Layer-A would then reject every write in
+    /// SD-2) and drop the auto-protected prefixes (an owned namespace would go
+    /// unprotected). So we refuse from a follower with `CODE_NOT_LEADER`; the PS
+    /// `fetch_authz_config_once` rotates to the leader on that code AND keeps its
+    /// last-known cached config through the election window (it only `install`s
+    /// on `CODE_OK`), so enforcement never fail-opens on a transient follower hit.
     async fn handle_get_authz_config(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&GetAuthzConfigResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
         let kr = self.authz_keyring.borrow();
         let (enabled, public_keys) = match kr.as_ref() {
             Some(k) => (true, k.published()),
             None => (false, Vec::new()),
         };
+        // F-KEY-NS D2/D7: derive both prefix lists from the namespace registry.
+        //  - `namespaces` = ALL registered prefixes (Layer-A data source, SD-2).
+        //  - `protected_prefixes` = the manually-configured D6 list (kept as a
+        //    fallback / union member so `--auth-protected-prefix` never breaks)
+        //    UNIONED with every registry namespace whose owner_tenant.is_some()
+        //    (auto-protected — replaces the hand-maintained list over time).
+        // Both are de-duplicated so a manually-listed prefix that is also an
+        // owned namespace appears once.
+        let mut protected: Vec<Vec<u8>> = self.protected_prefixes.borrow().clone();
+        let mut namespaces: Vec<Vec<u8>> = Vec::new();
+        {
+            let ns = self.namespaces.borrow();
+            for row in ns.values() {
+                namespaces.push(row.prefix.clone());
+                if row.owner_tenant.is_some() && !protected.contains(&row.prefix) {
+                    protected.push(row.prefix.clone());
+                }
+            }
+        }
         Ok(rkyv_encode(&GetAuthzConfigResp {
             code: CODE_OK,
             message: String::new(),
             enabled,
             public_keys,
-            protected_prefixes: self.protected_prefixes.borrow().clone(),
+            protected_prefixes: protected,
+            namespaces,
             token_ttl_secs: self.token_ttl_secs.get(),
             clock_skew_secs: self.clock_skew_secs.get(),
             cluster_id: self.cluster_id.borrow().clone(),
@@ -543,6 +584,154 @@ impl AutumnManager {
             }
         }
         self.tenant_accounts.borrow_mut().remove(&req.tenant);
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// `MSG_NAMESPACE_CREATE` (F-KEY-NS D2) — admin registers a namespace.
+    /// Leader-only, admin-token gated. Rejects reserved names + prefix-overlap;
+    /// etcd-first (Programming Note 1), F149-fenced, serialized on
+    /// `namespace_admin_lock`. Mirrors `handle_tenant_create`.
+    async fn handle_namespace_create(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&NamespaceCreateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: NamespaceCreateReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Admin-token gate (fail-closed; constant-time compare). Same as tenant.
+        match self.admin_token.borrow().as_ref() {
+            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
+            Some(_) => {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_PRECONDITION,
+                    message: "admin token invalid".to_string(),
+                }));
+            }
+            None => {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_ERROR,
+                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
+                }));
+            }
+        }
+
+        // Name charset validation (single path segment).
+        if let Err(msg) = crate::validate_namespace_name(&req.name) {
+            return Ok(rkyv_encode(&NamespaceCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: msg,
+            }));
+        }
+        // Reserved-name reject (fs/kvc/mem/default).
+        if crate::RESERVED_NAMESPACE_NAMES.contains(&req.name.as_str()) {
+            return Ok(rkyv_encode(&NamespaceCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: format!("'{}' is a reserved namespace name", req.name),
+            }));
+        }
+
+        let new_prefix = format!("{}/", req.name).into_bytes();
+
+        // Serialize the whole critical section (existence + disjointness check →
+        // etcd write → in-mem apply) so two concurrent creates can't both pass
+        // the checks and then commit in a conflicting order (mirrors the tenant
+        // admin lock — coco P1 class).
+        let _admin = self.namespace_admin_lock.lock().await;
+
+        // Already-exists + prefix-disjointness check (under the lock).
+        {
+            let ns = self.namespaces.borrow();
+            if ns.contains_key(&req.name) {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("namespace '{}' already exists", req.name),
+                }));
+            }
+            let existing: Vec<&[u8]> = ns.values().map(|r| r.prefix.as_slice()).collect();
+            if crate::namespace_prefix_conflicts(&new_prefix, &existing) {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: format!(
+                        "namespace '{}' prefix overlaps an existing namespace \
+                         (all namespace prefixes must be pairwise disjoint)",
+                        req.name
+                    ),
+                }));
+            }
+        }
+
+        let row = MgrNamespace {
+            name: req.name.clone(),
+            prefix: new_prefix,
+            owner_tenant: req.owner_tenant.clone(),
+            presplit: req.presplit.clone(),
+            created_at: Self::epoch_seconds(),
+        };
+        let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, rkyv_encode(&row).to_vec())])
+                .await
+            {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.namespaces.borrow_mut().insert(req.name.clone(), row);
+        Ok(rkyv_encode(&NamespaceCreateResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    /// `MSG_NAMESPACE_DELETE` (F-KEY-NS D2) — admin removes a namespace registry
+    /// row. Leader-only, admin-token gated. Refuses the three built-in families
+    /// (`fs`/`kvc`/`mem`). The NON-EMPTY guard (`--force`) is enforced
+    /// CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane client), so
+    /// this handler only drops the etcd registry row. Mirrors
+    /// `handle_tenant_delete`.
+    async fn handle_namespace_delete(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: NamespaceDeleteReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        match self.admin_token.borrow().as_ref() {
+            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
+            Some(_) => return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string()),
+            None => {
+                return Self::code_resp(
+                    CODE_ERROR,
+                    "admin RPCs disabled (no --admin-token configured)".to_string(),
+                )
+            }
+        }
+        // Built-in families are non-deletable (bootstrap-seeded).
+        if crate::BUILTIN_NAMESPACES.contains(&req.name.as_str()) {
+            return Self::code_resp(
+                CODE_INVALID_ARGUMENT,
+                format!("built-in namespace '{}' cannot be deleted", req.name),
+            );
+        }
+        let _admin = self.namespace_admin_lock.lock().await;
+        if !self.namespaces.borrow().contains_key(&req.name) {
+            return Self::code_resp(
+                CODE_NOT_FOUND,
+                format!("namespace '{}' not found", req.name),
+            );
+        }
+        let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.namespaces.borrow_mut().remove(&req.name);
         Self::code_resp(CODE_OK, String::new())
     }
 
@@ -6598,6 +6787,225 @@ mod authz_kdc_tests {
                 rkyv_decode(&mgr.handle_tenant_create(tc).await.unwrap()).unwrap();
             assert_ne!(r.code, CODE_OK);
         });
+    }
+}
+
+#[cfg(test)]
+mod namespace_registry_tests {
+    //! F-KEY-NS D2 (SD-1): namespace registry create/delete + bootstrap seed +
+    //! the GetAuthzConfig bridge. Memory-mode manager (leader==true, no etcd);
+    //! the etcd replay/persist path is covered by
+    //! `tests/namespace_registry_etcd.rs` (needs the etcd binary).
+    #![allow(clippy::await_holding_refcell_ref)]
+    use crate::{AutumnManager, MgrNamespace};
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    const ADMIN: &str = "admin-secret";
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    fn mgr() -> AutumnManager {
+        let m = AutumnManager::new();
+        m.set_admin_token(ADMIN.to_string());
+        m
+    }
+
+    fn create(
+        m: &AutumnManager,
+        admin: &str,
+        name: &str,
+        owner: Option<&str>,
+        presplit: Vec<Vec<u8>>,
+    ) -> NamespaceCreateResp {
+        let req = NamespaceCreateReq {
+            admin_token: admin.to_string(),
+            name: name.to_string(),
+            owner_tenant: owner.map(|s| s.to_string()),
+            presplit,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_create(payload).await.unwrap() });
+        rkyv_decode::<NamespaceCreateResp>(&resp).expect("decode NamespaceCreateResp")
+    }
+
+    fn delete(m: &AutumnManager, admin: &str, name: &str) -> CodeResp {
+        let req = NamespaceDeleteReq {
+            admin_token: admin.to_string(),
+            name: name.to_string(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_delete(payload).await.unwrap() });
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    fn authz_config(m: &AutumnManager) -> GetAuthzConfigResp {
+        let resp = run(async { m.handle_get_authz_config().await.unwrap() });
+        rkyv_decode::<GetAuthzConfigResp>(&resp).expect("decode GetAuthzConfigResp")
+    }
+
+    #[test]
+    fn bootstrap_seeds_the_three_builtin_families() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        let ns = m.namespaces.borrow();
+        for name in ["fs", "kvc", "mem"] {
+            let row = ns.get(name).unwrap_or_else(|| panic!("{name} not seeded"));
+            assert_eq!(row.prefix, format!("{name}/").into_bytes());
+            assert!(row.owner_tenant.is_none(), "{name} should be existence-only");
+        }
+        // Idempotent: a second seed leaves them untouched (memory mode).
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        assert_eq!(m.namespaces.borrow().len(), 3);
+    }
+
+    #[test]
+    fn create_delete_round_trip() {
+        let m = mgr();
+        let r = create(&m, ADMIN, "bench", None, Vec::new());
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        assert!(m.namespaces.borrow().contains_key("bench"));
+
+        // Re-create is a precondition failure (already exists).
+        let dup = create(&m, ADMIN, "bench", None, Vec::new());
+        assert_eq!(dup.code, CODE_PRECONDITION);
+
+        let d = delete(&m, ADMIN, "bench");
+        assert_eq!(d.code, CODE_OK, "{}", d.message);
+        assert!(!m.namespaces.borrow().contains_key("bench"));
+
+        // Delete of a now-absent namespace = NOT_FOUND.
+        let gone = delete(&m, ADMIN, "bench");
+        assert_eq!(gone.code, CODE_NOT_FOUND);
+    }
+
+    #[test]
+    fn presplit_points_are_stored_verbatim() {
+        let m = mgr();
+        let pts = vec![vec![0x01u8, 0x02], vec![0xffu8]];
+        let r = create(&m, ADMIN, "bench", Some("acme"), pts.clone());
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let ns = m.namespaces.borrow();
+        let row = ns.get("bench").unwrap();
+        assert_eq!(row.presplit, pts);
+        assert_eq!(row.owner_tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn reserved_names_are_rejected() {
+        let m = mgr();
+        for name in ["fs", "kvc", "mem", "default"] {
+            let r = create(&m, ADMIN, name, None, Vec::new());
+            assert_eq!(r.code, CODE_INVALID_ARGUMENT, "{name} must be reserved");
+        }
+    }
+
+    #[test]
+    fn invalid_charset_is_rejected() {
+        let m = mgr();
+        for bad in ["Bench", "a/b", "has space", "", "up_UP"] {
+            let r = create(&m, ADMIN, bad, None, Vec::new());
+            assert_eq!(r.code, CODE_INVALID_ARGUMENT, "'{bad}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn prefix_overlap_is_rejected() {
+        let m = mgr();
+        // Seed a namespace with a NESTED prefix (a/b/) directly into the shadow;
+        // a new `a/` would then be a `starts_with` ancestor of it → conflict.
+        m.namespaces.borrow_mut().insert(
+            "deep".to_string(),
+            MgrNamespace {
+                name: "deep".to_string(),
+                prefix: b"a/b/".to_vec(),
+                owner_tenant: None,
+                presplit: Vec::new(),
+                created_at: 0,
+            },
+        );
+        let r = create(&m, ADMIN, "a", None, Vec::new());
+        assert_eq!(r.code, CODE_INVALID_ARGUMENT, "overlapping prefix must reject");
+        // A disjoint name is still accepted.
+        let ok = create(&m, ADMIN, "bench", None, Vec::new());
+        assert_eq!(ok.code, CODE_OK, "{}", ok.message);
+    }
+
+    #[test]
+    fn builtin_families_cannot_be_deleted() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        for name in ["fs", "kvc", "mem"] {
+            let d = delete(&m, ADMIN, name);
+            assert_eq!(d.code, CODE_INVALID_ARGUMENT, "{name} must be non-deletable");
+            assert!(m.namespaces.borrow().contains_key(name));
+        }
+    }
+
+    #[test]
+    fn admin_token_is_enforced() {
+        let m = mgr();
+        // Wrong token.
+        let bad = create(&m, "wrong", "bench", None, Vec::new());
+        assert_eq!(bad.code, CODE_PRECONDITION);
+        assert!(!m.namespaces.borrow().contains_key("bench"));
+        // No admin token configured at all → RPCs disabled.
+        let m2 = AutumnManager::new();
+        let disabled = create(&m2, ADMIN, "bench", None, Vec::new());
+        assert_eq!(disabled.code, CODE_ERROR);
+    }
+
+    #[test]
+    fn get_authz_config_bridges_registry() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        // An OWNED namespace is auto-protected; an unowned one is registered only.
+        assert_eq!(create(&m, ADMIN, "bench", Some("acme"), Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, ADMIN, "scratch", None, Vec::new()).code, CODE_OK);
+
+        let cfg = authz_config(&m);
+        // `namespaces` carries EVERY registered prefix (Layer-A data source).
+        for p in [b"fs/".to_vec(), b"kvc/".to_vec(), b"mem/".to_vec(), b"bench/".to_vec(), b"scratch/".to_vec()] {
+            assert!(cfg.namespaces.contains(&p), "namespaces missing {p:?}");
+        }
+        // `protected_prefixes` carries ONLY the owned namespace (bench), not the
+        // existence-only families or the unowned `scratch`.
+        assert!(cfg.protected_prefixes.contains(&b"bench/".to_vec()));
+        assert!(!cfg.protected_prefixes.contains(&b"fs/".to_vec()));
+        assert!(!cfg.protected_prefixes.contains(&b"scratch/".to_vec()));
+    }
+
+    #[test]
+    fn get_authz_config_is_leader_gated() {
+        // F-KEY-NS D2 (coco P1): the registry is leader-maintained, so a
+        // follower must refuse rather than publish an empty/stale namespace list.
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        let ok = authz_config(&m);
+        assert_eq!(ok.code, CODE_OK);
+        assert!(!ok.namespaces.is_empty(), "leader must carry the registry");
+
+        m.set_leader(false);
+        let follower = authz_config(&m);
+        assert_eq!(follower.code, CODE_NOT_LEADER, "follower must refuse");
+        // A refused response carries NO registry data — a PS never installs an
+        // empty namespace list or drops protected prefixes from a follower.
+        assert!(follower.namespaces.is_empty());
+        assert!(follower.protected_prefixes.is_empty());
+        assert!(follower.public_keys.is_empty());
+    }
+
+    #[test]
+    fn manual_protected_prefix_list_is_preserved_as_union_member() {
+        let m = mgr();
+        // The D6 manual `--auth-protected-prefix` list must survive the bridge.
+        m.set_protected_prefixes(vec![b"legacy/".to_vec()]);
+        assert_eq!(create(&m, ADMIN, "bench", Some("acme"), Vec::new()).code, CODE_OK);
+        let cfg = authz_config(&m);
+        assert!(cfg.protected_prefixes.contains(&b"legacy/".to_vec()), "manual list dropped");
+        assert!(cfg.protected_prefixes.contains(&b"bench/".to_vec()), "owned ns not bridged");
     }
 }
 // end of rpc_handlers.rs
