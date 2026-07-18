@@ -132,7 +132,28 @@ impl NamespaceBinding {
         }
     }
 
-    /// `{ns}/{tenant}/` for a scoped binding; `None` for `Raw`.
+    /// F-KEY-NS SD-3: a scoped binding one level deeper — `{ns}/{tenant}/{volume}/`.
+    /// Same Prepend/strip/clamp behaviour as `scoped`; the `volume` lives only in
+    /// `prefix` (the `namespace`/`tenant` fields stay the scope's ns/tenant for
+    /// credential checks). Used by `connect_volume` (autumnfs) so its keys land in
+    /// the SAME `fs/{tenant}/{volume}/` keyspace a fuse mount writes under.
+    pub fn scoped_volume(
+        namespace: impl Into<String>,
+        tenant: impl Into<String>,
+        volume: &str,
+    ) -> Self {
+        let namespace = namespace.into();
+        let tenant = tenant.into();
+        let prefix = format!("{namespace}/{tenant}/{volume}/").into_bytes();
+        NamespaceBinding::Scoped {
+            namespace,
+            tenant,
+            prefix,
+        }
+    }
+
+    /// `{ns}/{tenant}/` (or `{ns}/{tenant}/{volume}/` for a `scoped_volume`
+    /// binding) for a scoped binding; `None` for `Raw`.
     pub fn prefix(&self) -> Option<&[u8]> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
@@ -1074,6 +1095,34 @@ impl ClusterClient {
             }
         }
         Self::connect_with_binding(manager, NamespaceBinding::scoped(namespace, tenant)).await
+    }
+
+    /// F-KEY-NS SD-3: connect a SCOPED client bound to a specific VOLUME
+    /// (`{namespace}/{tenant}/{volume}/`) — same Prepend-only clamp as `connect`,
+    /// one level deeper. The client prepends the full `fs/{tenant}/{volume}/` to
+    /// every key and strips it off returned range keys, so all of `autumnfs`'s
+    /// existing relative-key ops (`key::inode_key`/`dirent_key`/`extent_key`/…)
+    /// land in the SAME keyspace a fuse mount writes under — a write here is
+    /// visible to a mount pointed at the same `--tenant`/`--volume`. Validates all
+    /// three segments as `[a-z0-9._-]+`.
+    pub async fn connect_volume(
+        manager: &str,
+        namespace: &str,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Self> {
+        for (kind, seg) in [("namespace", namespace), ("tenant", tenant), ("volume", volume)] {
+            if !is_valid_scope_segment(seg) {
+                return Err(anyhow!(
+                    "invalid {kind} {seg:?}: must be non-empty and match [a-z0-9._-]+ (no '/')"
+                ));
+            }
+        }
+        Self::connect_with_binding(
+            manager,
+            NamespaceBinding::scoped_volume(namespace, tenant, volume),
+        )
+        .await
     }
 
     /// F-KEY-NS D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO

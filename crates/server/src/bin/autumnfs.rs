@@ -22,13 +22,13 @@
 //!
 //! Paths are `/`-separated; leading `/` is optional. ROOT_INO = 1.
 //!
-//! The inode allocator is intentionally racy — it does a get-then-put on the
-//! `next_inode` super-block counter without CAS, same as the fuse mount today.
-//! Two concurrent autumnfs writers racing the counter is a known limitation;
-//! the failure mode is "later writer overwrites earlier writer's inode" which
-//! corrupts the dirent that pointed at it. For a one-shot CLI this is
-//! acceptable; do not script `autumnfs` in parallel against the same
-//! directory.
+//! F-KEY-NS SD-3: `autumnfs` connects SCOPED to `fs/{tenant}/{volume}/`
+//! (`--tenant`/`--volume`, both default `default`) so its keys land in the SAME
+//! keyspace a fuse mount uses — a write here is visible to a mount pointed at the
+//! same tenant+volume, and vice versa. Inode numbers come from the MANAGER's
+//! crash-safe GLOBAL counter (`alloc_inodes`), the same source the fuse mount +
+//! PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding inodes
+//! (the pre-SD-3 racy non-CAS KV counter is gone).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -55,6 +55,16 @@ struct Args {
     /// Transport: tcp (default) or ucx (if built with the ucx feature).
     #[arg(long, default_value = "tcp")]
     transport: String,
+
+    /// F-KEY-NS SD-3: tenant this fs lives under (`fs/{tenant}/{volume}/`). Must
+    /// match the fuse mount's `--tenant` to see the same filesystem.
+    #[arg(long, default_value = "default")]
+    tenant: String,
+
+    /// F-KEY-NS SD-3: volume within the tenant. Must match the fuse mount's
+    /// `--volume` to see the same filesystem.
+    #[arg(long, default_value = "default")]
+    volume: String,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -109,11 +119,15 @@ fn main() -> Result<()> {
         .build()
         .context("create compio runtime")?;
     rt.block_on(async move {
-        // F-KEY-NS D7: autumnfs operates on the raw fuse key space (`0x01`–`0x04`,
-        // migrated to `fs/…` in SD-3) — bind Raw (no client clamp).
-        let cluster = ClusterClient::connect_raw(&args.manager)
-            .await
-            .context("connect to manager")?;
+        // F-KEY-NS SD-3: scope the client to `fs/{tenant}/{volume}/` — the binding
+        // prepends the full prefix to every relative fuse key (and strips it off
+        // range results), so a write here is visible to a fuse mount on the same
+        // `--tenant`/`--volume`. Every `key::*`-based op below is unchanged; the
+        // client owns the prefix (validates the segments).
+        let cluster =
+            ClusterClient::connect_volume(&args.manager, "fs", &args.tenant, &args.volume)
+                .await
+                .context("connect to manager")?;
         cluster
             .wait_for_cluster_ready(
                 std::time::Duration::from_secs(20),
@@ -201,21 +215,17 @@ async fn resolve_parent_leaf(
 
 // ─── Inode allocation ────────────────────────────────────────────────────────
 
-/// One-at-a-time inode allocator: get the counter, write back +1, return the
-/// allocated id. NOT CAS-safe; see the module doc comment.
+/// Allocate an inode number from the MANAGER's global counter — the SAME source
+/// the fuse mount + PyO3 `autumn.Fs` use (F-FS-UNIFY M0), so autumnfs's inodes are
+/// cluster-unique and never collide with a mount's. Empty volume = the single
+/// global counter (F-KEY-NS SD-3 review P1-2: inodes are cluster-unique, not
+/// per-volume, because the lease/fence plane keys by bare ino). Replaces the
+/// pre-SD-3 racy non-CAS get/put on the `next_inode` KV counter.
 async fn alloc_inode(cluster: &ClusterClient) -> Result<u64> {
-    let k = key::next_inode_key();
-    let current = match cluster.get(&k).await.map_err(|e| anyhow!("next_inode get: {e}"))? {
-        Some(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
-        _ => ROOT_INO + 1,
-    };
-    let next = current + 1;
-    let v = next.to_be_bytes();
     cluster
-        .put(&k, &v)
+        .alloc_inodes(1, 0, b"")
         .await
-        .map_err(|e| anyhow!("next_inode put: {e}"))?;
-    Ok(current)
+        .map_err(|e| anyhow!("alloc_inodes from manager: {e}"))
 }
 
 // ─── Meta builders (re-implemented; the fuse-gated `meta::new_*_meta` would
