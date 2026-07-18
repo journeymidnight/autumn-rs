@@ -890,25 +890,28 @@ RAM). vLLM matches the local cache first and asks the connector only for tokens
   cold ⇒ the connector loads the prefix from autumn and skips prefill (measured
   ~3–4× TTFT win on a 1.3 k-token prefix).
 
-The connector also **no longer re-saves a prefix already durable in autumn**: a
-repeat whose KV the local cache served writes nothing (before this fix it
-re-saved every layer every request — the "kvc grows 20 GB while hit rate is 0%,
-prefill stalls" symptom).
+Two changes killed the "kvc grows 20 GB while hit rate is 0%, prefill stalls"
+symptom:
 
-Two `kv_connector_extra_config` switches (read once at startup; a change needs a
-vLLM restart), both default on:
+- **Almost everything is asynchronous.** On the forward pass `save_kv_layer`
+  does ONLY the cheap GPU-side gather (a standalone tensor, no CPU sync). The
+  D2H `.cpu()` copy, the **store-dedup probe**, the durable `put_from`, and the
+  `__present__` marker all run on a background thread (a CUDA event orders the
+  D2H after the gather; the marker publishes only after every layer ACKs). So a
+  genuinely-new prefix no longer blocks prefill on the durable write, and a
+  repeat is deduped in the background. Measured **no-hit overhead: TTFT +≈6–7 ms
+  / TPOT ≈0** on both TCP and UCX (transport-independent, since the network work
+  is off the critical path) — down from +≈148 ms when the D2H was synchronous.
+- Staging: the in-flight background jobs hold *standalone GPU tensors* until
+  their D2H runs (bounded per step by vLLM's token budget, and by
+  `_MAX_INFLIGHT_SAVES` across steps); over the cap a save is dropped (a later
+  request re-saves — pure cache).
 
-```jsonc
-// load-only — serve external hits, never write (drop the write cost, keep reads)
-"kv_connector_extra_config": { "endpoint": "MGR:9001", "enable_save": false }
-// fully disabled — no probe, no load, no save (net-negative kill switch)
-"kv_connector_extra_config": { "endpoint": "MGR:9001", "enabled": false }
-```
-
-Verify on a live deployment: the connector logs `... in LOAD-ONLY mode` or
-`... DISABLED via kv_connector_extra_config` at startup, and a same-prompt
-request on a **freshly restarted** engine should log an external hit and a much
-lower TTFT than the cold-cluster first request.
+Verify on a live deployment: a same-prompt request on a **freshly restarted**
+engine (or after `reset_prefix_cache()`) should log an external hit and a much
+lower TTFT than the cold-cluster first request; the first cold request returns
+before its KV is durable, and the kvc partition's `live_size` grows in step with
+distinct prefixes, not requests.
 
 ## Data-plane authz setup (F-AUTHZ-1)
 

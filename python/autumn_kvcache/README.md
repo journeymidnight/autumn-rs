@@ -67,9 +67,9 @@ CUDA_VISIBLE_DEVICES=1 vllm serve /models/Qwen3-8B --served-model-name qwen3 \
 ```
 
 `kv_connector_extra_config` keys: `endpoint` (autumn manager `host:port`,
-required unless `enabled=false`), `transport` (`tcp` default, or `ucx`), `client_workers`,
+required), `transport` (`tcp` default, or `ucx`), `client_workers`,
 `max_inflight`, `ttl_secs`, `model_id` (optional explicit model identity — see
-below), `enabled` / `enable_save` (the kill switches — see next).
+below).
 
 ### What the external cache does (and does not) speed up
 
@@ -89,30 +89,31 @@ hit — you would never want to prefer autumn over GPU cache. Concretely:
 So judge the connector by **cross-instance / post-restart** hit rate, not by
 same-instance repeats. It also **never re-saves a prefix that is already durable
 in autumn** (BUG-KVC-NO-HIT): a repeat whose KV the local cache already served
-writes nothing, so it costs neither storage nor prefill time. (It does issue one
-lightweight presence probe per new request to make that de-dup decision; in
-`enable_save=false` load-only mode even that probe is skipped once the local
-cache covers the prompt.)
+writes nothing, so it costs neither storage nor prefill time. (It issues one
+lightweight presence probe per new request to make that de-dup decision.)
 
-### Turning it off (`enabled` / `enable_save`)
+### Saves are asynchronous (almost nothing on the prefill critical path)
 
-Both are read once at engine start (changing them needs a restart, same as any
-engine arg), and both default to on:
+On the forward pass, `save_kv_layer` does **only** the cheap GPU-side gather
+(`_extract_layer` → a *standalone* tensor, decoupled from the paged blocks — no
+CPU sync). Everything expensive runs on a background thread: the D2H `.cpu()`
+copy, the store-dedup probe, the durable batched `put_from`, and the marker. A
+CUDA event lets the background thread wait for the gathers before the D2H, and
+the `__present__` marker is published only *after* every layer ACKs (so a reader
+that sees the marker always finds a complete, correct prefix — verified: an
+external-load reproduces vLLM's local-cache output token-for-token).
 
-- **`enable_save`** (default `true`) — set to `false` for **load-only** mode:
-  external hits still serve (pure win on an already-warm cache) but nothing is
-  ever written. Use this when the cache is warm and you only want reads, or to
-  stop paying the write cost on a workload with little reuse.
-- **`enabled`** (default `true`) — set to `false` to make the connector a
-  **complete no-op** (no probe, no load, no save). The one-flag kill switch when
-  the cache is net-negative, without having to drop `--kv-transfer-config`.
+Measured no-hit overhead (Qwen3-VL-32B, 1 k-token prompt, H200): **TTFT +≈6 ms,
+TPOT ≈0** vs. no connector — i.e. a prefill that never gets reused costs almost
+nothing. (Before moving the D2H off the path it was +≈148 ms.) When the prefix
+*is* reused cross-instance, the connector skips the whole prefill instead.
 
-```jsonc
-// load-only: serve hits, write nothing
-"kv_connector_extra_config": { "endpoint": "127.0.0.1:9001", "enable_save": false }
-// fully disabled: no-op
-"kv_connector_extra_config": { "endpoint": "127.0.0.1:9001", "enabled": false }
-```
+At most `_MAX_INFLIGHT_SAVES` saves are in flight (bounding the held GPU/CPU
+staging); over that a save is dropped rather than blocking prefill — it is a pure
+cache, so a later request re-saves. The **store-dedup also lives in the
+background**: a prefix already durable in autumn is neither re-copied nor
+re-written, so a repeated prompt (served by the local GPU cache) costs no storage
+and no extra latency.
 
 ### Tenant isolation: the model's real identity is part of the key
 
