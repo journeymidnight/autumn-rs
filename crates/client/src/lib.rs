@@ -836,13 +836,15 @@ impl ClusterClient {
     /// disjoint ranges). `floor` is the legacy `[0x04]next_inode` fs KV
     /// counter value (0 = none): the grant never returns a base below it,
     /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
-    pub async fn alloc_inodes(&self, count: u32, floor: u64) -> Result<u64> {
-        // F-KEY-NS SD-1: `volume` is wire-frozen but not yet wired (SD-3);
-        // empty = the legacy single global inode counter.
+    pub async fn alloc_inodes(&self, count: u32, floor: u64, volume: &[u8]) -> Result<u64> {
+        // F-KEY-NS SD-3: `volume` is the canonicalized `fs/{tenant}/{volume}/`
+        // prefix, so the manager keys the inode counter per-volume (each volume
+        // numbers its inodes from 2, disjoint from every other). Empty = the
+        // legacy single global counter (admin/pre-SD-3 callers).
         let req = rkyv_encode(&AllocInodesReq {
             count,
             floor,
-            volume: Vec::new(),
+            volume: volume.to_vec(),
         });
         let resp: AllocInodesResp = self
             .mgr_call_leader(MSG_ALLOC_INODES, req, "alloc_inodes", 3, 3, |b| {

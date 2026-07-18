@@ -148,9 +148,13 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
         Ok(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
         _ => ROOT_INO + 1,
     };
+    // F-KEY-NS SD-3: the manager keys the inode counter per-volume, so pass
+    // this mount's `fs/{tenant}/{volume}/` identity (the floor is this volume's
+    // own `[0x04]next_inode` migration cursor, read volume-relative above).
+    let vol_id = state.volume_identity();
     let base = state
         .client
-        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor)
+        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor, &vol_id)
         .await
         .context("alloc_inodes from manager")?;
     // Best-effort: keep the legacy KV cursor roughly current so a disaster

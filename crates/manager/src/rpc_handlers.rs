@@ -6236,7 +6236,7 @@ impl AutumnManager {
                 base: 0,
             }));
         }
-        match self.alloc_fs_inodes(req.count as u64, req.floor).await {
+        match self.alloc_fs_inodes(req.count as u64, req.floor, &req.volume).await {
             Ok(base) => Ok(rkyv_encode(&AllocInodesResp {
                 code: CODE_OK,
                 message: String::new(),

@@ -2167,14 +2167,25 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     duplicated batches under concurrent allocators (two mounts, or a mount +
     the Python `autumn.Fs` client; design: `docs/fs_unify_design.md` §6,
     decision Q2 = manager RPC with CAS). Semantics:
-    - **Etcd mode:** authoritative counter at `autumn-rs/fs/next_inode`
+    - **Etcd mode:** authoritative counter at `fs_next_inode_key(volume)`
       (strict BE u64; malformed value → refuse loudly, never guess). Every
       grant is a read → `txn_fenced` value-CAS loop (F149 leader fence
       prepended, so a deposed leader's grant loses the txn — no double-grant
       across a leader transition). First-create uses the create_revision==0
       pattern (same as owner locks). No in-memory cache: every grant reads
       etcd fresh, so failover needs no replay hook for this key.
-    - **Memory mode (tests/dev):** `AutumnManager.fs_next_inode` Cell.
+    - **F-KEY-NS SD-3 — the counter is PER-VOLUME.** `AllocInodesReq.volume`
+      (frozen SD-1, wired SD-3) carries the fuse mount's canonicalized
+      `fs/{tenant}/{volume}/` identity; `fs_next_inode_key(volume)` keys the
+      etcd counter at `autumn-rs/fs/{tenant}/{volume}/next_inode` (empty volume
+      → the legacy global `autumn-rs/fs/next_inode`, for pre-SD-3 / admin
+      callers). Each volume numbers its inodes from 2 independently, so two
+      volumes (or two tenants) can never be granted the same inode — matching
+      the per-volume KV prefix `fs/{tenant}/{volume}/` the fuse layer writes
+      under (fuse CLAUDE.md KV-key SD-3 note). The `floor` is the volume's OWN
+      `[0x04]next_inode` migration cursor (read volume-relative by the mount).
+    - **Memory mode (tests/dev):** `AutumnManager.fs_next_inode`
+      `RefCell<HashMap<Vec<u8>, u64>>`, keyed per-volume (empty key = global).
     - **Migration floor:** requests carry the legacy KV counter value; the
       grant never returns a base below it (`max(cur, floor)`) and the counter
       never rewinds. The fuse mount passes it on every batch refill and
@@ -2184,11 +2195,13 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       manager ENTITIES (streams/extents/partitions) replayed from etcd
       prefixes; inode numbers are fs-layer data with their own key.
     - Handler: `handle_alloc_inodes` (leader-gated like MSG_ACQUIRE_LEASE;
-      count==0 → CODE_INVALID_ARGUMENT). Client: `ClusterClient::
-      alloc_inodes(count, floor)` via `mgr_call_leader`. Tests:
+      count==0 → CODE_INVALID_ARGUMENT; passes `req.volume` through). Client:
+      `ClusterClient::alloc_inodes(count, floor, volume)` via `mgr_call_leader`
+      (fuse passes `FsState::volume_identity()`). Tests:
       `tests/fs_alloc_inodes.rs` (16-way concurrent disjointness + floor
-      monotonicity in memory mode; etcd CAS disjointness + persisted
-      watermark + follower NOT_LEADER refusal), `fs_alloc::tests` unit.
+      monotonicity + per-volume independence in memory mode; etcd CAS
+      disjointness + persisted watermark + follower NOT_LEADER refusal),
+      `fs_alloc::tests` unit (per-volume isolation + key shape).
 
 43. **F-DASH-IN-MGR embedded web dashboard + auto-policy controller
     (2026-07-04).** The retired Python `python/dashboard/` (a browser UI + an

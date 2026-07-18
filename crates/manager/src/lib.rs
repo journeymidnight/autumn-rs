@@ -686,15 +686,16 @@ pub struct AutumnManager {
     /// the entry moves to this queue).
     pub(crate) failed_deletes:
         Rc<RefCell<HashMap<u64, crate::extent_delete::MgrExtentDeleteRetry>>>,
-    /// F-FS-UNIFY M0: etcd-less (memory-only) shadow of the fuse-fs
-    /// inode-allocator counter — the next unallocated inode number.
-    /// In etcd-backed mode the AUTHORITATIVE counter lives at
-    /// `fs_alloc::FS_NEXT_INODE_KEY` and every grant is a leader-fenced
-    /// CAS txn (this cell is unused there); memory-only mode (tests/dev)
-    /// allocates straight from this cell. NOT part of `alloc_ids` (note 5):
+    /// F-FS-UNIFY M0 / F-KEY-NS SD-3: etcd-less (memory-only) shadow of the
+    /// fuse-fs inode-allocator counter, keyed PER-VOLUME (the canonicalized
+    /// `fs/{tenant}/{volume}/` prefix; empty key = the legacy global counter).
+    /// In etcd-backed mode the AUTHORITATIVE per-volume counters live at
+    /// `fs_alloc::fs_next_inode_key(volume)` and every grant is a leader-fenced
+    /// CAS txn (this map is unused there); memory-only mode (tests/dev)
+    /// allocates straight from this map. NOT part of `alloc_ids` (note 5):
     /// that counter numbers stream/extent/partition ENTITIES replayed from
     /// etcd prefixes; inode numbers are fs-layer data with their own key.
-    pub(crate) fs_next_inode: Rc<Cell<u64>>,
+    pub(crate) fs_next_inode: Rc<RefCell<HashMap<Vec<u8>, u64>>>,
     runtime_started: Rc<Cell<bool>>,
     /// F265: true once `serve()`'s listener is actually BOUND and
     /// accepting. The UCX listener bind can retry through a killed
@@ -929,7 +930,7 @@ impl AutumnManager {
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
-            fs_next_inode: Rc::new(Cell::new(fs_alloc::FS_FIRST_ALLOCATABLE_INO)),
+            fs_next_inode: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),

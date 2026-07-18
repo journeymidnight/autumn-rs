@@ -29,16 +29,51 @@ use autumn_rpc::manager_rpc::{
 use support::{pick_addr, start_etcd, start_manager};
 
 async fn alloc(mgr: &RpcClient, count: u32, floor: u64) -> AllocInodesResp {
+    alloc_vol(mgr, count, floor, Vec::new()).await
+}
+
+async fn alloc_vol(mgr: &RpcClient, count: u32, floor: u64, volume: Vec<u8>) -> AllocInodesResp {
     let payload = rkyv_encode(&AllocInodesReq {
         count,
         floor,
-        volume: Vec::new(),
+        volume,
     });
     let resp = mgr
         .call(MSG_ALLOC_INODES, payload)
         .await
         .expect("alloc_inodes rpc");
     rkyv_decode(&resp).expect("decode AllocInodesResp")
+}
+
+/// F-KEY-NS SD-3: two distinct volume identities get INDEPENDENT counters —
+/// each numbers its inodes from 2, and a grant on one never advances the
+/// other. Proves the handler threads `req.volume` into the per-volume
+/// allocator (memory-mode manager, raw RPC).
+#[test]
+fn per_volume_counters_are_independent() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr_addr = pick_addr();
+        start_manager(mgr_addr);
+        compio::time::sleep(Duration::from_millis(300)).await;
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect");
+
+        let v1 = b"fs/acme/vol0/".to_vec();
+        let v2 = b"fs/acme/vol1/".to_vec();
+
+        // First grant on each volume: both start fresh at the reserved+1 floor.
+        let a1 = alloc_vol(&mgr, 100, 0, v1.clone()).await;
+        let a2 = alloc_vol(&mgr, 100, 0, v2.clone()).await;
+        assert_eq!(a1.code, CODE_OK, "{}", a1.message);
+        assert_eq!(a2.code, CODE_OK, "{}", a2.message);
+        assert_eq!(a1.base, 2, "vol0 numbers from the reserved-root+1 base");
+        assert_eq!(a2.base, 2, "vol1 numbers independently, also from 2");
+
+        // Second grant on v1 advances ONLY v1's counter.
+        let b1 = alloc_vol(&mgr, 100, 0, v1.clone()).await;
+        assert_eq!(b1.base, a1.base + 100, "vol0 advanced past its first batch");
+        let b2 = alloc_vol(&mgr, 100, 0, v2.clone()).await;
+        assert_eq!(b2.base, a2.base + 100, "vol1 unaffected by vol0's grants");
+    });
 }
 
 /// Grants must be pairwise disjoint under concurrency, and the floor must
