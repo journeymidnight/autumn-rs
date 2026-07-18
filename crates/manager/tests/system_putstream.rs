@@ -56,7 +56,7 @@ async fn boot_cluster(
     compio::time::sleep(Duration::from_millis(1500)).await;
     let _ = RpcClient::connect(ps_addr).await.unwrap();
 
-    let cluster = ClusterClient::connect(&mgr_addr.to_string())
+    let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
         .await
         .expect("ClusterClient::connect");
     cluster.set_rpc_timeout(Duration::from_secs(15));

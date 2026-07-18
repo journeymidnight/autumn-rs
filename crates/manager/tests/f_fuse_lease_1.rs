@@ -48,7 +48,7 @@ async fn boot_cluster(
     start_partition_server(base as u64, mgr_addr, ps_addr);
     compio::time::sleep(Duration::from_millis(1500)).await;
     let _ = RpcClient::connect(ps_addr).await.unwrap();
-    let cluster = ClusterClient::connect(&mgr_addr.to_string())
+    let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
         .await
         .expect("ClusterClient::connect");
     cluster.set_rpc_timeout(Duration::from_secs(30));
@@ -421,7 +421,7 @@ fn fuse_uses_fuse_kind_identity() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let id_fuse = DaemonClientId::new_fuse("host-x");
         let id_iouring = DaemonClientId::new("host-x");
         assert_eq!(id_fuse.as_wire().kind, LEASE_CLIENT_KIND_FUSE);

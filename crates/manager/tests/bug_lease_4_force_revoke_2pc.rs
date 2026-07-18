@@ -67,8 +67,8 @@ fn bug_lease_4_force_revoke_still_delivers_lease_revoked_after_2pc() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer_a = cid(0xb1, "a");
         let writer_b = cid(0xb2, "b");
         let ino = 8001u64;
@@ -128,8 +128,8 @@ fn bug_lease_4_revoke_pending_delivers_will_revoke_in() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer_a = cid(0xc1, "a");
         let writer_b = cid(0xc2, "b");
         let ino = 8002u64;

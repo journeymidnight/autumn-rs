@@ -59,8 +59,8 @@ fn long_poll_returns_promptly_on_writer_close() {
         // Two separate ClusterClient instances so the writer's
         // ReleaseLease and the reader's PollInvalidations travel
         // over distinct TCP connections — mirrors two daemons.
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_r = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer = cid(0xa1, "writer");
         let reader = cid(0xb2, "reader");
 
@@ -117,7 +117,7 @@ fn long_poll_times_out_when_idle() {
         // Bound the test runtime — the manager's LONG_POLL_WAIT is
         // 10 s; we use a higher SDK timeout so the manager's timer
         // is what fires.
-        let cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         cluster.set_rpc_timeout(Duration::from_secs(30));
         let id = cid(0xc3, "idle");
         // Subscribe so the inbox exists, then poll. The poll has no
@@ -146,7 +146,7 @@ fn long_poll_returns_all_queued_events() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let reader = cid(0xd4, "reader-multi");
         let w1 = cid(0xe5, "writer-1");
         let w2 = cid(0xe6, "writer-2");

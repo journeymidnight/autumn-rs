@@ -47,7 +47,10 @@ except Exception:  # standalone/tooling import must still work
 # ─── mem/ schema memory ops (merged from the former autumn_mem.py) ────────────
 # hermes is the only consumer, so the (thin) core lives in this one plugin file.
 # The `mem/` key schema is the stable contract — byte-identical to the Rust
-# `autumn-memory` lib (crates/autumn-memory/src/keys.rs, docs/autumn_memory_plan.md §6):
+# `autumn-memory` lib (crates/autumn-memory/src/keys.rs, docs/autumn_memory_plan.md §6).
+# The layouts below are the WIRE keys; F-KEY-NS D7 (Prepend-only) means the client
+# is bound to `mem`/`tenant` and PREPENDS `mem/{tenant}/`, so the builders here emit
+# only the RELATIVE part `{agent}/…` (keys.rs does the same on the Rust side):
 #   episodic:  mem/{tenant}/{agent}/ep/{session}/{suffix}  suffix = BE(u64_max-ts_ns)++BE(u32_max-ctr)
 #   fact:      mem/{tenant}/{agent}/fact/{namespace}/{key}
 # Every dynamic component is percent-encoded (RFC-3986 unreserved kept).
@@ -121,14 +124,18 @@ class AutumnMemory:
 
     def __init__(self, client: Any, tenant: str, agent: str) -> None:
         self._c = client
-        self._t = q(tenant)
+        # F-KEY-NS D7 (Prepend-only): `tenant` is owned by the client's
+        # NamespaceBinding — it connected `mem`/`tenant` and PREPENDS `mem/{tenant}/`
+        # itself. So the key builders below emit keys RELATIVE to that scope;
+        # NEVER re-add `mem/{tenant}/` here or every op double-prefixes (and
+        # diverges from the Rust `MemoryStore`, whose keys.rs is likewise relative).
         self._a = q(agent)
         # per-process monotonic counter so two events in the same ns still order
         self._ctr = itertools.count()
 
-    # ---- key builders -----------------------------------------------------
+    # ---- key builders (RELATIVE to the client's mem/{tenant}/ binding) ----
     def _agent_prefix(self) -> bytes:
-        return b"mem/" + self._t + b"/" + self._a + b"/"
+        return self._a + b"/"
 
     def _ep_agent_prefix(self) -> bytes:
         return self._agent_prefix() + b"ep/"
@@ -230,13 +237,21 @@ class AutumnMemoryProvider(_Base):
         # non-primary contexts (cron / subagent / flush) must not write.
         self._read_only = str(_ctx_get(context, "context_kind", default="primary")) != "primary"
         cred_file = os.environ.get("AUTUMN_MEMORY_CREDENTIAL_FILE")
+        # F-KEY-NS D7 (SD-2): the client binds the `mem` namespace for this
+        # tenant (Assert); the authz principal == the tenant (1:1) when a
+        # credential is configured.
         if cred_file:
             credential = _read_credential_file(cred_file)
             client = self._bridge.run(
-                autumn.Client.connect(manager, tenant=tenant, credential=credential)
+                autumn.Client.connect(
+                    manager, namespace="mem", tenant=tenant,
+                    principal=tenant, credential=credential,
+                )
             )
         else:
-            client = self._bridge.run(autumn.Client.connect(manager))
+            client = self._bridge.run(
+                autumn.Client.connect(manager, namespace="mem", tenant=tenant)
+            )
         self._mem = AutumnMemory(client, tenant, str(agent))
 
     def shutdown(self) -> None:

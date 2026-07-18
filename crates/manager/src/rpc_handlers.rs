@@ -258,6 +258,7 @@ impl AutumnManager {
             // ── F-KEY-NS D2: namespace registry ─────────────────────────
             MSG_NAMESPACE_CREATE => self.handle_namespace_create(payload).await,
             MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
+            MSG_NAMESPACE_LIST => self.handle_namespace_list().await,
             // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
@@ -733,6 +734,29 @@ impl AutumnManager {
         }
         self.namespaces.borrow_mut().remove(&req.name);
         Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// `MSG_NAMESPACE_LIST` (F-KEY-NS D2) — list the full registry (rich rows).
+    /// Leader-gated (the registry is leader-maintained; a follower's shadow is
+    /// empty/stale — same reason `GET_AUTHZ_CONFIG` is leader-gated). Read-only,
+    /// not admin-token gated.
+    async fn handle_namespace_list(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&NamespaceListResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                namespaces: Vec::new(),
+            }));
+        }
+        let mut namespaces: Vec<MgrNamespace> =
+            self.namespaces.borrow().values().cloned().collect();
+        // Stable order (by name) for deterministic CLI output.
+        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rkyv_encode(&NamespaceListResp {
+            code: CODE_OK,
+            message: String::new(),
+            namespaces,
+        }))
     }
 
     /// R1: read the persisted cluster_version. Servable from any replica,
@@ -6844,6 +6868,48 @@ mod namespace_registry_tests {
     fn authz_config(m: &AutumnManager) -> GetAuthzConfigResp {
         let resp = run(async { m.handle_get_authz_config().await.unwrap() });
         rkyv_decode::<GetAuthzConfigResp>(&resp).expect("decode GetAuthzConfigResp")
+    }
+
+    fn list(m: &AutumnManager) -> NamespaceListResp {
+        let resp = run(async { m.handle_namespace_list().await.unwrap() });
+        rkyv_decode::<NamespaceListResp>(&resp).expect("decode NamespaceListResp")
+    }
+
+    #[test]
+    fn namespace_list_returns_rich_registry_sorted() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        assert_eq!(
+            create(&m, ADMIN, "bench", Some("acme"), vec![vec![0x01u8, 0x02]]).code,
+            CODE_OK
+        );
+        let r = list(&m);
+        assert_eq!(r.code, CODE_OK);
+        let names: Vec<&str> = r.namespaces.iter().map(|n| n.name.as_str()).collect();
+        for want in ["fs", "kvc", "mem", "bench"] {
+            assert!(names.contains(&want), "missing {want}");
+        }
+        // Sorted by name (deterministic CLI output).
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        // Rich fields carried through.
+        let bench = r.namespaces.iter().find(|n| n.name == "bench").unwrap();
+        assert_eq!(bench.prefix, b"bench/".to_vec());
+        assert_eq!(bench.owner_tenant.as_deref(), Some("acme"));
+        assert_eq!(bench.presplit, vec![vec![0x01u8, 0x02]]);
+        let fs = r.namespaces.iter().find(|n| n.name == "fs").unwrap();
+        assert!(fs.owner_tenant.is_none(), "builtin fs is existence-only");
+    }
+
+    #[test]
+    fn namespace_list_is_leader_gated() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        m.set_leader(false);
+        let r = list(&m);
+        assert_eq!(r.code, CODE_NOT_LEADER);
+        assert!(r.namespaces.is_empty());
     }
 
     #[test]

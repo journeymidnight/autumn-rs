@@ -75,8 +75,8 @@ fn writer_close_bumps_reader_invalidation_floor() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_r = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer = cid(0xa1, "writer");
         let reader = cid(0xb2, "reader");
 
@@ -133,8 +133,8 @@ fn overflow_sentinel_triggers_wholesale_clear() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_r = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let reader = cid(0xc1, "overflow-reader");
         let writer = cid(0xd2, "overflow-writer");
 
@@ -188,8 +188,8 @@ fn out_of_order_events_dont_roll_back_floor() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_r = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer = cid(0xe1, "writer");
         let reader = cid(0xf2, "reader");
 

@@ -209,7 +209,7 @@ fn ps_kill_migrates_partitions() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (mgr, mut pses, parts) = boot(mgr_addr, 210).await;
 
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
             .await
             .expect("ClusterClient::connect");
         cluster.set_rpc_timeout(Duration::from_secs(10));
@@ -304,7 +304,7 @@ fn ps_kill_during_write_storm() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (mgr, mut pses, parts) = boot(mgr_addr, 220).await;
 
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
             .await
             .expect("ClusterClient::connect");
         cluster.set_rpc_timeout(Duration::from_secs(5));

@@ -65,8 +65,8 @@ fn two_daemons_write_lease_conflict() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr_a = format!("{}", mgr_addr);
         let mgr_b = mgr_a.clone();
-        let cluster_a = ClusterClient::connect(&mgr_a).await.expect("client A");
-        let cluster_b = ClusterClient::connect(&mgr_b).await.expect("client B");
+        let cluster_a = ClusterClient::connect_raw(&mgr_a).await.expect("client A");
+        let cluster_b = ClusterClient::connect_raw(&mgr_b).await.expect("client B");
         let id_a = cid(0xa1, "daemon-a");
         let id_b = cid(0xb2, "daemon-b");
 
@@ -102,8 +102,8 @@ fn two_daemons_read_lease_coexist() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let id_a = cid(0x11, "reader-a");
         let id_b = cid(0x22, "reader-b");
 
@@ -124,8 +124,8 @@ fn writer_release_unblocks_second_daemon_and_bumps_version() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let id_a = cid(0x33, "writer-a");
         let id_b = cid(0x44, "writer-b");
 
@@ -162,7 +162,7 @@ fn heartbeat_round_trip_and_post_release_not_held() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let id = cid(0x55, "writer-c");
         let _ = lease::acquire(&cluster, &id, 200, LEASE_MODE_WRITE)
             .await

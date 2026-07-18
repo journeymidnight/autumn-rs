@@ -268,8 +268,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //     frozen only, handle_alloc_inodes ignores it — SD-3 wires it).
     //   • CODE_NAMESPACE_UNKNOWN (10) error code (D7 Layer-A reject; PS returns
     //     it in SD-2).
+    //   • SD-2 addendum (sanctioned in-place v25 refinement): MSG_NAMESPACE_LIST
+    //     (0x59) + NamespaceListResp{code,message,namespaces:Vec<MgrNamespace>}
+    //     (rich registry list; the 5s GET_AUTHZ_CONFIG poll stays lean). This
+    //     changed the v25 fp below — NOT a version bump (still MIN=MAX=25).
     // Pre-R3: MIN=MAX=25 (same-commit deploy; rkyv has no cross-version decode).
-    (25, "76e8ba557f7fca2d"),
+    (25, "6bb3e2105b2845db"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

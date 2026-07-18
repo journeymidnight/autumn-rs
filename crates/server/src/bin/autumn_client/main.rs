@@ -38,6 +38,38 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
     String::from_utf8(key).expect("ASCII bench key")
 }
 
+/// F-KEY-NS D7: the benchmarks bind the `bench` namespace with tenant `perf`
+/// (Prepend `bench/perf/`), so their keys are USER keys.
+const BENCH_NS: &str = "bench";
+const BENCH_TENANT: &str = "perf";
+
+/// F-KEY-NS D7: derive the USER-space partition start keys covering the bench
+/// namespace. `all_partitions_with_range` returns WIRE ranges; the client
+/// prepends `bench/perf/`, so a bench key built off a partition's wire start
+/// would route into the WRONG namespace. Instead, take each partition whose wire
+/// start lies under `bench/perf/`, strip that prefix, and feed the remainder to
+/// `key_for_partition` — the binding re-prepends `bench/perf/`, landing the key
+/// back in that partition. Requires the `bench` namespace to be presplit for
+/// multi-partition spread; a non-presplit bench yields a single empty start (one
+/// partition), so the perf run measures one partition (documented in ops.md).
+fn bench_user_starts(partitions: &[(u64, String, Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let prefix = format!("{BENCH_NS}/{BENCH_TENANT}/").into_bytes();
+    let mut starts: Vec<Vec<u8>> = Vec::new();
+    for (_pid, _addr, start, _end) in partitions {
+        if let Some(rest) = start.strip_prefix(prefix.as_slice()) {
+            starts.push(rest.to_vec());
+        }
+    }
+    // Always cover the namespace's lower bound (the first bench partition may
+    // start at/below `bench/perf/`, whose stripped start is empty).
+    if !starts.iter().any(|s| s.is_empty()) {
+        starts.push(Vec::new());
+    }
+    starts.sort();
+    starts.dedup();
+    starts
+}
+
 // ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
@@ -249,8 +281,11 @@ async fn cmd_ycsb(
     );
 
     // Each thread owns one partition's key range and its own [0,records) keyspace.
+    // F-KEY-NS D7: user-space starts within the bench namespace (see
+    // `bench_user_starts`); the client re-prepends `bench/perf/`.
+    let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
-        .map(|tid| partitions[tid % partitions.len()].2.clone())
+        .map(|tid| bench_starts[tid % bench_starts.len()].clone())
         .collect();
     let mgr = Arc::new(manager.to_string());
 
@@ -264,7 +299,7 @@ async fn cmd_ycsb(
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         load_handles.push(std::thread::spawn(move || {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr).await {
+                let client = match ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb load thread {tid} connect error: {e}");
@@ -315,7 +350,7 @@ async fn cmd_ycsb(
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         run_handles.push(std::thread::spawn(move || -> (Vec<f64>, Vec<f64>) {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr).await {
+                let client = match ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb run thread {tid} connect error: {e}");
@@ -459,8 +494,11 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // keeps `depth` in-flight (sliding window) until the deadline. Each
     // future is one `kv_put` (put_zc for ZC, else put) — kv_put is the unit
     // the fan-out composes. The SDK routes per key; no per-partition striping.
+    // F-KEY-NS D7: user-space starts within the bench namespace (see
+    // `bench_user_starts`); the client re-prepends `bench/perf/`.
+    let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
-        .map(|tid| partitions[tid % partitions.len()].2.clone())
+        .map(|tid| bench_starts[tid % bench_starts.len()].clone())
         .collect();
     let mgr = Arc::new(manager.to_string());
 
@@ -490,7 +528,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr).await {
+                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("write thread {tid} connect error: {e}");
@@ -676,7 +714,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr).await {
+                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("read thread {tid} connect error: {e}");
@@ -964,7 +1002,31 @@ async fn main() -> Result<()> {
     }
 
     let _ = autumn_transport::init_with(args.transport);
-    let client = ClusterClient::connect(&args.manager).await?;
+    // F-KEY-NS D7: the top-level client's binding depends on the command.
+    //  - perf-check / ycsb use it ONLY for partition listing (a routing op,
+    //    binding-independent) and connect their own bench-scoped clients per
+    //    thread → Raw here.
+    //  - data-plane KV commands (put/get/del/head/ls/streams) MUST declare their
+    //    namespace scope → connect(mgr, ns, tenant); absent = migration error.
+    let client = match &args.command {
+        Command::PerfCheck { .. } | Command::Ycsb { .. } | Command::OpStub { .. } => {
+            ClusterClient::connect_raw(&args.manager).await?
+        }
+        _ => {
+            let (ns, tenant) = match (&args.namespace, &args.tenant) {
+                (Some(ns), Some(t)) => (ns.as_str(), t.as_str()),
+                _ => {
+                    eprintln!(
+                        "autumn-client: --namespace <NS> and --tenant <T> are REQUIRED for KV \
+                         commands (F-KEY-NS D7 — every write must declare its namespace). \
+                         List namespaces with `autumn-op namespace-list`."
+                    );
+                    std::process::exit(2);
+                }
+            };
+            ClusterClient::connect(&args.manager, ns, tenant).await?
+        }
+    };
 
     match args.command {
         Command::OpStub { .. } => unreachable!("handled before connect"),

@@ -4873,18 +4873,40 @@ fn authz_gate(
             Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
         );
     }
-    // Fast path: no enforcement configured (single relaxed atomic load).
-    if !authz.is_enabled() {
+    // Fast path: NEITHER layer configured (single relaxed atomic load each).
+    // The atomics are a lock-free SKIP HINT only — the actual per-request
+    // decision below comes from the CONSISTENT snapshot (coco P2), so a
+    // config-refresh window can't pair "flag from one atomic" with "config from a
+    // different-time snapshot". A transiently-stale hint can only cause a one-
+    // request fail-open on the turn-ON edge (the accepted pre-existing F-AUTHZ-1
+    // behavior), never a false reject.
+    if !authz.gate_active() {
         return None;
     }
     let snap = authz.snapshot();
-    let now = authz_now_secs();
-    if let Some((code, msg)) =
-        crate::authz::authz_check(msg_type, payload, principal.as_ref(), &snap, now)
-    {
-        return Some(
-            Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg)).encode(),
-        );
+    // F-KEY-NS D7 Layer-A: a put-class write must target a REGISTERED namespace.
+    // Token-free, runs whenever the registry is non-empty (independent of the
+    // signing key) — an anonymous connection is checked too. Derived from the
+    // snapshot's own namespace list so the check is self-consistent.
+    if !snap.namespaces.is_empty() {
+        if let Some((code, msg)) = crate::authz::check_layer_a(msg_type, payload, &snap) {
+            return Some(
+                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg))
+                    .encode(),
+            );
+        }
+    }
+    // Layer-B: protected-prefix / capability-token enforcement (snapshot-derived).
+    if snap.enabled {
+        let now = authz_now_secs();
+        if let Some((code, msg)) =
+            crate::authz::authz_check(msg_type, payload, principal.as_ref(), &snap, now)
+        {
+            return Some(
+                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg))
+                    .encode(),
+            );
+        }
     }
     None
 }
@@ -5190,7 +5212,7 @@ async fn handle_ps_connection(
                     // prefix uniformly (the ZC path bypasses that dispatch). The
                     // perf cost (a value copy on large authz-gated writes) is
                     // acceptable — large writes are rare on the `mem/` workload.
-                    if !authz.is_enabled() {
+                    if !authz.gate_active() {
                         drain_zc_writes(
                             &mut decoder,
                             &mut reader,
@@ -5336,9 +5358,10 @@ async fn handle_ps_connection(
                         decoder.feed(&buf[..n]);
                         // F216-E W1 / F219: recv large MSG_PUT_ZC values into
                         // pooled buffers first (UCX registered / TCP owned read).
-                        // F-AUTHZ-1: skip when authz is ON (see the idle-branch
-                        // note) so large PUT_ZC is enforced on the normal path.
-                        if !authz.is_enabled() {
+                        // F-AUTHZ-1 / F-KEY-NS D7: skip when EITHER layer is on
+                        // (see the idle-branch note) so a large PUT_ZC is enforced
+                        // (Layer-A + Layer-B) on the normal FrameDecoder path.
+                        if !authz.gate_active() {
                             drain_zc_writes(
                                 &mut decoder,
                                 &mut reader,

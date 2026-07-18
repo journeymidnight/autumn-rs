@@ -2026,6 +2026,10 @@ pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 // namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md §7.1.
 pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
 pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
+// admin → manager (leader-gated): list the full registry (rich rows). The 5 s
+// `MSG_GET_AUTHZ_CONFIG` poll stays LEAN (prefixes only, for Layer-A); the rich
+// data (owner/presplit/created_at) rides this dedicated low-frequency RPC.
+pub const MSG_NAMESPACE_LIST: u8 = 0x59;
 
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
@@ -2228,6 +2232,17 @@ pub struct NamespaceCreateResp {
 pub struct NamespaceDeleteReq {
     pub admin_token: String,
     pub name: String,
+}
+
+/// `MSG_NAMESPACE_LIST` — admin lists the full registry (rich rows: name,
+/// prefix, owner_tenant, presplit, created_at). Leader-only (the registry is
+/// leader-maintained; a follower's shadow is empty/stale). Request payload is
+/// empty. Not admin-token gated — listing is read-only inspection.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceListResp {
+    pub code: u8,
+    pub message: String,
+    pub namespaces: Vec<MgrNamespace>,
 }
 
 /// `MSG_MINT_TOKEN` — client authenticates with its permanent credential and

@@ -60,6 +60,12 @@ pub enum AutumnError {
     /// grants the key. Distinct from `NotFound` so a denied key isn't mistaken
     /// for an absent one.
     PermissionDenied(String),
+    /// F-KEY-NS D7 Layer-A: the PS refused a put-class write because its key
+    /// falls in NO registered namespace. TERMINAL: retrying / refreshing routing
+    /// won't create the namespace — the operator must `namespace-create` it (or
+    /// the caller must write under a registered namespace). Distinct from
+    /// `NotFound` (a read-miss) and `InvalidArgument`.
+    NamespaceUnknown(String),
 }
 
 impl std::fmt::Display for AutumnError {
@@ -67,6 +73,7 @@ impl std::fmt::Display for AutumnError {
         match self {
             AutumnError::NotFound => write!(f, "key not found"),
             AutumnError::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
+            AutumnError::NamespaceUnknown(msg) => write!(f, "namespace unknown: {msg}"),
             AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
@@ -88,6 +95,172 @@ impl std::fmt::Display for AutumnError {
 }
 
 impl std::error::Error for AutumnError {}
+
+// ── F-KEY-NS D7: namespace binding ───────────────────────────────────────────
+
+/// F-KEY-NS D7: the (namespace, tenant) scope a `ClusterClient` operates within.
+/// A scoped op ALWAYS PREPENDS `{ns}/{tenant}/` to the user key before routing, so
+/// a scoped client **cannot** touch anything outside its own keyspace — scope is
+/// locked by construction, not merely checked. The built-in key builders
+/// (fuse / memory / kvcache) therefore emit keys RELATIVE to `{ns}/{tenant}/`
+/// (the binding owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO
+/// client-side prefixing — for admin / cross-namespace tooling — but the PS still
+/// enforces Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never the
+/// server's authorization.
+#[derive(Clone, Debug)]
+pub enum NamespaceBinding {
+    Scoped {
+        namespace: String,
+        tenant: String,
+        /// `{namespace}/{tenant}/` as bytes — precomputed once.
+        prefix: Vec<u8>,
+    },
+    /// Admin / unscoped: no client-side prefixing.
+    Raw,
+}
+
+impl NamespaceBinding {
+    /// Build a scoped binding — always Prepend (`{ns}/{tenant}/ ++ key`).
+    pub fn scoped(namespace: impl Into<String>, tenant: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        let tenant = tenant.into();
+        let prefix = format!("{namespace}/{tenant}/").into_bytes();
+        NamespaceBinding::Scoped {
+            namespace,
+            tenant,
+            prefix,
+        }
+    }
+
+    /// `{ns}/{tenant}/` for a scoped binding; `None` for `Raw`.
+    pub fn prefix(&self) -> Option<&[u8]> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
+            NamespaceBinding::Raw => None,
+        }
+    }
+
+    /// Map a user key to the wire key. Scoped → `{ns}/{tenant}/ ++ key` (ALWAYS
+    /// prepend — scope is locked by construction); Raw → pass through unchanged.
+    /// Infallible (a scoped key can't escape its scope); returns `Result` only so
+    /// call sites keep the `?` shape.
+    pub fn bind_key(&self, key: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
+        Ok(match self {
+            NamespaceBinding::Raw => key.to_vec(),
+            NamespaceBinding::Scoped { prefix, .. } => [prefix.as_slice(), key].concat(),
+        })
+    }
+
+    /// Map a user range prefix to the wire prefix. Same mapping as `bind_key`; an
+    /// EMPTY user prefix scans the whole `{ns}/{tenant}/`.
+    pub fn bind_prefix(&self, user_prefix: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
+        self.bind_key(user_prefix)
+    }
+
+    /// Strip the binding prefix off a wire key returned by a scan, so a scoped
+    /// caller sees its original (relative) key. `Raw` returns the key unchanged.
+    pub fn strip(&self, wire_key: Vec<u8>) -> Vec<u8> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } if wire_key.starts_with(prefix) => {
+                wire_key[prefix.len()..].to_vec()
+            }
+            _ => wire_key,
+        }
+    }
+
+    /// Upper cap for a scoped range scan: `{ns}/{tenant}0` (`0`=0x30 is the
+    /// successor of `/`=0x2f), so a limit-driven scan can never walk past the
+    /// tenant into the next namespace. `None` for `Raw`.
+    pub fn upper_cap(&self) -> Option<Vec<u8>> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } => {
+                // prefix ends with '/'; replace it with its successor '0'.
+                let mut cap = prefix.clone();
+                let last = cap.len() - 1;
+                cap[last] = b'/' + 1; // 0x30 == b'0'
+                Some(cap)
+            }
+            NamespaceBinding::Raw => None,
+        }
+    }
+}
+
+/// F-KEY-NS D7: validate a namespace/tenant scope segment used at connect.
+/// Prepend-only embeds these verbatim into `{ns}/{tenant}/` (the old `q()`
+/// percent-encoding of the tenant is gone), so an EMPTY segment or one containing
+/// `/` would forge a nested/aliased scope (`mem` + `acme/sub` → `mem/acme/sub/`,
+/// or `mem//`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
+/// namespace names, at connect (fail fast) — restores the dropped invariant for
+/// every frontend at once.
+pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// F-KEY-NS D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
+/// binding, SHARING all of its connection pools (no reconnect, no Rc refactor).
+/// Returned by `ClusterClient::raw()` (Raw binding — admin/migration, no client
+/// clamp) and `ClusterClient::rescope(ns, tenant)` (a different scope). Exposes
+/// the core KV ops; exotic ZC/batch/stream ops use a dedicated scoped
+/// `ClusterClient`. **The PS still enforces Layer-A/B** on every op — a view only
+/// changes the CLIENT-side key transform, never server authorization.
+pub struct NamespaceScope<'a> {
+    client: &'a ClusterClient,
+    binding: NamespaceBinding,
+}
+
+impl NamespaceScope<'_> {
+    /// The binding this scope operates under.
+    pub fn binding(&self) -> &NamespaceBinding {
+        &self.binding
+    }
+
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.put_bound(&bound, value).await
+    }
+
+    pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.get_bound(&bound).await
+    }
+
+    pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.delete_bound(&bound).await
+    }
+
+    pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.head_bound(&bound).await
+    }
+
+    /// Range scan clamped to this scope's `{ns}/{tenant}/` (Raw = unbounded).
+    /// Same bind/clamp/strip as `ClusterClient::range`, under the view's binding.
+    pub async fn range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let cap = self.binding.upper_cap();
+        let mut result = self
+            .client
+            .range_bound(&wire_prefix, &wire_start, limit, cap.as_deref())
+            .await?;
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+}
 
 /// BUG-LEASE-2 Phase 2: write-fencing identity stamped on lease-covered
 /// puts. `ANON` (all-zero) = anonymous write, PS skips fencing.
@@ -149,6 +322,10 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
             // grant access), so it propagates to the caller instead of burning
             // the routing-refresh budget.
             StatusCode::PermissionDenied => AutumnError::PermissionDenied(message),
+            // F-KEY-NS D7 Layer-A: TERMINAL like PermissionDenied — refreshing
+            // routing can't create the namespace, so it propagates instead of
+            // burning the routing-refresh budget.
+            StatusCode::NamespaceUnknown => AutumnError::NamespaceUnknown(message),
             // Unavailable is transient (overloaded / draining) → keep retryable.
             StatusCode::Unavailable => AutumnError::ConnectionError(message),
             // Ok-as-error / Internal / AlreadyExists: surface as ServerError
@@ -455,6 +632,11 @@ pub struct ClusterClient {
     /// identity changed mid-connect — so a principal switch can't leave a
     /// wrong-identity-bound connection in the pool (coco P2).
     auth_gen: Cell<u64>,
+    /// F-KEY-NS D7: the namespace scope this client operates within. Set at
+    /// `connect(mgr, ns, tenant)` (Scoped) or `connect_raw(mgr)` (Raw). Every
+    /// scoped op binds its key through this before routing. `raw()` / `rescope`
+    /// return borrow-views with a different binding sharing these pools.
+    binding: NamespaceBinding,
 }
 
 /// Default per-call timeout for cluster RPCs. Generous enough to cover
@@ -817,6 +999,29 @@ impl ClusterClient {
         Ok(())
     }
 
+    /// F-KEY-NS D2: list the full namespace registry (rich rows). Leader-routed
+    /// (rotates on NOT_LEADER). Read-only.
+    pub async fn namespace_list(&self) -> Result<Vec<MgrNamespace>> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: NamespaceListResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_LIST,
+                Bytes::new(),
+                "namespace-list",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: NamespaceListResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-list rejected: {}", resp.message));
+        }
+        Ok(resp.namespaces)
+    }
+
     /// Call manager with retry and round-robin on NotLeader/connection error.
     pub async fn mgr_call_retry(
         &self,
@@ -848,8 +1053,37 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("manager not connected"))
     }
 
-    /// Connect to the cluster. Accepts comma-separated manager addresses.
-    pub async fn connect(manager: &str) -> Result<Self> {
+    /// F-KEY-NS D7: connect a SCOPED client bound to `(namespace, tenant)`. Every
+    /// data op is confined to `{namespace}/{tenant}/` — **Prepend-only**: the
+    /// client ALWAYS prepends `{namespace}/{tenant}/` to the user key (scope
+    /// locked by construction; the built-in key builders emit RELATIVE keys). This
+    /// is the entry point EVERY data-plane writer must use (CLI, PyO3 data
+    /// clients, kvcache, bench). Admin / mgr-only / unscoped callers use
+    /// `connect_raw`.
+    pub async fn connect(manager: &str, namespace: &str, tenant: &str) -> Result<Self> {
+        for (kind, seg) in [("namespace", namespace), ("tenant", tenant)] {
+            if !is_valid_scope_segment(seg) {
+                return Err(anyhow!(
+                    "invalid {kind} {seg:?}: must be non-empty and match [a-z0-9._-]+ (no '/')"
+                ));
+            }
+        }
+        Self::connect_with_binding(manager, NamespaceBinding::scoped(namespace, tenant)).await
+    }
+
+    /// F-KEY-NS D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO
+    /// client-side namespace clamp. For admin / manager-only tooling
+    /// (`autumn-op`, node registration), cross-namespace inspection/migration,
+    /// tests exercising other features, and fuse-before-SD3 (whose keys are still
+    /// raw bytes). **NOT for data-plane writers** — those must declare their
+    /// namespace via `connect`. The PS still enforces Layer-A/B, so this only
+    /// bypasses the CLIENT prefixing, never server authorization.
+    pub async fn connect_raw(manager: &str) -> Result<Self> {
+        Self::connect_with_binding(manager, NamespaceBinding::Raw).await
+    }
+
+    /// Shared constructor for `connect` / `connect_raw` / `connect_with_credential`.
+    async fn connect_with_binding(manager: &str, binding: NamespaceBinding) -> Result<Self> {
         let manager_addrs: Vec<String> = manager.split(',').map(|s| s.trim().to_string()).collect();
 
         let client = Self {
@@ -865,6 +1099,7 @@ impl ClusterClient {
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
             auth: RefCell::new(None),
             auth_gen: Cell::new(0),
+            binding,
         };
 
         // Try connecting to each manager until one responds
@@ -1095,15 +1330,86 @@ impl ClusterClient {
         self.ps_conns.borrow_mut().clear();
     }
 
-    /// F-AUTHZ-1: convenience — connect + set the tenant credential in one call.
+    /// F-AUTHZ-1 / F-KEY-NS D7: connect a SCOPED client + set its authz
+    /// credential in one call. `principal` is the authz identity (the credential
+    /// owner —细化三 renamed the old "tenant" kwarg to principal); `namespace` /
+    /// `tenant` are the KEY scope. When authz is enabled, this validates at bind
+    /// time that `{namespace}/{tenant}/` is covered by one of the credential's
+    /// granted `allowed_prefixes` (fail-fast — a mis-scoped credential fails at
+    /// connect, not on the first write). When authz is off (no signing key), the
+    /// mint fails harmlessly and the check is skipped.
     pub async fn connect_with_credential(
         manager: &str,
-        tenant: impl Into<String>,
+        namespace: &str,
+        tenant: &str,
+        principal: impl Into<String>,
         credential: Vec<u8>,
     ) -> Result<Self> {
-        let c = Self::connect(manager).await?;
-        c.set_tenant_credential(tenant, credential);
+        let c = Self::connect(manager, namespace, tenant).await?;
+        c.set_tenant_credential(principal, credential);
+        c.validate_credential_scope().await?;
         Ok(c)
+    }
+
+    /// F-KEY-NS D7: when authz is on, verify the client's `{ns}/{tenant}/` scope
+    /// is within one of the credential's granted prefixes, and FAIL FAST at
+    /// connect if not (coco P2 — no more silent defer-to-first-write). Skipped
+    /// only when authz is DISABLED on the manager (no signing key) — there is
+    /// then nothing to validate against. `pub` so the PyO3 connect paths run the
+    /// SAME check as `connect_with_credential`.
+    pub async fn validate_credential_scope(&self) -> Result<()> {
+        let scope_prefix = match self.binding.prefix() {
+            Some(p) => p.to_vec(),
+            None => return Ok(()), // Raw binding: nothing to validate.
+        };
+        // Mint (or reuse) a token to read the credential's granted prefixes.
+        let token = match self.ensure_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                // Only "authz is not enabled on this manager" is a legitimate
+                // skip (there is nothing to validate against). A REJECTED /
+                // invalid credential, a mint failure, or a transport error is a
+                // real config error — fail fast at CONNECT rather than silently
+                // deferring to the first write (coco P2). The manager's
+                // disabled-marker (`handle_mint_token`) is stable; the wire is
+                // frozen (v25) so we classify on it instead of adding a code.
+                let msg = e.to_string();
+                if msg.contains("authz not enabled") || msg.contains("no signing key") {
+                    return Ok(());
+                }
+                return Err(e.context(
+                    "mint token to validate the credential's namespace scope at connect",
+                ));
+            }
+        };
+        // The wire token is `canonical_bytes(claims) ‖ sig[64]`; decode the
+        // leading claims bytes (our own manager-minted token — no signature check
+        // needed just to read the granted prefixes). A malformed token from a
+        // SUCCESSFUL mint is a real bug → fail loud (was silently skipped).
+        let cb = token
+            .len()
+            .checked_sub(autumn_rpc::cap_token::SIG_LEN)
+            .filter(|n| *n > 0)
+            .map(|n| &token[..n])
+            .ok_or_else(|| anyhow!("minted token too short to hold claims + signature"))?;
+        let claims: autumn_rpc::cap_token::CapClaims =
+            rkyv_decode(cb).map_err(|e| anyhow!("decode minted token claims: {e}"))?;
+        let covered = claims
+            .allowed_prefixes
+            .iter()
+            .any(|ap| scope_prefix.starts_with(ap.as_slice()));
+        if !covered {
+            return Err(anyhow!(
+                "credential does not grant the namespace scope {:?}: allowed_prefixes={:?}",
+                String::from_utf8_lossy(&scope_prefix),
+                claims
+                    .allowed_prefixes
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        Ok(())
     }
 
     /// F-AUTHZ-1: return a currently-valid token, minting/renewing via
@@ -1480,6 +1786,12 @@ impl ClusterClient {
                         Ok(AutumnError::PermissionDenied(msg)) => {
                             return Err(AutumnError::PermissionDenied(msg));
                         }
+                        // F-KEY-NS D7 Layer-A: unregistered-namespace write is
+                        // TERMINAL — refreshing routing can't create the namespace
+                        // (same class as PermissionDenied above).
+                        Ok(AutumnError::NamespaceUnknown(msg)) => {
+                            return Err(AutumnError::NamespaceUnknown(msg));
+                        }
                         Ok(ae) => last_err = Some(ae.to_string()),
                         Err(other) => last_err = Some(other.to_string()),
                     }
@@ -1585,6 +1897,14 @@ impl ClusterClient {
     /// append goes through the extent-node fsync coalescer (RocksDB-style
     /// group commit). Callers no longer have a "fast but unsafe" mode.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.put_bound(&bound, value).await
+    }
+
+    /// Internal: `put` over an ALREADY-bound wire key (no namespace binding).
+    /// The public `put` binds then calls this; `raw()`/`rescope` views call it
+    /// with their own key transform. F-KEY-NS D7.
+    async fn put_bound(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
         self.put_opts(key, value, 0, WriteLease::ANON).await
     }
 
@@ -1599,7 +1919,8 @@ impl ClusterClient {
         value: &[u8],
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
-        self.put_opts(key, value, 0, lease).await
+        let bound = self.binding.bind_key(key)?;
+        self.put_opts(&bound, value, 0, lease).await
     }
 
     /// Helper: convert a relative TTL (seconds from now) to an
@@ -1682,7 +2003,8 @@ impl ClusterClient {
     /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
     /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
     pub async fn put_zc(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
-        self.put_zc_opts(key, value, 0, WriteLease::ANON).await
+        let bound = self.binding.bind_key(key)?;
+        self.put_zc_opts(&bound, value, 0, WriteLease::ANON).await
     }
 
     /// BUG-LEASE-2 Phase 2: lease-fenced zero-copy put (see `put_fenced`).
@@ -1692,7 +2014,8 @@ impl ClusterClient {
         value: Bytes,
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
-        self.put_zc_opts(key, value, 0, lease).await
+        let bound = self.binding.bind_key(key)?;
+        self.put_zc_opts(&bound, value, 0, lease).await
     }
 
     pub(crate) async fn put_zc_opts(
@@ -1772,7 +2095,14 @@ impl ClusterClient {
 
     /// Get a value by key. Returns None if not found.
     pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
-        self.get_range(key, 0, 0).await
+        let bound = self.binding.bind_key(key)?;
+        self.get_bound(&bound).await
+    }
+
+    /// Internal: `get` over an ALREADY-bound wire key (no namespace binding).
+    /// F-KEY-NS D7 — see `put_bound`.
+    async fn get_bound(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        self.get_range_core(key, 0, 0).await
     }
 
     /// Get a sub-range of a value: bytes `[offset, offset+length)`.
@@ -1783,6 +2113,18 @@ impl ClusterClient {
     /// on RPC error and routing is refreshed on the second attempt — same
     /// resilience as `get`/`put`/`head` after a cluster restart.
     pub async fn get_range(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.get_range_core(&bound, offset, length).await
+    }
+
+    /// Internal: `get_range` over an ALREADY-bound wire key (no namespace
+    /// binding). F-KEY-NS D7 — see `put_bound`.
+    async fn get_range_core(
         &self,
         key: &[u8],
         offset: u32,
@@ -1820,7 +2162,7 @@ impl ClusterClient {
         &self,
         key: &[u8],
     ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
-        let key_v = key.to_vec();
+        let key_v = self.binding.bind_key(key)?;
         let resp_bytes = self
             .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                 rkyv_encode(&GetReq {
@@ -1995,7 +2337,10 @@ impl ClusterClient {
                 Err(e) => Err(e),
             };
         }
-        let key_v = key.to_vec();
+        // F-KEY-NS D7: bind for the redirect routing/descriptor; the fallbacks
+        // above/below use the original user `key` (get_range/get_range_into bind
+        // it themselves), so a key is bound exactly ONCE per wire request.
+        let key_v = self.binding.bind_key(key)?;
         let resp_bytes = self
             .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                 rkyv_encode(&GetReq {
@@ -2066,6 +2411,12 @@ impl ClusterClient {
         // >= 64 KiB) items by owning partition so their descriptors resolve in
         // ONE round-trip per partition instead of one per item. Small items /
         // resolve-misses stay ungrouped → per-item proxy path in phase C.
+        // F-KEY-NS D7: bind each key ONCE for redirect routing + the batched
+        // descriptor payload (phases A/B). Phase C passes the ORIGINAL user key
+        // to the per-item helpers, which bind it themselves — so a key is bound
+        // exactly once per wire request (never double-prepended).
+        let bound_keys: Vec<Option<Vec<u8>>> =
+            items.iter().map(|it| self.binding.bind_key(it.key).ok()).collect();
         let mut groups: std::collections::HashMap<u64, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, it) in items.iter().enumerate() {
@@ -2073,7 +2424,11 @@ impl ClusterClient {
             if !zc_worthwhile(read_len) {
                 continue;
             }
-            if let Ok((pid, _addr)) = self.resolve_key(it.key).await {
+            let bk = match &bound_keys[i] {
+                Some(b) => b,
+                None => continue, // unreachable: bind is infallible under Prepend-only
+            };
+            if let Ok((pid, _addr)) = self.resolve_key(bk).await {
                 groups.entry(pid).or_default().push(i);
             }
         }
@@ -2088,7 +2443,11 @@ impl ClusterClient {
             let req_items: Vec<partition_rpc::GetRedirectItem> = idxs
                 .iter()
                 .map(|&i| partition_rpc::GetRedirectItem {
-                    key: items[i].key.to_vec(),
+                    // Grouped items always have a bound key (None-bind skipped in
+                    // phase A). `.expect` (not `unwrap_or_default`) so a future
+                    // fallible bind can't silently query the EMPTY key here —
+                    // matches `get_many`'s `.expect("grouped keys are bound")`.
+                    key: bound_keys[i].clone().expect("grouped keys are bound"),
                     offset: items[i].offset,
                     length: items[i].length,
                 })
@@ -2203,7 +2562,7 @@ impl ClusterClient {
         length: u32,
         dest: &mut [u8],
     ) -> std::result::Result<Option<usize>, AutumnError> {
-        let key = key.to_vec();
+        let key = self.binding.bind_key(key)?;
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
@@ -2412,21 +2771,42 @@ impl ClusterClient {
     ) -> Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> {
         let mut results: Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> =
             (0..keys.len()).map(|_| Ok(None)).collect();
-        let mut groups: std::collections::HashMap<u64, Vec<(usize, &[u8])>> =
-            std::collections::HashMap::new();
+        // F-KEY-NS D7: bind each key ONCE before routing — the WIRE key
+        // determines the partition. Bind is infallible under Prepend-only (a
+        // scoped key can't escape scope), so every slot binds; the `Option`
+        // shape is kept defensively.
+        let mut bound_keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(keys.len());
         for (i, &k) in keys.iter().enumerate() {
-            let part_id = match self.resolve_key(k).await {
+            match self.binding.bind_key(k) {
+                Ok(bk) => bound_keys.push(Some(bk)),
+                Err(e) => {
+                    results[i] = Err(e);
+                    bound_keys.push(None);
+                }
+            }
+        }
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, bk) in bound_keys.iter().enumerate() {
+            let bk = match bk {
+                Some(b) => b,
+                None => continue, // bind failed → already errored
+            };
+            let part_id = match self.resolve_key(bk).await {
                 Ok((pid, _addr)) => pid,
                 Err(e) => {
                     results[i] = Err(AutumnError::RoutingError(e.to_string()));
                     continue;
                 }
             };
-            groups.entry(part_id).or_default().push((i, k));
+            groups.entry(part_id).or_default().push(i);
         }
         for (part_id, group) in groups {
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let keys_payload: Vec<Vec<u8>> = group.iter().map(|(_, k)| k.to_vec()).collect();
+            let keys_payload: Vec<Vec<u8>> = group
+                .iter()
+                .map(|&i| bound_keys[i].clone().expect("grouped keys are bound"))
+                .collect();
             let payload = rkyv_encode(&partition_rpc::BatchGetReq {
                 part_id,
                 region_epoch,
@@ -2439,17 +2819,20 @@ impl ClusterClient {
                 Ok(b) => b,
                 Err(AutumnError::PreconditionFailed(_)) => {
                     // Same stale-epoch handling as batch_put — see comment
-                    // there. Fall back to per-key `get` (call_ps_for_key
-                    // refreshes natively + handles post-split re-routing).
+                    // there. Fall back to per-key `get_bound` (call_ps_for_key
+                    // refreshes natively + handles post-split re-routing). Keys
+                    // are ALREADY bound (grouped from `bound_keys`), so use
+                    // `get_bound` to avoid double-binding.
                     let _ = self.refresh_regions().await;
-                    for (idx, k) in group.iter() {
-                        results[*idx] = self.get(k).await;
+                    for &idx in group.iter() {
+                        let bk = bound_keys[idx].clone().expect("grouped keys are bound");
+                        results[idx] = self.get_bound(&bk).await;
                     }
                     continue;
                 }
                 Err(e) => {
                     let s = e.to_string();
-                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    fail_slots(&mut results, group.iter().copied(), || {
                         AutumnError::ConnectionError(s.clone())
                     });
                     continue;
@@ -2458,14 +2841,14 @@ impl ClusterClient {
             let resp: partition_rpc::BatchGetResp = match rkyv_decode(&resp_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    fail_slots(&mut results, group.iter().copied(), || {
                         AutumnError::ServerError(e.clone())
                     });
                     continue;
                 }
             };
             if resp.code != partition_rpc::CODE_OK {
-                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                fail_slots(&mut results, group.iter().copied(), || {
                     code_to_error(resp.code, resp.message.clone())
                 });
                 continue;
@@ -2476,13 +2859,13 @@ impl ClusterClient {
                     resp.items.len(),
                     group.len()
                 );
-                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                fail_slots(&mut results, group.iter().copied(), || {
                     AutumnError::ServerError(mismatch.clone())
                 });
                 continue;
             }
-            for ((idx, _), item) in group.iter().zip(resp.items.into_iter()) {
-                results[*idx] = match item.status {
+            for (&idx, item) in group.iter().zip(resp.items.into_iter()) {
+                results[idx] = match item.status {
                     0 => Ok(Some(item.value)),
                     1 => Ok(None),
                     s => Err(AutumnError::ServerError(format!(
@@ -2524,15 +2907,25 @@ impl ClusterClient {
         // (idx, key, value, expires_at) — keep all four pieces threaded so the
         // ZC fallback and per-partition packing can read them without
         // re-indexing into `items` (which is borrowed immutably).
-        let mut groups: std::collections::HashMap<u64, Vec<(usize, &[u8], bytes::Bytes, u64)>> =
+        // F-KEY-NS D7: each tuple's 2nd element is the BOUND wire key (owned) —
+        // routing + the batch payload + the ZC/put fallbacks all use it, so a key
+        // is bound exactly ONCE. Bind is infallible under Prepend-only.
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes, u64)>> =
             std::collections::HashMap::new();
-        let mut zc_only: Vec<(usize, &[u8], bytes::Bytes, u64)> = Vec::new();
+        let mut zc_only: Vec<(usize, Vec<u8>, bytes::Bytes, u64)> = Vec::new();
         for (i, (k, v, ttl)) in items.iter().enumerate() {
+            let bk = match self.binding.bind_key(k) {
+                Ok(b) => b,
+                Err(e) => {
+                    results[i] = Err(e);
+                    continue;
+                }
+            };
             if zc_worthwhile(v.len()) {
-                zc_only.push((i, *k, v.clone(), *ttl));
+                zc_only.push((i, bk, v.clone(), *ttl));
                 continue;
             }
-            let part_id = match self.resolve_key(k).await {
+            let part_id = match self.resolve_key(&bk).await {
                 Ok((pid, _addr)) => pid,
                 Err(e) => {
                     results[i] = Err(AutumnError::RoutingError(e.to_string()));
@@ -2542,7 +2935,7 @@ impl ClusterClient {
             groups
                 .entry(part_id)
                 .or_default()
-                .push((i, *k, v.clone(), *ttl));
+                .push((i, bk, v.clone(), *ttl));
         }
         for (part_id, group) in groups {
             let region_epoch = self.lookup_epoch_for_part(part_id);
@@ -2551,7 +2944,7 @@ impl ClusterClient {
                 .map(|(_, k, v, ttl)| partition_rpc::BatchPutOp {
                     inode_hint: lease.inode_hint,
                     lease_epoch: lease.lease_epoch,
-                    key: k.to_vec(),
+                    key: k.clone(),
                     value: v.to_vec(),
                     expires_at: *ttl,
                 })
@@ -2635,8 +3028,9 @@ impl ClusterClient {
         // ZC-only entries: per-op put_zc_opts so the TTL from put_many's
         // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at
         // on the wire; the single-key `put_zc` convenience hardcodes 0).
+        // `k` is the ALREADY-bound wire key.
         for (idx, k, v, ttl) in zc_only {
-            results[idx] = self.put_zc_opts(k, v, ttl, lease).await;
+            results[idx] = self.put_zc_opts(&k, v, ttl, lease).await;
         }
         results
     }
@@ -2669,6 +3063,14 @@ impl ClusterClient {
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.delete_bound(&bound).await
+    }
+
+    /// Internal: `delete` over an ALREADY-bound wire key (no namespace binding).
+    /// F-KEY-NS D7. NOTE: Layer-A does NOT gate deletes at the PS, but the CLIENT
+    /// still prepends so a scoped delete targets THIS tenant's key, not a raw one.
+    async fn delete_bound(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         self.delete_opts(key, WriteLease::ANON).await
     }
 
@@ -2680,7 +3082,8 @@ impl ClusterClient {
         key: &[u8],
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
-        self.delete_opts(key, lease).await
+        let bound = self.binding.bind_key(key)?;
+        self.delete_opts(&bound, lease).await
     }
 
     async fn delete_opts(
@@ -2709,6 +3112,13 @@ impl ClusterClient {
 
     /// Get key metadata (existence and value length).
     pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.head_bound(&bound).await
+    }
+
+    /// Internal: `head` over an ALREADY-bound wire key (no namespace binding).
+    /// F-KEY-NS D7 — see `put_bound`.
+    async fn head_bound(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self
             .call_ps_for_key(&key, MSG_HEAD, |part_id, region_epoch| {
@@ -2744,6 +3154,69 @@ impl ClusterClient {
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
+        // F-KEY-NS D7: clamp the scan to `{ns}/{tenant}/` — bind the prefix,
+        // bind the start (empty start → scan from the namespace lower bound),
+        // cap the upper end at `{ns}/{tenant}0`, then strip the binding prefix
+        // off returned keys so a Prepend caller sees its original keys. Raw
+        // binding is a no-op on all three (unbounded admin scan).
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let cap = self.binding.upper_cap();
+        let mut result = self
+            .range_bound(&wire_prefix, &wire_start, limit, cap.as_deref())
+            .await?;
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+
+    /// F-KEY-NS D7: this client's namespace binding.
+    pub fn binding(&self) -> &NamespaceBinding {
+        &self.binding
+    }
+
+    /// F-KEY-NS D7: a Raw (unscoped) VIEW sharing this client's pools — bypasses
+    /// the CLIENT-side namespace clamp for admin / cross-namespace / migration
+    /// tooling. **The PS still enforces Layer-A/B**, so this only removes the
+    /// client prefixing, never server authorization. The low-level seams
+    /// (`resolve_key` / `ps_call` / `mgr_call` / `all_partitions*`) are already
+    /// unbound + public. Documented admin-only — NOT the default.
+    pub fn raw(&self) -> NamespaceScope<'_> {
+        NamespaceScope {
+            client: self,
+            binding: NamespaceBinding::Raw,
+        }
+    }
+
+    /// F-KEY-NS D7: a VIEW of this client re-scoped to a DIFFERENT
+    /// `(namespace, tenant)`, sharing the same connection pools — for
+    /// multi-namespace tools (dashboard / migration) that operate across scopes
+    /// without reconnecting. Exposes the core KV ops (`put`/`get`/`delete`/
+    /// `head`/`range`); exotic ZC/batch/stream ops use a dedicated scoped
+    /// `ClusterClient`.
+    pub fn rescope(&self, namespace: &str, tenant: &str) -> NamespaceScope<'_> {
+        NamespaceScope {
+            client: self,
+            binding: NamespaceBinding::scoped(namespace, tenant),
+        }
+    }
+
+    /// Internal: range scan over ALREADY-bound `prefix`/`start` wire keys, with
+    /// an optional `upper_cap` (`{ns}/{tenant}0`) that stops the limit-driven
+    /// walk at the namespace boundary. No prefix binding / stripping — the public
+    /// `range` (and the `raw()`/`rescope` views) do that. F-KEY-NS D7.
+    async fn range_bound(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+        upper_cap: Option<&[u8]>,
+    ) -> std::result::Result<RangeResult, AutumnError> {
         // F212-fix-2 — uses the shared `refresh_backoff` + `MAX_PS_REFRESHES`
         // helpers (module-level docs explain the TiKV-style budget). Same
         // retry shape as point queries (`call_ps_for_key`) so async-split
@@ -2774,6 +3247,14 @@ impl ClusterClient {
             if remaining == 0 {
                 has_more = true;
                 break;
+            }
+            // F-KEY-NS D7: stop at the namespace upper bound `{ns}/{tenant}0` so a
+            // limit-driven scan can't walk past the tenant into the next
+            // namespace. `None` (Raw binding) = unbounded.
+            if let Some(cap) = upper_cap {
+                if cursor.as_slice() >= cap {
+                    break;
+                }
             }
             iterations += 1;
             if iterations > MAX_RANGE_ITERATIONS {
@@ -3551,6 +4032,7 @@ mod first_attempt_timeout_tests {
                 first_attempt_timeout: Cell::new(first),
                 auth: RefCell::new(None),
                 auth_gen: Cell::new(0),
+                binding: NamespaceBinding::Raw,
             }
         });
         cluster
@@ -3810,6 +4292,9 @@ impl<'a> PutStreamHandle<'a> {
                 self.state
             )));
         }
+        // The chunk key `\xff\xfe…++user_key` is a normal user key to the binding:
+        // a scoped (Prepend) client prepends `{ns}/{tenant}/` so chunks land in
+        // the tenant range; Raw writes the legacy global chunk space.
         let chunk_key = make_chunk_key(&self.user_key, self.next_chunk_index);
         self.cluster.put(&chunk_key, chunk).await?;
         self.next_chunk_index = self.next_chunk_index.saturating_add(1);
@@ -3981,5 +4466,114 @@ impl<'a> GetStream<'a> {
         self.pending_pos += want;
         self.cursor = self.cursor.saturating_add(want as u64);
         Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod namespace_binding_tests {
+    //! F-KEY-NS D7: the client namespace binding (Prepend-only) — scoped-prepend /
+    //! Raw key mapping, prefix binding, range strip, and the upper-cap successor.
+    use super::*;
+
+    #[test]
+    fn scoped_always_prepends_incl_builtins() {
+        // Prepend-only: EVERY scoped namespace (built-in or user) prepends
+        // `{ns}/{tenant}/`; there is no Assert mode. Built-in key builders emit
+        // keys RELATIVE to the prefix, so there is no double-prefix.
+        for (ns, tenant) in [("fs", "acme"), ("kvc", "acme"), ("mem", "acme"), ("bench", "perf")] {
+            let b = NamespaceBinding::scoped(ns, tenant);
+            let want = format!("{ns}/{tenant}/").into_bytes();
+            match &b {
+                NamespaceBinding::Scoped { prefix, .. } => assert_eq!(prefix, &want),
+                _ => panic!("expected Scoped"),
+            }
+            assert_eq!(
+                b.bind_key(b"rel/key").unwrap(),
+                [want.as_slice(), b"rel/key"].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn prepend_binds_and_strips() {
+        let b = NamespaceBinding::scoped("bench", "perf");
+        assert_eq!(b.bind_key(b"k1").unwrap(), b"bench/perf/k1".to_vec());
+        assert_eq!(b.bind_key(b"").unwrap(), b"bench/perf/".to_vec());
+        // strip is the inverse for keys under the prefix.
+        assert_eq!(b.strip(b"bench/perf/k1".to_vec()), b"k1".to_vec());
+        // a key NOT under the prefix is returned unchanged by strip.
+        assert_eq!(b.strip(b"other".to_vec()), b"other".to_vec());
+    }
+
+    #[test]
+    fn scope_is_locked_by_construction() {
+        // The whole point of Prepend-only: a scoped client CANNOT emit a key
+        // outside its `{ns}/{tenant}/`. Even a key that "looks like" another
+        // tenant is prepended, landing it firmly inside this scope.
+        let b = NamespaceBinding::scoped("mem", "acme");
+        assert_eq!(
+            b.bind_key(b"mem/other/x").unwrap(),
+            b"mem/acme/mem/other/x".to_vec(),
+        );
+        // bind_key is infallible for a scoped binding — no escape, no reject.
+        assert!(b.bind_key(b"\xff\xfeanything").is_ok());
+    }
+
+    #[test]
+    fn raw_is_identity() {
+        let b = NamespaceBinding::Raw;
+        assert_eq!(b.bind_key(b"\x01\x02anything").unwrap(), b"\x01\x02anything".to_vec());
+        assert_eq!(b.strip(b"\x01raw".to_vec()), b"\x01raw".to_vec());
+        assert!(b.upper_cap().is_none());
+        assert!(b.prefix().is_none());
+    }
+
+    #[test]
+    fn upper_cap_is_the_slash_successor() {
+        // `{ns}/{tenant}/` → `{ns}/{tenant}0` ('/'=0x2f, '0'=0x30).
+        let b = NamespaceBinding::scoped("bench", "perf");
+        assert_eq!(b.upper_cap().unwrap(), b"bench/perf0".to_vec());
+        // Every key under the prefix sorts strictly below the cap.
+        let cap = b.upper_cap().unwrap();
+        assert!(b"bench/perf/".to_vec() < cap);
+        assert!(b"bench/perf/zzzzz".to_vec() < cap);
+        assert!(b"bench/perf/\xff".to_vec() < cap);
+        // The next namespace/tenant sorts at/above the cap.
+        assert!(b"bench/pers/".to_vec() >= cap);
+    }
+
+    #[test]
+    fn bind_prefix_matches_bind_key() {
+        let b = NamespaceBinding::scoped("bench", "perf");
+        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"bench/perf/pre".to_vec());
+        // empty user prefix → the namespace lower bound.
+        assert_eq!(b.bind_prefix(b"").unwrap(), b"bench/perf/".to_vec());
+    }
+
+    #[test]
+    fn stripe_chunk_keys_land_in_the_tenant_range() {
+        // A stripe chunk key (`\xff\xfe…`) is just a normal user key to the
+        // binding, so a scoped (Prepend) client prepends `{ns}/{tenant}/` and the
+        // chunk lands INSIDE the tenant range (Layer-A / authz / presplit cover
+        // it). No special chunk path is needed under Prepend-only.
+        let chunk = make_chunk_key(b"userkey", 3);
+        let b = NamespaceBinding::scoped("bench", "perf");
+        assert!(b.bind_key(&chunk).unwrap().starts_with(b"bench/perf/"));
+        // Raw: passthrough (legacy global chunk space).
+        assert_eq!(NamespaceBinding::Raw.bind_key(&chunk).unwrap(), chunk);
+    }
+
+    #[test]
+    fn scope_segment_validation_rejects_forged_scopes() {
+        // P2 (fable review): connect() must reject a `/`-containing or empty
+        // ns/tenant, else a scope can be forged/nested (`mem` + `acme/sub` →
+        // `mem/acme/sub/`) — the old q() percent-encoding defense is gone under
+        // Prepend-only, so this charset check restores it.
+        for ok in ["bench", "kvc", "acme", "default", "model-cfg_1.0", "a-b_c.d"] {
+            assert!(super::is_valid_scope_segment(ok), "{ok} should be valid");
+        }
+        for bad in ["", "acme/sub", "Acme", "a b", "a:b", "a/", "/x"] {
+            assert!(!super::is_valid_scope_segment(bad), "{bad} should be rejected");
+        }
     }
 }

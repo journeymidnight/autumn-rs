@@ -109,7 +109,9 @@ fn main() -> Result<()> {
         .build()
         .context("create compio runtime")?;
     rt.block_on(async move {
-        let cluster = ClusterClient::connect(&args.manager)
+        // F-KEY-NS D7: autumnfs operates on the raw fuse key space (`0x01`–`0x04`,
+        // migrated to `fs/…` in SD-3) — bind Raw (no client clamp).
+        let cluster = ClusterClient::connect_raw(&args.manager)
             .await
             .context("connect to manager")?;
         cluster

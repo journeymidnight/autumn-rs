@@ -122,6 +122,12 @@ pub(crate) struct Args {
     /// in-flight and benefit from a higher cap; constrained hosts can
     /// shrink to fit. Clamped to [16 MiB, 64 GiB].
     pub(crate) ucx_regpool_cap_bytes: Option<usize>,
+    /// F-KEY-NS D7: the namespace + tenant every data-plane KV command
+    /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within. REQUIRED
+    /// for those commands (a write must declare its namespace); perf-check/ycsb
+    /// bind the `bench` namespace internally and don't need these.
+    pub(crate) namespace: Option<String>,
+    pub(crate) tenant: Option<String>,
 }
 
 fn usage() -> ! {
@@ -167,6 +173,8 @@ pub(crate) fn parse_args() -> Args {
     let mut manager = String::from("127.0.0.1:9001");
     let mut transport = autumn_transport::TransportKind::Tcp;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
+    let mut namespace: Option<String> = None;
+    let mut tenant: Option<String> = None;
     let mut i = 1;
 
     while i < raw.len() {
@@ -174,6 +182,17 @@ pub(crate) fn parse_args() -> Args {
             "--manager" => {
                 i += 1;
                 manager = val(&raw, i).to_owned();
+                i += 1;
+            }
+            // F-KEY-NS D7: the namespace scope for data-plane KV commands.
+            "--namespace" => {
+                i += 1;
+                namespace = Some(val(&raw, i).to_owned());
+                i += 1;
+            }
+            "--tenant" => {
+                i += 1;
+                tenant = Some(val(&raw, i).to_owned());
                 i += 1;
             }
             "--transport" => {
@@ -603,6 +622,8 @@ pub(crate) fn parse_args() -> Args {
         command,
         transport,
         ucx_regpool_cap_bytes,
+        namespace,
+        tenant,
     }
 }
 

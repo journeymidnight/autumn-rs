@@ -60,7 +60,7 @@ async fn boot_cluster(
     start_partition_server(base as u64, mgr_addr, ps_addr);
     compio::time::sleep(Duration::from_millis(1500)).await;
     let _ = RpcClient::connect(ps_addr).await.unwrap();
-    let cluster = ClusterClient::connect(&mgr_addr.to_string())
+    let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
         .await
         .expect("ClusterClient::connect");
     cluster.set_rpc_timeout(Duration::from_secs(30));
@@ -149,7 +149,7 @@ fn per_ino_writer_close_triggers_invalidator() {
         // Writer mount: distinct UUID. Acquire WRITE + Release →
         // manager pushes WriterClosed to the reader.
         let writer_id = cid(0xaa, "writer");
-        let writer_cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let writer_cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let _ = lease::acquire(&writer_cluster, &writer_id, ino, LEASE_MODE_WRITE)
             .await
             .unwrap();
@@ -242,7 +242,7 @@ fn multiple_distinct_inos_each_get_invalidated() {
         // writer identity. Manager queues 3 WriterClosed events
         // into the reader's inbox + wakes the parked poll.
         let writer = cid(0xcc, "writer");
-        let w_cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let w_cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         for &ino in &inos {
             let _ = lease::acquire(&w_cluster, &writer, ino, LEASE_MODE_WRITE)
                 .await

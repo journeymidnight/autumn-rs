@@ -307,7 +307,7 @@ async fn run(args: Args) -> Result<()> {
     // Select the process-global transport before connecting. Without this an
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
-    let client = ClusterClient::connect(&args.manager).await?;
+    let client = ClusterClient::connect_raw(&args.manager).await?;
     match args.cmd {
         // ---------------- F211 read ----------------
         Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
@@ -361,6 +361,7 @@ async fn run(args: Args) -> Result<()> {
         // ---------------- F-KEY-NS D2 namespace registry ----------------
         Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
         Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
+        Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
     }
     let _ = std::io::stdout().flush();
     Ok(())
@@ -555,6 +556,47 @@ async fn cmd_namespace_delete(
         println!("namespace '{name}' deleted (registry row removed)");
         if force {
             eprintln!("# --force: emptiness check skipped; any data under '{name}/' is untouched.");
+        }
+    }
+    Ok(())
+}
+
+/// F-KEY-NS D2: list the registered namespaces (rich rows). Read-only.
+async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
+    let namespaces = client.namespace_list().await?;
+    if json {
+        let rows: Vec<_> = namespaces
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "name": n.name,
+                    "prefix": String::from_utf8_lossy(&n.prefix),
+                    "owner_tenant": n.owner_tenant,
+                    "protected": n.owner_tenant.is_some(),
+                    "presplit_points": n.presplit.len(),
+                    "created_at": n.created_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!(
+            "{:<14} {:<16} {:<14} {:>8} {:>12}",
+            "NAME", "PREFIX", "OWNER", "PRESPLIT", "CREATED_AT"
+        );
+        for n in &namespaces {
+            let owner = match &n.owner_tenant {
+                Some(t) => format!("{t} (protected)"),
+                None => "-".to_string(),
+            };
+            println!(
+                "{:<14} {:<16} {:<14} {:>8} {:>12}",
+                n.name,
+                String::from_utf8_lossy(&n.prefix),
+                owner,
+                n.presplit.len(),
+                n.created_at,
+            );
         }
     }
     Ok(())

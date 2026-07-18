@@ -61,8 +61,8 @@ fn force_revoke_event_is_lease_revoked_kind_and_evict_fn_clears_held_lease() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_p = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_p = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let writer = cid(0xa1, "writer");
         let preempter = cid(0xa2, "preempter");
         let ino = 7000u64;

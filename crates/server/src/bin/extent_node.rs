@@ -322,7 +322,7 @@ fn apply_extent_tunables(
 /// see. No retry — if the manager isn't reachable at startup we want
 /// to bubble up the error fast.
 async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
-    let client = ClusterClient::connect(manager)
+    let client = ClusterClient::connect_raw(manager)
         .await
         .with_context(|| format!("connect to manager {manager} for cluster_id verify"))?;
     let resp_bytes = client
@@ -507,7 +507,7 @@ async fn register_with_manager(
     let mut last_err = String::new();
     for attempt in 1..=30u32 {
         let step = async {
-            let client = ClusterClient::connect(manager)
+            let client = ClusterClient::connect_raw(manager)
                 .await
                 .with_context(|| format!("connect to manager {manager}"))?;
             let bytes = client

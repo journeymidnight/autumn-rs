@@ -1658,7 +1658,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
 
-    let client: Client = Rc::new(ClusterClient::connect(&manager).await?);
+    let client: Client = Rc::new(ClusterClient::connect_raw(&manager).await?);
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));
 

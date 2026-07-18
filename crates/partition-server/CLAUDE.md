@@ -1652,6 +1652,45 @@ connection (`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDen
 is terminal (not retried). Cross-tenant e2e: `crates/autumn-memory/tests/
 run_authz_e2e.sh`.
 
+### F-KEY-NS D7 Layer-A — put must target a REGISTERED namespace (SD-2)
+
+`authz_gate` now runs TWO checks. The `AuthzState::gate_active()` atomic
+(`is_enabled() || layer_a_enabled()`) is ONLY a lock-free fast-path SKIP HINT; the
+per-request DECISION is derived from the CONSISTENT snapshot (`!snap.namespaces.
+is_empty()` for Layer-A, `snap.enabled` for Layer-B) so a config-refresh window
+can't pair a stale flag with a different-time config (coco P2). A stale hint can
+only cause a one-request fail-open on the turn-ON edge (accepted pre-existing
+F-AUTHZ-1 behavior), never a false reject.
+- **Layer-A** (`check_layer_a`, `authz.rs`): a **put-class** frame
+  (`MSG_PUT`/`MSG_PUT_ZC`/`MSG_BATCH_PUT`) whose key falls under NO registered
+  namespace prefix (`AuthzInner.namespaces`, from `GetAuthzConfigResp.namespaces`)
+  is rejected with `StatusCode::NamespaceUnknown` (8). **TOKEN-FREE** — pure
+  `starts_with` against the registry; anonymous connections are checked too.
+  Gated by `layer_a_enabled` = *registry non-empty*, INDEPENDENT of the signing
+  key (a dev cluster gets Layer-A without authz; a cold/unconfigured PS with an
+  empty registry doesn't brick writes). **delete/get/range are NOT Layer-A
+  gated** — Layer-A only prevents creating UNOWNED data via writes;
+  reads/deletes are Layer-B's job.
+- **Layer-B** (`authz_check`, unchanged) runs after, gated by `is_enabled`.
+- **`drain_zc_writes` gate**: the ZC write-recv fast path is skipped when
+  `!gate_active()` (was `!is_enabled()`) so a large `MSG_PUT_ZC` flows through the
+  FrameDecoder path where the gate enforces BOTH layers — else Layer-A would miss
+  large ZC writes when the signing key is off.
+- **Deploy ordering — Layer-A is LIVE from bootstrap, NOT "dormant"** (fable
+  review, 2026-07-18): SD-1's `seed_builtin_namespaces` CAS-registers `fs/`,`kvc/`,
+  `mem/` on the first leader of any etcd-backed cluster → registry non-empty → the
+  PS turns Layer-A ON (`layer_a_enabled = !namespaces.is_empty()`, independent of
+  the signing key). So this tree **must NOT be deployed without SD-3**: fuse
+  (pre-SD-3) writes raw `0x01`–`0x04` keys via `connect_raw`, which Layer-A rejects
+  with `NamespaceUnknown` (terminal — no `[a-z0-9._-]+` namespace can ever cover
+  `0x01…`) → a fuse data-plane outage. The §7.4 batch reset deploys SD-1+SD-2+SD-3
+  together, so at deploy time fuse writes `fs/…` (registered) and passes — **SD-2
+  is only ever shipped WITH SD-3**. Test gap to know: in-process test managers run
+  memory-mode and never call `seed_builtin_namespaces` (etcd `try_become_leader`
+  only), so Layer-A is OFF in the suite unless a test explicitly `namespace-create`s
+  (as `system_namespace_layer_a` does) — a real etcd cluster behaves differently.
+  Tests: `authz::tests::layer_a_*`, `system_namespace_layer_a`.
+
 ## region_epoch check (TiKV-style, 2026-05-16)
 
 Each `PartitionData` carries `region_epoch: u64`, populated at open

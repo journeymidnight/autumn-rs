@@ -74,7 +74,12 @@ impl MemoryStore {
         tenant: impl Into<String>,
         agent: impl Into<String>,
     ) -> Result<Self, AutumnError> {
-        let client = ClusterClient::connect(manager)
+        // F-KEY-NS D7 (Prepend-only): bind the client to `mem`/`tenant` — it
+        // PREPENDS `mem/{tenant}/` to every key, so `keys.rs` emits keys RELATIVE
+        // to that scope. NEVER make keys.rs re-add `mem/{tenant}/` or every op
+        // double-prefixes. Scope is locked by construction (can't escape `mem/`).
+        let tenant = tenant.into();
+        let client = ClusterClient::connect(manager, "mem", &tenant)
             .await
             .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
         Ok(Self::with_client(Rc::new(client), tenant, agent))
@@ -93,9 +98,19 @@ impl MemoryStore {
         credential: Vec<u8>,
     ) -> Result<Self, AutumnError> {
         let tenant = tenant.into();
-        let client = ClusterClient::connect_with_credential(manager, tenant.clone(), credential)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        // F-KEY-NS D7 (Prepend-only): bind to `mem`/`tenant` (prepends the scope).
+        // The authz PRINCIPAL is the same as the key tenant by the 1:1 default
+        // convention (细化三), so the minted token's `allowed_prefixes` cover
+        // `mem/{tenant}/`.
+        let client = ClusterClient::connect_with_credential(
+            manager,
+            "mem",
+            &tenant,
+            tenant.clone(),
+            credential,
+        )
+        .await
+        .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
         Ok(Self::with_client(Rc::new(client), tenant, agent))
     }
 

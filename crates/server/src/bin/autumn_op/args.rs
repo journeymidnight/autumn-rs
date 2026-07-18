@@ -58,6 +58,7 @@ fn usage() -> ! {
     eprintln!("                               register a namespace (--with-tenant marks it protected)");
     eprintln!("  namespace-delete --name <NS> [--force] --admin-token <TOK>");
     eprintln!("                               remove the registry row (refuses non-empty unless --force)");
+    eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/owner/presplit/created)");
     std::process::exit(1);
 }
 
@@ -352,6 +353,8 @@ pub(crate) enum Command {
         force: bool,
         admin_token: String,
     },
+    /// F-KEY-NS D2: list the full namespace registry (rich rows). Read-only.
+    NamespaceList,
 }
 
 pub(crate) fn parse() -> Args {
@@ -755,6 +758,7 @@ pub(crate) fn parse() -> Args {
                 admin_token,
             }
         }
+        "namespace-list" => Command::NamespaceList,
         // F213 read
         "info" => {
             let mut part: Option<u64> = None;

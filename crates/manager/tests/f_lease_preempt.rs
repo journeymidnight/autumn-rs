@@ -57,8 +57,8 @@ fn force_acquire_pushes_will_revoke_to_current_writer() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_p = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_p = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let w = cid(0x11, "writer");
         let p = cid(0x22, "preempter");
 
@@ -99,8 +99,8 @@ fn voluntary_release_within_grace_lets_preempter_acquire_cleanly() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_p = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_p = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let w = cid(0xa1, "writer");
         let p = cid(0xa2, "preempter");
 
@@ -145,8 +145,8 @@ fn force_acquire_after_grace_expiry_forces_revoke_and_grants() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
-        let cluster_p = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_p = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let w = cid(0xb1, "stubborn-writer");
         let p = cid(0xb2, "preempter");
 
@@ -214,7 +214,7 @@ fn force_acquire_on_no_writer_grants_immediately() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect(&mgr_addr.to_string()).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
         let p = cid(0xc1, "p");
         // Fresh ino with no writer → force-acquire just grants.
         let r = lease::acquire_force(&cluster, &p, 99, LEASE_MODE_WRITE)

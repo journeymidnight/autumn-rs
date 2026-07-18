@@ -171,7 +171,7 @@ fn e2e_reconcile_repairs_stats_drift() {
         .expect("compio runtime")
         .block_on(async {
             let agent = unique_agent();
-            let client = Rc::new(ClusterClient::connect(&manager_addr()).await.expect("connect"));
+            let client = Rc::new(ClusterClient::connect(&manager_addr(), "mem", "__am_e2e").await.expect("connect"));
             let mem = MemoryStore::with_client(client.clone(), "__am_e2e", agent.clone());
 
             for (i, id) in ["a", "b", "c"].iter().enumerate() {
@@ -347,7 +347,7 @@ fn e2e_reconcile_flags_dangling_edge() {
         .expect("compio runtime")
         .block_on(async {
             let agent = unique_agent();
-            let client = Rc::new(ClusterClient::connect(&manager_addr()).await.expect("connect"));
+            let client = Rc::new(ClusterClient::connect(&manager_addr(), "mem", "__am_e2e").await.expect("connect"));
             let mem = MemoryStore::with_client(client.clone(), "__am_e2e", agent.clone());
 
             mem.put_node("real", "Node", b"", None).await.expect("put real");

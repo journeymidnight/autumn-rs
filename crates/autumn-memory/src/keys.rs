@@ -84,9 +84,14 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Prefix covering ALL of one agent's private memory.
-pub fn agent_prefix(tenant: &str, agent: &str) -> Vec<u8> {
-    format!("{}/{}/{}/", NS, q(tenant), q(agent)).into_bytes()
+/// Prefix covering ALL of one agent's private memory, RELATIVE to the client's
+/// `mem/{tenant}/` binding scope (F-KEY-NS D7 Prepend-only: the `ClusterClient`
+/// owns the `mem/{tenant}/` prefix and prepends it, so scope is locked by
+/// construction). `_tenant` is now owned by the binding and ignored here — kept
+/// on the signature only so the many callers don't churn; the full param removal
+/// is a follow-up.
+pub fn agent_prefix(_tenant: &str, agent: &str) -> Vec<u8> {
+    format!("{}/", q(agent)).into_bytes()
 }
 
 // ----------------------------------------------------------------- episodic --
@@ -147,8 +152,9 @@ pub fn fact_key_name(key: &[u8], prefix: &[u8]) -> String {
 
 // ------------------------------------------------------------------- shared --
 
-pub fn shared_prefix(tenant: &str, namespace: Option<&str>) -> Vec<u8> {
-    let mut v = format!("{}/{}/shared/", NS, q(tenant)).into_bytes();
+/// Cross-agent shared prefix, RELATIVE to `mem/{tenant}/` (see `agent_prefix`).
+pub fn shared_prefix(_tenant: &str, namespace: Option<&str>) -> Vec<u8> {
+    let mut v = b"shared/".to_vec();
     if let Some(ns) = namespace {
         v.extend_from_slice(format!("{}/", q(ns)).as_bytes());
     }

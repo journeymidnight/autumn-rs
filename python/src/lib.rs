@@ -444,20 +444,27 @@ impl Client {
     /// cluster with authz off. Both-or-neither: a lone tenant or lone
     /// credential is a config error and fails loudly here rather than as a
     /// confusing first-write PermissionDenied.
+    // F-KEY-NS D7: `namespace` + `tenant` are the REQUIRED key scope — the client
+    // PREPENDS `{namespace}/{tenant}/` to every key (Prepend-only, scope locked by
+    // construction). `principal` + `credential` are the OPTIONAL authz identity
+    // (细化三 renamed the old `tenant=` authz kwarg to `principal=`; by the 1:1
+    // default the principal name == the key tenant).
     #[staticmethod]
-    #[pyo3(signature = (manager, tenant=None, credential=None))]
+    #[pyo3(signature = (manager, namespace, tenant, principal=None, credential=None))]
     fn connect<'py>(
         py: Python<'py>,
         manager: String,
-        tenant: Option<String>,
+        namespace: String,
+        tenant: String,
+        principal: Option<String>,
         credential: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let cred_pair = match (tenant, credential) {
-            (Some(t), Some(c)) => Some((t, c)),
+        let cred_pair = match (principal, credential) {
+            (Some(p), Some(c)) => Some((p, c)),
             (None, None) => None,
             _ => {
                 return Err(PyRuntimeError::new_err(
-                    "tenant= and credential= must be passed together (both or neither)",
+                    "principal= and credential= must be passed together (both or neither)",
                 ))
             }
         };
@@ -475,10 +482,17 @@ impl Client {
                     }
                 };
                 rt.block_on(async move {
-                    match ClusterClient::connect(&manager).await {
+                    match ClusterClient::connect(&manager, &namespace, &tenant).await {
                         Ok(client) => {
-                            if let Some((t, c)) = cred_pair {
-                                client.set_tenant_credential(t, c);
+                            if let Some((p, c)) = cred_pair {
+                                client.set_tenant_credential(p, c);
+                                // coco P2: run the SAME connect-time scope check as
+                                // Rust's connect_with_credential — fail fast on a
+                                // mis-scoped credential instead of at the first op.
+                                if let Err(e) = client.validate_credential_scope().await {
+                                    handle.reject(format!("credential scope invalid: {e}"));
+                                    return;
+                                }
                             }
                             // Move `tx` into the Python Client object so the
                             // caller can submit further ops; resolve future.
@@ -987,22 +1001,27 @@ impl BatchClient {
     /// from `kv_connector_extra_config`); harmless with authz off. Both or
     /// neither, validated up front.
     #[new]
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, tenant=None, credential=None))]
+    // F-KEY-NS D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
+    // (keyword-only, after the perf knobs); `principal` + `credential` are the
+    // OPTIONAL authz identity (细化三 rename from `tenant=`).
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, namespace, tenant, principal=None, credential=None))]
     fn new(
         py: Python<'_>,
         manager: String,
         n_workers: usize,
         per_worker_cap: usize,
         direct: bool,
-        tenant: Option<String>,
+        namespace: String,
+        tenant: String,
+        principal: Option<String>,
         credential: Option<Vec<u8>>,
     ) -> PyResult<Self> {
-        let cred_pair = match (tenant, credential) {
-            (Some(t), Some(c)) => Some((t, c)),
+        let cred_pair = match (principal, credential) {
+            (Some(p), Some(c)) => Some((p, c)),
             (None, None) => None,
             _ => {
                 return Err(PyRuntimeError::new_err(
-                    "tenant= and credential= must be passed together (both or neither)",
+                    "principal= and credential= must be passed together (both or neither)",
                 ))
             }
         };
@@ -1018,6 +1037,8 @@ impl BatchClient {
                 let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
                 let endpoint = manager.clone();
                 let worker_cred = cred_pair.clone();
+                let worker_ns = namespace.clone();
+                let worker_tenant = tenant.clone();
                 std::thread::Builder::new()
                     .name(format!("autumn-batch-{i}"))
                     .spawn(move || {
@@ -1029,10 +1050,18 @@ impl BatchClient {
                             }
                         };
                         rt.block_on(async move {
-                            let client = match ClusterClient::connect(&endpoint).await {
+                            let client = match ClusterClient::connect(&endpoint, &worker_ns, &worker_tenant).await {
                                 Ok(c) => {
-                                    if let Some((t, cred)) = worker_cred {
-                                        c.set_tenant_credential(t, cred);
+                                    if let Some((p, cred)) = worker_cred {
+                                        c.set_tenant_credential(p, cred);
+                                        // coco P2: run the SAME connect-time scope
+                                        // check as connect_with_credential — fail
+                                        // fast on a mis-scoped credential.
+                                        if let Err(e) = c.validate_credential_scope().await {
+                                            let _ = ready_tx
+                                                .send(Err(format!("credential scope invalid: {e}")));
+                                            return;
+                                        }
                                     }
                                     let _ = ready_tx.send(Ok(()));
                                     c

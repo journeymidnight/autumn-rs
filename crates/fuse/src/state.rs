@@ -121,7 +121,11 @@ impl FsState {
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
     pub async fn new_with_host(manager_addr: &str, host: String) -> Result<Self> {
-        let client = ClusterClient::connect(manager_addr)
+        // F-KEY-NS D7: fuse keys are still raw type-bytes (`0x01`–`0x04`) until
+        // SD-3 migrates them to `fs/{tenant}/{volume}/`, so bind Raw (no client
+        // clamp). SD-3 switches this to `connect(mgr, "fs", tenant)` (Prepend —
+        // key.rs then emits keys RELATIVE to `fs/{tenant}/`).
+        let client = ClusterClient::connect_raw(manager_addr)
             .await
             .context("connect to manager")?;
         Ok(Self {

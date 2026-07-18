@@ -29,6 +29,12 @@ use parking_lot::RwLock;
 
 /// Immutable snapshot of the authz config the PS enforces against.
 pub struct AuthzInner {
+    /// F-KEY-NS D7 (coco P2): Layer-B (protected-prefix / token) enforcement on
+    /// (a signing key was configured). Carried IN the snapshot so the gate's
+    /// per-request decision comes from ONE consistent object — never "flag from
+    /// one atomic + config from a different-time snapshot". The `enabled`
+    /// AtomicBool remains only as the lock-free fast-path skip hint.
+    pub enabled: bool,
     /// kid → verifying key. Only ENABLED kids are present — a disabled kid's
     /// tokens then reject as `UnknownKid` (emergency bulk revocation).
     pub keys: HashMap<u32, VerifyingKey>,
@@ -41,16 +47,16 @@ pub struct AuthzInner {
     /// (minted for another cluster that shares signing keys) is rejected at
     /// AUTH_HELLO. Empty = unknown → the aud check is skipped (degraded).
     pub cluster_id: String,
-    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry). STORED
-    /// in SD-1 (from `GetAuthzConfigResp.namespaces`) but UNUSED — SD-2 wires the
-    /// Layer-A gate (a put-class write must fall in one of these). Keeping it in
-    /// the snapshot now means SD-2 is a gate-only change with no plumbing.
+    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry, from
+    /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
+    /// admits a put-class write only if its key `starts_with` one of these.
     pub namespaces: Vec<Vec<u8>>,
 }
 
 impl AuthzInner {
     fn empty() -> Self {
         Self {
+            enabled: false,
             keys: HashMap::new(),
             protected_prefixes: Vec::new(),
             clock_skew_secs: 60,
@@ -64,9 +70,16 @@ impl AuthzInner {
 /// connection tasks run on the partition OS threads, not the main thread). The
 /// main-thread poll loop swaps `inner`; connection tasks read it.
 pub struct AuthzState {
-    /// Fast gate: is enforcement on? A single relaxed load on the hot path when
-    /// OFF (the common case).
+    /// Fast gate: is Layer-B (protected-prefix / token) enforcement on? A single
+    /// relaxed load on the hot path when OFF (the common case). True iff the
+    /// manager configured a signing key.
     enabled: AtomicBool,
+    /// F-KEY-NS D7: is Layer-A (put-class must fall in a REGISTERED namespace)
+    /// enforcement on? True iff the registry is non-empty. Independent of
+    /// `enabled` — a dev cluster with namespaces but no signing key still gets
+    /// Layer-A (token-free), and an unconfigured/cold PS (empty registry) doesn't
+    /// brick writes.
+    layer_a_enabled: AtomicBool,
     inner: RwLock<Arc<AuthzInner>>,
 }
 
@@ -80,14 +93,28 @@ impl AuthzState {
     pub fn new() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            layer_a_enabled: AtomicBool::new(false),
             inner: RwLock::new(Arc::new(AuthzInner::empty())),
         }
     }
 
-    /// Hot-path gate. `false` ⇒ no enforcement (single relaxed atomic load).
+    /// Hot-path gate. `false` ⇒ no Layer-B enforcement (single relaxed load).
     #[inline]
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// F-KEY-NS D7 hot-path gate: `false` ⇒ no Layer-A enforcement (empty
+    /// registry). A single relaxed load.
+    #[inline]
+    pub fn layer_a_enabled(&self) -> bool {
+        self.layer_a_enabled.load(Ordering::Relaxed)
+    }
+
+    /// True iff either Layer runs — the gate's fast skip test.
+    #[inline]
+    pub fn gate_active(&self) -> bool {
+        self.is_enabled() || self.layer_a_enabled()
     }
 
     /// Take a cheap `Arc` snapshot of the current config (one read-lock + one
@@ -117,17 +144,24 @@ impl AuthzState {
             }
         }
         let inner = Arc::new(AuthzInner {
+            enabled: resp.enabled,
             keys,
             protected_prefixes: resp.protected_prefixes.clone(),
             clock_skew_secs: resp.clock_skew_secs,
             cluster_id: resp.cluster_id.clone(),
-            // F-KEY-NS D7: stored for SD-2's Layer-A gate; unused today.
+            // F-KEY-NS D7: the registered-namespace list — Layer-A's data source.
             namespaces: resp.namespaces.clone(),
         });
+        // F-KEY-NS D7: Layer-A is on iff the registry is non-empty (independent
+        // of the signing key). Compute BEFORE the swap so the flag matches the
+        // installed snapshot.
+        let layer_a = !resp.namespaces.is_empty();
         *self.inner.write() = inner;
-        // Publish `enabled` AFTER the config is in place so a concurrent reader
-        // never sees enabled==true with an empty keyring.
+        // Publish `enabled` / `layer_a_enabled` AFTER the config is in place so a
+        // concurrent reader never sees enabled==true with an empty keyring / a
+        // stale namespace list.
         self.enabled.store(resp.enabled, Ordering::Relaxed);
+        self.layer_a_enabled.store(layer_a, Ordering::Relaxed);
     }
 }
 
@@ -344,6 +378,68 @@ pub fn authz_check(
     }
 }
 
+/// F-KEY-NS D7 **Layer-A**: a put-class write's key(s) MUST fall under some
+/// REGISTERED namespace prefix (`AuthzInner.namespaces`); otherwise the target
+/// namespace does not exist and the write is refused with
+/// `StatusCode::NamespaceUnknown`. Distinct from Layer-B (`authz_check`):
+/// - **Token-FREE** — pure prefix match; anonymous connections are checked too.
+/// - **PUT / PUT_ZC / BATCH_PUT only** — Layer-A prevents creating UNOWNED data
+///   via WRITES. Deletes / reads / ranges are NOT Layer-A gated (a delete can't
+///   create unowned data; read isolation is Layer-B's job).
+/// - Runs whenever the registry is non-empty (the caller gates on
+///   `layer_a_enabled`), INDEPENDENT of the signing key.
+/// Returns `Some((code, msg))` to REJECT, `None` to admit. A frame that fails to
+/// decode returns `None` (the real handler rejects it) — same safety argument as
+/// `authz_check`.
+pub fn check_layer_a(
+    msg_type: u8,
+    payload: &[u8],
+    inner: &AuthzInner,
+) -> Option<(StatusCode, String)> {
+    fn in_a_namespace(key: &[u8], namespaces: &[Vec<u8>]) -> bool {
+        namespaces.iter().any(|ns| key.starts_with(ns))
+    }
+    fn reject(key: &[u8]) -> Option<(StatusCode, String)> {
+        Some((
+            StatusCode::NamespaceUnknown,
+            format!(
+                "write to unregistered namespace: key {:?} is under no registered namespace prefix",
+                String::from_utf8_lossy(&key[..key.len().min(64)])
+            ),
+        ))
+    }
+    match msg_type {
+        MSG_PUT => {
+            let r = partition_rpc::rkyv_decode::<PutReq>(payload).ok()?;
+            if in_a_namespace(&r.key, &inner.namespaces) {
+                None
+            } else {
+                reject(&r.key)
+            }
+        }
+        MSG_PUT_ZC => {
+            let meta = parse_put_zc_meta(payload)?;
+            let key = payload.get(PUT_ZC_HEADER_LEN..meta.value_offset)?;
+            if in_a_namespace(key, &inner.namespaces) {
+                None
+            } else {
+                reject(key)
+            }
+        }
+        MSG_BATCH_PUT => {
+            let r = partition_rpc::rkyv_decode::<BatchPutReq>(payload).ok()?;
+            for op in &r.ops {
+                if !in_a_namespace(&op.key, &inner.namespaces) {
+                    return reject(&op.key);
+                }
+            }
+            None
+        }
+        // Not a put-class op → Layer-A does not apply (delete/get/range/admin).
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +453,7 @@ mod tests {
         let mut keys = HashMap::new();
         keys.insert(1u32, SigningKey::from_bytes(&[1u8; 32]).verifying_key());
         AuthzInner {
+            enabled: true,
             keys,
             protected_prefixes: prefixes,
             clock_skew_secs: 60,
@@ -470,6 +567,7 @@ mod tests {
         let mut keys = HashMap::new();
         keys.insert(1u32, vk);
         let inner = AuthzInner {
+            enabled: true,
             keys,
             protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
@@ -495,6 +593,7 @@ mod tests {
         assert_eq!(p.kid, 1);
         // wrong kid (not in keyring) → reject
         let inner2 = AuthzInner {
+            enabled: true,
             keys: HashMap::new(),
             protected_prefixes: vec![],
             clock_skew_secs: 60,
@@ -512,6 +611,7 @@ mod tests {
         // A principal bound to kid 1, then kid 1 is rotated out of the keyring
         // (disabled) → every subsequent request on that live connection denies.
         let inner_disabled = AuthzInner {
+            enabled: true,
             keys: HashMap::new(), // kid 1 no longer present
             protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
@@ -557,5 +657,133 @@ mod tests {
         assert_eq!(snap.protected_prefixes, vec![b"mem/".to_vec()]);
         assert_eq!(snap.clock_skew_secs, 45);
         assert_eq!(snap.cluster_id, "cluster-abc");
+    }
+
+    // ── F-KEY-NS D7 Layer-A ──────────────────────────────────────────────
+    fn inner_with_namespaces(namespaces: Vec<Vec<u8>>) -> AuthzInner {
+        let mut inner = inner_with(Vec::new());
+        inner.namespaces = namespaces;
+        inner
+    }
+
+    fn put_payload(key: &[u8]) -> Vec<u8> {
+        rkyv_encode(&PutReq {
+            part_id: 1,
+            key: key.to_vec(),
+            value: b"v".to_vec(),
+            expires_at: 0,
+            region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
+        })
+        .to_vec()
+    }
+
+    #[test]
+    fn layer_a_admits_put_in_registered_namespace() {
+        let inner = inner_with_namespaces(vec![b"kvc/".to_vec(), b"mem/".to_vec()]);
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"kvc/acme/x"), &inner).is_none());
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"mem/acme/y"), &inner).is_none());
+    }
+
+    #[test]
+    fn layer_a_rejects_put_in_unregistered_namespace() {
+        let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
+        let d = check_layer_a(MSG_PUT, &put_payload(b"scratch/x"), &inner);
+        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))), "{d:?}");
+        // A raw fuse-style key (no registered prefix) is rejected too.
+        let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
+        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
+    }
+
+    #[test]
+    fn layer_a_batch_put_rejects_if_any_op_out_of_namespace() {
+        let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
+        let ok = rkyv_encode(&BatchPutReq {
+            part_id: 1,
+            region_epoch: 0,
+            must_sync: true,
+            ops: vec![
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/2".to_vec(), value: vec![], expires_at: 0 },
+            ],
+        })
+        .to_vec();
+        assert!(check_layer_a(MSG_BATCH_PUT, &ok, &inner).is_none());
+        let bad = rkyv_encode(&BatchPutReq {
+            part_id: 1,
+            region_epoch: 0,
+            must_sync: true,
+            ops: vec![
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"other/2".to_vec(), value: vec![], expires_at: 0 },
+            ],
+        })
+        .to_vec();
+        assert!(matches!(
+            check_layer_a(MSG_BATCH_PUT, &bad, &inner),
+            Some((StatusCode::NamespaceUnknown, _))
+        ));
+    }
+
+    #[test]
+    fn layer_a_does_not_gate_delete_get_or_range() {
+        // Layer-A is put-class only. A delete/get/range of an unregistered key
+        // is NOT a Layer-A concern (reads/deletes are Layer-B's job).
+        let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
+        let del = rkyv_encode(&DeleteReq {
+            part_id: 1,
+            key: b"scratch/x".to_vec(),
+            region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
+        })
+        .to_vec();
+        assert!(check_layer_a(MSG_DELETE, &del, &inner).is_none());
+        let get = rkyv_encode(&GetReq {
+            part_id: 1,
+            key: b"scratch/x".to_vec(),
+            offset: 0,
+            length: 0,
+            region_epoch: 0,
+        })
+        .to_vec();
+        assert!(check_layer_a(MSG_GET, &get, &inner).is_none());
+    }
+
+    #[test]
+    fn layer_a_enabled_tracks_namespace_list() {
+        let st = AuthzState::new();
+        assert!(!st.layer_a_enabled());
+        // Install a config WITH namespaces but no signing key → Layer-A on,
+        // Layer-B off (dev cluster gets Layer-A token-free).
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: false,
+            public_keys: vec![],
+            protected_prefixes: vec![],
+            namespaces: vec![b"kvc/".to_vec()],
+            token_ttl_secs: 0,
+            clock_skew_secs: 0,
+            cluster_id: String::new(),
+        });
+        assert!(st.layer_a_enabled(), "non-empty registry → Layer-A on");
+        assert!(!st.is_enabled(), "no signing key → Layer-B off");
+        assert!(st.gate_active());
+        // Empty registry → Layer-A off (cold PS doesn't brick writes).
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: false,
+            public_keys: vec![],
+            protected_prefixes: vec![],
+            namespaces: vec![],
+            token_ttl_secs: 0,
+            clock_skew_secs: 0,
+            cluster_id: String::new(),
+        });
+        assert!(!st.layer_a_enabled());
+        assert!(!st.gate_active());
     }
 }

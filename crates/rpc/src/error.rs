@@ -19,6 +19,16 @@ pub enum StatusCode {
     /// client can't blind-retry-amplify a denied key as if it were absent.
     /// Appended (discriminant 7) so all prior codes stay wire-stable.
     PermissionDenied = 7,
+    /// F-KEY-NS D7 Layer-A: a put-class write whose key falls in NO registered
+    /// namespace prefix (the namespace does not exist). Distinct from NotFound
+    /// (which is a read-miss on an existing keyspace) so the client can treat it
+    /// as TERMINAL on the write path — refreshing routing can't create the
+    /// namespace, same class as `PermissionDenied`. Appended (discriminant 8) so
+    /// all prior codes stay wire-stable. NOTE: `error.rs` is intentionally NOT in
+    /// the WIRE fingerprint (build.rs hashes only manager_rpc/partition_rpc/frame/
+    /// extent_rpc/cap_token), so this addition keeps fp `76e8ba557f7fca2d`;
+    /// same-commit stop-world deploy makes the new value safe.
+    NamespaceUnknown = 8,
 }
 
 impl StatusCode {
@@ -32,6 +42,7 @@ impl StatusCode {
             5 => Self::Unavailable,
             6 => Self::AlreadyExists,
             7 => Self::PermissionDenied,
+            8 => Self::NamespaceUnknown,
             _ => Self::Internal,
         }
     }

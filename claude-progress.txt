@@ -1,3 +1,38 @@
+Date: 2026-07-18
+TaskStatus: completed
+Task scope: F-KEY-NS SD-2 = D7 client binding + PS Layer-A + kvc/mem key changes,
+  改为 **Prepend-only**（用户拍板："转全 Prepend，天然锁 scope"）。
+Done:
+  - client `NamespaceBinding` Prepend-only：Scoped 永远 prepend `{ns}/{tenant}/`
+    （scope 构造锁死，删掉 Assert/BindMode/chunk helper）；Raw 给 admin/connect_raw；
+    `bind_key` infallible；range clamp（`{ns}/{tenant}0` 上界 + strip）；connect 段
+    校验 ns/tenant `[a-z0-9._-]+`（P2）。
+  - built-in builder 改**相对 key**：memory `keys.rs`（agent_prefix/shared_prefix 去
+    `mem/{tenant}/`，`_tenant` 参数暂留 vestigial）、kvc `_keys.py`（full_key/pool_prefix
+    去 `kvc/{tenant}/`）、hermes `_agent_prefix`（去 `mem/{tenant}/`）。binding 拥有前缀。
+  - PS Layer-A gate（put/put-zc/batch 必须落已注册 namespace，delete/get/range 不 gate，
+    token-free，registry 非空即开）；`namespace-list` 富列表（sanctioned wire v25 fp
+    刷新 `6bb3e2105b2845db`）；PyO3/CLI 必填 ns/tenant + connect 时 `validate_credential_scope`
+    fail-fast（P2）；principal 改名；perf-check/bench_zc 改 bench/perf scope。
+  - 61 connect 站点迁移（admin/mgr-only/fuse-pre-SD3 → connect_raw；数据面 → connect）。
+Review: coco full-diff 反复 hang GPT-5.5（两次），scoped 审 authz.rs 通过；改用 **fable
+  subagent 深审**（用户指示）—— 验证 core mechanism（bind-once/range clamp/Layer-A/
+  credential 分类/PyO3 错误传播）solid，抓 2 P1 + 1 P2 + 3 P3。coco 3 + fable 6 findings
+  全修：put_stream+Assert（Prepend-only 消解，chunk 走普通 put）、connect_with_credential
+  只在 authz-off 跳过（否则 fail-fast）、PyO3 补 scope 校验、bench_zc 签名、hermes 双前缀、
+  Layer-A live-from-bootstrap 部署文档订正（**SD-2 不可单独部署，必须与 SD-3 同批**：SD-1
+  seed 让 registry 非空 → Layer-A 从 bootstrap 就 live → fuse pre-SD3 raw key 会被拒；
+  测试 memory-mode 不 seed 所以测不到）、Assert 注释清扫（~12 处）、get_many_direct `.expect`、
+  CLI typo。
+Verify: 全 workspace 构建绿（含 examples）；client binding 8 / memory 22 / manager 225 /
+  PS 202 / rpc 48 lib 测试过；2 集成测试过（Layer-A reject + putstream chunk in tenant
+  range）；wire fp v25 `6bb3e2105b2845db`；py_compile 5 个 python 文件干净。
+Next: SD-3（D1 fuse `fs/{tenant}/{volume}/` + per-volume next_inode + schema 戳 +
+  autumnfs 改 scoped + fuse builder 改相对）→ 全批 stop-world cluster reset 部署。
+遗留（非阻塞）：memory keys.rs / hermes 的 vestigial `tenant`/`_tenant` 参数彻底删是机械
+  follow-up；rescope() 未做段校验（admin 控制，低风险）。
+
+---- 上一子交付 ----
 Date: 2026-07-17
 TaskStatus: completed
 Task scope: F-KEY-NS SD-1 = D2 注册表 + 整批 wire 冻结（opus teammate 实现，team-lead+用户 review）。

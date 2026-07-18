@@ -233,11 +233,20 @@ class _AutumnKVStore:
             raise ValueError(
                 "auth_tenant and auth_credential must be passed together"
             )
-        self._auth = (
-            {"tenant": auth_tenant, "credential": auth_credential}
-            if auth_tenant is not None
-            else {}
-        )
+        # F-KEY-NS D7: the KEY tenant — the WIRE key carries a `{tenant}` layer
+        # (`kvc/{tenant}/{model}/…`); the client binds `kvc`/tenant and PREPENDS
+        # `kvc/{tenant}/` (`_keys.py` emits the relative `{model}/…`).
+        # `tenant_suffix` is the per-MODEL instance
+        # (`self._tenant` below, kept for the `tenant` property + logging); the
+        # authz PRINCIPAL == the key tenant by the 1:1 convention, `"default"`
+        # when authz is off.
+        self._key_tenant = auth_tenant or "default"
+        # Every client carries the (namespace, tenant) key scope; authz adds the
+        # (principal, credential) identity when configured (both-or-neither).
+        self._auth = {"namespace": "kvc", "tenant": self._key_tenant}
+        if auth_tenant is not None:
+            self._auth["principal"] = auth_tenant
+            self._auth["credential"] = auth_credential
         self._tenant = tenant_suffix
         # Marker TTL = configured ttl_secs; layer TTL = ttl_secs + grace so the
         # marker always expires first (see _TTL_LAYER_GRACE_SECS). 0 = no expiry.
@@ -298,8 +307,12 @@ class _AutumnKVStore:
         return self._marker_ttl
 
     def _key(self, content_hash: str, layer_name: str) -> bytes:
+        # F-KEY-NS D7: kvc/{key_tenant}/{model}/{pool}/{fmt}/{hash}/{layer}.
         return full_key(
-            self._tenant, f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}", VLLM_POOL_NAME
+            self._key_tenant,
+            self._tenant,
+            f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}",
+            VLLM_POOL_NAME,
         )
 
     def exists(self, content_hash: str, layer_name: str) -> bool:

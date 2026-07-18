@@ -258,10 +258,15 @@ def test_vllm_tenant_keeps_tp_pp_semantics():
 def test_full_key_layout_with_fingerprint():
     cfg = tenant_cfg_from_vllm(fake_vllm_config(FakeModelConfig(**QWEN_32B),
                                                 weights_path="models/qwen32b"))
-    tenant = build_tenant_suffix(cfg, cfg.model_fingerprint)
-    key = full_key(tenant, "v1/deadbeef/model.layers.0", "vllm")
-    assert key.startswith(b"kvc/model-cfg_")
+    model = build_tenant_suffix(cfg, cfg.model_fingerprint)
+    # F-KEY-NS D7 (Prepend-only): full_key is RELATIVE to the client's
+    # kvc/{tenant}/ binding scope — the builder emits {model}/{pool}/{hash} and
+    # the ClusterClient prepends kvc/{tenant}/ (scope locked by construction).
+    key = full_key("acme", model, "v1/deadbeef/model.layers.0", "vllm")
+    assert key.startswith(b"model-cfg_")  # relative: starts at the model segment
     assert key.endswith(b"/vllm/v1/deadbeef/model.layers.0")
+    # No namespace/tenant prefix in the relative key — the binding owns it.
+    assert not key.startswith(b"kvc/")
 
 
 def test_mla_detection_wired_from_use_mla():

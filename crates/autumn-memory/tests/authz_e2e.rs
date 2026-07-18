@@ -45,9 +45,13 @@ fn cross_tenant_isolation() {
         .expect("compio runtime")
         .block_on(async move {
             // ── tenant "acme" (granted mem/acme/) ─────────────────────────
-            let acme = ClusterClient::connect_with_credential(&mgr, "acme", acme_cred)
-                .await
-                .expect("connect acme");
+            // F-KEY-NS D7: this test drives absolute keys across MULTIPLE
+            // prefixes (mem/acme/, mem/other/, scratch/) to exercise PS-side
+            // authz (Layer-B), so it uses a RAW (unclamped) client + credential —
+            // an Assert(mem/acme) binding would clamp it client-side and never
+            // reach the PS. The PS is the authority under test here.
+            let acme = ClusterClient::connect_raw(&mgr).await.expect("connect acme");
+            acme.set_tenant_credential("acme", acme_cred);
 
             // own prefix: write + read back
             acme.put(b"mem/acme/authz-e2e/k1", b"v1")
@@ -70,9 +74,8 @@ fn cross_tenant_isolation() {
                 .expect("non-protected key is ungated");
 
             // ── tenant "other" (granted mem/other/) ───────────────────────
-            let other = ClusterClient::connect_with_credential(&mgr, "other", other_cred)
-                .await
-                .expect("connect other");
+            let other = ClusterClient::connect_raw(&mgr).await.expect("connect other");
+            other.set_tenant_credential("other", other_cred);
             other
                 .put(b"mem/other/authz-e2e/k1", b"w1")
                 .await
@@ -86,7 +89,7 @@ fn cross_tenant_isolation() {
             );
 
             // ── anonymous client (no credential) → denied on protected ────
-            let anon = ClusterClient::connect(&mgr).await.expect("connect anon");
+            let anon = ClusterClient::connect_raw(&mgr).await.expect("connect anon");
             let err = anon.get(b"mem/acme/authz-e2e/k1").await.unwrap_err();
             assert!(
                 is_denied(&err),

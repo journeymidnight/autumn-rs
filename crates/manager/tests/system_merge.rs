@@ -1018,7 +1018,7 @@ fn split_merge_split_with_concurrent_writes() {
         // closes req_rx but not the multiplexed TCP connection that
         // other partitions on the same PS still use).
         let cluster = std::rc::Rc::new(
-            ClusterClient::connect(&mgr_addr.to_string())
+            ClusterClient::connect_raw(&mgr_addr.to_string())
                 .await
                 .expect("ClusterClient::connect"),
         );
@@ -1261,7 +1261,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         compio::time::sleep(Duration::from_millis(2500)).await;
 
         let cluster = std::rc::Rc::new(
-            ClusterClient::connect(&mgr_addr.to_string())
+            ClusterClient::connect_raw(&mgr_addr.to_string())
                 .await
                 .expect("ClusterClient::connect"),
         );

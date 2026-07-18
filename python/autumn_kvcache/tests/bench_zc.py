@@ -31,11 +31,15 @@ PAGE = int(os.environ.get("AUTUMN_BENCH_PAGE_KB", "256")) * 1024
 N_WORKERS = int(os.environ.get("AUTUMN_BENCH_WORKERS", "8"))
 CAP = int(os.environ.get("AUTUMN_BENCH_CAP", "8"))
 ROUNDS = int(os.environ.get("AUTUMN_BENCH_ROUNDS", "5"))
+# F-KEY-NS D7: every client must declare its (namespace, tenant) key scope. The
+# bench writes into its OWN `bench/` namespace so it never touches fs/kvc/mem.
+NAMESPACE = os.environ.get("AUTUMN_BENCH_NAMESPACE", "bench")
+TENANT = os.environ.get("AUTUMN_BENCH_TENANT", "perf")
 
 
 def run():
     # ZC is auto-derived from the transport (set below). bc.zc() reports it.
-    bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP)
+    bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP, namespace=NAMESPACE, tenant=TENANT)
     # One contiguous pool; per-page views (zero-copy numpy slices).
     pool = np.zeros(N_PAGES * PAGE, dtype=np.uint8)
     for i in range(N_PAGES):

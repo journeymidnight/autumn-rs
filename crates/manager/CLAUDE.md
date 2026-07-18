@@ -2348,3 +2348,10 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     (pure helpers) + `tests/namespace_registry_etcd.rs` (`#[ignore]`, etcd
     replay + bootstrap-persist). Cross-ref: F-AUTHZ-1 (`tenantAccount/` template),
     note 42 (F-FS-UNIFY `AllocInodesReq`, extended here), note 15 (F149 fence).
+    **SD-2 addendum**: `MSG_NAMESPACE_LIST` (0x59) + `handle_namespace_list`
+    (leader-gated, read-only) returns the RICH registry rows (`NamespaceListResp
+    { namespaces: Vec<MgrNamespace> }`, sorted by name) for `autumn-op
+    namespace-list`. The 5 s `GET_AUTHZ_CONFIG` poll stays LEAN (prefixes only,
+    for Layer-A); the rich data rides this dedicated low-frequency RPC. This was a
+    sanctioned in-place v25 wire refinement (fp `76e8ba…` → `6bb3e2105b2845db`, NO
+    version bump — same-commit deploy).

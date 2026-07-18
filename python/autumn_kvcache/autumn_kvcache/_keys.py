@@ -93,15 +93,27 @@ def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     return "_".join(parts)
 
 
-def full_key(tenant_suffix: str, content_hash: str, pool: str) -> bytes:
-    """Compose the stored partition key (utf-8 bytes)."""
-    return f"{KEY_NAMESPACE}/{tenant_suffix}/{pool}/{content_hash}".encode("utf-8")
+def full_key(_tenant: str, model: str, content_hash: str, pool: str) -> bytes:
+    """Compose the stored partition key (utf-8 bytes), RELATIVE to the client's
+    ``kvc/{tenant}/`` binding scope.
+
+    F-KEY-NS D7 (Prepend-only): the ``BatchClient`` is bound to
+    ``(namespace="kvc", tenant)`` and PREPENDS ``kvc/{tenant}/`` itself, so scope
+    is locked by construction and the builder must emit only the RELATIVE part →
+    ``{model}/{pool}/{content_hash}`` (the full wire key becomes
+    ``kvc/{tenant}/{model}/{pool}/{content_hash}``). ``model`` is the per-model
+    instance suffix (arch + weights fingerprint + tp/pp — what
+    ``build_tenant_suffix`` returns). ``_tenant`` is now owned by the binding and
+    ignored here (kept on the signature only so callers don't churn).
+    """
+    return f"{model}/{pool}/{content_hash}".encode("utf-8")
 
 
-def pool_prefix(tenant_suffix: str, pool: str) -> bytes:
-    """Prefix covering one tenant's keys within a single pool.
+def pool_prefix(_tenant: str, model: str, pool: str) -> bytes:
+    """Prefix covering one model's keys within a single pool, RELATIVE to
+    ``kvc/{tenant}/`` (see `full_key`).
 
     `AutumnKVCacheStorage.clear()` (sglang) must use this so a debug clear of
-    the `kv` pool does not also wipe a co-tenant's `vllm` pool.
+    the `kv` pool does not also wipe the same model's `vllm` pool.
     """
-    return f"{KEY_NAMESPACE}/{tenant_suffix}/{pool}/".encode("utf-8")
+    return f"{model}/{pool}/".encode("utf-8")

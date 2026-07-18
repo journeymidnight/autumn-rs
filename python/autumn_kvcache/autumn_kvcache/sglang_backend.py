@@ -174,12 +174,18 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             raise ValueError(
                 "extra_config: auth_tenant and auth_credential_file must be set together"
             )
-        auth: dict = {}
+        # F-KEY-NS D7: the KEY tenant. The WIRE key carries a `{tenant}` layer
+        # (`kvc/{tenant}/{model}/…`); the client binds `kvc`/tenant and PREPENDS
+        # `kvc/{tenant}/` (`_keys.py` emits the relative `{model}/…`). By the 1:1
+        # convention the authz PRINCIPAL == the key tenant; when authz is off the
+        # deployment default is `"default"`.
+        self._key_tenant = auth_tenant or "default"
+        # Every client carries the (namespace, tenant) key scope; authz adds the
+        # (principal, credential) identity when configured (both-or-neither).
+        auth: dict = {"namespace": "kvc", "tenant": self._key_tenant}
         if auth_cred_file:
-            auth = {
-                "tenant": auth_tenant,
-                "credential": _read_credential_file(auth_cred_file),
-            }
+            auth["principal"] = auth_tenant
+            auth["credential"] = _read_credential_file(auth_cred_file)
         self._batch = autumn.BatchClient(
             endpoint, n_workers, max(1, self._max_inflight), **auth
         )
@@ -213,7 +219,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._mem_pool_host = mem_pool_host
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
-        return full_key(self._tenant_suffix, hash_str, pool_name)
+        return full_key(self._key_tenant, self._tenant_suffix, hash_str, pool_name)
 
     def _page_view(self, idx: int):
         """Resolve a host_index to a buffer-protocol view of the pinned page.
@@ -354,7 +360,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def clear(self) -> None:
         # Pool-scoped: must NOT cross into a co-tenant's vLLM (`vllm`) pool.
-        prefix = pool_prefix(self._tenant_suffix, DEFAULT_POOL_NAME)
+        prefix = pool_prefix(self._key_tenant, self._tenant_suffix, DEFAULT_POOL_NAME)
         try:
             n = run(lambda: self._client.batch_delete(prefix))
             log.info("AutumnKVCacheStorage.clear deleted %d keys under %r", n, prefix)

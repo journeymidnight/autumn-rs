@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{
-    rkyv_decode, rkyv_encode, GetAuthzConfigResp, NamespaceCreateReq, NamespaceCreateResp, CODE_OK,
-    MSG_GET_AUTHZ_CONFIG, MSG_NAMESPACE_CREATE,
+    rkyv_decode, rkyv_encode, GetAuthzConfigResp, NamespaceCreateReq, NamespaceCreateResp,
+    NamespaceListResp, CODE_OK, MSG_GET_AUTHZ_CONFIG, MSG_NAMESPACE_CREATE, MSG_NAMESPACE_LIST,
 };
 
 use support::{pick_addr, start_etcd};
@@ -82,6 +82,14 @@ async fn authz_config(mgr: &RpcClient) -> GetAuthzConfigResp {
         .await
         .expect("get_authz_config rpc");
     rkyv_decode(&resp).expect("decode GetAuthzConfigResp")
+}
+
+async fn namespace_list(mgr: &RpcClient) -> NamespaceListResp {
+    let resp = mgr
+        .call(MSG_NAMESPACE_LIST, bytes::Bytes::new())
+        .await
+        .expect("namespace_list rpc");
+    rkyv_decode(&resp).expect("decode NamespaceListResp")
 }
 
 #[test]
@@ -166,5 +174,16 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
         // Re-creating bench on the successor is rejected (replay saw it).
         let dup = ns_create(&mgr2, "bench", Some("acme")).await;
         assert_ne!(dup.code, CODE_OK, "duplicate create should fail after replay");
+
+        // MSG_NAMESPACE_LIST over the wire: the promoted leader returns the rich
+        // registry (rehydrated from etcd), with bench's owner carried through.
+        let listed = namespace_list(&mgr2).await;
+        assert_eq!(listed.code, CODE_OK);
+        let names: Vec<&str> = listed.namespaces.iter().map(|n| n.name.as_str()).collect();
+        for want in ["fs", "kvc", "mem", "bench"] {
+            assert!(names.contains(&want), "namespace-list missing {want}");
+        }
+        let bench = listed.namespaces.iter().find(|n| n.name == "bench").unwrap();
+        assert_eq!(bench.owner_tenant.as_deref(), Some("acme"));
     });
 }
