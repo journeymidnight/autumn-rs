@@ -64,6 +64,14 @@ spec:
             # the explicit member list (see docs/k8s_deploy.md).
             - --initial-cluster=$(POD_NAME)=http://$(POD_IP):2380
             - --initial-cluster-state=new
+            # A partition SPLIT commits one atomic txn whose op count scales with
+            # the partition's extent count (CoW refs++ per shared extent, plus the
+            # stream/partition/region rewrites). etcd's default --max-txn-ops=128
+            # therefore caps a splittable partition at only ~40 extents — hit live
+            # 2026-07-19: a partition merged down from 32 (127 extents) refused
+            # EVERY split with `etcdserver: too many operations in txn request`,
+            # which surfaces as a confusing `precondition failed` on presplit.
+            - --max-txn-ops=1024
           env:
             - name: POD_NAME
               valueFrom:
