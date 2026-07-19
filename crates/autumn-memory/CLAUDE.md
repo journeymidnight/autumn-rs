@@ -68,6 +68,13 @@ rkyv, …); the core never imposes one.
 
 ## Key schema (`keys.rs`, plan §6)
 
+> **TENANT-FIRST (2026-07-19):** the WIRE key is now `{tenant}/mem/{agent}/…`
+> (the client `NamespaceBinding` prepends `{tenant}/mem/`, tenant OUTER — see
+> [[project_key_order_tenant_first]]). `keys.rs` is UNCHANGED: it still emits keys
+> RELATIVE to the binding prefix (starting at `{agent}/…`); only the assembled
+> wire prefix flipped. The `mem/{tenant}/{agent}/…` forms below show the OLD wire
+> order — read them as `{tenant}/mem/{agent}/…` on the wire today.
+
 ```text
 mem/{tenant}/{agent}/ep/{session}/{12-byte suffix}   episodic
 mem/{tenant}/{agent}/fact/{namespace}/{key}          fact

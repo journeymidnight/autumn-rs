@@ -8,7 +8,7 @@
 //!    NOT Layer-A gated.
 //! 2. **put-stream chunk-in-tenant-range** (`putstream_chunks_land_in_tenant_range`):
 //!    a Prepend-bound client's F186 striped chunk keys land INSIDE
-//!    `[{ns}/{tenant}/, {ns}/{tenant}0)`, not in a global `\xff\xfe…` space.
+//!    `[{tenant}/{ns}/, {tenant}/{ns}0)`, not in a global `\xff\xfe…` space.
 //!
 //! Both need EN binaries + a real PS, so they are `#[ignore]` (run explicitly),
 //! mirroring `system_putstream.rs`.
@@ -84,8 +84,9 @@ fn layer_a_rejects_unregistered_namespace_put() {
         start_partition_server(130, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(1800)).await;
 
-        // Scoped client on the registered `bench` namespace (Prepend): a put of
-        // `k1` → wire `bench/perf/k1` → under `bench/` → ADMITTED.
+        // TENANT-FIRST: scoped client `("bench","perf")` prepends `perf/bench/`.
+        // A put of `k1` → wire `perf/bench/k1` → 2nd segment `bench/` registered →
+        // ADMITTED.
         let scoped = ClusterClient::connect(&mgr_addr.to_string(), "bench", "perf")
             .await
             .expect("scoped connect");
@@ -93,28 +94,28 @@ fn layer_a_rejects_unregistered_namespace_put() {
         scoped.put(b"k1", b"v1").await.expect("put in registered ns");
         assert_eq!(scoped.get(b"k1").await.unwrap().as_deref(), Some(&b"v1"[..]));
 
-        // RAW (anonymous, no client clamp) put of an ABSOLUTE key under an
-        // UNregistered prefix → Layer-A rejects with NamespaceUnknown. Anonymous
-        // connection is checked too (Layer-A is token-free).
+        // RAW (anonymous, no client clamp) put of an ABSOLUTE key whose 2nd
+        // segment is an UNregistered namespace → Layer-A rejects with
+        // NamespaceUnknown. Anonymous connection is checked too (token-free).
         let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
             .await
             .expect("raw connect");
         raw.set_rpc_timeout(Duration::from_secs(15));
-        let err = raw.put(b"zzz/x", b"nope").await.unwrap_err();
+        let err = raw.put(b"perf/unreg/x", b"nope").await.unwrap_err();
         assert!(
             matches!(err, AutumnError::NamespaceUnknown(_)),
             "put to unregistered namespace must be NamespaceUnknown, got {err:?}"
         );
 
-        // A put UNDER the registered prefix via the raw client is admitted (the
-        // key is absolute + in-namespace).
-        raw.put(b"bench/perf/raw-ok", b"ok")
+        // A put whose 2nd segment IS registered (`{tenant}/bench/…`) via the raw
+        // client is admitted.
+        raw.put(b"perf/bench/raw-ok", b"ok")
             .await
             .expect("raw put under registered ns");
 
-        // DELETE under an unregistered prefix is NOT Layer-A gated (Layer-A is
-        // put-class only) → succeeds (delete of an absent key is OK).
-        raw.delete(b"zzz/x")
+        // DELETE is NOT Layer-A gated (Layer-A is put-class only) → succeeds
+        // (delete of an absent key is OK).
+        raw.delete(b"perf/unreg/x")
             .await
             .expect("delete under unregistered ns is not Layer-A gated");
     });
@@ -141,22 +142,22 @@ fn putstream_chunks_land_in_tenant_range() {
         start_partition_server(140, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(1800)).await;
 
-        // Prepend-bound client on `bench/perf/`.
+        // Prepend-bound client on `perf/bench/`.
         let scoped = ClusterClient::connect(&mgr_addr.to_string(), "bench", "perf")
             .await
             .expect("scoped connect");
         scoped.set_rpc_timeout(Duration::from_secs(20));
 
         // Stripe-put a large value → chunks go through the leaf `put`, so each
-        // chunk key `\xff\xfe…++bigfile` is prefixed ONCE with `bench/perf/`.
+        // chunk key `\xff\xfe…++bigfile` is prefixed ONCE with `perf/bench/`.
         let value = vec![7u8; 3 * 1024 * 1024]; // 3 MiB → multiple chunks
         let mut h = scoped.put_stream_begin(b"bigfile", 0).with_chunk_size(1024 * 1024);
         h.send(&value).await.expect("send");
         h.commit().await.expect("commit");
 
-        // A tenant-scoped range scan (empty prefix → the whole `bench/perf/`)
+        // A tenant-scoped range scan (empty prefix → the whole `perf/bench/`)
         // sees BOTH the meta key and the striped chunk keys — proving the chunks
-        // landed inside the tenant range. The binding strips `bench/perf/`, so
+        // landed inside the tenant range. The binding strips `perf/bench/`, so
         // the chunk keys come back starting with the `\xff\xfe` chunk prefix.
         let scan = scoped.range(b"", b"", 10_000).await.expect("scoped range");
         let has_meta = scan.entries.iter().any(|e| e.key == b"bigfile");
@@ -170,10 +171,10 @@ fn putstream_chunks_land_in_tenant_range() {
             "striped chunk keys (\\xff\\xfe…) must be in the tenant range"
         );
 
-        // On the WIRE the chunk keys are `bench/perf/\xff\xfe…` — verify via a raw
+        // On the WIRE the chunk keys are `perf/bench/\xff\xfe…` — verify via a raw
         // client that scanning the GLOBAL `\xff\xfe` space finds NOTHING (the
         // chunks are NOT in a global stripe namespace), while scanning the
-        // `bench/perf/` prefix DOES find them.
+        // `perf/bench/` prefix DOES find them.
         let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
             .await
             .expect("raw connect");
@@ -185,15 +186,15 @@ fn putstream_chunks_land_in_tenant_range() {
             global.entries.len()
         );
         let in_tenant = raw
-            .range(b"bench/perf/", b"bench/perf/", 10_000)
+            .range(b"perf/bench/", b"perf/bench/", 10_000)
             .await
             .expect("raw tenant range");
         assert!(
             in_tenant
                 .entries
                 .iter()
-                .any(|e| e.key.starts_with(b"bench/perf/\xff\xfe")),
-            "chunk keys must be under `bench/perf/\\xff\\xfe…` on the wire"
+                .any(|e| e.key.starts_with(b"perf/bench/\xff\xfe")),
+            "chunk keys must be under `perf/bench/\\xff\\xfe…` on the wire"
         );
     });
 }

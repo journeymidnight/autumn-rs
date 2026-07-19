@@ -50,10 +50,11 @@ echo "[authz-e2e] signing key: $(cat "$WORK/signing.key" | cut -c1-8)…"
 #    production form cluster.sh uses — secrets never on argv).
 printf '%s' "$ADMIN_TOKEN" >"$WORK/admin.token"
 echo "[authz-e2e] manager (authz-enabled) on $MGR"
+# TENANT-FIRST + PROTECT-EVERYTHING: the signing key alone arms authz for EVERY
+# tenant-scoped write; no --auth-protected-prefix.
 "$BIN/autumn-manager-server" --port "$((PB + 1))" --listen 127.0.0.1 \
   --auth-signing-key-file "$WORK/signing.key" \
   --admin-token-file "$WORK/admin.token" \
-  --auth-protected-prefix "mem/" \
   >"$WORK/mgr.log" 2>&1 &
 PIDS+=($!); wait_port "$((PB + 1))" 20 || { echo "[authz-e2e] FAIL manager"; tail -8 "$WORK/mgr.log"; exit 1; }
 
@@ -81,8 +82,8 @@ create_tenant() { # $1 = tenant, $2 = prefix
   "$BIN/autumn-op" --manager "$MGR" tenant-create --tenant "$1" --prefix "$2" --admin-token "$ADMIN_TOKEN" 2>/dev/null \
     | awk '/^credential:/{print $2}'
 }
-ACME_CRED="$(create_tenant acme mem/acme/)"
-OTHER_CRED="$(create_tenant other mem/other/)"
+ACME_CRED="$(create_tenant acme acme/)"
+OTHER_CRED="$(create_tenant other other/)"
 [ -n "$ACME_CRED" ] && [ -n "$OTHER_CRED" ] || { echo "[authz-e2e] FAIL tenant-create (empty cred)"; tail -20 "$WORK/mgr.log"; exit 1; }
 echo "[authz-e2e] tenants created (acme=${ACME_CRED:0:8}… other=${OTHER_CRED:0:8}…)"
 

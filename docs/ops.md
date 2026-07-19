@@ -1476,12 +1476,12 @@ off), prefix-enforcement last (step 5).
 # 1. one-time: signing key (KEEP SAFE; k8s: put it in a Secret)
 autumn-op gen-signing-key > /secrets/autumn-auth-signing.key
 
-# 2. create the memory tenant, granting its mem/ prefix. tenant-create prints
-#    `credential: <hex>` (the credential is a LOWERCASE HEX string, shown ONCE).
-#    The credential FILE the clients read must contain that hex — extract just
-#    the hex, do NOT dump the whole multi-line stdout:
+# 2. create the tenant. TENANT-FIRST: grant the whole tenant `hermes/` (or scope
+#    to one namespace, e.g. `hermes/mem/`). tenant-create prints `credential:
+#    <hex>` (LOWERCASE HEX, shown ONCE). The credential FILE the clients read must
+#    contain that hex — extract just the hex, do NOT dump the whole multi-line stdout:
 autumn-op --manager $M tenant-create --tenant hermes \
-    --prefix "mem/default/" --admin-token-file /secrets/admin.token \
+    --prefix "hermes/mem/" --admin-token-file /secrets/admin.token \
   | awk '/^credential:/{print $2}' > /secrets/hermes-tenant.cred
 #    (the client-side reader also tolerates the full `credential: <hex>` line,
 #    but a bare-hex file is the contract; NEVER the raw stdout with the
@@ -1492,18 +1492,18 @@ autumn-op --manager $M tenant-create --tenant hermes \
 #    AUTUMN_MEMORY_CREDENTIAL_FILE=/secrets/hermes-tenant.cred
 #    (harmless while authz is off — credential is simply unused)
 
-# 4. verify mint works BEFORE enforcing (AUTH_HELLO on a non-protected
-#    prefix is a no-op, so this is safe):
+# 4. verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
+#    whether the PS is enforcing yet — safe to run while authz is off):
 autumn-op --manager $M mint-token --tenant hermes \
     --credential-file /secrets/hermes-tenant.cred   # must print a token
 
 # 5. ARM: manager gets --auth-signing-key-file (or env
-#    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint) — mem/ is the DEFAULT
-#    protected prefix, no --auth-protected-prefix needed for mem/-only.
-#    Restart manager; PS picks it up via 5s authz-config poll.
+#    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
+#    key alone arms enforcement of EVERY tenant-scoped write — there is no
+#    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
 
-# 6. verify enforcement: a credential-less write into mem/ must fail
-autumn-client --manager $M put "mem/default/x" /tmp/f   # expect PermissionDenied
+# 6. verify enforcement: a credential-less write must fail
+autumn-client --manager $M --namespace mem --tenant default put x /tmp/f  # expect PermissionDenied
 # hermes mem round-trip must still pass (it now carries the credential)
 ```
 

@@ -1,18 +1,20 @@
 //! F-AUTHZ-1 cross-tenant end-to-end test against a LIVE authz-enabled cluster.
 //!
 //! `#[ignore]` — driven by `tests/run_authz_e2e.sh`, which brings up an isolated
-//! authz-enabled cluster (manager with a signing key + protected `mem/`), creates
-//! two tenants, and passes their credentials in via env:
+//! authz-enabled cluster (manager with a signing key; protect-everything),
+//! creates two tenants, and passes their credentials in via env:
 //!
 //! ```bash
 //! bash crates/autumn-memory/tests/run_authz_e2e.sh
 //! ```
 //!
-//! Verifies the FULL wire path — manager mints → client AUTH_HELLOs → PS enforces:
-//!   * a tenant's client reads/writes its own `mem/{tenant}/` prefix,
+//! TENANT-FIRST: keys are `{tenant}/{namespace}/…` and a credential grants the
+//! whole tenant `{tenant}/`. Verifies the FULL wire path — manager mints →
+//! client AUTH_HELLOs → PS enforces:
+//!   * a tenant's client reads/writes its own `{tenant}/mem/` prefix,
 //!   * is DENIED (PermissionDenied) on another tenant's prefix,
-//!   * an anonymous client is denied on any protected `mem/` key,
-//!   * a non-protected key is ungated,
+//!   * an anonymous client is denied on ANY key (protect-everything),
+//!   * a write outside the tenant grant is denied,
 //!   * the MemoryStore credential pass-through works end to end.
 
 use autumn_client::{AutumnError, ClusterClient};
@@ -44,9 +46,9 @@ fn cross_tenant_isolation() {
     compio::runtime::Runtime::new()
         .expect("compio runtime")
         .block_on(async move {
-            // ── tenant "acme" (granted mem/acme/) ─────────────────────────
+            // ── tenant "acme" (granted acme/mem/) ─────────────────────────
             // F-KEY-NS D7: this test drives absolute keys across MULTIPLE
-            // prefixes (mem/acme/, mem/other/, scratch/) to exercise PS-side
+            // prefixes (acme/mem/, other/mem/, scratch/) to exercise PS-side
             // authz (Layer-B), so it uses a RAW (unclamped) client + credential —
             // an Assert(mem/acme) binding would clamp it client-side and never
             // reach the PS. The PS is the authority under test here.
@@ -54,43 +56,44 @@ fn cross_tenant_isolation() {
             acme.set_tenant_credential("acme", acme_cred);
 
             // own prefix: write + read back
-            acme.put(b"mem/acme/authz-e2e/k1", b"v1")
+            acme.put(b"acme/mem/authz-e2e/k1", b"v1")
                 .await
                 .expect("acme writes its own prefix");
             assert_eq!(
-                acme.get(b"mem/acme/authz-e2e/k1").await.expect("acme get"),
+                acme.get(b"acme/mem/authz-e2e/k1").await.expect("acme get"),
                 Some(b"v1".to_vec()),
             );
 
             // cross-tenant prefix: DENIED (read + write)
-            let err = acme.get(b"mem/other/authz-e2e/k1").await.unwrap_err();
+            let err = acme.get(b"other/mem/authz-e2e/k1").await.unwrap_err();
             assert!(is_denied(&err), "cross-tenant GET must be denied, got {err:?}");
-            let err = acme.put(b"mem/other/authz-e2e/k1", b"x").await.unwrap_err();
+            let err = acme.put(b"other/mem/authz-e2e/k1", b"x").await.unwrap_err();
             assert!(is_denied(&err), "cross-tenant PUT must be denied, got {err:?}");
 
-            // non-protected namespace (outside mem/): ungated → allowed
-            acme.put(b"scratch/authz-e2e/k", b"ok")
-                .await
-                .expect("non-protected key is ungated");
+            // PROTECT-EVERYTHING: a DIFFERENT tenant's prefix (even a "scratch"
+            // one) is DENIED — acme's credential grants only `acme/`. There are
+            // no ungated keys anymore.
+            let err = acme.put(b"scratch/authz-e2e/k", b"nope").await.unwrap_err();
+            assert!(is_denied(&err), "write outside the tenant grant must be denied, got {err:?}");
 
-            // ── tenant "other" (granted mem/other/) ───────────────────────
+            // ── tenant "other" (granted other/mem/) ───────────────────────
             let other = ClusterClient::connect_raw(&mgr).await.expect("connect other");
             other.set_tenant_credential("other", other_cred);
             other
-                .put(b"mem/other/authz-e2e/k1", b"w1")
+                .put(b"other/mem/authz-e2e/k1", b"w1")
                 .await
                 .expect("other writes its own prefix");
-            let err = other.get(b"mem/acme/authz-e2e/k1").await.unwrap_err();
+            let err = other.get(b"acme/mem/authz-e2e/k1").await.unwrap_err();
             assert!(is_denied(&err), "other reading acme must be denied, got {err:?}");
             // acme's key is intact + isolated (other couldn't touch it)
             assert_eq!(
-                acme.get(b"mem/acme/authz-e2e/k1").await.expect("acme get 2"),
+                acme.get(b"acme/mem/authz-e2e/k1").await.expect("acme get 2"),
                 Some(b"v1".to_vec()),
             );
 
             // ── anonymous client (no credential) → denied on protected ────
             let anon = ClusterClient::connect_raw(&mgr).await.expect("connect anon");
-            let err = anon.get(b"mem/acme/authz-e2e/k1").await.unwrap_err();
+            let err = anon.get(b"acme/mem/authz-e2e/k1").await.unwrap_err();
             assert!(
                 is_denied(&err),
                 "anonymous GET on protected prefix must be denied, got {err:?}"
@@ -108,12 +111,12 @@ fn cross_tenant_isolation() {
             store
                 .put_fact("ns", "greeting", b"hello", None)
                 .await
-                .expect("put_fact under mem/acme/");
+                .expect("put_fact under acme/mem/");
             assert_eq!(
                 store.get_fact("ns", "greeting").await.expect("get_fact"),
                 Some(b"hello".to_vec()),
             );
 
-            println!("AUTHZ E2E OK: cross-tenant isolation + anon deny + ungated + MemoryStore pass-through");
+            println!("AUTHZ E2E OK: cross-tenant isolation + anon deny + protect-everything + MemoryStore pass-through");
         });
 }
