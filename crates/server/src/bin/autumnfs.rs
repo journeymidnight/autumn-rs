@@ -666,9 +666,18 @@ async fn cmd_get(cluster: &ClusterClient, remote: &str, local: &PathBuf) -> Resu
 /// concurrently (grouped by owning partition, ZC for the ≥ 64 KiB extents —
 /// every 8 MiB extent qualifies), so a multi-GiB upload streams at the
 /// cluster's write bandwidth instead of one serial round-trip per extent, while
-/// RAM stays bounded to `PUT_WINDOW_EXTENTS * MAX_EXTENT` (64 MiB) rather than
-/// the whole file. Mirrors the fuse mount's `WRITE_BUF_EXTENTS` (8).
-const PUT_WINDOW_EXTENTS: usize = 8;
+/// RAM stays bounded to `PUT_WINDOW_EXTENTS * MAX_EXTENT` (128 MiB) rather than
+/// the whole file.
+///
+/// F-FS-STRIPE (A): 16, not 8. A STRIPED file's window spans N lane partitions,
+/// so a deeper window = more in-flight puts PER LANE = more cross-lane
+/// parallelism. Measured (3-disk / 4-PS, striped×4 2 GiB): window 8→16 lifts
+/// 305→344 MB/s (~13%), plateauing by 16 (32/64 ≈ 335/347). Non-striped is
+/// unchanged (single partition/connection saturates regardless). Full
+/// single-file scaling to the cluster ceiling needs a continuous pipeline
+/// (overlap the source read with in-flight puts) + more connections per lane —
+/// deferred; the rig here is EN-CPU-bound (~443 MB/s aggregate) so it can't show it.
+const PUT_WINDOW_EXTENTS: usize = 16;
 
 /// Read up to `cap` bytes, looping until the buffer is full or EOF. A returned
 /// length < `cap` therefore reliably means EOF — a bare `Read::read` may return
