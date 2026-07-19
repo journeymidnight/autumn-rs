@@ -133,7 +133,11 @@ class AutumnModelLoader(BaseModelLoader):
         # fails at startup, not as a PermissionDenied mid weight-load.
         cred_file = cfg.get("credential_file")
         self.credential = _read_credential_file(cred_file) if cred_file else None
-        self.principal = cfg.get("principal") if self.credential else None
+        # `principal` defaults to the tenant (the 1:1 principal↔tenant convention
+        # the native clients use for --principal). Without this default a config
+        # that sets only `credential_file` would pass credential-without-principal
+        # and trip `Fs.connect`'s both-or-neither check at startup.
+        self.principal = (cfg.get("principal") or self.tenant) if self.credential else None
         transport = cfg.get("transport")
         if transport:
             # Process-global; must precede the first connect (this loader is the
