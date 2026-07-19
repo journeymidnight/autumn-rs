@@ -14,6 +14,20 @@
 
 ## Active
 
+### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
+- **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
+- **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。
+  - **rpc**: `autumn_rpc::is_admin_mgr_msg(u8)` = { MSG_FENCE_NODE 0x3F / REMOVE_NODE 0x42 / SET_NODE_MAINTENANCE 0x40 / CLEAR_NODE_OVERRIDE 0x41 / BUMP_CLUSTER_VERSION 0x4B / UPDATE_STREAM_EC 0x32 / FORCE_EC_CONVERT 0x39 / CREATE_STREAM 0x23 / UPSERT_PARTITION 0x2D / REGISTER_NODE 0x22 / MERGE_PARTITIONS 0x37 }；`is_admin_ps_msg(u8)` = { MSG_SPLIT_PART / MSG_MAINTENANCE }（PS 空间,与 manager 空间分开判）。+ prefix/strip codec helper。
+  - **client** (`ClusterClient`): `admin_token: RefCell<Option<Vec<u8>>>` + `set_admin_token`；`mgr_call`/`mgr_call_leader`/`mgr_call_retry` 在 `is_admin_mgr_msg && token` 时前缀；`ps_call` 在 `is_admin_ps_msg && token` 时前缀。
+  - **manager** (`rpc_handlers::dispatch` @199): `is_admin_mgr_msg(mt) && self.admin_token.is_some()` → 切前缀 `ct_eq_secret` 比对，不符回 CODE_PRECONDITION，符则把剩余 payload 交原 handler。
+  - **PS**: PS 需持有 admin token —— `GetAuthzConfigResp` 加 `admin_token` 字段（**wire 改动 → fingerprint bump**），PS `authz_config_poll_loop` 缓存进 `AuthzState`；PS frame dispatch 在 `is_admin_ps_msg` 时同样切前缀校验（authz gate 旁）。
+  - **autumn-op**: 全局 `--admin-token-file`（复用 `read_secret_file`）→ 一 connect 就 `client.set_admin_token`（只读命令不受影响,server 只查 admin msg）。
+  - **cluster.sh**: admin.token 已生成分发；把打印的 `AO=(...)` 提示带上 `--admin-token-file $DATA_ROOT/authz/admin.token`。
+  - **opt-in**: manager 没配 admin token → 全跳过（dev/test/bench/单测零影响）。namespace/tenant 已有的 `req.admin_token` 字段校验保留（belt-and-suspenders,或后续统一到前缀）。
+  - **落地顺序（安全,分两片）**: ① manager 片（上面 manager+client+autumn-op,覆盖杀节点/force-ec/建stream/版本/merge,manager 已有 token,零 wire 改动）先做先验；② PS 片（split/gc/compact/forcegc + GetAuthzConfigResp 加字段 + PS gate + fingerprint bump）。
+- **Acceptance**: authz 开时,autumn-op fence/remove/split/gc/force-ec/merge/... **不带** `--admin-token-file` → 拒（CODE_PRECONDITION,清晰错误）；**带正确** token → 成功；**带错** token → 拒；只读 info/df/list-nodes **不带** token 仍工作。活集群: fence 一个节点不带 token 失败、带 token 成功;裸 restart（粘性 authz）后仍强制。
+- **Status**: `passes: false` (2026-07-19, 设计+范围已定,择日实现) — cross-ref `docs/admin_auth_design.md` Option A（本条把范围从 Option A 扩到含 split/gc = 部分 Option B,PS 也进鉴权面）。威胁模型仍是可信内网防"流氓/测试客户端跑破坏性命令",不防 MITM(不上 TLS)。
+
 ### F-KEY-NS — 内置应用 key 命名空间 + 分裂规则（design doc 已定稿，实现分四个子项）
 - **Trigger** (2026-07-16, 用户主张 "内置的应用必须有 prefix" + "有内置的应用对应的 split 规则"; 线上实测 fuse 全量落单 partition、kvc+mem 塌缩另一 partition、policy 把 45 GB 承载的 part 17 判成 merge 候选): fuse 是 `mem/keys.rs` 已成文的 "共享 namespace + 保留前缀" 契约的唯一违约者（裸 `0x01`–`0x04`），任何 client 裸 key 可静默损坏文件系统（含伪造 `[0x04]rmtomb/` 墓碑 → mount 时无条件删数据）；同时 policy 的 size 口径 = LSM 常驻字节（`lsm_resident_bytes`，VP 负载缩小 ~60×）→ size 触发的自动分裂永不发生、merge advisory 方向性错误。设计与论证：`docs/key_namespace_split_design.md`。
 - **Scope（子项，按实施顺序）**:
