@@ -66,6 +66,15 @@ pub(crate) const MAX_INTERVAL_SEC: u64 = 86_400;
 pub(crate) const MAX_COOLDOWN_SEC: u64 = 86_400;
 pub(crate) const MAX_ACTIONS_CAP: u32 = 100;
 
+/// Non-configurable floor on how often the auto-policy loop may ACTUATE a
+/// cluster-scoped `rebalance` (coco P1): a policy's `cooldown_sec` can be set to
+/// 0, but rebalance reopens partitions, so it must never fire more than once per
+/// this window regardless of config. Backstops the advisory-side
+/// `rebalance_cooldown_sec` (which gates EMISSION, not re-actuation of a cached
+/// candidate). Deliberately below the 120 s advisory default so it never
+/// over-throttles a legitimately-armed rebalance policy.
+pub(crate) const REBALANCE_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
+
 /// Clamp a (possibly hostile / corrupted) custom policy entry to safe bounds —
 /// applied on every UPSERT and on every replay of a persisted config.
 pub(crate) fn sanitize_entry(e: &mut MgrAutoPolicyEntry) {
@@ -280,7 +289,20 @@ pub(crate) fn decide_actions(
             continue;
         }
         let last = cooldowns.get(&key).copied().unwrap_or(0);
-        if now - last < cooldown_secs {
+        // REBALANCE is cluster-scoped + expensive (each actuation reopens up to
+        // `rebalance_max_moves_per_tick` partitions). Its advisory is emitted at
+        // most once per `rebalance_cooldown_sec`, but that candidate lingers in
+        // `advisory_cache` for a whole `policy_tick` window (~60 s) while THIS
+        // loop ticks every `interval_sec` — so a policy with `cooldown_sec = 0`
+        // would re-actuate the SAME cached candidate every tick → partition
+        // reopen storm (coco P1). Floor rebalance's actuation cooldown at a
+        // NON-CONFIGURABLE minimum so a mis-set `cooldown_sec` can't bypass it.
+        let effective_cooldown = if c.kind == POLICY_KIND_REBALANCE {
+            cooldown_secs.max(REBALANCE_MIN_ACTUATION_COOLDOWN_SEC)
+        } else {
+            cooldown_secs
+        };
+        if now - last < effective_cooldown {
             continue; // still cooling down from a recent actuation
         }
         seen_keys.insert(key.clone());
@@ -514,6 +536,42 @@ mod tests {
         // …but 400 s ago (> cooldown) → allowed.
         cds.insert("gc:2".to_string(), 600i64);
         assert_eq!(decide_actions(&cands, &cds, &enabled, 1000, 300, 5).len(), 1);
+    }
+
+    /// coco P1: a policy with `cooldown_sec = 0` must NOT let the cluster-scoped
+    /// rebalance re-actuate every tick — the non-configurable floor applies.
+    #[test]
+    fn rebalance_actuation_is_floored_despite_zero_cooldown() {
+        let enabled: HashSet<u8> = [POLICY_KIND_REBALANCE].into_iter().collect();
+        let cands = vec![cand(POLICY_KIND_REBALANCE, 0, 0)];
+        let key = cooldown_key(&cands[0]); // "rebalance:cluster"
+
+        // Actuated 10 s ago; policy cooldown_sec=0 alone would NOT suppress, but
+        // the 60 s floor must.
+        let mut cds = HashMap::new();
+        cds.insert(key.clone(), 990i64);
+        assert!(
+            decide_actions(&cands, &cds, &enabled, 1000, 0, 5).is_empty(),
+            "rebalance floored despite cooldown_sec=0"
+        );
+        // Past the floor → allowed.
+        cds.insert(key, 1000 - REBALANCE_MIN_ACTUATION_COOLDOWN_SEC - 1);
+        assert_eq!(
+            decide_actions(&cands, &cds, &enabled, 1000, 0, 5).len(),
+            1,
+            "allowed once past the floor"
+        );
+
+        // A NON-rebalance kind at cooldown_sec=0 is unaffected (no floor).
+        let gc_enabled: HashSet<u8> = [POLICY_KIND_GC].into_iter().collect();
+        let gc = vec![cand(POLICY_KIND_GC, 7, 0)];
+        let mut gcd = HashMap::new();
+        gcd.insert("gc:7".to_string(), 999i64); // 1 s ago
+        assert_eq!(
+            decide_actions(&gc, &gcd, &gc_enabled, 1000, 0, 5).len(),
+            1,
+            "gc is not floored at cooldown_sec=0"
+        );
     }
 
     #[test]

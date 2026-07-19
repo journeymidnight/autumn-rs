@@ -820,7 +820,18 @@ fn validate_action(
             }
         }
         // F-REGION-REBALANCE Phase B: cluster-scoped, takes no typed fields.
-        "rebalance" => {}
+        // REJECT target fields (coco P3) so a caller can't POST
+        // `{"action":"rebalance","part_id":7}` and wrongly believe it scoped the
+        // rebalance to one partition — it always rebalances the whole cluster.
+        "rebalance" => {
+            if part_id != 0 || victim_part_id != 0 || extent_id != 0 || !extent_ids.is_empty() {
+                return Err(
+                    "rebalance is cluster-scoped and takes no target fields \
+                     (part_id / victim_part_id / extent_id / extent_ids)"
+                        .to_string(),
+                );
+            }
+        }
         "" => return Err("missing action".to_string()),
         _ => return Err(format!("action '{action}' not allowed")),
     }

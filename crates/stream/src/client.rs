@@ -81,21 +81,55 @@ impl ManagerError {
             && autumn_common::is_owner_epoch_fence_message(&self.message)
     }
 
+    /// A `CODE_PRECONDITION` that is a TRANSIENT concurrency conflict — the
+    /// manager telling the client to re-pull a fresh snapshot or wait for an
+    /// in-flight op, NOT a deterministic verdict. Coupled (by message, like
+    /// `is_owner_fence`) to the `handle_stream_alloc_extent` producers: the
+    /// F207 inflight-ledger "defer alloc_extent until it completes"
+    /// (rpc_handlers.rs) and the stream-membership / tail-eversion
+    /// verify-at-apply + etcd mirror value-CAS "retry with [a] fresh snapshot"
+    /// (rpc_handlers.rs + lib.rs, manager note 33). These clear within a tick
+    /// or two. The owner fence ("owner_epoch mismatch") and deterministic
+    /// business-rule preconditions ("stream cannot be empty …") contain
+    /// neither marker → they stay fail-fast.
+    fn is_transient_conflict(&self) -> bool {
+        self.code == manager_rpc::CODE_PRECONDITION
+            && (self.message.contains("fresh snapshot")
+                || self.message.contains("until it completes"))
+    }
+
     /// Codes worth another attempt on a rotated / later manager:
     /// - `CODE_NOT_LEADER`: an alive-but-deposed manager answered; the
     ///   rotate (done by `note_manager_code`) walks to the real leader.
     /// - `CODE_ERROR` (`AppError::Internal`): transient manager-side
     ///   failure (etcd mirror hiccup, node-alloc RPC failure, …).
-    /// Everything else — NOT_FOUND / INVALID_ARGUMENT / PRECONDITION
-    /// (incl. the owner fence) / future codes — is a deterministic verdict
-    /// computed from shared etcd state: every manager gives the same
-    /// answer, so retrying only adds latency. Fail fast and let the
-    /// caller's recovery path act.
+    /// - `CODE_PRECONDITION` **only when it is a transient concurrency
+    ///   conflict** (`is_transient_conflict`): the sole `retry_manager_call`
+    ///   user is `alloc_new_extent`, whose self-heal IS the client re-pulling
+    ///   a fresh snapshot / waiting out an in-flight EC/recovery op and
+    ///   retrying (20×500ms). Failing fast on THOSE turns a self-healable
+    ///   conflict into an append/roll/recovery/open failure. (BUG-MGR-RETRY-
+    ///   CLASS's original fix over-generalized fail-fast from the fence to
+    ///   ALL Preconditions, killing this retry — coco P1.)
+    ///
+    /// Fail fast on:
+    /// - the owner-epoch fence Precondition — DETERMINISTIC (every manager
+    ///   consults the same etcd epoch); its Display carries "LockedByOther"
+    ///   so the PS poisons + reopens with a fresh epoch. THIS is the actual
+    ///   BUG-MGR-RETRY-CLASS incident (a permanently-stale epoch that burned
+    ///   20×500ms per write forever).
+    /// - deterministic non-fence Preconditions (e.g. "stream cannot be empty
+    ///   after punch holes"), `NOT_FOUND`, `INVALID_ARGUMENT`, future codes —
+    ///   deterministic verdicts from shared etcd state; retrying only adds
+    ///   latency.
     fn is_retryable(&self) -> bool {
-        matches!(
-            self.code,
-            manager_rpc::CODE_NOT_LEADER | manager_rpc::CODE_ERROR
-        )
+        match self.code {
+            manager_rpc::CODE_NOT_LEADER | manager_rpc::CODE_ERROR => true,
+            // Overloaded code: only the TRANSIENT concurrency conflicts retry;
+            // the deterministic fence + business-rule preconditions fail fast.
+            manager_rpc::CODE_PRECONDITION => self.is_transient_conflict(),
+            _ => false,
+        }
     }
 }
 
@@ -2074,17 +2108,20 @@ impl StreamClient {
                 Err(e) => {
                     // BUG-MGR-RETRY-CLASS: classify BEFORE burning a retry.
                     // A `ManagerError` in the chain means the manager
-                    // ANSWERED; a deterministic code (NotFound /
-                    // InvalidArgument / Precondition — incl. the
-                    // owner-epoch fence) reflects shared etcd state, so
-                    // every rotated manager returns the SAME verdict and
-                    // rotate+retry is pure wasted latency (the live
-                    // incident: 20×500ms per write on a permanently stale
-                    // epoch). Fail fast — returned UNWRAPPED (no
-                    // `.context()`) so the fence Display's "LockedByOther"
-                    // marker stays outermost for the PS's poison-and-reopen
-                    // classifier. Transport errors (no ManagerError) and
-                    // NOT_LEADER / CODE_ERROR keep the retry loop.
+                    // ANSWERED. A DETERMINISTIC verdict (NotFound /
+                    // InvalidArgument / the owner-epoch-fence Precondition)
+                    // reflects shared etcd state, so every rotated manager
+                    // returns the SAME answer and rotate+retry is pure
+                    // wasted latency (the live incident: 20×500ms per write
+                    // on a permanently stale epoch). Fail fast — returned
+                    // UNWRAPPED (no `.context()`) so the fence Display's
+                    // "LockedByOther" marker stays outermost for the PS's
+                    // poison-and-reopen classifier. Transport errors (no
+                    // ManagerError), NOT_LEADER / CODE_ERROR, AND the
+                    // TRANSIENT (non-fence) Preconditions — the "retry with
+                    // fresh snapshot" / "defer until it completes"
+                    // concurrency conflicts — keep the retry loop
+                    // (`is_retryable`).
                     let (retryable, already_rotated) = match e.downcast_ref::<ManagerError>() {
                         Some(me) => (
                             me.is_retryable(),
@@ -6070,6 +6107,74 @@ mod manager_retry_tests {
                 "non-fence code {code} must NOT poison partitions: {err:#}"
             );
         }
+    }
+
+    /// BUG-MGR-RETRY-CLASS regression (coco P1): the TRANSIENT `alloc_extent`
+    /// preconditions — the F207 inflight "defer … until it completes" and the
+    /// verify-at-apply / etcd-CAS "retry with [a] fresh snapshot" — MUST be
+    /// classified retryable, or a self-healable concurrency conflict (a
+    /// concurrent split/recovery/EC) becomes a hard append/roll failure.
+    #[test]
+    fn transient_conflict_preconditions_are_retryable() {
+        let mk = |msg: &str| {
+            ManagerError::new(manager_rpc::CODE_PRECONDITION, "alloc_new_extent", msg)
+        };
+        // The four real manager producers (verbatim marker phrases).
+        for msg in [
+            "extent 42 has in-flight ConvertToEc; defer alloc_extent until it completes",
+            "stream 7 membership changed during alloc_extent; retry with fresh snapshot",
+            "extent 9 eversion changed during alloc_extent (3 -> 4); retry with fresh snapshot",
+            "stream changed concurrently (CAS conflict); retry with a fresh snapshot",
+        ] {
+            let e = mk(msg);
+            assert!(e.is_transient_conflict(), "must be transient: {msg}");
+            assert!(e.is_retryable(), "must retry: {msg}");
+            assert!(!e.is_owner_fence(), "transient conflict is not a fence: {msg}");
+        }
+        // The fence + a deterministic business rule are NOT transient → fail fast.
+        let fence =
+            ManagerError::new(manager_rpc::CODE_PRECONDITION, "stream_alloc_extent", &fence_message());
+        assert!(!fence.is_transient_conflict());
+        assert!(!fence.is_retryable());
+        let biz = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "punch_holes",
+            "precondition failed: stream cannot be empty after punch holes",
+        );
+        assert!(!biz.is_transient_conflict());
+        assert!(!biz.is_retryable());
+    }
+
+    /// The retry LOOP (not just the classifier) re-attempts a transient
+    /// precondition and completes once it clears — the in-flight EC/recovery
+    /// op finishing, or the CAS succeeding on a fresh snapshot.
+    #[compio::test]
+    async fn transient_precondition_retries_until_it_clears() {
+        let sc = test_client(1);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    // Transient for the first 2 attempts, then clears.
+                    if a.get() < 3 {
+                        sc2.check_manager_resp(
+                            manager_rpc::CODE_PRECONDITION,
+                            "stream 7 membership changed during alloc_extent; \
+                             retry with fresh snapshot",
+                            "alloc_new_extent",
+                        )?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        res.expect("transient precondition must eventually succeed after retries");
+        assert_eq!(attempts.get(), 3, "must have retried the transient conflict");
     }
 
     /// Transport-layer failures (no ManagerError in the chain) keep the

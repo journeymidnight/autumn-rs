@@ -1331,6 +1331,7 @@ impl AutumnManager {
                         autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "HOT_COLD",
                         autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT => "MINOR_COMPACT",
                         autumn_rpc::manager_rpc::POLICY_KIND_EC => "EC",
+                        autumn_rpc::manager_rpc::POLICY_KIND_REBALANCE => "REBALANCE",
                         _ => "UNKNOWN",
                     };
                     tracing::info!(

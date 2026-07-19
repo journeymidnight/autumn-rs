@@ -1,36 +1,60 @@
 Date: 2026-07-18
 TaskStatus: not_completed
 Task scope: 4-task batch (用户 2026-07-18):
-  1. autumnfs 前缀 fs/{tenant}/{volume}/ → fs/{tenant}/ (去 {volume} 层)  — DONE
-  2. 默认打开 authz (部署层默认开, dev/测试仍关)                          — PENDING
-  3. fix F-AUTUMNFS-SLOW (autumnfs CLI upload/read 慢)                    — PENDING
-  4. push F-KVC-LAYOUT-FP + BUG-MGR-RETRY-CLASS (+F-REGION-REBALANCE PhaseB)
-     等 "代码已做待评审" 的推到 done                                      — PENDING
+  1. autumnfs 前缀 fs/{tenant}/{volume}/ → fs/{tenant}/ (去 {volume} 层)  — DONE (committed c7ad5a2, pushed)
+  2. 默认打开 authz (部署层默认开, dev/测试仍关)                          — PENDING (设计已定, 见下)
+  3. fix F-AUTUMNFS-SLOW (autumnfs CLI upload/read 慢)                    — DONE (uncommitted)
+  4. push F-KVC-LAYOUT-FP + BUG-MGR-RETRY-CLASS + F-REGION-REBALANCE PhaseB
+     等 "代码已做待评审" 的推到 done                                      — DONE (uncommitted, coco 复审中)
 
-── Task 1 (F-KEY-NS-NOVOLUME) — completed 2026-07-18 ──
-改动:
-  - crates/fuse/src/state.rs: FsState::new(manager, tenant) / new_with_host 去
-    volume 形参; 删 vol 字段/is_valid_volume/wire(); 8 个 kv_* 直传相对 key;
-    kv_range_keys 直接 collect entries.key (无 wire/strip)。
-  - crates/fuse/src/read.rs / extent.rs: batch 数据路径去 wire()（直接 extent_key）。
-  - crates/fuse/src/meta.rs ensure_schema_version: None 分支加 FAIL-LOUD 迁移 guard
-    —— range-scan 相对 start=\x05（旧 {volume} key 首字节≥0x2d，新类型字节 0x01-04，
-    fresh FS 空）；发现旧 volume 数据 → 响亮拒绝 mount（防静默当空盘 + 影子数据集）。
-  - crates/client/src/lib.rs: 删 connect_volume/scoped_volume（无外部调用者）。
-  - crates/fuse/src/main.rs / python/src/fs.rs / server/bin/autumnfs.rs: 删 --volume /
-    volume= 参数（零调用者，clean removal; PyO3 signature=(manager,host,tenant,direct_read)）。
-  - AllocInodesReq.volume 字段休眠保留（wire 不动）。
-  - 文档: fuse/CLAUDE.md, server/CLAUDE.md, schema.rs, meta.rs, key.rs, docs/ops.md
-    去 {volume}; docs/key_namespace_split_design.md 顶部加 REVERSION banner;
-    feature_list.md 加 F-KEY-NS-NOVOLUME 条目 (passes: true)。
-Review: coco 4 findings → P1 fail-loud schema guard 采纳(+测试); P2 Python/Rust
-  compat shim 因零调用者 WON'T-FIX(clean removal 是用户意图); P3 tenant 隔离测试补齐。
-测试(全绿): fuse lib 45, client 35, manager lib 228, fs_alloc 2; 新增/更新
-  system_fuse_ns.rs 三个 #[ignore] 集成测试全过:
-    cold_remount_reads_back_written_extents / two_tenants_isolate_same_inode /
-    stale_volume_data_refuses_mount。workspace build clean。
-Next: commit Task 1 → 进入 Task 2 (authz 部署层默认开)。
+── Task 3 (F-AUTUMNFS-SLOW) — completed 2026-07-18 ──
+crates/server/src/bin/autumnfs.rs:
+  - write_file_from_reader: 流式分窗 put_many（PUT_WINDOW_EXTENTS=8×8MiB=64MiB 窗,
+    read_full_chunk 逐块读; 首块决定 inline vs extent; ≥64KiB extent 自动 ZC）。
+    去掉整文件 read_to_end 进内存。
+  - read_file_to_writer: 分窗 get_many_into（ZC fan-out, 复用 dest buf, 按逻辑
+    offset 写 → sparse 正确）; 替换 get_many 的单大帧。
+  - cmd_ls: 每页 get_many 批取 dirent value + inode meta（替换逐条串行 get）。
+  - 单测 read_full_chunk 2 个（短读≠EOF, cap 整除边界）。
+活集群实测（本地 3-EN TCP, kvc_repro_cluster）:
+  PUT 256MiB 191MiB/s; GET 256MiB 33→686MiB/s(20×); 峰值 RSS 69MiB(不线性);
+  4 尺寸 round-trip 字节精确(3KiB inline/8MiB 单extent/20MiB/256MiB)。
 
-── 最近已完成(上一批, 已 commit) ──
-  36489b2 BUG-KVC-NO-HIT (vLLM connector 异步 save + dedup, no-hit +6.5/7ms)
-  0c7dd21 sglang connector batch_exists 128 RPC → 1 早退
+── Task 4 (push pending-review to done) — completed 2026-07-18 ──
+verify: 三 feature 代码+测试现绿(stream 113, PS 202, common 13, manager 229, kvc 27)。
+coco review 各 commit(GPT-5.5 deep):
+  - F-KVC-LAYOUT-FP (486b245): CLEAN(未发现问题) → passes: true。
+  - BUG-MGR-RETRY-CLASS (6eb9c53): 1 P1(真回归,已修)。首版 CODE_PRECONDITION 一刀切
+    fail-fast 误杀 alloc_new_extent 依赖的**瞬态并发冲突**重试自愈(manager 显式回
+    "retry with [a] fresh snapshot"/"defer…until it completes")。修=ManagerError::
+    is_transient_conflict() 按 marker 区分,is_retryable 只重试瞬态 precondition,
+    owner-fence + 业务规则 precondition 仍 fail-fast; 2 新单测; CLAUDE.md note30 订正。
+    → passes: true。
+  - F-REGION-REBALANCE PhaseB (997f030): 1 P1 + 1 P2 + 2 P3。
+    P1(已修): cooldown_sec=0 custom policy 让缓存 rebalance 每 tick 重复 actuate→reopen
+      storm。修=decide_actions 对 REBALANCE 加不可配置 60s actuation 下限; 1 新单测。
+    P3(已修): rebalance 日志 UNKNOWN→"REBALANCE"; /api/action rebalance 拒绝 target 字段。
+    P2(记档不改): 升级后已 Armed 旧 balanced/aggressive 开始自动 rebalance=刻意设计+有界
+      +全停全启,非缺陷。 → passes: true。
+
+── Task 2 (authz 部署层默认开) — 设计已定, 待实现 ──
+现状(两 Explore agent 已勘): AUTUMN_AUTH_* env→flag 已在 autumn-deploy(_start_managers
+  L505-516)/entrypoint.sh(run_manager L124-135)/cluster.sh(L617-649) 三层齐备但 OPT-IN
+  (无 signing key = OFF); cluster.sh/chaos 从不 set AUTUMN_AUTH_* → 已天然 OFF(勿动)。
+manager 端: --auth-signing-key-file 存在即启(manager.rs:307); 默认 protected=mem/ 单条;
+  PS 自动发现(MSG_GET_AUTHZ_CONFIG, 无需 flag)。
+CLI: autumn-op gen-signing-key(本地打印 <kid> <hex-seed>)/tenant-create(回 credential)/
+  mint-token; --credential-file 只在 autumn-op 有。
+缺口(需做):
+  A. 客户端 --credential-file: fuse main.rs / autumnfs.rs / autumn-client 三个 Rust 二进制
+     都只 plain connect, 无 credential flag → 加 flag + connect_with_credential
+     (client/lib.rs:1344, 需 principal[默认=tenant] + credential:Vec<u8>)。python 已有 credential=。
+  B. 部署层默认开: autumn-deploy do_start(L659) 起 manager 前 auto-gen signing key + admin
+     token(若未设)→ 默认 AUTUMN_AUTH_SIGNING_KEY_FILE + AUTUMN_AUTH_PROTECTED_PREFIXES=
+     fs/,kvc/,mem/; 逃生门 AUTUMN_AUTH_DISABLE=1; entrypoint.sh 同; k8s 加 Secret+manager
+     mount+configmap。分发 credential 到 client 路径(autumn-deploy 不起 client → 写已知路径+
+     print + runbook)。cluster.sh/tests 不动。
+Next: coco 复审 Task3/4 回来 → 处理 findings → commit Task3+Task4 → 做 Task 2。
+
+── 最近已完成(前批, committed) ──
+  36489b2 BUG-KVC-NO-HIT; 0c7dd21 sglang batch_exists; c7ad5a2 Task 1 去 {volume}

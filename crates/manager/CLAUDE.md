@@ -321,9 +321,18 @@ NOT PartitionLoad; fires when the per-PS spread exceeds `rebalance_gap_threshold
 and outside `rebalance_cooldown_sec`, gated by `PolicyEngine.last_rebalance_at`).
 The armed controller's `actuate_candidate` REBALANCE arm calls
 `handle_rebalance_regions` with `rebalance_max_moves_per_tick` (bounded, gradual —
-convergence across ticks). 6th auto-policy switch `rebalance` (SWITCH_ORDER
+convergence across ticks). **`decide_actions` floors rebalance's ACTUATION cooldown
+at a non-configurable `REBALANCE_MIN_ACTUATION_COOLDOWN_SEC` (60 s, auto_policy.rs)
+— the advisory-side `rebalance_cooldown_sec` only gates EMISSION, but the emitted
+candidate lingers in `advisory_cache` for a whole ~60 s `policy_tick` window while
+the auto-policy loop ticks every `interval_sec`, so a policy with `cooldown_sec = 0`
+would re-actuate the SAME cached candidate every tick → partition reopen storm
+(coco P1). The floor is rebalance-only (other kinds honor the policy's own
+cooldown).** 6th auto-policy switch `rebalance` (SWITCH_ORDER
 `[split,ec,compact,gc,merge,rebalance]`), ON in `balanced`+`aggressive` presets,
-default OFF; leader-only, preserves F203 mechanism/policy split. The three
+default OFF; leader-only, preserves F203 mechanism/policy split. (Upgrade note:
+an already-Armed pre-Phase-B `balanced`/`aggressive` cluster gains auto-rebalance
+on upgrade — intended, bounded + safe under stop-world deploy; coco P2, WON'T-REVERT.) The three
 thresholds live in the in-memory `PolicyConfig` (compiled defaults + runtime
 override, NOT persisted — like every advisory threshold); the policy DEFINITION
 (`MgrAutoPolicyEntry.switches` incl. rebalance) IS persisted in `autoPolicy/config`
