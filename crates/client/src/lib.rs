@@ -3111,12 +3111,29 @@ impl ClusterClient {
                 }
             }
         }
-        // ZC-only entries: per-op put_zc_opts so the TTL from put_many's
-        // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at
-        // on the wire; the single-key `put_zc` convenience hardcodes 0).
-        // `k` is the ALREADY-bound wire key.
-        for (idx, k, v, ttl) in zc_only {
-            results[idx] = self.put_zc_opts(&k, v, ttl, lease).await;
+        // ZC-only entries (values ≥ 64 KiB — every autumnfs / fuse 8 MiB extent,
+        // every large kvcache page): per-op put_zc_opts so the TTL from put_many's
+        // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at on the wire;
+        // the single-key `put_zc` convenience hardcodes 0). `k` is the ALREADY-bound
+        // wire key.
+        //
+        // Fan these out CONCURRENTLY (mirrors delete_many / head_many). A serial
+        // `for … .await` here capped a single-inode large-file write at ONE 8 MiB
+        // durable put per round trip: throughput = 8 MiB ÷ (WAL append + 3-replica
+        // fanout + fsync) ≈ 40 MB/s, no matter how big the caller's window. With the
+        // window in flight the PS group-commit coalesces the concurrent puts (one
+        // fsync amortised over many), so a big-file write runs at the partition's
+        // bandwidth instead of its per-op latency. Same multiplexed per-partition
+        // conn as the serial path — just no head-of-line wait between extents.
+        let zc_futs = zc_only.iter().map(|(_, k, v, ttl)| {
+            let (k, v, ttl) = (k.clone(), v.clone(), *ttl);
+            async move { self.put_zc_opts(&k, v, ttl, lease).await }
+        });
+        for ((idx, _, _, _), r) in zc_only
+            .iter()
+            .zip(fan_out_collect(zc_futs, BATCH_PUT_DEFAULT_CONCURRENCY).await)
+        {
+            results[*idx] = r;
         }
         results
     }

@@ -94,9 +94,17 @@ keyspace:
   internally: values < 64 KiB → one `MSG_BATCH_PUT` per partition
   (server decodes one frame, atomically injects all ops into
   `partition_loop.pending`); values ≥ 64 KiB → per-op `MSG_PUT_ZC`
-  (value as its own iovec; RDMA when caller-registered). Result `i`
-  matches `items[i]`. NO `concurrency` arg — partition-by-partition
-  issuance is the natural pacing.
+  **fanned out CONCURRENTLY via `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)`**
+  (value as its own iovec; RDMA when caller-registered) — mirrors the
+  concurrent fan-out every other batch API uses. This ZC path used to be a
+  serial `for … .await`, which capped a large-value batch (autumnfs / fuse
+  8 MiB extents, big kvcache pages) at ONE durable put per round trip
+  (extent_size ÷ per-put latency ≈ 40 MB/s when the durable path is
+  latency-bound; the PS group-commit — F256 natural batching — then coalesces
+  the concurrent puts). No change when the path is bandwidth-bound (single
+  fast-local partition/connection saturates at its stream ceiling regardless).
+  Result `i` matches `items[i]`. NO `concurrency` arg — partition-by-partition
+  issuance + the per-op fan-out cap are the natural pacing.
 - `get_many(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` —
   **the simpler batched-read API.** SDK allocates a `Vec<u8>` per
   returned value; one `MSG_BATCH_GET` per owning partition. Use this
