@@ -661,24 +661,6 @@ async fn cmd_get(cluster: &ClusterClient, remote: &str, local: &PathBuf) -> Resu
 
 // ─── put / touch ────────────────────────────────────────────────────────────
 
-/// F-AUTUMNFS-SLOW: bounded per-upload streaming window. Read + pipeline this
-/// many `MAX_EXTENT` chunks at a time. `put_many` pipelines a window
-/// concurrently (grouped by owning partition, ZC for the ≥ 64 KiB extents —
-/// every 8 MiB extent qualifies), so a multi-GiB upload streams at the
-/// cluster's write bandwidth instead of one serial round-trip per extent, while
-/// RAM stays bounded to `PUT_WINDOW_EXTENTS * MAX_EXTENT` (128 MiB) rather than
-/// the whole file.
-///
-/// F-FS-STRIPE (A): 16, not 8. A STRIPED file's window spans N lane partitions,
-/// so a deeper window = more in-flight puts PER LANE = more cross-lane
-/// parallelism. Measured (3-disk / 4-PS, striped×4 2 GiB): window 8→16 lifts
-/// 305→344 MB/s (~13%), plateauing by 16 (32/64 ≈ 335/347). Non-striped is
-/// unchanged (single partition/connection saturates regardless). Full
-/// single-file scaling to the cluster ceiling needs a continuous pipeline
-/// (overlap the source read with in-flight puts) + more connections per lane —
-/// deferred; the rig here is EN-CPU-bound (~443 MB/s aggregate) so it can't show it.
-const PUT_WINDOW_EXTENTS: usize = 16;
-
 /// Read up to `cap` bytes, looping until the buffer is full or EOF. A returned
 /// length < `cap` therefore reliably means EOF — a bare `Read::read` may return
 /// a short count without EOF, which would corrupt the inline-vs-extent decision
@@ -694,33 +676,6 @@ fn read_full_chunk(r: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
     }
     buf.truncate(filled);
     Ok(buf)
-}
-
-/// Flush a window of pending extents via one pipelined `put_many`, then clear
-/// it. Every window key is appended to `written` (BEFORE the RPC — `put_many`
-/// may write some items then error on another, so orphan cleanup must cover a
-/// partial success).
-async fn flush_put_window(
-    cluster: &ClusterClient,
-    window: &mut Vec<(Vec<u8>, Bytes)>,
-    written: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    if window.is_empty() {
-        return Ok(());
-    }
-    for (k, _) in window.iter() {
-        written.push(k.clone());
-    }
-    let items: Vec<(&[u8], Bytes, u64)> =
-        window.iter().map(|(k, v)| (k.as_slice(), v.clone(), 0u64)).collect();
-    for (i, r) in cluster.put_many(&items).await.into_iter().enumerate() {
-        r.map_err(|e| {
-            let off = key::parse_extent_key(&window[i].0).map(|(_, o)| o).unwrap_or(0);
-            anyhow!("put extent at {off}: {e}")
-        })?;
-    }
-    window.clear();
-    Ok(())
 }
 
 async fn write_file_from_reader(
@@ -768,40 +723,65 @@ async fn publish_file(
 ) -> Result<()> {
     let mut meta = new_file_meta();
 
-    // Stream the source in `MAX_EXTENT` chunks (F-AUTUMNFS-SLOW: no whole-file
-    // read-to-RAM). The FIRST chunk decides inline vs extent: a file that fits
-    // in one sub-`INLINE_THRESHOLD` read is stored inline in the inode (no
-    // extent keys), matching the fuse mount's small-file layout. Everything
-    // larger pipelines through windowed `put_many`.
+    // Read the FIRST chunk to decide inline vs extent: a file that fits in one
+    // sub-`INLINE_THRESHOLD` read is stored inline in the inode (no extent keys),
+    // matching the fuse mount's small-file layout.
     let mut off: u64 = 0;
-    let mut window: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(PUT_WINDOW_EXTENTS);
-    let mut first = true;
-    loop {
-        let chunk = read_full_chunk(&mut data_reader, MAX_EXTENT).context("read source")?;
-        let n = chunk.len();
-        // `n < MAX_EXTENT` ⇒ EOF (read_full_chunk otherwise fills fully).
-        if first && n < MAX_EXTENT && n <= INLINE_THRESHOLD {
-            meta.inline_data = Some(chunk);
-            off = n as u64;
-            break;
-        }
-        first = false;
-        if n > 0 {
-            let ek = match &stripe {
-                Some(s) => key::extent_key_striped(new_ino, off, s.lanes, s.unit_bytes),
-                None => key::extent_key(new_ino, off),
-            };
-            window.push((ek, Bytes::from(chunk)));
-            off += n as u64;
-            if window.len() >= PUT_WINDOW_EXTENTS {
-                flush_put_window(cluster, &mut window, written).await?;
+    let first_chunk = read_full_chunk(&mut data_reader, MAX_EXTENT).context("read source")?;
+    if first_chunk.len() < MAX_EXTENT && first_chunk.len() <= INLINE_THRESHOLD {
+        off = first_chunk.len() as u64;
+        meta.inline_data = Some(first_chunk);
+    } else {
+        // F-FS-STRIPE (A): CONTINUOUS write pipeline. The old window-of-8 +
+        // full-barrier drain kept only ~window/lanes puts in flight per lane —
+        // thin group-commit batches → the striped write stalled well under the
+        // cluster's capacity (profiling: nothing saturated — disks < 10% util,
+        // ENs ~60% of one core — so it was purely pipeline-depth / durability
+        // latency bound). Instead keep `depth` puts in flight at all times
+        // (read-ahead refills as completions land, no barrier), so each lane PS
+        // sees a DEEP, fat-batchable arrival stream and the durable-write latency
+        // is hidden. `depth` scales with lane count (each lane wants ~PS
+        // inflight-cap worth); non-striped stays shallow (one partition).
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let depth = match &stripe {
+            Some(s) => (s.lanes as usize * 12).clamp(24, 96),
+            None => 8,
+        };
+        let mut inflight = FuturesUnordered::new();
+        let mut pending = Some(first_chunk); // the already-read first chunk
+        let mut eof = false;
+        loop {
+            if !eof && inflight.len() < depth {
+                let chunk = match pending.take() {
+                    Some(c) => c,
+                    None => read_full_chunk(&mut data_reader, MAX_EXTENT).context("read source")?,
+                };
+                let n = chunk.len();
+                if n == 0 {
+                    eof = true;
+                } else {
+                    let ek = match &stripe {
+                        Some(s) => key::extent_key_striped(new_ino, off, s.lanes, s.unit_bytes),
+                        None => key::extent_key(new_ino, off),
+                    };
+                    // Track BEFORE the RPC — a put may land then a later one fail,
+                    // so orphan cleanup must cover the partial success (coco P2).
+                    written.push(ek.clone());
+                    let value = Bytes::from(chunk);
+                    inflight.push(async move { cluster.put_zc(&ek, value).await });
+                    off += n as u64;
+                    if n < MAX_EXTENT {
+                        eof = true;
+                    }
+                }
+                continue;
+            }
+            match inflight.next().await {
+                Some(r) => r.map_err(|e| anyhow!("put extent: {e}"))?,
+                None => break, // eof && fully drained
             }
         }
-        if n < MAX_EXTENT {
-            break; // EOF
-        }
     }
-    flush_put_window(cluster, &mut window, written).await?;
     meta.size = off;
     // Only stamp `stripe` for a file that actually took the extent path — an
     // inline small file has no extents to stripe (reader checks inline_data first).
