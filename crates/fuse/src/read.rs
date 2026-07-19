@@ -117,6 +117,11 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
     // Variable-extent read: load the extent map (F247) and plan each extent that
     // overlaps `[offset, read_end)`. Routing happens later inside `get_many_into`
     // (cached binary search per key) — `execute` needs no `&state`.
+    // F-FS-STRIPE: validate the persisted stripe geometry ONCE (coco P3 — else a
+    // corrupt `lanes=0` would div-by-zero in the key builder below).
+    if let Some(s) = &meta.stripe {
+        s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
+    }
     let ext = extent::extents_snapshot(state, ino, file_size).await?;
     let mut chunks: Vec<ChunkSpec> = Vec::new();
     for &(start, len) in &ext {
@@ -131,7 +136,11 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
             // `get_many_direct` directly on the client, which prepends
             // `fs/{tenant}/` — same as the write side (kv_put_fenced /
             // flush_appends). The bare `key::*` builder is relative.
-            key: key::extent_key(ino, start),
+            // F-FS-STRIPE: striped inode → lane key `[0x03][lane][ino][off]`.
+            key: match &meta.stripe {
+                Some(s) => key::extent_key_striped(ino, start, s.lanes, s.unit_bytes),
+                None => key::extent_key(ino, start),
+            },
             offset: (ov_start - start) as u32,
             length: (ov_end - ov_start) as u32,
             dest_offset: (ov_start - offset) as usize,

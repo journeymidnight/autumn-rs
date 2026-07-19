@@ -1171,9 +1171,13 @@ autumnfs --manager <mgr> --tenant default get /ckpt ./out   # reader auto-detect
   file may not fully drive many lanes; running few parallel uploads or a deeper
   client pipeline closes the gap). Give ENs enough cores + put replicas on separate
   disks/hosts so the per-stream ceiling is high.
-- **fuse mount** striping is NOT wired yet (streaming writes don't know the final
-  size up front); autumnfs `put` (size known) is the v1 path. Schema is **v3**
-  (`InodeMeta.stripe`) — a stop-world reset from v2 (no in-place migration).
+- **fuse mount**: READS and DELETES (unlink/rename-over) striped files correctly
+  (an autumnfs-striped file is fully readable + removable via a mount on the same
+  tenant). fuse WRITE/TRUNCATE of a striped file is refused fail-loud for now
+  (streaming writes don't know the final size up front, so fuse can't decide the
+  stripe geometry at create) — use `autumnfs put` to (re)write large striped files.
+  Schema is **v3** (`InodeMeta.stripe`) — a stop-world reset from v2 (no in-place
+  migration).
 
 **CRITICAL — presplit the EMPTY keyspace BEFORE loading data.** A data-bearing
 partition can't be split repeatedly: after the first CoW split, parent+child

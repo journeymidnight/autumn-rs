@@ -24,7 +24,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
 use crate::key;
-use crate::schema::MAX_EXTENT;
+use crate::schema::{StripeLayout, MAX_EXTENT};
 use crate::state::FsState;
 
 /// Pipeline depth for the append-write hot path. cp / dd / model-checkpoint
@@ -56,17 +56,37 @@ pub async fn extents_snapshot(
             return Ok(ext.clone());
         }
     }
-    let extents = scan_extents(state, ino, file_size).await?;
+    // F-FS-STRIPE: a striped inode's extents live under `[0x03][lane][ino][off]`,
+    // NOT scannable by the `[0x03][ino]` prefix — the map is COMPUTED from size.
+    // The stripe layout is on the cached meta (get_inode / ensure_inode_cached ran
+    // before any extent op). `scan_extents` branches on it.
+    let stripe = state.inodes.get(&ino).and_then(|is| is.meta.stripe.clone());
+    let extents = scan_extents(state, ino, file_size, stripe.as_ref()).await?;
     if let Some(is) = state.inodes.get_mut(&ino) {
         is.extents = Some(extents.clone());
     }
     Ok(extents)
 }
 
-/// Paginated range-scan of `[0x03][ino]` → sorted start offsets, then infer each
-/// extent's value length (`next_start - start`, last clamped to `file_size`),
-/// capped at `MAX_EXTENT`.
-async fn scan_extents(state: &mut FsState, ino: u64, file_size: u64) -> Result<Vec<(u64, u32)>> {
+/// Build the extent map. STRIPED (F-FS-STRIPE) → COMPUTE the MAX_EXTENT-granular
+/// offsets from `file_size` (extents are aligned + bounded by size; the writer
+/// never exceeds MAX_EXTENT). LEGACY → paginated range-scan of `[0x03][ino]` →
+/// sorted starts. Both then `infer_lengths`.
+async fn scan_extents(
+    state: &mut FsState,
+    ino: u64,
+    file_size: u64,
+    stripe: Option<&StripeLayout>,
+) -> Result<Vec<(u64, u32)>> {
+    if stripe.is_some() {
+        let mut starts: Vec<u64> = Vec::new();
+        let mut off = 0u64;
+        while off < file_size {
+            starts.push(off);
+            off += MAX_EXTENT as u64;
+        }
+        return Ok(infer_lengths(&starts, file_size));
+    }
     let prefix = key::extent_prefix(ino);
     let mut starts: Vec<u64> = Vec::new();
     let mut start_key = prefix.clone();
@@ -361,12 +381,41 @@ pub async fn sweep_unlink_tombstones(state: &mut FsState) -> Result<usize> {
 }
 
 pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
-    let prefix = key::extent_prefix(ino);
-    let mut start_key = prefix.clone();
     // BUG-LEASE-2 Phase 2 (coco P1 #3): unlink's extent deletes are
     // fenced under the held WRITE lease (anonymous when none is held —
     // unlink without an open writer is a metadata-path operation).
     let lease = state.write_lease_for(ino);
+    // F-FS-STRIPE: a striped inode's extents live under `[0x03][lane][ino][off]`,
+    // NOT scannable by the `[0x03][ino]` prefix — a range-scan would MISS them and
+    // leak. Look up stripe+size (cached from the caller's get_inode; on
+    // tombstone-replay the cache is cold, so read the inode from KV if it still
+    // exists) and delete the COMPUTED lane keys (MAX_EXTENT-granular up to size).
+    let stripe_size: Option<(Option<StripeLayout>, u64)> =
+        match state.inodes.get(&ino).map(|is| (is.meta.stripe.clone(), is.meta.size)) {
+            Some(v) => Some(v),
+            None => match state.kv_get_opt(&key::inode_key(ino)).await? {
+                Some(bytes) => {
+                    crate::schema::decode_inode_meta(&bytes).ok().map(|m| (m.stripe, m.size))
+                }
+                None => None, // inode already gone (crash mid-removal) — nothing to scan
+            },
+        };
+    if let Some((Some(s), size)) = stripe_size {
+        if let Ok((lanes, unit)) = s.checked() {
+            let mut off = 0u64;
+            while off < size {
+                let _ = state
+                    .kv_delete_fenced(&key::extent_key_striped(ino, off, lanes, unit), lease)
+                    .await;
+                off += MAX_EXTENT as u64;
+            }
+        }
+        invalidate(state, ino);
+        return Ok(());
+    }
+    // Legacy (non-striped, or meta unavailable): paginated range-scan + delete.
+    let prefix = key::extent_prefix(ino);
+    let mut start_key = prefix.clone();
     loop {
         let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
         let got = keys.len();
