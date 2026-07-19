@@ -1029,8 +1029,8 @@ async fn main() -> Result<()> {
             // `{ns}/{tenant}/`.
             match &args.credential_file {
                 Some(path) => {
-                    let credential = std::fs::read(path)
-                        .with_context(|| format!("read --credential-file {path}"))?;
+                    let credential =
+                        autumn_client::read_credential_file(path).context("--credential-file")?;
                     let principal = args.principal.clone().unwrap_or_else(|| tenant.to_string());
                     ClusterClient::connect_with_credential(
                         &args.manager,

@@ -95,8 +95,8 @@ fn main() -> Result<()> {
     // path) so the compio thread just carries the bytes. `principal` defaults to
     // the tenant (1:1 principal↔tenant).
     let credential: Option<Vec<u8>> = match &args.credential_file {
-        Some(path) => Some(std::fs::read(path).unwrap_or_else(|e| {
-            eprintln!("--credential-file {}: {e}", path.display());
+        Some(path) => Some(autumn_client::read_credential_file(path).unwrap_or_else(|e| {
+            eprintln!("{e:#}");
             std::process::exit(2);
         })),
         None => None,

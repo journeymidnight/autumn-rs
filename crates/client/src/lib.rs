@@ -375,6 +375,81 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
     value_size >= UCX_ZC_READ_MIN_BYTES
 }
 
+/// F-AUTHZ-BUILTIN: read a tenant credential file into RAW credential bytes for
+/// [`ClusterClient::connect_with_credential`]. On-disk format is the lowercase
+/// hex printed by `autumn-op tenant-create` — either the bare hex line, or its
+/// whole `credential: <hex>` stdout line (accepted defensively; "save the
+/// output" is the predictable operator move). The SDK/manager contract is RAW
+/// bytes (mint-token hex-decodes before sending; the manager stores the SHA-256
+/// of the raw bytes), so handing the ASCII hex straight through would present a
+/// WRONG credential and every protected-prefix op would die `PermissionDenied`
+/// once enforcement is on. Fail loud HERE, at startup, instead. Mirrors the
+/// Python `autumn_kvcache._identity.read_credential_file` byte-for-byte.
+pub fn read_credential_file(path: impl AsRef<std::path::Path>) -> Result<Vec<u8>> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("read credential file {}: {e}", path.display()))?;
+    parse_credential_text(&text).map_err(|e| anyhow!("credential file {}: {e}", path.display()))
+}
+
+/// Pure parser for [`read_credential_file`]: extract the hex (a bare hex line or
+/// a `credential: <hex>` line) and decode it to raw bytes. Split out so it is
+/// unit-testable without touching the filesystem.
+fn parse_credential_text(text: &str) -> Result<Vec<u8>> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let hexs = if let Some(l) =
+        lines.iter().find(|l| l.to_ascii_lowercase().starts_with("credential:"))
+    {
+        l.split_once(':').map(|(_, h)| h.trim()).unwrap_or("")
+    } else if lines.len() == 1 {
+        lines[0]
+    } else {
+        anyhow::bail!(
+            "expected a single hex line or a 'credential: <hex>' line, got {} non-empty lines",
+            lines.len()
+        );
+    };
+    if hexs.is_empty() || !hexs.is_ascii() || hexs.len() % 2 != 0 {
+        anyhow::bail!("not valid hex (empty, odd length, or non-ASCII)");
+    }
+    (0..hexs.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hexs[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
+}
+
+#[cfg(test)]
+mod credential_file_tests {
+    use super::parse_credential_text;
+
+    #[test]
+    fn bare_hex_line_decodes() {
+        assert_eq!(parse_credential_text("deadbeef\n").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        // surrounding whitespace tolerated
+        assert_eq!(parse_credential_text("  a1b2  ").unwrap(), vec![0xa1, 0xb2]);
+    }
+
+    #[test]
+    fn credential_labeled_line_decodes() {
+        // The raw `autumn-op tenant-create` stdout ("credential: <hex>") + the
+        // "tenant '…' created" line above it — pick the labeled line's hex.
+        let text = "tenant 'default' created\ncredential: 00ff10\n";
+        assert_eq!(parse_credential_text(text).unwrap(), vec![0x00, 0xff, 0x10]);
+    }
+
+    #[test]
+    fn rejects_ambiguous_multi_line_without_label() {
+        assert!(parse_credential_text("aa\nbb\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_hex() {
+        assert!(parse_credential_text("xyz\n").is_err()); // non-hex
+        assert!(parse_credential_text("abc\n").is_err()); // odd length
+        assert!(parse_credential_text("\n\n").is_err()); // empty
+    }
+}
+
 /// F-DIRECT-MANY: latches after the first direct-read→proxy fallback so the
 /// warning fires exactly once per process (default-ON direct-read on a topology
 /// where ENs aren't client-reachable would otherwise warn on every large read).
