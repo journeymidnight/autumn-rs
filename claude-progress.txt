@@ -1,5 +1,41 @@
 Date: 2026-07-19
 TaskStatus: completed
+Task scope: examples + cluster.sh 上 authz (用户: reset+启动authz、gallery/codebase-memory
+  改新API、都 protected)。
+Decision: 两个 namespace 都 protected(用户选"都protected最严")→ 两个 example 都接
+  credential。gallery 用 Scoped;autumn-memory core 已有 connect_with_credential。
+Done:
+  0. REBASE 到 origin/main 的 F-KEY-NS-TENANT-FIRST(key 顺序翻成 {tenant}/{ns}/、authz
+     开就全保护)。适配:cluster.sh 的 codebase grant mem/codebase/ → codebase/mem/
+     (tenant-first);去掉 vestigial 的 AUTUMN_AUTH_PROTECTED_PREFIXES(全保护自动)。
+     gallery(ns==tenant==gallery)prefix 不变 gallery/gallery/;两 example 代码不用改
+     (connect/connect_with_credential 签名不变,core 负责拼前缀)。
+  1. cluster.sh turnkey authz: AUTUMN_AUTH=1 → 自动 gen-signing-key + admin token;
+     bootstrap 后 namespace-create gallery + tenant-create codebase(codebase/mem/)/
+     gallery(gallery/gallery/) → credential 写到 $DATA_ROOT/authz/{codebase,gallery}.cred
+     (幂等,已存在则跳过)。
+  2. gallery(examples/gallery):connect_raw → Scoped connect(namespace/tenant 来自
+     AUTUMN_NAMESPACE/AUTUMN_TENANT,默认 gallery/gallery)+ 可选 AUTUMN_CREDENTIAL_FILE
+     → connect_with_credential。ROOT "gallery/" → ""(binding 拥有前缀,key 变相对;
+     两处 whole-store scan + strip_prefix 自动变 no-op;chunk 走 put→bind_key 落
+     namespace 内,is_chunk_key 在 stripped key 上仍生效)。
+  3. codebase-memory(examples/codebase-memory):+ --credential-file / AUTUMN_CREDENTIAL_FILE
+     → MemoryStore::connect_with_credential(mem/{tenant})。
+Verify: server + 两 example build clean。LIVE(AUTUMN_AUTH=1 ./cluster.sh reset 5):
+  namespace-list 有 fs/kvc/mem/gallery;写 mem/codebase 无 token → PermissionDenied,
+  带 codebase.cred → ok + 回读;gallery 二进制起来 + 凭证连上 + startup Scoped scan 无错,
+  HTTP POST /put/ → list → get 全链路回读字节精确;codebase-memory 带 cred 起来 serves 200。
+Main gaps: NONE。hermes-autumn-memory 由别的 teammate 负责,未动。
+Next steps: commit + push。cluster 现在带 authz 在跑(creds 在 /tmp/autumn-rs/authz/)。
+
+============================ prior task history ============================
+Date: 2026-07-19
+TaskStatus: completed
+Task scope: 4-task batch (用户 2026-07-18) — ALL DONE, committed + pushed to main。
+
+============================ prior task history ============================
+Date: 2026-07-19
+TaskStatus: completed
 Task scope: 用户会话续（tenant-first key 翻转 + F-PRESPLIT-NS-RULES）—— 均已 commit + push。
 
 ── F-KEY-NS-TENANT-FIRST（key 顺序 {ns}/{tenant}/ → {tenant}/{namespace}/ + authz 开了就全保护）──

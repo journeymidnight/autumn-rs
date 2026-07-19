@@ -616,6 +616,27 @@ launch_manager() {
             || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
         mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
     fi
+    # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key + admin token and
+    # protects mem/ & gallery/, feeding the AUTUMN_AUTH_* block below (per-example
+    # tenant credentials are minted post-bootstrap). Files live under
+    # $DATA_ROOT/authz/ and survive restart; `reset` wipes + regenerates them.
+    if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
+        local _az="$DATA_ROOT/authz"
+        mkdir -p "$_az"
+        if [[ -z "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
+            [[ -s "$_az/signing.key" ]] \
+                || "$AO" gen-signing-key > "$_az/signing.key" 2>/dev/null \
+                || die "gen-signing-key failed (build autumn-op first)"
+            AUTUMN_AUTH_SIGNING_KEY_FILE="$_az/signing.key"
+        fi
+        if [[ -z "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
+            [[ -s "$_az/admin.token" ]] \
+                || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_az/admin.token"
+            AUTUMN_ADMIN_TOKEN_FILE="$_az/admin.token"
+        fi
+        # authz protects EVERYTHING when a signing key is configured
+        # (F-KEY-NS-TENANT-FIRST) — no per-prefix list needed.
+    fi
     # F-AUTHZ-1: data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
     # with no env set, no flags are passed and authz stays OFF (zero impact on
     # every existing flow: perf_check, chaos, fuse, kvcache). To enable:
@@ -991,6 +1012,34 @@ do_start() {
         # Under F099-K the per-partition listener on :$PS_BASE_PORT only exists
         # once partition 0 has been opened and registered with the mgr.
         wait_port "$PS_BASE_PORT" "partition 0 listener" 60
+    fi
+
+    # Turnkey authz (AUTUMN_AUTH=1): register the gallery namespace + mint the
+    # per-example tenant credentials into $DATA_ROOT/authz/. Idempotent — a
+    # tenant whose .cred already exists is left alone so restarts keep working.
+    # The examples read their cred via AUTUMN_CREDENTIAL_FILE / --credential-file:
+    #   codebase-memory --credential-file $DATA_ROOT/authz/codebase.cred
+    #   AUTUMN_CREDENTIAL_FILE=$DATA_ROOT/authz/gallery.cred gallery <mgr>
+    if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
+        local _az="$DATA_ROOT/authz"
+        local _atok; _atok="$(cat "$_az/admin.token")"
+        local _ao=( "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
+        "${_ao[@]}" namespace-create --name gallery --admin-token "$_atok" >/dev/null 2>&1 || true
+        local _spec _t _pfx _out
+        # TENANT-FIRST wire layout: the SDK binds keys under `{tenant}/{namespace}/`,
+        # so the granted prefix is tenant-first too (codebase/mem/, gallery/gallery/).
+        for _spec in "codebase codebase/mem/ $_az/codebase.cred" \
+                     "gallery gallery/gallery/ $_az/gallery.cred"; do
+            read -r _t _pfx _out <<< "$_spec"
+            [[ -s "$_out" ]] && continue
+            "${_ao[@]}" --json tenant-create --tenant "$_t" --prefix "$_pfx" --admin-token "$_atok" \
+                | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"])' > "$_out" \
+                || die "tenant-create $_t failed"
+            [[ -s "$_out" ]] || die "tenant-create $_t produced no credential"
+        done
+        echo "[cluster] authz ON: signing key + admin token + creds in $_az/"
+        echo "[cluster]   codebase-memory: --credential-file $_az/codebase.cred"
+        echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi
 
     # F102: snapshot launch params so per-process subcommands can replay

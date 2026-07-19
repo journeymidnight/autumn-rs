@@ -192,6 +192,11 @@ struct Args {
     root: Option<PathBuf>,
     tenant: String,
     agent: String,
+    /// F-AUTHZ-1: path to the tenant credential (from `autumn-op tenant-create`,
+    /// hex). REQUIRED when `mem/` is a protected namespace — the SDK auto-mints
+    /// short-TTL tokens scoped to `mem/{tenant}/`. Omit on an unprotected/authz-
+    /// off cluster.
+    credential_file: Option<String>,
     host: String,
     port: u16,
     no_index: bool,
@@ -236,6 +241,7 @@ fn parse_args() -> Args {
         root: None,
         tenant: "codebase".into(),
         agent: "default".into(),
+        credential_file: std::env::var("AUTUMN_CREDENTIAL_FILE").ok().filter(|s| !s.is_empty()),
         host: "127.0.0.1".into(),
         port: LISTEN_PORT,
         no_index: false,
@@ -251,6 +257,7 @@ fn parse_args() -> Args {
             "--root" => a.root = it.next().map(PathBuf::from),
             "--tenant" => a.tenant = it.next().unwrap_or(a.tenant),
             "--agent" => a.agent = it.next().unwrap_or(a.agent),
+            "--credential-file" => a.credential_file = it.next(),
             "--host" => a.host = it.next().unwrap_or(a.host),
             "--port" => a.port = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.port),
             "--no-index" => a.no_index = true,
@@ -396,8 +403,23 @@ async fn main() -> Result<()> {
     });
 
     let store = Rc::new(
-        MemoryStore::connect(&args.manager, args.tenant.clone(), args.agent.clone())
-            .await?
+        match &args.credential_file {
+            // F-AUTHZ-1: protected `mem/` — connect with the tenant credential
+            // (SDK auto-mints/renews short-TTL tokens scoped to `mem/{tenant}/`).
+            Some(path) => {
+                let cred = autumn_client::read_credential_file(path)
+                    .map_err(|e| anyhow::anyhow!("--credential-file: {e}"))?;
+                MemoryStore::connect_with_credential(
+                    &args.manager,
+                    args.tenant.clone(),
+                    args.agent.clone(),
+                    cred,
+                )
+                .await?
+            }
+            None => MemoryStore::connect(&args.manager, args.tenant.clone(), args.agent.clone())
+                .await?,
+        }
             .with_page_limit(256),
     );
     let emb = Rc::new(build_embedder(&args));

@@ -922,6 +922,31 @@ short-TTL Ed25519 capability tokens; the PS verifies them per connection
 configured nothing changes (fuse / kvcache / perf-check / chaos all run
 authz-off, anonymous, zero hot-path cost).
 
+### Turnkey dev cluster with authz (`AUTUMN_AUTH=1`)
+
+`cluster.sh` auto-provisions the whole authz bring-up so the examples work
+end-to-end. `AUTUMN_AUTH=1` generates a signing key + admin token under
+`$DATA_ROOT/authz/`, protects `mem/` & `gallery/`, registers the `gallery`
+namespace, and mints per-example tenant credentials:
+
+```bash
+AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,codebase.cred,gallery.cred}
+
+# codebase-memory (mem/codebase/, protected) — pass its tenant credential:
+./target/release/codebase-memory --credential-file /tmp/autumn-rs/authz/codebase.cred
+
+# gallery (gallery/gallery/, protected) — Scoped client, credential via env:
+AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
+  ./target/release/gallery 127.0.0.1:9001
+```
+
+Both examples now bind a namespace scope (`{ns}/{tenant}/`, prepended by the SDK)
+and auth via `--credential-file` / `AUTUMN_CREDENTIAL_FILE` (the SDK auto-mints
+short-TTL tokens). Override the scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`
+(gallery) or `--tenant` (codebase-memory). Tune protection with
+`AUTUMN_AUTH_PROTECTED_PREFIXES` (default `mem/,gallery/`); an unprotected
+namespace needs no credential.
+
 ```bash
 # 0) One-shot cross-tenant e2e against an ISOLATED throwaway authz cluster
 #    (gen key → manager with authz → two tenants → verify isolation):

@@ -104,19 +104,23 @@ const LISTEN_PORT: u16 = 5001;
 // source video to a temp file before transcoding.
 const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
-// Root key namespace for ALL of this example's keys. A shared cluster hosts
-// other apps too (autumn-memory under `mem/`, kvcache under `kvc/`, …), so every
-// gallery key — inline files, the striped-video meta blob, thumbnails, HLS,
-// per-file meta — lives under this prefix, and the two whole-store scans (file
-// list + startup recovery) are scoped to it instead of walking the whole
-// keyspace (which would stall once another app has written many keys).
-const ROOT: &str = "gallery/";
+// F-KEY-NS: gallery's keys are RELATIVE to the client's namespace binding
+// `{ns}/{tenant}/` (default gallery/gallery/) — the scoped `ClusterClient` owns
+// the prefix and prepends it on every op (and strips it off returned range
+// keys), so `ROOT` is now empty. The two whole-store scans (`range(ROOT, …)`)
+// therefore scan the entire `{ns}/{tenant}/` scope (an empty user prefix), and
+// `strip_prefix(ROOT)` is a no-op because the binding already stripped the
+// scope. Was `"gallery/"` under the old raw-client model (F-KEY-NS moved the
+// prefix into the binding, so keeping it here would double-prefix).
+const ROOT: &str = "";
 
 // First two bytes of `autumn_client`'s striped-value chunk namespace (the SDK
 // keys each stripe under `\xff\xfe…` so chunks sort AFTER every normal user
-// key — see F186 in the client crate). They fall OUTSIDE the `gallery/` scan
-// range, so the scoped scans never see them; the guard is kept as belt-and-
-// suspenders.
+// key — see F186 in the client crate). Under the namespace binding the chunk
+// key is `\xff\xfe…` RELATIVE to `{ns}/{tenant}/`, so it now sorts at the tail of
+// the scope and the whole-store scans DO see it — the `is_chunk_key` guard skips
+// it (it operates on the binding-stripped relative key, which still starts with
+// these two bytes).
 const CHUNK_NS_PREFIX: &[u8] = b"\xff\xfe";
 
 fn is_chunk_key(key: &[u8]) -> bool {
@@ -1658,7 +1662,23 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
 
-    let client: Client = Rc::new(ClusterClient::connect_raw(&manager).await?);
+    // F-KEY-NS: gallery lives in its own namespace scope `{ns}/{tenant}/`
+    // (default gallery/gallery/). The scoped client PREPENDS that prefix to every
+    // key (incl. F186 stripe chunks), so gallery's key builders emit keys RELATIVE
+    // to the scope (see `ROOT = ""`). Under authz (protected namespace), point
+    // AUTUMN_CREDENTIAL_FILE at the tenant credential from `autumn-op
+    // tenant-create` — the SDK auto-mints + renews short-TTL tokens. Without it, a
+    // plain scoped connect (works only if the namespace is unprotected).
+    let namespace = std::env::var("AUTUMN_NAMESPACE").unwrap_or_else(|_| "gallery".into());
+    let tenant = std::env::var("AUTUMN_TENANT").unwrap_or_else(|_| "gallery".into());
+    let client: Client = Rc::new(match std::env::var("AUTUMN_CREDENTIAL_FILE") {
+        Ok(path) if !path.is_empty() => {
+            let cred = autumn_client::read_credential_file(&path)?;
+            ClusterClient::connect_with_credential(&manager, &namespace, &tenant, tenant.clone(), cred)
+                .await?
+        }
+        _ => ClusterClient::connect(&manager, &namespace, &tenant).await?,
+    });
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));
 
