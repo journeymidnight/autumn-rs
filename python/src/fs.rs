@@ -129,16 +129,34 @@ impl Fs {
     /// a cross-host throughput win for fsspec model/dataset serving. TOPOLOGY-
     /// DEPENDENT (this host must reach EN data ports), default False; each read
     /// falls back to the PS proxy on any direct-read failure.
+    ///
+    /// F-AUTHZ-BUILTIN: `principal=` + `credential=` (both or neither) attach an
+    /// authz identity, exactly like `Client`/`BatchClient` and the native
+    /// `--credential-file` clients. REQUIRED once the deploy protects `fs/` —
+    /// authz gates READS on protected prefixes too, so a credential-less `Fs`
+    /// (e.g. the vLLM weight loader) would fail with PermissionDenied on every
+    /// read. `credential` is RAW bytes (hex-decode the `autumn-op tenant-create`
+    /// output first — see `autumn_kvcache._identity.read_credential_file`).
+    /// `principal` defaults to the tenant (1:1 principal↔tenant convention).
     #[staticmethod]
-    #[pyo3(signature = (manager, host=None, tenant=None, direct_read=false))]
+    #[pyo3(signature = (manager, host=None, tenant=None, principal=None, credential=None, direct_read=false))]
     fn connect(
         py: Python<'_>,
         manager: String,
         host: Option<String>,
         tenant: Option<String>,
+        principal: Option<String>,
+        credential: Option<Vec<u8>>,
         direct_read: bool,
     ) -> PyResult<Self> {
         let host = host.unwrap_or_else(|| "autumn-fs-py".to_string());
+        // Both-or-neither, checked HERE (config error) rather than surfacing as a
+        // confusing mid-read PermissionDenied.
+        if principal.is_some() != credential.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "principal= and credential= must be passed together (both or neither)",
+            ));
+        }
         // F-KEY-NS: this front-end shares the fuse core, so it scopes to the same
         // `fs/{tenant}/` keyspace. Default tenant matches the fuse binary's default
         // so a Python `autumn.Fs` and a `--tenant default` mount see the SAME
@@ -158,7 +176,18 @@ impl Fs {
                     }
                 };
                 rt.block_on(async move {
-                    let mut state = match FsState::new_with_host(&manager, host, &tenant).await {
+                    // F-AUTHZ-BUILTIN: credential path when one was supplied —
+                    // `connect_with_credential` FAILS FAST at connect if the
+                    // credential doesn't cover `fs/{tenant}/`.
+                    let opened = match credential {
+                        Some(cred) => {
+                            let who = principal.unwrap_or_else(|| tenant.clone());
+                            FsState::new_with_host_credential(&manager, host, &tenant, &who, cred)
+                                .await
+                        }
+                        None => FsState::new_with_host(&manager, host, &tenant).await,
+                    };
+                    let mut state = match opened {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e.to_string()));
