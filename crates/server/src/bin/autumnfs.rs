@@ -34,6 +34,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use autumn_client::ClusterClient;
@@ -317,7 +318,10 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
         }
         return Ok(());
     }
-    // Range scan over `[0x02][parent_ino BE]`.
+    // Range scan over `[0x02][parent_ino BE]`. PS `handle_range` returns KEYS
+    // only (`value: vec![]`), so we batch-fetch the dirent values — and, in
+    // long mode, the child inode metas — via `get_many` per page instead of a
+    // sequential `get` per entry (F-AUTUMNFS-SLOW).
     let prefix = key::dirent_prefix(ino);
     let mut start: Vec<u8> = Vec::new();
     const PAGE: u32 = 256;
@@ -326,19 +330,19 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
             .range(&prefix, &start, PAGE)
             .await
             .map_err(|e| anyhow!("dirent range: {e}"))?;
-        for entry in &resp.entries {
+
+        // Batch-fetch this page's dirent values, then decode into (name, dirent)
+        // — dropping stale keys whose value is gone.
+        let dkeys: Vec<&[u8]> = resp.entries.iter().map(|e| e.key.as_slice()).collect();
+        let dvals = cluster.get_many(&dkeys).await;
+        let mut rows: Vec<(String, DirentValue)> = Vec::with_capacity(resp.entries.len());
+        for (entry, dv) in resp.entries.iter().zip(dvals.into_iter()) {
             let (parent, name_bytes) = match key::parse_dirent_key(&entry.key) {
                 Some(v) => v,
                 None => continue,
             };
             debug_assert_eq!(parent, ino);
-            // PS `handle_range` returns only KEYS (not values) — see
-            // crates/partition-server/src/rpc_handlers.rs::handle_range
-            // (`value: vec![]`). The fuse-side `state.kv_range_keys` knows
-            // this and does a per-key `kv_get` to fetch values; we mirror
-            // that here. For one-shot CLI use, N sequential gets are fine;
-            // if this ever needs to be hot we'd batch via `get_many_into`.
-            let v = match cluster.get(&entry.key).await {
+            let v = match dv {
                 Ok(Some(v)) => v,
                 Ok(None) => continue, // stale dirent key with deleted value
                 Err(e) => {
@@ -350,11 +354,17 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
-            if long {
-                let child_meta = match cluster
-                    .get(&key::inode_key(dirent.child_inode))
-                    .await
+            rows.push((String::from_utf8_lossy(name_bytes).into_owned(), dirent));
+        }
+
+        if long {
+            // Batch-fetch the child inode metas for this page.
+            let ikeys: Vec<Vec<u8>> =
+                rows.iter().map(|(_, d)| key::inode_key(d.child_inode)).collect();
+            let ikey_refs: Vec<&[u8]> = ikeys.iter().map(|k| k.as_slice()).collect();
+            let ivals = cluster.get_many(&ikey_refs).await;
+            for ((name, dirent), iv) in rows.iter().zip(ivals.into_iter()) {
+                let child_meta = match iv
                     .ok()
                     .flatten()
                     .and_then(|b| schema::decode_inode_meta(&b).ok())
@@ -365,8 +375,10 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
                         continue;
                     }
                 };
-                print_long_entry(&name, &child_meta);
-            } else {
+                print_long_entry(name, &child_meta);
+            }
+        } else {
+            for (name, dirent) in &rows {
                 let suffix = match dirent.file_type {
                     DT_DIR => "/",
                     DT_LNK => "@",
@@ -375,6 +387,7 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
                 println!("{name}{suffix}");
             }
         }
+
         match next_range_cursor(&resp.entries, PAGE) {
             Some(next) => start = next,
             None => break,
@@ -483,6 +496,14 @@ async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
 
 // ─── cat / get ──────────────────────────────────────────────────────────────
 
+/// F-AUTUMNFS-SLOW: bounded per-download read window — fetch this many extents
+/// per `get_many_into` so a multi-extent download pipelines (per-op ZC fan-out
+/// for the ≥ 64 KiB extents; on UCX RDMA-into-dest, on TCP recv-into-dest)
+/// instead of one serial `get` per extent — and, unlike `get_many`, without
+/// assembling the whole window into one giant response frame. RAM stays bounded
+/// to `GET_WINDOW_EXTENTS * MAX_EXTENT` (64 MiB) of reused dest buffers.
+const GET_WINDOW_EXTENTS: usize = 8;
+
 async fn read_file_to_writer(
     cluster: &ClusterClient,
     ino: u64,
@@ -496,47 +517,67 @@ async fn read_file_to_writer(
         out.write_all(inline).context("write inline to output")?;
         return Ok(());
     }
-    // Range-scan extents under `[0x03][ino BE]`, fetch each, write in order.
+    // Collect every extent key (the range scan returns them offset-sorted; PS
+    // `handle_range` returns KEYS only), then fetch values a window at a time.
+    // Extent keys are 17 B each, so accumulating the full list is cheap even for
+    // a multi-GiB file; the value fetch is what we bound + pipeline.
     let prefix = key::extent_prefix(ino);
     let mut start = prefix.clone();
     const PAGE: u32 = 256;
-    let mut written: u64 = 0;
+    let mut extents: Vec<(u64, Vec<u8>)> = Vec::new(); // (offset, extent_key)
     loop {
         let resp = cluster
             .range(&prefix, &start, PAGE)
             .await
             .map_err(|e| anyhow!("extent range: {e}"))?;
         for entry in &resp.entries {
-            let (_, off) = match key::parse_extent_key(&entry.key) {
-                Some(v) => v,
-                None => continue,
-            };
-            // PS range returns keys only — fetch each extent's value via get.
-            // For multi-extent files this is N round-trips; a future caller
-            // that needs speed could switch to `get_many_into` over the key
-            // list. For one-shot CLI use, this is fine.
-            let v = match cluster.get(&entry.key).await {
-                Ok(Some(v)) => v,
-                Ok(None) => continue,
-                Err(e) => bail!("extent get for offset {off}: {e}"),
-            };
-            // Pad with zeros if there's a hole (sparse semantics).
-            if off > written {
-                let pad = off - written;
-                std::io::copy(&mut std::io::repeat(0).take(pad), out)
-                    .context("pad sparse hole")?;
-                written = off;
+            if let Some((_, off)) = key::parse_extent_key(&entry.key) {
+                extents.push((off, entry.key.clone()));
             }
-            out.write_all(&v).context("write extent to output")?;
-            written += v.len() as u64;
         }
         match next_range_cursor(&resp.entries, PAGE) {
             Some(next) => start = next,
             None => break,
         }
     }
-    // Truncate trailing zeros if extents overshot meta.size (shouldn't happen
-    // in steady state, but be defensive).
+
+    // Dest buffers reused across windows. Each extent value is ≤ MAX_EXTENT by
+    // construction (autumnfs + the fuse mount both cap extents there), so a
+    // whole-value read (`offset:0, length:0`) always fits; `get_many_into`
+    // returns the actual byte count. Writing at the extent's LOGICAL offset (not
+    // sequentially) keeps sparse/variable-extent files correct.
+    let mut bufs: Vec<Vec<u8>> = (0..GET_WINDOW_EXTENTS).map(|_| vec![0u8; MAX_EXTENT]).collect();
+    let mut written: u64 = 0;
+    for chunk in extents.chunks(GET_WINDOW_EXTENTS) {
+        let mut items: Vec<autumn_client::GetManyItem> = chunk
+            .iter()
+            .zip(bufs.iter_mut())
+            .map(|((_, k), buf)| autumn_client::GetManyItem {
+                key: k.as_slice(),
+                offset: 0,
+                length: 0,
+                dest: buf.as_mut_slice(),
+            })
+            .collect();
+        let res = cluster.get_many_into(&mut items).await;
+        drop(items); // release the &mut borrows of `bufs` before reading them
+        for ((off, _), (r, buf)) in chunk.iter().zip(res.iter().zip(bufs.iter())) {
+            let n = match r {
+                Ok(Some(n)) => *n,
+                Ok(None) => continue,
+                Err(e) => bail!("extent get for offset {off}: {e}"),
+            };
+            // Pad with zeros if there's a hole (sparse semantics).
+            if *off > written {
+                let pad = *off - written;
+                std::io::copy(&mut std::io::repeat(0).take(pad), out)
+                    .context("pad sparse hole")?;
+                written = *off;
+            }
+            out.write_all(&buf[..n]).context("write extent to output")?;
+            written += n as u64;
+        }
+    }
     out.flush().context("flush output")?;
     Ok(())
 }
@@ -563,42 +604,93 @@ async fn cmd_get(cluster: &ClusterClient, remote: &str, local: &PathBuf) -> Resu
 
 // ─── put / touch ────────────────────────────────────────────────────────────
 
+/// F-AUTUMNFS-SLOW: bounded per-upload streaming window. Read + pipeline this
+/// many `MAX_EXTENT` chunks at a time. `put_many` pipelines a window
+/// concurrently (grouped by owning partition, ZC for the ≥ 64 KiB extents —
+/// every 8 MiB extent qualifies), so a multi-GiB upload streams at the
+/// cluster's write bandwidth instead of one serial round-trip per extent, while
+/// RAM stays bounded to `PUT_WINDOW_EXTENTS * MAX_EXTENT` (64 MiB) rather than
+/// the whole file. Mirrors the fuse mount's `WRITE_BUF_EXTENTS` (8).
+const PUT_WINDOW_EXTENTS: usize = 8;
+
+/// Read up to `cap` bytes, looping until the buffer is full or EOF. A returned
+/// length < `cap` therefore reliably means EOF — a bare `Read::read` may return
+/// a short count without EOF, which would corrupt the inline-vs-extent decision
+/// and the extent boundaries.
+fn read_full_chunk(r: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; cap];
+    let mut filled = 0;
+    while filled < cap {
+        match r.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Flush a window of pending extents via one pipelined `put_many`, then clear it.
+async fn flush_put_window(
+    cluster: &ClusterClient,
+    window: &mut Vec<(Vec<u8>, Bytes)>,
+) -> Result<()> {
+    if window.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<(&[u8], Bytes, u64)> =
+        window.iter().map(|(k, v)| (k.as_slice(), v.clone(), 0u64)).collect();
+    for (i, r) in cluster.put_many(&items).await.into_iter().enumerate() {
+        r.map_err(|e| {
+            let off = key::parse_extent_key(&window[i].0).map(|(_, o)| o).unwrap_or(0);
+            anyhow!("put extent at {off}: {e}")
+        })?;
+    }
+    window.clear();
+    Ok(())
+}
+
 async fn write_file_from_reader(
     cluster: &ClusterClient,
     parent_ino: u64,
     leaf: &[u8],
     mut data_reader: impl Read,
 ) -> Result<u64> {
-    // Read everything into RAM first. This CLI is for one-off ops on
-    // small/medium files; a streaming-with-chunked-extents version is the
-    // next refactor if we ever need it for multi-GiB uploads.
-    let mut buf = Vec::new();
-    data_reader.read_to_end(&mut buf).context("read source")?;
-    let size = buf.len() as u64;
-
     let new_ino = alloc_inode(cluster).await?;
     let mut meta = new_file_meta();
-    meta.size = size;
 
-    if size <= INLINE_THRESHOLD as u64 {
-        meta.inline_data = Some(buf);
-    } else {
-        // Split into ≤ MAX_EXTENT chunks at offsets 0, MAX_EXTENT, 2*MAX_EXTENT, …
-        // Each gets its own extent_key. Reads stitch them together via the
-        // extent_prefix range scan above.
-        let mut off: u64 = 0;
-        let mut rem = &buf[..];
-        while !rem.is_empty() {
-            let n = std::cmp::min(MAX_EXTENT, rem.len());
-            let chunk = &rem[..n];
-            cluster
-                .put(&key::extent_key(new_ino, off), chunk)
-                .await
-                .map_err(|e| anyhow!("put extent at {off}: {e}"))?;
+    // Stream the source in `MAX_EXTENT` chunks (F-AUTUMNFS-SLOW: no whole-file
+    // read-to-RAM). The FIRST chunk decides inline vs extent: a file that fits
+    // in one sub-`INLINE_THRESHOLD` read is stored inline in the inode (no
+    // extent keys), matching the fuse mount's small-file layout. Everything
+    // larger pipelines through windowed `put_many`.
+    let mut off: u64 = 0;
+    let mut window: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(PUT_WINDOW_EXTENTS);
+    let mut first = true;
+    loop {
+        let chunk = read_full_chunk(&mut data_reader, MAX_EXTENT).context("read source")?;
+        let n = chunk.len();
+        // `n < MAX_EXTENT` ⇒ EOF (read_full_chunk otherwise fills fully).
+        if first && n < MAX_EXTENT && n <= INLINE_THRESHOLD {
+            meta.inline_data = Some(chunk);
+            off = n as u64;
+            break;
+        }
+        first = false;
+        if n > 0 {
+            window.push((key::extent_key(new_ino, off), Bytes::from(chunk)));
             off += n as u64;
-            rem = &rem[n..];
+            if window.len() >= PUT_WINDOW_EXTENTS {
+                flush_put_window(cluster, &mut window).await?;
+            }
+        }
+        if n < MAX_EXTENT {
+            break; // EOF
         }
     }
+    flush_put_window(cluster, &mut window).await?;
+    meta.size = off;
+
     cluster
         .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta))
         .await
@@ -745,4 +837,56 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
             .await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A `Read` that hands back at most `step` bytes per call — models a socket
+    /// / pipe that returns short reads WITHOUT EOF. `read_full_chunk` must keep
+    /// looping until the requested `cap` is filled (or true EOF), so a short
+    /// syscall never fakes an early inline-vs-extent decision or a short extent.
+    struct ChoppyReader {
+        inner: Cursor<Vec<u8>>,
+        step: usize,
+    }
+    impl Read for ChoppyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let cap = self.step.min(buf.len());
+            self.inner.read(&mut buf[..cap])
+        }
+    }
+
+    #[test]
+    fn read_full_chunk_fills_despite_short_reads() {
+        // 5904 bytes, cap 4096 ⇒ one full chunk + one short (< cap) chunk.
+        let data: Vec<u8> = (0..5904u32).map(|i| i as u8).collect();
+        let mut r = ChoppyReader { inner: Cursor::new(data.clone()), step: 7 };
+        // First chunk: exactly `cap` bytes even though each read yields ≤ 7.
+        let c1 = read_full_chunk(&mut r, 4096).unwrap();
+        assert_eq!(c1.len(), 4096, "must fill cap despite 7-byte reads");
+        assert_eq!(c1, &data[..4096]);
+        // Second chunk: the remaining 1808 (< cap) ⇒ signals EOF via short len.
+        let c2 = read_full_chunk(&mut r, 4096).unwrap();
+        assert_eq!(c2.len(), 5904 - 4096, "short (< cap) len ⇒ EOF reached");
+        assert_eq!(c2, &data[4096..]);
+        // Third chunk: nothing left.
+        let c3 = read_full_chunk(&mut r, 4096).unwrap();
+        assert!(c3.is_empty(), "past EOF ⇒ empty");
+    }
+
+    #[test]
+    fn read_full_chunk_exact_multiple_is_not_early_eof() {
+        // cap-sized file: first read fills exactly, and only the NEXT read
+        // observes EOF (empty) — so a full extent is never mistaken for the
+        // last one.
+        let data = vec![0xABu8; 4096];
+        let mut r = ChoppyReader { inner: Cursor::new(data), step: 100 };
+        let c1 = read_full_chunk(&mut r, 4096).unwrap();
+        assert_eq!(c1.len(), 4096);
+        let c2 = read_full_chunk(&mut r, 4096).unwrap();
+        assert!(c2.is_empty());
+    }
 }
