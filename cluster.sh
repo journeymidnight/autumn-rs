@@ -616,6 +616,15 @@ launch_manager() {
             || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
         mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
     fi
+    # Sticky authz: once provisioned, authz stays ON across `restart`/`start` even
+    # without AUTUMN_AUTH=1 — if a signing key already exists on disk (from a prior
+    # bring-up) and the operator didn't explicitly pass AUTUMN_AUTH=0, re-enable it
+    # so a plain `restart` never SILENTLY drops token enforcement. `reset` wipes
+    # all of $DATA_ROOT (incl authz/), so a fresh cluster starts clean unless
+    # AUTUMN_AUTH=1 is set.
+    if [[ "${AUTUMN_AUTH:-}" != "0" && -s "$DATA_ROOT/authz/signing.key" ]]; then
+        AUTUMN_AUTH=1
+    fi
     # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key + admin token and
     # protects mem/ & gallery/, feeding the AUTUMN_AUTH_* block below (per-example
     # tenant credentials are minted post-bootstrap). Files live under
