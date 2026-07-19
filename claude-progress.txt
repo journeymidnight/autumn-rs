@@ -1,5 +1,57 @@
 Date: 2026-07-19
 TaskStatus: completed
+Task scope: tenant-first + authz-mandatory 全量重部署到 VKE 线上（用户 6 项：pull / cp build /
+  验 BUG-KVC-NO-HIT / 验 autumnfs 提速 / authz 强制 / fs 只剩 fs/{tenant}）。集群现处于可服务状态。
+
+── 线上现状（VKE, ns=autumn）──
+镜像 autumn-rs / vllm-autumn / hermes-autumn = 772372a（tenant-first + authz + presplit）。
+集群：5 EN + 3 PS + manager + etcd 全绿；registry 预注册 fs/kvc/mem；authz **默认开且强制**。
+布局：fs 6 分区（`default/fs/[0x03][ino]` 切在 ino 4..8 → 5 个 shard 各占一个分区，2/PS）。
+权重：Qwen32B 5 shard 19 GB 已用 tenant-first + 凭据上传（ino 4-8，与 presplit 对齐）。
+vLLM：权重 18.49 GiB / 16.8 s 载入；KV 63.78 GiB / 261k token；chat 正常。hermes-tui 已起。
+
+── 六项结论 ──
+1 pull ✅  2 cp build ✅（三镜像多轮，HEAD 移动时重建）
+3 BUG-KVC-NO-HIT ✅ **已修复并线上验证**：存 → 重启 vLLM 清本地 GPU prefix cache → 再问，
+  本地 0.0% / **external 98.9%**。冷 prefill 1084 token 1.33 s。
+  ⚠ 测量陷阱：同进程重复同一 prompt 时 external 恒 0%（本地全覆盖，外部不被 LOAD）=正确行为。
+4 autumnfs ⚠ **一半**：GET 276 MiB/s（分窗 get_many_into 生效）；**PUT 仍 30–40 MiB/s 没变快**
+  （536 s / 19 GB）。已排除来源盘（EBS 直读 111 MiB/s）。根因=client put_many 的 ZC 路径原是
+  串行 await（≈40 MB/s 上限），用户随后已修 → **待装新镜像重测**。
+5 authz ✅ 真强制：无凭据 autumnfs put → `permission denied: protected key requires a capability
+  token`；`tenant-create --prefix default/` 铸凭据 → Secret autumn-credential → 上传/vLLM/kvcache/
+  hermes 全接。
+6 fs 布局 ✅ 实为 **{tenant}/fs/**（tenant-first）：presplit 切点与 partition range 均为 default/fs/…。
+
+── 本次修的 bug（已 commit+push）──
+2f6aa68 PyO3 autumn.Fs 无凭据支持 → authz 强制下 vLLM 根本载不了权重（Rust 核心早有
+        new_with_host_credential，只差 binding）；loader 加 tenant/credential_file/principal。
+9384937 loader 只给 credential 不给 principal → 触发我自己的 both-or-neither 检查，engine init 挂。
+        改为 principal 默认取 tenant（对齐 autumnfs/fuse 的 --principal 默认）。
+7d52cea etcd --max-txn-ops 128 → 1024：split 的原子 txn op 数随分区 extent 数增长，默认值把
+        「可分裂分区」卡在 ~40 extent。合并 32→1（127 extent）后 presplit 每刀都报
+        `too many operations in txn request`（表面是 precondition failed）。
+0a019fe BUG-PRESPLIT-ONE-CUT 记档（见下）。
+
+── TODO（下次接手）──
+[1] **重测 autumnfs 上传**：装 put_many 并发修复后的 autumn-rs 镜像（已触发 build 7d52cea），
+    重跑 upload-model-qwen32b，期望远高于 30–40 MiB/s。
+[2] ~~BUG-PRESPLIT-ONE-CUT~~ **已由并行会话修掉**（F-FS-STRIPE 批次「顺手修 cmd_presplit 陈旧
+    region cache bug」）——正是我线上撞到的根因。待装新镜像后确认一次调用能落满 N 刀。
+[3] **kvc presplit 未做**：需要 `--hash-prefix '<model-fp>/vllm/v1/'`，而 model fingerprint 拿不到——
+    kvcache connector 的 `AutumnKVConnector role=… tenant=…` INFO 没进 vLLM stdout（logger 未 propagate）。
+    先修这个可观测性缺口，再按 hash 切 kvc。
+[4] ~~toolbox 坏 rollout~~ **已修**：merge patch 曾丢掉 command 导致 CrashLoopBackOff；
+    已用 /tmp/autumn-vllm-hermes/autumn-toolbox.yaml 重建（镜像 772372a + 挂 autumn-credential），
+    实测 `autumnfs --tenant default --credential-file … ls /models/qwen32b` 正常列出 5 个 shard。
+    教训：给 Deployment 打 strategic-merge patch 加 volumeMount 时必须带上 image+command，
+    否则会把容器 spec 抹掉——改 manifest 重 apply 更安全。
+[5] mem 命名空间未 presplit（用户指示先不做）；bootstrap 仍是 32 路裸字节均匀分裂（namespace-blind），
+    每次都要「merge 到 1 → presplit」，可考虑把 AUTUMN_BOOTSTRAP_PRESPLIT 默认改 1。
+[6] APT_MIRROR build-arg 已加进 vllm/hermes Dockerfile，但 **CP pipeline 的 buildParams 还没加**
+    （console 手工加 `--build-arg APT_MIRROR=https://mirrors.volces.com`），否则 apt 仍走上游很慢。
+
+---- 同日另一批（并行会话：F-FS-STRIPE）----
 Task scope: F-FS-STRIPE — 大文件跨 lane partition 条带化 + 突破单文件写天花板（用户多轮）。
 Done（commits aab377c→21004e4，全 push）:
   - 条带化: InodeMeta.stripe(schema v3) + striped key [0x03][lane][ino][off] + autumn-op
