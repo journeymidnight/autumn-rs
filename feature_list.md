@@ -82,6 +82,21 @@
 - **Acceptance**: 同 prompt 二次请求 external hit rate > 0 且 TTFT 显著下降；prefill throughput 回到同硬件无 connector 的水平（或差距 < 20%）；kvc 写入量与实际复用相称；提供 `kv_connector_extra_config` 开关一键停用。
 - **Status**: `passes: false` (2026-07-18) — **根因定位 + 修复 + 本机真 e2e 验证 + TCP/UCX 开销基准完成，待线上 redeploy**（部署=用户驱动）。**根因**（真机复现：本地 3-EN 集群 + vLLM 0.23 + 真 Qwen3-VL-32B-Instruct on H200，逐调用 trace；本机装的 `autumn` .so 旧于源码 → 先 `maturin develop --release` 重建对齐 namespace binding）：0% external hit **是分层设计的正确行为**——KV 在 **GPU prefix cache (HBM)**（非 CPU），vLLM 先命中本地、只把"本地未命中的残余 token"问外部；同实例重复本地全覆盖 → external 永不被 LOAD。**触发 hit 无需重启**：`llm.reset_prefix_cache()` 清 GPU cache → 下个请求 GPU miss → 命中 autumn（实测 after-reset matched=1/load_ok=64；正确性 O_extload==O_localcache 逐 token 一致）。**真 bug = 两点**：(1) 冗余重存（store 从不查已存 → 每个本地命中的重复请求重存 64 层 = 20 GB 放大）；(2) **同步搬运挂在 prefill 关键路径**——`save_kv_layer` 同步 `.detach().cpu()`（64 层 352MB D2H + 每层 sync）+ 同步 put_from。**修复**（`vllm_connector.py`，纯 Python，无 kill switch）：把**几乎所有工作移到后台单线程**——`save_kv_layer` 只留 GPU 侧 gather（`_extract_layer` 出独立 tensor，解耦 paged block、不 sync CPU）；后台 job 用 CUDA event 等 gather 完 → **D2H `.cpu()` + store-dedup(is_present) + 批量 put_from + marker** 全在后台；marker 仅在写全 ACK 后发（"marker⇒全层 durable"不变）；in-flight 上限 `_MAX_INFLIGHT_SAVES=2`（GPU staging 另按 vLLM token 预算天然有界），超了丢存（纯 cache 后补）；submit 失败回滚计数。**读写走 ZC 批量**（`put_from`/`get_into`=`BatchClient` ZC；≥64K+UCX 自动选 put_zc/EN-direct）：write 一次批量全层；**read 从逐层 64 次 get 改为一次批量 get_into**。**基准（1k-token prompt, H200, no-hit 纯开销 vs 无 connector）**：TTFT **+6.5ms(TCP)/+7.0ms(UCX)**、TPOT ~0（同步搬运时代是 +148ms）——搬运移出关键路径后 no-hit 开销**与传输无关**（GPU gather 主导，网络全异步）。**验证**：单测 33 绿（scheduler dedup + 后台 job dedup/写、torch 可选）；真机 e2e：dedup（warm 重复存 0）、异步（marks_at_gen=0）、跨实例 load 正确性 O2==O3 逐 token、reset 触发 hit、enabled/dead-backend N/A（无 kill switch）。coco(GPT-5.5 deep) 5 轮 findings：actionable 全修（inflight 泄漏回滚、doc、test importorskip），bounded-by-design 的（GPU staging=token 预算界、重复请求走廉价 gader）记档不改（huge GPU headroom + 复杂度/泄漏风险）。剩：线上 redeploy vLLM 主机（connector 纯 Python，native 未改 → 重装 autumn_kvcache 包即可）。
 
+### BUG-PRESPLIT-ONE-CUT — `autumn-op presplit` 每次调用只落 1 个切点（owner resolve 用了过期路由）
+- **Trigger** (2026-07-19, tenant-first 上线后线上实测): `presplit --namespace fs --tenant default --fs-inos 4,5,6,7,8`
+  报 `1/5 cut points applied`，其余 4 个全 skip，错误是
+  `split --at key …005 is at or above partition end …004 (must be strictly inside [start,end))`。
+  即：第一刀把 part 17 切成 `[,ino4)` + `[ino4,∞)` 之后，orchestration **仍把后续切点解到 part 17**
+  （现在是左孩子，end=ino4），而不是右孩子。**重复调用 5 次**才把 5 个切点全落（每次进程新起、
+  路由缓存是新的 → 只成第一刀），最终 6 个 partition 布局正确。
+- **Scope**: `cmd_presplit` 的"逐点重 resolve owner"没有在每次 `split_at` 之后刷新 client 的
+  region 缓存（`refresh_regions` / 重新 `resolve_key`），拿到的是分裂前的映射。修=每刀之后强制刷新
+  路由再解下一个点（或直接用返回的新 part_id 推进）。顺带：失败信息误导——最终报
+  "Check --hash-prefix / authz / partition map"，但真因是过期路由，应区分这两类。
+- **Acceptance**: 一次调用把 N 个切点全部落地（`N/N applied`）；单测覆盖"连续多刀"路径。
+- **Status**: `passes: false` (2026-07-19) — 线上已用"重复调用 5 次"绕过，fs 布局正确（6 分区，
+  每个 shard 独占）。
+
 ### F-AUTUMNFS-SLOW — autumnfs CLI 上传/读取明显偏慢
 - **Trigger** (2026-07-18, 用户线上观察 "明显感觉 autumnfs cli 偏慢"): 19 GB / 5 shard 顺序上传耗时约 7 min（≈45 MB/s），远低于集群实际能力（同集群 perf-check 写吞吐高一个量级）。
 - **Scope**: 定位并消除串行瓶颈。当前实现：`cmd_put` → `write_file_from_reader` 先把**整个文件 `read_to_end` 进内存**，再按 `MAX_EXTENT` 逐块**顺序 `put`**（无 pipeline、无并发、无 ZC）；`ls`/`cat` 因 PS `handle_range` 只回 key，对每个 key 再做一次**串行 `get`**。候选优化：流式分块读（去掉整文件驻留内存）+ `put_many` 批量并发（SDK 已有 `fan_out` 原语）+ 大 value 走 `put_zc`；`ls`/`cat` 改 `get_many_into` 批量取值。
