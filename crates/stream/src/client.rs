@@ -2122,14 +2122,25 @@ impl StreamClient {
                     // fresh snapshot" / "defer until it completes"
                     // concurrency conflicts — keep the retry loop
                     // (`is_retryable`).
-                    let (retryable, already_rotated) = match e.downcast_ref::<ManagerError>() {
+                    let (retryable, skip_rotate) = match e.downcast_ref::<ManagerError>() {
                         Some(me) => (
                             me.is_retryable(),
-                            // NOT_LEADER already rotated in
-                            // `note_manager_code` — don't skip a second
-                            // address by rotating again here.
-                            me.code == manager_rpc::CODE_NOT_LEADER,
+                            // Don't rotate the manager for:
+                            //  - NOT_LEADER: already rotated in
+                            //    `note_manager_code` — a second rotate here
+                            //    would skip a live address.
+                            //  - a TRANSIENT concurrency conflict: this is a
+                            //    LEADER-side self-heal ("retry with a fresh
+                            //    snapshot" / "defer … until it completes"), so
+                            //    stay on the SAME leader and wait it out;
+                            //    rotating to a follower would just burn an
+                            //    iteration on the NOT_LEADER it returns (coco P2,
+                            //    the multi-manager HA regression).
+                            me.code == manager_rpc::CODE_NOT_LEADER
+                                || me.is_transient_conflict(),
                         ),
+                        // Transport error (no ManagerError): rotate to try
+                        // another manager.
                         None => (true, false),
                     };
                     if !retryable {
@@ -2147,7 +2158,7 @@ impl StreamClient {
                             e.context(format!("{label} failed after {max_retries} retries"))
                         );
                     }
-                    if !already_rotated {
+                    if !skip_rotate {
                         self.rotate_manager();
                     }
                     tracing::warn!(
@@ -6175,6 +6186,43 @@ mod manager_retry_tests {
             .await;
         res.expect("transient precondition must eventually succeed after retries");
         assert_eq!(attempts.get(), 3, "must have retried the transient conflict");
+    }
+
+    /// coco P2 (multi-manager HA): a TRANSIENT precondition retry must NOT rotate
+    /// the manager — it's a LEADER-side self-heal, so stay on the leader and wait
+    /// it out. Rotating to a follower would just burn an iteration on the
+    /// NOT_LEADER it returns, reducing effective retries against the real leader.
+    #[compio::test]
+    async fn transient_precondition_does_not_rotate_manager() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    if a.get() < 3 {
+                        sc2.check_manager_resp(
+                            manager_rpc::CODE_PRECONDITION,
+                            "stream 7 membership changed during alloc_extent; \
+                             retry with fresh snapshot",
+                            "alloc_new_extent",
+                        )?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        res.expect("transient precondition retries + succeeds");
+        assert_eq!(attempts.get(), 3, "retried the transient conflict twice");
+        assert_eq!(
+            sc.current_mgr.get(),
+            0,
+            "transient precondition stays on the SAME leader — no rotation"
+        );
     }
 
     /// Transport-layer failures (no ManagerError in the chain) keep the

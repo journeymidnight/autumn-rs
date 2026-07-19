@@ -621,13 +621,15 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
   `"host1:9001,host2:9001,host3:9001"`.
 - Tries each manager to `acquire_owner_lock`, skipping `NotLeader` responses.
 - All subsequent manager RPCs use `self.manager_addr()` which returns the current leader.
-- On TRANSPORT failure / NOT_LEADER / CODE_ERROR — AND the TRANSIENT
+- On TRANSPORT failure / CODE_ERROR, `rotate_manager()` switches to the next
+  address (round-robin) and the call is retried. NOT_LEADER is retried but
+  rotated by `note_manager_code` (the loop must not double-rotate). The TRANSIENT
   `alloc_extent` Preconditions (`is_transient_conflict`: "retry with [a] fresh
-  snapshot" / "defer … until it completes") — `rotate_manager()` switches to the
-  next address (round-robin) and the call is retried. DETERMINISTIC codes
-  (NotFound / InvalidArgument / the owner-epoch-fence Precondition / deterministic
-  business-rule Preconditions) FAIL FAST via the typed `ManagerError` — see
-  Programming Note 30 (BUG-MGR-RETRY-CLASS).
+  snapshot" / "defer … until it completes") are retried WITHOUT rotating — they
+  are a leader-side self-heal, so the call stays on the SAME leader and waits it
+  out. DETERMINISTIC codes (NotFound / InvalidArgument / the owner-epoch-fence
+  Precondition / deterministic business-rule Preconditions) FAIL FAST via the
+  typed `ManagerError` — see Programming Note 30 (BUG-MGR-RETRY-CLASS).
 - `owner_key` should be unique per logical writer (e.g., `"ps/{ps_id}/partition/{part_id}"`).
 - **Return type change (4.3)**: `connect` / `new_with_owner_epoch` now return `Rc<StreamClient>`.
   The `Rc` is needed so the internal per-stream worker tasks can hold a
@@ -1648,17 +1650,21 @@ sufficient (and cheaper than DashMap).
       `downcast_ref`, Display keeps the legacy `"<ctx> failed: <message>"`
       shape (non-fence) so log greps / substring matchers are unaffected.
     - **`retry_manager_call` classifies before retrying**: transport errors
-      (no `ManagerError` in the chain), `CODE_NOT_LEADER` / `CODE_ERROR`, AND the
-      TRANSIENT concurrency-conflict Preconditions (`is_transient_conflict` —
-      "retry with [a] fresh snapshot" / "defer … until it completes", the sole
-      `retry_manager_call` user `alloc_new_extent`'s self-heal) keep rotate+retry
-      (F267 — NOT_LEADER is rotated once by `note_manager_code`, the loop must
-      not double-rotate); NOT_FOUND / INVALID_ARGUMENT / the owner-fence +
-      deterministic business-rule PRECONDITIONS / unknown codes fail fast,
-      returned UNWRAPPED (no `.context`) so the Display stays outermost.
+      (no `ManagerError` in the chain) + `CODE_ERROR` rotate+retry; `CODE_NOT_LEADER`
+      retries but is rotated by `note_manager_code` (F267 — the loop must not
+      double-rotate); the TRANSIENT concurrency-conflict Preconditions
+      (`is_transient_conflict` — "retry with [a] fresh snapshot" / "defer … until
+      it completes", the sole `retry_manager_call` user `alloc_new_extent`'s
+      self-heal) retry WITHOUT rotating (leader-side self-heal — stay on the
+      leader); NOT_FOUND / INVALID_ARGUMENT / the owner-fence + deterministic
+      business-rule PRECONDITIONS / unknown codes fail fast, returned UNWRAPPED
+      (no `.context`) so the Display stays outermost.
       **BUG-MGR-RETRY-CLASS's first cut over-generalized fail-fast from the fence
-      to ALL Preconditions, killing the alloc self-heal retry — coco P1, fixed
-      by the `is_transient_conflict` marker split.**
+      to ALL Preconditions, killing the alloc self-heal retry (coco P1); the
+      naive re-add then rotated the manager on every transient conflict, burning
+      the multi-manager HA retry budget (coco P2) — fixed by the
+      `is_transient_conflict` marker split (retryable) + the `skip_rotate` gate
+      (no rotation for transient conflicts).**
     - **Owner-fence self-heal**: `ManagerError::is_owner_fence`
       (CODE_PRECONDITION + `autumn_common::is_owner_epoch_fence_message`, the
       matcher living NEXT TO the `ensure_owner_epoch` producer in

@@ -884,6 +884,26 @@ async fn action_response(mgr: &AutumnManager, body: &[u8]) -> Response<Body> {
         }
     }
 
+    // Cluster-scoped rebalance takes NO target fields. Reject on raw JSON KEY
+    // presence (coco P3): the parsed check in `validate_action` folds a
+    // wrong-type / explicit-`0` value to 0, so `{"action":"rebalance",
+    // "part_id":"7"}` or `"part_id":0` would otherwise slip past it and run a
+    // whole-cluster rebalance while the caller believed it was scoped.
+    if action == "rebalance" {
+        for f in ["part_id", "victim_part_id", "extent_id", "extent_ids"] {
+            if v.get(f).is_some() {
+                let body = serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "rebalance is cluster-scoped and takes no target fields (got '{f}')"
+                    ),
+                })
+                .to_string();
+                return json_response(StatusCode::BAD_REQUEST, body, "application/json");
+            }
+        }
+    }
+
     if let Err(e) = validate_action(action, part_id, victim_part_id, extent_id, &extent_ids) {
         let body = serde_json::json!({ "ok": false, "error": e }).to_string();
         return json_response(StatusCode::BAD_REQUEST, body, "application/json");
