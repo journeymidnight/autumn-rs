@@ -1438,7 +1438,10 @@ dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n
 ## Enabling authz (F-AUTHZ-BUILTIN)
 
 **Deploy layer = ON by default (Task 2, 2026-07-18).** Both deploy paths arm
-data-plane authz automatically and protect `fs/`, `kvc/`, `mem/`:
+data-plane authz automatically. **Protect-everything (tenant-first, 2026-07-19):**
+with a signing key present, EVERY tenant-scoped write requires a token — there is
+no protected-prefix list; a credential grants the whole tenant `{tenant}/` (or a
+specific `{tenant}/{ns}/`). The key layout is `{tenant}/{namespace}/`.
 
 - **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
   token once (reused across re-deploys — rotating invalidates every credential),
@@ -1447,8 +1450,8 @@ data-plane authz automatically and protect `fs/`, `kvc/`, `mem/`:
   then pass `--credential-file ~/.autumn-deploy/authz/default.cred --tenant
   default`.
 - **k8s** (`deploy/overlays/vke/deploy.sh`) generates the `autumn-authz` Secret
-  (signing key + admin token) once and the manager StatefulSet mounts it; the
-  ConfigMap sets `AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/ mem/`. Mint a client
+  (signing key + admin token) once and the manager StatefulSet mounts it (the
+  signing key alone arms protect-everything — no prefix list). Mint a client
   credential + Secret with the manual steps below.
 - **Escape hatch:** `AUTUMN_AUTH_DISABLE=1` (both paths) runs authz-OFF — for
   local debugging. The dev/test harness (`cluster.sh`, `scripts/*_chaos.sh`)

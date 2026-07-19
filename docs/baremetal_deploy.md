@@ -110,9 +110,11 @@ skips bootstrap and preserves data, so `stop` + `start` is a safe restart.
 `start` arms data-plane authz automatically (F-AUTHZ-BUILTIN): it generates a
 signing key + admin token under `~/.autumn-deploy/authz/` (override with
 `AUTUMN_AUTHZ_DIR`) — **once, reused across re-deploys** so already-minted
-credentials keep working — distributes the key to every manager host, protects
-`fs/ kvc/ mem/`, and after bootstrap mints a `default`-tenant credential to
-`~/.autumn-deploy/authz/default.cred`. Point clients at it:
+credentials keep working — distributes the key to every manager host, and after
+bootstrap mints a `default`-tenant credential (granting the whole tenant
+`default/`) to `~/.autumn-deploy/authz/default.cred`. With authz on, EVERY
+tenant-scoped write needs a token (protect-everything; the key layout is
+`{tenant}/{namespace}/`). Point clients at the credential:
 
 ```bash
 autumnfs   --manager $M --credential-file ~/.autumn-deploy/authz/default.cred put F /F

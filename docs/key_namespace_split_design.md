@@ -3,6 +3,15 @@
 Status: PROPOSAL（未实现；本文档只做设计与论证）
 Date: 2026-07-16
 
+> **TENANT-FIRST (2026-07-19)：key 顺序已翻转为 `{tenant}/{namespace}/`（tenant 在最外层）。**
+> 本文档通篇写 `{namespace}/{tenant}/`（如 `fs/{tenant}/`、`mem/{tenant}/`），那是旧顺序；
+> 用户 2026-07-19 拍板：tenant 是强制的最外层隔离单位，应是最外层前缀 → 现况 wire key =
+> `{tenant}/{namespace}/[relative]`（如 `default/fs/[0x01]…`）。连带：authz 改「开了就全保护」
+> ——authz 开⇒每个 tenant-scoped 写都要 token，凭据授 `{tenant}/`（整租户）或 `{tenant}/{ns}/`，
+> `protected_prefixes` 退役；Layer-A 的「已注册 namespace」校验改为 key 第 2 段解析（不再左锚
+> prefix-match）。实现见 feature_list `F-KEY-NS-TENANT-FIRST`（client `NamespaceBinding::scoped`
+> 一行 + PS authz 两层 + 部署 grant `default/`）。以下 `{ns}/{tenant}/` 内容保留作历史/论证。
+>
 > **REVERSION (2026-07-18)：`{volume}` 子层已移除，fuse 前缀回到 `fs/{tenant}/`。**
 > 本文档下方（尤其 §D1 及 key 布局表）多处写 `fs/{tenant}/{volume}/`，那是
 > SD-3 曾短暂落地的两层模式；用户 2026-07-18 拍板去掉 `{volume}` 层——
