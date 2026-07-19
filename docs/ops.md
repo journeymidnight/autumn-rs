@@ -1435,13 +1435,37 @@ comparison is vs Model-Streamer-from-remote-storage, where autumn/RDMA wins).
 The `Fs.read_into` seam alone (no GPU) is checkable headless with a `bytearray`
 dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n)`.
 
-## Enabling authz for `mem/` — D6-mem runbook (F-AUTHZ-BUILTIN)
+## Enabling authz (F-AUTHZ-BUILTIN)
+
+**Deploy layer = ON by default (Task 2, 2026-07-18).** Both deploy paths arm
+data-plane authz automatically and protect `fs/`, `kvc/`, `mem/`:
+
+- **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
+  token once (reused across re-deploys — rotating invalidates every credential),
+  distributes the key to every manager host, and after bootstrap mints a
+  `default`-tenant credential to `~/.autumn-deploy/authz/default.cred`. Clients
+  then pass `--credential-file ~/.autumn-deploy/authz/default.cred --tenant
+  default`.
+- **k8s** (`deploy/overlays/vke/deploy.sh`) generates the `autumn-authz` Secret
+  (signing key + admin token) once and the manager StatefulSet mounts it; the
+  ConfigMap sets `AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/ mem/`. Mint a client
+  credential + Secret with the manual steps below.
+- **Escape hatch:** `AUTUMN_AUTH_DISABLE=1` (both paths) runs authz-OFF — for
+  local debugging. The dev/test harness (`cluster.sh`, `scripts/*_chaos.sh`)
+  never sets `AUTUMN_AUTH_*`, so it is authz-OFF unconditionally.
+- **Native clients** all take `--credential-file <path>` (+ `--principal`,
+  default = tenant): `autumn-fuse`, `autumnfs`, `autumn-client`. The file holds
+  the LOWERCASE HEX from `tenant-create` (a bare hex line, or its whole
+  `credential: <hex>` stdout line — both accepted; it is hex-decoded to the raw
+  bytes the manager hashed).
+
+### Manual runbook (custom tenants, or a non-deploy/`mem/`-only setup)
 
 Client-side wiring is DONE (PyO3 `Client.connect(tenant=,credential=)` +
 `BatchClient(tenant=,credential=)`, kvcache vLLM/sglang `auth_tenant` +
 `auth_credential_file` in extra_config, hermes provider
 `AUTUMN_MEMORY_CREDENTIAL_FILE`). Everything below is the OPERATIONAL
-enablement — deliberately not automated; run it when you decide to arm.
+enablement for a tenant the deploy layer did NOT auto-provision.
 Gradual-rollout axis: credentials-first (steps 1–4 are harmless with authz
 off), prefix-enforcement last (step 5).
 

@@ -114,3 +114,15 @@ spec:
             periodSeconds: 10
           resources:
             requests: { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            # F-AUTHZ-BUILTIN: signing key + admin token. The Secret is
+            # `optional` so a deploy WITHOUT it (authz disabled) still schedules
+            # — the entrypoint's `-s` gate then runs the manager authz-OFF.
+            - name: authz
+              mountPath: /etc/autumn/authz
+              readOnly: true
+      volumes:
+        - name: authz
+          secret:
+            secretName: autumn-authz
+            optional: true

@@ -656,6 +656,100 @@ wait_ps_ready() {
     log "WARN: PS partitions not fully registered after 60s (routing may be briefly stale)"
 }
 
+# F-AUTHZ-BUILTIN: authz is ON by default at the DEPLOY layer (the dev/test
+# harness `cluster.sh` never sets AUTUMN_AUTH_* so it stays OFF). Auto-generate a
+# signing key + admin token ONCE (reused across re-deploys — re-genning would
+# invalidate every minted credential), protect the built-in namespaces, and
+# distribute the key to every manager host. Escape hatch: AUTUMN_AUTH_DISABLE=1.
+# If the operator already set AUTUMN_AUTH_SIGNING_KEY_FILE, respect it and only
+# default the protected-prefix list. Sets AUTUMN_AUTH_* env that the existing
+# `_start_managers` env→flag block consumes.
+AUTHZ_LOCAL_ADMIN_TOKEN=""
+AUTHZ_LOCAL_DIR=""
+_ensure_authz() {
+    if [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]]; then
+        # Make the escape hatch AUTHORITATIVE: a leftover AUTUMN_AUTH_SIGNING_KEY_FILE
+        # in the caller's env would otherwise make `_start_managers` append
+        # --auth-signing-key-file anyway, so the manager would still enforce despite
+        # the "disabled" log (coco P2). Clear all authz env so disable really disables.
+        unset AUTUMN_AUTH_SIGNING_KEY_FILE AUTUMN_ADMIN_TOKEN_FILE AUTUMN_AUTH_PROTECTED_PREFIXES
+        log "authz: DISABLED (AUTUMN_AUTH_DISABLE=1)"
+        return
+    fi
+    export AUTUMN_AUTH_PROTECTED_PREFIXES="${AUTUMN_AUTH_PROTECTED_PREFIXES:-fs/ kvc/ mem/}"
+
+    if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
+        log "authz: using operator-provided key $AUTUMN_AUTH_SIGNING_KEY_FILE (protected: $AUTUMN_AUTH_PROTECTED_PREFIXES)"
+        return
+    fi
+
+    # Driver-local, persisted so re-deploys keep the SAME key + token.
+    local ldir="${AUTUMN_AUTHZ_DIR:-$HOME/.autumn-deploy/authz}"
+    mkdir -p "$ldir"; chmod 700 "$ldir" 2>/dev/null || true
+    local lkey="$ldir/signing.key" ltok="$ldir/admin.token"
+    if [[ ! -s "$lkey" ]]; then
+        "$BIN_SRC/autumn-op" gen-signing-key > "$lkey" 2>/dev/null || die "authz: gen-signing-key failed"
+        chmod 600 "$lkey" 2>/dev/null || true
+        log "authz: generated signing key → $lkey"
+    else
+        log "authz: reusing signing key → $lkey"
+    fi
+    if [[ ! -s "$ltok" ]]; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ltok"
+        chmod 600 "$ltok" 2>/dev/null || true
+    fi
+
+    # Distribute to every manager host; point the managers at the per-host path.
+    local mkey="$DATA_ROOT/authz/signing.key" mtok="$DATA_ROOT/authz/admin.token" h
+    for h in "${MANAGER_HOSTS[@]}"; do
+        on_host "$h" "mkdir -p '$DATA_ROOT/authz'"
+        copy_to_host "$lkey" "$h" "$mkey"
+        copy_to_host "$ltok" "$h" "$mtok"
+    done
+    export AUTUMN_AUTH_SIGNING_KEY_FILE="$mkey"
+    export AUTUMN_ADMIN_TOKEN_FILE="$mtok"
+    AUTHZ_LOCAL_ADMIN_TOKEN="$ltok"
+    AUTHZ_LOCAL_DIR="$ldir"
+    log "authz: ENABLED — protected [$AUTUMN_AUTH_PROTECTED_PREFIXES]; key on ${#MANAGER_HOSTS[@]} manager(s)"
+}
+
+# F-AUTHZ-BUILTIN: mint a 'default'-tenant credential (covering every protected
+# namespace for tenant `default`) and write it driver-local for clients to pass
+# via --credential-file. Idempotent: skips if the local credential already
+# exists (re-minting ROTATES it, invalidating already-distributed copies).
+_provision_credential() {
+    [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]] && return
+    [[ -z "$AUTHZ_LOCAL_ADMIN_TOKEN" ]] && return  # operator-provided key ⇒ they own credentials
+    local cred="$AUTHZ_LOCAL_DIR/default.cred"
+    # Skip ONLY if the local credential is present AND still valid on THIS
+    # cluster — a `mint-token` verify catches a wiped/rebuilt etcd (or a fresh
+    # cluster) where the local file survived but the `default` tenant account did
+    # not; skipping there would leave every client with a dead credential (coco
+    # P1). `default.cred` holds the BARE hex (mint-token's --credential-file
+    # reads a plain hex string; the native clients accept bare hex too).
+    if [[ -s "$cred" ]] && "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" \
+            mint-token --tenant default --credential-file "$cred" >/dev/null 2>&1; then
+        log "authz: default credential valid on this cluster → $cred"
+        return
+    fi
+    [[ -s "$cred" ]] && log "authz: local default credential is stale (tenant absent here) — re-provisioning"
+    local -a prefixes=() ns
+    for ns in $AUTUMN_AUTH_PROTECTED_PREFIXES; do prefixes+=(--prefix "${ns}default/"); done
+    local tmp="$cred.tmp"
+    if "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" tenant-create \
+            --tenant default "${prefixes[@]}" \
+            --admin-token-file "$AUTHZ_LOCAL_ADMIN_TOKEN" 2>/dev/null \
+            | awk '/^credential:/{print $2}' > "$tmp" && [[ -s "$tmp" ]]; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$cred"   # atomic replace
+        log "authz: minted 'default' tenant credential → $cred"
+        log "  clients: fuse/autumnfs/autumn-client --credential-file $cred --tenant default"
+    else
+        rm -f "$tmp"
+        log "authz: WARN tenant-create failed — mint manually: autumn-op --manager $MANAGER_LIST tenant-create --tenant default ${prefixes[*]} --admin-token-file <token>"
+    fi
+}
+
 do_start() {
     # binaries must be staged; deploy is idempotent so run it if bin dir is empty.
     if ! on_host "${MANAGER_HOSTS[0]}" "[ -x '$BIN_DIR/autumn-manager-server' ]" 2>/dev/null; then
@@ -663,9 +757,11 @@ do_start() {
         do_deploy
     fi
     _start_etcd
+    _ensure_authz          # F-AUTHZ-BUILTIN: set AUTUMN_AUTH_* before managers start
     _start_managers
     _format_and_start_ens
     _bootstrap
+    _provision_credential  # F-AUTHZ-BUILTIN: mint the default credential (manager is leader)
     _start_ps
     log "cluster started."
     log "  manager(s): $MANAGER_LIST"

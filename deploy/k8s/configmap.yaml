@@ -16,6 +16,17 @@ data:
   # Bootstrap waits for this many extent nodes Online before creating streams.
   # MUST equal the extent-node StatefulSet replica count.
   AUTUMN_EXPECT_NODES: "3"
+  # F-AUTHZ-BUILTIN: data-plane authz is ON by DEFAULT for k8s deploys. The
+  # signing key + admin token come from the `autumn-authz` Secret (generate it
+  # once with `autumn-op gen-signing-key` — deploy/overlays/vke/deploy.sh does
+  # this), mounted into the manager at /etc/autumn/authz. Authz engages ONLY when
+  # that Secret is actually mounted (entrypoint `-s` gate), so a cluster deployed
+  # WITHOUT the Secret — or with AUTUMN_AUTH_DISABLE="1" — runs authz-OFF.
+  # Clients pass the minted credential via --credential-file (see k8s_deploy.md).
+  AUTUMN_AUTH_SIGNING_KEY_FILE: "/etc/autumn/authz/signing.key"
+  AUTUMN_ADMIN_TOKEN_FILE: "/etc/autumn/authz/admin.token"
+  AUTUMN_AUTH_PROTECTED_PREFIXES: "fs/ kvc/ mem/"
+  # Escape hatch (dev/test): AUTUMN_AUTH_DISABLE: "1"
   # EC + replication defaults follow cluster.sh (auto by node count). To force:
   # AUTUMN_REPLICATION: "3+0"
   # AUTUMN_EC_LOG: "off"

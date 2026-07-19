@@ -105,6 +105,25 @@ streams-guarded `autumn-op bootstrap` → PS → wait a partition is served.** T
 bootstrap guard makes `start` idempotent: on an already-bootstrapped cluster it
 skips bootstrap and preserves data, so `stop` + `start` is a safe restart.
 
+## Authz (ON by default)
+
+`start` arms data-plane authz automatically (F-AUTHZ-BUILTIN): it generates a
+signing key + admin token under `~/.autumn-deploy/authz/` (override with
+`AUTUMN_AUTHZ_DIR`) — **once, reused across re-deploys** so already-minted
+credentials keep working — distributes the key to every manager host, protects
+`fs/ kvc/ mem/`, and after bootstrap mints a `default`-tenant credential to
+`~/.autumn-deploy/authz/default.cred`. Point clients at it:
+
+```bash
+autumnfs   --manager $M --credential-file ~/.autumn-deploy/authz/default.cred put F /F
+autumn-fuse --manager $M --credential-file ~/.autumn-deploy/authz/default.cred --mountpoint /mnt/x
+```
+
+Override `AUTUMN_AUTH_SIGNING_KEY_FILE` to bring your own key (then you own
+credential minting). **Escape hatch:** `AUTUMN_AUTH_DISABLE=1 autumn-deploy start`
+runs authz-OFF (dev/debug). Full runbook + rollback: `docs/ops.md` "Enabling
+authz".
+
 ## UCX (TRANSPORT=ucx)
 
 One rule (2026-07-03): **UCX topologies use RoCE NIC IPs** — 127.0.0.1 is not

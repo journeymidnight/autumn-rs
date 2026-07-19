@@ -121,8 +121,14 @@ run_manager() {
     fi
     [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]] \
         && args+=(--min-alloc-free-bytes "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES")
-    # F-AUTHZ-1 (opt-in, same contract as cluster.sh: no key file = authz off)
-    if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
+    # F-AUTHZ-BUILTIN: authz engages iff NOT explicitly disabled AND the signing
+    # key file is actually present + non-empty. The k8s ConfigMap sets
+    # AUTUMN_AUTH_SIGNING_KEY_FILE to the mounted-Secret path unconditionally, so
+    # the `-s` test (not just `-n`) is what keeps a deploy WITHOUT the
+    # `autumn-authz` Secret (optional mount → file absent) — or an explicit
+    # AUTUMN_AUTH_DISABLE=1 — running authz-OFF instead of crash-looping on a
+    # missing key. (cluster.sh stays OFF because it never sets the env at all.)
+    if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" && -s "${AUTUMN_AUTH_SIGNING_KEY_FILE:-/nonexistent}" ]]; then
         args+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
         [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] \
             && args+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
