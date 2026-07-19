@@ -40,7 +40,7 @@ fn usage() -> ! {
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (F-PRESPLIT-NS-RULES; presplit EMPTY keyspace before loading)");
-    eprintln!("      fs:  --fs-inos <i,j,…> | --count <N>             (split by inode)");
+    eprintln!("      fs:  --lanes <N> | --fs-inos <i,j,…> | --count <N>   (--lanes=F-FS-STRIPE lane split; others=by inode)");
     eprintln!("      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)");
     eprintln!("           hash-prefix = rel prefix down to just before the hash, e.g. '<model>/vllm/v1/'");
     eprintln!("      mem: --agents <a,b,…>                            (split by agent boundary)");
@@ -1018,6 +1018,7 @@ pub(crate) fn parse() -> Args {
             let mut tenant: Option<String> = None;
             let mut count: Option<usize> = None;
             let mut fs_inos: Option<Vec<u64>> = None;
+            let mut lanes: Option<usize> = None;
             let mut hash_prefix: Option<String> = None;
             let mut agents: Option<Vec<String>> = None;
             let num = |v: &str, what: &str| -> u64 {
@@ -1036,6 +1037,7 @@ pub(crate) fn parse() -> Args {
                         fs_inos = Some(val(&raw, i).split(',').map(|s| num(s, "--fs-inos entry")).collect());
                         i += 1;
                     }
+                    "--lanes" => { i += 1; lanes = Some(num(val(&raw, i), "--lanes") as usize); i += 1; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
                     "--agents" => {
                         i += 1;
@@ -1061,15 +1063,24 @@ pub(crate) fn parse() -> Args {
             reject_bad_segment("presplit", "tenant", &tenant);
             let rule = match namespace.as_str() {
                 "fs" => {
-                    let inos = if let Some(inos) = fs_inos {
-                        inos
+                    // F-FS-STRIPE: `--lanes N` presplits fs into N LANE partitions
+                    // (cut at `[0x03][1..N]`) so a striped large file's extents
+                    // spread across them. Distinct from `--fs-inos`/`--count`
+                    // (which cut by INODE, one file per partition).
+                    if let Some(n) = lanes {
+                        if !(2..=255).contains(&n) {
+                            eprintln!("presplit --namespace fs --lanes N: N must be in 2..=255 (got {n})");
+                            std::process::exit(1);
+                        }
+                        PresplitRule::FsLanes { lanes: n as u8 }
+                    } else if let Some(inos) = fs_inos {
+                        PresplitRule::Fs { inos }
                     } else if let Some(n) = count {
-                        (1..n as u64).collect() // split at ino 1..N-1 → N partitions
+                        PresplitRule::Fs { inos: (1..n as u64).collect() } // ino 1..N-1 → N parts
                     } else {
-                        eprintln!("presplit --namespace fs requires --fs-inos <i,j,…> or --count <N>");
+                        eprintln!("presplit --namespace fs requires --lanes <N> | --fs-inos <i,j,…> | --count <N>");
                         std::process::exit(1);
-                    };
-                    PresplitRule::Fs { inos }
+                    }
                 }
                 "kvc" => {
                     let n = count.unwrap_or_else(|| {
@@ -1512,6 +1523,13 @@ pub(crate) enum PresplitRule {
     /// (retires the old low-byte 0x20/0x40 stepping — inodes 4–8 are all < 0x20,
     /// so byte-stepping never split them). `inos` MUST be ascending + distinct.
     Fs { inos: Vec<u64> },
+    /// `fs --lanes N` = F-FS-STRIPE: split fs into N **lane** partitions, cutting
+    /// at `[0x03][1]..[0x03][N-1]` (the static, ino-independent lane boundaries).
+    /// A striped large file's extent at offset `off` lands on lane
+    /// `(off/unit)%N` under key `[0x03][lane][ino][off]`, so its extents spread
+    /// across these N partitions → parallel write/read. Lane 0 (`[start,[0x03][1])`)
+    /// also holds the 0x01/0x02 metadata + any legacy non-striped `[0x03][ino…]`.
+    FsLanes { lanes: u8 },
     /// `kvc` = split by CONTENT HASH (sha256 hexdigest, lowercase hex, uniform).
     /// The high-entropy dimension is at the TAIL, under `hash_prefix` segments, so
     /// `count` buckets split the FIRST hex char proportionally. `hash_prefix` is
@@ -1553,6 +1571,15 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
                 out.push(s);
             }
             Ok(out)
+        }
+        PresplitRule::FsLanes { lanes } => {
+            // Cut at `[0x03][lane]` for lane = 1..N-1 → N lane partitions. These
+            // boundaries are STATIC (independent of any ino), so fs can be
+            // pre-split for striping at bootstrap.
+            if *lanes < 2 {
+                return Ok(vec![]);
+            }
+            Ok((1..*lanes).map(|lane| vec![0x03u8, lane]).collect())
         }
         PresplitRule::Kvc { hash_prefix, count } => {
             if *count < 2 {
@@ -1857,6 +1884,22 @@ mod tests {
         use super::PresplitRule;
         assert!(super::presplit_suffixes(&PresplitRule::Fs { inos: vec![5, 4] }).is_err());
         assert!(super::presplit_suffixes(&PresplitRule::Fs { inos: vec![4, 4] }).is_err());
+    }
+
+    #[test]
+    fn presplit_fs_lanes_cuts_at_lane_boundaries() {
+        use super::PresplitRule;
+        // 4 lanes → cut at [0x03][1], [0x03][2], [0x03][3] → 4 partitions.
+        let s = super::presplit_suffixes(&PresplitRule::FsLanes { lanes: 4 }).unwrap();
+        assert_eq!(s, vec![vec![0x03, 1], vec![0x03, 2], vec![0x03, 3]]);
+        // A striped extent on lane 2 (wire [0x03][2][ino][off]) sorts into the
+        // partition [[0x03][2], [0x03][3]).
+        let ext_lane2 = wire("default", "fs", &[0x03, 2, /*ino*/ 0, 0, 0, 0, 0, 0, 0, 9, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0]);
+        let cut2 = wire("default", "fs", &s[1]); // [0x03][2]
+        let cut3 = wire("default", "fs", &s[2]); // [0x03][3]
+        assert!(ext_lane2 >= cut2 && ext_lane2 < cut3);
+        // < 2 lanes → no cut.
+        assert!(super::presplit_suffixes(&PresplitRule::FsLanes { lanes: 1 }).unwrap().is_empty());
     }
 
     #[test]

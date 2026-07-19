@@ -1130,7 +1130,46 @@ $AO presplit --namespace kvc --tenant default --count 8 --hash-prefix "qwen3-8b_
 
 # mem — split by AGENT.
 $AO presplit --namespace mem --tenant default --agents alice,bob,carol
+
+# fs --lanes N — F-FS-STRIPE: split fs into N LANE partitions (cut at [0x03][1..N-1],
+# the STATIC ino-independent lane boundaries). This is the setup step for striping a
+# SINGLE large file across N partitions/PSs. Distinct from --fs-inos/--count (by INODE).
+$AO presplit --namespace fs --tenant default --lanes 4
 ```
+
+### F-FS-STRIPE — stripe one large file across lanes (break the single-partition ceiling)
+
+A single file = one inode = key-contiguous `[0x03][ino][off]` → ONE partition → ONE
+log_stream. So a single file's write/read is capped by one stream's bandwidth
+(measured ~220 MB/s single-connection, ~350 MB/s single-partition on fast NVMe;
+disk/CPU are NOT the limit). To go faster, STRIPE the file across N lane partitions:
+
+```bash
+# 1. Presplit fs into N lanes (ideally N = PS count so lanes land on distinct PSs);
+#    the manager spreads the new lane partitions across PSs. Do this on the EMPTY fs.
+$AO presplit --namespace fs --tenant default --lanes 4
+$AO info | grep part          # → 4 fs partitions, ideally one per PS
+
+# 2. Upload with --stripe-lanes N. A file > 64 MiB gets its extents round-robined
+#    across lanes: extent e → lane e%N, key [0x03][lane][ino][off]. autumnfs's
+#    concurrent batch_put fans them out → parallel across the lane PSs. Small files
+#    (≤ 64 MiB) ignore the flag and stay single-partition.
+autumnfs --manager <mgr> --tenant default put ./checkpoint.safetensors /ckpt --stripe-lanes 4
+autumnfs --manager <mgr> --tenant default get /ckpt ./out   # reader auto-detects stripe
+```
+
+- The stripe layout (`lanes`, `unit`) is stamped in the file's `InodeMeta.stripe` at
+  create, so the reader computes the lane keys (no range scan) and old / non-striped
+  files stay correct with **no migration**. `unit = MAX_EXTENT` (8 MiB) in v1 = each
+  extent its own lane (max spread).
+- **Scaling is bounded by whichever saturates first**: the lane PSs, the ENs' data
+  plane, or the autumnfs client pipeline (window=8 + sync read barrier — a single
+  file may not fully drive many lanes; running few parallel uploads or a deeper
+  client pipeline closes the gap). Give ENs enough cores + put replicas on separate
+  disks/hosts so the per-stream ceiling is high.
+- **fuse mount** striping is NOT wired yet (streaming writes don't know the final
+  size up front); autumnfs `put` (size known) is the v1 path. Schema is **v3**
+  (`InodeMeta.stripe`) — a stop-world reset from v2 (no in-place migration).
 
 **CRITICAL — presplit the EMPTY keyspace BEFORE loading data.** A data-bearing
 partition can't be split repeatedly: after the first CoW split, parent+child

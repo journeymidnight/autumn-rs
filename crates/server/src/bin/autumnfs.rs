@@ -40,8 +40,14 @@ use clap::{Parser, Subcommand};
 use autumn_client::ClusterClient;
 use autumn_fuse::key;
 use autumn_fuse::schema::{
-    self, DirentValue, InodeMeta, DT_DIR, DT_LNK, DT_REG, INLINE_THRESHOLD, MAX_EXTENT, ROOT_INO,
+    self, DirentValue, InodeMeta, StripeLayout, DT_DIR, DT_LNK, DT_REG, INLINE_THRESHOLD,
+    MAX_EXTENT, ROOT_INO,
 };
+
+/// F-FS-STRIPE: only files LARGER than this get striped across lanes; smaller
+/// files stay single-partition (avoids scattering small files + metadata and
+/// the multi-partition round-trip on a read that a single stream serves fine).
+const STRIPE_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -99,6 +105,13 @@ enum Cmd {
         local: PathBuf,
         /// Destination path in the autumn fs. Parents must exist.
         remote: String,
+        /// F-FS-STRIPE: stripe a LARGE file (> 64 MiB) across N lane partitions so
+        /// its extents write/read in parallel beyond the single-partition ceiling.
+        /// 0/1 = no striping (single partition). Pre-split fs into N lanes first:
+        /// `autumn-op presplit --namespace fs --tenant <t> --lanes N`. Small files
+        /// ignore this and stay single-partition.
+        #[arg(long, default_value_t = 0)]
+        stripe_lanes: u8,
     },
     /// Download a cluster file to local disk.
     Get {
@@ -171,7 +184,9 @@ fn main() -> Result<()> {
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
             Cmd::Cat { path } => cmd_cat(&cluster, &path).await,
-            Cmd::Put { local, remote } => cmd_put(&cluster, &local, &remote).await,
+            Cmd::Put { local, remote, stripe_lanes } => {
+                cmd_put(&cluster, &local, &remote, stripe_lanes).await
+            }
             Cmd::Get { remote, local } => cmd_get(&cluster, &remote, &local).await,
             Cmd::Rm { path } => cmd_rm(&cluster, &path).await,
             Cmd::Touch { path } => cmd_touch(&cluster, &path).await,
@@ -277,6 +292,7 @@ fn new_file_meta() -> InodeMeta {
         ctime_nsecs: nsecs,
         inline_data: None,
         symlink_target: None,
+        stripe: None,
     }
 }
 
@@ -296,6 +312,7 @@ fn new_dir_meta() -> InodeMeta {
         ctime_nsecs: nsecs,
         inline_data: None,
         symlink_target: None,
+        stripe: None,
     }
 }
 
@@ -546,30 +563,44 @@ async fn read_file_to_writer(
         out.write_all(inline).context("write inline to output")?;
         return Ok(());
     }
-    // Collect every extent key (the range scan returns them offset-sorted; PS
-    // `handle_range` returns KEYS only), then fetch values a window at a time.
-    // Extent keys are 17 B and extents are ≤ 8 MiB, so the full key list is tiny
-    // even for a huge file (a 1 TB file = ~128 K extents ≈ 2 MB of keys), and
-    // the extra range-scan-before-first-byte latency is noise against a
-    // minutes-long download — so we pre-collect (coco P3, accepted for the CLI)
-    // and bound + pipeline only the VALUE fetch, which is what dominates.
-    let prefix = key::extent_prefix(ino);
-    let mut start = prefix.clone();
-    const PAGE: u32 = 256;
+    // Collect every extent key (offset-sorted), then fetch values a window at a
+    // time. Extent keys are ≤ 18 B and extents are ≤ 8 MiB, so the full key list
+    // is tiny even for a huge file, and the extra latency-before-first-byte is
+    // noise against a minutes-long download — so we pre-collect (coco P3, accepted
+    // for the CLI) and bound + pipeline only the VALUE fetch, which dominates.
     let mut extents: Vec<(u64, Vec<u8>)> = Vec::new(); // (offset, extent_key)
-    loop {
-        let resp = cluster
-            .range(&prefix, &start, PAGE)
-            .await
-            .map_err(|e| anyhow!("extent range: {e}"))?;
-        for entry in &resp.entries {
-            if let Some((_, off)) = key::parse_extent_key(&entry.key) {
-                extents.push((off, entry.key.clone()));
-            }
+    if let Some(s) = &meta.stripe {
+        // F-FS-STRIPE: extents live under `[0x03][lane][ino][off]`, so a range
+        // scan over `[0x03][ino]` would find NOTHING. Compute the key list from
+        // size + geometry. Extents are MAX_EXTENT-granular (the writer never
+        // exceeds it), so step by MAX_EXTENT and derive each extent's lane; the
+        // window `get_many_into` below then fans the reads out across the lane
+        // partitions in parallel.
+        let mut off = 0u64;
+        while off < meta.size {
+            extents.push((off, key::extent_key_striped(ino, off, s.lanes, s.unit_bytes)));
+            off += MAX_EXTENT as u64;
         }
-        match next_range_cursor(&resp.entries, PAGE) {
-            Some(next) => start = next,
-            None => break,
+    } else {
+        // Legacy single-partition layout: range-scan `[0x03][ino]` (PS
+        // `handle_range` returns KEYS only, offset-sorted).
+        let prefix = key::extent_prefix(ino);
+        let mut start = prefix.clone();
+        const PAGE: u32 = 256;
+        loop {
+            let resp = cluster
+                .range(&prefix, &start, PAGE)
+                .await
+                .map_err(|e| anyhow!("extent range: {e}"))?;
+            for entry in &resp.entries {
+                if let Some((_, off)) = key::parse_extent_key(&entry.key) {
+                    extents.push((off, entry.key.clone()));
+                }
+            }
+            match next_range_cursor(&resp.entries, PAGE) {
+                Some(next) => start = next,
+                None => break,
+            }
         }
     }
 
@@ -694,6 +725,7 @@ async fn write_file_from_reader(
     parent_ino: u64,
     leaf: &[u8],
     data_reader: impl Read,
+    stripe: Option<StripeLayout>,
 ) -> Result<u64> {
     let new_ino = alloc_inode(cluster).await?;
     // Extents are published BEFORE the inode+dirent (they're keyed by the new
@@ -703,7 +735,8 @@ async fn write_file_from_reader(
     // is never reused). Track every written key and best-effort delete them +
     // the inode key on any failure (coco P2). Harmless if a key isn't present.
     let mut written: Vec<Vec<u8>> = Vec::new();
-    match publish_file(cluster, parent_ino, new_ino, leaf, data_reader, &mut written).await {
+    match publish_file(cluster, parent_ino, new_ino, leaf, data_reader, stripe, &mut written).await
+    {
         Ok(()) => Ok(new_ino),
         Err(e) => {
             for k in &written {
@@ -717,13 +750,17 @@ async fn write_file_from_reader(
 
 /// Stream `data_reader` into extents for `new_ino`, then publish the inode +
 /// dirent. Records every written extent key in `written` so the caller can
-/// clean up orphans on failure.
+/// clean up orphans on failure. `stripe` (F-FS-STRIPE) selects the extent key
+/// layout: `Some` → lane-striped `[0x03][lane][ino][off]` (extents spread across
+/// lane partitions → parallel via batch_put's concurrent ZC fan-out); `None` →
+/// legacy `[0x03][ino][off]` (single partition).
 async fn publish_file(
     cluster: &ClusterClient,
     parent_ino: u64,
     new_ino: u64,
     leaf: &[u8],
     mut data_reader: impl Read,
+    stripe: Option<StripeLayout>,
     written: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     let mut meta = new_file_meta();
@@ -747,7 +784,11 @@ async fn publish_file(
         }
         first = false;
         if n > 0 {
-            window.push((key::extent_key(new_ino, off), Bytes::from(chunk)));
+            let ek = match &stripe {
+                Some(s) => key::extent_key_striped(new_ino, off, s.lanes, s.unit_bytes),
+                None => key::extent_key(new_ino, off),
+            };
+            window.push((ek, Bytes::from(chunk)));
             off += n as u64;
             if window.len() >= PUT_WINDOW_EXTENTS {
                 flush_put_window(cluster, &mut window, written).await?;
@@ -759,6 +800,9 @@ async fn publish_file(
     }
     flush_put_window(cluster, &mut window, written).await?;
     meta.size = off;
+    // Only stamp `stripe` for a file that actually took the extent path — an
+    // inline small file has no extents to stripe (reader checks inline_data first).
+    meta.stripe = if meta.inline_data.is_some() { None } else { stripe };
 
     cluster
         .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta))
@@ -775,7 +819,12 @@ async fn publish_file(
     Ok(())
 }
 
-async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {
+async fn cmd_put(
+    cluster: &ClusterClient,
+    local: &PathBuf,
+    remote: &str,
+    stripe_lanes: u8,
+) -> Result<()> {
     let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, remote).await?;
     if !is_dir(&parent_meta) {
         bail!("parent is not a directory");
@@ -790,8 +839,20 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Resu
     }
     let f = std::fs::File::open(local)
         .with_context(|| format!("open local file {}", local.display()))?;
-    let ino = write_file_from_reader(cluster, parent_ino, &leaf, f).await?;
-    println!("uploaded → ino {ino}");
+    // F-FS-STRIPE: stripe only a LARGE file across ≥2 lanes; small files stay
+    // single-partition. File size is known up front (a local file), so we can
+    // stamp the layout at create — unlike the fuse mount's streaming writes.
+    let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let stripe = (stripe_lanes >= 2 && file_size > STRIPE_THRESHOLD).then(|| StripeLayout {
+        lanes: stripe_lanes,
+        unit_bytes: MAX_EXTENT as u32,
+    });
+    let striped_note = stripe
+        .as_ref()
+        .map(|s| format!(" (striped ×{} lanes)", s.lanes))
+        .unwrap_or_default();
+    let ino = write_file_from_reader(cluster, parent_ino, &leaf, f, stripe).await?;
+    println!("uploaded → ino {ino}{striped_note}");
     Ok(())
 }
 
@@ -813,8 +874,8 @@ async fn cmd_touch(cluster: &ClusterClient, path: &str) -> Result<()> {
             .map_err(|e| anyhow!("update mtime: {e}"))?;
         return Ok(());
     }
-    // Empty file.
-    let ino = write_file_from_reader(cluster, parent_ino, &leaf, std::io::empty()).await?;
+    // Empty file (never striped).
+    let ino = write_file_from_reader(cluster, parent_ino, &leaf, std::io::empty(), None).await?;
     println!("touched → ino {ino}");
     Ok(())
 }
@@ -869,23 +930,36 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
     }
     // Delete extents (if any), then dirent, then inode if nlink would hit 0.
     if meta.inline_data.is_none() {
-        let prefix = key::extent_prefix(ino);
-        let mut start = prefix.clone();
-        const PAGE: u32 = 256;
-        loop {
-            let resp = cluster
-                .range(&prefix, &start, PAGE)
-                .await
-                .map_err(|e| anyhow!("extent range: {e}"))?;
-                for entry in &resp.entries {
-                cluster
-                    .delete(&entry.key)
-                    .await
-                    .map_err(|e| anyhow!("delete extent: {e}"))?;
+        if let Some(s) = &meta.stripe {
+            // F-FS-STRIPE: striped extents live under `[0x03][lane][ino][off]`,
+            // spread across lane partitions — a `[0x03][ino]` scan would MISS
+            // them (leak). Compute + delete each key (same enumeration the read
+            // path uses: MAX_EXTENT-granular up to size).
+            let mut off = 0u64;
+            while off < meta.size {
+                let ek = key::extent_key_striped(ino, off, s.lanes, s.unit_bytes);
+                cluster.delete(&ek).await.map_err(|e| anyhow!("delete extent: {e}"))?;
+                off += MAX_EXTENT as u64;
             }
-            match next_range_cursor(&resp.entries, PAGE) {
-                Some(next) => start = next,
-                None => break,
+        } else {
+            let prefix = key::extent_prefix(ino);
+            let mut start = prefix.clone();
+            const PAGE: u32 = 256;
+            loop {
+                let resp = cluster
+                    .range(&prefix, &start, PAGE)
+                    .await
+                    .map_err(|e| anyhow!("extent range: {e}"))?;
+                for entry in &resp.entries {
+                    cluster
+                        .delete(&entry.key)
+                        .await
+                        .map_err(|e| anyhow!("delete extent: {e}"))?;
+                }
+                match next_range_cursor(&resp.entries, PAGE) {
+                    Some(next) => start = next,
+                    None => break,
+                }
             }
         }
     }

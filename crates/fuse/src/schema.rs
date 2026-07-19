@@ -49,6 +49,26 @@ pub struct InodeMeta {
     pub inline_data: Option<Vec<u8>>,
     /// Symlink target path. None for non-symlinks.
     pub symlink_target: Option<Vec<u8>>,
+    /// F-FS-STRIPE: `Some` iff this file's data extents are STRIPED across
+    /// `lanes` partitions. `None` = the legacy single-partition layout
+    /// (`[0x03][ino][off]`, all extents in one partition/log_stream). A large
+    /// file (> threshold) is stamped striped at create so its extents round-robin
+    /// across lane partitions (`[0x03][lane][ino][off]`) → parallel write/read
+    /// beyond the single-stream ceiling. Immutable once set; the reader branches
+    /// on this to pick the key layout, so old files stay correct with no migration.
+    pub stripe: Option<StripeLayout>,
+}
+
+/// F-FS-STRIPE: per-file stripe geometry. An extent at logical offset `off` lives
+/// on lane `(off / unit_bytes) % lanes`, whose wire key is `[0x03][lane][ino][off]`.
+/// Lane partitions are pre-split at `[0x03][lane]` (static, ino-independent) and
+/// placed on distinct PSs, so consecutive extents hit different PSs in parallel.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StripeLayout {
+    /// Number of stripe lanes = number of pre-split lane partitions. 1..=255.
+    pub lanes: u8,
+    /// Stripe unit in bytes. v1 uses `MAX_EXTENT` (each extent its own lane).
+    pub unit_bytes: u32,
 }
 
 /// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.
@@ -113,8 +133,14 @@ pub const ROOT_INO: u64 = 1;
 /// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
 /// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)
 /// then refuses to mount rather than silently corrupting data.
+/// - **v3** = F-FS-STRIPE: `InodeMeta` gains the `stripe: Option<StripeLayout>`
+///   field (rkyv layout change — v2 inode bytes can't decode), and large files
+///   store data extents under the lane-striped key `[0x03][lane][ino][off]`.
+///   Stop-world reset from v2 (no in-place migration; old files would decode
+///   wrong). Small / legacy files keep `stripe=None` + the `[0x03][ino][off]` key.
+///
 /// BUMP this whenever the key layout / value encoding changes incompatibly.
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 
 // File type constants (from libc)
 pub const DT_REG: u8 = 8;

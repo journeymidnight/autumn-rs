@@ -56,6 +56,7 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
         ctime_nsecs: nsecs,
         inline_data: None,
         symlink_target: None,
+        stripe: None,
     }
 }
 
@@ -76,6 +77,7 @@ pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
         ctime_nsecs: nsecs,
         inline_data: None,
         symlink_target: None,
+        stripe: None,
     }
 }
 

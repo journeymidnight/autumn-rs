@@ -1603,7 +1603,14 @@ async fn cmd_presplit(
     let mut skipped: Vec<String> = Vec::new();
     for point in &points {
         // Re-fetch the region map each iteration — a prior split created a new
-        // child that may own this point.
+        // child that may own this point. `all_partitions_with_range` reads the
+        // client's REGION CACHE (it only auto-refreshes when empty), so force a
+        // refresh first: without it the 2nd+ cut of a multi-point presplit
+        // resolves against the PRE-split map and tries to split the wrong (now
+        // narrowed) partition → "at or above partition end" (hit live on
+        // `presplit --namespace fs --lanes N` where all cuts land in one small
+        // range so every later cut needs the fresh child).
+        let _ = client.refresh_regions().await;
         let parts = client
             .all_partitions_with_range()
             .await

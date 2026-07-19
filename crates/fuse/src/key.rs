@@ -98,6 +98,50 @@ pub fn parse_extent_key(key: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
+// ── F-FS-STRIPE: lane-striped extent keys ────────────────────────────────────
+// A large file's extents are spread across `lanes` partitions so a single file's
+// writes/reads parallelise beyond one partition/log_stream. The lane byte sits
+// HIGH (right after 0x03) so it dominates partition routing; lane boundaries
+// `[0x03][lane]` are STATIC (ino-independent), so fs can be pre-split into lane
+// partitions at bootstrap without knowing any ino.
+
+/// Which lane an extent at `logical_off` lives on: `(off / unit_bytes) % lanes`.
+/// `lanes` must be ≥ 1 and `unit_bytes` ≥ 1 (validated by the writer).
+pub fn stripe_lane(logical_off: u64, lanes: u8, unit_bytes: u32) -> u8 {
+    ((logical_off / unit_bytes as u64) % lanes as u64) as u8
+}
+
+/// Encode a STRIPED file data extent key: `[0x03][lane][ino BE][logical_off BE]`
+/// (18 B). `lane = stripe_lane(logical_off, lanes, unit_bytes)`.
+pub fn extent_key_striped(ino: u64, logical_off: u64, lanes: u8, unit_bytes: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(18);
+    key.push(PREFIX_EXTENT);
+    key.push(stripe_lane(logical_off, lanes, unit_bytes));
+    key.extend_from_slice(&ino.to_be_bytes());
+    key.extend_from_slice(&logical_off.to_be_bytes());
+    key
+}
+
+/// Parse a STRIPED extent key → (lane, ino, logical_off).
+pub fn parse_striped_extent_key(key: &[u8]) -> Option<(u8, u64, u64)> {
+    if key.len() == 18 && key[0] == PREFIX_EXTENT {
+        let lane = key[1];
+        let ino = u64::from_be_bytes(key[2..10].try_into().unwrap());
+        let logical_off = u64::from_be_bytes(key[10..18].try_into().unwrap());
+        Some((lane, ino, logical_off))
+    } else {
+        None
+    }
+}
+
+/// The lane-partition split boundary (RELATIVE key `[0x03][lane]`). Splitting the
+/// fs partition at each of `[0x03][1]..[0x03][N]` yields N lane partitions:
+/// lane 0 = `[start, [0x03][1])` (also holds 0x01/0x02 metadata + legacy
+/// non-striped `[0x03][ino…]` data, which all sort here), lane L = the L-th slice.
+pub fn stripe_lane_boundary(lane: u8) -> Vec<u8> {
+    vec![PREFIX_EXTENT, lane]
+}
+
 /// Encode superblock field key: `[0x04][field]`
 pub fn super_key(field: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + field.len());
@@ -193,6 +237,26 @@ mod tests {
         let (ino, off) = parse_extent_key(&key).unwrap();
         assert_eq!(ino, 100);
         assert_eq!(off, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn striped_extent_keys_round_trip_and_route_by_lane() {
+        // F-FS-STRIPE: 4 lanes, unit = 8 MiB → extent e lands on lane e%4.
+        let (lanes, unit) = (4u8, 8 * 1024 * 1024u32);
+        for e in 0..12u64 {
+            let off = e * unit as u64;
+            let k = extent_key_striped(100, off, lanes, unit);
+            assert_eq!(k.len(), 18);
+            let (lane, ino, o) = parse_striped_extent_key(&k).unwrap();
+            assert_eq!((lane, ino, o), ((e % 4) as u8, 100, off));
+            // The lane byte sits at position 1 (right after 0x03) so it dominates
+            // routing: the key falls in `[[0x03][lane], [0x03][lane+1])`.
+            assert!(k.as_slice() >= stripe_lane_boundary(lane).as_slice());
+            assert!(k.as_slice() < stripe_lane_boundary(lane + 1).as_slice());
+        }
+        // A non-striped (17 B) key never parses as striped and vice-versa.
+        assert!(parse_striped_extent_key(&extent_key(100, 0)).is_none());
+        assert!(parse_extent_key(&extent_key_striped(100, 0, 4, 4096)).is_none());
     }
 
     #[test]
