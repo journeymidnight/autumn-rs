@@ -1672,29 +1672,6 @@ fn append_reject(code: u8) -> HandlerResult {
     .encode())
 }
 
-/// Set TCP send/recv buffer sizes via setsockopt.
-fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let size = size as libc::c_int;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-}
-
 /// Positional write (pwrite) at reserved offset — safe for concurrent
 /// non-overlapping offsets (each caller uses fetch_add to reserve).
 ///
@@ -4016,7 +3993,19 @@ impl ExtentNode {
                 if let Err(e) = s.set_nodelay(true) {
                     tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
                 }
-                set_tcp_buffer_sizes(s, 512 * 1024);
+                // Do NOT setsockopt SO_RCVBUF/SO_SNDBUF here. An explicit
+                // SO_RCVBUF on an ACCEPTED socket cannot raise the TCP window
+                // (tp->window_clamp is already fixed at SYN time, ~64 KiB) —
+                // it only sets SOCK_RCVBUF_LOCK, which disables receive-window
+                // autotuning (DRS). Measured on a real 2-host cluster
+                // (2026-07-19): the old `set_tcp_buffer_sizes(s, 512 KiB)`
+                // froze the advertised window at 43008 B for the connection's
+                // lifetime (`ss -ti`: snd_wnd const, rwnd_limited ≈ 100 %),
+                // capping every PS→EN append conn at ~9 MB/s and a single
+                // durable 8 MiB RF3 put at ~500-900 ms/append (37 MB/s file
+                // write on a 200 GbE link). With autotuning (same as the PS
+                // listener, which never locked buffers) the window grows to
+                // multi-MB and the same conn moves hundreds of MB/s.
             }
             let node = self.clone();
             compio::runtime::spawn(async move {
