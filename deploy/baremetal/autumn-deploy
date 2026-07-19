@@ -676,10 +676,12 @@ _ensure_authz() {
         log "authz: DISABLED (AUTUMN_AUTH_DISABLE=1)"
         return
     fi
-    export AUTUMN_AUTH_PROTECTED_PREFIXES="${AUTUMN_AUTH_PROTECTED_PREFIXES:-fs/ kvc/ mem/}"
+    # TENANT-FIRST + PROTECT-EVERYTHING: when authz is on, EVERY tenant-scoped
+    # write needs a token, so there is no protected-prefix list to configure (the
+    # signing key alone arms enforcement). `--auth-protected-prefix` is retired.
 
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
-        log "authz: using operator-provided key $AUTUMN_AUTH_SIGNING_KEY_FILE (protected: $AUTUMN_AUTH_PROTECTED_PREFIXES)"
+        log "authz: using operator-provided key $AUTUMN_AUTH_SIGNING_KEY_FILE"
         return
     fi
 
@@ -710,7 +712,7 @@ _ensure_authz() {
     export AUTUMN_ADMIN_TOKEN_FILE="$mtok"
     AUTHZ_LOCAL_ADMIN_TOKEN="$ltok"
     AUTHZ_LOCAL_DIR="$ldir"
-    log "authz: ENABLED — protected [$AUTUMN_AUTH_PROTECTED_PREFIXES]; key on ${#MANAGER_HOSTS[@]} manager(s)"
+    log "authz: ENABLED (protect-everything) — key on ${#MANAGER_HOSTS[@]} manager(s)"
 }
 
 # F-AUTHZ-BUILTIN: mint a 'default'-tenant credential (covering every protected
@@ -733,11 +735,11 @@ _provision_credential() {
         return
     fi
     [[ -s "$cred" ]] && log "authz: local default credential is stale (tenant absent here) — re-provisioning"
-    local -a prefixes=() ns
-    for ns in $AUTUMN_AUTH_PROTECTED_PREFIXES; do prefixes+=(--prefix "${ns}default/"); done
+    # TENANT-FIRST: grant the WHOLE tenant `default/` (covers default/fs/,
+    # default/kvc/, default/mem/ — the key layout is {tenant}/{namespace}/).
     local tmp="$cred.tmp"
     if "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" tenant-create \
-            --tenant default "${prefixes[@]}" \
+            --tenant default --prefix default/ \
             --admin-token-file "$AUTHZ_LOCAL_ADMIN_TOKEN" 2>/dev/null \
             | awk '/^credential:/{print $2}' > "$tmp" && [[ -s "$tmp" ]]; then
         chmod 600 "$tmp" 2>/dev/null || true
@@ -746,7 +748,7 @@ _provision_credential() {
         log "  clients: fuse/autumnfs/autumn-client --credential-file $cred --tenant default"
     else
         rm -f "$tmp"
-        log "authz: WARN tenant-create failed — mint manually: autumn-op --manager $MANAGER_LIST tenant-create --tenant default ${prefixes[*]} --admin-token-file <token>"
+        log "authz: WARN tenant-create failed — mint manually: autumn-op --manager $MANAGER_LIST tenant-create --tenant default --prefix default/ --admin-token-file <token>"
     fi
 }
 

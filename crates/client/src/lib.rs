@@ -112,7 +112,13 @@ pub enum NamespaceBinding {
     Scoped {
         namespace: String,
         tenant: String,
-        /// `{namespace}/{tenant}/` as bytes — precomputed once.
+        /// `{tenant}/{namespace}/` as bytes — precomputed once. TENANT is the
+        /// OUTER prefix (it is mandatory + the primary isolation unit), so a
+        /// whole tenant's data across all its namespaces is ONE contiguous range
+        /// `[{tenant}/, {tenant}0)` — per-tenant backup/delete/isolation/authz
+        /// grant is a single prefix. (Flipped from `{namespace}/{tenant}/`
+        /// 2026-07-19 — that order was a historical artifact: the app-prefix
+        /// contract predated the mandatory tenant.)
         prefix: Vec<u8>,
     },
     /// Admin / unscoped: no client-side prefixing.
@@ -120,11 +126,13 @@ pub enum NamespaceBinding {
 }
 
 impl NamespaceBinding {
-    /// Build a scoped binding — always Prepend (`{ns}/{tenant}/ ++ key`).
+    /// Build a scoped binding — always Prepend (`{tenant}/{namespace}/ ++ key`).
     pub fn scoped(namespace: impl Into<String>, tenant: impl Into<String>) -> Self {
         let namespace = namespace.into();
         let tenant = tenant.into();
-        let prefix = format!("{namespace}/{tenant}/").into_bytes();
+        // TENANT-FIRST: tenant is the outer scope (see the `prefix` field doc).
+        // The arg order stays (namespace, tenant); only the assembled bytes flip.
+        let prefix = format!("{tenant}/{namespace}/").into_bytes();
         NamespaceBinding::Scoped {
             namespace,
             tenant,
@@ -132,7 +140,7 @@ impl NamespaceBinding {
         }
     }
 
-    /// `{ns}/{tenant}/` for a scoped binding; `None` for `Raw`.
+    /// `{tenant}/{namespace}/` for a scoped binding; `None` for `Raw`.
     pub fn prefix(&self) -> Option<&[u8]> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
@@ -140,7 +148,7 @@ impl NamespaceBinding {
         }
     }
 
-    /// Map a user key to the wire key. Scoped → `{ns}/{tenant}/ ++ key` (ALWAYS
+    /// Map a user key to the wire key. Scoped → `{tenant}/{ns}/ ++ key` (ALWAYS
     /// prepend — scope is locked by construction); Raw → pass through unchanged.
     /// Infallible (a scoped key can't escape its scope); returns `Result` only so
     /// call sites keep the `?` shape.
@@ -152,7 +160,7 @@ impl NamespaceBinding {
     }
 
     /// Map a user range prefix to the wire prefix. Same mapping as `bind_key`; an
-    /// EMPTY user prefix scans the whole `{ns}/{tenant}/`.
+    /// EMPTY user prefix scans the whole `{tenant}/{ns}/`.
     pub fn bind_prefix(&self, user_prefix: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
         self.bind_key(user_prefix)
     }
@@ -168,9 +176,9 @@ impl NamespaceBinding {
         }
     }
 
-    /// Upper cap for a scoped range scan: `{ns}/{tenant}0` (`0`=0x30 is the
-    /// successor of `/`=0x2f), so a limit-driven scan can never walk past the
-    /// tenant into the next namespace. `None` for `Raw`.
+    /// Upper cap for a scoped range scan: `{tenant}/{ns}0` (`0`=0x30 is the
+    /// successor of `/`=0x2f), so a limit-driven scan can never walk past this
+    /// namespace into the next one within the tenant. `None` for `Raw`.
     pub fn upper_cap(&self) -> Option<Vec<u8>> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => {
@@ -186,10 +194,10 @@ impl NamespaceBinding {
 }
 
 /// F-KEY-NS D7: validate a namespace/tenant scope segment used at connect.
-/// Prepend-only embeds these verbatim into `{ns}/{tenant}/` (the old `q()`
+/// Prepend-only embeds these verbatim into `{tenant}/{ns}/` (the old `q()`
 /// percent-encoding of the tenant is gone), so an EMPTY segment or one containing
-/// `/` would forge a nested/aliased scope (`mem` + `acme/sub` → `mem/acme/sub/`,
-/// or `mem//`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
+/// `/` would forge a nested/aliased scope (`acme/sub` + `mem` → `acme/sub/mem/`,
+/// or `//mem`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
 /// namespace names, at connect (fail fast) — restores the dropped invariant for
 /// every frontend at once.
 pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
@@ -4555,12 +4563,12 @@ mod namespace_binding_tests {
 
     #[test]
     fn scoped_always_prepends_incl_builtins() {
-        // Prepend-only: EVERY scoped namespace (built-in or user) prepends
-        // `{ns}/{tenant}/`; there is no Assert mode. Built-in key builders emit
-        // keys RELATIVE to the prefix, so there is no double-prefix.
+        // Prepend-only, TENANT-FIRST: EVERY scoped namespace (built-in or user)
+        // prepends `{tenant}/{ns}/`; there is no Assert mode. Built-in key
+        // builders emit keys RELATIVE to the prefix, so there is no double-prefix.
         for (ns, tenant) in [("fs", "acme"), ("kvc", "acme"), ("mem", "acme"), ("bench", "perf")] {
             let b = NamespaceBinding::scoped(ns, tenant);
-            let want = format!("{ns}/{tenant}/").into_bytes();
+            let want = format!("{tenant}/{ns}/").into_bytes();
             match &b {
                 NamespaceBinding::Scoped { prefix, .. } => assert_eq!(prefix, &want),
                 _ => panic!("expected Scoped"),
@@ -4574,11 +4582,11 @@ mod namespace_binding_tests {
 
     #[test]
     fn prepend_binds_and_strips() {
-        let b = NamespaceBinding::scoped("bench", "perf");
-        assert_eq!(b.bind_key(b"k1").unwrap(), b"bench/perf/k1".to_vec());
-        assert_eq!(b.bind_key(b"").unwrap(), b"bench/perf/".to_vec());
+        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
+        assert_eq!(b.bind_key(b"k1").unwrap(), b"perf/bench/k1".to_vec());
+        assert_eq!(b.bind_key(b"").unwrap(), b"perf/bench/".to_vec());
         // strip is the inverse for keys under the prefix.
-        assert_eq!(b.strip(b"bench/perf/k1".to_vec()), b"k1".to_vec());
+        assert_eq!(b.strip(b"perf/bench/k1".to_vec()), b"k1".to_vec());
         // a key NOT under the prefix is returned unchanged by strip.
         assert_eq!(b.strip(b"other".to_vec()), b"other".to_vec());
     }
@@ -4586,12 +4594,12 @@ mod namespace_binding_tests {
     #[test]
     fn scope_is_locked_by_construction() {
         // The whole point of Prepend-only: a scoped client CANNOT emit a key
-        // outside its `{ns}/{tenant}/`. Even a key that "looks like" another
-        // tenant is prepended, landing it firmly inside this scope.
-        let b = NamespaceBinding::scoped("mem", "acme");
+        // outside its `{tenant}/{ns}/`. Even a key that "looks like" another
+        // scope is prepended, landing it firmly inside this one.
+        let b = NamespaceBinding::scoped("mem", "acme"); // → acme/mem/
         assert_eq!(
-            b.bind_key(b"mem/other/x").unwrap(),
-            b"mem/acme/mem/other/x".to_vec(),
+            b.bind_key(b"other/mem/x").unwrap(),
+            b"acme/mem/other/mem/x".to_vec(),
         );
         // bind_key is infallible for a scoped binding — no escape, no reject.
         assert!(b.bind_key(b"\xff\xfeanything").is_ok());
@@ -4608,35 +4616,35 @@ mod namespace_binding_tests {
 
     #[test]
     fn upper_cap_is_the_slash_successor() {
-        // `{ns}/{tenant}/` → `{ns}/{tenant}0` ('/'=0x2f, '0'=0x30).
-        let b = NamespaceBinding::scoped("bench", "perf");
-        assert_eq!(b.upper_cap().unwrap(), b"bench/perf0".to_vec());
+        // `{tenant}/{ns}/` → `{tenant}/{ns}0` ('/'=0x2f, '0'=0x30).
+        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
+        assert_eq!(b.upper_cap().unwrap(), b"perf/bench0".to_vec());
         // Every key under the prefix sorts strictly below the cap.
         let cap = b.upper_cap().unwrap();
-        assert!(b"bench/perf/".to_vec() < cap);
-        assert!(b"bench/perf/zzzzz".to_vec() < cap);
-        assert!(b"bench/perf/\xff".to_vec() < cap);
-        // The next namespace/tenant sorts at/above the cap.
-        assert!(b"bench/pers/".to_vec() >= cap);
+        assert!(b"perf/bench/".to_vec() < cap);
+        assert!(b"perf/bench/zzzzz".to_vec() < cap);
+        assert!(b"perf/bench/\xff".to_vec() < cap);
+        // The next namespace within the tenant sorts at/above the cap.
+        assert!(b"perf/benci/".to_vec() >= cap);
     }
 
     #[test]
     fn bind_prefix_matches_bind_key() {
-        let b = NamespaceBinding::scoped("bench", "perf");
-        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"bench/perf/pre".to_vec());
+        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
+        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"perf/bench/pre".to_vec());
         // empty user prefix → the namespace lower bound.
-        assert_eq!(b.bind_prefix(b"").unwrap(), b"bench/perf/".to_vec());
+        assert_eq!(b.bind_prefix(b"").unwrap(), b"perf/bench/".to_vec());
     }
 
     #[test]
     fn stripe_chunk_keys_land_in_the_tenant_range() {
         // A stripe chunk key (`\xff\xfe…`) is just a normal user key to the
-        // binding, so a scoped (Prepend) client prepends `{ns}/{tenant}/` and the
+        // binding, so a scoped (Prepend) client prepends `{tenant}/{ns}/` and the
         // chunk lands INSIDE the tenant range (Layer-A / authz / presplit cover
         // it). No special chunk path is needed under Prepend-only.
         let chunk = make_chunk_key(b"userkey", 3);
-        let b = NamespaceBinding::scoped("bench", "perf");
-        assert!(b.bind_key(&chunk).unwrap().starts_with(b"bench/perf/"));
+        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
+        assert!(b.bind_key(&chunk).unwrap().starts_with(b"perf/bench/"));
         // Raw: passthrough (legacy global chunk space).
         assert_eq!(NamespaceBinding::Raw.bind_key(&chunk).unwrap(), chunk);
     }

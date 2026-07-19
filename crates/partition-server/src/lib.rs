@@ -12861,17 +12861,18 @@ mod authz_enforcement_tests {
             let mut dec = FrameDecoder::new();
 
             // (1) AUTH_HELLO with tenant acme's token → OK, binds principal.
-            let token = mint(&sk, vec![b"mem/acme/".to_vec()]);
+            // TENANT-FIRST: the grant is the WHOLE tenant `acme/`.
+            let token = mint(&sk, vec![b"acme/".to_vec()]);
             let hello = partition_rpc::rkyv_encode(&AuthHelloReq { token });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_AUTH_HELLO, hello).await;
             assert!(!f.is_error(), "AUTH_HELLO should succeed");
             let resp: AuthHelloResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
             assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
 
-            // (2) GET mem/acme/doc → authorized → delegates → GetResp OK.
+            // (2) GET acme/mem/doc → authorized → delegates → GetResp OK.
             let g = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"mem/acme/doc".to_vec(),
+                key: b"acme/mem/doc".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
@@ -12879,10 +12880,10 @@ mod authz_enforcement_tests {
             let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET, g).await;
             assert!(!f.is_error(), "authorized GET should pass");
 
-            // (3) GET mem/other/doc → cross-tenant → DENIED at the gate.
+            // (3) GET other/mem/doc → cross-tenant → DENIED at the gate.
             let g2 = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"mem/other/doc".to_vec(),
+                key: b"other/mem/doc".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
@@ -12892,10 +12893,10 @@ mod authz_enforcement_tests {
             let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
 
-            // (4) PUT mem/acme/x → authorized write passes the gate.
+            // (4) PUT acme/mem/x → authorized write passes the gate.
             let put = partition_rpc::rkyv_encode(&PutReq {
                 part_id: 7,
-                key: b"mem/acme/x".to_vec(),
+                key: b"acme/mem/x".to_vec(),
                 value: b"v".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
@@ -12905,10 +12906,10 @@ mod authz_enforcement_tests {
             let f = round_trip(&mut wr, &mut rd, &mut dec, 4, MSG_PUT, put).await;
             assert!(!f.is_error(), "authorized PUT should pass");
 
-            // (5) PUT mem/other/x → cross-tenant write DENIED.
+            // (5) PUT other/mem/x → cross-tenant write DENIED.
             let put2 = partition_rpc::rkyv_encode(&PutReq {
                 part_id: 7,
-                key: b"mem/other/x".to_vec(),
+                key: b"other/mem/x".to_vec(),
                 value: b"v".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
@@ -12920,16 +12921,18 @@ mod authz_enforcement_tests {
             let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
 
-            // (6) non-protected key without auth → allowed (ungated namespace).
+            // (6) A DIFFERENT namespace within the SAME tenant → allowed: the
+            // tenant-wide `acme/` grant covers every namespace (acme/fs/, …),
+            // and PROTECT-EVERYTHING means it still needs the (bound) token.
             let g3 = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"fuse/inode/1".to_vec(),
+                key: b"acme/fs/inode1".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
             });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET, g3).await;
-            assert!(!f.is_error(), "non-protected key should pass ungated");
+            assert!(!f.is_error(), "same-tenant different-namespace should pass under the acme/ grant");
 
             drop(wr);
             drop(rd);

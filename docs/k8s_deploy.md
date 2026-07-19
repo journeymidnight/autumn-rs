@@ -163,10 +163,11 @@ Mint a client credential + Secret (once the cluster is up):
 # admin token lives in the autumn-authz Secret
 ADMIN=$(kubectl -n autumn get secret autumn-authz -o jsonpath='{.data.admin\.token}' | base64 -d)
 # mint a 'default'-tenant credential (run against the manager Service).
-# --admin-token-file reads the token from a file (process substitution keeps it
-# out of argv); --admin-token would take the /dev/fd path as the literal token.
+# TENANT-FIRST: grant the whole tenant `default/` (covers default/fs/, default/kvc/,
+# default/mem/). --admin-token-file reads the token from a file (process
+# substitution keeps it out of argv).
 autumn-op --manager <mgr> tenant-create --tenant default \
-    --prefix fs/default/ --prefix kvc/default/ --prefix mem/default/ \
+    --prefix default/ \
     --admin-token-file <(printf %s "$ADMIN") | awk '/^credential:/{print $2}' > default.cred
 kubectl -n autumn create secret generic autumn-credential --from-file=credential=default.cred
 ```

@@ -39,21 +39,21 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
 }
 
 /// F-KEY-NS D7: the benchmarks bind the `bench` namespace with tenant `perf`
-/// (Prepend `bench/perf/`), so their keys are USER keys.
+/// (Prepend `perf/bench/` — TENANT-FIRST), so their keys are USER keys.
 const BENCH_NS: &str = "bench";
 const BENCH_TENANT: &str = "perf";
 
 /// F-KEY-NS D7: derive the USER-space partition start keys covering the bench
 /// namespace. `all_partitions_with_range` returns WIRE ranges; the client
-/// prepends `bench/perf/`, so a bench key built off a partition's wire start
+/// prepends `perf/bench/`, so a bench key built off a partition's wire start
 /// would route into the WRONG namespace. Instead, take each partition whose wire
-/// start lies under `bench/perf/`, strip that prefix, and feed the remainder to
-/// `key_for_partition` — the binding re-prepends `bench/perf/`, landing the key
+/// start lies under `perf/bench/`, strip that prefix, and feed the remainder to
+/// `key_for_partition` — the binding re-prepends `perf/bench/`, landing the key
 /// back in that partition. Requires the `bench` namespace to be presplit for
 /// multi-partition spread; a non-presplit bench yields a single empty start (one
 /// partition), so the perf run measures one partition (documented in ops.md).
 fn bench_user_starts(partitions: &[(u64, String, Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
-    let prefix = format!("{BENCH_NS}/{BENCH_TENANT}/").into_bytes();
+    let prefix = format!("{BENCH_TENANT}/{BENCH_NS}/").into_bytes();
     let mut starts: Vec<Vec<u8>> = Vec::new();
     for (_pid, _addr, start, _end) in partitions {
         if let Some(rest) = start.strip_prefix(prefix.as_slice()) {

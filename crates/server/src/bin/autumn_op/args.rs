@@ -136,9 +136,9 @@ pub(crate) struct Args {
 /// namespace/tenant):
 /// - `Median` — no explicit point; PS picks the median (legacy).
 /// - `Namespaced { namespace, tenant, suffix }` — the normal operator form.
-///   The cut key = `"{namespace}/{tenant}/" ++ suffix`. An EMPTY `suffix`
-///   cuts exactly at the pair boundary `"{namespace}/{tenant}/"` (splits two
-///   tenants into different partitions — a common op).
+///   The cut key = `"{tenant}/{namespace}/" ++ suffix` (TENANT-FIRST). An EMPTY
+///   `suffix` cuts exactly at the pair boundary `"{tenant}/{namespace}/"`
+///   (splits one tenant's namespace off — a common op).
 /// - `Raw(bytes)` — admin-only escape hatch (`--at-raw-hex`); the caller hand-
 ///   builds the whole prefix. Same posture as D7 ⑤ `raw()`: documented
 ///   admin-only, not the day-to-day path.
@@ -162,7 +162,7 @@ impl SplitPoint {
                 tenant,
                 suffix,
             } => {
-                let mut key = format!("{namespace}/{tenant}/").into_bytes();
+                let mut key = format!("{tenant}/{namespace}/").into_bytes();
                 key.extend_from_slice(suffix);
                 Some(key)
             }
@@ -180,10 +180,10 @@ impl SplitPoint {
                 suffix,
             } => {
                 if suffix.is_empty() {
-                    format!("pair boundary {namespace}/{tenant}/")
+                    format!("pair boundary {tenant}/{namespace}/")
                 } else {
                     format!(
-                        "{namespace}/{tenant}/ + suffix 0x{}",
+                        "{tenant}/{namespace}/ + suffix 0x{}",
                         suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     )
                 }
@@ -1460,26 +1460,26 @@ mod tests {
         };
         assert_eq!(
             p.resolve_at_key().unwrap(),
-            b"kvc/acme/vllm/v1/80".to_vec()
+            b"acme/kvc/vllm/v1/80".to_vec() // TENANT-FIRST
         );
     }
 
     #[test]
     fn split_point_empty_suffix_is_pair_boundary() {
-        // The common "split two tenants apart" op: empty suffix cuts exactly
-        // at the pair boundary "ns/tenant/".
+        // The common "split a tenant's namespace off" op: empty suffix cuts
+        // exactly at the pair boundary "tenant/ns/".
         let p = SplitPoint::Namespaced {
             namespace: "kvc".into(),
             tenant: "acme".into(),
             suffix: vec![],
         };
-        assert_eq!(p.resolve_at_key().unwrap(), b"kvc/acme/".to_vec());
+        assert_eq!(p.resolve_at_key().unwrap(), b"acme/kvc/".to_vec());
     }
 
     #[test]
     fn split_point_hex_suffix_carries_binary_bytes() {
         // --at-hex path: a binary suffix (e.g. an fs inode prefix) rides on
-        // the same ns/tenant assembly.
+        // the same tenant/ns assembly.
         let suffix = super::parse_hex_key("0103ff00");
         assert_eq!(suffix, vec![0x01, 0x03, 0xff, 0x00]);
         let p = SplitPoint::Namespaced {
@@ -1487,7 +1487,7 @@ mod tests {
             tenant: "t1".into(),
             suffix,
         };
-        let mut expected = b"fs/t1/".to_vec();
+        let mut expected = b"t1/fs/".to_vec();
         expected.extend_from_slice(&[0x01, 0x03, 0xff, 0x00]);
         assert_eq!(p.resolve_at_key().unwrap(), expected);
     }

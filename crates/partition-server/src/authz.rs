@@ -206,25 +206,24 @@ pub fn verify_auth_hello(
     })
 }
 
-/// Is `key` under any protected prefix?
-fn is_protected(key: &[u8], protected: &[Vec<u8>]) -> bool {
-    protected.iter().any(|p| key.starts_with(p))
-}
-
 fn denied(msg: &str) -> Option<(StatusCode, String)> {
     Some((StatusCode::PermissionDenied, msg.to_string()))
 }
 
 /// Authorize ONE key. `Some((code,msg))` = deny, `None` = allow.
+///
+/// PROTECT-EVERYTHING (tenant-first, 2026-07-19): when authz is enabled EVERY
+/// key requires a token (this fn only runs under `snap.enabled`), so there is no
+/// `is_protected` prefix filter — a credential grants `{tenant}/` (whole tenant)
+/// or `{tenant}/{ns}/` and the key must fall under one of those grants. The old
+/// `protected_prefixes` list is retired (there is no un-protected range once
+/// every write is mandatorily tenant-scoped, per F-NS-FIRST-CLASS).
 fn check_key(
     key: &[u8],
     principal: Option<&BoundPrincipal>,
     inner: &AuthzInner,
     now: u64,
 ) -> Option<(StatusCode, String)> {
-    if !is_protected(key, &inner.protected_prefixes) {
-        return None; // ungated namespace — not our concern
-    }
     let p = match principal {
         Some(p) => p,
         None => return denied("protected key requires a capability token (no AUTH_HELLO on this connection)"),
@@ -257,15 +256,10 @@ fn check_range(
     inner: &AuthzInner,
     now: u64,
 ) -> Option<(StatusCode, String)> {
-    // Gated iff the scan could return a protected key: {k: starts_with(prefix)}
-    // intersects {k: starts_with(PP)} iff prefix⊇PP or PP⊇prefix.
-    let gated = inner
-        .protected_prefixes
-        .iter()
-        .any(|pp| prefix.starts_with(pp) || pp.starts_with(prefix));
-    if !gated {
-        return None;
-    }
+    // PROTECT-EVERYTHING: every range needs a token when authz is on (this fn
+    // only runs under `snap.enabled`). An empty (unbounded) prefix can never be
+    // ⊆ a non-empty grant → denied; a `{tenant}/`-scoped scan is ⊆ the tenant
+    // grant → allowed.
     let p = match principal {
         Some(p) => p,
         None => return denied("protected range requires a capability token (no AUTH_HELLO on this connection)"),
@@ -396,8 +390,22 @@ pub fn check_layer_a(
     payload: &[u8],
     inner: &AuthzInner,
 ) -> Option<(StatusCode, String)> {
+    // TENANT-FIRST: the wire key is `{tenant}/{ns}/…`, so a registered namespace
+    // (`{name}/`, e.g. `fs/`) is the SECOND `/`-delimited segment, not a left
+    // prefix. Extract `{ns}/` (the bytes between the 1st and 2nd `/`, inclusive
+    // of the 2nd) and require an EXACT match against a registered namespace.
+    // `{tenant}` + `{ns}` are ASCII-no-slash (`is_valid_scope_segment`), so the
+    // first two slashes bound them even if the binary key tail contains `/`.
     fn in_a_namespace(key: &[u8], namespaces: &[Vec<u8>]) -> bool {
-        namespaces.iter().any(|ns| key.starts_with(ns))
+        let Some(s1) = key.iter().position(|&b| b == b'/') else {
+            return false;
+        };
+        let Some(rel) = key.get(s1 + 1..).and_then(|t| t.iter().position(|&b| b == b'/')) else {
+            return false;
+        };
+        let s2 = s1 + 1 + rel;
+        let ns_with_slash = &key[s1 + 1..=s2]; // `{ns}/`
+        namespaces.iter().any(|ns| ns.as_slice() == ns_with_slash)
     }
     fn reject(key: &[u8]) -> Option<(StatusCode, String)> {
         Some((
@@ -462,9 +470,11 @@ mod tests {
         }
     }
 
+    // TENANT-FIRST: a tenant credential grants the WHOLE tenant `acme/` (covers
+    // every namespace `acme/fs/`, `acme/kvc/`, `acme/mem/`).
     fn acme() -> BoundPrincipal {
         BoundPrincipal {
-            allowed_prefixes: vec![b"mem/acme/".to_vec()],
+            allowed_prefixes: vec![b"acme/".to_vec()],
             exp: 1_000_000,
             kid: 1,
         }
@@ -472,62 +482,61 @@ mod tests {
 
     #[test]
     fn check_key_matrix() {
-        let inner = inner_with(vec![b"mem/".to_vec()]);
+        // protected_prefixes is retired (protect-everything) — pass empty.
+        let inner = inner_with(vec![]);
         let p = acme();
         let now = 999_000;
-        // authorized protected key → allow
-        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, now).is_none());
-        // protected key outside allowed prefix → deny
-        assert!(check_key(b"mem/other/fact/1", Some(&p), &inner, now).is_some());
-        // anonymous on protected → deny
-        assert!(check_key(b"mem/acme/fact/1", None, &inner, now).is_some());
-        // non-protected key → allow (even anonymous)
-        assert!(check_key(b"fuse/inode/1", None, &inner, now).is_none());
+        // key inside the granted tenant → allow (ANY namespace within it)
+        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, now).is_none());
+        assert!(check_key(b"acme/fs/\x01x", Some(&p), &inner, now).is_none());
+        // another tenant → deny (outside the acme/ grant)
+        assert!(check_key(b"other/mem/fact/1", Some(&p), &inner, now).is_some());
+        // anonymous → deny (protect-everything: every key needs a token)
+        assert!(check_key(b"acme/mem/fact/1", None, &inner, now).is_some());
+        assert!(check_key(b"acme/fs/\x01x", None, &inner, now).is_some());
         // expired token → deny
-        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, p.exp + 61).is_some());
+        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, p.exp + 61).is_some());
         // within skew leeway → allow
-        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, p.exp + 30).is_none());
+        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, p.exp + 30).is_none());
     }
 
     #[test]
     fn prefix_boundary_not_forgeable() {
-        // `mem/acme` (no trailing /) must NOT be authorized by allowed `mem/acme/`
-        // — but percent-encoding + the trailing-/ normalization make a real
-        // cross-tenant key like `mem/acmeevil/` fall outside `mem/acme/`.
-        let inner = inner_with(vec![b"mem/".to_vec()]);
+        // `acmeevil/` must NOT be authorized by the `acme/` grant (the trailing
+        // `/` on the grant makes `acmeevil/…` fall outside it).
+        let inner = inner_with(vec![]);
         let p = acme();
         let now = 999_000;
-        assert!(check_key(b"mem/acmeevil/x", Some(&p), &inner, now).is_some());
-        assert!(check_key(b"mem/acme/x", Some(&p), &inner, now).is_none());
+        assert!(check_key(b"acmeevil/mem/x", Some(&p), &inner, now).is_some());
+        assert!(check_key(b"acme/mem/x", Some(&p), &inner, now).is_none());
     }
 
     #[test]
     fn range_whole_interval_subseteq_prefix() {
-        let inner = inner_with(vec![b"mem/".to_vec()]);
+        let inner = inner_with(vec![]);
         let p = acme();
         let now = 999_000;
-        // prefix ⊆ allowed → allow
-        assert!(check_range(b"mem/acme/", Some(&p), &inner, now).is_none());
-        assert!(check_range(b"mem/acme/fact/", Some(&p), &inner, now).is_none());
-        // prefix spans into other tenants (prefix ⊋ allowed) → deny
-        assert!(check_range(b"mem/", Some(&p), &inner, now).is_some());
-        // empty prefix (unbounded scan) touching protected → deny
+        // prefix ⊆ the tenant grant → allow (incl. scanning the whole tenant)
+        assert!(check_range(b"acme/mem/", Some(&p), &inner, now).is_none());
+        assert!(check_range(b"acme/mem/fact/", Some(&p), &inner, now).is_none());
+        assert!(check_range(b"acme/", Some(&p), &inner, now).is_none());
+        // another tenant (prefix ⊄ acme/) → deny
+        assert!(check_range(b"other/mem/", Some(&p), &inner, now).is_some());
+        // empty prefix (unbounded scan) → deny
         assert!(check_range(b"", Some(&p), &inner, now).is_some());
-        // anonymous protected range → deny
-        assert!(check_range(b"mem/acme/", None, &inner, now).is_some());
-        // ungated range (outside protected) → allow
-        assert!(check_range(b"fuse/", None, &inner, now).is_none());
+        // anonymous → deny (protect-everything)
+        assert!(check_range(b"acme/mem/", None, &inner, now).is_some());
     }
 
     #[test]
     fn authz_check_dispatch_get_and_put() {
-        let inner = inner_with(vec![b"mem/".to_vec()]);
+        let inner = inner_with(vec![]);
         let p = acme();
         let now = 999_000;
-        // GET authorized
+        // GET authorized (within the acme/ tenant grant)
         let g = rkyv_encode(&GetReq {
             part_id: 1,
-            key: b"mem/acme/doc/1".to_vec(),
+            key: b"acme/mem/doc/1".to_vec(),
             offset: 0,
             length: 0,
             region_epoch: 0,
@@ -536,7 +545,7 @@ mod tests {
         // GET cross-tenant denied
         let g2 = rkyv_encode(&GetReq {
             part_id: 1,
-            key: b"mem/other/doc/1".to_vec(),
+            key: b"other/mem/doc/1".to_vec(),
             offset: 0,
             length: 0,
             region_epoch: 0,
@@ -545,7 +554,7 @@ mod tests {
         // PUT cross-tenant denied (value not copied into the assertion path)
         let put = rkyv_encode(&PutReq {
             part_id: 1,
-            key: b"mem/other/doc/1".to_vec(),
+            key: b"other/mem/doc/1".to_vec(),
             value: vec![7u8; 100],
             expires_at: 0,
             region_epoch: 0,
@@ -555,9 +564,10 @@ mod tests {
         assert!(authz_check(MSG_PUT, &put, Some(&p), &inner, now).is_some());
         // non-data-plane msg_type → not gated
         assert!(authz_check(0x47 /* MSG_MAINTENANCE */, &[], Some(&p), &inner, now).is_none());
-        // authz off (no protected prefixes) → everything allowed
-        let open = inner_with(vec![]);
-        assert!(authz_check(MSG_GET, &g2, None, &open, now).is_none());
+        // PROTECT-EVERYTHING: authz_check assumes enabled (the caller gates on
+        // `snap.enabled`), so ANY key without a token is denied — there is no
+        // "empty protected ⇒ allowed" escape hatch anymore.
+        assert!(authz_check(MSG_GET, &g2, None, &inner, now).is_some());
     }
 
     #[test]
@@ -681,17 +691,19 @@ mod tests {
 
     #[test]
     fn layer_a_admits_put_in_registered_namespace() {
+        // TENANT-FIRST: namespace is the 2nd segment of `{tenant}/{ns}/…`.
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec(), b"mem/".to_vec()]);
-        assert!(check_layer_a(MSG_PUT, &put_payload(b"kvc/acme/x"), &inner).is_none());
-        assert!(check_layer_a(MSG_PUT, &put_payload(b"mem/acme/y"), &inner).is_none());
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"acme/kvc/x"), &inner).is_none());
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"acme/mem/y"), &inner).is_none());
     }
 
     #[test]
     fn layer_a_rejects_put_in_unregistered_namespace() {
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
-        let d = check_layer_a(MSG_PUT, &put_payload(b"scratch/x"), &inner);
+        // valid tenant, UNregistered 2nd-segment namespace → reject.
+        let d = check_layer_a(MSG_PUT, &put_payload(b"t1/scratch/x"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))), "{d:?}");
-        // A raw fuse-style key (no registered prefix) is rejected too.
+        // A raw key with no `{tenant}/{ns}/` structure is rejected too.
         let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
     }
@@ -704,8 +716,8 @@ mod tests {
             region_epoch: 0,
             must_sync: true,
             ops: vec![
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/1".to_vec(), value: vec![], expires_at: 0 },
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/2".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/2".to_vec(), value: vec![], expires_at: 0 },
             ],
         })
         .to_vec();
@@ -715,8 +727,8 @@ mod tests {
             region_epoch: 0,
             must_sync: true,
             ops: vec![
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/a/1".to_vec(), value: vec![], expires_at: 0 },
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"other/2".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/scratch/2".to_vec(), value: vec![], expires_at: 0 },
             ],
         })
         .to_vec();
