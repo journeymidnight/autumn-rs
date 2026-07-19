@@ -1,38 +1,29 @@
 Date: 2026-07-19
 TaskStatus: completed
-Task scope: 4-task batch (用户 2026-07-18) — ALL DONE, committed + pushed to main。
+Task scope: 用户会话续（tenant-first key 翻转 + F-PRESPLIT-NS-RULES）—— 均已 commit + push。
 
-1. autumnfs 前缀 fs/{tenant}/{volume}/ → fs/{tenant}/ (去 {volume} 层)   — DONE (c7ad5a2)
-2. 默认打开 authz (部署层默认开, dev/测试仍关)                            — DONE (35c4e98/066c552/b3bf127)
-3. fix F-AUTUMNFS-SLOW                                                     — DONE (615fed9)
-4. push F-KVC-LAYOUT-FP + BUG-MGR-RETRY-CLASS + F-REGION-REBALANCE PhaseB  — DONE (4718714/7f8ca9e)
+── F-KEY-NS-TENANT-FIRST（key 顺序 {ns}/{tenant}/ → {tenant}/{namespace}/ + authz 开了就全保护）──
+commit 0edb97c（core）/ c66ac42（docs）/ c11c880（#[ignore] 测试翻）/ 64e2752（ledger）。
+详见 memory project_key_order_tenant_first。核心=client NamespaceBinding::scoped 一行真源;
+Layer-B 去 protected_prefixes（全保护）;Layer-A 改第 2 段解析;凭据授 {tenant}/;
+SILENT 点=split resolve_at_key + bench 前缀。活集群 authz-ON e2e 验过。全单测绿。
+peripheral（#[ignore] 测试、docs）全补;manager 零改动（protected_prefixes 变废字段）。
 
-commit 顺序:
-  c7ad5a2 Task1 去 {volume}(fail-loud 迁移 guard + tenant 隔离测试)
-  615fed9 Task3 F-AUTUMNFS-SLOW(流式分窗 put_many + 分窗 get_many_into; GET 33→686MiB/s 20×)
-  4718714 Task4 三 feature 推 done(BUG-MGR-RETRY-CLASS 修真 P1 回归)
-  7f8ca9e Task4 coco 复审(retry 不 rotate 瞬态 precondition + rebalance raw-field 校验)
-  35c4e98 Task2A 客户端 --credential-file(fuse/autumnfs/autumn-client)+ autumnfs orphan 清理
-  066c552 Task2A 修凭据文件=HEX(read_credential_file 共享 helper, 4 单测)
-  b3bf127 Task2B 部署层默认开 authz(autumn-deploy + k8s + entrypoint + docs)
+── F-PRESPLIT-NS-RULES（namespace-aware presplit）── commit 4741f84（coco 复审中 ba1g76jw5）
+`autumn-op presplit --namespace <fs|kvc|mem> --tenant <t>`（autumn_op/args.rs + main.rs cmd_presplit）：
+  - fs: 按 inode `[0x03][ino BE]`（--fs-inos i,j,… / --count N;退役低字节步进）
+  - kvc: 按 content-hash 首 hex 字符（sha256 hexdigest 均匀,--count N 按 16 hex 切,--hash-prefix 默认 vllm/）
+  - mem: 按 agent（--agents a,b,… → {agent}/）
+  pure presplit_suffixes（3 规则,升序）+ orchestration（组 tenant-first wire 点 {t}/{ns}/++suffix →
+  逐点重 resolve owner → split_at;报 applied/skipped + has_overlap 提示）。
+  fuse_split_ranges 标 SUPERSEDED（namespace-blind fallback）。
+  4 单测绿;活集群验证（repro 9001）: 切点 hex `default/fs/[0x03][ino]`（tenant-first）、首 split 落地
+  part13→17、后续 has_overlap 正确报出+提示（4.6GB 数据分区,符合"presplit 空 keyspace 再灌"设计）。
+  ops.md 加 presplit runbook。feature_list passes: true。
 
-Task2 authz e2e(memory-mode authz-ON cluster, protect fs/): 无凭据 put→DENIED;
-  带 --credential-file(真 tenant-create 凭据)→ small+20MiB put/get 字节精确。
-Task2B coco 5 findings 全修: P1 凭据 skip 前 mint-token 验证(防 etcd wipe 后 stale
-  cred); P2 disable 分支 unset authz env; P2 deploy.sh disable 语义澄清(configmap 权威);
-  P2 k8s doc --admin-token-file; P2 deploy.sh --from-file+umask 临时文件(secret 不进 argv)。
+Next: coco 复审 presplit（后台 ba1g76jw5）回来处理 findings。剩余相关: 无（tenant-first 全链完整）。
 
-关键测试全绿: fuse 45, client 35+4(credential parser), stream 114, PS 202, common 13,
-  manager 229+1, kvc 27; autumnfs bin 2; system_fuse_ns 3 集成; deploy validate.sh OK。
-
-cluster.sh/chaos/测试从不 set AUTUMN_AUTH_* → 天然 authz-OFF(未动)。
-
-── 关键工程记录(供后续会话)──
-- BUG-MGR-RETRY-CLASS 首版把 CODE_PRECONDITION 一刀切 fail-fast → 误杀 alloc_new_extent
-  依赖的瞬态并发冲突重试(manager 显式回 "retry with [a] fresh snapshot"/"defer…until
-  it completes")。修=is_transient_conflict() 按 marker 区分;瞬态 retry 但**不 rotate**
-  (leader-side self-heal);fence + 业务规则 precondition 仍 fail-fast。
-- 凭据文件 = HEX(不是 raw bytes);read_credential_file 镜像 Python;native 客户端 +
-  autumn-op mint-token 都读 hex。default.cred 存 BARE hex(mint-token verify 要 bare hex)。
-- 部署 authz 逃生门 AUTUMN_AUTH_DISABLE=1: baremetal=unset env; k8s=configmap flag(entrypoint
-  读 pod env, 非 deploy.sh env; deploy.sh flag 只 skip Secret gen)。
+── 更早本会话（4-task batch,已 committed/pushed）──
+  c7ad5a2 去 {volume};615fed9 F-AUTUMNFS-SLOW;4718714+7f8ca9e Task4 pending-review→done（含 BUG-MGR-RETRY-CLASS P1 修）;
+  35c4e98+066c552 Task2A 客户端 --credential-file（+hex 修）;b3bf127 Task2B 部署层默认开 authz。
+  teammate: 2f6aa68 PyO3 autumn.Fs + vLLM loader credential（rebase 干净）。
