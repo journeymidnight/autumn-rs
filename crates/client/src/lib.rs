@@ -3120,20 +3120,47 @@ impl ClusterClient {
         // Fan these out CONCURRENTLY (mirrors delete_many / head_many). A serial
         // `for … .await` here capped a single-inode large-file write at ONE 8 MiB
         // durable put per round trip: throughput = 8 MiB ÷ (WAL append + 3-replica
-        // fanout + fsync) ≈ 40 MB/s, no matter how big the caller's window. With the
-        // window in flight the PS group-commit coalesces the concurrent puts (one
-        // fsync amortised over many), so a big-file write runs at the partition's
-        // bandwidth instead of its per-op latency. Same multiplexed per-partition
-        // conn as the serial path — just no head-of-line wait between extents.
-        let zc_futs = zc_only.iter().map(|(_, k, v, ttl)| {
-            let (k, v, ttl) = (k.clone(), v.clone(), *ttl);
-            async move { self.put_zc_opts(&k, v, ttl, lease).await }
+        // fanout + fsync) ≈ 40 MB/s WHEN the durable path is latency-bound (slow
+        // fsync / cross-host RTT). With the window in flight the PS group-commit
+        // (F256 natural batching) coalesces the concurrent puts, so the write runs
+        // at the partition's bandwidth instead of its per-op latency. (No change
+        // when bandwidth-bound: one fast-local partition/connection saturates its
+        // stream ceiling regardless.)
+        //
+        // ORDERING (coco P2): entries that share a bound wire key MUST commit in
+        // INPUT order so a duplicate-key batch keeps last-input-wins — the serial
+        // loop did, and the <64 KiB MSG_BATCH_PUT path does too (in-order seq
+        // assignment). So group by key: run each key's puts serially in input
+        // order, fan the GROUPS out concurrently. Unique keys (extents, distinct
+        // kvcache hashes) are all singletons ⇒ full concurrency; only the rare
+        // same-key-twice batch serialises, which is exactly where order matters.
+        //
+        // CONNECTIONS (coco P3): in STEADY state each partition has one cached
+        // multiplexed conn that all groups reuse. On a COLD cache (first big write,
+        // or after a token-renewal `ps_conns.clear()`) concurrent groups to the same
+        // PS can race `get_ps_client` and briefly open up to `concurrency` conns
+        // before the cache converges — bounded, one-time, self-healing (a
+        // singleflight connect would remove even that; deferred as a conn-layer
+        // change).
+        let mut key_groups: std::collections::HashMap<&[u8], Vec<usize>> =
+            std::collections::HashMap::new();
+        for (pos, (_, k, _, _)) in zc_only.iter().enumerate() {
+            key_groups.entry(k.as_slice()).or_default().push(pos);
+        }
+        let zc = &zc_only;
+        let this = self;
+        let group_futs = key_groups.into_values().map(move |positions| async move {
+            let mut out = Vec::with_capacity(positions.len());
+            for pos in positions {
+                let (idx, k, v, ttl) = &zc[pos];
+                out.push((*idx, this.put_zc_opts(k, v.clone(), *ttl, lease).await));
+            }
+            out
         });
-        for ((idx, _, _, _), r) in zc_only
-            .iter()
-            .zip(fan_out_collect(zc_futs, BATCH_PUT_DEFAULT_CONCURRENCY).await)
-        {
-            results[*idx] = r;
+        for group_out in fan_out_collect(group_futs, BATCH_PUT_DEFAULT_CONCURRENCY).await {
+            for (idx, r) in group_out {
+                results[idx] = r;
+            }
         }
         results
     }
