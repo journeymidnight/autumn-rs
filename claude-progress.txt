@@ -9,10 +9,10 @@ Layer-B 去 protected_prefixes（全保护）;Layer-A 改第 2 段解析;凭据�
 SILENT 点=split resolve_at_key + bench 前缀。活集群 authz-ON e2e 验过。全单测绿。
 peripheral（#[ignore] 测试、docs）全补;manager 零改动（protected_prefixes 变废字段）。
 
-── F-PRESPLIT-NS-RULES（namespace-aware presplit）── commit 4741f84（coco 复审中 ba1g76jw5）
+── F-PRESPLIT-NS-RULES（namespace-aware presplit）── commit 4741f84 + coco 修 <this>
 `autumn-op presplit --namespace <fs|kvc|mem> --tenant <t>`（autumn_op/args.rs + main.rs cmd_presplit）：
   - fs: 按 inode `[0x03][ino BE]`（--fs-inos i,j,… / --count N;退役低字节步进）
-  - kvc: 按 content-hash 首 hex 字符（sha256 hexdigest 均匀,--count N 按 16 hex 切,--hash-prefix 默认 vllm/）
+  - kvc: 按 content-hash 首 hex 字符（sha256 hexdigest 均匀,--count N 按 16 hex 切,--hash-prefix REQUIRED）
   - mem: 按 agent（--agents a,b,… → {agent}/）
   pure presplit_suffixes（3 规则,升序）+ orchestration（组 tenant-first wire 点 {t}/{ns}/++suffix →
   逐点重 resolve owner → split_at;报 applied/skipped + has_overlap 提示）。
@@ -21,7 +21,19 @@ peripheral（#[ignore] 测试、docs）全补;manager 零改动（protected_pref
   part13→17、后续 has_overlap 正确报出+提示（4.6GB 数据分区,符合"presplit 空 keyspace 再灌"设计）。
   ops.md 加 presplit runbook。feature_list passes: true。
 
-Next: coco 复审 presplit（后台 ba1g76jw5）回来处理 findings。剩余相关: 无（tenant-first 全链完整）。
+── coco 复审 presplit（ba1g76jw5, GPT-5.5）3 findings 全真、已修 ──
+  P1: kvc `--hash-prefix` 默认 "vllm/" 错 —— 真 wire key = {t}/kvc/{model}/vllm/v1/{hash}/{layer}
+      （full_key→{model}/{pool}/{fmt}/{hash}/{layer}, POOL=vllm FMT=v1）,hash 在 {model}/vllm/v1/ 下,
+      非直接 vllm/ 下 → 默认切点落空,presplit 静默失效。修=去默认,--hash-prefix REQUIRED（清晰引导 +
+      ls --prefix 查 model-fp）;doc/usage/单测同步真实前缀。
+  P2: presplit 未校验 tenant segment（split 有 reject_bad_segment）→ --tenant acme/prod 拼成
+      acme/prod/fs/… 越界。修=presplit 也调 reject_bad_segment;顺手把它改 command-aware（presplit:/split:）。
+  P3: cmd_presplit 全失败仍退出 0（自动化误判已 presplit）。修=applied==0 → bail!（非零退出）+
+      JSON ok=applied>0（与退出码一致）;部分成功（has_overlap skip）仍退 0=预期进度。
+  验证: cargo build --release 绿;autumn-op 22 单测全绿;P1/P2 error path 冒烟过（kvc 缺 prefix / 坏 tenant 均 fail-loud）。
+  P3=guarded bail（applied==0→bail,orchestration 已在 4741f84 活集群验过,exit-code 加法按 inspection 正确）。
+
+Next: 无（tenant-first 全链 + presplit + coco 修 全完整）。
 
 ── 更早本会话（4-task batch,已 committed/pushed）──
   c7ad5a2 去 {volume};615fed9 F-AUTUMNFS-SLOW;4718714+7f8ca9e Task4 pending-review→done（含 BUG-MGR-RETRY-CLASS P1 修）;

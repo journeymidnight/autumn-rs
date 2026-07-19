@@ -41,7 +41,8 @@ fn usage() -> ! {
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (F-PRESPLIT-NS-RULES; presplit EMPTY keyspace before loading)");
     eprintln!("      fs:  --fs-inos <i,j,…> | --count <N>             (split by inode)");
-    eprintln!("      kvc: --count <N> [--hash-prefix <segs, default vllm/>]   (split by content-hash first hex char)");
+    eprintln!("      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)");
+    eprintln!("           hash-prefix = rel prefix down to just before the hash, e.g. '<model>/vllm/v1/'");
     eprintln!("      mem: --agents <a,b,…>                            (split by agent boundary)");
     eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
     eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
@@ -1011,7 +1012,7 @@ pub(crate) fn parse() -> Args {
         "presplit" => {
             // F-PRESPLIT-NS-RULES: presplit <NS>/<TENANT> by the ns's dimension.
             //   presplit --namespace fs  --tenant T (--fs-inos i,j,… | --count N)
-            //   presplit --namespace kvc --tenant T --count N [--hash-prefix vllm/]
+            //   presplit --namespace kvc --tenant T --count N --hash-prefix '<model>/vllm/v1/'
             //   presplit --namespace mem --tenant T --agents a,b,…
             let mut namespace: Option<String> = None;
             let mut tenant: Option<String> = None;
@@ -1052,6 +1053,12 @@ pub(crate) fn parse() -> Args {
             let tenant = tenant.unwrap_or_else(|| {
                 eprintln!("presplit requires --tenant <T>"); std::process::exit(1);
             });
+            // `tenant` is concatenated raw into the `{tenant}/{namespace}/` cut key,
+            // so it MUST be a single lowercase path segment — same guard `split`
+            // uses. Without it `--tenant acme/prod` would cut at `acme/prod/…`,
+            // i.e. into a DIFFERENT tenant/namespace boundary than the operator
+            // named (and empty/uppercase/space tenants would be silently accepted).
+            reject_bad_segment("presplit", "tenant", &tenant);
             let rule = match namespace.as_str() {
                 "fs" => {
                     let inos = if let Some(inos) = fs_inos {
@@ -1068,9 +1075,24 @@ pub(crate) fn parse() -> Args {
                     let n = count.unwrap_or_else(|| {
                         eprintln!("presplit --namespace kvc requires --count <N>"); std::process::exit(1);
                     });
-                    // Default hash_prefix "vllm/" (the vLLM connector shape); on
-                    // sglang pass --hash-prefix "{model}/{pool}/".
-                    let hp = hash_prefix.unwrap_or_else(|| "vllm/".to_string());
+                    // No default: the content-hash is NOT directly under a fixed
+                    // segment. The vLLM connector stores
+                    //   kvc/{tenant}/{model}/vllm/v1/{hash}/{layer}
+                    // (full_key -> {model}/{pool}/{fmt}/{hash}/{layer}, POOL=vllm,
+                    // FMT=v1), so the hash sits under a per-MODEL prefix. A hardcoded
+                    // "vllm/" would cut nowhere near real keys and silently defeat the
+                    // presplit. Require the operator to pass the exact relative prefix
+                    // down to (but excluding) the hash hex — inspect a live key first.
+                    let hp = hash_prefix.unwrap_or_else(|| {
+                        eprintln!(
+                            "presplit --namespace kvc requires --hash-prefix <rel-prefix-to-hash>\n  \
+                             the RELATIVE prefix from the namespace root down to just before the\n  \
+                             content-hash hex. vLLM stores kvc/<tenant>/<model>/vllm/v1/<hash>/<layer>,\n  \
+                             so pass e.g. --hash-prefix '<model-fingerprint>/vllm/v1/'. Find the exact\n  \
+                             <model-fingerprint> with: autumn-client ls --prefix '<tenant>/kvc/'"
+                        );
+                        std::process::exit(1);
+                    });
                     PresplitRule::Kvc { hash_prefix: hp.into_bytes(), count: n }
                 }
                 "mem" => {
@@ -1281,11 +1303,11 @@ pub(crate) fn valid_segment(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn reject_bad_segment(kind: &str, s: &str) {
+fn reject_bad_segment(cmd: &str, kind: &str, s: &str) {
     if !valid_segment(s) {
         eprintln!(
-            "split: --{kind} {s:?} is not a valid segment — must be non-empty and \
-             match [a-z0-9._-]+ (no '/'). For a whole raw key use --at-raw-hex."
+            "{cmd}: --{kind} {s:?} is not a valid segment — must be non-empty and \
+             match [a-z0-9._-]+ (no '/')."
         );
         std::process::exit(1);
     }
@@ -1328,8 +1350,8 @@ pub(crate) fn build_split_point(
             // NOT intend. Enforce the F-KEY-NS charset `[a-z0-9._-]+` (no `/`,
             // non-empty). A key that genuinely needs other bytes must use the
             // `--at-raw-hex` escape hatch.
-            reject_bad_segment("namespace", &namespace);
-            reject_bad_segment("tenant", &tenant);
+            reject_bad_segment("split", "namespace", &namespace);
+            reject_bad_segment("split", "tenant", &tenant);
             SplitPoint::Namespaced {
                 namespace,
                 tenant,
@@ -1491,10 +1513,13 @@ pub(crate) enum PresplitRule {
     /// so byte-stepping never split them). `inos` MUST be ascending + distinct.
     Fs { inos: Vec<u64> },
     /// `kvc` = split by CONTENT HASH (sha256 hexdigest, lowercase hex, uniform).
-    /// The high-entropy dimension is at the TAIL, under `hash_prefix` segments
-    /// (e.g. `vllm/` for the vLLM connector, or `{model}/{pool}/` for sglang), so
-    /// `count` buckets split the FIRST hex char proportionally. Needs the model
-    /// online (hash_prefix known).
+    /// The high-entropy dimension is at the TAIL, under `hash_prefix` segments, so
+    /// `count` buckets split the FIRST hex char proportionally. `hash_prefix` is
+    /// the RELATIVE prefix from the namespace root down to just before the hash
+    /// hex — it is per-MODEL, so there is no fixed default: the vLLM connector
+    /// stores `{model}/vllm/v1/{hash}/{layer}` (POOL=vllm, FMT=v1), i.e. the hash
+    /// is under `{model}/vllm/v1/`, NOT directly under `vllm/`. Needs the model
+    /// online (its fingerprint prefix known — inspect a live key to find it).
     Kvc { hash_prefix: Vec<u8>, count: usize },
     /// `mem` = split by AGENT. The mem key is `{agent}/…`, so cut at `{agent}/`
     /// for each explicit boundary. `agents` are the boundary agent names
@@ -1837,20 +1862,24 @@ mod tests {
     #[test]
     fn presplit_kvc_splits_hash_first_hex_char_proportionally() {
         use super::PresplitRule;
+        // Realistic vLLM prefix: the hash sits under `{model}/vllm/v1/`, NOT
+        // directly under `vllm/` (see PresplitRule::Kvc doc / P1 review fix).
+        let hp = b"qwen3-8b/vllm/v1/";
         let s = super::presplit_suffixes(&PresplitRule::Kvc {
-            hash_prefix: b"vllm/".to_vec(),
+            hash_prefix: hp.to_vec(),
             count: 4,
         })
         .unwrap();
         // 4 buckets → boundaries at hex positions 4,8,12 → '4','8','c'.
-        assert_eq!(s, vec![b"vllm/4".to_vec(), b"vllm/8".to_vec(), b"vllm/c".to_vec()]);
+        let sfx = |c: u8| { let mut v = hp.to_vec(); v.push(c); v };
+        assert_eq!(s, vec![sfx(b'4'), sfx(b'8'), sfx(b'c')]);
         // A sha256-hexdigest key starting '9' lands in the 3rd bucket [8, c).
-        let k9 = wire("t", "kvc", b"vllm/9abc...");
-        let p8 = wire("t", "kvc", b"vllm/8");
-        let pc = wire("t", "kvc", b"vllm/c");
+        let k9 = wire("t", "kvc", &{ let mut v = hp.to_vec(); v.extend_from_slice(b"9abc..."); v });
+        let p8 = wire("t", "kvc", &sfx(b'8'));
+        let pc = wire("t", "kvc", &sfx(b'c'));
         assert!(k9 >= p8 && k9 < pc);
         // count < 2 → no cut.
-        assert!(super::presplit_suffixes(&PresplitRule::Kvc { hash_prefix: b"vllm/".to_vec(), count: 1 })
+        assert!(super::presplit_suffixes(&PresplitRule::Kvc { hash_prefix: hp.to_vec(), count: 1 })
             .unwrap()
             .is_empty());
     }

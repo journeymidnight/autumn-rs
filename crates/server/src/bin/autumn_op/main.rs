@@ -1626,11 +1626,18 @@ async fn cmd_presplit(
         }
     }
 
+    // `ok` (and the exit code below) track whether we ACCOMPLISHED anything, not
+    // whether every point applied. A partial run (some has_overlap skips on a live
+    // data-bearing cluster) is expected progress → success; but `applied == 0`
+    // means the run split nothing (wrong --hash-prefix so no owner found, authz
+    // denial, stale map, …) and MUST fail loudly — else automation reads exit 0
+    // and starts loading into an un-presplit keyspace.
+    let ok = applied > 0;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "ok": skipped.is_empty(),
+                "ok": ok,
                 "namespace": namespace,
                 "tenant": tenant,
                 "points": points.len(),
@@ -1639,7 +1646,7 @@ async fn cmd_presplit(
             }))?
         );
     } else {
-        println!("presplit {namespace}/{tenant}: {applied}/{} cut points applied", points.len());
+        println!("presplit {tenant}/{namespace}: {applied}/{} cut points applied", points.len());
         for s in &skipped {
             println!("  skipped: {s}");
         }
@@ -1650,6 +1657,13 @@ async fn cmd_presplit(
                  after compaction, or presplit the EMPTY keyspace BEFORE loading data."
             );
         }
+    }
+    if !ok {
+        bail!(
+            "presplit {tenant}/{namespace}: 0/{} cut points applied — nothing was split. \
+             Check --hash-prefix (a wrong prefix owns no partition), authz, and the partition map.",
+            points.len()
+        );
     }
     Ok(())
 }

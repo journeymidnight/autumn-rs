@@ -1035,20 +1035,21 @@ prefix bytes (the partition layer stays namespace-agnostic; the CLI assembles
 the key and the wire carries only raw bytes):
 
 ```bash
-# Cut exactly at the pair boundary "kvc/acme/" — splits tenant `acme` (and
-# everything sorting >= it) off into a new partition. Empty/omitted suffix =
-# the boundary itself.
+# Cut exactly at the pair boundary "acme/kvc/" — splits tenant `acme`'s kvc
+# namespace (and everything sorting >= it) off into a new partition. Empty/omitted
+# suffix = the boundary itself. TENANT-FIRST: {tenant}/{namespace}/.
 $AO split PART_ID --namespace kvc --tenant acme --at ""
 
-# Cut inside a pair at a text suffix -> key = "kvc/acme/" ++ "vllm/v1/80".
+# Cut inside a pair at a text suffix -> key = "acme/kvc/" ++ "vllm/v1/80".
 $AO split PART_ID --namespace kvc --tenant acme --at vllm/v1/80
 
-# Binary suffix (e.g. an fs inode prefix) via hex -> key = "fs/t1/" ++ 0x0103ff.
+# Binary suffix (e.g. an fs inode prefix) via hex -> key = "t1/fs/" ++ 0x0103ff.
 $AO split PART_ID --namespace fs --tenant t1 --at-hex 0103ff
 
 # ADMIN escape hatch only (documented admin-only, like D7 raw()): a whole raw
 # key, no namespace/tenant assembly. Operators should NOT hand-build prefixes.
-$AO split PART_ID --at-raw-hex 6b76632f61636d652f
+# (hex below = "acme/kvc/".)
+$AO split PART_ID --at-raw-hex 61636d652f6b76632f
 ```
 
 Rules & behavior:
@@ -1072,7 +1073,7 @@ Manual verification (memory-mode loopback recipe, no etcd):
 $AO info --json | jq '.partitions | length'          # -> 1
 $AO split <PART> --namespace kvc --tenant acme --at "" --json
 $AO info --json | jq '.partitions | length'          # -> 2
-$AO info --json | jq -r '.partitions[].start_key'    # one range starts at kvc/acme/
+$AO info --json | jq -r '.partitions[].start_key'    # one range starts at acme/kvc/
 # 3. Negative: a point outside the range is rejected up front:
 $AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-zero
 ```
@@ -1093,11 +1094,14 @@ primitive):
 $AO presplit --namespace fs --tenant default --fs-inos 4,5,6,7,8
 $AO presplit --namespace fs --tenant default --count 8            # → inodes 1..7
 
-# kvc — split by CONTENT HASH (sha256 hexdigest). Needs the model online so the
-# prefix segments before the hash are known. vLLM connector = `vllm/`; sglang =
-# `{model}/{pool}/`.
-$AO presplit --namespace kvc --tenant <model-fp> --count 8                      # vllm/ default
-$AO presplit --namespace kvc --tenant <t> --count 8 --hash-prefix "mymodel/pool0/"
+# kvc — split by CONTENT HASH (sha256 hexdigest). --hash-prefix is REQUIRED: it is
+# the RELATIVE prefix from the namespace root down to just before the hash hex, and
+# it is per-MODEL, so there is no default. The vLLM connector stores
+#   {tenant}/kvc/{model}/vllm/v1/{hash}/{layer}
+# → the hash is under `{model}/vllm/v1/`, NOT directly under `vllm/`. Find the exact
+# {model} fingerprint from a live key: `autumn-client ls --prefix "<tenant>/kvc/"`.
+$AO presplit --namespace kvc --tenant default --count 8 --hash-prefix "qwen3-8b_a1b2/vllm/v1/"
+# sglang keys are {model}/{pool}/{hash} → pass "<model>/<pool>/".
 
 # mem — split by AGENT.
 $AO presplit --namespace mem --tenant default --agents alice,bob,carol
