@@ -33,7 +33,10 @@ use serde::Serialize;
 
 
 mod args;
-use args::{fuse_split_ranges, hex_split_ranges, parse, parse_replication, Args, Command, SplitPoint};
+use args::{
+    fuse_split_ranges, hex_split_ranges, parse, parse_replication, presplit_suffixes, Args, Command,
+    PresplitRule, SplitPoint,
+};
 
 fn format_disk(dir: &str) -> Result<String> {
     for byte in 0u8..=255 {
@@ -343,6 +346,9 @@ async fn run(args: Args) -> Result<()> {
         Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
+        Command::Presplit { namespace, tenant, rule } => {
+            cmd_presplit(&client, args.json, &namespace, &tenant, &rule).await?
+        }
         Command::Merge { survivor_part_id, victim_part_id } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
         Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
@@ -1562,6 +1568,88 @@ async fn cmd_split(
         println!("split ok (at {})", point.describe());
     } else {
         println!("split ok");
+    }
+    Ok(())
+}
+
+/// F-PRESPLIT-NS-RULES: presplit a `{tenant}/{namespace}/` keyspace by its
+/// natural dimension (fs=ino, kvc=content-hash, mem=agent). Computes the cut
+/// points, then splits the owning partition at each in ASCENDING order —
+/// re-resolving the owner each time, since a prior split creates the child that
+/// owns the next point.
+async fn cmd_presplit(
+    client: &ClusterClient,
+    json: bool,
+    namespace: &str,
+    tenant: &str,
+    rule: &PresplitRule,
+) -> Result<()> {
+    let suffixes = presplit_suffixes(rule)?;
+    // TENANT-FIRST prefix `{tenant}/{namespace}/`, matching the client binding.
+    let prefix = format!("{tenant}/{namespace}/").into_bytes();
+    let points: Vec<Vec<u8>> = suffixes
+        .into_iter()
+        .map(|s| {
+            let mut k = prefix.clone();
+            k.extend_from_slice(&s);
+            k
+        })
+        .collect();
+    if points.is_empty() {
+        bail!("presplit: rule produced no cut points (count < 2 / empty list) — nothing to do");
+    }
+
+    let mut applied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    for point in &points {
+        // Re-fetch the region map each iteration — a prior split created a new
+        // child that may own this point.
+        let parts = client
+            .all_partitions_with_range()
+            .await
+            .map_err(|e| anyhow!("presplit: list partitions: {e}"))?;
+        let owner = parts.iter().find(|(_, _, start, end)| {
+            point.as_slice() >= start.as_slice()
+                && (end.is_empty() || point.as_slice() < end.as_slice())
+        });
+        let Some((pid, _, _, _)) = owner else {
+            skipped.push(format!("0x{} (no owning partition)", hex_encode(point)));
+            continue;
+        };
+        match client.split_at(*pid, Some(point.clone())).await {
+            Ok(_) => applied += 1,
+            // A data-bearing partition can't be split repeatedly until major
+            // compaction clears the CoW out-of-range keys (has_overlap). The PS
+            // auto-major-compacts, so a later re-run succeeds — surface the hint
+            // rather than failing the whole run.
+            Err(e) => skipped.push(format!("part {pid} at 0x{}: {e}", hex_encode(point))),
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": skipped.is_empty(),
+                "namespace": namespace,
+                "tenant": tenant,
+                "points": points.len(),
+                "applied": applied,
+                "skipped": skipped,
+            }))?
+        );
+    } else {
+        println!("presplit {namespace}/{tenant}: {applied}/{} cut points applied", points.len());
+        for s in &skipped {
+            println!("  skipped: {s}");
+        }
+        if !skipped.is_empty() {
+            println!(
+                "note: a data-bearing partition can't be split repeatedly until major \
+                 compaction clears CoW out-of-range keys (has_overlap). Re-run `presplit` \
+                 after compaction, or presplit the EMPTY keyspace BEFORE loading data."
+            );
+        }
     }
     Ok(())
 }

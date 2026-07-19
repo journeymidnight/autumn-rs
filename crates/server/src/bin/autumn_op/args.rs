@@ -39,6 +39,10 @@ fn usage() -> ! {
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
+    eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (F-PRESPLIT-NS-RULES; presplit EMPTY keyspace before loading)");
+    eprintln!("      fs:  --fs-inos <i,j,…> | --count <N>             (split by inode)");
+    eprintln!("      kvc: --count <N> [--hash-prefix <segs, default vllm/>]   (split by content-hash first hex char)");
+    eprintln!("      mem: --agents <a,b,…>                            (split by agent boundary)");
     eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
     eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
     eprintln!("  compact <PARTID>");
@@ -276,6 +280,14 @@ pub(crate) enum Command {
         part_id: u64,
         /// F-SPLIT-AT-KEY (D4): where to cut. See `SplitPoint`.
         point: SplitPoint,
+    },
+    /// F-PRESPLIT-NS-RULES: presplit a `{tenant}/{namespace}/` keyspace by the
+    /// namespace's natural dimension. Explicit op (NOT bootstrap — the tenant
+    /// must exist first).
+    Presplit {
+        namespace: String,
+        tenant: String,
+        rule: PresplitRule,
     },
     Merge {
         survivor_part_id: u64,
@@ -996,6 +1008,87 @@ pub(crate) fn parse() -> Args {
             let point = build_split_point(namespace, tenant, suffix, raw_key);
             Command::Split { part_id, point }
         }
+        "presplit" => {
+            // F-PRESPLIT-NS-RULES: presplit <NS>/<TENANT> by the ns's dimension.
+            //   presplit --namespace fs  --tenant T (--fs-inos i,j,… | --count N)
+            //   presplit --namespace kvc --tenant T --count N [--hash-prefix vllm/]
+            //   presplit --namespace mem --tenant T --agents a,b,…
+            let mut namespace: Option<String> = None;
+            let mut tenant: Option<String> = None;
+            let mut count: Option<usize> = None;
+            let mut fs_inos: Option<Vec<u64>> = None;
+            let mut hash_prefix: Option<String> = None;
+            let mut agents: Option<Vec<String>> = None;
+            let num = |v: &str, what: &str| -> u64 {
+                v.trim().parse().unwrap_or_else(|_| {
+                    eprintln!("presplit: {what} must be a number, got {v:?}");
+                    std::process::exit(1);
+                })
+            };
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--namespace" => { i += 1; namespace = Some(val(&raw, i).to_owned()); i += 1; }
+                    "--tenant" => { i += 1; tenant = Some(val(&raw, i).to_owned()); i += 1; }
+                    "--count" => { i += 1; count = Some(num(val(&raw, i), "--count") as usize); i += 1; }
+                    "--fs-inos" => {
+                        i += 1;
+                        fs_inos = Some(val(&raw, i).split(',').map(|s| num(s, "--fs-inos entry")).collect());
+                        i += 1;
+                    }
+                    "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
+                    "--agents" => {
+                        i += 1;
+                        agents = Some(
+                            val(&raw, i).split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
+                        );
+                        i += 1;
+                    }
+                    other => { eprintln!("presplit: unknown flag {other}"); std::process::exit(1); }
+                }
+            }
+            let namespace = namespace.unwrap_or_else(|| {
+                eprintln!("presplit requires --namespace <fs|kvc|mem>"); std::process::exit(1);
+            });
+            let tenant = tenant.unwrap_or_else(|| {
+                eprintln!("presplit requires --tenant <T>"); std::process::exit(1);
+            });
+            let rule = match namespace.as_str() {
+                "fs" => {
+                    let inos = if let Some(inos) = fs_inos {
+                        inos
+                    } else if let Some(n) = count {
+                        (1..n as u64).collect() // split at ino 1..N-1 → N partitions
+                    } else {
+                        eprintln!("presplit --namespace fs requires --fs-inos <i,j,…> or --count <N>");
+                        std::process::exit(1);
+                    };
+                    PresplitRule::Fs { inos }
+                }
+                "kvc" => {
+                    let n = count.unwrap_or_else(|| {
+                        eprintln!("presplit --namespace kvc requires --count <N>"); std::process::exit(1);
+                    });
+                    // Default hash_prefix "vllm/" (the vLLM connector shape); on
+                    // sglang pass --hash-prefix "{model}/{pool}/".
+                    let hp = hash_prefix.unwrap_or_else(|| "vllm/".to_string());
+                    PresplitRule::Kvc { hash_prefix: hp.into_bytes(), count: n }
+                }
+                "mem" => {
+                    let agents = agents.unwrap_or_else(|| {
+                        eprintln!("presplit --namespace mem requires --agents <a,b,…>"); std::process::exit(1);
+                    });
+                    if agents.is_empty() {
+                        eprintln!("presplit --namespace mem: --agents must be non-empty"); std::process::exit(1);
+                    }
+                    PresplitRule::Mem { agents }
+                }
+                other => {
+                    eprintln!("presplit --namespace must be one of fs|kvc|mem (got {other})");
+                    std::process::exit(1);
+                }
+            };
+            Command::Presplit { namespace, tenant, rule }
+        }
         "merge" => {
             if i + 1 >= raw.len() {
                 eprintln!("merge requires <SURVIVOR_PART_ID> <VICTIM_PART_ID>");
@@ -1350,6 +1443,15 @@ pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// (both prefix-sort before `[0x03]`); partition N-1 absorbs
 /// `[0x04]` superblock (sorts after every `[0x03]` key) and any
 /// non-fuse prefix ≥ 0x05. These are tiny next to file data.
+///
+/// **SUPERSEDED for real workloads by `autumn-op presplit --namespace fs`
+/// (F-PRESPLIT-NS-RULES).** This produces RAW `[0x03][ino low byte]` split
+/// points with NO `{tenant}/{namespace}/` prefix, so under SD-2/SD-3 tenant-first
+/// keys (`{t}/fs/[0x03][ino]`) it does NOT match any real wire key — every file
+/// lands in one partition. It also steps the ino LOW byte (0x20/0x40/…), but
+/// real inodes 4–8 are all < 0x20, so byte-stepping never splits them. Kept only
+/// as the namespace-blind bootstrap fallback (`AUTUMN_BOOTSTRAP_PRESPLIT`); use
+/// `presplit` after the tenant exists.
 pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     if n <= 1 {
         return vec![(vec![], vec![])];
@@ -1368,6 +1470,97 @@ pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         split_points.push(vec![0x03, 0, 0, 0, 0, 0, 0, 0, byte]);
     }
     ranges_from_split_points(split_points)
+}
+
+// ── F-PRESPLIT-NS-RULES ──────────────────────────────────────────────────────
+// Presplit a `{tenant}/{namespace}/` keyspace by the namespace's NATURAL
+// high-entropy dimension (a raw-byte uniform split is namespace-blind — after
+// SD-2/SD-3 all real keys sit in the `fs/`/`kvc/`/`mem/` byte sliver, so uniform
+// splitting collapses everything into a couple of partitions). Each rule returns
+// SUFFIXES relative to `{tenant}/{namespace}/`, ASCENDING; `cmd_presplit`
+// prepends the tenant-first `{tenant}/{namespace}/` prefix to get raw wire cut
+// points and splits the owning partition at each.
+
+/// Per-namespace presplit rule (key structure ⇒ split dimension).
+#[derive(Debug, Clone)]
+pub(crate) enum PresplitRule {
+    /// `fs` = split by INODE. The fs data key is `[0x03][ino BE][off BE]`, so a
+    /// cut at `[0x03][ino BE]` puts every extent of inodes `< ino` on the left.
+    /// Splitting at a sequence of inodes gives each inode its own partition
+    /// (retires the old low-byte 0x20/0x40 stepping — inodes 4–8 are all < 0x20,
+    /// so byte-stepping never split them). `inos` MUST be ascending + distinct.
+    Fs { inos: Vec<u64> },
+    /// `kvc` = split by CONTENT HASH (sha256 hexdigest, lowercase hex, uniform).
+    /// The high-entropy dimension is at the TAIL, under `hash_prefix` segments
+    /// (e.g. `vllm/` for the vLLM connector, or `{model}/{pool}/` for sglang), so
+    /// `count` buckets split the FIRST hex char proportionally. Needs the model
+    /// online (hash_prefix known).
+    Kvc { hash_prefix: Vec<u8>, count: usize },
+    /// `mem` = split by AGENT. The mem key is `{agent}/…`, so cut at `{agent}/`
+    /// for each explicit boundary. `agents` are the boundary agent names
+    /// (already in their key form — simple names are identity).
+    Mem { agents: Vec<String> },
+}
+
+/// The 16 hex digits in ASCENDING byte order (`'0'..'9'` = 0x30–0x39 then
+/// `'a'..'f'` = 0x61–0x66 — both ascending, and `'9' < 'a'`), matching the
+/// sha256 hexdigest charset.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Compute the ASCENDING relative split suffixes for a presplit rule. Empty =
+/// nothing to split (0/1 buckets). Returns an error on a malformed rule.
+pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
+    match rule {
+        PresplitRule::Fs { inos } => {
+            // Cut at `[0x03][ino BE]` for each inode.
+            let mut prev: Option<u64> = None;
+            let mut out = Vec::with_capacity(inos.len());
+            for &ino in inos {
+                if let Some(p) = prev {
+                    if ino <= p {
+                        bail!("fs presplit inodes must be strictly ascending (got {p} then {ino})");
+                    }
+                }
+                prev = Some(ino);
+                let mut s = Vec::with_capacity(9);
+                s.push(0x03u8); // PREFIX_EXTENT
+                s.extend_from_slice(&ino.to_be_bytes());
+                out.push(s);
+            }
+            Ok(out)
+        }
+        PresplitRule::Kvc { hash_prefix, count } => {
+            if *count < 2 {
+                return Ok(vec![]); // 0/1 buckets → no cut
+            }
+            let n = (*count).min(16); // one hex char → at most 16 buckets
+            let mut out = Vec::with_capacity(n - 1);
+            for i in 1..n {
+                // Proportional boundary over the 16 hex digits (same ±1 spread
+                // rationale as fuse_split_ranges).
+                let pos = (i * 16) / n; // 1..15
+                let mut s = hash_prefix.clone();
+                s.push(HEX_DIGITS[pos]);
+                out.push(s);
+            }
+            Ok(out)
+        }
+        PresplitRule::Mem { agents } => {
+            // Cut at `{agent}/` for each boundary; the agent segment ends at '/'.
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(agents.len());
+            for a in agents {
+                if a.is_empty() {
+                    bail!("mem presplit agent boundary must be non-empty");
+                }
+                let mut s = a.as_bytes().to_vec();
+                s.push(b'/');
+                out.push(s);
+            }
+            out.sort();
+            out.dedup();
+            Ok(out)
+        }
+    }
 }
 
 fn parse_byte_size(s: &str) -> Result<u64> {
@@ -1601,6 +1794,82 @@ mod tests {
         let ranges = super::fuse_split_ranges(1);
         assert_eq!(ranges.len(), 1);
         assert!(ranges[0].0.is_empty() && ranges[0].1.is_empty());
+    }
+
+    // ── F-PRESPLIT-NS-RULES ──────────────────────────────────────────────
+
+    /// The full tenant-first wire cut point = `{tenant}/{ns}/ ++ suffix`.
+    fn wire(tenant: &str, ns: &str, suffix: &[u8]) -> Vec<u8> {
+        let mut k = format!("{tenant}/{ns}/").into_bytes();
+        k.extend_from_slice(suffix);
+        k
+    }
+
+    #[test]
+    fn presplit_fs_cuts_at_inode_boundaries() {
+        use super::PresplitRule;
+        // Retires the low-byte stepping: inodes 4–8 are all < 0x20 but each gets
+        // its own cut here.
+        let suffixes =
+            super::presplit_suffixes(&PresplitRule::Fs { inos: vec![4, 5, 6, 7, 8] }).unwrap();
+        assert_eq!(suffixes.len(), 5);
+        // suffix = [0x03][ino BE 8]
+        assert_eq!(suffixes[0], vec![0x03, 0, 0, 0, 0, 0, 0, 0, 4]);
+        assert_eq!(suffixes[4], vec![0x03, 0, 0, 0, 0, 0, 0, 0, 8]);
+        // ascending on the wire, so limit-scans + PS range checks stay sane.
+        let pts: Vec<Vec<u8>> = suffixes.iter().map(|s| wire("default", "fs", s)).collect();
+        for w in pts.windows(2) {
+            assert!(w[0] < w[1], "cut points must be ascending");
+        }
+        // An extent of inode 5 (`[0x03][5][off]`) sorts >= the `[0x03][5]` cut
+        // and < the `[0x03][6]` cut → lands in inode 5's own partition.
+        let ext5 = wire("default", "fs", &[0x03, 0, 0, 0, 0, 0, 0, 0, 5, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(ext5 >= pts[1] && ext5 < pts[2]);
+    }
+
+    #[test]
+    fn presplit_fs_rejects_non_ascending() {
+        use super::PresplitRule;
+        assert!(super::presplit_suffixes(&PresplitRule::Fs { inos: vec![5, 4] }).is_err());
+        assert!(super::presplit_suffixes(&PresplitRule::Fs { inos: vec![4, 4] }).is_err());
+    }
+
+    #[test]
+    fn presplit_kvc_splits_hash_first_hex_char_proportionally() {
+        use super::PresplitRule;
+        let s = super::presplit_suffixes(&PresplitRule::Kvc {
+            hash_prefix: b"vllm/".to_vec(),
+            count: 4,
+        })
+        .unwrap();
+        // 4 buckets → boundaries at hex positions 4,8,12 → '4','8','c'.
+        assert_eq!(s, vec![b"vllm/4".to_vec(), b"vllm/8".to_vec(), b"vllm/c".to_vec()]);
+        // A sha256-hexdigest key starting '9' lands in the 3rd bucket [8, c).
+        let k9 = wire("t", "kvc", b"vllm/9abc...");
+        let p8 = wire("t", "kvc", b"vllm/8");
+        let pc = wire("t", "kvc", b"vllm/c");
+        assert!(k9 >= p8 && k9 < pc);
+        // count < 2 → no cut.
+        assert!(super::presplit_suffixes(&PresplitRule::Kvc { hash_prefix: b"vllm/".to_vec(), count: 1 })
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn presplit_mem_cuts_at_agent_boundaries_sorted() {
+        use super::PresplitRule;
+        let s = super::presplit_suffixes(&PresplitRule::Mem {
+            agents: vec!["m".into(), "b".into(), "z".into()], // out of order on input
+        })
+        .unwrap();
+        assert_eq!(s, vec![b"b/".to_vec(), b"m/".to_vec(), b"z/".to_vec()]); // sorted
+        // agent "chatbot" (starts 'c') sorts >= "b/" and < "m/" → bucket [b, m).
+        let kc = wire("t", "mem", b"chatbot/ep/1");
+        let pb = wire("t", "mem", b"b/");
+        let pm = wire("t", "mem", b"m/");
+        assert!(kc >= pb && kc < pm);
+        // empty agent name rejected.
+        assert!(super::presplit_suffixes(&PresplitRule::Mem { agents: vec!["".into()] }).is_err());
     }
 
     #[test]

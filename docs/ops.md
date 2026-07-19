@@ -1077,6 +1077,43 @@ $AO info --json | jq -r '.partitions[].start_key'    # one range starts at kvc/a
 $AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-zero
 ```
 
+## Namespace-aware presplit — `autumn-op presplit` (F-PRESPLIT-NS-RULES)
+
+A raw-byte uniform split (`AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring`, `fuse_split_ranges`)
+is **namespace-blind**: after F-KEY-NS every real key sits in the `{tenant}/fs/…`
+/ `{tenant}/kvc/…` / `{tenant}/mem/…` byte sliver, so uniform splitting collapses
+everything into one or two partitions (live: 19 GB fs on a single partition, 30
+empty). `presplit` splits a `{tenant}/{namespace}/` keyspace along the
+namespace's **natural high-entropy dimension** (built on the `split --at`
+primitive):
+
+```bash
+# fs — split by INODE (the fs data key is [0x03][ino BE][off BE]). Give the exact
+# inodes (each safetensors shard = one inode = one partition), or a --count.
+$AO presplit --namespace fs --tenant default --fs-inos 4,5,6,7,8
+$AO presplit --namespace fs --tenant default --count 8            # → inodes 1..7
+
+# kvc — split by CONTENT HASH (sha256 hexdigest). Needs the model online so the
+# prefix segments before the hash are known. vLLM connector = `vllm/`; sglang =
+# `{model}/{pool}/`.
+$AO presplit --namespace kvc --tenant <model-fp> --count 8                      # vllm/ default
+$AO presplit --namespace kvc --tenant <t> --count 8 --hash-prefix "mymodel/pool0/"
+
+# mem — split by AGENT.
+$AO presplit --namespace mem --tenant default --agents alice,bob,carol
+```
+
+**CRITICAL — presplit the EMPTY keyspace BEFORE loading data.** A data-bearing
+partition can't be split repeatedly: after the first CoW split, parent+child
+share extents and the child's SSTs hold out-of-range keys, so the PS rejects the
+next split with `precondition failed: cannot split: partition has overlapping
+keys` until a major compaction clears them. `presplit` applies what it can and
+prints the skipped points + this hint; the PS auto-major-compacts, so re-running
+after a bit converges — but the correct order is **presplit first, then ingest.**
+(Another known post-heavy-split hygiene item: manager `part_addrs` can go stale
+after lots of split/merge — `merge X Y` says `partition X not served by this
+P-log`; delete all PS pods in parallel to rebuild.)
+
 ## Chaos suites
 
 ```bash
