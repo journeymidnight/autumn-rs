@@ -1024,7 +1024,25 @@ async fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             };
-            ClusterClient::connect(&args.manager, ns, tenant).await?
+            // F-AUTHZ-BUILTIN: with a credential when `--credential-file` is given
+            // (principal defaults to the tenant). Fails fast if it doesn't cover
+            // `{ns}/{tenant}/`.
+            match &args.credential_file {
+                Some(path) => {
+                    let credential = std::fs::read(path)
+                        .with_context(|| format!("read --credential-file {path}"))?;
+                    let principal = args.principal.clone().unwrap_or_else(|| tenant.to_string());
+                    ClusterClient::connect_with_credential(
+                        &args.manager,
+                        ns,
+                        tenant,
+                        principal,
+                        credential,
+                    )
+                    .await?
+                }
+                None => ClusterClient::connect(&args.manager, ns, tenant).await?,
+            }
         }
     };
 

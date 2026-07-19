@@ -128,6 +128,12 @@ pub(crate) struct Args {
     /// bind the `bench` namespace internally and don't need these.
     pub(crate) namespace: Option<String>,
     pub(crate) tenant: Option<String>,
+    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential (a
+    /// minted token from `autumn-op tenant-create`). REQUIRED for KV commands
+    /// when the target namespace is protected; omit on an authz-off cluster.
+    pub(crate) credential_file: Option<String>,
+    /// F-AUTHZ-BUILTIN: authz principal for `--credential-file` (default = tenant).
+    pub(crate) principal: Option<String>,
 }
 
 fn usage() -> ! {
@@ -175,6 +181,8 @@ pub(crate) fn parse_args() -> Args {
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut namespace: Option<String> = None;
     let mut tenant: Option<String> = None;
+    let mut credential_file: Option<String> = None;
+    let mut principal: Option<String> = None;
     let mut i = 1;
 
     while i < raw.len() {
@@ -193,6 +201,16 @@ pub(crate) fn parse_args() -> Args {
             "--tenant" => {
                 i += 1;
                 tenant = Some(val(&raw, i).to_owned());
+                i += 1;
+            }
+            "--credential-file" => {
+                i += 1;
+                credential_file = Some(val(&raw, i).to_owned());
+                i += 1;
+            }
+            "--principal" => {
+                i += 1;
+                principal = Some(val(&raw, i).to_owned());
                 i += 1;
             }
             "--transport" => {
@@ -624,6 +642,8 @@ pub(crate) fn parse_args() -> Args {
         ucx_regpool_cap_bytes,
         namespace,
         tenant,
+        credential_file,
+        principal,
     }
 }
 

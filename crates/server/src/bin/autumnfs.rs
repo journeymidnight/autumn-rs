@@ -62,6 +62,18 @@ struct Args {
     #[arg(long, default_value = "default")]
     tenant: String,
 
+    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential (a
+    /// minted token from `autumn-op tenant-create`). REQUIRED when the cluster
+    /// protects the `fs/` namespace; omit on an authz-off cluster. Connects via
+    /// `connect_with_credential` and FAILS FAST if it doesn't cover `fs/{tenant}/`.
+    #[arg(long)]
+    credential_file: Option<PathBuf>,
+
+    /// F-AUTHZ-BUILTIN: authz principal presented with `--credential-file`.
+    /// Defaults to the tenant name (the 1:1 principal↔tenant convention).
+    #[arg(long)]
+    principal: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -119,9 +131,26 @@ fn main() -> Result<()> {
         // prefix to every relative fuse key (and strips it off range results), so a
         // write here is visible to a fuse mount on the same `--tenant`. Every
         // `key::*`-based op below is unchanged; the client owns the prefix.
-        let cluster = ClusterClient::connect(&args.manager, "fs", &args.tenant)
-            .await
-            .context("connect to manager")?;
+        // F-AUTHZ-BUILTIN: with a credential when `--credential-file` is given.
+        let cluster = match &args.credential_file {
+            Some(path) => {
+                let credential = std::fs::read(path)
+                    .with_context(|| format!("read --credential-file {}", path.display()))?;
+                let principal = args.principal.clone().unwrap_or_else(|| args.tenant.clone());
+                ClusterClient::connect_with_credential(
+                    &args.manager,
+                    "fs",
+                    &args.tenant,
+                    principal,
+                    credential,
+                )
+                .await
+                .context("connect to manager (authz)")?
+            }
+            None => ClusterClient::connect(&args.manager, "fs", &args.tenant)
+                .await
+                .context("connect to manager")?,
+        };
         cluster
             .wait_for_cluster_ready(
                 std::time::Duration::from_secs(20),
@@ -519,8 +548,11 @@ async fn read_file_to_writer(
     }
     // Collect every extent key (the range scan returns them offset-sorted; PS
     // `handle_range` returns KEYS only), then fetch values a window at a time.
-    // Extent keys are 17 B each, so accumulating the full list is cheap even for
-    // a multi-GiB file; the value fetch is what we bound + pipeline.
+    // Extent keys are 17 B and extents are ≤ 8 MiB, so the full key list is tiny
+    // even for a huge file (a 1 TB file = ~128 K extents ≈ 2 MB of keys), and
+    // the extra range-scan-before-first-byte latency is noise against a
+    // minutes-long download — so we pre-collect (coco P3, accepted for the CLI)
+    // and bound + pipeline only the VALUE fetch, which is what dominates.
     let prefix = key::extent_prefix(ino);
     let mut start = prefix.clone();
     const PAGE: u32 = 256;
@@ -630,13 +662,20 @@ fn read_full_chunk(r: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Flush a window of pending extents via one pipelined `put_many`, then clear it.
+/// Flush a window of pending extents via one pipelined `put_many`, then clear
+/// it. Every window key is appended to `written` (BEFORE the RPC — `put_many`
+/// may write some items then error on another, so orphan cleanup must cover a
+/// partial success).
 async fn flush_put_window(
     cluster: &ClusterClient,
     window: &mut Vec<(Vec<u8>, Bytes)>,
+    written: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     if window.is_empty() {
         return Ok(());
+    }
+    for (k, _) in window.iter() {
+        written.push(k.clone());
     }
     let items: Vec<(&[u8], Bytes, u64)> =
         window.iter().map(|(k, v)| (k.as_slice(), v.clone(), 0u64)).collect();
@@ -654,9 +693,39 @@ async fn write_file_from_reader(
     cluster: &ClusterClient,
     parent_ino: u64,
     leaf: &[u8],
-    mut data_reader: impl Read,
+    data_reader: impl Read,
 ) -> Result<u64> {
     let new_ino = alloc_inode(cluster).await?;
+    // Extents are published BEFORE the inode+dirent (they're keyed by the new
+    // ino, invisible until the dirent links it). If the upload fails partway —
+    // a read-source error mid-stream, a partial `put_many`, or the inode/dirent
+    // put — those extents become unreachable KV leaks (the manager-global inode
+    // is never reused). Track every written key and best-effort delete them +
+    // the inode key on any failure (coco P2). Harmless if a key isn't present.
+    let mut written: Vec<Vec<u8>> = Vec::new();
+    match publish_file(cluster, parent_ino, new_ino, leaf, data_reader, &mut written).await {
+        Ok(()) => Ok(new_ino),
+        Err(e) => {
+            for k in &written {
+                let _ = cluster.delete(k).await;
+            }
+            let _ = cluster.delete(&key::inode_key(new_ino)).await;
+            Err(e)
+        }
+    }
+}
+
+/// Stream `data_reader` into extents for `new_ino`, then publish the inode +
+/// dirent. Records every written extent key in `written` so the caller can
+/// clean up orphans on failure.
+async fn publish_file(
+    cluster: &ClusterClient,
+    parent_ino: u64,
+    new_ino: u64,
+    leaf: &[u8],
+    mut data_reader: impl Read,
+    written: &mut Vec<Vec<u8>>,
+) -> Result<()> {
     let mut meta = new_file_meta();
 
     // Stream the source in `MAX_EXTENT` chunks (F-AUTUMNFS-SLOW: no whole-file
@@ -681,14 +750,14 @@ async fn write_file_from_reader(
             window.push((key::extent_key(new_ino, off), Bytes::from(chunk)));
             off += n as u64;
             if window.len() >= PUT_WINDOW_EXTENTS {
-                flush_put_window(cluster, &mut window).await?;
+                flush_put_window(cluster, &mut window, written).await?;
             }
         }
         if n < MAX_EXTENT {
             break; // EOF
         }
     }
-    flush_put_window(cluster, &mut window).await?;
+    flush_put_window(cluster, &mut window, written).await?;
     meta.size = off;
 
     cluster
@@ -703,7 +772,7 @@ async fn write_file_from_reader(
         .put(&key::dirent_key(parent_ino, leaf), &schema::encode_dirent(&dirent))
         .await
         .map_err(|e| anyhow!("put dirent: {e}"))?;
-    Ok(new_ino)
+    Ok(())
 }
 
 async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {

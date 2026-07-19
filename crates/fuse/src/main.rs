@@ -39,6 +39,19 @@ struct Args {
     #[arg(long, default_value = "default")]
     tenant: String,
 
+    /// F-AUTHZ-BUILTIN: path to a file holding this mount's authz credential (a
+    /// minted token from `autumn-op tenant-create`). REQUIRED when the cluster
+    /// protects the `fs/` namespace; omit on an authz-off cluster. The mount
+    /// connects via `connect_with_credential` and FAILS FAST if the credential
+    /// doesn't cover `fs/{tenant}/`.
+    #[arg(long)]
+    credential_file: Option<PathBuf>,
+
+    /// F-AUTHZ-BUILTIN: authz principal presented alongside `--credential-file`.
+    /// Defaults to the tenant name (the 1:1 principal↔tenant convention).
+    #[arg(long)]
+    principal: Option<String>,
+
     /// Allow other users to access the mount
     #[arg(long, default_value = "false")]
     allow_other: bool,
@@ -78,9 +91,22 @@ fn main() -> Result<()> {
 
     let mountpoint = args.mountpoint.clone();
 
+    // F-AUTHZ-BUILTIN: read the authz credential up front (fail-loud on a bad
+    // path) so the compio thread just carries the bytes. `principal` defaults to
+    // the tenant (1:1 principal↔tenant).
+    let credential: Option<Vec<u8>> = match &args.credential_file {
+        Some(path) => Some(std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("--credential-file {}: {e}", path.display());
+            std::process::exit(2);
+        })),
+        None => None,
+    };
+    let principal = args.principal.clone().unwrap_or_else(|| args.tenant.clone());
+
     tracing::info!(
         manager = %args.manager,
         mountpoint = %mountpoint.display(),
+        authz = credential.is_some(),
         "starting autumn-fuse"
     );
 
@@ -129,8 +155,23 @@ fn main() -> Result<()> {
             // crosses threads after this point).
             let notifier = notifier;
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                // Connect to cluster (scoped to `fs/{tenant}/`)
-                let mut state = match FsState::new(&manager_addr, &args.tenant).await {
+                // Connect to cluster (scoped to `fs/{tenant}/`); with an authz
+                // credential when `--credential-file` was given (F-AUTHZ-BUILTIN).
+                let connect = async {
+                    match credential {
+                        Some(cred) => {
+                            FsState::new_with_credential(
+                                &manager_addr,
+                                &args.tenant,
+                                &principal,
+                                cred,
+                            )
+                            .await
+                        }
+                        None => FsState::new(&manager_addr, &args.tenant).await,
+                    }
+                };
+                let mut state = match connect.await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to connect to cluster");

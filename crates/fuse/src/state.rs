@@ -117,6 +117,19 @@ impl FsState {
         Self::new_with_host(manager_addr, host, tenant).await
     }
 
+    /// F-AUTHZ-BUILTIN: `new` with an authz credential — same HOSTNAME-derived
+    /// daemon identity, but connects via `connect_with_credential`. See
+    /// [`Self::new_with_host_credential`].
+    pub async fn new_with_credential(
+        manager_addr: &str,
+        tenant: &str,
+        principal: &str,
+        credential: Vec<u8>,
+    ) -> Result<Self> {
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
+        Self::new_with_host_credential(manager_addr, host, tenant, principal, credential).await
+    }
+
     /// Connect with an explicit daemon-identity host (no env read). The
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
@@ -133,7 +146,37 @@ impl FsState {
         let client = ClusterClient::connect(manager_addr, "fs", tenant)
             .await
             .context("connect to manager")?;
-        Ok(Self {
+        Ok(Self::from_client(client, host))
+    }
+
+    /// F-AUTHZ-BUILTIN: connect with an authz credential. Used when the deploy
+    /// protects the `fs/` namespace — the client presents `principal` +
+    /// `credential` (a minted token from `autumn-op tenant-create`), and
+    /// `connect_with_credential` FAILS FAST at connect if that credential does
+    /// not cover `fs/{tenant}/` (or the manager rejects it). When authz is off
+    /// on the manager the credential is harmlessly ignored (same as a plain
+    /// connect), so passing one is always safe.
+    pub async fn new_with_host_credential(
+        manager_addr: &str,
+        host: String,
+        tenant: &str,
+        principal: &str,
+        credential: Vec<u8>,
+    ) -> Result<Self> {
+        let client = ClusterClient::connect_with_credential(
+            manager_addr,
+            "fs",
+            tenant,
+            principal.to_string(),
+            credential,
+        )
+        .await
+        .context("connect to manager (authz)")?;
+        Ok(Self::from_client(client, host))
+    }
+
+    fn from_client(client: ClusterClient, host: String) -> Self {
+        Self {
             client: Rc::new(client),
             inodes: HashMap::new(),
             dirty_inodes: HashSet::new(),
@@ -146,7 +189,7 @@ impl FsState {
             notify_inval_failed: Rc::new(RefCell::new(HashSet::new())),
             kernel_invalidator: RefCell::new(None),
             direct_read: false,
-        })
+        }
     }
 
     // ── KV helpers ──────────────────────────────────────────────────────────
