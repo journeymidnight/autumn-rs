@@ -130,22 +130,20 @@ impl Fs {
     /// DEPENDENT (this host must reach EN data ports), default False; each read
     /// falls back to the PS proxy on any direct-read failure.
     #[staticmethod]
-    #[pyo3(signature = (manager, host=None, tenant=None, volume=None, direct_read=false))]
+    #[pyo3(signature = (manager, host=None, tenant=None, direct_read=false))]
     fn connect(
         py: Python<'_>,
         manager: String,
         host: Option<String>,
         tenant: Option<String>,
-        volume: Option<String>,
         direct_read: bool,
     ) -> PyResult<Self> {
         let host = host.unwrap_or_else(|| "autumn-fs-py".to_string());
-        // F-KEY-NS SD-3: this front-end shares the fuse core, so it scopes to the
-        // same `fs/{tenant}/{volume}/` keyspace. Default tenant+volume match the
-        // fuse binary's defaults so a Python `autumn.Fs` and a `--tenant default
-        // --volume default` mount see the SAME filesystem.
+        // F-KEY-NS: this front-end shares the fuse core, so it scopes to the same
+        // `fs/{tenant}/` keyspace. Default tenant matches the fuse binary's default
+        // so a Python `autumn.Fs` and a `--tenant default` mount see the SAME
+        // filesystem.
         let tenant = tenant.unwrap_or_else(|| "default".to_string());
-        let volume = volume.unwrap_or_else(|| "default".to_string());
         let (job_tx, mut job_rx) = unbounded::<FsJob>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -160,7 +158,7 @@ impl Fs {
                     }
                 };
                 rt.block_on(async move {
-                    let mut state = match FsState::new_with_host(&manager, host, &tenant, &volume).await {
+                    let mut state = match FsState::new_with_host(&manager, host, &tenant).await {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e.to_string()));

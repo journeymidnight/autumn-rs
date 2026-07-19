@@ -2,6 +2,18 @@
 
 Status: PROPOSAL（未实现；本文档只做设计与论证）
 Date: 2026-07-16
+
+> **REVERSION (2026-07-18)：`{volume}` 子层已移除，fuse 前缀回到 `fs/{tenant}/`。**
+> 本文档下方（尤其 §D1 及 key 布局表）多处写 `fs/{tenant}/{volume}/`，那是
+> SD-3 曾短暂落地的两层模式；用户 2026-07-18 拍板去掉 `{volume}` 层——
+> 「相比其他多了个 `{volume}`，改为 `fs/{tenant}/` 更好」。现况：
+> - wire key = `fs/{tenant}/[type]…`（`{volume}` 段不再存在）；
+> - inode 计数器保持 GLOBAL（`autumn-rs/fs/next_inode`，本就因 lease-by-bare-ino
+>   而全局，见 manager note 42），`AllocInodesReq.volume` 字段休眠保留；
+> - `ensure_schema_version` 增加 fail-loud 迁移检查：未迁移的旧 `{volume}` 数据
+>   会让 mount 响亮拒绝，绝不静默当空盘（见 `crates/fuse/src/meta.rs` +
+>   `tests/system_fuse_ns.rs::stale_volume_data_refuses_mount`）。
+> 隔离单元由此从 `(tenant, volume)` 收敛为 `tenant`。以下 SD-3 内容保留作历史。
 相关 feature 条目：F-KEY-NS-FUSE / F-POLICY-SIZE-EST-LIVE / F-SPLIT-AT-KEY / F-PRESPLIT-DEPLOY-MODE（feature_list.md）
 
 用户提出两条主张：

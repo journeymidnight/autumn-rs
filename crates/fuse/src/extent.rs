@@ -291,15 +291,10 @@ async fn flush_appends(
     let drained_keys = std::mem::take(keys);
     let drained_values = std::mem::take(values);
     let drained_upserts = std::mem::take(upserts);
-    // F-KEY-NS SD-3: this append path calls `put_many_fenced` DIRECTLY on the
-    // client, bypassing the `kv_*` volume-prefix choke point — so wire the
-    // `{volume}/` prefix onto every append key here (the client then prepends
-    // `fs/{tenant}/`). Must match the RMW-overwrite branch (`kv_put_fenced`) and
-    // the read path (`read::prepare`), else a fresh append lands at
-    // `fs/{tenant}/[0x03]…` while a later overwrite/read of the same extent uses
-    // `fs/{tenant}/{volume}/[0x03]…` — different keys, silent corruption.
-    let wired_keys: Vec<Vec<u8>> = drained_keys.iter().map(|k| state.wire(k)).collect();
-    let items: Vec<(&[u8], Bytes, u64)> = wired_keys
+    // This append path calls `put_many_fenced` directly on the client, which
+    // prepends `fs/{tenant}/` — same as the RMW-overwrite branch (kv_put_fenced)
+    // and the read path (read::prepare). The bare `key::*` keys are relative.
+    let items: Vec<(&[u8], Bytes, u64)> = drained_keys
         .iter()
         .zip(drained_values.iter())
         .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))

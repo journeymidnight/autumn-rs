@@ -159,31 +159,27 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 
 Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
 
-> **F-KEY-NS SD-3 — 上表是 RELATIVE key；真实 wire key 带 `fs/{tenant}/{volume}/` 前缀。**
-> 挂载时 `--tenant` / `--volume`（PyO3 `autumn.Fs.connect(tenant=, volume=)`；均默认
-> `default`）确定 scope。`FsState` 用 `scoped(fs, tenant)` 连接 —— **client 负责
-> `fs/{tenant}/` 那一半**（prepend + 把返回 range key 剥回），**`FsState.vol` 负责
-> `{volume}/` 那一半**（`state.rs` 的 8 个 `kv_*` choke point 里 prepend；`kv_range_keys`
-> 额外把 `{volume}/` 从返回 key 剥回）。所以 `key::*` builder 与其 38 处调用点、以及
-> 全部 `parse_*` 都保持 RELATIVE、**零改动** —— volume 前缀活在 KV choke point
-> （`state.rs` 的 8 个 `kv_*`）**外加两处 batch 数据路径**（`read::prepare` 的
-> `ChunkSpec.key` + `extent::flush_appends` 的 append keys；二者为性能直接调
-> `get_many_*`/`put_many_fenced` 绕过 `kv_*`，故也在这两站点 `state.wire()` 补
-> `{volume}/` —— 否则 extent 数据落 `fs/{t}/[0x03]` 缺 volume，见 P0 修复 9748d3d）。
-> 净 wire key = `fs/{tenant}/{volume}/[type][fields]`：一个 mount 只能碰自己的 volume
-> （scope 由构造锁死），写路径被 Layer-A 按 `fs` namespace 门控。每个 volume 有独立的
-> 根 inode（`fs/{t}/{v}/[0x01][1]`）、独立的 `next_inode` floor、独立的 rmtomb 墓碑扫描、
-> 独立的 `[0x04]schema_version` 戳——天然按前缀隔离。charset 与 ns/tenant 一致：
-> `[a-z0-9._-]+`（`is_valid_volume`）。
-> **inode 号是全局唯一（非 per-volume，review P1-2）**：lease/fence 平面按裸 ino 做 key
-> （manager `inode_leases/<ino>`、PS `fence_floors`、`WriteLease.inode_hint`），per-volume
-> inode（每 volume 从 2）会跨 volume 撞车 → 跨 volume 写租约冲突。所以 fuse 给 `alloc_inodes`
-> 传空 volume → manager 全局计数器（cluster-unique）；且 `init_root` 不再本地 seed inode 批次
-> ——全部 inode 走 manager 发号。数据隔离靠 `{volume}/` key 前缀（与 inode 号无关），不受影响。
-> per-volume 计数器机制（+ 冻结的 `AllocInodesReq.volume`）保留休眠，待将来 volume-aware lease。
+> **F-KEY-NS — 上表是 RELATIVE key；真实 wire key 带 `fs/{tenant}/` 前缀。**
+> 挂载时 `--tenant`（PyO3 `autumn.Fs.connect(tenant=)`；默认 `default`）确定 scope。
+> `FsState` 用 `scoped(fs, tenant)` 连接 —— **client 负责整个 `fs/{tenant}/` 前缀**
+> （prepend + 把返回 range key 剥回、按 tenant 边界 clamp）。所以 `state.rs` 的 8 个
+> `kv_*` choke point、`key::*` builder 与其调用点、全部 `parse_*` 都把裸 `key::*`
+> RELATIVE key 直接交给 client，**零 wire 拼接**。**两处 batch 数据路径**（`read::prepare`
+> 的 `ChunkSpec.key` + `extent::flush_appends` 的 append keys；二者为性能直接调
+> `get_many_*`/`put_many_fenced` 绕过 `kv_*`）同样交裸 `key::*`——client 一处 prepend
+> `fs/{tenant}/`，与 `kv_*` 元数据路径一致（无 key 不匹配隐患）。净 wire key =
+> `fs/{tenant}/[type][fields]`：一个 mount 只能碰自己 tenant 的数据（scope 由构造锁死），
+> 写路径被 Layer-A 按 `fs` namespace 门控。
+> **（历史）SD-3 曾在 `fs/{tenant}/` 与 `[type]` 之间加过一层 `{volume}/`，2026-07-19
+> 用户拍板去掉——多一层 sub-namespace 无收益。** inode 号本就全局唯一（lease/fence 平面
+> 按裸 ino 做 key），fuse 给 `alloc_inodes` 传空 volume → manager 全局计数器；`init_root`
+> 不本地 seed inode 批次，全部 inode 走 manager 发号。manager 的 per-volume 计数器机制
+> + 冻结的 `AllocInodesReq.volume` 字段保留**休眠**（reserved），去 volume 是纯 key-bytes
+> 改动（stop-world 数据 reset），**无 wire bump**。
 > **schema 版本戳（`schema::SCHEMA_VERSION` = 2, `meta::ensure_schema_version`）**：mount
 > 时（`ensure_root` 入口）缺则戳、有则核对、不符则 **fail-loud 拒挂**（防未来不兼容布局
-> 静默读写坏数据）；v1 = pre-SD-3 裸 key 布局（不戳），v2 = SD-3 `fs/{t}/{v}/` 相对布局。
+> 静默读写坏数据）；v1 = pre-namespace 裸 key 布局（不戳），v2 = `fs/{tenant}/` 相对布局
+> （去 `{volume}` 不改 RELATIVE 布局，仍 v2）。
 
 > **F247 — 变长 extent（取代固定 256 KiB chunk）。** 文件数据不再是固定 256 KiB
 > 块，而是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，

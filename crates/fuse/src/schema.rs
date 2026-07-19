@@ -99,23 +99,20 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
 
-/// F-KEY-NS SD-3: the on-disk layout version stamped per volume in the
-/// superblock (`[0x04]schema_version`, so it lands at
-/// `fs/{tenant}/{volume}/[0x04]schema_version`).
+/// F-KEY-NS: the on-disk layout version stamped per tenant in the superblock
+/// (`[0x04]schema_version`, so it lands at `fs/{tenant}/[0x04]schema_version`).
 ///
-/// - **v1** = the pre-SD-3 layout (raw `0x01`–`0x04` keys under a Raw client
-///   binding, single global inode counter). Never actually stamped — v1
-///   volumes carry NO schema_version key.
-/// - **v2** = the SD-3 layout: keys are RELATIVE to `fs/{tenant}/{volume}/`
-///   (the client prepends `fs/{tenant}/`, `FsState.vol` prepends `{volume}/`),
-///   with a cluster-unique GLOBAL inode counter (per-volume inode counters are
-///   deferred — the lease/fence plane keys by bare ino, so per-volume inodes
-///   would collide across volumes; see review P1-2). Data isolation comes from
-///   the key prefix, not the inode number.
+/// - **v1** = the pre-namespace layout (raw `0x01`–`0x04` keys under a Raw client
+///   binding). Never actually stamped — v1 filesystems carry NO schema_version
+///   key.
+/// - **v2** = the namespaced layout: keys are RELATIVE to `fs/{tenant}/` (the
+///   client prepends it), with a cluster-unique GLOBAL inode counter. (Removing
+///   the short-lived SD-3 `{volume}` layer does NOT change this relative on-disk
+///   format — only where the tree lives on the wire — so it stays v2.)
 ///
-/// `meta::ensure_schema_version` stamps a fresh volume with this value and
-/// FAILS LOUD if an existing volume's stamp differs — a future incompatible
-/// layout (v3+) then refuses to mount rather than silently corrupting data.
+/// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
+/// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)
+/// then refuses to mount rather than silently corrupting data.
 /// BUMP this whenever the key layout / value encoding changes incompatibly.
 pub const SCHEMA_VERSION: u64 = 2;
 

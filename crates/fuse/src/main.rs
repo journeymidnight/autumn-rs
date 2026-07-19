@@ -33,17 +33,11 @@ struct Args {
     #[arg(long)]
     mountpoint: PathBuf,
 
-    /// F-KEY-NS SD-3: tenant this mount's data lives under. Every KV key is
-    /// scoped to `fs/{tenant}/{volume}/`, so two tenants (or two volumes) never
-    /// share inodes/dirents/extents. Must match `[a-z0-9._-]+`.
+    /// F-KEY-NS: tenant this mount's data lives under. Every KV key is scoped to
+    /// `fs/{tenant}/`, so two tenants never share inodes/dirents/extents. Must
+    /// match `[a-z0-9._-]+`.
     #[arg(long, default_value = "default")]
     tenant: String,
-
-    /// F-KEY-NS SD-3: volume (sub-namespace within the tenant) this mount owns.
-    /// Distinct mounts of the SAME logical filesystem use the same tenant+volume;
-    /// unrelated filesystems pick distinct volumes. Must match `[a-z0-9._-]+`.
-    #[arg(long, default_value = "default")]
-    volume: String,
 
     /// Allow other users to access the mount
     #[arg(long, default_value = "false")]
@@ -135,8 +129,8 @@ fn main() -> Result<()> {
             // crosses threads after this point).
             let notifier = notifier;
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                // Connect to cluster (scoped to `fs/{tenant}/{volume}/`)
-                let mut state = match FsState::new(&manager_addr, &args.tenant, &args.volume).await {
+                // Connect to cluster (scoped to `fs/{tenant}/`)
+                let mut state = match FsState::new(&manager_addr, &args.tenant).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to connect to cluster");

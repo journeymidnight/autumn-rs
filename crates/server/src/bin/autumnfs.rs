@@ -22,10 +22,10 @@
 //!
 //! Paths are `/`-separated; leading `/` is optional. ROOT_INO = 1.
 //!
-//! F-KEY-NS SD-3: `autumnfs` connects SCOPED to `fs/{tenant}/{volume}/`
-//! (`--tenant`/`--volume`, both default `default`) so its keys land in the SAME
-//! keyspace a fuse mount uses — a write here is visible to a mount pointed at the
-//! same tenant+volume, and vice versa. Inode numbers come from the MANAGER's
+//! F-KEY-NS: `autumnfs` connects SCOPED to `fs/{tenant}/` (`--tenant`, default
+//! `default`) so its keys land in the SAME keyspace a fuse mount uses — a write
+//! here is visible to a mount pointed at the same tenant, and vice versa. Inode
+//! numbers come from the MANAGER's
 //! crash-safe GLOBAL counter (`alloc_inodes`), the same source the fuse mount +
 //! PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding inodes
 //! (the pre-SD-3 racy non-CAS KV counter is gone).
@@ -56,15 +56,10 @@ struct Args {
     #[arg(long, default_value = "tcp")]
     transport: String,
 
-    /// F-KEY-NS SD-3: tenant this fs lives under (`fs/{tenant}/{volume}/`). Must
-    /// match the fuse mount's `--tenant` to see the same filesystem.
+    /// F-KEY-NS: tenant this fs lives under (`fs/{tenant}/`). Must match the fuse
+    /// mount's `--tenant` to see the same filesystem.
     #[arg(long, default_value = "default")]
     tenant: String,
-
-    /// F-KEY-NS SD-3: volume within the tenant. Must match the fuse mount's
-    /// `--volume` to see the same filesystem.
-    #[arg(long, default_value = "default")]
-    volume: String,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -119,15 +114,13 @@ fn main() -> Result<()> {
         .build()
         .context("create compio runtime")?;
     rt.block_on(async move {
-        // F-KEY-NS SD-3: scope the client to `fs/{tenant}/{volume}/` — the binding
-        // prepends the full prefix to every relative fuse key (and strips it off
-        // range results), so a write here is visible to a fuse mount on the same
-        // `--tenant`/`--volume`. Every `key::*`-based op below is unchanged; the
-        // client owns the prefix (validates the segments).
-        let cluster =
-            ClusterClient::connect_volume(&args.manager, "fs", &args.tenant, &args.volume)
-                .await
-                .context("connect to manager")?;
+        // F-KEY-NS: scope the client to `fs/{tenant}/` — the binding prepends the
+        // prefix to every relative fuse key (and strips it off range results), so a
+        // write here is visible to a fuse mount on the same `--tenant`. Every
+        // `key::*`-based op below is unchanged; the client owns the prefix.
+        let cluster = ClusterClient::connect(&args.manager, "fs", &args.tenant)
+            .await
+            .context("connect to manager")?;
         cluster
             .wait_for_cluster_ready(
                 std::time::Duration::from_secs(20),

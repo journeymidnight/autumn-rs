@@ -132,28 +132,7 @@ impl NamespaceBinding {
         }
     }
 
-    /// F-KEY-NS SD-3: a scoped binding one level deeper — `{ns}/{tenant}/{volume}/`.
-    /// Same Prepend/strip/clamp behaviour as `scoped`; the `volume` lives only in
-    /// `prefix` (the `namespace`/`tenant` fields stay the scope's ns/tenant for
-    /// credential checks). Used by `connect_volume` (autumnfs) so its keys land in
-    /// the SAME `fs/{tenant}/{volume}/` keyspace a fuse mount writes under.
-    pub fn scoped_volume(
-        namespace: impl Into<String>,
-        tenant: impl Into<String>,
-        volume: &str,
-    ) -> Self {
-        let namespace = namespace.into();
-        let tenant = tenant.into();
-        let prefix = format!("{namespace}/{tenant}/{volume}/").into_bytes();
-        NamespaceBinding::Scoped {
-            namespace,
-            tenant,
-            prefix,
-        }
-    }
-
-    /// `{ns}/{tenant}/` (or `{ns}/{tenant}/{volume}/` for a `scoped_volume`
-    /// binding) for a scoped binding; `None` for `Raw`.
+    /// `{ns}/{tenant}/` for a scoped binding; `None` for `Raw`.
     pub fn prefix(&self) -> Option<&[u8]> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
@@ -858,13 +837,11 @@ impl ClusterClient {
     /// counter value (0 = none): the grant never returns a base below it,
     /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
     pub async fn alloc_inodes(&self, count: u32, floor: u64, volume: &[u8]) -> Result<u64> {
-        // F-KEY-NS SD-3: `volume` (canonicalized `fs/{tenant}/{volume}/`) would key
-        // the manager's inode counter per-volume — BUT the fuse layer passes EMPTY
-        // today so inodes stay a single cluster-unique GLOBAL counter: the
-        // lease/fence plane keys by bare ino, so per-volume inodes would collide
-        // across volumes (review P1-2). The per-volume path stays wired (frozen
-        // field + manager machinery) but dormant, for a future volume-aware-lease
-        // feature. Empty = the global counter.
+        // `volume` keys the manager's inode counter per-volume, but the fuse layer
+        // passes EMPTY so inodes are a single cluster-unique GLOBAL counter (the
+        // lease/fence plane keys by bare ino). The per-volume seam stays wired
+        // (frozen field + manager machinery) but DORMANT — reserved for a future
+        // volume-aware-lease feature. Empty = the global counter.
         let req = rkyv_encode(&AllocInodesReq {
             count,
             floor,
@@ -1095,34 +1072,6 @@ impl ClusterClient {
             }
         }
         Self::connect_with_binding(manager, NamespaceBinding::scoped(namespace, tenant)).await
-    }
-
-    /// F-KEY-NS SD-3: connect a SCOPED client bound to a specific VOLUME
-    /// (`{namespace}/{tenant}/{volume}/`) — same Prepend-only clamp as `connect`,
-    /// one level deeper. The client prepends the full `fs/{tenant}/{volume}/` to
-    /// every key and strips it off returned range keys, so all of `autumnfs`'s
-    /// existing relative-key ops (`key::inode_key`/`dirent_key`/`extent_key`/…)
-    /// land in the SAME keyspace a fuse mount writes under — a write here is
-    /// visible to a mount pointed at the same `--tenant`/`--volume`. Validates all
-    /// three segments as `[a-z0-9._-]+`.
-    pub async fn connect_volume(
-        manager: &str,
-        namespace: &str,
-        tenant: &str,
-        volume: &str,
-    ) -> Result<Self> {
-        for (kind, seg) in [("namespace", namespace), ("tenant", tenant), ("volume", volume)] {
-            if !is_valid_scope_segment(seg) {
-                return Err(anyhow!(
-                    "invalid {kind} {seg:?}: must be non-empty and match [a-z0-9._-]+ (no '/')"
-                ));
-            }
-        }
-        Self::connect_with_binding(
-            manager,
-            NamespaceBinding::scoped_volume(namespace, tenant, volume),
-        )
-        .await
     }
 
     /// F-KEY-NS D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO

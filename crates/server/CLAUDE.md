@@ -142,7 +142,7 @@ shell against a running cluster, useful for inspection, scripted setup,
 and CI seeding.
 
 ```
-autumnfs [--manager 127.0.0.1:9001] [--tenant default] [--volume default] <SUBCMD>
+autumnfs [--manager 127.0.0.1:9001] [--tenant default] <SUBCMD>
 ```
 
 | Subcommand | Description |
@@ -158,15 +158,14 @@ autumnfs [--manager 127.0.0.1:9001] [--tenant default] [--volume default] <SUBCM
 
 **Wire layer**: uses `autumn-client::ClusterClient` directly + `autumn-fuse`'s
 ungated `key` + `schema` modules (the `default-features = false` import skips
-the fuser/libc kernel-side deps). **F-KEY-NS SD-3**: connects via
-`ClusterClient::connect_volume(mgr, "fs", tenant, volume)` (`--tenant`/`--volume`,
-default `default`), so the client binding prepends the full
-`fs/{tenant}/{volume}/` to every relative fuse key (and strips it off range
-results) — the SAME keyspace a fuse mount uses, so a write here is visible to a
-mount on the same tenant+volume. Inode numbers come from the MANAGER's global
-counter (`alloc_inodes(1, 0, b"")`) — the same crash-safe source the fuse mount +
-PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding inodes
-(the pre-SD-3 racy non-CAS KV counter is gone). The schema-version stamp is
+the fuser/libc kernel-side deps). **F-KEY-NS**: connects via
+`ClusterClient::connect(mgr, "fs", tenant)` (`--tenant`, default `default`), so
+the client binding prepends `fs/{tenant}/` to every relative fuse key (and strips
+it off range results) — the SAME keyspace a fuse mount uses, so a write here is
+visible to a mount on the same tenant. Inode numbers come from the MANAGER's
+global counter (`alloc_inodes(1, 0, b"")`) — the same crash-safe source the fuse
+mount + PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding
+inodes. The schema-version stamp is
 written by the fuse mount's first `ensure_schema_version` (autumnfs doesn't
 stamp; it only creates the root).
 

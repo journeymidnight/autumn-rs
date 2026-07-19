@@ -111,10 +111,10 @@ pub fn next_inode_key() -> Vec<u8> {
     super_key(b"next_inode")
 }
 
-/// F-KEY-NS SD-3: well-known superblock key holding this volume's on-disk
-/// layout version (`schema::SCHEMA_VERSION`, BE u64). Volume-relative like
-/// every other key, so it lives at `fs/{tenant}/{volume}/[0x04]schema_version`
-/// — each volume stamps + verifies its own layout independently.
+/// Well-known superblock key holding this tenant's on-disk layout version
+/// (`schema::SCHEMA_VERSION`, BE u64). Relative like every other key, so it lives
+/// at `fs/{tenant}/[0x04]schema_version` — each tenant stamps + verifies its own
+/// layout independently.
 pub fn schema_version_key() -> Vec<u8> {
     super_key(b"schema_version")
 }
