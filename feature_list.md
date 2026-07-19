@@ -94,8 +94,9 @@
   路由再解下一个点（或直接用返回的新 part_id 推进）。顺带：失败信息误导——最终报
   "Check --hash-prefix / authz / partition map"，但真因是过期路由，应区分这两类。
 - **Acceptance**: 一次调用把 N 个切点全部落地（`N/N applied`）；单测覆盖"连续多刀"路径。
-- **Status**: `passes: false` (2026-07-19) — 线上已用"重复调用 5 次"绕过，fs 布局正确（6 分区，
-  每个 shard 独占）。
+- **Status**: `passes: true` (2026-07-19) — **已由并行会话修复**（F-FS-STRIPE 批次 aab377c→21004e4
+  「顺手修 cmd_presplit 陈旧 region cache bug」），与本条定位的根因一致。线上当时用"重复调用 5 次"
+  绕过，fs 布局正确（6 分区，每 shard 独占）；**待装新镜像后确认一次调用落满 N 刀**。
 
 ### F-AUTUMNFS-SLOW — autumnfs CLI 上传/读取明显偏慢
 - **Trigger** (2026-07-18, 用户线上观察 "明显感觉 autumnfs cli 偏慢"): 19 GB / 5 shard 顺序上传耗时约 7 min（≈45 MB/s），远低于集群实际能力（同集群 perf-check 写吞吐高一个量级）。
