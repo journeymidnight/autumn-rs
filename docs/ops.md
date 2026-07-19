@@ -1150,18 +1150,22 @@ disk/CPU are NOT the limit). To go faster, STRIPE the file across N lane partiti
 $AO presplit --namespace fs --tenant default --lanes 4
 $AO info | grep part          # → 4 fs partitions, ideally one per PS
 
-# 2. Upload with --stripe-lanes N. A file > 64 MiB gets its extents round-robined
-#    across lanes: extent e → lane e%N, key [0x03][lane][ino][off]. autumnfs's
-#    concurrent batch_put fans them out → parallel across the lane PSs. Small files
-#    (≤ 64 MiB) ignore the flag and stay single-partition.
-autumnfs --manager <mgr> --tenant default put ./checkpoint.safetensors /ckpt --stripe-lanes 4
+# 2. Just upload. autumnfs AUTO-DETECTS the lane count from the presplit fs (counts
+#    the lane partitions — a FIXED cluster property, no per-upload flag). A file
+#    > 64 MiB gets its extents round-robined across the N lanes: extent e → lane e%N,
+#    key [0x03][lane][ino][off]; autumnfs's concurrent batch_put fans them out →
+#    parallel across the lane PSs. Small files (≤ 64 MiB) and a non-lane-presplit fs
+#    stay single-partition.
+autumnfs --manager <mgr> --tenant default put ./checkpoint.safetensors /ckpt
 autumnfs --manager <mgr> --tenant default get /ckpt ./out   # reader auto-detects stripe
 ```
 
 - The stripe layout (`lanes`, `unit`) is stamped in the file's `InodeMeta.stripe` at
   create, so the reader computes the lane keys (no range scan) and old / non-striped
   files stay correct with **no migration**. `unit = MAX_EXTENT` (8 MiB) in v1 = each
-  extent its own lane (max spread).
+  extent its own lane (max spread). MAX_EXTENT sweep (3-disk rig, EN-CPU-bound):
+  striped-write peaks near 4 MiB (~340 MB/s) and DECLINES for bigger extents
+  (8→330, 16→298, 32→291); don't go above 8 MiB.
 - **Scaling is bounded by whichever saturates first**: the lane PSs, the ENs' data
   plane, or the autumnfs client pipeline (window=8 + sync read barrier — a single
   file may not fully drive many lanes; running few parallel uploads or a deeper

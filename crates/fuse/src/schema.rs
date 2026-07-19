@@ -71,6 +71,23 @@ pub struct StripeLayout {
     pub unit_bytes: u32,
 }
 
+impl StripeLayout {
+    /// coco P3: validate the PERSISTED geometry before it feeds `stripe_lane`'s
+    /// `off / unit_bytes` + `% lanes` — a corrupt/hand-written inode with
+    /// `lanes == 0` or `unit_bytes == 0` would otherwise div-by-zero panic the
+    /// reader/rm. Returns `(lanes, unit_bytes)` or a diagnostic error. Every path
+    /// that reads `meta.stripe` from KV MUST route through this, not the raw fields.
+    pub fn checked(&self) -> Result<(u8, u32), String> {
+        if self.lanes < 1 || self.unit_bytes < 1 {
+            return Err(format!(
+                "invalid stripe layout (corrupt inode?): lanes={} unit_bytes={}",
+                self.lanes, self.unit_bytes
+            ));
+        }
+        Ok((self.lanes, self.unit_bytes))
+    }
+}
+
 /// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DirentValue {

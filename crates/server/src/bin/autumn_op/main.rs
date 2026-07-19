@@ -1610,7 +1610,14 @@ async fn cmd_presplit(
         // narrowed) partition → "at or above partition end" (hit live on
         // `presplit --namespace fs --lanes N` where all cuts land in one small
         // range so every later cut needs the fresh child).
-        let _ = client.refresh_regions().await;
+        // coco P2: do NOT swallow the refresh error — a failed refresh falls back
+        // to the STALE cache and mis-resolves the owner, and since the run reports
+        // ok when applied>0 the operator could load into a partially-presplit
+        // keyspace. Fail the whole presplit instead.
+        client
+            .refresh_regions()
+            .await
+            .map_err(|e| anyhow!("presplit: refresh regions before cut: {e}"))?;
         let parts = client
             .all_partitions_with_range()
             .await

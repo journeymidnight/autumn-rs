@@ -105,13 +105,6 @@ enum Cmd {
         local: PathBuf,
         /// Destination path in the autumn fs. Parents must exist.
         remote: String,
-        /// F-FS-STRIPE: stripe a LARGE file (> 64 MiB) across N lane partitions so
-        /// its extents write/read in parallel beyond the single-partition ceiling.
-        /// 0/1 = no striping (single partition). Pre-split fs into N lanes first:
-        /// `autumn-op presplit --namespace fs --tenant <t> --lanes N`. Small files
-        /// ignore this and stay single-partition.
-        #[arg(long, default_value_t = 0)]
-        stripe_lanes: u8,
     },
     /// Download a cluster file to local disk.
     Get {
@@ -184,8 +177,8 @@ fn main() -> Result<()> {
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
             Cmd::Cat { path } => cmd_cat(&cluster, &path).await,
-            Cmd::Put { local, remote, stripe_lanes } => {
-                cmd_put(&cluster, &local, &remote, stripe_lanes).await
+            Cmd::Put { local, remote } => {
+                cmd_put(&cluster, &local, &remote, &args.tenant).await
             }
             Cmd::Get { remote, local } => cmd_get(&cluster, &remote, &local).await,
             Cmd::Rm { path } => cmd_rm(&cluster, &path).await,
@@ -576,9 +569,10 @@ async fn read_file_to_writer(
         // exceeds it), so step by MAX_EXTENT and derive each extent's lane; the
         // window `get_many_into` below then fans the reads out across the lane
         // partitions in parallel.
+        let (lanes, unit) = s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
         let mut off = 0u64;
         while off < meta.size {
-            extents.push((off, key::extent_key_striped(ino, off, s.lanes, s.unit_bytes)));
+            extents.push((off, key::extent_key_striped(ino, off, lanes, unit)));
             off += MAX_EXTENT as u64;
         }
     } else {
@@ -819,12 +813,33 @@ async fn publish_file(
     Ok(())
 }
 
-async fn cmd_put(
-    cluster: &ClusterClient,
-    local: &PathBuf,
-    remote: &str,
-    stripe_lanes: u8,
-) -> Result<()> {
+/// F-FS-STRIPE: how many lane partitions the fs is presplit into (the FIXED
+/// stripe width — NOT a per-upload flag). A lane partition L≥1 starts exactly at
+/// the wire key `{tenant}/fs/[0x03][L]` (`stripe_lane_boundary` under the binding
+/// prefix); count them → `N = (#lane boundaries) + 1` (lane 0 has no boundary
+/// start). Returns 1 when fs was never lane-presplit → no striping. Best-effort:
+/// any lookup error → 1 (fall back to single-partition, never fail the upload).
+async fn detect_stripe_lanes(cluster: &ClusterClient, tenant: &str) -> u8 {
+    // all_partitions_with_range reads the region cache; refresh so a just-presplit
+    // fs is seen. Errors are non-fatal — degrade to non-striped.
+    let _ = cluster.refresh_regions().await;
+    let Ok(parts) = cluster.all_partitions_with_range().await else {
+        return 1;
+    };
+    let prefix = format!("{tenant}/fs/").into_bytes();
+    let boundaries = parts
+        .iter()
+        .filter(|(_, _, start, _)| {
+            start.len() == prefix.len() + 2
+                && start.starts_with(&prefix)
+                && start[prefix.len()] == 0x03 // PREFIX_EXTENT
+                && start[prefix.len() + 1] >= 1 // lane byte L≥1
+        })
+        .count();
+    ((boundaries + 1).min(255)) as u8
+}
+
+async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str, tenant: &str) -> Result<()> {
     let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, remote).await?;
     if !is_dir(&parent_meta) {
         bail!("parent is not a directory");
@@ -839,14 +854,18 @@ async fn cmd_put(
     }
     let f = std::fs::File::open(local)
         .with_context(|| format!("open local file {}", local.display()))?;
-    // F-FS-STRIPE: stripe only a LARGE file across ≥2 lanes; small files stay
-    // single-partition. File size is known up front (a local file), so we can
-    // stamp the layout at create — unlike the fuse mount's streaming writes.
+    // F-FS-STRIPE: stripe only a LARGE file, and across exactly the lanes the fs
+    // was presplit into (auto-detected — a FIXED cluster property, not a flag).
+    // Small files (≤ threshold) and a non-lane-presplit fs (N<2) stay
+    // single-partition. Size is known up front (a local file), so we can stamp
+    // the layout at create — unlike the fuse mount's streaming writes.
     let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let stripe = (stripe_lanes >= 2 && file_size > STRIPE_THRESHOLD).then(|| StripeLayout {
-        lanes: stripe_lanes,
-        unit_bytes: MAX_EXTENT as u32,
-    });
+    let stripe = if file_size > STRIPE_THRESHOLD {
+        let lanes = detect_stripe_lanes(cluster, tenant).await;
+        (lanes >= 2).then_some(StripeLayout { lanes, unit_bytes: MAX_EXTENT as u32 })
+    } else {
+        None
+    };
     let striped_note = stripe
         .as_ref()
         .map(|s| format!(" (striped ×{} lanes)", s.lanes))
@@ -935,9 +954,10 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
             // spread across lane partitions — a `[0x03][ino]` scan would MISS
             // them (leak). Compute + delete each key (same enumeration the read
             // path uses: MAX_EXTENT-granular up to size).
+            let (lanes, unit) = s.checked().map_err(|e| anyhow!("rm {ino}: {e}"))?;
             let mut off = 0u64;
             while off < meta.size {
-                let ek = key::extent_key_striped(ino, off, s.lanes, s.unit_bytes);
+                let ek = key::extent_key_striped(ino, off, lanes, unit);
                 cluster.delete(&ek).await.map_err(|e| anyhow!("delete extent: {e}"))?;
                 off += MAX_EXTENT as u64;
             }
