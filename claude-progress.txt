@@ -1,5 +1,21 @@
 Date: 2026-07-19
 TaskStatus: completed
+Task scope: F-FS-STRIPE — 大文件跨 lane partition 条带化 + 突破单文件写天花板（用户多轮）。
+Done（commits aab377c→21004e4，全 push）:
+  - 条带化: InodeMeta.stripe(schema v3) + striped key [0x03][lane][ino][off] + autumn-op
+    presplit --namespace fs --lanes N（顺手修 cmd_presplit 陈旧 region cache bug）+ autumnfs
+    put/get/rm（auto-detect lane 数,无 flag,>64MiB 才切）。
+  - 连续 pipeline（突破天花板）: profiling 证明啥都没满 → autumnfs window+barrier 换成
+    FuturesUnordered 常驻 depth 个 put_zc，单 striped 文件 clean 3-disk 上 300→415 MB/s(+38%)。
+  - fuse: 读/删 striped 正确（stripe-aware），写/truncate striped fail-loud 拒绝（B2 fuse-write
+    striping 延后）。
+  - coco 两轮共 7 findings 全修（含 3 个 P1 真 bug: 冷缓存读零/unlink 泄漏/pipeline orphan）。
+  - MAX_EXTENT sweep: 越大越差别超 8MiB。C(满核 EN)证明 ~450 聚合墙非 EN-CPU=单机 loopback durability 伪影。
+剩余: B2 fuse-write-striping; 破 ~450 需真跨机集群（非代码）。详见 memory project_fs_stripe_design。
+
+============================ prior task history ============================
+Date: 2026-07-19
+TaskStatus: completed
 Task scope: examples + cluster.sh 上 authz (用户: reset+启动authz、gallery/codebase-memory
   改新API、都 protected)。
 Decision: 两个 namespace 都 protected(用户选"都protected最严")→ 两个 example 都接
