@@ -3419,6 +3419,21 @@ impl ClusterClient {
             {
                 Ok(b) => b,
                 Err(e) => {
+                    // F-AUTHZ-1 / F-KEY-NS: PermissionDenied + NamespaceUnknown are
+                    // TERMINAL — refreshing routing can't grant access or create the
+                    // namespace, so surface immediately instead of burning
+                    // MAX_PS_REFRESHES (mirrors call_ps_for_key on the point path).
+                    // A stale region_epoch surfaces as FailedPrecondition, which is
+                    // NOT short-circuited here — it still refreshes + retries below.
+                    match e.downcast_ref::<AutumnError>() {
+                        Some(AutumnError::PermissionDenied(msg)) => {
+                            return Err(AutumnError::PermissionDenied(msg.clone()));
+                        }
+                        Some(AutumnError::NamespaceUnknown(msg)) => {
+                            return Err(AutumnError::NamespaceUnknown(msg.clone()));
+                        }
+                        _ => {}
+                    }
                     // Epoch stale, transport error (incl. CODE_NOT_FOUND
                     // from a mis-routed fallback on a freshly-split right
                     // child whose part_addr isn't registered yet), or
