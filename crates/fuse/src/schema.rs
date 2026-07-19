@@ -88,6 +88,24 @@ impl StripeLayout {
     }
 }
 
+/// F-FS-STRIPE (coco P3): the MAX_EXTENT-aligned logical offsets (0, 8 MiB, …) of
+/// a striped file of `size` bytes — the enumeration the reader / rm / delete paths
+/// use to COMPUTE lane keys. Guards a corrupt huge `size`: a bare
+/// `while off < size { off += MAX_EXTENT }` would wrap `off` (infinite loop) or
+/// push billions of entries (OOM) if `size ≈ u64::MAX`. Errors when the extent
+/// count exceeds a sane ceiling (128 TiB) instead of hanging.
+pub fn striped_extent_offsets(size: u64) -> Result<Vec<u64>, String> {
+    const MAX_EXTENTS: u64 = 16 * 1024 * 1024; // 16M × 8 MiB = 128 TiB
+    let count = size.div_ceil(MAX_EXTENT as u64);
+    if count > MAX_EXTENTS {
+        return Err(format!(
+            "striped file size {size} too large ({count} extents > {MAX_EXTENTS} cap — corrupt inode?)"
+        ));
+    }
+    // i < count ≤ 16M ⇒ i * 8 MiB < 128 TiB < u64::MAX, no overflow.
+    Ok((0..count).map(|i| i * MAX_EXTENT as u64).collect())
+}
+
 /// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DirentValue {

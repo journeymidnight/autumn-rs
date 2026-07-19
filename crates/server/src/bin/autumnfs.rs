@@ -570,10 +570,9 @@ async fn read_file_to_writer(
         // window `get_many_into` below then fans the reads out across the lane
         // partitions in parallel.
         let (lanes, unit) = s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
-        let mut off = 0u64;
-        while off < meta.size {
+        // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
+        for off in schema::striped_extent_offsets(meta.size).map_err(|e| anyhow!("read {ino}: {e}"))? {
             extents.push((off, key::extent_key_striped(ino, off, lanes, unit)));
-            off += MAX_EXTENT as u64;
         }
     } else {
         // Legacy single-partition layout: range-scan `[0x03][ino]` (PS
@@ -750,11 +749,25 @@ async fn publish_file(
         let mut inflight = FuturesUnordered::new();
         let mut pending = Some(first_chunk); // the already-read first chunk
         let mut eof = false;
+        // coco P1: on ANY error (source read or a put), STOP scheduling new puts
+        // but keep DRAINING `inflight` to terminal state before returning — do NOT
+        // just drop the FuturesUnordered. A dropped-but-already-sent MSG_PUT_ZC may
+        // still commit server-side; if the caller's orphan cleanup (delete every
+        // `written` key) ran before that late put landed, it would leave an
+        // unreachable extent. Draining quiesces all sent puts first.
+        let mut fail: Option<anyhow::Error> = None;
         loop {
-            if !eof && inflight.len() < depth {
+            if fail.is_none() && !eof && inflight.len() < depth {
                 let chunk = match pending.take() {
                     Some(c) => c,
-                    None => read_full_chunk(&mut data_reader, MAX_EXTENT).context("read source")?,
+                    None => match read_full_chunk(&mut data_reader, MAX_EXTENT) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            fail = Some(anyhow!("read source: {e}"));
+                            eof = true;
+                            continue; // stop reading; fall through to drain
+                        }
+                    },
                 };
                 let n = chunk.len();
                 if n == 0 {
@@ -777,9 +790,18 @@ async fn publish_file(
                 continue;
             }
             match inflight.next().await {
-                Some(r) => r.map_err(|e| anyhow!("put extent: {e}"))?,
-                None => break, // eof && fully drained
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    if fail.is_none() {
+                        fail = Some(anyhow!("put extent: {e}"));
+                    }
+                    eof = true; // stop scheduling; keep draining the rest
+                }
+                None => break, // all sent puts reached terminal state
             }
+        }
+        if let Some(e) = fail {
+            return Err(e); // caller cleans up `written` — safe now (all puts settled)
         }
     }
     meta.size = off;
@@ -944,11 +966,10 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
             // them (leak). Compute + delete each key (same enumeration the read
             // path uses: MAX_EXTENT-granular up to size).
             let (lanes, unit) = s.checked().map_err(|e| anyhow!("rm {ino}: {e}"))?;
-            let mut off = 0u64;
-            while off < meta.size {
+            // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
+            for off in schema::striped_extent_offsets(meta.size).map_err(|e| anyhow!("rm {ino}: {e}"))? {
                 let ek = key::extent_key_striped(ino, off, lanes, unit);
                 cluster.delete(&ek).await.map_err(|e| anyhow!("delete extent: {e}"))?;
-                off += MAX_EXTENT as u64;
             }
         } else {
             let prefix = key::extent_prefix(ino);

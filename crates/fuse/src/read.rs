@@ -122,7 +122,7 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
     if let Some(s) = &meta.stripe {
         s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
     }
-    let ext = extent::extents_snapshot(state, ino, file_size).await?;
+    let ext = extent::extents_snapshot(state, ino, file_size, meta.stripe.as_ref()).await?;
     let mut chunks: Vec<ChunkSpec> = Vec::new();
     for &(start, len) in &ext {
         let e_end = start + len as u64;

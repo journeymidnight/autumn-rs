@@ -240,6 +240,19 @@ mod tests {
     }
 
     #[test]
+    fn striped_extent_offsets_bounded_and_correct() {
+        use crate::schema::{striped_extent_offsets, MAX_EXTENT};
+        let u = MAX_EXTENT as u64;
+        assert_eq!(striped_extent_offsets(0).unwrap(), Vec::<u64>::new());
+        assert_eq!(striped_extent_offsets(1).unwrap(), vec![0]); // 1 byte → 1 extent
+        assert_eq!(striped_extent_offsets(u).unwrap(), vec![0]); // exactly one full extent
+        assert_eq!(striped_extent_offsets(u + 1).unwrap(), vec![0, u]); // spills to 2nd
+        assert_eq!(striped_extent_offsets(3 * u).unwrap(), vec![0, u, 2 * u]);
+        // coco P3: a corrupt near-u64::MAX size errors instead of wrapping / OOMing.
+        assert!(striped_extent_offsets(u64::MAX).is_err());
+    }
+
+    #[test]
     fn striped_extent_keys_round_trip_and_route_by_lane() {
         // F-FS-STRIPE: 4 lanes, unit = 8 MiB → extent e lands on lane e%4.
         let (lanes, unit) = (4u8, 8 * 1024 * 1024u32);

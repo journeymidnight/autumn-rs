@@ -50,18 +50,20 @@ pub async fn extents_snapshot(
     state: &mut FsState,
     ino: u64,
     file_size: u64,
+    stripe: Option<&StripeLayout>,
 ) -> Result<Vec<(u64, u32)>> {
     if let Some(is) = state.inodes.get(&ino) {
         if let Some(ext) = &is.extents {
             return Ok(ext.clone());
         }
     }
-    // F-FS-STRIPE: a striped inode's extents live under `[0x03][lane][ino][off]`,
-    // NOT scannable by the `[0x03][ino]` prefix — the map is COMPUTED from size.
-    // The stripe layout is on the cached meta (get_inode / ensure_inode_cached ran
-    // before any extent op). `scan_extents` branches on it.
-    let stripe = state.inodes.get(&ino).and_then(|is| is.meta.stripe.clone());
-    let extents = scan_extents(state, ino, file_size, stripe.as_ref()).await?;
+    // F-FS-STRIPE (coco P1): a striped inode's extents live under
+    // `[0x03][lane][ino][off]`, NOT scannable by `[0x03][ino]`, so the map is
+    // COMPUTED from size. `stripe` is passed EXPLICITLY by the caller from the
+    // AUTHORITATIVE meta — NOT read from `state.inodes` (get_inode returns the
+    // meta but does NOT populate the cache on a cold miss, so a cache lookup
+    // would wrongly see None for a striped file → legacy scan → zeros).
+    let extents = scan_extents(state, ino, file_size, stripe).await?;
     if let Some(is) = state.inodes.get_mut(&ino) {
         is.extents = Some(extents.clone());
     }
@@ -79,12 +81,8 @@ async fn scan_extents(
     stripe: Option<&StripeLayout>,
 ) -> Result<Vec<(u64, u32)>> {
     if stripe.is_some() {
-        let mut starts: Vec<u64> = Vec::new();
-        let mut off = 0u64;
-        while off < file_size {
-            starts.push(off);
-            off += MAX_EXTENT as u64;
-        }
+        // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
+        let starts = crate::schema::striped_extent_offsets(file_size).map_err(|e| anyhow!(e))?;
         return Ok(infer_lengths(&starts, file_size));
     }
     let prefix = key::extent_prefix(ino);
@@ -171,7 +169,7 @@ pub async fn write_region(
     if data.is_empty() {
         return Ok(());
     }
-    let mut ext = extents_snapshot(state, ino, file_size).await?;
+    let mut ext = extents_snapshot(state, ino, file_size, None).await?;
     // BUG-LEASE-8 (coco P1): leftover extents from a crashed shrink must
     // not merge into / resurface under this write. Cold post-crash path —
     // whole-key leftovers are visible in the prefix scan for free; a
@@ -180,7 +178,7 @@ pub async fn write_region(
     // evidence, so it always sweeps.
     if offset > file_size || ext.iter().any(|&(s, _)| s >= file_size) {
         clean_beyond_eof(state, ino, file_size).await?;
-        ext = extents_snapshot(state, ino, file_size).await?;
+        ext = extents_snapshot(state, ino, file_size, None).await?;
     }
     // BUG-LEASE-2 Phase 2: stamp every data-extent put with the held WRITE
     // lease's version so a revoked writer's late RPCs are fenced at the PS.
@@ -401,14 +399,20 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
             },
         };
     if let Some((Some(s), size)) = stripe_size {
-        if let Ok((lanes, unit)) = s.checked() {
-            let mut off = 0u64;
-            while off < size {
-                let _ = state
-                    .kv_delete_fenced(&key::extent_key_striped(ino, off, lanes, unit), lease)
-                    .await;
-                off += MAX_EXTENT as u64;
-            }
+        // coco P1: striped cleanup MUST fail-loud. `remove_unreachable_inode`
+        // deletes the inode key + tombstone only AFTER this returns Ok; a striped
+        // extent can't be re-enumerated without the inode's stripe+size, so if we
+        // swallowed a checked()/delete error and returned Ok, the leftover lane
+        // extents would leak PERMANENTLY (the tombstone-replay path loses its
+        // recompute source). Propagate errors → the tombstone survives → next
+        // mount retries. (Legacy path can range-scan on replay, so it stays
+        // best-effort.)
+        let (lanes, unit) = s.checked().map_err(|e| anyhow!("striped unlink {ino}: {e}"))?;
+        for off in crate::schema::striped_extent_offsets(size).map_err(|e| anyhow!(e))? {
+            state
+                .kv_delete_fenced(&key::extent_key_striped(ino, off, lanes, unit), lease)
+                .await
+                .map_err(|e| anyhow!("striped unlink {ino} extent @{off}: {e}"))?;
         }
         invalidate(state, ino);
         return Ok(());
@@ -447,7 +451,7 @@ pub async fn truncate_extents(
     if new_size >= old_size {
         return Ok(());
     }
-    let ext = extents_snapshot(state, ino, old_size).await?;
+    let ext = extents_snapshot(state, ino, old_size, None).await?;
     // BUG-LEASE-2 Phase 2 (coco P1 #3): truncate's whole-extent deletes
     // are fenced too — a revoked writer's late shrink must not delete
     // extents the new writer kept or rewrote.
