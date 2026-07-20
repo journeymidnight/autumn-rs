@@ -200,8 +200,14 @@
   - **A (continuous pipeline)** — profiling the striped write showed NOTHING saturated (disks <12% util doing only fsync ops, ENs ~80% of one core, client ~30%) → it was pipeline-depth/durability-latency bound. Replaced autumnfs's window-16+barrier with a CONTINUOUS pipeline (FuturesUnordered, depth=lanes×12∈[24,96] put_zc in flight, read-ahead, no barrier). Single striped file 330→**425 MB/s (+29%)**, now at the cluster aggregate.
   - **C (rig)** — 8-shard ENs gave the SAME numbers as 1-shard → the ~450 aggregate wall is NOT EN-CPU; it's RF3 all-replica-fsync durability + loopback (single-box artifact; --ps-inflight-cap 8→32 made it WORSE, default is tuned). CLEAN 3-disk/8-shard/4-PS: non-striped single-partition 300 → striped×4+pipeline **415 MB/s (+38%)**.
 - **线上 VKE 实测（2026-07-20，fe68798 = put_many 并发 + TCP-window 修复 + 8 lane 条带）**：
-  **PUT 30–40 → 96–99 → 105 MiB/s**（19 GB 全量 536 s → 188 s，~2.8×）；此时已**打到来源盘天花板**
-  ——同 pod 直读 EBS PVC = 111 MiB/s，autumn 不再是瓶颈。
+  **PUT 30–40 → 96–99 → 105 MiB/s**（19 GB 全量 536 s → 188 s，~2.8×）。
+  **来源盘瓶颈已用 tmpfs 对照实锤**（同 pod、同 3.9 GB shard、同 build）：
+  EBS→tmpfs 冷读 **111 MiB/s**；**从 tmpfs PUT = 499 MiB/s**；从 EBS PUT（刚 stage 完、页缓存已热）
+  = 213 MiB/s。即：**autumn 写路径（条带 ×8 + RF3 全副本 ACK）本身能到 ~500 MiB/s**，
+  之前所有上传数字量的都是 **model-scratch-32b 这块 ebs-ssd 暂存盘**，不是 autumn。
+  ⚠ 注意区分两块盘：EN 数据盘是 `autumn-en-local`（本地 NVMe `/dev/nvme0n1` 3.5 T，写入目的地）；
+  `model-scratch-32b` 是 `ebs-ssd`（HF 下载缓存，autumnfs 的**读取来源**）。
+  **运维结论**：灌模型想跑满，来源要放内存/本地 NVMe，别用 EBS 暂存盘。
   **但 GET 从 276 → ~175 MiB/s**（原 shard 178、新写 striped 文件 170，两次一致）。
   ⚠ **非干净 A/B**（276 测于 772372a：未条带 + 按 ino presplit 的 6 分区；175 测于 fe68798：
   条带 ×8 lane），**假设**=条带把连续 extent 打散到不同 lane 分区，`get_many_into` 的 8-extent
