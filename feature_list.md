@@ -199,4 +199,13 @@
   - **B (fuse)** — fuse READS + DELETES striped files (read::prepare + scan_extents + delete_all_extents stripe-aware); fuse WRITE/TRUNCATE of a striped inode is refused fail-loud (coco P1: else it'd emit legacy-layout extents → corrupt). fuse WRITE-striping (B2) deferred (streaming size unknown). fuse-mount e2e deferred (no kernel mount in sandbox).
   - **A (continuous pipeline)** — profiling the striped write showed NOTHING saturated (disks <12% util doing only fsync ops, ENs ~80% of one core, client ~30%) → it was pipeline-depth/durability-latency bound. Replaced autumnfs's window-16+barrier with a CONTINUOUS pipeline (FuturesUnordered, depth=lanes×12∈[24,96] put_zc in flight, read-ahead, no barrier). Single striped file 330→**425 MB/s (+29%)**, now at the cluster aggregate.
   - **C (rig)** — 8-shard ENs gave the SAME numbers as 1-shard → the ~450 aggregate wall is NOT EN-CPU; it's RF3 all-replica-fsync durability + loopback (single-box artifact; --ps-inflight-cap 8→32 made it WORSE, default is tuned). CLEAN 3-disk/8-shard/4-PS: non-striped single-partition 300 → striped×4+pipeline **415 MB/s (+38%)**.
+- **线上 VKE 实测（2026-07-20，fe68798 = put_many 并发 + TCP-window 修复 + 8 lane 条带）**：
+  **PUT 30–40 → 96–99 → 105 MiB/s**（19 GB 全量 536 s → 188 s，~2.8×）；此时已**打到来源盘天花板**
+  ——同 pod 直读 EBS PVC = 111 MiB/s，autumn 不再是瓶颈。
+  **但 GET 从 276 → ~175 MiB/s**（原 shard 178、新写 striped 文件 170，两次一致）。
+  ⚠ **非干净 A/B**（276 测于 772372a：未条带 + 按 ino presplit 的 6 分区；175 测于 fe68798：
+  条带 ×8 lane），**假设**=条带把连续 extent 打散到不同 lane 分区，`get_many_into` 的 8-extent
+  读窗口原本一次批到同一分区，现在变成跨 8 个分区 → 批量退化成多次 per-partition RPC。
+  若成立，则条带是"写并行换读批量"的取舍，需要读侧按 lane 分组并发（每 lane 一个批）来补回。
+  **TODO：确认该假设并修读侧分组**（同一 build 下对比 striped vs 非 striped 同尺寸文件）。
 - **Status**: `passes: true` for the autumnfs path (write/read/rm striped, byte-exact, breaks single partition, continuous-pipeline'd). DEFERRED: fuse WRITE-striping (B2); breaking the ~450 single-box cluster wall (needs a real cross-host cluster — not a code fix); MAX_EXTENT optimum on full-resource hardware (this rig: smaller≈better, don't exceed 8 MiB).
