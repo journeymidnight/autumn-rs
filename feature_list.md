@@ -14,6 +14,19 @@
 
 ## Active
 
+### F-NS-PRINCIPAL-UNIFIED — 删 tenant、统一到 ns-first key + principal-grant（取代 tenant-first）
+- **Trigger** (2026-07-19, 用户: "可信内网不需要像公有云一样分离权限和资源，其实都是统一的资源，只是有不同的权限"): 现行 `F-KEY-NS-TENANT-FIRST`（`{tenant}/{ns}/` + tenant 一等公民 + tenant/principal 两概念）在可信内网是过度设计——公有云式"资源(tenant 拥有)/权限(principal 访问)"分离是为不可信多租户设的。本会话反复暴露 `--tenant`/`--principal` 在同一份凭据上语义来回跳的歧义（`tenant-create --tenant loader` 建的其实是 principal；`let principal = args.tenant.clone()` 之类的怪代码）。用户拍板收敛：**删 tenant 概念 + `{tenant}/` key 段**，统一成"一份 keyspace + principal 前缀授权"。
+- **Scope**: 完整设计 + 影响清单 + reset runbook = `docs/key_namespace_split_design.md` §8。要点：
+  - **key** = `{ns}/[relative]`（无 tenant 段）；**Layer-A 认 key 第 1 段**（现状是 tenant-first 的第 2 段）。
+  - **principal** = 唯一身份：`autumn-op principal-create <name> --grant <prefix>`（可重复；通常授一个 ns 如 `fs/`，细分授子前缀 `fs/models/`）→ 返回长期凭据。隔离 = 授不同子前缀。
+  - **SDK** `NamespaceBinding` `{tenant}/{ns}/`→`{ns}/`（或按 grant 前缀）；`connect`/`connect_with_credential` 删 tenant/principal 参数（principal 身份由凭据携带；scope 从凭据单条 grant 推导或 `--namespace` 显式）。
+  - **CLI** 删 `--tenant`/`--principal`（autumn-client/autumnfs/fuse）；`tenant-create`→`principal-create --grant`；数据面只 `--credential-file`（+ 可选 `--namespace`）。
+  - **PyO3 + 部署**：`autumn.Fs`/`Memory` 连接签名去 tenant/principal → **vLLM loader / hermes lockstep 改 + 重打镜像**；cluster.sh/k8s 例子凭据授权改 ns 前缀。
+  - authz KDC 机制不变（token scope 从 `{tenant}/…` 变 `{ns}/…` grant）；D2 注册表 / D3 size / D4 split / D8 presplit 保留（presplit 切点去掉 tenant 段）。
+- **迁移**: **全 reset**（用户确认线上 VKE 可全 reset，无 in-place 迁移）；停机全停全启；换镜像时 loader/hermes 连接参数 lockstep。**翻掉 F-KEY-NS-TENANT-FIRST**（队友刚上线，需协调）。
+- **Acceptance**: `principal-create --grant fs/models/` → loader.cred；`autumnfs --credential-file loader.cred put …` 落 `fs/models/…`（无 tenant 段）；未授前缀写被拒；authz-off 时 `--namespace fs` 直接读写；`namespace-list` 列 ns；旧 `--tenant`/`--principal` 不再存在；全 reset 后端到端跑通（含 vLLM 载权重 / kvcache / mem）。
+- **Status**: `passes: false` (2026-07-19, 设计定稿 = §8，待实现) — 需与 tenant-first 作者 + VKE 线上协调后作为一个专项 reviewed 改动 + reset 落地。cross-ref `F-KEY-NS-TENANT-FIRST`（被取代）、`F-ADMIN-OP-AUTH`（控制面 admin token，正交）、`docs/data_plane_authz_design.md`（KDC，机制不变）。
+
 ### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
 - **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
 - **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。

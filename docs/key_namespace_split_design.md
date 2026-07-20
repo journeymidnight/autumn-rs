@@ -3,6 +3,18 @@
 Status: PROPOSAL（未实现；本文档只做设计与论证）
 Date: 2026-07-16
 
+> **⚑ OPTION 3 / INTRANET-UNIFIED (2026-07-19, 取代下方所有 tenant / tenant-first 结论) → 见 §8。**
+> 用户拍板：可信内网**不需要**公有云式「资源(tenant 拥有) / 权限(principal 访问)」分离
+> （那是为不可信多租户设计的）——内网里就是**一份统一 keyspace**，只是不同 principal 有
+> 不同权限。于是**彻底删掉 tenant 概念 + `{tenant}/` 段**：key = `{ns}/[relative]`（namespace
+> 打头，无 tenant 段）；身份只剩 **principal**，`autumn-op principal-create <name> --grant <prefix>`
+> （通常授一个 ns，如 `fs/`；细分授子前缀 `fs/models/`）；Layer-A 认 key **第 1 段**（ns）；
+> 隔离 = 授不同子前缀，不再靠强制归属段。数据面连接只出示凭据（principal 身份），不再有
+> `--tenant` / `--principal` 两个词的歧义。**这会翻掉 `F-KEY-NS-TENANT-FIRST`**（队友刚上线）；
+> 线上 VKE **全 reset**（用户确认可接受，无需 in-place 迁移）。完整设计 + 影响 + reset runbook
+> 见 **§8**；实现见 feature_list `F-NS-PRINCIPAL-UNIFIED`。以下 tenant / tenant-first /
+> `{ns}/{tenant}/` / `{tenant}/{ns}/` 内容全部**保留作历史与论证**，不再是现行方向。
+>
 > **TENANT-FIRST (2026-07-19)：key 顺序已翻转为 `{tenant}/{namespace}/`（tenant 在最外层）。**
 > 本文档通篇写 `{namespace}/{tenant}/`（如 `fs/{tenant}/`、`mem/{tenant}/`），那是旧顺序；
 > 用户 2026-07-19 拍板：tenant 是强制的最外层隔离单位，应是最外层前缀 → 现况 wire key =
@@ -1176,3 +1188,110 @@ bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注�
   builder 加 tenant 层（小改）"（见 7.2 细化 1）。
 - **F186 chunk key 的 namespace 归属**是 §3.7 未覆盖的新决策点，已在 7.2 细化 2 定稿
   （前缀提到 chunk 外层，落进 tenant 区间）。
+
+---
+
+## 8. Option 3 —— intranet-unified：ns-first key + principal-grant（取代 tenant-first，2026-07-19）
+
+> 本节是**现行方向**，取代 §1–§7 里所有 tenant / tenant-first / `{tenant}/{ns}/`
+> 结论。实现 = feature_list `F-NS-PRINCIPAL-UNIFIED`。
+
+### 8.1 为什么：可信内网 ≠ 公有云
+
+公有云把 **资源（谁拥有 = tenant）** 和 **权限（谁能访问 = principal/role）** 分离，
+是为了**不可信多租户**：租户之间必须硬隔离，资源归属是一等公民。
+
+autumn-rs 的部署前提是**可信内网**（sglang/vLLM 推理集群，RoCE 内网；见
+`admin_auth_design.md` 威胁模型）。这里**没有互不信任的租户**——就是**一份统一
+资源**，只是**不同组件有不同访问权限**（loader 只碰模型目录、agent 只碰自己的记忆…）。
+因此不需要"资源归属"这层：**去掉 tenant，只留"权限"（principal + prefix grant）**。
+
+概念数 3（tenant / namespace / principal）→ 2（namespace 组织 + principal 权限），
+且 `--tenant` / `--principal` 两个词在同一份凭据上来回跳的歧义（见本会话讨论）消失。
+
+### 8.2 模型
+
+- **统一 keyspace，按 namespace 组织**：wire key = `{ns}/[relative]`
+  （`fs/[0x01]…`、`mem/…`、`kvc/…`、`gallery/…`）。**无 tenant 段。**
+- **namespace** = 资源类别（D2 注册表照旧；bootstrap 预注册 `fs`/`kvc`/`mem`；
+  app 用 `namespace-create` 加自己的，如 `gallery`）。Layer-A 认 key **第 1 段**。
+- **principal** = 唯一身份：`autumn-op principal-create <name> --grant <prefix> [--grant …]`
+  → manager 存 `{name, credential_hash, allowed_prefixes}`，返回长期凭据（≈ refresh
+  token，交给该组件）。grant **通常就是一个 ns**（`fs/`），要细分就授子前缀
+  （`fs/models/`、`mem/agent7/`）。
+- **隔离** = 授不同子前缀；多个组件共享一个 ns 就各授 `fs/a/`、`fs/b/`，各写各的段。
+  "tenant" 退化成 **ns 内的一段前缀约定**（app 自己写在 grant 的前缀下），不是强制 key 段。
+- **authz 开/关**（正交，note "tenant 一直在" 的现实版）：
+  - **开**（manager 配 signing key）：principal 出示凭据（SDK 自动 mint 短 TTL token），
+    PS 本地验签 + 按 token 的 `allowed_prefixes` 前缀 gate（KDC 模型不变，见
+    `data_plane_authz_design.md`）。
+  - **关**：key 结构不变（还是 `{ns}/…`），只是 Layer-B 不 gate；Layer-A（写必须落在
+    已注册 ns 下）仍在。
+
+### 8.3 CLI（数据面不再有 tenant/principal 歧义）
+
+```bash
+# 建身份 + 授权（唯一的"一处定义"）：
+autumn-op principal-create loader --grant fs/models/     # → loader.cred
+autumn-op principal-create agent  --grant mem/           # → agent.cred
+
+# 用：只出示凭据（= principal 身份），scope 从 grant 推导：
+autumnfs        --credential-file loader.cred put model.safetensors /...   # 落 fs/models/…
+codebase-memory --credential-file agent.cred                              # 落 mem/…
+
+# 只读列举（层级）：
+autumn-op namespace-list                    # 集群有哪些 ns（第 1 段）
+$AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=authz 关时；开时要 grant 覆盖 fs/）
+```
+
+- **删 `--tenant`、`--principal` 两个 flag**。数据面 scope 来自：① 凭据的单条 grant
+  自动推导；② 或显式 `--namespace <ns>`（authz 关、或凭据授多前缀需选一条时）。
+- `principal-create` 取代 `tenant-create`；`--grant`（可重复）取代 `--prefix`。
+- authz-off 集群：不给 `--credential-file`，`--namespace fs` 直接读写（Layer-A 仍要求
+  key 落在已注册 ns 下）。
+
+### 8.4 相对 tenant-first 的具体改动
+
+| 层 | tenant-first（现状，要翻掉） | Option 3（目标） |
+|---|---|---|
+| wire key | `{tenant}/{ns}/[rel]` | `{ns}/[rel]` |
+| Layer-A 校验 | key 第 2 段 = ns ∈ 注册表 | key **第 1 段** = ns ∈ 注册表 |
+| SDK binding | `scoped(ns, tenant)` → 前缀 `{tenant}/{ns}/` | `scoped(ns)` / `scoped_prefix(grant)` → 前缀 `{ns}/`（或子前缀） |
+| SDK connect | `connect(mgr, ns, tenant)` / `connect_with_credential(…, principal, cred)` | `connect(mgr, ns)` / `connect_with_credential(mgr, prefix, cred)`（无 tenant/principal 段；principal 身份由凭据本身携带） |
+| 建账户 | `tenant-create --tenant X --prefix P` | `principal-create <name> --grant P`（可多条） |
+| 凭据授权 | `{tenant}/` 或 `{tenant}/{ns}/` | 任意 ns / 子前缀（`fs/`、`fs/models/`） |
+| CLI flag | `--tenant`、`--principal`、`--namespace` | 删前两个；`--namespace` 可选（能从 grant 推导则免） |
+| authz Layer-B | 「开了就全保护」 | 不变（开→按 grant 前缀 gate；关→不 gate） |
+
+### 8.5 影响清单（实现时逐一）
+
+- **manager**：Layer-A 段解析改「第 1 段」；`namespace-create`/注册表不变；
+  `tenant-create`→`principal-create`（账户库 `tenantAccount/`→`principalAccount/`，
+  或保留 key 名只改 CLI/语义）；`MintTokenReq`/`GetAuthzConfigResp` 字段名可留（内部）。
+- **SDK（client）**：`NamespaceBinding` 从 `{tenant}/{ns}/` 改 `{ns}/`（或按 grant 前缀）；
+  `connect` / `connect_with_credential` 删 tenant/principal 参数；`range` 钳制按新前缀；
+  内置 key builder（fuse/memory/kvc）相对 key 不变（前缀由 binding 拼）。
+- **CLI**：autumn-op（`principal-create --grant`、删 tenant-create/--tenant/--principal）；
+  autumn-client / autumnfs / fuse（删 `--tenant`/`--principal`，`--namespace` 可选 + 凭据推导）；
+  gallery / codebase-memory example 同步。
+- **PyO3**（`python/src/fs.rs`、`lib.rs`）：连接签名删 tenant/principal；Python `autumn.Fs.connect`
+  / `Memory` kwargs 同步 —— **vLLM loader / hermes 要 lockstep 改 + 重打镜像**。
+- **deploy**：cluster.sh（`AUTUMN_AUTH` 里 `tenant-create`→`principal-create --grant`；
+  例子凭据 `codebase/mem/`→`mem/`、`gallery/gallery/`→`gallery/`）；k8s / entrypoint 同理。
+- **docs**：本文 §8 为准；`data_plane_authz_design.md`（principal+grant 术语）；ops.md。
+
+### 8.6 迁移 = 全 reset（用户 2026-07-19 确认线上可全 reset）
+
+- **on-disk key schema 变了**（`{tenant}/{ns}/`→`{ns}/`）+ etcd 账户库语义变了 →
+  **不做 in-place 迁移，直接 `cluster.sh reset`**（重灌权重/KV cache/记忆）。
+- 停机全停全启（仓库惯例）；rkyv fail-loud + R1 cluster_version 阻旧二进制误当选 leader。
+- **跨组件协调**：翻 tenant-first 会动到队友刚上线的东西 + VKE 上的 vLLM/hermes/loader
+  —— 换镜像时 loader/hermes 的连接参数（去 tenant/principal）要 lockstep，否则连不上。
+
+### 8.7 保留的东西（不受影响）
+
+- KDC 非对称 authz（manager 私钥签、PS 公钥离线验、短 TTL token 自动续、禁 kid 撤销）——
+  只是 token 的 scope 从 `{tenant}/…` 变成 `{ns}/…` grant，机制不变。
+- namespace 注册表（D2）、按 namespace 的 presplit 规则（D8，切点前缀去掉 tenant 段即可）、
+  policy 的 size 口径（D3）、split/merge 机制（D4）。
+- `admin_auth_design.md` 的控制面 admin-token（F-ADMIN-OP-AUTH，仍待实现）与本节正交。
