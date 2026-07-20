@@ -407,3 +407,37 @@ def test_credential_pair_rejects_three_bare_lines(tmp_path):
     raw = bytes(range(32)).hex()
     with pytest.raises(ValueError):
         read_credential_pair(_write(tmp_path, f"{raw}\n{raw}\n{raw}"))
+
+
+# ── parser parity with Rust `parse_credential_text` (coco P3) ───────────────
+# `bytes.fromhex` is laxer than `u8::from_str_radix`; these pin the gap shut so
+# the two readers accept exactly the same set of files.
+
+def test_credential_pair_rejects_empty_secret(tmp_path):
+    """A truncated / empty-rendered Secret must fail HERE as a format error, not
+    later as a generic PermissionDenied with a zero-length credential."""
+    import pytest
+    with pytest.raises(ValueError):
+        read_credential_pair(_write(tmp_path, "principal: loader\ncredential:\n"))
+
+
+def test_credential_pair_rejects_embedded_whitespace(tmp_path):
+    """`bytes.fromhex` silently skips inner spaces; Rust rejects them."""
+    import pytest
+    spaced = " ".join(bytes(range(32)).hex()[i:i + 2] for i in range(0, 64, 2))
+    with pytest.raises(ValueError):
+        read_credential_pair(_write(tmp_path, f"credential: {spaced}\n"))
+
+
+def test_credential_pair_rejects_odd_length(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        read_credential_pair(_write(tmp_path, "abc"))
+
+
+def test_credential_pair_tolerates_non_ascii_comment(tmp_path):
+    """Rust ASCII-checks only the HEX, so a non-ASCII line elsewhere is fine —
+    an `encoding="ascii"` open() would have raised UnicodeDecodeError."""
+    raw = bytes(range(32))
+    text = f"# 凭据文件\nprincipal: fs\ncredential: {raw.hex()}\n"
+    assert read_credential_pair(_write(tmp_path, text)) == ("fs", raw)

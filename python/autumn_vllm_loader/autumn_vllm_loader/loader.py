@@ -72,7 +72,10 @@ def _read_credential_pair(path: str) -> tuple[str, bytes]:
     `autumn_client::parse_credential_text`; duplicated (~20 lines) rather than
     imported so this loader keeps no dependency on the kvcache package.
     """
-    with open(path, "r", encoding="ascii") as f:
+    # utf-8, NOT ascii — see the note in `autumn_kvcache._identity`: Rust reads
+    # any valid UTF-8 and only ASCII-checks the hex, so an ascii open() would
+    # reject files Rust accepts.
+    with open(path, "r", encoding="utf-8") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
 
     def _labeled(key):
@@ -93,6 +96,14 @@ def _read_credential_pair(path: str) -> tuple[str, bytes]:
             f"credential file {path!r}: expected '<name>\\n<hex>', a "
             f"'principal:'/'credential:' pair, or a single hex line, got "
             f"{len(lines)} non-empty lines"
+        )
+    # Mirror Rust's guard EXACTLY — `bytes.fromhex` accepts an empty string and
+    # skips embedded whitespace, both of which Rust rejects. See the twin note in
+    # `autumn_kvcache._identity.read_credential_pair`.
+    if not hexs or not hexs.isascii() or len(hexs) % 2 != 0 or any(c.isspace() for c in hexs):
+        raise ValueError(
+            f"credential file {path!r}: not valid hex (empty, odd length, "
+            f"non-ASCII, or contains whitespace)"
         )
     try:
         return name, bytes.fromhex(hexs)
@@ -153,6 +164,25 @@ class AutumnModelLoader(BaseModelLoader):
         # overrides it. Both-or-neither is enforced by `Fs.connect`, so a
         # credential with no derivable name must fail HERE with a config-shaped
         # error rather than there with a generic one.
+        # A stale `tenant` key is a HARD error, deliberately NOT the
+        # accept-with-warning alias the kvcache connector gives `auth_tenant`.
+        # The two are not the same situation: kvcache's `auth_tenant` only ever
+        # named an authz identity, so renaming it to `auth_principal` preserves
+        # its full meaning. The loader's `tenant` meant TWO things — the authz
+        # principal AND the `fs/{tenant}/` key segment that weights lived under.
+        # Option 3 deleted the segment, so silently mapping it to `principal`
+        # would keep half the meaning and quietly change WHERE weights are read
+        # from: the config would "work" and load nothing (or the wrong model).
+        # Fail loudly with the migration instruction instead.
+        if "tenant" in cfg:
+            raise ValueError(
+                "model_loader_extra_config: `tenant` is retired "
+                "(F-NS-PRINCIPAL-UNIFIED) — weights now live in one global `fs/` "
+                "tree with no tenant segment. Remove the key; the authz identity "
+                "comes from `credential_file` (which names its principal). NOTE "
+                "the key layout changed, so weights uploaded under the old "
+                "`fs/{tenant}/` scheme must be re-uploaded."
+            )
         cred_file = cfg.get("credential_file")
         self.credential = None
         self.principal = None

@@ -281,7 +281,11 @@ def read_credential_pair(path: str) -> tuple[str, bytes]:
     protected-prefix op would die with PermissionDenied once enforcement is on
     (coco P1 2026-07-17). Fail loudly here, at startup, instead.
     """
-    with open(path, "r", encoding="ascii") as f:
+    # utf-8, NOT ascii: Rust's `read_to_string` accepts any valid UTF-8 and only
+    # ASCII-checks the hex itself, so an ascii open() here would reject (with a
+    # UnicodeDecodeError, not even a ValueError) a file Rust reads fine — e.g.
+    # one carrying a non-ASCII comment line above the credential.
+    with open(path, "r", encoding="utf-8") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
 
     def _labeled(key: str) -> str | None:
@@ -302,6 +306,17 @@ def read_credential_pair(path: str) -> tuple[str, bytes]:
             f"credential file {path!r}: expected '<name>\\n<hex>', a "
             f"'principal:'/'credential:' pair, or a single hex line, got "
             f"{len(lines)} non-empty lines"
+        )
+    # Mirror Rust's guard EXACTLY (crates/client/src/lib.rs) — `bytes.fromhex`
+    # is laxer than `u8::from_str_radix`: it accepts an EMPTY string (a truncated
+    # / empty-rendered Secret would sail through as a zero-length credential and
+    # resurface later as a generic PermissionDenied) and it SKIPS embedded ASCII
+    # whitespace (`"ab cd"`), which Rust rejects. Check before decoding so both
+    # readers accept exactly the same files.
+    if not hexs or not hexs.isascii() or len(hexs) % 2 != 0 or any(c.isspace() for c in hexs):
+        raise ValueError(
+            f"credential file {path!r}: not valid hex (empty, odd length, "
+            f"non-ASCII, or contains whitespace)"
         )
     try:
         return name, bytes.fromhex(hexs)
