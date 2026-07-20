@@ -33,24 +33,14 @@ struct Args {
     #[arg(long)]
     mountpoint: PathBuf,
 
-    /// F-KEY-NS: tenant this mount's data lives under. Every KV key is scoped to
-    /// `fs/{tenant}/`, so two tenants never share inodes/dirents/extents. Must
-    /// match `[a-z0-9._-]+`.
-    #[arg(long, default_value = "default")]
-    tenant: String,
-
-    /// F-AUTHZ-BUILTIN: path to a file holding this mount's authz credential (a
-    /// minted token from `autumn-op tenant-create`). REQUIRED when the cluster
-    /// protects the `fs/` namespace; omit on an authz-off cluster. The mount
-    /// connects via `connect_with_credential` and FAILS FAST if the credential
-    /// doesn't cover `fs/{tenant}/`.
+    /// F-AUTHZ-BUILTIN: path to a file holding this mount's authz credential
+    /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
+    /// cluster protects the `fs/` namespace; omit on an authz-off cluster. The
+    /// mount connects via `connect_with_credential` (principal read from the file)
+    /// and FAILS FAST if the credential doesn't cover `fs/`. (F-NS-PRINCIPAL-UNIFIED:
+    /// the tenant segment is gone — a mount covers the WHOLE `fs/` namespace.)
     #[arg(long)]
     credential_file: Option<PathBuf>,
-
-    /// F-AUTHZ-BUILTIN: authz principal presented alongside `--credential-file`.
-    /// Defaults to the tenant name (the 1:1 principal↔tenant convention).
-    #[arg(long)]
-    principal: Option<String>,
 
     /// Allow other users to access the mount
     #[arg(long, default_value = "false")]
@@ -91,17 +81,27 @@ fn main() -> Result<()> {
 
     let mountpoint = args.mountpoint.clone();
 
-    // F-AUTHZ-BUILTIN: read the authz credential up front (fail-loud on a bad
-    // path) so the compio thread just carries the bytes. `principal` defaults to
-    // the tenant (1:1 principal↔tenant).
-    let credential: Option<Vec<u8>> = match &args.credential_file {
-        Some(path) => Some(autumn_client::read_credential_file(path).unwrap_or_else(|e| {
-            eprintln!("{e:#}");
-            std::process::exit(2);
-        })),
+    // F-NS-PRINCIPAL-UNIFIED: read the authz credential up front (fail-loud on a
+    // bad path) so the compio thread just carries (principal, bytes). The
+    // principal identity travels IN the file (§8.5).
+    let credential: Option<(String, Vec<u8>)> = match &args.credential_file {
+        Some(path) => {
+            let (principal, secret) =
+                autumn_client::read_credential_file(path).unwrap_or_else(|e| {
+                    eprintln!("{e:#}");
+                    std::process::exit(2);
+                });
+            if principal.is_empty() {
+                eprintln!(
+                    "--credential-file {}: missing principal name (expected '<principal>\\n<hex>')",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+            Some((principal, secret))
+        }
         None => None,
     };
-    let principal = args.principal.clone().unwrap_or_else(|| args.tenant.clone());
 
     tracing::info!(
         manager = %args.manager,
@@ -159,16 +159,15 @@ fn main() -> Result<()> {
                 // credential when `--credential-file` was given (F-AUTHZ-BUILTIN).
                 let connect = async {
                     match credential {
-                        Some(cred) => {
+                        Some((principal, secret)) => {
                             FsState::new_with_credential(
                                 &manager_addr,
-                                &args.tenant,
                                 &principal,
-                                cred,
+                                secret,
                             )
                             .await
                         }
-                        None => FsState::new(&manager_addr, &args.tenant).await,
+                        None => FsState::new(&manager_addr).await,
                     }
                 };
                 let mut state = match connect.await {

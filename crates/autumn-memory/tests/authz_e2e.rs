@@ -53,21 +53,21 @@ fn cross_tenant_isolation() {
             // an Assert(mem/acme) binding would clamp it client-side and never
             // reach the PS. The PS is the authority under test here.
             let acme = ClusterClient::connect_raw(&mgr).await.expect("connect acme");
-            acme.set_tenant_credential("acme", acme_cred);
+            acme.set_principal_credential("acme", acme_cred);
 
             // own prefix: write + read back
-            acme.put(b"acme/mem/authz-e2e/k1", b"v1")
+            acme.put(b"mem/acme/authz-e2e/k1", b"v1")
                 .await
                 .expect("acme writes its own prefix");
             assert_eq!(
-                acme.get(b"acme/mem/authz-e2e/k1").await.expect("acme get"),
+                acme.get(b"mem/acme/authz-e2e/k1").await.expect("acme get"),
                 Some(b"v1".to_vec()),
             );
 
             // cross-tenant prefix: DENIED (read + write)
-            let err = acme.get(b"other/mem/authz-e2e/k1").await.unwrap_err();
+            let err = acme.get(b"mem/other/authz-e2e/k1").await.unwrap_err();
             assert!(is_denied(&err), "cross-tenant GET must be denied, got {err:?}");
-            let err = acme.put(b"other/mem/authz-e2e/k1", b"x").await.unwrap_err();
+            let err = acme.put(b"mem/other/authz-e2e/k1", b"x").await.unwrap_err();
             assert!(is_denied(&err), "cross-tenant PUT must be denied, got {err:?}");
 
             // PROTECT-EVERYTHING: a DIFFERENT tenant's prefix (even a "scratch"
@@ -78,22 +78,22 @@ fn cross_tenant_isolation() {
 
             // ── tenant "other" (granted other/mem/) ───────────────────────
             let other = ClusterClient::connect_raw(&mgr).await.expect("connect other");
-            other.set_tenant_credential("other", other_cred);
+            other.set_principal_credential("other", other_cred);
             other
-                .put(b"other/mem/authz-e2e/k1", b"w1")
+                .put(b"mem/other/authz-e2e/k1", b"w1")
                 .await
                 .expect("other writes its own prefix");
-            let err = other.get(b"acme/mem/authz-e2e/k1").await.unwrap_err();
+            let err = other.get(b"mem/acme/authz-e2e/k1").await.unwrap_err();
             assert!(is_denied(&err), "other reading acme must be denied, got {err:?}");
             // acme's key is intact + isolated (other couldn't touch it)
             assert_eq!(
-                acme.get(b"acme/mem/authz-e2e/k1").await.expect("acme get 2"),
+                acme.get(b"mem/acme/authz-e2e/k1").await.expect("acme get 2"),
                 Some(b"v1".to_vec()),
             );
 
             // ── anonymous client (no credential) → denied on protected ────
             let anon = ClusterClient::connect_raw(&mgr).await.expect("connect anon");
-            let err = anon.get(b"acme/mem/authz-e2e/k1").await.unwrap_err();
+            let err = anon.get(b"mem/acme/authz-e2e/k1").await.unwrap_err();
             assert!(
                 is_denied(&err),
                 "anonymous GET on protected prefix must be denied, got {err:?}"
@@ -104,6 +104,7 @@ fn cross_tenant_isolation() {
                 &mgr,
                 "acme",
                 "authz-e2e-agent",
+                "acme", // principal (credential owner)
                 hex_decode(&env("AUTUMN_AUTHZ_E2E_ACME_CRED")),
             )
             .await

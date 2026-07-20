@@ -8,32 +8,38 @@ Client SDK library for interacting with an autumn-rs cluster. Provides high-leve
 
 ### ClusterClient
 
-Main entry point. Connect via `ClusterClient::connect("addr1,addr2", ns, tenant)`.
+Main entry point. Connect via `ClusterClient::connect("addr1,addr2", scope)`.
 
-### F-KEY-NS D7 — namespace binding (SD-2)
+### F-NS-PRINCIPAL-UNIFIED — namespace binding (Option 3, §8)
 
 Every `ClusterClient` carries a `NamespaceBinding` that maps user keys onto wire
-keys BEFORE routing, so a client can only touch its own `{ns}/{tenant}/`
-keyspace:
-- **`connect(mgr, ns, tenant)`** — the entry point EVERY data-plane writer must
-  use. **Prepend-only**: a scoped client ALWAYS prepends `{ns}/{tenant}/` to the
-  user key and strips it back off returned range keys, so a scoped client
-  **cannot** touch anything outside its own keyspace — scope is locked by
-  construction, not merely checked (there is no Assert/validate mode). The
-  built-in key builders (`fuse/key.rs`, `memory/keys.rs`, `kvc/_keys.py`) emit
-  keys RELATIVE to `{ns}/{tenant}/` (the binding owns the prefix) so there is no
-  double-prefix.
+keys BEFORE routing, so a client can only touch its own `{scope}/` keyspace.
+**There is NO tenant segment** — a `scope` is a whole namespace (`fs`, `gallery`)
+or an in-namespace sub-prefix an app owns (`mem/agent7`). (Historical: tenant-first
+`{tenant}/{ns}/` and the earlier `{ns}/{tenant}/` were retired 2026-07-19; wire
+bumped to v26 to fence stale images. See docs/key_namespace_split_design.md §8.)
+- **`connect(mgr, scope)`** — the entry point EVERY data-plane writer must use.
+  **Prepend-only**: a scoped client ALWAYS prepends `{scope}/` to the user key and
+  strips it back off returned range keys, so a scoped client **cannot** touch
+  anything outside its own keyspace — scope is locked by construction, not merely
+  checked (there is no Assert/validate mode). Each `/`-delimited segment of `scope`
+  must match `[a-z0-9._-]+`; the FIRST is the namespace (Layer-A checks it). The
+  built-in key builders (`fuse/key.rs`, `memory/keys.rs`, `kvc/_keys.py`) emit keys
+  RELATIVE to `{scope}/` (the binding owns the prefix) so there is no double-prefix.
 - **`connect_raw(mgr)`** — admin/unscoped (`Raw` binding, no client prefixing).
   For admin/mgr-only tooling (autumn-op, node registration), cross-namespace
-  inspection/migration, tests, and **fuse-before-SD3** (raw `0x01`–`0x04` keys).
-  NOT for data writers. The PS still enforces Layer-A/B, so `raw` only bypasses
-  the CLIENT prefixing.
-- **`connect_with_credential(mgr, ns, tenant, principal, credential)`** — scoped +
-  authz. When authz is on, `validate_credential_scope` verifies at connect that
-  `{ns}/{tenant}/` ⊆ one of the credential's granted `allowed_prefixes` (decodes
-  the minted token's claims client-side, no cap_token change) — **fail-fast** on a
-  mis-scoped credential OR a rejected/invalid credential (only an authz-DISABLED
-  manager is a silent skip). `pub` so the PyO3 connect paths run the SAME check.
+  inspection/migration, tests. NOT for data writers. The PS still enforces
+  Layer-A/B, so `raw` only bypasses the CLIENT prefixing.
+- **`connect_with_credential(mgr, scope, principal, credential)`** — scoped +
+  authz. `principal` is the credential owner (read from the credential file's name
+  line — `read_credential_file` returns `(principal, secret)`); `credential` is the
+  raw secret. When authz is on, `validate_credential_scope` verifies at connect that
+  `{scope}/` ⊆ one of the credential's granted `allowed_prefixes` (decodes the
+  minted token's claims client-side) — **fail-fast** on a mis-scoped credential OR a
+  rejected/invalid credential (only an authz-DISABLED manager is a silent skip).
+  `pub` so the PyO3 connect paths run the SAME check. Account admin: `principal_create`
+  / `principal_delete` (were `tenant_create`/`tenant_delete`); `mint_token(principal,
+  cred)`. `set_principal_credential` sets the identity on an existing client.
 - **Binding placement**: at each op's ENTRY (`put`/`get`/`delete`/`head`/`put_zc`/
   `get_range`/`get_range_into`/`get_direct`, batch ops bind each key,
   `range` binds+clamps+strips). The bound key flows to both routing AND the
@@ -41,12 +47,12 @@ keyspace:
   bound keys) so a key is bound EXACTLY ONCE per wire request. **Stream ops call
   the plain `put`/`get`/`delete`** — an F186 striped chunk key `\xff\xfe…++user_key`
   is just a normal user key to the binding, so a scoped client prepends
-  `{ns}/{tenant}/` and the chunk lands INSIDE the tenant range (Layer-A/authz/
+  `{scope}/` and the chunk lands INSIDE the scope range (Layer-A/authz/
   presplit cover it); no special chunk path needed under Prepend-only.
-- **`range` clamp**: prepend `{ns}/{tenant}/` to the prefix, seed the cursor at
-  the namespace lower bound, cap the scan at `{ns}/{tenant}0` (`0`=0x30, the
+- **`range` clamp**: prepend `{scope}/` to the prefix, seed the cursor at
+  the scope lower bound, cap the scan at `{scope-last-seg}0` (`0`=0x30, the
   successor of `/`), strip the prefix off returned keys.
-- **`raw()` / `rescope(ns, tenant)`** return a `NamespaceScope<'_>` borrow-view
+- **`raw()` / `rescope(scope)`** return a `NamespaceScope<'_>` borrow-view
   (shared pools, no reconnect) exposing the core ops (`put`/`get`/`delete`/`head`/
   `range`) under a different binding. `raw()` = `Raw`; the PS still enforces.
 - **Errors**: `AutumnError::NamespaceUnknown` (from `StatusCode::NamespaceUnknown`

@@ -108,13 +108,13 @@ pub struct FsState {
 }
 
 impl FsState {
-    pub async fn new(manager_addr: &str, tenant: &str) -> Result<Self> {
+    pub async fn new(manager_addr: &str) -> Result<Self> {
         // The fuse binary keeps the env-derived hostname default (the daemon
         // has no CLI flag for it); the PyO3 `autumn.Fs` binding (F-FS-UNIFY
         // M2) passes an explicit host via `new_with_host` so no env read
         // leaks into the library path ([[feedback_no_env_in_rs]]).
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
-        Self::new_with_host(manager_addr, host, tenant).await
+        Self::new_with_host(manager_addr, host).await
     }
 
     /// F-AUTHZ-BUILTIN: `new` with an authz credential — same HOSTNAME-derived
@@ -122,51 +122,46 @@ impl FsState {
     /// [`Self::new_with_host_credential`].
     pub async fn new_with_credential(
         manager_addr: &str,
-        tenant: &str,
         principal: &str,
         credential: Vec<u8>,
     ) -> Result<Self> {
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
-        Self::new_with_host_credential(manager_addr, host, tenant, principal, credential).await
+        Self::new_with_host_credential(manager_addr, host, principal, credential).await
     }
 
     /// Connect with an explicit daemon-identity host (no env read). The
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
     ///
-    /// F-KEY-NS: `tenant` scopes this mount. The client connects
-    /// `scoped(fs, tenant)` — it prepends `fs/{tenant}/` to every key (and strips
-    /// it off returned range keys), validating the ns+tenant charset at connect —
-    /// so every KV key this mount writes/reads lands under `fs/{tenant}/`.
+    /// F-NS-PRINCIPAL-UNIFIED: this mount is scoped to the WHOLE `fs/` namespace
+    /// (Option 3 dropped the tenant segment — fuse is one global tree; multi-tree
+    /// isolation is by distinct namespaces, §8.9). The client `connect(mgr, "fs")`
+    /// prepends `fs/` to every key (and strips it off returned range keys).
     pub async fn new_with_host(
         manager_addr: &str,
         host: String,
-        tenant: &str,
     ) -> Result<Self> {
-        let client = ClusterClient::connect(manager_addr, "fs", tenant)
+        let client = ClusterClient::connect(manager_addr, "fs")
             .await
             .context("connect to manager")?;
         Ok(Self::from_client(client, host))
     }
 
     /// F-AUTHZ-BUILTIN: connect with an authz credential. Used when the deploy
-    /// protects the `fs/` namespace — the client presents `principal` +
-    /// `credential` (a minted token from `autumn-op tenant-create`), and
+    /// protects the `fs/` namespace — the client presents `principal` (credential
+    /// owner from the credential file's name line) + `credential`, and
     /// `connect_with_credential` FAILS FAST at connect if that credential does
-    /// not cover `fs/{tenant}/` (or the manager rejects it). When authz is off
-    /// on the manager the credential is harmlessly ignored (same as a plain
-    /// connect), so passing one is always safe.
+    /// not cover `fs/` (or the manager rejects it). When authz is off on the
+    /// manager the credential is harmlessly ignored, so passing one is safe.
     pub async fn new_with_host_credential(
         manager_addr: &str,
         host: String,
-        tenant: &str,
         principal: &str,
         credential: Vec<u8>,
     ) -> Result<Self> {
         let client = ClusterClient::connect_with_credential(
             manager_addr,
             "fs",
-            tenant,
             principal.to_string(),
             credential,
         )

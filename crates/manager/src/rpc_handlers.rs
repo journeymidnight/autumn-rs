@@ -343,7 +343,7 @@ impl AutumnManager {
         // credential return the SAME opaque error (don't reveal which).
         let allowed_prefixes = {
             let accts = self.tenant_accounts.borrow();
-            match accts.get(&req.tenant) {
+            match accts.get(&req.principal) {
                 Some(acct)
                     if crate::authz::ct_eq_32(
                         &crate::authz::credential_hash(&req.credential),
@@ -6718,7 +6718,7 @@ mod authz_kdc_tests {
 
             // ── (2) mint a token with the credential ───────────────────
             let mint = rkyv_encode(&MintTokenReq {
-                tenant: "acme".to_string(),
+                principal: "acme".to_string(),
                 credential: cred.clone(),
             });
             let mresp: MintTokenResp =
@@ -6729,14 +6729,14 @@ mod authz_kdc_tests {
 
             // wrong credential → refused (same opaque error as unknown tenant)
             let mint_bad = rkyv_encode(&MintTokenReq {
-                tenant: "acme".to_string(),
+                principal: "acme".to_string(),
                 credential: vec![9u8; 32],
             });
             let mr: MintTokenResp =
                 rkyv_decode(&mgr.handle_mint_token(mint_bad).await.unwrap()).unwrap();
             assert_ne!(mr.code, CODE_OK);
             let mint_unknown = rkyv_encode(&MintTokenReq {
-                tenant: "ghost".to_string(),
+                principal: "ghost".to_string(),
                 credential: cred.clone(),
             });
             let mru: MintTokenResp =
@@ -6788,7 +6788,7 @@ mod authz_kdc_tests {
                 rkyv_decode(&mgr.handle_tenant_delete(del).await.unwrap()).unwrap();
             assert_eq!(dresp.code, CODE_OK);
             let mint_after_del = rkyv_encode(&MintTokenReq {
-                tenant: "acme".to_string(),
+                principal: "acme".to_string(),
                 credential: cred,
             });
             let mr2: MintTokenResp =
@@ -6808,7 +6808,7 @@ mod authz_kdc_tests {
             assert!(cfg.public_keys.is_empty());
             // mint refused (no signing key), tenant-create refused (no admin token).
             let mint = rkyv_encode(&MintTokenReq {
-                tenant: "acme".to_string(),
+                principal: "acme".to_string(),
                 credential: vec![1u8; 32],
             });
             let mr: MintTokenResp =

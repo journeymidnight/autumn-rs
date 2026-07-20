@@ -444,18 +444,17 @@ impl Client {
     /// cluster with authz off. Both-or-neither: a lone tenant or lone
     /// credential is a config error and fails loudly here rather than as a
     /// confusing first-write PermissionDenied.
-    // F-KEY-NS D7: `namespace` + `tenant` are the REQUIRED key scope — the client
-    // PREPENDS `{namespace}/{tenant}/` to every key (Prepend-only, scope locked by
-    // construction). `principal` + `credential` are the OPTIONAL authz identity
-    // (细化三 renamed the old `tenant=` authz kwarg to `principal=`; by the 1:1
-    // default the principal name == the key tenant).
+    // F-NS-PRINCIPAL-UNIFIED: `scope` is the REQUIRED key prefix — the client
+    // PREPENDS `{scope}/` to every key (Prepend-only, scope locked by
+    // construction). A scope is a whole namespace (`kvc`) or an in-namespace
+    // sub-prefix (`kvc/model-fp`). `principal` + `credential` are the OPTIONAL
+    // authz identity (principal = credential owner, from the credential file).
     #[staticmethod]
-    #[pyo3(signature = (manager, namespace, tenant, principal=None, credential=None))]
+    #[pyo3(signature = (manager, scope, principal=None, credential=None))]
     fn connect<'py>(
         py: Python<'py>,
         manager: String,
-        namespace: String,
-        tenant: String,
+        scope: String,
         principal: Option<String>,
         credential: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -482,10 +481,10 @@ impl Client {
                     }
                 };
                 rt.block_on(async move {
-                    match ClusterClient::connect(&manager, &namespace, &tenant).await {
+                    match ClusterClient::connect(&manager, &scope).await {
                         Ok(client) => {
                             if let Some((p, c)) = cred_pair {
-                                client.set_tenant_credential(p, c);
+                                client.set_principal_credential(p, c);
                                 // coco P2: run the SAME connect-time scope check as
                                 // Rust's connect_with_credential — fail fast on a
                                 // mis-scoped credential instead of at the first op.
@@ -1004,15 +1003,14 @@ impl BatchClient {
     // F-KEY-NS D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
     // (keyword-only, after the perf knobs); `principal` + `credential` are the
     // OPTIONAL authz identity (细化三 rename from `tenant=`).
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, namespace, tenant, principal=None, credential=None))]
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
     fn new(
         py: Python<'_>,
         manager: String,
         n_workers: usize,
         per_worker_cap: usize,
         direct: bool,
-        namespace: String,
-        tenant: String,
+        scope: String,
         principal: Option<String>,
         credential: Option<Vec<u8>>,
     ) -> PyResult<Self> {
@@ -1037,8 +1035,7 @@ impl BatchClient {
                 let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
                 let endpoint = manager.clone();
                 let worker_cred = cred_pair.clone();
-                let worker_ns = namespace.clone();
-                let worker_tenant = tenant.clone();
+                let worker_scope = scope.clone();
                 std::thread::Builder::new()
                     .name(format!("autumn-batch-{i}"))
                     .spawn(move || {
@@ -1050,10 +1047,10 @@ impl BatchClient {
                             }
                         };
                         rt.block_on(async move {
-                            let client = match ClusterClient::connect(&endpoint, &worker_ns, &worker_tenant).await {
+                            let client = match ClusterClient::connect(&endpoint, &worker_scope).await {
                                 Ok(c) => {
                                     if let Some((p, cred)) = worker_cred {
-                                        c.set_tenant_credential(p, cred);
+                                        c.set_principal_credential(p, cred);
                                         // coco P2: run the SAME connect-time scope
                                         // check as connect_with_credential — fail
                                         // fast on a mis-scoped credential.

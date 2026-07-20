@@ -106,7 +106,7 @@ fn per_ino_writer_close_triggers_invalidator() {
 
         // Reader mount: subscribes via Acquire READ, holds the
         // lease so the writer-close push lands in its inbox.
-        let mut reader = FsState::new(&mgr_addr.to_string(), "default").await.expect("reader");
+        let mut reader = FsState::new(&mgr_addr.to_string()).await.expect("reader");
         let (inv, log) = counting_invalidator();
         dispatch::spawn_lease_background_tasks(&reader, Some(inv));
 
@@ -207,7 +207,7 @@ fn multiple_distinct_inos_each_get_invalidated() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 145, 14501).await;
 
-        let mut reader = FsState::new(&mgr_addr.to_string(), "default").await.expect("reader");
+        let mut reader = FsState::new(&mgr_addr.to_string()).await.expect("reader");
         let (inv, log) = counting_invalidator();
         dispatch::spawn_lease_background_tasks(&reader, Some(inv));
 

@@ -142,7 +142,7 @@ shell against a running cluster, useful for inspection, scripted setup,
 and CI seeding.
 
 ```
-autumnfs [--manager 127.0.0.1:9001] [--tenant default] <SUBCMD>
+autumnfs [--manager 127.0.0.1:9001] [--credential-file FILE] <SUBCMD>
 ```
 
 | Subcommand | Description |
@@ -158,11 +158,12 @@ autumnfs [--manager 127.0.0.1:9001] [--tenant default] <SUBCMD>
 
 **Wire layer**: uses `autumn-client::ClusterClient` directly + `autumn-fuse`'s
 ungated `key` + `schema` modules (the `default-features = false` import skips
-the fuser/libc kernel-side deps). **F-KEY-NS**: connects via
-`ClusterClient::connect(mgr, "fs", tenant)` (`--tenant`, default `default`), so
-the client binding prepends `fs/{tenant}/` to every relative fuse key (and strips
-it off range results) — the SAME keyspace a fuse mount uses, so a write here is
-visible to a mount on the same tenant. Inode numbers come from the MANAGER's
+the fuser/libc kernel-side deps). **F-NS-PRINCIPAL-UNIFIED**: connects via
+`ClusterClient::connect(mgr, "fs")` (no `--tenant` — Option 3 dropped it), so the
+client binding prepends `fs/` to every relative fuse key (and strips it off range
+results) — the SAME (single, global) keyspace a fuse mount uses, so a write here is
+visible to a mount. Authz: `--credential-file` (principal in the file). Inode
+numbers come from the MANAGER's
 global counter (`alloc_inodes(1, 0, b"")`) — the same crash-safe source the fuse
 mount + PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding
 inodes. The schema-version stamp is

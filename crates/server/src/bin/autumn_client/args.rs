@@ -122,18 +122,17 @@ pub(crate) struct Args {
     /// in-flight and benefit from a higher cap; constrained hosts can
     /// shrink to fit. Clamped to [16 MiB, 64 GiB].
     pub(crate) ucx_regpool_cap_bytes: Option<usize>,
-    /// F-KEY-NS D7: the namespace + tenant every data-plane KV command
-    /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within. REQUIRED
-    /// for those commands (a write must declare its namespace); perf-check/ycsb
-    /// bind the `bench` namespace internally and don't need these.
+    /// F-NS-PRINCIPAL-UNIFIED: the key-prefix SCOPE every data-plane KV command
+    /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within — a whole
+    /// namespace (`fs`, `gallery`) or an in-namespace sub-prefix (`mem/agent7`).
+    /// REQUIRED for those commands (a write must declare its scope); perf-check/
+    /// ycsb bind the `bench/perf` scope internally and don't need it.
     pub(crate) namespace: Option<String>,
-    pub(crate) tenant: Option<String>,
-    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential (a
-    /// minted token from `autumn-op tenant-create`). REQUIRED for KV commands
-    /// when the target namespace is protected; omit on an authz-off cluster.
+    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential
+    /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED for KV
+    /// commands when the target namespace is protected; omit on an authz-off
+    /// cluster. The principal identity is read from the file.
     pub(crate) credential_file: Option<String>,
-    /// F-AUTHZ-BUILTIN: authz principal for `--credential-file` (default = tenant).
-    pub(crate) principal: Option<String>,
 }
 
 fn usage() -> ! {
@@ -180,9 +179,7 @@ pub(crate) fn parse_args() -> Args {
     let mut transport = autumn_transport::TransportKind::Tcp;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut namespace: Option<String> = None;
-    let mut tenant: Option<String> = None;
     let mut credential_file: Option<String> = None;
-    let mut principal: Option<String> = None;
     let mut i = 1;
 
     while i < raw.len() {
@@ -192,25 +189,15 @@ pub(crate) fn parse_args() -> Args {
                 manager = val(&raw, i).to_owned();
                 i += 1;
             }
-            // F-KEY-NS D7: the namespace scope for data-plane KV commands.
-            "--namespace" => {
+            // F-NS-PRINCIPAL-UNIFIED: the key-prefix scope for data-plane KV cmds.
+            "--namespace" | "--scope" => {
                 i += 1;
                 namespace = Some(val(&raw, i).to_owned());
-                i += 1;
-            }
-            "--tenant" => {
-                i += 1;
-                tenant = Some(val(&raw, i).to_owned());
                 i += 1;
             }
             "--credential-file" => {
                 i += 1;
                 credential_file = Some(val(&raw, i).to_owned());
-                i += 1;
-            }
-            "--principal" => {
-                i += 1;
-                principal = Some(val(&raw, i).to_owned());
                 i += 1;
             }
             "--transport" => {
@@ -641,9 +628,7 @@ pub(crate) fn parse_args() -> Args {
         transport,
         ucx_regpool_cap_bytes,
         namespace,
-        tenant,
         credential_file,
-        principal,
     }
 }
 

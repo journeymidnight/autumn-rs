@@ -142,17 +142,16 @@ If a previous daemon died it can leave a stale mount (`ls` reports "Transport
 endpoint is not connected"); clear it before re-mounting with
 `fusermount3 -u "$MP"` (or `umount -l "$MP"`).
 
-**F-KEY-NS — the mount is scoped to `fs/{tenant}/`.** `autumn-fuse` takes
-`--tenant` (default `default`), so every inode/dirent/extent key lands under
-`fs/{tenant}/`. A `--tenant default` mount, the PyO3
-`autumn.Fs.connect(tenant="default")` client, and `autumnfs --tenant default`
-**all see the SAME filesystem**; point mounts at DIFFERENT `--tenant` to get
-isolated filesystems in one cluster. Inode numbers are cluster-unique (a single
-global counter), so the model-weight re-ingest via `autumnfs put` and a later
-fuse mount serving those files never collide; a `schema_version` stamp per tenant
-makes a future incompatible layout fail loud rather than mount empty. (The
-short-lived SD-3 `{volume}` sub-namespace layer was removed 2026-07-19 — one
-tenant level is enough; this is a stop-world data-reset change, no wire bump.)
+**F-NS-PRINCIPAL-UNIFIED — the mount is scoped to the WHOLE `fs/` namespace.**
+`autumn-fuse` (and `autumnfs`, and the PyO3 `autumn.Fs.connect(...)`) has NO
+`--tenant` — every inode/dirent/extent key lands under `fs/…` (one global tree).
+A fuse mount, `autumnfs`, and the PyO3 client **all see the SAME filesystem**. To
+run isolated filesystems in one cluster use DISTINCT NAMESPACES (`fsA`/`fsB`, each
+`namespace-create`d), not a tenant. Inode numbers are cluster-unique (a single
+global counter); a `schema_version` stamp makes a future incompatible layout fail
+loud rather than mount empty. (Option 3, docs/key_namespace_split_design.md §8:
+the tenant segment — and the short-lived SD-3 `{volume}` layer before it — were
+removed; this is a stop-world data-reset change with a WIRE bump to v26.)
 
 **UCX (RDMA):** with `--transport ucx`, export the UCX env before launching (the
 UCX C library reads it directly): a positive `UCX_TLS` list — never `^` negation —
@@ -963,20 +962,22 @@ AUTUMN_AUTH_SIGNING_KEY_FILE=/path/signing.key \
 AUTUMN_ADMIN_TOKEN_FILE=/path/admin.token \
   bash cluster.sh start 4
 
-# 3) Create a tenant (admin; credential printed ONCE — hand it to the tenant):
+# 3) Create a PRINCIPAL (admin; credential printed ONCE as principal:/credential:
+#    two lines — redirect straight to a credential file). F-NS-PRINCIPAL-UNIFIED:
+#    keys are ns-first `{ns}/…` (no tenant); a grant is a whole namespace (`fs/`)
+#    or an in-namespace sub-prefix (`mem/acme/`):
 AO="./target/release/autumn-op --manager 127.0.0.1:9001"
-$AO tenant-create --tenant acme --prefix mem/acme/ --admin-token-file /path/admin.token
+$AO principal-create --principal acme --grant mem/acme/ --admin-token-file /path/admin.token > /path/acme.cred
 
 # 4) Use it from the SDK / autumn-memory (auto-mints + renews tokens,
-#    AUTH_HELLOs each PS connection):
-#      ClusterClient::connect_with_credential(mgr, "acme", credential)
-#      MemoryStore::connect_with_credential(mgr, "acme", agent, credential)
-#    Cross-tenant / anonymous access to mem/ now fails with PermissionDenied;
-#    keys outside mem/ are ungated.
+#    AUTH_HELLOs each PS connection; principal read from the credential file):
+#      ClusterClient::connect_with_credential(mgr, "mem/acme", principal, secret)
+#      MemoryStore::connect_with_credential(mgr, "acme", agent, principal, secret)
+#    Cross-scope / anonymous access to a protected prefix fails PermissionDenied.
 
-# Ops: mint a token by hand / revoke a tenant:
-$AO mint-token --tenant acme --credential-file /path/acme.cred
-$AO tenant-delete --tenant acme --admin-token-file /path/admin.token   # stops renewal; token dies at exp
+# Ops: mint a token by hand / revoke a principal:
+$AO mint-token --principal acme --credential-file /path/acme.cred
+$AO principal-delete --principal acme --admin-token-file /path/admin.token   # stops renewal; token dies at exp
 # Key rotation: add a higher kid line to signing.key, restart the manager,
 # wait a TTL, then mark the old line "disabled" (PS rejects it per request).
 ```
@@ -1069,7 +1070,7 @@ $AO split PART_ID --namespace kvc --tenant acme --at ""
 $AO split PART_ID --namespace kvc --tenant acme --at vllm/v1/80
 
 # Binary suffix (e.g. an fs inode prefix) via hex -> key = "t1/fs/" ++ 0x0103ff.
-$AO split PART_ID --namespace fs --tenant t1 --at-hex 0103ff
+$AO split PART_ID --namespace fs --at-hex 0103ff
 
 # ADMIN escape hatch only (documented admin-only, like D7 raw()): a whole raw
 # key, no namespace/tenant assembly. Operators should NOT hand-build prefixes.
@@ -1086,8 +1087,9 @@ Rules & behavior:
   (the `>= 2 keys` gate is skipped) — this is the presplit primitive: cut an
   empty pair into two empty children. Without `--at`, an empty partition is
   still refused (`< 2 keys`).
-- `--namespace` / `--tenant` are both-or-neither; `--at` / `--at-hex` require
-  them. `--at-raw-hex` is mutually exclusive with all of the above.
+- `--namespace` is required for `--at`/`--at-hex`/`--tenant`; `--tenant` is an
+  OPTIONAL in-namespace sub-segment (mem/kvc — fs has none). `--at-raw-hex` is
+  mutually exclusive with all of the above.
 
 Manual verification (memory-mode loopback recipe, no etcd):
 ```bash
@@ -1116,8 +1118,8 @@ primitive):
 ```bash
 # fs — split by INODE (the fs data key is [0x03][ino BE][off BE]). Give the exact
 # inodes (each safetensors shard = one inode = one partition), or a --count.
-$AO presplit --namespace fs --tenant default --fs-inos 4,5,6,7,8
-$AO presplit --namespace fs --tenant default --count 8            # → inodes 1..7
+$AO presplit --namespace fs --fs-inos 4,5,6,7,8
+$AO presplit --namespace fs --count 8            # → inodes 1..7
 
 # kvc — split by CONTENT HASH (sha256 hexdigest). --hash-prefix is REQUIRED: it is
 # the RELATIVE prefix from the namespace root down to just before the hash hex, and
@@ -1134,7 +1136,7 @@ $AO presplit --namespace mem --tenant default --agents alice,bob,carol
 # fs --lanes N — F-FS-STRIPE: split fs into N LANE partitions (cut at [0x03][1..N-1],
 # the STATIC ino-independent lane boundaries). This is the setup step for striping a
 # SINGLE large file across N partitions/PSs. Distinct from --fs-inos/--count (by INODE).
-$AO presplit --namespace fs --tenant default --lanes 4
+$AO presplit --namespace fs --lanes 4
 ```
 
 ### F-FS-STRIPE — stripe one large file across lanes (break the single-partition ceiling)
@@ -1147,7 +1149,7 @@ disk/CPU are NOT the limit). To go faster, STRIPE the file across N lane partiti
 ```bash
 # 1. Presplit fs into N lanes (ideally N = PS count so lanes land on distinct PSs);
 #    the manager spreads the new lane partitions across PSs. Do this on the EMPTY fs.
-$AO presplit --namespace fs --tenant default --lanes 4
+$AO presplit --namespace fs --lanes 4
 $AO info | grep part          # → 4 fs partitions, ideally one per PS
 
 # 2. Just upload. autumnfs AUTO-DETECTS the lane count from the presplit fs (counts
@@ -1156,8 +1158,8 @@ $AO info | grep part          # → 4 fs partitions, ideally one per PS
 #    key [0x03][lane][ino][off]; autumnfs's concurrent batch_put fans them out →
 #    parallel across the lane PSs. Small files (≤ 64 MiB) and a non-lane-presplit fs
 #    stay single-partition.
-autumnfs --manager <mgr> --tenant default put ./checkpoint.safetensors /ckpt
-autumnfs --manager <mgr> --tenant default get /ckpt ./out   # reader auto-detects stripe
+autumnfs --manager <mgr> put ./checkpoint.safetensors /ckpt
+autumnfs --manager <mgr> get /ckpt ./out   # reader auto-detects stripe
 ```
 
 - The stripe layout (`lanes`, `unit`) is stamped in the file's `InodeMeta.stripe` at
@@ -1553,15 +1555,16 @@ dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n
 **Deploy layer = ON by default (Task 2, 2026-07-18).** Both deploy paths arm
 data-plane authz automatically. **Protect-everything (tenant-first, 2026-07-19):**
 with a signing key present, EVERY tenant-scoped write requires a token — there is
-no protected-prefix list; a credential grants the whole tenant `{tenant}/` (or a
-specific `{tenant}/{ns}/`). The key layout is `{tenant}/{namespace}/`.
+no protected-prefix list; a credential grants a key prefix — a whole namespace
+(`fs/`) or an in-namespace sub-prefix (`mem/hermes/`). The key layout is
+`{ns}/…` (F-NS-PRINCIPAL-UNIFIED — NO tenant segment; see §8).
 
 - **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
   token once (reused across re-deploys — rotating invalidates every credential),
-  distributes the key to every manager host, and after bootstrap mints a
-  `default`-tenant credential to `~/.autumn-deploy/authz/default.cred`. Clients
-  then pass `--credential-file ~/.autumn-deploy/authz/default.cred --tenant
-  default`.
+  distributes the key to every manager host, and after bootstrap mints per-family
+  principal credentials to `~/.autumn-deploy/authz/*.cred`. Clients pass
+  `--credential-file ~/.autumn-deploy/authz/fs.cred` (the principal name is read
+  from the file — no `--principal`/`--tenant`).
 - **k8s** (`deploy/overlays/vke/deploy.sh`) generates the `autumn-authz` Secret
   (signing key + admin token) once and the manager StatefulSet mounts it (the
   signing key alone arms protect-everything — no prefix list). Mint a client
@@ -1569,54 +1572,50 @@ specific `{tenant}/{ns}/`). The key layout is `{tenant}/{namespace}/`.
 - **Escape hatch:** `AUTUMN_AUTH_DISABLE=1` (both paths) runs authz-OFF — for
   local debugging. The dev/test harness (`cluster.sh`, `scripts/*_chaos.sh`)
   never sets `AUTUMN_AUTH_*`, so it is authz-OFF unconditionally.
-- **Native clients** all take `--credential-file <path>` (+ `--principal`,
-  default = tenant): `autumn-fuse`, `autumnfs`, `autumn-client`. The file holds
-  the LOWERCASE HEX from `tenant-create` (a bare hex line, or its whole
-  `credential: <hex>` stdout line — both accepted; it is hex-decoded to the raw
-  bytes the manager hashed).
+- **Native clients** all take `--credential-file <path>` (NO `--principal`/
+  `--tenant` — the principal identity travels IN the file): `autumn-fuse`,
+  `autumnfs`, `autumn-client`. The file is the two-line `principal:`/`credential:`
+  form `autumn-op principal-create` prints (or `<name>\n<hex>`); the hex decodes
+  to the raw bytes the manager hashed.
 
-### Manual runbook (custom tenants, or a non-deploy/`mem/`-only setup)
+### Manual runbook (custom principals, or a non-deploy setup)
 
-Client-side wiring is DONE (PyO3 `Client.connect(tenant=,credential=)` +
-`BatchClient(tenant=,credential=)`, kvcache vLLM/sglang `auth_tenant` +
-`auth_credential_file` in extra_config, hermes provider
-`AUTUMN_MEMORY_CREDENTIAL_FILE`). Everything below is the OPERATIONAL
-enablement for a tenant the deploy layer did NOT auto-provision.
-Gradual-rollout axis: credentials-first (steps 1–4 are harmless with authz
-off), prefix-enforcement last (step 5).
+Client-side wiring: PyO3 `Client.connect(scope=,principal=,credential=)` +
+`BatchClient(scope=,principal=,credential=)`, hermes provider
+`AUTUMN_MEMORY_CREDENTIAL_FILE`. Everything below is the OPERATIONAL enablement
+for a principal the deploy layer did NOT auto-provision. Gradual-rollout axis:
+credentials-first (steps 1–4 are harmless with authz off), prefix-enforcement
+last (step 5).
 
 ```bash
 # 1. one-time: signing key (KEEP SAFE; k8s: put it in a Secret)
 autumn-op gen-signing-key > /secrets/autumn-auth-signing.key
 
-# 2. create the tenant. TENANT-FIRST: grant the whole tenant `hermes/` (or scope
-#    to one namespace, e.g. `hermes/mem/`). tenant-create prints `credential:
-#    <hex>` (LOWERCASE HEX, shown ONCE). The credential FILE the clients read must
-#    contain that hex — extract just the hex, do NOT dump the whole multi-line stdout:
-autumn-op --manager $M tenant-create --tenant hermes \
-    --prefix "hermes/mem/" --admin-token-file /secrets/admin.token \
-  | awk '/^credential:/{print $2}' > /secrets/hermes-tenant.cred
-#    (the client-side reader also tolerates the full `credential: <hex>` line,
-#    but a bare-hex file is the contract; NEVER the raw stdout with the
-#    "tenant 'x' created" line — the hex must decode to 32 raw bytes.)
+# 2. create the PRINCIPAL. Grant an in-namespace sub-prefix (`mem/hermes/`) or a
+#    whole namespace (`fs/`). principal-create prints the two-line
+#    principal:/credential: form (shown ONCE) — redirect it STRAIGHT to the
+#    credential file (the reader parses the name + hex from it):
+autumn-op --manager $M principal-create --principal hermes \
+    --grant "mem/hermes/" --admin-token-file /secrets/admin.token \
+  > /secrets/hermes.cred
 
 # 3. hermes/memory clients: mount the Secret, set
-#    AUTUMN_MEMORY_TENANT=hermes
-#    AUTUMN_MEMORY_CREDENTIAL_FILE=/secrets/hermes-tenant.cred
+#    AUTUMN_MEMORY_TENANT=hermes  (the mem sub-prefix)
+#    AUTUMN_MEMORY_CREDENTIAL_FILE=/secrets/hermes.cred
 #    (harmless while authz is off — credential is simply unused)
 
 # 4. verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
 #    whether the PS is enforcing yet — safe to run while authz is off):
-autumn-op --manager $M mint-token --tenant hermes \
-    --credential-file /secrets/hermes-tenant.cred   # must print a token
+autumn-op --manager $M mint-token --principal hermes \
+    --credential-file /secrets/hermes.cred   # must print a token
 
 # 5. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
-#    key alone arms enforcement of EVERY tenant-scoped write — there is no
+#    key alone arms enforcement of EVERY namespaced write — there is no
 #    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
 
 # 6. verify enforcement: a credential-less write must fail
-autumn-client --manager $M --namespace mem --tenant default put x /tmp/f  # expect PermissionDenied
+autumn-client --manager $M --namespace mem put x /tmp/f  # expect PermissionDenied
 # hermes mem round-trip must still pass (it now carries the credential)
 ```
 

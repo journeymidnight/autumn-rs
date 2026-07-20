@@ -68,12 +68,15 @@ rkyv, …); the core never imposes one.
 
 ## Key schema (`keys.rs`, plan §6)
 
-> **TENANT-FIRST (2026-07-19):** the WIRE key is now `{tenant}/mem/{agent}/…`
-> (the client `NamespaceBinding` prepends `{tenant}/mem/`, tenant OUTER — see
-> [[project_key_order_tenant_first]]). `keys.rs` is UNCHANGED: it still emits keys
-> RELATIVE to the binding prefix (starting at `{agent}/…`); only the assembled
-> wire prefix flipped. The `mem/{tenant}/{agent}/…` forms below show the OLD wire
-> order — read them as `{tenant}/mem/{agent}/…` on the wire today.
+> **⚑ F-NS-PRINCIPAL-UNIFIED (Option 3, 2026-07-19):** the WIRE key is
+> `mem/{tenant}/{agent}/…` (NS-FIRST, no SDK tenant concept — `{tenant}` is now an
+> in-namespace sub-prefix the memory app owns). `MemoryStore::connect` uses
+> `ClusterClient::connect(mgr, "mem/{tenant}")`; `connect_with_credential` adds a
+> `principal` arg (credential owner, from the credential file). `keys.rs` is
+> UNCHANGED (emits keys RELATIVE to the binding, starting at `{agent}/…`). The
+> `mem/{tenant}/{agent}/…` forms below are the current wire order. Grant a memory
+> tenant with `principal-create --grant mem/{tenant}/`. See §8 of
+> docs/key_namespace_split_design.md.
 
 ```text
 mem/{tenant}/{agent}/ep/{session}/{12-byte suffix}   episodic

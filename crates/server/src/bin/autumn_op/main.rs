@@ -361,9 +361,9 @@ async fn run(args: Args) -> Result<()> {
         Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
         // ---------------- F-AUTHZ-1 tooling ----------------
         Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
-        Command::TenantCreate { tenant, prefixes, admin_token } => cmd_tenant_create(&client, args.json, tenant, prefixes, admin_token).await?,
-        Command::TenantDelete { tenant, admin_token } => cmd_tenant_delete(&client, args.json, tenant, admin_token).await?,
-        Command::MintToken { tenant, credential } => cmd_mint_token(&client, args.json, tenant, credential).await?,
+        Command::PrincipalCreate { principal, grants, admin_token } => cmd_principal_create(&client, args.json, principal, grants, admin_token).await?,
+        Command::PrincipalDelete { principal, admin_token } => cmd_principal_delete(&client, args.json, principal, admin_token).await?,
+        Command::MintToken { principal, credential } => cmd_mint_token(&client, args.json, principal, credential).await?,
         // ---------------- F-KEY-NS D2 namespace registry ----------------
         Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
         Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
@@ -410,78 +410,83 @@ fn cmd_gen_signing_key(kid: u32) -> Result<()> {
     Ok(())
 }
 
-/// F-AUTHZ-1: create/rotate a tenant account. Returns the permanent credential.
-async fn cmd_tenant_create(
+/// F-NS-PRINCIPAL-UNIFIED: create/rotate a principal account. Returns the
+/// permanent credential in the `principal:`/`credential:` two-line form, so
+/// `autumn-op principal-create ... > loader.cred` produces a ready credential file
+/// (the SDK's `read_credential_file` parses that form, carrying the name).
+async fn cmd_principal_create(
     client: &ClusterClient,
     json: bool,
-    tenant: String,
-    prefixes: Vec<String>,
+    principal: String,
+    grants: Vec<String>,
     admin_token: String,
 ) -> Result<()> {
-    let allowed_prefixes: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
+    let allowed_prefixes: Vec<Vec<u8>> = grants.iter().map(|p| p.as_bytes().to_vec()).collect();
     // Leader-only RPC with manager rotation on CODE_NOT_LEADER lives in the SDK.
     let credential = client
-        .tenant_create(&tenant, allowed_prefixes, &admin_token)
+        .principal_create(&principal, allowed_prefixes, &admin_token)
         .await?;
     let cred = hex_encode(&credential);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "tenant": tenant,
+                "principal": principal,
                 "credential": cred,
             }))?
         );
     } else {
-        println!("tenant '{tenant}' created");
+        // Two-line credential-file form (principal name travels with the secret).
+        println!("principal: {principal}");
         println!("credential: {cred}");
-        eprintln!("# ^ hand this credential to the tenant; it is shown ONCE (manager stores only its SHA-256 hash).");
+        eprintln!("# ^ save both lines as the principal's credential file; shown ONCE (manager stores only the SHA-256 hash).");
     }
     Ok(())
 }
 
-/// F-AUTHZ-1: remove a tenant account (stops renewal; current token still works
-/// until it expires).
-async fn cmd_tenant_delete(
+/// F-NS-PRINCIPAL-UNIFIED: remove a principal account (stops renewal; current
+/// token still works until it expires).
+async fn cmd_principal_delete(
     client: &ClusterClient,
     json: bool,
-    tenant: String,
+    principal: String,
     admin_token: String,
 ) -> Result<()> {
-    client.tenant_delete(&tenant, &admin_token).await?;
+    client.principal_delete(&principal, &admin_token).await?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "tenant": tenant, "deleted": true })
+            serde_json::json!({ "principal": principal, "deleted": true })
         );
     } else {
-        println!("tenant '{tenant}' deleted");
+        println!("principal '{principal}' deleted");
     }
     Ok(())
 }
 
-/// F-AUTHZ-1: mint a short-TTL capability token from a tenant credential.
+/// F-NS-PRINCIPAL-UNIFIED: mint a short-TTL capability token from a principal
+/// credential.
 async fn cmd_mint_token(
     client: &ClusterClient,
     json: bool,
-    tenant: String,
+    principal: String,
     credential_hex: String,
 ) -> Result<()> {
     let credential = hex_decode(&credential_hex).context("--credential")?;
-    let (token_bytes, exp) = client.mint_token(&tenant, credential).await?;
+    let (token_bytes, exp) = client.mint_token(&principal, credential).await?;
     let token = hex_encode(&token_bytes);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "tenant": tenant,
+                "principal": principal,
                 "token": token,
                 "exp": exp,
             }))?
         );
     } else {
         println!("{token}");
-        eprintln!("# token for '{tenant}', exp={exp} (unix seconds)");
+        eprintln!("# token for '{principal}', exp={exp} (unix seconds)");
     }
     Ok(())
 }
@@ -1585,8 +1590,13 @@ async fn cmd_presplit(
     rule: &PresplitRule,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
-    // TENANT-FIRST prefix `{tenant}/{namespace}/`, matching the client binding.
-    let prefix = format!("{tenant}/{namespace}/").into_bytes();
+    // F-NS-PRINCIPAL-UNIFIED: cut prefix = `{namespace}/` (+ `{tenant}/` as an
+    // in-namespace sub-segment for mem/kvc; empty for fs), matching the binding.
+    let prefix = if tenant.is_empty() {
+        format!("{namespace}/").into_bytes()
+    } else {
+        format!("{namespace}/{tenant}/").into_bytes()
+    };
     let points: Vec<Vec<u8>> = suffixes
         .into_iter()
         .map(|s| {

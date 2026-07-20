@@ -159,9 +159,15 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 
 Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
 
-> **F-KEY-NS — 上表是 RELATIVE key；真实 wire key 带 `fs/{tenant}/` 前缀。**
-> 挂载时 `--tenant`（PyO3 `autumn.Fs.connect(tenant=)`；默认 `default`）确定 scope。
-> `FsState` 用 `scoped(fs, tenant)` 连接 —— **client 负责整个 `fs/{tenant}/` 前缀**
+> **⚑ F-NS-PRINCIPAL-UNIFIED (Option 3, 2026-07-19)：fuse 去掉 tenant 段 —— wire key
+> 现为 `fs/[type][fields]`（一棵全局树，无 `{tenant}`）。`autumn-fuse` / `autumnfs` /
+> PyO3 `autumn.Fs` 都不再有 `--tenant`；`FsState::new(mgr)` 用 `connect(mgr, "fs")`。
+> 多棵互隔离的树用不同 namespace（`fsA`/`fsB`），不是 tenant。授权 = `principal-create
+> --grant fs/` + `--credential-file`（principal 名在文件里）。下方带 `{tenant}` 的旧描述
+> 按去掉该段阅读。详见 docs/key_namespace_split_design.md §8。**
+>
+> **F-KEY-NS — 上表是 RELATIVE key；真实 wire key 带 `fs/` 前缀（旧文：`fs/{tenant}/`）。**
+> `FsState` 用 `scoped(fs)` 连接 —— **client 负责整个 `fs/` 前缀**
 > （prepend + 把返回 range key 剥回、按 tenant 边界 clamp）。所以 `state.rs` 的 8 个
 > `kv_*` choke point、`key::*` builder 与其调用点、全部 `parse_*` 都把裸 `key::*`
 > RELATIVE key 直接交给 client，**零 wire 拼接**。**两处 batch 数据路径**（`read::prepare`

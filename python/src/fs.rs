@@ -135,16 +135,17 @@ impl Fs {
     /// `--credential-file` clients. REQUIRED once the deploy protects `fs/` —
     /// authz gates READS on protected prefixes too, so a credential-less `Fs`
     /// (e.g. the vLLM weight loader) would fail with PermissionDenied on every
-    /// read. `credential` is RAW bytes (hex-decode the `autumn-op tenant-create`
+    /// read. `credential` is RAW bytes (hex-decode the `autumn-op principal-create`
     /// output first — see `autumn_kvcache._identity.read_credential_file`).
-    /// `principal` defaults to the tenant (1:1 principal↔tenant convention).
+    /// `principal` is the credential owner (from the credential file's name line).
+    /// F-NS-PRINCIPAL-UNIFIED: no tenant — `autumn.Fs` scopes to the WHOLE `fs/`
+    /// namespace (one global tree; see docs/key_namespace_split_design.md §8).
     #[staticmethod]
-    #[pyo3(signature = (manager, host=None, tenant=None, principal=None, credential=None, direct_read=false))]
+    #[pyo3(signature = (manager, host=None, principal=None, credential=None, direct_read=false))]
     fn connect(
         py: Python<'_>,
         manager: String,
         host: Option<String>,
-        tenant: Option<String>,
         principal: Option<String>,
         credential: Option<Vec<u8>>,
         direct_read: bool,
@@ -157,11 +158,6 @@ impl Fs {
                 "principal= and credential= must be passed together (both or neither)",
             ));
         }
-        // F-KEY-NS: this front-end shares the fuse core, so it scopes to the same
-        // `fs/{tenant}/` keyspace. Default tenant matches the fuse binary's default
-        // so a Python `autumn.Fs` and a `--tenant default` mount see the SAME
-        // filesystem.
-        let tenant = tenant.unwrap_or_else(|| "default".to_string());
         let (job_tx, mut job_rx) = unbounded::<FsJob>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -178,14 +174,13 @@ impl Fs {
                 rt.block_on(async move {
                     // F-AUTHZ-BUILTIN: credential path when one was supplied —
                     // `connect_with_credential` FAILS FAST at connect if the
-                    // credential doesn't cover `fs/{tenant}/`.
+                    // credential doesn't cover `fs/`.
                     let opened = match credential {
                         Some(cred) => {
-                            let who = principal.unwrap_or_else(|| tenant.clone());
-                            FsState::new_with_host_credential(&manager, host, &tenant, &who, cred)
-                                .await
+                            let who = principal.unwrap_or_default();
+                            FsState::new_with_host_credential(&manager, host, &who, cred).await
                         }
-                        None => FsState::new_with_host(&manager, host, &tenant).await,
+                        None => FsState::new_with_host(&manager, host).await,
                     };
                     let mut state = match opened {
                         Ok(s) => s,

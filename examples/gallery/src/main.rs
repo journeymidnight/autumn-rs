@@ -1669,15 +1669,18 @@ async fn main() -> Result<()> {
     // AUTUMN_CREDENTIAL_FILE at the tenant credential from `autumn-op
     // tenant-create` — the SDK auto-mints + renews short-TTL tokens. Without it, a
     // plain scoped connect (works only if the namespace is unprotected).
-    let namespace = std::env::var("AUTUMN_NAMESPACE").unwrap_or_else(|_| "gallery".into());
-    let tenant = std::env::var("AUTUMN_TENANT").unwrap_or_else(|_| "gallery".into());
+    // F-NS-PRINCIPAL-UNIFIED: scope is a single key-prefix (the `gallery`
+    // namespace). AUTUMN_SCOPE (or legacy AUTUMN_NAMESPACE) overrides.
+    let scope = std::env::var("AUTUMN_SCOPE")
+        .or_else(|_| std::env::var("AUTUMN_NAMESPACE"))
+        .unwrap_or_else(|_| "gallery".into());
     let client: Client = Rc::new(match std::env::var("AUTUMN_CREDENTIAL_FILE") {
         Ok(path) if !path.is_empty() => {
-            let cred = autumn_client::read_credential_file(&path)?;
-            ClusterClient::connect_with_credential(&manager, &namespace, &tenant, tenant.clone(), cred)
+            let (principal, secret) = autumn_client::read_credential_file(&path)?;
+            ClusterClient::connect_with_credential(&manager, &scope, principal, secret)
                 .await?
         }
-        _ => ClusterClient::connect(&manager, &namespace, &tenant).await?,
+        _ => ClusterClient::connect(&manager, &scope).await?,
     });
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));

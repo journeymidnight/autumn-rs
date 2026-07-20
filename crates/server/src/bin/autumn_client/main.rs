@@ -38,10 +38,9 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
     String::from_utf8(key).expect("ASCII bench key")
 }
 
-/// F-KEY-NS D7: the benchmarks bind the `bench` namespace with tenant `perf`
-/// (Prepend `perf/bench/` — TENANT-FIRST), so their keys are USER keys.
-const BENCH_NS: &str = "bench";
-const BENCH_TENANT: &str = "perf";
+/// F-NS-PRINCIPAL-UNIFIED: the benchmarks bind the scope `bench/perf`
+/// (Prepend `bench/perf/`), so their keys are USER keys.
+const BENCH_SCOPE: &str = "bench/perf";
 
 /// F-KEY-NS D7: derive the USER-space partition start keys covering the bench
 /// namespace. `all_partitions_with_range` returns WIRE ranges; the client
@@ -53,7 +52,7 @@ const BENCH_TENANT: &str = "perf";
 /// multi-partition spread; a non-presplit bench yields a single empty start (one
 /// partition), so the perf run measures one partition (documented in ops.md).
 fn bench_user_starts(partitions: &[(u64, String, Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
-    let prefix = format!("{BENCH_TENANT}/{BENCH_NS}/").into_bytes();
+    let prefix = format!("{BENCH_SCOPE}/").into_bytes();
     let mut starts: Vec<Vec<u8>> = Vec::new();
     for (_pid, _addr, start, _end) in partitions {
         if let Some(rest) = start.strip_prefix(prefix.as_slice()) {
@@ -299,7 +298,7 @@ async fn cmd_ycsb(
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         load_handles.push(std::thread::spawn(move || {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
+                let client = match ClusterClient::connect(&mgr, BENCH_SCOPE).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb load thread {tid} connect error: {e}");
@@ -350,7 +349,7 @@ async fn cmd_ycsb(
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         run_handles.push(std::thread::spawn(move || -> (Vec<f64>, Vec<f64>) {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
+                let client = match ClusterClient::connect(&mgr, BENCH_SCOPE).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb run thread {tid} connect error: {e}");
@@ -528,7 +527,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
+                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_SCOPE).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("write thread {tid} connect error: {e}");
@@ -714,7 +713,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_NS, BENCH_TENANT).await {
+                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_SCOPE).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("read thread {tid} connect error: {e}");
@@ -1007,41 +1006,42 @@ async fn main() -> Result<()> {
     //    binding-independent) and connect their own bench-scoped clients per
     //    thread → Raw here.
     //  - data-plane KV commands (put/get/del/head/ls/streams) MUST declare their
-    //    namespace scope → connect(mgr, ns, tenant); absent = migration error.
+    //    scope → connect(mgr, scope); absent = migration error.
     let client = match &args.command {
         Command::PerfCheck { .. } | Command::Ycsb { .. } | Command::OpStub { .. } => {
             ClusterClient::connect_raw(&args.manager).await?
         }
         _ => {
-            let (ns, tenant) = match (&args.namespace, &args.tenant) {
-                (Some(ns), Some(t)) => (ns.as_str(), t.as_str()),
-                _ => {
+            let scope = match &args.namespace {
+                Some(s) => s.as_str(),
+                None => {
                     eprintln!(
-                        "autumn-client: --namespace <NS> and --tenant <T> are REQUIRED for KV \
-                         commands (F-KEY-NS D7 — every write must declare its namespace). \
-                         List namespaces with `autumn-op namespace-list`."
+                        "autumn-client: --namespace <SCOPE> is REQUIRED for KV commands \
+                         (F-NS-PRINCIPAL-UNIFIED — every write must declare its scope, a whole \
+                         namespace like `fs` or a sub-prefix like `mem/agent7`). List namespaces \
+                         with `autumn-op namespace-list`."
                     );
                     std::process::exit(2);
                 }
             };
             // F-AUTHZ-BUILTIN: with a credential when `--credential-file` is given
-            // (principal defaults to the tenant). Fails fast if it doesn't cover
-            // `{ns}/{tenant}/`.
+            // (principal read from the file). Fails fast if it doesn't cover `{scope}/`.
             match &args.credential_file {
                 Some(path) => {
-                    let credential =
+                    let (principal, secret) =
                         autumn_client::read_credential_file(path).context("--credential-file")?;
-                    let principal = args.principal.clone().unwrap_or_else(|| tenant.to_string());
+                    if principal.is_empty() {
+                        bail!("--credential-file: missing principal name (expected '<principal>\\n<hex>')");
+                    }
                     ClusterClient::connect_with_credential(
                         &args.manager,
-                        ns,
-                        tenant,
+                        scope,
                         principal,
-                        credential,
+                        secret,
                     )
                     .await?
                 }
-                None => ClusterClient::connect(&args.manager, ns, tenant).await?,
+                None => ClusterClient::connect(&args.manager, scope).await?,
             }
         }
     };

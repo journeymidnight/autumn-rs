@@ -1034,19 +1034,26 @@ do_start() {
         local _atok; _atok="$(cat "$_az/admin.token")"
         local _ao=( "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
         "${_ao[@]}" namespace-create --name gallery --admin-token "$_atok" >/dev/null 2>&1 || true
-        local _spec _t _pfx _out
-        # TENANT-FIRST wire layout: the SDK binds keys under `{tenant}/{namespace}/`,
-        # so the granted prefix is tenant-first too (codebase/mem/, gallery/gallery/).
-        for _spec in "codebase codebase/mem/ $_az/codebase.cred" \
-                     "gallery gallery/gallery/ $_az/gallery.cred"; do
-            read -r _t _pfx _out <<< "$_spec"
+        local _spec _p _grant _out
+        # F-NS-PRINCIPAL-UNIFIED (§8.8): per-family principals (NS-FIRST keys, no
+        # tenant segment). Each app uses its own credential = least privilege by
+        # default (no all-ns master key). Cred file = two-line `principal:`/
+        # `credential:` form (read_credential_file carries the name).
+        #   fs/  → fuse mount / autumnfs        kvc/ → kvcache loader
+        #   gallery/ → gallery example          mem/codebase/ → codebase-memory
+        for _spec in "fs fs/ $_az/fs.cred" \
+                     "kvc kvc/ $_az/kvc.cred" \
+                     "gallery gallery/ $_az/gallery.cred" \
+                     "codebase mem/codebase/ $_az/codebase.cred"; do
+            read -r _p _grant _out <<< "$_spec"
             [[ -s "$_out" ]] && continue
-            "${_ao[@]}" --json tenant-create --tenant "$_t" --prefix "$_pfx" --admin-token "$_atok" \
-                | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"])' > "$_out" \
-                || die "tenant-create $_t failed"
-            [[ -s "$_out" ]] || die "tenant-create $_t produced no credential"
+            "${_ao[@]}" --json principal-create --principal "$_p" --grant "$_grant" --admin-token "$_atok" \
+                | python3 -c 'import sys,json;d=json.load(sys.stdin);print("principal: "+d["principal"]);print("credential: "+d["credential"])' > "$_out" \
+                || die "principal-create $_p failed"
+            [[ -s "$_out" ]] || die "principal-create $_p produced no credential"
         done
-        echo "[cluster] authz ON: signing key + admin token + creds in $_az/"
+        echo "[cluster] authz ON: signing key + admin token + per-family creds in $_az/"
+        echo "[cluster]   fuse/autumnfs: --credential-file $_az/fs.cred"
         echo "[cluster]   codebase-memory: --credential-file $_az/codebase.cred"
         echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi

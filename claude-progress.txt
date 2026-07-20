@@ -1,5 +1,30 @@
 Date: 2026-07-19
 TaskStatus: completed
+Task scope: F-NS-PRINCIPAL-UNIFIED (Option 3) 实现 —— 删 tenant 概念，key `{ns}/[rel]`，
+  authz 身份=principal+grant。用户"实施吧"（VKE 到时 reset，不用管）。
+Current summary: 全 workspace build + test 绿。改动（NS-FIRST，无 tenant 段）:
+  - client SDK: NamespaceBinding→单 scope 串; connect(mgr,scope)/connect_with_credential(
+    mgr,scope,principal,secret)/rescope(scope); read_credential_file→(principal,secret)
+    两行/labeled; principal_create/delete; set_principal_credential; ClientAuth.principal.
+  - rpc: MintTokenReq.tenant→principal; WIRE v25→v26 (fp c408d5e3de95883a，fence 旧镜像).
+  - PS authz: check_layer_a 认第 1 段 (in_a_namespace); manager handle_mint_token 用 principal.
+  - CLIs: autumn-op principal-create --grant/principal-delete/mint-token --principal (cred
+    两行直存文件); autumn-client 删 --tenant/--principal (--namespace=scope);
+    autumnfs/fuse 删 --tenant (fs/ 全局树); split/presplit --tenant 变可选 in-ns 段.
+  - PyO3: Fs.connect(principal=,credential=); Client.connect(scope=,…); BatchClient(scope=,…).
+  - autumn-memory: mem/{tenant} 子前缀 + connect_with_credential 加 principal 参.
+  - examples gallery/codebase-memory; cluster.sh turnkey per-family principal (fs/kvc/
+    gallery/mem-codebase, 两行 cred).
+  - 集成测试改 Option-3 key (Layer-A/split_point/fuse-ns[删 2 tenant/volume obsolete 用例]/
+    fuse-lease/system_namespace_layer_a/authz_e2e/e2e).
+Main gaps: DEFER 子项 (非阻塞，写进 feature_list): (a) --superuser flag+签名 claim; (b)
+  --grant fs/models/ 二进制型 ns 拒绝; (c) presplit Option-3 语义未深测. PyO3 本地编译因
+  系统 Python 3.14 > pyo3 max 3.13 无法链接 (环境问题，非代码；Rust 侧编译过).
+Next steps: 上线 = cluster.sh reset (key/etcd/cred/WIRE 全变). commit + push.
+
+── prior task history ──
+Date: 2026-07-19
+TaskStatus: completed
 Task scope: tenant-first + authz-mandatory 全量重部署到 VKE 线上（用户 6 项：pull / cp build /
   验 BUG-KVC-NO-HIT / 验 autumnfs 提速 / authz 强制 / fs 只剩 fs/{tenant}）。集群现处于可服务状态。
 

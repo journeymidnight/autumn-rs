@@ -404,16 +404,18 @@ async fn main() -> Result<()> {
 
     let store = Rc::new(
         match &args.credential_file {
-            // F-AUTHZ-1: protected `mem/` — connect with the tenant credential
-            // (SDK auto-mints/renews short-TTL tokens scoped to `mem/{tenant}/`).
+            // F-NS-PRINCIPAL-UNIFIED: protected `mem/` — connect with the principal
+            // credential (SDK auto-mints/renews short-TTL tokens scoped to
+            // `mem/{tenant}/`). The principal identity is read from the file.
             Some(path) => {
-                let cred = autumn_client::read_credential_file(path)
+                let (principal, secret) = autumn_client::read_credential_file(path)
                     .map_err(|e| anyhow::anyhow!("--credential-file: {e}"))?;
                 MemoryStore::connect_with_credential(
                     &args.manager,
                     args.tenant.clone(),
                     args.agent.clone(),
-                    cred,
+                    principal,
+                    secret,
                 )
                 .await?
             }

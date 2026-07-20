@@ -22,9 +22,9 @@
 //!
 //! Paths are `/`-separated; leading `/` is optional. ROOT_INO = 1.
 //!
-//! F-KEY-NS: `autumnfs` connects SCOPED to `fs/{tenant}/` (`--tenant`, default
-//! `default`) so its keys land in the SAME keyspace a fuse mount uses — a write
-//! here is visible to a mount pointed at the same tenant, and vice versa. Inode
+//! F-NS-PRINCIPAL-UNIFIED: `autumnfs` connects SCOPED to the WHOLE `fs/` namespace
+//! (no `--tenant` — Option 3 dropped it) so its keys land in the SAME keyspace a
+//! fuse mount uses — a write here is visible to a mount, and vice versa. Inode
 //! numbers come from the MANAGER's
 //! crash-safe GLOBAL counter (`alloc_inodes`), the same source the fuse mount +
 //! PyO3 `autumn.Fs` use, so autumnfs and a mount never hand out colliding inodes
@@ -63,22 +63,14 @@ struct Args {
     #[arg(long, default_value = "tcp")]
     transport: String,
 
-    /// F-KEY-NS: tenant this fs lives under (`fs/{tenant}/`). Must match the fuse
-    /// mount's `--tenant` to see the same filesystem.
-    #[arg(long, default_value = "default")]
-    tenant: String,
-
-    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential (a
-    /// minted token from `autumn-op tenant-create`). REQUIRED when the cluster
-    /// protects the `fs/` namespace; omit on an authz-off cluster. Connects via
-    /// `connect_with_credential` and FAILS FAST if it doesn't cover `fs/{tenant}/`.
+    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential
+    /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
+    /// cluster protects the `fs/` namespace; omit on an authz-off cluster. Connects
+    /// via `connect_with_credential` (principal read from the file) and FAILS FAST
+    /// if it doesn't cover `fs/`. (F-NS-PRINCIPAL-UNIFIED: no tenant segment — this
+    /// CLI sees the WHOLE `fs/` namespace, same as a mount.)
     #[arg(long)]
     credential_file: Option<PathBuf>,
-
-    /// F-AUTHZ-BUILTIN: authz principal presented with `--credential-file`.
-    /// Defaults to the tenant name (the 1:1 principal↔tenant convention).
-    #[arg(long)]
-    principal: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -133,27 +125,27 @@ fn main() -> Result<()> {
         .build()
         .context("create compio runtime")?;
     rt.block_on(async move {
-        // F-KEY-NS: scope the client to `fs/{tenant}/` — the binding prepends the
-        // prefix to every relative fuse key (and strips it off range results), so a
-        // write here is visible to a fuse mount on the same `--tenant`. Every
+        // F-NS-PRINCIPAL-UNIFIED: scope the client to the WHOLE `fs/` namespace —
+        // the binding prepends `fs/` to every relative fuse key (and strips it off
+        // range results), so a write here is visible to a fuse mount. Every
         // `key::*`-based op below is unchanged; the client owns the prefix.
-        // F-AUTHZ-BUILTIN: with a credential when `--credential-file` is given.
         let cluster = match &args.credential_file {
             Some(path) => {
-                let credential = autumn_client::read_credential_file(path)
+                let (principal, secret) = autumn_client::read_credential_file(path)
                     .context("--credential-file")?;
-                let principal = args.principal.clone().unwrap_or_else(|| args.tenant.clone());
+                if principal.is_empty() {
+                    bail!("--credential-file: missing principal name (expected '<principal>\\n<hex>')");
+                }
                 ClusterClient::connect_with_credential(
                     &args.manager,
                     "fs",
-                    &args.tenant,
                     principal,
-                    credential,
+                    secret,
                 )
                 .await
                 .context("connect to manager (authz)")?
             }
-            None => ClusterClient::connect(&args.manager, "fs", &args.tenant)
+            None => ClusterClient::connect(&args.manager, "fs")
                 .await
                 .context("connect to manager")?,
         };
@@ -178,7 +170,7 @@ fn main() -> Result<()> {
             Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
             Cmd::Cat { path } => cmd_cat(&cluster, &path).await,
             Cmd::Put { local, remote } => {
-                cmd_put(&cluster, &local, &remote, &args.tenant).await
+                cmd_put(&cluster, &local, &remote).await
             }
             Cmd::Get { remote, local } => cmd_get(&cluster, &remote, &local).await,
             Cmd::Rm { path } => cmd_rm(&cluster, &path).await,
@@ -826,18 +818,18 @@ async fn publish_file(
 
 /// F-FS-STRIPE: how many lane partitions the fs is presplit into (the FIXED
 /// stripe width — NOT a per-upload flag). A lane partition L≥1 starts exactly at
-/// the wire key `{tenant}/fs/[0x03][L]` (`stripe_lane_boundary` under the binding
-/// prefix); count them → `N = (#lane boundaries) + 1` (lane 0 has no boundary
-/// start). Returns 1 when fs was never lane-presplit → no striping. Best-effort:
-/// any lookup error → 1 (fall back to single-partition, never fail the upload).
-async fn detect_stripe_lanes(cluster: &ClusterClient, tenant: &str) -> u8 {
+/// the wire key `fs/[0x03][L]` (`stripe_lane_boundary` under the binding prefix);
+/// count them → `N = (#lane boundaries) + 1` (lane 0 has no boundary start).
+/// Returns 1 when fs was never lane-presplit → no striping. Best-effort: any
+/// lookup error → 1 (fall back to single-partition, never fail the upload).
+async fn detect_stripe_lanes(cluster: &ClusterClient) -> u8 {
     // all_partitions_with_range reads the region cache; refresh so a just-presplit
     // fs is seen. Errors are non-fatal — degrade to non-striped.
     let _ = cluster.refresh_regions().await;
     let Ok(parts) = cluster.all_partitions_with_range().await else {
         return 1;
     };
-    let prefix = format!("{tenant}/fs/").into_bytes();
+    let prefix = b"fs/".to_vec();
     let boundaries = parts
         .iter()
         .filter(|(_, _, start, _)| {
@@ -850,7 +842,7 @@ async fn detect_stripe_lanes(cluster: &ClusterClient, tenant: &str) -> u8 {
     ((boundaries + 1).min(255)) as u8
 }
 
-async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str, tenant: &str) -> Result<()> {
+async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {
     let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, remote).await?;
     if !is_dir(&parent_meta) {
         bail!("parent is not a directory");
@@ -872,7 +864,7 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str, tenant:
     // the layout at create — unlike the fuse mount's streaming writes.
     let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
     let stripe = if file_size > STRIPE_THRESHOLD {
-        let lanes = detect_stripe_lanes(cluster, tenant).await;
+        let lanes = detect_stripe_lanes(cluster).await;
         (lanes >= 2).then_some(StripeLayout { lanes, unit_bytes: MAX_EXTENT as u32 })
     } else {
         None

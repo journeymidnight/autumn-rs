@@ -98,27 +98,24 @@ impl std::error::Error for AutumnError {}
 
 // ── F-KEY-NS D7: namespace binding ───────────────────────────────────────────
 
-/// F-KEY-NS D7: the (namespace, tenant) scope a `ClusterClient` operates within.
-/// A scoped op ALWAYS PREPENDS `{ns}/{tenant}/` to the user key before routing, so
+/// F-NS-PRINCIPAL-UNIFIED (Option 3): the key-prefix scope a `ClusterClient`
+/// operates within. There is NO tenant segment — a scope is `{ns}/` (a whole
+/// namespace, e.g. `fs/`, `gallery/`) or an in-namespace sub-prefix
+/// (`mem/agent7/` — an app's own segment; the app owns its sub-structure). A
+/// scoped op ALWAYS PREPENDS the scope prefix to the user key before routing, so
 /// a scoped client **cannot** touch anything outside its own keyspace — scope is
 /// locked by construction, not merely checked. The built-in key builders
-/// (fuse / memory / kvcache) therefore emit keys RELATIVE to `{ns}/{tenant}/`
-/// (the binding owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO
-/// client-side prefixing — for admin / cross-namespace tooling — but the PS still
-/// enforces Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never the
-/// server's authorization.
+/// (fuse / memory / kvcache) emit keys RELATIVE to the scope prefix (the binding
+/// owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO client-side
+/// prefixing — for admin / cross-namespace tooling — but the PS still enforces
+/// Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never authorization.
+/// (Historical: tenant-first `{tenant}/{ns}/` and pre-that `{ns}/{tenant}/` were
+/// retired 2026-07-19 — see docs/key_namespace_split_design.md §8.)
 #[derive(Clone, Debug)]
 pub enum NamespaceBinding {
     Scoped {
-        namespace: String,
-        tenant: String,
-        /// `{tenant}/{namespace}/` as bytes — precomputed once. TENANT is the
-        /// OUTER prefix (it is mandatory + the primary isolation unit), so a
-        /// whole tenant's data across all its namespaces is ONE contiguous range
-        /// `[{tenant}/, {tenant}0)` — per-tenant backup/delete/isolation/authz
-        /// grant is a single prefix. (Flipped from `{namespace}/{tenant}/`
-        /// 2026-07-19 — that order was a historical artifact: the app-prefix
-        /// contract predated the mandatory tenant.)
+        /// The scope prefix bytes, always ending in `/` (`fs/`, `mem/agent7/`).
+        /// The first `/`-delimited segment is the namespace (Layer-A checks it).
         prefix: Vec<u8>,
     },
     /// Admin / unscoped: no client-side prefixing.
@@ -126,21 +123,16 @@ pub enum NamespaceBinding {
 }
 
 impl NamespaceBinding {
-    /// Build a scoped binding — always Prepend (`{tenant}/{namespace}/ ++ key`).
-    pub fn scoped(namespace: impl Into<String>, tenant: impl Into<String>) -> Self {
-        let namespace = namespace.into();
-        let tenant = tenant.into();
-        // TENANT-FIRST: tenant is the outer scope (see the `prefix` field doc).
-        // The arg order stays (namespace, tenant); only the assembled bytes flip.
-        let prefix = format!("{tenant}/{namespace}/").into_bytes();
-        NamespaceBinding::Scoped {
-            namespace,
-            tenant,
-            prefix,
-        }
+    /// Build a scoped binding from a scope string (`fs`, `mem/agent7`,
+    /// `bench/perf`). Always Prepend (`{scope}/ ++ key`). A trailing `/` is
+    /// added if absent; an already-slash-terminated scope is taken verbatim.
+    pub fn scoped(scope: impl AsRef<str>) -> Self {
+        let scope = scope.as_ref().trim_end_matches('/');
+        let prefix = format!("{scope}/").into_bytes();
+        NamespaceBinding::Scoped { prefix }
     }
 
-    /// `{tenant}/{namespace}/` for a scoped binding; `None` for `Raw`.
+    /// `{scope}/` for a scoped binding; `None` for `Raw`.
     pub fn prefix(&self) -> Option<&[u8]> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
@@ -383,47 +375,58 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
     value_size >= UCX_ZC_READ_MIN_BYTES
 }
 
-/// F-AUTHZ-BUILTIN: read a tenant credential file into RAW credential bytes for
-/// [`ClusterClient::connect_with_credential`]. On-disk format is the lowercase
-/// hex printed by `autumn-op tenant-create` — either the bare hex line, or its
-/// whole `credential: <hex>` stdout line (accepted defensively; "save the
-/// output" is the predictable operator move). The SDK/manager contract is RAW
-/// bytes (mint-token hex-decodes before sending; the manager stores the SHA-256
-/// of the raw bytes), so handing the ASCII hex straight through would present a
-/// WRONG credential and every protected-prefix op would die `PermissionDenied`
-/// once enforcement is on. Fail loud HERE, at startup, instead. Mirrors the
-/// Python `autumn_kvcache._identity.read_credential_file` byte-for-byte.
-pub fn read_credential_file(path: impl AsRef<std::path::Path>) -> Result<Vec<u8>> {
+/// F-NS-PRINCIPAL-UNIFIED (§8.5): read a principal credential file into
+/// `(principal_name, raw_secret_bytes)` for
+/// [`ClusterClient::connect_with_credential`]. Because Option 3 dropped the
+/// `--principal` CLI flag, the principal IDENTITY now travels IN the file. Format
+/// (produced by `autumn-op principal-create`): two lines
+/// `<principal-name>` then `<hex-secret>`, or the labeled form
+/// `principal: <name>` / `credential: <hex>` (order-independent; extra stdout
+/// lines tolerated). The SDK/manager contract is RAW secret bytes (mint-token
+/// hex-decodes before sending; the manager stores the SHA-256 of the raw bytes),
+/// so handing ASCII hex straight through would present a WRONG credential — fail
+/// loud HERE at startup instead. A bare single hex line (no name) parses with an
+/// EMPTY name; a data-plane caller must reject that (mint needs the name).
+pub fn read_credential_file(path: impl AsRef<std::path::Path>) -> Result<(String, Vec<u8>)> {
     let path = path.as_ref();
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow!("read credential file {}: {e}", path.display()))?;
     parse_credential_text(&text).map_err(|e| anyhow!("credential file {}: {e}", path.display()))
 }
 
-/// Pure parser for [`read_credential_file`]: extract the hex (a bare hex line or
-/// a `credential: <hex>` line) and decode it to raw bytes. Split out so it is
-/// unit-testable without touching the filesystem.
-fn parse_credential_text(text: &str) -> Result<Vec<u8>> {
+/// Pure parser for [`read_credential_file`]: extract `(principal, hex-secret)` and
+/// decode the hex to raw bytes. Split out so it is unit-testable without the FS.
+fn parse_credential_text(text: &str) -> Result<(String, Vec<u8>)> {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let hexs = if let Some(l) =
-        lines.iter().find(|l| l.to_ascii_lowercase().starts_with("credential:"))
-    {
-        l.split_once(':').map(|(_, h)| h.trim()).unwrap_or("")
+    let labeled = |k: &str| -> Option<&str> {
+        lines
+            .iter()
+            .find(|l| l.to_ascii_lowercase().starts_with(k))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim())
+    };
+    let (name, hexs): (String, &str) = if let Some(h) = labeled("credential:") {
+        (labeled("principal:").unwrap_or("").to_string(), h)
+    } else if lines.len() == 2 {
+        // Two bare lines: <principal-name> then <hex-secret>.
+        (lines[0].to_string(), lines[1])
     } else if lines.len() == 1 {
-        lines[0]
+        // Bare hex, no name (legacy / anonymous — caller must reject if it needs one).
+        (String::new(), lines[0])
     } else {
         anyhow::bail!(
-            "expected a single hex line or a 'credential: <hex>' line, got {} non-empty lines",
+            "expected '<name>\\n<hex>', a 'principal:'/'credential:' pair, or a single hex line, got {} non-empty lines",
             lines.len()
         );
     };
     if hexs.is_empty() || !hexs.is_ascii() || hexs.len() % 2 != 0 {
         anyhow::bail!("not valid hex (empty, odd length, or non-ASCII)");
     }
-    (0..hexs.len())
+    let secret: Vec<u8> = (0..hexs.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hexs[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
-        .collect()
+        .collect::<Result<Vec<u8>>>()?;
+    Ok((name, secret))
 }
 
 #[cfg(test)]
@@ -432,22 +435,29 @@ mod credential_file_tests {
 
     #[test]
     fn bare_hex_line_decodes() {
-        assert_eq!(parse_credential_text("deadbeef\n").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
-        // surrounding whitespace tolerated
-        assert_eq!(parse_credential_text("  a1b2  ").unwrap(), vec![0xa1, 0xb2]);
+        // A single bare hex line = anonymous name (caller rejects on the data plane).
+        assert_eq!(parse_credential_text("deadbeef\n").unwrap(), ("".into(), vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(parse_credential_text("  a1b2  ").unwrap(), ("".into(), vec![0xa1, 0xb2]));
     }
 
     #[test]
-    fn credential_labeled_line_decodes() {
-        // The raw `autumn-op tenant-create` stdout ("credential: <hex>") + the
-        // "tenant '…' created" line above it — pick the labeled line's hex.
-        let text = "tenant 'default' created\ncredential: 00ff10\n";
-        assert_eq!(parse_credential_text(text).unwrap(), vec![0x00, 0xff, 0x10]);
+    fn two_bare_lines_are_name_then_hex() {
+        // `autumn-op principal-create` writes `<name>\n<hex>`.
+        assert_eq!(
+            parse_credential_text("loader\n00ff10\n").unwrap(),
+            ("loader".into(), vec![0x00, 0xff, 0x10])
+        );
     }
 
     #[test]
-    fn rejects_ambiguous_multi_line_without_label() {
-        assert!(parse_credential_text("aa\nbb\n").is_err());
+    fn labeled_lines_decode_name_and_hex() {
+        let text = "principal: default\ncredential: 00ff10\n";
+        assert_eq!(parse_credential_text(text).unwrap(), ("default".into(), vec![0x00, 0xff, 0x10]));
+    }
+
+    #[test]
+    fn rejects_three_bare_lines_without_label() {
+        assert!(parse_credential_text("aa\nbb\ncc\n").is_err());
     }
 
     #[test]
@@ -649,7 +659,8 @@ struct CachedToken {
 /// short-TTL token minted from it. One `ClusterClient` = one principal (the
 /// design: `MemoryStore` is per-`(tenant, agent)`, each with its own client).
 struct ClientAuth {
-    tenant: String,
+    /// The principal identity (credential owner) used to mint tokens.
+    principal: String,
     credential: Vec<u8>,
     token: Option<CachedToken>,
 }
@@ -942,11 +953,11 @@ impl ClusterClient {
         Ok(resp.base)
     }
 
-    /// F-AUTHZ-1: mint a short-TTL capability token for `tenant` from its
+    /// F-AUTHZ-1: mint a short-TTL capability token for `principal` from its
     /// permanent `credential`. Leader-only. Returns `(token_bytes, exp_unix_secs)`.
-    pub async fn mint_token(&self, tenant: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
+    pub async fn mint_token(&self, principal: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
         let req = rkyv_encode(&MintTokenReq {
-            tenant: tenant.to_string(),
+            principal: principal.to_string(),
             credential,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -962,17 +973,18 @@ impl ClusterClient {
         Ok((resp.token, resp.exp))
     }
 
-    /// F-AUTHZ-1: create/rotate a tenant account (admin). Returns the permanent
-    /// credential. Leader-only.
-    pub async fn tenant_create(
+    /// F-NS-PRINCIPAL-UNIFIED: create/rotate a principal account (admin). Returns
+    /// the permanent credential. Leader-only. (`TenantCreateReq.tenant` carries the
+    /// principal NAME — the wire struct name is retained; the concept is principal.)
+    pub async fn principal_create(
         &self,
-        tenant: &str,
+        principal: &str,
         allowed_prefixes: Vec<Vec<u8>>,
         admin_token: &str,
     ) -> Result<Vec<u8>> {
         let req = rkyv_encode(&TenantCreateReq {
             admin_token: admin_token.to_string(),
-            tenant: tenant.to_string(),
+            tenant: principal.to_string(),
             allowed_prefixes,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -995,11 +1007,11 @@ impl ClusterClient {
         Ok(resp.credential)
     }
 
-    /// F-AUTHZ-1: delete a tenant account (admin). Leader-only.
-    pub async fn tenant_delete(&self, tenant: &str, admin_token: &str) -> Result<()> {
+    /// F-NS-PRINCIPAL-UNIFIED: delete a principal account (admin). Leader-only.
+    pub async fn principal_delete(&self, principal: &str, admin_token: &str) -> Result<()> {
         let req = rkyv_encode(&TenantDeleteReq {
             admin_token: admin_token.to_string(),
-            tenant: tenant.to_string(),
+            tenant: principal.to_string(),
         });
         let managers = self.manager_addrs.len().max(1) as u32;
         let resp: CodeResp = self
@@ -1139,22 +1151,24 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("manager not connected"))
     }
 
-    /// F-KEY-NS D7: connect a SCOPED client bound to `(namespace, tenant)`. Every
-    /// data op is confined to `{namespace}/{tenant}/` — **Prepend-only**: the
-    /// client ALWAYS prepends `{namespace}/{tenant}/` to the user key (scope
-    /// locked by construction; the built-in key builders emit RELATIVE keys). This
-    /// is the entry point EVERY data-plane writer must use (CLI, PyO3 data
-    /// clients, kvcache, bench). Admin / mgr-only / unscoped callers use
-    /// `connect_raw`.
-    pub async fn connect(manager: &str, namespace: &str, tenant: &str) -> Result<Self> {
-        for (kind, seg) in [("namespace", namespace), ("tenant", tenant)] {
+    /// F-NS-PRINCIPAL-UNIFIED: connect a SCOPED client bound to a key-prefix
+    /// `scope` (`fs`, `gallery`, or an in-namespace sub-prefix `mem/agent7`). Every
+    /// data op is confined to `{scope}/` — **Prepend-only**: the client ALWAYS
+    /// prepends `{scope}/` to the user key (scope locked by construction; the
+    /// built-in key builders emit RELATIVE keys). This is the entry point EVERY
+    /// data-plane writer must use (CLI, PyO3 data clients, kvcache, bench). Admin /
+    /// mgr-only / unscoped callers use `connect_raw`. Each `/`-delimited segment of
+    /// `scope` must match `[a-z0-9._-]+`; the FIRST segment is the namespace
+    /// (Layer-A checks it against the registry).
+    pub async fn connect(manager: &str, scope: &str) -> Result<Self> {
+        for seg in scope.trim_end_matches('/').split('/') {
             if !is_valid_scope_segment(seg) {
                 return Err(anyhow!(
-                    "invalid {kind} {seg:?}: must be non-empty and match [a-z0-9._-]+ (no '/')"
+                    "invalid scope segment {seg:?} in {scope:?}: each segment must be non-empty and match [a-z0-9._-]+"
                 ));
             }
         }
-        Self::connect_with_binding(manager, NamespaceBinding::scoped(namespace, tenant)).await
+        Self::connect_with_binding(manager, NamespaceBinding::scoped(scope)).await
     }
 
     /// F-KEY-NS D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO
@@ -1405,9 +1419,9 @@ impl ClusterClient {
     /// token scoped to the tenant's granted prefixes. Anonymous (no credential,
     /// the default) works unchanged against non-authz clusters. Clears cached PS
     /// connections so they rebind under the new identity.
-    pub fn set_tenant_credential(&self, tenant: impl Into<String>, credential: Vec<u8>) {
+    pub fn set_principal_credential(&self, principal: impl Into<String>, credential: Vec<u8>) {
         *self.auth.borrow_mut() = Some(ClientAuth {
-            tenant: tenant.into(),
+            principal: principal.into(),
             credential,
             token: None,
         });
@@ -1416,23 +1430,22 @@ impl ClusterClient {
         self.ps_conns.borrow_mut().clear();
     }
 
-    /// F-AUTHZ-1 / F-KEY-NS D7: connect a SCOPED client + set its authz
-    /// credential in one call. `principal` is the authz identity (the credential
-    /// owner —细化三 renamed the old "tenant" kwarg to principal); `namespace` /
-    /// `tenant` are the KEY scope. When authz is enabled, this validates at bind
-    /// time that `{namespace}/{tenant}/` is covered by one of the credential's
+    /// F-NS-PRINCIPAL-UNIFIED: connect a SCOPED client + set its authz credential
+    /// in one call. `scope` is the KEY prefix (`fs`, `mem/agent7`); `principal` is
+    /// the authz identity (credential owner, sourced from the credential file's
+    /// name line, §8.5); `credential` is the raw secret. When authz is enabled this
+    /// validates at bind time that `{scope}/` is covered by one of the credential's
     /// granted `allowed_prefixes` (fail-fast — a mis-scoped credential fails at
-    /// connect, not on the first write). When authz is off (no signing key), the
+    /// connect, not on the first write). When authz is off (no signing key) the
     /// mint fails harmlessly and the check is skipped.
     pub async fn connect_with_credential(
         manager: &str,
-        namespace: &str,
-        tenant: &str,
+        scope: &str,
         principal: impl Into<String>,
         credential: Vec<u8>,
     ) -> Result<Self> {
-        let c = Self::connect(manager, namespace, tenant).await?;
-        c.set_tenant_credential(principal, credential);
+        let c = Self::connect(manager, scope).await?;
+        c.set_principal_credential(principal, credential);
         c.validate_credential_scope().await?;
         Ok(c)
     }
@@ -1516,14 +1529,14 @@ impl ClusterClient {
             }
         }
         // Mint / renew. Scoped borrow (nothing held across the await).
-        let (tenant, credential) = {
+        let (principal, credential) = {
             let auth = self.auth.borrow();
             let a = auth
                 .as_ref()
-                .ok_or_else(|| anyhow!("no tenant credential set"))?;
-            (a.tenant.clone(), a.credential.clone())
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
+            (a.principal.clone(), a.credential.clone())
         };
-        let (token, exp) = self.mint_token(&tenant, credential).await?;
+        let (token, exp) = self.mint_token(&principal, credential).await?;
         let renewed = {
             let mut auth = self.auth.borrow_mut();
             let a = auth
@@ -3323,16 +3336,16 @@ impl ClusterClient {
         }
     }
 
-    /// F-KEY-NS D7: a VIEW of this client re-scoped to a DIFFERENT
-    /// `(namespace, tenant)`, sharing the same connection pools — for
-    /// multi-namespace tools (dashboard / migration) that operate across scopes
+    /// F-NS-PRINCIPAL-UNIFIED: a VIEW of this client re-scoped to a DIFFERENT
+    /// key-prefix `scope` (`fs`, `mem/agent7`), sharing the same connection pools —
+    /// for multi-namespace tools (dashboard / migration) that operate across scopes
     /// without reconnecting. Exposes the core KV ops (`put`/`get`/`delete`/
     /// `head`/`range`); exotic ZC/batch/stream ops use a dedicated scoped
     /// `ClusterClient`.
-    pub fn rescope(&self, namespace: &str, tenant: &str) -> NamespaceScope<'_> {
+    pub fn rescope(&self, scope: &str) -> NamespaceScope<'_> {
         NamespaceScope {
             client: self,
-            binding: NamespaceBinding::scoped(namespace, tenant),
+            binding: NamespaceBinding::scoped(scope),
         }
     }
 
@@ -4622,14 +4635,15 @@ mod namespace_binding_tests {
 
     #[test]
     fn scoped_always_prepends_incl_builtins() {
-        // Prepend-only, TENANT-FIRST: EVERY scoped namespace (built-in or user)
-        // prepends `{tenant}/{ns}/`; there is no Assert mode. Built-in key
-        // builders emit keys RELATIVE to the prefix, so there is no double-prefix.
-        for (ns, tenant) in [("fs", "acme"), ("kvc", "acme"), ("mem", "acme"), ("bench", "perf")] {
-            let b = NamespaceBinding::scoped(ns, tenant);
-            let want = format!("{tenant}/{ns}/").into_bytes();
+        // Prepend-only, NS-FIRST (Option 3): EVERY scope prepends `{scope}/`;
+        // there is no Assert mode. Built-in key builders emit keys RELATIVE to the
+        // prefix, so there is no double-prefix. A scope may be a whole namespace
+        // (`fs`) or an in-namespace sub-prefix (`mem/agent7`).
+        for scope in ["fs", "kvc", "mem", "bench/perf", "mem/agent7"] {
+            let b = NamespaceBinding::scoped(scope);
+            let want = format!("{scope}/").into_bytes();
             match &b {
-                NamespaceBinding::Scoped { prefix, .. } => assert_eq!(prefix, &want),
+                NamespaceBinding::Scoped { prefix } => assert_eq!(prefix, &want),
                 _ => panic!("expected Scoped"),
             }
             assert_eq!(
@@ -4637,15 +4651,17 @@ mod namespace_binding_tests {
                 [want.as_slice(), b"rel/key"].concat()
             );
         }
+        // A trailing slash in the scope is idempotent.
+        assert_eq!(NamespaceBinding::scoped("fs/").prefix().unwrap(), b"fs/");
     }
 
     #[test]
     fn prepend_binds_and_strips() {
-        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
-        assert_eq!(b.bind_key(b"k1").unwrap(), b"perf/bench/k1".to_vec());
-        assert_eq!(b.bind_key(b"").unwrap(), b"perf/bench/".to_vec());
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert_eq!(b.bind_key(b"k1").unwrap(), b"bench/perf/k1".to_vec());
+        assert_eq!(b.bind_key(b"").unwrap(), b"bench/perf/".to_vec());
         // strip is the inverse for keys under the prefix.
-        assert_eq!(b.strip(b"perf/bench/k1".to_vec()), b"k1".to_vec());
+        assert_eq!(b.strip(b"bench/perf/k1".to_vec()), b"k1".to_vec());
         // a key NOT under the prefix is returned unchanged by strip.
         assert_eq!(b.strip(b"other".to_vec()), b"other".to_vec());
     }
@@ -4653,12 +4669,12 @@ mod namespace_binding_tests {
     #[test]
     fn scope_is_locked_by_construction() {
         // The whole point of Prepend-only: a scoped client CANNOT emit a key
-        // outside its `{tenant}/{ns}/`. Even a key that "looks like" another
-        // scope is prepended, landing it firmly inside this one.
-        let b = NamespaceBinding::scoped("mem", "acme"); // → acme/mem/
+        // outside its `{scope}/`. Even a key that "looks like" another scope is
+        // prepended, landing it firmly inside this one.
+        let b = NamespaceBinding::scoped("mem/acme"); // → mem/acme/
         assert_eq!(
             b.bind_key(b"other/mem/x").unwrap(),
-            b"acme/mem/other/mem/x".to_vec(),
+            b"mem/acme/other/mem/x".to_vec(),
         );
         // bind_key is infallible for a scoped binding — no escape, no reject.
         assert!(b.bind_key(b"\xff\xfeanything").is_ok());
@@ -4675,45 +4691,43 @@ mod namespace_binding_tests {
 
     #[test]
     fn upper_cap_is_the_slash_successor() {
-        // `{tenant}/{ns}/` → `{tenant}/{ns}0` ('/'=0x2f, '0'=0x30).
-        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
-        assert_eq!(b.upper_cap().unwrap(), b"perf/bench0".to_vec());
+        // `{scope}/` → `{scope-last-seg}0` ('/'=0x2f, '0'=0x30).
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert_eq!(b.upper_cap().unwrap(), b"bench/perf0".to_vec());
         // Every key under the prefix sorts strictly below the cap.
         let cap = b.upper_cap().unwrap();
-        assert!(b"perf/bench/".to_vec() < cap);
-        assert!(b"perf/bench/zzzzz".to_vec() < cap);
-        assert!(b"perf/bench/\xff".to_vec() < cap);
-        // The next namespace within the tenant sorts at/above the cap.
-        assert!(b"perf/benci/".to_vec() >= cap);
+        assert!(b"bench/perf/".to_vec() < cap);
+        assert!(b"bench/perf/zzzzz".to_vec() < cap);
+        assert!(b"bench/perf/\xff".to_vec() < cap);
+        // The next sub-prefix sorts at/above the cap.
+        assert!(b"bench/perg/".to_vec() >= cap);
     }
 
     #[test]
     fn bind_prefix_matches_bind_key() {
-        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
-        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"perf/bench/pre".to_vec());
-        // empty user prefix → the namespace lower bound.
-        assert_eq!(b.bind_prefix(b"").unwrap(), b"perf/bench/".to_vec());
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"bench/perf/pre".to_vec());
+        // empty user prefix → the scope lower bound.
+        assert_eq!(b.bind_prefix(b"").unwrap(), b"bench/perf/".to_vec());
     }
 
     #[test]
-    fn stripe_chunk_keys_land_in_the_tenant_range() {
+    fn stripe_chunk_keys_land_in_the_scope_range() {
         // A stripe chunk key (`\xff\xfe…`) is just a normal user key to the
-        // binding, so a scoped (Prepend) client prepends `{tenant}/{ns}/` and the
-        // chunk lands INSIDE the tenant range (Layer-A / authz / presplit cover
-        // it). No special chunk path is needed under Prepend-only.
+        // binding, so a scoped (Prepend) client prepends `{scope}/` and the chunk
+        // lands INSIDE the scope range (Layer-A / authz / presplit cover it). No
+        // special chunk path is needed under Prepend-only.
         let chunk = make_chunk_key(b"userkey", 3);
-        let b = NamespaceBinding::scoped("bench", "perf"); // → perf/bench/
-        assert!(b.bind_key(&chunk).unwrap().starts_with(b"perf/bench/"));
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert!(b.bind_key(&chunk).unwrap().starts_with(b"bench/perf/"));
         // Raw: passthrough (legacy global chunk space).
         assert_eq!(NamespaceBinding::Raw.bind_key(&chunk).unwrap(), chunk);
     }
 
     #[test]
     fn scope_segment_validation_rejects_forged_scopes() {
-        // P2 (fable review): connect() must reject a `/`-containing or empty
-        // ns/tenant, else a scope can be forged/nested (`mem` + `acme/sub` →
-        // `mem/acme/sub/`) — the old q() percent-encoding defense is gone under
-        // Prepend-only, so this charset check restores it.
+        // connect() validates EACH `/`-delimited segment against `[a-z0-9._-]+`,
+        // so an empty or illegal segment can't forge/nest a scope.
         for ok in ["bench", "kvc", "acme", "default", "model-cfg_1.0", "a-b_c.d"] {
             assert!(super::is_valid_scope_segment(ok), "{ok} should be valid");
         }

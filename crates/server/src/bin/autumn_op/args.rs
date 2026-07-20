@@ -167,7 +167,12 @@ impl SplitPoint {
                 tenant,
                 suffix,
             } => {
-                let mut key = format!("{tenant}/{namespace}/").into_bytes();
+                // F-NS-PRINCIPAL-UNIFIED: cut key = `{namespace}/` (+ `{tenant}/`
+                // as an in-namespace sub-segment, e.g. mem/kvc; empty for fs).
+                let mut key = format!("{namespace}/").into_bytes();
+                if !tenant.is_empty() {
+                    key.extend_from_slice(format!("{tenant}/").as_bytes());
+                }
                 key.extend_from_slice(suffix);
                 Some(key)
             }
@@ -184,11 +189,16 @@ impl SplitPoint {
                 tenant,
                 suffix,
             } => {
+                let base = if tenant.is_empty() {
+                    format!("{namespace}/")
+                } else {
+                    format!("{namespace}/{tenant}/")
+                };
                 if suffix.is_empty() {
-                    format!("pair boundary {tenant}/{namespace}/")
+                    format!("pair boundary {base}")
                 } else {
                     format!(
-                        "{tenant}/{namespace}/ + suffix 0x{}",
+                        "{base} + suffix 0x{}",
                         suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     )
                 }
@@ -330,22 +340,24 @@ pub(crate) enum Command {
     GenSigningKey {
         kid: u32,
     },
-    /// Create/rotate a tenant account (admin — needs `--admin-token`). Returns
-    /// the tenant's permanent credential (shown once).
-    TenantCreate {
-        tenant: String,
-        prefixes: Vec<String>,
+    /// F-NS-PRINCIPAL-UNIFIED: create/rotate a PRINCIPAL account (admin — needs
+    /// `--admin-token`). Returns the principal's permanent credential (shown once,
+    /// as `<name>\n<hex>` for direct save to a credential file).
+    PrincipalCreate {
+        principal: String,
+        /// Granted key prefixes (`--grant fs/`, repeatable). Normalized to end `/`.
+        grants: Vec<String>,
         admin_token: String,
     },
-    /// Remove a tenant account (admin). Its current token still works until exp.
-    TenantDelete {
-        tenant: String,
+    /// Remove a principal account (admin). Its current token still works until exp.
+    PrincipalDelete {
+        principal: String,
         admin_token: String,
     },
-    /// Mint a short-TTL capability token from a tenant credential. Prints the
+    /// Mint a short-TTL capability token from a principal credential. Prints the
     /// token (hex) to stdout.
     MintToken {
-        tenant: String,
+        principal: String,
         credential: String,
     },
     /// F-KEY-NS D2: register a namespace (admin — needs `--admin-token`).
@@ -582,20 +594,20 @@ pub(crate) fn parse() -> Args {
             }
             Command::GenSigningKey { kid }
         }
-        "tenant-create" => {
-            let mut tenant = String::new();
-            let mut prefixes: Vec<String> = Vec::new();
+        "principal-create" => {
+            let mut principal = String::new();
+            let mut grants: Vec<String> = Vec::new();
             let mut admin_token = String::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--tenant" => {
+                    "--principal" => {
                         i += 1;
-                        tenant = val(&raw, i).to_owned();
+                        principal = val(&raw, i).to_owned();
                         i += 1;
                     }
-                    "--prefix" => {
+                    "--grant" => {
                         i += 1;
-                        prefixes.push(val(&raw, i).to_owned());
+                        grants.push(val(&raw, i).to_owned());
                         i += 1;
                     }
                     "--admin-token" => {
@@ -615,23 +627,23 @@ pub(crate) fn parse() -> Args {
             }
             // Validate at parse time (fail-fast, coco P3): the RPC needs a
             // non-empty admin token; catch a missing --admin-token[-file] here.
-            if tenant.is_empty() || prefixes.is_empty() || admin_token.is_empty() {
+            if principal.is_empty() || grants.is_empty() || admin_token.is_empty() {
                 usage();
             }
-            Command::TenantCreate {
-                tenant,
-                prefixes,
+            Command::PrincipalCreate {
+                principal,
+                grants,
                 admin_token,
             }
         }
-        "tenant-delete" => {
-            let mut tenant = String::new();
+        "principal-delete" => {
+            let mut principal = String::new();
             let mut admin_token = String::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--tenant" => {
+                    "--principal" => {
                         i += 1;
-                        tenant = val(&raw, i).to_owned();
+                        principal = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--admin-token" => {
@@ -647,22 +659,22 @@ pub(crate) fn parse() -> Args {
                     _ => break,
                 }
             }
-            if tenant.is_empty() || admin_token.is_empty() {
+            if principal.is_empty() || admin_token.is_empty() {
                 usage();
             }
-            Command::TenantDelete {
-                tenant,
+            Command::PrincipalDelete {
+                principal,
                 admin_token,
             }
         }
         "mint-token" => {
-            let mut tenant = String::new();
+            let mut principal = String::new();
             let mut credential = String::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--tenant" => {
+                    "--principal" | "--tenant" => {
                         i += 1;
-                        tenant = val(&raw, i).to_owned();
+                        principal = val(&raw, i).to_owned();
                         i += 1;
                     }
                     "--credential" => {
@@ -679,10 +691,10 @@ pub(crate) fn parse() -> Args {
                     _ => break,
                 }
             }
-            if tenant.is_empty() || credential.is_empty() {
+            if principal.is_empty() || credential.is_empty() {
                 usage();
             }
-            Command::MintToken { tenant, credential }
+            Command::MintToken { principal, credential }
         }
         // F-KEY-NS D2: namespace registry admin
         "namespace-create" => {
@@ -1052,15 +1064,15 @@ pub(crate) fn parse() -> Args {
             let namespace = namespace.unwrap_or_else(|| {
                 eprintln!("presplit requires --namespace <fs|kvc|mem>"); std::process::exit(1);
             });
-            let tenant = tenant.unwrap_or_else(|| {
-                eprintln!("presplit requires --tenant <T>"); std::process::exit(1);
-            });
-            // `tenant` is concatenated raw into the `{tenant}/{namespace}/` cut key,
-            // so it MUST be a single lowercase path segment — same guard `split`
-            // uses. Without it `--tenant acme/prod` would cut at `acme/prod/…`,
-            // i.e. into a DIFFERENT tenant/namespace boundary than the operator
-            // named (and empty/uppercase/space tenants would be silently accepted).
-            reject_bad_segment("presplit", "tenant", &tenant);
+            // F-NS-PRINCIPAL-UNIFIED: `--tenant` is an OPTIONAL in-namespace
+            // sub-segment (mem/kvc). fs has no tenant → default empty → cut at
+            // `{namespace}/`. When given it is concatenated raw into the
+            // `{namespace}/{tenant}/` cut key, so it MUST be a single lowercase
+            // path segment — same guard `split` uses.
+            let tenant = tenant.unwrap_or_default();
+            if !tenant.is_empty() {
+                reject_bad_segment("presplit", "tenant", &tenant);
+            }
             let rule = match namespace.as_str() {
                 "fs" => {
                     // F-FS-STRIPE: `--lanes N` presplits fs into N LANE partitions
@@ -1352,38 +1364,35 @@ pub(crate) fn build_split_point(
         }
         return SplitPoint::Raw(bytes);
     }
-    match (namespace, tenant) {
-        (Some(namespace), Some(tenant)) => {
-            // coco P2: namespace/tenant MUST be single path segments, else the
-            // (ns, tenant, suffix) triple is not 1:1 with the assembled raw key
-            // — `--tenant acme/prod --at ""` would collide with
-            // `--tenant acme --at prod/` and cut at a boundary the operator did
-            // NOT intend. Enforce the F-KEY-NS charset `[a-z0-9._-]+` (no `/`,
-            // non-empty). A key that genuinely needs other bytes must use the
-            // `--at-raw-hex` escape hatch.
+    // F-NS-PRINCIPAL-UNIFIED: `--namespace` alone is enough (fs has no tenant);
+    // `--tenant` is an OPTIONAL in-namespace sub-segment (mem/kvc).
+    match namespace {
+        Some(namespace) => {
+            // Each segment MUST be a single path segment (`[a-z0-9._-]+`, no `/`),
+            // else the (ns, tenant, suffix) triple is not 1:1 with the assembled
+            // raw key. A key that needs other bytes uses `--at-raw-hex`.
             reject_bad_segment("split", "namespace", &namespace);
-            reject_bad_segment("split", "tenant", &tenant);
+            let tenant = tenant.unwrap_or_default();
+            if !tenant.is_empty() {
+                reject_bad_segment("split", "tenant", &tenant);
+            }
             SplitPoint::Namespaced {
                 namespace,
                 tenant,
-                // Omitted suffix = empty = cut exactly at the pair boundary.
+                // Omitted suffix = empty = cut exactly at the namespace/pair boundary.
                 suffix: suffix.unwrap_or_default(),
             }
         }
-        (None, None) => {
-            if suffix.is_some() {
+        None => {
+            if suffix.is_some() || tenant.is_some() {
                 eprintln!(
-                    "split: --at/--at-hex require --namespace <ns> --tenant <t> \
-                     (a suffix is relative to a namespace/tenant pair). For a \
-                     whole raw key use --at-raw-hex."
+                    "split: --at/--at-hex/--tenant require --namespace <ns> \
+                     (a suffix/tenant is relative to a namespace). For a whole raw \
+                     key use --at-raw-hex."
                 );
                 std::process::exit(1);
             }
             SplitPoint::Median
-        }
-        _ => {
-            eprintln!("split: --namespace and --tenant must be given together");
-            std::process::exit(1);
         }
     }
 }
@@ -1698,6 +1707,7 @@ mod tests {
 
     #[test]
     fn split_point_namespaced_with_suffix_assembles_prefix() {
+        // F-NS-PRINCIPAL-UNIFIED: NS-FIRST; tenant is an in-namespace sub-segment.
         let p = SplitPoint::Namespaced {
             namespace: "kvc".into(),
             tenant: "acme".into(),
@@ -1705,34 +1715,44 @@ mod tests {
         };
         assert_eq!(
             p.resolve_at_key().unwrap(),
-            b"acme/kvc/vllm/v1/80".to_vec() // TENANT-FIRST
+            b"kvc/acme/vllm/v1/80".to_vec()
         );
     }
 
     #[test]
+    fn split_point_empty_tenant_cuts_at_namespace_boundary() {
+        // fs has no tenant → cut at the namespace boundary `fs/`.
+        let p = SplitPoint::Namespaced {
+            namespace: "fs".into(),
+            tenant: String::new(),
+            suffix: vec![],
+        };
+        assert_eq!(p.resolve_at_key().unwrap(), b"fs/".to_vec());
+    }
+
+    #[test]
     fn split_point_empty_suffix_is_pair_boundary() {
-        // The common "split a tenant's namespace off" op: empty suffix cuts
-        // exactly at the pair boundary "tenant/ns/".
+        // With a tenant sub-segment, empty suffix cuts at "ns/tenant/".
         let p = SplitPoint::Namespaced {
             namespace: "kvc".into(),
             tenant: "acme".into(),
             suffix: vec![],
         };
-        assert_eq!(p.resolve_at_key().unwrap(), b"acme/kvc/".to_vec());
+        assert_eq!(p.resolve_at_key().unwrap(), b"kvc/acme/".to_vec());
     }
 
     #[test]
     fn split_point_hex_suffix_carries_binary_bytes() {
         // --at-hex path: a binary suffix (e.g. an fs inode prefix) rides on
-        // the same tenant/ns assembly.
+        // the `{ns}/` assembly (fs has no tenant sub-segment).
         let suffix = super::parse_hex_key("0103ff00");
         assert_eq!(suffix, vec![0x01, 0x03, 0xff, 0x00]);
         let p = SplitPoint::Namespaced {
             namespace: "fs".into(),
-            tenant: "t1".into(),
+            tenant: String::new(),
             suffix,
         };
-        let mut expected = b"t1/fs/".to_vec();
+        let mut expected = b"fs/".to_vec();
         expected.extend_from_slice(&[0x01, 0x03, 0xff, 0x00]);
         assert_eq!(p.resolve_at_key().unwrap(), expected);
     }

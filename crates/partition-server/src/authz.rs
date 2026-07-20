@@ -390,21 +390,17 @@ pub fn check_layer_a(
     payload: &[u8],
     inner: &AuthzInner,
 ) -> Option<(StatusCode, String)> {
-    // TENANT-FIRST: the wire key is `{tenant}/{ns}/…`, so a registered namespace
-    // (`{name}/`, e.g. `fs/`) is the SECOND `/`-delimited segment, not a left
-    // prefix. Extract `{ns}/` (the bytes between the 1st and 2nd `/`, inclusive
-    // of the 2nd) and require an EXACT match against a registered namespace.
-    // `{tenant}` + `{ns}` are ASCII-no-slash (`is_valid_scope_segment`), so the
-    // first two slashes bound them even if the binary key tail contains `/`.
+    // F-NS-PRINCIPAL-UNIFIED (Option 3): the wire key is `{ns}/…` (NO tenant
+    // segment), so a registered namespace (`{name}/`, e.g. `fs/`) is the FIRST
+    // `/`-delimited segment. Extract `{ns}/` (the bytes up to and including the
+    // first `/`) and require an EXACT match against a registered namespace. `{ns}`
+    // is ASCII-no-slash (`is_valid_scope_segment`), so the first slash bounds it
+    // even if the binary key tail contains `/`.
     fn in_a_namespace(key: &[u8], namespaces: &[Vec<u8>]) -> bool {
         let Some(s1) = key.iter().position(|&b| b == b'/') else {
             return false;
         };
-        let Some(rel) = key.get(s1 + 1..).and_then(|t| t.iter().position(|&b| b == b'/')) else {
-            return false;
-        };
-        let s2 = s1 + 1 + rel;
-        let ns_with_slash = &key[s1 + 1..=s2]; // `{ns}/`
+        let ns_with_slash = &key[..=s1]; // `{ns}/`
         namespaces.iter().any(|ns| ns.as_slice() == ns_with_slash)
     }
     fn reject(key: &[u8]) -> Option<(StatusCode, String)> {
@@ -691,19 +687,19 @@ mod tests {
 
     #[test]
     fn layer_a_admits_put_in_registered_namespace() {
-        // TENANT-FIRST: namespace is the 2nd segment of `{tenant}/{ns}/…`.
+        // F-NS-PRINCIPAL-UNIFIED: namespace is the FIRST segment of `{ns}/…`.
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec(), b"mem/".to_vec()]);
-        assert!(check_layer_a(MSG_PUT, &put_payload(b"acme/kvc/x"), &inner).is_none());
-        assert!(check_layer_a(MSG_PUT, &put_payload(b"acme/mem/y"), &inner).is_none());
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"kvc/x"), &inner).is_none());
+        assert!(check_layer_a(MSG_PUT, &put_payload(b"mem/acme/y"), &inner).is_none());
     }
 
     #[test]
     fn layer_a_rejects_put_in_unregistered_namespace() {
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
-        // valid tenant, UNregistered 2nd-segment namespace → reject.
-        let d = check_layer_a(MSG_PUT, &put_payload(b"t1/scratch/x"), &inner);
+        // UNregistered 1st-segment namespace → reject.
+        let d = check_layer_a(MSG_PUT, &put_payload(b"scratch/x"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))), "{d:?}");
-        // A raw key with no `{tenant}/{ns}/` structure is rejected too.
+        // A raw key with no `{ns}/` structure is rejected too.
         let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
     }
@@ -716,8 +712,8 @@ mod tests {
             region_epoch: 0,
             must_sync: true,
             ops: vec![
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/1".to_vec(), value: vec![], expires_at: 0 },
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/2".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/2".to_vec(), value: vec![], expires_at: 0 },
             ],
         })
         .to_vec();
@@ -727,8 +723,8 @@ mod tests {
             region_epoch: 0,
             must_sync: true,
             ops: vec![
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/kvc/1".to_vec(), value: vec![], expires_at: 0 },
-                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"a/scratch/2".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/1".to_vec(), value: vec![], expires_at: 0 },
+                partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"scratch/2".to_vec(), value: vec![], expires_at: 0 },
             ],
         })
         .to_vec();

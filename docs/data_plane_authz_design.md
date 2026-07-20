@@ -1,5 +1,12 @@
 # 数据面 key-range 授权（服务端 authz）设计
 
+> **⚑ 术语更新（F-NS-PRINCIPAL-UNIFIED / Option 3, 2026-07-19）：本文的「tenant」概念
+> 已改叫「principal」，key 布局从 `{tenant}/{ns}/` 变为 `{ns}/[rel]`（删 tenant 段）。
+> KDC 机制（manager 私钥签、PS 公钥离线验、短 TTL token、前缀 gate）**完全不变** —— 只是
+> token 的 grant 从 `{tenant}/…` 变成 `{ns}/…`（whole-ns 或 in-ns 子前缀）。CLI：
+> `principal-create --grant` 取代 `tenant-create --prefix`；`MintTokenReq.tenant→principal`；
+> WIRE v25→v26。下文读「tenant」为「principal」。权威设计见 key_namespace_split_design.md §8。**
+
 > 状态：**实现端到端完成（2026-07-01）** —— Stage 1 KDC + Stage 2 PS 强制 + Stage 3 client/工具，
 > 真二进制跨租户 e2e 通过（见文末「状态」）。设计经与用户 + coco 多轮讨论收敛。
 > 满足 plan §9.5 / §16 Phase 0 的多租户隔离。区别于（从未落地的）

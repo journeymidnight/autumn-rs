@@ -2249,7 +2249,9 @@ pub struct NamespaceListResp {
 /// receives a short-TTL signed capability token.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MintTokenReq {
-    pub tenant: String,
+    /// F-NS-PRINCIPAL-UNIFIED: the principal NAME (credential owner) to mint for.
+    /// The manager looks up the account under this name (`tenantAccount/<name>`).
+    pub principal: String,
     pub credential: Vec<u8>,
 }
 

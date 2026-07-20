@@ -74,39 +74,36 @@ impl MemoryStore {
         tenant: impl Into<String>,
         agent: impl Into<String>,
     ) -> Result<Self, AutumnError> {
-        // F-KEY-NS D7 (Prepend-only): bind the client to `mem`/`tenant` — it
-        // PREPENDS `mem/{tenant}/` to every key, so `keys.rs` emits keys RELATIVE
-        // to that scope. NEVER make keys.rs re-add `mem/{tenant}/` or every op
-        // double-prefixes. Scope is locked by construction (can't escape `mem/`).
+        // F-NS-PRINCIPAL-UNIFIED (Prepend-only): bind the client to the scope
+        // `mem/{tenant}` — it PREPENDS `mem/{tenant}/` to every key, so `keys.rs`
+        // emits keys RELATIVE to that scope (starting at `{agent}/…`). NEVER make
+        // keys.rs re-add the prefix or every op double-prefixes. `{tenant}` is an
+        // in-namespace sub-prefix the memory app owns (Option 3 dropped the SDK
+        // tenant concept; isolation is by grant on `mem/{tenant}/`).
         let tenant = tenant.into();
-        let client = ClusterClient::connect(manager, "mem", &tenant)
+        let client = ClusterClient::connect(manager, &format!("mem/{tenant}"))
             .await
             .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
         Ok(Self::with_client(Rc::new(client), tenant, agent))
     }
 
-    /// F-AUTHZ-1: connect a client bound to `credential` and build a store for
-    /// `(tenant, agent)`. Use against an authz-enabled cluster — the client
-    /// AUTH_HELLOs each PS connection with a short-TTL token (auto-minted +
-    /// renewed) scoped to the tenant's granted `mem/{tenant}/` prefix. The
-    /// `tenant` here MUST be the same tenant the credential was created for, so
-    /// the token's `allowed_prefixes` cover this store's `mem/{tenant}/` keys.
+    /// F-NS-PRINCIPAL-UNIFIED: connect a client bound to `credential` and build a
+    /// store for `(tenant, agent)`. Use against an authz-enabled cluster — the
+    /// client AUTH_HELLOs each PS connection with a short-TTL token (auto-minted +
+    /// renewed) scoped to `mem/{tenant}/`. `principal` is the credential owner
+    /// (from the credential file's name line); its grant MUST cover `mem/{tenant}/`.
     pub async fn connect_with_credential(
         manager: &str,
         tenant: impl Into<String>,
         agent: impl Into<String>,
+        principal: impl Into<String>,
         credential: Vec<u8>,
     ) -> Result<Self, AutumnError> {
         let tenant = tenant.into();
-        // F-KEY-NS D7 (Prepend-only): bind to `mem`/`tenant` (prepends the scope).
-        // The authz PRINCIPAL is the same as the key tenant by the 1:1 default
-        // convention (细化三), so the minted token's `allowed_prefixes` cover
-        // `mem/{tenant}/`.
         let client = ClusterClient::connect_with_credential(
             manager,
-            "mem",
-            &tenant,
-            tenant.clone(),
+            &format!("mem/{tenant}"),
+            principal,
             credential,
         )
         .await
