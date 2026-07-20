@@ -4,6 +4,7 @@ Status: PROPOSAL（未实现；本文档只做设计与论证）
 Date: 2026-07-16
 
 > **⚑ OPTION 3 / INTRANET-UNIFIED (2026-07-19, 取代下方所有 tenant / tenant-first 结论) → 见 §8。**
+> **（2026-07-19 fable review 后收敛为可实现版：§8.9 区分路径段型/二进制型 ns，superuser 用显式 flag 非空串，cred 文件加 name 行，迁移同批 bump WIRE。）**
 > 用户拍板：可信内网**不需要**公有云式「资源(tenant 拥有) / 权限(principal 访问)」分离
 > （那是为不可信多租户设计的）——内网里就是**一份统一 keyspace**，只是不同 principal 有
 > 不同权限。于是**彻底删掉 tenant 概念 + `{tenant}/` 段**：key = `{ns}/[relative]`（namespace
@@ -1217,10 +1218,16 @@ autumn-rs 的部署前提是**可信内网**（sglang/vLLM 推理集群，RoCE �
   app 用 `namespace-create` 加自己的，如 `gallery`）。Layer-A 认 key **第 1 段**。
 - **principal** = 唯一身份：`autumn-op principal-create <name> --grant <prefix> [--grant …]`
   → manager 存 `{name, credential_hash, allowed_prefixes}`，返回长期凭据（≈ refresh
-  token，交给该组件）。grant **通常就是一个 ns**（`fs/`），要细分就授子前缀
-  （`fs/models/`、`mem/agent7/`）。
-- **隔离** = 授不同子前缀；多个组件共享一个 ns 就各授 `fs/a/`、`fs/b/`，各写各的段。
-  "tenant" 退化成 **ns 内的一段前缀约定**（app 自己写在 grant 的前缀下），不是强制 key 段。
+  token，交给该组件）。grant **通常就是一个 ns**（`fs/`）。**能否再细分成子前缀取决于
+  该 ns 的 key 形态——见 §8.9**：
+  - **路径段型 ns**（相对 key 以 ASCII 段开头：`mem/{agent}/…`、`kvc/{model}/…`）→
+    子前缀 grant 有意义（`mem/agent7/`），Layer-B 字节前缀真能切开。
+  - **二进制型 ns**（相对 key 是定长二进制记录：fuse `fs/[0x01][ino]…`）→ **只能整 ns
+    授权（`fs/`），没有 ns 内子前缀可授**（`/models/` 是 dirent 名字，不是 key 前缀）。
+- **隔离**：路径段型 ns 授不同子前缀（`mem/a/`、`mem/b/`）各写各段；**二进制型 ns 无 ns
+  内隔离**——一个 `fs/` 授权 = 整棵文件系统树的读写（含伪造任意 inode 的 rmtomb 能力，
+  §8.9 权衡）。要多棵互隔离的 fuse 树，用**多个 ns**（`fsA`/`fsB`，各自注册），不是子前缀。
+  "tenant" 因此**不是**退化成"ns 内前缀约定"（对 fs 不成立），而是被 **ns 本身**取代。
 - **authz 开/关**（正交，note "tenant 一直在" 的现实版）：
   - **开**（manager 配 signing key）：principal 出示凭据（SDK 自动 mint 短 TTL token），
     PS 本地验签 + 按 token 的 `allowed_prefixes` 前缀 gate（KDC 模型不变，见
@@ -1232,21 +1239,26 @@ autumn-rs 的部署前提是**可信内网**（sglang/vLLM 推理集群，RoCE �
 
 ```bash
 # 建身份 + 授权（唯一的"一处定义"）：
-autumn-op principal-create loader --grant fs/models/     # → loader.cred
-autumn-op principal-create agent  --grant mem/           # → agent.cred
+autumn-op principal-create fs-writer --grant fs/          # → fs-writer.cred（整 fs：二进制型 ns 只能整授）
+autumn-op principal-create agent7    --grant mem/agent7/  # → agent7.cred（路径段型 ns：子前缀有意义）
+autumn-op principal-create loader    --grant kvc/         # → loader.cred
 
 # 用：只出示凭据（= principal 身份），scope 从 grant 推导：
-autumnfs        --credential-file loader.cred put model.safetensors /...   # 落 fs/models/…
-codebase-memory --credential-file agent.cred                              # 落 mem/…
+autumnfs        --credential-file fs-writer.cred put model.safetensors /...   # 落 fs/…
+codebase-memory --credential-file agent7.cred                                # 落 mem/agent7/…
 
 # 只读列举（层级）：
 autumn-op namespace-list                    # 集群有哪些 ns（第 1 段）
 $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=authz 关时；开时要 grant 覆盖 fs/）
 ```
 
-- **删 `--tenant`、`--principal` 两个 flag**。数据面 scope 来自：① 凭据的单条 grant
-  自动推导；② 或显式 `--namespace <ns>`（authz 关、或凭据授多前缀需选一条时）。
-- `principal-create` 取代 `tenant-create`；`--grant`（可重复）取代 `--prefix`。
+- **删 `--tenant`、`--principal` 两个 flag**。数据面 scope 来自：① 凭据的**单条** grant
+  自动推导（见 §8.9 推导规则）；② 或显式 `--namespace <ns>`（authz 关、或凭据授**多条**
+  前缀需选一条时）。**principal 名字随凭据文件携带**（cred 文件格式加一行 `<name>`，见 §8.5）。
+- `principal-create` 取代 `tenant-create`；`--grant`（可重复）取代 `--prefix`。grant 串
+  语义：**非空、左锚字节前缀、强制补尾 `/`**（沿用今日 `handle_tenant_create` 的段边界
+  归一化，`rpc_handlers.rs:498-518`）——`""` 非法（superuser 走 §8.8 的 `--superuser` flag，
+  不用空串）。
 - authz-off 集群：不给 `--credential-file`，`--namespace fs` 直接读写（Layer-A 仍要求
   key 落在已注册 ns 下）。
 
@@ -1256,21 +1268,34 @@ $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=au
 |---|---|---|
 | wire key | `{tenant}/{ns}/[rel]` | `{ns}/[rel]` |
 | Layer-A 校验 | key 第 2 段 = ns ∈ 注册表 | key **第 1 段** = ns ∈ 注册表 |
-| SDK binding | `scoped(ns, tenant)` → 前缀 `{tenant}/{ns}/` | `scoped(ns)` / `scoped_prefix(grant)` → 前缀 `{ns}/`（或子前缀） |
-| SDK connect | `connect(mgr, ns, tenant)` / `connect_with_credential(…, principal, cred)` | `connect(mgr, ns)` / `connect_with_credential(mgr, prefix, cred)`（无 tenant/principal 段；principal 身份由凭据本身携带） |
-| 建账户 | `tenant-create --tenant X --prefix P` | `principal-create <name> --grant P`（可多条） |
-| 凭据授权 | `{tenant}/` 或 `{tenant}/{ns}/` | 任意 ns / 子前缀（`fs/`、`fs/models/`） |
-| CLI flag | `--tenant`、`--principal`、`--namespace` | 删前两个；`--namespace` 可选（能从 grant 推导则免） |
+| wire 指纹 | 现 vN | **同批 bump（MIN=MAX），把「旧镜像静默读空」变「连不上」，见 §8.6** |
+| SDK binding | `scoped(ns, tenant)` → 前缀 `{tenant}/{ns}/` | `scoped_prefix(grant)` → 前缀 = **grant 全串**（`fs/` 或 `mem/agent7/`）；binding 拼的就是这一整串（§8.9 推导规则，避免双段） |
+| SDK connect | `connect(mgr, ns, tenant)` / `connect_with_credential(…, principal, cred)` | `connect(mgr, ns)` / `connect_with_credential(mgr, cred)`（无 tenant/principal 段；prefix 从 cred 单条 grant 推，或另给 `--namespace`；principal 名字在 cred 内） |
+| 建账户 | `tenant-create --tenant X --prefix P` | `principal-create <name> --grant P`（可多条；`--superuser` 见 §8.8） |
+| 凭据授权 | `{tenant}/` 或 `{tenant}/{ns}/` | 整 ns（`fs/`）或路径段型 ns 的子前缀（`mem/agent7/`）；二进制型 ns 只能整 ns（§8.9） |
+| CLI flag | `--tenant`、`--principal`、`--namespace` | 删前两个；`--namespace` 可选（单条 grant 能推导则免） |
 | authz Layer-B | 「开了就全保护」 | 不变（开→按 grant 前缀 gate；关→不 gate） |
 
 ### 8.5 影响清单（实现时逐一）
 
 - **manager**：Layer-A 段解析改「第 1 段」；`namespace-create`/注册表不变；
   `tenant-create`→`principal-create`（账户库 `tenantAccount/`→`principalAccount/`，
-  或保留 key 名只改 CLI/语义）；`MintTokenReq`/`GetAuthzConfigResp` 字段名可留（内部）。
-- **SDK（client）**：`NamespaceBinding` 从 `{tenant}/{ns}/` 改 `{ns}/`（或按 grant 前缀）；
-  `connect` / `connect_with_credential` 删 tenant/principal 参数；`range` 钳制按新前缀；
-  内置 key builder（fuse/memory/kvc）相对 key 不变（前缀由 binding 拼）。
+  或保留 key 名只改 CLI/语义）；grant 校验**沿用非空 + 补尾 `/`**（`rpc_handlers.rs:498-518`），
+  另加 `--superuser` 走单独字段（§8.8，**不**用空串放宽校验）；`RESERVED_NAMESPACE_NAMES`
+  **保留 `default`**（`manager/src/lib.rs:96`）——否则有人注册名为 `default` 的 ns 会让旧
+  tenant-first writer 的 `default/fs/…` key 反而「通过」Layer-A 进错 ns。
+- **凭据文件格式（关键，别漏）**：删 `--principal` 后 mint 必须仍能认出身份。今日
+  cred 是**裸 hex 一行、不带名字**（`client/src/lib.rs:387`，与 Python
+  `_identity.read_credential_file` 字节兼容）。改为 **`<principal-name>\n<hex-secret>`
+  两行**：`read_credential_file` 解析出 name 塞进 `MintTokenReq.principal`，manager 按
+  name 查账户 + 常量时间比对 hash（沿用今日 lookup 路径）。**Python parser 要 lockstep 改
+  同一格式**（列进跨组件协调）。`MintTokenReq` 字段名可留（内部）。
+- **SDK（client）**：`NamespaceBinding` 从 `{tenant}/{ns}/` 改 **grant 全串**（`fs/` 或
+  `mem/agent7/`，§8.9 推导）；`connect` / `connect_with_credential` 删 tenant/principal 参数；
+  `range` 钳制按新前缀；`validate_credential_scope` 改为「scope ⊇ 或 == 某条 grant」而非
+  「scope ⊆ grant」（否则 `fs/` scope 配 `fs/models/` grant 会误拒，`lib.rs:1483`）；
+  内置 key builder（fuse/memory/kvc）相对 key 不变（前缀由 binding 拼）——**但 binding
+  必须等于完整 grant，见 §8.9，否则 memory builder 的 agent 段会双写**。
 - **CLI**：autumn-op（`principal-create --grant`、删 tenant-create/--tenant/--principal）；
   autumn-client / autumnfs / fuse（删 `--tenant`/`--principal`，`--namespace` 可选 + 凭据推导）；
   gallery / codebase-memory example 同步。
@@ -1285,8 +1310,15 @@ $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=au
 - **on-disk key schema 变了**（`{tenant}/{ns}/`→`{ns}/`）+ etcd 账户库语义变了 →
   **不做 in-place 迁移，直接 `cluster.sh reset`**（重灌权重/KV cache/记忆）。
 - 停机全停全启（仓库惯例）；rkyv fail-loud + R1 cluster_version 阻旧二进制误当选 leader。
+- **必须同批 bump WIRE（MIN=MAX，即使无 rkyv 结构变更）**。原因：本方案没改任何 wire
+  struct，若不 bump，**旧 tenant-first 镜像照样连得上**——它写 `default/fs/…` 会被 Layer-A
+  响亮拒（`NamespaceUnknown` 终止，OK），但 **读/range/delete 不被 Layer-A 门控 → 静默返回空**，
+  hermes 会看到「空 memory store」与数据丢失无法区分，kvcache 静默 100% miss。bump 后旧镜像
+  在握手期即被 wire 指纹挡下（连不上），把「静默读空」变成「明确连不上」——这才是本节想要的
+  失败语义。（符合 [[feedback_warn_on_backward_incompat]]：key 布局翻转应按 wire-fenced 破坏对待。）
 - **跨组件协调**：翻 tenant-first 会动到队友刚上线的东西 + VKE 上的 vLLM/hermes/loader
-  —— 换镜像时 loader/hermes 的连接参数（去 tenant/principal）要 lockstep，否则连不上。
+  —— 换镜像时 loader/hermes 要 lockstep（连接参数去 tenant/principal + cred 文件加 name 行 +
+  同一 WIRE），三者任一不对齐都在握手期连不上（不再是静默读空）。
 
 ### 8.7 保留的东西（不受影响）
 
@@ -1302,18 +1334,64 @@ $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=au
 
 - **authz 关**（manager 未配 signing key）：**没有 principal**。谁都能读写任何**已注册**
   的 ns（只有 Layer-A「写必须落在注册 ns 下」在）。dev / 裸跑默认。
-- **authz 开**：默认建**一个覆盖所有 ns 的 principal**（superuser），所有内置 app 共用它
-  的凭据：
-  - grant = **空前缀 `""`**（左锚匹配 ⇒ 匹配一切 key ⇒ 整个 keyspace）。
-  - cluster.sh turnkey（`AUTUMN_AUTH=1`）建这一个（取代现在建 `default` 租户凭据那步）：
-    `principal-create default --grant ""` → 一份 `default.cred` 全给 fuse/kvc/mem/gallery。
-  - **最小权限 opt-in**：要收窄再另建窄 principal（`principal-create loader --grant fs/models/`）。
+- **authz 开**：**默认不建 all-ns 万能钥匙**（一把 master 会让 Layer-B 恒真、一个有 bug 的
+  kvcache 进程能删 fs 数据，违背 D6「彻底启用」）。turnkey（`AUTUMN_AUTH=1`）改建**每族一把
+  principal**（取代今日建 `default` 租户那步）：
+  - `principal-create fs   --grant fs/`  → `fs.cred`（给 fuse / autumnfs）
+  - `principal-create kvc  --grant kvc/` → `kvc.cred`（给 kvcache loader）
+  - `principal-create mem  --grant mem/` → `mem.cred`（给 codebase-memory）
+  - app 各用自己那把，天然最小权限；这才保住 §8.7 声称「不变」的 D6 机制不变量。
+- **真需要 superuser**（跨 ns 审计/运维）→ 显式 `principal-create root --superuser`，manager
+  存一个 `is_superuser` 布尔（**不是**空串 grant，避免脚本 `--grant "$UNSET"` 静默铸出万能钥匙）；
+  `check_key`/`check_range` 对 superuser token 短路放行。
+- **最小权限本就是默认**：要更细（agent 级）再建窄 principal（`principal-create agent7 --grant mem/agent7/`，
+  仅路径段型 ns，§8.9）。
 
-两个不变量：
+三个不变量：
 
-1. **Layer-A 仍生效**：all-ns superuser 的写也必须落在**已注册 ns** 下——grant（Layer-B
-   权限）与 ns 注册（Layer-A）正交。「全权限」= 覆盖所有 ns，**不**等于能往未注册前缀乱写。
-2. **空 grant ⇒ 需显式 `--namespace`**：窄 principal（单条 grant 如 `fs/models/`）→ SDK
-   从唯一 grant **自动推 scope**，连接只出示凭据即可；all-ns principal 的 grant 覆盖多处
-   → 推不出单一 ns，数据面须显式 `--namespace fs`（或 app 自带 ns）指定本次写哪条 ns，
-   凭据覆盖一切故任何 ns 放行。
+1. **Layer-A 仍生效**：superuser 的写也必须落在**已注册 ns** 下——grant / superuser（Layer-B）
+   与 ns 注册（Layer-A）正交。「全权限」**不**等于能往未注册前缀乱写。
+2. **scope 推导**：单条 grant 的 principal → SDK 从该 grant **自动推 binding 前缀**，连接只出示
+   凭据即可（§8.9）；superuser / 多条 grant 的 principal 推不出单一前缀，数据面须显式
+   `--namespace <ns>`（或 app 自带 ns）选本次写哪条 ns。
+3. **superuser 也做不了「空 prefix 全表扫」**（`check_range` 硬拒空扫描前缀，`authz.rs:273`）。
+   跨 ns 审计要么逐 ns 迭代，要么给 superuser token 在 `check_range` 里额外放行空 prefix
+   （一行改动，实现时二选一并写清）。
+
+### 8.9 路径段型 vs 二进制型 ns：grant 粒度 + scope 推导（fable review 2026-07-19 收敛）
+
+Option 3 用「授子前缀」做 ns 内隔离——但这只对**相对 key 以 ASCII 段开头**的 ns 成立。
+按 key 形态分两类，实现时**必须区别对待**：
+
+| | 路径段型 ns | 二进制型 ns |
+|---|---|---|
+| 例 | `mem/{agent}/…`、`kvc/{model}/…`、`gallery/…` | fuse `fs/[0x01][ino]…`、`[0x02][parent][name]…` |
+| 相对 key 开头 | ASCII 段（`agent7/…`） | 定长二进制记录（`[0x01]` + ino BE） |
+| ns 内子前缀 grant | **有意义**（`mem/agent7/` 字节前缀真能切开一片子空间） | **无意义**（`fs/models/` 里 `/models/` 是 `[0x02]` 记录内的 dirent 名字，不是 key 前缀 → 匹配零个 key，连接期 `validate_credential_scope` 还会拒） |
+| 隔离手段 | 授不同子前缀 | **只能整 ns 授（`fs/`）；要多棵隔离树 → 多个 ns（`fsA`/`fsB` 各自注册）** |
+
+**二进制型 ns 的取舍（明写，别沉默）**：删 tenant 段后，fuse 从「`{tenant}/fs/` = N 棵隔离树」
+塌成「`fs/` = 一棵全局树，唯一授权单位」。**代价**：任何持 `fs/` grant 的 writer 能伪造
+`fs/[0x04]rmtomb/<任意 ino>`（mount 时无条件删对应数据）——D6「INVARIANT 由机制保证」对
+**单 ns 内**退化回「同族组件互信」。**可信内网前提下可接受**（隔离敌人靠 ns 边界 + 授不同
+ns，不靠 ns 内子前缀）；**要 fuse 树之间硬隔离就开多个 ns**，一棵树内的多写者本就该互信。
+
+**scope（binding 前缀）推导规则（定死，避免双段 bug）**：
+
+- **binding 前缀 = principal 的那条 grant 全串**（`mem/agent7/`），**不是**只取首段 ns。
+  内置 key builder（fuse/memory/kvc）吐的**相对 key 不含 ns/段前缀**（memory builder 吐
+  `{agent}/ep|fact|…` 是相对 `mem/` 的；fuse 吐 `[0x01][ino]…` 相对 `fs/` 的）。
+  ⚠️ 陷阱：若 grant=`mem/agent7/` 而 memory builder 又自吐 `agent7/…`，binding+builder 会
+  拼成 `mem/agent7/agent7/…` **双段**。→ 约定：**app 的 builder 相对 key 从「grant 尾段之后」
+  起算**；等价地，agent 级隔离时 memory 的「agent 段」由 **grant 承担**、builder 不再自吐
+  （builder 的相对 key = `ep|fact|…`）。哪一段归 binding、哪一段归 builder，**每个 app
+  在实现里声明一次**（写进各自 CLAUDE.md）。
+- **单条 grant** → 自动推导，连接只出示凭据。**多条 grant / superuser** → 推不出唯一前缀，
+  必须 `--namespace <ns>`（或 app 自带 ns）显式选。
+- **`validate_credential_scope` 方向**（`client/src/lib.rs:1483`）：今日是「scope ⊆ grant」，
+  会把「`fs/` scope 配 `fs/` grant」放行、却把「`fs/` scope 配 `fs/models/` grant」**误拒**。
+  Option 3 下连接时 scope==binding==grant，改成「**scope 必须等于或落在某条 grant 之下**」即可。
+
+> presplit（§8.7）随之细化：二进制型 ns 的切点是相对二进制字节（fuse lane `[0x03][lane]`），
+> 去 tenant 段后仍成立；但 §3.4「同 ns 两租户切不同 partition」对 fs **不再可能**（无 ns 内
+> 段可切）——要按「租户」分 partition 就分到不同 ns。路径段型 ns（kvc/mem）可按 ASCII 段切。
