@@ -1,7 +1,34 @@
 Date: 2026-07-20
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: Option 3 (F-NS-PRINCIPAL-UNIFIED) 全量重部署到 VKE 线上（用户「autumn-rs 有重大
   修改，重新全部部署」）+ 顺手把 vLLM 从 Qwen2.5-32B-AWQ 升到 72B-AWQ（用户选 TP=1）。
+
+── 线上验证全绿（2026-07-20 收尾）──
+集群 37 分区（32 bootstrap + 5 lane 切点）3 PS 均衡 12/13/12，全 RF=3。
+① authz 实测强制：无凭据 autumnfs/autumn-client put -> "protected key requires a
+   capability token"；kvc.cred 拿 fs/ scope -> "credential does not grant fs/"（最小权限）。
+② fs（fs.cred）：autumnfs put/get 字节精确；72B 上传 41 GB / 225s = **187 MiB/s 均值**
+   （峰值 761），vs 32B 那次 30-40 MiB/s → **put_many 并发修复 + 6-lane striping 实测 5x**。
+③ 权重加载：vLLM autumn loader 用 fs.cred 认证 + 流式读 **39.56 GiB / 22.8s**；KV 41.86 GiB
+   = 137,152 token（与预测 ~43GiB/~137k 吻合）。72B 正常出答案。
+④ KV cache：连接器用 kvc.cred 写入，key = kvc/model-cfg_bf90181cf493_0_1/vllm/v1/{hash}/
+   {layer}（**无 tenant 段 = Option 3 正确**；model-fp 隔离 = BUG-KVC-TENANT 修复在）。
+   external LOAD 路径：重启 vLLM 清本地 GPU prefix cache → 重发同 prompt → **本地 0% /
+   external 92.8%**（definitive proof；~7% 尾块 miss 正常）。
+⑤ mem（mem.cred）：直接跑 hermes_provider.py 的 AutumnMemory.put_fact/get_fact 往返精确；
+   无凭据写被拒。provider connect 用 Option-3 签名 Client.connect(scope=mem/default,
+   principal=,credential=)。
+镜像三件套 = 40e23eb。凭据 Secret autumn-credential（fs/kvc/mem.cred 两行 labeled）；
+autumn-authz 复用未轮换。
+
+── 遗留（非阻塞）──
+[A] 部署清单只在 /tmp/autumn-vllm-hermes/（vllm-72b/upload-model-qwen72b/hermes-tui/
+    autumn-toolbox）——不在 repo，/tmp 清掉就丢。**建议收进仓库**（examples/ 下）。
+[B] 32B 旧下载缓存 PVC model-scratch/model-scratch-32b（60Gi）仍在，用户未指示删；72B 用
+    model-scratch-72b（90Gi）。
+[C] toolbox 镜像不带 python3/curl（HTTP 冒烟测试得从 vllm pod 里跑）。
+
+── 本次会话原始 scope（实现阶段）──
 
 ── 关键发现：Python 包没跟着 Option 3 迁移（本次修掉）──
 67728e4 只改了 PyO3 层，三个 Python wrapper 还在传旧 kwargs，v26 集群上 vLLM 进程里
