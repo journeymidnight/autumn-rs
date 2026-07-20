@@ -1295,3 +1295,25 @@ $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=au
 - namespace 注册表（D2）、按 namespace 的 presplit 规则（D8，切点前缀去掉 tenant 段即可）、
   policy 的 size 口径（D3）、split/merge 机制（D4）。
 - `admin_auth_design.md` 的控制面 admin-token（F-ADMIN-OP-AUTH，仍待实现）与本节正交。
+
+### 8.8 默认 principal：一份统一资源 + 一个全权限身份
+
+贴合 8.1 的心智——默认不做差异权限，差异是 opt-in：
+
+- **authz 关**（manager 未配 signing key）：**没有 principal**。谁都能读写任何**已注册**
+  的 ns（只有 Layer-A「写必须落在注册 ns 下」在）。dev / 裸跑默认。
+- **authz 开**：默认建**一个覆盖所有 ns 的 principal**（superuser），所有内置 app 共用它
+  的凭据：
+  - grant = **空前缀 `""`**（左锚匹配 ⇒ 匹配一切 key ⇒ 整个 keyspace）。
+  - cluster.sh turnkey（`AUTUMN_AUTH=1`）建这一个（取代现在建 `default` 租户凭据那步）：
+    `principal-create default --grant ""` → 一份 `default.cred` 全给 fuse/kvc/mem/gallery。
+  - **最小权限 opt-in**：要收窄再另建窄 principal（`principal-create loader --grant fs/models/`）。
+
+两个不变量：
+
+1. **Layer-A 仍生效**：all-ns superuser 的写也必须落在**已注册 ns** 下——grant（Layer-B
+   权限）与 ns 注册（Layer-A）正交。「全权限」= 覆盖所有 ns，**不**等于能往未注册前缀乱写。
+2. **空 grant ⇒ 需显式 `--namespace`**：窄 principal（单条 grant 如 `fs/models/`）→ SDK
+   从唯一 grant **自动推 scope**，连接只出示凭据即可；all-ns principal 的 grant 覆盖多处
+   → 推不出单一 ns，数据面须显式 `--namespace fs`（或 app 自带 ns）指定本次写哪条 ns，
+   凭据覆盖一切故任何 ns 放行。

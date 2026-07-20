@@ -23,6 +23,7 @@
   - **CLI** 删 `--tenant`/`--principal`（autumn-client/autumnfs/fuse）；`tenant-create`→`principal-create --grant`；数据面只 `--credential-file`（+ 可选 `--namespace`）。
   - **PyO3 + 部署**：`autumn.Fs`/`Memory` 连接签名去 tenant/principal → **vLLM loader / hermes lockstep 改 + 重打镜像**；cluster.sh/k8s 例子凭据授权改 ns 前缀。
   - authz KDC 机制不变（token scope 从 `{tenant}/…` 变 `{ns}/…` grant）；D2 注册表 / D3 size / D4 split / D8 presplit 保留（presplit 切点去掉 tenant 段）。
+  - **默认（§8.8）**：authz 关→无 principal（谁都能写已注册 ns）；authz 开→默认一个 all-ns superuser（`principal-create default --grant ""`，cluster.sh turnkey 建，内置 app 共用），最小权限 opt-in。Layer-A 正交（superuser 也只能写已注册 ns）；空 grant 需显式 `--namespace`。
 - **迁移**: **全 reset**（用户确认线上 VKE 可全 reset，无 in-place 迁移）；停机全停全启；换镜像时 loader/hermes 连接参数 lockstep。**翻掉 F-KEY-NS-TENANT-FIRST**（队友刚上线，需协调）。
 - **Acceptance**: `principal-create --grant fs/models/` → loader.cred；`autumnfs --credential-file loader.cred put …` 落 `fs/models/…`（无 tenant 段）；未授前缀写被拒；authz-off 时 `--namespace fs` 直接读写；`namespace-list` 列 ns；旧 `--tenant`/`--principal` 不再存在；全 reset 后端到端跑通（含 vLLM 载权重 / kvcache / mem）。
 - **Status**: `passes: false` (2026-07-19, 设计定稿 = §8，待实现) — 需与 tenant-first 作者 + VKE 线上协调后作为一个专项 reviewed 改动 + reset 落地。cross-ref `F-KEY-NS-TENANT-FIRST`（被取代）、`F-ADMIN-OP-AUTH`（控制面 admin token，正交）、`docs/data_plane_authz_design.md`（KDC，机制不变）。
