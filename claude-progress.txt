@@ -1,3 +1,47 @@
+Date: 2026-07-20
+TaskStatus: not_completed
+Task scope: Option 3 (F-NS-PRINCIPAL-UNIFIED) 全量重部署到 VKE 线上（用户「autumn-rs 有重大
+  修改，重新全部部署」）+ 顺手把 vLLM 从 Qwen2.5-32B-AWQ 升到 72B-AWQ（用户选 TP=1）。
+
+── 关键发现：Python 包没跟着 Option 3 迁移（本次修掉）──
+67728e4 只改了 PyO3 层，三个 Python wrapper 还在传旧 kwargs，v26 集群上 vLLM 进程里
+每个 autumn client 都会 TypeError 起不来：
+  - autumn_vllm_loader/loader.py  -> Fs.connect(..., tenant=)   新签名无此参
+  - autumn_kvcache/vllm_connector -> BatchClient(**{namespace,tenant})  需 scope=
+  - autumn_kvcache/sglang_backend -> 同上
+修复 9c65ccc（迁移）+ 40e23eb（coco 两条 finding）:
+  - _identity.read_credential_pair -> (principal, secret)，对齐 Rust parse_credential_text；
+    read_credential_file 保留为只取 secret 的 shim。
+  - config key: auth_tenant -> auth_principal；principal 默认从凭据文件里读（文件自带名字），
+    所以只配 auth_credential_file 就够。旧拼写仍接受但 warn（否则静默变未认证）。
+  - _keys.full_key/pool_prefix 去掉首个 tenant 参（本来就被忽略）→ kvc/{model}/{pool}/{hash}。
+  - coco P2: loader 的旧 `tenant` key 改 **硬报错**（不给 alias）——kvcache 的 auth_tenant 只
+    是身份可以改名，loader 的 tenant 同时还是 fs/{tenant}/ 的 key 段，Option 3 删了这段，
+    映射成 principal 会「配置照跑但读不到权重」。
+  - coco P3: Python 解析器比 Rust 松（bytes.fromhex 接受空串 + 跳过内嵌空格），补齐 Rust 同款
+    校验；另发现反向分歧 encoding="ascii" 会拒绝 Rust 能读的文件 → 改 utf-8。
+  测试：34 个离线单测（4 个新 parity 用例）；loader 那份解析器单独跑 9 个 accept/reject 全过。
+
+── 线上现状（VKE, ns=autumn）──
+镜像三件套 = 40e23eb（autumn-rs / vllm-autumn / hermes-autumn）。
+集群：5 EN + 3 PS + manager + etcd 全绿，bootstrap 32 分区；authz 默认开且**实测强制**
+（无凭据 autumnfs put -> "protected key requires a capability token"）。
+principal（每族一个，最小权限）：fs->fs/、kvc->kvc/、mem->mem/，凭据两行 labeled 形式存进
+Secret autumn-credential（fs.cred/kvc.cred/mem.cred）；autumn-authz 复用未轮换。
+fs 布局：presplit --namespace fs --lanes 6（F-FS-STRIPE 条带，6 条 lane 分区散在 3 个 PS）。
+  ⚠ 教训：先跑了 round-trip 冒烟测试再 presplit，结果 4/5 切点被 has_overlap 挡掉；
+  清数据 + major compact 238 后重跑才切满。**presplit 必须在空 keyspace 上先做**。
+
+── 未完成（下次接手）──
+[1] 72B 权重上传中（~41 GB hf-mirror 下载 + striped 上传，job upload-model-qwen72b）。
+    这同时是 put_many 并发修复后的**上传吞吐重测**（32B 那次只有 30-40 MiB/s）。
+[2] vllm-72b.yaml / hermes-tui.yaml 已按 Option 3 改好（loader 去 tenant/principal；kvcache
+    只留 auth_credential_file；hermes 加 AUTUMN_MEMORY_CREDENTIAL_FILE + 挂 secret），**待 apply**。
+[3] 待验证：vLLM 起得来（72B ~41 GiB 权重 + ~43 GiB KV ≈ 137k token）、kvcache external 命中、
+    hermes 接上、fuse/autumnfs 大文件条带读写。
+[4] 部署清单只在 /tmp/autumn-vllm-hermes/（不在 repo，易丢）——考虑收进仓库。
+
+── 上一批（同 feature 的实现阶段）──
 Date: 2026-07-19
 TaskStatus: completed
 Task scope: F-NS-PRINCIPAL-UNIFIED (Option 3) 实现 —— 删 tenant 概念，key `{ns}/[rel]`，
