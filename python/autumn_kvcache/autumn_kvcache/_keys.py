@@ -93,25 +93,25 @@ def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     return "_".join(parts)
 
 
-def full_key(_tenant: str, model: str, content_hash: str, pool: str) -> bytes:
+def full_key(model: str, content_hash: str, pool: str) -> bytes:
     """Compose the stored partition key (utf-8 bytes), RELATIVE to the client's
-    ``kvc/{tenant}/`` binding scope.
+    ``kvc`` binding scope.
 
-    F-KEY-NS D7 (Prepend-only): the ``BatchClient`` is bound to
-    ``(namespace="kvc", tenant)`` and PREPENDS ``kvc/{tenant}/`` itself, so scope
-    is locked by construction and the builder must emit only the RELATIVE part →
+    F-NS-PRINCIPAL-UNIFIED (Option 3, Prepend-only): the ``BatchClient`` is bound
+    to ``scope="kvc"`` and PREPENDS ``kvc/`` itself, so scope is locked by
+    construction and the builder must emit only the RELATIVE part →
     ``{model}/{pool}/{content_hash}`` (the full wire key becomes
-    ``kvc/{tenant}/{model}/{pool}/{content_hash}``). ``model`` is the per-model
-    instance suffix (arch + weights fingerprint + tp/pp — what
-    ``build_tenant_suffix`` returns). ``_tenant`` is now owned by the binding and
-    ignored here (kept on the signature only so callers don't churn).
+    ``kvc/{model}/{pool}/{content_hash}``). ``model`` is the per-model instance
+    suffix (arch + weights fingerprint + tp/pp — what ``build_tenant_suffix``
+    returns). The old ``{tenant}`` segment is GONE: Option 3 dropped tenants, so
+    the leading positional arg was removed rather than left ignored.
     """
     return f"{model}/{pool}/{content_hash}".encode("utf-8")
 
 
-def pool_prefix(_tenant: str, model: str, pool: str) -> bytes:
+def pool_prefix(model: str, pool: str) -> bytes:
     """Prefix covering one model's keys within a single pool, RELATIVE to
-    ``kvc/{tenant}/`` (see `full_key`).
+    ``kvc`` (see `full_key`).
 
     `AutumnKVCacheStorage.clear()` (sglang) must use this so a debug clear of
     the `kv` pool does not also wipe the same model's `vllm` pool.

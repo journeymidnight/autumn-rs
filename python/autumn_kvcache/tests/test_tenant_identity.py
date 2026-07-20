@@ -20,6 +20,7 @@ from autumn_kvcache._identity import (
     FINGERPRINT_HEX_LEN,
     fingerprint_from_sources,
     read_credential_file,
+    read_credential_pair,
     tenant_cfg_from_vllm,
     vllm_identity_sources,
 )
@@ -259,13 +260,14 @@ def test_full_key_layout_with_fingerprint():
     cfg = tenant_cfg_from_vllm(fake_vllm_config(FakeModelConfig(**QWEN_32B),
                                                 weights_path="models/qwen32b"))
     model = build_tenant_suffix(cfg, cfg.model_fingerprint)
-    # F-KEY-NS D7 (Prepend-only): full_key is RELATIVE to the client's
-    # kvc/{tenant}/ binding scope — the builder emits {model}/{pool}/{hash} and
-    # the ClusterClient prepends kvc/{tenant}/ (scope locked by construction).
-    key = full_key("acme", model, "v1/deadbeef/model.layers.0", "vllm")
+    # F-NS-PRINCIPAL-UNIFIED (Prepend-only): full_key is RELATIVE to the
+    # client's `kvc` binding scope — the builder emits {model}/{pool}/{hash} and
+    # the ClusterClient prepends `kvc/` (scope locked by construction). Option 3
+    # dropped the tenant segment, so full_key no longer takes one.
+    key = full_key(model, "v1/deadbeef/model.layers.0", "vllm")
     assert key.startswith(b"model-cfg_")  # relative: starts at the model segment
     assert key.endswith(b"/vllm/v1/deadbeef/model.layers.0")
-    # No namespace/tenant prefix in the relative key — the binding owns it.
+    # No namespace prefix in the relative key — the binding owns it.
     assert not key.startswith(b"kvc/")
 
 
@@ -364,9 +366,9 @@ def test_credential_file_bare_hex_decodes_to_raw(tmp_path):
     assert read_credential_file(_write(tmp_path, raw.hex() + "\n")) == raw
 
 
-def test_credential_file_accepts_tenant_create_stdout(tmp_path):
+def test_credential_file_accepts_principal_create_stdout(tmp_path):
     raw = bytes(range(1, 33))
-    stdout = f"tenant 'hermes' created\ncredential: {raw.hex()}\n"
+    stdout = f"principal 'hermes' created\ncredential: {raw.hex()}\n"
     assert read_credential_file(_write(tmp_path, stdout)) == raw
 
 
@@ -376,9 +378,32 @@ def test_credential_file_rejects_non_hex(tmp_path):
         read_credential_file(_write(tmp_path, "not-a-hex-string-zz"))
 
 
-def test_credential_file_rejects_ambiguous_multiline(tmp_path):
-    import pytest
+# ── F-NS-PRINCIPAL-UNIFIED: the file now names its principal ────────────────
+# Mirrors `autumn_client::parse_credential_text` — keep the two in lockstep.
+
+def test_credential_pair_labeled_form(tmp_path):
+    """What `autumn-op principal-create` / cluster.sh write."""
     raw = bytes(range(32))
-    # two bare-hex lines with no `credential:` marker is ambiguous → reject
+    text = f"principal: fs\ncredential: {raw.hex()}\n"
+    assert read_credential_pair(_write(tmp_path, text)) == ("fs", raw)
+
+
+def test_credential_pair_two_bare_lines(tmp_path):
+    """`<name>\\n<hex>` — accepted, and NO LONGER the ambiguous-multiline error
+    it was pre-Option-3 (the first line is the principal, not a second secret)."""
+    raw = bytes(range(32))
+    assert read_credential_pair(_write(tmp_path, f"kvc\n{raw.hex()}\n")) == ("kvc", raw)
+
+
+def test_credential_pair_bare_hex_is_anonymous(tmp_path):
+    """A lone hex line still parses, with an EMPTY principal — callers that
+    need a name (loader, kvcache) must reject it themselves."""
+    raw = bytes(range(32))
+    assert read_credential_pair(_write(tmp_path, raw.hex())) == ("", raw)
+
+
+def test_credential_pair_rejects_three_bare_lines(tmp_path):
+    import pytest
+    raw = bytes(range(32)).hex()
     with pytest.raises(ValueError):
-        read_credential_file(_write(tmp_path, raw.hex() + "\n" + raw.hex()))
+        read_credential_pair(_write(tmp_path, f"{raw}\n{raw}\n{raw}"))

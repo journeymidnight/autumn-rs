@@ -19,12 +19,16 @@ so config.json + tokenizer still come from vLLM's `model=` path (the standard
   direct_read         — bool, EN-direct read (default True; topology-dependent)
   n_workers           — parallel reader threads (default 4)
   prefetch            — bounded (name,tensor) queue depth (default 8)
-  tenant              — fs tenant (default "default"); keys live at `fs/{tenant}/`
-  credential_file     — path to the authz credential (hex, from
-                        `autumn-op tenant-create`). REQUIRED once the deploy
-                        protects `fs/` — authz gates READS too, so without it
-                        every weight read fails PermissionDenied.
-  principal           — authz principal (defaults to `tenant`, 1:1 convention)
+  credential_file     — path to the authz credential (from `autumn-op
+                        principal-create`; carries `principal:`+`credential:`).
+                        REQUIRED once the deploy protects `fs/` — authz gates
+                        READS too, so without it every weight read fails
+                        PermissionDenied.
+  principal           — authz principal; defaults to the name in the
+                        credential file, override only for cross-name setups
+
+F-NS-PRINCIPAL-UNIFIED (Option 3): there is no `tenant` key — weights live in
+one global `fs/` tree and `autumn.Fs` scopes itself to it.
 """
 
 from __future__ import annotations
@@ -51,35 +55,47 @@ _ST_DT = {
 }
 
 
-def _read_credential_file(path: str) -> bytes:
-    """Read a tenant credential file -> RAW bytes for the SDK.
+def _read_credential_pair(path: str) -> tuple[str, bytes]:
+    """Read a principal credential file -> `(principal, RAW secret bytes)`.
 
-    On-disk format = the lowercase hex printed by `autumn-op tenant-create`
-    (bare hex, or its `credential: <hex>` stdout line — accepted defensively
-    since "save the output" is the predictable operator move). The SDK/manager
-    contract is RAW bytes, so passing the ASCII hex through would authenticate
-    with the WRONG credential and every protected-prefix read would die with
-    PermissionDenied. Fail loudly here, at startup, instead.
+    F-NS-PRINCIPAL-UNIFIED: the file names its own principal, because Option 3
+    made `principal=` + `credential=` a both-or-neither pair on `Fs.connect`.
+    Accepts the `principal:`/`credential:` labelled form (what `autumn-op
+    principal-create` and cluster.sh write), two bare lines `<name>\\n<hex>`, or
+    a lone hex line (anonymous — the caller rejects that below).
 
-    Mirrors `autumn_kvcache._identity.read_credential_file`; duplicated (~15
-    lines) rather than importing so this loader keeps no dependency on the
-    kvcache package.
+    The SDK/manager contract is RAW bytes, so passing the ASCII hex through
+    would authenticate with the WRONG credential and every protected-prefix read
+    would die with PermissionDenied. Fail loudly here, at startup, instead.
+
+    Mirrors `autumn_kvcache._identity.read_credential_pair` and Rust's
+    `autumn_client::parse_credential_text`; duplicated (~20 lines) rather than
+    imported so this loader keeps no dependency on the kvcache package.
     """
     with open(path, "r", encoding="ascii") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-    for ln in lines:
-        if ln.lower().startswith("credential:"):
-            hexs = ln.split(":", 1)[1].strip()
-            break
+
+    def _labeled(key):
+        for ln in lines:
+            if ln.lower().startswith(key):
+                return ln.split(":", 1)[1].strip()
+        return None
+
+    hexs = _labeled("credential:")
+    if hexs is not None:
+        name = _labeled("principal:") or ""
+    elif len(lines) == 2:
+        name, hexs = lines[0], lines[1]
+    elif len(lines) == 1:
+        name, hexs = "", lines[0]
     else:
-        if len(lines) != 1:
-            raise ValueError(
-                f"credential file {path!r}: expected a single hex line or a "
-                f"'credential: <hex>' line, got {len(lines)} lines"
-            )
-        hexs = lines[0]
+        raise ValueError(
+            f"credential file {path!r}: expected '<name>\\n<hex>', a "
+            f"'principal:'/'credential:' pair, or a single hex line, got "
+            f"{len(lines)} non-empty lines"
+        )
     try:
-        return bytes.fromhex(hexs)
+        return name, bytes.fromhex(hexs)
     except ValueError as e:
         raise ValueError(f"credential file {path!r}: not valid hex: {e}") from None
 
@@ -126,18 +142,34 @@ class AutumnModelLoader(BaseModelLoader):
         self.direct_read = bool(cfg.get("direct_read", True))
         self.n_workers = int(cfg.get("n_workers", 4))
         self.prefetch = int(cfg.get("prefetch", 8))
-        # F-KEY-NS: weights live under `fs/{tenant}/`; must match how they were
-        # uploaded (autumnfs --tenant) and any fuse mount serving them.
-        self.tenant = cfg.get("tenant", "default")
+        # F-NS-PRINCIPAL-UNIFIED (Option 3): weights live under a GLOBAL `fs/`
+        # tree — no tenant segment — so there is nothing to configure here; the
+        # scope must simply match how they were uploaded (`autumnfs put`) and any
+        # fuse mount serving them. `autumn.Fs` scopes itself to `fs/`.
+        #
         # F-AUTHZ-BUILTIN: read the credential up front so a bad path/format
-        # fails at startup, not as a PermissionDenied mid weight-load.
+        # fails at startup, not as a PermissionDenied mid weight-load. The
+        # credential file names its principal; `principal` in the config
+        # overrides it. Both-or-neither is enforced by `Fs.connect`, so a
+        # credential with no derivable name must fail HERE with a config-shaped
+        # error rather than there with a generic one.
         cred_file = cfg.get("credential_file")
-        self.credential = _read_credential_file(cred_file) if cred_file else None
-        # `principal` defaults to the tenant (the 1:1 principal↔tenant convention
-        # the native clients use for --principal). Without this default a config
-        # that sets only `credential_file` would pass credential-without-principal
-        # and trip `Fs.connect`'s both-or-neither check at startup.
-        self.principal = (cfg.get("principal") or self.tenant) if self.credential else None
+        self.credential = None
+        self.principal = None
+        if cred_file:
+            file_principal, self.credential = _read_credential_pair(cred_file)
+            self.principal = cfg.get("principal") or file_principal
+            if not self.principal:
+                raise ValueError(
+                    f"credential file {cred_file!r} carries no principal name "
+                    f"(expected a 'principal: <name>' line or '<name>\\n<hex>'); "
+                    f"set `principal` in model_loader_extra_config"
+                )
+        elif cfg.get("principal"):
+            raise ValueError(
+                "model_loader_extra_config: `principal` set without "
+                "`credential_file`"
+            )
         transport = cfg.get("transport")
         if transport:
             # Process-global; must precede the first connect (this loader is the
@@ -146,10 +178,9 @@ class AutumnModelLoader(BaseModelLoader):
 
     def _connect(self):
         """One place that builds an `autumn.Fs` — the reader threads each open
-        their own, and both must carry the SAME tenant + authz identity."""
+        their own, and both must carry the SAME authz identity."""
         return autumn.Fs.connect(
             self.manager,
-            tenant=self.tenant,
             principal=self.principal,
             credential=self.credential,
             direct_read=self.direct_read,

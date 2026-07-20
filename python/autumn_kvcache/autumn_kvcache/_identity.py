@@ -259,32 +259,56 @@ def tenant_cfg_from_vllm(vllm_config: Any):
     )
 
 
-def read_credential_file(path: str) -> bytes:
-    """Read a tenant credential file -> RAW bytes for the SDK.
+def read_credential_pair(path: str) -> tuple[str, bytes]:
+    """Read a principal credential file -> `(principal, RAW secret bytes)`.
 
-    On-disk format = the lowercase hex printed by `autumn-op tenant-create`
-    (either the bare hex, or its `credential: <hex>` stdout line — accepted
-    defensively since "save the output" is the predictable operator move).
+    F-NS-PRINCIPAL-UNIFIED: the credential file now carries the OWNER's name
+    alongside the secret, because Option 3 made the principal a required half of
+    the SDK's authz identity (`principal=` + `credential=` are both-or-neither).
+
+    Mirrors `autumn_client::parse_credential_text` (crates/client/src/lib.rs) —
+    keep the two in lockstep, this is one on-disk format with two readers:
+
+      * a `credential: <hex>` line (+ optional `principal: <name>`) — what
+        `autumn-op principal-create` / cluster.sh write;
+      * two bare lines `<principal>\\n<hex>`;
+      * a single bare hex line — anonymous, principal is `""` (the caller must
+        reject it if it needs a name).
+
     The SDK/manager contract is RAW credential bytes (`mint-token` hex-decodes
-    before sending; the manager stores the SHA-256 of the raw bytes), so
-    passing the ASCII hex through would mint with a WRONG credential and every
+    before sending; the manager stores the SHA-256 of the raw bytes), so passing
+    the ASCII hex through would mint with a WRONG credential and every
     protected-prefix op would die with PermissionDenied once enforcement is on
     (coco P1 2026-07-17). Fail loudly here, at startup, instead.
     """
     with open(path, "r", encoding="ascii") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-    for ln in lines:
-        if ln.lower().startswith("credential:"):
-            hexs = ln.split(":", 1)[1].strip()
-            break
+
+    def _labeled(key: str) -> str | None:
+        for ln in lines:
+            if ln.lower().startswith(key):
+                return ln.split(":", 1)[1].strip()
+        return None
+
+    hexs = _labeled("credential:")
+    if hexs is not None:
+        name = _labeled("principal:") or ""
+    elif len(lines) == 2:
+        name, hexs = lines[0], lines[1]
+    elif len(lines) == 1:
+        name, hexs = "", lines[0]
     else:
-        if len(lines) != 1:
-            raise ValueError(
-                f"credential file {path!r}: expected a single hex line or a "
-                f"'credential: <hex>' line, got {len(lines)} lines"
-            )
-        hexs = lines[0]
+        raise ValueError(
+            f"credential file {path!r}: expected '<name>\\n<hex>', a "
+            f"'principal:'/'credential:' pair, or a single hex line, got "
+            f"{len(lines)} non-empty lines"
+        )
     try:
-        return bytes.fromhex(hexs)
+        return name, bytes.fromhex(hexs)
     except ValueError as e:
         raise ValueError(f"credential file {path!r}: not valid hex: {e}") from None
+
+
+def read_credential_file(path: str) -> bytes:
+    """`read_credential_pair` keeping only the secret (back-compat shim)."""
+    return read_credential_pair(path)[1]

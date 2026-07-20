@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import autumn
 
 from ._bridge import new_loop, run, run_on
-from ._identity import read_credential_file as _read_credential_file, tenant_cfg_from_vllm as _tenant_cfg_from_vllm
+from ._identity import read_credential_pair as _read_credential_pair, tenant_cfg_from_vllm as _tenant_cfg_from_vllm
 from ._keys import VLLM_KV_STORAGE_FORMAT, build_tenant_suffix, full_key
 
 log = logging.getLogger(__name__)
@@ -231,33 +231,28 @@ class _AutumnKVStore:
         max_inflight: Optional[int] = None,
         ttl_secs: int = 0,
         direct_read: bool = True,
-        auth_tenant: Optional[str] = None,
+        auth_principal: Optional[str] = None,
         auth_credential: Optional[bytes] = None,
     ):
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
-        # F-AUTHZ-BUILTIN (D6-kvc): authz identity, NOT the key-namespace
-        # tenant — `tenant_suffix` (model fingerprint etc.) picks WHERE keys
-        # live; `auth_tenant`+`auth_credential` prove WHO may write there.
+        # F-AUTHZ-BUILTIN (D6-kvc): authz identity, NOT the key scope —
+        # `tenant_suffix` (model fingerprint etc.) picks WHERE keys live;
+        # `auth_principal`+`auth_credential` prove WHO may write there.
         # Both-or-neither (the PyO3 layer enforces it too, but failing here
         # keeps the error at construction, before any worker threads spawn).
-        if (auth_tenant is None) != (auth_credential is None):
+        if (auth_principal is None) != (auth_credential is None):
             raise ValueError(
-                "auth_tenant and auth_credential must be passed together"
+                "auth_principal and auth_credential must be passed together"
             )
-        # F-KEY-NS D7: the KEY tenant — the WIRE key carries a `{tenant}` layer
-        # (`kvc/{tenant}/{model}/…`); the client binds `kvc`/tenant and PREPENDS
-        # `kvc/{tenant}/` (`_keys.py` emits the relative `{model}/…`).
-        # `tenant_suffix` is the per-MODEL instance
-        # (`self._tenant` below, kept for the `tenant` property + logging); the
-        # authz PRINCIPAL == the key tenant by the 1:1 convention, `"default"`
-        # when authz is off.
-        self._key_tenant = auth_tenant or "default"
-        # Every client carries the (namespace, tenant) key scope; authz adds the
-        # (principal, credential) identity when configured (both-or-neither).
-        self._auth = {"namespace": "kvc", "tenant": self._key_tenant}
-        if auth_tenant is not None:
-            self._auth["principal"] = auth_tenant
+        # F-NS-PRINCIPAL-UNIFIED (Option 3): keys are NS-FIRST with no tenant
+        # segment — the client binds the `kvc` SCOPE and PREPENDS `kvc/`, and
+        # `_keys.py` emits the relative `{model}/…` (wire key `kvc/{model}/…`).
+        # `tenant_suffix` is the per-MODEL instance (`self._tenant` below, kept
+        # for the `tenant` property + logging), unrelated to the authz identity.
+        self._auth = {"scope": "kvc"}
+        if auth_principal is not None:
+            self._auth["principal"] = auth_principal
             self._auth["credential"] = auth_credential
         self._tenant = tenant_suffix
         # Marker TTL = configured ttl_secs; layer TTL = ttl_secs + grace so the
@@ -319,9 +314,8 @@ class _AutumnKVStore:
         return self._marker_ttl
 
     def _key(self, content_hash: str, layer_name: str) -> bytes:
-        # F-KEY-NS D7: kvc/{key_tenant}/{model}/{pool}/{fmt}/{hash}/{layer}.
+        # F-NS-PRINCIPAL-UNIFIED: kvc/{model}/{pool}/{fmt}/{hash}/{layer}.
         return full_key(
-            self._key_tenant,
             self._tenant,
             f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}",
             VLLM_POOL_NAME,
@@ -555,21 +549,39 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         direct_read = extra.get("direct_read", True)
         if isinstance(direct_read, str):
             direct_read = direct_read.strip().lower() not in ("0", "false", "no", "off")
-        # F-AUTHZ-BUILTIN (D6-kvc): authz identity from extra_config —
-        # `auth_tenant` + `auth_credential_file` (path; k8s mounts a Secret).
-        # Required once kvc/ is enforcement-enabled; absent = unauthenticated
-        # (fine while authz is off). File read fails loudly at startup rather
-        # than as a first-write PermissionDenied mid-inference.
-        auth_tenant = extra.get("auth_tenant")
+        # F-AUTHZ-BUILTIN (D6-kvc) / F-NS-PRINCIPAL-UNIFIED: authz identity from
+        # extra_config. `auth_credential_file` (path; k8s mounts a Secret) is the
+        # ONLY required key — Option 3's credential file carries its principal's
+        # NAME, so the identity is self-describing. `auth_principal` overrides
+        # that name for the rare cross-name setup; `auth_tenant` is the retired
+        # spelling, still accepted so an un-migrated config fails loudly-but-
+        # working rather than silently unauthenticated. Required once kvc/ is
+        # enforcement-enabled; absent = unauthenticated (fine while authz is
+        # off). The file read fails at startup rather than as a first-write
+        # PermissionDenied mid-inference.
         auth_cred_file = extra.get("auth_credential_file")
-        if (auth_tenant is None) != (auth_cred_file is None):
-            raise ValueError(
-                "kv_connector_extra_config: auth_tenant and auth_credential_file "
-                "must be set together"
+        auth_principal = extra.get("auth_principal")
+        if auth_principal is None and extra.get("auth_tenant") is not None:
+            auth_principal = extra["auth_tenant"]
+            log.warning(
+                "kv_connector_extra_config: `auth_tenant` is the retired "
+                "(pre-Option-3) spelling — rename it to `auth_principal`"
             )
         auth_credential: Optional[bytes] = None
         if auth_cred_file:
-            auth_credential = _read_credential_file(auth_cred_file)
+            file_principal, auth_credential = _read_credential_pair(auth_cred_file)
+            auth_principal = auth_principal or file_principal
+            if not auth_principal:
+                raise ValueError(
+                    f"credential file {auth_cred_file!r} carries no principal "
+                    f"name (expected a 'principal: <name>' line or "
+                    f"'<name>\\n<hex>'); set `auth_principal` explicitly"
+                )
+        elif auth_principal is not None:
+            raise ValueError(
+                "kv_connector_extra_config: auth_principal set without "
+                "auth_credential_file"
+            )
         self._store = _AutumnKVStore(
             endpoint,
             self._tenant_suffix,
@@ -578,7 +590,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             max_inflight=extra.get("max_inflight"),
             ttl_secs=ttl_secs,
             direct_read=bool(direct_read),
-            auth_tenant=auth_tenant,
+            auth_principal=auth_principal,
             auth_credential=auth_credential,
         )
 

@@ -24,7 +24,7 @@ from typing import List, Optional
 import autumn
 
 from ._bridge import run, run_on, new_loop
-from ._identity import fingerprint_from_sources, read_credential_file as _read_credential_file
+from ._identity import fingerprint_from_sources, read_credential_pair as _read_credential_pair
 from ._keys import build_tenant_suffix, full_key, pool_prefix
 
 try:
@@ -163,29 +163,40 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         # path is used. (The old extra_config["zc"] opt-in was removed; KV-cache
         # pages are large so reads cross the ZC size threshold and writes are
         # always ZC on UCX — both win at this size; see UCX_ZC_READ_MIN_BYTES.)
-        # F-AUTHZ-BUILTIN (D6-kvc): same authz wiring as the vLLM connector —
-        # `auth_tenant` + `auth_credential_file` in extra_config, both or
-        # neither, file read fails loudly at startup. Threads to BOTH clients
-        # (authz gates reads on protected prefixes too — a credential-less
-        # probe client would silently turn every hit into a miss).
-        auth_tenant = extra_config.get("auth_tenant")
+        # F-AUTHZ-BUILTIN (D6-kvc) / F-NS-PRINCIPAL-UNIFIED: same authz wiring as
+        # the vLLM connector — `auth_credential_file` in extra_config is the only
+        # required key (Option 3's credential file names its own principal),
+        # `auth_principal` overrides that name, `auth_tenant` is the retired
+        # spelling. The file read fails loudly at startup. Threads to BOTH
+        # clients (authz gates reads on protected prefixes too — a
+        # credential-less probe client would silently turn every hit into a miss).
         auth_cred_file = extra_config.get("auth_credential_file")
-        if (auth_tenant is None) != (auth_cred_file is None):
-            raise ValueError(
-                "extra_config: auth_tenant and auth_credential_file must be set together"
+        auth_principal = extra_config.get("auth_principal")
+        if auth_principal is None and extra_config.get("auth_tenant") is not None:
+            auth_principal = extra_config["auth_tenant"]
+            log.warning(
+                "extra_config: `auth_tenant` is the retired (pre-Option-3) "
+                "spelling — rename it to `auth_principal`"
             )
-        # F-KEY-NS D7: the KEY tenant. The WIRE key carries a `{tenant}` layer
-        # (`kvc/{tenant}/{model}/…`); the client binds `kvc`/tenant and PREPENDS
-        # `kvc/{tenant}/` (`_keys.py` emits the relative `{model}/…`). By the 1:1
-        # convention the authz PRINCIPAL == the key tenant; when authz is off the
-        # deployment default is `"default"`.
-        self._key_tenant = auth_tenant or "default"
-        # Every client carries the (namespace, tenant) key scope; authz adds the
-        # (principal, credential) identity when configured (both-or-neither).
-        auth: dict = {"namespace": "kvc", "tenant": self._key_tenant}
+        # F-NS-PRINCIPAL-UNIFIED: NS-FIRST keys with no tenant segment — the
+        # client binds the `kvc` SCOPE and PREPENDS `kvc/` (`_keys.py` emits the
+        # relative `{model}/…`).
+        auth: dict = {"scope": "kvc"}
         if auth_cred_file:
-            auth["principal"] = auth_tenant
-            auth["credential"] = _read_credential_file(auth_cred_file)
+            file_principal, secret = _read_credential_pair(auth_cred_file)
+            auth_principal = auth_principal or file_principal
+            if not auth_principal:
+                raise ValueError(
+                    f"credential file {auth_cred_file!r} carries no principal "
+                    f"name (expected a 'principal: <name>' line or "
+                    f"'<name>\\n<hex>'); set `auth_principal` explicitly"
+                )
+            auth["principal"] = auth_principal
+            auth["credential"] = secret
+        elif auth_principal is not None:
+            raise ValueError(
+                "extra_config: auth_principal set without auth_credential_file"
+            )
         self._batch = autumn.BatchClient(
             endpoint, n_workers, max(1, self._max_inflight), **auth
         )
@@ -219,7 +230,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._mem_pool_host = mem_pool_host
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
-        return full_key(self._key_tenant, self._tenant_suffix, hash_str, pool_name)
+        return full_key(self._tenant_suffix, hash_str, pool_name)
 
     def _page_view(self, idx: int):
         """Resolve a host_index to a buffer-protocol view of the pinned page.
@@ -375,7 +386,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def clear(self) -> None:
         # Pool-scoped: must NOT cross into a co-tenant's vLLM (`vllm`) pool.
-        prefix = pool_prefix(self._key_tenant, self._tenant_suffix, DEFAULT_POOL_NAME)
+        prefix = pool_prefix(self._tenant_suffix, DEFAULT_POOL_NAME)
         try:
             n = run(lambda: self._client.batch_delete(prefix))
             log.info("AutumnKVCacheStorage.clear deleted %d keys under %r", n, prefix)
