@@ -14,14 +14,17 @@ shutdown). Signatures below follow that reference — CONFIRM them against the
 
 Config via env:
     AUTUMN_MEMORY_MANAGER   host:port of the autumn manager (ClusterIP in k8s)   [required]
-    AUTUMN_MEMORY_TENANT    tenant namespace                                     [default: "default"]
+    AUTUMN_MEMORY_TENANT    mem sub-prefix — keys land under `mem/{tenant}/`      [default: "default"]
     AUTUMN_MEMORY_CREDENTIAL_FILE
-                            path to the tenant credential (from `autumn-op
-                            tenant-create`; k8s: mount a Secret). Required once
-                            `mem/` enforcement is on (F-AUTHZ-BUILTIN D6-mem) —
-                            without it every write dies with PermissionDenied
-                            (terminal, not retried). Harmless when authz is off.
-                            The SDK auto-mints + renews the short-TTL token.
+                            path to the principal credential (from `autumn-op
+                            principal-create --grant mem/{tenant}/`; k8s: mount a
+                            Secret). Two-line `<principal>\n<hex>` / `principal:`
+                            /`credential:` form — the principal identity is read
+                            from it (F-NS-PRINCIPAL-UNIFIED: no separate
+                            --principal). Required once `mem/` enforcement is on —
+                            without it every write dies PermissionDenied (terminal).
+                            Harmless when authz is off. The SDK auto-mints/renews
+                            the short-TTL token.
 Semantic recall is intentionally OFF (lexical-only) — no embedder wired.
 """
 from __future__ import annotations
@@ -86,33 +89,43 @@ def _unq(b: bytes) -> str:
     return out.decode("utf-8", "replace")
 
 
-def _read_credential_file(path: str) -> bytes:
-    """Read a tenant credential file -> RAW bytes for the SDK.
+def _read_credential_file(path: str) -> tuple[str, bytes]:
+    """Read a principal credential file -> (principal_name, RAW secret bytes).
 
-    On-disk format = the lowercase hex printed by `autumn-op tenant-create`
-    (either the bare hex, or its `credential: <hex>` stdout line — accepted
-    defensively since "save the output" is the predictable operator move).
-    The SDK/manager contract is RAW credential bytes (`mint-token` hex-decodes
-    before sending; the manager stores the SHA-256 of the raw bytes), so
-    passing the ASCII hex through would mint with a WRONG credential and every
-    protected-prefix op would die with PermissionDenied once enforcement is on
-    (coco P1 2026-07-17). Fail loudly here, at startup, instead.
+    F-NS-PRINCIPAL-UNIFIED (Option 3): the `--principal` flag is gone, so the
+    principal IDENTITY travels IN the file. Format (from `autumn-op
+    principal-create`): two lines `<principal-name>` then `<hex-secret>`, or the
+    labeled `principal: <name>` / `credential: <hex>` form. A bare single hex
+    line parses with an EMPTY name (caller rejects it — mint needs the name).
+    The SDK/manager contract is RAW secret bytes (`mint-token` hex-decodes; the
+    manager stores the SHA-256), so handing ASCII hex through would mint a WRONG
+    credential and every protected op would die PermissionDenied — fail loudly
+    here at startup instead. Mirrors the Rust `autumn_client::read_credential_file`.
     """
     with open(path, "r", encoding="ascii") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-    for ln in lines:
-        if ln.lower().startswith("credential:"):
-            hexs = ln.split(":", 1)[1].strip()
-            break
+
+    def _labeled(key: str) -> Optional[str]:
+        for ln in lines:
+            if ln.lower().startswith(key):
+                return ln.split(":", 1)[1].strip()
+        return None
+
+    cred_line = _labeled("credential:")
+    if cred_line is not None:
+        name, hexs = (_labeled("principal:") or ""), cred_line
+    elif len(lines) == 2:
+        name, hexs = lines[0], lines[1]  # `<name>\n<hex>`
+    elif len(lines) == 1:
+        name, hexs = "", lines[0]  # bare hex, no name
     else:
-        if len(lines) != 1:
-            raise ValueError(
-                f"credential file {path!r}: expected a single hex line or a "
-                f"'credential: <hex>' line, got {len(lines)} lines"
-            )
-        hexs = lines[0]
+        raise ValueError(
+            f"credential file {path!r}: expected '<name>\\n<hex>', a "
+            f"'principal:'/'credential:' pair, or a single hex line, got "
+            f"{len(lines)} non-empty lines"
+        )
     try:
-        return bytes.fromhex(hexs)
+        return name, bytes.fromhex(hexs)
     except ValueError as e:
         raise ValueError(f"credential file {path!r}: not valid hex: {e}") from None
 
@@ -237,20 +250,25 @@ class AutumnMemoryProvider(_Base):
         # non-primary contexts (cron / subagent / flush) must not write.
         self._read_only = str(_ctx_get(context, "context_kind", default="primary")) != "primary"
         cred_file = os.environ.get("AUTUMN_MEMORY_CREDENTIAL_FILE")
-        # F-KEY-NS D7 (SD-2): the client binds the `mem` namespace for this
-        # tenant (Assert); the authz principal == the tenant (1:1) when a
-        # credential is configured.
+        # F-NS-PRINCIPAL-UNIFIED (Option 3): the client binds the SCOPE
+        # `mem/{tenant}` (an in-namespace sub-prefix — no SDK tenant concept).
+        # The authz principal (credential owner) is read from the credential file.
+        scope = f"mem/{tenant}"
         if cred_file:
-            credential = _read_credential_file(cred_file)
+            principal, credential = _read_credential_file(cred_file)
+            if not principal:
+                raise ValueError(
+                    f"AUTUMN_MEMORY_CREDENTIAL_FILE {cred_file!r}: missing principal "
+                    f"name (expected '<principal>\\n<hex>')"
+                )
             client = self._bridge.run(
                 autumn.Client.connect(
-                    manager, namespace="mem", tenant=tenant,
-                    principal=tenant, credential=credential,
+                    manager, scope=scope, principal=principal, credential=credential,
                 )
             )
         else:
             client = self._bridge.run(
-                autumn.Client.connect(manager, namespace="mem", tenant=tenant)
+                autumn.Client.connect(manager, scope=scope)
             )
         self._mem = AutumnMemory(client, tenant, str(agent))
 
