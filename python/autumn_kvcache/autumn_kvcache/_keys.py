@@ -50,6 +50,31 @@ KEY_NAMESPACE = "kvc"
 VLLM_KV_STORAGE_FORMAT = "v1"
 
 
+def _rank_int(cfg, attr: str, default: int) -> int:
+    """Read a rank/size attribute as an int, failing loudly on garbage.
+
+    The values are f-string'd straight into the tenant suffix, i.e. into every
+    KV key. A duck-typed config sourced from JSON/env can hand us `"2"`, which
+    used to blow up at the `pp_size > 1` comparison with a bare `TypeError`
+    (`'>' not supported between 'str' and 'int'`) — from inside key
+    construction, at engine start, with no hint of which field was at fault.
+    Coercion keeps those configs working AND is byte-identical for every config
+    that works today (`int(0) == 0`, `int("0") == 0` render the same); only
+    genuinely non-numeric values now fail, and they fail with a message naming
+    the field instead of producing a bogus rank in the keyspace.
+    """
+    v = getattr(cfg, attr, default)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"build_tenant_suffix: {attr}={v!r} is not an integer — it would be "
+            f"stamped into every KV key for this model"
+        ) from None
+
+
 def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     """Build the per-tenant key suffix from a model/parallel config.
 
@@ -79,16 +104,16 @@ def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     # `kvc/Qwen3-VL-32B/...` rather than `kvc//data/models/...`.
     model = str(model).strip("/").replace("/", "_")
     is_mla = bool(getattr(cfg, "is_mla_model", False))
-    tp_rank = getattr(cfg, "tp_rank", 0)
-    tp_size = getattr(cfg, "tp_size", 1)
-    pp_rank = getattr(cfg, "pp_rank", 0)
-    pp_size = getattr(cfg, "pp_size", 1)
+    tp_rank = _rank_int(cfg, "tp_rank", 0)
+    tp_size = _rank_int(cfg, "tp_size", 1)
+    pp_rank = _rank_int(cfg, "pp_rank", 0)
+    pp_size = _rank_int(cfg, "pp_size", 1)
     parts = [str(model)]
     if model_fingerprint:
         parts.append(str(model_fingerprint))
     if not is_mla:
         parts.append(f"{tp_rank}_{tp_size}")
-    if pp_size and pp_size > 1:
+    if pp_size > 1:
         parts.append(f"pp{pp_rank}_{pp_size}")
     return "_".join(parts)
 

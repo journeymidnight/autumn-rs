@@ -1,5 +1,47 @@
 Date: 2026-07-22
 TaskStatus: completed
+Task scope: 用户「fix BUG-KVC-TENANT」—— 修掉 coco 挖出的那条 blocking P1，本条**已关闭**
+  并按规则 13 从 feature_list.md 删除。
+
+── 改了什么（3 处，全在 python/autumn_kvcache）──
+[P1] _identity.py `vllm_identity_sources`: 新增 KV-cache dtype 维度。
+  vLLM 0.23.0 实测核过字段名：`CacheConfig.cache_dtype` 存在(默认 'auto')、
+  `.kv_cache_dtype_skip_layers` 存在(默认 [])、**没有** `kv_cache_dtype` 属性(尽管 CLI
+  flag 是那么拼的)。两个都进 fingerprint；skip_layers 排序渲染(不能让迭代顺序动指纹)。
+  **明确不收**: block_size(存的字节按 token 经 slot_mapping 聚出来,与 block 大小无关,
+  且 content hash 已随 block 对齐的 token 数变化) + mamba_*_cache_dtype(本 connector 的
+  _extract_layer/_inject_layer 根本不处理那个模型类 —— 收了就是给假想 bug 加防御)。
+[P2] _identity.py `tenant_cfg_from_vllm`: tp/pp rank 派生。`ParallelConfig.rank` 是**全局**
+  rank，vLLM 布局里 TP 是 pipeline stage 内变化最快的维度 → tp=g%t, pp=(g//t)%p；
+  有显式 tensor_parallel_rank/pipeline_parallel_rank 字段则优先用。原来 pp_rank 初始化成
+  None 后从没被赋值(恒 0)，tp_rank 直接拿全局 rank(TP=2/PP=2 会出 tp_rank=2,3 越界)。
+[P3] _keys.py `build_tenant_suffix`: rank/size 走新的 `_rank_int` 数值规范化 + fail-loud。
+  原来 JSON/env 来的 "2" 会在 `pp_size > 1` 处抛裸 TypeError(不提是哪个字段)。
+
+── 关键验证 ──
+* 43 个 identity 单测(34 旧 + 9 新)、包全量 49 passed。
+* **sglang 侧字节不变**(本条 Scope 的硬约束): sglang 的 fingerprint 只由 extra_config
+  ["model_id"] 生成,从不碰 cache_config → tenant 串完全不动。代码实证 + 既有单测钉住。
+* **PP=1 派生是恒等**(今天所有部署的形状): 新增 test_pp1_rank_derivation_is_byte_identical
+  钉住 tp_size=4/rank=2 仍得 `_2_4` —— 否则这次修复会二次冷掉线上 tenant。
+* 危险那对现在分开了(实测): fp8_e4m3 → 4447d2af8fb9, fp8_e5m2 → 65e11d2924fa。
+* 冷缓存代价实测量化: 同一 config 旧口径 model-cfg_16de1f947008_0_1 → 新 _d7ada6ee8177_0_1。
+  **下次部署 vLLM KV pool 从冷开始**(即使不改任何配置,因为 fingerprint 多了一个 source)。
+  已写进 docs/ops.md 的 kvcache 小节(含旧 tenant key 的手工回收步骤)。
+
+── 用户定调：其余 coco 发现不做 ──
+用户「剩下的 2 个你看着办，一般不需要」→ BUG-KVC-LOAD-ATOMIC / BUG-KVC-MM-ALIAS /
+BUG-KVC-PARTIAL-PREFIX / BUG-KVC-SGLANG-ZC-CANCEL / F-KVC-CONNECTOR-HARDENING 五条
+全部**不做**，已在各自条目里记下这个决定(留 backlog 作记录,动手前先复核触发条件)。
+同一批里我本来就判定不修的两条(sglang legacy key 的 `/`→`_` 有损编码、cfg=None 生产
+不可达)理由也留在 git 历史里。
+
+Next steps: 部署时注意 vLLM KV pool 会冷启一次(预期,非故障);旧 tenant key 用 ops.md
+  的 batch_delete 回收。
+
+============================ prior task history ============================
+Date: 2026-07-22
+TaskStatus: completed
 Task scope: /loop 第 2-4 轮 —— 推进第 1 轮认定的唯一可关闭项 BUG-KVC-TENANT：补做它缺的
   coco 评审。结论=**关不掉**，评审挖出一条同族 P1 + 4 条新条目。
 

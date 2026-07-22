@@ -14,7 +14,9 @@ Fix: derive a deterministic fingerprint from what actually identifies the
 KV bytes — architecture shape (layers / hidden / kv-heads / head-size /
 vocab / dtype / quant / MLA) plus the weights source (`load_format` and, for
 the autumn loader, the autumn weights `path`) plus an optional operator
-`model_id`, plus the LAYOUT versions (the running vLLM version and the
+`model_id`, plus the KV-CACHE dtype (`cache_config.cache_dtype`, which is
+independent of the model dtype and decides the element type of the very
+bytes we store), plus the LAYOUT versions (the running vLLM version and the
 connector's own `VLLM_KV_STORAGE_FORMAT`): the page byte layout is an
 internal detail of the vLLM build + this connector, so the same model on a
 different vLLM must not read the old bytes — and fold it into the tenant
@@ -165,6 +167,45 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
                 src["mla"] = 1
         except Exception:  # noqa: BLE001 — property may touch vllm envs
             pass
+    # ── KV-cache dtype (the "same model, different element type" axis) ──────
+    # The bytes this connector stores ARE the KV tensors, and `_inject_layer`
+    # reinterprets them with the CURRENT runtime dtype
+    # (`from_numpy(staging).view(template.dtype)`), so a deployment that flips
+    # --kv-cache-dtype without splitting the tenant reads old bytes under a new
+    # type. The dangerous pair is SAME-itemsize (fp8_e4m3 ↔ fp8_e5m2, both one
+    # byte): the reshape succeeds, nothing errors, the KV is silently wrong —
+    # exactly the failure class this module exists to close, on the dtype axis.
+    #
+    # `cache_dtype` is INDEPENDENT of `ModelConfig.dtype` above ("auto" = follow
+    # it, anything else overrides it), so the model dtype already in `src` does
+    # NOT cover this. Recording the raw string is precise AND stable: the value
+    # space is a fixed set of spellings ("auto"/"fp8"/"fp8_e4m3"/…), never a
+    # resolved torch dtype, so "auto" cannot drift against an explicit spelling
+    # of the same effective type.
+    #
+    # Field names verified against vLLM 0.23.0: `CacheConfig.cache_dtype`
+    # (default "auto") and `.kv_cache_dtype_skip_layers` (default []); there is
+    # NO `kv_cache_dtype` attribute despite the CLI flag being spelled that way.
+    cc = getattr(vllm_config, "cache_config", None)
+    if cc is not None:
+        cdt = getattr(cc, "cache_dtype", None)
+        if cdt is not None:
+            src["kv_cache_dtype"] = str(cdt)
+        # Per-layer exceptions to that dtype: two deployments both on fp8 but
+        # skipping different layers store different bytes for those layers.
+        skip = getattr(cc, "kv_cache_dtype_skip_layers", None)
+        if skip:
+            try:
+                # sorted: a set/list from config must not make the fingerprint
+                # depend on iteration order (see fingerprint_from_sources).
+                src["kv_skip_layers"] = ",".join(sorted(str(x) for x in skip))
+            except TypeError:  # not iterable — record it verbatim rather than drop
+                src["kv_skip_layers"] = str(skip)
+    # Deliberately NOT folded in: `block_size` — the saved bytes are gathered per
+    # TOKEN via `slot_mapping`, so their layout is block-size independent, and the
+    # content hash already varies with the block-aligned token count; and the
+    # `mamba_*_cache_dtype` knobs — a model class this connector's
+    # `_extract_layer`/`_inject_layer` pair does not handle at all.
     lc = getattr(vllm_config, "load_config", None)
     if lc is not None:
         fmt = getattr(lc, "load_format", None)
@@ -238,7 +279,24 @@ def tenant_cfg_from_vllm(vllm_config: Any):
         par = getattr(vllm_config, "parallel_config", None)
         tp_size = getattr(par, "tensor_parallel_size", 1)
         pp_size = getattr(par, "pipeline_parallel_size", 1)
-        tp_rank = getattr(par, "rank", 0)
+        # `ParallelConfig.rank` is the GLOBAL rank; vLLM lays ranks out with TP
+        # as the fastest-varying dimension inside a pipeline stage. Both halves
+        # must be derived from it: taking `rank` verbatim as the TP rank used to
+        # yield an out-of-range tp_rank (rank 2 with tp_size 2) AND stamp every
+        # stage as `pp0`, because pp_rank was initialised to None and never
+        # assigned. Prefer explicit fields when a vLLM build exposes them.
+        # With pp_size == 1 — every deployment today — the derivation is the
+        # identity (`g % t == g`), so existing tenants are byte-identical.
+        tp_rank = getattr(par, "tensor_parallel_rank", None)
+        pp_rank = getattr(par, "pipeline_parallel_rank", None)
+        if tp_rank is None or pp_rank is None:
+            g = int(getattr(par, "rank", 0) or 0)
+            t = max(1, int(tp_size or 1))
+            p = max(1, int(pp_size or 1))
+            if tp_rank is None:
+                tp_rank = g % t
+            if pp_rank is None:
+                pp_rank = (g // t) % p
     except Exception:  # noqa: BLE001
         pass
     is_mla = False

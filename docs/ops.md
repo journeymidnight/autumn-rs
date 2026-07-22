@@ -852,6 +852,17 @@ layout-incompatible stack never shares a tenant. Operational consequence:
 cold-invalidates the whole vLLM pool** — expected, one-time re-warm; the old
 tenant's keys need the same manual reclaim as below.
 
+**`--kv-cache-dtype` is part of the identity too** (added 2026-07-22): the
+connector stores raw KV bytes and reinterprets them with the *current* runtime
+dtype, and `CacheConfig.cache_dtype` is independent of the model dtype. The
+silent case is a same-itemsize flip — `fp8_e4m3` ↔ `fp8_e5m2` are both one byte,
+so nothing errors and the KV is just wrong. `cache_dtype` (plus
+`kv_cache_dtype_skip_layers`) therefore splits the tenant. **Changing
+`--kv-cache-dtype` moves the tenant and cold-invalidates the pool**, same as a
+vLLM upgrade. Note this also means the FIRST deploy carrying this change starts
+from a cold vLLM pool even with no config change, because the fingerprint gained
+a source — orphaned old-tenant keys reclaim exactly as below.
+
 ```bash
 # Offline unit tests (no cluster / engine / native module):
 cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q

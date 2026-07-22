@@ -73,7 +73,11 @@ class FakeModelConfig:
 
 
 def fake_vllm_config(model_config=None, weights_path=None, load_format="autumn",
-                     model_id=None, tp_size=1, pp_size=1, rank=0):
+                     model_id=None, tp_size=1, pp_size=1, rank=0,
+                     cache_dtype="auto", kv_skip_layers=()):
+    """Mirrors a real VllmConfig, INCLUDING `cache_config` — vLLM always builds
+    one (`CacheConfig.cache_dtype` defaults to "auto", verified on 0.23.0), so a
+    fake without it would only ever exercise the degraded path."""
     extra = {"endpoint": "mgr:9001"}
     if model_id:
         extra["model_id"] = model_id
@@ -84,6 +88,9 @@ def fake_vllm_config(model_config=None, weights_path=None, load_format="autumn",
         model_config=model_config or FakeModelConfig(),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size, rank=rank
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype=cache_dtype, kv_cache_dtype_skip_layers=list(kv_skip_layers)
         ),
         load_config=SimpleNamespace(load_format=load_format, model_loader_extra_config=mle),
         kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
@@ -346,6 +353,112 @@ def test_kv_layout_version_pinned_and_in_sources():
     assert VLLM_KV_STORAGE_FORMAT == "v1"
     src = vllm_identity_sources(_mk7b())
     assert src["kv_layout"] == "v1"
+
+
+# ── KV-cache dtype: the "same model, different element type" axis ───────────
+# `_inject_layer` reinterprets the stored raw bytes with the CURRENT runtime
+# dtype (`from_numpy(staging).view(template.dtype)`), so --kv-cache-dtype must
+# split the tenant. The fp8_e4m3 ↔ fp8_e5m2 pair is the dangerous one: same
+# itemsize ⇒ the reshape succeeds and the KV is silently wrong.
+
+
+def test_kv_cache_dtype_splits_tenant():
+    same = lambda dt: _tenant(  # noqa: E731
+        fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/q", cache_dtype=dt)
+    )
+    auto, e4m3, e5m2 = same("auto"), same("fp8_e4m3"), same("fp8_e5m2")
+    # the silent-corruption pair: identical itemsize, so nothing would have
+    # errored at load time had they shared a tenant
+    assert e4m3 != e5m2
+    assert len({auto, e4m3, e5m2}) == 3
+    # and it is still stable for a fixed dtype
+    assert same("fp8_e4m3") == e4m3
+
+
+def test_kv_cache_dtype_is_independent_of_model_dtype():
+    """`ModelConfig.dtype` (already fingerprinted) does NOT cover this: the same
+    model dtype with two different cache dtypes must still split."""
+    mk = lambda dt: vllm_identity_sources(  # noqa: E731
+        fake_vllm_config(FakeModelConfig(dtype="torch.bfloat16"), weights_path="m", cache_dtype=dt)
+    )
+    a, b = mk("auto"), mk("fp8")
+    assert a["dtype"] == b["dtype"] == "torch.bfloat16"
+    assert a["kv_cache_dtype"] == "auto" and b["kv_cache_dtype"] == "fp8"
+    assert fingerprint_from_sources(a) != fingerprint_from_sources(b)
+
+
+def test_kv_skip_layers_splits_tenant_and_is_order_independent():
+    mk = lambda skip: vllm_identity_sources(  # noqa: E731
+        fake_vllm_config(weights_path="m", cache_dtype="fp8", kv_skip_layers=skip)
+    )
+    none, a, b = mk(()), mk(("model.layers.0",)), mk(("model.layers.1",))
+    assert "kv_skip_layers" not in none  # empty list ⇒ absent, not ""
+    assert fingerprint_from_sources(a) != fingerprint_from_sources(b)
+    assert fingerprint_from_sources(none) != fingerprint_from_sources(a)
+    # iteration order of the config value must not move the fingerprint
+    ab = mk(("model.layers.0", "model.layers.1"))
+    ba = mk(("model.layers.1", "model.layers.0"))
+    assert fingerprint_from_sources(ab) == fingerprint_from_sources(ba)
+
+
+def test_missing_cache_config_degrades_not_raises():
+    """A config shape without `cache_config` still fingerprints (one source
+    fewer) — never an exception."""
+    cfg = SimpleNamespace(model_config=FakeModelConfig(**QWEN_7B))
+    src = vllm_identity_sources(cfg)
+    assert "kv_cache_dtype" not in src
+    assert fingerprint_from_sources(src) is not None
+
+
+# ── TP/PP rank derivation from the global rank ──────────────────────────────
+# `ParallelConfig.rank` is the GLOBAL rank (TP is the fastest-varying dimension
+# inside a pipeline stage). pp_rank used to be initialised to None and never
+# assigned, and `rank` was taken verbatim as the TP rank.
+
+
+def test_tp_pp_ranks_derived_from_global_rank():
+    tenants = set()
+    for g in range(4):  # tp_size=2, pp_size=2 ⇒ global ranks 0..3
+        cfg = tenant_cfg_from_vllm(fake_vllm_config(tp_size=2, pp_size=2, rank=g))
+        assert 0 <= cfg.tp_rank < 2, f"tp_rank {cfg.tp_rank} out of range for tp_size=2"
+        assert 0 <= cfg.pp_rank < 2, f"pp_rank {cfg.pp_rank} out of range for pp_size=2"
+        assert (cfg.tp_rank, cfg.pp_rank) == (g % 2, g // 2)
+        tenants.add(build_tenant_suffix(cfg, cfg.model_fingerprint))
+    assert len(tenants) == 4  # every rank still gets its own tenant
+
+
+def test_explicit_rank_fields_win_over_derivation():
+    par = SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=2, rank=3,
+                          tensor_parallel_rank=0, pipeline_parallel_rank=1)
+    cfg = tenant_cfg_from_vllm(SimpleNamespace(parallel_config=par))
+    assert (cfg.tp_rank, cfg.pp_rank) == (0, 1)
+
+
+def test_pp1_rank_derivation_is_byte_identical():
+    """Regression guard on the ONLY shape deployed today (pp_size == 1): the
+    derivation must be the identity, or this fix silently cold-invalidates
+    every live tenant a second time."""
+    t = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/q",
+                                 tp_size=4, rank=2))
+    assert t.endswith("_2_4")  # exactly what the pre-fix code produced
+    assert "_pp" not in t
+
+
+# ── rank/size numeric normalisation (duck-typed configs from JSON/env) ──────
+
+
+def test_build_tenant_suffix_coerces_numeric_strings_byte_identically():
+    assert build_tenant_suffix(_sg_cfg(tp_rank="1", tp_size="4")) == "smoke-model_1_4"
+    # the case that used to raise a bare TypeError from `pp_size > 1`
+    assert (
+        build_tenant_suffix(_sg_cfg(pp_rank="1", pp_size="2")) == "smoke-model_0_1_pp1_2"
+    )
+
+
+def test_build_tenant_suffix_rejects_non_numeric_rank():
+    import pytest
+    with pytest.raises(ValueError, match="tp_size"):
+        build_tenant_suffix(_sg_cfg(tp_size="four"))
 
 
 # ── F-AUTHZ-BUILTIN: credential file must hex-DECODE to raw bytes ────────────
