@@ -76,6 +76,11 @@ struct Args {
     /// F-DASH-IN-MGR: ARM cluster mutations — manual dashboard actions AND the
     /// auto-policy controller leaving DryRun. Default OFF = read-only viewer.
     dashboard_allow_mutations: bool,
+    /// F-AUTOPOLICY-BOOT-DEFAULT: seed this preset as the active policy (Armed)
+    /// on a FRESH cluster. Deploy layer passes `balanced`; unset = controller
+    /// stays Off (cluster.sh / tests). Armed is honored only with
+    /// `--dashboard-allow-mutations`.
+    auto_policy_default: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -98,6 +103,7 @@ fn parse_args() -> Args {
     let mut dashboard_port: Option<u16> = None;
     let mut dashboard_listen: Option<String> = None;
     let mut dashboard_allow_mutations = false;
+    let mut auto_policy_default: Option<String> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -221,6 +227,10 @@ fn parse_args() -> Args {
             "--dashboard-allow-mutations" => {
                 dashboard_allow_mutations = true;
             }
+            "--auto-policy-default" => {
+                i += 1;
+                auto_policy_default = Some(raw[i].clone());
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -246,6 +256,7 @@ fn parse_args() -> Args {
         dashboard_port,
         dashboard_listen,
         dashboard_allow_mutations,
+        auto_policy_default,
     }
 }
 
@@ -421,6 +432,30 @@ async fn main() -> Result<()> {
     // the auto-policy controller leaving DryRun. Set unconditionally — the
     // controller loop runs even without --dashboard-port.
     manager.set_dashboard_allow_mutations(args.dashboard_allow_mutations);
+    // F-AUTOPOLICY-BOOT-DEFAULT: seed the deploy-configured default active policy
+    // on a fresh cluster. Validate the preset name up front — a typo must fail
+    // loud at startup, not silently leave the controller Off.
+    if let Some(preset) = &args.auto_policy_default {
+        if !AutumnManager::is_known_auto_policy_preset(preset) {
+            anyhow::bail!(
+                "--auto-policy-default {preset:?} is not a known preset \
+                 (gc-only / maintenance / space-reclaim / balanced / aggressive)"
+            );
+        }
+        manager.set_auto_policy_default(preset.clone());
+        if !args.dashboard_allow_mutations {
+            tracing::warn!(
+                preset,
+                "--auto-policy-default set WITHOUT --dashboard-allow-mutations: the seeded \
+                 policy will run in DryRun (advisory only) until mutations are armed"
+            );
+        }
+    }
+    // F-AUTOPOLICY-BOOT-DEFAULT: seed now — AFTER the flag is set. `new_with_etcd`
+    // already ran the first replay + election in the constructor (which recorded
+    // whether a config was persisted), so this seeds a fresh cluster and no-ops
+    // when a config already exists or no default was requested.
+    manager.apply_auto_policy_default();
     if let Some(dport) = args.dashboard_port {
         let dhost = args
             .dashboard_listen

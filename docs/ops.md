@@ -63,12 +63,22 @@ policy advisories, and (armed) per-target action buttons.
 
 **Auto-policy controller** — the manager only *emits* advisories (F203 pure
 mechanism); the controller *decides + actuates* per an active policy. It is
-**leader-only** (never runs on a follower), **DEFAULT-OFF** (a fresh cluster stays
-pure-mechanism until an operator arms it), and a state machine `Off → DryRun →
+**leader-only** (never runs on a follower) and a state machine `Off → DryRun →
 Armed`. `Armed` actuates only when `--dashboard-allow-mutations` is set (else it
 degrades to DryRun and logs "would: …"). Config is persisted to etcd
 (`autoPolicy/config` + `autoPolicy/cooldowns`, leader-fenced) so the active policy
-survives leader failover. Headless control:
+survives leader failover.
+
+**Boot default (F-AUTOPOLICY-BOOT-DEFAULT).** The DEPLOY layer (entrypoint /
+autumn-deploy / k8s) seeds `--auto-policy-default balanced` + arms mutations, so a
+production cluster boots running the `balanced` policy (GC + compaction + EC +
+region rebalance — no split/merge) automatically. The seed fires only on a FRESH
+cluster (no persisted `autoPolicy/config`) and is in-memory, so the first operator
+change persists over it and a `deactivate` survives failover (never re-seeded).
+`AUTUMN_AUTO_POLICY_DEFAULT=<preset|off>` changes or disables it;
+`AUTUMN_DASHBOARD_ALLOW_MUTATIONS=0` makes it advisory-only. **cluster.sh / chaos /
+perf leave it OFF** (they never set the env), so dev/test behaviour is unchanged.
+Headless control:
 
 ```bash
 autumn-op auto-policy status                 # mode + active + presets + action log

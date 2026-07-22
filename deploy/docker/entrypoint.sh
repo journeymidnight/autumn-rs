@@ -112,13 +112,20 @@ run_manager() {
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)
     # F-DASH-IN-MGR: embedded web dashboard + auto-policy controller, ON by
-    # default (read-only viewer, bound to --listen). Set AUTUMN_DASHBOARD=0 to
-    # disable; AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 arms manual actions + the
-    # controller (autoPolicy runs ONLY on the leader).
+    # default (bound to --listen). Set AUTUMN_DASHBOARD=0 to disable.
+    # F-AUTOPOLICY-BOOT-DEFAULT: production deploy defaults to ARMED steady-state
+    # maintenance — the `balanced` policy (gc + compaction + EC + rebalance) runs
+    # automatically on a fresh cluster, and mutations are armed so it actuates.
+    # (cluster.sh / chaos / perf never set these envs, so they stay Off — dev/test
+    # unaffected.) Override: AUTUMN_DASHBOARD_ALLOW_MUTATIONS=0 for advisory-only,
+    # AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> to change/disable the seeded policy.
     if [[ "${AUTUMN_DASHBOARD:-1}" != "0" ]]; then
         args+=(--dashboard-port "${AUTUMN_DASHBOARD_PORT:-8799}")
-        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] && args+=(--dashboard-allow-mutations)
+        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-1}" == "1" ]] && args+=(--dashboard-allow-mutations)
     fi
+    _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"
+    [[ "$_auto_policy" != "off" && "$_auto_policy" != "0" ]] \
+        && args+=(--auto-policy-default "$_auto_policy")
     [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]] \
         && args+=(--min-alloc-free-bytes "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES")
     # F-AUTHZ-BUILTIN: authz engages iff NOT explicitly disabled AND the signing

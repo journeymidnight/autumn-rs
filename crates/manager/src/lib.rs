@@ -795,6 +795,17 @@ pub struct AutumnManager {
     /// runs ONLY on the leader and is DEFAULT-OFF (a fresh cluster stays
     /// pure-mechanism, F203).
     pub(crate) auto_policy: Rc<RefCell<crate::auto_policy::AutoPolicyState>>,
+    /// F-AUTOPOLICY-BOOT-DEFAULT: preset to seed as the active policy (Armed) on
+    /// a FRESH cluster — one with no persisted `autoPolicy/config`. Set from the
+    /// bin (`--auto-policy-default <preset>`, deploy-layer default `balanced`);
+    /// `None` = leave the controller Off until an operator activates one (cluster.sh
+    /// / tests / dev). Seed is IN-MEMORY only, so the first operator config change
+    /// (or a deactivate) persists over it and later failovers replay that instead.
+    pub(crate) auto_policy_default: Rc<RefCell<Option<String>>>,
+    /// F-AUTOPOLICY-BOOT-DEFAULT: did the last etcd replay find a persisted
+    /// `autoPolicy/config`? Set during replay, read by `apply_auto_policy_default`
+    /// (which runs from the bin after flags are set) to decide whether to seed.
+    pub(crate) auto_policy_had_persisted_config: Rc<Cell<bool>>,
     /// F-DASH-IN-MGR M2: whether `--dashboard-allow-mutations` was set. ONE
     /// flag gates BOTH manual dashboard actions AND the controller leaving
     /// DryRun (user decision). Set from the bin; default false.
@@ -945,6 +956,8 @@ impl AutumnManager {
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
+            auto_policy_default: Rc::new(RefCell::new(None)),
+            auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
             dashboard_allow_mutations: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
             // F195 defaults match the pre-F195 env defaults (F192).
@@ -1424,6 +1437,55 @@ impl AutumnManager {
     /// honored. Set from the bin (`--dashboard-allow-mutations`).
     pub fn set_dashboard_allow_mutations(&self, v: bool) {
         self.dashboard_allow_mutations.set(v);
+    }
+
+    /// F-AUTOPOLICY-BOOT-DEFAULT: set the preset to seed as the active policy on
+    /// a fresh cluster. Validated (must be a known preset) — an unknown name is a
+    /// startup error, surfaced by the bin.
+    pub fn set_auto_policy_default(&self, preset: String) {
+        *self.auto_policy_default.borrow_mut() = Some(preset);
+    }
+
+    /// True iff `name` names a built-in preset. Lets the bin fail-loud on
+    /// `--auto-policy-default garbage` before serving.
+    pub fn is_known_auto_policy_preset(name: &str) -> bool {
+        crate::auto_policy::is_preset_name(name)
+    }
+
+    /// F-AUTOPOLICY-BOOT-DEFAULT: seed the default active policy when the cluster
+    /// has NO persisted `autoPolicy/config` (a fresh cluster). In-memory only —
+    /// the moment an operator changes the config (or deactivates) it persists and
+    /// this never fires again for that cluster. `mode = Armed`, but Armed is
+    /// honored only when `--dashboard-allow-mutations` is also set (else the tick
+    /// loop degrades to DryRun with a WARN) — the two flags are orthogonal.
+    ///
+    /// Called from the bin AFTER `set_auto_policy_default`, because `new_with_etcd`
+    /// runs the first replay + election in the constructor, before the flag exists.
+    /// Safe to call whether or not this process won the election: it only seeds
+    /// in-memory state, which the tick loop reads only while leader; a follower's
+    /// seeded state is harmless and is replaced by the real config if it ever
+    /// promotes (the replay refreshes `auto_policy_had_persisted_config`).
+    pub fn apply_auto_policy_default(&self) {
+        if self.auto_policy_had_persisted_config.get() {
+            return; // operator/previous-leader config wins — never re-seed
+        }
+        let Some(preset) = self.auto_policy_default.borrow().clone() else {
+            return; // no --auto-policy-default: stay Off (cluster.sh / tests / dev)
+        };
+        if !crate::auto_policy::is_preset_name(&preset) {
+            // Defensive: the bin already validated, but never seed a bogus name.
+            tracing::warn!(preset, "auto-policy-default is not a known preset — leaving controller Off");
+            return;
+        }
+        let mut st = self.auto_policy.borrow_mut();
+        st.active = preset.clone();
+        st.mode = crate::auto_policy::AutoPolicyMode::Armed;
+        tracing::info!(
+            preset,
+            armed_honored = self.dashboard_allow_mutations.get(),
+            "F-AUTOPOLICY-BOOT-DEFAULT: seeded default active policy on a fresh cluster \
+             (Armed; actuation requires --dashboard-allow-mutations)"
+        );
     }
 
     /// Are we the current etcd leader? Used by the dashboard to gate leader-only
@@ -3021,11 +3083,19 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // cooldowns so the active policy + mode + custom policies survive leader
         // failover (the crash-safety win over the killable Python webserver).
         // Malformed → fail-loud (note 39) rather than silently reset the policy.
+        let had_persisted_config = autopolicy_config_kv.kvs.first().is_some();
         if let Some(kv) = autopolicy_config_kv.kvs.first() {
             let cfg: MgrAutoPolicyConfig =
                 rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
             self.auto_policy.borrow_mut().load_config(cfg);
         }
+        // F-AUTOPOLICY-BOOT-DEFAULT: record whether this cluster carried a
+        // persisted auto-policy config, so `apply_auto_policy_default` (called
+        // from the bin AFTER the flags are set) knows if it may seed. The seed
+        // can't happen HERE: `new_with_etcd` runs the first replay + leader
+        // election in the CONSTRUCTOR, before the bin has called
+        // `set_auto_policy_default`, so the flag isn't set yet.
+        self.auto_policy_had_persisted_config.set(had_persisted_config);
         if let Some(kv) = autopolicy_cooldowns_kv.kvs.first() {
             let cds: MgrAutoPolicyCooldowns =
                 rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
@@ -7911,6 +7981,45 @@ mod tests {
     /// `fetch_full_extent_from_sources` and allocated sealed_length-sized
     /// Vec<u8> per peer attempt (observed as multi-GB RSS swings on an
     /// idle cluster after `cluster.sh restart`).
+    // F-AUTOPOLICY-BOOT-DEFAULT: seed the default policy only on a fresh cluster.
+    #[test]
+    fn autopolicy_boot_default_seeds_only_a_fresh_cluster() {
+        use crate::auto_policy::AutoPolicyMode;
+
+        // No --auto-policy-default configured → stays Off (cluster.sh / tests).
+        let m = AutumnManager::new();
+        m.apply_auto_policy_default();
+        assert_eq!(m.auto_policy.borrow().mode, AutoPolicyMode::Off);
+        assert!(m.auto_policy.borrow().active.is_empty());
+
+        // Configured + fresh (no persisted config) → seed balanced/Armed.
+        let m = AutumnManager::new();
+        m.set_auto_policy_default("balanced".to_string());
+        m.apply_auto_policy_default();
+        assert_eq!(m.auto_policy.borrow().mode, AutoPolicyMode::Armed);
+        assert_eq!(m.auto_policy.borrow().active, "balanced");
+
+        // Configured but NOT fresh (a persisted config was replayed) → never
+        // re-seed: the operator's / previous leader's choice wins on failover.
+        let m = AutumnManager::new();
+        m.set_auto_policy_default("balanced".to_string());
+        m.auto_policy_had_persisted_config.set(true);
+        m.apply_auto_policy_default();
+        assert_eq!(m.auto_policy.borrow().mode, AutoPolicyMode::Off);
+        assert!(m.auto_policy.borrow().active.is_empty());
+
+        // A bogus preset name never seeds (belt to the bin's fail-loud check).
+        let m = AutumnManager::new();
+        m.set_auto_policy_default("no-such-preset".to_string());
+        m.apply_auto_policy_default();
+        assert_eq!(m.auto_policy.borrow().mode, AutoPolicyMode::Off);
+
+        // The preset-name validator the bin uses.
+        assert!(AutumnManager::is_known_auto_policy_preset("balanced"));
+        assert!(AutumnManager::is_known_auto_policy_preset("aggressive"));
+        assert!(!AutumnManager::is_known_auto_policy_preset("nope"));
+    }
+
     #[test]
     fn f206_apply_ec_conversion_done_sets_avali_for_all_shards() {
         run(async {

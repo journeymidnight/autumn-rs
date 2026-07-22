@@ -611,6 +611,12 @@ launch_manager() {
         [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] \
             && mgr_extra="$mgr_extra --dashboard-allow-mutations"
     fi
+    # F-AUTOPOLICY-BOOT-DEFAULT: unlike the deploy layer (entrypoint / autumn-deploy
+    # default `balanced`), cluster.sh leaves the controller OFF by default so
+    # chaos / perf / dev are unaffected. Set AUTUMN_AUTO_POLICY_DEFAULT=<preset> to
+    # opt in for testing.
+    [[ -n "${AUTUMN_AUTO_POLICY_DEFAULT:-}" ]] \
+        && mgr_extra="$mgr_extra --auto-policy-default $AUTUMN_AUTO_POLICY_DEFAULT"
     if [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]]; then
         [[ "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES" =~ ^[0-9]+$ ]] \
             || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
