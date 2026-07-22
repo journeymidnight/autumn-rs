@@ -1011,7 +1011,12 @@ do_start() {
         # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
         # is now interpreted as "presplit the BENCH namespace into N partitions",
         # applied after bootstrap + namespace registration below.
-        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
+        # F-ADMIN-OP-AUTH: the manager now always has an admin token (provisioned
+        # above), and bootstrap sends CREATE_STREAM / UPSERT_PARTITION, which the
+        # manager gates. Pass the token so bring-up is authorized.
+        local _boot_admin=()
+        [[ -r "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && _boot_admin=( --admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE" )
+        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" "${_boot_admin[@]}" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
         # Each partition's open() runs stream commit_length calls serially against

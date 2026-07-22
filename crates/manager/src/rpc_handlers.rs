@@ -197,6 +197,35 @@ impl AutumnManager {
     }
 
     async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
+        // F-ADMIN-OP-AUTH: gate cluster-MUTATING ops on a shared admin token,
+        // carried as a length-prefix on the payload (zero wire-struct change).
+        // OPT-IN: only enforced when this manager was configured with a token —
+        // a token-less manager (dev/test/bench/chaos) runs these bare. When a
+        // token IS set, the payload MUST carry a matching prefix; the stripped
+        // remainder is what the real handler decodes.
+        let payload = if autumn_rpc::manager_rpc::is_admin_mgr_msg(msg_type) {
+            if let Some(tok) = self.admin_token.borrow().as_ref() {
+                let Some((got, rest)) = autumn_rpc::manager_rpc::strip_admin_token(&payload) else {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        "admin op requires an admin token (malformed or missing prefix) — pass \
+                         --admin-token-file to autumn-op"
+                            .to_string(),
+                    ));
+                };
+                if !crate::authz::ct_eq_secret(tok, &String::from_utf8_lossy(got)) {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        "admin token invalid".to_string(),
+                    ));
+                }
+                payload.slice_ref(rest)
+            } else {
+                payload
+            }
+        } else {
+            payload
+        };
         match msg_type {
             MSG_STATUS => self.handle_status().await,
             MSG_ACQUIRE_OWNER_LOCK => self.handle_acquire_owner_lock(payload).await,
@@ -7038,6 +7067,7 @@ mod namespace_registry_tests {
     #![allow(clippy::await_holding_refcell_ref)]
     use crate::{AutumnManager, MgrNamespace};
     use autumn_rpc::manager_rpc::*;
+    use autumn_rpc::StatusCode;
     use bytes::Bytes;
 
     const ADMIN: &str = "admin-secret";
@@ -7088,6 +7118,72 @@ mod namespace_registry_tests {
     fn list(m: &AutumnManager) -> NamespaceListResp {
         let resp = run(async { m.handle_namespace_list().await.unwrap() });
         rkyv_decode::<NamespaceListResp>(&resp).expect("decode NamespaceListResp")
+    }
+
+    // ── F-ADMIN-OP-AUTH: payload-prefix admin gate on cluster-mutating ops ──
+
+    /// Drive a mutating op through `dispatch` (where the gate lives). Returns the
+    /// frame-level result: `Ok` = passed the gate (the handler then ran and
+    /// answered on its own merits), `Err(code,msg)` = the gate rejected it.
+    fn dispatch_merge(m: &AutumnManager, wire_payload: Bytes) -> Result<Bytes, (StatusCode, String)> {
+        run(async { m.dispatch(MSG_MERGE_PARTITIONS, wire_payload).await })
+    }
+
+    fn merge_body() -> Bytes {
+        rkyv_encode(&MergePartitionsReq {
+            survivor_part_id: 1,
+            victim_part_id: 2,
+            force: false,
+        })
+    }
+
+    #[test]
+    fn admin_gate_skipped_when_manager_has_no_token() {
+        // Opt-in: a token-less manager runs mutating ops BARE (dev/test/bench/
+        // chaos never set a token). The bare body passes the gate and reaches the
+        // handler, which then fails for its OWN reason (no such partition) — the
+        // point is it was NOT rejected by the gate.
+        let m = AutumnManager::new(); // no set_admin_token
+        let r = dispatch_merge(&m, merge_body());
+        assert!(r.is_ok(), "gate must not reject when no admin token is configured");
+    }
+
+    #[test]
+    fn admin_gate_rejects_missing_and_wrong_token_accepts_correct() {
+        let m = AutumnManager::new();
+        m.set_admin_token(ADMIN.to_string());
+
+        // No prefix at all (a stale/rogue client that doesn't know about the gate).
+        let bare = dispatch_merge(&m, merge_body());
+        let (code, msg) = bare.expect_err("token-ON manager must reject an unprefixed admin op");
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        assert!(msg.contains("admin token"), "{msg}");
+
+        // Wrong token.
+        let wrong = dispatch_merge(
+            &m,
+            autumn_rpc::manager_rpc::prefix_admin_token(b"not-the-secret", &merge_body()),
+        );
+        let (code, msg) = wrong.expect_err("wrong token must be rejected");
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        assert_eq!(msg, "admin token invalid");
+
+        // Correct token → passes the gate (handler then runs and fails on its own
+        // merits — a missing partition — which is NOT a gate rejection).
+        let ok = dispatch_merge(
+            &m,
+            autumn_rpc::manager_rpc::prefix_admin_token(ADMIN.as_bytes(), &merge_body()),
+        );
+        assert!(ok.is_ok(), "correct token must pass the gate");
+    }
+
+    #[test]
+    fn admin_gate_leaves_read_only_ops_untouched() {
+        // A read op is never prefixed and never stripped, even with a token set.
+        let m = AutumnManager::new();
+        m.set_admin_token(ADMIN.to_string());
+        let r = run(async { m.dispatch(MSG_NODES_INFO, Bytes::new()).await });
+        assert!(r.is_ok(), "read-only op must not be gated");
     }
 
     #[test]

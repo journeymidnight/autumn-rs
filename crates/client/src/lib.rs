@@ -711,6 +711,12 @@ pub struct ClusterClient {
     /// surfaces as `ConnectionError`; the existing `mgr_call_retry`
     /// path's `rotate_manager` then walks to the next manager address.
     rpc_timeout: Cell<Option<Duration>>,
+    /// F-ADMIN-OP-AUTH: shared admin secret for cluster-mutating manager ops
+    /// (fence/remove/merge/create-stream/…). When set, `mgr_call*` prefix it
+    /// onto the payload of an `is_admin_mgr_msg` (`[u32 len][token][payload]`)
+    /// and the manager strips + verifies. `None` = don't prefix (the manager
+    /// opt-in means a token-less manager runs these bare anyway).
+    admin_token: RefCell<Option<Vec<u8>>>,
     /// Bug #2 fix (2026-06-06) — first-attempt timeout for
     /// `call_ps_for_key` / `call_ps_for_part`. See
     /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
@@ -806,7 +812,30 @@ impl ClusterClient {
     /// surfaces as a transport error; `mgr_call_retry`'s
     /// `rotate_manager` walks to the next manager address on the next
     /// attempt.
+    /// F-ADMIN-OP-AUTH: set the admin secret used to authorize cluster-mutating
+    /// manager ops. `autumn-op` calls this once at connect when `--admin-token-file`
+    /// is given; read-only commands are unaffected (the server only gates
+    /// `is_admin_mgr_msg`).
+    pub fn set_admin_token(&self, token: Vec<u8>) {
+        *self.admin_token.borrow_mut() = Some(token);
+    }
+
+    /// Prefix the admin token onto an `is_admin_mgr_msg` payload when a token is
+    /// set; otherwise return the payload untouched. One choke point for all
+    /// three `mgr_call*` variants (leader/retry both funnel through `mgr_call`) so a
+    /// key is prefixed EXACTLY once per request.
+    fn maybe_prefix_admin(&self, msg_type: u8, payload: Bytes) -> Bytes {
+        if !autumn_rpc::manager_rpc::is_admin_mgr_msg(msg_type) {
+            return payload;
+        }
+        match self.admin_token.borrow().as_ref() {
+            Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok, &payload),
+            None => payload,
+        }
+    }
+
     pub async fn mgr_call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+        let payload = self.maybe_prefix_admin(msg_type, payload);
         let client = self.mgr_client().await?;
         let outcome = match self.rpc_timeout.get() {
             None => client.call(msg_type, payload).await,
@@ -1253,6 +1282,7 @@ impl ClusterClient {
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
             rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
+            admin_token: RefCell::new(None),
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
             auth: RefCell::new(None),
             auth_gen: Cell::new(0),
@@ -4250,6 +4280,7 @@ mod first_attempt_timeout_tests {
                 ps_details: RefCell::new(HashMap::new()),
                 part_addrs: RefCell::new(HashMap::new()),
                 rpc_timeout: Cell::new(rpc),
+                admin_token: RefCell::new(None),
                 first_attempt_timeout: Cell::new(first),
                 auth: RefCell::new(None),
                 auth_gen: Cell::new(0),

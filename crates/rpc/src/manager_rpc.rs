@@ -2051,6 +2051,77 @@ pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
 // points for a namespace being CREATED; presplit runs against existing ones.
 pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 
+// ── F-ADMIN-OP-AUTH: admin-token gating for cluster-mutating manager ops ──────
+//
+// A shared admin secret gates the control-plane ops that CHANGE the cluster but
+// are neither owner-fenced nor already admin-gated (tenant/namespace/principal
+// create/delete carry their own `admin_token` struct field). Trust model: a
+// trusted internal network defending against a ROGUE/TEST client running a
+// destructive command — NOT MITM (no TLS).
+//
+// Wire cost is ZERO: instead of adding an `admin_token` field to all eleven
+// request structs, the token is a length-prefixed PREFIX on the payload
+// (`[u32 LE len][token bytes][original payload]`), stripped and verified in one
+// place in the manager dispatch. `is_admin_mgr_msg` is the ONE list every layer
+// agrees on (client prefixes iff it holds a token; manager strips iff it holds
+// one).
+//
+// OPT-IN, unlike the struct-field ops: a manager with no admin token runs these
+// BARE (so dev / test / bench / chaos, which never set a token, are unaffected).
+// The struct-field ops stay fail-CLOSED (no token ⇒ refused) because they only
+// make sense under authz; these are everyday cluster ops.
+
+/// The length-prefix width for the admin-token payload prefix.
+pub const ADMIN_TOKEN_LEN_PREFIX: usize = 4;
+
+/// True for the cluster-MUTATING manager ops that `F-ADMIN-OP-AUTH` gates. NOT
+/// the read/observability ops (info/df/list-nodes/…), and NOT the ops that
+/// already carry their own `admin_token` field (tenant/namespace/principal).
+#[inline]
+pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        MSG_FENCE_NODE
+            | MSG_REMOVE_NODE
+            | MSG_SET_NODE_MAINTENANCE
+            | MSG_CLEAR_NODE_OVERRIDE
+            | MSG_BUMP_CLUSTER_VERSION
+            | MSG_UPDATE_STREAM_EC
+            | MSG_FORCE_EC_CONVERT
+            | MSG_CREATE_STREAM
+            | MSG_UPSERT_PARTITION
+            | MSG_MERGE_PARTITIONS
+    )
+    // MSG_REGISTER_NODE is DELIBERATELY NOT gated, deviating from the design
+    // doc's list. It is not operator-only: the EXTENT NODE self-registers with
+    // it at startup and re-registers after a manager restart
+    // (extent_node.rs `register_with_manager`), and the EN has no admin-token
+    // concept. Gating it would wedge cluster bring-up. CREATE_STREAM /
+    // UPSERT_PARTITION stay gated — only `autumn-op bootstrap` sends them, so
+    // cluster.sh's bootstrap call carries the token.
+}
+
+/// Prepend `[u32 LE token_len][token][payload]`. Called on the client for an
+/// `is_admin_mgr_msg` when a token is set.
+pub fn prefix_admin_token(token: &[u8], payload: &[u8]) -> bytes::Bytes {
+    let mut b = bytes::BytesMut::with_capacity(ADMIN_TOKEN_LEN_PREFIX + token.len() + payload.len());
+    b.extend_from_slice(&(token.len() as u32).to_le_bytes());
+    b.extend_from_slice(token);
+    b.extend_from_slice(payload);
+    b.freeze()
+}
+
+/// Split a payload carrying an admin-token prefix into `(token, rest)`. `None`
+/// if the prefix is malformed (too short / length runs past the buffer) — the
+/// manager treats that as a failed check, never as "run it bare".
+pub fn strip_admin_token(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len_bytes = payload.get(..ADMIN_TOKEN_LEN_PREFIX)?;
+    let token_len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+    let token = payload.get(ADMIN_TOKEN_LEN_PREFIX..ADMIN_TOKEN_LEN_PREFIX + token_len)?;
+    let rest = &payload[ADMIN_TOKEN_LEN_PREFIX + token_len..];
+    Some((token, rest))
+}
+
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
 pub const AUTOPOLICY_OP_SET_ACTIVE: u8 = 1;

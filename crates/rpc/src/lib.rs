@@ -295,9 +295,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //     MergePartitionsReq grew `force: bool` (override the sacred-boundary
     //     refusal). The registry's `presplit` field itself needed no change —
     //     it has been frozen and empty since SD-1 waiting for this consumer.
-    // Both purely additive, but pre-R3 rkyv has no cross-version decode, so
+    //   • F-ADMIN-OP-AUTH: is_admin_mgr_msg + the admin-token payload codec
+    //     (prefix_admin_token / strip_admin_token) landed in manager_rpc.rs.
+    //     These are pure fns + consts — NO rkyv struct changed shape, and the
+    //     payload prefix is an out-of-band convention the manager strips before
+    //     decoding — but the hashed schema SOURCE changed, so the fingerprint
+    //     refreshes (still an in-place v27 refinement: v27 is undeployed).
+    // All purely additive, but pre-R3 rkyv has no cross-version decode, so
     // MIN=MAX=27 and the deploy stays same-commit.
-    (27, "c8c83dc2b7bc9812"),
+    (27, "4edb18488d4502a4"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
@@ -405,6 +411,65 @@ mod shard_for_extent_tests {
             strided.iter().collect::<std::collections::HashSet<_>>().len() > 1,
             "strided ids must NOT all land on one shard under the hash"
         );
+    }
+}
+
+#[cfg(test)]
+mod admin_token_prefix_tests {
+    use crate::manager_rpc::*;
+
+    #[test]
+    fn prefix_then_strip_round_trips() {
+        let tok = b"deadbeef";
+        let payload = b"the original rkyv payload bytes";
+        let wire = prefix_admin_token(tok, payload);
+        let (got_tok, rest) = strip_admin_token(&wire).expect("well-formed");
+        assert_eq!(got_tok, tok);
+        assert_eq!(rest, payload);
+    }
+
+    #[test]
+    fn empty_token_and_empty_payload_are_valid() {
+        let wire = prefix_admin_token(b"", b"");
+        let (t, r) = strip_admin_token(&wire).unwrap();
+        assert!(t.is_empty() && r.is_empty());
+        // An empty payload with a real token.
+        let wire = prefix_admin_token(b"tok", b"");
+        let (t, r) = strip_admin_token(&wire).unwrap();
+        assert_eq!(t, b"tok");
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn malformed_prefix_is_none_never_run_bare() {
+        // A bare (unprefixed) admin payload must NOT be mistaken for a valid
+        // strip — the manager treats None as a failed check, not "run it bare".
+        assert!(strip_admin_token(b"").is_none()); // no length header at all
+        assert!(strip_admin_token(b"\x02\x00").is_none()); // header truncated (<4 B)
+        // length says 100 but only 3 bytes follow → runs past the buffer.
+        let mut bad = 100u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(b"abc");
+        assert!(strip_admin_token(&bad).is_none());
+    }
+
+    #[test]
+    fn the_admin_set_is_mutating_ops_only() {
+        // A representative mutating op is gated …
+        assert!(is_admin_mgr_msg(MSG_FENCE_NODE));
+        assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
+        assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
+        assert!(is_admin_mgr_msg(MSG_BUMP_CLUSTER_VERSION));
+        // … while read-only observability and the struct-field authz ops are NOT
+        // (those carry their own admin_token field and stay fail-closed).
+        assert!(!is_admin_mgr_msg(MSG_STATUS));
+        assert!(!is_admin_mgr_msg(MSG_NODES_INFO));
+        assert!(!is_admin_mgr_msg(MSG_TENANT_CREATE));
+        assert!(!is_admin_mgr_msg(MSG_NAMESPACE_CREATE));
+        assert!(!is_admin_mgr_msg(MSG_PRINCIPAL_LIST));
+        // REGISTER_NODE is explicitly NOT gated (deviates from the design list):
+        // the EXTENT NODE self-registers with it and has no admin token, so
+        // gating it would wedge bring-up.
+        assert!(!is_admin_mgr_msg(MSG_REGISTER_NODE));
     }
 }
 

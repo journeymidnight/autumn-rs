@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use autumn_transport::TransportKind;
 
 fn usage() -> ! {
-    eprintln!("usage: autumn-op [--manager addr] [--json] <command>");
+    eprintln!("usage: autumn-op [--manager addr] [--json] [--admin-token-file F] <command>");
+    eprintln!("  --admin-token-file F: authorize cluster-mutating ops (fence/remove/merge/create-stream/…)");
+    eprintln!("    when the manager was started with --admin-token-file (F-ADMIN-OP-AUTH). Read-only ops ignore it.");
     eprintln!();
     eprintln!("read / observability commands:");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
@@ -132,6 +134,11 @@ pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) json: bool,
     pub(crate) transport: TransportKind,
+    /// F-ADMIN-OP-AUTH: shared admin secret for cluster-mutating ops
+    /// (`--admin-token[-file]`). Applied to the client at connect via
+    /// `set_admin_token`; read-only commands are unaffected. `None` = don't send
+    /// a token (a token-less manager runs these bare; a token-ON manager refuses).
+    pub(crate) admin_token: Option<String>,
     pub(crate) cmd: Command,
 }
 
@@ -403,6 +410,7 @@ pub(crate) fn parse() -> Args {
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
     let mut transport = TransportKind::Tcp;
+    let mut admin_token: Option<String> = None;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -424,6 +432,20 @@ pub(crate) fn parse() -> Args {
                     eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                     usage()
                 });
+                i += 1;
+            }
+            // F-ADMIN-OP-AUTH: global admin token, gating cluster-mutating ops.
+            // (The per-command `--admin-token` on tenant/namespace/principal ops
+            // is a separate, older struct-field path; this global flag drives the
+            // payload-prefix path for fence/merge/create-stream/….)
+            "--admin-token" => {
+                i += 1;
+                admin_token = Some(raw.get(i).cloned().unwrap_or_else(|| usage()));
+                i += 1;
+            }
+            "--admin-token-file" => {
+                i += 1;
+                admin_token = Some(read_secret_file(&raw.get(i).cloned().unwrap_or_else(|| usage())));
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -1343,6 +1365,7 @@ pub(crate) fn parse() -> Args {
         manager,
         json,
         transport,
+        admin_token,
         cmd,
     }
 }

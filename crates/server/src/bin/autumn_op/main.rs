@@ -311,6 +311,13 @@ async fn run(args: Args) -> Result<()> {
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect_raw(&args.manager).await?;
+    // F-ADMIN-OP-AUTH: a global `--admin-token[-file]` authorizes cluster-mutating
+    // ops (fence/merge/create-stream/…). Read-only commands are unaffected — the
+    // manager only strips+checks the prefix for `is_admin_mgr_msg`, so passing a
+    // token to `info`/`list-nodes` is a harmless no-op.
+    if let Some(tok) = &args.admin_token {
+        client.set_admin_token(tok.as_bytes().to_vec());
+    }
     match args.cmd {
         // ---------------- F211 read ----------------
         Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
