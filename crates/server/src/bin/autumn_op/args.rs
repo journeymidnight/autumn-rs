@@ -35,7 +35,8 @@ fn usage() -> ! {
     eprintln!("  remove <id> --by alice");
     eprintln!();
     eprintln!("cluster / partition admin commands (F213, moved from autumn-client):");
-    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring|N:fuse]");
+    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]");
+    eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
@@ -877,8 +878,32 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                     }
                     "--presplit" => {
-                        i += 1;
-                        presplit = val(&raw, i).to_owned();
+                        // F-PRESPLIT-PER-NS: RETIRED. It cut the RAW keyspace at
+                        // uniform hex points, which is namespace-blind — under
+                        // Option 3 every key carries a `{ns}/` prefix, so those
+                        // points landed nowhere near real keys and the presplit
+                        // silently did nothing (BUG-BENCH-NS-UNREGISTERED: the
+                        // benches' `--partitions N` measured one partition for
+                        // every N). A cluster-wide single mode also has no correct
+                        // setting once more than one application shares the
+                        // cluster. Migration stub, house idiom: fail BEFORE doing
+                        // any work rather than accepting a flag that lies.
+                        eprintln!(
+                            "autumn-op bootstrap --presplit is RETIRED (F-PRESPLIT-PER-NS).\n\
+                             It cut the RAW keyspace, which is namespace-blind — under the\n\
+                             `{{ns}}/` key layout those points miss every real key, so the\n\
+                             presplit silently did nothing.\n\
+                             Presplit per namespace AFTER bootstrap instead:\n\
+                             \x20 autumn-op presplit --namespace fs    --lanes 24 --parts 6 --admin-token-file F\n\
+                             \x20 autumn-op presplit --namespace bench --count 8            --admin-token-file F\n\
+                             \x20 autumn-op presplit --namespace kvc   --count 8 --hash-prefix '<model>/vllm/v1/'"
+                        );
+                        std::process::exit(2);
+                        #[allow(unreachable_code)]
+                        {
+                            i += 1;
+                            presplit = val(&raw, i).to_owned();
+                        }
                         i += 1;
                     }
                     "--log-ec" => {
@@ -1155,9 +1180,13 @@ pub(crate) fn parse() -> Args {
                     }
                     PresplitRule::Mem { agents }
                 }
-                other => {
-                    eprintln!("presplit --namespace must be one of fs|kvc|mem (got {other})");
-                    std::process::exit(1);
+                _other => {
+                    // Any registered namespace can be presplit by uniform hex.
+                    let n = count.unwrap_or_else(|| {
+                        eprintln!("presplit --namespace {_other} requires --count <N> (uniform hex split)");
+                        std::process::exit(1);
+                    });
+                    PresplitRule::Hex { count: n }
                 }
             };
             Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token }
@@ -1581,6 +1610,16 @@ pub(crate) enum PresplitRule {
     /// for each explicit boundary. `agents` are the boundary agent names
     /// (already in their key form — simple names are identity).
     Mem { agents: Vec<String> },
+    /// ANY other namespace = split by UNIFORM HEX over the 8-hex-char space, the
+    /// namespace-relative replacement for the retired `bootstrap --presplit
+    /// N:hexstring`. That flag cut the RAW keyspace, so under Option 3 its points
+    /// (`2aaaaaaa`, `aaaaaaa8`, …) sat nowhere near a namespaced key and the
+    /// presplit silently did nothing — for the benches, `bench_user_starts` kept
+    /// only partitions starting with `bench/perf/` and got none, so every
+    /// `--partitions N` run measured ONE partition (BUG-BENCH-NS-UNREGISTERED).
+    /// Cutting relative to the namespace prefix puts the points where the keys
+    /// actually are.
+    Hex { count: usize },
 }
 
 /// The 16 hex digits in ASCENDING byte order (`'0'..'9'` = 0x30–0x39 then
@@ -1661,6 +1700,18 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
                 out.push(s);
             }
             Ok(out)
+        }
+        PresplitRule::Hex { count } => {
+            // Mirror `hex_split_ranges`' point choice, but as RELATIVE suffixes:
+            // evenly spaced over the 32-bit space rendered as 8 lowercase hex
+            // chars, which is the shape the bench key builder produces.
+            if *count < 2 {
+                return Ok(vec![]);
+            }
+            let span = 0xFFFF_FFFFu64 / *count as u64;
+            Ok((1..*count)
+                .map(|i| format!("{:08x}", span * i as u64).into_bytes())
+                .collect())
         }
         PresplitRule::Mem { agents } => {
             // Cut at `{agent}/` for each boundary; the agent segment ends at '/'.
@@ -2123,6 +2174,26 @@ mod tests {
 #[cfg(test)]
 mod lane_parts_tests {
     use super::{presplit_suffixes, PresplitRule};
+
+    #[test]
+    fn hex_rule_cuts_relative_to_the_namespace() {
+        use super::{presplit_suffixes, PresplitRule};
+        let s = presplit_suffixes(&PresplitRule::Hex { count: 4 }).unwrap();
+        // RELATIVE suffixes — the caller prepends `{ns}/{tenant}/`, which is the
+        // whole point: the retired bootstrap presplit emitted these as ABSOLUTE
+        // raw keys, where no namespaced key ever reaches them.
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], b"3fffffff".to_vec());
+        assert_eq!(s[1], b"7ffffffe".to_vec());
+        assert_eq!(s[2], b"bffffffd".to_vec());
+        // Ascending (required by the presplit orchestration) and fixed width, so
+        // they sort as bytes exactly as they sort numerically.
+        assert!(s.windows(2).all(|w| w[0] < w[1]));
+        assert!(s.iter().all(|p| p.len() == 8));
+        // Degenerate counts cut nothing.
+        assert!(presplit_suffixes(&PresplitRule::Hex { count: 1 }).unwrap().is_empty());
+        assert!(presplit_suffixes(&PresplitRule::Hex { count: 0 }).unwrap().is_empty());
+    }
 
     #[test]
     fn parts_must_divide_lanes() {

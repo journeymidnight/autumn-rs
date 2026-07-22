@@ -307,6 +307,12 @@ run_perf() {
 start_cluster_for() {
     local mode="$1"
     local parts="$2"
+    # AUTUMN_BOOTSTRAP_PRESPLIT now means "presplit the BENCH namespace into N
+    # partitions" — cluster.sh applies it AFTER bootstrap via
+    # `presplit --namespace bench --tenant perf --count N`. The old meaning
+    # (`bootstrap --presplit N:hexstring`) cut the RAW keyspace at points no
+    # `bench/perf/…` key ever reaches, so `bench_user_starts` filtered them all
+    # out and every N measured ONE partition (BUG-BENCH-NS-UNREGISTERED).
     if (( parts > 1 )); then
         export AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"
     else

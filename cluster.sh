@@ -629,22 +629,36 @@ launch_manager() {
     # protects mem/ & gallery/, feeding the AUTUMN_AUTH_* block below (per-example
     # tenant credentials are minted post-bootstrap). Files live under
     # $DATA_ROOT/authz/ and survive restart; `reset` wipes + regenerates them.
+    # The ADMIN TOKEN is independent of data-plane authz and is now provisioned
+    # UNCONDITIONALLY. They gate different planes — the admin token gates
+    # control-plane admin RPCs (namespace-create, principal-create, …), the
+    # signing key gates data-plane authz — but the token used to live inside the
+    # signing-key branch, so a cluster without authz had NO admin token, and
+    # `namespace-create` answered "admin RPCs disabled". That made it impossible
+    # to register a namespace on a default cluster, which is exactly what the
+    # benches need (BUG-BENCH-NS-UNREGISTERED). Configuring the token is safe:
+    # it only ever ENABLES admin RPCs that were refused outright before.
+    local _az="$DATA_ROOT/authz"
+    mkdir -p "$_az"
+    if [[ -z "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
+        [[ -s "$_az/admin.token" ]] \
+            || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_az/admin.token"
+        AUTUMN_ADMIN_TOKEN_FILE="$_az/admin.token"
+    fi
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
-        local _az="$DATA_ROOT/authz"
-        mkdir -p "$_az"
         if [[ -z "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
             [[ -s "$_az/signing.key" ]] \
                 || "$AO" gen-signing-key > "$_az/signing.key" 2>/dev/null \
                 || die "gen-signing-key failed (build autumn-op first)"
             AUTUMN_AUTH_SIGNING_KEY_FILE="$_az/signing.key"
         fi
-        if [[ -z "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
-            [[ -s "$_az/admin.token" ]] \
-                || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_az/admin.token"
-            AUTUMN_ADMIN_TOKEN_FILE="$_az/admin.token"
-        fi
         # authz protects EVERYTHING when a signing key is configured
         # (F-KEY-NS-TENANT-FIRST) — no per-prefix list needed.
+    fi
+    # Pass the admin token whether or not a signing key exists (the signing-key
+    # block below adds the authz flags on top when authz is on).
+    if [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" && -r "${AUTUMN_ADMIN_TOKEN_FILE}" ]]; then
+        mgr_extra="$mgr_extra --admin-token-file $AUTUMN_ADMIN_TOKEN_FILE"
     fi
     # F-AUTHZ-1: data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
     # with no env set, no flags are passed and authz stays OFF (zero impact on
@@ -658,11 +672,8 @@ launch_manager() {
         [[ -r "$AUTUMN_AUTH_SIGNING_KEY_FILE" ]] \
             || die "AUTUMN_AUTH_SIGNING_KEY_FILE '$AUTUMN_AUTH_SIGNING_KEY_FILE' is not readable"
         mgr_extra="$mgr_extra --auth-signing-key-file $AUTUMN_AUTH_SIGNING_KEY_FILE"
-        if [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
-            [[ -r "$AUTUMN_ADMIN_TOKEN_FILE" ]] \
-                || die "AUTUMN_ADMIN_TOKEN_FILE '$AUTUMN_ADMIN_TOKEN_FILE' is not readable"
-            mgr_extra="$mgr_extra --admin-token-file $AUTUMN_ADMIN_TOKEN_FILE"
-        fi
+        # (--admin-token-file is added unconditionally above — it gates the
+        # control plane and is not part of data-plane authz.)
         if [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
             local _pfx
             for _pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES//,/ }; do
@@ -674,8 +685,12 @@ launch_manager() {
                 || die "AUTUMN_AUTH_TOKEN_TTL_SECS must be a non-negative integer (got '$AUTUMN_AUTH_TOKEN_TTL_SECS')"
             mgr_extra="$mgr_extra --auth-token-ttl-secs $AUTUMN_AUTH_TOKEN_TTL_SECS"
         fi
-    elif [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
-        die "AUTUMN_ADMIN_TOKEN_FILE / AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — authz needs a signing key (autumn-op gen-signing-key)"
+    elif [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
+        # NOTE: AUTUMN_ADMIN_TOKEN_FILE deliberately NOT in this guard any more.
+        # The admin token gates CONTROL-plane admin RPCs and is now provisioned on
+        # every cluster; only the protected-prefix list is meaningless without a
+        # signing key (it configures DATA-plane authz).
+        die "AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — data-plane authz needs a signing key (autumn-op gen-signing-key)"
     fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
@@ -992,16 +1007,10 @@ do_start() {
             fi
             echo "[cluster] waiting for Online nodes (round ${_i})..."
         done
-        # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
-        # The literal split points in the env var are documentation only;
-        # autumn-client's `--presplit N:hexstring` calls hex_split_ranges(N)
-        # internally and produces the same 0x3FFF.../0x7FFF.../0xBFFF... split
-        # points. Forward just the partition count with `hexstring` kind.
-        if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
-            local n_parts_arg="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
-            [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
-            bootstrap_args+=( --presplit "${n_parts_arg}:hexstring" )
-        fi
+        # F-PRESPLIT-PER-NS: `bootstrap --presplit` is RETIRED (it cut the RAW
+        # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
+        # is now interpreted as "presplit the BENCH namespace into N partitions",
+        # applied after bootstrap + namespace registration below.
         "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
@@ -1029,6 +1038,29 @@ do_start() {
     # The examples read their cred via AUTUMN_CREDENTIAL_FILE / --credential-file:
     #   codebase-memory --credential-file $DATA_ROOT/authz/codebase.cred
     #   AUTUMN_CREDENTIAL_FILE=$DATA_ROOT/authz/gallery.cred gallery <mgr>
+    # BUG-BENCH-NS-UNREGISTERED: register `bench` on EVERY cluster, not just an
+    # authz one. Layer-A is active whenever the namespace registry is non-empty —
+    # and bootstrap always seeds fs/kvc/mem — so it runs even with authz OFF and
+    # rejects any write whose first key segment is unregistered. perf-check and
+    # ycsb bind the scope `bench/perf`, so without this every bench write dies
+    # with NamespaceUnknown. Idempotent (already-exists is a no-op).
+    if [[ -r "$DATA_ROOT/authz/admin.token" ]]; then
+        local _btok; _btok="$(cat "$DATA_ROOT/authz/admin.token")"
+        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
+            namespace-create --name bench --admin-token "$_btok" >/dev/null 2>&1 || true
+        # Presplit the bench namespace RELATIVE to `bench/perf/` so the cut points
+        # are where the bench keys actually are. The retired bootstrap presplit cut
+        # raw hex points that `bench_user_starts` filtered out entirely, so every
+        # `--partitions N` run silently measured one partition.
+        local _bparts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+        if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
+            "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
+                presplit --namespace bench --tenant perf --count "$_bparts" \
+                --admin-token "$_btok" \
+                || echo "[cluster] warning: bench presplit into $_bparts failed (bench will use 1 partition)"
+        fi
+    fi
+
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
         local _az="$DATA_ROOT/authz"
         local _atok; _atok="$(cat "$_az/admin.token")"
