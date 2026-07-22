@@ -526,9 +526,32 @@ async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
 /// per `get_many_into` so a multi-extent download pipelines (per-op ZC fan-out
 /// for the ≥ 64 KiB extents; on UCX RDMA-into-dest, on TCP recv-into-dest)
 /// instead of one serial `get` per extent — and, unlike `get_many`, without
-/// assembling the whole window into one giant response frame. RAM stays bounded
-/// to `GET_WINDOW_EXTENTS * MAX_EXTENT` (64 MiB) of reused dest buffers.
-const GET_WINDOW_EXTENTS: usize = 8;
+/// assembling the whole window into one giant response frame.
+const GET_WINDOW_MIN_EXTENTS: usize = 8;
+
+/// RAM ceiling for one download's reused dest buffers. The window is derived
+/// from this, NOT fixed, so that shrinking `MAX_EXTENT` widens the window
+/// instead of silently narrowing lane coverage.
+const GET_WINDOW_MAX_BYTES: usize = 192 * 1024 * 1024;
+
+/// How many extents to fetch per `get_many_into`, given a file's stripe width.
+///
+/// This has to scale with `lanes`, and the reason is not obvious. Consecutive
+/// extents round-robin across lanes (`lane = (off/unit) % lanes`), while a
+/// PARTITION owns a CONTIGUOUS RUN of lanes (partitions are key ranges and the
+/// lane byte is high). So a window of W consecutive extents touches W
+/// consecutive lanes, which is only `ceil(W / (lanes/parts))` distinct
+/// partitions. With lanes == parts (the old 1:1 world) a window of 8 hit 8
+/// partitions; with lanes over-provisioned to 24 over 6 partitions, that same
+/// window of 8 covers 8 consecutive lanes = just 2 partitions — over-
+/// provisioning would have QUIETLY COST read parallelism. Sizing the window at
+/// the lane count restores full spread for every partition count that divides
+/// it, without the reader needing to know how many partitions there are (which
+/// is exactly the placement-derived lookup this feature removed).
+fn get_window_extents(lanes: u8, unit_bytes: u32) -> usize {
+    let by_ram = GET_WINDOW_MAX_BYTES / (unit_bytes.max(1) as usize);
+    (lanes as usize).clamp(GET_WINDOW_MIN_EXTENTS, by_ram.max(GET_WINDOW_MIN_EXTENTS))
+}
 
 async fn read_file_to_writer(
     cluster: &ClusterClient,
@@ -591,9 +614,19 @@ async fn read_file_to_writer(
     // whole-value read (`offset:0, length:0`) always fits; `get_many_into`
     // returns the actual byte count. Writing at the extent's LOGICAL offset (not
     // sequentially) keeps sparse/variable-extent files correct.
-    let mut bufs: Vec<Vec<u8>> = (0..GET_WINDOW_EXTENTS).map(|_| vec![0u8; MAX_EXTENT]).collect();
+    // Window sized from the file's OWN stripe width (see `get_window_extents`):
+    // a legacy/unstriped file keeps the old 8, a striped one widens to its lane
+    // count so the window still spans every partition the lanes are spread over.
+    let window = match &meta.stripe {
+        Some(s) => {
+            let (lanes, unit) = s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
+            get_window_extents(lanes, unit)
+        }
+        None => GET_WINDOW_MIN_EXTENTS,
+    };
+    let mut bufs: Vec<Vec<u8>> = (0..window).map(|_| vec![0u8; MAX_EXTENT]).collect();
     let mut written: u64 = 0;
-    for chunk in extents.chunks(GET_WINDOW_EXTENTS) {
+    for chunk in extents.chunks(window) {
         let mut items: Vec<autumn_client::GetManyItem> = chunk
             .iter()
             .zip(bufs.iter_mut())
@@ -824,7 +857,7 @@ async fn publish_file(
 ///     bad throughput. `read_stripe_geom` propagates instead;
 ///   * it hardcoded the wire prefix `b"fs/"` in a CLI, a byte string that has
 ///     already changed twice (tenant-first, then Option 3).
-async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<Option<StripeLayout>> {
+async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<StripeLayout> {
     autumn_fuse::geom::read_stripe_geom(cluster).await
 }
 
@@ -851,7 +884,9 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Resu
     // either. Its only real effect was to REQUIRE the final size at create
     // time — which is exactly what made streaming (fuse mount) writes
     // unstripeable, since the lane function itself is incremental.
-    let stripe = declared_stripe_geom(cluster).await?.filter(|g| g.lanes >= 2);
+    // `lanes < 2` is the explicit opt-OUT (`presplit --lanes 1`); everything
+    // else stripes, whether or not the partitions were ever cut.
+    let stripe = Some(declared_stripe_geom(cluster).await?).filter(|g| g.lanes >= 2);
     let striped_note = stripe
         .as_ref()
         .map(|s| format!(" (striped ×{} lanes)", s.lanes))

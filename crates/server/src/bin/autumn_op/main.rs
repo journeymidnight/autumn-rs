@@ -1655,7 +1655,7 @@ async fn cmd_presplit(
     // yet, and it heals completely when the cuts land on a re-run. Cut-then-
     // fail-to-declare leaves boundaries with no declaration, i.e. silently
     // unstriped files forever — the exact failure class this feature removes.
-    if let PresplitRule::FsLanes { lanes } = rule {
+    if let PresplitRule::FsLanes { lanes, .. } = rule {
         let layout = autumn_fuse::schema::StripeLayout {
             lanes: *lanes,
             unit_bytes: autumn_fuse::schema::MAX_EXTENT as u32,
@@ -1675,7 +1675,6 @@ async fn cmd_presplit(
     }
 
     let mut applied = 0usize;
-    let mut applied_points: Vec<Vec<u8>> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for point in &points {
         // Re-fetch the region map each iteration — a prior split created a new
@@ -1707,10 +1706,7 @@ async fn cmd_presplit(
             continue;
         };
         match client.split_at(*pid, Some(point.clone())).await {
-            Ok(_) => {
-                applied += 1;
-                applied_points.push(point.clone());
-            }
+            Ok(_) => applied += 1,
             // A data-bearing partition can't be split repeatedly until major
             // compaction clears the CoW out-of-range keys (has_overlap). The PS
             // auto-major-compacts, so a later re-run succeeds — surface the hint
@@ -1725,37 +1721,45 @@ async fn cmd_presplit(
     // means the run split nothing (wrong --hash-prefix so no owner found, authz
     // denial, stale map, …) and MUST fail loudly — else automation reads exit 0
     // and starts loading into an un-presplit keyspace.
-    // F-FS-GEOM-DECLARED step 4: record the boundaries that ACTUALLY landed, so
-    // `merge` refuses to erase them. Only the applied ones: a point that was
-    // skipped (has_overlap) is not a boundary yet, and recording it would make
-    // merge refuse a pair that shares no declared boundary at all.
+    // F-FS-GEOM-DECLARED: record the operator's INTENDED cut points — all of
+    // them, not just the ones that landed this run.
+    //
+    // (An earlier revision recorded only the applied ones, reasoning that an
+    // uncut point would make merge refuse a pair sharing no real boundary. That
+    // reasoning was WRONG: the merge guard compares against `max(start_a,
+    // start_b)`, i.e. an actual partition start, and an uncut point is nobody's
+    // start — so it can never false-positive. Recording intent is free for
+    // merge, and REQUIRED for auto-split, which snaps to declared-but-uncut
+    // points instead of choosing a median inside a lane.)
     //
     // Best-effort by design — this runs AFTER the cuts, so failing the whole
     // presplit here would report failure for work that already succeeded and
     // send an operator into a re-run that now hits has_overlap on every point.
     // A WARN is the honest outcome: the layout is correct, only its protection
     // is missing, and re-running `namespace-set-presplit` fixes that alone.
-    if !applied_points.is_empty() {
+    let record_points = points.clone();
+    if !record_points.is_empty() {
         match admin_token {
             Some(tok) => {
                 if let Err(e) = client
-                    .namespace_set_presplit(namespace, applied_points.clone(), tok)
+                    .namespace_set_presplit(namespace, record_points.clone(), tok)
                     .await
                 {
                     eprintln!(
-                        "warning: split {} point(s) but failed to record them as protected \
+                        "warning: split {} point(s) but failed to record {} declared \
                          boundaries: {e}\n         the layout IS correct; merge just won't \
-                         refuse to undo it. Re-run with --admin-token to record.",
-                        applied_points.len()
+                         refuse to undo it, and auto-split won't snap to it. Re-run with \
+                         --admin-token to record.",
+                        applied, record_points.len()
                     );
                 }
             }
             None => eprintln!(
-                "warning: split {} point(s) but did NOT record them as protected boundaries \
-                 (no --admin-token). merge (including the auto-policy controller) can then \
-                 silently erase them — for fs lanes that means later large files stripe \
-                 narrower with no error. Pass --admin-token to protect them.",
-                applied_points.len()
+                "warning: split {applied} point(s) but did NOT record the {} declared boundaries \
+                 (no --admin-token). Without the record, merge (including the auto-policy \
+                 controller) can silently erase them, AND auto-split falls back to cutting \
+                 inside a lane instead of snapping to them. Pass --admin-token.",
+                record_points.len()
             ),
         }
     }

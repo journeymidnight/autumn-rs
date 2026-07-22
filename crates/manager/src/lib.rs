@@ -1971,12 +1971,39 @@ impl AutumnManager {
             .cloned()
             .or_else(|| state.ps_nodes.get(&region.ps_id).cloned())
             .ok_or_else(|| anyhow::anyhow!("no address for part {}", cand.primary_part_id))?;
+        // F-FS-GEOM-DECLARED: SNAP to an operator-declared boundary when one
+        // lies inside this partition, instead of letting the PS pick a median
+        // user key.
+        //
+        // Median selection cuts wherever the data happens to sit — for fs that
+        // is in the middle of some inode's extents, i.e. INSIDE a lane. That
+        // breaks the invariant a partition owns whole lanes, and since merge now
+        // refuses to cross a declared boundary, an un-snapped split makes the
+        // layout drift one way only: messier, never tidier. Declared boundaries
+        // are where you split FIRST and never merge — the symmetric pair.
+        //
+        // Generic, like the merge guard: the manager still has no idea what a
+        // "lane" is, so kvc hash buckets and mem agent cuts get it for free.
+        // Side benefit: an operator no longer HAS to run presplit — declare the
+        // points and the cluster walks itself toward that layout as it grows.
+        // (Auto-split is local/reactive, so it converges on "each partition owns
+        // a run of whole lanes", NOT on a perfectly even parts-divides-lanes
+        // split; that evenness stays a planned, presplit-time property.)
+        let at_key = self.declared_split_point_within(cand.primary_part_id);
+        if let Some(k) = &at_key {
+            tracing::info!(
+                part_id = cand.primary_part_id,
+                point = ?String::from_utf8_lossy(k),
+                "auto-split snapping to a declared presplit boundary"
+            );
+        }
         let payload =
             autumn_rpc::partition_rpc::rkyv_encode(&autumn_rpc::partition_rpc::SplitPartReq {
                 part_id: cand.primary_part_id,
-                // Advisory auto-split uses the PS median selection (D4 explicit
-                // point is an operator/controller primitive, not the policy path).
-                at_key: None,
+                // None ⇒ the partition holds no declared boundary (already cut
+                // down to one), so fall back to PS median selection — at that
+                // point an intra-lane cut is exactly what's wanted.
+                at_key,
             });
         // 60 s — split has to flush memtable + commit_length × 3 + a
         // manager round-trip. PS-side flush can take a few seconds

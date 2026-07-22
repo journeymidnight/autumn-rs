@@ -837,38 +837,73 @@ AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
 #   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
-## fs stripe geometry + protected presplit boundaries (F-FS-GEOM-DECLARED)
+## fs stripe geometry: lanes vs partitions (F-FS-GEOM-DECLARED)
 
-Large-file striping spreads one file's extents across N **lane** partitions so a
-single write escapes the one-partition/one-log_stream ceiling. Two pieces of
-state, with different jobs:
+Large-file striping spreads one file's extents across N **lanes** so a single
+write escapes the one-partition/one-log_stream ceiling. The key idea is that
+**lanes and partitions are separate decisions**:
 
-* `fs/[0x04]stripe_geom` — the **declared** geometry `{lanes, unit_bytes}`. What
-  NEW files get stamped with.
-* `InodeMeta.stripe` — each file's **actual** geometry, immutable once written.
-  Reads consult only this, never the cluster's current shape, so any
+* **lanes** = the KEY LAYOUT. `lane = (offset / unit) % lanes`, encoded high in
+  the key so it dominates routing. Default **24** (`DEFAULT_STRIPE_LANES`) —
+  every file is striped whether or not anyone ran presplit.
+* **partitions** = PLACEMENT. A partition owns a *contiguous run* of lanes.
+
+Striping unconditionally is what makes placement changeable later: a file
+written on a 1-partition fs already has its extents sorted by lane, so a split at
+a lane boundary gives it parallelism **retroactively** — no data rewrite, no
+re-stamping. (Before this, an fs that was never presplit wrote legacy keys that
+sit in lane 0 forever; growing to 24 partitions did nothing for them.)
+
+24 is over-provisioned on purpose. Any partition count that **divides** 24 —
+1, 2, 3, 4, 6, 8, 12, 24 — distributes every file evenly, so the lane count is a
+permanent constant instead of a function of cluster size. That is why a file's
+stripe width never needs to widen.
+
+Two pieces of state, different jobs:
+
+* `fs/[0x04]stripe_geom` — the declared geometry `{lanes, unit_bytes}`. What NEW
+  files get stamped with. Absent ⇒ the 24-lane default.
+* `InodeMeta.stripe` — each file's ACTUAL geometry, immutable once written. Reads
+  consult only this, never the cluster's current shape, so any
   split/merge/rebalance leaves existing files correct.
 
-Declare + cut in one command (it writes `stripe_geom` first, then splits):
-
 ```bash
-# Presplit fs into 6 lanes AND record the boundaries as protected.
-$AO presplit --namespace fs --lanes 6 --admin-token-file $DATA_ROOT/authz/admin.token
-# → declared fs stripe geometry: 6 lanes × 8 MiB units
+# Declare 24 lanes and cut 6 partitions (6 divides 24 → 4 lanes each).
+$AO presplit --namespace fs --lanes 24 --parts 6      --admin-token-file $DATA_ROOT/authz/admin.token
+# → declared fs stripe geometry: 24 lanes × 8 MiB units
 # → presplit /fs: 5/5 cut points applied
+
+$AO presplit --namespace fs --lanes 24 --parts 5     # rejected:
+# parts must DIVIDE lanes ... Divisors of 24: 1, 2, 3, 4, 6, 8, 12, 24
 ```
+
+`--parts` omitted ⇒ one partition per lane. `--lanes 1` turns striping off.
 
 **Presplit an EMPTY keyspace, before loading data.** A data-bearing partition
 can't be re-split until major compaction clears CoW out-of-range keys, so cuts
 land only partially (`has_overlap`) if you load first.
 
-`--admin-token[-file]` is optional but **strongly recommended**: it records the
-applied cut points on the namespace registry row, and `merge` then refuses to
-erase them. Without it the cuts still land, and a warning explains what is
-unprotected. Why it matters: an EMPTY lane partition is a perfect auto-merge
-candidate (cold, tiny, zero QPS), and the window where lanes sit empty is exactly
-the reset → presplit → first-upload sequence. Merging one away is silent — every
-LATER large file just stripes narrower, with no error anywhere.
+### Declared boundaries: split there first, never merge there
+
+`--admin-token[-file]` records the intended cut points on the namespace registry
+row. That record drives BOTH halves of a symmetric rule:
+
+* **merge refuses** to erase a declared boundary (`--force` to override). This
+  matters because an EMPTY lane partition is a perfect auto-merge candidate
+  (cold, tiny, zero QPS), and the window where lanes sit empty is exactly the
+  reset → presplit → first-upload sequence. Merging one away is silent: every
+  LATER large file just stripes narrower, with no error anywhere.
+* **auto-split snaps** to the declared boundary nearest the middle of the
+  partition, instead of the PS's median user key (which for fs lands *inside* a
+  lane and breaks the whole-lane invariant). Once a partition holds no declared
+  boundary, it falls back to median — an intra-lane inode split, which is the
+  right cut at that point.
+
+So you don't strictly have to run presplit at all: declare the points and the
+cluster walks itself toward that layout as load grows. (Auto-split is local and
+reactive, so it converges on "each partition owns a run of whole lanes", not on a
+perfectly even parts-divides-lanes split — that evenness is a planned,
+presplit-time property.)
 
 ```bash
 $AO merge 12 13
@@ -877,15 +912,17 @@ $AO merge 12 13
 $AO merge 12 13 --force          # deliberate
 ```
 
+The protection is generic — kvc hash buckets and mem agent cuts get it too; the
+manager never learns what a "lane" is.
+
 Notes:
 * Striped WRITES are an `autumnfs` capability. A fuse mount reads and removes
   striped files correctly but **refuses** to write or truncate one (by design —
   see F-FS-WRITE-STRIPE); write large files with `autumnfs put`.
-* Re-running `presplit --lanes N` at a larger N unions the recorded boundaries
-  (never drops one) and rewrites the declared geometry. Existing files keep
-  their own stamp and stay correct at their original width.
-* The protection is generic — kvc/mem presplits get it too; the manager never
-  learns what a "lane" is.
+* The download read window scales with the file's lane count (`get_window_extents`),
+  because a window of W consecutive extents only spans W consecutive lanes —
+  a fixed window would have quietly lost read parallelism once lanes were
+  over-provisioned relative to partitions.
 
 ## Inspecting authz: who exists and what may they touch (F-NS-PRINCIPAL-LIST)
 

@@ -851,6 +851,39 @@ impl AutumnManager {
             .map(|ns| ns.name.clone())
     }
 
+    /// F-FS-GEOM-DECLARED: the declared-but-uncut boundary a split of `part_id`
+    /// should snap to, or `None` to let the PS pick a median user key.
+    ///
+    /// Picks the declared point nearest the MIDDLE of the partition's range so a
+    /// split halves the lane span rather than shaving one lane off an end — the
+    /// same balance argument as median selection, applied to the declared grid
+    /// instead of to the data.
+    ///
+    /// "Strictly inside" matters: a point equal to `start_key` is already this
+    /// partition's boundary (splitting there produces an empty child, which the
+    /// PS rejects), and `end_key` belongs to the neighbour.
+    pub(crate) fn declared_split_point_within(&self, part_id: u64) -> Option<Vec<u8>> {
+        let (start, end) = {
+            let s = self.store.inner.borrow();
+            let rg = s.partitions.get(&part_id)?.rg.as_ref()?;
+            (rg.start_key.clone(), rg.end_key.clone())
+        };
+        let ns = self.namespaces.borrow();
+        let mut inside: Vec<&Vec<u8>> = ns
+            .values()
+            .flat_map(|n| n.presplit.iter())
+            .filter(|p| {
+                p.as_slice() > start.as_slice()
+                    && (end.is_empty() || p.as_slice() < end.as_slice())
+            })
+            .collect();
+        if inside.is_empty() {
+            return None;
+        }
+        inside.sort();
+        Some(inside[inside.len() / 2].clone())
+    }
+
     /// Every declared boundary in the cluster — the policy engine's input for
     /// skipping merge candidates before they are ever advertised.
     pub(crate) fn sacred_boundaries(&self) -> std::collections::HashSet<Vec<u8>> {
@@ -7227,6 +7260,112 @@ mod namespace_registry_tests {
         // follower
         m.set_leader(false);
         assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01"]).code, CODE_NOT_LEADER);
+    }
+
+    /// Put a partition with an explicit range into the store so the split-snap
+    /// helper has something to look at.
+    fn mk_range(m: &AutumnManager, id: u64, start: &[u8], end: &[u8]) {
+        let mut s = m.store.inner.borrow_mut();
+        s.partitions.insert(
+            id,
+            autumn_rpc::manager_rpc::MgrPartitionMeta {
+                part_id: id,
+                log_stream: 0,
+                row_stream: 0,
+                meta_stream: 0,
+                rg: Some(autumn_rpc::manager_rpc::MgrRange {
+                    start_key: start.to_vec(),
+                    end_key: end.to_vec(),
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn auto_split_snaps_to_the_middle_declared_boundary() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        // 24 lanes over 1 partition: declare the boundaries for 4 parts.
+        assert_eq!(
+            set_presplit(
+                &m,
+                "fs",
+                &[b"fs/\x03\x06", b"fs/\x03\x0c", b"fs/\x03\x12"]
+            )
+            .code,
+            CODE_OK
+        );
+        mk_range(&m, 1, b"fs/", b"fs0");
+        // Nearest the middle → halves the lane span, rather than shaving one
+        // lane off an end the way "first declared point" would.
+        assert_eq!(
+            m.declared_split_point_within(1).as_deref(),
+            Some(&b"fs/\x03\x0c"[..])
+        );
+
+        // After that cut, each half snaps to its own remaining boundary.
+        mk_range(&m, 2, b"fs/", b"fs/\x03\x0c");
+        mk_range(&m, 3, b"fs/\x03\x0c", b"fs0");
+        assert_eq!(
+            m.declared_split_point_within(2).as_deref(),
+            Some(&b"fs/\x03\x06"[..])
+        );
+        assert_eq!(
+            m.declared_split_point_within(3).as_deref(),
+            Some(&b"fs/\x03\x12"[..])
+        );
+    }
+
+    #[test]
+    fn auto_split_falls_back_to_median_when_no_boundary_is_left() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x06"]).code, CODE_OK);
+        // A partition already cut down to a single lane run holds no declared
+        // point → None → the PS picks a median, which is the RIGHT choice there
+        // (an intra-lane inode split is exactly what's wanted at that stage).
+        mk_range(&m, 7, b"fs/\x03\x06", b"fs/\x03\x07");
+        assert!(m.declared_split_point_within(7).is_none());
+
+        // A point EQUAL to start_key is this partition's own boundary, not an
+        // interior cut — splitting there would ask for an empty child.
+        mk_range(&m, 8, b"fs/\x03\x06", b"fs0");
+        assert!(
+            m.declared_split_point_within(8).is_none(),
+            "start_key must not be offered as an interior split point"
+        );
+
+        // A partition in another namespace is unaffected by fs's declarations.
+        mk_range(&m, 9, b"kvc/", b"kvc0");
+        assert!(m.declared_split_point_within(9).is_none());
+    }
+
+    #[test]
+    fn declared_but_uncut_points_never_false_positive_the_merge_guard() {
+        // Why recording INTENT (not just applied cuts) is safe: the merge guard
+        // compares against `max(start_a, start_b)`, always a REAL partition
+        // start, and an uncut declared point is nobody's start.
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        assert_eq!(
+            set_presplit(&m, "fs", &[b"fs/\x03\x06", b"fs/\x03\x0c"]).code,
+            CODE_OK
+        );
+        // Only \x06 was actually cut; \x0c is declared-but-uncut.
+        mk_range(&m, 1, b"fs/", b"fs/\x03\x06");
+        mk_range(&m, 2, b"fs/\x03\x06", b"fs0");
+        // The real boundary IS protected …
+        assert!(m.sacred_boundary_owner(b"fs/\x03\x06").is_some());
+        // … and the uncut one, while recorded, is not any partition's start, so
+        // it can never be the boundary a merge computes.
+        let starts: Vec<Vec<u8>> = {
+            let s = m.store.inner.borrow();
+            s.partitions
+                .values()
+                .filter_map(|p| p.rg.as_ref().map(|r| r.start_key.clone()))
+                .collect()
+        };
+        assert!(!starts.contains(&b"fs/\x03\x0c".to_vec()));
     }
 
     #[test]

@@ -1,5 +1,56 @@
 Date: 2026-07-22
 TaskStatus: completed
+Task scope: 用户对 lane 设计的两点修正（"多条 lane 一定有，但不一定做了 split" +
+  "presplit 的 part 数是 lane 的倍数"）+ 第三点（"auto split fs 一定要考虑 lane"）。
+  三点全对，且第三点暴露出我前一批的一个判断错误。默认 lane 数用户定 24。
+
+── 核心认识：lane 是 key 布局，split 是放置，两件事 ──
+之前 `--lanes N` 既定几何又切 N 刀，且没 presplit 就完全不条带 —— 这是错的耦合。
+**总是按 24 lane 布局**意味着：1 分区上写的文件 extent 已按 lane 排好序，以后任何时候在
+lane 边界切一刀，已有文件**追溯性**获得并行（零数据重写、零重新盖戳）。旧行为下没
+presplit 就写 legacy key，那些文件永远挤在 lane 0，之后扩到 24 分区也一点好处拿不到 ——
+不可逆的损失。
+24 超额供给（Kafka partition / Ceph PG / Cassandra vnode 的做法）：分区拥有**连续一段**
+lane，所以任何整除 24 的分区数(1/2/3/4/6/8/12/24)都能均分每个文件 ⇒ **lane 数成为永久
+布局常量而非集群形状的函数**，fable 当时判定"物理无解"的"stripe 宽度冻结"问题因此消失
+（根本不需要加宽）。24 比 32/16 因数多。
+
+── 我前一批的判断错误（本次修正）──
+第 4 步我只记录**实际落地**的切点，理由写的是"记未落地的会让 merge 误拒"。**错的**：
+merge 守卫比的是 `max(start_a, start_b)`，即**真实分区的 start_key**；未切的声明点不是
+任何分区的 start，永远不可能命中。记完整意图集对 merge 零风险，而 auto-split snap
+**必须**要它。已改为记录完整意图集 + 加单测钉住这个论证。
+
+── 五项改动 ──
+1. `--lanes N` / `--parts P` 拆开，切点在 lane `k·(N/P)`，**校验 P | N**（不整除 fail-loud
+   并列出 24 的所有因数；parts>lanes 也拒）。`--parts` 省略 = 每 lane 一分区（旧语义）。
+2. striping 默认开: `DEFAULT_STRIPE_LANES = 24`；`read_stripe_geom` 缺 key 返回默认而非
+   None。`--lanes 1` 是显式关闭。注意这里的不对称性：**"缺失"是合法稳态**（没人跑过
+   presplit），**错误不是** —— 所以只有后者 fail-loud。
+3. 读窗口按 lane 缩放（`get_window_extents`）。**这条不显然**：连续 extent 轮转 lane，而
+   分区拥有**连续**一段 lane ⇒ W 个连续 extent 只覆盖 ceil(W/(lanes/parts)) 个分区。
+   lanes==parts 时窗口 8 打 8 个分区；24 lane/6 分区时同样的窗口 8 只打**2 个** ——
+   超额供给会**悄悄吃掉读并行**。窗口取 lane 数即恢复全铺开，且读侧不需要知道分区数
+   （那正是本 feature 删掉的放置反推）。按字节预算(192MiB)封顶，MAX_EXTENT 变小则窗口
+   自动变大。
+4. `MgrNamespace.presplit` 改记完整意图集（见上）。
+5. auto-split **snap 到声明边界**: `auto_dispatch_split` 原来 `at_key: None` 走 PS median
+   —— 对 fs 就是切进某个 inode 的 extent 中间、把一条 lane 劈两半。而 merge 已被守卫拦住
+   ⇒ **布局只能单向变乱、永远回不来**（这个不对称是我引入的）。改为 `declared_split_
+   point_within`（取最靠中间的声明点，halve lane span 而非削掉一端一条 lane），无声明点
+   才回落 median（那时 intra-lane 分裂正是想要的）。**统一规则：声明过的边界=优先在那里
+   split，且永不在那里 merge。** manager 依然不知道 lane 是什么，kvc/mem 白送。
+   副产品：操作员不再必须跑 presplit —— 声明了点，集群随负载增长自己走向该布局。
+   **诚实边界**：auto-split 是局部反应式的，收敛到"每分区拥有整数条 lane"，**不保证**
+   P|N 完美均分；那是 presplit(计划态)的性质。
+
+测试: manager 240（新增 3：snap 取中间点/无点回落 median+start_key 不算内部点/未切声明点
+永不误伤 merge 守卫）、autumn-op 25（新增 parts 整除全矩阵 + 拒非因数 + 列因数）、
+rpc 40 + client 48 + fuse 50 全绿，全 workspace release 编译绿。ops.md 重写了该节。
+
+============================ prior task history ============================
+Date: 2026-07-22
+TaskStatus: completed
 Task scope: F-FS-GEOM-DECLARED（lane 重设计 Design B）**四步全部完成**。用户两个决定：
   「全做四步」+「Fuse mount 可以不做 lanes」。条目 + BUG-FS-LANE-MERGE 已按规则 13 删除。
 

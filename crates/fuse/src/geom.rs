@@ -24,31 +24,38 @@ use anyhow::{anyhow, Result};
 use crate::key;
 use crate::schema::{self, StripeLayout};
 
-/// Read the fs-wide declared stripe geometry.
+/// Read the fs-wide stripe geometry, falling back to the built-in default.
 ///
-/// Three outcomes, and the distinction between the last two is the whole point:
-/// - `Ok(Some(geom))` — this fs is striped; new files are stamped with it.
-/// - `Ok(None)` — genuinely absent ⇒ this fs is not striped. Legal and quiet.
+/// - `Ok(geom)` where the key exists — the fs declared its own geometry.
+/// - `Ok(default)` when the key is ABSENT — `DEFAULT_STRIPE_LANES` lanes. Lanes
+///   are a property of the KEY LAYOUT, not of the current partition map, so an
+///   fs that was never presplit still stripes; the lanes simply all live in one
+///   partition until someone cuts them apart. That is what makes a later split
+///   pay off retroactively for files written before it.
 /// - `Err` — a hard KV error. **PROPAGATES.** The detection this replaces
 ///   swallowed every failure into `lanes = 1`, so one transient manager blip at
 ///   create time produced a permanently single-partition 41 GB file whose only
 ///   symptom was "throughput is mysteriously bad" — the hardest class to
-///   diagnose. A loud, immediate, retryable refusal is strictly better.
+///   diagnose. A loud, immediate, retryable refusal is strictly better. Note the
+///   asymmetry that makes the default safe: "absent" is a legitimate steady
+///   state (nobody ran presplit), while an error is not, so only the latter is
+///   allowed to fail the caller.
 ///
-/// Callers read this ONCE per session (the mount at `ensure_root`, `autumnfs`
-/// per invocation) and cache it; it is not a per-file lookup.
-pub async fn read_stripe_geom(
-    client: &autumn_client::ClusterClient,
-) -> Result<Option<StripeLayout>> {
+/// Callers read this ONCE per session (`autumnfs` per invocation) and cache it;
+/// it is not a per-file lookup.
+pub async fn read_stripe_geom(client: &autumn_client::ClusterClient) -> Result<StripeLayout> {
     let bytes = client
         .get(&key::stripe_geom_key())
         .await
         .map_err(|e| anyhow!("read declared stripe geometry: {e}"))?;
     match bytes {
-        Some(b) => Ok(Some(schema::decode_stripe_geom(&b).map_err(|e| {
-            anyhow!("declared stripe geometry is corrupt: {e}")
-        })?)),
-        None => Ok(None),
+        Some(b) => {
+            schema::decode_stripe_geom(&b).map_err(|e| anyhow!("declared stripe geometry is corrupt: {e}"))
+        }
+        None => Ok(StripeLayout {
+            lanes: schema::DEFAULT_STRIPE_LANES,
+            unit_bytes: schema::MAX_EXTENT as u32,
+        }),
     }
 }
 

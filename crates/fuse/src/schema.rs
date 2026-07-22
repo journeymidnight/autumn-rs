@@ -15,6 +15,30 @@ pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
     autumn_rpc::partition_rpc::rkyv_encode(meta).to_vec()
 }
 
+/// F-FS-GEOM-DECLARED: lane count used when an fs has declared no geometry.
+///
+/// **Lanes are a LOGICAL property of the key layout; whether the partitions were
+/// actually cut at lane boundaries is a separate PLACEMENT decision.** Striping
+/// unconditionally is what makes placement changeable after the fact: a file
+/// written on a 1-partition fs already has its extents sorted by lane, so a
+/// later split at a lane boundary hands it parallelism RETROACTIVELY, with no
+/// data rewrite and no re-stamping. The old behaviour — no presplit ⇒ legacy
+/// `[0x03][ino][off]` keys — was an irreversible loss: those files sit entirely
+/// in lane 0 forever, and growing the cluster to 24 partitions does nothing
+/// for them.
+///
+/// 24 is over-provisioned on purpose (the Kafka-partition / Ceph-PG / Cassandra-
+/// vnode move): a partition owns a contiguous RUN of lanes, so any partition
+/// count that DIVIDES 24 — 1, 2, 3, 4, 6, 8, 12, 24 — distributes every file
+/// evenly. The lane count is therefore a permanent layout constant rather than a
+/// function of cluster shape, which is what removes the "a file's stripe width
+/// is frozen at create time and can never widen" problem: it never needs to
+/// widen. 24 has more divisors than 32 or 16, so it fits more cluster sizes.
+///
+/// Declare `--lanes 1` to turn striping off for an fs (the write path stripes
+/// only at `lanes >= 2`).
+pub const DEFAULT_STRIPE_LANES: u8 = 24;
+
 /// F-FS-GEOM-DECLARED: decode the declared fs-wide stripe geometry
 /// (`[0x04]stripe_geom`). Validated through `checked()` so a corrupt/truncated
 /// value fails loud here rather than dividing by zero deep in the key builder.
