@@ -1,3 +1,43 @@
+Date: 2026-07-22
+TaskStatus: completed
+Task scope: /loop「git pull + 逐一检查 feature_list 完成情况」第 1 轮 —— 对 9 条 OPEN 条目
+  逐条查代码取证，订正 ledger 里已过期的 status（不改需求描述，遵守规则 8）。
+
+git pull: 41 files / +1378-1054，HEAD fe68798 → 1f04192（Option-3 VKE 重部署那批）。
+
+── 逐条核验结论（证据=代码 grep + 实跑）──
+[未实现，status 正确] 4 条
+  F-NS-PRINCIPAL-LIST  — `MSG_PRINCIPAL_LIST`/`principal_list` 全仓零命中（对照
+    `MSG_NAMESPACE_LIST=0x59` 存在）。
+  F-ADMIN-OP-AUTH      — `is_admin_mgr_msg`/`is_admin_ps_msg` 零命中；只有 4 个 manager
+    handler 查 `req.admin_token` 字段（rpc_handlers.rs:473/568/606/705 = tenant/principal
+    + namespace 的 create/delete）。fence/remove/split/gc/force-ec 仍全裸奔。
+  F-SEALED-EMPTY-SWEEP — 无 manager sweep（只有 EN 侧 p0c_sealed_empty_* 单测，无关）。
+  F-FENCE-SEAL         — `MSG_SEAL_EXTENT` 零命中（deferred 条件也未触发）。
+  F-EN-SHARD-AUTO      — entrypoint.sh:176 仍 `AUTUMN_EXTENT_SHARDS:-1`，无 nproc 推导。
+  F-FS-WRITE-STRIPE    — fuse write.rs:48-51 / 229-233 仍 fail-loud 拒 striped 写/truncate。
+
+[status 已过期，本轮订正] 3 条
+  F-KEY-NS      — 「剩余：全批 stop-world reset 部署」**已于 2026-07-20 VKE 完成**（随
+    Option 3 一起）。收敛后真正 OPEN 的只剩两块：(1) F-POLICY-SIZE-EST-LIVE-FOLLOWUP
+    未做（policy.rs 有 est_live_bytes/effective_size_bytes，但无 sealed 环缓、size 仍在
+    防抖窗内；allow_mutations 默认 false 兜着）；(2) F-PRESPLIT-PER-NS 半成 —— per-ns
+    presplit CLI 在，但 bootstrap presplit 未退役（args.rs:38 / main.rs:344 /
+    cluster.sh / perf_check.sh 仍走 AUTUMN_BOOTSTRAP_PRESPLIT）。
+  BUG-KVC-TENANT — acceptance 实质达成：离线单测**重跑 34 passed**；线上 key
+    `kvc/model-cfg_bf90181cf493_0_1/...` 带 12-hex model fingerprint + external 92.8%
+    命中（跨进程稳定）。唯一缺口 = coco 没审过原始 diff（40e23eb 那轮审的是 Option-3
+    迁移）。→ 下一步 coco findbugs a42c6a1^..486b245，过了即可 passes:true + 删条目。
+  F-DIRECT-MANY — 残留之一已清：`cargo build --release -p autumn-fuse` **本地绿**（本机
+    是 Linux，--direct-read 线接完整）；跨机功能也被线上跑过（loader direct_read 默认
+    True，39.56 GiB / 22.8 s 字节正确）。仍缺 = direct-read on/off 的 PS-egress A/B 量测；
+    wheel 本地编不出（系统 Python 3.14 > pyo3 max 3.13，环境问题）。
+
+Next steps: ① coco findbugs BUG-KVC-TENANT 原始 diff（唯一能立刻关掉的条目）；
+  ② 若要清 F-KEY-NS，做 bootstrap-presplit 退役（小改，涉 4 处）；
+  ③ F-POLICY-SIZE-EST-LIVE-FOLLOWUP 仅在要开 size-based 自动分裂时才必须。
+
+============================ prior task history ============================
 Date: 2026-07-20
 TaskStatus: completed
 Task scope: Option 3 (F-NS-PRINCIPAL-UNIFIED) 全量重部署到 VKE 线上（用户「autumn-rs 有重大
