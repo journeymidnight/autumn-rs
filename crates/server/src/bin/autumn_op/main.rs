@@ -368,6 +368,7 @@ async fn run(args: Args) -> Result<()> {
         Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
         Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
         Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
+        Command::PrincipalList => cmd_principal_list(&client, args.json).await?,
     }
     let _ = std::io::stdout().flush();
     Ok(())
@@ -607,6 +608,38 @@ async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
                 owner,
                 n.presplit.len(),
                 n.created_at,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// F-NS-PRINCIPAL-LIST: `principal-list [--json]`. Read-only inspection —
+/// answers "who exists and what may they touch", which until now needed either
+/// `ls $DATA_ROOT/authz/*.cred` (only what turnkey wrote) or an etcd key scan
+/// (names only; grants live inside an rkyv value). Never prints credentials.
+async fn cmd_principal_list(client: &ClusterClient, json: bool) -> Result<()> {
+    let principals = client.principal_list().await?;
+    let grants_of = |p: &autumn_rpc::manager_rpc::PrincipalRow| -> Vec<String> {
+        p.grants
+            .iter()
+            .map(|g| String::from_utf8_lossy(g).into_owned())
+            .collect()
+    };
+    if json {
+        let rows: Vec<_> = principals
+            .iter()
+            .map(|p| serde_json::json!({ "name": p.name, "grants": grants_of(p) }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!("{:<20} {}", "NAME", "GRANTS");
+        for p in &principals {
+            let g = grants_of(p);
+            println!(
+                "{:<20} {}",
+                p.name,
+                if g.is_empty() { "-".to_string() } else { g.join(",") }
             );
         }
     }

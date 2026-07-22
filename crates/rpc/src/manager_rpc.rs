@@ -2030,6 +2030,13 @@ pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
 // `MSG_GET_AUTHZ_CONFIG` poll stays LEAN (prefixes only, for Layer-A); the rich
 // data (owner/presplit/created_at) rides this dedicated low-frequency RPC.
 pub const MSG_NAMESPACE_LIST: u8 = 0x59;
+// admin → manager (leader-gated): list every registered principal with its
+// grants. F-NS-PRINCIPAL-LIST — the symmetric counterpart of NAMESPACE_LIST:
+// `principal-create`/`principal-delete` shipped without a way to SEE what
+// exists, leaving `ls $DATA_ROOT/authz/*.cred` (only what turnkey happened to
+// write) or an etcd key scan (names only — the value is rkyv, so grants are
+// invisible) as the only options.
+pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
 
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
@@ -2243,6 +2250,33 @@ pub struct NamespaceListResp {
     pub code: u8,
     pub message: String,
     pub namespaces: Vec<MgrNamespace>,
+}
+
+/// One row of `MSG_PRINCIPAL_LIST`. Deliberately NOT a `MgrTenantAccount`:
+/// that type carries `credential_hash`, and an inspection RPC must not hand
+/// out the verifier for a credential — offline-guessing a weak credential
+/// against a leaked hash is exactly the attack the KDC design avoids by never
+/// storing the credential itself. Name + grants are all an operator needs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalRow {
+    /// The principal (credential owner) name — the key under `tenantAccount/`.
+    pub name: String,
+    /// The key prefixes this principal may access (`allowed_prefixes`), each
+    /// ending in `b'/'`. Rendered as `{ns}/…` under Option 3.
+    pub grants: Vec<Vec<u8>>,
+}
+
+/// `MSG_PRINCIPAL_LIST` — admin lists every registered principal + its grants.
+/// Leader-only (the account map is leader-maintained; a follower's shadow is
+/// empty/stale until it replays on promotion). Request payload is empty.
+/// NOT admin-token gated — read-only inspection, same posture as
+/// `MSG_NAMESPACE_LIST`; the secret-bearing field is omitted from the row type
+/// instead (see `PrincipalRow`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalListResp {
+    pub code: u8,
+    pub message: String,
+    pub principals: Vec<PrincipalRow>,
 }
 
 /// `MSG_MINT_TOKEN` — client authenticates with its permanent credential and

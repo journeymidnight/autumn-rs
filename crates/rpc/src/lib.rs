@@ -86,8 +86,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 26;
-pub const WIRE_VERSION_MAX: u32 = 26;
+pub const WIRE_VERSION_MIN: u32 = 27;
+pub const WIRE_VERSION_MAX: u32 = 27;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -282,6 +282,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // tenant-first image is fenced at the handshake instead of silently reading
     // empty). Pre-R3: MIN=MAX=26 (same-commit deploy; rkyv has no cross-version).
     (26, "c408d5e3de95883a"),
+    // v27 — F-NS-PRINCIPAL-LIST: MSG_PRINCIPAL_LIST (0x5A) + PrincipalRow{name,
+    // grants} / PrincipalListResp{code,message,principals}. Purely ADDITIVE (a
+    // new msg_type + two new structs; nothing existing changed shape), but
+    // pre-R3 rkyv has no cross-version decode, so MIN=MAX=27 and the deploy
+    // stays same-commit. Deliberately NOT a mirror of MgrTenantAccount — the
+    // row type omits `credential_hash` so an inspection RPC cannot hand out the
+    // verifier for a credential.
+    (27, "de39a3b10dfcfebd"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -64,6 +64,7 @@ fn usage() -> ! {
     eprintln!("  namespace-delete --name <NS> [--force] --admin-token <TOK>");
     eprintln!("                               remove the registry row (refuses non-empty unless --force)");
     eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/owner/presplit/created)");
+    eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
     std::process::exit(1);
 }
 
@@ -380,6 +381,9 @@ pub(crate) enum Command {
     },
     /// F-KEY-NS D2: list the full namespace registry (rich rows). Read-only.
     NamespaceList,
+    /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Read-only, and
+    /// never prints credential material.
+    PrincipalList,
 }
 
 pub(crate) fn parse() -> Args {
@@ -784,6 +788,7 @@ pub(crate) fn parse() -> Args {
             }
         }
         "namespace-list" => Command::NamespaceList,
+        "principal-list" => Command::PrincipalList,
         // F213 read
         "info" => {
             let mut part: Option<u64> = None;

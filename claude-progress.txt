@@ -1,4 +1,44 @@
 Date: 2026-07-22
+TaskStatus: not_completed
+Task scope: /loop「完成 F-KEY-NS 收尾 + F-ADMIN-OP-AUTH + F-NS-PRINCIPAL-LIST」第 1 轮。
+  三件里**第 3 件已完整做完并 commit**，前两件未动 → 本条目 not_completed。
+
+── 已完成: F-NS-PRINCIPAL-LIST（全链 + 测试 + 文档，条目已按规则 13 删除）──
+MSG_PRINCIPAL_LIST=0x5A + PrincipalRow{name,grants} / PrincipalListResp;
+manager handle_principal_list（leader-gated、read-only 不 admin gate、按 name 排序——
+底层 tenant_accounts 是 HashMap，不排序 CLI 输出会抖）; client principal_list();
+autumn-op `principal-list [--json]`; ops.md runbook; manager CLAUDE.md note。
+**行类型故意不是 MgrTenantAccount** —— 去掉 credential_hash 是结构性保证：inspection
+RPC 不能把凭据的校验物交出去（拿到 hash 可离线爆破弱凭据）。
+WIRE v26→v27 fp `de39a3b10dfcfebd`（纯新增，但 pre-R3 rkyv 无跨版本解码 ⇒ MIN=MAX，
+同 commit 部署）。测试: manager 新增 4 个单测 + rpc 40 / manager 233 / client 48 全绿。
+
+── 未完成（下一轮接手）──
+[1] F-ADMIN-OP-AUTH **manager 片**（零 wire 改动，可独立验证）: rpc `is_admin_mgr_msg`
+    + payload 长度前缀 codec；client mgr_call/mgr_call_leader/mgr_call_retry 在
+    is_admin_mgr_msg && token 时加前缀；manager dispatch 切前缀 ct_eq_secret；
+    autumn-op 全局 --admin-token-file。
+[2] F-ADMIN-OP-AUTH **PS 片**（要 wire）: GetAuthzConfigResp 加 admin_token 字段 +
+    PS authz_config_poll_loop 缓存 + PS frame dispatch 在 is_admin_ps_msg 时校验。
+    **注意**: v27 尚未部署，所以这一片可以按先例"就地刷新 v27 指纹"而不是再 bump v28
+    （对照 v25 那次 SD-2 addendum 的 sanctioned in-place refinement）。
+[3] F-KEY-NS 收尾(a) bootstrap presplit 退役: args.rs:38 usage / main.rs:344
+    run_bootstrap / cluster.sh / perf/perf_check.sh 四处。
+[4] F-KEY-NS 收尾(b) F-POLICY-SIZE-EST-LIVE-FOLLOWUP: sealed 历史化到 PolicyEngine
+    per-partition 环缓，或把 size 维度移出防抖。
+
+── 顺带查清的一件事（用户问 fs --lanes 存哪 / 再 split 会不会坏）──
+lane 数无集群级配置，两个来源: ①隐式=partition 切点（lane 边界 = `fs/`++[0x03][lane]
+**恰好 5 字节**）②显式=每文件 InodeMeta.stripe.lanes（建文件时由 detect_stripe_lanes
+数①得出，之后不可变，读侧只认它）。
+**split 安全**: 过滤条件是 `start.len()==prefix.len()+2` 精确 5 字节，而 lane 内部再
+分裂的 median 切点必是真实数据 key（条带 21B/legacy 20B），长度上结构性排除；且
+partition 数与正确性无关（路由按 range，老文件认自己的 stripe）。
+**merge 是缺口** → 已立条目 BUG-FS-LANE-MERGE: 合并掉一条 lane 边界会让新建文件条带
+变窄（非损坏，是静默吞吐退化）。今天不会自动发生（allow_mutations=false）。
+
+============================ prior task history ============================
+Date: 2026-07-22
 TaskStatus: completed
 Task scope: 用户「fix BUG-KVC-TENANT」—— 修掉 coco 挖出的那条 blocking P1，本条**已关闭**
   并按规则 13 从 feature_list.md 删除。

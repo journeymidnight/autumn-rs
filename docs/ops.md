@@ -837,6 +837,34 @@ AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
 #   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
+## Inspecting authz: who exists and what may they touch (F-NS-PRINCIPAL-LIST)
+
+`principal-create` / `principal-delete` shipped without a listing, so until now
+answering "which principals exist and what are they granted" meant either
+`ls $DATA_ROOT/authz/*.cred` (only what cluster.sh's turnkey path happened to
+write — nothing an operator minted by hand) or an etcd key scan
+(`etcdctl get --prefix --keys-only autumn-rs/tenantAccount/`), which shows names
+but NOT grants because the value is rkyv.
+
+```bash
+$AO principal-list
+# NAME                 GRANTS
+# fs                   fs/
+# kvc                  kvc/
+# mem                  mem/
+
+$AO principal-list --json     # [{"name":"fs","grants":["fs/"]}, ...]
+```
+
+Read-only and leader-routed (rotates on NOT_LEADER), so it needs **no**
+`--admin-token`. It never prints credential material: the response row type
+carries only `(name, grants)` — `credential_hash` is not a field on it, so there
+is no flag or future edit that can make it leak. A lost credential is re-minted
+(`principal-create` again, which rotates), never recovered.
+
+The namespace-side counterpart is `namespace-list` (registry rows: name / prefix
+/ owner / presplit / created_at).
+
 ## autumn-kvcache tenant / model identity (BUG-KVC-TENANT)
 
 vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...` — the

@@ -1120,6 +1120,29 @@ impl ClusterClient {
         Ok(resp.namespaces)
     }
 
+    /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Leader-routed
+    /// (rotates on NOT_LEADER), read-only. Never returns credential material.
+    pub async fn principal_list(&self) -> Result<Vec<PrincipalRow>> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: PrincipalListResp = self
+            .mgr_call_leader(
+                MSG_PRINCIPAL_LIST,
+                Bytes::new(),
+                "principal-list",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: PrincipalListResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("principal-list rejected: {}", resp.message));
+        }
+        Ok(resp.principals)
+    }
+
     /// Call manager with retry and round-robin on NotLeader/connection error.
     pub async fn mgr_call_retry(
         &self,

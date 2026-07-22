@@ -2383,3 +2383,14 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     for Layer-A); the rich data rides this dedicated low-frequency RPC. This was a
     sanctioned in-place v25 wire refinement (fp `76e8ba…` → `6bb3e2105b2845db`, NO
     version bump — same-commit deploy).
+    **F-NS-PRINCIPAL-LIST**: `MSG_PRINCIPAL_LIST` (0x5A) + `handle_principal_list`
+    — the symmetric counterpart on the authz side (`principal-create`/`-delete`
+    shipped with no way to SEE what exists). Same posture as namespace-list:
+    leader-gated (the account map is leader-maintained; a follower's shadow is
+    empty until it replays on promotion), read-only so NOT admin-token gated,
+    sorted by name (the backing `tenant_accounts` is a `HashMap`, so the sort is
+    what makes CLI output deterministic). The row type is `PrincipalRow{name,
+    grants}`, NOT `MgrTenantAccount` — dropping `credential_hash` is deliberate
+    and structural: an inspection RPC must not hand out the verifier for a
+    credential. WIRE v26→v27 (`de39a3b10dfcfebd`), purely additive but pre-R3
+    rkyv ⇒ MIN=MAX, same-commit deploy.

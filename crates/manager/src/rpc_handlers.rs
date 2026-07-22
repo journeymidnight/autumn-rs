@@ -259,6 +259,7 @@ impl AutumnManager {
             MSG_NAMESPACE_CREATE => self.handle_namespace_create(payload).await,
             MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
             MSG_NAMESPACE_LIST => self.handle_namespace_list().await,
+            MSG_PRINCIPAL_LIST => self.handle_principal_list().await,
             // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
@@ -756,6 +757,36 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             namespaces,
+        }))
+    }
+
+    /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Mirrors
+    /// `handle_namespace_list` — leader-gated, read-only, no admin-token gate.
+    /// `credential_hash` is dropped on the way out (see `PrincipalRow`).
+    async fn handle_principal_list(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&PrincipalListResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                principals: Vec::new(),
+            }));
+        }
+        let mut principals: Vec<PrincipalRow> = self
+            .tenant_accounts
+            .borrow()
+            .values()
+            .map(|a| PrincipalRow {
+                name: a.tenant.clone(),
+                grants: a.allowed_prefixes.clone(),
+            })
+            .collect();
+        // Stable order (by name) for deterministic CLI output — the map is a
+        // HashMap, so without this the listing shuffles between calls.
+        principals.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rkyv_encode(&PrincipalListResp {
+            code: CODE_OK,
+            message: String::new(),
+            principals,
         }))
     }
 
@@ -6922,6 +6953,82 @@ mod namespace_registry_tests {
         let r = list(&m);
         assert_eq!(r.code, CODE_NOT_LEADER);
         assert!(r.namespaces.is_empty());
+    }
+
+    // ── F-NS-PRINCIPAL-LIST ──────────────────────────────────────────────
+
+    fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> TenantCreateResp {
+        let req = TenantCreateReq {
+            admin_token: ADMIN.to_string(),
+            tenant: name.to_string(),
+            allowed_prefixes: grants.iter().map(|g| g.to_vec()).collect(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_tenant_create(payload).await.unwrap() });
+        rkyv_decode::<TenantCreateResp>(&resp).expect("decode TenantCreateResp")
+    }
+
+    fn principal_list(m: &AutumnManager) -> PrincipalListResp {
+        let resp = run(async { m.handle_principal_list().await.unwrap() });
+        rkyv_decode::<PrincipalListResp>(&resp).expect("decode PrincipalListResp")
+    }
+
+    #[test]
+    fn principal_list_returns_names_and_grants_sorted() {
+        let m = mgr();
+        assert_eq!(principal_create(&m, "fs", &[b"fs/"]).code, CODE_OK);
+        assert_eq!(
+            principal_create(&m, "agent7", &[b"mem/agent7/", b"kvc/"]).code,
+            CODE_OK
+        );
+        let r = principal_list(&m);
+        assert_eq!(r.code, CODE_OK);
+        let names: Vec<&str> = r.principals.iter().map(|p| p.name.as_str()).collect();
+        // sorted by name — the backing map is a HashMap, so without the sort
+        // the CLI output would shuffle between invocations
+        assert_eq!(names, vec!["agent7", "fs"]);
+        let a = r.principals.iter().find(|p| p.name == "agent7").unwrap();
+        assert_eq!(a.grants, vec![b"mem/agent7/".to_vec(), b"kvc/".to_vec()]);
+        let f = r.principals.iter().find(|p| p.name == "fs").unwrap();
+        assert_eq!(f.grants, vec![b"fs/".to_vec()]);
+    }
+
+    #[test]
+    fn principal_list_never_leaks_credential_material() {
+        // The row type has no credential_hash field at all, so this is a
+        // structural guarantee — assert the account DOES hold a hash while the
+        // listing carries only (name, grants), i.e. the drop is deliberate.
+        let m = mgr();
+        let created = principal_create(&m, "fs", &[b"fs/"]);
+        assert_eq!(created.code, CODE_OK);
+        assert!(!created.credential.is_empty(), "create returns the credential once");
+        assert_ne!(
+            m.tenant_accounts.borrow().get("fs").unwrap().credential_hash,
+            [0u8; 32],
+            "the account stores a real credential hash"
+        );
+        let r = principal_list(&m);
+        let row = &r.principals[0];
+        // Everything the row can possibly serialise:
+        assert_eq!(row.name, "fs");
+        assert_eq!(row.grants, vec![b"fs/".to_vec()]);
+    }
+
+    #[test]
+    fn principal_list_is_leader_gated() {
+        let m = mgr();
+        assert_eq!(principal_create(&m, "fs", &[b"fs/"]).code, CODE_OK);
+        m.set_leader(false);
+        let r = principal_list(&m);
+        assert_eq!(r.code, CODE_NOT_LEADER);
+        assert!(r.principals.is_empty());
+    }
+
+    #[test]
+    fn principal_list_is_empty_before_any_create() {
+        let r = principal_list(&mgr());
+        assert_eq!(r.code, CODE_OK);
+        assert!(r.principals.is_empty());
     }
 
     #[test]

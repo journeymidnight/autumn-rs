@@ -14,16 +14,6 @@
 
 ## Active
 
-### F-NS-PRINCIPAL-LIST — `autumn-op principal-list`（列出已建 principal + grant）
-- **Trigger** (2026-07-19, 用户问"如何 list namespace / list principal"): `namespace-list` 有（`MSG_NAMESPACE_LIST` + `handle_namespace_list` + `cmd_namespace_list`），但 F-NS-PRINCIPAL-UNIFIED 只加了 `principal-create`/`principal-delete`，**没有 list**。现状要看 principal 只能绕：`ls /tmp/autumn-rs/authz/*.cred`（turnkey 建的那批）或 `etcdctl get --prefix --keys-only autumn-rs/tenantAccount/`（只看到名字，value 是 rkyv 看不到 grant）。
-- **Scope**: 对称补齐 `namespace-list` 的形状。
-  - **rpc**: `MSG_PRINCIPAL_LIST`（新 msg_type）+ `PrincipalListResp { code, message, principals: Vec<PrincipalRow{ name: String, grants: Vec<Vec<u8>> }> }`。**wire 改动 → fingerprint bump v26→v27（MIN=MAX，same-commit）**。**不返回 credential_hash**（只 name + allowed_prefixes）。
-  - **manager**: `handle_principal_list`（leader-gated，同 `handle_namespace_list` 姿态：遍历 `tenant_accounts` 返回 `{tenant→name, allowed_prefixes→grants}`，排序 by name；读-only 不 admin-token gate，和 namespace-list 一致）。
-  - **client**: `ClusterClient::principal_list() -> Vec<PrincipalRow>`（`mgr_call_leader`）。
-  - **autumn-op**: `Command::PrincipalList` + `principal-list [--json]` + `cmd_principal_list`（人读：`name  grant1,grant2`；json：`{principals:[{name,grants:[...]}]}`）。
-- **Acceptance**: 建两个 principal（`principal-create fs --grant fs/`、`agent7 --grant mem/agent7/`）后 `principal-list` 列出两者 + 各自 grant；`--json` 结构正确；无 credential/hash 泄漏；follower 返回 CODE_NOT_LEADER（同 namespace-list）；WIRE registry test 绿。
-- **Status**: `passes: false` (2026-07-19, 记录待实现 — 用户"记录到 feature list") — 与 F-NS-PRINCIPAL-UNIFIED 同批风格；因要 bump wire，随下次 reset 批次一起做最干净。cross-ref `F-NS-PRINCIPAL-UNIFIED`（本条补齐它的 list 缺口）、`namespace-list`（对称参照）。
-
 ### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
 - **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
 - **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。
@@ -100,6 +90,15 @@
 - **Acceptance**: 1 有单测/日志证明每 client 用自己的 loop（或线程数不再随实例增长）；2 注入一个永久阻塞的 store，断言 watchdog 报警且 `_inflight_saves` 不永久占满；3 `close()` 后线程全部 join；5 marker 失败有 warning。
 - **Status**: `passes: false` (2026-07-22, coco 发现 + 主 agent 逐条复核；第 7 条已否决)。
   **用户定调 2026-07-22**（在 "fix BUG-KVC-TENANT" 之后说「剩下的 2 个你看着办，一般不需要」）: 本条**不做**，留在 backlog 只作记录。真要动之前，先复核它的触发条件是否已经在线上出现过。
+### BUG-FS-LANE-MERGE — merge 掉一条 lane 边界会静默减少新文件的条带宽度
+- **Trigger** (2026-07-22, 用户问"lane 数隐式存在 partition 切点里，再 split 不就坏了？"，追查后发现 split 安全、**merge 才是缺口**): fs 的 lane 数没有集群级配置，它有两个来源 —— ① 隐式：partition 切点（lane 边界 = `fs/` ++ `[0x03][lane]`，**恰好 5 字节**）；② 显式：每文件 `InodeMeta.stripe.lanes`（建文件时由 `autumnfs.rs:825 detect_stripe_lanes` 数①得出，之后不可变）。
+  - **split 是安全的**（已验证）：`detect_stripe_lanes` 的过滤条件是 `start.len() == prefix.len() + 2`（精确 5 字节），而 lane 分区内部再分裂的 median 切点必然是真实数据 key（条带 21 B / legacy 20 B），长度上结构性排除。且 partition 数与正确性无关 —— 路由按 key range 走，已有文件一律看自己的 `meta.stripe`。
+  - **merge 是缺口**：把两个相邻 lane 分区合并会让一条 5 字节边界消失 → `detect_stripe_lanes` 之后返回更小的 N → **新建**的大文件条带宽度变窄。**不是数据损坏**（已有文件仍带着自己的 lanes，读写照旧正确），是静默的能力退化：没有任何告警，只是吞吐悄悄掉回去。
+- **今天为什么还不会发生**: `allow_mutations` 默认 false ⇒ auto-merge 只出 DryRun advisory 不真执行。要触发得手工 `autumn-op merge` 跨 lane 边界。
+- **Scope（若要修）**: 二选一 —— (a) manager 侧把 lane 边界标成"不可 merge"（merge 谓词排除 start 恰为 `{ns}/[0x03][L]` 这种 2 字节后缀的边界）；或 (b) 把 lane 数提升为 namespace 注册表里的显式字段（`MgrNamespace` 加 `stripe_lanes`），`detect_stripe_lanes` 改读注册表而不是数分区 —— 顺带让"再 presplit 成不同 lane 数"这件事有据可查。(b) 更彻底但要 wire 改动。
+- **Acceptance**: 手工 merge 掉一条 lane 边界后，新建 >64 MiB 文件仍按原 lane 数条带（或 merge 被明确拒绝并给出原因）；已有条带文件读回字节精确不受影响。
+- **Status**: `passes: false` (2026-07-22, 记录待定) — 优先级低（需手工 merge 才触发 + 非损坏），但值得记，因为症状是"吞吐莫名变慢"这种最难查的类型。cross-ref F-FS-STRIPE（git 历史）、`F-FS-WRITE-STRIPE`。
+
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): the live 5-node wedge (10.4 TB leaked / 222 GB logical, 47×) was fixed two ways in `crates/stream/src/client.rs` — size-scaled append deadlines (`effective_append_timeout`) and writer-side reclaim of a tail sealed at commit=0 on roll-away (`reclaim_abandoned_empty_tail`, best-effort punch). The reclaim is CLIENT-side and best-effort: if the punch (or the authoritative `extent_info` re-fetch) fails — manager briefly unreachable, extent momentarily in a Recovery/EC ledger op — or the writer process dies right after the roll, that one sealed-empty extent still leaks forever (same unreclaimable shape: `sealed=true, sealed_length=0`, refs≥1, non-tail stream member, referenced by no VP/SST/checkpoint, invisible to accounting, skipped by GC/truncate/orphan-reconcile). A cluster already poisoned by the pre-fix bug also holds ~40k such extents that the writer-side fix will never revisit.
 - **Scope (when triggered)**: leader-only manager sweep (mirror `extent_both_zero_sweep_loop`, extent_delete.rs): for each stream, any member extent that is (a) NOT the tail (`extent_ids.last()`), (b) `sealed == true && sealed_length == 0` (authoritative empty seal — manager state note 32), and (c) not in the F207 inflight ledger → remove from `streams/<id>` membership (value-CAS per note 33) + refs-- (extent CAS) → existing pending-delete queue unlinks the physical files. Safety = the same argument as the writer-side reclaim: under caller-ack ⊆ commit (stream note 25a) + seal ≥ acked (notes 20/22), a sealed-AT-0 extent has no acked byte ⇒ nothing can reference it. CoW: refs-- only; delete at refs 0. Also drains the pre-fix backlog on an upgraded cluster (the 40k-extent case) — rate-limit the sweep (N extents/tick).
