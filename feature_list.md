@@ -14,6 +14,25 @@
 
 ## Active
 
+### BUG-BENCH-NS-UNREGISTERED — perf-check / ycsb 的 `bench/` 命名空间从未注册，Layer-A 会拒掉全部写入
+- **Trigger** (2026-07-22, 做 F-KEY-NS 收尾(a) 时顺链查出): 两个 bench 命令绑定 scope `bench/perf`（`autumn_client/main.rs:43 BENCH_SCOPE`），但 **`bench` 这个 namespace 没有任何地方注册**。而 Layer-A 在**任何 bootstrap 过的集群上都是激活的**，与 authz 开关无关：
+  1. `manager/src/lib.rs:2333` leader 晋升时**无条件**跑 `seed_builtin_namespaces()`（注册 fs/kvc/mem）；
+  2. `partition-server/src/authz.rs:158` `layer_a = !resp.namespaces.is_empty()` ⇒ 恒真；
+  3. `gate_active() = is_enabled() || layer_a_enabled()` ⇒ 恒真（**authz 关着也一样**）；
+  4. `lib.rs:4892` 于是每个 put 都过 `check_layer_a`，要求 key 第 1 段是已注册 namespace；
+  5. `bench/perf/…` 的 `bench/` 不在册 → `StatusCode::NamespaceUnknown` 拒绝。
+  既有单测 `authz.rs:700` 已经钉住了这个行为（`scratch/x` 被拒），`bench/perf/x` 与之同形。
+  **且注册不了**：`namespace-create` 要 admin token，而 cluster.sh 只在 `AUTUMN_AUTH=1` 时给 manager 配 token。
+- **第二个独立缺陷（同一批查出）**: `perf_check.sh:311` 的 `AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"` **对 bench 的分区铺开是空转**。`bench_user_starts`（`autumn_client/main.rs:54`）只保留 wire start 以 `bench/perf/` 开头的分区；而 bootstrap presplit 切的是**裸字节** hex 点（`2aaaaaaa`/`aaaaaaa8`/…），一个都不以 `bench/perf/` 开头 ⇒ 全被过滤，函数回落成单个空 start。**⇒ perf-check 的 `--partitions N` 这一维不管 N 多少都只测一个分区。** 即使修好上面那条，这条仍在。
+- **⚠️ 置信度**: 代码链完整（每一环都读过并引了行号），但**没有跑活集群实测**。决定性确认 = 起一个 cluster.sh 集群跑一次 perf-check，看是不是 `NamespaceUnknown`。
+- **Scope（待定方向，用户拍板）**: 三选一 ——
+  (a) `bench` 加进 `BUILTIN_NAMESPACES`（和 fs/kvc/mem 一起 seed）：最省事，但把测试用命名空间塞进生产内置表；
+  (b) cluster.sh/perf_check 显式 `namespace-create bench` —— 需要 cluster.sh 默认给 manager 配 admin token（目前只有 AUTUMN_AUTH=1 才配）；
+  (c) bench 改用已注册的 namespace（如 `mem/perf`）—— 零新机制，但 bench 数据混进 mem 空间。
+  修完第一条后，第二条的替代品 = 一个通用的"按均匀 hex 切任意 namespace"presplit 规则（现有 `PresplitRule` 只有 fs/kvc/mem 三种，没有通用变体），bootstrap presplit 才能干净退役。
+- **Acceptance**: 活集群上 perf-check 写入不再被拒；`--partitions N` 真的产出 N 个 bench 分区（`bench_user_starts` 返回 N 个 start），且 N 增大时吞吐有可观测变化。
+- **Status**: `passes: false` (2026-07-22) — **阻塞 F-KEY-NS 收尾(a)**：bootstrap presplit 不能在 perf-check 有可用替代路径之前退役。cross-ref `F-KEY-NS` 的 `F-PRESPLIT-PER-NS` 子项。
+
 ### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
 - **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
 - **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。
