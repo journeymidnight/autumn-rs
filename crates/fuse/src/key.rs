@@ -163,6 +163,26 @@ pub fn schema_version_key() -> Vec<u8> {
     super_key(b"schema_version")
 }
 
+/// F-FS-GEOM-DECLARED: the fs-wide DECLARED stripe geometry
+/// (`[0x04]stripe_geom` → rkyv `StripeLayout`).
+///
+/// Geometry is a policy value and this is its authoritative home. It used to
+/// have none: `autumnfs` reverse-engineered the lane count from the CURRENT
+/// partition split points on every large-file create. Partitions are the
+/// manager's elastic placement unit — it splits, merges and rebalances them
+/// autonomously — so deriving a durable per-file property from a mutable
+/// placement artifact drifted silently (a merged lane boundary narrowed every
+/// subsequent file with no error; a transient lookup failure degraded to
+/// `lanes=1` permanently for that file).
+///
+/// Absent key = this fs is not striped (new files stay single-partition). It
+/// lives beside `[0x04]schema_version` so it is read by the same fail-loud
+/// mount-time sequence, and it is a NEW key — no existing value layout changes,
+/// so adopting it needs no schema bump and no reset.
+pub fn stripe_geom_key() -> Vec<u8> {
+    super_key(b"stripe_geom")
+}
+
 /// UNLINK-1: unlink-intent tombstone `[0x04]rmtomb/[ino BE]`. Written the
 /// moment an inode becomes UNREACHABLE (its last dirent gone) and removed
 /// after its extents + inode key are deleted; the mount-time sweep replays
@@ -253,6 +273,43 @@ mod tests {
         assert!(striped_extent_offsets(u64::MAX, uu).is_err());
         // A corrupt stamp must error, not divide by zero.
         assert!(striped_extent_offsets(1024, 0).is_err());
+    }
+
+    #[test]
+    fn stripe_geom_key_is_a_superblock_key_below_every_lane() {
+        use crate::schema::MAX_EXTENT;
+        let k = stripe_geom_key();
+        assert_eq!(k[0], PREFIX_SUPER);
+        // It must NOT collide with the other superblock fields.
+        assert_ne!(k, schema_version_key());
+        assert_ne!(k, next_inode_key());
+        assert!(!k.starts_with(&unlink_tombstone_prefix()));
+        // Superblock (0x04) sorts ABOVE every extent key (0x03), so declaring
+        // geometry never lands inside a lane partition — it stays with the rest
+        // of the metadata and is reachable no matter how fs is presplit.
+        assert!(k > extent_key_striped(u64::MAX, 0, 255, MAX_EXTENT as u32));
+    }
+
+    #[test]
+    fn stripe_geom_codec_round_trips_and_rejects_corruption() {
+        use crate::schema::{decode_stripe_geom, encode_stripe_geom, StripeLayout};
+        let g = StripeLayout { lanes: 6, unit_bytes: 8 << 20 };
+        assert_eq!(decode_stripe_geom(&encode_stripe_geom(&g)).unwrap(), g);
+        // An absent key is the caller's `Ok(None)`; an EMPTY value is corruption.
+        assert!(decode_stripe_geom(&[]).is_err());
+        assert!(decode_stripe_geom(b"not rkyv at all").is_err());
+        // A zero in either field would divide by zero in `stripe_lane` /
+        // `striped_extent_offsets`, so the decoder rejects it up front rather
+        // than letting it reach the key builder.
+        for bad in [
+            StripeLayout { lanes: 0, unit_bytes: 8 << 20 },
+            StripeLayout { lanes: 6, unit_bytes: 0 },
+        ] {
+            assert!(
+                decode_stripe_geom(&encode_stripe_geom(&bad)).is_err(),
+                "decoder accepted {bad:?}"
+            );
+        }
     }
 
     #[test]

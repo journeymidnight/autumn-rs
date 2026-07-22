@@ -15,6 +15,24 @@ pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
     autumn_rpc::partition_rpc::rkyv_encode(meta).to_vec()
 }
 
+/// F-FS-GEOM-DECLARED: decode the declared fs-wide stripe geometry
+/// (`[0x04]stripe_geom`). Validated through `checked()` so a corrupt/truncated
+/// value fails loud here rather than dividing by zero deep in the key builder.
+pub fn decode_stripe_geom(bytes: &[u8]) -> Result<StripeLayout, String> {
+    if bytes.is_empty() {
+        return Err("empty stripe_geom bytes".to_string());
+    }
+    let layout: StripeLayout =
+        autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))?;
+    layout.checked()?;
+    Ok(layout)
+}
+
+/// Encode the declared fs-wide stripe geometry.
+pub fn encode_stripe_geom(layout: &StripeLayout) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(layout).to_vec()
+}
+
 /// Decode DirentValue from rkyv bytes.
 pub fn decode_dirent(bytes: &[u8]) -> Result<DirentValue, String> {
     if bytes.is_empty() {

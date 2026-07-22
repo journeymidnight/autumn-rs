@@ -102,7 +102,10 @@
 - **迁移代价**: 同 commit 停机部署（例行），**不用 reset、不用 schema bump、线上 41 GB / 6-lane 的 72B 权重不用重传**（无持久布局改动）。部署后跑一条命令写入 `stripe_geom{6, 8MiB}`。写注册表字段需要一个新 admin RPC —— **v27 尚未部署**，可按 v25 那次的先例就地刷新指纹而非再 bump。
 - **明确不做（fable 建议延后，我同意）**: lane 轮转（`lane = (ino + off/unit) % lanes`）以缓解 lane 0 集中（元数据 + 所有单 extent 文件 + 所有 legacy 文件都在 lane 0）。它**会**强制 schema v4 + reset + 重传权重。当前负载（少量巨型模型；kvc/mem 在别的 namespace）对 lane 0 压力可忽略 → 先做 **M1 测量**（各 lane 分区的 size/QPS 占比），真出现热点再作为 v4 变更。
 - **Acceptance**: 新建文件的 lanes 来自 `[0x04]stripe_geom` 而非分区扫描；几何读失败 = connect 期 fail-loud（不再静默 lanes=1）；跨已记录 presplit 切点的 merge 被拒并给出原因；fuse mount 能写 >64 MiB 条带文件且 autumnfs 冷读字节精确；既有 6-lane 文件读回不变。
-- **Status**: `passes: false` (2026-07-22, fable 设计复审产出，用户待决策实施范围) — **其中 S2 那条已单独修掉并 commit**（见下）。cross-ref `BUG-FS-LANE-MERGE`（被本条第 4 步吸收）、`F-FS-WRITE-STRIPE`（被第 3 步降为机械工作）、`F-PRESPLIT-PER-NS`。
+- **Status**: `passes: false` (2026-07-22, 用户拍板"全做四步"，**第 1-3 步的 autumnfs 半边已实现并 commit**)。
+  **已做**: ① `[0x04]stripe_geom` 权威归属地 —— `key::stripe_geom_key` + `schema::{encode,decode}_stripe_geom`（decode 走 `checked()`，corrupt/零值在解码处 fail-loud，进不到 key builder）+ **ungated `geom.rs`** 放共享的 `read_stripe_geom`/`write_stripe_geom`（autumnfs 用 `default-features=false` 导入 fuse，所以不能放 core-gated 的 `meta.rs`；ungated 才能两个前端共用一份实现、不 drift）。② `presplit --namespace fs --lanes N` 在**同一条命令**里声明几何，且**先声明后切**——两种失败顺序不对称：声明成功但切失败 = 新文件条带到还没分开的 lane 上（**正确**，只是暂时没并行，重跑即痊愈）；切成功但声明失败 = 永远静默不条带（正是本条要消灭的失败类）。③ **`detect_stripe_lanes` 已删**（连带消灭 CLI 里硬编码的 `b"fs/"` wire 前缀、每次建文件的分区扫描、以及"查询失败静默降级 lanes=1"——现在 fail-loud）。④ **64 MiB 阈值已删**（autumnfs 侧）。
+  **未做**: 第 2/3 步的 **fuse mount 半边**（mount 时读几何并缓存进 `FsState` + B2 条带写）；第 4 步 **sacred-boundary merge 守卫**（把 presplit 切点记进 `MgrNamespace.presplit` + merge 路径拒绝跨越，需要一个新 admin RPC 写既有 namespace 的该字段）。
+  ~~**其中 S2 那条已单独修掉并 commit**~~ S2 已修（86972d8）。cross-ref `BUG-FS-LANE-MERGE`（被本条第 4 步吸收）、`F-FS-WRITE-STRIPE`（被第 3 步降为机械工作）、`F-PRESPLIT-PER-NS`。
 
 ### BUG-FS-LANE-MERGE — merge 掉一条 lane 边界会静默减少新文件的条带宽度
 - **Trigger** (2026-07-22, 用户问"lane 数隐式存在 partition 切点里，再 split 不就坏了？"，追查后发现 split 安全、**merge 才是缺口**): fs 的 lane 数没有集群级配置，它有两个来源 —— ① 隐式：partition 切点（lane 边界 = `fs/` ++ `[0x03][lane]`，**恰好 5 字节**）；② 显式：每文件 `InodeMeta.stripe.lanes`（建文件时由 `autumnfs.rs:825 detect_stripe_lanes` 数①得出，之后不可变）。

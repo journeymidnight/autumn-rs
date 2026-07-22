@@ -44,11 +44,6 @@ use autumn_fuse::schema::{
     MAX_EXTENT, ROOT_INO,
 };
 
-/// F-FS-STRIPE: only files LARGER than this get striped across lanes; smaller
-/// files stay single-partition (avoids scattering small files + metadata and
-/// the multi-partition round-trip on a read that a single stream serves fine).
-const STRIPE_THRESHOLD: u64 = 64 * 1024 * 1024;
-
 #[derive(Parser, Debug)]
 #[command(
     name = "autumnfs",
@@ -818,30 +813,19 @@ async fn publish_file(
     Ok(())
 }
 
-/// F-FS-STRIPE: how many lane partitions the fs is presplit into (the FIXED
-/// stripe width — NOT a per-upload flag). A lane partition L≥1 starts exactly at
-/// the wire key `fs/[0x03][L]` (`stripe_lane_boundary` under the binding prefix);
-/// count them → `N = (#lane boundaries) + 1` (lane 0 has no boundary start).
-/// Returns 1 when fs was never lane-presplit → no striping. Best-effort: any
-/// lookup error → 1 (fall back to single-partition, never fail the upload).
-async fn detect_stripe_lanes(cluster: &ClusterClient) -> u8 {
-    // all_partitions_with_range reads the region cache; refresh so a just-presplit
-    // fs is seen. Errors are non-fatal — degrade to non-striped.
-    let _ = cluster.refresh_regions().await;
-    let Ok(parts) = cluster.all_partitions_with_range().await else {
-        return 1;
-    };
-    let prefix = b"fs/".to_vec();
-    let boundaries = parts
-        .iter()
-        .filter(|(_, _, start, _)| {
-            start.len() == prefix.len() + 2
-                && start.starts_with(&prefix)
-                && start[prefix.len()] == 0x03 // PREFIX_EXTENT
-                && start[prefix.len() + 1] >= 1 // lane byte L≥1
-        })
-        .count();
-    ((boundaries + 1).min(255)) as u8
+/// F-FS-GEOM-DECLARED: the fs-wide DECLARED stripe geometry, read once per
+/// invocation. This replaces `detect_stripe_lanes`, which reverse-engineered the
+/// lane count from the CURRENT partition split points on every large-file
+/// create. Three things went wrong with that and all three die here:
+///   * a merged lane boundary silently narrowed every subsequent file
+///     (BUG-FS-LANE-MERGE) — placement is not a declaration;
+///   * any lookup error degraded to `lanes = 1`, so one transient manager blip
+///     produced a permanently single-partition 41 GB file whose only symptom was
+///     bad throughput. `read_stripe_geom` propagates instead;
+///   * it hardcoded the wire prefix `b"fs/"` in a CLI, a byte string that has
+///     already changed twice (tenant-first, then Option 3).
+async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<Option<StripeLayout>> {
+    autumn_fuse::geom::read_stripe_geom(cluster).await
 }
 
 async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {
@@ -859,18 +843,15 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Resu
     }
     let f = std::fs::File::open(local)
         .with_context(|| format!("open local file {}", local.display()))?;
-    // F-FS-STRIPE: stripe only a LARGE file, and across exactly the lanes the fs
-    // was presplit into (auto-detected — a FIXED cluster property, not a flag).
-    // Small files (≤ threshold) and a non-lane-presplit fs (N<2) stay
-    // single-partition. Size is known up front (a local file), so we can stamp
-    // the layout at create — unlike the fuse mount's streaming writes.
-    let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let stripe = if file_size > STRIPE_THRESHOLD {
-        let lanes = detect_stripe_lanes(cluster).await;
-        (lanes >= 2).then_some(StripeLayout { lanes, unit_bytes: MAX_EXTENT as u32 })
-    } else {
-        None
-    };
+    // F-FS-GEOM-DECLARED: stripe EVERY file in a striped fs — the 64 MiB
+    // threshold is gone. It protected almost nothing: with unit = MAX_EXTENT a
+    // file of one extent or less has a single extent, which lands on lane 0
+    // regardless, i.e. byte-for-byte the same placement as not striping; and
+    // metadata (0x01/0x02) sorts below `[0x03][1]` so it never leaves lane 0
+    // either. Its only real effect was to REQUIRE the final size at create
+    // time — which is exactly what made streaming (fuse mount) writes
+    // unstripeable, since the lane function itself is incremental.
+    let stripe = declared_stripe_geom(cluster).await?.filter(|g| g.lanes >= 2);
     let striped_note = stripe
         .as_ref()
         .map(|s| format!(" (striped ×{} lanes)", s.lanes))

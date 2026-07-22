@@ -13,6 +13,7 @@
 //   (`bridge`), the dispatch loop (`dispatch`), and the ONLY place core
 //   types convert to `fuser` reply types (`attr`).
 
+pub mod geom;
 pub mod key;
 pub mod schema;
 

@@ -1642,6 +1642,37 @@ async fn cmd_presplit(
         bail!("presplit: rule produced no cut points (count < 2 / empty list) — nothing to do");
     }
 
+    // F-FS-GEOM-DECLARED: `--lanes N` DECLARES the fs stripe geometry, in the
+    // same command that cuts the boundaries — the declaration and the placement
+    // can never be created out of step. Writers read this key; they no longer
+    // reverse-engineer the lane count from partition boundaries.
+    //
+    // Declared BEFORE cutting, deliberately. The two failure orders are not
+    // symmetric: declare-then-fail-to-cut leaves geometry claiming N lanes whose
+    // boundaries don't exist yet, so new files stripe across lanes that all land
+    // in one partition — CORRECT (files are self-describing), just no parallelism
+    // yet, and it heals completely when the cuts land on a re-run. Cut-then-
+    // fail-to-declare leaves boundaries with no declaration, i.e. silently
+    // unstriped files forever — the exact failure class this feature removes.
+    if let PresplitRule::FsLanes { lanes } = rule {
+        let layout = autumn_fuse::schema::StripeLayout {
+            lanes: *lanes,
+            unit_bytes: autumn_fuse::schema::MAX_EXTENT as u32,
+        };
+        // `client` here is connect_raw (no binding), so the wire key carries the
+        // `fs/` namespace prefix explicitly — same bytes a scoped fs client
+        // produces from the relative `[0x04]stripe_geom`.
+        let mut k = b"fs/".to_vec();
+        k.extend_from_slice(&autumn_fuse::key::stripe_geom_key());
+        client
+            .put(&k, &autumn_fuse::schema::encode_stripe_geom(&layout))
+            .await
+            .map_err(|e| anyhow!("presplit: declare fs stripe geometry: {e}"))?;
+        if !json {
+            println!("declared fs stripe geometry: {lanes} lanes × {} MiB units", layout.unit_bytes / (1 << 20));
+        }
+    }
+
     let mut applied = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for point in &points {
