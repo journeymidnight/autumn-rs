@@ -14,29 +14,6 @@
 
 ## Active
 
-### BUG-BENCH-NS-UNREGISTERED — perf-check / ycsb 的 `bench/` 命名空间从未注册，Layer-A 会拒掉全部写入
-- **Trigger** (2026-07-22, 做 F-KEY-NS 收尾(a) 时顺链查出): 两个 bench 命令绑定 scope `bench/perf`（`autumn_client/main.rs:43 BENCH_SCOPE`），但 **`bench` 这个 namespace 没有任何地方注册**。而 Layer-A 在**任何 bootstrap 过的集群上都是激活的**，与 authz 开关无关：
-  1. `manager/src/lib.rs:2333` leader 晋升时**无条件**跑 `seed_builtin_namespaces()`（注册 fs/kvc/mem）；
-  2. `partition-server/src/authz.rs:158` `layer_a = !resp.namespaces.is_empty()` ⇒ 恒真；
-  3. `gate_active() = is_enabled() || layer_a_enabled()` ⇒ 恒真（**authz 关着也一样**）；
-  4. `lib.rs:4892` 于是每个 put 都过 `check_layer_a`，要求 key 第 1 段是已注册 namespace；
-  5. `bench/perf/…` 的 `bench/` 不在册 → `StatusCode::NamespaceUnknown` 拒绝。
-  既有单测 `authz.rs:700` 已经钉住了这个行为（`scratch/x` 被拒），`bench/perf/x` 与之同形。
-  **且注册不了**：`namespace-create` 要 admin token，而 cluster.sh 只在 `AUTUMN_AUTH=1` 时给 manager 配 token。
-- **第二个独立缺陷（同一批查出）**: `perf_check.sh:311` 的 `AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"` **对 bench 的分区铺开是空转**。`bench_user_starts`（`autumn_client/main.rs:54`）只保留 wire start 以 `bench/perf/` 开头的分区；而 bootstrap presplit 切的是**裸字节** hex 点（`2aaaaaaa`/`aaaaaaa8`/…），一个都不以 `bench/perf/` 开头 ⇒ 全被过滤，函数回落成单个空 start。**⇒ perf-check 的 `--partitions N` 这一维不管 N 多少都只测一个分区。** 即使修好上面那条，这条仍在。
-- **⚠️ 置信度**: 代码链完整（每一环都读过并引了行号），但**没有跑活集群实测**。决定性确认 = 起一个 cluster.sh 集群跑一次 perf-check，看是不是 `NamespaceUnknown`。
-- **Scope（待定方向，用户拍板）**: 三选一 ——
-  (a) `bench` 加进 `BUILTIN_NAMESPACES`（和 fs/kvc/mem 一起 seed）：最省事，但把测试用命名空间塞进生产内置表；
-  (b) cluster.sh/perf_check 显式 `namespace-create bench` —— 需要 cluster.sh 默认给 manager 配 admin token（目前只有 AUTUMN_AUTH=1 才配）；
-  (c) bench 改用已注册的 namespace（如 `mem/perf`）—— 零新机制，但 bench 数据混进 mem 空间。
-  修完第一条后，第二条的替代品 = 一个通用的"按均匀 hex 切任意 namespace"presplit 规则（现有 `PresplitRule` 只有 fs/kvc/mem 三种，没有通用变体），bootstrap presplit 才能干净退役。
-- **Acceptance**: 活集群上 perf-check 写入不再被拒；`--partitions N` 真的产出 N 个 bench 分区（`bench_user_starts` 返回 N 个 start），且 N 增大时吞吐有可观测变化。
-- **Status**: `passes: false` (2026-07-22) — **代码已实现（用户选方案 b），但活集群 e2e 未验完**。
-  **已做**: cluster.sh 把 admin token 与 signing key **解耦**（原先 token 嵌在 signing-key 的 if 块里，所以非 authz 集群根本没 token，`namespace-create` 回 "admin RPCs disabled"）→ 现在**每个集群**都发 token 并传 `--admin-token-file`；bootstrap 后**无条件** `namespace-create --name bench`；新增通用 `PresplitRule::Hex{count}`（按 namespace **相对**前缀均匀切 8-hex 点）供 `presplit --namespace bench --tenant perf --count N`；`bootstrap --presplit` 退役成 migration stub。
-  **实测到的额外收获**: 起集群时撞出 cluster.sh 一条**过期守卫** —— "AUTUMN_ADMIN_TOKEN_FILE 没配 signing key 就报错"，它假设 admin token 属于 authz，已一并修掉（只保留 protected-prefixes 那半边）。
-  **已获得的活证据**: manager 进程实测带上了 `--admin-token-file /tmp/autumn-rs/authz/admin.token` 且集群**没开 authz** ⇒ 解耦生效；`bootstrap succeeded: 1 partition(s)` ⇒ presplit 退役生效。
-  **⚠️ 未验证**: bench 的 `namespace-create` + `presplit` + 真实 bench 写入是否成功。**被环境挡住** —— `:2379` 上蹲着一个**外部** etcd（`--data-dir /data/kvc_repro_cluster/etcd`，7/18 起跑了 4 天），cluster.sh 只 kill data-dir 在 `autumn-rs` 树下的 etcd（`cluster.sh:1212`），所以每次 clean 都活着，我的新集群一直在读它的旧分区状态（13/17/34，连的还是旧 EN 口 9101）。**不擅自 kill 别人的进程** —— 需要用户确认后再补验。：bootstrap presplit 不能在 perf-check 有可用替代路径之前退役。cross-ref `F-KEY-NS` 的 `F-PRESPLIT-PER-NS` 子项。
-
 ### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
 - **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
 - **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。
@@ -69,8 +46,8 @@
 - **实施顺序**（doc §4）: D3(est_live) → D6-mem → D4(split --at) →【停机批次: D1(fs/ 迁移) + D7(namespace) + D2 注册表落库】→ D6-fs/kvc → D8(per-ns presplit 随清单生效)。
 - **Status**: `passes: false` (2026-07-16) — design doc 完成；**D3/D4/D6-mem client 已实现并 commit**（65d9e6c/dcb5e2f/c46c3ee）。**D1+D7+D2 停机批次实施设计已定稿**（doc §7，2026-07-17，三路 explorer file:line 复核）：拆 3 子交付、落地顺序 **D2 →（wire 冻结 v24→v25）→ D7 → D1**（用户拍板），**线上走 cluster reset 不迁移**（用户拍板）。**SD-1（D2 注册表 + 整批 wire 冻结 v24→v25 `76e8ba557f7fca2d` + bootstrap 预注册 fs/kvc/mem + GET_AUTHZ_CONFIG leader-gate）已实现 + review + commit**（opus teammate 实现，team-lead + 用户 review，coco P1/P2 已处理）。**SD-2（D7）已实现 + review + commit**：client `NamespaceBinding` **Prepend-only（scope 构造锁死，无 Assert）** + PS Layer-A gate + `namespace-list`（sanctioned wire 加项，v25 fp 刷新为 `6bb3e2105b2845db`）+ memory/kvcache builder 改**相对 key** + principal 改名 + connect ns/tenant 段校验。审查：coco（full-diff 反复 hang GPT-5.5，scoped 审 authz.rs）+ **fable subagent 深审**（coco 替代）。coco 3 + fable 6 findings 全修：put_stream+Assert（被 Prepend-only 消解）、connect_with_credential 吞错误、PyO3 缺 scope 校验、bench_zc 签名、hermes 双前缀、Layer-A live-from-bootstrap 部署文档订正（SD-2 不可单独部署）、Assert 注释清扫、get_many_direct `.expect`、CLI typo。**SD-3（D1 fuse）已实现 + fable 对抗审 + 活集群测试绿**：`{volume}/` 前缀落在 `FsState` 8 个 `kv_*` choke point **+ read/write batch 数据路径两处**（`read::prepare`/`extent::flush_appends`；key.rs 与 38 调用点零改动）+ `scoped(fs, tenant)` connect（fuse mount `--tenant/--volume`、PyO3 `autumn.Fs.connect(tenant=,volume=)`、autumnfs `connect_volume`，默认 default）；per-volume `[0x04]schema_version` 戳（fail-loud）；autumnfs 迁到 `fs/{t}/{v}/` + manager 发号（P1-3）。**inode 号=全局唯一（用户拍板 B，非 per-volume）**：lease/fence 平面按裸 ino key，per-volume 会跨 volume 撞车（review P1-2）→ fuse 传空 volume + 去掉 `init_root` 本地 seed，全 inode 走 manager 全局计数器；per-volume 机制 + 冻结的 `AllocInodesReq.volume` 休眠待将来 volume-aware lease（+ manager `valid_alloc_volume` 校验 P2-4）。**审查**：fable subagent（coco 替代）报 1 P0（batch 数据路径绕过 volume 前缀 → 自查已修 9748d3d，fable 确认修得全）+ 2 P1（lease ino 冲突=拍板 B 全局 inode；autumnfs 未迁=已迁）+ 2 P2（volume 校验=已加；schema v1 guard=reset 部署下 acceptable-risk，跳过）+ 文档漂移=已修。**测试**：fuse core 13、manager lib 228、client 35、fs_alloc 5 单测 + 集成；**活集群 cold-remount 读回 + 双 volume 隔离 + f247 全绿**（`system_fuse_ns.rs`，#[ignore]）。~~剩余：全批 stop-world cluster reset 部署 SD-1+SD-2+SD-3~~ **已部署**（2026-07-20 VKE 全量 reset，随 Option 3 一起上线；1f04192「all consumer paths verified live」：37 分区 / authz 实测强制 / fs+kvc+mem 三族全绿）。presplit `fuse_split_ranges` 归 D8/F-PRESPLIT-PER-NS（非 D1 核心）。
 - **剩余 OPEN 子项**（2026-07-22 逐条核代码后收敛 — 本条唯一未完成的两块）:
-  1. `F-POLICY-SIZE-EST-LIVE-FOLLOWUP` — 未实现。`policy.rs` 有 `est_live_bytes`/`effective_size_bytes`（D3 已上），但 **PolicyEngine 无 per-partition sealed 环缓、size 维度仍在防抖窗口内**。当前安全边界不变（`allow_mutations` 默认 false，仅 DryRun advisory）；启用 size-based 自动 split/merge 前必做。
-  2. `F-PRESPLIT-PER-NS` — 半成。`presplit --namespace <fs|kvc|mem>`（F-PRESPLIT-NS-RULES, 4741f84）+ `namespace-create --presplit <hex,...>` 都在；**但 bootstrap 级 presplit 未退役** —— `autumn_op/args.rs:38` 仍列 `bootstrap [--presplit 1:normal|N:hexstring|N:fuse]`、`main.rs:344 run_bootstrap(...&presplit...)`、`cluster.sh` + `perf/perf_check.sh` 仍读 `AUTUMN_BOOTSTRAP_PRESPLIT`。
+  1. `F-POLICY-SIZE-EST-LIVE-FOLLOWUP`（**F-KEY-NS 唯一剩余项**） — 未实现。`policy.rs` 有 `est_live_bytes`/`effective_size_bytes`（D3 已上），但 **PolicyEngine 无 per-partition sealed 环缓、size 维度仍在防抖窗口内**。当前安全边界不变（`allow_mutations` 默认 false，仅 DryRun advisory）；启用 size-based 自动 split/merge 前必做。
+  2. ~~`F-PRESPLIT-PER-NS` bootstrap presplit 退役~~ **DONE**（86d7ec9 + 本次活集群验证）：`bootstrap --presplit` 退役成 migration stub；新增通用 `PresplitRule::Hex{count}`（按 namespace 相对前缀均匀切）；cluster.sh 无条件建 bench + presplit。**活集群实测**：bench 4 分区切点 = `bench/perf/{3fffffff,7ffffffe,bffffffd}`（相对前缀，旧裸字节点会被 bench_user_starts 全滤掉）、bench 写 ok/读回精确、Layer-A 不再拒。
   其余子项（D3 est_live / D4 split --at / D6 authz 接线 / D7 namespace / D1 fuse 前缀）代码 + 部署均已完成。
 
 ### BUG-KVC-LOAD-ATOMIC — external KV load 是 fail-open：部分 layer 加载失败仍继续推理

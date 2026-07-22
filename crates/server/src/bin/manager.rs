@@ -302,6 +302,19 @@ async fn main() -> Result<()> {
         tracing::info!(audit_retention_days = v, "audit retention configured");
     }
 
+    // The ADMIN TOKEN gates CONTROL-plane admin RPCs (namespace-create,
+    // principal-create, the F-FS-GEOM-DECLARED merge/set-presplit ops, …) and is
+    // INDEPENDENT of data-plane authz. Apply it UNCONDITIONALLY: it used to live
+    // only inside the signing-key branch below, so a manager launched with
+    // `--admin-token-file` but no `--auth-signing-key-file` silently discarded
+    // the token and answered every admin RPC with "admin RPCs disabled". That is
+    // exactly the shape a default (authz-off) cluster needs in order to register
+    // the bench namespace (BUG-BENCH-NS-UNREGISTERED). Configuring the token can
+    // only ENABLE RPCs that were refused outright before.
+    if let Some(tok) = &args.admin_token {
+        manager.set_admin_token(tok.clone());
+    }
+
     // F-AUTHZ-1: data-plane authz (opt-in). Loading a signing-key file ENABLES
     // it; without the flag the manager is not a KDC and PSes don't enforce.
     if let Some(path) = &args.auth_signing_key_file {
@@ -326,9 +339,8 @@ async fn main() -> Result<()> {
         if let Some(v) = args.auth_clock_skew_secs {
             manager.set_clock_skew_secs(v);
         }
-        if let Some(tok) = &args.admin_token {
-            manager.set_admin_token(tok.clone());
-        }
+        // (admin token is applied unconditionally above — it is not part of
+        // data-plane authz.)
         tracing::info!(
             protected_prefixes = ?prefixes
                 .iter()
@@ -337,10 +349,13 @@ async fn main() -> Result<()> {
             admin_token_set = args.admin_token.is_some(),
             "F-AUTHZ-1: data-plane authz ENABLED (manager is a KDC)"
         );
-    } else if args.admin_token.is_some() || !args.auth_protected_prefixes.is_empty() {
+    } else if !args.auth_protected_prefixes.is_empty() {
+        // --admin-token WITHOUT a signing key is now valid (control-plane admin,
+        // applied above). Only protected-prefixes is meaningless without one —
+        // it configures data-plane enforcement that isn't running.
         tracing::warn!(
-            "F-AUTHZ-1: --admin-token / --auth-protected-prefix given without \
-             --auth-signing-key-file; authz stays DISABLED (no signing key)"
+            "F-AUTHZ-1: --auth-protected-prefix given without --auth-signing-key-file; \
+             data-plane authz stays DISABLED (no signing key)"
         );
     }
 
