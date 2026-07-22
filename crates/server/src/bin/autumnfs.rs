@@ -557,13 +557,15 @@ async fn read_file_to_writer(
     if let Some(s) = &meta.stripe {
         // F-FS-STRIPE: extents live under `[0x03][lane][ino][off]`, so a range
         // scan over `[0x03][ino]` would find NOTHING. Compute the key list from
-        // size + geometry. Extents are MAX_EXTENT-granular (the writer never
-        // exceeds it), so step by MAX_EXTENT and derive each extent's lane; the
-        // window `get_many_into` below then fans the reads out across the lane
-        // partitions in parallel.
+        // size + geometry. Step by the file's PERSISTED `unit_bytes` (NOT the
+        // MAX_EXTENT constant — see `striped_extent_offsets`) and derive each
+        // extent's lane; the window `get_many_into` below then fans the reads
+        // out across the lane partitions in parallel.
         let (lanes, unit) = s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
         // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
-        for off in schema::striped_extent_offsets(meta.size).map_err(|e| anyhow!("read {ino}: {e}"))? {
+        for off in
+            schema::striped_extent_offsets(meta.size, unit).map_err(|e| anyhow!("read {ino}: {e}"))?
+        {
             extents.push((off, key::extent_key_striped(ino, off, lanes, unit)));
         }
     } else {
@@ -956,10 +958,12 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
             // F-FS-STRIPE: striped extents live under `[0x03][lane][ino][off]`,
             // spread across lane partitions — a `[0x03][ino]` scan would MISS
             // them (leak). Compute + delete each key (same enumeration the read
-            // path uses: MAX_EXTENT-granular up to size).
+            // path uses: stride = the file's PERSISTED unit_bytes, up to size).
             let (lanes, unit) = s.checked().map_err(|e| anyhow!("rm {ino}: {e}"))?;
             // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
-            for off in schema::striped_extent_offsets(meta.size).map_err(|e| anyhow!("rm {ino}: {e}"))? {
+            for off in
+                schema::striped_extent_offsets(meta.size, unit).map_err(|e| anyhow!("rm {ino}: {e}"))?
+            {
                 let ek = key::extent_key_striped(ino, off, lanes, unit);
                 cluster.delete(&ek).await.map_err(|e| anyhow!("delete extent: {e}"))?;
             }

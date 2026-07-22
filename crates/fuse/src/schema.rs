@@ -88,22 +88,43 @@ impl StripeLayout {
     }
 }
 
-/// F-FS-STRIPE (coco P3): the MAX_EXTENT-aligned logical offsets (0, 8 MiB, …) of
-/// a striped file of `size` bytes — the enumeration the reader / rm / delete paths
-/// use to COMPUTE lane keys. Guards a corrupt huge `size`: a bare
-/// `while off < size { off += MAX_EXTENT }` would wrap `off` (infinite loop) or
-/// push billions of entries (OOM) if `size ≈ u64::MAX`. Errors when the extent
-/// count exceeds a sane ceiling (128 TiB) instead of hanging.
-pub fn striped_extent_offsets(size: u64) -> Result<Vec<u64>, String> {
+/// F-FS-STRIPE (coco P3): the `unit_bytes`-aligned logical offsets (0, u, 2u, …)
+/// of a striped file of `size` bytes — the enumeration the reader / rm / delete
+/// paths use to COMPUTE lane keys.
+///
+/// **`unit` MUST come from the file's PERSISTED `StripeLayout.unit_bytes`, never
+/// from the `MAX_EXTENT` constant.** This used to step by the compile-time
+/// constant, which silently assumed "the extent cap today == the extent cap when
+/// this file was written". `MAX_EXTENT` is explicitly slated for retuning on
+/// full-resource hardware, and the day it shrinks (8 MiB → 4 MiB) every existing
+/// striped file would enumerate offsets (0, 4M, 8M…) that do not match its
+/// written keys (0, 8M, 16M…) — and because a missing extent READS AS ZEROS
+/// (sparse-file semantics, `read::execute`), half of every striped file would
+/// come back zero-filled with no error. That is the same silent-misread class the
+/// stripe stamp exists to prevent, so the stride is now part of the file's
+/// self-describing geometry. Decoupling `unit_bytes` from the extent cap later
+/// (multi-extent stripe units) needs a new persisted field + a schema bump.
+///
+/// Guards a corrupt huge `size`: a bare `while off < size { off += unit }` would
+/// wrap `off` (infinite loop) or push billions of entries (OOM) if
+/// `size ≈ u64::MAX`. Errors when the extent count exceeds a sane ceiling.
+/// `unit == 0` errors rather than dividing by zero (`StripeLayout::checked()`
+/// is the normal gate, but this is a pub fn taking a bare u32).
+pub fn striped_extent_offsets(size: u64, unit: u32) -> Result<Vec<u64>, String> {
     const MAX_EXTENTS: u64 = 16 * 1024 * 1024; // 16M × 8 MiB = 128 TiB
-    let count = size.div_ceil(MAX_EXTENT as u64);
+    if unit == 0 {
+        return Err("striped file has unit_bytes=0 (corrupt inode?)".to_string());
+    }
+    let unit = unit as u64;
+    let count = size.div_ceil(unit);
     if count > MAX_EXTENTS {
         return Err(format!(
             "striped file size {size} too large ({count} extents > {MAX_EXTENTS} cap — corrupt inode?)"
         ));
     }
-    // i < count ≤ 16M ⇒ i * 8 MiB < 128 TiB < u64::MAX, no overflow.
-    Ok((0..count).map(|i| i * MAX_EXTENT as u64).collect())
+    // count ≤ 16M and unit ≤ MAX_EXTENT-class values ⇒ i * unit stays far below
+    // u64::MAX; saturating_mul keeps that true even for an absurd stamped unit.
+    Ok((0..count).map(|i| i.saturating_mul(unit)).collect())
 }
 
 /// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.

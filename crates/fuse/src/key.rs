@@ -243,13 +243,46 @@ mod tests {
     fn striped_extent_offsets_bounded_and_correct() {
         use crate::schema::{striped_extent_offsets, MAX_EXTENT};
         let u = MAX_EXTENT as u64;
-        assert_eq!(striped_extent_offsets(0).unwrap(), Vec::<u64>::new());
-        assert_eq!(striped_extent_offsets(1).unwrap(), vec![0]); // 1 byte → 1 extent
-        assert_eq!(striped_extent_offsets(u).unwrap(), vec![0]); // exactly one full extent
-        assert_eq!(striped_extent_offsets(u + 1).unwrap(), vec![0, u]); // spills to 2nd
-        assert_eq!(striped_extent_offsets(3 * u).unwrap(), vec![0, u, 2 * u]);
+        let uu = MAX_EXTENT as u32;
+        assert_eq!(striped_extent_offsets(0, uu).unwrap(), Vec::<u64>::new());
+        assert_eq!(striped_extent_offsets(1, uu).unwrap(), vec![0]); // 1 byte → 1 extent
+        assert_eq!(striped_extent_offsets(u, uu).unwrap(), vec![0]); // exactly one full extent
+        assert_eq!(striped_extent_offsets(u + 1, uu).unwrap(), vec![0, u]); // spills to 2nd
+        assert_eq!(striped_extent_offsets(3 * u, uu).unwrap(), vec![0, u, 2 * u]);
         // coco P3: a corrupt near-u64::MAX size errors instead of wrapping / OOMing.
-        assert!(striped_extent_offsets(u64::MAX).is_err());
+        assert!(striped_extent_offsets(u64::MAX, uu).is_err());
+        // A corrupt stamp must error, not divide by zero.
+        assert!(striped_extent_offsets(1024, 0).is_err());
+    }
+
+    #[test]
+    fn striped_offsets_follow_the_stamp_not_the_constant() {
+        // THE regression this parameterisation exists for: a file written when
+        // the extent cap was 8 MiB must keep enumerating on 8 MiB even after
+        // MAX_EXTENT is retuned. Before the fix the stride came from the
+        // constant, so a shrink made every striped file enumerate offsets that
+        // do not match its written keys — and a missing extent reads as ZEROS
+        // (sparse-file semantics), so the file silently came back half zero-filled.
+        use crate::schema::striped_extent_offsets;
+        const EIGHT_M: u32 = 8 * 1024 * 1024;
+        const FOUR_M: u32 = 4 * 1024 * 1024;
+        let size = 24 * 1024 * 1024u64; // 3 extents at 8 MiB, 6 at 4 MiB
+        assert_eq!(
+            striped_extent_offsets(size, EIGHT_M).unwrap(),
+            vec![0, 8 << 20, 16 << 20],
+            "an 8 MiB-stamped file must enumerate on 8 MiB whatever MAX_EXTENT is today"
+        );
+        assert_eq!(
+            striped_extent_offsets(size, FOUR_M).unwrap().len(),
+            6,
+            "a 4 MiB-stamped file enumerates on 4 MiB"
+        );
+        // The two stampings genuinely disagree — which is exactly why reading the
+        // stride from a global constant could not have been correct for both.
+        assert_ne!(
+            striped_extent_offsets(size, EIGHT_M).unwrap(),
+            striped_extent_offsets(size, FOUR_M).unwrap()
+        );
     }
 
     #[test]

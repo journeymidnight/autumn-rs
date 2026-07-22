@@ -1,4 +1,47 @@
 Date: 2026-07-22
+TaskStatus: completed
+Task scope: 用户「fable subagent 重新设计 lane 的部分，感觉现在的实现不大对」。
+  直觉是对的 —— 复审挖出一条**我和 coco 都漏掉的静默数据误读陷阱**，已修并 commit；
+  完整重设计（Design B）已立条目 F-FS-GEOM-DECLARED 等用户定实施范围。
+
+── 已修：条带枚举步长用编译期常量而非持久化 unit_bytes ──
+`schema::striped_extent_offsets(size)` 只收 size，步长写死 `MAX_EXTENT` 常量；持久化的
+`StripeLayout.unit_bytes` 只在算 lane 时用到，**枚举时从没被读**。而 MAX_EXTENT 重新
+调优是已排进 ledger 的计划（"满资源硬件另测"）。那天一改小（8→4 MiB），已有条带文件
+枚举出 0,4M,8M… 而实际写的 key 是 0,8M,16M…，且**读路径对缺失 extent 零填充**
+（sparse 语义）⇒ 文件一半读回来是 0，无任何报错。撞死项目那条"静默误读旧数据绝不可
+接受"的红线。
+修：`striped_extent_offsets(size, unit)`，步长来自文件自己的持久化几何。**4 个调用点**
+（extent.rs:85 读、extent.rs:416 条带 unlink、autumnfs.rs:566 读、autumnfs.rs:962 rm）——
+注意 fuse 侧那两个我第一遍 grep 漏了一个，是编译器逼出来的。`unit==0` 返回 Err 不除零。
+今天所有活文件 unit_bytes 都 == MAX_EXTENT ⇒ **行为等价，线上 41 GB 权重不受影响**。
+新增回归守卫 `striped_offsets_follow_the_stamp_not_the_constant`：钉住 8 MiB 盖戳的文件
+在 MAX_EXTENT 变化后仍按 8 MiB 枚举。fuse 48 单测绿 + 全 workspace release 编译绿。
+
+── 复审的其它结论（详见 feature_list F-FS-GEOM-DECLARED）──
+* 根因**不是**"每文件盖不可变戳"——那恰恰是对的，也正是 split 安全的原因。根因是
+  **几何没有权威归属地**，只能从 partition 切点反推；partition 是 manager 自主
+  split/merge/rebalance 的弹性放置单位。
+* 证伪我两条判断: (a) 建文件那次 RPC 是噪声（相对 225s 上传），**真问题是任何查询
+  失败静默降级 lanes=1** → 一次 manager 抖动产出永久单分区的 41 GB 文件；
+  (b) `unit_bytes = MAX_EXTENT` 是对的，不该动。
+* 64 MiB 阈值几乎不保护任何东西（≤8 MiB 文件只有一个 extent，必然全在 lane 0，与不
+  条带逐字节同位；元数据排序恒在 lane 0）。它唯一作用是强加"建文件时已知大小"，而这
+  正是 fuse 流式写不能条带的原因 → 删阈值则 B2 变机械工作。
+* BUG-FS-LANE-MERGE 危险度**上调**：空 lane 分区正是 auto-merge 头号候选（冷+小+零
+  QPS），危险窗口就是标准运维序列 reset→空 keyspace presplit→首次上传前的空闲期。
+* 推荐 Design B: `[0x04]stripe_geom` 声明几何 + 删 detect_stripe_lanes + 删阈值 +
+  把 presplit 切点记进**已冻结待用的** `MgrNamespace.presplit` 做通用 sacred-boundary
+  merge 守卫（manager 不需要知道 lane 是什么，分层干净，kvc/mem 白送同样保护）。
+  **不用 reset、不用 schema bump、线上 72B 权重不用重传。**
+* 明确延后: lane 轮转（缓解 lane 0 集中）—— 会强制 schema v4 + reset + 重传，先做 M1
+  测量再说。
+
+── 待用户决策 ──
+F-FS-GEOM-DECLARED 四步做几步；以及是否先跑 M1/M2 测量。
+
+============================ prior task history ============================
+Date: 2026-07-22
 TaskStatus: not_completed
 Task scope: /loop「完成 F-KEY-NS 收尾 + F-ADMIN-OP-AUTH + F-NS-PRINCIPAL-LIST」第 1 轮。
   三件里**第 3 件已完整做完并 commit**，前两件未动 → 本条目 not_completed。

@@ -80,9 +80,14 @@ async fn scan_extents(
     file_size: u64,
     stripe: Option<&StripeLayout>,
 ) -> Result<Vec<(u64, u32)>> {
-    if stripe.is_some() {
+    if let Some(s) = stripe {
         // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
-        let starts = crate::schema::striped_extent_offsets(file_size).map_err(|e| anyhow!(e))?;
+        // The stride is the file's PERSISTED unit_bytes, not MAX_EXTENT — see
+        // `striped_extent_offsets` for why reading it from the constant is a
+        // silent-zero-fill trap the day the constant is retuned.
+        let (_, unit) = s.checked().map_err(|e| anyhow!(e))?;
+        let starts =
+            crate::schema::striped_extent_offsets(file_size, unit).map_err(|e| anyhow!(e))?;
         return Ok(infer_lengths(&starts, file_size));
     }
     let prefix = key::extent_prefix(ino);
@@ -408,7 +413,10 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
         // mount retries. (Legacy path can range-scan on replay, so it stays
         // best-effort.)
         let (lanes, unit) = s.checked().map_err(|e| anyhow!("striped unlink {ino}: {e}"))?;
-        for off in crate::schema::striped_extent_offsets(size).map_err(|e| anyhow!(e))? {
+        // Stride from the PERSISTED unit_bytes: enumerating on today's
+        // MAX_EXTENT after a retune would compute the WRONG keys and leak every
+        // extent it failed to name (see `striped_extent_offsets`).
+        for off in crate::schema::striped_extent_offsets(size, unit).map_err(|e| anyhow!(e))? {
             state
                 .kv_delete_fenced(&key::extent_key_striped(ino, off, lanes, unit), lease)
                 .await

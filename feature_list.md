@@ -90,6 +90,20 @@
 - **Acceptance**: 1 有单测/日志证明每 client 用自己的 loop（或线程数不再随实例增长）；2 注入一个永久阻塞的 store，断言 watchdog 报警且 `_inflight_saves` 不永久占满；3 `close()` 后线程全部 join；5 marker 失败有 warning。
 - **Status**: `passes: false` (2026-07-22, coco 发现 + 主 agent 逐条复核；第 7 条已否决)。
   **用户定调 2026-07-22**（在 "fix BUG-KVC-TENANT" 之后说「剩下的 2 个你看着办，一般不需要」）: 本条**不做**，留在 backlog 只作记录。真要动之前，先复核它的触发条件是否已经在线上出现过。
+### F-FS-GEOM-DECLARED — stripe 几何改为「声明式」，删掉从 partition 切点反推的那条路
+- **Trigger** (2026-07-22, 用户「感觉现在的实现不大对」→ fable subagent 设计复审): 复审确认根因**不是**"每文件盖不可变戳"（那恰恰是对的，也正是 split 安全的原因），而是**几何没有权威归属地**：lane 数是个策略值，却只能在每次建大文件时从当前 partition 切点**反推**（`autumnfs.rs:825 detect_stripe_lanes`）。partition 是 manager 自主 split/merge/rebalance 的**弹性放置单位**，把持久属性从可变放置产物里推导出来，就是设计错误。已知的四个症状（merge 静默变窄 / 建文件打控制面 / fuse 流式写不能条带 / 新旧 lane 数不衔接）都是这一个错误的分身。
+  - **顺带证伪了我两条判断**: (a) "建文件时刷 region cache 是热路径开销" —— 一次 RPC 之于 225 秒的上传是噪声，**真问题是 `autumnfs.rs:823` 任何查询失败都静默降级 lanes=1**，于是一次 manager 抖动就产出一个永久单分区的 41 GB 文件，症状只有"吞吐莫名很差"；(b) "`unit_bytes = MAX_EXTENT` 粒度可疑" —— 是对的，不该动（更小则 key 数爆炸且破坏 ZC ≥64 KiB 甜点，更大则 < lanes×unit 的文件失去并行）。
+  - **64 MiB 阈值其实几乎不保护任何东西**: unit=8 MiB 意味着 ≤8 MiB 的文件只有一个 extent、必然整个落在 lane 0，与不条带**逐字节同位**；元数据（0x01/0x02）排序恒在 `[0x03][1]` 之下也永远在 lane 0。阈值唯一的真实作用是**强加了"建文件时必须已知大小"这个要求**，而这正是 fuse 流式写做不了条带的原因。删掉阈值 → 流式写问题自动消失（lane 函数是增量的，不需要知道大小）。
+- **Scope（Design B，按此顺序）**:
+  1. 几何权威归属地 = fs superblock 的新 KV key `[0x04]stripe_geom` → `{lanes, unit_bytes}`（rkyv 新 key，**不改任何既有 value 布局**，零 wire 改动，紧邻已有 fail-loud 机制的 `[0x04]schema_version`）。由 `presplit --namespace fs --lanes N` **同一条命令**写入并切边界（创建时不可能歪）。
+  2. **删掉 `detect_stripe_lanes`** —— writer 在 mount/connect 时读一次几何并缓存。顺带消灭：每次建文件的控制面往返、CLI 里硬编码的 `b"fs/"` wire 前缀（这个字节串已经变过两次），以及静默降级 lanes=1（改为 connect 期 fail-loud，和其它 connect 检查一致）。
+  3. **删掉 64 MiB 阈值**，新文件一律盖戳 → fuse B2 变成机械工作（`write_region` 加条带分支 + unit 对齐 flush 窗口，不需要知道大小）。**上线前先做 M2 测量**：8–64 MiB 文件的条带 vs 不条带 A/B（读写、P≥8）；若测得不好就退回"一个 unit"的小阈值，而不是 64 MiB。
+  4. **通用「神圣边界」merge 守卫**：把 presplit 切点记进**已经冻结且为空、等着 D8 消费者的** `MgrNamespace.presplit` 字段，merge 路径拒绝跨越已记录切点（除非 `--force`）。manager **不需要知道 lane 是什么** —— 分层干净，且顺带给 kvc/mem 的 presplit 白送同样的保护。
+- **迁移代价**: 同 commit 停机部署（例行），**不用 reset、不用 schema bump、线上 41 GB / 6-lane 的 72B 权重不用重传**（无持久布局改动）。部署后跑一条命令写入 `stripe_geom{6, 8MiB}`。写注册表字段需要一个新 admin RPC —— **v27 尚未部署**，可按 v25 那次的先例就地刷新指纹而非再 bump。
+- **明确不做（fable 建议延后，我同意）**: lane 轮转（`lane = (ino + off/unit) % lanes`）以缓解 lane 0 集中（元数据 + 所有单 extent 文件 + 所有 legacy 文件都在 lane 0）。它**会**强制 schema v4 + reset + 重传权重。当前负载（少量巨型模型；kvc/mem 在别的 namespace）对 lane 0 压力可忽略 → 先做 **M1 测量**（各 lane 分区的 size/QPS 占比），真出现热点再作为 v4 变更。
+- **Acceptance**: 新建文件的 lanes 来自 `[0x04]stripe_geom` 而非分区扫描；几何读失败 = connect 期 fail-loud（不再静默 lanes=1）；跨已记录 presplit 切点的 merge 被拒并给出原因；fuse mount 能写 >64 MiB 条带文件且 autumnfs 冷读字节精确；既有 6-lane 文件读回不变。
+- **Status**: `passes: false` (2026-07-22, fable 设计复审产出，用户待决策实施范围) — **其中 S2 那条已单独修掉并 commit**（见下）。cross-ref `BUG-FS-LANE-MERGE`（被本条第 4 步吸收）、`F-FS-WRITE-STRIPE`（被第 3 步降为机械工作）、`F-PRESPLIT-PER-NS`。
+
 ### BUG-FS-LANE-MERGE — merge 掉一条 lane 边界会静默减少新文件的条带宽度
 - **Trigger** (2026-07-22, 用户问"lane 数隐式存在 partition 切点里，再 split 不就坏了？"，追查后发现 split 安全、**merge 才是缺口**): fs 的 lane 数没有集群级配置，它有两个来源 —— ① 隐式：partition 切点（lane 边界 = `fs/` ++ `[0x03][lane]`，**恰好 5 字节**）；② 显式：每文件 `InodeMeta.stripe.lanes`（建文件时由 `autumnfs.rs:825 detect_stripe_lanes` 数①得出，之后不可变）。
   - **split 是安全的**（已验证）：`detect_stripe_lanes` 的过滤条件是 `start.len() == prefix.len() + 2`（精确 5 字节），而 lane 分区内部再分裂的 median 切点必然是真实数据 key（条带 21 B / legacy 20 B），长度上结构性排除。且 partition 数与正确性无关 —— 路由按 key range 走，已有文件一律看自己的 `meta.stripe`。
@@ -97,7 +111,7 @@
 - **今天为什么还不会发生**: `allow_mutations` 默认 false ⇒ auto-merge 只出 DryRun advisory 不真执行。要触发得手工 `autumn-op merge` 跨 lane 边界。
 - **Scope（若要修）**: 二选一 —— (a) manager 侧把 lane 边界标成"不可 merge"（merge 谓词排除 start 恰为 `{ns}/[0x03][L]` 这种 2 字节后缀的边界）；或 (b) 把 lane 数提升为 namespace 注册表里的显式字段（`MgrNamespace` 加 `stripe_lanes`），`detect_stripe_lanes` 改读注册表而不是数分区 —— 顺带让"再 presplit 成不同 lane 数"这件事有据可查。(b) 更彻底但要 wire 改动。
 - **Acceptance**: 手工 merge 掉一条 lane 边界后，新建 >64 MiB 文件仍按原 lane 数条带（或 merge 被明确拒绝并给出原因）；已有条带文件读回字节精确不受影响。
-- **Status**: `passes: false` (2026-07-22, 记录待定) — 优先级低（需手工 merge 才触发 + 非损坏），但值得记，因为症状是"吞吐莫名变慢"这种最难查的类型。cross-ref F-FS-STRIPE（git 历史）、`F-FS-WRITE-STRIPE`。
+- **Status**: `passes: false` (2026-07-22, 记录待定) — ~~优先级低~~ **2026-07-22 fable 复审上调了危险度**：持有 41 GB 模型的 lane 分区确实大到 auto-merge 够不着（远超 `MERGE_SIZE_LOW` 1 GiB），**但空的 lane 分区正是 auto-merge 的头号候选**（冷 + 小 + 零 QPS），而危险窗口恰好是标准运维序列 —— **reset → 在空 keyspace 上 presplit → 首次上传前的空闲期**。等哪天 `allow-mutations` 一开（这是既定目标，controller 已经在了），刚 presplit 好的 fs 可能一夜之间被悄悄合掉，下一次 41 GB 上传就被盖上 `lanes=1`，唯一的迹象是 CLI 少打了一行 "(striped ×N lanes)"。cross-ref F-FS-STRIPE（git 历史）、`F-FS-WRITE-STRIPE`、**`F-FS-GEOM-DECLARED` 第 4 步会吸收本条**（通用 sacred-boundary 守卫）。
 
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): the live 5-node wedge (10.4 TB leaked / 222 GB logical, 47×) was fixed two ways in `crates/stream/src/client.rs` — size-scaled append deadlines (`effective_append_timeout`) and writer-side reclaim of a tail sealed at commit=0 on roll-away (`reclaim_abandoned_empty_tail`, best-effort punch). The reclaim is CLIENT-side and best-effort: if the punch (or the authoritative `extent_info` re-fetch) fails — manager briefly unreachable, extent momentarily in a Recovery/EC ledger op — or the writer process dies right after the roll, that one sealed-empty extent still leaks forever (same unreclaimable shape: `sealed=true, sealed_length=0`, refs≥1, non-tail stream member, referenced by no VP/SST/checkpoint, invisible to accounting, skipped by GC/truncate/orphan-reconcile). A cluster already poisoned by the pre-fix bug also holds ~40k such extents that the writer-side fix will never revisit.
