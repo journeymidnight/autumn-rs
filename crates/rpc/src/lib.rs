@@ -282,14 +282,22 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // tenant-first image is fenced at the handshake instead of silently reading
     // empty). Pre-R3: MIN=MAX=26 (same-commit deploy; rkyv has no cross-version).
     (26, "c408d5e3de95883a"),
-    // v27 — F-NS-PRINCIPAL-LIST: MSG_PRINCIPAL_LIST (0x5A) + PrincipalRow{name,
-    // grants} / PrincipalListResp{code,message,principals}. Purely ADDITIVE (a
-    // new msg_type + two new structs; nothing existing changed shape), but
-    // pre-R3 rkyv has no cross-version decode, so MIN=MAX=27 and the deploy
-    // stays same-commit. Deliberately NOT a mirror of MgrTenantAccount — the
-    // row type omits `credential_hash` so an inspection RPC cannot hand out the
-    // verifier for a credential.
-    (27, "de39a3b10dfcfebd"),
+    // v27 — two same-batch additions (v27 was never deployed, so the second one
+    // REFRESHES this fingerprint in place rather than taking a v28; same
+    // sanctioned in-place refinement the v25 SD-2 addendum used):
+    //   • F-NS-PRINCIPAL-LIST: MSG_PRINCIPAL_LIST (0x5A) + PrincipalRow{name,
+    //     grants} / PrincipalListResp. Deliberately NOT a mirror of
+    //     MgrTenantAccount — the row omits `credential_hash` so an inspection
+    //     RPC cannot hand out the verifier for a credential.
+    //   • F-FS-GEOM-DECLARED step 4: MSG_NAMESPACE_SET_PRESPLIT (0x5B) +
+    //     NamespaceSetPresplitReq{admin_token,name,points} (record the split
+    //     points a presplit applied onto an EXISTING namespace row), and
+    //     MergePartitionsReq grew `force: bool` (override the sacred-boundary
+    //     refusal). The registry's `presplit` field itself needed no change —
+    //     it has been frozen and empty since SD-1 waiting for this consumer.
+    // Both purely additive, but pre-R3 rkyv has no cross-version decode, so
+    // MIN=MAX=27 and the deploy stays same-commit.
+    (27, "c8c83dc2b7bc9812"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

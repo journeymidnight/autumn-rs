@@ -242,6 +242,70 @@ fn merge_adjacent_pair_qualifying_same_ps() {
     assert!(merge_cands[0].same_ps);
 }
 
+/// F-FS-GEOM-DECLARED step 4: an otherwise-perfect merge candidate must NOT be
+/// advertised when the boundary it would erase is an operator-declared presplit
+/// point. `handle_merge_partitions` refuses it anyway; skipping here stops the
+/// auto-policy controller retrying a doomed op every tick.
+///
+/// This is the exact shape the guard exists for: an EMPTY lane partition is the
+/// IDEAL merge candidate (cold, tiny, zero QPS), and the window where fs lanes
+/// sit empty is the standard reset → presplit-on-empty → first-upload sequence.
+#[test]
+fn merge_candidate_is_skipped_at_a_declared_presplit_boundary() {
+    let mut state = MetadataState::default();
+    mk_part(&mut state, 1, b"a", b"m");
+    mk_part(&mut state, 2, b"m", b"z");
+    let now = 1_700_000_000;
+    let small = PartitionLoad {
+        part_id: 0,
+        size_bytes: 200 * 1024 * 1024,
+        req_per_sec: 100,
+        imm_full_per_sec: 0,
+        p99_us: 0,
+        ..Default::default()
+    };
+    let mut owners = HashMap::new();
+    owners.insert(1u64, 99u64);
+    owners.insert(2u64, 99u64);
+    let mk = |sacred: &[&[u8]]| {
+        let mut eng = PolicyEngine::default();
+        eng.sacred_boundaries = sacred.iter().map(|p| p.to_vec()).collect();
+        for pid in [1u64, 2u64] {
+            fill_window(
+                &mut eng,
+                pid,
+                POLICY_REQUIRED_BUCKETS,
+                small.clone(),
+                now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+            );
+        }
+        eng.compute_candidates(ComputeArgs {
+            state: &state,
+            last_op_at: &HashMap::new(),
+            region_owners: &owners,
+            now,
+        })
+    };
+
+    // The vanishing boundary is the RIGHT partition's start_key (`m`).
+    let guarded = mk(&[b"m"]);
+    assert!(
+        guarded.iter().all(|c| c.kind != POLICY_KIND_MERGE),
+        "a declared boundary must not be advertised for merge"
+    );
+
+    // A declared point that is NOT this pair's boundary must not suppress it —
+    // otherwise one presplit anywhere would freeze merging cluster-wide.
+    let unrelated = mk(&[b"zzz"]);
+    assert_eq!(
+        unrelated.iter().filter(|c| c.kind == POLICY_KIND_MERGE).count(),
+        1
+    );
+
+    // Default (nothing declared) = exactly the pre-feature behaviour.
+    assert_eq!(mk(&[]).iter().filter(|c| c.kind == POLICY_KIND_MERGE).count(), 1);
+}
+
 #[test]
 fn merge_cross_ps_marks_infeasible() {
     let mut state = MetadataState::default();

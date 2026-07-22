@@ -1120,6 +1120,40 @@ impl ClusterClient {
         Ok(resp.namespaces)
     }
 
+    /// F-FS-GEOM-DECLARED step 4: record the split points a presplit actually
+    /// applied onto an EXISTING namespace row, so `merge` refuses to undo them.
+    /// UNIONs with whatever is already recorded (never replaces). Admin-gated.
+    pub async fn namespace_set_presplit(
+        &self,
+        name: &str,
+        points: Vec<Vec<u8>>,
+        admin_token: &str,
+    ) -> Result<()> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let req = rkyv_encode(&NamespaceSetPresplitReq {
+            admin_token: admin_token.to_string(),
+            name: name.to_string(),
+            points,
+        });
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_SET_PRESPLIT,
+                req,
+                "namespace-set-presplit",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-set-presplit rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
     /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Leader-routed
     /// (rotates on NOT_LEADER), read-only. Never returns credential material.
     pub async fn principal_list(&self) -> Result<Vec<PrincipalRow>> {
@@ -3797,16 +3831,22 @@ impl ClusterClient {
     /// CLI crashes mid-call are now benign: the manager continues
     /// serving the orchestrated merge, and a 30 s `FREEZE_TTL` on the
     /// PS side is the final backstop for an orchestrator crash.
+    /// `force` overrides the sacred-boundary refusal (F-FS-GEOM-DECLARED step
+    /// 4): merging erases the boundary between the two partitions, and when
+    /// that boundary is a recorded presplit point the manager refuses unless
+    /// forced.
     pub async fn merge_partitions(
         &self,
         survivor_part_id: u64,
         victim_part_id: u64,
+        force: bool,
     ) -> std::result::Result<(), AutumnError> {
         self.flush(survivor_part_id).await?;
         self.flush(victim_part_id).await?;
         let req = rkyv_encode(&MergePartitionsReq {
             survivor_part_id,
             victim_part_id,
+            force,
         });
         let resp_bytes = self
             .mgr_call(MSG_MERGE_PARTITIONS, req)

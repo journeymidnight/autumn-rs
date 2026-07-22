@@ -260,6 +260,7 @@ impl AutumnManager {
             MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
             MSG_NAMESPACE_LIST => self.handle_namespace_list().await,
             MSG_PRINCIPAL_LIST => self.handle_principal_list().await,
+            MSG_NAMESPACE_SET_PRESPLIT => self.handle_namespace_set_presplit(payload).await,
             // ── F-FS-UNIFY M0: crash-safe fuse-fs inode allocation ──────
             MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
@@ -758,6 +759,106 @@ impl AutumnManager {
             message: String::new(),
             namespaces,
         }))
+    }
+
+    /// F-FS-GEOM-DECLARED step 4: record split points an operator's presplit
+    /// actually applied, so `merge` can refuse to undo them.
+    ///
+    /// UNIONs rather than replaces — see `NamespaceSetPresplitReq`. Admin-gated
+    /// because it changes what merge refuses; leader-gated because the registry
+    /// is leader-maintained.
+    async fn handle_namespace_set_presplit(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: NamespaceSetPresplitReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        match self.admin_token.borrow().as_ref() {
+            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
+            Some(_) => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_PRECONDITION,
+                    message: "admin token invalid".to_string(),
+                }));
+            }
+            None => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_ERROR,
+                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
+                }));
+            }
+        }
+        // Build the updated row WITHOUT touching the live map: etcd is written
+        // first and memory only commits on success, same discipline as
+        // `handle_namespace_create`. Mutating in place and then failing to
+        // persist would leave memory claiming boundaries that a leader failover
+        // (which replays from etcd) would silently forget — merge would then
+        // start allowing what this leader refuses.
+        let mut updated = match self.namespaces.borrow().get(&req.name) {
+            Some(row) => row.clone(),
+            None => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_NOT_FOUND,
+                    message: format!("namespace {} is not registered", req.name),
+                }));
+            }
+        };
+        for p in &req.points {
+            if !updated.presplit.contains(p) {
+                updated.presplit.push(p.clone());
+            }
+        }
+        // Sorted so the persisted row is stable regardless of the order the
+        // operator's cuts happened to land in.
+        updated.presplit.sort();
+        if let Some(etcd) = &self.etcd {
+            let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, rkyv_encode(&updated).to_vec())])
+                .await
+            {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.namespaces.borrow_mut().insert(req.name.clone(), updated);
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    /// F-FS-GEOM-DECLARED step 4: is `key` a boundary an operator declared via
+    /// presplit? Returns the owning namespace name if so.
+    ///
+    /// Deliberately GENERIC — the manager never learns what a "lane" is. The
+    /// rule is "an operator-declared boundary is sacred", which is why fs lane
+    /// boundaries, kvc hash buckets and mem agent cuts all get the protection
+    /// from one predicate.
+    pub(crate) fn sacred_boundary_owner(&self, key: &[u8]) -> Option<String> {
+        if key.is_empty() {
+            return None; // the keyspace start is nobody's declared cut
+        }
+        self.namespaces
+            .borrow()
+            .values()
+            .find(|ns| ns.presplit.iter().any(|p| p.as_slice() == key))
+            .map(|ns| ns.name.clone())
+    }
+
+    /// Every declared boundary in the cluster — the policy engine's input for
+    /// skipping merge candidates before they are ever advertised.
+    pub(crate) fn sacred_boundaries(&self) -> std::collections::HashSet<Vec<u8>> {
+        self.namespaces
+            .borrow()
+            .values()
+            .flat_map(|ns| ns.presplit.iter().cloned())
+            .collect()
     }
 
     /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Mirrors
@@ -3892,6 +3993,44 @@ impl AutumnManager {
         let req: MergePartitionsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F-FS-GEOM-DECLARED step 4: merging destroys the boundary between the
+        // two partitions — which is the start_key of whichever one sits on the
+        // RIGHT. If an operator declared that boundary via presplit, undoing it
+        // is almost never what they meant, and the damage is silent: for fs lane
+        // boundaries every SUBSEQUENT large file stripes narrower, with no error
+        // and no log line, so it surfaces only as "throughput got worse at some
+        // point". Refuse by default; `--force` for the deliberate case.
+        if !req.force {
+            let boundary = {
+                let s = self.store.inner.borrow();
+                let start_of = |pid: u64| -> Option<Vec<u8>> {
+                    s.partitions
+                        .get(&pid)?
+                        .rg
+                        .as_ref()
+                        .map(|r| r.start_key.clone())
+                };
+                match (start_of(req.survivor_part_id), start_of(req.victim_part_id)) {
+                    // The vanishing boundary is the greater of the two starts.
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                }
+            };
+            if let Some(owner) = boundary.as_deref().and_then(|b| self.sacred_boundary_owner(b)) {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "refusing to merge {} into {}: the boundary between them is a presplit \
+                         point declared for namespace '{}'. Merging it would silently undo that \
+                         layout (for fs lane boundaries: every later large file stripes \
+                         narrower, with no error). Re-run with --force if that is intended.",
+                        req.victim_part_id, req.survivor_part_id, owner
+                    ),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
+
         // Resolve PS endpoints and stream ids in one borrow.
         struct PartInfo {
             part_addr: String,
@@ -7022,6 +7161,82 @@ mod namespace_registry_tests {
         let r = principal_list(&m);
         assert_eq!(r.code, CODE_NOT_LEADER);
         assert!(r.principals.is_empty());
+    }
+
+    // ── F-FS-GEOM-DECLARED step 4: sacred presplit boundaries ────────────
+
+    fn set_presplit(m: &AutumnManager, name: &str, points: &[&[u8]]) -> CodeResp {
+        let req = NamespaceSetPresplitReq {
+            admin_token: ADMIN.to_string(),
+            name: name.to_string(),
+            points: points.iter().map(|p| p.to_vec()).collect(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_set_presplit(payload).await.unwrap() });
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    #[test]
+    fn set_presplit_unions_and_marks_boundaries_sacred() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        // fs lane boundaries: `fs/` ++ [0x03][lane]
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01", b"fs/\x03\x02"]).code, CODE_OK);
+        assert_eq!(
+            m.sacred_boundary_owner(b"fs/\x03\x01").as_deref(),
+            Some("fs")
+        );
+        assert!(m.sacred_boundary_owner(b"fs/\x03\x09").is_none());
+
+        // Re-running presplit at a WIDER lane count unions rather than replaces:
+        // dropping a protected boundary must be a deliberate separate act, not a
+        // side effect of re-running presplit.
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x02", b"fs/\x03\x03"]).code, CODE_OK);
+        let row = m.namespaces.borrow().get("fs").unwrap().clone();
+        assert_eq!(
+            row.presplit,
+            vec![
+                b"fs/\x03\x01".to_vec(),
+                b"fs/\x03\x02".to_vec(),
+                b"fs/\x03\x03".to_vec()
+            ],
+            "points must union AND stay sorted"
+        );
+        assert_eq!(m.sacred_boundaries().len(), 3);
+    }
+
+    #[test]
+    fn set_presplit_is_admin_and_leader_gated_and_needs_a_real_namespace() {
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        // wrong token
+        let bad = NamespaceSetPresplitReq {
+            admin_token: "wrong".to_string(),
+            name: "fs".to_string(),
+            points: vec![b"fs/\x03\x01".to_vec()],
+        };
+        let r = run(async {
+            m.handle_namespace_set_presplit(rkyv_encode(&bad)).await.unwrap()
+        });
+        assert_eq!(rkyv_decode::<CodeResp>(&r).unwrap().code, CODE_PRECONDITION);
+        assert!(m.sacred_boundaries().is_empty(), "a rejected call must record nothing");
+
+        // unknown namespace
+        assert_eq!(set_presplit(&m, "nope", &[b"nope/\x01"]).code, CODE_NOT_FOUND);
+
+        // follower
+        m.set_leader(false);
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01"]).code, CODE_NOT_LEADER);
+    }
+
+    #[test]
+    fn empty_key_is_never_a_sacred_boundary() {
+        // The keyspace start is not a declared cut — treating it as one would
+        // make the very first partition unmergeable forever.
+        let m = mgr();
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        assert_eq!(set_presplit(&m, "fs", &[b""]).code, CODE_OK);
+        assert!(m.sacred_boundary_owner(b"").is_none());
     }
 
     #[test]

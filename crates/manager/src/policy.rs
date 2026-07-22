@@ -404,6 +404,17 @@ pub struct PolicyEngine {
     /// F-REGION-REBALANCE Phase B: cluster-level rebalance advisory cooldown
     /// stamp (unix-epoch second of the last emission; 0 = never).
     pub last_rebalance_at: i64,
+    /// F-FS-GEOM-DECLARED step 4: split points an operator declared via
+    /// presplit (union over every registered namespace). A merge candidate whose
+    /// disappearing boundary is one of these is never advertised — the manager
+    /// would refuse the merge anyway, so proposing it would just make the
+    /// controller retry a doomed op forever and fill `policy-candidates` with
+    /// noise an operator can't act on.
+    ///
+    /// Lives on the engine rather than in `ComputeArgs` so the (many) existing
+    /// call sites keep working: empty set = no boundary is sacred = exactly the
+    /// pre-feature behaviour.
+    pub sacred_boundaries: std::collections::HashSet<Vec<u8>>,
 }
 
 impl PolicyEngine {
@@ -573,6 +584,20 @@ impl PolicyEngine {
             let (left_id, left_meta) = win[0];
             let (right_id, right_meta) = win[1];
             if left_meta.rg.as_ref().unwrap().end_key != right_meta.rg.as_ref().unwrap().start_key {
+                continue;
+            }
+            // F-FS-GEOM-DECLARED step 4: never advertise a merge that would
+            // erase an operator-declared presplit boundary. `handle_merge_
+            // partitions` refuses it anyway; skipping here keeps the controller
+            // from retrying a doomed op every tick. NOTE the shape this
+            // protects: an EMPTY lane partition is the ideal merge candidate
+            // (cold, tiny, zero QPS), and the window where fs lanes are empty is
+            // exactly the standard reset → presplit-on-empty → first-upload
+            // sequence.
+            if self
+                .sacred_boundaries
+                .contains(&right_meta.rg.as_ref().unwrap().start_key)
+            {
                 continue;
             }
             let lw = match self.metrics.get(&left_id) {

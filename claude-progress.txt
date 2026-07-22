@@ -1,5 +1,49 @@
 Date: 2026-07-22
 TaskStatus: completed
+Task scope: F-FS-GEOM-DECLARED（lane 重设计 Design B）**四步全部完成**。用户两个决定：
+  「全做四步」+「Fuse mount 可以不做 lanes」。条目 + BUG-FS-LANE-MERGE 已按规则 13 删除。
+
+── 第 1-3 步（前一 commit d2026c1）──
+`[0x04]stripe_geom` 成为几何的权威归属地；ungated `geom.rs` 让 autumnfs（default-features
+=false）与 mount 共用一份读写实现；`presplit --lanes N` 同命令声明+切（**先声明后切**：声明
+成功切失败=新文件条带到未分开的 lane 上，正确只是暂无并行、重跑即愈；反过来=永远静默不
+条带）；删 `detect_stripe_lanes`（顺带干掉硬编码 `b"fs/"`、每次建文件扫分区、以及查询失败
+静默降级 lanes=1）；删 64 MiB 阈值。
+
+── 用户拍板：fuse mount 不做 lanes ──
+→ 第 2/3 步的 fuse 半边取消，工作量归零。mount 从不创建条带文件因此不需读几何；对条带文件
+写/truncate 的 fail-loud 拒绝保持原样（读/rm 仍 stripe-aware 正确）。条带写=autumnfs 独有。
+F-FS-WRITE-STRIPE 标 WON'T-DO（注明：删阈值后已无技术障碍，是产品取舍不是做不了）。
+
+── 第 4 步：通用 sacred-boundary merge 守卫（本次）──
+* wire: `MSG_NAMESPACE_SET_PRESPLIT`(0x5B) + `NamespaceSetPresplitReq`；
+  `MergePartitionsReq` 加 `force: bool`。**v27 就地刷指纹**（未部署，援引 v25 SD-2 addendum
+  的 sanctioned in-place refinement 先例）→ `c8c83dc2b7bc9812`。
+* manager: `handle_namespace_set_presplit`（leader+admin gated，**UNION 不替换** —— 丢掉一条
+  受保护边界必须是刻意的独立动作，不能是重跑 presplit 的副作用；**先落 etcd 再改内存**，
+  否则持久化失败会让内存声称的边界在 leader failover 后被悄悄遗忘，merge 就开始放行本 leader
+  拒绝的事）。`sacred_boundary_owner` / `sacred_boundaries` 两个查询。
+* merge 守卫: `handle_merge_partitions` 算出消失的边界 = 两者 start_key 的较大者，命中已记录
+  切点则 CODE_PRECONDITION 拒绝（除非 force）。**manager 全程不知道 lane 是什么** —— 规则是
+  通用的"操作员声明的边界神圣"，kvc/mem presplit 白送同样保护。
+* policy: `PolicyEngine.sacred_boundaries` 字段（**不放 ComputeArgs** —— 那有十几处测试构造点，
+  加必填字段全炸；放引擎上则空集=完全等于旧行为，测试零改动）。`merge_candidates` 跳过，
+  免得 controller 每 tick 重试一个必被拒的 op。两处内部 merge 调用方（auto-policy controller
+  + dashboard 按钮）一律 `force: false` —— 它们正是最该被拦的调用方。
+* CLI: `presplit ... --admin-token[-file]` 记录**实际落地**的切点（跳过的点不是边界，记了会
+  让 merge 误拒）；记录失败只 WARN 不失败（切已经成功了，报失败会把人送进一个必然 has_overlap
+  的重跑）。`merge --force`。
+* 测试: manager 4 新（union+sorted / admin+leader+unknown-ns gate / 空 key 永不神圣 /
+  policy 跳过且不误伤无关 pair 且空集=旧行为）。rpc 40 + manager 237 + client 48 + fuse 50 全绿，
+  全 workspace release 编译绿。
+
+── 部署 ──
+不用 reset、不用 schema bump、线上 41GB/6-lane 权重不用重传。部署后跑一次
+`presplit --namespace fs --lanes 6 --admin-token-file …` 把 stripe_geom 补写上并保护边界。
+
+============================ prior task history ============================
+Date: 2026-07-22
+TaskStatus: completed
 Task scope: 用户「fable subagent 重新设计 lane 的部分，感觉现在的实现不大对」。
   直觉是对的 —— 复审挖出一条**我和 coco 都漏掉的静默数据误读陷阱**，已修并 commit；
   完整重设计（Design B）已立条目 F-FS-GEOM-DECLARED 等用户定实施范围。

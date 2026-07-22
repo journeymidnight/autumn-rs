@@ -1376,7 +1376,14 @@ impl AutumnManager {
         owners: &HashMap<u64, u64>,
         now: i64,
     ) -> Vec<PolicyCandidate> {
+        // F-FS-GEOM-DECLARED step 4: refresh the operator-declared boundaries
+        // BEFORE borrowing the engine (`sacred_boundaries()` borrows
+        // `self.namespaces`, and holding the policy borrow across it would be
+        // fine today but is exactly the kind of nested-borrow that later grows
+        // into a RefCell panic). Cheap: a handful of namespaces × a few points.
+        let sacred = self.sacred_boundaries();
         let mut p = self.policy.borrow_mut();
+        p.sacred_boundaries = sacred;
         // F210-F3: prune metrics for partitions that no longer exist
         // (post-split / merge / PS-evict) whose latest bucket has aged past
         // STALE_METRICS_AGE_SEC — else advisories fire off zombie metrics
@@ -1640,6 +1647,12 @@ impl AutumnManager {
                 let req = MergePartitionsReq {
                     survivor_part_id: cand.primary_part_id,
                     victim_part_id: cand.secondary_part_id,
+                    // NEVER force from the automatic path: the controller is
+                    // precisely the actor that must not silently erase an
+                    // operator-declared presplit boundary (F-FS-GEOM-DECLARED
+                    // step 4). `merge_candidates` already skips these, so this
+                    // is the belt to that suspenders.
+                    force: false,
                 };
                 let resp_bytes = self
                     .handle_merge_partitions(rkyv_encode(&req))
@@ -1747,6 +1760,10 @@ impl AutumnManager {
                 let req = MergePartitionsReq {
                     survivor_part_id: part_id,
                     victim_part_id,
+                    // Dashboard button: same posture as the controller. Forcing
+                    // through a declared boundary is a CLI-level deliberate act
+                    // (`autumn-op merge --force`), not a click.
+                    force: false,
                 };
                 let resp_bytes = self
                     .handle_merge_partitions(rkyv_encode(&req))

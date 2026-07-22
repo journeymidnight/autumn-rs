@@ -346,10 +346,10 @@ async fn run(args: Args) -> Result<()> {
         Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
-        Command::Presplit { namespace, tenant, rule } => {
-            cmd_presplit(&client, args.json, &namespace, &tenant, &rule).await?
+        Command::Presplit { namespace, tenant, rule, admin_token } => {
+            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, admin_token.as_deref()).await?
         }
-        Command::Merge { survivor_part_id, victim_part_id } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id).await?,
+        Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id, force).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
         Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
         Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, part_id, ratio, max_size, stream_debt, empty_only).await?,
@@ -1621,6 +1621,7 @@ async fn cmd_presplit(
     namespace: &str,
     tenant: &str,
     rule: &PresplitRule,
+    admin_token: Option<&str>,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
     // F-NS-PRINCIPAL-UNIFIED: cut prefix = `{namespace}/` (+ `{tenant}/` as an
@@ -1674,6 +1675,7 @@ async fn cmd_presplit(
     }
 
     let mut applied = 0usize;
+    let mut applied_points: Vec<Vec<u8>> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for point in &points {
         // Re-fetch the region map each iteration — a prior split created a new
@@ -1705,7 +1707,10 @@ async fn cmd_presplit(
             continue;
         };
         match client.split_at(*pid, Some(point.clone())).await {
-            Ok(_) => applied += 1,
+            Ok(_) => {
+                applied += 1;
+                applied_points.push(point.clone());
+            }
             // A data-bearing partition can't be split repeatedly until major
             // compaction clears the CoW out-of-range keys (has_overlap). The PS
             // auto-major-compacts, so a later re-run succeeds — surface the hint
@@ -1720,6 +1725,41 @@ async fn cmd_presplit(
     // means the run split nothing (wrong --hash-prefix so no owner found, authz
     // denial, stale map, …) and MUST fail loudly — else automation reads exit 0
     // and starts loading into an un-presplit keyspace.
+    // F-FS-GEOM-DECLARED step 4: record the boundaries that ACTUALLY landed, so
+    // `merge` refuses to erase them. Only the applied ones: a point that was
+    // skipped (has_overlap) is not a boundary yet, and recording it would make
+    // merge refuse a pair that shares no declared boundary at all.
+    //
+    // Best-effort by design — this runs AFTER the cuts, so failing the whole
+    // presplit here would report failure for work that already succeeded and
+    // send an operator into a re-run that now hits has_overlap on every point.
+    // A WARN is the honest outcome: the layout is correct, only its protection
+    // is missing, and re-running `namespace-set-presplit` fixes that alone.
+    if !applied_points.is_empty() {
+        match admin_token {
+            Some(tok) => {
+                if let Err(e) = client
+                    .namespace_set_presplit(namespace, applied_points.clone(), tok)
+                    .await
+                {
+                    eprintln!(
+                        "warning: split {} point(s) but failed to record them as protected \
+                         boundaries: {e}\n         the layout IS correct; merge just won't \
+                         refuse to undo it. Re-run with --admin-token to record.",
+                        applied_points.len()
+                    );
+                }
+            }
+            None => eprintln!(
+                "warning: split {} point(s) but did NOT record them as protected boundaries \
+                 (no --admin-token). merge (including the auto-policy controller) can then \
+                 silently erase them — for fs lanes that means later large files stripe \
+                 narrower with no error. Pass --admin-token to protect them.",
+                applied_points.len()
+            ),
+        }
+    }
+
     let ok = applied > 0;
     if json {
         println!(
@@ -1756,14 +1796,14 @@ async fn cmd_presplit(
     Ok(())
 }
 
-async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, victim_part_id: u64) -> Result<()> {
+async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, victim_part_id: u64, force: bool) -> Result<()> {
     eprintln!(
         "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
          before continuing. The CLI will FLUSH both, then issue the manager merge. \
          The survivor's PS picks up the wider range on the next region_sync (~2 s)."
     );
     client
-        .merge_partitions(survivor_part_id, victim_part_id)
+        .merge_partitions(survivor_part_id, victim_part_id, force)
         .await
         .map_err(|e| anyhow!("merge: {e}"))?;
     if json {

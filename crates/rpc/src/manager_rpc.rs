@@ -1001,6 +1001,13 @@ pub struct MultiModifyMergeResp {
 pub struct MergePartitionsReq {
     pub survivor_part_id: u64,
     pub victim_part_id: u64,
+    /// F-FS-GEOM-DECLARED step 4: override the sacred-boundary refusal. Merging
+    /// two partitions destroys the boundary between them; when that boundary is
+    /// a recorded presplit point, the merge silently undoes an operator's
+    /// declared layout (for fs lane boundaries the symptom is that every
+    /// SUBSEQUENT large file stripes narrower, with no error anywhere). Refused
+    /// by default, allowed with this flag.
+    pub force: bool,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -2037,6 +2044,12 @@ pub const MSG_NAMESPACE_LIST: u8 = 0x59;
 // write) or an etcd key scan (names only — the value is rkyv, so grants are
 // invisible) as the only options.
 pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
+// admin → manager (leader-gated): record the split points a presplit actually
+// applied, so merge can refuse to undo them. F-FS-GEOM-DECLARED step 4 — the
+// namespace registry's `presplit` field was frozen and empty since SD-1 waiting
+// for exactly this consumer. `namespace-create --presplit` can only declare
+// points for a namespace being CREATED; presplit runs against existing ones.
+pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 
 /// `AutoPolicySetReq.op` values.
 pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
@@ -2250,6 +2263,21 @@ pub struct NamespaceListResp {
     pub code: u8,
     pub message: String,
     pub namespaces: Vec<MgrNamespace>,
+}
+
+/// `MSG_NAMESPACE_SET_PRESPLIT` — record split points that a presplit actually
+/// applied, onto an EXISTING namespace registry row. Leader-only, admin-token
+/// gated (it changes what merge will refuse). Points are UNIONed with whatever
+/// the row already carries, never replaced: widening a namespace's presplit
+/// (e.g. fs 6 lanes → 24) is a superset, and dropping a sacred boundary must be
+/// a deliberate separate act, not a side effect of re-running presplit.
+/// Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceSetPresplitReq {
+    pub admin_token: String,
+    pub name: String,
+    /// Raw split keys (absolute, as passed to `split --at`).
+    pub points: Vec<Vec<u8>>,
 }
 
 /// One row of `MSG_PRINCIPAL_LIST`. Deliberately NOT a `MgrTenantAccount`:

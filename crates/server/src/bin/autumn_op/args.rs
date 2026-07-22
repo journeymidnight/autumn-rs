@@ -300,10 +300,20 @@ pub(crate) enum Command {
         namespace: String,
         tenant: String,
         rule: PresplitRule,
+        /// F-FS-GEOM-DECLARED step 4: admin token used to RECORD the applied cut
+        /// points as protected boundaries (`--admin-token` / `--admin-token-file`).
+        /// Optional — without it the cuts still land, but merge won't refuse to
+        /// undo them (a warning says so).
+        admin_token: Option<String>,
     },
     Merge {
         survivor_part_id: u64,
         victim_part_id: u64,
+        /// F-FS-GEOM-DECLARED step 4: merge THROUGH a declared presplit
+        /// boundary. Refused without this — erasing an operator-declared
+        /// boundary is silent (for fs lanes: later large files stripe narrower,
+        /// no error anywhere).
+        force: bool,
     },
     /// F-REGION-REBALANCE: actively re-spread partitions across the PS fleet.
     Rebalance {
@@ -1038,6 +1048,7 @@ pub(crate) fn parse() -> Args {
             let mut lanes: Option<usize> = None;
             let mut hash_prefix: Option<String> = None;
             let mut agents: Option<Vec<String>> = None;
+            let mut presplit_admin_token: Option<String> = None;
             let num = |v: &str, what: &str| -> u64 {
                 v.trim().parse().unwrap_or_else(|_| {
                     eprintln!("presplit: {what} must be a number, got {v:?}");
@@ -1055,6 +1066,8 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                     }
                     "--lanes" => { i += 1; lanes = Some(num(val(&raw, i), "--lanes") as usize); i += 1; }
+                    "--admin-token" => { i += 1; presplit_admin_token = Some(val(&raw, i).to_owned()); i += 1; }
+                    "--admin-token-file" => { i += 1; presplit_admin_token = Some(read_secret_file(val(&raw, i))); i += 1; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
                     "--agents" => {
                         i += 1;
@@ -1137,7 +1150,7 @@ pub(crate) fn parse() -> Args {
                     std::process::exit(1);
                 }
             };
-            Command::Presplit { namespace, tenant, rule }
+            Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token }
         }
         "merge" => {
             if i + 1 >= raw.len() {
@@ -1147,6 +1160,7 @@ pub(crate) fn parse() -> Args {
             Command::Merge {
                 survivor_part_id: val(&raw, i).parse().expect("SURVIVOR_PART_ID must be a number"),
                 victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
+                force: raw.iter().any(|a| a == "--force"),
             }
         }
         "rebalance" => {
