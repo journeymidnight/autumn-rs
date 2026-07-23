@@ -4813,6 +4813,54 @@ fn authz_now_secs() -> u64 {
 ///
 /// Synchronous (no I/O): `*principal` is mutated only here, before any await in
 /// the calling dispatch fn, so the `&mut` borrow never spans an await.
+/// F-ADMIN-OP-AUTH (PS slice): gate a cluster-mutating PS op (split /
+/// maintenance) on the admin token AND strip the token prefix so the handler
+/// decodes the bare request. Returns `Some(reject frame)` to refuse, `None` to
+/// allow — and on allow, `payload` has had any admin prefix removed.
+///
+/// OPT-IN, exactly like the manager slice: when the manager configured no admin
+/// token, `snap.admin_token` is empty and this is a no-op, so a token-less
+/// cluster (dev/test/chaos) runs split/gc/compact/flush BARE. When a token IS
+/// present the payload MUST carry a matching prefix — from `autumn-op` (operator)
+/// OR from the MANAGER itself (its controller drives split + gc/compact and merge
+/// drives flush; those manager→PS calls prefix `self.admin_token`).
+fn admin_ps_gate_and_strip(
+    msg_type: u8,
+    payload: &mut Bytes,
+    req_id: u32,
+    authz: &crate::authz::AuthzState,
+) -> Option<Bytes> {
+    if !partition_rpc::is_admin_ps_msg(msg_type) {
+        return None;
+    }
+    let snap = authz.snapshot();
+    if snap.admin_token.is_empty() {
+        return None; // unconfigured → run bare (opt-in)
+    }
+    let reject = |m: &str| -> Option<Bytes> {
+        Some(
+            Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, m),
+            )
+            .encode(),
+        )
+    };
+    let Some((got, rest)) = autumn_rpc::manager_rpc::strip_admin_token(payload) else {
+        return reject(
+            "admin op requires an admin token (malformed or missing prefix) — pass \
+             --admin-token-file to autumn-op",
+        );
+    };
+    if !crate::authz::ct_eq_bytes(got, &snap.admin_token) {
+        return reject("admin token invalid");
+    }
+    // Verified — hand the handler the bare request.
+    *payload = payload.slice_ref(rest);
+    None
+}
+
 fn authz_gate(
     msg_type: u8,
     payload: &Bytes,
@@ -4941,11 +4989,17 @@ fn push_one_frame_to_inflight(
     use futures::FutureExt;
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
-    let payload = frame.payload;
+    let mut payload = frame.payload;
     // F-AUTHZ-1: AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
+        inflight.push(async move { (reply, None) }.boxed_local());
+        return;
+    }
+    // F-ADMIN-OP-AUTH (PS slice): gate + strip the admin prefix off split /
+    // maintenance BEFORE part-id extraction (the prefix would misroute otherwise).
+    if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
         inflight.push(async move { (reply, None) }.boxed_local());
         return;
     }
@@ -5075,10 +5129,14 @@ async fn d1_fast_path_round_trip(
 ) -> (Bytes, Option<Bytes>) {
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
-    let payload = frame.payload;
+    let mut payload = frame.payload;
     // F-AUTHZ-1: AUTH_HELLO bind / per-request gate (synchronous, before the
     // first await). A handled frame returns its reply directly.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
+        return (reply, None);
+    }
+    // F-ADMIN-OP-AUTH (PS slice): admin gate + strip before part-id extraction.
+    if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
         return (reply, None);
     }
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
@@ -12719,6 +12777,7 @@ mod authz_enforcement_tests {
             }],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "cluster-test".to_string(),
@@ -12748,6 +12807,7 @@ mod authz_enforcement_tests {
             }],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: vec![b"fs/".to_vec(), b"mem/".to_vec()],
+            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "cluster-test".to_string(),

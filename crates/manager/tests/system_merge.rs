@@ -1358,7 +1358,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         // now sends MSG_MERGE_PARTITIONS to the manager, which handles
         // freeze + capture + txn atomically.
         cluster
-            .merge_partitions(s1, v1)
+            .merge_partitions(s1, v1, false)
             .await
             .expect("merge_partitions OK");
         compio::time::sleep(Duration::from_millis(3000)).await;

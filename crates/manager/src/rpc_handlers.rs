@@ -482,6 +482,14 @@ impl AutumnManager {
             token_ttl_secs: self.token_ttl_secs.get(),
             clock_skew_secs: self.clock_skew_secs.get(),
             cluster_id: self.cluster_id.borrow().clone(),
+            // F-ADMIN-OP-AUTH (PS slice): hand the PS the admin secret so it can
+            // gate split/maintenance. Empty when unconfigured → PS runs them bare.
+            admin_token: self
+                .admin_token
+                .borrow()
+                .as_ref()
+                .map(|t| t.as_bytes().to_vec())
+                .unwrap_or_default(),
         }))
     }
 

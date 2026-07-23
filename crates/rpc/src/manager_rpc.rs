@@ -2433,6 +2433,14 @@ pub struct GetAuthzConfigResp {
     pub token_ttl_secs: u64,
     /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
     pub clock_skew_secs: u64,
+    /// F-ADMIN-OP-AUTH (PS slice): the manager's shared admin secret, so the PS
+    /// can gate cluster-mutating PS ops (`is_admin_ps_msg`: split + maintenance =
+    /// gc/compact/forcegc/flush). EMPTY when the manager configured no admin token
+    /// → the PS runs those ops BARE (opt-in, same posture as the manager slice;
+    /// dev/test/chaos unaffected). Travels manager→PS in the clear, which the
+    /// trust model allows (internal network, no MITM — same as the cap-token
+    /// signing material). Additive rkyv field.
+    pub admin_token: Vec<u8>,
     /// This cluster's `cluster_id` = the token `aud` the manager mints with. The
     /// PS enforces `token.aud == cluster_id` at AUTH_HELLO so a token minted for
     /// another cluster (that happens to share signing keys) can't be replayed

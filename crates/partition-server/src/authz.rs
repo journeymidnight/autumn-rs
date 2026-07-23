@@ -51,6 +51,11 @@ pub struct AuthzInner {
     /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
     /// admits a put-class write only if its key `starts_with` one of these.
     pub namespaces: Vec<Vec<u8>>,
+    /// F-ADMIN-OP-AUTH (PS slice): the manager's admin secret, for gating
+    /// `is_admin_ps_msg` (split / maintenance). EMPTY = unconfigured → those ops
+    /// run bare (opt-in). Carried in the snapshot so the gate reads one
+    /// consistent object.
+    pub admin_token: Vec<u8>,
 }
 
 impl AuthzInner {
@@ -62,6 +67,7 @@ impl AuthzInner {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
         }
     }
 }
@@ -151,6 +157,7 @@ impl AuthzState {
             cluster_id: resp.cluster_id.clone(),
             // F-KEY-NS D7: the registered-namespace list — Layer-A's data source.
             namespaces: resp.namespaces.clone(),
+            admin_token: resp.admin_token.clone(),
         });
         // F-KEY-NS D7: Layer-A is on iff the registry is non-empty (independent
         // of the signing key). Compute BEFORE the swap so the flag matches the
@@ -295,6 +302,22 @@ fn check_range(
 /// auth is a separate concern) and `AUTH_HELLO` (handled by the connection
 /// loop). Adding a new keyed read/write RPC without an arm here silently lets
 /// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
+/// F-ADMIN-OP-AUTH (PS slice): constant-time byte equality for the admin token.
+/// The token is a fixed-width hex secret, so a length mismatch is not sensitive;
+/// equal lengths are compared with an XOR-accumulate that never short-circuits,
+/// so a matching prefix can't be timed out. (The PS has no sha2/subtle dep, so
+/// this is a small local impl rather than the manager's hash-then-compare.)
+pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn authz_check(
     msg_type: u8,
     payload: &[u8],
@@ -463,6 +486,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
         }
     }
 
@@ -579,6 +603,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
         };
         let now = 1_000_000;
         let mk = |aud: &str| CapClaims {
@@ -605,6 +630,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
         };
         assert!(verify_auth_hello(&token, &inner2, now).is_err());
         // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
@@ -623,10 +649,36 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
         };
         let p = acme(); // kid 1
         assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner_disabled, 999_000).is_some());
         assert!(check_range(b"mem/acme/", Some(&p), &inner_disabled, 999_000).is_some());
+    }
+
+    #[test]
+    fn ct_eq_bytes_matches_only_exact() {
+        assert!(ct_eq_bytes(b"deadbeef", b"deadbeef"));
+        assert!(!ct_eq_bytes(b"deadbeef", b"deadbee0"));
+        assert!(!ct_eq_bytes(b"deadbeef", b"deadbee")); // length differs
+        assert!(ct_eq_bytes(b"", b""));
+    }
+
+    #[test]
+    fn install_caches_admin_token_from_config() {
+        // F-ADMIN-OP-AUTH (PS slice): the PS learns the admin secret from the
+        // manager's GetAuthzConfigResp and stores it in the snapshot.
+        let st = AuthzState::new();
+        // Absent by default (opt-in: the gate runs bare).
+        assert!(st.snapshot().admin_token.is_empty());
+        st.install(&GetAuthzConfigResp {
+            admin_token: b"the-secret".to_vec(),
+            ..Default::default()
+        });
+        assert_eq!(st.snapshot().admin_token, b"the-secret");
+        // An empty token in a later poll clears it (manager dropped its token).
+        st.install(&GetAuthzConfigResp::default());
+        assert!(st.snapshot().admin_token.is_empty());
     }
 
     #[test]
@@ -652,6 +704,7 @@ mod tests {
             ],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
+            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 45,
             cluster_id: "cluster-abc".to_string(),
@@ -772,6 +825,7 @@ mod tests {
             public_keys: vec![],
             protected_prefixes: vec![],
             namespaces: vec![b"kvc/".to_vec()],
+            admin_token: Vec::new(),
             token_ttl_secs: 0,
             clock_skew_secs: 0,
             cluster_id: String::new(),
@@ -787,6 +841,7 @@ mod tests {
             public_keys: vec![],
             protected_prefixes: vec![],
             namespaces: vec![],
+            admin_token: Vec::new(),
             token_ttl_secs: 0,
             clock_skew_secs: 0,
             cluster_id: String::new(),

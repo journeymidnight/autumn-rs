@@ -295,15 +295,18 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //     MergePartitionsReq grew `force: bool` (override the sacred-boundary
     //     refusal). The registry's `presplit` field itself needed no change —
     //     it has been frozen and empty since SD-1 waiting for this consumer.
-    //   • F-ADMIN-OP-AUTH: is_admin_mgr_msg + the admin-token payload codec
-    //     (prefix_admin_token / strip_admin_token) landed in manager_rpc.rs.
-    //     These are pure fns + consts — NO rkyv struct changed shape, and the
-    //     payload prefix is an out-of-band convention the manager strips before
-    //     decoding — but the hashed schema SOURCE changed, so the fingerprint
-    //     refreshes (still an in-place v27 refinement: v27 is undeployed).
-    // All purely additive, but pre-R3 rkyv has no cross-version decode, so
-    // MIN=MAX=27 and the deploy stays same-commit.
-    (27, "4edb18488d4502a4"),
+    //   • F-ADMIN-OP-AUTH manager slice: is_admin_mgr_msg + the admin-token
+    //     payload codec (prefix_admin_token / strip_admin_token) in
+    //     manager_rpc.rs (pure fns + consts, no rkyv struct changed shape).
+    //   • F-ADMIN-OP-AUTH PS slice: GetAuthzConfigResp grew `admin_token:
+    //     Vec<u8>` (additive) + is_admin_ps_msg in partition_rpc.rs — so the PS
+    //     can gate split/maintenance on the manager's admin secret.
+    // The payload prefix is an out-of-band convention the manager/PS strip
+    // before decoding; the ONLY rkyv struct change is the additive
+    // GetAuthzConfigResp field. All within undeployed v27 → fingerprint
+    // refreshes in place. Pre-R3 rkyv has no cross-version decode, so MIN=MAX=27
+    // and the deploy stays same-commit.
+    (27, "26b331782ad033b2"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

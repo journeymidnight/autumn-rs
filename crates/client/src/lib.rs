@@ -2027,6 +2027,17 @@ impl ClusterClient {
         msg_type: u8,
         payload: Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
+        // F-ADMIN-OP-AUTH (PS slice): split / maintenance (gc/compact/forcegc/
+        // flush) are admin-gated at the PS when a token is configured — prefix
+        // it once here (before the retry loop; the loop re-clones this payload).
+        let payload = if autumn_rpc::partition_rpc::is_admin_ps_msg(msg_type) {
+            match self.admin_token.borrow().as_ref() {
+                Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok, &payload),
+                None => payload,
+            }
+        } else {
+            payload
+        };
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {

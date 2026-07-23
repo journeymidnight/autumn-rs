@@ -1025,6 +1025,21 @@ impl AutumnManager {
         *self.admin_token.borrow_mut() = Some(token);
     }
 
+    /// F-ADMIN-OP-AUTH (PS slice): prefix the manager's admin token onto a
+    /// payload bound for a PS `is_admin_ps_msg` (split / maintenance). The
+    /// manager DRIVES those ops itself — the auto-policy controller's split +
+    /// gc/compact and merge's flush are manager→PS calls — so with the PS gate
+    /// on (the manager configured a token, which the PS learns via
+    /// GetAuthzConfigResp), the manager must authenticate exactly like an
+    /// operator's autumn-op. No token configured → unchanged payload (the PS
+    /// gate is off too, so it runs bare).
+    fn admin_prefix_ps(&self, payload: bytes::Bytes) -> bytes::Bytes {
+        match self.admin_token.borrow().as_ref() {
+            Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok.as_bytes(), &payload),
+            None => payload,
+        }
+    }
+
     /// F-AUTHZ-1: set the protected (default-DENY) key prefixes
     /// (`--auth-protected-prefix`, repeatable). Each is normalized to end `/`.
     pub fn set_protected_prefixes(&self, mut prefixes: Vec<Vec<u8>>) {
@@ -1673,6 +1688,9 @@ impl AutumnManager {
                 gc_empty_only: false,
             },
         );
+        // F-ADMIN-OP-AUTH (PS slice): authenticate the manager's own maintenance
+        // call so the PS gate (when a token is configured) admits it.
+        let payload = self.admin_prefix_ps(payload);
         let resp_bytes = self
             .conn_pool
             .call_timeout(
@@ -2067,6 +2085,9 @@ impl AutumnManager {
                 // point an intra-lane cut is exactly what's wanted.
                 at_key,
             });
+        // F-ADMIN-OP-AUTH (PS slice): the controller's auto-split is a manager→PS
+        // MSG_SPLIT_PART, gated by the PS — prefix the manager's admin token.
+        let payload = self.admin_prefix_ps(payload);
         // 60 s — split has to flush memtable + commit_length × 3 + a
         // manager round-trip. PS-side flush can take a few seconds
         // under contention, but anything > 60 s is a real wedge worth
@@ -2120,8 +2141,14 @@ impl AutumnManager {
             .ok_or_else(|| anyhow::anyhow!("no address for victim {victim_id}"))?;
 
         // FLUSH both partitions.
+        // F-ADMIN-OP-AUTH (PS slice): merge's flush is a manager→PS MSG_MAINTENANCE;
+        // capture the admin token so the closure can prefix it (the closure moves
+        // `pool`, not `self`).
+        let admin_tok: Option<Vec<u8>> =
+            self.admin_token.borrow().as_ref().map(|t| t.as_bytes().to_vec());
         let flush = |addr: String, pid: u64| {
             let pool = self.conn_pool.clone();
+            let admin_tok = admin_tok.clone();
             async move {
                 let payload = autumn_rpc::partition_rpc::rkyv_encode(
                     &autumn_rpc::partition_rpc::MaintenanceReq {
@@ -2135,6 +2162,10 @@ impl AutumnManager {
                         gc_empty_only: false,
                     },
                 );
+                let payload = match &admin_tok {
+                    Some(t) => autumn_rpc::manager_rpc::prefix_admin_token(t, &payload),
+                    None => payload,
+                };
                 // 60 s — MAINTENANCE_FLUSH rotates active + drains the
                 // imm queue (each imm is up to FLUSH_MEM_BYTES = 256 MiB).
                 pool.call_timeout(

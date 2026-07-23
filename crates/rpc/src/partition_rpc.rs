@@ -41,6 +41,19 @@ pub const MSG_SPLIT_PART: u8 = 0x45;
 pub const MSG_MAINTENANCE: u8 = 0x47;
 pub const MSG_GET_DISCARDS: u8 = 0x48;
 
+/// F-ADMIN-OP-AUTH (PS slice): the cluster-MUTATING PS ops gated on the admin
+/// token — split and every maintenance op (compact / auto-gc / force-gc /
+/// flush, all under `MSG_MAINTENANCE`). Token carried as the SAME payload prefix
+/// the manager slice uses (`manager_rpc::{prefix,strip}_admin_token`). The data
+/// plane (PUT/GET/DELETE/HEAD/RANGE/*_ZC) is never gated here — that is Layer-A/B.
+/// Senders that must prefix: `autumn-op` (operator) AND the MANAGER itself (its
+/// auto-policy controller drives split + gc/compact, and merge drives flush, all
+/// as manager→PS calls).
+#[inline]
+pub fn is_admin_ps_msg(msg_type: u8) -> bool {
+    matches!(msg_type, MSG_SPLIT_PART | MSG_MAINTENANCE)
+}
+
 // F129/F186 — server-side multipart upload was REMOVED in F186.
 // Wire constants 0x49-0x4C remain RESERVED to prevent accidental re-use
 // while old binaries with handlers may still be in flight in production
