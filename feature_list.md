@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-07-22
+**Last updated:** 2026-07-23
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,28 +13,6 @@
 ---
 
 ## Active
-
-### F-ADMIN-OP-AUTH — 控制面变更 op 用 admin token 鉴权（Option A 落地 + 扩到 split/gc）
-- **Trigger** (2026-07-19, 用户实测: authz 开着时 autumn-op 仍能**无障碍**执行所有变更命令): `admin_auth_design.md` 的 Option A（共享 admin secret 只 gate 破坏性、manager-only、非 owner-fenced 的控制面 op）**只设计未实现**。现状代码只有 4 个 handler（tenant-create/delete、namespace-create/delete，F-KEY-NS 加的 `req.admin_token` 字段 + `ct_eq_secret`）校验 admin token；fence-node / remove-node / force-ec / create-stream / bump-version / merge / split / gc / compact / forcegc 全裸奔。`--admin-token-file` 基础设施已就位（manager `set_admin_token`，cluster.sh AUTUMN_AUTH 已生成分发 `$DATA_ROOT/authz/admin.token`）。**用户决定 (2026-07-19): gate 全部"会改集群"的变更 op**（Option A 的 10 个 + split/merge/gc/compact/forcegc）；只读（info/df/list-nodes/recovery-stats/audit）留开。
-- **Scope**: 用设计文档推荐的 **payload 前缀 token**（长度前缀 `[u32 len][token][原payload]`，零 wire-struct 改动，一处 codec）。
-  - **rpc**: `autumn_rpc::is_admin_mgr_msg(u8)` = { MSG_FENCE_NODE 0x3F / REMOVE_NODE 0x42 / SET_NODE_MAINTENANCE 0x40 / CLEAR_NODE_OVERRIDE 0x41 / BUMP_CLUSTER_VERSION 0x4B / UPDATE_STREAM_EC 0x32 / FORCE_EC_CONVERT 0x39 / CREATE_STREAM 0x23 / UPSERT_PARTITION 0x2D / REGISTER_NODE 0x22 / MERGE_PARTITIONS 0x37 }；`is_admin_ps_msg(u8)` = { MSG_SPLIT_PART / MSG_MAINTENANCE }（PS 空间,与 manager 空间分开判）。+ prefix/strip codec helper。
-  - **client** (`ClusterClient`): `admin_token: RefCell<Option<Vec<u8>>>` + `set_admin_token`；`mgr_call`/`mgr_call_leader`/`mgr_call_retry` 在 `is_admin_mgr_msg && token` 时前缀；`ps_call` 在 `is_admin_ps_msg && token` 时前缀。
-  - **manager** (`rpc_handlers::dispatch` @199): `is_admin_mgr_msg(mt) && self.admin_token.is_some()` → 切前缀 `ct_eq_secret` 比对，不符回 CODE_PRECONDITION，符则把剩余 payload 交原 handler。
-  - **PS**: PS 需持有 admin token —— `GetAuthzConfigResp` 加 `admin_token` 字段（**wire 改动 → fingerprint bump**），PS `authz_config_poll_loop` 缓存进 `AuthzState`；PS frame dispatch 在 `is_admin_ps_msg` 时同样切前缀校验（authz gate 旁）。
-  - **autumn-op**: 全局 `--admin-token-file`（复用 `read_secret_file`）→ 一 connect 就 `client.set_admin_token`（只读命令不受影响,server 只查 admin msg）。
-  - **cluster.sh**: admin.token 已生成分发；把打印的 `AO=(...)` 提示带上 `--admin-token-file $DATA_ROOT/authz/admin.token`。
-  - **opt-in**: manager 没配 admin token → 全跳过（dev/test/bench/单测零影响）。namespace/tenant 已有的 `req.admin_token` 字段校验保留（belt-and-suspenders,或后续统一到前缀）。
-  - **落地顺序（安全,分两片）**: ① manager 片（上面 manager+client+autumn-op,覆盖杀节点/force-ec/建stream/版本/merge,manager 已有 token,零 wire 改动）先做先验；② PS 片（split/gc/compact/forcegc + GetAuthzConfigResp 加字段 + PS gate + fingerprint bump）。
-- **Acceptance**: authz 开时,autumn-op fence/remove/split/gc/force-ec/merge/... **不带** `--admin-token-file` → 拒（CODE_PRECONDITION,清晰错误）；**带正确** token → 成功；**带错** token → 拒；只读 info/df/list-nodes **不带** token 仍工作。活集群: fence 一个节点不带 token 失败、带 token 成功;裸 restart（粘性 authz）后仍强制。
-- **Status**: `passes: false` (2026-07-19；**manager 片已实现 + 活集群验证 2026-07-22**，PS 片仍 open) — cross-ref `docs/admin_auth_design.md` Option A。威胁模型=可信内网防"流氓/测试客户端跑破坏性命令",不防 MITM(不上 TLS)。
-  **manager 片 DONE**（零 wire-struct 改动，payload 前缀 token `[u32 len][token][payload]`）: `autumn_rpc::is_admin_mgr_msg` + `prefix_admin_token`/`strip_admin_token` codec（一处）；client `admin_token` 字段 + `set_admin_token` + `mgr_call` 一处前缀（leader/retry 都汇流此处，恰好一次）；manager `dispatch` 顶部 strip+`ct_eq_secret`，**opt-in**（无 token 裸跑 → dev/test/bench/chaos 零影响；有 token 则 mutating op 必须带前缀）；autumn-op 全局 `--admin-token[-file]` → connect 后 `set_admin_token`。cluster.sh 无条件配 token（承接 BUG-BENCH-NS 那批）+ bootstrap 调用带 token。
-  **网关集合**（偏离设计文档一处）: gate = FENCE/REMOVE/SET_MAINTENANCE/CLEAR_OVERRIDE/BUMP_VERSION/UPDATE_STREAM_EC/FORCE_EC_CONVERT/CREATE_STREAM/UPSERT_PARTITION/MERGE。**MSG_REGISTER_NODE 故意不 gate** —— EN 进程自注册用它、无 token 概念，gate 了会 wedge bring-up（活集群实测撞出，已修）。auto-policy controller 的 merge 走进程内 handler 不过 dispatch，天然不受影响（正好只拦外部 merge）。
-  **活集群验证**（3 节点，authz-OFF，manager 有 admin token）: 读 op（list-nodes）不带 token 正常；force-ec-convert / fence-node 不带 token → `FailedPrecondition` 拒；带**错** token → `admin token invalid` 拒；带**对** token → 过 gate（fence 真的 fence 了节点 3，force-ec 走到 handler 报 `not found`）。
-  **测试**: rpc codec 4（前缀往返/空值/畸形前缀不当裸跑/集合正确含 REGISTER_NODE 排除）+ manager gate 3（无 token 裸跑、缺/错/对 token、读 op 不受影响）。WIRE v27 就地刷指纹 `4edb18488d4502a4`（纯 fn/const，无 rkyv 变化；v27 未部署）。
-  **PS 片 DONE + 活集群验证 (2026-07-23)**: `GetAuthzConfigResp` 加 `admin_token: Vec<u8>`（additive，manager 从 self.admin_token 填，空=未配）；PS `AuthzInner.admin_token` 缓存（install 时装）；`partition_rpc::is_admin_ps_msg` = {SPLIT_PART, MAINTENANCE(gc/compact/forcegc/flush)}；PS 新增 `admin_ps_gate_and_strip`（两个 dispatch 点，authz_gate 之后、extract_part_id **之前** strip，否则前缀会 misroute）+ `ct_eq_bytes`（PS 无 sha2/subtle 依赖，定长 XOR）。opt-in：PS `snap.admin_token` 空 → 裸跑。
-  **关键：3 个 manager→PS 发送方也前缀了自己的 token**（否则我刚默认开的 balanced 会断）—— manager `admin_prefix_ps` 用在 auto-policy 的 split(lib.rs:~2078) + gc/compact(~1680) + merge 的 flush(~2142，闭包捕获 token)；client `call_ps_for_part` 入口对 is_admin_ps_msg 前缀（split/gc/compact/flush 共同 chokepoint）。
-  **活集群验证**（3 节点，cluster.sh 总配 admin token → PS gate ON）: autumn-op gc/compact 不带/带错 token → `admin token invalid` 拒，带对 → 过；**split（client→PS）带 token 成功**；**merge 成功 = client→PS flush + manager→PS flush 两条都过 gate**（不带 token 的 merge 在 flush 阶段就 `admin token invalid`——正是最担心的 manager 自驱路径）。opt-in 裸跑由 `system_merge` 的 6 个 #[ignore] 系统测试（无 token 内存 manager 跑真实 split/merge/auto-dispatch）+ 244 manager/204 PS lib 测试覆盖。WIRE v27 就地刷 `26b331782ad033b2`。
-  **威胁模型**: admin token 明文经 GetAuthzConfigResp 到 PS——可信内网无 MITM（同 cap-token 签名材料）。
 
 ### BUG-KVC-LOAD-ATOMIC — external KV load 是 fail-open：部分 layer 加载失败仍继续推理
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:773`；**已复核代码为真**): scheduler 见 `__present__` marker 后就告诉 vLLM 这些 token 不用再 prefill。worker 侧 `start_load_kv()` 拿 `oks = load_layers(...)` 后是**边检查边注入**：`if not ok: log.warning(); continue`。于是任一 layer 缺失时，前面的 layer 已写进 paged cache、失败的 layer 保持**未初始化**内容，请求进入"部分新 KV + 部分旧/未初始化 KV"的混合态且无法回滚，继续推理 → 静默错误输出。**这不是假想**：BUG-KVC-TENANT 那次线上事故的表现就正是 `external KV load miss after positive presence`（layer 0..3）+ garbage output。
