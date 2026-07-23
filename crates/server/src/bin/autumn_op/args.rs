@@ -1754,6 +1754,33 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
     }
 }
 
+/// F-KEY-NS UX-fix (M4): the FULL declared boundary grid to RECORD as sacred,
+/// which for `FsLanes` is EVERY lane boundary (`lanes-1`), not just the
+/// `parts-1` we physically cut this run.
+///
+/// Why record more than we cut: a `--lanes 24 --parts 6` run creates 6
+/// partitions but the LOGICAL grid is 24 lanes. A partition owning lanes [0,4)
+/// holds no cut point today, so a later auto-split of it would fall back to a
+/// PS median — cutting INSIDE a lane (usually inside one inode's extents),
+/// breaking the whole-lane-ownership invariant. Recording all 24-lane
+/// boundaries makes auto-split SNAP to the next lane boundary instead, and makes
+/// the merge guard protect the lane grid an operator actually declared. This is
+/// the same "record INTENT, not just applied" philosophy `cmd_presplit` already
+/// applies to the parts grid. For non-fs rules the record grid == the cut grid.
+pub(crate) fn presplit_record_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
+    match rule {
+        PresplitRule::FsLanes { lanes, .. } => {
+            if *lanes < 2 {
+                return Ok(vec![]);
+            }
+            // ALL lane boundaries `[0x03][lane]` for lane = 1..lanes.
+            Ok((1..*lanes).map(|lane| vec![0x03u8, lane]).collect())
+        }
+        // Every other rule cuts exactly its declared grid, so record == cut.
+        other => presplit_suffixes(other),
+    }
+}
+
 fn parse_byte_size(s: &str) -> Result<u64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -2197,6 +2224,29 @@ mod tests {
 #[cfg(test)]
 mod lane_parts_tests {
     use super::{presplit_suffixes, PresplitRule};
+
+    #[test]
+    fn record_grid_is_the_full_lane_grid_not_just_the_cut_grid() {
+        use super::{presplit_record_suffixes, presplit_suffixes, PresplitRule};
+        // 24 lanes over 6 parts: we CUT 5 points (the parts grid) …
+        let cut = presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 6 }).unwrap();
+        assert_eq!(cut.len(), 5);
+        // … but RECORD all 23 lane boundaries (M4): a partition owning lanes
+        // [0,4) then holds a declared point so auto-split snaps to a lane
+        // boundary instead of a median inside a lane.
+        let rec = presplit_record_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 6 }).unwrap();
+        assert_eq!(rec.len(), 23);
+        assert_eq!(rec[0], vec![0x03, 1]);
+        assert_eq!(rec[22], vec![0x03, 23]);
+        // The cut grid is a subset of the record grid.
+        for c in &cut {
+            assert!(rec.contains(c), "cut point {c:?} must be in the recorded grid");
+        }
+        // Non-fs rules record exactly what they cut.
+        let hexc = presplit_suffixes(&PresplitRule::Hex { count: 4 }).unwrap();
+        let hexr = presplit_record_suffixes(&PresplitRule::Hex { count: 4 }).unwrap();
+        assert_eq!(hexc, hexr);
+    }
 
     #[test]
     fn hex_rule_cuts_relative_to_the_namespace() {

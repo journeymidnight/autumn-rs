@@ -813,18 +813,23 @@ impl AutumnManager {
         }
         let req: NamespaceSetPresplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        match self.admin_token.borrow().as_ref() {
-            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => {
+        // F-KEY-NS UX-fix (M2): recording sacred boundaries is OPT-IN on the
+        // admin token, mirroring `is_admin_mgr_msg` — NOT fail-closed like the
+        // tenant/namespace-create family. Rationale: this op only *records* a
+        // layout an operator already declared (it grants no capability and
+        // exposes no secret), and the WHOLE POINT is the merge guard + auto-split
+        // snap. Fail-closing it meant a token-less cluster (dev / bench / chaos /
+        // memory-mode) could NEVER arm the protection, while its auto-policy
+        // controller could still merge boundaries away. So:
+        //   • manager has NO token  → accept bare (record the boundaries);
+        //   • manager HAS a token   → the request MUST carry a matching one.
+        // This makes "merge is safe" unconditional instead of contingent on a
+        // two-position secret ritual.
+        if let Some(cfg) = self.admin_token.borrow().as_ref() {
+            if !crate::authz::ct_eq_secret(cfg, &req.admin_token) {
                 return Ok(rkyv_encode(&CodeResp {
                     code: CODE_PRECONDITION,
                     message: "admin token invalid".to_string(),
-                }));
-            }
-            None => {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_ERROR,
-                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
                 }));
             }
         }
@@ -7364,6 +7369,29 @@ mod namespace_registry_tests {
         // follower
         m.set_leader(false);
         assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01"]).code, CODE_NOT_LEADER);
+    }
+
+    #[test]
+    fn set_presplit_is_opt_in_bare_on_a_tokenless_manager() {
+        // F-KEY-NS UX-fix (M2): recording is OPT-IN like is_admin_mgr_msg — a
+        // manager with NO admin token accepts a bare (empty-token) call and
+        // records, so a token-less cluster (dev/bench/chaos) can ARM the merge
+        // guard + auto-split snap. Fail-closing it (the old behaviour) made the
+        // whole protection impossible to enable there.
+        let m = AutumnManager::new(); // deliberately NO set_admin_token
+        run(async { m.seed_builtin_namespaces().await.unwrap() });
+        let bare = NamespaceSetPresplitReq {
+            admin_token: String::new(),
+            name: "fs".to_string(),
+            points: vec![b"fs/\x03\x06".to_vec(), b"fs/\x03\x0c".to_vec()],
+        };
+        let r = run(async {
+            m.handle_namespace_set_presplit(rkyv_encode(&bare)).await.unwrap()
+        });
+        assert_eq!(rkyv_decode::<CodeResp>(&r).unwrap().code, CODE_OK);
+        assert_eq!(m.sacred_boundaries().len(), 2, "bare call must record on a tokenless manager");
+        // And the guard is now live on this tokenless cluster.
+        assert!(m.sacred_boundary_owner(b"fs/\x03\x06").is_some());
     }
 
     /// Put a partition with an explicit range into the store so the split-snap

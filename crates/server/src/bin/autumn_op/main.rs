@@ -354,7 +354,12 @@ async fn run(args: Args) -> Result<()> {
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
         Command::Presplit { namespace, tenant, rule, admin_token } => {
-            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, admin_token.as_deref()).await?
+            // F-KEY-NS UX-fix (F1): the recording token falls back to the GLOBAL
+            // `--admin-token[-file]` (the position `usage()` documents) so an
+            // operator no longer has to pass the same secret twice. The
+            // per-command spelling stays as an override.
+            let record_token = admin_token.as_deref().or(args.admin_token.as_deref());
+            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token).await?
         }
         Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id, force).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
@@ -1682,6 +1687,7 @@ async fn cmd_presplit(
     }
 
     let mut applied = 0usize;
+    let mut already = 0usize; // boundaries a prior run / presplit already put in place
     let mut skipped: Vec<String> = Vec::new();
     for point in &points {
         // Re-fetch the region map each iteration — a prior split created a new
@@ -1708,10 +1714,20 @@ async fn cmd_presplit(
             point.as_slice() >= start.as_slice()
                 && (end.is_empty() || point.as_slice() < end.as_slice())
         });
-        let Some((pid, _, _, _)) = owner else {
+        let Some((pid, _, start, _)) = owner else {
             skipped.push(format!("0x{} (no owning partition)", hex_encode(point)));
             continue;
         };
+        // F-KEY-NS UX-fix (S2): a point that IS a partition's start_key is
+        // already a boundary (a prior presplit, or this being a re-run). That is
+        // success, not a skip — the old code let split_at reject it ("at or below
+        // partition start"), leaving `applied` low and (if all points were
+        // already cut) bailing with a misleading "0 applied, check --hash-prefix"
+        // exactly when the operator followed the "re-run to record" advice.
+        if start.as_slice() == point.as_slice() {
+            already += 1;
+            continue;
+        }
         match client.split_at(*pid, Some(point.clone())).await {
             Ok(_) => applied += 1,
             // A data-bearing partition can't be split repeatedly until major
@@ -1740,38 +1756,42 @@ async fn cmd_presplit(
     // points instead of choosing a median inside a lane.)
     //
     // Best-effort by design — this runs AFTER the cuts, so failing the whole
-    // presplit here would report failure for work that already succeeded and
-    // send an operator into a re-run that now hits has_overlap on every point.
-    // A WARN is the honest outcome: the layout is correct, only its protection
-    // is missing, and re-running `namespace-set-presplit` fixes that alone.
-    let record_points = points.clone();
+    // presplit here would report failure for work that already succeeded.
+    //
+    // F-KEY-NS UX-fix (M2): recording is now OPT-IN server-side (bare when the
+    // manager has no admin token), so we ALWAYS attempt it — a token-less
+    // cluster records the boundaries with an empty token, arming the merge guard
+    // + auto-split snap unconditionally. `record_token = ""` when the operator
+    // passed no token; if the manager DID configure one, its SPLIT_PART gate
+    // would already have rejected every cut above (applied == 0 → we bailed),
+    // so an empty token only ever reaches a token-less manager.
+    let record_token = admin_token.unwrap_or("");
+    // F-KEY-NS UX-fix (M4): record the FULL declared grid (for FsLanes, every
+    // lane boundary), not just the `points` we cut — so auto-split snaps to a
+    // lane boundary instead of a median-inside-a-lane when `parts < lanes`.
+    let record_points: Vec<Vec<u8>> = args::presplit_record_suffixes(rule)?
+        .into_iter()
+        .map(|s| {
+            let mut k = prefix.clone();
+            k.extend_from_slice(&s);
+            k
+        })
+        .collect();
     if !record_points.is_empty() {
-        match admin_token {
-            Some(tok) => {
-                if let Err(e) = client
-                    .namespace_set_presplit(namespace, record_points.clone(), tok)
-                    .await
-                {
-                    eprintln!(
-                        "warning: split {} point(s) but failed to record {} declared \
-                         boundaries: {e}\n         the layout IS correct; merge just won't \
-                         refuse to undo it, and auto-split won't snap to it. Re-run with \
-                         --admin-token to record.",
-                        applied, record_points.len()
-                    );
-                }
-            }
-            None => eprintln!(
-                "warning: split {applied} point(s) but did NOT record the {} declared boundaries \
-                 (no --admin-token). Without the record, merge (including the auto-policy \
-                 controller) can silently erase them, AND auto-split falls back to cutting \
-                 inside a lane instead of snapping to them. Pass --admin-token.",
+        if let Err(e) = client
+            .namespace_set_presplit(namespace, record_points.clone(), record_token)
+            .await
+        {
+            eprintln!(
+                "warning: split {applied} point(s) but failed to record {} declared \
+                 boundaries: {e}\n         the layout IS correct; merge just won't refuse to \
+                 undo it, and auto-split won't snap to it. Re-run `presplit` to record.",
                 record_points.len()
-            ),
+            );
         }
     }
 
-    let ok = applied > 0;
+    let ok = applied > 0 || already > 0;
     if json {
         println!(
             "{}",
@@ -1781,11 +1801,16 @@ async fn cmd_presplit(
                 "tenant": tenant,
                 "points": points.len(),
                 "applied": applied,
+                "already_in_place": already,
                 "skipped": skipped,
             }))?
         );
     } else {
-        println!("presplit {tenant}/{namespace}: {applied}/{} cut points applied", points.len());
+        println!(
+            "presplit {tenant}/{namespace}: {applied}/{} cut points applied{}",
+            points.len(),
+            if already > 0 { format!(" ({already} boundaries already in place)") } else { String::new() }
+        );
         for s in &skipped {
             println!("  skipped: {s}");
         }
@@ -1799,8 +1824,9 @@ async fn cmd_presplit(
     }
     if !ok {
         bail!(
-            "presplit {tenant}/{namespace}: 0/{} cut points applied — nothing was split. \
-             Check --hash-prefix (a wrong prefix owns no partition), authz, and the partition map.",
+            "presplit {tenant}/{namespace}: 0/{} cut points applied and none already in place — \
+             nothing was split. Check --hash-prefix (a wrong prefix owns no partition), authz, \
+             and the partition map.",
             points.len()
         );
     }

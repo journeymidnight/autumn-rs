@@ -1168,12 +1168,12 @@ $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions
-$AO bootstrap --replication 3+0 --presplit 8:hexstring
-$AO split PART_ID
-$AO merge SURVIVOR_PART_ID VICTIM_PART_ID
+$AO bootstrap --replication 3+0          # --presplit RETIRED; use `presplit --namespace <NS>` after
+$AO split PART_ID                         # or: split PART --namespace <ns> --tenant <t> --at <suffix>
+$AO merge SURVIVOR_PART_ID VICTIM_PART_ID # add --force to cross a declared presplit boundary
 $AO rebalance [MAX_MOVES]                 # re-spread partitions across PS (F-REGION-REBALANCE)
 $AO compact PART_ID
-$AO gc PART_ID --ratio 0.4
+$AO gc --ratio 0.4 PART_ID                # NB: gc flags come BEFORE the partition id
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
 
 # Cluster lifecycle (subshells so cwd stays at the repo root for ./cluster.sh)
@@ -1196,22 +1196,25 @@ point on the CLI. The user-facing form speaks **namespace + tenant**, never raw
 prefix bytes (the partition layer stays namespace-agnostic; the CLI assembles
 the key and the wire carries only raw bytes):
 
+The key order is **NAMESPACE-FIRST**: `{namespace}/{tenant}/{suffix}` (Option 3;
+the older tenant-first `{tenant}/{namespace}/` was retired 2026-07-19).
+
 ```bash
-# Cut exactly at the pair boundary "acme/kvc/" — splits tenant `acme`'s kvc
-# namespace (and everything sorting >= it) off into a new partition. Empty/omitted
-# suffix = the boundary itself. TENANT-FIRST: {tenant}/{namespace}/.
+# Cut exactly at the pair boundary "kvc/acme/" — splits `acme`'s kvc keyspace
+# (and everything sorting >= it) off into a new partition. Empty/omitted
+# suffix = the boundary itself.
 $AO split PART_ID --namespace kvc --tenant acme --at ""
 
-# Cut inside a pair at a text suffix -> key = "acme/kvc/" ++ "vllm/v1/80".
+# Cut inside a pair at a text suffix -> key = "kvc/acme/" ++ "vllm/v1/80".
 $AO split PART_ID --namespace kvc --tenant acme --at vllm/v1/80
 
-# Binary suffix (e.g. an fs inode prefix) via hex -> key = "t1/fs/" ++ 0x0103ff.
+# Binary suffix (e.g. an fs extent/inode prefix) via hex -> key = "fs/" ++ 0x0103ff.
 $AO split PART_ID --namespace fs --at-hex 0103ff
 
 # ADMIN escape hatch only (documented admin-only, like D7 raw()): a whole raw
 # key, no namespace/tenant assembly. Operators should NOT hand-build prefixes.
-# (hex below = "acme/kvc/".)
-$AO split PART_ID --at-raw-hex 61636d652f6b76632f
+# (hex below = "kvc/acme/" — namespace-first.)
+$AO split PART_ID --at-raw-hex 6b76632f61636d652f
 ```
 
 Rules & behavior:
@@ -1243,13 +1246,13 @@ $AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-ze
 
 ## Namespace-aware presplit — `autumn-op presplit` (F-PRESPLIT-NS-RULES)
 
-A raw-byte uniform split (`AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring`, `fuse_split_ranges`)
-is **namespace-blind**: after F-KEY-NS every real key sits in the `{tenant}/fs/…`
-/ `{tenant}/kvc/…` / `{tenant}/mem/…` byte sliver, so uniform splitting collapses
-everything into one or two partitions (live: 19 GB fs on a single partition, 30
-empty). `presplit` splits a `{tenant}/{namespace}/` keyspace along the
-namespace's **natural high-entropy dimension** (built on the `split --at`
-primitive):
+A raw-byte uniform split is **namespace-blind**: after F-KEY-NS every real key
+sits in the `fs/…` / `kvc/…` / `mem/…` byte sliver (namespace-first, Option 3),
+so uniform splitting over the whole 0x00..0xff space collapses everything into
+one or two partitions (live: 19 GB fs on a single partition, 30 empty). That is
+why `bootstrap --presplit` was retired. `presplit` instead splits a
+`{namespace}/{tenant}/` keyspace along the namespace's **natural high-entropy
+dimension** (built on the `split --at` primitive):
 
 ```bash
 # fs — split by INODE (the fs data key is [0x03][ino BE][off BE]). Give the exact
@@ -1259,20 +1262,23 @@ $AO presplit --namespace fs --count 8            # → inodes 1..7
 
 # kvc — split by CONTENT HASH (sha256 hexdigest). --hash-prefix is REQUIRED: it is
 # the RELATIVE prefix from the namespace root down to just before the hash hex, and
-# it is per-MODEL, so there is no default. The vLLM connector stores
-#   {tenant}/kvc/{model}/vllm/v1/{hash}/{layer}
+# it is per-MODEL, so there is no default. The vLLM connector stores (Option 3, no
+# tenant segment):
+#   kvc/{model}/vllm/v1/{hash}/{layer}
 # → the hash is under `{model}/vllm/v1/`, NOT directly under `vllm/`. Find the exact
-# {model} fingerprint from a live key: `autumn-client ls --prefix "<tenant>/kvc/"`.
+# {model} fingerprint from a live key: `autumn-client --namespace kvc ls`.
 $AO presplit --namespace kvc --tenant default --count 8 --hash-prefix "qwen3-8b_a1b2/vllm/v1/"
 # sglang keys are {model}/{pool}/{hash} → pass "<model>/<pool>/".
 
 # mem — split by AGENT.
 $AO presplit --namespace mem --tenant default --agents alice,bob,carol
 
-# fs --lanes N — F-FS-STRIPE: split fs into N LANE partitions (cut at [0x03][1..N-1],
-# the STATIC ino-independent lane boundaries). This is the setup step for striping a
-# SINGLE large file across N partitions/PSs. Distinct from --fs-inos/--count (by INODE).
-$AO presplit --namespace fs --lanes 4
+# fs --lanes N [--parts P] — split fs for large-file striping. LANES is the key
+# layout (24 by default, a permanent constant), PARTS is how many partitions to
+# create (must divide lanes; omit = one per lane). See the "fs stripe geometry:
+# lanes vs partitions" section above for the full model + the sacred-boundary
+# merge guard. Pass --admin-token[-file] so the boundaries are RECORDED (protected).
+$AO presplit --namespace fs --lanes 24 --parts 6 --admin-token-file "$ADMIN_TOKEN"
 ```
 
 ### F-FS-STRIPE — stripe one large file across lanes (break the single-partition ceiling)
@@ -1282,28 +1288,35 @@ log_stream. So a single file's write/read is capped by one stream's bandwidth
 (measured ~220 MB/s single-connection, ~350 MB/s single-partition on fast NVMe;
 disk/CPU are NOT the limit). To go faster, STRIPE the file across N lane partitions:
 
-```bash
-# 1. Presplit fs into N lanes (ideally N = PS count so lanes land on distinct PSs);
-#    the manager spreads the new lane partitions across PSs. Do this on the EMPTY fs.
-$AO presplit --namespace fs --lanes 4
-$AO info | grep part          # → 4 fs partitions, ideally one per PS
+**Geometry is DECLARED, not auto-detected** (F-FS-GEOM-DECLARED — see the "fs
+stripe geometry" section above for the full model). `presplit --lanes N` writes
+the fs-wide `[0x04]stripe_geom`; every new file stamps that geometry into its own
+`InodeMeta.stripe` at create (immutable), whether or not the partitions were cut
+yet. There is no 64 MiB threshold and no per-upload flag — striping is on for the
+whole fs once declared (default 24 lanes even with no presplit; declare `--lanes 1`
+to turn it off).
 
-# 2. Just upload. autumnfs AUTO-DETECTS the lane count from the presplit fs (counts
-#    the lane partitions — a FIXED cluster property, no per-upload flag). A file
-#    > 64 MiB gets its extents round-robined across the N lanes: extent e → lane e%N,
-#    key [0x03][lane][ino][off]; autumnfs's concurrent batch_put fans them out →
-#    parallel across the lane PSs. Small files (≤ 64 MiB) and a non-lane-presplit fs
-#    stay single-partition.
+```bash
+# 1. Declare + cut on the EMPTY fs (before ingest). --parts spreads the lanes over
+#    P partitions (must divide lanes). --admin-token records the boundaries so the
+#    merge guard protects them.
+$AO presplit --namespace fs --lanes 24 --parts 6 --admin-token-file "$ADMIN_TOKEN"
+$AO info | grep part          # → 6 fs lane partitions, spread across PSs
+
+# 2. Just upload. Every file's extents round-robin across the declared lanes:
+#    extent e's offset o → lane (o/unit)%lanes, key [0x03][lane][ino][off];
+#    autumnfs's concurrent batch_put fans them out → parallel across the lane PSs.
 autumnfs --manager <mgr> put ./checkpoint.safetensors /ckpt
-autumnfs --manager <mgr> get /ckpt ./out   # reader auto-detects stripe
+autumnfs --manager <mgr> get /ckpt ./out   # reader reads the file's own stamp
 ```
 
-- The stripe layout (`lanes`, `unit`) is stamped in the file's `InodeMeta.stripe` at
-  create, so the reader computes the lane keys (no range scan) and old / non-striped
-  files stay correct with **no migration**. `unit = MAX_EXTENT` (8 MiB) in v1 = each
-  extent its own lane (max spread). MAX_EXTENT sweep (3-disk rig, EN-CPU-bound):
-  striped-write peaks near 4 MiB (~340 MB/s) and DECLINES for bigger extents
-  (8→330, 16→298, 32→291); don't go above 8 MiB.
+- The reader consults ONLY the file's stamped `InodeMeta.stripe` (never the current
+  cluster shape), so old / non-striped files stay correct with **no migration**, and
+  a later re-split at a lane boundary gives an existing file parallelism
+  retroactively. `unit = MAX_EXTENT` (8 MiB) in v1 = each extent its own lane (max
+  spread). MAX_EXTENT sweep (3-disk rig, EN-CPU-bound): striped-write peaks near
+  4 MiB (~340 MB/s) and DECLINES for bigger extents (8→330, 16→298, 32→291); don't
+  go above 8 MiB.
 - **Scaling is bounded by whichever saturates first**: the lane PSs, the ENs' data
   plane, or the autumnfs client pipeline (window=8 + sync read barrier — a single
   file may not fully drive many lanes; running few parallel uploads or a deeper
