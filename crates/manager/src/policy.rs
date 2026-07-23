@@ -478,9 +478,8 @@ impl PolicyEngine {
     fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
-        // F-POLICY-SIZE-EST-LIVE: one sealed-sum snapshot per pass, applied
-        // to every bucket in the window (sealed lengths move slowly relative
-        // to the 5-minute window; the PS-reported components stay per-bucket).
+        // F-POLICY-SIZE-EST-LIVE: one sealed-sum snapshot per pass (sealed
+        // lengths move slowly; the PS-reported QPS/imm-full stay per-bucket).
         let sealed = partition_sealed_sums(args.state);
 
         for (&part_id, window) in self.metrics.iter() {
@@ -494,34 +493,37 @@ impl PolicyEngine {
             }
 
             let sealed_sum = sealed.get(&part_id).copied().unwrap_or(0);
-            // ALL of the last required_buckets must show a trigger.
-            // F-POLICY-SIZE-EST-LIVE: both size comparisons consume
-            // `effective_size_bytes` (max of LSM-resident and est_live) so a
-            // VP-heavy partition whose bytes live in log_stream can reach
-            // the size triggers at all (pre-this, `size_bytes` alone made
-            // SPLIT_SIZE_HARD ≈ 3 TB of real data on a VP workload).
-            let all_match = bs.iter().all(|(_, l)| {
-                let eff = effective_size_bytes(sealed_sum, l);
-                eff > cfg.split_size_hard
-                    || (l.req_per_sec > cfg.split_qps_high && eff > cfg.split_size_min)
-                    || l.imm_full_per_sec > cfg.split_immfull_high
-            });
-            if !all_match {
-                continue;
-            }
-
             let recent = &bs[0].1;
             let recent_eff = effective_size_bytes(sealed_sum, recent);
-            // Reason carries BOTH metrics so a DryRun `policy-candidates`
-            // round can calibrate the thresholds under the new口径.
-            let reason = if recent_eff > cfg.split_size_hard {
+            // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (design (b)): the SIZE dimension
+            // is NOT debounced. `required_buckets` debounce exists to filter
+            // QPS SPIKES; size (sealed bytes) is a slow, near-monotone quantity,
+            // so demanding "all N buckets big" is the wrong abstraction — a
+            // partition that IS big should split now, thrash guarded by
+            // `split_cooldown_sec`, not wait out a window. So:
+            //   • size-hard   → evaluated ONCE on the current effective size;
+            //   • QPS / imm-full (spiky) → keep the all-N-buckets debounce;
+            //   • the size-MIN gate on the QPS trigger also reads CURRENT size
+            //     (it's a size floor, same slow-signal argument).
+            let size_hard = recent_eff > cfg.split_size_hard;
+            let qps_sustained = bs.iter().all(|(_, l)| l.req_per_sec > cfg.split_qps_high);
+            let qps_trigger = qps_sustained && recent_eff > cfg.split_size_min;
+            let immfull_sustained =
+                bs.iter().all(|(_, l)| l.imm_full_per_sec > cfg.split_immfull_high);
+            if !(size_hard || qps_trigger || immfull_sustained) {
+                continue;
+            }
+            // Reason names the trigger that actually fired (checked in the same
+            // priority order size-hard → imm-full → QPS) and carries both size
+            // metrics so a DryRun `policy-candidates` round can calibrate.
+            let reason = if size_hard {
                 format!(
                     "size>{} (est_live {} GiB, lsm {} MiB)",
                     cfg.split_size_hard,
                     est_live_bytes(sealed_sum, recent) / GIB,
                     recent.size_bytes / (1024 * 1024),
                 )
-            } else if recent.imm_full_per_sec > cfg.split_immfull_high {
+            } else if immfull_sustained {
                 format!("imm_full_per_sec>{} sustained", cfg.split_immfull_high)
             } else {
                 format!(
@@ -624,18 +626,26 @@ impl PolicyEngine {
 
             let sealed_l = sealed.get(&left_id).copied().unwrap_or(0);
             let sealed_r = sealed.get(&right_id).copied().unwrap_or(0);
-            // F-POLICY-SIZE-EST-LIVE: per-side `max(size_bytes, est_live)`
-            // must be small — either metric reading "big" vetoes the pair
-            // (old predicate AND new predicate; strict non-regression for
-            // small-value loads, direction fix for VP loads).
-            let all_qualify = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
-                effective_size_bytes(sealed_l, lb) < cfg.merge_size_low
-                    && effective_size_bytes(sealed_r, rb) < cfg.merge_size_low
-                    && (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
+            let recent_l = &lbs[0].1;
+            let recent_r = &rbs[0].1;
+            let eff_l = effective_size_bytes(sealed_l, recent_l);
+            let eff_r = effective_size_bytes(sealed_r, recent_r);
+            // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (design (b)): symmetric to split —
+            // the SIZE condition (both sides small) is evaluated ONCE on the
+            // CURRENT effective size (slow signal, no debounce), while the COLD
+            // condition (summed QPS low + no imm-full pressure — spiky) keeps the
+            // all-N-buckets debounce so a brief lull can't trigger a merge.
+            // `effective_size_bytes` uses `max(size_bytes, est_live)`, so either
+            // metric reading "big" vetoes the pair (VP-load direction fix +
+            // strict non-regression for small-value loads).
+            let size_small =
+                eff_l < cfg.merge_size_low && eff_r < cfg.merge_size_low;
+            let cold_sustained = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
+                (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
                     && lb.imm_full_per_sec == 0
                     && rb.imm_full_per_sec == 0
             });
-            if !all_qualify {
+            if !(size_small && cold_sustained) {
                 continue;
             }
 
@@ -646,10 +656,6 @@ impl PolicyEngine {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
             };
-            let recent_l = &lbs[0].1;
-            let recent_r = &rbs[0].1;
-            let eff_l = effective_size_bytes(sealed_l, recent_l);
-            let eff_r = effective_size_bytes(sealed_r, recent_r);
             out.push(PolicyCandidate {
                 kind: POLICY_KIND_MERGE,
                 primary_part_id: left_id, // survivor candidate = left

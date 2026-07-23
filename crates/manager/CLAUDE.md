@@ -242,6 +242,26 @@ like ~700 MB. F-POLICY-SIZE-EST-LIVE therefore feeds every size predicate
 where `est_live = Σsealed + open_tail − gc_debt − open_tail_dead`. Do NOT
 reason about split/merge off raw `size_bytes` — it under-counts VP workloads.
 
+**F-POLICY-SIZE-EST-LIVE-FOLLOWUP (design (b), 2026-07-23): the SIZE dimension is
+NOT debounced.** The `required_buckets` sliding-window "all N buckets must trigger"
+rule exists to filter QPS SPIKES. Size (sealed bytes) is a slow, near-monotone
+signal, so demanding N sustained buckets is the wrong abstraction — a partition
+that IS big should split now (thrash-guarded by `split_cooldown_sec`), and a pair
+that IS small should merge now (guarded by `merge_cooldown_sec`). So
+`split_candidates` / `merge_candidates` evaluate the size condition ONCE on the
+CURRENT effective size (`sealed_sum` snapshot × the newest bucket), while the QPS
+and imm-full dimensions KEEP the all-N-buckets debounce. This closes coco's P1
+(the pre-(b) code applied one `sealed_sum` snapshot to every bucket, so `size`
+effectively bypassed the debounce anyway — inconsistently, only via the snapshot
+trick). The alternative (a) — historise sealed into a per-partition ring so size
+debounces "properly" — was rejected: it makes a slow signal masquerade as a spiky
+one. Tests: `policy_tests::split_size_fires_on_current_bucket_not_debounced` (size
+fires on the current bucket alone) + `split_qps_still_debounced_a_single_spike_no_trigger`
+(QPS spike still filtered). **This makes size-based auto-split/merge SAFE TO ARM**
+(the reason it was gated behind `allow-mutations=0` is gone); an operator can now
+activate a split-bearing policy without a sealed step (big flush / big GC)
+triggering a one-tick over-reaction.
+
 ## cluster-df amplification = physical / logical FOOTPRINT (F-DF-OPENTAIL)
 
 `ClusterCapSnapshot.logical_open_tail` (Σ PS-reported `open_tail_bytes` across

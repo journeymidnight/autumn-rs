@@ -14,7 +14,7 @@ use crate::policy::{
     GC_COOLDOWN_SEC, GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW,
     MINOR_COMPACT_COOLDOWN_SEC, MINOR_COMPACT_PENDING_HIGH, POLICY_BUCKET_SEC,
     POLICY_REQUIRED_BUCKETS, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH, SPLIT_QPS_HIGH,
-    SPLIT_SIZE_HARD,
+    SPLIT_SIZE_HARD, SPLIT_SIZE_MIN,
 };
 
 /// F202 compatibility: the old `POLICY_KIND_COMPACT` constant maps to
@@ -167,6 +167,77 @@ fn split_cooldown_blocks() {
         now,
     });
     assert!(out.is_empty());
+}
+
+#[test]
+fn split_size_fires_on_current_bucket_not_debounced() {
+    // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (b): the SIZE dimension is NOT debounced.
+    // A full window whose EARLIER buckets are small but whose CURRENT bucket is
+    // over size-hard MUST split now — the old "all N buckets big" rule made a
+    // just-grown partition wait out the whole window.
+    let state = MetadataState::default();
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let small = PartitionLoad { part_id: 7, size_bytes: GIB, ..Default::default() };
+    let big = PartitionLoad {
+        part_id: 7,
+        size_bytes: SPLIT_SIZE_HARD + GIB,
+        ..Default::default()
+    };
+    // N-1 small buckets, then the newest bucket big (push order = oldest→newest;
+    // `recent` takes from the tail, so the LAST pushed is bucket[0]).
+    let w = eng.metrics.entry(7).or_default();
+    for i in 0..POLICY_REQUIRED_BUCKETS - 1 {
+        w.push(base + i as i64 * POLICY_BUCKET_SEC, small.clone());
+    }
+    w.push(
+        base + (POLICY_REQUIRED_BUCKETS - 1) as i64 * POLICY_BUCKET_SEC,
+        big,
+    );
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out.len(), 1, "current-bucket size-hard must trigger split");
+    assert_eq!(out[0].kind, POLICY_KIND_SPLIT);
+}
+
+#[test]
+fn split_qps_still_debounced_a_single_spike_no_trigger() {
+    // The QPS dimension KEEPS the debounce: one hot bucket among N calm ones
+    // must NOT split (that's exactly the spike (b) still filters). Size is over
+    // size-min so only the QPS debounce can gate it.
+    let state = MetadataState::default();
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let calm = PartitionLoad {
+        part_id: 7,
+        size_bytes: SPLIT_SIZE_MIN + GIB,
+        req_per_sec: 0,
+        ..Default::default()
+    };
+    let spike = PartitionLoad {
+        part_id: 7,
+        size_bytes: SPLIT_SIZE_MIN + GIB,
+        req_per_sec: SPLIT_QPS_HIGH + 1000,
+        ..Default::default()
+    };
+    let w = eng.metrics.entry(7).or_default();
+    for i in 0..POLICY_REQUIRED_BUCKETS - 1 {
+        w.push(base + i as i64 * POLICY_BUCKET_SEC, calm.clone());
+    }
+    w.push(base + (POLICY_REQUIRED_BUCKETS - 1) as i64 * POLICY_BUCKET_SEC, spike);
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert!(out.is_empty(), "a single QPS spike must NOT trigger split");
 }
 
 #[test]
