@@ -43,6 +43,7 @@ fn usage() -> ! {
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (F-PRESPLIT-NS-RULES; presplit EMPTY keyspace before loading)");
+    eprintln!("           fs: --lanes <N> [--parts <P>] [--admin-token-file F to record] [--force to narrow declared lanes]");
     eprintln!("      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>");
     eprintln!("           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)");
     eprintln!("      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)");
@@ -314,6 +315,12 @@ pub(crate) enum Command {
         /// Optional — without it the cuts still land, but merge won't refuse to
         /// undo them (a warning says so).
         admin_token: Option<String>,
+        /// F-KEY-NS UX-fix (M5): required to NARROW an fs's declared stripe
+        /// geometry (`--lanes` smaller than the current declaration). Without it,
+        /// a redeclare that lowers the lane count is refused — a stray
+        /// `presplit --namespace fs --lanes 2` would otherwise silently halve
+        /// every future file's stripe width fs-wide.
+        force: bool,
     },
     Merge {
         survivor_part_id: u64,
@@ -1098,6 +1105,7 @@ pub(crate) fn parse() -> Args {
             let mut hash_prefix: Option<String> = None;
             let mut agents: Option<Vec<String>> = None;
             let mut presplit_admin_token: Option<String> = None;
+            let mut presplit_force = false;
             let num = |v: &str, what: &str| -> u64 {
                 v.trim().parse().unwrap_or_else(|_| {
                     eprintln!("presplit: {what} must be a number, got {v:?}");
@@ -1119,6 +1127,7 @@ pub(crate) fn parse() -> Args {
                     "--admin-token" => { i += 1; presplit_admin_token = Some(val(&raw, i).to_owned()); i += 1; }
                     "--admin-token-file" => { i += 1; presplit_admin_token = Some(read_secret_file(val(&raw, i))); i += 1; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
+                    "--force" => { i += 1; presplit_force = true; }
                     "--agents" => {
                         i += 1;
                         agents = Some(
@@ -1211,7 +1220,7 @@ pub(crate) fn parse() -> Args {
                     PresplitRule::Hex { count: n }
                 }
             };
-            Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token }
+            Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token, force: presplit_force }
         }
         "merge" => {
             if i + 1 >= raw.len() {

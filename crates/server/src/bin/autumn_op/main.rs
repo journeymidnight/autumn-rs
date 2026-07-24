@@ -353,13 +353,13 @@ async fn run(args: Args) -> Result<()> {
         Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
-        Command::Presplit { namespace, tenant, rule, admin_token } => {
+        Command::Presplit { namespace, tenant, rule, admin_token, force } => {
             // F-KEY-NS UX-fix (F1): the recording token falls back to the GLOBAL
             // `--admin-token[-file]` (the position `usage()` documents) so an
             // operator no longer has to pass the same secret twice. The
             // per-command spelling stays as an override.
             let record_token = admin_token.as_deref().or(args.admin_token.as_deref());
-            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token).await?
+            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token, force).await?
         }
         Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id, force).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
@@ -1634,6 +1634,7 @@ async fn cmd_presplit(
     tenant: &str,
     rule: &PresplitRule,
     admin_token: Option<&str>,
+    force: bool,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
     // F-NS-PRINCIPAL-UNIFIED: cut prefix = `{namespace}/` (+ `{tenant}/` as an
@@ -1677,6 +1678,29 @@ async fn cmd_presplit(
         // produces from the relative `[0x04]stripe_geom`.
         let mut k = b"fs/".to_vec();
         k.extend_from_slice(&autumn_fuse::key::stripe_geom_key());
+        // F-KEY-NS UX-fix (M5): read-before-write guard. The declared geometry is
+        // now the sole authority for every future file's stripe width, and this
+        // put OVERWRITES it. A stray `presplit --namespace fs --lanes 2` would
+        // silently halve the width fs-wide — the exact "silently narrow the
+        // stripe width" harm the merge guard was built for, which migrated here.
+        // So NARROWING (fewer lanes than currently declared) requires `--force`;
+        // widening / same / first declaration is unguarded (additive).
+        if let Some(existing_bytes) = client
+            .get(&k)
+            .await
+            .map_err(|e| anyhow!("presplit: read existing stripe geometry: {e}"))?
+        {
+            if let Ok(existing) = autumn_fuse::schema::decode_stripe_geom(&existing_bytes) {
+                if *lanes < existing.lanes && !force {
+                    bail!(
+                        "presplit --namespace fs --lanes {lanes}: fs already declares {} lanes — \
+                         narrowing the stripe width affects EVERY future file fs-wide. Re-run with \
+                         --force if that is intended (existing files keep their own stamped width).",
+                        existing.lanes
+                    );
+                }
+            }
+        }
         client
             .put(&k, &autumn_fuse::schema::encode_stripe_geom(&layout))
             .await

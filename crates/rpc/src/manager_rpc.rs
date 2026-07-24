@@ -2091,7 +2091,16 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_CREATE_STREAM
             | MSG_UPSERT_PARTITION
             | MSG_MERGE_PARTITIONS
+            | MSG_MULTI_MODIFY_MERGE
     )
+    // F-KEY-NS UX-fix (M3): MSG_MULTI_MODIFY_MERGE (the raw F183 merge txn) is
+    // gated too. The manager invokes it IN-PROCESS (from handle_merge_partitions
+    // + auto_dispatch_merge, not over the wire), so gating it only blocks an
+    // EXTERNAL rogue client from dispatching the low-level primitive to bypass
+    // both the admin gate AND the F185 freeze / sacred-boundary guard that
+    // MSG_MERGE_PARTITIONS enforces. No in-tree wire caller sends it. (Unlike
+    // MSG_MULTI_MODIFY_SPLIT, which IS PS-driven, so it stays ungated.)
+    //
     // MSG_REGISTER_NODE is DELIBERATELY NOT gated, deviating from the design
     // doc's list. It is not operator-only: the EXTENT NODE self-registers with
     // it at startup and re-registers after a manager restart

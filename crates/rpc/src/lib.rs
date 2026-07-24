@@ -301,12 +301,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   • F-ADMIN-OP-AUTH PS slice: GetAuthzConfigResp grew `admin_token:
     //     Vec<u8>` (additive) + is_admin_ps_msg in partition_rpc.rs — so the PS
     //     can gate split/maintenance on the manager's admin secret.
+    //   • F-KEY-NS UX-fix (M3): MSG_MULTI_MODIFY_MERGE added to is_admin_mgr_msg
+    //     (pure fn edit) so the raw F183 merge txn can't be dispatched to bypass
+    //     the freeze + sacred-boundary guard.
     // The payload prefix is an out-of-band convention the manager/PS strip
     // before decoding; the ONLY rkyv struct change is the additive
     // GetAuthzConfigResp field. All within undeployed v27 → fingerprint
     // refreshes in place. Pre-R3 rkyv has no cross-version decode, so MIN=MAX=27
     // and the deploy stays same-commit.
-    (27, "26b331782ad033b2"),
+    (27, "706da8704a419602"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
@@ -462,6 +465,10 @@ mod admin_token_prefix_tests {
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
         assert!(is_admin_mgr_msg(MSG_BUMP_CLUSTER_VERSION));
+        // M3: the raw F183 merge txn is gated so it can't bypass the guard.
+        assert!(is_admin_mgr_msg(MSG_MULTI_MODIFY_MERGE));
+        // … but MULTI_MODIFY_SPLIT stays ungated — it IS PS-driven.
+        assert!(!is_admin_mgr_msg(MSG_MULTI_MODIFY_SPLIT));
         // … while read-only observability and the struct-field authz ops are NOT
         // (those carry their own admin_token field and stay fail-closed).
         assert!(!is_admin_mgr_msg(MSG_STATUS));
