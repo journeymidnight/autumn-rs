@@ -85,6 +85,21 @@ fn val(raw: &[String], i: usize) -> &str {
     }
 }
 
+/// F2: parse a required positional as a number, printing a NAMED error + usage
+/// instead of panicking with a raw `ParseIntError` backtrace. `--help`/`-h` in a
+/// positional slot prints usage (so `autumn-op split --help` works). Missing arg
+/// → usage.
+fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
+    let s = val(raw, i);
+    if s == "--help" || s == "-h" {
+        usage();
+    }
+    s.trim().parse().unwrap_or_else(|_| {
+        eprintln!("autumn-op: {name} must be a number, got {s:?}");
+        usage()
+    })
+}
+
 /// F-AUTHZ-1: read a secret (admin token / tenant credential) from a file,
 /// trimming a trailing newline. Preferred over passing secrets on argv, which
 /// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
@@ -1029,7 +1044,7 @@ pub(crate) fn parse() -> Args {
                 eprintln!("split requires <PARTID>");
                 std::process::exit(1);
             }
-            let part_id: u64 = val(&raw, i).parse().expect("PARTID must be a number");
+            let part_id: u64 = num_arg(&raw, i, "PARTID");
             i += 1;
             // F-SPLIT-AT-KEY (D4). CLI user面 speaks namespace/tenant, never
             // raw prefix bytes (§3.4 CLI refinement / 细化三). Forms:
@@ -1223,15 +1238,27 @@ pub(crate) fn parse() -> Args {
             Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token, force: presplit_force }
         }
         "merge" => {
+            if raw.get(i).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
+                usage();
+            }
             if i + 1 >= raw.len() {
-                eprintln!("merge requires <SURVIVOR_PART_ID> <VICTIM_PART_ID>");
+                eprintln!("merge requires <SURVIVOR_PART_ID> <VICTIM_PART_ID> [--force]");
                 std::process::exit(1);
             }
-            Command::Merge {
-                survivor_part_id: val(&raw, i).parse().expect("SURVIVOR_PART_ID must be a number"),
-                victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
-                force: raw.iter().any(|a| a == "--force"),
+            let survivor_part_id = num_arg(&raw, i, "SURVIVOR_PART_ID");
+            let victim_part_id = num_arg(&raw, i + 1, "VICTIM_PART_ID");
+            // F4: reject any trailing token other than --force (was: scan the
+            // whole argv for --force and ignore everything else).
+            let mut force = false;
+            for tok in &raw[i + 2..] {
+                if tok == "--force" {
+                    force = true;
+                } else {
+                    eprintln!("merge: unexpected argument {tok:?} (only --force is allowed after the two partition ids)");
+                    usage();
+                }
             }
+            Command::Merge { survivor_part_id, victim_part_id, force }
         }
         "rebalance" => {
             // Optional [MAX_MOVES]; absent / 0 = move as many as needed to balance.
@@ -1242,28 +1269,41 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             let max_moves = if i < raw.len() {
-                val(&raw, i).parse().expect("MAX_MOVES must be a number")
+                num_arg(&raw, i, "MAX_MOVES")
             } else {
                 0
             };
             Command::Rebalance { max_moves }
         }
         "compact" => {
+            if raw.get(i).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
+                usage();
+            }
             if i >= raw.len() {
                 eprintln!("compact requires <PARTID>");
                 std::process::exit(1);
             }
-            Command::Compact {
-                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
+            let part_id = num_arg(&raw, i, "PARTID");
+            // F4: reject trailing tokens (compact takes exactly one arg).
+            if let Some(extra) = raw.get(i + 1) {
+                eprintln!("compact: unexpected argument {extra:?} (takes exactly one PARTID)");
+                usage();
             }
+            Command::Compact { part_id }
         }
         "gc" => {
             let mut ratio: Option<f64> = None;
             let mut max_size: Option<u64> = None;
             let mut stream_debt: Option<u64> = None;
             let mut empty_only = false;
+            let mut part_id: Option<u64> = None;
+            // F4: one pass so flags and the PARTID appear in ANY order — the old
+            // loop `break`d on the first non-flag, so `gc PART --ratio 0.4`
+            // (exactly the documented form) silently dropped every flag after the
+            // positional. Unknown tokens are rejected, not ignored (a mutation).
             while i < raw.len() {
                 match raw[i].as_str() {
+                    "--help" | "-h" => usage(),
                     "--ratio" => {
                         i += 1;
                         ratio = Some(val(&raw, i).parse().unwrap_or_else(|_| {
@@ -1292,31 +1332,36 @@ pub(crate) fn parse() -> Args {
                         empty_only = true;
                         i += 1;
                     }
-                    _ => break,
+                    tok if tok.starts_with('-') => {
+                        eprintln!("gc: unknown flag {tok:?}");
+                        usage();
+                    }
+                    _ if part_id.is_none() => {
+                        part_id = Some(num_arg(&raw, i, "PARTID"));
+                        i += 1;
+                    }
+                    tok => {
+                        eprintln!("gc: unexpected argument {tok:?} (PARTID already given)");
+                        usage();
+                    }
                 }
             }
-            if i >= raw.len() {
+            let Some(part_id) = part_id else {
                 eprintln!("gc requires <PARTID>");
                 std::process::exit(1);
-            }
-            Command::Gc {
-                part_id: val(&raw, i).parse().expect("PARTID must be a number"),
-                ratio,
-                max_size,
-                stream_debt,
-                empty_only,
-            }
+            };
+            Command::Gc { part_id, ratio, max_size, stream_debt, empty_only }
         }
         "forcegc" => {
             if i >= raw.len() {
                 eprintln!("forcegc requires <PARTID> <EXTID>...");
                 std::process::exit(1);
             }
-            let part_id: u64 = val(&raw, i).parse().expect("PARTID must be a number");
+            let part_id: u64 = num_arg(&raw, i, "PARTID");
             i += 1;
             let mut extent_ids = Vec::new();
             while i < raw.len() {
-                extent_ids.push(val(&raw, i).parse::<u64>().expect("EXTID must be a number"));
+                extent_ids.push(num_arg::<u64>(&raw, i, "EXTID"));
                 i += 1;
             }
             if extent_ids.is_empty() {
@@ -1368,7 +1413,12 @@ pub(crate) fn parse() -> Args {
             }
             Command::Format { dirs }
         }
-        _ => usage(),
+        "--help" | "-h" | "help" => usage(),
+        // F3: name the unknown subcommand before dumping the usage wall.
+        other => {
+            eprintln!("autumn-op: unknown command {other:?}");
+            usage()
+        }
     };
     Args {
         manager,
