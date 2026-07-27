@@ -2,92 +2,12 @@
 
 ## Purpose
 
-FUSE 文件系统层，将 autumn-rs KV 存储挂载为 POSIX 文件系统。设计借鉴 3FS (DeepSeek/3FS) 的高性能 FUSE 架构。
+FUSE 文件系统层，将 autumn-rs KV 存储挂载为 POSIX 文件系统。设计借鉴 3FS
+(DeepSeek/3FS) 的高性能 FUSE 模式：**每 inode 1MB 级写缓冲 + 延迟刷写、周期异步
+sync、内核 attr/entry 缓存、元数据/数据路径分离**。3FS 的共享内存 I/O Ring 与三级
+优先级 worker 未采纳（autumn 用 channel 桥接足够）。
 
-## 3FS FUSE 性能架构分析
-
-### 3FS 采用的关键性能模式
-
-3FS 的 FUSE 实现（`3FS/src/fuse/`）通过以下手段实现极高性能：
-
-#### 1. 写缓冲 (InodeWriteBuf)
-**来源**: `3FS/src/fuse/FuseOps.cc` lines 1552-1680
-
-每个 inode 一个 1MB 写缓冲区，延迟刷写：
-- 顺序写入累积到缓冲区，满时才刷到存储层
-- Gap 检测：如果写入偏移不连续，立即 flush 当前缓冲
-- O_DIRECT 绕过缓冲直接写入
-- RDMA 注册内存，避免额外拷贝
-
-```cpp
-// 3FS 写逻辑核心
-if (wb->len && wb->off + wb->len != off) {
-    flushBuf(req, pi, wb->off, *wb->memh, wb->len, true);  // gap → flush
-}
-memcpy(wb->buf.data() + wb->len, buf, size);
-wb->len += size;
-if (wb->len == wb->buf.size()) {
-    flushBuf(...);  // buffer full → flush
-}
-```
-
-#### 2. 周期异步 Sync
-**来源**: `3FS/src/fuse/FuseClients.cc` lines 159-164
-
-- 30 秒间隔，±30% 抖动（防止惊群）
-- 脏 inode 集合 (`dirtyInodes`) 在写完成时标记
-- 后台扫描刷写，不阻塞应用写操作
-- 每轮最多处理 1000 个脏 inode
-
-#### 3. 内核级元数据缓存
-**来源**: `3FS/src/fuse/FuseConfig.h` lines 24-28
-
-```
-attr_timeout   = 30s   // getattr 结果缓存
-entry_timeout  = 30s   // lookup 结果缓存
-negative_timeout = 5s  // ENOENT 缓存
-```
-
-FUSE 内核模块直接缓存这些结果，30 秒内重复 stat/lookup 完全不到用户态。
-
-#### 4. 自定义 I/O Ring（共享内存）
-**来源**: `3FS/src/fuse/IoRing.h` lines 53-215
-
-通过共享内存实现 lock-free 的提交/完成队列：
-- 原子操作 + 信号量协调
-- 批量提交多个 I/O 再唤醒 worker
-- 3 级优先级（hi/normal/lo）
-- **autumn-fuse v1 不实现**，用 channel 桥接代替
-
-#### 5. 批量 I/O 处理
-**来源**: `3FS/src/fuse/IoRing.cc` lines 67-284, `PioV.cc` lines 132-183
-
-- Ring 级别批量：一次取最多 32 个 I/O 请求
-- 文件查找去重：同批次中同一文件只查找一次
-- Chunk 级别批量：所有 chunk 的 storage I/O 打包成一个 batchRead/batchWrite
-
-#### 6. 元数据/数据路径分离
-- 元数据操作（lookup, getattr, mkdir）：同步 RPC，结果缓存
-- 数据操作（read, write）：异步缓冲，批量提交
-- 每个 inode 的 DynamicAttr 独立跟踪长度/时间戳 hint
-
-### autumn-fuse 采纳决策
-
-| 3FS 模式 | autumn-fuse | 原因 |
-|----------|-------------|------|
-| 写缓冲 1MB/inode | ✅ 采用 | 关键性能优化，直接移植 |
-| 周期 sync 30s+jitter | ✅ 采用 | 防止数据丢失窗口 |
-| 内核缓存 30s timeout | ✅ 采用 | 零成本，效果显著 |
-| 元数据/数据分离 | ✅ 采用 | 自然匹配 |
-| I/O Ring 共享内存 | ❌ 跳过 v1 | 复杂度极高，channel 足够 |
-| 3 级优先级 worker | ❌ 跳过 v1 | 依赖 I/O Ring |
-| 批量 chunk I/O | ⚠️ 部分 | 多 chunk 读并发化 |
-
----
-
-## 架构设计
-
-### 整体架构
+## 架构
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -101,13 +21,11 @@ FUSE 内核模块直接缓存这些结果，30 秒内重复 stat/lookup 完全�
                      │ /dev/fuse
 ┌────────────────────▼────────────────────────────┐
 │           autumn-fuse daemon                      │
-│                                                   │
-│  ┌─────────┐   crossbeam     ┌───────────────┐  │
-│  │ fuser   │──channel───>│ compio thread  │  │
-│  │ threads │<─oneshot────│ + ClusterClient│  │
-│  └─────────┘              └───────────────┘  │
-│                                                   │
-│  写缓冲 (1MB/inode) | inode 缓存 | 周期 sync     │
+│  ┌─────────┐   crossbeam     ┌───────────────┐   │
+│  │ fuser   │──channel──────>│ compio thread  │   │
+│  │ threads │<─oneshot───────│ + ClusterClient│   │
+│  └─────────┘                └───────────────┘   │
+│  写缓冲 (64MiB/inode) | inode 缓存 | 周期 sync    │
 └────────────────────┬────────────────────────────┘
                      │ autumn-rpc (binary RPC)
 ┌────────────────────▼────────────────────────────┐
@@ -118,511 +36,308 @@ FUSE 内核模块直接缓存这些结果，30 秒内重复 stat/lookup 完全�
 
 ### FUSE 线程 ↔ compio 桥接
 
-核心挑战：`fuser` 在自己的线程中调用回调，`ClusterClient` 使用 `Rc<RpcClient>` 是 `!Send`。
-
-方案参考 `crates/rpc/src/server.rs` 的 Dispatcher 模式：
-
-```rust
-// bridge.rs
-enum FsRequest {
-    Lookup { parent: u64, name: OsString, reply: oneshot::Sender<Result<(FileAttr, u64)>> },
-    GetAttr { ino: u64, reply: oneshot::Sender<Result<FileAttr>> },
-    Read { ino: u64, offset: i64, size: u32, reply: oneshot::Sender<Result<Vec<u8>>> },
-    Write { ino: u64, offset: i64, data: Vec<u8>, reply: oneshot::Sender<Result<u32>> },
-    // ... 其他操作
-}
-```
-
-fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 recv + 处理 → oneshot 回复
+`fuser` 在自己的线程中调用回调，`ClusterClient`（`Rc<RpcClient>`）是 `!Send`。
+桥接：fuser 回调线程 → `crossbeam::channel::send(FsRequest)` → compio 线程 recv +
+处理 → `oneshot` 回复。`FsRequest` 是 typed enum（Lookup / GetAttr / Read / Write /
+…），参考 `crates/rpc/src/server.rs` 的 Dispatcher 模式。
 
 ### Inode-based 路径映射
 
-采用 inode 方案（非扁平 path=key）：
-- rename O(1)：只改目录项
-- hardlink：多目录项指向同一 inode
-- 根 inode = 1 (FUSE_ROOT_ID)
-- inode 分配器：**manager 发号**（F-FS-UNIFY M0，`ClusterClient::alloc_inodes`
-  → `MSG_ALLOC_INODES`，leader-fenced etcd CAS），批量预分配 1000 个。
-  旧方案（客户端对 `[0x04]next_inode` KV 做非-CAS 读改写）在并发分配者
-  （双 mount，或 mount + Python `autumn.Fs`）下会重号，已废弃；该 KV key
-  降级为**迁移 floor**（首个批次把旧值传给 manager，保证不重发旧 inode）
-  + 每批 best-effort 回写（灾备重建时的新鲜 floor，advisory-only）。
+采用 inode 方案（非扁平 path=key）：rename O(1)（只改目录项）、hardlink（多目录项
+指向同一 inode）、根 inode = 1 (`ROOT_INO` / FUSE_ROOT_ID)。
 
-### KV Key 编码
+**inode 分配 = manager 发号**：`ClusterClient::alloc_inodes` → `MSG_ALLOC_INODES`
+（leader-fenced etcd CAS），每批预分配 `INODE_ALLOC_BATCH`=1000 个，全局计数器保证
+并发分配者（双 mount，或 mount + Python `autumn.Fs`）不重号。`[0x04]next_inode` KV
+仅作**迁移 floor**（首批把旧值传给 manager）+ 每批 best-effort 回写（advisory-only）。
+
+## KV Key 编码
+
+所有文件系统数据存在同一 KV namespace，靠 key 第一个字节区分类型。Big Endian 保证
+自然排序：同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
 
 | 前缀 | 用途 | Key 格式 | Value |
 |------|------|---------|-------|
 | `0x01` | Inode 元数据 | `[0x01][ino: u64 BE]` | InodeMeta (rkyv) |
 | `0x02` | 目录项 | `[0x02][parent: u64 BE][name]` | DirentValue (rkyv) |
 | `0x03` | 文件数据 extent | `[0x03][ino: u64 BE][logical_off: u64 BE]` | raw bytes ≤ 8 MiB (`MAX_EXTENT`) |
-| `0x04` | FS 超级块 | `[0x04][field]` | varies |
+| `0x03` | 条带 extent (striped) | `[0x03][lane: u8][ino BE][logical_off BE]` | raw bytes ≤ `MAX_EXTENT` |
+| `0x04` | FS 超级块 | `[0x04][field]` | varies（`next_inode` / `schema_version` / `stripe_geom` / `rmtomb/[ino]`）|
 
-Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
+**Namespace-first 绑定（Option 3）**：wire key = `fs/[type][fields]`（一棵全局树，
+无 tenant 段、无 volume 段）。`autumn-fuse` / `autumnfs` / PyO3 `autumn.Fs` 都无
+`--tenant`；`FsState` 用 `connect(mgr, "fs")` / `scoped("fs")`。多棵互隔离的树用不同
+namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个 `fs/` 前缀**
+（prepend + 把返回 range key 剥回、按 namespace 边界 clamp）。`state.rs` 的 8 个
+`kv_*` choke point、`key::*` builder、全部 `parse_*` 都交裸 RELATIVE key 给 client，
+零 wire 拼接。两处 batch 数据路径（`read::prepare` 的 `ChunkSpec.key`、
+`extent::flush_appends` 的 append keys，为性能直调 `get_many_*`/`put_many_fenced`
+绕过 `kv_*`）同样交裸 `key::*`——client 一处 prepend，与元数据路径一致。授权 =
+`principal-create --grant fs/` + `--credential-file`（principal 名在文件里，authz
+开了就整个 `fs/` 受保护）。详见 docs/key_namespace_split_design.md §8。
 
-> **⚑ F-NS-PRINCIPAL-UNIFIED (Option 3, 2026-07-19)：fuse 去掉 tenant 段 —— wire key
-> 现为 `fs/[type][fields]`（一棵全局树，无 `{tenant}`）。`autumn-fuse` / `autumnfs` /
-> PyO3 `autumn.Fs` 都不再有 `--tenant`；`FsState::new(mgr)` 用 `connect(mgr, "fs")`。
-> 多棵互隔离的树用不同 namespace（`fsA`/`fsB`），不是 tenant。授权 = `principal-create
-> --grant fs/` + `--credential-file`（principal 名在文件里）。下方带 `{tenant}` 的旧描述
-> 按去掉该段阅读。详见 docs/key_namespace_split_design.md §8。**
->
-> **F-KEY-NS — 上表是 RELATIVE key；真实 wire key 带 `fs/` 前缀（旧文：`fs/{tenant}/`）。**
-> `FsState` 用 `scoped(fs)` 连接 —— **client 负责整个 `fs/` 前缀**
-> （prepend + 把返回 range key 剥回、按 tenant 边界 clamp）。所以 `state.rs` 的 8 个
-> `kv_*` choke point、`key::*` builder 与其调用点、全部 `parse_*` 都把裸 `key::*`
-> RELATIVE key 直接交给 client，**零 wire 拼接**。**两处 batch 数据路径**（`read::prepare`
-> 的 `ChunkSpec.key` + `extent::flush_appends` 的 append keys；二者为性能直接调
-> `get_many_*`/`put_many_fenced` 绕过 `kv_*`）同样交裸 `key::*`——client 一处 prepend
-> `fs/{tenant}/`，与 `kv_*` 元数据路径一致（无 key 不匹配隐患）。净 wire key =
-> `fs/{tenant}/[type][fields]`：一个 mount 只能碰自己 tenant 的数据（scope 由构造锁死），
-> 写路径被 Layer-A 按 `fs` namespace 门控。
-> **（历史）SD-3 曾在 `fs/{tenant}/` 与 `[type]` 之间加过一层 `{volume}/`，2026-07-19
-> 用户拍板去掉——多一层 sub-namespace 无收益。** inode 号本就全局唯一（lease/fence 平面
-> 按裸 ino 做 key），fuse 给 `alloc_inodes` 传空 volume → manager 全局计数器；`init_root`
-> 不本地 seed inode 批次，全部 inode 走 manager 发号。manager 的 per-volume 计数器机制
-> + 冻结的 `AllocInodesReq.volume` 字段保留**休眠**（reserved），去 volume 是纯 key-bytes
-> 改动（stop-world 数据 reset），**无 wire bump**。
-> **schema 版本戳（`schema::SCHEMA_VERSION` = 2, `meta::ensure_schema_version`）**：mount
-> 时（`ensure_root` 入口）缺则戳、有则核对、不符则 **fail-loud 拒挂**（防未来不兼容布局
-> 静默读写坏数据）；v1 = pre-namespace 裸 key 布局（不戳），v2 = `fs/{tenant}/` 相对布局
-> （去 `{volume}` 不改 RELATIVE 布局，仍 v2）。
+### 变长 extent（F247）
 
-> **F247 — 变长 extent（取代固定 256 KiB chunk）。** 文件数据不再是固定 256 KiB
-> 块，而是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
-> value ≤ 8 MiB = `MAX_EXTENT`）。顺序写（write-once）合并成接近 8 MiB 的 extent，
-> 末尾/部分 extent 较短 → "像 Linux extent 一样变长"。动机：模型文件等大文件以前会
-> 散成几十万个 256 KiB chunk（LSM key 基数爆炸 + 每读散成大量小 RPC），现在变成数量级
-> 更少、每个 ≥ 64 KiB 的 extent —— **每个整 extent 读都走 `get_many_into` 的 ZC 路径
-> （`MSG_GET_ZC`）**，正是 F243 RDMA 零拷贝要利用的尺寸。
->
-> - **持久真相 = extent KV key 本身**（隐式 key 设计，InodeMeta 里**不**存 extent 列表）。
-> - **运行时缓存**：`InodeState.extents: Option<Vec<(start, len)>>` —— 冷启动用
->   range-scan `[0x03][ino]` 前缀拿到起始偏移 + 由相邻起始/文件大小推断长度；写时增量
->   维护，truncate 时失效。
-> - **不变量：extent 互不重叠**。读按 `[start, start+len)` 请求每个重叠 extent 的精确
->   子区间，PS get 会按真实 value 长度裁剪、dest 余下补零 —— 短 extent / 稀疏空洞都正确。
-> - 全部寻址/读/写/截断/删除逻辑在 `crate::extent`。
+文件数据是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
+value ≤ 8 MiB = `MAX_EXTENT`）：顺序写合并成接近 8 MiB 的 extent，末尾/部分 extent
+较短（"像 Linux extent 一样变长"）。相比固定 256 KiB chunk，大文件从几十万个小块变成
+数量级更少、每个 ≥ 64 KiB 的 extent，每个整 extent 读走 `get_many_into` 的 ZC 路径
+（`MSG_GET_ZC`，F243 RDMA 零拷贝的目标尺寸）。
 
-### KV 数据模型详解
+- **持久真相 = extent KV key 本身**（隐式 key 设计，InodeMeta 里**不**存 extent 列表）。
+- **运行时缓存** `InodeState.extents: Option<Vec<(start, len)>>`：冷启动 range-scan
+  `[0x03][ino]` 前缀拿起始偏移 + 由相邻起始/文件大小推断长度；写时增量维护，
+  truncate 时失效（置 `None`）。
+- **不变量：extent 互不重叠**。读按 `[start, start+len)` 请求每个重叠 extent 的精确
+  子区间，PS get 按真实 value 长度裁剪、dest 余下补零 → 短 extent / 稀疏空洞都正确。
+- **小文件** ≤ `INLINE_THRESHOLD`=4KB：inline 在 `InodeMeta.inline_data`（无 extent，
+  读写各省一次 KV 操作；增长超过阈值迁移到 extent 存储）。
+- 全部寻址/读/写/截断/删除逻辑在 `crate::extent`。
 
-所有文件系统数据存在同一个 autumn-rs KV namespace 中，靠 key 的第一个字节区分类型。
+### Lane striping（F-FS-STRIPE，大文件跨分区条带化）
 
-#### 完整示例
+大文件的 extent 跨 `lanes` 个分区分布，使单文件读写并行超过单 partition/log_stream
+天花板。
 
-假设文件系统内容：
+- **每文件 stamp**：`InodeMeta.stripe: Option<StripeLayout>`。`Some` = 条带化
+  （extent 走 `[0x03][lane][ino][off]`），`None` = 单分区 legacy 布局
+  （`[0x03][ino][off]`）。**create 时定，之后不可变**；读侧 branch 于此选 key 布局，
+  老文件无迁移仍正确。
+- **striped key**（18 B）：`[0x03][lane][ino BE][off BE]`，`lane =
+  stripe_lane(off, lanes, unit_bytes) = (off / unit_bytes) % lanes`。lane 字节在
+  HIGH 位（紧跟 0x03）主导分区路由；lane 边界 `[0x03][lane]` 是 STATIC（ino 无关），
+  故 fs 可在 bootstrap 预切成 lane 分区而无需任何 ino。
+- **declared 几何** `[0x04]stripe_geom` → rkyv `StripeLayout { lanes: u8,
+  unit_bytes: u32 }`。`geom::read_stripe_geom` 每 session 读一次并缓存：key 存在=fs
+  自声明；key 缺失=默认 `DEFAULT_STRIPE_LANES`=24 lanes、unit=`MAX_EXTENT`；**硬 KV
+  错 PROPAGATE**（不吞成 lanes=1，否则一次瞬时 blip 造出永久单分区大文件，症状只有
+  "吞吐莫名差"，最难诊断）。由 `autumn-op presplit --namespace fs --lanes N` 在切
+  lane 边界的**同一命令**里写声明，声明与放置不会脱节。
+- **24 lanes 过量供给**：任何整除 24 的分区数（1,2,3,4,6,8,12,24）都能均匀分布每个
+  文件；lane 数是永久布局常量而非 cluster 形状的函数 → 一个 1-分区 fs 写的文件已按
+  lane 排序，日后在 lane 边界 split 可 RETROACTIVELY 拿到并行度，无数据重写。
+- **`striped_extent_offsets(size, unit)`** 枚举 `(0, u, 2u, …)` 的对齐偏移供
+  reader/rm/delete 计算 lane key —— **`unit` 必来自文件 PERSISTED 的
+  `StripeLayout.unit_bytes`，不是 `MAX_EXTENT` 常量**：`MAX_EXTENT` 会在满配硬件上
+  retune，若按当下常量步进，缩小后老条带文件会枚举出不匹配的偏移 → 半个文件读成零而
+  无错（稀疏语义）。`StripeLayout::checked()` 校验 `lanes ≥ 1 && unit_bytes ≥ 1`
+  （防 key builder div-by-zero），每条读 `meta.stripe` 的路径必经它。
+- **fuse mount 拒绝条带写**：`write::write` / `write::truncate` 对 `meta.stripe`
+  非空的 inode 返回 "not supported yet; use autumnfs"。fuse **能读**条带文件，
+  **条带写只由 `autumnfs` 做**（大文件 create 时按声明 stamp 成条带）。
+
+## KV 数据模型
+
+### 完整示例
+
 ```
 /                          (ino=1, 目录)
 └── docs/                  (ino=2, 目录)
     └── readme.txt         (ino=3, 文件, 600KB)
 ```
 
-KV 存储的全部内容：
-
 ```
-─── 0x01: InodeMeta (每个文件/目录一条) ───────────────────────
-
-  [0x01][ino=1]  →  { mode=S_IFDIR|0755, nlink=3, uid=501, gid=20,
-                       size=0, atime, mtime, ctime,
-                       inline_data=None, symlink_target=None }
-
-  [0x01][ino=2]  →  { mode=S_IFDIR|0755, nlink=2, ... }
-
-  [0x01][ino=3]  →  { mode=S_IFREG|0644, nlink=1, size=614400,
-                       inline_data=None, ... }
-
-─── 0x02: DirentValue (每个"父→子"关系一条) ──────────────────
-
+  [0x01][ino=1]  →  InodeMeta{ mode=S_IFDIR|0755, nlink=3, size=0, ... }
+  [0x01][ino=3]  →  InodeMeta{ mode=S_IFREG|0644, nlink=1, size=614400, inline_data=None, stripe=None }
   [0x02][parent=1]["docs"]        →  { child_inode=2, file_type=DT_DIR }
-  [0x02][parent=2]["readme.txt"]  →  { child_inode=3, file_type=DT_REG }
-
-  注意: 文件名编码在 key 里 (第 9 字节之后), 不在 value 里。
-
-─── 0x03: Chunk (文件数据, 每块最大 256KB) ────────────────────
-
-  [0x03][ino=3][chunk=0]  →  [256KB 原始字节]   ← 文件 0-256KB
-  [0x03][ino=3][chunk=1]  →  [256KB 原始字节]   ← 文件 256-512KB
-  [0x03][ino=3][chunk=2]  →  [88KB 原始字节]    ← 文件 512-600KB
-
-  目录没有 chunk。chunk 数量 = ceil(size / 256KB)。
-
-─── 0x04: Superblock (全局状态) ──────────────────────────────
-
-  [0x04]["next_inode"]  →  [u64 BE: 1001]   ← 下一批 inode 分配起点
+  [0x02][parent=2]["readme.txt"]  →  { child_inode=3, file_type=DT_REG }   (文件名在 key，不在 value)
+  [0x03][ino=3][off=0]            →  [≤ 8 MiB 原始字节]
+  [0x04]["next_inode"] / ["schema_version"]=3 / ["stripe_geom"]=StripeLayout(rkyv)
 ```
 
-#### 三者的关系
+`DirentValue.child_inode` 指向 `InodeMeta`；extent key 里的 ino 就是该 InodeMeta
+的 inode 号；`InodeMeta.size` 界住可见 extent 范围。
 
-```
-     DirentValue                 InodeMeta                Chunk Data
-  (父子关系 + 名字)           (文件/目录属性)             (文件内容)
+### InodeMeta — "这个东西是什么"
 
-[0x02][parent=1]["docs"]      [0x01][ino=2]
-{ child_inode: 2 ──────────→ { mode: DIR               (目录没有 chunk)
-  file_type: DIR }              nlink: 2, ... }
+key `[0x01][ino BE]`，描述文件/目录**自身属性**（对应 Linux `struct stat`）：
+`mode`（类型+权限）、`uid`/`gid`、`size`（目录为 0）、`nlink`、`atime`/`mtime`/
+`ctime`、`inline_data`（≤4KB 小文件数据）、`symlink_target`、`stripe`（条带几何或
+None）。**不含文件名和父目录** —— 一个 inode 不知道自己叫什么、在哪，硬链接才能工作。
 
-[0x02][parent=2]["readme.txt"] [0x01][ino=3]            [0x03][ino=3][0] → 256KB
-{ child_inode: 3 ──────────→ { mode: REG               [0x03][ino=3][1] → 256KB
-  file_type: REG }              size: 614400            [0x03][ino=3][2] → 88KB
-                                nlink: 1, ... }
-```
+### DirentValue — "谁在哪个目录下叫什么名字"
 
-DirentValue.child_inode 指向 InodeMeta。InodeMeta.size 隐含了 chunk 数量。
-chunk key 中的 ino 就是 InodeMeta 的 inode 号。
+key `[0x02][parent_ino BE][name]`，两个字段：`child_inode`、`file_type`
+（DT_REG=8 / DT_DIR=4 / DT_LNK=10）。文件名在 key 里不在 value。`file_type` 与
+`InodeMeta.mode` 冗余是**空间换时间**：`readdir` 直接返回每个条目类型，无需为每个条目
+再查一次 InodeMeta（同 ext4 `ext4_dir_entry_2.file_type`）。
 
-#### InodeMeta — "这个东西是什么"
-
-存储在 key `[0x01][ino BE]`，描述一个文件或目录**自身的全部属性**。
-对应 Linux `struct stat`，`ls -l` 显示的所有信息都来自这里。
-
-| 字段 | 说明 |
-|------|------|
-| `mode` | 文件类型 + 权限。如 `S_IFREG\|0644` = 普通文件 owner 读写 |
-| `uid` / `gid` | 所属用户和组 |
-| `size` | 文件逻辑大小（字节），目录为 0 |
-| `nlink` | 硬链接计数。文件默认 1，目录默认 2（`. ` 和父目录的指向） |
-| `atime` | 最后访问时间 |
-| `mtime` | 最后数据修改时间 |
-| `ctime` | 最后元数据变更时间（chmod、chown 等） |
-| `inline_data` | ≤4KB 小文件的数据直接存在这里，省掉 chunk KV 操作 |
-| `symlink_target` | 符号链接的目标路径 |
-
-**不包含**：文件名、父目录。一个 inode 不知道自己叫什么名字，也不知道在哪个目录下。
-这样硬链接才能工作——同一个 inode 可以有多个名字。
-
-#### DirentValue — "谁在哪个目录下叫什么名字"
-
-存储在 key `[0x02][parent_ino BE][name]`，只有两个字段：
-
-| 字段 | 说明 |
-|------|------|
-| `child_inode` | 指向的 inode 号 |
-| `file_type` | DT_REG(8)=文件, DT_DIR(4)=目录, DT_LNK(10)=符号链接 |
-
-文件名不在 value 里，而是编码在 **key 本身**的第 9 字节之后。
-
-`file_type` 和 InodeMeta.mode 中的信息是冗余的，但 `readdir` 需要返回每个条目的类型。
-如果不冗余存储，readdir 就要为每个条目额外查一次 InodeMeta，N 个文件就是 N 次 KV Get。
-这是用空间换时间——和 Linux ext4 的 `struct ext4_dir_entry_2.file_type` 设计一致。
-
-#### Chunk — 文件的原始字节
-
-存储在 key `[0x03][ino BE][chunk_idx BE]`，value 是原始文件字节，最大 256KB。
-
-对一个 600KB 的文件：
-- chunk 0: 字节 0-262143 (256KB)
-- chunk 1: 字节 262144-524287 (256KB)
-- chunk 2: 字节 524288-614399 (88KB，最后一块不满)
-
-目录没有 chunk。小文件 (≤4KB) 也没有 chunk，数据 inline 在 InodeMeta 中。
-
-#### 为什么 InodeMeta 和 DirentValue 分开存储
-
-类比 Linux 文件系统，inode 和目录项是分离的两种数据结构：
+### 为什么 InodeMeta 与 DirentValue 分开
 
 | 操作 | 只改 DirentValue | 只改 InodeMeta | 两者都改 |
 |------|:---:|:---:|:---:|
 | `rename` | ✓ | | |
-| `chmod` / `chown` | | ✓ | |
-| `write` (改内容) | | ✓ (size/mtime) | |
-| `link` (硬链接) | ✓ (新目录项) | ✓ (nlink++) | ✓ |
-| `mkdir` | ✓ | ✓ | ✓ |
-| `unlink` | ✓ (删目录项) | ✓ (nlink--) | ✓ |
+| `chmod`/`chown` | | ✓ | |
+| `write` | | ✓ (size/mtime) | |
+| `link` | ✓ (新目录项) | ✓ (nlink++) | ✓ |
+| `mkdir`/`unlink` | ✓ | ✓ | ✓ |
 
-如果把 InodeMeta 嵌入 DirentValue：
-- **硬链接无法实现**：同一文件两个名字需要共享同一份属性
-- **rename 变重**：要读写更大的 value
-- **chmod 要找到所有目录项**：不知道文件有几个名字、在哪些目录下
+内嵌会使硬链接无法实现（多名共享属性）、rename 变重、chmod 要找到所有目录项。
 
-#### 小文件特例 (≤4KB)
-
-小文件不产生 chunk，数据直接存在 InodeMeta.inline_data 中：
-
-```
-[0x01][ino=5]  →  InodeMeta{
-    size: 18,
-    inline_data: Some(b"hello autumn-fuse\n"),  ← 数据在这里
-    ...
-}
-[0x02][parent=1]["hello.txt"]  →  { child_inode=5, file_type=DT_REG }
-```
-
-只有 2 条 KV 记录（1 InodeMeta + 1 DirentValue），没有 `[0x03]` chunk。
-读写各省一次 KV 操作。当文件增长超过 4KB 时，迁移到 chunk 存储。
-
-#### 各操作的 KV 访问模式
+### 各操作的 KV 访问模式
 
 | FUSE 操作 | KV 操作 |
 |-----------|---------|
 | `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
 | `readdir(ino)` | 1× Range(prefix=[0x02][ino BE]) |
 | `getattr(ino)` | 1× Get inode |
-| `mkdir(parent, name)` | 1× Put inode + 1× Put dirent + 1× Put parent inode (nlink) |
-| `create(parent, name)` | 同 mkdir |
-| `unlink(parent, name)` | 1× Get dirent + 1× Delete dirent + N× Delete chunks + 1× Delete inode |
+| `mkdir`/`create(parent, name)` | 1× Put inode + 1× Put dirent + 1× Put parent inode (nlink) |
+| `unlink(parent, name)` | 1× Get dirent + 1× Delete dirent + tombstone + N× Delete extent + 1× Delete inode |
 | `rename(old, new)` | 1× Get old dirent + 1× Delete old dirent + 1× Put new dirent |
-| `read(ino, off, size)` | ceil(size/256KB)× Get chunk |
-| `write(ino, off, data)` | 缓冲后: per-chunk 1× Put (对齐) 或 1× Get + 1× Put (非对齐) |
-| `truncate(ino, 0)` | N× Delete chunk + 1× Put inode |
+| `read(ino, off, size)` | 每个重叠 extent 1× Get（sub-range，批量并发） |
+| `write(ino, off, data)` | 缓冲后：对齐 1× Put / 非对齐 1× Get + 1× Put（RMW） |
+| `truncate(ino, 0)` | meta Put（commit）+ N× Delete extent |
 
-#### 与 Linux ext4 的架构对比
+ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree 查找，非 ext4
+的 O(1) 数组下标）；ino → 数据靠 extent key 隐式关联，物理位置由 KV 层透明管理。性能
+差距主要在**网络 RTT**（每 Get 一次 RPC），FUSE 内核缓存（entry_timeout=30s）抵消
+大部分重复 lookup。
 
-从 dirent 到文件数据的完整查找链路：
+## 常量
 
-```
-Linux ext4:                              autumn-fuse:
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `MAX_EXTENT` | 8 MiB | extent value 上限；写缓冲按此粒度刷；≥64 KiB 整 extent 读走 ZC |
+| `INLINE_THRESHOLD` | 4 KiB | 小文件 inline 阈值（匹配 VALUE_THROTTLE）|
+| `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
+| `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent 由 `put_many` 按 `APPEND_PIPELINE_DEPTH` 流水 |
+| `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
+| `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
+| `ROOT_INO` | 1 | 根 inode（FUSE_ROOT_ID）|
+| `SCHEMA_VERSION` | 3 | 见下 fail-loud |
+| `DT_REG`/`DT_DIR`/`DT_LNK` | 8/4/10 | 目录项类型 |
 
-dirent("readme.txt") → ino=42          [0x02][parent]["readme.txt"] → {ino=42}
-         │                                        │
-         ▼                                        ▼
-inode_table[42]       O(1) 算术         KV Get [0x01][ino=42]     O(log N)
-  { size, mode,                           { size, mode,
-    extents → disk blocks }                 inline_data }
-         │                                        │
-         ▼                                        ▼
-disk block 1001,1002,1003               KV Get [0x03][ino=42][chunk=0,1,2]
-```
-
-ext4 的 inode table 是 mkfs 时预分配的**固定大小数组**，inode 号直接当下标算磁盘偏移：
-
-```
-ext4:    &inode_table + ino * 256B      → 一次算术，O(1)
-autumn:  KV Get([0x01][ino BE])         → LSM-tree 查找，O(log N)
-         (memtable SkipMap.seek → bloom filter → SSTable 二分查找)
-```
-
-| | ext4 | autumn-fuse |
-|---|---|---|
-| ino → inode 数据 | **O(1) 算术**（ino 是数组下标） | **O(log N) KV Get**（ino 编码在 key 里） |
-| inode → file data | inode 里存 block 指针/extent tree | ino 编码在 chunk key 里，隐式关联 |
-| 数据位置管理 | inode 自己管（extent tree） | KV 存储层管（LSM-tree + ValuePointer） |
-
-ext4 的 inode 里存了 `i_block[15]` 数组或 extent tree，直接指向数据所在的磁盘 block 号。
-autumn-fuse 不需要显式的 block 指针——chunk key `[0x03][ino][chunk_idx]` 本身就是寻址方式，
-数据的物理位置由 KV 存储层（LSM-tree → stream layer → extent node）透明管理。
-
-实际性能差距主要在**网络 RTT**（每次 KV Get 是一次 RPC 到 PartitionServer），
-而非查找算法本身。FUSE 内核缓存（entry_timeout=30s）抵消了大部分重复 lookup 开销。
-
-### 数据存储 (F247 变长 extent)
-
-- **Extent 上限**: 8 MiB (`MAX_EXTENT`)，变长（顺序写合并到上限，末尾较短）
-  - 远大于 4KB VALUE_THROTTLE → 走 ValuePointer（高效）
-  - 写缓冲也按 8 MiB 刷写（每满一个 extent 落一条 KV）
-  - ≥ 64 KiB → 整 extent 读走 ZC (`MSG_GET_ZC`)
-- **小文件优化**: ≤4KB inline 在 InodeMeta.inline_data 中（无 extent）
-- **部分 extent 读**: 利用 `GetReq.offset + length` 做 in-extent sub-range 读；读结果按
-  绝对 dest 偏移拼装，extent 间空洞补零（稀疏文件语义）
-
-### 核心数据结构
+## 核心数据结构
 
 ```rust
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct InodeMeta {
-    mode: u32,              // S_IFREG | 0644, S_IFDIR | 0755
-    uid: u32,
-    gid: u32,
-    size: u64,
-    nlink: u32,
-    atime_secs: i64,
-    atime_nsecs: u32,
-    mtime_secs: i64,
-    mtime_nsecs: u32,
-    ctime_secs: i64,
-    ctime_nsecs: u32,
+struct InodeMeta {          // rkyv, key [0x01][ino BE]
+    mode: u32, uid: u32, gid: u32, size: u64, nlink: u32,
+    atime_secs: i64, atime_nsecs: u32,
+    mtime_secs: i64, mtime_nsecs: u32,
+    ctime_secs: i64, ctime_nsecs: u32,
     inline_data: Option<Vec<u8>>,     // ≤4KB 小文件
-    symlink_target: Option<Vec<u8>>,  // 符号链接
+    symlink_target: Option<Vec<u8>>,
+    stripe: Option<StripeLayout>,     // Some = 条带化, None = 单分区 legacy
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct DirentValue {
-    child_inode: u64,
-    file_type: u8,  // DT_REG=8, DT_DIR=4, DT_LNK=10
-}
+struct DirentValue { child_inode: u64, file_type: u8 }  // key [0x02][parent BE][name]
 
-// 运行时状态 (compio 线程本地)
+struct StripeLayout { lanes: u8, unit_bytes: u32 }       // [0x04]stripe_geom + per-inode
+
+// 运行时状态（compio 线程本地，不持久化）
 struct InodeState {
     meta: InodeMeta,
-    write_buf: Option<WriteBuffer>,
+    write_buf: Option<WriteBuffer>,        // buf 容量 WRITE_BUF_CAP
     dirty: bool,
     open_count: u32,
-}
-
-struct WriteBuffer {
-    buf: Vec<u8>,    // capacity = 1MB
-    offset: i64,
-    len: usize,
+    extents: Option<Vec<(u64, u32)>>,      // F247 运行时 extent map（truncate 置 None）
+    cached_version: u64,                   // 上次从 KV 刷 meta/extents 时的 lease 版本
 }
 ```
 
----
+`cached_version`：Open 时与 AcquireLease 返回的版本比对，不符则丢弃缓存 InodeState 从
+`get_inode` 重建（+ 下次 rescan extent），维持 close-to-open 一致性（第二 mount
+Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 
 ## 操作路径
 
-### Read 路径
-```
-read(ino, offset, size):
-  1. 脏写缓冲与读范围重叠 → 先 flush
-  2. 小文件 inline_data → 直接返回
-  3. 计算 chunk 范围，per-chunk Get RPC（利用 sub-range）
-  4. 多 chunk 并发读 (compio spawn)
-```
+### Read
+1. 脏写缓冲与读范围重叠 → 先 flush（read-after-write 一致性）。
+2. 小文件 `inline_data` → 直接返回。
+3. 加载 extent map（F247 运行时缓存，冷启动 range-scan），条带文件先 `checked()` 校验
+   几何，为每个重叠 extent 生成 `ChunkSpec`（striped → lane key，否则 `[0x03][ino][off]`），
+   sub-range = 精确重叠区间，extent 间空洞补零（稀疏语义）。
+4. 一次批量读所有 extent slice，多 extent 并发（compio spawn，spawned `execute`
+   不持 `&FsState`）。
 
-**F-DIRECT-MANY — `--direct-read` 挂载参数（默认 ON，2026-07-09 用户指令）。**
-`read::execute` 用 `ClusterClient::get_many_direct` 取代 `get_many_into`：≥ 64 KiB
-的整 extent 读**绕过 PS 直读 EN**（PS 网卡出流量离开数据路径，大文件/模型服务跨机
-吞吐更高）；< 64 KiB 的读仍走 PS proxy（逐项按大小 gate）。默认 ON 是安全的——每项
-直读失败**逐项回退 PS proxy**（authoritative），首次回退 client 打**一次 WARN**
-提示拓扑（EN 不可达）。若部署把 EN 数据口放在 PS-only 子网，用 `--direct-read false`
-关掉以省掉每 extent 一个 redirect RTT。落点：`FsState.direct_read`
-(`main.rs` 从 `--direct-read` 置位；PyO3 `autumn.Fs.connect(direct_read=)` 同一字段)
-→ `prepare` 时抓进每个 `ReadPlan.direct_read`（spawned `execute` 不持 `&FsState`）
-→ `execute` 据此选 batch 原语。混合大小的一次读天然逐项路由：< 64 KiB 的项仍走 PS。
+**`--direct-read`（默认 ON）**：`read::execute` 用 `get_many_direct` 取代
+`get_many_into`，≥ 64 KiB 整 extent 读**绕过 PS 直读 EN**（PS 网卡出流量离开数据
+路径，大文件/模型服务跨机吞吐更高）；< 64 KiB 仍走 PS proxy（逐项按大小 gate）。
+安全：每项直读失败**逐项回退 PS proxy**（authoritative），首次回退 client 打一次 WARN
+（EN 不可达）。若 EN 数据口在 PS-only 子网，用 `--direct-read false` 省掉每 extent 一个
+redirect RTT。落点：`FsState.direct_read` → `ReadPlan.direct_read` → `execute` 选原语。
 
-### Write 路径 (带缓冲)
-```
-write(ino, offset, data):
-  1. 懒分配 1MB WriteBuffer
-  2. gap 检测 → flush
-  3. 拷贝到 buffer
-  4. buffer ≥ CHUNK_SIZE → flush 一个 chunk
-  5. 标记 dirty
-```
+### Write（带缓冲）
+1. 懒分配 `WriteBuffer`（容量 `WRITE_BUF_CAP`=64 MiB）。
+2. gap 检测（写偏移不连续）→ flush 当前缓冲。
+3. 拷贝到 buffer；满一个 buffer → `extent::write_region` 刷（拆成 `MAX_EXTENT` 封顶、
+   互不重叠的 extent，`put_many` 流水）。
+4. 标记 dirty。
 
-### Flush 路径
-```
-flush_buffer(ino):
-  对每个 chunk:
-    - 部分写 → read-modify-write
-    - 整块写 → 直接 Put
-  更新 InodeMeta.size
-```
+### Flush
+`extent::write_region`：对齐区间直接 Put；非对齐落在已有 extent 内 → RMW（读旧值、
+覆盖子区间、回写）。之后更新 `InodeMeta.size`。
 
 ### 目录操作
-- **lookup**: Get dirent key → Get inode meta
-- **readdir**: Range scan on dirent prefix
-- **mkdir**: Allocate inode + Put meta + Put dirent + Update parent nlink
-- **rename**: Delete old dirent + Put new dirent (非原子, v1 限制)
+- **lookup**：Get dirent → Get inode。
+- **readdir**：dirent 前缀 Range scan。
+- **mkdir**：alloc inode + Put meta + Put dirent + parent nlink。
+- **rename**：Delete old dirent + Put new dirent（非原子，v1 限制；rename-over 见
+  UNLINK-1）。
 
----
+## 模块职责（core / fuse 两层）
 
-## 模块职责(F-FS-UNIFY M1 起分两层 feature)
-
-**`core` feature —— fuser-free 文件系统核心**(`--no-default-features
---features core` 可独立编译,唯一额外依赖 libc;返回裸 `InodeMeta`/`DT_*`,
-供 M2 PyO3 `autumn.Fs` 绑定与 M3 fsspec facade 复用):
+**`core` feature —— fuser-free 文件系统核心**（`--no-default-features --features
+core` 可独立编译，唯一额外依赖 libc；返回裸 `InodeMeta`/`DT_*`，供 PyO3 `autumn.Fs`
+绑定与 fsspec facade 复用）：
 
 | 文件 | 职责 |
 |------|------|
-| `key.rs` | KV key 编码/解码工具函数(恒编译,无 feature 门)|
-| `schema.rs` | InodeMeta, DirentValue, ReaddirEntry(kind=DT_* byte), WriteBuffer(恒编译)|
-| `meta.rs` | inode 元数据 get/put、alloc_inode(M0 manager 取号)、S_IF* mode 格式常量 |
-| `dir.rs` | lookup/readdir/mkdir/rmdir/rename —— 返回 `(ino, InodeMeta)` / DT_* 条目 |
-| `extent.rs` | 变长 extent 寻址/写/截断/删除 |
+| `key.rs` | KV key 编码/解码（含 striped key builder；恒编译）|
+| `schema.rs` | InodeMeta / DirentValue / StripeLayout / ReaddirEntry / WriteBuffer + 常量（恒编译）|
+| `geom.rs` | declared stripe 几何 read/write（`[0x04]stripe_geom`；恒编译）|
+| `meta.rs` | inode 元数据 get/put、`alloc_inode`（manager 取号）、`ensure_root`/`ensure_schema_version`、S_IF* mode 常量 |
+| `dir.rs` | lookup/readdir/mkdir/rmdir/rename/create/unlink/resolve —— 返回 `(ino, InodeMeta)` / DT_* 条目 |
+| `extent.rs` | 变长 extent 寻址/写/RMW/截断/删除/`clean_beyond_eof`/`remove_unreachable_inode` |
 | `read.rs` / `write.rs` | 分块读组装 / 写缓冲 + flush |
-| `lease_tasks.rs` | per-session lease 后台任务(heartbeat + invalidation poll + revoked 驱逐;M4 从 dispatch 抽出,fuser-free;mount 传真 kernel invalidator、binding 传 None)|
-| `state.rs` | FsState(ClusterClient、inode 批次游标、lease 簿记)|
+| `lease_tasks.rs` | per-session lease 后台任务（heartbeat + invalidation poll + revoked 驱逐；fuser-free）|
+| `state.rs` | `FsState`（ClusterClient、inode 批次游标、lease 簿记、`direct_read`）|
 
-**`fuse` feature(default,含 `core`)—— 内核挂载胶水**:
+**`fuse` feature（default，含 `core`）—— 内核挂载胶水**：
 
 | 文件 | 职责 |
 |------|------|
-| `main.rs` | 二进制入口 + 30s 周期脏 inode sync |
-| `attr.rs` | **唯一的 core→fuser 转换点**:`inode_to_attr`/`dt_to_filetype`(M1 从 meta/dir 上移)|
-| `bridge.rs` | FsRequest enum, FUSE↔compio channel 桥接(ReaddirEntry 从 schema 再导出)|
-| `ops.rs` | fuser::Filesystem trait 实现(readdir 在 reply 边界做 DT_*→FileType)|
-| `dispatch.rs` | compio 侧派发循环(lookup/mkdir 在此转 FileAttr)|
+| `main.rs` | 二进制入口 + 30s 周期脏 inode sync + CLI |
+| `attr.rs` | **唯一的 core→fuser 转换点**：`inode_to_attr` / `dt_to_filetype` |
+| `bridge.rs` | `FsRequest` enum、FUSE↔compio channel 桥接 |
+| `ops.rs` | `fuser::Filesystem` trait 实现（readdir 在 reply 边界做 DT_*→FileType）|
+| `dispatch.rs` | compio 侧派发循环（lookup/mkdir 在此转 FileAttr；lease 三方法 `pub use` 自 `lease_tasks`）|
 
-不变量:core 文件**禁止 import fuser**(`cargo tree --features core` 中
-fuser 计数为 0 是 M1 验收标准);新的 core→fuser 转换一律进 `attr.rs`。
+不变量：core 文件**禁止 import fuser**（`cargo tree --features core` 中 fuser 计数
+为 0）；新的 core→fuser 转换一律进 `attr.rs`。PyO3 `autumn.Fs`（`python/src/fs.rs`）
+与 fsspec facade 调用的就是这份 Rust core，一处实现两个前端不 drift；绑定用一个专属
+compio worker 线程独占 `!Send` 的 `FsState`（Python 同步方法 ship job 阻塞取结果）。
 
-### F-FS-UNIFY M2 —— PyO3 `autumn.Fs` 绑定复用同一 core
+## Per-session lease + 跨前端围栏
 
-M2 给 core 加了一层 PyO3 绑定(`python/src/fs.rs` 的 `autumn.Fs` 类),让
-Python 直接做 inode 级文件系统操作。**逻辑不在 Python 重写 —— 绑定调用的
-就是 fuse 二进制跑的那份 Rust core**,一处实现两个前端,不会 drift。
+per-session lease 后台任务（5s heartbeat 续所有 held lease + 持久 invalidation
+long-poll + `LeaseRevoked` 驱逐）在 `lease_tasks.rs`（core）；mount 传真 kernel
+invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 
-为消除 dispatch↔binding 的潜在重复,M2 把原先内联在 `dispatch.rs` 的文件
-create/unlink KV 步骤抽成 core 函数,dispatch 改为调用(M1 同款):
+- **写写围栏**：写路径 `acquire(WRITE)` 环绕；冲突时 fsspec facade 抛
+  `BlockingIOError`，被抢占租约标 revoked、`write` 对 revoked 租约快失败（无租约的
+  匿名写仍放行）。写租约在长写期间被续。
+- **读一致性**：靠 fresh-read + Q1 只写租约（binding 只在写时缓存，release 时
+  `forget` 驱逐 inode 缓存）。
 
-| 新增/改动(core) | 说明 |
-|---|---|
-| `dir::create`(文件)| 从 dispatch Create 抽出;exists→EEXIST、alloc、put inode/dirent、parent mtime、lookup_count++。**不**做 lease、**不**建运行时 InodeState 缓存(那是前端职责)|
-| `dir::unlink`(文件)| 从 dispatch Unlink 抽出;dirent 删除 + nlink-- + `remove_unreachable_inode`(UNLINK-1 墓碑)|
-| `dir::resolve(path)`| 路径→ino 从 ROOT 逐段游走(fuse 内核自带 parent,故只有 Python 面需要);用 `kv_get_opt` 屏障(缺失=None,硬错=Err);`..` 拒绝(精简面不追父指针)|
-| `meta::ensure_root`| 建根 inode(若缺);**fail-loud**(`kv_get_opt`,不再像旧 `init_root` 那样把瞬时错当"已存在"而重建根);**不**本地 seed inode 批次 → 所有 inode 走 M0 manager 发号,对并发写者安全 |
-| `dispatch::init_root`| 改为调 `ensure_root` + 仅在全新 FS 时叠加 fuse 专属的 pre-manager 本地批次 seed(行为对 fuse 不变)|
-| `FsState::new_with_host`| 显式 host(不读 env,[[feedback_no_env_in_rs]]);`new` 保留 env 默认给 fuse 二进制 |
+## Schema 版本戳（fail-loud）
 
-绑定线程模型照搬 `Memory`:一个专属 compio worker 线程独占 `!Send` 的
-`FsState`,Python 同步方法 ship 一个 job 过去并阻塞(GIL 释放)取结果。job
-签名用 HRTB `for<'a> FnOnce(&'a mut FsState) -> LocalBoxFuture<'a,()>`,让
-core op 在其 await 间持有 `&mut`(worker 串行处理,一次一个借用,安全)。
-sync 面是因为 M3 fsspec `AbstractFileSystem` 是同步 API。
+`schema::SCHEMA_VERSION` = **3**，存于 `[0x04]schema_version`（相对 key，即
+`fs/[0x04]schema_version`）。`meta::ensure_schema_version` 在 mount（`ensure_root`
+入口）缺则戳、有则核对、**不符则 fail-loud 拒挂**（防未来不兼容布局静默读写坏数据）。
+- v1 = pre-namespace 裸 key（从不戳）。
+- v2 = namespaced 相对布局 + 全局 inode 计数器。
+- v3 = F-FS-STRIPE：`InodeMeta` 加 `stripe` 字段（rkyv 布局变，v2 inode 字节解不出），
+  大文件走 lane-striped key。v2→v3 stop-world reset，无 in-place 迁移；小/legacy 文件
+  仍 `stripe=None` + `[0x03][ino][off]`。BUMP whenever 布局/编码不兼容变更。
 
-### F-FS-UNIFY M4 —— lease 接线 + 跨面围栏(F-FS-UNIFY 完成）
+## 配置（CLI）
 
-M4 把 per-session lease 后台任务(5s heartbeat 续所有 held lease + 持久
-invalidation long-poll + `LeaseRevoked` 驱逐)从 fuse-gated `dispatch.rs`
-抽到 fuser-free 的 `lease_tasks.rs`(core;`dispatch.rs` 用 `pub use` 再导出,
-mount + 单测引用不变;core feature 因此加 `compio` 依赖供 spawn/timer)。
-- **binding**:connect 后 `spawn_lease_background_tasks(&state, None)`(headless,
-  无 kernel 页缓存驱逐)→ facade 的写租约在长写期间被续、被抢占时标 revoked;
-  `Fs.forget(ino)` 驱逐 inode 缓存;`write` 对 revoked 租约快失败(无租约的
-  匿名写仍放行 = M2 语义)。
-- **facade**(fsspec):写路径 `acquire(WRITE)` 环绕(pipe_file + buffered
-  `_initiate_upload`→final `_upload_chunk` flush+release+forget),冲突抛
-  `BlockingIOError` → 跨面写写围栏;读一致性靠 fresh-read(binding 只在写时
-  缓存 + release 时 forget)+ Q1 只写租约。
-- 验收:`run_fs_lease_e2e.sh`(两 DaemonClientId 写 XOR + 一致性 + forget 驱逐)、
-  `test_cross_facade_coherence`;fuse e2e 抽取后全绿。
-
-M2 边界(现已由 M4 补齐):lease 三方法在 M2 是薄 wrapper;open→acquire→
-heartbeat→release 的 facade 逻辑 + 围栏在 M4 接线。fsspec 改写是 M3。
-headless 验收 = `python/tests/run_fs_e2e.sh` + `run_fs_lease_e2e.sh`。
-
----
-
-## 配置
-
-```rust
-struct FuseConfig {
-    manager_addr: String,
-    mountpoint: String,
-
-    // 缓存 (来自 3FS)
-    attr_timeout_secs: f64,      // 默认 30
-    entry_timeout_secs: f64,     // 默认 30
-    negative_timeout_secs: f64,  // 默认 5
-
-    // 写缓冲 (来自 3FS)
-    write_buf_size: usize,       // 默认 1MB
-    chunk_size: usize,           // 默认 256KB
-
-    // 周期 sync (来自 3FS)
-    sync_interval_secs: u64,     // 默认 30
-    sync_max_dirty: usize,       // 默认 1000
-
-    // FUSE
-    allow_other: bool,
-    max_readahead: usize,        // 默认 16MB
-}
-```
-
----
-
-## 实现分阶段
-
-### Phase 1 — MVP
-init, destroy, lookup, forget, getattr, setattr, mkdir, rmdir, unlink, rename,
-create, open, read, write, flush, release, fsync, opendir, readdir, releasedir, statfs
-
-### Phase 2 — 完善
-symlink, readlink, link, readdirplus, xattr
-
-### Phase 3 — 高级性能
-I/O Ring, copy_file_range, fallocate
-
----
+`autumn-fuse` 参数：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
+`--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
+则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
+cluster 一致）、`--direct-read`（default true）。内核缓存 `attr_timeout` /
+`entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
 
 ## 关键依赖文件
 
@@ -630,162 +345,92 @@ I/O Ring, copy_file_range, fallocate
 |------|------|
 | `crates/client/src/lib.rs` | ClusterClient — 所有 KV 操作入口 |
 | `crates/rpc/src/partition_rpc.rs` | PutReq/GetReq/RangeReq/DeleteReq |
-| `crates/rpc/src/server.rs` | Dispatcher 模式参考（bridge 设计） |
+| `crates/rpc/src/server.rs` | Dispatcher 模式参考（bridge 设计）|
 
-## Crash-consistency contract (BUG-LEASE-8, 2026-06-12)
+## Crash-consistency contract
 
-The fuse layer has NO multi-key atomic commit (the full fix — a per-inode
-generation manifest — stays deferred in feature_list BUG-LEASE-8). What IS
-guaranteed is a strict ordering discipline so that a crash anywhere never
-FABRICATES data; it can only lose a recent un-fsynced write:
+fuse 层无多 key 原子提交（完整方案 per-inode generation manifest 仍 deferred）。保证
+的是严格的顺序纪律：崩溃**永不伪造数据**，最多丢失最近未 fsync 的写。规则（present-tense
+不变量 + 一句原因）：
 
-- **Grow / write path**: extent KV puts are all-replica ACKed
-  (`write_region(..).await?`) BEFORE the inode-meta size advances and is
-  persisted. Crash between ⇒ durable size is SHORT of the written extents:
-  the file just looks older (POSIX-acceptable for un-fsynced data). The
-  beyond-size extent KVs are benign orphans: invisible to reads (bounded
-  by size), overwritten by a regrowing append (same `[0x03][ino][off]`
-  keys), and reaped by unlink / truncate (both PREFIX-scan, not
-  size-bounded).
-- **In-place overwrite (RMW) read barrier (RMW-GET-SWALLOW, 2026-06-23)**:
-  a partial write whose offset lands INSIDE an existing extent must
-  read-modify-write that extent's value (`extent::write_region` RMW
-  branch). The existing-value read MUST use the `kv_get_opt` barrier and
-  PROPAGATE a hard error — exactly like `clean_beyond_eof`. Pre-fix it was
-  `kv_get(&ck).await.unwrap_or_default()`, which collapsed a transient
-  RPC/routing/storage error into an EMPTY value; the code then zero-filled
-  the untouched prefix `[start, offset)`, TRUNCATED the untouched suffix,
-  and `put` the result — fabricating zeros / dropping bytes on a
-  *successful* write (the cp-only append workload never hits RMW, so
-  `fuse_chaos` T1–T3 missed it). The corruption is deterministic when the
-  RMW's `get` hard-errors but the following `put` lands: `get`/`put` have
-  SEPARATE 10-refresh (~13 s) retry budgets, so a PS that is briefly
-  unavailable (kill, migration > budget, a single RPC timeout under load)
-  exhausts the `get` while the `put` later succeeds. Fix propagates → fuse
-  EIO (the app retries); only a genuinely-absent key (`Ok(None)`, which a
-  mapped extent should never be) is treated as the safe sparse-empty value.
-  Guarded by the dedicated `scripts/fuse_rmw_chaos.sh` (partial overwrite + PS
-  kill + restart-at-16s so the get's retry budget exhausts while the put lands;
-  asserts the untouched prefix is NEVER zeroed). It is SINGLE-PS on purpose —
-  a kill+respawn in the 2-PS `fuse_chaos.sh` migrates the partition and the
-  post-restart verify read can wedge on part_addr reconvergence, which is
-  unrelated to this bug; single-PS has no migration so the read returns.
-- **Shrink / truncate path (the fixed bug)**: the inode-meta put is the
-  COMMIT POINT — it lands BEFORE extents are deleted/shortened. Pre-fix
-  the order was inverted: a crash between extent destruction and the meta
-  put left durable size = old_size with the tail data already gone, so
-  reads returned ZEROS INSIDE the file — the one crash window in this
-  layer that fabricated data. Invariant: **content[0..size] always equals
-  what was last successfully written there; a crash may only choose WHICH
-  size (old or new) survives.** Covered by `scripts/fuse_chaos.sh` T1
-  (truncate burst + kill -9 mid-burst + remount + prefix-exact verify).
-- **Leftover reaping on GROW (coco P1)**: with meta-first shrink, a crash
-  in the post-commit cleanup window leaves extents beyond the durable
-  size. They are invisible while size stays put, but a later GROW would
-  re-expose them as resurrected old data where POSIX requires zeros.
-  `extent::clean_beyond_eof(ino, eof)` (raw prefix scan; deletes whole
-  keys ≥ eof, shortens the straddler by its ACTUAL KV value length)
-  runs on every grow path: `write::write` ENTRY when `offset > size`
-  (coco P0: the sweep must fire BEFORE the in-memory size bump — the
-  bump erases the pre-grow EOF, so by flush time `write_region` sees
-  the grown size and a stale straddler tail looks like legitimate
-  in-file data whose RMW would merge the write into pre-shrink bytes),
-  `write::truncate` grow branch (before the meta put), and
-  `write_region` entry as defense (leftover keys visible in the prefix
-  scan / sparse grow vs the passed file_size). Contiguous appends
-  self-bound (the new key at old-EOF caps the straddler's inferred
-  length) — the hot path pays one size compare. The sweep is a
-  pre-grow BARRIER: a hard kv error on the straddler read PROPAGATES
-  (aborts the grow) — only a genuinely absent key may be skipped
-  (`kv_get_opt`, coco P1).
-- **Post-commit cleanup errors do NOT fail the truncate** (coco P1): the
-  shrink is committed once the meta lands; surfacing a cleanup error
-  would make the caller retry into the `new_size == old_size` early
-  return (a no-op that never re-cleans). WARN + invalidate instead;
-  leftovers are reaped by the next grow/unlink.
-- **UNLINK-1 (closed the former "deferred gap")**: unlink and
-  rename-over-existing remove the target's data through
-  `extent::remove_unreachable_inode` — an intent TOMBSTONE
-  (`[0x04]rmtomb/[ino]`) written the moment the inode becomes
-  UNREACHABLE, then extents + inode key + tombstone deleted;
-  `sweep_unlink_tombstones` replays survivors at every mount (Init).
-  INVARIANT: a tombstone is only ever written for an unreachable inode
-  (the sweep deletes unconditionally) — in rename-over this forces the
-  removal AFTER the dirent overwrite. The residual leak window is the
-  single unreachability→tombstone RPC gap (pre-fix: the whole scan + N
-  deletes). Bonus unconditional bug fixed en route: rename-over deleted
-  the target's INODE but never its EXTENTS — the POSIX atomic-save
-  pattern (write tmp; mv tmp file) leaked the entire previous content
-  on EVERY save. Covered by fuse_chaos T3 (unlink burst + kill +
-  remount sweep; rename-over content check).
-- **Read-path bug found by the T2 harness check (fixed in
-  partition-server)**: a sub-range GET fully past a VP value's end
-  clamped to a zero-length read, and `read_value_from_log`'s pooled
-  fast path returned the recycled RegPool buffer's STALE contents as
-  the value — fuse reads of a shortened/sparse extent window got
-  varying garbage instead of zeros. Now short-circuits to empty
-  (`crates/partition-server/src/background.rs::read_value_from_log`).
-  Caller-side counterpart (coco P1): the ioring daemon's `read_into`
-  zeroes the unwritten tail of every short/empty extent slice — its
-  dest is a REUSED ring buffer, not a fresh zeroed Vec (the fuse path
-  pre-zeros its whole buffer; ioring zeroed only the gaps BETWEEN
-  extents). `crates/ioring/src/fuse_read.rs`.
+- **Grow / write**：extent KV put 全副本 ACK（`write_region(..).await?`）**后**才推进
+  并持久化 inode-meta size。原因：崩溃只让 durable size 落后于已写 extent（文件看起来
+  更旧，未 fsync 数据 POSIX 可接受）；beyond-size extent 是良性孤儿（读被 size 界住不
+  可见、regrow 用同 `[0x03][ino][off]` key 覆盖、unlink/truncate 前缀扫描回收）。
+- **Read-after-write barrier**：read 前若脏写缓冲与读范围重叠**必先 flush**。原因：
+  否则读到未落盘的旧内容，破坏 read-after-write 一致性。
+- **In-place overwrite (RMW) read barrier**：部分写落在已有 extent 内必须
+  read-modify-write，读旧值**必用 `kv_get_opt` 屏障并 PROPAGATE 硬错**（同
+  `clean_beyond_eof`）。原因：把瞬时 RPC/routing/storage 错吞成空值会零填未触及前缀
+  `[start, offset)`、截断未触及后缀、再 put → 在成功写里伪造零/丢字节（`get`/`put`
+  各有独立 ~13s 重试预算，PS 短暂不可用时 get 耗尽而 put 后成功 → 确定性损坏）。只有
+  真正 `Ok(None)`（已映射 extent 不该出现）当稀疏空值。守卫 `scripts/fuse_rmw_chaos.sh`
+  （单 PS，partial overwrite + PS kill + restart-at-16s 使 get 预算耗尽而 put 落地，
+  断言未触及前缀永不被零）。
+- **Shrink / truncate**：inode-meta put 是 **COMMIT POINT**，先落，再删/缩 extent。
+  原因：反序会在 durable size=old 但尾数据已删时读到文件内部零。**不变量：
+  content[0..size] 永远等于最后成功写入的内容；崩溃只能选 old/new 哪个 size 存活。**
+  守卫 `fuse_chaos.sh` T1（truncate burst + kill -9 mid-burst + remount + 前缀精确校验）。
+- **Grow 上的 leftover reaping**（`clean_beyond_eof(ino, eof)`）：每条 grow 路径先做
+  raw 前缀扫描，删 ≥ eof 的整 key、按 straddler 的**真实 KV value 长度**缩它。原因：
+  meta-first shrink 后崩溃残留的 beyond-size extent，日后 grow 会当作复活的旧数据
+  （POSIX 要求零）。必须在内存 size bump **之前**跑（bump 抹掉 pre-grow EOF，否则
+  flush 时 `write_region` 看到已 grow 的 size、陈旧 straddler 尾看似合法 in-file
+  数据）。跑在 `write::write` 入口（`offset > size`）、`write::truncate` grow 分支
+  （meta put 前）、`write_region` 入口（防御）。硬 kv 错传播中止 grow，只有真正缺失
+  key 可跳过（`kv_get_opt`）。连续 append 自界（old-EOF 的新 key 封住 straddler 推断
+  长度），热路径只付一次 size 比较。
+- **Post-commit cleanup 错误不失败 truncate**：meta 落地即已提交；上报清理错误会让
+  caller 重试进 `new_size == old_size` 早返回（no-op，永不重清）。WARN + invalidate，
+  残留由下次 grow/unlink 回收。
+- **UNLINK-1 tombstone**：unlink 与 rename-over 通过 `extent::remove_unreachable_inode`
+  删目标数据 —— inode 变 UNREACHABLE 的**瞬间**写 intent tombstone
+  （`[0x04]rmtomb/[ino]`），再删 extent + inode key + tombstone；
+  `sweep_unlink_tombstones` 每次 mount（Init）重放幸存者。**不变量：tombstone 只为
+  不可达 inode 写**（sweep 无条件删）—— rename-over 里这强制删除发生在 dirent 覆盖
+  之后。原因：残留泄漏窗口从"整次扫描 + N 删"缩到单次 unreachability→tombstone RPC
+  gap。rename-over 必须同时删目标 **extent**（否则 POSIX atomic-save「写 tmp；mv tmp
+  file」每次泄漏整份旧内容）。守卫 `fuse_chaos` T3。
+- **Read-path 边界短路**（partition-server + ioring）：完全越过 VP value 末尾的
+  sub-range GET 短路成空（`read_value_from_log` 不返回复用 RegPool buffer 的陈旧
+  内容）；caller 侧 ioring `read_into` 对短/空 extent slice 的未写尾清零（dest 是复用
+  ring buffer，非新零 Vec）。原因：读缩短/稀疏 extent 窗口应得零而非 garbage。
 
-## statfs — real backend capacity (CLUSTER-DF, 2026-06-16)
+## statfs — 保守 3 副本映射
 
-`df -h <mountpoint>` was a hardcoded 1 TiB / 512 GiB placeholder. The `Statfs`
-arm in `dispatch.rs` now calls `state.client.cluster_df()` (the `MSG_CLUSTER_DF`
-aggregate snapshot — RAW + autumn physical_used summed from every EN's df) and
-maps it **conservatively at the 3-replica factor**: `blocks = raw_total/3/4096`,
-`bavail = bfree = raw_free/3/4096`. Usable LOGICAL capacity is a RANGE under EC
-(cold EC 1.25–1.33× vs hot 3×); statfs is a single scalar, so — CephFS-style —
-we collapse the range to the WORST factor so `df` never over-reports free and
-can't lull a writer into an optimistic ENOSPC (already-EC'd cold data means real
-free is higher; under-reporting is the safe side). The call is BOUNDED
-(`compio::time::timeout` 2 s) so a slow/down manager can't hang the syscall —
-on timeout/error it falls back to the benign large default. statfs is rare
-(a `df` invocation) so an inline call is fine; no background cache needed.
-File `size` stays the logical size (replica/EC amplification is transparent to
-the FS layer, matching Ceph/HDFS). inode counts (files/ffree) stay a constant.
+`df -h <mountpoint>` 的 `Statfs` 调 `state.client.cluster_df()`（`MSG_CLUSTER_DF`
+聚合快照，每 EN 的 RAW + autumn physical_used 求和），**按 3 副本因子保守映射**：
+`blocks = raw_total/3/4096`，`bavail = bfree = raw_free/3/4096`。EC 下可用逻辑容量是
+个区间（cold EC 1.25–1.33× vs hot 3×），statfs 是单标量 → 收敛到 WORST 因子（CephFS
+式），使 `df` 绝不高报空闲、不会诱使 writer 乐观 ENOSPC（低报是安全侧）。调用有界
+（`compio::time::timeout` 2s），超时/错回退到良性大默认值。文件 `size` 保持逻辑大小
+（副本/EC 放大对 FS 层透明）；inode 计数为常量。
 
-## Restart behaviour under chaos — EN vs PS (2026-06-23)
+## Restart 行为 —— EN vs PS
 
-Three restart classes, each with its own harness:
+- **PS kill+restart**（`scripts/fuse_chaos.sh` F1）：分区 MIGRATE 到另一 PS，region
+  重收敛后 I/O 恢复，已 sync 文件字节精确。RMW-GET-SWALLOW 窗口由
+  `scripts/fuse_rmw_chaos.sh` 覆盖。
+- **manager / fuse-daemon kill+restart**：`fuse_chaos.sh` F2/F3。
+- **EN kill+restart**（`scripts/fuse_en_restart_chaos.sh`）：EN kill **不迁移**分区，
+  stream 层把读写 failover 到存活副本。**INTEGRITY 完好** —— 4 轮 kill+restart（全 3
+  EN）+ remount 验证 6 个 durable 文件（4 KiB..10 MiB 含多 extent）+ 4 个反复 RMW
+  文件对 lockstep mirror 字节精确。
 
-- **PS (partition-server) kill+restart** — `scripts/fuse_chaos.sh` F1. The
-  partition MIGRATES to another PS; file I/O resumes after region
-  reconvergence; synced files stay byte-exact. The RMW-GET-SWALLOW guard
-  (`scripts/fuse_rmw_chaos.sh`) covers the PS-down RMW corruption window.
-- **manager / fuse-daemon kill+restart** — `fuse_chaos.sh` F2/F3.
-- **EN (extent-node, data-plane) kill+restart** —
-  `scripts/fuse_en_restart_chaos.sh`. An EN kill does NOT migrate partitions;
-  the stream layer fails reads/writes over to the surviving replicas.
-  **INTEGRITY is intact** — verified byte-exact across 4 kill+restart rounds
-  (all 3 ENs) + a remount, for 6 durable files (4 KiB..10 MiB incl.
-  multi-extent) + 4 repeatedly-RMW'd files vs a lockstep mirror.
+  **WRITE 可用性 caveat = CAPACITY 非 failover-latency bug**：EN kill 只在 cluster
+  恰好 = RF（=3）EN 时 stall 写。
+  - **3 EN / RF=3**：每 extent 在全 3 EN，killing 1 剩 2 healthy `< RF`，
+    `select_nodes` 组不出新 3 副本 extent → all-replica-ACK append 不完成、new-extent
+    alloc 反复退回死节点 → 单次写 WEDGE 到 EN 回来（实测一次 put 撞 90s CLI 超时，
+    实际无界）。这是 RF=N-on-N 的真相（Ceph/HDFS 同样在 3 节点 RF=3 一个 down 时停写），
+    非 autumn 缺陷。
+  - **5 EN / RF=3**：killing 1 剩 4 healthy `≥ RF` → 新 extent 在 healthy 节点 alloc，
+    append 透明滚过死副本 extent → **写永不 stall**（实测每 put/get < 0.1s，PS
+    retries=0）。
+  - READS 在任意 cluster 大小容忍一个 down 副本（min-quorum read），这就是上面 3 EN
+    下 integrity 校验总过的原因。
 
-  **WRITE-availability caveat = CAPACITY, not a failover-latency bug
-  (localized 2026-06-23, reproduce-first via `autumn-client`, no fuse bridge).**
-  An EN kill stalls WRITES only when the cluster has exactly RF (=3) ENs:
-  - **3 ENs, RF=3:** every extent lives on all 3 ENs, and killing 1 leaves 2
-    healthy `< RF` — `select_nodes` cannot form a new 3-replica extent without
-    the dead node, so the F227 all-replica-ACK append never completes and a
-    new-extent alloc keeps falling back to the dead node → a single write
-    WEDGES until the EN returns (measured: one `put` hit the 90 s CLI timeout;
-    effectively unbounded). This is the RF=N-on-N-nodes truth (Ceph/HDFS halt
-    writes too at RF=3 on 3 nodes with one down), NOT an autumn defect.
-  - **5 ENs, RF=3:** killing 1 leaves 4 healthy `≥ RF` → new extents alloc on
-    healthy nodes, the append rolls off the dead-replica extent transparently
-    → **writes never stall** (measured: every put/get < 0.1 s with 1 EN down,
-    PS `retries=0`, no manager Suspected-mark even needed).
-  READS tolerate a down replica at ANY cluster size (min-quorum read), which is
-  why the integrity check above always passed even at 3 ENs.
-
-  CONSEQUENCE for these harnesses: `fuse_chaos.sh` / `fuse_en_restart_chaos.sh`
-  run 3 ENs, so they verify EN-restart INTEGRITY (the EN is respawned quickly,
-  reads work throughout) but DO NOT exercise sustained writes-during-EN-down
-  (that would just hit the RF=3 capacity wedge). To test write availability
-  under EN loss, provision >RF ENs. The single-threaded fuse dispatcher + 30 s
-  bridge `REPLY_TIMEOUT` only AMPLIFY a stall into an EIO; they are not the
-  cause. No stream-layer timeout change is warranted (the "fast-fail the stale
-  EN conn" idea was the wrong diagnosis).
+  CONSEQUENCE：`fuse_chaos.sh` / `fuse_en_restart_chaos.sh` 跑 3 EN，验的是 EN-restart
+  INTEGRITY（EN 很快重生、读全程可用），**不**测 EN-down 期间持续写（那只会撞 RF=3
+  capacity wedge）。要测 EN 丢失下的写可用性须配 >RF 台 EN。单线程 fuse dispatcher +
+  30s bridge `REPLY_TIMEOUT` 只把 stall 放大成 EIO，非成因；无需改 stream 层超时。

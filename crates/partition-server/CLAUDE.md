@@ -6,7 +6,7 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## Architecture
 
-### Thread Model (post F099-J/K/I, 2026-04-20)
+### Thread Model
 
 ```
 Main compio thread (control plane + fd dispatcher)
@@ -19,16 +19,13 @@ Accept OS thread (blocking)
 
 Partition threads — 2 OS threads per partition:
 ├─ part-N (P-log): OWNS
-│     • partition_loop (request dispatch + group-commit SQ/CQ)
-│     • fd-drain task: fd_rx.next() → compio::TcpStream → spawn ps-conn task
-│     • ps-conn task × K (one per live client connection, all on this runtime)
-│     • background_flush_loop, background_maintenance_loop (compaction + GC
-│       on ONE task — see "GC/compaction merged loop" below)
+│     • partition_loop (request dispatch + group-commit SQ/CQ; write loop is
+│       inlined here — no per-Put spawn/oneshot)
+│     • per-partition accept loop + ps-conn tasks (one per live client conn),
+│       all on THIS compio runtime
+│     • background_maintenance_loop (compaction + GC on ONE task), flush loop
 │     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
 │     • dedicated StreamClient + ConnPool for log_stream/meta_stream
-│     • F099-D: write loop inlined into partition_loop (no spawn/oneshot)
-│     • F099-J: ps-conn tasks collocated here; per-request mpsc hop is now
-│       same-thread (no eventfd, no cross-thread futex).
 ├─ part-N-bulk (P-bulk): flush_worker_loop
 │     • own compio runtime + io_uring + ConnPool + StreamClient
 │     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
@@ -38,40 +35,34 @@ P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 ```
 
 **Thread count**: `1 main + 1 ps-accept + 2N partition` = `2N + 2` OS threads.
-At N=1 this is **4** OS threads total (vs pre-F099-J `3 + (CPU-count workers) + 2 = ~194`).
 
 **Why two OS threads per partition?** A 128 MB row_stream flush holds the P-log
-compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait), head-
-of-line-blocking the log_stream 4 KB WAL batches sharing the same io_uring. The
-F087-bulk-mux pool split separated the TCP sockets, but the runtime was still
-single-threaded. F088 gives flush its own runtime so WAL appends make forward
-progress concurrently with SST uploads.
+compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait),
+head-of-line-blocking the log_stream 4 KB WAL batches sharing the same io_uring.
+P-bulk gives flush its own runtime so WAL appends make forward progress
+concurrently with SST uploads.
 
-**How ps-conn handoff works (F099-J + F099-K)**:
-- Post F099-K, each partition OS thread binds its OWN `compio::net::TcpListener`
-  on a unique port (`base_port + ord`) and runs its own accept loop + ps-conn
-  tasks on the SAME compio runtime as `partition_loop`. The main thread
-  does NOT forward fds across partitions; clients connect directly to the
-  owning partition's port (part_addr reported via `MSG_REGISTER_PARTITION_ADDR`
-  and served to clients via `GetRegions.part_addrs`).
-- Each ps-conn task runs `handle_ps_connection` on THIS runtime. Its
-  `req_tx.send(req).await` is a same-thread mpsc send; the matching
-  `req_rx.next().await` inside `partition_loop` wakes via a local
-  Waker (Rc-based) — no eventfd, no cross-thread futex.
+**ps-conn handoff (per-partition listeners)**: each partition OS thread binds its
+OWN `compio::net::TcpListener` on a unique port (`base_port + ord`) and runs its
+own accept loop + ps-conn tasks on the SAME compio runtime as `partition_loop`.
+The main thread does NOT forward fds across partitions; clients connect directly
+to the owning partition's port (`part_addr` reported via
+`MSG_REGISTER_PARTITION_ADDR`, served to clients via `GetRegions.part_addrs`).
+Each ps-conn task's `req_tx.send(req).await` is a same-thread mpsc send; the
+matching `req_rx.next().await` inside `partition_loop` wakes via a local Rc-based
+Waker — no eventfd, no cross-thread futex.
 
-**ps-conn handler — F099-I true SQ/CQ inner loop (commit f099i)**:
-`handle_ps_connection` mirrors the ExtentNode R4 4.2 v3 pattern
-(`stream::extent_node::handle_connection`, commit `1e7e456`):
+**ps-conn handler — SQ/CQ inner loop** (`handle_ps_connection`, one task per TCP
+conn):
 
 ```
-┌─ handle_ps_connection (one task per TCP conn) ──────────────────┐
-│                                                                 │
+┌─ handle_ps_connection ──────────────────────────────────────────┐
 │  SQ side — persistent read future:                              │
 │    Option<LocalBoxFuture<'static, PsReadBurst>>                 │
 │    owns OwnedReadHalf + 64 KiB buf across iterations;           │
 │    NEVER dropped mid-flight (io_uring SQE stability)            │
 │                                                                 │
-│  CQ side — FuturesUnordered<LocalBoxFuture<'static, Bytes>>     │
+│  CQ side — FuturesUnordered<LocalBoxFuture<'static, ...>>       │
 │    cap = AUTUMN_PS_CONN_INFLIGHT_CAP (default 64)               │
 │    each future: clone req_tx → send PartitionRequest →          │
 │                 await oneshot resp → encode Frame::response     │
@@ -83,69 +74,41 @@ progress concurrently with SST uploads.
 │    (C) branch on (n_inflight, at_cap):                          │
 │       n_inflight == 0 → await read alone; then                  │
 │         d=1 FAST PATH: if the burst yielded exactly one          │
-│         complete frame AND inflight/tx_bufs are empty,           │
-│         run request→response→write inline via `write_all`       │
-│         (no FU, no Box::pin, no write_vectored). Restores       │
-│         pre-F099-I cost at pipeline-depth=1.                     │
+│         complete frame AND inflight/tx_bufs empty, run           │
+│         request→response→write inline via write_all             │
+│         (no FU, no Box::pin, no write_vectored)                 │
 │       at_cap          → await completion alone (back-pressure)  │
-│       n_inflight == 1 → await completion (fast path: avoid      │
-│           5-10 µs per-iter select polling cost at d=1)          │
+│       n_inflight == 1 → await completion (avoid select cost)    │
 │       n_inflight > 1  → select(read, inflight.next())           │
-│           Left wins  → process frames, restart read_fut         │
-│           Right wins → put read_fut back, extend tx_bufs        │
 │    (D) on EOF: drain remaining inflight + final flush + return  │
-│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-At `--pipeline-depth=1`: the d=1 fast path engages — after reading a
-single-frame burst with no earlier in-flight replies, the ps-conn task
-does `tx.send(req) → resp_rx.await → writer.write_all(bytes)` inline.
-No `Box::pin(async {...})` heap alloc, no `FuturesUnordered::push`, no
-`write_vectored_all([1_iov])` — strictly cheaper than the pre-F099-I
-baseline's `write_all(one_frame)` path.
+At `--pipeline-depth ≥ N`, one TCP read delivers N frames → all N futures run
+concurrently → drain-all-ready collects up to N ready replies into `tx_bufs` →
+one `write_vectored_all` = one `tcp_sendmsg`. This targets small-frame TCP kernel
+overhead (32–63 B PutResp headers): ~N× fewer kernel TCP traversals per Put.
 
-At `--pipeline-depth ≥ N`: one TCP read delivers N frames → all N futures
-in `inflight` concurrently → drain-all-ready collects up to N ready replies
-into `tx_bufs` → one `write_vectored_all` = one `tcp_sendmsg`. Targeted
-win against F099-H's measured 0.8 CPU cores of small-frame TCP kernel
-overhead (91 % of `tcp_sendmsg` at 32–63 B PutResp headers, 22 µs each,
-34 k/s → ~N× fewer kernel TCP traversals per Put).
+**Back-pressure**: if `inflight.len()` reaches the cap mid-push,
+`push_frames_to_inflight` awaits one completion before pushing the next future —
+caps memory per pathological client (a large pipeline burst all targeting one
+partition).
 
-Back-pressure: if `inflight.len()` reaches the cap mid-push, the inner
-`push_frames_to_inflight` helper awaits one completion before pushing the
-next future. This caps memory usage per pathological client (e.g. a large
-pipeline-depth burst all targeting the same partition).
-
-Mis-routed frames (`part_id != owner_part`) synthesise an immediate
-`NotFound` error frame onto inflight — no mpsc hop. TODO(F099-K):
-forward to owning partition's req_tx instead.
-
-**N>1 behaviour (F099-K)**: with per-partition listeners, each
-`handle_ps_connection` serves only frames whose `part_id == owner_part`.
-The client (autumn-client `perf-check`) is F099-K-aware and opens one
-TCP connection to each partition's port, striping requests across them
-by partition id.
-
-**Trade-off measured**:
-- Pre-F099-J P-log CPU: ~57 % user / 43 % iouring-idle (F099-H §2.3).
-- Post-F099-J P-log CPU: ~100 % — ps-conn decode + dispatch + response
-  writes all run on this thread.
-- Post F099-K: load distributes across N partition threads, each with
-  its own listener + P-log.
-- Post F099-I: ~N× fewer `tcp_sendmsg` calls at pipeline-depth=N, which
-  at the 57 k N=1 × d=1 ceiling accounted for 0.8 CPU cores of pure
-  kernel TCP overhead.
+**Mis-routed frames** (`part_id != owner_part`) synthesise an immediate
+`NotFound` error frame onto inflight — no mpsc hop. With per-partition listeners
+each `handle_ps_connection` serves only frames whose `part_id == owner_part`; a
+partition-aware client opens one TCP connection per partition port and stripes
+requests by partition id.
 
 ```
 ┌─────────────────── PartitionServer ────────────────────┐
 │  Rc<RefCell<HashMap<part_id, PartitionHandle>>>         │
-│  (F099-J: no Arc<PartitionRouter> — ps-conn tasks run   │
-│           on the P-log runtime and use a same-thread    │
-│           PartitionRequest mpsc; no cross-thread wake)  │
+│  (ps-conn tasks run on the P-log runtime and use a      │
+│   same-thread PartitionRequest mpsc; no cross-thread    │
+│   wake, no Arc<PartitionRouter>)                        │
 │                                                          │
 │  ┌──────── PartitionData (per partition thread) ───┐    │
-│  │  active: Memtable (RwLock<BTreeMap>, F099-C)     │    │
+│  │  active: Memtable (RwLock<BTreeMap>)             │    │
 │  │  imm: VecDeque<Arc<Memtable>>   ← frozen tables  │    │
 │  │  sst_readers: Vec<Arc<SstReader>>  ← oldest→new  │    │
 │  │  tables: Vec<TableMeta>          ← aligned        │    │
@@ -154,8 +117,6 @@ by partition id.
 │  │  row_stream_id   ← SSTables                       │    │
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
-│  │  (F099-D: no write_tx — writes come directly from │    │
-│  │   req_rx via partition_loop)                │    │
 │  │  seq_number: monotonic MVCC counter               │    │
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
@@ -168,402 +129,270 @@ by partition id.
 
 Internal (storage) key = `user_key ++ 0x00 ++ BigEndian(u64::MAX - seq_number)`
 
-The null byte (`0x00`) is a **separator** between the user key and the inverted sequence number. This is critical: without the separator, a user key that is a prefix of another (e.g. `"mykey"` and `"mykey1"`) would sort incorrectly in internal-key space. With the separator, `"mykey\x00..."` sorts before `"mykey1\x00..."` because `0x00 < '1'`.
+The null byte (`0x00`) is a **separator** between the user key and the inverted
+sequence number. INVARIANT: without it, a user key that is a prefix of another
+(`"mykey"` vs `"mykey1"`) sorts incorrectly in internal-key space —
+`"mykey\x00..."` sorts before `"mykey1\x00..."` because `0x00 < '1'`.
 
-The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
+The **inverted** sequence ensures that for the same user key, newer writes
+(higher seq) sort **before** older writes in byte order. Lookup uses
+`seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest
+possible internal key for this user key — then returns the first (newest) entry.
 
-## SST VP dependency tracking (`vp_deps`) — SYNC RETIRED 2026-06-18
+## SST VP dependency tracking (`vp_deps`)
 
-Each SST `MetaBlock` used to persist `vp_deps: Vec<u64>` (the distinct log
-extent ids referenced by live `ValuePointer` entries in that SST). The PS
-recomputed the per-partition live-SST snapshot (`extent_id -> #SSTs`) after
-recovery / flush / compaction and shipped it to the manager via
-`MSG_SYNC_PARTITION_VP_REFS` so the manager could maintain a `vp_table_refs`
-retention counter.
-
-**That whole sync/maintenance mechanism was removed** (Stage 1 of the
-`vp_table_refs` removal): the PS no longer computes or syncs `vp_deps` —
-`collect_partition_vp_refs`, `sync_partition_vp_refs*`, the `vp_refs_dirty` GC
-gate, and `vp_refs_retry_loop` are gone, and `MSG_SYNC_PARTITION_VP_REFS` /
-`MSG_PULL_VP_REFS` are retired. The target end-state is `refs`-only retention,
-safe because GC's relocate-then-punch invariant guarantees `refs == 0 ⇒ no live
-VP`. But the manager-side gate is collapsed to `refs == 0` only in **Stage 2**
-(after a migration), NOT now — a cluster upgraded from a pre-removal build may
-hold legacy extents legitimately retained at `refs == 0 && vp_table_refs > 0`,
-so `extent_can_delete` keeps the `&& vp_table_refs == 0` guard meanwhile (see
-manager CLAUDE.md "VP lifetime after split"). The on-disk `MetaBlock.vp_deps`
-field + its in-memory mirror `SstReader.vp_deps` are kept INERT (no SST-format
-break — the builder still writes it, the reader still decodes it, nothing reads
-it); both are removed behind a format-version bump in Stage 2.
-
-The split-lifetime correctness this once protected (shared SSTs still holding
+Each SST `MetaBlock` still carries `vp_deps: Vec<u64>` (the distinct log extent
+ids referenced by live `ValuePointer`s), and `SstReader.vp_deps` mirrors it, but
+both are **INERT**: the builder writes it, the reader decodes it, nothing reads
+it. The PS does NOT compute or sync any per-partition VP-ref snapshot. Retention
+is `refs`-based; it is safe because GC's relocate-then-punch invariant guarantees
+`refs == 0 ⇒ no live VP`. Split-lifetime correctness (shared SSTs still holding
 old `ValuePointer`s after a child truncated the log) is upheld by GC relocating
-live values out before `punch_holes` drops `refs` — verified by
-`crates/manager/tests/system_vp_after_split_gc.rs`.
+live values out before `punch_holes` drops `refs`
+(`crates/manager/tests/system_vp_after_split_gc.rs`).
 
-## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)
+## Write Path: Put / Delete (Group Commit)
 
 ```
 Put(key, value, part_id, must_sync):
-  1. ps-conn task (F099-I): decode frame from TCP read; push
+  1. ps-conn task: decode frame; push
      `async { clone req_tx → send PartitionRequest → await oneshot resp →
-              encode Frame::response }` onto the per-conn inflight
-     FuturesUnordered. MULTIPLE frames from the same TCP read end up in
-     the inflight set concurrently.
+              encode Frame::response }` onto the per-conn inflight FU.
   2. Same-thread mpsc: PartitionRequest delivered into partition_loop.
-  3. P-log partition_loop: decode PutReq inline, push a
-     WriteRequest with a direct `WriteResponder::Put { outer: resp_tx, key }`
-     into the `pending` Vec. NO compio::spawn, NO inner oneshot.
-  4. ps-conn awaits the outer resp_tx via the inflight future — the SAME
-     oneshot that was sent into the request; Phase 3 fires its encoded
-     `PutResp` frame directly into it.
-  5. ps-conn loop top: drain-all-ready completions into `tx_bufs`; flush
-     `tx_bufs` via ONE `write_vectored_all` syscall — coalescing all Put
-     responses that became ready since the previous flush.
+  3. P-log partition_loop: decode PutReq inline, push a WriteRequest with a
+     direct WriteResponder::Put { outer: resp_tx, key } into `pending`.
+     NO spawn, NO inner oneshot.
+  4. ps-conn awaits the outer resp_tx via the inflight future — Phase 3 fires
+     its encoded PutResp frame directly into it.
+  5. ps-conn loop top: drain-all-ready completions into tx_bufs; flush via ONE
+     write_vectored_all — coalescing all responses ready since the last flush.
 
-partition_loop (per partition, F099-D fold-in of the old
-                       background_write_loop_r1):
-  OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
+partition_loop (per partition):
+  OWNS:   FuturesOrdered<Pin<Box<dyn Future<Output=InflightCompletion>>>>
   CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
-  GATE:   none (F256 natural batching — launch whatever is pending as
-          soon as a pipeline slot is free; see "Natural batching" below)
   RECV:   req_rx: mpsc<PartitionRequest> (WRITE_CHANNEL_CAP = 1024)
-          — the SAME channel that carries reads + writes from ps-conn
+          — the SAME channel carries reads + writes from ps-conn
 
   Loop (per iteration):
-    (A) drain ready completions via `inflight.next().now_or_never()`
-        → run Phase 3 (memtable insert + direct WriteResponder::send_ok) each
-    (B) if pending.non_empty && !at_cap && !imm_full (F256):
+    (A) drain ready completions via inflight.next().now_or_never()
+        → run Phase 3 (memtable insert + WriteResponder::send_ok) each
+    (B) if pending.non_empty && !at_cap && !imm_full:
           launch_new_batch:
             Phase 1: validate, seq-assign, encode WAL records
             Launch Phase 2: stream_client.append_batch future (NOT awaited)
             Push (BatchData, Phase2Fut → InflightCompletion) into FU
-          continue
-    (C) if at_cap:
-          await inflight.next() (back-pressure) → run Phase 3
-          continue
+    (C) if at_cap: await inflight.next() (back-pressure) → Phase 3
     (D) branch on n_inflight:
           == 0:  await req_rx.next() alone (cold idle)
-          >  0:  select(req_rx.next, inflight.next()) — race SQ vs CQ
-                 Left  (SQ wins) → handle_incoming_req:
-                                   - PUT/DELETE: decode + pending.push
-                                   - GET/HEAD/RANGE/SPLIT/MAINTENANCE: inline
-                                     via dispatch_partition_rpc (reads still
-                                     run inline on P-log)
-                 Right (CQ wins) → run Phase 3 on the completion
-    (E) non-blocking drain of any queued requests (still decode inline)
+          >  0:  select(req_rx.next, inflight.next())
+                 Left  (SQ) → handle_incoming_req:
+                              PUT/DELETE: decode + pending.push
+                              GET/HEAD/RANGE/SPLIT/MAINTENANCE: inline via
+                              dispatch_partition_rpc (reads run inline on P-log)
+                 Right (CQ) → run Phase 3 on the completion
+    (E) non-blocking drain of any queued requests (decode inline)
 
-  Shutdown (req_rx closed):
-    Drain all inflight via await-loop; run Phase 3 on each so clients
-    receive their final ack. Then flush any residual pending as one last
-    batch. Finally emit metrics.
+  Shutdown (req_rx closed): drain all inflight (await-loop, Phase 3 each so
+    clients get their final ack); flush residual pending as one last batch.
 
   Error handling:
-    LockedByOther on any completion  → set locked_by_other flag, drain
-      remaining inflight cleanly, return (partition self-evicts in the
-      enclosing loop).
-    Other append errors              → log + propagate Err(_) to each
-      client's oneshot. Loop continues.
+    LockedByOther on any completion → set locked_by_other, drain inflight,
+      return (partition self-evicts in the enclosing loop).
+    Other append errors → log + propagate Err to each client's oneshot.
 ```
 
-**Phase 1 / Phase 3 primitives** (`start_write_batch` / `finish_write_batch`
-in `background.rs`) are unchanged from R3; Phase 2 is wrapped into a boxed
-`InflightCompletion` future. Phase 3 runs at most once per loop iteration
-(single-threaded compio task), so the partition write lock is never held
-concurrently — `maybe_rotate_locked` remains correct.
+Phase 1 / Phase 3 primitives are `start_write_batch` / `finish_write_batch`
+(`background.rs`); Phase 2 is wrapped into a boxed `InflightCompletion` future.
+Phase 3 runs at most once per loop iteration (single-threaded compio task), so
+the partition write lock is never held concurrently — `maybe_rotate_locked`
+stays correct.
 
 `Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
 
-### Natural batching (F256 — replaced the `MIN_PIPELINE_BATCH` gate)
+### Natural batching
 
-History: R3 Task 5b found that greedily splitting a naturally-full
-256-op burst into multiple small batches regressed throughput, so a
-gate was added: a *second or later* batch launched only when pending
-reached 256. But whenever per-partition concurrency was below 256 —
-the common case at N>1 partitions (perf baseline: 16 in-flight per
-partition) — pending could NEVER reach 256, so after the first launch
-the loop waited for the WHOLE pipeline to drain (`n_inflight == 0`)
-before launching again. Effective pipeline depth = 1 regardless of
-`ps_inflight_cap()`; 4K writes ran lock-step at one batch per
-(append RTT + fsync window). The background.rs F099-K/M/N comment
-documented this and deferred it to an `AUTUMN_PS_MIN_BATCH` knob that
-baselines never set.
+`partition_loop` launches whatever `pending` holds as soon as a pipeline slot is
+free (`!at_cap && !imm_full`) — no minimum-batch gate. Batch size adapts to
+arrival-rate × in-flight latency (group-commit style). Fragmentation is prevented
+STRUCTURALLY: ps-conn tasks share the P-log thread and enqueue a whole TCP burst
+into req_rx before partition_loop is polled, and the (E) drain pulls the entire
+channel into `pending` (up to MAX_WRITE_BATCH) each iteration, so a naturally-full
+burst still launches as ONE batch. `--min-pipeline-batch` is parsed but a
+deprecated no-op.
 
-F256 removes the gate: launch whatever `pending` holds as soon as a
-pipeline slot is free (`!at_cap && !imm_full`). Batch size adapts to
-arrival-rate × in-flight latency (group-commit style). The R3 Task 5b
-fragmentation concern is prevented STRUCTURALLY, not by a gate:
-ps-conn tasks share the P-log thread and enqueue a whole TCP burst
-into req_rx before partition_loop is polled, and the (E) drain pulls
-the entire channel into `pending` (up to MAX_WRITE_BATCH) each
-iteration — so a naturally-full burst still launches as ONE batch.
-The `--min-pipeline-batch` CLI flag is parsed but deprecated (no-op +
-warning).
+### In-order Phase 3 commit
 
-### In-order Phase 3 commit (F210-C1, post-2026-05-15)
+INVARIANT: `partition_loop` uses **`FuturesOrdered`** (not `FuturesUnordered`) so
+Phase 3 yields are strictly in launch order = seq order — the rotated active
+memtable must contain a **contiguous** seq range. Otherwise batch B (seq 101–200)
+could Phase 3 + flush → SST with `last_seq=200` while batch A (seq 1–100) is still
+in flight; on crash, replay's dedup `if ts <= sst_max_seq { continue; }` skips
+seq 1–100 (`50 <= 200`), silently dropping ack'd writes. The trade-off is a small
+p99 uptick from head-of-line wait (bounded by Phase 2 p99, ~5–10 ms with
+coalesced fsync); throughput unchanged.
 
-Phase 2 futures execute concurrently up to `ps_inflight_cap()`, but
-`partition_loop` uses **`FuturesOrdered`** (not
-`FuturesUnordered`) so Phase 3 yields are strictly in launch order =
-strictly in seq order. This is a load-bearing invariant for recovery
-correctness.
+Related always-hold properties: seq numbers assigned in Phase 1 in launch order;
+memtable MVCC keys sort independently of insertion order; LogStream ordering is
+preserved by the stream worker's lease/ack cursor (concurrent Phase 2 lands at
+distinct contiguous offsets regardless of completion order).
 
-Pre-F210-C1 (`FuturesUnordered`): completions could yield out of order.
-Phase 3 inserts ran in completion order, not seq order. The rotated
-active memtable was therefore NOT guaranteed to contain a contiguous
-seq range — e.g. batch B (seq 101-200) could be Phase 3'd and the
-active rotated to imm + flushed → SST with `last_seq=200`, while
-batch A (seq 1-100) was still in flight. On crash before A's Phase 3,
-replay's dedup predicate `if ts <= sst_max_seq { continue; }` would
-skip seq 1-100 records (since `50 <= 200`), silently dropping ack'd
-writes. Lost data was bounded by the in-flight cap (8 batches × 256
-records each, up to 2K records / partition).
-
-Post-F210-C1 (`FuturesOrdered`): rotated memtable = contiguous seq
-range, SST.last_seq = bound on "every seq <= last_seq is in this SST
-or an earlier one". Replay's dedup is sound. The trade-off — small
-p99 latency uptick from head-of-line wait when in-flight batches'
-Phase 2 latencies are unequal — is bounded by Phase 2 p99 (typically
-~5-10 ms with F178 coalesced fsync); throughput unchanged.
-
-Properties that still hold (unchanged from pre-F210-C1):
-- **Seq numbers** assigned in Phase 1 in batch-launch order.
-- **Memtable MVCC keys** are `user_key ++ 0x00 ++ BE(u64::MAX - seq)`.
-  Byte-sort order is independent of insertion order.
-- **Client oneshot replies** are per-request — Phase 3's response
-  emission happens in seq order under `FuturesOrdered`, which is a
-  side effect of the change but doesn't break clients.
-- **LogStream ordering** is preserved by the stream worker's
-  lease/ack cursor (step 4.3); concurrent Phase 2 still lands at
-  distinct contiguous offsets regardless of Phase 2 completion order.
-
-### Cross-layer SQ/CQ stack (post-R4)
+### Cross-layer SQ/CQ stack
 
 ```
-┌─ PS partition_loop  (this crate, 4.4 + F099-D)        ┐
-│    FU<InflightCompletion>, cap 8                              │
-│    (was background_write_loop_r1 before F099-D; merged with   │
-│     the request-dispatch loop to remove the per-Put spawn +   │
-│     inner oneshot that cost ~30 % of P-log CPU at 256 × d=1)  │
+┌─ PS partition_loop  (this crate)                              ┐
+│    FuturesOrdered<InflightCompletion>, cap 8                  │
 └─────────────┬─────────────────────────────────────────────────┘
               ▼  stream_client.append_batch(log_stream_id, …)
-┌─ autumn-stream stream_worker_loop  (step 4.3)                 ┐
+┌─ autumn-stream stream_worker_loop                             ┐
 │    FU<3-replica-join>, cap 32, per stream_id                  │
 └─────────────┬─────────────────────────────────────────────────┘
               ▼  pool.send_vectored per replica
-┌─ autumn-rpc writer_task (step 4.1) — single SQ per conn       ┐
+┌─ autumn-rpc writer_task — single SQ per conn                  ┐
 └─────────────┬─────────────────────────────────────────────────┘
               ▼  TCP
-┌─ autumn-stream handle_connection (step 4.2 v3, server side)   ┐
+┌─ autumn-stream handle_connection (server side)                ┐
 │    FU<batch-io>, cap 64, persistent read future               │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-## P-bulk SQ/CQ (flush_worker_loop, R4 4.4)
+### P-bulk SQ/CQ (flush_worker_loop)
 
-Same FuturesUnordered + select pattern on the bulk thread, cap = 2
-(default, env `AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each
-in-flight flush holds a 128 MB SST buffer, so the cap is deliberately
-small.
+Same FuturesUnordered + select pattern on the bulk thread, cap = 2 (env
+`AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each in-flight flush holds a 128 MB
+SST buffer, so the cap is deliberately small. The overlap benefit: while one SST
+uploads via `row_stream.append`, the next flush can start its `build_sst_bytes`
+`spawn_blocking` — CPU (build) overlaps network (upload) without ballooning peak
+memory. P-bulk needs no special `StreamClientConfig`; the stream client derives
+every append deadline from the actual payload size (256 MiB → ~37 s), which also
+covers P-log's large-value log_stream appends.
 
-**BUG-FLUSH-TIMEOUT-LEAK (2026-07-14, fixed in the stream crate — no PS code
-change):** `bulk_sc`'s 256 MiB SST `row_stream.append` used to run against the
-stream client's fixed 5 s per-replica deadline (sized for P-log's 4 KiB WAL
-appends). Under load it ALWAYS timed out, the retry sealed-empty + rolled the
-row_stream tail and re-uploaded the same SST, leaking one ~255 MB
-unreclaimable extent per iteration (live cluster: 10.4 TB for 222 GB logical,
-disks full, writes dead). The stream client now derives every append deadline
-from the ACTUAL payload size (256 MiB → ~37 s) and reclaims (punches) a tail
-it sealed at commit=0 when rolling away. See `crates/stream/CLAUDE.md`
-Programming Note 28. P-bulk needs no special `StreamClientConfig` — the
-default config self-adapts per append size (this also covers P-log's
-large-value log_stream appends). The benefit is that while one SST is uploading via
-`row_stream.append`, the next flush can start its `build_sst_bytes`
-`spawn_blocking` — overlapping CPU (build) with network (upload) without
-ballooning peak memory.
-
-**Single-writer invariant for row_stream (post-2026-05-03 fix):** ALL
-appends to `row_stream` MUST go through P-bulk's `StreamClient`. The
-`flush_worker_loop` accepts two channel types:
+**Single-writer invariant for row_stream:** ALL appends to `row_stream` MUST go
+through P-bulk's `StreamClient`. Two independent `StreamClient`s track commit
+position locally; if one writer's stale commit is sent in an append header,
+ExtentNode truncates data written by the other → destroyed SST data and
+`invalid meta_len` corruption on PS restart. `flush_worker_loop` accepts:
 - `FlushReq` (from flush_loop): build SST + row_stream.append
 - `RowAppendReq` (from compaction on P-log): row_stream.append only
 
-Both share P-bulk's single `StreamClient`, so the per-stream worker's
-commit/lease state stays coherent. **Never use P-log's `part_sc` for
-row_stream appends.** Pre-fix, compaction (`do_compact`) used P-log's
-`part_sc.append(row_stream_id, ...)` while flush used P-bulk's
-`bulk_sc.append(row_stream_id, ...)`. The two independent StreamClients
-tracked commit position locally and independently. When one writer's
-stale commit was sent in an append header, ExtentNode truncated data
-written by the other, destroying SST data and causing `invalid meta_len`
-corruption on PS restart.
+Both share P-bulk's single `StreamClient` so the per-stream worker's commit/lease
+state stays coherent. **Never use P-log's `part_sc` for row_stream appends**;
+`part_sc` is for log/meta append and row_stream non-append ops (`truncate`,
+`get_stream_info`) only. The invariant is type-level: `open_partition` returns Err
+when P-bulk fails to spawn (the manager reschedules), so
+`PartitionData.flush_req_tx` / `row_append_tx` are non-`Option<Sender>` — there is
+no in-thread fallback.
 
-Single-writer invariant is now type-level (post-F254): `open_partition`
-returns Err when P-bulk fails to spawn (the manager reschedules the
-partition), so `PartitionData.flush_req_tx` / `row_append_tx` are
-non-`Option<Sender>`. The in-thread fallback that previously coincidentally
-preserved single-writer when P-bulk spawn failed is gone (both
-`run_flush_async_phase`'s `req_tx_opt == None` branch and
-`compact_row_append`'s `else`).
+**Record format** (WAL): `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header).
 
-**Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
+**No local WAL file**: logStream is the sole write-ahead log. Recovery replays
+logStream from the VP head recorded in the last metaStream checkpoint.
 
-**No local WAL file**: logStream is the sole write-ahead log. Recovery replays logStream from the VP head recorded in the last metaStream checkpoint.
+### Per-ino fence floors (write leases)
 
-### BUG-LEASE-2 — per-ino fence floors (Phase 1 in-memory, Phase 2 persisted)
+Write requests stamped with `(inode_hint != 0, lease_epoch)` are checked against
+`PartitionData.fence_floors` (per-partition `HashMap<ino, max epoch seen>`):
+`stamped < floor` ⇒ `CODE_FENCED` (a revoked writer's late RPC), else admit +
+raise the floor. All three write entry points run it — `enqueue_put`,
+`enqueue_put_zc` (meta carries the two fields, `PUT_ZC_HEADER_LEN = 44`),
+`enqueue_batch_put` (per-op; a fenced op gets CODE_FENCED in its statuses slot
+without failing the batch). DELETE is fenced too (`enqueue_delete`).
 
-Write requests stamped with `(inode_hint != 0, lease_epoch)` are checked
-against `PartitionData.fence_floors` (per-partition `HashMap<ino, max
-epoch seen>`): `stamped < floor` ⇒ `CODE_FENCED` (a revoked writer's
-late RPC), else admit + raise the floor. All three write entry points
-run it — `enqueue_put`, `enqueue_put_zc` (meta carries the two fields,
-`PUT_ZC_HEADER_LEN = 44`), `enqueue_batch_put` (per-op; a fenced op gets
-CODE_FENCED in its statuses slot without failing the batch). Ordering
-invariant (coco R2-P1 #5): the value-too-large check runs BEFORE the
-fence check so a rejected oversized write can't poison the floor.
+INVARIANT (admission ordering): `region_epoch → in_range → value-too-large →
+fence` — a rejected request must NEVER raise or persist the floor (else a rejected
+oversized write could poison the floor).
 
-Phase 2 persistence — floors survive PS restart / partition reschedule:
-- **WAL**: when `check_and_bump_fence` returns `Ok(true)` (raised), the
-  dispatcher queues `WriteOp::FenceBump { ino, epoch }`
-  (`WriteResponder::Fence`, no client reply) BEFORE the admitted write —
-  same group-commit pipeline ⇒ the floor is durable no later than the
-  write's ACK. The WAL record is op `OP_FENCE_BUMP` (0x08), key = ino
-  BE8 (skips in_range), value = epoch LE8. It NEVER enters the memtable
+Persistence — floors survive restart / reschedule:
+- **WAL**: when `check_and_bump_fence` returns `Ok(true)` (raised), the dispatcher
+  queues `WriteOp::FenceBump { ino, epoch }` (`WriteResponder::Fence`, no client
+  reply) BEFORE the admitted write — same group-commit pipeline ⇒ the floor is
+  durable no later than the write's ACK. WAL record op `OP_FENCE_BUMP` (0x08),
+  key = ino BE8 (skips in_range), value = epoch LE8. It NEVER enters the memtable
   (Phase 3 filter) or SSTs; GC's VP scan skips it (no VP bit).
-- **Checkpoint**: `TableLocations.fence_floors` snapshot, captured via
-  `snapshot_fence_floors(&p)` under the SAME borrow as the tables
-  snapshot at all three publish sites (F148-A intact). Covers floors
-  raised before the replay window.
-- **Recovery**: seeds floors by max-merge over ALL meta records (post-
-  merge union of both sources), then replay max-merges every
-  OP_FENCE_BUMP it sees (idempotent — deliberately BYPASSES ts-dedup,
+- **Checkpoint**: `TableLocations.fence_floors` snapshot, captured under the SAME
+  borrow as the tables snapshot at all three publish sites (metadata-publish
+  ordering invariant intact).
+- **Recovery**: seeds floors by max-merge over ALL meta records, then replay
+  max-merges every OP_FENCE_BUMP (idempotent — deliberately bypasses ts-dedup;
   re-applying a checkpoint-covered bump is a no-op).
 
-Client surface: `WriteLease` + `put_fenced`/`put_zc_fenced`/
-`put_many_fenced` (`AutumnError::Fenced`); fuse stamps from
-`held_leases[ino].version` (`FsState::write_lease_for`), the ioring
-daemon from `OpenedExtents.lease_version` (`write_lease_of`) including
-its deferred dirty-meta flush. DELETE is fenced too (enqueue_delete,
-same range→fence admission order; fuse truncate/unlink stamp it).
-MSG_STREAM_PUT was REMOVED outright (zero callers since F186 + its
-handler bypassed both the inline cap and the fence — 0x46 reserved).
-Admission
-ordering invariant (coco): region_epoch → in_range → value-too-large →
-fence — a rejected request must NEVER raise (or persist) the floor.
+Client surface: `WriteLease` + `put_fenced`/`put_zc_fenced`/`put_many_fenced`
+(`AutumnError::Fenced`); fuse stamps from `held_leases[ino].version`, the ioring
+daemon from `OpenedExtents.lease_version`. `MSG_STREAM_PUT` is REMOVED (0x46
+reserved).
 
-### `MSG_BATCH_PUT` (0x53) — server-batched Put (commit 1724ca3 / 09b2a39)
+### `MSG_BATCH_PUT` (0x53) — server-batched Put
 
-A second write entry point alongside `MSG_PUT` / `MSG_PUT_ZC`. One
-frame from the SDK carries `BatchPutReq { part_id, region_epoch,
-must_sync, ops: Vec<BatchPutOp{key, value, expires_at}> }`. The
-SDK (`ClusterClient::batch_put`) groups items by owning partition
-and emits one frame per partition.
+One frame carries `BatchPutReq { part_id, region_epoch, must_sync,
+ops: Vec<BatchPutOp{key, value, expires_at}> }`. The SDK
+(`ClusterClient::batch_put`) groups items by owning partition and emits one frame
+per partition. Server side (`enqueue_batch_put`):
+1. Decode the frame ONCE on the ps-conn task.
+2. Allocate one `Rc<BatchPutAccumulator>` carrying the outer `resp_tx`, a
+   `RefCell<Vec<u8>>` statuses (one per op), and a `Cell<usize>` remaining.
+3. For each op push a `WriteRequest` whose `WriteResponder` is
+   `BatchPut { accum, idx }` into `partition_loop.pending` — an ATOMIC injection
+   of N ops as a single mpsc message, giving the group-commit loop the fat arrival
+   it needs to fill MAX_WRITE_BATCH=256.
+4. Each op's Phase 3 calls `accum.record(idx, status)`; the LAST recorder
+   (remaining==0) encodes `BatchPutResp` and fires the single outer oneshot.
 
-Server side (`enqueue_batch_put` in `lib.rs`):
-1. Decode the frame ONCE on the ps-conn task (vs. per-op decode
-   for the N-frame `put_many` path it replaced).
-2. Allocate one `Rc<BatchPutAccumulator>` carrying the outer
-   `resp_tx`, a `RefCell<Vec<u8>>` statuses (one per op), and a
-   `Cell<usize>` remaining counter.
-3. For each op: push a `WriteRequest` whose `WriteResponder` is
-   the new `BatchPut { accum, idx }` variant into
-   `partition_loop.pending`. This is an ATOMIC injection of N
-   ops as a single mpsc message — the same wide batch all
-   landing in pending at once, where the F099-D group-commit
-   loop picks them up. Compared with the pre-batch path (N
-   independent mpsc messages), this saves N-1 wake/dispatch
-   cycles and gives the group-commit loop the "fat arrival" it
-   needs to fill MAX_WRITE_BATCH=256.
-4. Each op's Phase 3 completion calls `accum.record(idx,
-   status)` instead of sending its own outer oneshot. The LAST
-   recorder (remaining==0) encodes the `BatchPutResp` and fires
-   the single outer oneshot back to ps-conn.
-
-Frozen-for-merge rejection path also handles MSG_BATCH_PUT —
-returns `CODE_UNAVAILABLE` per-op uniformly via the same
-accumulator path.
-
-Measured win (cross-host TCP, 4 K values, 8 partitions × 64
-threads × pipeline-depth 8): 6,531 ops/s baseline → 45,146 ops/s
-with `--batch-put 64` (6.9×). Per-partition tracing showed
-batch_size hitting cap=256 consistently, vs. ~8-16 on baseline.
-Single-host loopback shows a smaller 1.7× win because per-frame
-routing/decode overhead is already low over localhost.
+Frozen-for-merge rejection returns `CODE_UNAVAILABLE` per-op via the same
+accumulator.
 
 ### `MSG_BATCH_GET` (0x54) — server-batched Get
 
-Read mirror. `BatchGetReq { part_id, region_epoch, keys: Vec<Vec<u8>> }`,
-response `BatchGetResp { items: Vec<BatchGetItem{ status, value }> }`.
+`BatchGetReq { part_id, region_epoch, keys: Vec<Vec<u8>> }` →
+`BatchGetResp { items: Vec<BatchGetItem{ status, value }> }`. Server side
+(`handle_batch_get`) runs INLINE on the ps-conn task (no partition_loop hop, same
+as `handle_get`): decode once, brief `borrow()` to snapshot readers/state, loop
+`get_value` per key, pack into one frame. NO zero-copy for the response
+(rkyv-encoded, values inline). For ≥ 64 KiB reads where each value needs its own
+dest, callers use the client `get_many_into` (per-key `MSG_GET_ZC` into
+caller-owned dests, fan-out via `fan_out_collect`).
 
-Server side (`handle_batch_get` in `rpc_handlers.rs`):
-1. Runs INLINE on the ps-conn task (no `partition_loop` mpsc
-   hop — same as `handle_get`).
-2. Decode the frame once, brief `borrow()` to snapshot
-   readers/state, then loop calling `get_value` per key in the
-   batch.
-3. Pack the per-key responses into a single `BatchGetResp` frame.
-
-NO zero-copy for the response — `BatchGetResp` is rkyv-encoded
-with each value embedded inline. For ≥ 64 KiB reads, callers
-should use the client `get_many_into` (per-key `MSG_GET_ZC` into
-caller-owned dests, fan-out via `fan_out_collect`) — that's the
-right primitive when each value needs its own dest.
-
-Measured win (single-host loopback, 4 K values, 8 threads ×
-pipeline-depth 4, --batch-get 32): 158 K read ops/s baseline →
-234 K (1.47×), p99 0.28 ms → 0.07 ms (4×). The bigger win is in
-p99, not throughput — batching collapses the per-frame
-write_vectored response coalescing.
-
-## Open-tail size probe for the cluster overview (F-OVERVIEW-OPENTAIL)
+## Open-tail size probe for the cluster overview
 
 `background_maintenance_loop` refreshes `PartitionMetrics.open_tail_bytes` — the
 Σ committed length on the partition's log/row/meta OPEN-tail extents — which
-`report_load_loop` ships to the manager in `PartitionLoad.open_tail_bytes`. The
-manager adds it to its authoritative sealed-length sum for the cluster overview
-`live_size` (an open extent's manager `sealed_length` is 0, so an all-open-tail
-partition would render 0 B without this — see manager CLAUDE.md). The refresh:
-- runs at loop top, throttled to every 30 s (`next_size_refresh_at`);
+`report_load_loop` ships in `PartitionLoad.open_tail_bytes`. The manager adds it
+to its authoritative sealed-length sum for the overview `live_size` (an open
+extent's manager `sealed_length` is 0, so an all-open-tail partition would render
+0 B without this). The refresh:
+- runs at loop top, throttled to every 30 s;
 - is **DETACHED** (`compio::runtime::spawn(...).detach()`) and guarded by an
-  `open_tail_probe_inflight` CAS — because it does a `commit_length` on each of
-  the 3 stream tails, which is up to 15 s worst-case (all-replica probe) and
-  must NEVER stall the shared GC/compaction maintenance task;
-- stores the sum ONLY if all 3 probes succeed — a partial 3-tail sum
-  (e.g. a briefly-unreachable replica) would misreport, so it keeps the prior
-  value on any error. 0 until the first successful probe.
+  `open_tail_probe_inflight` CAS — it does `commit_length` on each of 3 stream
+  tails (up to 15 s worst case) and must never stall the shared GC/compaction task;
+- stores the sum ONLY if all 3 probes succeed (a partial sum would misreport);
+  keeps the prior value on any error; 0 until the first success;
 - uses `StreamClient::open_tail_committed_len` (NOT `commit_length`), which
   returns 0 when the tail is SEALED — a sealed tail's length is already in the
-  manager's sealed-length sum, so counting it here double-counts (F-DF-OPENTAIL:
-  a freshly-reopened CoW split child / just-sealed-not-yet-rolled tail has an
-  all-sealed stream; part 45 over-reported 147.6 MB vs 94.1 MB before this).
-**Invariant: the probe must stay off the maintenance task's critical path
-(detached + in-flight-guarded) — a blocking `commit_length` here would gate
-GC/compaction on manager/replica latency.** The sibling `size_bytes` gauge is
-DEAD (no writer — see the field doc); do not confuse it with `open_tail_bytes`.
+  manager's sealed-length sum, so counting it here would double-count.
 
-### `open_tail_dead_bytes` — WAL debt on the open tail (F-DF-WALDEBT)
+INVARIANT: the probe must stay off the maintenance task's critical path (detached
++ in-flight-guarded) — a blocking `commit_length` here would gate GC/compaction on
+manager/replica latency. The sibling `size_bytes` gauge is DEAD (no writer); do
+not confuse it with `open_tail_bytes`.
+
+### `open_tail_dead_bytes` — WAL debt on the open tail
 
 `PartitionMetrics.open_tail_dead_bytes` is the dead (overwritten/deleted)
 large-value bytes on the OPEN (last) `log_stream` extent. `gc_debt_bytes` is
-SEALED-only — `valid_discard(sealed_extents)` drops the tail because GC can't
-punch an unsealed extent — so a log-heavy / all-open-tail partition (whole log in
-one open extent) reports `gc_debt=0` while holding real garbage. This gauge
-exposes it; together `gc_debt_bytes + open_tail_dead_bytes` is the partition's
-full reclaimable WAL debt (the two are DISJOINT — the open tail's discard vs the
-sealed prefix's — so no double-count). Shipped via `PartitionLoad.open_tail_dead_bytes`;
-the manager sums `Σ(gc_debt + open_tail_dead)` into `ClusterDfResp.logical_wal_debt`
-for `autumn-op df`. Load-bearing invariants (both regressed once — see
-`background::wal_debt_tests` + the coco-2026-07-11 fixes):
-- It is DERIVED each GC tick via `open_tail_dead_bytes(discards, extent_ids)` (=
-  `discards[extent_ids.last()]`) from the already-persisted SST discard maps —
-  NOT a bespoke counter. So it survives PS restart exactly like `gc_debt` (recovery
-  reloads the discard maps from the meta_stream checkpoint) with zero write-path cost.
-- Refreshed BEFORE the `extent_ids.len() < 2` gate in BOTH the `Sel::GcRecv`
-  dispatch path AND the `Sel::GcTimeout` periodic F203 refresh — the headline
-  all-open-tail case has a SINGLE log extent and would skip the gate, so a
-  gate-gated refresh would leave this 0 exactly where it matters most.
-- The same `<2`-extent early exits store `gc_debt_bytes = 0` (no sealed prefix ⇒
-  0 debt) so a partition GC-reclaimed down to one extent doesn't leave a stale
+SEALED-only (GC can't punch an unsealed extent), so a log-heavy / all-open-tail
+partition reports `gc_debt=0` while holding real garbage; this gauge exposes it.
+`gc_debt_bytes + open_tail_dead_bytes` is the full reclaimable WAL debt (the two
+are DISJOINT — no double-count). Shipped via `PartitionLoad.open_tail_dead_bytes`;
+the manager sums `Σ(gc_debt + open_tail_dead)` into
+`ClusterDfResp.logical_wal_debt` for `autumn-op df`. Load-bearing:
+- DERIVED each GC tick via `open_tail_dead_bytes(discards, extent_ids)` (=
+  `discards[extent_ids.last()]`) from already-persisted SST discard maps — not a
+  bespoke counter, so it survives restart exactly like `gc_debt` with zero
+  write-path cost.
+- Refreshed BEFORE the `extent_ids.len() < 2` gate in BOTH the `Sel::GcRecv` and
+  `Sel::GcTimeout` paths — the all-open-tail case has a SINGLE log extent and
+  would skip the gate, so a gate-gated refresh would leave it 0 exactly where it
+  matters most.
+- The `<2`-extent early exits also store `gc_debt_bytes = 0` (no sealed prefix ⇒
+  no debt) so a GC-reclaimed-to-one-extent partition doesn't leave stale
   sealed-debt inflating `logical_wal_debt`.
 
 ## Read Path: Get
@@ -582,172 +411,123 @@ Get(key, part_id):
        else → return raw value
 ```
 
-### F261 — SST on-demand paging + bounded block cache (Stage-1)
+### SST on-demand paging + bounded block cache
 
-`SstReader` no longer keeps SST bytes resident: production readers
-(flush / compact / recovery) are PAGED — only MetaBlock state stays in
-memory; data blocks are fetched on demand from row_stream through the
-process-wide bounded `BlockCache` (`--sst-block-cache-bytes`, default
-512 MB, sampled-LRU; keys = `(extent_id, abs_off)`; NO compaction
-invalidation needed — extent ids are never reused, stale entries age
-out). Recovery opens SSTs from the META TAIL ONLY (last-4-bytes →
-meta region) and the WAL replay streams in 64 MB chunked-carry
-(`decode_records_chunk`) — both pre-F261 whole-reads kept restart RSS
-at O(dataset) (measured 18-28 GB on a 14 GB set; now 2,380 MB =
-replay-window bound, dataset-independent). The replay chunks MUST use
-`StreamClient::read_committed_bytes_from_extent` (committed-clamped),
-never the plain explicit-length read: a replica's file legitimately
-holds speculative bytes past `sealed_length`/min-commit, so the plain
-read's short-read stop never fires at the committed end — the scan
-ingests un-committed bytes and the next chunk trips `StaleVpOffset`,
-permanently wedging the partition open (hit 2026-06-11 on 4/8
-partitions after kill+restart).
+`SstReader` does NOT keep SST bytes resident: production readers (flush / compact
+/ recovery) are PAGED — only MetaBlock state stays in memory; data blocks are
+fetched on demand from row_stream through the process-wide bounded `BlockCache`
+(`--sst-block-cache-bytes`, default 512 MB, sampled-LRU; keys =
+`(extent_id, abs_off)`; NO compaction invalidation needed — extent ids are never
+reused, stale entries age out). Recovery opens SSTs from the META TAIL ONLY
+(last-4-bytes → meta region) and the WAL replay streams in 64 MB chunked-carry
+(`decode_records_chunk`), so restart RSS = replay-window bound, dataset-independent.
+
+INVARIANT: the replay chunks MUST use
+`StreamClient::read_committed_bytes_from_extent` (committed-clamped), never the
+plain explicit-length read — a replica's file legitimately holds speculative bytes
+past `sealed_length`/min-commit, so a plain read ingests un-committed bytes and the
+next chunk trips `StaleVpOffset`, permanently wedging the partition open.
 
 Invariants:
-- Point lookups go through `lookup_in_sst_via` (async): callers
-  SNAPSHOT `Arc<SstReader>`s + stream_client under the borrow, DROP it,
-  await, re-borrow (note 15). `lookup_in_sst` (sync) serves resident
-  readers only and ERRORS on paged ones — never silently misses.
-- Iteration is ASYNC (F262 = Stage-2): `AsyncTableIterator` /
-  `AsyncMergeIterator` fetch blocks on demand. FetchMode::Cached
-  (range — per-block via the global BlockCache, repeated lists hit warm
-  blocks) vs FetchMode::Window(8MiB) (do_compact / split
-  unique_user_keys — sequential bulk windows BYPASSING the cache,
-  scan-resistant; one RPC per window; peak read memory = inputs × one
-  window). `materialize`/`materialized_for_iteration` are GONE. The
-  async API returns Result — a block-read error ABORTS the compaction
-  (the old sync iterator stashed errors in an unread field, which with
-  network-backed blocks would have silently truncated merge output).
-  Sync TableIterator/MergeIterator remain Resident-only (tests,
-  builder round-trips).
+- Point lookups go through `lookup_in_sst_via` (async): callers SNAPSHOT
+  `Arc<SstReader>`s + stream_client under the borrow, DROP it, await, re-borrow.
+  `lookup_in_sst` (sync) serves resident readers only and ERRORS on paged ones —
+  never silently misses.
+- Iteration is ASYNC (`AsyncTableIterator` / `AsyncMergeIterator`, fetch blocks on
+  demand). `FetchMode::Cached` (range — per-block via the global BlockCache) vs
+  `FetchMode::Window(8MiB)` (do_compact / split unique_user_keys — sequential bulk
+  windows BYPASSING the cache, scan-resistant; one RPC per window; peak read memory
+  = inputs × one window). The async API returns Result — a block-read error ABORTS
+  the compaction (never silently truncates merge output). Sync
+  TableIterator/MergeIterator remain Resident-only (tests, builder round-trips).
 - Diag seq_opt/fullscan report miss on paged readers (diagnostic-only).
 
-### F259 — large-VP client direct-read (MSG_GET_REDIRECT)
+### Large-VP client direct-read (`MSG_GET_REDIRECT`)
 
-`handle_get_redirect` (rpc_handlers.rs): a FULL-value read of a VP whose
-`vp.len >= 64 KiB` answers with a descriptor — `GetRedirectResp { extent_id,
-value_offset, value_len, eversion, replica_addrs }` — instead of resolving
-the bytes through this PS; the client (`ClusterClient::get_direct`) reads
-the range straight from an EN (`autumn_stream::read_extent_value_direct`,
-MSG_READ_BYTES_ZC zero-copy) and falls back to the proxy `get` on ANY
-failure. Invariants:
-- The GC writer-pin check (F162) runs BEFORE the redirect decision — an
-  extent being punched surfaces NotFound exactly like the proxy path. The
-  client's read window is deliberately unprotected: a GC punch in the gap
-  is a failed EN read → proxy fallback (extents unlink whole + eversion
-  fence ⇒ never a torn read).
-- EC-converted extents NEVER get a descriptor
-  (`StreamClient::extent_read_descriptor` refuses; shard bytes ≠ value) —
-  handle_get_redirect falls back to `handle_get`.
-- Short reads under CODE_OK are FAILURES in `read_extent_value_direct`
-  (same "got < need" rule as `read_value_from_log`).
-- Inline values, small VPs: inline in the response (`extent_id == 0`);
-  `get_value` (non-redirect callers) never yields `GetOutcome::Redirect`.
-Loopback perf: latency win only (TCP 8M read p50 145→46ms, UCX 137→15ms);
-the throughput win is cross-host where PS NIC egress leaves the data path.
+`handle_get_redirect` (`rpc_handlers.rs`): a read of a VP whose CLAMPED requested
+length `r_len` is `>= 64 KiB` answers with a descriptor `GetRedirectResp {
+extent_id, value_offset, value_len, eversion, replica_addrs }` instead of resolving
+the bytes through this PS; the client (`ClusterClient::get_direct`) reads the range
+straight from an EN (`read_extent_value_direct`, `MSG_READ_BYTES_ZC` zero-copy) and
+falls back to the proxy `get` on ANY failure. Sub-range support (`F-DIRECT-MANY`):
+redirect fires for any VP sub-range with `r_len = (req.length==0 ? vp.len-r_off :
+min(req.length, vp.len-r_off)) >= 64 KiB`, returning `value_offset = vp.offset +
+req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
+`r_off==0, r_len==vp.len` special case. Invariants:
+- The GC writer-pin check runs BEFORE the redirect decision — an extent being
+  punched surfaces NotFound exactly like the proxy path. The client's read window
+  is deliberately unprotected: a GC punch in the gap is a failed EN read → proxy
+  fallback (extents unlink whole + eversion fence ⇒ never a torn read); `_vp_pin`
+  drops at return exactly as the whole-value path.
+- EC-converted extents NEVER get a descriptor (`extent_read_descriptor` refuses;
+  shard bytes ≠ value) — falls back to `handle_get`.
+- Short reads under CODE_OK are FAILURES in `read_extent_value_direct` (same
+  "got < need" rule as `read_value_from_log`).
+- Inline values / small VPs / sub-64 KiB / offset past value end: inline in the
+  response (`extent_id == 0`); `get_value` (non-redirect callers) never yields
+  `GetOutcome::Redirect`. No wire-struct change → no WIRE bump.
 
-**F-DIRECT-MANY — sub-range redirect (batched direct-read).** `get_value_inner`'s
-redirect was whole-value-only (`req.offset==0 && req.length==0`). A batched
-reader like fuse's `read::execute` requests explicit sub-ranges of each extent
-value (F247 whole-extent reads carry `length = extent_len`), so it NEVER
-redirected — every large read proxied through the PS. Now redirect fires for any
-VP sub-range whose CLAMPED requested length `r_len = (req.length==0 ? vp.len-r_off
-: min(req.length, vp.len-r_off))` is ≥ 64 KiB, returning `value_offset =
-vp.offset + req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
-`r_off==0, r_len==vp.len` special case → byte-identical. Sub-ranges past the value
-end (`req.offset > vp.len`) and sub-64 KiB requests fall through to the inline
-`resolve_value` proxy UNCHANGED (the inline response already carries the resolved
-sub-range bytes, so the client copies them straight in). The `_vp_pin` drops at
-return exactly as the whole-value path — a GC punch in the window becomes a failed
-EN read → client proxy fallback. Client side: `ClusterClient::get_many_direct`
-(the batch mirror; see client CLAUDE.md). NO wire-struct change (handler logic
-only) → no WIRE bump.
-
-### F216-E — UCX end-to-end zero-copy read (MSG_GET_ZC)
+### UCX end-to-end zero-copy read (`MSG_GET_ZC`)
 
 The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value lands in its
-registered dest with no intermediate copies across all three tiers
-(`EN → PS → client`). The seam is `resolve_value`/`read_value_from_log`
-(`background.rs`) returning **`Bytes`**, not `Vec<u8>`:
-
-- **VP value (UCX + TCP, F219)**: `read_value_from_log` calls
+registered dest with no intermediate copies across `EN → PS → client`. The seam is
+`resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
+`Vec<u8>`:
+- **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
   `RegPool` `PooledBuf` (EN emits `[zc_meta][value]` as 2 `Bytes`, value aliases
-  the EN pread buffer — no encode copy). **UCX** recvs into a *registered* buffer
-  (RDMA); **TCP** (F219, gate relaxed from UCX-only) recvs via a compio owned
-  read (`read_exact_into_pooled`) — only the kernel copy, no FrameDecoder copy.
-  The PS hands the value onward as `Bytes::from_owner(pb)` (the value `Bytes`
-  ALIASES the pool buffer; returns to the pool when that `Bytes` drops after the
-  client write completes). Falls back to the `read_bytes_from_extent` copy path
-  for EC / chunked / stale-eversion / length==0. No value crc is verified (F219).
-- **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`
-  of the memtable `Bytes`.
-- **`handle_get_zc`** (`rpc_handlers.rs`) returns the response as TWO segments
-  `(head, value)`: `head = [V0 frame header][zc_meta: code+value_len+crc32c]`
-  (built by `ps_zc_head`, mirrors `extent_node::zc_read_head`), `value` is the
-  aliasing `Bytes`. The ps-conn's inflight FU output type is
-  `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
-  `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with
-  **no concat copy** (the d=1 fast path uses `write_vectored_all([head, value])`
-  for ZC, plain `write_all(head)` otherwise — no regression). The on-the-wire
-  bytes are identical to the pre-R4 concatenated form, so the client read path
-  (`call_into_dest` / `call_into_pooled`) is unchanged.
+  the EN pread buffer — no encode copy). UCX recvs into a *registered* buffer
+  (RDMA); TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
+  kernel copy, no FrameDecoder copy. The PS hands the value onward as
+  `Bytes::from_owner(pb)` (aliases the pool buffer; returns to the pool when that
+  `Bytes` drops after the client write completes). Falls back to the
+  `read_bytes_from_extent` copy path for EC / chunked / stale-eversion / length==0.
+  No value crc is verified (integrity is the transport's job).
+- **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`.
+- **`handle_get_zc`** returns the response as TWO segments `(head, value)`:
+  `head = [V0 frame header][zc_meta: code+value_len+crc32c]` (built by
+  `ps_zc_head`), `value` is the aliasing `Bytes`. The ps-conn inflight FU output
+  type is `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
+  `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with no
+  concat copy. On-the-wire bytes are identical to the concatenated form, so the
+  client read path (`call_into_dest` / `call_into_pooled`) is unchanged.
 
-`handle_get` (rkyv `GetResp`, generic SDK) copies the value once
-(`value.to_vec()`); the rkyv encode copies regardless, so returning `Bytes`
-from `resolve_value` does not regress it — the copy just moves. Net read-path
-value copies: VP-over-UCX `get_into` = **0**, generic `get` = same as before.
+`handle_get` (rkyv `GetResp`, generic SDK) copies the value once (the rkyv encode
+copies regardless). Net read-path value copies: VP-over-UCX `get_into` = **0**.
+Cancel-safety of the registered recv lives in the read_loop that OWNS the `PooledBuf`
+(returns it to the pool on cancel).
 
-UCX send from the registered `PooledBuf` is zero-copy via the rcache (the
-buffer is `ucp_mem_map`-registered, so the unregistered `ucx_send` still finds
-the registration). Cancel-safety of the registered recv lives in the read_loop
-that OWNS the `PooledBuf` (returns it to the pool on cancel — never leaks); see
-`autumn-transport/src/ucx/regpool.rs` + `autumn-rpc/src/client.rs`.
+### PS write-recv zero-copy (`MSG_PUT_ZC`, large values)
 
-### F216-E W1 — PS write-recv zero-copy (`MSG_PUT_ZC`, large values)
+Symmetric on the WRITE recv side. `drain_zc_writes` (`lib.rs`) runs in the ps-conn
+read loop right after `decoder.feed`, BEFORE the normal decode: if the FRONT frame
+is a `MSG_PUT_ZC` whose value is `>= AUTUMN_PS_ZC_RECV_MIN_BYTES` (64 KiB), it
+recvs the value straight into a `PooledBuf` instead of letting `FrameDecoder`
+accumulate (and copy) it. Mechanics:
+- `peek_header` + `peek_payload` read the frame header and the
+  `[part_id][..][key_len][key]` meta WITHOUT consuming, to locate the value
+  boundary. Gated on `part_id == owner_part` and the size band
+  `[64 KiB, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
+- Consume the header+meta+key, `drain_into` any buffered value prefix into the
+  `PooledBuf`, recv the remainder (UCX `recv_into` registered / TCP
+  `read_exact_into_pooled` owned). The V1 frame-crc trailer is consumed off the
+  wire (stream alignment) but not validated — value integrity is the transport's
+  job. Normal (non-ZC) frames keep their V1 frame-CRC.
+- The value rides onward as `Bytes::from_owner(pb)` via a
+  `PartitionRequest.zc_value: Option<Bytes>` field; `payload` carries only
+  `[meta][key]`. `enqueue_put_zc` uses `zc_value` directly when present. The PS→EN
+  `append_batch` send is already rcache-zero-copy (UCX) / Arc-Bytes (TCP).
+- Cancel-safe on both transports: `drain_zc_writes` owns the `PooledBuf` across the
+  recv (UCX `InflightSlot` drains the NIC on drop; TCP compio retains the owned
+  buffer until the read CQE lands). The d=1 fast path is skipped when
+  `drain_zc_writes` queued a reply (`inflight.is_empty()` guard) to keep in-order
+  replies.
 
-Symmetric to the read path, on the WRITE recv side. `drain_zc_writes` (lib.rs)
-runs in the ps-conn read loop right after `decoder.feed`, BEFORE the normal
-decode: if the FRONT frame is a `MSG_PUT_ZC` whose value is
-`≥ AUTUMN_PS_ZC_RECV_MIN_BYTES` (64 KiB), it recvs the value straight into a
-`PooledBuf` instead of letting `FrameDecoder` accumulate (and copy) the whole
-value. **Both transports (F219)**: UCX recvs into a *registered* buffer via
-`ReadHalf::recv_into(dest, reg)` (RDMA, no off-wire copy); TCP recvs via
-`ReadHalf::read_exact_into_pooled` (a compio *owned* read — only the unavoidable
-kernel→userspace copy, no FrameDecoder copy). Mechanics:
+Small writes (< 64 KiB) keep the unchanged FrameDecoder path — the only added cost
+is one `peek_header` + size-check branch per frame. `drain_zc_writes` is SKIPPED
+when authz is ON (see authz section).
 
-- `peek_header` + `peek_payload` (new on `FrameDecoder`) read the frame header
-  and the `[part_id][..][key_len][key]` meta WITHOUT consuming, to locate the
-  value boundary. Gated on `part_id == owner_part` (mis-routed → normal path
-  synths NotFound) and the size band `[64 KiB,
-  AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
-- It then `consume`s the header+meta+key, `drain_into`s any buffered value
-  prefix into the `PooledBuf`, and recvs the remainder (UCX `recv_into` / TCP
-  `read_exact_into_pooled`). **F219 removed the per-value CRC**: the V1 frame-crc
-  trailer is still consumed off the wire (stream alignment) but no longer
-  validated — value integrity is the transport's job (UCX NIC ICRC / TCP kernel
-  segment checksum). Normal (non-ZC) frames keep their V1 frame-CRC (F165).
-- The value rides onward as `Bytes::from_owner(pb)` (aliases the pool buffer, no
-  copy) via a NEW `PartitionRequest.zc_value: Option<Bytes>` field; `payload`
-  carries only `[meta][key]`. `enqueue_put_zc` uses `zc_value` directly when
-  present (else slices from `payload` as before). The value never gets the
-  off-wire / decoder-accumulation copy; the PS→EN `append_batch` send is already
-  rcache-zero-copy (UCX) / Arc-Bytes (TCP) from the pool buffer.
-- Cancel-safe on both transports: `drain_zc_writes` owns the `PooledBuf` across
-  the recv. UCX → `recv_into`'s `InflightSlot` drains the NIC on drop; TCP →
-  compio retains the owned buffer until the read CQE lands. Either way the buffer
-  returns to the pool, never freed-under-the-kernel. The d=1 fast path is skipped
-  when `drain_zc_writes` queued a reply (`inflight.is_empty()` guard) to keep
-  in-order replies.
-- `PS_ZC_WRITE_RECV_HITS` counts engagements; logged once on first engage
-  (`transport="ucx(registered)"` / `"tcp(pooled)"`).
-
-Small writes (< 64 KiB) keep the unchanged FrameDecoder path on both transports
-— the only added cost there is one `peek_header` + a size-check branch per frame.
-On TCP, only callers that send `MSG_PUT_ZC` engage this (perf-check + `put-zc`
-CLI, for values ≥ 64 KiB); regular `MSG_PUT` writes are unaffected.
-
-## Flush Pipeline (F088: cross-thread hand-off)
+## Flush Pipeline
 
 Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256 MB).
 
@@ -756,13 +536,13 @@ P-log: background_flush_loop
   1. recv flush_rx signal
   2. snapshot front imm + vp + tables → FlushReq
   3. flush_req_tx.send(req)      ← cross-thread hand-off (capacity 1)
-  4. oneshot resp.await           ← ~1 ms–seconds depending on row_stream backlog
+  4. oneshot resp.await
 
 P-bulk: flush_worker_loop
   1. recv FlushReq
   2. build_sst_bytes(imm, vp_eid, vp_off)         ← spawn_blocking (CPU)
   3. bulk_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
-  4. SstReader::from_bytes(Bytes::from(sst_bytes))
+  4. SstReader::from_bytes(...)
   5. resp_tx.send(Ok((new_meta, reader)))
 
 P-log: continuation
@@ -772,453 +552,301 @@ P-log: continuation
   9. save_table_locs_raw(part_sc, meta_stream_id, part.tables.clone(), vp)
 ```
 
-P-bulk spawn failure is fatal-for-this-partition (post-F254): `open_partition`
-returns Err and the manager reschedules. There is no in-thread fallback. The
-historic fallback (and `flush_one_imm_local`, removed earlier by F197) only
-preserved single-writer by coincidence — see the row_stream invariant note
-above.
+P-bulk spawn failure is fatal-for-this-partition: `open_partition` returns Err and
+the manager reschedules. There is no in-thread fallback (see row_stream
+single-writer invariant).
 
 After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
 **truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
 
-**Checkpoint publication invariant (post-2026-04-29 fix):** only P-log may
-publish `metaStream` checkpoints. P-bulk may upload the SST and build the
-`SstReader`, but it must not write `TableLocations` from the `FlushReq`
-snapshot. With `AUTUMN_PS_BULK_INFLIGHT_CAP > 1`, two in-flight flushes can
-complete out of order; publishing from stale `tables_before` snapshots can drop
-older SSTs or emit duplicate `(extent_id, offset)` entries in the checkpoint
-(`part 19` restart corruption: extent 48 locs `[len=13754, len=8387]`, extent
-24 missing). The authoritative checkpoint must be emitted only after P-log has
-merged `new_meta` into `part.tables`. Already-corrupted historical checkpoints
-must be repaired out of band; do not add silent normalization to the normal
-reopen path.
+INVARIANT (checkpoint publication): only P-log may publish `metaStream`
+checkpoints. P-bulk may upload the SST and build the `SstReader`, but it must not
+write `TableLocations` from the `FlushReq` snapshot. With
+`AUTUMN_PS_BULK_INFLIGHT_CAP > 1`, two in-flight flushes can complete out of order;
+publishing from stale `tables_before` snapshots can drop older SSTs or emit
+duplicate `(extent_id, offset)` entries. The authoritative checkpoint must be
+emitted only after P-log merges `new_meta` into `part.tables`.
 
 **vp snapshot semantics**: the meta_stream checkpoint records the vp
-(`vp_extent_id/vp_offset`) captured at FlushReq send time on P-log — NOT the
-current vp at P-bulk commit time. Correctness: during replay, logStream from
-the snapshot vp forward will include any records added after snapshot,
-re-inserting them into memtable (some may already be in the just-flushed SST,
-which is fine — duplicate entries with the same seq are idempotent). Trade-off:
+(`vp_extent_id/vp_offset`) captured at FlushReq send time on P-log — NOT the vp at
+P-bulk commit time. Correctness: during replay, logStream from the snapshot vp
+forward re-inserts any records added after the snapshot (some may already be in the
+just-flushed SST — duplicate entries with the same seq are idempotent). Trade-off:
 avoids a second round trip; slightly more logStream retained until next flush.
 
 ## Compaction
 
-Two modes, run in `background_compact_loop`. Public method: `trigger_major_compact(part_id) -> Result<(), &'static str>` — enqueues via `compact_tx` channel (capacity 1), non-blocking.
+Two modes, run in `background_maintenance_loop`. Public method:
+`trigger_major_compact(part_id) -> Result<(), &'static str>` — enqueues via
+`compact_tx` (capacity 1), non-blocking.
 
 ### Expiry-Triggered Major Compaction (automatic)
-During each periodic timeout tick, the compact loop checks all SST readers for `min_expires_at > 0 && min_expires_at <= now`. If any SSTable contains expired keys, a major compaction is triggered on all tables (which drops expired entries and tombstones). This ensures partitions with TTL keys eventually clean up even without explicit compaction triggers.
+During each periodic tick, the loop checks all SST readers for
+`min_expires_at > 0 && min_expires_at <= now`. If any SSTable contains expired
+keys, a major compaction runs on all tables (drops expired entries + tombstones),
+so TTL partitions eventually clean up without explicit triggers.
 
 ### Minor Compaction (periodic, 10–20s jitter)
 `pickup_tables` selects tables via one of two strategies:
+- **Head-extent**: if the oldest extent's tables are < 30% of total data
+  (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it — clears old extents to
+  enable `truncate` on `row_stream` (freeing disk/logStream extents).
+- **Size-tiered**: sort tables by sequence, find consecutive "small" tables
+  (< 32MB = `COMPACT_RATIO * MAX_SKIP_LIST`), pick up to `COMPACT_N`.
 
-**Head-extent strategy**: If the oldest extent's tables are < 30% of total data (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from that extent. This clears old extents to enable `truncate` on `row_stream` (freeing disk/logStream extents).
+Runs `do_compact(major=false)`.
 
-**Size-tiered strategy**: Sort tables by sequence, find consecutive "small" tables (< 32MB = `COMPACT_RATIO * MAX_SKIP_LIST`), pick up to `COMPACT_N`.
+### Major Compaction (`compact_tx`, e.g. after overlap detected)
+`do_compact(major=true)`: processes all tables, additionally drops tombstones
+(op=2), expired entries, out-of-range keys (overlap cleanup), and clears
+`has_overlap` on success.
 
-After minor compaction, `do_compact` is called with `major=false`.
-
-### Major Compaction (triggered via `compact_tx`, e.g., after overlap detected)
-`do_compact` called with `major=true`. Processes all tables. Additionally:
-- Drops tombstones (op=2)
-- Drops expired entries
-- Drops out-of-range keys (overlap cleanup)
-- Clears `has_overlap` flag on success
-
-### `do_compact` Logic (the core, F104 streaming)
+### `do_compact` Logic (streaming)
 ```
   1. Read lock: collect SstReaders for selected tables, sort newest-first by last_seq
   2. Create MergeIterator over TableIterators
-  3. Streaming merge loop (F104):
-       - Maintain ONE in-progress SstBuilder + Vec<(TableMeta, Arc<SstReader>)> new_readers
-       - Per item from merge.next():
-         - Dedup: skip if same user_key already seen (newest wins)
-         - Range filter: skip keys outside partition range
-         - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes}
-         - Major filter: skip tombstones and expired entries
-         - If current SstBuilder size > 2 × MAX_SKIP_LIST: finalize, append
-           to row_stream, push (TableMeta, SstReader) into new_readers,
-           start a fresh builder
-         - Otherwise: SstBuilder.add(key, op, value, expires_at)
-       - After loop: attach aggregated discards to the final SstBuilder,
-         finalize, append, push to new_readers
-       - NO `chunks: Vec<(Vec<IterItem>, u64)>` accumulator — pre-F104 this
-         materialized every kept entry as a cloned IterItem (~150 B each
-         for VP-path workloads), reaching ~6 GB per partition for a 5 GB
-         SST set; with 4 partitions concurrent that compounded to ~24 GB
-         on top of input + output bytes. See F104 in feature_list.md.
-  4. Atomic swap: write lock → remove old SstReaders + tables → push
-     new_readers entries → save_table_locs_raw to meta_stream
-       (single linearization point; if we crash before this commit, new
-        SSTs in row_stream are orphan bytes and recovery loads from the
-        previous meta checkpoint — same crash semantics as pre-F104)
+  3. Streaming merge loop (ONE in-progress SstBuilder + Vec<new_readers>):
+       - Dedup: skip if same user_key already seen (newest wins)
+       - Range filter: skip keys outside partition range
+       - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes}
+       - Major filter: skip tombstones and expired entries
+       - If current SstBuilder size > 2 × MAX_SKIP_LIST: finalize, append to
+         row_stream, push (TableMeta, SstReader) into new_readers, start fresh
+       - Otherwise SstBuilder.add(key, op, value, expires_at)
+       - After loop: attach aggregated discards to final SstBuilder, finalize,
+         append, push to new_readers
+  4. Atomic swap: write lock → remove old SstReaders + tables → push new_readers
+     → save_table_locs_raw to meta_stream (single linearization point; crash before
+     this leaves new SSTs as orphan bytes and recovery loads the prior checkpoint)
   5. If truncate_id returned: truncate row_stream up to that extent
 ```
+The merge never materializes all kept entries into an accumulator Vec — it streams
+one builder at a time to keep peak compaction RAM ≈ inputs + one output builder.
 
-### Compaction output vp_head = MAX(input vp_heads), NOT the live cursor (F-COMPACT-VPHEAD, 2026-07-04)
+### Compaction output vp_head = MAX(input vp_heads) by stream position
 
-The vp_head a compaction stamps on its output SSTs + meta checkpoint IS
-recovery's replay-start for the merged data. `do_compact` used to stamp it from
-the **live write cursor** `p.vp_extent_id/vp_offset` — which points PAST any
-acked-but-un-flushed write sitting in the active memtable (below the cursor).
-A major compaction replaces the ENTIRE live SST set (each of which carried an
-older, smaller vp_head anchoring the un-flushed log tail) with outputs all
-stamped at the live cursor; recovery reads the LATEST checkpoint
-(`decode_last_table_locations` — only the last record per meta extent, so NO
-old-checkpoint masking) + the live SST vp_heads, and after major compaction ALL
-of them equal the live cursor → replay starts PAST the un-flushed tail → those
-writes are never replayed = **silent data loss on crash**. Directly
-reproducible (no GC / extent-roll needed): `crates/manager/tests/
-system_compact_unflushed_vp_head.rs`.
+INVARIANT: `do_compact` stamps its output SSTs + meta checkpoint with the MAX over
+the INPUT SSTs' vp_heads by STREAM POSITION (first-occurrence index into
+`log_extent_ids`; extent_id order is non-monotonic post-CoW-split so a raw
+`max(extent_id)` is wrong), NOT the live write cursor `p.vp_extent_id/vp_offset`.
+Why: the live cursor points PAST acked-but-un-flushed writes in the active
+memtable; a major compaction replaces the ENTIRE live SST set, so stamping all
+outputs at the live cursor makes recovery start replay PAST the un-flushed tail →
+silent data loss on crash. The merged SST holds every input's data up to the newest
+input's `last_seq`, so recovery only needs the log AFTER the newest input's content
+= the MAX. This ADVANCES the GC replay floor (reclaims the fully-merged log region)
+while staying ≤ the live cursor → strictly safer. `log_extent_ids` is a hard `?`
+(a swallowed fetch-failure → empty list → `(0,0)` → recovery no-replay = loss); the
+abort is before any row_stream append so nothing is half-published.
+`background::compaction_vp_head_tests`.
 
-Fix (`background::compaction_output_vp_head`): stamp the **MAX over the INPUT
-SSTs' vp_heads by STREAM POSITION** (first-occurrence index into
-`log_extent_ids`, matching recovery's `chosen_pos`/`first_pos_by_eid`; extent_id
-order is non-monotonic post-CoW-split so a raw `max(extent_id)` is wrong). The
-merged SST holds every input's data up to the newest input's `last_seq`, so
-recovery only needs the log AFTER the newest input's content = the newest
-input's vp_head (the MAX). This ADVANCES the GC replay floor (so GC can reclaim
-the fully-merged log region — e.g. a post-split shared extent, guarded by
-`system_gc_multiversion_same_extent`) while staying ≤ the live cursor, hence
-STRICTLY SAFER than the pre-fix stamp. `log_extent_ids` is now a hard `?` (was
-`unwrap_or_default()`): a swallowed fetch-failure → empty list → `(0,0)` → the
-recovery no-replay branch = loss (coco P1); the abort is before any row_stream
-append so nothing is half-published.
+### Flush stamps the imm's ROTATION-time vp_head
 
-The MAX above is only correct if each input SST's vp_head is its TRUE content
-boundary. That premise is now upheld by the flush-tight fix below (it used to be
-the claim-time cursor, which could sit ahead of the SST's content → MAX inherited
-the ahead-ness). Regression unit tests: `background::compaction_vp_head_tests`.
+INVARIANT: `rotate_active` captures `p.vp_*` at the FREEZE instant (the imm's true
+content boundary) into `PartitionData.imm_vp_heads` (`RefCell<HashMap<usize,
+(u64,u64)>>` keyed by `Arc::as_ptr`; INSERT at push, REMOVE at the single
+`commit_flush_outcome` pop, kept on flush ERROR since the imm stays queued for
+retry). The flush reads the imm's captured vp — NOT the live cursor — for both the
+stamped SST/meta vp_head AND the `await_log_synced_to` durability barrier. Why:
+background flush lags the writer; foreground writes landing between an imm's
+`rotate_active` and its claim push the cursor forward, so a claim-time cursor is
+AHEAD of that imm's own content → on crash before those writes flush, recovery
+starts past them → silent loss. This is also the premise the compaction-MAX rests
+on (each input's vp_head must be its TRUE content boundary). Test-only affordances:
+`set_flush_mem_bytes`, `set_flush_test_pause`, `flush_commit_count`.
 
-### Flush stamps the imm's ROTATION-time vp_head, not the claim cursor (F-FLUSH-VPHEAD, 2026-07-04)
-
-`run_flush_async_phase_inner` used to snapshot `p.vp_extent_id/vp_offset` (the
-live write cursor) at flush-CLAIM time. But the background flush lags the writer:
-foreground writes that land between an imm's `rotate_active` and its claim push
-the cursor forward, so the flushed SST's vp_head (recovery replay-start) ends up
-AHEAD of that imm's own content — past acked-but-un-flushed writes sitting in the
-active memtable. On crash before they flush, recovery starts past them → silent
-loss. This is *also* the premise the compaction MAX above rests on, so it was
-load-bearing for both. Deterministic repro (flush test sync-point +
-`set_flush_mem_bytes`): `crates/manager/tests/system_flush_race_vp_head.rs`.
-
-Fix: `rotate_active` captures `p.vp_*` at the FREEZE instant (the imm's true
-content boundary) into `PartitionData.imm_vp_heads` (a `RefCell<HashMap<usize,
-(u64,u64)>>` keyed by `Arc::as_ptr`, same lifecycle discipline as
-`flushing_imm_ptrs` — INSERT at push, REMOVE at the single `commit_flush_outcome`
-pop; kept on a flush ERROR since the imm stays queued for retry). The flush reads
-the imm's captured vp instead of the live cursor — for BOTH the stamped SST/meta
-vp_head AND the F178 `await_log_synced_to` durability barrier (now waits for
-exactly the imm's content, not an over-far cursor). Test-only affordances added:
-`set_flush_mem_bytes` (configurable rotation threshold), `set_flush_test_pause`
-(a RocksDB-`SyncPoint`-style hold before the flush claim — one relaxed load per
-flush-wake, never set in production), and `flush_commit_count` (a durable-commit
-counter tests poll instead of sleeping).
-
-Companion — recovery seeds `p.vp` = the committed log TAIL (F-FLUSH-VPHEAD-b):
-`recover_partition` used to return the replay-MIN (its `chosen_pos` start) as the
-`p.vp` seed, so an idle-restarted partition's recovered active memtable rotated
-with a BACKWARD vp_head → the GC floor couldn't advance without a fresh write
-(the user's original "compact-then-forceg stuck" symptom for that case). It now
-tracks each replayed extent's committed end (including an empty rolled tail — coco
-P2) and seeds `p.vp` to the TAIL, kept SEPARATE from the replay start (which the
-replay loop still needs). SAFE: reads are committed-clamped, so the tail is ≥
-every replayed record; the recovered active is always flushed INTO an SST that
-contains its data, so even a mis-seed can't strand it. Guard:
-`crates/manager/tests/system_recovery_vp_seed.rs` (restart with un-flushed data →
-flush the recovered active → restart again → nothing lost).
-
-### F104 — Cross-partition compaction concurrency cap
-`PartitionServer` holds an `Arc<CompactionGate>` (lib.rs); each partition's
-`background_compact_loop` calls `gate.acquire().await` BEFORE invoking
-`do_compact` and drops the permit on RAII when the call returns. Default
-parallelism = 1 (fully serialized across all partitions on this PS),
-overridable via `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` env var, range [1, 64].
-Without this cap, `autumn-op compact ALL` against an N-partition PS
-would launch N concurrent `do_compact` calls each holding ~2× SST bytes
-in memory, multiplying per-partition peak by N.
+Companion: recovery seeds `p.vp` = the committed log TAIL (tracks each replayed
+extent's committed end), kept SEPARATE from the replay start. Without it, an
+idle-restarted partition's recovered active rotates with a BACKWARD vp_head → the GC
+floor can't advance without a fresh write. SAFE because reads are committed-clamped
+(the tail is ≥ every replayed record) and the recovered active is always flushed
+into an SST containing its data. `crates/manager/tests/system_recovery_vp_seed.rs`.
 
 ## GC/compaction merged loop (`background_maintenance_loop`)
 
-Compaction and GC run on ONE P-log task (`background_maintenance_loop`),
-replacing the former separate `background_compact_loop` + `background_gc_loop`.
-A unified `select` waits on `compact_rx` / `gc_rx` + two **deadline** timers
-(independent per-kind metric-refresh cadence); whichever fires runs its work to
-completion before the next select, so compaction and GC are **structurally
-serialized** — never concurrent. This is load-bearing for the GC replay-floor
-guard below (GC never observes `sst_readers` mid-compaction-publish). They share
-one `maintenance_gate` vs split (see "Split serialisation"). Each section still
-acquires its PS-wide cap (`acquire_compact` / `acquire_gc`) inner to the gate.
-Flush stays a separate loop — it only ADDS forward-vp_head SSTs, which can't
-lower the replay floor, so it needs no serialization with GC.
+Compaction and GC run on ONE P-log task. A unified `select` waits on `compact_rx` /
+`gc_rx` + two per-kind deadline timers; whichever fires runs to completion before
+the next select, so compaction and GC are **structurally serialized** — never
+concurrent. This is load-bearing for the GC replay-floor guard (GC never observes
+`sst_readers` mid-compaction-publish). They share one `maintenance_gate` vs split;
+each section acquires its PS-wide cap (`acquire_compact` / `acquire_gc`) inner to
+the gate. Flush stays a separate loop — it only ADDS forward-vp_head SSTs, which
+can't lower the replay floor, so it needs no serialization with GC.
 
-### GC WAL replay-floor guard (F1 — never punch what recovery replays)
+### GC WAL replay-floor guard — never punch what recovery replays
 
-GC `punch_holes` removes an extent from `log_stream.extent_ids`. If it punches
-an extent that crash recovery still replays from (`recover_partition` replays
-the log from `chosen_pos` = the MIN stream-position over all live SSTs'
-vp_heads), a crash before the next checkpoint loses un-flushed writes (small
-inline values not yet in any SST, or — if the vp_head extent itself is punched —
-`chosen_pos==MAX` → no replay at all). Relocating live large VPs (seq+1) is fine;
-the danger is punching the replay window.
+INVARIANT: GC only punches NON-EMPTY log extents STRICTLY BEFORE the replay floor
+(empty `sealed_length==0` extents are always eligible). Punching an extent that
+crash recovery still replays from loses un-flushed writes (small inline values not
+yet in any SST; or, if the vp_head extent itself is punched, `chosen_pos==MAX` → no
+replay at all). Relocating live large VPs (seq+1) is fine; the danger is punching
+the replay window.
 
-**Guard** (`gc_replay_floor` / `gc_extent_punchable`, used by the GC section for
-BOTH Auto and Force): compute `replay_floor_pos = min` stream-position
-(FIRST-occurrence index into `log_extent_ids`, matching recovery's
-`first_pos_by_eid` for CoW-shared post-split/merge extents) over the live SSTs'
-vp_heads, then only punch NON-EMPTY extents STRICTLY BEFORE it (empty
-`sealed_length==0` extents always eligible). The floor == recovery's `chosen_pos`
-exactly; the single-task merge makes the in-memory `sst_readers` it reads match
-the durable checkpoint recovery loads. `floor=0` (protect all non-empty) when no
-vp_head resolves. Regression: `background::gc_replay_floor_tests`.
+`gc_replay_floor` / `gc_extent_punchable` (used for both Auto and Force): compute
+`replay_floor_pos = min` stream-position (FIRST-occurrence index into
+`log_extent_ids`, matching recovery's `first_pos_by_eid` for CoW-shared extents)
+over the live SSTs' vp_heads. The floor == recovery's `chosen_pos` exactly; the
+single-task merge makes the in-memory `sst_readers` it reads match the durable
+checkpoint recovery loads. `floor=0` (protect all non-empty) when no vp_head
+resolves.
 
-**F-RECOVERY-UNBOUNDED BUG2 (2026-07-13) — raise the floor to the DURABLY-ACKed
-flush checkpoint vp.** The MIN-over-live-SST-vps floor above is over-conservative:
-it drags the punchable frontier back to the OLDEST live SST's vp_head, so GC can't
-reclaim the fully-covered `[MIN, newest-flush-vp)` region (disk debt) and recovery
-re-reads + CRC-checks it only to discard via dedup. Fix (`gc_floor_raise_to_durable_ckpt`,
-a `max`): after `gc_replay_floor`, raise `replay_floor_pos` to the position of
-`PartitionData.durable_ckpt_vp` when it resolves. `durable_ckpt_vp` is the vp_head
-of the newest FLUSH-published, **durably-ACKed** meta_stream checkpoint of THIS
-incarnation — set ONLY in `commit_flush_outcome_inner` AFTER `save_table_locs_raw`
-returns Ok, `(0,0)` until then, and NOT seeded from the recovered checkpoint at open
-(a fresh incarnation stays at the conservative MIN until its own first flush, which
-also collapses meta_stream to one record → closes the post-merge two-source
-region-shift window). By F-FLUSH-VPHEAD every log record strictly below a durable
-checkpoint vp is in that checkpoint's persisted SST set (or compaction-dead), so
-`[MIN, durable-vp)` is safe to punch.
+**Raise the floor to the durably-ACKed flush checkpoint vp**
+(`gc_floor_raise_to_durable_ckpt`, a `max`): the MIN-over-live-SST floor is
+over-conservative (drags back to the OLDEST live SST's vp_head, so GC can't reclaim
+the fully-covered `[MIN, newest-flush-vp)` region). After `gc_replay_floor`, raise
+to the position of `PartitionData.durable_ckpt_vp` when it resolves.
+`durable_ckpt_vp` is the vp_head of the newest FLUSH-published, **durably-ACKed**
+meta_stream checkpoint of THIS incarnation — set ONLY in
+`commit_flush_outcome_inner` AFTER `save_table_locs_raw` returns Ok, `(0,0)` until
+then, NOT seeded from the recovered checkpoint at open. Every log record strictly
+below a durable checkpoint vp is in that checkpoint's persisted SST set (or
+compaction-dead), so `[MIN, durable-vp)` is safe to punch.
 
-**Why the value MUST be ack-gated, never in-memory (load-bearing invariant):**
-`commit_flush_outcome_inner` pushes the new SST into `tables`/`sst_readers` BEFORE
-the checkpoint append acks. A floor derived from in-memory state (`p.vp_*`, or a MAX
-over live `sst_readers` vp_heads) could therefore run AHEAD of what a crash-time
-recovery will load — GC punches `[V_old, V_new)`, the process crashes before the
-`V_new` checkpoint acks, recovery loads the `V_old` checkpoint (whose SSTs don't
-cover `[V_old, V_new)`), and those records are in neither the loaded SST set nor the
-(punched) log → **silent loss**. The ack-gated `durable_ckpt_vp` is immune: a crash
-always leaves recovery loading a checkpoint whose SST set covers everything below
-the floor.
-
-**Why `recover_partition` is deliberately NOT changed** (the naive "MIN→MAX replay
-start" is UNSAFE — it deletes the `chosen_pos==usize::MAX` no-replay rescue that is
-the sole anchor when Step-1 checkpoints resolve nothing, and it reopens the
-post-merge q-key loss). The recovery-read half self-resolves for free: once GC
-punches the covered prefix, those extents vanish from `log_extent_ids`, the punched
-SSTs' vp_heads become unresolvable, recovery's Step-2 per-SST pass skips them
-(`if let Some(reader_pos) = first_pos_by_eid.get(...)`), and `chosen_pos` naturally
-lands at the first surviving position ≥ the raised floor. The vp extent sits AT the
-floor and the strictly-before punch rule keeps it live, so Step-1 always resolves it.
-Regression: the `durable_ckpt_raise_*` cases in `background::gc_replay_floor_tests`.
-Recommended cross-host guard (deferred, needs etcd + a `set_flush_commit_pause`
-sync-point): `system_gc_floor_durable_ckpt.rs` (kill+restart across the
-checkpoint-publish window proves K-keys survive).
+INVARIANT (why ack-gated, never in-memory): `commit_flush_outcome_inner` pushes the
+new SST into `tables`/`sst_readers` BEFORE the checkpoint append acks. A floor
+derived from in-memory state (`p.vp_*`, or a MAX over live `sst_readers` vp_heads)
+could run AHEAD of what a crash-time recovery loads — GC punches `[V_old, V_new)`,
+the process crashes before the `V_new` checkpoint acks, recovery loads the `V_old`
+checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-gated
+`durable_ckpt_vp` is immune. `recover_partition` is deliberately NOT changed to
+raise its replay start (the naive "MIN→MAX" deletes the `chosen_pos==MAX` no-replay
+rescue): the recovery-read half self-resolves — once GC punches the covered prefix
+those extents vanish from `log_extent_ids`, the punched SSTs' vp_heads become
+unresolvable, recovery skips them, and `chosen_pos` lands at the first surviving
+position ≥ the raised floor. `background::gc_replay_floor_tests`.
 
 ## GC (Garbage Collection)
 
 Targets the **logStream** where large values (ValuePointers) are stored.
 
-**Trigger**: periodic (30–60s jitter), via `gc_tx` channel (capacity 1), or via the `Maintenance` gRPC RPC. Two public methods on `PartitionServer`:
-- `trigger_gc(part_id) -> Result<(), &'static str>` — enqueue `GcTask::Auto(GcAutoParams::default())`
-- `trigger_force_gc(part_id, extent_ids) -> Result<(), &'static str>` — enqueue `GcTask::Force { extent_ids }`
+**Trigger**: periodic (30–60s jitter), via `gc_tx` (capacity 1), or via the
+`Maintenance` gRPC RPC. Public methods:
+- `trigger_gc(part_id)` — enqueue `GcTask::Auto(GcAutoParams::default())`
+- `trigger_force_gc(part_id, extent_ids)` — enqueue `GcTask::Force { extent_ids }`
 
-**F201 candidate selection** (`background.rs::background_gc_loop` Auto arm):
-1. Candidates = all `sealed_extents` (`extent_ids[..len-1]`), sorted by reclaimable bytes desc. Pre-F201 candidates came only from `discards.keys()`, so empty sealed extents (no SST ever referenced them → never in any discards map) were invisible to the loop.
+**Candidate selection** (Auto arm):
+1. Candidates = all `sealed_extents` (`extent_ids[..len-1]`), sorted by reclaimable
+   bytes desc (includes empty sealed extents that no SST ever referenced).
 2. For each candidate, `get_extent_info(eid)`:
-   - `sealed_length == 0` → push to holes (empty slot, no rewrite). `run_gc(eid, 0)` skips the read loop and goes straight to `flush_gc_batch` (no-op) + `punch_holes`.
-   - Else apply the F201 multi-tier filter:
-     - If `GcAutoParams::empty_only` is set → skip non-empty.
-     - If `max_size` is set and `sealed_length > max_size` → skip.
-     - Effective `ratio = max(GC_DISCARD_RATIO, params.ratio)`; halved when stream total discard ≥ `stream_debt` high-water.
-     - Push if `discard_bytes / sealed_length > effective_ratio`.
+   - `sealed_length == 0` → push to holes (empty slot, no rewrite). `run_gc(eid, 0)`
+     skips the read loop and goes straight to `flush_gc_batch` (no-op) + `punch_holes`.
+   - Else multi-tier filter: skip if `empty_only`; skip if `max_size` set and
+     `sealed_length > max_size`; effective `ratio = max(GC_DISCARD_RATIO,
+     params.ratio)` (halved when stream total discard ≥ `stream_debt` high-water);
+     push if `discard_bytes / sealed_length > effective_ratio`.
 3. Cap at `MAX_GC_ONCE` (3) per dispatch.
 
-**GC-STALE-CACHE (2026-06-18): a GC punch must NEVER fire on a stale/open
-`extent_info`.** The destructive `sealed_length == 0` → fast-punch branch above
-keys on `get_extent_info(eid)`, which is a CACHED read (`StreamClient.
-extent_info_cache`). `StreamClient::alloc_new_extent` caches the NEW tail after a
-seal-and-roll but does NOT evict the OLD tail, so a now-sealed extent can linger
-in cache as its pre-seal OPEN snapshot (`sealed=false, sealed_length=0`). The
-pre-fix loop trusted that stale `sealed_length==0` and **punched a sealed extent
-full of live ValuePointers as if empty → silent big-value loss** (chaos seed=583:
-extent 12 sealed at 7.8 MB, GC read stale `0`, punched it, GET of the VP'd key
-returned NotFound). Fix (`authoritative_sealed_length` helper, used by BOTH the
-Auto candidate loop AND Force GC, carrying the validated `(eid, sealed_length)` to
-`run_gc` so there is no check/use re-read split): `sealed` is IMMUTABLE once set,
-so a cached `sealed=true` is trustworthy; a candidate that reads NOT sealed is
-SKIPPED (`None`) — conservatively refusing to GC anything not authoritatively
-known sealed (an OPEN extent always reports `sealed_length==0` but is NOT empty —
-its committed length is `last_synced`, invisible here). **Deliberately NO
-invalidate+refetch** here: an extra GC→manager RPC per stale candidate shifts
-P-log timing and (chaos seed=603) EXPOSED a separate pre-existing split-child-open
-wedge (see below). The conservative skip leaves anything not authoritatively
-sealed-in-cache for a later tick (data-safe — never punches it).
+INVARIANT (never punch on a stale/open `extent_info`): the destructive
+`sealed_length == 0` fast-punch branch keys on `get_extent_info(eid)`, a CACHED read.
+A now-sealed extent can linger in `extent_info_cache` as its pre-seal OPEN snapshot
+(`sealed=false, sealed_length=0`); trusting that would punch a sealed extent full of
+live ValuePointers as if empty → silent big-value loss. `authoritative_sealed_length`
+(used by BOTH Auto and Force, carrying the validated `(eid, sealed_length)` to `run_gc`
+so there is no check/use re-read split): `sealed` is IMMUTABLE once set, so a cached
+`sealed=true` is trustworthy; a candidate that reads NOT sealed is SKIPPED — refusing to
+GC anything not authoritatively known sealed (an OPEN extent reports `sealed_length==0`
+but is NOT empty). The reclamation gap this could leave is closed at the SOURCE:
+`StreamClient::alloc_new_extent` (seal-and-roll) EVICTS the OLD tail from
+`extent_info_cache`, so GC's next `get_extent_info` fetches the authoritative sealed
+state and reclaims it. We EVICT, not synthesize `sealed_length = seal_commit` locally
+(the manager's `already_sealed` branch keeps the existing `L ≥ seal_commit`, so a
+synthesized smaller value would make GC punch committed `[seal_commit, L)`).
 
-**GC-reclamation gap — CLOSED (was deferred, paired with the seed=603 wedge).**
-The skip alone left a genuinely-sealed extent stuck stale-cached-as-open SKIPPED
-until its cache happened to refresh (a read / EC-`invalidate_extent_cache` /
-restart) → its dead bytes never reclaimed (a GC-efficiency leak, never data-loss).
-Now closed at the SOURCE: `StreamClient::alloc_new_extent` (seal-and-roll)
-**evicts the OLD tail from `extent_info_cache`** on the authoritative path
-(`seal_commit = Some(_)`, `seal_extent_id != 0`), so GC's next `get_extent_info`
-fetches the AUTHORITATIVE sealed state from the manager and reclaims it. We
-EVICT, not synthesize `sealed_length = seal_commit` locally (coco P1 data-loss):
-the manager's `already_sealed` branch ignores `req.seal_commit` and keeps the
-existing `L` (a prior probe/split seal, `L ≥ acked ≥ seal_commit`), so a
-synthesized `seal_commit < L` would make GC relocate only the first `seal_commit`
-bytes yet punch the whole extent → lose committed `[seal_commit, L)`. The extra
-cache-miss RPC is safe now that the seed=603 wedge it would once have exposed is
-itself fixed (see manager CLAUDE.md note 32a, BUG2-IDEMPOTENT-ROLL). The
-conservative skip above remains as the data-safe backstop for any OTHER
-stale-open source (probe/split/merge seals that don't go through this client's
-alloc). **The SPLIT-source case is actually UNREACHABLE, not merely
-backstop-covered (verified reproduce-first 2026-07-05,
-`crates/manager/tests/system_split_forcegc_stale_cache.rs`):** the manager-sealed
-tail is EXCLUDED from `sealed_extents` (it's the last extent) until the source
-allocates a FRESH tail, and that allocation routes through
-`ensure_tail_initialised → load_stream_tail`, which INSERTS the tail into
-`extent_info_cache` with its fresh `sealed` state. So the sealed tail's cache is
-refreshed BEFORE it can ever become a force-GC candidate — a `handle_split_part`
-seal-time `invalidate_extent_cache` would be redundant dead code. (A merge
-SURVIVOR has a brief `frozen_for_merge` window before its region_sync reopen
-where a spliced non-tail old-tail could read stale-open, but the reopen installs
-a fresh StreamClient + cache, so it self-heals within a ~2 s tick — data-safe
-either way.) **seed=603 wedge — FIXED (was a separate OPEN bug):** the split's right
-child never opened because a non-idempotent `alloc_new_extent` retry over-sealed
-the freshly-rolled tail → unrecoverable extent → WAL-FAILSTOP on replay. Fixed
-by pinning the seal to `seal_extent_id` (manager CLAUDE.md note 32a); NOT a
-routing/open bug.
+INVARIANT (GC liveness is FULL VP identity, not extent_id): a scanned record is the
+live version of its key ONLY if the current live VP matches `extent_id` AND `offset`
+AND `len` — it points at THIS record's exact bytes. Comparing `vp.extent_id` alone
+and relocating the *scanned* record's value drops a lost-update for a key with two
+large versions in the SAME sealed extent (relocate old A, then scan of new B sees
+the live version pointing elsewhere → skip → punch drops B). The scanned record's
+absolute value offset = `buf_base_offset + record_start + val_off`, where `val_off`
+comes from the single source of truth `wal_record::value_offset_in_record` (V1
+`22+key_len` / V0 `17+key_len`). Recovery's VP reconstruction (`lib.rs`) uses the
+SAME helper. `crates/manager/tests/system_gc_multiversion_same_extent.rs`.
 
-**F201 multi-tier params** (`GcTask::Auto(GcAutoParams)`):
-- `ratio: Option<f64>` — discard-ratio threshold, default 0.4
-- `max_size: Option<u64>` — only consider extents at most this size
-- `stream_debt: Option<u64>` — when total reclaimable bytes ≥ threshold, halve the ratio
-- `empty_only: bool` — pick only `sealed_length == 0` (cheapest, no rewrite)
-
-External controllers / `client gc --ratio X --max-size Y --stream-debt Z --empty-only` compose effective tiers by issuing multiple dispatches back-to-back. The PS does not internally "schedule across tiers"; it executes exactly the set of params each dispatch carries.
-
-**F201 cooldown classification** (`classify_gc_failure_cooldown`):
-- Soft window (30 s) when the failure's anyhow chain contains `"precondition failed"` (manager refuses `punch_holes` while `ec_conversion_inflight` per F138/F145) or `"eversion mismatch"` (private `EversionStale` sentinel from autumn-stream — stale `extent_info_cache` after an EC bump).
-- Hard window (300 s, was the only window pre-F201) for everything else.
-- `gc_failure_cooldown` map shape is `HashMap<u64, (Instant, Duration)>` so each entry carries its own window.
-
-Wire surface: `MaintenanceReq` carries 4 new optional fields (`gc_ratio` / `gc_max_size` / `gc_stream_debt` / `gc_empty_only`) — backward-incompatible at rkyv level; same-commit upgrade required (cluster.sh stops all roles before restart). Legacy callers (FLUSH, COMPACT, FORCE_GC) pass default values for these fields.
-
-**Discard snapshot RPC** (`MSG_GET_DISCARDS = 0x48`, FOPS-01): `handle_get_discards` in `rpc_handlers.rs`
-reads a live snapshot of the partition's discard map without any manager state. It:
-1. Snapshots `sst_readers` from `part.borrow()` (no await while borrowed).
-2. Calls `background::get_discards(&readers)` — same aggregation the GC loop uses.
-3. Fetches `log_stream extent_ids` via `part_sc.get_stream_info(log_stream_id)`.
-4. Filters via `background::valid_discard(&mut discards, &log_extent_ids)` to drop
-   extents already punched by a prior GC run.
-5. Returns `(extent_id, reclaimable_bytes)` pairs to the caller.
-Used by `autumn-client info` to display `discard: N ext / X pending` per log stream.
-
-**Discard map**: Each SSTable's MetaBlock contains `HashMap<extent_id, reclaimable_bytes>`. During compaction, when a VP entry is dropped (dedup, range filter, tombstone/expiry), its extent_id and value length are added to the discard map. The GC loop aggregates across all SSTable readers.
-
-**`run_gc` for one extent (F106 streaming + F130 multi-frag pre-pass)**:
+**`run_gc` for one extent (streaming)**:
 ```
-  0. F130 multi-frag rewrite pre-pass (NEW):
-     `rewrite_multi_frag_for_extent(part, log_stream_id, eid, part_sc)`
-       - Walk active memtable + imm queue for OP_VALUE_POINTER_MULTI
-         entries whose mfvp has any fragment on `eid`. Dedup by user_key
-         (newest seq wins). SST-only mfvps deferred to compaction's
-         discard path (see F130 entry in feature_list.md).
-       - For each candidate: read every fragment via
-         read_bytes_from_extent (full-value rewrite, not partial),
-         append each as a fresh OP_CHUNK_BLOB record, build new
-         MultiFragVp, allocate seq + append OP_VALUE_POINTER_MULTI|1
-         commit record, insert memtable entry.
-       - Race semantics: foreground Put on the same user_key allocates
-         a strictly newer seq under the same single-threaded P-log
-         runtime → wins on read via MVCC. Rewrite chunks become orphan
-         and are reclaimed by the next GC pass.
-     Without F130, OP_CHUNK_BLOB records of live multi-frag values would
-     be silently orphaned when punch_holes fired (the single-VP scan at
-     step 1 skips OP_CHUNK_BLOB records since `op & OP_VALUE_POINTER == 0`).
-  1. Single-VP loop (F106 streaming): until cur >= sealed_length:
+  0. Multi-frag rewrite pre-pass
+     (rewrite_multi_frag_for_extent): walk active memtable + imm queue for
+     OP_VALUE_POINTER_MULTI entries whose mfvp has any fragment on `eid`. Dedup by
+     user_key (newest seq wins; SST-only mfvps deferred to compaction's discard
+     path). For each candidate: read every fragment via read_bytes_from_extent
+     (full-value rewrite), append each as a fresh OP_CHUNK_BLOB record, build new
+     MultiFragVp, allocate seq + append OP_VALUE_POINTER_MULTI|1 commit record,
+     insert memtable entry. A foreground Put on the same user_key wins via a strictly
+     newer seq (single-threaded P-log); rewrite chunks become orphan, reclaimed next
+     GC pass. Without this, OP_CHUNK_BLOB records of live multi-frag values would be
+     silently orphaned by punch_holes (the single-VP scan skips OP_CHUNK_BLOB).
+  1. Single-VP loop (streaming): until cur >= sealed_length:
        a. read_bytes_from_extent(eid, cur, AUTUMN_PS_GC_READ_CHUNK_BYTES)
        b. concatenate carry + chunk → buf
        c. process_gc_chunk(buf):
-          - decode complete records left-to-right
-          - on partial record at tail, stop; caller saves buf[consumed..]
-            as carry for the next chunk
-          - per record (if single-VP and in_range):
-            * lookup current live version (active → imm → SSTables)
-            * if live VP still points to (eid, offset): re-write value
-              via stream_client.append, drop borrow_mut BEFORE awaiting
-              the network RPC, then re-acquire borrow_mut to insert
-              the updated VP into the memtable
-          - OP_CHUNK_BLOB records: skipped (handled by F130 pre-pass)
-          - OP_VALUE_POINTER_MULTI commit records: skipped (these are
-            tiny — ~16 + n_frags*16 bytes — and the rewrite pre-pass
-            covers their semantic content; the byte-trail of the old
-            commit record falls within the punched extent same as
-            chunks)
+          - decode complete records left-to-right; on partial record at tail stop,
+            save buf[consumed..] as carry for the next chunk
+          - per record (single-VP, in_range): lookup current live version
+            (active → imm → SSTables); if live VP still points to (eid, offset, len):
+            re-write value via stream_client.append, DROP borrow_mut BEFORE awaiting
+            the RPC, re-acquire to insert the updated VP
+          - OP_CHUNK_BLOB skipped (handled by the pre-pass); OP_VALUE_POINTER_MULTI
+            commit records skipped (tiny; pre-pass covers their semantic content)
        d. cur += chunk.len()
-  2. carry must be empty at end (sealed extent records are byte-aligned);
-     non-empty carry → refuse to punch and return error
-  3. punch_holes([eid]) on log_stream → manager decrements refs;
-     extent is physically freed when refs → 0 across all CoW-shared streams
+  2. carry must be empty at end (sealed records are byte-aligned); non-empty carry →
+     refuse to punch and return error
+  3. punch_holes([eid]) on log_stream → manager decrements refs; extent physically
+     freed when refs → 0 across all CoW-shared streams
 ```
 
-**GC-VP-IDENTITY (2026-06-18): liveness is FULL VP identity, not extent_id.**
-A scanned record is the live version of its key ONLY if the current live VP
-matches `extent_id` **AND** `offset` **AND** `len` — i.e. it points at THIS
-record's exact bytes. The pre-fix check compared `vp.extent_id` alone and then
-relocated the *scanned* record's value, so for a key with two large versions in
-the SAME sealed extent (old A@off_a, new B@off_b) GC relocated A's OLD value at
-a fresh seq; once that flushed, scanning B saw the live version pointing
-elsewhere and skipped it → punch dropped B = silent lost-update. The scanned
-record's absolute value offset = `buf_base_offset + record_start + val_off`,
-where `val_off` (V1 `22+key_len` / V0 `17+key_len`) comes from the single source
-of truth `wal_record::value_offset_in_record`. **recovery's VP reconstruction
-(`lib.rs`) uses the SAME helper** (was a hardcoded V1 `+22` that mis-placed V0
-legacy VPs by 5 B — would make this identity check drop live V0 records).
-Regression: `crates/manager/tests/system_gc_multiversion_same_extent.rs`.
+**Discard map**: each SSTable's MetaBlock holds `HashMap<extent_id,
+reclaimable_bytes>`. During compaction, dropping a VP entry (dedup/range/tombstone/
+expiry) adds its extent_id + value length to the map. The GC loop aggregates across
+all SstReaders.
 
-Pre-F106 (~commit before this) `run_gc` slurped the entire sealed
-extent into one Vec via `read_bytes_from_extent(eid, 0, sealed_length)`
-and held `borrow_mut()` across the per-record `part_sc.append` await.
-Two latent bugs: (i) for sealed log_stream extents > 2 GiB, the
-extent_node `pread` failed with EINVAL (macOS INT_MAX limit), repeating
-forever every 30s GC tick — also addressed by F105 chunked reads at the
-StreamClient layer. (ii) the cross-await `RefMut` would panic if any
-other task on the P-log runtime tried to borrow `part` during the
-in-flight RPC. F106 fixes both: chunked carry-streaming (peak GC RAM
-≈ one chunk + one record) and tighter borrow scopes around the await.
+**Discard snapshot RPC** (`MSG_GET_DISCARDS = 0x48`): `handle_get_discards` reads a
+live snapshot of the partition's discard map without manager state — snapshots
+`sst_readers` (no await while borrowed), calls `background::get_discards(&readers)`,
+fetches `log_stream extent_ids`, filters via `valid_discard` (drops already-punched
+extents), returns `(extent_id, reclaimable_bytes)` pairs. Used by `autumn-client
+info`.
 
-**Tunable**: `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB) — chunk
-size for the streaming read inside `run_gc`. Matches Go's
-~1000-block (≈ 64 MiB) `replayLog` window in `valuelog.go::runGC`.
+**Multi-tier params** (`GcTask::Auto(GcAutoParams)`): `ratio: Option<f64>` (default
+0.4), `max_size: Option<u64>`, `stream_debt: Option<u64>` (halve ratio when total
+reclaimable ≥ threshold), `empty_only: bool`. External controllers compose tiers by
+issuing multiple back-to-back dispatches; the PS executes exactly the params each
+dispatch carries. `MaintenanceReq` carries `gc_ratio` / `gc_max_size` /
+`gc_stream_debt` / `gc_empty_only`.
 
-## Admission: rate limiting + concurrency control (F189 → F196 D-r7)
+**Cooldown classification** (`classify_gc_failure_cooldown`,
+`gc_failure_cooldown: HashMap<u64, (Instant, Duration)>`): soft window (30 s) when
+the failure chain contains `"precondition failed"` (manager refuses `punch_holes`
+while `ec_conversion_inflight`) or `"eversion mismatch"` (stale `extent_info_cache`
+after an EC bump); hard window (300 s) for everything else.
 
-Background-IO admission split into TWO orthogonal mechanisms after
-F196 D-r7. The split mirrors the physical resource they protect:
-**rates** are per-partition because IO patterns are partition-local;
-**concurrency** is PS-wide because the protected resource is process
-RAM (each compact / GC operation holds ~hundreds of MB of buffers).
+**Tunable**: `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB) — chunk size for the
+streaming read inside `run_gc`.
 
-| Type | Scope | What it controls | Default (post D-r7-recal) | Code |
-|------|-------|-----------------|---------------------------|------|
-| `RateController` | **per-partition** | fg bytes/s + fg iops + compact bytes/s + gc bytes/s | fg 1 GiB/s + 30K iops; compact 256 MiB/s; gc 128 MiB/s | `lib.rs::RateController` |
-| `ConcurrencyController` | **PS-wide** (`Arc<>`) | compact + gc concurrency permits | compact_max=4, gc_max=4 | `lib.rs::ConcurrencyController` |
+## Admission: rate limiting + concurrency control
 
-`PartitionServer` carries one `Arc<ConcurrencyController>`; each
-`PartitionData` carries its own fresh `Arc<RateController>` (independent
-mutex/state) plus a clone of the PS-wide concurrency Arc.
+Background-IO admission is split into two orthogonal mechanisms mirroring the
+physical resource they protect: **rates** are per-partition (IO patterns are
+partition-local); **concurrency** is PS-wide (the protected resource is process RAM
+— each compact/GC operation holds hundreds of MB of buffers).
+
+| Type | Scope | Controls | Defaults | Code |
+|------|-------|----------|----------|------|
+| `RateController` | per-partition | fg bytes/s + fg iops + compact bytes/s + gc bytes/s | fg 1 GiB/s + 30K iops; compact 256 MiB/s; gc 128 MiB/s | `lib.rs` |
+| `ConcurrencyController` | PS-wide (`Arc<>`) | compact + gc concurrency permits | compact_max=4, gc_max=4 | `lib.rs` |
+
+`PartitionServer` carries one `Arc<ConcurrencyController>`; each `PartitionData`
+carries its own fresh `Arc<RateController>` plus a clone of the PS-wide concurrency
+Arc.
 
 ### RateController — per-partition rate caps
 
-Four independent rate dimensions in one 1-second window (lazy fixed-
-window token bucket):
+Four independent rate dimensions in one 1-second lazy fixed-window token bucket:
 
 ```rust
 struct RateState {
     window_start: Instant,    // updated only when elapsed >= 1 s
-    fg_bytes: u64,
-    fg_ops: u64,
-    compact_bytes: u64,
-    gc_bytes: u64,
+    fg_bytes: u64, fg_ops: u64, compact_bytes: u64, gc_bytes: u64,
 }
 ```
 
@@ -1226,76 +854,66 @@ Public methods (all async, all sleep OUTSIDE the lock):
 
 | Method | Semantics |
 |--------|-----------|
-| `account_fg(bytes, ops)` | fg write hot path. EITHER bytes OR ops cap reached → sleep (larger sleep wins). Default 256 MiB/s + 30K ops/s catches both 8 MiB-Put bytes-bound and 4 KiB-Put IOPS-bound workloads. |
+| `account_fg(bytes, ops)` | fg write hot path. EITHER bytes OR ops cap reached → sleep (larger wins). Catches both 8 MiB-Put bytes-bound and 4 KiB-Put IOPS-bound workloads. |
 | `account_compact(bytes)` | compact write. Sleeps until BOTH own compact rate AND fg-aware-yield allow. |
 | `account_gc(bytes)` | gc write. Symmetric to compact, separate counter. |
 
-**fg-aware yield** (inside `account_compact` and `account_gc`): yields
-the remainder of the 1-s window when `fg_observed_bytes_rate > 0.8 × fg_rate`
-OR `fg_observed_iops > 0.8 × fg_iops`. Disabled per-dimension when
-that fg cap is 0. Each partition checks ITS OWN fg counters — cold
-partition's compact doesn't yield because of hot partition's fg
-pressure (partitions are isolated).
+**fg-aware yield** (inside `account_compact`/`account_gc`): yields the remainder of
+the 1-s window when `fg_observed_bytes_rate > 0.8 × fg_rate` OR `fg_observed_iops >
+0.8 × fg_iops` (disabled per-dimension when that fg cap is 0). Each partition checks
+its OWN fg counters — a cold partition's compact doesn't yield to a hot partition's
+fg pressure. INVARIANT: compact and gc counters are INDEPENDENT (saturating compact
+does not throttle gc, and vice versa), so operators can budget them separately
+(compact is bulk/burst; gc is sustained). Per-partition also aligns with
+thread-per-core — each partition has its own io_uring and admission state on no
+shared Mutex.
 
-**Independent counters** (key invariant tested by
-`compact_and_gc_rates_are_independent`): saturating compact does NOT
-throttle gc and vice versa. Pre-D-r7 they shared a single `bg_rate_bytes_per_sec`
-counter; the split lets operators allocate budgets independently
-(compact tends to be bulk/burst; gc is more sustained).
-
-Why per-partition? In a multi-partition PS, a hot partition's fg
-pressure consuming a shared bg budget would starve cold partitions'
-maintenance work. Per-partition rates also align with the thread-per-
-core P-log model — each partition has its own io_uring; no reason its
-admission state should fight other partitions' on a shared Mutex.
+The lock guards synchronous accounting only; the sleep happens OUTSIDE (holding a
+non-async mutex across `.await` would deadlock the compio runtime — same thread =
+recursive lock = futex_wait on self):
+```rust
+let sleep_for = { let mut s = self.state.lock();
+    Self::maybe_reset_window(&mut s); s.<dim>_bytes += bytes; compute_sleep(&mut s) };
+if let Some(d) = sleep_for { compio::time::sleep(d).await; }
+```
+Trade-off vs continuous-refill: at the 1-s boundary you can burst 2× rate over a
+~2 ms window — a feature for our 256 MB compact chunks / 4 MiB GC batches (a chunk
+never gets sliced across windows).
 
 ### ConcurrencyController — PS-wide RAM cap
 
-Each `do_compact` holds ~2× SST bytes in memory; each `run_gc` holds
-~64 MiB of chunk-read buffer + rewrite staging. Without a global cap,
-`autumn-op compact ALL` would launch N concurrent compactions and
-multiply peak RSS by N (the F104 incident hit 44 GB RSS).
+Each `do_compact` holds ~2× SST bytes; each `run_gc` holds ~64 MiB chunk-read +
+rewrite staging. Without a global cap, `autumn-op compact ALL` would launch N
+concurrent compactions and multiply peak RSS by N.
 
 ```rust
 pub struct ConcurrencyController {
-    compact_max: usize,
-    gc_max: usize,
-    compact_inflight: AtomicUsize,
-    gc_inflight: AtomicUsize,
+    compact_max: usize, gc_max: usize,
+    compact_inflight: AtomicUsize, gc_inflight: AtomicUsize,
 }
 ```
-
-Public methods:
-
-| Method | Returns | Drop semantics |
-|--------|---------|----------------|
-| `acquire_compact()` | `CompactPermit` | decrements `compact_inflight` |
-| `acquire_gc()` | `GcPermit` | decrements `gc_inflight` |
-
-Atomic counters + 50 ms backoff loop (mirrors EN's
-`stream::ConcurrencyController`). `parking_lot::Mutex` NOT used here
-because per-Arc concurrency operations are inherently cross-thread
-(multiple partition threads acquire from the same Arc) and Atomic
-CAS is the right primitive.
+`acquire_compact() -> CompactPermit` / `acquire_gc() -> GcPermit` — atomic counters
++ 50 ms backoff loop; drop decrements. Atomic CAS (not a Mutex) is right here
+because acquisitions are inherently cross-thread (multiple partition threads share
+the same Arc).
 
 ### Call sites
 
 | Path | Call |
 |------|------|
-| `background::start_write_batch` (fg hot path) | `rate_ctrl.account_fg(bytes, ops)` |
-| `background::do_compact` (chunk emit + final emit) | `rate_ctrl.account_compact(chunk_bytes)` |
-| `background::flush_gc_batch` (write side) | `rate_ctrl.account_gc(batch_bytes)` |
-| `background::run_gc` (chunk read side) | `rate_ctrl.account_gc(chunk_len)` |
-| `background::background_maintenance_loop` (compaction section) | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_compact()` |
-| `background::background_maintenance_loop` (GC section) | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_gc()` |
-| `rpc_handlers::handle_split_part` | `maintenance_gate.acquire()` + `concurrency_ctrl.acquire_compact()` |
+| `start_write_batch` (fg hot path) | `rate_ctrl.account_fg(bytes, ops)` |
+| `do_compact` (chunk + final emit) | `rate_ctrl.account_compact(chunk_bytes)` |
+| `flush_gc_batch` (write side) | `rate_ctrl.account_gc(batch_bytes)` |
+| `run_gc` (chunk read side) | `rate_ctrl.account_gc(chunk_len)` |
+| `background_maintenance_loop` compaction section | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_compact()` |
+| `background_maintenance_loop` GC section | `maintenance_gate.acquire()` then `concurrency_ctrl.acquire_gc()` |
+| `handle_split_part` | `maintenance_gate.acquire()` + `concurrency_ctrl.acquire_compact()` |
 
-F141's per-partition `GcRateLimiter` survives as a deprecated inner
-cap layered before `account_gc`; it stays for back-compat with the
-`--gc-rate-bytes-per-sec` flag (distinct from D-r7's
+A per-partition `GcRateLimiter` survives as a deprecated inner cap layered before
+`account_gc`, kept for the `--gc-rate-bytes-per-sec` flag (distinct from
 `--admission-gc-rate-bytes-per-sec`).
 
-### Configuration (CLI flags + cluster.sh env)
+### Configuration (CLI flags + env)
 
 | Flag | Env | Default | Knob |
 |------|-----|---------|------|
@@ -1303,488 +921,276 @@ cap layered before `account_gc`; it stays for back-compat with the
 | `--fg-iops-per-sec` | `AUTUMN_PS_FG_IOPS_PER_SEC` | 30_000 | per-partition fg ops |
 | `--admission-compact-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC` | **256 MiB/s** | per-partition compact bytes |
 | `--admission-gc-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC` | **128 MiB/s** | per-partition gc bytes |
-| `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger ratio |
-| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency |
-| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency |
-| `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold passed to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
+| `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger |
+| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency (`compact_max`) |
+| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
+| `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
 
-**`--max-extent-size-bytes` (u64-offset widening).** The threshold at which a
-stream's tail extent rolls a fresh extent. Raised from a hardcoded 3 GiB to a
-16 GiB default + flag, enabled by widening every extent byte position on the
-read+append path from `u32` to `u64` (wire `AppendReq.commit` /
-`AppendResp.offset/end` / `ReadBytesReq.offset/length` / `CommitLengthResp.length`;
-persisted `ValuePointer` 16→24 B, `SstLocation`, `TableLocations.vp_offset`,
-SST `MetaBlock.vp_offset`, `TableMeta.offset/len`). Bigger extents = fewer
-extents = less manager/etcd metadata pressure at scale. The flag flows through
-`partition_server::set_max_extent_size_bytes` → `max_extent_size_bytes()`,
-read at both `StreamClient::new_with_owner_epoch` sites (P-log + P-bulk). WIRE
-fingerprint bumped to v5 (MIN=MAX=5, same-commit deploy). NOTE: with EC + 16 GiB
-extents a shard exceeds 4 GiB, so `read_shard_from_addr` chunks internally (see
-stream CLAUDE.md note 12) to keep each `MSG_READ_BYTES` under the frame's
-`payload_len: u32` ceiling.
+`0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
-Defaults sized to perf_check baselines. See `feature_list.md` F196
-D-r7-recal entry for the derivation (4K p16 d8: per-partition fg
-27 MB/s, flush 27 MB/s; 8M p8 d8: per-partition fg 218 MB/s).
-
-`0` on any rate flag = unlimited for that dimension (per-dimension
-opt-out without disabling the others). Removed in D-r7:
-`--bg-rate-bytes-per-sec` (split into compact + gc), with a migration
-error message at the CLI parser.
-
-### Pre-D-r7 history (for archeologists)
-
-- F141 (per-partition `GcRateLimiter`): standalone gc bytes/s limiter.
-  Kept as a layered inner cap.
-- F188 (`IoTokenBucket`): single PS-wide bg bytes/s cap. Replaced by F189.
-- F189 (`AdmissionController` Stage 3): two-class (fg + bg) admission
-  with fg-aware yield. PS-wide single Arc.
-- D-r5 (early F196): made it per-partition with `total/N` split. **Bug**:
-  one busy partition couldn't use full pool, double-bookkeeping vs
-  F104's PS-wide compact_gate. Reverted by D-r6.
-- D-r6: unified back to PS-wide AND folded F104 compact_gate +
-  gc_concurrency_gate into the single controller. Cleaner but
-  confused two orthogonal concerns (rate vs concurrency).
-- **D-r7 (current)**: separates rate (per-partition `RateController`)
-  from concurrency (PS-wide `ConcurrencyController`). compact/gc rates
-  are split into independent counters.
-
-### Algorithm: lazy fixed-window token bucket
-
-Each rate dimension uses the same shape: a 1-s wall-clock window with
-step-function reset, lazy `Instant::elapsed()` checks (vDSO
-`clock_gettime`, ~20 ns user-space). The `parking_lot::Mutex` guards
-synchronous accounting only — the sleep happens OUTSIDE the lock
-(holding a non-async mutex across `.await` would deadlock the compio
-runtime, same thread = recursive lock = futex_wait on self):
-
-```rust
-let sleep_for = {
-    let mut s = self.state.lock();
-    Self::maybe_reset_window(&mut s);
-    s.<dim>_bytes += bytes;
-    compute_sleep(&mut s)
-};                                  // guard dropped here
-if let Some(d) = sleep_for {
-    compio::time::sleep(d).await;   // await OUTSIDE lock
-}
-```
-
-Trade-off vs continuous-refill token bucket: at the 1-s boundary you
-can burst 2× rate over a ~2 ms window. For our workloads (256 MB
-compact chunks + 4 MiB GC batches) this is a feature — a single chunk
-never gets sliced across windows.
-
-### Industry comparison (legacy F189 notes)
-
-- **RocksDB `GenericRateLimiter`**: fixed-window + sleep, 100 ms refill,
-  separate hi/lo priority queues.
-- **TiKV `file_system::RateLimiter`**: direct port of RocksDB.
-- **Linux cgroups `blkio.throttle`**: kernel-side fixed-window slice
-  with jiffies reset — we're the user-space equivalent.
-- **CockroachDB `kvadmission`**: inspiration for fg/bg + fg-aware yield.
-  Far more sophisticated; we ship the minimum viable subset.
-
-If we ever need multi-priority + dynamic disk-bandwidth feedback,
-follow CockroachDB's structure. The four counters in `RateState` are
-already laid out for extension.
-
-### Cooldown / scheduler invariants (F189-fix race-review notes)
-
-Distributed-system race review of F187/F188/F189 found 7 bugs in
-surrounding scheduler/cooldown logic (the controller itself was clean):
-- `last_gc_at` / `last_compact_at` MUST be stamped on every loop
-  iteration that ran eligibility check (not just on success) — the
-  scheduler's cooldown gate gets stuck and re-dispatches every 5 s
-  otherwise.
-- `*_inflight` flags MUST be latched at receive-arm top (not after
-  `acquire`), to prevent the scheduler from firing duplicates during
-  the manager-RPC pre-flight.
-- The compact channel's `bool` payload means `is_major`; receivers
-  drain backlog and OR-merge to handle futures-channel's `cap +
-  num_senders` semantics.
-- The scheduler reads `req_count_monotonic` (never-reset) for the
-  fg-quota gate; `req_count` (swap-reset by `report_load_loop`) is
-  unsafe for diff-based rate calc.
+**`--max-extent-size-bytes`**: the threshold at which a stream's tail rolls a fresh
+extent. Enabled by widening every extent byte position on the read+append path from
+`u32` to `u64` (wire `AppendReq.commit` / `AppendResp.offset/end` /
+`ReadBytesReq.offset/length` / `CommitLengthResp.length`; persisted `ValuePointer`
+16→24 B, `SstLocation`, `TableLocations.vp_offset`, SST `MetaBlock.vp_offset`,
+`TableMeta.offset/len`). Bigger extents = fewer extents = less manager/etcd metadata
+pressure. Flows through `set_max_extent_size_bytes` → `max_extent_size_bytes()`, read
+at both `StreamClient::new_with_owner_epoch` sites (P-log + P-bulk). With EC + 16 GiB
+extents a shard exceeds 4 GiB, so `read_shard_from_addr` chunks internally to keep
+each `MSG_READ_BYTES` under the frame's `payload_len: u32` ceiling.
 
 ## Partition Split
 
-`handle_split_part` runs inline on `partition_loop` (the P-log
-task) via `dispatch_partition_rpc`, so all partition-state mutations are
-single-writer on the partition thread.
+`handle_split_part` runs inline on `partition_loop` (the P-log task) via
+`dispatch_partition_rpc`, so all partition-state mutations are single-writer on the
+partition thread.
 
 ```
 handle_split_part(req):
   1. Reject if part.has_overlap == 1 (run major compaction first)
-  2. F103: fetch authoritative range from manager via MSG_GET_REGIONS
-       — PS-local part.rg is set at open_partition and is NOT refreshed
-         by sync_regions_once for already-open partitions, so after a
-         previous split it still spans the pre-split wide range. Picking
-         mid_key against the stale rg yields keys outside the manager's
-         narrowed range and multi_modify_split rejects them.
-  3. mid_key SELECTION — two sources (F-SPLIT-AT-KEY / D4):
-       EXPLICIT (`req.at_key = Some(key)`): validate `key` STRICTLY inside
-         auth_rg `(start, end)` (== start / == end / out-of-range →
-         InvalidArgument), use it verbatim. SKIPS the SST scan (step 3-median)
-         AND the `>= 2 keys` gate (step 4) — so an EMPTY / near-empty partition
-         can be split (D8 presplit primitive). `at_key` is a RAW byte string;
-         the PS is namespace-agnostic (D5) — the CLI assembles `{ns}/{tenant}/
-         ++ suffix`, the wire carries only raw bytes.
-       MEDIAN (`req.at_key = None`, legacy):
-         user_keys = unique_user_keys(part).filter(in_range(auth_rg))
-         (sorted, dedup, tombstone-/expired-filtered; F103 auth-rg filter drops
-          CoW-shared SSTable keys spanning the old wide range)
-  4. MEDIAN path only: if user_keys.len() < 2 → FailedPrecondition (run major
-       compaction, or pass an explicit `split --at` point)
-  5. flush_memtable_locked(part): rotate active + flush all imm via
-       P-bulk
-  6. MEDIAN path: mid_key = user_keys[user_keys.len() / 2]
-       (EXPLICIT path: mid_key = req.at_key, chosen in step 3)
+  2. Fetch authoritative range from manager via MSG_GET_REGIONS — PS-local part.rg
+       is set at open and NOT refreshed for already-open partitions, so after a
+       previous split it still spans the pre-split wide range; picking mid_key
+       against the stale rg yields keys the manager's narrowed range rejects.
+  3. mid_key SELECTION — two sources:
+       EXPLICIT (req.at_key = Some(key)): validate key STRICTLY inside auth_rg
+         (start, end) (== start / == end / out-of-range → InvalidArgument), use
+         verbatim. SKIPS the SST scan AND the `>= 2 keys` gate — an empty / near-
+         empty partition can be split (presplit primitive). at_key is a RAW byte
+         string; the PS is namespace-agnostic (CLI assembles the prefix).
+       MEDIAN (req.at_key = None): user_keys = unique_user_keys(part).filter(
+         in_range(auth_rg)) (sorted, dedup, tombstone-/expired-filtered; auth-rg
+         filter drops CoW-shared SSTable keys spanning the old wide range)
+  4. MEDIAN only: if user_keys.len() < 2 → FailedPrecondition
+  5. flush_memtable_locked(part): rotate active + flush all imm via P-bulk
+  6. mid_key = user_keys[len/2] (MEDIAN) or req.at_key (EXPLICIT)
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
-       (up to 8 retries, exponential backoff 100ms → 2s)
-  8b. Invalidate stream workers: call part_sc.invalidate_stream()
-       on all 3 stream IDs (log, row, meta) and set
-       need_invalidate_row_stream for P-bulk. The manager sealed
-       the old tails; without invalidation the stale workers keep
-       appending beyond sealed_length and recovery misses that data.
-  9. F103: narrow PS-local part.rg to [auth_rg.start, mid_key) AND
-       re-evaluate has_overlap by checking each sst_reader's smallest/
-       biggest key against the new rg. Without this the same staleness
-       bug recurs on the 3rd split.
+       (up to 8 retries, backoff 100ms → 2s)
+  8b. Row-stream invalidate BARRIER to P-bulk (see below), INSIDE the critical
+       section BEFORE the manager seal; await the ACK. Then invalidate the log +
+       meta stream workers (part_sc.invalidate_stream) — the manager sealed the old
+       tails; without invalidation stale workers keep appending past sealed_length
+       and recovery misses that data.
+  9. Narrow PS-local part.rg to [auth_rg.start, mid_key), re-evaluate has_overlap
+       (each sst_reader's smallest/biggest vs new rg), bump p.region_epoch locally,
+       publish the new tuple to opened_with_shared (see region_epoch section).
 ```
 
-After split, both child partitions' on-disk SSTables still span the
-pre-split wider range (via CoW-shared extents). Per F103 step 9 the
-left (split source) partition immediately observes `has_overlap = 1`
-and refuses subsequent splits until major compaction drops the out-of-
-range keys and clears the flag. The right (newly created) partition
-gets opened by `sync_regions_once`, where `open_partition` evaluates
-overlap against its (correct) authoritative range and likewise sets
-`has_overlap = 1`.
+After split, both children's on-disk SSTables still span the pre-split range (via
+CoW-shared extents), so the left (source) immediately observes `has_overlap = 1` and
+refuses subsequent splits until major compaction drops the out-of-range keys. The
+right (new) partition is opened by `sync_regions_once`, where `open_partition`
+evaluates overlap against its authoritative range and likewise sets `has_overlap = 1`.
 
-**Split serialisation (single `maintenance_gate`):** `handle_split_part`
-acquires ONE per-partition gate before `flush_memtable_locked` / `commit_length`:
-`maintenance_gate` (held by `background_maintenance_loop` around BOTH its
-compaction and GC sections). Holding it guarantees neither a `do_compact`
-(`compact_row_append` racing the row_stream seal) NOR a `run_gc` (log_stream
-append racing the log seal) is in flight while split seals — because the merged
-loop runs only one of the two at a time. It is RAII-held through
-`multi_modify_split` + the F255 P-bulk barrier ACK, then `acquire_compact`
-(PS-wide RAM cap) is acquired inner. This unifies the former dual gates
-(`compact_gate` F255 + `gc_gate` F140), valid now that compaction and GC are on
-one task and can't race each other. **Lock order:** compaction/split are
-gate-first (`maintenance_gate` → `acquire_compact`); GC is **permit-first**
-(`acquire_gc` → `maintenance_gate`) so a GC queued on the global gc permit
-doesn't hold the gate and block a same-partition split (coco). Acyclic either
-way because GC uses `acquire_gc` (GC-exclusive) and split/compaction use
-`acquire_compact`: the wait-for graph `acquire_gc → maintenance_gate →
-acquire_compact` has no back-edge. (Compaction MUST stay gate-first to match
-split, else `acquire_compact ↔ maintenance_gate` cycles; GC has no such
-constraint.)
+**Split serialisation (single `maintenance_gate`):** `handle_split_part` acquires
+the per-partition `maintenance_gate` (a `CompactionGate::new(1)`, max=1, held by
+`background_maintenance_loop` around BOTH its compaction and GC sections) before
+`flush_memtable_locked` / `commit_length`. Holding it guarantees neither a
+`do_compact` (`compact_row_append` racing the row_stream seal) NOR a `run_gc`
+(log_stream append racing the log seal) is in flight while split seals — the merged
+loop runs only one at a time. RAII-held through `multi_modify_split` + the P-bulk
+barrier ACK, then `acquire_compact` (PS-wide RAM cap) is acquired inner. **Lock
+order**: compaction/split are gate-first (`maintenance_gate → acquire_compact`); GC
+is **permit-first** (`acquire_gc → maintenance_gate`) so a GC queued on the global gc
+permit doesn't hold the gate and block a same-partition split. Acyclic because GC
+uses `acquire_gc` (GC-exclusive) and split/compaction use `acquire_compact`
+(`acquire_gc → maintenance_gate → acquire_compact` has no back-edge). Compaction MUST
+stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycles.
 
 ## Crash Recovery (`open_partition`)
 
 ```
-  0. Check commit_length on all 3 streams (log/row/meta) — infinite retry with 5s backoff
-       Ensures last extent of each stream has consistent commit length across replicas
-       (equivalent to Go checkCommitLength)
-  1. Read last TableLocations checkpoint from metaStream
-       (iterate all extents backward, find first non-empty)
-  2. For each location: read SST bytes from rowStream, open SstReader
-  3. Compute max seq_number and VP head (vp_extent_id, vp_offset) from SSTables
-  4. Replay logStream from VP head forward:
-       - Read extent data from vp_extent_id onward
-       - Decode WAL records, re-insert into recovered memtable (active)
-       - Large values (>4KB): VP points to record in logStream
-       - Records with ts ≤ max_seq (already in SSTables) are skipped
+  0. Check commit_length on all 3 streams (log/row/meta) — infinite retry, 5s backoff
+       (ensures the last extent has consistent commit length across replicas)
+  1. Read last TableLocations checkpoint from metaStream (iterate extents backward,
+     find first non-empty)
+  2. For each location: read SST bytes from rowStream (META TAIL only), open SstReader
+  3. Compute max seq_number + VP head from SSTables
+  4. Replay logStream from VP head forward (committed-clamped, 64 MB chunked-carry):
+       decode WAL records, re-insert into recovered memtable (active); large values
+       (>4KB) via VP; records with ts ≤ max_seq (already in SSTables) skipped
   5. PartitionData.active = recovered memtable (preserves unflushed entries)
-  6. F107: log final state (`open_partition: ready` with tables=N,
-     sst_readers=N, has_overlap, max_seq, vp_extent_id, vp_offset) so
-     operators can correlate a user-issued `compact <PARTID>` against
-     the actual partition state — the major-compact path skips when
-     `tables.len() < 2 && has_overlap == 0` (matches Go reference;
-     correct when there's nothing to merge), but pre-F107 the silent
-     skip and missing open-time state hid this from users.
+  6. Log final state (`open_partition: ready` with tables/sst_readers/has_overlap/
+     max_seq/vp_extent_id/vp_offset)
   7. Spawn P-bulk OS thread (flush_worker_loop on own compio runtime)
-  8. Spawn P-log background tasks on this thread: flush_loop (dispatcher),
-     compact_loop, gc_loop, write_loop, dispatch_rpc
+  8. Spawn P-log background tasks on this thread (maintenance loop, flush loop,
+     accept loop, dispatch)
 ```
 
-**F105 chunked reads also apply here**: the logStream replay step reads
-each extent via `read_bytes_from_extent(eid, start_off, 0)`. Pre-F105
-this would EINVAL on a >2 GiB sealed extent and prevent the partition
-from opening at all — the GC failure was the visible symptom, but the
-recovery failure was a ticking time bomb. F105's chunking inside
-`StreamClient::read_bytes_from_extent` covers both paths transparently.
+The logStream replay + GC both read via `StreamClient::read_bytes_from_extent`, which
+chunks internally so a >2 GiB sealed extent never EINVALs.
 
-**Historical checkpoint repair (2026-04-29):** the bad `part 19` checkpoint was
-repaired with a one-off server binary, `repair_metastream`, which appends a new
-`TableLocations` record to the target meta stream and leaves normal recovery
-strict. Use this path for preserved broken data; keep `recover_partition`
-simple and authoritative.
+INVARIANT (concurrent opens): `sync_regions_once` fans out the opens via
+`futures::stream::iter(to_open).buffer_unordered(OPEN_PARALLELISM=64)` so a PS
+inheriting N partitions (full takeover) doesn't pay ~N× the single-partition recovery
+wallclock (each recovery runs on its own thread/core and is latency-bound). Race-free
+because port ordinals are reserved synchronously per open
+(`used_port_ords.borrow_mut()` before any await) and owner locks are per-partition
+keys, so no cross-open shared-RefCell borrow is held across an await. Gating
+(already-open / backoff / budget, with a LOCAL budget reservation counter) is applied
+UP FRONT; results (insert handle + budget inc + backoff record) after `collect`.
+`OPEN_PARALLELISM` caps only the manager-RPC burst; the live count is bounded by the
+per-PS partition budget (cpuset_len / 2).
 
-**F-RECOVERY-UNBOUNDED BUG3 (2026-07-13) — `sync_regions_once` opens partitions
-CONCURRENTLY.** `open_partition().await` spawns the partition's own OS thread (own
-compio runtime + core) and returns only after that thread finishes
-`recover_partition` (log_stream replay) + bind + register (`ready_tx` fires last).
-Awaiting the opens one-at-a-time made a PS that inherits N partitions (a full
-takeover after a sibling PS died) pay ~N× the single-partition recovery wallclock
-(×32 measured on a 32-partition takeover). Since each recovery runs on its own
-thread/core and is latency-bound (per-stream `commit_length` RTTs + SST meta-tail
-reads + chunked log replay), the opens now fan out via
-`futures::stream::iter(to_open).buffer_unordered(OPEN_PARALLELISM=64)` — the waits
-overlap for a ~N× speedup. The gating (already-open / backoff / F196 budget, with a
-LOCAL budget reservation counter so the batch decision stays exact before any
-`inc()`) is applied UP FRONT so the concurrent launch preserves the serial
-semantics; results (insert handle + budget inc + clear/record backoff) are applied
-after `collect`. Concurrency is race-free because port ordinals are reserved
-synchronously per open (`used_port_ords.borrow_mut()` before any await — a later
-open never collides) and owner locks are per-partition keys (`partition/<id>`), so
-no cross-open shared-RefCell borrow is held across an await. `OPEN_PARALLELISM` caps
-only the manager-RPC burst; the live count is already bounded by the per-PS
-partition budget (cpuset_len / 2).
+Corrupt historical checkpoints are repaired out of band (a one-off `repair_metastream`
+that appends a fresh `TableLocations` record); `recover_partition` stays strict and
+authoritative — do not add silent normalization to the reopen path.
 
 ## Fault Recovery: LockedByOther Self-Eviction
 
-If the `partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
-(meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
-The main partition loop checks this flag on each request and exits if set.
-This prevents split-brain where two PS nodes serve the same partition.
+If `partition_loop` receives `CODE_LOCKED_BY_OTHER` from the stream layer (a newer
+partition owner took the lock), it sets `locked_by_other`; the loop checks it each
+request and exits, preventing split-brain. The classifier
+`background::is_locked_by_other` matches the "LockedByOther" substring across the
+WHOLE anyhow chain (`{e:#}`, not plain `{e}` which shows only the outermost
+`.context`). It fires for BOTH fence layers: the EN's native `CODE_LOCKED_BY_OTHER`
+AND the stream client's typed `ManagerError` fence for a manager-side
+`ensure_owner_epoch` rejection (stale `owner_epoch`). INVARIANT: the poison → reopen
+→ fresh-epoch re-acquire path is the ONLY sanctioned recovery — never re-acquire a
+stale epoch in place.
 
-The classifier `background::is_locked_by_other` matches the "LockedByOther"
-substring across the WHOLE anyhow chain (`{e:#}`, BUG-MGR-RETRY-CLASS —
-plain `{e}` only shows the outermost `.context(...)` and silently hid the
-marker). It fires for BOTH fence layers: the EN's native
-`CODE_LOCKED_BY_OTHER` rejection AND the stream client's typed
-`ManagerError` fence Display for a manager-side `ensure_owner_epoch`
-rejection (stale `owner_epoch` on `alloc_new_extent` etc. — pre-fix that
-burned 20×500 ms of futile manager retries per write instead of poisoning;
-see stream CLAUDE.md Programming Note 30). Either way the poison →
-reopen → fresh-epoch re-acquire path is the ONLY sanctioned recovery: never
-re-acquire a stale epoch in place.
+**Liveness closure**: the poison makes `partition_loop` break → `partition_thread_main`
+returns → the runtime drops (accept loop, ps-conn tasks, flush loop). But the
+`PartitionHandle` would SURVIVE in `self.partitions`, so with an unchanged `(rg,
+streams, region_epoch)` tuple `sync_regions_once`'s `contains_key` skips the reopen
+forever (zombie: safe fencing but not live). So `sync_regions_once` DROPS any handle
+whose partition thread `is_finished()` (one atomic load per partition per ~2 s tick),
+making the manager's region map the arbiter that same tick:
+- still assigned here → reopen → `acquire_partition_owner_epoch` gets a FRESH epoch →
+  partition resumes;
+- moved away (rebalance) → not in `wanted` → stays closed. Also self-heals a crashed
+  partition thread.
 
-**Liveness closure (BUG-MGR-RETRY-CLASS)**: the poison makes
-`partition_loop` break → `partition_thread_main` returns → the thread's
-`block_on` completes, dropping the runtime (accept loop, ps-conn tasks,
-flush loop) — but the `PartitionHandle` used to SURVIVE in
-`self.partitions`, so when the region map still assigned the partition
-here with an unchanged `(rg, streams, region_epoch)` tuple,
-`sync_regions_once`'s `contains_key` skipped the reopen FOREVER (zombie
-partition; the fencing was safe but not live — the fenced side never
-recovered or exited, the coco-P0-dual-owner review only argued safety).
-Now `sync_regions_once` drops any handle whose partition thread
-`is_finished()` (one atomic load per partition per 2 s tick), making the
-manager's region map the arbiter that same tick:
-- still assigned here → reopen → `acquire_partition_owner_epoch` gets a
-  FRESH epoch → partition resumes ("my token was stale, refresh");
-- moved away (rebalance) → not in `wanted` → stays closed ("I am no
-  longer the owner, release"). Also self-heals a crashed partition
-  thread (previously the same zombie shape).
-Guard: `PartitionServer.shutting_down` (set first thing in `shutdown()`)
-makes `sync_regions_once` a no-op so the dead-thread reopen cannot
-resurrect partitions drained for process exit.
+`PartitionServer.shutting_down` (set first thing in `shutdown()`) makes
+`sync_regions_once` a no-op so the dead-thread reopen can't resurrect partitions
+drained for process exit.
 
-## F111: Heartbeat must outlive `sync_regions_once`
+## Heartbeat must outlive `sync_regions_once`
 
-`finish_connect` spawns `heartbeat_loop` immediately after `register_ps`
-succeeds, BEFORE the (potentially long) `sync_regions_once`. With
-several hundred MiB of unflushed WAL across N partitions,
-`sync_regions_once` can take 10+ s — past the manager's
-`PS_DEAD_TIMEOUT` (10 s, F069). Pre-F111 the spawn lived in `serve()`
-which only runs after `finish_connect` returns, so the first heartbeat
-landed AFTER the manager had already evicted the PS, leaving every
-region's `ps_addr` permanently `unknown`.
+`finish_connect` spawns `heartbeat_loop` immediately after `register_ps` succeeds,
+BEFORE the (potentially 10+ s with hundreds of MiB unflushed WAL) `sync_regions_once`
+— else the first heartbeat lands AFTER the manager's `PS_DEAD_TIMEOUT` (10 s) evicts
+the PS, leaving every region's `ps_addr` permanently `unknown`. `heartbeat_loop` also
+decodes the manager `CodeResp`: on `CODE_NOT_FOUND` (unknown `ps_id`) it WARN-logs and
+re-runs `register_ps` + `sync_regions_once`, so a transient eviction self-heals.
 
-The `heartbeat_loop` also decodes the `CodeResp` from the manager. On
-`CODE_NOT_FOUND` (manager doesn't know this `ps_id`) it logs a WARN
-and re-runs `register_ps` + `sync_regions_once` so a transient
-eviction (network blip, etcd lease hiccup) self-heals. Pre-F111 the
-manager silently returned `CODE_OK` for unknown ps_id, so the running
-PS never noticed it had been evicted.
+## Data-plane authz enforcement (`authz.rs`)
 
-## Data-plane authz enforcement (F-AUTHZ-1, `authz.rs`)
+The PS is the KV-layer enforcement point for multi-tenant `mem/` isolation. It holds
+ONLY the manager's PUBLIC keys (fetched via `MSG_GET_AUTHZ_CONFIG`, cached in
+`PartitionServer.authz: Arc<AuthzState>`, refreshed by `authz_config_poll_loop`, 5 s).
+It verifies a capability token ONCE per connection and enforces a byte prefix + `exp`
+check per request — it NEVER calls the manager to enforce.
 
-The PS is the KV-layer enforcement point for multi-tenant `mem/` isolation
-(design: `docs/data_plane_authz_design.md`). It holds ONLY the manager's PUBLIC
-keys (fetched via `MSG_GET_AUTHZ_CONFIG`, cached in `PartitionServer.authz:
-Arc<AuthzState>`, refreshed by `authz_config_poll_loop`, 5 s). It verifies a
-capability token ONCE per connection and enforces a byte prefix + `exp` check
-per request — it NEVER calls the manager to enforce.
+**OPT-IN.** `AuthzState.is_enabled()` is a single relaxed `AtomicBool` load; false (no
+signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kvcache /
+dev pay nothing. `enabled` flips true only after the config poll installs a keyring.
 
-**OPT-IN.** `AuthzState.is_enabled()` is a single relaxed `AtomicBool` load;
-false (no signing key configured cluster-wide) ⇒ the whole gate is skipped, so
-fuse / kvcache / dev pay nothing. `enabled` flips true only after the config
-poll installs a keyring.
-
-**ONE choke point: `authz_gate` (lib.rs), at the TOP of every frame dispatch,
-BEFORE routing.** Called from exactly two places — `push_one_frame_to_inflight`
-(the canonical dispatch; also covers `push_frames_to_inflight` + the idle-branch
-direct pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
+INVARIANT — **ONE choke point: `authz_gate`, at the TOP of every frame dispatch,
+BEFORE routing.** Called from exactly two places — `push_one_frame_to_inflight` (the
+canonical dispatch; also covers `push_frames_to_inflight` + the idle-branch direct
+pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
 - handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
-  `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`
-  (`handle_ps_connection` local; `&mut` threaded into both dispatch fns). When
-  authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works
-  against a non-authz PS.
-- else runs `authz_check(msg_type, payload, principal, …)`: per the request's
-  user key(s), `check_key` (protected prefix ⇒ require an unexpired token whose
+  `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
+  authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against
+  a non-authz PS.
+- else runs `authz_check(msg_type, payload, principal, …)`: per the request's user
+  key(s), `check_key` (protected prefix ⇒ require an unexpired token whose
   `allowed_prefixes` covers the key; kid still in the live keyring) / `check_range`
-  (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied`
-  frame is emitted and the frame NEVER reaches serve/delegate.
+  (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied` frame is
+  emitted and the frame NEVER reaches serve/delegate.
 
-**`drain_zc_writes` is SKIPPED when authz is ON.** The ZC write-recv fast path
-bypasses the `authz_gate` dispatch, so with authz on a large `MSG_PUT_ZC` is
+**`drain_zc_writes` is SKIPPED when authz is ON** (`!gate_active()`) — the ZC
+write-recv fast path bypasses `authz_gate`, so with authz on a large `MSG_PUT_ZC` is
 left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
-enforces uniformly (one value copy — acceptable, large writes are rare on
-`mem/`). Never re-enable it under authz without moving the key check into it.
+enforces uniformly (one value copy — acceptable; large writes are rare on `mem/`).
+Never re-enable it under authz without moving the key check into it.
 
 **Two load-bearing INVARIANTS (breaking either = silent cross-tenant exposure):**
-1. Any new frame-dispatch path (a new local-serve fast path, a new inline
-   handler off the ps-conn task) MUST route through `authz_gate` before serving
-   — the gate is the only enforcement point.
-2. Any new client data-plane msg_type that carries a USER KEY MUST get an arm in
+1. Any new frame-dispatch path (a new local-serve fast path, a new inline handler off
+   the ps-conn task) MUST route through `authz_gate` before serving — the gate is the
+   only enforcement point.
+2. Any new client data-plane msg_type carrying a USER KEY MUST get an arm in
    `authz_check` that extracts the key and calls `check_key`/`check_range`. The
    catch-all `_ => None` admits ungated (correct only for non-keyed admin ops).
 
 Wire: `MSG_AUTH_HELLO` (0x55) + `AuthHelloReq/Resp`; `StatusCode::PermissionDenied`
-(7). Client side: SDK auto-mints/renews the token and AUTH_HELLOs each PS
-connection (`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDenied`
-is terminal (not retried). Cross-tenant e2e: `crates/autumn-memory/tests/
-run_authz_e2e.sh`.
+(7). SDK auto-mints/renews the token and AUTH_HELLOs each PS connection
+(`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDenied` is terminal
+(not retried).
 
-### F-KEY-NS D7 Layer-A — put must target a REGISTERED namespace (SD-2)
+### Layer-A — put must target a REGISTERED namespace
 
-`authz_gate` now runs TWO checks. The `AuthzState::gate_active()` atomic
-(`is_enabled() || layer_a_enabled()`) is ONLY a lock-free fast-path SKIP HINT; the
-per-request DECISION is derived from the CONSISTENT snapshot (`!snap.namespaces.
-is_empty()` for Layer-A, `snap.enabled` for Layer-B) so a config-refresh window
-can't pair a stale flag with a different-time config (coco P2). A stale hint can
-only cause a one-request fail-open on the turn-ON edge (accepted pre-existing
-F-AUTHZ-1 behavior), never a false reject.
-- **Layer-A** (`check_layer_a`, `authz.rs`): a **put-class** frame
-  (`MSG_PUT`/`MSG_PUT_ZC`/`MSG_BATCH_PUT`) whose key falls under NO registered
-  namespace prefix (`AuthzInner.namespaces`, from `GetAuthzConfigResp.namespaces`)
-  is rejected with `StatusCode::NamespaceUnknown` (8). **TOKEN-FREE** — pure
-  `starts_with` against the registry; anonymous connections are checked too.
-  Gated by `layer_a_enabled` = *registry non-empty*, INDEPENDENT of the signing
-  key (a dev cluster gets Layer-A without authz; a cold/unconfigured PS with an
-  empty registry doesn't brick writes). **delete/get/range are NOT Layer-A
-  gated** — Layer-A only prevents creating UNOWNED data via writes;
-  reads/deletes are Layer-B's job.
-- **Layer-B** (`authz_check`, unchanged) runs after, gated by `is_enabled`.
-- **`drain_zc_writes` gate**: the ZC write-recv fast path is skipped when
-  `!gate_active()` (was `!is_enabled()`) so a large `MSG_PUT_ZC` flows through the
-  FrameDecoder path where the gate enforces BOTH layers — else Layer-A would miss
-  large ZC writes when the signing key is off.
-- **Deploy ordering — Layer-A is LIVE from bootstrap, NOT "dormant"** (fable
-  review, 2026-07-18): SD-1's `seed_builtin_namespaces` CAS-registers `fs/`,`kvc/`,
-  `mem/` on the first leader of any etcd-backed cluster → registry non-empty → the
-  PS turns Layer-A ON (`layer_a_enabled = !namespaces.is_empty()`, independent of
-  the signing key). So this tree **must NOT be deployed without SD-3**: fuse
-  (pre-SD-3) writes raw `0x01`–`0x04` keys via `connect_raw`, which Layer-A rejects
-  with `NamespaceUnknown` (terminal — no `[a-z0-9._-]+` namespace can ever cover
-  `0x01…`) → a fuse data-plane outage. The §7.4 batch reset deploys SD-1+SD-2+SD-3
-  together, so at deploy time fuse writes `fs/…` (registered) and passes — **SD-2
-  is only ever shipped WITH SD-3**. Test gap to know: in-process test managers run
-  memory-mode and never call `seed_builtin_namespaces` (etcd `try_become_leader`
-  only), so Layer-A is OFF in the suite unless a test explicitly `namespace-create`s
-  (as `system_namespace_layer_a` does) — a real etcd cluster behaves differently.
-  Tests: `authz::tests::layer_a_*`, `system_namespace_layer_a`.
+`authz_gate` runs TWO checks. The `AuthzState::gate_active()` atomic (`is_enabled() ||
+layer_a_enabled()`) is ONLY a lock-free fast-path SKIP HINT; the per-request DECISION
+is derived from the CONSISTENT snapshot (`!snap.namespaces.is_empty()` for Layer-A,
+`snap.enabled` for Layer-B) so a config-refresh window can't pair a stale flag with a
+different-time config. A stale hint can only cause a one-request fail-open on the
+turn-ON edge, never a false reject.
+- **Layer-A** (`check_layer_a`): a **put-class** frame (`MSG_PUT`/`MSG_PUT_ZC`/
+  `MSG_BATCH_PUT`) whose key falls under NO registered namespace prefix
+  (`AuthzInner.namespaces`, from `GetAuthzConfigResp.namespaces`) is rejected with
+  `StatusCode::NamespaceUnknown` (8). TOKEN-FREE — pure `starts_with` against the
+  registry; anonymous connections checked too. Gated by `layer_a_enabled` = *registry
+  non-empty*, INDEPENDENT of the signing key. delete/get/range are NOT Layer-A gated
+  (Layer-A only prevents creating UNOWNED data via writes; reads/deletes are
+  Layer-B's job).
+- **Layer-B** (`authz_check`) runs after, gated by `is_enabled`.
+- **`drain_zc_writes` gate** is skipped when `!gate_active()` so a large `MSG_PUT_ZC`
+  flows through the FrameDecoder path where the gate enforces BOTH layers.
+- Deploy note: builtin namespaces (`fs/`,`kvc/`,`mem/`) are CAS-registered on the
+  first leader of any etcd-backed cluster → registry non-empty → Layer-A ON. So raw
+  `0x01`–`0x04` keys (pre-namespace fuse via `connect_raw`) would be rejected with
+  `NamespaceUnknown` — Layer-A must only ship alongside the namespace-key migration
+  that makes fuse write `fs/…`. In-process test managers run memory-mode and never
+  seed builtins, so Layer-A is OFF in the suite unless a test `namespace-create`s.
 
-## region_epoch check (TiKV-style, 2026-05-16)
+## region_epoch check (TiKV-style)
 
-Each `PartitionData` carries `region_epoch: u64`, populated at open
-time from `MgrRegionInfo.region_epoch` (manager bumps on every `rg`
-rewrite — split / merge). Hot-path handlers compare the request's
-stamped `region_epoch` against `p.region_epoch`; mismatch returns
-`StatusCode::FailedPrecondition` so the SDK's `Err`-arm refresh path
-engages.
+Each `PartitionData` carries `region_epoch: u64`, populated at open from
+`MgrRegionInfo.region_epoch` (manager bumps on every `rg` rewrite — split / merge).
+Hot-path handlers compare the request's stamped `region_epoch` against
+`p.region_epoch`; mismatch returns `StatusCode::FailedPrecondition` so the SDK's
+`Err`-arm refresh path engages. Check sites: `handle_get` / `handle_head` (before
+in_range), `handle_range` (at top — **load-bearing**: without it a stale-epoch range
+silently filters out-of-range keys and returns a partial `Ok(RangeResp)` the SDK
+can't detect), `enqueue_put` / `enqueue_delete` / `enqueue_stream_put`
+(`handle_incoming_req` snapshots `(region_epoch, part_id)` under one `borrow()`).
+`0` on the wire = "skip check" (tests/bench/legacy); production callers always stamp
+non-zero from `ClusterClient.lookup_epoch_for_part`.
 
-Check sites:
-- `rpc_handlers.rs::handle_get` — before in_range
-- `rpc_handlers.rs::handle_head` — same
-- `rpc_handlers.rs::handle_range` — at top; **this is the load-bearing
-  one** for the gallery list bug. Pre-this, `handle_range` silently
-  filtered out-of-range keys via `continue` and returned partial
-  `Ok(RangeResp)` — the SDK couldn't tell. Now any stale-epoch range
-  is rejected up front.
-- `lib.rs::enqueue_put` / `enqueue_delete` / `enqueue_stream_put` —
-  write path. `handle_incoming_req` snapshots `(region_epoch, part_id)`
-  under one `borrow()` and threads it through.
+`RangeResp.cur_end_key` carries `p.rg.end_key` as a ResumeSpan cursor; the SDK uses
+it to advance across partition boundaries within one `range()` call, so a split
+mid-scan auto-resolves. `PartitionHandle.opened_with` is `(rg, log/row/meta,
+region_epoch)` so `sync_regions_once`'s drop+reopen check catches an epoch bump even
+if rg byte-matches.
 
-`0` on the wire = "skip check" (tests / bench / legacy). Production
-callers always stamp non-zero from `ClusterClient.lookup_epoch_for_part`.
+INVARIANT: `handle_split_part` MUST bump `p.region_epoch` locally (in-place) AND
+publish the new tuple to `opened_with_shared`. The manager bumps the region epoch in
+lock-step with rg rewrites, but the partition thread can't see that until the next
+`sync_regions_once` drops+reopens (seconds, expensive) unless it updates its own copy.
+- Without the in-place bump: a `range()` in the gap routes to a partition whose
+  `p.region_epoch` still matches the SDK's stale cached epoch — the check passes,
+  `handle_range` filters against the just-narrowed `part_rg`, returns left-only
+  entries with `cur_end_key = mid`, and the SDK loops back to the same partition → the
+  user sees an empty list. (SDK also falls back to `refresh_regions` + retry on the
+  cursor-non-advance trip as a second defensive layer.)
+- Without publishing to `opened_with_shared`: the next `region_sync_loop` tick sees
+  the stale snapshot `!= latest` and drops+reopens the SOURCE partition (full
+  `recover_partition` + a new port) even though its in-memory state is already
+  correct → a 5–60+ s outage on every split. `PartitionHandle.opened_with` is
+  `Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>` shared with
+  `PartitionData.opened_with_shared`; `handle_split_part` writes the post-split tuple.
 
-`RangeResp.cur_end_key` carries `p.rg.end_key` as the resume cursor
-for the SDK — CockroachDB-style ResumeSpan. The SDK uses it to
-advance across partition boundaries within a single `range()` call,
-so a split mid-scan auto-resolves.
-
-`PartitionHandle.opened_with` extends to `(rg, log/row/meta, region_epoch)`
-so `sync_regions_once`'s drop+reopen check catches an epoch bump even
-in the (theoretical) case where rg byte-for-byte matches but epoch
-moved.
-
-**`handle_split_part` must bump `p.region_epoch` locally** (post-fix
-above the rg/has_overlap update). The manager bumps the region epoch
-in lock-step with rg rewrites (`next_region_epoch` in manager/src/lib.rs),
-but the PS partition thread can't see that bump until either (a) the
-next `sync_regions_once` tick drops + reopens this partition (seconds
-later, expensive), or (b) it updates its own copy in place. Without
-the in-place bump, a gallery `range()` call issued in the gap routes
-to a partition whose `p.region_epoch` still matches the SDK's stale
-cached epoch — the check passes, handle_range filters the SSTables
-against the just-narrowed `part_rg`, returns left-only entries with
-`cur_end_key = mid`, and the SDK's still-stale routing cache loops
-back to the same partition, hits the cursor-non-advance defensive
-trip, and the user sees an empty list. SDK additionally falls back
-to `refresh_regions` + retry on the non-advance trip as a defensive
-second layer (`crates/client/src/lib.rs::range`), so a future PS-side
-bug of this shape self-heals instead of erroring out.
-
-**`handle_split_part` must ALSO publish the new tuple to
-`opened_with_shared`** so `sync_regions_once` skips the drop+reopen
-that pre-fix-2 caused a 5-60+ s outage on every split (F212-fix-2).
-`PartitionHandle.opened_with` is now
-`Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>` shared with
-`PartitionData.opened_with_shared` on the partition thread. The
-in-place rg/epoch update block in `handle_split_part` is followed
-by a second `borrow + lock + write` block that publishes the
-post-split tuple. Same pattern as `Arc<PartitionMetrics>`
-(programming note 11) and `Arc<ConcurrencyController>` (F196 D-r7) —
-cross-thread shared state for low-frequency cross-thread reads.
-
-Why this is load-bearing: pre-fix-2, `opened_with` was a frozen
-snapshot from `open_partition` time. After `handle_split_part`
-narrowed `p.rg` + bumped `p.region_epoch` in-place on the
-partition thread, the snapshot stayed stale. On the next
-`region_sync_loop` tick (~2 s), `sync_regions_once` compared the
-stale snapshot against the manager's latest, saw `prev != latest`,
-and dropped + reopened the SOURCE partition even though its
-in-memory state was already perfectly correct. The reopen ran a
-full `recover_partition` (log_stream replay), allocated a new
-F099-K port, and during that window (5-60+ s depending on WAL
-depth) the partition was unreachable. The user observed >2 min
-gallery emptiness from this on a partition with a deep WAL tail.
-
-Post-fix, only the **right child** still has an inherent open
-window: it's a brand-new partition that has to be opened from
-scratch on its assigned PS (~2 s `region_sync_loop` tick + the
-new partition's `open_partition`). The SDK absorbs that window
-via TiKV-style retry in `crates/client/src/lib.rs::range`,
-`call_ps_for_key`, and `call_ps_for_part`
-(`MAX_PS_REFRESHES = 10`, base 100 ms, cap 2000 ms, cumulative
-~9 s — well over the typical 2-4 s convergence). The retry is
-deliberately NOT large enough to hide multi-minute PS-side bugs
-of the same shape (so the next one fails loudly here instead of
-being masked).
-
-Future in-place updaters of `PartitionData.rg` / `region_epoch`
-(e.g., a future merge-survivor in-place widening) MUST follow
-the same pattern: update local fields → release `borrow_mut` →
-take a fresh `borrow` and lock `opened_with_shared` → write the
-new tuple. Skip either step and the partition gets needlessly
-torn down on the next `region_sync_loop` tick.
+Only the **right child** still has an inherent open window (a brand-new partition
+opened from scratch on its assigned PS, ~2 s tick + `open_partition`). The SDK
+absorbs it via TiKV-style retry (`MAX_PS_REFRESHES = 10`, base 100 ms, cap 2000 ms,
+cumulative ~9 s), deliberately NOT large enough to mask multi-minute PS-side bugs of
+this shape. INVARIANT: any future in-place updater of `PartitionData.rg` /
+`region_epoch` (e.g. a merge-survivor widening) MUST follow the same pattern (update
+local fields → release `borrow_mut` → fresh `borrow` + lock `opened_with_shared` →
+write the new tuple), else the partition gets needlessly torn down next tick.
 
 ## SSTable Format
 
@@ -1796,14 +1202,15 @@ The last 4 bytes are `meta_len` — used by `SstReader::open` to locate the Meta
 
 ### Block Layout (64KB target, max 1000 entries)
 ```
-[Entry 0][Entry 1]...[Entry N][entry_offsets: N×4B LE][num_entries: 4B LE][crc32c: 4B LE]
+[Entry 0]...[Entry N][entry_offsets: N×4B LE][num_entries: 4B LE][crc32c: 4B LE]
 ```
 
 ### Entry Layout (prefix-compressed)
 ```
 [EntryHeader: 4B = overlap:u16 LE + diff_len:u16 LE][diff_key][op:1B][val_len:4B LE][expires_at:8B LE][value]
 ```
-`overlap` = bytes shared with the block's **base key** (first key of the block, stored in MetaBlock index). Only the diff suffix is stored. This is **prefix compression**.
+`overlap` = bytes shared with the block's **base key** (first key of the block, stored
+in the MetaBlock index). Only the diff suffix is stored (prefix compression).
 
 ### MetaBlock Layout
 ```
@@ -1824,19 +1231,20 @@ crc32c (4B)
 ```
 
 ### Bloom Filter
-
-Double hashing with xxh3:
-- `h1 = xxh3_64(user_key)`, `h2 = xxh3_64_with_seed(user_key, SEED)`
-- `hash_i = (h1 + i * h2) mod num_bits`
-
-Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% target FPR, initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...]`.
+Double hashing with xxh3: `h1 = xxh3_64(user_key)`, `h2 =
+xxh3_64_with_seed(user_key, SEED)`, `hash_i = (h1 + i * h2) mod num_bits`. Operates
+on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% target FPR,
+initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...]`.
 
 ### Iterators
-
-- `BlockIterator`: scan entries within one decoded block; `seek` via binary search over entry offsets.
+- `BlockIterator`: scan entries within one decoded block; `seek` via binary search
+  over entry offsets.
 - `TableIterator`: spans all blocks; advances to next block when current exhausted.
-- `MergeIterator`: N-way merge of TableIterators; for duplicate internal keys, lower-index iterator (newer data) wins; `next()` advances ALL iterators at the current minimum key.
-- `MemtableIterator`: snapshot of memtable entries as sorted Vec; uses `partition_point` for seek.
+- `MergeIterator`: N-way merge of TableIterators; for duplicate internal keys, the
+  lower-index (newer) iterator wins; `next()` advances ALL iterators at the current
+  minimum key.
+- `MemtableIterator`: snapshot of memtable entries as sorted Vec; `partition_point`
+  for seek.
 
 ## Key Constants
 
@@ -1849,643 +1257,382 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
-| `MAX_IMM_DEPTH` (F120-A) | 4 | imm queue cap; merged_loop stalls req intake when reached. RocksDB's `max_write_buffer_number`. Env: `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
-| `MAX_WAL_GAP` (F120-B) | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. **F-RECOVERY-UNBOUNDED BUG1: measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`** — a VP is ~24 B for an 8 MB value, so a `mem_bytes` gap never tripped on large-value workloads and the replay window grew O(dataset). RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
-| `SHUTDOWN_TIMEOUT_MS` (F120-C) | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env: `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
-| `MAX_SST_BEFORE_AUTO_COMPACT` (F210-E2) | 32 | defensive: `background_compact_loop`'s timeout arm auto-triggers a minor compaction when `sst_readers.len()` exceeds this. Prevents bloom-FPR runaway on partitions where external policy is paused (1% per-SST bloom × N=32 ≈ 28% cumulative miss-path false-positive). Not env-tunable — mechanism-level defensive bound, not a policy knob. |
+| `MAX_IMM_DEPTH` | 4 | imm queue cap; merged_loop stalls req intake when reached (RocksDB `max_write_buffer_number`). Env `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
+| `MAX_WAL_GAP` | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. Measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`. RocksDB `max_total_wal_size`. Env `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
+| `SHUTDOWN_TIMEOUT_MS` | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
+| `MAX_SST_BEFORE_AUTO_COMPACT` | 32 | defensive: the compact loop's timeout arm auto-triggers a minor compaction when `sst_readers.len()` exceeds this (bounds bloom-FPR runaway: 1% per-SST × 32 ≈ 28% cumulative). Not env-tunable. |
 
-## F120 — bounded recovery replay
+## Bounded recovery replay
 
-**The problem (2026-04-27):** A killed-mid-write PS that had pushed many imm
-tables behind a slow P-bulk left the entire `(vp_offset, log_stream commit)`
-window for restart-time replay. Witnessed at **1.96 GB on partition 15** with
-several hundred MiB across siblings, surfacing as a 16 GB process footprint
-post-restart.
+Three fixes bound the restart replay window (worst case per partition =
+`MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB):
 
-**The three fixes:**
+1. **imm depth cap + back-pressure.** `partition_loop` reads `imm_full = part.imm.len()
+   >= MAX_IMM_DEPTH` at top of loop. When full it skips both batch launches (B) and
+   `req_rx.next()` (D), only polling `inflight.next()` and `imm_drained_rx`.
+   `flush_one_imm` signals `imm_drained_tx` after each successful `imm.pop_front()` so
+   the loop wakes and resumes intake.
 
-1. **F120-A — imm depth cap + back-pressure.** `partition_loop` reads
-   `imm_full = part.imm.len() >= MAX_IMM_DEPTH` at top of loop. When full it
-   skips both batch launches (B) and `req_rx.next()` (D), only polling
-   `inflight.next()` and a new `imm_drained_rx` channel. `flush_one_imm`
-   (and the legacy `flush_one_imm_local` fallback) signal `imm_drained_tx`
-   after each successful `imm.pop_front()` so the loop wakes and resumes
-   request intake. Worst-case unflushed-WAL window per partition is now
-   `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB.
+2. **WAL-gap forced rotate.** After each `partition_loop` iteration, if `gap =
+   active.log_bytes() + Σ imm[i].log_bytes() > MAX_WAL_GAP` AND `imm.len() <
+   MAX_IMM_DEPTH`, call `rotate_active`. INVARIANT: the gap MUST be the un-flushed LOG
+   bytes, not the memtable footprint — for a large-value (VP) workload the memtable
+   holds only the ~24-byte ValuePointer while the 8 MB value lives in log_stream, so a
+   `mem_bytes` gap never trips → active never force-rotates → the un-flushed replay
+   window grows O(dataset). `Memtable.log_bytes: AtomicU64` tracks the actual appended
+   log bytes (value included), incremented in THREE places — group-commit Phase 3
+   (`finish_write_batch`), the GC multi-frag rewrite, and recovery-replay — travels
+   with the memtable through `rotate_active` into imm, and disappears from the sum when
+   the imm flushes (durable in an SST → no replay needed). A fresh active starts at 0.
 
-2. **F120-B — WAL-gap forced rotate.** After each iteration of
-   `partition_loop`, compute `gap = active.log_bytes() + Σ imm[i].log_bytes()`.
-   If `gap > MAX_WAL_GAP` AND `imm.len() < MAX_IMM_DEPTH`, call
-   `rotate_active`. Bounds replay window for workloads that don't fill
-   `FLUSH_MEM_BYTES` before triggering rotate (e.g. mostly-large-value
-   writes where memtable is light but log_stream grows fast via VPs).
-   **F-RECOVERY-UNBOUNDED BUG1 (2026-07-13): the gap MUST be the un-flushed
-   LOG bytes, not the memtable footprint.** Pre-fix it read `active.mem_bytes()
-   + Σ imm.mem_bytes()`; for a large-value (VP) workload the memtable holds only
-   the ~24-byte ValuePointer while the 8 MB value lives in log_stream, so the gap
-   never approached MAX_WAL_GAP (1 GiB default) → active never force-rotated → the un-flushed replay
-   window grew O(dataset) (the real cause of "slow reopen on a big dataset", not
-   the dataset size itself). `Memtable.log_bytes: AtomicU64` tracks the actual
-   appended log bytes (value included), incremented in THREE places — the
-   group-commit Phase 3 (`finish_write_batch`, Σ `record_sizes`), the GC
-   multi-frag rewrite (Σ appended `batch_bytes`), and recovery-replay (per
-   inserted record: `V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + key + value`). It
-   travels with the memtable through `rotate_active` into imm and disappears from
-   the sum when the imm flushes (its bytes are now durable in an SST → no longer
-   need replay). A fresh active starts at 0.
-
-3. **F120-C — graceful shutdown.** New `PartitionServer::shutdown()` sends
-   a `oneshot::Sender<()>` per partition through `drain_tx`. The
-   `partition_loop` picks it up via select, sets `drain_ack`, exits
-   the main loop, runs the existing tail-drain block (in-flight + pending),
-   THEN rotates `active` and loops `flush_one_imm` until imm empties,
-   replies on the oneshot, exits. `serve_until_shutdown(addr,
-   shutdown_signal)` wraps `serve()` with a future the binary drives from a
-   SIGTERM/SIGINT handler. `cluster.sh stop` waits up to 60 s instead of
-   the previous 5 s before SIGKILL fallback.
+3. **Graceful shutdown.** `PartitionServer::shutdown()` sends a `oneshot::Sender<()>`
+   per partition through `drain_tx`. `partition_loop` picks it up via select, sets
+   `drain_ack`, exits the main loop, runs the tail-drain (in-flight + pending), rotates
+   `active`, loops `flush_one_imm` until imm empties, replies on the oneshot, exits.
+   `serve_until_shutdown(addr, shutdown_signal)` wraps `serve()` with a future the
+   binary drives from SIGTERM/SIGINT. `cluster.sh stop` waits up to 60 s before SIGKILL.
 
 ## Programming Notes
 
-1. **Flush is 3-phase** — never hold the write lock during SSTable construction or stream I/O. Only take the write lock for the final reader swap.
+1. **Flush is 3-phase** — never hold the write lock during SSTable construction or
+   stream I/O. Take the write lock only for the final reader swap.
 
-2. **`pickup_tables` has two strategies** — understand both head-extent and size-tiered paths before modifying compaction selection logic.
+2. **`pickup_tables` has two strategies** — understand both head-extent and
+   size-tiered paths before modifying compaction selection.
 
-3. **Discard map pipeline**: compaction drops VP entry → accumulates size in local `discard` map → attached to last output SST's MetaBlock → persisted to metaStream → aggregated by GC loop from all SstReaders. Break any link in this chain and GC will not collect dead VP data.
+3. **Discard map pipeline**: compaction drops a VP entry → accumulates size in a local
+   `discard` map → attaches to the last output SST's MetaBlock → persisted to
+   metaStream → aggregated by GC from all SstReaders. Break any link and GC won't
+   collect dead VP data.
 
-4. **`has_overlap` blocks split but not reads** — reads with `has_overlap` set do range-filter in `range()`. `get()` does NOT filter (point lookups are exact). Only `range()` scans need filtering.
+4. **`has_overlap` blocks split but not reads** — `range()` with `has_overlap` set
+   range-filters; `get()` does NOT filter (point lookups are exact).
 
-5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. If no checkpoint exists (tables is empty AND vp_eid == 0), recovery replays logStream from the very first extent, offset 0 — this covers partitions that accepted writes but were killed before their first flush. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
+5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go
+   to logStream via `append_batch`. If no checkpoint exists (tables empty AND
+   vp_eid == 0), recovery replays logStream from the first extent, offset 0 (covers
+   partitions killed before their first flush). Unflushed imm tables in memory are
+   covered — logStream contains all records newer than the last SSTable flush.
 
-6. **Group commit batching (post-F178)** — the partition_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. The batch's `must_sync` is the OR of caller flags only; the F150 Phase B rotation-trigger barrier (which auto-promoted `must_sync=true` when the active memtable would cross `FLUSH_MEM_BYTES`) was removed in F178 Phase 2. Durability is now guaranteed in two complementary places:
-   - **Per-write coverage**: the extent-node's per-extent fsync coalescer (F178 Phase 1) fires `sync_data` every 1-5 ms; every append's bytes become durable within one coalesce window regardless of the AppendReq.must_sync flag.
-   - **Flush barrier**: `flush_one_imm` (and `flush_one_imm_local`) call `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST. **F227: ALL log_stream replicas** (was quorum-min) must report `last_synced >= vp_offset` first. This guarantees that every byte the imm's ValuePointers reference is durable on every replica BEFORE the SST that names them is checkpointed — a fsync-quorum could publish an SST whose VP bytes are durable on only a subset, so a later min-commit truncation on the un-synced replica could orphan the VP (the `stale_vp_offset_past_sealed_length` class). On a healthy cluster this is satisfied immediately because the append already acked all-replicas. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms in parallel with SST build; on the worst case it waits one coalesce window.
-   Why this is better than F150 Phase B: the rotation-triggering writer no longer pays a 5-15 ms (real SSD) fsync cost as a tail-latency spike — every Put pays the same 1-5 ms coalesce floor. The fsync work moves entirely to background flush, latency-invisible to clients. F178 Phase 3 removed `--nosync` from CLI surfaces; the `must_sync` field on PutReq/AppendReq is kept for wire back-compat but always true in practice.
+6. **Group commit batching + durability.** `partition_loop` drains up to
+   MAX_WRITE_BATCH (256) requests per RPC cycle; the batch's `must_sync` is the OR of
+   caller flags only. Durability lives in two complementary places:
+   - **Per-write coverage**: the extent-node's per-extent fsync coalescer fires
+     `sync_data` every 1–5 ms; every append's bytes become durable within one coalesce
+     window regardless of `AppendReq.must_sync`.
+   - **Flush barrier**: `flush_one_imm` calls
+     `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST.
+     INVARIANT: **ALL log_stream replicas** (not quorum-min) must report `last_synced >=
+     vp_offset` first — every byte the imm's ValuePointers reference must be durable on
+     every replica BEFORE the SST that names them is checkpointed, else a later
+     min-commit truncation on an un-synced replica orphans the VP (the
+     `stale_vp_offset_past_sealed_length` class). On a healthy cluster this waits ≈ 0.
+   The fsync work is entirely background (latency-invisible); every Put pays only the
+   1–5 ms coalesce floor. The `must_sync` field is kept for wire back-compat but is
+   always true in practice.
 
-7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_owner_epoch`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
+7. **Per-partition StreamClient** — each `PartitionData` holds its own
+   `stream_client: Arc<StreamClient>` (no Mutex) via `new_with_owner_epoch`.
+   StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id,
+   Arc<Mutex<StreamAppendState>>>`): different streams (log/row/meta) are fully
+   concurrent; the same stream is serialized. The server-level
+   `PartitionServer.stream_client` is used only in `split_part` coordination RPCs.
 
-8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
+8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held
+   only for seq assignment + block encoding (Phase 1), released before the
+   `append_batch` RPC (Phase 2), re-acquired for memtable insert + VP head update
+   (Phase 3). Prevents the partition write lock from blocking reads/flushes/compaction
+   during network I/O.
 
-7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.
+9. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and
+   `sst_readers[i]` refer to the same SSTable. Compaction's atomic swap replaces
+   slices, not individual elements.
 
-9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `partition_loop` Phase 3) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
-   - Writer holds the write lock for the duration of one `insert_batch` call (hot path, up to 256 entries), then releases. Subsequent readers take the read lock AFTER the writer releases → linearisable Put-then-Get.
-   - Rotation (`rotate_active`) replaces the whole `Memtable` struct via `std::mem::replace` on the owning `PartitionData`; this is safe because `rotate_active` runs exclusively on P-log inside a `RefCell::borrow_mut`.
-   - `imm: VecDeque<Arc<Memtable>>` — after rotation, frozen memtables are read-only from both P-log (during flush + GC + compaction) and P-bulk (during `build_sst_bytes`). Multiple readers acquire the read lock concurrently.
-   - Hot path uses `insert_batch(iter)` (one write lock per batch of 256 inserts, not 256 locks), and `for_each(closure)` (read lock held for the iteration — used by `build_sst_bytes` and `rotate_active`).
-   - The `bytes: AtomicU64` counter is not inside the lock, so `mem_bytes()` and `maybe_rotate` stay lock-free.
+10. **Memtable backing = `parking_lot::RwLock<BTreeMap>`** — the active memtable has
+    exactly one writer (the P-log thread's Phase 3) and N readers (ps-conn
+    `handle_get` + P-log). Correctness:
+    - Writer holds the write lock for one `insert_batch` call (up to 256 entries) then
+      releases; subsequent readers take the read lock AFTER → linearisable
+      Put-then-Get.
+    - Rotation (`rotate_active`) replaces the whole `Memtable` via `std::mem::replace`
+      on the owning `PartitionData` — safe because it runs exclusively on P-log inside
+      a `RefCell::borrow_mut`.
+    - `imm: VecDeque<Arc<Memtable>>` — frozen memtables are read-only from P-log (flush
+      + GC + compaction) and P-bulk (`build_sst_bytes`); multiple readers acquire the
+      read lock concurrently.
+    - Hot path uses `insert_batch(iter)` (one write lock per 256 inserts) and
+      `for_each(closure)` (read lock held for the iteration). The `bytes: AtomicU64`
+      counter is outside the lock, so `mem_bytes()` / `maybe_rotate` stay lock-free.
 
-10. **Metadata-publish ordering invariant (F148-A)** — `flush_one_imm` (lib.rs) and `do_compact` (background.rs) both publish to `meta_stream` via `save_table_locs_raw`. (Pre-2026-06-18 each was followed by a `sync_partition_vp_refs` call; that was removed with the vp_table_refs deletion.) They run as separate background tasks on the single-threaded P-log compio runtime and therefore interleave at every `.await` point. Race-free concurrent publishing (i.e. the LATEST persisted meta_stream record always reflects ALL prior in-memory mutations from both publishers) rests on three load-bearing properties — DO NOT violate them in future refactors:
+11. **Metadata-publish ordering invariant.** `flush_one_imm` (lib.rs) and `do_compact`
+    (background.rs) both publish to `meta_stream` via `save_table_locs_raw`. They run as
+    separate background tasks on the single-threaded P-log runtime and interleave at
+    every `.await`. INVARIANT (race-free concurrent publishing — the LATEST persisted
+    meta_stream record always reflects ALL prior in-memory mutations from both
+    publishers) rests on three load-bearing properties — DO NOT violate:
     - **(P1)** P-log compio runtime is single-threaded.
     - **(P2)** the `borrow_mut` block that captures `tables_snapshot` contains no `.await`.
-    - **(P3)** the path `borrow_mut` drop → `rkyv_encode` → `stream_client.append` → mpsc-send-into-per-stream-worker is purely synchronous; the first `.await` is on the per-stream worker's `ack_rx`, *after* the message lands in the FIFO mpsc.
+    - **(P3)** the path `borrow_mut` drop → `rkyv_encode` → `stream_client.append` →
+      mpsc-send-into-per-stream-worker is purely synchronous; the first `.await` is on
+      the per-stream worker's `ack_rx`, AFTER the message lands in the FIFO mpsc.
 
-    Together (P1)–(P3) imply: `borrow_mut` order = mpsc-send order = meta_stream record order. The latest record's `tables_snapshot` therefore necessarily reflects all prior `borrow_mut` mutations, including those of any concurrent publisher. A refactor that introduces an `.await` between the `borrow_mut` drop and the `stream_client.append` (e.g., moving `rkyv_encode` behind an async helper, adding async metric flushes, holding a `futures::lock::Mutex` around the publish) re-opens a stale-snapshot race against the concurrent publisher: a flush whose snapshot was captured earlier could be ack'd later than a compact's, persisting tables that compact has already removed. On restart, recovery would load the stale checkpoint and resurrect compacted-away SSTs whose VPs may now point at GC-punched log_stream extents.
+    Together: `borrow_mut` order = mpsc-send order = meta_stream record order. Adding an
+    `.await` between the `borrow_mut` drop and `stream_client.append` (moving
+    `rkyv_encode` behind an async helper, an async metric flush, a `futures::lock::Mutex`
+    around publish) re-opens a stale-snapshot race: a flush whose snapshot was captured
+    earlier could be ack'd later than a compact's, persisting tables that compact already
+    removed → on restart recovery resurrects compacted-away SSTs whose VPs may point at
+    GC-punched log_stream extents. Inline `// F148-A invariant` comments mark both call
+    sites; test `f148_publisher_invariant_tests` exercises two concurrent publishers.
 
-    Inline `// F148-A invariant` comments at both call sites (`flush_one_imm`, `flush_one_imm_local`, both branches of `do_compact`) state the rule next to the code. Test: `f148_publisher_invariant_tests::f148_concurrent_publisher_ordering_invariant` (lib.rs) exercises the pattern with two concurrent simulated publishers and asserts the LATER snapshot extends the EARLIER one.
-
-11. **F183 metrics export.** Each `PartitionData` carries an
-    `Arc<PartitionMetrics>` whose AtomicU64 counters are bumped by
-    `partition_loop` (req_count on each `handle_incoming_req`,
-    imm_full_count when the imm cap stalls intake). The same Arc is
-    cloned into the `PartitionHandle` on the main thread; the main
-    thread's `report_load_loop` (5 s cadence) snapshots all live
-    handles' metrics, computes /sec rates, and ships
-    `ReportPartitionLoadReq` to the manager. Manager's policy engine
-    consumes the per-partition windowed history (30 min, 1-min buckets)
-    to emit advisory split/merge candidates.
-
-    **F187 maintenance debt extension.** Same `PartitionMetrics` struct
-    grows six fields used by `compute_maintenance_advisory`:
-    `gc_debt_bytes` (gauge, refreshed every GC tick from
-    `Σ(get_discards filtered to live sealed log_stream extents)` —
-    reuses existing aggregation, no extra RPCs); `pending_compaction_bytes`
-    (gauge, refreshed every compact tick: when `has_overlap == 1` it's
-    total SST bytes, else it's `pickup_tables(...)`'s output);
-    `gc_inflight` / `compact_inflight` (0/1 booleans set around `run_gc`
-    and `do_compact` awaits, lets the policy engine skip already-active
-    partitions); `last_gc_at` / `last_compact_at` (unix-epoch i64 set
-    on successful completion, drives the per-kind cooldown). Helper
-    `compute_pending_compaction_bytes(part)` lives in `background.rs`
-    and is callable both from the compact loop and (future Stage 2)
-    from a PS-local maintenance scheduler.
-
-    Stage 1 keeps the existing random-jitter scheduling intact (10-20s
-    compact, 30-60s GC). Stage 2/3 (deferred): replace with a PS-local
-    priority scheduler driven by these gauges + a shared fg/bg token
-    bucket on top of F141's GC bytes/sec limiter and a new (currently
-    missing) compact bytes/sec limiter.
-
-    **F188 Stage 2 (shipped 2026-05-10).** PS-level
-    `maintenance_scheduler_loop` (5s cadence on main thread) replaces
-    the random-jitter timers as the primary trigger source. Reads the
-    F187 metrics, computes `urgency = debt / threshold`, sorts desc,
-    dispatches top-K minor compactions / GCs via Send-capable trigger
-    channels held in PartitionHandle. Skips partitions whose
-    `req_per_sec` (derived from `req_count` diff over the interval)
-    exceeds `AUTUMN_PS_FG_QPS_QUOTA` (default 50K) — foreground always
-    wins. Cooldowns drive from PS-side `last_*_at` so the gate respects
-    actual completion. The compact channel's `bool` payload now means
-    `is_major` (true: manual `client compact`, expiry; false: scheduler
-    routine — picks via `pickup_tables`).
-
-    Background loops (`background_compact_loop`, `background_gc_loop`)
-    keep their channel-receive paths but their timeout branches are
-    demoted to short 5-7s metric-refresh ticks — they NO LONGER fire
-    compact/GC off the timer (except expiry-major, which is a
-    wall-clock event the scheduler doesn't see). Helper
+12. **Metrics export.** Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
+    AtomicU64 counters are bumped by `partition_loop` (req_count on each
+    `handle_incoming_req`, imm_full_count on imm-cap stalls). The same Arc is cloned into
+    the `PartitionHandle` on the main thread; `report_load_loop` (5 s) snapshots all live
+    handles, computes /sec rates, ships `ReportPartitionLoadReq`. Maintenance-debt gauges
+    on the same struct feed `compute_maintenance_advisory`: `gc_debt_bytes` (refreshed
+    each GC tick from `Σ(get_discards filtered to live sealed log extents)`),
+    `pending_compaction_bytes` (each compact tick: total SST bytes if `has_overlap==1`,
+    else `pickup_tables` output), `gc_inflight` / `compact_inflight` (0/1 around the
+    awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown).
     `compute_pending_compaction_bytes(part)` lives in `background.rs`.
 
-    PS-wide `IoTokenBucket` (parking_lot::Mutex<sliding-window>):
-    `Arc<IoTokenBucket>` on PartitionServer cloned into every
-    PartitionData. GC + compact append paths call
-    `io_bucket.account(bytes).await` BEFORE every network append,
-    sleeping if the cluster ceiling
-    (`AUTUMN_PS_BG_RATE_BYTES_PER_SEC`, default 256 MiB/s; 0 =
-    unlimited) would be exceeded. F141's per-partition GC limiter
-    stays as a tighter inner cap.
+    The PS-level `maintenance_scheduler_loop` (5 s, main thread) is the primary trigger
+    source: reads the gauges, computes `urgency = debt / threshold`, sorts desc,
+    dispatches top-K minor compactions / GCs via Send-capable trigger channels in
+    `PartitionHandle`. Skips partitions whose `req_per_sec` (from `req_count` diff)
+    exceeds `AUTUMN_PS_FG_QPS_QUOTA` (default 50K) — foreground always wins. Cooldowns
+    drive from PS-side `last_*_at`. The compact channel's `bool` payload means `is_major`
+    (true: manual `client compact`, expiry; false: scheduler routine, picks via
+    `pickup_tables`). Background loops keep their channel-receive paths but their timeout
+    branches are demoted to short metric-refresh ticks (they no longer fire compact/GC
+    off the timer, except expiry-major which the scheduler doesn't see).
 
-    **F189 Stage 3 (shipped 2026-05-10)** replaces `IoTokenBucket` with
-    `AdmissionController` — a two-class admission controller (CockroachDB
-    `kvadmission` pattern, simplified). Same 1-second wall-clock window
-    + parking_lot::Mutex<state>, but state now tracks `fg_bytes` and
-    `bg_bytes` independently:
+13. **Partition merge (manager-orchestrated, TiKV PrepareMerge + PS-side write halt).**
+    The merge primitive is a manager-side atomic etcd txn (manager CLAUDE.md note 16);
+    the PS closes the merge-window data-loss gap with a write halt. Wire: client →
+    `MSG_MERGE_PARTITIONS { survivor, victim }` → manager → `MSG_MERGE_FREEZE { freeze:
+    true }` to victim PS → same to survivor PS → 6× commit_length under freeze →
+    `handle_multi_modify_merge` atomic etcd txn → return. PS-side state on
+    `PartitionData`:
+    - `frozen_for_merge: Cell<Option<Instant>>` — `Some(set_at)` while the write halt is
+      in effect.
+    - `freeze_drain_ack: RefCell<Option<oneshot::Sender>>` — parked freeze response.
 
-    - `account_fg(bytes).await`: sleeps only when an explicit fg
-      ceiling (`AUTUMN_PS_FG_RATE_BYTES_PER_SEC`, default 0 =
-      unlimited) is set AND would be exceeded. Default returns
-      immediately after a single Mutex acquire — keeps the fg hot
-      path cheap.
-    - `account_bg(bytes).await`: sleeps until BOTH (1) bg's own
-      ceiling (`AUTUMN_PS_BG_RATE_BYTES_PER_SEC`, default 256 MiB/s)
-      AND (2) fg-aware yield — when fg observed rate >
-      `AUTUMN_PS_FG_SATURATED_THRESHOLD * fg_rate` (default 0.8), bg
-      waits till the next 1-second window. Fg-aware yield is
-      disabled when fg_rate=0 (no baseline to detect saturation).
+    `handle_incoming_req` short-circuits Put / Delete with `CODE_UNAVAILABLE` while
+    frozen; reads + maintenance flow normally. `partition_loop` top-of-loop:
+    - if `freeze_drain_ack.is_some() && pending.is_empty() && inflight.is_empty()`:
+      rotate active + flush every imm via `flush_one_imm`, then send OK on the parked
+      oneshot (the strict precondition for the orchestrator's commit_length capture to
+      be race-free).
+    - if `frozen_for_merge` elapsed > `FREEZE_TTL` (30 s): auto-unfreeze + drop stale ack
+      with PRECONDITION (orchestrator-crash backstop; happy path completes < 1 s).
 
-    Wire site for fg: `start_write_batch` in `background.rs` calls
-    `admission.account_fg(total_value_bytes).await` ONCE per batch
-    just before launching Phase 2. Per-batch (not per-op) keeps the
-    lock acquisition rate at ~1/256 of per-op overhead.
+    Recovery on success: the merge txn deletes victim's region and widens survivor's;
+    `region_sync_loop` sees both on its next ~2 s tick, drops the frozen `PartitionData`
+    for victim, reopens survivor with `frozen_for_merge = None` (no explicit unfreeze).
+    Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
+    FREEZE_TTL backstop fires if even that fails. Merge wallclock is ~2–3 s (bounded by
+    the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing
+    (each `PartitionData` is `Rc<RefCell<>>`, `!Send`) that a PS-orchestrated design
+    would need.
 
-    Wire sites for bg: `do_compact` (chunk-emit + final-emit),
-    `flush_gc_batch` (write side), `run_gc` (chunk-read side),
-    `process_gc_chunk` (passes through). All call `account_bg`
-    instead of the old `account`. F141's per-partition GC limiter is
-    kept as an inner cap.
+14. **Background-loop supervision — no loop dies silently; durability loops fail-stop.**
+    Every PS background loop runs under a supervisor wrapper, never a bare
+    `spawn(..).detach()` (which swallows panics → a dead loop with no signal). Two
+    helpers in `lib.rs`:
+    - `spawn_supervised(name, make)` — catch_unwind + ERROR-log + 1 s restart. For
+      RESTARTABLE loops that re-derive state each tick and own no moved resource:
+      `heartbeat_loop`, `report_load_loop`, `region_sync_loop`.
+    - `spawn_failstop(name, fut)` — catch_unwind; NORMAL return is the expected shutdown
+      (no-op); PANIC → ERROR-log + `std::process::exit(1)`. For NON-restartable loops that
+      own a moved channel receiver / `TcpListener` and are durability/serving-critical:
+      per-partition `background_flush_loop` / maintenance / the per-partition accept loop.
+      Fail-stop (not restart) because the moved receiver can't be re-acquired and
+      re-running on a mid-panic half-mutated `PartitionData` could double-apply; exiting
+      lets the manager evict + reopen from the durable streams (log_stream WAL = source of
+      truth → no committed loss).
 
-    Tests in `f189_admission_tests` (7, all passing):
-    fg_unlimited_no_sleep, bg_unlimited_no_sleep, bg_respects_own_rate,
-    bg_yields_when_fg_saturated, bg_does_not_yield_when_fg_idle,
-    bg_ignores_fg_when_fg_unlimited, window_resets_after_1s.
+    INVARIANT: never reintroduce a bare `spawn(..).detach()` for a PS background loop —
+    pick supervised (re-derive-safe) or failstop (moved-resource / durability). Per-conn
+    `handle_ps_connection` spawns are intentionally NOT wrapped — a panic there drops one
+    request-scoped client connection, not a background loop. The explicit `catch_unwind`
+    is for observability + decisioning (log, restart, exit); compio's own
+    spawn-catch_unwind only keeps the runtime *thread* alive (which is exactly what made
+    silent loop death possible — the caught panic was dropped with the detached
+    JoinHandle). The two layers are not bug-redundant; don't "remove the duplicate."
 
-12. **F183/F185 partition merge.** F183 shipped the merge primitive
-    as a manager-side atomic etcd txn (see `crates/manager/CLAUDE.md`
-    note 16). F185 closes the F184-K ~5% merge-window data-loss gap by
-    putting the orchestration in the manager (TiKV PrepareMerge model)
-    and adding a PS-side write halt:
+15. **`flushing_imm_ptrs` claim MUST be released on EVERY flush error path, and reads
+    (RANGE/HEAD) MUST be served off `partition_loop`.** `flushing_imm_ptrs` is a per-imm
+    "who is flushing this" latch shared by the two flush drivers on the P-log runtime
+    (`background_flush_loop` lazy, `flush_one_imm` eager — called inline by split / merge
+    / graceful+freeze drain) so the same imm is never double-flushed. CONTRACT: the
+    claimer always reaches `commit_flush_outcome`, which pops the imm + removes the ptr.
+    If a flush ERRORS without removing the ptr, the imm is orphaned (claimed but no-one
+    flushing) → every later attempt sees it "already claimed" → the imm NEVER drains →
+    `partition_loop` stays imm-full parked FOREVER.
+    - **Release on every error.** `run_flush_async_phase` AND `commit_flush_outcome`
+      remove their `src_imm_ptr` on any Err (idempotent). `background_flush_loop` also
+      releases the ptr of a *successful* outcome it must DROP because a FIFO-earlier imm
+      in the same batch failed, and retries pending imm every `FLUSH_RETRY_BACKOFF` (2 s)
+      so a failed flush self-heals once the cluster recovers (a parked loop produces no
+      rotate → no `flush_tx`). INVARIANT: any new flush error path must release the claim.
+    - **Reads off the write loop.** RANGE + HEAD are served LOCALLY on the ps-conn task
+      (`serve_read_local`), mirroring `serve_get_local` for GET.
+      `handle_range`/`handle_head` brief-`borrow()` to snapshot then `drop` before
+      iterating, so a flush-wedged (back-pressured) `partition_loop` halts WRITES without
+      taking READS down. INVARIANT: read handlers served locally must never hold a
+      `RefCell` borrow across an `.await`. (This relaxes per-connection read-your-writes
+      for a read pipelined behind an in-flight delegated write on the same connection —
+      the same gap GET-local already has.)
 
-    Wire path: client → `MSG_MERGE_PARTITIONS { survivor, victim }` →
-    manager.handle_merge_partitions → `MSG_MERGE_FREEZE { freeze: true }`
-    to victim PS → same to survivor PS → 6× commit_length under the
-    freeze → handle_multi_modify_merge atomic etcd txn → return.
+16. **row_stream single-writer is type-level; split invalidates P-bulk via a SYNC
+    BARRIER.** All `row_stream.append` MUST go through P-bulk's `bulk_sc` — flush
+    via `FlushReq`, compaction via `RowAppendReq` (see the row_stream single-writer
+    invariant in the P-bulk section). `part_sc` is for log/meta append and row_stream
+    non-append ops only. P-bulk spawn failure is fatal-for-this-partition;
+    `flush_req_tx`/`row_append_tx` are non-`Option`.
 
-    PS-side state on `PartitionData`:
-      - `frozen_for_merge: Cell<Option<Instant>>` — `Some(set_at)` while
-        the merge-window write halt is in effect.
-      - `freeze_drain_ack: RefCell<Option<oneshot::Sender>>` — parked
-        freeze response oneshot.
+    Split invalidates P-bulk's stale row_stream worker via a synchronous P-log → P-bulk
+    barrier (a lazy per-message invalidate flag is racy with P-bulk's `FuturesUnordered`
+    cap=2 — a post-split FlushReq could enter the FU concurrently with the invalidating
+    RowAppendReq and append to the stale worker BEFORE the invalidate took effect → SST
+    past sealed_length → orphan SST on recovery):
+    1. `RowInvalidateBarrierReq { row_stream_id, resp_tx }` on
+       `PartitionData.row_invalidate_tx` (capacity 1).
+    2. `flush_worker_loop` consumes the barrier on a priority-biased
+       `select_with_strategy` (PollNext::Left) and sets a `pending_barrier` slot.
+    3. The next iteration drains `inflight` `FuturesUnordered` to ZERO, then
+       `bulk_sc.invalidate_stream(row_stream_id)`, then signals `resp_tx`. No new SQ
+       message is picked up until the barrier completes.
+    4. `handle_split_part` sends the barrier INSIDE the critical section BEFORE
+       `multi_modify_split` (after drain + commit_length, before the manager seal) and
+       AWAITS the ACK.
 
-    `handle_incoming_req` short-circuits Put / Delete with
-    `CODE_UNAVAILABLE` while frozen; reads + maintenance flow normally.
+    Same-partition compact-vs-split serialization is by the per-partition
+    `maintenance_gate` (see Split serialisation).
 
-    `partition_loop` top-of-loop logic:
-      - if `freeze_drain_ack.is_some() && pending.is_empty() &&
-        inflight.is_empty()`: rotate active + flush every imm via
-        `flush_one_imm`, then send OK on the parked oneshot. This is
-        the strict precondition for the orchestrator's commit_length
-        capture to be race-free.
-      - if `frozen_for_merge.is_some_and(|t| t.elapsed() > FREEZE_TTL)`
-        (30 s): auto-unfreeze + drop any stale ack with PRECONDITION.
-        Backstop for orchestrator crash; happy path completes in <1 s
-        and is unfrozen by region_sync_loop dropping the PartitionData.
+    **INVARIANTS:**
+    1. Any control message that mutates row_stream from P-log MUST travel through
+       P-bulk's channel set — never `part_sc`.
+    2. `handle_split_part` MUST await the barrier ACK BEFORE releasing `maintenance_gate`
+       or clearing `frozen_for_split` — a freshly-resumed compact/flush loop could
+       otherwise send a P-bulk request before `bulk_sc` is invalidated.
+    3. The barrier channel is capacity 1 and `handle_split_part` is the sole sender; a
+       new sender must prove the sender count stays 1 or convert to unbounded.
+    4. `flush_worker_loop`'s `pending_barrier` MUST drain `inflight` to ZERO before
+       invalidating + ACKing (else an in-flight append on the stale worker lands after
+       the invalidate ACKed).
+    5. The priority-biased select (PollNext::Left) is DEFENSIVE — under today's gate
+       discipline the SQ queue is empty when the barrier arrives, but the bias keeps it
+       race-free if a future refactor relaxes the gates.
+    6. `handle_split_part` sends the barrier BEFORE `multi_modify_split`; failure of the
+       send / ACK must abort split with the manager not yet committed. Post-seal
+       placement would leak an unrecoverable window (manager-committed seal + local state
+       not converged + freeze cleared).
+    7. Any new do_compact / split-shaped dispatch site MUST acquire `maintenance_gate`
+       first, then `acquire_compact`.
+    8. BOTH the barrier `send().await` AND the ACK `recv().await` MUST be bounded by
+       separate timers (5 s send + 10 s ACK). The total (15 s) MUST stay well under
+       `FREEZE_TTL` (30 s) — a wedged P-bulk blocking past FREEZE_TTL would let
+       `check_freeze_ttls` unfreeze, new writes extend the row_stream tail past the
+       already-captured `commit_length`, and `multi_modify_split` would commit a STALE
+       `row_end` → post-TTL writes above sealed_length, invisible on recovery. Both
+       timeouts unfreeze + return `FailedPrecondition`. If tuning changes either, `send +
+       ack < FREEZE_TTL` MUST hold.
 
-    Recovery on success: the merge etcd txn deletes victim's region and
-    widens survivor's. `region_sync_loop` (F184-B) sees both changes
-    on its next tick (~2 s), drops the frozen `PartitionData` for
-    victim, and reopens the survivor with `frozen_for_merge = None`.
-    No explicit unfreeze needed.
+    P-bulk readiness handshake: `spawn_bulk_thread` returns `(JoinHandle,
+    oneshot::Receiver<Result<()>>)` and sends `Ok(())` only AFTER compio `build`,
+    `StreamClient::new_with_owner_epoch`, and `set_reporter_part_id` all succeed;
+    `partition_thread_main` awaits it before publishing `flush_req_tx` / `row_append_tx`
+    / `row_invalidate_tx` — a partition is never half-opened with a live Sender to a
+    dropped Receiver (thread abort surfaces as `Err(Canceled)`, not a hang). INVARIANT:
+    any change to the in-thread init order MUST send the ready signal only after ALL
+    `flush_worker_loop` preconditions are met.
 
-    Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze:
-    false }` rollback to anyone it already froze. If even that fails,
-    the FREEZE_TTL backstop fires.
+17. **`part_addr` self-heal in `sync_regions_once`.** The manager's `part_addrs`
+    (per-partition listener addresses served to clients for routing) is in-memory only
+    and LOST on manager restart; registration happens once inside `open_partition`, so an
+    already-open partition never re-reported → a manager kill+respawn under a healthy
+    cluster left clients unable to resolve any partition listener. `sync_regions_once` now
+    compares the just-fetched `resp.part_addrs` against open partitions'
+    `PartitionHandle.part_addr` and re-sends `MSG_REGISTER_PARTITION_ADDR` for any
+    missing/stale entry (zero steady-state cost; convergence one ~2 s tick). INVARIANT:
+    any code path that binds/re-binds a partition listener must keep
+    `PartitionHandle.part_addr` equal to the ACTUALLY advertised address — the self-heal
+    trusts it as source of truth.
 
-    Why not the spec §4.1 PS-orchestrated 4-gate design: it required
-    new Send-capable cross-thread channels + a main-thread
-    `merge_service_loop` registry to route freeze coordination between
-    survivor's and victim's partition threads (each `PartitionData` is
-    `Rc<RefCell<>>`, `!Send`). The TiKV-style "leader-fenced control
-    plane orchestrates" model achieves the same 0-loss guarantee with
-    no cross-thread plumbing. Trade-off: merge wallclock stays ~2-3 s
-    instead of <1 s — bounded by region_sync_loop tick — but the
-    write loss is what F184-K actually measured, and that's now 0.
+18. **Heartbeat-loss exit is a 90 s last resort, not a 10 s tripwire.**
+    `heartbeat_loop`'s `MAX_CONSECUTIVE_FAILURES` is 45 (× 2 s = 90 s). The
+    `std::process::exit(1)` on sustained heartbeat failure guards only the narrow
+    "partitioned from the manager but not from clients" stale-serving case — it is NOT the
+    primary fencing (owner_epoch fences writes at the ENs; region_epoch fences client
+    routing). At a lower threshold, any manager outage longer than it (including the ~60 s
+    TIME_WAIT bind retry after a manager respawn) makes the entire PS fleet exit
+    simultaneously — a self-inflicted, unrecoverable data-plane outage. While the manager
+    is down NO reassignment can happen, so serving through its outage is safe.
 
-13. **F229 background-loop supervision — no loop dies silently; durability
-    loops fail-stop.** Every PS background loop runs under a supervisor wrapper
-    instead of a bare `spawn(..).detach()` (which swallowed panics → a dead
-    flush/heartbeat loop with no signal). Two helpers in `lib.rs`:
-    - `spawn_supervised(name, make)` — catch_unwind + ERROR-log + 1 s restart.
-      For RESTARTABLE loops that re-derive state each tick and own no moved
-      resource: `heartbeat_loop`, `report_load_loop`, `region_sync_loop`,
-      `vp_refs_retry_loop`. Mirrors manager F228 (note 29 there).
-    - `spawn_failstop(name, fut)` — catch_unwind; NORMAL return is the expected
-      shutdown (no-op); PANIC → ERROR-log + `std::process::exit(1)`. For
-      NON-restartable loops that own a moved channel receiver / `TcpListener` and
-      are durability/serving-critical: per-partition `background_flush_loop` /
-      `background_compact_loop` / `background_gc_loop` and the per-partition
-      accept loop. **Why fail-stop, not restart:** the moved receiver can't be
-      re-acquired, and re-running on a mid-panic half-mutated `PartitionData`
-      could double-apply; exiting lets the manager evict (F069/F111) and reopen
-      the partition from the durable streams (log_stream WAL = source of truth →
-      no committed loss). **Invariant: never reintroduce a bare
-      `spawn(..).detach()` for a PS background loop — pick supervised (re-derive-
-      safe) or failstop (moved-resource / durability).** Per-partition
-      self-eviction (smaller blast radius than process exit) is a future
-      refinement. 1A companion: `ConnPool::get_client` connect is bounded
-      (`CONNECT_TIMEOUT`, stream crate) so a blackholed peer can't hang
-      `region_sync`'s `open_partition`. Per-conn `handle_ps_connection` spawns
-      are intentionally NOT wrapped — a panic there drops one client connection
-      (request-scoped), not a background loop.
+19. **Owner locks are PER-PARTITION, acquired fresh at every `open_partition`.**
+    `owner_key = "partition/<part_id>"` — ONE stable logical key per partition, NO ps_id
+    in the key (a per-PS key shape would leave the old owner's key valid at the manager
+    after takeover, so its lingering GC punch_holes/truncate could mutate streams owned
+    elsewhere; with a stable key the takeover acquire bumps THE SAME key and the old owner
+    fails `ensure_owner_epoch` everywhere). P-log's `part_sc` and P-bulk's `bulk_sc` share
+    the ONE epoch acquired for that open (via `new_with_owner_epoch`). The epoch must be
+    newest-at-TAKEOVER, not newest-at-process-start — a standing PS inheriting partitions
+    from a PS that acquired LATER would sit below the EN fence floors forever. Per-partition
+    keys scope fencing exactly: an open of partition X bumps only X's key; siblings keep
+    their epochs; X's previous owner alone is fenced and self-evicts via LockedByOther. The
+    PS-lifetime `server_owner_key`/`server_revision` ("ps-<id>") remains ONLY for
+    split-coordination RPCs.
 
-    **Why explicit `catch_unwind` when `compio::runtime::spawn` already wraps
-    in catch_unwind** (`compio-runtime-0.11.0/src/runtime/mod.rs:202`:
-    `spawn_impl(AssertUnwindSafe(future).catch_unwind())`; `JoinHandle<T> =
-    Task<Result<T, Box<dyn Any + Send>>>`). compio's wrap keeps the *runtime
-    thread* alive on task panic — that's exactly what made pre-F229 "silent
-    death" possible: `spawn(loop_fn).detach()` had the panic caught by
-    compio, then the `JoinHandle` was dropped via `detach`, dropping the
-    captured panic with it. The thread survived; the loop didn't; no log
-    surfaced. F229's explicit `catch_unwind` is for **observability +
-    decisioning** (log, restart, exit), NOT for runtime survival —
-    runtime survival is already compio's job. Equivalent designs that read
-    compio's caught panic via `JoinHandle.await -> Result<T, Box<dyn Any>>`
-    require an extra outer `spawn` to preserve the spawn-and-forget API and
-    aren't simpler; the explicit form here matches the inline comment intent
-    ("catch_unwind + 1 s restart" reads at the call site without indirection).
-    The two catch_unwind layers are not bug-redundant — compio's catches a
-    panic that our inner has already turned into `Result::Err`, so it sees
-    nothing. Don't try to "remove the duplicate"; you'd lose the log + the
-    restart/exit semantic.
-
-14. **`lookup_in_sst` MUST hop to the next block when the in-block binary
-    search runs off the end (block-boundary point-lookup).** The GET point
-    lookup seeks `target = user_key ++ 0x00 ++ BE(0)` — SMALLER than every
-    real entry for that key (entries carry `BE(u64::MAX - seq)`, always > 0).
-    `SstReader::find_block_for_key` returns the LAST block whose base_key <=
-    target. When a user_key's NEWEST entry happens to be the FIRST entry
-    (base_key) of block B, `base_key[B] > target`, so the lookup lands on
-    block B-1; the binary search there finds no key >= target (returns
-    `lo == n`). Pre-fix `lookup_in_sst` returned `None` → GET fell through to
-    an OLDER SST and returned a STALE value (the data was present and correct
-    in block B all along). Fix: on `lo == n`, read block `block_idx + 1` and
-    check its first entry (entry 0 = its base_key = the smallest key >
-    target). **Invisible until SSTs exceed one block (>64 KiB / table)** — a
-    64-key partition has a single block (block 0 always correct), so this hid
-    until the 1024-key f250 reproducer built multi-block SSTs. This was the
-    "fence+flush data loss" — actually a read-only block-boundary bug, no
-    on-disk corruption. `TableIterator::seek` (compaction / range, iterator.rs)
-    already does this next-block hop (`!bi.valid()` → `block_idx += 1`), so
-    those paths were never affected. **Invariant: any point lookup over the
-    block-indexed SST must treat "no key >= target in the selected block" as
-    "check the next block's first entry," never as "absent."** Regression
-    test: `background::lookup_block_boundary_tests::
-    lookup_in_sst_finds_keys_at_block_boundaries`. Localization aid:
-    `MSG_DIAG_TRACE_KEY` (per-SST newest-seq under bloom-gated / no-bloom /
-    fullscan scans) distinguishes a bloom false-negative vs a block-selection
-    miss vs true data loss; used by `crates/manager/tests/
-    f250_fence_flush_invariant.rs`.
-
-15. **The `flushing_imm_ptrs` claim MUST be released on EVERY flush error path,
-    and reads (RANGE/HEAD) MUST be served off `partition_loop` (Mode B fix).**
-    `flushing_imm_ptrs` is a per-imm "who is flushing this" latch shared by the
-    two flush drivers on the P-log runtime — `background_flush_loop` (lazy) and
-    `flush_one_imm` (eager, called inline by split / merge / graceful+freeze
-    drain) — so the same imm is never double-flushed. Its load-bearing CONTRACT:
-    *the claimer always reaches `commit_flush_outcome`, which pops the imm +
-    removes the ptr.* If a flush ERRORS without removing the ptr, the imm is
-    orphaned (claimed but no-one flushing) → every later flush attempt sees it
-    "already claimed" and defers to a phantom flusher → the imm NEVER drains →
-    `partition_loop` stays imm-full parked (F120-A) FOREVER → since RANGE/HEAD
-    were delegated through the parked loop, they wedge permanently (GET kept
-    working because it is served locally on ps-conn). Root cause = a
-    `row_stream` flush append wedged on a dead replica during a degraded window.
-    **Two-part fix, both load-bearing:**
-    - **Release on every error.** `run_flush_async_phase` AND
-      `commit_flush_outcome` are thin wrappers that `flushing_imm_ptrs.remove`
-      their `src_imm_ptr` on any Err (idempotent — no-op if the inner already
-      popped + removed). `background_flush_loop` also releases the ptr of a
-      *successful* outcome it must DROP because a FIFO-earlier imm in the same
-      batch failed. The loop then retries pending imm every `FLUSH_RETRY_BACKOFF`
-      (2 s) so a failed flush self-heals once the cluster recovers — even with no
-      new write to signal it (a parked loop produces no rotate → no `flush_tx`).
-      **Invariant: any new flush error path must release the claim (or the imm
-      orphans + the partition permanently wedges).**
-    - **Reads off the write loop.** RANGE + HEAD are served LOCALLY on the
-      ps-conn task (`serve_read_local`, both dispatch points), mirroring
-      `serve_get_local` for GET. `handle_range`/`handle_head` brief-`borrow()` to
-      snapshot then `drop` before iterating — same single-thread RefCell +
-      memtable-`RwLock` discipline that makes GET-local safe — so a flush-wedged
-      (back-pressured) `partition_loop` halts WRITES (correct) without taking
-      READS down. Relaxes per-connection read-your-writes for a read pipelined
-      behind an in-flight delegated write on the same connection (same gap
-      GET-local already has); a connection-level prior-write barrier over all
-      local reads is a noted follow-up. **Invariant: read handlers served locally
-      must never hold a `RefCell` borrow across an `.await`.**
-
-16. **row_stream single-writer is now a type-level invariant; P-bulk spawn
-    failure is fatal-for-this-partition (F254).** All `row_stream.append` MUST go
-    through P-bulk's `bulk_sc` — flush via `FlushReq`, compaction via
-    `RowAppendReq`. Pre-F254 we kept a coincidence-based fallback: when
-    `spawn_bulk_thread` failed, `flush_req_tx`/`row_append_tx` were `None` and
-    both flush + compact ran inline on P-log against `part_sc`. That accidentally
-    preserved single-writer because BOTH writers degraded to the same client; if
-    only one degraded (or someone added a third row_stream-writing edge), the
-    `invalid_meta_len` corruption mode (two `StreamClient`s racing per-stream
-    commit watermarks on the same row_stream → ExtentNode truncates one
-    writer's SST bytes per commit protocol step 5) would recur. **Mitigation:**
-    `open_partition` propagates `spawn_bulk_thread` Err; the manager reschedules.
-    `PartitionData.flush_req_tx` and `row_append_tx` are non-`Option<Sender>`.
-    **Invariant: any new row_stream-mutating path MUST go through P-bulk
-    (`FlushReq` or `RowAppendReq`). `part_sc` is for log/meta append and
-    row_stream non-append ops (`truncate`, `get_stream_info`) only.**
-
-    **Follow-up fixes shipped as F255 (closes the two coco-audit findings the
-    F254 review surfaced; both predated F254 and are independent of the
-    fallback removal):**
-    - **(P0) split → P-bulk row_stream invalidate race — FIXED via SYNC
-      BARRIER.** Pre-F255 (and the v1 F255 attempt) the partition carried
-      a `Cell<bool> need_invalidate_row_stream` flag that
-      `handle_split_part` set; each P-bulk message (FlushReq /
-      RowAppendReq) piggybacked the flag via a `fetch-and-clear` at send
-      time. coco /arch GPT-5.5 surfaced (2026-06-02, second pass) that
-      the lazy form is racy with P-bulk's `FuturesUnordered` cap=2: a
-      post-split FlushReq with `invalidate=false` (flag already taken by
-      an earlier RowAppendReq) could enter the FU CONCURRENTLY with the
-      invalidating RowAppendReq and append to the stale per-stream worker
-      BEFORE the invalidate took effect → SST past sealed_length → orphan
-      SST on recovery (`stale_vp_offset_past_sealed_length` / missing-SST).
-
-      The v2 fix replaces the lazy flag with a SYNCHRONOUS P-log → P-bulk
-      barrier:
-      1. New `RowInvalidateBarrierReq { row_stream_id, resp_tx }` message
-         + `mpsc::Sender<RowInvalidateBarrierReq>` channel
-         (`PartitionData.row_invalidate_tx`, capacity 1).
-      2. `flush_worker_loop` consumes the barrier on a priority-biased
-         `select_with_strategy` (PollNext::Left = invalidate stream).
-         When picked, it sets a `pending_barrier` slot.
-      3. The next loop iteration drains `inflight` `FuturesUnordered` to
-         ZERO via `while inflight.next().await`, then calls
-         `bulk_sc.invalidate_stream(row_stream_id)`, then signals the
-         barrier's `resp_tx`. No new SQ message is picked up until the
-         barrier completes.
-      4. `handle_split_part` sends the barrier INSIDE the critical section
-         **BEFORE `multi_modify_split`** (after the drain + commit_length,
-         before the manager seal) and AWAITS the ACK. Pre-seal placement
-         is REQUIRED so the failure path is cleanly abortable: if the
-         barrier send / ACK fails, the manager has not yet committed the
-         seal, so unfreezing + returning Err leaves the cluster in a
-         coherent pre-split state. Post-seal placement (the v2 first
-         draft) would create an unrecoverable window — manager-committed
-         seal + local state not converged + freeze cleared (coco
-         /findbugs 2026-06-02 v2 review). At the moment of the send,
-         gates are still held + `frozen_for_split` halts writes, so
-         P-bulk's queue is normally empty; by the time gates release,
-         bulk_sc is invalidated and subsequent compact / flush re-fetch
-         a fresh tail from the manager — which by then carries the
-         post-seal extent.
-
-      The `need_invalidate_row_stream` / `invalidate_row_stream` field
-      machinery is GONE — `FlushReq` and `RowAppendReq` carry no
-      invalidate flag, `compact_row_append` doesn't borrow `part`, and
-      `run_flush_async_phase_inner` doesn't fetch any flag. The barrier
-      is the single source of truth.
-
-      **Per-partition compact_gate is load-bearing.** v3 of the F255 review
-      (coco /findbugs 2026-06-02) caught that the PS-wide
-      `ConcurrencyController.acquire_compact()` permit (default max=4)
-      does NOT serialize same-partition: split on partition P could acquire
-      one permit while a concurrent `do_compact` on partition P held
-      another and emit `compact_row_append` RowAppendReqs that raced the
-      seal. Fix: `PartitionData.compact_gate: Arc<CompactionGate>` (max=1
-      per partition). Acquired by `background_compact_loop`'s three
-      do_compact dispatch points (main / expiry-major / defensive auto)
-      and by `handle_split_part`. Acquisition order at the split site is
-      strictly outer→inner: per-partition `compact_gate` → PS-wide
-      `acquire_compact` → per-partition `gc_gate`. Same-partition
-      compact-vs-split is now serialised; cross-partition concurrency
-      preserved.
-
-      **Invariants:**
-      1. Any new control message that mutates row_stream from P-log MUST
-         travel through P-bulk's channel set — never write row_stream
-         directly via `part_sc` (note 16 above).
-      2. `handle_split_part` MUST await the barrier ACK BEFORE releasing
-         `compact_gate`, `gc_gate`, or clearing `frozen_for_split`. If a
-         future refactor moves any of those releases earlier, the race
-         re-opens — a freshly-resumed background_compact_loop /
-         background_flush_loop can send a P-bulk request before
-         bulk_sc is invalidated.
-      3. The barrier channel is capacity 1; `handle_split_part` is the
-         sole sender. If another sender is added later, prove the
-         barrier sender count stays bounded (1) or convert to an
-         unbounded channel.
-      4. `flush_worker_loop`'s `pending_barrier` slot MUST drain
-         `inflight` to ZERO before invalidating + ACKing. Skipping the
-         drain reintroduces the race coco surfaced (in-flight append on
-         stale worker landing after the invalidate ACKed).
-      5. The priority-biased select (PollNext::Left) is DEFENSIVE — under
-         today's gate discipline the SQ queue is empty when the barrier
-         arrives, but the bias keeps the design race-free if a future
-         refactor relaxes the gates.
-      6. `handle_split_part` sends the barrier BEFORE `multi_modify_split`.
-         Failure of the barrier send / ACK must abort split with the
-         manager not yet committed; post-seal placement (the v2 first
-         draft) would leak an unrecoverable window where manager-
-         committed seal + local state not converged.
-      7. ANY new do_compact dispatch site (future code paths that bypass
-         `background_compact_loop`) MUST acquire `compact_gate` first,
-         then `acquire_compact`. Same goes for split-shaped operations.
-      8. BOTH the barrier `send().await` AND the ACK `recv().await`
-         MUST be bounded by separate timers (5 s send + 10 s ACK
-         today). The total budget (15 s) MUST stay well under
-         `FREEZE_TTL` (30 s, lib.rs). Pre-bound (or only-ACK-bounded),
-         a wedged P-bulk could block the await past `FREEZE_TTL`,
-         `check_freeze_ttls` would unfreeze, new writes would extend
-         the row_stream tail past the already-captured
-         `commit_length`, and the eventual continuation would call
-         `multi_modify_split` with the STALE `row_end` → post-TTL
-         writes above sealed_length, invisible on recovery (coco
-         /findbugs v4 + v5 findings). The send is independently
-         bound-able because `row_invalidate_tx` is capacity 1: a prior
-         split's barrier sitting un-consumed in the channel (P-bulk
-         wedged on a stuck flush) back-pressures the next split's
-         send BEFORE the ACK timer arms. Both timeouts unfreeze +
-         return `FailedPrecondition` so the partition resumes serving
-         and the client can retry. If future tuning changes either
-         timeout, the relation `send + ack < FREEZE_TTL` MUST hold.
-
-      Regression guards (lib.rs):
-      `f255_row_invalidate_barrier_req_round_trips` (wire shape +
-      ACK round-trip) + `f255_invalidate_wins_priority_select` (PollNext
-      bias).
-
-    - **(P2) P-bulk readiness handshake — FIXED.** `spawn_bulk_thread`
-      now returns `(JoinHandle, oneshot::Receiver<Result<()>>)`. The
-      spawned thread sends `Ok(())` only AFTER compio `RuntimeBuilder::
-      build` succeeds AND `StreamClient::new_with_owner_epoch` succeeds AND
-      `set_reporter_part_id` runs; runtime / StreamClient init failure
-      sends `Err(_)` so P-log surfaces the real failure cause.
-      `partition_thread_main` awaits the receiver before publishing
-      `flush_req_tx` / `row_append_tx` / `row_invalidate_tx` into
-      `PartitionData` — a partition is never half-opened with a live
-      Sender to a dropped Receiver. Thread abort (drop without send)
-      surfaces as `Err(Canceled)` so the open path returns instead of
-      hanging. **Invariant: any future change to `spawn_bulk_thread`'s
-      in-thread init order MUST send the ready signal only after ALL
-      preconditions for `flush_worker_loop` are met — a premature
-      `Ok(())` regresses to the pre-F255 wedge.**
-      Regression guard:
-      `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.
-
-17. **F265 `part_addr` self-heal in `sync_regions_once`.** The manager's
-    `part_addrs` (per-partition listener addresses, the thing
-    `GetRegionsResp.part_addrs` serves to clients for routing) is
-    in-memory only and is LOST on manager restart. Registration used to
-    happen exactly once, inside `open_partition` — an already-open
-    partition never re-reported, so a manager kill+respawn under a
-    fully healthy cluster left clients unable to resolve any partition
-    listener (every get/put failed; observed as a 30-minute total
-    outage in the F265 transport chaos run, ending only when an
-    unrelated PS failover forced reopens). `sync_regions_once` now
-    compares the just-fetched `resp.part_addrs` against the open
-    partitions' `PartitionHandle.part_addr` and re-sends
-    `MSG_REGISTER_PARTITION_ADDR` for any missing/stale entry. Zero
-    steady-state cost (view matches → no RPC); convergence after a
-    manager restart is one ~2 s sync tick. The manager handler is no
-    longer leader-gated (in-memory idempotent hint; see manager
-    CLAUDE.md note 35). **Invariant: any new code path that binds or
-    re-binds a partition listener must keep `PartitionHandle.part_addr`
-    equal to the ACTUALLY advertised address — the self-heal trusts it
-    as the source of truth.**
-
-18. **F265 heartbeat-loss exit is a 90 s last resort, not a 10 s tripwire.**
-    `heartbeat_loop`'s `MAX_CONSECUTIVE_FAILURES` is 45 (× 2 s = 90 s; was
-    5 = 10 s). The `std::process::exit(1)` on sustained heartbeat failure
-    guards the narrow "partitioned from the manager but not from clients"
-    stale-serving case — it is NOT the primary fencing (owner_epoch fences
-    writes at the ENs; region_epoch fences client routing). At 10 s, any
-    manager outage > 10 s — and EVERY ucx manager kill+respawn pays a
-    ~60 s TIME_WAIT bind retry (F264) — made the entire PS fleet exit
-    simultaneously: a self-inflicted, unrecoverable data-plane outage
-    (nothing left to re-register when the manager returned; observed in
-    the F265 ucx chaos round). While the manager is down NO reassignment
-    can happen (the manager performs it), so serving through its outage
-    is safe. Companion manager-side guard: the eviction sweep is gated on
-    `serving` (listener actually bound) and heartbeat clocks are re-seeded
-    at listener-ready (manager CLAUDE.md note 35).
-
-19. **F267 owner locks are PER-PARTITION, acquired fresh at every
-    `open_partition`.** `owner_key = "partition/<part_id>"` — ONE stable logical key per
-    partition, NO ps_id in the key (coco P1: a per-PS key shape would
-    leave the old owner's key valid at the manager after takeover, so
-    its lingering GC punch_holes/truncate could still mutate streams
-    owned elsewhere; with a stable key the takeover acquire bumps THE
-    SAME key and the old owner fails `ensure_owner_epoch` everywhere); `acquire_partition_owner_epoch` walks the manager list.
-    P-log's `part_sc` and P-bulk's `bulk_sc` share the ONE epoch acquired
-    for that open (via `new_with_owner_epoch`). Why: the epoch must be
-    newest-at-TAKEOVER, not newest-at-process-start — a standing PS
-    inheriting partitions from a PS that acquired LATER sat below the EN
-    fence floors forever (manager-HA chaos H2; F265's bump-on-acquire
-    only fixed the respawned-PS case). Per-partition keys scope fencing
-    exactly: an open of partition X bumps only X's key — siblings keep
-    their epochs; X's previous owner alone is fenced (manager equality +
-    EN floor) and self-evicts via LockedByOther. The PS-lifetime
-    `server_owner_key`/`server_revision` ("ps-<id>") remains ONLY for
-    split-coordination RPCs. Cross-ref: manager CLAUDE.md note 35
-    (F265 bump-on-acquire), stream CLAUDE.md note 1.
-
-20. **F267 manager-list rotation invariants (4 bugs from manager-HA
-    chaos — keep all four properties or HA failover silently dies).**
-    (a) `PartitionServer.current_mgr` is `Rc<Cell<usize>>` — the struct
-    is cloned once per supervised loop; a plain Cell gave each loop a
-    PRIVATE rotation index (only heartbeat's rotated; region_sync +
-    the F265 part_addrs self-heal hammered the dead manager forever).
-    (b) Every StreamClient manager RPC routes through `manager_call`
-    (rotate on transport failure) or `retry_manager_call`; decode sites
-    call `note_manager_code` (rotate on CODE_NOT_LEADER). Never add a
-    raw `pool.call_timeout(self.manager_addr(), ..)` site.
-    (c) `MSG_GET_REGIONS` + `MSG_HEARTBEAT_PS` are leader-gated; the PS
-    heartbeat Ok-arm rotates on NOT_LEADER and COUNTS it toward the 90 s
-    stale-serving exit budget (only a real leader ACK resets — coco P1:
-    a follower-only-reachable PS is partitioned from the leader and may
-    be getting evicted),
-    and `sync_regions_once` rotates on NOT_LEADER. A follower answering
-    OK pins the shared rotation to itself while serving empty/stale
-    `part_addrs` (manager-HA chaos H3).
+20. **Manager-list rotation invariants (keep all four or HA failover silently dies).**
+    (a) `PartitionServer.current_mgr` is `Rc<Cell<usize>>` (the struct is cloned once per
+    supervised loop; a plain Cell gives each loop a PRIVATE rotation index, so only
+    heartbeat's rotates while region_sync + part_addr self-heal hammer the dead manager
+    forever).
+    (b) Every StreamClient manager RPC routes through `manager_call` (rotate on transport
+    failure) or `retry_manager_call`; decode sites call `note_manager_code` (rotate on
+    CODE_NOT_LEADER). Never add a raw `pool.call_timeout(self.manager_addr(), ..)` site.
+    (c) `MSG_GET_REGIONS` + `MSG_HEARTBEAT_PS` are leader-gated; the PS heartbeat Ok-arm
+    rotates on NOT_LEADER and COUNTS it toward the 90 s stale-serving budget (only a real
+    leader ACK resets — a follower-only-reachable PS is partitioned from the leader);
+    `sync_regions_once` rotates on NOT_LEADER. A follower answering OK pins the shared
+    rotation to itself while serving stale `part_addrs`.
     (d) Client SDK `refresh_regions` rotates + retries on NOT_LEADER.
 
-21a. **LAT-1 latency histograms.** `PartitionMetrics.write_lat/get_lat` (write = Put+Delete+FenceBump batch ops, coco P3 rename)
-    (`LatHist`: 9 finite ns buckets 0.5ms..250ms + sum + count,
-    non-cumulative storage, cumulative `le` at render). PUT observes the
-    ALREADY-MEASURED `BatchStats.end_to_end_ns` once per batch with
-    `n = ops` (every op in a group-committed batch experienced the
-    batch's latency — zero new hot-path timing); GET adds one `Instant`
-    pair + RefCell borrow in `serve_get_local` (same cost class as the
-    F183 req_count add). A/B perf-check (4K p8 d8): write 999,864 →
-    1,069,685 ops (no regression). Rendered as Prometheus histograms in
-    `metrics_text`.
+21. **Latency histograms + /metrics.** `PartitionMetrics.write_lat/get_lat` (`LatHist`:
+    9 finite ns buckets 0.5ms..250ms + sum + count, non-cumulative storage, cumulative
+    `le` at render). PUT observes the ALREADY-MEASURED `BatchStats.end_to_end_ns` once
+    per batch with `n = ops` (zero new hot-path timing); GET adds one `Instant` pair +
+    RefCell borrow in `serve_get_local`. `PartitionServer::metrics_text()` renders the
+    Prometheus snapshot on the MAIN compio thread (the `partitions` map is `Rc<RefCell>`);
+    `--metrics-port` spawns a 2 s publisher task that copies the string into an
+    `Arc<RwLock<String>>` served by `autumn_common::metrics_http`. Export rules: only
+    `req_count_monotonic` (the never-reset counter — `req_count` is swap-reset every 30 s
+    and would saw-tooth) plus gauges (size / gc-debt / pending-compaction bytes,
+    gc/compact inflight, sealed log extents). Emission is metric-major (all samples of one
+    metric contiguous after its `# TYPE` line — the Prometheus text format requires it).
 
-21. **/metrics (observability batch 1).** `PartitionServer::metrics_text()`
-    renders the Prometheus text snapshot on the MAIN compio thread (the
-    `partitions` map is `Rc<RefCell>`); the binary's `--metrics-port` path
-    spawns a 2 s publisher task that copies the string into an
-    `Arc<RwLock<String>>` served by the `autumn_common::metrics_http`
-    listener thread. Export rules: only `req_count_monotonic` (the
-    never-reset counter — `req_count` is swap-reset every 30 s by
-    `report_load_loop` and would saw-tooth) plus gauges
-    (size/gc-debt/pending-compaction bytes, gc/compact inflight, sealed log
-    extents). Emission is metric-major (all samples of one metric
-    contiguous after its `# TYPE` line — the Prometheus text format
-    requires grouping; the first cut interleaved per-partition and was
-    non-compliant).
+## WAL-FAILSTOP — mid-stream log_stream corruption fails recovery, not silent skip
 
-## WAL-FAILSTOP — mid-stream log_stream corruption fails recovery, not silent skip (2026-06-13)
+INVARIANT: the log_stream replay decoder must FAIL LOUD on a `DecodeOne::Corrupt`
+(a COMPLETE record whose V1 CRC or inner-length disagrees = bit rot / torn write), not
+`skip + continue` — skipping drops an ACKed-but-unflushed write AND holes the replay
+sequence → silent data loss.
+- `decode_records_chunk` returns `anyhow::Result`: `Corrupt` → `Err`
+  (`recover_partition` propagates via `?` → partition open fails loud → recover from a
+  healthy replica). `Incomplete` (truncated TAIL) still `break`s clean (crash-tail).
+- `process_gc_chunk` likewise `Err`s on `Corrupt` — refusing to punch_holes past records
+  it can't parse (could reclaim still-live VP data).
+- **Committed-end carry check**: a record whose LENGTH field is bit-flipped LARGER reports
+  as `Incomplete` (the `bytes.len() < total` check precedes the CRC check), escaping the
+  `Corrupt` arm. But replay reads are committed-clamped (`read_committed_bytes_from_extent`)
+  and the committed boundary always lands on a record boundary (commit advances by whole
+  all-replica-ACKed records), so a **non-empty carry at the committed end** can only be a
+  length-corrupt / lagging-truncated committed record, never a legit crash-tail.
+  `recover_partition` `Err`s on it instead of discarding.
 
-Production-readiness audit P0 (coco). The log_stream replay decoder used to
-`skip + continue` on a `DecodeOne::Corrupt` (a COMPLETE record whose V1 CRC or
-inner-length disagrees = bit rot / torn write). Skipping drops an
-ACKed-but-unflushed write AND holes the replay sequence → silent data loss.
-
-Fix (reproduce-first — `wal_mid_record_corruption_fails_recovery_not_silently_skipped`):
-- `decode_records_chunk` now returns `anyhow::Result`: `Corrupt` → `Err`
-  (`recover_partition` propagates via `?` → partition open fails loud → recover
-  from a healthy log_stream replica). `Incomplete` (truncated TAIL) still
-  `break`s clean (crash-tail).
-- `process_gc_chunk` (GC) likewise `Err`s on `Corrupt` instead of skipping —
-  refusing to punch_holes past records it can't parse (could reclaim still-live
-  VP data).
-- **Committed-end carry check (coco P1 follow-up):** `decode_one` reports a
-  record whose LENGTH field is bit-flipped LARGER as `Incomplete` (the
-  `bytes.len() < total` check precedes the CRC check), so it escapes the
-  `Corrupt` arm. But replay reads are committed-clamped
-  (`read_committed_bytes_from_extent`, F261), and the committed boundary always
-  lands on a record boundary (commit advances by whole all-replica-ACKed
-  records) with uncommitted partial tails clamped OUT — so a **non-empty carry
-  at the committed end** can only be a length-corrupt / lagging-truncated
-  committed record, never a legit crash-tail. `recover_partition` now `Err`s on
-  it instead of discarding (the pre-F261 "trailing partial = crash-tail"
-  tolerance is stale under the committed-clamp).
-
-Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced
-+ leaves the dirent). Test-only `decode_records_full` / `decode_records_with_offsets`
-keep the old skip (not on any production path). Verified: ps 163 unit tests +
-live (40 keys + 3 MiB value, PS restart → 0 loss, no false WAL-FAILSTOP trip).
+Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced + leaves
+the dirent). Test-only `decode_records_full` / `decode_records_with_offsets` keep the old
+skip (not on any production path).

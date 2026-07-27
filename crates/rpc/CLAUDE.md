@@ -2,7 +2,12 @@
 
 ## Purpose
 
-Custom binary RPC framework built on compio (completion-based I/O, thread-per-core). Replaces tonic/gRPC to eliminate HTTP/2 framing and protobuf overhead on the hot path (extent node append fanout).
+Custom binary RPC framework on compio (completion-based I/O, thread-per-core).
+Replaces tonic/gRPC to drop HTTP/2 framing and protobuf overhead on the hot path
+(extent-node append fanout). Its living surface is the **client + wire** half:
+`RpcClient`, the `manager_rpc` / `partition_rpc` / `extent_rpc` wire schemas,
+`Frame`/`FrameDecoder`, `StatusCode`. Servers are hand-rolled per component on
+`autumn_transport::Conn` (EN, manager, PS), not in this crate.
 
 ## Wire Format
 
@@ -16,250 +21,194 @@ Custom binary RPC framework built on compio (completion-based I/O, thread-per-co
 |-------|------|-------------|
 | req_id | 4B | Multiplexing ID. Client picks, server echoes. 0 = fire-and-forget. |
 | msg_type | 1B | RPC method identifier (0-255 per service) |
-| flags | 1B | bit 0: is_response, bit 1: is_error, bit 2: stream_end, bit 3: crc |
-| payload_len | 4B | Payload size in bytes (max 512MB); includes the 4-byte CRC trailer when bit 3 is set |
+| flags | 1B | bit 0 `FLAG_RESPONSE`, bit 1 `FLAG_ERROR`, bit 2 `FLAG_STREAM_END`, bit 3 `FLAG_CRC` |
+| payload_len | 4B | Payload size (`HEADER_LEN=10`, `MAX_PAYLOAD_LEN=u32::MAX`); includes the 4-byte CRC trailer when `FLAG_CRC` is set |
 
-Error responses encode status as: `[status_code: u8][message bytes]`.
+Error responses encode status as `[status_code: u8][message bytes]`.
 
-### Per-frame CRC32C (F165; single frame protocol since F232)
+### Per-frame CRC32C
 
-There is exactly **one** frame protocol — no "V0/V1" versions, no encoder toggle,
-no back-compat (the whole cluster restarts together). Every frame from
-`Frame::encode` carries a 4-byte CRC32C trailer over the payload: `FLAG_CRC`
-(bit 3) set, `payload_len` counts the trailer. The decoder verifies + strips it;
-mismatch → `FrameError::CrcMismatch`. Rationale (vs Kafka/HDFS/Ceph, which all
-ship checksums by default): a flipped `extent_id`/`eversion`/`revision` over TCP
-is a silent wrong-extent write or fence bypass that TCP's 16-bit checksum + NIC
-offload bugs can let through; on-disk CRC can't catch in-transit corruption. HW
-CRC32C (SSE4.2) is negligible on the small control frames it now covers.
+One frame protocol — no versions, no encoder toggle, no back-compat (the cluster
+restarts together). Every frame from `Frame::encode` carries a 4-byte CRC32C
+trailer over the payload: `FLAG_CRC` set, `payload_len` counts the trailer. The
+decoder verifies + strips it; a mismatch is `FrameError::CrcMismatch`. This
+guards a flipped `extent_id`/`eversion`/`revision`/`owner_epoch` over TCP — a
+silent wrong-extent write or fence bypass that TCP's 16-bit checksum + NIC
+offload bugs can let through and on-disk CRC cannot catch in transit. HW CRC32C
+(SSE4.2) is negligible on the small control frames it covers.
 
 **The one CRC-less frame** is the zero-copy value response, built by
-`Frame::encode_no_crc` (and hand-built in production: `partition-server::ps_zc_head`
+`Frame::encode_no_crc` (hand-built in production as `partition-server::ps_zc_head`
 / `stream::zc_read_head`): `call_into_dest` / `call_into_pooled` recv the value
 straight into a caller dest and cannot strip a trailer, so it omits the CRC
-(FLAG_CRC unset) and relies on the transport's own integrity (UCX NIC ICRC / TCP
-kernel checksum, per F219). The decoder's `FLAG_CRC` dispatch branch exists to
-handle this one shape — a ZC design constraint, not a legacy version.
+(`FLAG_CRC` unset) and relies on transport integrity (UCX NIC ICRC / TCP kernel
+checksum). The decoder's `FLAG_CRC` branch exists to handle this one shape — a ZC
+design constraint, not a legacy version.
 
 ## Modules
 
-### `extent_rpc.rs` (relocated from autumn-stream, CLUSTER-DF Phase 0)
-ExtentService wire codec — hot-path binary (Append/ReadBytes/CommitLength) +
-rkyv control-plane (AllocExtent/Df/RequireRecovery/ConvertToEc/…). Lives HERE
-(not autumn-stream) so it's the single wire-schema home alongside
-`manager_rpc`/`partition_rpc`; autumn-stream re-exports it
-(`pub use autumn_rpc::extent_rpc`) so `autumn_stream::extent_rpc::*` paths are
-unchanged. This deleted the manager's hand-mirrored `ExtDiskStatus` (pure-wire
-duplicate → `ExtDfResp` now nests canonical `extent_rpc::DiskStatus`); the
-`Ext*` types that nest a manager DOMAIN type (`MgrRecoveryTask`, persisted in
-etcd) are kept — that's domain/wire separation, not a mirror. `DiskStatus`
-carries `extent_bytes` (EN self-reported real per-disk extent footprint) for
-cluster-df. `MSG_CLUSTER_DF = 0x4D` + `ClusterDfReq/Resp/NodeCapWire` live in
-`manager_rpc.rs`.
+- **`frame.rs`** — `Frame` (encode/decode one frame), `FrameDecoder` (streaming
+  decode state machine), `HEADER_LEN=10`, `MAX_PAYLOAD_LEN`, flag bits.
+  `encode_response_with` builds a framed response in one allocation.
+- **`error.rs`** — `StatusCode` (Ok, NotFound, InvalidArgument,
+  FailedPrecondition, Internal, Unavailable, AlreadyExists, PermissionDenied),
+  `RpcError`, `encode_status`/`decode_status`.
+- **`client.rs`** — `RpcClient` (below).
+- **`extent_rpc.rs`** — ExtentService wire codec: hot-path binary
+  (Append/ReadBytes/CommitLength) + rkyv control-plane (AllocExtent/Df/…). The
+  single wire-schema home; autumn-stream re-exports it. `DiskStatus.extent_bytes`
+  (EN self-reported per-disk footprint) feeds cluster-df.
+- **`manager_rpc.rs`** / **`partition_rpc.rs`** — manager and PS wire schemas
+  (rkyv structs + `MSG_*` constants), the most-referenced surface in the crate.
+- **`cap_token.rs`** — Ed25519 capability-token codec for data-plane authz: the
+  manager (leader) signs short-TTL tokens with a private key, the PS verifies
+  with the public key only (asymmetric — a compromised PS can verify, never
+  forge), the client forwards opaque bytes. Single source of truth for the claims
+  layout, signing bytes, and domain-separation prefix; in the wire fingerprint.
 
-### `frame.rs`
-- `Frame`: encode/decode a single RPC frame
-- `FrameDecoder`: streaming decoder state machine (feed bytes → try_decode frames)
-- Constants: `HEADER_LEN=10`, `MAX_PAYLOAD_LEN=512MB`, flag bits
+`MSG_TYPE_PING = 0xFF` is reserved; heartbeat lives in each per-component pool.
 
-### `error.rs`
-- `StatusCode`: Ok, NotFound, InvalidArgument, FailedPrecondition, Internal, Unavailable, AlreadyExists
-- `RpcError`: Status, ConnectionClosed, Cancelled, Frame, Io
-- `encode_status/decode_status`: wire encoding for error payloads
+## RpcClient — SQ/CQ architecture
 
-### `client.rs`
-- `RpcClient`: multiplexed client over one TCP connection
-  - `connect(addr)` → `Rc<RpcClient>`: connect + start background reader + writer tasks
-  - `call(msg_type, payload)` → `Bytes`: send request, await response
-  - `call_vectored(msg_type, parts)` → `Bytes`: vectored payload, zero-copy
-  - `send_frame(frame)` → `oneshot::Receiver<Frame>`: low-level send
-  - `send_vectored(msg_type, parts)` → `oneshot::Receiver<Frame>`: pipelined submit
-  - `send_oneshot(msg_type, payload)`: fire-and-forget (req_id=0)
-- **SQ/CQ architecture (R4 step 4.1, F098)**:
-  - **SQ**: callers push `SubmitMsg { Single | Vectored }` onto a bounded
-    `mpsc::channel(SUBMIT_CHANNEL_CAP=1024)`. A single `writer_task` owns
-    `WriteHalf` and drains the queue sequentially — no cross-caller mutex.
-    Back-pressure comes naturally from the bounded channel.
-  - **CQ**: `read_loop` task owns `ReadHalf`, decodes frames, dispatches to
-    the matching `oneshot::Sender<Frame>` in
-    `Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>>`.
-- Invariants:
-  - pending-insert happens **before** submit_tx.send so the CQ can't race
-    in and find no entry.
-  - `pending.borrow_mut()` is always scoped tight — never held across await.
-  - `submit_tx` is cloned from a `RefCell` borrow (scoped), never borrowed
-    across `.send().await` — avoids RefCell-across-await panics.
-  - `next_req_id` skips `0` on wraparound (0 reserved for fire-and-forget).
-- **F099-I-fix writer_task instrumentation**: on any write error, the
-  writer_task logs `iov_count`, `total_bytes`, `errno.raw_os_error()`,
-  `kind`, and the error message at WARN before exiting. This makes the
-  previously opaque "submit error: connection closed" downstream cascade
-  (see `stream::client::launch_append`) self-explanatory — the FIRST
-  writer that encountered a kernel-level error in a stress run surfaces
-  with the exact shape of the offending SendMsg, eliminating guesswork.
-- **2-iov SendMsg shape is stable**: every `call_vectored` /
-  `send_vectored` produces a `SubmitMsg::Vectored { bufs: [hdr, part] }`
-  with exactly 2 iovecs — well under UIO_MAXIOV=1024. The writer_task
-  serialises submits so concurrent callers never combine their iovs in
-  one syscall. Stress-tested at 2048 concurrent futures sharing one
-  writer_task in `writer_task_handles_2048_concurrent_vectored` — no
-  EINVAL, no EAGAIN, all requests complete.
-- **F121 closed-state flag (`closed: Rc<Cell<bool>>`)**: set true
-  whenever `read_loop` or `writer_task` exits — the read EOF / write
-  error / channel-closed paths all set it BEFORE clearing `pending`.
-  `send_frame`, `send_vectored`, `send_oneshot` short-circuit with
-  `RpcError::ConnectionClosed` when `closed.get()` is true; without
-  this, a stale `Rc<RpcClient>` left in any pool would let new
-  submits insert pending entries that nobody dispatches (no
-  read_loop alive). Single-threaded compio guarantees the check +
-  `pending.insert` run in one sync block (no awaits between them),
-  so a concurrent close race resolves to either "we early-return"
-  or "our entry gets cleared by `pending.clear()`". Pools should
-  treat `is_closed()` as a hard "evict and reconnect" signal —
-  `crates/stream/src/conn_pool.rs::get_client` does this.
+`RpcClient::connect(addr)` returns `Rc<RpcClient>` and starts two background tasks
+over one TCP connection:
 
-- **F216-E zero-copy receive-into-dest (`call_into_dest`)**: a second
-  `Pending` variant `IntoDest` alongside `Frame`. `call_into_dest(msg_type,
-  payload, dest: *mut u8, dest_cap, reg: Option<&RegisteredMem>) -> DestMeta`
-  reads the response value straight into `dest` with no intermediate Vec:
-  - Wire: a **V0** response frame whose payload is `[ZC meta][value]`, where
-    `encode_zc_meta(code, value) = [code:1][value_len:4 LE][reserved:4 LE]`
-    (`ZC_META_LEN = 9`). The 3rd field was the value crc32c; **F219 removed the
-    ZC value crc** (it cost a full crc32c pass per value and duplicated the
-    transport's own integrity), so the field is now reserved/0 — the 9-byte
-    layout is kept for wire-compat. `DestMeta { code, value_len }` is returned to
-    the caller; `value` lands in `dest[..value_len]`.
-  - `read_loop` dual-path on the matching `req_id`: **UCX** → `peek_header`
-    + `drain_into` the buffered meta prefix out of the `FrameDecoder`, then
-    `ReadHalf::recv_into(&mut dest[filled..], reg)` for the value remainder
-    (memh RDMA when `reg=Some`); **TCP / non-UCX** `call_into_dest` → normal
-    `try_decode` then `finish_into_dest_from_frame` (memcpy `payload[9..]` into
-    dest). **`call_into_pooled` on TCP (F219)** instead recvs the value (≥ 64 KiB,
-    `TCP_RECV_INTO_POOLED_MIN_BYTES`) straight into the read_loop-owned `PooledBuf`
-    via `ReadHalf::read_exact_into_pooled` (a compio owned read) — no FrameDecoder
-    accumulation copy. No value crc is verified anywhere (F219); integrity is the
-    transport's (UCX NIC ICRC / TCP kernel checksum). Normal (non-ZC) frames keep
-    their V1 frame-CRC (F165). All other msg_types go through the untouched
-    `Pending::Frame` path → **TCP fully compatible, no regression**.
-  - `RegisteredMem` is re-exported from `autumn-transport` (uninhabited stub on
-    non-ucx builds, so `reg` is always `None` there and the code compiles
-    uniformly).
-  - **Cancel-safety:** the recv-into-`dest` happens in the long-lived
-    `read_loop` task, NOT the caller future. It is safe ONLY when `dest`
-    outlives the call and the call is not dropped mid-recv (no per-call
-    timeout). The client←PS GET (`ClusterClient::get_into`) satisfies this
-    (no timeout; the sglang page outlives the batch). A path that needs a
-    timeout / failover (e.g. PS←EN) must instead use the planned
-    read_loop-owns-the-PooledBuf-and-hands-it-back variant — see
-    `feature_list.md` F216-E "Remaining".
-  - **Write counterpart (`MSG_PUT_ZC`)** needs no new RPC primitive: the client
-    sends `[meta][value]` via the existing `call_vectored` (value = its own
-    iovec, zero-copy via rcache when its memory is registered; V1 frame CRC
-    covers `[meta||value]`). The value-separable framing lives in
-    `partition_rpc` (`encode/parse_put_zc_meta`); the PS slices the value
-    zero-copy out of the reassembled frame. So WRITE zero-copy is send-side
-    framing only; READ zero-copy needs `call_into_dest` because the value must
-    land in a specific caller dest.
+- **SQ**: callers push `SubmitMsg { Single | Vectored }` onto a bounded
+  `mpsc::channel(SUBMIT_CHANNEL_CAP=1024)`. A single `writer_task` owns
+  `WriteHalf` and drains it sequentially — no cross-caller mutex; back-pressure
+  comes from the bounded channel.
+- **CQ**: the `read_loop` task owns `ReadHalf`, decodes frames, dispatches to the
+  matching entry in `Rc<RefCell<HashMap<u32, Pending>>>`.
 
-### (removed: `server.rs` / `pool.rs`)
-The generic `RpcServer` (`server.rs`) and `ConnPool` (`pool.rs`) were dead
-code — every component hand-rolls its OWN `serve` + `handle_connection` on
-`autumn_transport::Conn` (EN `extent_node.rs`, manager `rpc_handlers.rs`, PS
-`lib.rs`), and each has its own connection pool (`autumn_stream::ConnPool` in
-`conn_pool.rs`, the manager's `RpcConn` map in `lib.rs`). The audit found 0
-external references to `autumn_rpc::RpcServer` / `autumn_rpc::ConnPool`; both
-were deleted (2026-06-16). autumn-rpc's living surface is the **client + wire**
-half: `RpcClient` (57 refs), `manager_rpc`/`partition_rpc`/`extent_rpc` wire
-schemas (the most-referenced things in the crate), `Frame`/`FrameDecoder`,
-`StatusCode`. `MSG_TYPE_PING` (0xFF) is still reserved; heartbeat lives in the
-per-component pools.
+Calls: `call`, `call_vectored` (vectored, zero-copy), `call_timeout` /
+`call_vectored_timeout`, `send_frame` / `send_vectored` (low-level, return
+`oneshot::Receiver<Frame>`), `send_oneshot` (fire-and-forget, req_id=0).
 
-## Architecture
+**Invariants (correctness rules):**
 
-```
-Server side (per-component, NOT in autumn-rpc):
-  each daemon hand-rolls serve(addr) + handle_connection on
-  autumn_transport::Conn — EN true-SQ/CQ loop, manager dispatch,
-  PS partition routing. autumn-rpc provides Frame/FrameDecoder + StatusCode.
+- Pending-insert happens **before** submit (`register_and_submit`), so the
+  read_loop never finds a response with no entry; a failed submit rolls it back.
+- `pending.borrow_mut()` is always tightly scoped, never held across an await —
+  else a re-entrant call on the same compio thread panics the RefCell.
+- `submit_tx` is cloned from a scoped borrow, never borrowed across
+  `.send().await` — same RefCell-across-await hazard.
+- `next_req_id` skips `0` on wraparound — `0` is fire-and-forget, no response
+  routing.
+- **`closed: Rc<Cell<bool>>`** is set true when `read_loop` or `writer_task`
+  exits, BEFORE `pending` is cleared. Every submit checks it first, in the same
+  sync block as `pending.insert` (no await between), so a concurrent close
+  resolves to either early-return `ConnectionClosed` or a `pending.clear()`.
+  Without it, a stale `Rc<RpcClient>` in a pool would accept submits no live
+  read_loop can dispatch. Pools treat `is_closed()` as evict-and-reconnect
+  (`stream::conn_pool::get_client`).
 
-Client side (autumn-rpc):
-  RpcClient = single writer_task (SQ) + background read_loop (CQ)
-  Multiplexing: RefCell<HashMap<req_id, Pending>>
-```
+### Zero-copy receive-into-dest
 
-## Usage Pattern
+`call_into_dest(msg_type, payload, dest: *mut u8, dest_cap, reg:
+Option<&RegisteredMem>) -> DestMeta` reads the response value straight into
+`dest`, no intermediate Vec. Wire response = CRC-less frame with payload
+`[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1][value_len:4 LE]
+[reserved:4 LE]` (`ZC_META_LEN = 9`; reserved carries no value CRC — integrity is
+the transport's). `read_loop` dispatches two ways: **UCX** peeks the header,
+drains the buffered meta out of the `FrameDecoder`, then `recv_into(&mut
+dest[filled..], reg)` for the value (memh RDMA when `reg=Some`); **TCP/non-UCX**
+decodes then memcpys `payload[9..]` into dest. `call_into_pooled` is the sibling
+that recvs into a read_loop-owned `PooledBuf` and hands it back (on TCP, values ≥
+`TCP_RECV_INTO_POOLED_MIN_BYTES = 64 KiB`). No value CRC is verified on either
+path. All other msg_types use the untouched `Pending::Frame` path, keeping their
+frame CRC. `RegisteredMem`/`PooledBuf` re-export from autumn-transport
+(uninhabited/plain stubs on non-ucx, so `reg` is always `None`).
 
-```rust
-// Client (autumn-rpc)
-let client = RpcClient::connect(addr).await?;
-let resp = client.call(1, payload).await?;
-// Servers are hand-rolled per component on autumn_transport::Conn —
-// see crates/stream/src/extent_node.rs / manager/src/rpc_handlers.rs.
-```
+**Cancel-safety (mandatory):** the recv-into-`dest` runs in the long-lived
+`read_loop`, NOT the caller future. It is safe ONLY when `dest` outlives the call
+and the call is not dropped mid-recv — so `call_into_dest` has no per-call
+timeout (`ClusterClient::get_into` satisfies this). Any path needing a
+timeout/failover uses `call_into_pooled` — the read_loop owns the buffer, so a
+caller-cancel just returns it to the pool, never a leak.
 
-## Key Design Decisions
+**Write counterpart (`MSG_PUT_ZC = 0x51`)** needs no new primitive: the client
+sends `[meta][value]` via `call_vectored` (value as its own iovec, zero-copy via
+rcache when registered; the frame CRC covers `[meta||value]`). Framing lives in
+`partition_rpc`: `encode_put_zc_meta` / `parse_put_zc_meta`, fixed prefix
+`PUT_ZC_HEADER_LEN = 44` (part_id + region_epoch + expires_at + value_len +
+key_len) then the key; the PS slices the value zero-copy from the reassembled
+frame. Write ZC is send-side framing only; read ZC needs `call_into_dest` because
+the value must land in a specific caller dest.
 
-1. **10-byte header vs gRPC**: Eliminates HTTP/2 frame (9B) + gRPC envelope (5B) + HEADERS frame (~50B+). ~58B total overhead vs ~200B+ for gRPC.
-2. **tokio::sync for locking**: tokio::sync::Mutex/mpsc/oneshot are runtime-agnostic futures. Work correctly on compio without needing tokio Runtime.
-3. **req_id=0 for fire-and-forget**: No response routing, handler runs but response is not written.
-4. **MSG_TYPE_PING=0xFF reserved**: Health-check msg_type; the per-component pools (autumn-stream ConnPool, manager RpcConn map) implement the heartbeat.
-5. **`shard_for_extent(extent_id, shard_count)` — the ONE canonical extent→shard map (F-EN-SHARD-HASH).** Lives here (lowest common dep) so the EN (`extent_node::owns_extent` + sibling forward), the manager (`shard_addr_for_extent`), and the StreamClient (`conn_pool::shard_addr_for_extent`) all compute the SAME shard for an extent — a mismatch black-holes routing. splitmix64 finalizer (same mixer as the read-rotation `rotated_replica_start`) DECORRELATES bootstrap's contiguous extent ids (7 per partition) from the modulus: the old raw `extent_id % shard_count` put every partition's data extents on shard 0 (ids all ≡ 0 mod the count), concentrating client-direct reads on one EN. `shard_count <= 1` / empty `shard_ports` → shard 0 (legacy single-shard). **Changing this remaps ownership of existing extents ⇒ STOP-THE-WORLD reshard** (EN + manager must agree); byte-free (EN shards share the hashed on-disk data dirs → only logical ownership re-partitions on restart), NO wire-struct change (lib.rs isn't in the WIRE fingerprint), NO etcd reset. Tests: `shard_for_extent_tests`.
+## shard_for_extent
 
-## WIRE-1 — wire-schema fingerprint (2026-06-12)
+`shard_for_extent(extent_id, shard_count) -> u32` is the ONE canonical
+extent→shard map, living here (lowest common dep) so the EN (`owns_extent` +
+sibling forward), the manager (`shard_addr_for_extent`), and the StreamClient
+(`conn_pool::shard_addr_for_extent`) all compute the same shard — a mismatch
+black-holes routing. A splitmix64 finalizer decorrelates bootstrap's contiguous
+extent ids (7 per partition) from the modulus; a raw `extent_id % shard_count`
+aliased every partition's data extents onto shard 0, concentrating client-direct
+reads on one EN. `shard_count <= 1` / empty `shard_ports` → shard 0.
 
-`build.rs` hashes the wire-schema SOURCE files (`manager_rpc.rs`,
-`partition_rpc.rs`, `frame.rs`, `extent_rpc.rs`) into
-`autumn_rpc::WIRE_FINGERPRINT` (16-hex compile-time const). Rationale:
-deploys are SAME-COMMIT (rkyv has no cross-version compatibility) and a
-mixed deploy fails SILENTLY with garbage decodes — the F275 stale python
-wheel decoded `PutReq` with `part_id=0` and every write failed with
-nothing pointing at the cause. Hashing the schema source (not the git
-commit) keeps dev flows sane: unrelated code edits don't perturb it; any
-wire-struct edit does.
+**Changing this remaps ownership of existing extents ⇒ STOP-THE-WORLD reshard**
+(every EN shard + the manager must agree). It is byte-free (EN shards share the
+hashed on-disk data dirs — only logical ownership re-partitions on restart), needs
+no wire-struct change (lib.rs is not in the WIRE fingerprint) and no etcd reset.
+Tests: `shard_for_extent_tests`.
 
-Exchange: `GetClusterIdResp.wire_fingerprint` (filled by the manager in
-both arms of `handle_get_cluster_id`). Checks at startup of every
-long-lived process via `wire_fingerprint_check`:
-- `ClusterClient::connect` (covers autumn-client/op, fuse, ioring, the
-  python wheel — the F275 shape — and the EN's cluster_id verify which
-  connects through it),
-- PS `finish_connect` (own pool path).
-Semantics: a SUCCESSFUL response with a different (or empty = pre-WIRE-1)
-fingerprint is a HARD startup refusal with an actionable message; a
-TRANSPORT failure fetching it is best-effort-skipped (availability wins
-while the manager is briefly down — every subsequent RPC fails loudly
-anyway). NOTE for a future rolling-upgrade design: this check is the
-enforcement point to relax once a real wire-compat story exists.
+## Admin-token payload-prefix codec
 
-## R1 — wire-version interval + cluster_version (2026-06-12, rolling upgrade design §3-R1)
+`is_admin_mgr_msg(msg_type)` is the set of cluster-MUTATING manager ops gated
+behind the manager's admin secret (fence/remove/maintenance/create-stream/
+upsert-partition/merge/bump-cluster-version/…). Read-only observability ops and
+ops carrying their own `admin_token` field (tenant/namespace/principal) are NOT
+gated; `MSG_REGISTER_NODE` is deliberately excluded (the EN self-registers with no
+admin token — gating it would wedge bring-up). `is_admin_ps_msg` is the PS analog
+(`MSG_SPLIT_PART`, `MSG_MAINTENANCE`).
 
-WIRE-1's single-point fingerprint equality is relaxed to
-`wire_compat_check(remote_fp, remote_min, remote_max)`:
+The token rides as an out-of-band prefix stripped before rkyv decode:
+`prefix_admin_token(token, payload)` prepends `[u32 LE token_len][token][payload]`
+(`ADMIN_TOKEN_LEN_PREFIX = 4`); `strip_admin_token` returns `(token, rest)` or
+`None` on a malformed prefix. The manager treats `None` as a FAILED check, never
+"run it bare" — a bare unprefixed payload can't be mistaken for a valid strip.
 
-- `WIRE_VERSION_MIN/MAX` (lib.rs consts) declare the interval this binary
-  speaks. Accept iff fingerprints equal (same-build fast path) OR the
-  intervals overlap.
-- **`WIRE_VERSION_FINGERPRINTS` registry + `registry_pins_current_schema_
-  to_max_version` test = the bump-enforcement mechanism.** ANY edit to a
-  wire-schema source file (even a comment) changes `WIRE_FINGERPRINT` and
-  fails the test until the developer records the new fingerprint — and
-  decides compatibility: pre-R3 bump MAX and set MIN=MAX (rkyv = no
-  cross-version decode; same-commit deploys); post-R3 keep MIN=MAX-1
-  (frozen V1 + V2 msg_types; design §5 N↔N-1 window).
-- Runtime cross-check (coco P1): a peer claiming a version that exists in
-  OUR registry with a DIFFERENT fingerprint is refused as "wire-version
-  fraud" — forgot-to-bump caught at runtime, not only in CI.
-- **`GetClusterIdReq/Resp` are FROZEN from R1 on** — they ARE the
-  negotiation channel (decoded before any compat decision can run); a
-  layout change would make the handshake unreachable for mixed versions.
-  Additions go in NEW msg_types.
-- `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII
-  decimal — readable across all future serialization eras): the
-  operator-bumped feature gate. `MSG_GET_CLUSTER_VERSION` (0x4A, fresh
-  etcd read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, exactly +1,
-  capped at the manager's WIRE_VERSION_MAX, value-CAS'd). Bump via
-  `autumn-op upgrade-version` ONLY after every member runs the new
-  binary; new wire forms / persisted formats versioned N gate on
-  cluster_version >= N. Rollback safety: every manager decode of the
-  persisted value refuses (fail-closed, blocks leadership via replay
-  error) when it exceeds the binary's own WIRE_VERSION_MAX.
+## WIRE fingerprint + wire-version interval
+
+`build.rs` hashes the wire-schema sources (`manager_rpc.rs`, `partition_rpc.rs`,
+`frame.rs`, `extent_rpc.rs`, `cap_token.rs`) into `WIRE_FINGERPRINT` (16-hex
+compile-time const). Deploys are same-commit (rkyv has no cross-version compat; a
+mixed deploy fails SILENTLY with garbage decodes). Hashing the schema source (not
+the commit) keeps dev flows sane: unrelated edits don't perturb it, any
+wire-struct edit does — even a comment.
+
+- **`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX`** (currently 27/27) declare the
+  interval this binary speaks. `wire_compat_check(remote_fp, remote_min,
+  remote_max)` accepts iff fingerprints are equal (same-build fast path) OR the
+  intervals overlap. A peer reporting `max == 0` (empty/pre-WIRE) is refused.
+- **`WIRE_VERSION_FINGERPRINTS`** pins each declared version to the fingerprint it
+  was declared against. The `registry_pins_current_schema_to_max_version` test
+  fails the test run whenever the schema changes without a version decision — this
+  is what makes interval overlap trustworthy. Bump rule: pre-R3 (rkyv has no
+  cross-version decode) bump `MAX` and set `MIN = MAX`; post-R3 keep `MIN = MAX-1`
+  (frozen V1 + explicit V2 msg_types, N↔N-1 window).
+- Runtime cross-check: a peer claiming a version in our registry with a DIFFERENT
+  fingerprint is refused as "wire-version fraud" — forgot-to-bump caught at
+  runtime, not just CI.
+- Exchange: the fingerprint + interval ride on `GetClusterIdResp` (filled by the
+  manager in `handle_get_cluster_id`), checked at every long-lived process's
+  startup (`ClusterClient::connect`, PS `finish_connect`). `GetClusterIdReq/Resp`
+  are FROZEN — they ARE the negotiation channel, decoded before any compat
+  decision; additions go in new msg_types. A SUCCESSFUL response failing the check
+  is a hard startup refusal; a TRANSPORT failure fetching it is best-effort
+  skipped (availability wins while the manager is briefly down — every subsequent
+  RPC fails loudly anyway).
+- `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal)
+  is the operator-bumped feature gate: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd
+  read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at
+  `WIRE_VERSION_MAX`, value-CAS'd). Bump via `autumn-op upgrade-version` only
+  after every member runs the new binary; new wire/persisted formats gate on
+  `cluster_version >= N`. Every manager decode of the persisted value fails closed
+  (blocks leadership) when it exceeds the binary's own `WIRE_VERSION_MAX`.
+
+## Notes
+
+- The 10-byte header eliminates HTTP/2 frame (9B) + gRPC envelope (5B) + HEADERS
+  frame (~50B+): ~58B overhead vs ~200B+ for gRPC.
+- `tokio::sync::{Mutex,mpsc,oneshot}` are runtime-agnostic futures — they work on
+  compio without a tokio Runtime.

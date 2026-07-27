@@ -1,6 +1,6 @@
 # autumn-rs Architecture Guide
 
-## 长任务执行规则 (inherited from monorepo 2026-04-21)
+## 长任务执行规则
 
 ### 项目目标
 1. 底层是 `stream layer`，负责分布式文件存储与恢复。
@@ -34,7 +34,7 @@
     - 执行测试验证
     - 更新 `docs/ops.md`（手动测试/运维步骤）；若用户可见的用法变化，同步更新 `README.md`
     - 提交 git commit，作为该 feature 的完成点
-11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不再堆放验证步骤（2026-07-02 重写）。
+11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不堆放验证步骤。
 12. 每个feature和BUG都用coco 做review, 但是coco有时候会提出纯理论过于窄或者trick的情况，
 13. 如果claude-progress.txt,feature-list太长, 定期清理删除, 保持整洁
 

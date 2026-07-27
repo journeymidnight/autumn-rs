@@ -5,11 +5,8 @@
 Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
 Consumers are Rust: the `examples/codebase-memory` app uses the crate directly
-(web UI + MCP) to index/search a codebase and walk its call graph. The former
-Python ergonomic layer + `autumn.Memory` PyO3 binding were dropped (2026-07-03)
-once all consumers went Rust; the `examples/memory-browser` app was dropped
-(2026-07-03, user directive — not intuitive). Design + rationale:
-`docs/autumn_memory_plan.md`.
+(web UI + MCP) to index/search a codebase and walk its call graph. Design +
+rationale: `docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
 — drive its async methods on a compio runtime.
@@ -42,7 +39,7 @@ style example `examples/codebase-memory` uses it.
 
 ## Lexical recall — BM25-on-KV (`recall.rs`, plan §7 词法腿)
 
-Posting-on-KV done directly (no brute-force MVP — user directive 2026-06-30):
+Posting-on-KV, done directly:
 
 - `idx/{term}/{doc_id}` = **existence marker** (empty value) → candidate
   discovery is a keys-only range scan.
@@ -68,14 +65,13 @@ rkyv, …); the core never imposes one.
 
 ## Key schema (`keys.rs`, plan §6)
 
-> **⚑ F-NS-PRINCIPAL-UNIFIED (Option 3, 2026-07-19):** the WIRE key is
-> `mem/{tenant}/{agent}/…` (NS-FIRST, no SDK tenant concept — `{tenant}` is now an
-> in-namespace sub-prefix the memory app owns). `MemoryStore::connect` uses
-> `ClusterClient::connect(mgr, "mem/{tenant}")`; `connect_with_credential` adds a
-> `principal` arg (credential owner, from the credential file). `keys.rs` is
-> UNCHANGED (emits keys RELATIVE to the binding, starting at `{agent}/…`). The
-> `mem/{tenant}/{agent}/…` forms below are the current wire order. Grant a memory
-> tenant with `principal-create --grant mem/{tenant}/`. See §8 of
+> **Wire key = `mem/{tenant}/{agent}/…`** (namespace-first; `{tenant}` is an
+> in-namespace sub-prefix the memory app owns, NOT an SDK tenant concept).
+> `MemoryStore::connect` uses `ClusterClient::connect(mgr, "mem/{tenant}")`;
+> `connect_with_credential` adds a `principal` arg (credential owner, from the
+> credential file). `keys.rs` emits keys RELATIVE to the binding (starting at
+> `{agent}/…`); the client prepends `mem/{tenant}/`. Grant a memory tenant with
+> `principal-create --grant mem/{tenant}/`. See §8 of
 > docs/key_namespace_split_design.md.
 
 ```text
@@ -110,14 +106,13 @@ in the consumer.
 ## Read-path semantics (plan §8.5 contract)
 
 - `range` returns **keys only** (server-side `value` is empty) → every list/
-  replay is a keys-scan + per-key point-get (the known two-hop; MVP uses
-  sequential `get`, a later iteration swaps `get_many_into`).
+  replay is a keys-scan + per-key point-get (the known two-hop).
 - Recall/list is **near-real-time / eventually consistent**, NOT a snapshot:
   `get_values` skips keys that vanished (deleted/expired) between the scan and
   the get. Main-record point-get is the correctness boundary.
 - **Vector leg**: `delete_memory` reaps BOTH legs — BM25 postings + `doc/{id}`,
   AND the IVF posting `ivf/{c}/{id}` via `delete_vector`, located in O(1) by the
-  reverse pointer `ivf_meta/vptr/{id} -> centroid` (F-MEM-4). `train_centroids`
+  reverse pointer `ivf_meta/vptr/{id} -> centroid`. `train_centroids`
   re-buckets every posting it scans WITHOUT checking doc existence, so it never
   reaps a deleted vector — the vptr reap is the only reaper. `index_vector`
   keeps exactly one IVF copy per id (reaps the old bucket on a move) and keeps
