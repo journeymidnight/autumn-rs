@@ -106,18 +106,52 @@ Calls: `call`, `call_vectored` (vectored, zero-copy), `call_timeout` /
 
 `call_into_dest(msg_type, payload, dest: *mut u8, dest_cap, reg:
 Option<&RegisteredMem>) -> DestMeta` reads the response value straight into
-`dest`, no intermediate Vec. Wire response = CRC-less frame with payload
-`[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1][value_len:4 LE]
-[reserved:4 LE]` (`ZC_META_LEN = 9`; reserved carries no value CRC — integrity is
-the transport's). `read_loop` dispatches two ways: **UCX** peeks the header,
-drains the buffered meta out of the `FrameDecoder`, then `recv_into(&mut
-dest[filled..], reg)` for the value (memh RDMA when `reg=Some`); **TCP/non-UCX**
-decodes then memcpys `payload[9..]` into dest. `call_into_pooled` is the sibling
-that recvs into a read_loop-owned `PooledBuf` and hands it back (on TCP, values ≥
-`TCP_RECV_INTO_POOLED_MIN_BYTES = 64 KiB`). No value CRC is verified on either
-path. All other msg_types use the untouched `Pending::Frame` path, keeping their
-frame CRC. `RegisteredMem`/`PooledBuf` re-export from autumn-transport
-(uninhabited/plain stubs on non-ucx, so `reg` is always `None`).
+`dest`, no intermediate Vec; `call_into_pooled` is the sibling that recvs into a
+read_loop-owned `PooledBuf` and hands it back. Wire response = CRC-less frame
+with payload `[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1]
+[value_len:4 LE][reserved:4 LE]` (`ZC_META_LEN = 9`; reserved carries no value
+CRC — integrity is the transport's). No value CRC is verified on either path.
+`RegisteredMem`/`PooledBuf` re-export from autumn-transport (uninhabited/plain
+stubs on non-ucx, so `reg` is always `None`).
+
+**read_loop dispatch (4-way)** — keyed on the req_id's `Pending` variant (which
+API the caller used), NEVER on msg_type (the rpc layer stays business-agnostic;
+msg_type↔API pairing is the caller's contract, enforced nowhere):
+
+```
+Pending::Frame (non-ZC call)
+  → try_decode whole frame (verify+strip frame CRC) → oneshot the Frame
+Pending::IntoDest / IntoPooled (ZC call)
+  ├─ UCX                → fast path: consume header+meta, drain buffered value
+  │                       prefix, recv_into(dest, reg) — memh RDMA when reg=Some
+  │                       (0 copies). Unconditional: recv-into is never worse
+  │                       than decode on UCX, any size.
+  └─ TCP
+     ├─ value ≥ 64 KiB  → fast path: drain buffered prefix into dest, then one
+     │  (TCP_RECV_INTO_   owned read — read_exact_into_raw (IntoDest) /
+     │   POOLED_MIN_      read_exact_into_pooled (IntoPooled). Only the
+     │   BYTES)           unavoidable kernel copy; no FrameDecoder accumulation.
+     └─ value < 64 KiB  → try_decode + finish_into_{dest,pooled}_from_frame
+                          (decode + one memcpy — a small value's whole frame is
+                          usually already buffered, so recv-into would only add
+                          a pool acquire + an extra syscall).
+```
+
+The TCP size gate lives at the RECEIVER, not the caller, because its input — the
+ACTUAL value_len — only exists once the response header arrives: an error /
+NotFound reply is a 0-length ZC frame regardless of what the caller expected,
+and `dest_cap` is only an upper bound. Intent vs execution: the client-side
+`zc_worthwhile` (autumn-client, ≥ 64 KiB on the EXPECTED size) picks which
+msg_type/API to use; the receiver picks the recv strategy from what actually
+arrived. The four 64 KiB gates are deliberately one value (see autumn-client
+CLAUDE.md "Zero-copy selection rule"):
+
+| Gate | Side | Input | Decides |
+|------|------|-------|---------|
+| `zc_worthwhile` (autumn-client) | client send | expected size | which msg_type/API (read + write intent) |
+| `TCP_RECV_INTO_POOLED_MIN_BYTES` (client.rs) | client recv | actual value_len | GET-ZC response recv strategy (this table) |
+| `AUTUMN_PS_ZC_RECV_MIN_BYTES` (partition-server) | PS recv | actual value_len | PUT_ZC request recv strategy (`drain_zc_writes`) |
+| `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 
 **Cancel-safety (mandatory):** the recv-into-`dest` runs in the long-lived
 `read_loop`, NOT the caller future. It is safe ONLY when `dest` outlives the call
@@ -133,7 +167,13 @@ rcache when registered; the frame CRC covers `[meta||value]`). Framing lives in
 `PUT_ZC_HEADER_LEN = 44` (part_id + region_epoch + expires_at + value_len +
 key_len) then the key; the PS slices the value zero-copy from the reassembled
 frame. Write ZC is send-side framing only; read ZC needs `call_into_dest` because
-the value must land in a specific caller dest.
+the value must land in a specific caller dest. Write-side selection is purely
+size-based and client-side (the sender KNOWS the exact value size): `put_many`
+routes items ≥ 64 KiB to per-op `MSG_PUT_ZC` and smaller ones into
+`MSG_BATCH_PUT` via `zc_worthwhile`; the bare `put_zc` API does not gate, so the
+wire legitimately carries any-size `MSG_PUT_ZC` — the PS recv side re-decides on
+the ACTUAL size (`drain_zc_writes` recv-into-pooled ≥
+`AUTUMN_PS_ZC_RECV_MIN_BYTES`, else the normal FrameDecoder path).
 
 ## shard_for_extent
 

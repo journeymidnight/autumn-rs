@@ -161,12 +161,18 @@ ONE source of truth** that perf-check, the python `BatchClient`, and `get_many_i
 call.
 
 **One symmetric rule — engage ZC iff `value_size >= UCX_ZC_READ_MIN_BYTES` (64 KiB), for
-BOTH reads and writes AND BOTH transports.** Mirrors the PS-side recv gates
-(`UCX_ZC_READ_MIN_BYTES` on the client + `AUTUMN_PS_ZC_RECV_MIN_BYTES` on the PS, both
-64 KiB). Below 64 KiB the per-op registered/pooled-recv machinery costs more than the copy
-it saves AND the PS recv side doesn't ZC anyway, so e2e ZC doesn't engage; at/above it ZC
-wins on both transports (UCX RDMA-into-dest / registered-send; TCP recv-into-dest dropping
-the rkyv wrap + owned-`Vec` alloc).
+BOTH reads and writes AND BOTH transports.** This is the INTENT gate (which msg_type/API
+to use, from the size the sender knows/expects); the two RECEIVERS re-decide their recv
+strategy on the ACTUAL size with the same 64 KiB — the client read_loop for GET-ZC
+responses (`TCP_RECV_INTO_POOLED_MIN_BYTES`), the PS ps-conn loop for PUT_ZC requests
+(`AUTUMN_PS_ZC_RECV_MIN_BYTES`) — because a reply/request can legitimately be smaller
+than the intent predicted (error/NotFound = 0-length value; bare `put_zc` doesn't gate).
+All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 KiB) are
+deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop
+dispatch (4-way)". Below 64 KiB the per-op registered/pooled-recv machinery costs more
+than the copy it saves AND the recv side doesn't ZC anyway, so e2e ZC doesn't engage;
+at/above it ZC wins on both transports (UCX RDMA-into-dest / registered-send; TCP
+recv-into-dest dropping the rkyv wrap + owned-`Vec` alloc).
 
 There is no `--zc` / `zc=` flag — call `zc_worthwhile(size)`. The const + helper live in
 `crates/client/src/lib.rs` so the CLI and the python extension share one source of truth.
