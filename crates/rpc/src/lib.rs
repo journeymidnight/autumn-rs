@@ -16,9 +16,10 @@ pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
 
-/// Re-exported so consumers of `RpcClient::call_into_dest(reg: Option<&RegisteredMem>)`
-/// don't need a direct autumn-transport dependency. (Uninhabited stub on
-/// non-ucx builds — `reg` is always `None` there.)
+/// Re-exported so consumers of the recv-into seam (`autumn_transport::
+/// ReadHalf::recv_into(reg: Option<&RegisteredMem>)`) don't need a direct
+/// autumn-transport dependency. (Uninhabited stub on non-ucx builds — `reg`
+/// is always `None` there.)
 pub use autumn_transport::RegisteredMem;
 /// Re-exported so `call_into_pooled` consumers (autumn-stream's StreamClient)
 /// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.

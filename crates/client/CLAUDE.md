@@ -59,13 +59,15 @@ Semantics / invariants:
 
 - `put(key, value, must_sync)` — write a key-value pair.
 - `get(key) → Option<Vec<u8>>` — read, `None` if not found.
-- `get_into(key, dest: &mut [u8]) → Option<usize>` — **zero-copy read.** Reads the value
-  straight into `dest` (no `Vec`) via `MSG_GET_ZC` + `RpcClient::call_into_dest`; returns
-  `Some(value_len)` or `None`. Caller sizes `dest` (e.g. from `head`). Same routing +
-  refresh + retry as `call_ps_for_key`. **No per-call timeout; `dest` MUST outlive the
-  call** — cancel-safety (autumn-rpc CLAUDE `call_into_dest`). No `reg` argument — the UCX
-  rcache handles registration (first call into a fresh address pays a one-time ~100 µs
-  `ibv_reg_mr` miss; the SAME address is free thereafter, zero-copy from the 2nd call on).
+- `get_into(key, dest: &mut [u8]) → Option<usize>` — **ZC read, one copy.** The value is
+  recv'd into a read_loop-owned RegPool buffer (`MSG_GET_ZC` +
+  `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool buffer; TCP ≥ 64 KiB
+  pays only the kernel copy) then copied ONCE into `dest`. Returns `Some(value_len)`
+  (`dest[..value_len.min(dest.len())]` filled; longer values TRUNCATED to fit — same
+  contract as `get_many_into`/`get_many_direct`) or `None`. Caller sizes `dest` (e.g. from
+  `head`). Same routing + refresh + retry as `call_ps_for_key`; **honors `rpc_timeout`**
+  (the pooled recv is cancel-safe; the recv-into-caller-dest primitive that forbade
+  timeouts was removed — autumn-rpc CLAUDE "Why pooled-only").
 - `put_zc(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy via
   `MSG_PUT_ZC` + `RpcClient::call_vectored` (value sent as its own iovec from `value`'s
   backing memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered —
@@ -106,13 +108,13 @@ ZC decisions go through `zc_worthwhile`. No `concurrency` arg — internal defau
   wouldn't engage).
 - `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **ZC batched
   read.** Use when values ≥ 64 KiB AND you have caller-owned dest buffers (sglang pages /
-  torch tensors — UCX RDMA into `dest` is true e2e zero-copy from the second call on).
-  Each `GetManyItem` = `{key, offset, length, dest}` — no `reg` field; UCX rcache handles
-  registration. Auto-routes: HOMOGENEOUS small whole-value batch (every item `offset==0`,
+  torch tensors). Each `GetManyItem` = `{key, offset, length, dest}`. The ZC recv lands
+  in a read_loop-owned RegPool buffer (UCX RDMAs into the registered slab; TCP owned
+  read), then ONE memcpy into `dest` — `dest` needs no registration and no special
+  lifetime. Auto-routes: HOMOGENEOUS small whole-value batch (every item `offset==0`,
   `length==0`, `dest.len() < 64 KiB`) → delegates to `get_many` + memcpy into each `dest`;
-  MIXED / range / large-ZC → per-op fan-out (`MSG_GET_ZC` into `dest` when `read_len ≥ 64
-  KiB`, else `MSG_GET` + memcpy). Result `i` matches `items[i]`. **Each `dest` MUST
-  outlive the call.**
+  MIXED / range / large-ZC → per-op fan-out (`MSG_GET_ZC` pooled recv when `read_len ≥ 64
+  KiB`, else `MSG_GET` + memcpy). Result `i` matches `items[i]`.
 - `get_many_direct(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **EN-DIRECT
   batch read.** Same dest shape as `get_many_into`, but each item with length ≥ 64 KiB is
   read STRAIGHT from an extent node (`MSG_GET_REDIRECT` descriptor →
@@ -124,11 +126,10 @@ ZC decisions go through `zc_worthwhile`. No `concurrency` arg — internal defau
   `BatchClient(direct=…)` / `autumn.Fs.connect(direct_read=…)` / kvcache / vLLM-loader),
   DEFAULT ON — safe because size-gated AND proxy fallback is authoritative. First fallback
   logs ONE `WARN` (`DIRECT_FALLBACK_WARNED`). Shares the replica-failover loop with
-  `get_direct` (`read_redirect_replicas`). The direct read lands in a read_loop pooled
-  buffer (`call_into_pooled`) then memcpys into `dest` — the pooled recv (not
-  `call_into_dest`) is DELIBERATE because the direct read carries a 3 s timeout + replica
-  failover that `call_into_dest`'s cancel-safety contract forbids. **Each `dest` MUST
-  outlive the call.**
+  `get_direct` (`read_redirect_replicas`). Same recv shape as the proxy path (pooled
+  recv + one memcpy into `dest`; cancel-safe → the size-scaled timeout + replica
+  failover are safe); the win over `get_many_into` is ROUTING (PS NIC egress leaves the
+  large-value data path), not copy count.
 - `delete_many(keys) → Vec<Result<()>>` / `head_many(keys) → Vec<Result<KeyMeta>>` —
   batched delete / metadata. Client-side fan-out (no server `MSG_BATCH_*`), no ZC (tiny).
   `delete_many` uses `BATCH_PUT_DEFAULT_CONCURRENCY`, `head_many` uses
@@ -171,8 +172,9 @@ All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 
 deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop
 dispatch (4-way)". Below 64 KiB the per-op registered/pooled-recv machinery costs more
 than the copy it saves AND the recv side doesn't ZC anyway, so e2e ZC doesn't engage;
-at/above it ZC wins on both transports (UCX RDMA-into-dest / registered-send; TCP
-recv-into-dest dropping the rkyv wrap + owned-`Vec` alloc).
+at/above it ZC wins on both transports (UCX RDMA into the registered pool slab /
+registered-send; TCP pooled recv dropping the rkyv wrap + FrameDecoder accumulation +
+owned-`Vec` alloc).
 
 There is no `--zc` / `zc=` flag — call `zc_worthwhile(size)`. The const + helper live in
 `crates/client/src/lib.rs` so the CLI and the python extension share one source of truth.

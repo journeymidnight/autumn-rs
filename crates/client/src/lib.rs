@@ -606,16 +606,14 @@ pub struct KeyMeta {
 
 /// One item for [`ClusterClient::get_many_into`]. `length == 0` reads the
 /// whole value; `offset`/`length` give a sub-range (fuse chunk reads, io_uring
-/// `sqe.offset`/`len`). `dest` is sized by the caller (e.g. from `head`, a fixed
-/// chunk size, or the ring-buffer slot) and MUST outlive the call.
+/// `sqe.offset`/`len`). `dest` is sized by the caller (e.g. from `head`, a
+/// fixed chunk size, or the ring-buffer slot); a value longer than `dest` is
+/// truncated to fit (the returned `Some(n)` carries the full value length).
 ///
-/// UCX RDMA into `dest` is automatic: the first read into a fresh address
-/// pays a one-time UCX rcache miss (~100 µs `ibv_reg_mr`); subsequent reads
-/// into the SAME address hit the rcache for free. Power users who want to
-/// pre-warm the rcache (skip the first-call cost on a hot path) can call
-/// `autumn_transport::register_memory` directly — the registration lands in
-/// the same rcache and the SDK finds it transparently. No SDK-API hook
-/// needed.
+/// The ZC recv lands in a read_loop-owned RegPool buffer (registered on UCX —
+/// RDMA off the wire; plain recycled buffer on TCP), then ONE memcpy into
+/// `dest`. `dest` itself needs no registration and no special lifetime — it
+/// is a plain borrow filled after the RPC resolves.
 pub struct GetManyItem<'a> {
     pub key: &'a [u8],
     pub offset: u32,
@@ -2513,7 +2511,7 @@ impl ClusterClient {
     ///   (`extent_id == 0`: the PS declined to redirect — small/non-VP after
     ///   resolution) is copied straight in; a descriptor drives
     ///   `read_redirect_replicas`; ALL-replica failure falls back to the proxy
-    ///   ZC path (`get_range_into`). `dest` MUST outlive the call.
+    ///   ZC path (`get_range_into`).
     async fn get_range_direct_into(
         &self,
         key: &[u8],
@@ -2586,18 +2584,14 @@ impl ClusterClient {
     ///
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
     /// (`dest[..min(n, dest.len())]` filled), `Ok(None)` = not found, `Err` =
-    /// that item's RPC failed. Each `dest` MUST outlive the call (same
-    /// cancel-safety contract as `get_into`). Concurrency is the shared
+    /// that item's RPC failed. Concurrency is the shared
     /// `BATCH_GET_DEFAULT_CONCURRENCY` sliding window (`fan_out_collect`).
     ///
-    /// The one extra copy vs `get_many_into`'s `MSG_GET_ZC` (which recvs
-    /// straight into `dest`): the direct EN read lands in a read_loop-owned
-    /// pooled buffer (`read_extent_value_direct`), then memcpys into `dest`.
-    /// The pooled recv (not recv-into-`dest`) is deliberate — the direct read
-    /// carries a 3 s timeout + replica failover, which `call_into_dest`'s
-    /// cancel-safety contract (no timeout; `dest` must outlive the recv)
-    /// forbids. The copy is the price of failover-safety on the bypass path;
-    /// the win is the PS NIC egress leaving the large-value data path
+    /// Same recv shape as the proxy path: the direct EN read lands in a
+    /// read_loop-owned pooled buffer (`read_extent_value_direct`,
+    /// cancel-safe → the size-scaled timeout + replica failover are safe),
+    /// then ONE memcpy into `dest`. The win over `get_many_into` is not copy
+    /// count but ROUTING: the PS NIC egress leaves the large-value data path
     /// (cross-host).
     pub async fn get_many_direct(
         &self,
@@ -2721,22 +2715,20 @@ impl ClusterClient {
         self.get_range_into(key, offset, length, dest).await
     }
 
-    /// Zero-copy GET: read a key's value straight into `dest` (no
-    /// intermediate Vec). Returns `Some(value_len)` (value written to
-    /// `dest[..value_len]`) or `None` if not found. `dest` must be at least the
-    /// value size.
+    /// ZC GET: read a key's value into `dest` with ONE copy. The value is
+    /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET_ZC` +
+    /// `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool
+    /// buffer; TCP ≥ 64 KiB pays only the kernel copy, no FrameDecoder
+    /// accumulation) and then copied once into `dest`. Returns
+    /// `Some(value_len)`; `dest[..value_len.min(dest.len())]` is filled —
+    /// `value_len > dest.len()` means the value was TRUNCATED to fit (the
+    /// same contract as `get_many_into` / `get_many_direct`). `None` = not
+    /// found.
     ///
-    /// On UCX, the first call into a fresh `dest` address pays a one-time
-    /// rcache miss (`~100 µs ibv_reg_mr`); subsequent calls into the SAME
-    /// address hit the rcache for free — so any pool / long-lived buffer is
-    /// effectively zero-copy from the second call onward. Power users who
-    /// want to skip the first-call cost on a hot path can call
-    /// `autumn_transport::register_memory` directly to pre-populate the
-    /// rcache; the SDK finds the registration transparently. On TCP the
-    /// kernel copy off the wire is the lower bound regardless.
-    ///
-    /// Uses `MSG_GET_ZC` + `RpcClient::call_into_dest`; same routing +
-    /// epoch-stale refresh + RPC retry shape as `call_ps_for_key`.
+    /// Honors `rpc_timeout` — the pooled recv is cancel-safe (a timed-out
+    /// call's buffer returns to the pool), so this is a bounded RPC like
+    /// every other SDK call. (The old recv-into-caller-dest primitive,
+    /// `call_into_dest`, forbade any per-call timeout and was removed.)
     pub async fn get_into(
         &self,
         key: &[u8],
@@ -2746,12 +2738,12 @@ impl ClusterClient {
     }
 
     /// Sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
-    /// (`length == 0` = whole value) straight into `dest` via `MSG_GET_ZC`.
-    /// `get_into(key, dest)` is exactly `get_range_into(key, 0, 0, dest)`.
-    /// Same routing + epoch-stale refresh + RPC retry shape as `call_ps_for_key`;
-    /// same cancel-safety contract (`dest` must outlive the call; no per-call
-    /// timeout). Used by `get_many_into` and by sub-range callers (fuse /
-    /// ioring) that route per key.
+    /// (`length == 0` = whole value) into `dest` via `MSG_GET_ZC` (pooled recv
+    /// + one copy, see [`get_into`]). `get_into(key, dest)` is exactly
+    /// `get_range_into(key, 0, 0, dest)`. Same routing + epoch-stale refresh +
+    /// RPC retry shape as `call_ps_for_key`; honors `rpc_timeout`. Used by
+    /// `get_many_into` and by sub-range callers (fuse / ioring) that route
+    /// per key.
     pub async fn get_range_into(
         &self,
         key: &[u8],
@@ -2777,18 +2769,30 @@ impl ClusterClient {
             });
             match self.get_ps_client(&ps_addr).await {
                 Ok(client) => {
-                    match client
-                        .call_into_dest(
-                            partition_rpc::MSG_GET_ZC,
-                            payload,
-                            dest.as_mut_ptr(),
-                            dest.len(),
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(meta) => match meta.code {
-                            partition_rpc::CODE_OK => return Ok(Some(meta.value_len)),
+                    // The value lands in a read_loop-owned PooledBuf, then ONE
+                    // memcpy into `dest`. Racing rpc_timeout is safe: on expiry
+                    // the dropped call's buffer returns to the pool via the
+                    // read_loop (cancel-safe, unlike the removed
+                    // call_into_dest).
+                    let call = client.call_into_pooled(partition_rpc::MSG_GET_ZC, payload);
+                    let outcome = match self.rpc_timeout.get() {
+                        None => call.await,
+                        Some(t) => match compio::time::timeout(t, call).await {
+                            Ok(r) => r,
+                            Err(_) => Err(autumn_rpc::RpcError::status(
+                                StatusCode::Unavailable,
+                                format!("MSG_GET_ZC timed out after {t:?}"),
+                            )),
+                        },
+                    };
+                    match outcome {
+                        Ok((pb, code)) => match code {
+                            partition_rpc::CODE_OK => {
+                                let value = pb.filled();
+                                let n = value.len().min(dest.len());
+                                dest[..n].copy_from_slice(&value[..n]);
+                                return Ok(Some(value.len()));
+                            }
                             partition_rpc::CODE_NOT_FOUND => return Ok(None),
                             // Epoch stale → fall through to refresh + retry.
                             partition_rpc::CODE_PRECONDITION
@@ -2798,9 +2802,31 @@ impl ClusterClient {
                             other => return Err(code_to_error(other, String::new())),
                         },
                         Err(e) => {
-                            // Drop the conn so the next attempt reconnects.
-                            self.ps_conns.borrow_mut().remove(&ps_addr);
-                            last_err = Some(e.to_string());
+                            // Frame-level error or transport failure. (An authz
+                            // denial now decodes properly — it used to be
+                            // misparsed as a ZC meta by the IntoDest path.)
+                            match rpc_status_to_error(e) {
+                                // TERMINAL — retrying can't grant access /
+                                // create the namespace (same classification as
+                                // call_ps_for_key).
+                                AutumnError::PermissionDenied(m) => {
+                                    return Err(AutumnError::PermissionDenied(m))
+                                }
+                                AutumnError::NamespaceUnknown(m) => {
+                                    return Err(AutumnError::NamespaceUnknown(m))
+                                }
+                                // Frame-level FailedPrecondition = stale-epoch
+                                // class → refresh + retry on a healthy conn.
+                                AutumnError::PreconditionFailed(m) => {
+                                    last_err = Some(m);
+                                }
+                                other => {
+                                    // Drop the conn so the next attempt
+                                    // reconnects.
+                                    self.ps_conns.borrow_mut().remove(&ps_addr);
+                                    last_err = Some(other.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -2825,12 +2851,12 @@ impl ClusterClient {
     /// connections, amortising per-call await latency + letting the writer_task
     /// batch syscalls. Per item the ZC decision is `zc_worthwhile(read_len)`
     /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
-    /// `get_range_into` (`MSG_GET_ZC`, recv straight into `dest`; RDMA on UCX with a
-    /// registered `reg`); else `get_range` (`MSG_GET`) + one copy into `dest`.
+    /// `get_range_into` (`MSG_GET_ZC`, pooled recv — UCX RDMAs into the
+    /// registered pool buffer — then one copy into `dest`); else `get_range`
+    /// (`MSG_GET`) + one copy into `dest`.
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
     /// (`dest[..n.min(dest.len())]` filled; `n > dest.len()` ⇒ truncated to fit),
     /// `Ok(None)` = not found, `Err` = that item's RPC failed (others still ran).
-    /// Each `dest` MUST outlive the call (same cancel-safety contract as `get_into`).
     pub async fn get_many_into(
         &self,
         items: &mut [GetManyItem<'_>],

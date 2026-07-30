@@ -39,11 +39,11 @@ offload bugs can let through and on-disk CRC cannot catch in transit. HW CRC32C
 
 **The one CRC-less frame** is the zero-copy value response, built by
 `Frame::encode_no_crc` (hand-built in production as `partition-server::ps_zc_head`
-/ `stream::zc_read_head`): `call_into_dest` / `call_into_pooled` recv the value
-straight into a caller dest and cannot strip a trailer, so it omits the CRC
-(`FLAG_CRC` unset) and relies on transport integrity (UCX NIC ICRC / TCP kernel
-checksum). The decoder's `FLAG_CRC` branch exists to handle this one shape — a ZC
-design constraint, not a legacy version.
+/ `stream::zc_read_head`): `call_into_pooled` recvs the value straight into a
+pool buffer and cannot strip a trailer, so it omits the CRC (`FLAG_CRC` unset)
+and relies on transport integrity (UCX NIC ICRC / TCP kernel checksum). The
+decoder's `FLAG_CRC` branch exists to handle this one shape — a ZC design
+constraint, not a legacy version.
 
 ## Modules
 
@@ -102,17 +102,17 @@ Calls: `call`, `call_vectored` (vectored, zero-copy), `call_timeout` /
   read_loop can dispatch. Pools treat `is_closed()` as evict-and-reconnect
   (`stream::conn_pool::get_client`).
 
-### Zero-copy receive-into-dest
+### Zero-copy receive-into-pooled
 
-`call_into_dest(msg_type, payload, dest: *mut u8, dest_cap, reg:
-Option<&RegisteredMem>) -> DestMeta` reads the response value straight into
-`dest`, no intermediate Vec; `call_into_pooled` is the sibling that recvs into a
-read_loop-owned `PooledBuf` and hands it back. Wire response = CRC-less frame
-with payload `[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1]
+`call_into_pooled(msg_type, payload) -> (PooledBuf, code)` recvs the response
+value straight into a read_loop-owned RegPool `PooledBuf` (registered on UCX,
+plain recycled buffer on TCP), no intermediate Vec. Wire response = CRC-less
+frame with payload `[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1]
 [value_len:4 LE][reserved:4 LE]` (`ZC_META_LEN = 9`; reserved carries no value
-CRC — integrity is the transport's). No value CRC is verified on either path.
+CRC — integrity is the transport's). No value CRC is verified.
 `RegisteredMem`/`PooledBuf` re-export from autumn-transport (uninhabited/plain
-stubs on non-ucx, so `reg` is always `None`).
+stubs on non-ucx). A recv-into-CALLER-dest sibling (`call_into_dest`) no longer
+exists — see "Why pooled-only" below.
 
 **read_loop dispatch (4-way)** — keyed on the req_id's `Pending` variant (which
 API the caller used), NEVER on msg_type (the rpc layer stays business-agnostic;
@@ -121,30 +121,35 @@ msg_type↔API pairing is the caller's contract, enforced nowhere):
 ```
 Pending::Frame (non-ZC call)
   → try_decode whole frame (verify+strip frame CRC) → oneshot the Frame
-Pending::IntoDest / IntoPooled (ZC call)
+Pending::IntoPooled (ZC call), response frame NOT FLAG_ERROR
   ├─ UCX                → fast path: consume header+meta, drain buffered value
-  │                       prefix, recv_into(dest, reg) — memh RDMA when reg=Some
-  │                       (0 copies). Unconditional: recv-into is never worse
-  │                       than decode on UCX, any size.
+  │                       prefix, regpool_acquire + recv_into(dest, reg) — memh
+  │                       RDMA when the slab is registered (0 copies).
+  │                       Unconditional: recv-into is never worse than decode
+  │                       on UCX, any size.
   └─ TCP
-     ├─ value ≥ 64 KiB  → fast path: drain buffered prefix into dest, then one
-     │  (TCP_RECV_INTO_   owned read — read_exact_into_raw (IntoDest) /
-     │   POOLED_MIN_      read_exact_into_pooled (IntoPooled). Only the
-     │   BYTES)           unavoidable kernel copy; no FrameDecoder accumulation.
-     └─ value < 64 KiB  → try_decode + finish_into_{dest,pooled}_from_frame
+     ├─ value ≥ 64 KiB  → fast path: drain buffered prefix into the PooledBuf,
+     │  (TCP_RECV_INTO_   then one owned read (read_exact_into_pooled). Only
+     │   POOLED_MIN_      the unavoidable kernel copy; no FrameDecoder
+     │   BYTES)           accumulation.
+     └─ value < 64 KiB  → try_decode + finish_into_pooled_from_frame
                           (decode + one memcpy — a small value's whole frame is
                           usually already buffered, so recv-into would only add
                           a pool acquire + an extra syscall).
+Pending::IntoPooled, response frame IS FLAG_ERROR
+  → excluded from the fast path by the peeked flags → try_decode → the
+    IntoPooled arm decodes the `[status_code][message]` envelope into
+    `RpcError::Status` (an authz PermissionDenied / mis-route NotFound reaches
+    the ZC caller typed, never misparsed as a ZC meta).
 ```
 
 The TCP size gate lives at the RECEIVER, not the caller, because its input — the
 ACTUAL value_len — only exists once the response header arrives: an error /
-NotFound reply is a 0-length ZC frame regardless of what the caller expected,
-and `dest_cap` is only an upper bound. Intent vs execution: the client-side
-`zc_worthwhile` (autumn-client, ≥ 64 KiB on the EXPECTED size) picks which
-msg_type/API to use; the receiver picks the recv strategy from what actually
-arrived. The four 64 KiB gates are deliberately one value (see autumn-client
-CLAUDE.md "Zero-copy selection rule"):
+NotFound reply is a 0-length ZC frame regardless of what the caller expected.
+Intent vs execution: the client-side `zc_worthwhile` (autumn-client, ≥ 64 KiB on
+the EXPECTED size) picks which msg_type/API to use; the receiver picks the recv
+strategy from what actually arrived. The four 64 KiB gates are deliberately one
+value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 
 | Gate | Side | Input | Decides |
 |------|------|-------|---------|
@@ -153,12 +158,18 @@ CLAUDE.md "Zero-copy selection rule"):
 | `AUTUMN_PS_ZC_RECV_MIN_BYTES` (partition-server) | PS recv | actual value_len | PUT_ZC request recv strategy (`drain_zc_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 
-**Cancel-safety (mandatory):** the recv-into-`dest` runs in the long-lived
-`read_loop`, NOT the caller future. It is safe ONLY when `dest` outlives the call
-and the call is not dropped mid-recv — so `call_into_dest` has no per-call
-timeout (`ClusterClient::get_into` satisfies this). Any path needing a
-timeout/failover uses `call_into_pooled` — the read_loop owns the buffer, so a
-caller-cancel just returns it to the pool, never a leak.
+**Why pooled-only (cancel-safety):** the recv runs in the long-lived
+`read_loop`, NOT the caller future, and the read_loop OWNS the `PooledBuf` — a
+caller-cancel/timeout just drops the buffer back to the pool, never a leak,
+never a NIC writing freed memory. The removed `call_into_dest` variant recv'd
+into a caller-owned `*mut u8`, which forced the inverse contract (dest outlives
+the call, NO per-call timeout ever) — making it the one SDK RPC that could hang
+unboundedly; its explicit `reg` was `None` at every production call site
+(implicit rcache registration), and the default-on EN-direct read path had
+already chosen pooled-recv + one memcpy deliberately. Callers needing the value
+at a specific address copy out of the returned `PooledBuf`
+(`ClusterClient::get_range_into` does exactly this, and now honors
+`rpc_timeout`).
 
 **Write counterpart (`MSG_PUT_ZC = 0x51`)** needs no new primitive: the client
 sends `[meta][value]` via `call_vectored` (value as its own iovec, zero-copy via
@@ -166,8 +177,9 @@ rcache when registered; the frame CRC covers `[meta||value]`). Framing lives in
 `partition_rpc`: `encode_put_zc_meta` / `parse_put_zc_meta`, fixed prefix
 `PUT_ZC_HEADER_LEN = 44` (part_id + region_epoch + expires_at + value_len +
 key_len) then the key; the PS slices the value zero-copy from the reassembled
-frame. Write ZC is send-side framing only; read ZC needs `call_into_dest` because
-the value must land in a specific caller dest. Write-side selection is purely
+frame. Write ZC is send-side framing only; read ZC needs the `call_into_pooled`
+recv primitive because the response value must land outside the FrameDecoder.
+Write-side selection is purely
 size-based and client-side (the sender KNOWS the exact value size): `put_many`
 routes items ≥ 64 KiB to per-op `MSG_PUT_ZC` and smaller ones into
 `MSG_BATCH_PUT` via `zc_worthwhile`; the bare `put_zc` API does not gate, so the

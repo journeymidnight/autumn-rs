@@ -1,3 +1,47 @@
+Date: 2026-07-29
+TaskStatus: not_completed
+Task scope: 用户拍板「删掉 call_into_dest，大 value 读统一走 pooled」（源于本会话的
+  F216 ZC 架构讨论）。代码 + 测试 + 文档全部完成；唯一缺口 = coco findbugs 没跑成
+  （Trae token 过期，GPT-5.5/GLM-5.1 都失败，需要用户交互式重新登录后补跑）→ 按
+  规则 5 记 not_completed。
+
+── 改了什么 ──
+1. rpc/client.rs: 删 call_into_dest / IntoDest / DestMeta / finish_into_dest_from_frame
+   + read_loop 的 IntoDest 两个分支。Pending 收缩为 Frame + IntoPooled。
+2. BUG 修复（顺带，删除暴露的）: FLAG_ERROR 帧此前会被 ZC 路径当 zc_meta 盲解析
+   （authz PermissionDenied → 客户端读到 code=7 + 垃圾 value）。现在 zc_fast_path 用
+   peek 到的 flags 排除错误帧，normal-path IntoPooled 分支 decode_status → 类型化
+   RpcError::Status。新增回归测试 call_into_pooled_error_frame_surfaces_status。
+3. transport/lib.rs: 删 read_exact_into_raw + RawDest（unsafe 面整体消失）。
+4. client/lib.rs: get_range_into 迁移 call_into_pooled + 一次 memcpy 进 dest。
+   语义变化 ①: **接入 rpc_timeout**（原 call_into_dest 契约禁止超时，是全 SDK 唯一
+   可无界挂起的 RPC；PS drop req_rx 类 hang 此前对 get_into 无解）。超时→Unavailable
+   →ConnectionError→退避重试，同 ps_call。
+   语义变化 ②: value > dest 从「报错+杀连接」改为**截断到 dest**、返回完整
+   value_len —— 与 get_many_into/get_many_direct 已文档化的契约对齐（此前 direct
+   fallback 到 proxy 时行为不一致）。
+   帧级错误分类同 call_ps_for_key: PermissionDenied/NamespaceUnknown 终态直返，
+   FailedPrecondition 刷新重试，其余丢连接重试。
+5. 权衡（有意为之）: UCX 端到端 0 拷贝的纸面故事 → 1 拷贝（pool→dest memcpy）。
+   理由: reg 参数生产恒 None（隐式 rcache）、register_memory 生产零调用、默认配置大
+   value 读早已走 get_many_direct 的 pooled+memcpy（代码注释原文 DELIBERATE）。要复活
+   0 拷贝的正确方向是 reg 必传 Some，而不是维持"参数留着没人传"的中间态。
+6. WIRE 零改动（msg_type/帧格式不变；刻意不碰 frame.rs/partition_rpc.rs 的过时注释，
+   免得指纹空 bump）。CLAUDE.md ×3 同步（rpc "Why pooled-only" + 4-way 表、client
+   get_into/get_many_* 条目、PS 端 0→1 拷贝说明）。
+
+── 验证 ──
+rpc 52（含新回归测试）/ client --lib 40 / transport 全绿；cargo check --workspace 绿
+（唯一 warning 是 autumn-op 一处 pre-existing unused_mut，与本批无关）；
+manager system_putstream f235_get_many_into_mixed_sizes（--ignored，真集群）绿。
+regpool_acquire(0) 边界核过（size_class(0)→MIN_CLASS，无 panic）。
+
+Next steps: ① 用户重新 coco 登录后补跑 /coco-review findbugs（评本 commit）；
+② 遗留观察项: ucx feature + TCP transport 组合下 regpool 仍会 ucp_mem_map（编译期
+门控看不见运行时 transport），VKE 的 TCP 部署若带 ucx feature 编译则白付 memlock —
+确认部署 feature 配置，必要时立条目。
+
+============================ prior task history ============================
 Date: 2026-07-22
 TaskStatus: completed
 Task scope: 用户对 lane 设计的两点修正（"多条 lane 一定有，但不一定做了 split" +

@@ -469,8 +469,9 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
 
 ### UCX end-to-end zero-copy read (`MSG_GET_ZC`)
 
-The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value lands in its
-registered dest with no intermediate copies across `EN → PS → client`. The seam is
+The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value crosses
+`EN → PS → client` with no FrameDecoder/encode copies (the client lands it in a
+registered pool buffer, then one memcpy into the caller's dest). The seam is
 `resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
 `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
@@ -490,12 +491,15 @@ registered dest with no intermediate copies across `EN → PS → client`. The s
   type is `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
   `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with no
   concat copy. On-the-wire bytes are identical to the concatenated form, so the
-  client read path (`call_into_dest` / `call_into_pooled`) is unchanged.
+  client read path (`call_into_pooled`) is unchanged.
 
 `handle_get` (rkyv `GetResp`, generic SDK) copies the value once (the rkyv encode
-copies regardless). Net read-path value copies: VP-over-UCX `get_into` = **0**.
-Cancel-safety of the registered recv lives in the read_loop that OWNS the `PooledBuf`
-(returns it to the pool on cancel).
+copies regardless). Net read-path value copies: VP-over-UCX `get_into` = **1**
+(the client-side pool→dest memcpy; the PS/EN hops stay 0-copy — the
+recv-into-caller-dest primitive that made it 0 was removed for cancel-safety +
+timeout-ability, see autumn-rpc CLAUDE "Why pooled-only"). Cancel-safety of the
+registered recv lives in the read_loop that OWNS the `PooledBuf` (returns it to
+the pool on cancel).
 
 ### PS write-recv zero-copy (`MSG_PUT_ZC`, large values)
 

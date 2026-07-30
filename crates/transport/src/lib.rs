@@ -46,9 +46,9 @@ pub use ucx::UcxTransport;
 pub use ucx::{register_memory, RegisteredMem};
 
 /// Placeholder when built without the `ucx` feature — never constructed (TCP
-/// has no memory registration). Lets autumn-rpc's
-/// `call_into_dest(reg: Option<&RegisteredMem>)` and the recv-into-dest seam
-/// compile uniformly across features; `reg` is always `None` on TCP-only builds.
+/// has no memory registration). Lets the recv-into seam
+/// (`ReadHalf::recv_into(reg: Option<&RegisteredMem>)`) compile uniformly
+/// across features; `reg` is always `None` on TCP-only builds.
 #[cfg(not(feature = "ucx"))]
 pub enum RegisteredMem {}
 
@@ -395,8 +395,8 @@ impl Listener {
 
 impl ReadHalf {
     /// True for the UCX variant. The autumn-rpc read_loop uses this to choose
-    /// the recv-into-registered-dest path (UCX) vs decode+memcpy (TCP) for
-    /// `call_into_dest`.
+    /// the recv-into-registered-buffer path (UCX) vs owned-read/decode+memcpy
+    /// (TCP) for `call_into_pooled`.
     pub fn is_ucx(&self) -> bool {
         #[cfg(feature = "ucx")]
         {
@@ -419,37 +419,6 @@ impl compio::io::AsyncRead for ReadHalf {
     }
 }
 
-/// F219 — a `'static` owned compio buffer over caller-owned raw memory, so a
-/// compio TCP read can land bytes straight into a `*mut u8` dest (the client
-/// `call_into_dest` recv-into-dest path). The bytes are treated as already
-/// initialized (the recv overwrites them); `set_len` is a no-op (fixed region).
-/// SAFETY is the caller's: `ptr[0..len]` valid for writes + outlives every op
-/// built from this buffer (see `ReadHalf::read_exact_into_raw`).
-struct RawDest {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl compio::buf::IoBuf for RawDest {
-    fn as_init(&self) -> &[u8] {
-        // SAFETY: caller guarantees ptr[0..len] is a valid, live region.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl compio::buf::SetLen for RawDest {
-    unsafe fn set_len(&mut self, _len: usize) {}
-}
-
-impl compio::buf::IoBufMut for RawDest {
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
-        // SAFETY: same contract; u8 and MaybeUninit<u8> share layout.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.ptr as *mut std::mem::MaybeUninit<u8>, self.len)
-        }
-    }
-}
-
 impl ReadHalf {
     /// F216 zero-copy recv into a pre-registered buffer (UCX only). Single
     /// recv (may be partial). See `UcxReadHalf::recv_registered`.
@@ -468,12 +437,13 @@ impl ReadHalf {
         }
     }
 
-    /// F216 recv-into-dest seam. `Some(reg)` → zero-copy receive via memh;
+    /// F216 recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
     /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
     /// Single recv (may be partial); caller loops for read_exact semantics.
-    /// TCP errors — the autumn-rpc read_loop handles TCP recv-into-dest via the
-    /// normal decode + memcpy path, never this seam. Defined for all builds so
-    /// autumn-rpc compiles uniformly; on TCP-only builds it always errors.
+    /// TCP errors — the autumn-rpc read_loop handles TCP ZC recvs via
+    /// `read_exact_into_pooled` / the normal decode + memcpy path, never this
+    /// seam. Defined for all builds so autumn-rpc compiles uniformly; on
+    /// TCP-only builds it always errors.
     pub async fn recv_into(
         &mut self,
         buf: &mut [u8],
@@ -537,49 +507,6 @@ impl ReadHalf {
         Ok(slice.into_inner())
     }
 
-    /// F219 — TCP recv the remaining `[filled..target]` bytes of a value straight
-    /// into CALLER-OWNED memory at `ptr` (a `*mut u8` dest, e.g. an sglang page
-    /// or a regpool buffer the SDK holds). The recv-into-dest counterpart of
-    /// `call_into_dest` (client←PS read): the value lands in the caller's buffer
-    /// with no intermediate copy beyond the unavoidable kernel→userspace one.
-    ///
-    /// UCX errors (callers gate on `!is_ucx()` and use `recv_into` there).
-    ///
-    /// # Safety
-    /// Caller contract — identical to the UCX `call_into_dest` path:
-    /// `ptr[0..target]` must be valid for writes AND outlive this future. Unlike
-    /// `read_exact_into_pooled`, the in-flight read writes into memory the
-    /// read_loop does NOT own, so cancel-safety relies on the caller never
-    /// dropping the call mid-recv — `call_into_dest` guarantees this by having no
-    /// per-call timeout and requiring `dest` to outlive the call. (compio retains
-    /// the `RawDest` ptr-wrapper on cancel, but that does not keep the pointed-to
-    /// memory alive — so a caller that frees `dest` mid-recv would UAF, exactly as
-    /// the UCX `recv_into(&mut dest[..])` path would.)
-    pub async unsafe fn read_exact_into_raw(
-        &mut self,
-        ptr: *mut u8,
-        filled: usize,
-        target: usize,
-    ) -> io::Result<()> {
-        debug_assert!(filled <= target);
-        if self.is_ucx() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "read_exact_into_raw is TCP-only; UCX uses recv_into",
-            ));
-        }
-        if filled >= target {
-            return Ok(());
-        }
-        use compio::buf::IoBuf;
-        use compio::io::AsyncReadExt;
-        // RawDest is a 'static owned IoBufMut over the caller's memory; slicing
-        // [filled..target] makes read_exact fill ptr[filled..target].
-        let raw = RawDest { ptr, len: target };
-        let slice = raw.slice(filled..target);
-        let compio::BufResult(r, _slice) = self.read_exact(slice).await;
-        r
-    }
 }
 
 impl compio::io::AsyncWrite for WriteHalf {
