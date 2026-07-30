@@ -273,7 +273,7 @@ class _AutumnKVStore:
                 transport = "tcp"
         default_cap = 16 if transport == "ucx" else 64
         cap = int(max_inflight) if max_inflight else default_cap
-        # Hot-path: GIL-releasing batched client (ZC on UCX for large pages).
+        # Hot-path: GIL-releasing batched client (bulk on UCX for large pages).
         # F-DIRECT-MANY: direct_read (default ON) sends ≥64 KiB KV-page gets
         # STRAIGHT to an EN (bypassing the PS); <64 KiB pages stay on the proxy
         # (size-gated per item), and any direct-read failure falls back to the
@@ -760,7 +760,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             if _slot_len(rm.slot_mapping) == 0:
                 continue
             # Build one staging buffer per layer, then fetch ALL layers in ONE
-            # batched zero-copy get (`load_layers` → BatchClient.get_into, ZC on
+            # batched zero-copy get (`load_layers` → BatchClient.get_into, bulk on
             # UCX, fans across workers) — was 64 separate round trips per request.
             layer_names = list(self._kv_caches.keys())
             templates = []

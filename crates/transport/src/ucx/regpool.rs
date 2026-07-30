@@ -388,7 +388,7 @@ impl Drop for PooledBuf {
         let Some(slab) = self.slab.take() else { return };
         // F219: on **non-ucx** builds every slab is unregistered (there's no NIC
         // to register against), so they MUST be re-pooled — otherwise TCP
-        // recv-into-pooled (`read_value_into_pooled` / `drain_zc_writes`) does a
+        // recv-into-pooled (`read_value_into_pooled` / `drain_bulk_writes`) does a
         // fresh `vec![0u8; class]` (malloc + zero the whole slab) and free on
         // EVERY op, which is strictly worse than the regular reused-BytesMut
         // path (measured: 8 MiB TCP write 3× slower before this fix).

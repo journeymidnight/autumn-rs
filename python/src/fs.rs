@@ -409,7 +409,7 @@ impl Fs {
         Ok(PyBytes::new(py, &v).into_any().unbind())
     }
 
-    /// F-MODEL-ZC-LOAD: zero-copy read into a caller buffer. `buf` is a writable,
+    /// F-MODEL-bulk-LOAD: zero-copy read into a caller buffer. `buf` is a writable,
     /// C-contiguous Python buffer-protocol object (e.g. a CUDA-pinned host tensor
     /// `torch.empty(n, dtype=torch.uint8, pin_memory=True)`); the extent data is
     /// written STRAIGHT into it — no intermediate `bytes` — so a model loader can

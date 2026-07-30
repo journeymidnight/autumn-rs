@@ -99,7 +99,7 @@ pub struct FsState {
 
     /// F-DIRECT-MANY — when true, whole-extent reads (≥ 64 KiB) bypass the PS
     /// and read straight from an extent node (`get_many_direct`); otherwise the
-    /// PS-proxied ZC path (`get_many_into`). Topology-dependent (needs the fuse
+    /// PS-proxied bulk path (`get_many_into`). Topology-dependent (needs the fuse
     /// host to reach EN data ports), so DEFAULT FALSE — the fuse binary flips it
     /// from `--direct-read`; the PyO3 binding leaves it false. Threaded into
     /// each `ReadPlan` at `prepare` time so the spawned `read::execute` task

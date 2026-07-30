@@ -298,7 +298,7 @@ detect_cpu_count() {
 #   - Linux with taskset: nproc honors the cpuset, so the gate triggers
 #     correctly under restricted cgroups.
 # Heuristic: need REPLICAS*SHARDS cores for EN side + 2*PS_PARTS_HINT for
-# PS (P-log + P-bulk per partition). PS_PARTS_HINT defaults to 8 (matches
+# PS (P-log + P-sst per partition). PS_PARTS_HINT defaults to 8 (matches
 # perf_check.sh default partition count); override via
 # AUTUMN_PS_PARTS_HINT for clusters with more partitions.
 compute_affinity_decision() {
@@ -427,7 +427,7 @@ launch_ps() {
     # F196 even-distribution layout (single-host, multi-process cluster):
     #   EN i ∈ [1..REPLICAS]  → cores [(i-1)*SHARDS .. i*SHARDS-1]
     #   PS                    → cores [REPLICAS*SHARDS .. REPLICAS*SHARDS + 2*PS_PARTS_HINT - 1]
-    # Each PS partition reserves 2 cores (P-log + P-bulk). PS_PARTS_HINT
+    # Each PS partition reserves 2 cores (P-log + P-sst). PS_PARTS_HINT
     # (defaults to 8, matches perf_check.sh) sets how many partitions
     # this PS has room for. compute_affinity_decision() guarantees
     # AFFINITY_ENABLED=1 only when total cores >= REPLICAS*SHARDS +
@@ -463,8 +463,8 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_FLUSH_INFLIGHT_CAP:-}" ]]; then
         tunable_args+=(--flush-inflight-cap "$AUTUMN_PS_FLUSH_INFLIGHT_CAP")
     fi
-    if [[ -n "${AUTUMN_PS_BULK_INFLIGHT_CAP:-}" ]]; then
-        tunable_args+=(--ps-bulk-inflight-cap "$AUTUMN_PS_BULK_INFLIGHT_CAP")
+    if [[ -n "${AUTUMN_PS_SST_INFLIGHT_CAP:-}" ]]; then
+        tunable_args+=(--ps-bulk-inflight-cap "$AUTUMN_PS_SST_INFLIGHT_CAP")
     fi
     if [[ -n "${AUTUMN_PS_MAX_IMM_DEPTH:-}" ]]; then
         tunable_args+=(--max-imm-depth "$AUTUMN_PS_MAX_IMM_DEPTH")
@@ -868,7 +868,7 @@ do_start() {
 
     # F221: auto-size the PS partition budget from the presplit count when the
     # operator didn't set AUTUMN_PS_PARTS_HINT. Each partition needs 2 PS cores
-    # (P-log + P-bulk); the PS refuses partitions past cpuset_len/2, and
+    # (P-log + P-sst); the PS refuses partitions past cpuset_len/2, and
     # cluster.sh sizes the PS cpuset from AUTUMN_PS_PARTS_HINT (default 8). So
     # presplitting >8 partitions without bumping the hint silently strands the
     # surplus ("F196: core budget exhausted"). Raise the hint to the presplit

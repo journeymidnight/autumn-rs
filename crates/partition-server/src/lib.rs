@@ -72,11 +72,11 @@ const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
 
 static MAX_WRITE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_BULK_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_SST_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// F197 — parallel-flush drain cap on P-log side. Sets how many imm
 /// entries `background_flush_loop` can have in flight concurrently
 /// (each doing build SST + upload row_stream + await response from
-/// P-bulk). Commit (`tables.push` + `meta_stream` save) is still
+/// P-sst). Commit (`tables.push` + `meta_stream` save) is still
 /// strictly serial in launch order via `FuturesOrdered`.
 static PS_FLUSH_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -124,8 +124,8 @@ pub fn set_max_write_batch(n: usize) -> bool {
 pub fn set_ps_inflight_cap(n: usize) -> bool {
     PS_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
 }
-pub fn set_ps_bulk_inflight_cap(n: usize) -> bool {
-    PS_BULK_INFLIGHT_CAP_CELL.set(n.clamp(1, 16)).is_ok()
+pub fn set_ps_sst_inflight_cap(n: usize) -> bool {
+    PS_SST_INFLIGHT_CAP_CELL.set(n.clamp(1, 16)).is_ok()
 }
 /// F197: max concurrent in-flight imm flushes (parallel drain).
 /// Range [1, 64]; default = MAX_IMM_DEPTH so the imm queue can fully
@@ -292,12 +292,12 @@ pub(crate) fn ps_inflight_cap() -> usize {
     *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
 }
 
-/// R4 4.4 — maximum number of P-bulk (flush) in-flight SST uploads per
+/// R4 4.4 — maximum number of P-sst (flush) in-flight SST uploads per
 /// partition. Each in-flight request holds a full 128 MB SSTable buffer
 /// (peak), so this cap is deliberately small. Default = 2 lets the next
 /// flush start its `build_sst_bytes` while the previous one's 128 MB
 /// `row_stream.append` is streaming. Range clamped to [1, 16]. F195:
-/// overridable via `set_ps_bulk_inflight_cap`.
+/// overridable via `set_ps_sst_inflight_cap`.
 ///
 /// F197 (2026-05-13): `background_flush_loop` is now structurally
 /// parallel via `FuturesOrdered` and `ps_flush_inflight_cap()`. The
@@ -306,10 +306,10 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// — EN-side row_stream fsync is the wall, not P-log concurrency.
 /// Operators opting in to parallel flush via
 /// `--flush-inflight-cap N` should bump this knob to match so the
-/// P-bulk `FuturesUnordered` doesn't head-of-line block.
+/// P-sst `FuturesUnordered` doesn't head-of-line block.
 /// Default returns to 2 (the long-standing R4 4.4 value).
-pub(crate) fn ps_bulk_inflight_cap() -> usize {
-    *PS_BULK_INFLIGHT_CAP_CELL.get_or_init(|| 2)
+pub(crate) fn ps_sst_inflight_cap() -> usize {
+    *PS_SST_INFLIGHT_CAP_CELL.get_or_init(|| 2)
 }
 
 /// F197 — parallel imm-flush drain cap on the P-log side.
@@ -396,8 +396,8 @@ pub(crate) fn shutdown_timeout_ms() -> u64 {
 const OPEN_PARALLELISM: usize = 64;
 
 // CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
-// owned by a partition (P-log `part-{id}` and P-bulk `part-{id}-bulk`)
-// pin to the SAME core — P-bulk is mostly idle during P-log's busy
+// owned by a partition (P-log `part-{id}` and P-sst `part-{id}-sst`)
+// pin to the SAME core — P-sst is mostly idle during P-log's busy
 // windows (its work is syscall + 3-replica network wait on a 128 MB SST
 // upload), so sharing a core is fine and keeps "one partition = one core".
 
@@ -576,15 +576,15 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 // `put_stream_begin` (client-side striping).
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 
-/// F216-E (PS write-recv ZC, W1): minimum `MSG_PUT_ZC` value size for which the
+/// F216-E (PS write-recv bulk, W1): minimum `MSG_PUT_BULK` value size for which the
 /// ps-conn recvs the value straight into a registered `PooledBuf` (UCX RDMA, no
 /// off-wire copy) instead of letting the `FrameDecoder` accumulate it. Below
 /// this the per-op recv-into-registered overhead (regpool_acquire + memh +
 /// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
-/// `UCX_ZC_READ_MIN_BYTES`. Consulted on BOTH transports (F219): UCX recvs into a
+/// `BULK_MIN_BYTES`. Consulted on BOTH transports (F219): UCX recvs into a
 /// registered buffer, TCP into a pooled buffer via a compio owned read; below
 /// this both keep the proven FrameDecoder path. 64 KiB matches the read threshold.
-pub(crate) const AUTUMN_PS_ZC_RECV_MIN_BYTES: usize = 64 * 1024;
+pub(crate) const AUTUMN_PS_BULK_RECV_MIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
@@ -872,10 +872,10 @@ pub(crate) struct PartitionData {
     durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// F088: sender to the per-partition bulk thread. Always present —
-    /// `open_partition` returns Err if P-bulk fails to spawn, so the
+    /// `open_partition` returns Err if P-sst fails to spawn, so the
     /// partition is never half-opened with no flush channel.
     flush_req_tx: mpsc::Sender<FlushReq>,
-    /// Channel for compaction to route row_stream appends through P-bulk's
+    /// Channel for compaction to route row_stream appends through P-sst's
     /// StreamClient, preventing dual-writer truncation corruption.
     /// Always present (see `flush_req_tx`).
     row_append_tx: mpsc::Sender<RowAppendReq>,
@@ -883,9 +883,9 @@ pub(crate) struct PartitionData {
     /// doc for the full ordering inside `handle_split_part`. Briefly: the
     /// barrier is sent AFTER `commit_length` capture but BEFORE
     /// `multi_modify_split` (so any barrier failure can cleanly abort
-    /// without leaving manager state half-committed). P-bulk drains its
+    /// without leaving manager state half-committed). P-sst drains its
     /// in-flight FuturesUnordered to zero before calling
-    /// `bulk_sc.invalidate_stream(row_stream_id)`, then ACKs; split
+    /// `sst_sc.invalidate_stream(row_stream_id)`, then ACKs; split
     /// proceeds with the seal once the ACK lands.
     row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>,
     /// F120-A: signaled (one item per pop) by `flush_one_imm` after every
@@ -1473,12 +1473,12 @@ pub(crate) struct GcAutoParams {
 }
 
 // ---------------------------------------------------------------------------
-// Flush channel types (P-log → P-bulk)
+// Flush channel types (P-log → P-sst)
 // ---------------------------------------------------------------------------
 //
 // F088: background_flush_loop on the P-log thread no longer runs
 // build_sst_bytes + row_stream.append itself. Instead it ships a FlushReq
-// over to a dedicated P-bulk OS thread (its own compio runtime + io_uring +
+// over to a dedicated P-sst OS thread (its own compio runtime + io_uring +
 // ConnPool), which does the heavy lifting and replies with the new TableMeta
 // + SstReader. P-log then atomically pushes the new table/reader, pops imm,
 // and publishes the authoritative metaStream checkpoint from its single-
@@ -1503,7 +1503,7 @@ pub(crate) struct RowAppendReq {
     pub(crate) resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
 }
 
-/// F255 — synchronous P-log → P-bulk barrier. Sent by `handle_split_part`
+/// F255 — synchronous P-log → P-sst barrier. Sent by `handle_split_part`
 /// in this strict order inside split's freeze-drain critical section:
 /// (a) drain ACK received → (b) capture commit_length of log/row/meta →
 /// **(c) send THIS barrier + await ACK** → (d) `multi_modify_split` →
@@ -1518,29 +1518,29 @@ pub(crate) struct RowAppendReq {
 /// committed + local state not converged + freeze about to be cleared
 /// (coco /findbugs v2 finding, 2026-06-02).
 ///
-/// P-bulk's `flush_worker_loop`, on receiving the barrier:
+/// P-sst's `flush_worker_loop`, on receiving the barrier:
 ///   (1) drains its in-flight `FuturesUnordered` to ZERO (waits for every
 ///       concurrent FlushReq / RowAppendReq to land or fail),
-///   (2) calls `bulk_sc.invalidate_stream(row_stream_id)` so the per-
+///   (2) calls `sst_sc.invalidate_stream(row_stream_id)` so the per-
 ///       stream worker's cached tail is discarded,
 ///   (3) signals `resp_tx`.
-/// By the time the manager seals the tail in step (d), bulk_sc has no
-/// in-flight ops AND no cached worker; the next P-bulk op (only
+/// By the time the manager seals the tail in step (d), sst_sc has no
+/// in-flight ops AND no cached worker; the next P-sst op (only
 /// possible after the gates release in step g) re-fetches a fresh tail
 /// from the manager, which by then carries the post-seal extent.
 ///
 /// Pre-F255 this was a lazy `Cell<bool>` flag on `PartitionData` that the
-/// next P-bulk message piggybacked. The lazy form had a window where a
+/// next P-sst message piggybacked. The lazy form had a window where a
 /// FlushReq with `invalidate=false` (flag already taken by a queued
-/// RowAppendReq) could enter P-bulk's cap=2 FuturesUnordered ALONGSIDE
+/// RowAppendReq) could enter P-sst's cap=2 FuturesUnordered ALONGSIDE
 /// the invalidating RowAppendReq and race to `append_bytes` on the stale
 /// per-stream worker (coco /arch GPT-5.5 audit). The barrier closes the
 /// race structurally — no concurrent append can be in-flight when the
 /// invalidate runs.
 pub(crate) struct RowInvalidateBarrierReq {
     pub(crate) row_stream_id: u64,
-    /// F-FENCE-DRAIN: when true, after draining inflight P-bulk to zero the
-    /// worker SEALS + ROLLS the row_stream tail (`bulk_sc.seal_and_roll_tail`,
+    /// F-FENCE-DRAIN: when true, after draining inflight P-sst to zero the
+    /// worker SEALS + ROLLS the row_stream tail (`sst_sc.seal_and_roll_tail`,
     /// which invalidates internally) instead of only invalidating the cache.
     /// Used by MSG_ROLL_TAILS to drain a row tail off a fenced node. Split
     /// (F255) passes `false` — it only needs the invalidate before the manager
@@ -1867,14 +1867,14 @@ pub struct PartitionRequest {
     msg_type: u8,
     payload: Bytes,
     resp_tx: oneshot::Sender<HandlerResult>,
-    /// F216-E (PS write-recv ZC, W1): for a LARGE `MSG_PUT_ZC`, the ps-conn
+    /// F216-E (PS write-recv bulk, W1): for a LARGE `MSG_PUT_BULK`, the ps-conn
     /// recvs the value straight into a registered `PooledBuf` (no off-wire
     /// copy) and carries it here as a `Bytes` aliasing that buffer; `payload`
-    /// then holds only `[meta][key]`. `enqueue_put_zc` uses this directly
+    /// then holds only `[meta][key]`. `enqueue_put_bulk` uses this directly
     /// instead of slicing the value out of `payload` (which would require
     /// concatenating it back in — the copy we're avoiding). `None` for every
     /// other request (the value, if any, is sliced from `payload` as before).
-    zc_value: Option<Bytes>,
+    bulk_value: Option<Bytes>,
 }
 
 /// Handle to a running partition thread.
@@ -2428,7 +2428,7 @@ impl ConcurrencyController {
 /// F196: ScyllaDB-style static partition budget.
 ///
 /// When the operator passes `--cpuset` to the PS binary, each partition
-/// reserves 2 cores (P-log + P-bulk), so the budget is `cpuset_len / 2`.
+/// reserves 2 cores (P-log + P-sst), so the budget is `cpuset_len / 2`.
 /// `sync_regions_once` bumps `current` on insert and dec on remove;
 /// `handle_split_part` refuses to call `multi_modify_split` when adding
 /// one more partition would exceed `max`.
@@ -2481,7 +2481,7 @@ impl PartitionBudget {
 ///
 /// - When `--cpuset` was supplied explicitly (`cpuset_explicit() == true`),
 ///   the cap is `cpuset_len / 2` because each partition reserves 2 OS
-///   threads (P-log + P-bulk). Floored at 1 so a single-core cpuset
+///   threads (P-log + P-sst). Floored at 1 so a single-core cpuset
 ///   still permits one partition.
 /// - Otherwise the cap is `usize::MAX` (gate off — pre-F196 behaviour).
 pub(crate) fn compute_partition_budget_cap() -> usize {
@@ -2492,7 +2492,7 @@ pub(crate) fn compute_partition_budget_cap() -> usize {
         if cap == 0 {
             tracing::warn!(
                 cpuset_len = n,
-                "F196: --cpuset has < 2 cores; PS partition budget set to 1 (no headroom for P-bulk pinning)"
+                "F196: --cpuset has < 2 cores; PS partition budget set to 1 (no headroom for P-sst pinning)"
             );
             1
         } else {
@@ -3958,10 +3958,10 @@ impl PartitionServer {
             committed: false,
         };
         // ord is 1-based; cpu pool indexing is 0-based. F122-fix: P-log and
-        // P-bulk now pin to different cores — at sustained 4 KB write loads
-        // P-bulk's `build_sst_bytes` is CPU-heavy enough to fight P-log for
+        // P-sst now pin to different cores — at sustained 4 KB write loads
+        // P-sst's `build_sst_bytes` is CPU-heavy enough to fight P-log for
         // cycles when they share. Layout: partition i takes cores
-        // [cpu_offset + 2i, cpu_offset + 2i+1] (P-log, P-bulk).
+        // [cpu_offset + 2i, cpu_offset + 2i+1] (P-log, P-sst).
         let ord_zero = (ord as usize).saturating_sub(1);
         let cpu_log = pick_cpu_for_ord(2 * ord_zero);
         let cpu_bulk = pick_cpu_for_ord(2 * ord_zero + 1);
@@ -4237,7 +4237,7 @@ impl PartitionServer {
     // F099-K thread model:
     //   - 1 main compio thread: control plane only (heartbeat_loop +
     //     region_sync_loop). No listener, no accept, no fd dispatch.
-    //   - N × 2 partition OS threads: per-partition P-log + P-bulk. P-log
+    //   - N × 2 partition OS threads: per-partition P-log + P-sst. P-log
     //     binds its OWN `compio::net::TcpListener` on a unique port and
     //     runs its OWN accept task + ps-conn tasks + partition_loop
     //     on the same compio runtime. The only mpsc on the hot path is
@@ -4387,10 +4387,10 @@ fn ps_conn_inflight_cap() -> usize {
 pub(crate) static PS_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// F216-E (W1) — count of `MSG_PUT_ZC` values recv'd straight into a registered
-/// `PooledBuf` by `drain_zc_writes` (the PS write-recv zero-copy path). Logged
+/// F216-E (W1) — count of `MSG_PUT_BULK` values recv'd straight into a registered
+/// `PooledBuf` by `drain_bulk_writes` (the PS write-recv zero-copy path). Logged
 /// once on first engage so operators / e2e can confirm the path is live.
-pub(crate) static PS_ZC_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
+pub(crate) static PS_BULK_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Workspace-wide serialization guard for tests that exercise
@@ -4467,7 +4467,7 @@ fn spawn_ps_read(
 }
 
 /// F216 R4 — push a completed response `(head, Option<value>)` into `tx_bufs`.
-/// `head` (frame header + any meta) goes first; for MSG_GET_ZC the `value`
+/// `head` (frame header + any meta) goes first; for MSG_GET_BULK the `value`
 /// (aliasing the RegPool buffer, no copy) goes immediately after so the next
 /// `write_vectored_all` emits both as one contiguous wire frame. Keeping the
 /// pair adjacent preserves per-connection in-order reply semantics.
@@ -4480,20 +4480,20 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
     }
 }
 
-/// F216-E W1 (UCX) + F219 (TCP) — drain LARGE `MSG_PUT_ZC` frames at the FRONT
+/// F216-E W1 (UCX) + F219 (TCP) — drain LARGE `MSG_PUT_BULK` frames at the FRONT
 /// of `decoder`, recv'ing each value straight into a `PooledBuf` instead of
 /// letting `FrameDecoder` accumulate it (which would copy the whole value into
 /// the decoder buffer). On UCX the buffer is registered → RDMA recv, no off-wire
 /// copy; on TCP the value is recv'd via a compio owned read
 /// (`read_exact_into_pooled`) → only the unavoidable kernel→userspace copy
 /// remains (the app-level FrameDecoder copy is gone). Each is routed as a
-/// `PartitionRequest { payload = [meta][key], zc_value = Some(value) }` so
-/// `enqueue_put_zc` uses the value directly (no concat back). Returns as soon as
-/// the front frame is NOT an eligible large `MSG_PUT_ZC` (the caller then runs
+/// `PartitionRequest { payload = [meta][key], bulk_value = Some(value) }` so
+/// `enqueue_put_bulk` uses the value directly (no concat back). Returns as soon as
+/// the front frame is NOT an eligible large `MSG_PUT_BULK` (the caller then runs
 /// the normal decode path on the remainder).
 ///
 /// v28 (F-WIRE-CRC-UNIFY): the frame's ctrl (`[meta][key]`) is CRC-protected
-/// together with the header — `peek_zc_prologue` VERIFIES it before the value
+/// together with the header — `peek_bulk_prologue` VERIFIES it before the value
 /// recv commits, so a flipped part_id/key_len/lease field fails loud. The raw
 /// value tail carries no frame CRC (transport integrity: UCX NIC ICRC / TCP
 /// kernel segment checksum — F219 measured the per-value crc at ~20% of a
@@ -4503,9 +4503,9 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
 /// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
 /// drops back to the pool; on TCP, compio retains the owned buffer until the
 /// in-flight read CQE lands. Either way: no leak, no DMA/kernel-writes-to-freed.
-/// Small writes (< `AUTUMN_PS_ZC_RECV_MIN_BYTES`) keep the proven decode path.
+/// Small writes (< `AUTUMN_PS_BULK_RECV_MIN_BYTES`) keep the proven decode path.
 #[allow(clippy::too_many_arguments)]
-async fn drain_zc_writes(
+async fn drain_bulk_writes(
     decoder: &mut FrameDecoder,
     reader: &mut autumn_transport::ReadHalf,
     req_tx: &mpsc::Sender<PartitionRequest>,
@@ -4521,27 +4521,27 @@ async fn drain_zc_writes(
         let Some((req_id, msg_type, _flags, _payload_len)) = decoder.peek_header() else {
             return Ok(());
         };
-        if msg_type != MSG_PUT_ZC || req_id == 0 {
-            return Ok(()); // not a ZC write at the front → normal path
+        if msg_type != MSG_PUT_BULK || req_id == 0 {
+            return Ok(()); // not a bulk write at the front → normal path
         }
         // Wait for the full prologue ([header][ctrl_len][meta+key][crc]) and
         // VERIFY the ctrl crc before committing to the recv. Malformed/corrupt
         // prologue → tear the connection down (stream position unrecoverable).
-        let prologue = match decoder.peek_zc_prologue() {
+        let prologue = match decoder.peek_bulk_prologue() {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(()), // need more bytes (prologue is tiny)
-            Err(e) => return Err(anyhow!("MSG_PUT_ZC prologue: {e}")),
+            Err(e) => return Err(anyhow!("MSG_PUT_BULK prologue: {e}")),
         };
         let ctrl_len = prologue.ctrl_len;
         let value_len = prologue.value_len;
-        if value_len < AUTUMN_PS_ZC_RECV_MIN_BYTES
+        if value_len < AUTUMN_PS_BULK_RECV_MIN_BYTES
             || value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
         {
-            // Below threshold, or over the inline cap (enqueue_put_zc rejects
+            // Below threshold, or over the inline cap (enqueue_put_bulk rejects
             // the latter) — let the normal path handle it.
             return Ok(());
         }
-        if ctrl_len < PUT_ZC_HEADER_LEN {
+        if ctrl_len < PUT_BULK_HEADER_LEN {
             return Ok(()); // malformed meta → let normal decode reject it
         }
         let (part_id, key_len) = {
@@ -4558,7 +4558,7 @@ async fn drain_zc_writes(
         }
         // v28: ctrl must be exactly [meta][key] — a declared key_len that
         // disagrees with ctrl_len is malformed; the normal path rejects it.
-        if PUT_ZC_HEADER_LEN.checked_add(key_len) != Some(ctrl_len) {
+        if PUT_BULK_HEADER_LEN.checked_add(key_len) != Some(ctrl_len) {
             return Ok(());
         }
         let meta_key = Bytes::copy_from_slice(
@@ -4578,7 +4578,7 @@ async fn drain_zc_writes(
 
         // Commit: drop header + ctrl_len + ctrl + crc; recv the value into a
         // pooled buf. The value ends the frame — no trailer after it (v28).
-        decoder.consume_zc_prologue(ctrl_len);
+        decoder.consume_bulk_prologue(ctrl_len);
         let mut pb = autumn_transport::regpool_acquire(value_len);
         // Drain any buffered value prefix into the pool buffer (no socket).
         let filled = {
@@ -4593,7 +4593,7 @@ async fn drain_zc_writes(
                 let n = reader.recv_into(&mut dest[filled..], reg).await?;
                 if n == 0 {
                     return Err(anyhow!(
-                        "eof mid MSG_PUT_ZC value (got {filled}/{value_len})"
+                        "eof mid MSG_PUT_BULK value (got {filled}/{value_len})"
                     ));
                 }
                 filled += n;
@@ -4604,32 +4604,32 @@ async fn drain_zc_writes(
             pb = reader
                 .read_exact_into_pooled(pb, filled, value_len)
                 .await
-                .map_err(|e| anyhow!("eof/io mid MSG_PUT_ZC value (tcp zc-recv): {e}"))?;
+                .map_err(|e| anyhow!("eof/io mid MSG_PUT_BULK value (tcp bulk-recv): {e}"))?;
         }
         let value = Bytes::from_owner(pb);
 
-        // Observability: count + log-once that the ZC write-recv path is live.
-        if PS_ZC_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        // Observability: count + log-once that the bulk write-recv path is live.
+        if PS_BULK_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             tracing::info!(
                 value_len,
                 transport = if reader.is_ucx() { "ucx(registered)" } else { "tcp(pooled)" },
-                "PS write-recv ZC engaged (MSG_PUT_ZC recv into pooled buffer; F216-E UCX / F219 TCP)"
+                "PS write-recv bulk engaged (MSG_PUT_BULK recv into pooled buffer; F216-E UCX / F219 TCP)"
             );
         }
 
         // Route into partition_loop (writes are single-writer there); value
-        // rides as zc_value (aliases the pool buffer, no concat).
+        // rides as bulk_value (aliases the pool buffer, no concat).
         let tx = req_tx.clone();
         inflight.push(
             async move {
                 (
-                    delegate_round_trip(tx, req_id, MSG_PUT_ZC, meta_key, Some(value)).await,
+                    delegate_round_trip(tx, req_id, MSG_PUT_BULK, meta_key, Some(value)).await,
                     None,
                 )
             }
             .boxed_local(),
         );
-        // Loop to handle a possible next large MSG_PUT_ZC at the new front.
+        // Loop to handle a possible next large MSG_PUT_BULK at the new front.
     }
 }
 
@@ -4645,7 +4645,7 @@ fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> B
 }
 
 /// F216 (Option B) — serve a GET / GET_ZC LOCALLY in the ps-conn task (no req_tx
-/// hop / partition_loop detour). Returns `(head, Some(value))` for MSG_GET_ZC
+/// hop / partition_loop detour). Returns `(head, Some(value))` for MSG_GET_BULK
 /// (value-separable: value aliases the RegPool buffer, emitted as its own iovec)
 /// or `(frame, None)` for MSG_GET. `handle_get` borrows the partition only across
 /// synchronous code (drops it before the `resolve_value` await), so on the
@@ -4658,9 +4658,9 @@ async fn serve_get_local(
     part: &Rc<RefCell<PartitionData>>,
 ) -> (Bytes, Option<Bytes>) {
     let t0 = Instant::now();
-    let out = if msg_type == MSG_GET_ZC {
-        // handle_get_zc never errors (status rides in the meta code).
-        let (head, value) = crate::rpc_handlers::handle_get_zc(req_id, payload, part).await;
+    let out = if msg_type == MSG_GET_BULK {
+        // handle_get_bulk never errors (status rides in the meta code).
+        let (head, value) = crate::rpc_handlers::handle_get_bulk(req_id, payload, part).await;
         (head, Some(value))
     } else {
         let frame = match crate::rpc_handlers::handle_get(payload, part).await {
@@ -4723,7 +4723,7 @@ async fn serve_read_local(
 /// Delegate a request to `partition_loop` over the same-thread mpsc and await its
 /// response, returning the encoded response frame. Single-sources the
 /// "partition thread closed" / "partition response dropped" wording shared by the
-/// three delegate sites (`drain_zc_writes`, `push_one_frame_to_inflight`,
+/// three delegate sites (`drain_bulk_writes`, `push_one_frame_to_inflight`,
 /// `d1_fast_path_round_trip`). A plain `async fn` (NOT boxed) so the d=1 fast path
 /// can await it inline without the per-frame heap alloc F099-I avoids.
 async fn delegate_round_trip(
@@ -4731,14 +4731,14 @@ async fn delegate_round_trip(
     req_id: u32,
     msg_type: u8,
     payload: Bytes,
-    zc_value: Option<Bytes>,
+    bulk_value: Option<Bytes>,
 ) -> Bytes {
     let (resp_tx, resp_rx) = oneshot::channel();
     let req = PartitionRequest {
         msg_type,
         payload,
         resp_tx,
-        zc_value,
+        bulk_value,
     };
     let resp_frame = if tx.send(req).await.is_err() {
         Frame::error(
@@ -4947,7 +4947,7 @@ fn push_one_frame_to_inflight(
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
     // F216 R4: each completion is `(head, Option<value>)` — `Some(value)` ONLY
-    // for MSG_GET_ZC, whose value `Bytes` aliases the RegPool buffer and is
+    // for MSG_GET_BULK, whose value `Bytes` aliases the RegPool buffer and is
     // emitted as its own iovec (no concat copy). All other frames are `(frame,
     // None)`. The drain sites push `head` then `value` consecutively into
     // `tx_bufs` so one `write_vectored_all` flushes them as a single wire frame.
@@ -4962,9 +4962,9 @@ fn push_one_frame_to_inflight(
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let mut payload = frame.payload;
-    // v28: a value-separable request (MSG_PUT_ZC) arrives with its raw value
-    // split off by the decoder; thread it into the delegate as zc_value so
-    // enqueue_put_zc uses it directly (payload = [meta][key] only).
+    // v28: a value-separable request (MSG_PUT_BULK) arrives with its raw value
+    // split off by the decoder; thread it into the delegate as bulk_value so
+    // enqueue_put_bulk uses it directly (payload = [meta][key] only).
     let frame_value = frame.value;
     // F-AUTHZ-1: AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
@@ -4991,7 +4991,7 @@ fn push_one_frame_to_inflight(
     // partition_loop detour) — reads need a consistent PartitionData snapshot,
     // not the single-writer group-commit actor. part == None is unit-test mode →
     // fall through to the delegate.
-    if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
+    if msg_type == MSG_GET || msg_type == MSG_GET_BULK {
         if let Some(part) = part {
             let part_c = part.clone();
             inflight.push(
@@ -5016,11 +5016,11 @@ fn push_one_frame_to_inflight(
     }
 
     let tx = req_tx.clone();
-    let zc_value = (!frame_value.is_empty()).then_some(frame_value);
+    let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
     inflight.push(
         async move {
             (
-                delegate_round_trip(tx, req_id, msg_type, payload, zc_value).await,
+                delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
                 None,
             )
         }
@@ -5127,7 +5127,7 @@ async fn d1_fast_path_round_trip(
 
     // F216 (Option B): d=1 GET served locally too — same rationale as
     // push_one_frame_to_inflight. part == None (unit tests) → delegate.
-    if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
+    if msg_type == MSG_GET || msg_type == MSG_GET_BULK {
         if let Some(part) = part {
             return serve_get_local(req_id, msg_type, payload, part).await;
         }
@@ -5140,9 +5140,9 @@ async fn d1_fast_path_round_trip(
     }
 
     let tx = req_tx.clone();
-    let zc_value = (!frame_value.is_empty()).then_some(frame_value);
+    let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
     (
-        delegate_round_trip(tx, req_id, msg_type, payload, zc_value).await,
+        delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
         None,
     )
 }
@@ -5200,7 +5200,7 @@ async fn handle_ps_connection(
     let mut principal: Option<crate::authz::BoundPrincipal> = None;
 
     let cap = ps_conn_inflight_cap();
-    // F216 R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_ZC
+    // F216 R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_BULK
     // (value aliases the RegPool buffer, emitted as its own iovec — no concat).
     let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Option<Bytes>)>> =
         FuturesUnordered::new();
@@ -5239,20 +5239,20 @@ async fn handle_ps_connection(
                 PsReadBurst::Data { buf, n, mut reader } => {
                     decoder.feed(&buf[..n]);
 
-                    // F216-E W1 / F219: recv any LARGE MSG_PUT_ZC value(s) at the
+                    // F216-E W1 / F219: recv any LARGE MSG_PUT_BULK value(s) at the
                     // front straight into a PooledBuf (UCX registered RDMA / TCP
                     // compio owned read — no FrameDecoder accumulation copy)
                     // before the normal decode buffers them. May push write
                     // replies onto `inflight`, which disables the d=1 fast path
                     // below (guarded by is_empty()).
-                    // F-AUTHZ-1: when authz is ON, skip the ZC-recv fast path so
-                    // large MSG_PUT_ZC flows through the normal FrameDecoder path
+                    // F-AUTHZ-1: when authz is ON, skip the bulk-recv fast path so
+                    // large MSG_PUT_BULK flows through the normal FrameDecoder path
                     // where `push_one_frame_to_inflight`'s gate enforces the key
-                    // prefix uniformly (the ZC path bypasses that dispatch). The
+                    // prefix uniformly (the bulk path bypasses that dispatch). The
                     // perf cost (a value copy on large authz-gated writes) is
                     // acceptable — large writes are rare on the `mem/` workload.
                     if !authz.gate_active() {
-                        drain_zc_writes(
+                        drain_bulk_writes(
                             &mut decoder,
                             &mut reader,
                             &req_tx,
@@ -5277,7 +5277,7 @@ async fn handle_ps_connection(
                     let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
                     if let Some(frame) = first {
                         let more = decoder.try_decode().map_err(|e| anyhow!(e))?;
-                        // `inflight.is_empty()`: drain_zc_writes above may have
+                        // `inflight.is_empty()`: drain_bulk_writes above may have
                         // queued a write reply — if so, the d=1 inline path would
                         // write its response ahead of that reply, breaking in-order
                         // semantics. Fall through to the FU path in that case.
@@ -5293,7 +5293,7 @@ async fn handle_ps_connection(
                                 &mut principal,
                             )
                             .await;
-                            // F216 R4: MSG_GET_ZC returns a separate value iovec
+                            // F216 R4: MSG_GET_BULK returns a separate value iovec
                             // — write [head, value] vectored; everything else is
                             // a single frame via write_all (no regression).
                             match value {
@@ -5395,13 +5395,13 @@ async fn handle_ps_connection(
                     PsReadBurst::Err { e, .. } => return Err(e.into()),
                     PsReadBurst::Data { buf, n, mut reader } => {
                         decoder.feed(&buf[..n]);
-                        // F216-E W1 / F219: recv large MSG_PUT_ZC values into
+                        // F216-E W1 / F219: recv large MSG_PUT_BULK values into
                         // pooled buffers first (UCX registered / TCP owned read).
                         // F-AUTHZ-1 / F-KEY-NS D7: skip when EITHER layer is on
                         // (see the idle-branch note) so a large PUT_ZC is enforced
                         // (Layer-A + Layer-B) on the normal FrameDecoder path.
                         if !authz.gate_active() {
-                            drain_zc_writes(
+                            drain_bulk_writes(
                                 &mut decoder,
                                 &mut reader,
                                 &req_tx,
@@ -5561,32 +5561,32 @@ async fn partition_thread_main(
     // the loop drains them via `now_or_never` at iteration top.
     let (split_wake_tx, split_wake_rx) = mpsc::unbounded::<()>();
 
-    // F088: spawn a dedicated OS thread (P-bulk) that owns its own compio
+    // F088: spawn a dedicated OS thread (P-sst) that owns its own compio
     // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
     // `flush_req_tx`. capacity=1 keeps flushes sequential (matches the old
     // in-thread semantics) and provides back-pressure on the P-log flush_loop.
     //
-    // P-bulk spawn failure is FATAL for this partition: open_partition returns
+    // P-sst spawn failure is FATAL for this partition: open_partition returns
     // Err, sync_regions_once backs off and the manager reschedules. Pre-this
     // we kept an Option<Sender> + an in-thread fallback in run_flush_async_phase
     // and compact_row_append. The fallback was dead in production (OS spawn
     // never failed on healthy hosts) AND was the structural foothold for the
     // 2026-05-03 invalid_meta_len corruption — two StreamClients (P-log part_sc
-    // and P-bulk bulk_sc) appending to the same row_stream, each tracking its
+    // and P-sst sst_sc) appending to the same row_stream, each tracking its
     // own commit cursor; one's stale commit truncated the other's SST bytes.
-    // The fix unified compaction onto P-bulk; this change removes the fallback
+    // The fix unified compaction onto P-sst; this change removes the fallback
     // entirely so the single-writer invariant is a type-level guarantee, not
     // an "accidentally preserved by coincidence" runtime property.
     let (flush_req_tx, flush_req_rx) = mpsc::channel::<FlushReq>(1);
     let (row_append_tx, row_append_rx) = mpsc::channel::<RowAppendReq>(1);
-    // F255 — synchronous P-log → P-bulk barrier channel. Capacity 1: only
+    // F255 — synchronous P-log → P-sst barrier channel. Capacity 1: only
     // `handle_split_part` sends, and it awaits the ACK before returning, so
     // back-to-back splits are naturally serialised. Larger cap would let a
     // queued barrier sit behind a regular append, which is exactly what we
     // are trying to prevent.
     let (row_invalidate_tx, row_invalidate_rx) =
         mpsc::channel::<RowInvalidateBarrierReq>(1);
-    let (_bulk_handle, bulk_ready_rx) = spawn_bulk_thread(
+    let (_bulk_handle, bulk_ready_rx) = spawn_sst_thread(
         part_id,
         manager_addr.clone(),
         owner_key.clone(),
@@ -5596,10 +5596,10 @@ async fn partition_thread_main(
         row_invalidate_rx,
         cpu_bulk,
     )
-    .with_context(|| format!("spawn P-bulk thread for partition {part_id}"))?;
-    // F255: wait for P-bulk to confirm its runtime + StreamClient are live
+    .with_context(|| format!("spawn P-sst thread for partition {part_id}"))?;
+    // F255: wait for P-sst to confirm its runtime + StreamClient are live
     // BEFORE we publish flush_req_tx / row_append_tx into PartitionData.
-    // Pre-F255 OS thread spawn returning Ok was treated as "P-bulk ready",
+    // Pre-F255 OS thread spawn returning Ok was treated as "P-sst ready",
     // but compio runtime build or StreamClient init could still fail
     // inside the thread, leaving P-log holding a Sender to a dropped
     // Receiver — the partition wedged on first flush.
@@ -5607,12 +5607,12 @@ async fn partition_thread_main(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             return Err(e).with_context(|| {
-                format!("P-bulk readiness for partition {part_id} reported failure")
+                format!("P-sst readiness for partition {part_id} reported failure")
             })
         }
         Err(_canceled) => {
             return Err(anyhow!(
-                "P-bulk readiness signal dropped before partition {part_id} opened (thread aborted)"
+                "P-sst readiness signal dropped before partition {part_id} opened (thread aborted)"
             ));
         }
     }
@@ -5699,7 +5699,7 @@ async fn partition_thread_main(
     // of P-log CPU on 256 × d=1 came from spawn + inner oneshot + Waker
     // cascade).
     // F270: created BEFORE the flush spawn — the flush loop shares the
-    // poison flag so a fence rejection inside the flush path (P-bulk
+    // poison flag so a fence rejection inside the flush path (P-sst
     // append / commit_length barrier hitting CODE_LOCKED_BY_OTHER after
     // an admin fence-bump or ownership change) tears the partition down
     // for a region_sync reopen with a FRESH per-partition epoch (F267)
@@ -5775,7 +5775,7 @@ async fn partition_thread_main(
                     // The deterministic base_port+ord port is stuck. Pinned
                     // root cause (2026-05-29): a collision with an OS
                     // EPHEMERAL local port — outbound sockets (StreamClient
-                    // -> EN, recovery reads, manager RPCs, P-bulk) draw their
+                    // -> EN, recovery reads, manager RPCs, P-sst) draw their
                     // local port from ip_local_port_range, and when base_port
                     // falls INSIDE that range one of them already holds
                     // base_port+ord, so the listener bind fails EADDRINUSE on
@@ -6583,7 +6583,7 @@ async fn try_complete_freeze_drain(
     }
     // 2026-06-02 fix — wait for in-flight `do_compact` to finish before acking
     // the freeze. `do_compact` writes new SSTs to row_stream via
-    // `compact_row_append → P-bulk` and `row_append_tx` is not tracked by the
+    // `compact_row_append → P-sst` and `row_append_tx` is not tracked by the
     // flush_one_imm / flushing_imm_ptrs mechanism above. Without this wait,
     // handle_split_part captures `commit_length(row_stream)` while compact's
     // RowAppendReq is still in flight: EN's `last_synced` doesn't yet cover
@@ -6743,9 +6743,9 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
-            MSG_PUT_ZC => {
-                let key = partition_rpc::parse_put_zc_meta(&req.payload)
-                    .map(|m| req.payload[PUT_ZC_HEADER_LEN..m.value_offset].to_vec())
+            MSG_PUT_BULK => {
+                let key = partition_rpc::parse_put_bulk_meta(&req.payload)
+                    .map(|m| req.payload[PUT_BULK_HEADER_LEN..m.value_offset].to_vec())
                     .unwrap_or_default();
                 let resp = PutResp {
                     code: CODE_UNAVAILABLE,
@@ -6816,9 +6816,9 @@ async fn handle_incoming_req(
                 Some(&p.rg),
             )
         }
-        MSG_PUT_ZC => {
+        MSG_PUT_BULK => {
             let p = part.borrow();
-            enqueue_put_zc(
+            enqueue_put_bulk(
                 req,
                 pending,
                 part_region_epoch,
@@ -6935,7 +6935,7 @@ async fn handle_incoming_req(
         }
         // F-FENCE-DRAIN: seal + roll open tails off a fenced node. Spawned like
         // SPLIT_PART so its manager RPCs (get_stream_info + seal_and_roll_tail +
-        // the P-bulk row barrier) don't block partition_loop's group-commit.
+        // the P-sst row barrier) don't block partition_loop's group-commit.
         MSG_ROLL_TAILS => {
             let part_c = part.clone();
             let part_sc_c = routing.part_sc.clone();
@@ -7013,7 +7013,7 @@ pub(crate) fn check_and_bump_fence(
 }
 
 /// region-epoch + in_range admission shared by `enqueue_put` /
-/// `enqueue_put_zc` / `enqueue_delete`. Returns `Some(rejection)` for the FIRST
+/// `enqueue_put_bulk` / `enqueue_delete`. Returns `Some(rejection)` for the FIRST
 /// failing check — stale region epoch → `FailedPrecondition`, out-of-range key
 /// → `InvalidArgument` — or `None` if admitted. The caller sends the rejection
 /// on its own single `resp_tx` and returns, which keeps the exact
@@ -7273,32 +7273,32 @@ fn enqueue_batch_put(
 }
 
 /// F216-E zero-copy PUT enqueue. Mirrors `enqueue_put` but decodes the binary
-/// `[meta][value]` framing (`partition_rpc::parse_put_zc_meta`) instead of rkyv,
+/// `[meta][value]` framing (`partition_rpc::parse_put_bulk_meta`) instead of rkyv,
 /// and slices BOTH key and value as **zero-copy `Bytes`** out of `req.payload`
 /// (no per-field copy). Same region-epoch + inline-cap checks and the same
 /// rkyv `PutResp` response shape as `enqueue_put`.
-fn enqueue_put_zc(
+fn enqueue_put_bulk(
     req: PartitionRequest,
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
-    // BUG-LEASE-2 Phase 2: the ZC meta now carries `inode_hint` /
-    // `lease_epoch` (PUT_ZC_HEADER_LEN 28 -> 44); same fencing semantics
+    // BUG-LEASE-2 Phase 2: the bulk meta now carries `inode_hint` /
+    // `lease_epoch` (PUT_BULK_HEADER_LEN 28 -> 44); same fencing semantics
     // as enqueue_put, same admission ordering (range -> size -> fence).
     fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
     part_rg: Option<&Range>,
 ) {
-    let Some(meta) = partition_rpc::parse_put_zc_meta(&req.payload) else {
+    let Some(meta) = partition_rpc::parse_put_bulk_meta(&req.payload) else {
         let _ = req.resp_tx.send(Err((
             StatusCode::InvalidArgument,
-            "malformed MSG_PUT_ZC payload".to_string(),
+            "malformed MSG_PUT_BULK payload".to_string(),
         )));
         return;
     };
     // Zero-copy slice of the frame payload (Bytes refcount, no memcpy);
-    // `value_offset` was validated by `parse_put_zc_meta` above, so hoisting
+    // `value_offset` was validated by `parse_put_bulk_meta` above, so hoisting
     // this above the epoch check is side-effect-free.
-    let key = req.payload.slice(PUT_ZC_HEADER_LEN..meta.value_offset);
+    let key = req.payload.slice(PUT_BULK_HEADER_LEN..meta.value_offset);
     // region-epoch + in_range admission BEFORE value-too-large + fence
     // (BUG-LEASE-2 P1 #1: a mis-routed key must not raise the floor).
     if let Some(err) = admit_region_range(
@@ -7312,10 +7312,10 @@ fn enqueue_put_zc(
         return;
     }
     // F216-E W1: a LARGE value was recv'd straight into a registered PooledBuf
-    // by the ps-conn (zc_value = a Bytes aliasing it, no off-wire copy); use it
+    // by the ps-conn (bulk_value = a Bytes aliasing it, no off-wire copy); use it
     // directly. Otherwise (small / TCP) slice the value out of `payload` as
-    // before. `payload` holds only `[meta][key]` in the zc_value case.
-    let value = match req.zc_value {
+    // before. `payload` holds only `[meta][key]` in the bulk_value case.
+    let value = match req.bulk_value {
         Some(v) => v,
         None => req.payload.slice(meta.value_offset..),
     };
@@ -9332,7 +9332,7 @@ async fn background_flush_loop(
 }
 
 // ---------------------------------------------------------------------------
-// F088: Per-partition bulk thread (P-bulk)
+// F088: Per-partition bulk thread (P-sst)
 //
 // The bulk thread owns its own compio runtime (separate io_uring), its own
 // ConnPool, and its own StreamClient. This prevents 128MB row_stream SSTable
@@ -9345,17 +9345,17 @@ async fn background_flush_loop(
 // kinds; each thread's ConnPool is role-dedicated.
 // ---------------------------------------------------------------------------
 
-/// F255 — readiness signal sent by the spawned P-bulk thread once its
+/// F255 — readiness signal sent by the spawned P-sst thread once its
 /// compio runtime + `StreamClient` + reporter_part_id are all live.
 /// `partition_thread_main` awaits this BEFORE constructing `PartitionData`
-/// so a partition is never half-opened with a dead P-bulk receiver. Pre-
+/// so a partition is never half-opened with a dead P-sst receiver. Pre-
 /// F255 only OS `thread::Builder::spawn` failure was surfaced; runtime
 /// build / `StreamClient::new_with_owner_epoch` failures inside the thread
 /// silently logged + returned, leaving P-log with a live `Sender` to a
 /// dropped receiver and the partition wedged on first flush.
 type BulkReady = futures::channel::oneshot::Receiver<Result<()>>;
 
-fn spawn_bulk_thread(
+fn spawn_sst_thread(
     part_id: u64,
     manager_addr: String,
     owner_key: String,
@@ -9367,7 +9367,7 @@ fn spawn_bulk_thread(
 ) -> std::io::Result<(std::thread::JoinHandle<()>, BulkReady)> {
     let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<Result<()>>();
     let handle = std::thread::Builder::new()
-        .name(format!("part-{part_id}-bulk"))
+        .name(format!("part-{part_id}-sst"))
         .spawn(move || {
             let rt = match compio::runtime::RuntimeBuilder::new()
                 .thread_affinity(affinity_set(cpu))
@@ -9376,14 +9376,14 @@ fn spawn_bulk_thread(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(part_id, error = %e, "bulk thread runtime init failed");
-                    let _ = ready_tx.send(Err(anyhow!("P-bulk runtime init: {e}")));
+                    let _ = ready_tx.send(Err(anyhow!("P-sst runtime init: {e}")));
                     return;
                 }
             };
-            tracing::info!(part_id, ?cpu, "P-bulk thread runtime ready");
+            tracing::info!(part_id, ?cpu, "P-sst thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());
-                let bulk_sc = match StreamClient::new_with_owner_epoch(
+                let sst_sc = match StreamClient::new_with_owner_epoch(
                     &manager_addr,
                     owner_key,
                     owner_epoch,
@@ -9395,49 +9395,49 @@ fn spawn_bulk_thread(
                     Ok(sc) => sc,
                     Err(e) => {
                         tracing::error!(part_id, error = %e, "bulk StreamClient init failed");
-                        let _ = ready_tx.send(Err(anyhow!("P-bulk StreamClient init: {e}")));
+                        let _ = ready_tx.send(Err(anyhow!("P-sst StreamClient init: {e}")));
                         return;
                     }
                 };
                 // F192: same reporter_part_id as the P-log StreamClient so
                 // bulk-thread row_stream / compact append failures bucket
                 // into the same partition for the manager's quorum count.
-                bulk_sc.set_reporter_part_id(part_id);
+                sst_sc.set_reporter_part_id(part_id);
                 tracing::info!(part_id, "bulk thread ready");
                 if ready_tx.send(Ok(())).is_err() {
                     // P-log dropped the receiver (open_partition aborted
                     // before our ready landed). Exit cleanly without
                     // running flush_worker_loop — the channel senders
                     // will be dropped by the failed open path.
-                    tracing::warn!(part_id, "P-bulk ready signal dropped; exiting");
+                    tracing::warn!(part_id, "P-sst ready signal dropped; exiting");
                     return;
                 }
-                flush_worker_loop(bulk_sc, flush_req_rx, row_append_rx, row_invalidate_rx).await;
+                flush_worker_loop(sst_sc, flush_req_rx, row_append_rx, row_invalidate_rx).await;
                 tracing::info!(part_id, "bulk thread exiting");
             });
         })?;
     Ok((handle, ready_rx))
 }
 
-/// R4 4.4 — P-bulk worker with N-deep SQ/CQ pipeline.
+/// R4 4.4 — P-sst worker with N-deep SQ/CQ pipeline.
 ///
-/// Handles two kinds of work, both using P-bulk's single StreamClient so
+/// Handles two kinds of work, both using P-sst's single StreamClient so
 /// that row_stream commit tracking stays coherent:
 ///   - `FlushReq`: build SST bytes + row_stream.append (from flush_loop)
 ///   - `RowAppendReq`: row_stream.append only (from compaction on P-log)
 ///
 /// The cap is deliberately small (default 2, env
-/// `AUTUMN_PS_BULK_INFLIGHT_CAP`) because each in-flight item holds a
+/// `AUTUMN_PS_SST_INFLIGHT_CAP`) because each in-flight item holds a
 /// full SSTable buffer in RAM.
 async fn flush_worker_loop(
-    bulk_sc: Rc<StreamClient>,
+    sst_sc: Rc<StreamClient>,
     flush_req_rx: mpsc::Receiver<FlushReq>,
     row_append_rx: mpsc::Receiver<RowAppendReq>,
     row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
 ) {
     use futures::future::{select, Either};
 
-    let cap = crate::ps_bulk_inflight_cap();
+    let cap = crate::ps_sst_inflight_cap();
 
     // Variants differ in size (Flush carries a TableMeta+SstReader); this is a
     // short-lived local completion enum on a bounded (cap) FU, not stored en
@@ -9495,7 +9495,7 @@ async fn flush_worker_loop(
 
     // F255: barrier set-aside slot. When SQ yields an `Invalidate`, we
     // place the request here and the next loop iteration drains `inflight`
-    // to zero before running `bulk_sc.invalidate_stream(...)` + ACK. This
+    // to zero before running `sst_sc.invalidate_stream(...)` + ACK. This
     // guarantees the invalidate is NOT racing any in-flight append on the
     // pre-seal stale worker cache (the bug coco /arch GPT-5.5 surfaced on
     // the v1 lazy-flag F255 attempt: cap=2 FuturesUnordered let a FlushReq
@@ -9504,7 +9504,7 @@ async fn flush_worker_loop(
     let mut pending_barrier: Option<RowInvalidateBarrierReq> = None;
 
     let launch = |msg: SqMsg,
-                  bulk_sc: &Rc<StreamClient>,
+                  sst_sc: &Rc<StreamClient>,
                   pending_barrier: &mut Option<RowInvalidateBarrierReq>|
      -> Option<BulkFut> {
         match msg {
@@ -9516,10 +9516,10 @@ async fn flush_worker_loop(
                     row_stream_id,
                     resp_tx,
                 } = req;
-                let bulk_sc = bulk_sc.clone();
+                let sst_sc = sst_sc.clone();
                 Some(Box::pin(async move {
                     let result =
-                        do_flush_on_bulk(&bulk_sc, imm, vp_eid, vp_off, row_stream_id).await;
+                        do_flush_on_bulk(&sst_sc, imm, vp_eid, vp_off, row_stream_id).await;
                     BulkCompletion::Flush { resp_tx, result }
                 }))
             }
@@ -9529,9 +9529,9 @@ async fn flush_worker_loop(
                     row_stream_id,
                     resp_tx,
                 } = req;
-                let bulk_sc = bulk_sc.clone();
+                let sst_sc = sst_sc.clone();
                 Some(Box::pin(async move {
-                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes).await;
+                    let result = sst_sc.append_bytes(row_stream_id, sst_bytes).await;
                     BulkCompletion::RowAppend { resp_tx, result }
                 }))
             }
@@ -9565,7 +9565,7 @@ async fn flush_worker_loop(
                 // effort: on error (e.g. all replicas unreachable → manager
                 // Precondition) log + still ACK; the manager sweep retries on
                 // its cooldown.
-                if let Err(e) = bulk_sc.seal_and_roll_tail(req.row_stream_id).await {
+                if let Err(e) = sst_sc.seal_and_roll_tail(req.row_stream_id).await {
                     tracing::warn!(
                         row_stream_id = req.row_stream_id,
                         error = %e,
@@ -9573,11 +9573,11 @@ async fn flush_worker_loop(
                     );
                 }
             } else {
-                bulk_sc.invalidate_stream(req.row_stream_id);
+                sst_sc.invalidate_stream(req.row_stream_id);
             }
             // ACK after invalidate/roll (the ACK semantics are "by the time you
-            // receive this, no in-flight P-bulk operation is touching the
-            // pre-invalidate bulk_sc state"). Receiver-dropped is treated
+            // receive this, no in-flight P-sst operation is touching the
+            // pre-invalidate sst_sc state"). Receiver-dropped is treated
             // as the caller aborted; the invalidate/roll stands regardless.
             let _ = req.resp_tx.send(());
             continue;
@@ -9590,7 +9590,7 @@ async fn flush_worker_loop(
             // Idle: only SQ can progress.
             match sq_rx.next().await {
                 Some(msg) => {
-                    if let Some(fut) = launch(msg, &bulk_sc, &mut pending_barrier) {
+                    if let Some(fut) = launch(msg, &sst_sc, &mut pending_barrier) {
                         inflight.push(fut);
                     }
                 }
@@ -9614,7 +9614,7 @@ async fn flush_worker_loop(
         match select(sq_fut, Box::pin(cq_fut)).await {
             Either::Left((maybe_msg, _cq_dropped)) => match maybe_msg {
                 Some(msg) => {
-                    if let Some(fut) = launch(msg, &bulk_sc, &mut pending_barrier) {
+                    if let Some(fut) = launch(msg, &sst_sc, &mut pending_barrier) {
                         inflight.push(fut);
                     }
                 }
@@ -9635,7 +9635,7 @@ async fn flush_worker_loop(
 }
 
 async fn do_flush_on_bulk(
-    bulk_sc: &Rc<StreamClient>,
+    sst_sc: &Rc<StreamClient>,
     imm: Arc<Memtable>,
     vp_eid: u64,
     vp_off: u64,
@@ -9647,7 +9647,7 @@ async fn do_flush_on_bulk(
             .await
             .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
 
-    let append_result = bulk_sc.append(row_stream_id, &sst_bytes).await?;
+    let append_result = sst_sc.append(row_stream_id, &sst_bytes).await?;
     let estimated_size = sst_bytes.len() as u64;
     let sst_len = sst_bytes.len() as u64;
     // F261: parse the meta then DROP the resident bytes — blocks are
@@ -10775,7 +10775,7 @@ mod f120_knob_tests {
 
 // F120-A imm-pop signal flow is validated by:
 //   - The integration test `crates/manager/tests/f120_graceful_shutdown.rs`
-//     (graceful drain end-to-end exercises rotate → imm push → P-bulk
+//     (graceful drain end-to-end exercises rotate → imm push → P-sst
 //     flush → pop_front → imm_drained_tx wake).
 //   - Live cluster verification documented in feature_list.md F120.
 // Constructing a `PartitionData` directly in a unit test would require a
@@ -10835,7 +10835,7 @@ mod merged_loop_tests {
                 msg_type: MSG_PUT,
                 payload,
                 resp_tx,
-                zc_value: None,
+                bulk_value: None,
             },
             resp_rx,
         )
@@ -10858,7 +10858,7 @@ mod merged_loop_tests {
                 msg_type: MSG_DELETE,
                 payload,
                 resp_tx,
-                zc_value: None,
+                bulk_value: None,
             },
             resp_rx,
         )
@@ -12481,33 +12481,33 @@ mod f148_publisher_invariant_tests {
 #[cfg(test)]
 mod f255_invalidate_plumbing_tests {
     //! F255 — regression guards for the two coco-audit findings (Bug #1 split
-    //! → P-bulk RowAppendReq missed invalidate; Bug #2 P-bulk readiness
+    //! → P-sst RowAppendReq missed invalidate; Bug #2 P-sst readiness
     //! handshake).
     //!
     //! Bug #1 v1 attempt (lazy `Cell<bool>` flag piggybacked on
     //! `FlushReq.invalidate_row_stream` + `RowAppendReq.invalidate_row_stream`)
     //! was found racy by coco /arch GPT-5.5 in a second-pass review: with
-    //! P-bulk's `FuturesUnordered` cap=2, the post-split fetch-and-clear
+    //! P-sst's `FuturesUnordered` cap=2, the post-split fetch-and-clear
     //! pattern let a queued `FlushReq(invalidate=false)` (flag already taken
-    //! by an earlier `RowAppendReq(invalidate=true)`) enter P-bulk's FU
+    //! by an earlier `RowAppendReq(invalidate=true)`) enter P-sst's FU
     //! ALONGSIDE the invalidating request — the FlushReq's append could land
     //! on the stale per-stream worker BEFORE the RowAppendReq's invalidate
     //! ran. v3 final replaces the lazy flag with a SYNCHRONOUS P-log →
-    //! P-bulk barrier (`RowInvalidateBarrierReq`): `handle_split_part` sends
+    //! P-sst barrier (`RowInvalidateBarrierReq`): `handle_split_part` sends
     //! it BETWEEN `commit_length` capture and `multi_modify_split` (inside
     //! the critical section guarded by per-partition `compact_gate` +
     //! PS-wide `acquire_compact` + per-partition `gc_gate` +
     //! `frozen_for_split`). The pre-seal placement is REQUIRED for clean
     //! abort: barrier failure leaves the manager not yet committed.
-    //! P-bulk drains its FuturesUnordered to ZERO, calls
-    //! `bulk_sc.invalidate_stream(...)`, and ACKs; only then does split
+    //! P-sst drains its FuturesUnordered to ZERO, calls
+    //! `sst_sc.invalidate_stream(...)`, and ACKs; only then does split
     //! call `multi_modify_split`, then release its gates. BOTH the send and
     //! the ACK are bounded by separate timers (5 s + 10 s, total well under
-    //! `FREEZE_TTL`'s 30 s backstop) so a wedged P-bulk can't extend the
+    //! `FREEZE_TTL`'s 30 s backstop) so a wedged P-sst can't extend the
     //! window past TTL and let stale `commit_length` reach
     //! `multi_modify_split`. Race window structurally closed.
     //!
-    //! Bug #2 fix (P-bulk readiness handshake) is unchanged from v1.
+    //! Bug #2 fix (P-sst readiness handshake) is unchanged from v1.
     use super::*;
     use futures::channel::{mpsc, oneshot};
 
@@ -12582,9 +12582,9 @@ mod f255_invalidate_plumbing_tests {
         });
     }
 
-    /// Bug #2 regression: `spawn_bulk_thread`'s readiness channel surfaces
+    /// Bug #2 regression: `spawn_sst_thread`'s readiness channel surfaces
     /// thread-abort as `Err(_canceled)` rather than hanging the open path.
-    /// Pre-F255 `spawn_bulk_thread` returned `Ok(JoinHandle)` as soon as the
+    /// Pre-F255 `spawn_sst_thread` returned `Ok(JoinHandle)` as soon as the
     /// OS thread spawn succeeded; runtime / `StreamClient` init failures
     /// inside the thread logged + returned, leaving P-log with a Sender
     /// targeting a dead Receiver. Simulated here by dropping the sender

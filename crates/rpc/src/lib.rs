@@ -318,9 +318,9 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   [header][ctrl_len:4][ctrl…][crc32c:4][value…], crc over header+ctrl,
     //   value raw (transport + storage integrity). FLAG_CRC bit retired
     //   (protection is no longer optional → no flag to flip off); the 9-byte
-    //   zc_meta + encode_no_crc CRC-less shape deleted; ZC read responses
+    //   bulk_ctrl + encode_no_crc CRC-less shape deleted; bulk read responses
     //   carry `[code][message]` in the CRC'd ctrl (errors finally have a
-    //   human-readable message); MSG_PUT_ZC's value is excluded from the crc
+    //   human-readable message); MSG_PUT_BULK's value is excluded from the crc
     //   (the sender no longer crc-scans the value — F219 completed).
     //   MSG_APPEND is the ONE deliberate exception: its bulk payload stays
     //   inside ctrl (durability path keeps in-transit CRC).
@@ -329,7 +329,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   (loud connection error) instead of reaching the GetClusterId version
     //   handshake — acceptable under same-commit deploys, better than silent
     //   garbage. Pre-R3: MIN=MAX=28.
-    (28, "db105c702b8ff770"),
+    //   v28 fingerprint refreshed IN PLACE twice pre-deploy (sanctioned
+    //   refinement precedent, v25 SD-2 / v27): ① the F-VALUEBUF batch,
+    //   ② the bulk-vocabulary rename (zc→bulk everywhere: the old name
+    //   claimed an effect — zero-copy — that is a property of memory
+    //   provenance × transport, not of the wire structure; the structure is
+    //   value-separable "bulk" framing. Wire BYTES unchanged: msg_type
+    //   values 0x50/0x51/15 keep their numbers, only const/API names moved).
+    (28, "7e04e6c6cbf5a759"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

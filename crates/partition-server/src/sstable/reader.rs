@@ -57,8 +57,8 @@ pub struct SstReader {
     sst_base: u64,
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
     /// Mutex (not RefCell) so SstReader is Sync and can be shared across
-    /// P-log/P-bulk via Arc without the unsafe Rc→Arc transmute that the
-    /// codebase carried pre-F092. In practice only P-log reads blocks; P-bulk
+    /// P-log/P-sst via Arc without the unsafe Rc→Arc transmute that the
+    /// codebase carried pre-F092. In practice only P-log reads blocks; P-sst
     /// only consumes freshly built SstReaders via oneshot move. Contention is
     /// near-zero; the two-phase locking in read_block allows idempotent
     /// concurrent misses.

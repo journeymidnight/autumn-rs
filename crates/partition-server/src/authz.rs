@@ -18,10 +18,10 @@ use std::sync::Arc;
 use autumn_rpc::cap_token::{verify_token, AuthReject};
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
-    self, parse_put_zc_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
+    self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
     HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT, MSG_DELETE, MSG_GET,
-    MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_ZC, MSG_HEAD, MSG_PUT, MSG_PUT_ZC, MSG_RANGE,
-    PUT_ZC_HEADER_LEN,
+    MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
+    PUT_BULK_HEADER_LEN,
 };
 use autumn_rpc::StatusCode;
 use ed25519_dalek::VerifyingKey;
@@ -291,7 +291,7 @@ fn check_range(
 /// A frame that fails to decode returns `None` (admit) — the real handler will
 /// reject it with `InvalidArgument`. This is safe because the gate and the
 /// handler extract the key with the SAME decode (`rkyv_decode` for the rkyv
-/// requests, `parse_put_zc_meta` for `MSG_PUT_ZC`): a payload that fails to
+/// requests, `parse_put_bulk_meta` for `MSG_PUT_BULK`): a payload that fails to
 /// parse here fails identically in the handler, so no bytes are ever served.
 ///
 /// **INVARIANT (load-bearing — an authz bypass = cross-tenant data exposure):
@@ -326,7 +326,7 @@ pub fn authz_check(
     now: u64,
 ) -> Option<(StatusCode, String)> {
     match msg_type {
-        MSG_GET | MSG_GET_ZC | MSG_GET_REDIRECT => {
+        MSG_GET | MSG_GET_BULK | MSG_GET_REDIRECT => {
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
@@ -350,16 +350,16 @@ pub fn authz_check(
         }
         MSG_PUT => {
             // Value copied by rkyv_decode, but MSG_PUT is only used for values
-            // < 64 KiB (large values go MSG_PUT_ZC, key extracted below without
+            // < 64 KiB (large values go MSG_PUT_BULK, key extracted below without
             // copying the value), so the copy is bounded — and only when authz
             // is enabled.
             let r = partition_rpc::rkyv_decode::<PutReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
-        MSG_PUT_ZC => {
+        MSG_PUT_BULK => {
             // Zero value copy: the key is a slice of the binary meta header.
-            let meta = parse_put_zc_meta(payload)?;
-            let key = payload.get(PUT_ZC_HEADER_LEN..meta.value_offset)?;
+            let meta = parse_put_bulk_meta(payload)?;
+            let key = payload.get(PUT_BULK_HEADER_LEN..meta.value_offset)?;
             check_key(key, principal, inner, now)
         }
         MSG_RANGE => {
@@ -444,9 +444,9 @@ pub fn check_layer_a(
                 reject(&r.key)
             }
         }
-        MSG_PUT_ZC => {
-            let meta = parse_put_zc_meta(payload)?;
-            let key = payload.get(PUT_ZC_HEADER_LEN..meta.value_offset)?;
+        MSG_PUT_BULK => {
+            let meta = parse_put_bulk_meta(payload)?;
+            let key = payload.get(PUT_BULK_HEADER_LEN..meta.value_offset)?;
             if in_a_namespace(key, &inner.namespaces) {
                 None
             } else {

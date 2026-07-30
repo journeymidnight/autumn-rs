@@ -9,7 +9,7 @@
 //! - A full buffer flushes the WHOLE buffer at once via `extent::write_region`,
 //!   which splits it into `WRITE_BUF_EXTENTS` ≤ `MAX_EXTENT` extents and
 //!   dispatches the puts via `put_many` (SDK groups by partition + one
-//!   MSG_BATCH_PUT/MSG_PUT_ZC per group). Pre-pipelining the buffer was exactly
+//!   MSG_BATCH_PUT/MSG_PUT_BULK per group). Pre-pipelining the buffer was exactly
 //!   `MAX_EXTENT` and the flush was a single serial `put` — the cp ceiling
 //!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ WRITE_BUF_EXTENTS *
 //!   MAX_EXTENT / RPC_RTT` until disk + replica fanout saturates.

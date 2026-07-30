@@ -167,7 +167,7 @@ pub(crate) async fn dispatch_partition_rpc(
 
 /// Outcome of the shared GET resolve core: the value bytes, or a not-found.
 /// `Value` is a `Bytes` that, for a VP read over UCX, ALIASES the registered
-/// RegPool buffer (R4) — `handle_get_zc` sends it as its own iovec (no copy);
+/// RegPool buffer (R4) — `handle_get_bulk` sends it as its own iovec (no copy);
 /// `handle_get` copies it into the rkyv `GetResp` (which copies regardless).
 pub(crate) enum GetOutcome {
     NotFound,
@@ -244,7 +244,7 @@ pub(crate) async fn handle_batch_get(
 /// (`!sealed`) has a replica on a Fenced node — recovery rebuilds only SEALED
 /// extents, so without a roll an idle partition's open tail on a fenced node
 /// never drains and blocks `remove` forever. Log/meta tails roll on P-log's
-/// `part_sc` (the client that owns them); the row tail routes through P-bulk's
+/// `part_sc` (the client that owns them); the row tail routes through P-sst's
 /// `row_invalidate_tx` barrier with `seal_and_roll=true` (row_stream
 /// single-writer invariant — lib.rs note 16). Idempotent: an entry whose
 /// current tail no longer equals the requested `expected_tail` (already rolled
@@ -289,7 +289,7 @@ pub(crate) async fn handle_roll_tails(
             continue; // already rolled by a natural write or a prior sweep
         }
         if stream_id == row_id {
-            // row_stream single-writer invariant: seal+roll on P-bulk's bulk_sc
+            // row_stream single-writer invariant: seal+roll on P-sst's sst_sc
             // via the F255 barrier (drains inflight to zero first).
             let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let mut inv_tx = row_inv_tx.clone();
@@ -488,20 +488,20 @@ pub(crate) async fn handle_get_redirect_many(
     Ok(partition_rpc::rkyv_encode(&GetRedirectManyResp { results }))
 }
 
-/// F216 zero-copy GET (MSG_GET_ZC): returns the response as TWO segments —
-/// `(head, value)` where `head = [CRC-less frame header][ZC meta: code +
+/// F216 zero-copy GET (MSG_GET_BULK): returns the response as TWO segments —
+/// `(head, value)` where `head = [CRC-less frame header][bulk meta: code +
 /// value_len + reserved]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
 /// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
 /// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
 /// NO concat copy — fully zero-copy EN->PS->client. (Pre-R4 this concatenated
 /// `[meta][value]` into a Vec, copied again by `encode_v0`.)
 ///
-/// ALL outcomes (incl errors) map to a ZC-shaped response — the status (and,
+/// ALL outcomes (incl errors) map to a bulk-shaped response — the status (and,
 /// since v28, a human-readable message) rides in the CRC-protected ctrl; the
 /// SDK's get_into maps non-OK codes to refresh/retry. StatusCode discriminants
 /// align with the partition CODE_* for the GET-relevant cases
 /// (InvalidArgument=2, FailedPrecondition=3, Internal=4). So this never errors.
-pub(crate) async fn handle_get_zc(
+pub(crate) async fn handle_get_bulk(
     req_id: u32,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -513,21 +513,21 @@ pub(crate) async fn handle_get_zc(
         Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
         Err((status, msg)) => (status as u8, msg, Bytes::new()),
     };
-    (ps_zc_head(req_id, code, &msg, value.len()), value)
+    (ps_bulk_head(req_id, code, &msg, value.len()), value)
 }
 
-/// Build the MSG_GET_ZC response head — v28 value-separable frame head
+/// Build the MSG_GET_BULK response head — v28 value-separable frame head
 /// `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl; see
 /// autumn-rpc frame.rs). The value is sent as a SEPARATE `Bytes` right after
 /// (aliasing the RegPool buffer) so it is never copied and never crc-scanned.
-/// Mirrors `extent_node::zc_read_head`.
-pub(crate) fn ps_zc_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
-    autumn_rpc::frame::encode_zc_response_head(req_id, MSG_GET_ZC, code, msg, value_len)
+/// Mirrors `extent_node::bulk_read_head`.
+pub(crate) fn ps_bulk_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
+    autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_GET_BULK, code, msg, value_len)
 }
 
 /// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →
 /// VP resolve (read_value_from_log). Used by both `handle_get` (rkyv) and
-/// `handle_get_zc` (value-separable). Carries the read metrics.
+/// `handle_get_bulk` (value-separable). Carries the read metrics.
 // clippy false-positive: the `part.borrow()` (`p`) is explicitly `drop(p)`-ed
 // (see below) BEFORE the only `.await` (`resolve_value`). The lint flags the
 // borrow because an await exists later in the fn; it doesn't track the drop.
@@ -540,7 +540,7 @@ async fn get_value(
 }
 
 /// F259: `redirect_large_vp` — when true, a FULL-value read of a VP whose
-/// value length >= AUTUMN_PS_ZC_RECV_MIN (64 KiB, the zc_worthwhile
+/// value length >= AUTUMN_PS_ZC_RECV_MIN (64 KiB, the bulk_worthwhile
 /// threshold) returns `GetOutcome::Redirect` (extent + exact value byte
 /// range) instead of resolving through this PS. Sub-range reads, inline
 /// values and small VPs resolve as before. The GC writer-pin check still
@@ -1154,7 +1154,7 @@ pub(crate) async fn handle_split_part(
     //      dedicated per-partition gate.
     //   2. **PS-wide `concurrency.acquire_compact`** (F196 D-r7) — caps
     //      cross-partition peak RAM. Inner to the gate.
-    // Both RAII-held through `multi_modify_split` AND the F255 P-bulk barrier
+    // Both RAII-held through `multi_modify_split` AND the F255 P-sst barrier
     // ACK below.
     let (maintenance_gate, concurrency) = {
         let p = part.borrow();
@@ -1406,7 +1406,7 @@ pub(crate) async fn handle_split_part(
         .await
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
 
-    // F255 — synchronous P-log → P-bulk barrier. Sent BEFORE
+    // F255 — synchronous P-log → P-sst barrier. Sent BEFORE
     // `multi_modify_split` so that any failure here is cleanly abortable:
     // the manager has not yet sealed the row_stream tail, so unfreezing
     // and returning Err leaves the cluster in a coherent pre-split state.
@@ -1414,19 +1414,19 @@ pub(crate) async fn handle_split_part(
     // unrecoverable window — manager-committed seal + local state not
     // converged + freeze cleared (per coco /findbugs 2026-06-02 v2 review).
     //
-    // The barrier itself: P-bulk drains its in-flight FuturesUnordered to
-    // zero and calls `bulk_sc.invalidate_stream(row_stream_id)` so the
-    // cached per-stream worker is discarded. Any future P-bulk op (after
+    // The barrier itself: P-sst drains its in-flight FuturesUnordered to
+    // zero and calls `sst_sc.invalidate_stream(row_stream_id)` so the
+    // cached per-stream worker is discarded. Any future P-sst op (after
     // gates release) re-fetches a fresh tail — by then `multi_modify_split`
     // will have sealed the old tail and the manager will return the
     // post-seal extent. At the moment of THIS send, gates are still held +
-    // `frozen_for_split` halts new writes, so P-bulk's queue is normally
+    // `frozen_for_split` halts new writes, so P-sst's queue is normally
     // empty (the priority-biased select in `flush_worker_loop` keeps the
     // ordering race-free defensively).
     //
     // Pre-F255 v2 (and the F255 v1 lazy-flag attempt) this was a
     // `Cell<bool> need_invalidate_row_stream` flag piggybacked on each
-    // P-bulk message — racy under P-bulk's cap=2 FuturesUnordered (see
+    // P-sst message — racy under P-sst's cap=2 FuturesUnordered (see
     // F255 fix history in `partition-server/CLAUDE.md` programming note 16).
     let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<()>();
     let mut inv_tx = part.borrow().row_invalidate_tx.clone();
@@ -1439,7 +1439,7 @@ pub(crate) async fn handle_split_part(
     // (30 s, lib.rs) is the partition's unconditional "the handler is
     // wedged, unfreeze and resume writes" backstop (see
     // `check_freeze_ttls`). If EITHER step were unbounded, a wedged
-    // P-bulk could block the await past the TTL; `check_freeze_ttls`
+    // P-sst could block the await past the TTL; `check_freeze_ttls`
     // would unfreeze, new writes would resume + extend the row_stream
     // tail past the already-captured `commit_length`, and the eventual
     // continuation would call `multi_modify_split` with the STALE
@@ -1447,13 +1447,13 @@ pub(crate) async fn handle_split_part(
     // end up above sealed_length, invisible on recovery (coco /findbugs
     // v4/v5, 2026-06-02). The SEND can block independently of the ACK:
     // `row_invalidate_tx` is capacity 1 (only `handle_split_part`
-    // sends), so a still-queued prior-split barrier whose P-bulk
+    // sends), so a still-queued prior-split barrier whose P-sst
     // processing never completed (e.g. permanently-down replica on
     // flush) would back-pressure us here BEFORE the ACK timeout could
     // even arm. Two separate timers (5 s + 10 s) keep the total budget
     // (15 s) safely under FREEZE_TTL while still leaving ample
     // happy-path headroom (when nothing's wedged the send is
-    // microseconds and the ACK lands on the next P-bulk poll).
+    // microseconds and the ACK lands on the next P-sst poll).
     let send_timeout = std::time::Duration::from_secs(5);
     let ack_timeout = std::time::Duration::from_secs(10);
     {
@@ -1467,7 +1467,7 @@ pub(crate) async fn handle_split_part(
                 part.borrow().frozen_for_split.set(None);
                 return Err((
                     StatusCode::Internal,
-                    "split: P-bulk row_invalidate channel closed".to_string(),
+                    "split: P-sst row_invalidate channel closed".to_string(),
                 ));
             }
             futures::future::Either::Right(_elapsed) => {
@@ -1475,7 +1475,7 @@ pub(crate) async fn handle_split_part(
                 return Err((
                     StatusCode::FailedPrecondition,
                     format!(
-                        "split: P-bulk row_invalidate send timed out after {}s (channel full \
+                        "split: P-sst row_invalidate send timed out after {}s (channel full \
                          from prior wedged split); client may retry",
                         send_timeout.as_secs()
                     ),
@@ -1491,7 +1491,7 @@ pub(crate) async fn handle_split_part(
             part.borrow().frozen_for_split.set(None);
             return Err((
                 StatusCode::Internal,
-                "split: P-bulk row_invalidate ACK dropped (bulk thread aborted)".to_string(),
+                "split: P-sst row_invalidate ACK dropped (bulk thread aborted)".to_string(),
             ));
         }
         futures::future::Either::Right(_elapsed) => {
@@ -1499,7 +1499,7 @@ pub(crate) async fn handle_split_part(
             return Err((
                 StatusCode::FailedPrecondition,
                 format!(
-                    "split: P-bulk row_invalidate barrier ACK timeout after {}s (bulk thread \
+                    "split: P-sst row_invalidate barrier ACK timeout after {}s (bulk thread \
                      wedged); client may retry",
                     ack_timeout.as_secs()
                 ),
@@ -1616,7 +1616,7 @@ pub(crate) async fn handle_split_part(
     part_sc.invalidate_stream(log_stream_id);
     part_sc.invalidate_stream(row_stream_id);
     part_sc.invalidate_stream(meta_stream_id);
-    // (F255 — P-bulk row_invalidate barrier was already done BEFORE
+    // (F255 — P-sst row_invalidate barrier was already done BEFORE
     // multi_modify_split above; see commentary at the barrier send site.)
 
     // Narrow PS-local rg to match the manager's new left range and

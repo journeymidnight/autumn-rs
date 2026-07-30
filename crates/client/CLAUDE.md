@@ -39,7 +39,7 @@ Constructors:
 
 Semantics / invariants:
 - **Bind a key exactly once per wire request.** Binding happens at each op's ENTRY
-  (`put`/`get`/`delete`/`head`/`put_zc`/`get_range`/`get_range_into`/`get_direct`; batch
+  (`put`/`get`/`delete`/`head`/`put_bulk`/`get_range`/`get_range_into`/`get_direct`; batch
   ops bind each key; `range` binds+clamps+strips). The bound key flows to both routing
   AND the payload closure. `*_bound`/`*_core`/`*_opts` are UNBOUND cores (they receive
   already-bound keys) so a scoped op never double-prefixes.
@@ -61,7 +61,7 @@ Semantics / invariants:
 with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation
 → rcache/memh zero-copy; TCP runtime: plain recycler, no per-op alloc/zero). Write side:
 `alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `freeze() → Bytes` →
-`put_zc`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
+`put_bulk`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
 (zero SDK-side copies); read in place or `freeze()` for a framework sink. Dropping
 either returns the slab to the pool. Cross-thread drop of a frozen `Bytes` is legal but
 frees the slab instead of re-pooling (regpool home-thread guard — foreign-TLS re-pooling
@@ -70,10 +70,13 @@ anti-pattern: on UCX every send from a fresh address re-registers (~100 µs × r
 the rcache entry dies with the free — there is NO explicit registration anywhere;
 UCX zero-copy is decided by the value's memory provenance via the implicit rcache.
 
-**What `_zc` promises (naming contract):** `MSG_*_ZC` (wire) = value-separable layout —
-the value is a raw tail, never encoded or CRC-scanned. `*_zc`/`*_pooled` (SDK) = the
-SDK+RPC path itself adds ZERO value copies. Neither says how the value got into the
-`Bytes` — TRUE end-to-end zero-copy additionally depends on the SOURCE: (1) producer
+**What `bulk` names (naming contract):** `MSG_*_BULK` (wire) = value-separable
+framing — the value rides in the v28 frame's raw value region, never encoded or
+CRC-scanned. `*_bulk`/`*_pooled` (SDK) = the SDK+RPC path itself adds ZERO value
+copies. Deliberately named after the STRUCTURE, not an effect: the pre-rename `_zc`
+("zero-copy") suffix baked a copies claim into a wire-layout name, and the claim only
+holds under conditions the name can't see. TRUE end-to-end zero-copy additionally
+depends on the SOURCE: (1) producer
 writes directly into pool memory (autumnfs reads file chunks straight into a slab) =
 0 copies + stable; (2) producer's own memory is already stable (kvcache aliases pinned
 torch pages) = 0 copies + stable; (3) producer hands you its own fresh allocation
@@ -85,21 +88,21 @@ the API suffix.
 - `put(key, value, must_sync)` — write a key-value pair.
 - `get(key) → Option<Vec<u8>>` — read, `None` if not found.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
-  **ZC read, ZERO SDK-side copies** — the CORE every ZC read routes through. The value
-  arrives in a read_loop-owned RegPool buffer (`MSG_GET_ZC` + `call_into_pooled`; UCX
+  **bulk read, ZERO SDK-side copies** — the CORE every bulk read routes through. The value
+  arrives in a read_loop-owned RegPool buffer (`MSG_GET_BULK` + `call_into_pooled`; UCX
   RDMAs into the registered slab, TCP ≥ 64 KiB pays only the kernel copy) and is handed
   straight back. The address-UNCONSTRAINED shape ("I just want the value"): autumnfs
   cat/get, gallery serving, any consumer without a fixed destination. Any value size.
   Honors `rpc_timeout` (pooled recv is cancel-safe).
-- `get_into(key, dest: &mut [u8]) → Option<usize>` — **ZC read, one copy**:
+- `get_into(key, dest: &mut [u8]) → Option<usize>` — **bulk read, one copy**:
   `get_range_pooled` + ONE memcpy into `dest`. For address-CONSTRAINED consumers only
   (sglang pages / torch tensors / python buffers / fuse assembly) — the copy is inherent
   there (bytes must land at THEIR address; recv-into-caller-memory was removed for
   cancel-safety). Returns `Some(value_len)` (`dest[..value_len.min(dest.len())]` filled;
   longer values TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`)
   or `None`.
-- `put_zc(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy AND
-  no value crc scan via `MSG_PUT_ZC` + `RpcClient::call_vectored_zc` (v28: `[meta][key]`
+- `put_bulk(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy AND
+  no value crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]`
   is the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing
   memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered). Same
   routing + refresh + retry + inline-cap rules as `put`. The frame decoder hands the PS
@@ -121,30 +124,30 @@ All three route through the plain `put`/`get`/`delete` (see the binding invarian
 ## Public API — batched operations
 
 All batch APIs are thin wrappers over the `fan_out` / `fan_out_collect` primitive; per-op
-ZC decisions go through `zc_worthwhile`. No `concurrency` arg — internal defaults apply.
+bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal defaults apply.
 
 - `put_many(items: &[(key, Bytes, expires_at)]) → Vec<Result<()>>` — **public batched
   write.** Third tuple field is `expires_at` (Unix-epoch seconds; `0` = no TTL); convert
   a relative TTL with `ClusterClient::ttl_to_expires_at(ttl_secs)`. SDK groups by owning
   partition: values < 64 KiB → one `MSG_BATCH_PUT` per partition (server decodes one
   frame, atomically injects all ops into `partition_loop.pending`); values ≥ 64 KiB →
-  per-op `MSG_PUT_ZC` fanned out CONCURRENTLY via
+  per-op `MSG_PUT_BULK` fanned out CONCURRENTLY via
   `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)`. Result `i` matches `items[i]`.
 - `put_many_fenced(items, lease: WriteLease) → Vec<Result<()>>` — lease-fenced
   `put_many`: every item stamped with the SAME `(inode_hint, lease_epoch)` (one inode's
   flush). A fenced item returns `AutumnError::Fenced` in its result slot.
 - `get_many(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` — **simpler batched read.**
   SDK allocates a `Vec<u8>` per value; one `MSG_BATCH_GET` per partition. Use when you
-  don't know value sizes, don't want to pre-alloc dests, or values are < 64 KiB (ZC
+  don't know value sizes, don't want to pre-alloc dests, or values are < 64 KiB (bulk
   wouldn't engage).
-- `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **ZC batched
+- `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **bulk batched
   read.** Use when values ≥ 64 KiB AND you have caller-owned dest buffers (sglang pages /
-  torch tensors). Each `GetManyItem` = `{key, offset, length, dest}`. The ZC recv lands
+  torch tensors). Each `GetManyItem` = `{key, offset, length, dest}`. The bulk recv lands
   in a read_loop-owned RegPool buffer (UCX RDMAs into the registered slab; TCP owned
   read), then ONE memcpy into `dest` — `dest` needs no registration and no special
   lifetime. Auto-routes: HOMOGENEOUS small whole-value batch (every item `offset==0`,
   `length==0`, `dest.len() < 64 KiB`) → delegates to `get_many` + memcpy into each `dest`;
-  MIXED / range / large-ZC → per-op fan-out (`MSG_GET_ZC` pooled recv when `read_len ≥ 64
+  MIXED / range / large-bulk → per-op fan-out (`MSG_GET_BULK` pooled recv when `read_len ≥ 64
   KiB`, else `MSG_GET` + memcpy). Result `i` matches `items[i]`.
 - `get_many_direct(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **EN-DIRECT
   batch read.** Same dest shape as `get_many_into`, but each item with length ≥ 64 KiB is
@@ -162,7 +165,7 @@ ZC decisions go through `zc_worthwhile`. No `concurrency` arg — internal defau
   failover are safe); the win over `get_many_into` is ROUTING (PS NIC egress leaves the
   large-value data path), not copy count.
 - `delete_many(keys) → Vec<Result<()>>` / `head_many(keys) → Vec<Result<KeyMeta>>` —
-  batched delete / metadata. Client-side fan-out (no server `MSG_BATCH_*`), no ZC (tiny).
+  batched delete / metadata. Client-side fan-out (no server `MSG_BATCH_*`), no bulk (tiny).
   `delete_many` uses `BATCH_PUT_DEFAULT_CONCURRENCY`, `head_many` uses
   `BATCH_GET_DEFAULT_CONCURRENCY`. `head_many` returns `found=false` for a missing key
   (not `Err`).
@@ -185,29 +188,29 @@ Module-level, `pub`. All batch APIs are thin wrappers over ONE streaming primiti
   io_uring daemon, one CQE per finished SQE, no head-of-line wait) — the reason a
   batch-COLLECT primitive like `get_many_into` is the wrong fit there.
 
-## Zero-copy selection rule — `zc_worthwhile`
+## Bulk-value selection rule — `bulk_worthwhile`
 
-The SDK exposes both regular (`get`/`put`) and zero-copy (`get_into`/`put_zc`) ops; the
-SELECTION is encapsulated in `autumn_client::zc_worthwhile(value_size) -> bool` — **the
+The SDK exposes both regular (`get`/`put`) and zero-copy (`get_into`/`put_bulk`) ops; the
+SELECTION is encapsulated in `autumn_client::bulk_worthwhile(value_size) -> bool` — **the
 ONE source of truth** that perf-check, the python `BatchClient`, and `get_many_into` all
 call.
 
-**One symmetric rule — engage ZC iff `value_size >= UCX_ZC_READ_MIN_BYTES` (64 KiB), for
+**One symmetric rule — engage bulk iff `value_size >= BULK_MIN_BYTES` (64 KiB), for
 BOTH reads and writes AND BOTH transports.** This is the INTENT gate (which msg_type/API
 to use, from the size the sender knows/expects); the two RECEIVERS re-decide their recv
-strategy on the ACTUAL size with the same 64 KiB — the client read_loop for GET-ZC
-responses (`TCP_RECV_INTO_POOLED_MIN_BYTES`), the PS ps-conn loop for PUT_ZC requests
-(`AUTUMN_PS_ZC_RECV_MIN_BYTES`) — because a reply/request can legitimately be smaller
-than the intent predicted (error/NotFound = 0-length value; bare `put_zc` doesn't gate).
+strategy on the ACTUAL size with the same 64 KiB — the client read_loop for GET-bulk
+responses (`TCP_RECV_INTO_POOLED_MIN_BYTES`), the PS ps-conn loop for PUT_BULK requests
+(`AUTUMN_PS_BULK_RECV_MIN_BYTES`) — because a reply/request can legitimately be smaller
+than the intent predicted (error/NotFound = 0-length value; bare `put_bulk` doesn't gate).
 All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 KiB) are
 deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop
 dispatch (4-way)". Below 64 KiB the per-op registered/pooled-recv machinery costs more
-than the copy it saves AND the recv side doesn't ZC anyway, so e2e ZC doesn't engage;
-at/above it ZC wins on both transports (UCX RDMA into the registered pool slab /
+than the copy it saves AND the recv side doesn't bulk anyway, so e2e bulk doesn't engage;
+at/above it bulk wins on both transports (UCX RDMA into the registered pool slab /
 registered-send; TCP pooled recv dropping the rkyv wrap + FrameDecoder accumulation +
 owned-`Vec` alloc).
 
-There is no `--zc` / `zc=` flag — call `zc_worthwhile(size)`. The const + helper live in
+There is no `--bulk` / `bulk=` flag — call `bulk_worthwhile(size)`. The const + helper live in
 `crates/client/src/lib.rs` so the CLI and the python extension share one source of truth.
 
 ## Public API — maintenance operations
@@ -364,7 +367,7 @@ carried in a successful response body.
 
 ## Constants
 
-- `UCX_ZC_READ_MIN_BYTES = 64 KiB` — ZC engage threshold (both directions/transports).
+- `BULK_MIN_BYTES = 64 KiB` — bulk engage threshold (both directions/transports).
 - `BATCH_PUT_DEFAULT_CONCURRENCY = 32` — put/delete fan-out cap.
 - `BATCH_GET_DEFAULT_CONCURRENCY = 32` — get/head fan-out cap.
 - `MAX_PS_REFRESHES = 10` — routing-refresh retry budget (~9 s), base 100 ms / cap 2000 ms.

@@ -445,31 +445,31 @@ async fn cmd_ycsb(
 #[allow(clippy::too_many_arguments)]
 async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, manager: &str) -> Result<()> {
     let pipeline_depth = pipeline_depth.max(1);
-    // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
-    // with the python BatchClient + `get_many_into` via `zc_worthwhile`:
-    // engage ZC iff value >= 64 KiB, for BOTH reads and writes and BOTH
-    // transports. Mirrors the PS recv gates (client UCX_ZC_READ_MIN_BYTES +
-    // PS AUTUMN_PS_ZC_RECV_MIN_BYTES, both 64 KiB): below 64 KiB the per-op
+    // bulk ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
+    // with the python BatchClient + `get_many_into` via `bulk_worthwhile`:
+    // engage bulk iff value >= 64 KiB, for BOTH reads and writes and BOTH
+    // transports. Mirrors the PS recv gates (client BULK_MIN_BYTES +
+    // PS AUTUMN_PS_BULK_RECV_MIN_BYTES, both 64 KiB): below 64 KiB the per-op
     // registered/pooled-recv machinery exceeds the copy saved (small UCX read
-    // -18%) and the PS recv doesn't ZC anyway. (F234 kept an asymmetric WRITE
+    // -18%) and the PS recv doesn't bulk anyway. (F234 kept an asymmetric WRITE
     // rule `is_ucx || large`; F235 dropped `is_ucx ||` — small UCX writes only
     // saved client-side allocs while the PS still FrameDecoder-copied, i.e.
-    // not real end-to-end ZC.)
-    let zc_write = autumn_client::zc_worthwhile(value_size);
-    let zc_read = autumn_client::zc_worthwhile(value_size);
-    let zc_tag = match (zc_write, zc_read) {
-        (true, true) => " [ZC: MSG_PUT_ZC + MSG_GET_ZC]",
-        (true, false) => " [ZC: MSG_PUT_ZC; read regular]",
+    // not real end-to-end bulk.)
+    let bulk_write = autumn_client::bulk_worthwhile(value_size);
+    let bulk_read = autumn_client::bulk_worthwhile(value_size);
+    let bulk_tag = match (bulk_write, bulk_read) {
+        (true, true) => " [bulk: MSG_PUT_BULK + MSG_GET_BULK]",
+        (true, false) => " [bulk: MSG_PUT_BULK; read regular]",
         _ => "",
     };
     // ---- Write phase ----
     if pipeline_depth > 1 {
         println!(
-            "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth}){zc_tag}"
+            "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth}){bulk_tag}"
         );
     } else {
         println!(
-            "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B){zc_tag}"
+            "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B){bulk_tag}"
         );
     }
 
@@ -491,7 +491,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // shared `fan_out` streaming primitive. A lazy, deadline-bounded
     // iterator yields ONE single-op future per key; `fan_out(.., depth)`
     // keeps `depth` in-flight (sliding window) until the deadline. Each
-    // future is one `kv_put` (put_zc for ZC, else put) — kv_put is the unit
+    // future is one `kv_put` (put_bulk for bulk, else put) — kv_put is the unit
     // the fan-out composes. The SDK routes per key; no per-partition striping.
     // F-KEY-NS D7: user-space starts within the bench namespace (see
     // `bench_user_starts`); the client re-prepends `bench/perf/`.
@@ -562,7 +562,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                     // --bulk N → one put_many per round of N items.
                     // SDK groups by partition, emits one
                     // MSG_BATCH_PUT per group for small values,
-                    // per-op MSG_PUT_ZC for ≥ 64 KiB.
+                    // per-op MSG_PUT_BULK for ≥ 64 KiB.
                     if bulk > 0 {
                         while std::time::SystemTime::now() < *dl {
                             let keys: Vec<String> = (0..bulk)
@@ -602,8 +602,8 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                         let val = vz.clone();
                         Some(async move {
                             let t0 = Instant::now();
-                            let ok = if zc_write {
-                                cref.put_zc(key.as_bytes(), val).await.is_ok()
+                            let ok = if bulk_write {
+                                cref.put_bulk(key.as_bytes(), val).await.is_ok()
                             } else {
                                 cref.put(key.as_bytes(), val.as_ref()).await.is_ok()
                             };
@@ -684,7 +684,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // deterministically (the same `key_for_partition(start_key, "pc", tid,
     // seq)` the write phase used, cycling seq in `0..written`), so every
     // read hits a key the write phase actually stored. Each future is one
-    // kv_get: `get_into` into a per-future dest for ZC (>= 64 KiB), else `get`.
+    // kv_get: `get_into` into a per-future dest for bulk (>= 64 KiB), else `get`.
     let written_per_thread = Arc::new(written_per_thread);
     let deadline =
         Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
@@ -737,7 +737,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                     if bulk > 0 {
                         // --bulk N → one `get_many_into(N items)`
                         // per round. SDK does client-side
-                        // fan-out (ZC `get_into` for ≥ 64 KiB
+                        // fan-out (bulk `get_into` for ≥ 64 KiB
                         // dest, else `get` with a copy into the
                         // dest). One unified knob; same wire
                         // semantics as the prior --batch-get.
@@ -798,7 +798,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                             // key) must NOT count as a successful read.
                             let ok = if direct_read {
                                 matches!(cref.get_direct(key.as_bytes()).await, Ok(Some(_)))
-                            } else if zc_read {
+                            } else if bulk_read {
                                 let mut dest = vec![0u8; value_size];
                                 matches!(cref.get_into(key.as_bytes(), &mut dest).await, Ok(Some(_)))
                             } else {
@@ -1057,15 +1057,15 @@ async fn main() -> Result<()> {
             println!("ok");
         }
 
-        Command::PutZc { key, file } => {
+        Command::PutBulk { key, file } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             let value = bytes::Bytes::from(value);
             // UCX rcache auto-registers the value's backing memory on first
             // send (one-time ~100 µs ibv_reg_mr); no SDK-level reg hook needed.
             client
-                .put_zc(key.as_bytes(), value)
+                .put_bulk(key.as_bytes(), value)
                 .await
-                .map_err(|e| anyhow!("put-zc: {e}"))?;
+                .map_err(|e| anyhow!("put-bulk: {e}"))?;
             println!("ok");
         }
 
@@ -1172,13 +1172,13 @@ async fn main() -> Result<()> {
             }
             Err(e) => bail!("direct-get: {e}"),
         },
-        Command::ZcGet { key } => {
+        Command::BulkGet { key } => {
             // Size the dest from head() (kvcache caller knows the size; the
             // CLI discovers it). Then read the value straight into dest.
             let meta = client
                 .head(key.as_bytes())
                 .await
-                .map_err(|e| anyhow!("zc-get head: {e}"))?;
+                .map_err(|e| anyhow!("bulk-get head: {e}"))?;
             if !meta.found {
                 eprintln!("key not found");
                 std::process::exit(2);
@@ -1195,7 +1195,7 @@ async fn main() -> Result<()> {
                     eprintln!("key not found");
                     std::process::exit(2);
                 }
-                Err(e) => bail!("zc-get: {e}"),
+                Err(e) => bail!("bulk-get: {e}"),
             }
         }
 

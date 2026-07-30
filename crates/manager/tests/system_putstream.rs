@@ -277,8 +277,8 @@ fn f186_get_stream_inline_value_passthrough() {
 }
 
 /// F235 — `get_many_into` batched zero-copy reads. Exercises BOTH branches of
-/// the per-item ZC decision (`zc_worthwhile(dest.len())`): a 4 KiB value (< 64 KiB
-/// → regular `MSG_GET` + copy) and a 256 KiB value (>= 64 KiB → `MSG_GET_ZC`
+/// the per-item bulk decision (`bulk_worthwhile(dest.len())`): a 4 KiB value (< 64 KiB
+/// → regular `MSG_GET` + copy) and a 256 KiB value (>= 64 KiB → `MSG_GET_BULK`
 /// recv-into-dest), plus a missing key (`Ok(None)`).
 #[test]
 #[ignore]
@@ -297,7 +297,7 @@ fn f235_get_many_into_mixed_sizes() {
         let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 120, 12001).await;
 
         let small = pattern(4 * 1024); // < 64 KiB → regular MSG_GET branch
-        let large = pattern(256 * 1024); // >= 64 KiB → MSG_GET_ZC branch
+        let large = pattern(256 * 1024); // >= 64 KiB → MSG_GET_BULK branch
         cluster.put(b"k-small", &small).await.expect("put small");
         cluster.put(b"k-large", &large).await.expect("put large");
 
@@ -358,8 +358,8 @@ fn f235_get_many_into_mixed_sizes() {
 }
 
 /// F236 — `put_many` batched zero-copy writes. Exercises BOTH branches of the
-/// per-item ZC decision (`zc_worthwhile(value.len())`): a 4 KiB value (< 64 KiB →
-/// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_ZC`), then reads
+/// per-item bulk decision (`bulk_worthwhile(value.len())`): a 4 KiB value (< 64 KiB →
+/// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_BULK`), then reads
 /// each back byte-for-byte.
 #[test]
 #[ignore]
@@ -378,7 +378,7 @@ fn f236_put_many_mixed_sizes() {
         let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 121, 12101).await;
 
         let small = bytes::Bytes::from(pattern(4 * 1024)); // < 64 KiB → MSG_PUT
-        let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_ZC
+        let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_BULK
         let items: [(&[u8], bytes::Bytes, u64); 2] = [
             (b"pm-small", small.clone(), 0u64),
             (b"pm-large", large.clone(), 0u64),

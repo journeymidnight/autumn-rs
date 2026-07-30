@@ -1,5 +1,31 @@
 Date: 2026-07-30
 TaskStatus: not_completed
+Task scope: 【实现完成，仅欠 coco】术语定版 —— zc→bulk 全量改名 + P-bulk→P-sst 腾词。
+  用户裁定链: (1) _zc 含糊——gallery 仍要拷进池；(2) zc 本质是 wire 结构，TCP 下 put 照样
+  有内核拷贝，结构不能拿效果命名；(3) raw 有歧义（调研 brpc attachment / Ceph data segment /
+  NVMe in-capsule / TOAST out-of-line 后）；(4) 定 bulk，冲突的 P-bulk flush 线程改名 P-sst
+  （更准：它就是 SST build+upload 线程）。
+── 执行（两阶段机械清洗，44+14 文件）──
+Phase1 P-bulk→P-sst: env AUTUMN_PS_BULK_INFLIGHT_CAP→AUTUMN_PS_SST_INFLIGHT_CAP（entrypoint.sh/
+  autumn-deploy/ops.md/cluster.sh 同步）、spawn_sst_thread/sst_sc/SST_INFLIGHT_CAP_CELL、
+  线程名 part-N-sst、全部 CLAUDE.md prose。
+Phase2 zc→bulk: MSG_{GET,PUT}_BULK/MSG_READ_BYTES_BULK（0x50/0x51/15 值不变）、put_bulk*/
+  bulk_worthwhile/BULK_MIN_BYTES（原 UCX_ZC_READ_MIN_BYTES）、call_vectored_bulk/BulkResp/
+  BulkPrologue/encode_bulk_response_head/peek+consume_bulk_prologue/parse_bulk_ctrl、
+  drain_bulk_writes/handle_get_bulk/ps_bulk_head/bulk_read_head/enqueue_put_bulk/bulk_value、
+  AUTUMN_PS_BULK_RECV_MIN_BYTES、CLI put-bulk/bulk-get（原 put-zc/zc-get）、python
+  BatchClient.bulk()（原 .zc()）、bench_bulk.py（git mv）、BULK-EXACT 不变量、裸词 zc/ZC prose
+  按词边界清洗（AuthzConfig 等无误伤，perf_check.sh 的 rndv-zcopy 是 UCX 自家协议名保留）。
+  命名契约段落重写（client CLAUDE.md）: bulk 是结构名；zero-copy 是"源出身×传输层"的效果。
+── wire 字节零变化；v28 指纹就地二刷 7e04e6c6cbf5a759（frame/partition_rpc/extent_rpc 改名
+  扰动指纹；v25/v27 先例，v28 未部署）。registry 注释记录两次 in-place refresh 缘由。
+── 验证: workspace check 0 错; rpc 54 / client --lib 41 / transport 10 / PS --lib 204 /
+  stream --lib 114 全绿; manager system_putstream --ignored 7/7 真集群绿。
+── 待办: coco（token 过期，攒 5 commit）; ucx-feature Linux 编译（CP 流水线）。
+
+============================ prior task history ============================
+Date: 2026-07-30
+TaskStatus: not_completed
 Task scope: 【实现完成，仅欠 coco】F-VALUEBUF —— ValueBuf/regpool 中心化的 SDK 数据面 API。
   背景结论（本会话查实）: put_zc 的 value 全仓库无显式注册；kvcache 靠"惰性 rcache +
   稳定 pinned 页"稳态成立（PyBuffer pin + Bytes::from_static alias，python/src/lib.rs:340-362）；

@@ -1102,13 +1102,13 @@ async fn put_handler_inner(
         //   when the body frees).
         // - TCP: the pool buys nothing for an already-allocated source —
         //   send the body's own Bytes directly (clone = refcount, 0 copies).
-        let put_res = if autumn_client::zc_worthwhile(data.len()) {
+        let put_res = if autumn_client::bulk_worthwhile(data.len()) {
             if autumn_client::runtime_transport_is_ucx() {
                 let mut vb = autumn_client::alloc_value_buf(data.len());
                 vb.as_mut_slice().copy_from_slice(&data);
-                client.put_zc(file_key(&filename).as_bytes(), vb.freeze()).await
+                client.put_bulk(file_key(&filename).as_bytes(), vb.freeze()).await
             } else {
-                client.put_zc(file_key(&filename).as_bytes(), data.clone()).await
+                client.put_bulk(file_key(&filename).as_bytes(), data.clone()).await
             }
         } else {
             client.put(file_key(&filename).as_bytes(), &data).await

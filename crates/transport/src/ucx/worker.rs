@@ -99,7 +99,7 @@ pub(crate) fn process_context() -> *mut ucp_context {
             (ucp_feature::UCP_FEATURE_STREAM | ucp_feature::UCP_FEATURE_WAKEUP) as u64;
         // ROOT-CAUSE FIX (multi-worker collapse): this ONE process-global
         // ucp_context is shared by MANY worker threads — PS has 2 per partition
-        // (P-log + P-bulk), the perf-check/BatchClient clients have one per
+        // (P-log + P-sst), the perf-check/BatchClient clients have one per
         // thread (dozens). Context-level operations (the registration cache /
         // ibv_reg_mr that every stream send/recv hits on an rcache miss) are
         // NOT thread-safe unless the context is created with mt_workers_shared.

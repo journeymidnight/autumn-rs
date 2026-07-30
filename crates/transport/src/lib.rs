@@ -470,7 +470,7 @@ impl ReadHalf {
     /// F216 recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
     /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
     /// Single recv (may be partial); caller loops for read_exact semantics.
-    /// TCP errors — the autumn-rpc read_loop handles TCP ZC recvs via
+    /// TCP errors — the autumn-rpc read_loop handles TCP bulk recvs via
     /// `read_exact_into_pooled` / the normal decode + memcpy path, never this
     /// seam. Defined for all builds so autumn-rpc compiles uniformly; on
     /// TCP-only builds it always errors.
@@ -500,7 +500,7 @@ impl ReadHalf {
     /// FrameDecoder accumulation copy (only the unavoidable kernel→userspace
     /// copy remains). The counterpart to UCX's `recv_into` on the recv-side
     /// zero-copy paths (PS←EN read = `call_into_pooled`, PS←client write =
-    /// `drain_zc_writes`). Reads exactly `target - filled` bytes; returns the
+    /// `drain_bulk_writes`). Reads exactly `target - filled` bytes; returns the
     /// filled buffer.
     ///
     /// Cancel-safe: the caller (a read_loop / ps-conn task) OWNS `pb` across the

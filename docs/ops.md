@@ -450,7 +450,7 @@ through recovery, not this path. End-to-end fault injection lives in
 key + slot isolated; plus an all-replicas-corrupt fail-loud negative). That
 harness caught a real read-path bug on its first run: the avali isolation filter
 was wired only into the copy read path, so the two VP-value fast paths
-(`read_value_into_pooled` ZC proxy + `extent_read_descriptor` client-direct)
+(`read_value_into_pooled` bulk proxy + `extent_read_descriptor` client-direct)
 still served the bit-rotted-but-isolated replica — now both filter
 `eligible_replica_slots`. Design: `docs/wal_selfheal_design.md`.
 
@@ -520,7 +520,7 @@ Three properties enforce this (2026-07-13):
   pointers in the memtable, so the gap never tripped and the log_stream replay
   window grew with the dataset. If reopen replay is still large, check
   `autumn-op info --part P` `vp_seed(tail)` vs `replay_floor` spread — a wide
-  spread means flushes are lagging (slow P-bulk / row_stream), not a recovery bug.
+  spread means flushes are lagging (slow P-sst / row_stream), not a recovery bug.
 - **Parallel reopen (BUG3).** `sync_regions_once` opens up to 64 partitions
   concurrently (each recovers on its own OS thread/core). A 32-partition takeover
   recovers in ~single-partition time, not ×32. In the PS log you'll see all
@@ -1649,7 +1649,7 @@ cargo test -p autumn-manager --test f_ioring_lease_4
 cargo test -p autumn-manager --test bug_lease_2_storage_fencing -- --ignored
 # Phase 2 — the floor SURVIVES a PS kill -9 + restart, on both recovery
 # paths (WAL OP_FENCE_BUMP replay; TableLocations.fence_floors checkpoint
-# after a flush), and MSG_PUT_ZC (the fuse/ioring large-write path) is
+# after a flush), and MSG_PUT_BULK (the fuse/ioring large-write path) is
 # fenced too. Manual check: write at epoch 1 then 5 for one ino, kill
 # the PS, restart, retry epoch 1 → must get CODE_FENCED.
 cargo test -p autumn-manager --test bug_lease_2_phase2_persistence -- --ignored
@@ -1675,7 +1675,7 @@ Phase 1 is complete. Future work tracked under separate features:
   "another daemon needs to write NOW" doesn't have to wait for
   the current writer to close.
 
-## Zero-copy model load (F-MODEL-ZC-LOAD + F-REDIRECT-BATCH)
+## Zero-copy model load (F-MODEL-bulk-LOAD + F-REDIRECT-BATCH)
 
 Serve a model that lives in autumn straight into GPU memory via the pinned
 zero-copy read seam (`autumn.Fs.read_into`) + batched EN direct-read, at

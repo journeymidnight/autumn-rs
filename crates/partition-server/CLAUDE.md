@@ -26,12 +26,12 @@ Partition threads — 2 OS threads per partition:
 │     • background_maintenance_loop (compaction + GC on ONE task), flush loop
 │     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
 │     • dedicated StreamClient + ConnPool for log_stream/meta_stream
-├─ part-N-bulk (P-bulk): flush_worker_loop
+├─ part-N-sst (P-sst): flush_worker_loop
 │     • own compio runtime + io_uring + ConnPool + StreamClient
 │     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
 │
-P-log → P-bulk: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
-P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
+P-log → P-sst: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
+P-sst → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 ```
 
 **Thread count**: `1 main + 1 ps-accept + 2N partition` = `2N + 2` OS threads.
@@ -39,7 +39,7 @@ P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 **Why two OS threads per partition?** A 128 MB row_stream flush holds the P-log
 compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait),
 head-of-line-blocking the log_stream 4 KB WAL batches sharing the same io_uring.
-P-bulk gives flush its own runtime so WAL appends make forward progress
+P-sst gives flush its own runtime so WAL appends make forward progress
 concurrently with SST uploads.
 
 **ps-conn handoff (per-partition listeners)**: each partition OS thread binds its
@@ -255,30 +255,30 @@ distinct contiguous offsets regardless of completion order).
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### P-bulk SQ/CQ (flush_worker_loop)
+### P-sst SQ/CQ (flush_worker_loop)
 
 Same FuturesUnordered + select pattern on the bulk thread, cap = 2 (env
-`AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each in-flight flush holds a 128 MB
+`AUTUMN_PS_SST_INFLIGHT_CAP`, range [1, 16]). Each in-flight flush holds a 128 MB
 SST buffer, so the cap is deliberately small. The overlap benefit: while one SST
 uploads via `row_stream.append`, the next flush can start its `build_sst_bytes`
 `spawn_blocking` — CPU (build) overlaps network (upload) without ballooning peak
-memory. P-bulk needs no special `StreamClientConfig`; the stream client derives
+memory. P-sst needs no special `StreamClientConfig`; the stream client derives
 every append deadline from the actual payload size (256 MiB → ~37 s), which also
 covers P-log's large-value log_stream appends.
 
 **Single-writer invariant for row_stream:** ALL appends to `row_stream` MUST go
-through P-bulk's `StreamClient`. Two independent `StreamClient`s track commit
+through P-sst's `StreamClient`. Two independent `StreamClient`s track commit
 position locally; if one writer's stale commit is sent in an append header,
 ExtentNode truncates data written by the other → destroyed SST data and
 `invalid meta_len` corruption on PS restart. `flush_worker_loop` accepts:
 - `FlushReq` (from flush_loop): build SST + row_stream.append
 - `RowAppendReq` (from compaction on P-log): row_stream.append only
 
-Both share P-bulk's single `StreamClient` so the per-stream worker's commit/lease
+Both share P-sst's single `StreamClient` so the per-stream worker's commit/lease
 state stays coherent. **Never use P-log's `part_sc` for row_stream appends**;
 `part_sc` is for log/meta append and row_stream non-append ops (`truncate`,
 `get_stream_info`) only. The invariant is type-level: `open_partition` returns Err
-when P-bulk fails to spawn (the manager reschedules), so
+when P-sst fails to spawn (the manager reschedules), so
 `PartitionData.flush_req_tx` / `row_append_tx` are non-`Option<Sender>` — there is
 no in-thread fallback.
 
@@ -293,7 +293,7 @@ Write requests stamped with `(inode_hint != 0, lease_epoch)` are checked against
 `PartitionData.fence_floors` (per-partition `HashMap<ino, max epoch seen>`):
 `stamped < floor` ⇒ `CODE_FENCED` (a revoked writer's late RPC), else admit +
 raise the floor. All three write entry points run it — `enqueue_put`,
-`enqueue_put_zc` (meta carries the two fields, `PUT_ZC_HEADER_LEN = 44`),
+`enqueue_put_bulk` (meta carries the two fields, `PUT_BULK_HEADER_LEN = 44`),
 `enqueue_batch_put` (per-op; a fenced op gets CODE_FENCED in its statuses slot
 without failing the batch). DELETE is fenced too (`enqueue_delete`).
 
@@ -315,7 +315,7 @@ Persistence — floors survive restart / reschedule:
   max-merges every OP_FENCE_BUMP (idempotent — deliberately bypasses ts-dedup;
   re-applying a checkpoint-covered bump is a no-op).
 
-Client surface: `WriteLease` + `put_fenced`/`put_zc_fenced`/`put_many_fenced`
+Client surface: `WriteLease` + `put_fenced`/`put_bulk_fenced`/`put_many_fenced`
 (`AutumnError::Fenced`); fuse stamps from `held_leases[ino].version`, the ioring
 daemon from `OpenedExtents.lease_version`. `MSG_STREAM_PUT` is REMOVED (0x46
 reserved).
@@ -347,7 +347,7 @@ accumulator.
 as `handle_get`): decode once, brief `borrow()` to snapshot readers/state, loop
 `get_value` per key, pack into one frame. NO zero-copy for the response
 (rkyv-encoded, values inline). For ≥ 64 KiB reads where each value needs its own
-dest, callers use the client `get_many_into` (per-key `MSG_GET_ZC` into
+dest, callers use the client `get_many_into` (per-key `MSG_GET_BULK` into
 caller-owned dests, fan-out via `fan_out_collect`).
 
 ## Open-tail size probe for the cluster overview
@@ -448,7 +448,7 @@ Invariants:
 length `r_len` is `>= 64 KiB` answers with a descriptor `GetRedirectResp {
 extent_id, value_offset, value_len, eversion, replica_addrs }` instead of resolving
 the bytes through this PS; the client (`ClusterClient::get_direct`) reads the range
-straight from an EN (`read_extent_value_direct`, `MSG_READ_BYTES_ZC` zero-copy) and
+straight from an EN (`read_extent_value_direct`, `MSG_READ_BYTES_BULK` zero-copy) and
 falls back to the proxy `get` on ANY failure. Sub-range support (`F-DIRECT-MANY`):
 redirect fires for any VP sub-range with `r_len = (req.length==0 ? vp.len-r_off :
 min(req.length, vp.len-r_off)) >= 64 KiB`, returning `value_offset = vp.offset +
@@ -467,16 +467,16 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   response (`extent_id == 0`); `get_value` (non-redirect callers) never yields
   `GetOutcome::Redirect`. No wire-struct change → no WIRE bump.
 
-### UCX end-to-end zero-copy read (`MSG_GET_ZC`)
+### UCX end-to-end zero-copy read (`MSG_GET_BULK`)
 
-The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value crosses
+The kvcache SDK's `get_into` issues `MSG_GET_BULK` so the value crosses
 `EN → PS → client` with no FrameDecoder/encode copies (the client lands it in a
 registered pool buffer, then one memcpy into the caller's dest). The seam is
 `resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
 `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
-  `RegPool` `PooledBuf` (EN emits `[zc head][value]` as 2 `Bytes`, value aliases
+  `RegPool` `PooledBuf` (EN emits `[bulk head][value]` as 2 `Bytes`, value aliases
   the EN pread buffer — no encode copy). UCX recvs into a *registered* buffer
   (RDMA); TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
@@ -485,9 +485,9 @@ registered pool buffer, then one memcpy into the caller's dest). The seam is
   `read_bytes_from_extent` copy path for EC / chunked / stale-eversion / length==0.
   No value crc is verified (integrity is the transport's job).
 - **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`.
-- **`handle_get_zc`** returns the response as TWO segments `(head, value)`:
-  `head = [header][ctrl_len][code+message][crc]` (v28, built by `ps_zc_head` →
-  `frame::encode_zc_response_head`; the crc covers header+ctrl, the value is a
+- **`handle_get_bulk`** returns the response as TWO segments `(head, value)`:
+  `head = [header][ctrl_len][code+message][crc]` (v28, built by `ps_bulk_head` →
+  `frame::encode_bulk_response_head`; the crc covers header+ctrl, the value is a
   raw tail), `value` is the aliasing `Bytes`. The ps-conn inflight FU output
   type is `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
   `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with no
@@ -502,11 +502,11 @@ timeout-ability, see autumn-rpc CLAUDE "Why pooled-only"). Cancel-safety of the
 registered recv lives in the read_loop that OWNS the `PooledBuf` (returns it to
 the pool on cancel).
 
-### PS write-recv zero-copy (`MSG_PUT_ZC`, large values)
+### PS write-recv zero-copy (`MSG_PUT_BULK`, large values)
 
-Symmetric on the WRITE recv side. `drain_zc_writes` (`lib.rs`) runs in the ps-conn
+Symmetric on the WRITE recv side. `drain_bulk_writes` (`lib.rs`) runs in the ps-conn
 read loop right after `decoder.feed`, BEFORE the normal decode: if the FRONT frame
-is a `MSG_PUT_ZC` whose value is `>= AUTUMN_PS_ZC_RECV_MIN_BYTES` (64 KiB), it
+is a `MSG_PUT_BULK` whose value is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
 recvs the value straight into a `PooledBuf` instead of letting `FrameDecoder`
 accumulate (and copy) it. Mechanics:
 - `peek_header` + `peek_payload` read the frame header and the
@@ -517,19 +517,19 @@ accumulate (and copy) it. Mechanics:
   `PooledBuf`, recv the remainder (UCX `recv_into` registered / TCP
   `read_exact_into_pooled` owned). The V1 frame-crc trailer is consumed off the
   wire (stream alignment) but not validated — value integrity is the transport's
-  job. Normal (non-ZC) frames keep their V1 frame-CRC.
+  job. Normal (non-bulk) frames keep their V1 frame-CRC.
 - The value rides onward as `Bytes::from_owner(pb)` via a
-  `PartitionRequest.zc_value: Option<Bytes>` field; `payload` carries only
-  `[meta][key]`. `enqueue_put_zc` uses `zc_value` directly when present. The PS→EN
+  `PartitionRequest.bulk_value: Option<Bytes>` field; `payload` carries only
+  `[meta][key]`. `enqueue_put_bulk` uses `bulk_value` directly when present. The PS→EN
   `append_batch` send is already rcache-zero-copy (UCX) / Arc-Bytes (TCP).
-- Cancel-safe on both transports: `drain_zc_writes` owns the `PooledBuf` across the
+- Cancel-safe on both transports: `drain_bulk_writes` owns the `PooledBuf` across the
   recv (UCX `InflightSlot` drains the NIC on drop; TCP compio retains the owned
   buffer until the read CQE lands). The d=1 fast path is skipped when
-  `drain_zc_writes` queued a reply (`inflight.is_empty()` guard) to keep in-order
+  `drain_bulk_writes` queued a reply (`inflight.is_empty()` guard) to keep in-order
   replies.
 
 Small writes (< 64 KiB) keep the unchanged FrameDecoder path — the only added cost
-is one `peek_header` + size-check branch per frame. `drain_zc_writes` is SKIPPED
+is one `peek_header` + size-check branch per frame. `drain_bulk_writes` is SKIPPED
 when authz is ON (see authz section).
 
 ## Flush Pipeline
@@ -543,10 +543,10 @@ P-log: background_flush_loop
   3. flush_req_tx.send(req)      ← cross-thread hand-off (capacity 1)
   4. oneshot resp.await
 
-P-bulk: flush_worker_loop
+P-sst: flush_worker_loop
   1. recv FlushReq
   2. build_sst_bytes(imm, vp_eid, vp_off)         ← spawn_blocking (CPU)
-  3. bulk_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
+  3. sst_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
   4. SstReader::from_bytes(...)
   5. resp_tx.send(Ok((new_meta, reader)))
 
@@ -557,7 +557,7 @@ P-log: continuation
   9. save_table_locs_raw(part_sc, meta_stream_id, part.tables.clone(), vp)
 ```
 
-P-bulk spawn failure is fatal-for-this-partition: `open_partition` returns Err and
+P-sst spawn failure is fatal-for-this-partition: `open_partition` returns Err and
 the manager reschedules. There is no in-thread fallback (see row_stream
 single-writer invariant).
 
@@ -565,16 +565,16 @@ After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
 **truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
 
 INVARIANT (checkpoint publication): only P-log may publish `metaStream`
-checkpoints. P-bulk may upload the SST and build the `SstReader`, but it must not
+checkpoints. P-sst may upload the SST and build the `SstReader`, but it must not
 write `TableLocations` from the `FlushReq` snapshot. With
-`AUTUMN_PS_BULK_INFLIGHT_CAP > 1`, two in-flight flushes can complete out of order;
+`AUTUMN_PS_SST_INFLIGHT_CAP > 1`, two in-flight flushes can complete out of order;
 publishing from stale `tables_before` snapshots can drop older SSTs or emit
 duplicate `(extent_id, offset)` entries. The authoritative checkpoint must be
 emitted only after P-log merges `new_meta` into `part.tables`.
 
 **vp snapshot semantics**: the meta_stream checkpoint records the vp
 (`vp_extent_id/vp_offset`) captured at FlushReq send time on P-log — NOT the vp at
-P-bulk commit time. Correctness: during replay, logStream from the snapshot vp
+P-sst commit time. Correctness: during replay, logStream from the snapshot vp
 forward re-inserts any records added after the snapshot (some may already be in the
 just-flushed SST — duplicate entries with the same seq are idempotent). Trade-off:
 avoids a second round trip; slightly more logStream retained until next flush.
@@ -940,7 +940,7 @@ extent. Enabled by widening every extent byte position on the read+append path f
 16→24 B, `SstLocation`, `TableLocations.vp_offset`, SST `MetaBlock.vp_offset`,
 `TableMeta.offset/len`). Bigger extents = fewer extents = less manager/etcd metadata
 pressure. Flows through `set_max_extent_size_bytes` → `max_extent_size_bytes()`, read
-at both `StreamClient::new_with_owner_epoch` sites (P-log + P-bulk). With EC + 16 GiB
+at both `StreamClient::new_with_owner_epoch` sites (P-log + P-sst). With EC + 16 GiB
 extents a shard exceeds 4 GiB, so `read_shard_from_addr` chunks internally to keep
 each `MSG_READ_BYTES` under the frame's `payload_len: u32` ceiling.
 
@@ -967,12 +967,12 @@ handle_split_part(req):
          in_range(auth_rg)) (sorted, dedup, tombstone-/expired-filtered; auth-rg
          filter drops CoW-shared SSTable keys spanning the old wide range)
   4. MEDIAN only: if user_keys.len() < 2 → FailedPrecondition
-  5. flush_memtable_locked(part): rotate active + flush all imm via P-bulk
+  5. flush_memtable_locked(part): rotate active + flush all imm via P-sst
   6. mid_key = user_keys[len/2] (MEDIAN) or req.at_key (EXPLICIT)
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
        (up to 8 retries, backoff 100ms → 2s)
-  8b. Row-stream invalidate BARRIER to P-bulk (see below), INSIDE the critical
+  8b. Row-stream invalidate BARRIER to P-sst (see below), INSIDE the critical
        section BEFORE the manager seal; await the ACK. Then invalidate the log +
        meta stream workers (part_sc.invalidate_stream) — the manager sealed the old
        tails; without invalidation stale workers keep appending past sealed_length
@@ -994,7 +994,7 @@ the per-partition `maintenance_gate` (a `CompactionGate::new(1)`, max=1, held by
 `flush_memtable_locked` / `commit_length`. Holding it guarantees neither a
 `do_compact` (`compact_row_append` racing the row_stream seal) NOR a `run_gc`
 (log_stream append racing the log seal) is in flight while split seals — the merged
-loop runs only one at a time. RAII-held through `multi_modify_split` + the P-bulk
+loop runs only one at a time. RAII-held through `multi_modify_split` + the P-sst
 barrier ACK, then `acquire_compact` (PS-wide RAM cap) is acquired inner. **Lock
 order**: compaction/split are gate-first (`maintenance_gate → acquire_compact`); GC
 is **permit-first** (`acquire_gc → maintenance_gate`) so a GC queued on the global gc
@@ -1018,7 +1018,7 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
   5. PartitionData.active = recovered memtable (preserves unflushed entries)
   6. Log final state (`open_partition: ready` with tables/sst_readers/has_overlap/
      max_seq/vp_extent_id/vp_offset)
-  7. Spawn P-bulk OS thread (flush_worker_loop on own compio runtime)
+  7. Spawn P-sst OS thread (flush_worker_loop on own compio runtime)
   8. Spawn P-log background tasks on this thread (maintenance loop, flush loop,
      accept loop, dispatch)
 ```
@@ -1106,8 +1106,8 @@ pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
   (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied` frame is
   emitted and the frame NEVER reaches serve/delegate.
 
-**`drain_zc_writes` is SKIPPED when authz is ON** (`!gate_active()`) — the ZC
-write-recv fast path bypasses `authz_gate`, so with authz on a large `MSG_PUT_ZC` is
+**`drain_bulk_writes` is SKIPPED when authz is ON** (`!gate_active()`) — the bulk
+write-recv fast path bypasses `authz_gate`, so with authz on a large `MSG_PUT_BULK` is
 left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
 enforces uniformly (one value copy — acceptable; large writes are rare on `mem/`).
 Never re-enable it under authz without moving the key check into it.
@@ -1133,7 +1133,7 @@ is derived from the CONSISTENT snapshot (`!snap.namespaces.is_empty()` for Layer
 `snap.enabled` for Layer-B) so a config-refresh window can't pair a stale flag with a
 different-time config. A stale hint can only cause a one-request fail-open on the
 turn-ON edge, never a false reject.
-- **Layer-A** (`check_layer_a`): a **put-class** frame (`MSG_PUT`/`MSG_PUT_ZC`/
+- **Layer-A** (`check_layer_a`): a **put-class** frame (`MSG_PUT`/`MSG_PUT_BULK`/
   `MSG_BATCH_PUT`) whose key falls under NO registered namespace prefix
   (`AuthzInner.namespaces`, from `GetAuthzConfigResp.namespaces`) is rejected with
   `StatusCode::NamespaceUnknown` (8). TOKEN-FREE — pure `starts_with` against the
@@ -1142,7 +1142,7 @@ turn-ON edge, never a false reject.
   (Layer-A only prevents creating UNOWNED data via writes; reads/deletes are
   Layer-B's job).
 - **Layer-B** (`authz_check`) runs after, gated by `is_enabled`.
-- **`drain_zc_writes` gate** is skipped when `!gate_active()` so a large `MSG_PUT_ZC`
+- **`drain_bulk_writes` gate** is skipped when `!gate_active()` so a large `MSG_PUT_BULK`
   flows through the FrameDecoder path where the gate enforces BOTH layers.
 - Deploy note: builtin namespaces (`fs/`,`kvc/`,`mem/`) are CAS-registered on the
   first leader of any etcd-backed cluster → registry non-empty → Layer-A ON. So raw
@@ -1363,7 +1363,7 @@ Three fixes bound the restart replay window (worst case per partition =
       on the owning `PartitionData` — safe because it runs exclusively on P-log inside
       a `RefCell::borrow_mut`.
     - `imm: VecDeque<Arc<Memtable>>` — frozen memtables are read-only from P-log (flush
-      + GC + compaction) and P-bulk (`build_sst_bytes`); multiple readers acquire the
+      + GC + compaction) and P-sst (`build_sst_bytes`); multiple readers acquire the
       read lock concurrently.
     - Hot path uses `insert_batch(iter)` (one write lock per 256 inserts) and
       `for_each(closure)` (read lock held for the iteration). The `bytes: AtomicU64`
@@ -1491,15 +1491,15 @@ Three fixes bound the restart replay window (worst case per partition =
       for a read pipelined behind an in-flight delegated write on the same connection —
       the same gap GET-local already has.)
 
-16. **row_stream single-writer is type-level; split invalidates P-bulk via a SYNC
-    BARRIER.** All `row_stream.append` MUST go through P-bulk's `bulk_sc` — flush
+16. **row_stream single-writer is type-level; split invalidates P-sst via a SYNC
+    BARRIER.** All `row_stream.append` MUST go through P-sst's `sst_sc` — flush
     via `FlushReq`, compaction via `RowAppendReq` (see the row_stream single-writer
-    invariant in the P-bulk section). `part_sc` is for log/meta append and row_stream
-    non-append ops only. P-bulk spawn failure is fatal-for-this-partition;
+    invariant in the P-sst section). `part_sc` is for log/meta append and row_stream
+    non-append ops only. P-sst spawn failure is fatal-for-this-partition;
     `flush_req_tx`/`row_append_tx` are non-`Option`.
 
-    Split invalidates P-bulk's stale row_stream worker via a synchronous P-log → P-bulk
-    barrier (a lazy per-message invalidate flag is racy with P-bulk's `FuturesUnordered`
+    Split invalidates P-sst's stale row_stream worker via a synchronous P-log → P-sst
+    barrier (a lazy per-message invalidate flag is racy with P-sst's `FuturesUnordered`
     cap=2 — a post-split FlushReq could enter the FU concurrently with the invalidating
     RowAppendReq and append to the stale worker BEFORE the invalidate took effect → SST
     past sealed_length → orphan SST on recovery):
@@ -1508,7 +1508,7 @@ Three fixes bound the restart replay window (worst case per partition =
     2. `flush_worker_loop` consumes the barrier on a priority-biased
        `select_with_strategy` (PollNext::Left) and sets a `pending_barrier` slot.
     3. The next iteration drains `inflight` `FuturesUnordered` to ZERO, then
-       `bulk_sc.invalidate_stream(row_stream_id)`, then signals `resp_tx`. No new SQ
+       `sst_sc.invalidate_stream(row_stream_id)`, then signals `resp_tx`. No new SQ
        message is picked up until the barrier completes.
     4. `handle_split_part` sends the barrier INSIDE the critical section BEFORE
        `multi_modify_split` (after drain + commit_length, before the manager seal) and
@@ -1519,10 +1519,10 @@ Three fixes bound the restart replay window (worst case per partition =
 
     **INVARIANTS:**
     1. Any control message that mutates row_stream from P-log MUST travel through
-       P-bulk's channel set — never `part_sc`.
+       P-sst's channel set — never `part_sc`.
     2. `handle_split_part` MUST await the barrier ACK BEFORE releasing `maintenance_gate`
        or clearing `frozen_for_split` — a freshly-resumed compact/flush loop could
-       otherwise send a P-bulk request before `bulk_sc` is invalidated.
+       otherwise send a P-sst request before `sst_sc` is invalidated.
     3. The barrier channel is capacity 1 and `handle_split_part` is the sole sender; a
        new sender must prove the sender count stays 1 or convert to unbounded.
     4. `flush_worker_loop`'s `pending_barrier` MUST drain `inflight` to ZERO before
@@ -1539,14 +1539,14 @@ Three fixes bound the restart replay window (worst case per partition =
        first, then `acquire_compact`.
     8. BOTH the barrier `send().await` AND the ACK `recv().await` MUST be bounded by
        separate timers (5 s send + 10 s ACK). The total (15 s) MUST stay well under
-       `FREEZE_TTL` (30 s) — a wedged P-bulk blocking past FREEZE_TTL would let
+       `FREEZE_TTL` (30 s) — a wedged P-sst blocking past FREEZE_TTL would let
        `check_freeze_ttls` unfreeze, new writes extend the row_stream tail past the
        already-captured `commit_length`, and `multi_modify_split` would commit a STALE
        `row_end` → post-TTL writes above sealed_length, invisible on recovery. Both
        timeouts unfreeze + return `FailedPrecondition`. If tuning changes either, `send +
        ack < FREEZE_TTL` MUST hold.
 
-    P-bulk readiness handshake: `spawn_bulk_thread` returns `(JoinHandle,
+    P-sst readiness handshake: `spawn_sst_thread` returns `(JoinHandle,
     oneshot::Receiver<Result<()>>)` and sends `Ok(())` only AFTER compio `build`,
     `StreamClient::new_with_owner_epoch`, and `set_reporter_part_id` all succeed;
     `partition_thread_main` awaits it before publishing `flush_req_tx` / `row_append_tx`
@@ -1582,7 +1582,7 @@ Three fixes bound the restart replay window (worst case per partition =
     in the key (a per-PS key shape would leave the old owner's key valid at the manager
     after takeover, so its lingering GC punch_holes/truncate could mutate streams owned
     elsewhere; with a stable key the takeover acquire bumps THE SAME key and the old owner
-    fails `ensure_owner_epoch` everywhere). P-log's `part_sc` and P-bulk's `bulk_sc` share
+    fails `ensure_owner_epoch` everywhere). P-log's `part_sc` and P-sst's `sst_sc` share
     the ONE epoch acquired for that open (via `new_with_owner_epoch`). The epoch must be
     newest-at-TAKEOVER, not newest-at-process-start — a standing PS inheriting partitions
     from a PS that acquired LATER would sit below the EN fence floors forever. Per-partition

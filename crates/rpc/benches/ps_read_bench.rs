@@ -11,8 +11,8 @@
 //!
 //! The CLIENT (the part that mimics the PS read side) is pinned to ONE core;
 //! the stub-EN server runs on all the OTHER cores, so it is never the
-//! bottleneck. The server emits the exact EN MSG_READ_BYTES_ZC response shape:
-//! `[V0 header][zc_meta: code+value_len+crc32c][value]`.
+//! bottleneck. The server emits the exact EN MSG_READ_BYTES_BULK response shape:
+//! `[V0 header][bulk_ctrl: code+value_len+crc32c][value]`.
 //!
 //! Run (UCX):
 //!   ulimit -l unlimited
@@ -33,7 +33,7 @@ use autumn_rpc::frame::FLAG_RESPONSE;
 use autumn_rpc::HEADER_LEN;
 use autumn_transport::{AutumnTransport, TransportKind};
 
-const MSG_READ_BYTES_ZC: u8 = 15;
+const MSG_READ_BYTES_BULK: u8 = 15;
 const CODE_OK: u8 = 0;
 
 fn env(k: &str, d: u64) -> u64 {
@@ -64,10 +64,10 @@ fn pin_avoid(core: usize, ncpu: usize) {
     }
 }
 
-/// v28 value-separable response head — exactly what the EN's `zc_read_head`
+/// v28 value-separable response head — exactly what the EN's `bulk_read_head`
 /// emits (`[header][ctrl_len][code][crc]`; the value follows as a raw tail).
-fn zc_head(req_id: u32, value: &[u8]) -> Bytes {
-    autumn_rpc::frame::encode_zc_response_head(req_id, MSG_READ_BYTES_ZC, CODE_OK, "", value.len())
+fn bulk_head(req_id: u32, value: &[u8]) -> Bytes {
+    autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_READ_BYTES_BULK, CODE_OK, "", value.len())
 }
 
 async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
@@ -89,16 +89,16 @@ async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
                 return;
             }
         }
-        if msg_type == MSG_READ_BYTES_ZC {
-            // ZC: [zc_head][value] (value-separable, EN's MSG_READ_BYTES_ZC).
-            if w.write_all(zc_head(req_id, &value)).await.0.is_err() {
+        if msg_type == MSG_READ_BYTES_BULK {
+            // bulk: [bulk_head][value] (value-separable, EN's MSG_READ_BYTES_BULK).
+            if w.write_all(bulk_head(req_id, &value)).await.0.is_err() {
                 return;
             }
             if w.write_all(value.clone()).await.0.is_err() {
                 return;
             }
         } else {
-            // Non-ZC: regular framed response, value as the payload (the client's
+            // Non-bulk: regular framed response, value as the payload (the client's
             // `call` recvs it into the decode buffer — no recv-into-registered).
             let resp = autumn_rpc::frame::Frame::response(req_id, msg_type, value.clone()).encode();
             if w.write_all(resp).await.0.is_err() {
@@ -128,11 +128,11 @@ where
     bytes.get() as f64 / t0.elapsed().as_secs_f64() / 1e6
 }
 
-/// Loop ZC reads (`call_into_pooled`, recv-into-registered) until the deadline.
-async fn zc_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
+/// Loop bulk reads (`call_into_pooled`, recv-into-registered) until the deadline.
+async fn bulk_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
     while Instant::now() < deadline {
         match c
-            .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
+            .call_into_pooled(MSG_READ_BYTES_BULK, Bytes::from_static(b"r"))
             .await
         {
             Ok(z) => b.set(b.get() + z.buf.len() as u64),
@@ -144,7 +144,7 @@ async fn zc_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
 /// Loop plain reads (regular `call`, recv into the decode buffer) until the
 /// deadline. Mirrors the pre-F216-E read path.
 async fn plain_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
-    // msg_type 2 ≠ MSG_READ_BYTES_ZC → server replies with a regular framed
+    // msg_type 2 ≠ MSG_READ_BYTES_BULK → server replies with a regular framed
     // response.
     const MSG_GET: u8 = 2;
     while Instant::now() < deadline {
@@ -160,7 +160,7 @@ async fn plain_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) 
 async fn client_shared(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
     let client = RpcClient::connect(addr).await.expect("connect");
     drive(conns, dur, |b, deadline| {
-        zc_read_loop(client.clone(), b, deadline)
+        bulk_read_loop(client.clone(), b, deadline)
     })
     .await
 }
@@ -169,12 +169,12 @@ async fn client_shared(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
 async fn client_perconn(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
     drive(conns, dur, |b, deadline| async move {
         let c = RpcClient::connect(addr).await.expect("connect");
-        zc_read_loop(c, b, deadline).await;
+        bulk_read_loop(c, b, deadline).await;
     })
     .await
 }
 
-/// Non-ZC: one RpcClient, `conns` concurrent regular `call`s — the response
+/// Non-bulk: one RpcClient, `conns` concurrent regular `call`s — the response
 /// value is recv'd into the FrameDecoder buffer (a copy off the wire) and
 /// returned as a `Bytes` slice. No recv-into-registered, no memh.
 async fn client_nozc(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
@@ -199,7 +199,7 @@ fn main() {
         _ => TransportKind::Tcp,
     };
     autumn_transport::init_with(transport);
-    // F219: the ZC value crc on the hot path was removed entirely (no toggle).
+    // F219: the bulk value crc on the hot path was removed entirely (no toggle).
     // AUTUMN_PSREAD_NOCRC is now a no-op kept for script back-compat.
     let _ = std::env::var("AUTUMN_PSREAD_NOCRC").is_ok();
 
@@ -247,8 +247,8 @@ fn main() {
         let perconn = client_perconn(addr, conns, dur).await;
         let one = client_perconn(addr, 1, dur).await;
         println!("  1 RpcClient  (1 conn)              : {one:8.1} MB/s");
-        println!("  1 RpcClient, {conns} concurrent ZC    : {shared:8.1} MB/s  (PS-style: call_into_pooled, recv-into-registered)");
-        println!("  1 RpcClient, {conns} concurrent NON-ZC: {nozc:8.1} MB/s  (regular call, recv into decode buffer)");
+        println!("  1 RpcClient, {conns} concurrent bulk    : {shared:8.1} MB/s  (PS-style: call_into_pooled, recv-into-registered)");
+        println!("  1 RpcClient, {conns} concurrent NON-bulk: {nozc:8.1} MB/s  (regular call, recv into decode buffer)");
         println!("  {conns} RpcClients (N read_loops)      : {perconn:8.1} MB/s");
     });
 }

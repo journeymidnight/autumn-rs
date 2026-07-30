@@ -184,7 +184,7 @@ pub struct DirentValue {
 /// sequential (write-once) stream coalesces into extents capped at `MAX_EXTENT`;
 /// the last/partial extent is shorter → "variable like Linux extents". 8 MiB
 /// matches the project's large-value bench size and the UCX large-read sweet
-/// spot, so the ≥64 KiB ZC path (and the future RDMA path, F243) is engaged for
+/// spot, so the ≥64 KiB bulk path (and the future RDMA path, F243) is engaged for
 /// whole-extent reads. The write buffer also flushes at this granularity.
 pub const MAX_EXTENT: usize = 8 * 1024 * 1024;
 

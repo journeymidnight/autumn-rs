@@ -42,19 +42,19 @@ record CRC, SST block CRC); F219 measured a per-value crc at ~20% of a core
 @ 8 MiB. Per-msg_type ctrl/value split:
 
 - normal rkyv/binary RPCs + error envelopes: ctrl = whole body, no value.
-- `MSG_GET_ZC` / `MSG_READ_BYTES_ZC` responses: ctrl = `[code:1][message…]`
-  (ZC errors carry a human-readable message), value = raw value.
-- `MSG_PUT_ZC` requests: ctrl = `[put_zc meta 44B][key]`, value = raw value —
-  the sender never crc-scans the value (`call_vectored_zc`).
+- `MSG_GET_BULK` / `MSG_READ_BYTES_BULK` responses: ctrl = `[code:1][message…]`
+  (bulk errors carry a human-readable message), value = raw value.
+- `MSG_PUT_BULK` requests: ctrl = `[put_bulk meta 44B][key]`, value = raw value —
+  the sender never crc-scans the value (`call_vectored_bulk`).
 - **`MSG_APPEND` is the ONE deliberate exception** (durability path): its bulk
   payload rides INSIDE ctrl, keeping in-transit CRC on WAL/SST bytes.
 
 Builders: `Frame::encode` / `encode_response_with` (ctrl-only, one buffer),
 `encode_vectored_head` + `compute_ctrl_crc` (vectored sends),
-`encode_zc_response_head` (ZC response head; `ps_zc_head` / `zc_read_head` are
-thin wrappers), `parse_zc_ctrl`. ZC fast paths use
-`FrameDecoder::peek_zc_prologue` (verify crc without consuming) +
-`consume_zc_prologue`. One protocol — no versions, no encoder toggle, no
+`encode_bulk_response_head` (bulk response head; `ps_bulk_head` / `bulk_read_head` are
+thin wrappers), `parse_bulk_ctrl`. bulk fast paths use
+`FrameDecoder::peek_bulk_prologue` (verify crc without consuming) +
+`consume_bulk_prologue`. One protocol — no versions, no encoder toggle, no
 back-compat (the cluster restarts together; a pre-v28 peer fails LOUDLY at the
 first frame with CrcMismatch instead of reaching the version handshake).
 
@@ -94,10 +94,10 @@ over one TCP connection:
   matching entry in `Rc<RefCell<HashMap<u32, Pending>>>`.
 
 Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
-`call_vectored_zc` (ctrl parts + raw value after the crc — `MSG_PUT_ZC`),
+`call_vectored_bulk` (ctrl parts + raw value after the crc — `MSG_PUT_BULK`),
 `call_timeout` / `call_vectored_timeout`, `send_frame` / `send_vectored`
 (low-level, return `oneshot::Receiver<Frame>`), `send_oneshot`
-(fire-and-forget, req_id=0), `call_into_pooled` (ZC read, below).
+(fire-and-forget, req_id=0), `call_into_pooled` (bulk read, below).
 
 **Invariants (correctness rules):**
 
@@ -119,11 +119,11 @@ Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
 
 ### Zero-copy receive-into-pooled
 
-`call_into_pooled(msg_type, payload) -> ZcResp{buf, code, message}` recvs the
+`call_into_pooled(msg_type, payload) -> BulkResp{buf, code, message}` recvs the
 response's raw value tail straight into a read_loop-owned RegPool `PooledBuf`
 (registered on UCX, plain recycled buffer on TCP), no intermediate Vec. Wire
 response = the v28 value-separable frame: ctrl = `[code:1][message…]` (both
-CRC-protected together with the header; ZC errors carry a readable message),
+CRC-protected together with the header; bulk errors carry a readable message),
 value = raw tail (`value_len` derived from `payload_len`).
 `RegisteredMem`/`PooledBuf` re-export from autumn-transport (uninhabited/plain
 stubs on non-ucx). A recv-into-CALLER-dest sibling (`call_into_dest`) no longer
@@ -134,10 +134,10 @@ API the caller used), NEVER on msg_type (the rpc layer stays business-agnostic;
 msg_type↔API pairing is the caller's contract, enforced nowhere):
 
 ```
-Pending::Frame (non-ZC call)
+Pending::Frame (non-bulk call)
   → try_decode whole frame (verify header+ctrl crc) → oneshot the Frame
-Pending::IntoPooled (ZC call), response frame NOT FLAG_ERROR
-  ├─ UCX                → fast path: peek_zc_prologue (verify crc, parse
+Pending::IntoPooled (bulk call), response frame NOT FLAG_ERROR
+  ├─ UCX                → fast path: peek_bulk_prologue (verify crc, parse
   │                       code+message), consume prologue, regpool_acquire +
   │                       recv_into(dest, reg) — memh RDMA when the slab is
   │                       registered (0 copies). Unconditional: recv-into is
@@ -155,22 +155,22 @@ Pending::IntoPooled, response frame IS FLAG_ERROR
   → excluded from the fast path by the peeked flags → try_decode → the
     IntoPooled arm decodes the `[status_code][message]` envelope into
     `RpcError::Status` (an authz PermissionDenied / mis-route NotFound reaches
-    the ZC caller typed, never parsed as a ZC ctrl).
+    the bulk caller typed, never parsed as a bulk ctrl).
 ```
 
 The TCP size gate lives at the RECEIVER, not the caller, because its input — the
 ACTUAL value_len — only exists once the response header arrives: an error /
-NotFound reply is a 0-length ZC frame regardless of what the caller expected.
-Intent vs execution: the client-side `zc_worthwhile` (autumn-client, ≥ 64 KiB on
+NotFound reply is a 0-length bulk frame regardless of what the caller expected.
+Intent vs execution: the client-side `bulk_worthwhile` (autumn-client, ≥ 64 KiB on
 the EXPECTED size) picks which msg_type/API to use; the receiver picks the recv
 strategy from what actually arrived. The four 64 KiB gates are deliberately one
 value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 
 | Gate | Side | Input | Decides |
 |------|------|-------|---------|
-| `zc_worthwhile` (autumn-client) | client send | expected size | which msg_type/API (read + write intent) |
-| `TCP_RECV_INTO_POOLED_MIN_BYTES` (client.rs) | client recv | actual value_len | GET-ZC response recv strategy (this table) |
-| `AUTUMN_PS_ZC_RECV_MIN_BYTES` (partition-server) | PS recv | actual value_len | PUT_ZC request recv strategy (`drain_zc_writes`) |
+| `bulk_worthwhile` (autumn-client) | client send | expected size | which msg_type/API (read + write intent) |
+| `TCP_RECV_INTO_POOLED_MIN_BYTES` (client.rs) | client recv | actual value_len | GET-bulk response recv strategy (this table) |
+| `AUTUMN_PS_BULK_RECV_MIN_BYTES` (partition-server) | PS recv | actual value_len | PUT_BULK request recv strategy (`drain_bulk_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 
 **Why pooled-only (cancel-safety):** the recv runs in the long-lived
@@ -186,22 +186,22 @@ at a specific address copy out of the returned `PooledBuf`
 (`ClusterClient::get_range_into` does exactly this, and now honors
 `rpc_timeout`).
 
-**Write counterpart (`MSG_PUT_ZC = 0x51`)** uses `call_vectored_zc`: ctrl =
+**Write counterpart (`MSG_PUT_BULK = 0x51`)** uses `call_vectored_bulk`: ctrl =
 `[meta][key]` (CRC'd with the header), the value rides after the crc as its own
 iovec — zero-copy via rcache when registered, and NEVER crc-scanned by the
 sender (v28 completed F219: pre-v28 `call_vectored` paid a full crc32c pass
-over the value). Meta codec lives in `partition_rpc`: `encode_put_zc_meta` /
-`parse_put_zc_meta`, fixed prefix `PUT_ZC_HEADER_LEN = 44` then the key; the
+over the value). Meta codec lives in `partition_rpc`: `encode_put_bulk_meta` /
+`parse_put_bulk_meta`, fixed prefix `PUT_BULK_HEADER_LEN = 44` then the key; the
 decoder hands the PS `frame.payload = [meta][key]` + `frame.value` (zero-copy
-split). Write ZC is send-side framing only; read ZC needs the
+split). Write bulk is send-side framing only; read bulk needs the
 `call_into_pooled` recv primitive because the response value must land outside
 the FrameDecoder. Write-side selection is purely
 size-based and client-side (the sender KNOWS the exact value size): `put_many`
-routes items ≥ 64 KiB to per-op `MSG_PUT_ZC` and smaller ones into
-`MSG_BATCH_PUT` via `zc_worthwhile`; the bare `put_zc` API does not gate, so the
-wire legitimately carries any-size `MSG_PUT_ZC` — the PS recv side re-decides on
-the ACTUAL size (`drain_zc_writes` recv-into-pooled ≥
-`AUTUMN_PS_ZC_RECV_MIN_BYTES`, else the normal FrameDecoder path).
+routes items ≥ 64 KiB to per-op `MSG_PUT_BULK` and smaller ones into
+`MSG_BATCH_PUT` via `bulk_worthwhile`; the bare `put_bulk` API does not gate, so the
+wire legitimately carries any-size `MSG_PUT_BULK` — the PS recv side re-decides on
+the ACTUAL size (`drain_bulk_writes` recv-into-pooled ≥
+`AUTUMN_PS_BULK_RECV_MIN_BYTES`, else the normal FrameDecoder path).
 
 ## shard_for_extent
 

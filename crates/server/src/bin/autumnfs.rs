@@ -523,7 +523,7 @@ async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
 // ─── cat / get ──────────────────────────────────────────────────────────────
 
 /// F-AUTUMNFS-SLOW: bounded per-download read window — fetch this many extents
-/// per `get_many_into` so a multi-extent download pipelines (per-op ZC fan-out
+/// per `get_many_into` so a multi-extent download pipelines (per-op bulk fan-out
 /// for the ≥ 64 KiB extents; on UCX RDMA-into-dest, on TCP recv-into-dest)
 /// instead of one serial `get` per extent — and, unlike `get_many`, without
 /// assembling the whole window into one giant response frame.
@@ -740,7 +740,7 @@ async fn write_file_from_reader(
 /// dirent. Records every written extent key in `written` so the caller can
 /// clean up orphans on failure. `stripe` (F-FS-STRIPE) selects the extent key
 /// layout: `Some` → lane-striped `[0x03][lane][ino][off]` (extents spread across
-/// lane partitions → parallel via batch_put's concurrent ZC fan-out); `None` →
+/// lane partitions → parallel via batch_put's concurrent bulk fan-out); `None` →
 /// legacy `[0x03][ino][off]` (single partition).
 async fn publish_file(
     cluster: &ClusterClient,
@@ -793,7 +793,7 @@ async fn publish_file(
         let mut eof = false;
         // coco P1: on ANY error (source read or a put), STOP scheduling new puts
         // but keep DRAINING `inflight` to terminal state before returning — do NOT
-        // just drop the FuturesUnordered. A dropped-but-already-sent MSG_PUT_ZC may
+        // just drop the FuturesUnordered. A dropped-but-already-sent MSG_PUT_BULK may
         // still commit server-side; if the caller's orphan cleanup (delete every
         // `written` key) ran before that late put landed, it would leave an
         // unreachable extent. Draining quiesces all sent puts first.
@@ -829,7 +829,7 @@ async fn publish_file(
                     // so orphan cleanup must cover the partial success (coco P2).
                     written.push(ek.clone());
                     let value = chunk.freeze(); // aliases the pool slab, 0-copy
-                    inflight.push(async move { cluster.put_zc(&ek, value).await });
+                    inflight.push(async move { cluster.put_bulk(&ek, value).await });
                     off += n as u64;
                     if n < MAX_EXTENT {
                         eof = true;

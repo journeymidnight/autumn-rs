@@ -15,10 +15,10 @@
 //!
 //! F247: data is variable-length extents keyed by logical offset (was fixed
 //! 256 KiB chunks). The whole-extent reads are ≤ 8 MiB (`MAX_EXTENT`) so the
-//! `zc_worthwhile` (≥ 64 KiB) per-extent ZC path (`MSG_GET_ZC`) engages on every
+//! `bulk_worthwhile` (≥ 64 KiB) per-extent bulk path (`MSG_GET_BULK`) engages on every
 //! full-extent read — the win that motivated the move (model-file serving).
 //! Sub-64 KiB tail/sub-range reads use the regular `MSG_GET` path (bounded by
-//! the client's 30 s `rpc_timeout`). **Tradeoff:** the ZC path has no per-call
+//! the client's 30 s `rpc_timeout`). **Tradeoff:** the bulk path has no per-call
 //! timeout (cancel-safety — the dest must outlive the recv), so a hung PS blocks
 //! a large-extent read instead of erroring after 30 s (F239/F216-E tradeoff).
 
@@ -157,14 +157,14 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
 }
 
 /// Phase 2: spawned task — one batched read over all extent slices, via
-/// `get_many_into` (PS-proxied ZC, default) or `get_many_direct` (EN-direct,
+/// `get_many_into` (PS-proxied bulk, default) or `get_many_direct` (EN-direct,
 /// when the mount's `--direct-read` set `plan.direct_read`).
 ///
 /// Pre-allocates the zero-filled result sized to the WHOLE read span and gives
 /// each extent slice its OWN disjoint `&mut` sub-slice at its absolute
 /// `dest_offset` (gaps between extents are skipped → stay zero, sparse-file
 /// semantics). The batch primitive writes each successful extent into its slice
-/// (`get_many_into`: ZC recv-into-dest for ≥ 64 KiB; `get_many_direct`: EN
+/// (`get_many_into`: bulk recv-into-dest for ≥ 64 KiB; `get_many_direct`: EN
 /// direct read → copy, per-item PS-proxy fallback); a missing/short extent
 /// leaves zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
 /// Carve `region` — already sized to the read span and pre-zeroed by the caller
@@ -208,7 +208,7 @@ async fn fill_region(
     // F-DIRECT-MANY: `direct_read` sends the ≥ 64 KiB whole-extent gets STRAIGHT
     // to an EN (`get_many_direct`), bypassing the PS on the data path; each item
     // falls back to the PS proxy on any direct-read failure, so it's safe even if
-    // some ENs are unreachable. Default OFF ⇒ the PS-proxied ZC path
+    // some ENs are unreachable. Default OFF ⇒ the PS-proxied bulk path
     // (`get_many_into`).
     let results = if direct_read {
         client.get_many_direct(&mut items).await

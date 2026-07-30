@@ -2213,14 +2213,14 @@ async fn process_frames_backpressured(
                 }
             };
             inflight.push(build_read_future(extent, file_rc, slots, false));
-        } else if msg_type == MSG_READ_BYTES_ZC {
+        } else if msg_type == MSG_READ_BYTES_BULK {
             // F216-E zero-copy read grouping — mirrors MSG_READ_BYTES but every
-            // response (ok + error) is ZC-shaped (`zc_read_head` + value Bytes)
-            // so the PS's call_into_pooled always parses a zc_meta.
+            // response (ok + error) is bulk-shaped (`bulk_read_head` + value Bytes)
+            // so the PS's call_into_pooled always parses a bulk_ctrl.
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
                 Ok(r) => r,
                 Err(_) => {
-                    let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
+                    let bytes = bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -2233,7 +2233,7 @@ async fn process_frames_backpressured(
                 req_id: frames[i].req_id,
             });
             i += 1;
-            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_ZC {
+            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_BULK {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
                     Ok(r) if r.extent_id == anchor_extent => {
                         slots.push(ReadSlot {
@@ -2244,7 +2244,7 @@ async fn process_frames_backpressured(
                     }
                     Ok(_) => break,
                     Err(_) => {
-                        let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
+                        let bytes = bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -2255,7 +2255,7 @@ async fn process_frames_backpressured(
                 Err((_code, _msg)) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
+                        .map(|s| bulk_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -2267,7 +2267,7 @@ async fn process_frames_backpressured(
                 Err(_msg) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
+                        .map(|s| bulk_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -2318,14 +2318,14 @@ fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     .encode()
 }
 
-/// Build a `CODE_EVERSION_MISMATCH` read response for one slot — the zc head
-/// or a full `ReadBytesResp` frame, matching the connection's `zc` mode.
+/// Build a `CODE_EVERSION_MISMATCH` read response for one slot — the bulk head
+/// or a full `ReadBytesResp` frame, matching the connection's `bulk` mode.
 /// Typed CODE (not a frame-level error) so the client's
 /// `read_bytes_from_extent` retry self-heals (invalidate cache + refetch)
 /// instead of seeing a generic transport error.
-fn eversion_mismatch_read_resp(req_id: u32, zc: bool) -> Bytes {
-    if zc {
-        zc_read_head(req_id, CODE_EVERSION_MISMATCH, "eversion mismatch", 0)
+fn eversion_mismatch_read_resp(req_id: u32, bulk: bool) -> Bytes {
+    if bulk {
+        bulk_read_head(req_id, CODE_EVERSION_MISMATCH, "eversion mismatch", 0)
     } else {
         Frame::response(
             req_id,
@@ -2772,13 +2772,13 @@ async fn build_append_future(
 /// Build the async future that services a same-extent READ batch. Reads
 /// are processed sequentially inside ONE future — each pread is ~1µs and
 /// the responses are written back together.
-/// F216-E: build a MSG_READ_BYTES_ZC response head — v28 value-separable
+/// F216-E: build a MSG_READ_BYTES_BULK response head — v28 value-separable
 /// frame head `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl;
 /// see autumn-rpc frame.rs). The value (if any) is pushed as a SEPARATE
 /// `Bytes` right after, so it aliases the pread buffer — no copy, and the raw
 /// value is never crc-scanned (transport + storage integrity).
-fn zc_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
-    autumn_rpc::frame::encode_zc_response_head(req_id, MSG_READ_BYTES_ZC, code, msg, value_len)
+fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
+    autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_READ_BYTES_BULK, code, msg, value_len)
 }
 
 fn build_read_future(
@@ -2790,7 +2790,7 @@ fn build_read_future(
     // eviction can't yank it mid-scan.
     file_rc: std::rc::Rc<CompioFile>,
     slots: Vec<ReadSlot>,
-    zc: bool,
+    bulk: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
     Box::pin(async move {
         use compio::io::AsyncReadAtExt;
@@ -2804,7 +2804,7 @@ fn build_read_future(
         // client fails over to a healthy replica.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
             for slot in slots {
-                out.push(eversion_mismatch_read_resp(slot.req_id, zc));
+                out.push(eversion_mismatch_read_resp(slot.req_id, bulk));
             }
             return out;
         }
@@ -2814,7 +2814,7 @@ fn build_read_future(
             // Eversion gate + length semantics live in `read_plan` (shared
             // with handle_read_bytes — see its doc for F119-C / P0-C).
             let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
-                out.push(eversion_mismatch_read_resp(slot.req_id, zc));
+                out.push(eversion_mismatch_read_resp(slot.req_id, bulk));
                 continue;
             };
 
@@ -2822,15 +2822,15 @@ fn build_read_future(
             // (was `extent.file_rc()` per slot — now the extent may be an
             // evicted sealed one, resolved once at the call site).
             let f: &CompioFile = &file_rc;
-            if zc {
-                // ZC-EXACT invariant: a ZC read is always an EXACT-length value
+            if bulk {
+                // BULK-EXACT invariant: a bulk read is always an EXACT-length value
                 // read (the VP's `(offset, length)` — callers never pass
                 // length=0/to-end). `read_plan` CLAMPS `read_size` to the local
-                // bytes (correct for the non-ZC scanner path, whose callers
-                // handle short reads), but for ZC a clamp means THIS REPLICA
+                // bytes (correct for the non-bulk scanner path, whose callers
+                // handle short reads), but for bulk a clamp means THIS REPLICA
                 // cannot serve the requested range — answering CODE_OK with a
-                // silently SHORT payload made every ZC consumer responsible for
-                // its own length check (the copy path had one, the ZC proxy
+                // silently SHORT payload made every bulk consumer responsible for
+                // its own length check (the copy path had one, the bulk proxy
                 // path did not → a truncated value could reach a client).
                 // Reject here — the producer — with CODE_PRECONDITION; clients
                 // treat any non-OK as failover (next replica / copy path).
@@ -2844,12 +2844,12 @@ fn build_read_future(
                         want = req.length,
                         have = read_size,
                         local_len = end,
-                        "ZC read cannot serve full range; rejecting (no short CODE_OK)"
+                        "bulk read cannot serve full range; rejecting (no short CODE_OK)"
                     );
-                    out.push(zc_read_head(
+                    out.push(bulk_read_head(
                         slot.req_id,
                         CODE_PRECONDITION,
-                        "zc read cannot serve full range",
+                        "bulk read cannot serve full range",
                         0,
                     ));
                     continue;
@@ -2861,17 +2861,17 @@ fn build_read_future(
                 // address). The value `Bytes` aliases the slab
                 // (`Bytes::from_owner`) and returns it to the pool when the
                 // response write completes. 2 Bytes on the wire:
-                // [header+zc_meta], [value] — no ReadBytesResp/Frame encode copy.
+                // [header+bulk_ctrl], [value] — no ReadBytesResp/Frame encode copy.
                 let pb = autumn_transport::regpool_acquire(read_size as usize);
                 let BufResult(result, pb) = f.read_exact_at(pb, read_offset).await;
                 match result {
                     Ok(_) => {
                         let value = Bytes::from_owner(pb);
-                        out.push(zc_read_head(slot.req_id, CODE_OK, "", value.len()));
+                        out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
                         out.push(value);
                     }
                     Err(_e) => {
-                        out.push(zc_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
+                        out.push(bulk_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
                     }
                 }
             } else {
@@ -2887,13 +2887,13 @@ fn build_read_future(
                         // `ReadBytesResp::encode`.
                         //
                         // A fully zero-copy 3-segment form (head + value-alias +
-                        // CRC trailer, like the ZC path) was measured and REJECTED
+                        // CRC trailer, like the bulk path) was measured and REJECTED
                         // for this small-read path: at 4 KiB the saved memcpy is
                         // cheaper than the cost it adds — tripling the iovec count
                         // in `write_vectored_all` plus a per-read trailer alloc —
                         // and regressed batched reads 2-5% (extent_bench d=16/64).
                         // Zero-copy only pays off once the value memcpy dominates
-                        // (>= 64 KiB), which is exactly the UCX `zc` branch above.
+                        // (>= 64 KiB), which is exactly the UCX `bulk` branch above.
                         use bytes::BufMut;
                         out.push(Frame::encode_response_with(
                             slot.req_id,

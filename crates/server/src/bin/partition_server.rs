@@ -44,7 +44,7 @@ struct Args {
     // `None` = library default. Defaults match pre-F195 env defaults.
     group_commit_cap: Option<usize>,
     ps_inflight_cap: Option<usize>,
-    ps_bulk_inflight_cap: Option<usize>,
+    ps_sst_inflight_cap: Option<usize>,
     ps_flush_inflight_cap: Option<usize>,
     max_imm_depth: Option<usize>,
     max_wal_gap: Option<u64>,
@@ -80,7 +80,7 @@ struct Args {
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB] by
     /// `set_regpool_cap_bytes`. Mostly useful when shrinking on a memlock-
-    /// constrained host or growing when many in-flight 8 MiB ZC writes
+    /// constrained host or growing when many in-flight 8 MiB bulk writes
     /// pin the pool above the default.
     ucx_regpool_cap_bytes: Option<usize>,
     /// Period (seconds) for emitting a `regpool` snapshot via
@@ -117,7 +117,7 @@ fn parse_args() -> Args {
     // F195 tunables — None = library default.
     let mut group_commit_cap: Option<usize> = None;
     let mut ps_inflight_cap: Option<usize> = None;
-    let mut ps_bulk_inflight_cap: Option<usize> = None;
+    let mut ps_sst_inflight_cap: Option<usize> = None;
     let mut ps_flush_inflight_cap: Option<usize> = None;
     let mut max_imm_depth: Option<usize> = None;
     let mut max_wal_gap: Option<u64> = None;
@@ -221,7 +221,7 @@ fn parse_args() -> Args {
             }
             "--ps-bulk-inflight-cap" => {
                 i += 1;
-                ps_bulk_inflight_cap = Some(args[i].parse().expect("--ps-bulk-inflight-cap usize"));
+                ps_sst_inflight_cap = Some(args[i].parse().expect("--ps-bulk-inflight-cap usize"));
             }
             "--flush-inflight-cap" => {
                 i += 1;
@@ -460,7 +460,7 @@ fn parse_args() -> Args {
         cpuset,
         group_commit_cap,
         ps_inflight_cap,
-        ps_bulk_inflight_cap,
+        ps_sst_inflight_cap,
         ps_flush_inflight_cap,
         max_imm_depth,
         max_wal_gap,
@@ -511,8 +511,8 @@ fn apply_ps_tunables(args: &Args) {
     if let Some(n) = args.ps_inflight_cap {
         ps::set_ps_inflight_cap(n);
     }
-    if let Some(n) = args.ps_bulk_inflight_cap {
-        ps::set_ps_bulk_inflight_cap(n);
+    if let Some(n) = args.ps_sst_inflight_cap {
+        ps::set_ps_sst_inflight_cap(n);
     }
     if let Some(n) = args.ps_flush_inflight_cap {
         ps::set_ps_flush_inflight_cap(n);

@@ -92,17 +92,17 @@ async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// ZC-EXACT invariant (F-READ-OPENTAIL-ROTATE root fix, coco P1): a ZC read
-// (MSG_READ_BYTES_ZC) is always an exact-length VP value read — the EN must
+// BULK-EXACT invariant (F-READ-OPENTAIL-ROTATE root fix, coco P1): a bulk read
+// (MSG_READ_BYTES_BULK) is always an exact-length VP value read — the EN must
 // NEVER answer CODE_OK with a silently SHORT payload. `read_plan` clamps to
-// the local bytes (correct for the non-ZC scanner path), but for ZC an
-// unservable range is a REJECTION (CODE_PRECONDITION), so no ZC consumer
+// the local bytes (correct for the non-bulk scanner path), but for bulk an
+// unservable range is a REJECTION (CODE_PRECONDITION), so no bulk consumer
 // needs its own defensive length check and a rotated-to replica that is
 // somehow short can never hand a truncated value to a client.
 // ─────────────────────────────────────────────────────────────────────────
 
 #[compio::test]
-async fn zc_read_rejects_short_range_instead_of_short_ok() {
+async fn bulk_read_rejects_short_range_instead_of_short_ok() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -114,21 +114,21 @@ async fn zc_read_rejects_short_range_instead_of_short_ok() {
     assert_eq!(w.code, CODE_OK);
     assert_eq!(w.end, 10);
 
-    // Exact in-range ZC read → OK + the full requested bytes.
-    let (code, payload) = conn.read_bytes_zc(eid, 1, 2, 5).await;
+    // Exact in-range bulk read → OK + the full requested bytes.
+    let (code, payload) = conn.read_bytes_bulk(eid, 1, 2, 5).await;
     assert_eq!(code, CODE_OK);
-    assert_eq!(&payload, b"23456", "in-range ZC read returns exact bytes");
+    assert_eq!(&payload, b"23456", "in-range bulk read returns exact bytes");
 
-    // Over-range ZC read (want 20, extent holds 10) → REJECTED, not OK+short.
-    let (code, payload) = conn.read_bytes_zc(eid, 1, 0, 20).await;
+    // Over-range bulk read (want 20, extent holds 10) → REJECTED, not OK+short.
+    let (code, payload) = conn.read_bytes_bulk(eid, 1, 0, 20).await;
     assert_eq!(
         code, CODE_PRECONDITION,
-        "over-range ZC read must be rejected — CODE_OK+short payload would let \
+        "over-range bulk read must be rejected — CODE_OK+short payload would let \
          a truncated value reach a client (payload len {})",
         payload.len()
     );
 
     // Offset past the end entirely → same rejection.
-    let (code, _p) = conn.read_bytes_zc(eid, 1, 15, 4).await;
-    assert_eq!(code, CODE_PRECONDITION, "past-end ZC read must be rejected");
+    let (code, _p) = conn.read_bytes_bulk(eid, 1, 15, 4).await;
+    assert_eq!(code, CODE_PRECONDITION, "past-end bulk read must be rejected");
 }

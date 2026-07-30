@@ -13,7 +13,7 @@
 //!    moves the vp head PAST the bump records — restart must seed the
 //!    floor from the checkpoint, not the (no longer replayed) records.
 //!
-//! Also covers the Phase 2 ZC wire change: a stale-epoch `MSG_PUT_ZC`
+//! Also covers the Phase 2 bulk wire change: a stale-epoch `MSG_PUT_BULK`
 //! (the path fuse/ioring large writes take) is fenced too.
 //!
 //! The PS runs as a real `autumn-ps` SUBPROCESS (chaos-test pattern) so
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::{
-    self, rkyv_decode, rkyv_encode, PutReq, PutResp, CODE_FENCED, CODE_OK, MSG_PUT, MSG_PUT_ZC,
+    self, rkyv_decode, rkyv_encode, PutReq, PutResp, CODE_FENCED, CODE_OK, MSG_PUT, MSG_PUT_BULK,
 };
 
 use support::*;
@@ -44,7 +44,7 @@ fn ps_binary() -> PathBuf {
         Err(_) => workspace.join("target"),
     };
     // Pick the NEWEST build across profiles — a stale binary with an old
-    // wire layout silently mis-parses the Phase 2 ZC meta.
+    // wire layout silently mis-parses the Phase 2 bulk meta.
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for profile in ["debug", "release"] {
         let p = target.join(profile).join("autumn-ps");
@@ -97,7 +97,7 @@ async fn put_with_fence(
     rkyv_decode::<PutResp>(&bytes).expect("decode PutResp")
 }
 
-async fn put_zc_with_fence(
+async fn put_bulk_with_fence(
     ps: &RpcClient,
     part_id: u64,
     key: &[u8],
@@ -105,11 +105,11 @@ async fn put_zc_with_fence(
     lease_epoch: u64,
 ) -> PutResp {
     let meta =
-        partition_rpc::encode_put_zc_meta(part_id, 0, 0, key, inode_hint, lease_epoch);
+        partition_rpc::encode_put_bulk_meta(part_id, 0, 0, key, inode_hint, lease_epoch);
     let bytes = ps
-        .call_vectored(MSG_PUT_ZC, vec![meta, bytes::Bytes::from_static(b"zcval")])
+        .call_vectored(MSG_PUT_BULK, vec![meta, bytes::Bytes::from_static(b"zcval")])
         .await
-        .expect("MSG_PUT_ZC");
+        .expect("MSG_PUT_BULK");
     rkyv_decode::<PutResp>(&bytes).expect("decode PutResp")
 }
 
@@ -144,9 +144,9 @@ fn p2_fence_floor_survives_ps_restart_via_wal_replay() {
         let r2 = put_with_fence(&ps, part_id, b"k2", 42, 5).await;
         assert_eq!(r2.code, CODE_OK, "bump: {r2:?}");
 
-        // ZC stale write is fenced pre-restart (Phase 2 wire change).
-        let rz = put_zc_with_fence(&ps, part_id, b"kz", 42, 1).await;
-        assert_eq!(rz.code, CODE_FENCED, "ZC stale must be fenced: {rz:?}");
+        // bulk stale write is fenced pre-restart (Phase 2 wire change).
+        let rz = put_bulk_with_fence(&ps, part_id, b"kz", 42, 1).await;
+        assert_eq!(rz.code, CODE_FENCED, "bulk stale must be fenced: {rz:?}");
 
         // Crash the PS (no flush ran — the floor exists ONLY as
         // OP_FENCE_BUMP records in log_stream).
@@ -178,9 +178,9 @@ fn p2_fence_floor_survives_ps_restart_via_wal_replay() {
             r3.code, CODE_FENCED,
             "Phase 2: stale epoch must STAY fenced across PS restart (WAL replay): {r3:?}"
         );
-        // ZC stale write equally fenced post-restart.
-        let rz2 = put_zc_with_fence(&ps2, part_id, b"kz2", 42, 1).await;
-        assert_eq!(rz2.code, CODE_FENCED, "ZC stale post-restart: {rz2:?}");
+        // bulk stale write equally fenced post-restart.
+        let rz2 = put_bulk_with_fence(&ps2, part_id, b"kz2", 42, 1).await;
+        assert_eq!(rz2.code, CODE_FENCED, "bulk stale post-restart: {rz2:?}");
         // The live writer (epoch 5) keeps working.
         let r4 = put_with_fence(&ps2, part_id, b"k4", 42, 5).await;
         assert_eq!(r4.code, CODE_OK, "live epoch must pass: {r4:?}");

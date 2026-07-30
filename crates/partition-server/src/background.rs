@@ -1895,9 +1895,9 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 // the single atomic commit point. Any chunks appended to row_stream
 // before that commit are orphan bytes if we crash, recoverable via the
 // pre-existing meta_stream-authoritative recovery path.
-/// F135 — route a single row_stream append through P-bulk's StreamClient.
+/// F135 — route a single row_stream append through P-sst's StreamClient.
 ///
-/// **Why this matters:** flush is owned by P-bulk, which holds its own
+/// **Why this matters:** flush is owned by P-sst, which holds its own
 /// `StreamClient` with its own per-stream commit-tracking state. If
 /// compaction independently appends to row_stream via P-log's `part_sc`,
 /// the two clients each carry their own commit watermark. When one client's
@@ -1906,30 +1906,30 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 /// bytes from one writer are silently destroyed mid-flight, surfacing later
 /// as `invalid meta_len` on PS restart (witnessed 2026-05-03).
 ///
-/// The fix is to funnel ALL row_stream appends through P-bulk's single
+/// The fix is to funnel ALL row_stream appends through P-sst's single
 /// StreamClient. Flush does so via `FlushReq`; compaction does so via
-/// `RowAppendReq`. P-log → P-bulk hand-off is a oneshot per request, so
+/// `RowAppendReq`. P-log → P-sst hand-off is a oneshot per request, so
 /// callers see the same `AppendResult` shape as a direct append.
 ///
-/// Pre-this we also kept an in-thread fallback when P-bulk failed to spawn
+/// Pre-this we also kept an in-thread fallback when P-sst failed to spawn
 /// (`row_append_tx == None`, append via P-log's `part_sc`). That kept the
 /// single-writer property by accident — flush had a matching fallback, so
 /// in the spawn-failed case both writers happened to be `part_sc`. The
-/// fallback is gone: `open_partition` returns Err on P-bulk spawn failure,
+/// fallback is gone: `open_partition` returns Err on P-sst spawn failure,
 /// so this function's contract is now type-level — `row_append_tx` is
 /// always live.
 ///
 /// **F255** — `RowAppendReq` carries no invalidate flag; the invalidate is
-/// performed as a synchronous P-log → P-bulk BARRIER by `handle_split_part`
+/// performed as a synchronous P-log → P-sst BARRIER by `handle_split_part`
 /// before the manager seals the row_stream tail (see `RowInvalidateBarrierReq`
 /// in lib.rs). By the time `do_compact` runs, any prior split's barrier
-/// has already drained P-bulk's inflight FU to zero and invalidated
-/// `bulk_sc`'s stale per-stream worker cache, so `compact_row_append`'s
+/// has already drained P-sst's inflight FU to zero and invalidated
+/// `sst_sc`'s stale per-stream worker cache, so `compact_row_append`'s
 /// append is guaranteed to land on a fresh, post-seal worker. No per-chunk
 /// flag-checking — the structural barrier replaces the lazy fetch-and-
 /// clear approach (the lazy form had a window where a FlushReq with
 /// `invalidate=false` could race a RowAppendReq with `invalidate=true`
-/// inside P-bulk's cap=2 FuturesUnordered; coco /arch found this 2026-06-02).
+/// inside P-sst's cap=2 FuturesUnordered; coco /arch found this 2026-06-02).
 async fn compact_row_append(
     row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
     row_stream_id: u64,
@@ -1945,15 +1945,15 @@ async fn compact_row_append(
         .clone()
         .send(req)
         .await
-        .map_err(|_| anyhow::anyhow!("P-bulk row_append channel closed"))?;
+        .map_err(|_| anyhow::anyhow!("P-sst row_append channel closed"))?;
     resp_rx
         .await
-        .map_err(|_| anyhow::anyhow!("P-bulk row_append response dropped"))?
+        .map_err(|_| anyhow::anyhow!("P-sst row_append response dropped"))?
 }
 
 /// Finalize one compaction-output chunk: build the SST bytes off the compio
 /// runtime, account the per-partition compact rate, append to row_stream
-/// through P-bulk's single writer, parse the paged SstReader (off-runtime
+/// through P-sst's single writer, parse the paged SstReader (off-runtime
 /// too), and push `(TableMeta, reader)` into `new_readers`. Returns the
 /// chunk's byte size. Shared by `do_compact`'s in-loop and final chunk
 /// emits — the only difference is that the final caller attaches
@@ -1975,7 +1975,7 @@ async fn emit_compact_chunk(
     let chunk_bytes = sst_bytes.len() as u64;
     // Sleep BEFORE the append so the counter reflects "intent to write".
     rate_ctrl.account_compact(chunk_bytes).await;
-    // Route through P-bulk's StreamClient to preserve the single-writer
+    // Route through P-sst's StreamClient to preserve the single-writer
     // invariant on row_stream.
     let result = compact_row_append(row_append_tx, row_stream_id, sst_bytes.clone()).await?;
     let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
@@ -3430,7 +3430,7 @@ pub(crate) async fn resolve_value(
 /// Read value bytes from logStream. VP.offset points to value start.
 /// `offset`/`length` = 0/0 means read the entire value. Returns a `Bytes`:
 /// R4 — on the UCX zero-copy fast path the value `Bytes` ALIASES the registered
-/// RegPool buffer (`Bytes::from_owner(pb)`, no copy), so handle_get_zc can send
+/// RegPool buffer (`Bytes::from_owner(pb)`, no copy), so handle_get_bulk can send
 /// it as its own iovec (fully copy-free EN->PS->client); on the copy-path
 /// fallback the Vec is moved into a Bytes.
 pub(crate) async fn read_value_from_log(
@@ -3462,7 +3462,7 @@ pub(crate) async fn read_value_from_log(
         return Ok(Bytes::new());
     }
     // F216-E R3/R4: zero-copy fast path — recv the value straight into a
-    // registered RegPool buffer over UCX (MSG_READ_BYTES_ZC) and hand it onward
+    // registered RegPool buffer over UCX (MSG_READ_BYTES_BULK) and hand it onward
     // as a Bytes ALIASING that buffer (from_owner; pb returns to the pool when
     // the Bytes drops). No off-wire copy, no pb->Vec. Any non-OK / EC / chunked
     // / non-UCX case returns None -> the proven read_bytes_from_extent copy path.
@@ -3844,11 +3844,11 @@ mod sqcq_tests {
     }
 
     #[test]
-    fn ps_bulk_inflight_cap_default_and_bounds() {
-        let v = crate::ps_bulk_inflight_cap();
+    fn ps_sst_inflight_cap_default_and_bounds() {
+        let v = crate::ps_sst_inflight_cap();
         assert!(
             (1..=16).contains(&v),
-            "ps_bulk_inflight_cap out of range: {}",
+            "ps_sst_inflight_cap out of range: {}",
             v
         );
     }

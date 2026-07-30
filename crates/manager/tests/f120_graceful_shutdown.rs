@@ -26,7 +26,7 @@
 //!     surface for those values requires extra RPC plumbing — covered
 //!     by live cluster verification per feature_list.md F120 acceptance.
 //!   - The `MAX_IMM_DEPTH` back-pressure path (F120-A) — that requires
-//!     a slowed-down P-bulk fixture to actually fill imm.
+//!     a slowed-down P-sst fixture to actually fill imm.
 //!   - The `MAX_WAL_GAP` force-rotate path (F120-B) — same.
 
 mod support;

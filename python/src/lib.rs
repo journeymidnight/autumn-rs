@@ -273,7 +273,7 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             // No-TTL fast path unchanged. TTL path routes through `put_many` of 1
             // (the wire form carrying `expires_at`); it copies the pinned bytes
             // into `Bytes` — the single `put_from` TTL path is low-frequency. The
-            // kvcache ZC write path is `BatchClient.put_from` (run_job
+            // kvcache bulk write path is `BatchClient.put_from` (run_job
             // `BatchOp::Put`), which stays zero-copy via `Bytes::from_static`.
             let res = if ttl_secs == 0 {
                 client.put(&key, value).await
@@ -905,7 +905,7 @@ struct BatchClient {
     workers: Vec<BatchWorker>,
     per_worker_cap: usize,
     /// F216-E: captured from the process transport at construction. True ⟹
-    /// zero-copy data path (writes always; reads above UCX_ZC_READ_MIN_BYTES).
+    /// zero-copy data path (writes always; reads above BULK_MIN_BYTES).
     is_ucx: bool,
     /// F-DIRECT-MANY: opt-in EN direct-read for the Get path (`get_many_direct`).
     /// Topology-dependent (client must reach EN data ports), default OFF.
@@ -918,8 +918,8 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
         BatchOp::Get => {
             // F244-D: consolidate onto `ClusterClient::get_many_into` — the ONE
             // batch-read fan-out primitive (also driving the e2e-tested SDK path).
-            // Drops the hand-rolled `buffered` loop + the per-item `zc_worthwhile`
-            // decision (which used to drift across callers — see F234); the ZC rule
+            // Drops the hand-rolled `buffered` loop + the per-item `bulk_worthwhile`
+            // decision (which used to drift across callers — see F234); the bulk rule
             // now lives once, inside `get_many_into`. `cap` (per_worker_cap) is the
             // concurrency window.
             // SAFETY: each `it.ptr/len` addresses a pinned dest page the caller keeps
@@ -958,8 +958,8 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
         }
         BatchOp::Put => {
             // F246: consolidate onto `ClusterClient::put_many` (fan_out) — the write
-            // mirror of the Get arm. The ZC decision (`zc_worthwhile`) + per-item
-            // put_zc/put dispatch now live once inside `put_many`. The value is a
+            // mirror of the Get arm. The bulk decision (`bulk_worthwhile`) + per-item
+            // put_bulk/put dispatch now live once inside `put_many`. The value is a
             // `Bytes::from_static` view aliasing the pinned source page.
             // SAFETY: each `it.ptr/len` addresses a pinned source page the caller
             // keeps alive for the whole batch (until `allow_threads` returns); the
@@ -1026,7 +1026,7 @@ impl BatchClient {
         let n_workers = n_workers.max(1);
         // F216-E "ucx ⟹ zerocopy": derive the data path from the process
         // transport (set via set_transport BEFORE construction) — no explicit
-        // zc flag. UCX → zero-copy (writes always; reads size-guarded).
+        // bulk flag. UCX → zero-copy (writes always; reads size-guarded).
         let is_ucx = IS_UCX.load(std::sync::atomic::Ordering::SeqCst);
         let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
             let mut workers = Vec::with_capacity(n_workers);
@@ -1088,9 +1088,9 @@ impl BatchClient {
 
     /// Whether this client uses the F216-E zero-copy data path. This is now
     /// derived from the process transport (True ⟺ `set_transport("ucx")` was
-    /// called before construction): writes are zero-copy (MSG_PUT_ZC) always,
-    /// reads (MSG_GET_ZC) for values ≥ the size threshold. No explicit flag.
-    fn zc(&self) -> bool {
+    /// called before construction): writes are zero-copy (MSG_PUT_BULK) always,
+    /// reads (MSG_GET_BULK) for values ≥ the size threshold. No explicit flag.
+    fn bulk(&self) -> bool {
         self.is_ucx
     }
 

@@ -9,7 +9,7 @@ use crate::extent_rpc::{
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
     encode_chain_prefix, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
     MSG_APPEND, MSG_APPEND_CHAIN,
-    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_ZC, MSG_SYNCED_LENGTH,
+    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH,
 };
 use crate::ConnPool;
 use anyhow::{anyhow, Result};
@@ -232,7 +232,7 @@ use futures::future::join_all;
 
 /// F259: one-shot direct EN read of a value byte range, for clients holding
 /// a MSG_GET_REDIRECT descriptor. No StreamClient (no owner lock, no manager)
-/// — the zero-copy wire read the PS itself uses (MSG_READ_BYTES_ZC +
+/// — the zero-copy wire read the PS itself uses (MSG_READ_BYTES_BULK +
 /// call_into_pooled: UCX registered recv / TCP owned read, no FrameDecoder
 /// accumulation). Returns a `Bytes` ALIASING the pool buffer (returns to the
 /// pool on drop). Errors (eversion mismatch, extent gone, replica down)
@@ -258,7 +258,7 @@ pub async fn read_extent_value_direct(
         // consts — same source of truth as `StreamClientConfig::default`.
         .call_into_pooled(
             addr,
-            MSG_READ_BYTES_ZC,
+            MSG_READ_BYTES_BULK,
             req.encode(),
             IoDeadline {
                 base: DEFAULT_READ_BASE_TIMEOUT,
@@ -311,7 +311,7 @@ pub(crate) fn read_hedge_ms() -> u64 {
 /// F260: minimum total append payload (bytes) for CHAINED replication —
 /// the writer sends ONE copy to replica[0] which pipelines to the rest
 /// (PS egress 3x -> 1x for large writes). 0 = chaining disabled (always
-/// star fanout). Default 64 KiB (the zc_worthwhile threshold). Set once
+/// star fanout). Default 64 KiB (the bulk_worthwhile threshold). Set once
 /// at process start (`autumn-ps --append-chain-min-bytes`).
 static APPEND_CHAIN_MIN_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -399,7 +399,7 @@ pub(crate) fn replicated_read_order(
         return Vec::new();
     }
     // F-READ-OPENTAIL-ROTATE: rotate the start replica for OPEN extents too,
-    // not just sealed ones. This fn is READ-PATH-EXCLUSIVE (the ZC-proxy value
+    // not just sealed ones. This fn is READ-PATH-EXCLUSIVE (the bulk-proxy value
     // read + the chunked copy read are its only callers), and an open tail's
     // COMMITTED prefix is on every replica (all-replica-ACK), so a committed VP
     // read may start from any replica. Pre-fix open tails pinned `start = 0`
@@ -3849,7 +3849,7 @@ impl StreamClient {
     }
 
     /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
-    /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_ZC +
+    /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_BULK +
     /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio
     /// owned read (one kernel copy, no app-level copy). Returns `Some((pb, len))`
     /// on a clean OK; returns `Ok(None)` for ANYTHING the simple replicated path
@@ -3868,13 +3868,13 @@ impl StreamClient {
         // a *registered* buffer (RDMA, no off-wire copy); TCP recvs it into a
         // pooled buffer via a compio owned read in the rpc read_loop (no
         // FrameDecoder accumulation copy — only the unavoidable kernel copy).
-        // The EN `MSG_READ_BYTES_ZC` response is value-separable + pooled on both
+        // The EN `MSG_READ_BYTES_BULK` response is value-separable + pooled on both
         // transports, so the EN send side also drops its per-op alloc/zeroing +
         // encode copy (subsumes F216-F).
         if length == 0 {
             return Ok(None);
         }
-        // F276: this ZC value fast path is a READ path too — refresh the
+        // F276: this bulk value fast path is a READ path too — refresh the
         // Suspected snapshot (TTL-gated, non-blocking) so it routes around a
         // flaky node like the copy path, not just the avali-isolated ones
         // (coco P2: without this the hot GET still hit slot 0 first and paid
@@ -3918,14 +3918,14 @@ impl StreamClient {
                 // is chunk-bounded ≤ read_chunk_bytes by the caller.
                 .call_into_pooled(
                     addr,
-                    MSG_READ_BYTES_ZC,
+                    MSG_READ_BYTES_BULK,
                     req,
                     self.config.read_deadline().for_len(length),
                 )
                 .await
             {
-                // EN-side guarantee (ZC-EXACT, extent_node `build_read_future`):
-                // a ZC read that cannot serve the FULL requested range returns a
+                // EN-side guarantee (BULK-EXACT, extent_node `build_read_future`):
+                // a bulk read that cannot serve the FULL requested range returns a
                 // non-OK code, never CODE_OK + a short payload — so CODE_OK here
                 // implies the buffer holds exactly `length` bytes.
                 Ok(z) if z.code == CODE_OK => return Ok(Some((z.buf, length as usize))),
@@ -3936,7 +3936,7 @@ impl StreamClient {
                         extent_id,
                         code = z.code,
                         message = %z.message,
-                        "ZC proxy read non-OK; falling back to copy path"
+                        "bulk proxy read non-OK; falling back to copy path"
                     );
                     self.extent_info_cache.remove(&extent_id);
                     return Ok(None);
@@ -3955,7 +3955,7 @@ impl StreamClient {
                             extent_id,
                             addr = %addr,
                             error = %msg,
-                            "ZC proxy read TIMED OUT; evicting cache, trying next replica"
+                            "bulk proxy read TIMED OUT; evicting cache, trying next replica"
                         );
                         // Damp: after 2 liveness timeouts bail to the chunked
                         // copy path (it refetches ExtentInfo + re-routes) rather
@@ -3968,7 +3968,7 @@ impl StreamClient {
                             extent_id,
                             addr = %addr,
                             error = %msg,
-                            "ZC proxy read failed; evicting cache, trying next replica"
+                            "bulk proxy read failed; evicting cache, trying next replica"
                         );
                     }
                 }
@@ -4104,7 +4104,7 @@ impl StreamClient {
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         // WAL self-heal A1 + F276: hand the client only avali-ELIGIBLE replicas
         // (an isolated bit-rotted slot must not be a client-direct read target
-        // — same I2 invariant as the ZC + copy paths, no per-VP CRC here) AND
+        // — same I2 invariant as the bulk + copy paths, no per-VP CRC here) AND
         // drop manager-Suspected replicas (the client hash-rotates, so excluding
         // is the only effective route-around). `healthy_eligible_slots` keeps
         // ALL eligible when every one is Suspected — never strand the read.
@@ -4984,7 +4984,7 @@ impl StreamClient {
 
         // F117: RS decode of a full extent (up to 128 MiB) is CPU-bound;
         // run it on the blocking pool so the caller's compio thread (P-log
-        // / P-bulk / extent-node read fanout) stays responsive while the
+        // / P-sst / extent-node read fanout) stays responsive while the
         // GF(256) math runs. `sealed_length` is the authoritative payload
         // length (no in-shard trailer); decode truncates the data shards to it.
         let original_size = ex.sealed_length as usize;

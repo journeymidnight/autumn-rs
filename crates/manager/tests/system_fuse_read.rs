@@ -7,7 +7,7 @@
 //!     (`[0x03][ino][off BE]`): a 10 MiB file → extents at off 0 and off 8 MiB
 //!     (`MAX_EXTENT` = 8 MiB), NOT 40 × 256 KiB chunks.
 //!   - full multi-extent read round-trips byte-exactly
-//!   - whole-extent read (8 MiB ≥ 64 KiB → ZC `MSG_GET_ZC` branch)
+//!   - whole-extent read (8 MiB ≥ 64 KiB → bulk `MSG_GET_BULK` branch)
 //!   - small sub-range (< 64 KiB → regular `MSG_GET` branch)
 //!   - cross-extent sub-range (spans the 8 MiB boundary)
 //!   - EOF-clamped read
@@ -126,7 +126,7 @@ fn f247_variable_length_extents() {
         assert_eq!(full.len(), total, "full read length");
         assert!(full == data, "full read content mismatch");
 
-        // Whole first extent (8 MiB ≥ 64 KiB → ZC MSG_GET_ZC branch).
+        // Whole first extent (8 MiB ≥ 64 KiB → bulk MSG_GET_BULK branch).
         let e0 = read::read(&mut state, ino, 0, MAX_EXTENT as u32)
             .await
             .expect("extent0 read");

@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-07-29
+**Last updated:** 2026-07-30
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -28,7 +28,14 @@
   * WIRE 27→28（MIN=MAX），指纹重 pin。混部失败模式变化要写文档：帧层变更使 GetClusterId 协商通道对旧 binary 也解不开 —— 混部第一帧 CRC mismatch 响亮断连（劣于优雅拒绝、优于 rkyv 静默乱码；same-commit 部署策略下无实际影响）。
 - **Acceptance**: 单测 —— header 任一字节翻转 → CrcMismatch（普通帧 + ZC 帧都验）；ZC 错误响应 message 端到端可读；put_zc 大/小 value 双路径字节精确；`registry_pins_current_schema_to_max_version` 过（v28 pin）。集成 —— rpc/client/PS --lib/stream 全绿 + manager f235（--ignored 真集群）绿 + e2e put/get/append 冒烟。性能 —— put_zc 8MiB 发送侧少一趟全量 crc（perf-check 或微基准佐证方向即可）。
 - **Status**: `passes: false` (2026-07-29, **实现完成、验收基本达成，仅欠 coco 评审**——Trae
-  token 过期待用户重登)。已落地: frame.rs 全重写（统一帧 + peek_zc_prologue/
+  token 过期待用户重登)。
+  **Notes (2026-07-30, 术语定版)**: 全部 zc 词汇改名 **bulk**（用户裁定: zc 是 wire 结构却拿
+  效果命名——拷贝数由源内存出身×传输层决定，TCP 下 put 照样有内核拷贝；调研 brpc attachment /
+  Ceph data segment / NVMe in-capsule / TOAST out-of-line 后定 bulk）。腾词: P-bulk flush 线程
+  改名 **P-sst**（更准——它就是 SST build+upload 线程），env `AUTUMN_PS_BULK_INFLIGHT_CAP` →
+  `AUTUMN_PS_SST_INFLIGHT_CAP`（entrypoint.sh/autumn-deploy/ops.md 已同步）。CLI 动词
+  put-zc/zc-get → put-bulk/bulk-get；python `BatchClient.zc()` → `.bulk()`；bench_zc.py →
+  bench_bulk.py。wire 字节零变化，v28 指纹就地二刷 `7e04e6c6cbf5a759`。已落地: frame.rs 全重写（统一帧 + peek_zc_prologue/
   consume_zc_prologue + encode_zc_response_head/encode_vectored_head/compute_ctrl_crc +
   Malformed 错误变体）；rpc client（call_vectored_zc 新增、call_into_pooled 返回
   ZcResp{buf,code,message}、read_loop 快路径先验 crc 再 recv）；PS（ps_zc_head 瘦包装、

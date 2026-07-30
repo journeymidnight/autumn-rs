@@ -4,8 +4,8 @@ Drives autumn.BatchClient over a contiguous pinned-style host pool (numpy),
 exactly the kvcache v1 hot path (per-page put_from / get_into into pinned
 pages), and reports write/read throughput.
 
-F216-E "ucx ⟹ zerocopy": there is no longer a `zc` flag. The zero-copy data
-path (MSG_PUT_ZC write + MSG_GET_ZC read for large pages) is the DEFAULT on the
+F216-E "ucx ⟹ zerocopy": there is no longer a `bulk` flag. The zero-copy data
+path (MSG_PUT_BULK write + MSG_GET_BULK read for large pages) is the DEFAULT on the
 UCX transport; the regular path runs on TCP. So the A/B is now done at the
 TRANSPORT level — run this once per transport (separate processes, since the
 transport is process-global, first-call-wins):
@@ -13,11 +13,11 @@ transport is process-global, first-call-wins):
     # regular (TCP)
     AUTUMN_KVCACHE_ENDPOINT="127.0.0.1:9001" AUTUMN_TRANSPORT=tcp \
       AUTUMN_BENCH_PAGES=512 AUTUMN_BENCH_PAGE_KB=256 \
-      /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_zc
+      /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_bulk
     # zero-copy (UCX/RoCE)
     AUTUMN_KVCACHE_ENDPOINT="[<roce-ip>]:9001" AUTUMN_TRANSPORT=ucx \
       AUTUMN_BENCH_PAGES=512 AUTUMN_BENCH_PAGE_KB=256 \
-      /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_zc
+      /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_bulk
 """
 from __future__ import annotations
 import os, time
@@ -38,7 +38,7 @@ TENANT = os.environ.get("AUTUMN_BENCH_TENANT", "perf")
 
 
 def run():
-    # ZC is auto-derived from the transport (set below). bc.zc() reports it.
+    # bulk is auto-derived from the transport (set below). bc.bulk() reports it.
     bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP, namespace=NAMESPACE, tenant=TENANT)
     # One contiguous pool; per-page views (zero-copy numpy slices).
     pool = np.zeros(N_PAGES * PAGE, dtype=np.uint8)
@@ -62,7 +62,7 @@ def run():
     best_w = min(time_put()[1] for _ in range(ROUNDS))
     okr = time_get()[0]
     best_r = min(time_get()[1] for _ in range(ROUNDS))
-    print(f"  zerocopy={bc.zc()!s:5}  write {total_mb/best_w:8.1f} MB/s ({N_PAGES/best_w:7.0f} pg/s, ok={okw}/{N_PAGES})"
+    print(f"  zerocopy={bc.bulk()!s:5}  write {total_mb/best_w:8.1f} MB/s ({N_PAGES/best_w:7.0f} pg/s, ok={okw}/{N_PAGES})"
           f"  |  read {total_mb/best_r:8.1f} MB/s ({N_PAGES/best_r:7.0f} pg/s, ok={okr}/{N_PAGES})")
 
 

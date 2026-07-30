@@ -81,8 +81,8 @@ namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个
 文件数据是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
 value ≤ 8 MiB = `MAX_EXTENT`）：顺序写合并成接近 8 MiB 的 extent，末尾/部分 extent
 较短（"像 Linux extent 一样变长"）。相比固定 256 KiB chunk，大文件从几十万个小块变成
-数量级更少、每个 ≥ 64 KiB 的 extent，每个整 extent 读走 `get_many_into` 的 ZC 路径
-（`MSG_GET_ZC`，F243 RDMA 零拷贝的目标尺寸）。
+数量级更少、每个 ≥ 64 KiB 的 extent，每个整 extent 读走 `get_many_into` 的 bulk 路径
+（`MSG_GET_BULK`，F243 RDMA 零拷贝的目标尺寸）。
 
 - **持久真相 = extent KV key 本身**（隐式 key 设计，InodeMeta 里**不**存 extent 列表）。
 - **运行时缓存** `InodeState.extents: Option<Vec<(start, len)>>`：冷启动 range-scan
@@ -197,7 +197,7 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
-| `MAX_EXTENT` | 8 MiB | extent value 上限；写缓冲按此粒度刷；≥64 KiB 整 extent 读走 ZC |
+| `MAX_EXTENT` | 8 MiB | extent value 上限；写缓冲按此粒度刷；≥64 KiB 整 extent 读走 bulk |
 | `INLINE_THRESHOLD` | 4 KiB | 小文件 inline 阈值（匹配 VALUE_THROTTLE）|
 | `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
 | `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent 由 `put_many` 按 `APPEND_PIPELINE_DEPTH` 流水 |

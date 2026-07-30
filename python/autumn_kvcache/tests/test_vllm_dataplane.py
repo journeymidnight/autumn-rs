@@ -76,7 +76,7 @@ def main() -> int:
     # ── 3. per-layer zero-copy save/load round-trip ──────────────────────────
     chash = prefix_hash([10, 20, 30, 40], 4)
     layers = ["layer.0", "layer.1", "layer.2", "layer.3"]
-    page_bytes = 64 * 1024  # 64 KiB — crosses the UCX ZC threshold
+    page_bytes = 64 * 1024  # 64 KiB — crosses the UCX bulk threshold
     src = [_page(0xC0 + i, page_bytes) for i in range(len(layers))]
 
     save_ok = store.save_layers(chash, layers, src)
@@ -142,7 +142,7 @@ def main() -> int:
 
     # ── 6b. batch path (BatchClient.put_from) TTL, no grace ──────────────────
     # §6 proves the marker (single Client.put) TTL, but the layer write goes via
-    # the batched ZC path at ttl+grace (301s), so a regressed batch TTL would
+    # the batched bulk path at ttl+grace (301s), so a regressed batch TTL would
     # still look alive at +3s. Drive BatchClient.put_from with a bare 1s TTL to
     # prove it actually threads expires_at (the path the connector uses most).
     bch = prefix_hash([1, 1, 1, 1], 4)

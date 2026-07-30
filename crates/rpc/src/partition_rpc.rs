@@ -90,12 +90,12 @@ pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 
 // F216 zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
 // is value-separable for recv-into-registered-dest: a CRC-less frame whose
-// payload is `[ZC meta: code(1)+value_len(4)+reserved(4)][raw value]` (see
+// payload is `[bulk meta: code(1)+value_len(4)+reserved(4)][raw value]` (see
 // autumn_rpc::client::ZC_META_LEN; the reserved field held a value crc32c
 // before F219 removed it). The client uses RpcClient::call_into_dest to
 // land the value straight in its registered buffer (sglang page). Generic
 // MSG_GET keeps the rkyv GetResp form.
-pub const MSG_GET_ZC: u8 = 0x50;
+pub const MSG_GET_BULK: u8 = 0x50;
 
 // F216-E zero-copy PUT (client -> PS write hop). Same semantics as MSG_PUT but
 // value-separable so the client sends the value as its OWN iovec straight from
@@ -104,11 +104,11 @@ pub const MSG_GET_ZC: u8 = 0x50;
 // rkyv decode copy). Wire payload:
 //   [part_id: u64 LE][region_epoch: u64 LE][expires_at: u64 LE][key_len: u32 LE]
 //   [key: key_len bytes][value: rest]
-// Sent via RpcClient::call_vectored(MSG_PUT_ZC, [meta, value]) — on UCX the
+// Sent via RpcClient::call_vectored(MSG_PUT_BULK, [meta, value]) — on UCX the
 // value iovec is zero-copy via rcache when its memory is ucp_mem_map-registered;
 // the frame CRC covers [meta||value] just like MSG_PUT. The
-// response is a normal rkyv `PutResp` (tiny — no ZC framing needed back).
-pub const MSG_PUT_ZC: u8 = 0x51;
+// response is a normal rkyv `PutResp` (tiny — no bulk framing needed back).
+pub const MSG_PUT_BULK: u8 = 0x51;
 
 /// Batched PUT: N operations on the SAME partition in ONE frame. The PS
 /// decodes the frame once and injects all N ops into `partition_loop`'s
@@ -117,7 +117,7 @@ pub const MSG_PUT_ZC: u8 = 0x51;
 /// a full-size batch immediately, exercising both `INFLIGHT_CAP` (8)
 /// AND a wide `batch_size` (up to `MAX_WRITE_BATCH = 256`).
 ///
-/// Non-ZC ONLY (values < 64 KiB). Large values keep per-op `MSG_PUT_ZC`
+/// Non-bulk ONLY (values < 64 KiB). Large values keep per-op `MSG_PUT_BULK`
 /// — for them the wire payload IS the bottleneck and per-op overhead
 /// is negligible; bundling them into one frame would force a 256 MB
 /// frame for a 32-op batch of 8 MiB values which the wire framing
@@ -147,7 +147,7 @@ pub const MSG_BATCH_GET: u8 = 0x54;
 /// OPTIMIZATION, never a correctness dependency: any client-side
 /// direct-read failure (eversion bumped by EC conversion, extent GC'd
 /// between redirect and read, replica down) falls back to the plain
-/// MSG_GET / MSG_GET_ZC proxy path, which re-resolves through the PS.
+/// MSG_GET / MSG_GET_BULK proxy path, which re-resolves through the PS.
 pub const MSG_GET_REDIRECT: u8 = 0x56;
 
 /// F-AUTHZ-1: first-frame connection authentication. The client sends a signed
@@ -369,18 +369,18 @@ pub struct DiagPartitionVpResp {
     pub vp_seed_offset: u64,
 }
 
-/// Fixed prefix of the MSG_PUT_ZC meta: part_id(8)+region_epoch(8)+
+/// Fixed prefix of the MSG_PUT_BULK meta: part_id(8)+region_epoch(8)+
 /// expires_at(8)+key_len(4)+inode_hint(8)+lease_epoch(8).
 /// BUG-LEASE-2 Phase 2 extended this 28 → 44 (the two fence fields);
 /// no version byte — same-commit cluster upgrade, like every other
 /// wire-shape change in this repo.
-pub const PUT_ZC_HEADER_LEN: usize = 44;
+pub const PUT_BULK_HEADER_LEN: usize = 44;
 
-/// Build the MSG_PUT_ZC meta block `[part_id][region_epoch][expires_at]
+/// Build the MSG_PUT_BULK meta block `[part_id][region_epoch][expires_at]
 /// [key_len][inode_hint][lease_epoch][key]` (value is appended by the
 /// caller as a separate iovec).
 #[allow(clippy::too_many_arguments)]
-pub fn encode_put_zc_meta(
+pub fn encode_put_bulk_meta(
     part_id: u64,
     region_epoch: u64,
     expires_at: u64,
@@ -389,7 +389,7 @@ pub fn encode_put_zc_meta(
     lease_epoch: u64,
 ) -> bytes::Bytes {
     use bytes::BufMut;
-    let mut b = bytes::BytesMut::with_capacity(PUT_ZC_HEADER_LEN + key.len());
+    let mut b = bytes::BytesMut::with_capacity(PUT_BULK_HEADER_LEN + key.len());
     b.put_u64_le(part_id);
     b.put_u64_le(region_epoch);
     b.put_u64_le(expires_at);
@@ -400,8 +400,8 @@ pub fn encode_put_zc_meta(
     b.freeze()
 }
 
-/// Parsed MSG_PUT_ZC meta + the offset where the value begins in the payload.
-pub struct PutZcMeta {
+/// Parsed MSG_PUT_BULK meta + the offset where the value begins in the payload.
+pub struct PutBulkMeta {
     pub part_id: u64,
     pub region_epoch: u64,
     pub expires_at: u64,
@@ -413,12 +413,12 @@ pub struct PutZcMeta {
     pub value_offset: usize,
 }
 
-/// Parse the fixed prefix + key length of a MSG_PUT_ZC payload. Returns `None`
+/// Parse the fixed prefix + key length of a MSG_PUT_BULK payload. Returns `None`
 /// if the payload is too short to hold the header + declared key. The caller
-/// reads the key as `payload[PUT_ZC_HEADER_LEN..value_offset]` and the value as
+/// reads the key as `payload[PUT_BULK_HEADER_LEN..value_offset]` and the value as
 /// `payload[value_offset..]` (both zero-copy slices).
-pub fn parse_put_zc_meta(payload: &[u8]) -> Option<PutZcMeta> {
-    if payload.len() < PUT_ZC_HEADER_LEN {
+pub fn parse_put_bulk_meta(payload: &[u8]) -> Option<PutBulkMeta> {
+    if payload.len() < PUT_BULK_HEADER_LEN {
         return None;
     }
     let part_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
@@ -427,11 +427,11 @@ pub fn parse_put_zc_meta(payload: &[u8]) -> Option<PutZcMeta> {
     let key_len = u32::from_le_bytes(payload[24..28].try_into().ok()?) as usize;
     let inode_hint = u64::from_le_bytes(payload[28..36].try_into().ok()?);
     let lease_epoch = u64::from_le_bytes(payload[36..44].try_into().ok()?);
-    let value_offset = PUT_ZC_HEADER_LEN.checked_add(key_len)?;
+    let value_offset = PUT_BULK_HEADER_LEN.checked_add(key_len)?;
     if payload.len() < value_offset {
         return None;
     }
-    Some(PutZcMeta {
+    Some(PutBulkMeta {
         part_id,
         region_epoch,
         expires_at,
@@ -803,13 +803,13 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_PUT => rkyv_decode::<PutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
-        // MSG_PUT_ZC meta is binary: part_id is the first u64 LE.
-        MSG_PUT_ZC => payload
+        // MSG_PUT_BULK meta is binary: part_id is the first u64 LE.
+        MSG_PUT_BULK => payload
             .get(0..8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0),
-        MSG_GET | MSG_GET_ZC | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
+        MSG_GET | MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
@@ -875,7 +875,7 @@ mod msg_type_tests {
             MSG_GET_DISCARDS,
             MSG_MERGE_PART,
             MSG_MERGE_FREEZE,
-            MSG_GET_ZC,
+            MSG_GET_BULK,
             MSG_BATCH_PUT,
             MSG_BATCH_GET,
             MSG_GET_REDIRECT,
@@ -904,40 +904,40 @@ mod msg_type_tests {
 }
 
 #[cfg(test)]
-mod bug_lease_2_phase2_zc_meta_tests {
+mod bug_lease_2_phase2_bulk_ctrl_tests {
     use super::*;
 
     #[test]
-    fn put_zc_meta_round_trips_fence_fields() {
+    fn put_bulk_meta_round_trips_fence_fields() {
         let key = b"some/extent/key";
-        let meta = encode_put_zc_meta(7, 3, 99, key, 42, 5);
-        assert_eq!(meta.len(), PUT_ZC_HEADER_LEN + key.len());
+        let meta = encode_put_bulk_meta(7, 3, 99, key, 42, 5);
+        assert_eq!(meta.len(), PUT_BULK_HEADER_LEN + key.len());
         // [meta][value] is the wire payload; parse over meta+key+value.
         let mut payload = meta.to_vec();
         payload.extend_from_slice(b"VALUE");
-        let parsed = parse_put_zc_meta(&payload).expect("parse");
+        let parsed = parse_put_bulk_meta(&payload).expect("parse");
         assert_eq!(parsed.part_id, 7);
         assert_eq!(parsed.region_epoch, 3);
         assert_eq!(parsed.expires_at, 99);
         assert_eq!(parsed.key_len, key.len());
         assert_eq!(parsed.inode_hint, 42);
         assert_eq!(parsed.lease_epoch, 5);
-        assert_eq!(&payload[PUT_ZC_HEADER_LEN..parsed.value_offset], key);
+        assert_eq!(&payload[PUT_BULK_HEADER_LEN..parsed.value_offset], key);
         assert_eq!(&payload[parsed.value_offset..], b"VALUE");
     }
 
     #[test]
-    fn put_zc_meta_anonymous_zeroes() {
-        let meta = encode_put_zc_meta(1, 0, 0, b"k", 0, 0);
-        let parsed = parse_put_zc_meta(&meta).expect("parse");
+    fn put_bulk_meta_anonymous_zeroes() {
+        let meta = encode_put_bulk_meta(1, 0, 0, b"k", 0, 0);
+        let parsed = parse_put_bulk_meta(&meta).expect("parse");
         assert_eq!(parsed.inode_hint, 0);
         assert_eq!(parsed.lease_epoch, 0);
     }
 
     #[test]
-    fn put_zc_meta_short_payload_rejected() {
+    fn put_bulk_meta_short_payload_rejected() {
         // One byte short of the fixed header.
-        let meta = encode_put_zc_meta(1, 0, 0, b"", 9, 9);
-        assert!(parse_put_zc_meta(&meta[..PUT_ZC_HEADER_LEN - 1]).is_none());
+        let meta = encode_put_bulk_meta(1, 0, 0, b"", 9, 9);
+        assert!(parse_put_bulk_meta(&meta[..PUT_BULK_HEADER_LEN - 1]).is_none());
     }
 }

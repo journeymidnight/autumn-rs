@@ -18,9 +18,9 @@
 //!
 //! Per-msg_type ctrl/value split:
 //! - normal rkyv / binary RPCs and error envelopes: ctrl = whole body, no value.
-//! - `MSG_GET_ZC` / `MSG_READ_BYTES_ZC` responses: ctrl = `[code:1][message…]`,
+//! - `MSG_GET_BULK` / `MSG_READ_BYTES_BULK` responses: ctrl = `[code:1][message…]`,
 //!   value = the raw value bytes (recv'd straight into a `PooledBuf`).
-//! - `MSG_PUT_ZC` requests: ctrl = `[put_zc meta][key]`, value = raw value —
+//! - `MSG_PUT_BULK` requests: ctrl = `[put_bulk meta][key]`, value = raw value —
 //!   the sender never CRC-scans the value.
 //! - `MSG_APPEND` is the ONE deliberate exception (durability path): its bulk
 //!   payload rides INSIDE ctrl, so append bytes keep in-transit CRC protection.
@@ -60,7 +60,7 @@ pub struct Frame {
     pub msg_type: u8,
     pub flags: u8,
     /// Control bytes — the CRC-protected part (rkyv body / error envelope /
-    /// ZC meta+key). For non-value-separable frames this is the whole logical
+    /// bulk meta+key). For non-value-separable frames this is the whole logical
     /// payload, so existing handlers keep reading `frame.payload` unchanged.
     pub payload: Bytes,
     /// Raw value tail — NOT covered by the frame CRC (transport + storage
@@ -104,7 +104,7 @@ impl Frame {
     }
 
     /// Create a value-separable request frame: `payload` = ctrl (CRC'd),
-    /// `value` = raw tail (transport integrity). `MSG_PUT_ZC`'s shape.
+    /// `value` = raw tail (transport integrity). `MSG_PUT_BULK`'s shape.
     pub fn request_zc(req_id: u32, msg_type: u8, ctrl: Bytes, value: Bytes) -> Self {
         Self {
             req_id,
@@ -116,7 +116,7 @@ impl Frame {
     }
 
     /// Create a value-separable response frame: `payload` = ctrl (CRC'd,
-    /// `[code:1][message…]` for the ZC read responses), `value` = raw tail.
+    /// `[code:1][message…]` for the bulk read responses), `value` = raw tail.
     pub fn response_zc(req_id: u32, msg_type: u8, ctrl: Bytes, value: Bytes) -> Self {
         Self {
             req_id,
@@ -232,11 +232,11 @@ pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
 /// Build the complete head of a value-separable RESPONSE as ONE buffer:
 /// `[header][ctrl_len][code:1][message][crc]`. The caller emits the raw value
 /// as the following iovec(s); `value_len` only feeds the header's
-/// `payload_len`. This is the ZC read response (`MSG_GET_ZC` /
-/// `MSG_READ_BYTES_ZC`): status code + human-readable message ride in the
+/// `payload_len`. This is the bulk read response (`MSG_GET_BULK` /
+/// `MSG_READ_BYTES_BULK`): status code + human-readable message ride in the
 /// CRC-protected ctrl, the value is a raw tail the receiver lands in a
 /// `PooledBuf`.
-pub fn encode_zc_response_head(
+pub fn encode_bulk_response_head(
     req_id: u32,
     msg_type: u8,
     code: u8,
@@ -258,16 +258,16 @@ pub fn encode_zc_response_head(
     buf.freeze()
 }
 
-/// Parse a ZC read-response ctrl: `[code:1][message…]`. `None` on empty ctrl.
-pub fn parse_zc_ctrl(ctrl: &[u8]) -> Option<(u8, &[u8])> {
+/// Parse a bulk read-response ctrl: `[code:1][message…]`. `None` on empty ctrl.
+pub fn parse_bulk_ctrl(ctrl: &[u8]) -> Option<(u8, &[u8])> {
     ctrl.split_first().map(|(c, m)| (*c, m))
 }
 
 /// Verified prologue of the frame at the front of a `FrameDecoder` — the
-/// ZC fast paths use it to learn the value boundary and validate the control
+/// bulk fast paths use it to learn the value boundary and validate the control
 /// bytes BEFORE recv'ing the value straight into its destination.
 #[derive(Debug, Clone, Copy)]
-pub struct ZcPrologue {
+pub struct BulkPrologue {
     pub req_id: u32,
     pub msg_type: u8,
     pub flags: u8,
@@ -367,7 +367,7 @@ impl FrameDecoder {
 
     /// Peek the next frame's header without consuming it. Returns
     /// `(req_id, msg_type, flags, payload_len)` once `HEADER_LEN` bytes are
-    /// buffered. Lets the ZC fast paths decide whether to recv a raw value
+    /// buffered. Lets the bulk fast paths decide whether to recv a raw value
     /// tail straight into its destination before `try_decode` would buffer
     /// the whole payload.
     pub fn peek_header(&self) -> Option<(u32, u8, u8, u32)> {
@@ -393,7 +393,7 @@ impl FrameDecoder {
 
     /// Peek the first `n` ctrl bytes of the front frame without consuming,
     /// once they are buffered. Lets a server read loop inspect a
-    /// value-separable request's meta/key prefix (e.g. `MSG_PUT_ZC`'s
+    /// value-separable request's meta/key prefix (e.g. `MSG_PUT_BULK`'s
     /// `[meta][key]`) to gate the recv-into fast path BEFORE committing.
     pub fn peek_ctrl(&self, n: usize) -> Option<&[u8]> {
         let start = HEADER_LEN + CTRL_PREFIX_LEN;
@@ -403,12 +403,12 @@ impl FrameDecoder {
         Some(&self.buf[start..start + n])
     }
 
-    /// ZC fast path: once the front frame's FULL prologue
+    /// bulk fast path: once the front frame's FULL prologue
     /// (`[header][ctrl_len][ctrl][crc]`) is buffered, verify the CRC and
     /// return the parsed prologue WITHOUT consuming anything.
     /// `Ok(None)` = need more bytes. A CRC mismatch or malformed ctrl_len is
     /// a hard frame error (same as `try_decode` would raise).
-    pub fn peek_zc_prologue(&self) -> Result<Option<ZcPrologue>, FrameError> {
+    pub fn peek_bulk_prologue(&self) -> Result<Option<BulkPrologue>, FrameError> {
         let Some((req_id, msg_type, flags, payload_len)) = self.peek_header() else {
             return Ok(None);
         };
@@ -431,7 +431,7 @@ impl FrameDecoder {
         if stored != computed {
             return Err(FrameError::CrcMismatch { stored, computed });
         }
-        Ok(Some(ZcPrologue {
+        Ok(Some(BulkPrologue {
             req_id,
             msg_type,
             flags,
@@ -440,9 +440,9 @@ impl FrameDecoder {
         }))
     }
 
-    /// Consume a prologue previously verified by `peek_zc_prologue`, leaving
+    /// Consume a prologue previously verified by `peek_bulk_prologue`, leaving
     /// the frame's raw value bytes (or the next frame) at the front.
-    pub fn consume_zc_prologue(&mut self, ctrl_len: usize) {
+    pub fn consume_bulk_prologue(&mut self, ctrl_len: usize) {
         self.buf
             .advance(HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len + CRC_LEN);
     }
@@ -563,9 +563,9 @@ mod tests {
     /// Value-separable round trip: ctrl carries `[code][message]`, value is a
     /// raw tail; decoder splits them and verifies the ctrl CRC.
     #[test]
-    fn zc_frame_round_trip_splits_ctrl_and_value() {
+    fn bulk_frame_round_trip_splits_ctrl_and_value() {
         let value = Bytes::from(vec![0x5A; 4096]);
-        let head = encode_zc_response_head(9, 0x50, 0, "", value.len());
+        let head = encode_bulk_response_head(9, 0x50, 0, "", value.len());
         let mut wire = BytesMut::new();
         wire.extend_from_slice(&head);
         wire.extend_from_slice(&value);
@@ -574,20 +574,20 @@ mod tests {
         decoder.feed(&wire);
         let decoded = decoder.try_decode().unwrap().unwrap();
         assert!(decoded.is_response());
-        let (code, msg) = parse_zc_ctrl(&decoded.payload).unwrap();
+        let (code, msg) = parse_bulk_ctrl(&decoded.payload).unwrap();
         assert_eq!(code, 0);
         assert!(msg.is_empty());
         assert_eq!(decoded.value, value);
     }
 
-    /// ZC error responses carry a readable message in the CRC'd ctrl.
+    /// bulk error responses carry a readable message in the CRC'd ctrl.
     #[test]
-    fn zc_head_carries_error_message() {
-        let head = encode_zc_response_head(3, 0x50, 6, "eversion mismatch", 0);
+    fn bulk_head_carries_error_message() {
+        let head = encode_bulk_response_head(3, 0x50, 6, "eversion mismatch", 0);
         let mut decoder = FrameDecoder::new();
         decoder.feed(&head);
         let decoded = decoder.try_decode().unwrap().unwrap();
-        let (code, msg) = parse_zc_ctrl(&decoded.payload).unwrap();
+        let (code, msg) = parse_bulk_ctrl(&decoded.payload).unwrap();
         assert_eq!(code, 6);
         assert_eq!(msg, b"eversion mismatch");
         assert!(decoded.value.is_empty());
@@ -648,24 +648,24 @@ mod tests {
         }
     }
 
-    /// peek_zc_prologue: verifies the ctrl CRC without consuming; a partial
-    /// buffer reports "need more"; consume_zc_prologue leaves the value.
+    /// peek_bulk_prologue: verifies the ctrl CRC without consuming; a partial
+    /// buffer reports "need more"; consume_bulk_prologue leaves the value.
     #[test]
-    fn zc_prologue_peek_verify_consume() {
+    fn bulk_prologue_peek_verify_consume() {
         let value = Bytes::from(vec![0x11; 512]);
-        let head = encode_zc_response_head(5, 0x50, 0, "", value.len());
+        let head = encode_bulk_response_head(5, 0x50, 0, "", value.len());
 
         let mut decoder = FrameDecoder::new();
         decoder.feed(&head[..8]);
-        assert!(decoder.peek_zc_prologue().unwrap().is_none(), "partial header");
+        assert!(decoder.peek_bulk_prologue().unwrap().is_none(), "partial header");
         decoder.feed(&head[8..]);
-        let p = decoder.peek_zc_prologue().unwrap().expect("full prologue");
+        let p = decoder.peek_bulk_prologue().unwrap().expect("full prologue");
         assert_eq!(p.req_id, 5);
         assert_eq!(p.ctrl_len, 1);
         assert_eq!(p.value_len, 512);
 
         decoder.feed(&value[..100]); // value arrives in pieces
-        decoder.consume_zc_prologue(p.ctrl_len);
+        decoder.consume_bulk_prologue(p.ctrl_len);
         assert_eq!(decoder.buffered_len(), 100, "value prefix left at front");
     }
 

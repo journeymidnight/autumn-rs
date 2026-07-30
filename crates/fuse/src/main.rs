@@ -131,7 +131,7 @@ fn main() -> Result<()> {
         // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
         // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
         // out across the file's variable-length extents (F247, ≤ 8 MiB each)
-        // via `get_many_into` — each whole-extent get is ZC-eligible (≥ 64 KiB).
+        // via `get_many_into` — each whole-extent get is bulk-eligible (≥ 64 KiB).
         fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
     ];
     if args.allow_other {

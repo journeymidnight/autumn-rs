@@ -594,7 +594,7 @@ _ps_tunable_args() {
         "AUTUMN_GROUP_COMMIT_CAP:--group-commit-cap"
         "AUTUMN_PS_INFLIGHT_CAP:--ps-inflight-cap"
         "AUTUMN_PS_FLUSH_INFLIGHT_CAP:--flush-inflight-cap"
-        "AUTUMN_PS_BULK_INFLIGHT_CAP:--ps-bulk-inflight-cap"
+        "AUTUMN_PS_SST_INFLIGHT_CAP:--ps-bulk-inflight-cap"
         "AUTUMN_PS_MAX_IMM_DEPTH:--max-imm-depth"
         "AUTUMN_PS_MAX_WAL_GAP:--max-wal-gap"
         "AUTUMN_PS_SHUTDOWN_TIMEOUT_MS:--shutdown-timeout-ms"

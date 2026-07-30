@@ -138,10 +138,10 @@ impl TestConn {
         ReadBytesResp::decode(resp).expect("decode ReadBytesResp")
     }
 
-    /// ZC value read (MSG_READ_BYTES_ZC). Returns `(code, payload_bytes)` —
+    /// bulk value read (MSG_READ_BYTES_BULK). Returns `(code, payload_bytes)` —
     /// the payload is copied out of the pooled recv buffer for assertion
     /// convenience.
-    pub async fn read_bytes_zc(
+    pub async fn read_bytes_bulk(
         &self,
         extent_id: u64,
         eversion: u64,
@@ -158,12 +158,12 @@ impl TestConn {
             .pool
             .call_into_pooled(
                 &self.addr,
-                MSG_READ_BYTES_ZC,
+                MSG_READ_BYTES_BULK,
                 req.encode(),
                 Duration::from_secs(5),
             )
             .await
-            .expect("read_bytes_zc RPC");
+            .expect("read_bytes_bulk RPC");
         (z.code, z.buf.as_ref().to_vec())
     }
 

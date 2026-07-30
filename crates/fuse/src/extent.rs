@@ -35,7 +35,7 @@ use crate::state::FsState;
 /// 8 is conservative — `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` is 32 —
 // APPEND_PIPELINE_DEPTH removed: `put_many` no longer takes a `concurrency`
 // argument. The SDK groups items by owning partition and issues one
-// MSG_BATCH_PUT (or per-op MSG_PUT_ZC for >=64 KiB values) per partition;
+// MSG_BATCH_PUT (or per-op MSG_PUT_BULK for >=64 KiB values) per partition;
 // each partition's RPCs ride the multiplexed PS connection. Fuse-side
 // pipelining now happens naturally via the per-partition pipeline at the
 // PS partition_loop level.
@@ -288,12 +288,12 @@ pub async fn write_region(
 
 /// Dispatch a batch of append puts via `ClusterClient::put_many` (SDK
 /// groups by partition and issues server-batched MSG_BATCH_PUT for small
-/// values, per-op MSG_PUT_ZC for ≥ 64 KiB), then apply the
+/// values, per-op MSG_PUT_BULK for ≥ 64 KiB), then apply the
 /// corresponding `(start, len)` upserts to the in-memory extent map in input
 /// order. Empties the input vecs.
 ///
-/// Each item's value is a `Bytes` so ZC engages for ≥ 64 KiB (see
-/// `autumn_client::zc_worthwhile`). On any item failure the whole batch is
+/// Each item's value is a `Bytes` so bulk engages for ≥ 64 KiB (see
+/// `autumn_client::bulk_worthwhile`). On any item failure the whole batch is
 /// reported as an error and the in-memory extent map is left UN-upserted for
 /// every item past the first failure — callers treat this as a "this fuse
 /// write failed, retry the whole flush" outcome (matches the pre-pipelined

@@ -202,7 +202,7 @@ pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
 /// binding, SHARING all of its connection pools (no reconnect, no Rc refactor).
 /// Returned by `ClusterClient::raw()` (Raw binding — admin/migration, no client
 /// clamp) and `ClusterClient::rescope(ns, tenant)` (a different scope). Exposes
-/// the core KV ops; exotic ZC/batch/stream ops use a dedicated scoped
+/// the core KV ops; exotic bulk/batch/stream ops use a dedicated scoped
 /// `ClusterClient`. **The PS still enforces Layer-A/B** on every op — a view only
 /// changes the CLIENT-side key transform, never server authorization.
 pub struct NamespaceScope<'a> {
@@ -349,30 +349,30 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
 pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 
 /// F216-E — minimum value size for which the UCX zero-copy READ path
-/// (`get_into` / `MSG_GET_ZC`) is worth taking. Below this, the per-op
+/// (`get_into` / `MSG_GET_BULK`) is worth taking. Below this, the per-op
 /// registered-recv machinery (regpool_acquire + `UCP_OP_ATTR_FIELD_MEMH` +
 /// the 2-stage header/value recv) costs MORE than the single small copy it
 /// saves, so a small read regresses (~18% at 4 KiB in the perf_check A/B).
-/// At/above this, ZC reads are parity→2.3× (8 MiB). This is the
-/// "ucx ⟹ zerocopy" READ default's size guard; WRITES are always ZC on UCX
+/// At/above this, bulk reads are parity→2.3× (8 MiB). This is the
+/// "ucx ⟹ zerocopy" READ default's size guard; WRITES are always bulk on UCX
 /// (cheaper at every size — they drop the rkyv encode + value copies).
 /// The inline/VP boundary is `VALUE_THROTTLE` (4 KiB); 64 KiB is the
 /// conservative crossover (the mid-range is parity, large is a clear win).
-pub const UCX_ZC_READ_MIN_BYTES: usize = 64 * 1024;
+pub const BULK_MIN_BYTES: usize = 64 * 1024;
 
-/// F235: the single zero-copy selection rule. Engage ZC (`get_into`/`MSG_GET_ZC`,
-/// `put_zc`/`MSG_PUT_ZC`) iff the value is at least `UCX_ZC_READ_MIN_BYTES`
+/// F235: the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET_BULK`,
+/// `put_bulk`/`MSG_PUT_BULK`) iff the value is at least `BULK_MIN_BYTES`
 /// (64 KiB). SYMMETRIC across reads and writes AND across transports — it mirrors
-/// the PS-side recv gates (`UCX_ZC_READ_MIN_BYTES` here + `AUTUMN_PS_ZC_RECV_MIN_BYTES`
+/// the PS-side recv gates (`BULK_MIN_BYTES` here + `AUTUMN_PS_BULK_RECV_MIN_BYTES`
 /// on the PS, both 64 KiB). Below 64 KiB the per-op registered/pooled-recv machinery
 /// costs more than the copy it saves (small UCX read regresses ~18%) AND the PS recv
-/// side doesn't ZC anyway, so end-to-end ZC only engages at/above 64 KiB. This is the
+/// side doesn't bulk anyway, so end-to-end bulk only engages at/above 64 KiB. This is the
 /// ONE source of truth — perf-check, the python `BatchClient`, and `get_many_into`
 /// all call it (F234 found 3 hand-rolled copies had drifted; F235 collapsed them and
 /// made the write rule symmetric — was `is_ucx || large`, which only saved
 /// client-side allocs on small UCX writes while the PS still FrameDecoder-copied).
-pub fn zc_worthwhile(value_size: usize) -> bool {
-    value_size >= UCX_ZC_READ_MIN_BYTES
+pub fn bulk_worthwhile(value_size: usize) -> bool {
+    value_size >= BULK_MIN_BYTES
 }
 
 /// A value buffer backed by the transport RegPool — the SDK's data-plane
@@ -389,7 +389,7 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
 /// Two directions, same currency:
 /// - **Write**: [`alloc_value_buf`] → fill via [`ValueBuf::as_mut_slice`] →
 ///   [`ValueBuf::truncate`] to the written length → [`ValueBuf::freeze`] →
-///   [`ClusterClient::put_zc`].
+///   [`ClusterClient::put_bulk`].
 /// - **Read**: [`ClusterClient::get_pooled`] / `get_range_pooled` hand the
 ///   recv'd pool buffer straight back as a `ValueBuf` — zero SDK-side copies.
 ///   Read it in place (`Deref<[u8]>`), or `freeze()` into a `Bytes` to hand
@@ -456,7 +456,7 @@ impl ValueBuf {
 
     /// Convert into a `Bytes` exposing the filled bytes, WITHOUT copying (the
     /// `Bytes` aliases the slab; the slab returns to the pool when it drops).
-    /// Feed this to `put_zc` / `put_many`, or hand it to any `Bytes`-consuming
+    /// Feed this to `put_bulk` / `put_many`, or hand it to any `Bytes`-consuming
     /// sink (HTTP body, channel).
     pub fn freeze(self) -> Bytes {
         Bytes::from_owner(self.pb)
@@ -720,7 +720,7 @@ pub struct KeyMeta {
 /// fixed chunk size, or the ring-buffer slot); a value longer than `dest` is
 /// truncated to fit (the returned `Some(n)` carries the full value length).
 ///
-/// The ZC recv lands in a read_loop-owned RegPool buffer (registered on UCX —
+/// The bulk recv lands in a read_loop-owned RegPool buffer (registered on UCX —
 /// RDMA off the wire; plain recycled buffer on TCP), then ONE memcpy into
 /// `dest`. `dest` itself needs no registration and no special lifetime — it
 /// is a plain borrow filled after the RPC resolves.
@@ -2298,8 +2298,8 @@ impl ClusterClient {
     }
 
     /// F216-E zero-copy PUT: write a value with NO intermediate value copy and
-    /// NO value crc scan on the client (`MSG_PUT_ZC` +
-    /// `RpcClient::call_vectored_zc` — v28: the value rides after the ctrl crc
+    /// NO value crc scan on the client (`MSG_PUT_BULK` +
+    /// `RpcClient::call_vectored_bulk` — v28: the value rides after the ctrl crc
     /// as its own iovec, straight from `value`'s backing memory). The regular
     /// `put` path copies the value 3× (to_vec → clone → rkyv_encode); this
     /// copies 0.
@@ -2319,23 +2319,23 @@ impl ClusterClient {
     /// Same routing + epoch-stale refresh + RPC-retry shape as
     /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
     /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
-    pub async fn put_zc(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
+    pub async fn put_bulk(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.put_zc_opts(&bound, value, 0, WriteLease::ANON).await
+        self.put_bulk_opts(&bound, value, 0, WriteLease::ANON).await
     }
 
     /// BUG-LEASE-2 Phase 2: lease-fenced zero-copy put (see `put_fenced`).
-    pub async fn put_zc_fenced(
+    pub async fn put_bulk_fenced(
         &self,
         key: &[u8],
         value: Bytes,
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.put_zc_opts(&bound, value, 0, lease).await
+        self.put_bulk_opts(&bound, value, 0, lease).await
     }
 
-    pub(crate) async fn put_zc_opts(
+    pub(crate) async fn put_bulk_opts(
         &self,
         key: &[u8],
         value: Bytes,
@@ -2357,7 +2357,7 @@ impl ClusterClient {
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let meta = partition_rpc::encode_put_zc_meta(
+            let meta = partition_rpc::encode_put_bulk_meta(
                 part_id,
                 region_epoch,
                 expires_at,
@@ -2373,7 +2373,7 @@ impl ClusterClient {
                     // old call_vectored path paid a full crc32c pass over the
                     // value).
                     match client
-                        .call_vectored_zc(partition_rpc::MSG_PUT_ZC, vec![meta], value.clone())
+                        .call_vectored_bulk(partition_rpc::MSG_PUT_BULK, vec![meta], value.clone())
                         .await
                     {
                         Ok(resp_bytes) => {
@@ -2409,7 +2409,7 @@ impl ClusterClient {
             }
         }
         Err(AutumnError::ConnectionError(format!(
-            "put_zc after {attempt} refreshes: {}",
+            "put_bulk after {attempt} refreshes: {}",
             last_err.unwrap_or_else(|| "unknown".to_string())
         )))
     }
@@ -2630,14 +2630,14 @@ impl ClusterClient {
     /// proxy fallback — the per-item core of `get_many_direct`. Returns
     /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or
     /// `None` if not found. `read_len = length>0 ? length : dest.len()`:
-    /// - `read_len < 64 KiB` (`!zc_worthwhile`): no redirect — a small
+    /// - `read_len < 64 KiB` (`!bulk_worthwhile`): no redirect — a small
     ///   value/sub-range never bypasses the PS (the redirect RTT + EN connect
     ///   would cost more than the copy it saves). Plain proxy `get_range` + copy.
     /// - `read_len >= 64 KiB`: `MSG_GET_REDIRECT`. An inline answer
     ///   (`extent_id == 0`: the PS declined to redirect — small/non-VP after
     ///   resolution) is copied straight in; a descriptor drives
     ///   `read_redirect_replicas`; ALL-replica failure falls back to the proxy
-    ///   ZC path (`get_range_into`).
+    ///   bulk path (`get_range_into`).
     async fn get_range_direct_into(
         &self,
         key: &[u8],
@@ -2646,7 +2646,7 @@ impl ClusterClient {
         dest: &mut [u8],
     ) -> std::result::Result<Option<usize>, AutumnError> {
         let read_len = if length > 0 { length as usize } else { dest.len() };
-        if !zc_worthwhile(read_len) {
+        if !bulk_worthwhile(read_len) {
             // Small item: straight proxy, no redirect round-trip.
             return match self.get_range(key, offset, length).await {
                 Ok(Some(v)) => {
@@ -2692,7 +2692,7 @@ impl ClusterClient {
             dest[..n].copy_from_slice(&v[..n]);
             return Ok(Some(v.len()));
         }
-        // All replicas failed → proxy ZC fallback re-resolves through the PS.
+        // All replicas failed → proxy bulk fallback re-resolves through the PS.
         self.get_range_into(key, offset, length, dest).await
     }
 
@@ -2738,7 +2738,7 @@ impl ClusterClient {
             std::collections::HashMap::new();
         for (i, it) in items.iter().enumerate() {
             let read_len = if it.length > 0 { it.length as usize } else { it.dest.len() };
-            if !zc_worthwhile(read_len) {
+            if !bulk_worthwhile(read_len) {
                 continue;
             }
             let bk = match &bound_keys[i] {
@@ -2813,7 +2813,7 @@ impl ClusterClient {
     /// of `get_range_direct_into`, factored out so the batch path skips the
     /// per-item `MSG_GET_REDIRECT` round-trip. Inline (`extent_id == 0`) copies
     /// straight in; a descriptor drives `read_redirect_replicas`; ALL-replica
-    /// failure falls back to the proxy ZC path (`get_range_into`). Returns
+    /// failure falls back to the proxy bulk path (`get_range_into`). Returns
     /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or `None`.
     async fn apply_redirect_desc(
         &self,
@@ -2841,8 +2841,8 @@ impl ClusterClient {
         self.get_range_into(key, offset, length, dest).await
     }
 
-    /// ZC GET: read a key's value into `dest` with ONE copy. The value is
-    /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET_ZC` +
+    /// bulk GET: read a key's value into `dest` with ONE copy. The value is
+    /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET_BULK` +
     /// `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool
     /// buffer; TCP ≥ 64 KiB pays only the kernel copy, no FrameDecoder
     /// accumulation) and then copied once into `dest`. Returns
@@ -2890,8 +2890,8 @@ impl ClusterClient {
         }
     }
 
-    /// ZC GET, zero SDK-side copies: the value arrives in a read_loop-owned
-    /// RegPool buffer (`MSG_GET_ZC` + `RpcClient::call_into_pooled` — UCX
+    /// bulk GET, zero SDK-side copies: the value arrives in a read_loop-owned
+    /// RegPool buffer (`MSG_GET_BULK` + `RpcClient::call_into_pooled` — UCX
     /// RDMAs into the registered slab; TCP ≥ 64 KiB pays only the kernel
     /// copy) and is handed straight back as a [`ValueBuf`]. Read it in place,
     /// or `freeze()` into a `Bytes` for a framework sink; dropping either
@@ -2910,7 +2910,7 @@ impl ClusterClient {
     }
 
     /// Sub-range variant of [`get_pooled`](ClusterClient::get_pooled) — the
-    /// CORE every ZC read routes through. Reads bytes `[offset,
+    /// CORE every bulk read routes through. Reads bytes `[offset,
     /// offset+length)` (`length == 0` = whole value / to-end). Same routing +
     /// epoch-stale refresh + RPC retry shape as `call_ps_for_key`; honors
     /// `rpc_timeout` (the pooled recv is cancel-safe — a timed-out call's
@@ -2944,14 +2944,14 @@ impl ClusterClient {
                     // rpc_timeout is safe: on expiry the dropped call's buffer
                     // returns to the pool via the read_loop (cancel-safe,
                     // unlike the removed call_into_dest).
-                    let call = client.call_into_pooled(partition_rpc::MSG_GET_ZC, payload);
+                    let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
                     let outcome = match self.rpc_timeout.get() {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
                             Err(_) => Err(autumn_rpc::RpcError::status(
                                 StatusCode::Unavailable,
-                                format!("MSG_GET_ZC timed out after {t:?}"),
+                                format!("MSG_GET_BULK timed out after {t:?}"),
                             )),
                         },
                     };
@@ -2970,13 +2970,13 @@ impl ClusterClient {
                                     z.message
                                 });
                             }
-                            // v28: the ZC ctrl carries a human-readable message.
+                            // v28: the bulk ctrl carries a human-readable message.
                             other => return Err(code_to_error(other, z.message)),
                         },
                         Err(e) => {
                             // Frame-level error or transport failure. (An authz
                             // denial now decodes properly — it used to be
-                            // misparsed as a ZC meta by the IntoDest path.)
+                            // misparsed as a bulk meta by the IntoDest path.)
                             match rpc_status_to_error(e) {
                                 // TERMINAL — retrying can't grant access /
                                 // create the namespace (same classification as
@@ -3021,9 +3021,9 @@ impl ClusterClient {
     /// callers pass `BATCH_GET_DEFAULT_CONCURRENCY` or their own tuned cap, e.g.
     /// python's `per_worker_cap`) over the per-partition multiplexed PS
     /// connections, amortising per-call await latency + letting the writer_task
-    /// batch syscalls. Per item the ZC decision is `zc_worthwhile(read_len)`
+    /// batch syscalls. Per item the bulk decision is `bulk_worthwhile(read_len)`
     /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
-    /// `get_range_into` (`MSG_GET_ZC`, pooled recv — UCX RDMAs into the
+    /// `get_range_into` (`MSG_GET_BULK`, pooled recv — UCX RDMAs into the
     /// registered pool buffer — then one copy into `dest`); else `get_range`
     /// (`MSG_GET`) + one copy into `dest`.
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
@@ -3036,12 +3036,12 @@ impl ClusterClient {
         // Homogeneous small whole-value case → MSG_BATCH_GET (server
         // batches per partition; measured 4× lower read p99 on
         // loopback). Conditions: every item is a whole-value read
-        // (offset == 0 && length == 0) whose dest is below the ZC
-        // threshold. Mixed / range / large-ZC inputs fall through to
-        // the per-op fan_out which keeps the ZC RDMA path.
+        // (offset == 0 && length == 0) whose dest is below the bulk
+        // threshold. Mixed / range / large-bulk inputs fall through to
+        // the per-op fan_out which keeps the bulk RDMA path.
         let homogeneous_small = !items.is_empty()
             && items.iter().all(|it| {
-                it.offset == 0 && it.length == 0 && !zc_worthwhile(it.dest.len())
+                it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len())
             });
         if homogeneous_small {
             let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
@@ -3072,7 +3072,7 @@ impl ClusterClient {
             let dest: &mut [u8] = &mut *it.dest;
             async move {
                 let read_len = if length > 0 { length as usize } else { dest.len() };
-                if zc_worthwhile(read_len) {
+                if bulk_worthwhile(read_len) {
                     self.get_range_into(key, offset, length, dest).await
                 } else {
                     match self.get_range(key, offset, length).await {
@@ -3094,10 +3094,10 @@ impl ClusterClient {
     /// built on the shared `fan_out_collect`. Pure client-side fan-out (no server
     /// `MSG_BATCH_PUT`): each `(key, value)` is written concurrently (sliding window
     /// of `concurrency`) over the per-partition multiplexed PS connections. Per item
-    /// the ZC decision
-    /// is `zc_worthwhile(value.len())`: >= 64 KiB → `put_zc` (`MSG_PUT_ZC`, value
+    /// the bulk decision
+    /// is `bulk_worthwhile(value.len())`: >= 64 KiB → `put_bulk` (`MSG_PUT_BULK`, value
     /// sent as its own iovec from the `Bytes` backing memory; RDMA on UCX when that
-    /// memory is registered); else `put` (`MSG_PUT`). Values are `Bytes` so the ZC
+    /// memory is registered); else `put` (`MSG_PUT`). Values are `Bytes` so the bulk
     /// path needs no copy (`clone` = Arc bump). Result `i` matches `items[i]`:
     /// `Ok(())` = stored, `Err` = that item's RPC failed (others still ran).
     #[allow(clippy::type_complexity)]
@@ -3115,9 +3115,9 @@ impl ClusterClient {
         //     owning partition, server decodes once and injects all ops
         //     into partition_loop.pending atomically). Measured 6.9×
         //     over the pre-merge client-side fan-out on cross-host TCP.
-        //   * value >= 64 KiB → per-op MSG_PUT_ZC (zero-copy value
+        //   * value >= 64 KiB → per-op MSG_PUT_BULK (zero-copy value
         //     transfer; on UCX with registered Bytes → RDMA from caller
-        //     memory). Batching ZC values would bloat the frame.
+        //     memory). Batching bulk values would bloat the frame.
         //
         // No `concurrency` parameter: batch_put issues one RPC per
         // owning partition and the underlying multiplexed PS connection
@@ -3150,7 +3150,7 @@ impl ClusterClient {
     /// When to use `get_many` vs `get_many_into`:
     /// - **`get_many`** — when you don't know the value sizes (or
     ///   don't care to alloc dests), or values are small (< 64 KiB)
-    ///   so ZC wouldn't engage anyway. SDK allocates each `Vec<u8>`.
+    ///   so bulk wouldn't engage anyway. SDK allocates each `Vec<u8>`.
     /// - **`get_many_into`** — when values are ≥ 64 KiB AND you have
     ///   caller-owned dest buffers (especially `RegisteredMem` for
     ///   UCX RDMA into pinned memory like sglang pages / torch
@@ -3281,10 +3281,10 @@ impl ClusterClient {
     /// `docs/perf_4k_loopback_vs_xhost_scaling.md`.
     ///
     /// Constraints (vs the client-side `put_many` fan-out):
-    /// * **Non-ZC only** — values >= 64 KiB skip this path (the wire
+    /// * **Non-bulk only** — values >= 64 KiB skip this path (the wire
     ///   bandwidth dominates per-op overhead; bundling them gives no
     ///   win and bloats the frame). The caller may still pass large
-    ///   values; they're routed to per-op `put_zc` individually here.
+    ///   values; they're routed to per-op `put_bulk` individually here.
     /// * **One frame per partition** — the client groups `items` by
     ///   owning partition first, then issues one BATCH RPC per
     ///   partition. A 32-key batch spread across 16 partitions becomes
@@ -3300,14 +3300,14 @@ impl ClusterClient {
         let mut results: Vec<std::result::Result<(), AutumnError>> =
             (0..items.len()).map(|_| Ok(())).collect();
         // (idx, key, value, expires_at) — keep all four pieces threaded so the
-        // ZC fallback and per-partition packing can read them without
+        // bulk fallback and per-partition packing can read them without
         // re-indexing into `items` (which is borrowed immutably).
         // F-KEY-NS D7: each tuple's 2nd element is the BOUND wire key (owned) —
-        // routing + the batch payload + the ZC/put fallbacks all use it, so a key
+        // routing + the batch payload + the bulk/put fallbacks all use it, so a key
         // is bound exactly ONCE. Bind is infallible under Prepend-only.
         let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes, u64)>> =
             std::collections::HashMap::new();
-        let mut zc_only: Vec<(usize, Vec<u8>, bytes::Bytes, u64)> = Vec::new();
+        let mut bulk_only: Vec<(usize, Vec<u8>, bytes::Bytes, u64)> = Vec::new();
         for (i, (k, v, ttl)) in items.iter().enumerate() {
             let bk = match self.binding.bind_key(k) {
                 Ok(b) => b,
@@ -3316,8 +3316,8 @@ impl ClusterClient {
                     continue;
                 }
             };
-            if zc_worthwhile(v.len()) {
-                zc_only.push((i, bk, v.clone(), *ttl));
+            if bulk_worthwhile(v.len()) {
+                bulk_only.push((i, bk, v.clone(), *ttl));
                 continue;
             }
             let part_id = match self.resolve_key(&bk).await {
@@ -3420,10 +3420,10 @@ impl ClusterClient {
                 }
             }
         }
-        // ZC-only entries (values ≥ 64 KiB — every autumnfs / fuse 8 MiB extent,
-        // every large kvcache page): per-op put_zc_opts so the TTL from put_many's
-        // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at on the wire;
-        // the single-key `put_zc` convenience hardcodes 0). `k` is the ALREADY-bound
+        // bulk-only entries (values ≥ 64 KiB — every autumnfs / fuse 8 MiB extent,
+        // every large kvcache page): per-op put_bulk_opts so the TTL from put_many's
+        // 3-tuple is preserved end-to-end (PutBulkMeta carries expires_at on the wire;
+        // the single-key `put_bulk` convenience hardcodes 0). `k` is the ALREADY-bound
         // wire key.
         //
         // Fan these out CONCURRENTLY (mirrors delete_many / head_many). A serial
@@ -3453,16 +3453,16 @@ impl ClusterClient {
         // change).
         let mut key_groups: std::collections::HashMap<&[u8], Vec<usize>> =
             std::collections::HashMap::new();
-        for (pos, (_, k, _, _)) in zc_only.iter().enumerate() {
+        for (pos, (_, k, _, _)) in bulk_only.iter().enumerate() {
             key_groups.entry(k.as_slice()).or_default().push(pos);
         }
-        let zc = &zc_only;
+        let bulk = &bulk_only;
         let this = self;
         let group_futs = key_groups.into_values().map(move |positions| async move {
             let mut out = Vec::with_capacity(positions.len());
             for pos in positions {
-                let (idx, k, v, ttl) = &zc[pos];
-                out.push((*idx, this.put_zc_opts(k, v.clone(), *ttl, lease).await));
+                let (idx, k, v, ttl) = &bulk[pos];
+                out.push((*idx, this.put_bulk_opts(k, v.clone(), *ttl, lease).await));
             }
             out
         });
@@ -3475,7 +3475,7 @@ impl ClusterClient {
     }
 
     /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
-    /// `buffered` over the per-partition multiplexed connections. No ZC (delete is
+    /// `buffered` over the per-partition multiplexed connections. No bulk (delete is
     /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
     /// same as `delete`; `Err` = that item's RPC failed, others still ran).
     pub async fn delete_many(&self, keys: &[&[u8]]) -> Vec<std::result::Result<(), AutumnError>> {
@@ -3487,7 +3487,7 @@ impl ClusterClient {
     }
 
     /// F237: batched metadata lookups — pure client-side fan-out, `buffered` over
-    /// the per-partition multiplexed connections. No ZC (head carries no value).
+    /// the per-partition multiplexed connections. No bulk (head carries no value).
     /// Result `i` matches `keys[i]`: `Ok(KeyMeta{ found, value_length })`
     /// (`found=false` for a missing key, NOT an `Err`); `Err` = that item's RPC
     /// failed (others still ran).
@@ -3636,7 +3636,7 @@ impl ClusterClient {
     /// key-prefix `scope` (`fs`, `mem/agent7`), sharing the same connection pools —
     /// for multi-namespace tools (dashboard / migration) that operate across scopes
     /// without reconnecting. Exposes the core KV ops (`put`/`get`/`delete`/
-    /// `head`/`range`); exotic ZC/batch/stream ops use a dedicated scoped
+    /// `head`/`range`); exotic bulk/batch/stream ops use a dedicated scoped
     /// `ClusterClient`.
     pub fn rescope(&self, scope: &str) -> NamespaceScope<'_> {
         NamespaceScope {
@@ -4566,7 +4566,7 @@ mod zc_rule_tests {
 
     /// F-VALUEBUF: write into a pool slab, truncate to the written length,
     /// freeze into a Bytes exposing exactly those bytes (aliasing the slab —
-    /// the write-side currency for `put_zc`).
+    /// the write-side currency for `put_bulk`).
     #[test]
     fn value_buf_truncate_freeze_roundtrip() {
         let mut vb = alloc_value_buf(8192);
@@ -4579,15 +4579,15 @@ mod zc_rule_tests {
         assert_eq!(&b[..], b"hello", "freeze aliases exactly the filled bytes");
     }
 
-    // F235: ZC is engaged iff value >= 64 KiB — symmetric across read/write +
+    // F235: bulk is engaged iff value >= 64 KiB — symmetric across read/write +
     // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
     #[test]
-    fn zc_worthwhile_is_symmetric_at_64k() {
-        assert!(!zc_worthwhile(0));
-        assert!(!zc_worthwhile(4 * 1024));
-        assert!(!zc_worthwhile(UCX_ZC_READ_MIN_BYTES - 1));
-        assert!(zc_worthwhile(UCX_ZC_READ_MIN_BYTES));
-        assert!(zc_worthwhile(8 * 1024 * 1024));
+    fn bulk_worthwhile_is_symmetric_at_64k() {
+        assert!(!bulk_worthwhile(0));
+        assert!(!bulk_worthwhile(4 * 1024));
+        assert!(!bulk_worthwhile(BULK_MIN_BYTES - 1));
+        assert!(bulk_worthwhile(BULK_MIN_BYTES));
+        assert!(bulk_worthwhile(8 * 1024 * 1024));
     }
 }
 

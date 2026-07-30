@@ -30,10 +30,10 @@ pub(crate) enum Command {
         chunk_size: u32,
         out: Option<String>,
     },
-    /// F216-E verification: zero-copy PUT via ClusterClient::put_zc. Reads
+    /// F216-E verification: zero-copy PUT via ClusterClient::put_bulk. Reads
     /// `file` into a Bytes, registers it for UCX zero-copy send (ucx build),
-    /// writes via MSG_PUT_ZC (value sent as its own iovec, no client-side copy).
-    PutZc {
+    /// writes via MSG_PUT_BULK (value sent as its own iovec, no client-side copy).
+    PutBulk {
         key: String,
         file: String,
     },
@@ -48,7 +48,7 @@ pub(crate) enum Command {
     /// F216 verification: zero-copy GET via ClusterClient::get_into. heads
     /// the key, allocates a dest buffer, registers it for UCX zero-copy
     /// (ucx build only), reads the value straight into dest, writes to stdout.
-    ZcGet {
+    BulkGet {
         key: String,
     },
     Del {
@@ -262,12 +262,12 @@ pub(crate) fn parse_args() -> Args {
             let file = raw[i + 1].clone();
             Command::Put { key, file }
         }
-        "put-zc" => {
+        "put-bulk" => {
             if i + 1 >= raw.len() {
-                eprintln!("put-zc requires <KEY> <FILE>");
+                eprintln!("put-bulk requires <KEY> <FILE>");
                 std::process::exit(1);
             }
-            Command::PutZc {
+            Command::PutBulk {
                 key: raw[i].clone(),
                 file: raw[i + 1].clone(),
             }
@@ -341,12 +341,12 @@ pub(crate) fn parse_args() -> Args {
                 key: raw[i].clone(),
             }
         }
-        "zc-get" => {
+        "bulk-get" => {
             if i >= raw.len() {
-                eprintln!("zc-get requires <KEY>");
+                eprintln!("bulk-get requires <KEY>");
                 std::process::exit(1);
             }
-            Command::ZcGet {
+            Command::BulkGet {
                 key: raw[i].clone(),
             }
         }
@@ -432,10 +432,10 @@ pub(crate) fn parse_args() -> Args {
             let mut group_commit_cap: Option<usize> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--zc" => {
+                    "--bulk" => {
                         // F216-E: removed. Zero-copy is now the DEFAULT on the
                         // UCX transport (writes always; reads when value >=
-                        // UCX_ZC_READ_MIN_BYTES). Kept as a no-op so existing
+                        // BULK_MIN_BYTES). Kept as a no-op so existing
                         // perf_check.sh / scripts don't hard-fail; on TCP it
                         // stays the regular path. Same spirit as --nosync.
                         warn_zc_flag_deprecated_once();
@@ -653,10 +653,10 @@ fn warn_zc_flag_deprecated_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         eprintln!(
-            "[autumn-client] note: --zc was removed (F216-E). Zero-copy is now \
+            "[autumn-client] note: --bulk was removed (F216-E). Zero-copy is now \
              the DEFAULT on --transport ucx: writes always; reads when value \
              >= {} B. On --transport tcp the regular path is used. Flag ignored.",
-            autumn_client::UCX_ZC_READ_MIN_BYTES
+            autumn_client::BULK_MIN_BYTES
         );
     });
 }
