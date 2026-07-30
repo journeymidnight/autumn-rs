@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use autumn_rpc::client::{encode_zc_meta, RpcClient};
+use autumn_rpc::client::RpcClient;
 use autumn_rpc::frame::FLAG_RESPONSE;
 use autumn_rpc::HEADER_LEN;
 use autumn_transport::{AutumnTransport, TransportKind};
@@ -64,17 +64,10 @@ fn pin_avoid(core: usize, ncpu: usize) {
     }
 }
 
-/// `[V0 header][zc_meta]` — exactly what the EN's `zc_read_head` emits.
+/// v28 value-separable response head — exactly what the EN's `zc_read_head`
+/// emits (`[header][ctrl_len][code][crc]`; the value follows as a raw tail).
 fn zc_head(req_id: u32, value: &[u8]) -> Bytes {
-    let meta = encode_zc_meta(CODE_OK, value);
-    let payload_len = meta.len() + value.len();
-    let mut h = BytesMut::with_capacity(HEADER_LEN + meta.len());
-    h.put_u32_le(req_id);
-    h.put_u8(MSG_READ_BYTES_ZC);
-    h.put_u8(FLAG_RESPONSE); // V0 (value crc rides in the meta)
-    h.put_u32_le(payload_len as u32);
-    h.put_slice(&meta);
-    h.freeze()
+    autumn_rpc::frame::encode_zc_response_head(req_id, MSG_READ_BYTES_ZC, CODE_OK, "", value.len())
 }
 
 async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
@@ -142,7 +135,7 @@ async fn zc_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
             .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
             .await
         {
-            Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
+            Ok(z) => b.set(b.get() + z.buf.len() as u64),
             Err(_) => break,
         }
     }

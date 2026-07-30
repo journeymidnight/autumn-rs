@@ -4492,12 +4492,12 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
 /// the front frame is NOT an eligible large `MSG_PUT_ZC` (the caller then runs
 /// the normal decode path on the remainder).
 ///
-/// F219: the per-value ZC crc on the hot path is removed (it cost a full crc32c
-/// pass over every large value — the same memory-bandwidth the copy-elimination
-/// recovers — and duplicated the transport's own integrity: UCX NIC ICRC / TCP
-/// kernel segment checksum). The MSG_PUT_ZC frame still carries the frame CRC,
-/// so its 4-byte frame-crc trailer is CONSUMED off the wire (stream alignment)
-/// but no longer validated. Normal (non-ZC) RPC frames keep their frame-CRC (F165).
+/// v28 (F-WIRE-CRC-UNIFY): the frame's ctrl (`[meta][key]`) is CRC-protected
+/// together with the header — `peek_zc_prologue` VERIFIES it before the value
+/// recv commits, so a flipped part_id/key_len/lease field fails loud. The raw
+/// value tail carries no frame CRC (transport integrity: UCX NIC ICRC / TCP
+/// kernel segment checksum — F219 measured the per-value crc at ~20% of a
+/// core @ 8 MiB) and there is no trailer after the value to consume.
 ///
 /// Cancel-safe on both transports: the `PooledBuf` is owned here for the whole
 /// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
@@ -4517,42 +4517,23 @@ async fn drain_zc_writes(
     cap: usize,
 ) -> Result<()> {
     use futures::FutureExt;
-    // F219: both transports recv the large value straight into a PooledBuf,
-    // skipping the FrameDecoder accumulation copy. UCX recvs into a *registered*
-    // buffer (RDMA, no off-wire copy); TCP recvs via a compio owned read (only
-    // the unavoidable kernel→userspace copy remains — no app-level copy).
     loop {
-        let Some((req_id, msg_type, flags, payload_len)) = decoder.peek_header() else {
+        let Some((req_id, msg_type, _flags, _payload_len)) = decoder.peek_header() else {
             return Ok(());
         };
         if msg_type != MSG_PUT_ZC || req_id == 0 {
             return Ok(()); // not a ZC write at the front → normal path
         }
-        let has_crc = flags & autumn_rpc::frame::FLAG_CRC != 0;
-        let inner_len = if has_crc {
-            (payload_len as usize).saturating_sub(4)
-        } else {
-            payload_len as usize
+        // Wait for the full prologue ([header][ctrl_len][meta+key][crc]) and
+        // VERIFY the ctrl crc before committing to the recv. Malformed/corrupt
+        // prologue → tear the connection down (stream position unrecoverable).
+        let prologue = match decoder.peek_zc_prologue() {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(()), // need more bytes (prologue is tiny)
+            Err(e) => return Err(anyhow!("MSG_PUT_ZC prologue: {e}")),
         };
-        if inner_len < AUTUMN_PS_ZC_RECV_MIN_BYTES {
-            return Ok(()); // small write → cheaper via FrameDecoder
-        }
-        // Need the fixed meta prefix buffered to read part_id + key_len.
-        let Some(meta_prefix) = decoder.peek_payload(PUT_ZC_HEADER_LEN) else {
-            return Ok(()); // not enough buffered yet → next read accumulates it
-        };
-        let part_id = u64::from_le_bytes(meta_prefix[0..8].try_into().unwrap());
-        let key_len = u32::from_le_bytes(meta_prefix[24..28].try_into().unwrap()) as usize;
-        if part_id != owner_part {
-            return Ok(()); // mis-routed → normal path synths the NotFound
-        }
-        let Some(value_offset) = PUT_ZC_HEADER_LEN.checked_add(key_len) else {
-            return Ok(());
-        };
-        if value_offset > inner_len {
-            return Ok(()); // malformed → let normal decode reject it
-        }
-        let value_len = inner_len - value_offset;
+        let ctrl_len = prologue.ctrl_len;
+        let value_len = prologue.value_len;
         if value_len < AUTUMN_PS_ZC_RECV_MIN_BYTES
             || value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
         {
@@ -4560,11 +4541,31 @@ async fn drain_zc_writes(
             // the latter) — let the normal path handle it.
             return Ok(());
         }
-        // Need the full [meta][key] buffered to locate the value boundary.
-        let Some(meta_key_slice) = decoder.peek_payload(value_offset) else {
-            return Ok(()); // wait for more (meta+key is tiny; ~always next read)
+        if ctrl_len < PUT_ZC_HEADER_LEN {
+            return Ok(()); // malformed meta → let normal decode reject it
+        }
+        let (part_id, key_len) = {
+            let ctrl = decoder
+                .peek_ctrl(ctrl_len)
+                .expect("prologue verified => ctrl buffered");
+            (
+                u64::from_le_bytes(ctrl[0..8].try_into().unwrap()),
+                u32::from_le_bytes(ctrl[24..28].try_into().unwrap()) as usize,
+            )
         };
-        let meta_key = Bytes::copy_from_slice(meta_key_slice); // small copy
+        if part_id != owner_part {
+            return Ok(()); // mis-routed → normal path synths the NotFound
+        }
+        // v28: ctrl must be exactly [meta][key] — a declared key_len that
+        // disagrees with ctrl_len is malformed; the normal path rejects it.
+        if PUT_ZC_HEADER_LEN.checked_add(key_len) != Some(ctrl_len) {
+            return Ok(());
+        }
+        let meta_key = Bytes::copy_from_slice(
+            decoder
+                .peek_ctrl(ctrl_len)
+                .expect("prologue verified => ctrl buffered"),
+        ); // small copy
 
         // Back-pressure before adding another in-flight reply.
         while inflight.len() >= cap {
@@ -4575,8 +4576,9 @@ async fn drain_zc_writes(
             }
         }
 
-        // Commit: drop header + meta + key, recv the value into a pooled buf.
-        decoder.consume(autumn_rpc::HEADER_LEN + value_offset);
+        // Commit: drop header + ctrl_len + ctrl + crc; recv the value into a
+        // pooled buf. The value ends the frame — no trailer after it (v28).
+        decoder.consume_zc_prologue(ctrl_len);
         let mut pb = autumn_transport::regpool_acquire(value_len);
         // Drain any buffered value prefix into the pool buffer (no socket).
         let filled = {
@@ -4605,36 +4607,6 @@ async fn drain_zc_writes(
                 .map_err(|e| anyhow!("eof/io mid MSG_PUT_ZC value (tcp zc-recv): {e}"))?;
         }
         let value = Bytes::from_owner(pb);
-        // F219: the ZC value crc on the hot path is removed. The MSG_PUT_ZC frame
-        // still carries the frame CRC, so the 4-byte trailer is on the wire — we
-        // CONSUME it to keep the byte stream aligned for the next frame, but no
-        // longer compute/compare it on the PS (value integrity is the
-        // transport's job: UCX NIC ICRC / TCP kernel segment checksum).
-        if has_crc {
-            let mut trailer = [0u8; 4];
-            let got = decoder.drain_into(&mut trailer);
-            if got < 4 {
-                if reader.is_ucx() {
-                    let mut g = got;
-                    while g < 4 {
-                        let n = reader.recv_into(&mut trailer[g..], None).await?;
-                        if n == 0 {
-                            return Err(anyhow!("eof mid MSG_PUT_ZC crc trailer"));
-                        }
-                        g += n;
-                    }
-                } else {
-                    // TCP: the trailer follows the value on the socket (the value
-                    // recv read exactly value_len bytes).
-                    use compio::io::AsyncReadExt;
-                    let tail = vec![0u8; 4 - got];
-                    let compio::BufResult(r, tail) = reader.read_exact(tail).await;
-                    r.map_err(|e| anyhow!("eof mid MSG_PUT_ZC crc trailer (tcp): {e}"))?;
-                    let _ = tail; // discarded — PS no longer validates the crc
-                }
-            }
-            let _ = &trailer; // discarded — PS no longer validates the crc
-        }
 
         // Observability: count + log-once that the ZC write-recv path is live.
         if PS_ZC_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -4990,6 +4962,10 @@ fn push_one_frame_to_inflight(
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let mut payload = frame.payload;
+    // v28: a value-separable request (MSG_PUT_ZC) arrives with its raw value
+    // split off by the decoder; thread it into the delegate as zc_value so
+    // enqueue_put_zc uses it directly (payload = [meta][key] only).
+    let frame_value = frame.value;
     // F-AUTHZ-1: AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
@@ -5040,10 +5016,11 @@ fn push_one_frame_to_inflight(
     }
 
     let tx = req_tx.clone();
+    let zc_value = (!frame_value.is_empty()).then_some(frame_value);
     inflight.push(
         async move {
             (
-                delegate_round_trip(tx, req_id, msg_type, payload, None).await,
+                delegate_round_trip(tx, req_id, msg_type, payload, zc_value).await,
                 None,
             )
         }
@@ -5130,6 +5107,9 @@ async fn d1_fast_path_round_trip(
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let mut payload = frame.payload;
+    // v28: raw value tail of a value-separable request (see
+    // push_one_frame_to_inflight).
+    let frame_value = frame.value;
     // F-AUTHZ-1: AUTH_HELLO bind / per-request gate (synchronous, before the
     // first await). A handled frame returns its reply directly.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
@@ -5160,8 +5140,9 @@ async fn d1_fast_path_round_trip(
     }
 
     let tx = req_tx.clone();
+    let zc_value = (!frame_value.is_empty()).then_some(frame_value);
     (
-        delegate_round_trip(tx, req_id, msg_type, payload, None).await,
+        delegate_round_trip(tx, req_id, msg_type, payload, zc_value).await,
         None,
     )
 }

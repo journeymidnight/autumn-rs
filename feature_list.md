@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-29
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,34 @@
 ---
 
 ## Active
+
+### F-WIRE-CRC-UNIFY — 统一帧结构：header+ctrl 必有 CRC、bulk value 交给传输层、FLAG_CRC 位退役
+- **Trigger** (2026-07-29, 用户审阅 CRC 全景表后拍板「CRC 在 wire 上就很乱，改为 header+meta 必有 CRC、大 value 交给传输层」+「不需要 FLAG_CRC 了，默认都有 meta crc」): 现状三档不一致
+  —— 普通帧 CRC 只盖 payload 不盖 header（req_id 翻转 = 响应静默投递给错误 caller 且 CRC 仍通过；FLAG_CRC 位被翻掉 = 验证被静默关闭）；ZC value 响应完全无保护；`MSG_PUT_ZC` 发送侧仍全量扫 value 算 CRC（F219 残留）而 PS 快路径只消费不验证。且 ZC meta codec (`encode_zc_meta`) 住在 `rpc/src/client.rs`，不在 WIRE 指纹内 —— 改布局不会触发版本决策。
+- **Scope（设计已钉死）**: 唯一一种帧形状，无标志位区分：
+  `[req_id:4][msg_type:1][flags:1][payload_len:4] [ctrl_len:4][ctrl…][crc32c:4][value…]`
+  crc32c 覆盖 header ++ ctrl_len ++ ctrl；value 裸（传输层完整性）；value_len = payload_len−4−ctrl_len−4；flags 只剩 RESPONSE/ERROR/STREAM_END（FLAG_CRC 位退役保留）。per-msg_type 的 ctrl/value 切分：
+  * 普通 rkyv 帧 / 错误帧: ctrl = 整个 body，value 空（每帧 wire +4B）。
+  * `MSG_GET_ZC` / `MSG_READ_BYTES_ZC` 响应: ctrl = `[code:1][message…]`（旧 9B zc_meta 死亡；ZC 错误终于有 message），value = 裸值。
+  * `MSG_PUT_ZC` 请求: ctrl = `[44B put_meta][key]`，value = 裸值 —— **发送侧全量 value CRC pass 消灭**；PS `drain_zc_writes` 改为验 ctrl-crc（廉价）+ 无 trailer 消费。
+  * **`MSG_APPEND` 是唯一例外（用户拍板 payload 需保护）**: ctrl = `[29B meta][payload]`，value 空 —— 零新 msg_type，F165 的 control 字段保护 + payload 在途完整性全保留。不做 EN 收侧 recv-into-pooled（批处理架构 + 4KiB 主导负载 + 保 CRC 后反正要全量扫；未来 profiling 说话再议）。
+  * codec 迁入 `frame.rs`（纳入 WIRE 指纹）；`encode_no_crc`/`ps_zc_head`/`zc_read_head` 手搓头统一为 frame.rs helper；`call_into_pooled` 返回类型携带 message。
+  * WIRE 27→28（MIN=MAX），指纹重 pin。混部失败模式变化要写文档：帧层变更使 GetClusterId 协商通道对旧 binary 也解不开 —— 混部第一帧 CRC mismatch 响亮断连（劣于优雅拒绝、优于 rkyv 静默乱码；same-commit 部署策略下无实际影响）。
+- **Acceptance**: 单测 —— header 任一字节翻转 → CrcMismatch（普通帧 + ZC 帧都验）；ZC 错误响应 message 端到端可读；put_zc 大/小 value 双路径字节精确；`registry_pins_current_schema_to_max_version` 过（v28 pin）。集成 —— rpc/client/PS --lib/stream 全绿 + manager f235（--ignored 真集群）绿 + e2e put/get/append 冒烟。性能 —— put_zc 8MiB 发送侧少一趟全量 crc（perf-check 或微基准佐证方向即可）。
+- **Status**: `passes: false` (2026-07-29, **实现完成、验收基本达成，仅欠 coco 评审**——Trae
+  token 过期待用户重登)。已落地: frame.rs 全重写（统一帧 + peek_zc_prologue/
+  consume_zc_prologue + encode_zc_response_head/encode_vectored_head/compute_ctrl_crc +
+  Malformed 错误变体）；rpc client（call_vectored_zc 新增、call_into_pooled 返回
+  ZcResp{buf,code,message}、read_loop 快路径先验 crc 再 recv）；PS（ps_zc_head 瘦包装、
+  drain_zc_writes 验 ctrl-crc + 无 trailer、frame.value 经 zc_value 线到 enqueue_put_zc、
+  authz 零改动——parse_put_zc_meta 在 ctrl 上原样工作）；EN（zc_read_head 瘦包装 + 全部
+  错误点带 message）；SDK（put_zc→call_vectored_zc、get_range_into 消费 message）。
+  验收: header/ctrl 任意字节翻转→CrcMismatch（新单测）、ZC error message 端到端（新单测
+  ×2 + rpc 54 全绿）、put_zc 大/小值 + get_zc 混合大小真集群 e2e（system_putstream 7/7
+  绿）、v28 pin `db105c702b8ff770` 过、transport 9 / client --lib 40 / PS --lib 204 /
+  stream 114 全绿；layer_a 与 system_chaos 的 2 处失败经 stash 对照确认为预存在（admin
+  token 环境 + 缺 force 字段），与本 feature 无关。ops.md 已加 v28 混部失败模式说明。
+  put_zc 发送侧 crc pass 消灭为结构性保证（value 不再进 compute_ctrl_crc）。
 
 ### BUG-KVC-LOAD-ATOMIC — external KV load 是 fail-open：部分 layer 加载失败仍继续推理
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:773`；**已复核代码为真**): scheduler 见 `__present__` marker 后就告诉 vLLM 这些 token 不用再 prefill。worker 侧 `start_load_kv()` 拿 `oks = load_layers(...)` 后是**边检查边注入**：`if not ok: log.warning(); continue`。于是任一 layer 缺失时，前面的 layer 已写进 paged cache、失败的 layer 保持**未初始化**内容，请求进入"部分新 KV + 部分旧/未初始化 KV"的混合态且无法回滚，继续推理 → 静默错误输出。**这不是假想**：BUG-KVC-TENANT 那次线上事故的表现就正是 `external KV load miss after positive presence`（layer 0..3）+ garbage output。

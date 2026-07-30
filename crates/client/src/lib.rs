@@ -2245,9 +2245,13 @@ impl ClusterClient {
             );
             match self.get_ps_client(&ps_addr).await {
                 Ok(client) => {
-                    // [meta, value] — value is a zero-copy iovec; no copy here.
+                    // v28 value-separable send: [meta][key] is the CRC'd ctrl,
+                    // the value rides after the crc as its own iovec and is
+                    // NEVER crc-scanned by the sender (F-WIRE-CRC-UNIFY — the
+                    // old call_vectored path paid a full crc32c pass over the
+                    // value).
                     match client
-                        .call_vectored(partition_rpc::MSG_PUT_ZC, vec![meta, value.clone()])
+                        .call_vectored_zc(partition_rpc::MSG_PUT_ZC, vec![meta], value.clone())
                         .await
                     {
                         Ok(resp_bytes) => {
@@ -2786,9 +2790,9 @@ impl ClusterClient {
                         },
                     };
                     match outcome {
-                        Ok((pb, code)) => match code {
+                        Ok(z) => match z.code {
                             partition_rpc::CODE_OK => {
-                                let value = pb.filled();
+                                let value = z.buf.filled();
                                 let n = value.len().min(dest.len());
                                 dest[..n].copy_from_slice(&value[..n]);
                                 return Ok(Some(value.len()));
@@ -2797,9 +2801,14 @@ impl ClusterClient {
                             // Epoch stale → fall through to refresh + retry.
                             partition_rpc::CODE_PRECONDITION
                             | partition_rpc::CODE_REGION_EPOCH_STALE => {
-                                last_err = Some("region epoch stale".to_string());
+                                last_err = Some(if z.message.is_empty() {
+                                    "region epoch stale".to_string()
+                                } else {
+                                    z.message
+                                });
                             }
-                            other => return Err(code_to_error(other, String::new())),
+                            // v28: the ZC ctrl carries a human-readable message.
+                            other => return Err(code_to_error(other, z.message)),
                         },
                         Err(e) => {
                             // Frame-level error or transport failure. (An authz

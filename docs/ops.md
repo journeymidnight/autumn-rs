@@ -1550,6 +1550,14 @@ autumn-op cluster-version            # expect: still 1 (etcd replay)
 # startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
 ```
 
+v28 (F-WIRE-CRC-UNIFY) changed the FRAME layer itself (one uniform shape:
+`[header][ctrl_len][ctrl][crc][value]`, crc over header+ctrl, raw value tails
+uncrc'd). Deploy note: a pre-v28 binary against a v28 peer fails at the FIRST
+frame with a loud `frame CRC mismatch` connection error — it never reaches the
+GetClusterId version handshake, so expect transport-level errors (not the
+"wire-schema mismatch" message) in a mixed deploy. Same-commit deploys are
+unaffected.
+
 Bump discipline lives in `crates/rpc/src/lib.rs` (`WIRE_VERSION_FINGERPRINTS`
 registry): any wire-schema edit fails `cargo test -p autumn-rpc` until you
 record the new fingerprint and consciously decide MIN/MAX. Rolling back a

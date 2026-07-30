@@ -1,5 +1,22 @@
 Date: 2026-07-29
 TaskStatus: not_completed
+Task scope: F-WIRE-CRC-UNIFY（用户拍板「CRC 在 wire 上很乱，改为 header+meta 必有
+  CRC、大 value 交给传输层」+「不需要 FLAG_CRC，默认都有 meta crc」+「MSG_APPEND 的
+  payload 需要保护（唯一例外）」）。WIRE v27→v28 全帧层重构，实现+测试+文档完成；
+  唯一缺口 = coco 评审（Trae token 过期）→ 规则 5 记 not_completed。设计/实现/验收
+  细节全在 feature_list.md F-WIRE-CRC-UNIFY 条目（含预存在失败的 stash 对照结论）。
+
+── 本条目关键提醒 ──
+* 新帧: [header][ctrl_len:4][ctrl][crc32c:4][value]，crc 盖 header+ctrl，value 裸。
+  FLAG_CRC 位退役（bit3 保留）；encode_no_crc/9B zc_meta/DestMeta 全删。
+* MSG_APPEND payload 在 ctrl 内（用户钦定例外，WAL/SST 字节保留在途 CRC）。
+* put_zc 发送侧不再全量扫 value 算 crc（call_vectored_zc）；ZC 错误带 message。
+* 部署: v28 与旧 binary 混部在第一帧 CrcMismatch 断连（响亮），same-commit 部署照旧；
+  ops.md cluster_version 节已加说明。指纹 pin db105c702b8ff770。
+
+============================ prior task history ============================
+Date: 2026-07-29
+TaskStatus: not_completed
 Task scope: 用户拍板「删掉 call_into_dest，大 value 读统一走 pooled」（源于本会话的
   F216 ZC 架构讨论）。代码 + 测试 + 文档全部完成；唯一缺口 = coco findbugs 没跑成
   （Trae token 过期，GPT-5.5/GLM-5.1 都失败，需要用户交互式重新登录后补跑）→ 按

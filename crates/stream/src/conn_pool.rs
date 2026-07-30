@@ -121,14 +121,14 @@ impl ConnPool {
     /// F216-E: send an RPC and recv the value response into a read_loop-owned
     /// `PooledBuf` (cancel-safe — see RpcClient::call_into_pooled). Wraps the
     /// timeout here; on expiry the inner future drops and the read_loop reclaims
-    /// the buffer (no leak). Returns `(filled PooledBuf, status code)`.
+    /// the buffer (no leak). Returns a `ZcResp` (buffer + code + message).
     pub async fn call_into_pooled(
         &self,
         addr: &str,
         msg_type: u8,
         payload: Bytes,
         timeout: Duration,
-    ) -> Result<(autumn_rpc::PooledBuf, u8)> {
+    ) -> Result<autumn_rpc::client::ZcResp> {
         let sock = parse_addr(addr)?;
         let client = self.get_client(sock).await?;
         let fut = client.call_into_pooled(msg_type, payload);

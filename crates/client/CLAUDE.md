@@ -68,11 +68,12 @@ Semantics / invariants:
   `head`). Same routing + refresh + retry as `call_ps_for_key`; **honors `rpc_timeout`**
   (the pooled recv is cancel-safe; the recv-into-caller-dest primitive that forbade
   timeouts was removed — autumn-rpc CLAUDE "Why pooled-only").
-- `put_zc(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy via
-  `MSG_PUT_ZC` + `RpcClient::call_vectored` (value sent as its own iovec from `value`'s
-  backing memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered —
-  caller holds a `RegisteredMem` and passes a `Bytes` aliasing it). Same routing + refresh
-  + retry + inline-cap rules as `put`. The PS slices key+value zero-copy from the frame.
+- `put_zc(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy AND
+  no value crc scan via `MSG_PUT_ZC` + `RpcClient::call_vectored_zc` (v28: `[meta][key]`
+  is the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing
+  memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered). Same
+  routing + refresh + retry + inline-cap rules as `put`. The frame decoder hands the PS
+  ctrl and value pre-split (zero-copy).
 - `delete(key)` — delete a key.
 - `head(key) → KeyMeta` — metadata (`found`, `value_length`).
 - `range(prefix, start, limit) → RangeResult` — prefix scan (resume cursor below).

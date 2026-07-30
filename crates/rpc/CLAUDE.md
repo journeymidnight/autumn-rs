@@ -9,41 +9,54 @@ Replaces tonic/gRPC to drop HTTP/2 framing and protobuf overhead on the hot path
 `Frame`/`FrameDecoder`, `StatusCode`. Servers are hand-rolled per component on
 `autumn_transport::Conn` (EN, manager, PS), not in this crate.
 
-## Wire Format
+## Wire Format (v28 — F-WIRE-CRC-UNIFY)
 
-10-byte frame header + payload:
+ONE frame shape, no flag-dependent variants:
 
 ```
-[req_id: u32 LE][msg_type: u8][flags: u8][payload_len: u32 LE][payload bytes]
+[req_id: u32 LE][msg_type: u8][flags: u8][payload_len: u32 LE]      header, 10 B
+payload = [ctrl_len: u32 LE][ctrl …][crc32c: u32 LE][value …]
 ```
 
 | Field | Size | Description |
 |-------|------|-------------|
 | req_id | 4B | Multiplexing ID. Client picks, server echoes. 0 = fire-and-forget. |
 | msg_type | 1B | RPC method identifier (0-255 per service) |
-| flags | 1B | bit 0 `FLAG_RESPONSE`, bit 1 `FLAG_ERROR`, bit 2 `FLAG_STREAM_END`, bit 3 `FLAG_CRC` |
-| payload_len | 4B | Payload size (`HEADER_LEN=10`, `MAX_PAYLOAD_LEN=u32::MAX`); includes the 4-byte CRC trailer when `FLAG_CRC` is set |
+| flags | 1B | bit 0 `FLAG_RESPONSE`, bit 1 `FLAG_ERROR`, bit 2 `FLAG_STREAM_END`. Bit 3 reserved (was `FLAG_CRC` pre-v28 — protection is now structural, no bit to flip off) |
+| payload_len | 4B | Everything after the header (`HEADER_LEN=10`) |
+| ctrl_len | 4B | Length of the CRC-protected control bytes |
+| crc32c | 4B | Over `header ++ ctrl_len ++ ctrl` — NEVER over `value` |
 
-Error responses encode status as `[status_code: u8][message bytes]`.
+`value_len = payload_len − 4 − ctrl_len − 4`, may be 0. Error responses put
+`[status_code: u8][message]` in ctrl.
 
-### Per-frame CRC32C
+### CRC rule: header+ctrl always protected, bulk value never
 
-One frame protocol — no versions, no encoder toggle, no back-compat (the cluster
-restarts together). Every frame from `Frame::encode` carries a 4-byte CRC32C
-trailer over the payload: `FLAG_CRC` set, `payload_len` counts the trailer. The
-decoder verifies + strips it; a mismatch is `FrameError::CrcMismatch`. This
-guards a flipped `extent_id`/`eversion`/`revision`/`owner_epoch` over TCP — a
-silent wrong-extent write or fence bypass that TCP's 16-bit checksum + NIC
-offload bugs can let through and on-disk CRC cannot catch in transit. HW CRC32C
-(SSE4.2) is negligible on the small control frames it covers.
+The decoder verifies the crc BEFORE exposing anything; mismatch =
+`FrameError::CrcMismatch`, structural inconsistency = `FrameError::Malformed`.
+Header inclusion closes the pre-v28 holes: a flipped `req_id` delivering a
+valid-crc response to the WRONG caller, and a flipped `FLAG_CRC` bit silently
+disabling verification. The `value` tail is raw — its integrity is the
+transport's (UCX NIC ICRC / TCP kernel checksum) + the storage layer's (WAL
+record CRC, SST block CRC); F219 measured a per-value crc at ~20% of a core
+@ 8 MiB. Per-msg_type ctrl/value split:
 
-**The one CRC-less frame** is the zero-copy value response, built by
-`Frame::encode_no_crc` (hand-built in production as `partition-server::ps_zc_head`
-/ `stream::zc_read_head`): `call_into_pooled` recvs the value straight into a
-pool buffer and cannot strip a trailer, so it omits the CRC (`FLAG_CRC` unset)
-and relies on transport integrity (UCX NIC ICRC / TCP kernel checksum). The
-decoder's `FLAG_CRC` branch exists to handle this one shape — a ZC design
-constraint, not a legacy version.
+- normal rkyv/binary RPCs + error envelopes: ctrl = whole body, no value.
+- `MSG_GET_ZC` / `MSG_READ_BYTES_ZC` responses: ctrl = `[code:1][message…]`
+  (ZC errors carry a human-readable message), value = raw value.
+- `MSG_PUT_ZC` requests: ctrl = `[put_zc meta 44B][key]`, value = raw value —
+  the sender never crc-scans the value (`call_vectored_zc`).
+- **`MSG_APPEND` is the ONE deliberate exception** (durability path): its bulk
+  payload rides INSIDE ctrl, keeping in-transit CRC on WAL/SST bytes.
+
+Builders: `Frame::encode` / `encode_response_with` (ctrl-only, one buffer),
+`encode_vectored_head` + `compute_ctrl_crc` (vectored sends),
+`encode_zc_response_head` (ZC response head; `ps_zc_head` / `zc_read_head` are
+thin wrappers), `parse_zc_ctrl`. ZC fast paths use
+`FrameDecoder::peek_zc_prologue` (verify crc without consuming) +
+`consume_zc_prologue`. One protocol — no versions, no encoder toggle, no
+back-compat (the cluster restarts together; a pre-v28 peer fails LOUDLY at the
+first frame with CrcMismatch instead of reaching the version handshake).
 
 ## Modules
 
@@ -80,9 +93,11 @@ over one TCP connection:
 - **CQ**: the `read_loop` task owns `ReadHalf`, decodes frames, dispatches to the
   matching entry in `Rc<RefCell<HashMap<u32, Pending>>>`.
 
-Calls: `call`, `call_vectored` (vectored, zero-copy), `call_timeout` /
-`call_vectored_timeout`, `send_frame` / `send_vectored` (low-level, return
-`oneshot::Receiver<Frame>`), `send_oneshot` (fire-and-forget, req_id=0).
+Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
+`call_vectored_zc` (ctrl parts + raw value after the crc — `MSG_PUT_ZC`),
+`call_timeout` / `call_vectored_timeout`, `send_frame` / `send_vectored`
+(low-level, return `oneshot::Receiver<Frame>`), `send_oneshot`
+(fire-and-forget, req_id=0), `call_into_pooled` (ZC read, below).
 
 **Invariants (correctness rules):**
 
@@ -104,12 +119,12 @@ Calls: `call`, `call_vectored` (vectored, zero-copy), `call_timeout` /
 
 ### Zero-copy receive-into-pooled
 
-`call_into_pooled(msg_type, payload) -> (PooledBuf, code)` recvs the response
-value straight into a read_loop-owned RegPool `PooledBuf` (registered on UCX,
-plain recycled buffer on TCP), no intermediate Vec. Wire response = CRC-less
-frame with payload `[ZC meta][value]`, `encode_zc_meta(code, value) = [code:1]
-[value_len:4 LE][reserved:4 LE]` (`ZC_META_LEN = 9`; reserved carries no value
-CRC — integrity is the transport's). No value CRC is verified.
+`call_into_pooled(msg_type, payload) -> ZcResp{buf, code, message}` recvs the
+response's raw value tail straight into a read_loop-owned RegPool `PooledBuf`
+(registered on UCX, plain recycled buffer on TCP), no intermediate Vec. Wire
+response = the v28 value-separable frame: ctrl = `[code:1][message…]` (both
+CRC-protected together with the header; ZC errors carry a readable message),
+value = raw tail (`value_len` derived from `payload_len`).
 `RegisteredMem`/`PooledBuf` re-export from autumn-transport (uninhabited/plain
 stubs on non-ucx). A recv-into-CALLER-dest sibling (`call_into_dest`) no longer
 exists — see "Why pooled-only" below.
@@ -120,27 +135,27 @@ msg_type↔API pairing is the caller's contract, enforced nowhere):
 
 ```
 Pending::Frame (non-ZC call)
-  → try_decode whole frame (verify+strip frame CRC) → oneshot the Frame
+  → try_decode whole frame (verify header+ctrl crc) → oneshot the Frame
 Pending::IntoPooled (ZC call), response frame NOT FLAG_ERROR
-  ├─ UCX                → fast path: consume header+meta, drain buffered value
-  │                       prefix, regpool_acquire + recv_into(dest, reg) — memh
-  │                       RDMA when the slab is registered (0 copies).
-  │                       Unconditional: recv-into is never worse than decode
-  │                       on UCX, any size.
+  ├─ UCX                → fast path: peek_zc_prologue (verify crc, parse
+  │                       code+message), consume prologue, regpool_acquire +
+  │                       recv_into(dest, reg) — memh RDMA when the slab is
+  │                       registered (0 copies). Unconditional: recv-into is
+  │                       never worse than decode on UCX, any size.
   └─ TCP
-     ├─ value ≥ 64 KiB  → fast path: drain buffered prefix into the PooledBuf,
-     │  (TCP_RECV_INTO_   then one owned read (read_exact_into_pooled). Only
-     │   POOLED_MIN_      the unavoidable kernel copy; no FrameDecoder
-     │   BYTES)           accumulation.
-     └─ value < 64 KiB  → try_decode + finish_into_pooled_from_frame
-                          (decode + one memcpy — a small value's whole frame is
-                          usually already buffered, so recv-into would only add
-                          a pool acquire + an extra syscall).
+     ├─ payload ≥ 64 KiB → fast path: verify prologue, drain buffered value
+     │  (TCP_RECV_INTO_    prefix into the PooledBuf, then one owned read
+     │   POOLED_MIN_       (read_exact_into_pooled). Only the unavoidable
+     │   BYTES)            kernel copy; no FrameDecoder accumulation.
+     └─ payload < 64 KiB → try_decode (splits ctrl/value, verifies crc) +
+                          finish_into_pooled_from_frame (one memcpy — a small
+                          value's whole frame is usually already buffered, so
+                          recv-into would only add a pool acquire + a syscall).
 Pending::IntoPooled, response frame IS FLAG_ERROR
   → excluded from the fast path by the peeked flags → try_decode → the
     IntoPooled arm decodes the `[status_code][message]` envelope into
     `RpcError::Status` (an authz PermissionDenied / mis-route NotFound reaches
-    the ZC caller typed, never misparsed as a ZC meta).
+    the ZC caller typed, never parsed as a ZC ctrl).
 ```
 
 The TCP size gate lives at the RECEIVER, not the caller, because its input — the
@@ -171,15 +186,16 @@ at a specific address copy out of the returned `PooledBuf`
 (`ClusterClient::get_range_into` does exactly this, and now honors
 `rpc_timeout`).
 
-**Write counterpart (`MSG_PUT_ZC = 0x51`)** needs no new primitive: the client
-sends `[meta][value]` via `call_vectored` (value as its own iovec, zero-copy via
-rcache when registered; the frame CRC covers `[meta||value]`). Framing lives in
-`partition_rpc`: `encode_put_zc_meta` / `parse_put_zc_meta`, fixed prefix
-`PUT_ZC_HEADER_LEN = 44` (part_id + region_epoch + expires_at + value_len +
-key_len) then the key; the PS slices the value zero-copy from the reassembled
-frame. Write ZC is send-side framing only; read ZC needs the `call_into_pooled`
-recv primitive because the response value must land outside the FrameDecoder.
-Write-side selection is purely
+**Write counterpart (`MSG_PUT_ZC = 0x51`)** uses `call_vectored_zc`: ctrl =
+`[meta][key]` (CRC'd with the header), the value rides after the crc as its own
+iovec — zero-copy via rcache when registered, and NEVER crc-scanned by the
+sender (v28 completed F219: pre-v28 `call_vectored` paid a full crc32c pass
+over the value). Meta codec lives in `partition_rpc`: `encode_put_zc_meta` /
+`parse_put_zc_meta`, fixed prefix `PUT_ZC_HEADER_LEN = 44` then the key; the
+decoder hands the PS `frame.payload = [meta][key]` + `frame.value` (zero-copy
+split). Write ZC is send-side framing only; read ZC needs the
+`call_into_pooled` recv primitive because the response value must land outside
+the FrameDecoder. Write-side selection is purely
 size-based and client-side (the sender KNOWS the exact value size): `put_many`
 routes items ≥ 64 KiB to per-op `MSG_PUT_ZC` and smaller ones into
 `MSG_BATCH_PUT` via `zc_worthwhile`; the bare `put_zc` API does not gate, so the

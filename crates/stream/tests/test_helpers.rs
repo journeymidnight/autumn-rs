@@ -154,7 +154,7 @@ impl TestConn {
             offset,
             length,
         };
-        let (pb, code) = self
+        let z = self
             .pool
             .call_into_pooled(
                 &self.addr,
@@ -164,7 +164,7 @@ impl TestConn {
             )
             .await
             .expect("read_bytes_zc RPC");
-        (code, pb.as_ref().to_vec())
+        (z.code, z.buf.as_ref().to_vec())
     }
 
     pub async fn df(&self, tasks: Vec<RecoveryTask>, disk_ids: Vec<u64>) -> DfResp {

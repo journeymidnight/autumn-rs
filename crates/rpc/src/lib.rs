@@ -87,8 +87,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 27;
-pub const WIRE_VERSION_MAX: u32 = 27;
+pub const WIRE_VERSION_MIN: u32 = 28;
+pub const WIRE_VERSION_MAX: u32 = 28;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -311,6 +311,22 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // refreshes in place. Pre-R3 rkyv has no cross-version decode, so MIN=MAX=27
     // and the deploy stays same-commit.
     (27, "706da8704a419602"),
+    // v28: F-WIRE-CRC-UNIFY — ONE frame shape, CRC structural (frame.rs):
+    //   [header][ctrl_len:4][ctrl…][crc32c:4][value…], crc over header+ctrl,
+    //   value raw (transport + storage integrity). FLAG_CRC bit retired
+    //   (protection is no longer optional → no flag to flip off); the 9-byte
+    //   zc_meta + encode_no_crc CRC-less shape deleted; ZC read responses
+    //   carry `[code][message]` in the CRC'd ctrl (errors finally have a
+    //   human-readable message); MSG_PUT_ZC's value is excluded from the crc
+    //   (the sender no longer crc-scans the value — F219 completed).
+    //   MSG_APPEND is the ONE deliberate exception: its bulk payload stays
+    //   inside ctrl (durability path keeps in-transit CRC).
+    //   NOTE mixed-deploy failure mode: the FRAME layer changed, so an
+    //   old-binary peer fails at the first frame with CrcMismatch/Malformed
+    //   (loud connection error) instead of reaching the GetClusterId version
+    //   handshake — acceptable under same-commit deploys, better than silent
+    //   garbage. Pre-R3: MIN=MAX=28.
+    (28, "db105c702b8ff770"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

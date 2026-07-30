@@ -476,7 +476,7 @@ registered pool buffer, then one memcpy into the caller's dest). The seam is
 `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
-  `RegPool` `PooledBuf` (EN emits `[zc_meta][value]` as 2 `Bytes`, value aliases
+  `RegPool` `PooledBuf` (EN emits `[zc head][value]` as 2 `Bytes`, value aliases
   the EN pread buffer — no encode copy). UCX recvs into a *registered* buffer
   (RDMA); TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
@@ -486,8 +486,9 @@ registered pool buffer, then one memcpy into the caller's dest). The seam is
   No value crc is verified (integrity is the transport's job).
 - **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`.
 - **`handle_get_zc`** returns the response as TWO segments `(head, value)`:
-  `head = [V0 frame header][zc_meta: code+value_len+crc32c]` (built by
-  `ps_zc_head`), `value` is the aliasing `Bytes`. The ps-conn inflight FU output
+  `head = [header][ctrl_len][code+message][crc]` (v28, built by `ps_zc_head` →
+  `frame::encode_zc_response_head`; the crc covers header+ctrl, the value is a
+  raw tail), `value` is the aliasing `Bytes`. The ps-conn inflight FU output
   type is `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
   `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with no
   concat copy. On-the-wire bytes are identical to the concatenated form, so the

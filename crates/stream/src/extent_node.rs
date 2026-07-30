@@ -2220,7 +2220,7 @@ async fn process_frames_backpressured(
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
                 Ok(r) => r,
                 Err(_) => {
-                    let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, &[]);
+                    let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -2244,7 +2244,7 @@ async fn process_frames_backpressured(
                     }
                     Ok(_) => break,
                     Err(_) => {
-                        let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, &[]);
+                        let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -2255,7 +2255,7 @@ async fn process_frames_backpressured(
                 Err((_code, _msg)) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, &[]))
+                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -2267,7 +2267,7 @@ async fn process_frames_backpressured(
                 Err(_msg) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, &[]))
+                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -2325,7 +2325,7 @@ fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
 /// instead of seeing a generic transport error.
 fn eversion_mismatch_read_resp(req_id: u32, zc: bool) -> Bytes {
     if zc {
-        zc_read_head(req_id, CODE_EVERSION_MISMATCH, &[])
+        zc_read_head(req_id, CODE_EVERSION_MISMATCH, "eversion mismatch", 0)
     } else {
         Frame::response(
             req_id,
@@ -2772,24 +2772,13 @@ async fn build_append_future(
 /// Build the async future that services a same-extent READ batch. Reads
 /// are processed sequentially inside ONE future — each pread is ~1µs and
 /// the responses are written back together.
-/// F216-E: build a MSG_READ_BYTES_ZC response head = `[CRC-less frame header]
-/// [zc_meta: code(1)+value_len(4)+reserved(4)]`. The value (if any) is
-/// pushed as a SEPARATE `Bytes` right after, so it aliases the pread buffer —
-/// no copy. `value` is borrowed only to compute the meta len (the reserved
-/// field held a value crc before F219 removed it).
-fn zc_read_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
-    use bytes::BufMut;
-    let meta = autumn_rpc::client::encode_zc_meta(code, value);
-    let payload_len = meta.len() + value.len();
-    let mut head = bytes::BytesMut::with_capacity(autumn_rpc::HEADER_LEN + meta.len());
-    head.put_u32_le(req_id);
-    head.put_u8(MSG_READ_BYTES_ZC);
-    // CRC-less frame (FLAG_CRC unset): recv-into-dest can't strip a trailer;
-    // value integrity is the transport's (F219).
-    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE);
-    head.put_u32_le(payload_len as u32);
-    head.put_slice(&meta);
-    head.freeze()
+/// F216-E: build a MSG_READ_BYTES_ZC response head — v28 value-separable
+/// frame head `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl;
+/// see autumn-rpc frame.rs). The value (if any) is pushed as a SEPARATE
+/// `Bytes` right after, so it aliases the pread buffer — no copy, and the raw
+/// value is never crc-scanned (transport + storage integrity).
+fn zc_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
+    autumn_rpc::frame::encode_zc_response_head(req_id, MSG_READ_BYTES_ZC, code, msg, value_len)
 }
 
 fn build_read_future(
@@ -2857,7 +2846,12 @@ fn build_read_future(
                         local_len = end,
                         "ZC read cannot serve full range; rejecting (no short CODE_OK)"
                     );
-                    out.push(zc_read_head(slot.req_id, CODE_PRECONDITION, &[]));
+                    out.push(zc_read_head(
+                        slot.req_id,
+                        CODE_PRECONDITION,
+                        "zc read cannot serve full range",
+                        0,
+                    ));
                     continue;
                 }
                 // F216-E: pread straight into a registered, pooled, zeroed-once
@@ -2873,11 +2867,11 @@ fn build_read_future(
                 match result {
                     Ok(_) => {
                         let value = Bytes::from_owner(pb);
-                        out.push(zc_read_head(slot.req_id, CODE_OK, &value));
+                        out.push(zc_read_head(slot.req_id, CODE_OK, "", value.len()));
                         out.push(value);
                     }
                     Err(_e) => {
-                        out.push(zc_read_head(slot.req_id, CODE_ERROR, &[]));
+                        out.push(zc_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
                     }
                 }
             } else {

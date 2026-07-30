@@ -251,7 +251,7 @@ pub async fn read_extent_value_direct(
         offset,
         length,
     };
-    let (pb, code) = pool
+    let z = pool
         // BUG-READ-TIMEOUT-STORM: size-scale the deadline (was a fixed 3 s that
         // stormed on 8 MiB reads). This free fn holds no StreamClientConfig (the
         // client-SDK EN-direct path), so it uses the shared `DEFAULT_READ_*`
@@ -267,13 +267,14 @@ pub async fn read_extent_value_direct(
             .for_len(length),
         )
         .await?;
-    if code != CODE_OK {
+    if z.code != CODE_OK {
         return Err(anyhow!(
-            "direct read from {addr} extent={extent_id}: code={}",
-            crate::extent_rpc::code_description(code)
+            "direct read from {addr} extent={extent_id}: code={} ({})",
+            crate::extent_rpc::code_description(z.code),
+            z.message
         ));
     }
-    let mut value = bytes::Bytes::from_owner(pb);
+    let mut value = bytes::Bytes::from_owner(z.buf);
     if value.len() > length as usize {
         value.truncate(length as usize);
     }
@@ -3926,11 +3927,17 @@ impl StreamClient {
                 // EN-side guarantee (ZC-EXACT, extent_node `build_read_future`):
                 // a ZC read that cannot serve the FULL requested range returns a
                 // non-OK code, never CODE_OK + a short payload — so CODE_OK here
-                // implies pb holds exactly `length` bytes.
-                Ok((pb, code)) if code == CODE_OK => return Ok(Some((pb, length as usize))),
-                Ok((_pb, _code)) => {
+                // implies the buffer holds exactly `length` bytes.
+                Ok(z) if z.code == CODE_OK => return Ok(Some((z.buf, length as usize))),
+                Ok(z) => {
                     // eversion mismatch / EN-side error → bail to the copy path
-                    // (it refetches ExtentInfo + re-routes EC). pb drops → pool.
+                    // (it refetches ExtentInfo + re-routes EC). buf drops → pool.
+                    tracing::debug!(
+                        extent_id,
+                        code = z.code,
+                        message = %z.message,
+                        "ZC proxy read non-OK; falling back to copy path"
+                    );
                     self.extent_info_cache.remove(&extent_id);
                     return Ok(None);
                 }
