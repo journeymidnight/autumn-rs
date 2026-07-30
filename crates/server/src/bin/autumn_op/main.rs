@@ -359,6 +359,16 @@ async fn run(args: Args) -> Result<()> {
             // operator no longer has to pass the same secret twice. The
             // per-command spelling stays as an override.
             let record_token = admin_token.as_deref().or(args.admin_token.as_deref());
+            // The cuts inside cmd_presplit go out as `split_at` → MSG_MULTI_MODIFY_SPLIT,
+            // a PS admin op that authorizes via the client's global admin-token prefix.
+            // The connect-time `set_admin_token` above only fires for the GLOBAL flag
+            // position; when the token is given as the per-command `--admin-token` (the
+            // position `usage()` documents), install it here too — otherwise every cut is
+            // rejected "missing prefix" and presplit silently no-ops to one partition on
+            // any admin-token cluster.
+            if let Some(tok) = record_token {
+                client.set_admin_token(tok.as_bytes().to_vec());
+            }
             cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token, force).await?
         }
         Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id, force).await?,
