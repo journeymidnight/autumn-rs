@@ -1092,7 +1092,21 @@ async fn put_handler_inner(
         };
         let bytes = data.len() as u64;
         let t0 = Instant::now();
-        let put_res = client.put(file_key(&filename).as_bytes(), &data).await;
+        // F-VALUEBUF demo: large uploads are staged into a RegPool ValueBuf
+        // and written via put_zc — the pool's stable slab addresses mean a
+        // UCX runtime sends from ALREADY-registered memory every time
+        // (rcache hit) instead of re-registering each request's fresh
+        // HTTP-body allocation (~100µs × rails, wasted when the body frees);
+        // on TCP the pool is a plain recycler. The body already arrived in
+        // its own allocation, so the staging costs ONE memcpy — the price of
+        // a stable source address when you don't control the producer.
+        let put_res = if autumn_client::zc_worthwhile(data.len()) {
+            let mut vb = autumn_client::alloc_value_buf(data.len());
+            vb.as_mut_slice().copy_from_slice(&data);
+            client.put_zc(file_key(&filename).as_bytes(), vb.freeze()).await
+        } else {
+            client.put(file_key(&filename).as_bytes(), &data).await
+        };
         let dt = elapsed_ms(t0);
         if let Err(e) = put_res {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {e}"));
@@ -1513,15 +1527,19 @@ async fn thumb_handler_inner(
     // SVG: no point rasterizing — just serve the original bytes.
     if is_svg_ext(&ext) {
         let t0 = Instant::now();
-        let res = client.get(file_key(&name).as_bytes()).await;
+        // F-VALUEBUF demo: address-unconstrained read → get_pooled hands the
+        // recv'd pool buffer straight back (zero SDK-side copies); freeze()
+        // aliases it as the response body, and the slab returns to the pool
+        // when hyper finishes writing it.
+        let res = client.get_pooled(file_key(&name).as_bytes()).await;
         let dt = elapsed_ms(t0);
         return match res {
-            Ok(Some(v)) => {
-                metrics.borrow_mut().record_get(dt, v.len() as u64);
+            Ok(Some(vb)) => {
+                metrics.borrow_mut().record_get(dt, vb.len() as u64);
                 Response::builder()
                     .header("content-type", "image/svg+xml")
                     .header("cache-control", "no-cache")
-                    .body(Body::from(v))
+                    .body(Body::from(vb.freeze()))
                     .unwrap()
             }
             Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
@@ -1543,16 +1561,18 @@ async fn thumb_handler_inner(
     // by the transcode pipeline; this handler never invokes ffmpeg for
     // videos anymore).
     let t0 = Instant::now();
-    let cache_res = client.get(key.as_bytes()).await;
+    // F-VALUEBUF demo: pooled read + freeze — see the SVG branch above.
+    let cache_res = client.get_pooled(key.as_bytes()).await;
     let dt = elapsed_ms(t0);
     match cache_res {
-        Ok(Some(v)) => {
-            metrics.borrow_mut().record_get(dt, v.len() as u64);
+        Ok(Some(vb)) => {
+            metrics.borrow_mut().record_get(dt, vb.len() as u64);
+            let body = vb.freeze();
             return Response::builder()
                 .header("content-type", "image/jpeg")
                 .header("cache-control", "no-cache")
-                .header("content-length", v.len())
-                .body(Body::from(v))
+                .header("content-length", body.len())
+                .body(Body::from(body))
                 .unwrap();
         }
         Ok(None) => { /* fall through */ }

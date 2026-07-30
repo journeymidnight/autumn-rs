@@ -57,17 +57,35 @@ Semantics / invariants:
 
 ## Public API — data operations
 
+**`ValueBuf` (F-VALUEBUF) is the data-plane buffer currency**: a RegPool-backed slab
+with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation
+→ rcache/memh zero-copy; TCP runtime: plain recycler, no per-op alloc/zero). Write side:
+`alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `freeze() → Bytes` →
+`put_zc`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
+(zero SDK-side copies); read in place or `freeze()` for a framework sink. Dropping
+either returns the slab to the pool. Cross-thread drop of a frozen `Bytes` is legal but
+frees the slab instead of re-pooling (regpool home-thread guard — foreign-TLS re-pooling
+would corrupt per-thread pinning accounts). Fresh per-op allocations are the
+anti-pattern: on UCX every send from a fresh address re-registers (~100 µs × rails) and
+the rcache entry dies with the free — there is NO explicit registration anywhere;
+UCX zero-copy is decided by the value's memory provenance via the implicit rcache.
+
 - `put(key, value, must_sync)` — write a key-value pair.
 - `get(key) → Option<Vec<u8>>` — read, `None` if not found.
-- `get_into(key, dest: &mut [u8]) → Option<usize>` — **ZC read, one copy.** The value is
-  recv'd into a read_loop-owned RegPool buffer (`MSG_GET_ZC` +
-  `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool buffer; TCP ≥ 64 KiB
-  pays only the kernel copy) then copied ONCE into `dest`. Returns `Some(value_len)`
-  (`dest[..value_len.min(dest.len())]` filled; longer values TRUNCATED to fit — same
-  contract as `get_many_into`/`get_many_direct`) or `None`. Caller sizes `dest` (e.g. from
-  `head`). Same routing + refresh + retry as `call_ps_for_key`; **honors `rpc_timeout`**
-  (the pooled recv is cancel-safe; the recv-into-caller-dest primitive that forbade
-  timeouts was removed — autumn-rpc CLAUDE "Why pooled-only").
+- `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
+  **ZC read, ZERO SDK-side copies** — the CORE every ZC read routes through. The value
+  arrives in a read_loop-owned RegPool buffer (`MSG_GET_ZC` + `call_into_pooled`; UCX
+  RDMAs into the registered slab, TCP ≥ 64 KiB pays only the kernel copy) and is handed
+  straight back. The address-UNCONSTRAINED shape ("I just want the value"): autumnfs
+  cat/get, gallery serving, any consumer without a fixed destination. Any value size.
+  Honors `rpc_timeout` (pooled recv is cancel-safe).
+- `get_into(key, dest: &mut [u8]) → Option<usize>` — **ZC read, one copy**:
+  `get_range_pooled` + ONE memcpy into `dest`. For address-CONSTRAINED consumers only
+  (sglang pages / torch tensors / python buffers / fuse assembly) — the copy is inherent
+  there (bytes must land at THEIR address; recv-into-caller-memory was removed for
+  cancel-safety). Returns `Some(value_len)` (`dest[..value_len.min(dest.len())]` filled;
+  longer values TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`)
+  or `None`.
 - `put_zc(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy AND
   no value crc scan via `MSG_PUT_ZC` + `RpcClient::call_vectored_zc` (v28: `[meta][key]`
   is the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing

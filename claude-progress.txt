@@ -1,6 +1,57 @@
-Date: 2026-07-29
+Date: 2026-07-30
 TaskStatus: not_completed
-Task scope: F-WIRE-CRC-UNIFY（用户拍板「CRC 在 wire 上很乱，改为 header+meta 必有
+Task scope: 【实现完成，仅欠 coco】F-VALUEBUF —— ValueBuf/regpool 中心化的 SDK 数据面 API。
+  背景结论（本会话查实）: put_zc 的 value 全仓库无显式注册；kvcache 靠"惰性 rcache +
+  稳定 pinned 页"稳态成立（PyBuffer pin + Bytes::from_static alias，python/src/lib.rs:340-362）；
+  perf bench 已是模板 Bytes clone = 稳定地址，无需改；autumnfs 上传每 chunk 新分配 8MiB =
+  UCX 下每次重注册（~100µs×rail 数）+ TCP 下白付 alloc，是唯一真惯犯。
+  用户追加洞察: get_range_into 读进 regpool 后再拷到 dest 的那次 memcpy，对地址无约束的
+  调用方是纯浪费 —— "一系列 API 都有问题"。
+
+── 已定设计（用户认可方向，我修正了机制）──
+* 消灭读拷贝的形态 = "把 read_loop 收好的 pool buffer 交还调用方"（call_into_pooled 已
+  返回 ZcResp{buf}，SDK 的 memcpy 只是在伺候 &mut [u8] API 形状），NOT "recv 进调用方
+  预分配的 buf"（那要重造 call_into_dest 管线，且 pool slab 同池循环，预分配零收益，
+  交还还能按实际 value_len 自动选 size class）。
+* API 家族: ① 新 get_pooled/get_range_pooled → 返回 ValueBuf，0 拷贝，给地址无约束读
+  （autumnfs cat/get、gallery 出图）；v28 后 MSG_GET_ZC 错误带 message，可无脑全尺寸走 ZC。
+  ② get_into/get_many_into/get_many_direct 保留 —— 地址受约束（sglang page/torch/python
+  buffer/fuse 拼装）的那次 memcpy 是本质的，文档说清。get_range_into 内部改为
+  get_range_pooled + 一次 memcpy（一份核心两种皮）。
+  ③ 新 alloc_value_buf(len) -> ValueBuf（包 PooledBuf: DerefMut 写入/truncate(n)/
+  freeze()->Bytes(from_owner)），给可控写入方。
+* 落地清单: (1) client/src/lib.rs: ValueBuf + alloc_value_buf + get_range_pooled 核心 +
+  get_range_into 改皮 + put_zc 注释纠偏（惰性 rcache+稳定地址，删除不存在的 RegisteredMem
+  说法）；(2) autumnfs 上传: read_full_chunk(自 689 行, vec![0u8;cap] 每 chunk) 改读进
+  alloc_value_buf(MAX_EXTENT)+truncate+freeze（上传主循环在 ~780-812, pending.take() 预读
+  机制注意保持）；autumnfs 下载路径 363/391/490 的 get_many/get 小值、640 get_many_into
+  窗口拼装是地址受约束的 —— 只把单值无约束点换 get_pooled，不硬套；(3) gallery 示范
+  alloc_value_buf 写 + get_pooled 读（带诚实注释: HTTP body 本已是新分配，staging 多一次
+  memcpy 只在 UCX 划算）；(4) client CLAUDE.md 数据面 API 节同步 + progress + commit。
+* 验证: client --lib + manager system_putstream 7 个（--ignored, 真集群）+ f235 必跑。
+
+── 落地结果（2026-07-30，全部完成）──
+* client: ValueBuf(Deref/as_mut_slice/truncate/freeze) + alloc_value_buf +
+  get_pooled/get_range_pooled 核心 + get_range_into 改皮（pooled+1 memcpy）+ put_zc
+  文档纠偏（惰性 rcache + 内存出身决定 UCX ZC；显式注册不存在）。
+* regpool: PooledBuf 加 home ThreadId，**异线程 drop 不入池直接 free**（入外线程 TLS
+  池会腐蚀双方 per-thread 钉页记账；home 计数只向上漂=保守方向；TCP 运行时零漂移）。
+  全局 gauge 在该路径同步减账。新测试 foreign_thread_drop_frees_instead_of_pooling。
+* autumnfs 上传: read_full_chunk_into 新核心，chunk 直接读进 alloc_value_buf(MAX_EXTENT)
+  slab（UCX: depth 个 slab 循环首轮后 rcache 全命中；TCP: 免每 chunk 8MiB alloc）。
+  首 chunk（inline 判定需 Vec）staging 一次。
+* gallery 示范: 上传 zc_worthwhile 门 + ValueBuf staging + put_zc（注释讲清 HTTP body
+  已是新分配、staging 一次 memcpy 只在 UCX 划算）；SVG/缩略图出图 get_pooled + freeze
+  当响应体（gallery 单线程 compio，同线程 drop 回池完整生效）。
+* 用户问答记录: "get_range_pooled 始终不还 ValueBuf 怎么办" → 池是回收器非信号量，
+  acquire 永不阻塞；hoarding = 自己付内存账 + UCX 下吃 pre-flight cap 后静默降级未注册
+  （OVER_CAP_TOTAL 可观测），不伤他人、不死锁。跨线程 drop 即上文 guard。
+* 验证: workspace check 0 错; client --lib 41（新 ValueBuf 测试）; transport 10
+  （新 foreign-drop 测试）; manager system_putstream --ignored 7/7 真集群绿。
+* 待办: coco（token 过期）; perf bench 确认无需改（模板 Bytes clone 已稳定地址）。
+
+── 前一批（同日，已 commit+push: c566233/77a5665/c8fa70b）──
+F-WIRE-CRC-UNIFY（用户拍板「CRC 在 wire 上很乱，改为 header+meta 必有
   CRC、大 value 交给传输层」+「不需要 FLAG_CRC，默认都有 meta crc」+「MSG_APPEND 的
   payload 需要保护（唯一例外）」）。WIRE v27→v28 全帧层重构，实现+测试+文档完成；
   唯一缺口 = coco 评审（Trae token 过期）→ 规则 5 记 not_completed。设计/实现/验收

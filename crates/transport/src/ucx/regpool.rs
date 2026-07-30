@@ -239,9 +239,21 @@ fn size_class(need: usize) -> Option<usize> {
 /// A registered buffer borrowed from the thread-local pool. Returns to the
 /// free-list on drop (if under cap). Hold it for the entire duration of any
 /// in-flight recv that targets it (see module cancel-safety note).
+///
+/// A `PooledBuf` (or a `Bytes::from_owner` of one) MAY be dropped on a
+/// DIFFERENT thread than it was acquired on (e.g. a frozen value handed to
+/// another runtime as an HTTP body): that is safe, but the slab is then FREED
+/// instead of re-pooled — re-pooling into a foreign thread's TLS pool would
+/// corrupt both threads' per-thread pinning accounts. The home thread's
+/// `registered_bytes` then drifts UP only (it hits the unregistered-fallback
+/// cap earlier than strictly necessary — conservative, never over-pins); on a
+/// TCP runtime nothing was registered, so there is no drift at all.
 pub struct PooledBuf {
     /// `Option` so `Drop` can move the slab back into the pool.
     slab: Option<Slab>,
+    /// Thread that acquired this buffer — only its TLS pool may take the slab
+    /// back (see the cross-thread-drop note above).
+    home: std::thread::ThreadId,
     /// size class of the slab (its `buf.capacity()`).
     class: usize,
     /// logical length the caller asked for (`<= class`). This is the
@@ -394,6 +406,23 @@ impl Drop for PooledBuf {
         if class > MAX_CLASS {
             return;
         }
+        // Cross-thread drop (a frozen value handed to another runtime): FREE
+        // the slab instead of re-pooling — pushing it into the FOREIGN
+        // thread's TLS pool would corrupt both threads' per-thread pinning
+        // accounts (home stays elevated, foreign under-counts → could
+        // over-pin past its cap). Freeing here is safe: `ucp_mem_unmap` is
+        // process-context-global and the `Slab` field order unmaps before the
+        // buf frees. Keep the process-wide gauge truthful; the HOME thread's
+        // TLS `registered_bytes` is unreachable from here and drifts UP only
+        // (conservative — earlier unregistered-fallback, never over-pinning).
+        if std::thread::current().id() != self.home {
+            #[cfg(feature = "ucx")]
+            if slab.reg.is_some() {
+                REGISTERED_BYTES_GAUGE.fetch_sub(class as u64, Ordering::Relaxed);
+            }
+            drop(slab);
+            return;
+        }
         // `try_with`, not `with`: a `PooledBuf` that escaped into another TLS
         // or task-local can outlive the regpool's TLS destructor; `with` would
         // then panic, and a Drop panic during stack-unwind aborts the process.
@@ -459,6 +488,7 @@ pub fn acquire(need: usize) -> PooledBuf {
             class: need,
             used: need,
             filled_len: need,
+            home: std::thread::current().id(),
         };
     };
     let slab = POOL.with(|p| {
@@ -478,6 +508,7 @@ pub fn acquire(need: usize) -> PooledBuf {
             class,
             used: need,
             filled_len: need,
+            home: std::thread::current().id(),
         };
     }
 
@@ -554,6 +585,7 @@ pub fn acquire(need: usize) -> PooledBuf {
         class,
         used: need,
         filled_len: need,
+        home: std::thread::current().id(),
     }
 }
 
@@ -668,6 +700,22 @@ mod tests {
         // Defensive clamp: set_len(> used) is clamped, never out-of-bounds.
         unsafe { pb.set_len(usize::MAX) };
         assert_eq!(pb.len(), 8000, "set_len clamps to used");
+    }
+
+    /// Cross-thread drop (F-VALUEBUF): a `PooledBuf` dropped on a FOREIGN
+    /// thread is freed, never re-pooled into the foreign TLS pool (which
+    /// would corrupt both threads' per-thread pinning accounts). Smoke: the
+    /// foreign drop must not panic (TLS interplay) nor underflow the gauge;
+    /// the slab simply leaves circulation.
+    #[test]
+    fn foreign_thread_drop_frees_instead_of_pooling() {
+        let pb = acquire(2 * 1024 * 1024);
+        std::thread::spawn(move || drop(pb))
+            .join()
+            .expect("foreign drop must not panic");
+        // Home thread keeps working normally afterwards.
+        let pb2 = acquire(2 * 1024 * 1024);
+        assert_eq!(pb2.cap(), 2 * 1024 * 1024);
     }
 
     /// Out-of-pool acquire: any `need > MAX_CLASS` returns an unregistered

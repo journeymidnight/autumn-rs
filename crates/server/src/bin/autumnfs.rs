@@ -688,15 +688,24 @@ async fn cmd_get(cluster: &ClusterClient, remote: &str, local: &PathBuf) -> Resu
 /// and the extent boundaries.
 fn read_full_chunk(r: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; cap];
+    let n = read_full_chunk_into(r, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Fill `buf` from `r` until full or EOF; returns the filled count. The
+/// into-slice core of `read_full_chunk`, used by the upload loop to read
+/// straight into an `alloc_value_buf` slab (stable, recycled — on UCX
+/// registered — addresses; no per-chunk 8 MiB alloc+zero).
+fn read_full_chunk_into(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
-    while filled < cap {
+    while filled < buf.len() {
         match r.read(&mut buf[filled..])? {
             0 => break,
             n => filled += n,
         }
     }
-    buf.truncate(filled);
-    Ok(buf)
+    Ok(filled)
 }
 
 async fn write_file_from_reader(
@@ -769,7 +778,18 @@ async fn publish_file(
             None => 8,
         };
         let mut inflight = FuturesUnordered::new();
-        let mut pending = Some(first_chunk); // the already-read first chunk
+        // F-VALUEBUF: chunks ride in RegPool-backed ValueBufs — `depth` slabs
+        // cycle with STABLE addresses (UCX: registered → rcache hits from the
+        // second round, no per-chunk ~100µs×rails re-registration; TCP: plain
+        // recycling, no per-chunk 8 MiB alloc). The already-read first chunk
+        // (a Vec, from the inline-vs-extent decision) is staged into a slab
+        // once — every later chunk is read DIRECTLY into its slab.
+        let first_len = first_chunk.len();
+        let mut first_vb = autumn_client::alloc_value_buf(MAX_EXTENT);
+        first_vb.as_mut_slice()[..first_len].copy_from_slice(&first_chunk);
+        first_vb.truncate(first_len);
+        drop(first_chunk);
+        let mut pending = Some(first_vb); // the already-read first chunk
         let mut eof = false;
         // coco P1: on ANY error (source read or a put), STOP scheduling new puts
         // but keep DRAINING `inflight` to terminal state before returning — do NOT
@@ -782,14 +802,20 @@ async fn publish_file(
             if fail.is_none() && !eof && inflight.len() < depth {
                 let chunk = match pending.take() {
                     Some(c) => c,
-                    None => match read_full_chunk(&mut data_reader, MAX_EXTENT) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            fail = Some(anyhow!("read source: {e}"));
-                            eof = true;
-                            continue; // stop reading; fall through to drain
+                    None => {
+                        let mut vb = autumn_client::alloc_value_buf(MAX_EXTENT);
+                        match read_full_chunk_into(&mut data_reader, vb.as_mut_slice()) {
+                            Ok(n) => {
+                                vb.truncate(n);
+                                vb
+                            }
+                            Err(e) => {
+                                fail = Some(anyhow!("read source: {e}"));
+                                eof = true;
+                                continue; // stop reading; fall through to drain
+                            }
                         }
-                    },
+                    }
                 };
                 let n = chunk.len();
                 if n == 0 {
@@ -802,7 +828,7 @@ async fn publish_file(
                     // Track BEFORE the RPC — a put may land then a later one fail,
                     // so orphan cleanup must cover the partial success (coco P2).
                     written.push(ek.clone());
-                    let value = Bytes::from(chunk);
+                    let value = chunk.freeze(); // aliases the pool slab, 0-copy
                     inflight.push(async move { cluster.put_zc(&ek, value).await });
                     off += n as u64;
                     if n < MAX_EXTENT {

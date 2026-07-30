@@ -375,6 +375,106 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
     value_size >= UCX_ZC_READ_MIN_BYTES
 }
 
+/// A value buffer backed by the transport RegPool — the SDK's data-plane
+/// buffer currency (F-VALUEBUF).
+///
+/// The pool hands out RECYCLED slabs with STABLE addresses: on a UCX runtime
+/// the slab is `ucp_mem_map`-registered at creation, so sends/recvs touching
+/// it are true zero-copy (rcache/memh hits) with no per-op `ibv_reg_mr`; on a
+/// TCP runtime the pool is a plain recycler (no registration — saves the
+/// per-op alloc + zeroing). Fresh per-op allocations are the anti-pattern:
+/// on UCX every send from a fresh address re-registers (~100 µs × rails) and
+/// the cache entry dies with the free.
+///
+/// Two directions, same currency:
+/// - **Write**: [`alloc_value_buf`] → fill via [`ValueBuf::as_mut_slice`] →
+///   [`ValueBuf::truncate`] to the written length → [`ValueBuf::freeze`] →
+///   [`ClusterClient::put_zc`].
+/// - **Read**: [`ClusterClient::get_pooled`] / `get_range_pooled` hand the
+///   recv'd pool buffer straight back as a `ValueBuf` — zero SDK-side copies.
+///   Read it in place (`Deref<[u8]>`), or `freeze()` into a `Bytes` to hand
+///   to a framework (HTTP body, channel); dropping either returns the slab to
+///   the pool.
+pub struct ValueBuf {
+    pb: autumn_rpc::PooledBuf,
+}
+
+/// Allocate a [`ValueBuf`] with writable capacity `len` from the RegPool.
+/// See [`ValueBuf`] for when this beats a fresh `Vec`.
+pub fn alloc_value_buf(len: usize) -> ValueBuf {
+    ValueBuf {
+        pb: autumn_rpc::regpool_acquire(len),
+    }
+}
+
+impl ValueBuf {
+    fn from_pooled(pb: autumn_rpc::PooledBuf) -> Self {
+        Self { pb }
+    }
+
+    /// Filled length (what `Deref`/`freeze` expose). For a fresh
+    /// `alloc_value_buf(len)` this starts at `len`; `truncate` narrows it.
+    pub fn len(&self) -> usize {
+        self.pb.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pb.len() == 0
+    }
+
+    /// Full writable capacity (the `len` passed to `alloc_value_buf`).
+    pub fn capacity(&self) -> usize {
+        self.pb.cap()
+    }
+
+    /// The full writable area (`[..capacity]`) — write your value here.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.pb.dest_mut()
+    }
+
+    /// Narrow the filled view to the first `n` bytes (clamped to capacity).
+    /// Call after a short write/read so `freeze`/`Deref` expose exactly the
+    /// value bytes.
+    pub fn truncate(&mut self, n: usize) {
+        // SAFETY of the underlying `SetLen`: slab bytes are always initialized
+        // (zeroed at slab creation; recycled bytes hold prior data), so
+        // narrowing/re-widening within `[..capacity]` never exposes uninit
+        // memory — at worst stale pool bytes, which `truncate` only shrinks
+        // away from.
+        unsafe { compio::buf::SetLen::set_len(&mut self.pb, n) }
+    }
+
+    /// Convert into a `Bytes` exposing the filled bytes, WITHOUT copying (the
+    /// `Bytes` aliases the slab; the slab returns to the pool when it drops).
+    /// Feed this to `put_zc` / `put_many`, or hand it to any `Bytes`-consuming
+    /// sink (HTTP body, channel).
+    pub fn freeze(self) -> Bytes {
+        Bytes::from_owner(self.pb)
+    }
+}
+
+impl std::ops::Deref for ValueBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.pb.filled()
+    }
+}
+
+impl AsRef<[u8]> for ValueBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.pb.filled()
+    }
+}
+
+impl std::fmt::Debug for ValueBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValueBuf")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
 /// F-NS-PRINCIPAL-UNIFIED (§8.5): read a principal credential file into
 /// `(principal_name, raw_secret_bytes)` for
 /// [`ClusterClient::connect_with_credential`]. Because Option 3 dropped the
@@ -2187,14 +2287,26 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F216-E zero-copy PUT: write a value with NO intermediate value copy on
-    /// the client. The value is sent as its own iovec (via `MSG_PUT_ZC` +
-    /// `RpcClient::call_vectored`) straight from `value`'s backing memory — on
-    /// UCX that is a zero-copy send via rcache when `value`'s memory is
-    /// `ucp_mem_map`-registered (the kvcache caller holds a `RegisteredMem` over
-    /// the sglang source pool and passes a `Bytes` aliasing it → 0 copies). The
-    /// regular `put` path copies the value 3× (to_vec → clone → rkyv_encode);
-    /// this copies 0. Same routing + epoch-stale refresh + RPC-retry shape as
+    /// F216-E zero-copy PUT: write a value with NO intermediate value copy and
+    /// NO value crc scan on the client (`MSG_PUT_ZC` +
+    /// `RpcClient::call_vectored_zc` — v28: the value rides after the ctrl crc
+    /// as its own iovec, straight from `value`'s backing memory). The regular
+    /// `put` path copies the value 3× (to_vec → clone → rkyv_encode); this
+    /// copies 0.
+    ///
+    /// UCX send-side zero-copy is decided by the VALUE'S MEMORY PROVENANCE,
+    /// via UCX's implicit registration cache — there is no explicit
+    /// registration anywhere: the first send from an address region pays a
+    /// lazy `ibv_reg_mr` (~100 µs × rails) and populates the rcache; later
+    /// sends from the SAME region hit for free. So:
+    /// - STABLE addresses (an [`alloc_value_buf`] slab, a pinned KV-pool page
+    ///   aliased via `Bytes::from_static`, a reused template `Bytes`) are
+    ///   effectively registered from the second touch on;
+    /// - FRESH per-op allocations re-register on EVERY send and the cache
+    ///   entry dies with the free — the anti-pattern. Produce values into
+    ///   [`alloc_value_buf`] instead.
+    ///
+    /// Same routing + epoch-stale refresh + RPC-retry shape as
     /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
     /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
     pub async fn put_zc(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
@@ -2742,12 +2854,15 @@ impl ClusterClient {
     }
 
     /// Sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
-    /// (`length == 0` = whole value) into `dest` via `MSG_GET_ZC` (pooled recv
-    /// + one copy, see [`get_into`]). `get_into(key, dest)` is exactly
-    /// `get_range_into(key, 0, 0, dest)`. Same routing + epoch-stale refresh +
-    /// RPC retry shape as `call_ps_for_key`; honors `rpc_timeout`. Used by
-    /// `get_many_into` and by sub-range callers (fuse / ioring) that route
-    /// per key.
+    /// (`length == 0` = whole value) into `dest`: [`get_range_pooled`] + ONE
+    /// memcpy. Use this shape only when the bytes must land at YOUR address
+    /// (sglang page / torch tensor / python buffer / an assembly buffer);
+    /// address-unconstrained callers should use `get_range_pooled` directly
+    /// and skip the copy. `get_into(key, dest)` is exactly
+    /// `get_range_into(key, 0, 0, dest)`. Used by `get_many_into` and by
+    /// sub-range callers (fuse / ioring) that route per key.
+    ///
+    /// [`get_range_pooled`]: ClusterClient::get_range_pooled
     pub async fn get_range_into(
         &self,
         key: &[u8],
@@ -2755,6 +2870,47 @@ impl ClusterClient {
         length: u32,
         dest: &mut [u8],
     ) -> std::result::Result<Option<usize>, AutumnError> {
+        match self.get_range_pooled(key, offset, length).await? {
+            None => Ok(None),
+            Some(vb) => {
+                let n = vb.len().min(dest.len());
+                dest[..n].copy_from_slice(&vb[..n]);
+                Ok(Some(vb.len()))
+            }
+        }
+    }
+
+    /// ZC GET, zero SDK-side copies: the value arrives in a read_loop-owned
+    /// RegPool buffer (`MSG_GET_ZC` + `RpcClient::call_into_pooled` — UCX
+    /// RDMAs into the registered slab; TCP ≥ 64 KiB pays only the kernel
+    /// copy) and is handed straight back as a [`ValueBuf`]. Read it in place,
+    /// or `freeze()` into a `Bytes` for a framework sink; dropping either
+    /// returns the slab to the pool. `None` = not found.
+    ///
+    /// This is the address-UNCONSTRAINED read shape ("I just want the
+    /// value"); when the bytes must land at a specific address use
+    /// [`get_into`](ClusterClient::get_into) (one documented memcpy).
+    /// Any value size is fine — sub-64 KiB responses simply take the decode
+    /// path into a plain pool buffer.
+    pub async fn get_pooled(
+        &self,
+        key: &[u8],
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
+        self.get_range_pooled(key, 0, 0).await
+    }
+
+    /// Sub-range variant of [`get_pooled`](ClusterClient::get_pooled) — the
+    /// CORE every ZC read routes through. Reads bytes `[offset,
+    /// offset+length)` (`length == 0` = whole value / to-end). Same routing +
+    /// epoch-stale refresh + RPC retry shape as `call_ps_for_key`; honors
+    /// `rpc_timeout` (the pooled recv is cancel-safe — a timed-out call's
+    /// buffer returns to the pool).
+    pub async fn get_range_pooled(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
         let key = self.binding.bind_key(key)?;
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
@@ -2773,11 +2929,11 @@ impl ClusterClient {
             });
             match self.get_ps_client(&ps_addr).await {
                 Ok(client) => {
-                    // The value lands in a read_loop-owned PooledBuf, then ONE
-                    // memcpy into `dest`. Racing rpc_timeout is safe: on expiry
-                    // the dropped call's buffer returns to the pool via the
-                    // read_loop (cancel-safe, unlike the removed
-                    // call_into_dest).
+                    // The value lands in a read_loop-owned PooledBuf and is
+                    // handed back as-is (ZERO SDK-side copies). Racing
+                    // rpc_timeout is safe: on expiry the dropped call's buffer
+                    // returns to the pool via the read_loop (cancel-safe,
+                    // unlike the removed call_into_dest).
                     let call = client.call_into_pooled(partition_rpc::MSG_GET_ZC, payload);
                     let outcome = match self.rpc_timeout.get() {
                         None => call.await,
@@ -2792,10 +2948,7 @@ impl ClusterClient {
                     match outcome {
                         Ok(z) => match z.code {
                             partition_rpc::CODE_OK => {
-                                let value = z.buf.filled();
-                                let n = value.len().min(dest.len());
-                                dest[..n].copy_from_slice(&value[..n]);
-                                return Ok(Some(value.len()));
+                                return Ok(Some(ValueBuf::from_pooled(z.buf)));
                             }
                             partition_rpc::CODE_NOT_FOUND => return Ok(None),
                             // Epoch stale → fall through to refresh + retry.
@@ -2846,7 +2999,7 @@ impl ClusterClient {
             }
         }
         Err(AutumnError::ConnectionError(format!(
-            "get_range_into after {attempt} refreshes: {}",
+            "get_range_pooled after {attempt} refreshes: {}",
             last_err.unwrap_or_else(|| "unknown".to_string())
         )))
     }
@@ -4400,6 +4553,21 @@ mod first_attempt_timeout_tests {
 #[cfg(test)]
 mod zc_rule_tests {
     use super::*;
+
+    /// F-VALUEBUF: write into a pool slab, truncate to the written length,
+    /// freeze into a Bytes exposing exactly those bytes (aliasing the slab —
+    /// the write-side currency for `put_zc`).
+    #[test]
+    fn value_buf_truncate_freeze_roundtrip() {
+        let mut vb = alloc_value_buf(8192);
+        assert_eq!(vb.capacity(), 8192);
+        assert_eq!(vb.len(), 8192, "filled defaults to capacity");
+        vb.as_mut_slice()[..5].copy_from_slice(b"hello");
+        vb.truncate(5);
+        assert_eq!(&*vb, b"hello", "Deref exposes the filled view");
+        let b = vb.freeze();
+        assert_eq!(&b[..], b"hello", "freeze aliases exactly the filled bytes");
+    }
 
     // F235: ZC is engaged iff value >= 64 KiB — symmetric across read/write +
     // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
