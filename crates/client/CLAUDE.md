@@ -70,6 +70,18 @@ anti-pattern: on UCX every send from a fresh address re-registers (~100 µs × r
 the rcache entry dies with the free — there is NO explicit registration anywhere;
 UCX zero-copy is decided by the value's memory provenance via the implicit rcache.
 
+**What `_zc` promises (naming contract):** `MSG_*_ZC` (wire) = value-separable layout —
+the value is a raw tail, never encoded or CRC-scanned. `*_zc`/`*_pooled` (SDK) = the
+SDK+RPC path itself adds ZERO value copies. Neither says how the value got into the
+`Bytes` — TRUE end-to-end zero-copy additionally depends on the SOURCE: (1) producer
+writes directly into pool memory (autumnfs reads file chunks straight into a slab) =
+0 copies + stable; (2) producer's own memory is already stable (kvcache aliases pinned
+torch pages) = 0 copies + stable; (3) producer hands you its own fresh allocation
+(an HTTP body) = pick 0-copies+fresh-address (TCP-optimal; UCX re-registers per op) OR
+one staging memcpy into a `ValueBuf` for a stable address (UCX-optimal — the gallery
+demo's choice). The copy count is decided by who allocates the source buffer, not by
+the API suffix.
+
 - `put(key, value, must_sync)` — write a key-value pair.
 - `get(key) → Option<Vec<u8>>` — read, `None` if not found.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
