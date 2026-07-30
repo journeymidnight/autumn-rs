@@ -25,6 +25,9 @@ pub use autumn_transport::RegisteredMem;
 /// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.
 /// Transport-agnostic: registered on `ucx`, plain (copy-out) on TCP/no-ucx.
 pub use autumn_transport::{regpool_acquire, PooledBuf};
+/// Re-exported for SDK-level source-staging decisions (autumn-client
+/// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
+pub use autumn_transport::runtime_transport_is_ucx;
 pub use error::{Result, RpcError, StatusCode};
 pub use frame::{Frame, FrameDecoder, HEADER_LEN};
 

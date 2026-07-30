@@ -1085,25 +1085,31 @@ async fn put_handler_inner(
 
         // Non-video (images / PDFs / text / small binaries) stay inline so
         // /get/ can byte-range them directly. They're small, so buffering the
-        // whole field is fine.
+        // whole field is fine. Kept as the producer's own `Bytes` — no
+        // defensive `.to_vec()` copy.
         let data = match field.bytes().await {
-            Ok(b) => b.to_vec(),
+            Ok(b) => b,
             Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("read field: {e}")),
         };
         let bytes = data.len() as u64;
         let t0 = Instant::now();
-        // F-VALUEBUF demo: large uploads are staged into a RegPool ValueBuf
-        // and written via put_zc — the pool's stable slab addresses mean a
-        // UCX runtime sends from ALREADY-registered memory every time
-        // (rcache hit) instead of re-registering each request's fresh
-        // HTTP-body allocation (~100µs × rails, wasted when the body frees);
-        // on TCP the pool is a plain recycler. The body already arrived in
-        // its own allocation, so the staging costs ONE memcpy — the price of
-        // a stable source address when you don't control the producer.
+        // F-VALUEBUF demo, source case ③ (producer-owned fresh allocation —
+        // hyper owns the body's memory, we can't make it write into a slab):
+        // the staging trade is RUNTIME-transport decided.
+        // - UCX: ONE memcpy into a RegPool ValueBuf buys a stable REGISTERED
+        //   source address — every upload sends from already-rcached memory
+        //   instead of re-registering the fresh body (~100µs × rails, wasted
+        //   when the body frees).
+        // - TCP: the pool buys nothing for an already-allocated source —
+        //   send the body's own Bytes directly (clone = refcount, 0 copies).
         let put_res = if autumn_client::zc_worthwhile(data.len()) {
-            let mut vb = autumn_client::alloc_value_buf(data.len());
-            vb.as_mut_slice().copy_from_slice(&data);
-            client.put_zc(file_key(&filename).as_bytes(), vb.freeze()).await
+            if autumn_client::runtime_transport_is_ucx() {
+                let mut vb = autumn_client::alloc_value_buf(data.len());
+                vb.as_mut_slice().copy_from_slice(&data);
+                client.put_zc(file_key(&filename).as_bytes(), vb.freeze()).await
+            } else {
+                client.put_zc(file_key(&filename).as_bytes(), data.clone()).await
+            }
         } else {
             client.put(file_key(&filename).as_bytes(), &data).await
         };

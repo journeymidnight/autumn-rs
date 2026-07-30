@@ -50,6 +50,17 @@ Task scope: 【实现完成，仅欠 coco】F-VALUEBUF —— ValueBuf/regpool �
   （新 foreign-drop 测试）; manager system_putstream --ignored 7/7 真集群绿。
 * 待办: coco（token 过期）; perf bench 确认无需改（模板 Bytes clone 已稳定地址）。
 
+── 追加（同日，commit a5230d6 + 22db30e）──
+* _zc 命名契约钉进 client CLAUDE.md（用户指出 gallery 仍要拷进池）: MSG_*_ZC=wire
+  value-separable 布局; *_zc/*_pooled=SDK 零添加拷贝; 真 e2e 零拷贝=还要看源内存出身
+  （①生产者写进池[autumnfs] ②生产者内存本稳定[kvcache pinned 页] ③生产者塞新分配
+  [HTTP body]→0拷贝+新鲜 vs 1staging+稳定 二选一）。拷贝数由谁分配源 buffer 决定。
+* 用户拍板情形③运行时分支: autumn_transport::runtime_transport_is_ucx 转 pub
+  （non-ucx 恒 false，不 lazy-init）→ 经 autumn_rpc → autumn_client 三层 re-export；
+  gallery 上传改为 zc_worthwhile && is_ucx ? staging : put_zc(body 直发)，并删掉原有
+  防御性 .to_vec()（TCP 路径现为真零拷贝直发）。验证: workspace 0 错, client 41 /
+  rpc 54 / transport 10 绿。本地未 push commit ×4: 9474cc3/a5230d6/22db30e + 前批。
+
 ── 前一批（同日，已 commit+push: c566233/77a5665/c8fa70b）──
 F-WIRE-CRC-UNIFY（用户拍板「CRC 在 wire 上很乱，改为 header+meta 必有
   CRC、大 value 交给传输层」+「不需要 FLAG_CRC，默认都有 meta crc」+「MSG_APPEND 的

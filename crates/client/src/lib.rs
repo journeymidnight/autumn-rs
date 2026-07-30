@@ -407,6 +407,16 @@ pub fn alloc_value_buf(len: usize) -> ValueBuf {
     }
 }
 
+/// True iff the process transport is UCX. Decides the SOURCE-staging trade
+/// for a producer-owned fresh allocation (an HTTP body, a decoded blob):
+/// on UCX, one staging memcpy into an [`alloc_value_buf`] slab buys a stable
+/// REGISTERED source address (rcache hit on every send); on TCP the pool buys
+/// nothing for an already-allocated source — send the producer's own `Bytes`
+/// directly (zero copies). Producers that can write straight into a slab
+/// (file reads, generated data) skip the trade entirely and win on both
+/// transports.
+pub use autumn_rpc::runtime_transport_is_ucx;
+
 impl ValueBuf {
     fn from_pooled(pb: autumn_rpc::PooledBuf) -> Self {
         Self { pb }
