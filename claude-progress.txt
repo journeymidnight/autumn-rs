@@ -36,10 +36,18 @@ rpc 52（含新回归测试）/ client --lib 40 / transport 全绿；cargo check
 manager system_putstream f235_get_many_into_mixed_sizes（--ignored，真集群）绿。
 regpool_acquire(0) 边界核过（size_class(0)→MIN_CLASS，无 panic）。
 
-Next steps: ① 用户重新 coco 登录后补跑 /coco-review findbugs（评本 commit）；
-② 遗留观察项: ucx feature + TCP transport 组合下 regpool 仍会 ucp_mem_map（编译期
-门控看不见运行时 transport），VKE 的 TCP 部署若带 ucx feature 编译则白付 memlock —
-确认部署 feature 配置，必要时立条目。
+── 追加（同会话）: 观察项 ② 已修 ──
+regpool 注册加运行时 transport 门（`runtime_transport_is_ucx`，transport/lib.rs）：
+ucx-feature 构建跑 TCP transport 时 acquire() 直接发未注册 buffer，不再 ucp_mem_map
+（省 UCX context 初始化 + memlock 钉页；用户确认部署"可能带也可能不带 ucx feature"，
+所以两种构建都要对）。未初始化 transport 读作"非 UCX"是安全的：所有 regpool recv
+路径都在活连接之后，连接必然已 init transport。既有测试不断言必注册（注释明写
+no-ucx 下 reg=None 也要过）→ ucx-feature 测试进程不受影响。验证: 非 ucx 全测绿；
+ucx feature 在 macOS 本来就编不了（ucp_* bindgen 需 Linux，git stash 对照确认 121 个
+同类错误预存在），Linux 侧留给 CP 流水线构建验证。
+
+Next steps: ① 用户重新 coco 登录后补跑 /coco-review findbugs（评这两个 commit）；
+② ucx-feature Linux 构建（CP 流水线或 perf 机）过一次编译即完全闭环。
 
 ============================ prior task history ============================
 Date: 2026-07-22

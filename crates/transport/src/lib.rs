@@ -74,6 +74,21 @@ pub fn init_with(kind: TransportKind) -> &'static dyn AutumnTransport {
     t
 }
 
+/// True iff the process-global transport is initialised AND is UCX. The
+/// regpool uses this to decide whether registering a fresh slab pays off — a
+/// ucx-FEATURE binary running the TCP transport must NOT `ucp_mem_map` (memh
+/// is never used on TCP; registering would only initialise a UCX context +
+/// pin memlock for nothing). Deliberately does NOT lazy-init: an
+/// uninitialised transport reads as "not UCX" (every regpool recv path runs
+/// behind a live connection, which implies the transport is initialised).
+#[cfg(feature = "ucx")]
+pub(crate) fn runtime_transport_is_ucx() -> bool {
+    GLOBAL
+        .get()
+        .map(|t| t.kind() == TransportKind::Ucx)
+        .unwrap_or(false)
+}
+
 /// Read the process-global transport. Panics if `init()` was never called.
 ///
 /// Use this from binaries that call `init()` explicitly at startup so a

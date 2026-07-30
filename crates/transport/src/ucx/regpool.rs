@@ -437,6 +437,11 @@ impl Drop for PooledBuf {
 /// fresh one. If registering would exceed the per-thread memlock cap, returns
 /// an unregistered buffer (recv falls back to copy-out — still correct).
 ///
+/// Registration is RUNTIME-transport gated, not just compile-feature gated: a
+/// ucx-feature binary whose process transport is TCP gets plain buffers (memh
+/// is never used on TCP; `ucp_mem_map` would only init a UCX context + pin
+/// memlock for nothing). See `runtime_transport_is_ucx`.
+///
 /// For `need > MAX_CLASS` (256 MiB), returns an unregistered out-of-pool
 /// buffer of EXACTLY `need` bytes (no rounding, no pooling) — keeps the API
 /// total while making "absurdly large" allocations cheap-and-non-pinning
@@ -480,7 +485,14 @@ pub fn acquire(need: usize) -> PooledBuf {
     #[cfg_attr(not(feature = "ucx"), allow(unused_mut))]
     let mut buf = vec![0u8; class];
     #[cfg(feature = "ucx")]
-    let reg = {
+    let reg = if !crate::runtime_transport_is_ucx() {
+        // Runtime-transport gate (compile-feature gating can't see the
+        // runtime choice): a ucx-feature build running the TCP transport
+        // never recvs via memh, so registering would only initialise a UCX
+        // context + pin memlock for nothing. Hand out a plain buffer — on
+        // TCP the pool's benefit is recycling alone.
+        None
+    } else {
         // PRE-FLIGHT cap check: would registering `class` more bytes push the
         // thread's total pinned mem above cap? If so, skip register_memory —
         // an over-budget `ucp_mem_map` would either fail (memlock) or succeed
