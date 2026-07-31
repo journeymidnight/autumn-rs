@@ -36,6 +36,7 @@
     - 提交 git commit，作为该 feature 的完成点
 11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不堆放验证步骤。
 12. 如果claude-progress.txt,feature-list太长, 定期清理删除, 保持整洁
+13. 在注释，commit description， 尤其是代码内容里面， 不要写类似于Fxxx这种feature号
 
 
 ### claude-progress.txt 约定
