@@ -331,7 +331,7 @@ async fn handle_op(client: &ClusterClient, op: Op) {
         }
         Op::BatchPutFrom { keys, bufs, ttl_secs, handle } => {
             // Pipeline all puts concurrently on this single compio thread. The
-            // partition server's group-commit (F099-D) coalesces them at the
+            // partition server's group-commit coalesces them at the
             // WAL level — same pattern perf-check uses, just driven from one
             // batch op instead of N Python round-trips.
             let oks: Vec<bool> = if ttl_secs == 0 {
@@ -435,7 +435,7 @@ impl Client {
     /// Spawns the compio worker thread, performs the cluster handshake,
     /// then resolves the returned future with a connected `Client` instance.
     ///
-    /// F-AUTHZ-BUILTIN (D6-mem wiring): pass `tenant=` + `credential=`
+    /// (D6-mem wiring): pass `tenant=` + `credential=`
     /// (bytes, from `autumn-op tenant-create`) to bind the connection to a
     /// tenant credential — the client then AUTH_HELLOs each PS connection
     /// with a short-TTL token (auto-minted + renewed by the SDK) scoped to
@@ -444,7 +444,7 @@ impl Client {
     /// cluster with authz off. Both-or-neither: a lone tenant or lone
     /// credential is a config error and fails loudly here rather than as a
     /// confusing first-write PermissionDenied.
-    // F-NS-PRINCIPAL-UNIFIED: `scope` is the REQUIRED key prefix — the client
+    // `scope` is the REQUIRED key prefix — the client
     // PREPENDS `{scope}/` to every key (Prepend-only, scope locked by
     // construction). A scope is a whole namespace (`kvc`) or an in-namespace
     // sub-prefix (`kvc/model-fp`). `principal` + `credential` are the OPTIONAL
@@ -786,7 +786,7 @@ impl Drop for Client {
 
 // ── Transport selection ──────────────────────────────────────────────────────
 
-/// F216-E: tracks whether the process transport is UCX, so the batch path can
+/// tracks whether the process transport is UCX, so the batch path can
 /// default to zero-copy ("ucx ⟹ zerocopy") with no explicit flag. Set by
 /// `set_transport`; read at `BatchClient` construction. `autumn_transport`'s
 /// `is_ucx` lives on `ReadHalf` (per-conn), not globally, so we mirror it here.
@@ -810,7 +810,7 @@ fn set_transport(kind: &str) -> PyResult<()> {
         "ucx" => {
             #[cfg(feature = "ucx")]
             {
-                // F216-E: this process becomes an RDMA endpoint — UCX rc_mlx5
+                // this process becomes an RDMA endpoint — UCX rc_mlx5
                 // pins registered send/recv buffers (ibv_reg_mr) against
                 // RLIMIT_MEMLOCK. The default soft limit (often 8 MiB) faults
                 // libibverbs on the first large transfer (observed: client
@@ -904,10 +904,10 @@ struct BatchWorker {
 struct BatchClient {
     workers: Vec<BatchWorker>,
     per_worker_cap: usize,
-    /// F216-E: captured from the process transport at construction. True ⟹
+    /// captured from the process transport at construction. True ⟹
     /// zero-copy data path (writes always; reads above BULK_MIN_BYTES).
     is_ucx: bool,
-    /// F-DIRECT-MANY: opt-in EN direct-read for the Get path (`get_many_direct`).
+    /// opt-in EN direct-read for the Get path (`get_many_direct`).
     /// Topology-dependent (client must reach EN data ports), default OFF.
     direct: bool,
 }
@@ -916,10 +916,10 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
-            // F244-D: consolidate onto `ClusterClient::get_many_into` — the ONE
+            // consolidate onto `ClusterClient::get_many_into` — the ONE
             // batch-read fan-out primitive (also driving the e2e-tested SDK path).
             // Drops the hand-rolled `buffered` loop + the per-item `bulk_worthwhile`
-            // decision (which used to drift across callers — see F234); the bulk rule
+            // decision (which used to drift across callers); the bulk rule
             // now lives once, inside `get_many_into`. `cap` (per_worker_cap) is the
             // concurrency window.
             // SAFETY: each `it.ptr/len` addresses a pinned dest page the caller keeps
@@ -935,7 +935,7 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
                 })
                 .collect();
             let _ = cap; // unused — SDK manages internal concurrency
-            // F-DIRECT-MANY: `direct` (BatchClient(direct=True)) sends the
+            // `direct` (BatchClient(direct=True)) sends the
             // ≥ 64 KiB whole-value gets STRAIGHT to an EN (`get_many_direct`),
             // bypassing the PS on the data path — a cross-host throughput win
             // for kvcache / fsspec large-tensor serving. TOPOLOGY-DEPENDENT
@@ -949,7 +949,7 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
             };
             drop(gitems);
             // Success = the value was found AND its length matches the page size
-            // the caller reserved (same contract as the pre-F244 per-item path).
+            // the caller reserved (same contract as the former per-item path).
             results
                 .iter()
                 .zip(items.iter())
@@ -957,7 +957,7 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
                 .collect()
         }
         BatchOp::Put => {
-            // F246: consolidate onto `ClusterClient::put_many` (fan_out) — the write
+            // consolidate onto `ClusterClient::put_many` (fan_out) — the write
             // mirror of the Get arm. The bulk decision (`bulk_worthwhile`) + per-item
             // put_bulk/put dispatch now live once inside `put_many`. The value is a
             // `Bytes::from_static` view aliasing the pinned source page.
@@ -994,13 +994,13 @@ impl BatchClient {
     /// ClusterClient, and wait until all are ready. `per_worker_cap` bounds the
     /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
     /// rendezvous cliff).
-    /// F-AUTHZ-BUILTIN (D6-kvc wiring): `tenant=` + `credential=` (bytes)
+    /// (D6-kvc wiring): `tenant=` + `credential=` (bytes)
     /// bind EVERY worker's ClusterClient to the tenant credential — required
     /// once `kvc/` is enforcement-enabled (the kvcache connector threads these
     /// from `kv_connector_extra_config`); harmless with authz off. Both or
     /// neither, validated up front.
     #[new]
-    // F-KEY-NS D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
+    // D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
     // (keyword-only, after the perf knobs); `principal` + `credential` are the
     // OPTIONAL authz identity (细化三 rename from `tenant=`).
     #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
@@ -1024,7 +1024,7 @@ impl BatchClient {
             }
         };
         let n_workers = n_workers.max(1);
-        // F216-E "ucx ⟹ zerocopy": derive the data path from the process
+        // "ucx ⟹ zerocopy": derive the data path from the process
         // transport (set via set_transport BEFORE construction) — no explicit
         // bulk flag. UCX → zero-copy (writes always; reads size-guarded).
         let is_ucx = IS_UCX.load(std::sync::atomic::Ordering::SeqCst);
@@ -1086,7 +1086,7 @@ impl BatchClient {
         Ok(BatchClient { workers, per_worker_cap, is_ucx, direct })
     }
 
-    /// Whether this client uses the F216-E zero-copy data path. This is now
+    /// Whether this client uses the zero-copy data path. This is now
     /// derived from the process transport (True ⟺ `set_transport("ucx")` was
     /// called before construction): writes are zero-copy (MSG_PUT_BULK) always,
     /// reads (MSG_GET_BULK) for values ≥ the size threshold. No explicit flag.
@@ -1094,7 +1094,7 @@ impl BatchClient {
         self.is_ucx
     }
 
-    /// F-DIRECT-MANY: whether the Get path bypasses the PS and reads ≥ 64 KiB
+    /// whether the Get path bypasses the PS and reads ≥ 64 KiB
     /// values straight from an extent node (`BatchClient(direct=True)`).
     /// Topology-dependent — enable only when this host can reach EN data ports.
     fn direct(&self) -> bool {

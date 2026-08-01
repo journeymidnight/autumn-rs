@@ -1,13 +1,13 @@
-//! F211 operator-driven node lifecycle — in-memory smoke tests.
+//! operator-driven node lifecycle — in-memory smoke tests.
 //!
 //! These tests exercise the AutumnManager state machine without
 //! requiring an etcd server. They cover:
-//!   * F211-A: NodeStateTracker default state, on_heartbeat_ok seed
-//!   * F211-B: handle_list_node_states / extent_health_report aggregation
-//!   * F211-C: handle_fence_node + handle_clear_node_override +
-//!             handle_remove_node + zombie defense
-//!   * F211-I: audit append is exercised by going through the handlers
-//!   * F211-H: handle_recovery_stats baseline
+//!   * NodeStateTracker default state, on_heartbeat_ok seed
+//!   * handle_list_node_states / extent_health_report aggregation
+//!   * handle_fence_node + handle_clear_node_override +
+//!     handle_remove_node + zombie defense
+//!   * audit append is exercised by going through the handlers
+//!   * handle_recovery_stats baseline
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::*;
@@ -32,7 +32,7 @@ fn register(m: &AutumnManager, addr: &str) -> u64 {
     resp.node_id
 }
 
-// F214-B: first-time register seeds NodeAutoState::Suspend, not Online.
+// first-time register seeds NodeAutoState::Suspend, not Online.
 // The first successful df transitions to Online. Renamed from
 // `list_node_states_starts_online` to reflect the new initial state.
 #[test]
@@ -161,12 +161,12 @@ fn remove_after_fence_succeeds_when_no_refs() {
         node_uuid: String::new(),
     };
     // This caller is UUID-LESS (legacy `node_uuid: ""`), so the
-    // F-EN-DYNSHARD tombstone-by-uuid check is skipped (an empty uuid
+    // tombstone-by-uuid check is skipped (an empty uuid
     // matches no tombstone), and the removed node is gone from `s.nodes`
     // — so a fresh register at the same addr is allowed and gets a NEW
     // node_id. A node carrying its stable `node_uuid` would instead be
     // refused by the uuid-keyed tombstone (see the manager lib
-    // `f_en_dynshard_decommissioned_uuid_refused_at_new_address` test).
+    // `en_dynshard_decommissioned_uuid_refused_at_new_address` test).
     let resp_bytes = run(m.handle_register_node(rkyv_encode(&req))).expect("re-register");
     let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).expect("decode");
     // After remove, prior nodes entry is gone — register succeeds with

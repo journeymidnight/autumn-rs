@@ -33,12 +33,12 @@ struct Args {
     #[arg(long)]
     mountpoint: PathBuf,
 
-    /// F-AUTHZ-BUILTIN: path to a file holding this mount's authz credential
+    /// path to a file holding this mount's authz credential
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
     /// cluster protects the `fs/` namespace; omit on an authz-off cluster. The
     /// mount connects via `connect_with_credential` (principal read from the file)
-    /// and FAILS FAST if the credential doesn't cover `fs/`. (F-NS-PRINCIPAL-UNIFIED:
-    /// the tenant segment is gone — a mount covers the WHOLE `fs/` namespace.)
+    /// and FAILS FAST if the credential doesn't cover `fs/`. (The tenant segment
+    /// is gone — a mount covers the WHOLE `fs/` namespace.)
     #[arg(long)]
     credential_file: Option<PathBuf>,
 
@@ -51,7 +51,7 @@ struct Args {
     #[arg(long, default_value = "tcp")]
     transport: String,
 
-    /// F-DIRECT-MANY — read whole extents (≥ 64 KiB) STRAIGHT from an extent
+    /// read whole extents (≥ 64 KiB) STRAIGHT from an extent
     /// node, bypassing the PS on the large-value data path (`get_many_direct`).
     /// A cross-host throughput win for large-file (model) serving: the PS NIC
     /// egress leaves the read path. Size-gated per read (< 64 KiB stays on the
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
 
     let mountpoint = args.mountpoint.clone();
 
-    // F-NS-PRINCIPAL-UNIFIED: read the authz credential up front (fail-loud on a
+    // read the authz credential up front (fail-loud on a
     // bad path) so the compio thread just carries (principal, bytes). The
     // principal identity travels IN the file (§8.5).
     let credential: Option<(String, Vec<u8>)> = match &args.credential_file {
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     let tx = bridge.tx.clone();
     let mut rx = bridge.rx;
 
-    // F-fuse-lease-2: build the fuse Session UP FRONT so we can
+    // Build the fuse Session UP FRONT so we can
     // grab a `Notifier` BEFORE the compio thread starts. The
     // notifier is `Clone + Send`; we ship one clone to the compio
     // thread (wrapped in the `InodeInvalidator` Rc-Fn closure) so
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
         fuser::MountOption::DefaultPermissions,
         // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
         // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
-        // out across the file's variable-length extents (F247, ≤ 8 MiB each)
+        // out across the file's variable-length extents (≤ 8 MiB each)
         // via `get_many_into` — each whole-extent get is bulk-eligible (≥ 64 KiB).
         fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
     ];
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
             let notifier = notifier;
             compio::runtime::Runtime::new().unwrap().block_on(async {
                 // Connect to cluster (scoped to `fs/{tenant}/`); with an authz
-                // credential when `--credential-file` was given (F-AUTHZ-BUILTIN).
+                // credential when `--credential-file` was given.
                 let connect = async {
                     match credential {
                         Some((principal, secret)) => {
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
 
                 // Bug #1 fix (2026-06-06) — ride out the fresh-bootstrap
                 // window where manager has assigned partitions but the
-                // PS process hasn't yet bound each F099-K listener +
+                // PS process hasn't yet bound each partition's listener +
                 // called `RegisterPartitionAddr`. Without this, fuse's
                 // init_root kv_put hits 10× mis-route → `ps_call after
                 // 10 refreshes: key not found`. 60 s budget is generous
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
                 }
                 tracing::info!("cluster ready (all partition listeners reachable)");
 
-                // F-fuse-lease-2: build the invalidator that the
+                // Build the invalidator that the
                 // poll loop calls per WriterClosed/LeaseRevoked
                 // event. `inval_inode(ino, 0, 0)` drops both
                 // attribute and the full data range — kernel
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
                         }
                     });
 
-                // F-fuse-lease-1: spawn per-mount lease heartbeat +
+                // Spawn per-mount lease heartbeat +
                 // invalidation poll loops. They share the compio
                 // runtime and reference state.held_leases /
                 // state.invalidations via Rc<RefCell<…>>.

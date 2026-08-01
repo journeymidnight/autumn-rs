@@ -190,7 +190,7 @@ connector path — use the `vllm:external_prefix_cache_*` /
 `prompt_tokens_by_source{source="external_kv_transfer"}` metrics, which are the
 authoritative external-hit signal.)
 
-A scripted version of this check is `tests/` + the F250-D e2e in the repo.
+A scripted version of this check is `tests/` + the e2e in the repo.
 
 ## Data-plane smoke test (no engine required)
 

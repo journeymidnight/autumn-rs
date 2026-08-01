@@ -1,4 +1,4 @@
-//! F-RECOVERY-UNBOUNDED BUG2 — end-to-end data-safety of the GC replay-floor
+//! BUG2 — end-to-end data-safety of the GC replay-floor
 //! raise to the DURABLY-ACKed checkpoint vp (`gc_floor_raise_to_durable_ckpt`).
 //!
 //! Reproduce-first + discriminating: we force-GC the FIRST log extent E0, which

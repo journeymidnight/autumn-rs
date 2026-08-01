@@ -115,7 +115,7 @@ fn split_compact_preserves_gallery_originals_on_rightmost_child() {
             let regions = get_regions(&mgr).await;
             current_part = rightmost_part_id(&regions);
 
-            // F099-K: the new right child binds a dedicated per-partition
+            // the new right child binds a dedicated per-partition
             // port asynchronously after region propagation. Wait long enough
             // for `part_addrs` to become visible before routed maintenance.
             compio::time::sleep(Duration::from_millis(6000)).await;

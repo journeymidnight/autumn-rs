@@ -1,7 +1,7 @@
 //! FUSE-side type conversions: core `InodeMeta` / `DT_*` → `fuser` reply
 //! types.
 //!
-//! F-FS-UNIFY M1: this is the ONLY place the filesystem core's data model
+//! M1: this is the ONLY place the filesystem core's data model
 //! meets `fuser`. The core (`meta`/`dir`/`extent`/`read`/`write`/`state`)
 //! returns plain `InodeMeta` / `DT_*` bytes and compiles without `fuser`
 //! (`--no-default-features --features core`), so the PyO3 `autumn.Fs`

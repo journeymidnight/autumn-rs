@@ -37,7 +37,7 @@ Files live in the cluster's KV store under these key conventions:
 | Key pattern | Holds |
 |---|---|
 | `<filename>` | Original image / PDF / text upload (inline value); for a *transient* video original, the 28-byte stripe-meta blob — see below |
-| `\xff\xfe…` (reserved) | Striped video chunks (`autumn-client` F186 `put_stream` namespace; one 4 MiB chunk per key) |
+| `\xff\xfe…` (reserved) | Striped video chunks (`autumn-client` `put_stream` namespace; one 4 MiB chunk per key) |
 | `.thumb/320/<filename>` | Cached 320 px-wide JPEG thumbnail |
 | `.hls/<filename>/index.m3u8` | HLS playlist for a transcoded video |
 | `.hls/<filename>/seg000.ts` … | HLS media segments |
@@ -52,7 +52,7 @@ Images, PDFs, and text are small, so they're stored as a single inline KV
 value and byte-range-served via `/get/`. **Videos** are different: they can be
 arbitrarily large and are never range-served (the frontend plays them through
 HLS), so the upload handler detects them by extension and streams them with
-`autumn-client`'s F186 striped API:
+`autumn-client`'s striped API:
 
 - `put_stream_begin` opens a handle; the multipart field's network-sized
   chunks are coalesced into 4 MiB (`STRIPE_CHUNK_SIZE`) pieces and `send`-ed

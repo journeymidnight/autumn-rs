@@ -1,4 +1,4 @@
-//! F-ioring-lease-1 — end-to-end RPC validation for the inode-lease
+//! End-to-end RPC validation for the inode-lease
 //! handlers. Single in-process AutumnManager (memory-only, no etcd),
 //! real autumn-rpc TCP client. Covers:
 //!
@@ -173,7 +173,7 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
 
         // Reader polls — exactly one WriterClosed event for ino=7.
         // (Drain returns immediately because the writer-close push
-        // already queued the event; F-ioring-lease-3's long-poll
+        // already queued the event; the long-poll
         // engages only when the inbox is empty at the time of the
         // call.)
         let r = poll(
@@ -192,7 +192,7 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
 
         // The "drain is idempotent" property — that a second poll on
         // the same reader sees no events — is now covered by the
-        // F-ioring-lease unit test suite (`drain_or_park_*`). Calling
+        // inode-lease unit test suite (`drain_or_park_*`). Calling
         // a second `MSG_POLL_INVALIDATIONS` here would correctly
         // long-poll for 10 s, but adding 10 s to this test buys no
         // additional coverage over the unit tests.

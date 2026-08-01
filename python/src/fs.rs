@@ -1,6 +1,6 @@
 //! Python binding for the shared FUSE filesystem core (`autumn.Fs`).
 //!
-//! F-FS-UNIFY M2. A SYNCHRONOUS, blocking façade over the fuser-FREE FS core
+//! M2. A SYNCHRONOUS, blocking façade over the fuser-FREE FS core
 //! (`autumn_fuse` built with `--features core`): meta/dir/extent/read/write ops
 //! on the shared inode layout (`0x01` inode / `0x02` dirent / `0x03` extent),
 //! plus the reusable `autumn_client::lease` primitives. This is the SAME Rust
@@ -124,13 +124,13 @@ impl Fs {
     /// (or raises). `host` seeds the daemon lease identity
     /// (`DaemonClientId::new_fuse`); defaults to a stable label.
     ///
-    /// F-DIRECT-MANY: `direct_read=True` makes whole-value reads (≥ 64 KiB)
+    /// `direct_read=True` makes whole-value reads (≥ 64 KiB)
     /// bypass the PS and read straight from an extent node (`get_many_direct`) —
     /// a cross-host throughput win for fsspec model/dataset serving. TOPOLOGY-
     /// DEPENDENT (this host must reach EN data ports), default False; each read
     /// falls back to the PS proxy on any direct-read failure.
     ///
-    /// F-AUTHZ-BUILTIN: `principal=` + `credential=` (both or neither) attach an
+    /// `principal=` + `credential=` (both or neither) attach an
     /// authz identity, exactly like `Client`/`BatchClient` and the native
     /// `--credential-file` clients. REQUIRED once the deploy protects `fs/` —
     /// authz gates READS on protected prefixes too, so a credential-less `Fs`
@@ -138,7 +138,7 @@ impl Fs {
     /// read. `credential` is RAW bytes (hex-decode the `autumn-op principal-create`
     /// output first — see `autumn_kvcache._identity.read_credential_file`).
     /// `principal` is the credential owner (from the credential file's name line).
-    /// F-NS-PRINCIPAL-UNIFIED: no tenant — `autumn.Fs` scopes to the WHOLE `fs/`
+    /// no tenant — `autumn.Fs` scopes to the WHOLE `fs/`
     /// namespace (one global tree; see docs/key_namespace_split_design.md §8).
     #[staticmethod]
     #[pyo3(signature = (manager, host=None, principal=None, credential=None, direct_read=false))]
@@ -172,7 +172,7 @@ impl Fs {
                     }
                 };
                 rt.block_on(async move {
-                    // F-AUTHZ-BUILTIN: credential path when one was supplied —
+                    // credential path when one was supplied —
                     // `connect_with_credential` FAILS FAST at connect if the
                     // credential doesn't cover `fs/`.
                     let opened = match credential {
@@ -196,7 +196,7 @@ impl Fs {
                         let _ = ready_tx.send(Err(format!("ensure_root: {e}")));
                         return;
                     }
-                    // F-FS-UNIFY M4: the same per-session lease background tasks
+                    // M4: the same per-session lease background tasks
                     // the fuse mount runs (headless — no kernel invalidator):
                     // heartbeat held write leases so a long write doesn't lose
                     // its lease, and poll invalidations so a preempted lease is
@@ -409,7 +409,7 @@ impl Fs {
         Ok(PyBytes::new(py, &v).into_any().unbind())
     }
 
-    /// F-MODEL-bulk-LOAD: zero-copy read into a caller buffer. `buf` is a writable,
+    /// Zero-copy read into a caller buffer. `buf` is a writable,
     /// C-contiguous Python buffer-protocol object (e.g. a CUDA-pinned host tensor
     /// `torch.empty(n, dtype=torch.uint8, pin_memory=True)`); the extent data is
     /// written STRAIGHT into it — no intermediate `bytes` — so a model loader can

@@ -1,4 +1,4 @@
-//! F-FS-GEOM-DECLARED: the fs-wide DECLARED stripe geometry.
+//! the fs-wide DECLARED stripe geometry.
 //!
 //! Geometry is a policy value and `[0x04]stripe_geom` is its authoritative home.
 //! It used to have none: `autumnfs` reverse-engineered the lane count from the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# transport_chaos.sh — transport-layer chaos for tcp|ucx (F264 iteration 2).
+# transport_chaos.sh — transport-layer chaos for tcp|ucx (iteration 2).
 #
 # Boots a real 3-EN cluster via cluster.sh under the given transport, adds a
 # SECOND PS (psid 2), then injects faults while a write loop runs:
@@ -88,7 +88,7 @@ setsid nohup "$PSBIN" --psid 2 --port 9351 --manager "$MGR" \
 sleep 3
 
 # Every CLI call is timeout-bounded: an un-answered TCP connection
-# otherwise hangs ~28 min in kernel retransmit (observed in the F265
+# otherwise hangs ~28 min in kernel retransmit (observed in the
 # round), freezing the harness and hiding the event timeline.
 CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T")
 CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T") # stream ops (12 MiB)
@@ -229,7 +229,7 @@ verify_seeds "after-PS1-respawn"
 wait_mgr_ready() {
     # 150s: the respawned manager must wait out the predecessor's etcd
     # leader lease AND (ucx) the listener bind retry through TIME_WAIT —
-    # ~65-90s total (F264 budget is 3s x 30). Readiness = info PRODUCED
+    # ~65-90s total (budget is 3s x 30). Readiness = info PRODUCED
     # OUTPUT: autumn-op's exit code is not a health signal (it exits
     # non-zero on benign per-partition discard-fetch warnings, e.g. when
     # probing ucx partition listeners over tcp).
@@ -327,14 +327,14 @@ verify_seeds "after-E5-ps-respawn"
 # Each round kills a random victim (EN / holder PS / manager), waits for
 # convergence, respawns, and verifies. Repeated cycles stress CUMULATIVE
 # state the one-shot events E1-E5 cannot: repeated ownership failback
-# (owner_epoch must keep bumping, F265), part_addrs churn across many
+# (owner_epoch must keep bumping), part_addrs churn across many
 # reopen waves, PS port-ordinal growth, region_epoch growth.
 ROUNDS="${CHAOS_ROUNDS:-4}"
 SEED="${CHAOS_SEED:-$$}"
 RANDOM=$SEED
 say "E6: $ROUNDS randomized rounds (seed=$SEED)"
 for r in $(seq 1 "$ROUNDS"); do
-    # F269: victims 3/4 are best-effort ORCHESTRATION ops (split/merge),
+    # victims 3/4 are best-effort ORCHESTRATION ops (split/merge),
     # not kills — interleaved with kill rounds they compound state that
     # one-shot events never reach (deep split trees, repeated CoW chains,
     # dozens of owner-epoch bumps). Op rejections (has_overlap, non-
@@ -408,17 +408,17 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 write_liveness "e6"
 
-# ── E7: split/merge orchestration racing kills (F268) ───────────────────────
+# ── E7: split/merge orchestration racing kills ──────────────────────────────
 # E7a: issue a SPLIT on the partition holding the a-* keys, then kill -9
 #      the hosting PS mid-flight (~0.7s in). Whatever the split's fate
 #      (committed → both children reopen on the survivor; aborted → the
 #      parent reopens), every seed key must stay readable and writable.
-# E7b: issue an F185 orchestrated MERGE (two adjacent empty partitions),
+# E7b: issue an orchestrated MERGE (two adjacent empty partitions),
 #      then kill -9 the manager ~0.3s in — inside the freeze → etcd-commit
 #      window. The PS-side FREEZE_TTL (30s) is the designed backstop;
 #      after the manager respawns the cluster must serve again with the
 #      merge either fully committed or fully rolled back.
-# E6's merge ops (F269) can shrink the partition count below the
+# E6's merge ops can shrink the partition count below the
 # original 4 — adapt: need >= 2; the a-* keys live in the upper-middle
 # band, approximated by the 2/3 index in id (= key) order.
 mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part  *\([0-9]*\)  *ps .*/\1/p' | sort -n)

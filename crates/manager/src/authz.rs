@@ -1,4 +1,4 @@
-//! F-AUTHZ-1: manager-side KDC key material + credential helpers.
+//! manager-side KDC key material + credential helpers.
 //!
 //! This is CONFIG loading (not wire). The token codec + claims layout live in
 //! `autumn_rpc::cap_token` (the shared signer/verifier source of truth). Here

@@ -1,9 +1,9 @@
-/// F021: Multi-disk support for extent nodes.
+/// Multi-disk support for extent nodes.
 ///
 /// Tests:
-///   f021_multi_disk_alloc        — two disks, extents distributed across them
-///   f021_multi_disk_load_extents — pre-populate hash subdirs, verify all loaded on restart
-///   f021_disk_offline_skip       — first disk offline → alloc goes to second
+///   multi_disk_alloc        — two disks, extents distributed across them
+///   multi_disk_load_extents — pre-populate hash subdirs, verify all loaded on restart
+///   disk_offline_skip       — first disk offline → alloc goes to second
 mod test_helpers;
 
 use test_helpers::{pick_addr, start_node_multi, TestConn};
@@ -16,7 +16,7 @@ fn format_disk(dir: &std::path::Path, disk_id: u64) {
 
 /// Alloc several extents on a two-disk node, then verify both disks received files.
 #[compio::test]
-async fn f021_multi_disk_alloc() {
+async fn multi_disk_alloc() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
     format_disk(d1.path(), 10);
@@ -52,7 +52,7 @@ async fn f021_multi_disk_alloc() {
 /// Pre-populate two disk dirs with extent files in hash subdirs, then start a node
 /// and verify all extents are discovered by load_extents.
 #[compio::test]
-async fn f021_multi_disk_load_extents() {
+async fn multi_disk_load_extents() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
     format_disk(d1.path(), 10);
@@ -75,7 +75,7 @@ async fn f021_multi_disk_load_extents() {
     start_node_multi(vec![d1.path().to_path_buf(), d2.path().to_path_buf()], addr).await;
     let conn = TestConn::new(addr);
 
-    // F210-H3 Tier 2: probe_extent — verifying multi-disk load, not fence.
+    // Tier 2: probe_extent — verifying multi-disk load, not fence.
     let r100 = conn.probe_extent(100).await;
     assert_eq!(r100.length, 5, "extent 100 should have 5 bytes");
 
@@ -85,7 +85,7 @@ async fn f021_multi_disk_load_extents() {
 
 /// When the node has two disks, verify the df() response reports per-disk stats.
 #[compio::test]
-async fn f021_df_reports_per_disk_stats() {
+async fn df_reports_per_disk_stats() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
     format_disk(d1.path(), 10);

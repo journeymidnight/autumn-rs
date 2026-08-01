@@ -57,7 +57,7 @@ Semantics / invariants:
 
 ## Public API — data operations
 
-**`ValueBuf` (F-VALUEBUF) is the data-plane buffer currency**: a RegPool-backed slab
+**`ValueBuf` is the data-plane buffer currency**: a RegPool-backed slab
 with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation
 → rcache/memh zero-copy; TCP runtime: plain recycler, no per-op alloc/zero). Write side:
 `alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `freeze() → Bytes` →

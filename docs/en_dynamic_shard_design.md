@@ -38,7 +38,7 @@ Three decisions are LOCKED by the user and this design builds around them
 ### 1.1 The routing source is format-stamped, not runtime-reported
 
 - The EN binary sizes itself at boot: `shard_count = cpuset_len`
-  (`crates/server/src/bin/extent_node.rs:498-499`, F196 removed `--shards`),
+  (`crates/server/src/bin/extent_node.rs:498-499`, no `--shards` flag),
   and derives per-shard listeners `port + i*stride` / control
   `port+1000 + i*stride` (`extent_node.rs:513-523`, stride default 10).
 - But the *manager's* routing source is `MgrNodeInfo.shard_ports`
@@ -88,7 +88,7 @@ existing node **by address** (`rpc_handlers.rs:912-923`
   `--shard-ports` (`deploy/docker/entrypoint.sh:149-172`,
   `docs/k8s_deploy.md:170-200`). `deploy/baremetal/autumn-deploy:100` outright
   refuses multi-shard for the same reason.
-- The F211-C zombie/decommission defense is also address-keyed
+- The zombie/decommission defense is also address-keyed
   (`rpc_handlers.rs:874-906`) — under pod IP reuse this is both too strict
   (a fresh node inheriting a decommissioned pod IP is refused) and too weak
   (a decommissioned node returning on a new IP registers as a phantom).
@@ -125,13 +125,13 @@ Mirror of the PS pattern: PS identity is `ps_id` supplied via `--psid`,
 location self-registered at runtime via `MSG_REGISTER_PS`
 (`crates/partition-server/src/lib.rs:3069`) + per-partition
 `MSG_REGISTER_PARTITION_ADDR` on open, self-healed each `sync_regions_once`
-tick (`lib.rs:3761-3812`, F265). Conceptual ancestry: HDFS DataNode storageID
+tick (`lib.rs:3761-3812`). Conceptual ancestry: HDFS DataNode storageID
 (stable) + heartbeat-reported location; Ceph OSD uuid + monitor OSDMap; Kafka
 `broker.id` + dynamically registered listeners. The concrete mechanism we copy
 is autumn's own.
 
 - **`node_uuid`**: UUID v4, one per EN node, stored as a sentinel file
-  `node_uuid` in every data dir (alongside the existing F214 `cluster_id`,
+  `node_uuid` in every data dir (alongside the existing `cluster_id`,
   `disk_uuid`, `node_id`, `disk_id` sentinels written by `cmd_format`,
   `autumn_op/main.rs:1590-1600`).
   - Written by `format` for new dirs.
@@ -164,7 +164,7 @@ is autumn's own.
    (unchanged shape, `main.rs:1570-1600`).
 
 CLI surface: **remove `--shard-ports` and `--listen`/`--advertise` from
-`format`** with a migration error message (the established F196/F214-C
+`format`** with a migration error message (the established
 stub pattern — `extent_node.rs:151-166` and the `RegisterNode` pre-connect
 stub in `autumn_op`). The UCX control_address special case
 (`main.rs:1534-1544`: UCX registers empty control_address so df falls back to
@@ -172,7 +172,7 @@ the data addr) **moves to the EN binary** (§2.3), which knows its own
 transport anyway.
 
 Nice side effect: a formatted-but-never-booted node has no location → df
-can't reach it → it stays `Suspend` (F214-B) and is never selected for
+can't reach it → it stays `Suspend` and is never selected for
 allocation. Today a formatted node is immediately selectable at a stamped
 address that may not be listening yet.
 
@@ -223,8 +223,8 @@ in-struct on `MgrNodeInfo`):
    required; disjoint → refuse `CODE_PRECONDITION` ("cloned identity file?").
    Then update location — but ONLY when `req.addr` is non-empty (a real
    self-registration always ships addr + live ports + ctrl). `address`,
-   `shard_ports`, and `control_address` update together, etcd-first (F152) via
-   `mirror_register_node` under the F149 fence. A `shard_ports` change here **is
+   `shard_ports`, and `control_address` update together, etcd-first via
+   `mirror_register_node` under the leader fence. A `shard_ports` change here **is
    the reshard commit point** (§4 step R5).
 2. **legacy address match** (no uuid match; `req.addr` non-empty and matches a
    UUID-LESS node) → re-register branch + uuid ADOPTION: the matched node
@@ -243,7 +243,7 @@ in-struct on `MgrNodeInfo`):
 5. **create** (addr non-empty & free, or empty addr with a fresh uuid) →
    allocate a new node_id + disks; the uuid persists in the `nodes/<id>` record.
 
-**Zombie/decommission defense is uuid-keyed** (F211-C): BEFORE resolution, if
+**Zombie/decommission defense is uuid-keyed**: BEFORE resolution, if
 `req.node_uuid` is non-empty, scan the `decommissioned/` + Fenced
 `node_overrides` tombstones **by uuid** and refuse a match. This is
 load-bearing because `remove_node` deletes `nodes/<id>` — a matched-node_id
@@ -253,7 +253,7 @@ address. The matched-node_id Fenced check is kept for uuid-less legacy
 registrants (their node is still present). `clear-node-override` lifts BOTH the
 `node_override/` and `decommissioned/` keys so the refusal has a real remedy.
 The uuid key makes the tombstone travel with the node, not the IP — a strict
-improvement to the old address-keyed F211-C (which refused innocent recycled-IP
+improvement to the old address-keyed defense (which refused innocent recycled-IP
 tenants and missed a zombie on a fresh IP).
 
 Response: unchanged `RegisterNodeResp` (node_id + disk map).
@@ -467,9 +467,9 @@ reconciliation point and its background loops tolerate down nodes by design).
 
 ### R1 — quiesce writers: stop ALL PS processes
 `systemctl stop autumn-ps@*` per host / `kubectl scale sts autumn-ps
---replicas=0`. This stops appends, GC, flush, splits. F120-C graceful drain
+--replicas=0`. This stops appends, GC, flush, splits. The graceful drain
 flushes imm; anything un-flushed is in log_stream (the WAL) and replays on
-reopen — a process stop loses nothing (page cache survives kill; F178
+reopen — a process stop loses nothing (page cache survives kill; the
 coalescer + all-replica ack cover the rest).
 
 ### R2 — stop ALL ENs
@@ -490,12 +490,12 @@ Each EN: verifies sentinels, derives `shard_count = cpuset_len`, binds
 (uuid, advertise, new `shard_ports`, control_address) with the 30×1 s retry.
 Each shard's `load_extents` picks up exactly the extents it owns under the new
 modulo (`extent_node.rs:3643`); files are found by the hash layout; open fds
-are re-established (F-EN-FD-LRU bounds them).
+are re-established (the fd LRU bounds them).
 
 ### R5 — manager reconciles (automatic; the commit point)
 `handle_register_node` uuid-matches the node and updates
 `address/shard_ports/control_address` in **one leader-fenced etcd txn**,
-etcd-first (`rpc_handlers.rs:950-978` extended; F152/F149). From this txn on,
+etcd-first (`rpc_handlers.rs:950-978` extended). From this txn on,
 every `shard_addr_for_extent` call for this node computes `id % new_count`.
 There is no separate "reconcile step" to run — registration IS the
 reconciliation.
@@ -509,7 +509,7 @@ Optional: `autumn-op extent-health --all`.
 `systemctl start` / scale the sts back up. Each PS re-registers
 (`register_ps`), re-opens partitions (fresh `StreamClient`s, fresh
 nodes/extent caches → new routing), re-acquires per-partition owner epochs —
-bump-on-acquire (manager note 35 / F265) hands out epochs above anything
+bump-on-acquire (manager note 35) hands out epochs above anything
 pre-stop, so even a hypothetical stale writer is fenced at the ENs.
 
 ### R8 — post-checks
@@ -546,7 +546,7 @@ consistent.
 The manager's `shard_ports` for node X changes ONLY via X's own registration
 carrying the ports X actually derived-and-will-bind, applied etcd-first in one
 fenced txn. Timeline: X stops (old count) → manager still routes old ports →
-connection refused / df fails → callers retry (recovery backoff F233, GC
+connection refused / df fails → callers retry (recovery backoff, GC
 cooldown, PS append retry) — all existing down-node behavior. X registers (new
 count) → routing flips atomically with the txn. X crashes between register and
 serve → node down; healed on restart. **There is no reachable state where the
@@ -577,13 +577,13 @@ within the process.)
 `load_extents`, enforced on every append regardless of which shard owns the
 extent (stream note 23). A reshard changes *which shard* enforces it, not the
 value. PS restart re-acquires per-partition epochs above all prior values
-(F265 bump-on-acquire) → post-reshard writers dominate. Seal/commit semantics
-(all-replica ack, lenient seal, F227) are keyed by extent + node, not shard.
+(bump-on-acquire) → post-reshard writers dominate. Seal/commit semantics
+(all-replica ack, lenient seal) are keyed by extent + node, not shard.
 
 ### 5.5 Manager crash mid-reshard
 Registration idempotent; etcd replay restores committed state; the uuid index
 and node row are written in one fenced txn so identity can never tear. A
-deposed leader's registration txn loses the F149 fence and the EN's retry
+deposed leader's registration txn loses the leader fence and the EN's retry
 lands on the new leader.
 
 ### 5.6 EN restarted with an unexpected count (operator error)
@@ -729,7 +729,7 @@ or the operator, is the fix). A CAS-safe auto-heal (re-read + verify uuid +
 
 **M1c — DONE (format identity-only + required --advertise + launcher wiring).**
 - `autumn-op format <DIR>...` is IDENTITY-ONLY: `--listen`/`--advertise`/
-  `--shard-ports` are removed (hard migration-error stubs, F214-D/F196 pattern);
+  `--shard-ports` are removed (hard migration-error stubs);
   it registers with empty `addr`/`shard_ports`/`control_address` (§2.2 as
   designed). `derive_control_address` deleted (moved to the EN's
   `build_register_req` in M1a). `list-nodes` uuid + SHARDS columns (WIRE v21).

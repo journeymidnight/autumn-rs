@@ -155,7 +155,7 @@ first `K+M` nodes, `alloc_extent` on each (empty files), create `StreamInfo` +
 **Seal + alloc new tail** (`stream_alloc_extent`): validate owner epoch → seal the
 current tail → `alloc_ids(1)` → `alloc_extent` on preferred nodes with a per-RPC
 fallback walk over other registered nodes if one is dead → append to the stream →
-mirror. Sealing semantics: see the F227 note.
+mirror. Sealing semantics: see the lenient-seal note.
 
 **GC**: `stream_punch_holes` removes named extent ids from a stream and decrements
 extent `refs`; `truncate` removes all extents before a given id. Extents are
@@ -308,7 +308,7 @@ Deploying onto pre-ledger etcd state is unsupported (`cluster.sh reset`).
 does a per-disk health check first (offline `disk_id` → dispatch immediately), then
 probes `commit_length` (or `re_avali` for known-lagging replicas). On no-response /
 error, dispatch `require_recovery` to a healthy candidate. In-flight recoveries live
-in the F207 ledger so a double-dispatch is impossible across failover.
+in the unified inflight ledger so a double-dispatch is impossible across failover.
 
 **Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): a slot is
 rebuilt only when its node's override is `Fenced`; `auto_disk` reverts to the legacy

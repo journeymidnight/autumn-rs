@@ -135,7 +135,7 @@ pub enum FsRequest {
 // FsRequest is Send because all its fields are Send
 unsafe impl Send for FsRequest {}
 
-/// A single readdir entry. F-FS-UNIFY M1: the struct moved to the
+/// A single readdir entry. The struct lives in the
 /// fuser-free core (`schema::ReaddirEntry`, `kind` = `DT_*` byte);
 /// re-exported here so `bridge::ReaddirEntry` callers keep compiling.
 pub use crate::schema::ReaddirEntry;

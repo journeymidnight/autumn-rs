@@ -449,7 +449,7 @@ length `r_len` is `>= 64 KiB` answers with a descriptor `GetRedirectResp {
 extent_id, value_offset, value_len, eversion, replica_addrs }` instead of resolving
 the bytes through this PS; the client (`ClusterClient::get_direct`) reads the range
 straight from an EN (`read_extent_value_direct`, `MSG_READ_BYTES_BULK` zero-copy) and
-falls back to the proxy `get` on ANY failure. Sub-range support (`F-DIRECT-MANY`):
+falls back to the proxy `get` on ANY failure. Sub-range support:
 redirect fires for any VP sub-range with `r_len = (req.length==0 ? vp.len-r_off :
 min(req.length, vp.len-r_off)) >= 64 KiB`, returning `value_offset = vp.offset +
 req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
@@ -1387,8 +1387,8 @@ Three fixes bound the restart replay window (worst case per partition =
     around publish) re-opens a stale-snapshot race: a flush whose snapshot was captured
     earlier could be ack'd later than a compact's, persisting tables that compact already
     removed → on restart recovery resurrects compacted-away SSTs whose VPs may point at
-    GC-punched log_stream extents. Inline `// F148-A invariant` comments mark both call
-    sites; test `f148_publisher_invariant_tests` exercises two concurrent publishers.
+    GC-punched log_stream extents. Inline invariant comments mark both call
+    sites; test `publisher_invariant_tests` exercises two concurrent publishers.
 
 12. **Metrics export.** Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
     AtomicU64 counters are bumped by `partition_loop` (req_count on each

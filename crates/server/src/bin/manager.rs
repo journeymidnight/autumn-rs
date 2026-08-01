@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use autumn_manager::AutumnManager;
 use autumn_transport::TransportKind;
 
-// F193 allocator hygiene — see crates/server/src/bin/extent_node.rs for
+// allocator hygiene — see crates/server/src/bin/extent_node.rs for
 // the rationale and the MALLOC_CONF tuning explanation. Manager's peak
 // RSS during etcd replay can also benefit, though the dominant case is
 // the extent-node EC path.
@@ -13,7 +13,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // `_rjem_malloc_conf` (NOT `malloc_conf`): tikv-jemallocator 0.6 is `_rjem_`-
 // prefixed, so the old unprefixed symbol was a silent no-op. `oversize_threshold:0`
 // keeps large allocations in normal arenas (warm reuse) — see
-// crates/server/src/bin/extent_node.rs for the full F193/F216-E rationale.
+// crates/server/src/bin/extent_node.rs for the full rationale.
 // Override at runtime via `_RJEM_MALLOC_CONF` (cluster.sh / prod launcher).
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
@@ -25,16 +25,16 @@ struct Args {
     etcd: Vec<String>,
     bind_host: String,
     transport: TransportKind,
-    /// F187: enable fast-mode policy thresholds for load testing —
+    /// enable fast-mode policy thresholds for load testing —
     /// 1-bucket / 5 s tick / 1 MiB GC debt / 4 MiB compact pending /
     /// 30 s cooldowns. Production should never use this; the default
     /// is `false` (production thresholds = 1 GiB / 4 GiB / 5-bucket /
     /// 60 s tick / 5-min cooldown).
     policy_fast_mode: bool,
-    /// F195 (was F192 env): MSG_REPORT_DISK_FAILURE sliding window
+    /// (was env): MSG_REPORT_DISK_FAILURE sliding window
     /// length in seconds. `None` = library default (60 s).
     report_disk_failure_window_secs: Option<u64>,
-    /// F195 (was F192 env): MSG_REPORT_DISK_FAILURE distinct-reporter
+    /// (was env): MSG_REPORT_DISK_FAILURE distinct-reporter
     /// quorum threshold. `None` = library default (3).
     report_disk_failure_quorum: Option<usize>,
     /// Observability batch 1: Prometheus `/metrics` HTTP port.
@@ -48,24 +48,24 @@ struct Args {
     /// disk has less free are soft-avoided by extent allocation.
     /// `None` = library default (256 MiB); 0 = disabled.
     min_alloc_free_bytes: Option<u64>,
-    /// F211-I audit-log retention (days). `None` = default 90; 0 = off.
+    /// audit-log retention (days). `None` = default 90; 0 = off.
     audit_retention_days: Option<u64>,
-    /// F-AUTHZ-1: path to the Ed25519 signing-key file (KDC private material).
+    /// path to the Ed25519 signing-key file (KDC private material).
     /// `None` = data-plane authz DISABLED (opt-in). Format: one key per line,
     /// `<kid> <hex-32-byte-seed> [disabled]`. Generate via
     /// `autumn-op gen-signing-key`.
     auth_signing_key_file: Option<String>,
-    /// F-AUTHZ-1: admin token gating `tenant-create` / `tenant-delete`
+    /// admin token gating `tenant-create` / `tenant-delete`
     /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
     admin_token: Option<String>,
-    /// F-AUTHZ-1: protected (default-DENY) key prefixes, repeatable. `mem/` is
+    /// protected (default-DENY) key prefixes, repeatable. `mem/` is
     /// the default when authz is enabled and none is given.
     auth_protected_prefixes: Vec<String>,
-    /// F-AUTHZ-1: minted-token TTL in seconds. `None` = library default 3600.
+    /// minted-token TTL in seconds. `None` = library default 3600.
     auth_token_ttl_secs: Option<u64>,
-    /// F-AUTHZ-1: clock-skew leeway in seconds. `None` = library default 60.
+    /// clock-skew leeway in seconds. `None` = library default 60.
     auth_clock_skew_secs: Option<u64>,
-    /// F-DASH-IN-MGR: embedded web dashboard HTTP port. `None` = disabled
+    /// embedded web dashboard HTTP port. `None` = disabled
     /// (no listener). Deploy layer defaults this on (cluster.sh / entrypoint /
     /// autumn-deploy translate AUTUMN_DASHBOARD=1 → --dashboard-port 8799).
     dashboard_port: Option<u16>,
@@ -73,10 +73,10 @@ struct Args {
     /// cluster-wide by default, per the on-by-default rollout decision). Pin to
     /// 127.0.0.1 to keep the unauthenticated surface loopback-only.
     dashboard_listen: Option<String>,
-    /// F-DASH-IN-MGR: ARM cluster mutations — manual dashboard actions AND the
+    /// ARM cluster mutations — manual dashboard actions AND the
     /// auto-policy controller leaving DryRun. Default OFF = read-only viewer.
     dashboard_allow_mutations: bool,
-    /// F-AUTOPOLICY-BOOT-DEFAULT: seed this preset as the active policy (Armed)
+    /// seed this preset as the active policy (Armed)
     /// on a FRESH cluster. Deploy layer passes `balanced`; unset = controller
     /// stays Off (cluster.sh / tests). Armed is honored only with
     /// `--dashboard-allow-mutations`.
@@ -130,13 +130,13 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 });
             }
-            // F203: --auto-split / --auto-merge removed. Mechanism /
+            // --auto-split / --auto-merge removed. Mechanism /
             // policy separation puts dispatch decisions in an external
             // controller. Read `client policy` + call `client split` /
             // `client merge` to act.
             "--auto-split" | "--auto-merge" => {
                 eprintln!(
-                    "{}: removed in F203. Use `client policy` + `client {}` to drive policy externally.",
+                    "{}: removed. Use `client policy` + `client {}` to drive policy externally.",
                     raw[i],
                     if raw[i] == "--auto-split" { "split" } else { "merge" },
                 );
@@ -177,7 +177,7 @@ fn parse_args() -> Args {
                 audit_retention_days =
                     Some(raw[i].parse().expect("--audit-retention-days must be a number"));
             }
-            // ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ────────────
+            // ── manager-as-KDC (data-plane authz) ────────────
             "--auth-signing-key-file" => {
                 i += 1;
                 auth_signing_key_file = Some(raw[i].clone());
@@ -215,7 +215,7 @@ fn parse_args() -> Args {
                 auth_clock_skew_secs =
                     Some(raw[i].parse().expect("--auth-clock-skew-secs must be a number"));
             }
-            // ── F-DASH-IN-MGR: embedded web dashboard ───────────────────
+            // ── embedded web dashboard ───────────────────
             "--dashboard-port" => {
                 i += 1;
                 dashboard_port = Some(raw[i].parse().expect("--dashboard-port must be a port"));
@@ -287,11 +287,11 @@ async fn main() -> Result<()> {
             .context("connect to etcd")?
     };
 
-    // F203: in-kernel auto-dispatch deleted. The manager's policy_tick_loop
+    // in-kernel auto-dispatch deleted. The manager's policy_tick_loop
     // produces an advisory_cache via `MSG_GET_POLICY_CANDIDATES`; external
     // operators / controllers act on it.
-    // F195: F192 quorum debounce config — applied if either flag was
-    // set. The library defaults (60 s / 3) match pre-F195 env defaults.
+    // quorum debounce config — applied if either flag was
+    // set. The library defaults (60 s / 3) match the earlier env defaults.
     if args.report_disk_failure_window_secs.is_some() || args.report_disk_failure_quorum.is_some() {
         let window =
             std::time::Duration::from_secs(args.report_disk_failure_window_secs.unwrap_or(60));
@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
         tracing::info!(
             window_secs = window.as_secs(),
             quorum,
-            "F192 quorum debounce configured"
+            "quorum debounce configured"
         );
     }
 
@@ -314,7 +314,7 @@ async fn main() -> Result<()> {
     }
 
     // The ADMIN TOKEN gates CONTROL-plane admin RPCs (namespace-create,
-    // principal-create, the F-FS-GEOM-DECLARED merge/set-presplit ops, …) and is
+    // principal-create, the merge/set-presplit ops, …) and is
     // INDEPENDENT of data-plane authz. Apply it UNCONDITIONALLY: it used to live
     // only inside the signing-key branch below, so a manager launched with
     // `--admin-token-file` but no `--auth-signing-key-file` silently discarded
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
         manager.set_admin_token(tok.clone());
     }
 
-    // F-AUTHZ-1: data-plane authz (opt-in). Loading a signing-key file ENABLES
+    // data-plane authz (opt-in). Loading a signing-key file ENABLES
     // it; without the flag the manager is not a KDC and PSes don't enforce.
     if let Some(path) = &args.auth_signing_key_file {
         let text = std::fs::read_to_string(path)
@@ -358,14 +358,14 @@ async fn main() -> Result<()> {
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect::<Vec<_>>(),
             admin_token_set = args.admin_token.is_some(),
-            "F-AUTHZ-1: data-plane authz ENABLED (manager is a KDC)"
+            "data-plane authz ENABLED (manager is a KDC)"
         );
     } else if !args.auth_protected_prefixes.is_empty() {
         // --admin-token WITHOUT a signing key is now valid (control-plane admin,
         // applied above). Only protected-prefixes is meaningless without one —
         // it configures data-plane enforcement that isn't running.
         tracing::warn!(
-            "F-AUTHZ-1: --auth-protected-prefix given without --auth-signing-key-file; \
+            "--auth-protected-prefix given without --auth-signing-key-file; \
              data-plane authz stays DISABLED (no signing key)"
         );
     }
@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
         };
         manager.set_policy_config(cfg);
         tracing::warn!(
-            "F187: --policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
+            "--policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
         );
     }
 
@@ -424,15 +424,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // F-DASH-IN-MGR: embedded web dashboard + (M2+) auto-policy controller.
+    // embedded web dashboard + (M2+) auto-policy controller.
     // Spawns its own compio TcpListener task; must be started BEFORE the
     // blocking serve() below. Default bind follows --listen (on-by-default
     // rollout); mutations are OFF unless --dashboard-allow-mutations.
-    // F-DASH-IN-MGR M2: one flag gates BOTH the dashboard's manual actions AND
+    // M2: one flag gates BOTH the dashboard's manual actions AND
     // the auto-policy controller leaving DryRun. Set unconditionally — the
     // controller loop runs even without --dashboard-port.
     manager.set_dashboard_allow_mutations(args.dashboard_allow_mutations);
-    // F-AUTOPOLICY-BOOT-DEFAULT: seed the deploy-configured default active policy
+    // seed the deploy-configured default active policy
     // on a fresh cluster. Validate the preset name up front — a typo must fail
     // loud at startup, not silently leave the controller Off.
     if let Some(preset) = &args.auto_policy_default {
@@ -451,7 +451,7 @@ async fn main() -> Result<()> {
             );
         }
     }
-    // F-AUTOPOLICY-BOOT-DEFAULT: seed now — AFTER the flag is set. `new_with_etcd`
+    // seed now — AFTER the flag is set. `new_with_etcd`
     // already ran the first replay + election in the constructor (which recorded
     // whether a config was persisted), so this seeds a fresh cluster and no-ops
     // when a config already exists or no default was requested.

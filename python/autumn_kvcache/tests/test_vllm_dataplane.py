@@ -2,9 +2,9 @@
 
 Exercises the autumn-facing core the vLLM connector relies on — `_AutumnKVStore`
 (key format + per-layer zero-copy save/load + existence) — against an
-externally-running 1-node autumn cluster. This is the half of F250 that does
+externally-running 1-node autumn cluster. This is the half that does
 NOT need a model / vLLM runtime; the full e2e (cross-instance prefix hit) is
-F250-D in an isolated venv.
+run in an isolated venv.
 
 Setup before running:
     cd python && maturin develop --release         # builds the `autumn` module

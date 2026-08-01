@@ -1,4 +1,4 @@
-//! F064: System test — seal during active writes, client retry.
+//! System test — seal during active writes, client retry.
 //!
 //! Tests that when a stream's tail extent is sealed (via stream_alloc_extent),
 //! the StreamClient's cached tail becomes stale. After invalidating the cache,

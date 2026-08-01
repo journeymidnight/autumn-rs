@@ -1,4 +1,4 @@
-//! F216 — thread-local pool of UCX-registered buffers for zero-copy receive.
+//! thread-local pool of UCX-registered buffers for zero-copy receive.
 //!
 //! `ucp_mem_map` is expensive (tens of µs), so we register a buffer ONCE and
 //! reuse it across ops. Each `PooledBuf` owns a stable-address `Vec<u8>` plus a
@@ -338,7 +338,7 @@ impl AsRef<[u8]> for PooledBuf {
     }
 }
 
-// F216-E: make `PooledBuf` a first-class compio buffer so the EN read path can
+// make `PooledBuf` a first-class compio buffer so the EN read path can
 // `read_exact_at(pb, off)` straight into the registered, zeroed-once, pooled
 // slab — eliminating the per-op `vec![0u8; read_size]` (per-op malloc + an 8 MiB
 // memset that the pread immediately overwrites) and letting the UCX send find
@@ -386,7 +386,7 @@ impl compio::buf::IoBufMut for PooledBuf {
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         let Some(slab) = self.slab.take() else { return };
-        // F219: on **non-ucx** builds every slab is unregistered (there's no NIC
+        // on **non-ucx** builds every slab is unregistered (there's no NIC
         // to register against), so they MUST be re-pooled — otherwise TCP
         // recv-into-pooled (`read_value_into_pooled` / `drain_bulk_writes`) does a
         // fresh `vec![0u8; class]` (malloc + zero the whole slab) and free on
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(pb.len(), 8000, "set_len clamps to used");
     }
 
-    /// Cross-thread drop (F-VALUEBUF): a `PooledBuf` dropped on a FOREIGN
+    /// Cross-thread drop: a `PooledBuf` dropped on a FOREIGN
     /// thread is freed, never re-pooled into the foreign TLS pool (which
     /// would corrupt both threads' per-thread pinning accounts). Smoke: the
     /// foreign drop must not panic (TLS interplay) nor underflow the gauge;
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(p.len(), 1000);
     }
 
-    // F216-E: `read_exact_at` into a PooledBuf must read exactly `used` bytes,
+    // `read_exact_at` into a PooledBuf must read exactly `used` bytes,
     // NOT the full slab `class`. `used=5000` rounds to `class=8192`; a file of
     // 5000 bytes would EOF-error if the read targeted the whole 8192-slab.
     // Validates the IoBufMut impl (as_uninit exposes `used`) on the no-ucx

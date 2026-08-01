@@ -13,7 +13,7 @@ use super::block_cache::BlockCache;
 use super::bloom::BloomFilter;
 use super::format::{BlockOffset, DecodedBlock, MetaBlock};
 
-/// F261 — where this SSTable's data blocks live.
+/// where this SSTable's data blocks live.
 pub enum SstSource {
     /// Full SSTable bytes resident in memory (legacy mode; flush-fresh
     /// readers before conversion, tests, materialized iteration copies).
@@ -58,7 +58,7 @@ pub struct SstReader {
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
     /// Mutex (not RefCell) so SstReader is Sync and can be shared across
     /// P-log/P-sst via Arc without the unsafe Rc→Arc transmute that the
-    /// codebase carried pre-F092. In practice only P-log reads blocks; P-sst
+    /// codebase once carried. In practice only P-log reads blocks; P-sst
     /// only consumes freshly built SstReaders via oneshot move. Contention is
     /// near-zero; the two-phase locking in read_block allows idempotent
     /// concurrent misses.
@@ -95,7 +95,7 @@ impl SstReader {
         Self::parse(data, base, end)
     }
 
-    /// F261: construct a PAGED reader from just the MetaBlock bytes — the
+    /// construct a PAGED reader from just the MetaBlock bytes — the
     /// recovery path reads ONLY the meta tail off row_stream (two small
     /// reads) instead of materializing the whole SST (which kept recovery
     /// RSS at O(dataset): 9.4 GB of SSTs page-faulted ~25 GB transient).
@@ -227,7 +227,7 @@ impl SstReader {
             SstSource::Resident(d) => d,
             SstSource::Paged { .. } => {
                 return Err(anyhow!(
-                    "block {idx}: SST is paged (F261) — use read_block_via / materialize"
+                    "block {idx}: SST is paged — use read_block_via / materialize"
                 ));
             }
         };
@@ -249,7 +249,7 @@ impl SstReader {
         Ok(block)
     }
 
-    /// F261: convert a freshly parsed reader into PAGED mode — the resident
+    /// convert a freshly parsed reader into PAGED mode — the resident
     /// bytes are dropped (memory returned) and future block reads go through
     /// `read_block_via`. `base_in_extent` is where this SST starts inside
     /// `extent_id` on row_stream (`TableMeta.offset`), `len_in_extent` its
@@ -266,9 +266,9 @@ impl SstReader {
         self
     }
 
-    /// F261: block read that works for BOTH modes. Resident → the sync path;
+    /// block read that works for BOTH modes. Resident → the sync path;
     /// paged → bounded global cache, miss fetched from row_stream via `sc`
-    /// (rides the F258 replica rotation). The await happens with NO RefCell
+    /// (rides the replica rotation). The await happens with NO RefCell
     /// borrow held — callers snapshot `Arc<SstReader>`s first (note 15).
     pub async fn read_block_via(
         &self,
@@ -290,7 +290,7 @@ impl SstReader {
                 self.block_offsets.len()
             )
         })?;
-        // coco P2 (F261): checked arithmetic + SST-window bound. The resident
+        // coco P2: checked arithmetic + SST-window bound. The resident
         // path is protected by its `end > data.len()` check; the paged path
         // must equivalently refuse a corrupt/foreign MetaBlock whose block
         // offsets point outside `[base, base + len_in_extent)` — otherwise a
@@ -335,7 +335,7 @@ impl SstReader {
         Ok(block)
     }
 
-    /// F262: bulk-fetch the raw bytes of consecutive blocks starting at
+    /// bulk-fetch the raw bytes of consecutive blocks starting at
     /// `start_idx` — as many whole blocks as fit in `max_bytes` (always at
     /// least one) — in ONE read. For sequential scans (compaction / split
     /// key-scan): one RPC per window instead of per 64 KiB block, and it
@@ -362,7 +362,7 @@ impl SstReader {
         let mut end_idx = start_idx + 1;
         while end_idx < n {
             let bo = &self.block_offsets[end_idx];
-            // coco P1 (F262): block offsets must be monotonically
+            // coco P1: block offsets must be monotonically
             // non-overlapping. A CRC-valid but semantically corrupt
             // MetaBlock with a REGRESSING offset would otherwise underflow
             // the budget check (masked by saturating_sub) and wrap
@@ -449,7 +449,7 @@ impl SstReader {
         }
     }
 
-    /// F262: decode block `idx` out of a window previously returned by
+    /// decode block `idx` out of a window previously returned by
     /// `read_blocks_window` (whose `win_start_rel` must be passed back).
     pub fn decode_block_from_window(
         &self,
@@ -500,12 +500,12 @@ impl SstReader {
 }
 
 // ---------------------------------------------------------------------------
-// F262 tests — window-span math + window block decode (Resident fixture;
+// tests — window-span math + window block decode (Resident fixture;
 // the paged RPC path is covered e2e)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod f262_window_tests {
+mod window_tests {
     use super::*;
     use crate::sstable::builder::SstBuilder;
 

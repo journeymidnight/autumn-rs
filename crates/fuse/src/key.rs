@@ -9,7 +9,7 @@
 //! | 0x03   | File extent   | [0x03][ino: u64 BE][logical_off: u64 BE]  |
 //! | 0x04   | FS superblock | [0x04][field bytes]                       |
 //!
-//! F247: data is stored as **variable-length extents** keyed by their logical
+//! data is stored as **variable-length extents** keyed by their logical
 //! byte offset (was fixed 256 KiB chunks keyed by chunk index). BigEndian
 //! `logical_off` keeps extents naturally sorted, so a range-scan of the
 //! `[0x03][ino]` prefix returns a file's extents in offset order.
@@ -65,7 +65,7 @@ pub fn parse_dirent_key(key: &[u8]) -> Option<(u64, &[u8])> {
     }
 }
 
-/// Encode file data extent key: `[0x03][ino BE][logical_off BE]` (F247).
+/// Encode file data extent key: `[0x03][ino BE][logical_off BE]`.
 ///
 /// `logical_off` is the byte offset in the file where this extent's data
 /// begins (NOT a chunk index). The extent's value length is variable (≤
@@ -98,7 +98,7 @@ pub fn parse_extent_key(key: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
-// ── F-FS-STRIPE: lane-striped extent keys ────────────────────────────────────
+// ── lane-striped extent keys ─────────────────────────────────────────────────
 // A large file's extents are spread across `lanes` partitions so a single file's
 // writes/reads parallelise beyond one partition/log_stream. The lane byte sits
 // HIGH (right after 0x03) so it dominates partition routing; lane boundaries
@@ -163,7 +163,7 @@ pub fn schema_version_key() -> Vec<u8> {
     super_key(b"schema_version")
 }
 
-/// F-FS-GEOM-DECLARED: the fs-wide DECLARED stripe geometry
+/// the fs-wide DECLARED stripe geometry
 /// (`[0x04]stripe_geom` → rkyv `StripeLayout`).
 ///
 /// Geometry is a policy value and this is its authoritative home. It used to
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn striped_extent_keys_round_trip_and_route_by_lane() {
-        // F-FS-STRIPE: 4 lanes, unit = 8 MiB → extent e lands on lane e%4.
+        // 4 lanes, unit = 8 MiB → extent e lands on lane e%4.
         let (lanes, unit) = (4u8, 8 * 1024 * 1024u32);
         for e in 0..12u64 {
             let off = e * unit as u64;

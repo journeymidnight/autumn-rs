@@ -3,7 +3,7 @@ mod test_helpers;
 use autumn_stream::extent_rpc::{CODE_OK, CODE_PRECONDITION};
 use test_helpers::{pick_addr, start_node, TestConn};
 
-/// F123: The batch append path must reject truncation on a sealed extent.
+/// The batch append path must reject truncation on a sealed extent.
 ///
 /// Scenario: write data, simulate seal by sending a higher-eversion append
 /// (which triggers manager refresh → seal applied), then attempt an append
@@ -43,8 +43,9 @@ async fn batch_path_rejects_append_to_sealed_extent() {
     assert_eq!(w2.end, 10);
 
     // Now try to append with commit=3 (lower than current length=10).
-    // Without F123, on a non-sealed extent, this would truncate to 3 and
-    // succeed. With F123, if the manager says it's sealed, it would reject.
+    // Without the sealed-truncation guard, on a non-sealed extent, this would
+    // truncate to 3 and succeed. With the guard, if the manager says it's
+    // sealed, it would reject.
     // Without a manager, the truncation proceeds (correct for non-sealed).
     let w3 = conn.append(5001, 1, 3, 1, b"x".to_vec()).await;
     assert_eq!(
@@ -57,7 +58,7 @@ async fn batch_path_rejects_append_to_sealed_extent() {
     assert_eq!(w3.end, 4);
 }
 
-/// F123: An append with eversion < local eversion must be rejected
+/// An append with eversion < local eversion must be rejected
 /// through the batch path (step 2 sealed/eversion check).
 #[compio::test]
 async fn batch_path_rejects_stale_eversion() {

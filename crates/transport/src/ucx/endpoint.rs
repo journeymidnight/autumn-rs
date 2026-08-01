@@ -425,7 +425,7 @@ impl compio::io::AsyncRead for UcxReadHalf {
 }
 
 impl UcxReadHalf {
-    /// F216 zero-copy recv: `ucp_stream_recv_nbx` into `buf` with the
+    /// zero-copy recv: `ucp_stream_recv_nbx` into `buf` with the
     /// registered region's `memh` passed via `UCP_OP_ATTR_FIELD_MEMH`, so UCX
     /// can RDMA directly into it (zero-copy) instead of the default copy-out
     /// (bounce buffer → memcpy). Single recv — may return < buf.len(); the

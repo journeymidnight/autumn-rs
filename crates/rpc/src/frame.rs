@@ -1,6 +1,6 @@
 //! Wire protocol framing for autumn-rpc.
 //!
-//! ONE frame shape (F-WIRE-CRC-UNIFY, wire v28) — no flag-dependent variants:
+//! ONE frame shape (wire v28) — no flag-dependent variants:
 //!
 //! ```text
 //! ┌───────────┬──────────┬───────┬──────────────┐

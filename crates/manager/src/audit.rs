@@ -1,4 +1,4 @@
-//! F211-I: operator-action audit log.
+//! operator-action audit log.
 //!
 //! Append-only etcd records keyed `mgr_audit_log/<ts_ns>_<op_id>`. Each
 //! entry captures `(op, node_id?, extent_id?, by, reason, result_code,
@@ -7,7 +7,7 @@
 //! path) so we have a complete operator history even when leader
 //! changes hands.
 //!
-//! The append goes through `txn_fenced` (F149) so a deposed leader's
+//! The append goes through `txn_fenced` so a deposed leader's
 //! audit write fails along with everything else. GC runs every hour
 //! and deletes records older than `AUTUMN_MGR_AUDIT_RETENTION_DAYS`
 //! (default 90).
@@ -51,7 +51,7 @@ impl AutumnManager {
                     node_id = entry.node_id,
                     extent_id = entry.extent_id,
                     error = %e,
-                    "F211-I: failed to persist audit entry (continuing anyway)"
+                    "failed to persist audit entry (continuing anyway)"
                 );
             }
         }
@@ -79,7 +79,7 @@ impl AutumnManager {
             match c.get_prefix(AUDIT_PREFIX).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, "F211-I: audit prefix read failed");
+                    tracing::warn!(error = %e, "audit prefix read failed");
                     return Vec::new();
                 }
             }
@@ -89,7 +89,7 @@ impl AutumnManager {
             let entry: MgrAuditEntry = match rkyv_decode(&kv.value) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(error = %e, "F211-I: skipping malformed audit entry");
+                    tracing::warn!(error = %e, "skipping malformed audit entry");
                     continue;
                 }
             };
@@ -123,7 +123,7 @@ impl AutumnManager {
     /// Driven by `audit_gc_loop` (daily, leader-only) — pre-wiring this
     /// helper was DEAD CODE and the audit log grew in etcd forever.
     pub(crate) async fn audit_retention_gc(&self) {
-        // F195 convention: config via CLI flag (--audit-retention-days),
+        // convention: config via CLI flag (--audit-retention-days),
         // not env (the original env read predates the no-env rule).
         let days = self.audit_retention_days.get();
         if days == 0 {

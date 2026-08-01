@@ -74,7 +74,7 @@ impl MemoryStore {
         tenant: impl Into<String>,
         agent: impl Into<String>,
     ) -> Result<Self, AutumnError> {
-        // F-NS-PRINCIPAL-UNIFIED (Prepend-only): bind the client to the scope
+        // (Prepend-only): bind the client to the scope
         // `mem/{tenant}` — it PREPENDS `mem/{tenant}/` to every key, so `keys.rs`
         // emits keys RELATIVE to that scope (starting at `{agent}/…`). NEVER make
         // keys.rs re-add the prefix or every op double-prefixes. `{tenant}` is an
@@ -87,7 +87,7 @@ impl MemoryStore {
         Ok(Self::with_client(Rc::new(client), tenant, agent))
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: connect a client bound to `credential` and build a
+    /// connect a client bound to `credential` and build a
     /// store for `(tenant, agent)`. Use against an authz-enabled cluster — the
     /// client AUTH_HELLOs each PS connection with a short-TTL token (auto-minted +
     /// renewed) scoped to `mem/{tenant}/`. `principal` is the credential owner
@@ -766,7 +766,7 @@ pub struct ReconcileReport {
     /// reverse pointers (`ivf_meta/vptr/*`) counted by a full scan.
     pub vptrs: u64,
     /// IVF postings whose `vec_id` has NO reverse pointer — unreapable orphans
-    /// (the `index_vector` double-fault residual, F-MEM-4). Should be 0.
+    /// (the `index_vector` double-fault residual). Should be 0.
     pub orphan_ivf: u64,
     /// extra IVF postings beyond one per `vec_id` — e.g. a `train_centroids`
     /// crash that wrote the new-bucket posting but didn't delete the old one.

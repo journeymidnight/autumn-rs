@@ -1,10 +1,10 @@
-"""F216-E kvcache data-path micro-bench (no sglang).
+"""kvcache data-path micro-bench (no sglang).
 
 Drives autumn.BatchClient over a contiguous pinned-style host pool (numpy),
 exactly the kvcache v1 hot path (per-page put_from / get_into into pinned
 pages), and reports write/read throughput.
 
-F216-E "ucx ⟹ zerocopy": there is no longer a `bulk` flag. The zero-copy data
+"ucx ⟹ zerocopy": there is no longer a `bulk` flag. The zero-copy data
 path (MSG_PUT_BULK write + MSG_GET_BULK read for large pages) is the DEFAULT on the
 UCX transport; the regular path runs on TCP. So the A/B is now done at the
 TRANSPORT level — run this once per transport (separate processes, since the
@@ -31,7 +31,7 @@ PAGE = int(os.environ.get("AUTUMN_BENCH_PAGE_KB", "256")) * 1024
 N_WORKERS = int(os.environ.get("AUTUMN_BENCH_WORKERS", "8"))
 CAP = int(os.environ.get("AUTUMN_BENCH_CAP", "8"))
 ROUNDS = int(os.environ.get("AUTUMN_BENCH_ROUNDS", "5"))
-# F-KEY-NS D7: every client must declare its (namespace, tenant) key scope. The
+# D7: every client must declare its (namespace, tenant) key scope. The
 # bench writes into its OWN `bench/` namespace so it never touches fs/kvc/mem.
 NAMESPACE = os.environ.get("AUTUMN_BENCH_NAMESPACE", "bench")
 TENANT = os.environ.get("AUTUMN_BENCH_TENANT", "perf")

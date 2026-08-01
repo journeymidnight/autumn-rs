@@ -320,7 +320,7 @@ def tenant_cfg_from_vllm(vllm_config: Any):
 def read_credential_pair(path: str) -> tuple[str, bytes]:
     """Read a principal credential file -> `(principal, RAW secret bytes)`.
 
-    F-NS-PRINCIPAL-UNIFIED: the credential file now carries the OWNER's name
+    The credential file now carries the OWNER's name
     alongside the secret, because Option 3 made the principal a required half of
     the SDK's authz identity (`principal=` + `credential=` are both-or-neither).
 

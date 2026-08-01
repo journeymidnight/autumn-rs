@@ -4,7 +4,7 @@ extern crate libc;
 use autumn_partition_server::PartitionServer;
 use autumn_transport::TransportKind;
 
-// F193 allocator hygiene + F216-E read-perf fix — see
+// allocator hygiene + read-perf fix — see
 // crates/server/src/bin/extent_node.rs for the full rationale.
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -17,9 +17,9 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // bearing setting: jemalloc 5.x's default oversize_threshold is 8 MiB, so 8 MiB
 // VP value reads landed in the dedicated oversize arena that PURGES pages on
 // free — every read then page-faulted cold pages (~2× slower; a TCP 8 MiB read
-// regression bisected to F193). Threshold 0 routes them through normal arenas
+// regression). Threshold 0 routes them through normal arenas
 // with warm dirty-page reuse (~3.1 GB/s vs ~1.6), while jemalloc's default
-// decay still returns idle pages (the RSS hygiene F193 wanted). RUNTIME-
+// decay still returns idle pages (the desired RSS hygiene). RUNTIME-
 // CONFIGURABLE: `_RJEM_MALLOC_CONF` (set by cluster.sh / the prod launcher,
 // like UCX_TLS) is read after this symbol and overrides/extends it per deploy.
 #[cfg(target_os = "linux")]
@@ -35,13 +35,13 @@ struct Args {
     bind_host: String,
     transport: TransportKind,
     cpu_start: usize,
-    /// F196: explicit list of cores this binary may pin to, taskset
+    /// explicit list of cores this binary may pin to, taskset
     /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
     /// `core_affinity::get_core_ids()` snapshot and disables
     /// `--cpu-start`. Mutually exclusive with `--cpu-start`.
     cpuset: Option<Vec<usize>>,
-    // F195: PS tunables previously env::var-gated, now CLI flags.
-    // `None` = library default. Defaults match pre-F195 env defaults.
+    // PS tunables previously env::var-gated, now CLI flags.
+    // `None` = library default. Defaults match the earlier env defaults.
     group_commit_cap: Option<usize>,
     ps_inflight_cap: Option<usize>,
     ps_sst_inflight_cap: Option<usize>,
@@ -67,11 +67,11 @@ struct Args {
     gc_cooldown_secs: Option<i64>,
     compact_cooldown_secs: Option<i64>,
     min_pipeline_batch: Option<usize>,
-    /// F258: hedge delay (ms) for replicated sealed-extent reads. None/0 = off.
+    /// hedge delay (ms) for replicated sealed-extent reads. None/0 = off.
     read_hedge_ms: Option<u64>,
-    /// F260: min append payload for chained replication. None = default 64K; 0 = off.
+    /// min append payload for chained replication. None = default 64K; 0 = off.
     append_chain_min_bytes: Option<u32>,
-    /// F261: bounded SST block cache capacity (bytes). None = 512 MiB.
+    /// bounded SST block cache capacity (bytes). None = 512 MiB.
     sst_block_cache_bytes: Option<usize>,
     gc_read_chunk_bytes: Option<u32>,
     gc_batch_records: Option<usize>,
@@ -96,7 +96,7 @@ struct Args {
     /// endpoint is unauthenticated — operators exposing the RPC plane
     /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
     metrics_listen: Option<String>,
-    // F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
+    // pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
     #[cfg(feature = "profiling")]
@@ -114,7 +114,7 @@ fn parse_args() -> Args {
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
-    // F195 tunables — None = library default.
+    // tunables — None = library default.
     let mut group_commit_cap: Option<usize> = None;
     let mut ps_inflight_cap: Option<usize> = None;
     let mut ps_sst_inflight_cap: Option<usize> = None;
@@ -198,18 +198,18 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 }));
             }
-            // F099-J: `--conn-threads` is a no-op. Pre-F099-J it sized the
+            // `--conn-threads` is a no-op. Earlier it sized the
             // compio Dispatcher worker pool that ran ps-conn tasks; after
-            // F099-J every ps-conn task runs on the owning partition's
+            // every ps-conn task runs on the owning partition's
             // P-log runtime and there is no worker pool. The flag is
             // accepted and ignored to preserve CLI compatibility with
             // existing deployment scripts.
             "--conn-threads" => {
                 i += 1;
                 let _ = args[i].clone();
-                tracing::warn!("--conn-threads is a no-op post F099-J; worker pool removed");
+                tracing::warn!("--conn-threads is a no-op; worker pool removed");
             }
-            // F195 PS tunables. Each flag mirrors the pre-F195 env var
+            // PS tunables. Each flag mirrors the earlier env var
             // of the same suffix (lowercased + kebab-cased).
             "--group-commit-cap" => {
                 i += 1;
@@ -267,7 +267,7 @@ fn parse_args() -> Args {
             }
             "--bg-rate-bytes-per-sec" => {
                 eprintln!(
-                    "error: --bg-rate-bytes-per-sec was removed in F196 D-r7. \
+                    "error: --bg-rate-bytes-per-sec was removed. \
                      Use --compact-rate-bytes-per-sec + --gc-rate-bytes-per-sec instead."
                 );
                 std::process::exit(2);
@@ -315,7 +315,7 @@ fn parse_args() -> Args {
                 compact_cooldown_secs = Some(args[i].parse().expect("--compact-cooldown-secs i64"));
             }
             "--min-pipeline-batch" => {
-                // F256: deprecated no-op. The launch gate this tuned is gone —
+                // deprecated no-op. The launch gate this tuned is gone —
                 // partition_loop natural-batches (launches whatever is pending
                 // whenever a pipeline slot is free). Parsed for back-compat so
                 // existing cluster.sh invocations don't break.
@@ -323,7 +323,7 @@ fn parse_args() -> Args {
                 min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
             }
             "--append-chain-min-bytes" => {
-                // F260: 0 disables chained replication (star fanout always).
+                // 0 disables chained replication (star fanout always).
                 i += 1;
                 append_chain_min_bytes =
                     Some(args[i].parse().expect("--append-chain-min-bytes u32"));
@@ -334,7 +334,7 @@ fn parse_args() -> Args {
                     Some(args[i].parse().expect("--sst-block-cache-bytes usize"));
             }
             "--read-hedge-ms" => {
-                // F258: hedge delay for replicated sealed-extent reads.
+                // hedge delay for replicated sealed-extent reads.
                 // 0 (default) = hedging off; replica rotation always on.
                 i += 1;
                 read_hedge_ms = Some(args[i].parse().expect("--read-hedge-ms u64"));
@@ -400,13 +400,13 @@ fn parse_args() -> Args {
                 eprintln!("Options:");
                 eprintln!("  --psid <ID>          Partition server ID (required, non-zero)");
                 eprintln!("  --port <PORT>        First partition's listener port [default: 9201]");
-                eprintln!("                       (F099-K: subsequent partitions bind PORT+1, PORT+2, ...)");
+                eprintln!("                       (subsequent partitions bind PORT+1, PORT+2, ...)");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
                 eprintln!("  --listen <HOST>      Bind host (IPv4 or bare/bracketed IPv6) [default: 0.0.0.0]");
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
-                eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
+                eprintln!("                       (the `host:port` base — port comes from --port)");
                 eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
-                eprintln!("  --read-hedge-ms <MS> F258: hedge delay for replicated sealed-extent");
+                eprintln!("  --read-hedge-ms <MS> hedge delay for replicated sealed-extent");
                 eprintln!("                       reads; 0/default = hedging off (replica");
                 eprintln!("                       rotation is always on)");
                 eprintln!("  --max-extent-size-bytes <N>  Per-extent seal threshold");
@@ -420,15 +420,15 @@ fn parse_args() -> Args {
                     "                       so PS partitions don't share cores with extent-nodes."
                 );
                 eprintln!(
-                    "                       (F196: prefer --cpuset for explicit pre-allocation.)"
+                    "                       (prefer --cpuset for explicit pre-allocation.)"
                 );
-                eprintln!("  --cpuset <SPEC>      F196: explicit core list, taskset syntax");
+                eprintln!("  --cpuset <SPEC>      explicit core list, taskset syntax");
                 eprintln!("                       (e.g. 4-11, 0,2,4, 0-3,8-11). Overrides the");
                 eprintln!(
                     "                       auto-detected core list and disables --cpu-start."
                 );
                 eprintln!("                       PS uses cpuset_len/2 as max partition budget.");
-                eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
+                eprintln!("  --conn-threads <N>   [DEPRECATED] accepted but ignored");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg: {other}"),
@@ -441,7 +441,7 @@ fn parse_args() -> Args {
         std::process::exit(1);
     }
 
-    // F196: --cpuset and --cpu-start are mutually exclusive at the CLI
+    // --cpuset and --cpu-start are mutually exclusive at the CLI
     // layer. cpuset is the final list; offset has no meaning on top of
     // an explicit list.
     if cpuset.is_some() && cpu_start != 0 {
@@ -500,7 +500,7 @@ fn parse_args() -> Args {
     }
 }
 
-/// F195: apply CLI-derived tunables BEFORE the first PartitionServer
+/// apply CLI-derived tunables BEFORE the first PartitionServer
 /// construction. Each setter is first-call-wins, so calling here
 /// guarantees the binary's values land before any library reader fires.
 fn apply_ps_tunables(args: &Args) {
@@ -589,7 +589,7 @@ fn apply_ps_tunables(args: &Args) {
     if let Some(n) = args.min_pipeline_batch {
         eprintln!(
             "warning: --min-pipeline-batch {n} is deprecated and ignored \
-             (F256: partition_loop natural batching removed the launch gate)"
+             (partition_loop natural batching removed the launch gate)"
         );
     }
     if let Some(n) = args.gc_read_chunk_bytes {
@@ -615,7 +615,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // F195: F164 env-dump removed — production rs code no longer reads
+    // env-dump removed — production rs code no longer reads
     // AUTUMN_* env vars, so dumping them at startup was misleading. The
     // remaining AUTUMN_* in the operator's shell (e.g. for cluster.sh's
     // own use) are no longer the source of truth for binary config.
@@ -636,7 +636,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ---- F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
+    // ---- pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
     #[cfg(feature = "profiling")]
     {
         if let Some(secs) = args.pprof_secs {
@@ -675,11 +675,11 @@ async fn main() -> Result<()> {
     }
     // ---- end pprof hook ----
 
-    // F195: apply PS-library tunables before any library reader fires.
+    // apply PS-library tunables before any library reader fires.
     apply_ps_tunables(&args);
 
     let _ = autumn_transport::init_with(args.transport);
-    // F196: --cpuset (if given) is installed BEFORE any cpu_pin reader
+    // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Otherwise
     // fall back to the legacy --cpu-start offset.
     if let Some(cs) = args.cpuset.clone() {
@@ -698,7 +698,7 @@ async fn main() -> Result<()> {
             rl.rlim_cur = rl.rlim_max.min(65535);
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         }
-        // F216-E: RDMA (UCX rc_mlx5) registers every send/recv buffer with the
+        // RDMA (UCX rc_mlx5) registers every send/recv buffer with the
         // NIC via ibv_reg_mr, pinning pages against RLIMIT_MEMLOCK. The default
         // soft limit (often 8 MiB) is far too small for large values — a single
         // 8 MiB value send exceeds it and ibv_reg_mr FAULTS inside libibverbs
@@ -740,11 +740,11 @@ async fn main() -> Result<()> {
         advertise,
     );
     tracing::info!(
-        "F099-K: per-partition listener — partition N binds port={}+N-1",
+        "per-partition listener — partition N binds port={}+N-1",
         args.port,
     );
 
-    // F099-K fix: use `_and_port` so `base_port` is set BEFORE `finish_connect`'s
+    // fix: use `_and_port` so `base_port` is set BEFORE `finish_connect`'s
     // implicit `sync_regions_once()` runs `open_partition`. On restart, partitions
     // already exist in the manager — without this, `open_partition` reads
     // `base_port = 0` and binds the first partition to port `0 + 1 = 1`.
@@ -757,7 +757,7 @@ async fn main() -> Result<()> {
     .await
     .context("connect partition server")?;
 
-    tracing::info!("autumn-ps ready (F099-K: per-partition listeners; first partition on {addr})");
+    tracing::info!("autumn-ps ready (per-partition listeners; first partition on {addr})");
 
     // Periodic regpool snapshot. Single per-process task on the PS main
     // compio runtime — `regpool_snapshot()` aggregates atomic counters
@@ -826,7 +826,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // F120-C — install a SIGTERM/SIGINT handler. The handler sets an
+    // install a SIGTERM/SIGINT handler. The handler sets an
     // atomic flag (only async-signal-safe ops allowed); a sidecar future
     // polls the flag every 100 ms and resolves once tripped, asking
     // `serve_until_shutdown` to drain partitions and exit gracefully.

@@ -1,4 +1,4 @@
-//! F247 — autumn-fuse variable-length extents (was fixed 256 KiB chunks).
+//! autumn-fuse variable-length extents (was fixed 256 KiB chunks).
 //!
 //! Exercises the REAL write + read paths against a live cluster (manager + 2 EN
 //! + PS): write a multi-extent file through `write::write` / `flush_inode` (so
@@ -66,7 +66,7 @@ async fn boot_cluster(
 
 #[test]
 #[ignore]
-fn f247_variable_length_extents() {
+fn variable_length_extents() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 

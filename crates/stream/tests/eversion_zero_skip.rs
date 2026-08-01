@@ -1,4 +1,4 @@
-//! F119-C regression: a stale-cached `eversion=0` must NOT silently bypass
+//! regression: a stale-cached `eversion=0` must NOT silently bypass
 //! the server-side eversion check on a sealed/EC-converted extent.
 //!
 //! Pre-fix: `handle_read_bytes` and the batched `build_read_future` both

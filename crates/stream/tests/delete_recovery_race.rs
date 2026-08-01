@@ -1,4 +1,4 @@
-//! F139 — delete_extent must be refused while recovery is in flight for the
+//! delete_extent must be refused while recovery is in flight for the
 //! same extent_id.
 //!
 //! Covers the extent-node side of the delete-vs-recovery race:
@@ -15,7 +15,7 @@ use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use test_helpers::{pick_addr, TestConn};
 
 #[compio::test]
-async fn f139_delete_extent_refused_during_recovery() {
+async fn delete_extent_refused_during_recovery() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let addr = pick_addr();
 
@@ -55,7 +55,7 @@ async fn f139_delete_extent_refused_during_recovery() {
     let resp = conn.delete_extent(extent_id).await;
     assert_eq!(
         resp.code, CODE_PRECONDITION,
-        "F139: delete must return CODE_PRECONDITION when recovery in flight; \
+        "delete must return CODE_PRECONDITION when recovery in flight; \
          got code={} msg={}",
         resp.code, resp.message
     );
@@ -65,7 +65,7 @@ async fn f139_delete_extent_refused_during_recovery() {
     let resp = conn.delete_extent(extent_id).await;
     assert_eq!(
         resp.code, CODE_OK,
-        "F139: delete must succeed after recovery_inflight cleared: {}",
+        "delete must succeed after recovery_inflight cleared: {}",
         resp.message
     );
 }

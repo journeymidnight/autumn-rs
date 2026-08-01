@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F-FS-UNIFY M4 — lease fencing + cross-client coherence for autumn.Fs.
+# M4 — lease fencing + cross-client coherence for autumn.Fs.
 #
 #   1. build the wheel (with Fs) into a throwaway venv,
 #   2. bring up an ISOLATED minimal cluster (memory-mode manager, 1 EN, 1 PS),

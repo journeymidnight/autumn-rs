@@ -161,7 +161,7 @@ async fn ps_flush(ps: &RpcClient, part_id: u64) {
 }
 
 /// Helper: trigger major compaction via the Maintenance RPC.
-/// Retries on "compaction busy" because the PS-local F188 maintenance
+/// Retries on "compaction busy" because the PS-local maintenance
 /// scheduler can hold the capacity-1 `compact_tx` channel during its
 /// auto-dispatch cycle; without retry, `try_send` silently fails and
 /// the explicit major-compact never runs.
@@ -254,7 +254,7 @@ async fn upsert_partition(
 
 /// Start a partition server on its own thread.
 ///
-/// F099-K: use `connect_with_advertise_and_port` so `base_port` is
+/// use `connect_with_advertise_and_port` so `base_port` is
 /// populated BEFORE the implicit `sync_regions_once()` inside
 /// `finish_connect()` fires. See
 /// `crates/manager/tests/support/mod.rs::start_partition_server` for
@@ -636,7 +636,7 @@ fn stream_append_and_read_blocks_flow() {
 }
 
 // ---------------------------------------------------------------------------
-// F030: three-stream model tests
+// three-stream model tests
 // ---------------------------------------------------------------------------
 
 /// Helper: spin up manager + 2 extent nodes.
@@ -693,7 +693,7 @@ async fn create_three_streams(mgr: &RpcClient) -> (u64, u64, u64) {
 }
 
 #[test]
-fn f030_flush_writes_sst_to_row_stream() {
+fn flush_writes_sst_to_row_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(101);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -744,7 +744,7 @@ fn f030_flush_writes_sst_to_row_stream() {
         );
         let raw = meta_bytes.unwrap();
         let locs = decode_last_table_locations(raw.as_slice());
-        // F099-D/F178: ps_flush plus the subsequent maintenance path
+        // ps_flush plus the subsequent maintenance path
         // can produce more than one SST per call. The invariant the
         // test originally encoded — "exactly one SST after one put +
         // one flush" — no longer holds; the spirit (flushing actually
@@ -758,7 +758,7 @@ fn f030_flush_writes_sst_to_row_stream() {
 }
 
 #[test]
-fn f030_recovery_from_meta_and_row_streams() {
+fn recovery_from_meta_and_row_streams() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(103);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -800,7 +800,7 @@ fn f030_recovery_from_meta_and_row_streams() {
 }
 
 #[test]
-fn f029_compaction_merges_small_tables() {
+fn compaction_merges_small_tables() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(105);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -889,11 +889,11 @@ fn f029_compaction_merges_small_tables() {
 }
 
 // ---------------------------------------------------------------------------
-// F031: value log separation tests
+// value log separation tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn f031_large_value_stored_in_log_stream() {
+fn large_value_stored_in_log_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(107);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -932,7 +932,7 @@ fn f031_large_value_stored_in_log_stream() {
 }
 
 #[test]
-fn f031_recovery_replays_log_stream() {
+fn recovery_replays_log_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(109);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -978,7 +978,7 @@ fn f031_recovery_replays_log_stream() {
 }
 
 #[test]
-fn f031_compaction_preserves_value_pointers() {
+fn compaction_preserves_value_pointers() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(111);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -1019,7 +1019,7 @@ fn f031_compaction_preserves_value_pointers() {
 }
 
 #[test]
-fn f033_gc_reclaims_log_stream_extents() {
+fn gc_reclaims_log_stream_extents() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(117);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -1070,11 +1070,11 @@ fn f033_gc_reclaims_log_stream_extents() {
 }
 
 // ---------------------------------------------------------------------------
-// F037: Partition split with overlap detection and major compaction
+// Partition split with overlap detection and major compaction
 // ---------------------------------------------------------------------------
 
 #[test]
-fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
+fn overlap_detected_after_split_and_cleared_by_compaction() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(119);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {

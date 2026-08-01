@@ -1,4 +1,4 @@
-//! Write path: write buffering + flush into variable-length extents (F247).
+//! Write path: write buffering + flush into variable-length extents.
 //!
 //! Mirrors the 3FS InodeWriteBuf pattern, but the flush unit is a variable-
 //! length extent (≤ `MAX_EXTENT` = 8 MiB) keyed by logical offset, not a fixed
@@ -30,7 +30,7 @@ use crate::state::FsState;
 pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
     // Reject a negative offset (symmetric with `read::prepare`). The kernel FUSE
     // path never sends one, but a direct core caller (the PyO3 `autumn.Fs`
-    // binding, F-FS-UNIFY M2) could — and `offset as u64` would wrap to a huge
+    // binding, M2) could — and `offset as u64` would wrap to a huge
     // logical offset, poisoning size/extent-key math on flush.
     if offset < 0 {
         return Err(anyhow::anyhow!("negative offset"));
@@ -41,14 +41,14 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
 
     ensure_inode_cached(state, ino).await?;
 
-    // F-FS-STRIPE (coco P1): fuse cannot yet MODIFY a striped file — writing here
+    // (coco P1): fuse cannot yet MODIFY a striped file — writing here
     // would emit LEGACY-layout `[0x03][ino][off]` extents into an inode whose data
     // lives under `[0x03][lane][ino][off]`, mixing layouts + corrupting the file.
     // fuse READS striped files fine; deferred fuse write-striping (B2) will lift
     // this. Until then, refuse (use autumnfs to (re)write large striped files).
     if state.inodes.get(&ino).and_then(|is| is.meta.stripe.as_ref()).is_some() {
         return Err(anyhow::anyhow!(
-            "fuse write to a striped file (ino {ino}) is not supported yet (F-FS-STRIPE); use autumnfs"
+            "fuse write to a striped file (ino {ino}) is not supported yet; use autumnfs"
         ));
     }
 
@@ -224,13 +224,13 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
 /// Truncate a file to the given size.
 pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
     ensure_inode_cached(state, ino).await?;
-    // F-FS-STRIPE (coco P1): fuse truncate of a striped file would run the legacy
+    // (coco P1): fuse truncate of a striped file would run the legacy
     // range-scan extent cleanup, which finds no `[0x03][lane]…` keys → leaks the
     // striped extents (and a grow would emit legacy-layout ones). Refuse until
     // fuse write-striping (B2); reads work. Use autumnfs to manage striped files.
     if state.inodes.get(&ino).and_then(|is| is.meta.stripe.as_ref()).is_some() {
         return Err(anyhow::anyhow!(
-            "fuse truncate of a striped file (ino {ino}) is not supported yet (F-FS-STRIPE); use autumnfs"
+            "fuse truncate of a striped file (ino {ino}) is not supported yet; use autumnfs"
         ));
     }
     flush_inode(state, ino).await?;
@@ -292,7 +292,7 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
 
     if new_size < old_size {
         // Cleanup AFTER the commit: delete extents past the new EOF +
-        // shorten the straddling one (F247 — variable-length extents
+        // shorten the straddling one (variable-length extents
         // keyed by logical offset). The truncate is already COMMITTED
         // (meta landed), so a cleanup error must NOT surface as failure
         // (coco P1: the caller would retry, hit the `new_size ==

@@ -1,20 +1,19 @@
-//! F207 Phase 0 — unified extent-level in-flight ledger.
+//! Phase 0 — unified extent-level in-flight ledger.
 //!
-//! Replaces (over the course of F207-B / F207-C / F207-D) the four scattered
+//! Replaces (across three migration phases) the four scattered
 //! inflight bookkeeping mechanisms:
 //!
-//! | Pre-F207 mechanism                                          | Persistence            |
+//! | Prior mechanism                                             | Persistence            |
 //! |-------------------------------------------------------------|------------------------|
-//! | `ec_conversion_inflight: HashSet<u64>` (F138)               | in-memory              |
-//! | `pending_ec_dispatch: HashMap<u64, MgrEcDispatchInflight>`  | etcd `ecConversionInflight/<id>` (F198) |
+//! | `ec_conversion_inflight: HashSet<u64>`                      | in-memory              |
+//! | `pending_ec_dispatch: HashMap<u64, MgrEcDispatchInflight>`  | etcd `ecConversionInflight/<id>` |
 //! | `recovery_tasks: HashMap<u64, MgrRecoveryTask>`             | etcd `recoveryTasks/<id>` |
-//! | `pending_extent_deletes: VecDeque<PendingDelete>` (F109)    | in-memory              |
+//! | `pending_extent_deletes: VecDeque<PendingDelete>`           | in-memory              |
 //!
 //! Phase 0 (this commit) adds the infrastructure types + acquire / release /
 //! probe API + `replay_from_etcd` arm. **No existing handler is migrated
 //! yet.** The new field is dormant; existing tests pass unchanged. Phase 1
-//! (F207-B) migrates EC convert, Phase 2 (F207-C) recovery + delete,
-//! Phase 3 (F207-D) cleanup.
+//! migrates EC convert, Phase 2 recovery + delete, Phase 3 cleanup.
 //!
 //! See `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for the
 //! full plan and PS-layer ↔ stream-layer interaction model.
@@ -30,7 +29,7 @@ use crate::AutumnManager;
 /// Etcd key prefix for the unified ledger. Note the snake_case spelling —
 /// the older `ecConversionInflight/` and `recoveryTasks/` prefixes use
 /// camelCase, but those will be drained one-cycle-after-deploy and removed
-/// in F207-D. The new prefix matches our other snake_case prefixes
+/// later. The new prefix matches our other snake_case prefixes
 /// (`partitionVpRefs/` is the camelCase outlier; consistency was already
 /// imperfect — pick whichever).
 pub const EXTENT_INFLIGHT_PREFIX: &str = "extent_inflight/";
@@ -97,10 +96,10 @@ pub struct MgrExtentInflightRecord {
     /// 1=ConvertToEc, 2=Recovery, 3=Delete.
     pub op_kind: u8,
     /// Unix epoch seconds when the marker was acquired. Used by future
-    /// stale-marker WARN sweep (F207-D).
+    /// stale-marker WARN sweep.
     pub started_at: i64,
     /// `instance_id` of the leader that acquired the marker. Parity with
-    /// F149's pattern; useful for diagnostics.
+    /// the leader-fence pattern; useful for diagnostics.
     pub leader_id: String,
     pub ec_payload: Option<MgrEcDispatchInflight>,
     pub recovery_payload: Option<MgrRecoveryTask>,
@@ -183,8 +182,8 @@ impl MgrExtentInflightRecord {
     }
 }
 
-// F207 Phase 0: API is wired but not yet called by any production handler.
-// Phase 1 (F207-B) migrates EC convert; Phase 2 (F207-C) migrates
+// Phase 0: API is wired but not yet called by any production handler.
+// Phase 1 migrates EC convert; Phase 2 migrates
 // recovery + delete. Until those land, the methods are exercised only by
 // the unit tests below.
 #[allow(dead_code)]
@@ -195,7 +194,7 @@ impl AutumnManager {
     }
 
     /// Atomically take exclusive in-flight on `extent_id`. CAS via etcd
-    /// `create_revision == 0` + F149 leader fence (`txn_fenced`).
+    /// `create_revision == 0` + leader fence (`txn_fenced`).
     ///
     /// Returns `Err(Precondition)` if any op is already in-flight (either
     /// the etcd CAS refused because the key exists, or the in-memory shadow
@@ -206,7 +205,7 @@ impl AutumnManager {
     /// useful for unit tests.
     ///
     /// **Phase 0 note:** this function is NOT yet called by any production
-    /// handler. It's added now so F207-B / F207-C only swap call sites.
+    /// handler. It's added now so later phases only swap call sites.
     pub async fn acquire_extent_inflight(
         &self,
         extent_id: u64,
@@ -256,10 +255,10 @@ impl AutumnManager {
             .and_then(|r| r.kind())
     }
 
-    /// F207-C helper for PS-layer handlers that iterate over many
+    /// helper for PS-layer handlers that iterate over many
     /// extent_ids and need to consult the ledger multiple times under a
     /// `store.inner.borrow_mut`. Snapshots the ConvertToEc-kind and
-    /// Recovery-kind sets in one ledger borrow. Replaces the pre-F207
+    /// Recovery-kind sets in one ledger borrow. Replaces the prior
     /// `(let ec_inflight = self.ec_conversion_inflight.borrow(); let
     /// recovery_inflight = self.recovery_tasks.borrow())` pair.
     pub(crate) fn inflight_snapshot_ec_recovery(
@@ -287,8 +286,8 @@ impl AutumnManager {
     /// Test-only convenience: simulate that `extent_id` is in flight with
     /// a ConvertToEc op. Replaces today's
     /// `m.ec_conversion_inflight.borrow_mut().insert(extent_id)` pattern in
-    /// F138 / mark_extent_available / split / etc. tests. Bypasses etcd
-    /// CAS and the F149 fence for direct in-memory state injection.
+    /// / mark_extent_available / split / etc. tests. Bypasses etcd
+    /// CAS and the leader fence for direct in-memory state injection.
     #[cfg(test)]
     pub(crate) fn _test_mark_ec_inflight(&self, extent_id: u64) {
         let payload = ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
@@ -311,7 +310,7 @@ impl AutumnManager {
         self.inflight.borrow_mut().remove(&extent_id);
     }
 
-    /// F207-C: test-only convenience for the Recovery op kind. Mirrors
+    /// test-only convenience for the Recovery op kind. Mirrors
     /// `_test_mark_ec_inflight` but inserts a Recovery payload.
     #[cfg(test)]
     pub(crate) fn _test_mark_recovery_inflight(&self, extent_id: u64, task: MgrRecoveryTask) {
@@ -320,7 +319,7 @@ impl AutumnManager {
         self.inflight.borrow_mut().insert(extent_id, record);
     }
 
-    /// F207-C: test-only convenience for the Delete op kind.
+    /// test-only convenience for the Delete op kind.
     #[cfg(test)]
     pub(crate) fn _test_mark_delete_inflight(&self, extent_id: u64, pending_addrs: Vec<String>) {
         let payload = ExtentOpPayload::Delete(PersistedPendingDelete {
@@ -331,14 +330,14 @@ impl AutumnManager {
         self.inflight.borrow_mut().insert(extent_id, record);
     }
 
-    /// F208: stale-marker sweep with auto-release.
+    /// stale-marker sweep with auto-release.
     ///
     /// Runs on the manager (only when leader). Every
     /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60s), iterates
     /// the in-memory ledger; for any marker whose `started_at` is older
     /// than `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600s =
     /// 10 min), atomically releases it: one `txn_fenced` deletes
-    /// `extent_inflight/<id>` from etcd under the F149 leader fence,
+    /// `extent_inflight/<id>` from etcd under the leader fence,
     /// then `commit_extent_inflight_release` drops the in-memory shadow.
     /// The release is the same primitive the apply paths
     /// (`apply_recovery_done` / `apply_ec_conversion_done` /
@@ -359,16 +358,16 @@ impl AutumnManager {
     ///   (NotFound is downgraded to Ok) — re-dispatch from a future
     ///   GC tick is safe.
     ///
-    /// **ConvertToEc is WARN-only (F209-C, supersedes F208's blanket
+    /// **ConvertToEc is WARN-only (supersedes the earlier blanket
     /// auto-release).** A released ConvertToEc marker opens a race with
     /// the original EN-side dispatch: a fresh `handle_force_ec_convert`
     /// can succeed in the gap and shuffle a *different* parity node
     /// assignment, then apply_ec_conversion_done writes the new layout
-    /// while the original EN-side `convert_to_ec` is still running. F153
-    /// serialises the two on the coordinator, but the manager state can
+    /// while the original EN-side `convert_to_ec` is still running. The
+    /// coordinator serialises the two, but the manager state can
     /// still record the second dispatch's `target_nodes` while the first
     /// dispatch's bytes are what hit disk. This is exactly the failure
-    /// mode F198's rich marker was added to prevent. The remediation for
+    /// mode the rich EC-dispatch marker was added to prevent. The remediation for
     /// a stuck ConvertToEc marker is operator intervention via Python
     /// ops (`etcdctl get extent_inflight/<id>` + inspect EN state +
     /// decide whether to manually delete the marker after confirming EN
@@ -380,12 +379,12 @@ impl AutumnManager {
     /// in-memory ledger from etcd from scratch. `started_at` is part
     /// of the rkyv'd `MgrExtentInflightRecord` payload, persisted
     /// since acquire time — so the stale-detection clock continues
-    /// across leader changes. F208 sweep on the new leader picks up
+    /// across leader changes. The sweep on the new leader picks up
     /// any markers that were already stale on the deposed leader.
     /// In-memory drift between manager state and etcd state ONLY
     /// arises from a human running `etcdctl del extent_inflight/<id>`
     /// directly; the supported remediation for that is to restart the
-    /// manager (or wait for next failover). F208 does NOT reconcile
+    /// manager (or wait for next failover). The sweep does NOT reconcile
     /// against etcd on each tick — the operator-error scenario is too
     /// rare to justify the per-tick prefix read.
     pub(crate) async fn extent_inflight_stale_sweep_loop(self) {
@@ -405,7 +404,7 @@ impl AutumnManager {
         }
     }
 
-    /// F208: stale threshold in seconds. Override with env
+    /// stale threshold in seconds. Override with env
     /// `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS`. Default 600
     /// (10 minutes) — generous for typical recovery / EC convert
     /// durations on local + LAN setups; bumped if you have
@@ -420,7 +419,7 @@ impl AutumnManager {
             .max(60)
     }
 
-    /// F-FENCE-DRAIN-2: RECOVERY markers get a SHORTER stale threshold than the
+    /// RECOVERY markers get a SHORTER stale threshold than the
     /// general (Delete) one. Override with `AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`,
     /// default 120s, clamped >= 30.
     ///
@@ -436,10 +435,10 @@ impl AutumnManager {
     /// (chaos: node never reached 0 shards within the test window). 120s is just
     /// past the EN's own 100s give-up, so a Recovery marker older than this
     /// definitely has no live EN task behind it; releasing it re-dispatches with
-    /// fresh state (recovery is idempotent + retries — F208 auto-release safety
-    /// argument, and the EN's F139 `recovery_inflight` refuses any genuine
+    /// fresh state (recovery is idempotent + retries — the auto-release safety
+    /// argument, and the EN's `recovery_inflight` refuses any genuine
     /// duplicate). Delete keeps the 600s general threshold (it has its own
-    /// F210-G2 retry queue); ConvertToEc stays WARN-only (F209-C).
+    /// retry queue); ConvertToEc stays WARN-only.
     fn recovery_stale_threshold_secs() -> i64 {
         std::env::var("AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS")
             .ok()
@@ -448,7 +447,7 @@ impl AutumnManager {
             .max(30)
     }
 
-    /// F208: sweep interval in seconds. Override with env
+    /// sweep interval in seconds. Override with env
     /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`. Default 60s.
     /// Clamped to >= 1.
     fn stale_sweep_interval_secs() -> i64 {
@@ -459,14 +458,14 @@ impl AutumnManager {
             .max(1)
     }
 
-    /// F208: one sweep iteration. Extracted from the loop so unit tests
+    /// one sweep iteration. Extracted from the loop so unit tests
     /// can drive it with controlled `now` + `threshold_secs` values.
     ///
-    /// F209-C: ConvertToEc markers are WARN-only and never auto-released —
+    /// ConvertToEc markers are WARN-only and never auto-released —
     /// see the loop's docstring for the safety argument. Only Recovery
     /// and Delete are auto-released here.
     pub(crate) async fn sweep_stale_inflight_once(&self, now: i64, threshold_secs: i64) -> usize {
-        // F-FENCE-DRAIN-2: Recovery markers release faster (see
+        // Recovery markers release faster (see
         // `recovery_stale_threshold_secs`). `.min(threshold_secs)` so a caller
         // (unit test) passing an even-shorter general threshold still wins —
         // recovery is never released LATER than the general threshold.
@@ -494,7 +493,7 @@ impl AutumnManager {
             .collect();
         let mut released = 0usize;
         for (eid, kind, age_secs) in stale {
-            // F209-C: ConvertToEc is WARN-only. Releasing the marker would
+            // ConvertToEc is WARN-only. Releasing the marker would
             // open a race with the original EN-side dispatch — a fresh
             // force-ec-convert could shuffle a different parity assignment
             // and apply_ec_conversion_done would write the new layout while
@@ -505,13 +504,13 @@ impl AutumnManager {
                     extent_id = eid,
                     age_secs,
                     threshold_secs,
-                    "F209-C: stale ConvertToEc inflight marker — NOT auto-released. \
+                    "stale ConvertToEc inflight marker — NOT auto-released. \
                      Operator must inspect EN state and decide manually. \
                      See crates/manager/CLAUDE.md note 21 for rationale."
                 );
                 continue;
             }
-            // Atomic etcd delete under F149 fence. On error, log and
+            // Atomic etcd delete under leader fence. On error, log and
             // skip — next tick will retry.
             if let Some(etcd) = &self.etcd {
                 if let Err(e) = etcd
@@ -523,7 +522,7 @@ impl AutumnManager {
                         op = ?kind,
                         age_secs,
                         error = %e,
-                        "F208: failed to auto-release stale inflight marker; \
+                        "failed to auto-release stale inflight marker; \
                          will retry next sweep tick"
                     );
                     continue;
@@ -541,7 +540,7 @@ impl AutumnManager {
                 op = ?kind,
                 age_secs,
                 threshold_secs,
-                "F208: auto-released stale inflight marker — no manager-side \
+                "auto-released stale inflight marker — no manager-side \
                  apply within threshold. EN-side task (if any) remains \
                  independent; idempotency on retry handles convergence."
             );
@@ -565,7 +564,7 @@ impl AutumnManager {
                     } else {
                         tracing::warn!(
                             extent_id,
-                            "F207: extent_inflight record has malformed op_kind / payload \
+                            "extent_inflight record has malformed op_kind / payload \
                              combination; skipping on replay"
                         );
                     }
@@ -574,7 +573,7 @@ impl AutumnManager {
                     tracing::warn!(
                         extent_id,
                         error = %e,
-                        "F207: failed to rkyv-decode extent_inflight value; skipping on replay"
+                        "failed to rkyv-decode extent_inflight value; skipping on replay"
                     );
                 }
             }
@@ -620,10 +619,10 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(f)
     }
 
-    /// F207 Phase 0: acquire on an empty extent succeeds; in-memory shadow
+    /// Phase 0: acquire on an empty extent succeeds; in-memory shadow
     /// reflects the op kind.
     #[test]
-    fn f207_acquire_extent_inflight_succeeds_when_empty() {
+    fn acquire_extent_inflight_succeeds_when_empty() {
         run(async {
             let m = AutumnManager::new();
             m.acquire_extent_inflight(42, ec_payload(42))
@@ -633,11 +632,11 @@ mod tests {
         })
     }
 
-    /// F207 Phase 0: second acquire on the same extent is refused with
-    /// Precondition. Replaces today's F126/F138/F139 ad-hoc checks once
+    /// Phase 0: second acquire on the same extent is refused with
+    /// Precondition. Replaces today's ad-hoc checks once
     /// the migration phases land.
     #[test]
-    fn f207_acquire_extent_inflight_rejects_duplicate() {
+    fn acquire_extent_inflight_rejects_duplicate() {
         run(async {
             let m = AutumnManager::new();
             m.acquire_extent_inflight(42, ec_payload(42))
@@ -653,9 +652,9 @@ mod tests {
         })
     }
 
-    /// F207 Phase 0: in-memory release clears the probe.
+    /// Phase 0: in-memory release clears the probe.
     #[test]
-    fn f207_commit_extent_inflight_release_clears_probe() {
+    fn commit_extent_inflight_release_clears_probe() {
         run(async {
             let m = AutumnManager::new();
             m.acquire_extent_inflight(42, ec_payload(42))
@@ -671,9 +670,9 @@ mod tests {
         })
     }
 
-    /// F207 Phase 0: rkyv round-trip on all three payload variants.
+    /// Phase 0: rkyv round-trip on all three payload variants.
     #[test]
-    fn f207_record_rkyv_round_trip_all_variants() {
+    fn record_rkyv_round_trip_all_variants() {
         for payload in [ec_payload(42), recovery_payload(43), delete_payload(44)] {
             let kind = payload.kind();
             let extent_id = match &payload {
@@ -693,10 +692,10 @@ mod tests {
         }
     }
 
-    /// F207 Phase 0: unpack rejects records whose `op_kind` and populated
+    /// Phase 0: unpack rejects records whose `op_kind` and populated
     /// payload field disagree. Replay drops these with a WARN.
     #[test]
-    fn f207_unpack_rejects_malformed_records() {
+    fn unpack_rejects_malformed_records() {
         // op_kind = ConvertToEc but no ec_payload populated.
         let bad = MgrExtentInflightRecord {
             extent_id: 42,
@@ -740,9 +739,9 @@ mod tests {
         assert!(bad.unpack().is_none(), "unknown op_kind must not unpack");
     }
 
-    /// F207 Phase 0: decode_extent_inflight_kvs filters malformed records.
+    /// Phase 0: decode_extent_inflight_kvs filters malformed records.
     #[test]
-    fn f207_decode_drops_malformed() {
+    fn decode_drops_malformed() {
         let good = MgrExtentInflightRecord::new(42, ec_payload(42), "leader-a".to_string());
         let good_bytes = rkyv_encode(&good).to_vec();
 
@@ -754,11 +753,11 @@ mod tests {
         assert_eq!(decoded[0].0, 42);
     }
 
-    /// F208 + F209-C: sweep auto-releases Recovery + Delete markers
+    /// sweep auto-releases Recovery + Delete markers
     /// older than the threshold; ConvertToEc is WARN-only and survives;
     /// fresh markers stay alone; cleans `delete_progress` for Delete.
     #[test]
-    fn f208_sweep_auto_releases_stale_markers() {
+    fn sweep_auto_releases_stale_markers() {
         run(async {
             let m = AutumnManager::new();
             // Three markers, one of each kind.
@@ -794,7 +793,7 @@ mod tests {
                 .as_secs() as i64
                 + 7200;
             let released = m.sweep_stale_inflight_once(now_future, 1).await;
-            // F209-C: only Recovery (20) + Delete (30) are auto-released.
+            // only Recovery (20) + Delete (30) are auto-released.
             // ConvertToEc (10) is WARN-only and survives.
             assert_eq!(
                 released, 2,
@@ -803,23 +802,23 @@ mod tests {
             assert_eq!(
                 m.extent_inflight_op(10),
                 Some(ExtentOpKind::ConvertToEc),
-                "F209-C: stale ConvertToEc marker must survive sweep"
+                "stale ConvertToEc marker must survive sweep"
             );
             assert_eq!(m.extent_inflight_op(20), None);
             assert_eq!(m.extent_inflight_op(30), None);
             // Delete progress entry also cleaned.
             assert!(
                 !m.delete_progress.borrow().contains_key(&30),
-                "F208: Delete release must also drop delete_progress entry"
+                "Delete release must also drop delete_progress entry"
             );
         })
     }
 
-    /// F209-C: stale ConvertToEc marker is WARN-only across multiple
+    /// stale ConvertToEc marker is WARN-only across multiple
     /// sweep ticks — never auto-released. Operator must manually
     /// remediate via Python ops tooling.
     #[test]
-    fn f209_c_sweep_excludes_convert_to_ec_from_auto_release() {
+    fn sweep_excludes_convert_to_ec_from_auto_release() {
         run(async {
             let m = AutumnManager::new();
             m.acquire_extent_inflight(77, ec_payload(77))
@@ -844,9 +843,9 @@ mod tests {
         })
     }
 
-    /// F208: sweep does NOT release markers younger than the threshold.
+    /// sweep does NOT release markers younger than the threshold.
     #[test]
-    fn f208_sweep_leaves_fresh_markers_alone() {
+    fn sweep_leaves_fresh_markers_alone() {
         run(async {
             let m = AutumnManager::new();
             m.acquire_extent_inflight(42, ec_payload(42))
@@ -869,9 +868,9 @@ mod tests {
         })
     }
 
-    /// F208: env var overrides clamp to safe minimums.
+    /// env var overrides clamp to safe minimums.
     #[test]
-    fn f208_env_var_clamping() {
+    fn env_var_clamping() {
         std::env::set_var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS", "5");
         std::env::set_var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS", "0");
         // Threshold floor is 60, sweep interval floor is 1.

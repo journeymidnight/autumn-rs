@@ -6,7 +6,7 @@
 #  1. FULL nemesis action set. vphead runs split,merge,compact,forcegc,gc,flush,kill.
 #     This adds the ones the scripts never exercised even though the harness has
 #     always supported them:
-#       fence      — MSG_FENCE_NODE / clear (owner_epoch + F-FENCE-DRAIN)
+#       fence      — MSG_FENCE_NODE / clear (owner_epoch + drain)
 #       killfence  — SIGKILL then fence the dead node (recovery dispatch path)
 #       ec         — MSG_UPDATE_STREAM_EC convert-under-load
 #       partition  — toxiproxy link disable (network partition)
@@ -14,11 +14,11 @@
 #
 #  2. Node DECOMMISSION (`AUTUMN_CHAOS_DECOMMISSION=1`). After the nemesis loop
 #     stops and the cluster heals, ONE extent-node is permanently removed the
-#     HDFS way: fence -> wait for F-FENCE-DRAIN + fenced_only recovery to
+#     HDFS way: fence -> wait for the drain + fenced_only recovery to
 #     relocate every extent off it -> MSG_REMOVE_NODE (refuses until fully
 #     drained, tombstones the address). The existing per-key / range / accounting
 #     verify then proves NO DATA LOSS with the node gone. This is the first chaos
-#     coverage of the MSG_REMOVE_NODE / F211 decommission primitive.
+#     coverage of the MSG_REMOVE_NODE decommission primitive.
 #
 # Non-reversible removal is a TERMINAL one-shot (see run_terminal_decommission),
 # NOT a per-cycle nemesis action — every nemesis action must be reversible.
@@ -34,7 +34,7 @@
 # │ sealed-empty short-circuit, 120 s recovery-marker release, NOT_LEADER retry)  │
 # │ but NONE resolve the hang — it needs focused recovery-runtime investigation.  │
 # │ CONTRAST: AUTUMN_CHAOS_DECOMMISSION_KILL=1 (stop the node first) drains fast. │
-# │ Tracked in feature_list.md F-CHAOS-DECOMMISSION (passes:false / OPEN).        │
+# │ Tracked in feature_list.md (passes:false / OPEN).                             │
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # Usage:
@@ -53,9 +53,9 @@ SEEDS="${DECOMMISSION_SEEDS:-1 42 2024}"
 export AUTUMN_CHAOS_ACTIONS="${AUTUMN_CHAOS_ACTIONS:-split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency}"
 export AUTUMN_CHAOS_DECOMMISSION="${AUTUMN_CHAOS_DECOMMISSION:-1}"
 # 1 = SIGKILL the fenced node before draining (stop-then-remove flow). Default 0
-# runs the live-node path (now drains via F-FENCE-DRAIN-2, see note above).
+# runs the live-node path (now drains, see note above).
 export AUTUMN_CHAOS_DECOMMISSION_KILL="${AUTUMN_CHAOS_DECOMMISSION_KILL:-0}"
-# F-FENCE-DRAIN-2: release a stuck Recovery marker fast so a live-fenced-node
+# release a stuck Recovery marker fast so a live-fenced-node
 # decommission re-dispatches + drains within the test window (product default is
 # 120 s; 60 s here just speeds up CI — the recovery-specific threshold picks the
 # min of this and AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS).

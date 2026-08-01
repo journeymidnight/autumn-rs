@@ -1,10 +1,10 @@
-//! F070: System test — PS crash, unflushed data recoverable from logStream.
+//! System test — PS crash, unflushed data recoverable from logStream.
 //!
 //! PS writes 50 KV pairs (all in memtable, no flush), then "crashes".
 //! A new PS opens the same partition, replays from logStream offset 0,
 //! and all 50 KV pairs are readable.
 //!
-//! F075: Sequential PS crash — data accumulates across multiple crashes.
+//! Sequential PS crash — data accumulates across multiple crashes.
 
 mod support;
 

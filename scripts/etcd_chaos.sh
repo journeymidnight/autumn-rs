@@ -11,7 +11,7 @@
 #   D2: 150 s outage (past the PS heartbeat exit budget) → NO PS may
 #       exit. A leaderless control plane cannot evict/reassign anyone, so
 #       serving through the outage is safe; a fleet suicide here is a
-#       self-inflicted total outage. (This caught exactly that: the F267
+#       self-inflicted total outage. (This caught exactly that: the
 #       NOT_LEADER budget shared the 90 s transport-failure budget.)
 #   D3: restart etcd (same data dir) → manager re-elects, replays, and
 #       control-plane ops (autumn-op info / partition ops) resume.
@@ -45,7 +45,7 @@ for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill
 sleep 2
 # Port drain: a prior (esp. ucx) cluster leaves 9001/PS ports in
 # TIME_WAIT for ~60s; the tcp manager exits on EADDRINUSE (only the ucx
-# listener retries, F264) — back-to-back harness phases need the wait.
+# listener retries) — back-to-back harness phases need the wait.
 say "draining cluster ports"
 for i in $(seq 1 40); do
     busy=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true

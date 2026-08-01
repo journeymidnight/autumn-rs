@@ -267,7 +267,7 @@ def test_full_key_layout_with_fingerprint():
     cfg = tenant_cfg_from_vllm(fake_vllm_config(FakeModelConfig(**QWEN_32B),
                                                 weights_path="models/qwen32b"))
     model = build_tenant_suffix(cfg, cfg.model_fingerprint)
-    # F-NS-PRINCIPAL-UNIFIED (Prepend-only): full_key is RELATIVE to the
+    # (Prepend-only): full_key is RELATIVE to the
     # client's `kvc` binding scope — the builder emits {model}/{pool}/{hash} and
     # the ClusterClient prepends `kvc/` (scope locked by construction). Option 3
     # dropped the tenant segment, so full_key no longer takes one.
@@ -461,7 +461,7 @@ def test_build_tenant_suffix_rejects_non_numeric_rank():
         build_tenant_suffix(_sg_cfg(tp_size="four"))
 
 
-# ── F-AUTHZ-BUILTIN: credential file must hex-DECODE to raw bytes ────────────
+# ── credential file must hex-DECODE to raw bytes ────────────
 # The SDK/manager contract is RAW credential bytes; `autumn-op tenant-create`
 # prints lowercase hex. Passing the ASCII hex through would mint with a wrong
 # credential → PermissionDenied once enforcement is on (coco P1 2026-07-17).
@@ -491,7 +491,7 @@ def test_credential_file_rejects_non_hex(tmp_path):
         read_credential_file(_write(tmp_path, "not-a-hex-string-zz"))
 
 
-# ── F-NS-PRINCIPAL-UNIFIED: the file now names its principal ────────────────
+# ── the file now names its principal ────────────────
 # Mirrors `autumn_client::parse_credential_text` — keep the two in lockstep.
 
 def test_credential_pair_labeled_form(tmp_path):

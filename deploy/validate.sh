@@ -7,7 +7,7 @@
 #   - StatefulSet/Job selector.matchLabels ⊆ template labels (k8s hard rule)
 #   - each StatefulSet.serviceName resolves to a headless Service
 #   - the EN StatefulSet advertises its pod IP (AUTUMN_ADVERTISE_IP ← status.podIP;
-#     F-EN-DYNSHARD M2 — no per-pod ClusterIP Services anymore)
+# M2 — no per-pod ClusterIP Services anymore)
 #   - Service ports line up with the entrypoint's role port defaults
 #   - kustomization.resources all exist; image name matches
 #
@@ -120,7 +120,7 @@ for kind, d in workloads:
         else:
             ok(f"{name}: serviceName '{svc_name}' is a headless Service")
 
-# F-EN-DYNSHARD M2: the EN advertises its OWN pod IP (Downward-API
+# M2: the EN advertises its OWN pod IP (Downward-API
 # status.podIP) and self-registers under a stable node_uuid — there are NO
 # per-pod ClusterIP Services anymore. Validate the pod-IP wiring instead:
 # the EN StatefulSet must inject AUTUMN_ADVERTISE_IP from status.podIP.
@@ -149,7 +149,7 @@ if en_ss:
     if fp == "status.podIP":
         ok("autumn-en advertises pod IP (AUTUMN_ADVERTISE_IP ← status.podIP)")
     else:
-        bad("autumn-en StatefulSet must set AUTUMN_ADVERTISE_IP from fieldRef status.podIP (F-EN-DYNSHARD M2)")
+        bad("autumn-en StatefulSet must set AUTUMN_ADVERTISE_IP from fieldRef status.podIP")
 
 # port defaults must match the entrypoint role ports
 def svc_ports(n):

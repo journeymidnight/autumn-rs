@@ -1,11 +1,11 @@
-//! F209-E: F207 invariant I3 — `apply_ec_conversion_done` bundles the
+//! Invariant I3 — `apply_ec_conversion_done` bundles the
 //! `extents/<id>` put and the `extent_inflight/<id>` delete into one
 //! etcd transaction. Either both effects land or neither does.
 //!
 //! Asserts:
 //! 1. Success path: after a successful apply, etcd has the new
 //!    `extents/<id>` AND no `extent_inflight/<id>`.
-//! 2. Failure path: with a deposed leader (F149 fence breaks), the
+//! 2. Failure path: with a deposed leader (leader fence breaks), the
 //!    txn is atomically rejected — etcd shows the original
 //!    `extent_inflight/<id>` still present AND no `extents/<id>` write.
 //!
@@ -57,7 +57,7 @@ fn make_dispatch_record(extent_id: u64) -> MgrEcDispatchInflight {
 
 #[test]
 #[ignore] // requires embedded etcd (go runtime)
-fn f209_e_apply_ec_conversion_done_atomic_success() {
+fn apply_ec_conversion_done_atomic_success() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
@@ -76,7 +76,7 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
             .insert(extent_id, make_pre_ec_extent(extent_id));
 
         // Acquire the ConvertToEc marker — this writes
-        // `extent_inflight/<id>` to etcd under the F149 fence.
+        // `extent_inflight/<id>` to etcd under the leader fence.
         m.acquire_extent_inflight(
             extent_id,
             ExtentOpPayload::ConvertToEc(make_dispatch_record(extent_id)),
@@ -97,7 +97,7 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
                 .kvs
                 .iter()
                 .any(|kv| kv.key == extent_inflight_key(extent_id).into_bytes()),
-            "F207: extent_inflight marker must be in etcd after acquire"
+            "extent_inflight marker must be in etcd after acquire"
         );
 
         // Apply the conversion — the atomic put-and-delete txn.
@@ -115,7 +115,7 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
                 .kvs
                 .iter()
                 .any(|kv| kv.key == extent_inflight_key(extent_id).into_bytes()),
-            "F207 I3: extent_inflight marker must be deleted by apply"
+            "I3: extent_inflight marker must be deleted by apply"
         );
 
         let post_extent = aux
@@ -127,14 +127,14 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
                 .kvs
                 .iter()
                 .any(|kv| kv.key == format!("extents/{}", extent_id).into_bytes()),
-            "F207 I3: extents/<id> must be written by apply"
+            "I3: extents/<id> must be written by apply"
         );
     });
 }
 
 #[test]
 #[ignore] // requires embedded etcd (go runtime)
-fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
+fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
@@ -157,13 +157,13 @@ fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
         .expect("acquire marker");
 
         // Externally depose M1 — overwrite the leader key with a different
-        // instance_id. F149 fence on the next etcd write txn (from M1)
+        // instance_id. Leader fence on the next etcd write txn (from M1)
         // will fail; the whole apply txn must atomically reject.
         let aux = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
             .await
             .expect("aux etcd client");
         let _ = aux.delete(LEADER_KEY.as_bytes()).await;
-        aux.put(LEADER_KEY.as_bytes(), b"f209e-impostor")
+        aux.put(LEADER_KEY.as_bytes(), b"impostor-leader")
             .await
             .expect("overwrite leader key");
 
@@ -174,7 +174,7 @@ fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
             .await;
         assert!(
             res.is_err(),
-            "F149 + F207 I3: apply must fail atomically under deposed leader; got {res:?}"
+            "I3: apply must fail atomically under deposed leader; got {res:?}"
         );
 
         // Marker still in etcd (delete didn't land).
@@ -187,7 +187,7 @@ fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
                 .kvs
                 .iter()
                 .any(|kv| kv.key == extent_inflight_key(extent_id).into_bytes()),
-            "F207 I3: marker must survive a fence-rejected apply (atomicity)"
+            "I3: marker must survive a fence-rejected apply (atomicity)"
         );
 
         // `extents/<id>` was never written (no pre-test put on this
@@ -201,7 +201,7 @@ fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
                 .kvs
                 .iter()
                 .any(|kv| kv.key == format!("extents/{}", extent_id).into_bytes()),
-            "F207 I3: extents/<id> must not be written when apply txn fence-fails"
+            "I3: extents/<id> must not be written when apply txn fence-fails"
         );
     });
 }

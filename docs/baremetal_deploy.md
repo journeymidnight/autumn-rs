@@ -107,7 +107,7 @@ skips bootstrap and preserves data, so `stop` + `start` is a safe restart.
 
 ## Authz (ON by default)
 
-`start` arms data-plane authz automatically (F-AUTHZ-BUILTIN): it generates a
+`start` arms data-plane authz automatically: it generates a
 signing key + admin token under `~/.autumn-deploy/authz/` (override with
 `AUTUMN_AUTHZ_DIR`) — **once, reused across re-deploys** so already-minted
 credentials keep working — distributes the key to every manager host, and after

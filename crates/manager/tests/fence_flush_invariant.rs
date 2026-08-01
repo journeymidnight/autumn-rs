@@ -1,4 +1,4 @@
-//! F250 — deterministic single-thread reproducer for the fence+flush data-loss bug.
+//! deterministic single-thread reproducer for the fence+flush data-loss bug.
 //!
 //! The chaos test (`system_chaos.rs`) reliably surfaces a mismatch under
 //! `AUTUMN_CHAOS_ACTIONS=fence,flush` with seed=3 (q000112 expected=4497
@@ -229,7 +229,7 @@ async fn nemesis_loop(
 
 #[test]
 #[ignore]
-fn f250_fence_flush_invariant() {
+fn fence_flush_invariant() {
     // ── Manager (in-process, memory-only) ──
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -387,7 +387,7 @@ fn f250_fence_flush_invariant() {
     });
 
     let n = mismatches.len();
-    // F250 diagnostic: trace where each failing key's MVCC entries live
+    // diagnostic: trace where each failing key's MVCC entries live
     // across memtable / imm / SSTs to localise the data-loss root cause.
     let trace_rt = compio::runtime::Runtime::new().unwrap();
     trace_rt.block_on(async {

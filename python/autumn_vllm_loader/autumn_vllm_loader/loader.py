@@ -27,7 +27,7 @@ so config.json + tokenizer still come from vLLM's `model=` path (the standard
   principal           — authz principal; defaults to the name in the
                         credential file, override only for cross-name setups
 
-F-NS-PRINCIPAL-UNIFIED (Option 3): there is no `tenant` key — weights live in
+Under Option 3 there is no `tenant` key — weights live in
 one global `fs/` tree and `autumn.Fs` scopes itself to it.
 """
 
@@ -58,7 +58,7 @@ _ST_DT = {
 def _read_credential_pair(path: str) -> tuple[str, bytes]:
     """Read a principal credential file -> `(principal, RAW secret bytes)`.
 
-    F-NS-PRINCIPAL-UNIFIED: the file names its own principal, because Option 3
+    The file names its own principal, because Option 3
     made `principal=` + `credential=` a both-or-neither pair on `Fs.connect`.
     Accepts the `principal:`/`credential:` labelled form (what `autumn-op
     principal-create` and cluster.sh write), two bare lines `<name>\\n<hex>`, or
@@ -153,12 +153,12 @@ class AutumnModelLoader(BaseModelLoader):
         self.direct_read = bool(cfg.get("direct_read", True))
         self.n_workers = int(cfg.get("n_workers", 4))
         self.prefetch = int(cfg.get("prefetch", 8))
-        # F-NS-PRINCIPAL-UNIFIED (Option 3): weights live under a GLOBAL `fs/`
+        # (Option 3): weights live under a GLOBAL `fs/`
         # tree — no tenant segment — so there is nothing to configure here; the
         # scope must simply match how they were uploaded (`autumnfs put`) and any
         # fuse mount serving them. `autumn.Fs` scopes itself to `fs/`.
         #
-        # F-AUTHZ-BUILTIN: read the credential up front so a bad path/format
+        # read the credential up front so a bad path/format
         # fails at startup, not as a PermissionDenied mid weight-load. The
         # credential file names its principal; `principal` in the config
         # overrides it. Both-or-neither is enforced by `Fs.connect`, so a
@@ -177,7 +177,7 @@ class AutumnModelLoader(BaseModelLoader):
         if "tenant" in cfg:
             raise ValueError(
                 "model_loader_extra_config: `tenant` is retired "
-                "(F-NS-PRINCIPAL-UNIFIED) — weights now live in one global `fs/` "
+                "— weights now live in one global `fs/` "
                 "tree with no tenant segment. Remove the key; the authz identity "
                 "comes from `credential_file` (which names its principal). NOTE "
                 "the key layout changed, so weights uploaded under the old "

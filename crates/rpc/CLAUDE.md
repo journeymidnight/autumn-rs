@@ -9,7 +9,7 @@ Replaces tonic/gRPC to drop HTTP/2 framing and protobuf overhead on the hot path
 `Frame`/`FrameDecoder`, `StatusCode`. Servers are hand-rolled per component on
 `autumn_transport::Conn` (EN, manager, PS), not in this crate.
 
-## Wire Format (v28 — F-WIRE-CRC-UNIFY)
+## Wire Format (v28 — unified CRC)
 
 ONE frame shape, no flag-dependent variants:
 
@@ -38,7 +38,7 @@ Header inclusion closes the pre-v28 holes: a flipped `req_id` delivering a
 valid-crc response to the WRONG caller, and a flipped `FLAG_CRC` bit silently
 disabling verification. The `value` tail is raw — its integrity is the
 transport's (UCX NIC ICRC / TCP kernel checksum) + the storage layer's (WAL
-record CRC, SST block CRC); F219 measured a per-value crc at ~20% of a core
+record CRC, SST block CRC); a per-value crc was measured at ~20% of a core
 @ 8 MiB. Per-msg_type ctrl/value split:
 
 - normal rkyv/binary RPCs + error envelopes: ctrl = whole body, no value.
@@ -189,7 +189,7 @@ at a specific address copy out of the returned `PooledBuf`
 **Write counterpart (`MSG_PUT_BULK = 0x51`)** uses `call_vectored_bulk`: ctrl =
 `[meta][key]` (CRC'd with the header), the value rides after the crc as its own
 iovec — zero-copy via rcache when registered, and NEVER crc-scanned by the
-sender (v28 completed F219: pre-v28 `call_vectored` paid a full crc32c pass
+sender (v28 removed the per-value crc: pre-v28 `call_vectored` paid a full crc32c pass
 over the value). Meta codec lives in `partition_rpc`: `encode_put_bulk_meta` /
 `parse_put_bulk_meta`, fixed prefix `PUT_BULK_HEADER_LEN = 44` then the key; the
 decoder hands the PS `frame.payload = [meta][key]` + `frame.value` (zero-copy

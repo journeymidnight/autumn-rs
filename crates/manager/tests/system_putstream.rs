@@ -1,10 +1,10 @@
-//! F186 — End-to-end tests for client-side striped put/get (replaces F129
+//! End-to-end tests for client-side striped put/get (replaces the
 //! server-side multipart upload + multi-fragment ValuePointer).
 //!
 //! The client SDK now implements striping in pure ClusterClient code (Ceph
 //! striperados pattern): each chunk is a normal `Put` to a deterministic
 //! reserved-namespace key, and `commit` writes a 29-byte meta blob to the
-//! user's key. No new server RPCs, no multi-frag VP, no F130 GC rewrite.
+//! user's key. No new server RPCs, no multi-frag VP, no GC rewrite.
 //!
 //! Tests verify:
 //!   - large values round-trip byte-for-byte via put_stream + get_stream
@@ -65,7 +65,7 @@ async fn boot_cluster(
 
 #[test]
 #[ignore]
-fn f186_putstream_roundtrip_12mib() {
+fn putstream_roundtrip_12mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -167,7 +167,7 @@ fn f186_putstream_roundtrip_12mib() {
 /// verifies the smallest possible striped value survives roundtrip.
 #[test]
 #[ignore]
-fn f186_putstream_single_chunk_1mib() {
+fn putstream_single_chunk_1mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -216,7 +216,7 @@ fn f186_putstream_single_chunk_1mib() {
 /// all written chunks are best-effort deleted.
 #[test]
 #[ignore]
-fn f186_putstream_abort_drops_chunks() {
+fn putstream_abort_drops_chunks() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -250,7 +250,7 @@ fn f186_putstream_abort_drops_chunks() {
 /// in a single `next_chunk` call.
 #[test]
 #[ignore]
-fn f186_get_stream_inline_value_passthrough() {
+fn get_stream_inline_value_passthrough() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -276,13 +276,13 @@ fn f186_get_stream_inline_value_passthrough() {
     });
 }
 
-/// F235 — `get_many_into` batched zero-copy reads. Exercises BOTH branches of
+/// `get_many_into` batched zero-copy reads. Exercises BOTH branches of
 /// the per-item bulk decision (`bulk_worthwhile(dest.len())`): a 4 KiB value (< 64 KiB
 /// → regular `MSG_GET` + copy) and a 256 KiB value (>= 64 KiB → `MSG_GET_BULK`
 /// recv-into-dest), plus a missing key (`Ok(None)`).
 #[test]
 #[ignore]
-fn f235_get_many_into_mixed_sizes() {
+fn get_many_into_mixed_sizes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -357,13 +357,13 @@ fn f235_get_many_into_mixed_sizes() {
     });
 }
 
-/// F236 — `put_many` batched zero-copy writes. Exercises BOTH branches of the
+/// `put_many` batched zero-copy writes. Exercises BOTH branches of the
 /// per-item bulk decision (`bulk_worthwhile(value.len())`): a 4 KiB value (< 64 KiB →
 /// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_BULK`), then reads
 /// each back byte-for-byte.
 #[test]
 #[ignore]
-fn f236_put_many_mixed_sizes() {
+fn put_many_mixed_sizes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -398,12 +398,12 @@ fn f236_put_many_mixed_sizes() {
     });
 }
 
-/// F237 — `head_many` + `delete_many` batched fan-out. `head_many` over present +
+/// `head_many` + `delete_many` batched fan-out. `head_many` over present +
 /// absent keys returns correct `found`/`value_length`; `delete_many` removes the
 /// present keys (verified gone via `get`).
 #[test]
 #[ignore]
-fn f237_delete_many_and_head_many() {
+fn delete_many_and_head_many() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 

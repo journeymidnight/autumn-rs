@@ -1,4 +1,4 @@
-//! F-fuse-lease-1 — autumn-fuse mount Open/Release acquires +
+//! autumn-fuse mount Open/Release acquires +
 //! releases an inode lease via the manager. End-to-end:
 //!
 //! 1. Two `FsState` instances (representing two mounts) acquire

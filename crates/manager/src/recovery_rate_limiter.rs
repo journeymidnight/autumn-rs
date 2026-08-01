@@ -1,6 +1,6 @@
-//! F211-H: in-memory rate limiter for the recovery dispatch loop.
+//! in-memory rate limiter for the recovery dispatch loop.
 //!
-//! Pre-F211-H, a large node death (`fence_node` against an EN holding
+//! Previously, a large node death (`fence_node` against an EN holding
 //! thousands of extents) released a flood of recovery dispatches in one
 //! `recovery_dispatch_loop` tick. Each dispatch fired a sustained
 //! `COPY_EXTENT` / RS-decode against the source replicas and the target
@@ -20,9 +20,9 @@
 //!
 //! Counters are pure-counter — no persistence. Manager restart resets
 //! them; the dispatch loop re-derives "who is recovering what" from
-//! the F207 unified inflight ledger and reseeds the limiter on each
+//! the unified inflight ledger and reseeds the limiter on each
 //! `acquire`. Worst case after a leader failover: the new leader runs
-//! one tick at the unconstrained pre-F211-H concurrency until the next
+//! one tick at the unconstrained pre-limiter concurrency until the next
 //! reseed cycle. This is acceptable — the alternative (etcd-persisted
 //! counters) would multiply manager etcd traffic per dispatch.
 
@@ -36,7 +36,7 @@ pub struct RecoveryRateLimiter {
     pub per_source: HashMap<u64, u32>,
     pub per_target: HashMap<u64, u32>,
     /// (extent_id, slot) → consecutive failure count for exponential
-    /// backoff (F211-E). Cleared on a successful dispatch.
+    /// backoff. Cleared on a successful dispatch.
     pub backoff: HashMap<(u64, u32), BackoffState>,
 }
 
@@ -127,12 +127,12 @@ impl RecoveryRateLimiter {
         }
     }
 
-    /// F224: clear the in-flight counters (global / per-source /
+    /// clear the in-flight counters (global / per-source /
     /// per-target) WITHOUT touching backoff state. The dispatch loop
     /// calls this then reseeds from the inflight ledger each tick, so
     /// the counters always reflect actually-in-flight recoveries —
     /// `recovery-stats` reports real numbers and the per-candidate
-    /// `try_acquire` gate enforces the caps. Pre-F224 `try_acquire`
+    /// `try_acquire` gate enforces the caps. Previously `try_acquire`
     /// was never called in production, so `global` was stuck at 0 and
     /// the caps were unenforced (a big fence could still flood
     /// recoveries — the exact thing this limiter was added to prevent).
@@ -142,8 +142,8 @@ impl RecoveryRateLimiter {
         self.per_target.clear();
     }
 
-    /// F224: unconditionally count one in-flight recovery. Used only to
-    /// reseed from the F207 ledger (the ledger is truth and may exceed
+    /// unconditionally count one in-flight recovery. Used only to
+    /// reseed from the unified ledger (the ledger is truth and may exceed
     /// the caps after a leader failover — reseeding must reflect
     /// reality, not clamp it; clamping is the job of `try_acquire` on
     /// NEW dispatches).

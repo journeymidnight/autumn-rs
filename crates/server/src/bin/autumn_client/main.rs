@@ -9,12 +9,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::ClusterClient;
 use serde::{Deserialize, Serialize};
 
-// (F213: hex_split_ranges moved to autumn_op.rs along with `bootstrap`.)
+// (hex_split_ranges moved to autumn_op.rs along with `bootstrap`.)
 
-/// F099-N-c — generate a bench key guaranteed to lie in the partition
+/// c — generate a bench key guaranteed to lie in the partition
 /// identified by `start_key`. Returns an ASCII string (valid UTF-8). The write
 /// and read perf-check phases call this with the SAME (tid, seq) so the read
-/// phase regenerates exactly the keys the write phase stored (F246-B).
+/// phase regenerates exactly the keys the write phase stored.
 ///
 /// Strategy: for empty `start_key` (first partition [""..X)), prefix with
 /// "!" (0x21, smaller than any hex digit '0'..'f' = 0x30..0x66). For any
@@ -38,11 +38,11 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
     String::from_utf8(key).expect("ASCII bench key")
 }
 
-/// F-NS-PRINCIPAL-UNIFIED: the benchmarks bind the scope `bench/perf`
+/// the benchmarks bind the scope `bench/perf`
 /// (Prepend `bench/perf/`), so their keys are USER keys.
 const BENCH_SCOPE: &str = "bench/perf";
 
-/// F-KEY-NS D7: derive the USER-space partition start keys covering the bench
+/// D7: derive the USER-space partition start keys covering the bench
 /// namespace. `all_partitions_with_range` returns WIRE ranges; the client
 /// prepends `perf/bench/`, so a bench key built off a partition's wire start
 /// would route into the WRONG namespace. Instead, take each partition whose wire
@@ -115,7 +115,7 @@ struct PerfBaseline {
     recorded_at: u64,
 }
 
-// (F213: Info{Disk,Node,Extent,Stream,Discard,Partition,Snapshot}View
+// (Info{Disk,Node,Extent,Stream,Discard,Partition,Snapshot}View
 // moved to autumn_op.rs along with the `info` subcommand.)
 
 struct LatencyHist {
@@ -177,7 +177,7 @@ fn print_bench_summary(
     }
 }
 
-// (F213: derive_control_address + format_disk moved to autumn_op.rs
+// (derive_control_address + format_disk moved to autumn_op.rs
 // along with the `format` subcommand.)
 
 // ---------------------------------------------------------------------------
@@ -280,7 +280,7 @@ async fn cmd_ycsb(
     );
 
     // Each thread owns one partition's key range and its own [0,records) keyspace.
-    // F-KEY-NS D7: user-space starts within the bench namespace (see
+    // D7: user-space starts within the bench namespace (see
     // `bench_user_starts`); the client re-prepends `bench/perf/`.
     let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
@@ -445,14 +445,14 @@ async fn cmd_ycsb(
 #[allow(clippy::too_many_arguments)]
 async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, manager: &str) -> Result<()> {
     let pipeline_depth = pipeline_depth.max(1);
-    // bulk ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
+    // bulk ("ucx ⟹ zerocopy") selection — ONE symmetric rule, shared
     // with the python BatchClient + `get_many_into` via `bulk_worthwhile`:
     // engage bulk iff value >= 64 KiB, for BOTH reads and writes and BOTH
     // transports. Mirrors the PS recv gates (client BULK_MIN_BYTES +
     // PS AUTUMN_PS_BULK_RECV_MIN_BYTES, both 64 KiB): below 64 KiB the per-op
     // registered/pooled-recv machinery exceeds the copy saved (small UCX read
-    // -18%) and the PS recv doesn't bulk anyway. (F234 kept an asymmetric WRITE
-    // rule `is_ucx || large`; F235 dropped `is_ucx ||` — small UCX writes only
+    // -18%) and the PS recv doesn't bulk anyway. (An earlier asymmetric WRITE
+    // rule `is_ucx || large` later dropped its `is_ucx ||` term — small UCX writes only
     // saved client-side allocs while the PS still FrameDecoder-copied, i.e.
     // not real end-to-end bulk.)
     let bulk_write = autumn_client::bulk_worthwhile(value_size);
@@ -473,7 +473,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         );
     }
 
-    // F099-N-c: use `all_partitions_with_range` so each thread can
+    // c: use `all_partitions_with_range` so each thread can
     // generate keys that fall inside its assigned partition's range.
     let partitions = client.all_partitions_with_range().await?;
     if partitions.is_empty() {
@@ -487,13 +487,13 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         );
     }
 
-    // F246-B: per-thread `ClusterClient`; continuous pipelining via the
+    // per-thread `ClusterClient`; continuous pipelining via the
     // shared `fan_out` streaming primitive. A lazy, deadline-bounded
     // iterator yields ONE single-op future per key; `fan_out(.., depth)`
     // keeps `depth` in-flight (sliding window) until the deadline. Each
     // future is one `kv_put` (put_bulk for bulk, else put) — kv_put is the unit
     // the fan-out composes. The SDK routes per key; no per-partition striping.
-    // F-KEY-NS D7: user-space starts within the bench namespace (see
+    // D7: user-space starts within the bench namespace (see
     // `bench_user_starts`); the client re-prepends `bench/perf/`.
     let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
@@ -545,7 +545,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                     let mut lats: Vec<f64> = Vec::new();
                     let mut written = 0u64;
                     let cref = &client;
-                    // F258-bench: with --ramp-ms the timed window
+                    // bench: with --ramp-ms the timed window
                     // starts only after EVERY thread has connected
                     // (worker created) — measure steady state, not
                     // the creation ramp.
@@ -679,7 +679,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
     }
 
-    // F246-B: read phase mirrors the write phase — per-thread ClusterClient,
+    // read phase mirrors the write phase — per-thread ClusterClient,
     // continuous pipelining via `fan_out` streaming. Keys are regenerated
     // deterministically (the same `key_for_partition(start_key, "pc", tid,
     // seq)` the write phase used, cycling seq in `0..written`), so every
@@ -949,7 +949,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 part_id: None,
                 reuse_value: true,
                 partition_count: partitions_meta_from_flag,
-                // F195: explicit CLI flag (was env read at baseline-write time).
+                // explicit CLI flag (was env read at baseline-write time).
                 group_commit_cap,
             },
             recorded_at: now_secs,
@@ -981,7 +981,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // F213: handle the `op` stub BEFORE attempting to connect to the
+    // handle the `op` stub BEFORE attempting to connect to the
     // manager — the user is trying to run an op command via the wrong
     // binary; making them wait on a connection attempt would be hostile.
     if let Command::OpStub { args: op_args } = &args.command {
@@ -1001,7 +1001,7 @@ async fn main() -> Result<()> {
     }
 
     let _ = autumn_transport::init_with(args.transport);
-    // F-KEY-NS D7: the top-level client's binding depends on the command.
+    // D7: the top-level client's binding depends on the command.
     //  - perf-check / ycsb use it ONLY for partition listing (a routing op,
     //    binding-independent) and connect their own bench-scoped clients per
     //    thread → Raw here.
@@ -1017,14 +1017,14 @@ async fn main() -> Result<()> {
                 None => {
                     eprintln!(
                         "autumn-client: --namespace <SCOPE> is REQUIRED for KV commands \
-                         (F-NS-PRINCIPAL-UNIFIED — every write must declare its scope, a whole \
+                         (every write must declare its scope, a whole \
                          namespace like `fs` or a sub-prefix like `mem/agent7`). List namespaces \
                          with `autumn-op namespace-list`."
                     );
                     std::process::exit(2);
                 }
             };
-            // F-AUTHZ-BUILTIN: with a credential when `--credential-file` is given
+            // with a credential when `--credential-file` is given
             // (principal read from the file). Fails fast if it doesn't cover `{scope}/`.
             match &args.credential_file {
                 Some(path) => {
@@ -1080,7 +1080,7 @@ async fn main() -> Result<()> {
             if chunk_size == 0 {
                 bail!("--chunk-size must be >= 1");
             }
-            // F129: read full payload (stdin if file = "-"), drive
+            // read full payload (stdin if file = "-"), drive
             // PutBegin → N×Chunk → Commit. The handle owns the cached
             // RpcClient so all chunks land on the same PS connection.
             use std::io::Read;

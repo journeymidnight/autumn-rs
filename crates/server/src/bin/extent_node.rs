@@ -9,7 +9,7 @@ use autumn_rpc::manager_rpc::{
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use autumn_transport::TransportKind;
 
-// F193 allocator hygiene + F216-E read-perf fix. jemalloc (vs glibc) keeps the
+// allocator hygiene + read-perf fix. jemalloc (vs glibc) keeps the
 // EC-convert / copy_extent peak working set (~3 GiB on a 3 GiB sealed extent at
 // K=3, M=1) from sitting at the high-water RSS mark indefinitely — its decay
 // timers MADV_FREE idle pages back to the OS within seconds.
@@ -23,7 +23,7 @@ use autumn_transport::TransportKind;
 //   2. `oversize_threshold:0`: jemalloc 5.x's default oversize_threshold is
 //      8 MiB, so 8 MiB read/append buffers landed in the dedicated oversize
 //      arena that PURGES pages on free — every large read page-faulted cold
-//      pages (~2× slower; a TCP 8 MiB read regression bisected to F193).
+//      pages (~2× slower; a TCP 8 MiB read regression).
 //      Threshold 0 routes them through normal arenas (warm dirty-page reuse,
 //      ~3.1 GB/s vs ~1.6) while decay still returns idle pages.
 //
@@ -45,13 +45,13 @@ struct Args {
     /// `port + shard_idx * shard_stride` (default stride 10).
     port: u16,
     /// One or more data directories. Comma-separated or repeated --data flags.
-    /// F214-D: every dir must be formatted via `autumn-op format` first;
+    /// every dir must be formatted via `autumn-op format` first;
     /// the EN reads `disk_id` + `cluster_id` from each dir's sentinel
     /// files. The old `--disk-id` CLI bypass is gone.
     data_dirs: Vec<PathBuf>,
     manager: Option<String>,
-    /// F099-M: port stride between sibling shards. Shard count itself
-    /// (F196) is always `cpuset_len` — supply `--cpuset` to control it.
+    /// port stride between sibling shards. Shard count itself
+    /// is always `cpuset_len` — supply `--cpuset` to control it.
     shard_stride: u16,
     /// Bind host for the listener (IPv4 or bare/bracketed IPv6). Default 0.0.0.0.
     bind_host: String,
@@ -60,29 +60,29 @@ struct Args {
     /// need disjoint values across processes so they don't share cores.
     /// Mutually exclusive with `--cpuset`.
     cpu_start: usize,
-    /// F196: explicit list of cores this binary may pin to, taskset
+    /// explicit list of cores this binary may pin to, taskset
     /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
     /// `core_affinity::get_core_ids()` snapshot and disables
-    /// `--cpu-start`. When unset, behaviour matches pre-F196.
+    /// `--cpu-start`. When unset, behaviour matches the earlier default.
     cpuset: Option<Vec<usize>>,
-    /// F191: control-plane listener port. None → derive as `port + 1000`.
+    /// control-plane listener port. None → derive as `port + 1000`.
     /// Each shard binds its own control listener at
     /// `control_port + shard_idx * shard_stride`. Operators only need
     /// to override this when 1000 collides on a non-default deployment.
     control_port: Option<u16>,
-    /// F195 (was F194 env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`).
+    /// (was env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`).
     /// Default 1; clamped to [1, 16] by library.
     ec_convert_parallelism: Option<usize>,
-    /// F195 (was F194 env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`).
+    /// (was env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`).
     /// Default 2; clamped to [1, 16] by library.
     recovery_parallelism: Option<usize>,
-    /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I). Default 64.
+    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`). Default 64.
     inflight_cap: Option<usize>,
     /// Chunked EC-convert stripe size (bytes). `None` = library default
     /// (64 MiB). Peak EC-convert RAM = `(K+M) × stripe`. Clamped to
     /// [1 MiB, 1 GiB] by the library.
     ec_stripe_bytes: Option<usize>,
-    /// F-EN-FD-LRU: max resident SEALED-extent fds cached per shard. `None` =
+    /// max resident SEALED-extent fds cached per shard. `None` =
     /// library default (4096). Bounds open fds on a node with many extents.
     fd_cache_cap: Option<usize>,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
@@ -96,7 +96,7 @@ struct Args {
     /// endpoint is unauthenticated — operators exposing the RPC plane
     /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
     metrics_listen: Option<String>,
-    /// F-EN-DYNSHARD M1: `HOST:PORT` this EN announces to the manager at
+    /// M1: `HOST:PORT` this EN announces to the manager at
     /// startup (HOST must be an IP — the binary stays DNS-free; the shell
     /// resolves names). PORT is the shard-0 data port (== `--port`). When set
     /// (and `--manager` is given), the EN self-registers its live location +
@@ -110,7 +110,7 @@ fn parse_args() -> Args {
     let mut port: u16 = 9101;
     let mut data_dirs: Vec<PathBuf> = Vec::new();
     let mut manager: Option<String> = None;
-    // F196: `--shards` was removed. Shard count = cpuset_len; supply
+    // `--shards` was removed. Shard count = cpuset_len; supply
     // `--cpuset` to control it. `--shard-stride` survives as the
     // port stride between sibling shards.
     let mut shard_stride: u16 = 10;
@@ -118,11 +118,11 @@ fn parse_args() -> Args {
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
-    // F191: optional override; default = port + 1000.
+    // optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
-    // F195: F194 + F099-I knobs as Option<usize>; library defaults when None.
+    // parallelism + inflight-cap knobs as Option<usize>; library defaults when None.
     let mut ec_convert_parallelism: Option<usize> = None;
     let mut recovery_parallelism: Option<usize> = None;
     let mut inflight_cap: Option<usize> = None;
@@ -149,7 +149,7 @@ fn parse_args() -> Args {
                 }
             }
             "--disk-id" => {
-                // F214-D: --disk-id removed. Every data dir must be
+                // --disk-id removed. Every data dir must be
                 // formatted via `autumn-op format` first; the EN reads
                 // `disk_id` from the dir's sentinel file. Print a
                 // migration error and exit 2, matching the --shards
@@ -157,7 +157,7 @@ fn parse_args() -> Args {
                 i += 1;
                 let _ = args[i].clone();
                 eprintln!(
-                    "error: --disk-id was removed in F214-D. \
+                    "error: --disk-id was removed. \
                      Run `autumn-op format <DIR>...` \
                      first; the EN reads disk_id from each dir's \
                      `disk_id` sentinel file."
@@ -172,7 +172,7 @@ fn parse_args() -> Args {
                 i += 1;
                 let _ = args[i].clone();
                 eprintln!(
-                    "error: --shards was removed in F196; pass --cpuset <SPEC> to size the EN (shard count = cpuset_len)"
+                    "error: --shards was removed; pass --cpuset <SPEC> to size the EN (shard count = cpuset_len)"
                 );
                 std::process::exit(2);
             }
@@ -267,7 +267,7 @@ fn parse_args() -> Args {
         data_dirs.push(PathBuf::from("/tmp/autumn-extent"));
     }
 
-    // F196: --cpuset and --cpu-start are mutually exclusive at the CLI
+    // --cpuset and --cpu-start are mutually exclusive at the CLI
     // layer. cpuset is the final list; offset has no meaning on top of
     // an explicit list.
     if cpuset.is_some() && cpu_start != 0 {
@@ -297,7 +297,7 @@ fn parse_args() -> Args {
     }
 }
 
-/// F195: helper — apply the F194 / F099-I CLI flags to an ExtentNodeConfig.
+/// helper — apply the parallelism / inflight-cap CLI flags to an ExtentNodeConfig.
 /// `None` means "library default" and skips the builder call.
 fn apply_extent_tunables(
     mut cfg: autumn_stream::ExtentNodeConfig,
@@ -315,7 +315,7 @@ fn apply_extent_tunables(
     cfg
 }
 
-/// F214-D: async manager cross-check. Connects to the manager once,
+/// async manager cross-check. Connects to the manager once,
 /// fetches its cluster_id, and verifies it matches the value stamped
 /// in our data dirs. Catches the "EN pointed at the wrong manager"
 /// misconfiguration that the on-disk consistency check alone cannot
@@ -361,7 +361,7 @@ async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
     Ok(())
 }
 
-/// F214-D: read the `cluster_id` sentinel file from each data dir and
+/// read the `cluster_id` sentinel file from each data dir and
 /// verify they all agree. Returns the shared cluster_id string. Panics
 /// (via `Result::Err` → main returns) with an actionable message if any
 /// dir is unformatted, partially-formatted, or formatted for a different
@@ -411,7 +411,7 @@ fn read_and_verify_cluster_id(data_dirs: &[PathBuf]) -> Result<String> {
     Ok(shared.unwrap())
 }
 
-/// F-EN-DYNSHARD M1: read the identity sentinels `autumn-op format` stamped —
+/// M1: read the identity sentinels `autumn-op format` stamped —
 /// the single `node_uuid` (must agree across every dir) and each dir's
 /// `disk_uuid` (in `--data` order). The EN re-reports these to the manager at
 /// startup (self-registration), so a missing / empty / disagreeing sentinel is
@@ -461,7 +461,7 @@ fn read_node_identity(data_dirs: &[PathBuf]) -> Result<(String, Vec<String>)> {
     Ok((node_uuid.unwrap(), disk_uuids))
 }
 
-/// F-EN-DYNSHARD M1: build the self-registration request (pure — no I/O, so the
+/// M1: build the self-registration request (pure — no I/O, so the
 /// control_address derivation is unit-testable). UCX serves control RPCs on the
 /// data listener (a second `ucp_listener` on the same RoCE device can't bind),
 /// so it registers an EMPTY control_address → the manager's df falls back to the
@@ -491,7 +491,7 @@ fn build_register_req(
     }
 }
 
-/// F-EN-DYNSHARD M1: self-register the EN's LIVE location (advertise address +
+/// M1: self-register the EN's LIVE location (advertise address +
 /// the shard ports this process actually binds) with the manager at startup.
 /// The manager keys the node by `node_uuid` (M0) and updates the location IN
 /// PLACE — so a changed shard-port layout (a reshard) or a fresh pod IP is
@@ -525,7 +525,7 @@ async fn register_with_manager(
                     node_id = resp.node_id,
                     advertise = %req.addr,
                     ports = ?req.shard_ports,
-                    "F-EN-DYNSHARD M1: EN self-registered its location with the manager"
+                    "M1: EN self-registered its location with the manager"
                 );
                 return Ok(());
             }
@@ -564,7 +564,7 @@ fn main() -> Result<()> {
             tracing::warn!(n, "ec-stripe-bytes already set (ignored — first-call-wins)");
         }
     }
-    // F-EN-FD-LRU: apply the sealed-extent fd-cache cap (process-global,
+    // apply the sealed-extent fd-cache cap (process-global,
     // first-call-wins) before ExtentNode::new opens extents.
     if let Some(n) = args.fd_cache_cap {
         if !autumn_stream::set_fd_cache_cap(n) {
@@ -580,8 +580,8 @@ fn main() -> Result<()> {
     }
     let _ = autumn_transport::init_with(args.transport);
 
-    // F-EN-NOFILE: the EN is the fd大户 — `ExtentNode::load_extents` opens every
-    // owned extent's data file at startup and the F-EN-FD-LRU cache keeps up to
+    // the EN is the fd大户 — `ExtentNode::load_extents` opens every
+    // owned extent's data file at startup and the fd-LRU cache keeps up to
     // `--fd-cache-cap` of them open. The default RLIMIT_NOFILE soft limit (often
     // 1024) is far too small — a multi-disk node with 16 GiB extents already
     // approaches it, and smaller extents blow past → EMFILE in the load_extents
@@ -600,7 +600,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
+    // RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
     // RLIMIT_MEMLOCK via ibv_reg_mr. The default soft limit (often 8 MiB) faults
     // libibverbs on large (e.g. 8 MiB) value transfers — raise to INFINITY,
     // same as the PS. Harmless on TCP. Falls back to soft-up-to-hard.
@@ -622,16 +622,16 @@ fn main() -> Result<()> {
         }
     }
 
-    // F214-D: verify every --data dir has a matching cluster_id
+    // verify every --data dir has a matching cluster_id
     // sentinel file before launching shard threads. The manager
     // cross-check happens inside the per-shard async block below
     // (needs a compio runtime to do an RPC).
     let stamped_cluster_id = read_and_verify_cluster_id(&args.data_dirs)?;
     tracing::info!(
         cluster_id = %stamped_cluster_id,
-        "F214-D: data dirs verified consistent"
+        "data dirs verified consistent"
     );
-    // F196: --cpuset (if given) is installed BEFORE any cpu_pin reader
+    // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Without
     // --cpuset we fall back to the legacy --cpu-start offset over
     // `core_affinity::get_core_ids()`.
@@ -641,7 +641,7 @@ fn main() -> Result<()> {
     } else {
         autumn_common::set_cpu_offset(args.cpu_start);
     }
-    // F196: `--cpuset` is the sole sizing surface. Shard count = cpuset_len
+    // `--cpuset` is the sole sizing surface. Shard count = cpuset_len
     // (one shard per pre-allocated core). `--shards` was removed; CLI
     // parsing rejects it. Default with no --cpuset gives `cpuset_len`
     // shards over the auto-detected core set — pass `--cpuset 0` (or a
@@ -653,20 +653,20 @@ fn main() -> Result<()> {
         cpuset_len = cpuset_n,
         cpuset_given,
         shards,
-        "F196: EN sized from cpuset"
+        "EN sized from cpuset"
     );
     if cpuset_n <= 1 {
         tracing::warn!(
-            "F196: EN started with a single-core cpuset; no parallelism across extent shards. \
+            "EN started with a single-core cpuset; no parallelism across extent shards. \
              Consider growing --cpuset for production loads."
         );
     }
 
-    // F099-M: each shard i listens on port + i * shard_stride.
+    // each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..shards)
         .map(|i| args.port + (i as u16) * args.shard_stride)
         .collect();
-    // F191: per-shard control port. Operator can override the shard-0
+    // per-shard control port. Operator can override the shard-0
     // base via --control-port; per-shard stride matches data plane so
     // shard-N has its own control listener too.
     let control_port_base = args.control_port.unwrap_or(args.port + 1000);
@@ -674,7 +674,7 @@ fn main() -> Result<()> {
         .map(|i| control_port_base + (i as u16) * args.shard_stride)
         .collect();
 
-    // F-EN-DYNSHARD M1c: --advertise is now REQUIRED whenever --manager is
+    // M1c: --advertise is now REQUIRED whenever --manager is
     // given. `autumn-op format` (M1c) is identity-only — it no longer stamps
     // a location — so an EN started without --advertise would self-register
     // NOTHING and sit at an empty location forever (df can never reach it,
@@ -691,7 +691,7 @@ fn main() -> Result<()> {
         (Some(_), None) => {
             eprintln!(
                 "error: --advertise HOST:PORT is required when --manager is given \
-                 (F-EN-DYNSHARD M1c — `autumn-op format` no longer stamps a location; \
+                 (M1c — `autumn-op format` no longer stamps a location; \
                  the EN self-registers its own address + shard ports at every startup)."
             );
             std::process::exit(2);
@@ -761,7 +761,7 @@ fn main() -> Result<()> {
     }
 
     if shards == 1 {
-        // Single-shard fast path — preserve exact pre-F196 behaviour.
+        // Single-shard fast path — preserve exact single-core behaviour.
         return run_single_shard(args, stamped_cluster_id);
     }
 
@@ -780,7 +780,7 @@ fn main() -> Result<()> {
         let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
         let control_listen_port = control_ports[shard_idx as usize];
-        // F-EN-DYNSHARD M1: shard 0 self-registers the live location. Capture
+        // M1: shard 0 self-registers the live location. Capture
         // the full port vector + advertise + control base + transport (unused
         // by shards > 0).
         let reg_advertise = args.advertise.clone();
@@ -789,7 +789,7 @@ fn main() -> Result<()> {
         let reg_shard_ports = advertise_shard_ports.clone();
         let reg_control_base = advertise_control_base;
         let reg_transport = args.transport;
-        // F195: capture F194 / F099-I tunable overrides for the thread.
+        // capture parallelism / inflight-cap tunable overrides for the thread.
         let ec_par = args.ec_convert_parallelism;
         let rec_par = args.recovery_parallelism;
         let inflight = args.inflight_cap;
@@ -818,7 +818,7 @@ fn main() -> Result<()> {
                             autumn_transport::current().kind(),
                         )
                         .ok();
-                        // F191: per-shard control listener — same SQ/CQ
+                        // per-shard control listener — same SQ/CQ
                         // machinery, no API churn.
                         let ctl_addr = autumn_transport::format_listen_addr(
                             &bind_host,
@@ -826,17 +826,17 @@ fn main() -> Result<()> {
                         )
                         .context("parse control listen address")?;
 
-                        // F214-D: only shard 0 runs the manager cross-check;
+                        // only shard 0 runs the manager cross-check;
                         // it's the same check for every shard, so doing it
                         // once is sufficient. Skipped when no manager is
                         // configured (test deployments).
-                        // F-EN-DYNSHARD M1b: identity to echo in this shard's
+                        // M1b: identity to echo in this shard's
                         // `handle_df` (only shard 0 is dialed by the manager df).
                         let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
                         if shard_idx == 0 {
                             if let Some(mgr) = manager.as_ref() {
                                 verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
-                                // F-EN-DYNSHARD M1: self-register live location +
+                                // M1: self-register live location +
                                 // shard ports BEFORE any shard serves. Only when
                                 // --advertise is given (else keep the format-stamped
                                 // location, the pre-M1 behavior).
@@ -866,7 +866,7 @@ fn main() -> Result<()> {
                         if let Some((nu, adv, ports)) = reg_for_cfg {
                             cfg = cfg.with_registration(nu, adv, ports);
                         }
-                        // F195: per-shard tunables.
+                        // per-shard tunables.
                         if let Some(n) = ec_par {
                             cfg = cfg.with_ec_convert_parallelism(n);
                         }
@@ -946,7 +946,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         .build()
         .context("create compio runtime")?;
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
-    // F191: control port defaults to port + 1000.
+    // control port defaults to port + 1000.
     let ctl_port = args.control_port.unwrap_or(args.port + 1000);
     rt.block_on(async move {
         let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
@@ -955,11 +955,11 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         let ctl_addr = autumn_transport::format_listen_addr(&args.bind_host, ctl_port)
             .context("parse control listen address")?;
 
-        // F214-D: manager cross-check (skipped when --manager is omitted).
+        // manager cross-check (skipped when --manager is omitted).
         let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
         if let Some(mgr) = args.manager.as_ref() {
             verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
-            // F-EN-DYNSHARD M1: self-register live location before serving. A
+            // M1: self-register live location before serving. A
             // single-shard node registers `[advertise_port]` — the PEER-reachable
             // port (== --port normally, but the proxy/NAT port when they differ),
             // and control = advertise_port + 1000. main() already required
@@ -987,12 +987,12 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         if let Some(mgr) = args.manager.clone() {
             config = config.with_manager_endpoint(mgr);
         }
-        // F-EN-DYNSHARD M1b: echo identity in handle_df for the manager's
+        // M1b: echo identity in handle_df for the manager's
         // drift-heal / imposter check.
         if let Some((nu, adv, ports)) = reg_for_cfg {
             config = config.with_registration(nu, adv, ports);
         }
-        // F195: F194 / F099-I tunables.
+        // parallelism / inflight-cap tunables.
         let config = apply_extent_tunables(config, &args);
 
         tracing::info!(
@@ -1011,7 +1011,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
 mod tests {
     use super::*;
 
-    // F-EN-DYNSHARD M1: the control_address derivation is transport-conditional
+    // M1: the control_address derivation is transport-conditional
     // (TCP → separate control port; UCX → empty = manager df falls back to the
     // data addr), and the request must echo the live location + shard ports.
     #[test]

@@ -13,7 +13,7 @@ use autumn_client::ClusterClient;
 
 use crate::schema::{InodeState, ROOT_INO};
 
-/// F-fuse-lease-1: per-inode lease bookkeeping on the fuse mount side.
+/// Per-inode lease bookkeeping on the fuse mount side.
 /// The `apply_invalidation` / `cache_is_stale` helpers operate on this
 /// shape (a writer-XOR-readers lease keyed per inode).
 #[derive(Clone, Debug)]
@@ -49,7 +49,7 @@ pub struct FuseLease {
 /// Central filesystem state, lives on the compio thread (single-threaded, no locks).
 pub struct FsState {
     /// `Rc` so the spawned `read::execute` task can hold a clone and call
-    /// `get_many_into` without an `&FsState` reference (F244-B).
+    /// `get_many_into` without an `&FsState` reference.
     pub client: Rc<ClusterClient>,
     pub inodes: HashMap<u64, InodeState>,
     pub dirty_inodes: HashSet<u64>,
@@ -58,7 +58,7 @@ pub struct FsState {
     /// FUSE lookup refcounts (separate from open_count).
     pub lookup_count: HashMap<u64, u64>,
 
-    // ── F-fuse-lease-1 ────────────────────────────────────────────────
+    // ── inode leases ──────────────────────────────────────────────────
     /// Per-mount daemon identity (kind = `LEASE_CLIENT_KIND_FUSE`,
     /// fresh UUID at mount). Reused for every lease RPC so the
     /// manager's lease-registry state stays stable for this mount.
@@ -72,7 +72,7 @@ pub struct FsState {
     /// `session_invalidation_poll_loop` from the manager's
     /// `WriterClosed` / `LeaseRevoked` push events; the read path
     /// will use `cache_is_stale` against it for close-to-open
-    /// coherence (full path eviction wires in F-fuse-lease-2's
+    /// coherence (full path eviction wires in the
     /// `notify_inval_inode` work).
     pub invalidations: Rc<RefCell<InvalidationMap>>,
 
@@ -97,7 +97,7 @@ pub struct FsState {
     /// the alias here to avoid a dispatch ↔ state circular dep.
     pub kernel_invalidator: RefCell<Option<Rc<dyn Fn(u64)>>>,
 
-    /// F-DIRECT-MANY — when true, whole-extent reads (≥ 64 KiB) bypass the PS
+    /// when true, whole-extent reads (≥ 64 KiB) bypass the PS
     /// and read straight from an extent node (`get_many_direct`); otherwise the
     /// PS-proxied bulk path (`get_many_into`). Topology-dependent (needs the fuse
     /// host to reach EN data ports), so DEFAULT FALSE — the fuse binary flips it
@@ -110,14 +110,14 @@ pub struct FsState {
 impl FsState {
     pub async fn new(manager_addr: &str) -> Result<Self> {
         // The fuse binary keeps the env-derived hostname default (the daemon
-        // has no CLI flag for it); the PyO3 `autumn.Fs` binding (F-FS-UNIFY
-        // M2) passes an explicit host via `new_with_host` so no env read
+        // has no CLI flag for it); the PyO3 `autumn.Fs` binding (M2)
+        // passes an explicit host via `new_with_host` so no env read
         // leaks into the library path ([[feedback_no_env_in_rs]]).
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
         Self::new_with_host(manager_addr, host).await
     }
 
-    /// F-AUTHZ-BUILTIN: `new` with an authz credential — same HOSTNAME-derived
+    /// `new` with an authz credential — same HOSTNAME-derived
     /// daemon identity, but connects via `connect_with_credential`. See
     /// [`Self::new_with_host_credential`].
     pub async fn new_with_credential(
@@ -133,7 +133,7 @@ impl FsState {
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
     ///
-    /// F-NS-PRINCIPAL-UNIFIED: this mount is scoped to the WHOLE `fs/` namespace
+    /// this mount is scoped to the WHOLE `fs/` namespace
     /// (Option 3 dropped the tenant segment — fuse is one global tree; multi-tree
     /// isolation is by distinct namespaces, §8.9). The client `connect(mgr, "fs")`
     /// prepends `fs/` to every key (and strips it off returned range keys).
@@ -147,7 +147,7 @@ impl FsState {
         Ok(Self::from_client(client, host))
     }
 
-    /// F-AUTHZ-BUILTIN: connect with an authz credential. Used when the deploy
+    /// connect with an authz credential. Used when the deploy
     /// protects the `fs/` namespace — the client presents `principal` (credential
     /// owner from the credential file's name line) + `credential`, and
     /// `connect_with_credential` FAILS FAST at connect if that credential does
@@ -228,9 +228,9 @@ impl FsState {
 
     /// Put a key-value pair into the KV store.
     ///
-    /// F178: every Put is durable (no `must_sync` flag). Pre-F178 there
+    /// every Put is durable (no `must_sync` flag). Previously there
     /// was a `kv_put` (must_sync=false) and `kv_put_sync` (must_sync=
-    /// true) split; post-F178 they collapse to one method because the
+    /// true) split; they now collapse to one method because the
     /// extent-node fsync coalescer makes every append durable
     /// regardless. The `kv_put_sync` alias is retained as a no-op
     /// pass-through for callers that explicitly want to read as

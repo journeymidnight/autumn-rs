@@ -1,12 +1,12 @@
-//! F211-F: EC convert auto-abandon when the coord EN is fenced.
+//! EC convert auto-abandon when the coord EN is fenced.
 //!
-//! After F211-C's `mgr_fence_node` persists the override + bumps
+//! After `mgr_fence_node` persists the override + bumps
 //! owner-lock revisions, this module sweeps the unified inflight ledger
 //! for ConvertToEc markers whose `target_nodes[0]` (the coord) matches
 //! the freshly-fenced node. For each match it atomically deletes the
 //! ledger marker + writes an audit `ec_convert_advisory/<extent_id>`
 //! breadcrumb. The advisory entry is what the OP policy script later
-//! reads to decide whether to `force_ec_convert` reissue. F138's
+//! reads to decide whether to `force_ec_convert` reissue. The
 //! in-memory exclusion is released by the same put-and-delete txn.
 //!
 //! **EC convert reissue is NOT automatic.** The advisory exists only
@@ -32,7 +32,7 @@ pub const EC_CONVERT_ADVISORY_PREFIX: &str = "ec_convert_advisory/";
 pub struct MgrEcAdvisoryEntry {
     pub extent_id: u64,
     pub original_coord_node_id: u64,
-    /// Reason short-code. `"fence_abandon"` for F211-F's auto-abandon
+    /// Reason short-code. `"fence_abandon"` for the auto-abandon
     /// path; `"stale_sweep"` for `extent_inflight_stale_sweep_loop`.
     pub reason: String,
     pub set_at: i64,
@@ -43,8 +43,8 @@ pub fn advisory_key(extent_id: u64) -> String {
 }
 
 impl AutumnManager {
-    /// F211-F: invoked from `handle_fence_node` AFTER the override has
-    /// been persisted to etcd + F211-D's owner-lock owner_epoch bumps.
+    /// invoked from `handle_fence_node` AFTER the override has
+    /// been persisted to etcd + owner-lock owner_epoch bumps.
     ///
     /// Returns the list of extent_ids whose markers were abandoned, so
     /// the caller can audit the chain.
@@ -95,7 +95,7 @@ impl AutumnManager {
                         extent_id = *extent_id,
                         fenced_node,
                         error = %e,
-                        "F211-F: failed to abandon inflight marker; will retry next fence"
+                        "failed to abandon inflight marker; will retry next fence"
                     );
                     continue;
                 }
@@ -105,12 +105,12 @@ impl AutumnManager {
             tracing::warn!(
                 extent_id = *extent_id,
                 fenced_node,
-                "F211-F: auto-abandoned EC convert marker after fence — \
+                "auto-abandoned EC convert marker after fence — \
                  advisory persisted; OP policy script must decide \
                  whether to force_ec_convert reissue"
             );
 
-            // #3 (2026-06-15): the former "F211-D Tier 2 fence-handover push"
+            // #3 (2026-06-15): the former "Tier 2 fence-handover push"
             // was DELETED here — it was DEAD CODE. It called
             // `commit_length_on_node` with the post-fence owner_epoch expecting
             // the EN's `handle_commit_length` to BUMP `entry.owner_epoch`

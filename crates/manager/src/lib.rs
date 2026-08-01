@@ -13,12 +13,12 @@ mod recovery;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
 
-// F-DASH-IN-MGR: embedded web dashboard + (M2+) leader-fenced auto-policy
+// embedded web dashboard + (M2+) leader-fenced auto-policy
 // controller, folding the retired standalone Python `python/dashboard/` into
 // the manager process (all-in-one; the controller survives as long as the
 // manager leader does). axum over the compio-native cyper_axum::serve.
 mod dashboard;
-// F-DASH-IN-MGR: ported pure decision helpers (M1) → leader-fenced controller (M2).
+// ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
 
 pub(crate) use extent_delete::PendingDelete;
@@ -40,21 +40,21 @@ use compio::BufResult;
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
 
-/// Etcd path for the manager leader-key. F149: also used as the fence target
+/// Etcd path for the manager leader-key. Also used as the fence target
 /// for every manager etcd write txn.
 pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
 
-/// F211-C: etcd prefix for persistent operator overrides
+/// etcd prefix for persistent operator overrides
 /// (`node_override/<node_id>` → rkyv'd `MgrNodeOverride`).
 pub const NODE_OVERRIDE_PREFIX: &str = "node_override/";
 
-/// F211-C: etcd prefix for hard-removed node tombstones
+/// etcd prefix for hard-removed node tombstones
 /// (`decommissioned/<node_id>` → rkyv'd `MgrNodeOverride`). Same value
 /// shape as the override prefix — the existence of the key is what
 /// blocks re-registration.
 pub const DECOMMISSIONED_PREFIX: &str = "decommissioned/";
 
-/// F214-A: cluster identity key. Written exactly once: the first leader
+/// cluster identity key. Written exactly once: the first leader
 /// to win the election CAS-creates this key (create_revision==0) with a
 /// fresh UUID. Subsequent leaders inherit via `replay_from_etcd`. Read
 /// by `MSG_GET_CLUSTER_ID` so `autumn-op format` can stamp each
@@ -65,37 +65,37 @@ pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
 /// future serialization era (it gates exactly those transitions).
 pub const CLUSTER_VERSION_KEY: &str = "autumn-rs/cluster_version";
 
-/// F-ioring-lease-1: writer-lease etcd prefix. One key per inode that
+/// Writer-lease etcd prefix. One key per inode that
 /// currently has a writer (reader leases are NOT persisted — they're
 /// ephemeral, and a manager failover invalidates every reader's cache
 /// per plan §6.4).
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 
-/// F-AUTHZ-1: etcd prefix for the KDC tenant account DB
+/// etcd prefix for the KDC tenant account DB
 /// (`tenantAccount/<tenant>` → rkyv'd `MgrTenantAccount`). Replayed on leader
 /// failover; the credential HASH is stored, never the raw credential. The
 /// tenant name is a string suffix (percent-encoded segment), not a u64 id.
 pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 
-/// F-KEY-NS D2: etcd prefix for the namespace registry
+/// D2: etcd prefix for the namespace registry
 /// (`namespace/<name>` → rkyv'd `MgrNamespace`). Replayed on leader failover;
 /// mutated only via the admin namespace-create/delete RPCs. The three built-in
 /// families (`fs`/`kvc`/`mem`) are CAS-preregistered on first leader promotion
 /// (`seed_builtin_namespaces`). See docs/key_namespace_split_design.md §3.7③.
 pub const NAMESPACE_PREFIX: &str = "namespace/";
 
-/// F-KEY-NS D2: the built-in namespace families, CAS-preregistered by the first
+/// D2: the built-in namespace families, CAS-preregistered by the first
 /// leader. `owner_tenant = None` (existence-only until an owner is later
 /// assigned), so they are registered but NOT protected out of the box.
 pub const BUILTIN_NAMESPACES: [&str; 3] = ["fs", "kvc", "mem"];
 
-/// F-KEY-NS D2: names that `namespace-create` refuses. `fs`/`kvc`/`mem` are the
+/// D2: names that `namespace-create` refuses. `fs`/`kvc`/`mem` are the
 /// bootstrap-seeded families (created + non-deletable); `default` is reserved
 /// purely to prevent confusion (it is a conventional TENANT name, never a
 /// namespace — see §3.7③).
 pub const RESERVED_NAMESPACE_NAMES: [&str; 4] = ["fs", "kvc", "mem", "default"];
 
-/// F-KEY-NS D2: validate a namespace name — a single path segment matching
+/// D2: validate a namespace name — a single path segment matching
 /// `[a-z0-9._-]+` (same charset as the D1 tenant/volume components). Returns the
 /// reason string on rejection. Pure (unit-tested).
 pub(crate) fn validate_namespace_name(name: &str) -> Result<(), String> {
@@ -113,7 +113,7 @@ pub(crate) fn validate_namespace_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// F-KEY-NS D2: prefix-disjointness. A new namespace prefix `new_prefix`
+/// D2: prefix-disjointness. A new namespace prefix `new_prefix`
 /// (`name + "/"`) may not be in a `starts_with` relation — in EITHER direction —
 /// with any existing registered prefix, so all namespace intervals stay pairwise
 /// non-overlapping (Layer-A / authz / presplit prefix matching is then
@@ -133,10 +133,10 @@ pub const DEFAULT_MIN_ALLOC_FREE_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
     client: Rc<autumn_etcd::EtcdClient>,
-    /// F149: identity used in the leader-fence compare. Set at connect time
+    /// identity used in the leader-fence compare. Set at connect time
     /// from `AutumnManager::instance_id`.
     instance_id: Rc<String>,
-    /// F149: shared with `AutumnManager.leader`. Flipped to `false` when the
+    /// shared with `AutumnManager.leader`. Flipped to `false` when the
     /// fence compare detects a deposition, so the in-process state agrees with
     /// the etcd ground truth before the next operation runs.
     leader: Rc<Cell<bool>>,
@@ -164,7 +164,7 @@ impl EtcdMirror {
         })
     }
 
-    /// F149: run a fenced txn. Always prepends a
+    /// run a fenced txn. Always prepends a
     /// `Cmp::value(LEADER_KEY) == instance_id` compare to `extra_cmp`.
     ///
     /// Returns:
@@ -250,7 +250,7 @@ impl EtcdMirror {
         AppError::Internal("etcd txn rejected with empty extra_cmp".to_string())
     }
 
-    /// F265: fenced txn whose success value is the txn's COMMIT REVISION
+    /// fenced txn whose success value is the txn's COMMIT REVISION
     /// (`ResponseHeader.revision`). For a txn containing exactly one PUT
     /// on a key, that revision IS the PUT's `mod_revision` — read
     /// atomically from the same txn response, with no separate GET that
@@ -359,7 +359,7 @@ impl EtcdMirror {
     /// `Cmp::value(key) == baseline`. If the record was deleted
     /// or changed since our read, the txn returns `Ok(false)` →
     /// `Precondition` → caller treats as "skip, next heartbeat
-    /// will retry". F149 leader fence is still threaded via the
+    /// will retry". The leader fence is still threaded via the
     /// underlying `txn_fenced`.
     ///
     /// Returns: `Ok(true)` if the CAS-put committed, `Ok(false)`
@@ -522,7 +522,7 @@ impl ConnPool {
         result
     }
 
-    /// F191: bound an RPC at `timeout`. Same connection / eviction
+    /// bound an RPC at `timeout`. Same connection / eviction
     /// semantics as `call`; on the timeout branch we deliberately evict
     /// because the underlying connection is now mid-protocol (we sent a
     /// request but stopped reading) and reusing it could deadlock the
@@ -559,7 +559,7 @@ impl ConnPool {
         if let Some(conn) = self.conns.borrow().get(&addr) {
             return Ok(conn.clone());
         }
-        // F228 (1A): bound the TCP connect. `call_timeout` wraps only the
+        // (1A): bound the TCP connect. `call_timeout` wraps only the
         // request future, NOT this connect — a hung connect to a dead /
         // firewalled peer would wedge the calling background loop forever
         // despite call_timeout. Default 5 s, env AUTUMN_MGR_CONNECT_TIMEOUT_MS.
@@ -573,7 +573,7 @@ impl ConnPool {
     }
 }
 
-/// F228 (1A): TCP connect timeout for the manager's ConnPool. See
+/// (1A): TCP connect timeout for the manager's ConnPool. See
 /// `get_or_connect`. Env `AUTUMN_MGR_CONNECT_TIMEOUT_MS` (default 5 s).
 fn connect_timeout() -> std::time::Duration {
     let ms = std::env::var("AUTUMN_MGR_CONNECT_TIMEOUT_MS")
@@ -621,11 +621,11 @@ pub(crate) struct ClusterCapSnapshot {
     pub last_update_ms: u64,
     /// Read-only Σ distinct sealed_length (de-amplified, sealed-only).
     pub logical_stored: u64,
-    /// F-DF-OPENTAIL: Σ PS-reported open-tail committed bytes across
+    /// Σ PS-reported open-tail committed bytes across
     /// partitions (one copy). Refreshed every tick from the policy load
     /// window (cheap sum). The amp denominator is `logical_stored + this`.
     pub logical_open_tail: u64,
-    /// F-DF-WALDEBT: Σ reclaimable dead bytes across partitions — sealed
+    /// Σ reclaimable dead bytes across partitions — sealed
     /// (`PartitionLoad.gc_debt_bytes`) + open-tail (`open_tail_dead_bytes`).
     /// Refreshed every tick from the same policy load window; the dead fraction
     /// of the footprint that GC can eventually reclaim.
@@ -643,12 +643,12 @@ pub struct AutumnManager {
     etcd: Option<EtcdMirror>,
     /// Owned via `Rc` so `EtcdMirror` (cloned from this) can use the same
     /// identity in its leader-fence compare without shipping a string per
-    /// txn (F149).
+    /// txn.
     instance_id: Rc<String>,
-    /// F207-C: unified extent-level in-flight ledger. Authoritative
+    /// unified extent-level in-flight ledger. Authoritative
     /// source of truth for every stream-layer op currently in flight
     /// (ConvertToEc / Recovery / Delete). Replaces the four scattered
-    /// inflight bookkeeping mechanisms that existed pre-F207
+    /// inflight bookkeeping mechanisms that existed before the unified ledger
     /// (`ec_conversion_inflight` HashSet, `pending_ec_dispatch` HashMap,
     /// `recovery_tasks` HashMap, `pending_extent_deletes` VecDeque).
     /// Persisted at etcd prefix `extent_inflight/`. See
@@ -666,7 +666,7 @@ pub struct AutumnManager {
     /// failover duplicate is a far narrower residual (the new leader hasn't
     /// processed the in-flight request).
     pub(crate) split_inflight: Rc<RefCell<std::collections::HashSet<u64>>>,
-    /// F207-C: in-memory live retry state for Delete ops. The ledger
+    /// in-memory live retry state for Delete ops. The ledger
     /// entry's `PersistedPendingDelete` payload is a snapshot of the
     /// original addrs (captured at enqueue time); the live "which
     /// addrs are still pending an ack" state lives here and is NOT
@@ -675,7 +675,7 @@ pub struct AutumnManager {
     /// on `enqueue_pending_deletes` and on `replay_from_etcd` (from
     /// Delete-kind ledger entries with attempts=0).
     pub(crate) delete_progress: Rc<RefCell<HashMap<u64, crate::extent_delete::PendingDelete>>>,
-    /// F210-G2: persisted "tried 60 times in extent_delete_loop and still
+    /// persisted "tried 60 times in extent_delete_loop and still
     /// failed" queue. Hydrated from the `extentDeleteRetry/` etcd
     /// prefix at replay; updated by `persist_failed_delete` and
     /// `extent_delete_retry_loop`. Survives manager restart + leader
@@ -686,7 +686,7 @@ pub struct AutumnManager {
     /// the entry moves to this queue).
     pub(crate) failed_deletes:
         Rc<RefCell<HashMap<u64, crate::extent_delete::MgrExtentDeleteRetry>>>,
-    /// F-FS-UNIFY M0 / F-KEY-NS SD-3: etcd-less (memory-only) shadow of the
+    /// Etcd-less (memory-only) shadow of the
     /// fuse-fs inode-allocator counter, keyed PER-VOLUME (the canonicalized
     /// `fs/{tenant}/{volume}/` prefix; empty key = the legacy global counter).
     /// In etcd-backed mode the AUTHORITATIVE per-volume counters live at
@@ -697,9 +697,9 @@ pub struct AutumnManager {
     /// etcd prefixes; inode numbers are fs-layer data with their own key.
     pub(crate) fs_next_inode: Rc<RefCell<HashMap<Vec<u8>, u64>>>,
     runtime_started: Rc<Cell<bool>>,
-    /// F265: true once `serve()`'s listener is actually BOUND and
+    /// true once `serve()`'s listener is actually BOUND and
     /// accepting. The UCX listener bind can retry through a killed
-    /// predecessor's TIME_WAIT window for ~60 s (F264) — far past
+    /// predecessor's TIME_WAIT window for ~60 s — far past
     /// `PS_DEAD_TIMEOUT` — during which no PS heartbeat can possibly
     /// arrive. `ps_liveness_check_loop` must not evict before this is
     /// set (observed: a respawned ucx manager won the election at ~4 s,
@@ -725,23 +725,23 @@ pub struct AutumnManager {
     /// disabled). Soft: select_nodes falls back to the full healthy set
     /// when too few spacious nodes remain.
     min_alloc_free_bytes: Rc<Cell<u64>>,
-    /// F211-I audit log retention (days; `--audit-retention-days`,
+    /// audit log retention (days; `--audit-retention-days`,
     /// default 90, 0 = disabled). Enforced by `audit_gc_loop` — the GC
-    /// helper existed since F211-I but had NO caller, so `mgr_audit_log/`
+    /// helper already existed but had NO caller, so `mgr_audit_log/`
     /// grew in etcd unboundedly.
     pub(crate) audit_retention_days: Rc<Cell<u64>>,
     /// etcd-chaos D1: WHY are we not leader? `true` (the safe default —
     /// every fresh/rejoined process starts displaced) = another instance
     /// holds/held leadership or we never won it: our in-memory state may
-    /// be arbitrarily stale → routing reads answer NOT_LEADER (the F267
-    /// H3 fix). `false` while `!leader` = we WERE the leader and lost the
+    /// be arbitrarily stale → routing reads answer NOT_LEADER (the
+    /// rejoined-follower fix). `false` while `!leader` = we WERE the leader and lost the
     /// lease without anyone replacing us (etcd outage / lease blip): our
     /// in-memory routing is the freshest that exists and NO new leader
     /// can be elected or mutate anything while etcd is down — serving
     /// get_regions + heartbeats STALE-WHILE-LEADERLESS keeps the data
     /// plane fully alive through etcd maintenance (pre-fix, a >90 s etcd
     /// outage black-holed fresh clients AND suicided the PS fleet).
-    /// Shared with `EtcdMirror` so the F149 fence-diagnosis paths can
+    /// Shared with `EtcdMirror` so the leader-fence diagnosis paths can
     /// flip it when they observe a DIFFERENT leader id.
     displaced: Rc<Cell<bool>>,
     /// etcd-chaos D1 (coco P1): when the stale-while-leaderless window
@@ -755,7 +755,7 @@ pub struct AutumnManager {
     /// the gate fails closed (pre-fix behavior).
     leaderless_since: Rc<Cell<Option<Instant>>>,
     conn_pool: Rc<ConnPool>,
-    /// F191: dedicated pool for control-plane RPCs to extent nodes
+    /// dedicated pool for control-plane RPCs to extent nodes
     /// (`EXT_MSG_DF`, future `MSG_REPORT_DISK_FAILURE`, future heartbeat).
     /// Separate from `conn_pool` (which carries data-plane RPCs like
     /// `CONVERT_TO_EC`, `COPY_EXTENT`, `RECOVERY`). The split prevents a
@@ -766,51 +766,51 @@ pub struct AutumnManager {
     /// here at `node.control_address` (or `node.address` for legacy
     /// nodes whose `control_address` is empty).
     control_pool: Rc<ConnPool>,
-    // F207-C: `pending_extent_deletes` field deleted. Replaced by
+    // `pending_extent_deletes` field deleted. Replaced by
     // `inflight` (etcd-persisted exclusion + snapshot for failover) +
-    // `delete_progress` (in-memory live retry state). The F109
+    // `delete_progress` (in-memory live retry state). The delete
     // semantics — "extents whose refs dropped to 0 still need to be
     // unlinked on every replica" — are unchanged; the persistence
     // model upgraded from in-memory only to etcd-backed (closes the
-    // pre-F207 footnote that manager restart lost pending entries).
-    /// F183: per-partition unix-epoch timestamp of the last split or merge
+    // pre-ledger footnote that manager restart lost pending entries).
+    /// per-partition unix-epoch timestamp of the last split or merge
     /// involving this partition. Sourced from etcd prefix
     /// `partitionLastOp/<part_id>` (i64 little-endian). Default 0 for
     /// partitions never split/merged. Used by the policy engine for
     /// cooldown.
     pub(crate) last_op_at: Rc<RefCell<HashMap<u64, i64>>>,
-    /// F183: policy engine — split/merge candidate computation over a
-    /// 30-min sliding window of per-partition load metrics. F202
-    /// extended it to also generate minor-compact + EC advisories.
-    /// F203 deleted the auto-dispatch consumer of this output — the
+    /// policy engine — split/merge candidate computation over a
+    /// 30-min sliding window of per-partition load metrics. It was
+    /// later extended to also generate minor-compact + EC advisories.
+    /// deleted the auto-dispatch consumer of this output — the
     /// engine is now advisory-only; external controllers query
     /// `MSG_GET_POLICY_CANDIDATES` and call client subcommands to
     /// act on what they see.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
-    /// F-DASH-IN-MGR M2: in-manager auto-policy controller state — mode +
+    /// M2: in-manager auto-policy controller state — mode +
     /// active policy + custom policies + cooldowns + rolling action log.
     /// Config (mode/active/custom) is etcd-persisted (`autoPolicy/config`,
     /// leader-fenced) + cooldowns (`autoPolicy/cooldowns`), replayed on leader
     /// promotion so the active policy survives failover. The controller loop
     /// runs ONLY on the leader and is DEFAULT-OFF (a fresh cluster stays
-    /// pure-mechanism, F203).
+    /// pure-mechanism).
     pub(crate) auto_policy: Rc<RefCell<crate::auto_policy::AutoPolicyState>>,
-    /// F-AUTOPOLICY-BOOT-DEFAULT: preset to seed as the active policy (Armed) on
+    /// preset to seed as the active policy (Armed) on
     /// a FRESH cluster — one with no persisted `autoPolicy/config`. Set from the
     /// bin (`--auto-policy-default <preset>`, deploy-layer default `balanced`);
     /// `None` = leave the controller Off until an operator activates one (cluster.sh
     /// / tests / dev). Seed is IN-MEMORY only, so the first operator config change
     /// (or a deactivate) persists over it and later failovers replay that instead.
     pub(crate) auto_policy_default: Rc<RefCell<Option<String>>>,
-    /// F-AUTOPOLICY-BOOT-DEFAULT: did the last etcd replay find a persisted
+    /// did the last etcd replay find a persisted
     /// `autoPolicy/config`? Set during replay, read by `apply_auto_policy_default`
     /// (which runs from the bin after flags are set) to decide whether to seed.
     pub(crate) auto_policy_had_persisted_config: Rc<Cell<bool>>,
-    /// F-DASH-IN-MGR M2: whether `--dashboard-allow-mutations` was set. ONE
+    /// M2: whether `--dashboard-allow-mutations` was set. ONE
     /// flag gates BOTH manual dashboard actions AND the controller leaving
     /// DryRun (user decision). Set from the bin; default false.
     pub(crate) dashboard_allow_mutations: Rc<Cell<bool>>,
-    /// F192: per-node sliding-window of push-based failure reports from
+    /// per-node sliding-window of push-based failure reports from
     /// PSes. Eviction window = `report_disk_failure_window`; quorum
     /// threshold = `report_disk_failure_quorum` distinct
     /// `reporter_part_id` → `mark_node_disks_offline` (in-memory only —
@@ -821,48 +821,48 @@ pub struct AutumnManager {
     /// reports doesn't re-trip the quorum after the node recovers.
     pub(crate) recent_failure_reports:
         Rc<RefCell<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>>,
-    /// F211-A: per-extent-node auto-tracked liveness (Online ↔ Suspected).
+    /// per-extent-node auto-tracked liveness (Online ↔ Suspected).
     /// Fed by `disk_status_update_loop` (df ok / fail) and `register_node`
-    /// (initial heartbeat). Consumed by F211-B health-report RPCs,
-    /// F211-E recovery dispatch gate, and F211-F EC dispatch loop's
+    /// (initial heartbeat). Consumed by health-report RPCs,
+    /// recovery dispatch gate, and the EC dispatch loop's
     /// Suspected-window skip. **No automatic Down transition** — fence
-    /// is operator-driven (F211-C `mgr_fence_node`).
+    /// is operator-driven (`mgr_fence_node`).
     pub(crate) node_states: Rc<RefCell<crate::node_state::NodeStateTracker>>,
-    /// F211-C: persistent operator overrides keyed on node_id. Mirrors
+    /// persistent operator overrides keyed on node_id. Mirrors
     /// the etcd prefix `node_override/<node_id>`. Mutated only via the
     /// admin RPCs `mgr_fence_node` / `mgr_set_node_maintenance` /
     /// `mgr_clear_node_override` / by Maintenance TTL expiry inside
     /// `node_states.tick()`. Survives leader failover via etcd replay.
     pub(crate) node_overrides: Rc<RefCell<HashMap<u64, MgrNodeOverride>>>,
-    /// F211-C: tombstones for `mgr_remove_node`. Etcd prefix
+    /// tombstones for `mgr_remove_node`. Etcd prefix
     /// `decommissioned/<node_id>` — written when the OP removes a node.
     /// Read by `handle_register_node`'s zombie-defense check.
     pub(crate) decommissioned: Rc<RefCell<HashMap<u64, MgrNodeOverride>>>,
-    /// F211-H: in-memory recovery throttle counters (per-source /
+    /// in-memory recovery throttle counters (per-source /
     /// per-target / global). Mutated by `dispatch_recovery_task` on
     /// acquire and by `apply_recovery_done` / `drain_extent_inflight_marker`
     /// on release. NOT persisted — limits are advisory, not safety
     /// invariants.
     pub(crate) recovery_limiter: Rc<RefCell<crate::recovery_rate_limiter::RecoveryRateLimiter>>,
-    /// F-FENCE-DRAIN: per-partition last `MSG_ROLL_TAILS` send time (unix secs).
+    /// per-partition last `MSG_ROLL_TAILS` send time (unix secs).
     /// The open-tail drain sweep in `recovery_dispatch_loop` uses a 30 s
     /// cooldown so a repeatedly-failing roll doesn't hammer the PS every tick.
     /// In-memory only (a routing hint; safe to lose on failover).
     pub(crate) roll_tails_cooldown: Rc<RefCell<HashMap<u64, i64>>>,
-    /// F211-I: per-process audit-log sequence counter. Combined with
+    /// per-process audit-log sequence counter. Combined with
     /// the unix-nanosecond timestamp to form the `mgr_audit_log/`
     /// suffix so ordering is unique even for concurrent appends.
     pub(crate) audit_seq: Rc<Cell<u64>>,
-    /// F195: F192 quorum debounce — sliding-window length. Default 60 s.
+    /// quorum debounce — sliding-window length. Default 60 s.
     /// Configured via the manager binary's `--report-disk-failure-window-secs`
     /// CLI flag (was previously `AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`).
     pub(crate) report_disk_failure_window: Cell<Duration>,
-    /// F195: F192 quorum debounce — distinct-reporter threshold to flip
+    /// quorum debounce — distinct-reporter threshold to flip
     /// node offline. Default 3. Configured via the manager binary's
     /// `--report-disk-failure-quorum` CLI flag (was previously
     /// `AUTUMN_REPORT_DISK_FAILURE_QUORUM`).
     pub(crate) report_disk_failure_quorum: Cell<usize>,
-    /// F214-A: persistent cluster identity. CAS-created in etcd
+    /// persistent cluster identity. CAS-created in etcd
     /// (`autumn-rs/cluster_id`) by the first leader; inherited by
     /// subsequent leaders via `replay_from_etcd`. Empty when the manager
     /// is running in memory-only mode (no etcd) — in that mode
@@ -880,7 +880,7 @@ pub struct AutumnManager {
     /// binary's own WIRE_VERSION_MAX). Memory-only mode starts at this
     /// binary's WIRE_VERSION_MAX.
     pub(crate) cluster_version: Rc<Cell<u32>>,
-    /// F-ioring-lease-1: inode-level lease registry shared between the
+    /// Inode-level lease registry shared between the
     /// AcquireLease / ReleaseLease / HeartbeatLease / PollInvalidations
     /// handlers and the `inode_lease_revoke_loop` background task.
     /// Writer leases are persisted under the `inode_leases/` etcd
@@ -888,25 +888,25 @@ pub struct AutumnManager {
     /// `crates/manager/src/inode_lease.rs` and
     /// `docs/autumn_fs_lease_plan.md`.
     pub(crate) inode_leases: crate::inode_lease::SharedRegistry,
-    /// F-AUTHZ-1: the manager's Ed25519 signing keyring (KDC private
+    /// the manager's Ed25519 signing keyring (KDC private
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz
     /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
     pub(crate) authz_keyring: Rc<RefCell<Option<crate::authz::AuthzKeyring>>>,
-    /// F-AUTHZ-1: admin token gating the tenant-create/delete RPCs
+    /// admin token gating the tenant-create/delete RPCs
     /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
     pub(crate) admin_token: Rc<RefCell<Option<String>>>,
-    /// F-AUTHZ-1: key prefixes under which the PS applies default-DENY (e.g.
+    /// key prefixes under which the PS applies default-DENY (e.g.
     /// `mem/`). Published in `GET_AUTHZ_CONFIG`. Each ends with `/`.
     pub(crate) protected_prefixes: Rc<RefCell<Vec<Vec<u8>>>>,
-    /// F-AUTHZ-1: TTL (seconds) minted tokens get. Default 3600 (1 h).
+    /// TTL (seconds) minted tokens get. Default 3600 (1 h).
     pub(crate) token_ttl_secs: Rc<Cell<u64>>,
-    /// F-AUTHZ-1: clock-skew leeway (seconds) advertised to the PS. Default 60.
+    /// clock-skew leeway (seconds) advertised to the PS. Default 60.
     pub(crate) clock_skew_secs: Rc<Cell<u64>>,
-    /// F-AUTHZ-1: tenant account DB (etcd `tenantAccount/<tenant>` →
+    /// tenant account DB (etcd `tenantAccount/<tenant>` →
     /// `MgrTenantAccount`). Replayed on leader failover; mutated only via the
     /// admin RPCs. Stores the credential HASH, never the raw credential.
     pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, MgrTenantAccount>>>,
-    /// F-AUTHZ-1: serializes the tenant create/delete critical section
+    /// serializes the tenant create/delete critical section
     /// (build → etcd write → in-memory apply). Handlers are spawned per-frame
     /// and interleave at the etcd await, and a tenant account's value is a
     /// NON-idempotent freshly-generated secret — without this, two concurrent
@@ -914,11 +914,11 @@ pub struct AutumnManager {
     /// the other, leaving the live leader's in-memory hash out of sync with
     /// etcd (coco P1). Low-frequency admin path → a global async mutex is free.
     pub(crate) tenant_admin_lock: Rc<futures::lock::Mutex<()>>,
-    /// F-KEY-NS D2: namespace registry shadow (etcd `namespace/<name>` →
+    /// D2: namespace registry shadow (etcd `namespace/<name>` →
     /// `MgrNamespace`). Replayed on leader failover; mutated only via the admin
     /// namespace-create/delete RPCs + `seed_builtin_namespaces`. Keyed by name.
     pub(crate) namespaces: Rc<RefCell<HashMap<String, MgrNamespace>>>,
-    /// F-KEY-NS D2: serializes the namespace create/delete critical section
+    /// D2: serializes the namespace create/delete critical section
     /// (build → etcd write → in-memory apply), mirroring `tenant_admin_lock`.
     /// Low-frequency admin path → a global async mutex is free.
     pub(crate) namespace_admin_lock: Rc<futures::lock::Mutex<()>>,
@@ -960,21 +960,21 @@ impl AutumnManager {
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
             dashboard_allow_mutations: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
-            // F195 defaults match the pre-F195 env defaults (F192).
+            // defaults match the legacy env defaults.
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
             report_disk_failure_quorum: Cell::new(3),
-            // F211-A: env-controlled soft-timeout, default 10 s.
+            // env-controlled soft-timeout, default 10 s.
             node_states: Rc::new(RefCell::new(crate::node_state::NodeStateTracker::default())),
-            // F211-C: starts empty; populated by replay / admin RPCs.
+            // starts empty; populated by replay / admin RPCs.
             node_overrides: Rc::new(RefCell::new(HashMap::new())),
             decommissioned: Rc::new(RefCell::new(HashMap::new())),
-            // F211-H: starts at the env-configured default limits.
+            // starts at the env-configured default limits.
             recovery_limiter: Rc::new(RefCell::new(
                 crate::recovery_rate_limiter::RecoveryRateLimiter::from_env(),
             )),
             roll_tails_cooldown: Rc::new(RefCell::new(HashMap::new())),
             audit_seq: Rc::new(Cell::new(0)),
-            // F214-A: in memory-only mode this serves as the cluster
+            // in memory-only mode this serves as the cluster
             // identity. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
             cluster_id: Rc::new(RefCell::new(uuid::Uuid::new_v4().to_string())),
@@ -982,14 +982,14 @@ impl AutumnManager {
             // version. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
             cluster_version: Rc::new(Cell::new(autumn_rpc::WIRE_VERSION_MAX)),
-            // F-ioring-lease-1: empty registry; populated on
+            // Empty registry; populated on
             // AcquireLease and on `replay_from_etcd`.
             inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(
                 std::time::Duration::from_secs(
                     crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64,
                 ),
             ))),
-            // F-AUTHZ-1: authz OFF unless the binary loads a signing-key file.
+            // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
             admin_token: Rc::new(RefCell::new(None)),
             protected_prefixes: Rc::new(RefCell::new(Vec::new())),
@@ -997,14 +997,14 @@ impl AutumnManager {
             clock_skew_secs: Rc::new(Cell::new(60)),
             tenant_accounts: Rc::new(RefCell::new(HashMap::new())),
             tenant_admin_lock: Rc::new(futures::lock::Mutex::new(())),
-            // F-KEY-NS D2: empty; populated by replay / admin RPCs /
+            // D2: empty; populated by replay / admin RPCs /
             // seed_builtin_namespaces on leader promotion.
             namespaces: Rc::new(RefCell::new(HashMap::new())),
             namespace_admin_lock: Rc::new(futures::lock::Mutex::new(())),
         }
     }
 
-    /// F195: F192 quorum debounce config setter. Called by the manager
+    /// Quorum debounce config setter. Called by the manager
     /// binary's main() after CLI parsing; the public API mirrors the
     /// existing `set_auto_split` / `set_policy_config` pattern.
     /// `quorum` is clamped to at least 1.
@@ -1013,19 +1013,19 @@ impl AutumnManager {
         self.report_disk_failure_quorum.set(quorum.max(1));
     }
 
-    /// F-AUTHZ-1: install the KDC signing keyring (parsed by the binary from
+    /// install the KDC signing keyring (parsed by the binary from
     /// `--auth-signing-key-file`). Its presence ENABLES data-plane authz.
     pub fn set_authz_keyring(&self, keyring: crate::authz::AuthzKeyring) {
         *self.authz_keyring.borrow_mut() = Some(keyring);
     }
 
-    /// F-AUTHZ-1: set the admin token gating tenant-create/delete
+    /// set the admin token gating tenant-create/delete
     /// (`--admin-token`). Without it those admin RPCs are refused.
     pub fn set_admin_token(&self, token: String) {
         *self.admin_token.borrow_mut() = Some(token);
     }
 
-    /// F-ADMIN-OP-AUTH (PS slice): prefix the manager's admin token onto a
+    /// (PS slice): prefix the manager's admin token onto a
     /// payload bound for a PS `is_admin_ps_msg` (split / maintenance). The
     /// manager DRIVES those ops itself — the auto-policy controller's split +
     /// gc/compact and merge's flush are manager→PS calls — so with the PS gate
@@ -1040,7 +1040,7 @@ impl AutumnManager {
         }
     }
 
-    /// F-AUTHZ-1: set the protected (default-DENY) key prefixes
+    /// set the protected (default-DENY) key prefixes
     /// (`--auth-protected-prefix`, repeatable). Each is normalized to end `/`.
     pub fn set_protected_prefixes(&self, mut prefixes: Vec<Vec<u8>>) {
         for p in &mut prefixes {
@@ -1051,7 +1051,7 @@ impl AutumnManager {
         *self.protected_prefixes.borrow_mut() = prefixes;
     }
 
-    /// F-AUTHZ-1: set the minted-token TTL in seconds. Clamped to
+    /// set the minted-token TTL in seconds. Clamped to
     /// [60, 30 days] — the design wants short TTLs (prod hours); the 30-day
     /// ceiling both discourages long-lived bearer tokens and prevents an absurd
     /// value from overflowing `now + ttl` (coco P2). 30-day cap is generous.
@@ -1059,22 +1059,22 @@ impl AutumnManager {
         self.token_ttl_secs.set(secs.clamp(60, 30 * 24 * 3600));
     }
 
-    /// F-AUTHZ-1: set the advertised clock-skew leeway in seconds. Capped at 1 h
+    /// set the advertised clock-skew leeway in seconds. Capped at 1 h
     /// (design suggests 30-120 s; the cap bounds `exp + skew` against wrap and a
     /// misconfigured huge leeway that would neuter expiry).
     pub fn set_clock_skew_secs(&self, secs: u64) {
         self.clock_skew_secs.set(secs.min(3600));
     }
 
-    /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
+    /// read the last_op_at timestamp for a partition (0 if never op'd).
     #[allow(dead_code)]
     pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
         self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
     }
 
-    /// F184 test helper: dispatch a SPLIT against `part_id` as if the
+    /// test helper: dispatch a SPLIT against `part_id` as if the
     /// policy engine had picked it. Snapshots state internally.
-    /// F184 test helper: override the policy engine's thresholds.
+    /// test helper: override the policy engine's thresholds.
     /// Tests can lower `required_buckets` and `tick_interval_sec` to
     /// fast-mode the full policy_tick_loop.
     pub fn set_policy_config(&self, config: crate::policy::PolicyConfig) {
@@ -1097,7 +1097,7 @@ impl AutumnManager {
         self.auto_dispatch_split(&cand, &state).await
     }
 
-    /// F184 test helper: orchestrate a MERGE for (survivor, victim) as
+    /// test helper: orchestrate a MERGE for (survivor, victim) as
     /// if the policy engine had picked it. Snapshots state internally.
     pub async fn force_auto_merge(&self, survivor: u64, victim: u64) -> Result<()> {
         let state = (*self.store.inner.borrow()).clone();
@@ -1150,7 +1150,7 @@ impl AutumnManager {
     /// leaderless WITHOUT displacement (we were the last leader and no
     /// one can have superseded our state — etcd outage). Mutating
     /// handlers stay on the strict `ensure_leader` (they need etcd
-    /// anyway). The F267/H3 rejoined-follower blackhole stays closed:
+    /// anyway). The rejoined-follower blackhole stays closed:
     /// a process that never won (or observed another holder) has
     /// `displaced == true`.
     pub(crate) fn ensure_routable(&self) -> Result<(), AppError> {
@@ -1175,8 +1175,8 @@ impl AutumnManager {
 
     /// Start background loops. Called from `new_with_etcd` and `serve`.
     /// Idempotent — safe to call multiple times.
-    /// F228 (1C): spawn a manager background loop with panic-isolation +
-    /// auto-restart. Pre-F228 each loop was a bare
+    /// (1C): spawn a manager background loop with panic-isolation +
+    /// auto-restart. Previously each loop was a bare
     /// `compio::runtime::spawn(...).detach()` with NO supervision: a panic
     /// (e.g. a RefCell double-borrow, an index out of bounds) silently
     /// killed just that one task while the rest of the manager kept
@@ -1189,7 +1189,7 @@ impl AutumnManager {
     ///
     /// NOTE: `catch_unwind` cannot rescue a *hung* `.await` — a stuck
     /// future never returns, so the supervisor would wait forever too.
-    /// Hangs are prevented separately by F228 (1A): every await a loop can
+    /// Hangs are prevented separately (1A): every await a loop can
     /// reach is now bounded (etcd `unary_call` timeout, ConnPool connect +
     /// request timeouts). The two together close both failure modes.
     ///
@@ -1197,7 +1197,7 @@ impl AutumnManager {
     /// wraps the future in `AssertUnwindSafe(future).catch_unwind()`
     /// internally (compio-runtime-0.11.0/src/runtime/mod.rs:202); its
     /// `JoinHandle<T>` is `Task<Result<T, Box<dyn Any + Send>>>`. That's
-    /// why pre-F228 `spawn(loop).detach()` was "silently dead" — compio
+    /// why the earlier `spawn(loop).detach()` was "silently dead" — compio
     /// caught the panic, then `.detach()` dropped the captured `Err`. Our
     /// inner `catch_unwind` here is for OBSERVABILITY + RESTART decisioning
     /// (read the Result to log + sleep + reschedule), NOT to keep the
@@ -1234,7 +1234,7 @@ impl AutumnManager {
         }
         self.runtime_started.set(true);
 
-        // F228 (1C): every loop runs under spawn_supervised (panic ->
+        // (1C): every loop runs under spawn_supervised (panic ->
         // ERROR log + restart) instead of a bare detached spawn.
 
         // Leader election only needed with etcd (non-etcd is always leader).
@@ -1250,14 +1250,14 @@ impl AutumnManager {
             mgr.clone().recovery_dispatch_loop()
         });
 
-        // F222: single df caller — merges the former recovery_collect_loop
+        // single df caller — merges the former recovery_collect_loop
         // (2 s, apply done_tasks) and disk_status_update_loop (10 s, disk +
         // node liveness). Eliminates the race where the empty-`tasks` df
         // drained the EN's recovery_done and discarded the completions.
         let mgr = self.clone();
         Self::spawn_supervised("node_health", move || mgr.clone().node_health_loop());
 
-        // F211-I completion: audit retention GC was a dead helper —
+        // completion: audit retention GC was a dead helper —
         // mgr_audit_log/ grew unboundedly. Daily leader-only sweep.
         if self.etcd.is_some() {
             let mgr = self.clone();
@@ -1274,11 +1274,11 @@ impl AutumnManager {
             mgr.clone().ps_liveness_check_loop()
         });
 
-        // F109: physical extent file deletion fanout.
+        // physical extent file deletion fanout.
         let mgr = self.clone();
         Self::spawn_supervised("extent_delete", move || mgr.clone().extent_delete_loop());
 
-        // F210-G2: persisted-retry slow loop for deletes that exhausted
+        // persisted-retry slow loop for deletes that exhausted
         // the primary 60-attempt budget.
         let mgr = self.clone();
         Self::spawn_supervised("extent_delete_retry", move || {
@@ -1294,16 +1294,16 @@ impl AutumnManager {
             mgr.clone().extent_both_zero_sweep_loop()
         });
 
-        // F183: policy advisory tick.
+        // policy advisory tick.
         let mgr = self.clone();
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
 
-        // F-DASH-IN-MGR M2: leader-fenced auto-policy controller (DEFAULT-OFF;
+        // M2: leader-fenced auto-policy controller (DEFAULT-OFF;
         // ticks + actuates ONLY on the leader; Armed needs --dashboard-allow-mutations).
         let mgr = self.clone();
         Self::spawn_supervised("auto_policy", move || mgr.clone().auto_policy_tick_loop());
 
-        // F207-D: stale-marker WARN sweep. Iterates the inflight ledger
+        // stale-marker WARN sweep. Iterates the inflight ledger
         // every 5 minutes and logs WARN for any marker > 24h old.
         // Auto-clearing is INTENTIONALLY not done — a stuck marker
         // usually signals a real bug worth surfacing. Operator runs the
@@ -1314,7 +1314,7 @@ impl AutumnManager {
             mgr.clone().extent_inflight_stale_sweep_loop()
         });
 
-        // F-ioring-lease-1: TTL revoke pass — once per second, sweep
+        // TTL revoke pass — once per second, sweep
         // expired writer leases (queues `LEASE_REVOKED` invalidations
         // for readers; etcd-deletes the persisted record) and silently
         // drops expired reader leases.
@@ -1324,7 +1324,7 @@ impl AutumnManager {
         });
     }
 
-    /// F183: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
+    /// every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
     /// candidates from the per-partition load windows + last_op_at +
     /// region owners. Logs new candidates at INFO; exposes the cache
     /// via MSG_GET_POLICY_CANDIDATES.
@@ -1349,7 +1349,7 @@ impl AutumnManager {
             // advisory passes + cache write) under a single policy borrow.
             let cands = self.recompute_advisory_cache(&state_snapshot, &last_op, &owners, now);
             if !cands.is_empty() {
-                tracing::info!("F183/F187/F202 policy: {} candidate(s)", cands.len());
+                tracing::info!("policy: {} candidate(s)", cands.len());
                 for c in &cands {
                     let kind = match c.kind {
                         POLICY_KIND_SPLIT => "SPLIT",
@@ -1376,7 +1376,7 @@ impl AutumnManager {
                 }
             }
 
-            // F203: in-kernel auto-dispatch removed. The advisory_cache
+            // in-kernel auto-dispatch removed. The advisory_cache
             // is the manager's only contribution to operational policy;
             // an external controller queries `MSG_GET_POLICY_CANDIDATES`
             // (or `client policy`) and acts via the existing client
@@ -1393,7 +1393,7 @@ impl AutumnManager {
     /// prune stale metrics, run all five advisory passes (split/merge
     /// candidates, maintenance GC/major+minor-compact, hot/cold, EC), store the
     /// union into `advisory_cache` (read by `MSG_GET_POLICY_CANDIDATES`), and
-    /// return it for logging. Advisory-only (F203): no etcd write, no
+    /// return it for logging. Advisory-only: no etcd write, no
     /// extent-state mutation, no fencing. All passes run under a SINGLE
     /// `self.policy` borrow (there is no await), collapsing what were six
     /// separate borrow scopes in the loop body.
@@ -1404,7 +1404,7 @@ impl AutumnManager {
         owners: &HashMap<u64, u64>,
         now: i64,
     ) -> Vec<PolicyCandidate> {
-        // F-FS-GEOM-DECLARED step 4: refresh the operator-declared boundaries
+        // step 4: refresh the operator-declared boundaries
         // BEFORE borrowing the engine (`sacred_boundaries()` borrows
         // `self.namespaces`, and holding the policy borrow across it would be
         // fine today but is exactly the kind of nested-borrow that later grows
@@ -1412,7 +1412,7 @@ impl AutumnManager {
         let sacred = self.sacred_boundaries();
         let mut p = self.policy.borrow_mut();
         p.sacred_boundaries = sacred;
-        // F210-F3: prune metrics for partitions that no longer exist
+        // prune metrics for partitions that no longer exist
         // (post-split / merge / PS-evict) whose latest bucket has aged past
         // STALE_METRICS_AGE_SEC — else advisories fire off zombie metrics
         // indefinitely after a partition is merged away.
@@ -1423,20 +1423,20 @@ impl AutumnManager {
             region_owners: owners,
             now,
         });
-        // F187: maintenance (GC + major/minor compact) — windowed metrics only
+        // maintenance (GC + major/minor compact) — windowed metrics only
         // (`last_gc_at` / `last_compact_at` come from the PS-reported buckets).
         cands.append(&mut p.compute_maintenance_advisory(now));
-        // F196 Stage D: hot/cold imbalance (kind = POLICY_KIND_HOT_COLD), ridden
+        // Stage D: hot/cold imbalance (kind = POLICY_KIND_HOT_COLD), ridden
         // on the same advisory_cache for `client info` rendering.
-        // F-POLICY-SIZE-EST-LIVE: the size dimension consumes the same
+        // the size dimension consumes the same
         // effective-size口径 as split/merge (sealed sums + PS-reported
         // open-tail/debt gauges), so a VP-heavy partition is visible to it.
         let sealed_sums = crate::policy::partition_sealed_sums(state);
         cands.append(&mut p.compute_hot_cold_advisory(owners, &sealed_sums, now));
-        // F202: EC advisory — per-extent, sourced from streams + extents (not
+        // EC advisory — per-extent, sourced from streams + extents (not
         // partition-windowed); the helper filters extents < ec_min_extent_bytes.
         cands.append(&mut p.compute_ec_advisory(state, now));
-        // F-REGION-REBALANCE Phase B: cluster-level region→PS imbalance advisory
+        // Phase B: cluster-level region→PS imbalance advisory
         // (kind = POLICY_KIND_REBALANCE), sourced from regions + ps_nodes.
         cands.append(&mut p.compute_rebalance_advisory(state, now));
         // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 8 kinds
@@ -1446,7 +1446,7 @@ impl AutumnManager {
         cands
     }
 
-    // ── F-DASH-IN-MGR M2: auto-policy controller config ──────────────────
+    // ── auto-policy controller config ──────────────────────────────────
 
     /// Whether manual dashboard actions + the controller's Armed mode are
     /// honored. Set from the bin (`--dashboard-allow-mutations`).
@@ -1454,7 +1454,7 @@ impl AutumnManager {
         self.dashboard_allow_mutations.set(v);
     }
 
-    /// F-AUTOPOLICY-BOOT-DEFAULT: set the preset to seed as the active policy on
+    /// set the preset to seed as the active policy on
     /// a fresh cluster. Validated (must be a known preset) — an unknown name is a
     /// startup error, surfaced by the bin.
     pub fn set_auto_policy_default(&self, preset: String) {
@@ -1467,7 +1467,7 @@ impl AutumnManager {
         crate::auto_policy::is_preset_name(name)
     }
 
-    /// F-AUTOPOLICY-BOOT-DEFAULT: seed the default active policy when the cluster
+    /// seed the default active policy when the cluster
     /// has NO persisted `autoPolicy/config` (a fresh cluster). In-memory only —
     /// the moment an operator changes the config (or deactivates) it persists and
     /// this never fires again for that cluster. `mode = Armed`, but Armed is
@@ -1498,7 +1498,7 @@ impl AutumnManager {
         tracing::info!(
             preset,
             armed_honored = self.dashboard_allow_mutations.get(),
-            "F-AUTOPOLICY-BOOT-DEFAULT: seeded default active policy on a fresh cluster \
+            "seeded default active policy on a fresh cluster \
              (Armed; actuation requires --dashboard-allow-mutations)"
         );
     }
@@ -1538,7 +1538,7 @@ impl AutumnManager {
 
     /// Apply an `AutoPolicySet` op (SET_MODE / SET_ACTIVE / UPSERT / DELETE),
     /// persist the new config to etcd, and echo the resulting state. Leader-only
-    /// (the etcd write is F149-fenced; a follower fails NotLeader). Shared by the
+    /// (the etcd write is leader-fenced; a follower fails NotLeader). Shared by the
     /// `MSG_AUTOPOLICY_SET` handler, the dashboard `/api/policies/*`, and
     /// `autumn-op auto-policy`.
     pub(crate) async fn autopolicy_set(
@@ -1688,7 +1688,7 @@ impl AutumnManager {
                 gc_empty_only: false,
             },
         );
-        // F-ADMIN-OP-AUTH (PS slice): authenticate the manager's own maintenance
+        // (PS slice): authenticate the manager's own maintenance
         // call so the PS gate (when a token is configured) admits it.
         let payload = self.admin_prefix_ps(payload);
         let resp_bytes = self
@@ -1711,11 +1711,11 @@ impl AutumnManager {
     }
 
     /// Actuate ONE advisory candidate IN-PROCESS (no autumn-op subprocess).
-    /// split → auto_dispatch_split; merge → the F185 freeze-drain handler (NOT
-    /// the F184 flush path — avoids the ~5% loss window); gc/compact → PS
+    /// split → auto_dispatch_split; merge → the freeze-drain handler (NOT
+    /// the raw flush path — avoids the ~5% loss window); gc/compact → PS
     /// MSG_MAINTENANCE; ec → handle_force_ec_convert. Every underlying op is
-    /// already crash-safe + idempotent-on-retry (F149 fence / F207 ledger / F185
-    /// freeze), so a refusal is logged + retried next tick.
+    /// already crash-safe + idempotent-on-retry (leader fence / inflight ledger /
+    /// freeze-drain), so a refusal is logged + retried next tick.
     async fn actuate_candidate(
         &self,
         cand: &PolicyCandidate,
@@ -1729,8 +1729,8 @@ impl AutumnManager {
                     victim_part_id: cand.secondary_part_id,
                     // NEVER force from the automatic path: the controller is
                     // precisely the actor that must not silently erase an
-                    // operator-declared presplit boundary (F-FS-GEOM-DECLARED
-                    // step 4). `merge_candidates` already skips these, so this
+                    // operator-declared presplit boundary (the declared-geometry
+                    // merge guard). `merge_candidates` already skips these, so this
                     // is the belt to that suspenders.
                     force: false,
                 };
@@ -1779,7 +1779,7 @@ impl AutumnManager {
                 Ok(())
             }
             POLICY_KIND_REBALANCE => {
-                // F-REGION-REBALANCE Phase B: move a BOUNDED batch per tick so a
+                // Phase B: move a BOUNDED batch per tick so a
                 // concentrated cluster converges gradually (the target PSes take
                 // a reopen storm otherwise). The advisory's own cooldown paces
                 // re-emission; this cap paces each actuation.
@@ -1800,7 +1800,7 @@ impl AutumnManager {
         }
     }
 
-    /// F-DASH-IN-MGR M3: actuate ONE manual dashboard action IN-PROCESS from a
+    /// M3: actuate ONE manual dashboard action IN-PROCESS from a
     /// STRUCTURED request (no CLI command string). `action` is the verb; the
     /// typed ids carry the target(s). Dispatches to the SAME underlying ops as
     /// the controller loop (no subprocess, no `autumn-op`). The dashboard
@@ -1900,7 +1900,7 @@ impl AutumnManager {
                 Ok(format!("force_ec_convert extent {extent_id} OK"))
             }
             "rebalance" => {
-                // F-REGION-REBALANCE Phase B: manual dashboard trigger, same
+                // Phase B: manual dashboard trigger, same
                 // bounded per-tick batch as the armed controller.
                 let max_moves = self.policy.borrow().config.rebalance_max_moves_per_tick;
                 let req = RebalanceRegionsReq { max_moves };
@@ -1919,14 +1919,14 @@ impl AutumnManager {
         }
     }
 
-    /// The leader-fenced auto-policy controller tick loop (F-DASH-IN-MGR M2).
+    /// The leader-fenced auto-policy controller tick loop.
     ///
     /// **INVARIANT (leader-only):** every tick begins with `leader.get()` — no
     /// candidate read, no decision, no actuation on a follower. DEFAULT-OFF: an
-    /// `Off` mode (fresh cluster) does nothing, preserving F203 pure-mechanism.
+    /// `Off` mode (fresh cluster) does nothing, preserving pure-mechanism.
     /// `Armed` actuates ONLY when `--dashboard-allow-mutations` is set, else it
     /// degrades to DryRun with the reason logged. Registered under
-    /// `spawn_supervised` (F228). Replaces the retired Python `AutoPolicy` loop,
+    /// `spawn_supervised`. Replaces the retired Python `AutoPolicy` loop,
     /// hosted on the crash-safe leader instead of a killable webserver.
     async fn auto_policy_tick_loop(self) {
         loop {
@@ -1991,7 +1991,7 @@ impl AutumnManager {
             let mut any_issued = false;
             for (cand, cmd, key) in actions {
                 if !self.leader.get() {
-                    break; // lost leadership mid-batch — stragglers are F149-fenced anyway
+                    break; // lost leadership mid-batch — stragglers are leader-fenced anyway
                 }
                 let desc = crate::auto_policy::describe_candidate(&cand);
                 let cmd_str = cmd.join(" ");
@@ -2031,9 +2031,9 @@ impl AutumnManager {
         }
     }
 
-    /// F184: auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
+    /// auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
     /// The PS handler (`handle_split_part`) already implements the full
-    /// F140 dual-gate + F103 auth-rg flow; we just send the RPC.
+    /// dual-gate + auth-rg flow; we just send the RPC.
     pub async fn auto_dispatch_split(
         &self,
         cand: &PolicyCandidate,
@@ -2044,14 +2044,14 @@ impl AutumnManager {
             .regions
             .get(&cand.primary_part_id)
             .ok_or_else(|| anyhow::anyhow!("no region for part {}", cand.primary_part_id))?;
-        // Prefer per-partition address (F099-K) when present; fall back to PS-level.
+        // Prefer per-partition address when present; fall back to PS-level.
         let ps_addr = state
             .part_addrs
             .get(&cand.primary_part_id)
             .cloned()
             .or_else(|| state.ps_nodes.get(&region.ps_id).cloned())
             .ok_or_else(|| anyhow::anyhow!("no address for part {}", cand.primary_part_id))?;
-        // F-FS-GEOM-DECLARED: SNAP to an operator-declared boundary when one
+        // SNAP to an operator-declared boundary when one
         // lies inside this partition, instead of letting the PS pick a median
         // user key.
         //
@@ -2085,7 +2085,7 @@ impl AutumnManager {
                 // point an intra-lane cut is exactly what's wanted.
                 at_key,
             });
-        // F-ADMIN-OP-AUTH (PS slice): the controller's auto-split is a manager→PS
+        // (PS slice): the controller's auto-split is a manager→PS
         // MSG_SPLIT_PART, gated by the PS — prefix the manager's admin token.
         let payload = self.admin_prefix_ps(payload);
         // 60 s — split has to flush memtable + commit_length × 3 + a
@@ -2109,13 +2109,13 @@ impl AutumnManager {
             anyhow::bail!("split returned code {}: {}", resp.code, resp.message);
         }
         tracing::info!(
-            "F184 auto-split part={} dispatched OK",
+            "auto-split part={} dispatched OK",
             cand.primary_part_id
         );
         Ok(())
     }
 
-    /// F184: auto-orchestrate MERGE for a same-PS adjacent cold pair.
+    /// auto-orchestrate MERGE for a same-PS adjacent cold pair.
     /// Mirrors the CLI orchestration (FLUSH both → admin owner-lock →
     /// commit_lengths → multi_modify_merge). PS-side state catches up
     /// via region_sync_loop within ~2 s.
@@ -2141,7 +2141,7 @@ impl AutumnManager {
             .ok_or_else(|| anyhow::anyhow!("no address for victim {victim_id}"))?;
 
         // FLUSH both partitions.
-        // F-ADMIN-OP-AUTH (PS slice): merge's flush is a manager→PS MSG_MAINTENANCE;
+        // (PS slice): merge's flush is a manager→PS MSG_MAINTENANCE;
         // capture the admin token so the closure can prefix it (the closure moves
         // `pool`, not `self`).
         let admin_tok: Option<Vec<u8>> =
@@ -2155,7 +2155,7 @@ impl AutumnManager {
                         part_id: pid,
                         op: autumn_rpc::partition_rpc::MAINTENANCE_FLUSH,
                         extent_ids: vec![],
-                        // F201 wire fields — ignored for FLUSH op.
+                        // wire fields — ignored for FLUSH op.
                         gc_ratio: None,
                         gc_max_size: None,
                         gc_stream_debt: None,
@@ -2242,14 +2242,14 @@ impl AutumnManager {
             anyhow::bail!("merge returned code {}: {}", resp.code, resp.message);
         }
         tracing::info!(
-            "F184 auto-merge survivor={survivor_id} victim={victim_id} OK \
+            "auto-merge survivor={survivor_id} victim={victim_id} OK \
              (E_new={})",
             resp.new_log_tail_extent_id
         );
         Ok(())
     }
 
-    /// F184 helper: query commit_length for one stream by hitting the
+    /// helper: query commit_length for one stream by hitting the
     /// stream's tail extent's replicas via ConnPool.
     async fn commit_length_for_stream(
         &self,
@@ -2364,23 +2364,23 @@ impl AutumnManager {
             return Ok(false);
         }
 
-        // F210-A3: replay_from_etcd BEFORE set_leader(true). Pre-F210-A3,
+        // replay_from_etcd BEFORE set_leader(true). Previously,
         // set_leader(true) ran first; during the (typically short) replay
         // window any concurrent mutating RPC saw leader=true but the
         // in-memory store was still empty / being repopulated, and could
         // compute mutations against a stale base, durably mirroring them
-        // to etcd via the F149 fence (which only checks instance_id, not
+        // to etcd via the leader fence (which only checks instance_id, not
         // "post-replay"). Replay then re-overwrote in-memory with the
         // (now-corrupted) etcd state.
         //
-        // After F210-A3: ensure_leader() (= self.leader.get()) returns
+        // After the reordering: ensure_leader() (= self.leader.get()) returns
         // false during replay; mutating handlers reject with
         // CODE_NOT_LEADER; client retries land after replay completes and
         // the handler runs with a fully-rebuilt store.
         //
         // Lease TTL is 10 s. Typical replay is sub-second; if etcd is so
         // big replay exceeds 10 s, the lease expires before set_leader
-        // and the next mutating RPC's F149 fence flips us back to
+        // and the next mutating RPC's leader fence flips us back to
         // non-leader — the election loop retries. The deeper fix (start
         // keepalive between CAS and replay so the lease stays alive
         // through arbitrarily long replays) is filed as a P3 follow-up
@@ -2390,7 +2390,7 @@ impl AutumnManager {
         self.displaced.set(false);
         self.leaderless_since.set(None);
 
-        // F214-A: ensure the cluster identity is imprinted in etcd. The
+        // ensure the cluster identity is imprinted in etcd. The
         // CAS uses create_revision==0, so only the first leader ever to
         // run against a fresh etcd actually writes; subsequent leaders
         // re-CAS, observe `succeeded == false`, and read the existing
@@ -2399,9 +2399,9 @@ impl AutumnManager {
         // etcd". Best-effort: a failure here logs WARN and leaves the
         // per-process UUID as the cluster_id; the next election retry
         // will try again. Wire through `txn_fenced` so the write
-        // inherits the F149 leader-fence guarantee.
+        // inherits the leader-fence guarantee.
         if let Err(err) = self.imprint_cluster_id().await {
-            tracing::warn!(error = %err, "F214-A: imprint_cluster_id failed");
+            tracing::warn!(error = %err, "imprint_cluster_id failed");
         }
 
         // R1: ensure cluster_version exists in etcd (same CAS-imprint
@@ -2418,13 +2418,13 @@ impl AutumnManager {
             tracing::warn!(error = %err, "R1: imprint_cluster_version failed");
         }
 
-        // F-KEY-NS D2: CAS-preregister the built-in namespace families
+        // D2: CAS-preregister the built-in namespace families
         // (`fs`/`kvc`/`mem`). Same best-effort posture as imprint_cluster_id:
         // a failure logs WARN and the next election retry re-seeds. Idempotent
         // (CAS create_revision==0 — a namespace already present is left as-is,
         // preserving any owner assigned later).
         if let Err(err) = self.seed_builtin_namespaces().await {
-            tracing::warn!(error = %err, "F-KEY-NS: seed_builtin_namespaces failed");
+            tracing::warn!(error = %err, "seed_builtin_namespaces failed");
         }
 
         let mgr = self.clone();
@@ -2436,7 +2436,7 @@ impl AutumnManager {
         Ok(true)
     }
 
-    /// F214-A: CAS-imprint the cluster_id key in etcd. Idempotent.
+    /// CAS-imprint the cluster_id key in etcd. Idempotent.
     /// On first ever leader: generates a fresh UUID and CAS-writes
     /// `create_revision==0`. On subsequent leaders the CAS fails (key
     /// already exists), and we read the existing value to install it
@@ -2476,7 +2476,7 @@ impl AutumnManager {
                 *self.cluster_id.borrow_mut() = fresh;
                 tracing::info!(
                     cluster_id = %self.cluster_id.borrow().as_str(),
-                    "F214-A: imprinted fresh cluster_id"
+                    "imprinted fresh cluster_id"
                 );
                 Ok(())
             }
@@ -2583,7 +2583,7 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
         }
     }
 
-    /// F-KEY-NS D2: CAS-preregister the built-in namespace families
+    /// D2: CAS-preregister the built-in namespace families
     /// (`fs`/`kvc`/`mem`). Runs on every leader promotion (after replay), same
     /// idempotent best-effort shape as `imprint_cluster_id`: a family already in
     /// the registry (loaded by replay or seeded by a prior leader) is left
@@ -2623,7 +2623,7 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
                     self.namespaces
                         .borrow_mut()
                         .insert(name.to_string(), row);
-                    tracing::info!(namespace = name, "F-KEY-NS: preregistered built-in namespace");
+                    tracing::info!(namespace = name, "preregistered built-in namespace");
                 }
                 false => {
                     // CAS lost — re-read whoever wrote first and install it.
@@ -2807,7 +2807,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     tracing::warn!(
                         node_id = id,
                         error = %e,
-                        "F211-C: skipping malformed {} entry",
+                        "skipping malformed {} entry",
                         label
                     );
                     continue;
@@ -2834,32 +2834,32 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let partitions = c.get_prefix("partitions/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
-        // F183: per-partition last_op_at sidecar
+        // per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
-        // F207: unified extent in-flight ledger. Authoritative source of
+        // unified extent in-flight ledger. Authoritative source of
         // truth for stream-layer ops in flight on each extent.
         let extent_inflight_raw = c
             .get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX)
             .await?;
-        // F210-G2: persisted retry queue for extent deletes that
+        // persisted retry queue for extent deletes that
         // exhausted the primary in-memory loop's budget.
         let failed_delete_raw = c
             .get_prefix(crate::extent_delete::EXTENT_DELETE_RETRY_PREFIX)
             .await?;
-        // F211-C: persistent operator overrides + decommissioned tombstones.
+        // persistent operator overrides + decommissioned tombstones.
         let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
-        // F214-A: cluster identity (single key, not a prefix).
+        // cluster identity (single key, not a prefix).
         let cluster_id_kv = c.get(CLUSTER_ID_KEY.as_bytes()).await?;
         // R1: persisted cluster_version (single key, ASCII decimal).
         let cluster_version_kv = c.get(CLUSTER_VERSION_KEY.as_bytes()).await?;
-        // F-ioring-lease-1: persisted writer leases.
+        // Persisted writer leases.
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
-        // F-AUTHZ-1: persisted tenant account DB.
+        // persisted tenant account DB.
         let tenant_account_raw = c.get_prefix(TENANT_ACCOUNT_PREFIX).await?;
-        // F-KEY-NS D2: persisted namespace registry.
+        // D2: persisted namespace registry.
         let namespace_raw = c.get_prefix(NAMESPACE_PREFIX).await?;
-        // F-DASH-IN-MGR M2: auto-policy controller config + cooldowns (single keys)
+        // M2: auto-policy controller config + cooldowns (single keys)
         // so the active policy + mode survive leader failover.
         let autopolicy_config_kv = c.get(b"autoPolicy/config").await?;
         let autopolicy_cooldowns_kv = c.get(b"autoPolicy/cooldowns").await?;
@@ -2883,7 +2883,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 .strip_prefix("ownerLocks/")
                 .ok_or_else(|| anyhow::anyhow!("invalid owner lock key: {raw}"))?
                 .to_string();
-            // F265: epoch = mod_revision (bumped on every acquire), NOT
+            // epoch = mod_revision (bumped on every acquire), NOT
             // create_revision. Must match `acquire_owner_epoch` or the
             // post-failover `ensure_owner_epoch` equality check rejects
             // every live owner.
@@ -2910,7 +2910,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             decoded_regions.insert(id, region);
         }
 
-        // F183: parse partitionLastOp/ sidecar (i64 little-endian)
+        // parse partitionLastOp/ sidecar (i64 little-endian)
         let mut decoded_last_op: HashMap<u64, i64> = HashMap::new();
         for kv in &last_op.kvs {
             let id = Self::parse_id_from_key("partitionLastOp/", &kv.key)?;
@@ -2933,10 +2933,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
-        // F211-A: seed the node-state tracker with an OK heartbeat for
+        // seed the node-state tracker with an OK heartbeat for
         // every replayed EN node so the new leader starts with all
         // nodes Online; the next `df` poll (10 s tick) will re-derive
-        // the truth from RPC outcomes. Mirrors the F210-G1 approach
+        // the truth from RPC outcomes. Mirrors the approach
         // for PS heartbeats below.
         {
             let mut t = self.node_states.borrow_mut();
@@ -2945,9 +2945,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 t.on_heartbeat_ok(*node_id);
             }
         }
-        // F211-C: replay persistent operator overrides (Fenced /
+        // replay persistent operator overrides (Fenced /
         // Maintenance). Overrides survive leader failover so the new
-        // leader's `recovery_dispatch_loop` (F211-E) sees the same
+        // leader's `recovery_dispatch_loop` sees the same
         // Fenced set as the deposed leader.
         Self::replay_node_override_map(
             &node_override_raw.kvs,
@@ -2961,7 +2961,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             "decommissioned",
             &mut self.decommissioned.borrow_mut(),
         )?;
-        // F-AUTHZ-1: replay the KDC tenant account DB. String-keyed (tenant
+        // replay the KDC tenant account DB. String-keyed (tenant
         // name), so we can't use replay_node_override_map (u64 id); mirror the
         // ownerLocks/ inline pattern. A malformed account is fail-loud (a bad
         // authz record must not silently start the KDC half-armed — it would
@@ -2977,12 +2977,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     .ok_or_else(|| anyhow::anyhow!("invalid tenantAccount key: {raw}"))?
                     .to_string();
                 let acct: MgrTenantAccount = rkyv_decode(&kv.value).map_err(|e| {
-                    anyhow::anyhow!("F-AUTHZ-1: malformed tenantAccount/{tenant}: {e}")
+                    anyhow::anyhow!("malformed tenantAccount/{tenant}: {e}")
                 })?;
                 accts.insert(tenant, acct);
             }
         }
-        // F-KEY-NS D2: replay the namespace registry. String-keyed (namespace
+        // D2: replay the namespace registry. String-keyed (namespace
         // name), so mirror the tenantAccount/ inline pattern above. A malformed
         // row is fail-loud (note 39): a bad registry record must not silently
         // start the manager with a half-populated namespace set — Layer-A / the
@@ -3004,22 +3004,22 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     .ok_or_else(|| anyhow::anyhow!("invalid namespace key: {raw}"))?
                     .to_string();
                 let row: MgrNamespace = rkyv_decode(&kv.value)
-                    .map_err(|e| anyhow::anyhow!("F-KEY-NS: malformed namespace/{name}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("malformed namespace/{name}: {e}"))?;
                 // Semantic consistency — the stored fields must match the key and
                 // the naming rules the create path enforces.
                 if let Err(msg) = validate_namespace_name(&name) {
-                    return Err(anyhow::anyhow!("F-KEY-NS: namespace/{name} invalid name: {msg}"));
+                    return Err(anyhow::anyhow!("namespace/{name} invalid name: {msg}"));
                 }
                 if row.name != name {
                     return Err(anyhow::anyhow!(
-                        "F-KEY-NS: namespace/{name} row.name mismatch ('{}' != key '{name}')",
+                        "namespace/{name} row.name mismatch ('{}' != key '{name}')",
                         row.name
                     ));
                 }
                 let expect_prefix = format!("{name}/").into_bytes();
                 if row.prefix != expect_prefix {
                     return Err(anyhow::anyhow!(
-                        "F-KEY-NS: namespace/{name} row.prefix mismatch (got {:?}, expected {:?})",
+                        "namespace/{name} row.prefix mismatch (got {:?}, expected {:?})",
                         row.prefix,
                         expect_prefix
                     ));
@@ -3027,11 +3027,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 ns.insert(name, row);
             }
         }
-        // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
-        // every replayed PS. Pre-F210-G1 the map was empty post-failover,
+        // seed `ps_last_heartbeat` with `Instant::now()` for
+        // every replayed PS. Previously the map was empty post-failover,
         // and the liveness loop's `None` arm treated unknown PSes as
         // "alive" — so a PS that died right before the failover (with
-        // its evicted etcd entry still lingering pre-F210-G1) was
+        // its evicted etcd entry still lingering) was
         // resurrected on replay and stayed forever unevictable. Seeding
         // grants every replayed PS a fresh `PS_DEAD_TIMEOUT` window to
         // start heartbeating again. If it doesn't, the regular eviction
@@ -3046,10 +3046,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 hb.entry(*ps_id).or_insert(now);
             }
         }
-        // F183: install last_op_at sidecar so policy engine cooldown
+        // install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
-        // F207: install the unified inflight ledger. Records with
+        // install the unified inflight ledger. Records with
         // malformed op_kind/payload combinations are dropped with a WARN
         // inside `decode_extent_inflight_kvs`. The `extent_inflight/`
         // prefix is the single source of truth — no legacy fold-in.
@@ -3071,7 +3071,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 }
             }
         }
-        // F207-C: rehydrate in-memory `delete_progress` from Delete-kind
+        // rehydrate in-memory `delete_progress` from Delete-kind
         // ledger entries so the new leader's extent_delete_loop picks up
         // pending fanouts immediately. Attempts reset to 0 (correct
         // behaviour — a new leader's first attempt is its own "1").
@@ -3093,7 +3093,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 }
             }
         }
-        // F214-A: install cluster_id from etcd. The key may legitimately
+        // install cluster_id from etcd. The key may legitimately
         // be absent on a brand-new cluster where no leader has yet run
         // `imprint_cluster_id`; in that case `try_become_leader` will
         // write it right after replay completes. Followers see the
@@ -3110,7 +3110,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             self.cluster_version
                 .set(Self::parse_cluster_version(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?);
         }
-        // F-DASH-IN-MGR M2: rehydrate the auto-policy controller config +
+        // M2: rehydrate the auto-policy controller config +
         // cooldowns so the active policy + mode + custom policies survive leader
         // failover (the crash-safety win over the killable Python webserver).
         // Malformed → fail-loud (note 39) rather than silently reset the policy.
@@ -3120,7 +3120,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
             self.auto_policy.borrow_mut().load_config(cfg);
         }
-        // F-AUTOPOLICY-BOOT-DEFAULT: record whether this cluster carried a
+        // record whether this cluster carried a
         // persisted auto-policy config, so `apply_auto_policy_default` (called
         // from the bin AFTER the flags are set) knows if it may seed. The seed
         // can't happen HERE: `new_with_etcd` runs the first replay + leader
@@ -3132,7 +3132,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
             self.auto_policy.borrow_mut().load_cooldowns(cds);
         }
-        // F210-G2: rehydrate `failed_deletes` from the persisted retry
+        // rehydrate `failed_deletes` from the persisted retry
         // prefix. `attempts` + `last_attempt_at` are kept as written so
         // the new leader respects any in-flight backoff window from
         // the deposed leader's most recent attempt.
@@ -3148,7 +3148,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "F210-G2: replay skipped malformed extentDeleteRetry/ key"
+                            "replay skipped malformed extentDeleteRetry/ key"
                         );
                         continue;
                     }
@@ -3160,7 +3160,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                             tracing::warn!(
                                 extent_id = id,
                                 error = %e,
-                                "F210-G2: replay skipped malformed extentDeleteRetry/ payload"
+                                "replay skipped malformed extentDeleteRetry/ payload"
                             );
                             continue;
                         }
@@ -3169,7 +3169,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             }
         }
 
-        // F-ioring-lease-1: install persisted writer leases. Reader leases are
+        // Install persisted writer leases. Reader leases are
         // NOT persisted (plan §6.4 — reader subscribe-reconnect drops every
         // cached version, so losing the reader set across failover is benign).
         //
@@ -3264,10 +3264,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
-    /// F-FENCE-DRAIN: node_ids that must NOT receive new extent placements —
+    /// node_ids that must NOT receive new extent placements —
     /// operator-Fenced or -Maintenance (`node_overrides`) plus auto-Suspected
     /// (`node_states`). Capture this owned set BEFORE any `store.inner` borrow
-    /// (the RefCells are disjoint), mirroring the F214-B `online_node_ids`
+    /// (the RefCells are disjoint), mirroring the `online_node_ids`
     /// capture pattern, then thread it into `select_nodes` + every fallback walk
     /// + recovery-target selection so a decommissioning / flaky node never gets
     /// data we'd immediately have to migrate off.
@@ -3285,7 +3285,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         set
     }
 
-    /// F121: pick `count` candidate nodes for a fresh extent allocation.
+    /// pick `count` candidate nodes for a fresh extent allocation.
     ///
     /// Prefers nodes that have **at least one online disk** so the very
     /// first AllocExtent fan-out doesn't include a peer the manager has
@@ -3296,19 +3296,19 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// available even in degraded states (e.g. cold leader before the
     /// first `df` poll has run).
     ///
-    /// F144: pick is **shuffled** (uniform random `count`-subset) instead
-    /// of "lowest `node_id` first". The pre-F144 deterministic order
+    /// pick is **shuffled** (uniform random `count`-subset) instead
+    /// of "lowest `node_id` first". The previous deterministic order
     /// concentrated load on the first `count` nodes by ID — e.g. a 4-node
     /// cluster {1,3,5,7} with 3-replica streams placed every extent on
     /// {1,3,5}, leaving node 7 idle until one of the first three failed.
     ///
-    /// F190: `exclude_node_ids` carries the writer's per-stream "recently
+    /// `exclude_node_ids` carries the writer's per-stream "recently
     /// failed" set (30 s TTL on the client). Filter the candidate pool by
     /// this set BEFORE the online-disk filter; if the result is too small
     /// to satisfy `count`, drop the exclusion and retry — never block
     /// allocation on a stale exclude.
     ///
-    /// F214-B: `online_node_ids` is the set of nodes whose
+    /// `online_node_ids` is the set of nodes whose
     /// `NodeStateTracker` state is `Online` (i.e. registered AND verified
     /// alive via at least one successful df). Suspend / Suspected nodes
     /// are excluded at the primary filter; the cold-leader fallback
@@ -3317,9 +3317,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// df sweep), the pool widens to honour the existing
     /// "fall-back-to-fresh-node" path in `handle_stream_alloc_extent`.
     ///
-    /// F-FENCE-DRAIN: `hard_excluded` (Fenced / Maintenance / Suspected, from
+    /// `hard_excluded` (Fenced / Maintenance / Suspected, from
     /// `placement_excluded_node_ids`) is removed from EVERY placement path,
-    /// INCLUDING the cold-leader degraded fallback below — unlike the F190
+    /// INCLUDING the cold-leader degraded fallback below — unlike the
     /// `exclude_node_ids` soft hint (which is backfilled when it under-fills),
     /// a hard-excluded node must never receive a new extent even if that means
     /// allocation fails loudly (the caller's per-RPC fallback / client retry
@@ -3355,14 +3355,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .filter(|n| !exclude_set.contains(&n.node_id))
             .cloned()
             .collect();
-        // F190: only honor the exclude set if at least `count` non-excluded
+        // only honor the exclude set if at least `count` non-excluded
         // nodes remain — otherwise stale excludes would block allocation.
         let all = if after_exclude.len() >= count {
             after_exclude
         } else {
             all_unfiltered
         };
-        // F214-B + F121: prefer nodes that are BOTH verified-Online AND
+        // prefer nodes that are BOTH verified-Online AND
         // have at least one online disk. The two filters layer naturally
         // — the state filter is the new gate, the disk filter is the
         // existing post-df health signal.
@@ -3400,7 +3400,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             return Ok(pool.into_iter().take(count).collect());
         }
         // Degraded fallback: not enough verified-online nodes with
-        // online disks. Preserve the pre-F121 / pre-F214-B fallback —
+        // online disks. Preserve the legacy fallback —
         // widen to the full node set so the post-RPC fall-back path
         // in `handle_stream_alloc_extent` can still recover (it pings
         // the candidate per-RPC and walks alternates on failure). Cold-
@@ -3437,11 +3437,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
         if let Some(etcd) = &self.etcd {
             let key = format!("ownerLocks/{owner_key}");
-            // F265: the epoch BUMPS on every acquire. Pre-F265 this was a
+            // the epoch BUMPS on every acquire. Previously this was a
             // create_revision==0 CAS that reused the key's stable
             // create_revision forever — so an owner_key's epoch NEVER rose
             // again after first creation. Consequences (both observed in
-            // the F265 transport chaos run): (a) failback wedge — once a
+            // the transport chaos run): (a) failback wedge — once a
             // later-created owner (higher revision) touched an extent, the
             // EN floor stayed above the earlier owner's frozen epoch and
             // ownership could never transfer BACK (PS1 → PS2 → PS1 left
@@ -3471,7 +3471,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(s.acquire_owner_lock(owner_key))
     }
 
-    /// F265: called by `serve()` once the RPC listener is BOUND. Restarts
+    /// called by `serve()` once the RPC listener is BOUND. Restarts
     /// every PS's liveness clock (heartbeats physically could not arrive
     /// earlier) and unblocks the eviction sweep. See the `serving` field
     /// doc for the ucx TIME_WAIT motivation.
@@ -3573,7 +3573,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     // ── Background loops ───────────────────────────────────────────────
 
-    // F228 (1C): takes `self` by value (was `&self`) for uniformity with the
+    // (1C): takes `self` by value (was `&self`) for uniformity with the
     // other 8 supervised loops — `spawn_supervised` clones a fresh handle per
     // restart, so the loop future must own it.
     async fn ps_liveness_check_loop(self) {
@@ -3582,9 +3582,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
         loop {
             compio::time::sleep(CHECK_INTERVAL).await;
-            // F265: never evict while our OWN listener isn't accepting —
+            // never evict while our OWN listener isn't accepting —
             // a PS cannot heartbeat into an unbound socket. The ucx bind
-            // retry (F264 TIME_WAIT) holds `serve()` for up to ~60 s
+            // retry (TIME_WAIT) holds `serve()` for up to ~60 s
             // after a kill+respawn; evicting during that window
             // de-assigns the entire healthy fleet. `serve()` re-seeds
             // the heartbeat clocks when the listener comes up.
@@ -3627,9 +3627,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 }
             }
 
-            // F210-G1: explicit delete of every evicted PS's etcd key.
+            // explicit delete of every evicted PS's etcd key.
             // `mirror_partition_snapshot` only PUTs survivors and never
-            // DELETEs — pre-F210-G1 the evicted `psNodes/<id>` key
+            // DELETEs — previously the evicted `psNodes/<id>` key
             // persisted in etcd indefinitely. On manager failover the
             // new leader's `replay_from_etcd` rehydrated it back into
             // `s.ps_nodes`, but `ps_last_heartbeat` (in-memory only) was
@@ -3685,7 +3685,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .collect();
         for part_id in stale {
             state.regions.remove(&part_id);
-            // F099-K: a dropped region implies the old per-partition
+            // a dropped region implies the old per-partition
             // listener address is also invalid; drop it so clients can't
             // be handed back a dead addr via GetRegions.
             state.part_addrs.remove(&part_id);
@@ -3749,7 +3749,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
-    /// F-REGION-REBALANCE: compute the moves that bring the per-PS partition
+    /// compute the moves that bring the per-PS partition
     /// COUNT as even as possible — repeatedly reassign one partition from the
     /// most-loaded registered PS to the least-loaded, stopping when the gap is
     /// ≤ 1 (perfectly balanced up to the remainder) or `max_moves` is reached
@@ -3917,7 +3917,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok((dst, modified_extents))
     }
 
-    /// F183: splice victim's extents onto the END of survivor's
+    /// splice victim's extents onto the END of survivor's
     /// extent_ids list, then append `new_tail` as the new active tail.
     ///
     /// Order invariant (load-bearing):
@@ -3932,8 +3932,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ///   - new_tail is appended as-is (caller has already built its
     ///     MgrExtentInfo via select_nodes + alloc_extent_on_node)
     ///
-    /// Caller (handle_multi_modify_merge) is responsible for the F138/
-    /// F145/F146 inflight checks before calling this.
+    /// Caller (handle_multi_modify_merge) is responsible for the
+    /// inflight checks before calling this.
     /// Seal the survivor stream's existing tail extent at
     /// `survivor_sealed` and push the sealed record to `modified_extents`.
     /// The tail is sealed EVEN WHEN EMPTY (length 0): after the merge it
@@ -3967,7 +3967,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// Splice victim's extents onto the survivor and push each (eversion-
     /// bumped, tail sealed) record to `modified_extents`.
     ///
-    /// F-merge-refs-leak: `refs` is MEMBERSHIP-NEUTRAL for victim extents
+    /// Merge refs accounting: `refs` is MEMBERSHIP-NEUTRAL for victim extents
     /// (refs == # of streams whose `extent_ids` list the extent). A victim
     /// extent is one of:
     ///   * CoW-shared (also in the survivor, from a prior split→merge-back):
@@ -4073,7 +4073,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok((updated, modified_extents))
     }
 
-    /// F183: same as compute_merge_streams but without appending a new
+    /// same as compute_merge_streams but without appending a new
     /// tail. Used for row_stream + meta_stream where the post-merge
     /// stream's tail is just victim's last existing extent (sealed by
     /// the caller's commit_length capture).
@@ -4170,7 +4170,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Self::rebalance_regions(state);
     }
 
-    /// F183: apply computed merge mutations. Mirror of `apply_split_mutations`.
+    /// apply computed merge mutations. Mirror of `apply_split_mutations`.
     /// Caller (handle_multi_modify_merge Phase 3) verifies eversion drift
     /// before invoking. Drops victim partition + its three stream metas;
     /// rebalances regions to remove the victim's region.
@@ -4236,7 +4236,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     // ── Extent node RPC helpers ─────────────────────────────────────────
 
-    /// F099-M: look up `shard_ports` for a node by address, so we can
+    /// look up `shard_ports` for a node by address, so we can
     /// route extent RPCs to the owning shard. Returns empty Vec if the
     /// node isn't found (shouldn't happen in practice but stays safe).
     fn shard_ports_for_addr(&self, addr: &str) -> Vec<u16> {
@@ -4250,14 +4250,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Vec::new()
     }
 
-    /// F099-M: route an address to the shard listening for `extent_id`.
+    /// route an address to the shard listening for `extent_id`.
     /// If `shard_ports` is empty, returns `addr` unchanged (legacy mode).
     fn shard_addr_for_extent(addr: &str, shard_ports: &[u16], extent_id: u64) -> String {
         if shard_ports.is_empty() {
             return addr.to_string();
         }
         let k = shard_ports.len();
-        // F-EN-SHARD-HASH: canonical hashed extent→shard map (was
+        // canonical hashed extent→shard map (was
         // `extent_id % k`, which aliased bootstrap's contiguous ids onto shard
         // 0). MUST match the EN `owns_extent` + StreamClient conn_pool routing.
         let port = shard_ports[autumn_rpc::shard_for_extent(extent_id, k as u32) as usize];
@@ -4299,7 +4299,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     }
 
     /// Seal-consensus probe: query an EN's `commit_length` for one extent
-    /// under the caller's validated owner-lock owner_epoch. F210-H3 Tier 2
+    /// under the caller's validated owner-lock owner_epoch. This path
     /// (2026-05-17) plumbs the PS-validated owner_epoch through (was: hardcoded
     /// `0` + EN-side escape hatch) so the EN's fence-handover side-effect
     /// (`if req.owner_epoch > last { bump + persist .meta }`) actually fires
@@ -4347,7 +4347,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(r.length)
     }
 
-    /// F210-H3 Tier 2 fence-free probe. Used by:
+    /// Tier 2 fence-free probe. Used by:
     ///   - `recovery_dispatch_loop` liveness check (ignores `length`,
     ///     uses `code == CODE_OK` to decide whether to fire
     ///     `dispatch_recovery_task`).
@@ -4396,16 +4396,16 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
-    /// F173: persist a marker that extent X is currently mid-EC-conversion
+    /// persist a marker that extent X is currently mid-EC-conversion
     /// from THIS leader's perspective. Called BEFORE the
     /// `EXT_MSG_CONVERT_TO_EC` RPC is dispatched. If this leader dies
     /// mid-flight, the new leader's `replay_from_etcd` repopulates
     async fn mark_extent_available(&self, extent_id: u64, slot: usize) -> Result<(), AppError> {
-        // F138 / F207-B: defer while EC conversion is in flight on this
+        // defer while EC conversion is in flight on this
         // extent. re_avali was sent to the extent-node (eversion bump
         // there), but the manager-side eversion bump must not race
         // apply_ec_conversion_done's overwrite. The recovery_dispatch_loop
-        // retries on the next tick. F207-B: reads the unified ledger via
+        // retries on the next tick. Reads the unified ledger via
         // `extent_inflight_op`.
         if matches!(
             self.extent_inflight_op(extent_id),
@@ -4462,7 +4462,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         disks: &[MgrDiskInfo],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            // F-EN-DYNSHARD M0: `node.node_uuid` (the stable identity) rides
+            // M0: `node.node_uuid` (the stable identity) rides
             // inside the persisted `MgrNodeInfo` — no separate index kv.
             let mut kvs = Vec::with_capacity(1 + disks.len());
             kvs.push(Self::kv_entry("nodes", node.node_id, node));
@@ -4600,7 +4600,7 @@ mod tests {
     #![allow(clippy::await_holding_refcell_ref)]
     use super::*;
 
-    // ── F-KEY-NS D2: pure namespace-validation helpers ──────────────────
+    // ── pure namespace-validation helpers ──────────────────────────────
     #[test]
     fn validate_namespace_name_accepts_valid_segments() {
         for ok in ["bench", "a", "kv-cache", "app.v2", "under_score", "0", "a1._-"] {
@@ -4652,10 +4652,10 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(f)
     }
 
-    /// F192: registers a node in-memory so a subsequent
+    /// registers a node in-memory so a subsequent
     /// `handle_report_disk_failure` quorum trip has a node to flip
     /// offline. Skips etcd / mirror by writing to the in-memory store
-    /// directly. Used only by the F192 unit tests below.
+    /// directly. Used only by the quorum-debounce unit tests below.
     fn add_node_and_disk(m: &AutumnManager, node_id: u64, disk_id: u64) {
         let mut s = m.store.inner.borrow_mut();
         s.nodes.insert(
@@ -4692,7 +4692,7 @@ mod tests {
     }
 
     #[test]
-    fn f192_two_distinct_reporters_below_quorum_no_offline() {
+    fn two_distinct_reporters_below_quorum_no_offline() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 7, 70);
 
@@ -4710,7 +4710,7 @@ mod tests {
     }
 
     #[test]
-    fn f192_three_distinct_reporters_flips_offline() {
+    fn three_distinct_reporters_flips_offline() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 7, 70);
 
@@ -4728,7 +4728,7 @@ mod tests {
     }
 
     #[test]
-    fn f192_duplicate_reporter_does_not_count_toward_quorum() {
+    fn duplicate_reporter_does_not_count_toward_quorum() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 7, 70);
 
@@ -4811,7 +4811,7 @@ mod tests {
     }
 
     #[test]
-    fn f192_quorum_clears_after_trip_and_does_not_re_fire() {
+    fn quorum_clears_after_trip_and_does_not_re_fire() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 7, 70);
 
@@ -4857,7 +4857,7 @@ mod tests {
         })
     }
 
-    // --- F-EN-DYNSHARD M0 acceptance matrix: UUID identity vs address ---
+    // --- EN dynamic-shard acceptance matrix: UUID identity vs address ---
 
     async fn reg_node(
         m: &AutumnManager,
@@ -4882,7 +4882,7 @@ mod tests {
     /// address change because the UUID — not the IP — is its identity. This is
     /// the k8s reschedule case (pod gets a fresh IP but the same PVC/uuid).
     #[test]
-    fn f_en_dynshard_uuid_match_survives_address_change() {
+    fn en_dynshard_uuid_match_survives_address_change() {
         run(async {
             let m = AutumnManager::new();
             let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "10.0.0.1:9100").await;
@@ -4909,7 +4909,7 @@ mod tests {
     /// address ADOPTS that uuid; afterwards the uuid alone (any address)
     /// resolves to the same node — the legacy→identity migration path.
     #[test]
-    fn f_en_dynshard_legacy_address_node_adopts_uuid() {
+    fn en_dynshard_legacy_address_node_adopts_uuid() {
         run(async {
             let m = AutumnManager::new();
             let r1 = reg_node(&m, "", "10.0.0.1:9101", "disk-A", &[9101], "").await;
@@ -4933,7 +4933,7 @@ mod tests {
     /// `format` re-stamp shape) is idempotent and must NEVER clobber ANY live
     /// routing metadata: empty ports/ctrl mean "unspecified", NOT "clear them".
     #[test]
-    fn f_en_dynshard_identity_only_reregister_preserves_location() {
+    fn en_dynshard_identity_only_reregister_preserves_location() {
         run(async {
             let m = AutumnManager::new();
             let r1 =
@@ -4965,7 +4965,7 @@ mod tests {
     /// removed node returning under its OWN uuid at a FRESH address is refused.
     /// Clearing the tombstone lets it rejoin.
     #[test]
-    fn f_en_dynshard_decommissioned_uuid_refused_at_new_address() {
+    fn en_dynshard_decommissioned_uuid_refused_at_new_address() {
         run(async {
             let m = AutumnManager::new();
             let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
@@ -5001,7 +5001,7 @@ mod tests {
     /// its address freed), a BRAND-NEW node (fresh uuid) landing on the recycled
     /// pod IP is accepted as a new node.
     #[test]
-    fn f_en_dynshard_recycled_ip_under_fresh_uuid_accepted() {
+    fn en_dynshard_recycled_ip_under_fresh_uuid_accepted() {
         run(async {
             let m = AutumnManager::new();
             let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
@@ -5033,7 +5033,7 @@ mod tests {
     /// physical EN two failure domains (RF double-placement). The node's OWN
     /// uuid re-registering at its own address stays fine.
     #[test]
-    fn f_en_dynshard_duplicate_address_different_uuid_refused() {
+    fn en_dynshard_duplicate_address_different_uuid_refused() {
         run(async {
             let m = AutumnManager::new();
             let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "").await;
@@ -5087,7 +5087,7 @@ mod tests {
     }
 
     #[test]
-    fn f019_least_loaded_allocation() {
+    fn least_loaded_allocation() {
         run(async {
             let m = AutumnManager::new();
 
@@ -5138,7 +5138,7 @@ mod tests {
     }
 
     #[test]
-    fn f019_ps_eviction_reassigns_regions() {
+    fn ps_eviction_reassigns_regions() {
         run(async {
             let m = AutumnManager::new();
 
@@ -5189,7 +5189,7 @@ mod tests {
     }
 
     #[test]
-    fn f019_heartbeat_updates_timestamp() {
+    fn heartbeat_updates_timestamp() {
         run(async {
             let m = AutumnManager::new();
             let req = rkyv_encode(&RegisterPsReq {
@@ -5214,7 +5214,7 @@ mod tests {
     // retention is now `refs`-only.)
 
     #[test]
-    fn f181_compute_merge_streams_extent_ids_order_and_refs() {
+    fn compute_merge_streams_extent_ids_order_and_refs() {
         let mut state = autumn_common::MetadataState::default();
         let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
             extent_id: id,
@@ -5273,7 +5273,7 @@ mod tests {
             "non-tail survivor extent unchanged → not in modified"
         );
 
-        // F-merge-refs-leak: victim-only extents transfer victim→survivor, so
+        // Merge refs accounting: victim-only extents transfer victim→survivor, so
         // after the merge they are in exactly ONE stream → refs stays 1 (was
         // asserted as 2, which baked in the +1 leak that orphaned extents).
         let e20 = modified.iter().find(|e| e.extent_id == 20).unwrap();
@@ -5290,7 +5290,7 @@ mod tests {
     }
 
     #[test]
-    fn f181_splice_streams_without_new_tail_no_e_new() {
+    fn splice_streams_without_new_tail_no_e_new() {
         let mut state = autumn_common::MetadataState::default();
         let mk = |id: u64, refs: u64| MgrExtentInfo {
             extent_id: id,
@@ -5331,20 +5331,20 @@ mod tests {
         let (updated, modified) =
             AutumnManager::splice_streams_without_new_tail(&state, 300, 400, 100, 200).unwrap();
         assert_eq!(updated.extent_ids, vec![30, 40]);
-        // F-merge-refs-leak: victim-only extent transfers victim→survivor →
+        // Merge refs accounting: victim-only extent transfers victim→survivor →
         // refs stays 1 (was asserted as 2 = the leak).
         let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
         assert_eq!(e40.refs, 1);
         assert_eq!(e40.sealed_length, 200);
     }
 
-    /// F-merge-refs-leak regression: merging back a split (survivor + victim
+    /// Merge refs-leak regression: merging back a split (survivor + victim
     /// CoW-share the pre-split extents) must NOT leak refs and must NOT list a
     /// shared extent twice. Pre-fix the shared extent got refs += 1 AND a
     /// duplicate entry in extent_ids; over repeated split→merge cycles it drove
     /// extents to refs>0 with zero stream membership (invisible orphans).
     #[test]
-    fn f_merge_refs_leak_cow_shared_extent_dedup_and_refs() {
+    fn merge_refs_leak_cow_shared_extent_dedup_and_refs() {
         let mut state = autumn_common::MetadataState::default();
         let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
             extent_id: id,
@@ -5416,9 +5416,9 @@ mod tests {
         assert_eq!(occ, 1, "no duplicate listing → GC can reconcile refs to 0");
     }
 
-    /// F-merge-refs-leak regression for the row/meta splice path (no new tail).
+    /// Merge refs-leak regression for the row/meta splice path (no new tail).
     #[test]
-    fn f_merge_refs_leak_splice_cow_shared_extent_dedup_and_refs() {
+    fn merge_refs_leak_splice_cow_shared_extent_dedup_and_refs() {
         let mut state = autumn_common::MetadataState::default();
         let mk = |id: u64, refs: u64| MgrExtentInfo {
             extent_id: id,
@@ -5572,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn f181_apply_merge_mutations_drops_victim_entries() {
+    fn apply_merge_mutations_drops_victim_entries() {
         let mut state = autumn_common::MetadataState::default();
         // Survivor partition 1 with streams 100/101/102
         state.partitions.insert(
@@ -5655,12 +5655,12 @@ mod tests {
         );
     }
 
-    // (removed: f181_merged_partition_vp_refs_sums_per_extent and
+    // (removed: merged_partition_vp_refs_sums_per_extent and
     // split_partition_vp_snapshot_clones_parent_refs — both exercised the
     // deleted partition_vp_refs maintenance fns.)
 
     #[test]
-    fn f124_compute_region_keeps_existing_ps_for_left_partition() {
+    fn compute_region_keeps_existing_ps_for_left_partition() {
         let mut state = autumn_common::MetadataState::default();
         state.ps_nodes.insert(10, "ps10:9001".to_string());
         state.ps_nodes.insert(20, "ps20:9002".to_string());
@@ -5703,7 +5703,7 @@ mod tests {
     }
 
     #[test]
-    fn f124_compute_region_assigns_least_loaded_for_new_partition() {
+    fn compute_region_assigns_least_loaded_for_new_partition() {
         let mut state = autumn_common::MetadataState::default();
         state.ps_nodes.insert(10, "ps10:9001".to_string());
         state.ps_nodes.insert(20, "ps20:9002".to_string());
@@ -5747,7 +5747,7 @@ mod tests {
         assert_eq!(region.part_id, 999);
     }
 
-    // ── F-REGION-REBALANCE: compute_rebalance_moves ──────────────────────────
+    // ── region rebalance: compute_rebalance_moves ────────────────────────────
 
     /// Build a state with `ps_ids` registered and `assignments` = (part_id, ps_id).
     fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> autumn_common::MetadataState {
@@ -5851,13 +5851,13 @@ mod tests {
     // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
     // merge_extent_updates was deleted with the vp_table_refs machinery.)
 
-    /// F125: handle_stream_alloc_extent must not modify the in-memory store
+    /// handle_stream_alloc_extent must not modify the in-memory store
     /// when the handler fails partway through. When alloc_extent_on_node
     /// fails (no running extent nodes), the store must remain unchanged.
-    /// Pre-F125, the handler mutated the store before the etcd mirror, so
+    /// Previously the handler mutated the store before the etcd mirror, so
     /// any early return left stale mutations behind.
     #[test]
-    fn f125_alloc_extent_no_store_mutation_on_failure() {
+    fn alloc_extent_no_store_mutation_on_failure() {
         run(async {
             let m = AutumnManager::new();
 
@@ -5960,7 +5960,7 @@ mod tests {
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
             assert_ne!(r.code, CODE_OK, "should fail: no running extent nodes");
 
-            // F125 invariant: store must be unchanged after failed alloc.
+            // invariant: store must be unchanged after failed alloc.
             let tail_after = m
                 .store
                 .inner
@@ -5994,11 +5994,11 @@ mod tests {
         })
     }
 
-    /// F126: handle_stream_punch_holes only removes extents that are
+    /// handle_stream_punch_holes only removes extents that are
     /// members of the target stream. Non-member extent IDs in the
     /// request are silently ignored — their ref counts must NOT change.
     #[test]
-    fn f126_punch_holes_ignores_non_member_extents() {
+    fn punch_holes_ignores_non_member_extents() {
         run(async {
             let m = AutumnManager::new();
 
@@ -6110,10 +6110,10 @@ mod tests {
         })
     }
 
-    // ── F126: recovery + EC conversion mutual exclusion ─────────────────
+    // ── recovery + EC conversion mutual exclusion ──────────────────────
 
     #[test]
-    fn f126_apply_recovery_done_rejects_duplicate_target() {
+    fn apply_recovery_done_rejects_duplicate_target() {
         run(async {
             let m = AutumnManager::new();
 
@@ -6184,7 +6184,7 @@ mod tests {
     }
 
     #[test]
-    fn f126_apply_recovery_done_succeeds_when_target_is_unique() {
+    fn apply_recovery_done_succeeds_when_target_is_unique() {
         // Sanity check: the duplicate-target check must not interfere with
         // normal recovery applies. With a 5-node cluster, recovery from
         // node 1 → node 9 (not in extent_nodes) should succeed cleanly.
@@ -6239,7 +6239,7 @@ mod tests {
         })
     }
 
-    // ── F138: eversion lost-update during EC conversion await ──────────────
+    // ── eversion lost-update during EC conversion await ────────────────────
 
     fn make_ec_extent(extent_id: u64, eversion: u64) -> MgrExtentInfo {
         MgrExtentInfo {
@@ -6259,13 +6259,13 @@ mod tests {
     }
 
     /// apply_recovery_done must defer (return Err) when a ConvertToEc op
-    /// is in flight on the extent. F207-C: the exclusive ledger makes
+    /// is in flight on the extent. The exclusive ledger makes
     /// "EC + Recovery simultaneously in flight" structurally impossible,
     /// so this test now exercises the defense-in-depth path:
     /// apply_recovery_done sees a ConvertToEc marker (left behind by a
     /// concurrent dispatch tick) and refuses to write through.
     #[test]
-    fn f138_apply_recovery_done_during_ec_inflight_defers() {
+    fn apply_recovery_done_during_ec_inflight_defers() {
         run(async {
             let m = AutumnManager::new();
             let extent_id = 200u64;
@@ -6292,12 +6292,12 @@ mod tests {
             let result = m.apply_recovery_done(done.clone()).await;
             assert!(
                 result.is_err(),
-                "F138: apply_recovery_done must return Err while ConvertToEc in flight"
+                "apply_recovery_done must return Err while ConvertToEc in flight"
             );
             assert_eq!(
                 m.extent_inflight_op(extent_id),
                 Some(crate::extent_inflight::ExtentOpKind::ConvertToEc),
-                "F207-C: ConvertToEc marker must be preserved on deferral"
+                "ConvertToEc marker must be preserved on deferral"
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
@@ -6315,7 +6315,7 @@ mod tests {
             let result = m.apply_recovery_done(done).await;
             assert!(
                 result.is_ok(),
-                "F138: recovery apply must succeed after EC clears"
+                "recovery apply must succeed after EC clears"
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
@@ -6327,7 +6327,7 @@ mod tests {
     /// mark_extent_available must defer when ec_conversion_inflight contains
     /// the extent.
     #[test]
-    fn f138_mark_extent_available_during_ec_inflight_defers() {
+    fn mark_extent_available_during_ec_inflight_defers() {
         run(async {
             let m = AutumnManager::new();
             let extent_id = 201u64;
@@ -6340,7 +6340,7 @@ mod tests {
             let result = m.mark_extent_available(extent_id, 0).await;
             assert!(
                 result.is_err(),
-                "F138: mark_extent_available must return Err while ec_conversion_inflight"
+                "mark_extent_available must return Err while ec_conversion_inflight"
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
@@ -6353,7 +6353,7 @@ mod tests {
             let result = m.mark_extent_available(extent_id, 0).await;
             assert!(
                 result.is_ok(),
-                "F138: mark_extent_available must succeed after EC clears"
+                "mark_extent_available must succeed after EC clears"
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
@@ -6366,7 +6366,7 @@ mod tests {
     /// EC lock released → recovery retries. Final state reflects BOTH bumps
     /// and recovery's slot replacement is preserved.
     #[test]
-    fn f138_full_race_recovery_after_ec_apply() {
+    fn full_race_recovery_after_ec_apply() {
         run(async {
             let m = AutumnManager::new();
             let extent_id = 202u64;
@@ -6384,7 +6384,7 @@ mod tests {
             };
             let new_eversion_for_ec = captured_eversion + 1; // = 6
 
-            // Step 2: recovery's done report arrives during EC. F207-C: under
+            // Step 2: recovery's done report arrives during EC. Under
             // the exclusive ledger we can't ALSO have a Recovery marker;
             // the ConvertToEc marker alone is what triggers the defer.
             // apply_recovery_done's defense-in-depth check fires and
@@ -6416,7 +6416,7 @@ mod tests {
             m._test_clear_inflight(extent_id);
 
             // Step 4: deferred recovery retries — must succeed now. Under
-            // F207-C, retry rehydrates the Recovery marker (mimicking
+            // the exclusive ledger, retry rehydrates the Recovery marker (mimicking
             // recovery_collect_loop's behaviour after the EC tick cleared).
             m._test_mark_recovery_inflight(extent_id, task);
             let r = m.apply_recovery_done(done).await;
@@ -6431,12 +6431,12 @@ mod tests {
             assert_eq!(
                 ex.replicates,
                 vec![9, 3, 5],
-                "F138: recovery's slot replacement (node 1→9) must survive EC apply"
+                "recovery's slot replacement (node 1→9) must survive EC apply"
             );
             assert_eq!(ex.parity, vec![7], "parity node added by EC");
             assert_eq!(
                 ex.eversion, 7,
-                "F138: eversion must reflect EC bump (5→6) + recovery bump (6→7)"
+                "eversion must reflect EC bump (5→6) + recovery bump (6→7)"
             );
             assert!(ex.ec_converted);
         })
@@ -6445,7 +6445,7 @@ mod tests {
     /// handle_multi_modify_split must return Precondition when any source-
     /// stream extent is in ec_conversion_inflight.
     #[test]
-    fn f138_split_aborts_when_source_extent_is_ec_inflight() {
+    fn split_aborts_when_source_extent_is_ec_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -6535,7 +6535,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F138: split must be rejected when source extent is ec_inflight"
+                "split must be rejected when source extent is ec_inflight"
             );
             assert!(
                 r.message.contains("ec conversion in flight"),
@@ -6553,9 +6553,9 @@ mod tests {
         })
     }
 
-    /// F183: merge handler rejects non-adjacent partitions.
+    /// merge handler rejects non-adjacent partitions.
     #[test]
-    fn f181_merge_refuses_non_adjacent() {
+    fn merge_refuses_non_adjacent() {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
@@ -6618,9 +6618,9 @@ mod tests {
         })
     }
 
-    /// F183: merge handler rejects when survivor == victim.
+    /// merge handler rejects when survivor == victim.
     #[test]
-    fn f181_merge_refuses_self_merge() {
+    fn merge_refuses_self_merge() {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
@@ -6648,10 +6648,10 @@ mod tests {
         })
     }
 
-    /// F183: merge handler rejects when any source extent is in
-    /// ec_conversion_inflight (mirrors F138).
+    /// merge handler rejects when any source extent is in
+    /// ec_conversion_inflight (mirrors the recovery/EC guard).
     #[test]
-    fn f181_merge_refuses_when_ec_inflight() {
+    fn merge_refuses_when_ec_inflight() {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
@@ -6745,10 +6745,10 @@ mod tests {
         })
     }
 
-    /// F183: merge handler refuses when any source extent is in
-    /// recovery_tasks (mirrors F146 split-side guard).
+    /// merge handler refuses when any source extent is in
+    /// recovery_tasks (mirrors the split-side guard).
     #[test]
-    fn f183_merge_refuses_when_recovery_inflight() {
+    fn merge_refuses_when_recovery_inflight() {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
@@ -6850,10 +6850,10 @@ mod tests {
         })
     }
 
-    /// F183: merge handler refuses when any source extent is queued
-    /// for physical delete (mirrors F139).
+    /// merge handler refuses when any source extent is queued
+    /// for physical delete (mirrors the delete-vs-recovery guard).
     #[test]
-    fn f183_merge_refuses_when_pending_delete() {
+    fn merge_refuses_when_pending_delete() {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
@@ -6947,10 +6947,10 @@ mod tests {
         })
     }
 
-    /// F183 + F184: merge then last_op_at must be updated on the
+    /// merge then last_op_at must be updated on the
     /// survivor and removed for the victim.
     #[test]
-    fn f184_merge_updates_last_op_at_correctly() {
+    fn merge_updates_last_op_at_correctly() {
         let mut state = autumn_common::MetadataState::default();
         let mut m = HashMap::new();
         m.insert(1u64, 1_700_000_000i64);
@@ -6970,11 +6970,11 @@ mod tests {
         state.next_id = 1;
     }
 
-    /// F144: with 4 nodes and count=3, every node must appear in a
-    /// non-trivial fraction of selections — pre-F144 the lowest-id 3
+    /// with 4 nodes and count=3, every node must appear in a
+    /// non-trivial fraction of selections — previously the lowest-id 3
     /// always won and node 7 never showed up.
     #[test]
-    fn f144_select_nodes_distribution() {
+    fn select_nodes_distribution() {
         let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
         let mut disks: HashMap<u64, MgrDiskInfo> = HashMap::new();
         for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
@@ -7000,7 +7000,7 @@ mod tests {
             );
         }
 
-        // F214-B: tests assume all nodes are verified-Online.
+        // tests assume all nodes are verified-Online.
         let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
@@ -7033,7 +7033,7 @@ mod tests {
     /// repeated retries from a cold leader spread across the cluster
     /// instead of always pinging the lowest-id node first.
     #[test]
-    fn f144_select_nodes_degraded_fallback_shuffles() {
+    fn select_nodes_degraded_fallback_shuffles() {
         let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
         let disks: HashMap<u64, MgrDiskInfo> = HashMap::new(); // empty = nothing online
         for &nid in &[1u64, 3, 5, 7] {
@@ -7050,7 +7050,7 @@ mod tests {
             );
         }
 
-        // F214-B: tests assume all nodes are verified-Online; the
+        // tests assume all nodes are verified-Online; the
         // degraded fallback here is "no online disks" (empty `disks`
         // map), not "no Online state nodes".
         let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
@@ -7119,12 +7119,12 @@ mod tests {
         assert_eq!(picked.len(), 3);
     }
 
-    // ── F139: extent-node delete vs in-flight recovery ──────────────────────
+    // ── extent-node delete vs in-flight recovery ────────────────────────────
 
     /// dispatch_recovery_task must return Ok without populating recovery_tasks
     /// when the extent is already queued for physical deletion.
     #[test]
-    fn f139_dispatch_recovery_skips_when_pending_delete_queued() {
+    fn dispatch_recovery_skips_when_pending_delete_queued() {
         run(async {
             let m = AutumnManager::new();
             let extent_id = 300u64;
@@ -7141,14 +7141,14 @@ mod tests {
             let result = m.dispatch_recovery_task(extent_id, /*replace_id=*/ 1).await;
             assert!(
                 result.is_ok(),
-                "F139: dispatch_recovery_task must return Ok when delete queued: {result:?}"
+                "dispatch_recovery_task must return Ok when delete queued: {result:?}"
             );
             assert!(
                 !matches!(
                     m.extent_inflight_op(extent_id),
                     Some(crate::extent_inflight::ExtentOpKind::Recovery)
                 ),
-                "F139: recovery_tasks must NOT be populated when delete is queued"
+                "recovery_tasks must NOT be populated when delete is queued"
             );
         })
     }
@@ -7156,7 +7156,7 @@ mod tests {
     /// handle_stream_punch_holes must return Precondition (not remove the
     /// extent) when the to-be-deleted extent is currently being recovered.
     #[test]
-    fn f139_punch_holes_aborts_when_extent_is_in_recovery() {
+    fn punch_holes_aborts_when_extent_is_in_recovery() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7210,7 +7210,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F139: punch_holes must be rejected when target extent is in recovery"
+                "punch_holes must be rejected when target extent is in recovery"
             );
             assert!(
                 r.message.contains("in-flight recovery"),
@@ -7221,13 +7221,13 @@ mod tests {
             let s = m.store.inner.borrow();
             assert!(
                 s.extents.contains_key(&extent_id),
-                "F139: extent must not be removed from store on rejection"
+                "extent must not be removed from store on rejection"
             );
             drop(s);
             // No pending delete must have been enqueued.
             assert!(
                 m.delete_progress.borrow().is_empty(),
-                "F139: delete_progress must be empty on rejection"
+                "delete_progress must be empty on rejection"
             );
         })
     }
@@ -7235,7 +7235,7 @@ mod tests {
     /// handle_truncate must return Precondition when any to-be-truncated
     /// extent that would drop to refs=0 is currently being recovered.
     #[test]
-    fn f139_truncate_aborts_when_any_extent_is_in_recovery() {
+    fn truncate_aborts_when_any_extent_is_in_recovery() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7291,7 +7291,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F139: truncate must be rejected when a to-be-removed extent is in recovery"
+                "truncate must be rejected when a to-be-removed extent is in recovery"
             );
             assert!(
                 r.message.contains("in-flight recovery"),
@@ -7303,7 +7303,7 @@ mod tests {
             let stream = s.streams.get(&stream_id).unwrap();
             assert!(
                 stream.extent_ids.contains(&extent_a),
-                "F139: extent_a must not be removed from stream on rejection"
+                "extent_a must not be removed from stream on rejection"
             );
         })
     }
@@ -7312,7 +7312,7 @@ mod tests {
     /// then recovery completes, then punch_holes succeeds and extent is
     /// enqueued for physical deletion.
     #[test]
-    fn f139_full_race_recovery_after_punch_holes_attempt() {
+    fn full_race_recovery_after_punch_holes_attempt() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7386,29 +7386,29 @@ mod tests {
             let stream = s.streams.get(&stream_id).unwrap();
             assert!(
                 !stream.extent_ids.contains(&extent_id),
-                "F139: extent must be removed from stream after successful punch_holes"
+                "extent must be removed from stream after successful punch_holes"
             );
             drop(s);
-            // Extent must be queued for physical deletion. F207-C: check
+            // Extent must be queued for physical deletion: check
             // both the in-memory progress map and the unified ledger.
             assert!(
                 m.delete_progress.borrow().contains_key(&extent_id),
-                "F139: extent must be enqueued for physical deletion after refs→0"
+                "extent must be enqueued for physical deletion after refs→0"
             );
             assert_eq!(
                 m.extent_inflight_op(extent_id),
                 Some(crate::extent_inflight::ExtentOpKind::Delete),
-                "F207-C: ledger entry must reflect Delete in flight"
+                "ledger entry must reflect Delete in flight"
             );
         })
     }
 
-    // ── F145: punch_holes/truncate vs in-flight EC conversion ────────────────
+    // ── punch_holes/truncate vs in-flight EC conversion ──────────────────────
 
     /// handle_stream_punch_holes must return Precondition (not bump eversion)
     /// when any to-be-removed extent is currently undergoing EC conversion.
     #[test]
-    fn f145_punch_holes_refuses_when_ec_inflight() {
+    fn punch_holes_refuses_when_ec_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7456,7 +7456,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F145: punch_holes must be rejected when target extent is mid-EC"
+                "punch_holes must be rejected when target extent is mid-EC"
             );
             assert!(
                 r.message.contains("in-flight EC conversion"),
@@ -7468,15 +7468,15 @@ mod tests {
             let ex = s
                 .extents
                 .get(&extent_id)
-                .expect("F145: extent must not be removed");
+                .expect("extent must not be removed");
             assert_eq!(
                 ex.eversion, eversion_before,
-                "F145: eversion must not be bumped during mid-EC punch_holes"
+                "eversion must not be bumped during mid-EC punch_holes"
             );
             drop(s);
             assert!(
                 m.delete_progress.borrow().is_empty(),
-                "F145: no pending delete must be enqueued on rejection"
+                "no pending delete must be enqueued on rejection"
             );
 
             // After EC completes (remove from inflight), punch_holes must succeed.
@@ -7491,13 +7491,13 @@ mod tests {
             let r2: PunchHolesResp = rkyv_decode(&resp2).unwrap();
             assert_eq!(
                 r2.code, CODE_OK,
-                "F145: punch_holes must succeed after EC completes: {}",
+                "punch_holes must succeed after EC completes: {}",
                 r2.message
             );
             let s2 = m.store.inner.borrow();
             assert!(
                 !s2.streams[&stream_id].extent_ids.contains(&extent_id),
-                "F145: extent must be removed from stream after successful punch_holes"
+                "extent must be removed from stream after successful punch_holes"
             );
         })
     }
@@ -7505,7 +7505,7 @@ mod tests {
     /// handle_truncate must return Precondition (not bump eversion) when any
     /// to-be-truncated extent is currently undergoing EC conversion.
     #[test]
-    fn f145_truncate_refuses_when_ec_inflight() {
+    fn truncate_refuses_when_ec_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7554,7 +7554,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F145: truncate must be rejected when a to-be-removed extent is mid-EC"
+                "truncate must be rejected when a to-be-removed extent is mid-EC"
             );
             assert!(
                 r.message.contains("in-flight EC conversion"),
@@ -7566,25 +7566,25 @@ mod tests {
             let stream = s.streams.get(&stream_id).unwrap();
             assert!(
                 stream.extent_ids.contains(&extent_a),
-                "F145: extent_a must not be removed from stream on rejection"
+                "extent_a must not be removed from stream on rejection"
             );
             let ex = s
                 .extents
                 .get(&extent_a)
-                .expect("F145: extent_a must still be in store");
+                .expect("extent_a must still be in store");
             assert_eq!(
                 ex.eversion, eversion_before,
-                "F145: eversion must not be bumped during mid-EC truncate"
+                "eversion must not be bumped during mid-EC truncate"
             );
         })
     }
 
-    // ── F146: alloc_extent / split lost-update races ─────────────────────────
+    // ── alloc_extent / split lost-update races ───────────────────────────────
 
     /// handle_stream_alloc_extent must return Precondition (not proceed to
     /// network calls) when the current tail extent is in ec_conversion_inflight.
     #[test]
-    fn f146_alloc_extent_refuses_when_ec_inflight() {
+    fn alloc_extent_refuses_when_ec_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7644,7 +7644,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F146: alloc_extent must be rejected when tail is mid-EC"
+                "alloc_extent must be rejected when tail is mid-EC"
             );
             assert!(
                 r.message.contains("in-flight ConvertToEc"),
@@ -7654,7 +7654,7 @@ mod tests {
             let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
             assert_eq!(
                 ev_after, eversion_before,
-                "F146: eversion must not be bumped when alloc_extent is rejected mid-EC"
+                "eversion must not be bumped when alloc_extent is rejected mid-EC"
             );
         })
     }
@@ -7662,7 +7662,7 @@ mod tests {
     /// handle_stream_alloc_extent must return Precondition when the tail
     /// extent has an in-flight recovery task (symmetric to EC guard above).
     #[test]
-    fn f146_alloc_extent_refuses_when_recovery_inflight() {
+    fn alloc_extent_refuses_when_recovery_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7730,7 +7730,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F146: alloc_extent must be rejected when tail is mid-recovery"
+                "alloc_extent must be rejected when tail is mid-recovery"
             );
             assert!(
                 r.message.contains("in-flight Recovery"),
@@ -7740,16 +7740,16 @@ mod tests {
             let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
             assert_eq!(
                 ev_after, eversion_before,
-                "F146: eversion must not be bumped when alloc_extent is rejected mid-recovery"
+                "eversion must not be bumped when alloc_extent is rejected mid-recovery"
             );
         })
     }
 
     /// handle_multi_modify_split must return Precondition when any source-
-    /// stream extent is currently undergoing recovery (symmetric to F138's
+    /// stream extent is currently undergoing recovery (symmetric to the
     /// ec_conversion_inflight guard).
     #[test]
-    fn f146_split_refuses_when_recovery_inflight() {
+    fn split_refuses_when_recovery_inflight() {
         run(async {
             let m = AutumnManager::new();
 
@@ -7844,7 +7844,7 @@ mod tests {
 
             assert_ne!(
                 r.code, CODE_OK,
-                "F146: split must be rejected when source extent is mid-recovery"
+                "split must be rejected when source extent is mid-recovery"
             );
             assert!(
                 r.message.contains("recovery in flight"),
@@ -7855,23 +7855,23 @@ mod tests {
             let s = m.store.inner.borrow();
             assert_eq!(
                 s.extents[&log_extent].eversion, eversion_before,
-                "F146: eversion must not be bumped when split is rejected"
+                "eversion must not be bumped when split is rejected"
             );
             assert!(
                 s.partitions.contains_key(&part_id),
-                "F146: original partition must still exist on split rejection"
+                "original partition must still exist on split rejection"
             );
         })
     }
 
-    // ── F198: rich-marker rkyv roundtrip + pending_ec_dispatch bookkeeping ──
+    // ── rich-marker rkyv roundtrip + pending_ec_dispatch bookkeeping ──
 
     /// The marker value persisted to etcd must round-trip rkyv encode/decode
-    /// without losing any field. Pre-F198 the marker had an empty value;
-    /// post-F198 the value carries `target_nodes` so re-dispatch after
+    /// without losing any field. Previously the marker had an empty value;
+    /// now the value carries `target_nodes` so re-dispatch after
     /// failover uses the original assignment instead of a fresh shuffle.
     #[test]
-    fn f198_ec_dispatch_inflight_rkyv_roundtrip() {
+    fn ec_dispatch_inflight_rkyv_roundtrip() {
         let original = MgrEcDispatchInflight {
             extent_id: 42,
             target_nodes: vec![1, 3, 5, 7],
@@ -7955,15 +7955,15 @@ mod tests {
         assert!(AutumnManager::parse_cluster_version(b"-1").is_err());
     }
 
-    /// F198 / F207-B: the unified inflight ledger (the post-F207-B
+    /// the unified inflight ledger (the
     /// successor to `pending_ec_dispatch`) starts empty; acquire +
     /// commit_release round-trip ConvertToEc payloads correctly.
     #[test]
-    fn f198_pending_ec_dispatch_in_memory_bookkeeping() {
+    fn pending_ec_dispatch_in_memory_bookkeeping() {
         let m = AutumnManager::new();
         assert!(
             m.inflight.borrow().is_empty(),
-            "F207-B: ledger starts empty"
+            "ledger starts empty"
         );
 
         let rec = MgrEcDispatchInflight {
@@ -8000,19 +8000,19 @@ mod tests {
         m.commit_extent_inflight_release(7);
         assert!(
             m.inflight.borrow().is_empty(),
-            "F207-B: ledger cleared after release"
+            "ledger cleared after release"
         );
     }
 
-    /// F206: `apply_ec_conversion_done` must set `avali` to
-    /// `all_bits(K + M)`. Pre-F206 it left `avali` at the pre-EC value
+    /// `apply_ec_conversion_done` must set `avali` to
+    /// `all_bits(K + M)`. Previously it left `avali` at the pre-EC value
     /// (`all_bits(K)`), leaving the parity slot(s) marked unavailable.
     /// The `recovery_dispatch_loop` then fired RE_AVALI on parity holders
     /// every 2 s, which on the extent-node side ran
     /// `fetch_full_extent_from_sources` and allocated sealed_length-sized
     /// Vec<u8> per peer attempt (observed as multi-GB RSS swings on an
     /// idle cluster after `cluster.sh restart`).
-    // F-AUTOPOLICY-BOOT-DEFAULT: seed the default policy only on a fresh cluster.
+    // seed the default policy only on a fresh cluster.
     #[test]
     fn autopolicy_boot_default_seeds_only_a_fresh_cluster() {
         use crate::auto_policy::AutoPolicyMode;
@@ -8052,7 +8052,7 @@ mod tests {
     }
 
     #[test]
-    fn f206_apply_ec_conversion_done_sets_avali_for_all_shards() {
+    fn apply_ec_conversion_done_sets_avali_for_all_shards() {
         run(async {
             let m = AutumnManager::new();
             let extent_id = 206u64;
@@ -8090,7 +8090,7 @@ mod tests {
             // not just the K=3 from the pre-EC seal path.
             assert_eq!(
                 ex.avali, 0xF,
-                "F206: avali must mark every post-EC slot available; \
+                "avali must mark every post-EC slot available; \
                  leaving the parity bit clear causes the recovery loop to \
                  fire RE_AVALI on the parity holder indefinitely"
             );

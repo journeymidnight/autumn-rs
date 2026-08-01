@@ -156,14 +156,14 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._ttl_secs = int(extra_config.get("ttl_secs", 0) or 0)
         if self._ttl_secs < 0:
             raise ValueError(f"ttl_secs must be non-negative, got {self._ttl_secs}")
-        # F216-E "ucx ⟹ zerocopy": the zero-copy data path (MSG_PUT_BULK write +
+        # "ucx ⟹ zerocopy": the zero-copy data path (MSG_PUT_BULK write +
         # MSG_GET_BULK read for large pages) is now the DEFAULT whenever the
         # transport is UCX — no opt-in flag. BatchClient derives it from the
         # process transport set by set_transport() above. On TCP the regular
         # path is used. (The old extra_config["bulk"] opt-in was removed; KV-cache
         # pages are large so reads cross the bulk size threshold and writes are
         # always bulk on UCX — both win at this size; see BULK_MIN_BYTES.)
-        # F-AUTHZ-BUILTIN (D6-kvc) / F-NS-PRINCIPAL-UNIFIED: same authz wiring as
+        # (D6-kvc): same authz wiring as
         # the vLLM connector — `auth_credential_file` in extra_config is the only
         # required key (Option 3's credential file names its own principal),
         # `auth_principal` overrides that name, `auth_tenant` is the retired
@@ -178,7 +178,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 "extra_config: `auth_tenant` is the retired (pre-Option-3) "
                 "spelling — rename it to `auth_principal`"
             )
-        # F-NS-PRINCIPAL-UNIFIED: NS-FIRST keys with no tenant segment — the
+        # NS-FIRST keys with no tenant segment — the
         # client binds the `kvc` SCOPE and PREPENDS `kvc/` (`_keys.py` emits the
         # relative `{model}/…`).
         auth: dict = {"scope": "kvc"}

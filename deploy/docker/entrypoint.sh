@@ -16,7 +16,7 @@
 #
 # Addressing model (see docs/k8s_deploy.md):
 #   extent-node  advertises its per-pod Service ClusterIP (Service name ==
-#                pod name). F-EN-DYNSHARD M0/M1a: the manager keys EN
+#                pod name). The manager keys EN
 #                identity on a stable node_uuid (persisted on the PVC), NOT
 #                the address, and the EN self-registers its live address +
 #                shard ports at EVERY startup — so a naked pod IP would now
@@ -111,9 +111,9 @@ run_manager() {
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)
-    # F-DASH-IN-MGR: embedded web dashboard + auto-policy controller, ON by
+    # embedded web dashboard + auto-policy controller, ON by
     # default (bound to --listen). Set AUTUMN_DASHBOARD=0 to disable.
-    # F-AUTOPOLICY-BOOT-DEFAULT: production deploy defaults to ARMED steady-state
+    # production deploy defaults to ARMED steady-state
     # maintenance — the `balanced` policy (gc + compaction + EC + rebalance) runs
     # automatically on a fresh cluster, and mutations are armed so it actuates.
     # (cluster.sh / chaos / perf never set these envs, so they stay Off — dev/test
@@ -128,7 +128,7 @@ run_manager() {
         && args+=(--auto-policy-default "$_auto_policy")
     [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]] \
         && args+=(--min-alloc-free-bytes "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES")
-    # F-AUTHZ-BUILTIN: authz engages iff NOT explicitly disabled AND the signing
+    # authz engages iff NOT explicitly disabled AND the signing
     # key file is actually present + non-empty. The k8s ConfigMap sets
     # AUTUMN_AUTH_SIGNING_KEY_FILE to the mounted-Secret path unconditionally, so
     # the `-s` test (not just `-n`) is what keeps a deploy WITHOUT the
@@ -157,7 +157,7 @@ run_extent_node() {
     mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
     [[ "$mgr" == *,* ]] && die "extent-node takes a single manager address, got '$mgr'"
 
-    # F-EN-DYNSHARD M2: advertise this pod's OWN IP (Downward-API status.podIP,
+    # M2: advertise this pod's OWN IP (Downward-API status.podIP,
     # passed as AUTUMN_ADVERTISE_IP). The EN self-registers its location under a
     # stable node_uuid at every startup, so a fresh pod IP on reschedule just
     # updates the same identity — no per-pod ClusterIP Service, no FQDN, no
@@ -175,7 +175,7 @@ run_extent_node() {
     # listener at `port + i*stride` and its control listener at
     # `port+1000 + i*stride` (EN default stride 10 — keep it in sync here).
     # The manager routes an extent to shard `extent_id % shards` and dials
-    # `advertise_host:shard_port`. F-EN-DYNSHARD M1a/M1b/M2: the EN binary
+    # `advertise_host:shard_port`. The EN binary
     # itself self-registers every shard's data port at startup (via its own
     # `--advertise`) and the manager/PS dial the pod IP directly — no
     # `--shard-ports` flag and no per-pod Service enumerating shard ports
@@ -190,8 +190,8 @@ run_extent_node() {
 
     wait_for_manager "$mgr"
 
-    # F-EN-DYNSHARD M1c: format is IDENTITY-ONLY (no --listen/--advertise) —
-    # idempotent (F214-C): re-running on a formatted dir reuses the stamped
+    # M1c: format is IDENTITY-ONLY (no --listen/--advertise) —
+    # idempotent: re-running on a formatted dir reuses the stamped
     # disk_uuid and re-registers the same node identity. The EN process
     # below self-registers the live location (--advertise) at every startup.
     local -a dirs=()
@@ -213,16 +213,16 @@ run_extent_node() {
     local -a args=(
         --port "$port" --data "$data" --manager "$mgr"
         --listen 0.0.0.0 --transport "$TRANSPORT"
-        # F-EN-DYNSHARD M1a: self-register the live location + shard ports at
+        # M1a: self-register the live location + shard ports at
         # every startup — required now that `format` no longer stamps one.
         --advertise "${adv}:${port}"
-        # Shard count == cpuset length (EN F196). Default cpuset "0" = single
+        # Shard count == cpuset length (EN). Default cpuset "0" = single
         # shard; AUTUMN_EXTENT_SHARDS=N gives cores 0..N-1. See the sharding
         # block above and docs/k8s_deploy.md "Multi-shard extent nodes".
         --cpuset "$cpuset"
     )
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9601)
-    # F-EN-FD-LRU: bound resident sealed-extent fds (default 4096 in the
+    # bound resident sealed-extent fds (default 4096 in the
     # binary). env→flag in the shell layer, never read in Rust.
     [[ -n "${AUTUMN_EXTENT_FD_CACHE_CAP:-}" ]] && args+=(--fd-cache-cap "$AUTUMN_EXTENT_FD_CACHE_CAP")
     log "exec autumn-extent-node ${args[*]}"

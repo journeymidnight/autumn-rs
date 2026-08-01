@@ -22,7 +22,7 @@
 //!
 //! Paths are `/`-separated; leading `/` is optional. ROOT_INO = 1.
 //!
-//! F-NS-PRINCIPAL-UNIFIED: `autumnfs` connects SCOPED to the WHOLE `fs/` namespace
+//! `autumnfs` connects SCOPED to the WHOLE `fs/` namespace
 //! (no `--tenant` — Option 3 dropped it) so its keys land in the SAME keyspace a
 //! fuse mount uses — a write here is visible to a mount, and vice versa. Inode
 //! numbers come from the MANAGER's
@@ -58,11 +58,11 @@ struct Args {
     #[arg(long, default_value = "tcp")]
     transport: String,
 
-    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential
+    /// path to a file holding this client's authz credential
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
     /// cluster protects the `fs/` namespace; omit on an authz-off cluster. Connects
     /// via `connect_with_credential` (principal read from the file) and FAILS FAST
-    /// if it doesn't cover `fs/`. (F-NS-PRINCIPAL-UNIFIED: no tenant segment — this
+    /// if it doesn't cover `fs/`. (No tenant segment — this
     /// CLI sees the WHOLE `fs/` namespace, same as a mount.)
     #[arg(long)]
     credential_file: Option<PathBuf>,
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
         .build()
         .context("create compio runtime")?;
     rt.block_on(async move {
-        // F-NS-PRINCIPAL-UNIFIED: scope the client to the WHOLE `fs/` namespace —
+        // scope the client to the WHOLE `fs/` namespace —
         // the binding prepends `fs/` to every relative fuse key (and strips it off
         // range results), so a write here is visible to a fuse mount. Every
         // `key::*`-based op below is unchanged; the client owns the prefix.
@@ -234,9 +234,9 @@ async fn resolve_parent_leaf(
 // ─── Inode allocation ────────────────────────────────────────────────────────
 
 /// Allocate an inode number from the MANAGER's global counter — the SAME source
-/// the fuse mount + PyO3 `autumn.Fs` use (F-FS-UNIFY M0), so autumnfs's inodes are
+/// the fuse mount + PyO3 `autumn.Fs` use (M0), so autumnfs's inodes are
 /// cluster-unique and never collide with a mount's. Empty volume = the single
-/// global counter (F-KEY-NS SD-3 review P1-2: inodes are cluster-unique, not
+/// global counter (SD-3 review P1-2: inodes are cluster-unique, not
 /// per-volume, because the lease/fence plane keys by bare ino). Replaces the
 /// pre-SD-3 racy non-CAS get/put on the `next_inode` KV counter.
 async fn alloc_inode(cluster: &ClusterClient) -> Result<u64> {
@@ -347,7 +347,7 @@ async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
     // Range scan over `[0x02][parent_ino BE]`. PS `handle_range` returns KEYS
     // only (`value: vec![]`), so we batch-fetch the dirent values — and, in
     // long mode, the child inode metas — via `get_many` per page instead of a
-    // sequential `get` per entry (F-AUTUMNFS-SLOW).
+    // sequential `get` per entry.
     let prefix = key::dirent_prefix(ino);
     let mut start: Vec<u8> = Vec::new();
     const PAGE: u32 = 256;
@@ -522,7 +522,7 @@ async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
 
 // ─── cat / get ──────────────────────────────────────────────────────────────
 
-/// F-AUTUMNFS-SLOW: bounded per-download read window — fetch this many extents
+/// bounded per-download read window — fetch this many extents
 /// per `get_many_into` so a multi-extent download pipelines (per-op bulk fan-out
 /// for the ≥ 64 KiB extents; on UCX RDMA-into-dest, on TCP recv-into-dest)
 /// instead of one serial `get` per extent — and, unlike `get_many`, without
@@ -573,7 +573,7 @@ async fn read_file_to_writer(
     // for the CLI) and bound + pipeline only the VALUE fetch, which dominates.
     let mut extents: Vec<(u64, Vec<u8>)> = Vec::new(); // (offset, extent_key)
     if let Some(s) = &meta.stripe {
-        // F-FS-STRIPE: extents live under `[0x03][lane][ino][off]`, so a range
+        // extents live under `[0x03][lane][ino][off]`, so a range
         // scan over `[0x03][ino]` would find NOTHING. Compute the key list from
         // size + geometry. Step by the file's PERSISTED `unit_bytes` (NOT the
         // MAX_EXTENT constant — see `striped_extent_offsets`) and derive each
@@ -738,7 +738,7 @@ async fn write_file_from_reader(
 
 /// Stream `data_reader` into extents for `new_ino`, then publish the inode +
 /// dirent. Records every written extent key in `written` so the caller can
-/// clean up orphans on failure. `stripe` (F-FS-STRIPE) selects the extent key
+/// clean up orphans on failure. `stripe` selects the extent key
 /// layout: `Some` → lane-striped `[0x03][lane][ino][off]` (extents spread across
 /// lane partitions → parallel via batch_put's concurrent bulk fan-out); `None` →
 /// legacy `[0x03][ino][off]` (single partition).
@@ -762,7 +762,7 @@ async fn publish_file(
         off = first_chunk.len() as u64;
         meta.inline_data = Some(first_chunk);
     } else {
-        // F-FS-STRIPE (A): CONTINUOUS write pipeline. The old window-of-8 +
+        // (A): CONTINUOUS write pipeline. The old window-of-8 +
         // full-barrier drain kept only ~window/lanes puts in flight per lane —
         // thin group-commit batches → the striped write stalled well under the
         // cluster's capacity (profiling: nothing saturated — disks < 10% util,
@@ -778,7 +778,7 @@ async fn publish_file(
             None => 8,
         };
         let mut inflight = FuturesUnordered::new();
-        // F-VALUEBUF: chunks ride in RegPool-backed ValueBufs — `depth` slabs
+        // chunks ride in RegPool-backed ValueBufs — `depth` slabs
         // cycle with STABLE addresses (UCX: registered → rcache hits from the
         // second round, no per-chunk ~100µs×rails re-registration; TCP: plain
         // recycling, no per-chunk 8 MiB alloc). The already-read first chunk
@@ -872,7 +872,7 @@ async fn publish_file(
     Ok(())
 }
 
-/// F-FS-GEOM-DECLARED: the fs-wide DECLARED stripe geometry, read once per
+/// the fs-wide DECLARED stripe geometry, read once per
 /// invocation. This replaces `detect_stripe_lanes`, which reverse-engineered the
 /// lane count from the CURRENT partition split points on every large-file
 /// create. Three things went wrong with that and all three die here:
@@ -902,7 +902,7 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Resu
     }
     let f = std::fs::File::open(local)
         .with_context(|| format!("open local file {}", local.display()))?;
-    // F-FS-GEOM-DECLARED: stripe EVERY file in a striped fs — the 64 MiB
+    // stripe EVERY file in a striped fs — the 64 MiB
     // threshold is gone. It protected almost nothing: with unit = MAX_EXTENT a
     // file of one extent or less has a single extent, which lands on lane 0
     // regardless, i.e. byte-for-byte the same placement as not striping; and
@@ -997,7 +997,7 @@ async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
     // Delete extents (if any), then dirent, then inode if nlink would hit 0.
     if meta.inline_data.is_none() {
         if let Some(s) = &meta.stripe {
-            // F-FS-STRIPE: striped extents live under `[0x03][lane][ino][off]`,
+            // striped extents live under `[0x03][lane][ino][off]`,
             // spread across lane partitions — a `[0x03][ino]` scan would MISS
             // them (leak). Compute + delete each key (same enumeration the read
             // path uses: stride = the file's PERSISTED unit_bytes, up to size).

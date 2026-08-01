@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# perf_ucx_baseline.sh — F100-UCX A/B perf capture (transport-level + cluster-level).
+# perf_ucx_baseline.sh — A/B perf capture (transport-level + cluster-level).
 #
 # TRANSPORT-LEVEL (no cluster needed; runs locally):
 #   ./scripts/perf_ucx_baseline.sh transport

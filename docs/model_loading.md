@@ -134,7 +134,7 @@ runai_streamer/tensorizer). One implementation serves both vLLM and SGLang
 
 **Verified end-to-end** (vLLM 0.24, 8×H200): loads `gte-Qwen2-1.5B` from autumn,
 embedding **byte-exact vs the default local-disk loader**; over RDMA reaches
-~82% of Run:ai Model Streamer's local-page-cache throughput (F-REDIRECT-BATCH).
+~82% of Run:ai Model Streamer's local-page-cache throughput.
 Package: `python/autumn_vllm_loader/` (+ `tests/run_vllm_e2e.sh`).
 
 ```bash

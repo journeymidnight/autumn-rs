@@ -1,4 +1,4 @@
-//! F109 — extent-node DelExtent handler.
+//! extent-node DelExtent handler.
 //!
 //! Single-node integration coverage:
 //! 1. Existing extent: handler returns CODE_OK and unlinks both

@@ -6,7 +6,7 @@
 //! At process start we snapshot the set of CPU cores this binary is allowed
 //! to pin work to. The snapshot comes from one of two sources, in order:
 //!
-//! 1. **`--cpuset <SPEC>`** (F196): operator-supplied explicit list, e.g.
+//! 1. **`--cpuset <SPEC>`**: operator-supplied explicit list, e.g.
 //!    `4-11`, `4,5,6`, `0-3,8-11`. When present, this is the final
 //!    list (offset is ignored). Each work-unit (partition pair, extent
 //!    shard, bench worker) takes one core in ascending order:
@@ -41,8 +41,8 @@ pub fn set_cpu_offset(offset: usize) {
     CPU_OFFSET.store(offset, Ordering::Relaxed);
 }
 
-/// F196: install an explicit cpuset overriding `core_affinity::get_core_ids()`.
-/// First-call-wins (matches the F195 tunable pattern); subsequent calls
+/// install an explicit cpuset overriding `core_affinity::get_core_ids()`.
+/// First-call-wins (matches the tunable pattern); subsequent calls
 /// return `false` without mutating the override. Must be called BEFORE the
 /// first `pick_cpu_for_ord` or `cpuset_len` call, since both cache the
 /// resolved list in a `OnceLock`.
@@ -58,7 +58,7 @@ pub fn set_cpuset(cores: Vec<usize>) -> bool {
     CPU_SET_OVERRIDE.set(v).is_ok()
 }
 
-/// F196: parse a taskset-style cpu list spec into a sorted, deduped
+/// parse a taskset-style cpu list spec into a sorted, deduped
 /// vector of core indices. Accepts `<int>` or `<int>-<int>` segments
 /// separated by commas, e.g. `"4"`, `"4-11"`, `"0-3,8,12-15"`. The
 /// `:groupsize/chunksize` advanced form is intentionally not supported.
@@ -102,7 +102,7 @@ pub fn parse_cpuset(spec: &str) -> Result<Vec<usize>, String> {
 fn available_cpu_cores() -> &'static [usize] {
     static CELL: OnceLock<Vec<usize>> = OnceLock::new();
     CELL.get_or_init(|| {
-        // F196: explicit --cpuset overrides auto-detection when set.
+        // explicit --cpuset overrides auto-detection when set.
         if let Some(over) = CPU_SET_OVERRIDE.get() {
             return over.clone();
         }
@@ -114,14 +114,14 @@ fn available_cpu_cores() -> &'static [usize] {
     })
 }
 
-/// F196: number of cores available for pinning in the resolved cpuset.
+/// number of cores available for pinning in the resolved cpuset.
 /// Used by PS for partition-budget gating and by EN for default shard
 /// count. Returns 0 only on platforms without affinity support.
 pub fn cpuset_len() -> usize {
     available_cpu_cores().len()
 }
 
-/// F196: returns true iff the operator passed `--cpuset` explicitly
+/// returns true iff the operator passed `--cpuset` explicitly
 /// (i.e. `set_cpuset` was called). PS uses this to decide whether to
 /// enforce its partition budget. EN uses it to decide whether to
 /// auto-size `--shards` from the cpuset.
@@ -139,7 +139,7 @@ pub fn pick_cpu_for_ord(zero_based_ord: usize) -> Option<usize> {
     if cores.is_empty() {
         return None;
     }
-    // F196: cpuset override = explicit list; ord indexes it directly with
+    // cpuset override = explicit list; ord indexes it directly with
     // no offset. Without override, fall back to legacy CPU_OFFSET + ord.
     let idx = if CPU_SET_OVERRIDE.get().is_some() {
         zero_based_ord

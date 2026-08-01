@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F-AUTHZ-1 cross-tenant e2e: bring up an ISOLATED authz-ENABLED cluster from
+# cross-tenant e2e: bring up an ISOLATED authz-ENABLED cluster from
 # this tree's debug binaries, create two tenants, and run the #[ignore]
 # cross-tenant isolation test. Does NOT touch any other cluster (distinct ports
 # / data dirs). Memory-only manager (no etcd) — authz works without etcd.

@@ -1,6 +1,6 @@
 //! Per-session lease background tasks — heartbeat + invalidation poll.
 //!
-//! F-FS-UNIFY M4: extracted from the fuse-gated `dispatch.rs` into the
+//! M4: extracted from the fuse-gated `dispatch.rs` into the
 //! `fuser`-free core so BOTH front-ends share one implementation: the
 //! `autumn-fuse` mount (passing a real kernel `InodeInvalidator`) and the PyO3
 //! `autumn.Fs` binding (passing `None` — headless, no kernel page cache to
@@ -14,7 +14,7 @@
 
 use crate::state::FsState;
 
-/// F-fuse-lease-2: callback the per-session invalidation poll loop runs for
+/// Callback the per-session invalidation poll loop runs for
 /// every per-ino `WriterClosed` / `LeaseRevoked` event. In the fuse mount this
 /// is `notifier.inval_inode(ino, 0, 0)` against the live `fuser::Session`'s
 /// `Notifier`, dropping the kernel's attribute + page cache for the ino so the
@@ -50,7 +50,7 @@ pub fn evict_revoked_held_leases(
     newly_revoked
 }
 
-/// F-fuse-lease-2 — pure-fn extracted from the invalidation poll loop so the
+/// Pure-fn extracted from the invalidation poll loop so the
 /// "per-event ⇒ per-ino invalidator call" contract can be unit-tested without
 /// booting a real cluster. For every event in the batch, runs the kernel-cache
 /// eviction callback iff the event has a non-zero ino. `ino == 0` is the
@@ -67,7 +67,7 @@ pub fn invalidate_kernel_cache_for_events(
     }
 }
 
-/// F-fuse-lease-1 + F-fuse-lease-2: per-session background tasks. Spawn ONCE on
+/// Per-session background tasks. Spawn ONCE on
 /// the compio runtime right after `FsState::new` (before the dispatch / job
 /// loop). Two tasks: a lease heartbeat loop + an invalidation poll loop:
 ///
@@ -112,12 +112,12 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                     Ok(autumn_client::lease::HeartbeatResult::NotHeld) => {
                         tracing::warn!(
                             ino,
-                            "F-fuse-lease-1: heartbeat NotHeld; dropping local lease entry"
+                            "heartbeat NotHeld; dropping local lease entry"
                         );
                         held_h.borrow_mut().remove(&ino);
                     }
                     Err(e) => {
-                        tracing::warn!(ino, error = %e, "F-fuse-lease-1: heartbeat transient");
+                        tracing::warn!(ino, error = %e, "heartbeat transient");
                     }
                 }
             }
@@ -143,7 +143,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                             ino = ev.ino,
                             version = ev.version,
                             kind = ev.kind,
-                            "F-fuse-lease-2: invalidation"
+                            "invalidation"
                         );
                     }
                     // Drop the kernel's attribute + page cache for each non-zero
@@ -169,7 +169,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                     }
                     if wholesale {
                         tracing::warn!(
-                            "F-fuse-lease-1: overflow sentinel; wholesale invalidating session"
+                            "overflow sentinel; wholesale invalidating session"
                         );
                         let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                         held_p.borrow_mut().clear();
@@ -191,7 +191,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "F-fuse-lease-1: poll failed; invalidating session cache + retry"
+                        "poll failed; invalidating session cache + retry"
                     );
                     let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                     held_p.borrow_mut().clear();

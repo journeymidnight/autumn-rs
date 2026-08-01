@@ -11,7 +11,7 @@ use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{RpcError, StatusCode};
 use bytes::Bytes;
 
-/// F-fuse-lease-1: inode-lease client helpers. Used by autumn-fuse
+/// Inode-lease client helpers. Used by autumn-fuse
 /// `open`/`release` callbacks. (Originated for the io_uring daemon,
 /// which was removed 2026-06-30; autumn-fuse is now the sole caller.)
 pub mod lease;
@@ -41,7 +41,7 @@ pub enum AutumnError {
     ServerError(String),
     RoutingError(String),
     ConnectionError(String),
-    /// F129/F186: value exceeds the inline `Put` cap. Caller should retry
+    /// value exceeds the inline `Put` cap. Caller should retry
     /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`
     /// (client-side striped write, no server-side multipart RPC any more).
     ValueTooLarge {
@@ -53,14 +53,14 @@ pub enum AutumnError {
     /// lease was revoked. The caller must stop writing under this lease
     /// and re-acquire.
     Fenced(String),
-    /// F-AUTHZ-1: the PS refused this request — the connection is not
+    /// the PS refused this request — the connection is not
     /// authorized for the key range (no valid capability token, key outside the
     /// granted prefixes, or the token expired). TERMINAL: retrying / refreshing
     /// routing won't help; the caller must (re-)authenticate with a token that
     /// grants the key. Distinct from `NotFound` so a denied key isn't mistaken
     /// for an absent one.
     PermissionDenied(String),
-    /// F-KEY-NS D7 Layer-A: the PS refused a put-class write because its key
+    /// D7 Layer-A: the PS refused a put-class write because its key
     /// falls in NO registered namespace. TERMINAL: retrying / refreshing routing
     /// won't create the namespace — the operator must `namespace-create` it (or
     /// the caller must write under a registered namespace). Distinct from
@@ -96,9 +96,9 @@ impl std::fmt::Display for AutumnError {
 
 impl std::error::Error for AutumnError {}
 
-// ── F-KEY-NS D7: namespace binding ───────────────────────────────────────────
+// ── D7: namespace binding ───────────────────────────────────────────
 
-/// F-NS-PRINCIPAL-UNIFIED (Option 3): the key-prefix scope a `ClusterClient`
+/// (Option 3): the key-prefix scope a `ClusterClient`
 /// operates within. There is NO tenant segment — a scope is `{ns}/` (a whole
 /// namespace, e.g. `fs/`, `gallery/`) or an in-namespace sub-prefix
 /// (`mem/agent7/` — an app's own segment; the app owns its sub-structure). A
@@ -185,7 +185,7 @@ impl NamespaceBinding {
     }
 }
 
-/// F-KEY-NS D7: validate a namespace/tenant scope segment used at connect.
+/// D7: validate a namespace/tenant scope segment used at connect.
 /// Prepend-only embeds these verbatim into `{tenant}/{ns}/` (the old `q()`
 /// percent-encoding of the tenant is gone), so an EMPTY segment or one containing
 /// `/` would forge a nested/aliased scope (`acme/sub` + `mem` → `acme/sub/mem/`,
@@ -198,7 +198,7 @@ pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// F-KEY-NS D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
+/// D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
 /// binding, SHARING all of its connection pools (no reconnect, no Rc refactor).
 /// Returned by `ClusterClient::raw()` (Raw binding — admin/migration, no client
 /// clamp) and `ClusterClient::rescope(ns, tenant)` (a different scope). Exposes
@@ -305,7 +305,7 @@ fn check_ps_code(code: u8, message: &str) -> std::result::Result<(), AutumnError
     Ok(())
 }
 
-/// F225: map an autumn-rpc FRAME-level error (`Err((StatusCode, msg))` returned
+/// map an autumn-rpc FRAME-level error (`Err((StatusCode, msg))` returned
 /// by a PS handler — e.g. `handle_split_part`'s overlap precondition) into a
 /// typed `AutumnError`. `ps_call` returns this (wrapped in `anyhow`) instead of
 /// stringifying, so the routing-retry loops can classify terminal vs transient
@@ -318,18 +318,18 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
             StatusCode::NotFound => AutumnError::NotFound,
             StatusCode::InvalidArgument => AutumnError::InvalidArgument(message),
             StatusCode::FailedPrecondition => AutumnError::PreconditionFailed(message),
-            // F-AUTHZ-1: TERMINAL — not in any retry set (refresh/retry can't
+            // TERMINAL — not in any retry set (refresh/retry can't
             // grant access), so it propagates to the caller instead of burning
             // the routing-refresh budget.
             StatusCode::PermissionDenied => AutumnError::PermissionDenied(message),
-            // F-KEY-NS D7 Layer-A: TERMINAL like PermissionDenied — refreshing
+            // D7 Layer-A: TERMINAL like PermissionDenied — refreshing
             // routing can't create the namespace, so it propagates instead of
             // burning the routing-refresh budget.
             StatusCode::NamespaceUnknown => AutumnError::NamespaceUnknown(message),
             // Unavailable is transient (overloaded / draining) → keep retryable.
             StatusCode::Unavailable => AutumnError::ConnectionError(message),
             // Ok-as-error / Internal / AlreadyExists: surface as ServerError
-            // (retryable in the loops, same as the pre-F225 stringified path).
+            // (retryable in the loops, same as the previous stringified path).
             StatusCode::Ok | StatusCode::Internal | StatusCode::AlreadyExists => {
                 AutumnError::ServerError(message)
             }
@@ -340,7 +340,7 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
     }
 }
 
-/// F129 client-side hard cap. Matches the PS's `AUTUMN_PS_MAX_INLINE_BYTES_HARD`
+/// client-side hard cap. Matches the PS's `AUTUMN_PS_MAX_INLINE_BYTES_HARD`
 /// (256 MiB). Pre-checked in `put_opts` to avoid sending a 256 MB+ request
 /// over the wire only to get rejected. The PS may be configured with a
 /// stricter (lower) cap; in that case the server still rejects, mapped to
@@ -348,7 +348,7 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
 /// from the message would require parsing, which we skip).
 pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 
-/// F216-E — minimum value size for which the UCX zero-copy READ path
+/// minimum value size for which the UCX zero-copy READ path
 /// (`get_into` / `MSG_GET_BULK`) is worth taking. Below this, the per-op
 /// registered-recv machinery (regpool_acquire + `UCP_OP_ATTR_FIELD_MEMH` +
 /// the 2-stage header/value recv) costs MORE than the single small copy it
@@ -360,7 +360,7 @@ pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 /// conservative crossover (the mid-range is parity, large is a clear win).
 pub const BULK_MIN_BYTES: usize = 64 * 1024;
 
-/// F235: the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET_BULK`,
+/// the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET_BULK`,
 /// `put_bulk`/`MSG_PUT_BULK`) iff the value is at least `BULK_MIN_BYTES`
 /// (64 KiB). SYMMETRIC across reads and writes AND across transports — it mirrors
 /// the PS-side recv gates (`BULK_MIN_BYTES` here + `AUTUMN_PS_BULK_RECV_MIN_BYTES`
@@ -368,15 +368,15 @@ pub const BULK_MIN_BYTES: usize = 64 * 1024;
 /// costs more than the copy it saves (small UCX read regresses ~18%) AND the PS recv
 /// side doesn't bulk anyway, so end-to-end bulk only engages at/above 64 KiB. This is the
 /// ONE source of truth — perf-check, the python `BatchClient`, and `get_many_into`
-/// all call it (F234 found 3 hand-rolled copies had drifted; F235 collapsed them and
-/// made the write rule symmetric — was `is_ucx || large`, which only saved
+/// all call it (3 hand-rolled copies had drifted; collapsing them and
+/// making the write rule symmetric — was `is_ucx || large`, which only saved
 /// client-side allocs on small UCX writes while the PS still FrameDecoder-copied).
 pub fn bulk_worthwhile(value_size: usize) -> bool {
     value_size >= BULK_MIN_BYTES
 }
 
 /// A value buffer backed by the transport RegPool — the SDK's data-plane
-/// buffer currency (F-VALUEBUF).
+/// buffer currency.
 ///
 /// The pool hands out RECYCLED slabs with STABLE addresses: on a UCX runtime
 /// the slab is `ucp_mem_map`-registered at creation, so sends/recvs touching
@@ -485,7 +485,7 @@ impl std::fmt::Debug for ValueBuf {
     }
 }
 
-/// F-NS-PRINCIPAL-UNIFIED (§8.5): read a principal credential file into
+/// (§8.5): read a principal credential file into
 /// `(principal_name, raw_secret_bytes)` for
 /// [`ClusterClient::connect_with_credential`]. Because Option 3 dropped the
 /// `--principal` CLI flag, the principal IDENTITY now travels IN the file. Format
@@ -578,22 +578,22 @@ mod credential_file_tests {
     }
 }
 
-/// F-DIRECT-MANY: latches after the first direct-read→proxy fallback so the
+/// latches after the first direct-read→proxy fallback so the
 /// warning fires exactly once per process (default-ON direct-read on a topology
 /// where ENs aren't client-reachable would otherwise warn on every large read).
 static DIRECT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// F235: default in-flight concurrency for `get_many_into` (sliding-window pipeline
+/// default in-flight concurrency for `get_many_into` (sliding-window pipeline
 /// over the per-partition multiplexed connections). Mirrors the stream worker's
 /// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
 pub const BATCH_GET_DEFAULT_CONCURRENCY: usize = 32;
 
-/// F236: default in-flight concurrency for `put_many` (write sibling of
+/// default in-flight concurrency for `put_many` (write sibling of
 /// `BATCH_GET_DEFAULT_CONCURRENCY`).
 pub const BATCH_PUT_DEFAULT_CONCURRENCY: usize = 32;
 
-/// F245: the streaming fan-out primitive — the ONE concurrency base under every
+/// the streaming fan-out primitive — the ONE concurrency base under every
 /// batch API. Drives `futs` with bounded `concurrency` (sliding window) and
 /// yields `(input_index, output)` as each future COMPLETES (completion order,
 /// NOT input order). This is the same SQ/CQ "fire N, reap as they land" shape the
@@ -618,7 +618,7 @@ pub fn fan_out<Fut: std::future::Future>(
     .buffer_unordered(concurrency.max(1))
 }
 
-/// F245: collect convenience over [`fan_out`] — runs all `futs` with bounded
+/// collect convenience over [`fan_out`] — runs all `futs` with bounded
 /// `concurrency` and returns the outputs in INPUT order (result `i` ⇔ `futs[i]`).
 pub async fn fan_out_collect<Fut: std::future::Future>(
     futs: impl IntoIterator<Item = Fut>,
@@ -638,7 +638,7 @@ pub async fn fan_out_collect<Fut: std::future::Future>(
         .collect()
 }
 
-// ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
+// ── TiKV-style retry/backoff for async-split-tolerant routing ─
 //
 // Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
 // "Partition Split"): `handle_split_part` returns the moment
@@ -648,7 +648,7 @@ pub async fn fan_out_collect<Fut: std::future::Future>(
 // deep WAL tails). The SOURCE partition is ALSO dropped + reopened on
 // its host PS because `opened_with` no longer matches the post-split
 // (rg, region_epoch). During those windows clients see either
-// CODE_NOT_FOUND (mis-routed via `ps_details` fallback under F099-K)
+// CODE_NOT_FOUND (mis-routed via `ps_details` fallback)
 // or TCP-refused/timeout (listener torn down for reopen).
 //
 // Modelled on `tikv-client-rust/src/backoff.rs::NoJitterBackoff`:
@@ -667,7 +667,7 @@ pub async fn fan_out_collect<Fut: std::future::Future>(
 // finish in <500 ms. This budget targets the inherent right-child
 // open window (~2-4 s). It is deliberately NOT large enough to mask
 // PS-side correctness bugs that produce minute-scale unavailability
-// (e.g., the F212-fix-2 `opened_with` staleness that caused the
+// (e.g., the `opened_with` staleness that caused the
 // SOURCE partition to be needlessly dropped + reopened by
 // `sync_regions_once`). Such bugs should fail loudly here so they
 // get fixed at the source, not papered over with bigger retries.
@@ -744,12 +744,12 @@ pub struct GetManyItem<'a> {
 /// the routing caches and `Cell` for the manager round-robin index.
 /// Borrows are deliberately scoped: every `borrow()` / `borrow_mut()` is
 /// released before any `.await`.
-/// F-AUTHZ-1: re-mint a token when it has less than this many seconds of life
+/// re-mint a token when it has less than this many seconds of life
 /// left, so connections are (re-)bound to a fresh token before the current one
 /// expires — the PS never sees an expired token in normal operation.
 const TOKEN_RENEW_MARGIN_SECS: u64 = 300;
 
-/// F-AUTHZ-1: current unix seconds.
+/// current unix seconds.
 fn client_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -757,13 +757,13 @@ fn client_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// F-AUTHZ-1: a minted capability token + its expiry (unix seconds).
+/// a minted capability token + its expiry (unix seconds).
 struct CachedToken {
     bytes: Vec<u8>,
     exp: u64,
 }
 
-/// F-AUTHZ-1: the client's tenant identity (permanent credential) + the current
+/// the client's tenant identity (permanent credential) + the current
 /// short-TTL token minted from it. One `ClusterClient` = one principal (the
 /// design: `MemoryStore` is per-`(tenant, agent)`, each with its own client).
 struct ClientAuth {
@@ -782,14 +782,14 @@ pub struct ClusterClient {
     mgr_conn: Rc<RefCell<Option<Rc<RpcClient>>>>,
     /// Cached PS RPC connections. Dropped on error, recreated on next use.
     ps_conns: RefCell<HashMap<String, Rc<RpcClient>>>,
-    /// F259: extent-node connections for redirect direct reads.
+    /// extent-node connections for redirect direct reads.
     en_pool: autumn_stream::ConnPool,
     /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
     /// `RefCell` so concurrent tasks holding `Rc<ClusterClient>` can do
     /// brief lookup-and-clone borrows without blocking each other.
     regions: RefCell<Vec<(u64, MgrRegionInfo)>>,
     ps_details: RefCell<HashMap<u64, MgrPsDetail>>,
-    /// F099-K — per-partition listener addresses, indexed by `part_id`.
+    /// per-partition listener addresses, indexed by `part_id`.
     /// When an entry is present, it supersedes `ps_details[ps_id].address`
     /// for routing decisions (thread-per-partition shard target).
     part_addrs: RefCell<HashMap<u64, String>>,
@@ -806,12 +806,12 @@ pub struct ClusterClient {
     /// resets back to the default (NOT to `None` — wait-forever is no
     /// longer a supported mode).
     ///
-    /// Originally introduced as F184 to fix the partition-server
+    /// Originally introduced to fix the partition-server
     /// dropping a partition's `req_rx` mid-call (region_sync_loop
     /// reload after merge / graceful shutdown drain): the per-request
     /// response oneshot closes WITHOUT closing the underlying TCP
     /// connection (other partitions on the same PS still use it).
-    /// autumn-rpc's F121 `closed: Cell<bool>` flag fires on TCP close
+    /// autumn-rpc's `closed: Cell<bool>` flag fires on TCP close
     /// but not on req_rx drop, so without a per-call timeout the
     /// caller's `.await` would hang forever.
     ///
@@ -819,7 +819,7 @@ pub struct ClusterClient {
     /// surfaces as `ConnectionError`; the existing `mgr_call_retry`
     /// path's `rotate_manager` then walks to the next manager address.
     rpc_timeout: Cell<Option<Duration>>,
-    /// F-ADMIN-OP-AUTH: shared admin secret for cluster-mutating manager ops
+    /// shared admin secret for cluster-mutating manager ops
     /// (fence/remove/merge/create-stream/…). When set, `mgr_call*` prefix it
     /// onto the payload of an `is_admin_mgr_msg` (`[u32 len][token][payload]`)
     /// and the manager strips + verifies. `None` = don't prefix (the manager
@@ -830,17 +830,17 @@ pub struct ClusterClient {
     /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
     /// disables fast-fail (every attempt uses the full `rpc_timeout`).
     first_attempt_timeout: Cell<Option<Duration>>,
-    /// F-AUTHZ-1: optional tenant credential + cached token. `None` = anonymous
+    /// optional tenant credential + cached token. `None` = anonymous
     /// (no AUTH_HELLO sent — the pre-authz behavior; works against non-authz
     /// clusters). When `Some`, every fresh PS connection sends AUTH_HELLO with a
     /// (lazily minted, auto-renewed) token before use.
     auth: RefCell<Option<ClientAuth>>,
-    /// F-AUTHZ-1: bumped by `set_tenant_credential`. `get_ps_client` captures it
+    /// bumped by `set_tenant_credential`. `get_ps_client` captures it
     /// before the AUTH_HELLO await and refuses to CACHE a connection if the
     /// identity changed mid-connect — so a principal switch can't leave a
     /// wrong-identity-bound connection in the pool (coco P2).
     auth_gen: Cell<u64>,
-    /// F-KEY-NS D7: the namespace scope this client operates within. Set at
+    /// D7: the namespace scope this client operates within. Set at
     /// `connect(mgr, ns, tenant)` (Scoped) or `connect_raw(mgr)` (Raw). Every
     /// scoped op binds its key through this before routing. `raw()` / `rescope`
     /// return borrow-views with a different binding sharing these pools.
@@ -920,7 +920,7 @@ impl ClusterClient {
     /// surfaces as a transport error; `mgr_call_retry`'s
     /// `rotate_manager` walks to the next manager address on the next
     /// attempt.
-    /// F-ADMIN-OP-AUTH: set the admin secret used to authorize cluster-mutating
+    /// set the admin secret used to authorize cluster-mutating
     /// manager ops. `autumn-op` calls this once at connect when `--admin-token-file`
     /// is given; read-only commands are unaffected (the server only gates
     /// `is_admin_mgr_msg`).
@@ -1013,7 +1013,7 @@ impl ClusterClient {
         Ok(resp)
     }
 
-    /// F-DASH-IN-MGR M2: read the auto-policy controller state
+    /// M2: read the auto-policy controller state
     /// (`MSG_AUTOPOLICY_GET`). Leader-routed (rotates on NOT_LEADER).
     pub async fn auto_policy_get(&self) -> Result<AutoPolicyGetResp> {
         let req = rkyv_encode(&AutoPolicyGetReq {});
@@ -1037,7 +1037,7 @@ impl ClusterClient {
         Ok(resp)
     }
 
-    /// F-DASH-IN-MGR M2: apply an auto-policy op (`MSG_AUTOPOLICY_SET`).
+    /// M2: apply an auto-policy op (`MSG_AUTOPOLICY_SET`).
     /// Leader-routed; the manager persists the new config to etcd.
     pub async fn auto_policy_set(&self, req: AutoPolicySetReq) -> Result<AutoPolicySetResp> {
         let payload = rkyv_encode(&req);
@@ -1061,7 +1061,7 @@ impl ClusterClient {
         Ok(resp)
     }
 
-    /// F-FS-UNIFY M0: grant a contiguous batch of fuse-fs inode numbers
+    /// M0: grant a contiguous batch of fuse-fs inode numbers
     /// `[base, base + count)` from the manager's crash-safe allocator
     /// (leader-fenced etcd CAS — concurrent allocators always receive
     /// disjoint ranges). `floor` is the legacy `[0x04]next_inode` fs KV
@@ -1090,7 +1090,7 @@ impl ClusterClient {
         Ok(resp.base)
     }
 
-    /// F-AUTHZ-1: mint a short-TTL capability token for `principal` from its
+    /// mint a short-TTL capability token for `principal` from its
     /// permanent `credential`. Leader-only. Returns `(token_bytes, exp_unix_secs)`.
     pub async fn mint_token(&self, principal: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
         let req = rkyv_encode(&MintTokenReq {
@@ -1110,7 +1110,7 @@ impl ClusterClient {
         Ok((resp.token, resp.exp))
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: create/rotate a principal account (admin). Returns
+    /// create/rotate a principal account (admin). Returns
     /// the permanent credential. Leader-only. (`TenantCreateReq.tenant` carries the
     /// principal NAME — the wire struct name is retained; the concept is principal.)
     pub async fn principal_create(
@@ -1144,7 +1144,7 @@ impl ClusterClient {
         Ok(resp.credential)
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: delete a principal account (admin). Leader-only.
+    /// delete a principal account (admin). Leader-only.
     pub async fn principal_delete(&self, principal: &str, admin_token: &str) -> Result<()> {
         let req = rkyv_encode(&TenantDeleteReq {
             admin_token: admin_token.to_string(),
@@ -1170,7 +1170,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-KEY-NS D2: register a namespace (admin). Leader-only. `owner_tenant`
+    /// D2: register a namespace (admin). Leader-only. `owner_tenant`
     /// `Some(_)` marks it protected; `presplit` freezes D8 split points (stored,
     /// not yet acted upon).
     pub async fn namespace_create(
@@ -1206,7 +1206,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-KEY-NS D2: delete a namespace registry row (admin). Leader-only. The
+    /// D2: delete a namespace registry row (admin). Leader-only. The
     /// non-empty guard (`--force`) is enforced by the CALLER (autumn-op scans
     /// the prefix); this only drops the registry row.
     pub async fn namespace_delete(&self, name: &str, admin_token: &str) -> Result<()> {
@@ -1234,7 +1234,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-KEY-NS D2: list the full namespace registry (rich rows). Leader-routed
+    /// D2: list the full namespace registry (rich rows). Leader-routed
     /// (rotates on NOT_LEADER). Read-only.
     pub async fn namespace_list(&self) -> Result<Vec<MgrNamespace>> {
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -1257,7 +1257,7 @@ impl ClusterClient {
         Ok(resp.namespaces)
     }
 
-    /// F-FS-GEOM-DECLARED step 4: record the split points a presplit actually
+    /// step 4: record the split points a presplit actually
     /// applied onto an EXISTING namespace row, so `merge` refuses to undo them.
     /// UNIONs with whatever is already recorded (never replaces). Admin-gated.
     pub async fn namespace_set_presplit(
@@ -1291,7 +1291,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Leader-routed
+    /// list every principal + its grants. Leader-routed
     /// (rotates on NOT_LEADER), read-only. Never returns credential material.
     pub async fn principal_list(&self) -> Result<Vec<PrincipalRow>> {
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -1345,7 +1345,7 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("manager not connected"))
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: connect a SCOPED client bound to a key-prefix
+    /// connect a SCOPED client bound to a key-prefix
     /// `scope` (`fs`, `gallery`, or an in-namespace sub-prefix `mem/agent7`). Every
     /// data op is confined to `{scope}/` — **Prepend-only**: the client ALWAYS
     /// prepends `{scope}/` to the user key (scope locked by construction; the
@@ -1365,7 +1365,7 @@ impl ClusterClient {
         Self::connect_with_binding(manager, NamespaceBinding::scoped(scope)).await
     }
 
-    /// F-KEY-NS D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO
+    /// D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO
     /// client-side namespace clamp. For admin / manager-only tooling
     /// (`autumn-op`, node registration), cross-namespace inspection/migration,
     /// tests exercising other features, and fuse-before-SD3 (whose keys are still
@@ -1415,7 +1415,7 @@ impl ClusterClient {
 
         // WIRE-1: startup wire-schema cross-check. A SUCCESSFUL response
         // with a different fingerprint is a hard refusal (mixed
-        // same-commit deploy — rkyv would decode garbage; the F275 stale
+        // same-commit deploy — rkyv would decode garbage; the stale
         // python wheel failed exactly this way, silently). A transport
         // failure is skipped: availability wins while the manager is
         // briefly down, and every RPC after this would fail loudly anyway.
@@ -1445,7 +1445,7 @@ impl ClusterClient {
     }
 
     pub async fn refresh_regions(&self) -> Result<()> {
-        // F267: get_regions is leader-gated (a follower's part_addrs view
+        // get_regions is leader-gated (a follower's part_addrs view
         // is empty/stale — manager-HA chaos H3 black-holed every client
         // that connected to a rejoined follower first). On NOT_LEADER,
         // rotate and retry until the leader answers.
@@ -1509,7 +1509,7 @@ impl ClusterClient {
     }
 
     /// Wait until every partition reported by the manager has a
-    /// registered `part_addr` (the per-partition F099-K listener) AND
+    /// registered `part_addr` (the per-partition listener) AND
     /// each `part_addr` accepts TCP connections. Polls `refresh_regions`
     /// every `poll_interval` until the readiness condition holds or
     /// `timeout` elapses.
@@ -1609,7 +1609,7 @@ impl ClusterClient {
     }
 
     /// Get or create a PS RPC connection. Auto-reconnects on failure.
-    /// F-AUTHZ-1: set this client's tenant credential. Enables authz — every
+    /// set this client's tenant credential. Enables authz — every
     /// fresh PS connection AUTH_HELLOs with a (lazily minted, auto-renewed)
     /// token scoped to the tenant's granted prefixes. Anonymous (no credential,
     /// the default) works unchanged against non-authz clusters. Clears cached PS
@@ -1625,7 +1625,7 @@ impl ClusterClient {
         self.ps_conns.borrow_mut().clear();
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: connect a SCOPED client + set its authz credential
+    /// connect a SCOPED client + set its authz credential
     /// in one call. `scope` is the KEY prefix (`fs`, `mem/agent7`); `principal` is
     /// the authz identity (credential owner, sourced from the credential file's
     /// name line, §8.5); `credential` is the raw secret. When authz is enabled this
@@ -1645,7 +1645,7 @@ impl ClusterClient {
         Ok(c)
     }
 
-    /// F-KEY-NS D7: when authz is on, verify the client's `{ns}/{tenant}/` scope
+    /// D7: when authz is on, verify the client's `{ns}/{tenant}/` scope
     /// is within one of the credential's granted prefixes, and FAIL FAST at
     /// connect if not (coco P2 — no more silent defer-to-first-write). Skipped
     /// only when authz is DISABLED on the manager (no signing key) — there is
@@ -1706,7 +1706,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-AUTHZ-1: return a currently-valid token, minting/renewing via
+    /// return a currently-valid token, minting/renewing via
     /// `MSG_MINT_TOKEN` when there is none or it's within
     /// `TOKEN_RENEW_MARGIN_SECS` of expiry. On a renewal (a prior token existed),
     /// drops cached PS connections so they rebind under the fresh token.
@@ -1751,7 +1751,7 @@ impl ClusterClient {
     }
 
     pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
-        // F-AUTHZ-1: renew the token BEFORE serving a cached connection so a
+        // renew the token BEFORE serving a cached connection so a
         // long-lived client rebinds before the current token expires —
         // `ensure_token` clears `ps_conns` on renewal, dropping stale-token
         // connections so the cache lookup below misses and rebinds (coco P1).
@@ -1836,7 +1836,7 @@ impl ClusterClient {
             Err(e) => {
                 // Drop connection so next call reconnects
                 self.ps_conns.borrow_mut().remove(ps_addr);
-                // F225: preserve the typed error inside anyhow (downcastable)
+                // preserve the typed error inside anyhow (downcastable)
                 // instead of stringifying, so the routing-retry loops can tell
                 // a deterministic precondition from a transient routing miss.
                 Err(anyhow::Error::new(rpc_status_to_error(e)))
@@ -1931,7 +1931,7 @@ impl ClusterClient {
             return None;
         }
         let (_, region) = &regions[idx];
-        // F099-K: prefer per-partition listener if registered.
+        // prefer per-partition listener if registered.
         let part_addrs = self.part_addrs.borrow();
         let ps_details = self.ps_details.borrow();
         let addr = match part_addrs.get(&region.part_id) {
@@ -1951,7 +1951,7 @@ impl ClusterClient {
     }
 
     pub async fn resolve_part_id(&self, part_id: u64) -> Result<String> {
-        // F099-K: prefer the per-partition listener address when
+        // prefer the per-partition listener address when
         // registered; fall back to the PS-level base address otherwise.
         // Borrows are scoped — released before any `.await`.
         let lookup = |this: &Self| -> Option<String> {
@@ -1981,7 +1981,7 @@ impl ClusterClient {
         let mut result: Vec<(u64, String)> = regions
             .iter()
             .map(|(_, region)| {
-                // F099-K: prefer per-partition listener address when present.
+                // prefer per-partition listener address when present.
                 let addr = part_addrs
                     .get(&region.part_id)
                     .cloned()
@@ -1994,7 +1994,7 @@ impl ClusterClient {
         Ok(result)
     }
 
-    /// F099-N-c — like `all_partitions`, but also returns each partition's
+    /// c — like `all_partitions`, but also returns each partition's
     /// `(start_key, end_key)` range so bench tools can generate keys that
     /// actually land in each partition. Prior bench tools used a constant
     /// prefix like "pc_{tid}_{seq}" / "bench_{tid}_{seq}" which lexically
@@ -2032,7 +2032,7 @@ impl ClusterClient {
     /// Resolve key to (part_id, ps_addr), call PS, retry with TiKV-style
     /// backoff on failure.
     ///
-    /// F212-fix-2: same retry shape as `range()` so point queries
+    /// fix-2: same retry shape as `range()` so point queries
     /// (get/put/delete/head/stream_put) absorb the same async-split
     /// / async-merge convergence window. Pre-fix this had only ONE
     /// retry with no backoff — adequate for stable steady state but
@@ -2069,7 +2069,7 @@ impl ClusterClient {
             {
                 Ok(b) => return Ok(b),
                 Err(e) => {
-                    // F-AUTHZ-1: PermissionDenied is TERMINAL on the data path —
+                    // PermissionDenied is TERMINAL on the data path —
                     // refreshing routing can't grant access, so surface it
                     // immediately instead of burning MAX_PS_REFRESHES and masking
                     // it as ConnectionError (coco P2). Unlike call_ps_for_part we
@@ -2080,7 +2080,7 @@ impl ClusterClient {
                         Ok(AutumnError::PermissionDenied(msg)) => {
                             return Err(AutumnError::PermissionDenied(msg));
                         }
-                        // F-KEY-NS D7 Layer-A: unregistered-namespace write is
+                        // D7 Layer-A: unregistered-namespace write is
                         // TERMINAL — refreshing routing can't create the namespace
                         // (same class as PermissionDenied above).
                         Ok(AutumnError::NamespaceUnknown(msg)) => {
@@ -2123,7 +2123,7 @@ impl ClusterClient {
     /// Resolve part_id to ps_addr, call PS, retry with TiKV-style
     /// backoff on failure.
     ///
-    /// F212-fix-2: same retry shape as `call_ps_for_key`. Admin ops
+    /// fix-2: same retry shape as `call_ps_for_key`. Admin ops
     /// (split/compact/gc/flush) don't carry `region_epoch` on the
     /// wire, but they CAN race the same post-split topology change
     /// window — e.g. `compact <new_part_id>` issued immediately
@@ -2135,7 +2135,7 @@ impl ClusterClient {
         msg_type: u8,
         payload: Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
-        // F-ADMIN-OP-AUTH (PS slice): split / maintenance (gc/compact/forcegc/
+        // (PS slice): split / maintenance (gc/compact/forcegc/
         // flush) are admin-gated at the PS when a token is configured — prefix
         // it once here (before the retry loop; the loop re-clones this payload).
         let payload = if autumn_rpc::partition_rpc::is_admin_ps_msg(msg_type) {
@@ -2161,7 +2161,7 @@ impl ClusterClient {
             {
                 Ok(b) => return Ok(b),
                 Err(e) => {
-                    // F225: short-circuit DETERMINISTIC failures. Admin ops
+                    // short-circuit DETERMINISTIC failures. Admin ops
                     // (split/compact/gc/flush) are region_epoch-exempt, so a
                     // FailedPrecondition here is never stale-routing — it's a
                     // real precondition (e.g. "partition has overlapping keys",
@@ -2197,8 +2197,8 @@ impl ClusterClient {
 
     /// Put a key-value pair. Retries once on routing miss.
     ///
-    /// F178: every Put is durable. Pre-F178 the API took a `must_sync: bool`
-    /// flag; after F178 the field was removed from the wire and every
+    /// every Put is durable. Earlier the API took a `must_sync: bool`
+    /// flag; that field was later removed from the wire and every
     /// append goes through the extent-node fsync coalescer (RocksDB-style
     /// group commit). Callers no longer have a "fast but unsafe" mode.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
@@ -2208,7 +2208,7 @@ impl ClusterClient {
 
     /// Internal: `put` over an ALREADY-bound wire key (no namespace binding).
     /// The public `put` binds then calls this; `raw()`/`rescope` views call it
-    /// with their own key transform. F-KEY-NS D7.
+    /// with their own key transform. D7.
     async fn put_bound(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
         self.put_opts(key, value, 0, WriteLease::ANON).await
     }
@@ -2257,7 +2257,7 @@ impl ClusterClient {
         expires_at: u64,
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
-        // F129: client-side pre-check against the hard cap. Avoids sending
+        // client-side pre-check against the hard cap. Avoids sending
         // a 256 MB+ payload over the wire only to be rejected post-decode.
         // The PS still authoritatively rejects > its configured (default
         // 64 MiB) cap; for anything in (64 MiB, 256 MiB] we let the server
@@ -2297,7 +2297,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F216-E zero-copy PUT: write a value with NO intermediate value copy and
+    /// zero-copy PUT: write a value with NO intermediate value copy and
     /// NO value crc scan on the client (`MSG_PUT_BULK` +
     /// `RpcClient::call_vectored_bulk` — v28: the value rides after the ctrl crc
     /// as its own iovec, straight from `value`'s backing memory). The regular
@@ -2369,7 +2369,7 @@ impl ClusterClient {
                 Ok(client) => {
                     // v28 value-separable send: [meta][key] is the CRC'd ctrl,
                     // the value rides after the crc as its own iovec and is
-                    // NEVER crc-scanned by the sender (F-WIRE-CRC-UNIFY — the
+                    // NEVER crc-scanned by the sender (the
                     // old call_vectored path paid a full crc32c pass over the
                     // value).
                     match client
@@ -2421,7 +2421,7 @@ impl ClusterClient {
     }
 
     /// Internal: `get` over an ALREADY-bound wire key (no namespace binding).
-    /// F-KEY-NS D7 — see `put_bound`.
+    /// D7 — see `put_bound`.
     async fn get_bound(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         self.get_range_core(key, 0, 0).await
     }
@@ -2444,7 +2444,7 @@ impl ClusterClient {
     }
 
     /// Internal: `get_range` over an ALREADY-bound wire key (no namespace
-    /// binding). F-KEY-NS D7 — see `put_bound`.
+    /// binding). D7 — see `put_bound`.
     async fn get_range_core(
         &self,
         key: &[u8],
@@ -2471,7 +2471,7 @@ impl ClusterClient {
         Ok(Some(resp.value))
     }
 
-    /// F259: GET with PS-bypass for large VP values. Issues
+    /// GET with PS-bypass for large VP values. Issues
     /// `MSG_GET_REDIRECT`; when the PS answers with a descriptor (>= 64 KiB
     /// ValuePointer value), the value bytes are read STRAIGHT from an
     /// extent-node replica — the PS never touches the data. Replica choice
@@ -2513,7 +2513,7 @@ impl ClusterClient {
     }
 
     /// Shared EN-direct-read replica loop for `MSG_GET_REDIRECT` descriptors
-    /// (F259 `get_direct` + F-DIRECT-MANY `get_many_direct`). Reads the exact
+    /// (`get_direct` + `get_many_direct`). Reads the exact
     /// byte range `[resp.value_offset, +resp.value_len)` from a replica, trying
     /// them in a `(extent, value_offset)`-rotated order with failover. Returns
     /// `Some(value)` on the first success, or `None` when EVERY replica failed
@@ -2602,7 +2602,7 @@ impl ClusterClient {
                 "direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
             );
         } else {
-            // F-DIRECT-MANY default-ON: the FIRST proxy fallback WARNS (surfaces
+            // default-ON: the FIRST proxy fallback WARNS (surfaces
             // a topology where the ENs aren't client-reachable → direct-read is
             // silently on the slow proxy path); later ones stay debug to avoid
             // per-read spam. Correctness is unaffected — the proxy read is
@@ -2625,7 +2625,7 @@ impl ClusterClient {
         None
     }
 
-    /// F-DIRECT-MANY: read one key's sub-range `[offset, offset+length)`
+    /// read one key's sub-range `[offset, offset+length)`
     /// (`length == 0` = whole value) STRAIGHT from an EN into `dest`, with a
     /// proxy fallback — the per-item core of `get_many_direct`. Returns
     /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or
@@ -2658,7 +2658,7 @@ impl ClusterClient {
                 Err(e) => Err(e),
             };
         }
-        // F-KEY-NS D7: bind for the redirect routing/descriptor; the fallbacks
+        // D7: bind for the redirect routing/descriptor; the fallbacks
         // above/below use the original user `key` (get_range/get_range_into bind
         // it themselves), so a key is bound exactly ONCE per wire request.
         let key_v = self.binding.bind_key(key)?;
@@ -2696,7 +2696,7 @@ impl ClusterClient {
         self.get_range_into(key, offset, length, dest).await
     }
 
-    /// F-DIRECT-MANY: batched client direct-read — the batch mirror of
+    /// batched client direct-read — the batch mirror of
     /// `get_direct`, same dest-based shape as `get_many_into`. Each item whose
     /// requested length is >= 64 KiB is read STRAIGHT from an EN
     /// (`MSG_GET_REDIRECT` descriptor → `read_extent_value_direct`), taking the
@@ -2724,11 +2724,11 @@ impl ClusterClient {
         items: &mut [GetManyItem<'_>],
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
         let n = items.len();
-        // Phase A (F-REDIRECT-BATCH) — group the redirect-eligible (read_len
+        // Phase A — group the redirect-eligible (read_len
         // >= 64 KiB) items by owning partition so their descriptors resolve in
         // ONE round-trip per partition instead of one per item. Small items /
         // resolve-misses stay ungrouped → per-item proxy path in phase C.
-        // F-KEY-NS D7: bind each key ONCE for redirect routing + the batched
+        // D7: bind each key ONCE for redirect routing + the batched
         // descriptor payload (phases A/B). Phase C passes the ORIGINAL user key
         // to the per-item helpers, which bind it themselves — so a key is bound
         // exactly once per wire request (never double-prepended).
@@ -2808,7 +2808,7 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
-    /// F-REDIRECT-BATCH: read one item using a PRE-RESOLVED redirect descriptor
+    /// read one item using a PRE-RESOLVED redirect descriptor
     /// (from the batched `MSG_GET_REDIRECT_MANY`) — the descriptor-consuming tail
     /// of `get_range_direct_into`, factored out so the batch path skips the
     /// per-item `MSG_GET_REDIRECT` round-trip. Inline (`extent_id == 0`) copies
@@ -3014,7 +3014,7 @@ impl ClusterClient {
         )))
     }
 
-    /// F235/F244: batched point reads — the ONE client-side fan-out primitive
+    /// batched point reads — the ONE client-side fan-out primitive
     /// (no server `MSG_BATCH_GET`). All batch-read callers route through this:
     /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
     /// daemon. Each item is read concurrently (sliding window of `concurrency` —
@@ -3090,7 +3090,7 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
-    /// F236/F245: batched zero-copy writes — the write mirror of `get_many_into`,
+    /// batched zero-copy writes — the write mirror of `get_many_into`,
     /// built on the shared `fan_out_collect`. Pure client-side fan-out (no server
     /// `MSG_BATCH_PUT`): each `(key, value)` is written concurrently (sliding window
     /// of `concurrency`) over the per-partition multiplexed PS connections. Per item
@@ -3166,7 +3166,7 @@ impl ClusterClient {
     ) -> Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> {
         let mut results: Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> =
             (0..keys.len()).map(|_| Ok(None)).collect();
-        // F-KEY-NS D7: bind each key ONCE before routing — the WIRE key
+        // D7: bind each key ONCE before routing — the WIRE key
         // determines the partition. Bind is infallible under Prepend-only (a
         // scoped key can't escape scope), so every slot binds; the `Option`
         // shape is kept defensively.
@@ -3302,7 +3302,7 @@ impl ClusterClient {
         // (idx, key, value, expires_at) — keep all four pieces threaded so the
         // bulk fallback and per-partition packing can read them without
         // re-indexing into `items` (which is borrowed immutably).
-        // F-KEY-NS D7: each tuple's 2nd element is the BOUND wire key (owned) —
+        // D7: each tuple's 2nd element is the BOUND wire key (owned) —
         // routing + the batch payload + the bulk/put fallbacks all use it, so a key
         // is bound exactly ONCE. Bind is infallible under Prepend-only.
         let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes, u64)>> =
@@ -3359,7 +3359,7 @@ impl ClusterClient {
                     // Stale region_epoch: server returns FailedPrecondition
                     // (`MSG_BATCH_PUT` enforces epoch on the data path, see
                     // partition-server lib.rs:5830). `call_ps_for_part`
-                    // short-circuits PreconditionFailed under F225 admin-op
+                    // short-circuits PreconditionFailed under admin-op
                     // semantics — correct for split/compact/gc/flush, WRONG
                     // for the data path where the SDK's job is to refresh
                     // routing and retry. Fall back to per-op `put_opts` for
@@ -3431,7 +3431,7 @@ impl ClusterClient {
         // durable put per round trip: throughput = 8 MiB ÷ (WAL append + 3-replica
         // fanout + fsync) ≈ 40 MB/s WHEN the durable path is latency-bound (slow
         // fsync / cross-host RTT). With the window in flight the PS group-commit
-        // (F256 natural batching) coalesces the concurrent puts, so the write runs
+        // (natural batching) coalesces the concurrent puts, so the write runs
         // at the partition's bandwidth instead of its per-op latency. (No change
         // when bandwidth-bound: one fast-local partition/connection saturates its
         // stream ceiling regardless.)
@@ -3474,7 +3474,7 @@ impl ClusterClient {
         results
     }
 
-    /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
+    /// batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
     /// `buffered` over the per-partition multiplexed connections. No bulk (delete is
     /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
     /// same as `delete`; `Err` = that item's RPC failed, others still ran).
@@ -3486,7 +3486,7 @@ impl ClusterClient {
         fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await
     }
 
-    /// F237: batched metadata lookups — pure client-side fan-out, `buffered` over
+    /// batched metadata lookups — pure client-side fan-out, `buffered` over
     /// the per-partition multiplexed connections. No bulk (head carries no value).
     /// Result `i` matches `keys[i]`: `Ok(KeyMeta{ found, value_length })`
     /// (`found=false` for a missing key, NOT an `Err`); `Err` = that item's RPC
@@ -3507,7 +3507,7 @@ impl ClusterClient {
     }
 
     /// Internal: `delete` over an ALREADY-bound wire key (no namespace binding).
-    /// F-KEY-NS D7. NOTE: Layer-A does NOT gate deletes at the PS, but the CLIENT
+    /// D7. NOTE: Layer-A does NOT gate deletes at the PS, but the CLIENT
     /// still prepends so a scoped delete targets THIS tenant's key, not a raw one.
     async fn delete_bound(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         self.delete_opts(key, WriteLease::ANON).await
@@ -3556,7 +3556,7 @@ impl ClusterClient {
     }
 
     /// Internal: `head` over an ALREADY-bound wire key (no namespace binding).
-    /// F-KEY-NS D7 — see `put_bound`.
+    /// D7 — see `put_bound`.
     async fn head_bound(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self
@@ -3593,7 +3593,7 @@ impl ClusterClient {
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        // F-KEY-NS D7: clamp the scan to `{ns}/{tenant}/` — bind the prefix,
+        // D7: clamp the scan to `{ns}/{tenant}/` — bind the prefix,
         // bind the start (empty start → scan from the namespace lower bound),
         // cap the upper end at `{ns}/{tenant}0`, then strip the binding prefix
         // off returned keys so a Prepend caller sees its original keys. Raw
@@ -3614,12 +3614,12 @@ impl ClusterClient {
         Ok(result)
     }
 
-    /// F-KEY-NS D7: this client's namespace binding.
+    /// D7: this client's namespace binding.
     pub fn binding(&self) -> &NamespaceBinding {
         &self.binding
     }
 
-    /// F-KEY-NS D7: a Raw (unscoped) VIEW sharing this client's pools — bypasses
+    /// D7: a Raw (unscoped) VIEW sharing this client's pools — bypasses
     /// the CLIENT-side namespace clamp for admin / cross-namespace / migration
     /// tooling. **The PS still enforces Layer-A/B**, so this only removes the
     /// client prefixing, never server authorization. The low-level seams
@@ -3632,7 +3632,7 @@ impl ClusterClient {
         }
     }
 
-    /// F-NS-PRINCIPAL-UNIFIED: a VIEW of this client re-scoped to a DIFFERENT
+    /// a VIEW of this client re-scoped to a DIFFERENT
     /// key-prefix `scope` (`fs`, `mem/agent7`), sharing the same connection pools —
     /// for multi-namespace tools (dashboard / migration) that operate across scopes
     /// without reconnecting. Exposes the core KV ops (`put`/`get`/`delete`/
@@ -3648,7 +3648,7 @@ impl ClusterClient {
     /// Internal: range scan over ALREADY-bound `prefix`/`start` wire keys, with
     /// an optional `upper_cap` (`{ns}/{tenant}0`) that stops the limit-driven
     /// walk at the namespace boundary. No prefix binding / stripping — the public
-    /// `range` (and the `raw()`/`rescope` views) do that. F-KEY-NS D7.
+    /// `range` (and the `raw()`/`rescope` views) do that. D7.
     async fn range_bound(
         &self,
         prefix: &[u8],
@@ -3656,7 +3656,7 @@ impl ClusterClient {
         limit: u32,
         upper_cap: Option<&[u8]>,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        // F212-fix-2 — uses the shared `refresh_backoff` + `MAX_PS_REFRESHES`
+        // fix-2 — uses the shared `refresh_backoff` + `MAX_PS_REFRESHES`
         // helpers (module-level docs explain the TiKV-style budget). Same
         // retry shape as point queries (`call_ps_for_key`) so async-split
         // / async-merge windows are absorbed uniformly.
@@ -3687,7 +3687,7 @@ impl ClusterClient {
                 has_more = true;
                 break;
             }
-            // F-KEY-NS D7: stop at the namespace upper bound `{ns}/{tenant}0` so a
+            // D7: stop at the namespace upper bound `{ns}/{tenant}0` so a
             // limit-driven scan can't walk past the tenant into the next
             // namespace. `None` (Raw binding) = unbounded.
             if let Some(cap) = upper_cap {
@@ -3772,7 +3772,7 @@ impl ClusterClient {
             {
                 Ok(b) => b,
                 Err(e) => {
-                    // F-AUTHZ-1 / F-KEY-NS: PermissionDenied + NamespaceUnknown are
+                    // PermissionDenied + NamespaceUnknown are
                     // TERMINAL — refreshing routing can't grant access or create the
                     // namespace, so surface immediately instead of burning
                     // MAX_PS_REFRESHES (mirrors call_ps_for_key on the point path).
@@ -3862,10 +3862,10 @@ impl ClusterClient {
     }
 
 
-    // ── F129 multipart upload ──────────────────────────────────────────────
+    // ── multipart upload ──────────────────────────────────────────────
 
     /// Open a multipart upload session for `key`. Returns a handle that
-    /// F186 — Begin a striped (Ceph-striperados-style) put. Returns a
+    /// Begin a striped (Ceph-striperados-style) put. Returns a
     /// handle that takes value bytes via `send` and finalises via
     /// `commit`. Internals (no new server RPCs):
     ///   - each `send(chunk)` writes `chunk` to a deterministic chunk
@@ -3878,9 +3878,9 @@ impl ClusterClient {
     ///     chunks are invisible
     ///   - `abort` best-effort deletes the partial chunks
     ///
-    /// Replaces the deprecated server-side multipart upload (F129
-    /// `MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT` + multi-fragment ValuePointer +
-    /// F130 GC active rewrite). Total simplification: ~1500 server-side
+    /// Replaces the deprecated server-side multipart upload
+    /// (`MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT` + multi-fragment ValuePointer +
+    /// GC active rewrite). Total simplification: ~1500 server-side
     /// lines deleted, ~200 client-side lines added; behaviour from the
     /// caller's perspective is identical.
     ///
@@ -3897,7 +3897,7 @@ impl ClusterClient {
         }
     }
 
-    /// F186 — Open a streaming reader. Auto-detects:
+    /// Open a streaming reader. Auto-detects:
     ///   - **striped** values (key holds a 28-byte `Meta` blob with the
     ///     magic) → reads chunks under the reserved chunk-key namespace
     ///     and yields them via `next_chunk()`
@@ -3937,7 +3937,7 @@ impl ClusterClient {
         }))
     }
 
-    /// F186 — Cascade-delete a striped value: read meta, delete all
+    /// Cascade-delete a striped value: read meta, delete all
     /// chunks, delete meta. For non-striped keys this is just a regular
     /// delete on the meta key (chunks don't exist). Idempotent on
     /// already-deleted keys.
@@ -3962,7 +3962,7 @@ impl ClusterClient {
         self.split_at(part_id, None).await
     }
 
-    /// F-SPLIT-AT-KEY (design doc D4): trigger partition split at an EXPLICIT
+    /// (design doc D4): trigger partition split at an EXPLICIT
     /// split point. `at_key = Some(key)` makes the PS validate the key lies
     /// strictly inside the partition's `(start_key, end_key)` and use it
     /// verbatim as `mid_key` (skipping median selection and the `>= 2 keys`
@@ -3994,9 +3994,9 @@ impl ClusterClient {
         self.gc_with_params(part_id, GcAutoParams::default()).await
     }
 
-    /// F201: trigger automatic GC with multi-tier filter parameters.
+    /// trigger automatic GC with multi-tier filter parameters.
     /// `params` is forwarded verbatim to the PS-side selection logic.
-    /// Default `GcAutoParams::default()` matches pre-F201 behaviour
+    /// Default `GcAutoParams::default()` matches the prior behaviour
     /// (`discard_ratio > 0.4`, plus the new empty-sealed-extent free
     /// path).
     pub async fn gc_with_params(
@@ -4041,7 +4041,7 @@ impl ClusterClient {
             .map(|_| ())
     }
 
-    /// F183: merge two adjacent partitions. Survivor keeps its part_id;
+    /// merge two adjacent partitions. Survivor keeps its part_id;
     /// victim is deleted from the manager.
     ///
     /// Stage 1 implementation orchestrates the merge from the client:
@@ -4053,7 +4053,7 @@ impl ClusterClient {
     ///      unavailability during the reopen is the trade-off for not
     ///      requiring a PS-side splice handler in Stage 1.
     ///
-    /// F185: thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
+    /// thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
     ///
     /// The manager (which is leader-fenced and crash-recoverable via etcd)
     /// owns the full sequence:
@@ -4061,8 +4061,8 @@ impl ClusterClient {
     ///   - send `MSG_MERGE_FREEZE` to both PSes (drains pending+inflight,
     ///     flushes all imm, halts new writes with `CODE_UNAVAILABLE`)
     ///   - capture `commit_length` × 6 under the freeze (closes the
-    ///     ~5 % loss window measured by F184-K)
-    ///   - run the F183 atomic etcd merge txn
+    ///     ~5 % loss window)
+    ///   - run the atomic etcd merge txn
     ///   - on success: leave PSes frozen — region_sync_loop drops the
     ///     frozen `PartitionData` on its next ~2 s tick
     ///   - on failure: send `freeze=false` rollback to both PSes
@@ -4070,8 +4070,8 @@ impl ClusterClient {
     /// CLI crashes mid-call are now benign: the manager continues
     /// serving the orchestrated merge, and a 30 s `FREEZE_TTL` on the
     /// PS side is the final backstop for an orchestrator crash.
-    /// `force` overrides the sacred-boundary refusal (F-FS-GEOM-DECLARED step
-    /// 4): merging erases the boundary between the two partitions, and when
+    /// `force` overrides the sacred-boundary refusal: merging erases the
+    /// boundary between the two partitions, and when
     /// that boundary is a recorded presplit point the manager refuses unless
     /// forced.
     pub async fn merge_partitions(
@@ -4099,7 +4099,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F-REGION-REBALANCE: actively re-spread partitions across the PS fleet
+    /// actively re-spread partitions across the PS fleet
     /// (most-loaded → least-loaded), bounded by `max_moves` (`0` = as many as
     /// needed to balance). Returns the reassignments the manager applied.
     pub async fn rebalance_regions(
@@ -4119,7 +4119,7 @@ impl ClusterClient {
         Ok(resp.moves)
     }
 
-    /// F183: query the manager's policy-engine advisory cache.
+    /// query the manager's policy-engine advisory cache.
     pub async fn policy_candidates(
         &self,
     ) -> std::result::Result<Vec<PolicyCandidate>, AutumnError> {
@@ -4155,10 +4155,10 @@ impl ClusterClient {
                     part_id,
                     op,
                     extent_ids,
-                    // F201: legacy callers (compact / force_gc / flush)
+                    // legacy callers (compact / force_gc / flush)
                     // don't supply GC tier params — they're ignored when
                     // op != MAINTENANCE_AUTO_GC anyway. Defaults match
-                    // pre-F201 wire shape semantically.
+                    // the prior wire shape semantically.
                     gc_ratio: None,
                     gc_max_size: None,
                     gc_stream_debt: None,
@@ -4172,9 +4172,9 @@ impl ClusterClient {
     }
 }
 
-/// F201: SDK-visible mirror of the PS-side `GcAutoParams`. Forwarded
+/// SDK-visible mirror of the PS-side `GcAutoParams`. Forwarded
 /// verbatim through `MaintenanceReq` to the partition's GC loop.
-/// Default matches pre-F201 behaviour (`discard_ratio > 0.4`).
+/// Default matches the prior behaviour (`discard_ratio > 0.4`).
 #[derive(Default, Clone, Debug)]
 pub struct GcAutoParams {
     pub ratio: Option<f64>,
@@ -4183,10 +4183,10 @@ pub struct GcAutoParams {
     pub empty_only: bool,
 }
 
-// ── F186 client-side striperados (Ceph-style) ─────────────────────────────
+// ── client-side striperados (Ceph-style) ─────────────────────────────
 //
-// Replaces F129's server-side multipart upload + multi-fragment ValuePointer
-// + F130 GC active rewrite. Pure client-side striping over the existing
+// Replaces the server-side multipart upload + multi-fragment ValuePointer
+// + GC active rewrite. Pure client-side striping over the existing
 // MSG_PUT / MSG_GET / MSG_DELETE primitives — no new server RPCs, no
 // changes to the WAL / memtable / SSTable shape.
 //
@@ -4199,7 +4199,7 @@ pub struct GcAutoParams {
 //   - Chunks live at deterministic keys under a reserved 0xff-prefixed
 //     namespace so range scans of user prefixes don't see them.
 
-/// F186 — meta object header magic + version, 9 bytes total. The last
+/// meta object header magic + version, 9 bytes total. The last
 /// byte is the version; bumping the wire format means bumping that
 /// byte. Chosen to start with `0xfe 0xfd` so a casual `head` of a
 /// striped key returns a recognisable hex prefix in operator tooling.
@@ -4211,21 +4211,21 @@ const META_VERSION: u8 = 0x01;
 /// chunk_count+chunk_size i.e. the first 25 bytes.
 const META_ENCODED_LEN: usize = 29;
 
-/// F186 — default chunk size for `put_stream_begin`. 4 MiB matches
-/// the inline-VP threshold ratio used by other F129-replacement
+/// default chunk size for `put_stream_begin`. 4 MiB matches
+/// the inline-VP threshold ratio used by comparable
 /// systems (S3 multipart's 5 MiB minimum, Ceph striperados 4 MiB
 /// default). Each chunk is one `MSG_PUT` RPC + one VP entry on the
 /// PS — large enough to amortise per-chunk RPC framing, small enough
 /// that a transient connection error costs only a 4 MiB resend.
 pub const STRIPE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
-/// F186 — chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
+/// chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
 /// sort AFTER all normal user keys; range scans within a user prefix
 /// naturally skip them. Followed by a 4-byte format tag (`acv1` =
 /// "Autumn Chunk v1") and a separator byte.
 const CHUNK_KEY_PREFIX: &[u8] = b"\xff\xfeacv1\xff";
 
-/// F186 — encode a chunk key as
+/// encode a chunk key as
 /// `[CHUNK_KEY_PREFIX][user_key_len:u32 BE][user_key][chunk_index:u64 BE]`.
 /// Length-prefixing the user key avoids ambiguity if it contains the
 /// separator pattern; BE encoding on the index keeps chunks of one
@@ -4239,7 +4239,7 @@ pub(crate) fn make_chunk_key(user_key: &[u8], chunk_index: u64) -> Vec<u8> {
     k
 }
 
-/// F186 — striped-value meta header. Fixed 28-byte layout makes
+/// striped-value meta header. Fixed 28-byte layout makes
 /// `try_decode` cheap and unambiguous.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StripeMeta {
@@ -4260,7 +4260,7 @@ impl StripeMeta {
         buf
     }
 
-    /// F186 — try to interpret `blob` as a stripe meta. Returns None if
+    /// try to interpret `blob` as a stripe meta. Returns None if
     /// length, magic, or CRC don't match — the caller treats the blob
     /// as an inline value in that case.
     ///
@@ -4564,7 +4564,7 @@ mod first_attempt_timeout_tests {
 mod zc_rule_tests {
     use super::*;
 
-    /// F-VALUEBUF: write into a pool slab, truncate to the written length,
+    /// write into a pool slab, truncate to the written length,
     /// freeze into a Bytes exposing exactly those bytes (aliasing the slab —
     /// the write-side currency for `put_bulk`).
     #[test]
@@ -4579,7 +4579,7 @@ mod zc_rule_tests {
         assert_eq!(&b[..], b"hello", "freeze aliases exactly the filled bytes");
     }
 
-    // F235: bulk is engaged iff value >= 64 KiB — symmetric across read/write +
+    // bulk is engaged iff value >= 64 KiB — symmetric across read/write +
     // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
     #[test]
     fn bulk_worthwhile_is_symmetric_at_64k() {
@@ -4597,7 +4597,7 @@ mod fan_out_tests {
     use futures::stream::StreamExt;
     use std::time::Duration;
 
-    // F245: `fan_out_collect` returns INPUT order even when futures complete in
+    // `fan_out_collect` returns INPUT order even when futures complete in
     // reverse (index 0 sleeps longest). The reorder is deterministic regardless
     // of timing, so this is not flaky.
     #[test]
@@ -4613,7 +4613,7 @@ mod fan_out_tests {
         });
     }
 
-    // F245: `fan_out` (the streaming base the io_uring daemon will use) yields
+    // `fan_out` (the streaming base the io_uring daemon will use) yields
     // every input index exactly once, paired with its own output.
     #[test]
     fn fan_out_yields_every_index_once() {
@@ -4711,7 +4711,7 @@ mod stripe_meta_tests {
 /// transitions are one-way; the `commit` / `abort` consumers move the
 /// handle. A drop in the `Open` state logs a WARN; the chunks already
 /// written under the reserved namespace become orphan until a sweep
-/// cleans them up (no automatic TTL — that was an F129 server-side
+/// cleans them up (no automatic TTL — that was a server-side
 /// feature; client-side striping pushes orphan handling to the
 /// application layer or a periodic GC tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4721,7 +4721,7 @@ enum PutStreamState {
     Aborted,
 }
 
-/// F186 — In-progress striped put. Borrows the `ClusterClient` so each
+/// In-progress striped put. Borrows the `ClusterClient` so each
 /// `send`/`commit` can route its sub-Put through the SDK's existing
 /// resolution + connection caching. The handle is `!Send` (transitively
 /// through the SDK's `Rc` internals); don't move it across runtimes.
@@ -4855,7 +4855,7 @@ impl<'a> Drop for PutStreamHandle<'a> {
     }
 }
 
-/// F186 — streaming reader. For striped values: walks chunk keys
+/// streaming reader. For striped values: walks chunk keys
 /// in order. For inline values: yields the entire blob in one
 /// `next_chunk` call. The same `GetStream` shape so callers don't
 /// need to know which path they're on.
@@ -4947,7 +4947,7 @@ impl<'a> GetStream<'a> {
 
 #[cfg(test)]
 mod namespace_binding_tests {
-    //! F-KEY-NS D7: the client namespace binding (Prepend-only) — scoped-prepend /
+    //! D7: the client namespace binding (Prepend-only) — scoped-prepend /
     //! Raw key mapping, prefix binding, range strip, and the upper-cap successor.
     use super::*;
 

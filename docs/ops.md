@@ -12,14 +12,14 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Prometheus /metrics](#prometheus-metrics)
 - [Disk-full (ENOSPC) behavior](#disk-full-enospc-behavior)
 - [WAL replay self-heal](#wal-replay-self-heal-log_stream-bit-rot--truncated-replica)
-- [Read route-around for Suspected nodes (F276)](#read-route-around-for-suspected-nodes-f276)
+- [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
 - [autumn-memory verification](#autumn-memory-verification)
-- [Data-plane authz setup (F-AUTHZ-1)](#data-plane-authz-setup-f-authz-1)
+- [Data-plane authz setup](#data-plane-authz-setup)
 - [CLI cheatsheet](#cli-cheatsheet)
 - [Chaos suites](#chaos-suites)
 - [Rolling restart & upgrade versioning](#rolling-restart-r0-of-docsrolling_upgrade_designmd)
 - [Test matrix](#test-matrix)
-- [Inode-lease + close-to-open coherence (in flight)](#inode-lease--close-to-open-coherence-f-ioring-lease-in-flight)
+- [Inode-lease + close-to-open coherence (in flight)](#inode-lease--close-to-open-coherence-in-flight)
 
 ## Binaries & ports
 
@@ -37,7 +37,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
 "Web dashboard + auto-policy controller" below.)
 
-## Web dashboard + auto-policy controller (F-DASH-IN-MGR)
+## Web dashboard + auto-policy controller
 
 The manager serves an embedded web dashboard AND hosts the auto-policy controller
 in-process — one crash-safe, leader-owned process (the retired Python dashboard's
@@ -61,7 +61,7 @@ autumn-manager-server --etcd … --dashboard-port 8799 [--dashboard-allow-mutati
 The page shows cluster capacity, node health, the PS→partition→extent hierarchy,
 policy advisories, and (armed) per-target action buttons.
 
-**Auto-policy controller** — the manager only *emits* advisories (F203 pure
+**Auto-policy controller** — the manager only *emits* advisories (pure
 mechanism); the controller *decides + actuates* per an active policy. It is
 **leader-only** (never runs on a follower) and a state machine `Off → DryRun →
 Armed`. `Armed` actuates only when `--dashboard-allow-mutations` is set (else it
@@ -69,7 +69,7 @@ degrades to DryRun and logs "would: …"). Config is persisted to etcd
 (`autoPolicy/config` + `autoPolicy/cooldowns`, leader-fenced) so the active policy
 survives leader failover.
 
-**Boot default (F-AUTOPOLICY-BOOT-DEFAULT).** The DEPLOY layer (entrypoint /
+**Boot default.** The DEPLOY layer (entrypoint /
 autumn-deploy / k8s) seeds `--auto-policy-default balanced` + arms mutations, so a
 production cluster boots running the `balanced` policy (GC + compaction + EC +
 region rebalance — no split/merge) automatically. The seed fires only on a FRESH
@@ -91,7 +91,7 @@ Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 `balanced`, `aggressive`. The dashboard `/api/policies` UI can also create/select
 custom policies (armed only).
 
-**Auto-rebalance switch (F-REGION-REBALANCE Phase B).** A 6th policy switch,
+**Auto-rebalance switch (Phase B).** A 6th policy switch,
 `rebalance`, arms the automatic version of `autumn-op rebalance` (see "Rebalancing
 region→PS assignment" below). When enabled + Armed, the controller emits a
 cluster-level advisory whenever the per-PS partition-count spread exceeds
@@ -152,7 +152,7 @@ If a previous daemon died it can leave a stale mount (`ls` reports "Transport
 endpoint is not connected"); clear it before re-mounting with
 `fusermount3 -u "$MP"` (or `umount -l "$MP"`).
 
-**F-NS-PRINCIPAL-UNIFIED — the mount is scoped to the WHOLE `fs/` namespace.**
+**The mount is scoped to the WHOLE `fs/` namespace.**
 `autumn-fuse` (and `autumnfs`, and the PyO3 `autumn.Fs.connect(...)`) has NO
 `--tenant` — every inode/dirent/extent key lands under `fs/…` (one global tree).
 A fuse mount, `autumnfs`, and the PyO3 client **all see the SAME filesystem**. To
@@ -188,7 +188,7 @@ loopback chaos harnesses set it themselves). Explicit env always wins.
 `/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
 nodes, separate from the storage StatefulSets.
 
-### `--direct-read` — bypass the PS for large reads (F-DIRECT-MANY)
+### `--direct-read` — bypass the PS for large reads
 
 Add `--direct-read` to the mount to make whole-extent reads (≥ 64 KiB) read
 STRAIGHT from an extent node instead of proxying through the PS — a cross-host
@@ -223,7 +223,7 @@ direct_read=True)`, kvcache `AutumnKVConnector` (`extra_config.direct_read`),
 item — sub-64 KiB values still go through the PS; on a topology where ENs aren't
 client-reachable each item falls back to the proxy and the client logs one WARN.
 
-## Python `autumn.Fs` — shared inode-layout binding (F-FS-UNIFY M2)
+## Python `autumn.Fs` — shared inode-layout binding
 
 `autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
@@ -248,8 +248,8 @@ to one inode conflict instead of corrupting each other; reads are close-to-open
 coherent (fresh-read + `forget`-on-release). Behavior-preservation gate for the
 `dispatch` Create/Unlink/init_root refactor + the M4 `lease_tasks` extraction
 (the binding shares those core steps): the fuse e2e suite must stay green —
-`cargo test -p autumn-manager --test system_fuse_read --test f_fuse_lease_1
---test f_fuse_lease_2 -- --ignored --test-threads=1`.
+`cargo test -p autumn-manager --test system_fuse_read --test fuse_lease_1
+--test fuse_lease_2 -- --ignored --test-threads=1`.
 
 ## Cluster capacity — `autumn-op df`
 
@@ -275,7 +275,7 @@ The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` reflects real
 backend capacity (conservatively, at the 3-replica factor) instead of a fixed
 placeholder.
 
-### Amplification in `df` = physical / footprint, not physical / sealed (F-DF-OPENTAIL)
+### Amplification in `df` = physical / footprint, not physical / sealed
 
 `amplification` = `physical_used / (logical_stored_sealed + logical_open_tail)`
 ≈ the real replication/EC factor (~3× for 3-replica, lower with EC). The
@@ -287,7 +287,7 @@ human `df` prints the breakdown `logical: sealed=… + open_tail=… = footprint
 A high `amp` (>> replication factor) now genuinely means an EC/replication issue,
 not just un-sealed data.
 
-### WAL debt (dead large-value bytes) in `df` (F-DF-WALDEBT)
+### WAL debt (dead large-value bytes) in `df`
 
 `df` also prints `WAL debt: <bytes> dead (<pct>% of footprint, GC-reclaimable;
 incl. open-tail)` and, in `--json`, `logical_wal_debt` + `wal_debt_ratio`. This is
@@ -297,7 +297,7 @@ newer version or deleted, still occupying replicas until GC punches them. It is
 
 - **sealed-extent dead** = each partition's `gc_debt_bytes` (already tracked).
 - **open-tail dead** = the discard-map entry for the current OPEN log tail, which
-  `gc_debt_bytes` excludes because GC can't punch an unsealed extent. Pre-F-DF-WALDEBT
+  `gc_debt_bytes` excludes because GC can't punch an unsealed extent. Previously
   a log-heavy / all-open-tail partition (data entirely in one open log tail) showed
   `gc_debt = 0` and looked debt-free even when holding GBs of overwritten garbage;
   `df` now surfaces it.
@@ -308,7 +308,7 @@ Do NOT read `footprint − data` as debt — `size_bytes` is SST-only and exclud
 live VP value bytes, so it would flag a healthy VP partition as ~all-debt. A high
 `wal_debt_ratio` is the signal to run `compact` + `gc`/`forcegc` to reclaim.
 
-### Per-partition size in `autumn-op info` (F-OVERVIEW-OPENTAIL)
+### Per-partition size in `autumn-op info`
 
 The cluster overview's per-partition size = the manager's authoritative
 Σ `sealed_length` **plus** the PS-reported open-tail committed bytes (log + row +
@@ -437,11 +437,11 @@ bumps the extent eversion (so every PS refetches and stops serving from them)
 PS log for `WAL self-heal: ... recovered the window from a clean replica` and
 `isolated corrupt log_stream replica(s) via the manager`. An **OPEN-tail**
 content corruption is sealed-and-rolled first (`WAL self-heal A4: sealed-and-rolled
-the corrupt OPEN log_stream tail`) — frozen at the committed length via the F227
+the corrupt OPEN log_stream tail`) — frozen at the committed length via the lenient-seal
 probe, then isolated in the same pass like a sealed extent. Still fails the open
 loud (data lives on a healthy replica → recover / retry) for: an all-replicas-bad
 extent, or an open tail that is **truncated** below the committed prefix (sealing
-there could drop acked data — a separate F227 edge; **F227 — the seal must be
+there could drop acked data — a separate lenient-seal edge; **the seal must be
 lenient**: the seal path accepts a lenient/committed-length freeze rather than
 demanding byte-perfect tails). EC extents route shard repair
 through recovery, not this path. End-to-end fault injection lives in
@@ -454,7 +454,7 @@ was wired only into the copy read path, so the two VP-value fast paths
 still served the bit-rotted-but-isolated replica — now both filter
 `eligible_replica_slots`. Design: `docs/wal_selfheal_design.md`.
 
-### Compaction never strands un-flushed writes past the replay-start (F-COMPACT-VPHEAD)
+### Compaction never strands un-flushed writes past the replay-start
 
 Each SSTable records a `vp_head` = the `log_stream` position recovery replays
 FROM. A major compaction rewrites every SSTable, so whatever `vp_head` it stamps
@@ -481,11 +481,11 @@ still won't reclaim" case. Guard:
 `crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
 content boundary on every path (flush, compaction, and recovery).
 
-### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT (F-GC-FLOOR-OBS)
+### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT
 
 GC protects any NON-EMPTY `log_stream` extent that sits AT/BEFORE the recovery
 replay floor (`MIN` over every live SST's `vp_head` position). If you `forcegc`
-such an extent it is refused — this is the F1 safety guard, **not a bug**: recovery
+such an extent it is refused — this is the replay-floor safety guard, **not a bug**: recovery
 replays the log from `floor_extent` forward, so punching it could drop un-flushed
 writes. How to tell CORRECT-protection from a real problem:
 
@@ -507,7 +507,7 @@ extent (a lagging CoW-shared SST from a split is the usual cause), then re-issue
 that extent for replay (its data was all flushed while that extent was the log
 tail) — nothing to reclaim until newer data supersedes it.
 
-### Recovery is BOUNDED and reopens in parallel (F-RECOVERY-UNBOUNDED)
+### Recovery is BOUNDED and reopens in parallel
 
 A partition's reopen time is bounded by the un-flushed **log** window, NOT the
 dataset size — if a full-takeover reopen (all a dead PS's partitions land on one
@@ -537,7 +537,7 @@ Three properties enforce this (2026-07-13):
   this just means less lingering log debt on write-heavy partitions between major
   compactions.
 
-### GC auto-reclaims empty sealed log extents from split/merge churn (F-GC-FLOOR-OBS #5)
+### GC auto-reclaims empty sealed log extents from split/merge churn
 
 Frequent split/merge mints **empty sealed** `log_stream` tail extents
 (`sealed_length == 0`). These are free to reclaim (`punch_holes`, no data
@@ -552,7 +552,7 @@ can occasionally be stale-cached-as-open on the PS and skipped until its cache
 refreshes (a read / restart) — a `forcegc` that logs "not authoritatively sealed
 yet" is that case; re-issue after a moment.
 
-## Read route-around for Suspected nodes (F276)
+## Read route-around for Suspected nodes
 
 When the manager marks an EN **Suspected** (df heartbeats lapsed past the soft
 timeout, ~10 s), the READ path proactively avoids it — not just allocation. For
@@ -573,7 +573,7 @@ a per-read guarantee: the very first read after a node flips to `Suspected` (e.g
 on a previously-idle client) uses the current snapshot and only *kicks* the
 refresh, so that one read can still pay a single timeout if it lands on the flaky
 node — every read after the ~2 s refresh routes around it. This never regresses
-the pre-F276 reactive failover; it just removes the repeated per-read timeout
+the pre-existing reactive failover; it just removes the repeated per-read timeout
 under sustained load. **Manual check:** on a 3-EN replicated cluster, `kill` one
 EN; after the manager flips it to `Suspected` (`autumn-op info` /
 `list-node-states`) and a couple seconds of read traffic, `get` of keys whose
@@ -595,7 +595,7 @@ Post-fix behavior (what to verify):
 1. The first fenced manager call FAILS FAST (log: `"... got a deterministic
    manager error, failing fast"` + `"stream_alloc_extent fenced
    (LockedByOther): ..."`) — no 20-retry storm.
-2. The PS poisons the partition (`"F270: ... fenced (LockedByOther) —
+2. The PS poisons the partition (`"... fenced (LockedByOther) —
    poisoning partition for fresh-epoch reopen"` or `"LockedByOther detected,
    poisoning partition"`), its thread exits.
 3. Within one region-sync tick (~2 s) the PS logs
@@ -619,7 +619,7 @@ time autumn-client --manager <mgr:9001> put <key-in-that-partition> v
 # CHANGES after the reopen (fresh epoch) instead of repeating.
 ```
 
-## Node decommission runbook (fence → drain → remove, F211 + F-FENCE-DRAIN)
+## Node decommission runbook (fence → drain → remove)
 
 Retiring an EN is operator-driven (HDFS-decommission style). The manager never
 auto-removes a node; you fence it, the system drains it, `remove` gates on the
@@ -648,7 +648,7 @@ What fencing triggers (all automatic):
 - **Open tails**: recovery only rebuilds sealed extents, so the manager's drain
   sweep (every 2 s tick, 30 s per-partition cooldown) asks the owning PS to
   seal + roll any OPEN tail with a fenced replica (`MSG_ROLL_TAILS`). The old
-  tail seals (F227 lenient probe — a dead fenced replica doesn't block), a
+  tail seals (lenient probe — a dead fenced replica doesn't block), a
   fresh tail rolls on healthy nodes, and the next recovery tick rebuilds the
   now-sealed extent. An idle partition therefore drains with no client writes.
 
@@ -665,7 +665,7 @@ until the node is fully drained, and prints `remove: ok` only when the manager
 has verified no extent / EC-marker references remain. After remove, the node_id
 is tombstoned (same address cannot re-register); stop the EN process.
 
-**Drain-never-completes checklist (F-CHAOS-DECOMMISSION root cause):** the
+**Drain-never-completes checklist (root cause):** the
 drain's last mile is the manager LEARNING that a rebuild finished — the EN
 reports completed recoveries only in its `df` response, and the manager's df
 goes to the node's **control address = advertise_host:(advertise_port+1000)**.
@@ -696,7 +696,7 @@ Dead-EN notes (fence a node that's already unreachable):
   rebalancer assigns one (the sweep WARNs per cooldown). Manager-unilateral
   seal is a recorded follow-up, not built.
 
-### EN identity is a UUID, not an address (F-EN-DYNSHARD M0)
+### EN identity is a UUID, not an address
 
 An extent node's stable identity is a **UUID**, decoupled from its network
 address — the same split the PS already has (`ps_id` vs advertise address).
@@ -729,7 +729,7 @@ The full design (including the k8s topology and the phased milestones) is in
 stop-world upgrade that requires an **etcd reset** (`cluster.sh reset`); there is
 no rolling upgrade across this change.
 
-### Resharding an extent node — changing its shard count (F-EN-DYNSHARD M1)
+### Resharding an extent node — changing its shard count
 
 An EN's shard count = the number of io_uring cores it runs (one shard per core),
 sized by `--cpuset` (`shard_count = cpuset_len`). Each shard `i` listens on
@@ -764,7 +764,7 @@ autumn-op --manager <MGR> list-nodes
 Requirements / caveats:
 - **The new shard ports (`port + i*stride`) must be free** on the host. On k8s
   the pod's Service must expose exactly `shard_count` data+control ports — that
-  Service-port generation is a deploy-layer follow-up (F-EN-DYNSHARD M2); on
+  Service-port generation is a deploy-layer follow-up; on
   bare-metal / `cluster.sh` the ports just need to be unbound.
 - **`--advertise` is what enables self-registration.** Without it the EN keeps
   the `format`-stamped location and the shard count stays frozen (pre-M1
@@ -847,7 +847,7 @@ AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
 #   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
 ```
 
-## fs stripe geometry: lanes vs partitions (F-FS-GEOM-DECLARED)
+## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single
 write escapes the one-partition/one-log_stream ceiling. The key idea is that
@@ -927,14 +927,14 @@ manager never learns what a "lane" is.
 
 Notes:
 * Striped WRITES are an `autumnfs` capability. A fuse mount reads and removes
-  striped files correctly but **refuses** to write or truncate one (by design —
-  see F-FS-WRITE-STRIPE); write large files with `autumnfs put`.
+  striped files correctly but **refuses** to write or truncate one (by design);
+  write large files with `autumnfs put`.
 * The download read window scales with the file's lane count (`get_window_extents`),
   because a window of W consecutive extents only spans W consecutive lanes —
   a fixed window would have quietly lost read parallelism once lanes were
   over-provisioned relative to partitions.
 
-## Inspecting authz: who exists and what may they touch (F-NS-PRINCIPAL-LIST)
+## Inspecting authz: who exists and what may they touch
 
 `principal-create` / `principal-delete` shipped without a listing, so until now
 answering "which principals exist and what are they granted" meant either
@@ -1048,7 +1048,7 @@ lower TTFT than the cold-cluster first request; the first cold request returns
 before its KV is durable, and the kvc partition's `live_size` grows in step with
 distinct prefixes, not requests.
 
-## Data-plane authz setup (F-AUTHZ-1)
+## Data-plane authz setup
 
 Server-side key-range authorization for the `mem/` namespace
 (`data_plane_authz_design.md`): the manager acts as a KDC that mints
@@ -1099,8 +1099,8 @@ AUTUMN_ADMIN_TOKEN_FILE=/path/admin.token \
   bash cluster.sh start 4
 
 # 3) Create a PRINCIPAL (admin; credential printed ONCE as principal:/credential:
-#    two lines — redirect straight to a credential file). F-NS-PRINCIPAL-UNIFIED:
-#    keys are ns-first `{ns}/…` (no tenant); a grant is a whole namespace (`fs/`)
+#    two lines — redirect straight to a credential file).
+#    Keys are ns-first `{ns}/…` (no tenant); a grant is a whole namespace (`fs/`)
 #    or an in-namespace sub-prefix (`mem/acme/`):
 AO="./target/release/autumn-op --manager 127.0.0.1:9001"
 $AO principal-create --principal acme --grant mem/acme/ --admin-token-file /path/admin.token > /path/acme.cred
@@ -1133,13 +1133,13 @@ $AC ls --prefix p/ --limit 100           # scan
 $AC put-stream KEY /path/to/big.bin      # chunked stripe-put for large values
 $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 
-# F261 — SST block cache (paged SSTs; SST data blocks no longer RAM-resident)
+# SST block cache (paged SSTs; SST data blocks no longer RAM-resident)
 # PS flag: autumn-ps --sst-block-cache-bytes N   (cluster.sh: AUTUMN_SST_BLOCK_CACHE_BYTES, default 512MB)
 # Manual check: write >> RAM dataset, kill -TERM the PS, restart, then
 #   `$AC get KEY` must byte-match and idle PS RSS stays at the replay-window
 #   bound (GBs), not O(dataset). Recovery must log `open_partition: ready`
 #   for every partition with no `stale_vp_offset_past_sealed_length` retries.
-# F262 — async SST iteration (no whole-SST materialization for range/compact/split)
+# async SST iteration (no whole-SST materialization for range/compact/split)
 # Manual check: on a multi-GB dataset, `$AO compact PART_ID` must log
 #   "compact part N: ... output=..." and `$AC ls --prefix p/` must return
 #   correct entries, while PS RSS stays bounded during both (read side =
@@ -1171,7 +1171,7 @@ $AO info                                 # nodes / extents / streams / partition
 $AO bootstrap --replication 3+0          # --presplit RETIRED; use `presplit --namespace <NS>` after
 $AO split PART_ID                         # or: split PART --namespace <ns> --tenant <t> --at <suffix>
 $AO merge SURVIVOR_PART_ID VICTIM_PART_ID # add --force to cross a declared presplit boundary
-$AO rebalance [MAX_MOVES]                 # re-spread partitions across PS (F-REGION-REBALANCE)
+$AO rebalance [MAX_MOVES]                 # re-spread partitions across PS
 $AO compact PART_ID
 $AO gc --ratio 0.4 PART_ID                # NB: gc flags come BEFORE the partition id
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
@@ -1187,7 +1187,7 @@ chaos verify phase's STORAGE-ACCOUNTING invariants (see [Chaos suites](#chaos-su
 — it reads the manager's etcd at a pinned revision and cross-checks every
 extent's `refs` against live stream membership.
 
-## Explicit split point — `autumn-op split --at` (F-SPLIT-AT-KEY / D4)
+## Explicit split point — `autumn-op split --at`
 
 `split PART_ID` with no extra flags lets the PS pick the median of the live keys
 (legacy). To cut at an **operator-chosen** point — e.g. to pre-split an empty /
@@ -1244,9 +1244,9 @@ $AO info --json | jq -r '.partitions[].start_key'    # one range starts at acme/
 $AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-zero
 ```
 
-## Namespace-aware presplit — `autumn-op presplit` (F-PRESPLIT-NS-RULES)
+## Namespace-aware presplit — `autumn-op presplit`
 
-A raw-byte uniform split is **namespace-blind**: after F-KEY-NS every real key
+A raw-byte uniform split is **namespace-blind**: after key-namespacing every real key
 sits in the `fs/…` / `kvc/…` / `mem/…` byte sliver (namespace-first, Option 3),
 so uniform splitting over the whole 0x00..0xff space collapses everything into
 one or two partitions (live: 19 GB fs on a single partition, 30 empty). That is
@@ -1281,14 +1281,14 @@ $AO presplit --namespace mem --tenant default --agents alice,bob,carol
 $AO presplit --namespace fs --lanes 24 --parts 6 --admin-token-file "$ADMIN_TOKEN"
 ```
 
-### F-FS-STRIPE — stripe one large file across lanes (break the single-partition ceiling)
+### Stripe one large file across lanes (break the single-partition ceiling)
 
 A single file = one inode = key-contiguous `[0x03][ino][off]` → ONE partition → ONE
 log_stream. So a single file's write/read is capped by one stream's bandwidth
 (measured ~220 MB/s single-connection, ~350 MB/s single-partition on fast NVMe;
 disk/CPU are NOT the limit). To go faster, STRIPE the file across N lane partitions:
 
-**Geometry is DECLARED, not auto-detected** (F-FS-GEOM-DECLARED — see the "fs
+**Geometry is DECLARED, not auto-detected** (see the "fs
 stripe geometry" section above for the full model). `presplit --lanes N` writes
 the fs-wide `[0x04]stripe_geom`; every new file stamps that geometry into its own
 `InodeMeta.stripe` at create (immutable), whether or not the partitions were cut
@@ -1346,7 +1346,7 @@ P-log`; delete all PS pods in parallel to rebuild.)
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
-# vp_head multi-seed chaos (F-COMPACT/FLUSH-VPHEAD): several seeds through the
+# vp_head multi-seed chaos: several seeds through the
 # in-process system_chaos harness (real subprocess ENs + etcd + toxiproxy),
 # nemesis focused on split/merge/compact/FORCEGC (+ gc/flush/EN-kill). forcegc
 # bypasses the discard-ratio gate to punch specific sealed extents -> the maximal
@@ -1359,12 +1359,12 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 #   (system_chaos's own action name for force GC is `forcegc`; AUTUMN_CHAOS_ACTIONS
 #    to bisect, e.g. AUTUMN_CHAOS_ACTIONS=split,forcegc)
-# Full-set + node DECOMMISSION chaos (F-CHAOS-DECOMMISSION): same system_chaos
+# Full-set + node DECOMMISSION chaos: same system_chaos
 # harness but with the FULL nemesis set — including the ones vphead omits:
 # fence (MSG_FENCE_NODE/clear), killfence (kill-then-fence), ec (convert-under-
 # load), partition + latency (toxiproxy net faults). THEN a terminal one-shot:
 # after the nemesis loop stops and the cluster heals, one EN is permanently
-# removed the HDFS way (fence -> F-FENCE-DRAIN + fenced_only recovery relocate
+# removed the HDFS way (fence -> drain + fenced_only recovery relocate
 # every extent off it -> MSG_REMOVE_NODE refuses until fully drained, tombstones
 # the address), and the per-key/range/accounting verify proves NO loss with the
 # node gone. Removal is a TERMINAL one-shot, NOT a per-cycle nemesis action
@@ -1375,21 +1375,21 @@ AUTUMN_CHAOS_DECOMMISSION=0 ./scripts/decommission_chaos.sh   # full set, no rem
 #   (any run of the base test can add the terminal remove with
 #    AUTUMN_CHAOS_DECOMMISSION=1 AUTUMN_CHAOS_NUM_ENS=6)
 # Transport-layer chaos (real cluster.sh cluster; E1 EN kill+respawn, E2 PS
-# kill -> migrate, E3 PS respawn, E4 manager kill+respawn (F265), E5 PS +
+# kill -> migrate, E3 PS respawn, E4 manager kill+respawn, E5 PS +
 # manager double-kill inside the eviction window -> the interrupted eviction
-# must converge and partitions FAIL BACK to the survivor (F265); every ACKed
+# must converge and partitions FAIL BACK to the survivor; every ACKed
 # write verified afterwards):
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh tcp
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --features autumn-server/ucx binaries
 # (ucx note: a node killed -9 leaves its port in TIME_WAIT ~60s; the UCX
 #  listener now retries bind through that window instead of exiting.)
-# E6: CHAOS_ROUNDS=N CHAOS_SEED=S randomized repeated kill rounds (F266).
-# E7: split + mid-flight PS kill; merge + mid-freeze manager kill (F268).
-# Kvcache-interface chaos (F275): python L3 backend under PS/manager kill
+# E6: CHAOS_ROUNDS=N CHAOS_SEED=S randomized repeated kill rounds.
+# E7: split + mid-flight PS kill; merge + mid-freeze manager kill.
+# Kvcache-interface chaos: python L3 backend under PS/manager kill
 #   (NOTE: rebuild the wheel after ANY rust wire change — maturin build
 #    --release + pip reinstall; a stale wheel mis-encodes requests):
 #   ./scripts/kvcache_chaos.sh
-# Fuse-interface chaos (F273): file workload through the mount under
+# Fuse-interface chaos: file workload through the mount under
 #   PS-kill / manager-kill / fuse-kill+remount + T1 truncate-shrink crash:
 #   ./scripts/fuse_chaos.sh
 # Fuse RMW corruption guard (RMW-GET-SWALLOW, 2026-06-23): partial in-place
@@ -1404,13 +1404,13 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 #    >RF ENs writes never stall; reads tolerate a down replica at any size.
 #    See fuse CLAUDE.md "Restart behaviour".):
 #   AUTUMN_DATA_ROOT=/data05/autumn-eni ./scripts/fuse_en_restart_chaos.sh
-# Cross-host chaos (F272, real network ::14+::15, remote via ssh):
+# Cross-host chaos (real network ::14+::15, remote via ssh):
 #   ./scripts/crosshost_chaos.sh tcp | ucx
-# Multi-manager HA chaos (F267): leader kill -> standby takeover, PS kill under
+# Multi-manager HA chaos: leader kill -> standby takeover, PS kill under
 # the new leader, old leader rejoins as follower; zero ACKed-write loss:
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh tcp
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh ucx
-# (F265 notes: manager restart used to black-hole client routing — part_addrs
+# (Notes: manager restart used to black-hole client routing — part_addrs
 #  is in-memory; the PS now re-reports it every ~2s sync tick. Ownership
 #  failback used to wedge forever — owner_epoch now bumps on every acquire.)
 #
@@ -1482,7 +1482,7 @@ writes: 191/191 ACKed keys survived.
 `start-manager` / `stop-manager` / `restart-manager` (etcd state replay makes
 a manager bounce a safe rolling step).
 
-### Rebalancing region→PS assignment after a restart (F-REGION-REBALANCE)
+### Rebalancing region→PS assignment after a restart
 
 **Symptom:** after a restart (especially a k8s rolling `kubectl apply`, which
 bounces the PS pods one at a time) `autumn-op info` shows **all partitions
@@ -1522,7 +1522,7 @@ autumn-op --manager <MGR> info | grep '  part' | awk '{print $4}' | sort | uniq 
 
 Idempotent: re-running on an already-balanced cluster reports `0 moves`. (An
 automatic version — the dashboard auto-policy `rebalance` switch — is
-F-REGION-REBALANCE Phase B, not yet shipped.)
+Phase B, not yet shipped.)
 
 ### cluster_version + wire-version interval (R1)
 
@@ -1550,7 +1550,7 @@ autumn-op cluster-version            # expect: still 1 (etcd replay)
 # startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
 ```
 
-v28 (F-WIRE-CRC-UNIFY) changed the FRAME layer itself (one uniform shape:
+v28 changed the FRAME layer itself (one uniform shape:
 `[header][ctrl_len][ctrl][crc][value]`, crc over header+ctrl, raw value tails
 uncrc'd). Deploy note: a pre-v28 binary against a v28 peer fails at the FIRST
 frame with a loud `frame CRC mismatch` connection error — it never reaches the
@@ -1584,14 +1584,14 @@ version of a key in the same sealed extent must NOT revive over the newer one):
 cargo test -p autumn-manager --test system_gc_multiversion_same_extent
 ```
 
-**Write-pipeline changes (e.g. F256 natural batching) are verified with the perf matrix**
+**Write-pipeline changes (e.g. natural batching) are verified with the perf matrix**
 (`./perf/perf_check.sh --3disk --partitions 8` — builds release, starts a fresh 3-replica
 cluster, runs tcp/ucx × 4K/8M and compares each leg against
 `perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg passes when ops/s ≥ 80% of
-baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated since F256
+baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated
 (parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
 
-## Inode-lease + close-to-open coherence (F-ioring-lease, in flight)
+## Inode-lease + close-to-open coherence (in flight)
 
 Multi-mount / multi-daemon coherence for `autumn-fuse` and
 `autumn-ioring-daemon` runs through a JuiceFS-style inode lease served
@@ -1599,24 +1599,24 @@ by the manager. Plan + invariants live in
 [`autumn_fs_lease_plan.md`](autumn_fs_lease_plan.md).
 
 Landed so far:
-- **F-ioring-lease-1** — manager state + 4 RPCs (`MSG_*_LEASE` /
+- **Manager lease state** — manager state + 4 RPCs (`MSG_*_LEASE` /
   `MSG_POLL_INVALIDATIONS` = `0x46`–`0x49`), writer-lease etcd
   persistence under `inode_leases/<ino>`, TTL revoke loop.
-- **F-ioring-lease-2** — autumn-ioring-daemon Open acquires (and
+- **Daemon lease acquire** — autumn-ioring-daemon Open acquires (and
   Close releases) a write/read lease per inode. `RING_VERSION 1→2`:
   the Open SQE's flags byte now carries `LEASE_MODE_READ` (1) /
   `LEASE_MODE_WRITE` (2). A v1 client (flags=0) is interpreted as
   WRITE — the safe default. Two concurrent writers on the same
   inode (different daemons OR different sessions of the same
   daemon) get `libc::EBUSY` on the second Open.
-- **F-ioring-lease-3** — long-poll invalidation channel.
+- **Invalidation long-poll** — long-poll invalidation channel.
   `MSG_POLL_INVALIDATIONS` blocks up to 10 s when the inbox is
   empty (manager parks a waker); a writer-close pushed by ANOTHER
   daemon fires the waker so the reader sees the event in ms, not
   via a retry tick. Daemon spawns a persistent
   `session_invalidation_poll_loop`; on transport error or overflow
   sentinel it wholesale-invalidates the session cache.
-- **F-ioring-lease-4** — `OpenedExtents.lease_version` populated
+- **Close-to-open coherence** — `OpenedExtents.lease_version` populated
   from the AcquireLease response; per-session `InvalidationMap`
   bumped by the poll loop. Read SQE arm calls `cache_is_stale`
   and on stale invokes `fuse_read::reload_extents` to re-fetch
@@ -1628,20 +1628,20 @@ Smoke-tests (no cluster boot required):
 ```bash
 # Manager-side state machine + RPC contract.
 cargo test -p autumn-manager --lib inode_lease
-cargo test -p autumn-manager --test f_ioring_lease
+cargo test -p autumn-manager --test ioring_lease
 
 # Daemon-side lease helpers + two-daemon conflict / read-coexistence /
 # version monotonicity / heartbeat round-trip.
-cargo test -p autumn-manager --test f_ioring_lease_2
+cargo test -p autumn-manager --test ioring_lease_2
 
 # Long-poll: writer-close wakes a parked reader in ms (3 tests; the
 # idle-timeout case waits the full 10s LONG_POLL_WAIT — ~30 s total).
-cargo test -p autumn-manager --test f_ioring_lease_3
+cargo test -p autumn-manager --test ioring_lease_3
 
 # Close-to-open cache invalidation: per-ino floor bumps on
 # WriterClosed; reader's stale-cache predicate flips; overflow
 # sentinel surfaces (overflow test takes ~10 s for its 1025 cycles).
-cargo test -p autumn-manager --test f_ioring_lease_4
+cargo test -p autumn-manager --test ioring_lease_4
 
 # BUG-LEASE-2 storage fencing (needs built binaries; boots a cluster):
 # Phase 1 — stale-epoch MSG_PUT rejected with CODE_FENCED; anonymous
@@ -1668,14 +1668,14 @@ cargo run -p autumn-ioring --features daemon --bin autumn-ioring-daemon -- \
 ```
 
 Phase 1 is complete. Future work tracked under separate features:
-- **F-fuse-lease-1/2/3** — autumn-fuse mount opt-in: open/release
+- **fuse mount lease + cache invalidation** — autumn-fuse mount opt-in: open/release
   call lease::acquire/release; kernel attribute cache invalidated
   via `fuser::notify_inval_inode`.
-- **F-lease-preempt** — force-revoke / writer revoke protocol so
+- **Force-revoke / writer revoke** — force-revoke / writer revoke protocol so
   "another daemon needs to write NOW" doesn't have to wait for
   the current writer to close.
 
-## Zero-copy model load (F-MODEL-bulk-LOAD + F-REDIRECT-BATCH)
+## Zero-copy model load
 
 Serve a model that lives in autumn straight into GPU memory via the pinned
 zero-copy read seam (`autumn.Fs.read_into`) + batched EN direct-read, at
@@ -1707,14 +1707,14 @@ comparison is vs Model-Streamer-from-remote-storage, where autumn/RDMA wins).
 The `Fs.read_into` seam alone (no GPU) is checkable headless with a `bytearray`
 dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n)`.
 
-## Enabling authz (F-AUTHZ-BUILTIN)
+## Enabling authz
 
 **Deploy layer = ON by default (Task 2, 2026-07-18).** Both deploy paths arm
 data-plane authz automatically. **Protect-everything (tenant-first, 2026-07-19):**
 with a signing key present, EVERY tenant-scoped write requires a token — there is
 no protected-prefix list; a credential grants a key prefix — a whole namespace
 (`fs/`) or an in-namespace sub-prefix (`mem/hermes/`). The key layout is
-`{ns}/…` (F-NS-PRINCIPAL-UNIFIED — NO tenant segment; see §8).
+`{ns}/…` (NO tenant segment; see §8).
 
 - **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
   token once (reused across re-deploys — rotating invalidates every credential),

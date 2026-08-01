@@ -266,7 +266,7 @@ struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
     /// SHARED across every DiskFS instance for the same physical
-    /// directory in this process (coco P1: F196 multi-shard builds one
+    /// directory in this process (coco P1: multi-shard builds one
     /// DiskFS per shard for the same dir — a shard-local health flag let
     /// shard B keep allocating onto a disk shard A had just marked Full).
     /// Keyed by canonical base_dir via `shared_disk_health`.
@@ -417,23 +417,23 @@ impl DiskFS {
         self.extent_file_path(extent_id, "ec.commit")
     }
 
-    /// F109: unlink the `.dat`, `.meta`, and (F210-D2) `.ec.dat` files
+    /// unlink the `.dat`, `.meta`, and `.ec.dat` files
     /// for an extent. Idempotent — `NotFound` errors on any of the
     /// three are downgraded to `Ok(())` so retries from the manager
     /// are safe. Returns Err only on a real I/O failure (permission
     /// denied, etc.) so the caller can keep the entry in the
     /// pending-delete queue and retry.
     ///
-    /// **F210-D2: `.ec.dat` staging files are now unlinked.** Pre-F210-D2
+    /// **`.ec.dat` staging files are now unlinked.** Previously
     /// `remove_extent_files` only touched `.dat` + `.meta`, leaving any
     /// `.ec.dat` from a crashed mid-conversion as a permanent orphan
     /// (orphan-reconcile only scanned `self.extents`, not the directory).
-    /// With the F210-D1 op lock, a delete that races a convert is now
+    /// With the mutating-op lock, a delete that races a convert is now
     /// refused — but a CRASH mid-convert can still leave a `.ec.dat`
     /// behind. Including it here ensures that when the manager
     /// eventually issues `MSG_DELETE_EXTENT` for the extent (refs→0),
     /// the staging file is also cleaned. The orphan reconcile loop
-    /// (F210-D2 second leg) handles the case where the extent's
+    /// (second leg) handles the case where the extent's
     /// `extent-{id}.dat` is already gone but `.ec.dat` survived.
     async fn remove_extent_files(&self, extent_id: u64) -> Result<()> {
         for path in [
@@ -512,7 +512,7 @@ impl DiskFS {
     }
 
     fn parse_extent_id(name: &str) -> Option<u64> {
-        // Reject `.ec.dat` (the F210-D2 ec-staging file) — that prefix
+        // Reject `.ec.dat` (the ec-staging file) — that prefix
         // also ends with ".dat" but parses as "42.ec" which fails
         // parse::<u64>. Be explicit about the rejection so future
         // maintainers don't accidentally match it here.
@@ -527,7 +527,7 @@ impl DiskFS {
         }
     }
 
-    /// F210-D2: parse the extent_id out of an `extent-{id}.ec.dat`
+    /// parse the extent_id out of an `extent-{id}.ec.dat`
     /// staging filename. Returns None for any other shape (including
     /// `extent-{id}.dat`).
     fn parse_ec_staging_extent_id(name: &str) -> Option<u64> {
@@ -539,7 +539,7 @@ impl DiskFS {
         }
     }
 
-    /// F210-D2: scan all 256 hash subdirs for `extent-{id}.ec.dat`
+    /// scan all 256 hash subdirs for `extent-{id}.ec.dat`
     /// staging files. Returns the extent_ids that have a `.ec.dat` on
     /// disk. Used by the reconcile loop to also report ec-staging
     /// orphans to the manager (the regular `scan_extents` only sees
@@ -578,7 +578,7 @@ impl DiskFS {
 /// - `new(data_dir, io_mode, disk_id)`: single disk with explicit disk_id (tests, simple deploys).
 /// - `new_multi(data_dirs, io_mode)`: multiple disks; each dir must have a `disk_id` file
 ///   written by `autumn-op format`.
-/// F-EN-DYNSHARD M1b: the EN's own live identity, threaded from the binary into
+/// M1b: the EN's own live identity, threaded from the binary into
 /// **shard 0's** `ExtentNode` (the only shard the manager dials for df — the
 /// registered `control_address` is shard 0's control port) so `handle_df` can
 /// ECHO it to the manager. The manager uses the echo to detect pod-IP reuse (a
@@ -599,35 +599,35 @@ pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
     disks: Vec<(PathBuf, Option<u64>)>,
     pub manager_endpoint: Option<String>,
-    /// F099-M: this shard's index (0..shard_count). Only extents where
+    /// this shard's index (0..shard_count). Only extents where
     /// `autumn_rpc::shard_for_extent(extent_id, shard_count) == shard_idx` are
-    /// owned by this instance (F-EN-SHARD-HASH; was a raw `extent_id %
+    /// owned by this instance (the canonical hash; was a raw `extent_id %
     /// shard_count`).
     pub shard_idx: u32,
-    /// F099-M: total shard count in the extent-node process. 1 = legacy
+    /// total shard count in the extent-node process. 1 = legacy
     /// single-threaded mode; >1 enables per-shard filtering + routing.
     pub shard_count: u32,
-    /// F099-M: sibling shards' local listener addresses on this process
+    /// sibling shards' local listener addresses on this process
     /// (typically `127.0.0.1:<shard_ports[i]>`). Used by control-plane
     /// RPC handlers (alloc, re_avali, convert_to_ec, copy_extent,
     /// require_recovery) to forward a mismatched extent_id to the
     /// owning sibling shard via localhost loopback.
     pub sibling_addrs: Vec<String>,
-    /// F195 (was F194 env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`):
+    /// (was env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`):
     /// cross-extent cap on concurrent `handle_convert_to_ec` heavy
     /// paths. Default 1 = fully serialise. Clamped to [1, 16].
     pub ec_convert_parallelism: usize,
-    /// F195 (was F194 env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`):
+    /// (was env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`):
     /// cross-extent cap on concurrent `run_recovery_task` heavy paths.
     /// Default 2 (repair work — some concurrency speeds post-failure
     /// convergence). Clamped to [1, 16].
     pub recovery_parallelism: usize,
-    /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I): per-conn
+    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
     /// FuturesUnordered cap for the connection-task SQ/CQ loop. Caps
     /// the per-client memory footprint at `cap × avg-frame`. Default
     /// 64 matches the historical env default.
     pub inflight_cap: usize,
-    /// F-EN-DYNSHARD M1b: this EN's own identity to echo in `handle_df`.
+    /// M1b: this EN's own identity to echo in `handle_df`.
     /// `None` = not self-registered (`--advertise` unset) → the manager skips
     /// the echo-based drift-heal / imposter checks.
     pub registration: Option<NodeRegistration>,
@@ -665,26 +665,26 @@ impl ExtentNodeConfig {
         }
     }
 
-    /// F195: F194 EC convert parallelism setter. Clamped to [1, 16].
+    /// EC convert parallelism setter. Clamped to [1, 16].
     pub fn with_ec_convert_parallelism(mut self, n: usize) -> Self {
         self.ec_convert_parallelism = n.clamp(1, 16);
         self
     }
 
-    /// F195: F194 recovery parallelism setter. Clamped to [1, 16].
+    /// recovery parallelism setter. Clamped to [1, 16].
     pub fn with_recovery_parallelism(mut self, n: usize) -> Self {
         self.recovery_parallelism = n.clamp(1, 16);
         self
     }
 
-    /// F195: F099-I per-conn inflight cap setter. Must be > 0; falls
+    /// per-conn inflight cap setter. Must be > 0; falls
     /// back to default 64 on 0.
     pub fn with_inflight_cap(mut self, n: usize) -> Self {
         self.inflight_cap = if n == 0 { 64 } else { n };
         self
     }
 
-    /// F-EN-DYNSHARD M1b: set the EN's own identity to echo in `handle_df`.
+    /// M1b: set the EN's own identity to echo in `handle_df`.
     pub fn with_registration(
         mut self,
         node_uuid: impl Into<String>,
@@ -704,7 +704,7 @@ impl ExtentNodeConfig {
         self
     }
 
-    /// F099-M: mark this config as a shard of a multi-shard extent-node.
+    /// mark this config as a shard of a multi-shard extent-node.
     /// `shard_idx` must be < `shard_count`. `sibling_addrs[i]` is the
     /// local address of shard `i` (normally `127.0.0.1:<shard_ports[i]>`).
     pub fn with_shard(
@@ -731,7 +731,7 @@ impl ExtentNodeConfig {
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
-/// F178 Phase 1: per-extent fsync coalescer state (event-driven, RocksDB-style).
+/// Phase 1: per-extent fsync coalescer state (event-driven, RocksDB-style).
 ///
 /// Decouples pwrite throughput from fsync rate. Hot-path append handlers
 /// store-then-register: advance `pending_fsync` to their write end_offset,
@@ -851,10 +851,10 @@ pub(crate) fn register_sync_waiter(
     rx
 }
 
-/// F229 (1C): supervise a RESTARTABLE extent-node background loop —
+/// (1C): supervise a RESTARTABLE extent-node background loop —
 /// catch_unwind, ERROR-log on panic/unexpected return, restart after 1 s. Use
 /// ONLY for re-derive-each-tick loops with no moved resource (the orphan
-/// reconcile sweep). Mirrors manager F228 / PS `spawn_supervised`. Pre-F229
+/// reconcile sweep). Mirrors the manager / PS `spawn_supervised`. Previously
 /// these were bare `spawn(..).detach()` → a panic killed the loop silently.
 pub(crate) fn en_spawn_supervised<F, Fut>(name: &'static str, make: F)
 where
@@ -881,13 +881,13 @@ where
     .detach();
 }
 
-/// F229 (1C): supervise a NON-restartable extent-node loop that owns a moved
+/// (1C): supervise a NON-restartable extent-node loop that owns a moved
 /// resource (the per-extent fsync coalescer owns its wake-channel receiver) and
 /// is durability-critical. NORMAL return is the expected lazy-exit path
 /// (no-op). A PANIC means the fsync-coalescing path broke on possibly-
 /// inconsistent state; restart-in-place is unsafe (the receiver is gone), so
 /// **fail-stop the process** — the EN restarts and recovers extents from disk
-/// (the data files are the journal; nothing committed is lost). See F229.
+/// (the data files are the journal; nothing committed is lost).
 pub(crate) fn en_spawn_failstop<Fut>(name: String, fut: Fut)
 where
     Fut: std::future::Future<Output = ()> + 'static,
@@ -975,7 +975,7 @@ async fn coalescer_loop(
             // a wake event on `wake_rx`; the next loop iteration sees
             // `pending > synced` and issues a fresh fsync.
             let snapshot = pending; // already loaded at top of iteration
-            // F-EN-FD-LRU: `None` is provably unreachable here — a
+            // `None` is provably unreachable here — a
             // pending-fsync extent (`pending > synced`) is NOT `fd_evictable`,
             // and the writer that registered the waiter held a pinned fd clone
             // (`strong_count > 1`) through registration until `pending > synced`
@@ -1069,14 +1069,14 @@ async fn coalescer_loop(
 }
 
 pub(crate) struct ExtentEntry {
-    /// F171: structural close of the type-level UB at the file-replacement
-    /// path. Pre-F171 this was `UnsafeCell<CompioFile>` and the replace
+    /// structural close of the type-level UB at the file-replacement
+    /// path. This was previously `UnsafeCell<CompioFile>` and the replace
     /// path (`*entry.file.get() = new_file`) could dangle a concurrent
-    /// reader's `&CompioFile` borrow if F153's EC-conversion lock missed
+    /// reader's `&CompioFile` borrow if the EC-conversion lock missed
     /// any reader (theoretical UB even when in practice ruled out by
-    /// F119-C's eversion check).
+    /// the eversion check).
     ///
-    /// Post-F171: `RefCell<Rc<CompioFile>>`. Reads clone the `Rc` while
+    /// Now `RefCell<Rc<CompioFile>>`. Reads clone the `Rc` while
     /// holding a brief `borrow()`; the I/O runs on the cloned `Rc` so
     /// the borrow is released before any `.await`. The replace path
     /// takes a `borrow_mut()` and `Rc::replace` — the OLD `Rc` is
@@ -1084,7 +1084,7 @@ pub(crate) struct ExtentEntry {
     /// releases its clone, so the underlying file handle / fd cannot
     /// dangle. No `unsafe` anywhere in the file-access path.
     ///
-    /// F-EN-FD-LRU: now `Option<Rc<CompioFile>>`. `None` = the fd has been
+    /// now `Option<Rc<CompioFile>>`. `None` = the fd has been
     /// EVICTED by the sealed-extent fd cache (`FdLru`) to bound open fds on a
     /// node with many extents. **Only SEALED, idle, UNREFERENCED extents are
     /// ever evicted** (`fd_evictable`: `sealed && pending_fsync<=last_synced &&
@@ -1092,13 +1092,13 @@ pub(crate) struct ExtentEntry {
     /// `None`" (an OPEN extent CAN be sealed concurrently, then evicted) — it is:
     /// every path resolves the fd via `resident_file()` (sync, write/durability
     /// path) or `ExtentNode::extent_file` (async, read/sealed-op path), holds the
-    /// returned `Rc` for its whole I/O (F171 — so the `strong_count==1` evict
+    /// returned `Rc` for its whole I/O (so the `strong_count==1` evict
     /// guard can't yank it mid-op), and treats `None` as "concurrently sealed" →
     /// a clean `CODE_PRECONDITION` reject, never a panic. Eviction dropping the
-    /// cache's `Rc` is the SAME structural safety as F171's `replace_file`: a
+    /// cache's `Rc` is the SAME structural safety as `replace_file`: a
     /// concurrent holder's `Rc` clone keeps the fd alive until it finishes.
     pub(crate) file: RefCell<Option<Rc<CompioFile>>>,
-    /// F-EN-FD-LRU: this extent's id — needed to re-open the `.dat` on a cache
+    /// this extent's id — needed to re-open the `.dat` on a cache
     /// miss (`disk_for(disk_id).extent_path(extent_id)`). Immutable.
     pub(crate) extent_id: u64,
     pub(crate) len: AtomicU64,
@@ -1134,7 +1134,7 @@ pub(crate) struct ExtentEntry {
     pub(crate) durable_owner_epoch: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
     pub(crate) disk_id: u64,
-    /// F178 Phase 1: per-extent fsync coalescer state.
+    /// Phase 1: per-extent fsync coalescer state.
     pub(crate) coalescer: Coalescer,
     /// META-FAILCLOSED: set true at load time when the `.meta` sidecar is
     /// PRESENT but CORRUPT (CRC/magic/extent_id invalid — bit rot / torn
@@ -1151,7 +1151,7 @@ pub(crate) struct ExtentEntry {
 }
 
 impl ExtentEntry {
-    /// F171: replace the file handle. Safe by construction —
+    /// replace the file handle. Safe by construction —
     /// `RefCell::borrow_mut` panics if any borrow is currently held,
     /// and concurrent readers have already cloned an `Rc<CompioFile>`
     /// off a brief `borrow()` so they hold no `RefCell` borrow during
@@ -1159,22 +1159,22 @@ impl ExtentEntry {
     /// last concurrent reader releases its clone — the underlying fd
     /// cannot dangle.
     ///
-    /// F153's per-extent EC-conversion lock still serialises concurrent
+    /// The per-extent EC-conversion lock still serialises concurrent
     /// `handle_convert_to_ec` dispatches at a higher level (so two
     /// converts don't race on the staging file), but is no longer
     /// load-bearing for memory safety of the replace itself.
     pub(crate) fn replace_file(&self, new_file: CompioFile) {
-        // F-EN-FD-LRU: replacing installs a fresh resident fd (EC-commit /
+        // replacing installs a fresh resident fd (EC-commit /
         // recovery writeback). Sets `Some` — the extent is pinned resident.
         *self.file.borrow_mut() = Some(Rc::new(new_file));
     }
 
-    /// F-EN-FD-LRU: SYNC accessor — clone the resident fd if present, else
+    /// SYNC accessor — clone the resident fd if present, else
     /// `None` (the extent's fd was evicted; by construction it is sealed + idle).
     /// This REPLACED the old panic-on-`None` `file_rc()` (a coco/subagent
     /// finding: an accepted append or in-flight `truncate_to_commit` could hit a
     /// concurrent seal+evict window and PANIC at first poll). Callers on the
-    /// write/durability path resolve once (pinning the `Rc` via F171) and treat
+    /// write/durability path resolve once (pinning the `Rc`) and treat
     /// `None` as "extent was concurrently sealed" → the semantically-correct
     /// `CODE_PRECONDITION` reject, NOT a panic. Read / sealed-extent background
     /// ops use the async `ExtentNode::extent_file` (open-on-miss) instead.
@@ -1182,7 +1182,7 @@ impl ExtentEntry {
         self.file.borrow().clone()
     }
 
-    /// F-EN-FD-LRU: drop the cached fd (eviction). Safe by the same F171
+    /// drop the cached fd (eviction). Safe by the same
     /// reasoning as `replace_file`: a concurrent reader's `Rc` clone keeps the
     /// underlying fd alive until it finishes; only the cache's reference is
     /// released here. Callers MUST call `fd_evictable` first.
@@ -1190,7 +1190,7 @@ impl ExtentEntry {
         *self.file.borrow_mut() = None;
     }
 
-    /// F-EN-FD-LRU: is this extent's fd safe to evict RIGHT NOW? Three
+    /// is this extent's fd safe to evict RIGHT NOW? Three
     /// conditions, all load-bearing:
     /// - `sealed` — only sealed extents are ever cached/evicted (open/active
     ///   extents are pinned; the write/coalescer path assumes them resident);
@@ -1221,10 +1221,10 @@ impl ExtentEntry {
     }
 }
 
-/// F-EN-FD-LRU: max resident SEALED-extent fds cached per shard. Open/active
+/// max resident SEALED-extent fds cached per shard. Open/active
 /// extents are pinned (NOT counted here), so the process fd ceiling is
 /// `fd_cache_cap + Σ(open tails) + sockets`. Default 4096 — well under the
-/// F-EN-NOFILE-raised RLIMIT_NOFILE (65535) with room for open tails + TCP
+/// raised RLIMIT_NOFILE (65535) with room for open tails + TCP
 /// conns. Set via `--fd-cache-cap` (binary); OnceLock first-call-wins, env-free
 /// per the project's no-env-in-Rust rule (the shell maps env→flag).
 static FD_CACHE_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1241,7 +1241,7 @@ pub fn set_fd_cache_cap(cap: usize) -> bool {
     FD_CACHE_CAP_CELL.set(cap.max(64)).is_ok()
 }
 
-/// F-EN-FD-LRU — a bounded LRU cache of open file descriptors for SEALED
+/// a bounded LRU cache of open file descriptors for SEALED
 /// extents on one shard. Open/active extents are NEVER tracked here (their fd
 /// is pinned resident by `ExtentEntry.file = Some`); only sealed, idle,
 /// unreferenced extents (`fd_evictable`) are cached + evicted. The write /
@@ -1252,7 +1252,7 @@ pub fn set_fd_cache_cap(cap: usize) -> bool {
 /// When the number of resident sealed fds exceeds `cap`, the least-recently-used
 /// one's fd is dropped (`ExtentEntry::evict_file`) — re-opened lazily on the
 /// next read via `ExtentNode::extent_file`. Eviction dropping the cache's `Rc`
-/// is the same structural safety as F171's `replace_file`: a concurrent reader
+/// is the same structural safety as `replace_file`: a concurrent reader
 /// holds its own `Rc` clone across `.await`, so the fd stays alive until the
 /// reader finishes.
 ///
@@ -1361,9 +1361,9 @@ struct LocalExtentMeta {
     avali: u32,
 }
 
-// ─── F194 → F196 D-r7 ConcurrencyController ──────────────────────────────────
+// ─── ConcurrencyController ──────────────────────────────────
 //
-// Renamed from `ExtentNodeGate` in F196 D-r7 to mirror PS's
+// Renamed from `ExtentNodeGate` to mirror PS's
 // `partition_server::ConcurrencyController`. Same purpose on both
 // sides: per-process cap on the number of simultaneous memory-heavy
 // background operations. RAM cap, not rate cap (rate cap is not yet
@@ -1384,9 +1384,9 @@ struct LocalExtentMeta {
 // partition threads. Polling backoff is 50 ms, negligible vs the
 // seconds-to-minutes wallclock of EC convert / recovery.
 //
-// Why not the per-extent locks alone? `ec_conversion_locks` (F153)
+// Why not the per-extent locks alone? `ec_conversion_locks`
 // only serialises requests for the SAME extent_id; `recovery_inflight`
-// (F109) only blocks duplicate requests for the SAME extent_id. Both
+// only blocks duplicate requests for the SAME extent_id. Both
 // allow unbounded cross-extent fanout: a single manager
 // `recovery_dispatch_loop` tick that finds 8 different extents needing
 // recovery on the same node spawns 8 detached `run_recovery_task`
@@ -1471,8 +1471,8 @@ impl Drop for RecoveryPermit {
     }
 }
 
-// F195: F194 env-reading helpers `ec_convert_parallelism()` and
-// `recovery_parallelism()` removed — values now live on
+// The env-reading helpers `ec_convert_parallelism()` and
+// `recovery_parallelism()` were removed — values now live on
 // `ExtentNodeConfig.ec_convert_parallelism` / `.recovery_parallelism`,
 // set by the extent-node binary's CLI parser. The clamp([1, 16]) moved
 // to the `with_*` builder methods on ExtentNodeConfig.
@@ -1481,7 +1481,7 @@ impl Drop for RecoveryPermit {
 
 pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
-    /// F-EN-FD-LRU: bounded cache of open fds for SEALED extents (open/active
+    /// bounded cache of open fds for SEALED extents (open/active
     /// extents are pinned). Shares the `extents` map (for eviction). See `FdLru`.
     fd_lru: Rc<FdLru>,
     /// All disks attached to this node, keyed by disk_id.
@@ -1493,7 +1493,7 @@ pub struct ExtentNode {
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
-    /// F260: per-downstream-addr chain forwarder queues. The conn loop
+    /// per-downstream-addr chain forwarder queues. The conn loop
     /// enqueues forwards UNBOUNDED (non-blocking — a blocking submit here
     /// stalled the whole handle_connection loop under 8M backlog, v1 bug);
     /// each addr's forwarder task drains sequentially, preserving
@@ -1505,35 +1505,35 @@ pub struct ExtentNode {
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
-    /// F099-M: shard_idx / shard_count for per-shard extent ownership.
+    /// shard_idx / shard_count for per-shard extent ownership.
     /// Default is (0, 1) = legacy single-thread mode.
     shard_idx: u32,
     shard_count: u32,
-    /// F099-M: local sibling shard addresses for cross-shard control RPC
+    /// local sibling shard addresses for cross-shard control RPC
     /// forwarding. `sibling_addrs[i]` is the address of shard `i` on this
     /// host. Empty in single-thread mode.
     sibling_addrs: Rc<Vec<String>>,
-    /// F153: per-extent serialisation lock for `handle_convert_to_ec`. The
+    /// per-extent serialisation lock for `handle_convert_to_ec`. The
     /// manager-side `ec_conversion_inflight` set is purely in-memory and is
     /// lost on leader failover; a deposed leader's in-flight EC conversion
     /// is invisible to the new leader, whose 5 s `ec_conversion_dispatch_loop`
     /// can fire a SECOND `EXT_MSG_CONVERT_TO_EC` before the first completes.
-    /// F119-D's idempotency guard fires post-hoc (eversion bump is the last
+    /// The idempotency guard fires post-hoc (eversion bump is the last
     /// step of the 2PC), so during the deposed leader's mid-`spawn_blocking`
     /// `ec_encode` + `write_shard_local` window the guard does not yet
     /// trigger and two encodes race on the same `.ec.dat` staging file —
     /// producing corrupted shards or sub-shard-of-sub-shard payloads
-    /// (the F119-D corruption shape). This lock serialises both dispatches
-    /// on the coordinator: the second one waits, then re-runs the F119-D
+    /// (the same corruption shape). This lock serialises both dispatches
+    /// on the coordinator: the second one waits, then re-runs the idempotency
     /// guard under the lock and exits as a no-op once the first finishes.
     /// Pattern mirrors `client.rs::stream_init_locks`.
     ///
-    /// **F210-D1: extended to a general "mutating-op lock"**. In addition
+    /// **Extended to a general "mutating-op lock"**. In addition
     /// to EC convert, `handle_re_avali` now acquires this lock (its
     /// write path — fetch_full_extent_from_sources + truncate + pwrite —
     /// races with both convert and delete the same way). `handle_delete_extent`
     /// `try_lock`s this and refuses with CODE_PRECONDITION if held,
-    /// closing the convert↔delete and re_avali↔delete races that F139's
+    /// closing the convert↔delete and re_avali↔delete races that the
     /// `recovery_inflight` check alone didn't cover. The lock entry lives
     /// for the lifetime of the node — bounded by the number of distinct
     /// extents that ever ran a mutating op on this shard. Use
@@ -1548,17 +1548,17 @@ pub struct ExtentNode {
     /// `ec_conversion_locks` (the op-lock): EC commit / re_avali hold the
     /// op-lock and call `save_meta`, so reusing it would self-deadlock.
     meta_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
-    /// F194 → F196 D-r7: per-shard `ConcurrencyController` hosting both
+    /// per-shard `ConcurrencyController` hosting both
     /// the EC-convert and recovery concurrency caps. Renamed from the
     /// two separate `ExtentNodeGate` fields (`ec_convert_gate` +
     /// `recovery_gate`) to mirror PS's `ConcurrencyController` shape —
     /// one struct, two counters. RAM cap, not rate cap.
     concurrency_ctrl: Rc<ConcurrencyController>,
-    /// F195 (was F099-I env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
+    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
     /// FuturesUnordered cap. Read once at construction from
     /// `ExtentNodeConfig.inflight_cap`; immutable after.
     inflight_cap: usize,
-    /// F-EN-DYNSHARD M1b: this EN's own identity, echoed in `handle_df`
+    /// M1b: this EN's own identity, echoed in `handle_df`
     /// (default/empty when `--advertise` was not passed).
     registration: Rc<NodeRegistration>,
 }
@@ -1675,7 +1675,7 @@ fn append_reject(code: u8) -> HandlerResult {
 /// Positional write (pwrite) at reserved offset — safe for concurrent
 /// non-overlapping offsets (each caller uses fetch_add to reserve).
 ///
-/// F171: takes `Rc<CompioFile>` by value. The caller cloned the `Rc`
+/// takes `Rc<CompioFile>` by value. The caller cloned the `Rc`
 /// off `entry.file_rc()` before invoking us, so the `RefCell` borrow
 /// is already released and the underlying fd is kept alive by THIS
 /// future's captured `Rc` for the duration of the `.await`. If
@@ -1695,7 +1695,7 @@ async fn file_pwrite(
     result.map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Positional read (pread). F171: see `file_pwrite` for the
+/// Positional read (pread). See `file_pwrite` for the
 /// `Rc<CompioFile>` rationale.
 async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
     let f: &CompioFile = &file;
@@ -1708,7 +1708,7 @@ async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec
 /// Per-call chunk size for local-disk pread/pwrite. macOS caps a single
 /// pread/pwrite at INT_MAX (~2 GiB) and Linux at 0x7ffff000 — without
 /// chunking, sealed extents > 2 GiB EINVAL on the very first syscall.
-/// Mirrors `read_chunk_bytes` in `client.rs` (F105) for the StreamClient
+/// Mirrors `read_chunk_bytes` in `client.rs` for the StreamClient
 /// RPC path; this constant covers the local-file path on the extent node.
 const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
@@ -1775,7 +1775,7 @@ async fn file_pread_chunked(file: Rc<CompioFile>, offset: u64, len: usize) -> Re
 /// staging, etc.). Takes `Bytes` so callers that already hold a `Bytes` (e.g.,
 /// EC shard from `Vec<u8>` via zero-copy `Bytes::from`) avoid an event-loop
 /// memcpy. Chunks are split via `Bytes::split_to` (O(1) Arc reslice) and
-/// passed straight to `file_pwrite` which accepts `impl IoBuf`; F140 removed
+/// passed straight to `file_pwrite` which accepts `impl IoBuf`; this removed
 /// the per-chunk `chunk.to_vec()` round-trip that previously forced
 /// `O(extent)` event-loop memcpy on every full-extent write.
 async fn file_pwrite_chunked(file: Rc<CompioFile>, offset: u64, data: Bytes) -> Result<()> {
@@ -1859,7 +1859,7 @@ fn spawn_read(
     .boxed_local()
 }
 
-// F195: F099-I env-reading helper `extent_inflight_cap()` removed —
+// The env-reading helper `extent_inflight_cap()` was removed —
 // value now lives on `ExtentNodeConfig.inflight_cap`, set by the
 // extent-node binary's CLI parser. Default 64 matches the client-side
 // pipelining depth where extent_bench peaks.
@@ -1872,11 +1872,11 @@ fn spawn_read(
 /// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
 /// completion before pushing more. Completions drained during back-pressure
 /// go into `tx_bufs` and are flushed by the caller after this returns.
-/// F260: one queued chain forward — `parts` is the full MSG_APPEND_CHAIN
+/// one queued chain forward — `parts` is the full MSG_APPEND_CHAIN
 /// request (prefix + AppendReq header + payload, all Bytes refs); the
 /// forwarder sends `Ok(receiver)` (or the submit error) back through
 /// `rx_back` so the chain future can await the downstream ack itself.
-/// F260: downstream failure classification — semantic codes pass through
+/// downstream failure classification — semantic codes pass through
 /// to the writer (fencing/alloc reactions), transport faults stay generic.
 enum ChainFail {
     Code(u8),
@@ -1889,7 +1889,7 @@ struct ChainFwdJob {
 }
 
 impl ExtentNode {
-    /// F260: enqueue a chain forward to `addr` — non-blocking, in caller
+    /// enqueue a chain forward to `addr` — non-blocking, in caller
     /// order. Lazily spawns the per-addr forwarder task on this shard's
     /// runtime (lives for the process; one per peer shard addr, ~dozens).
     fn chain_forward_enqueue(
@@ -1905,7 +1905,7 @@ impl ExtentNode {
         };
         let mut map = self.chain_fwd.borrow_mut();
         let tx = map.entry(addr.to_string()).or_insert_with(|| {
-            // coco P2 (F260): BOUNDED — each job pins a large payload Bytes;
+            // coco P2: BOUNDED — each job pins a large payload Bytes;
             // a slow/dead downstream must backpressure (fail fast) instead
             // of accumulating unbounded memory. 32 jobs ≈ 256MB of 8M refs.
             let (tx, mut rx) = futures::channel::mpsc::channel::<ChainFwdJob>(32);
@@ -1935,7 +1935,7 @@ impl ExtentNode {
     }
 }
 
-/// F260: bound for awaiting the downstream hop's ack in a chained append.
+/// bound for awaiting the downstream hop's ack in a chained append.
 /// Generous — covers a tail hop's pwrite + coalesced fsync under load; the
 /// writer-side append timeout (scaled by chain depth) is the outer bound.
 const CHAIN_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2040,14 +2040,14 @@ async fn process_frames_backpressured(
             let fut = build_append_future(node.clone(), extent, slots).await;
             inflight.push(fut);
         } else if msg_type == MSG_APPEND_CHAIN {
-            // F260 — chained append. One frame, one future (no same-extent
+            // chained append. One frame, one future (no same-extent
             // grouping: chained payloads are >= 64 KiB, pwritev coalescing
             // buys nothing). ORDERING INVARIANT: the downstream forward is
             // SUBMITTED here, synchronously, in frame-arrival order — this
             // socket's arrival order is the writer's lease order, and the
             // downstream RpcClient's single writer_task preserves submit
             // order, so every hop sees per-extent appends in lease order
-            // (same argument as the client's star fanout, F099-B).
+            // (same argument as the client's star fanout).
             let req_id = frames[i].req_id;
             i += 1;
             let (chain, append_bytes) = match decode_chain_prefix(frames[i - 1].payload.clone()) {
@@ -2106,7 +2106,7 @@ async fn process_frames_backpressured(
                                 } else {
                                     match AppendResp::decode(frame.payload.clone()) {
                                         Ok(r) if r.code == CODE_OK => Ok(()),
-                                        // coco P1 (F260): PRESERVE the downstream
+                                        // coco P1: PRESERVE the downstream
                                         // code (LockedByOther must reach the
                                         // writer for self-eviction; NotFound
                                         // drives alloc-new-extent) — surfaced
@@ -2198,7 +2198,7 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
-            // F-EN-FD-LRU: resolve (re-open if evicted) the fd here, where we
+            // resolve (re-open if evicted) the fd here, where we
             // have the node; pin it into the read future.
             let file_rc = match node.extent_file(&extent).await {
                 Ok(f) => f,
@@ -2214,7 +2214,7 @@ async fn process_frames_backpressured(
             };
             inflight.push(build_read_future(extent, file_rc, slots, false));
         } else if msg_type == MSG_READ_BYTES_BULK {
-            // F216-E zero-copy read grouping — mirrors MSG_READ_BYTES but every
+            // zero-copy read grouping — mirrors MSG_READ_BYTES but every
             // response (ok + error) is bulk-shaped (`bulk_read_head` + value Bytes)
             // so the PS's call_into_pooled always parses a bulk_ctrl.
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
@@ -2344,11 +2344,11 @@ fn eversion_mismatch_read_resp(req_id: u32, bulk: bool) -> Bytes {
 /// A read's serving plan, computed from the extent's local state — the ONE
 /// place holding the eversion gate + logical-length semantics for reads.
 /// Shared by the batched hot path (`build_read_future`) and the single-op
-/// `handle_read_bytes` so the two can never drift (the F119-C and P0-C fixes
-/// each previously had to land twice). Pure computation, no awaits.
+/// `handle_read_bytes` so the two can never drift (the eversion-gate and P0-C
+/// fixes each previously had to land twice). Pure computation, no awaits.
 ///
 /// Returns `None` when `req.eversion` is stale → the caller answers
-/// CODE_EVERSION_MISMATCH. F119-C: `req.eversion < ev` is enforced
+/// CODE_EVERSION_MISMATCH. `req.eversion < ev` is enforced
 /// UNCONDITIONALLY (no `> 0` skip) — a stale-cached eversion=0, populated
 /// while the extent was open, must be rejected after split/EC bump it, and it
 /// must be a typed RESPONSE (not a frame error) so the client's retry loop
@@ -2466,7 +2466,7 @@ async fn build_append_future(
         let extent_id = slots[0].req.extent_id;
         match node.extent_info_from_manager(extent_id).await {
             Ok(Some(ex)) => {
-                // F143: durable seal — fsync the data file when the
+                // durable seal — fsync the data file when the
                 // refresh promotes 0 → sealed_length so the on-disk
                 // prefix matches the manager's view.
                 // P0-A: if the seal can't be made durable, do NOT proceed with
@@ -2554,7 +2554,7 @@ async fn build_append_future(
     // task may have (a) taken over with a HIGHER owner_epoch, or (b) SEALED
     // this extent (seal/EC/re_avali bumps eversion + sets sealed). Owner
     // takeover → LockedByOther; a fresh seal → CODE_PRECONDITION (mirrors the
-    // F147-B post-truncate seal recheck) so we never ghost-write past a seal
+    // post-truncate seal recheck) so we never ghost-write past a seal
     // landed during our await. (owner_epoch and sealed are CHECKED
     // SEPARATELY — they are independent concerns: fencing vs seal state.)
     if first_revision < extent.owner_epoch.load(Ordering::SeqCst) {
@@ -2573,7 +2573,7 @@ async fn build_append_future(
         return batch_append_reject(slots, CODE_PRECONDITION);
     }
     if file_start > first.commit {
-        // F119-E / F123: before truncating, confirm with manager that this
+        // before truncating, confirm with manager that this
         // extent is NOT sealed. A stale writer's low `header.commit` would
         // otherwise silently shrink a sealed extent.
         let extent_id = slots[0].req.extent_id;
@@ -2583,7 +2583,7 @@ async fn build_append_future(
             // tail) also refuses the stale writer's truncate+append instead of
             // shrinking + ghost-writing a manager-sealed extent.
             if mgr_info.sealed || mgr_info.sealed_length > 0 {
-                // F143: durable seal — fsync the data file as part
+                // durable seal — fsync the data file as part
                 // of accepting the manager's seal point.
                 // P0-A: a seal-persist failure here marks the disk offline (for
                 // recovery) inside apply_extent_meta_durable; the stale append
@@ -2605,7 +2605,7 @@ async fn build_append_future(
                 .collect();
             return Box::pin(async move { out });
         }
-        // F146: re-check seal state after the truncate await.
+        // re-check seal state after the truncate await.
         // apply_extent_meta_durable from a concurrent handle_re_avali or
         // handle_convert_to_ec may have landed a fresh seal during the
         // truncate's I/O. Without this re-check our pwritev would write
@@ -2638,17 +2638,17 @@ async fn build_append_future(
     let total_end = cursor;
     let extent_id = slots[0].req.extent_id;
 
-    // F-EN-FD-LRU (coco/subagent P1 — the seal-transition panic): resolve + PIN
+    // (coco/subagent P1 — the seal-transition panic): resolve + PIN
     // the fd HERE, in the synchronous prologue, while the seal/fence re-checks
     // above have just established the extent is OPEN — NOT lazily at the returned
     // future's first poll. Between accept and poll the conn task awaits other
     // frames' prologues, so a concurrent seal + LRU-evict could set `file = None`
     // and the old poll-time access would PANIC. Resolving now and MOVING the `Rc`
-    // into the future pins the fd (F171) for the whole write, and holding the
+    // into the future pins the fd for the whole write, and holding the
     // clone makes the extent non-evictable (`fd_evictable` checks
     // `strong_count == 1`) through the pending_fsync store + waiter register. A
     // `None` here means the extent was concurrently sealed → reject the batch
-    // with `CODE_PRECONDITION` (the F146/F147-B seal re-checks give the same
+    // with `CODE_PRECONDITION` (the seal re-checks give the same
     // answer), never a panic.
     let file_rc = match extent.resident_file() {
         Some(f) => f,
@@ -2676,7 +2676,7 @@ async fn build_append_future(
         let write_t0 = Instant::now();
         // The fd `Rc` (resolved+pinned in the prologue above) is moved into this
         // future; the write runs on it. It survives any concurrent
-        // `replace_file` / LRU-evict until our I/O completes (F171).
+        // `replace_file` / LRU-evict until our I/O completes.
         let mut f: &CompioFile = &file_rc;
         // ENOSPC-1 CORRUPTION FIX: `write_vectored_all_at`, NOT the raw
         // `write_vectored_at`. POSIX pwritev on a nearly-full disk writes
@@ -2699,14 +2699,14 @@ async fn build_append_future(
                 .collect();
         }
 
-        // F178: every append is durable. Advance pending_fsync to the new
+        // every append is durable. Advance pending_fsync to the new
         // high-water, register a sync waiter on the per-extent coalescer,
         // and await. The coalescer task issues ONE sync_data per
         // wake-cycle covering ALL pending bytes (event-driven, RocksDB
         // group-commit style); every waiter whose end_offset is now
-        // covered wakes together. Pre-F178 must_sync was a per-batch
-        // flag and false batches skipped this wait; post-F178 the wire
-        // field is gone and every batch waits.
+        // covered wakes together. must_sync was formerly a per-batch
+        // flag and false batches skipped this wait; the wire
+        // field is now gone and every batch waits.
         extent_for_io
             .coalescer
             .pending_fsync
@@ -2772,7 +2772,7 @@ async fn build_append_future(
 /// Build the async future that services a same-extent READ batch. Reads
 /// are processed sequentially inside ONE future — each pread is ~1µs and
 /// the responses are written back together.
-/// F216-E: build a MSG_READ_BYTES_BULK response head — v28 value-separable
+/// build a MSG_READ_BYTES_BULK response head — v28 value-separable
 /// frame head `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl;
 /// see autumn-rpc frame.rs). The value (if any) is pushed as a SEPARATE
 /// `Bytes` right after, so it aliases the pread buffer — no copy, and the raw
@@ -2783,10 +2783,10 @@ fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
 
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
-    // F-EN-FD-LRU: the fd is resolved ONCE at the call site (which has the
+    // the fd is resolved ONCE at the call site (which has the
     // `ExtentNode` + can re-open an evicted sealed extent via `extent_file`) and
     // passed in; this boxed future is a free fn with no node handle, and holding
-    // the `Rc` pins the fd for the whole read (F171) so a concurrent read's
+    // the `Rc` pins the fd for the whole read so a concurrent read's
     // eviction can't yank it mid-scan.
     file_rc: std::rc::Rc<CompioFile>,
     slots: Vec<ReadSlot>,
@@ -2812,13 +2812,13 @@ fn build_read_future(
         for slot in slots {
             let req = slot.req;
             // Eversion gate + length semantics live in `read_plan` (shared
-            // with handle_read_bytes — see its doc for F119-C / P0-C).
+            // with handle_read_bytes — see its doc for the eversion gate / P0-C).
             let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
                 out.push(eversion_mismatch_read_resp(slot.req_id, bulk));
                 continue;
             };
 
-            // F-EN-FD-LRU: use the caller-resolved, pinned fd for every slot
+            // use the caller-resolved, pinned fd for every slot
             // (was `extent.file_rc()` per slot — now the extent may be an
             // evicted sealed one, resolved once at the call site).
             let f: &CompioFile = &file_rc;
@@ -2854,7 +2854,7 @@ fn build_read_future(
                     ));
                     continue;
                 }
-                // F216-E: pread straight into a registered, pooled, zeroed-once
+                // pread straight into a registered, pooled, zeroed-once
                 // slab — no per-op `vec![0u8; read_size]` alloc, no per-op 8 MiB
                 // memset (the pread overwrites it anyway), and the UCX send finds
                 // the `ucp_mem_map` registration via the rcache (stable slab
@@ -2922,15 +2922,15 @@ fn build_read_future(
 }
 
 impl ExtentNode {
-    /// F157: extent .meta sidecar layout versioning.
+    /// extent .meta sidecar layout versioning.
     ///
-    /// V0 (legacy, pre-F157): 40 bytes, no CRC.
+    /// V0 (legacy, no CRC): 40 bytes.
     ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][owner_epoch[8]]
     ///
-    /// V1 (post-F157): 44 bytes, CRC32C trailer over the first 40 bytes.
+    /// V1 (with CRC): 44 bytes, CRC32C trailer over the first 40 bytes.
     ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][owner_epoch[8]][crc32c[4]]
     ///
-    /// Pre-F157 a flipped bit anywhere in the 40-byte payload (bit rot, undetected
+    /// Before the CRC trailer, a flipped bit anywhere in the 40-byte payload (bit rot, undetected
     /// disk error, partial overwrite during a torn write) silently changed the
     /// extent's seal state at restart — recovery would load `sealed_length=0`
     /// for an actually-sealed extent, accept new appends past the old seal
@@ -3007,14 +3007,14 @@ impl ExtentNode {
             g
         };
 
-        // F-EN-FD-LRU: build `extents` first so the fd cache can share it (for
+        // build `extents` first so the fd cache can share it (for
         // eviction reach-through). Both are `Rc`, no cycle (FdLru holds the
         // DashMap, not the node).
         let extents: Rc<DashMap<u64, Rc<ExtentEntry>>> = Rc::new(DashMap::new());
         // coco P1: `fd_cache_cap` is PER SHARD, but `RLIMIT_NOFILE` is
         // PROCESS-wide. Each shard is a separate `ExtentNode`, so N shards would
         // hold N × cap sealed fds; clamp the per-shard cap so the process total
-        // stays comfortably under the F-EN-NOFILE 65535 limit (reserve headroom
+        // stays comfortably under the 65535 RLIMIT_NOFILE limit (reserve headroom
         // for open tails + TCP sockets). Floor 64 (matches `set_fd_cache_cap`).
         let shards = config.shard_count.max(1) as usize;
         let per_shard_cap = fd_cache_cap().min((60_000 / shards).max(64));
@@ -3034,7 +3034,7 @@ impl ExtentNode {
             sibling_addrs: Rc::new(config.sibling_addrs),
             ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
             meta_locks: Rc::new(RefCell::new(HashMap::new())),
-            // F195: parallelism comes from `ExtentNodeConfig`. CLI flag
+            // parallelism comes from `ExtentNodeConfig`. CLI flag
             // → builder → here. No env read.
             concurrency_ctrl: ConcurrencyController::new(
                 config.ec_convert_parallelism,
@@ -3047,13 +3047,13 @@ impl ExtentNode {
         // Load existing extents from all disks.
         node.load_extents().await?;
 
-        // F109+F113: reconcile loaded extents against the manager. Any
+        // reconcile loaded extents against the manager. Any
         // `extent_id` the manager no longer knows about (refs went to
         // 0 while this node was offline, or the manager's in-memory
         // pending-delete queue was lost across a restart, or an EC
         // conversion left a replica behind) is unlinked.
         //
-        // F113: spawn as a long-lived background task. After an initial
+        // spawn as a long-lived background task. After an initial
         // exp-backoff retry that races past manager leader election,
         // it enters a steady-state periodic sweep so the node self-
         // heals on any extent that becomes garbage at runtime —
@@ -3115,7 +3115,7 @@ impl ExtentNode {
         Ok(node)
     }
 
-    /// F113: long-lived periodic orphan reconcile.
+    /// long-lived periodic orphan reconcile.
     ///
     /// Runs immediately on spawn, then every `SWEEP_INTERVAL`. Errors
     /// (manager not leader during cold boot, transient network blip,
@@ -3165,7 +3165,7 @@ impl ExtentNode {
                     if let Err(e) = node.reconcile_orphans_with_manager().await {
                         tracing::warn!(
                             error = %e,
-                            "F113 reconcile failed (will retry next sweep)",
+                            "reconcile failed (will retry next sweep)",
                         );
                     }
                     compio::time::sleep(SWEEP_INTERVAL).await;
@@ -3174,13 +3174,13 @@ impl ExtentNode {
         });
     }
 
-    /// F109: best-effort startup orphan reconcile.
+    /// best-effort startup orphan reconcile.
     /// If `manager_endpoint` is configured, ship every loaded
     /// `extent_id` to the manager; receive back the subset that's no
     /// longer registered and unlink the corresponding `.dat`/`.meta`.
     /// Skips silently when there's no manager (test setups). Per-disk
     /// errors are logged but don't propagate — partial cleanup is fine,
-    /// the F113 retry loop will catch the next iteration.
+    /// the retry loop will catch the next iteration.
     async fn reconcile_orphans_with_manager(&self) -> Result<()> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
@@ -3193,10 +3193,10 @@ impl ExtentNode {
             .filter(|id| self.owns_extent(*id))
             .collect();
 
-        // F210-D2: also include extent_ids that have an
+        // also include extent_ids that have an
         // `extent-{id}.ec.dat` staging file on disk. A CRASHED
         // mid-`handle_convert_to_ec` may leave a `.ec.dat` without a
-        // corresponding `.dat` entry in `self.extents`. The F210-D2
+        // corresponding `.dat` entry in `self.extents`. The
         // `remove_extent_files` unlinks `.ec.dat` too, but only when
         // the manager TELLS us this extent is garbage — and the
         // manager only sees the IDs we report here. Without the scan,
@@ -3254,14 +3254,14 @@ impl ExtentNode {
         tracing::info!(
             local = extent_ids.len(),
             garbage = resp.garbage.len(),
-            "F109 startup reconcile: unlinking orphans",
+            "startup reconcile: unlinking orphans",
         );
         for eid in &resp.garbage {
             // Drop in-memory entry and unlink files. Look up the disk
             // via the entry; if the entry is gone (concurrent delete),
             // fall back to scanning every disk.
             let entry = self.extents.remove(eid).map(|(_, v)| v);
-            self.fd_lru.forget(*eid); // F-EN-FD-LRU
+            self.fd_lru.forget(*eid);
             if let Some(entry) = entry {
                 if let Some(disk) = self.disks.get(&entry.disk_id) {
                     if let Err(e) = disk.remove_extent_files(*eid).await {
@@ -3279,17 +3279,17 @@ impl ExtentNode {
         Ok(())
     }
 
-    /// F099-M: does this shard own `extent_id`?
+    /// does this shard own `extent_id`?
     #[inline]
     pub(crate) fn owns_extent(&self, extent_id: u64) -> bool {
-        // F-EN-SHARD-HASH: canonical hashed map (was `extent_id % shard_count`,
+        // canonical hashed map (was `extent_id % shard_count`,
         // which aliased bootstrap's contiguous ids onto shard 0). MUST match the
         // manager / StreamClient `shard_addr_for_extent`.
         self.shard_count <= 1
             || autumn_rpc::shard_for_extent(extent_id, self.shard_count) == self.shard_idx
     }
 
-    /// F210-D1: look up / create the per-extent mutating-op lock. Held
+    /// look up / create the per-extent mutating-op lock. Held
     /// by `handle_convert_to_ec` and `handle_re_avali` for their full
     /// duration; `try_lock`'d by `handle_delete_extent` to refuse
     /// concurrent unlinks. Created lazily; lives for the node's
@@ -3303,7 +3303,7 @@ impl ExtentNode {
             .clone()
     }
 
-    /// F099-M: return the local sibling address that owns `extent_id`
+    /// return the local sibling address that owns `extent_id`
     /// (this host's shard for the target extent). None in single-thread mode.
     #[inline]
     fn sibling_for_extent(&self, extent_id: u64) -> Option<&str> {
@@ -3314,7 +3314,7 @@ impl ExtentNode {
         self.sibling_addrs.get(owner).map(|s| s.as_str())
     }
 
-    /// F099-M: forward a control-plane RPC to a sibling shard on the same
+    /// forward a control-plane RPC to a sibling shard on the same
     /// host. Used when an RPC arrives at a non-owner shard. Uses the
     /// manager_pool as a general-purpose ConnPool (the sibling address is
     /// a localhost loopback; per-shard reuse amortises the TCP cost).
@@ -3349,12 +3349,12 @@ impl ExtentNode {
         self.disks.values().find(|d| d.allocatable()).cloned()
     }
 
-    /// F-EN-FD-LRU: resolve an extent's file handle, re-opening it on a cache
+    /// resolve an extent's file handle, re-opening it on a cache
     /// miss (a SEALED extent whose fd was evicted). Open/active extents hit the
     /// resident fast path (their fd is pinned, never evicted). Reading a sealed
     /// extent LRU-`touch`es it so the cache evicts the least-recently-read one
     /// once over `cap`. The returned `Rc` pins the fd for the caller's I/O
-    /// across `.await` (F171): even if a later read evicts this extent, the
+    /// across `.await`: even if a later read evicts this extent, the
     /// caller's clone keeps the fd alive until it finishes.
     ///
     /// Callers: every read / sealed-extent background op (EC-convert, re_avali,
@@ -3507,7 +3507,7 @@ impl ExtentNode {
         let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V2 - 4]);
         buf[48..52].copy_from_slice(&crc.to_le_bytes());
 
-        // F159: the .meta must be durable, not just in the page cache.
+        // the .meta must be durable, not just in the page cache.
         // `apply_extent_meta_durable` fsyncs .dat FIRST so a crash can't leave a
         // persisted sealed_length longer than the durable .dat. P0-B: write
         // atomically (temp + fsync + rename) — a fixed `.tmp` name is safe
@@ -3630,7 +3630,7 @@ impl ExtentNode {
                     extent_id,
                     stored_crc,
                     computed_crc,
-                    "F157: meta sidecar CRC mismatch — bit rot or torn write; treating as missing"
+                    "meta sidecar CRC mismatch — bit rot or torn write; treating as missing"
                 );
                 return None;
             }
@@ -3638,7 +3638,7 @@ impl ExtentNode {
             // V0 legacy: no checksum. Warn once per load so operators see the upgrade signal.
             tracing::warn!(
                 extent_id,
-                "F157: legacy V0 meta sidecar (no CRC) — will upgrade to V2 on next save_meta"
+                "legacy V0 meta sidecar (no CRC) — will upgrade to V2 on next save_meta"
             );
         }
         let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
@@ -3679,7 +3679,7 @@ impl ExtentNode {
             .await?;
 
             for extent_id in found {
-                // F099-M: only load extents this shard owns. Under normal
+                // only load extents this shard owns. Under normal
                 // operation the other shards will never have touched this
                 // extent file (disk hash-byte vs. extent_id-modulo are
                 // independent, so all extents with the same id collide on
@@ -3763,7 +3763,7 @@ impl ExtentNode {
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
-                        // F-EN-FD-LRU: at startup, do NOT keep SEALED extents'
+                        // at startup, do NOT keep SEALED extents'
                         // fds resident — that was the O(all-extents) open-fd
                         // storm. `file`/`len` were read above; drop the fd for
                         // sealed (first read re-opens via `extent_file`), keep it
@@ -3879,7 +3879,7 @@ impl ExtentNode {
         self.accept_loop(addr, "data").await
     }
 
-    /// F191: serve BOTH the data-plane and a separate control-plane
+    /// serve BOTH the data-plane and a separate control-plane
     /// listener on the same `ExtentNode` instance. The control listener
     /// reuses `handle_connection` (same SQ/CQ machinery) but only
     /// receives small-payload control RPCs (`MSG_DF`, future
@@ -3899,7 +3899,7 @@ impl ExtentNode {
         data_addr: SocketAddr,
         control_addr: SocketAddr,
     ) -> Result<()> {
-        // F191 separate control listener. Under UCX a second ucp_listener on
+        // separate control listener. Under UCX a second ucp_listener on
         // the same RoCE device fails to bind ("Device is busy" / "Address
         // already in use"), so we serve control RPCs on the data listener
         // instead — `handle_connection` dispatches by msg_type, so DF and the
@@ -3964,8 +3964,8 @@ impl ExtentNode {
         let transport = autumn_transport::current_or_init();
         tracing::info!(addr = %addr, role, kind = ?transport.kind(), "extent node listening");
         loop {
-            // F257: accept errors are connection-scoped — log + backoff +
-            // continue. Pre-F257 the `?` here killed the whole EN shard on
+            // accept errors are connection-scoped — log + backoff +
+            // continue. Previously the `?` here killed the whole EN shard on
             // a single failed handshake (on UCX, accept flushes the new ep,
             // so a peer dying mid-handshake surfaced as an accept Err).
             // Same fix shape as the manager serve loop + the PS
@@ -4071,7 +4071,7 @@ impl ExtentNode {
         let (reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
 
-        // F195: per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
+        // per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
         // set once at node construction. No env read.
         let cap = node.inflight_cap;
         let mut inflight: FuturesUnordered<
@@ -4231,7 +4231,7 @@ impl ExtentNode {
         }
     }
 
-    /// F099-M wrong-shard rejection: hot-path RPCs (append/read/
+    /// wrong-shard rejection: hot-path RPCs (append/read/
     /// commit_length/probe/synced_length) must hit the owning shard. A
     /// wrong-shard request signals a client routing bug — surface it as
     /// FailedPrecondition so the client logs it instead of silently
@@ -4265,7 +4265,7 @@ impl ExtentNode {
     }
 
     async fn ensure_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, String> {
-        // F099-M: a non-owning shard should never `ensure_extent`. This is
+        // a non-owning shard should never `ensure_extent`. This is
         // an invariant violation — log loudly and reject.
         if !self.owns_extent(extent_id) {
             return Err(format!(
@@ -4375,7 +4375,7 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
-                // F-EN-FD-LRU: freshly-allocated OPEN extent — pinned resident.
+                // freshly-allocated OPEN extent — pinned resident.
                 file: RefCell::new(Some(Rc::new(file))),
                 extent_id,
                 len: AtomicU64::new(len),
@@ -4430,7 +4430,7 @@ impl ExtentNode {
         }
         // P0-C: the seal must be made durable when EITHER the extent newly
         // became sealed (incl. the sealed-EMPTY case `sealed_length` stays 0)
-        // OR its sealed_length newly grew from 0 (the original F143 trigger —
+        // OR its sealed_length newly grew from 0 (the original grow trigger —
         // covers a sealed-empty tail that later receives a length). Both must
         // hit disk so a restart doesn't forget the seal.
         let became_sealed = !old_sealed && (ex.sealed || ex.sealed_length > 0);
@@ -4438,7 +4438,7 @@ impl ExtentNode {
         became_sealed || len_grew
     }
 
-    /// F143: apply extent metadata from manager AND make the seal
+    /// apply extent metadata from manager AND make the seal
     /// durable on disk. When `apply_extent_meta` reports a 0→nonzero
     /// `sealed_length` transition we (1) persist the meta sidecar so a
     /// restart doesn't forget the seal, and (2) `file.sync_all()` the
@@ -4479,8 +4479,8 @@ impl ExtentNode {
         // (sealed=false) still skip it. `sealed_changed` is still returned for
         // callers that branch on the transition.
         if extent.sealed.load(Ordering::SeqCst) {
-            // F159: fsync .dat FIRST (data durable), THEN write+fsync .meta
-            // (sealed_length / eversion durable). Pre-F159 the order was
+            // fsync .dat FIRST (data durable), THEN write+fsync .meta
+            // (sealed_length / eversion durable). Previously the order was
             // reversed: .meta written first then .dat fsync'd. If the
             // process crashed in that window, the OS page cache could have
             // already flushed .meta (44 bytes, well under one sector) while
@@ -4493,7 +4493,7 @@ impl ExtentNode {
             // between the two steps, the worst observable state is "old
             // .meta + new .dat" which restart treats as still-unsealed
             // (manager re-applies the seal on next contact). Save_meta
-            // itself was also made durable in F159 (open + write + fsync,
+            // itself was also made durable (open + write + fsync,
             // not bare `compio::fs::write`).
             // P0-A (coco final): do NOT persist a seal the local data does not
             // yet back. For a NON-EC extent whose `.dat` is shorter than the
@@ -4527,8 +4527,8 @@ impl ExtentNode {
             // peer. The in-memory seal stays set (this process keeps rejecting
             // appends); nothing false is persisted, and on restart the OLD
             // (unsealed) `.meta` is the safe state — the manager re-applies the
-            // seal on next contact (the F159 ordering invariant).
-            // F-EN-FD-LRU: resolve (re-open if the sealed extent was fd-evicted)
+            // seal on next contact (the ordering invariant).
+            // resolve (re-open if the sealed extent was fd-evicted)
             // before the durability fsync. Fail-closed on a reopen error.
             let seal_f = self.extent_file(extent).await?;
             if let Err(e) = seal_f.sync_data().await {
@@ -4566,17 +4566,17 @@ impl ExtentNode {
     }
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u64) -> Result<(), String> {
-        // F-EN-FD-LRU (coco/subagent P1): called from the append prologue AFTER
+        // (coco/subagent P1): called from the append prologue AFTER
         // a manager seal-confirm RPC await — a concurrent seal+evict in that
         // window would panic the old `file_rc()`. `None` = the extent was
-        // concurrently sealed → reject (the caller's F146 re-check handles it);
-        // holding `f` pins the fd (F171 + `fd_evictable` strong_count) for the
+        // concurrently sealed → reject (the caller's seal re-check handles it);
+        // holding `f` pins the fd (via `fd_evictable` strong_count) for the
         // set_len + fsync.
         let Some(f) = extent.resident_file() else {
             return Err("extent sealed (fd evicted) during commit-reconcile".to_string());
         };
         f.set_len(commit).await.map_err(|e| e.to_string())?;
-        // F152: fsync the truncate. Without this, the kernel may report the
+        // fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
         // node crashes after `set_len` but before any subsequent must_sync
         // append flushes the file's metadata, post-restart the file size
@@ -4596,7 +4596,7 @@ impl ExtentNode {
         // pre-truncate value, commit_length reports a length that no
         // longer exists on disk. `pending_fsync` follows the same
         // shrink — the subsequent pwrite (if any) will store its own
-        // larger end value via the regular F178 path.
+        // larger end value via the regular coalescer path.
         extent
             .coalescer
             .last_synced
@@ -4618,13 +4618,13 @@ impl ExtentNode {
     }
 
     /// Copy the full extent data from a remote source node using autumn-rpc.
-    /// F223: fetch a source replica's extent in 256 MiB chunks.
+    /// fetch a source replica's extent in 256 MiB chunks.
     ///
-    /// Pre-F223 this issued ONE `MSG_READ_BYTES` with `length: 0`
+    /// This previously issued ONE `MSG_READ_BYTES` with `length: 0`
     /// (read-to-end). On a multi-GB sealed extent that trips the
     /// >2 GiB per-syscall pread ceiling on the source EN (macOS
     /// > INT_MAX / Linux 0x7ffff000) and oversized rpc frames — exactly
-    /// > what F105/F115 chunk every OTHER full-extent path for. The raw
+    /// > what the chunked paths chunk every OTHER full-extent path for. The raw
     /// > recovery fetch bypassed all of it, so replicated-extent recovery
     /// > of any >2 GiB extent failed with "no source replica available
     /// > for copy" (10 retries, source nodes logged nothing — the read
@@ -4683,7 +4683,7 @@ impl ExtentNode {
             offset,
             length,
         };
-        // F-FENCE-DRAIN-2: BOUND this recovery source read. `rpc_oneshot`
+        // BOUND this recovery source read. `rpc_oneshot`
         // (connect + write + read) is otherwise UNBOUNDED — under chaos churn a
         // source EN slowed / half-open by a network-partition or latency toxic
         // (or mid-kill) can park this await indefinitely, pinning a recovery
@@ -4692,8 +4692,8 @@ impl ExtentNode {
         // through to the next healthy source (or the recovery fails cleanly +
         // retries). 30 s covers a legit 256 MiB chunk transfer even on a
         // slow-but-progressing link while capping a genuinely wedged peer.
-        // Mirrors the F228/F229 "bound every await reachable from a loop"
-        // invariant + the F121 append-fanout / F223 chunked-read timeouts.
+        // Mirrors the "bound every await reachable from a loop"
+        // invariant + the append-fanout / chunked-read timeouts.
         // `extent_info_from_manager` (right below) already bounds its manager
         // call the same way. (NOTE: this bound was ADDED while chasing the
         // decommission drain wedge, but was NOT that bug's cause — the wedge
@@ -4729,7 +4729,7 @@ impl ExtentNode {
     // streaming form. Its helper `copy_bytes_from_source` survives for the
     // `[offset, size)` range copy used by `handle_copy_extent`.)
 
-    /// F193 Stage C: stream the full sealed extent from a healthy peer straight
+    /// Stage C: stream the full sealed extent from a healthy peer straight
     /// into `dest`, chunk-by-chunk (read one `FILE_IO_CHUNK_BYTES` chunk →
     /// `pwrite` it → drop it), so peak RAM is ONE chunk regardless of extent
     /// size — unlike `fetch_full_extent_from_sources`, which materialized the
@@ -4750,9 +4750,9 @@ impl ExtentNode {
             .nodes_map_from_manager()
             .await
             .map_err(|e| format!("nodes_map: {e}"))?;
-        // F-EN-FD-LRU: `dest` may be a SEALED extent (re_avali repair) whose fd
+        // `dest` may be a SEALED extent (re_avali repair) whose fd
         // was evicted — resolve (re-open on miss) ONCE and hold it for the whole
-        // rebuild. The held `Rc` pins the fd (F171) across every source attempt.
+        // rebuild. The held `Rc` pins the fd across every source attempt.
         let dest_f = self.extent_file(dest).await?;
         let total = extent.sealed_length;
         // SEED13: per-source failure-reason trace + over-promised-seal
@@ -4855,7 +4855,7 @@ impl ExtentNode {
         // SEED13 over-promised-seal reconciliation. No source held the full
         // `sealed_length`. If EVERY source we could reach responded
         // (`err_count == 0`) yet all are short, the manager's `sealed_length`
-        // is an over-promise — F227's lenient failover-seal (the `end == 0`
+        // is an over-promise — the lenient failover-seal (the `end == 0`
         // path in `handle_stream_alloc_extent`) sealed at `min` over the
         // reachable members at seal time, promoting a speculative/un-acked
         // tail byte that NO replica durably retained (it rolled back on the
@@ -4867,7 +4867,7 @@ impl ExtentNode {
         // Reconcile to the replica consensus: copy the longest available copy
         // and succeed. SAFE under all-replica-ACK — the acked prefix is on
         // EVERY replica, so the best reachable copy is >= the acked length;
-        // only phantom (un-acked) tail bytes are dropped, which F227 already
+        // only phantom (un-acked) tail bytes are dropped, which the lenient seal already
         // treats as acceptable (see manager note 28 / `feedback`-seal-lenient).
         // The guard `err_count == 0 && unverified == 0` ensures we NEVER
         // reconcile down while any source was unreachable OR unattempted — such
@@ -4983,9 +4983,9 @@ impl ExtentNode {
             None => return Ok(None),
         };
         let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentInfoReq { extent_id });
-        // 5 s — read-only manager call. Hot in F119-E
+        // 5 s — read-only manager call. Hot in EC convert
         // (handle_convert_to_ec syncs sealed_length / eversion from
-        // manager) and the F147-C recovery verify-after-fetch path.
+        // manager) and the recovery verify-after-fetch path.
         let resp_data = self
             .manager_pool
             .call_timeout(
@@ -5047,7 +5047,7 @@ impl ExtentNode {
     ) -> Result<RecoveryTaskDone, String> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
 
-        // F147-C: refuse-at-start — if the local extent already has a fresher
+        // refuse-at-start — if the local extent already has a fresher
         // eversion than the manager's snapshot, the recovery snapshot is stale.
         // Skip the expensive peer-copy and let the manager redispatch (the
         // caller's retry loop will re-resolve extent_info from manager on the
@@ -5062,8 +5062,8 @@ impl ExtentNode {
             }
         }
 
-        // F194: gate cross-extent recovery concurrency. Acquired AFTER
-        // the cheap F147-C stale-snapshot check so a stale recovery
+        // gate cross-extent recovery concurrency. Acquired AFTER
+        // the cheap stale-snapshot check so a stale recovery
         // doesn't consume a permit. Held until the end of the function
         // via RAII (`_rec_permit`); released when the function returns
         // or unwinds. Each `run_recovery_task` peer-fetches ~payload
@@ -5085,11 +5085,11 @@ impl ExtentNode {
         // `extent_info.parity` is non-empty.
         let extent = self.ensure_extent(task.extent_id).await?;
 
-        // F-EN-FD-LRU: resolve (re-open if evicted) + pin the recovery dest fd
+        // resolve (re-open if evicted) + pin the recovery dest fd
         // once for the writeback + sync below.
         let rf = self.extent_file(&extent).await?;
         let payload_len = if !extent_info.ec_converted && extent_info.sealed_length == 0 {
-            // F-FENCE-DRAIN-2: a sealed-EMPTY extent (`sealed_length == 0` — e.g.
+            // a sealed-EMPTY extent (`sealed_length == 0` — e.g.
             // an open tail that the fence drain rolled empty, then recovery
             // rebuilds its fenced slot) has NO bytes to copy: `ensure_extent`
             // already created the empty local file. SKIP the source read
@@ -5098,11 +5098,11 @@ impl ExtentNode {
             // waste that also exposes this recovery to source-side stalls).
             // Sets the sealed flag below via the same `sealed_length == 0` →
             // sealed path. This is the common shape in a fenced-node drain:
-            // F-FENCE-DRAIN rolls the victim's open tails empty, then the
+            // rolls the victim's open tails empty, then the
             // fenced-slot dispatch rebuilds them.
             0
         } else if !extent_info.ec_converted {
-            // Replication recovery — F193 Stage C: stream the full extent from a
+            // Replication recovery: stream the full extent from a
             // healthy peer chunk-by-chunk straight into the file (peak = one
             // FILE_IO_CHUNK_BYTES chunk), instead of materializing the whole
             // extent in a Vec then writing it back. stream_* truncates to 0 and
@@ -5112,8 +5112,8 @@ impl ExtentNode {
         } else {
             // EC recovery: read individual shards from healthy peers and
             // reconstruct the missing shard for this node's slot. Shard-sized
-            // buffering (≈ sealed_length / K), not full-extent; streaming RS
-            // decode would be F193 Stage B.
+            // buffering (≈ sealed_length / K), not full-extent; a streaming RS
+            // decode would be a further optimization.
             let payload = self.run_ec_recovery_payload(&task, &extent_info).await?;
             let len = payload.len() as u64;
             rf.set_len(0).await.map_err(|e| e.to_string())?;
@@ -5124,7 +5124,7 @@ impl ExtentNode {
         };
         rf.sync_data().await.map_err(|e| e.to_string())?;
 
-        // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
+        // verify-after-sync — a concurrent apply_extent_meta_durable
         // (triggered by handle_re_avali or another append's seal-confirm branch)
         // may have bumped eversion/sealed_length/avali during the long peer-copy
         // await above. If the local eversion has advanced past the snapshot,
@@ -5179,11 +5179,11 @@ impl ExtentNode {
             // persist would then report a "recovered" replica on an offline
             // disk — and (b) block a future manager re-dispatch with
             // "extent already exists". The orphaned .dat is reaped by the
-            // startup/periodic reconcile (F109/F113), the established path
+            // startup/periodic reconcile, the established path
             // for abandoned recovery artifacts.
             self.mark_disk_error_for_extent(task.extent_id, &e.to_string());
             self.extents.remove(&task.extent_id);
-            self.fd_lru.forget(task.extent_id); // F-EN-FD-LRU
+            self.fd_lru.forget(task.extent_id);
             return Err(format!(
                 "recovery of extent {} completed but .meta persist failed (fail-closed): {e}",
                 task.extent_id
@@ -5246,7 +5246,7 @@ impl ExtentNode {
             let Some(addr) = nodes.get(&node_id) else {
                 continue;
             };
-            // F223: EC shard read — each peer holds a shard of size
+            // EC shard read — each peer holds a shard of size
             // ~sealed_length/K (well under the chunking threshold), so
             // keep the legacy to-end single read (total_len=0). Only the
             // replicated full-extent fetch needed chunking.
@@ -5278,7 +5278,7 @@ impl ExtentNode {
             ));
         }
 
-        // F117: offload RS reconstruct (CPU-bound, GF(256) polynomial math
+        // offload RS reconstruct (CPU-bound, GF(256) polynomial math
         // over up-to-data_shards × per-shard MiB) to the blocking pool so
         // recovery doesn't stall the extent-node compio runtime.
         compio::runtime::spawn_blocking(move || {
@@ -5392,7 +5392,7 @@ impl ExtentNode {
                 (StatusCode::Internal, msg)
             })?;
 
-        // F171: staging file is local to this function — the path is unique per
+        // staging file is local to this function — the path is unique per
         // `extent_id` and EC convert on this extent is serialised by the
         // per-extent op-lock, so a freshly-created `Rc` suffices.
         let staging_rc = Rc::new(staging_file);
@@ -5614,7 +5614,7 @@ impl ExtentNode {
         // it. coco P1 #1: the same-process retry path may still hold a STALE fd
         // to the old (unlinked) full-replica file if a prior attempt failed
         // AFTER the rename — trusting entry.file/len there would serve old data
-        // over a shard `.dat`. F171: safe replace via RefCell + Rc swap
+        // over a shard `.dat`. Safe replace via RefCell + Rc swap
         // (concurrent readers keep their OLD Rc alive until they drop).
         let new_file = OpenOptions::new()
             .read(true)
@@ -5630,7 +5630,7 @@ impl ExtentNode {
         entry.replace_file(new_file);
         entry.len.store(shard_len, Ordering::SeqCst);
 
-        // F119-E: sealed_length = original payload length (from manager), not
+        // sealed_length = original payload length (from manager), not
         // shard size.
         entry
             .sealed_length
@@ -5756,10 +5756,10 @@ impl ExtentNode {
         // In the common case (eversions match) we trust local atomics -- no RPC needed.
         let local_eversion = extent.eversion.load(Ordering::SeqCst);
         if req.eversion > local_eversion {
-            // TODO(F044): manager RPC for eversion refresh not yet implemented
+            // TODO: manager RPC for eversion refresh not yet implemented
             match self.extent_info_from_manager(req.extent_id).await {
                 Ok(Some(ex)) => {
-                    // F143: fsync on 0→sealed transition so the
+                    // fsync on 0→sealed transition so the
                     // sealed prefix is durable on this node before we
                     // surface the seal upstream.
                     // P0-A: propagate a seal-persist failure (disk now offline)
@@ -5834,7 +5834,7 @@ impl ExtentNode {
         // P0-B: re-check fencing after the (possibly awaiting) durable step —
         // a higher owner_epoch may have taken over (LockedByOther), or a concurrent
         // seal/EC may have SEALED the extent during the await (CODE_PRECONDITION,
-        // mirrors F147-B). owner_epoch and sealed are checked SEPARATELY.
+        // mirrors the post-truncate recheck). owner_epoch and sealed are checked SEPARATELY.
         if req.owner_epoch < extent.owner_epoch.load(Ordering::SeqCst) {
             return append_reject(CODE_LOCKED_BY_OTHER);
         }
@@ -5850,7 +5850,7 @@ impl ExtentNode {
             return append_reject(CODE_PRECONDITION);
         }
         if start > req.commit {
-            // F119-E: confirm with the manager that this extent is NOT
+            // confirm with the manager that this extent is NOT
             // sealed before truncating. Otherwise a stale-PS append with
             // a low `header.commit` would silently shrink an extent the
             // manager has already sealed (the seal isn't pushed to
@@ -5861,7 +5861,7 @@ impl ExtentNode {
             // subsequent EC pass would encode `req.commit` bytes while
             // the manager still believes `sealed_length` was the larger
             // value, miscomputing every cross-shard read boundary
-            // afterwards (surfaced as F119-E `invalid meta_len=...` /
+            // afterwards (surfaced as `invalid meta_len=...` /
             // `logStream value short`). The manager round-trip on this
             // path is acceptable because commit-reconciliation
             // truncation is rare in normal operation (only fires when
@@ -5870,7 +5870,7 @@ impl ExtentNode {
                 // P0-C: explicit `sealed` flag (catches sealed-empty), not
                 // `sealed_length > 0`.
                 if mgr_info.sealed || mgr_info.sealed_length > 0 {
-                    // F143: fsync as part of accepting the seal —
+                    // fsync as part of accepting the seal —
                     // see apply_extent_meta_durable for why.
                     // P0-A: a persist failure marks the disk offline (recovery)
                     // inside; the stale append is still rejected as
@@ -5887,8 +5887,8 @@ impl ExtentNode {
             Self::truncate_to_commit(&extent, req.commit)
                 .await
                 .map_err(|e| (StatusCode::Internal, e))?;
-            // F147-B: re-check seal state after the truncate await (symmetric
-            // to F146 in build_append_future). A concurrent
+            // re-check seal state after the truncate await (symmetric
+            // to the recheck in build_append_future). A concurrent
             // apply_extent_meta_durable (from handle_re_avali or another
             // handle_append's pre-truncate seal-confirm branch) may have landed
             // a fresh seal DURING the truncate I/O. Without this re-check the
@@ -5906,7 +5906,7 @@ impl ExtentNode {
 
         let data_payload = req.payload;
 
-        // F-EN-FD-LRU: resolve + pin the fd once (reject if concurrently
+        // resolve + pin the fd once (reject if concurrently
         // sealed+evicted); `af` is held through the pwrite AND the
         // `register_sync_waiter` below, so `fd_evictable`'s `strong_count == 1`
         // keeps the extent non-evictable across the whole durable-append window.
@@ -5923,7 +5923,7 @@ impl ExtentNode {
         }
         let start_offset = start;
         let end = start + data_payload.len() as u64;
-        // F178: every append is durable via the per-extent coalescer. See
+        // every append is durable via the per-extent coalescer. See
         // `register_sync_waiter` and the matching block in
         // `build_append_future` for the full design.
         extent.coalescer.pending_fsync.store(end, Ordering::SeqCst);
@@ -5974,7 +5974,7 @@ impl ExtentNode {
         }
 
         // Eversion gate + length semantics live in `read_plan` (shared with
-        // the batched build_read_future — see its doc for F119-C / P0-C and
+        // the batched build_read_future — see its doc for the eversion gate / P0-C and
         // why the mismatch is a typed RESPONSE, not an Err status).
         let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
             return Ok(ReadBytesResp {
@@ -5989,7 +5989,7 @@ impl ExtentNode {
         // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
-        // F-EN-FD-LRU: re-open on miss for an evicted sealed extent.
+        // re-open on miss for an evicted sealed extent.
         let rf = self
             .extent_file(&extent)
             .await
@@ -6015,7 +6015,7 @@ impl ExtentNode {
         let req = CommitLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-        // F099-M: commit_length is a hot-path RPC; reject wrong-shard.
+        // commit_length is a hot-path RPC; reject wrong-shard.
         if !self.owns_extent(req.extent_id) {
             return Err(self.wrong_shard_err(req.extent_id));
         }
@@ -6040,11 +6040,11 @@ impl ExtentNode {
             .encode());
         }
 
-        // F210-H3 Tier 2 (post-2026-05-17): `req.owner_epoch <= 0` is a
-        // protocol error, not a sentinel. The pre-F210-H2 "owner_epoch == 0
+        // Tier 2 (post-2026-05-17): `req.owner_epoch <= 0` is a
+        // protocol error, not a sentinel. The earlier "owner_epoch == 0
         // bypasses the fence" escape hatch tangled three call sites
         // (seal probe, recovery liveness, autumn-client info) onto one
-        // RPC and forced ad-hoc fence skipping; F210-H2 closed it and
+        // RPC and forced ad-hoc fence skipping; closing that escape hatch
         // broke the seal+recovery paths; the Tier 2 redesign splits
         // probe-without-fence onto `MSG_PROBE_EXTENT` and tightens THIS
         // RPC into a clean fence-enforcing primitive. Callers that
@@ -6088,12 +6088,12 @@ impl ExtentNode {
             }
             .encode());
         }
-        // F119-E: for sealed extents, return the LOGICAL sealed length
+        // for sealed extents, return the LOGICAL sealed length
         // (the original payload length, agreed with the manager). For
-        // open extents, return the **F210-B3 fix**: the durable
+        // open extents, return the durable
         // high-water (`coalescer.last_synced`), NOT `entry.len`.
         //
-        // Pre-F210-B3 this returned `entry.len`, which is set to
+        // This previously returned `entry.len`, which is set to
         // `total_end` BEFORE the pwrite + fsync future is even returned
         // (see `build_append_future` step 7). A concurrent peer (e.g.
         // EC convert peer-copy gap fill, or manager seal) querying
@@ -6103,14 +6103,14 @@ impl ExtentNode {
         // before fsync, the file shrinks back below sealed_length →
         // permanent inconsistency in etcd.
         //
-        // F178's per-extent coalescer maintains `last_synced` =
+        // The per-extent coalescer maintains `last_synced` =
         // post-fsync durable high-water. Returning it gives the strict
         // "what's actually on disk" guarantee that seal needs.
         // Trade-off: bytes between `last_synced` and `entry.len` (in
         // flight pwrites) are temporarily invisible to commit_length;
         // they reappear on the next coalescer tick (1-5 ms later).
-        // For the original F119-E concern (post-EC-conversion shard
-        // size), `last_synced` is also bounded above by
+        // For the original post-EC-conversion shard-size concern,
+        // `last_synced` is also bounded above by
         // `sealed_length` for sealed extents (set in
         // `apply_extent_meta_durable`), so the EC-shard-size confusion
         // doesn't recur.
@@ -6122,7 +6122,7 @@ impl ExtentNode {
         .encode())
     }
 
-    /// F210-H3 Tier 2: manager-only fence-free length+existence probe.
+    /// Tier 2: manager-only fence-free length+existence probe.
     ///
     /// Two call sites only:
     ///   - `manager/src/recovery.rs::recovery_dispatch_loop` — uses
@@ -6167,7 +6167,7 @@ impl ExtentNode {
         .encode())
     }
 
-    /// F178 Phase 2: report the per-extent fsync coalescer's
+    /// Phase 2: report the per-extent fsync coalescer's
     /// `last_synced_offset`. Used by `flush_one_imm` (via
     /// `StreamClient::await_log_synced_to`) to ensure all log_stream bytes
     /// referenced by a to-be-flushed memtable's ValuePointers are durable
@@ -6175,7 +6175,7 @@ impl ExtentNode {
     ///
     /// Notes:
     /// - This is a node-local view; the client takes the quorum-min across
-    ///   3 replicas (mirror of F156 commit_length quorum).
+    ///   3 replicas (mirror of the commit_length quorum).
     /// - For sealed extents, all bytes up to `sealed_length` were forced
     ///   durable by `apply_extent_meta_durable` at seal time, so we
     ///   bound-up to `max(last_synced, sealed_length)` here. Otherwise a
@@ -6186,7 +6186,7 @@ impl ExtentNode {
         let req = SyncedLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-        // F099-M: hot-path RPC; reject wrong-shard.
+        // hot-path RPC; reject wrong-shard.
         if !self.owns_extent(req.extent_id) {
             return Err(self.wrong_shard_err(req.extent_id));
         }
@@ -6220,7 +6220,7 @@ impl ExtentNode {
         let req: AllocExtentReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F099-M: forward to owner shard if we don't own this extent.
+        // forward to owner shard if we don't own this extent.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
                 return self
@@ -6259,7 +6259,7 @@ impl ExtentNode {
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
-                // F-EN-FD-LRU: freshly-created local extent (copy/recovery) —
+                // freshly-created local extent (copy/recovery) —
                 // pinned resident; it's actively being written.
                 file: RefCell::new(Some(Rc::new(file))),
                 extent_id: req.extent_id,
@@ -6283,11 +6283,11 @@ impl ExtentNode {
         // just-inserted entry — leaving it would let local lookups see an
         // extent with no durable sidecar and block a manager re-dispatch
         // with "extent already exists" (same family as the P0-D recovery
-        // path; the orphan .dat is reaped by F109/F113 reconcile).
+        // path; the orphan .dat is reaped by the reconcile sweep).
         if let Err(e) = self.save_meta(req.extent_id, &entry).await {
             self.mark_disk_error_for_extent(req.extent_id, &e);
             self.extents.remove(&req.extent_id);
-            self.fd_lru.forget(req.extent_id); // F-EN-FD-LRU
+            self.fd_lru.forget(req.extent_id);
             return Err((StatusCode::Internal, e));
         }
 
@@ -6385,7 +6385,7 @@ impl ExtentNode {
         Ok(rkyv_encode(&DfResp {
             done_tasks,
             disk_status,
-            // F-EN-DYNSHARD M1b: echo our own identity so the manager can
+            // M1b: echo our own identity so the manager can
             // self-heal stored-location drift + detect pod-IP reuse. Empty when
             // `--advertise` was not passed (test / pre-M1 deployments).
             node_uuid: self.registration.node_uuid.clone(),
@@ -6394,12 +6394,12 @@ impl ExtentNode {
         }))
     }
 
-    /// F-FENCE-DRAIN-3: re-dispatch adopt for a COMPLETED-but-unreported
+    /// re-dispatch adopt for a COMPLETED-but-unreported
     /// recovery. `handle_df` hands `recovery_done` to the manager via
     /// `std::mem::take` BEFORE knowing the response was delivered (an
     /// at-most-once handoff): if the df response is lost in transit, the
     /// completion is gone forever — the manager's Recovery marker ages out
-    /// via the F208 stale sweep and the slot is re-dispatched. Pre-this-fix
+    /// via the stale sweep and the slot is re-dispatched. Before this fix
     /// the "extent already exists" refusal then PERMANENTLY poisoned every
     /// candidate that had already completed once; after every candidate was
     /// poisoned the fenced slot could never be rebuilt and `MSG_REMOVE_NODE`
@@ -6425,7 +6425,7 @@ impl ExtentNode {
         let info = match self.extent_info_from_manager(task.extent_id).await {
             Ok(Some(info)) => info,
             // Manager unreachable / extent unknown — keep the refusal; the
-            // orphan-reconcile sweep (F109/F113) reaps a truly-deleted extent.
+            // orphan-reconcile sweep reaps a truly-deleted extent.
             _ => return false,
         };
         if info.ec_converted || !info.sealed {
@@ -6462,7 +6462,7 @@ impl ExtentNode {
         let req: RequireRecoveryReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F099-M: forward to owner shard.
+        // forward to owner shard.
         if !self.owns_extent(req.task.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.task.extent_id) {
                 return self
@@ -6489,7 +6489,7 @@ impl ExtentNode {
             .get(&task.extent_id)
             .map(|v| Rc::clone(v.value()))
         {
-            // F-FENCE-DRAIN-3: a local copy already exists. If it is a
+            // a local copy already exists. If it is a
             // COMPLETED-but-unreported prior recovery (the df response
             // carrying its RecoveryTaskDone was lost — see
             // `try_adopt_completed_recovery`), adopt it: re-report done
@@ -6544,7 +6544,7 @@ impl ExtentNode {
         code_resp(CODE_OK, String::new())
     }
 
-    /// F109: unlink the physical extent files after the manager has
+    /// unlink the physical extent files after the manager has
     /// confirmed `refs == 0`. Idempotent: deleting an already-missing
     /// extent returns `CODE_OK` so the manager's retry loop is safe.
     ///
@@ -6558,7 +6558,7 @@ impl ExtentNode {
         let req: DeleteExtentReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F099-M: forward to owner shard so each shard only ever
+        // forward to owner shard so each shard only ever
         // touches the extents whose ids hash to it.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
@@ -6568,12 +6568,12 @@ impl ExtentNode {
             }
         }
 
-        // F139: if recovery is in flight for this extent, refuse the delete.
+        // if recovery is in flight for this extent, refuse the delete.
         // run_recovery_task's ensure_extent auto-creates on NotFound; if we
         // unlink now, recovery either writes to the unlinked inode (data
         // evaporates when fd closes) or resurrects the extent on-disk as an
         // orphan with no manager record. The manager's extent_delete_loop
-        // retries up to 60× (~2 min); orphan-reconcile (F113) is the backstop
+        // retries up to 60× (~2 min); orphan-reconcile is the backstop
         // if that budget exhausts before recovery completes.
         if self.recovery_inflight.contains_key(&req.extent_id) {
             return code_resp(
@@ -6582,12 +6582,12 @@ impl ExtentNode {
             );
         }
 
-        // F210-D1: try-acquire the per-extent mutating-op lock. If held
+        // try-acquire the per-extent mutating-op lock. If held
         // by an in-flight `handle_convert_to_ec` or `handle_re_avali`,
-        // refuse the delete with CODE_PRECONDITION. Pre-F210-D1 the
-        // F139 check only covered the recovery↔delete pair; convert
+        // refuse the delete with CODE_PRECONDITION. Previously the
+        // check only covered the recovery↔delete pair; convert
         // and re_avali could race with delete (data-loss paths
-        // documented in feature_list F210-D1):
+        // documented in feature_list):
         //   - convert↔delete: delete unlinks `.dat`+`.meta` mid-encode;
         //     convert's later `rename(.ec.dat, .dat)` resurrects an
         //     orphan with no manager record + stale `.meta`.
@@ -6616,7 +6616,7 @@ impl ExtentNode {
         // Pull the entry out of the map so any later append on this id
         // fails with NotFound rather than racing the unlink.
         let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
-        self.fd_lru.forget(req.extent_id); // F-EN-FD-LRU
+        self.fd_lru.forget(req.extent_id);
 
         // Locate the file. Prefer the in-memory entry's disk_id (exact
         // match for the file that was actually created); fall back to
@@ -6657,7 +6657,7 @@ impl ExtentNode {
         let req: ReAvaliReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F099-M: forward to owner shard.
+        // forward to owner shard.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
                 return self
@@ -6666,7 +6666,7 @@ impl ExtentNode {
             }
         }
 
-        // F210-D1: acquire the per-extent mutating-op lock for the
+        // acquire the per-extent mutating-op lock for the
         // entire re_avali. Held against concurrent
         // `handle_convert_to_ec` (would corrupt the staging path) and
         // `handle_delete_extent` (would unlink the inode while
@@ -6685,7 +6685,7 @@ impl ExtentNode {
             }
         };
 
-        // TODO(F044): manager RPC for extent_info not yet implemented
+        // TODO: manager RPC for extent_info not yet implemented
         let extent_info = match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => ex,
             Ok(None) => {
@@ -6698,7 +6698,7 @@ impl ExtentNode {
                 return code_resp(CODE_ERROR, e);
             }
         };
-        // F143: fsync on 0→sealed transition.
+        // fsync on 0→sealed transition.
         // P0-A (coco): if the seal can't be made durable, return CODE_ERROR
         // (disk is now offline) — do NOT fall through to the CODE_OK
         // "already up to date" path, which would let the manager treat this
@@ -6723,7 +6723,7 @@ impl ExtentNode {
             );
         }
 
-        // F206: RE_AVALI is a replicated-extent repair primitive. For an
+        // RE_AVALI is a replicated-extent repair primitive. For an
         // EC'd extent the local shard size is `sealed_length / K`, so
         // the `local_len >= sealed_length` check below would always fall
         // through to `fetch_full_extent_from_sources` — which allocates a
@@ -6732,7 +6732,7 @@ impl ExtentNode {
         // Missing-shard repair on an EC'd extent must route through
         // EXT_MSG_REQUIRE_RECOVERY → run_ec_recovery_payload. Returning
         // CODE_OK here also lets the manager's recovery_dispatch_loop
-        // self-heal pre-F206 buggy `avali` values via mark_extent_available
+        // self-heal historically buggy `avali` values via mark_extent_available
         // on the next 2 s tick.
         if extent_info.ec_converted {
             return code_resp(CODE_OK, String::new());
@@ -6743,8 +6743,8 @@ impl ExtentNode {
             return code_resp(CODE_OK, String::new());
         }
 
-        // F210-E1: gate cross-extent re_avali concurrency through the
-        // shared recovery permit pool. Pre-F210-E1 only `run_recovery_task`
+        // gate cross-extent re_avali concurrency through the
+        // shared recovery permit pool. Previously only `run_recovery_task`
         // acquired it; the replicated re_avali path
         // (`fetch_full_extent_from_sources` + `file_pwrite_chunked`) had
         // the same `payload × 2` transient working set as recovery but
@@ -6758,7 +6758,7 @@ impl ExtentNode {
         // (env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`, default 2).
         let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
 
-        // F193 Stage C: stream the full extent from a healthy peer chunk-by-chunk
+        // Stage C: stream the full extent from a healthy peer chunk-by-chunk
         // straight into the file (peak = one FILE_IO_CHUNK_BYTES chunk) instead
         // of buffering the whole extent in a Vec before writeback. stream_*
         // succeeds only on a full sealed_length transfer (a short/failed source
@@ -6773,7 +6773,7 @@ impl ExtentNode {
                 return code_resp(CODE_ERROR, err);
             }
         };
-        // F-EN-FD-LRU: re_avali repairs a SEALED extent — re-open on miss.
+        // re_avali repairs a SEALED extent — re-open on miss.
         self.extent_file(&extent)
             .await
             .map_err(|e| (StatusCode::Internal, e))?
@@ -6808,7 +6808,7 @@ impl ExtentNode {
         let req = CopyExtentReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-        // F099-M: forward to owner shard.
+        // forward to owner shard.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
                 return self
@@ -6820,10 +6820,10 @@ impl ExtentNode {
         let extent = self.get_extent(req.extent_id).await?;
         let mut logical_len = extent.len.load(Ordering::SeqCst);
 
-        // TODO(F044): manager RPC for extent_info not yet implemented
+        // TODO: manager RPC for extent_info not yet implemented
         match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => {
-                // F143: fsync on 0→sealed transition.
+                // fsync on 0→sealed transition.
                 // P0-A: propagate a seal-persist failure (disk now offline)
                 // rather than serving a copy from a non-durably-sealed replica.
                 self.apply_extent_meta_durable(req.extent_id, &extent, &ex)
@@ -6856,9 +6856,9 @@ impl ExtentNode {
             }
             Ok(None) => {
                 let ev = extent.eversion.load(Ordering::SeqCst);
-                // F160: drop the `req.eversion > 0` clause to match
-                // F119-C's invariant. Pre-F160 the check skipped on
-                // `req.eversion == 0`, which the F119-C closure for
+                // drop the `req.eversion > 0` clause to match
+                // the eversion-gate invariant. The check previously skipped on
+                // `req.eversion == 0`, which the eversion-gate closure for
                 // `handle_read_bytes` had already identified as a
                 // silent-skip loophole — `entry.eversion` defaults to 1
                 // on alloc, so any `req.eversion == 0` is by construction
@@ -6878,7 +6878,7 @@ impl ExtentNode {
             }
             Err(_) => {
                 let ev = extent.eversion.load(Ordering::SeqCst);
-                // F160: same tightening as the Ok(None) branch above.
+                // same tightening as the Ok(None) branch above.
                 if req.eversion < ev {
                     return Err((
                         StatusCode::FailedPrecondition,
@@ -6888,7 +6888,7 @@ impl ExtentNode {
             }
         }
 
-        // F148-B: refuse copy on unsealed extents. Production callers
+        // refuse copy on unsealed extents. Production callers
         // (run_recovery_task, handle_re_avali) only target sealed extents
         // by design — the manager dispatches recovery/re-avali after seal.
         // Without this guard, a stray caller hitting an unsealed extent
@@ -6935,7 +6935,7 @@ impl ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        // F-EN-FD-LRU: copy serves a range of a (possibly sealed) extent —
+        // copy serves a range of a (possibly sealed) extent —
         // re-open on miss.
         let cf = self
             .extent_file(&extent)
@@ -6964,7 +6964,7 @@ impl ExtentNode {
     /// over `.dat` ONLY after a full `sealed_length` copy lands + fsyncs. On
     /// "no source held the full length" the live `.dat` is left untouched and we
     /// fail (the manager retries; a permanent over-seal needs operator/recovery
-    /// reconciliation — EC cannot encode a partial extent). No F227 reconcile-
+    /// reconciliation — EC cannot encode a partial extent). No reconcile-
     /// down here: a short consensus means EC convert must NOT proceed.
     async fn peer_copy_full_extent_to_dat(
         &self,
@@ -7103,7 +7103,7 @@ impl ExtentNode {
         let req: ConvertToEcReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F099-M: forward to owner shard.
+        // forward to owner shard.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
                 return self
@@ -7134,17 +7134,17 @@ impl ExtentNode {
             ));
         }
 
-        // F153: serialise concurrent EC conversion dispatches on this
+        // serialise concurrent EC conversion dispatches on this
         // extent. The manager-side `ec_conversion_inflight` set is purely
         // in-memory and is lost on leader failover; without this lock,
         // a deposed leader's mid-conversion + new leader's redispatch
-        // could both pass the F119-D guard (because eversion has not yet
+        // could both pass the idempotency guard (because eversion has not yet
         // bumped) and race on `.ec.dat` writes. The lock entry is created
         // lazily and lives for the lifetime of the node — bounded by the
         // number of extents ever EC-converted on this shard, which is
         // the same bound as the existing `extents` DashMap (~negligible).
-        // F210-D1: now uses the shared `extent_op_lock` helper (same
-        // map, broadened semantic). handle_re_avali and the F210-D1
+        // now uses the shared `extent_op_lock` helper (same
+        // map, broadened semantic). handle_re_avali and the
         // delete try-lock route through the same lock.
         let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;
@@ -7156,7 +7156,7 @@ impl ExtentNode {
         // at the post-EC value, a prior 2PC completed successfully
         // (commit_shard_local is the last step, so eversion bump means
         // all phases finished). Return OK so the manager's
-        // apply_ec_conversion_done converges. F153: this re-check now
+        // apply_ec_conversion_done converges. This re-check now
         // runs UNDER the per-extent lock, so a serialized second
         // dispatch reliably observes the post-bump state.
         let local_eversion = entry.eversion.load(Ordering::SeqCst);
@@ -7190,12 +7190,12 @@ impl ExtentNode {
             return code_resp(CODE_OK, String::new());
         }
 
-        // F194: gate cross-extent EC convert concurrency. Acquired AFTER
-        // the F119-D idempotent-skip check above so an already-converted
+        // gate cross-extent EC convert concurrency. Acquired AFTER
+        // the idempotent-skip check above so an already-converted
         // extent (e.g. a deposed-leader redispatch) returns OK without
         // consuming a permit. Held until the end of the function via
         // RAII (`_ec_permit`); released when the function returns or
-        // unwinds. The per-extent F153 lock above remains the
+        // unwinds. The per-extent lock above remains the
         // correctness gate against same-extent concurrent dispatches;
         // this is the new memory-safety gate against cross-extent fan
         // out. Default parallelism=1 — fully serialise. Env tunable
@@ -7237,7 +7237,7 @@ impl ExtentNode {
         } else {
             // ── Full prepare path: read, encode, distribute ──
 
-            // F119-E: sync sealed_length / eversion from manager.
+            // sync sealed_length / eversion from manager.
             let mgr_info_opt = self
                 .extent_info_from_manager(extent_id)
                 .await
@@ -7259,8 +7259,8 @@ impl ExtentNode {
                     // — proceeding with a NON-DURABLE seal lets a crash
                     // mid-convert restart this extent as OPEN while shards may
                     // already be distributed. Fail-closed: refuse the convert
-                    // (the manager's dispatch loop retries; F153's per-extent
-                    // lock + F119-D idempotency make the redo safe) and mark
+                    // (the manager's dispatch loop retries; the per-extent
+                    // lock + idempotency make the redo safe) and mark
                     // the disk offline (sidecar-persist I/O error).
                     if let Err(e) = self.save_meta(extent_id, &entry).await {
                         self.mark_disk_error_for_extent(extent_id, &e);
@@ -7289,21 +7289,21 @@ impl ExtentNode {
 
             // Peer-copy gap if local file is short.
             let local_len = entry.len.load(Ordering::SeqCst);
-            // F128: detect crash between rename(.ec.dat → .dat) and
+            // detect crash between rename(.ec.dat → .dat) and
             // save_meta in commit_shard_local. .dat is the shard file
             // (len = shard_size), .meta has old eversion, no staging
             // file exists. Fix meta and skip to Phase 2.
             let expected_shard =
                 crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
-            let f128_recovered =
+            let recovered =
                 local_len < sealed_length && local_len == expected_shard && !coordinator_prepared;
-            if f128_recovered {
+            if recovered {
                 tracing::info!(
                     extent_id,
                     local_len,
                     sealed_length,
                     new_eversion,
-                    "F128: detected post-rename/pre-save_meta crash, recovering meta"
+                    "detected post-rename/pre-save_meta crash, recovering meta"
                 );
                 entry
                     .sealed_length
@@ -7318,7 +7318,7 @@ impl ExtentNode {
                 // an EC-converted extent whose post-convert eversion/seal is
                 // not durable would restart with the PRE-convert sidecar
                 // (stale eversion over shard-shaped data = the exact
-                // corruption family F119-C/D guard against).
+                // corruption family the eversion-gate guards against).
                 if let Err(e) = self.save_meta(extent_id, &entry).await {
                     self.mark_disk_error_for_extent(extent_id, &e);
                     return Err((
@@ -7354,7 +7354,7 @@ impl ExtentNode {
                 );
             }
 
-            if !f128_recovered {
+            if !recovered {
                 // ── Phase 1 (prepare): CHUNKED RS-encode + streamed fanout ──
                 //
                 // RS over GF(256) is byte-wise per offset, so each shard is
@@ -7366,7 +7366,7 @@ impl ExtentNode {
                 // extents) where a whole-shard WriteShard would overflow.
                 let per_shard = crate::erasure::shard_size(sealed_length as usize, data_shards);
                 let stripe_bytes = ec_encode_stripe_bytes();
-                // F-EN-FD-LRU: EC converts a SEALED source extent — resolve
+                // EC converts a SEALED source extent — resolve
                 // (re-open on miss) + pin its fd once for the whole stripe scan.
                 let ecf = self
                     .extent_file(&entry)
@@ -7404,7 +7404,7 @@ impl ExtentNode {
                         data_bufs.push(buf);
                     }
 
-                    // F117: offload RS to a blocking thread. Move `data_bufs` in
+                    // offload RS to a blocking thread. Move `data_bufs` in
                     // and hand it back alongside the parity so the fanout below
                     // doesn't re-clone the data stripes.
                     let pshards = parity_shards;
@@ -7431,8 +7431,7 @@ impl ExtentNode {
                     // K..K+M) first, coordinator's own shard 0 LAST so that
                     // coord-staging-full ⇒ every participant durably staged
                     // every stripe (the `coordinator_prepared` skip + 2PC commit
-                    // ordering depend on this). owner_epoch fence as before
-                    // (F211-D Tier 2).
+                    // ordering depend on this). owner_epoch fence as before.
                     let shard_off = s as u64;
                     for i in 1..(data_shards + parity_shards) {
                         let payload: Bytes = if i < data_shards {
@@ -7486,7 +7485,7 @@ impl ExtentNode {
                     stripe_bytes,
                     "EC 2PC phase 1 (prepare) complete on all nodes (chunked)"
                 );
-            } // !f128_recovered
+            } // !recovered
         }
 
         // ── Phase 2 (commit): rename .ec.dat → .dat on all nodes ──
@@ -7499,7 +7498,7 @@ impl ExtentNode {
                 extent_id,
                 sealed_length,
                 eversion: new_eversion,
-                // F211-D Tier 2: see WriteShardReq site above.
+                // Tier 2: see WriteShardReq site above.
                 owner_epoch: req.owner_epoch,
             };
             let sock = parse_addr(target_addr).map_err(|e| {
@@ -7531,7 +7530,7 @@ impl ExtentNode {
         let req = WriteShardReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-        // F099-M: forward to owner shard.
+        // forward to owner shard.
         if !self.owns_extent(req.extent_id) {
             if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
                 return self
@@ -7540,8 +7539,8 @@ impl ExtentNode {
             }
         }
 
-        // F211-D: owner-lock owner_epoch fence. `owner_epoch == 0` keeps the
-        // pre-F211-D no-fence behaviour; non-zero is rejected when the
+        // owner-lock owner_epoch fence. `owner_epoch == 0` keeps the
+        // legacy no-fence behaviour; non-zero is rejected when the
         // local owner_epoch has moved ahead (e.g., a fence on the
         // coord node bumped owner-lock revisions on every extent the
         // coord touched, so a revived ghost coord's WriteShard with the
@@ -7583,7 +7582,7 @@ impl ExtentNode {
             }
         }
 
-        // F211-D: owner-lock owner_epoch fence (see handle_write_shard).
+        // owner-lock owner_epoch fence (see handle_write_shard).
         if req.owner_epoch > 0 {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
                 let last = entry.owner_epoch.load(Ordering::SeqCst);
@@ -7689,12 +7688,12 @@ mod enospc_disk_health_tests {
 }
 
 #[cfg(test)]
-mod f147b_tests {
+mod sealed_append_guard_tests {
     use super::*;
 
-    /// F147-B: handle_append returns CODE_PRECONDITION when sealed_length > 0.
+    /// handle_append returns CODE_PRECONDITION when sealed_length > 0.
     ///
-    /// The F147-B fix inserts a post-truncate seal recheck in handle_append
+    /// The post-truncate seal recheck in handle_append is inserted
     /// after `Self::truncate_to_commit` completes. That recheck fires in the
     /// async window between the truncate await and the subsequent file_pwrite —
     /// a concurrent `apply_extent_meta_durable` may have landed a fresh seal
@@ -7707,8 +7706,8 @@ mod f147b_tests {
     ///       sealed_length > 0 (whatever the code path that fires it),
     ///   (b) the call does NOT panic or produce CODE_OK.
     ///
-    /// The post-truncate recheck (new F147-B code at line ~2434) is validated
-    /// by code inspection: it is structurally identical to the F146 recheck in
+    /// The post-truncate recheck (at line ~2434) is validated
+    /// by code inspection: it is structurally identical to the recheck in
     /// build_append_future (lines 882-898) and fires on the same atomics.
     #[compio::test]
     async fn handle_append_rejects_sealed_extent_with_low_commit() {
@@ -7747,7 +7746,7 @@ mod f147b_tests {
         // Now attempt an append with commit=50 (< current len=100): truncation
         // branch is entered. The early sealed check (step 3 of handle_append)
         // fires before truncation starts and returns CODE_PRECONDITION, which is
-        // the same CODE_PRECONDITION the post-truncate F147-B recheck would
+        // the same CODE_PRECONDITION the post-truncate recheck would
         // return if the seal had arrived DURING the truncate await instead.
         let stale_req = AppendReq {
             extent_id: 9001,
@@ -8030,10 +8029,10 @@ mod f147b_tests {
 }
 
 #[cfg(test)]
-mod f147c_tests {
+mod recovery_eversion_guard_tests {
     use super::*;
 
-    /// F147-C: run_recovery_task refuses when the local extent's eversion
+    /// run_recovery_task refuses when the local extent's eversion
     /// already exceeds the manager's recovery snapshot.
     ///
     /// The full `run_recovery_task` path requires a live manager (for
@@ -8053,11 +8052,11 @@ mod f147c_tests {
     ///       guarantee that replaces the old unconditional store).
     ///   (b) fetch_max on avali (AtomicU32) behaves identically.
     ///
-    /// Pattern matches F147-B's test: the post-fetch verify cannot be injected
-    /// in a single-threaded compio test either, so both tests validate the
-    /// observable guard semantics rather than the concurrent injection.
+    /// Pattern matches the post-truncate recheck test: the post-fetch verify
+    /// cannot be injected in a single-threaded compio test either, so both tests
+    /// validate the observable guard semantics rather than the concurrent injection.
     #[compio::test]
-    async fn f147_recovery_refuses_when_local_eversion_advanced() {
+    async fn recovery_refuses_when_local_eversion_advanced() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
         let node = ExtentNode::new(config).await.expect("ExtentNode::new");
@@ -8133,10 +8132,10 @@ mod f147c_tests {
 }
 
 #[cfg(test)]
-mod f148_copy_extent_tests {
+mod copy_extent_tests {
     use super::*;
 
-    /// F148-B: handle_copy_extent refuses with CODE_PRECONDITION on
+    /// handle_copy_extent refuses with CODE_PRECONDITION on
     /// unsealed extents.
     ///
     /// Production callers (run_recovery_task, handle_re_avali) only target
@@ -8152,7 +8151,7 @@ mod f148_copy_extent_tests {
     /// `extent_info_from_manager` returns `Ok(None)` in unit tests (no
     /// manager configured) so the manager-fetch branch falls into `Ok(None)`,
     /// no apply_extent_meta_durable runs, and `entry.sealed_length` stays
-    /// at its alloc-time value of 0. The F148-B post-fetch check fires.
+    /// at its alloc-time value of 0. The post-fetch check fires.
     #[compio::test]
     async fn copy_extent_unsealed_refused_with_precondition() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8214,7 +8213,7 @@ mod f148_copy_extent_tests {
         );
     }
 
-    /// F148-B: handle_copy_extent succeeds on a sealed extent.
+    /// handle_copy_extent succeeds on a sealed extent.
     ///
     /// Sanity check that the guard does not regress the production path.
     /// Seal the extent locally (sealed_length > 0) and assert copy_extent
@@ -8268,10 +8267,10 @@ mod f148_copy_extent_tests {
 }
 
 #[cfg(test)]
-mod f153_ec_lock_tests {
+mod ec_lock_tests {
     use super::*;
 
-    /// F153: per-extent EC conversion lock serialises concurrent dispatches.
+    /// per-extent EC conversion lock serialises concurrent dispatches.
     ///
     /// Validates the lock plumbing: requesting the same extent's lock twice
     /// returns the SAME `Rc<Mutex>`, so the second await blocks until the
@@ -8334,10 +8333,10 @@ mod f153_ec_lock_tests {
 }
 
 #[cfg(test)]
-mod f157_meta_crc_tests {
+mod meta_crc_tests {
     use super::*;
 
-    /// F157: round-trip through V1 meta save/parse with CRC validation.
+    /// round-trip through V1 meta save/parse with CRC validation.
     #[test]
     fn v1_round_trip() {
         // Build a valid V1 buffer manually to test parse_meta in isolation
@@ -8361,7 +8360,7 @@ mod f157_meta_crc_tests {
         assert_eq!(parsed.avali, 1);
     }
 
-    /// F157: V0 legacy 40-byte buffer must parse (back-compat).
+    /// V0 legacy 40-byte buffer must parse (back-compat).
     #[test]
     fn v0_legacy_compat() {
         let extent_id = 0x1234_5678u64;
@@ -8381,7 +8380,7 @@ mod f157_meta_crc_tests {
         assert_eq!(parsed.avali, 1);
     }
 
-    /// F157: a V1 buffer with a flipped payload byte must be rejected (CRC mismatch).
+    /// a V1 buffer with a flipped payload byte must be rejected (CRC mismatch).
     #[test]
     fn v1_bit_rot_in_payload_rejected() {
         let extent_id = 100u64;
@@ -8403,7 +8402,7 @@ mod f157_meta_crc_tests {
         );
     }
 
-    /// F157: a V1 buffer with a flipped CRC trailer byte must be rejected.
+    /// a V1 buffer with a flipped CRC trailer byte must be rejected.
     #[test]
     fn v1_bit_rot_in_crc_trailer_rejected() {
         let extent_id = 200u64;
@@ -8425,7 +8424,7 @@ mod f157_meta_crc_tests {
         );
     }
 
-    /// F157: extent_id mismatch on V1 meta returns None (existing behaviour preserved).
+    /// extent_id mismatch on V1 meta returns None (existing behaviour preserved).
     #[test]
     fn v1_extent_id_mismatch_rejected() {
         let mut buf = [0u8; ExtentNode::META_SIZE_V1];
@@ -8443,7 +8442,7 @@ mod f157_meta_crc_tests {
         );
     }
 
-    /// F157: unknown magic byte (not V0 or V1) returns None.
+    /// unknown magic byte (not V0 or V1) returns None.
     #[test]
     fn unknown_magic_rejected() {
         let mut buf = [0u8; ExtentNode::META_SIZE_V1];
@@ -8547,13 +8546,13 @@ mod f157_meta_crc_tests {
 }
 
 #[cfg(test)]
-mod f160_copy_extent_eversion_tests {
+mod copy_extent_eversion_tests {
     use super::*;
 
-    /// F160: handle_copy_extent (the Ok(None) branch — no manager configured)
+    /// handle_copy_extent (the Ok(None) branch — no manager configured)
     /// must reject `req.eversion = 0` when local eversion has advanced past 0.
-    /// Pre-F160 the check skipped on req.eversion == 0 due to the legacy
-    /// `req.eversion > 0 &&` clause that F119-C had removed in
+    /// The check previously skipped on req.eversion == 0 due to the legacy
+    /// `req.eversion > 0 &&` clause that the eversion-gate fix had removed in
     /// handle_read_bytes / build_read_future but missed here.
     ///
     /// Production callers (run_recovery_task, handle_re_avali) fetch
@@ -8568,8 +8567,8 @@ mod f160_copy_extent_eversion_tests {
         let node = ExtentNode::new(config).await.expect("ExtentNode::new");
 
         // Allocate extent 9001 then seal it (so handle_copy_extent's
-        // F148-B unsealed-refusal doesn't fire first — we want to reach
-        // the F160 eversion check).
+        // unsealed-refusal doesn't fire first — we want to reach
+        // the eversion check).
         let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 9001 });
         node.handle_alloc_extent(alloc_payload)
             .await
@@ -8604,7 +8603,7 @@ mod f160_copy_extent_eversion_tests {
         let r = node.handle_copy_extent(copy_req.encode()).await;
         assert!(
             r.is_err(),
-            "F160: copy_extent with eversion=0 must Err when local eversion=7"
+            "copy_extent with eversion=0 must Err when local eversion=7"
         );
         let (code, msg) = r.unwrap_err();
         assert_eq!(code, StatusCode::FailedPrecondition);
@@ -8617,8 +8616,8 @@ mod f160_copy_extent_eversion_tests {
 }
 
 #[cfg(test)]
-mod f194_concurrency_gate_tests {
-    //! F194 (renamed to ConcurrencyController in F196 D-r7): cross-extent
+mod concurrency_gate_tests {
+    //! (renamed to ConcurrencyController): cross-extent
     //! concurrency cap for EC convert and recovery. These tests target
     //! `ConcurrencyController` directly — full end-to-end coverage of
     //! `handle_convert_to_ec` / `run_recovery_task` with concurrent
@@ -8671,7 +8670,7 @@ mod f194_concurrency_gate_tests {
         assert_eq!(ctrl.recovery_inflight_count(), 2);
     }
 
-    /// F196 D-r7: the two counters are independent. Saturating
+    /// D-r7: the two counters are independent. Saturating
     /// ec_convert MUST NOT block recovery and vice versa.
     #[compio::test]
     async fn ec_convert_and_recovery_counters_are_independent() {
@@ -8719,8 +8718,8 @@ mod f194_concurrency_gate_tests {
         assert_eq!(ctrl.recovery_max, 1, "recovery: 0 must clamp to 1");
     }
 
-    /// F195: clamp test against the builder methods (replaces the
-    /// removed F194 env-parser smoke test). Process-global env mutation
+    /// clamp test against the builder methods (replaces the
+    /// removed env-parser smoke test). Process-global env mutation
     /// removed — no more hostility to parallel test runs.
     #[test]
     fn config_builder_clamps_parallelism() {
@@ -8747,13 +8746,14 @@ mod f194_concurrency_gate_tests {
     }
 }
 
-/// F211-D: shard wire-fence on `WriteShardReq` / `CommitEcShardReq`.
+/// shard wire-fence on `WriteShardReq` / `CommitEcShardReq`.
 /// Round-trip the encoded bytes through `decode` and assert the
 /// `owner_epoch` field survives so future callers cannot accidentally
 /// drop it. The handler-level fence behaviour is covered by the
-/// integration tests in `crates/manager/tests/f211_node_lifecycle.rs`.
+/// integration tests in the manager crate's node-lifecycle suite
+/// (`crates/manager/tests/`).
 #[cfg(test)]
-mod f211d_wire_fence_tests {
+mod wire_fence_tests {
     use crate::extent_rpc::{CommitEcShardReq, WriteShardReq};
     use bytes::Bytes;
 
@@ -8813,7 +8813,7 @@ mod f211d_wire_fence_tests {
 #[cfg(test)]
 mod p0_fsync_highwater_tests {
     //! P0 #1 (coco arch finding, 2026-05-31) — deterministic MECHANISM
-    //! reproduction of the F178 fsync-coalescer high-water accounting bug.
+    //! reproduction of the fsync-coalescer high-water accounting bug.
     //!
     //! THE BUG: `build_append_future` (and `handle_append`) do
     //! `pending_fsync.store(total_end)` — a PLAIN store, AFTER the pwrite
@@ -8868,7 +8868,7 @@ mod p0_fsync_highwater_tests {
         let node = ExtentNode::new(config).await.expect("ExtentNode::new");
         let entry = alloc_entry(&node, 5001).await;
 
-        // ── Model F2 = [100,150) completing FIRST (higher offset). ──
+        // ── Write B = [100,150) completing FIRST (higher offset). ──
         // Write the real bytes, then advance the high-water + register, exactly
         // as build_append_future does (write .await THEN pending_fsync.store).
         pwrite(&entry, vec![0xBBu8; 50], 100).await;
@@ -8883,7 +8883,7 @@ mod p0_fsync_highwater_tests {
             "the [100,150) fsync advanced last_synced to 150"
         );
 
-        // ── Model F1 = [0,100) completing LATE (lower offset). ──
+        // ── Write A = [0,100) completing LATE (lower offset). ──
         // Its bytes are written to the page cache NOW — i.e. AFTER the fsync
         // above already ran. In production a power-loss here loses [0,100).
         pwrite(&entry, vec![0xAAu8; 100], 0).await;
@@ -9031,7 +9031,7 @@ mod ec5_commit_window_tests {
         let entry = node.extents.get(&eid).expect("extent loaded").clone();
         // eversion bumped to the marker's new_ev (was the stale 1).
         assert_eq!(entry.eversion.load(SeqCst), new_ev, "eversion completed to marker's");
-        // sealed_length kept = original (F119-E), sealed flag set.
+        // sealed_length kept = original, sealed flag set.
         assert_eq!(entry.sealed_length.load(SeqCst), orig as u64);
         assert!(entry.sealed.load(SeqCst), "EC-committed extent is sealed");
         assert_eq!(entry.avali.load(SeqCst), 1);
@@ -9161,7 +9161,7 @@ mod ec3_fence_handover_tests {
     }
 }
 
-/// F-EN-FD-LRU regression tests: the sealed-extent fd cache evicts the
+/// regression tests: the sealed-extent fd cache evicts the
 /// least-recently-used sealed fd, re-opens on access, and never touches
 /// pending-fsync (durability-critical) or open/active extents.
 #[cfg(test)]
@@ -9303,7 +9303,7 @@ mod fd_lru_tests {
 
 #[cfg(test)]
 mod fd_lru_chaos_tests {
-    //! F-EN-FD-LRU chaos/stress — closes the deferred acceptance item ("a live EN
+    //! chaos/stress — closes the deferred acceptance item ("a live EN
     //! with >cap extents serving without EMFILE / torn read on eviction"). The
     //! other `fd_lru_tests` drive `FdLru` in isolation with a hand-set cap; this
     //! drives the PRODUCTION path end to end: write N (>> cap) sealed extents to
@@ -9397,7 +9397,7 @@ mod fd_lru_chaos_tests {
 
         // ── Phase 2: RESTART — reload the same dir. load_extents reads N sealed
         //    .meta, marks each sealed, and DROPS its fd (startup fd peak is
-        //    ~one-at-a-time, NOT O(all extents) — the F-EN-FD-LRU startup win).
+        //    ~one-at-a-time, NOT O(all extents) — the fd-cache startup win).
         let node = Rc::new(
             ExtentNode::new(ExtentNodeConfig::new(path.clone(), 1))
                 .await

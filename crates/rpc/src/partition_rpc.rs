@@ -32,16 +32,16 @@ pub const MSG_DELETE: u8 = 0x42;
 pub const MSG_HEAD: u8 = 0x43;
 pub const MSG_RANGE: u8 = 0x44;
 pub const MSG_SPLIT_PART: u8 = 0x45;
-// MSG_STREAM_PUT (0x46) REMOVED 2026-06-11: zero callers since F186 made
-// stripe-writes client-side, and its PS handler bypassed BOTH the inline
+// MSG_STREAM_PUT (0x46) REMOVED 2026-06-11: zero callers once
+// stripe-writes moved client-side, and its PS handler bypassed BOTH the inline
 // value cap AND the BUG-LEASE-2 fence check (an unfenced unbounded-write
-// backdoor). 0x46 stays RESERVED (F129-constants pattern) to prevent
+// backdoor). 0x46 stays RESERVED (reserved-constants pattern) to prevent
 // accidental re-use against in-flight old binaries.
 //   pub const MSG_STREAM_PUT: u8 = 0x46;  // RESERVED, removed
 pub const MSG_MAINTENANCE: u8 = 0x47;
 pub const MSG_GET_DISCARDS: u8 = 0x48;
 
-/// F-ADMIN-OP-AUTH (PS slice): the cluster-MUTATING PS ops gated on the admin
+/// (PS slice): the cluster-MUTATING PS ops gated on the admin
 /// token — split and every maintenance op (compact / auto-gc / force-gc /
 /// flush, all under `MSG_MAINTENANCE`). Token carried as the SAME payload prefix
 /// the manager slice uses (`manager_rpc::{prefix,strip}_admin_token`). The data
@@ -54,7 +54,7 @@ pub fn is_admin_ps_msg(msg_type: u8) -> bool {
     matches!(msg_type, MSG_SPLIT_PART | MSG_MAINTENANCE)
 }
 
-// F129/F186 — server-side multipart upload was REMOVED in F186.
+// server-side multipart upload was REMOVED.
 // Wire constants 0x49-0x4C remain RESERVED to prevent accidental re-use
 // while old binaries with handlers may still be in flight in production
 // rolling deploys. Stripe-write is now pure client-side (Ceph
@@ -62,15 +62,15 @@ pub fn is_admin_ps_msg(msg_type: u8) -> bool {
 // 0xff-prefixed key namespace, and the user key holds a 29-byte Meta
 // blob. See `crates/client/src/lib.rs::PutStreamHandle` + `GetStream`.
 //
-//   pub const MSG_PUT_BEGIN:  u8 = 0x49;  // RESERVED, was F129
-//   pub const MSG_PUT_CHUNK:  u8 = 0x4A;  // RESERVED, was F129
-//   pub const MSG_PUT_COMMIT: u8 = 0x4B;  // RESERVED, was F129
-//   pub const MSG_PUT_ABORT:  u8 = 0x4C;  // RESERVED, was F129
+//   pub const MSG_PUT_BEGIN:  u8 = 0x49;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_CHUNK:  u8 = 0x4A;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_COMMIT: u8 = 0x4B;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_ABORT:  u8 = 0x4C;  // RESERVED (was multipart upload)
 
-// F183: partition merge — sent to the SURVIVOR's PS.
+// partition merge — sent to the SURVIVOR's PS.
 pub const MSG_MERGE_PART: u8 = 0x4D;
 
-// F185: PrepareMerge-style freeze. CLI/manager sends to BOTH the survivor and
+// PrepareMerge-style freeze. CLI/manager sends to BOTH the survivor and
 // victim's PS BEFORE capturing commit_length so writes that would otherwise
 // fall in the FLUSH→manager.commit window are halted at the source.
 //
@@ -85,19 +85,19 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 
 // 0x4F retired with the vp_table_refs removal (was MSG_PULL_VP_REFS,
-// F210-C4 manager→PS vp_refs pull). Extent retention is now driven by
+// manager→PS vp_refs pull). Extent retention is now driven by
 // `refs` (stream membership) alone — see manager `extent_can_delete`.
 
-// F216 zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
+// zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
 // is value-separable for recv-into-registered-dest: a CRC-less frame whose
 // payload is `[bulk meta: code(1)+value_len(4)+reserved(4)][raw value]` (see
 // autumn_rpc::client::ZC_META_LEN; the reserved field held a value crc32c
-// before F219 removed it). The client uses RpcClient::call_into_dest to
+// before it was removed). The client uses RpcClient::call_into_dest to
 // land the value straight in its registered buffer (sglang page). Generic
 // MSG_GET keeps the rkyv GetResp form.
 pub const MSG_GET_BULK: u8 = 0x50;
 
-// F216-E zero-copy PUT (client -> PS write hop). Same semantics as MSG_PUT but
+// zero-copy PUT (client -> PS write hop). Same semantics as MSG_PUT but
 // value-separable so the client sends the value as its OWN iovec straight from
 // the (registered) sglang source pool — no `value.to_vec()`/clone/rkyv copy on
 // the client, and the PS slices the value zero-copy out of the frame (vs an
@@ -137,7 +137,7 @@ pub const MSG_BATCH_PUT: u8 = 0x53;
 /// per-key status, not a per-batch error.
 pub const MSG_BATCH_GET: u8 = 0x54;
 
-/// F259 — redirect GET. Same request shape as MSG_GET (`GetReq`). For a
+/// redirect GET. Same request shape as MSG_GET (`GetReq`). For a
 /// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
 /// DESCRIPTOR (extent + the value's exact byte range inside the extent +
 /// replica addresses + eversion) instead of proxying the bytes; the
@@ -150,7 +150,7 @@ pub const MSG_BATCH_GET: u8 = 0x54;
 /// MSG_GET / MSG_GET_BULK proxy path, which re-resolves through the PS.
 pub const MSG_GET_REDIRECT: u8 = 0x56;
 
-/// F-AUTHZ-1: first-frame connection authentication. The client sends a signed
+/// first-frame connection authentication. The client sends a signed
 /// Ed25519 capability token (see `crate::cap_token`); the PS verifies it once
 /// against its cached public keys and binds the connection's `{allowed_prefixes,
 /// exp}` principal. Subsequent per-request enforcement is a byte `starts_with`
@@ -159,14 +159,14 @@ pub const MSG_GET_REDIRECT: u8 = 0x56;
 /// no `part_id` — it's connection-level, handled before the routing check.
 pub const MSG_AUTH_HELLO: u8 = 0x55;
 
-/// F-FENCE-DRAIN: manager → PS "seal + roll these stream tails". The recovery
+/// manager → PS "seal + roll these stream tails". The recovery
 /// sweep sends this when it finds an OPEN tail extent (`!sealed`) with a replica
 /// on a Fenced node — recovery only rebuilds SEALED extents, so an idle
 /// partition's open tail on a fenced node would otherwise never drain and block
 /// `remove` forever. The PS routes each `(stream_id, tail_extent_id)` into the
 /// owning partition's writer thread and calls the existing
 /// `StreamClient::seal_and_roll_tail` (WAL self-heal already uses it): the tail
-/// seals via the manager's F227 lenient probe (dead replicas don't block; all
+/// seals via the manager's lenient probe (dead replicas don't block; all
 /// replicas unreachable → the seal Precondition surfaces), a fresh tail rolls on
 /// healthy nodes (Part A placement exclusion keeps it off fenced nodes), and the
 /// next recovery tick rebuilds the now-sealed extent's fenced slots. Idempotent:
@@ -188,7 +188,7 @@ pub struct AuthHelloResp {
     pub message: String,
 }
 
-/// F259 response for `MSG_GET_REDIRECT` (rkyv).
+/// response for `MSG_GET_REDIRECT` (rkyv).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetRedirectResp {
     pub code: u8,
@@ -210,7 +210,7 @@ pub struct GetRedirectResp {
     pub replica_addrs: Vec<String>,
 }
 
-/// F-REDIRECT-BATCH: resolve MANY redirect descriptors in ONE PS call — the
+/// resolve MANY redirect descriptors in ONE PS call — the
 /// batch mirror of `MSG_GET_REDIRECT`. A large-file read (model load / dataset
 /// stream) redirects one extent per `MSG_GET_REDIRECT`, funnelling ~630 PS
 /// round-trips through the single owning partition's task; this resolves them
@@ -227,7 +227,7 @@ pub struct GetRedirectItem {
     pub length: u32,
 }
 
-/// F-REDIRECT-BATCH request. All items share `part_id` + `region_epoch` (the
+/// request. All items share `part_id` + `region_epoch` (the
 /// client groups items by owning partition and sends one frame per partition).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetRedirectManyReq {
@@ -236,7 +236,7 @@ pub struct GetRedirectManyReq {
     pub items: Vec<GetRedirectItem>,
 }
 
-/// F-REDIRECT-BATCH response: one `GetRedirectResp` per request item, in input
+/// response: one `GetRedirectResp` per request item, in input
 /// order (`results.len() == req.items.len()`).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetRedirectManyResp {
@@ -302,7 +302,7 @@ pub struct BatchGetResp {
     pub items: Vec<BatchGetItem>,
 }
 
-/// F250 diagnostic: trace where a user_key's MVCC entries live across
+/// diagnostic: trace where a user_key's MVCC entries live across
 /// memtable / imm / sst — used by the f250 reproducer to localise
 /// data-loss bugs without guessing.
 pub const MSG_DIAG_TRACE_KEY: u8 = 0x52;
@@ -337,7 +337,7 @@ pub struct DiagTraceKeyResp {
     pub sst_last_seqs: Vec<u64>,
 }
 
-/// F-GC-FLOOR-OBS: per-partition GC replay-floor + per-SST vp_head snapshot.
+/// per-partition GC replay-floor + per-SST vp_head snapshot.
 /// Lets `autumn-op info --part P` show WHY a `forcegc P E` on a given extent
 /// would be protected (extent E sits at/before the recovery replay floor →
 /// correct protection, not a bug) without grepping the PS log.
@@ -449,18 +449,18 @@ pub const CODE_NOT_FOUND: u8 = 1;
 pub const CODE_INVALID_ARGUMENT: u8 = 2;
 pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
-/// F129/F186: regular `Put` value exceeds the
+/// regular `Put` value exceeds the
 /// `AUTUMN_PS_MAX_INLINE_BYTES` cap. Caller should split the value into
 /// chunks and stripe-write via `ClusterClient::put_stream_begin`
 /// (client-side striperados — chunks are normal Puts to a
 /// reserved-namespace key + a 29-byte Meta blob at the user key).
 pub const CODE_VALUE_TOO_LARGE: u8 = 5;
 //
-// CODE 6 was `CODE_UPLOAD_NOT_FOUND` for the F129 server-side
-// multipart upload session. Removed in F186 (no server-side sessions
+// CODE 6 was `CODE_UPLOAD_NOT_FOUND` for the server-side
+// multipart upload session. Removed (no server-side sessions
 // any more). Code 6 is RESERVED — don't reuse for at least one major
 // version to avoid mis-decoding by stale clients.
-/// F185: Put/Delete/StreamPut rejected because the partition is in the
+/// Put/Delete/StreamPut rejected because the partition is in the
 /// `frozen_for_merge` window. Caller should refresh routing and retry —
 /// the merged topology is committed on the manager and the survivor will
 /// reopen with the wider rg on its next region_sync tick.
@@ -493,7 +493,7 @@ pub struct PutReq {
     pub part_id: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
-    /// F178 follow-up: the `must_sync` field was removed. Every Put is
+    /// follow-up: the `must_sync` field was removed. Every Put is
     /// now durable via the extent-node fsync coalescer (RocksDB-style
     /// group commit). The PS no longer threads any sync flag through.
     pub expires_at: u64,
@@ -619,7 +619,7 @@ pub struct RangeResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct SplitPartReq {
     pub part_id: u64,
-    /// F-SPLIT-AT-KEY (design doc D4): operator/controller-specified split
+    /// (design doc D4): operator/controller-specified split
     /// point. When `Some(key)`, the PS validates the key lies STRICTLY inside
     /// the partition's authoritative `(start_key, end_key)` interval and uses
     /// it verbatim as `mid_key`, SKIPPING both median selection AND the
@@ -638,7 +638,7 @@ pub struct SplitPartResp {
     pub message: String,
 }
 
-// F183 — partition merge. Sent to the SURVIVOR's PS; both partitions
+// partition merge. Sent to the SURVIVOR's PS; both partitions
 // must currently be served by that PS (cross-PS merge unsupported).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MergePartReq {
@@ -652,7 +652,7 @@ pub struct MergePartResp {
     pub message: String,
 }
 
-// F185 — PrepareMerge-style freeze RPC. The CLI sends this to each
+// PrepareMerge-style freeze RPC. The CLI sends this to each
 // participating partition (survivor + victim) BEFORE capturing
 // commit_length so the merge txn cannot lose writes that would otherwise
 // race the FLUSH→commit window.
@@ -671,7 +671,7 @@ pub struct MergeFreezeResp {
     pub message: String,
 }
 
-// F-FENCE-DRAIN — manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).
+// manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct RollTailsReq {
     pub part_id: u64,
@@ -692,8 +692,8 @@ pub struct RollTailsResp {
 
 // StreamPutReq REMOVED 2026-06-11 with MSG_STREAM_PUT (see the reserved
 // constant note near the msg_type list).
-// F129 PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
-// F186. Stripe-write is now pure client-side (Ceph striperados pattern):
+// PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
+// Stripe-write is now pure client-side (Ceph striperados pattern):
 // `ClusterClient::put_stream_begin` returns a `PutStreamHandle` that
 // writes each chunk via plain `MSG_PUT` to a reserved-namespace key,
 // then writes a 29-byte Meta blob to the user key as the atomic
@@ -701,7 +701,7 @@ pub struct RollTailsResp {
 
 /// Maintenance operations.
 ///
-/// **F201 wire change (backward-incompatible)**: added four optional
+/// **Wire change (backward-incompatible)**: added four optional
 /// fields to carry auto-GC filter parameters (`gc_ratio`,
 /// `gc_max_size`, `gc_stream_debt`, `gc_empty_only`). Old binaries
 /// that still encode the 3-field shape will fail to decode against
@@ -713,18 +713,18 @@ pub struct MaintenanceReq {
     /// 0 = compact, 1 = auto_gc, 2 = force_gc, 3 = flush
     pub op: u8,
     pub extent_ids: Vec<u64>,
-    /// F201: filter — discard ratio threshold (0.0..=1.0). `None` → 0.4
+    /// filter — discard ratio threshold (0.0..=1.0). `None` → 0.4
     /// (`GC_DISCARD_RATIO`). Used only when `op == MAINTENANCE_AUTO_GC`.
     pub gc_ratio: Option<f64>,
-    /// F201: filter — only consider sealed extents whose `sealed_length`
+    /// filter — only consider sealed extents whose `sealed_length`
     /// is at most this many bytes. Combined with a lower `gc_ratio`
     /// lets the caller say "punch small extents at even 10% dead".
     pub gc_max_size: Option<u64>,
-    /// F201: stream-level dead-byte high-water hint. When the partition's
+    /// stream-level dead-byte high-water hint. When the partition's
     /// total reclaimable bytes exceed this, the per-extent ratio is
     /// halved for this dispatch.
     pub gc_stream_debt: Option<u64>,
-    /// F201: only pick `sealed_length == 0` non-tail extents (cheapest
+    /// only pick `sealed_length == 0` non-tail extents (cheapest
     /// possible GC — no rewrite, just punch_holes). Overrides
     /// `gc_ratio` / `gc_max_size` when true.
     pub gc_empty_only: bool,
@@ -775,7 +775,7 @@ pub struct TableLocations {
     pub locs: Vec<SstLocation>,
     pub vp_extent_id: u64,
     pub vp_offset: u64,
-    /// F243-merge: source partition's log_stream extent count at flush
+    /// merge: source partition's log_stream extent count at flush
     /// time. Used post-merge by `recover_partition` to derive each
     /// source's region (positions [cumsum, cumsum + count)) in the
     /// spliced log_stream, so replay dedup uses each source's OWN

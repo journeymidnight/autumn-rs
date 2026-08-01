@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# crosshost_chaos.sh — CROSS-HOST chaos for tcp|ucx (F272).
+# crosshost_chaos.sh — CROSS-HOST chaos for tcp|ucx.
 #
 # Topology (real network, two hosts — addresses come from the env below):
 #   LOCAL  ($AUTUMN_LOCAL_IP):  etcd + manager:9001 + EN x2 (21001/21002)
@@ -14,7 +14,7 @@
 #       remote PS2; write liveness on both keyspace halves
 #   X3: kill -9 REMOTE PS2 (ssh) → cross-host FAILBACK to local PS1
 #   X4: kill -9 the manager + exact-cmdline respawn with remote
-#       components live → routing self-heals (F265/F267 over real RTT)
+#       components live → routing self-heals (over real RTT)
 # Afterwards every ACKed write is verified byte-exact.
 #
 # Usage:
@@ -85,7 +85,7 @@ CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T")
 CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T")
 
 # Readiness gates — NEVER rely on fixed sleeps: under ucx the manager's
-# listener can spend ~90s in the F264 TIME_WAIT bind retry (cross-host
+# listener can spend ~90s in the TIME_WAIT bind retry (cross-host
 # TIME_WAIT from a previous round on the same [::14]:9001). The first
 # ucx round was stillborn end-to-end because every stage marched past a
 # not-yet-listening manager (format/bootstrap/seeds all failed, ENs and
@@ -116,7 +116,7 @@ say "formatting + starting ENs (2 local + 1 remote)"
 REM "cd $RROOT && timeout 20 ./target/release/autumn-op --manager '$MGR' --transport $T format $RDATA/d1 >/dev/null 2>&1 && echo fmt-ok || echo fmt-FAIL" | grep -q fmt-ok || fail "format remote d1"
 
 start_local_en() { # port datadir logname
-    # F-EN-DYNSHARD M1c: format is identity-only now — the EN self-registers
+    # M1c: format is identity-only now — the EN self-registers
     # its live location via --advertise (required with --manager).
     setsid nohup "$ROOT/target/release/autumn-extent-node" \
         --port "$1" --data "$2" --manager "$MGR" --listen "$LIP" \

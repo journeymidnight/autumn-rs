@@ -34,18 +34,18 @@ use futures::{SinkExt, StreamExt};
 use crate::error::RpcError;
 use crate::frame::{Frame, FrameDecoder};
 
-// ── F216 zero-copy GET (recv-into-pooled) ────────────────────────────────────
+// ── zero-copy GET (recv-into-pooled) ─────────────────────────────────────────
 //
 // `call_into_pooled` recvs a value-response's raw value tail straight into a
 // read_loop-owned RegPool `PooledBuf` (registered, for UCX) instead of a fresh
-// `Vec`. Wire v28 (F-WIRE-CRC-UNIFY) uses ONE frame shape for everything:
+// `Vec`. Wire v28 uses ONE frame shape for everything:
 //
 //   [header 10][ctrl_len 4][ctrl…][crc32c 4][value…]
 //
 // For the bulk read response ctrl = `[code:1][message…]`; the crc covers
 // header+ctrl (so a flipped code/req_id fails loud) while the value tail is
 // raw — its integrity is the transport's (UCX NIC ICRC / TCP kernel segment
-// checksum; F219 measured the per-value crc at ~20% of a core @ 8 MiB).
+// checksum; the per-value crc was measured at ~20% of a core @ 8 MiB).
 //
 // The recv-into-CALLER-dest sibling (`call_into_dest`, raw `*mut u8` + optional
 // explicit `RegisteredMem`) was REMOVED: its cancel-safety contract (dest must
@@ -205,7 +205,7 @@ impl RpcClient {
         // the flag and short-circuits with `ConnectionClosed`. Without
         // `closed`, a stale `Rc<RpcClient>` left in a pool would let new
         // submits insert pending entries that nobody dispatches — the
-        // caller's `rx.await` then hangs forever (F121 root cause).
+        // caller's `rx.await` then hangs forever (the original hang's root cause).
         let pending_for_writer = pending.clone();
         let closed_for_writer = closed.clone();
         spawn(async move {
@@ -222,7 +222,7 @@ impl RpcClient {
             if let Err(e) = read_loop(reader, pending_for_reader.clone(), peer_addr).await {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
-            // F121: set closed BEFORE clearing pending so subsequent
+            // set closed BEFORE clearing pending so subsequent
             // `send_*` short-circuits and never inserts a fresh pending
             // entry that has no read_loop alive to dispatch it.
             closed_for_reader.set(true);
@@ -258,7 +258,7 @@ impl RpcClient {
         Ok(resp.payload)
     }
 
-    /// F216-E cancel-safe zero-copy read: send a request whose value response
+    /// cancel-safe zero-copy read: send a request whose value response
     /// the READ_LOOP recvs straight into a freshly-acquired `PooledBuf` (which
     /// the read_loop owns), then hands back here. The caller never owns the
     /// in-flight buffer — so a cancelled/timed-out caller can NOT leave the
@@ -289,7 +289,7 @@ impl RpcClient {
     /// for a slot when the submit channel is full — natural back-pressure).
     /// The caller awaits the receiver to get the response frame.
     pub async fn send_frame(&self, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
-        // F121: short-circuit if the reader/writer task has already
+        // short-circuit if the reader/writer task has already
         // exited. The check + pending.insert below run in one sync block
         // (single-threaded compio, no awaits), so a concurrent close that
         // races us either flips `closed` first → we return here, or runs
@@ -353,21 +353,21 @@ impl RpcClient {
         msg_type: u8,
         payload_parts: Vec<Bytes>,
     ) -> Result<oneshot::Receiver<Frame>, RpcError> {
-        // F121: see send_frame for the rationale.
+        // see send_frame for the rationale.
         if self.closed.get() {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
         let ctrl_len: usize = payload_parts.iter().map(|p| p.len()).sum();
         // Vectored ctrl-only frame: [head(hdr+ctrl_len)][parts…][crc]. The crc
-        // covers head + parts (F-WIRE-CRC-UNIFY: header always protected).
+        // covers head + parts (header always protected).
         let head = crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, 0);
 
         let (tx, rx) = oneshot::channel();
         // Insert BEFORE submit — see register_and_submit for the rationale.
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
 
-        // F163: compute CRC32C over head + the multi-segment ctrl BEFORE
+        // compute CRC32C over head + the multi-segment ctrl BEFORE
         // moving the parts into bufs (compute_ctrl_crc takes &[Bytes]).
         let crc = crate::frame::compute_ctrl_crc(&head, &payload_parts);
         let mut bufs: Vec<Bytes> = Vec::with_capacity(2 + payload_parts.len());
@@ -436,7 +436,7 @@ impl RpcClient {
     /// Returns Ok once the frame has been queued for the writer_task
     /// (under back-pressure from the bounded submit channel).
     pub async fn send_oneshot(&self, msg_type: u8, payload: Bytes) -> Result<(), RpcError> {
-        // F121: short-circuit on a dead client; the submit channel may
+        // short-circuit on a dead client; the submit channel may
         // still drain into a writer_task that has nowhere to read replies.
         if self.closed.get() {
             return Err(RpcError::ConnectionClosed);
@@ -518,7 +518,7 @@ async fn writer_task(
 ) {
     while let Some(msg) = submit_rx.next().await {
         let req_id = msg.req_id();
-        // F099-I-fix instrumentation: capture iov count + total bytes
+        // fix instrumentation: capture iov count + total bytes
         // before the syscall so the EINVAL path can attribute the error
         // to the exact shape of the Vectored message. Negligible cost
         // (2 integer ops per msg; the logging formatter only runs on the
@@ -542,11 +542,11 @@ async fn writer_task(
         };
 
         if let Err(e) = result {
-            // F099-I-fix (CAP-EINVAL): ALWAYS log the write error at
+            // fix (CAP-EINVAL): ALWAYS log the write error at
             // WARN so production runs surface the root-cause signature
             // (iov_count, total_bytes, errno.raw_os_error()) rather than
             // just a downstream "submit error: connection closed" cascade.
-            // The original F099-I concern speculated about `IOV_MAX`
+            // The original concern speculated about `IOV_MAX`
             // exhaustion; in practice the shape logged here lets us
             // confirm or reject that hypothesis from a single bench run.
             tracing::warn!(
@@ -557,7 +557,7 @@ async fn writer_task(
                 errno = ?e.raw_os_error(),
                 kind = ?e.kind(),
                 error = %e,
-                "rpc client writer exited on write error (F099-I-fix instrumentation)"
+                "rpc client writer exited on write error (instrumentation)"
             );
             // Remove this request's pending entry so the caller surfaces
             // ConnectionClosed immediately (req_id 0 never had one).
@@ -626,7 +626,7 @@ async fn read_loop(
 
             if bulk_fast_path {
                 // Wait for the full prologue ([header][ctrl_len][ctrl][crc]),
-                // verify the ctrl CRC (header included — F-WIRE-CRC-UNIFY),
+                // verify the ctrl CRC (header included),
                 // and parse the status ctrl. bulk ctrls are tiny (code+message),
                 // so "prologue buffered" is ~always the very next read.
                 let prologue = match decoder.peek_bulk_prologue() {
@@ -662,7 +662,7 @@ async fn read_loop(
                 // Bind the removed entry BEFORE matching: a `match` on the
                 // `borrow_mut()` temporary would hold the RefMut across the
                 // awaits in the arms below and panic any concurrent `send_*`
-                // on this thread (the F108 class).
+                // on this thread (the same borrow-across-await class).
                 let entry = pending.borrow_mut().remove(&req_id);
                 match entry {
                     Some(Pending::IntoPooled(tx)) => {
@@ -803,14 +803,14 @@ fn finish_into_pooled_from_frame(
     }));
 }
 
-// ── F121 tests ─────────────────────────────────────────────────────────
+// ── connection-close tests ─────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use std::time::Duration;
 
-    /// F121 — when the peer closes its socket without responding, the
+    /// when the peer closes its socket without responding, the
     /// client's `read_loop` exits, `closed` flips to true, and the very
     /// next `send_frame`/`send_vectored`/`send_oneshot`/`call` returns
     /// `ConnectionClosed` immediately instead of inserting a fresh
@@ -818,9 +818,9 @@ mod tests {
     /// the >120 s hang in the original repro).
     #[compio::test]
     async fn closed_flag_set_after_peer_disconnect() {
-        // F161 drive-by: was `autumn_transport::init()` (function removed in
+        // drive-by: was `autumn_transport::init()` (function removed in
         // a prior refactor; baseline build failure noted in claude-progress
-        // since F151). The transport is now initialised on first use via
+        // at the time). The transport is now initialised on first use via
         // `current_or_init()`.
         let _ = autumn_transport::current_or_init();
 
@@ -919,7 +919,7 @@ mod tests {
         srv.join().expect("server thread");
     }
 
-    /// F216-E — `call_into_pooled` recvs a value-separable response into a
+    /// `call_into_pooled` recvs a value-separable response into a
     /// read_loop-owned `PooledBuf` (TCP small-value path = decode + copy),
     /// ctrl CRC verified by the decoder, `BulkResp` handed back. Proves the
     /// cancel-safe primitive's happy path before the UCX + EN/PS wiring.
@@ -964,7 +964,7 @@ mod tests {
         srv.join().expect("server thread");
     }
 
-    /// F219 — `call_into_pooled` over TCP with a value ABOVE
+    /// `call_into_pooled` over TCP with a value ABOVE
     /// `TCP_RECV_INTO_POOLED_MIN_BYTES` engages the read_loop recv-into-pooled
     /// branch: prologue verified via `peek_bulk_prologue`, then the value recv'd
     /// straight into the PooledBuf via a compio owned read, skipping the

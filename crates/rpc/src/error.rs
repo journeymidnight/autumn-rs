@@ -13,13 +13,13 @@ pub enum StatusCode {
     Internal = 4,
     Unavailable = 5,
     AlreadyExists = 6,
-    /// F-AUTHZ-1: the caller's connection is not authorized for the key range
+    /// the caller's connection is not authorized for the key range
     /// (no valid capability token, or the key falls outside its granted
     /// prefixes, or the token expired). Distinct from NotFound so a rogue
     /// client can't blind-retry-amplify a denied key as if it were absent.
     /// Appended (discriminant 7) so all prior codes stay wire-stable.
     PermissionDenied = 7,
-    /// F-KEY-NS D7 Layer-A: a put-class write whose key falls in NO registered
+    /// D7 Layer-A: a put-class write whose key falls in NO registered
     /// namespace prefix (the namespace does not exist). Distinct from NotFound
     /// (which is a read-miss on an existing keyspace) so the client can treat it
     /// as TERMINAL on the write path — refreshing routing can't create the

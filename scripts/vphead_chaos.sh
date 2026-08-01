@@ -4,7 +4,7 @@
 # Drives the in-process `system_chaos` harness (real subprocess ENs + etcd +
 # toxiproxy, real kill/fence/split/merge/compact/GC) across SEVERAL random seeds,
 # with the nemesis action set focused on the ops that stress the SSTable
-# `vp_head` (recovery replay-start) — the F-COMPACT/FLUSH-VPHEAD fixes:
+# `vp_head` (recovery replay-start) — the compact/flush fixes:
 #
 #   split   — CoW-shares log extents across children; recovery must replay each
 #             from the correct first-occurrence vp_head.

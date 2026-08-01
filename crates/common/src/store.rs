@@ -20,7 +20,7 @@ pub struct MetadataState {
     pub partitions: HashMap<u64, MgrPartitionMeta>,
     pub ps_nodes: HashMap<u64, String>,
     pub regions: BTreeMap<u64, MgrRegionInfo>,
-    /// F099-K — per-partition listener addresses reported by PS via
+    /// per-partition listener addresses reported by PS via
     /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS
     /// re-registers on restart. Keyed by `part_id`; value is `host:port`.
     pub part_addrs: HashMap<u64, String>,
@@ -34,7 +34,7 @@ impl MetadataState {
         (start, end)
     }
 
-    /// F265: the epoch BUMPS on every acquire (mirrors the etcd-backed
+    /// the epoch BUMPS on every acquire (mirrors the etcd-backed
     /// `acquire_owner_epoch`, which rewrites the key and uses the fresh
     /// mod_revision). Re-acquiring an existing key returns a strictly
     /// higher epoch so the previous holder is fenced — required for
@@ -84,7 +84,7 @@ pub const OWNER_KEY_MISSING_TOKEN: &str = "does not exist";
 /// without a new wire code — and a new code in `manager_rpc.rs` changes
 /// `WIRE_FINGERPRINT` and forces a stop-world WIRE version bump. The
 /// stream-layer `StreamClient` uses this to turn a manager-side fence into
-/// the "LockedByOther" classification that drives the PS's F270
+/// the "LockedByOther" classification that drives the PS's
 /// poison-and-reopen self-heal (reopen re-acquires a fresh owner_epoch),
 /// mirroring what the extent-node layer already signals natively via
 /// `CODE_LOCKED_BY_OTHER`.
@@ -132,7 +132,7 @@ mod tests {
         assert!(s.ensure_owner_epoch("lock/b", 1).is_err());
     }
 
-    /// F265: re-acquiring the same owner_key must FENCE the previous
+    /// re-acquiring the same owner_key must FENCE the previous
     /// holder — the epoch bumps on every acquire (failback A→B→A and
     /// same-key split-brain both depend on this), and epochs stay
     /// globally monotonic across different keys.

@@ -124,7 +124,7 @@ fn e2e_full_surface() {
             assert!(!hy.is_empty(), "hybrid returns fused results");
             assert!(hy.iter().any(|p| p.0 == "d1"), "d1 wins both legs: {hy:?}");
 
-            // ---- F-MEM-4: deleting a memory reaps its IVF vector posting
+            // ---- deleting a memory reaps its IVF vector posting
             // (not just doc + BM25), so it no longer surfaces in vector search.
             // (train_centroids never reaps a deleted vector — it re-buckets
             // every posting it scans — so the vptr-based reap is the reaper.)

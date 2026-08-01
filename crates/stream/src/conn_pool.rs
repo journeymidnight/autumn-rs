@@ -22,13 +22,13 @@ use anyhow::{anyhow, Result};
 use autumn_rpc::client::RpcClient;
 use bytes::Bytes;
 
-/// F229 (1A): bound the TCP connect so a blackholed peer (SYN dropped) can't
+/// (1A): bound the TCP connect so a blackholed peer (SYN dropped) can't
 /// hang `get_client` — and therefore any PS/EN background loop that reaches it
 /// (region_sync `open_partition` → `commit_length`, EN reconcile, recovery
 /// fanout) — indefinitely. `call_timeout` only bounds the call AFTER connect;
-/// the connect itself had no deadline. Mirrors the manager-side F228 fix
-/// (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`); a fixed constant here (not a tuning knob)
-/// keeps it env-free per the F195 config rule. 5 s is generous for
+/// the connect itself had no deadline. Mirrors the manager-side connect-timeout
+/// fix (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`); a fixed constant here (not a tuning
+/// knob) keeps it env-free per the config rule. 5 s is generous for
 /// datacenter / loopback (sub-second normal); on expiry the entry is not
 /// cached, so the next call retries a fresh connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,7 +48,7 @@ impl ConnPool {
     /// if present and not closed; otherwise connects and stashes.
     /// Connection is shared across concurrent callers.
     ///
-    /// F121: a cached entry whose `read_loop`/`writer_task` has exited
+    /// a cached entry whose `read_loop`/`writer_task` has exited
     /// (i.e. the peer died) is poisoned — `client.is_closed()` returns
     /// true. Returning it would cause new submits to fail fast (good)
     /// but lock us out of any reconnect attempt. Evict and reconnect
@@ -63,7 +63,7 @@ impl ConnPool {
         // Evict any closed entry under a fresh borrow so the upcoming
         // `connect.await` doesn't hold the RefCell across a yield.
         self.clients.borrow_mut().remove(&addr);
-        // F229 (1A): bound the connect (see CONNECT_TIMEOUT). On timeout the
+        // (1A): bound the connect (see CONNECT_TIMEOUT). On timeout the
         // entry stays uncached so the next call retries a fresh connect.
         let client = match compio::time::timeout(CONNECT_TIMEOUT, RpcClient::connect(addr)).await {
             Ok(Ok(c)) => c,
@@ -118,7 +118,7 @@ impl ConnPool {
         }
     }
 
-    /// F216-E: send an RPC and recv the value response into a read_loop-owned
+    /// send an RPC and recv the value response into a read_loop-owned
     /// `PooledBuf` (cancel-safe — see RpcClient::call_into_pooled). Wraps the
     /// timeout here; on expiry the inner future drops and the read_loop reclaims
     /// the buffer (no leak). Returns a `BulkResp` (buffer + code + message).
@@ -178,7 +178,7 @@ impl ConnPool {
         match client.send_vectored(msg_type, payload_parts).await {
             Ok(rx) => Ok(rx),
             Err(e) => {
-                // F121: matches `call`/`call_timeout` semantics — evict
+                // matches `call`/`call_timeout` semantics — evict
                 // on submit-time error so the next call retries with a
                 // fresh client. `client.is_closed()` is `true` whenever
                 // the reader/writer task has exited, regardless of which
@@ -205,19 +205,19 @@ impl Default for ConnPool {
     }
 }
 
-/// F099-M: route `extent_id` to the correct shard port.
+/// route `extent_id` to the correct shard port.
 ///
 /// If `shard_ports` is empty, returns `address` unchanged (legacy mode).
 /// Otherwise replaces the port in `address` with
 /// `shard_ports[autumn_rpc::shard_for_extent(extent_id, K)]` (the canonical
-/// hashed map — F-EN-SHARD-HASH; was `extent_id % K`) and returns the
+/// hashed map; was `extent_id % K`) and returns the
 /// resulting `host:port` string.
 pub fn shard_addr_for_extent(address: &str, shard_ports: &[u16], extent_id: u64) -> String {
     if shard_ports.is_empty() {
         return address.to_string();
     }
     let k = shard_ports.len();
-    // F-EN-SHARD-HASH: canonical hashed extent→shard map (was `extent_id % k`,
+    // canonical hashed extent→shard map (was `extent_id % k`,
     // which aliased bootstrap's contiguous ids onto shard 0). MUST match the EN
     // `owns_extent` + manager `shard_addr_for_extent`.
     let port = shard_ports[autumn_rpc::shard_for_extent(extent_id, k as u32) as usize];

@@ -10,7 +10,7 @@ use crate::{AutumnManager, PendingDelete};
 
 /// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
 /// `ex`, the `stream` whose `(K, M)` shape it converts to, and the authoritative
-/// F207 ledger marker (`params`: target nodes / extra disks / post-EC eversion /
+/// ledger marker (`params`: target nodes / extra disks / post-EC eversion /
 /// owner_epoch) to reuse verbatim. Built by `collect_ec_dispatch_candidates`,
 /// consumed by `dispatch_one_ec_conversion`.
 struct EcDispatchCandidate {
@@ -25,10 +25,10 @@ impl AutumnManager {
         extent_id: u64,
         replace_id: u64,
     ) -> Result<(), AppError> {
-        // F126 / F139 / F207-C: any in-flight stream-layer op on this
-        // extent blocks recovery dispatch. Pre-F207-C this was three
+        // any in-flight stream-layer op on this
+        // extent blocks recovery dispatch. This was previously three
         // separate ad-hoc checks (recovery_tasks dedup, ec_conversion_inflight,
-        // pending_extent_deletes). F207-C collapses them into one ledger
+        // pending_extent_deletes), now collapsed into one ledger
         // read. The probe distinguishes "already-recovering (idempotent
         // OK)" from "different op in flight (caller retries)".
         match self.extent_inflight_op(extent_id) {
@@ -37,7 +37,7 @@ impl AutumnManager {
             None => {}
         }
 
-        // F-FENCE-DRAIN: never rebuild a replica onto a fenced / maintenance /
+        // never rebuild a replica onto a fenced / maintenance /
         // suspected node — that would just create more work to migrate off.
         // Captured before the store borrow (disjoint RefCells).
         let hard_excluded = self.placement_excluded_node_ids();
@@ -70,7 +70,7 @@ impl AutumnManager {
 
         let mut rate_limited = false;
         for candidate in &candidates {
-            // F224: gate this (source -> target) dispatch on the rate
+            // gate this (source -> target) dispatch on the rate
             // limiter (reseeded from the ledger at the top of the dispatch
             // loop). On cap-hit try the NEXT candidate — a different target
             // may have headroom; if every candidate is capped we return Ok
@@ -87,7 +87,7 @@ impl AutumnManager {
                 continue;
             }
             let base = Self::normalize_endpoint(&candidate.address);
-            // F099-M: recovery targets a specific extent_id → route to owner shard.
+            // recovery targets a specific extent_id → route to owner shard.
             let addr = Self::shard_addr_for_extent(&base, &candidate.shard_ports, extent_id);
 
             let task = MgrRecoveryTask {
@@ -97,8 +97,8 @@ impl AutumnManager {
                 start_time: Self::epoch_seconds(),
             };
 
-            // F210-D3: acquire the unified inflight marker BEFORE the
-            // EN RPC. Pre-F210-D3 the order was reversed (RPC → check
+            // acquire the unified inflight marker BEFORE the
+            // EN RPC. The order was previously reversed (RPC → check
             // code → acquire): if `acquire_extent_inflight` failed
             // (NotLeader during the etcd CAS await, etcd transient,
             // or someone else acquired between our probe at L24 and
@@ -106,7 +106,7 @@ impl AutumnManager {
             // with no corresponding manager ledger entry. apply_recovery_done
             // (which validates state from the ledger) would later be
             // missing the I3 atomic put_and_delete_txn's delete target,
-            // and the F207 ledger invariants drift.
+            // and the ledger invariants drift.
             //
             // Now: acquire first; on success → RPC; if RPC fails or EN
             // rejects, drain the marker (release etcd + in-memory) and
@@ -145,11 +145,11 @@ impl AutumnManager {
                     // RPC failed → release the marker we just acquired
                     // and try the next candidate. We don't know if the
                     // EN received the request; if it did, the EN-side
-                    // F139 recovery_inflight tracks it; we'll re-dispatch
+                    // recovery_inflight tracks it; we'll re-dispatch
                     // on the next tick and the EN-side check will idempotently
                     // refuse the duplicate.
                     let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
-                    // F224: release the limiter slot we took above.
+                    // release the limiter slot we took above.
                     self.recovery_limiter
                         .borrow_mut()
                         .release(replace_id, candidate.node_id);
@@ -160,7 +160,7 @@ impl AutumnManager {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
-                    // F224: release the limiter slot we took above.
+                    // release the limiter slot we took above.
                     self.recovery_limiter
                         .borrow_mut()
                         .release(replace_id, candidate.node_id);
@@ -169,10 +169,10 @@ impl AutumnManager {
             };
             if r.code != CODE_OK {
                 // EN rejected (e.g. extent exists locally already, or
-                // F139 recovery_inflight conflict). Release marker
+                // recovery_inflight conflict). Release marker
                 // and try next candidate.
                 let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
-                // F224: release the limiter slot we took above.
+                // release the limiter slot we took above.
                 self.recovery_limiter
                     .borrow_mut()
                     .release(replace_id, candidate.node_id);
@@ -181,11 +181,11 @@ impl AutumnManager {
 
             // Both acquire AND RPC succeeded. Marker stays in place
             // until apply_recovery_done's atomic put_and_delete_txn
-            // releases it (F207 invariant I3).
+            // releases it (invariant I3).
             return Ok(());
         }
 
-        // F224: if we never reached the RPC because every candidate was
+        // if we never reached the RPC because every candidate was
         // rate-limited, this is a deferral, not a failure. Return Ok so
         // the dispatch loop records success (no backoff) and retries next
         // tick once the limiter has headroom. A genuine all-candidates-
@@ -198,11 +198,11 @@ impl AutumnManager {
         ))
     }
 
-    /// F209-B best-effort Recovery inflight-marker release. Drops the etcd
+    /// best-effort Recovery inflight-marker release. Drops the etcd
     /// `extent_inflight/<id>` marker and the in-memory marker. The etcd delete
     /// is best-effort: a transient failure is WARN-logged, NOT propagated —
     /// the in-memory marker is released regardless so the extent isn't blocked,
-    /// and the F208 stale-marker sweep (~10 min ceiling) reclaims the etcd
+    /// and the stale-marker sweep (~10 min ceiling) reclaims the etcd
     /// marker. Propagating (`?`) would skip the in-memory release + each
     /// caller's follow-up cleanup (e.g. the extent-removed branch's
     /// `enqueue_pending_deletes`) — a worse regression than a transient
@@ -218,7 +218,7 @@ impl AutumnManager {
                 tracing::warn!(
                     extent_id,
                     error = %e,
-                    "recovery inflight marker etcd-release failed; in-memory released, F208 sweep reclaims the etcd marker"
+                    "recovery inflight marker etcd-release failed; in-memory released, stale-marker sweep reclaims the etcd marker"
                 );
             }
         }
@@ -231,23 +231,23 @@ impl AutumnManager {
     ) -> Result<(), AppError> {
         let task = &done_task.task;
 
-        // F138 / F207-B: if EC conversion is in flight for this extent,
+        // if EC conversion is in flight for this extent,
         // defer the recovery apply. apply_ec_conversion_done would
         // overwrite both ex.replicates (reverting the slot replacement)
         // and ex.eversion (losing the recovery's eversion bump). The
         // Recovery marker is KEPT (we return before any release).
-        // CAVEAT (pre-existing, deferred): under F222 the df handler
+        // CAVEAT (pre-existing, deferred): the df handler
         // mem::take's recovery_done once, so THIS completion is consumed
         // and NOT re-delivered — the "retry next tick" the old comment
-        // promised does not happen. Convergence is instead via the F208
+        // promised does not happen. Convergence is instead via the
         // stale-marker sweep (releases the kept marker, ~10 min ceiling)
         // followed by recovery_dispatch_loop re-evaluating the now-EC'd
         // extent's per-slot health and re-recovering any genuinely-missing
         // shard. A manager-side completion-retry queue would converge
         // faster but is a new mechanism in a revert-prone path — deferred
-        // until the slow-convergence is reproduced as real harm (F208 +
-        // orphan-reconcile backstop correctness today).
-        // F207-B: reads the unified ledger via `extent_inflight_op`.
+        // until the slow-convergence is reproduced as real harm (stale-marker
+        // sweep + orphan-reconcile backstop correctness today).
+        // reads the unified ledger via `extent_inflight_op`.
         if matches!(
             self.extent_inflight_op(task.extent_id),
             Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
@@ -258,7 +258,7 @@ impl AutumnManager {
             )));
         }
 
-        // F126: precheck — if `task.node_id` is already present in this
+        // precheck — if `task.node_id` is already present in this
         // extent at a slot OTHER than the failed `replace_id`, the layout
         // has changed since dispatch (typically EC conversion completed
         // during recovery and assigned this node as parity). Applying the
@@ -282,11 +282,11 @@ impl AutumnManager {
             }
         };
         if matches!(layout_changed, Some(true)) {
-            // F207-D: release the Recovery marker so the dedup check in
+            // release the Recovery marker so the dedup check in
             // dispatch_recovery_task doesn't permanently block future
             // attempts to repair this slot. Legacy `recoveryTasks/<id>`
             // delete dropped (the backward-compat dual-key path lived in
-            // F207-C only).
+            // only).
             self.release_recovery_marker_best_effort(task.extent_id).await;
             return Err(AppError::Precondition(format!(
                 "recovery target {} for extent {} already in extent node list at a different slot; \
@@ -295,14 +295,14 @@ impl AutumnManager {
             )));
         }
 
-        // F209-B: layout_changed == None ⇒ the extent exists but
+        // layout_changed == None ⇒ the extent exists but
         // `task.replace_id` is no longer in any slot (extent_slot
-        // returned None above). Pre-F209-B this case fell through to
+        // returned None above). This case previously fell through to
         // the apply block where the inner `slot None` branch did
         // `return Err(...)` from inside borrow_mut WITHOUT releasing
         // the Recovery marker — violating invariant I3 (every
         // acquire has a matching release). The marker survived until
-        // F208's 10-min sweep, blocking any other op on the extent
+        // the stale-marker sweep (~10 min), blocking any other op on the extent
         // for that window. Release now, then return.
         if layout_changed.is_none() {
             self.release_recovery_marker_best_effort(task.extent_id).await;
@@ -312,8 +312,8 @@ impl AutumnManager {
             )));
         }
 
-        // F210-A1 etcd-first: compute updated_extent from a clone under
-        // read-only borrow. Pre-F210-A1 the borrow_mut block mutated
+        // etcd-first: compute updated_extent from a clone under
+        // read-only borrow. The borrow_mut block previously mutated
         // s.extents[task.extent_id] in place, then the etcd put_and_delete_txn
         // below ran. If etcd failed (NotLeader / fence break), the in-memory
         // mutation had already advanced ex.replicates / eversion / avali —
@@ -328,7 +328,7 @@ impl AutumnManager {
                     let slot = match Self::extent_slot(ex, task.replace_id) {
                         Some(v) => v,
                         // Unreachable under single-threaded compio: the
-                        // F209-B layout_changed.is_none() branch above
+                        // layout_changed.is_none() branch above
                         // already covered this. Kept as defense.
                         None => {
                             return Err(AppError::Precondition(format!(
@@ -363,7 +363,7 @@ impl AutumnManager {
 
         let Some(updated_extent) = updated_extent else {
             // The extent was removed from manager state before recovery
-            // completed. F139 / F207-C: release the Recovery marker, then
+            // completed. Release the Recovery marker, then
             // enqueue a targeted delete for the recovering node so the
             // resurrected on-disk files are reaped promptly instead of
             // waiting for the 5-minute orphan-reconcile sweep. Recovery
@@ -376,8 +376,8 @@ impl AutumnManager {
                     Self::shard_addr_for_extent(&base, &n.shard_ports, task.extent_id)
                 })
             };
-            // Release Recovery (etcd + in-memory). F207-D removed the
-            // legacy-key delete entry.
+            // Release Recovery (etcd + in-memory). The legacy-key delete
+            // entry was removed.
             self.release_recovery_marker_best_effort(task.extent_id).await;
             // Then enqueue Delete (best effort — extent_delete_loop will
             // pick it up on next tick).
@@ -394,7 +394,7 @@ impl AutumnManager {
         };
 
         if let Some(etcd) = &self.etcd {
-            // F207-D: atomic put + delete txn. Releases the Recovery
+            // atomic put + delete txn. Releases the Recovery
             // marker in the same txn that writes the updated extent
             // state. Legacy `recoveryTasks/<id>` delete dropped.
             let ex_payload = rkyv_encode(&updated_extent).to_vec();
@@ -405,8 +405,8 @@ impl AutumnManager {
             .await?;
         }
 
-        // F210-A1: only AFTER etcd success do we apply to in-memory.
-        // (Pre-F210-A1 this was the borrow_mut block above; now the
+        // only AFTER etcd success do we apply to in-memory.
+        // (This was previously the borrow_mut block above; now the
         // borrow_mut here is the sole in-memory write.)
         {
             let mut s = self.store.inner.borrow_mut();
@@ -421,7 +421,7 @@ impl AutumnManager {
     /// outcome in the rate limiter (success clears backoff; failure backs off
     /// `(extent_id, slot)`). Dedups the four byte-identical dispatch tails in
     /// `recovery_dispatch_loop` (fenced / disk-offline / avali==0 / unhealthy-
-    /// probe). Keeps the `&Result` passthrough so F233's failure reason is never
+    /// probe). Keeps the `&Result` passthrough so the failure reason is never
     /// dropped (note 30).
     async fn dispatch_and_record(&self, extent_id: u64, slot: u32, node_id: u64, now_s: i64) {
         let res = self.dispatch_recovery_task(extent_id, node_id).await;
@@ -435,20 +435,20 @@ impl AutumnManager {
                 continue;
             }
 
-            // F211-E: gate on `AUTUMN_MGR_RECOVERY_GATE`:
+            // gate on `AUTUMN_MGR_RECOVERY_GATE`:
             //   - `fenced_only` (default): trigger recovery ONLY when the
             //     replica's node is operator-Fenced. Pre-fence transient
             //     failures stop causing cross-node rebuilds.
             //   - `auto_disk`: legacy behaviour (trigger on disk.online
-            //     == false). For ops who haven't yet stood up the F211-G
+            //     == false). For ops who haven't yet stood up the
             //     OP policy script.
             let gate_mode = Self::recovery_gate_mode();
 
-            // F211-E: maintenance-TTL tick — clear expired Maintenance
+            // maintenance-TTL tick — clear expired Maintenance
             // overrides before the dispatch decision. Cheap.
             self.tick_maintenance_ttl().await;
 
-            // F211-F: snapshot operator overrides so the body's fenced-gate
+            // snapshot operator overrides so the body's fenced-gate
             // decision is consistent within this tick. (The node auto-state
             // snapshot was dead — recovery dispatch gates on Fenced only;
             // Suspected/Maintenance are consulted by the EC dispatch loop, not
@@ -456,7 +456,7 @@ impl AutumnManager {
             let overrides = self.node_overrides.borrow().clone();
             let now_s = Self::epoch_seconds();
 
-            // F224: reseed the recovery rate limiter from the inflight
+            // reseed the recovery rate limiter from the inflight
             // ledger so its counters reflect actually-in-flight recoveries.
             // The ledger is the source of truth (survives leader failover);
             // re-deriving every tick means no manual release bookkeeping
@@ -477,34 +477,34 @@ impl AutumnManager {
                 }
             }
 
-            // F172-A: pre-filter under the store borrow so we DON'T clone
+            // pre-filter under the store borrow so we DON'T clone
             // extents that the loop body will skip on the next line. The
             // loop body's first checks are `if ex.sealed_length == 0
             // { continue; }` and `if ec_conversion_inflight.contains(...)
-            // { continue; }`. Pre-F172 we cloned every single extent in
+            // { continue; }`. This previously cloned every single extent in
             // `s.extents` (~200 B each for the 4 Vec fields) only to drop
             // most on the floor — a 10K-extent cluster cloned 2 MB inline
             // per 2 s tick on the manager's compio runtime, blocking
             // heartbeat / register_ps / get_regions handlers for a few ms
-            // each tick. F138's ec_conversion_inflight gating is unchanged
+            // each tick. The ec_conversion_inflight gating is unchanged
             // — `apply_recovery_done` / `mark_extent_available` /
             // `handle_multi_modify_split` still re-check the set at apply
             // time, so a stale snapshot here is safe (drops at most one
             // tick's worth of dispatch latency on the racing extent).
             let (extents, nodes, disks) = {
                 let s = self.store.inner.borrow();
-                // F207-B: read the unified inflight ledger instead of the
+                // read the unified inflight ledger instead of the
                 // old `ec_conversion_inflight` HashSet. We filter for
                 // ConvertToEc specifically — recovery dispatch on an extent
                 // that's mid-Recovery or mid-Delete is handled by
-                // `dispatch_recovery_task`'s own refuse-at-start (F207-C
+                // `dispatch_recovery_task`'s own refuse-at-start (which
                 // collapses those into the same probe).
                 let inflight = self.inflight.borrow();
                 let extents: Vec<MgrExtentInfo> = s
                     .extents
                     .values()
                     .filter(|ex| {
-                        // F-FENCE-DRAIN: gate on the authoritative `sealed` STATE,
+                        // gate on the authoritative `sealed` STATE,
                         // NOT `sealed_length == 0`. A sealed-EMPTY extent
                         // (`sealed = true, sealed_length = 0` — a split/merge tail
                         // seal, or an open tail sealed by the fence drain) is a
@@ -533,7 +533,7 @@ impl AutumnManager {
                     let bit = 1u32 << slot;
                     let node = nodes.get(&node_id).cloned();
 
-                    // F211-E: backoff gate. If the (extent, slot) pair
+                    // backoff gate. If the (extent, slot) pair
                     // has consecutive failures, skip this tick.
                     if self
                         .recovery_limiter
@@ -543,7 +543,7 @@ impl AutumnManager {
                         continue;
                     }
 
-                    // F211-E: under `fenced_only`, only dispatch when the
+                    // under `fenced_only`, only dispatch when the
                     // replica's owning node has an operator Fenced
                     // override. Suspected alone is NOT enough (matches
                     // the HDFS decommission analogue). Under `auto_disk`,
@@ -553,7 +553,7 @@ impl AutumnManager {
                         Some(NODE_OVERRIDE_FENCED)
                     );
 
-                    // F211-E: under `fenced_only`, the operator must
+                    // under `fenced_only`, the operator must
                     // explicitly fence before we dispatch recovery. The
                     // backoff-from-failure path still applies once a
                     // dispatch attempt does fire.
@@ -561,7 +561,7 @@ impl AutumnManager {
                         continue;
                     }
 
-                    // F211-E: a Fenced node MUST have all its slots
+                    // a Fenced node MUST have all its slots
                     // rebuilt regardless of probe outcome (the whole
                     // point of fence is to migrate data off). Skip the
                     // disk + probe shortcuts and dispatch immediately.
@@ -592,7 +592,7 @@ impl AutumnManager {
                     if (ex.avali & bit) == 0 {
                         if let Some(n) = node.clone() {
                             let base = Self::normalize_endpoint(&n.address);
-                            // F099-M: re_avali on specific extent → owner shard.
+                            // re_avali on specific extent → owner shard.
                             let addr =
                                 Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
                             let payload = rkyv_encode(&ExtReAvaliReq {
@@ -627,7 +627,7 @@ impl AutumnManager {
                         continue;
                     }
 
-                    // F210-H3 Tier 2: switched from `commit_length_on_node`
+                    // Tier 2: switched from `commit_length_on_node`
                     // (fence-gated, requires PS-owner owner_epoch) to the
                     // dedicated fence-free `probe_extent_on_node`. The
                     // recovery loop has no owner context and only uses
@@ -635,7 +635,7 @@ impl AutumnManager {
                     // owner-lock fence was always wrong (pre-Tier 2 we
                     // worked around it by hardcoding `owner_epoch: 0` + a
                     // server-side escape hatch; that escape silently
-                    // broke under F210-H2 and forced this same fix).
+                    // broke and forced this same fix).
                     let healthy = match node {
                         Some(n) => self
                             .probe_extent_on_node(&n.address, ex.extent_id)
@@ -650,14 +650,14 @@ impl AutumnManager {
                 }
             }
 
-            // F-FENCE-DRAIN: seal + roll open tails that sit on a fenced node so
+            // seal + roll open tails that sit on a fenced node so
             // recovery (above) can rebuild them and `remove` can proceed. Runs
             // each tick after the sealed-extent recovery dispatch.
             self.drain_fenced_open_tails().await;
         }
     }
 
-    /// F-FENCE-DRAIN: find OPEN tail extents (`!sealed`) whose replica set
+    /// find OPEN tail extents (`!sealed`) whose replica set
     /// includes an operator-Fenced node and ask each owning partition's PS to
     /// seal + roll them (`MSG_ROLL_TAILS`). Recovery only rebuilds SEALED
     /// extents, so without this an idle partition's open tail on a fenced node
@@ -718,7 +718,7 @@ impl AutumnManager {
                     Some(addr) => work.push((meta.part_id, addr, entries)),
                     None => tracing::warn!(
                         part_id = meta.part_id,
-                        "F-FENCE-DRAIN: open tail on fenced node but no PS address to roll it (awaiting reassignment)"
+                        "open tail on fenced node but no PS address to roll it (awaiting reassignment)"
                     ),
                 }
             }
@@ -757,25 +757,25 @@ impl AutumnManager {
                         Ok(resp) if resp.rolled > 0 => tracing::info!(
                             part_id,
                             rolled = resp.rolled,
-                            "F-FENCE-DRAIN: rolled open tail(s) off fenced node(s)"
+                            "rolled open tail(s) off fenced node(s)"
                         ),
                         Ok(_) => {}
                         Err(e) => {
-                            tracing::warn!(part_id, error = %e, "F-FENCE-DRAIN: bad RollTailsResp")
+                            tracing::warn!(part_id, error = %e, "bad RollTailsResp")
                         }
                     }
                 }
                 Err(e) => tracing::warn!(
                     part_id, addr = %addr, error = %e,
-                    "F-FENCE-DRAIN: roll_tails RPC failed (will retry)"
+                    "roll_tails RPC failed (will retry)"
                 ),
             }
         }
     }
 
-    /// F211-E: load the dispatch gate mode from env. Default
+    /// load the dispatch gate mode from env. Default
     /// `fenced_only` (operator-driven). `auto_disk` opts back into the
-    /// pre-F211 always-auto-rebuild behaviour for ops who haven't yet
+    /// legacy always-auto-rebuild behaviour for ops who haven't yet
     /// stood up the OP policy script.
     pub(crate) fn recovery_gate_mode() -> RecoveryGateMode {
         match std::env::var("AUTUMN_MGR_RECOVERY_GATE")
@@ -788,7 +788,7 @@ impl AutumnManager {
         }
     }
 
-    /// F211-H: record a (success / failure) outcome for the
+    /// record a (success / failure) outcome for the
     /// (extent, slot) pair so the rate-limiter's backoff window
     /// updates correctly.
     pub(crate) fn record_dispatch_outcome(
@@ -801,7 +801,7 @@ impl AutumnManager {
         let mut l = self.recovery_limiter.borrow_mut();
         match res {
             Ok(()) => l.record_success(extent_id, slot),
-            // F-backoff-obs: capture WHY it failed so `recovery-stats`
+            // Capture WHY it failed so `recovery-stats`
             // can show the reason, not just a count. Pre-this the call
             // sites passed `res.is_ok()` and the error was discarded.
             Err(e) => {
@@ -810,7 +810,7 @@ impl AutumnManager {
         }
     }
 
-    /// F211-C #6: Maintenance auto-clear. Walk overrides; for any
+    /// #6: Maintenance auto-clear. Walk overrides; for any
     /// Maintenance entry whose `expire_at` is in the past, delete the
     /// etcd key + in-memory entry. Logs an INFO; no audit entry (the
     /// system, not the operator, did this — the operator scheduled it
@@ -837,7 +837,7 @@ impl AutumnManager {
             self.node_overrides.borrow_mut().remove(&id);
             tracing::info!(
                 node_id = id,
-                "F211-C: Maintenance override expired; auto-cleared"
+                "Maintenance override expired; auto-cleared"
             );
         }
     }
@@ -850,7 +850,7 @@ pub(crate) enum RecoveryGateMode {
 }
 
 impl crate::AutumnManager {
-    /// F222: unified node-health + recovery-collect loop. Merges the
+    /// unified node-health + recovery-collect loop. Merges the
     /// former `recovery_collect_loop` (2 s, recovery-target nodes only,
     /// non-empty `tasks`) and `disk_status_update_loop` (10 s, all nodes,
     /// empty `tasks`) into a SINGLE `EXT_MSG_DF` caller per node per tick.
@@ -863,7 +863,7 @@ impl crate::AutumnManager {
     /// its 10 s sweep won the race against the 2 s collect loop, the
     /// recovery completion was lost: `apply_recovery_done` never ran, the
     /// extent's slot was never repaired in manager metadata, the recovered
-    /// copy became an orphan, and the inflight marker sat until the F208
+    /// copy became an orphan, and the inflight marker sat until the
     /// stale sweep released it ~10 min later. One loop = one df caller =
     /// completions are always applied.
     ///
@@ -909,7 +909,7 @@ impl crate::AutumnManager {
             let mut cdf_per_node: Vec<(u64, crate::NodeCap)> = Vec::with_capacity(nodes.len());
 
             for node in nodes.values() {
-                // F191: prefer the control_address; fall back to data
+                // prefer the control_address; fall back to data
                 // plane address for legacy / not-yet-re-registered nodes.
                 let raw_addr = if node.control_address.is_empty() {
                     &node.address
@@ -917,10 +917,10 @@ impl crate::AutumnManager {
                     &node.control_address
                 };
                 let addr = Self::normalize_endpoint(raw_addr);
-                // F222: empty `tasks` → EN returns its full `recovery_done`
+                // empty `tasks` → EN returns its full `recovery_done`
                 // (std::mem::take). We apply ALL of it below, so no
                 // completion is ever discarded (the merge's whole point).
-                // F191 P0: bound DF at 5 s via control_pool.call_timeout.
+                // P0: bound DF at 5 s via control_pool.call_timeout.
                 let payload = rkyv_encode(&ExtDfReq {
                     tasks: Vec::new(),
                     disk_ids: Vec::new(),
@@ -932,12 +932,12 @@ impl crate::AutumnManager {
                 {
                     Ok(v) => v,
                     Err(_) => {
-                        // F121: peer unreachable — mark its disks offline
+                        // peer unreachable — mark its disks offline
                         // so allocation/recovery skip it. ConnPool already
                         // evicts the broken conn so the next poll reconnects.
-                        // F211-A: feed the auto-state tracker (Online →
+                        // feed the auto-state tracker (Online →
                         // Suspected after the soft timeout). NOT a recovery
-                        // trigger — that requires explicit fence (F211-E).
+                        // trigger — that requires explicit fence.
                         Self::mark_node_disks_offline(&self.store, node);
                         self.node_states
                             .borrow_mut()
@@ -967,7 +967,7 @@ impl crate::AutumnManager {
                         continue;
                     }
                 };
-                // F-EN-DYNSHARD M1b: act on the df identity echo (pure decision
+                // M1b: act on the df identity echo (pure decision
                 // in `classify_df_echo`).
                 match classify_df_echo(
                     &node.node_uuid,
@@ -989,7 +989,7 @@ impl crate::AutumnManager {
                             stored_uuid = %node.node_uuid,
                             echo_uuid = %df.node_uuid,
                             addr = %addr,
-                            "F-EN-DYNSHARD: df echo uuid != stored — a DIFFERENT \
+                            "df echo uuid != stored — a DIFFERENT \
                              process answers at this address (pod-IP reuse?); NOT \
                              healing, treating df as failed"
                         );
@@ -1020,7 +1020,7 @@ impl crate::AutumnManager {
                             echo_addr = %df.advertise_addr,
                             stored_ports = ?node.shard_ports,
                             echo_ports = ?df.shard_ports,
-                            "F-EN-DYNSHARD: stored EN location differs from the df echo \
+                            "stored EN location differs from the df echo \
                              (stale etcd?); re-register the EN or correct etcd — NOT \
                              auto-healing to avoid clobbering concurrent updates"
                         );
@@ -1028,7 +1028,7 @@ impl crate::AutumnManager {
                     DfEchoAction::Ok => {}
                 }
 
-                // F121: a successful df proves the node reachable — promote
+                // a successful df proves the node reachable — promote
                 // on the call-level signal, not per-payload disk_id (the
                 // wire status keys on the extent-node's local disk_id,
                 // unrelated to the manager's allocated disk_id).
@@ -1036,7 +1036,7 @@ impl crate::AutumnManager {
                 // ENOSPC-1: stash the node's max per-disk free for the
                 // allocation free-space soft filter. Uses the df payload's
                 // aggregate only — the per-disk ids in it are EN-local and
-                // unrelated to manager disk_ids (F121, note 7), but the
+                // unrelated to manager disk_ids (note 7), but the
                 // MAX across disks needs no id mapping.
                 let max_free = df
                     .disk_status
@@ -1072,26 +1072,26 @@ impl crate::AutumnManager {
                         online: true,
                     },
                 ));
-                // F192: drop stale push-based failure reports so a residual
+                // drop stale push-based failure reports so a residual
                 // burst can't re-flip the node offline on the next tick.
                 self.recent_failure_reports
                     .borrow_mut()
                     .remove(&node.node_id);
-                // F211-A: heartbeat OK → flip Suspected back to Online.
+                // heartbeat OK → flip Suspected back to Online.
                 self.node_states.borrow_mut().on_heartbeat_ok(node.node_id);
-                // F222: apply EVERY completed recovery task — the step the
+                // apply EVERY completed recovery task — the step the
                 // old disk_status_update_loop omitted (it discarded them).
                 for done in df.done_tasks {
                     // No-swallow: never `let _ =` the apply result. A completion
                     // is delivered exactly once (the EN mem::take's it from
                     // recovery_done), so on ANY error this completion is gone —
                     // there is no immediate re-delivery. Convergence for the
-                    // kept-marker cases is via the F208 stale-marker sweep +
+                    // kept-marker cases is via the stale-marker sweep +
                     // re-dispatch (see the match arms). We surface the error so
                     // it is never silent; we deliberately do NOT add a
-                    // manager-side completion-retry queue (F208 backstops
-                    // correctness; the slow-convergence harm is bounded and
-                    // unreproduced — a reproduce-first follow-up).
+                    // manager-side completion-retry queue (the stale-marker sweep
+                    // backstops correctness; the slow-convergence harm is bounded
+                    // and unreproduced — a reproduce-first follow-up).
                     if let Err(e) = self.apply_recovery_done(done).await {
                         match e {
                             AppError::Precondition(_) => {
@@ -1099,12 +1099,12 @@ impl crate::AutumnManager {
                                 // gone) — marker released, completion correctly
                                 // dropped; OR EC-in-flight defer — marker kept,
                                 // completion dropped (the EN mem::take'd it once),
-                                // convergence via F208 sweep + re-dispatch on the
+                                // convergence via the stale-marker sweep + re-dispatch on the
                                 // EC'd extent. NOT an immediate completion-retry.
                                 tracing::trace!(error = %e, "apply_recovery_done deferred/stale (benign); converges via sweep / re-dispatch");
                             }
                             _ => {
-                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained — converges via F208 stale-marker sweep");
+                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained — converges via stale-marker sweep");
                             }
                         }
                     }
@@ -1153,7 +1153,7 @@ impl crate::AutumnManager {
                     logical_cycle_ids = Vec::new();
                 }
             }
-            // F-DF-OPENTAIL: Σ latest PS-reported open-tail committed bytes
+            // Σ latest PS-reported open-tail committed bytes
             // across partitions (cheap — one back()-of-window read per
             // partition). physical_used INCLUDES these bytes, so the amp
             // denominator adds them to the sealed logical scan. Open tails are
@@ -1166,7 +1166,7 @@ impl crate::AutumnManager {
                     .map(|(_, l)| l.open_tail_bytes)
                     .sum()
             };
-            // F-DF-WALDEBT: Σ reclaimable dead bytes = sealed (gc_debt) +
+            // Σ reclaimable dead bytes = sealed (gc_debt) +
             // open-tail dead, across the same latest-bucket window. gc_debt is
             // sealed-only, so adding open_tail_dead surfaces the debt a
             // log-heavy / all-open-tail partition otherwise hides at 0.
@@ -1196,7 +1196,7 @@ impl crate::AutumnManager {
         }
     }
 
-    /// F121 helper: flip `online=false` for every disk owned by `node`
+    /// helper: flip `online=false` for every disk owned by `node`
     /// when its `df` RPC fails. In-memory only — the manager reseeds
     /// disk state from etcd on leader promotion via `replay_from_etcd`,
     /// and a recovered node will overwrite `online=true` on the next
@@ -1227,7 +1227,7 @@ impl crate::AutumnManager {
         }
     }
 
-    /// F121 helper: counterpart to `mark_node_disks_offline`. Flip
+    /// helper: counterpart to `mark_node_disks_offline`. Flip
     /// `online=true` on a successful df. Keys on `MgrNodeInfo.disks`
     /// (manager-allocated disk_ids) instead of the response payload's
     /// extent-node-local disk_ids, which historically failed to map.
@@ -1253,15 +1253,15 @@ impl crate::AutumnManager {
         }
     }
 
-    /// Drain-only EC-conversion dispatcher (F203). Every ~5 s the leader drains
-    /// the F207 ledger's ConvertToEc markers (written by `handle_force_ec_convert`
+    /// Drain-only EC-conversion dispatcher. Every ~5 s the leader drains
+    /// the ledger's ConvertToEc markers (written by `handle_force_ec_convert`
     /// / restored by `replay_from_etcd`) and (re-)dispatches each to its
     /// coordinator. Two phases per tick, split into helpers for clarity:
     /// `collect_ec_dispatch_candidates` (snapshot + filter, holds the store
     /// borrow) then `dispatch_one_ec_conversion` per candidate (RPC + apply,
     /// no borrow held across the await).
     pub(crate) async fn ec_conversion_dispatch_loop(self) {
-        // F198: short initial delay so post-restart re-dispatch of replay-loaded
+        // short initial delay so post-restart re-dispatch of replay-loaded
         // markers fires quickly (otherwise PS startup sees up to 5 s of
         // eversion-mismatch against extents whose `apply_ec_conversion_done`
         // didn't commit last lifetime); steady-state cadence is 5 s thereafter.
@@ -1299,19 +1299,19 @@ impl crate::AutumnManager {
     /// PHASE 1 of `ec_conversion_dispatch_loop`: snapshot the cluster once and
     /// build the set of EC conversions to (re-)dispatch this tick.
     ///
-    /// Drain-only (F203): candidates are the F207 ledger's ConvertToEc markers,
+    /// Drain-only: candidates are the ledger's ConvertToEc markers,
     /// NOT a fresh `s.streams` scan — the manager is pure mechanism, an external
     /// controller decides via `MSG_FORCE_EC_CONVERT`. The marker IS the rich
     /// authoritative dispatch record (`MgrEcDispatchInflight`); we reuse its
     /// target nodes / disks / eversion verbatim (replay-safe). Filters:
-    /// - skip extents with a Recovery in flight (F126 — avoid colliding with
+    /// - skip extents with a Recovery in flight (avoid colliding with
     ///   `run_recovery_task`);
     /// - skip when the coordinator (`target_nodes[0]`) is Suspected / Suspend /
-    ///   operator-overridden (F211-F / F214-B) — silently, marker kept;
+    ///   operator-overridden — silently, marker kept;
     /// - drop the marker for an extent that vanished, was already converted, or
     ///   truncated to 0 (stale).
-    /// F119-D dedup is structural: ledger keys are unique by construction.
-    /// Returns the candidates + the per-tick node-address snapshot (F172-B) that
+    /// dedup is structural: ledger keys are unique by construction.
+    /// Returns the candidates + the per-tick node-address snapshot that
     /// PHASE 2 resolves target addresses against.
     fn collect_ec_dispatch_candidates(
         &self,
@@ -1400,9 +1400,9 @@ impl crate::AutumnManager {
     /// PHASE 2 of `ec_conversion_dispatch_loop`: (re-)dispatch one candidate.
     /// Resolves the coordinator + per-target shard addresses, sends
     /// `EXT_MSG_CONVERT_TO_EC` (60 s ceiling), and on CODE_OK runs
-    /// `finalize_ec_dispatch_after_convert` (apply + marker release). The F207
-    /// ledger marker is the eversion-bump lock across the whole RPC→apply window
-    /// (F138). A target-count/stream mismatch drops the marker (operator-induced
+    /// `finalize_ec_dispatch_after_convert` (apply + marker release). The
+    /// ledger marker is the eversion-bump lock across the whole RPC→apply window.
+    /// A target-count/stream mismatch drops the marker (operator-induced
     /// inconsistency); a transiently-missing node address defers (marker kept,
     /// retried next tick).
     async fn dispatch_one_ec_conversion(
@@ -1425,7 +1425,7 @@ impl crate::AutumnManager {
                 extent_id,
                 marker_targets = params.target_nodes.len(),
                 stream_total_shards = total_shards,
-                "F207-B: dispatch marker target count != stream K+M; dropping stale marker"
+                "dispatch marker target count != stream K+M; dropping stale marker"
             );
             self.spawn_drain_stale_ec_marker(extent_id);
             return;
@@ -1439,14 +1439,14 @@ impl crate::AutumnManager {
                     tracing::warn!(
                         extent_id,
                         target_nodes = ?params.target_nodes,
-                        "F207-B: marker target_node missing from cluster; deferring re-dispatch"
+                        "marker target_node missing from cluster; deferring re-dispatch"
                     );
                     return;
                 }
             }
         }
 
-        // F099-M: coordinator = the shard owning `extent_id` on the first
+        // coordinator = the shard owning `extent_id` on the first
         // replica; it reads the full extent locally and fans WriteShard out to
         // each target node's owner shard for `extent_id`.
         let coordinator_base = Self::normalize_endpoint(&target_addrs[0]);
@@ -1462,9 +1462,9 @@ impl crate::AutumnManager {
             })
             .collect();
 
-        // F198: send the post-conversion eversion in-band so every target node
+        // send the post-conversion eversion in-band so every target node
         // bumps `entry.eversion` to match what `apply_ec_conversion_done`
-        // persists, closing the read-side stale-cache window. F211-D Tier 2:
+        // persists, closing the read-side stale-cache window. Tier 2:
         // owner_epoch lets the coord stamp WriteShard / CommitEcShard for
         // EN-side fence rejection of a ghost ex-coord.
         let payload = rkyv_encode(&ExtConvertToEcReq {
@@ -1510,7 +1510,7 @@ impl crate::AutumnManager {
         };
 
         if rpc_ok {
-            // F138 / F207-B: apply releases the ledger marker atomically with the
+            // apply releases the ledger marker atomically with the
             // `extents/<id>` etcd write; on failure the marker is kept for
             // re-dispatch (see `finalize_ec_dispatch_after_convert`).
             self.finalize_ec_dispatch_after_convert(
@@ -1534,11 +1534,11 @@ impl crate::AutumnManager {
     /// `txn_fenced` failed transiently WITHOUT losing leadership (etcd blip,
     /// non-fence error), etcd kept the marker + pre-EC layout while THIS leader
     /// dropped the in-memory marker; because `ec_conversion_dispatch_loop` is
-    /// drain-only (F203 — it enumerates the in-memory shadow, not a fresh etcd
+    /// drain-only (it enumerates the in-memory shadow, not a fresh etcd
     /// scan), it never re-dispatched, so the extent stayed manager-pre-EC /
     /// EN-post-EC and every read wedged on `EVERSION_MISMATCH` until a leader
     /// failover replayed the etcd marker. Keeping the marker on apply-failure
-    /// lets the next tick re-dispatch; F119-D / F153 make repeated convert calls
+    /// lets the next tick re-dispatch; repeated convert calls are
     /// idempotent, so a re-dispatch after the EN already converted is a no-op.
     async fn finalize_ec_dispatch_after_convert(
         &self,
@@ -1565,7 +1565,7 @@ impl crate::AutumnManager {
             }
             Err(e) => {
                 // Leadership-retained apply failure: keep the marker so the
-                // next dispatch tick re-dispatches (idempotent via F119-D/F153).
+                // next dispatch tick re-dispatches (idempotent).
                 // A leadership-LOST failure (NotLeader) also keeps it; the new
                 // leader's replay reloads it from etcd either way.
                 tracing::warn!(
@@ -1577,14 +1577,14 @@ impl crate::AutumnManager {
         }
     }
 
-    /// F207-B: drop a stale or no-longer-valid `extent_inflight/<id>` marker.
+    /// drop a stale or no-longer-valid `extent_inflight/<id>` marker.
     /// Used by the dispatch loop when it observes a ledger entry for an
     /// extent that has been deleted or that has incompatible state (e.g.,
     /// already EC-converted) — best-effort cleanup so the next tick's
     /// candidate set shrinks. Idempotent.
     async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            // Use `put_and_delete_txn` (one-element delete list) so the F149
+            // Use `put_and_delete_txn` (one-element delete list) so the leader
             // fence applies. A `false` return from the underlying CAS is
             // impossible here (no extra_cmp); only NotLeader can happen and
             // bubbles up.
@@ -1603,8 +1603,8 @@ impl crate::AutumnManager {
         data_shards: usize,
         new_eversion: u64,
     ) -> Result<(), AppError> {
-        // F210-A1 etcd-first: compute `updated` from a clone under
-        // read-only borrow. Pre-F210-A1 the borrow_mut block mutated
+        // etcd-first: compute `updated` from a clone under
+        // read-only borrow. The borrow_mut block previously mutated
         // s.extents[extent_id] in place (ec_converted=true, replicates,
         // parity, avali, eversion), then the etcd put_and_delete_txn
         // ran. If etcd failed (NotLeader / fence break), in-memory had
@@ -1632,24 +1632,24 @@ impl crate::AutumnManager {
             // ExtConvertToEcReq. Manager + every shard host now agree on
             // the same post-EC eversion.
             new_ex.eversion = new_eversion;
-            // F206: post-EC the extent has K+M shards across K+M nodes;
+            // post-EC the extent has K+M shards across K+M nodes;
             // every slot is available by construction.
             new_ex.avali = Self::all_bits(target_nodes.len());
             new_ex
         };
 
         if let Some(etcd) = &self.etcd {
-            // F207-B/D: bundle the marker delete into the same etcd txn
-            // as the `extents/<id>` put. Pre-F207 this was two separate
-            // etcd round-trips; F207 made them atomic. F210-A1 makes
-            // the in-memory apply happen ONLY after this txn lands.
+            // Bundle the marker delete into the same etcd txn
+            // as the `extents/<id>` put. This was previously two separate
+            // etcd round-trips, now atomic. The in-memory apply happens
+            // ONLY after this txn lands.
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
             etcd.put_and_delete_txn(vec![(key, val)], vec![Self::extent_inflight_key(extent_id)])
                 .await?;
         }
 
-        // F210-A1: only after etcd success do we apply to in-memory.
+        // only after etcd success do we apply to in-memory.
         {
             let mut s = self.store.inner.borrow_mut();
             s.extents.insert(extent_id, updated);
@@ -1659,7 +1659,7 @@ impl crate::AutumnManager {
     }
 }
 
-/// F-EN-DYNSHARD M1b: what `node_health_loop` should do with a df identity echo.
+/// M1b: what `node_health_loop` should do with a df identity echo.
 pub(crate) enum DfEchoAction {
     /// No echo (EN not self-registered), or echo agrees with stored state.
     Ok,
@@ -1692,7 +1692,7 @@ pub(crate) enum DfEchoAction {
 /// M1b surfaces drift as a WARN (the operator, or the EN's next boot
 /// self-register, resolves it) and keeps only the self-protecting imposter
 /// check. A CAS-safe auto-heal (re-read + verify + `nodes/<id>` value-CAS) is a
-/// deferred, reproduce-first follow-up (feature_list F-EN-DYNSHARD M1b note).
+/// deferred, reproduce-first follow-up (feature_list M1b note).
 pub(crate) fn classify_df_echo(
     stored_uuid: &str,
     stored_addr: &str,

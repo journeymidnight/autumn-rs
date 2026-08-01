@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# fuse_chaos.sh — data-plane INTERFACE chaos: autumn-fuse under failover (F273).
+# fuse_chaos.sh — data-plane INTERFACE chaos: autumn-fuse under failover.
 #
 # Boots a 2-PS cluster.sh cluster (tcp), mounts autumn-fuse, runs a file
 # workload through the MOUNT (the full fuse -> SDK -> PS -> EN path incl.
 # the inode-lease subsystem), and injects faults:
-#   F1: kill -9 the partition-holding PS → migration; file I/O through the
-#       mount must resume; every previously-synced file stays byte-exact
-#   F2: kill -9 the manager + exact-cmdline respawn → file I/O resumes
-#   F3: kill -9 the fuse daemon itself + remount → all synced files persist
+#   PS-kill:   kill -9 the partition-holding PS → migration; file I/O through
+#              the mount must resume; every previously-synced file stays byte-exact
+#   MGR-kill:  kill -9 the manager + exact-cmdline respawn → file I/O resumes
+#   FUSE-kill: kill -9 the fuse daemon itself + remount → all synced files persist
 # Final: full manifest verification (sha256 of every synced file).
 #
 # Usage: AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/fuse_chaos.sh
@@ -139,7 +139,7 @@ file_liveness() {
 }
 verify_manifest "baseline"
 
-# ── F1: kill the partition-holding PS → migration under live file I/O ──────
+# ── PS-kill: kill the partition-holding PS → migration under live file I/O ──
 # Retry until BOTH bands probe successfully AND at least one holds a partition —
 # never fold a transient probe failure into 0 (would kill the wrong PS).
 p1=""; p2=""
@@ -147,10 +147,10 @@ for _ in $(seq 1 15); do
     a=$(parts_on 9301) && b=$(parts_on 9351) && [ $((a + b)) -gt 0 ] && { p1=$a; p2=$b; break; }
     sleep 2
 done
-[ -n "$p1" ] || fail "F1: could not determine partition holder (probe failed)"
+[ -n "$p1" ] || fail "PS-kill: could not determine partition holder (probe failed)"
 if [ "${p1:-0}" -ge 1 ]; then VID=1; VPORT=9301; else VID=2; VPORT=9351; fi
 VPID=$(pgrep -f -- "--psid $VID .*--transport tcp" | head -1)
-say "F1: kill -9 holder PS$VID pid=${VPID:-?}"
+say "PS-kill: kill -9 holder PS$VID pid=${VPID:-?}"
 [ -n "$VPID" ] && kill -9 "$VPID"
 deadline=$((SECONDS + 90))
 while [ $SECONDS -lt $deadline ]; do
@@ -158,10 +158,10 @@ while [ $SECONDS -lt $deadline ]; do
     [ "${left:-1}" = "0" ] && break
     sleep 2
 done
-say "F1: migration converged"
+say "PS-kill: migration converged"
 file_liveness "f1"
 verify_manifest "after-PS-kill"
-say "F1: respawn PS$VID"
+say "PS-kill: respawn PS$VID"
 setsid nohup "$PSBIN" --psid "$VID" --port "$VPORT" --manager "$MGR" \
     --listen 127.0.0.1 --advertise "127.0.0.1:$VPORT" --transport tcp \
     > "$WORK/ps${VID}_respawn.log" 2>&1 < /dev/null &
@@ -175,24 +175,24 @@ sleep 6
 # Integrity under EN restart is intact (verified there); the stall is an
 # AVAILABILITY characteristic, not data loss. See fuse CLAUDE.md.
 
-# ── F2: manager kill + respawn under live file I/O ─────────────────────────
+# ── MGR-kill: manager kill + respawn under live file I/O ───────────────────
 MPID=$(pgrep -f autumn-manager-server | head -1)
 MCMD=$(tr '\0' ' ' < "/proc/$MPID/cmdline")
-say "F2: kill -9 manager pid=$MPID"
+say "MGR-kill: kill -9 manager pid=$MPID"
 kill -9 "$MPID"
 sleep 6
 setsid nohup $MCMD > "$WORK/mgr_respawn.log" 2>&1 < /dev/null &
 deadline=$((SECONDS + 150))
 while [ $SECONDS -lt $deadline ]; do
-    [ -n "$("${AOC[@]}" info 2>/dev/null)" ] && { say "F2: manager ready"; break; }
+    [ -n "$("${AOC[@]}" info 2>/dev/null)" ] && { say "MGR-kill: manager ready"; break; }
     sleep 2
 done
 file_liveness "f2"
 verify_manifest "after-mgr-kill"
 
-# ── F3: kill the fuse daemon + remount → durability across the interface ───
+# ── FUSE-kill: kill the fuse daemon + remount → durability across interface ─
 FPID=$(pgrep -f "autumn-fuse --manager" | head -1)
-say "F3: kill -9 fuse daemon pid=$FPID + remount"
+say "FUSE-kill: kill -9 fuse daemon pid=$FPID + remount"
 [ -n "$FPID" ] && kill -9 "$FPID"
 sleep 2
 unmount_all

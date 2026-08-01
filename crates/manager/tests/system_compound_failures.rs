@@ -1,4 +1,4 @@
-//! F074: System test — compound failure: split + PS crash.
+//! System test — compound failure: split + PS crash.
 //!
 //! PS1 writes data, flushes, splits. After split completes, PS1 crashes.
 //! PS2 takes over and opens both child partitions. Data from both
@@ -103,7 +103,7 @@ fn split_then_ps_crash_data_survives() {
         let ps2_addr = pick_addr();
         start_partition_server(81, mgr_addr, ps2_addr);
         let _ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
-        // F099-K: after split, left and right live on different partition ports.
+        // after split, left and right live on different partition ports.
         let router2 = PsRouter::new(mgr_addr, ps2_addr);
 
         // Wait for PS2 to sync regions and open both partitions

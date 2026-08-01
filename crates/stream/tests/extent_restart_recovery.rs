@@ -29,7 +29,7 @@ async fn restart_preserves_commit_length() {
     start_node(dir.path(), addr2).await;
     let conn2 = TestConn::new(addr2);
 
-    // F210-H3 Tier 2: probe_extent is the fence-free length-read path
+    // Tier 2: probe_extent is the fence-free length-read path
     // (the test verifies post-restart length, not owner-lock fence behaviour).
     let cl = conn2.probe_extent(2001).await;
     assert_eq!(cl.code, CODE_OK, "extent 2001 should be loaded");
@@ -87,7 +87,7 @@ async fn restart_extent_remains_writable() {
     start_node(dir.path(), addr2).await;
     let conn2 = TestConn::new(addr2);
 
-    // F210-H3 Tier 2: probe_extent (no fence) — the test verifies the
+    // Tier 2: probe_extent (no fence) — the test verifies the
     // post-restart length, not the owner-lock fence behaviour.
     let cl = conn2.probe_extent(2003).await;
     assert_eq!(cl.code, CODE_OK);

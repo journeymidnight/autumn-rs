@@ -29,7 +29,7 @@ use prost::Message;
 /// [`call_with_sender`] **without** holding a borrow of the channel across
 /// `.await`. This is essential for `EtcdClient`, which is wrapped in
 /// `Rc<RefCell<GrpcChannel>>` for swap-on-reconnect: holding `RefMut` across
-/// an awaited gRPC call would panic the second concurrent caller (F108).
+/// an awaited gRPC call would panic the second concurrent caller.
 pub struct GrpcChannel {
     sender: http2::SendRequest<Full<Bytes>>,
 }

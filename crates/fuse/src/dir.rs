@@ -14,7 +14,7 @@ use crate::state::FsState;
 ///
 /// Uses the `kv_get_opt` barrier so a transient KV/routing failure does NOT
 /// masquerade as "not found" — this is the barrier-correct primitive the PyO3
-/// `autumn.Fs` binding (F-FS-UNIFY M2) needs (a false miss would let a facade
+/// `autumn.Fs` binding (M2) needs (a false miss would let a facade
 /// wrongly `create`/`rename`-over on a transient error). The FUSE `lookup`
 /// layers the ENOENT mapping + lookup-count bump on top.
 pub async fn lookup_opt(
@@ -33,7 +33,7 @@ pub async fn lookup_opt(
 }
 
 /// Lookup a child entry in a directory. Returns `(ino, meta)` — the FUSE
-/// layer converts to `FileAttr` at the reply boundary (F-FS-UNIFY M1). A miss
+/// layer converts to `FileAttr` at the reply boundary (M1). A miss
 /// (or, pre-M2-behavior-preserving, any error mapped by `ops.rs` to ENOENT)
 /// is `Err("ENOENT")`.
 pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u64, InodeMeta)> {
@@ -48,7 +48,7 @@ pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u
 
 /// Resolve an absolute path to its inode by walking dirents from `ROOT_INO`.
 ///
-/// F-FS-UNIFY M2: the FUSE kernel always supplies a parent inode, so the mount
+/// M2: the FUSE kernel always supplies a parent inode, so the mount
 /// path never needs this; the PyO3 `autumn.Fs` binding (and the M3 fsspec
 /// facade) work in `str` paths and need a path→ino walk. Empty components and
 /// `"."` are skipped. `".."` is rejected — the lean POSIX surface (Q5) does not
@@ -134,7 +134,7 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
 }
 
 /// Create a directory. Returns `(ino, meta)` — the FUSE layer converts to
-/// `FileAttr` at the reply boundary (F-FS-UNIFY M1).
+/// `FileAttr` at the reply boundary (M1).
 pub async fn mkdir(
     state: &mut FsState,
     parent: u64,
@@ -174,7 +174,7 @@ pub async fn mkdir(
 /// Create an empty regular file. Returns `(ino, meta)` — the FUSE layer
 /// converts to `FileAttr` and drives the open-lease at the reply boundary;
 /// the PyO3 `autumn.Fs` binding uses the plain `(ino, meta)` directly
-/// (F-FS-UNIFY M2). This is the single source of the file-create KV steps
+/// (M2). This is the single source of the file-create KV steps
 /// (`dispatch.rs` Create calls it, then layers on lease acquire + the
 /// FUSE-runtime `InodeState` cache) — no drift between the two front-ends.
 ///
@@ -252,7 +252,7 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
 
 /// Unlink a regular file (drop one name; reap data when it becomes
 /// unreachable). Single source of the file-unlink KV steps — `dispatch.rs`
-/// Unlink calls this (F-FS-UNIFY M2), as does the PyO3 `autumn.Fs` binding.
+/// Unlink calls this (M2), as does the PyO3 `autumn.Fs` binding.
 ///
 /// UNLINK-1: the `nlink == 0` transition removes the inode's extents through
 /// `extent::remove_unreachable_inode` (tombstoned so a crash mid-removal is
@@ -378,5 +378,5 @@ pub async fn rename(
     Ok(())
 }
 
-// F-FS-UNIFY M1: `dt_to_filetype` moved to `attr.rs` (fuse-gated reply
+// M1: `dt_to_filetype` moved to `attr.rs` (fuse-gated reply
 // boundary) — readdir entries carry the raw `DT_*` byte now.

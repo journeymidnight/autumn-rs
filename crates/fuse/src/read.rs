@@ -1,9 +1,9 @@
 //! Read path: variable-length-extent read via the shared
-//! `ClusterClient::get_many_into` batch primitive (F244-B + F247).
+//! `ClusterClient::get_many_into` batch primitive.
 //!
 //! Two-phase design (autumn-fuse perf fix #1):
 //! - `prepare`: under the dispatcher's `&mut FsState`, do cheap work — flush an
-//!   overlapping write buf, fetch inode meta, load the extent map (F247 runtime
+//!   overlapping write buf, fetch inode meta, load the extent map (runtime
 //!   cache; range-scan on cold), and plan each overlapping extent (key +
 //!   in-extent sub-range + absolute dest offset). Clones the `Rc<ClusterClient>`
 //!   into the plan. `get_many_into` routes per key, so `execute` needs no state.
@@ -13,14 +13,14 @@
 //!   Sparse gaps between extents (and short/over-requested extents) stay zero; a
 //!   hard RPC/routing error surfaces as `Err` (→ EIO).
 //!
-//! F247: data is variable-length extents keyed by logical offset (was fixed
+//! data is variable-length extents keyed by logical offset (was fixed
 //! 256 KiB chunks). The whole-extent reads are ≤ 8 MiB (`MAX_EXTENT`) so the
 //! `bulk_worthwhile` (≥ 64 KiB) per-extent bulk path (`MSG_GET_BULK`) engages on every
 //! full-extent read — the win that motivated the move (model-file serving).
 //! Sub-64 KiB tail/sub-range reads use the regular `MSG_GET` path (bounded by
 //! the client's 30 s `rpc_timeout`). **Tradeoff:** the bulk path has no per-call
 //! timeout (cancel-safety — the dest must outlive the recv), so a hung PS blocks
-//! a large-extent read instead of erroring after 30 s (F239/F216-E tradeoff).
+//! a large-extent read instead of erroring after 30 s.
 
 use std::rc::Rc;
 
@@ -43,7 +43,7 @@ pub struct ReadPlan {
     pub actual_size: usize,
     pub client: Rc<ClusterClient>,
     pub chunks: Vec<ChunkSpec>,
-    /// F-DIRECT-MANY — captured from `FsState.direct_read` at `prepare` time
+    /// captured from `FsState.direct_read` at `prepare` time
     /// (the spawned `execute` holds no `&FsState`). `true` → the batch read
     /// bypasses the PS via `get_many_direct`; `false` → PS-proxied `get_many_into`.
     pub direct_read: bool,
@@ -114,10 +114,10 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
         });
     }
 
-    // Variable-extent read: load the extent map (F247) and plan each extent that
+    // Variable-extent read: load the extent map and plan each extent that
     // overlaps `[offset, read_end)`. Routing happens later inside `get_many_into`
     // (cached binary search per key) — `execute` needs no `&state`.
-    // F-FS-STRIPE: validate the persisted stripe geometry ONCE (coco P3 — else a
+    // validate the persisted stripe geometry ONCE (coco P3 — else a
     // corrupt `lanes=0` would div-by-zero in the key builder below).
     if let Some(s) = &meta.stripe {
         s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
@@ -136,7 +136,7 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
             // `get_many_direct` directly on the client, which prepends
             // `fs/{tenant}/` — same as the write side (kv_put_fenced /
             // flush_appends). The bare `key::*` builder is relative.
-            // F-FS-STRIPE: striped inode → lane key `[0x03][lane][ino][off]`.
+            // striped inode → lane key `[0x03][lane][ino][off]`.
             key: match &meta.stripe {
                 Some(s) => key::extent_key_striped(ino, start, s.lanes, s.unit_bytes),
                 None => key::extent_key(ino, start),
@@ -205,7 +205,7 @@ async fn fill_region(
             dest,
         })
         .collect();
-    // F-DIRECT-MANY: `direct_read` sends the ≥ 64 KiB whole-extent gets STRAIGHT
+    // `direct_read` sends the ≥ 64 KiB whole-extent gets STRAIGHT
     // to an EN (`get_many_direct`), bypassing the PS on the data path; each item
     // falls back to the PS proxy on any direct-read failure, so it's safe even if
     // some ENs are unreachable. Default OFF ⇒ the PS-proxied bulk path
@@ -217,7 +217,7 @@ async fn fill_region(
     };
     drop(items); // release the &mut borrows of `region`
 
-    // Propagate a hard RPC/routing failure (pre-F244 surfaced this at
+    // Propagate a hard RPC/routing failure (an earlier design surfaced this at
     // prepare-time as EIO); `Ok(None)` (missing extent) stays sparse-zero-filled.
     for r in &results {
         if let Err(e) = r {

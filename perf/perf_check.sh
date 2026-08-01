@@ -18,7 +18,7 @@
 #   UCX p=8 × 16t × d=8 × 4 KB → 129 k write / 764 k read
 # 8 MB payload is where UCX rc_mlx5 zero-copy starts beating TCP loopback
 # memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
-# DMA; at 4 KB it's pure overhead (see F100-UCX §12).
+# DMA; at 4 KB it's pure overhead (see the UCX notes §12).
 #
 # UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each
 # PS partition runs a single-threaded UCX worker. The cliff is set by
@@ -143,7 +143,7 @@ PIPELINE_DEPTH_LIST="8"           # depth is client-side only; d=8 is the repres
 SIZES_LIST="4096 8388608"         # default: 4 KB (small-msg) + 8 MB (rndv-zcopy)
 THREADS=16                        # default: 16 client OS threads (see header)
 DURATION=10                       # default: 10 s (baseline window). Use --duration 120
-                                  # to exercise compact/gc paths (F196 D-r7-recal).
+                                  # to exercise compact/gc paths (D-r7-recal).
 
 # Map a byte size to a short label used in baseline filenames:
 # 4096 → "4k", 8388608 → "8m", other → "<N>b" / "<N>k" / "<N>m".
@@ -236,7 +236,7 @@ else
     STORAGE_SUFFIX=""
 fi
 
-# F100-UCX: build with the ucx feature when any UCX run is requested.
+# build with the ucx feature when any UCX run is requested.
 NEED_UCX_FEATURE=0
 for t in $TRANSPORT_LIST; do
     [[ "$t" == "ucx" ]] && NEED_UCX_FEATURE=1
@@ -321,7 +321,7 @@ start_cluster_for() {
     if (( SKIP_CLUSTER == 0 )); then
         bash "$ROOT_DIR/cluster.sh" clean
         await_ports_clear
-        # F122-fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
+        # fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
         # cores serving extent traffic (single-shard mode put all 3-replica
         # writes through 3 cores total — EN became the wall at >100k ops/s).
         # Caller can override via env. With our current cpu-start formula
@@ -336,7 +336,7 @@ start_cluster_for() {
         if (( USE_3DISK )); then
             cluster_3disk=(--3disk)
         fi
-        # F196: cluster.sh default PS cpuset budget = PS_PARTS_HINT (8).
+        # cluster.sh default PS cpuset budget = PS_PARTS_HINT (8).
         # If this bench asks for more partitions, the PS would silently
         # skip openings past the budget. Bump the hint to match the
         # bench's partition count so all partitions actually open.
@@ -344,7 +344,7 @@ start_cluster_for() {
         if [[ -z "$ps_parts_hint_for_bench" ]] && (( parts > 8 )); then
             ps_parts_hint_for_bench="$parts"
         fi
-        # F197-followup (2026-05-13): bumped 4 → 8 after 120 s test
+        # followup (2026-05-13): bumped 4 → 8 after 120 s test
         # showed SHARDS=8 gives read +9 % / read-p99 −11 % at no
         # write cost (write is fsync-bound, the row_stream tail extent
         # serialises on its single shard regardless of total shard count).

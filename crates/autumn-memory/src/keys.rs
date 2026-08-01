@@ -85,7 +85,7 @@ fn hex_val(c: u8) -> Option<u8> {
 }
 
 /// Prefix covering ALL of one agent's private memory, RELATIVE to the client's
-/// `mem/{tenant}/` binding scope (F-KEY-NS D7 Prepend-only: the `ClusterClient`
+/// `mem/{tenant}/` binding scope (D7 Prepend-only: the `ClusterClient`
 /// owns the `mem/{tenant}/` prefix and prepends it, so scope is locked by
 /// construction). `_tenant` is now owned by the binding and ignored here — kept
 /// on the signature only so the many callers don't churn; the full param removal

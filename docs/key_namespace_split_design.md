@@ -11,9 +11,9 @@ Date: 2026-07-16
 > 打头，无 tenant 段）；身份只剩 **principal**，`autumn-op principal-create <name> --grant <prefix>`
 > （通常授一个 ns，如 `fs/`；细分授子前缀 `fs/models/`）；Layer-A 认 key **第 1 段**（ns）；
 > 隔离 = 授不同子前缀，不再靠强制归属段。数据面连接只出示凭据（principal 身份），不再有
-> `--tenant` / `--principal` 两个词的歧义。**这会翻掉 `F-KEY-NS-TENANT-FIRST`**（队友刚上线）；
+> `--tenant` / `--principal` 两个词的歧义。**这会翻掉 tenant-first key 顺序**（队友刚上线）；
 > 线上 VKE **全 reset**（用户确认可接受，无需 in-place 迁移）。完整设计 + 影响 + reset runbook
-> 见 **§8**；实现见 feature_list `F-NS-PRINCIPAL-UNIFIED`。以下 tenant / tenant-first /
+> 见 **§8**；实现见 feature_list 的 principal 统一条目。以下 tenant / tenant-first /
 > `{ns}/{tenant}/` / `{tenant}/{ns}/` 内容全部**保留作历史与论证**，不再是现行方向。
 >
 > **TENANT-FIRST (2026-07-19)：key 顺序已翻转为 `{tenant}/{namespace}/`（tenant 在最外层）。**
@@ -22,7 +22,7 @@ Date: 2026-07-16
 > `{tenant}/{namespace}/[relative]`（如 `default/fs/[0x01]…`）。连带：authz 改「开了就全保护」
 > ——authz 开⇒每个 tenant-scoped 写都要 token，凭据授 `{tenant}/`（整租户）或 `{tenant}/{ns}/`，
 > `protected_prefixes` 退役；Layer-A 的「已注册 namespace」校验改为 key 第 2 段解析（不再左锚
-> prefix-match）。实现见 feature_list `F-KEY-NS-TENANT-FIRST`（client `NamespaceBinding::scoped`
+> prefix-match）。实现见 feature_list 的 tenant-first 条目（client `NamespaceBinding::scoped`
 > 一行 + PS authz 两层 + 部署 grant `default/`）。以下 `{ns}/{tenant}/` 内容保留作历史/论证。
 >
 > **REVERSION (2026-07-18)：`{volume}` 子层已移除，fuse 前缀回到 `fs/{tenant}/`。**
@@ -36,7 +36,7 @@ Date: 2026-07-16
 >   会让 mount 响亮拒绝，绝不静默当空盘（见 `crates/fuse/src/meta.rs` +
 >   `tests/system_fuse_ns.rs::stale_volume_data_refuses_mount`）。
 > 隔离单元由此从 `(tenant, volume)` 收敛为 `tenant`。以下 SD-3 内容保留作历史。
-相关 feature 条目：F-KEY-NS-FUSE / F-POLICY-SIZE-EST-LIVE / F-SPLIT-AT-KEY / F-PRESPLIT-DEPLOY-MODE（feature_list.md）
+相关 feature 条目：fuse key-namespace / live size 估计 / split-at-key / presplit 部署模式（feature_list.md）
 
 用户提出两条主张：
 1. **内置的应用必须有 prefix**；
@@ -49,8 +49,8 @@ Date: 2026-07-16
   kvc/、mem/ 都遵守，**fuse 是唯一的违约者**（裸 `0x01`–`0x04` 字节）。
   这不只是热点问题，是一个真实的隔离/损坏漏洞（§2.1）。
 - **主张 2 的目标成立，但实现位置要改**：per-app 规则不应该进 partition
-  layer（PS/manager 机制层），应该进 **policy/controller 层**（F203 的
-  mechanism/policy 分离是本仓库自己立下的架构原则）。partition 层已有的
+  layer（PS/manager 机制层），应该进 **policy/controller 层**（mechanism/policy
+  分离是本仓库自己立下的架构原则）。partition 层已有的
   split 机制（median-user-key，任意字节切点）对所有应用**天然够用**；
   真正坏掉的是**触发器的度量口径**（`size_bytes` = LSM 常驻字节，对
   大 value 负载失明，§2.2）和 presplit 模式被部署层硬编码埋掉（§2.3）。
@@ -68,7 +68,7 @@ Date: 2026-07-16
 |---|---|---|---|
 | ① `PartitionLoad.size_bytes`（`info --part 17 --detail`、policy split/merge、hot/cold size 维度、Prometheus gauge） | 741 MB | **LSM 常驻字节** = Σ SST `len` + active/imm memtable 字节。>4 KiB 的 value 走 ValuePointer，SST/memtable 里只有 ~24–40 B 的指针，**value 本体（在 log_stream）完全不计** | `partition-server/src/lib.rs::lsm_resident_bytes`（1228）；writer 在 `background.rs:309-317`（30 s 刷新） |
 | ② `autumn-op info` 每 partition 的 `live_size` | 45.4 GB | 该 partition 三条 stream（log/row/meta）**去重后所有 extent 的字节和**：sealed 取 `sealed_length`，open tail 现场 probe EN。**包含尚未 GC 的死字节**（被覆盖/删除的大 value）与 CoW split 后与兄弟共享的 extent（双计） | `autumn_op/main.rs::run_info`（~2106-2134） |
-| ③ dashboard/overview 的 `live_size` | — | ②的周期性 rollup 版：manager sealed 和 + PS 上报的 `open_tail_bytes`（5 s 心跳携带，30 s 刷新） | manager `compute_cluster_overview_resp`（F-OVERVIEW-OPENTAIL） |
+| ③ dashboard/overview 的 `live_size` | — | ②的周期性 rollup 版：manager sealed 和 + PS 上报的 `open_tail_bytes`（5 s 心跳携带，30 s 刷新） | manager `compute_cluster_overview_resp` |
 
 推论（这是 §2.2 的全部根源）：
 
@@ -78,10 +78,10 @@ Date: 2026-07-16
 - policy（split/merge/hot-cold size 维度）消费的是 ①。对 fuse/kvcache
   这类几乎全部字节都在 VP 里的负载，policy 看到的是一个缩小 ~60× 的影子。
 
-**订正一处文档陈旧**：manager CLAUDE.md:234（F-OVERVIEW-OPENTAIL 段）仍写着
-"`PartitionLoad.size_bytes` has no writer (always 0) … F-PS-SIZE-BYTES-DEAD
+**订正一处文档陈旧**：manager CLAUDE.md:234（open-tail overview 段）仍写着
+"`PartitionLoad.size_bytes` has no writer (always 0) … 作为死字段
 deferred"。该 gauge 已于 2026-07-05 复活（`background.rs:309` 的
-F-PS-SIZE-BYTES-DEAD 注释就是复活现场），写入的就是 LSM 常驻字节。
+注释就是复活现场），写入的就是 LSM 常驻字节。
 结论没变（对 VP 负载失明），但"恒 0"的描述已过期，随本设计落地时应同步改。
 
 ---
@@ -163,7 +163,7 @@ CoW 复制三条 stream。要点：
   next_inode 计数器），client 的杂 key 混进去会让 readdir/sweep
   扫出无法解析的记录。
 
-对比：mem/ 有百分号编码防止组件伪造分隔符，且 F-AUTHZ-1 的数据面
+对比：mem/ 有百分号编码防止组件伪造分隔符，且数据面 authz 的
 capability 机制（`docs/data_plane_authz_design.md`，PS 侧
 `protected_prefixes` + `allowed_prefixes` 前缀检查）已经为 "按字节前缀
 做服务端隔离" 修好了路 —— **fuse 的裸字节空间连被这个机制保护的资格
@@ -240,7 +240,7 @@ fs/{tenant}/{volume}/\x04[field]                 superblock / next_inode floor /
   fail-loud 校验），**不做百分号编码** —— 它们是运维配置名，不是运行时
   任意数据（mem/ 需要 q() 编码的原因在此不成立）。
 - 选 ASCII 前缀而不是另一个保留裸字节（如 `\x05`）：与 kvc/、mem/
-  同一 convention，可 grep、可在 `autumn-op ls` 里辨认、可被 F-AUTHZ-1
+  同一 convention，可 grep、可在 `autumn-op ls` 里辨认、可被数据面 authz
   的 `protected_prefixes` 直接声明。两层结构额外送一个能力：authz 既可
   按 `fs/` 整族保护，也可按 `fs/{tenant}/` 分租户授权。
 - 前缀之后的内部布局**不变**（保持 BE 排序性质、positional 解析，
@@ -266,7 +266,7 @@ etcd key）的操作，天然正确。逐项：
   root ino=1 本来就是 per-mount 概念，volume 作用域的 ino 命名空间让它
   无需任何全局协调。
 - **`next_inode` 计数器每 volume 一份（必须）**：manager 侧 etcd key
-  由全局单个 `autumn-rs/fs/next_inode`（F-FS-UNIFY M0）改为
+  由全局单个 `autumn-rs/fs/next_inode`（fuse/fsspec 合一 M0）改为
   `autumn-rs/fs/{tenant}/{volume}/next_inode`；KV 侧迁移 floor 同步变
   `fs/{t}/{v}/\x04next_inode`。注意：共享全局计数器本身不会造成 ino
   碰撞（key 空间已隔离），但它给每个 volume 埋一条隐蔽的跨 volume
@@ -348,9 +348,9 @@ D7 消亡（写入必须归属某 namespace）。
 ```
 est_live_bytes(part) =
     Σ sealed_length(该 partition 三条 stream 的去重 extent)   # manager 状态，已有
-  + PartitionLoad.open_tail_bytes                              # PS 已上报（F-OVERVIEW-OPENTAIL）
-  − PartitionLoad.gc_debt_bytes                                # PS 已上报（F187，sealed 死字节）
-  − PartitionLoad.open_tail_dead_bytes                         # PS 已上报（F-DF-WALDEBT，open tail 死字节）
+  + PartitionLoad.open_tail_bytes                              # PS 已上报（open-tail overview）
+  − PartitionLoad.gc_debt_bytes                                # PS 已上报（sealed 死字节）
+  − PartitionLoad.open_tail_dead_bytes                         # PS 已上报（open tail 死字节）
 ```
 
 - **纯 manager 侧改动**（policy_tick 里计算，喂给 split/merge/hot-cold
@@ -429,7 +429,7 @@ fuse 的单大文件 presplit 切不开。**任何 bootstrap 时刻的静态规�
 
 - 机制上不需要：split 选点已经是 data-driven 的（median 跟着真实 key
   分布走），app 身份不改变"往哪切"的答案；
-- 架构上有先例约束：F203 花了真实成本把 manager 清成纯 mechanism、
+- 架构上有先例约束：此前已花真实成本把 manager 清成纯 mechanism、
   把策略赶进 controller（auto_policy.rs），PS 里塞 app 规则是开倒车；
 - 演化上更脆：partition 层认识 `kvc/` 的那天起，`_keys.py` 改版就要
   同步改 Rust —— 跨语言耦合换不来任何 median+--at 给不了的能力。
@@ -520,7 +520,7 @@ P0 修复的定义从"D1"修正为"D1+D6"；§4 的实施顺序同步更新。
   **宽限期 = TTL 的可用性依赖**（强制本身不回调 manager，但续签
   leader-only）。这是 authz 的固有代价，必须写进运维认知：TTL 是
   "撤销窗口 vs manager 故障容忍"的权衡旋钮 —— 按设计默认小时级，
-  比 F265/etcd-chaos 实测的 manager 故障恢复时间（秒~分钟级）有
+  比 etcd-chaos 实测的 manager 故障恢复时间（秒~分钟级）有
   充足余量，但"manager 挂一整天"从此不再是数据面无感事件。
 - **令牌轮换**：kid 多密钥 + disabled 位 + PS 5 s poll，机制已支持
   （加新 kid → 新 token 用新 kid → 旧 token 自然过期 → 禁旧 kid）；
@@ -661,7 +661,7 @@ client.rescope("kvc", "acme")?                       // 多 pair 工具：换作
 
 | 面 | 改动 | 量级 |
 |---|---|---|
-| `crates/client/src/lib.rs` | `NamespaceBinding` 字段 + Prepend/Assert 两模式 + `connect_ns`/`rescope` + credential 同点绑定校验 + `raw()` 逃生舱 | 大（本项主体，F-AUTHZ-1 Stage 3 量级） |
+| `crates/client/src/lib.rs` | `NamespaceBinding` 字段 + Prepend/Assert 两模式 + `connect_ns`/`rescope` + credential 同点绑定校验 + `raw()` 逃生舱 | 大（本项主体，数据面 authz Stage 3 量级） |
 | PyO3（`python/src/lib.rs`） | `BatchClient(namespace=…, tenant=…)` / `Client.connect(…, namespace=, tenant=)` **必填参数**（无缺省） | 小 |
 | `autumn.Fs` / fuse mount / `autumnfs` | Assert 绑定到 `fs/`；key builder 零改动 | 小 |
 | kvcache（`_keys.py`）/ memory（`keys.rs`） | Assert 绑定到 `kvc/`/`mem/`；builder 零改动 | 小 |
@@ -762,7 +762,7 @@ D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
 
 - **创建**：`autumn-op namespace-create --name bench
   [--presplit 8:hexstring] [--with-tenant]`（admin-token gated，
-  与 tenant-create 同门禁）→ etcd `namespace/<name>`（F149 fenced）
+  与 tenant-create 同门禁）→ etcd `namespace/<name>`（leader fenced）
   → PS 5 s poll 生效。命名规则与 D1 组件一致：`[a-z0-9._-]+`，
   注册表内以 `name + "/"` 存前缀。**内置三族（fs/、kvc/、mem/）由
   bootstrap 预注册**，注册表粒度 = 顶层 family（`fs/` 一行，不是
@@ -852,7 +852,7 @@ D6 的 protected_prefixes 手工清单**随之消亡** —— 被"注册表里
 - **代价照实记**：≥7 个面的一次性破坏改动 + 一个 wire bump +
   新错误码 + 5 s 传播窗口的新失败模式 + perf-check 重设计。全部
   绑进 D1 的停机批次后，边际运维成本 ≈ 0，但代码量是本 doc 各项
-  里最大的（估计与 F-AUTHZ-1 Stage 3 同量级）。
+  里最大的（估计与数据面 authz Stage 3 同量级）。
 
 ### 3.8 D8：presplit 按 namespace —— 从"集群级一次性模式"到"namespace-create 时的 SPLITS"【已拍板】
 
@@ -1025,7 +1025,7 @@ namespace 一行、tenant 不注册，授权/presplit 操作粒度 = pair，CLI
   两个 presplit 的切法、部署硬编码 hexstring、fuse key 无前缀、线上
   key→partition 映射——**全部与代码/实测一致**。
 - ✏️ "`size_bytes` 无 writer / 恒 0"（manager CLAUDE.md 原文）——
-  **已过期**：F-PS-SIZE-BYTES-DEAD 于 2026-07-05 复活了该 gauge
+  **已过期**：该 gauge 已于 2026-07-05 复活
   （`background.rs:309`），现在写入 LSM 常驻字节。所以线上 policy
   才会有 741 MB 这个非零读数。失明结论不变，但机理是"量错了东西"，
   不是"没在量"。
@@ -1066,7 +1066,7 @@ Status: 设计定稿，待实现（三个子交付分片，共享一次 wire 冻
 
 ### 7.1 SD-1：D2 注册表 + 整批 wire 冻结（foundation，先落）
 
-模板全部照抄 **`tenantAccount/` 账户 DB**（F-AUTHZ-1，string-keyed etcd
+模板全部照抄 **`tenantAccount/` 账户 DB**（数据面 authz，string-keyed etcd
 前缀 + rkyv 结构 + replay fail-loud），它与 `namespace/<name>` 同构。
 
 | # | 改动 | 抄自 / 改处（file:line） | 量级 |
@@ -1113,7 +1113,7 @@ bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注�
    但 **builder 本身要加 tenant 层**（J）。所以 `_keys.py` 是**小改动，
    非零改动**——§3.7 改动面清单 line 633 "builder 零改动" 只对"binding
    不双拼前缀"成立，对"builder 产出的绝对 key 形状"不成立。以本节 J 为准。
-2. **F186 条带大 value 的 chunk key 落在 tenant 区间外 → 决定：把 namespace
+2. **条带大 value 的 chunk key 落在 tenant 区间外 → 决定：把 namespace
    前缀提到 chunk 前缀外层**。现状 `make_chunk_key`（`client/lib.rs:3222`）=
    `\xff\xfe...` 外层前缀 + user_key，排在所有 user key 之后、落在
    `[{ns}/{tenant}/, {ns}/{tenant}0)` **之外**。若不处理，Layer A（put 必须
@@ -1142,7 +1142,7 @@ bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注�
 | J | presplit 工具 `fuse_split_ranges` 把 `fs/{t}/{v}/` 拼到 `vec![0x03,…]` 切点前；改文档 + 字节字面量测试 | `args.rs:1205-1223`,`1438-1545` |
 | K | Python `autumn.Fs`：`connect` 加 `tenant`/`volume` 穿给 `FsState::new_with_host`；key 代码零改（走 Rust core）| `python/src/fs.rs:132-188` |
 | L | fuse mount 的 ClusterClient 用 **Assert 绑定 `fs/`**（依赖 SD-2 binding）| mount 接线 |
-| M | 测试穿 prefix + per-volume counter | `f_fuse_lease_{1,2}.rs`,`system_fuse_read.rs`,`fs_alloc_inodes.rs` |
+| M | 测试穿 prefix + per-volume counter | `fuse_lease_{1,2}.rs`,`system_fuse_read.rs`,`fs_alloc_inodes.rs` |
 
 ### 7.4 部署 runbook（一次 stop-world；**cluster reset，不迁移**）
 
@@ -1187,7 +1187,7 @@ bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注�
   清单后，这条 env 的必要性进一步下降；部署层若要 env 需另加接线。
 - **§3.7 改动面清单 line 633 "kvcache builder 零改动" 需订正**为"binding 不前缀化，但
   builder 加 tenant 层（小改）"（见 7.2 细化 1）。
-- **F186 chunk key 的 namespace 归属**是 §3.7 未覆盖的新决策点，已在 7.2 细化 2 定稿
+- **条带 chunk key 的 namespace 归属**是 §3.7 未覆盖的新决策点，已在 7.2 细化 2 定稿
   （前缀提到 chunk 外层，落进 tenant 区间）。
 
 ---
@@ -1195,7 +1195,7 @@ bootstrap 预注册 + wire fingerprint 测试），其 wire 供 D7/D1 用但注�
 ## 8. Option 3 —— intranet-unified：ns-first key + principal-grant（取代 tenant-first，2026-07-19）
 
 > 本节是**现行方向**，取代 §1–§7 里所有 tenant / tenant-first / `{tenant}/{ns}/`
-> 结论。实现 = feature_list `F-NS-PRINCIPAL-UNIFIED`。
+> 结论。实现 = feature_list 的 principal 统一条目。
 
 ### 8.1 为什么：可信内网 ≠ 公有云
 
@@ -1326,7 +1326,7 @@ $AC --namespace fs ls                        # 列 fs/ 下的 key（无凭据=au
   只是 token 的 scope 从 `{tenant}/…` 变成 `{ns}/…` grant，机制不变。
 - namespace 注册表（D2）、按 namespace 的 presplit 规则（D8，切点前缀去掉 tenant 段即可）、
   policy 的 size 口径（D3）、split/merge 机制（D4）。
-- `admin_auth_design.md` 的控制面 admin-token（F-ADMIN-OP-AUTH，仍待实现）与本节正交。
+- `admin_auth_design.md` 的控制面 admin-token（admin-op 鉴权，仍待实现）与本节正交。
 
 ### 8.8 默认 principal：一份统一资源 + 一个全权限身份
 

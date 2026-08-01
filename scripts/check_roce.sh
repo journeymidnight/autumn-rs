@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check_roce.sh — quick RoCEv2 sanity check for autumn-rs UCX transport (F100-UCX).
+# check_roce.sh — quick RoCEv2 sanity check for autumn-rs UCX transport.
 #
 # Walks every InfiniBand-class device in /sys/class/infiniband/ and reports:
 #   - port state + link layer (Ethernet = RoCE, InfiniBand = IB)
@@ -109,9 +109,9 @@ fi
 log ""
 log "summary: $usable usable RoCEv2 GID(s)"
 if [ "$usable" -gt 0 ]; then
-  log "autumn-rs F100-UCX: AUTUMN_TRANSPORT=ucx is viable on this host"
+  log "autumn-rs: AUTUMN_TRANSPORT=ucx is viable on this host"
   exit 0
 else
-  log "autumn-rs F100-UCX: no usable RoCEv2 endpoint — UCX mode will fall back / fail"
+  log "autumn-rs: no usable RoCEv2 endpoint — UCX mode will fall back / fail"
   exit 1
 fi

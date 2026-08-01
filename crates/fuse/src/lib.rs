@@ -1,4 +1,4 @@
-// F-FS-UNIFY M1: the crate is split into two feature layers.
+// M1: the crate is split into two feature layers.
 //
 //   `core` — the fuser-FREE filesystem core: inode/dirent/extent layout
 //   (`key`/`schema`), namespace ops (`meta`/`dir`), data path
@@ -41,8 +41,8 @@ pub mod dispatch;
 #[cfg(feature = "fuse")]
 pub mod ops;
 
-/// Re-export `fuser` so downstream test crates (autumn-manager tests
-/// for F-fuse-lease-*) can name the bridge-handler reply types
+/// Re-export `fuser` so downstream test crates (autumn-manager
+/// inode-lease tests) can name the bridge-handler reply types
 /// (`fuser::FileAttr`) without taking a direct dep on `fuser`. The
 /// FUSE-callback types come and go with the `fuse` feature, same as
 /// the rest of this module set.

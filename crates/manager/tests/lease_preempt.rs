@@ -1,4 +1,4 @@
-//! F-lease-preempt — force-revoke / writer revoke protocol.
+//! Force-revoke / writer revoke protocol.
 //! End-to-end via the real `AcquireLease` RPC + the
 //! `autumn-client::lease` helpers.
 //!

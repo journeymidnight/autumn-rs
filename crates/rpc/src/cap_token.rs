@@ -1,5 +1,5 @@
 //! Ed25519 capability-token codec — the shared wire + crypto core for
-//! data-plane authz (`docs/data_plane_authz_design.md`, F-AUTHZ-1).
+//! data-plane authz (`docs/data_plane_authz_design.md`).
 //!
 //! The manager (leader) acts as a KDC and **signs** short-TTL capability
 //! tokens with an Ed25519 private key. The partition-server (KV layer)

@@ -32,12 +32,12 @@ pub const MSG_UPSERT_PARTITION: u8 = 0x2D;
 pub const MSG_GET_REGIONS: u8 = 0x2E;
 pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 
-// F099-K: per-partition listener address registration (PS reports the
+// per-partition listener address registration (PS reports the
 // `host:port` of each partition's TcpListener to the manager so clients
 // can target the owning partition's CPU shard directly).
 pub const MSG_REGISTER_PARTITION_ADDR: u8 = 0x30;
 
-// F109: extent-node startup orphan reconcile. The node sends every
+// extent-node startup orphan reconcile. The node sends every
 // `extent_id` it loaded from disk; the manager replies with the subset
 // no longer present in `s.extents` so the node can unlink them.
 pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
@@ -50,13 +50,13 @@ pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 // 0x33 retired with the vp_table_refs removal (was
 // MSG_SYNC_PARTITION_VP_REFS, partition→manager VP-dependency sync).
 
-// F183: partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
+// partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
 pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
-// F183: advisory engine — query split/merge candidates.
+// advisory engine — query split/merge candidates.
 pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
-// F183: per-partition load metrics report (PS → manager, 5 s cadence).
+// per-partition load metrics report (PS → manager, 5 s cadence).
 pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
-// F185: orchestrated partition merge — inputs are just (survivor, victim).
+// orchestrated partition merge — inputs are just (survivor, victim).
 // The manager (which is leader-fenced + persistent) acquires its own
 // admin owner lock, freezes both PSes via MSG_MERGE_FREEZE, captures the
 // 6 commit_lengths under the freeze, then runs the existing
@@ -66,60 +66,60 @@ pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 // drops the frozen PartitionData on next tick) or it doesn't (PSes
 // auto-unfreeze after FREEZE_TTL seconds).
 pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
-// F192: PS → manager push-based disk failure signal. Fire-and-forget
+// PS → manager push-based disk failure signal. Fire-and-forget
 // (req_id = 0); manager deduplicates by reporter_part_id, applies a
 // 60 s sliding window + 3-distinct-reporter quorum before flipping
-// `node.disks[*].online = false`. Pre-F192 the manager's disk online
-// view was purely pull-based via the df loop (`node_health_loop` since
-// F222, 2 s; was `disk_status_update_loop`, 10 s), so between F190's
-// per-stream alloc route-around and the next DF poll the global view
+// `node.disks[*].online = false`. Previously the manager's disk online
+// view was purely pull-based via the df loop (`node_health_loop`, 2 s;
+// was `disk_status_update_loop`, 10 s), so between the per-stream
+// alloc route-around and the next DF poll the global view
 // lagged the per-stream truth.
 pub const MSG_REPORT_DISK_FAILURE: u8 = 0x38;
 
-// F203: per-extent EC convert trigger. Replaces the deleted
+// per-extent EC convert trigger. Replaces the deleted
 // ec_conversion_dispatch_loop fresh-candidate scan. Persists a rich
 // `pending_ec_dispatch` marker for `extent_id`; the next dispatch_loop
-// tick drains it via the F198 replay path.
+// tick drains it via the replay path.
 pub const MSG_FORCE_EC_CONVERT: u8 = 0x39;
 
-// F203: external policy controller helper — query the manager's
+// external policy controller helper — query the manager's
 // latest cached `PartitionLoad` for a given partition. Lets `client
 // info --part PID --detail` surface SST tombstone / expired /
 // out-of-range / minor pending byte counts without a separate PS RPC.
 pub const MSG_GET_PARTITION_DETAIL: u8 = 0x3A;
 
-// F210-F1: const-dump of the `POLICY_KIND_*` enum so external
+// const-dump of the `POLICY_KIND_*` enum so external
 // controllers (Python, ops scripts) can introspect the wire values
 // without hardcoding them. The values themselves are wire-stable
-// (frozen — pre-F210-F1 a docstring drift made the docs say `1..7`
+// (frozen — a docstring drift once made the docs say `1..7`
 // while the code said `0..6`, which produced an off-by-one bug in
-// every Python controller that trusted the docs). After F210-F1 the
+// every Python controller that trusted the docs). Now the
 // names + values come from the manager binary as the single source
 // of truth; any future addition appends a new `(name, value)` pair.
 pub const MSG_GET_POLICY_KIND_NAMES: u8 = 0x3B;
 
-// ── F211 operator-driven node lifecycle ─────────────────────────────────────
+// ── operator-driven node lifecycle ──────────────────────────────────────────
 //
-// F211-B: read-only health reporting — the operator policy script reads
+// read-only health reporting — the operator policy script reads
 // these to decide whether to `mgr_fence_node` / `mgr_set_node_maintenance`.
 pub const MSG_LIST_NODE_STATES: u8 = 0x3C;
 pub const MSG_EXTENT_HEALTH_REPORT: u8 = 0x3D;
 pub const MSG_LIST_EC_INFLIGHT_MARKERS: u8 = 0x3E;
 
-// F211-C: admin RPCs that mutate `node_override/<node_id>` (etcd-persisted)
+// admin RPCs that mutate `node_override/<node_id>` (etcd-persisted)
 // — operator explicitly fences / maintains / clears / removes nodes.
 pub const MSG_FENCE_NODE: u8 = 0x3F;
 pub const MSG_SET_NODE_MAINTENANCE: u8 = 0x40;
 pub const MSG_CLEAR_NODE_OVERRIDE: u8 = 0x41;
 pub const MSG_REMOVE_NODE: u8 = 0x42;
 
-// F211-H: monitoring of the recovery throttle / queue depth.
+// monitoring of the recovery throttle / queue depth.
 pub const MSG_RECOVERY_STATS: u8 = 0x43;
 
-// F211-I: append-only operator audit log query.
+// append-only operator audit log query.
 pub const MSG_QUERY_AUDIT_LOG: u8 = 0x44;
 
-// F214-A: read-only cluster identity. The manager CAS-writes a UUID to
+// read-only cluster identity. The manager CAS-writes a UUID to
 // etcd `autumn-rs/cluster_id` on first leader promotion; this RPC exposes
 // it to `autumn-op format` (stamps cluster_id into each formatted disk)
 // and to `autumn-extent-node` (verifies the disk's stamped cluster_id
@@ -127,7 +127,7 @@ pub const MSG_QUERY_AUDIT_LOG: u8 = 0x44;
 // replayed state — no leader check.
 pub const MSG_GET_CLUSTER_ID: u8 = 0x45;
 
-// ── F-ioring-lease-1: inode-level lease + close-to-open coherence ──────────
+// ── inode-level lease + close-to-open coherence ─────────────────────────────
 //
 // JuiceFS-style single-writer / many-reader leases on each fuse inode,
 // served by the manager (same etcd backing as owner locks). The lease
@@ -180,7 +180,7 @@ pub const MSG_CLUSTER_DF: u8 = 0x4D;
 /// Per-partition extents are fetched lazily via scoped `MSG_STREAM_INFO`.
 pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
 
-// ── F-AUTHZ-1: manager-as-KDC (data-plane authz) ──────────────────────────────
+// ── manager-as-KDC (data-plane authz) ─────────────────────────────────────────
 //
 // The manager (leader) is a KDC: it holds an Ed25519 signing private key + a
 // tenant account DB, mints short-TTL capability tokens, and publishes its
@@ -197,7 +197,7 @@ pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
 // account (credential_hash + allowed_prefixes) in the KDC's account DB.
 pub const MSG_TENANT_CREATE: u8 = 0x51;
 pub const MSG_TENANT_DELETE: u8 = 0x52;
-// F-FS-UNIFY M0: fuse-fs inode-number allocation moved into the manager
+// M0: fuse-fs inode-number allocation moved into the manager
 // (leader-fenced etcd CAS). The old scheme — every allocator doing a
 // non-CAS read-modify-write on the `[0x04]next_inode` fs KV key — hands
 // out DUPLICATE inode batches under concurrent allocators (two mounts,
@@ -219,8 +219,8 @@ where
 
 /// Deserialize a value from bytes using rkyv with archive-bytes validation.
 ///
-/// F155: switched from `from_bytes_unchecked` to the checked `from_bytes`.
-/// Pre-F155 a malformed payload (corrupted by a flipped bit that escaped TCP
+/// switched from `from_bytes_unchecked` to the checked `from_bytes`.
+/// Previously a malformed payload (corrupted by a flipped bit that escaped TCP
 /// CRC, a peer running an incompatible struct layout from a partial rolling
 /// upgrade, or — in a future where the wire crosses an untrusted boundary —
 /// a hostile sender) caused undefined behaviour: out-of-bounds reads, pointer
@@ -253,12 +253,12 @@ pub struct MgrRange {
 
 /// Node metadata.
 ///
-/// F099-M: `shard_ports` lists the per-shard TCP listener ports on the
+/// `shard_ports` lists the per-shard TCP listener ports on the
 /// extent-node process. Clients route hot-path RPCs (append, read_bytes,
 /// commit_length) by `extent_id % shard_ports.len()`. When `shard_ports`
 /// is empty, clients fall back to `address` (legacy single-thread mode).
 ///
-/// F191: `control_address` is the extent-node's *separate* control-plane
+/// `control_address` is the extent-node's *separate* control-plane
 /// listener — by convention `host:port + 1000`. Manager DF / future
 /// heartbeat / disk-failure-report RPCs travel on this address via a
 /// dedicated `control_pool`, so a sustained data-plane RPC (CONVERT_TO_EC,
@@ -273,10 +273,10 @@ pub struct MgrNodeInfo {
     pub disks: Vec<u64>,
     /// Optional per-shard ports. Empty = legacy single-thread extent-node.
     pub shard_ports: Vec<u16>,
-    /// F191: optional control-plane address. Empty = legacy node;
+    /// optional control-plane address. Empty = legacy node;
     /// manager falls back to `address` for DF.
     pub control_address: String,
-    /// F-EN-DYNSHARD M0: stable node identity (UUID v4), decoupled from the
+    /// M0: stable node identity (UUID v4), decoupled from the
     /// network address so an EN can change IP / shard-port layout across
     /// restarts and still be recognised as the SAME node (mirrors the PS's
     /// `ps_id`-vs-address split). Persisted WITH the node; the manager matches a
@@ -293,14 +293,14 @@ pub struct MgrDiskInfo {
     pub uuid: String,
 }
 
-/// F198: rkyv-encoded value of the `ecConversionInflight/<extent_id>` etcd
-/// marker. F173 originally persisted only the existence of the marker
+/// rkyv-encoded value of the `ecConversionInflight/<extent_id>` etcd
+/// marker. This originally persisted only the existence of the marker
 /// (empty value); on leader failover or process restart the new leader
 /// could not safely re-dispatch because it didn't know which `target_nodes`
 /// the deposed leader had selected (a fresh `shuffle().take(extra)` would
 /// pick different parity-node IDs, and `alloc_extent_on_node` against a
 /// node that already received shard data resets that node's in-memory
-/// state — silently corrupting EC layout). F198 widens the marker so
+/// state — silently corrupting EC layout). A later change widens the marker so
 /// re-dispatch can reuse the original assignment.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrEcDispatchInflight {
@@ -315,7 +315,7 @@ pub struct MgrEcDispatchInflight {
     pub extra_disk_ids: Vec<u64>,
     pub data_shards: u32,
     pub new_eversion: u64,
-    /// F211-D Tier 2: owner-lock owner_epoch the manager held when this
+    /// Tier 2: owner-lock owner_epoch the manager held when this
     /// dispatch was authorised. Threaded into `ExtConvertToEcReq.owner_epoch`
     /// → `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch` so a
     /// fenced ex-coord whose in-flight 2PC continues with the OLD owner_epoch
@@ -325,7 +325,7 @@ pub struct MgrEcDispatchInflight {
     /// `auto_abandon_for_fenced_node` (fence-handover via
     /// `MSG_CHECK_COMMIT_LENGTH`) so the EN-side check fires.
     ///
-    /// `0` keeps the pre-F211-D-Tier-2 no-fence behaviour for tests /
+    /// `0` keeps the earlier no-fence behaviour for tests /
     /// memory-only mode where no owner_lock has been acquired.
     pub owner_epoch: i64,
 }
@@ -472,13 +472,13 @@ pub const CODE_INVALID_ARGUMENT: u8 = 2;
 pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
 pub const CODE_NOT_LEADER: u8 = 5;
-/// F-lease-preempt: `AcquireLease(force=true)` against a held writer
+/// Lease preemption: `AcquireLease(force=true)` against a held writer
 /// surfaces this; the response's `lease.ttl_secs` is repurposed to
 /// carry the grace milliseconds REMAINING in the current revoke
 /// window. Client retries the acquire after that delay (or sooner
 /// if it sees a `WriterClosed` invalidation).
 pub const CODE_REVOKE_PENDING: u8 = 6;
-/// F-KEY-NS D7 Layer-A: a put-class write whose key falls in NO registered
+/// D7 Layer-A: a put-class write whose key falls in NO registered
 /// namespace prefix. Semantics = NotFound-class (the target namespace does not
 /// exist). **Defined in SD-1, RETURNED by the PS Layer-A gate in SD-2.** 7/8/9
 /// are already taken by `partition_rpc` (Unavailable / RegionEpochStale /
@@ -509,14 +509,14 @@ pub struct AcquireOwnerLockResp {
 pub struct RegisterNodeReq {
     pub addr: String,
     pub disk_uuids: Vec<String>,
-    /// F099-M: per-shard ports the extent-node listens on. Empty = legacy
+    /// per-shard ports the extent-node listens on. Empty = legacy
     /// single-thread mode (clients route all extents to `addr`).
     pub shard_ports: Vec<u16>,
-    /// F191: extent-node's control-plane listener address (typically
+    /// extent-node's control-plane listener address (typically
     /// `host:port + 1000`). Empty = caller wants the manager to fall back
     /// to the data-plane `addr` for DF (legacy / mid-upgrade behaviour).
     pub control_address: String,
-    /// F-EN-DYNSHARD M0: stable node identity (UUID v4), decoupled from the
+    /// M0: stable node identity (UUID v4), decoupled from the
     /// network address so a node can change IP / shard-port layout across
     /// restarts and still be recognised as the SAME node (mirrors the PS's
     /// `ps_id`-vs-address split). Empty = legacy uuid-less caller (matched by
@@ -622,7 +622,7 @@ pub struct StreamAllocExtentReq {
     ///   a QUIESCED point via the `SealCommit` worker handshake (in-flight
     ///   drained first), or a known exact end (preemptive roll). Honoured even
     ///   for `Some(0)` (an empty tail where nothing was ever all-acked → sealed
-    ///   empty, `sealed = true, sealed_length = 0`). This prevents the F227
+    ///   empty, `sealed = true, sealed_length = 0`). This prevents the
     ///   phantom seal: a probe over reachable members can capture a
     ///   speculative/un-acked byte that only one (soon-dead) member holds,
     ///   sealing at a length no replica durably retains (the seed=13 stuck-
@@ -632,7 +632,7 @@ pub struct StreamAllocExtentReq {
     ///   `compute_commit_seal` (seal-over-reachable). Moot when the tail is
     ///   already sealed (the existing seal is preserved untouched).
     pub seal_commit: Option<u64>,
-    /// F190: per-stream "recently failed" node ids the writer wants the
+    /// per-stream "recently failed" node ids the writer wants the
     /// manager to skip when picking nodes for the new extent. Empty Vec
     /// means "no exclusions" (legacy / cold-start clients). The manager
     /// filters candidate nodes by this set before scoring; if the filter
@@ -743,7 +743,7 @@ pub struct GetRegionsResp {
     pub regions: Vec<(u64, MgrRegionInfo)>,
     /// (ps_id, MgrPsDetail) pairs
     pub ps_details: Vec<(u64, MgrPsDetail)>,
-    /// F099-K: per-partition listener addresses (`host:port`). Populated
+    /// per-partition listener addresses (`host:port`). Populated
     /// by `RegisterPartitionAddr` calls from the PS; one entry per open
     /// partition. Clients prefer this over `ps_details[ps_id].address`
     /// when present, so traffic is routed to the specific partition's
@@ -758,7 +758,7 @@ pub struct HeartbeatPsReq {
 }
 // Response: CodeResp
 
-// --- RegisterPartitionAddr (F099-K) ---
+// --- RegisterPartitionAddr ---
 // PS calls this once per partition after binding that partition's
 // dedicated TcpListener. Manager records `(part_id -> address)` in memory
 // and returns it via `GetRegionsResp.part_addrs`. Clients use it to
@@ -771,7 +771,7 @@ pub struct RegisterPartitionAddrReq {
 }
 // Response: CodeResp
 
-// --- ReconcileExtents (F109) ---
+// --- ReconcileExtents ---
 // Extent node calls this on startup (after `load_extents`) with every
 // `extent_id` it found on disk. Manager checks each id against
 // `s.extents` and returns the subset that no longer exists — those are
@@ -840,18 +840,18 @@ pub struct ExtDfReq {
 
 /// Df response (extent node → manager).
 ///
-/// F-unify: `disk_status` now nests the canonical `extent_rpc::DiskStatus`
+/// `disk_status` now nests the canonical `extent_rpc::DiskStatus`
 /// (the pure-wire `ExtDiskStatus` mirror was deleted — it had no manager
 /// domain equivalent, so it was pure duplication with twin-drift risk).
 /// `done_tasks` keeps the manager DOMAIN type `MgrRecoveryTaskDone`
-/// (persisted in etcd `recoveryTasks/`, woven into the F207 inflight
+/// (persisted in etcd `recoveryTasks/`, woven into the inflight
 /// ledger) — that is a legitimate domain/wire separation, NOT a mirror,
 /// so it is intentionally preserved. rkyv layout is unchanged either way.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtDfResp {
     pub done_tasks: Vec<MgrRecoveryTaskDone>,
     pub disk_status: Vec<(u64, crate::extent_rpc::DiskStatus)>,
-    /// F-EN-DYNSHARD M1b: the EN's echoed identity (see `extent_rpc::DfResp`).
+    /// M1b: the EN's echoed identity (see `extent_rpc::DfResp`).
     /// Appended in the SAME order as `DfResp` so the manager decodes the EN's
     /// `DfResp` bytes into this struct unchanged. Empty when the EN did not
     /// self-register (`--advertise` unset).
@@ -875,7 +875,7 @@ pub struct UpdateStreamEcResp {
     pub stream: Option<MgrStreamInfo>,
 }
 
-/// DeleteExtent request (manager → extent node, F109).
+/// DeleteExtent request (manager → extent node).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtDeleteExtentReq {
     pub extent_id: u64,
@@ -894,7 +894,7 @@ pub struct ExtConvertToEcReq {
     pub parity_shards: u32,
     pub target_addrs: Vec<String>,
     pub eversion: u64,
-    /// F211-D Tier 2: owner-lock owner_epoch threaded from the manager's
+    /// Tier 2: owner-lock owner_epoch threaded from the manager's
     /// `MgrEcDispatchInflight.owner_epoch`. Coord forwards into each
     /// `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch`. `0` =
     /// no-fence (legacy / memory-only mode).
@@ -965,7 +965,7 @@ impl ExtProbeExtentReq {
 /// `ExtCommitLengthResp`). `code` is `CODE_OK` / `CODE_NOT_FOUND`.
 pub type ExtProbeExtentResp = ExtCommitLengthResp;
 
-// ── F183: partition merge + policy advisory ────────────────────────────────
+// ── partition merge + policy advisory ──────────────────────────────────────
 
 // --- MultiModifyMerge ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -990,9 +990,9 @@ pub struct MultiModifyMergeResp {
     pub new_log_tail_extent_id: u64,
 }
 
-// --- F185: MergePartitions (manager-orchestrated merge) ---
+// --- MergePartitions (manager-orchestrated merge) ---
 //
-// Drop-in replacement for the F183 client-orchestrated merge sequence.
+// Drop-in replacement for the client-orchestrated merge sequence.
 // Caller passes only the two partition ids; the manager handles owner-
 // lock acquisition, PS freeze, commit_length capture, and the multi-
 // modify-merge txn internally. This relocates the orchestration's
@@ -1001,7 +1001,7 @@ pub struct MultiModifyMergeResp {
 pub struct MergePartitionsReq {
     pub survivor_part_id: u64,
     pub victim_part_id: u64,
-    /// F-FS-GEOM-DECLARED step 4: override the sacred-boundary refusal. Merging
+    /// step 4: override the sacred-boundary refusal. Merging
     /// two partitions destroys the boundary between them; when that boundary is
     /// a recorded presplit point, the merge silently undoes an operator's
     /// declared layout (for fs lane boundaries the symptom is that every
@@ -1017,7 +1017,7 @@ pub struct MergePartitionsResp {
     pub new_log_tail_extent_id: u64,
 }
 
-// --- F-REGION-REBALANCE: active region→PS load rebalance ---
+// --- active region→PS load rebalance ---
 //
 // `rebalance_regions` (the eviction path) is STICKY — it keeps a region on its
 // currently-registered PS and only reassigns regions whose PS is unregistered.
@@ -1052,7 +1052,7 @@ pub struct RebalanceRegionsResp {
 
 // --- ReportPartitionLoad (PS → manager periodic metrics) ---
 //
-// F202 wire change (backward-incompatible): adds 5 new fields
+// wire change (backward-incompatible): adds 5 new fields
 // surfacing per-partition SST dead-data breakdown and minor-compact
 // debt. Same-commit upgrade required (cluster.sh stops all roles
 // before restart).
@@ -1069,45 +1069,45 @@ pub struct PartitionLoad {
     pub read_bytes_per_sec: u64,
     pub imm_full_per_sec: u32,
     pub p99_us: u32,
-    /// F187: Σ reclaimable bytes on still-live sealed log_stream extents.
+    /// Σ reclaimable bytes on still-live sealed log_stream extents.
     /// "GC debt" — rises with deletes/overwrites, drops on `punch_holes`.
     pub gc_debt_bytes: u64,
-    /// F187: bytes that the next compact tick would feed into `do_compact`
+    /// bytes that the next compact tick would feed into `do_compact`
     /// (overlap-tagged tables when has_overlap == 1, else
     /// pickup_tables(...)). "Major-compaction debt".
     pub pending_compaction_bytes: u64,
-    /// F187: 1 while `background_gc_loop` is inside `run_gc`, else 0.
+    /// 1 while `background_gc_loop` is inside `run_gc`, else 0.
     pub gc_inflight: u32,
-    /// F187: 1 while `background_compact_loop` is inside `do_compact`,
+    /// 1 while `background_compact_loop` is inside `do_compact`,
     /// else 0.
     pub compact_inflight: u32,
-    /// F187: unix-epoch seconds of the last successful GC `punch_holes`.
+    /// unix-epoch seconds of the last successful GC `punch_holes`.
     /// 0 = never since process start.
     pub last_gc_at: i64,
-    /// F187: unix-epoch seconds of the last successful `do_compact`.
+    /// unix-epoch seconds of the last successful `do_compact`.
     /// 0 = never since process start.
     pub last_compact_at: i64,
-    /// F202: total bytes occupied by tombstone (op==2) records inside
+    /// total bytes occupied by tombstone (op==2) records inside
     /// the partition's live SSTs. Drives external controllers'
     /// "should-major-compact" decisions; advisory-only here.
     pub sst_tombstone_bytes: u64,
-    /// F202: total bytes occupied by SST records with `expires_at <= now`.
+    /// total bytes occupied by SST records with `expires_at <= now`.
     /// Dead-data driver alongside tombstones.
     pub sst_expired_bytes: u64,
-    /// F202: total bytes of SST records whose keys fall outside the
+    /// total bytes of SST records whose keys fall outside the
     /// partition's current `rg` range (only > 0 when `has_overlap == 1`,
     /// i.e. post-split CoW-shared SSTables haven't been compacted yet).
     pub sst_out_of_range_bytes: u64,
-    /// F202: total bytes the next *minor* compact tick would feed into
+    /// total bytes the next *minor* compact tick would feed into
     /// `do_compact` (size-tiered + head-extent pickup output). Distinct
     /// from `pending_compaction_bytes` which captures the major-compact
     /// pickup. Both can be non-zero simultaneously.
     pub minor_compact_pending_bytes: u64,
-    /// F202: number of sealed log_stream extents currently in
+    /// number of sealed log_stream extents currently in
     /// `extent_ids[..len-1]` (informational; helps OP correlate
     /// `gc_debt_bytes` against the extent population).
     pub sealed_log_extent_count: u32,
-    /// F-OVERVIEW-OPENTAIL: Σ committed bytes on this partition's three
+    /// Σ committed bytes on this partition's three
     /// stream OPEN-TAIL extents (log + row + meta), as the PS knows them
     /// locally. An open extent's manager-side `sealed_length` is 0, so the
     /// manager's authoritative sealed-length sum (the cluster-overview
@@ -1118,7 +1118,7 @@ pub struct PartitionLoad {
     /// `autumn-op info --part` gets by probing the EN. Refreshed on the PS
     /// maintenance loop (throttled, non-blocking); 0 until first refresh.
     pub open_tail_bytes: u64,
-    /// F-DF-WALDEBT: dead (overwritten/deleted) large-value bytes on the OPEN
+    /// dead (overwritten/deleted) large-value bytes on the OPEN
     /// log_stream tail extent. `gc_debt_bytes` is sealed-only (GC can't punch
     /// an unsealed tail), so a log-heavy / all-open-tail partition reports
     /// `gc_debt_bytes = 0` while still holding real dead bytes here. Together
@@ -1136,7 +1136,7 @@ pub struct ReportPartitionLoadReq {
 
 // --- GetPolicyCandidates (advisory) ---
 //
-// F210-F1: **WIRE-STABILITY CONTRACT** — the numeric values below are
+// **WIRE-STABILITY CONTRACT** — the numeric values below are
 // frozen. New advisory kinds must be APPENDED with the next unused
 // value (POLICY_KIND_EC = 6 → next would be 7). Renumbering breaks
 // every external controller, dashboard, and historical log analysis.
@@ -1148,23 +1148,23 @@ pub struct ReportPartitionLoadReq {
 // any one is a wire-breaking event.
 pub const POLICY_KIND_SPLIT: u8 = 0;
 pub const POLICY_KIND_MERGE: u8 = 1;
-/// F187: GC debt advisory — partition's `gc_debt_bytes` exceeds the
+/// GC debt advisory — partition's `gc_debt_bytes` exceeds the
 /// configured high-water threshold for `policy.required_buckets`
 /// consecutive sliding-window buckets and the partition is outside the
 /// gc cooldown window. Stage 1 is advisory-only — no auto-trigger.
 pub const POLICY_KIND_GC: u8 = 2;
-/// F187: major-compaction debt advisory — partition's
+/// major-compaction debt advisory — partition's
 /// `pending_compaction_bytes` exceeds the configured high-water
 /// threshold for `policy.required_buckets` consecutive buckets and
-/// outside the compact cooldown. F202 renamed from `POLICY_KIND_COMPACT`
+/// outside the compact cooldown. Renamed from `POLICY_KIND_COMPACT`
 /// to disambiguate against the new minor-compact advisory.
 pub const POLICY_KIND_MAJOR_COMPACT: u8 = 3;
-/// F202 compatibility alias: pre-F202 callers used `POLICY_KIND_COMPACT`.
+/// compatibility alias: older callers used `POLICY_KIND_COMPACT`.
 /// Same wire value (3). Marked `#[deprecated]` so new code prefers the
 /// `_MAJOR_COMPACT` name.
-#[deprecated(note = "use POLICY_KIND_MAJOR_COMPACT (F202 rename, same wire value)")]
+#[deprecated(note = "use POLICY_KIND_MAJOR_COMPACT (rename, same wire value)")]
 pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
-/// F196 Stage D: hot/cold imbalance advisory. Emitted once per PS
+/// Stage D: hot/cold imbalance advisory. Emitted once per PS
 /// when sustained `max(req_per_sec) / min(req_per_sec) ≥ HOT_COLD_RATIO`
 /// AND hottest > `HOT_COLD_MIN_HOT_QPS`, OR the same imbalance on
 /// `size_bytes`. `primary_part_id` = hottest partition, `secondary_part_id`
@@ -1172,14 +1172,14 @@ pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
 /// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
 /// `same_ps = true` always (the advisory is by definition per-PS).
 pub const POLICY_KIND_HOT_COLD: u8 = 4;
-/// F202: minor-compaction debt advisory. PS-local `pickup_tables`
+/// minor-compaction debt advisory. PS-local `pickup_tables`
 /// would emit a non-empty set on the next tick and the partition's
 /// `minor_compact_pending_bytes` exceeds the configured low-water
 /// threshold over `required_buckets` consecutive buckets.
 /// `primary_part_id` = partition; `secondary_part_id = 0`;
 /// `reason` carries the byte volume.
 pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
-/// F202: EC-conversion advisory. A sealed log/row stream extent has
+/// EC-conversion advisory. A sealed log/row stream extent has
 /// not been EC-converted yet AND its `sealed_length` exceeds the
 /// minimum-payoff threshold (default 64 MiB — below that, EC
 /// overhead outweighs the space savings, so we don't even suggest
@@ -1188,7 +1188,7 @@ pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
 /// `sealed_length`. Manager emits these from a direct scan of
 /// `s.streams`, NOT from PartitionLoad.
 pub const POLICY_KIND_EC: u8 = 6;
-/// F-REGION-REBALANCE Phase B: CLUSTER-level region→PS load-balance advisory.
+/// Phase B: CLUSTER-level region→PS load-balance advisory.
 /// Emitted (at most one per tick) when the per-PS partition-count spread exceeds
 /// the configured threshold. `primary_part_id = 0` / `secondary_part_id = 0`
 /// (cluster-scoped, not a single partition/extent); `reason` carries the per-PS
@@ -1220,7 +1220,7 @@ pub struct GetPolicyCandidatesResp {
     pub candidates: Vec<PolicyCandidate>,
 }
 
-// --- GetPolicyKindNames (F210-F1 const-dump) ---
+// --- GetPolicyKindNames (const-dump) ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GetPolicyKindNamesReq {}
 
@@ -1260,7 +1260,7 @@ pub fn policy_kind_names() -> Vec<(String, u8)> {
     ]
 }
 
-// --- ReportDiskFailure (F192) ---
+// --- ReportDiskFailure ---
 /// Generic transport/append failure on a known replica. The manager
 /// does not act on `error_kind` directly today; it's surfaced for
 /// future per-kind policy tuning (e.g. demote vs. trigger immediate
@@ -1287,7 +1287,7 @@ pub struct ReportDiskFailureReq {
 // Response: fire-and-forget (req_id = 0). No reply needed; manager
 // logs are the operator-facing surface.
 
-// --- ForceEcConvert (F203) ---
+// --- ForceEcConvert ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ForceEcConvertReq {
     /// Sealed-but-unconverted extent the OP wants to EC-encode now.
@@ -1300,7 +1300,7 @@ pub struct ForceEcConvertResp {
     pub message: String,
 }
 
-// --- GetPartitionDetail (F203) ---
+// --- GetPartitionDetail ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetPartitionDetailReq {
     pub part_id: u64,
@@ -1330,7 +1330,7 @@ pub struct GetClusterOverviewReq {}
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PartitionOverview {
     pub part_id: u64,
-    /// The serving PS INSTANCE id. Distinct from `ps_addr`, which under F099-K
+    /// The serving PS INSTANCE id. Distinct from `ps_addr`, which
     /// is the partition's OWN listener (`base_port + ord`) — many partitions on
     /// ONE PS each get a different `ps_addr`, so PS-count must group by `ps_id`.
     pub ps_id: u64,
@@ -1388,25 +1388,25 @@ pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
 pub const EXT_MSG_COMMIT_EC_SHARD: u8 = 12;
 pub const EXT_MSG_PROBE_EXTENT: u8 = 14;
 
-// ── F211 wire types ─────────────────────────────────────────────────────────
+// ── node-lifecycle wire types ────────────────────────────────────────────────
 //
-// All F211 message payloads use the same rkyv encode/decode helpers as the
+// These message payloads use the same rkyv encode/decode helpers as the
 // rest of this file. New `MgrNode*` types are append-only; existing wire
 // shapes (MgrNodeInfo, MgrExtentInfo, etc.) are unchanged.
 
-/// F211-A/B + F214-B: auto-tracked state byte. Wire-stable; APPEND-only.
+/// Auto-tracked state byte. Wire-stable; APPEND-only.
 pub const NODE_AUTO_STATE_ONLINE: u8 = 0;
 pub const NODE_AUTO_STATE_SUSPECTED: u8 = 1;
-/// F214-B: registered, never verified alive (no successful df yet).
+/// registered, never verified alive (no successful df yet).
 /// Initial state for any node freshly added via `MSG_REGISTER_NODE`.
 pub const NODE_AUTO_STATE_SUSPEND: u8 = 2;
 
-/// F211-C: operator override kind. Wire-stable; new kinds APPEND-only.
+/// operator override kind. Wire-stable; new kinds APPEND-only.
 pub const NODE_OVERRIDE_NONE: u8 = 0;
 pub const NODE_OVERRIDE_FENCED: u8 = 1;
 pub const NODE_OVERRIDE_MAINTENANCE: u8 = 2;
 
-/// F211-C: rkyv'd value at etcd prefix `node_override/<node_id>`. Replayed
+/// rkyv'd value at etcd prefix `node_override/<node_id>`. Replayed
 /// on leader failover; cleared by `mgr_clear_node_override` or by the
 /// `NodeStateTracker.tick()` Maintenance-TTL sweep.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -1422,7 +1422,7 @@ pub struct MgrNodeOverride {
     /// `NodeStateTracker.tick()` automatically clears the override.
     /// `0` = no TTL (Fenced is permanent until explicit clear).
     pub expire_at: u64,
-    /// F-EN-DYNSHARD M0: the fenced/decommissioned node's stable `node_uuid`,
+    /// M0: the fenced/decommissioned node's stable `node_uuid`,
     /// captured at override time. Load-bearing for the `decommissioned/`
     /// tombstone: `remove_node` deletes `nodes/<id>`, so after removal the
     /// node_id→uuid mapping only survives HERE — the re-register zombie check
@@ -1432,7 +1432,7 @@ pub struct MgrNodeOverride {
     pub node_uuid: String,
 }
 
-// --- ListNodeStates (F211-B) ---
+// --- ListNodeStates ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ListNodeStatesReq {}
@@ -1455,7 +1455,7 @@ pub struct NodeStateEntry {
     pub override_set_by: String,
     pub override_set_at: i64,
     pub override_expire_at: u64,
-    /// F-EN-DYNSHARD M1c: the node's stable identity + the shard ports it last
+    /// M1c: the node's stable identity + the shard ports it last
     /// registered (`shard_ports.len()` = its shard count). Lets `list-nodes`
     /// show the identity and verify a reshard took effect. Empty for a pre-M0
     /// node (impossible on a reset cluster) / legacy single-shard registration.
@@ -1470,7 +1470,7 @@ pub struct ListNodeStatesResp {
     pub nodes: Vec<NodeStateEntry>,
 }
 
-// --- ExtentHealthReport (F211-B) ---
+// --- ExtentHealthReport ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ExtentHealthReq {
@@ -1515,7 +1515,7 @@ pub struct ExtentHealthResp {
     pub extents: Vec<ExtentHealth>,
 }
 
-// --- ListEcInflightMarkers (F211-B) ---
+// --- ListEcInflightMarkers ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ListEcInflightMarkersReq {}
@@ -1542,7 +1542,7 @@ pub struct ListEcInflightMarkersResp {
     pub markers: Vec<InflightWithCoordState>,
 }
 
-// --- FenceNode / SetNodeMaintenance / ClearNodeOverride / RemoveNode (F211-C) ---
+// --- FenceNode / SetNodeMaintenance / ClearNodeOverride / RemoveNode ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct FenceNodeReq {
@@ -1584,7 +1584,7 @@ pub struct RemoveNodeResp {
     pub blocking_marker_extent_ids: Vec<u64>,
 }
 
-// --- RecoveryStats (F211-H) ---
+// --- RecoveryStats ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RecoveryStatsReq {}
@@ -1627,7 +1627,7 @@ pub struct RecoveryStatsResp {
     pub backoff: Vec<RecoveryBackoffEntry>,
 }
 
-// --- Audit log (F211-I) ---
+// --- Audit log ---
 
 pub const AUDIT_OP_FENCE_NODE: u8 = 1;
 pub const AUDIT_OP_SET_NODE_MAINTENANCE: u8 = 2;
@@ -1673,7 +1673,7 @@ pub struct QueryAuditLogResp {
 }
 
 // --- GetClusterId ---
-// F214-A: read-only cluster identity exposed via MSG_GET_CLUSTER_ID.
+// read-only cluster identity exposed via MSG_GET_CLUSTER_ID.
 //
 // ⚠️ R1 FREEZE (coco P1): GetClusterIdReq/Resp ARE the version-negotiation
 // channel — every long-lived process decodes this resp BEFORE any compat
@@ -1805,7 +1805,7 @@ pub struct ClusterDfResp {
     pub physical_used: u64,
     /// Manager's read-only Σ distinct sealed_length (de-amplified, sealed-only).
     pub logical_stored: u64,
-    /// F-DF-OPENTAIL: Σ PS-reported open-tail committed bytes across all
+    /// Σ PS-reported open-tail committed bytes across all
     /// partitions (log + row + meta OPEN tails, one copy — open tails are
     /// refs=1 partition-private, so no CoW dedup needed). physical_used
     /// INCLUDES these bytes (they are largely LIVE large-value / VP data
@@ -1815,11 +1815,11 @@ pub struct ClusterDfResp {
     /// counts the open bytes, sealed-only logical drops them). 0 until the PS
     /// reports (falls back to sealed-only).
     pub logical_open_tail: u64,
-    /// F-DF-WALDEBT: Σ reclaimable DEAD bytes across all partitions — sealed
+    /// Σ reclaimable DEAD bytes across all partitions — sealed
     /// (`PartitionLoad.gc_debt_bytes`) + open-tail
     /// (`PartitionLoad.open_tail_dead_bytes`). The dead fraction of the logical
     /// footprint; `physical_used` carries these bytes (they occupy replicas
-    /// until GC punches them). Pre-F-DF-WALDEBT a log-heavy partition's
+    /// until GC punches them). Previously a log-heavy partition's
     /// open-tail dead bytes were invisible (gc_debt is sealed-only). Lets `df`
     /// print a dead-vs-live breakdown. 0 until the PS reports.
     pub logical_wal_debt: u64,
@@ -1833,7 +1833,7 @@ pub struct ClusterDfResp {
     pub per_node: Vec<NodeCapWire>,
 }
 
-// ── F-ioring-lease-1 wire types ────────────────────────────────────────────
+// ── inode-lease wire types ──────────────────────────────────────────────────
 
 /// Daemon kind discriminant for `MgrClientId`. Manager treats both kinds
 /// identically — this is purely diagnostic so `autumn-op` can tell which
@@ -1849,7 +1849,7 @@ pub const LEASE_MODE_WRITE: u8 = 2;
 pub const LEASE_INVAL_WRITER_CLOSED: u8 = 1;
 pub const LEASE_INVAL_LEASE_REVOKED: u8 = 2;
 pub const LEASE_INVAL_META_CHANGED: u8 = 3;
-/// F-lease-preempt: pre-revocation grace notification pushed to a
+/// Lease preemption: pre-revocation grace notification pushed to a
 /// writer that another client has tried to force-acquire. The
 /// `MgrInvalidation.version` field carries the grace period in
 /// milliseconds — writer should flush + release within that
@@ -1891,7 +1891,7 @@ pub struct AcquireLeaseReq {
     pub ino: u64,
     /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE`.
     pub mode: u8,
-    /// F-lease-preempt: when true, the manager starts a revocation
+    /// Lease preemption: when true, the manager starts a revocation
     /// of any current writer (pushes `LEASE_INVAL_WILL_REVOKE_IN`
     /// with a grace period) instead of returning a conflict
     /// immediately. The first force-acquire call on a held writer
@@ -1959,9 +1959,9 @@ pub struct MgrInvalidation {
 
 // --- PollInvalidations (msg_type = MSG_POLL_INVALIDATIONS = 0x49) -------
 //
-// F-ioring-lease-1 ships the simple synchronous "drain my queue"
+// This ships the simple synchronous "drain my queue"
 // semantics — returns the queued events immediately (or an empty list).
-// F-ioring-lease-3 will wrap this in a long-poll loop on the client and
+// A later phase will wrap this in a long-poll loop on the client and
 // add a server-side wait-for-event hook so the round-trip rate stays low.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PollInvalidationsReq {
@@ -1977,7 +1977,7 @@ pub struct PollInvalidationsResp {
 
 // --- AllocInodes (msg_type = MSG_ALLOC_INODES = 0x53) --------------------
 //
-// F-FS-UNIFY M0: grant a contiguous batch of fuse-fs inode numbers
+// M0: grant a contiguous batch of fuse-fs inode numbers
 // `[base, base + count)`. The manager owns the counter (etcd key
 // `autumn-rs/fs/next_inode`, big-endian u64) and every grant is a
 // leader-fenced etcd CAS txn — concurrent allocators can never receive
@@ -1993,7 +1993,7 @@ pub struct AllocInodesReq {
     /// fuse mount passes that legacy value here on its first batch so an
     /// existing filesystem migrates without duplicate inodes. 0 = none.
     pub floor: u64,
-    /// F-KEY-NS D1: the per-volume identity (the canonicalized `fs/{tenant}/
+    /// D1: the per-volume identity (the canonicalized `fs/{tenant}/
     /// {volume}/` prefix, or empty for the pre-D1 single global counter). SD-1
     /// FREEZES this field into the wire; `handle_alloc_inodes` IGNORES it for
     /// now. SD-3 wires the per-volume etcd counter
@@ -2011,22 +2011,22 @@ pub struct AllocInodesResp {
     pub base: u64,
 }
 
-// --- F-DASH-IN-MGR: auto-policy controller (msg_types 0x54/0x55) -----------
+// --- auto-policy controller (msg_types 0x54/0x55) -----------
 //
 // The in-manager auto-policy controller, folded in from the retired Python
 // `python/dashboard/`. Config is leader-owned and persisted to etcd
 // (`autoPolicy/config` + `autoPolicy/cooldowns`) so the active policy survives
 // leader failover — the crash-safety win over a killable Python webserver.
 // The controller loop runs ONLY on the leader and is DEFAULT-OFF (a fresh
-// cluster stays pure-mechanism, F203). Built-in presets are compiled-in (never
+// cluster stays pure-mechanism). Built-in presets are compiled-in (never
 // persisted); only custom entries + the (mode, active) selection go to etcd.
 pub const MSG_AUTOPOLICY_GET: u8 = 0x54;
 pub const MSG_AUTOPOLICY_SET: u8 = 0x55;
 
-/// F-REGION-REBALANCE: active region→PS load rebalance (leader-only mutation).
+/// active region→PS load rebalance (leader-only mutation).
 pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 
-// ── F-KEY-NS D2: namespace registry (admin → manager, low-frequency) ──────────
+// ── namespace registry (admin → manager, low-frequency) ──────────────────────
 // admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
 // admin-token gated — same posture as MSG_TENANT_CREATE/DELETE). The registry is
 // the authoritative source for D7 Layer-A (writes must fall in a registered
@@ -2038,20 +2038,20 @@ pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
 // data (owner/presplit/created_at) rides this dedicated low-frequency RPC.
 pub const MSG_NAMESPACE_LIST: u8 = 0x59;
 // admin → manager (leader-gated): list every registered principal with its
-// grants. F-NS-PRINCIPAL-LIST — the symmetric counterpart of NAMESPACE_LIST:
+// grants. The symmetric counterpart of NAMESPACE_LIST:
 // `principal-create`/`principal-delete` shipped without a way to SEE what
 // exists, leaving `ls $DATA_ROOT/authz/*.cred` (only what turnkey happened to
 // write) or an etcd key scan (names only — the value is rkyv, so grants are
 // invisible) as the only options.
 pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
 // admin → manager (leader-gated): record the split points a presplit actually
-// applied, so merge can refuse to undo them. F-FS-GEOM-DECLARED step 4 — the
+// applied, so merge can refuse to undo them. Step 4 — the
 // namespace registry's `presplit` field was frozen and empty since SD-1 waiting
 // for exactly this consumer. `namespace-create --presplit` can only declare
 // points for a namespace being CREATED; presplit runs against existing ones.
 pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 
-// ── F-ADMIN-OP-AUTH: admin-token gating for cluster-mutating manager ops ──────
+// ── admin-token gating for cluster-mutating manager ops ──────────────────────
 //
 // A shared admin secret gates the control-plane ops that CHANGE the cluster but
 // are neither owner-fenced nor already admin-gated (tenant/namespace/principal
@@ -2074,7 +2074,7 @@ pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 /// The length-prefix width for the admin-token payload prefix.
 pub const ADMIN_TOKEN_LEN_PREFIX: usize = 4;
 
-/// True for the cluster-MUTATING manager ops that `F-ADMIN-OP-AUTH` gates. NOT
+/// True for the cluster-MUTATING manager ops that the admin token gates. NOT
 /// the read/observability ops (info/df/list-nodes/…), and NOT the ops that
 /// already carry their own `admin_token` field (tenant/namespace/principal).
 #[inline]
@@ -2093,11 +2093,11 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_MERGE_PARTITIONS
             | MSG_MULTI_MODIFY_MERGE
     )
-    // F-KEY-NS UX-fix (M3): MSG_MULTI_MODIFY_MERGE (the raw F183 merge txn) is
+    // UX-fix (M3): MSG_MULTI_MODIFY_MERGE (the raw merge txn) is
     // gated too. The manager invokes it IN-PROCESS (from handle_merge_partitions
     // + auto_dispatch_merge, not over the wire), so gating it only blocks an
     // EXTERNAL rogue client from dispatching the low-level primitive to bypass
-    // both the admin gate AND the F185 freeze / sacred-boundary guard that
+    // both the admin gate AND the freeze / sacred-boundary guard that
     // MSG_MERGE_PARTITIONS enforces. No in-tree wire caller sends it. (Unlike
     // MSG_MULTI_MODIFY_SPLIT, which IS PS-driven, so it stays ungated.)
     //
@@ -2231,7 +2231,7 @@ pub struct MgrInodeLeaseRecord {
     pub expires_at: i64,
 }
 
-// ── F-AUTHZ-1 wire + persisted types (manager-as-KDC) ─────────────────────────
+// ── authz wire + persisted types (manager-as-KDC) ────────────────────────────
 
 /// Persisted tenant account in etcd (`tenantAccount/<tenant>`). Replayed on
 /// leader failover. Holds only the credential HASH (never the credential) +
@@ -2273,7 +2273,7 @@ pub struct TenantDeleteReq {
     pub tenant: String,
 }
 
-// ── F-KEY-NS D2: namespace registry types (SD-1) ─────────────────────────────
+// ── namespace registry types (SD-1) ──────────────────────────────────────────
 
 /// Persisted namespace registry row in etcd (`namespace/<name>`). Replayed on
 /// leader failover. Modelled on `MgrTenantAccount` (string-keyed etcd prefix +
@@ -2391,7 +2391,7 @@ pub struct PrincipalListResp {
 /// receives a short-TTL signed capability token.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MintTokenReq {
-    /// F-NS-PRINCIPAL-UNIFIED: the principal NAME (credential owner) to mint for.
+    /// the principal NAME (credential owner) to mint for.
     /// The manager looks up the account under this name (`tenantAccount/<name>`).
     pub principal: String,
     pub credential: Vec<u8>,
@@ -2431,7 +2431,7 @@ pub struct GetAuthzConfigResp {
     /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
     /// key outside every protected prefix is not gated.
     pub protected_prefixes: Vec<Vec<u8>>,
-    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry). This is
+    /// D7: ALL registered namespace prefixes (the D2 registry). This is
     /// Layer-A's data source (a put-class write must fall in one of these).
     /// POPULATED by the manager in SD-1; CONSUMED by the PS Layer-A gate in SD-2
     /// (the PS stores it now, unused). Distinct from `protected_prefixes`, which
@@ -2442,7 +2442,7 @@ pub struct GetAuthzConfigResp {
     pub token_ttl_secs: u64,
     /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
     pub clock_skew_secs: u64,
-    /// F-ADMIN-OP-AUTH (PS slice): the manager's shared admin secret, so the PS
+    /// (PS slice): the manager's shared admin secret, so the PS
     /// can gate cluster-mutating PS ops (`is_admin_ps_msg`: split + maintenance =
     /// gc/compact/forcegc/flush). EMPTY when the manager configured no admin token
     /// → the PS runs those ops BARE (opt-in, same posture as the manager slice;

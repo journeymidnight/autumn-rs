@@ -25,7 +25,7 @@ async fn append_rejects_stale_revision() {
 
 #[compio::test]
 async fn append_with_mid_byte_commit_truncates_and_succeeds() {
-    // F038: block_sizes removed; truncate is byte-granular, no alignment check.
+    // block_sizes removed; truncate is byte-granular, no alignment check.
     // commit=6 truncates the file to 6 bytes, then appends the new payload.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
@@ -52,13 +52,13 @@ async fn append_with_mid_byte_commit_truncates_and_succeeds() {
     assert_eq!(cl.length, 7);
 }
 
-/// F123: batch append path must reject with PRECONDITION when the extent is
+/// batch append path must reject with PRECONDITION when the extent is
 /// sealed, even when the append carries a commit value lower than file_start.
 /// This exercises the sealed check in `build_append_future` step 2 (local
 /// atomics) and ensures the batch hot-path doesn't silently truncate a
 /// sealed extent.
 #[compio::test]
-async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
+async fn batch_append_rejects_sealed_extent_with_low_commit() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -92,7 +92,7 @@ async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// BULK-EXACT invariant (F-READ-OPENTAIL-ROTATE root fix, coco P1): a bulk read
+// BULK-EXACT invariant (open-tail-rotate root fix, coco P1): a bulk read
 // (MSG_READ_BYTES_BULK) is always an exact-length VP value read — the EN must
 // NEVER answer CODE_OK with a silently SHORT payload. `read_plan` clamps to
 // the local bytes (correct for the non-bulk scanner path), but for bulk an

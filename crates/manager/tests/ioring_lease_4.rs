@@ -1,4 +1,4 @@
-//! F-ioring-lease-4 — end-to-end close-to-open coherence via the
+//! End-to-end close-to-open coherence via the
 //! per-session invalidation map. Drives the full lease layer (real
 //! AutumnManager + real ClusterClient + the daemon-side `lease`
 //! helpers + the pure-fn `apply_invalidation` / `cache_is_stale`)
@@ -24,7 +24,7 @@
 //!    end-to-end here by interleaving releases on two inodes.
 //!
 //! The byte-level "reader actually sees new bytes after write+close"
-//! is realized as `f_ioring_lease_phase1_e2e.rs::
+//! is realized as `ioring_lease_phase1_e2e.rs::
 //! phase1_close_to_open_coherence_e2e` — a full-cluster test
 //! (manager + 2 EN + 1 PS, seeds shared.bin via the data plane).
 //! `#[ignore]`'d like every other system_* test (run via

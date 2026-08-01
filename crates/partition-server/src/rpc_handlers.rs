@@ -1,6 +1,6 @@
 //! RPC dispatch and handler functions for partition operations.
 //!
-//! F099-D: `handle_put`, `handle_delete`, and `handle_stream_put` are gone —
+//! `handle_put`, `handle_delete`, and `handle_stream_put` are gone —
 //! writes decode inline in `partition_loop::handle_incoming_req` and
 //! push directly into the SQ/CQ pipeline's pending queue. Only read ops and
 //! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
@@ -19,7 +19,7 @@ use bytes::Bytes;
 use crate::sstable::{AsyncMergeIterator, AsyncTableIterator, FetchMode};
 use crate::*;
 
-/// F204: translate VP-resolve errors into wire status codes that
+/// translate VP-resolve errors into wire status codes that
 /// distinguish "data permanently lost; clean up the key" from
 /// "server bug; investigate".
 ///
@@ -112,7 +112,7 @@ impl ReadMetrics {
     }
 }
 
-/// F099-D: PUT / DELETE / STREAM_PUT are handled by `partition_loop`'s
+/// PUT / DELETE / STREAM_PUT are handled by `partition_loop`'s
 /// direct `handle_incoming_req` path (no spawn, no inner oneshot). Only
 /// reads and low-frequency control ops route through this dispatch function.
 /// Receiving a write op here is a bug — we short-circuit with an error.
@@ -134,7 +134,7 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_RANGE => handle_range(payload, part).await,
         partition_rpc::MSG_BATCH_GET => handle_batch_get(payload, part).await,
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
-        // F210-C2: SPLIT_PART must NOT be invoked inline through
+        // SPLIT_PART must NOT be invoked inline through
         // dispatch_partition_rpc — handle_split_part awaits an internal
         // drain signal that requires partition_loop to run, and
         // an inline call would self-deadlock (the loop's stack is parked
@@ -142,7 +142,7 @@ pub(crate) async fn dispatch_partition_rpc(
         // `handle_incoming_req` and dispatched via `compio::runtime::spawn`.
         MSG_SPLIT_PART => Err((
             StatusCode::Internal,
-            "MSG_SPLIT_PART must not be dispatched inline — F210-C2 requires spawned task; \
+            "MSG_SPLIT_PART must not be dispatched inline — requires a spawned task; \
              routed via handle_incoming_req's MSG_SPLIT_PART arm"
                 .to_string(),
         )),
@@ -151,8 +151,8 @@ pub(crate) async fn dispatch_partition_rpc(
         partition_rpc::MSG_DIAG_PARTITION_VP => {
             handle_diag_partition_vp(payload, part, part_sc).await
         }
-        // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
-        // removed in F186. Stripe-write is now pure client-side via
+        // server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
+        // removed. Stripe-write is now pure client-side via
         // ClusterClient::put_stream_begin (Ceph striperados pattern).
         MSG_PUT | MSG_DELETE => Err((
             StatusCode::Internal,
@@ -172,7 +172,7 @@ pub(crate) async fn dispatch_partition_rpc(
 pub(crate) enum GetOutcome {
     NotFound,
     Value(Bytes),
-    /// F259: large full-value VP — the caller (handle_get_redirect) sends
+    /// large full-value VP — the caller (handle_get_redirect) sends
     /// a descriptor instead of resolving the bytes through this PS.
     Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
 }
@@ -239,7 +239,7 @@ pub(crate) async fn handle_batch_get(
 }
 
 /// rkyv-framed GET (generic SDK path).
-/// F-FENCE-DRAIN: seal + roll the requested open tails so a fenced node's
+/// seal + roll the requested open tails so a fenced node's
 /// replicas drain. The manager's recovery sweep sends this when an OPEN tail
 /// (`!sealed`) has a replica on a Fenced node — recovery rebuilds only SEALED
 /// extents, so without a roll an idle partition's open tail on a fenced node
@@ -290,7 +290,7 @@ pub(crate) async fn handle_roll_tails(
         }
         if stream_id == row_id {
             // row_stream single-writer invariant: seal+roll on P-sst's sst_sc
-            // via the F255 barrier (drains inflight to zero first).
+            // via the row-invalidate barrier (drains inflight to zero first).
             let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let mut inv_tx = row_inv_tx.clone();
             let br = crate::RowInvalidateBarrierReq {
@@ -341,7 +341,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     }
 }
 
-/// F259 (MSG_GET_REDIRECT): like `handle_get`, but a large full-value VP
+/// (MSG_GET_REDIRECT): like `handle_get`, but a large full-value VP
 /// answers with a descriptor (extent + value byte range + eversion +
 /// replica addrs) so the client reads the bytes straight from an EN.
 pub(crate) async fn handle_get_redirect(
@@ -397,7 +397,7 @@ pub(crate) async fn handle_get_redirect(
     }
 }
 
-/// F-REDIRECT-BATCH (MSG_GET_REDIRECT_MANY): resolve N redirect descriptors in
+/// (MSG_GET_REDIRECT_MANY): resolve N redirect descriptors in
 /// ONE PS call — the batch mirror of `handle_get_redirect`. Loops
 /// `get_value_inner` per item (same resolution + `extent_read_descriptor`
 /// lookup + inline fallback as the single handler) and returns one
@@ -488,7 +488,7 @@ pub(crate) async fn handle_get_redirect_many(
     Ok(partition_rpc::rkyv_encode(&GetRedirectManyResp { results }))
 }
 
-/// F216 zero-copy GET (MSG_GET_BULK): returns the response as TWO segments —
+/// zero-copy GET (MSG_GET_BULK): returns the response as TWO segments —
 /// `(head, value)` where `head = [CRC-less frame header][bulk meta: code +
 /// value_len + reserved]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
 /// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
@@ -539,7 +539,7 @@ async fn get_value(
     get_value_inner(payload, part, false).await
 }
 
-/// F259: `redirect_large_vp` — when true, a FULL-value read of a VP whose
+/// `redirect_large_vp` — when true, a FULL-value read of a VP whose
 /// value length >= AUTUMN_PS_ZC_RECV_MIN (64 KiB, the bulk_worthwhile
 /// threshold) returns `GetOutcome::Redirect` (extent + exact value byte
 /// range) instead of resolving through this PS. Sub-range reads, inline
@@ -548,7 +548,7 @@ async fn get_value(
 /// the proxy path (the client falls back / retries and sees the
 /// rewritten VP).
 #[allow(clippy::await_holding_refcell_ref)]
-/// F261 paged SST point-lookup with the compaction-truncate retry — shared by
+/// paged SST point-lookup with the compaction-truncate retry — shared by
 /// `get_value_inner` and `handle_head` (the two MUST stay in sync).
 ///
 /// A snapshot reader's backing row extent can be TRUNCATED by a compaction
@@ -627,7 +627,7 @@ async fn get_value_inner(
                 None
             })
     };
-    // F261: the SST lookup may FETCH blocks from row_stream (paged
+    // the SST lookup may FETCH blocks from row_stream (paged
     // readers) — `sst_lookup_paged_retry` snapshots the reader set, drops
     // the borrow across its awaits (note 15), and handles the
     // compaction-truncate single retry. The re-borrow below may observe
@@ -679,7 +679,7 @@ async fn get_value_inner(
     let sc = p.stream_client.clone();
     let is_vp = (op & crate::OP_VALUE_POINTER) != 0;
 
-    // F162 (MED-2): acquire a per-extent reader pin BEFORE dropping the
+    // (MED-2): acquire a per-extent reader pin BEFORE dropping the
     // partition borrow, so a concurrent run_gc can't decide-and-punch the
     // log_stream extent during our await on read_bytes_from_extent.
     // The pin is taken only when the value is a VP (small inline values
@@ -701,7 +701,7 @@ async fn get_value_inner(
     } else {
         None
     };
-    // F-DIRECT-MANY: redirect a VP read (whole value OR a sub-range) to the
+    // redirect a VP read (whole value OR a sub-range) to the
     // EN when the REQUESTED byte count is >= 64 KiB. `req.offset`/`req.length`
     // address bytes WITHIN the value (`length == 0` = to end); the descriptor
     // carries the absolute in-extent range `[vp.offset + req.offset, +req_len)`
@@ -709,7 +709,7 @@ async fn get_value_inner(
     // replica. Whole-value single-key `get_direct` (offset=0,length=0) is the
     // `req.offset==0 && req_len==vp.len` special case — unchanged. Sub-ranges
     // past the value end (`req.offset > vp.len`) and sub-64 KiB requests fall
-    // through to the inline proxy resolve below (identical to pre-F-DIRECT-MANY).
+    // through to the inline proxy resolve below (identical to the whole-value path).
     if redirect_large_vp && is_vp && raw_value.len() >= crate::VALUE_POINTER_SIZE {
         let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
         let r_off = req.offset as u64;
@@ -785,7 +785,7 @@ pub(crate) async fn handle_head(
             None
         })
     };
-    // F261: paged SST lookup awaits — `sst_lookup_paged_retry` snapshots +
+    // paged SST lookup awaits — `sst_lookup_paged_retry` snapshots +
     // drops the borrow (note 15) and runs the same compaction-truncate
     // single retry as get_value_inner.
     if found.is_none() {
@@ -862,7 +862,7 @@ pub(crate) async fn handle_range(
 
     drop(p);
 
-    // F262 + coco P1: the scan reads blocks on demand, so a background
+    // + coco P1: the scan reads blocks on demand, so a background
     // compaction that completes MID-SCAN can truncate a snapshot reader's
     // backing row extent (the Arc holds metadata only) — a longer exposure
     // window than Stage-1's up-front materialization had. Same remedy as
@@ -878,7 +878,7 @@ pub(crate) async fn handle_range(
         // Unfiltered Arc snapshot for change detection (the scan set below
         // is pre-filtered, so it can't be ptr-compared against live state).
         let full_snap: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
-        // F262: async block-on-demand iteration over the (paged) SSTs — no
+        // async block-on-demand iteration over the (paged) SSTs — no
         // materialization. Blocks fetch through the global BlockCache
         // (FetchMode::Cached): repeated list calls over the same prefix hit
         // warm blocks, and per-request memory is O(open blocks), not O(SST
@@ -949,10 +949,10 @@ pub(crate) async fn handle_range(
 }
 
 
-/// F262 + coco P1: one full SST-merge scan pass for `handle_range` — built
+/// + coco P1: one full SST-merge scan pass for `handle_range` — built
 /// from fresh snapshots each call so the caller can retry the whole pass
 /// when a concurrent compaction invalidates the reader set mid-scan.
-/// Mirrors the pre-F262 mem/SST 2-way merge exactly; block-read errors
+/// Mirrors the earlier sync mem/SST 2-way merge exactly; block-read errors
 /// propagate (caller decides retry vs Internal).
 #[allow(clippy::too_many_arguments)]
 async fn range_scan_sst_merge(
@@ -1119,9 +1119,9 @@ pub(crate) async fn handle_split_part(
         ));
     }
 
-    // F196: refuse split when this PS's static core budget can't host the
+    // refuse split when this PS's static core budget can't host the
     // right child. The check fires only when `--cpuset` was supplied;
-    // pre-F196 deployments keep the legacy unlimited behaviour. We reject
+    // deployments without it keep the legacy unlimited behaviour. We reject
     // BEFORE any flush/commit_length/multi_modify_split so retries don't
     // burn extent-node IO. Operator response: grow --cpuset, migrate
     // partitions to another PS, or (future Stage D advisory) merge a cold
@@ -1132,7 +1132,7 @@ pub(crate) async fn handle_split_part(
             return Err((
                 StatusCode::FailedPrecondition,
                 format!(
-                    "F196: PS core budget exhausted ({} / {} partitions); split refused. \
+                    "PS core budget exhausted ({} / {} partitions); split refused. \
                      Operator: grow --cpuset or merge a cold partition first.",
                     budget.current(),
                     budget.max,
@@ -1148,13 +1148,13 @@ pub(crate) async fn handle_split_part(
     //      and GC on ONE task and acquires this gate around BOTH, so holding it
     //      means neither a `do_compact` (`compact_row_append` racing the
     //      row_stream seal) NOR a `run_gc` (log_stream append racing the log
-    //      seal) is in flight. Unifies the former compact_gate (F255) + gc_gate
-    //      (F140); the PS-wide `acquire_compact` permit (default max=4) does NOT
+    //      seal) is in flight. Unifies the former compact_gate + gc_gate;
+    //      the PS-wide `acquire_compact` permit (default max=4) does NOT
     //      serialize same-partition (coco /findbugs v3, 2026-06-02), hence the
     //      dedicated per-partition gate.
-    //   2. **PS-wide `concurrency.acquire_compact`** (F196 D-r7) — caps
+    //   2. **PS-wide `concurrency.acquire_compact`** (D-r7) — caps
     //      cross-partition peak RAM. Inner to the gate.
-    // Both RAII-held through `multi_modify_split` AND the F255 P-sst barrier
+    // Both RAII-held through `multi_modify_split` AND the P-sst barrier
     // ACK below.
     let (maintenance_gate, concurrency) = {
         let p = part.borrow();
@@ -1171,7 +1171,7 @@ pub(crate) async fn handle_split_part(
     // multi_modify_split then rejects.
     let auth_rg: Range = {
         // 10 s — read-only manager call. Fetches authoritative range
-        // for the F103 stale-rg fix. Bounded so split doesn't wedge
+        // for the stale-rg fix. Bounded so split doesn't wedge
         // on a hung manager.
         let resp_bytes = pool
             .call_timeout(
@@ -1202,7 +1202,7 @@ pub(crate) async fn handle_split_part(
             })?
     };
 
-    // F-SPLIT-AT-KEY (design doc D4): the split point comes from one of two
+    // (design doc D4): the split point comes from one of two
     // sources.
     //   * EXPLICIT (`req.at_key = Some`): an operator/controller names the
     //     point. We validate it lies STRICTLY inside the authoritative
@@ -1250,7 +1250,7 @@ pub(crate) async fn handle_split_part(
         }
         at_key
     } else {
-        // F262: async window scan over the (paged) SSTs — snapshot readers +
+        // async window scan over the (paged) SSTs — snapshot readers +
         // sc under one brief borrow, drop, await (note 15). Reader set is
         // stable: this path holds maintenance_gate.
         let (uuk_readers, uuk_sc) = {
@@ -1260,7 +1260,7 @@ pub(crate) async fn handle_split_part(
         let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc)
             .await
             .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
-        // coco P2 (F262): sample the memtable AFTER the (long) SST scan, so
+        // coco P2: sample the memtable AFTER the (long) SST scan, so
         // writes that landed during it still count toward the `< 2 keys`
         // check and the midpoint choice.
         let uuk_mem_items = collect_mem_items(&part.borrow());
@@ -1286,14 +1286,14 @@ pub(crate) async fn handle_split_part(
         (p.log_stream_id, p.row_stream_id, p.meta_stream_id)
     };
 
-    // F210-C2: PrepareSplit-style freeze + drain. Pre-F210-C2 split called
+    // PrepareSplit-style freeze + drain. Split formerly called
     // `flush_memtable_locked(part)` directly then `commit_length` — but
     // partition_loop could still process in-flight Phase 2 writes
     // (their work is on stream_worker_loop, independent of split's stack)
     // during the await window. Those writes' bytes landed on EN past the
     // captured commit_length, then manager sealed at the captured value,
     // leaving the trailing bytes invisible on recovery. The fix mirrors
-    // F185's merge freeze: set frozen_for_split → halt new Put/Delete via
+    // the merge freeze: set frozen_for_split → halt new Put/Delete via
     // handle_incoming_req's reject branch → park split_drain_ack →
     // partition_loop drains pending+inflight+imm → fires the ack
     // signal → split resumes. After this drain, commit_length is stable.
@@ -1321,7 +1321,7 @@ pub(crate) async fn handle_split_part(
         }
         p.frozen_for_split.set(Some(std::time::Instant::now()));
         *p.split_drain_ack.borrow_mut() = Some(drain_tx);
-        // F210-C2 fix — wake partition_loop so its idle-path
+        // fix — wake partition_loop so its idle-path
         // select observes that split_drain_ack just transitioned to
         // Some. Without this the loop sleeps through the full
         // FREEZE_TTL (30s) on an idle partition and the TTL backstop
@@ -1356,10 +1356,10 @@ pub(crate) async fn handle_split_part(
     // Phase 2 can complete (drain emptied them) and no new writes can
     // launch (frozen_for_split halts handle_incoming_req).
     //
-    // **F227 — failure MUST abort the split, NOT default to 1.** Pre-fix
+    // **Failure MUST abort the split, NOT default to 1.** Pre-fix
     // this swallowed errors with `unwrap_or(0).max(1)`. When one replica
-    // is unreachable (e.g. concurrent F211 fence + recovery dispatch),
-    // F227's all-replica `commit_length` rightly returns `Err`. The old
+    // is unreachable (e.g. concurrent fence + recovery dispatch),
+    // the all-replica `commit_length` rightly returns `Err`. The old
     // `unwrap_or(0).max(1)` masked that as "sealed at byte 1", so the
     // manager sealed the tail extent at byte 1; the right-child opened
     // post-split with a 1-byte-sealed tail and lost every log_stream
@@ -1370,7 +1370,7 @@ pub(crate) async fn handle_split_part(
     //
     // Returning `FailedPrecondition` lets the client retry the split
     // once the cluster is healthy enough that all-replica commit_length
-    // succeeds. F210-C2 already unfreezes on the error return below, so
+    // succeeds. The split path already unfreezes on the error return below, so
     // the partition resumes serving writes during the retry gap.
     let unfreeze_on_err = |e: anyhow::Error, what: &str| {
         part.borrow().frozen_for_split.set(None);
@@ -1391,7 +1391,7 @@ pub(crate) async fn handle_split_part(
     // so this variant wasn't independently reproduced, but the mechanism is
     // identical and compute_duplicate_stream is symmetric to compute_merge_streams.
     // The `?` above still aborts on a genuine commit_length Err (unreachable
-    // replica, the F227 hazard documented above), so OK+0 = genuinely empty,
+    // replica, the hazard documented above), so OK+0 = genuinely empty,
     // never a masked failure → safe to seal at 0.
     let log_end = part_sc
         .commit_length(log_stream_id)
@@ -1406,7 +1406,7 @@ pub(crate) async fn handle_split_part(
         .await
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
 
-    // F255 — synchronous P-log → P-sst barrier. Sent BEFORE
+    // synchronous P-log → P-sst barrier. Sent BEFORE
     // `multi_modify_split` so that any failure here is cleanly abortable:
     // the manager has not yet sealed the row_stream tail, so unfreezing
     // and returning Err leaves the cluster in a coherent pre-split state.
@@ -1424,10 +1424,10 @@ pub(crate) async fn handle_split_part(
     // empty (the priority-biased select in `flush_worker_loop` keeps the
     // ordering race-free defensively).
     //
-    // Pre-F255 v2 (and the F255 v1 lazy-flag attempt) this was a
+    // Before the current barrier (and the earlier lazy-flag attempt) this was a
     // `Cell<bool> need_invalidate_row_stream` flag piggybacked on each
     // P-sst message — racy under P-sst's cap=2 FuturesUnordered (see
-    // F255 fix history in `partition-server/CLAUDE.md` programming note 16).
+    // fix history in `partition-server/CLAUDE.md` programming note 16).
     let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<()>();
     let mut inv_tx = part.borrow().row_invalidate_tx.clone();
     let inv_req = crate::RowInvalidateBarrierReq {
@@ -1435,7 +1435,7 @@ pub(crate) async fn handle_split_part(
         seal_and_roll: false, // split: manager seals the tail itself; only invalidate here
         resp_tx: inv_resp_tx,
     };
-    // F255 — BOTH the send and the ACK await are bounded. `FREEZE_TTL`
+    // BOTH the send and the ACK await are bounded. `FREEZE_TTL`
     // (30 s, lib.rs) is the partition's unconditional "the handler is
     // wedged, unfreeze and resume writes" backstop (see
     // `check_freeze_ttls`). If EITHER step were unbounded, a wedged
@@ -1562,7 +1562,7 @@ pub(crate) async fn handle_split_part(
     }
 
     if !split_ok {
-        // F210-C2: unfreeze on multi_modify_split failure so the partition
+        // unfreeze on multi_modify_split failure so the partition
         // resumes serving writes (client will retry split). Without this
         // the partition stays frozen until FREEZE_TTL backstop fires.
         part.borrow().frozen_for_split.set(None);
@@ -1590,7 +1590,7 @@ pub(crate) async fn handle_split_part(
     // commit_length (the call's send) and the manager's commit,
     // `handle_multi_modify_split` has ONLY bounded awaits, each with a kill-
     // timeout that turns slowness into FAILURE (Err -> no commit -> no stale
-    // seal), never late success: the main put_msgs_txn (F228 etcd
+    // seal), never late success: the main put_msgs_txn (etcd
     // request_timeout 10 s); Phase-1 compute before it is fully synchronous.
     // No code path sleeps there — the only way to land a SUCCESSFUL commit after
     // the freeze window is the TEMP /tmp/autumn_repro6 sleep (now removed), which
@@ -1616,7 +1616,7 @@ pub(crate) async fn handle_split_part(
     part_sc.invalidate_stream(log_stream_id);
     part_sc.invalidate_stream(row_stream_id);
     part_sc.invalidate_stream(meta_stream_id);
-    // (F255 — P-sst row_invalidate barrier was already done BEFORE
+    // (The P-sst row_invalidate barrier was already done BEFORE
     // multi_modify_split above; see commentary at the barrier send site.)
 
     // Narrow PS-local rg to match the manager's new left range and
@@ -1624,7 +1624,7 @@ pub(crate) async fn handle_split_part(
     // sync_regions_once would leave the partition with a stale wide rg
     // and a stale has_overlap=0, perpetuating the bug above.
     //
-    // F212-fix: bump `region_epoch` in lock-step with the manager's
+    // fix: bump `region_epoch` in lock-step with the manager's
     // `next_region_epoch` rule (rg-rewrite ⇒ +1). Pre-fix, a gallery
     // `range(b"", b"", MAX)` issued before `region_sync_loop` had a
     // chance to drop+reopen this partition saw BOTH sides stale at the
@@ -1657,7 +1657,7 @@ pub(crate) async fn handle_split_part(
         p.region_epoch = p.region_epoch.saturating_add(1).max(2);
     }
 
-    // F212-fix-2: publish the new (rg, log, row, meta, region_epoch)
+    // fix-2: publish the new (rg, log, row, meta, region_epoch)
     // tuple to the cross-thread mirror so `sync_regions_once` on the
     // main thread observes `prev == latest` on its next tick and
     // SKIPS the drop+reopen. Pre-fix this mirror was a frozen
@@ -1680,7 +1680,7 @@ pub(crate) async fn handle_split_part(
         );
     }
 
-    // F210-C2: unfreeze on success — split commit landed; the LEFT
+    // unfreeze on success — split commit landed; the LEFT
     // (this partition's) post-split rg is now in effect, and merged
     // commit_length matches the manager's sealed_length. Writes can
     // resume against the narrower range.
@@ -1700,7 +1700,7 @@ pub(crate) async fn handle_maintenance(
     let req: MaintenanceReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
     if req.op == MAINTENANCE_FORCE_GC {
-        // F-GC-FLOOR-OBS #3: enqueue the Force GC AND return an advisory so the
+        // #3: enqueue the Force GC AND return an advisory so the
         // operator learns SYNCHRONOUSLY (not by grepping the PS log) that a
         // requested extent sits inside the recovery replay window and will be
         // PROTECTED (correct, not a bug). The background loop recomputes the
@@ -1768,7 +1768,7 @@ pub(crate) async fn handle_maintenance(
     let result = match req.op {
         MAINTENANCE_COMPACT => p.compact_tx.try_send(true).map_err(|_| "compaction busy"),
         MAINTENANCE_AUTO_GC => {
-            // F201: decode multi-tier filter params from wire request.
+            // decode multi-tier filter params from wire request.
             let params = crate::GcAutoParams {
                 ratio: req.gc_ratio,
                 max_size: req.gc_max_size,
@@ -1794,7 +1794,7 @@ pub(crate) async fn handle_maintenance(
     }
 }
 
-/// F-GC-FLOOR-OBS #2: snapshot the per-partition GC replay floor + per-SST
+/// #2: snapshot the per-partition GC replay floor + per-SST
 /// vp_heads so `autumn-op info --part` can show WHY a `forcegc` on a given
 /// extent would be protected (correct, not a bug). Read-only; borrows briefly,
 /// then does one `get_stream_info` to resolve the log extent order + floor.
@@ -1928,7 +1928,7 @@ pub(crate) async fn handle_get_discards(
 }
 
 // ---------------------------------------------------------------------------
-// F204 — `map_storage_error` translation tests
+// `map_storage_error` translation tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1965,7 +1965,7 @@ mod split_freeze_budget_tests {
 }
 
 #[cfg(test)]
-mod f204_map_storage_error_tests {
+mod map_storage_error_tests {
     use super::map_storage_error;
     use autumn_rpc::StatusCode;
     use autumn_stream::StaleVpOffset;

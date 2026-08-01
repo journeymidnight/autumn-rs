@@ -23,8 +23,8 @@
 //!   - The workspace binaries at `target/debug/` — run `cargo build
 //!     --workspace` first.
 //!   - The `etcd` binary on `$PATH` (or `AUTUMN_TEST_ETCD_BIN` set).
-//!     The manager runs in etcd-persistent mode so F149 leader fence,
-//!     F207 inflight ledger, F211-D owner_epoch bumps, and F198 rich EC
+//!     The manager runs in etcd-persistent mode so the leader fence,
+//! inflight ledger, owner_epoch bumps, and rich EC
 //!     markers all exercise the real durable code paths (memory-only
 //!     mode disables most of these).
 //!
@@ -60,7 +60,7 @@ use autumn_rpc::partition_rpc;
 use support::*;
 
 /// Spawn manager in etcd-persistent mode on a background thread. Mirrors
-/// `start_etcd_manager` in `f149_leader_fence.rs` — kept inline here so
+/// `start_etcd_manager` in `leader_fence.rs` — kept inline here so
 /// the chaos test stays a single-file deliverable.
 fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
     std::thread::spawn(move || {
@@ -291,7 +291,7 @@ impl EnProcess {
             .append(true)
             .open(&self.log_path)
             .expect("open log");
-        // F-EN-DYNSHARD M1a/M1c: the EN self-registers its location now (format
+        // M1a/M1c: the EN self-registers its location now (format
         // is identity-only). It BINDS its real port (`self.port`) but ADVERTISES
         // the toxiproxy data port (`self.proxy_port`) — so the manager routes
         // data → proxy_port and control → proxy_port+1000 (both toxiproxy-fronted),
@@ -310,10 +310,10 @@ impl EnProcess {
                 "127.0.0.1",
                 "--advertise",
                 &advertise,
-                // F196: cap shard count to 1 (default = cpuset_len; on a
+                // cap shard count to 1 (default = cpuset_len; on a
                 // 192-core test box that's 192 listeners per EN × N ENs).
-                // Single-shard is enough for the chaos contract — F099-M
-                // routing is exercised by the multi-EN cluster, not
+                // Single-shard is enough for the chaos contract — routing
+                // is exercised by the multi-EN cluster, not
                 // multi-shard per EN.
                 "--cpuset",
                 "0",
@@ -335,7 +335,7 @@ impl Drop for EnProcess {
 /// Format a fresh EN dir via `autumn-op format`, then spawn an
 /// `autumn-extent-node` subprocess. The format step is what stamps
 /// `cluster_id` / `disk_id` / `disk_uuid` / `node_id` sentinel files
-/// that the EN startup requires (F214-D).
+/// that the EN startup requires.
 ///
 /// **Toxiproxy ordering** (load-bearing): the proxy MUST be created
 /// *before* `format` runs, because format's advertise address (= proxy
@@ -363,7 +363,7 @@ fn bootstrap_en(
     )
     .expect("create toxiproxy proxy");
 
-    // 1b. F-CHAOS-DECOMMISSION root-cause fix: ALSO proxy the EN CONTROL
+    // 1b. Decommission root-cause fix: ALSO proxy the EN CONTROL
     //     port. `autumn-op format` registers `control_address` derived from
     //     the ADVERTISE address (+1000 → proxy_port+1000), and the manager's
     //     `node_health_loop` sends every `EXT_MSG_DF` there — the ONLY
@@ -382,7 +382,7 @@ fn bootstrap_en(
     )
     .expect("create toxiproxy control proxy");
 
-    // 2. autumn-op format <DIR> — F-EN-DYNSHARD M1c: IDENTITY-ONLY, no location
+    // 2. autumn-op format <DIR> — IDENTITY-ONLY, no location
     //    flags. Talks to the manager, allocates node_uuid + disk_uuid(s), stamps
     //    sentinel files. The EN's own --advertise (EnProcess::restart) reports
     //    the PROXY address at startup. Synchronous.
@@ -584,8 +584,8 @@ async fn writer_loop(
             Ok(r) => r,
             Err(_) => {
                 // A client-side timeout is an UNKNOWN outcome: the append may
-                // still land server-side after a transient stall (e.g. F227
-                // all-replica blocks while a replica is network-partitioned,
+                // still land server-side after a transient stall (e.g. the
+                // all-replica commit blocks while a replica is network-partitioned,
                 // then completes once it heals). So we must NOT treat the key
                 // as "old value" — that produced false "got seq > expected"
                 // mismatches. Forget the key entirely; its state is uncertain
@@ -791,7 +791,7 @@ impl NemesisCtx {
     /// partitioned. Pre-fix this didn't subtract `partitioned`, so two
     /// concurrent failure injections (e.g. partition + fence) could
     /// drop the cluster below K+M quorum without the nemesis budget
-    /// guard catching it — F227 then refuses commit_length, the writer
+    /// guard catching it — the manager then refuses commit_length, the writer
     /// retries land in a hard-to-recover state, and a rare key
     /// reverts to an older value. The guard is the test's only
     /// safeguard against pushing the cluster off the cliff, so it must
@@ -847,6 +847,7 @@ async fn do_merge(ctx: &NemesisCtx) -> Result<String, String> {
             rkyv_encode(&MergePartitionsReq {
                 survivor_part_id: survivor,
                 victim_part_id: victim,
+                force: false,
             }),
         )
         .await
@@ -1173,7 +1174,7 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
 }
 
 /// Inject 500 ms latency on an EN's proxy for ~4 s, then remove the
-/// toxic. Exercises slow-replica behaviour: F227 commit_length still
+/// toxic. Exercises slow-replica behaviour: commit_length still
 /// requires this replica to ACK so writes pay the latency, surfacing
 /// any timeout bug.
 async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
@@ -1234,7 +1235,7 @@ async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String,
 }
 
 /// FORCE GC on every partition's sealed log_stream extents — the maximal stress
-/// on the PS replay-floor guard (the F-COMPACT/FLUSH-VPHEAD vp_head thread). Force
+/// on the PS replay-floor guard (the vp_head thread). Force
 /// GC bypasses the discard-ratio gate and asks the PS to punch SPECIFIC sealed
 /// extents; a wrong vp_head (compaction MAX / flush rotation-stamp / recovery
 /// tail-seed) would let it punch an extent still inside the replay window → the
@@ -1334,7 +1335,7 @@ async fn nemesis_loop(
         }
         let action = pending.pop().expect("pending refilled when empty");
         // Bound every nemesis action: split/merge/EC orchestration RPCs are
-        // unbounded, so if a PS partition is wedged (e.g. stuck on an F227
+        // unbounded, so if a PS partition is wedged (e.g. stuck on an
         // all-replica op after a node kill+restart whose behind replica was
         // never recovered), the in-flight op never returns and the test
         // hangs forever at shutdown-join. 30s is generous (split retries up
@@ -1981,7 +1982,7 @@ async fn verify_gc_reclaim(
         }
         let sealed: Vec<u64> = stream.extent_ids[..stream.extent_ids.len() - 1].to_vec();
         let client = router.client_for(pid).await;
-        // Capture the force-GC advisory: F-GC-FLOOR-OBS #3 returns a NON-EMPTY
+        // Capture the force-GC advisory: the check returns a NON-EMPTY
         // `MaintenanceResp.message` ONLY when a requested sealed extent resolves
         // AT/BEFORE the recovery replay floor and is therefore PROTECTED (a
         // pinned floor holding reclaimable data — the "stuck" case this check
@@ -2013,7 +2014,7 @@ async fn verify_gc_reclaim(
         if any_protected {
             // A pinned replay floor is holding reclaimable extents even after
             // flush + MAJOR-compact — the real "compact-then-forceg won't
-            // reclaim" stuck-floor bug (F-VPHEAD-CHAOS / F-GC-FLOOR-OBS).
+            // reclaim" stuck-floor bug.
             errors.push(format!(
                 "GC-RECLAIM: the quiesce (flush + major-compact + force-GC) DELETED 0 \
                  extents WHILE force-GC reported PROTECTED extents — reclamation is STUCK \
@@ -2241,7 +2242,7 @@ mod accounting_checker_tests {
 ///
 /// After the nemesis loop has stopped and the cluster is restored to full
 /// health, fully decommission ONE extent-node the HDFS way: fence it, wait for
-/// the F-FENCE-DRAIN open-tail sweep + `fenced_only` recovery to relocate every
+/// the fence-drain open-tail sweep + `fenced_only` recovery to relocate every
 /// extent off it, then `MSG_REMOVE_NODE` — which refuses with
 /// `CODE_PRECONDITION` (listing the still-referencing extents) until the node is
 /// fully drained, and tombstones the address on success. This exercises the
@@ -2287,7 +2288,7 @@ async fn run_terminal_decommission(
         alive.len()
     );
 
-    // 1. Fence (force) — arms the F-FENCE-DRAIN open-tail drain + fenced_only
+    // 1. Fence (force) — arms the fence-drain open-tail drain + fenced_only
     //    recovery of the victim's sealed slots, and hard-excludes it from new
     //    placement.
     let resp = mgr
@@ -2321,11 +2322,11 @@ async fn run_terminal_decommission(
     }
 
     // 2. Poll MSG_REMOVE_NODE until the node is fully drained. Recovery
-    //    dispatches every 2 s and F-FENCE-DRAIN rolls open tails each tick
+    //    dispatches every 2 s and the fence-drain rolls open tails each tick
     //    (30 s per-partition cooldown). A fenced node's healthy SEALED replicas
     //    are relocated by the fenced-slot recovery dispatch; if that first
     //    recovery attempt sticks (the EN copy stalls under churn), re-dispatch
-    //    is frozen until the F-FENCE-DRAIN-2 stale-marker sweep releases the
+    //    is frozen until the fence-drain stale-marker sweep releases the
     //    Recovery marker (recovery-specific threshold, default 120 s; the
     //    decommission chaos script sets it to 60 s for faster CI). 90 attempts
     //    × 3 s = 270 s ceiling covers a stick + one sweep-release + retry.
@@ -2451,7 +2452,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         .collect();
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        // Wait until the manager has acquired the etcd leader lease — F149
+        // Wait until the manager has acquired the etcd leader lease — the
         // bootstrap fence rejects writes from a non-leader, and the
         // election loop runs every 2 s. Without this, `autumn-op format`'s
         // `register_node` can race in before `try_become_leader` lands.
@@ -2477,7 +2478,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // the proxy to simulate a network partition without killing the EN.
         let mut ens: Vec<EnProcess> = Vec::new();
         for (i, dir) in en_dirs.iter_mut().enumerate() {
-            // F270: ENs are killed + respawned on the SAME port mid-run; an
+            // ENs are killed + respawned on the SAME port mid-run; an
             // ephemeral-range port loses a race to outbound sockets while the
             // EN is down (respawn EADDRINUSE → fail-stop → permanently dead
             // EN → "no healthy node" alloc starvation = ALL of this run's

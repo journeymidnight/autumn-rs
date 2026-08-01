@@ -230,7 +230,7 @@ pub struct DecodedBlock {
 }
 
 impl DecodedBlock {
-    /// F261 test helper — fabricate a minimal block for cache unit tests.
+    /// test helper — fabricate a minimal block for cache unit tests.
     #[cfg(test)]
     pub fn test_dummy(data: Bytes) -> Self {
         Self {

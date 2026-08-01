@@ -1,4 +1,4 @@
-//! F073: System test — split with large values, VP resolution across shared extents.
+//! System test — split with large values, VP resolution across shared extents.
 //!
 //! Write keys with values >4KB (stored as ValuePointers in logStream), flush,
 //! split. Both child partitions can resolve VPs pointing to shared logStream extents.
@@ -34,7 +34,7 @@ fn split_with_large_values_preserves_vp_resolution() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
-        // F099-K: post-split right partition binds a different port.
+        // post-split right partition binds a different port.
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write keys with large values (>4KB triggers ValuePointer storage)

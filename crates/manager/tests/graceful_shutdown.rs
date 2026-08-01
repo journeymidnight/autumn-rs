@@ -1,4 +1,4 @@
-//! F120-C — graceful shutdown end-to-end.
+//! graceful shutdown end-to-end.
 //!
 //! Strategy:
 //!   1. Bring up a 1-node cluster (manager + 1 extent node).
@@ -14,7 +14,7 @@
 //!      the same partitions. Verify that every previously-written key
 //!      is readable. This proves the post-shutdown on-disk state
 //!      survives — either via SST written during graceful drain
-//!      (F120-C path) or via logStream replay (pre-F120 fallback).
+//!      (graceful-drain path) or via logStream replay (fallback).
 //!      Either way the data is safe; the deadline assertion + a clean
 //!      thread join differentiates regression vs. SIGKILL race.
 //!
@@ -24,10 +24,10 @@
 //!     restart). The right assertion would be "metaStream's vp_offset
 //!     equals log_stream commit_length after restart" but the manager
 //!     surface for those values requires extra RPC plumbing — covered
-//!     by live cluster verification per feature_list.md F120 acceptance.
-//!   - The `MAX_IMM_DEPTH` back-pressure path (F120-A) — that requires
+//!     by live cluster verification per feature_list.md acceptance.
+//!   - The `MAX_IMM_DEPTH` back-pressure path — that requires
 //!     a slowed-down P-sst fixture to actually fill imm.
-//!   - The `MAX_WAL_GAP` force-rotate path (F120-B) — same.
+//!   - The `MAX_WAL_GAP` force-rotate path — same.
 
 mod support;
 
@@ -42,7 +42,7 @@ use autumn_rpc::partition_rpc::CODE_OK;
 use support::*;
 
 #[test]
-fn f120_graceful_shutdown_drains_active_to_sst() {
+fn graceful_shutdown_drains_active_to_sst() {
     // Tighten shutdown deadline so the test fails fast on regression.
     // Read by `shutdown_timeout_ms()` once via OnceLock — must be set
     // before the PS thread spawns.
@@ -114,12 +114,12 @@ fn f120_graceful_shutdown_drains_active_to_sst() {
         "graceful shutdown took {:?} (deadline 10 s — likely regression)",
         total_shutdown,
     );
-    println!("F120-C: graceful shutdown took {:?}", total_shutdown);
+    println!("graceful shutdown took {:?}", total_shutdown);
 
     // Spawn a second PS (different psid, same partition slot) and verify
     // the data is queryable. Manager rebalances the partition onto the
-    // new PS once the first one's heartbeat times out (10 s default,
-    // F069). We wait long enough.
+    // new PS once the first one's heartbeat times out (10 s default).
+    // We wait long enough.
     std::thread::sleep(Duration::from_secs(11));
     let ps2_addr = pick_addr();
     let shutdown_flag2 = Arc::new(AtomicBool::new(false));

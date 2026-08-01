@@ -1,4 +1,4 @@
-//! F063: System test — owner lock owner_epoch fencing (LockedByOther).
+//! System test — owner lock owner_epoch fencing (LockedByOther).
 //!
 //! Two StreamClients acquire owner locks with different keys on the same stream.
 //! The second client's higher owner_epoch fences out the first client's writes.

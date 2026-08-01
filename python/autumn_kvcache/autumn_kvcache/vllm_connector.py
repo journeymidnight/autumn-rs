@@ -139,7 +139,7 @@ def prefix_hash(
     same tokens but different LoRA/mm context would alias the same KV (a
     correctness bug). Ideally these come from vLLM's own `BlockHash` extra keys
     (docs/autumn_kvcache_plan.md §13.3); MVP derives a best-effort subset from
-    the request and reconciles exact parity during the e2e (F250-D).
+    the request and reconciles exact parity during the e2e.
     """
     h = hashlib.sha256()
     # 4-byte little-endian per token id; deterministic across processes.
@@ -236,7 +236,7 @@ class _AutumnKVStore:
     ):
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
-        # F-AUTHZ-BUILTIN (D6-kvc): authz identity, NOT the key scope —
+        # (D6-kvc): authz identity, NOT the key scope —
         # `tenant_suffix` (model fingerprint etc.) picks WHERE keys live;
         # `auth_principal`+`auth_credential` prove WHO may write there.
         # Both-or-neither (the PyO3 layer enforces it too, but failing here
@@ -245,7 +245,7 @@ class _AutumnKVStore:
             raise ValueError(
                 "auth_principal and auth_credential must be passed together"
             )
-        # F-NS-PRINCIPAL-UNIFIED (Option 3): keys are NS-FIRST with no tenant
+        # (Option 3): keys are NS-FIRST with no tenant
         # segment — the client binds the `kvc` SCOPE and PREPENDS `kvc/`, and
         # `_keys.py` emits the relative `{model}/…` (wire key `kvc/{model}/…`).
         # `tenant_suffix` is the per-MODEL instance (`self._tenant` below, kept
@@ -274,7 +274,7 @@ class _AutumnKVStore:
         default_cap = 16 if transport == "ucx" else 64
         cap = int(max_inflight) if max_inflight else default_cap
         # Hot-path: GIL-releasing batched client (bulk on UCX for large pages).
-        # F-DIRECT-MANY: direct_read (default ON) sends ≥64 KiB KV-page gets
+        # direct_read (default ON) sends ≥64 KiB KV-page gets
         # STRAIGHT to an EN (bypassing the PS); <64 KiB pages stay on the proxy
         # (size-gated per item), and any direct-read failure falls back to the
         # proxy (the client warns once). Set direct_read=False in extra_config
@@ -314,7 +314,7 @@ class _AutumnKVStore:
         return self._marker_ttl
 
     def _key(self, content_hash: str, layer_name: str) -> bytes:
-        # F-NS-PRINCIPAL-UNIFIED: kvc/{model}/{pool}/{fmt}/{hash}/{layer}.
+        # kvc/{model}/{pool}/{fmt}/{hash}/{layer}.
         return full_key(
             self._tenant,
             f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}",
@@ -476,7 +476,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # this with a pydantic validation error); older vLLM used the 2-arg
         # form. Accept both — pass the 3rd arg when present, fall back to the
         # 2-arg shape on TypeError — so the adapter tracks the pinned vLLM
-        # without a hard version floor (F250-D reconciliation).
+        # without a hard version floor (reconciled during the e2e).
         if _VLLM_AVAILABLE:
             try:
                 super().__init__(
@@ -544,12 +544,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         ttl_secs = int(extra.get("ttl_secs", 0) or 0)
         if ttl_secs < 0:
             raise ValueError(f"ttl_secs must be non-negative, got {ttl_secs}")
-        # F-DIRECT-MANY: EN-direct reads default ON (topology-dependent, safe —
+        # EN-direct reads default ON (topology-dependent, safe —
         # size-gated + per-item proxy fallback). Accept a JSON bool or a string.
         direct_read = extra.get("direct_read", True)
         if isinstance(direct_read, str):
             direct_read = direct_read.strip().lower() not in ("0", "false", "no", "off")
-        # F-AUTHZ-BUILTIN (D6-kvc) / F-NS-PRINCIPAL-UNIFIED: authz identity from
+        # (D6-kvc): authz identity from
         # extra_config. `auth_credential_file` (path; k8s mounts a Secret) is the
         # ONLY required key — Option 3's credential file carries its principal's
         # NAME, so the identity is self-describing. `auth_principal` overrides

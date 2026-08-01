@@ -1,4 +1,4 @@
-//! F-FS-UNIFY M0 — manager-side fuse-fs inode allocation (`MSG_ALLOC_INODES`).
+//! M0 — manager-side fuse-fs inode allocation (`MSG_ALLOC_INODES`).
 //!
 //! The pre-M0 allocator was a client-side non-CAS read-modify-write on the
 //! fs KV `[0x04]next_inode` key: concurrent allocators (two fuse mounts, or
@@ -45,7 +45,7 @@ async fn alloc_vol(mgr: &RpcClient, count: u32, floor: u64, volume: Vec<u8>) -> 
     rkyv_decode(&resp).expect("decode AllocInodesResp")
 }
 
-/// F-KEY-NS SD-3: two distinct volume identities get INDEPENDENT counters —
+/// SD-3: two distinct volume identities get INDEPENDENT counters —
 /// each numbers its inodes from 2, and a grant on one never advances the
 /// other. Proves the handler threads `req.volume` into the per-volume
 /// allocator (memory-mode manager, raw RPC).

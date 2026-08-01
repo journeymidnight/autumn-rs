@@ -15,7 +15,7 @@ use crate::state::FsState;
 // `InodeMeta.mode` is `u32` everywhere, so normalise the libc constants
 // once here and use these `u32` aliases from every call site (meta.rs +
 // dispatch.rs). `#[allow]` covers the host where the cast is a no-op.
-// `pub` (F-FS-UNIFY M1): these are the persisted `InodeMeta.mode` format
+// `pub` (M1): these are the persisted `InodeMeta.mode` format
 // bits — part of the core's public vocabulary (the fuse-gated `attr.rs`
 // and the M2 PyO3 binding both classify inodes with them).
 #[allow(clippy::unnecessary_cast)]
@@ -27,7 +27,7 @@ pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFREG: u32 = libc::S_IFREG as u32;
 
-// F-FS-UNIFY M1: `inode_to_attr` / `mode_to_filetype` (the InodeMeta →
+// M1: `inode_to_attr` / `mode_to_filetype` (the InodeMeta →
 // fuser::FileAttr conversions) moved to `attr.rs` — the fuse-gated reply
 // boundary. This module is part of the fuser-free FS core.
 
@@ -88,10 +88,10 @@ pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
 /// error PROPAGATES (never silently recreates the root over a transient
 /// failure via `kv_get`'s absent-vs-error conflation). Does NOT seed the
 /// local inode-alloc cursor — every inode is granted by the manager
-/// (F-FS-UNIFY M0), so this is safe for any co-equal writer (the fuse mount's
+/// (M0), so this is safe for any co-equal writer (the fuse mount's
 /// `init_root` layers its legacy pre-manager batch seed on top).
 pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
-    // F-KEY-NS SD-3: verify/stamp the volume's layout version BEFORE any
+    // SD-3: verify/stamp the volume's layout version BEFORE any
     // root read/write, so an incompatible layout refuses to mount up front.
     ensure_schema_version(state).await?;
     let root_key = key::inode_key(ROOT_INO);
@@ -103,7 +103,7 @@ pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
     Ok(true)
 }
 
-/// F-KEY-NS: verify (or stamp) this filesystem's on-disk layout version.
+/// verify (or stamp) this filesystem's on-disk layout version.
 /// Each tenant carries its own `[0x04]schema_version` (relative → it lives at
 /// `fs/{tenant}/[0x04]schema_version`).
 ///
@@ -200,7 +200,7 @@ pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Resul
 
 /// Allocate a new inode number from the batch allocator.
 ///
-/// F-FS-UNIFY M0: batches are granted by the MANAGER
+/// M0: batches are granted by the MANAGER
 /// (`ClusterClient::alloc_inodes` — leader-fenced etcd CAS), replacing the
 /// pre-M0 non-CAS read-modify-write on the `[0x04]next_inode` fs KV key,
 /// which handed out duplicate batches under concurrent allocators (two

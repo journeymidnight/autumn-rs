@@ -1,4 +1,4 @@
-"""F275 — kvcache-interface chaos workload (no sglang dependency).
+"""kvcache-interface chaos workload (no sglang dependency).
 
 Runs a continuous put → readback-verify loop through the L3 backend API
 (`batch_set_v1` / `batch_get_v1`) against an externally-running cluster,

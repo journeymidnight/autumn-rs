@@ -1,4 +1,4 @@
-//! F-AUTHZ-1 cross-tenant end-to-end test against a LIVE authz-enabled cluster.
+//! cross-tenant end-to-end test against a LIVE authz-enabled cluster.
 //!
 //! `#[ignore]` — driven by `tests/run_authz_e2e.sh`, which brings up an isolated
 //! authz-enabled cluster (manager with a signing key; protect-everything),
@@ -47,7 +47,7 @@ fn cross_tenant_isolation() {
         .expect("compio runtime")
         .block_on(async move {
             // ── tenant "acme" (granted acme/mem/) ─────────────────────────
-            // F-KEY-NS D7: this test drives absolute keys across MULTIPLE
+            // D7: this test drives absolute keys across MULTIPLE
             // prefixes (acme/mem/, other/mem/, scratch/) to exercise PS-side
             // authz (Layer-B), so it uses a RAW (unclamped) client + credential —
             // an Assert(mem/acme) binding would clamp it client-side and never

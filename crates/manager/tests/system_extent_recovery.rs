@@ -1,4 +1,4 @@
-//! F065: System test — extent recovery end-to-end.
+//! System test — extent recovery end-to-end.
 //!
 //! 3 extent nodes. Create a 2-replica stream on (node1, node2).
 //! Write data, seal extent. Register a "dead" node (node_dead) that was
@@ -101,7 +101,7 @@ fn extent_recovery_replaces_dead_node() {
         // has all replicas available (avali bits set).
         sc.invalidate_extent_cache(extent_id);
         let ext = sc.get_extent_info(extent_id).await.expect("extent info");
-        // F206: assert every slot bit is set, not just `> 0`. Pre-F206 a
+        // assert every slot bit is set, not just `> 0`. Previously a
         // post-EC extent had `avali = all_bits(K)` instead of
         // `all_bits(K + M)`, which the looser `> 0` check let through.
         let total_slots = ext.replicates.len() + ext.parity.len();
@@ -152,7 +152,7 @@ fn extent_recovery_replaces_dead_node() {
     });
 }
 
-/// F-FENCE-DRAIN-3: a recovery completion whose df delivery was LOST must
+/// a recovery completion whose df delivery was LOST must
 /// not permanently poison the recovery candidate.
 ///
 /// `handle_df` hands `recovery_done` to the manager via `std::mem::take`
@@ -175,7 +175,7 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
 
     /// Like `support::start_extent_node` but with the manager endpoint
     /// wired, so `handle_require_recovery` / the adopt triage can resolve
-    /// extent_info (mirrors `f211_e2e_lifecycle::start_extent_node_with_manager`).
+    /// extent_info (mirrors `e2e_lifecycle::start_extent_node_with_manager`).
     fn start_en_with_manager(
         addr: std::net::SocketAddr,
         dir: std::path::PathBuf,

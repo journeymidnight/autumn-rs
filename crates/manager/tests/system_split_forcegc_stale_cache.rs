@@ -1,7 +1,7 @@
 //! Reproduce-first probe for the "split-sealed tail stays cached-as-open →
 //! force-GC conservatively skips it" GC-promptness gap.
 //!
-//! Claim under test: the split SOURCE keeps its StreamClient (no reopen, F212),
+//! Claim under test: the split SOURCE keeps its StreamClient (no reopen),
 //! and `handle_split_part` only `invalidate_stream`s (drops the worker) — it does
 //! NOT `invalidate_extent_cache` the manager-sealed tail. So the sealed tail could
 //! read `sealed=false` from a stale cache and `authoritative_sealed_length` would

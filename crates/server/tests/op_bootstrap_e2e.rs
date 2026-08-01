@@ -1,4 +1,4 @@
-//! F213 e2e — exercise the autumn-op `bootstrap` + autumn-client
+//! e2e — exercise the autumn-op `bootstrap` + autumn-client
 //! `put`/`get` round-trip through the actual binaries.
 //!
 //! Regression target: if anyone deletes a subcommand from autumn-op or
@@ -104,13 +104,13 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // OS tmp dir; the binaries hash-allocate sub-dirs (`{data}/{hash}/...`)
     // and tests historically have collided on `/tmp/autumn-test-*`. A
     // per-PID dir avoids cross-test contention.
-    let tmp = std::env::temp_dir().join(format!("f213-e2e-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("op-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let data_dir = tmp.join("en1");
     let val_path = tmp.join("val.txt");
     std::fs::create_dir_all(&data_dir).unwrap();
-    std::fs::write(&val_path, b"hello-from-f213-e2e").unwrap();
+    std::fs::write(&val_path, b"hello-from-op-e2e").unwrap();
 
     let mgr_port = pick_port();
     let en_port = pick_port();
@@ -136,16 +136,16 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         "manager did not open port {mgr_port}"
     );
 
-    // ── format the EN dir via autumn-op (F214-C) ────────────────────
-    // F214 unified `register-node` into `format`: one call fetches the
+    // ── format the EN dir via autumn-op ────────────────────
+    // unified `register-node` into `format`: one call fetches the
     // manager's cluster_id, allocates disk_uuid, registers the node,
     // and stamps sentinel files (`cluster_id` / `disk_uuid` /
     // `node_id` / `disk_id`) per data dir. The EN binary refuses to
-    // start without these files (F214-D), so format MUST run before
+    // start without these files, so format MUST run before
     // the extent-node spawn.
     {
         let mut cmd = Command::new(AUTUMN_OP_BIN);
-        // F-EN-DYNSHARD M1c: format is identity-only — no location flags.
+        // M1c: format is identity-only — no location flags.
         cmd.args(["--manager", &mgr_addr, "format", data_dir.to_str().unwrap()]);
         let stdout = run_or_panic("autumn-op format", cmd);
         let text = String::from_utf8_lossy(&stdout);
@@ -160,8 +160,8 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     }
 
     // ── extent-node ─────────────────────────────────────────────────
-    // `--cpuset 0` pins to a single core / single shard. F214-D
-    // removed `--disk-id`; disk_id now comes from the sentinel file
+    // `--cpuset 0` pins to a single core / single shard. An earlier
+    // change removed `--disk-id`; disk_id now comes from the sentinel file
     // written by `autumn-op format` above.
     let _extent_node = ChildGuard::new(
         "extent-node",
@@ -171,7 +171,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
                 &en_port.to_string(),
                 "--listen",
                 "127.0.0.1",
-                // F-EN-DYNSHARD M1a/M1c: --advertise is required with --manager;
+                // M1a/M1c: --advertise is required with --manager;
                 // the EN self-registers its live location (format is identity-only).
                 "--advertise",
                 &en_addr,
@@ -193,7 +193,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     );
 
     // ── partition-server ────────────────────────────────────────────
-    // F099-K note: PS does NOT bind `--port` itself; instead each
+    // note: PS does NOT bind `--port` itself; instead each
     // partition assigned to this PS binds `base_port + ord` (so the
     // first partition lands on `--port` = ps_port). Before bootstrap,
     // PS has zero partitions and therefore no listening sockets — we
@@ -236,7 +236,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     }
 
     // PS picks up the new partition on the next region_sync tick (~2 s)
-    // and binds its per-partition listener on `ps_port` (F099-K: first
+    // and binds its per-partition listener on `ps_port` (first
     // partition = base_port + 0). Wait for that listener.
     assert!(
         wait_port_open(ps_port, Duration::from_secs(15)),
@@ -268,7 +268,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         let stdout = run_or_panic("autumn-client get", cmd);
         assert_eq!(
             stdout,
-            b"hello-from-f213-e2e",
+            b"hello-from-op-e2e",
             "get returned wrong bytes: {:?}",
             String::from_utf8_lossy(&stdout)
         );

@@ -185,7 +185,7 @@ fn ec_2_1_failover_and_recovery() {
         let stream_info = get_stream_info(&mgr, stream_id).await;
         eprintln!("stream {} extents: {:?}", stream_id, stream_info.extent_ids);
 
-        // F203: ec_conversion_dispatch_loop is drain-only — only
+        // ec_conversion_dispatch_loop is drain-only — only
         // markers placed via `MSG_FORCE_EC_CONVERT` (or replayed from
         // etcd) are processed. Auto-conversion of newly-sealed extents
         // was removed during the mechanism/policy refactor. Trigger

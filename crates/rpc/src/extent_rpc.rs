@@ -23,12 +23,12 @@ pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
 pub const MSG_DELETE_EXTENT: u8 = 11;
 pub const MSG_COMMIT_EC_SHARD: u8 = 12;
-// 13 = MSG_SYNC_EXTENT — retired in F150 Phase B (the F142 fsync barrier was
+// 13 = MSG_SYNC_EXTENT — retired when the fsync barrier was
 //      folded into `start_write_batch`'s rotation-trigger `must_sync=true`
-//      batch promotion). F178 Phase 2 retires the rotation barrier in turn,
+//      batch promotion. A later phase retires the rotation barrier in turn,
 //      replacing both with the per-extent fsync coalescer + `MSG_SYNCED_LENGTH`
 //      durability query so flush waits at flush-time, not at write-time.
-/// F178 Phase 2: query the extent-node's coalesced fsync high-water mark.
+/// Phase 2: query the extent-node's coalesced fsync high-water mark.
 /// Returned `length` = `Coalescer::last_synced` for `extent_id`. Used by
 /// `flush_one_imm` to await durability of all log_stream bytes referenced
 /// by the to-be-flushed memtable's ValuePointers BEFORE uploading the SST.
@@ -48,7 +48,7 @@ pub const MSG_SYNCED_LENGTH: u8 = 13;
 /// with a real owner_epoch so the EN's fence handover side-effect
 /// fires (see `extent_node.rs::handle_commit_length`).
 pub const MSG_PROBE_EXTENT: u8 = 14;
-/// F216-E zero-copy read (EN -> PS). Same request shape as MSG_READ_BYTES
+/// zero-copy read (EN -> PS). Same request shape as MSG_READ_BYTES
 /// (ReadBytesReq), but the response is value-separable for recv-into-registered:
 /// a V0 frame whose payload is `[bulk meta: code(1)+value_len(4)+value_crc32c(4)]
 /// [raw value]` (autumn_rpc::client::ZC_META_LEN). The EN emits it as TWO Bytes
@@ -59,7 +59,7 @@ pub const MSG_PROBE_EXTENT: u8 = 14;
 /// MSG_READ_BYTES for EC / chunked / TCP.
 pub const MSG_READ_BYTES_BULK: u8 = 15;
 
-/// F260 — chained append (large-payload replication pipeline). Payload:
+/// chained append (large-payload replication pipeline). Payload:
 ///
 /// ```text
 /// [n_chain: u8][ per hop: addr_len u16 LE + addr utf8 ]...[AppendReq bytes]
@@ -75,7 +75,7 @@ pub const MSG_READ_BYTES_BULK: u8 = 15;
 /// fencing and commit-truncation are per-replica invariants, unchanged.
 pub const MSG_APPEND_CHAIN: u8 = 16;
 
-/// F260: encode the chain prefix (`[n][len+addr]...`) for MSG_APPEND_CHAIN.
+/// encode the chain prefix (`[n][len+addr]...`) for MSG_APPEND_CHAIN.
 /// The full request is `[prefix][AppendReq::encode_header()][payload...]` —
 /// senders use vectored writes so the payload stays zero-copy.
 pub fn encode_chain_prefix(chain: &[String]) -> Bytes {
@@ -88,7 +88,7 @@ pub fn encode_chain_prefix(chain: &[String]) -> Bytes {
     buf.freeze()
 }
 
-/// F260: split a MSG_APPEND_CHAIN payload into `(chain, AppendReq bytes)`.
+/// split a MSG_APPEND_CHAIN payload into `(chain, AppendReq bytes)`.
 /// The AppendReq remainder is returned as Bytes (zero-copy slice) so the
 /// forward path can re-send it without re-encoding.
 pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'static str> {
@@ -124,11 +124,11 @@ pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'st
 /// [payload bytes...]
 /// ```
 ///
-/// F178 Phase 3 follow-up: `must_sync` byte removed. Every append is
+/// Phase 3 follow-up: `must_sync` byte removed. Every append is
 /// always durable via the per-extent fsync coalescer (see
 /// `extent_node.rs::Coalescer`); the handler unconditionally registers a
-/// sync waiter and awaits coalesced `sync_data`. Pre-F178 this byte
-/// distinguished sync vs. nosync writes; post-F178 there is no nosync
+/// sync waiter and awaits coalesced `sync_data`. This byte previously
+/// distinguished sync vs. nosync writes; now there is no nosync
 /// path. Wire format shrinks by 1 byte.
 // u64-offset widening: commit is a byte position in the extent (up to
 // max_extent_size, now > 4 GiB), so it is u64. Header = 8+8+8(commit)+8 = 32.
@@ -283,12 +283,12 @@ impl ReadBytesResp {
 /// CommitLengthRequest: 16 bytes.
 /// [extent_id: u64 LE][owner_epoch: i64 LE]
 ///
-/// **Wire contract on `owner_epoch` (post-F210-H3 Tier 2, 2026-05-17):**
+/// **Wire contract on `owner_epoch` (Tier 2, 2026-05-17):**
 ///
 /// `owner_epoch` is an i64 but MUST be `> 0` on the wire — it carries the
 /// caller's owner-lock claim. The EN's `handle_commit_length`:
 ///   - returns `CODE_INVALID_ARGUMENT` if `owner_epoch <= 0` (no
-///     "probe sentinel" path — that escape hatch existed pre-F210-H2
+///     "probe sentinel" path — that escape hatch existed earlier
 ///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
 ///   - returns `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch`
 ///     (caller is a stale owner; reject);
@@ -398,13 +398,13 @@ impl ProbeExtentReq {
 /// `coalescer.last_synced` for open extents or `sealed_length` for sealed.
 pub type ProbeExtentResp = CommitLengthResp;
 
-// (F150 Phase B removed SyncExtentReq/Resp + MSG_SYNC_EXTENT — the F142
+// (SyncExtentReq/Resp + MSG_SYNC_EXTENT were removed — the
 // fsync barrier is now folded into `start_write_batch`'s rotation-trigger
-// `must_sync=true` promotion in autumn-partition-server. F178 Phase 2
+// `must_sync=true` promotion in autumn-partition-server. A later phase
 // then drops the rotation barrier altogether and adds MSG_SYNCED_LENGTH
 // (below) for flush-time durability waits via the per-extent coalescer.)
 
-// ── SyncedLength (F178 Phase 2) ──────────────────────────────────────────────
+// ── SyncedLength ─────────────────────────────────────────────────────────────
 
 /// SyncedLengthRequest: 8 bytes.
 /// `[extent_id: u64 LE]`
@@ -478,7 +478,7 @@ where
 /// Deserialize a value from bytes using rkyv with archive-bytes validation.
 /// Copies into an AlignedVec if the input is not properly aligned.
 ///
-/// F155: switched from `from_bytes_unchecked` to the checked `from_bytes` —
+/// switched from `from_bytes_unchecked` to the checked `from_bytes` —
 /// see the matching note in `crates/rpc/src/manager_rpc.rs` for rationale.
 /// Validates archived bytes via bytecheck before deserialising; returns
 /// `Err` on malformed input instead of UB.
@@ -626,7 +626,7 @@ pub struct DfReq {
 
 /// Df response: completed recovery tasks + per-disk stats.
 ///
-/// F-EN-DYNSHARD M1b — the trailing three fields ECHO the EN's own live
+/// M1b — the trailing three fields ECHO the EN's own live
 /// identity so the manager's `node_health_loop` (the single df caller) can
 /// self-heal stored-location drift and detect pod-IP reuse (a DIFFERENT process
 /// answering at a stored address → `node_uuid` mismatch → refuse to heal). All
@@ -638,11 +638,11 @@ pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
     /// (disk_id, DiskStatus) pairs (HashMap not used for rkyv compat).
     pub disk_status: Vec<(u64, DiskStatus)>,
-    /// F-EN-DYNSHARD M1b: the EN's stable identity (empty = not registered).
+    /// M1b: the EN's stable identity (empty = not registered).
     pub node_uuid: String,
-    /// F-EN-DYNSHARD M1b: the address the EN advertises (empty = not registered).
+    /// M1b: the address the EN advertises (empty = not registered).
     pub advertise_addr: String,
-    /// F-EN-DYNSHARD M1b: the shard ports this EN process actually binds.
+    /// M1b: the shard ports this EN process actually binds.
     pub shard_ports: Vec<u16>,
 }
 
@@ -690,7 +690,7 @@ pub struct ConvertToEcReq {
     /// k+m target node addresses (data shard nodes first, then parity).
     pub target_addrs: Vec<String>,
     pub eversion: u64,
-    /// F211-D Tier 2: owner-lock owner_epoch propagated from manager.
+    /// Tier 2: owner-lock owner_epoch propagated from manager.
     /// Coord puts this into every `WriteShardReq.owner_epoch` and
     /// `CommitEcShardReq.owner_epoch` so a fenced ex-coord whose in-flight
     /// 2PC continues against bumped revisions on remote ENs is
@@ -774,11 +774,11 @@ impl CopyExtentResp {
 /// installs the shard, so subsequent ReadBytes requests with a stale
 /// (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
 ///
-/// `owner_epoch` (F211-D) carries the owner-lock owner_epoch the caller
+/// `owner_epoch` carries the owner-lock owner_epoch the caller
 /// claims. When `owner_epoch > 0` the extent-node refuses with
 /// `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch` — same
 /// fence model as the append path. `owner_epoch = 0` means "no fence
-/// requested" (pre-F211-D wire-compat).
+/// requested" (wire-compat).
 ///
 /// `shard_offset` (chunked EC convert): the byte offset WITHIN the shard
 /// at which `payload` is written into the staging `.ec.dat`. EC convert
@@ -856,7 +856,7 @@ impl WriteShardResp {
 
 /// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE]
 ///
-/// F211-D: `owner_epoch` fence — see `WriteShardReq` for semantics.
+/// `owner_epoch` fence — see `WriteShardReq` for semantics.
 pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 32;
 
 pub struct CommitEcShardReq {
@@ -937,13 +937,13 @@ mod tests {
         assert!(decoded.message.is_empty());
     }
 
-    /// F155: rkyv_decode rejects malformed input via bytecheck instead of UB.
-    /// Pre-F155 this used `from_bytes_unchecked` and a corrupted payload
+    /// rkyv_decode rejects malformed input via bytecheck instead of UB.
+    /// Previously this used `from_bytes_unchecked` and a corrupted payload
     /// (flipped bits past TCP CRC, mixed-version cluster, etc.) caused
     /// out-of-bounds reads or pointer dereferences into arbitrary memory.
-    /// Post-F155 the checked decoder runs validation first and returns Err.
+    /// Now the checked decoder runs validation first and returns Err.
     #[test]
-    fn f155_rkyv_decode_rejects_malformed() {
+    fn rkyv_decode_rejects_malformed() {
         // Encode a valid CodeResp, then mangle each byte and confirm the
         // decode path returns Err rather than panicking or reading garbage.
         let valid = rkyv_encode(&CodeResp {
@@ -988,7 +988,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod f260_chain_codec_tests {
+mod chain_codec_tests {
     use super::*;
 
     #[test]

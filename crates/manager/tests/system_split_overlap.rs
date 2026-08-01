@@ -1,4 +1,4 @@
-//! F067: System test — split overlap compaction enables second split.
+//! System test — split overlap compaction enables second split.
 //!
 //! After split, child partition has has_overlap. Second split is rejected.
 //! After major compaction clears overlap, second split succeeds.

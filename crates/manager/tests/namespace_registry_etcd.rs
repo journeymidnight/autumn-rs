@@ -1,4 +1,4 @@
-//! F-KEY-NS D2 (SD-1) — etcd-backed namespace registry: bootstrap
+//! D2 (SD-1) — etcd-backed namespace registry: bootstrap
 //! pre-registration + replay rehydration across a leader failover, plus the
 //! coco-P1 leader-gating of `MSG_GET_AUTHZ_CONFIG` over the real wire.
 //!

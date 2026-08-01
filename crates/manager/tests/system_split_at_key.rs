@@ -1,4 +1,4 @@
-//! F-SPLIT-AT-KEY (design doc D4): operator/controller-specified split point.
+//! (design doc D4): operator/controller-specified split point.
 //!
 //! Covers the four cases the feature adds on top of the legacy median path
 //! (which stays exercised by `system_range_split` / `system_multi_split_chain`):

@@ -109,7 +109,7 @@ Three classes of failure stopped the cross-host UCX leg on this attempt:
    vLLM tenants also squat random ports in 12000–40000, so a free
    contiguous band is increasingly hard to find on this box; production
    should reserve a band via `/proc/sys/net/ipv4/ip_local_reserved_ports`,
-   or finish the F099-K `:0`-fallback work for the EN control listener
+   or finish the `:0`-fallback work for the EN control listener
    (PS already has it per [[project_bug3_routing_wedge_pinned]]; EN still
    uses deterministic ports).
 
@@ -478,5 +478,5 @@ is now nuanced:
 - **No regression** on either transport at current HEAD.
 
 Takeaway: keep UCX for large-value (≥ ~64K-1M) and bulk transfer; TCP is fine —
-and now competitive — for small ops. Matches the F216-E "ZC iff size≥64K" rule
+and now competitive — for small ops. Matches the "ZC iff size≥64K" rule
 ([[project_ucx_zerocopy_default]]).

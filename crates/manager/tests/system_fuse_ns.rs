@@ -1,4 +1,4 @@
-//! F-KEY-NS — fuse batch-data-path key-consistency regression test.
+//! fuse batch-data-path key-consistency regression test.
 //!
 //! The extent DATA path bypasses `FsState`'s `kv_*` helpers for performance
 //! (read → `get_many_into`, write append → `put_many_fenced`), calling the
@@ -13,7 +13,7 @@
 //! byte-exact. Fails if the append path's extents aren't at the same keys the
 //! cold scan/read use.
 //!
-//! (F-NS-PRINCIPAL-UNIFIED, 2026-07-19: the former `two_tenants_isolate_same_inode`
+//! (2026-07-19: the former `two_tenants_isolate_same_inode`
 //! + `stale_volume_data_refuses_mount` cases were REMOVED — fuse no longer has a
 //! tenant segment (`fs/…` is one global tree; multi-tree isolation is by distinct
 //! namespaces, §8.9), so per-tenant isolation / per-tenant stale-volume refusal are

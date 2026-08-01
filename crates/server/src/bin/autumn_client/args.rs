@@ -5,7 +5,7 @@
 //! are `pub(crate)` for `main.rs`'s dispatcher.
 
 pub(crate) enum Command {
-    /// F213: stub that points to `autumn-op` (all op subcommands moved).
+    /// stub that points to `autumn-op` (all op subcommands moved).
     /// `args` carries everything after the literal `op` token so we can
     /// suggest the equivalent autumn-op invocation.
     OpStub {
@@ -15,7 +15,7 @@ pub(crate) enum Command {
         key: String,
         file: String,
     },
-    /// F129: multipart upload of a large value via PutBegin/Chunk/Commit.
+    /// multipart upload of a large value via PutBegin/Chunk/Commit.
     /// Reads `file` (or stdin if file = "-"), splits into `chunk_size`
     /// byte chunks, and commits.
     PutStream {
@@ -23,14 +23,14 @@ pub(crate) enum Command {
         file: String,
         chunk_size: usize,
     },
-    /// F129: streaming read. Walks the value via offset/length GetReqs
+    /// streaming read. Walks the value via offset/length GetReqs
     /// and writes chunks to stdout (or `out` if provided).
     GetStream {
         key: String,
         chunk_size: u32,
         out: Option<String>,
     },
-    /// F216-E verification: zero-copy PUT via ClusterClient::put_bulk. Reads
+    /// verification: zero-copy PUT via ClusterClient::put_bulk. Reads
     /// `file` into a Bytes, registers it for UCX zero-copy send (ucx build),
     /// writes via MSG_PUT_BULK (value sent as its own iovec, no client-side copy).
     PutBulk {
@@ -40,12 +40,12 @@ pub(crate) enum Command {
     Get {
         key: String,
     },
-    /// F259: GET via MSG_GET_REDIRECT + EN direct read (byte-for-byte
+    /// GET via MSG_GET_REDIRECT + EN direct read (byte-for-byte
     /// comparable against plain `get` for verification).
     DirectGet {
         key: String,
     },
-    /// F216 verification: zero-copy GET via ClusterClient::get_into. heads
+    /// verification: zero-copy GET via ClusterClient::get_into. heads
     /// the key, allocates a dest buffer, registers it for UCX zero-copy
     /// (ucx build only), reads the value straight into dest, writes to stdout.
     BulkGet {
@@ -71,7 +71,7 @@ pub(crate) enum Command {
         update_baseline: bool,
         partitions: usize,
         pipeline_depth: usize,
-        /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
+        /// was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
         /// Unified bulk size for both write + read phases. When > 0:
         /// write loop calls `put_many(N items)`; read loop calls
@@ -81,10 +81,10 @@ pub(crate) enum Command {
         /// flags (`--batch-put` / `--batch-get` / `--put-many`) — all
         /// three drove the same code paths after the SDK consolidation.
         bulk: usize,
-        /// F258-bench: per-thread start stagger (tid*ramp_ms) + connect
+        /// bench: per-thread start stagger (tid*ramp_ms) + connect
         /// warmup + barrier-aligned timed window. 0 = legacy behavior.
         ramp_ms: u64,
-        /// F259: read phase uses get_direct (MSG_GET_REDIRECT + EN direct
+        /// read phase uses get_direct (MSG_GET_REDIRECT + EN direct
         /// read) instead of get/get_into.
         direct_read: bool,
     },
@@ -122,13 +122,13 @@ pub(crate) struct Args {
     /// in-flight and benefit from a higher cap; constrained hosts can
     /// shrink to fit. Clamped to [16 MiB, 64 GiB].
     pub(crate) ucx_regpool_cap_bytes: Option<usize>,
-    /// F-NS-PRINCIPAL-UNIFIED: the key-prefix SCOPE every data-plane KV command
+    /// the key-prefix SCOPE every data-plane KV command
     /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within — a whole
     /// namespace (`fs`, `gallery`) or an in-namespace sub-prefix (`mem/agent7`).
     /// REQUIRED for those commands (a write must declare its scope); perf-check/
     /// ycsb bind the `bench/perf` scope internally and don't need it.
     pub(crate) namespace: Option<String>,
-    /// F-AUTHZ-BUILTIN: path to a file holding this client's authz credential
+    /// path to a file holding this client's authz credential
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED for KV
     /// commands when the target namespace is protected; omit on an authz-off
     /// cluster. The principal identity is read from the file.
@@ -142,7 +142,7 @@ fn usage() -> ! {
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
     eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
     eprintln!(
-        "                                    Chunked stream put (default 4 MiB chunks; F186)"
+        "                                    Chunked stream put (default 4 MiB chunks)"
     );
     eprintln!("  get <KEY>                         Get value for key");
     eprintln!("  get-stream [--chunk-size N] [--out FILE] <KEY>");
@@ -155,7 +155,7 @@ fn usage() -> ! {
     eprintln!("  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]");
     eprintln!("                                    YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN");
     eprintln!();
-    eprintln!("Operator / admin commands moved to `autumn-op` (F213):");
+    eprintln!("Operator / admin commands moved to `autumn-op`:");
     eprintln!("  bootstrap, set-stream-ec, force-ec-convert, split, merge,");
     eprintln!("  compact, gc, forcegc, register-node, format, info, policy-candidates");
     eprintln!("  Run `autumn-op --help` for the full list.");
@@ -189,7 +189,7 @@ pub(crate) fn parse_args() -> Args {
                 manager = val(&raw, i).to_owned();
                 i += 1;
             }
-            // F-NS-PRINCIPAL-UNIFIED: the key-prefix scope for data-plane KV cmds.
+            // the key-prefix scope for data-plane KV cmds.
             "--namespace" | "--scope" => {
                 i += 1;
                 namespace = Some(val(&raw, i).to_owned());
@@ -230,7 +230,7 @@ pub(crate) fn parse_args() -> Args {
     i += 1;
 
     let command = match subcmd {
-        // F213: op commands moved to autumn-op. Common typos and the
+        // op commands moved to autumn-op. Common typos and the
         // explicit `op` namespace prefix all route here.
         "op" | "bootstrap" | "set-stream-ec" | "force-ec-convert" | "split" | "merge"
         | "policy-candidates" | "policy_candidates" | "policy" | "compact" | "gc" | "forcegc"
@@ -424,7 +424,7 @@ pub(crate) fn parse_args() -> Args {
             let mut ramp_ms: u64 = 0;
             let mut direct_read = false;
             let mut bulk: usize = 0;
-            // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
+            // was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
             // same value to autumn-ps (`--group-commit-cap N`) AND to
             // perf-check (`--group-commit-cap N`) so the baseline JSON
@@ -433,7 +433,7 @@ pub(crate) fn parse_args() -> Args {
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--bulk" => {
-                        // F216-E: removed. Zero-copy is now the DEFAULT on the
+                        // removed. Zero-copy is now the DEFAULT on the
                         // UCX transport (writes always; reads when value >=
                         // BULK_MIN_BYTES). Kept as a no-op so existing
                         // perf_check.sh / scripts don't hard-fail; on TCP it
@@ -496,7 +496,7 @@ pub(crate) fn parse_args() -> Args {
                         direct_read = true;
                     }
                     "--ramp-ms" => {
-                        // F258-bench: stagger thread start by tid*ramp_ms so
+                        // bench: stagger thread start by tid*ramp_ms so
                         // UCX worker creation doesn't storm (host-level devx
                         // serialization); threads then warm up (connect) and
                         // align on a barrier before the timed window starts.
@@ -632,7 +632,7 @@ pub(crate) fn parse_args() -> Args {
     }
 }
 
-/// F178 Phase 3: `--nosync` was removed because writes are now ALWAYS
+/// Phase 3: `--nosync` was removed because writes are now ALWAYS
 /// durable via the per-extent fsync coalescer (Phase 1) + flush-time
 /// quorum durability wait (Phase 2). The flag is kept as a parser
 /// no-op so existing scripts (perf_check.sh, ad-hoc invocations) don't
@@ -642,7 +642,7 @@ fn warn_nosync_deprecated_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         eprintln!(
-            "[autumn-client] note: --nosync was removed in F178 (LevelDB-style \
+            "[autumn-client] note: --nosync was removed (LevelDB-style \
              coalescing makes writes always durable). Flag ignored, behaviour \
              unchanged from --sync."
         );
@@ -653,7 +653,7 @@ fn warn_zc_flag_deprecated_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         eprintln!(
-            "[autumn-client] note: --bulk was removed (F216-E). Zero-copy is now \
+            "[autumn-client] note: --bulk was removed. Zero-copy is now \
              the DEFAULT on --transport ucx: writes always; reads when value \
              >= {} B. On --transport tcp the regular path is used. Flag ignored.",
             autumn_client::BULK_MIN_BYTES

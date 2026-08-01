@@ -1,21 +1,21 @@
-//! F211 — end-to-end operator-driven node lifecycle tests.
+//! end-to-end operator-driven node lifecycle tests.
 //!
 //! Spins up a real manager + 4 real extent nodes (one of which is a
 //! "phantom" — registered with an address that has no listener so the
 //! manager's `df` probe fails and the `NodeStateTracker` flips it to
 //! Suspected). Exercises:
 //!
-//! - F211-A: auto Online → Suspected after `df` timeout
-//! - F211-B: list_node_states reflects the transition
-//! - F211-C: fence persists override + appears in list_node_states +
+//! - auto Online → Suspected after `df` timeout
+//! - list_node_states reflects the transition
+//! - fence persists override + appears in list_node_states +
 //!   register_node is refused while Fenced (zombie defense)
-//! - F211-E: fence on a node holding a replica triggers
+//! - fence on a node holding a replica triggers
 //!   `recovery_dispatch_loop` to rebuild the slot on another node
-//! - F211-H: recovery_stats RPC reports counters after dispatch
-//! - F211-I: audit log captures the fence operation
+//! - recovery_stats RPC reports counters after dispatch
+//! - audit log captures the fence operation
 //!
 //! These tests are tagged with the `e2e` test name so they can be run
-//! selectively via `cargo test --test f211_e2e_lifecycle`.
+//! selectively via `cargo test --test e2e_lifecycle`.
 
 mod support;
 
@@ -109,11 +109,11 @@ async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry
     resp.entries
 }
 
-// ── E2E test 1: phantom node stays Suspend (F214-B) ─────────────────
+// ── E2E test 1: phantom node stays Suspend ─────────────────
 //
-// Pre-F214 a phantom node (registered, no real EN listening) seeded
+// Previously a phantom node (registered, no real EN listening) seeded
 // Online and was promoted to Suspected after df failed for the soft-
-// timeout window. Post-F214-B (state-machine refactor), an
+// timeout window. After the state-machine refactor, an
 // unverified-alive node starts in `Suspend`; `on_heartbeat_fail` and
 // `tick()` no longer auto-promote Suspend → Suspected because the
 // "Suspected" semantic requires a prior verified-alive baseline. So
@@ -121,7 +121,7 @@ async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry
 // operator-facing diagnostic ("format ran but EN never started").
 
 #[test]
-fn f211_e2e_phantom_node_stays_suspend() {
+fn e2e_phantom_node_stays_suspend() {
     fast_node_timeout();
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -135,14 +135,14 @@ fn f211_e2e_phantom_node_stays_suspend() {
         assert_eq!(resp.code, CODE_OK);
         let phantom_id = resp.node_id;
 
-        // F214-B: first-time register seeds Suspend (was Online pre-F214).
+        // first-time register seeds Suspend (was Online previously).
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).expect("me");
         assert_eq!(me.auto_state, NODE_AUTO_STATE_SUSPEND);
 
-        // Wait long enough that pre-F214 the node would have been
+        // Wait long enough that previously the node would have been
         // promoted to Suspected (one df cycle + soft timeout). With
-        // F214-B the state stays Suspend forever.
+        // the state stays Suspend forever.
         compio::time::sleep(Duration::from_secs(15)).await;
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).unwrap();
@@ -157,7 +157,7 @@ fn f211_e2e_phantom_node_stays_suspend() {
 // ── E2E test 2: fence persists override + zombie defense ─────────────
 
 #[test]
-fn f211_e2e_fence_persists_and_blocks_reregister() {
+fn e2e_fence_persists_and_blocks_reregister() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -236,7 +236,7 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
 // ── E2E test 3: fence triggers recovery on a real replica ────────────
 
 #[test]
-fn f211_e2e_fence_triggers_recovery_dispatch() {
+fn e2e_fence_triggers_recovery_dispatch() {
     // Make the recovery gate explicit so the test is independent of
     // a future default flip.
     std::env::set_var("AUTUMN_MGR_RECOVERY_GATE", "fenced_only");
@@ -358,7 +358,7 @@ fn f211_e2e_fence_triggers_recovery_dispatch() {
 // ── E2E test 4: remove refused on Fenced node with active extents ────
 
 #[test]
-fn f211_e2e_remove_blocked_by_active_extents() {
+fn e2e_remove_blocked_by_active_extents() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -439,7 +439,7 @@ fn f211_e2e_remove_blocked_by_active_extents() {
 // ── E2E test 5: audit log captures admin ops ─────────────────────────
 
 #[test]
-fn f211_e2e_audit_log_captures_admin_ops() {
+fn e2e_audit_log_captures_admin_ops() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -484,7 +484,7 @@ fn f211_e2e_audit_log_captures_admin_ops() {
 // ── E2E test 6: recovery_stats RPC is queryable ──────────────────────
 
 #[test]
-fn f211_e2e_recovery_stats_baseline() {
+fn e2e_recovery_stats_baseline() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -507,7 +507,7 @@ fn f211_e2e_recovery_stats_baseline() {
 // ── E2E test 7: extent_health_report shows fenced-slot details ───────
 
 #[test]
-fn f211_e2e_extent_health_report_reflects_overrides() {
+fn e2e_extent_health_report_reflects_overrides() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -588,7 +588,7 @@ fn f211_e2e_extent_health_report_reflects_overrides() {
 // ── E2E test 8: list_ec_inflight_markers reads cleanly (no markers) ──
 
 #[test]
-fn f211_e2e_list_ec_inflight_markers_empty_baseline() {
+fn e2e_list_ec_inflight_markers_empty_baseline() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 

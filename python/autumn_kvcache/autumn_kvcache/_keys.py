@@ -122,7 +122,7 @@ def full_key(model: str, content_hash: str, pool: str) -> bytes:
     """Compose the stored partition key (utf-8 bytes), RELATIVE to the client's
     ``kvc`` binding scope.
 
-    F-NS-PRINCIPAL-UNIFIED (Option 3, Prepend-only): the ``BatchClient`` is bound
+    Under Option 3 (Prepend-only) the ``BatchClient`` is bound
     to ``scope="kvc"`` and PREPENDS ``kvc/`` itself, so scope is locked by
     construction and the builder must emit only the RELATIVE part →
     ``{model}/{pool}/{content_hash}`` (the full wire key becomes

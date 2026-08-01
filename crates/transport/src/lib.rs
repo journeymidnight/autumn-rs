@@ -1,4 +1,4 @@
-//! autumn-transport — pluggable transport for autumn-rs (TCP today, UCX optional; F100-UCX).
+//! autumn-transport — pluggable transport for autumn-rs (TCP today, UCX optional).
 //!
 //! ## Why enum dispatch instead of trait objects
 //!
@@ -26,7 +26,7 @@ mod tcp;
 #[cfg(feature = "ucx")]
 mod ucx;
 
-// F216-E: the registered-buffer pool is transport-agnostic (compiles with and
+// the registered-buffer pool is transport-agnostic (compiles with and
 // without `ucx`); only the `ibv_reg_mr` call inside is `cfg(ucx)`. Declared at
 // top level (file lives under ucx/ for history) so autumn-rpc/stream can use
 // `PooledBuf` with no `cfg` — preserving the "only the transport leaf is
@@ -450,7 +450,7 @@ impl compio::io::AsyncRead for ReadHalf {
 }
 
 impl ReadHalf {
-    /// F216 zero-copy recv into a pre-registered buffer (UCX only). Single
+    /// zero-copy recv into a pre-registered buffer (UCX only). Single
     /// recv (may be partial). See `UcxReadHalf::recv_registered`.
     #[cfg(feature = "ucx")]
     pub async fn recv_registered(
@@ -467,7 +467,7 @@ impl ReadHalf {
         }
     }
 
-    /// F216 recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
+    /// recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
     /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
     /// Single recv (may be partial); caller loops for read_exact semantics.
     /// TCP errors — the autumn-rpc read_loop handles TCP bulk recvs via
@@ -495,7 +495,7 @@ impl ReadHalf {
         }
     }
 
-    /// F219 — TCP recv the remaining `[filled..target]` bytes of a value
+    /// TCP recv the remaining `[filled..target]` bytes of a value
     /// straight into a `PooledBuf` via compio owned reads, eliminating the
     /// FrameDecoder accumulation copy (only the unavoidable kernel→userspace
     /// copy remains). The counterpart to UCX's `recv_into` on the recv-side

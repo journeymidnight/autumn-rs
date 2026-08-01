@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F-FS-UNIFY M2 — headless e2e for the `autumn.Fs` PyO3 binding.
+# M2 — headless e2e for the `autumn.Fs` PyO3 binding.
 #
 #   1. build + install the `autumn` wheel (with Fs) into a throwaway venv,
 #   2. bring up an ISOLATED minimal cluster (memory-only manager, 1 EN, 1 PS,

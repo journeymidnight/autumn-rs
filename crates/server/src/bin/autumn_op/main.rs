@@ -1,4 +1,4 @@
-//! F211-G + F213: companion CLI for manager control plane.
+//! companion CLI for manager control plane.
 //!
 //! `autumn-op` is the canonical operator interface. It speaks rkyv over
 //! the manager RPC framing and prints either human-readable or
@@ -6,10 +6,10 @@
 //! JSON form).
 //!
 //! Two command families:
-//!   * F211 node-lifecycle: list-nodes / extent-health / list-ec-markers
+//!   * node-lifecycle: list-nodes / extent-health / list-ec-markers
 //!     / recovery-stats / audit-log + fence-node / maintenance / unfence
 //!     / remove.
-//!   * F213 (moved from autumn-client): bootstrap / set-stream-ec /
+//!   * cluster / partition admin (moved from autumn-client): bootstrap / set-stream-ec /
 //!     force-ec-convert / split / merge / policy-candidates / compact /
 //!     gc / forcegc / register-node / format / info.
 //!
@@ -50,7 +50,7 @@ fn format_disk(dir: &str) -> Result<String> {
     Ok(disk_uuid)
 }
 
-/// F214-C: fetch the manager's cluster_id. Retries on `CODE_NOT_LEADER`
+/// fetch the manager's cluster_id. Retries on `CODE_NOT_LEADER`
 /// (same pattern as other admin RPCs in this binary). Returns an error
 /// if the cluster has never been imprinted (manager replied with
 /// `CODE_ERROR` "not yet bootstrapped"), which only happens before the
@@ -79,8 +79,8 @@ async fn fetch_cluster_id(client: &ClusterClient) -> Result<String> {
     }
 }
 
-/// F214-C: probe a data dir for prior `format` state. The dedicated
-/// `cluster_id` + `disk_uuid` sentinel files (added in F214-C) are the
+/// probe a data dir for prior `format` state. The dedicated
+/// `cluster_id` + `disk_uuid` sentinel files are the
 /// canonical "already formatted" signal. Returns `(cluster_id, disk_uuid)`
 /// when both files are present and readable; `None` for a fresh dir.
 fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
@@ -96,7 +96,7 @@ fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
     if !std::path::Path::new(&uuid_path).exists() {
         // Defensive: cluster_id present but disk_uuid missing means a
         // partially-formatted dir (interrupted previous run, or a
-        // pre-F214 dir that's been hand-patched). Treat as fresh and
+        // older-format dir that's been hand-patched). Treat as fresh and
         // let the new format overwrite — the operator hit this path
         // intentionally by running format on this dir.
         return Ok(None);
@@ -110,7 +110,7 @@ fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
 
 /// Atomically write a sentinel file: write a temp sibling then rename over the
 /// target, so a concurrent / crash-interrupted reader never observes a torn
-/// value. Used for the F-EN-DYNSHARD `node_uuid` identity sentinel, which is
+/// value. Used for the `node_uuid` identity sentinel, which is
 /// read back verbatim to keep a node's `node_id` stable across re-formats — a
 /// half-written value there would mint a duplicate identity.
 fn write_sentinel_atomic(path: &str, content: &str) -> std::io::Result<()> {
@@ -147,7 +147,7 @@ fn auto_state_str(b: u8) -> &'static str {
     match b {
         NODE_AUTO_STATE_ONLINE => "Online",
         NODE_AUTO_STATE_SUSPECTED => "Suspected",
-        // F214-B: registered, never verified alive. Distinct from
+        // registered, never verified alive. Distinct from
         // Suspected — Suspended means "was alive, now flaky".
         NODE_AUTO_STATE_SUSPEND => "Suspend",
         _ => "Unknown",
@@ -187,7 +187,7 @@ struct JsonNode {
     override_set_by: String,
     override_set_at: i64,
     override_expire_at: u64,
-    // F-EN-DYNSHARD M1c
+    // M1c
     node_uuid: String,
     shard_count: usize,
     shard_ports: Vec<u16>,
@@ -206,7 +206,7 @@ struct JsonAudit {
 }
 
 // ---------------------------------------------------------------------------
-// F213 `info` JSON output types (migrated from autumn_client.rs)
+// `info` JSON output types (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -288,7 +288,7 @@ struct InfoSnapshot {
 // ---------------------------------------------------------------------------
 
 async fn run(args: Args) -> Result<()> {
-    // F214-C: the register-node migration stub must print BEFORE we
+    // the register-node migration stub must print BEFORE we
     // try to connect to the manager — otherwise users hit "manager
     // unreachable" instead of the actionable migration message.
     if matches!(args.cmd, Command::RegisterNode) {
@@ -296,13 +296,13 @@ async fn run(args: Args) -> Result<()> {
             "register-node has merged into 'autumn-op format'.\n\
              Run: autumn-op --manager <ADDR> format <DIR> [<DIR>...]\n\
              'format' fetches the cluster_id, registers the node IDENTITY \
-             (F-EN-DYNSHARD M1c — no location), and stamps every data dir. \
+             (M1c — no location), and stamps every data dir. \
              Start `autumn-extent-node --manager <ADDR> --data <DIR>... \
              --advertise <HOST:PORT>` to self-register the live location."
         );
         std::process::exit(1);
     }
-    // F-AUTHZ-1: gen-signing-key is LOCAL (no manager) — handle it BEFORE
+    // gen-signing-key is LOCAL (no manager) — handle it BEFORE
     // connecting so key generation works offline (and never needs a cluster).
     if let Command::GenSigningKey { kid } = &args.cmd {
         return cmd_gen_signing_key(*kid);
@@ -311,7 +311,7 @@ async fn run(args: Args) -> Result<()> {
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect_raw(&args.manager).await?;
-    // F-ADMIN-OP-AUTH: a global `--admin-token[-file]` authorizes cluster-mutating
+    // a global `--admin-token[-file]` authorizes cluster-mutating
     // ops (fence/merge/create-stream/…). Read-only commands are unaffected — the
     // manager only strips+checks the prefix for `is_admin_mgr_msg`, so passing a
     // token to `info`/`list-nodes` is a harmless no-op.
@@ -319,7 +319,7 @@ async fn run(args: Args) -> Result<()> {
         client.set_admin_token(tok.as_bytes().to_vec());
     }
     match args.cmd {
-        // ---------------- F211 read ----------------
+        // ---------------- node-lifecycle read ----------------
         Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
         Command::UpgradeVersion { to } => cmd_upgrade_version(&client, args.json, to).await?,
         Command::ListNodes => cmd_list_nodes(&client, args.json).await?,
@@ -328,12 +328,12 @@ async fn run(args: Args) -> Result<()> {
         Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
         Command::AuditLog { op, node_id, since, until, limit } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
-        // ---------------- F211 admin ----------------
+        // ---------------- node-lifecycle admin ----------------
         Command::Fence { node_id, reason, by, force } => cmd_fence(&client, args.json, node_id, reason, by, force).await?,
         Command::Maintenance { node_id, reason, by, expire } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
         Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
-        // ---------------- F213 read ----------------
+        // ---------------- cluster / partition read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
         Command::AutoPolicy { action, name, arm } => {
             cmd_auto_policy(&client, args.json, &action, &name, arm).await?
@@ -341,7 +341,7 @@ async fn run(args: Args) -> Result<()> {
         Command::Info { part, detail, full } => {
             run_info(&client, args.json, part, detail, full).await?;
         }
-        // ---------------- F213 admin ----------------
+        // ---------------- cluster / partition admin ----------------
         Command::Bootstrap {
             replication,
             presplit,
@@ -354,7 +354,7 @@ async fn run(args: Args) -> Result<()> {
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
         Command::Presplit { namespace, tenant, rule, admin_token, force } => {
-            // F-KEY-NS UX-fix (F1): the recording token falls back to the GLOBAL
+            // UX-fix: the recording token falls back to the GLOBAL
             // `--admin-token[-file]` (the position `usage()` documents) so an
             // operator no longer has to pass the same secret twice. The
             // per-command spelling stays as an override.
@@ -381,12 +381,12 @@ async fn run(args: Args) -> Result<()> {
             unreachable!("Command::RegisterNode handled before connect");
         }
         Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
-        // ---------------- F-AUTHZ-1 tooling ----------------
+        // ---------------- authz tooling ----------------
         Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
         Command::PrincipalCreate { principal, grants, admin_token } => cmd_principal_create(&client, args.json, principal, grants, admin_token).await?,
         Command::PrincipalDelete { principal, admin_token } => cmd_principal_delete(&client, args.json, principal, admin_token).await?,
         Command::MintToken { principal, credential } => cmd_mint_token(&client, args.json, principal, credential).await?,
-        // ---------------- F-KEY-NS D2 namespace registry ----------------
+        // ---------------- namespace registry ----------------
         Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
         Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
         Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
@@ -416,7 +416,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// F-AUTHZ-1: generate an Ed25519 signing key locally. Prints the keyfile line
+/// generate an Ed25519 signing key locally. Prints the keyfile line
 /// (`<kid> <hex-seed>`) to STDOUT (redirect into `--auth-signing-key-file`); the
 /// derived public key + guidance go to STDERR so they don't pollute the file.
 fn cmd_gen_signing_key(kid: u32) -> Result<()> {
@@ -425,7 +425,7 @@ fn cmd_gen_signing_key(kid: u32) -> Result<()> {
     rand::rngs::OsRng.fill_bytes(&mut seed);
     let public = autumn_rpc::cap_token::public_key_from_seed(&seed);
     println!("{} {}", kid, hex_encode(&seed));
-    eprintln!("# F-AUTHZ-1 signing key kid={kid}");
+    eprintln!("# signing key kid={kid}");
     eprintln!("# public_key = {}", hex_encode(&public));
     eprintln!("# The stdout line (kid + hex seed) is the SECRET keyfile line — give");
     eprintln!("# it to the manager via --auth-signing-key-file and keep it protected.");
@@ -433,7 +433,7 @@ fn cmd_gen_signing_key(kid: u32) -> Result<()> {
     Ok(())
 }
 
-/// F-NS-PRINCIPAL-UNIFIED: create/rotate a principal account. Returns the
+/// create/rotate a principal account. Returns the
 /// permanent credential in the `principal:`/`credential:` two-line form, so
 /// `autumn-op principal-create ... > loader.cred` produces a ready credential file
 /// (the SDK's `read_credential_file` parses that form, carrying the name).
@@ -467,7 +467,7 @@ async fn cmd_principal_create(
     Ok(())
 }
 
-/// F-NS-PRINCIPAL-UNIFIED: remove a principal account (stops renewal; current
+/// remove a principal account (stops renewal; current
 /// token still works until it expires).
 async fn cmd_principal_delete(
     client: &ClusterClient,
@@ -487,7 +487,7 @@ async fn cmd_principal_delete(
     Ok(())
 }
 
-/// F-NS-PRINCIPAL-UNIFIED: mint a short-TTL capability token from a principal
+/// mint a short-TTL capability token from a principal
 /// credential.
 async fn cmd_mint_token(
     client: &ClusterClient,
@@ -514,7 +514,7 @@ async fn cmd_mint_token(
     Ok(())
 }
 
-/// F-KEY-NS D2: register a namespace. `--with-tenant` sets the owner (protected);
+/// D2: register a namespace. `--with-tenant` sets the owner (protected);
 /// `--presplit` freezes D8 split points (stored, not acted upon in SD-1).
 async fn cmd_namespace_create(
     client: &ClusterClient,
@@ -549,7 +549,7 @@ async fn cmd_namespace_create(
     Ok(())
 }
 
-/// F-KEY-NS D2: delete a namespace registry row. The non-empty guard is enforced
+/// D2: delete a namespace registry row. The non-empty guard is enforced
 /// HERE (client-side): scan the `<name>/` prefix and refuse unless `--force`, since
 /// the manager has no KV data-plane client. `--force` only skips the guard — it
 /// does NOT batch-delete data (deploy is cluster-reset, §7.4; batch-delete tooling
@@ -595,7 +595,7 @@ async fn cmd_namespace_delete(
     Ok(())
 }
 
-/// F-KEY-NS D2: list the registered namespaces (rich rows). Read-only.
+/// D2: list the registered namespaces (rich rows). Read-only.
 async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
     let namespaces = client.namespace_list().await?;
     if json {
@@ -636,7 +636,7 @@ async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// F-NS-PRINCIPAL-LIST: `principal-list [--json]`. Read-only inspection —
+/// `principal-list [--json]`. Read-only inspection —
 /// answers "who exists and what may they touch", which until now needed either
 /// `ls $DATA_ROOT/authz/*.cred` (only what turnkey wrote) or an etcd key scan
 /// (names only; grants live inside an rkyv value). Never prints credentials.
@@ -752,7 +752,7 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
             } else {
                 format!("{}s", n.last_heartbeat_secs_ago)
             };
-            // F-EN-DYNSHARD M1c: short uuid + shard count (verify a reshard took).
+            // M1c: short uuid + shard count (verify a reshard took).
             let uuid_short = if n.node_uuid.is_empty() {
                 "-".to_string()
             } else {
@@ -781,7 +781,7 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     // Logical FOOTPRINT = sealed data + open-tail committed bytes (one copy).
     // physical_used counts open-tail bytes (largely live VP/log data), so amp
     // MUST divide by the footprint, not sealed-only — else an all-open-tail
-    // (VP/log-heavy) cluster shows a ~15× inflated amp (F-DF-OPENTAIL).
+    // (VP/log-heavy) cluster shows a ~15× inflated amp.
     let logical_footprint = r.logical_stored.saturating_add(r.logical_open_tail);
     // Empirical replication/EC amplification (physical_used / logical
     // footprint): the REAL current cold/hot mix. ~3× for 3-replica, lower with
@@ -818,8 +818,8 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
         .unwrap_or(0);
     let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
     let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
-    // F-DF-WALDEBT: dead (reclaimable) fraction of the footprint = sealed
-    // gc_debt + open-tail dead bytes. Pre-F-DF-WALDEBT a log-heavy /
+    // dead (reclaimable) fraction of the footprint = sealed
+    // gc_debt + open-tail dead bytes. Earlier, a log-heavy /
     // all-open-tail partition's open-tail debt was invisible (df only had
     // sealed gc_debt). physical_used carries these bytes until GC punches them.
     let wal_debt_ratio = if logical_footprint > 0 {
@@ -1172,7 +1172,7 @@ async fn cmd_audit_log(client: &ClusterClient, json: bool, op: u8, node_id: u64,
     Ok(())
 }
 
-/// F-DASH-IN-MGR M2: headless control of the in-manager auto-policy controller.
+/// M2: headless control of the in-manager auto-policy controller.
 ///   auto-policy status
 ///   auto-policy activate <name> [--arm]   (select policy; --arm = actuate)
 ///   auto-policy deactivate                (mode → Off)
@@ -1632,7 +1632,7 @@ async fn cmd_split(
     Ok(())
 }
 
-/// F-PRESPLIT-NS-RULES: presplit a `{tenant}/{namespace}/` keyspace by its
+/// presplit a `{tenant}/{namespace}/` keyspace by its
 /// natural dimension (fs=ino, kvc=content-hash, mem=agent). Computes the cut
 /// points, then splits the owning partition at each in ASCENDING order —
 /// re-resolving the owner each time, since a prior split creates the child that
@@ -1647,7 +1647,7 @@ async fn cmd_presplit(
     force: bool,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
-    // F-NS-PRINCIPAL-UNIFIED: cut prefix = `{namespace}/` (+ `{tenant}/` as an
+    // cut prefix = `{namespace}/` (+ `{tenant}/` as an
     // in-namespace sub-segment for mem/kvc; empty for fs), matching the binding.
     let prefix = if tenant.is_empty() {
         format!("{namespace}/").into_bytes()
@@ -1666,7 +1666,7 @@ async fn cmd_presplit(
         bail!("presplit: rule produced no cut points (count < 2 / empty list) — nothing to do");
     }
 
-    // F-FS-GEOM-DECLARED: `--lanes N` DECLARES the fs stripe geometry, in the
+    // `--lanes N` DECLARES the fs stripe geometry, in the
     // same command that cuts the boundaries — the declaration and the placement
     // can never be created out of step. Writers read this key; they no longer
     // reverse-engineer the lane count from partition boundaries.
@@ -1688,7 +1688,7 @@ async fn cmd_presplit(
         // produces from the relative `[0x04]stripe_geom`.
         let mut k = b"fs/".to_vec();
         k.extend_from_slice(&autumn_fuse::key::stripe_geom_key());
-        // F-KEY-NS UX-fix (M5): read-before-write guard. The declared geometry is
+        // UX-fix (M5): read-before-write guard. The declared geometry is
         // now the sole authority for every future file's stripe width, and this
         // put OVERWRITES it. A stray `presplit --namespace fs --lanes 2` would
         // silently halve the width fs-wide — the exact "silently narrow the
@@ -1752,7 +1752,7 @@ async fn cmd_presplit(
             skipped.push(format!("0x{} (no owning partition)", hex_encode(point)));
             continue;
         };
-        // F-KEY-NS UX-fix (S2): a point that IS a partition's start_key is
+        // UX-fix (S2): a point that IS a partition's start_key is
         // already a boundary (a prior presplit, or this being a re-run). That is
         // success, not a skip — the old code let split_at reject it ("at or below
         // partition start"), leaving `applied` low and (if all points were
@@ -1778,7 +1778,7 @@ async fn cmd_presplit(
     // means the run split nothing (wrong --hash-prefix so no owner found, authz
     // denial, stale map, …) and MUST fail loudly — else automation reads exit 0
     // and starts loading into an un-presplit keyspace.
-    // F-FS-GEOM-DECLARED: record the operator's INTENDED cut points — all of
+    // record the operator's INTENDED cut points — all of
     // them, not just the ones that landed this run.
     //
     // (An earlier revision recorded only the applied ones, reasoning that an
@@ -1792,7 +1792,7 @@ async fn cmd_presplit(
     // Best-effort by design — this runs AFTER the cuts, so failing the whole
     // presplit here would report failure for work that already succeeded.
     //
-    // F-KEY-NS UX-fix (M2): recording is now OPT-IN server-side (bare when the
+    // UX-fix (M2): recording is now OPT-IN server-side (bare when the
     // manager has no admin token), so we ALWAYS attempt it — a token-less
     // cluster records the boundaries with an empty token, arming the merge guard
     // + auto-split snap unconditionally. `record_token = ""` when the operator
@@ -1800,7 +1800,7 @@ async fn cmd_presplit(
     // would already have rejected every cut above (applied == 0 → we bailed),
     // so an empty token only ever reaches a token-less manager.
     let record_token = admin_token.unwrap_or("");
-    // F-KEY-NS UX-fix (M4): record the FULL declared grid (for FsLanes, every
+    // UX-fix (M4): record the FULL declared grid (for FsLanes, every
     // lane boundary), not just the `points` we cut — so auto-split snaps to a
     // lane boundary instead of a median-inside-a-lane when `parts < lanes`.
     let record_points: Vec<Vec<u8>> = args::presplit_record_suffixes(rule)?
@@ -1869,7 +1869,7 @@ async fn cmd_presplit(
 
 async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, victim_part_id: u64, force: bool) -> Result<()> {
     eprintln!(
-        "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
+        "Stop writes to partitions {survivor_part_id} and {victim_part_id} \
          before continuing. The CLI will FLUSH both, then issue the manager merge. \
          The survivor's PS picks up the wider range on the next region_sync (~2 s)."
     );
@@ -1999,7 +1999,7 @@ async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_i
     Ok(())
 }
 
-/// F-EN-DYNSHARD M1c: `format` mints/reuses IDENTITY only (`node_uuid` +
+/// M1c: `format` mints/reuses IDENTITY only (`node_uuid` +
 /// per-dir `disk_uuid`) and registers with an EMPTY location — no
 /// `addr`/`shard_ports`/`control_address`. The EN binary's own `--advertise`
 /// self-registers the live address + shard ports at every startup (M1a/M1b),
@@ -2009,7 +2009,7 @@ async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_i
 /// only the OSD fsid) — mkfs mints identity offline; the daemon reports its
 /// own network location every boot, not the formatting step.
 async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manager: &str) -> Result<()> {
-    // F214-C: fetch the manager's cluster_id BEFORE touching
+    // fetch the manager's cluster_id BEFORE touching
     // any disk. Failure here means the manager is not yet
     // leader (retries internally) or has never bootstrapped
     // (fatal — operator must start the manager first).
@@ -2060,7 +2060,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manag
         }
     }
 
-    // F-EN-DYNSHARD M0: resolve the node's stable identity (one node_uuid per
+    // M0: resolve the node's stable identity (one node_uuid per
     // NODE, not per disk) BEFORE registering. Reuse an existing sentinel so a
     // re-format keeps the same node_id; mint a fresh v4 only when NO dir carries
     // one. The read is FAIL-LOUD: a NotFound means "to mint", but a
@@ -2110,14 +2110,14 @@ async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manag
             .with_context(|| format!("write node_uuid in {dir}"))?;
     }
 
-    // F214-C + F-EN-DYNSHARD M1c: register against the manager, IDENTITY
+    // M1c: register against the manager, IDENTITY
     // ONLY. `addr`/`shard_ports`/`control_address` are all empty — an
     // identity-only registration is the M0 `handle_register_node`
     // "identity-only" branch: the manager allocates node_id + disk_ids
     // for a fresh node, or (re-format on an existing uuid) returns the
     // existing node_id + disk map WITHOUT touching any live location the
     // EN has already self-registered. A never-booted node therefore has
-    // NO location, so df can't reach it — it stays Suspend (F214-B) and
+    // NO location, so df can't reach it — it stays Suspend and
     // is never selected for allocation until the EN actually starts and
     // self-registers (M1a/M1b).
     let resp_bytes = client
@@ -2167,7 +2167,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manag
         disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
     }
     for (dir, disk_uuid, disk_id) in &disk_assignments {
-        // F214-C: cluster_id + disk_uuid sentinel files. The
+        // cluster_id + disk_uuid sentinel files. The
         // extent-node binary's startup check reads cluster_id
         // and cross-checks against the manager; disk_uuid is
         // used by re-formats to preserve idempotency.
@@ -2179,7 +2179,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manag
             .with_context(|| format!("write node_id in {dir}"))?;
         std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
             .with_context(|| format!("write disk_id in {dir}"))?;
-        // F-EN-DYNSHARD M0: the node_uuid sentinel was already persisted (atomic
+        // M0: the node_uuid sentinel was already persisted (atomic
         // tmp+rename) to every dir BEFORE registration — nothing to write here.
     }
 
@@ -2214,7 +2214,7 @@ async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manag
         } else {
             println!("\nFormat complete ({n_fresh} formatted, {n_reused} reused).");
         }
-        // F-EN-DYNSHARD M1c: format registered IDENTITY ONLY — the node has
+        // M1c: format registered IDENTITY ONLY — the node has
         // NO location until the EN process itself self-registers via its own
         // `--advertise` (required whenever `--manager` is given).
         println!("Start the extent node with:");
@@ -2248,7 +2248,7 @@ fn print_code(json: bool, op: &str, resp: &CodeResp) {
 }
 
 // ---------------------------------------------------------------------------
-// F213 bootstrap (migrated from autumn_client.rs)
+// bootstrap (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
 async fn run_bootstrap(
@@ -2419,7 +2419,7 @@ async fn run_bootstrap(
 }
 
 // ---------------------------------------------------------------------------
-// F213 info (migrated from autumn_client.rs)
+// info (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
 /// Scalable compact cluster overview (the DEFAULT `info`). One
@@ -2443,7 +2443,7 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         (!a.range_start.is_empty(), &a.range_start).cmp(&(!b.range_start.is_empty(), &b.range_start))
     });
     // PS-instance count comes from the manager (distinct ps_id). NOT distinct
-    // ps_addr — under F099-K each partition has its OWN listener (base_port+ord),
+    // ps_addr — each partition has its OWN listener (base_port+ord),
     // so one PS process serving N partitions exposes N addresses.
     let ps_count = resp.ps_count;
     let key_s = |k: &[u8]| String::from_utf8_lossy(k).into_owned();
@@ -2621,7 +2621,7 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
         }
     }
 
-    // F-GC-FLOOR-OBS #2: ask the PS for the GC replay floor + per-SST vp_heads,
+    // #2: ask the PS for the GC replay floor + per-SST vp_heads,
     // so the operator can see WHY a `forcegc P E` on a given extent is protected
     // (extent E at/before the floor → correct, not a bug). Best-effort: a PS that
     // predates this RPC, or is briefly unreachable, just omits the section.
@@ -2706,7 +2706,7 @@ async fn run_info(
     detail: bool,
     full: bool,
 ) -> Result<()> {
-    // F203: `--detail` prints PartitionLoad snapshot for `part`.
+    // `--detail` prints PartitionLoad snapshot for `part`.
     if detail {
         let pid = part.expect("--detail requires --part PID; checked at parse time");
         let req = rkyv_encode(&GetPartitionDetailReq { part_id: pid });
@@ -2884,7 +2884,7 @@ async fn run_info(
             if let Some(node_id) = ext.replicates.first() {
                 if let Some(addr) = node_map.get(node_id) {
                     if let Ok(en_client) = client.get_ps_client(addr).await {
-                        // F210-H3 Tier 2: probe RPC has no PS-owner context;
+                        // Tier 2: probe RPC has no PS-owner context;
                         // must NOT use the fence-gated commit_length RPC.
                         let req = ExtProbeExtentReq { extent_id: *eid };
                         if let Ok(resp_bytes) = en_client
@@ -3066,7 +3066,7 @@ async fn run_info(
             })
             .collect();
 
-        // F205: keep sort_by live_size desc for consistent ordering.
+        // keep sort_by live_size desc for consistent ordering.
         partitions_view.sort_by_key(|p| std::cmp::Reverse(p.live_size));
 
         if let Some(pid) = part {

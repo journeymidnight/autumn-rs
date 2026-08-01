@@ -1,8 +1,8 @@
-//! WAL record codec — F158.
+//! WAL record codec.
 //!
 //! Each `log_stream` record is one of two on-disk formats:
 //!
-//! - **V0 (legacy, pre-F158):** 17-byte header + variable payload, no CRC.
+//! - **V0 (legacy):** 17-byte header + variable payload, no CRC.
 //!   ```text
 //!   [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]
 //!   ```
@@ -12,7 +12,7 @@
 //!   `0_000_0001` (1), `0_000_0010` (2), `1_000_0001` (0x81), or
 //!   `1_000_0010` (0x82). Values like 0xff never appear in production.
 //!
-//! - **V1 (post-F158):** 5-byte envelope header + V0 payload + 4-byte CRC.
+//! - **V1 (current):** 5-byte envelope header + V0 payload + 4-byte CRC.
 //!   ```text
 //!   [0xff sentinel][length:4 LE][op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value][crc32c:4 LE]
 //!   ```
@@ -24,7 +24,7 @@
 //!
 //! ## Why
 //!
-//! Pre-F158, a flipped bit in a `log_stream` record (bit rot, undetected disk
+//! Before V1, a flipped bit in a `log_stream` record (bit rot, undetected disk
 //! error, sub-page torn write) silently corrupted recovered state at restart:
 //! a corrupted `key_len` could read past the record into garbage and insert a
 //! garbage MVCC entry into the memtable; a corrupted `val_len` could return
@@ -39,7 +39,7 @@
 //! ## Migration
 //!
 //! Forward-compatible: V1 binaries write V1 records; V1 decoders accept both
-//! V0 (legacy data on disk pre-F158) and V1 (new writes). V0 binaries on V1
+//! V0 (legacy data on disk) and V1 (new writes). V0 binaries on V1
 //! data would interpret the 0xff sentinel as an `op` byte and fail the bounds
 //! check (V0's `decode_records*` uses `if cursor + key_len + val_len >
 //! bytes.len() break`); rollback is operator-driven and rare, acceptable.
@@ -190,7 +190,7 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
 /// `(header_bytes, value_bytes, crc_bytes)` — three segments suitable for
 /// vectored I/O without copying `value`.
 ///
-/// F177: takes `value: Bytes` by value so the caller's owned buffer
+/// takes `value: Bytes` by value so the caller's owned buffer
 /// flows into the returned value segment **without a memcpy**. The
 /// original `Bytes::copy_from_slice(value)` was a wasted ~3 ms inline
 /// memcpy on 8 MiB values (caller already owned a `Bytes` from the
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn v1_then_v0_mixed_decode() {
         // Simulate a log_stream containing a V1 record followed by a V0 record
-        // (e.g., during a rolling upgrade between F158 and pre-F158 binaries
+        // (e.g., during a rolling upgrade between V1 and V0 binaries
         // writing to the same stream — won't actually happen in production
         // since autumn-rs restarts all-together, but tests the dispatcher).
         let mut buf = encode_v1(1, b"v1key", b"v1val", 0);

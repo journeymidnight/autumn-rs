@@ -1,6 +1,6 @@
 # 数据面 key-range 授权（服务端 authz）设计
 
-> **⚑ 术语更新（F-NS-PRINCIPAL-UNIFIED / Option 3, 2026-07-19）：本文的「tenant」概念
+> **⚑ 术语更新（Option 3, 2026-07-19）：本文的「tenant」概念
 > 已改叫「principal」，key 布局从 `{tenant}/{ns}/` 变为 `{ns}/[rel]`（删 tenant 段）。
 > KDC 机制（manager 私钥签、PS 公钥离线验、短 TTL token、前缀 gate）**完全不变** —— 只是
 > token 的 grant 从 `{tenant}/…` 变成 `{ns}/…`（whole-ns 或 in-ns 子前缀）。CLI：
@@ -164,7 +164,7 @@ per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）�
   `AuthReject` 分类、`DOMAIN` 分离；进 wire 指纹 → v9，MIN=MAX=9；10 单测）。manager 侧：
   `authz.rs` keyring（`--auth-signing-key-file`，多 kid，fail-loud 解析，active=最高 enabled kid，
   published 从种子派生公钥无 drift）+ SHA-256 凭据哈希 + 常量时间比较；etcd `tenantAccount/` 账户库
-  （F149-fenced，fail-loud replay）；`MSG_MINT_TOKEN`（leader-only，常量时间验 cred，unknown-tenant/
+  （leader-fenced，fail-loud replay）；`MSG_MINT_TOKEN`（leader-only，常量时间验 cred，unknown-tenant/
   wrong-cred 同 opaque 错）/ `MSG_GET_AUTHZ_CONFIG`（不 leader-gate，静态本地配置）/ `tenant-create/delete`
   admin RPC（leader + admin token gated，etcd-first）；binary CLI（opt-in，无 signing key 则关）。
   验收单测 `authz_kdc_tests`：mint→publish config→验签→过期失败→改字节失败→delete 停续期 + disabled-when-no-key。
@@ -191,7 +191,7 @@ per-token 撤销黑名单；非 `mem/` 命名空间的强制（除非配置）�
   （kid 轮换机制已在 Stage 1/2 支持：多 kid keyfile + published disabled 位 + PS per-request kid-revocation；未单列 e2e。）
 
 ## 状态
-**F-AUTHZ-1 端到端完成（2026-07-01）** = server KDC（Stage 1）+ PS 强制（Stage 2）+ client token 路径 + 工具（Stage 3），
+**数据面 authz 端到端完成（2026-07-01）** = server KDC（Stage 1）+ PS 强制（Stage 2）+ client token 路径 + 工具（Stage 3），
 真二进制跨租户 e2e 通过。两轮 coco（Stage 1/2）全处置。
 
 ## 参照

@@ -1,9 +1,9 @@
-//! F-ioring-lease-2 — daemon-side client surface end-to-end. Drives
+//! Daemon-side client surface end-to-end. Drives
 //! the `autumn_client::lease` helpers (used inside the daemon's
 //! Open/Close arms) against an in-process AutumnManager + the real
 //! `ClusterClient::mgr_call_retry` transport.
 //!
-//! Covers what F-ioring-lease-1's RPC-only tests can't:
+//! Covers what the RPC-only tests can't:
 //! 1. Two simulated daemons (distinct `DaemonClientId`s) attempting
 //!    a WRITE lease on the same inode — second returns
 //!    `AcquireResult::Conflict` (this is what the daemon maps to
@@ -17,7 +17,7 @@
 //!    session_heartbeat_loop to detect external revocation).
 //!
 //! Multi-daemon coherence over actual ring buffers + cache
-//! invalidation lands in F-ioring-lease-4.
+//! invalidation is covered separately.
 
 use std::net::SocketAddr;
 use std::time::Duration;

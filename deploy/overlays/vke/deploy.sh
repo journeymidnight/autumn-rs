@@ -21,7 +21,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AUTUMN_IMAGE_TAG:=$(git -C "$here" rev-parse HEAD)}"
 image="${AUTUMN_IMAGE_REPO}:${AUTUMN_IMAGE_TAG}"
 
-# F-AUTHZ-BUILTIN: data-plane authz is ON by default. Provision the signing-key
+# data-plane authz is ON by default. Provision the signing-key
 # + admin-token Secret ONCE (rotating it invalidates every minted credential, so
 # we never overwrite an existing one). The signing-key file format is
 # `<kid> <hex-32-byte-seed>` — same as `autumn-op gen-signing-key`, generated

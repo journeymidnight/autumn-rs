@@ -1,11 +1,11 @@
-//! F247 variable-length extents: runtime extent map + the data read/write/
+//! variable-length extents: runtime extent map + the data read/write/
 //! truncate/delete operations keyed by logical byte offset.
 //!
 //! Files are stored as **variable-length extents** keyed by their logical byte
 //! offset (`[0x03][ino][logical_off BE]`, see `key.rs`), each value capped at
 //! [`MAX_EXTENT`] (8 MiB). A sequential (write-once) stream coalesces into
 //! `MAX_EXTENT`-sized extents; the last/partial extent is shorter → "variable
-//! like Linux extents". This replaces the pre-F247 fixed-256 KiB-chunk scheme.
+//! like Linux extents". This replaces the earlier fixed-256 KiB-chunk scheme.
 //!
 //! **Persistent source of truth = the extent KV keys themselves** (the implicit-
 //! key design: no extent list in `InodeMeta`). This module keeps a per-inode
@@ -28,7 +28,7 @@ use crate::schema::{StripeLayout, MAX_EXTENT};
 use crate::state::FsState;
 
 /// Pipeline depth for the append-write hot path. cp / dd / model-checkpoint
-/// streamers send sequential 8 MiB extents — pre-F178 every put was awaited
+/// streamers send sequential 8 MiB extents — previously every put was awaited
 /// serially (in_flight=1) and a single-stream cp ceiling was `8 MiB / RPC_RTT`
 /// ≈ 100 MB/s. With this many in-flight puts the ceiling becomes
 /// `N × 8 MiB / RPC_RTT`, bounded by the per-PS partition's pwritev throughput.
@@ -57,7 +57,7 @@ pub async fn extents_snapshot(
             return Ok(ext.clone());
         }
     }
-    // F-FS-STRIPE (coco P1): a striped inode's extents live under
+    // (coco P1): a striped inode's extents live under
     // `[0x03][lane][ino][off]`, NOT scannable by `[0x03][ino]`, so the map is
     // COMPUTED from size. `stripe` is passed EXPLICITLY by the caller from the
     // AUTHORITATIVE meta — NOT read from `state.inodes` (get_inode returns the
@@ -70,7 +70,7 @@ pub async fn extents_snapshot(
     Ok(extents)
 }
 
-/// Build the extent map. STRIPED (F-FS-STRIPE) → COMPUTE the MAX_EXTENT-granular
+/// Build the extent map. STRIPED → COMPUTE the MAX_EXTENT-granular
 /// offsets from `file_size` (extents are aligned + bounded by size; the writer
 /// never exceeds MAX_EXTENT). LEGACY → paginated range-scan of `[0x03][ino]` →
 /// sorted starts. Both then `infer_lengths`.
@@ -388,7 +388,7 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
     // fenced under the held WRITE lease (anonymous when none is held —
     // unlink without an open writer is a metadata-path operation).
     let lease = state.write_lease_for(ino);
-    // F-FS-STRIPE: a striped inode's extents live under `[0x03][lane][ino][off]`,
+    // a striped inode's extents live under `[0x03][lane][ino][off]`,
     // NOT scannable by the `[0x03][ino]` prefix — a range-scan would MISS them and
     // leak. Look up stripe+size (cached from the caller's get_inode; on
     // tombstone-replay the cache is cold, so read the inode from KV if it still

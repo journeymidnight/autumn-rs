@@ -186,7 +186,7 @@ Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
   commit protocol & fencing, LSM partition server, control plane, transports
 - [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md) / [`docs/k8s_deploy.md`](docs/k8s_deploy.md) — deployment guides
 - [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md) / [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md) / [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md) — subsystem designs
-- [`feature_list.md`](feature_list.md) — the F-numbered feature ledger
+- [`feature_list.md`](feature_list.md) — the feature ledger
 
 ## License
 

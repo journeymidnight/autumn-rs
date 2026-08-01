@@ -1,4 +1,4 @@
-//! F183 policy engine: per-partition load metrics window + split/merge
+//! policy engine: per-partition load metrics window + split/merge
 //! candidate computation. Stage 1 ships advisory only; auto-trigger is
 //! gated behind feature flags in Stage 2/3.
 
@@ -13,7 +13,7 @@ use autumn_rpc::manager_rpc::{
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// F-POLICY-SIZE-EST-LIVE (design doc `docs/key_namespace_split_design.md`
+/// (design doc `docs/key_namespace_split_design.md`
 /// §3.3 D3): the size metric the split/merge/hot-cold predicates compare
 /// against these thresholds is `effective_size_bytes` =
 /// `max(size_bytes, est_live)` — NOT the raw `PartitionLoad.size_bytes`
@@ -29,10 +29,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// DryRun a round of `policy-candidates` first).
 pub const SPLIT_SIZE_HARD: u64 = 50 * GIB;
 pub const SPLIT_SIZE_MIN: u64 = GIB;
-/// F196: recalibrated 50K → 15K. autumn-rs's measured single-partition
+/// recalibrated 50K → 15K. autumn-rs's measured single-partition
 /// QPS ceiling on the perf_check workload is ~30K (one P-log thread,
 /// one io_uring). 15K = 50% of ceiling — "this partition is using
-/// half its single-thread budget, time to split." Pre-F196 the value
+/// half its single-thread budget, time to split." Previously the value
 /// was 50K which is unreachable on this engine; condition ② of the
 /// SPLIT predicate (`req_per_sec > SPLIT_QPS_HIGH && size > SPLIT_
 /// SIZE_MIN`) was effectively dead code.
@@ -41,43 +41,43 @@ pub const SPLIT_IMMFULL_HIGH: u32 = 10;
 pub const SPLIT_COOLDOWN_SEC: i64 = 3600;
 
 pub const MERGE_SIZE_LOW: u64 = GIB;
-/// F196: recalibrated 5K → 1.5K to preserve the 10× hysteresis ratio
+/// recalibrated 5K → 1.5K to preserve the 10× hysteresis ratio
 /// against the new `SPLIT_QPS_HIGH = 15K`. 1.5K = 5% of single-partition
 /// ceiling — "two adjacent cold partitions barely make a dent, merge
 /// them to free a core slot."
 pub const MERGE_QPS_LOW: u32 = 1_500;
 pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
 
-/// F187: GC debt advisory threshold. Default 1 GiB sustained — large
+/// GC debt advisory threshold. Default 1 GiB sustained — large
 /// enough to filter normal write churn, small enough that operators
 /// notice before disk pressure. Tunable via `PolicyConfig`.
 pub const GC_DEBT_HIGH: u64 = GIB;
-/// F187: major-compaction debt advisory threshold. Default 4 GiB — higher
+/// major-compaction debt advisory threshold. Default 4 GiB — higher
 /// than GC because compact's pending bytes naturally accumulate to
 /// MAX_SKIP_LIST × N tables before the periodic loop fires.
 pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
-/// F187: GC advisory cooldown. Once an advisory fires for a partition,
+/// GC advisory cooldown. Once an advisory fires for a partition,
 /// suppress re-emission for 5 min so operators can react without
 /// duplicate-noise. Distinct from any auto-trigger cooldown (Stage 2/3
 /// territory).
 pub const GC_COOLDOWN_SEC: i64 = 300;
-/// F187: compaction advisory cooldown.
+/// compaction advisory cooldown.
 pub const COMPACT_COOLDOWN_SEC: i64 = 300;
 
-/// F202: minor-compaction advisory threshold. 512 MiB — minor compact
+/// minor-compaction advisory threshold. 512 MiB — minor compact
 /// is much cheaper than major (size-tiered pickup of < 32 MiB tables
 /// only), so the bar to surface as advisory is correspondingly lower.
 pub const MINOR_COMPACT_PENDING_HIGH: u64 = 512 * 1024 * 1024;
-/// F202: minor-compact advisory cooldown.
+/// minor-compact advisory cooldown.
 pub const MINOR_COMPACT_COOLDOWN_SEC: i64 = 120;
-/// F202: minimum sealed-extent size to even consider EC advice. Below
+/// minimum sealed-extent size to even consider EC advice. Below
 /// this, the EC encode + K+M shard write + manager state churn
 /// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
 /// Aligned with the deferred PS-side `EC_MIN_EXTENT_BYTES` const in
 /// the plan; 64 MiB matches WAS lazy-EC heuristics.
 pub const EC_MIN_EXTENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// F210-F3: drop a partition's metrics window when its latest bucket
+/// drop a partition's metrics window when its latest bucket
 /// is older than this. Without it, a deleted / merged-away partition's
 /// final `PartitionLoad` snapshot kept driving advisories indefinitely
 /// (the manager never explicitly clears `metrics[part_id]` on partition
@@ -87,7 +87,7 @@ pub const EC_MIN_EXTENT_BYTES: u64 = 64 * 1024 * 1024;
 /// the rest of the policy clock).
 pub const STALE_METRICS_AGE_SEC: i64 = 300;
 
-/// F210-E3: per-tick cap on EC-conversion advisory candidates. Without
+/// per-tick cap on EC-conversion advisory candidates. Without
 /// it, a backlog of N sealed-not-converted extents (real-cluster
 /// observation: 10k+ after a controller pause) emits N candidates per
 /// tick into both the manager's `advisory_cache` and every
@@ -104,25 +104,25 @@ pub const STALE_METRICS_AGE_SEC: i64 = 300;
 pub const MAX_EC_ADVISORY_CANDIDATES: usize = 256;
 
 pub const POLICY_BUCKET_SEC: i64 = 60;
-/// F196: trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
+/// trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
 /// consulted; the extra 25 buckets were dead memory. 10 keeps 2× safety
 /// margin for a future advisory that needs slightly more history.
 pub const POLICY_WINDOW_BUCKETS: usize = 10;
 pub const POLICY_REQUIRED_BUCKETS: usize = 5;
 pub const POLICY_TICK_INTERVAL_SEC: i64 = 60;
 
-/// F196 Stage D: hot/cold imbalance advisory thresholds. Per PS, the
+/// Stage D: hot/cold imbalance advisory thresholds. Per PS, the
 /// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
 /// `required_buckets` consecutive sustained windows must exceed this
 /// to trigger a single advisory candidate listing the hot + cold partitions.
 pub const HOT_COLD_RATIO: u32 = 10;
 /// The hottest partition must additionally exceed this floor so a
 /// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
-/// F196: pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
+/// pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
 /// QPS ceiling). Decoupled from `SPLIT_QPS_HIGH` — operators tuning
 /// the split threshold no longer auto-shift the hot/cold floor.
 pub const HOT_COLD_MIN_HOT_QPS: u32 = 10_000;
-/// F196 Stage D (size dimension): same 10× ratio, but on
+/// Stage D (size dimension): same 10× ratio, but on
 /// `size_bytes`. Catches large-value / low-QPS workloads that QPS
 /// imbalance can't see.
 pub const HOT_COLD_SIZE_RATIO: u64 = 10;
@@ -133,11 +133,11 @@ pub const HOT_COLD_MIN_HOT_SIZE_BYTES: u64 = SPLIT_SIZE_HARD / 2;
 /// Per-PS advisory cooldown — suppress re-emission for 5 min so the
 /// operator log isn't flooded while imbalance persists.
 pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
-/// F210-F4: band tightener for hot/cold classification. A partition
+/// band tightener for hot/cold classification. A partition
 /// only qualifies as "hot" when its window MIN is still within
 /// 1/HOT_COLD_BAND_DIVISOR of the PS's hottest reading — i.e. its
 /// LOWEST bucket is still elevated. Symmetric on the cold side.
-/// Pre-F210-F4 the classifier picked partitions on equality with the
+/// Previously the classifier picked partitions on equality with the
 /// PS-wide max/min, so a partition that oscillated wildly (10k qps in
 /// bucket 1, 100 qps in bucket 5) registered as the PS's MAX in
 /// bucket 1 AND its MIN in bucket 5 — emitted into BOTH the hot and
@@ -147,7 +147,7 @@ pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
 /// stay silent rather than recommending an action against it.
 pub const HOT_COLD_BAND_DIVISOR: u32 = 2;
 
-/// F-REGION-REBALANCE Phase B: emit a rebalance advisory only when the per-PS
+/// Phase B: emit a rebalance advisory only when the per-PS
 /// partition-count spread (max − min) EXCEEDS this. `2` gives hysteresis — a
 /// balanced cluster's irreducible remainder gap is ≤ 1, and a transient gap of 2
 /// (one partition mid-reopen) shouldn't trigger a move; a gap of 3+ is a real
@@ -161,7 +161,7 @@ pub const REBALANCE_COOLDOWN_SEC: i64 = 120;
 /// ticks (HBase limits concurrent region moves the same way).
 pub const REBALANCE_MAX_MOVES_PER_TICK: u32 = 4;
 
-/// F184: runtime-configurable policy thresholds. Production uses the
+/// runtime-configurable policy thresholds. Production uses the
 /// `*_DEFAULT` constants above; tests can lower `required_buckets` and
 /// `tick_interval_sec` to exercise the full policy_tick_loop fast.
 #[derive(Clone, Debug)]
@@ -178,32 +178,32 @@ pub struct PolicyConfig {
     pub window_buckets: usize,
     pub required_buckets: usize,
     pub tick_interval_sec: i64,
-    /// F187: gc advisory threshold (bytes, sustained over
+    /// gc advisory threshold (bytes, sustained over
     /// `required_buckets`).
     pub gc_debt_high: u64,
-    /// F187: compaction advisory threshold (bytes, sustained over
+    /// compaction advisory threshold (bytes, sustained over
     /// `required_buckets`).
     pub compact_pending_high: u64,
-    /// F187: gc advisory cooldown (seconds since `last_gc_at`).
+    /// gc advisory cooldown (seconds since `last_gc_at`).
     pub gc_cooldown_sec: i64,
-    /// F187: compact advisory cooldown (seconds since `last_compact_at`).
+    /// compact advisory cooldown (seconds since `last_compact_at`).
     pub compact_cooldown_sec: i64,
-    /// F202: minor-compact advisory threshold (bytes, sustained over
+    /// minor-compact advisory threshold (bytes, sustained over
     /// `required_buckets`).
     pub minor_compact_pending_high: u64,
-    /// F202: minor-compact advisory cooldown (seconds since
+    /// minor-compact advisory cooldown (seconds since
     /// `last_compact_at` — same field; minor and major share it
     /// because they share the PS-side `do_compact` infrastructure).
     pub minor_compact_cooldown_sec: i64,
-    /// F202: minimum sealed-extent size below which EC advisory is
+    /// minimum sealed-extent size below which EC advisory is
     /// suppressed (encode overhead would outweigh the savings).
     pub ec_min_extent_bytes: u64,
-    /// F-REGION-REBALANCE Phase B: fire the rebalance advisory when the per-PS
+    /// Phase B: fire the rebalance advisory when the per-PS
     /// partition-count spread exceeds this (0 = disable the advisory entirely).
     pub rebalance_gap_threshold: usize,
-    /// F-REGION-REBALANCE Phase B: cluster-level rebalance advisory cooldown.
+    /// Phase B: cluster-level rebalance advisory cooldown.
     pub rebalance_cooldown_sec: i64,
-    /// F-REGION-REBALANCE Phase B: partitions an armed rebalance moves per tick.
+    /// Phase B: partitions an armed rebalance moves per tick.
     pub rebalance_max_moves_per_tick: u32,
 }
 
@@ -236,10 +236,10 @@ impl Default for PolicyConfig {
     }
 }
 
-/// F-POLICY-SIZE-EST-LIVE: per-partition Σ `sealed_length` over the
+/// per-partition Σ `sealed_length` over the
 /// partition's three streams' DEDUP'd extents — the manager-authoritative
 /// half of `est_live_bytes`. Mirrors `compute_cluster_overview_resp`'s
-/// `live_size` sealed sum (rpc_handlers.rs, F-OVERVIEW-OPENTAIL), sourced
+/// `live_size` sealed sum (rpc_handlers.rs), sourced
 /// from `state.partitions` (carries log/row/meta stream ids for every live
 /// partition, present even before a region is assigned). Pure + read-only;
 /// called once per advisory pass on the 60 s policy tick — O(streams +
@@ -270,14 +270,14 @@ pub fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
     out
 }
 
-/// F-POLICY-SIZE-EST-LIVE (design doc §3.3 D3): estimated REAL live bytes a
+/// (design doc §3.3 D3): estimated REAL live bytes a
 /// partition carries, VP payload included:
 ///
 /// ```text
 /// est_live = Σ sealed_length (3 streams, dedup'd — manager state)
-///          + open_tail_bytes       (PS-reported, F-OVERVIEW-OPENTAIL)
-///          − gc_debt_bytes         (PS-reported, F187: sealed-extent dead bytes)
-///          − open_tail_dead_bytes  (PS-reported, F-DF-WALDEBT: open-tail dead bytes)
+///          + open_tail_bytes       (PS-reported)
+///          − gc_debt_bytes         (PS-reported: sealed-extent dead bytes)
+///          − open_tail_dead_bytes  (PS-reported: open-tail dead bytes)
 /// ```
 ///
 /// All four components already exist — zero wire change, zero PS hot-path
@@ -315,7 +315,7 @@ pub fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
 ///   (a per-partition sealed ring in PolicyEngine, updated each compute tick)
 ///   or drop the size dimension out of the debounce entirely (size is a slow
 ///   monotonic level, unlike QPS spikes the window exists to filter).
-///   Tracked: F-POLICY-SIZE-EST-LIVE-FOLLOWUP (feature_list). coco P1 2026-07-17.
+///   Tracked in feature_list. coco P1 2026-07-17.
 pub fn est_live_bytes(sealed_sum: u64, l: &PartitionLoad) -> u64 {
     sealed_sum
         .saturating_add(l.open_tail_bytes)
@@ -347,9 +347,9 @@ impl PartitionMetricsWindow {
     pub fn push(&mut self, ts: i64, load: PartitionLoad) {
         self.push_with_cap_and_bucket(ts, load, POLICY_WINDOW_BUCKETS, POLICY_BUCKET_SEC);
     }
-    /// F210-F2: snap `ts` to a `bucket_sec` boundary. If the previous
+    /// snap `ts` to a `bucket_sec` boundary. If the previous
     /// entry shares that snapped bucket, REPLACE its load (last-wins
-    /// within a bucket). Pre-F210-F2 every PS `report_load_loop` tick
+    /// within a bucket). Previously every PS `report_load_loop` tick
     /// (5 s cadence) produced a fresh bucket, so `required_buckets=5`
     /// represented just 25 s of history, not the 5 minutes the
     /// `bucket_sec=60` × `required_buckets=5` arithmetic implied — every
@@ -395,16 +395,16 @@ pub struct PolicyEngine {
     pub last_advisory_at: HashMap<(u8, u64, u64), i64>,
     pub advisory_cache: Vec<PolicyCandidate>,
     pub advisory_cache_at: i64,
-    /// F184: runtime-configurable thresholds. Default production values;
+    /// runtime-configurable thresholds. Default production values;
     /// tests can override via `set_config`.
     pub config: PolicyConfig,
-    /// F196 Stage D: per-PS hot/cold advisory cooldown. Keyed by
+    /// Stage D: per-PS hot/cold advisory cooldown. Keyed by
     /// `ps_id`; value is the unix-epoch second of the last WARN.
     pub last_hot_cold_at: HashMap<u64, i64>,
-    /// F-REGION-REBALANCE Phase B: cluster-level rebalance advisory cooldown
+    /// Phase B: cluster-level rebalance advisory cooldown
     /// stamp (unix-epoch second of the last emission; 0 = never).
     pub last_rebalance_at: i64,
-    /// F-FS-GEOM-DECLARED step 4: split points an operator declared via
+    /// step 4: split points an operator declared via
     /// presplit (union over every registered namespace). A merge candidate whose
     /// disappearing boundary is one of these is never advertised — the manager
     /// would refuse the merge anyway, so proposing it would just make the
@@ -422,9 +422,9 @@ impl PolicyEngine {
         self.config = config;
     }
 
-    /// F210-F3: drop metrics windows that no longer correspond to a
+    /// drop metrics windows that no longer correspond to a
     /// known partition (post-split / merge / PS-evict) OR whose latest
-    /// bucket is stale beyond `STALE_METRICS_AGE_SEC`. Pre-F210-F3 the
+    /// bucket is stale beyond `STALE_METRICS_AGE_SEC`. Previously the
     /// `policy_tick_loop` would happily emit advisories — including
     /// MERGE candidates pointing at a victim that no longer exists —
     /// off these zombie windows. Also clears the per-PS hot/cold
@@ -468,7 +468,7 @@ impl PolicyEngine {
         out
     }
 
-    /// F183 SPLIT pass — per-partition sliding-window trigger.
+    /// SPLIT pass — per-partition sliding-window trigger.
     ///
     /// For each metrics-tracked partition, requires ALL of the last
     /// `required_buckets` to show a split trigger (size-hard, sustained
@@ -478,7 +478,7 @@ impl PolicyEngine {
     fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
-        // F-POLICY-SIZE-EST-LIVE: one sealed-sum snapshot per pass (sealed
+        // one sealed-sum snapshot per pass (sealed
         // lengths move slowly; the PS-reported QPS/imm-full stay per-bucket).
         let sealed = partition_sealed_sums(args.state);
 
@@ -495,7 +495,7 @@ impl PolicyEngine {
             let sealed_sum = sealed.get(&part_id).copied().unwrap_or(0);
             let recent = &bs[0].1;
             let recent_eff = effective_size_bytes(sealed_sum, recent);
-            // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (design (b)): the SIZE dimension
+            // (design (b)): the SIZE dimension
             // is NOT debounced. `required_buckets` debounce exists to filter
             // QPS SPIKES; size (sealed bytes) is a slow, near-monotone quantity,
             // so demanding "all N buckets big" is the wrong abstraction — a
@@ -547,7 +547,7 @@ impl PolicyEngine {
         out
     }
 
-    /// F183 MERGE pass — adjacent-pair sliding-window trigger.
+    /// MERGE pass — adjacent-pair sliding-window trigger.
     ///
     /// Walks partitions sorted by `start_key`; for each adjacent pair
     /// where `left.end_key == right.start_key`, requires ALL of the last
@@ -560,7 +560,7 @@ impl PolicyEngine {
     fn merge_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
-        // F-POLICY-SIZE-EST-LIVE: the smallness check MUST consume
+        // the smallness check MUST consume
         // `effective_size_bytes` — the live incident this fixes is the
         // policy flagging the cluster's LARGEST partition (part 17: 741 MB
         // LSM-resident vs ~45 GB real stream bytes under a VP workload) as
@@ -588,7 +588,7 @@ impl PolicyEngine {
             if left_meta.rg.as_ref().unwrap().end_key != right_meta.rg.as_ref().unwrap().start_key {
                 continue;
             }
-            // F-FS-GEOM-DECLARED step 4: never advertise a merge that would
+            // step 4: never advertise a merge that would
             // erase an operator-declared presplit boundary. `handle_merge_
             // partitions` refuses it anyway; skipping here keeps the controller
             // from retrying a doomed op every tick. NOTE the shape this
@@ -630,7 +630,7 @@ impl PolicyEngine {
             let recent_r = &rbs[0].1;
             let eff_l = effective_size_bytes(sealed_l, recent_l);
             let eff_r = effective_size_bytes(sealed_r, recent_r);
-            // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (design (b)): symmetric to split —
+            // (design (b)): symmetric to split —
             // the SIZE condition (both sides small) is evaluated ONCE on the
             // CURRENT effective size (slow signal, no debounce), while the COLD
             // condition (summed QPS low + no imm-full pressure — spiky) keeps the
@@ -684,7 +684,7 @@ impl PolicyEngine {
         out
     }
 
-    /// F187: maintenance (GC + compact) advisory pass. Mirrors the F183
+    /// maintenance (GC + compact) advisory pass. Mirrors the
     /// split/merge structure: require all of the most recent
     /// `required_buckets` to exceed the threshold, gate by per-kind
     /// cooldown driven from the partition's own `last_gc_at` /
@@ -718,7 +718,7 @@ impl PolicyEngine {
         out
     }
 
-    /// GC maintenance sub-check (F187). Emits a `POLICY_KIND_GC`
+    /// GC maintenance sub-check. Emits a `POLICY_KIND_GC`
     /// candidate when no GC is inflight on the partition, it is outside
     /// `gc_cooldown_sec`, and ALL recent buckets sustain
     /// `gc_debt_bytes > gc_debt_high`.
@@ -756,7 +756,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Major-compaction maintenance sub-check (F187). Emits a
+    /// Major-compaction maintenance sub-check. Emits a
     /// `POLICY_KIND_MAJOR_COMPACT` candidate when no compaction is
     /// inflight, the partition is outside `compact_cooldown_sec`, and
     /// ALL recent buckets sustain
@@ -796,7 +796,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Minor-compaction maintenance sub-check (F202). Independent from
+    /// Minor-compaction maintenance sub-check. Independent from
     /// the major path: minor compact addresses size-tiered write-amp
     /// hygiene, not dead-data cleanup. Common-sense filter: only emit
     /// when the PS-side `minor_compact_pending_bytes` is non-zero (i.e.
@@ -842,7 +842,7 @@ impl PolicyEngine {
         }
     }
 
-    /// F202: EC-conversion advisory. Scans the manager state for
+    /// EC-conversion advisory. Scans the manager state for
     /// sealed-but-not-converted extents that exceed
     /// `cfg.ec_min_extent_bytes`. Emits one `POLICY_KIND_EC`
     /// candidate per such extent. Stage 2 is advisory-only.
@@ -880,7 +880,7 @@ impl PolicyEngine {
                 }
                 if ext.sealed_length == 0 {
                     // Open or sealed-at-zero — encode has nothing to
-                    // do. Open-tail won't be EC'd until sealed; F201
+                    // do. Open-tail won't be EC'd until sealed;
                     // GC empty-extent picks reclaims sealed-at-zero.
                     continue;
                 }
@@ -907,9 +907,9 @@ impl PolicyEngine {
                 });
             }
         }
-        // F210-E3: cap the per-tick advisory at the top
+        // cap the per-tick advisory at the top
         // `MAX_EC_ADVISORY_CANDIDATES` extents sorted by `sealed_length`
-        // desc. Pre-F210-E3 the function emitted one candidate per
+        // desc. Previously the function emitted one candidate per
         // sealed-not-converted extent unconditionally; on a cluster
         // that ran without EC for a while (or any time the external
         // controller is slow to drain candidates), the backlog of
@@ -931,7 +931,7 @@ impl PolicyEngine {
         out
     }
 
-    /// F-REGION-REBALANCE Phase B: a CLUSTER-level advisory (not per-partition
+    /// Phase B: a CLUSTER-level advisory (not per-partition
     /// or per-extent) — emitted when the per-PS partition-count spread exceeds
     /// `rebalance_gap_threshold` and we're outside the cluster cooldown. Sourced
     /// directly from `regions` + `ps_nodes` (the same inputs `compute_rebalance_moves`
@@ -986,7 +986,7 @@ impl PolicyEngine {
         }]
     }
 
-    /// F196 Stage D — hot/cold imbalance advisory.
+    /// Stage D — hot/cold imbalance advisory.
     ///
     /// Groups partitions by their owning PS via `region_owners` and, for
     /// every PS that hosts at least two metrics-tracked partitions,
@@ -1013,7 +1013,7 @@ impl PolicyEngine {
     /// (via `MSG_GET_POLICY_CANDIDATES`) renders them next to SPLIT /
     /// MERGE / GC / COMPACT advisories. A matching `WARN` line is also
     /// emitted to `manager.log` for at-a-glance operator awareness.
-    /// F210-F4 hot/cold band classification for ONE dimension (qps or size).
+    /// hot/cold band classification for ONE dimension (qps or size).
     /// Hot = own window MAX equals the PS's hottest AND own MIN is still
     /// within the band of it (sustained-high across its buckets); symmetric
     /// on cold. Returns sorted `(hot, cold)` part-id lists; both empty when
@@ -1067,7 +1067,7 @@ impl PolicyEngine {
                 Some(p) => *p,
                 None => continue,
             };
-            // F-POLICY-SIZE-EST-LIVE: the size dimension consumes
+            // the size dimension consumes
             // `effective_size_bytes` (same口径 as split/merge) so a VP-heavy
             // partition registers as size-hot even though its LSM-resident
             // `size_bytes` is tiny (`sealed_sums` from
@@ -1124,7 +1124,7 @@ impl PolicyEngine {
             // The earlier median-based classification didn't work for
             // 2-partition PSes (median == max → hot list empty), so
             // this min/max-match approach is what we use.
-            // F210-F4: partition qualifies as "hot" only when its own
+            // partition qualifies as "hot" only when its own
             // window MIN is still within 1/HOT_COLD_BAND_DIVISOR of the
             // PS's hottest reading (sustained-high across its buckets);
             // symmetric on cold. Excludes rotating hotspots that would
@@ -1151,7 +1151,7 @@ impl PolicyEngine {
                 size_hottest / size_band,
                 size_coldest.saturating_mul(size_band),
             );
-            // F210-F4: if the band filter dropped every candidate on a
+            // if the band filter dropped every candidate on a
             // triggering dimension, suppress the advisory for that
             // dimension. Without this we'd still log a fire WARN but
             // emit empty hot/cold lists.
@@ -1176,7 +1176,7 @@ impl PolicyEngine {
                 size_coldest_mb = size_coldest / (1024 * 1024),
                 size_hot_parts = ?size_hot,
                 size_cold_parts = ?size_cold,
-                "F196 hot/cold imbalance on PS — consider auto-split for the hot partitions, or merge the cold pair to free a core slot"
+                "hot/cold imbalance on PS — consider auto-split for the hot partitions, or merge the cold pair to free a core slot"
             );
             // Hottest part = first qps_hot if QPS triggered else first
             // size_hot; coldest = symmetric. Fall back to 0 when a

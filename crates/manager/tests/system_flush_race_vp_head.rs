@@ -118,7 +118,7 @@ fn flush_must_stamp_rotation_vp_not_claim_cursor() {
         // be rebuilt from the log replay window. Mirrors `system_crash_mid_flush`
         // / `system_crash_mid_compact`. We do NOT use
         // `start_partition_server_stoppable`: its graceful drain flushes every
-        // imm (F120-C), which would persist the tail and mask the loss.
+        // imm, which would persist the tail and mask the loss.
         drop(ps1);
 
         let ps2_addr = pick_addr();

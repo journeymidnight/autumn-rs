@@ -1,25 +1,24 @@
-//! F099-M — multi-thread ExtentNode tests.
+//! multi-thread ExtentNode tests.
 //!
-//! Validates the per-shard runtime + port architecture introduced in
-//! F099-M:
+//! Validates the per-shard runtime + port architecture:
 //!
-//!   1. `f099m_shards_serve_disjoint_extents`: an extent-node process
+//!   1. `shards_serve_disjoint_extents`: an extent-node process
 //!      running with `shard_count=2` serves disjoint extent IDs on
 //!      its two shards (ownership = `autumn_rpc::shard_for_extent(id, 2)`,
-//!      the canonical hashed map — F-EN-SHARD-HASH; was `id % 2`). Wrong-shard
+//!      the canonical hashed map; was `id % 2`). Wrong-shard
 //!      requests are rejected with FailedPrecondition.
 //!
-//!   2. `f099m_register_node_reports_shard_ports`: register-node
+//!   2. `register_node_reports_shard_ports`: register-node
 //!      carries `shard_ports`; the manager stores them and
 //!      `nodes_info` returns them so clients can route.
 //!
-//!   3. `f099m_client_routes_by_extent_hash`: client's
+//!   3. `client_routes_by_extent_hash`: client's
 //!      `shard_addr_for_extent` helper maps each extent to
-//!      `shard_ports[autumn_rpc::shard_for_extent(id, k)]` (F-EN-SHARD-HASH).
+//!      `shard_ports[autumn_rpc::shard_for_extent(id, k)]`.
 //!      Smoke-test through the alloc+append path — the hot path lands on the
 //!      owning shard's port (the EN `owns_extent` agrees with the routing).
 //!
-//!   4. `f099m_recovery_per_shard`: after process restart with the
+//!   4. `recovery_per_shard`: after process restart with the
 //!      same data dir + shard_count, each shard only loads its owned
 //!      extents.
 
@@ -63,7 +62,7 @@ fn spawn_sharded_node(data_dir: &std::path::Path, disk_id: u64, shards: u32) -> 
         let shard_idx = idx as u32;
         let bind_addr = *addr;
         std::thread::Builder::new()
-            .name(format!("f099m-shard-{shard_idx}"))
+            .name(format!("shard-{shard_idx}"))
             .spawn(move || {
                 compio::runtime::Runtime::new()
                     .expect("runtime")
@@ -90,11 +89,11 @@ async fn alloc_on(addr: SocketAddr, extent_id: u64) -> AllocExtentResp {
     rkyv_decode::<AllocExtentResp>(&resp).expect("decode")
 }
 
-/// Fence-free length probe — uses `MSG_PROBE_EXTENT` (F210-H3 Tier 2).
+/// Fence-free length probe — uses `MSG_PROBE_EXTENT`.
 ///
-/// Pre-F210-H3 this called `MSG_COMMIT_LENGTH` with `owner_epoch: 0` as
-/// a "skip fence" sentinel. F210-H3 Tier 2 tightened the
-/// `MSG_COMMIT_LENGTH` wire contract: `owner_epoch <= 0` now returns
+/// This previously called `MSG_COMMIT_LENGTH` with `owner_epoch: 0` as
+/// a "skip fence" sentinel. The `MSG_COMMIT_LENGTH` wire contract was
+/// later tightened: `owner_epoch <= 0` now returns
 /// `CODE_INVALID_ARGUMENT` (the probe sentinel escape hatch was
 /// removed; see `MSG_PROBE_EXTENT` instead). The tests are pure
 /// length probes with no owner context — exactly what
@@ -115,11 +114,11 @@ async fn commit_length_on(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// A 2-shard ExtentNode owns each extent on `shard_for_extent(id, 2)` (the
-/// canonical hash — F-EN-SHARD-HASH). Extent 100 hashes to shard 0, 101 to
+/// canonical hash). Extent 100 hashes to shard 0, 101 to
 /// shard 1: allocating 100 on shard 0 succeeds; probing commit_length for 100
 /// on shard 1 returns FailedPrecondition (wrong shard), and vice-versa for 101.
 #[test]
-fn f099m_shards_serve_disjoint_extents() {
+fn shards_serve_disjoint_extents() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let addrs = spawn_sharded_node(tmp.path(), 1, 2);
     assert_eq!(addrs.len(), 2);
@@ -204,7 +203,7 @@ fn f099m_shards_serve_disjoint_extents() {
 /// Register a node with `shard_ports=[p0, p1, p2, p3]`; then fetch the
 /// nodes map and verify shard_ports round-tripped intact.
 #[test]
-fn f099m_register_node_reports_shard_ports() {
+fn register_node_reports_shard_ports() {
     let mgr_addr = pick_addr();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new()
@@ -296,7 +295,7 @@ fn f099m_register_node_reports_shard_ports() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Test 3: client routes by the canonical extent→shard HASH (F-EN-SHARD-HASH)
+// Test 3: client routes by the canonical extent→shard HASH
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Exercises the client-side routing helper: `shard_addr_for_extent` MUST
@@ -307,7 +306,7 @@ fn f099m_register_node_reports_shard_ports() {
 /// routed port actually works end-to-end (the EN accepts the append → its
 /// `owns_extent` agrees with the routing).
 #[test]
-fn f099m_client_routes_by_extent_hash() {
+fn client_routes_by_extent_hash() {
     use autumn_rpc::shard_for_extent;
 
     // Pure routing check: shard_addr_for_extent wires through shard_for_extent.
@@ -352,8 +351,8 @@ fn f099m_client_routes_by_extent_hash() {
             let pool = ConnPool::new();
 
             for (id, payload) in [
-                (id_a, &b"hello-f099m-a"[..]),
-                (id_b, &b"f099m-b-world"[..]),
+                (id_a, &b"hello-shard-a"[..]),
+                (id_b, &b"shard-b-world"[..]),
             ] {
                 let routed = shard_addr_for_extent(&base, &shard_ports, id);
                 let expect_port = shard_ports[shard_for_extent(id, 2) as usize];
@@ -405,7 +404,7 @@ fn f099m_client_routes_by_extent_hash() {
 /// what we're exercising: despite both .dat files living in the shared
 /// data dir, each shard on restart skips IDs it doesn't own.
 #[test]
-fn f099m_recovery_per_shard() {
+fn recovery_per_shard() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
 

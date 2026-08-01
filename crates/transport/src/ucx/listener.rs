@@ -49,7 +49,7 @@ impl UcxListener {
                  bind a RoCE NIC IP for production"
             );
         }
-        // F264 (UCX chaos): a node restarted within the TIME_WAIT window of
+        // (UCX chaos): a node restarted within the TIME_WAIT window of
         // its previous incarnation fails `ucp_listener_create` with
         // UCS_ERR_BUSY ("Device is busy") — the killed process's ACCEPTED
         // sockets keep the local port in TIME_WAIT (~60 s) and UCX's

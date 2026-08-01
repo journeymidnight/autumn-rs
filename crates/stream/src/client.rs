@@ -85,7 +85,7 @@ impl ManagerError {
     /// manager telling the client to re-pull a fresh snapshot or wait for an
     /// in-flight op, NOT a deterministic verdict. Coupled (by message, like
     /// `is_owner_fence`) to the `handle_stream_alloc_extent` producers: the
-    /// F207 inflight-ledger "defer alloc_extent until it completes"
+    /// inflight-ledger "defer alloc_extent until it completes"
     /// (rpc_handlers.rs) and the stream-membership / tail-eversion
     /// verify-at-apply + etcd mirror value-CAS "retry with [a] fresh snapshot"
     /// (rpc_handlers.rs + lib.rs, manager note 33). These clear within a tick
@@ -139,7 +139,7 @@ impl std::fmt::Display for ManagerError {
             // The "LockedByOther" token is LOAD-BEARING: the PS's
             // `is_locked_by_other` classifies on it and poisons the
             // partition, whose reopen re-acquires a FRESH owner_epoch
-            // (F270) — the same self-heal the EN layer's native
+            // — the same self-heal the EN layer's native
             // CODE_LOCKED_BY_OTHER rejection triggers. This is what turns
             // a manager-side fence from "20 futile retries, then hope the
             // upper layer notices" into an immediate fresh-epoch reopen.
@@ -188,12 +188,12 @@ fn parse_read_bytes_resp(
     Ok(resp)
 }
 
-/// F204: structured sentinel for "VP points past manager-recorded
+/// structured sentinel for "VP points past manager-recorded
 /// `sealed_length`" — historical data corruption from the
 /// pre-2026-04-27 `handle_stream_alloc_extent` race against EC
 /// conversion (see `crates/stream/CLAUDE.md` programming note 6).
 /// Manager writes to `sealed_length` are now monotonic-by-construction
-/// (F138/F145/F146/F147/F149 + the 2026-04-27 `if tail.sealed_length > 0`
+/// (the 2026-04-27 `if tail.sealed_length > 0`
 /// guard), so no NEW corruption can arise — but etcd values that were
 /// shrunken before those fixes shipped persist, and the physical EC
 /// shards were truncated during the bug window so the bytes past
@@ -230,7 +230,7 @@ use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::future::join_all;
 
-/// F259: one-shot direct EN read of a value byte range, for clients holding
+/// one-shot direct EN read of a value byte range, for clients holding
 /// a MSG_GET_REDIRECT descriptor. No StreamClient (no owner lock, no manager)
 /// — the zero-copy wire read the PS itself uses (MSG_READ_BYTES_BULK +
 /// call_into_pooled: UCX registered recv / TCP owned read, no FrameDecoder
@@ -278,7 +278,7 @@ pub async fn read_extent_value_direct(
     if value.len() > length as usize {
         value.truncate(length as usize);
     }
-    // coco P1 (F259): a short payload under CODE_OK (sealed_length clamp,
+    // coco P1: a short payload under CODE_OK (sealed_length clamp,
     // stale VP, EN-side truncation) must be a FAILURE — the proxy path's
     // read_value_from_log enforces the same "got < need" check. Returning
     // short bytes as Ok would hand the caller silently corrupt data.
@@ -291,13 +291,13 @@ pub async fn read_extent_value_direct(
     Ok(value)
 }
 
-// ── F258: replicated-read spreading + hedging ──────────────────────────
+// ── replicated-read spreading + hedging ──────────────────────────
 
-/// F258 (b): hedge delay (ms) for replicated sealed-extent reads. 0
-/// (default) = hedging disabled; rotation (F258 (a)) still applies. Set
+/// (b): hedge delay (ms) for replicated sealed-extent reads. 0
+/// (default) = hedging disabled; start-replica rotation still applies. Set
 /// once at process start from a CLI flag (`autumn-ps --read-hedge-ms`,
 /// translated from `AUTUMN_READ_HEDGE_MS` by cluster.sh) — no env reads
-/// in library code per the F195 discipline.
+/// in library code per the config discipline.
 static READ_HEDGE_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 pub fn set_read_hedge_ms(ms: u64) -> bool {
@@ -308,7 +308,7 @@ pub(crate) fn read_hedge_ms() -> u64 {
     *READ_HEDGE_MS_CELL.get_or_init(|| 0)
 }
 
-/// F260: minimum total append payload (bytes) for CHAINED replication —
+/// minimum total append payload (bytes) for CHAINED replication —
 /// the writer sends ONE copy to replica[0] which pipelines to the rest
 /// (PS egress 3x -> 1x for large writes). 0 = chaining disabled (always
 /// star fanout). Default 64 KiB (the bulk_worthwhile threshold). Set once
@@ -327,7 +327,7 @@ pub(crate) fn append_chain_min_bytes() -> u32 {
     *APPEND_CHAIN_MIN_CELL.get_or_init(|| 0)
 }
 
-/// F258 (a): deterministic start-replica rotation for sealed-extent reads.
+/// (a): deterministic start-replica rotation for sealed-extent reads.
 /// SplitMix64 finalizer over `(extent_id, offset)` — no extra deps, cheap,
 /// and well-mixed so consecutive chunk offsets of one large read stripe
 /// across replicas instead of clustering.
@@ -373,14 +373,14 @@ pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
     }
 }
 
-/// F276: `replicates ++ parity` node ids in slot order — the SAME order that
+/// `replicates ++ parity` node ids in slot order — the SAME order that
 /// `replica_addrs_from_cache` resolves addresses in, so a read slot index maps
 /// back to its `node_id` (needed to consult the Suspected snapshot).
 pub(crate) fn replica_node_ids(ex: &ExtentInfo) -> Vec<u64> {
     ex.replicates.iter().chain(ex.parity.iter()).copied().collect()
 }
 
-/// F276: slot try-order for a REPLICATED read. Starts from the F258 rotated
+/// slot try-order for a REPLICATED read. Starts from the rotated
 /// start, keeps only `avali`-eligible slots, and moves slots whose node the
 /// manager currently believes `Suspected` to the BACK — healthy replicas are
 /// tried first so a flaky node never costs a per-read RPC timeout before
@@ -388,7 +388,7 @@ pub(crate) fn replica_node_ids(ex: &ExtentInfo) -> Vec<u64> {
 /// suspected node is not dead, and every committed byte of a sealed extent is
 /// on every replica, so they remain a correct last-resort. With an empty
 /// `suspected` set (the common case) the result is byte-identical to the
-/// pre-F276 rotated order, so the hot path is unchanged.
+/// plain rotated order, so the hot path is unchanged.
 pub(crate) fn replicated_read_order(
     ex: &ExtentInfo,
     offset: u64,
@@ -398,7 +398,7 @@ pub(crate) fn replicated_read_order(
     if n == 0 {
         return Vec::new();
     }
-    // F-READ-OPENTAIL-ROTATE: rotate the start replica for OPEN extents too,
+    // rotate the start replica for OPEN extents too,
     // not just sealed ones. This fn is READ-PATH-EXCLUSIVE (the bulk-proxy value
     // read + the chunked copy read are its only callers), and an open tail's
     // COMMITTED prefix is on every replica (all-replica-ACK), so a committed VP
@@ -430,7 +430,7 @@ pub(crate) fn replicated_read_order(
     healthy
 }
 
-/// F276: eligible replica slots with manager-`Suspected` nodes DROPPED — but
+/// eligible replica slots with manager-`Suspected` nodes DROPPED — but
 /// only when at least one healthy eligible slot remains (else fall back to ALL
 /// eligible, never strand). Used by the CLIENT-DIRECT descriptor path
 /// (`extent_read_descriptor`), whose external consumer picks its OWN
@@ -471,7 +471,7 @@ pub struct AppendResult {
 struct StreamTail {
     extent: ExtentInfo,
     replica_addrs: Vec<String>,
-    /// F190: parallel to `replica_addrs` — `replicates ++ parity` node ids
+    /// parallel to `replica_addrs` — `replicates ++ parity` node ids
     /// in the same index order used by `replica_addrs_from_cache`. Required
     /// so `apply_completion` can resolve a failing replica index back to
     /// its `node_id` for the per-stream `bad_nodes` exclusion list.
@@ -522,7 +522,7 @@ struct StreamAppendState {
     /// concurrent append could write past the new `sealed_length` and have its
     /// acked data become unreadable (coco P1).
     sealing: bool,
-    /// F190: per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// per-stream "recently failed" node ids (`node_id → expires_at`).
     /// Shared with the public API via `Rc<RefCell<_>>` so
     /// `alloc_new_extent_once` can snapshot non-expired entries to pass via
     /// `StreamAllocExtentReq.exclude_node_ids`. Worker writes on
@@ -530,16 +530,16 @@ struct StreamAppendState {
     /// covers a full manager polling cycle without holding excludes long
     /// enough to block natural disk recovery (default 30 s, env-tunable).
     bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
-    /// F192: cloned sender for the per-StreamClient failure-report
+    /// cloned sender for the per-StreamClient failure-report
     /// drainer. `try_send` from `apply_completion` Err; drops the event
     /// silently when full (best-effort).
     failure_report_tx: mpsc::Sender<FailureReport>,
-    /// F195: snapshotted F190 TTL — clone-on-spawn from StreamClientConfig
+    /// snapshotted bad-nodes TTL — clone-on-spawn from StreamClientConfig
     /// so the worker doesn't need to re-clone the config Rc per Err.
     bad_nodes_ttl: Duration,
 }
 
-// F195: F190 TTL helper `bad_nodes_ttl()` removed. Value now lives on
+// The bad-nodes TTL helper `bad_nodes_ttl()` was removed. Value now lives on
 // `StreamClientConfig.bad_nodes_ttl` (defined below) — set once at
 // `StreamClient` construction, snapshotted into `StreamAppendState`
 // for the worker. Was previously env `AUTUMN_STREAM_BAD_NODES_TTL_SECS`,
@@ -565,7 +565,7 @@ impl StreamAppendState {
         }
     }
 
-    /// F190: mark a node as recently failed. Called from `apply_completion`
+    /// mark a node as recently failed. Called from `apply_completion`
     /// Err paths with the `node_id` resolved from the cached `ExtentInfo`
     /// via `StreamTail.replica_node_ids[failing_index]`. Refresh-on-insert
     /// (overwrites the existing expires_at) so a chain of failures keeps
@@ -575,10 +575,10 @@ impl StreamAppendState {
         self.bad_nodes.borrow_mut().insert(node_id, expires_at);
     }
 
-    /// F192: best-effort fire of a `MSG_REPORT_DISK_FAILURE` event into
+    /// best-effort fire of a `MSG_REPORT_DISK_FAILURE` event into
     /// the per-StreamClient drainer. Drops on full channel — the manager
     /// quorum debounce tolerates loss (per-stream alloc route-around via
-    /// F190 stays as the primary defense).
+    /// stays as the primary defense).
     fn try_report_failure(&mut self, node_id: u64, extent_id: u64) {
         let _ = self
             .failure_report_tx
@@ -796,24 +796,24 @@ const STREAM_SUBMIT_CAP: usize = 256;
 const OPEN_TAIL_COMMIT_RETRIES: u32 = 3;
 const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
 
-// F195: env-reading helpers `stream_inflight_cap()`,
+// env-reading helpers `stream_inflight_cap()`,
 // `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
 // on `StreamClientConfig` (defined below) — set once at construction,
 // CLI-flag-driven on the binary. Tests that need overrides build a
 // custom `StreamClientConfig` instead of setting process-global env
 // vars (hostile to parallel test runs).
 
-/// F195: Stream client tunables. Default values match the pre-F195
+/// Stream client tunables. Default values match the legacy
 /// env-default behaviour:
-///   - `bad_nodes_ttl`: 30 s (F190)
+///   - `bad_nodes_ttl`: 30 s
 ///   - `inflight_cap`: 32 per-stream FU cap
-///   - `append_fanout_timeout`: 5 s per-replica append BASE deadline (F121;
-///     BUG-FLUSH-TIMEOUT-LEAK made it a base, not the whole deadline)
+///   - `append_fanout_timeout`: 5 s per-replica append BASE deadline
+///     (BUG-FLUSH-TIMEOUT-LEAK made it a base, not the whole deadline)
 ///   - `append_floor_bytes_per_sec`: 8 MiB/s assumed worst-case sustained
 ///     all-replica append throughput floor (BUG-FLUSH-TIMEOUT-LEAK)
-///   - `read_chunk_bytes`: 256 MiB per replicated read chunk (F105)
-///   - `synced_poll`: 2 ms F178 flush-barrier poll interval
-///   - `synced_timeout`: 30 s F178 flush-barrier overall timeout
+///   - `read_chunk_bytes`: 256 MiB per replicated read chunk
+///   - `synced_poll`: 2 ms flush-barrier poll interval
+///   - `synced_timeout`: 30 s flush-barrier overall timeout
 #[derive(Clone, Debug)]
 pub struct StreamClientConfig {
     pub bad_nodes_ttl: Duration,
@@ -821,7 +821,7 @@ pub struct StreamClientConfig {
     pub append_fanout_timeout: Duration,
     /// BUG-FLUSH-TIMEOUT-LEAK: the per-append deadline scales with payload
     /// size — `deadline = append_fanout_timeout + payload_len / this`
-    /// (see `effective_io_timeout`). The F121 fixed 5 s deadline was
+    /// (see `effective_io_timeout`). The earlier fixed 5 s deadline was
     /// sized for 4 KiB WAL appends; applied verbatim to a 256 MiB SST
     /// flush it CANNOT be met under load (live cluster: 788× "append
     /// timeout after 5s" while every EN had durably written all ~255 MB),
@@ -872,7 +872,7 @@ impl Default for StreamClientConfig {
 }
 
 /// BUG-FLUSH-TIMEOUT-LEAK: hard ceiling on the size-scaled I/O deadline (shared
-/// by append AND read). Preserves the F121 dead-replica bound — every append
+/// by append AND read). Preserves the dead-replica bound — every append
 /// still resolves (success/error/timeout) within a bounded window, so
 /// `drain_inflight_for_seal` and the failover SealCommit handshake can never
 /// hang. 10 min covers a 4 GiB payload (the frame `payload_len: u32` wire
@@ -914,7 +914,7 @@ pub(crate) fn is_liveness_timeout(err: &anyhow::Error) -> bool {
 /// the ACTUAL payload size instead of applying one fixed constant to every
 /// append: `deadline = min(base + payload_len / floor_bytes_per_sec, CAP)`.
 /// `base` covers RTT + queueing + fsync latency (the pre-existing 4 KiB-WAL
-/// deadline, F121); the scaled term covers transfer + write time at an assumed
+/// deadline); the scaled term covers transfer + write time at an assumed
 /// worst-case throughput floor (see `StreamClientConfig::
 /// append_floor_bytes_per_sec` for the derivation of the default floor).
 pub(crate) fn effective_io_timeout(
@@ -946,7 +946,7 @@ impl IoDeadline {
         effective_io_timeout(self.base, self.floor_bytes_per_sec, payload_len)
     }
 
-    /// F260 chained append: the ack traverses every hop store-and-forward, so
+    /// chained append: the ack traverses every hop store-and-forward, so
     /// the budget is the per-hop (already size-scaled) deadline × hops × 3.
     ///
     /// coco P2: the cap is applied AFTER the multiplier. Clamping only inside
@@ -961,13 +961,13 @@ impl IoDeadline {
 }
 
 impl StreamClientConfig {
-    /// F195: F190 TTL clamp `[1, 600]` seconds.
+    /// bad-nodes TTL clamp `[1, 600]` seconds.
     pub fn with_bad_nodes_ttl(mut self, ttl: Duration) -> Self {
         let secs = ttl.as_secs().clamp(1, 600);
         self.bad_nodes_ttl = Duration::from_secs(secs);
         self
     }
-    /// F195: F121 fanout clamp `[200 ms, 60 s]`. Post-BUG-FLUSH-TIMEOUT-LEAK
+    /// append fanout clamp `[200 ms, 60 s]`. Post-BUG-FLUSH-TIMEOUT-LEAK
     /// this is the BASE deadline only (the payload-scaled term is added on
     /// top per append — see `effective_io_timeout`), so the 60 s ceiling
     /// stays correct: it bounds the size-independent slack, not the transfer
@@ -1012,23 +1012,23 @@ impl StreamClientConfig {
             floor_bytes_per_sec: self.read_floor_bytes_per_sec,
         }
     }
-    /// F195: per-stream FU cap. 0 → default 32.
+    /// per-stream FU cap. 0 → default 32.
     pub fn with_inflight_cap(mut self, cap: usize) -> Self {
         self.inflight_cap = if cap == 0 { 32 } else { cap };
         self
     }
-    /// F195: F105 chunk size. 0 → default 256 MiB.
+    /// read chunk size. 0 → default 256 MiB.
     pub fn with_read_chunk_bytes(mut self, bytes: u64) -> Self {
         self.read_chunk_bytes = if bytes == 0 { 256 * 1024 * 1024 } else { bytes };
         self
     }
-    /// F195: F178 flush-barrier poll interval `[1, 50] ms`.
+    /// flush-barrier poll interval `[1, 50] ms`.
     pub fn with_synced_poll(mut self, p: Duration) -> Self {
         let ms = p.as_millis().clamp(1, 50) as u64;
         self.synced_poll = Duration::from_millis(ms);
         self
     }
-    /// F195: F178 flush-barrier overall timeout `≥ 100 ms`.
+    /// flush-barrier overall timeout `≥ 100 ms`.
     pub fn with_synced_timeout(mut self, t: Duration) -> Self {
         let ms = (t.as_millis() as u64).max(100);
         self.synced_timeout = Duration::from_millis(ms);
@@ -1039,7 +1039,7 @@ impl StreamClientConfig {
 /// BUG-FLUSH-TIMEOUT-LEAK FIX #1 reproduce-first tests.
 ///
 /// Live-cluster evidence for the red state: a PS flush appends ONE ~256 MiB
-/// SST to row_stream; the fixed 5 s F121 deadline (sized for 4 KiB WAL
+/// SST to row_stream; the fixed 5 s deadline (sized for 4 KiB WAL
 /// appends) fired 788× ("append timeout after 5s") while every EN had
 /// durably written all ~255 MB — the client then rolled to a fresh extent
 /// and rewrote the same SST, leaking 255 MB per iteration (10.4 TB of
@@ -1103,7 +1103,7 @@ mod io_deadline_tests {
         )));
     }
 
-    /// coco P2 regression: the F260 chain path multiplies the per-hop deadline by
+    /// coco P2 regression: the chain path multiplies the per-hop deadline by
     /// hops×3. If the cap is applied only INSIDE `for_len` (before the
     /// multiply), a capped 600 s becomes 90 min at RF=3 — breaking the invariant
     /// every other part of this fix rests on: EVERY `InflightFut` resolves within
@@ -1183,7 +1183,7 @@ mod io_deadline_tests {
 
     #[test]
     fn deadline_stays_bounded_for_any_size() {
-        // F121 dead-replica bound: every append must still resolve within a
+        // dead-replica bound: every append must still resolve within a
         // bounded window (SealCommit drain depends on it). Even an absurd
         // payload is capped.
         let cfg = StreamClientConfig::default();
@@ -1204,9 +1204,9 @@ mod io_deadline_tests {
 /// `length == 0` means "to end"), or an `Err` describing the
 /// out-of-bounds condition. Lifted out of the async method so it can
 /// be unit-tested without standing up a manager + extent-node fixture.
-/// F170: takes `full_payload` by value so the full-read path
+/// takes `full_payload` by value so the full-read path
 /// (offset=0, length=0) can return the decoded Vec directly with
-/// zero copy. Pre-F170 this took `&[u8]` and unconditionally
+/// zero copy. This previously took `&[u8]` and unconditionally
 /// `.to_vec()`'d, which on a 256 MiB EC-decoded payload spent
 /// 50-100 ms memcpy'ing INLINE on the caller's compio runtime —
 /// a thread-per-core violation. Sub-range reads still allocate
@@ -1214,7 +1214,7 @@ mod io_deadline_tests {
 /// read path (the dominant case during recovery / VP fetches)
 /// is now zero-copy after `spawn_blocking(ec_decode)` returns.
 /// `extent_id` + `sealed_length` are pass-through context for the
-/// F204 `StaleVpOffset` sentinel — they're not used by the
+/// `StaleVpOffset` sentinel — they're not used by the
 /// in-range slice path. We could derive `sealed_length` from
 /// `full_payload.len()` (they agree in the happy path), but the
 /// caller already has the manager-reported value and we want the
@@ -1232,7 +1232,7 @@ fn ec_slice_decoded(
     }
     let start = offset as usize;
     if start > full_payload.len() {
-        // F204: structured sentinel so the PS read path can map this
+        // structured sentinel so the PS read path can map this
         // to `StatusCode::FailedPrecondition` and surface a stable
         // diagnostic to Python operational tooling.
         return Err(anyhow::Error::new(StaleVpOffset {
@@ -1256,8 +1256,8 @@ enum StreamSubmitMsg {
     /// Append payload segments; worker leases offsets, fans out to 3
     /// replicas, and acks on completion.
     ///
-    /// F178: no `must_sync` field. Every append is durable via the
-    /// extent-node's per-extent fsync coalescer. Pre-F178 this carried
+    /// no `must_sync` field. Every append is durable via the
+    /// extent-node's per-extent fsync coalescer. This previously carried
     /// a `must_sync: bool` that the extent-node honoured to skip the
     /// fsync wait; that wire field was removed when --nosync was
     /// dropped.
@@ -1313,7 +1313,7 @@ struct InflightResult {
     /// Raw oneshot frames from each replica. `Err` slots are RPC/connection
     /// failures; `Ok(f)` slots include protocol-level error frames.
     frames: Vec<Result<autumn_rpc::Frame>>,
-    /// F190: parallel to `frames` — `node_id` of each replica in the same
+    /// parallel to `frames` — `node_id` of each replica in the same
     /// index order. Lets `apply_completion` resolve a failing replica back
     /// to its `node_id` for the per-stream `bad_nodes` exclusion list.
     replica_node_ids: Vec<u64>,
@@ -1340,13 +1340,13 @@ impl Drop for WorkerRemovalGuard {
     }
 }
 
-/// F192: drainer task for per-StreamClient failure reports. Holds a
+/// drainer task for per-StreamClient failure reports. Holds a
 /// `Weak<StreamClient>` so it exits naturally when the StreamClient is
 /// dropped (mpsc Receiver close also exits the loop, but Weak coverage
 /// makes shutdown deterministic when senders survive in a worker mid-
 /// drop). Each report is sent fire-and-forget against the current
 /// manager address; failures are logged at trace and otherwise
-/// ignored — F190's per-stream alloc route-around remains the primary
+/// ignored — the per-stream alloc route-around remains the primary
 /// defense.
 async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receiver<FailureReport>) {
     use futures::StreamExt;
@@ -1371,7 +1371,7 @@ async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receive
         let addr = sc.manager_addr().to_string();
         // Fire-and-forget: best-effort. The handler does not return
         // a meaningful response payload (CODE_OK CodeResp), and a
-        // dropped report is benign — F190's per-stream alloc route-
+        // dropped report is benign — the per-stream alloc route-
         // around handles the per-call need.
         // 5 s — fire-and-forget telemetry; bounded so a slow manager
         // doesn't keep this background task alive past a coarse SLO.
@@ -1493,7 +1493,7 @@ async fn stream_worker_loop(
     pool: Rc<ConnPool>,
     bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
     failure_report_tx: mpsc::Sender<FailureReport>,
-    // F195: tunables snapshot — clone-of-Rc<StreamClientConfig> from
+    // tunables snapshot — clone-of-Rc<StreamClientConfig> from
     // the StreamClient, captured at spawn time. No env reads.
     config: Rc<StreamClientConfig>,
     removal_guard: WorkerRemovalGuard,
@@ -1610,7 +1610,7 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     let mut saw_not_found = false;
     let mut saw_locked_by_other = false;
     let mut err_msg: Option<String> = None;
-    // F190: index of the first replica that produced a hard error
+    // index of the first replica that produced a hard error
     // (rpc/decode/non-OK code/NotFound). LockedByOther is intentionally
     // NOT recorded — it's a control-plane fence event, not a node-health
     // signal. Resolved to a `node_id` after the loop via `replica_node_ids`.
@@ -1624,7 +1624,7 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                 break;
             }
             Ok(frame) => {
-                // F260 chaos root-cause (coco arch P1): NEVER decode an
+                // chaos root-cause (coco arch P1): NEVER decode an
                 // ERROR frame's payload as AppendResp — error payloads are
                 // [status_code][message], and StatusCode::Unavailable (5)
                 // collides with CODE_LOCKED_BY_OTHER (5), so a generic
@@ -1690,14 +1690,14 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     }
 
     if saw_not_found {
-        // F190: the writer's tail cache is stale (the extent has been
+        // the writer's tail cache is stale (the extent has been
         // moved/sealed/reclaimed on this replica). The replica itself
         // may still be healthy, but allocating around it for one TTL
         // window is harmless and routes around persistent inconsistency.
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
                 state.mark_bad_node(nid);
-                // F192: NotFound is stale-cache, not a node-health
+                // NotFound is stale-cache, not a node-health
                 // signal — do NOT report it. The manager's quorum
                 // would otherwise misclassify it as a real failure.
             }
@@ -1710,11 +1710,11 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     }
 
     if let Some(err) = err_msg {
-        // F190: real per-replica failure (rpc/decode/non-OK code) — mark
+        // real per-replica failure (rpc/decode/non-OK code) — mark
         // the node so the next alloc skips it.
-        // F192: same failure pushes a manager-side report so the
+        // same failure pushes a manager-side report so the
         // global view catches up to the per-stream truth without
-        // waiting for the next `node_health_loop` df tick (F222: 2 s;
+        // waiting for the next `node_health_loop` df tick (2 s;
         // was the 10 s `disk_status_update_loop`).
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
@@ -1751,7 +1751,7 @@ async fn launch_append(
     payload_parts: Vec<Bytes>,
     owner_epoch: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
-    // F195 + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
+    // + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
     // the worker loop from its config snapshot; the actual deadline is
     // derived per append from the payload size (`for_len`) so a 4 KiB
     // WAL record and a 256 MiB SST upload each get a size-appropriate bound.
@@ -1790,12 +1790,12 @@ async fn launch_append(
     let header_commit = offset; // Option A: lease-time cursor.
 
     let extent_id = tail.extent.extent_id;
-    // F190: node_ids parallel to replica_addrs, captured here so the
+    // node_ids parallel to replica_addrs, captured here so the
     // future moves a Vec<u64> rather than borrowing tail across await.
     let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
     let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, owner_epoch);
 
-    // F260 — chained replication for large appends: ONE wire copy to
+    // chained replication for large appends: ONE wire copy to
     // replica[0], which forwards down the chain (extent_node.rs
     // MSG_APPEND_CHAIN). The single ack means EVERY hop wrote (the tail
     // acks first, aggregated hop by hop) — all-replica-ACK semantics
@@ -1855,7 +1855,7 @@ async fn launch_append(
         return;
     }
 
-    // Fire send_vectored to each replica IN PARALLEL (F099-B). Each
+    // Fire send_vectored to each replica IN PARALLEL. Each
     // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
     // replica TCP byte order is still determined by the order this
     // worker's submits land on each replica's submit_tx — and since
@@ -1886,7 +1886,7 @@ async fn launch_append(
     let receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
         join_all(send_futs).await;
 
-    // F121: bound each replica's recv. A half-open socket whose SubmitMsg
+    // bound each replica's recv. A half-open socket whose SubmitMsg
     // landed in the writer_task before RpcClient.closed flipped will
     // otherwise hang join_all forever (the response can never arrive — peer
     // is dead). Translating Elapsed into a regular `replica N rpc error:
@@ -1898,7 +1898,7 @@ async fn launch_append(
     // 4 KiB WAL appends, fired 788× on the live cluster against 256 MiB SST
     // flush appends that every replica was durably completing, and each
     // spurious timeout rolled + leaked a ~255 MB extent (47× disk
-    // amplification, total write outage). Boundedness (the F121 dead-replica
+    // amplification, total write outage). Boundedness (the dead-replica
     // requirement) is preserved by IO_TIMEOUT_CAP.
     let timeout = append_deadline.for_len(size);
     let fut = async move {
@@ -1956,9 +1956,9 @@ pub struct StreamClient {
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
     pool: Rc<ConnPool>,
-    /// Node-id → (address, shard_ports) map (refreshed on miss). F099-M:
+    /// Node-id → (address, shard_ports) map (refreshed on miss).
     /// `shard_ports` routes hot-path RPCs by
-    /// `autumn_rpc::shard_for_extent(extent_id, K)` (F-EN-SHARD-HASH; was
+    /// `autumn_rpc::shard_for_extent(extent_id, K)` (the canonical hash; was
     /// `extent_id % K`). Empty `shard_ports` means legacy single-thread EN.
     nodes_cache: DashMap<u64, (String, Vec<u16>)>,
     /// Cached ExtentInfo for read path.
@@ -1972,7 +1972,7 @@ pub struct StreamClient {
     /// to the same stream (per-stream init lock).  After the first init,
     /// subsequent callers observe `*guard == true` and skip.
     stream_init_locks: RefCell<HashMap<u64, Rc<futures::lock::Mutex<bool>>>>,
-    /// F190: per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// per-stream "recently failed" node ids (`node_id → expires_at`).
     /// Shared between the per-stream worker (writes on `apply_completion`
     /// Err) and the public-API `alloc_new_extent_once` (reads + prunes
     /// before each alloc). Persists across worker respawn — a node that
@@ -1980,34 +1980,34 @@ pub struct StreamClient {
     /// respawn happens within the TTL window. Pruned lazily on snapshot;
     /// no background sweeper.
     stream_bad_nodes: RefCell<HashMap<u64, Rc<RefCell<HashMap<u64, Instant>>>>>,
-    /// F192: fire-and-forget reporter for `MSG_REPORT_DISK_FAILURE`.
+    /// fire-and-forget reporter for `MSG_REPORT_DISK_FAILURE`.
     /// Worker (`apply_completion` Err path) pushes here via `try_send`
     /// (drop on full — pure best-effort). The drainer task (spawned in
     /// `construct`) holds the `Receiver`, reads each report, builds a
     /// `ReportDiskFailureReq` with the current `reporter_part_id`, and
     /// sends to the manager. The channel is bounded so a misbehaving
-    /// peer can't OOM us; F190's per-stream alloc route-around remains
+    /// peer can't OOM us; the per-stream alloc route-around remains
     /// the primary defense, so dropped reports don't hurt correctness.
     failure_report_tx: mpsc::Sender<FailureReport>,
-    /// F192: identifier the manager dedups by inside its quorum
+    /// identifier the manager dedups by inside its quorum
     /// debounce window. Each `PartitionData` sets this to its own
     /// `part_id` after `StreamClient::new_with_owner_epoch`. Default 0
     /// means "no reporter id configured" — drainer skips sending to
     /// avoid polluting the manager's quorum count with a sentinel.
     reporter_part_id: Cell<u64>,
-    /// F195: stream tunables. Defaults match pre-F195 env defaults.
+    /// stream tunables. Defaults match the legacy env defaults.
     /// Cloned into per-stream workers at spawn time (`Rc` keeps the
     /// clone cheap).
     config: Rc<StreamClientConfig>,
     append_metrics: StreamAppendMetrics,
-    /// F276: lazily-refreshed snapshot of manager-`Suspected` node ids. The
+    /// lazily-refreshed snapshot of manager-`Suspected` node ids. The
     /// READ path consults it to route around a flaky node proactively (no
     /// per-read RPC timeout) and to reconstruct EC shards from parity instead
     /// of reading a suspected shard. Soft hint only — see `SuspectedCache`.
     suspected: Rc<RefCell<SuspectedCache>>,
 }
 
-/// F192: payload of one failure-observation event passed from a
+/// payload of one failure-observation event passed from a
 /// per-stream worker to the per-StreamClient drainer task.
 #[derive(Clone, Copy, Debug)]
 struct FailureReport {
@@ -2015,7 +2015,7 @@ struct FailureReport {
     extent_id: u64,
 }
 
-/// F276: client-side snapshot of the manager's `Suspected` node set, consumed
+/// client-side snapshot of the manager's `Suspected` node set, consumed
 /// by the READ path. Refreshed lazily + NON-BLOCKING off the read path
 /// (`maybe_refresh_suspected`): the read never waits on a manager RTT, it just
 /// uses the latest snapshot (stale by at most `SUSPECTED_REFRESH_TTL`). This is
@@ -2029,7 +2029,7 @@ struct SuspectedCache {
     refreshing: bool,
 }
 
-/// F276: how stale the Suspected snapshot may get before the read path kicks
+/// how stale the Suspected snapshot may get before the read path kicks
 /// off a background refresh. 2 s matches the manager's df probe cadence; the
 /// `Suspected` soft-timeout is ~10 s, so a 2 s-stale view is plenty fresh.
 const SUSPECTED_REFRESH_TTL: Duration = Duration::from_secs(2);
@@ -2046,7 +2046,7 @@ impl StreamClient {
         self.current_mgr.set(next);
     }
 
-    /// F267: one manager RPC with rotate-on-transport-failure. Every
+    /// one manager RPC with rotate-on-transport-failure. Every
     /// StreamClient manager call MUST route through this (or through
     /// `retry_manager_call`, which rotates itself) — a raw
     /// `pool.call_timeout(self.manager_addr(), ..)` pins every
@@ -2074,7 +2074,7 @@ impl StreamClient {
         }
     }
 
-    /// F267 companion: rotate away from a manager that ANSWERED but is
+    /// companion: rotate away from a manager that ANSWERED but is
     /// no longer the leader (alive-but-deposed after an HA failover) —
     /// the symmetric wedge to the dead-address case above.
     fn note_manager_code(&self, code: u8) {
@@ -2195,7 +2195,7 @@ impl StreamClient {
         .await
     }
 
-    /// F195: connect with explicit tunables.
+    /// connect with explicit tunables.
     pub async fn connect_with_config(
         manager_endpoint: &str,
         owner_key: String,
@@ -2284,7 +2284,7 @@ impl StreamClient {
         .await
     }
 
-    /// F195: as `new_with_owner_epoch` but with explicit tunables.
+    /// as `new_with_owner_epoch` but with explicit tunables.
     pub async fn new_with_owner_epoch_and_config(
         manager_endpoint: &str,
         owner_key: String,
@@ -2309,8 +2309,8 @@ impl StreamClient {
     }
 
     /// Private ctor: `Rc::new_cyclic` captures a weak self-ref for the
-    /// per-stream workers' removal guard and for the F192 failure-report
-    /// drainer task. F195: `config` carries the (pre-F195 env-default-
+    /// per-stream workers' removal guard and for the failure-report
+    /// drainer task. `config` carries the (env-default-
     /// equivalent) tunables; pass `StreamClientConfig::default()` to
     /// keep historical behavior.
     fn construct(
@@ -2323,8 +2323,8 @@ impl StreamClient {
         config: StreamClientConfig,
     ) -> Rc<Self> {
         let config = Rc::new(config);
-        // F192: bounded channel — drop reports on overflow rather than
-        // OOMing the writer. F190's per-stream alloc route-around is
+        // bounded channel — drop reports on overflow rather than
+        // OOMing the writer. The per-stream alloc route-around is
         // the primary defense; reports are pure advisory.
         let (failure_report_tx, failure_report_rx) = mpsc::channel::<FailureReport>(1024);
         let rc = Rc::new_cyclic(|weak| Self {
@@ -2346,17 +2346,17 @@ impl StreamClient {
             append_metrics: StreamAppendMetrics::default(),
             suspected: Rc::new(RefCell::new(SuspectedCache::default())),
         });
-        // F192: spawn the drainer task on the current compio runtime.
+        // spawn the drainer task on the current compio runtime.
         // The Weak<Self> exits the loop when StreamClient is dropped.
         let weak = Rc::downgrade(&rc);
         compio::runtime::spawn(failure_report_drain_loop(weak, failure_report_rx)).detach();
         rc
     }
 
-    /// F192: set the partition id that the manager-side quorum debounce
+    /// set the partition id that the manager-side quorum debounce
     /// dedups by. Each `PartitionData` calls this once after
-    /// `new_with_owner_epoch`. Leaving it at 0 disables the F192 send path
-    /// (the drainer skips events with reporter=0) — safe for tests and
+    /// `new_with_owner_epoch`. Leaving it at 0 disables the failure-report
+    /// send path (the drainer skips events with reporter=0) — safe for tests and
     /// for the rare server-level `StreamClient` that doesn't belong to
     /// a partition.
     pub fn set_reporter_part_id(&self, part_id: u64) {
@@ -2399,14 +2399,14 @@ impl StreamClient {
         Ok(())
     }
 
-    /// F276: cheap, synchronous "does the manager currently believe this node
+    /// cheap, synchronous "does the manager currently believe this node
     /// Suspected?" read off the cached snapshot. Same-thread `RefCell` borrow,
     /// no await, no alloc.
     fn is_node_suspected(&self, node_id: u64) -> bool {
         self.suspected.borrow().nodes.contains(&node_id)
     }
 
-    /// F276: kick a NON-BLOCKING refresh of the Suspected snapshot if it's
+    /// kick a NON-BLOCKING refresh of the Suspected snapshot if it's
     /// older than `SUSPECTED_REFRESH_TTL` and none is already in flight. The
     /// caller (read path) does NOT await this — it spawns a detached task that
     /// polls `MSG_LIST_NODE_STATES` and swaps the snapshot in. The current read
@@ -2421,7 +2421,7 @@ impl StreamClient {
     /// routes around it. We accept this over a synchronous first-refresh (which
     /// would put a manager RTT on the read's critical path) or idle background
     /// polling (the per-partition manager traffic we deliberately avoid). It
-    /// never regresses the pre-F276 reactive failover.
+    /// never regresses the reactive failover.
     fn maybe_refresh_suspected(&self) {
         {
             let c = self.suspected.borrow();
@@ -2452,7 +2452,7 @@ impl StreamClient {
         .detach();
     }
 
-    /// F276: one `MSG_LIST_NODE_STATES` poll → the set of node ids the manager
+    /// one `MSG_LIST_NODE_STATES` poll → the set of node ids the manager
     /// currently marks `Suspected`. Rotates managers on transport / NotLeader
     /// failure like every other StreamClient manager call.
     async fn fetch_suspected_nodes(&self) -> Result<HashSet<u64>> {
@@ -2480,7 +2480,7 @@ impl StreamClient {
                 .get(node_id)
                 .ok_or_else(|| anyhow!("node {} missing", node_id))?;
             let (addr, shard_ports) = entry.value();
-            // F099-M: route this extent to the owning shard port.
+            // route this extent to the owning shard port.
             addrs.push(crate::conn_pool::shard_addr_for_extent(
                 addr,
                 shard_ports,
@@ -2528,11 +2528,11 @@ impl StreamClient {
             .insert(stream_id, tx.clone());
         let pool = self.pool.clone();
         let bad_nodes = self.stream_bad_nodes_handle(stream_id);
-        // F192: clone the failure-report sender into the worker so
+        // clone the failure-report sender into the worker so
         // `apply_completion` Err can fire reports without an extra
         // hop through the StreamClient.
         let failure_report_tx = self.failure_report_tx.clone();
-        // F195: hand the worker its tunables. `Rc<StreamClientConfig>`
+        // hand the worker its tunables. `Rc<StreamClientConfig>`
         // clone is O(1) ref-count bump.
         let config = self.config.clone();
         let guard = WorkerRemovalGuard {
@@ -2555,7 +2555,7 @@ impl StreamClient {
         tx
     }
 
-    /// F190: get or create the per-stream `bad_nodes` Rc handle.
+    /// get or create the per-stream `bad_nodes` Rc handle.
     /// Persisted across worker respawn so a node that just failed stays
     /// excluded for one TTL window even if the worker briefly exits.
     fn stream_bad_nodes_handle(&self, stream_id: u64) -> Rc<RefCell<HashMap<u64, Instant>>> {
@@ -2569,7 +2569,7 @@ impl StreamClient {
         rc
     }
 
-    /// F190: snapshot of currently-active (non-expired) bad-node ids for
+    /// snapshot of currently-active (non-expired) bad-node ids for
     /// `stream_id`. Lazily prunes expired entries during the read so the
     /// map can never grow without bound. Returns empty Vec if no entry
     /// exists (which is also the legacy / cold-start behaviour).
@@ -2653,7 +2653,7 @@ impl StreamClient {
         })
     }
 
-    /// F190: chained `replicates ++ parity` node ids — same index order as
+    /// chained `replicates ++ parity` node ids — same index order as
     /// `replica_addrs_from_cache`. Used to populate `StreamTail.replica_node_ids`.
     fn replica_node_ids_for(ex: &ExtentInfo) -> Vec<u64> {
         ex.replicates
@@ -2695,7 +2695,7 @@ impl StreamClient {
         seal_commit: Option<u64>,
         seal_extent_id: u64,
     ) -> Result<(StreamInfo, ExtentInfo)> {
-        // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
+        // snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
         // this set and only blocks allocation if doing so would empty
         // the pool — see `select_nodes` + `handle_stream_alloc_extent`.
@@ -2876,7 +2876,7 @@ impl StreamClient {
     }
 
     /// WAL self-heal A4: seal-and-roll the current OPEN tail of `stream_id` via
-    /// the F227 manager probe (seal-over-reachable) and alloc a fresh tail.
+    /// the manager probe (seal-over-reachable) and alloc a fresh tail.
     ///
     /// Used by recovery when replay finds the OPEN tail corrupt: an open extent
     /// has no `avali` to clear, so it can't be isolated in place. Sealing freezes
@@ -3188,7 +3188,7 @@ impl StreamClient {
             (self.build_stream_tail(new_ext).await?, 0)
         } else {
             // Open tail. Determine its committed length to seed the worker
-            // cursor. F227: a failure here must NEVER seed 0 — pre-F227
+            // cursor. A failure here must NEVER seed 0 — the earlier
             // `unwrap_or(0)` turned "can't determine the committed length (a
             // replica down)" into cursor=0, and the next append's
             // `header.commit=0` truncated EVERY replica to 0, destroying all
@@ -3250,10 +3250,10 @@ impl StreamClient {
     /// Query commit length from all replicas (min). Called on first append
     /// to an existing extent (commit==0) to avoid truncating pre-existing data.
     ///
-    /// F227: NO quorum. This is a WAS stream layer — the append path is
+    /// NO quorum. This is a WAS stream layer — the append path is
     /// all-replica-ACK (`apply_completion` acks only when every replica
     /// wrote the record), so the committed length must be derived from ALL
-    /// replicas. A subset `min` (the pre-F227 majority-quorum) can sit
+    /// replicas. A subset `min` (the former majority-quorum) can sit
     /// BELOW the acked length when it includes a short / catching-up
     /// replica (→ next append's `header.commit` truncates acked data on
     /// the up-to-date replicas → silent loss), or ABOVE it when it
@@ -3294,9 +3294,9 @@ impl StreamClient {
                 continue;
             };
             if resp.code != CODE_OK {
-                // F270: a CODE_LOCKED_BY_OTHER rejection means OUR epoch is
+                // a CODE_LOCKED_BY_OTHER rejection means OUR epoch is
                 // stale (admin fence-bump / new owner), NOT that the replica
-                // is unreachable. Pre-F270 this was folded into the generic
+                // is unreachable. This was previously folded into the generic
                 // "only N/M responded" error, so the caller could never tell
                 // a fenced probe from a dead replica — and a fence-bumped
                 // writer retried the same stale epoch forever (the seed=13/15
@@ -3309,13 +3309,13 @@ impl StreamClient {
             success += 1;
             min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
         }
-        // F227: require ALL replicas to respond — no quorum (see fn doc).
+        // require ALL replicas to respond — no quorum (see fn doc).
         if success < total {
             if locked > 0 {
                 // The "LockedByOther" substring is load-bearing: the PS's
                 // `is_locked_by_other` classifies on it and poisons the
                 // partition, whose region_sync reopen re-acquires a FRESH
-                // per-partition epoch (F267) — the self-heal for fence bumps.
+                // per-partition epoch — the self-heal for fence bumps.
                 return Err(anyhow!(
                     "commit_length on extent {}: only {}/{} replicas responded \
                      ({} rejected LockedByOther — stale owner epoch)",
@@ -3408,7 +3408,7 @@ impl StreamClient {
         Ok(if extent.sealed { 0 } else { end })
     }
 
-    /// F178 Phase 2: query a single replica for `MSG_SYNCED_LENGTH(extent_id)`.
+    /// Phase 2: query a single replica for `MSG_SYNCED_LENGTH(extent_id)`.
     /// Returns `Ok(Some(synced))` on a success response, `Ok(None)` if the
     /// extent is unknown to that node (CODE_NOT_FOUND or any other non-OK
     /// code), and `Err` only on transport / decode failure.
@@ -3435,14 +3435,14 @@ impl StreamClient {
         }
     }
 
-    /// F178 Phase 2: wait until the per-extent fsync coalescer on **all**
+    /// Phase 2: wait until the per-extent fsync coalescer on **all**
     /// of `extent_id`'s replicas has flushed bytes covering `min_offset`.
     ///
-    /// F227: NO quorum. The append path is all-replica-ACK, so a VP at
+    /// NO quorum. The append path is all-replica-ACK, so a VP at
     /// `min_offset` is durable on every replica the moment its append
     /// acked; the flush barrier must therefore require ALL replicas to
     /// have synced past `min_offset` before the SST that names the VP is
-    /// checkpointed — a fsync-quorum (the pre-F227 `⌊N/2⌋+1`) could
+    /// checkpointed — a fsync-quorum (the former `⌊N/2⌋+1`) could
     /// publish an SST whose VP bytes are durable on only a subset, so a
     /// later min-commit truncation on the un-synced replica could orphan
     /// the VP. On a healthy cluster this is satisfied immediately (all-ACK
@@ -3463,7 +3463,7 @@ impl StreamClient {
         if min_offset == 0 {
             return Ok(());
         }
-        // F195: F178 flush-barrier knobs come from StreamClientConfig.
+        // flush-barrier knobs come from StreamClientConfig.
         // No env reads.
         let poll_ms: u64 = self.config.synced_poll.as_millis() as u64;
         let timeout_ms: u64 = self.config.synced_timeout.as_millis() as u64;
@@ -3476,7 +3476,7 @@ impl StreamClient {
                 "await_extent_synced_to: no replica addrs for extent {extent_id}"
             ));
         }
-        // F227: require ALL replicas synced — no quorum (see fn doc).
+        // require ALL replicas synced — no quorum (see fn doc).
         let required = total;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -3501,7 +3501,7 @@ impl StreamClient {
         }
     }
 
-    /// F178 Phase 2: helper for flush durability — convenience wrapper
+    /// Phase 2: helper for flush durability — convenience wrapper
     /// that delegates to `await_extent_synced_to` for a single extent.
     /// Renamed from the original plan's `await_log_synced_to(stream_id, _)`
     /// because `(extent_id, offset)` is the unit the partition layer
@@ -3512,7 +3512,7 @@ impl StreamClient {
         self.await_extent_synced_to(extent_id, offset).await
     }
 
-    // F150 Phase B retired the public `sync_stream_tail` API. The F142 fsync
+    // Phase B retired the public `sync_stream_tail` API. The fsync
     // barrier is now folded into `start_write_batch`'s rotation-trigger
     // must_sync=true promotion in autumn-partition-server.
 
@@ -3625,7 +3625,7 @@ impl StreamClient {
     /// `read_committed_bytes_from_extent` and `read_committed_from_replica`
     /// so their committed-end semantics can never drift. Sealed →
     /// `sealed_length`, first guarding a stale VP whose offset lies past the
-    /// seal (the F204 `stale_vp_offset_past_sealed_length` wire-contract
+    /// seal (the `stale_vp_offset_past_sealed_length` wire-contract
     /// sentinel); open tail → one min-replica `commit_length` probe per call
     /// (replay-only cadence, one probe per chunk — not a hot path).
     async fn committed_end_for_read(
@@ -3689,7 +3689,7 @@ impl StreamClient {
         unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
     }
 
-    /// F261: replay-oriented chunked read — like `read_bytes_from_extent`,
+    /// replay-oriented chunked read — like `read_bytes_from_extent`,
     /// but the requested window is CLAMPED to the extent's COMMITTED end
     /// before the read is issued: `sealed_length` for sealed extents, the
     /// min-replica commit probe for the open tail. An EN's data file can
@@ -3848,7 +3848,7 @@ impl StreamClient {
         Ok(())
     }
 
-    /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
+    /// UCX / TCP recv-side copy-elimination fast path: recv the
     /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_BULK +
     /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio
     /// owned read (one kernel copy, no app-level copy). Returns `Some((pb, len))`
@@ -3864,17 +3864,17 @@ impl StreamClient {
         offset: u64,
         length: u64,
     ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
-        // F219: both transports use this fast path now. UCX recvs the value into
+        // both transports use this fast path now. UCX recvs the value into
         // a *registered* buffer (RDMA, no off-wire copy); TCP recvs it into a
         // pooled buffer via a compio owned read in the rpc read_loop (no
         // FrameDecoder accumulation copy — only the unavoidable kernel copy).
         // The EN `MSG_READ_BYTES_BULK` response is value-separable + pooled on both
         // transports, so the EN send side also drops its per-op alloc/zeroing +
-        // encode copy (subsumes F216-F).
+        // encode copy.
         if length == 0 {
             return Ok(None);
         }
-        // F276: this bulk value fast path is a READ path too — refresh the
+        // this bulk value fast path is a READ path too — refresh the
         // Suspected snapshot (TTL-gated, non-blocking) so it routes around a
         // flaky node like the copy path, not just the avali-isolated ones
         // (coco P2: without this the hot GET still hit slot 0 first and paid
@@ -3889,14 +3889,14 @@ impl StreamClient {
             return Ok(None);
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        // WAL self-heal A1 + F276: serve only avali-eligible slots, healthy
+        // WAL self-heal A1: serve only avali-eligible slots, healthy
         // (non-Suspected) replicas FIRST, rotated start — exactly the copy
         // path's `replicated_read_order`. avali isolation: a bit-rotted-but-
         // isolated replica returns CODE_OK with corrupt bytes (no per-VP CRC on
         // this path), so it must never be read (I2 invariant; e2e 2026-06-14).
         // Suspected-to-back: a flaky node is tried last so the common case
         // doesn't pay its timeout. With an empty snapshot this is the prior
-        // eligible-slot order (plus F258 rotation, matching the copy path).
+        // eligible-slot order (plus start-replica rotation, matching the copy path).
         let order = {
             let c = self.suspected.borrow();
             replicated_read_order(&ex, offset, &c.nodes)
@@ -3943,7 +3943,7 @@ impl StreamClient {
                 }
                 Err(e) => {
                     // transport/timeout error → evict + try next replica.
-                    // Classify like the client-side direct read (F259): a
+                    // Classify like the client-side direct read: a
                     // TIMEOUT means the op silently ate the full 3s deadline
                     // (2026-07-03 UCX dead-ep stalls) — warn; fast transport
                     // errors (connect refused mid-failover) stay debug.
@@ -4003,12 +4003,12 @@ impl StreamClient {
         length: u64,
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u64)> {
-        // F276: refresh the Suspected snapshot in the background (TTL-gated,
+        // refresh the Suspected snapshot in the background (TTL-gated,
         // non-blocking) so the replica-routing + EC-reconstruct decisions
         // below see a ~2 s-fresh view of which nodes are flaky.
         self.maybe_refresh_suspected();
-        // F210-H1: mirror the F204 `StaleVpOffset` sentinel for the
-        // replicated path. Pre-F210-H1 only `ec_slice_decoded` produced
+        // mirror the `StaleVpOffset` sentinel for the
+        // replicated path. Previously only `ec_slice_decoded` produced
         // it; a VP read on a sealed replicated extent whose offset was
         // past `sealed_length` was silently short-circuited by the
         // server (`handle_read_bytes` returns `code=OK end=total_len
@@ -4079,19 +4079,19 @@ impl StreamClient {
         Ok((data, last_end))
     }
 
-    /// F259: descriptor for a CLIENT-side direct extent read — the cached
+    /// descriptor for a CLIENT-side direct extent read — the cached
     /// `(eversion, replica addresses)` for an extent, fetched/refreshed via
     /// the manager on cache miss. The PS embeds these in a MSG_GET_REDIRECT
     /// response so the client can read value bytes straight from an EN
     /// without a manager round-trip of its own.
     pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<(u64, Vec<String>)> {
-        // F276: the external client picks its OWN hash-rotated start over the
+        // the external client picks its OWN hash-rotated start over the
         // returned addrs (crates/client/src/lib.rs), so reordering can't route
         // around a flaky node — a Suspected address must be EXCLUDED outright
         // (coco P2). Refresh the snapshot here too (this is a read path).
         self.maybe_refresh_suspected();
         let ex = self.fetch_extent_info(extent_id).await?;
-        // coco P1 (F259): an EC-converted extent holds RS shards, not the
+        // coco P1: an EC-converted extent holds RS shards, not the
         // full payload — a single-EN raw read would hand the client shard
         // bytes as if they were the value (data corruption). EC reads must
         // go through ec_subrange_read; refuse the descriptor so the PS
@@ -4102,7 +4102,7 @@ impl StreamClient {
             ));
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        // WAL self-heal A1 + F276: hand the client only avali-ELIGIBLE replicas
+        // WAL self-heal A1: hand the client only avali-ELIGIBLE replicas
         // (an isolated bit-rotted slot must not be a client-direct read target
         // — same I2 invariant as the bulk + copy paths, no per-VP CRC here) AND
         // drop manager-Suspected replicas (the client hash-rotates, so excluding
@@ -4126,19 +4126,19 @@ impl StreamClient {
     /// the remaining addresses just burns 3s timeouts each. Top-level
     /// `read_bytes_from_extent` catches this and refetches.
     ///
-    /// F258 (a) — rotated start replica. Pre-F258 every read walked
+    /// (a) — rotated start replica. Previously every read walked
     /// `addrs` from index 0, so ALL replicated read IO landed on
     /// replica[0] while the other two replicas' disks + NICs idled.
     /// The start index is rotated by `(extent_id, offset)` hash — so
     /// consecutive chunks of the chunked large-read path naturally
     /// stripe across replicas. This applies to SEALED extents (immutable;
     /// all-replica-ACK ⇒ every committed byte is on every replica) AND —
-    /// F-READ-OPENTAIL-ROTATE — to OPEN tails (their committed prefix is
+    /// to OPEN tails (their committed prefix is
     /// likewise on every replica, so a committed VP read starts anywhere;
     /// was replica[0]-first, which piled hot-tail reads on the append
     /// leader). Appends are unaffected (they go through `launch_append`).
     ///
-    /// F258 (b) — optional hedged read (off by default;
+    /// (b) — optional hedged read (off by default;
     /// `set_read_hedge_ms`). When enabled and the rotated-first replica
     /// hasn't answered within the hedge window, the SECOND replica is
     /// raced concurrently and the first Ok wins — classic "Tail at
@@ -4155,13 +4155,13 @@ impl StreamClient {
         let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
 
         // A1 (self-heal I2): avali-isolated slots are dropped from the read set
-        // on a sealed replicated extent. F276: among the eligible slots, the
+        // on a sealed replicated extent. Among the eligible slots, the
         // ones whose node the manager believes Suspected are moved to the BACK
         // so a flaky replica never costs a per-read RPC timeout before failover
         // — soft hint, they remain a last-resort fallback (suspected != dead,
         // and every committed byte is on every replica). `replicated_read_order`
         // folds all three: rotated start, avali eligibility, suspected-to-back.
-        // With an empty Suspected snapshot the order is the pre-F276 rotated
+        // With an empty Suspected snapshot the order is the plain rotated
         // walk, so the hot path is unchanged.
         let eligible = eligible_replica_slots(ex);
         let filtered = eligible.len() < n;
@@ -4183,7 +4183,7 @@ impl StreamClient {
 
         let mut from = 0usize;
         // Hedge the two LEADING (healthy-first) slots. Disabled when a slot is
-        // avali-isolated (filtered), same as pre-F276.
+        // avali-isolated (filtered), same as the unfiltered path.
         if !filtered && read_hedge_ms() > 0 && ex.sealed && order.len() > 1 {
             match self
                 .read_hedged_pair(&addrs, order[0], order[1], ex, offset, length)
@@ -4218,7 +4218,7 @@ impl StreamClient {
         Err(last_err)
     }
 
-    /// F258 (b): hedged read over the first two rotated replicas. Fires the
+    /// (b): hedged read over the first two rotated replicas. Fires the
     /// read to `addrs[start]`; if no answer within `read_hedge_ms()`, races
     /// a second read to `addrs[start+1]` and returns whichever succeeds
     /// first.
@@ -4243,7 +4243,7 @@ impl StreamClient {
     ) -> Result<(Vec<u8>, u64)> {
         use futures::future::{select, Either};
         let n = addrs.len();
-        // F276: `s0`/`s1` are the two LEADING slots of the suspected-aware read
+        // `s0`/`s1` are the two LEADING slots of the suspected-aware read
         // order (healthy-first), not necessarily `start`/`start+1`.
         let a0 = addrs[s0 % n].clone();
         let a1 = addrs[s1 % n].clone();
@@ -4318,7 +4318,7 @@ impl StreamClient {
     /// safe contiguous-prefix end). For open extents only — sealed
     /// extents should read `ExtentInfo.sealed_length` directly.
     ///
-    /// F156: requires majority quorum to respond — see `current_commit`
+    /// requires majority quorum to respond — see `current_commit`
     /// for the rationale. Without a quorum check, the protocol could
     /// commit at a position only the lone surviving responder held,
     /// permanently losing data if that responder later died before
@@ -4332,7 +4332,7 @@ impl StreamClient {
     ///   1. A reader StreamClient created with a NEW owner_key
     ///      (higher owner_epoch) silently fences the original writer's
     ///      next append → CODE_LOCKED_BY_OTHER. Reproducible via the
-    ///      f029 integration test: PS appends meta_stream 3× with
+    ///      integration test: PS appends meta_stream 3× with
     ///      owner_epoch=1; test creates external StreamClient
     ///      (owner_epoch=2) for read-only `read_last_extent_data`; that
     ///      call falls through to this helper which bumps EN's
@@ -4400,7 +4400,7 @@ impl StreamClient {
     /// `CODE_EVERSION_MISMATCH`, surfaced here as `EversionStale` so
     /// the top-level `read_bytes_from_extent` can refetch and retry.
     ///
-    /// F119-C: there is no longer a "pass 0 to skip" sentinel — the
+    /// there is no longer a "pass 0 to skip" sentinel — the
     /// extent_node defaults `entry.eversion` to 1 on alloc (matches
     /// the manager's `MgrExtentInfo { eversion: 1 }` default), so any
     /// `eversion=0` is by definition stale (or never-cached). Always
@@ -4584,7 +4584,7 @@ impl StreamClient {
             shard_plan.push((shard_idx, sh_off, sh_len));
         }
 
-        // F276: a data shard whose node the manager believes Suspected is
+        // a data shard whose node the manager believes Suspected is
         // reconstructed from parity IMMEDIATELY — its direct shard read is NOT
         // issued, so the `join_all` below never blocks on a flaky node's full
         // RPC timeout before reconstruction starts (the user's "EC → 直接重新
@@ -4593,7 +4593,7 @@ impl StreamClient {
         // (`ec_reconstruct_shard_subrange` races first-K-wins), so a mistaken
         // Suspected mark only costs a little extra parity traffic, never
         // correctness. With an empty snapshot every shard is read directly =
-        // pre-F276 behavior.
+        // the unfiltered behavior.
         let node_ids = replica_node_ids(ex);
         let mut plan_results: Vec<Option<Vec<u8>>> = vec![None; shard_plan.len()];
         let mut needs_reconstruct: Vec<usize> = Vec::new();
@@ -4620,12 +4620,13 @@ impl StreamClient {
             .collect();
         let results = futures::future::join_all(read_futs).await;
 
-        // F200: failed (or F276 suspected-skipped) entries get reconstructed
+        // failed (or suspected-skipped) entries get reconstructed
         // via sub-range RS in the pass below — DO NOT fall back to
         // `ec_read_full_and_slice` (which would read 4 × full-shard payloads to
         // decode the whole extent just to slice out the requested sub-range).
         // The amplification triggered macOS-side df-probe timeouts under heavy
-        // GC fanout, flapping disks offline (see F200 entry in feature_list.md).
+        // GC fanout, flapping disks offline (see the sub-range-reconstruct entry
+        // in feature_list.md).
         let mut last_end: u64 = 0;
         for (k, r) in results.into_iter().enumerate() {
             let i = to_read[k];
@@ -4696,7 +4697,7 @@ impl StreamClient {
         Ok((data, last_end))
     }
 
-    /// F200: reconstruct one data shard's sub-range `[sh_off, sh_off + sh_len)`
+    /// reconstruct one data shard's sub-range `[sh_off, sh_off + sh_len)`
     /// from K healthy peers (the other data shards + a parity shard).
     /// Replaces the old `ec_read_full_and_slice` fall-back for the case where
     /// a single per-shard sub-range read fails inside `ec_subrange_read`.
@@ -4709,7 +4710,7 @@ impl StreamClient {
     /// on K healthy shards — no full-extent decode needed.
     ///
     /// Bytes-on-the-wire: `K × sh_len` (e.g., 3 × 64 MiB = 192 MiB for the
-    /// user's GC chunk read of a 3+1 extent), vs the pre-F200 fall-back
+    /// user's GC chunk read of a 3+1 extent), vs the earlier fall-back
     /// of `(K + M) × shard_size(sealed_length, K)` (e.g., 4 × 933 MiB ≈
     /// 3.7 GiB for the same chunk on a 2.8 GiB extent). 20× reduction.
     ///
@@ -4864,9 +4865,9 @@ impl StreamClient {
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u64)> {
         let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
-        // F204: pass extent_id + sealed_length so `ec_slice_decoded`
+        // pass extent_id + sealed_length so `ec_slice_decoded`
         // can build a structured `StaleVpOffset` sentinel on
-        // out-of-bounds. Pre-F204 we wrapped a stringy
+        // out-of-bounds. Previously we wrapped a stringy
         // `anyhow!("ec_read_full_and_slice: ...")` here — that erased
         // the downcast surface the PS layer relies on. Now the
         // sentinel surfaces unmodified; the PS `map_storage_error`
@@ -4982,7 +4983,7 @@ impl StreamClient {
             )));
         }
 
-        // F117: RS decode of a full extent (up to 128 MiB) is CPU-bound;
+        // RS decode of a full extent (up to 128 MiB) is CPU-bound;
         // run it on the blocking pool so the caller's compio thread (P-log
         // / P-sst / extent-node read fanout) stays responsive while the
         // GF(256) math runs. `sealed_length` is the authoritative payload
@@ -5319,8 +5320,8 @@ mod pipeline_tests {
 }
 
 #[cfg(test)]
-mod f190_bad_nodes_tests {
-    //! F190: per-stream bad_nodes exclusion.
+mod bad_nodes_tests {
+    //! per-stream bad_nodes exclusion.
     //!
     //! Covers (a) insert + immediate snapshot returns the node id,
     //! (b) refresh-on-insert preserves only the latest expires_at, and
@@ -5428,8 +5429,8 @@ mod selfheal_avali_filter_tests {
 }
 
 #[cfg(test)]
-mod f276_suspected_read_tests {
-    //! F276: the READ path routes around manager-`Suspected` nodes. Replicated
+mod suspected_read_tests {
+    //! the READ path routes around manager-`Suspected` nodes. Replicated
     //! reads deprioritize suspected slots to the BACK (healthy-first, never
     //! dropped); EC reads reconstruct a suspected data shard from parity
     //! instead of issuing a doomed direct read. These cover the pure decision
@@ -5460,7 +5461,7 @@ mod f276_suspected_read_tests {
     #[test]
     fn empty_suspected_preserves_rotated_order() {
         // Common case: an empty Suspected snapshot must reproduce the pure
-        // rotated order (no Suspected reshuffle). F-READ-OPENTAIL-ROTATE: OPEN
+        // rotated order (no Suspected reshuffle). OPEN
         // extents now rotate too, so the order is the contiguous rotation from
         // `rotated_replica_start`, NOT a hardcoded [0,1,2].
         let ex = ext(vec![10, 20, 30], vec![], false, 0);
@@ -5473,7 +5474,7 @@ mod f276_suspected_read_tests {
     #[test]
     fn suspected_slot_moves_to_back_preserving_order() {
         // node 20 (slot 1) suspected → tried last; the healthy slots keep their
-        // rotated order (F-READ-OPENTAIL-ROTATE: open extent rotates, so derive
+        // rotated order (open extent rotates, so derive
         // the expectation from `rotated_replica_start` rather than assuming 0).
         let ex = ext(vec![10, 20, 30], vec![], false, 0);
         let s: HashSet<u64> = [20].into_iter().collect();
@@ -5498,7 +5499,7 @@ mod f276_suspected_read_tests {
 
     #[test]
     fn open_tail_read_rotates_across_replicas() {
-        // F-READ-OPENTAIL-ROTATE: an OPEN extent's reads must spread the start
+        // an OPEN extent's reads must spread the start
         // replica across offsets (was pinned to replica[0], concentrating all
         // hot-tail reads on the append leader). Vary the offset and assert every
         // replica gets picked as the start at least once.
@@ -5548,7 +5549,7 @@ mod f276_suspected_read_tests {
     #[test]
     fn healthy_eligible_respects_avali_isolation() {
         // Sealed, slot 1 avali bit clear → excluded by avali; node 10 (slot 0)
-        // Suspected → excluded by F276; only slot 2 left.
+        // Suspected → excluded; only slot 2 left.
         let ex = ext(vec![10, 20, 30], vec![], true, 0b101);
         let s: HashSet<u64> = [10].into_iter().collect();
         assert_eq!(healthy_eligible_slots(&ex, &s), vec![2]);
@@ -5556,7 +5557,7 @@ mod f276_suspected_read_tests {
 
     #[test]
     fn suspected_rotated_first_slot_tried_last_on_sealed() {
-        // Sealed extent, all avali set: whichever slot the F258 rotation would
+        // Sealed extent, all avali set: whichever slot the rotation would
         // start on, if its node is Suspected it must end up LAST.
         let ex = ext(vec![10, 20, 30], vec![40], true, 0b1111);
         let start = rotated_replica_start(ex.extent_id, 0, 4);
@@ -5573,10 +5574,10 @@ mod f276_suspected_read_tests {
 }
 
 #[cfg(test)]
-mod f190_wire_compat_tests {
-    //! F190: backwards-compat smoke for `StreamAllocExtentReq`. An empty
+mod wire_compat_tests {
+    //! backwards-compat smoke for `StreamAllocExtentReq`. An empty
     //! `exclude_node_ids` field must round-trip through rkyv as a
-    //! zero-length Vec — equivalent semantics to the pre-F190 wire (no
+    //! zero-length Vec — equivalent semantics to the earlier wire (no
     //! filter applied on the manager side via the fall-back-on-empty
     //! branch in `select_nodes`).
     use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, StreamAllocExtentReq};
@@ -5628,7 +5629,7 @@ mod ec_slice_tests {
     use super::{ec_slice_decoded, StaleVpOffset};
 
     /// Test fixture: arbitrary extent_id + sealed_length context that
-    /// ec_slice_decoded threads through into the F204 sentinel on
+    /// ec_slice_decoded threads through into the StaleVpOffset sentinel on
     /// out-of-bounds. The happy-path tests pass arbitrary values
     /// because the data flow doesn't use them when offset is in range.
     const TEST_EXTENT: u64 = 42;
@@ -5660,7 +5661,7 @@ mod ec_slice_tests {
         let payload = vec![0u8; 45_479_123];
         let err = ec_slice_decoded(payload, 49_541_652, 14_456_954, 7, 45_479_123)
             .expect_err("offset past end must be rejected");
-        // F204: must be the structured sentinel, not just a stringy error.
+        // must be the structured sentinel, not just a stringy error.
         let stale = err
             .chain()
             .find_map(|c| c.downcast_ref::<StaleVpOffset>())
@@ -5704,7 +5705,7 @@ mod ec_slice_tests {
 
     #[test]
     fn slice_full_read_is_zero_copy() {
-        // F170 invariant: offset=0,length=0 returns the input Vec
+        // invariant: offset=0,length=0 returns the input Vec
         // by ownership transfer (no allocation). This test verifies
         // that the returned Vec's capacity matches the input — if a
         // memcpy slipped in, the new Vec would have shrunken capacity.
@@ -5719,7 +5720,7 @@ mod ec_slice_tests {
 }
 
 #[cfg(test)]
-mod f258_rotation_tests {
+mod rotation_tests {
     use super::rotated_replica_start;
 
     #[test]
@@ -5765,7 +5766,7 @@ mod f258_rotation_tests {
     }
 }
 
-/// F258: unwrap a hedged-read oneshot result. `Canceled` means the spawned
+/// unwrap a hedged-read oneshot result. `Canceled` means the spawned
 /// read task was dropped before sending (runtime teardown) — surfaced as a
 /// plain error so the failover loop continues.
 fn flatten_hedge(
@@ -5967,7 +5968,7 @@ mod merge_ec_replay_tests {
 /// 10 s of mathematically-futile retries per `alloc_new_extent`, ≈15 s per
 /// autumnfs write (45 s for a 3-key put). The fix: deterministic codes fail
 /// fast, and an owner-epoch fence carries the "LockedByOther" marker so the
-/// PS's F270 poison-and-reopen self-heal re-acquires a fresh epoch.
+/// PS's poison-and-reopen self-heal re-acquires a fresh epoch.
 #[cfg(test)]
 mod manager_retry_tests {
     use super::*;
@@ -6128,7 +6129,7 @@ mod manager_retry_tests {
     }
 
     /// BUG-MGR-RETRY-CLASS regression (coco P1): the TRANSIENT `alloc_extent`
-    /// preconditions — the F207 inflight "defer … until it completes" and the
+    /// preconditions — the inflight "defer … until it completes" and the
     /// verify-at-apply / etcd-CAS "retry with [a] fresh snapshot" — MUST be
     /// classified retryable, or a self-healable concurrency conflict (a
     /// concurrent split/recovery/EC) becomes a hard append/roll failure.
@@ -6233,7 +6234,7 @@ mod manager_retry_tests {
     }
 
     /// Transport-layer failures (no ManagerError in the chain) keep the
-    /// rotate-and-retry behavior — the F267 dead-manager escape.
+    /// rotate-and-retry behavior — the dead-manager escape.
     #[compio::test]
     async fn transport_errors_still_rotate_and_retry() {
         let sc = test_client(3);

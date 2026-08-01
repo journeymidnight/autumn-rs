@@ -103,7 +103,7 @@ impl TestConn {
         CommitLengthResp::decode(resp).expect("decode CommitLengthResp")
     }
 
-    /// F210-H3 Tier 2 fence-free probe. Use this instead of
+    /// Tier 2 fence-free probe. Use this instead of
     /// `commit_length(eid, 0)` when the test only wants to verify
     /// "extent exists + what's its current length" without
     /// claiming an owner lock.
@@ -195,7 +195,7 @@ impl TestConn {
         eversion: u64,
         payload: Vec<u8>,
     ) -> WriteShardResp {
-        // F211-D added `owner_epoch`; tests use 0 (the documented
+        // added `owner_epoch`; tests use 0 (the documented
         // "no fence requested" wire-compat sentinel).
         let req = WriteShardReq {
             extent_id,
@@ -225,7 +225,7 @@ impl TestConn {
             extent_id,
             sealed_length,
             eversion,
-            // F211-D: tests pass 0 (no-fence sentinel).
+            // tests pass 0 (no-fence sentinel).
             owner_epoch: 0,
         };
         let resp = self

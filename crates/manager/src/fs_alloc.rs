@@ -1,4 +1,4 @@
-//! F-FS-UNIFY M0 — crash-safe, multi-writer fuse-fs inode-number allocation.
+//! M0 — crash-safe, multi-writer fuse-fs inode-number allocation.
 //!
 //! Pre-M0 every allocator (each fuse mount) did a non-CAS read-modify-write
 //! on the fs KV superblock key `[0x04]next_inode`: two concurrent allocators
@@ -11,7 +11,7 @@
 //!
 //! Concurrency model: the CAS loop re-reads the counter and retries on
 //! conflict, so any number of concurrent `AllocInodes` grants receive
-//! disjoint `[base, base+count)` ranges; the F149 leader fence inside
+//! disjoint `[base, base+count)` ranges; the leader fence inside
 //! `txn_fenced` means a deposed leader's grant loses the txn instead of
 //! double-granting across a leader transition.
 //!
@@ -29,12 +29,12 @@ use crate::{AutumnManager, EtcdMirror};
 
 /// Etcd key holding the next unallocated fuse-fs inode number for the LEGACY
 /// single global counter (empty `volume`), big-endian u64. Same `autumn-rs/`
-/// namespace as `cluster_id` / `cluster_version`. F-KEY-NS SD-3 makes the
+/// namespace as `cluster_id` / `cluster_version`. SD-3 makes the
 /// counter PER-VOLUME (see `fs_next_inode_key`); this stays the empty-volume
 /// key so the pre-SD-3 wire (`volume = ""`) and existing tests are unchanged.
 pub(crate) const FS_NEXT_INODE_KEY: &str = "autumn-rs/fs/next_inode";
 
-/// F-KEY-NS SD-3: the etcd counter key for a fuse `volume` identity. `volume`
+/// SD-3: the etcd counter key for a fuse `volume` identity. `volume`
 /// is the canonicalized `fs/{tenant}/{volume}/` prefix (ends in `/`) the fuse
 /// mount sends in `AllocInodesReq.volume`, so the per-volume counter lives at
 /// `autumn-rs/fs/{tenant}/{volume}/next_inode` — each volume numbers its inodes
@@ -51,7 +51,7 @@ pub(crate) fn fs_next_inode_key(volume: &[u8]) -> Vec<u8> {
     k
 }
 
-/// F-KEY-NS SD-3 (review P2-4): validate `AllocInodesReq.volume` before it is
+/// SD-3 (review P2-4): validate `AllocInodesReq.volume` before it is
 /// concatenated into an etcd key (`fs_next_inode_key`). Empty = the global
 /// counter (the only shape the fuse layer sends today — see the client
 /// `alloc_inodes` note). A non-empty value must be the canonical
@@ -137,7 +137,7 @@ fn alloc_from_map(
 impl EtcdMirror {
     /// Leader-fenced CAS grant loop. Reads the counter, computes
     /// `base = max(cur, floor)`, and commits `base + count` back with a
-    /// txn that requires BOTH the F149 leader fence AND the counter still
+    /// txn that requires BOTH the leader fence AND the counter still
     /// holding the value we read (value-CAS; the counter is strictly
     /// monotonic so ABA is impossible). Conflict → re-read and retry.
     pub(crate) async fn alloc_fs_inodes_cas(
@@ -151,7 +151,7 @@ impl EtcdMirror {
                 // Linear backoff on CAS conflict (coco P3): each round some
                 // writer commits, so N conflicters finish in ≤ N rounds; the
                 // spread just de-synchronizes their re-reads under a mount
-                // storm. Bounded await (F228 1A: 3 ms × attempt ≤ 45 ms).
+                // storm. Bounded await (3 ms × attempt ≤ 45 ms).
                 compio::time::sleep(std::time::Duration::from_millis(3 * attempt as u64)).await;
             }
             let got = self
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn map_alloc_per_volume_isolation() {
-        // F-KEY-NS SD-3: two volumes number their inodes independently.
+        // SD-3: two volumes number their inodes independently.
         let map = RefCell::new(HashMap::new());
         let v1 = b"fs/t/v1/".as_slice();
         let v2 = b"fs/t/v2/".as_slice();

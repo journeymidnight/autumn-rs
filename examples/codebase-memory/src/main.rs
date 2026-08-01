@@ -192,7 +192,7 @@ struct Args {
     root: Option<PathBuf>,
     tenant: String,
     agent: String,
-    /// F-AUTHZ-1: path to the tenant credential (from `autumn-op tenant-create`,
+    /// path to the tenant credential (from `autumn-op tenant-create`,
     /// hex). REQUIRED when `mem/` is a protected namespace — the SDK auto-mints
     /// short-TTL tokens scoped to `mem/{tenant}/`. Omit on an unprotected/authz-
     /// off cluster.
@@ -404,7 +404,7 @@ async fn main() -> Result<()> {
 
     let store = Rc::new(
         match &args.credential_file {
-            // F-NS-PRINCIPAL-UNIFIED: protected `mem/` — connect with the principal
+            // protected `mem/` — connect with the principal
             // credential (SDK auto-mints/renews short-TTL tokens scoped to
             // `mem/{tenant}/`). The principal identity is read from the file.
             Some(path) => {

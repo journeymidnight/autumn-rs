@@ -16,8 +16,8 @@ manifests are shaped around them:
    (IP literals only). The entrypoint resolves Service names to ClusterIPs with
    `getent` and passes IPs as flags. IPv6 pod/Service IPs work (bracketed).
 
-2. **Extent-node identity is a stable `node_uuid`, not its address**
-   (F-EN-DYNSHARD). The `node_uuid` is minted once at `format` and persisted on
+2. **Extent-node identity is a stable `node_uuid`, not its address.**
+   The `node_uuid` is minted once at `format` and persisted on
    the PVC; the EN **self-registers its live pod IP + every shard port at each
    startup** under that uuid. A pod IP change on reschedule just updates the
    same identity's location and routing follows — so the EN advertises its
@@ -147,8 +147,8 @@ kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=3
 
 ## Authz (ON by default)
 
-`deploy/overlays/vke/deploy.sh` provisions data-plane authz automatically
-(F-AUTHZ-BUILTIN): it generates the `autumn-authz` Secret (signing key + admin
+`deploy/overlays/vke/deploy.sh` provisions data-plane authz automatically:
+it generates the `autumn-authz` Secret (signing key + admin
 token) **once — never rotated here** (rotating invalidates every minted
 credential) — and the manager StatefulSet mounts it (`optional`, at
 `/etc/autumn/authz`). The ConfigMap sets `AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/
@@ -204,8 +204,8 @@ overlay must name a class explicitly, as the VKE example does.
 
 - **Extent nodes**: bump `extent-node.yaml` StatefulSet `replicas` to N and set
   `AUTUMN_EXPECT_NODES: "N"` in the ConfigMap. That's it — ENs advertise their
-  pod IPs and self-register, so there are no per-pod Services to add (F-EN-DYNSHARD
-  M2). Provision **more ENs than the replication factor** — with `#EN == RF` a
+  pod IPs and self-register, so there are no per-pod Services to add. Provision
+  **more ENs than the replication factor** — with `#EN == RF` a
   single EN down wedges writes (can't form a fresh replica set); reads tolerate a
   down replica at any size.
 - **Partition servers**: raise `partition-server.yaml` `replicas`; each pod's
@@ -222,7 +222,7 @@ wall (benchmarked here: write flattens ~65k ops/s past 16 partitions). Giving
 each EN more shards spreads its extents (`shard = extent_id % N`) across N cores.
 
 The entrypoint exposes this via **`AUTUMN_EXTENT_SHARDS`** (default 1). When > 1
-it sizes the EN to cores `0..N-1`. F-EN-DYNSHARD M1c/M2: `format` is
+it sizes the EN to cores `0..N-1`. `format` is
 identity-only now — the EN binary itself self-registers all N shard ports at
 startup (via its own `--advertise`, which now carries the **pod IP**), and the
 manager/PS dial `pod_ip:shard_port` directly. Shard `i` binds data port
@@ -232,7 +232,7 @@ is a worked 4-shard example: it sets `AUTUMN_EXTENT_SHARDS: "4"` and requests 4
 CPU per EN. That's the complete change.
 
 Changing the shard count for a **running** cluster is a **stop-the-world reshard**
-(F-EN-DYNSHARD M3, ownership = `extent_id % shard_count` remaps globally): edit
+(ownership = `extent_id % shard_count` remaps globally): edit
 `AUTUMN_EXTENT_SHARDS`, then restart all ENs together. Zero bytes move on disk
 (the file layout is hash-subdir'd, shard-independent); only routing remaps. See
 the reshard runbook in `docs/ops.md` and `scripts/reshard_chaos.sh`.

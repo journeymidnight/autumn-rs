@@ -76,13 +76,13 @@ namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个
 `principal-create --grant fs/` + `--credential-file`（principal 名在文件里，authz
 开了就整个 `fs/` 受保护）。详见 docs/key_namespace_split_design.md §8。
 
-### 变长 extent（F247）
+### 变长 extent
 
 文件数据是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
 value ≤ 8 MiB = `MAX_EXTENT`）：顺序写合并成接近 8 MiB 的 extent，末尾/部分 extent
 较短（"像 Linux extent 一样变长"）。相比固定 256 KiB chunk，大文件从几十万个小块变成
 数量级更少、每个 ≥ 64 KiB 的 extent，每个整 extent 读走 `get_many_into` 的 bulk 路径
-（`MSG_GET_BULK`，F243 RDMA 零拷贝的目标尺寸）。
+（`MSG_GET_BULK`，RDMA 零拷贝的目标尺寸）。
 
 - **持久真相 = extent KV key 本身**（隐式 key 设计，InodeMeta 里**不**存 extent 列表）。
 - **运行时缓存** `InodeState.extents: Option<Vec<(start, len)>>`：冷启动 range-scan
@@ -94,7 +94,7 @@ value ≤ 8 MiB = `MAX_EXTENT`）：顺序写合并成接近 8 MiB 的 extent，
   读写各省一次 KV 操作；增长超过阈值迁移到 extent 存储）。
 - 全部寻址/读/写/截断/删除逻辑在 `crate::extent`。
 
-### Lane striping（F-FS-STRIPE，大文件跨分区条带化）
+### Lane striping（大文件跨分区条带化）
 
 大文件的 extent 跨 `lanes` 个分区分布，使单文件读写并行超过单 partition/log_stream
 天花板。
@@ -230,7 +230,7 @@ struct InodeState {
     write_buf: Option<WriteBuffer>,        // buf 容量 WRITE_BUF_CAP
     dirty: bool,
     open_count: u32,
-    extents: Option<Vec<(u64, u32)>>,      // F247 运行时 extent map（truncate 置 None）
+    extents: Option<Vec<(u64, u32)>>,      // 运行时 extent map（truncate 置 None）
     cached_version: u64,                   // 上次从 KV 刷 meta/extents 时的 lease 版本
 }
 ```
@@ -244,7 +244,7 @@ Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 ### Read
 1. 脏写缓冲与读范围重叠 → 先 flush（read-after-write 一致性）。
 2. 小文件 `inline_data` → 直接返回。
-3. 加载 extent map（F247 运行时缓存，冷启动 range-scan），条带文件先 `checked()` 校验
+3. 加载 extent map（运行时缓存，冷启动 range-scan），条带文件先 `checked()` 校验
    几何，为每个重叠 extent 生成 `ChunkSpec`（striped → lane key，否则 `[0x03][ino][off]`），
    sub-range = 精确重叠区间，extent 间空洞补零（稀疏语义）。
 4. 一次批量读所有 extent slice，多 extent 并发（compio spawn，spawned `execute`
@@ -327,7 +327,7 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 入口）缺则戳、有则核对、**不符则 fail-loud 拒挂**（防未来不兼容布局静默读写坏数据）。
 - v1 = pre-namespace 裸 key（从不戳）。
 - v2 = namespaced 相对布局 + 全局 inode 计数器。
-- v3 = F-FS-STRIPE：`InodeMeta` 加 `stripe` 字段（rkyv 布局变，v2 inode 字节解不出），
+- v3 = lane striping：`InodeMeta` 加 `stripe` 字段（rkyv 布局变，v2 inode 字节解不出），
   大文件走 lane-striped key。v2→v3 stop-world reset，无 in-place 迁移；小/legacy 文件
   仍 `stripe=None` + `[0x03][ino][off]`。BUMP whenever 布局/编码不兼容变更。
 
@@ -408,10 +408,10 @@ fuse 层无多 key 原子提交（完整方案 per-inode generation manifest 仍
 
 ## Restart 行为 —— EN vs PS
 
-- **PS kill+restart**（`scripts/fuse_chaos.sh` F1）：分区 MIGRATE 到另一 PS，region
+- **PS kill+restart**（`scripts/fuse_chaos.sh` 的 PS-kill 阶段）：分区 MIGRATE 到另一 PS，region
   重收敛后 I/O 恢复，已 sync 文件字节精确。RMW-GET-SWALLOW 窗口由
   `scripts/fuse_rmw_chaos.sh` 覆盖。
-- **manager / fuse-daemon kill+restart**：`fuse_chaos.sh` F2/F3。
+- **manager / fuse-daemon kill+restart**：`fuse_chaos.sh` 的 MGR-kill / FUSE-kill 阶段。
 - **EN kill+restart**（`scripts/fuse_en_restart_chaos.sh`）：EN kill **不迁移**分区，
   stream 层把读写 failover 到存活副本。**INTEGRITY 完好** —— 4 轮 kill+restart（全 3
   EN）+ remount 验证 6 个 durable 文件（4 KiB..10 MiB 含多 extent）+ 4 个反复 RMW

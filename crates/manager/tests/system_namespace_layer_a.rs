@@ -1,4 +1,4 @@
-//! F-KEY-NS D7 (SD-2) — wire-level integration tests for the two subtle
+//! D7 (SD-2) — wire-level integration tests for the two subtle
 //! correctness points the unit tests only cover in isolation:
 //!
 //! 1. **Layer-A over the wire** (`layer_a_rejects_unregistered_namespace_put`):
@@ -7,7 +7,7 @@
 //!    connection checked too), and a `delete` under an unregistered prefix is
 //!    NOT Layer-A gated.
 //! 2. **put-stream chunk-in-tenant-range** (`putstream_chunks_land_in_tenant_range`):
-//!    a Prepend-bound client's F186 striped chunk keys land INSIDE
+//!    a Prepend-bound client's striped chunk keys land INSIDE
 //!    `[{tenant}/{ns}/, {tenant}/{ns}0)`, not in a global `\xff\xfe…` space.
 //!
 //! Both need EN binaries + a real PS, so they are `#[ignore]` (run explicitly),
@@ -84,7 +84,7 @@ fn layer_a_rejects_unregistered_namespace_put() {
         start_partition_server(130, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(1800)).await;
 
-        // F-NS-PRINCIPAL-UNIFIED: scoped client `"bench/perf"` prepends `bench/perf/`.
+        // scoped client `"bench/perf"` prepends `bench/perf/`.
         // A put of `k1` → wire `bench/perf/k1` → 1st segment `bench/` registered →
         // ADMITTED.
         let scoped = ClusterClient::connect(&mgr_addr.to_string(), "bench/perf")

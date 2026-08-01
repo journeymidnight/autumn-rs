@@ -1,4 +1,4 @@
-//! F261 — process-wide bounded cache of decoded SST data blocks.
+//! process-wide bounded cache of decoded SST data blocks.
 //!
 //! Keyed by `(row_stream extent_id, absolute byte offset of the block within
 //! the extent)` — stable across SstReader instances and partition reopens.
@@ -111,7 +111,7 @@ impl BlockCache {
     /// never invalidates per-extent — extent ids are globally unique within a
     /// process, so a punched/truncated extent's `(extent_id, offset)` keys are
     /// never reused (cross-cluster test reuse is handled by `clear`). (An
-    /// earlier F261 doc claimed a compaction-time caller; that wiring never
+    /// earlier doc claimed a compaction-time caller; that wiring never
     /// existed.)
     #[cfg(test)]
     pub fn invalidate_extent(&self, extent_id: u64) {

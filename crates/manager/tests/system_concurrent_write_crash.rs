@@ -206,7 +206,7 @@ fn concurrent_writers_during_split() {
         //
         // Empirically up to ~65% of writes acknowledged during a
         // concurrent split are missing from BOTH children. Root cause:
-        // unlike merge (F185), split has no orchestrator-driven
+        // unlike merge, split has no orchestrator-driven
         // FREEZE phase. `handle_split_part` runs PS-local under the
         // partition thread but doesn't halt incoming writes — a Put
         // that lands AFTER the split's commit_length capture but
@@ -219,12 +219,12 @@ fn concurrent_writers_during_split() {
         // even if they ARE in the recovered log.
         //
         // Production impact: only manual `autumn-op split` against an
-        // actively-written partition exhibits this. Auto-split (F183)
+        // actively-written partition exhibits this. Auto-split
         // gates on QPS thresholds + cooldowns so it rarely fires on
         // a hot writer; admin-driven split is a planned op where the
         // operator pauses writes is the typical workflow.
         //
-        // Fix design (defer to F215 follow-up): port F185's merge
+        // Fix design (deferred follow-up): port the merge
         // orchestrator pattern to split — `handle_split_partition`
         // wraps the atomic txn with MSG_SPLIT_FREEZE flush+drain on
         // the source PS, then captures commit_length under the
@@ -232,7 +232,7 @@ fn concurrent_writers_during_split() {
         //
         // For now this assertion is informational-only: the test
         // measures the loss but doesn't fail. A real fix should
-        // re-enable a strict bound (≤ 20%, matching the F185 merge
+        // re-enable a strict bound (≤ 20%, matching the merge
         // tolerance).
         let total = concurrent_keys.len();
         let mut missing = 0usize;

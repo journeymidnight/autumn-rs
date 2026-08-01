@@ -25,7 +25,7 @@ use transport::{call_with_sender, GrpcChannel};
 ///
 /// All methods take `&self` (the inner `channel` is `Rc<RefCell<GrpcChannel>>`
 /// and is the only mutable state — swapped on reconnect; concurrent calls are
-/// F108-safe via the sender-clone-out-of-cell pattern). Callers therefore hold
+/// safe via the sender-clone-out-of-cell pattern). Callers therefore hold
 /// it as a plain `Rc<EtcdClient>` (no outer `RefCell`), so a manager etcd RPC
 /// never holds a borrow across `.await`.
 pub struct EtcdClient {
@@ -199,12 +199,12 @@ impl EtcdClient {
         let body = grpc_encode(req);
         let timeout = request_timeout();
 
-        // F108: clone the SendRequest out of the RefCell, then drop the borrow
+        // clone the SendRequest out of the RefCell, then drop the borrow
         // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
         // panic the next concurrent caller on the same single-threaded runtime
         // (e.g. 4 partitions racing on `handle_stream_punch_holes`).
         //
-        // F228 (1A): bound the call with `compio::time::timeout`. Without this
+        // (1A): bound the call with `compio::time::timeout`. Without this
         // a stuck server / half-open TCP hangs the caller forever — the
         // node_health_loop production freeze. A timeout falls through to the
         // reconnect + retry path, same as a connection error.
@@ -223,7 +223,7 @@ impl EtcdClient {
         }
 
         // Reconnect: try each endpoint once (round-robin from the next one).
-        // F228 (1A): also bounded — a hung connect must not wedge the loop.
+        // (1A): also bounded — a hung connect must not wedge the loop.
         compio::time::timeout(timeout, self.reconnect())
             .await
             .map_err(|_| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
@@ -246,7 +246,7 @@ impl EtcdClient {
 }
 
 /// Reconnect to the next available etcd endpoint (round-robin).
-/// F228 (1A): per-request timeout for every etcd unary RPC. etcd over h2c
+/// (1A): per-request timeout for every etcd unary RPC. etcd over h2c
 /// has no built-in request deadline, so a half-open TCP connection or a
 /// stuck server would hang the caller forever. Every manager background
 /// loop ultimately awaits an etcd call; an unbounded hang here silently
@@ -308,7 +308,7 @@ impl LeaseKeeper {
         let body = grpc_encode(&req);
         let path = "/etcdserverpb.Lease/LeaseKeepAlive";
 
-        // F108: same fix as `EtcdClient::unary_call` — clone the sender out
+        // same fix as `EtcdClient::unary_call` — clone the sender out
         // of the RefCell before await, so concurrent keepalives (or any
         // future shared use of LeaseKeeper) don't panic on borrow_mut.
         let mut sender = self.channel.borrow().sender();
@@ -402,7 +402,7 @@ impl Cmp {
     }
 
     /// Compare value of a key equals the given byte slice. Used by autumn-rs
-    /// for the F149 leader-fence: every manager etcd write txn prepends a
+    /// for the leader-fence: every manager etcd write txn prepends a
     /// `Cmp::value(LEADER_KEY) == instance_id` so a deposed leader cannot
     /// stomp on the new leader's writes during the failover window.
     pub fn value(key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Compare {

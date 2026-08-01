@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# manager_ha_chaos.sh — multi-manager HA chaos for tcp|ucx (F267).
+# manager_ha_chaos.sh — multi-manager HA chaos for tcp|ucx.
 #
 # Boots a real cluster.sh cluster (manager1 @9001 + 3 EN), adds a STANDBY
 # manager2 @9002 (same etcd), and replaces the PSes with ones that carry the
 # full manager list "9001,9002". Then, while an ACKed-write loop runs:
 #   H1: kill -9 manager1 (the leader) → manager2 must win the election
 #       (etcd lease TTL ~10 s), PSes rotate to it, part_addrs self-heals on
-#       the new leader (F265), clients keep reading/writing — zero loss
+#       the new leader, clients keep reading/writing — zero loss
 #   H2: kill -9 the partition-holding PS with ONLY manager2 alive → the
 #       new leader's eviction/rebalance must migrate everything to the
 #       survivor PS
-#   H3: respawn manager1 → it must come back as a FOLLOWER (F149 fence —
+#   H3: respawn manager1 → it must come back as a FOLLOWER (fence —
 #       no split-brain writes), cluster keeps serving
 # Afterwards every ACKed write is verified byte-exact.
 #
@@ -164,8 +164,8 @@ say "H1: kill -9 leader manager1 pid=$MGR1_PID"
 kill -9 "$MGR1_PID"
 # manager2 must take over: leader lease TTL ~10s + election retry ~2s.
 # Takeover signal = an END-TO-END write routed via manager2 ONLY: needs
-# its routing answered, its part_addrs view healed (F265 self-heal must
-# follow the PS manager rotation — F267), and a PS serving. An info-only
+# its routing answered, its part_addrs view healed (self-heal must
+# follow the PS manager rotation), and a PS serving. An info-only
 # probe is vacuous: get_regions is ungated and a follower answers from
 # replay-at-startup state.
 deadline=$((SECONDS + 120))
@@ -219,7 +219,7 @@ setsid nohup $MGR1_CMD > "$WORK/mgr1_respawn.log" 2>&1 < /dev/null &
 sleep 15
 # manager2 must STILL be the leader: its info keeps showing partitions and
 # the cluster keeps serving. (A split-brain write from manager1 would trip
-# the F149 fence; data-plane verifies below catch any divergence.)
+# the fence; data-plane verifies below catch any divergence.)
 out=$(ao_info 127.0.0.1:9002)
 if [ -n "$out" ] && printf '%s' "$out" | grep -q "^  part"; then
     say "H3: manager2 still serving after manager1 rejoin"

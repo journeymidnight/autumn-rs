@@ -15,7 +15,7 @@ pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
     autumn_rpc::partition_rpc::rkyv_encode(meta).to_vec()
 }
 
-/// F-FS-GEOM-DECLARED: lane count used when an fs has declared no geometry.
+/// lane count used when an fs has declared no geometry.
 ///
 /// **Lanes are a LOGICAL property of the key layout; whether the partitions were
 /// actually cut at lane boundaries is a separate PLACEMENT decision.** Striping
@@ -39,7 +39,7 @@ pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
 /// only at `lanes >= 2`).
 pub const DEFAULT_STRIPE_LANES: u8 = 24;
 
-/// F-FS-GEOM-DECLARED: decode the declared fs-wide stripe geometry
+/// decode the declared fs-wide stripe geometry
 /// (`[0x04]stripe_geom`). Validated through `checked()` so a corrupt/truncated
 /// value fails loud here rather than dividing by zero deep in the key builder.
 pub fn decode_stripe_geom(bytes: &[u8]) -> Result<StripeLayout, String> {
@@ -91,7 +91,7 @@ pub struct InodeMeta {
     pub inline_data: Option<Vec<u8>>,
     /// Symlink target path. None for non-symlinks.
     pub symlink_target: Option<Vec<u8>>,
-    /// F-FS-STRIPE: `Some` iff this file's data extents are STRIPED across
+    /// `Some` iff this file's data extents are STRIPED across
     /// `lanes` partitions. `None` = the legacy single-partition layout
     /// (`[0x03][ino][off]`, all extents in one partition/log_stream). A large
     /// file (> threshold) is stamped striped at create so its extents round-robin
@@ -101,7 +101,7 @@ pub struct InodeMeta {
     pub stripe: Option<StripeLayout>,
 }
 
-/// F-FS-STRIPE: per-file stripe geometry. An extent at logical offset `off` lives
+/// per-file stripe geometry. An extent at logical offset `off` lives
 /// on lane `(off / unit_bytes) % lanes`, whose wire key is `[0x03][lane][ino][off]`.
 /// Lane partitions are pre-split at `[0x03][lane]` (static, ino-independent) and
 /// placed on distinct PSs, so consecutive extents hit different PSs in parallel.
@@ -130,7 +130,7 @@ impl StripeLayout {
     }
 }
 
-/// F-FS-STRIPE (coco P3): the `unit_bytes`-aligned logical offsets (0, u, 2u, …)
+/// (coco P3): the `unit_bytes`-aligned logical offsets (0, u, 2u, …)
 /// of a striped file of `size` bytes — the enumeration the reader / rm / delete
 /// paths use to COMPUTE lane keys.
 ///
@@ -177,14 +177,14 @@ pub struct DirentValue {
     pub file_type: u8,
 }
 
-/// Maximum extent (variable-length data block) size: 8 MiB (F247).
+/// Maximum extent (variable-length data block) size: 8 MiB.
 ///
 /// Files are stored as **variable-length extents** keyed by their logical byte
 /// offset (`[0x03][ino][logical_off BE]`), NOT fixed 256 KiB chunks. A
 /// sequential (write-once) stream coalesces into extents capped at `MAX_EXTENT`;
 /// the last/partial extent is shorter → "variable like Linux extents". 8 MiB
 /// matches the project's large-value bench size and the UCX large-read sweet
-/// spot, so the ≥64 KiB bulk path (and the future RDMA path, F243) is engaged for
+/// spot, so the ≥64 KiB bulk path (and the future RDMA path) is engaged for
 /// whole-extent reads. The write buffer also flushes at this granularity.
 pub const MAX_EXTENT: usize = 8 * 1024 * 1024;
 
@@ -217,7 +217,7 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
 
-/// F-KEY-NS: the on-disk layout version stamped per tenant in the superblock
+/// the on-disk layout version stamped per tenant in the superblock
 /// (`[0x04]schema_version`, so it lands at `fs/{tenant}/[0x04]schema_version`).
 ///
 /// - **v1** = the pre-namespace layout (raw `0x01`–`0x04` keys under a Raw client
@@ -231,7 +231,7 @@ pub const ROOT_INO: u64 = 1;
 /// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
 /// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)
 /// then refuses to mount rather than silently corrupting data.
-/// - **v3** = F-FS-STRIPE: `InodeMeta` gains the `stripe: Option<StripeLayout>`
+/// - **v3** = lane striping: `InodeMeta` gains the `stripe: Option<StripeLayout>`
 ///   field (rkyv layout change — v2 inode bytes can't decode), and large files
 ///   store data extents under the lane-striped key `[0x03][lane][ino][off]`.
 ///   Stop-world reset from v2 (no in-place migration; old files would decode
@@ -245,7 +245,7 @@ pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
 pub const DT_LNK: u8 = 10;
 
-/// A single readdir entry. F-FS-UNIFY M1: lives in the fuser-free core
+/// A single readdir entry. Lives in the fuser-free core
 /// (`kind` is a `DT_*` byte, not `fuser::FileType`); the FUSE reply
 /// boundary (`ops.rs`) converts via `attr::dt_to_filetype`.
 pub struct ReaddirEntry {
@@ -288,7 +288,7 @@ pub struct InodeState {
     pub write_buf: Option<WriteBuffer>,
     pub dirty: bool,
     pub open_count: u32,
-    /// F247 runtime extent map: sorted `(logical_start, value_len)` of this
+    /// runtime extent map: sorted `(logical_start, value_len)` of this
     /// file's data extents. `None` = not yet loaded (rebuild via range-scan of
     /// the `[0x03][ino]` prefix + neighbor/file-size length inference). This is a
     /// *runtime cache only* — the persistent source of truth is the extent KV

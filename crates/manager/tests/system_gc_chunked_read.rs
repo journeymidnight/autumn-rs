@@ -1,8 +1,8 @@
-//! F105/F106 system test: chunked `read_bytes_from_extent` keeps GC
+//! system test: chunked `read_bytes_from_extent` keeps GC
 //! working when a sealed log_stream extent exceeds the per-syscall
 //! read ceiling (macOS pread INT_MAX, Linux 0x7ffff000).
 //!
-//! Pre-F105 the user observed `GC run_gc extent X: rpc status Internal:
+//! Previously the user observed `GC run_gc extent X: rpc status Internal:
 //! Invalid argument (os error 22)` repeated for every 30s GC tick on a
 //! 3 GiB log_stream extent — the partition server's run_gc slurped the
 //! whole extent into one Vec via a single `read_bytes_from_extent(eid,
@@ -27,11 +27,11 @@ use autumn_rpc::client::RpcClient;
 use support::*;
 
 #[test]
-fn f105_gc_works_on_large_extent_via_chunked_reads() {
+fn gc_works_on_large_extent_via_chunked_reads() {
     // Force StreamClient to chunk reads at 1 KiB and run_gc to carry
     // records across 512 B GC chunks. With ~8 KiB values, every read
     // and every record will straddle a chunk boundary — exercising the
-    // F105 chunked read path AND the F106 carry-forward path on every
+    // chunked read path AND the carry-forward path on every
     // step. `set_var` is fine here because this is the only test in
     // this binary.
     //

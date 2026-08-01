@@ -1,4 +1,4 @@
-//! F183 policy engine unit tests.
+//! policy engine unit tests.
 
 use std::collections::HashMap;
 
@@ -17,7 +17,7 @@ use crate::policy::{
     SPLIT_SIZE_HARD, SPLIT_SIZE_MIN,
 };
 
-/// F202 compatibility: the old `POLICY_KIND_COMPACT` constant maps to
+/// compatibility: the old `POLICY_KIND_COMPACT` constant maps to
 /// `POLICY_KIND_MAJOR_COMPACT` (same wire value 3). Existing tests use
 /// the major-compact path; re-export under both names to keep them
 /// compiling without churn.
@@ -171,7 +171,7 @@ fn split_cooldown_blocks() {
 
 #[test]
 fn split_size_fires_on_current_bucket_not_debounced() {
-    // F-POLICY-SIZE-EST-LIVE-FOLLOWUP (b): the SIZE dimension is NOT debounced.
+    // (b): the SIZE dimension is NOT debounced.
     // A full window whose EARLIER buckets are small but whose CURRENT bucket is
     // over size-hard MUST split now — the old "all N buckets big" rule made a
     // just-grown partition wait out the whole window.
@@ -313,7 +313,7 @@ fn merge_adjacent_pair_qualifying_same_ps() {
     assert!(merge_cands[0].same_ps);
 }
 
-/// F-FS-GEOM-DECLARED step 4: an otherwise-perfect merge candidate must NOT be
+/// step 4: an otherwise-perfect merge candidate must NOT be
 /// advertised when the boundary it would erase is an operator-declared presplit
 /// point. `handle_merge_partitions` refuses it anyway; skipping here stops the
 /// auto-policy controller retrying a doomed op every tick.
@@ -586,7 +586,7 @@ fn merge_cooldown_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// F187 maintenance advisory tests
+// maintenance advisory tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -760,7 +760,7 @@ fn maintenance_advisory_partial_window_no_trigger() {
     assert!(out.is_empty());
 }
 
-// ── F196 Stage D: hot/cold advisory ─────────────────────────────────────
+// ── Stage D: hot/cold advisory ─────────────────────────────────────
 
 #[test]
 fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
@@ -1004,7 +1004,7 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
 }
 
 // ===========================================================================
-// F202 — minor compact + EC advisory tests
+// minor compact + EC advisory tests
 // ===========================================================================
 
 fn mk_stream(state: &mut MetadataState, sid: u64, ec: (u32, u32), extent_ids: &[u64]) {
@@ -1040,7 +1040,7 @@ fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_convert
     );
 }
 
-/// F202: minor compact advisory fires when sustained
+/// minor compact advisory fires when sustained
 /// `minor_compact_pending_bytes` exceeds threshold across the window.
 #[test]
 fn minor_compact_fires_when_sustained_above_threshold() {
@@ -1071,7 +1071,7 @@ fn minor_compact_fires_when_sustained_above_threshold() {
     );
 }
 
-/// F202: minor compact advisory is SUPPRESSED when the latest bucket has
+/// minor compact advisory is SUPPRESSED when the latest bucket has
 /// `minor_compact_pending_bytes == 0` (i.e. `pickup_tables` had nothing
 /// to do — common-sense filter "don't suggest minor compact when there's
 /// no minor compact work").
@@ -1108,7 +1108,7 @@ fn minor_compact_suppressed_when_latest_bucket_empty() {
     );
 }
 
-/// F202: minor compact respects its own cooldown — distinct from major.
+/// minor compact respects its own cooldown — distinct from major.
 #[test]
 fn minor_compact_respects_cooldown() {
     let mut eng = PolicyEngine::default();
@@ -1133,7 +1133,7 @@ fn minor_compact_respects_cooldown() {
     );
 }
 
-/// F202: EC advisory fires for sealed-unconverted extents ≥ threshold.
+/// EC advisory fires for sealed-unconverted extents ≥ threshold.
 #[test]
 fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     let mut state = MetadataState::default();
@@ -1149,7 +1149,7 @@ fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     assert_eq!(c.size_bytes, EC_MIN_EXTENT_BYTES * 2);
 }
 
-/// F202: EC advisory common-sense filter — extents below
+/// EC advisory common-sense filter — extents below
 /// `ec_min_extent_bytes` are NOT surfaced (encode overhead > savings).
 #[test]
 fn ec_advisory_suppresses_small_extents() {
@@ -1165,7 +1165,7 @@ fn ec_advisory_suppresses_small_extents() {
     assert_eq!(out[0].secondary_part_id, 1003);
 }
 
-/// F202: EC advisory skips already-converted extents.
+/// EC advisory skips already-converted extents.
 #[test]
 fn ec_advisory_skips_converted() {
     let mut state = MetadataState::default();
@@ -1179,7 +1179,7 @@ fn ec_advisory_skips_converted() {
     );
 }
 
-/// F202: EC advisory skips replication-only streams (no EC policy
+/// EC advisory skips replication-only streams (no EC policy
 /// attached → nothing to convert toward).
 #[test]
 fn ec_advisory_skips_non_ec_streams() {
@@ -1195,7 +1195,7 @@ fn ec_advisory_skips_non_ec_streams() {
     );
 }
 
-/// F202: EC advisory skips sealed_length=0 extents (open OR
+/// EC advisory skips sealed_length=0 extents (open OR
 /// sealed-at-zero — both are GC empty-extent territory, not EC).
 #[test]
 fn ec_advisory_skips_empty_extents() {
@@ -1207,7 +1207,7 @@ fn ec_advisory_skips_empty_extents() {
     assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
 }
 
-// ── F-REGION-REBALANCE Phase B: compute_rebalance_advisory ───────────────────
+// ── Region-rebalance Phase B: compute_rebalance_advisory ───────────────────
 
 fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> MetadataState {
     let mut state = MetadataState::default();
@@ -1282,7 +1282,7 @@ fn rebalance_advisory_disabled_when_threshold_zero() {
 }
 
 // ===========================================================================
-// F-POLICY-SIZE-EST-LIVE — est_live口径 tests (design doc §3.3 D3)
+// est_live口径 tests (design doc §3.3 D3)
 // ===========================================================================
 
 use crate::policy::{effective_size_bytes, est_live_bytes, partition_sealed_sums};

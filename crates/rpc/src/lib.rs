@@ -37,7 +37,7 @@ pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>
 /// Msg type reserved for heartbeat ping/pong.
 pub const MSG_TYPE_PING: u8 = 0xFF;
 
-/// F-EN-SHARD-HASH: the canonical extent → shard-index map. This is the ONE
+/// the canonical extent → shard-index map. This is the ONE
 /// source of truth shared by the ExtentNode (`owns_extent` + sibling forward)
 /// and the manager / StreamClient shard routing (`shard_addr_for_extent`), so
 /// every layer agrees which shard serves an extent.
@@ -73,7 +73,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// deploys share it; ANY wire-struct edit changes it. Exchanged via
 /// `GetClusterIdResp.wire_fingerprint` and checked at every long-lived
 /// process's startup — a mixed-version join refuses LOUDLY instead of
-/// silently decoding garbage (rkyv has no cross-version compat; F275).
+/// silently decoding garbage (rkyv has no cross-version compat).
 pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 
 /// R1 (rolling upgrade design): the wire-version interval this binary
@@ -107,7 +107,7 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // extent_id, eversion, corrupt_node_ids}/Resp. Pre-R3: MIN=MAX=2
     // (same-commit deploy; rkyv has no cross-version decode).
     (2, "5d94c026c08e69ca"),
-    // v3: F-unify — extent_rpc relocated from autumn-stream into autumn-rpc
+    // v3: wire-schema unify — extent_rpc relocated from autumn-stream into autumn-rpc
     // (single wire-schema home alongside manager_rpc/partition_rpc); the
     // pure-wire `ExtDiskStatus` mirror deleted, `ExtDfResp.disk_status` now
     // nests canonical `extent_rpc::DiskStatus`. rkyv layout unchanged, but
@@ -157,14 +157,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // a comment edit in `manager_rpc.rs` only, no wire-layout change; v8 not
     // yet deployed, so updated in place rather than bumped.)
     (8, "ba19149e1ed99c41"),
-    // v9: F-AUTHZ-1 data-plane authz — new `cap_token.rs` (Ed25519 capability
+    // v9: data-plane authz — new `cap_token.rs` (Ed25519 capability
     // token layout, added to the fingerprint hash set) + manager_rpc gained
     // MSG_MINT_TOKEN (0x4F) / MSG_GET_AUTHZ_CONFIG (0x50) / MSG_TENANT_CREATE
     // (0x51) / MSG_TENANT_DELETE (0x52) and their req/resp + MgrTenantAccount /
     // AuthzPublicKey. Pre-R3: MIN=MAX=9 (same-commit deploy; rkyv has no
     // cross-version decode).
     (9, "839d196b5be56249"),
-    // v10: F-AUTHZ-1 Stage 2 (PS enforcement) — partition_rpc gained
+    // v10: data-plane authz Stage 2 (PS enforcement) — partition_rpc gained
     // MSG_AUTH_HELLO (0x55) + AuthHelloReq/AuthHelloResp (per-connection token
     // bind). StatusCode::PermissionDenied (7) was also added but error.rs is
     // not in the fingerprint set, so only the partition_rpc addition bumps it.
@@ -173,7 +173,7 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // GetAuthzConfigResp.cluster_id so the PS can enforce token aud == cluster_id;
     // v10 not yet deployed, so no bump.)
     (10, "64554258323fbe51"),
-    // v11: F-FS-UNIFY M0 — manager_rpc gained MSG_ALLOC_INODES (0x53) +
+    // v11: fs-unify M0 — manager_rpc gained MSG_ALLOC_INODES (0x53) +
     // AllocInodesReq{count, floor}/AllocInodesResp{code, message, base}:
     // fuse-fs inode-number allocation moved into the manager (leader-fenced
     // etcd CAS on `autumn-rs/fs/next_inode`), replacing the client-side
@@ -181,7 +181,7 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // batches under concurrent allocators. Pre-R3: MIN=MAX=11 (same-commit
     // deploy; rkyv has no cross-version decode).
     (11, "8a586475b2930f0f"),
-    // v12: F-DASH-IN-MGR M2 — manager_rpc gained MSG_AUTOPOLICY_GET (0x54) /
+    // v12: dashboard-in-manager M2 — manager_rpc gained MSG_AUTOPOLICY_GET (0x54) /
     // MSG_AUTOPOLICY_SET (0x55) + MgrAutoPolicyEntry / MgrAutoPolicyConfig /
     // MgrAutoPolicyCooldowns / AutoPolicyLogEntry / AutoPolicyGetReq/Resp /
     // AutoPolicySetReq/Resp: the in-manager auto-policy controller's headless
@@ -189,14 +189,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // dashboard). Pre-R3: MIN=MAX=12 (same-commit deploy; rkyv has no
     // cross-version decode).
     (12, "c2ae65efd6e168f6"),
-    // v13: F-FENCE-DRAIN — partition_rpc gained MSG_ROLL_TAILS (0x57) +
+    // v13: fence-drain — partition_rpc gained MSG_ROLL_TAILS (0x57) +
     // RollTailsReq{part_id, entries}/RollTailsResp{code, rolled, message}: the
     // manager's recovery sweep tells a PS to seal+roll open tail extents that
     // sit on a fenced node (recovery only rebuilds SEALED extents, so an idle
     // partition's open tail on a fenced node would never drain / block remove).
     // Pre-R3: MIN=MAX=13 (same-commit deploy; rkyv has no cross-version decode).
     (13, "87ad9d165bd07e15"),
-    // v14: F-GC-FLOOR-OBS — partition_rpc gained MSG_DIAG_PARTITION_VP (0x58) +
+    // v14: gc-floor observability — partition_rpc gained MSG_DIAG_PARTITION_VP (0x58) +
     // DiagPartitionVpReq{part_id}/DiagPartitionVpResp{code, message,
     // log_extent_ids, sst_vp_heads, floor_pos, floor_extent_id,
     // vp_seed_extent_id, vp_seed_offset}: `autumn-op info --part` surfaces the
@@ -204,14 +204,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // forcegc-protected extent from a bug. Pre-R3: MIN=MAX=14 (same-commit
     // deploy; rkyv has no cross-version decode).
     (14, "e9c149b55565f2ad"),
-    // v15: F-OVERVIEW-OPENTAIL — PartitionLoad grew `open_tail_bytes: u64`
+    // v15: overview open-tail — PartitionLoad grew `open_tail_bytes: u64`
     // (Σ committed bytes on the partition's log/row/meta OPEN-tail extents,
     // PS-reported). The manager's cluster overview adds it to its
     // authoritative sealed-length sum so an all-open-tail (compacted /
     // log-heavy) partition no longer renders 0 B. Pre-R3: MIN=MAX=15
     // (same-commit deploy; rkyv has no cross-version decode).
     (15, "4bbbbf8faeb05923"),
-    // v16: F-DF-OPENTAIL — ClusterDfResp grew `logical_open_tail: u64` (Σ
+    // v16: df open-tail — ClusterDfResp grew `logical_open_tail: u64` (Σ
     // PS-reported open-tail committed bytes across partitions). The df
     // amplification denominator becomes `logical_stored + logical_open_tail`
     // so an all-open-tail (VP/log-heavy) cluster no longer shows a ~15×
@@ -219,49 +219,49 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // them). Pre-R3: MIN=MAX=16 (same-commit deploy; rkyv has no
     // cross-version decode).
     (16, "4c2dd28d4b3ff567"),
-    // v17: F-REDIRECT-BATCH — MSG_GET_REDIRECT_MANY (0x59) + GetRedirectItem /
+    // v17: redirect-batch — MSG_GET_REDIRECT_MANY (0x59) + GetRedirectItem /
     // GetRedirectManyReq / GetRedirectManyResp (batched redirect resolution).
     // Same-commit deploy (MIN=MAX=17). Fingerprint filled after the build test
     // reports it.
     (17, "55411e9479326ff8"),
-    // v18: F-DF-WALDEBT — PartitionLoad grew `open_tail_dead_bytes: u64` (dead
+    // v18: df wal-debt — PartitionLoad grew `open_tail_dead_bytes: u64` (dead
     // large-value bytes on the OPEN log tail, the discard-map entry gc_debt's
     // sealed-only filter drops) and ClusterDfResp grew `logical_wal_debt: u64`
     // (Σ gc_debt + open_tail_dead across partitions). `autumn-op df` shows a
     // dead-vs-live breakdown that includes the open-tail debt gc_debt hid.
     // Same-commit deploy (MIN=MAX=18).
     (18, "dd40c423722d2a44"),
-    // v19: F-EN-DYNSHARD M0 — RegisterNodeReq + MgrNodeInfo grew `node_uuid:
+    // v19: EN dyn-shard M0 — RegisterNodeReq + MgrNodeInfo grew `node_uuid:
     // String` (stable node identity decoupled from the address, so an EN can
     // self-register a changed IP / shard-port layout and stay the same node).
     // MgrNodeInfo is persisted, so this is a same-commit STOP-THE-WORLD deploy
     // that requires an etcd reset (no migration). Fingerprint filled after the
     // build test reports it.
     (19, "44ac1df3e38f6e77"),
-    // v20 — F-EN-DYNSHARD M1b: `DfResp` / `ExtDfResp` gained the EN identity
+    // v20 — EN dyn-shard M1b: `DfResp` / `ExtDfResp` gained the EN identity
     // echo fields (`node_uuid`, `advertise_addr`, `shard_ports`) so the manager
     // `node_health_loop` can self-heal stored-location drift + detect pod-IP
     // reuse. Df is NOT persisted, but wire is same-commit either way.
     (20, "23a6b7794ff8fb6a"),
-    // v21 — F-EN-DYNSHARD M1c: `NodeStateEntry` gained `node_uuid` +
+    // v21 — EN dyn-shard M1c: `NodeStateEntry` gained `node_uuid` +
     // `shard_ports` so `autumn-op list-nodes` shows identity + shard count
     // (reshard verification). Additive to a non-persisted response struct.
     (21, "a76409bf80fbdb21"),
-    // v22 — F-REGION-REBALANCE: `MSG_REBALANCE_REGIONS` + `RebalanceRegionsReq`
+    // v22 — region-rebalance: `MSG_REBALANCE_REGIONS` + `RebalanceRegionsReq`
     // / `RebalanceMove` / `RebalanceRegionsResp` (active region→PS load
     // rebalance). New msg_type + structs; no persisted-struct change.
     (22, "57fe8f244d8fd5c1"),
-    // v23 — F-REGION-REBALANCE Phase B: `POLICY_KIND_REBALANCE` (7) + its
+    // v23 — region-rebalance Phase B: `POLICY_KIND_REBALANCE` (7) + its
     // `policy_kind_names` entry (cluster-level region→PS rebalance advisory kind
     // for the dashboard auto-policy). Additive const + name-map row.
     (23, "6b0224cb5e4f13f3"),
-    // v24 — F-SPLIT-AT-KEY (design doc D4): `SplitPartReq` grew
+    // v24 — split-at-key (design doc D4): `SplitPartReq` grew
     // `at_key: Option<Vec<u8>>` (operator/controller-specified split point;
     // `None` = legacy median selection). Additive rkyv field on an admin
     // (region_epoch-exempt) request struct. Pre-R3: MIN=MAX=24 (same-commit
     // deploy; rkyv has no cross-version decode).
     (24, "eeaf88720200e4da"),
-    // v25 — F-KEY-NS D1+D7+D2 stop-world batch wire freeze (SD-1). One bump
+    // v25 — key-namespace D1+D7+D2 stop-world batch wire freeze (SD-1). One bump
     // covers every struct the batch touches (SD-2/SD-3 add NO further wire):
     //   • MSG_NAMESPACE_CREATE (0x57) / MSG_NAMESPACE_DELETE (0x58) + the
     //     NamespaceCreate{Req,Resp} / NamespaceDeleteReq / MgrNamespace structs
@@ -278,7 +278,7 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //     changed the v25 fp below — NOT a version bump (still MIN=MAX=25).
     // Pre-R3: MIN=MAX=25 (same-commit deploy; rkyv has no cross-version decode).
     (25, "6bb3e2105b2845db"),
-    // v26 — F-NS-PRINCIPAL-UNIFIED (Option 3, docs/key_namespace_split_design.md
+    // v26 — namespace-principal-unified (Option 3, docs/key_namespace_split_design.md
     // §8): keys drop the tenant segment (`{tenant}/{ns}/` → `{ns}/…`) and the
     // authz identity becomes `principal`. `MintTokenReq.tenant` → `principal`
     // (the only wire-STRUCT change; the key-layout flip is client/PS-side and
@@ -289,24 +289,24 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // v27 — two same-batch additions (v27 was never deployed, so the second one
     // REFRESHES this fingerprint in place rather than taking a v28; same
     // sanctioned in-place refinement the v25 SD-2 addendum used):
-    //   • F-NS-PRINCIPAL-LIST: MSG_PRINCIPAL_LIST (0x5A) + PrincipalRow{name,
+    //   • namespace-principal-list: MSG_PRINCIPAL_LIST (0x5A) + PrincipalRow{name,
     //     grants} / PrincipalListResp. Deliberately NOT a mirror of
     //     MgrTenantAccount — the row omits `credential_hash` so an inspection
     //     RPC cannot hand out the verifier for a credential.
-    //   • F-FS-GEOM-DECLARED step 4: MSG_NAMESPACE_SET_PRESPLIT (0x5B) +
+    //   • fs-geom-declared step 4: MSG_NAMESPACE_SET_PRESPLIT (0x5B) +
     //     NamespaceSetPresplitReq{admin_token,name,points} (record the split
     //     points a presplit applied onto an EXISTING namespace row), and
     //     MergePartitionsReq grew `force: bool` (override the sacred-boundary
     //     refusal). The registry's `presplit` field itself needed no change —
     //     it has been frozen and empty since SD-1 waiting for this consumer.
-    //   • F-ADMIN-OP-AUTH manager slice: is_admin_mgr_msg + the admin-token
+    //   • admin-op-auth manager slice: is_admin_mgr_msg + the admin-token
     //     payload codec (prefix_admin_token / strip_admin_token) in
     //     manager_rpc.rs (pure fns + consts, no rkyv struct changed shape).
-    //   • F-ADMIN-OP-AUTH PS slice: GetAuthzConfigResp grew `admin_token:
+    //   • admin-op-auth PS slice: GetAuthzConfigResp grew `admin_token:
     //     Vec<u8>` (additive) + is_admin_ps_msg in partition_rpc.rs — so the PS
     //     can gate split/maintenance on the manager's admin secret.
-    //   • F-KEY-NS UX-fix (M3): MSG_MULTI_MODIFY_MERGE added to is_admin_mgr_msg
-    //     (pure fn edit) so the raw F183 merge txn can't be dispatched to bypass
+    //   • key-namespace UX-fix (M3): MSG_MULTI_MODIFY_MERGE added to is_admin_mgr_msg
+    //     (pure fn edit) so the raw merge txn can't be dispatched to bypass
     //     the freeze + sacred-boundary guard.
     // The payload prefix is an out-of-band convention the manager/PS strip
     // before decoding; the ONLY rkyv struct change is the additive
@@ -314,14 +314,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // refreshes in place. Pre-R3 rkyv has no cross-version decode, so MIN=MAX=27
     // and the deploy stays same-commit.
     (27, "706da8704a419602"),
-    // v28: F-WIRE-CRC-UNIFY — ONE frame shape, CRC structural (frame.rs):
+    // v28: wire CRC-unify — ONE frame shape, CRC structural (frame.rs):
     //   [header][ctrl_len:4][ctrl…][crc32c:4][value…], crc over header+ctrl,
     //   value raw (transport + storage integrity). FLAG_CRC bit retired
     //   (protection is no longer optional → no flag to flip off); the 9-byte
     //   bulk_ctrl + encode_no_crc CRC-less shape deleted; bulk read responses
     //   carry `[code][message]` in the CRC'd ctrl (errors finally have a
     //   human-readable message); MSG_PUT_BULK's value is excluded from the crc
-    //   (the sender no longer crc-scans the value — F219 completed).
+    //   (the sender no longer crc-scans the value).
     //   MSG_APPEND is the ONE deliberate exception: its bulk payload stays
     //   inside ctrl (durability path keeps in-transit CRC).
     //   NOTE mixed-deploy failure mode: the FRAME layer changed, so an
@@ -330,13 +330,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   handshake — acceptable under same-commit deploys, better than silent
     //   garbage. Pre-R3: MIN=MAX=28.
     //   v28 fingerprint refreshed IN PLACE twice pre-deploy (sanctioned
-    //   refinement precedent, v25 SD-2 / v27): ① the F-VALUEBUF batch,
+    //   refinement precedent, v25 SD-2 / v27): ① the value-buffer batch,
     //   ② the bulk-vocabulary rename (zc→bulk everywhere: the old name
     //   claimed an effect — zero-copy — that is a property of memory
     //   provenance × transport, not of the wire structure; the structure is
     //   value-separable "bulk" framing. Wire BYTES unchanged: msg_type
     //   values 0x50/0x51/15 keep their numbers, only const/API names moved).
-    (28, "7e04e6c6cbf5a759"),
+    (28, "fad13fb1a07d1cc2"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
@@ -424,7 +424,7 @@ mod shard_for_extent_tests {
 
     #[test]
     fn bootstrap_contiguous_ids_spread_across_all_shards() {
-        // The regression F-EN-SHARD-HASH fixes: `autumn-op bootstrap` allocates
+        // The regression this hash fixes: `autumn-op bootstrap` allocates
         // a contiguous run of stream/extent ids (7 per partition), which under a
         // raw `id % 4` all aliased onto shard 0. A well-mixed hash must hit every
         // shard across such a run.
@@ -492,7 +492,7 @@ mod admin_token_prefix_tests {
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
         assert!(is_admin_mgr_msg(MSG_BUMP_CLUSTER_VERSION));
-        // M3: the raw F183 merge txn is gated so it can't bypass the guard.
+        // M3: the raw merge txn is gated so it can't bypass the guard.
         assert!(is_admin_mgr_msg(MSG_MULTI_MODIFY_MERGE));
         // … but MULTI_MODIFY_SPLIT stays ungated — it IS PS-driven.
         assert!(!is_admin_mgr_msg(MSG_MULTI_MODIFY_SPLIT));

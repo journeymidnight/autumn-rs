@@ -15,7 +15,7 @@ use crate::schema::InodeState;
 use crate::state::{FsState, FuseLease};
 use crate::write;
 
-/// F-fuse-lease-1: derive the lease mode from POSIX open flags. The
+/// Derive the lease mode from POSIX open flags. The
 /// fuse `open` callback supplies `flags` directly (`O_RDONLY` /
 /// `O_WRONLY` / `O_RDWR`). Treat any non-read-only opener as a
 /// writer — that's the safe upper bound; a read-leased fd would
@@ -136,8 +136,8 @@ pub struct ReleaseAction {
 /// BUG-LEASE-7 (P2 #8, 2026-06-06) — pure-fn predicate used by the
 /// Open arm to decide whether the cached `InodeState.meta` /
 /// `extents` are stale relative to a freshly-acquired lease
-/// version. Mirrors the ioring daemon's F-ioring-lease-4 +
-/// F-ioring-lease-5 #1 staleness check.
+/// version. Mirrors the ioring daemon's
+/// lease-version staleness check.
 ///
 /// `acquired_version`: the version returned by the just-completed
 ///   AcquireLease (or read back from `held_leases[ino].version` on
@@ -184,7 +184,7 @@ pub fn notify_inval_inode_failed_for(
     failed.contains(&ino)
 }
 
-// F-FS-UNIFY M4: the per-session lease background tasks (heartbeat +
+// M4: the per-session lease background tasks (heartbeat +
 // invalidation poll) moved to the fuser-free `crate::lease_tasks` so the PyO3
 // `autumn.Fs` binding shares them. Re-exported here so `main.rs` +
 // this module's unit tests reference them unchanged.
@@ -196,14 +196,14 @@ pub use crate::lease_tasks::{
 /// Initialize the root inode if it doesn't exist yet.
 pub async fn init_root(state: &mut FsState) -> Result<()> {
     // Root creation is the shared core primitive (`meta::ensure_root`, used by
-    // the PyO3 `autumn.Fs` binding too — F-FS-UNIFY M2); the fuse mount adds
+    // the PyO3 `autumn.Fs` binding too — M2); the fuse mount adds
     // its legacy pre-manager batch seed on a fresh filesystem only.
     if !ensure_root(state).await? {
         tracing::info!("root inode already exists");
         return Ok(());
     }
     tracing::info!("created root inode");
-    // F-KEY-NS SD-3 (review P1-2): do NOT seed a local inode batch here. The
+    // SD-3 (review P1-2): do NOT seed a local inode batch here. The
     // pre-SD-3 mount seeded `[ROOT_INO+1, ROOT_INO+1+INODE_ALLOC_BATCH)` locally
     // on a fresh FS — but with per-volume filesystems each volume's fresh mount
     // would seed the SAME low range, and the lease/fence plane keys by BARE ino,
@@ -247,7 +247,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             name,
             reply,
         } => {
-            // F-FS-UNIFY M1: core returns (ino, meta); convert to the
+            // M1: core returns (ino, meta); convert to the
             // fuser reply shape at this boundary.
             let result = dir::lookup(state, parent, &name)
                 .await
@@ -374,13 +374,13 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             reply,
         } => {
             let result = async {
-                // F-FS-UNIFY M2: the file-create KV steps live in the shared
+                // M2: the file-create KV steps live in the shared
                 // core (`dir::create`) so the fuse mount and the PyO3
                 // `autumn.Fs` binding never drift. Open semantics — lease
                 // acquire + the runtime `InodeState` cache + the `FileAttr`
                 // reply — stay here at the FUSE reply boundary.
                 let (ino, meta) = dir::create(state, parent, &name, mode).await?;
-                // F-fuse-lease-1 (coco P1 #1 fix): Create produces a
+                // coco P1 #1 fix: Create produces a
                 // writable fd just like Open. AcquireLease BEFORE
                 // publishing the inode cache so a concurrent Open
                 // from another mount can't get a writer-lease on
@@ -456,7 +456,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             name,
             reply,
         } => {
-            // F-FS-UNIFY M2: shared core owns the file-unlink KV steps
+            // M2: shared core owns the file-unlink KV steps
             // (dirent delete + nlink decrement + tombstoned data reap).
             let result = dir::unlink(state, parent, &name).await;
             let _ = reply.send(result);
@@ -508,7 +508,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 // Ensure inode exists.
                 let _ = get_inode(state, ino).await?;
 
-                // F-fuse-lease-1: AcquireLease BEFORE bumping the
+                // AcquireLease BEFORE bumping the
                 // local open_count so a conflicting writer surfaces
                 // as `EBUSY` (mapped to ErrorKind::Other in
                 // `err_to_errno`). Refcount the lease per-mount.
@@ -729,7 +729,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
         }
         FsRequest::Release { ino, flush, reply } => {
             let result = async {
-                // F-fuse-lease-1 (coco P1 #2 fix): writer-release
+                // coco P1 #2 fix: writer-release
                 // MUST happen AFTER dirty data is flushed (plan
                 // §6.2). The kernel's `flush: bool` argument is
                 // unreliable — close-with-error paths and some
@@ -810,7 +810,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         tracing::warn!(
                             ino,
                             error = %e,
-                            "F-fuse-lease-1: ReleaseLease failed; TTL revoke is the backstop"
+                            "ReleaseLease failed; TTL revoke is the backstop"
                         );
                     }
                 }
@@ -877,10 +877,10 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
 }
 
 #[cfg(test)]
-mod f_fuse_lease_2_unit_tests {
-    //! F-fuse-lease-2 (coco P3 review feedback): unit-test the
+mod fuse_lease_2_unit_tests {
+    //! coco P3 review feedback: unit-test the
     //! per-event ⇒ invalidator-call contract so default `cargo test`
-    //! catches regressions. The `f_fuse_lease_2.rs` integration
+    //! catches regressions. The `fuse_lease_2.rs` integration
     //! suite is `#[ignore]`'d (cluster-boot, slow); these guard
     //! the same shape with no cluster.
 
@@ -1351,7 +1351,7 @@ mod bug_lease_7_open_cache_version_tests {
     //! against (cached_version, acquired_version) on every Open;
     //! a `true` return drops the cached InodeState and forces
     //! `get_inode` to repopulate. Mirror of ioring's
-    //! F-ioring-lease-4 + F-ioring-lease-5 #1 staleness check.
+    //! lease-version staleness check.
 
     use super::inode_cache_needs_reload;
 

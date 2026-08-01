@@ -1,4 +1,4 @@
-//! F072: System test — extent node crash, StreamClient retries on new extent.
+//! System test — extent node crash, StreamClient retries on new extent.
 //!
 //! With 3 extent nodes, a 2-replica stream is created on (node1, node2).
 //! We register a third node but simulate node1 failure by stopping it.

@@ -1,4 +1,4 @@
-//! F109 — physical extent file deletion when refs → 0.
+//! physical extent file deletion when refs → 0.
 //!
 //! When `handle_stream_punch_holes` / `handle_truncate` decrement an
 //! extent's refcount to 0, the snapshot of its replica set is captured
@@ -7,7 +7,7 @@
 //! replica address. Idempotent on the receiver side, so retries from
 //! this loop are safe.
 //!
-//! F207-C: the persistence of "delete in flight on this extent" is now
+//! the persistence of "delete in flight on this extent" is now
 //! the unified inflight ledger (`extent_inflight/<id>` etcd prefix +
 //! `AutumnManager.inflight` in-memory map). The ledger entry's payload
 //! carries a snapshot of `pending_addrs` so a new leader's
@@ -30,7 +30,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::AutumnManager;
 
-/// F210-G2: long-lived persisted retry queue for deletes whose primary
+/// long-lived persisted retry queue for deletes whose primary
 /// retry budget (`MAX_ATTEMPTS = 60`) was exhausted. Etcd prefix. Without
 /// this, deleted-extent metadata in etcd already had refs=0 but the
 /// physical files persisted on the offline replica until that node's
@@ -59,7 +59,7 @@ pub struct MgrExtentDeleteRetry {
 }
 
 /// One outstanding delete the manager still needs to ship to one or
-/// more replicas. F207-C: the etcd persistence side lives in the
+/// more replicas. The etcd persistence side lives in the
 /// unified inflight ledger as `ExtentOpPayload::Delete`; this in-memory
 /// struct tracks per-attempt live state that does NOT survive failover.
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// NO stream).
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// F210-G2: backoff cadence for the persisted retry loop. Each
+/// backoff cadence for the persisted retry loop. Each
 /// `MgrExtentDeleteRetry` increments `attempts` once per attempt; the
 /// backoff for the next try is `RETRY_BACKOFF_BASE * 2^min(attempts, MAX_SHIFT)`,
 /// floor `RETRY_BACKOFF_BASE`, ceiling `RETRY_BACKOFF_MAX`. With base
@@ -109,8 +109,8 @@ fn epoch_seconds() -> i64 {
 }
 
 impl AutumnManager {
-    /// F207-C: enqueue pending deletes. Acquires a Delete entry in the
-    /// unified inflight ledger (atomic CAS create_revision==0 + F149
+    /// enqueue pending deletes. Acquires a Delete entry in the
+    /// unified inflight ledger (atomic CAS create_revision==0 + leader
     /// fence) for each extent, and populates the in-memory
     /// `delete_progress` map with live attempt state.
     ///
@@ -149,7 +149,7 @@ impl AutumnManager {
                     // node-startup reconcile is the backstop.
                     tracing::warn!(
                         extent_id = d.extent_id,
-                        "F207-C: enqueue_pending_deletes saw existing inflight marker; \
+                        "enqueue_pending_deletes saw existing inflight marker; \
                          relying on node-startup reconcile backstop"
                     );
                 }
@@ -179,7 +179,7 @@ impl AutumnManager {
     /// until Stage 2's migration clears the field.
     ///
     /// Mirrors `punch_holes`: fenced `extents/<id>` etcd delete → in-memory
-    /// remove → `enqueue_pending_deletes` (acquires the F207 Delete marker;
+    /// remove → `enqueue_pending_deletes` (acquires the Delete marker;
     /// `extent_delete_loop` fans out the physical unlink). Returns the count
     /// reclaimed this pass.
     pub(crate) async fn extent_both_zero_sweep_once(&self) -> usize {
@@ -253,7 +253,7 @@ impl AutumnManager {
             // extent-state path:
             // - #3 atomicity: the `extents/<id>` delete and the Delete inflight
             //   marker are separate steps (same as `punch_holes`); a crash
-            //   between them is reaped by the F109 node-startup reconcile. A
+            //   between them is reaped by the node-startup reconcile. A
             //   space-leak backstop, not data loss.
             if let Some(etcd) = &self.etcd {
                 let key = format!("extents/{eid}");
@@ -288,7 +288,7 @@ impl AutumnManager {
     }
 
     /// EXTENT10-AUTORECLAIM background loop (leader-only via the gate inside
-    /// `extent_both_zero_sweep_once`; F228-supervised by `start_runtime_tasks`).
+    /// `extent_both_zero_sweep_once`; supervised by `start_runtime_tasks`).
     pub(crate) async fn extent_both_zero_sweep_loop(self) {
         loop {
             compio::time::sleep(BOTH_ZERO_SWEEP_INTERVAL).await;
@@ -303,7 +303,7 @@ impl AutumnManager {
                 continue;
             }
 
-            // F207-C: drain the in-memory progress map (NOT the ledger).
+            // drain the in-memory progress map (NOT the ledger).
             // The ledger is the "delete is in flight" flag; live retry
             // state lives in-memory. On failover, the new leader's
             // `replay_from_etcd` rehydrates `delete_progress` from the
@@ -330,9 +330,9 @@ impl AutumnManager {
                     tracing::info!(
                         extent_id = entry.extent_id,
                         attempts = entry.attempts + 1,
-                        "F109 extent delete: all replicas acked",
+                        "extent delete: all replicas acked",
                     );
-                    // F207-C: release the ledger entry atomically with
+                    // release the ledger entry atomically with
                     // the in-memory removal (which already happened via
                     // the drain at the top of this iteration).
                     self.release_delete_marker(entry.extent_id).await;
@@ -347,10 +347,10 @@ impl AutumnManager {
                         extent_id = entry.extent_id,
                         attempts = entry.attempts,
                         remaining_replicas = entry.pending_addrs.len(),
-                        "F109 extent delete: max retries exhausted in primary loop; \
-                         moving to F210-G2 persisted retry queue",
+                        "extent delete: max retries exhausted in primary loop; \
+                         moving to persisted retry queue",
                     );
-                    // F210-G2: instead of abandoning to the
+                    // instead of abandoning to the
                     // node-startup reconcile backstop (unbounded
                     // free-space-leak window for any node that stays
                     // down >2 min), persist the pending addrs to the
@@ -368,7 +368,7 @@ impl AutumnManager {
                         tracing::error!(
                             extent_id = entry.extent_id,
                             error = %e,
-                            "F210-G2: persist failed delete to etcd failed; \
+                            "persist failed delete to etcd failed; \
                              will fall back to node-startup reconcile"
                         );
                     }
@@ -397,7 +397,7 @@ impl AutumnManager {
                 tracing::warn!(
                     extent_id,
                     error = %e,
-                    "F207-C: failed to clear Delete inflight marker; \
+                    "failed to clear Delete inflight marker; \
                      will retry on next loop iteration if state is consistent"
                 );
                 return;
@@ -435,7 +435,7 @@ impl AutumnManager {
         addrs
     }
 
-    /// F210-G2: persist a long-lived retry entry to etcd + the in-memory
+    /// persist a long-lived retry entry to etcd + the in-memory
     /// shadow. Idempotent: re-persisting an existing entry simply updates
     /// the `attempts` / `last_attempt_at` fields.
     pub(crate) async fn persist_failed_delete(
@@ -458,7 +458,7 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// F210-G2: slow retry loop for entries persisted to the
+    /// slow retry loop for entries persisted to the
     /// `extentDeleteRetry/` etcd prefix. Wakes every
     /// `RETRY_LOOP_INTERVAL` (1 min). For each entry whose `last_attempt_at`
     /// + per-entry exponential backoff has elapsed, retries every
@@ -508,7 +508,7 @@ impl AutumnManager {
                     tracing::info!(
                         extent_id,
                         attempts = entry.attempts + 1,
-                        "F210-G2: persisted-retry delete finally acked on every replica",
+                        "persisted-retry delete finally acked on every replica",
                     );
                     self.failed_deletes.borrow_mut().remove(&extent_id);
                     if let Some(etcd) = &self.etcd {
@@ -517,7 +517,7 @@ impl AutumnManager {
                             tracing::warn!(
                                 extent_id,
                                 error = %e,
-                                "F210-G2: failed to clear retry etcd key; will re-clear next tick"
+                                "failed to clear retry etcd key; will re-clear next tick"
                             );
                             // Re-insert so the next tick retries clearing.
                             self.failed_deletes.borrow_mut().insert(
@@ -543,7 +543,7 @@ impl AutumnManager {
                         tracing::warn!(
                             extent_id,
                             error = %e,
-                            "F210-G2: failed to update retry etcd key; in-memory still updated"
+                            "failed to update retry etcd key; in-memory still updated"
                         );
                     }
                 }

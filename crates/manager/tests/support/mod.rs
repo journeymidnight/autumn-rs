@@ -49,7 +49,7 @@ pub fn pick_addr() -> SocketAddr {
     addr
 }
 
-/// F270: pick a free FIXED port BELOW the kernel's ephemeral range for
+/// pick a free FIXED port BELOW the kernel's ephemeral range for
 /// components that get killed + respawned on the SAME port (chaos ENs).
 /// `pick_addr` (`bind :0`) returns an ephemeral-range port; using that as a
 /// long-lived identity loses a race after kill -9 — while the process is
@@ -152,7 +152,7 @@ pub fn start_extent_node_stoppable(
 
 /// Start a partition server on its own thread.
 ///
-/// F099-K note: `PartitionServer::connect()` implicitly calls
+/// note: `PartitionServer::connect()` implicitly calls
 /// `sync_regions_once()` during `finish_connect`. That sync opens any
 /// partitions already assigned to this PS via `open_partition`, which
 /// binds a dedicated per-partition listener on `base_port + ord`.
@@ -332,11 +332,11 @@ pub async fn get_regions(mgr: &RpcClient) -> GetRegionsResp {
 /// Put a key-value pair.
 pub async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
     // Bounded retry on transient errors. The first write on a stream
-    // triggers tail-init `current_commit`, which under F227 requires ALL
+    // triggers tail-init `current_commit`, which requires ALL
     // replicas to answer `commit_length`; a momentary single-replica
     // non-response (common on a loaded test cluster during a concurrent
     // split/merge storm, or right after PS startup) surfaces as a
-    // retryable `Internal` error. The F227 contract is "the caller
+    // retryable `Internal` error. The commit-length contract is "the caller
     // retries"; the production SDK (maps Internal → retryable ServerError)
     // and the concurrent-writer task in `system_merge` both already do.
     // This helper used to `.expect()` on the first attempt, so a transient
@@ -549,9 +549,9 @@ pub async fn ps_range(
     r
 }
 
-// ── F099-K per-partition router ───────────────────────────────────────
+// ── per-partition router ───────────────────────────────────────
 //
-// After F099-K, each partition binds its own TCP listener at
+// Each partition binds its own TCP listener at
 // `base_port + ord`; cross-partition frames sent to the wrong port are
 // rejected with `NotFound` ("partition X not served by this P-log
 // (owner=Y)"). Tests that touch multiple partitions on one PS (e.g.
@@ -684,43 +684,43 @@ impl PsRouter {
     }
 }
 
-/// Routed `ps_put` — F099-K aware: dials the partition's own listener.
+/// Routed `ps_put` — partition-aware: dials the partition's own listener.
 pub async fn psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) {
     let c = router.client_for(part_id).await;
     ps_put(&c, part_id, key, value).await;
 }
 
-/// Routed `ps_get` — F099-K aware.
+/// Routed `ps_get` — partition-aware.
 pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
     let c = router.client_for(part_id).await;
     ps_get(&c, part_id, key).await
 }
 
-/// Routed `ps_flush` — F099-K aware.
+/// Routed `ps_flush` — partition-aware.
 pub async fn psr_flush(router: &PsRouter, part_id: u64) {
     let c = router.client_for(part_id).await;
     ps_flush(&c, part_id).await;
 }
 
-/// Routed `ps_compact` — F099-K aware.
+/// Routed `ps_compact` — partition-aware.
 pub async fn psr_compact(router: &PsRouter, part_id: u64) {
     let c = router.client_for(part_id).await;
     ps_compact(&c, part_id).await;
 }
 
-/// Routed `ps_gc` — F099-K aware.
+/// Routed `ps_gc` — partition-aware.
 pub async fn psr_gc(router: &PsRouter, part_id: u64) {
     let c = router.client_for(part_id).await;
     ps_gc(&c, part_id).await;
 }
 
-/// Routed `ps_head` — F099-K aware.
+/// Routed `ps_head` — partition-aware.
 pub async fn psr_head(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
     let c = router.client_for(part_id).await;
     ps_head(&c, part_id, key).await
 }
 
-/// Routed `ps_range` — F099-K aware.
+/// Routed `ps_range` — partition-aware.
 pub async fn psr_range(
     router: &PsRouter,
     part_id: u64,
@@ -841,7 +841,7 @@ where
 // uses whatever etcd version is installed on the system (verified
 // against 3.5.x).
 //
-// All etcd-dependent tests (`f149_leader_fence`, `f209_apply_done_atomicity`,
+// All etcd-dependent tests (`leader_fence`, `apply_done_atomicity`,
 // `system_manager_failover`, `etcd_stream_integration`) call
 // `start_etcd()` and drop the returned guard at test exit.
 

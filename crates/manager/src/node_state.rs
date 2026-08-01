@@ -1,4 +1,4 @@
-//! F211-A: per-extent-node auto-tracked liveness (Online ↔ Suspected).
+//! per-extent-node auto-tracked liveness (Online ↔ Suspected).
 //!
 //! Pure in-memory; no etcd persistence. Re-derived on leader failover from
 //! the next `df` poll (the new leader gets a 1-tick window to observe each
@@ -9,24 +9,24 @@
 //! `AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS` (default 10 s). Hard fence
 //! ("the operator confirms the node is dead, proceed to recovery + EC
 //! abandon") is **always** an explicit operator action — `mgr_fence_node`
-//! (F211-C) writes an etcd `node_override/<node_id>` row, which F211-D
-//! reads to bump owner-lock revisions, and F211-E reads to gate recovery.
+//! writes an etcd `node_override/<node_id>` row, which downstream logic
+//! reads to bump owner-lock revisions and to gate recovery.
 //!
 //! This is the "manager provides facts, operator policy script decides"
-//! split (F211 design; HDFS decommission analogue).
+//! split (HDFS decommission analogue).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Auto-tracked per-node state. F214-B added `Suspend` — a registered
+/// Auto-tracked per-node state. `Suspend` is a registered
 /// node that has never had a successful heartbeat. Distinct from
 /// `Suspected` (which means "was alive and verified, now flaky") so the
 /// operator-facing health report can distinguish "format ran but EN
 /// never started" from "EN was running and crashed". `Down` / `Fenced`
-/// remain operator-driven and live in `node_override/<id>` (F211-C).
+/// remain operator-driven and live in `node_override/<id>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAutoState {
-    /// F214-B: post-register, pre-first-df. The state machine entry
+    /// post-register, pre-first-df. The state machine entry
     /// point. Transitions to `Online` on the first successful heartbeat
     /// (df ok), or via operator re-register. Never transitions to
     /// `Suspected` — Suspended requires a prior verified-alive baseline.
@@ -97,7 +97,7 @@ impl NodeStateTracker {
         self.states.insert(node_id, NodeAutoState::Online);
     }
 
-    /// F214-B: first-time register seed. Sets the state to `Suspend` and
+    /// first-time register seed. Sets the state to `Suspend` and
     /// does **not** touch `last_ok` — we have no first heartbeat yet, so
     /// any later `on_heartbeat_fail` defensively flips us to `Suspected`
     /// only after the soft timeout (its `last_ok` lookup falls through
@@ -107,7 +107,7 @@ impl NodeStateTracker {
     /// Re-register (operator re-runs format / register-node against an
     /// already-known address) goes through `on_heartbeat_ok` instead —
     /// the operator's explicit re-registration counts as vouching the
-    /// node alive, matching the pre-F214 F211-A behaviour.
+    /// node alive, matching the earlier behaviour.
     pub fn on_register_first(&mut self, node_id: u64) {
         self.states.insert(node_id, NodeAutoState::Suspend);
         // No last_ok insert — see doc above.
@@ -115,7 +115,7 @@ impl NodeStateTracker {
 
     /// Heartbeat failure. Mark `Suspected` only when we already have a
     /// verified-alive baseline (`last_ok` set) AND the soft timeout has
-    /// elapsed. F214-B: a `Suspend` node — registered but never
+    /// elapsed. A `Suspend` node — registered but never
     /// verified — stays `Suspend` on failure; never auto-promoted to
     /// `Suspected` because the "was alive, now flaky" framing requires
     /// the prior verified state.
@@ -131,7 +131,7 @@ impl NodeStateTracker {
         let cur = self.states.get(&node_id).copied();
         match cur {
             Some(NodeAutoState::Suspected { .. }) => {}
-            Some(NodeAutoState::Suspend) => {} // F214-B: no auto-promotion
+            Some(NodeAutoState::Suspend) => {} // no auto-promotion
             Some(NodeAutoState::Online) | None => {
                 if elapsed_since_ok >= self.soft_timeout {
                     self.states
@@ -143,7 +143,7 @@ impl NodeStateTracker {
 
     /// Periodic tick — promote stale `Online` entries even without an
     /// explicit failure call (defensive against missed failure paths).
-    /// F214-B: `Suspend` nodes (no `last_ok` ever) are not affected — the
+    /// `Suspend` nodes (no `last_ok` ever) are not affected — the
     /// filter on `self.last_ok.iter()` naturally skips them.
     pub fn tick(&mut self) {
         let now = Instant::now();
@@ -191,15 +191,15 @@ impl NodeStateTracker {
         }
     }
 
-    /// F214-B test helper: seed a node directly into the `Suspend` state.
+    /// test helper: seed a node directly into the `Suspend` state.
     #[cfg(test)]
     pub(crate) fn _test_register_first(&mut self, node_id: u64) {
         self.on_register_first(node_id);
     }
 
-    /// F214-B: return the set of node_ids whose state is `Online`. Used
+    /// return the set of node_ids whose state is `Online`. Used
     /// by `select_nodes` to gate fresh extent allocation on a verified-
-    /// alive baseline. Pre-F214-B, allocation gated only on
+    /// alive baseline. Previously, allocation gated only on
     /// `disk.online`, which is a per-disk-health signal — that left a
     /// 10-20 s "Pending" window after `register-node` where the
     /// allocation could target an EN whose binary had never started.
@@ -210,7 +210,7 @@ impl NodeStateTracker {
             .collect()
     }
 
-    /// F-FENCE-DRAIN: node_ids currently `Suspected` (was verified-alive, now
+    /// node_ids currently `Suspected` (was verified-alive, now
     /// flaky). Folded into `placement_excluded_node_ids` so a flapping node
     /// stops receiving NEW extents until it recovers to `Online` or is fenced.
     /// `Suspend` (registered-but-never-verified) is deliberately NOT included —
@@ -224,7 +224,7 @@ impl NodeStateTracker {
     }
 
     /// Snapshot: `(node_id, state, last_heartbeat_secs_ago)` for every
-    /// tracked node. Used by `mgr_list_node_states` (F211-B).
+    /// tracked node. Used by `mgr_list_node_states`.
     pub fn snapshot(&self) -> Vec<(u64, NodeAutoState, Option<u64>)> {
         let mut out = Vec::with_capacity(self.states.len());
         for (id, st) in self.states.iter() {
@@ -327,7 +327,7 @@ mod tests {
         assert!(t.last_heartbeat_secs_ago(7).is_none());
     }
 
-    // ── F214-B ──────────────────────────────────────────────────────
+    // ── Suspend state machine ───────────────────────────────────────
 
     #[test]
     fn register_first_seeds_suspend() {

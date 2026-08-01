@@ -237,10 +237,10 @@ autumn-rpc 现状是 req/resp 模型，**没有 streaming RPC**。要么扩 autu
 
 | Feature | 范围 | 验收 |
 |---------|------|------|
-| F-ioring-lease-1 | manager 加 InodeLease + 4 个 RPC + etcd 持久化 | 单元测试 + 多客户端 acquire/release |
-| F-ioring-lease-2 | ioring daemon Open/Close 接 lease | 两 daemon 并跑互斥写测试 |
-| F-ioring-lease-3 | invalidation push 通道（常驻 poll） | writer close → reader 1s 内 invalidate |
-| F-ioring-lease-4 | OpenedExtents version 标记 + cache 失效 | e2e：两个 daemon 读写同 ino，cache 正确失效 |
-| F-fuse-lease-1 | fuse open/release 接 lease | 与 ioring 互操作 |
-| F-fuse-lease-2 | fuse kernel cache invalidate (`notify_inval_inode`) | multi-host fuse mount 验证 |
-| F-lease-preempt | force-revoke + writer revoke 协议 | 抢占测试 |
+| inode-lease 状态机 + RPC | manager 加 InodeLease + 4 个 RPC + etcd 持久化 | 单元测试 + 多客户端 acquire/release |
+| daemon 客户端 lease | ioring daemon Open/Close 接 lease | 两 daemon 并跑互斥写测试 |
+| invalidation long-poll 通道 | invalidation push 通道（常驻 poll） | writer close → reader 1s 内 invalidate |
+| close-to-open cache 失效 | OpenedExtents version 标记 + cache 失效 | e2e：两个 daemon 读写同 ino，cache 正确失效 |
+| fuse 挂载 lease | fuse open/release 接 lease | 与 ioring 互操作 |
+| fuse 内核 cache 失效 | fuse kernel cache invalidate (`notify_inval_inode`) | multi-host fuse mount 验证 |
+| force-revoke / writer revoke 抢占 | force-revoke + writer revoke 协议 | 抢占测试 |

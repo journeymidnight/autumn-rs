@@ -1,5 +1,5 @@
-//! F068: System test — manager leader failover preserves full state.
-//! F071: System test — manager crash during split, state consistent.
+//! System test — manager leader failover preserves full state.
+//! System test — manager crash during split, state consistent.
 //!
 //! These tests spawn the `etcd` binary (override via `AUTUMN_TEST_ETCD_BIN`).
 //! Marked `#[ignore]` so CI without etcd skips them — run explicitly:
@@ -29,7 +29,7 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
     std::thread::sleep(Duration::from_millis(300));
 }
 
-// ── F068: Manager failover preserves full state ───────────────────────
+// ── Manager failover preserves full state ───────────────────────
 
 #[test]
 #[ignore] // requires embedded etcd (go runtime)
@@ -122,7 +122,7 @@ fn manager_failover_preserves_streams_and_partitions() {
     });
 }
 
-// ── F071: Manager crash during split — state consistent ───────────────
+// ── Manager crash during split — state consistent ───────────────
 
 #[test]
 #[ignore] // requires embedded etcd (go runtime)

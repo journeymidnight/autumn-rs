@@ -1,4 +1,4 @@
-//! F109 — physical extent file deletion when refs → 0 (end-to-end).
+//! physical extent file deletion when refs → 0 (end-to-end).
 //!
 //! Drives `MSG_STREAM_PUNCH_HOLES` directly via `StreamClient` (the same
 //! RPC the GC loop in autumn-partition-server eventually calls) and
@@ -52,7 +52,7 @@ fn list_dat_files(dir: &Path) -> HashSet<String> {
 }
 
 #[test]
-fn f109_punched_extents_are_physically_unlinked() {
+fn punched_extents_are_physically_unlinked() {
     let (mgr_addr, n1_addr, n2_addr, n1_dir, n2_dir) = setup_two_node_infra(7200);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -74,7 +74,7 @@ fn f109_punched_extents_are_physically_unlinked() {
         )
         .await
         .expect("StreamClient::connect");
-        // F099 worker requires explicit ResetTail; the easiest way to
+        // worker requires explicit ResetTail; the easiest way to
         // populate the worker's tail cache is to call append once and
         // let alloc roll on the next call. We do 6 appends of 600 B
         // each → 6 rolls → ~6 extents added to the initial one = 7
@@ -139,7 +139,7 @@ fn f109_punched_extents_are_physically_unlinked() {
         let after_n2 = list_dat_files(n2_dir.path());
         assert!(
             unlinked,
-            "F109: punched extents not unlinked on both replicas within 8 s.\n\
+            "punched extents not unlinked on both replicas within 8 s.\n\
              punched={:?}\nbefore n1={:?}\nafter  n1={:?}\nbefore n2={:?}\nafter  n2={:?}",
             to_punch, before_n1, after_n1, before_n2, after_n2,
         );
@@ -150,7 +150,7 @@ fn f109_punched_extents_are_physically_unlinked() {
             let basename = format!("extent-{eid}.dat");
             assert!(
                 after_n1.contains(&basename) || after_n2.contains(&basename),
-                "F109: surviving extent {eid} missing from both replicas",
+                "surviving extent {eid} missing from both replicas",
             );
         }
     });

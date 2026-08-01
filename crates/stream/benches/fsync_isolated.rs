@@ -17,8 +17,8 @@
 //! Two scenarios per directory:
 //!
 //!  * **Per-write fsync** — write + fdatasync per op. Models the
-//!    pre-F178 ceiling (every Put = one fsync, no coalescing).
-//!  * **Group commit** — K writes then 1 fdatasync. Models the F178
+//!    pre-coalescer ceiling (every Put = one fsync, no coalescing).
+//!  * **Group commit** — K writes then 1 fdatasync. Models the
 //!    coalescer's amortized cost. K=16 mirrors `--depth 8` batch sizes;
 //!    K=256 mirrors `MAX_WRITE_BATCH`.
 //!

@@ -10,7 +10,7 @@ use autumn_transport::TransportKind;
 fn usage() -> ! {
     eprintln!("usage: autumn-op [--manager addr] [--json] [--admin-token-file F] <command>");
     eprintln!("  --admin-token-file F: authorize cluster-mutating ops (fence/remove/merge/create-stream/…)");
-    eprintln!("    when the manager was started with --admin-token-file (F-ADMIN-OP-AUTH). Read-only ops ignore it.");
+    eprintln!("    when the manager was started with --admin-token-file. Read-only ops ignore it.");
     eprintln!();
     eprintln!("read / observability commands:");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
@@ -20,9 +20,9 @@ fn usage() -> ! {
     eprintln!("  recovery-stats               in-flight + per-source/target counters");
     eprintln!("  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]");
     eprintln!("                               query operator action history");
-    eprintln!("  info [--part PID] [--detail] show cluster snapshot (F213; --detail = F203 partition load)");
+    eprintln!("  info [--part PID] [--detail] show cluster snapshot (--detail = partition load)");
     eprintln!(
-        "  policy-candidates            advisory split/merge/gc/compact/ec candidates (F213)"
+        "  policy-candidates            advisory split/merge/gc/compact/ec candidates"
     );
     eprintln!("  cluster-version              persisted cluster_version + manager wire interval (R1)");
     eprintln!();
@@ -36,13 +36,13 @@ fn usage() -> ! {
     eprintln!("  unfence <id> --by alice");
     eprintln!("  remove <id> --by alice");
     eprintln!();
-    eprintln!("cluster / partition admin commands (F213, moved from autumn-client):");
+    eprintln!("cluster / partition admin commands (moved from autumn-client):");
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]");
     eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
-    eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (F-PRESPLIT-NS-RULES; presplit EMPTY keyspace before loading)");
+    eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
     eprintln!("           fs: --lanes <N> [--parts <P>] [--admin-token-file F to record] [--force to narrow declared lanes]");
     eprintln!("      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>");
     eprintln!("           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)");
@@ -54,8 +54,8 @@ fn usage() -> ! {
     eprintln!("  compact <PARTID>");
     eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
     eprintln!("  forcegc <PARTID> <EXTID>...");
-    // F214-C: `register-node` removed; `format` is the single per-EN setup.
-    // F-EN-DYNSHARD M1c: format is IDENTITY-ONLY — it no longer takes a
+    // `register-node` removed; `format` is the single per-EN setup.
+    // M1c: format is IDENTITY-ONLY — it no longer takes a
     // location (no --listen/--advertise/--shard-ports). The EN binary's own
     // `--advertise` self-registers the live location at every startup.
     eprintln!("  format <DIR>...");
@@ -63,7 +63,7 @@ fn usage() -> ! {
         "                               format dir(s), register node identity, stamp cluster_id"
     );
     eprintln!();
-    eprintln!("namespace registry (F-KEY-NS D2, admin — needs --admin-token[-file]):");
+    eprintln!("namespace registry (admin — needs --admin-token[-file]):");
     eprintln!("  namespace-create --name <NS> [--with-tenant <T>] [--presplit <hex,hex,...>] --admin-token <TOK>");
     eprintln!("                               register a namespace (--with-tenant marks it protected)");
     eprintln!("  namespace-delete --name <NS> [--force] --admin-token <TOK>");
@@ -85,7 +85,7 @@ fn val(raw: &[String], i: usize) -> &str {
     }
 }
 
-/// F2: parse a required positional as a number, printing a NAMED error + usage
+/// Parse a required positional as a number, printing a NAMED error + usage
 /// instead of panicking with a raw `ParseIntError` backtrace. `--help`/`-h` in a
 /// positional slot prints usage (so `autumn-op split --help` works). Missing arg
 /// → usage.
@@ -100,7 +100,7 @@ fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
     })
 }
 
-/// F-AUTHZ-1: read a secret (admin token / tenant credential) from a file,
+/// read a secret (admin token / tenant credential) from a file,
 /// trimming a trailing newline. Preferred over passing secrets on argv, which
 /// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
 fn read_secret_file(path: &str) -> String {
@@ -113,7 +113,7 @@ fn read_secret_file(path: &str) -> String {
     }
 }
 
-/// F-KEY-NS D2: parse the `--presplit` value = a comma-separated list of HEX
+/// D2: parse the `--presplit` value = a comma-separated list of HEX
 /// split points into raw bytes. Empty / whitespace-only → no points. Each token
 /// must be an even-length ASCII hex string (a raw split key). Bad hex → usage().
 /// These are FROZEN for D8 (stored in the registry, not acted upon in SD-1).
@@ -150,7 +150,7 @@ pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) json: bool,
     pub(crate) transport: TransportKind,
-    /// F-ADMIN-OP-AUTH: shared admin secret for cluster-mutating ops
+    /// shared admin secret for cluster-mutating ops
     /// (`--admin-token[-file]`). Applied to the client at connect via
     /// `set_admin_token`; read-only commands are unaffected. `None` = don't send
     /// a token (a token-less manager runs these bare; a token-ON manager refuses).
@@ -158,7 +158,7 @@ pub(crate) struct Args {
     pub(crate) cmd: Command,
 }
 
-/// F-SPLIT-AT-KEY (D4) — where `autumn-op split` cuts the partition.
+/// (D4) — where `autumn-op split` cuts the partition.
 ///
 /// The wire (SPLIT_PART) only ever carries a RAW byte key (partition layer is
 /// namespace-agnostic, D5). This enum is the CLI-side INTENT; `resolve_at_key`
@@ -193,7 +193,7 @@ impl SplitPoint {
                 tenant,
                 suffix,
             } => {
-                // F-NS-PRINCIPAL-UNIFIED: cut key = `{namespace}/` (+ `{tenant}/`
+                // cut key = `{namespace}/` (+ `{tenant}/`
                 // as an in-namespace sub-segment, e.g. mem/kvc; empty for fs).
                 let mut key = format!("{namespace}/").into_bytes();
                 if !tenant.is_empty() {
@@ -238,7 +238,7 @@ impl SplitPoint {
 }
 
 pub(crate) enum Command {
-    // F211 read / observability
+    // read / observability
     ListNodes,
     // cluster-df: aggregate capacity summary (Ceph `ceph df` style)
     Df,
@@ -260,7 +260,7 @@ pub(crate) enum Command {
         until: i64,
         limit: u32,
     },
-    // F211 node-lifecycle admin
+    // node-lifecycle admin
     Fence {
         node_id: u64,
         reason: String,
@@ -281,7 +281,7 @@ pub(crate) enum Command {
         node_id: u64,
         by: String,
     },
-    // F213 read / observability (migrated from autumn-client)
+    // read / observability (migrated from autumn-client)
     Info {
         part: Option<u64>,
         detail: bool,
@@ -291,14 +291,14 @@ pub(crate) enum Command {
         full: bool,
     },
     PolicyCandidates,
-    /// F-DASH-IN-MGR M2: headless control of the in-manager auto-policy
+    /// M2: headless control of the in-manager auto-policy
     /// controller. `action` = status | activate | deactivate.
     AutoPolicy {
         action: String,
         name: String,
         arm: bool,
     },
-    // F213 cluster / partition admin (migrated from autumn-client)
+    // cluster / partition admin (migrated from autumn-client)
     Bootstrap {
         replication: String,
         presplit: String,
@@ -315,22 +315,22 @@ pub(crate) enum Command {
     },
     Split {
         part_id: u64,
-        /// F-SPLIT-AT-KEY (D4): where to cut. See `SplitPoint`.
+        /// (D4): where to cut. See `SplitPoint`.
         point: SplitPoint,
     },
-    /// F-PRESPLIT-NS-RULES: presplit a `{tenant}/{namespace}/` keyspace by the
+    /// presplit a `{tenant}/{namespace}/` keyspace by the
     /// namespace's natural dimension. Explicit op (NOT bootstrap — the tenant
     /// must exist first).
     Presplit {
         namespace: String,
         tenant: String,
         rule: PresplitRule,
-        /// F-FS-GEOM-DECLARED step 4: admin token used to RECORD the applied cut
+        /// step 4: admin token used to RECORD the applied cut
         /// points as protected boundaries (`--admin-token` / `--admin-token-file`).
         /// Optional — without it the cuts still land, but merge won't refuse to
         /// undo them (a warning says so).
         admin_token: Option<String>,
-        /// F-KEY-NS UX-fix (M5): required to NARROW an fs's declared stripe
+        /// UX-fix (M5): required to NARROW an fs's declared stripe
         /// geometry (`--lanes` smaller than the current declaration). Without it,
         /// a redeclare that lowers the lane count is refused — a stray
         /// `presplit --namespace fs --lanes 2` would otherwise silently halve
@@ -340,13 +340,13 @@ pub(crate) enum Command {
     Merge {
         survivor_part_id: u64,
         victim_part_id: u64,
-        /// F-FS-GEOM-DECLARED step 4: merge THROUGH a declared presplit
+        /// step 4: merge THROUGH a declared presplit
         /// boundary. Refused without this — erasing an operator-declared
         /// boundary is silent (for fs lanes: later large files stripe narrower,
         /// no error anywhere).
         force: bool,
     },
-    /// F-REGION-REBALANCE: actively re-spread partitions across the PS fleet.
+    /// actively re-spread partitions across the PS fleet.
     Rebalance {
         max_moves: u32,
     },
@@ -364,11 +364,11 @@ pub(crate) enum Command {
         part_id: u64,
         extent_ids: Vec<u64>,
     },
-    // F214-C: `register-node` merged into `format`. Variant kept so
+    // `register-node` merged into `format`. Variant kept so
     // the parser can route the legacy spelling to a migration stub
     // (in run()) instead of failing at parse with "unknown subcommand".
     RegisterNode,
-    /// F-EN-DYNSHARD M1c: format is IDENTITY-ONLY (mints/reuses `node_uuid` +
+    /// M1c: format is IDENTITY-ONLY (mints/reuses `node_uuid` +
     /// per-dir `disk_uuid`, registers with an EMPTY location). It no longer
     /// carries `listen`/`advertise`/`shard_ports` — the EN binary's own
     /// `--advertise` self-registers the live address + shard ports at every
@@ -376,13 +376,13 @@ pub(crate) enum Command {
     /// prepare`: mkfs mints identity only, the daemon reports its own network
     /// location on every boot). See docs/en_dynamic_shard_design.md §2.2.
     Format { dirs: Vec<String> },
-    // ── F-AUTHZ-1 data-plane authz tooling ──────────────────────────────────
+    // ── data-plane authz tooling ──────────────────────────────────
     /// Generate an Ed25519 signing key (LOCAL — no manager). Prints the keyfile
     /// line (`<kid> <hex-seed>`) to stdout; redirect to `--auth-signing-key-file`.
     GenSigningKey {
         kid: u32,
     },
-    /// F-NS-PRINCIPAL-UNIFIED: create/rotate a PRINCIPAL account (admin — needs
+    /// create/rotate a PRINCIPAL account (admin — needs
     /// `--admin-token`). Returns the principal's permanent credential (shown once,
     /// as `<name>\n<hex>` for direct save to a credential file).
     PrincipalCreate {
@@ -402,7 +402,7 @@ pub(crate) enum Command {
         principal: String,
         credential: String,
     },
-    /// F-KEY-NS D2: register a namespace (admin — needs `--admin-token`).
+    /// D2: register a namespace (admin — needs `--admin-token`).
     /// `--with-tenant <T>` marks it protected (owner tenant = T). `--presplit`
     /// takes comma-separated hex split points (frozen for D8; stored, not yet
     /// acted upon).
@@ -412,7 +412,7 @@ pub(crate) enum Command {
         presplit: Vec<Vec<u8>>,
         admin_token: String,
     },
-    /// F-KEY-NS D2: delete a namespace registry row (admin). Refuses a non-empty
+    /// D2: delete a namespace registry row (admin). Refuses a non-empty
     /// namespace unless `--force` (the emptiness check is done client-side here,
     /// scanning the prefix — the manager has no KV data-plane client).
     NamespaceDelete {
@@ -420,9 +420,9 @@ pub(crate) enum Command {
         force: bool,
         admin_token: String,
     },
-    /// F-KEY-NS D2: list the full namespace registry (rich rows). Read-only.
+    /// D2: list the full namespace registry (rich rows). Read-only.
     NamespaceList,
-    /// F-NS-PRINCIPAL-LIST: list every principal + its grants. Read-only, and
+    /// list every principal + its grants. Read-only, and
     /// never prints credential material.
     PrincipalList,
 }
@@ -456,7 +456,7 @@ pub(crate) fn parse() -> Args {
                 });
                 i += 1;
             }
-            // F-ADMIN-OP-AUTH: global admin token, gating cluster-mutating ops.
+            // global admin token, gating cluster-mutating ops.
             // (The per-command `--admin-token` on tenant/namespace/principal ops
             // is a separate, older struct-field path; this global flag drives the
             // payload-prefix path for fence/merge/create-stream/….)
@@ -480,7 +480,7 @@ pub(crate) fn parse() -> Args {
     let sub = raw[i].as_str();
     i += 1;
     let cmd = match sub {
-        // F211 read
+        // read
         "list-nodes" => Command::ListNodes,
         "df" => Command::Df,
         // R1 rolling upgrade
@@ -570,7 +570,7 @@ pub(crate) fn parse() -> Args {
                 limit,
             }
         }
-        // F211 admin
+        // admin
         "fence-node" => {
             let node_id: u64 = raw
                 .get(i)
@@ -639,7 +639,7 @@ pub(crate) fn parse() -> Args {
             let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
             Command::Remove { node_id, by }
         }
-        // ── F-AUTHZ-1 tooling ────────────────────────────────────────────
+        // ── authz tooling ────────────────────────────────────────────
         "gen-signing-key" => {
             let mut kid: u32 = 1;
             while i < raw.len() {
@@ -756,7 +756,7 @@ pub(crate) fn parse() -> Args {
             }
             Command::MintToken { principal, credential }
         }
-        // F-KEY-NS D2: namespace registry admin
+        // D2: namespace registry admin
         "namespace-create" => {
             let mut name = String::new();
             let mut owner_tenant: Option<String> = None;
@@ -845,7 +845,7 @@ pub(crate) fn parse() -> Args {
         }
         "namespace-list" => Command::NamespaceList,
         "principal-list" => Command::PrincipalList,
-        // F213 read
+        // read
         "info" => {
             let mut part: Option<u64> = None;
             let mut detail = false;
@@ -885,7 +885,7 @@ pub(crate) fn parse() -> Args {
             Command::Info { part, detail, full }
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
-        // F-DASH-IN-MGR M2: auto-policy <status|activate <name> [--arm]|deactivate>
+        // M2: auto-policy <status|activate <name> [--arm]|deactivate>
         "auto-policy" | "auto_policy" => {
             let action = if i < raw.len() {
                 let a = raw[i].clone();
@@ -908,7 +908,7 @@ pub(crate) fn parse() -> Args {
             }
             Command::AutoPolicy { action, name, arm }
         }
-        // F213 admin
+        // admin
         "bootstrap" => {
             let mut replication = String::from("3+0");
             let mut presplit = String::from("1:normal");
@@ -922,7 +922,7 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                     }
                     "--presplit" => {
-                        // F-PRESPLIT-PER-NS: RETIRED. It cut the RAW keyspace at
+                        // RETIRED. It cut the RAW keyspace at
                         // uniform hex points, which is namespace-blind — under
                         // Option 3 every key carries a `{ns}/` prefix, so those
                         // points landed nowhere near real keys and the presplit
@@ -933,7 +933,7 @@ pub(crate) fn parse() -> Args {
                         // cluster. Migration stub, house idiom: fail BEFORE doing
                         // any work rather than accepting a flag that lies.
                         eprintln!(
-                            "autumn-op bootstrap --presplit is RETIRED (F-PRESPLIT-PER-NS).\n\
+                            "autumn-op bootstrap --presplit is RETIRED.\n\
                              It cut the RAW keyspace, which is namespace-blind — under the\n\
                              `{{ns}}/` key layout those points miss every real key, so the\n\
                              presplit silently did nothing.\n\
@@ -1046,7 +1046,7 @@ pub(crate) fn parse() -> Args {
             }
             let part_id: u64 = num_arg(&raw, i, "PARTID");
             i += 1;
-            // F-SPLIT-AT-KEY (D4). CLI user面 speaks namespace/tenant, never
+            // (D4). CLI user面 speaks namespace/tenant, never
             // raw prefix bytes (§3.4 CLI refinement / 细化三). Forms:
             //   split <PART>                                    → median (legacy)
             //   split <PART> --namespace NS --tenant T [--at S | --at-hex HEX]
@@ -1107,7 +1107,7 @@ pub(crate) fn parse() -> Args {
             Command::Split { part_id, point }
         }
         "presplit" => {
-            // F-PRESPLIT-NS-RULES: presplit <NS>/<TENANT> by the ns's dimension.
+            // presplit <NS>/<TENANT> by the ns's dimension.
             //   presplit --namespace fs  --tenant T (--fs-inos i,j,… | --count N)
             //   presplit --namespace kvc --tenant T --count N --hash-prefix '<model>/vllm/v1/'
             //   presplit --namespace mem --tenant T --agents a,b,…
@@ -1156,7 +1156,7 @@ pub(crate) fn parse() -> Args {
             let namespace = namespace.unwrap_or_else(|| {
                 eprintln!("presplit requires --namespace <fs|kvc|mem>"); std::process::exit(1);
             });
-            // F-NS-PRINCIPAL-UNIFIED: `--tenant` is an OPTIONAL in-namespace
+            // `--tenant` is an OPTIONAL in-namespace
             // sub-segment (mem/kvc). fs has no tenant → default empty → cut at
             // `{namespace}/`. When given it is concatenated raw into the
             // `{namespace}/{tenant}/` cut key, so it MUST be a single lowercase
@@ -1167,7 +1167,7 @@ pub(crate) fn parse() -> Args {
             }
             let rule = match namespace.as_str() {
                 "fs" => {
-                    // F-FS-STRIPE: `--lanes N` presplits fs into N LANE partitions
+                    // `--lanes N` presplits fs into N LANE partitions
                     // (cut at `[0x03][1..N]`) so a striped large file's extents
                     // spread across them. Distinct from `--fs-inos`/`--count`
                     // (which cut by INODE, one file per partition).
@@ -1247,7 +1247,7 @@ pub(crate) fn parse() -> Args {
             }
             let survivor_part_id = num_arg(&raw, i, "SURVIVOR_PART_ID");
             let victim_part_id = num_arg(&raw, i + 1, "VICTIM_PART_ID");
-            // F4: reject any trailing token other than --force (was: scan the
+            // Reject any trailing token other than --force (was: scan the
             // whole argv for --force and ignore everything else).
             let mut force = false;
             for tok in &raw[i + 2..] {
@@ -1284,7 +1284,7 @@ pub(crate) fn parse() -> Args {
                 std::process::exit(1);
             }
             let part_id = num_arg(&raw, i, "PARTID");
-            // F4: reject trailing tokens (compact takes exactly one arg).
+            // Reject trailing tokens (compact takes exactly one arg).
             if let Some(extra) = raw.get(i + 1) {
                 eprintln!("compact: unexpected argument {extra:?} (takes exactly one PARTID)");
                 usage();
@@ -1297,7 +1297,7 @@ pub(crate) fn parse() -> Args {
             let mut stream_debt: Option<u64> = None;
             let mut empty_only = false;
             let mut part_id: Option<u64> = None;
-            // F4: one pass so flags and the PARTID appear in ANY order — the old
+            // One pass so flags and the PARTID appear in ANY order — the old
             // loop `break`d on the first non-flag, so `gc PART --ratio 0.4`
             // (exactly the documented form) silently dropped every flag after the
             // positional. Unknown tokens are rejected, not ignored (a mutation).
@@ -1374,7 +1374,7 @@ pub(crate) fn parse() -> Args {
             }
         }
         "register-node" => {
-            // F214-C: route to the migration stub. Consume any remaining
+            // route to the migration stub. Consume any remaining
             // arguments so the parser doesn't misinterpret them.
             while i < raw.len() {
                 i += 1;
@@ -1385,16 +1385,16 @@ pub(crate) fn parse() -> Args {
             let mut dirs = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    // F-EN-DYNSHARD M1c: format is identity-only now — these
+                    // M1c: format is identity-only now — these
                     // location flags moved to the EN binary itself (its own
                     // `--advertise`, self-registered at every startup). Hard
                     // error (not a silent ignore) so a not-yet-updated caller
                     // fails loudly instead of format silently keying off a
                     // register that never fires. Same-commit migration
-                    // pattern as `--disk-id` / `--shards` (F214-D / F196).
+                    // pattern as `--disk-id` / `--shards`.
                     "--listen" | "--advertise" | "--shard-ports" => {
                         eprintln!(
-                            "error: format's `{}` was removed in F-EN-DYNSHARD M1c — \
+                            "error: format's `{}` was removed in M1c — \
                              format now registers IDENTITY ONLY (node_uuid + disk_uuids), \
                              no location. Pass `--advertise HOST:PORT` to \
                              `autumn-extent-node` itself instead; it self-registers its \
@@ -1414,7 +1414,7 @@ pub(crate) fn parse() -> Args {
             Command::Format { dirs }
         }
         "--help" | "-h" | "help" => usage(),
-        // F3: name the unknown subcommand before dumping the usage wall.
+        // Name the unknown subcommand before dumping the usage wall.
         other => {
             eprintln!("autumn-op: unknown command {other:?}");
             usage()
@@ -1455,9 +1455,9 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
     (reason, by, force)
 }
 
-/// F-SPLIT-AT-KEY (D4) / coco P2: a namespace/tenant CLI segment must be a
+/// (D4) / coco P2: a namespace/tenant CLI segment must be a
 /// SINGLE path segment so `{ns}/{tenant}/ ++ suffix` is 1:1 with what the
-/// operator typed. The F-KEY-NS convention pins the charset to `[a-z0-9._-]+`
+/// operator typed. The namespace convention pins the charset to `[a-z0-9._-]+`
 /// (non-empty, no `/`). Pure so it is unit-testable; `reject_bad_segment` is
 /// the fail-loud wrapper.
 pub(crate) fn valid_segment(s: &str) -> bool {
@@ -1476,7 +1476,7 @@ fn reject_bad_segment(cmd: &str, kind: &str, s: &str) {
     }
 }
 
-/// F-SPLIT-AT-KEY (D4): validate the split-point flag combination and lift it
+/// (D4): validate the split-point flag combination and lift it
 /// into a `SplitPoint`. Exits with a clear message on a contradictory combo
 /// (an operator naming a cut point must fail loudly, not split at garbage).
 ///
@@ -1504,7 +1504,7 @@ pub(crate) fn build_split_point(
         }
         return SplitPoint::Raw(bytes);
     }
-    // F-NS-PRINCIPAL-UNIFIED: `--namespace` alone is enough (fs has no tenant);
+    // `--namespace` alone is enough (fs has no tenant);
     // `--tenant` is an OPTIONAL in-namespace sub-segment (mem/kvc).
     match namespace {
         Some(namespace) => {
@@ -1537,7 +1537,7 @@ pub(crate) fn build_split_point(
     }
 }
 
-/// F-SPLIT-AT-KEY (D4): decode a `--at-hex <HEX>` value into raw key bytes.
+/// (D4): decode a `--at-hex <HEX>` value into raw key bytes.
 /// Even-length ASCII hex; exits with a clear message on malformed input (an
 /// operator naming a split point wants to fail loudly, not split at garbage).
 pub(crate) fn parse_hex_key(s: &str) -> Vec<u8> {
@@ -1557,7 +1557,7 @@ pub(crate) fn parse_hex_key(s: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// F213 helpers (migrated from autumn_client.rs)
+// helpers (migrated from autumn_client.rs)
 // ---------------------------------------------------------------------------
 
 /// Assemble `split_points.len() + 1` contiguous `(start_key, end_key)`
@@ -1626,8 +1626,8 @@ pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// `[0x04]` superblock (sorts after every `[0x03]` key) and any
 /// non-fuse prefix ≥ 0x05. These are tiny next to file data.
 ///
-/// **SUPERSEDED for real workloads by `autumn-op presplit --namespace fs`
-/// (F-PRESPLIT-NS-RULES).** This produces RAW `[0x03][ino low byte]` split
+/// **SUPERSEDED for real workloads by `autumn-op presplit --namespace fs`.**
+/// This produces RAW `[0x03][ino low byte]` split
 /// points with NO `{tenant}/{namespace}/` prefix, so under SD-2/SD-3 tenant-first
 /// keys (`{t}/fs/[0x03][ino]`) it does NOT match any real wire key — every file
 /// lands in one partition. It also steps the ino LOW byte (0x20/0x40/…), but
@@ -1654,7 +1654,7 @@ pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     ranges_from_split_points(split_points)
 }
 
-// ── F-PRESPLIT-NS-RULES ──────────────────────────────────────────────────────
+// ── Per-namespace presplit rules ─────────────────────────────────────────────
 // Presplit a `{tenant}/{namespace}/` keyspace by the namespace's NATURAL
 // high-entropy dimension (a raw-byte uniform split is namespace-blind — after
 // SD-2/SD-3 all real keys sit in the `fs/`/`kvc/`/`mem/` byte sliver, so uniform
@@ -1672,7 +1672,7 @@ pub(crate) enum PresplitRule {
     /// (retires the old low-byte 0x20/0x40 stepping — inodes 4–8 are all < 0x20,
     /// so byte-stepping never split them). `inos` MUST be ascending + distinct.
     Fs { inos: Vec<u64> },
-    /// `fs --lanes N` = F-FS-STRIPE: split fs into N **lane** partitions, cutting
+    /// `fs --lanes N`: split fs into N **lane** partitions, cutting
     /// at `[0x03][1]..[0x03][N-1]` (the static, ino-independent lane boundaries).
     /// A striped large file's extent at offset `off` lands on lane
     /// `(off/unit)%N` under key `[0x03][lane][ino][off]`, so its extents spread
@@ -1813,7 +1813,7 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
     }
 }
 
-/// F-KEY-NS UX-fix (M4): the FULL declared boundary grid to RECORD as sacred,
+/// UX-fix (M4): the FULL declared boundary grid to RECORD as sacred,
 /// which for `FsLanes` is EVERY lane boundary (`lanes-1`), not just the
 /// `parts-1` we physically cut this run.
 ///
@@ -1900,7 +1900,7 @@ fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
 mod tests {
     use super::{parse_hex_split_points, SplitPoint};
 
-    // ── F-KEY-NS D2 CLI --presplit hex parsing ────────────────────────────
+    // ── CLI --presplit hex parsing ────────────────────────────
     #[test]
     fn parse_hex_split_points_decodes_comma_separated_hex() {
         assert_eq!(parse_hex_split_points(""), Vec::<Vec<u8>>::new());
@@ -1914,7 +1914,7 @@ mod tests {
         assert_eq!(parse_hex_split_points("ab,,cd,"), vec![vec![0xab], vec![0xcd]]);
     }
 
-    // ── F-SPLIT-AT-KEY (D4) CLI split-point assembly ──────────────────────
+    // ── CLI split-point assembly ──────────────────────
 
     #[test]
     fn split_point_median_resolves_to_none() {
@@ -1923,7 +1923,7 @@ mod tests {
 
     #[test]
     fn split_point_namespaced_with_suffix_assembles_prefix() {
-        // F-NS-PRINCIPAL-UNIFIED: NS-FIRST; tenant is an in-namespace sub-segment.
+        // NS-FIRST; tenant is an in-namespace sub-segment.
         let p = SplitPoint::Namespaced {
             namespace: "kvc".into(),
             tenant: "acme".into(),
@@ -2084,7 +2084,7 @@ mod tests {
         assert!(ranges[0].0.is_empty() && ranges[0].1.is_empty());
     }
 
-    // ── F-PRESPLIT-NS-RULES ──────────────────────────────────────────────
+    // ── Per-namespace presplit rules ──────────────────────────────────────────────
 
     /// The full tenant-first wire cut point = `{tenant}/{ns}/ ++ suffix`.
     fn wire(tenant: &str, ns: &str, suffix: &[u8]) -> Vec<u8> {

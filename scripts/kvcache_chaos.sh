@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # kvcache_chaos.sh — data-plane INTERFACE chaos: the python kvcache L3
-# backend (sglang HiCache path, no sglang needed) under failover (F275).
+# backend (sglang HiCache path, no sglang needed) under failover.
 #
 # Boots a 2-PS cluster (tcp), runs python/autumn_kvcache/tests/
 # chaos_workload.py (continuous batch_set_v1 + readback-verify through the

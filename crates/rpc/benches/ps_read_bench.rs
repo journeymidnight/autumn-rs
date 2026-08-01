@@ -142,7 +142,7 @@ async fn bulk_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
 }
 
 /// Loop plain reads (regular `call`, recv into the decode buffer) until the
-/// deadline. Mirrors the pre-F216-E read path.
+/// deadline. Mirrors the pre-zero-copy read path.
 async fn plain_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
     // msg_type 2 ≠ MSG_READ_BYTES_BULK → server replies with a regular framed
     // response.
@@ -199,7 +199,7 @@ fn main() {
         _ => TransportKind::Tcp,
     };
     autumn_transport::init_with(transport);
-    // F219: the bulk value crc on the hot path was removed entirely (no toggle).
+    // the bulk value crc on the hot path was removed entirely (no toggle).
     // AUTUMN_PSREAD_NOCRC is now a no-op kept for script back-compat.
     let _ = std::env::var("AUTUMN_PSREAD_NOCRC").is_ok();
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# perf_r1_sweep.sh — F095 Round 1 matrix driver (throwaway).
+# perf_r1_sweep.sh — Round 1 matrix driver (throwaway).
 #
 # Env:
 #   PHASE         A1 | A2 | A3 | A4 | A5                           (required)

@@ -117,8 +117,8 @@ impl BlockIterator {
 // TableIterator: iterates all entries in an SSTable across blocks
 // ---------------------------------------------------------------------------
 
-/// TEST-ONLY sync iterator over a Resident SST — production iteration is
-/// F262's `AsyncTableIterator` (works on Resident AND Paged sources).
+/// TEST-ONLY sync iterator over a Resident SST — production iteration uses
+/// `AsyncTableIterator` (works on Resident AND Paged sources).
 #[cfg(test)]
 pub struct TableIterator {
     reader: Arc<SstReader>,
@@ -228,7 +228,7 @@ impl TableIterator {
 }
 
 // ---------------------------------------------------------------------------
-// F262 — AsyncTableIterator: block-on-demand iteration over a (paged) SST
+// AsyncTableIterator: block-on-demand iteration over a (paged) SST
 // ---------------------------------------------------------------------------
 
 /// How an `AsyncTableIterator` fetches blocks it doesn't have.
@@ -246,7 +246,7 @@ pub enum FetchMode {
     Window(u32),
 }
 
-/// F262: async counterpart of `TableIterator` — works on BOTH Resident and
+/// async counterpart of `TableIterator` — works on BOTH Resident and
 /// Paged readers, fetching blocks on demand per `FetchMode`. Replaces the
 /// Stage-1 `materialized_for_iteration` whole-SST transient residency.
 ///
@@ -379,7 +379,7 @@ impl AsyncTableIterator {
 }
 
 // ---------------------------------------------------------------------------
-// F262 — AsyncMergeIterator: N-way merge over AsyncTableIterators
+// AsyncMergeIterator: N-way merge over AsyncTableIterators
 // ---------------------------------------------------------------------------
 //
 // Same key-ordering invariants as the sync MergeIterator below (pass

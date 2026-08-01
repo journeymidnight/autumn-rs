@@ -1,4 +1,4 @@
-//! F-DASH-IN-MGR — auto-policy pure decision helpers (M1) + controller (M2).
+//! auto-policy pure decision helpers (M1) + controller (M2).
 //!
 //! M1 lands ONLY the pure functions ported verbatim from the retired Python
 //! `python/dashboard/autumn_dashboard.py`: `policy_kind_str`,
@@ -138,7 +138,7 @@ impl AutoPolicyState {
 }
 
 /// Controller lifecycle — a state machine, NOT a bool ([[feedback_state_machine_not_bool]]).
-/// `Off` = nothing runs (a fresh cluster stays pure-mechanism, F203). `DryRun` =
+/// `Off` = nothing runs (a fresh cluster stays pure-mechanism). `DryRun` =
 /// the loop runs and logs "would: …" but never actuates. `Armed` = actuates, and
 /// is only honored when the process was started with `--dashboard-allow-mutations`
 /// (else it degrades to DryRun with a WARN). Byte values are wire/etcd-stable.
@@ -169,7 +169,7 @@ impl AutoPolicyMode {
 // The 6 friendly UI switches, in order, are [split, ec, compact, gc, merge,
 // rebalance] (SWITCH_ORDER) — encoded positionally in MgrAutoPolicyEntry.switches
 // and consumed by kinds_from_switches + the dashboard switches_to_dict. The 6th
-// (rebalance, F-REGION-REBALANCE Phase B) was appended after the original 5; a
+// (rebalance, Phase B) was appended after the original 5; a
 // shorter persisted Vec (pre-Phase-B config) reads absent switches as off.
 
 /// Build a built-in preset (`builtin=true`, never persisted). Switches are

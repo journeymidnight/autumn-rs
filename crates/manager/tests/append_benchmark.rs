@@ -46,7 +46,7 @@ fn benchmark_append_stream_throughput() {
     let ops = env_usize("APPEND_BENCH_OPS", 20_000);
     let payload_size = env_usize("APPEND_BENCH_PAYLOAD", 4096);
     let warmup_ops = env_usize("APPEND_BENCH_WARMUP", 1000);
-    // F178: writes are always durable; the APPEND_BENCH_SYNC env var no
+    // writes are always durable; the APPEND_BENCH_SYNC env var no
     // longer controls sync behaviour (the per-extent fsync coalescer
     // does it unconditionally).
 

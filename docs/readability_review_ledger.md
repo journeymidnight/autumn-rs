@@ -26,7 +26,7 @@ Rules per chunk:
 | 5 | crates/client | 3966 | done | c66d555 (NOT_LEADER loop ×4, fail_slots ×8, GetStream ctor, lease_call ×4) |
 | 6 | crates/stream — server side (extent node) | ~9000 | done | 9bc0408 (read_plan/committed_length_value/wrong_shard_err dedup + clippy sweep; conn_pool+erasure clean) |
 | 7 | crates/stream — client side (StreamClient) | ~9000 | done | 38403c8 (committed_end_for_read, parse_read_bytes_resp ×3, build_stream_tail ×6) |
-| 8 | crates/partition-server — core write/read path + sstable + dead code | ~11000 | done | 8437622 (F261 retry dedup, sst_readers_changed ×4, record_read ×5, dead-code gate/delete, clippy sweep) |
+| 8 | crates/partition-server — core write/read path + sstable + dead code | ~11000 | done | 8437622 (block-cache retry dedup, sst_readers_changed ×4, record_read ×5, dead-code gate/delete, clippy sweep) |
 | 9 | crates/partition-server — flush/compact/GC/split | ~11400 | done | covered by the same full-crate review as chunk 8; remaining findings deliberately skipped with reasons in findings log (safe-form duplication kept; no clean seams in the long loops) |
 | 10 | crates/manager — src reviewed (2 agents, full src) + fence dedup + dead code | 21164 src | done | ea118a8 |
 | 11 | crates/manager — remaining agent findings | — | done | 7adec55 (place_extents_with_fallback ×3, classify_hot_cold_band ×2) |
@@ -103,10 +103,10 @@ items).
 - extent_node.rs DEFERRED (needs a dedicated session + chaos validation, per
   the note-24 reverted-refactor history — do NOT do these in a casual pass):
   - The append validation protocol (corrupt_meta gate → eversion refresh →
-    seal check → P0-B durable fence + recheck → commit reconcile + F146/F147-B
+    seal check → P0-B durable fence + recheck → commit reconcile + guard
     recheck) exists TWICE: build_append_future (hot, ~2200-2360) and
     handle_append (single-op/test-only reference, ~5330-5490). Guard fixes
-    have had to land twice (F146 vs F147-B). Extraction shape: an
+    have had to land twice. Extraction shape: an
     `append_fence_and_reconcile(extent, owner_epoch, commit) -> AppendGate`
     helper; callers map to their response forms. handle_append is NOT
     production-reachable (process_frames_backpressured handles MSG_APPEND
@@ -136,7 +136,7 @@ items).
   leave unless reproduced issue).
 - PS chunk 9 remaining (agent-reviewed, apply next): do_compact
   bump-discards `continue` ×4 (macro-awkward, skip); the duplicated
-  save_table_locs_raw 7-arg call sites are the SAFE form (F148-A no-await
+  save_table_locs_raw 7-arg call sites are the SAFE form (no-await
   invariant) — deliberately NOT deduped; overlong background_maintenance_loop
   /recover_partition/partition_thread_main have no clean safe seams (agent
   confirmed) — leave.

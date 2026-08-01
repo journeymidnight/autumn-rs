@@ -1,4 +1,4 @@
-//! F-fuse-lease-2 — kernel cache eviction via the per-mount
+//! Kernel cache eviction via the per-mount
 //! invalidation poll loop. The production wiring calls
 //! `fuser::Notifier::inval_inode(ino, 0, 0)` (drops both
 //! attribute + page cache for the ino); the e2e covers the
@@ -8,7 +8,7 @@
 //! Why we can't just mount a real fuse FS in the test: the test
 //! harness runs in CI containers without `/dev/fuse` access.
 //! The `InodeInvalidator` indirection is exactly what
-//! F-fuse-lease-2 designed it to be — a swappable closure the
+//! it was designed to be — a swappable closure the
 //! production binary fills with the real Notifier and tests fill
 //! with a counter.
 //!

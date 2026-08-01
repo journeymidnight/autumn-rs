@@ -34,7 +34,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
-        // F099-K: after split, the right child binds a different port.
+        // after split, the right child binds a different port.
         // Route per-partition via manager's `part_addrs`.
         let router = PsRouter::new(mgr_addr, ps_addr);
 

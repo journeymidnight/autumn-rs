@@ -96,7 +96,7 @@ fn compaction_must_not_strand_unflushed_writes_past_vp_head() {
         // and recovery must rebuild it from the log replay window. This mirrors
         // `system_crash_mid_compact`. We deliberately do NOT use
         // `start_partition_server_stoppable`: its `serve_until_shutdown` path is
-        // a GRACEFUL drain that flushes every imm (F120-C), which would persist
+        // a GRACEFUL drain that flushes every imm, which would persist
         // batch C into an SST and mask the very loss this test reproduces.
         drop(ps1);
 

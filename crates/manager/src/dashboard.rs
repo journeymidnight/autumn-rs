@@ -1,4 +1,4 @@
-//! F-DASH-IN-MGR — embedded web dashboard served from the manager process.
+//! embedded web dashboard served from the manager process.
 //!
 //! Folds the retired standalone Python `python/dashboard/` (a browser UI + an
 //! auto-policy controller that shelled out to `autumn-op --json`) into the
@@ -76,8 +76,8 @@ const DASHBOARD_HTML: &str = include_str!("dashboard_web.html");
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 impl AutumnManager {
-    /// Spawn the embedded dashboard HTTP server under `spawn_supervised`
-    /// (F228). Called from `autumn-manager-server` main when `--dashboard-port`
+    /// Spawn the embedded dashboard HTTP server under `spawn_supervised`.
+    /// Called from `autumn-manager-server` main when `--dashboard-port`
     /// is set, BEFORE the blocking `serve()`. Binding is done inside the
     /// supervised body so a transient bind failure (e.g. a killed predecessor's
     /// TIME_WAIT) self-heals on the 1 s restart instead of disabling the
@@ -113,14 +113,14 @@ impl AutumnManager {
         tracing::info!(
             bind = %bind,
             mutations = allow_mutations,
-            "F-DASH-IN-MGR: embedded dashboard up (open http://{bind}/ )"
+            "embedded dashboard up (open http://{bind}/ )"
         );
         if allow_mutations {
             // Armed: manual /api/action AND the auto-policy controller (once a
             // policy is activated + Armed) can mutate the cluster. Surface it as
             // a security reminder — this port has no per-request auth.
             tracing::warn!(
-                "F-DASH-IN-MGR: --dashboard-allow-mutations is SET — the dashboard's \
+                "--dashboard-allow-mutations is SET — the dashboard's \
                  manual actions AND the auto-policy controller (when armed) can mutate \
                  the cluster (split/merge/gc/compact/ec). Keep this port behind a \
                  trusted network."
@@ -242,7 +242,7 @@ impl AutumnManager {
         // Empirical amplification = physical / logical FOOTPRINT (sealed +
         // open-tail; matches autumn-op df). Including open-tail is load-bearing:
         // physical_used counts open-tail bytes (largely live VP/log data), so a
-        // sealed-only denominator inflates amp ~15× (F-DF-OPENTAIL).
+        // sealed-only denominator inflates amp ~15×.
         let logical_footprint = df.logical_stored.saturating_add(df.logical_open_tail);
         let amp = if logical_footprint > 0 {
             df.physical_used as f64 / logical_footprint as f64
@@ -271,7 +271,7 @@ impl AutumnManager {
             "logical_stored_sealed": df.logical_stored,
             "logical_open_tail": df.logical_open_tail,
             "logical_footprint": logical_footprint,
-            // F-DF-WALDEBT: dead (GC-reclaimable) bytes incl. open-tail debt.
+            // dead (GC-reclaimable) bytes incl. open-tail debt.
             "logical_wal_debt": df.logical_wal_debt,
             "wal_debt_ratio": if logical_footprint > 0 {
                 df.logical_wal_debt as f64 / logical_footprint as f64
@@ -321,8 +321,8 @@ impl AutumnManager {
             })
             .collect();
 
-        // Roll up by PS INSTANCE (ps_id), not per-partition addr (F099-K gives
-        // each partition its own listener, so addr-grouping over-counts PS).
+        // Roll up by PS INSTANCE (ps_id), not per-partition addr (each partition
+        // has its own listener, so addr-grouping over-counts PS).
         let mut ps_roll: std::collections::HashMap<u64, (String, u64, u64)> =
             std::collections::HashMap::new();
         let partitions: Vec<serde_json::Value> = ov
@@ -776,7 +776,7 @@ fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
         POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
             Some(json!({ "action": "compact", "part_id": c.primary_part_id }))
         }
-        // F-REGION-REBALANCE Phase B: cluster-scoped, no target id.
+        // Phase B: cluster-scoped, no target id.
         POLICY_KIND_REBALANCE => Some(json!({ "action": "rebalance" })),
         _ => None, // hotcold / unknown → advisory only
     }
@@ -819,7 +819,7 @@ fn validate_action(
                 return Err("force_ec_convert requires extent_id".to_string());
             }
         }
-        // F-REGION-REBALANCE Phase B: cluster-scoped, takes no typed fields.
+        // Phase B: cluster-scoped, takes no typed fields.
         // REJECT target fields (coco P3) so a caller can't POST
         // `{"action":"rebalance","part_id":7}` and wrongly believe it scoped the
         // rebalance to one partition — it always rebalances the whole cluster.

@@ -21,7 +21,7 @@ WAL-FAILSTOP（5873b71）把 log_stream replay 遇损坏记录从静默丢数据
   open 一致性由 commit-min 协议管）。**EC extent 不过滤 addr 列表**（破坏 shard↔addr 索引
   对齐；缺 shard 由 EC 重建处理）。防御：过滤后 0 个可用 → 回退全读 + WARN（避免回归）。
 - **I3 open tail 坏副本 = seal-and-roll**：open tail 没固定长度，直接 failover 读含糊
-  （commit-min 随读集变）。改为 **F227 seal-over-reachable（排除坏副本）封当前 tail +
+  （commit-min 随读集变）。改为 **seal-over-reachable（排除坏副本）封当前 tail +
   roll 新 tail（健康节点）**。已 ACK 前缀在每个 committed 成员上 → min over 健康 ≥ ACK，
   不丢已确认数据；超出健康 committed 的字节是未 ACK 投机，封掉正确。新写落新 tail。
   已 sealed 的 extent → 不 seal，直接 isolate + 固定 sealed_length 修复。
@@ -48,7 +48,7 @@ WAL-FAILSTOP（5873b71）把 log_stream replay 遇损坏记录从静默丢数据
   纯选择核 `select_clean_replica_chunk`；只对 sealed replicated，跳 avali=0 slot。
 - **A5 ✅** manager `MSG_REPORT_CORRUPT_REPLICA`（owner+eversion+归属链 fencing,
   etcd-first + verify-at-apply）。
-- **A4 ✅** open-tail **内容损坏** → `seal_and_roll_tail`（F227 probe seal-over-
+- **A4 ✅** open-tail **内容损坏** → `seal_and_roll_tail`（probe seal-over-
   reachable 封 + roll 新 tail）→ 同一 pass 重取 sealed ExtentInfo → 跑 sealed
   cross-read 隔离坏副本（不依赖重开）。**截断（short）的 open tail 不封**（probe
   min 会含截断副本 → 可能封到 acked 以下 → 丢数据）→ fail loud。"封时排除坏副本
@@ -77,7 +77,7 @@ WAL-FAILSTOP（5873b71）把 log_stream replay 遇损坏记录从静默丢数据
 - 隔离持久成功后 replay 用干净副本继续、partition serving。
 
 ### 增量 B — 异步强制修复（后做：把隔离的坏副本复活）
-- forced-repair（I6 staging+rename+CRC 校验 + I7 源排除），manager dispatch（F207 ledger
+- forced-repair（I6 staging+rename+CRC 校验 + I7 源排除），manager dispatch（inflight ledger
   防并发），etcd-first 恢复 avali，清 EN quarantine + corrupt_meta。
 
 ## reproduce-first 测试

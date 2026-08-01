@@ -1,4 +1,4 @@
-//! F-AUTHZ-1 Stage 2 — PS-side data-plane authorization enforcement.
+//! Stage 2 — PS-side data-plane authorization enforcement.
 //!
 //! The PS is the KV-layer enforcement point (per the design decision "auth 在
 //! kv 层做"). It holds ONLY the manager's PUBLIC verifying keys (fetched via
@@ -29,7 +29,7 @@ use parking_lot::RwLock;
 
 /// Immutable snapshot of the authz config the PS enforces against.
 pub struct AuthzInner {
-    /// F-KEY-NS D7 (coco P2): Layer-B (protected-prefix / token) enforcement on
+    /// D7 (coco P2): Layer-B (protected-prefix / token) enforcement on
     /// (a signing key was configured). Carried IN the snapshot so the gate's
     /// per-request decision comes from ONE consistent object — never "flag from
     /// one atomic + config from a different-time snapshot". The `enabled`
@@ -47,11 +47,11 @@ pub struct AuthzInner {
     /// (minted for another cluster that shares signing keys) is rejected at
     /// AUTH_HELLO. Empty = unknown → the aud check is skipped (degraded).
     pub cluster_id: String,
-    /// F-KEY-NS D7: ALL registered namespace prefixes (the D2 registry, from
+    /// D7: ALL registered namespace prefixes (the D2 registry, from
     /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
     /// admits a put-class write only if its key `starts_with` one of these.
     pub namespaces: Vec<Vec<u8>>,
-    /// F-ADMIN-OP-AUTH (PS slice): the manager's admin secret, for gating
+    /// (PS slice): the manager's admin secret, for gating
     /// `is_admin_ps_msg` (split / maintenance). EMPTY = unconfigured → those ops
     /// run bare (opt-in). Carried in the snapshot so the gate reads one
     /// consistent object.
@@ -80,7 +80,7 @@ pub struct AuthzState {
     /// relaxed load on the hot path when OFF (the common case). True iff the
     /// manager configured a signing key.
     enabled: AtomicBool,
-    /// F-KEY-NS D7: is Layer-A (put-class must fall in a REGISTERED namespace)
+    /// D7: is Layer-A (put-class must fall in a REGISTERED namespace)
     /// enforcement on? True iff the registry is non-empty. Independent of
     /// `enabled` — a dev cluster with namespaces but no signing key still gets
     /// Layer-A (token-free), and an unconfigured/cold PS (empty registry) doesn't
@@ -110,7 +110,7 @@ impl AuthzState {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// F-KEY-NS D7 hot-path gate: `false` ⇒ no Layer-A enforcement (empty
+    /// D7 hot-path gate: `false` ⇒ no Layer-A enforcement (empty
     /// registry). A single relaxed load.
     #[inline]
     pub fn layer_a_enabled(&self) -> bool {
@@ -155,11 +155,11 @@ impl AuthzState {
             protected_prefixes: resp.protected_prefixes.clone(),
             clock_skew_secs: resp.clock_skew_secs,
             cluster_id: resp.cluster_id.clone(),
-            // F-KEY-NS D7: the registered-namespace list — Layer-A's data source.
+            // D7: the registered-namespace list — Layer-A's data source.
             namespaces: resp.namespaces.clone(),
             admin_token: resp.admin_token.clone(),
         });
-        // F-KEY-NS D7: Layer-A is on iff the registry is non-empty (independent
+        // D7: Layer-A is on iff the registry is non-empty (independent
         // of the signing key). Compute BEFORE the swap so the flag matches the
         // installed snapshot.
         let layer_a = !resp.namespaces.is_empty();
@@ -224,7 +224,7 @@ fn denied(msg: &str) -> Option<(StatusCode, String)> {
 /// `is_protected` prefix filter — a credential grants `{tenant}/` (whole tenant)
 /// or `{tenant}/{ns}/` and the key must fall under one of those grants. The old
 /// `protected_prefixes` list is retired (there is no un-protected range once
-/// every write is mandatorily tenant-scoped, per F-NS-FIRST-CLASS).
+/// every write is mandatorily tenant-scoped).
 fn check_key(
     key: &[u8],
     principal: Option<&BoundPrincipal>,
@@ -302,7 +302,7 @@ fn check_range(
 /// auth is a separate concern) and `AUTH_HELLO` (handled by the connection
 /// loop). Adding a new keyed read/write RPC without an arm here silently lets
 /// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
-/// F-ADMIN-OP-AUTH (PS slice): constant-time byte equality for the admin token.
+/// (PS slice): constant-time byte equality for the admin token.
 /// The token is a fixed-width hex secret, so a length mismatch is not sensitive;
 /// equal lengths are compared with an XOR-accumulate that never short-circuits,
 /// so a matching prefix can't be timed out. (The PS has no sha2/subtle dep, so
@@ -330,7 +330,7 @@ pub fn authz_check(
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
-        // F-REDIRECT-BATCH: carries a USER KEY per item — gate each like MSG_BATCH_GET.
+        // carries a USER KEY per item — gate each like MSG_BATCH_GET.
         MSG_GET_REDIRECT_MANY => {
             let r = partition_rpc::rkyv_decode::<GetRedirectManyReq>(payload).ok()?;
             for item in &r.items {
@@ -395,7 +395,7 @@ pub fn authz_check(
     }
 }
 
-/// F-KEY-NS D7 **Layer-A**: a put-class write's key(s) MUST fall under some
+/// D7 **Layer-A**: a put-class write's key(s) MUST fall under some
 /// REGISTERED namespace prefix (`AuthzInner.namespaces`); otherwise the target
 /// namespace does not exist and the write is refused with
 /// `StatusCode::NamespaceUnknown`. Distinct from Layer-B (`authz_check`):
@@ -413,7 +413,7 @@ pub fn check_layer_a(
     payload: &[u8],
     inner: &AuthzInner,
 ) -> Option<(StatusCode, String)> {
-    // F-NS-PRINCIPAL-UNIFIED (Option 3): the wire key is `{ns}/…` (NO tenant
+    // (Option 3): the wire key is `{ns}/…` (NO tenant
     // segment), so a registered namespace (`{name}/`, e.g. `fs/`) is the FIRST
     // `/`-delimited segment. Extract `{ns}/` (the bytes up to and including the
     // first `/`) and require an EXACT match against a registered namespace. `{ns}`
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn install_caches_admin_token_from_config() {
-        // F-ADMIN-OP-AUTH (PS slice): the PS learns the admin secret from the
+        // (PS slice): the PS learns the admin secret from the
         // manager's GetAuthzConfigResp and stores it in the snapshot.
         let st = AuthzState::new();
         // Absent by default (opt-in: the gate runs bare).
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(snap.cluster_id, "cluster-abc");
     }
 
-    // ── F-KEY-NS D7 Layer-A ──────────────────────────────────────────────
+    // ── Layer-A ──────────────────────────────────────────────────────────
     fn inner_with_namespaces(namespaces: Vec<Vec<u8>>) -> AuthzInner {
         let mut inner = inner_with(Vec::new());
         inner.namespaces = namespaces;
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn layer_a_admits_put_in_registered_namespace() {
-        // F-NS-PRINCIPAL-UNIFIED: namespace is the FIRST segment of `{ns}/…`.
+        // namespace is the FIRST segment of `{ns}/…`.
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec(), b"mem/".to_vec()]);
         assert!(check_layer_a(MSG_PUT, &put_payload(b"kvc/x"), &inner).is_none());
         assert!(check_layer_a(MSG_PUT, &put_payload(b"mem/acme/y"), &inner).is_none());

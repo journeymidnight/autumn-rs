@@ -270,7 +270,7 @@ fn update_stream_ec_triggers_conversion() {
         let resp = call_update_stream_ec(&mgr, stream_id, 2, 1).await;
         assert_eq!(resp.code, CODE_OK, "update_stream_ec: {}", resp.message);
 
-        // F203: ec_conversion_dispatch_loop is drain-only. update_stream_ec
+        // ec_conversion_dispatch_loop is drain-only. update_stream_ec
         // changes the stream's EC params but does NOT enqueue conversion
         // markers for existing sealed extents — callers must explicitly
         // trigger via MSG_FORCE_EC_CONVERT (per the manager / external

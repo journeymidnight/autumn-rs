@@ -444,7 +444,7 @@ fn sq_continues_submitting_while_cq_drains() {
     });
 }
 
-/// Test 5 (F099-B): parallel 3-replica fanout.
+/// Test 5: parallel 3-replica fanout.
 ///
 /// Validates that `launch_append` fires the 3 per-replica `send_vectored`
 /// futures concurrently via `futures::future::join_all` rather than
@@ -547,7 +547,7 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
             }
             let elapsed = t.elapsed();
             println!(
-                "F099-B: 64 sequential appends on 3-rep stream: {:?}",
+                "64 sequential appends on 3-rep stream: {:?}",
                 elapsed
             );
         });

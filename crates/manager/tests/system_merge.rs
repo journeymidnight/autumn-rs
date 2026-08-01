@@ -4,7 +4,7 @@
     clippy::redundant_pattern_matching,
     clippy::if_same_then_else
 )] // integration-test file
-//! F183 / F184 — System tests for partition merge primitive.
+//! System tests for partition merge primitive.
 //!
 //! Cluster topology: manager + 2 extent-nodes + 1 PS. Tests exercise
 //! the manager's `MSG_MULTI_MODIFY_MERGE` handler end-to-end via the
@@ -36,7 +36,7 @@ async fn merge_partitions(
     survivor: u64,
     victim: u64,
 ) -> CodeResp {
-    // FLUSH both partitions via the per-partition router (F099-K).
+    // FLUSH both partitions via the per-partition router.
     psr_flush(router, survivor).await;
     psr_flush(router, victim).await;
 
@@ -182,7 +182,7 @@ fn merge_split_round_trip_keys_intact() {
 
         // Wait for region propagation; the manager allocates a new part_id
         // (next id from alloc_ids) for the right child. Poll until BOTH
-        // partition addresses are registered (F099-K per-partition listener).
+        // partition addresses are registered (per-partition listener).
         let _ = poll_until_async(
             Duration::from_secs(10),
             Duration::from_millis(200),
@@ -220,7 +220,7 @@ fn merge_split_round_trip_keys_intact() {
         // inherited the wider range's SSTs via CoW). Same for the right
         // child. Without this, merge would refuse with the has_overlap gate.
         // Use the per-partition router because the right child has its own
-        // listener port (F099-K).
+        // listener port.
         psr_compact(&router, survivor_id).await;
         psr_compact(&router, victim_id).await;
         compio::time::sleep(Duration::from_millis(3000)).await;
@@ -342,10 +342,10 @@ fn merge_refuses_self_merge() {
 /// PRE-SPLIT (no merge involved) `psr_get` of an 8 KiB value put +
 /// flushed + compacted returns the value prepended with 5 bytes of the
 /// MVCC suffix tail (`0xff 0xff 0xff 0xff 0xfe` for seq=1). Reproducing
-/// against `main` without any merge code path. Out of F184 scope —
+/// against `main` without any merge code path. Out of scope —
 /// tracked as a VP-encoding regression for separate investigation. The
 /// `#[test]` attribute is removed so `cargo test --ignored` doesn't
-/// surface this as a F184 regression.
+/// surface this as a regression.
 #[allow(dead_code)]
 fn merge_preserves_value_pointer_resolution() {
     let mgr_addr = pick_addr();
@@ -579,7 +579,7 @@ fn merge_then_split_again_round_trip() {
     });
 }
 
-/// F184 auto-trigger smoke: register an in-process AutumnManager so the
+/// auto-trigger smoke: register an in-process AutumnManager so the
 /// test can call `force_auto_merge` directly. Verifies that
 /// `auto_dispatch_merge` orchestrates FLUSH+lock+commit_length+merge
 /// end-to-end via the manager's own internal RPC handlers.
@@ -687,15 +687,15 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
     });
 }
 
-/// F184 fast-mode policy_tick_loop e2e: enable auto-merge with a 1-bucket
+/// fast-mode policy_tick_loop e2e: enable auto-merge with a 1-bucket
 /// 1-second tick config, send synthetic low-load metrics for two adjacent
 /// partitions, verify the policy_tick_loop fires auto-merge automatically
 /// (no manual force_auto_merge call). Exercises the full closed loop:
 /// `MSG_REPORT_PARTITION_LOAD → metrics window → compute_candidates →
 /// auto_dispatch_merge → multi_modify_merge`.
 ///
-/// F203 removed the in-kernel auto-dispatch loop; this test now only
-/// compiles as a pre-F203 reference and is permanently `#[ignore]`'d. The
+/// removed the in-kernel auto-dispatch loop; this test now only
+/// compiles as a historical reference and is permanently `#[ignore]`'d. The
 /// `force_auto_merge` direct path is still exercised by
 /// `auto_dispatch_merge_orchestrates_full_flow` above. To restore an
 /// equivalent end-to-end test, drive the merge from outside via
@@ -788,12 +788,12 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
     });
 }
 
-/// F184 fast-mode policy_tick_loop e2e for auto-SPLIT: enable auto-split
+/// fast-mode policy_tick_loop e2e for auto-SPLIT: enable auto-split
 /// with a 1-bucket / 1-second config + low SPLIT_SIZE_HARD threshold,
 /// send synthetic high-load metrics for one partition, verify
 /// policy_tick_loop fires SPLIT automatically.
 ///
-/// F203 removed the in-kernel auto-dispatch loop; `cfg(any())` excludes
+/// removed the in-kernel auto-dispatch loop; `cfg(any())` excludes
 /// the body so the symbol stays as historical reference. The
 /// `force_auto_split` direct path is still exercised by
 /// `auto_dispatch_split_dispatches_msg_split_part` below.
@@ -884,7 +884,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
     });
 }
 
-/// F184 auto-split smoke: invoke `force_auto_split` and verify the
+/// auto-split smoke: invoke `force_auto_split` and verify the
 /// manager dispatches MSG_SPLIT_PART to the owning PS via conn_pool.
 #[test]
 #[ignore]
@@ -952,7 +952,7 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
     });
 }
 
-/// F184 stress: split → merge → split with a CONCURRENT writer task
+/// stress: split → merge → split with a CONCURRENT writer task
 /// running through ClusterClient (caches mgr/PS connections + regions
 /// + auto-routes per Put). Replaces the earlier abandoned attempt that
 /// used PsRouter (per-call TCP reconnect → unbounded CPU on the manager
@@ -968,7 +968,7 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
 ///    correct partition
 ///
 /// Why this matters: handle_split_part runs inline on the partition's
-/// partition_loop and serialises against writes via the F140
+/// partition_loop and serialises against writes via the
 /// dual-gate. Merge orchestration FLUSHes both partitions then drops
 /// their PartitionHandles to force region_sync reload — during which
 /// reads/writes against the merging partitions can fail with NotFound
@@ -1012,7 +1012,7 @@ fn split_merge_split_with_concurrent_writes() {
         // ── ClusterClient with cached connections + regions ──────────
         // Connect ONCE, share via Rc with the writer task. Internal
         // mgr_conn + ps_conns + regions caches handle all routing.
-        // F184: set rpc_timeout=2s so writes that race a partition-
+        // set rpc_timeout=2s so writes that race a partition-
         // handle drop during merge reload return promptly with
         // ConnectionError instead of waiting forever (handle drop
         // closes req_rx but not the multiplexed TCP connection that
@@ -1042,7 +1042,7 @@ fn split_merge_split_with_concurrent_writes() {
                     // so writes hit both halves of any post-split topology.
                     let prefix = if counter.is_multiple_of(2) { "b" } else { "n" };
                     let key = format!("{prefix}-{counter:06}").into_bytes();
-                    // F184 SDK-level rpc_timeout (set on the cluster
+                    // SDK-level rpc_timeout (set on the cluster
                     // above) bounds each put. Expiry surfaces as
                     // AutumnError::ConnectionError; treat as transient
                     // and refresh routing for the next iteration.
@@ -1160,7 +1160,7 @@ fn split_merge_split_with_concurrent_writes() {
             }
         }
 
-        // F184 STAGE-1 KNOWN LIMITATION: the CLI-orchestrated merge does
+        // STAGE-1 KNOWN LIMITATION: the CLI-orchestrated merge does
         // FLUSH → manager.commit → drop-partition-handles → reload via
         // region_sync_loop. Writes that arrived AFTER the FLUSH but
         // BEFORE the handle drop land in the old log_stream's tail
@@ -1179,7 +1179,7 @@ fn split_merge_split_with_concurrent_writes() {
         // documents the known Stage-1 loss window.
         let lost_pct = (missing.len() as f64 / n as f64) * 100.0;
         eprintln!(
-            "F184 concurrent writer: {} acked, {} read back successfully, \
+            "concurrent writer: {} acked, {} read back successfully, \
              {} lost ({:.1}% — Stage 1 merge-window loss is expected), \
              {} transient routing-miss errors gracefully retried",
             n,
@@ -1205,29 +1205,29 @@ fn split_merge_split_with_concurrent_writes() {
         // Note: pre-fix this asserted `transient_errors.get() > 0` —
         // the spec said split/merge topology changes MUST surface as
         // transient routing-miss errors that the SDK retries through.
-        // Post the F212 region_epoch refresh + SDK retry hardening,
+        // Post the region_epoch refresh + SDK retry hardening,
         // most topology windows are absorbed by the retry path
         // without ever surfacing the error to the caller. Zero
         // transient errors is now a valid happy-path outcome (the
         // retry budget happened to cover every reload). The
         // load-bearing assertion is `lost_pct <= 20.0%` above.
         eprintln!(
-            "F184 transient routing-miss errors: {} (informational only)",
+            "transient routing-miss errors: {} (informational only)",
             transient_errors.get()
         );
     });
 }
 
-/// F185 — same scenario as `split_merge_split_with_concurrent_writes`
+/// same scenario as `split_merge_split_with_concurrent_writes`
 /// but routes the merge through the manager-orchestrated
 /// `MSG_MERGE_PARTITIONS` path. The orchestrator freezes both PSes
 /// (drains pending+inflight, flushes all imm) BEFORE capturing
-/// commit_length, so the F184-K loss window of "writes after FLUSH but
+/// commit_length, so the loss window of "writes after FLUSH but
 /// before manager commit land in a tail that vp_head bypasses" is
-/// closed at the source. Asserts 0 lost writes (vs F184-K's ≤20%).
+/// closed at the source. Asserts 0 lost writes (vs the earlier ≤20%).
 #[test]
 #[ignore]
-fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
+fn orchestrated_merge_zero_loss_concurrent_writes() {
     use autumn_client::ClusterClient;
 
     let mgr_addr = pick_addr();
@@ -1354,7 +1354,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         psr_compact(&router, v1).await;
         compio::time::sleep(Duration::from_millis(3000)).await;
 
-        // MERGE via the orchestrated F185 path. ClusterClient.merge_partitions
+        // MERGE via the orchestrated path. ClusterClient.merge_partitions
         // now sends MSG_MERGE_PARTITIONS to the manager, which handles
         // freeze + capture + txn atomically.
         cluster
@@ -1387,7 +1387,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
 
         let lost_pct = (missing.len() as f64 / n as f64) * 100.0;
         eprintln!(
-            "F185 orchestrated merge: {} acked, {} read back, {} lost ({:.2}%), \
+            "orchestrated merge: {} acked, {} read back, {} lost ({:.2}%), \
              {} unavailable-retried (expected during freeze window), {} other-errors",
             n,
             n - missing.len(),
@@ -1397,14 +1397,14 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
             other_errors.get()
         );
 
-        // F185 contract: 0 loss on the orchestrated path. The CLI
+        // contract: 0 loss on the orchestrated path. The CLI
         // orchestration left ~5 % loss; the freeze-drain closes that
         // entirely. Allowing a 1-key tolerance for the rare case where
         // a write's PS reply was in flight when the connection got
         // dropped, but assert tightly otherwise.
         assert!(
             missing.is_empty() || (missing.len() as f64 / n as f64) < 0.001,
-            "F185 expected 0 loss; got {} of {} ({:.3}%). First missing: {:?}",
+            "expected 0 loss; got {} of {} ({:.3}%). First missing: {:?}",
             missing.len(),
             n,
             lost_pct,
@@ -1416,7 +1416,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         );
         // Some unavailability is expected during the freeze window —
         // assertion proves the writer actually hit the frozen state
-        // (otherwise the test isn't exercising F185's contract).
+        // (otherwise the test isn't exercising the orchestrated contract).
         assert!(
             unavailable_errors.get() > 0,
             "expected the writer to hit at least one CODE_UNAVAILABLE during the merge \
@@ -1426,7 +1426,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
     });
 }
 
-/// F184 stress: split → put → merge → put → split with batches of writes
+/// stress: split → put → merge → put → split with batches of writes
 /// interleaved between topology ops. Verifies all written keys remain
 /// readable across the full lifecycle.
 ///

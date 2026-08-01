@@ -1,4 +1,4 @@
-//! F-ioring-lease-2 + F-fuse-lease-1 — client-side helpers for the
+//! Client-side helpers for the
 //! four inode lease RPCs (`MSG_ACQUIRE_LEASE` / `MSG_RELEASE_LEASE` /
 //! `MSG_HEARTBEAT_LEASE` / `MSG_POLL_INVALIDATIONS`).
 //!
@@ -15,8 +15,8 @@
 //! writer slot), `LeaseError::NotLeader` (transient), or
 //! `LeaseError::Manager` (other).
 //!
-//! **History**: originated for the io_uring daemon lease work
-//! (F-ioring-lease-1..4), moved into the SDK in F-fuse-lease-1 so
+//! **History**: originated for the io_uring daemon lease work,
+//! moved into the SDK so
 //! autumn-fuse could call it directly. The io_uring daemon (and its
 //! `autumn-ioring::lease` re-export) was removed 2026-06-30;
 //! autumn-fuse is now the sole consumer.
@@ -48,7 +48,7 @@ impl DaemonClientId {
         Self::new_with_kind(LEASE_CLIENT_KIND_IORING, host)
     }
 
-    /// F-fuse-lease-1: fresh identity for an autumn-fuse mount
+    /// Fresh identity for an autumn-fuse mount
     /// (`kind = LEASE_CLIENT_KIND_FUSE`). Functionally identical to
     /// `new` — the manager treats every kind the same; the
     /// discriminant is diagnostic so `autumn-op` can label which
@@ -85,7 +85,7 @@ pub enum AcquireResult {
     Granted(MgrInodeLeaseInfo),
     /// Another client holds the writer lease for this inode.
     Conflict { manager_message: String },
-    /// F-lease-preempt: `acquire_force` started (or re-observed) a
+    /// `acquire_force` started (or re-observed) a
     /// pre-revocation grace window for the held writer. Caller
     /// should sleep ~`eta_ms` and retry; on retry the writer may
     /// have voluntarily released (→ `Granted`) or the grace
@@ -146,7 +146,7 @@ pub async fn acquire(
     acquire_inner(cluster, client, ino, mode, false).await
 }
 
-/// F-lease-preempt: acquire with the `force` flag. Identical to
+/// Acquire with the `force` flag. Identical to
 /// `acquire` except: when a different writer is currently held,
 /// the manager pushes `WillRevokeIn` to that writer and returns
 /// `RevokePending { eta_ms }`. Caller sleeps `eta_ms` and retries
@@ -216,7 +216,7 @@ async fn acquire_inner(
     }
 }
 
-/// F-lease-preempt: convenience wrapper that wraps `acquire_force`
+/// Convenience wrapper that wraps `acquire_force`
 /// with the retry loop the protocol expects. Polls `acquire_force`
 /// until the manager returns `Granted` or `Conflict`, or until
 /// `max_wait_ms` has elapsed (in which case the last
@@ -304,9 +304,9 @@ pub async fn heartbeat(
 }
 
 /// Drain queued invalidation events for `client`. Empty vec means no
-/// events at this poll. F-ioring-lease-2 only ships the call site;
-/// the persistent long-poll loop that consumes them lands in
-/// F-ioring-lease-3.
+/// events at this poll. This only ships the call site;
+/// the persistent long-poll loop that consumes them lands
+/// separately.
 pub async fn poll_invalidations(
     cluster: &ClusterClient,
     client: &DaemonClientId,
@@ -326,7 +326,7 @@ pub async fn poll_invalidations(
     }
 }
 
-// ──────────────────── F-ioring-lease-4 ─────────────────────────────────
+// ──────────────────── invalidation version map ─────────────────────────
 //
 // Per-session "minimum valid version" map. The
 // `session_invalidation_poll_loop` updates this on every per-ino

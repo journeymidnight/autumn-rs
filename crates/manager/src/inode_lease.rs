@@ -1,4 +1,4 @@
-//! F-ioring-lease-1 — JuiceFS-style inode-level lease state machine.
+//! JuiceFS-style inode-level lease state machine.
 //!
 //! Single writer + many readers per inode. Writer-close bumps the
 //! `version` (close-to-open coherence marker) and pushes
@@ -18,7 +18,7 @@
 //!
 //! Layer rules — every change here must respect:
 //! - Single-threaded compio (Rc/RefCell, !Send).
-//! - F149 leader fence on every etcd write (handlers call
+//! - Leader fence on every etcd write (handlers call
 //!   `put_msgs_txn` / `put_and_delete_txn` which carry the fence).
 //! - Plan §6 invariants (manager is the only lease decision-maker;
 //!   writer Release happens AFTER flush; cache is version-tagged on
@@ -40,7 +40,7 @@ use autumn_rpc::manager_rpc::{
 /// heartbeat at <= TTL / 6 (`5s` for the 30s default) to stay alive.
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 
-/// F-lease-preempt: default grace window the manager gives a writer
+/// Default grace window the manager gives a writer
 /// to flush + voluntarily release after a peer's
 /// `AcquireLease(force=true)`. Matches plan §5 Phase 3 "writer
 /// revoke 协议: WillRevokeIn { 5s }". Tunable per-registry via
@@ -88,7 +88,7 @@ pub struct InodeLeaseState {
     pub writer_expires_at: Option<Instant>,
     pub readers: BTreeMap<ClientKey, Instant>,
     pub version: u64,
-    /// F-lease-preempt: deadline after which a force-acquire that's
+    /// Deadline after which a force-acquire that's
     /// already pushed `WillRevokeIn` to the current writer will be
     /// allowed to force-revoke. `Some(t)` means "grace period
     /// running until t"; `None` means "no preempt in flight."
@@ -126,7 +126,7 @@ pub enum AcquireOutcome {
         held_by_kind: u8,
         held_by_host: String,
     },
-    /// F-lease-preempt: `force=true` against a held writer; manager
+    /// `force=true` against a held writer; manager
     /// started the grace window. Client should retry after
     /// `eta_ms`; on retry it either gets `Granted` (writer
     /// released voluntarily) or — past the deadline — the manager
@@ -172,7 +172,7 @@ pub enum InvalidationReason {
     WriterClosed,
     /// Manager TTL revoked the writer (or admin took it away).
     LeaseRevoked,
-    /// F-lease-preempt: pushed to the CURRENT writer when another
+    /// Pushed to the CURRENT writer when another
     /// client force-acquires. Writer should flush + voluntarily
     /// `ReleaseLease` within the grace window or the manager
     /// will force-revoke (which then pushes `LeaseRevoked`).
@@ -191,7 +191,7 @@ impl InvalidationReason {
 
 /// Per-client inbox.
 ///
-/// F-ioring-lease-3: extended with a parked `waker` so the
+/// Extended with a parked `waker` so the
 /// `MSG_POLL_INVALIDATIONS` handler can register a long-poll. A
 /// subsequent `push_invalidation` fires the waker → the handler's
 /// `recv` resolves → it returns the queued events without burning a
@@ -218,7 +218,7 @@ impl ClientInbox {
             self.overflowed = true;
         }
         self.events.push_back(ev);
-        // F-ioring-lease-3: wake any parked long-poll. `send` on a
+        // Wake any parked long-poll. `send` on a
         // dropped receiver is a no-op — happens when the client's
         // RPC connection closed before the push; the next poll's
         // reconnect refreshes the waker.
@@ -309,7 +309,7 @@ pub struct LeaseRegistry {
     /// from a different generation.
     pub last_version: HashMap<u64, u64>,
     pub lease_ttl: Duration,
-    /// F-lease-preempt: how long the manager waits between pushing
+    /// How long the manager waits between pushing
     /// `WillRevokeIn` to a writer and force-revoking on a subsequent
     /// `AcquireLease(force=true)` retry.
     pub revoke_grace: Duration,
@@ -326,7 +326,7 @@ impl LeaseRegistry {
         }
     }
 
-    /// F-lease-preempt: registry constructor with both TTL and
+    /// Registry constructor with both TTL and
     /// revoke-grace overrides. Used by tests that want a sub-second
     /// grace window to keep wall-clock test runtime low.
     pub fn with_ttl_and_revoke_grace(ttl: Duration, revoke_grace: Duration) -> Self {
@@ -369,7 +369,7 @@ impl LeaseRegistry {
     /// `mode = LEASE_MODE_READ` or `LEASE_MODE_WRITE`. `now` is the
     /// monotonic clock the manager owns; tests pass a synthetic
     /// `Instant`. `force = false` (this method) is the non-preempt
-    /// path — see `acquire_with_force` for the F-lease-preempt
+    /// path — see `acquire_with_force` for the force-preempt
     /// variant.
     pub fn acquire(
         &mut self,
@@ -381,7 +381,7 @@ impl LeaseRegistry {
         self.acquire_with_force(client, ino, mode, false, now)
     }
 
-    /// F-lease-preempt: `acquire` with the `force` flag.
+    /// `acquire` with the `force` flag.
     ///
     /// - `force = false`: identical to the legacy `acquire`.
     /// - `force = true` AND no current writer (or writer is the
@@ -482,7 +482,7 @@ impl LeaseRegistry {
                                 held_by_host: state.writer_diag_host.clone(),
                             };
                         }
-                        // F-lease-preempt: force-acquire path.
+                        // Force-acquire path.
                         match state.pending_revoke_at {
                             None => {
                                 // Start the grace window. Push
@@ -558,7 +558,7 @@ impl LeaseRegistry {
             }
         }
 
-        // After the &mut borrow ends, STAGE the F-lease-preempt
+        // After the &mut borrow ends, STAGE the preemption
         // invalidations into `pushes` (BUG-LEASE-4: not into
         // self.inboxes — the caller flushes after etcd commit, or
         // drops on etcd-fail).
@@ -615,7 +615,7 @@ impl LeaseRegistry {
         }
     }
 
-    /// F-ioring-lease-5 (coco P2 #7): read-only "what would `release`
+    /// coco P2 #7: read-only "what would `release`
     /// do" predicate. Lets the handler order the etcd delete BEFORE
     /// the in-memory mutate so a failed etcd-delete doesn't leave a
     /// stale `inode_leases/<ino>` record (which would re-install
@@ -654,7 +654,7 @@ impl LeaseRegistry {
             state.writer = None;
             state.writer_diag_host.clear();
             state.writer_expires_at = None;
-            // F-lease-preempt: voluntary release clears any
+            // Voluntary release clears any
             // pending revoke window — the next force-acquire
             // will start a fresh one if it lands on a future
             // writer.
@@ -731,7 +731,7 @@ impl LeaseRegistry {
 
     /// Drain a client's invalidation queue. Returns the (possibly
     /// empty) batch. `overflowed=true` if any events were dropped due
-    /// to overflow since the last poll — F-ioring-lease-3's poller
+    /// to overflow since the last poll — the long-poll poller
     /// will then surface the loss to the client which invalidates
     /// every cached inode (plan §6.4).
     pub fn drain_invalidations(&mut self, client: &MgrClientId) -> (Vec<MgrInvalidation>, bool) {
@@ -745,7 +745,7 @@ impl LeaseRegistry {
         (events, overflowed)
     }
 
-    /// F-ioring-lease-3: atomic drain-or-install-waker for the
+    /// Atomic drain-or-install-waker for the
     /// long-poll path. Returns the drained events PLUS, when the
     /// queue was empty, a fresh receiver the caller awaits with a
     /// timeout. A subsequent `push_invalidation` on this client
@@ -940,12 +940,12 @@ impl LeaseRegistry {
         })
     }
 
-    /// F-ioring-lease-5 (coco P1 #6) + BUG-LEASE-4 (P1 #4): precise
+    /// coco P1 #6 + BUG-LEASE-4 (P1 #4): precise
     /// rollback for a writer AcquireLease whose etcd persistence
     /// failed AFTER the in-memory grant landed. Restores the writer
     /// slot AND (BUG-LEASE-4) the `version` field to `snapshot`'s
     /// shape; readers that subscribed during the etcd await are
-    /// preserved (the pre-F-ioring-lease-5 rollback abused
+    /// preserved (the earlier rollback abused
     /// `release()`, which bumps version + pushes a phantom
     /// WriterClosed).
     ///
@@ -986,7 +986,7 @@ impl LeaseRegistry {
                 entry.writer = s.writer;
                 entry.writer_diag_host = s.writer_diag_host;
                 entry.writer_expires_at = s.writer_expires_at;
-                // F-lease-preempt: restore the preempt window too
+                // Restore the preempt window too
                 // so an etcd-failed force-acquire doesn't leak the
                 // half-progressed grace state into the next call.
                 entry.pending_revoke_at = s.pending_revoke_at;
@@ -1051,12 +1051,12 @@ pub type SharedRegistry = Rc<RefCell<LeaseRegistry>>;
 use crate::AutumnManager;
 
 impl AutumnManager {
-    /// F-ioring-lease-1: per-second sweep of writer-TTL deadlines.
+    /// Per-second sweep of writer-TTL deadlines.
     /// Revoked writers etcd-delete the persisted record under
     /// `inode_leases/<ino>`; reader-side invalidations were already
     /// queued by `LeaseRegistry::tick`. Reader expiries are silent.
     ///
-    /// Follows the F228 background-loop invariants: every await is
+    /// Follows the background-loop invariants: every await is
     /// bounded (`sleep` + the bounded etcd `put_msgs_txn` /
     /// `put_and_delete_txn` calls); the loop runs under
     /// `spawn_supervised` (panic → log + restart).
@@ -1387,7 +1387,7 @@ mod tests {
         );
     }
 
-    // ───────────── F-lease-preempt ─────────────────────────
+    // ───────────── force-preempt / writer revoke ───────────
 
     fn reg_with_grace(grace_ms: u64) -> LeaseRegistry {
         LeaseRegistry::with_ttl_and_revoke_grace(
@@ -1610,7 +1610,7 @@ mod tests {
 
     #[test]
     fn version_is_monotonic_across_remove_and_reacquire() {
-        // Regression: pre-F-ioring-lease-2 the auto-remove of an empty
+        // Regression: the earlier auto-remove of an empty
         // inode entry on release reset `version` to 1, breaking close-
         // to-open coherence for any client whose cache still carried
         // the older generation's `(ino, version)` pair.
@@ -1814,7 +1814,7 @@ mod tests {
         // The case where the pre-acquire snapshot is None (no entry
         // existed). Reverting should drop the entry if no readers
         // subscribed during the etcd await. This is the existing
-        // F-ioring-lease-5 behavior; BUG-LEASE-4 doesn't change it,
+        // revert behavior; BUG-LEASE-4 doesn't change it,
         // but a regression test guards the helper's None arm
         // against an accidental edit.
         let mut r = reg_with_grace(0);

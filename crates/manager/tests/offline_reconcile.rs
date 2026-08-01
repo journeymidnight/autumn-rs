@@ -1,4 +1,4 @@
-//! F109 — startup orphan reconcile.
+//! startup orphan reconcile.
 //!
 //! Verifies the second-line cleanup path: a `DelExtent` fanout that
 //! exhausts its retry window (extent-node was offline for the entire
@@ -10,7 +10,7 @@
 //! Strategy:
 //!   1. Two-node cluster as usual.
 //!   2. Open a stream + roll several extents (same trick as
-//!      `f109_physical_deletion`: max_extent_size = 1 KiB).
+//!      `physical_deletion`: max_extent_size = 1 KiB).
 //!   3. Manually unlink one extent on n1 to simulate "manager succeeded
 //!      in deleting on n1 but n2 was offline" — actually simpler: kill
 //!      the live ExtentNode on n2 (drop its handle isn't possible
@@ -80,7 +80,7 @@ fn orphan_present(disk_dir: &Path, extent_id: u64) -> bool {
 }
 
 #[test]
-fn f109_startup_reconcile_unlinks_orphans() {
+fn startup_reconcile_unlinks_orphans() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -128,7 +128,7 @@ fn f109_startup_reconcile_unlinks_orphans() {
 
         assert!(
             unlinked,
-            "F109 reconcile: orphan extent {orphan_id} still present in {}",
+            "reconcile: orphan extent {orphan_id} still present in {}",
             n_dir.path().display(),
         );
     });

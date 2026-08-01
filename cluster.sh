@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-# F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
+# RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
 # RLIMIT_MEMLOCK via ibv_reg_mr. The default soft limit (often 8 MiB) faults
 # libibverbs on large (e.g. 8 MiB) value transfers — observed as a PS SIGSEGV
 # in ucp_stream_send_nbx -> rcache -> ibv_reg_mr_iova2 under concurrent 8 MiB
@@ -86,7 +86,7 @@ UCX_TLS=posix,cma,tcp,self (≥64K transfers are known-broken there)"
 # Invoked from do_start and load_cluster_config (NOT here) so it always sees
 # the FINAL BIND_HOST — including the one re-derived from the saved config by
 # per-process subcommands (start-ps / start-node after a RoCE start).
-# F220: base port for the PS per-partition listeners (F099-K binds
+# base port for the PS per-partition listeners (binds
 # PS_BASE_PORT + ordinal). Kept clear of the extent-node shard port grid
 # (9100+i + s*SHARD_STRIDE, climbs to ~9253 at 16 shards) so partition
 # listeners don't lose their first bind to an EN shard and force a
@@ -102,7 +102,7 @@ MANAGER="$BIN/autumn-manager-server"
 NODE="$BIN/autumn-extent-node"
 PS="$BIN/autumn-ps"
 AC="$BIN/autumn-client"
-# F213: all cluster/partition op commands (bootstrap / register-node /
+# all cluster/partition op commands (bootstrap / register-node /
 # format / split / merge / compact / gc / info / ...) live on autumn-op.
 # autumn-client is data-plane only.
 AO="$BIN/autumn-op"
@@ -164,7 +164,7 @@ kill_proc() {
         local pid; pid="$(cat "$pf")"
         if proc_alive "$pid"; then
             kill "$pid" 2>/dev/null || true
-            # F120-C: wait up to 60s for process to exit gracefully — autumn-ps
+            # wait up to 60s for process to exit gracefully — autumn-ps
             # now drains active+imm to row_stream on SIGTERM (PartitionServer::
             # shutdown), which can take seconds per partition with EC bulk
             # uploads. SIGKILL if still stuck after the deadline (replay on
@@ -254,15 +254,15 @@ disk_args_for_node() {
 }
 
 # ---------------------------------------------------------------------------
-# F102: per-process helpers + saved config
+# per-process helpers + saved config
 # ---------------------------------------------------------------------------
 #
 # Used by:
 #   - do_start (full bring-up): writes the config snapshot once everything
 #     is staged, then re-uses launch_extent_node / format_extent_node /
 #     launch_ps so the per-process subcommands take exactly the same code
-#     path as the bulk start. (F214: format_extent_node replaces the
-#     pre-F214 register_extent_node — see its doc above.)
+#     path as the bulk start. (format_extent_node replaces the
+#     former register_extent_node — see its doc above.)
 #   - do_start_node / do_stop_node / do_start_ps / do_stop_ps: load the
 #     snapshot so a recovery test can `stop-node 2 && start-node 2`
 #     without re-typing flags or remembering env vars.
@@ -328,7 +328,7 @@ launch_extent_node() {
     local port=$(( ${AUTUMN_EXTENT_BASE_PORT:-9100} + i ))
     local disk_arg
     disk_arg=$(disk_args_for_node "$i")
-    # F196: EN has no --shards flag — shard count == cpuset_len. Each
+    # EN has no --shards flag — shard count == cpuset_len. Each
     # node gets its own slice of cores, computed from SHARDS env (which
     # now means "shards per EN, also = cores per EN"). Operator can
     # override per node via AUTUMN_EN${i}_CPUSET (taskset syntax).
@@ -373,7 +373,7 @@ launch_extent_node() {
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     local -a stride_args=()
     (( SHARDS > 1 )) && stride_args=(--shard-stride "$SHARD_STRIDE")
-    # F214-D: --disk-id was removed. Single-disk and multi-disk paths
+    # --disk-id was removed. Single-disk and multi-disk paths
     # are now uniform — `autumn-op format` writes the disk_id sentinel
     # file per dir, which the EN reads on startup.
     local -a metrics_args=()
@@ -395,9 +395,9 @@ launch_extent_node() {
 # a fresh disk_uuid per dir, registers the node, and stamps the
 # cluster_id / disk_uuid / node_id / disk_id sentinel files. Must run
 # AFTER the manager is up and BEFORE the EN binary starts (the EN
-# refuses to start without the sentinel files — F214-D).
+# refuses to start without the sentinel files).
 #
-# F214-C unification: this replaces the pre-F214 fork between
+# unification: this replaces the former fork between
 # `format` (used only for multidisk-1node) and `register-node`
 # (used everywhere else with the `--disk-id N` flag). Both paths
 # now go through `autumn-op format`, which handles single-disk
@@ -411,7 +411,7 @@ format_extent_node() {
     # the launch path can rely on them.
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
-    # F-EN-DYNSHARD M1c: format is IDENTITY-ONLY — it takes no
+    # M1c: format is IDENTITY-ONLY — it takes no
     # --listen/--advertise/--shard-ports. launch_extent_node's own
     # --advertise self-registers the live address + shard ports at every
     # EN startup (M1a/M1b), so format never needs to know them.
@@ -420,11 +420,11 @@ format_extent_node() {
         $(echo "$disk_arg" | tr ',' ' ')
 }
 
-# Launch the partition server. F099-K: the per-partition listeners (PS_BASE_PORT+1,
+# Launch the partition server. The per-partition listeners (PS_BASE_PORT+1,
 # 9202, ...) come up only after partitions open, so we don't wait_port
 # here — bootstrap or region-sync handles readiness.
 launch_ps() {
-    # F196 even-distribution layout (single-host, multi-process cluster):
+    # even-distribution layout (single-host, multi-process cluster):
     #   EN i ∈ [1..REPLICAS]  → cores [(i-1)*SHARDS .. i*SHARDS-1]
     #   PS                    → cores [REPLICAS*SHARDS .. REPLICAS*SHARDS + 2*PS_PARTS_HINT - 1]
     # Each PS partition reserves 2 cores (P-log + P-sst). PS_PARTS_HINT
@@ -450,7 +450,7 @@ launch_ps() {
         cpu_args=(--cpuset "${ps_cpu_start}-${ps_cpu_end}")
         affinity_msg="cpuset=${ps_cpu_start}-${ps_cpu_end} (max_parts=$ps_hint)"
     fi
-    # F195: operator-set AUTUMN_* env vars are translated explicitly to
+    # operator-set AUTUMN_* env vars are translated explicitly to
     # per-binary CLI flags here — Rust libraries no longer read env
     # vars. Each is opt-in: only emit the flag if the env is set.
     local -a tunable_args=()
@@ -490,8 +490,8 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_FG_IOPS_PER_SEC:-}" ]]; then
         tunable_args+=(--fg-iops-per-sec "$AUTUMN_PS_FG_IOPS_PER_SEC")
     fi
-    # F196 D-r7: --bg-rate-bytes-per-sec was split into D-r7's admission
-    # compact + gc rate caps. Note: F141's `--gc-rate-bytes-per-sec` is
+    # D-r7: --bg-rate-bytes-per-sec was split into D-r7's admission
+    # compact + gc rate caps. Note: the `--gc-rate-bytes-per-sec` flag is
     # a SEPARATE per-partition limiter wired via
     # AUTUMN_PS_GC_RATE_BYTES_PER_SEC and stays as-is.
     if [[ -n "${AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC:-}" ]]; then
@@ -562,7 +562,7 @@ launch_ps() {
         --transport "$TRANSPORT" \
         ${cpu_args[@]:+"${cpu_args[@]}"} \
         ${tunable_args[@]:+"${tunable_args[@]}"}
-    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; $affinity_msg)"
+    echo "[cluster] PS launched (per-partition listeners bind on partition open; $affinity_msg)"
 }
 
 # Derive the etcd client endpoint list from AUTUMN_ETCD_CLUSTER without
@@ -585,7 +585,7 @@ compute_etcd_endpoints() {
 
 # Launch the manager. Reads the global ETCD_ENDPOINTS (set by do_start's
 # etcd bring-up, or by compute_etcd_endpoints for a standalone
-# start-manager). F187: AUTUMN_POLICY_FAST_MODE=1 enables fast-mode
+# start-manager). AUTUMN_POLICY_FAST_MODE=1 enables fast-mode
 # advisory thresholds (1 MiB GC / 4 MiB compact / 5s tick / 1 bucket /
 # 30s cooldown) so load tests surface advisories within seconds instead
 # of the production 5-min sustained window.
@@ -600,7 +600,7 @@ launch_manager() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         mgr_extra="$mgr_extra --metrics-port 9591"
     fi
-    # F-DASH-IN-MGR: AUTUMN_DASHBOARD=1 serves the embedded web dashboard +
+    # AUTUMN_DASHBOARD=1 serves the embedded web dashboard +
     # auto-policy controller from the manager (default port 8799, below the
     # 10000 ephemeral floor). OPT-IN in the test harness (avoid a surprise port
     # on a shared box); deploy (autumn-deploy / k8s) enables it by default.
@@ -611,7 +611,7 @@ launch_manager() {
         [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] \
             && mgr_extra="$mgr_extra --dashboard-allow-mutations"
     fi
-    # F-AUTOPOLICY-BOOT-DEFAULT: unlike the deploy layer (entrypoint / autumn-deploy
+    # unlike the deploy layer (entrypoint / autumn-deploy
     # default `balanced`), cluster.sh leaves the controller OFF by default so
     # chaos / perf / dev are unaffected. Set AUTUMN_AUTO_POLICY_DEFAULT=<preset> to
     # opt in for testing.
@@ -659,14 +659,14 @@ launch_manager() {
             AUTUMN_AUTH_SIGNING_KEY_FILE="$_az/signing.key"
         fi
         # authz protects EVERYTHING when a signing key is configured
-        # (F-KEY-NS-TENANT-FIRST) — no per-prefix list needed.
+        # no per-prefix list needed.
     fi
     # Pass the admin token whether or not a signing key exists (the signing-key
     # block below adds the authz flags on top when authz is on).
     if [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" && -r "${AUTUMN_ADMIN_TOKEN_FILE}" ]]; then
         mgr_extra="$mgr_extra --admin-token-file $AUTUMN_ADMIN_TOKEN_FILE"
     fi
-    # F-AUTHZ-1: data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
+    # data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
     # with no env set, no flags are passed and authz stays OFF (zero impact on
     # every existing flow: perf_check, chaos, fuse, kvcache). To enable:
     #   AUTUMN_AUTH_SIGNING_KEY_FILE=/path/key   (generate: autumn-op gen-signing-key)
@@ -758,7 +758,7 @@ load_cluster_config() {
     export CLUSTER_MODE="$MODE"
     BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
     MANAGER_ADDR="${BIND_HOST}:9001"
-    # F220: re-derive after sourcing so a persisted AUTUMN_PS_BASE_PORT
+    # re-derive after sourcing so a persisted AUTUMN_PS_BASE_PORT
     # (saved by save_cluster_config) takes effect for start-ps/stop-ps.
     PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
     compute_shard_config
@@ -866,12 +866,12 @@ do_start() {
         mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     done
 
-    # F221: auto-size the PS partition budget from the presplit count when the
+    # auto-size the PS partition budget from the presplit count when the
     # operator didn't set AUTUMN_PS_PARTS_HINT. Each partition needs 2 PS cores
     # (P-log + P-sst); the PS refuses partitions past cpuset_len/2, and
     # cluster.sh sizes the PS cpuset from AUTUMN_PS_PARTS_HINT (default 8). So
     # presplitting >8 partitions without bumping the hint silently strands the
-    # surplus ("F196: core budget exhausted"). Raise the hint to the presplit
+    # surplus ("core budget exhausted"). Raise the hint to the presplit
     # count so a fresh start "just works". Only ever RAISES above the default 8
     # (≤8 keeps the default); an explicit AUTUMN_PS_PARTS_HINT always wins. If
     # the box lacks REPLICAS*SHARDS + 2*hint cores, compute_affinity_decision
@@ -883,19 +883,19 @@ do_start() {
         local _presplit_n="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
         if [[ "$_presplit_n" =~ ^[0-9]+$ ]] && (( _presplit_n > 8 )); then
             export AUTUMN_PS_PARTS_HINT="$_presplit_n"
-            echo "[cluster] F221: auto PS_PARTS_HINT=$_presplit_n (from presplit; PS budget = $(( _presplit_n * 2 )) cores)"
+            echo "[cluster] auto PS_PARTS_HINT=$_presplit_n (from presplit; PS budget = $(( _presplit_n * 2 )) cores)"
         fi
     fi
 
-    # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
+    # when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
     # with K shards (see compute_shard_config + launch_extent_node above).
     compute_shard_config
     compute_affinity_decision
     if (( SHARDS > 1 )); then
-        echo "[cluster] F099-M: extent-node shards=$SHARDS stride=$SHARD_STRIDE"
+        echo "[cluster] extent-node shards=$SHARDS stride=$SHARD_STRIDE"
     fi
 
-    # F214-C/D: format each EN's data dirs BEFORE launching the EN
+    # format each EN's data dirs BEFORE launching the EN
     # binary. `autumn-op format` queries the manager's cluster_id,
     # registers the node, and stamps the per-dir sentinel files; the
     # EN binary refuses to start without them. The previous separate
@@ -1013,11 +1013,11 @@ do_start() {
             fi
             echo "[cluster] waiting for Online nodes (round ${_i})..."
         done
-        # F-PRESPLIT-PER-NS: `bootstrap --presplit` is RETIRED (it cut the RAW
+        # `bootstrap --presplit` is RETIRED (it cut the RAW
         # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
         # is now interpreted as "presplit the BENCH namespace into N partitions",
         # applied after bootstrap + namespace registration below.
-        # F-ADMIN-OP-AUTH: the manager now always has an admin token (provisioned
+        # the manager now always has an admin token (provisioned
         # above), and bootstrap sends CREATE_STREAM / UPSERT_PARTITION, which the
         # manager gates. Pass the token so bring-up is authorized.
         local _boot_admin=()
@@ -1037,8 +1037,8 @@ do_start() {
         (( wait_secs < 3 )) && wait_secs=3
         echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
         sleep "$wait_secs"
-        # F099-K: confirm the first partition's listener is actually up.
-        # Under F099-K the per-partition listener on :$PS_BASE_PORT only exists
+        # confirm the first partition's listener is actually up.
+        # The per-partition listener on :$PS_BASE_PORT only exists
         # once partition 0 has been opened and registered with the mgr.
         wait_port "$PS_BASE_PORT" "partition 0 listener" 60
     fi
@@ -1078,7 +1078,7 @@ do_start() {
         local _ao=( "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
         "${_ao[@]}" namespace-create --name gallery --admin-token "$_atok" >/dev/null 2>&1 || true
         local _spec _p _grant _out
-        # F-NS-PRINCIPAL-UNIFIED (§8.8): per-family principals (NS-FIRST keys, no
+        # (§8.8): per-family principals (NS-FIRST keys, no
         # tenant segment). Each app uses its own credential = least privilege by
         # default (no all-ns master key). Cred file = two-line `principal:`/
         # `credential:` form (read_credential_file carries the name).
@@ -1101,7 +1101,7 @@ do_start() {
         echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi
 
-    # F102: snapshot launch params so per-process subcommands can replay
+    # snapshot launch params so per-process subcommands can replay
     # them later without the user re-typing flags or env vars.
     save_cluster_config
 
@@ -1120,7 +1120,7 @@ do_start() {
 }
 
 # ---------------------------------------------------------------------------
-# F102: per-process subcommands (recovery testing)
+# per-process subcommands (recovery testing)
 # ---------------------------------------------------------------------------
 
 do_start_node() {
@@ -1135,7 +1135,7 @@ do_start_node() {
     if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
         die "node$i already running (pid $(cat "$pf"))"
     fi
-    # F214-C: idempotent re-format. The dir's existing cluster_id /
+    # idempotent re-format. The dir's existing cluster_id /
     # disk_uuid sentinel files match the manager → format reuses the
     # existing disk_uuid and re-calls register-node. This is the safety
     # net for "manager lost in-memory state (no etcd mode) after a
@@ -1162,7 +1162,7 @@ do_start_ps() {
     fi
     launch_ps
     # Per-partition listener on :$PS_BASE_PORT only comes up after partition 0
-    # opens (F099-K). Wait for it so a recovery test can `start-ps` and
+    # opens. Wait for it so a recovery test can `start-ps` and
     # immediately drive traffic.
     wait_port "$PS_BASE_PORT" ps 60
 }
@@ -1286,7 +1286,7 @@ shift || true
 
 REPLICAS=1
 MODE="default"  # default | 3disk | multidisk-1node
-ARG_INT_PROVIDED=0  # F102: distinguishes "explicit N" from "default 1" so per-process subcommands can require an explicit index.
+ARG_INT_PROVIDED=0  # distinguishes "explicit N" from "default 1" so per-process subcommands can require an explicit index.
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
     REPLICAS="$1"
     ARG_INT_PROVIDED=1
@@ -1351,7 +1351,7 @@ case "$CMD" in
     reset)        do_clean; do_start "$REPLICAS" 1 ;;
     status)       do_status ;;
     logs)         do_logs ;;
-    # F102: per-process control for recovery testing. Args inherit the
+    # per-process control for recovery testing. Args inherit the
     # ARG_INT_PROVIDED gate above so a typo doesn't silently default N=1.
     start-node)
         (( ARG_INT_PROVIDED )) || die "usage: $0 start-node <N>"

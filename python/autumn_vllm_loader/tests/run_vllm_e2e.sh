@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F-VLLM-LOADER e2e: vLLM loads a real model from autumn via --load-format autumn.
+# e2e: vLLM loads a real model from autumn via --load-format autumn.
 # Local TCP cluster + venv vLLM. Uploads gte-Qwen2-1.5B weights to autumn, then
 # vLLM loads them through AutumnModelLoader and runs a forward pass.
 set -u

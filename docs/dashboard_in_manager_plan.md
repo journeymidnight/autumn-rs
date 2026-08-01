@@ -1,4 +1,4 @@
-# F-DASH-IN-MGR — fold the web dashboard + auto-policy controller into `autumn-manager`
+# Fold the web dashboard + auto-policy controller into `autumn-manager`
 
 **Status:** plan (approved decisions folded in 2026-07-04) — not yet started.
 **Produced by:** Fable planning sub-agent, grounded against real symbols (all verified to exist).
@@ -62,7 +62,7 @@ can only serve pre-rendered strings, which is fine for `/metrics` but not for th
 request-driven `/api/partition/<id>` + POST `/api/action`.
 
 **Approach:** new `crates/manager/src/dashboard.rs` — an accept loop on a compio `TcpListener`
-(mirrors `AutumnManager::serve()` in `rpc_handlers.rs:34`, incl. the F257 accept-error tolerance:
+(mirrors `AutumnManager::serve()` in `rpc_handlers.rs:34`, incl. the accept-error tolerance:
 log + 100 ms backoff, never `?` out of the loop). Each accepted connection is handled in a
 detached `compio::runtime::spawn`, so handlers get direct `Rc<AutumnManager>` access with zero
 channels/snapshots, and a stalled browser can't head-of-line-block the RPC plane. Guards:
@@ -76,7 +76,7 @@ New dep: `serde_json` only (already used by `crates/server`; `serde` is a worksp
 responses are built with `serde_json::json!` — no derives on the rkyv wire structs.
 
 **Where spawned / flags:** `AutumnManager::start_dashboard(listen_host, port, allow_mutations)`,
-wrapped in the existing `spawn_supervised` panic isolation (`lib.rs:1081`, F228), called from
+wrapped in the existing `spawn_supervised` panic isolation (`lib.rs:1081`), called from
 `crates/server/src/bin/manager.rs` main next to the metrics block. Flags `--dashboard-port <P>`,
 `--dashboard-listen <HOST>` (default = `--listen`), `--dashboard-allow-mutations` — all mirroring
 `--metrics-port`/`--metrics-listen` parsing (`manager.rs:142`). No env reads in Rust
@@ -87,14 +87,14 @@ wrapped in the existing `spawn_supervised` panic isolation (`lib.rs:1081`, F228)
 > **INVARIANT (leader-only).** The auto-policy loop runs on the etcd **leader and nowhere else**.
 > Every tick begins with `if !self.leader.get() { continue; }` — no candidate read, no decision, no
 > actuation, not even DryRun logging of an actuation on a follower. On demotion the loop goes idle
-> on the next tick; a straggler in-flight actuation is additionally refused by the F149 leader fence
+> on the next tick; a straggler in-flight actuation is additionally refused by the leader fence
 > carried on the manager ops themselves. Followers MAY serve the read-only dashboard endpoints
 > (replica state), but the loop and every mutating/config-writing endpoint are leader-gated.
 
-**F203 reconciliation (must be written into `crates/manager/CLAUDE.md`).** F203 made the manager
+**Pure-mechanism reconciliation (must be written into `crates/manager/CLAUDE.md`).** The manager is
 pure *mechanism*: `policy_tick_loop` (`lib.rs:1201`) only fills `advisory_cache` via
 `recompute_advisory_cache`; dispatch was deleted and moved to the external Python controller.
-Folding the loop back in does **not** revert F203's layering:
+Folding the loop back in does **not** revert that layering:
 
 - Advisory emission stays a separable mechanism layer that never self-dispatches.
 - The controller is a **distinct** module (`auto_policy.rs`), **default-OFF** — a fresh cluster is
@@ -124,24 +124,24 @@ in `start_runtime_tasks` (`lib.rs:1106`):
   - `cooldown_key` (py:263), `describe_candidate` (py:222).
 - **In-process actuation** (no subprocess, no self-RPC):
   - split → `auto_dispatch_split` (`lib.rs:1307`, sends `MSG_SPLIT_PART` to the owning PS).
-  - merge → extract the **F185 freeze-drain** body of `handle_merge_partitions`
+  - merge → extract the **freeze-drain** body of `handle_merge_partitions`
     (`rpc_handlers.rs:3461`, the frozen-for-merge path at 3382) into
-    `pub(crate) async fn do_merge_partitions(...)` — NOT the F184 flush-based `auto_dispatch_merge`
-    (`lib.rs:1359`), which has the ~5 % loss window F185 closed. Both the RPC handler and the loop
+    `pub(crate) async fn do_merge_partitions(...)` — NOT the flush-based `auto_dispatch_merge`
+    (`lib.rs:1359`), which has the ~5 % loss window the freeze-drain path closed. Both the RPC handler and the loop
     call the extracted fn.
   - gc / compact → PS RPC `MSG_MAINTENANCE` (`MAINTENANCE_AUTO_GC` / `MAINTENANCE_COMPACT`) via
     `conn_pool.call_timeout` — the pattern already in `auto_dispatch_merge`'s flush closure
     (`lib.rs:1381`).
   - ec → extract `handle_force_ec_convert`'s body (`rpc_handlers.rs:3797`) into an inner fn taking
-    `extent_id` (already idempotent, F198).
+    `extent_id` (already idempotent).
 - Refusals (Precondition / inflight / NotLeader) → logged to the action log, retried next tick.
-  Safe because the underlying ops are crash-safe + idempotent-on-retry (F149 fence, F207 inflight
-  ledger, F185 merge freeze).
+  Safe because the underlying ops are crash-safe + idempotent-on-retry (the leader fence, the inflight
+  ledger, the merge freeze).
 
 ## 5. Config & persistence (etcd, leader-fenced)
 
 New rkyv structs in `crates/rpc/src/manager_rpc.rs` (precedent: `MgrTenantAccount`,
-`MgrEcDispatchInflight`), written via the F149-fenced `EtcdMirror::put_msgs_txn` (`lib.rs:243`) so
+`MgrEcDispatchInflight`), written via the leader-fenced `EtcdMirror::put_msgs_txn` (`lib.rs:243`) so
 **only the leader mutates controller config**, loaded in `replay_from_etcd` (`lib.rs:1976`) so it
 survives restart + failover:
 
@@ -161,7 +161,7 @@ survives restart + failover:
 ## 6. New RPCs + `autumn-op` subcommands
 
 Add to `crates/rpc/src/manager_rpc.rs` (bumps the wire fingerprint — MIN=MAX same-commit deploy
-discipline, as F-FS-UNIFY M0 did with WIRE v11):
+discipline, as the fuse/fsspec unification did with WIRE v11):
 
 - `MSG_AUTOPOLICY_GET` — returns `MgrAutoPolicyConfig` + the action log. Routes to leader
   (`mgr_call_leader`) since the log is leader-local.
@@ -228,13 +228,13 @@ endpoints reproduce the exact JSON contracts:
   the leader → new leader resumes the SAME active policy + mode from etcd; follower never ticks;
   `autumn-op auto-policy status` reflects state.
 - **M3 — mutations + arming.** `--dashboard-allow-mutations` gates loop-Armed + `/api/action`;
-  in-process actuation (split / extracted `do_merge_partitions` F185 path / gc / compact / ec);
+  in-process actuation (split / extracted `do_merge_partitions` freeze path / gc / compact / ec);
   POST `/api/action` live.
   *Acceptance:* fast-mode cluster, `aggressive` Armed → a real auto-split + auto-gc land (manager
   log + `info`); manual UI compact works; without the flag both paths refuse; leader-failover during
   Armed operation resumes actuating on the new leader.
 - **M4 — retire Python + docs.** Delete `python/dashboard/` (5 files); fold `DASHBOARD.md` ops
-  content into `docs/ops.md`; update `README.md`, `crates/manager/CLAUDE.md` (F203 note),
+  content into `docs/ops.md`; update `README.md`, `crates/manager/CLAUDE.md` (pure-mechanism note),
   `crates/server/CLAUDE.md` (manager flags), deploy k8s/baremetal port exposure, `feature_list.md`,
   `claude-progress.txt`.
   *Acceptance:* `grep -r autumn_dashboard` finds only history/archive; `docs/ops.md` manual steps
@@ -269,10 +269,10 @@ autumn_dashboard_web.html, test_autumn_dashboard.py, DASHBOARD.md}`.
   leader-gated manager Service. **Flag this prominently in `docs/ops.md`.**
 - **Hand-rolled HTTP correctness** — bounded by `Connection: close`, 64 KiB cap, timeouts, per-conn
   detached task; parser handles exactly GET/POST + Content-Length.
-- **F203 optics** — mitigated by §4 (opt-in, default-OFF, mechanism untouched); write into
+- **Pure-mechanism optics** — mitigated by §4 (opt-in, default-OFF, mechanism untouched); write into
   `crates/manager/CLAUDE.md` so a future session doesn't "fix" it back.
-- **Leader failover mid-actuation** — split/ec/merge already fenced/idempotent (F149/F198/F185 30 s
-  freeze TTL/F207 ledger); residual is a lost `autoPolicy/cooldowns` stamp → one possible early
+- **Leader failover mid-actuation** — split/ec/merge already fenced/idempotent (leader fence / idempotent EC / 30 s
+  merge-freeze TTL / inflight ledger); residual is a lost `autoPolicy/cooldowns` stamp → one possible early
   re-actuation, bounded by server-side per-kind cooldowns + inflight flags.
 - **Wire-version bump** — `MSG_AUTOPOLICY_*` bumps the fingerprint; MIN=MAX same-commit deploy
   (whole-cluster stop/start, `feedback_stopworld_restart_primary`), no rolling.
@@ -280,12 +280,12 @@ autumn_dashboard_web.html, test_autumn_dashboard.py, DASHBOARD.md}`.
 ## 12. `feature_list.md` entry (to add at task start)
 
 ```markdown
-### F-DASH-IN-MGR — web dashboard + auto-policy controller folded into autumn-manager
+### Web dashboard + auto-policy controller folded into autumn-manager
 - **Trigger**: "all-in-one AI storage" — the standalone Python dashboard (`python/dashboard/`) is
   architecturally fragmented AND hosts the auto-policy controller in a killable web process: stop the
   dashboard and auto-split/merge/gc/compact/ec stops with it. Standing directive: 编排/policy 循环必须进
   leader-fenced manager,不进 CLI/SDK. Fold both into `autumn-manager` (HTML embedded via `include_str!`),
-  one process, crash-safe, leader-owned. F203 reconciliation: advisory emission stays pure mechanism; the
+  one process, crash-safe, leader-owned. Pure-mechanism reconciliation: advisory emission stays pure mechanism; the
   in-manager controller is leader-fenced, etcd-config-driven, and DEFAULT-OFF (Off→DryRun→Armed state
   machine; armed only when an operator selects+enables a policy AND `--dashboard-allow-mutations` is set),
   so a fresh cluster remains pure-mechanism.
@@ -293,7 +293,7 @@ autumn_dashboard_web.html, test_autumn_dashboard.py, DASHBOARD.md}`.
   metrics_http precedent, NOT axum; `include_str!` of `dashboard_web.html`; JSON endpoints byte-compatible
   with the Python contracts; verb-whitelisted `/api/action`) + `crates/manager/src/auto_policy.rs` (ported
   decide_actions/candidate_to_cmd/cooldown_key; in-process actuation: auto_dispatch_split, extracted
-  do_merge_partitions (F185 freeze path), PS MSG_MAINTENANCE gc/compact, force-ec inner fn) + etcd
+  do_merge_partitions (freeze path), PS MSG_MAINTENANCE gc/compact, force-ec inner fn) + etcd
   `autoPolicy/{config,cooldowns}` (rkyv, leader-fenced put_msgs_txn, replay_from_etcd) + `MSG_AUTOPOLICY_*`
   RPCs + `autumn-op auto-policy status|activate|deactivate` + flags
   `--dashboard-port/--dashboard-listen/--dashboard-allow-mutations` (env→flag in

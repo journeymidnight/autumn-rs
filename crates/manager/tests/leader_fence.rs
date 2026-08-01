@@ -1,4 +1,4 @@
-//! F149: leader-fence on every manager etcd write txn.
+//! leader-fence on every manager etcd write txn.
 //!
 //! Asserts that a manager whose leader-key value has been overwritten
 //! (simulating a clean failover where a new leader has taken the slot)
@@ -36,11 +36,11 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
     std::thread::sleep(Duration::from_millis(400));
 }
 
-// ── F149: deposed leader's writes are fence-rejected ──────────────────
+// ── deposed leader's writes are fence-rejected ──────────────────
 
 #[test]
 #[ignore] // requires embedded etcd (go runtime)
-fn f149_deposed_leader_etcd_writes_are_fenced() {
+fn deposed_leader_etcd_writes_are_fenced() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
@@ -73,7 +73,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
         // (`Cmp::value(LEADER_KEY) == M1.instance_id`) starts failing
         // for any subsequent etcd write from M1. This simulates a clean
         // failover where a new leader has taken the slot before M1's
-        // keepalive notices, which is exactly the F149 split-brain
+        // keepalive notices, which is exactly the split-brain
         // window we want to close.
         let aux = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
             .await

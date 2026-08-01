@@ -1,4 +1,4 @@
-//! F-ioring-lease-3 — long-poll invalidation channel. Drives the
+//! Long-poll invalidation channel. Drives the
 //! end-to-end shape: a reader's `MSG_POLL_INVALIDATIONS` parks on
 //! the manager side; a concurrent writer-close fires the waker; the
 //! poll returns the WriterClosed event within ~ms (NOT after the
@@ -97,7 +97,7 @@ fn long_poll_returns_promptly_on_writer_close() {
         );
         // The release went out after a 200 ms sleep — the poll must
         // have actually waited (not returned the empty-then-retry
-        // result our pre-F3 implementation would).
+        // result the pre-long-poll implementation would).
         assert!(
             elapsed >= Duration::from_millis(150),
             "long-poll resolved too fast; expected ~200 ms wait; elapsed={elapsed:?}"

@@ -1,4 +1,4 @@
-//! F069: System test — PS crash → partition reassigned → continued read/write.
+//! System test — PS crash → partition reassigned → continued read/write.
 //!
 //! PS1 serves a partition and writes data. PS1 stops heartbeating.
 //! After ~10s manager timeout, partition is reassigned to PS2.

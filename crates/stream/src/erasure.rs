@@ -401,11 +401,11 @@ mod tests {
         assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
 
-    /// F200: verify that `ec_reconstruct_shard` operates correctly on
+    /// verify that `ec_reconstruct_shard` operates correctly on
     /// SUB-RANGE shard slices (not full-size shards). This is the
     /// load-bearing invariant for `ec_reconstruct_shard_subrange` in
     /// `client.rs` — without it, sub-range reconstruction would have
-    /// to fall back to full-extent decode (the pre-F200 hot path that
+    /// to fall back to full-extent decode (the earlier hot path that
     /// caused macOS GC pressure).
     ///
     /// Galois-8 RS encodes byte-by-byte: at each row position `i` the
@@ -413,7 +413,7 @@ mod tests {
     /// sub-range `[a, b)` of length N on the missing shard can be
     /// reconstructed from `[a, b)` of length N on K healthy shards.
     #[test]
-    fn f200_reconstruct_shard_subrange_data_shard() {
+    fn reconstruct_shard_subrange_data_shard() {
         let payload: Vec<u8> = (0..(1 << 16)).map(|i| (i % 251) as u8).collect();
         let data_shards = 3usize;
         let parity_shards = 1usize;
@@ -442,16 +442,16 @@ mod tests {
             ec_reconstruct_shard(sub_shards, data_shards, parity_shards, 0).unwrap();
         assert_eq!(
             reconstructed, truth,
-            "F200: sub-range reconstruction must match the original shard's sub-range"
+            "sub-range reconstruction must match the original shard's sub-range"
         );
     }
 
-    /// F200: same property holds for K-1 healthy data shards + 1 parity
+    /// same property holds for K-1 healthy data shards + 1 parity
     /// (the typical online-failure scenario where one data-shard host
     /// is offline). Reconstructs shard 1's sub-range from shards
     /// {0, 2, parity}.
     #[test]
-    fn f200_reconstruct_shard_subrange_with_one_parity_present() {
+    fn reconstruct_shard_subrange_with_one_parity_present() {
         let payload: Vec<u8> = (0..(1 << 18)).map(|i| (i % 251) as u8).collect();
         let data_shards = 3usize;
         let parity_shards = 1usize;
@@ -473,13 +473,13 @@ mod tests {
         assert_eq!(reconstructed, truth);
     }
 
-    /// F128: verify the shard_size detection condition used by
+    /// verify the shard_size detection condition used by
     /// handle_convert_to_ec to detect a crash between rename(.ec.dat → .dat)
     /// and save_meta. After the crash, local file len == shard_size but meta
     /// still has the old eversion. The condition is:
     ///   local_len < sealed_length && local_len == expected_shard
     #[test]
-    fn f128_shard_size_detection_for_crash_recovery() {
+    fn shard_size_detection_for_crash_recovery() {
         for &(payload_len, data_shards) in &[
             (1024usize, 2usize),
             (4096, 3),
@@ -497,14 +497,14 @@ mod tests {
             let detected = local_len < sealed_length && local_len == expected_shard as u64;
             assert!(
                 detected,
-                "F128 detection should fire for payload={payload_len}, data_shards={data_shards}"
+                "crash-recovery detection should fire for payload={payload_len}, data_shards={data_shards}"
             );
 
             let not_crash = payload_len as u64;
             let not_detected = not_crash < sealed_length && not_crash == expected_shard as u64;
             assert!(
                 !not_detected,
-                "full payload should NOT trigger F128 detection"
+                "full payload should NOT trigger crash-recovery detection"
             );
         }
     }
