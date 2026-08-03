@@ -36,8 +36,8 @@ RA="$ROOT/.claude/skills/remote-autumn/remote-autumn.sh"
 #   export AUTUMN_REMOTE_ROOT=/path/to/autumn-rs    # repo checkout on the peer
 #   export AUTUMN_LOCAL_DATA=/path/to/en-data       # EN data dir, this host
 #   export AUTUMN_REMOTE_DATA=/path/to/en-data      # EN data dir, peer host
-LIP="${AUTUMN_LOCAL_IP:?set AUTUMN_LOCAL_IP (this host's address)}"
-RIP="${AUTUMN_REMOTE_IP:?set AUTUMN_REMOTE_IP (the peer host's address)}"
+LIP="${AUTUMN_LOCAL_IP:?set AUTUMN_LOCAL_IP (this host address)}"
+RIP="${AUTUMN_REMOTE_IP:?set AUTUMN_REMOTE_IP (the peer host address)}"
 MGR="[$LIP]:9001"
 RROOT="${AUTUMN_REMOTE_ROOT:?set AUTUMN_REMOTE_ROOT (autumn-rs checkout on the peer)}"
 LDATA="${AUTUMN_LOCAL_DATA:?set AUTUMN_LOCAL_DATA (EN data dir on this host)}"
@@ -81,8 +81,8 @@ setsid nohup "$ROOT/target/release/autumn-manager-server" \
 sleep 3
 
 AOC=(timeout 20 "$AO" --manager "$MGR" --transport "$T")
-CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T")
-CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T")
+CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T" --namespace mem)
+CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T" --namespace mem)
 
 # Readiness gates — NEVER rely on fixed sleeps: under ucx the manager's
 # listener can spend ~90s in the TIME_WAIT bind retry (cross-host
@@ -137,7 +137,7 @@ sleep 5
 # ── bootstrap (replication 3 over 3 ENs) + PSes ─────────────────────────────
 wait_nodes 3
 say "bootstrap + starting PS1 (local) / PS2 (remote)"
-"${AOC[@]}" bootstrap --replication 3+0 --presplit 4:hexstring >/dev/null 2>&1 || fail "bootstrap"
+"${AOC[@]}" bootstrap --replication 3+0 >/dev/null 2>&1 || fail "bootstrap"
 setsid nohup "$ROOT/target/release/autumn-ps" --psid 1 --port 9301 --manager "$MGR" \
     --listen "$LIP" --advertise "[$LIP]:9301" --transport "$T" \
     > "$WORK/ps1.log" 2>&1 < /dev/null &
@@ -160,6 +160,12 @@ wait_mgr_ready() {
 }
 
 # ── seed + verify helpers + write loop ──────────────────────────────────────
+# Presplit the mem namespace into 4 partitions so X2 exercises cross-host
+# partition migration on both keyspace halves. Best-effort — bootstrap creates
+# one partition covering all of mem/, and the recovery test still runs on a
+# single partition if this can't split.
+"${AOC[@]}" presplit --namespace mem --count 4 >/dev/null 2>&1 || say "presplit skipped (single partition)"
+
 say "seeding keys"
 mkdir -p "$WORK/seed"; seed_keys=()
 for i in $(seq 0 39); do
