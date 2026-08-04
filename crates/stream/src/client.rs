@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::extent_rpc::{
-    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ProbeExtentReq,
+    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
+    FenceExtentResp, ProbeExtentReq,
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
     encode_chain_prefix, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
-    MSG_APPEND, MSG_APPEND_CHAIN,
+    MSG_APPEND, MSG_APPEND_CHAIN, MSG_FENCE_EXTENT,
     MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH,
 };
 use crate::ConnPool;
@@ -3603,6 +3604,108 @@ impl StreamClient {
     /// Needed after EC conversion changes the extent's topology.
     pub fn invalidate_extent_cache(&self, extent_id: u64) {
         self.extent_info_cache.remove(&extent_id);
+    }
+
+    /// EAGERLY raise the EN `owner_epoch` fence floor on the stream's CURRENT
+    /// tail extent to `owner_epoch`, on every REACHABLE replica, WITHOUT
+    /// appending (`MSG_FENCE_EXTENT`).
+    ///
+    /// Called on partition TAKEOVER (`open_partition`) so a paused-then-resumed
+    /// previous owner (a "zombie writer") whose in-flight append still carries
+    /// the OLD epoch is rejected at the EN (`handle_append`: `req.owner_epoch <
+    /// stored`). It closes the idle-takeover window where the EN floor stayed at
+    /// `E_old` until the new owner's FIRST append lazily raised it — the window
+    /// in which the zombie's `E_old` append (equal to the stale floor) passed
+    /// the fence, landed in the log extent, and was silently ACKed.
+    ///
+    /// LENIENT + best-effort (mirrors the seal-over-reachable rule): append is
+    /// all-replica-ACK, so fencing even ONE reachable replica already blocks the
+    /// zombie — its append needs EVERY replica to accept. Returns `Ok` when at
+    /// least one replica was fenced (`CODE_OK`) or already carries a HIGHER
+    /// epoch (`CODE_LOCKED_BY_OTHER` — someone newer already owns it); a replica
+    /// that is unreachable, undecodable, or fail-closed (`CODE_PRECONDITION`) is
+    /// logged and skipped. `Err` only when NO replica could be fenced. An empty
+    /// stream (no tail extent) is `Ok` — nothing to fence.
+    ///
+    /// CALLER CONTRACT (Layer-C guard): `owner_epoch` MUST be the partition's own
+    /// freshly-acquired `partition/{part_id}` owner-lock revision (E_new from
+    /// `acquire_partition_owner_epoch`). NEVER pass a `ps-<id>` server_revision, an
+    /// `admin-merge:` epoch, or any other lock's revision — feeding a foreign
+    /// revision into a floor-RAISING op is exactly the hazard the check-only
+    /// `handle_commit_length` postmortem ("CHECK ONLY, NEVER handover") records:
+    /// a stray higher revision would poison the LIVE owner's own fence floor.
+    pub async fn fence_tail(&self, stream_id: u64, owner_epoch: i64) -> Result<()> {
+        let stream = self.get_stream_info(stream_id).await?;
+        let Some(&tail_id) = stream.extent_ids.last() else {
+            // Empty stream — no tail extent exists yet. Nothing to fence; the
+            // first-appended extent starts at owner_epoch 0 and the new owner's
+            // own first append raises it.
+            return Ok(());
+        };
+        let ex = self.get_extent_info(tail_id).await?;
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        let total = addrs.len();
+        let mut fenced = 0usize;
+        for addr in &addrs {
+            let req = FenceExtentReq {
+                extent_id: tail_id,
+                owner_epoch,
+            };
+            // 5 s — the fence is a tiny in-memory `fetch_max` + a durable
+            // `.meta` persist on the EN; a paged-out / slow replica counts as a
+            // miss (best-effort) rather than wedging the takeover.
+            let result = self
+                .pool
+                .call_timeout(addr, MSG_FENCE_EXTENT, req.encode(), Duration::from_secs(5))
+                .await;
+            let Ok(resp_bytes) = result else {
+                // Transport error OR a handler-level error frame (wrong-shard /
+                // invalid-arg surface as `Err`, never a mis-decodable OK body).
+                tracing::warn!(
+                    stream_id,
+                    extent_id = tail_id,
+                    addr = %addr,
+                    "fence_tail: replica unreachable / errored — skipped (best-effort)"
+                );
+                continue;
+            };
+            let Ok(resp) = FenceExtentResp::decode(resp_bytes) else {
+                tracing::warn!(
+                    stream_id,
+                    extent_id = tail_id,
+                    addr = %addr,
+                    "fence_tail: undecodable response — skipped"
+                );
+                continue;
+            };
+            match resp.code {
+                // Floor raised to (or already at/above) `owner_epoch`, durable.
+                CODE_OK => fenced += 1,
+                // A HIGHER owner already fenced this extent — also fine: the
+                // zombie (lower epoch) is rejected by that higher floor too.
+                CODE_LOCKED_BY_OTHER => fenced += 1,
+                other => {
+                    // CODE_PRECONDITION (fail-closed persist error / quarantine)
+                    // or anything unexpected: this replica is NOT fenced. Other
+                    // reachable replicas may still cover the all-replica-ACK
+                    // guarantee, so keep going.
+                    tracing::warn!(
+                        stream_id,
+                        extent_id = tail_id,
+                        addr = %addr,
+                        code = other,
+                        message = %resp.message,
+                        "fence_tail: replica refused fence — not fenced there"
+                    );
+                }
+            }
+        }
+        if fenced == 0 {
+            return Err(anyhow!(
+                "fence_tail extent {tail_id} (stream {stream_id}): no replica accepted the fence (0/{total})"
+            ));
+        }
+        Ok(())
     }
 
     /// Read-error policy shared by the replicated failover + hedge paths.

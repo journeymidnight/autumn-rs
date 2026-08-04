@@ -336,7 +336,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   provenance × transport, not of the wire structure; the structure is
     //   value-separable "bulk" framing. Wire BYTES unchanged: msg_type
     //   values 0x50/0x51/15 keep their numbers, only const/API names moved).
-    (28, "fad13fb1a07d1cc2"),
+    //   v28 fingerprint refreshed IN PLACE again (③, same sanctioned
+    //   pre-deploy-refinement precedent): the G1 "SIGSTOP zombie writer"
+    //   takeover-fence fix ADDS `MSG_FENCE_EXTENT` (0x11) + `FenceExtentReq`/
+    //   `FenceExtentResp` to `extent_rpc.rs` — a NEW append-only message type
+    //   (existing decode paths unaffected) that perturbs the hashed schema.
+    //   Pre-R3 same-commit stop-world deploy ⇒ MIN=MAX=28 unchanged.
+    (28, "bba50c4a490d2c0d"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -70,7 +70,10 @@ first frame with CrcMismatch instead of reaching the version handshake).
 - **`extent_rpc.rs`** — ExtentService wire codec: hot-path binary
   (Append/ReadBytes/CommitLength) + rkyv control-plane (AllocExtent/Df/…). The
   single wire-schema home; autumn-stream re-exports it. `DiskStatus.extent_bytes`
-  (EN self-reported per-disk footprint) feeds cluster-df.
+  (EN self-reported per-disk footprint) feeds cluster-df. `MSG_FENCE_EXTENT` (17,
+  `FenceExtentReq`/`FenceExtentResp`) raises the per-extent `owner_epoch` fence
+  floor WITHOUT appending — the eager takeover fence (`StreamClient::fence_tail`,
+  the G1 zombie-writer fix; see stream CLAUDE.md note 31).
 - **`manager_rpc.rs`** / **`partition_rpc.rs`** — manager and PS wire schemas
   (rkyv structs + `MSG_*` constants), the most-referenced surface in the crate.
 - **`cap_token.rs`** — Ed25519 capability-token codec for data-plane authz: the

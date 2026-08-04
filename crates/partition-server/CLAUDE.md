@@ -1591,6 +1591,25 @@ Three fixes bound the restart replay window (worst case per partition =
     PS-lifetime `server_owner_key`/`server_revision` ("ps-<id>") remains ONLY for
     split-coordination RPCs.
 
+    **EAGER takeover fence (G1 "SIGSTOP zombie writer" fix).** Acquiring E_new only
+    fences the previous owner at the MANAGER (`ensure_owner_epoch` equality) — the EN
+    per-extent `owner_epoch` floor is raised LAZILY, by the new owner's FIRST append
+    (stream note 23). So on an IDLE takeover (E_new acquired, no write yet), the EN floor
+    stays at E_old, and a paused-then-resumed old owner's in-flight append carrying E_old
+    PASSES the EN fence (`E_old == stored`), lands in the log extent, and is silently
+    ACKed — a lost update the new owner never sees. `partition_thread_main` closes this:
+    right after the initial `commit_length` loop and BEFORE `recover_partition`, it calls
+    `part_sc.fence_tail(sid, owner_epoch)` for each of log/row/meta, EAGERLY raising the EN
+    floor to E_new via `MSG_FENCE_EXTENT` (a control op, not an append — so routing all
+    three through `part_sc` respects the row_stream single-writer rule). Best-effort +
+    lenient (append is all-replica-ACK, so one fenced replica already blocks the zombie);
+    a transient fence failure is logged and the open PROCEEDS (never wedge). This makes the
+    append-path fence EAGER, not first-append-lazy; it does not replace it. Regression
+    guard: `crates/manager/tests/system_sigstop_zombie_writer.rs` (asserts the old owner
+    can no longer cleanly ACK a stale-epoch write). The read-side `handle_get` write fence
+    (a residual STALE READ before the old owner closes the reassigned partition) is a
+    documented SEPARATE follow-up.
+
 20. **Manager-list rotation invariants (keep all four or HA failover silently dies).**
     (a) `PartitionServer.current_mgr` is `Rc<Cell<usize>>` (the struct is cloned once per
     supervised loop; a plain Cell gives each loop a PRIVATE rotation index, so only

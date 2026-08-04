@@ -723,6 +723,8 @@ and from other crates' CLAUDE.md); do not renumber.
     - `retry_manager_call` classifies before retrying (see the retry-classification list under "Connection & ownership"). The transient-conflict marker (`is_transient_conflict`) is retryable WITHOUT rotating; the fence + deterministic Preconditions fail fast, unwrapped.
     - **Owner-fence self-heal.** `ManagerError::is_owner_fence` (CODE_PRECONDITION + `autumn_common::is_owner_epoch_fence_message`, the matcher living next to its `ensure_owner_epoch` producer in `common/store.rs`) renders Display as `"<ctx> fenced (LockedByOther): …"`. The **"LockedByOther" token is LOAD-BEARING**: the PS's `is_locked_by_other` (`{e:#}` chain-wide so `.context` wraps can't hide it) poisons the partition → reopen re-acquires a fresh epoch (the SAME self-heal the EN's native `CODE_LOCKED_BY_OTHER` triggers). The PS also closes the liveness gap: a poisoned/crashed partition thread's dead handle is detected by `sync_regions_once` (`is_finished()`) and dropped, so the region map arbitrates the same tick (still-assigned → reopen with fresh epoch; moved-away → clean release). **Invariant: a stale `owner_epoch` must NEVER be silently re-acquired inside StreamClient** — auto-refresh would defeat fencing (a zombie writer could steal the lock back); recovery is always tear-down-and-reopen at the partition layer, arbitrated by the region map.
 
+31. **`fence_tail` EAGERLY raises the EN fence floor on TAKEOVER (G1 "SIGSTOP zombie writer" fix).** The EN `owner_epoch` floor is raised ONLY by the APPEND path (note 23), so on an IDLE takeover (new owner acquires E_new but has not written yet) the floor stays at the OLD owner's epoch E_old. A paused-then-resumed previous owner (SIGSTOP > eviction window → reassign → SIGCONT) whose in-flight append still carries E_old then PASSES the fence (`E_old == stored`, neither `<` nor `>`), lands in the log extent, and is ACKed — a silent LOST UPDATE the new owner never sees. `fence_tail(stream_id, owner_epoch)` closes this: it resolves the stream's CURRENT tail extent + replica set (`get_stream_info` → `get_extent_info` → `replica_addrs_for_extent`) and sends `MSG_FENCE_EXTENT{tail, owner_epoch}` to every REACHABLE replica, raising the EN floor to E_new BEFORE the partition serves. The PS calls it in `partition_thread_main` for all three stream tails (log/row/meta) right after the initial `commit_length` loop and BEFORE `recover_partition` (fencing is a control op, not a row_stream append, so routing all three through `part_sc` is consistent with the row_stream single-writer rule). **Lenient + best-effort** (mirrors seal-over-reachable): append is all-replica-ACK, so fencing even ONE reachable replica already blocks the zombie (its append needs EVERY replica to accept). Returns Ok if ≥1 replica was fenced (`CODE_OK`) or already carries a higher epoch (`CODE_LOCKED_BY_OTHER`); an unreachable / fail-closed replica is logged + skipped; a total failure is logged and the open PROCEEDS (never wedge on a transient fence failure). **Invariant: the takeover fence must run before the partition accepts requests; it does NOT replace the append-path fence (note 23) — it makes it EAGER instead of first-append-lazy.** The read-side (`handle_get`) has no write fence, so a residual STALE READ from the old owner before it closes the reassigned partition is a documented SEPARATE follow-up (out of scope for this write-side fix). A second narrow residual: an extent allocated AFTER the fence is born at floor 0 (raised lazily by the first append), so a zombie that follows a tail ROLL into a fresh unfenced tail during the sub-second window before the new owner's first append could still slip through — far narrower than pre-fix (needs a sealed tail at takeover + tight timing); a born-fenced alloc (carry the allocator epoch in `AllocExtentReq`) is the hardening follow-up. The APPEND path also re-checks `owner_epoch` AFTER the commit-reconcile truncate await and (non-batched path) before the ACK, so a fence landing DURING an in-flight append's widest awaits still rejects it — the fence op's "durable ⇒ stale appends rejected here" contract holds across the whole prologue.
+
 ---
 
 ## RPC wire protocol (`extent_rpc.rs`, in autumn-rpc)
@@ -737,11 +739,25 @@ RPCs use hand-coded binary encoding; control-plane RPCs use rkyv zero-copy.
 | Append | 1 | 29B + payload | 9B |
 | ReadBytes | 2 | 24B | 9B + payload |
 | CommitLength | 3 | 16B | 5B |
+| FenceExtent | 17 | 16B | [code]+msg |
 
 ### Control-plane (rkyv)
 
 AllocExtent(4), Df(5), RequireRecovery(6), ReAvali(7), CopyExtent(8),
 ConvertToEc(9), WriteShard(10), DeleteExtent(11), ReconcileExtents(0x31).
+
+**`MSG_FENCE_EXTENT` (17) — eager owner_epoch fence, no append.** `handle_fence_
+extent` raises the per-extent `owner_epoch` fence floor to `req.owner_epoch`
+WITHOUT writing: it mirrors the APPEND fence prologue (`owner_epoch.fetch_max` +
+`ensure_fence_durable`, fail-closed) minus the pwrite. `FenceExtentReq`
+(16 B binary `[extent_id][owner_epoch]`, same shape as CommitLength) →
+`FenceExtentResp` (`[code][message]`): `CODE_OK` = floor `>= owner_epoch` &
+durable; `CODE_LOCKED_BY_OTHER` = a HIGHER owner already holds it (caller stale);
+`CODE_PRECONDITION` = fail-closed (persist error / quarantined `.meta`).
+`owner_epoch <= 0` is a protocol error. It deliberately does NOT reject a SEALED
+extent — raising a sealed tail's floor is a harmless no-op. Used by
+`StreamClient::fence_tail` on partition TAKEOVER to close the G1 idle-takeover
+window (see note 31).
 
 ---
 

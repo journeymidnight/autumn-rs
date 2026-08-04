@@ -5535,6 +5535,69 @@ async fn partition_thread_main(
         }
     }
 
+    // EAGER TAKEOVER FENCE (G1 "SIGSTOP zombie writer" fix). We just acquired a
+    // FRESH per-partition `owner_epoch` (E_new). Raise the EN `owner_epoch`
+    // fence floor on each stream's CURRENT tail extent to E_new NOW — BEFORE
+    // recovery replay and BEFORE this partition serves ANY request — so a
+    // paused-then-resumed PREVIOUS owner whose in-flight append still carries
+    // the OLD epoch (E_old) is rejected at the EN (`handle_append`:
+    // `req.owner_epoch < stored`). Without this the EN floor stays at E_old
+    // until THIS owner's first append lazily raises it, and on an IDLE takeover
+    // (no write yet) the zombie's `E_old == stored` append passes the fence,
+    // lands in the log extent, and is silently ACKed — a lost update this new
+    // owner never sees. `fence_tail` is a control op (not an append), so routing
+    // all three streams through `part_sc` is consistent with the row_stream
+    // single-writer invariant (which only governs row_stream APPENDs).
+    //
+    // Best-effort + lenient: `fence_tail` returns Ok once at least one reachable
+    // replica is fenced (append is all-replica-ACK → one fenced replica already
+    // blocks the zombie). A transient failure is logged, NOT wedged — the same
+    // stance as a soft tail-init failure; the fence normally succeeds against
+    // the same ENs `commit_length` just reached above.
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        // Bounded retry: the fence is the SOLE mechanism blocking a zombie
+        // writer, so a transient EN flap right after the commit_length loop must
+        // not silently revert us to the vulnerable lazy-fence state. The ENs were
+        // provably reachable a moment ago (commit_length just succeeded), so retry
+        // a few times with a short backoff before proceeding best-effort.
+        let mut fence_err = None;
+        for attempt in 0..3u32 {
+            match part_sc.fence_tail(sid, owner_epoch).await {
+                Ok(()) => {
+                    fence_err = None;
+                    break;
+                }
+                Err(e) => {
+                    fence_err = Some(e);
+                    if attempt < 2 {
+                        compio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        }
+        match fence_err {
+            None => tracing::info!(
+                part_id,
+                stream_id = sid,
+                owner_epoch,
+                "{} takeover fence raised to E_new",
+                label
+            ),
+            Some(e) => tracing::warn!(
+                part_id,
+                stream_id = sid,
+                owner_epoch,
+                error = %e,
+                "{} takeover fence failed after retries (best-effort — proceeding to open)",
+                label
+            ),
+        }
+    }
+
     // Recovery: read metaStream → rowStream → logStream replay
     let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active, recovered_floors) =
         recover_partition(

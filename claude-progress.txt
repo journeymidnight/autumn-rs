@@ -1,3 +1,48 @@
+Date: 2026-08-04
+TaskStatus: completed
+Task scope: 【完成：实现 + 复现验证(A/B 反证) + fable 复审(P1-1 必修已应用:append 路径
+  truncate 后 + pre-ACK 补 owner_epoch 重查;P2-2 有界重试;P3 文档) + 全 lib 测试绿,已 commit】
+  G1 "SIGSTOP zombie writer" lost-update 修复 —— PROACTIVE FENCE-OP（takeover 时 EAGER
+  抬 EN owner_epoch fence floor）。coco 坏了(--profile),改用 fable subagent 复审。
+── 根因 ──
+  open_partition 拿到 FRESH owner_epoch(E_new) 但 EN per-extent owner_epoch 只由 FIRST
+  APPEND 抬（extent_node 2516-2538）。IDLE takeover(无写)下 EN floor 停在 E_old；被
+  SIGSTOP>evict 窗后 reassign、再 SIGCONT 的旧 owner 带 E_old 的 in-flight append 满足
+  E_old==stored（既非 < 也非 >）过 fence → 落 log extent + ACK → 新 owner 永远看不到（丢更新）。
+── 修复（三层，wire+EN+client+PS 接线）──
+  1. wire: extent_rpc.rs 新增 MSG_FENCE_EXTENT=17（append-only，16 后首个空号）+
+     FenceExtentReq(16B binary [extent_id][owner_epoch]，同 CommitLength 形状)/
+     FenceExtentResp([code][message])。round-trip 单测 ×2。
+  2. EN: handle_fence_extent 镜像 APPEND fence 前奏(step3/3b)但不写：owns_extent→
+     corrupt_meta fail-closed→owner_epoch<=0 拒→`<stored`→CODE_LOCKED_BY_OTHER→
+     `>stored` fetch_max→ensure_fence_durable(fail-closed 持久失败→CODE_PRECONDITION)→
+     durable 后 re-check 更高 owner→OK。**不 special-case 拒 sealed**（抬 sealed floor 无害）。
+     dispatch 接线 MSG_FENCE_EXTENT。
+  3. StreamClient::fence_tail(stream_id, owner_epoch): get_stream_info→tail=last→
+     get_extent_info→replica_addrs_for_extent→对每个可达 replica 发 MSG_FENCE_EXTENT。
+     LENIENT+best-effort：append 全副本 ACK ⇒ 一个 replica 被 fence 就挡住 zombie；
+     ≥1 fenced(CODE_OK|LOCKED_BY_OTHER)→Ok；空 stream→Ok；全不可达→Err(log 后 open 继续)。
+  4. PS: partition_thread_main 在 commit_length loop 后、recover_partition 前，对
+     log/row/meta 三个 tail 调 part_sc.fence_tail(sid, E_new)（fence 是控制op非 append，
+     走 part_sc 不违反 row_stream 单写）。best-effort：失败 warn 不 wedge。
+── wire 指纹 ──
+  加 MSG_FENCE_EXTENT 扰动 extent_rpc.rs 哈希 → v28 指纹就地二刷 fad13fb1a07d1cc2→
+  bba50c4a490d2c0d（新增 append-only msg_type，pre-R3 same-commit，MIN=MAX=28 不动）。
+── 复现验证（A/B 硬证据）──
+  harness system_sigstop_zombie_writer 断言从「anomaly 复现」翻成「zombie write 被 fence/拒」
+  = assert!(!zombie_ack)（比 !lost_update 更严：也挡"acked 却恰好传播"）；stale-read 诚实记录
+  不断言（read-side handle_get fence 是 OUT-OF-SCOPE 的独立 follow-up）。
+  * 修复后 3/3 绿：zombie_ack=false、LOST UPDATE=no、STALE READ=no。
+  * A/B 反证（临时 `if false` 禁 fence + rebuild）3/3：zombie-put=>ACK(code=0)、
+    LOST UPDATE=YES、STALE READ=YES、assert!(!zombie_ack) panic FAILED → 证明 harness 是
+    真 regression guard、fence 是唯一机制。已还原（无 TEMP 残留）。
+── 测试 ── rpc --lib 56 / stream --lib 114 / manager --lib 249 / PS --lib 204 全绿；
+  workspace build 绿（3 个 unused_mut/unreachable warning 均 pre-existing 于 server/bin/*，
+  与本改无关，touched files warning-clean）。CLAUDE.md ×3 同步(rpc/stream note31/PS note19)。
+── 待办 ── coco findbugs + human review（未 commit，按要求 leave green）；read-side
+  handle_get fence（stale-read 面）作为独立 follow-up。
+
+============================ prior task history ============================
 Date: 2026-07-30
 TaskStatus: not_completed
 Task scope: 【实现完成，仅欠 coco】术语定版 —— zc→bulk 全量改名 + P-bulk→P-sst 腾词。

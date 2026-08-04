@@ -75,6 +75,25 @@ pub const MSG_READ_BYTES_BULK: u8 = 15;
 /// fencing and commit-truncation are per-replica invariants, unchanged.
 pub const MSG_APPEND_CHAIN: u8 = 16;
 
+/// fence an extent WITHOUT appending: raise the EN's per-extent
+/// `owner_epoch` fence floor to `req.owner_epoch` (durably, across replicas).
+///
+/// Used on partition TAKEOVER to EAGERLY fence the previous owner at the new
+/// owner's epoch (E_new) BEFORE the partition serves any request. Closes the
+/// idle-takeover window: the EN floor is otherwise only raised by the new
+/// owner's FIRST APPEND, so on an idle takeover it stayed at the OLD owner's
+/// epoch (E_old) — and a paused-then-resumed "zombie writer" (the old owner)
+/// whose in-flight append still carries E_old would pass the fence
+/// (`E_old == stored`), land in the log extent, and be ACKed: a silent lost
+/// update the new owner never sees.
+///
+/// The handler mirrors the APPEND fence prologue (`owner_epoch.fetch_max` +
+/// `ensure_fence_durable`, fail-closed on a persist error) MINUS the write.
+/// Raising the floor on a SEALED extent is a harmless no-op (a sealed tail
+/// already rejects the zombie via the sealed check; fencing it is still safe),
+/// so the handler deliberately does NOT special-case-reject sealed.
+pub const MSG_FENCE_EXTENT: u8 = 17;
+
 /// encode the chain prefix (`[n][len+addr]...`) for MSG_APPEND_CHAIN.
 /// The full request is `[prefix][AppendReq::encode_header()][payload...]` —
 /// senders use vectored writes so the payload stays zero-copy.
@@ -457,6 +476,75 @@ impl SyncedLengthResp {
             code: data.get_u8(),
             length: data.get_u64_le(),
         })
+    }
+}
+
+// ── FenceExtent (raise the owner_epoch fence floor, no append) ───────────────
+
+/// FenceExtentRequest: 16 bytes.
+/// `[extent_id: u64 LE][owner_epoch: i64 LE]`
+///
+/// Same fixed-header shape as `CommitLengthReq`, but a MUTATING fence op: the
+/// EN raises `entry.owner_epoch` to `owner_epoch` (monotonic `fetch_max`) and
+/// persists it durably (`ensure_fence_durable`); it neither reads nor returns
+/// a length. `owner_epoch` MUST be `> 0` (a real acquired owner epoch); the EN
+/// rejects `<= 0` as a protocol error. See the `MSG_FENCE_EXTENT` docstring.
+pub struct FenceExtentReq {
+    pub extent_id: u64,
+    pub owner_epoch: i64,
+}
+
+impl FenceExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u64_le(self.extent_id);
+        buf.put_i64_le(self.owner_epoch);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 16 {
+            return Err("fence_extent request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+            owner_epoch: data.get_i64_le(),
+        })
+    }
+}
+
+/// FenceExtentResponse: `[code: u8][message: utf8 …]`
+///
+/// `code`:
+///   - `CODE_OK` — the floor is now `>= owner_epoch` AND durable on this
+///     replica (fence installed, or already at/above it).
+///   - `CODE_LOCKED_BY_OTHER` — a HIGHER owner already holds this extent
+///     (`owner_epoch < stored`); the caller is stale. `fence_tail` treats
+///     this as "fine — someone newer already owns it".
+///   - `CODE_PRECONDITION` — fail-closed: the durable `.meta` persist failed
+///     (disk marked offline) or the `.meta` is quarantined, so the fence is
+///     NOT guaranteed durable on this replica.
+/// `message` carries a human-readable reason for the non-OK codes.
+pub struct FenceExtentResp {
+    pub code: u8,
+    pub message: String,
+}
+
+impl FenceExtentResp {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + self.message.len());
+        buf.put_u8(self.code);
+        buf.extend_from_slice(self.message.as_bytes());
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("fence_extent response too short");
+        }
+        let code = data.get_u8();
+        let message = String::from_utf8_lossy(&data).into_owned();
+        Ok(Self { code, message })
     }
 }
 
@@ -923,6 +1011,41 @@ mod tests {
         let bytes = rkyv_encode(&req);
         let decoded: DeleteExtentReq = rkyv_decode(&bytes).expect("decode");
         assert_eq!(decoded.extent_id, req.extent_id);
+    }
+
+    #[test]
+    fn fence_extent_req_round_trip() {
+        let req = FenceExtentReq {
+            extent_id: 0x0102_0304_0506_0708,
+            owner_epoch: 14396,
+        };
+        let decoded = FenceExtentReq::decode(req.encode()).expect("decode");
+        assert_eq!(decoded.extent_id, req.extent_id);
+        assert_eq!(decoded.owner_epoch, req.owner_epoch);
+    }
+
+    #[test]
+    fn fence_extent_resp_round_trip() {
+        // OK: empty message.
+        let ok = FenceExtentResp {
+            code: CODE_OK,
+            message: String::new(),
+        };
+        let d = FenceExtentResp::decode(ok.encode()).expect("decode ok");
+        assert_eq!(d.code, CODE_OK);
+        assert!(d.message.is_empty());
+
+        // Non-OK carries a readable message.
+        let locked = FenceExtentResp {
+            code: CODE_LOCKED_BY_OTHER,
+            message: "higher owner holds extent 7".to_string(),
+        };
+        let d = FenceExtentResp::decode(locked.encode()).expect("decode locked");
+        assert_eq!(d.code, CODE_LOCKED_BY_OTHER);
+        assert_eq!(d.message, "higher owner holds extent 7");
+
+        // Truncated (empty) response is a decode error, not a panic.
+        assert!(FenceExtentResp::decode(Bytes::new()).is_err());
     }
 
     #[test]

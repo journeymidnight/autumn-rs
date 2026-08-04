@@ -2618,6 +2618,15 @@ async fn build_append_future(
         {
             return batch_append_reject(slots, CODE_PRECONDITION);
         }
+        // Also re-check the owner_epoch fence after the truncate await: a
+        // concurrent MSG_FENCE_EXTENT (eager takeover fence) may have raised the
+        // floor during the truncate's manager RTT + fsync. Without this a stale
+        // lower-epoch (zombie) writer that passed the earlier prologue fence check
+        // would still ACK here under the old epoch — the exact takeover
+        // lost-update the fence op exists to close. Mirrors the P0-B re-check.
+        if first_revision < extent.owner_epoch.load(Ordering::SeqCst) {
+            return batch_append_reject(slots, CODE_LOCKED_BY_OTHER);
+        }
         file_start = extent.len.load(Ordering::SeqCst);
     }
 
@@ -4224,6 +4233,7 @@ impl ExtentNode {
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
             MSG_SYNCED_LENGTH => self.handle_synced_length(payload).await,
             MSG_PROBE_EXTENT => self.handle_probe_extent(payload).await,
+            MSG_FENCE_EXTENT => self.handle_fence_extent(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -5901,6 +5911,13 @@ impl ExtentNode {
             {
                 return append_reject(CODE_PRECONDITION);
             }
+            // Re-check the owner_epoch fence after the truncate await too: a
+            // concurrent eager takeover MSG_FENCE_EXTENT may have raised the floor
+            // during the manager RTT + truncate fsync. See the symmetric re-check
+            // in build_append_future.
+            if req.owner_epoch < extent.owner_epoch.load(Ordering::SeqCst) {
+                return append_reject(CODE_LOCKED_BY_OTHER);
+            }
             start = extent.len.load(Ordering::SeqCst);
         }
 
@@ -5938,6 +5955,17 @@ impl ExtentNode {
                 self.mark_disk_offline_for_extent(req.extent_id);
                 return Err((StatusCode::Internal, "fsync coalescer canceled".to_string()));
             }
+        }
+
+        // Final owner_epoch fence re-check before the write becomes visible/ACKed.
+        // This path advances `extent.len` only here (after pwrite + fsync), so an
+        // eager takeover MSG_FENCE_EXTENT that raised the floor DURING that window
+        // is otherwise invisible until the ACK. Reject so a stale (zombie) writer
+        // never gets an ACK; the bytes already on disk are past the un-advanced
+        // committed end and are reconciled by the committed-end carry check on the
+        // new owner's replay (never a silent lost update).
+        if req.owner_epoch < extent.owner_epoch.load(Ordering::SeqCst) {
+            return append_reject(CODE_LOCKED_BY_OTHER);
         }
 
         extent.len.store(end, Ordering::SeqCst);
@@ -6163,6 +6191,135 @@ impl ExtentNode {
         Ok(ProbeExtentResp {
             code: CODE_OK,
             length,
+        }
+        .encode())
+    }
+
+    /// EAGER owner_epoch fence — raise the per-extent write fence floor to
+    /// `req.owner_epoch` WITHOUT appending. Mirrors the APPEND fence prologue
+    /// (`handle_append` step 3/3b + `build_append_future`) minus the write:
+    /// synchronously raise the in-memory bar (`fetch_max`, monotonic), then
+    /// make the fence DURABLE (`ensure_fence_durable`) before ACKing.
+    /// Fail-closed: a persist failure marks the disk offline and returns
+    /// `CODE_PRECONDITION` so the caller does NOT trust an undurable fence.
+    ///
+    /// Used on partition TAKEOVER (`StreamClient::fence_tail` from
+    /// `open_partition`) to close the idle-takeover window: without it the EN
+    /// floor stays at the OLD owner's epoch until the new owner's first append,
+    /// letting a paused-then-resumed zombie writer's `E_old` append pass the
+    /// fence and be silently ACKed (a lost update). After this fence, that same
+    /// append is rejected at `handle_append` (`req.owner_epoch < stored`).
+    ///
+    /// Deliberately does NOT reject a SEALED extent: raising the floor on a
+    /// sealed tail is a harmless no-op (the sealed check already rejects the
+    /// zombie), and the caller resolves "the current tail" which may have
+    /// sealed under it — fencing it anyway is safe (seal-lenient).
+    async fn handle_fence_extent(&self, payload: Bytes) -> HandlerResult {
+        let req = FenceExtentReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // hot-path-shaped RPC; reject wrong-shard (the StreamClient routes by
+        // `shard_addr_for_extent`, so a mismatch is a routing bug).
+        if !self.owns_extent(req.extent_id) {
+            return Err(self.wrong_shard_err(req.extent_id));
+        }
+
+        // A fence carries a REAL acquired owner epoch (the manager owner-lock
+        // `mod_revision`, always > 0). `<= 0` is protocol misuse — never a
+        // sentinel (same stance as `handle_commit_length`).
+        if req.owner_epoch <= 0 {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "fence_extent requires owner_epoch > 0 (got {})",
+                    req.owner_epoch
+                ),
+            ));
+        }
+
+        // Clone the `Rc` OUT of the DashMap and drop the shard `Ref` before any
+        // `.await` — `ensure_fence_durable` awaits, and on the single-threaded
+        // compio runtime holding a DashMap read guard across an await would
+        // deadlock a concurrent writer (recovery / delete / alloc mutating
+        // `self.extents` on the same shard). Mirrors `get_extent` / `handle_append`.
+        let entry = self
+            .extents
+            .get(&req.extent_id)
+            .map(|v| Rc::clone(v.value()))
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("extent {} not found", req.extent_id),
+                )
+            })?;
+
+        // META-FAILCLOSED: a quarantined extent (corrupt `.meta` at load) has an
+        // untrusted fence — persisting a fence over it could clobber the
+        // authoritative-but-unreadable sidecar. Refuse; recovery rebuilds it.
+        if entry.corrupt_meta.load(Ordering::SeqCst) {
+            return Ok(FenceExtentResp {
+                code: CODE_PRECONDITION,
+                message: format!("extent {} meta quarantined", req.extent_id),
+            }
+            .encode());
+        }
+
+        // Fence prologue, mirroring the append path (step 3/3b):
+        //   req.owner_epoch < stored → stale caller, reject LockedByOther;
+        //   req.owner_epoch > stored → raise the in-memory bar synchronously;
+        //   then persist durably (fail-closed) before ACKing.
+        let stored = entry.owner_epoch.load(Ordering::SeqCst);
+        if req.owner_epoch < stored {
+            return Ok(FenceExtentResp {
+                code: CODE_LOCKED_BY_OTHER,
+                message: format!(
+                    "extent {} held at higher owner_epoch {} (fence carried {})",
+                    req.extent_id, stored, req.owner_epoch
+                ),
+            }
+            .encode());
+        }
+        if req.owner_epoch > stored {
+            entry
+                .owner_epoch
+                .fetch_max(req.owner_epoch, Ordering::SeqCst);
+        }
+        if let Err(e) = self
+            .ensure_fence_durable(req.extent_id, &entry, req.owner_epoch)
+            .await
+        {
+            self.mark_disk_error_for_extent(req.extent_id, &e.to_string());
+            tracing::error!(
+                extent_id = req.extent_id,
+                error = %e,
+                "handle_fence_extent: durable fence persist failed — refusing (fail-closed)"
+            );
+            return Ok(FenceExtentResp {
+                code: CODE_PRECONDITION,
+                message: format!("durable fence persist failed: {e}"),
+            }
+            .encode());
+        }
+        // Re-check after the (possibly awaiting) durable step: a concurrent
+        // higher-owner fence/append may have taken over. owner_epoch is a
+        // monotonic fetch_max, so `stored >= req` now means our floor is at
+        // least as high — that is exactly what the fence guarantees. If a
+        // STRICTLY higher owner landed, report LockedByOther (the caller is
+        // already superseded), else OK.
+        let after = entry.owner_epoch.load(Ordering::SeqCst);
+        if req.owner_epoch < after {
+            return Ok(FenceExtentResp {
+                code: CODE_LOCKED_BY_OTHER,
+                message: format!(
+                    "extent {} taken over at owner_epoch {} during fence persist",
+                    req.extent_id, after
+                ),
+            }
+            .encode());
+        }
+        Ok(FenceExtentResp {
+            code: CODE_OK,
+            message: String::new(),
         }
         .encode())
     }
