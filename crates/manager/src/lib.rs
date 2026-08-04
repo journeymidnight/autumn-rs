@@ -12,6 +12,10 @@ mod policy_tests;
 mod recovery;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
+/// Test-only merge-freeze failpoint (always 0 in production); see its doc in
+/// `rpc_handlers`. Re-exported so integration tests can arm it.
+#[doc(hidden)]
+pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 
 // embedded web dashboard + (M2+) leader-fenced auto-policy
 // controller, folding the retired standalone Python `python/dashboard/` into

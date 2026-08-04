@@ -28,6 +28,38 @@ impl Drop for SplitInflightGuard {
     }
 }
 
+/// The PS-side `FREEZE_TTL` (`crates/partition-server/src/lib.rs`, 30 s at time
+/// of writing — this const MUST stay comfortably below it; if FREEZE_TTL
+/// changes, revisit this) auto-unfreezes a merge/split freeze after that long.
+/// The manager MUST land the merge txn while the pair is PROVABLY still frozen,
+/// otherwise the seal records a STALE captured `commit_length` and silently
+/// drops the writes that resumed on the victim tail post-unfreeze (reproduced
+/// deterministically: `system_merge_freeze_lostupdate`). Mirrors the split
+/// path's PS-side `split_freeze_deadline` budget — merge is manager-driven, so
+/// the budget lives here.
+///
+/// Unlike split (which bounds its commit RPC with `SPLIT_CALL_TIMEOUT` = 8 s),
+/// the merge Phase-2 `txn_fenced` here is NOT wrapped in an explicit hard
+/// timeout — it relies on the etcd client's own bound, which can be ~10 s under
+/// a degraded etcd. So the deadline is set conservatively: FREEZE_TTL(30) −
+/// worst-case txn(~12) − safety(2) = 15 s. A merge that reaches the budget check
+/// within 15 s of issuing the freeze then commits with ≥ 3 s of headroom before
+/// the PS could unfreeze even if the txn itself runs long. (A merge slower than
+/// 15 s here is pathological; the abort is retryable, so a rare false-abort only
+/// costs a retry, never data.)
+const MERGE_FREEZE_COMMIT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Test-only failpoint: sleep this many ms between the commit_length capture and
+/// the merge txn inside `handle_merge_partitions`, simulating a paused/slow
+/// coordinator so the freeze-budget guard can be exercised deterministically.
+/// Always compiled (the failpoints idiom) so an integration test can arm it —
+/// production always leaves it 0, making the hook a single relaxed load per
+/// (rare) merge. A process-global (not thread-local) so a test thread can arm it
+/// for the manager's own runtime thread. Re-exported from `lib.rs`.
+#[doc(hidden)]
+pub static MERGE_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl AutumnManager {
     // ── Serve ──────────────────────────────────────────────────────────
 
@@ -4209,6 +4241,13 @@ impl AutumnManager {
             }
         };
 
+        // Freeze budget: measured from BEFORE the first freeze is issued (the
+        // earliest a PS could have started its FREEZE_TTL clock) so the elapsed
+        // check below is conservative. The txn must land within
+        // MERGE_FREEZE_COMMIT_DEADLINE of here or we abort rather than seal at a
+        // possibly-stale commit_length.
+        let freeze_start = Instant::now();
+
         // Freeze victim first (matches the dual-gate ordering convention
         // in `crates/partition-server/CLAUDE.md` — victim < survivor for
         // deadlock-safe lock acquisition; here the freezes don't deadlock
@@ -4311,6 +4350,38 @@ impl AutumnManager {
                 return Err((code, msg));
             }
         };
+
+        // Test failpoint (always 0 in production): simulate a slow/paused
+        // coordinator between the commit_length capture and the txn so the
+        // freeze-budget guard below is exercised deterministically (no real
+        // SIGSTOP needed).
+        {
+            let pause = MERGE_TEST_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
+
+        // Freeze-budget guard (fixes the merge-freeze lost-update): if the
+        // freeze has been held long enough that the PS-side FREEZE_TTL could
+        // have lapsed and resumed writes on the victim tail, DO NOT commit — the
+        // captured commit_lengths may be stale and the txn would seal the tail
+        // BELOW post-unfreeze acked writes (silent lost update). Roll back the
+        // freezes and abort; the merge is retryable (auto-policy re-evaluates).
+        if freeze_start.elapsed() >= MERGE_FREEZE_COMMIT_DEADLINE {
+            let held = freeze_start.elapsed();
+            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: Self::err_to_code(&AppError::Precondition(String::new())),
+                message: format!(
+                    "merge freeze budget exceeded: held {:.1}s >= {:.1}s deadline \
+                     (PS FREEZE_TTL may have lapsed); aborting to avoid a stale-length seal — retry",
+                    held.as_secs_f64(),
+                    MERGE_FREEZE_COMMIT_DEADLINE.as_secs_f64(),
+                ),
+                new_log_tail_extent_id: 0,
+            }));
+        }
 
         // Run the existing merge txn under the same owner-lock.
         let mmm_req = MultiModifyMergeReq {
