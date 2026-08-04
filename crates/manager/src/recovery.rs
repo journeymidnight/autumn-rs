@@ -19,6 +19,22 @@ struct EcDispatchCandidate {
     params: MgrEcDispatchInflight,
 }
 
+// ── TEST-ONLY failpoint for the G4 / BUG-EC-APPLY-FAIL reproduce harness ──
+// A one-shot, self-clearing flag that forces the NEXT `apply_ec_conversion_done`
+// call to return a transient `Internal` error WITHOUT touching etcd/leadership
+// (models an etcd blip while this manager stays leader). Compiled out of every
+// non-test build. See `ec_g4_wedge_harness.rs`.
+#[cfg(test)]
+thread_local! {
+    static EC_APPLY_FAIL_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm the one-shot EC-apply failpoint (test-only).
+#[cfg(test)]
+pub(crate) fn _test_arm_ec_apply_fail_once() {
+    EC_APPLY_FAIL_ONCE.with(|c| c.set(true));
+}
+
 impl AutumnManager {
     pub(crate) async fn dispatch_recovery_task(
         &self,
@@ -1603,6 +1619,15 @@ impl crate::AutumnManager {
         data_shards: usize,
         new_eversion: u64,
     ) -> Result<(), AppError> {
+        // TEST-ONLY (G4 harness): one-shot transient failure BEFORE any etcd /
+        // leadership interaction — a faithful model of "apply's etcd txn blipped
+        // while this manager stayed leader". No-op in production builds.
+        #[cfg(test)]
+        if EC_APPLY_FAIL_ONCE.with(|c| c.replace(false)) {
+            return Err(AppError::Internal(
+                "test-injected transient EC apply failure (G4)".into(),
+            ));
+        }
         // etcd-first: compute `updated` from a clone under
         // read-only borrow. The borrow_mut block previously mutated
         // s.extents[extent_id] in place (ec_converted=true, replicates,
@@ -1792,6 +1817,13 @@ mod df_echo_tests {
         ));
     }
 }
+
+// G4 / BUG-EC-APPLY-FAIL loop-level reproduce harness. Kept in its own file;
+// declared here (child of `recovery`) so it can reach the module-private
+// `finalize_ec_dispatch_after_convert` / `collect_ec_dispatch_candidates`.
+#[cfg(test)]
+#[path = "ec_g4_wedge_harness.rs"]
+mod ec_g4_wedge_harness;
 
 #[cfg(test)]
 mod ec_apply_fail_tests {
