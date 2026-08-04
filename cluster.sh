@@ -1063,7 +1063,7 @@ do_start() {
         # are where the bench keys actually are. The retired bootstrap presplit cut
         # raw hex points that `bench_user_starts` filtered out entirely, so every
         # `--partitions N` run silently measured one partition.
-        local _bparts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+        local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
         if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
             "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
                 presplit --namespace bench --tenant perf --count "$_bparts" \

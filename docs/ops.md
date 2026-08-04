@@ -1782,3 +1782,52 @@ mem/ writes with PermissionDenied (terminal, not retried — that is the
 fail-loud design); manager unreachable > TTL−300 s → token renewal fails →
 writes rejected until the manager returns (enforcement adds a
 grace-window=TTL availability dependency of the data plane on the manager).
+
+## G2 — power-loss crash-consistency test (LazyFS, single machine)
+
+Verifies the core durability contract: **every write the client got an ACK for
+survives a power loss**, and recovery never fails-loud spuriously or serves
+garbage. Uses [LazyFS](https://github.com/dsrhaslab/lazyfs) — a userspace FUSE
+filesystem that only persists `fsync`'d data; its `clear-cache` command drops
+everything not yet fsync'd = a power cut at that instant. **No kernel module**
+(dm-log-writes needs `dm_log_writes.ko`, absent in this container; LazyFS is the
+userspace equivalent). autumn's io_uring write path works on the FUSE backend.
+
+Scope: single-node **RF1** cluster with the data plane (`AUTUMN_DATA_ROOT`) on
+the LazyFS mount; **etcd is bind-mounted OFF LazyFS** so only autumn's
+data-plane durability is under test (control plane assumed on its own durable
+quorum).
+
+```bash
+# 0. Build LazyFS once (userspace; needs libfuse3-dev + cmake + g++):
+git clone --recurse-submodules https://github.com/dsrhaslab/lazyfs /opt/lazyfs
+(cd /opt/lazyfs/lazyfs/libs/libpcache && ./build.sh)   # or cmake -S . -B build && cmake --build build
+(cd /opt/lazyfs/lazyfs/lazyfs        && ./build.sh)    # → /opt/lazyfs/lazyfs/lazyfs/build/lazyfs
+# The harness auto-discovers /opt/lazyfs, ~/lazyfs, ../lazyfs; else set LAZYFS_BIN=<path>/lazyfs.
+
+# 1. Run it (quiesced crash — coalescer settles, then power loss):
+cargo build --release --workspace          # harness uses release binaries
+scripts/g2_crash_consistency.sh
+#   → "VERDICT: PASS — every acked write survived power loss, recovery clean" (exit 0)
+
+# 2. Immediate crash (power loss the instant after the last ACK — probes any
+#    ACK-before-fsync window; PASS proves synchronous durability):
+scripts/g2_crash_consistency.sh --immediate
+
+# Knobs: --keys N (small values) / --big M (2 MiB values; default 70×2 MiB =
+# 140 MiB > MAX_WAL_GAP 128 MiB → forces a rotate+flush so recovery exercises the
+# checkpoint-reload path too, not just WAL replay). Env: LAZYFS_BIN, G2_WORK,
+# N_SMALL, N_BIG, BIG_BYTES, QUIESCE, MAX_WAL_GAP.
+```
+
+What it asserts, per acked key: present after restart + byte-identical (SHA-256);
+counts LOST (acked→gone) and CORRUPT (bad bytes); scans PS/EN/manager logs for
+fail-loud markers (`WAL-FAILSTOP`, `invalid meta`, `StaleVpOffset`,
+`failed to open partition`, `panicked`). PASS requires 0 lost, 0 corrupt, and
+`survived == acked`. The `open_partition: ready … tables=N sst_readers=N
+max_seq=…` line in the summary confirms which recovery path ran (tables>0 =
+checkpoint reload + WAL replay; tables=0 = pure WAL replay).
+
+Mechanism has teeth: a standalone check (write file A with `fsync`, file B
+without, `clear-cache`) shows A survives and B is dropped — so a real durability
+gap would surface as LOST keys.
