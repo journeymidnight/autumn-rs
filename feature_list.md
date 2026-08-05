@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-07-30
+**Last updated:** 2026-08-05
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,41 +13,6 @@
 ---
 
 ## Active
-
-### F-WIRE-CRC-UNIFY — 统一帧结构：header+ctrl 必有 CRC、bulk value 交给传输层、FLAG_CRC 位退役
-- **Trigger** (2026-07-29, 用户审阅 CRC 全景表后拍板「CRC 在 wire 上就很乱，改为 header+meta 必有 CRC、大 value 交给传输层」+「不需要 FLAG_CRC 了，默认都有 meta crc」): 现状三档不一致
-  —— 普通帧 CRC 只盖 payload 不盖 header（req_id 翻转 = 响应静默投递给错误 caller 且 CRC 仍通过；FLAG_CRC 位被翻掉 = 验证被静默关闭）；ZC value 响应完全无保护；`MSG_PUT_ZC` 发送侧仍全量扫 value 算 CRC（F219 残留）而 PS 快路径只消费不验证。且 ZC meta codec (`encode_zc_meta`) 住在 `rpc/src/client.rs`，不在 WIRE 指纹内 —— 改布局不会触发版本决策。
-- **Scope（设计已钉死）**: 唯一一种帧形状，无标志位区分：
-  `[req_id:4][msg_type:1][flags:1][payload_len:4] [ctrl_len:4][ctrl…][crc32c:4][value…]`
-  crc32c 覆盖 header ++ ctrl_len ++ ctrl；value 裸（传输层完整性）；value_len = payload_len−4−ctrl_len−4；flags 只剩 RESPONSE/ERROR/STREAM_END（FLAG_CRC 位退役保留）。per-msg_type 的 ctrl/value 切分：
-  * 普通 rkyv 帧 / 错误帧: ctrl = 整个 body，value 空（每帧 wire +4B）。
-  * `MSG_GET_ZC` / `MSG_READ_BYTES_ZC` 响应: ctrl = `[code:1][message…]`（旧 9B zc_meta 死亡；ZC 错误终于有 message），value = 裸值。
-  * `MSG_PUT_ZC` 请求: ctrl = `[44B put_meta][key]`，value = 裸值 —— **发送侧全量 value CRC pass 消灭**；PS `drain_zc_writes` 改为验 ctrl-crc（廉价）+ 无 trailer 消费。
-  * **`MSG_APPEND` 是唯一例外（用户拍板 payload 需保护）**: ctrl = `[29B meta][payload]`，value 空 —— 零新 msg_type，F165 的 control 字段保护 + payload 在途完整性全保留。不做 EN 收侧 recv-into-pooled（批处理架构 + 4KiB 主导负载 + 保 CRC 后反正要全量扫；未来 profiling 说话再议）。
-  * codec 迁入 `frame.rs`（纳入 WIRE 指纹）；`encode_no_crc`/`ps_zc_head`/`zc_read_head` 手搓头统一为 frame.rs helper；`call_into_pooled` 返回类型携带 message。
-  * WIRE 27→28（MIN=MAX），指纹重 pin。混部失败模式变化要写文档：帧层变更使 GetClusterId 协商通道对旧 binary 也解不开 —— 混部第一帧 CRC mismatch 响亮断连（劣于优雅拒绝、优于 rkyv 静默乱码；same-commit 部署策略下无实际影响）。
-- **Acceptance**: 单测 —— header 任一字节翻转 → CrcMismatch（普通帧 + ZC 帧都验）；ZC 错误响应 message 端到端可读；put_zc 大/小 value 双路径字节精确；`registry_pins_current_schema_to_max_version` 过（v28 pin）。集成 —— rpc/client/PS --lib/stream 全绿 + manager f235（--ignored 真集群）绿 + e2e put/get/append 冒烟。性能 —— put_zc 8MiB 发送侧少一趟全量 crc（perf-check 或微基准佐证方向即可）。
-- **Status**: `passes: false` (2026-07-29, **实现完成、验收基本达成，仅欠 coco 评审**——Trae
-  token 过期待用户重登)。
-  **Notes (2026-07-30, 术语定版)**: 全部 zc 词汇改名 **bulk**（用户裁定: zc 是 wire 结构却拿
-  效果命名——拷贝数由源内存出身×传输层决定，TCP 下 put 照样有内核拷贝；调研 brpc attachment /
-  Ceph data segment / NVMe in-capsule / TOAST out-of-line 后定 bulk）。腾词: P-bulk flush 线程
-  改名 **P-sst**（更准——它就是 SST build+upload 线程），env `AUTUMN_PS_BULK_INFLIGHT_CAP` →
-  `AUTUMN_PS_SST_INFLIGHT_CAP`（entrypoint.sh/autumn-deploy/ops.md 已同步）。CLI 动词
-  put-zc/zc-get → put-bulk/bulk-get；python `BatchClient.zc()` → `.bulk()`；bench_zc.py →
-  bench_bulk.py。wire 字节零变化，v28 指纹就地二刷 `7e04e6c6cbf5a759`。已落地: frame.rs 全重写（统一帧 + peek_zc_prologue/
-  consume_zc_prologue + encode_zc_response_head/encode_vectored_head/compute_ctrl_crc +
-  Malformed 错误变体）；rpc client（call_vectored_zc 新增、call_into_pooled 返回
-  ZcResp{buf,code,message}、read_loop 快路径先验 crc 再 recv）；PS（ps_zc_head 瘦包装、
-  drain_zc_writes 验 ctrl-crc + 无 trailer、frame.value 经 zc_value 线到 enqueue_put_zc、
-  authz 零改动——parse_put_zc_meta 在 ctrl 上原样工作）；EN（zc_read_head 瘦包装 + 全部
-  错误点带 message）；SDK（put_zc→call_vectored_zc、get_range_into 消费 message）。
-  验收: header/ctrl 任意字节翻转→CrcMismatch（新单测）、ZC error message 端到端（新单测
-  ×2 + rpc 54 全绿）、put_zc 大/小值 + get_zc 混合大小真集群 e2e（system_putstream 7/7
-  绿）、v28 pin `db105c702b8ff770` 过、transport 9 / client --lib 40 / PS --lib 204 /
-  stream 114 全绿；layer_a 与 system_chaos 的 2 处失败经 stash 对照确认为预存在（admin
-  token 环境 + 缺 force 字段），与本 feature 无关。ops.md 已加 v28 混部失败模式说明。
-  put_zc 发送侧 crc pass 消灭为结构性保证（value 不再进 compute_ctrl_crc）。
 
 ### BUG-KVC-LOAD-ATOMIC — external KV load 是 fail-open：部分 layer 加载失败仍继续推理
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:773`；**已复核代码为真**): scheduler 见 `__present__` marker 后就告诉 vLLM 这些 token 不用再 prefill。worker 侧 `start_load_kv()` 拿 `oks = load_layers(...)` 后是**边检查边注入**：`if not ok: log.warning(); continue`。于是任一 layer 缺失时，前面的 layer 已写进 paged cache、失败的 layer 保持**未初始化**内容，请求进入"部分新 KV + 部分旧/未初始化 KV"的混合态且无法回滚，继续推理 → 静默错误输出。**这不是假想**：BUG-KVC-TENANT 那次线上事故的表现就正是 `external KV load miss after positive presence`（layer 0..3）+ garbage output。
@@ -112,18 +77,6 @@
 - **Scope (when triggered)**: EN `MSG_SEAL_EXTENT` (persist sealed in `.meta`, reject appends with a distinct code the writer's roll path maps to seal-and-roll), manager seal-over-reachable orchestration (seal at ENs FIRST, then min over responses, then persist), writer-side append-rejection → existing roll machinery.
 - **Acceptance**: fence a node while its partition has no serving PS → tails still drain; live-writer race test proves no acked-data truncation.
 - **Status**: `passes: false` (deferred — trigger condition not yet observed in practice; rebalancer reassigns partitions within seconds in all runs so far).
-
-### F-DIRECT-MANY — batched client direct-read (fuse / kvcache / fsspec opt-in)
-- **Trigger**: user 2026-07-07, continuing the "autumn-fuse 是否该默认 --direct-read" discussion. F259 `get_direct` only bypasses the PS for a SINGLE whole-value read; fuse/kvcache/fsspec read in BATCHES via `get_many_into` (PS-proxied `MSG_GET_ZC`), so large-file (model) serving never took the PS off the data path. User asked for a batched direct-read shared by all three frontends, and set two constraints: (1) direct-read is TOPOLOGY-dependent (needs the client to reach EN data ports) so each frontend needs its OWN opt-in flag, default OFF — never a hardcoded SDK default; (2) it must handle mixed-size batches (some values large, some small) correctly.
-- **Scope**:
-  - **PS sub-range redirect** (`partition-server/src/rpc_handlers.rs::get_value_inner`): `MSG_GET_REDIRECT` was whole-value-only (`req.offset==0 && req.length==0`); fuse whole-extent reads carry an explicit `length` so they never redirected. Now redirects any VP sub-range whose CLAMPED requested length `r_len = (length==0 ? vp.len-off : min(length, vp.len-off))` is ≥ 64 KiB, returning `value_offset = vp.offset + req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the `r_off==0, r_len==vp.len` special case — byte-identical. Sub-ranges past the value end (`req.offset > vp.len`) and sub-64 KiB requests fall through to the inline proxy resolve unchanged. No wire-struct change (only PS handler logic) → NO WIRE bump.
-  - **Client `get_many_direct`** (`client/src/lib.rs`): dest-based batched direct-read mirroring `get_many_into`. Per item, `read_len ≥ 64 KiB` → `MSG_GET_REDIRECT` → descriptor → EN direct read (`read_extent_value_direct`, pooled `Bytes`) copied into `dest`; inline (`extent_id==0`, PS declined) copied straight in; ALL-replica failure → proxy `get_range_into` fallback. `read_len < 64 KiB` → plain proxy `get_range` + copy (mixed-size batches route per item). Extracted `read_redirect_replicas` (shared with `get_direct`) + `get_range_direct_into` (per-item core). The one extra copy vs `get_many_into`'s recv-into-dest is deliberate: the direct read carries a 3 s timeout + replica failover, which `call_into_dest`'s cancel-safety contract forbids, so it uses the pooled recv (`call_into_pooled`) then memcpys — the price of failover-safety on the bypass path.
-  - **Frontend flags (now DEFAULT ON everywhere — 2026-07-09 user directive; topology-dependent, size-gated, fallback+warn make it safe)**: fuse `--direct-read` (default `true`; `--direct-read false` to disable) → `FsState.direct_read` → threaded into each `ReadPlan` → `read::execute` picks `get_many_direct` vs `get_many_into`; python `BatchClient(direct=True)` (PyO3 default stays `false`, but every consumer passes `True`) → Get arm chooses the primitive; `autumn.Fs.connect(..., direct_read=True)` → `FsState.direct_read` (fsspec `AutumnFileSystem(direct_read=True)`); kvcache `AutumnKVConnector` (`kv_connector_extra_config.direct_read`, default True → `_AutumnKVStore` → `BatchClient(direct=…)`); `autumn_vllm_loader` (`model_loader_extra_config.direct_read`, default True). **Requirement 2 (size-gated) already holds**: `get_many_direct` routes per item via `zc_worthwhile` — only ≥ 64 KiB reads issue `MSG_GET_REDIRECT`, < 64 KiB stay on the proxy. Safe even when ENs are unreachable — each item falls back to the PS proxy (authoritative); the shared client (`read_redirect_replicas`) logs ONE `WARN` (`DIRECT_FALLBACK_WARNED`) on first fallback so a wrong topology surfaces without per-read spam.
-- **Acceptance**: build + clippy green (autumn-client 0 warnings, autumn-partition-server 187 `--lib` tests green); fuse `core` feature builds (the fuse binary + python wheel are Linux/nightly-only build envs — `main.rs`/PyO3 changes are trivial clap/`#[pyo3(signature)]` threading). Manual verification in `docs/ops.md` (fuse `--direct-read` mount: reads return byte-identical; cross-host large-file read offloads PS NIC egress). LIVE cluster perf verification (cross-host PS-egress win, mirroring F259's 145→46 ms loopback latency figure) DEFERRED to a cluster run.
-- **Status**: `passes: not_completed` — code complete + builds/clippy/PS-tests green. coco findbugs DONE 2026-07-07 (GPT-5.5, deep, on `HEAD~1..HEAD`) → **未发现问题** (0 findings): it traced the sub-range offset/length clamp vs `get_direct`'s whole-value contract, FUSE's explicit-range reads, `BatchClient` whole-value reads, and the EN direct short-read/all-replica-fail → PS-proxy fallback; the two things it weighed (`vp.offset + r_off` u64 overflow — identical to the existing `resolve_value`, benign; small-dest/large-value truncation — pre-existing documented behavior) were cleared. (The coco-review.sh wrapper itself needed a fix first — traecli 0.200.16 repurposed the old headless `-p` flag to `-p/--profile`; corrected to the `coco exec` subcommand, verified working.) STILL not_completed: the fuse binary + python wheel are Linux/nightly-only build envs (unbuilt locally — trivial flag threading only), and the cross-host functional + PS-egress perf verification is DEFERRED to a real cluster run.
-  **2026-07-22 audit** — 两条残留里一条已清、一条部分清:
-  - ✅ **fuse 二进制本地构建绿**：`cargo build --release -p autumn-fuse` 通过（本机就是 Linux；`main.rs:180` 的 `--direct-read` 线接完整）。PyO3 侧 `autumn.Fs.connect(..., direct_read=...)` 在 `python/src/fs.rs:144`。wheel 本地仍编不出（系统 Python 3.14 > pyo3 max 3.13，环境问题非代码）。
-  - ⚠️ **跨机功能路径已被线上跑过**：VKE 2026-07-20 vLLM autumn loader（`loader.py:153` `direct_read` 默认 True）流式读 39.56 GiB / 22.8 s ≈ 1.78 GiB/s，字节正确（72B 正常出答案）→ 直读路径跨机功能 OK。**仍缺**：`--direct-read on/off` 的 A/B **PS-egress 卸载量测**（F259 那种 145→46 ms 的对照数字），这才是本条 Acceptance 里 DEFERRED 的那项。
 
 ### F-FS-WRITE-STRIPE — fuse MOUNT write-path large-file striping (B2 of F-FS-STRIPE)
 - **Trigger** (2026-07-19, 从已完成的 F-FS-STRIPE 抽出剩余项): F-FS-STRIPE 的 autumnfs 路径已 done（write/read/rm striped、字节精确、突破单分区、连续 pipeline），但 **fuse MOUNT 的写路径 striping 延后**——现状 fuse 读/删 striped 正确（stripe-aware），但 mount 内的 write/truncate 对 striped 文件是 fail-loud 拒绝（不是自己写 striped）。

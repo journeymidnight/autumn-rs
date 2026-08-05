@@ -1,3 +1,16 @@
+Date: 2026-08-05
+TaskStatus: completed
+Task scope: close 两个"几乎完工"feature（用户"先把几乎完工的 close 了，不需要 coco review"）。
+  重跑验收（树在 G1/G5/G2 后动过 wire/stream/PS）确认仍绿，再按规则从 feature_list 删除：
+  - F-WIRE-CRC-UNIFY：实现+验收早已达成，唯一 blocker 是 coco 评审 → 用户免除 → close。
+    重验：rpc --lib 56 / client 41 / stream 114 / PS 204 全绿；registry_pins_current_schema_
+    to_max_version（v28 指纹 pin）+ CRC 翻转具名测试 ok。
+  - F-DIRECT-MANY：代码完成、coco 早已 0 findings、跨机功能线上跑过（VKE 39.56GiB 字节正确）。
+    重验：fuse 二进制构建绿、client clippy 0 warning。唯一残留=`--direct-read` on/off 的
+    PS-egress A/B 量测（perf 特征化数字，非功能门），作为可选后续，不阻塞 close。
+  feature_list 85 行；两条已删（git 是记录）。
+
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-04
 TaskStatus: completed
 Task scope: G2 断电/崩溃一致性测试 —— 单机 lazyfs（用户"G2可以测试吧？做loop设备跑
