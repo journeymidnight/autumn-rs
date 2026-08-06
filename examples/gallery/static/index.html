@@ -509,8 +509,17 @@ header .tag {
 
 .lightbox .lb-img-layer {
   position: absolute;
-  top: 50%;
-  left: 50%;
+  /* Center with inset:0 + margin:auto instead of translate(-50%,-50%): the
+     latter's -50% is resolved against the element's OWN width, so if the image
+     isn't laid out at its final size yet (fresh open snaps before the full-res
+     /get/ decodes; worse under upload load when many thumbs decode at once) the
+     offset is computed against a stale/zero width and the image lands off to one
+     side. margin:auto re-centers on every layout, including the late image load,
+     so centering never depends on decode timing. The slide is a pure pixel nudge. */
+  inset: 0;
+  margin: auto;
+  width: auto;
+  height: auto;
   max-width: calc(100% - 3rem);
   max-height: calc(100% - 8rem);
   object-fit: contain;
@@ -518,29 +527,34 @@ header .tag {
   -webkit-user-drag: none;
   z-index: 1;
   opacity: 0;
-  transform: translate(-50%, -50%);
+  transform: translateX(0);
   transition: opacity 220ms ease, transform 220ms ease;
   pointer-events: none;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
 }
 
+.lightbox .lb-img-layer.from-left  { transform: translateX(-60px); }
+.lightbox .lb-img-layer.from-right { transform: translateX(60px); }
+
+/* Placed AFTER from-left/from-right so an active layer is always re-centered
+   even if a directional class lingers (equal specificity → later rule wins). */
 .lightbox .lb-img-layer.active {
   opacity: 1;
   pointer-events: auto;
+  transform: translateX(0);
 }
 
-.lightbox .lb-img-layer.from-left  { transform: translate(calc(-50% - 60px), -50%); }
-.lightbox .lb-img-layer.from-right { transform: translate(calc(-50% + 60px), -50%); }
-
 .lightbox video {
-  /* Absolute-center mirrors the image layer pattern. We don't rely on the
-     flex centering for video because the element's intrinsic size after
-     metadata (videoWidth × videoHeight, e.g. 1080×1920 for portrait clips)
-     can interact with flex sizing in surprising ways and shift the box. */
+  /* Mirrors the image layer: inset:0 + margin:auto centers by the element's
+     laid-out size and re-centers when video metadata (videoWidth × videoHeight,
+     e.g. 1080×1920 for portrait clips) arrives, without the translate(-50%)
+     width-dependency that shifts the box when the size isn't known yet. This is
+     margin-based, not flex, so it avoids the flex-sizing surprises too. */
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  inset: 0;
+  margin: auto;
+  width: auto;
+  height: auto;
   z-index: 1;
   max-width: calc(100% - 3rem);
   max-height: calc(100% - 8rem);
@@ -558,7 +572,7 @@ header .tag {
 @media (prefers-reduced-motion: reduce) {
   .lightbox .lb-img-layer { transition: opacity 200ms ease; }
   .lightbox .lb-img-layer.from-left,
-  .lightbox .lb-img-layer.from-right { transform: translate(-50%, -50%); }
+  .lightbox .lb-img-layer.from-right { transform: translateX(0); }
   .lightbox .lb-backdrop { transition: opacity 200ms ease; }
 }
 
