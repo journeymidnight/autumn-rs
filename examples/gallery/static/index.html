@@ -478,7 +478,11 @@ header .tag {
   cursor: zoom-out;
   padding: 1.5rem;
   animation: lightbox-in 0.18s ease forwards;
-  overflow: hidden;
+  /* clip, not hidden: `hidden` still establishes a scroll container, so a child
+     that transiently overflows (e.g. a huge image mid-decode) can leave the
+     overlay with a nonzero scrollLeft, shifting the centered image sideways.
+     `clip` forbids scrolling entirely, so scrollLeft stays 0. */
+  overflow: clip;
   transition: background-color 320ms ease;
 }
 
