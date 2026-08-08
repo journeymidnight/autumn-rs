@@ -731,69 +731,15 @@ impl ExtentNodeConfig {
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
-/// Phase 1: per-extent fsync coalescer state (event-driven, RocksDB-style).
-///
-/// Decouples pwrite throughput from fsync rate. Hot-path append handlers
-/// store-then-register: advance `pending_fsync` to their write end_offset,
-/// register a `(end, oneshot)` waiter via `register_sync_waiter`, await the
-/// receiver. A lazily-spawned coalescer task issues ONE `sync_data` syscall
-/// per wake-cycle covering ALL pending bytes, then drains every waiter
-/// whose `end ≤ last_synced`.
-///
-/// **Event-driven, not timer-driven.** The first `register_sync_waiter`
-/// spawns the coalescer task with a `mpsc::Unbounded<()>` wake channel. Each
-/// subsequent waiter pushes itself into the list AND sends a `()` on the
-/// wake channel. The coalescer loop:
-///
-/// 1. Snapshot `pending`/`synced`. If there's work AND any waiter, run
-///    `sync_data` immediately (no sleep).
-/// 2. After fsync, drain every waiter covered by the snapshot.
-/// 3. If no work AND no waiters, set `wake_tx = None` and return —
-///    a future `register_sync_waiter` will see `wake_tx.is_none()` and
-///    spawn a fresh task.
-/// 4. Otherwise park on `wake_rx.next().await` until the next waiter wakes
-///    us. No timer involved.
-///
-/// Latency profile vs the prior timer-driven design (kept for reference):
-///   - timer (sleep 2 ms): every fsync paid up to 2 ms of "wait for more
-///     friends" even when the queue was empty after the first arrival.
-///   - event-driven (this version): first waiter triggers fsync immediately;
-///     friends that arrive during the fsync's I/O await ride along on the
-///     same syscall (whole-file fsync covers ALL dirty pages including
-///     those written after the syscall was issued? — no: `sync_data`
-///     captures the file's dirty page state at issue time, plus any new
-///     pages whose write was started before the syscall returns. In
-///     practice, "all friends whose pwrite completed before sync_data
-///     returns" are durable, which is exactly the LevelDB/RocksDB group-
-///     commit semantics.). Subsequent batches that arrived too late get a
-///     fresh wake → fresh fsync. No per-fsync 2 ms floor.
-///
-/// Why per-extent: an extent file's `sync_data` covers ALL of THAT file's
-/// dirty pages in one syscall — no benefit to grouping across extents at
-/// userspace; the kernel already does the I/O scheduling.
-///
-/// Lifecycle race-freedom (single-threaded compio):
-///   - Spawn: first register sees `wake_tx.is_none()`, sets it Some, spawns.
-///     Subsequent registers see Some, send `()` on the channel.
-///   - Exit: task takes `inner.borrow_mut()`, re-checks `waiters.is_empty()`
-///     AND `pending == synced`, sets `wake_tx = None`, releases borrow,
-///     returns. Compio is single-threaded, so a concurrent register
-///     interleaves only at `.await` points; the borrow_mut block has no
-///     await inside, so the swap from Some→None and a fresh register
-///     observing None happen in disjoint scheduling slots — no lost wake.
+/// Per-extent durability watermarks (formerly the fsync coalescer's state; the
+/// coalescer task + waiter machinery were removed once the per-extent owner task
+/// serialised appends and does the fsync inline). `pending_fsync` = high-water of
+/// pwritten bytes; `last_synced` = high-water of durable (fsynced) bytes — read
+/// by MSG_SYNCED_LENGTH / committed_length and gated by `fd_evictable`
+/// (`sealed && pending_fsync <= last_synced && strong_count == 1`).
 pub(crate) struct Coalescer {
     pub(crate) last_synced: AtomicU64,
     pub(crate) pending_fsync: AtomicU64,
-    inner: RefCell<CoalescerInner>,
-}
-
-struct CoalescerInner {
-    waiters: Vec<(u64, futures::channel::oneshot::Sender<Result<(), String>>)>,
-    /// Wake channel sender. `Some` iff a coalescer task is running.
-    /// `None` means no task; the next `register_sync_waiter` must spawn one.
-    /// Replaces the prior `task_running: bool` so we can both signal AND
-    /// wake-from-park with a single primitive.
-    wake_tx: Option<futures::channel::mpsc::UnboundedSender<()>>,
 }
 
 impl Coalescer {
@@ -801,55 +747,10 @@ impl Coalescer {
         Self {
             last_synced: AtomicU64::new(initial_len),
             pending_fsync: AtomicU64::new(initial_len),
-            inner: RefCell::new(CoalescerInner {
-                waiters: Vec::new(),
-                wake_tx: None,
-            }),
         }
     }
 }
 
-/// Register a sync waiter on `extent` for bytes up to `end_offset`. Returns
-/// a `oneshot::Receiver<Result<(), String>>` that resolves Ok when the
-/// next coalesced `sync_data` has covered `end_offset`, or Err with the
-/// fsync error message if the syscall failed (in which case ALL pending
-/// waiters fail together — sync_data covers the whole file, no per-waiter
-/// ordering).
-///
-/// Side effect: if no coalescer task is currently running for this extent,
-/// spawns one. Otherwise pushes a `()` onto the existing task's wake
-/// channel so it processes us on its next iteration.
-pub(crate) fn register_sync_waiter(
-    extent: &Rc<ExtentEntry>,
-    end_offset: u64,
-) -> futures::channel::oneshot::Receiver<Result<(), String>> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let new_wake_rx = {
-        let mut inner = extent.coalescer.inner.borrow_mut();
-        inner.waiters.push((end_offset, tx));
-        if let Some(wtx) = inner.wake_tx.as_ref() {
-            // Task is running. Send a wake; ignore Err (would only happen
-            // if the receiver was dropped, which shouldn't be possible
-            // while wake_tx is Some).
-            let _ = wtx.unbounded_send(());
-            None
-        } else {
-            // No task running — create wake channel, take ownership of rx
-            // so we can hand it to the new task.
-            let (wtx, wrx) = futures::channel::mpsc::unbounded::<()>();
-            inner.wake_tx = Some(wtx);
-            Some(wrx)
-        }
-    };
-    if let Some(wrx) = new_wake_rx {
-        let extent_clone = Rc::clone(extent);
-        en_spawn_failstop(
-            "en_coalescer".to_string(),
-            coalescer_loop(extent_clone, wrx),
-        );
-    }
-    rx
-}
 
 /// (1C): supervise a RESTARTABLE extent-node background loop —
 /// catch_unwind, ERROR-log on panic/unexpected return, restart after 1 s. Use
@@ -910,163 +811,6 @@ where
     .detach();
 }
 
-async fn coalescer_loop(
-    extent: Rc<ExtentEntry>,
-    mut wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
-) {
-    use futures::StreamExt as _;
-    loop {
-        // ── Try to do work ─────────────────────────────────────────────
-        let pending = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
-        let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
-        let have_waiters = !extent.coalescer.inner.borrow().waiters.is_empty();
-
-        // Bug fix (truncate path): a `truncate_to_commit` shrinks
-        // `extent.len` + the following pwrite stores a smaller
-        // `pending_fsync` (e.g. 10 → set_len(6) + pwrite 1 byte → 7).
-        // `truncate_to_commit` already issued `sync_data` for the
-        // shrink, so `last_synced` still reflects the previous larger
-        // value (10). Any waiter with `end <= last_synced` (here 7 ≤
-        // 10) is already durable — satisfy them without a fresh fsync
-        // call. Pre-fix the coalescer's `if pending > synced` skipped
-        // the fsync branch, then parked on wake_rx forever even though
-        // the waiters were trivially satisfiable. Reproducer:
-        // `extent_append_semantics::append_with_mid_byte_commit_truncates_and_succeeds`
-        // hung indefinitely on its second append (`commit=6` then
-        // pwrite "!").
-        if pending <= synced && have_waiters {
-            let waiters = {
-                let mut inner = extent.coalescer.inner.borrow_mut();
-                std::mem::take(&mut inner.waiters)
-            };
-            let mut still = Vec::new();
-            for (end, tx) in waiters {
-                if end <= synced {
-                    let _ = tx.send(Ok(()));
-                } else {
-                    still.push((end, tx));
-                }
-            }
-            if !still.is_empty() {
-                extent.coalescer.inner.borrow_mut().waiters.extend(still);
-            }
-            // Re-loop: state may have changed (new waiters could have
-            // arrived during the borrow_mut drops). If nothing left to
-            // do, the park-or-exit block below handles cleanup.
-            continue;
-        }
-
-        if pending > synced && have_waiters {
-            // POSIX-correct group commit: snapshot `pending` BEFORE
-            // issuing `sync_data`. Per POSIX, `fdatasync` only
-            // guarantees durability for writes that completed BEFORE
-            // the syscall entered the kernel; writes that completed
-            // DURING the syscall (i.e. between the syscall entry and
-            // its return) MAY or MAY NOT be flushed (Linux often does
-            // include them, but it's not contractual). RocksDB's
-            // group-commit leader does this same snapshot — only the
-            // batches the leader merged BEFORE issuing fsync are
-            // claimed durable; late arrivals create a fresh group.
-            //
-            // We capture `snapshot = pending_fsync.load()` here, then
-            // after fsync only credit `last_synced = snapshot`. Late
-            // arrivals (whose `pending_fsync.store` happens DURING our
-            // await) advance `pending_fsync` past `snapshot` and queue
-            // a wake event on `wake_rx`; the next loop iteration sees
-            // `pending > synced` and issues a fresh fsync.
-            let snapshot = pending; // already loaded at top of iteration
-            // `None` is provably unreachable here — a
-            // pending-fsync extent (`pending > synced`) is NOT `fd_evictable`,
-            // and the writer that registered the waiter held a pinned fd clone
-            // (`strong_count > 1`) through registration until `pending > synced`
-            // took over. Defensive (NEVER panic, NEVER credit durability without
-            // an fsync): if it somehow evicted, fail the waiters so they retry
-            // the append on a fresh tail, and re-park.
-            let Some(file_rc) = extent.resident_file() else {
-                let waiters = {
-                    let mut inner = extent.coalescer.inner.borrow_mut();
-                    std::mem::take(&mut inner.waiters)
-                };
-                for (_, tx) in waiters {
-                    let _ = tx.send(Err(
-                        "fd evicted under pending fsync — retry on a fresh tail".to_string(),
-                    ));
-                }
-                continue;
-            };
-            let f: &CompioFile = &file_rc;
-            match f.sync_data().await {
-                Ok(_) => {
-                    extent
-                        .coalescer
-                        .last_synced
-                        .store(snapshot, Ordering::SeqCst);
-                    let waiters = {
-                        let mut inner = extent.coalescer.inner.borrow_mut();
-                        std::mem::take(&mut inner.waiters)
-                    };
-                    let mut still: Vec<(
-                        u64,
-                        futures::channel::oneshot::Sender<Result<(), String>>,
-                    )> = Vec::new();
-                    for (end, tx) in waiters {
-                        if end <= snapshot {
-                            let _ = tx.send(Ok(()));
-                        } else {
-                            still.push((end, tx));
-                        }
-                    }
-                    if !still.is_empty() {
-                        extent.coalescer.inner.borrow_mut().waiters.extend(still);
-                    }
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let waiters = {
-                        let mut inner = extent.coalescer.inner.borrow_mut();
-                        std::mem::take(&mut inner.waiters)
-                    };
-                    for (_, tx) in waiters {
-                        let _ = tx.send(Err(msg.clone()));
-                    }
-                    // Don't advance last_synced; the next register will
-                    // retry via a fresh wake.
-                }
-            }
-            // Loop back — there may already be queued wakes / late waiters.
-            continue;
-        }
-
-        // ── No work. Park on wake_rx, OR exit if truly idle. ───────────
-        let park_or_exit = {
-            let mut inner = extent.coalescer.inner.borrow_mut();
-            let p = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
-            let s = extent.coalescer.last_synced.load(Ordering::SeqCst);
-            if inner.waiters.is_empty() && p == s {
-                // No outstanding work AND nobody's waiting — exit cleanly.
-                // Drop wake_tx so any concurrent registers see None and
-                // spawn a fresh task.
-                inner.wake_tx = None;
-                None
-            } else {
-                Some(())
-            }
-        };
-        if park_or_exit.is_none() {
-            return;
-        }
-        // Park on the wake channel. Compio single-thread guarantees that
-        // any register that took the inner borrow_mut after our exit-check
-        // finished AND saw wake_tx=Some has already pushed its `()` onto
-        // the channel, so `next().await` either returns Some(()) immediately
-        // (event already queued) or blocks until the next register does so.
-        if wake_rx.next().await.is_none() {
-            // wake_tx dropped (shouldn't happen in normal operation —
-            // we control its drop only on our own exit path). Bail.
-            return;
-        }
-    }
-}
 
 pub(crate) struct ExtentEntry {
     /// structural close of the type-level UB at the file-replacement
@@ -2924,39 +2668,31 @@ async fn append_burst_frames(
                 .collect();
         }
 
-        // every append is durable. Advance pending_fsync to the new
-        // high-water, register a sync waiter on the per-extent coalescer,
-        // and await. The coalescer task issues ONE sync_data per
-        // wake-cycle covering ALL pending bytes (event-driven, RocksDB
-        // group-commit style); every waiter whose end_offset is now
-        // covered wakes together. must_sync was formerly a per-batch
-        // flag and false batches skipped this wait; the wire
-        // field is now gone and every batch waits.
+        // every append is durable: fsync INLINE. The per-extent owner task
+        // serialises appends, so this ONE `sync_data` covers exactly this
+        // burst's bytes — the old cross-burst coalescer (register_sync_waiter +
+        // coalescer_loop) is unnecessary under the owner and has been removed.
+        // pending_fsync advances BEFORE the fsync and last_synced (the
+        // durability high-water read by MSG_SYNCED_LENGTH / committed_length and
+        // gated by fd_evictable) AFTER, so an evict-check during the fsync window
+        // sees pending > last_synced and won't evict. On error: mark the disk +
+        // reject the whole burst, never advance last_synced.
         extent_for_io
             .coalescer
             .pending_fsync
             .store(total_end, Ordering::SeqCst);
-        let rx = register_sync_waiter(&extent_for_io, total_end);
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => {
-                node.mark_disk_error_for_extent(extent_id, &msg);
-                return req_ids
-                    .into_iter()
-                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                    .collect();
-            }
-            Err(_canceled) => {
-                // Coalescer dropped tx without sending — should not happen
-                // unless the runtime is shutting down. Treat as Internal.
-                node.mark_disk_offline_for_extent(extent_id);
-                let msg = "fsync coalescer canceled".to_string();
-                return req_ids
-                    .into_iter()
-                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                    .collect();
-            }
+        if let Err(e) = f.sync_data().await {
+            let msg = e.to_string();
+            node.mark_disk_error_for_extent(extent_id, &msg);
+            return req_ids
+                .into_iter()
+                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                .collect();
         }
+        extent_for_io
+            .coalescer
+            .last_synced
+            .store(total_end, Ordering::SeqCst);
 
         let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
         EXTENT_APPEND_METRICS.with(|m| {
@@ -3671,12 +3407,6 @@ impl ExtentNode {
                 }
             }
         }
-    }
-
-    /// Legacy unclassified form — kept for call sites with no error text
-    /// (e.g. canceled-channel paths). Faults the disk.
-    pub(crate) fn mark_disk_offline_for_extent(&self, extent_id: u64) {
-        self.mark_disk_error_for_extent(extent_id, "unclassified I/O failure");
     }
 
     /// P0-B: per-extent `.meta`-write critical section. Every `.meta` writer
@@ -6158,22 +5888,16 @@ impl ExtentNode {
         }
         let start_offset = start;
         let end = start + data_payload.len() as u64;
-        // every append is durable via the per-extent coalescer. See
-        // `register_sync_waiter` and the matching block in
-        // `build_append_future` for the full design.
+        // every append is durable: fsync INLINE (the coalescer was removed — see
+        // append_burst_frames). `af` is the fd pinned for the pwrite above.
+        // pending_fsync BEFORE the fsync, last_synced AFTER (fd_evictable gate).
         extent.coalescer.pending_fsync.store(end, Ordering::SeqCst);
-        let rx = register_sync_waiter(&extent, end);
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => {
-                self.mark_disk_error_for_extent(req.extent_id, &msg);
-                return Err((StatusCode::Internal, msg));
-            }
-            Err(_canceled) => {
-                self.mark_disk_offline_for_extent(req.extent_id);
-                return Err((StatusCode::Internal, "fsync coalescer canceled".to_string()));
-            }
+        if let Err(e) = af.sync_data().await {
+            let msg = e.to_string();
+            self.mark_disk_error_for_extent(req.extent_id, &msg);
+            return Err((StatusCode::Internal, msg));
         }
+        extent.coalescer.last_synced.store(end, Ordering::SeqCst);
 
         // Final owner_epoch fence re-check before the write becomes visible/ACKed.
         // This path advances `extent.len` only here (after pwrite + fsync), so an
@@ -9186,140 +8910,6 @@ mod wire_fence_tests {
     }
 }
 
-#[cfg(test)]
-mod p0_fsync_highwater_tests {
-    //! P0 #1 (coco arch finding, 2026-05-31) — deterministic MECHANISM
-    //! reproduction of the fsync-coalescer high-water accounting bug.
-    //!
-    //! THE BUG: `build_append_future` (and `handle_append`) do
-    //! `pending_fsync.store(total_end)` — a PLAIN store, AFTER the pwrite
-    //! `.await`. Two appends to the SAME extent can be in the inflight
-    //! `FuturesUnordered` at once (frames that straddle read-burst boundaries),
-    //! and io_uring may complete their writes OUT OF ORDER. When the
-    //! higher-offset write completes first, its `store(150)` + fsync set
-    //! `last_synced = 150`; then the lower-offset write completes LATE, does
-    //! `store(100)` (REGRESSING `pending_fsync` 150->100, because it is a plain
-    //! store not a `fetch_max`), and registers a waiter at 100. The coalescer's
-    //! `pending <= synced` branch (extent_node.rs ~624) then satisfies that
-    //! waiter WITHOUT a fresh `sync_data` — so the append of `[0,100)` is ACKed
-    //! durable even though the only fsync ran BEFORE those bytes were written.
-    //!
-    //! WHY THIS IS A *MECHANISM* TEST, NOT AN END-TO-END LOSS TEST: actual
-    //! byte loss is only observable under power-loss / kernel-panic (a process
-    //! kill does NOT drop un-fsynced page-cache writes — the kernel still
-    //! writes them back). So no process-kill chaos can ever surface this. What
-    //! this proves DETERMINISTICALLY is the coalescer's *accounting* bug: a
-    //! waiter is resolved Ok() crediting durability to bytes whose write
-    //! completed after the covering fsync. The out-of-order completion is
-    //! modeled by performing the writes + `pending_fsync.store`s in the
-    //! high-then-low order (= the CQE order io_uring is free to choose).
-    //!
-    //! Status: demonstration + regression guard only. Per the project
-    //! reproduce-first discipline the hot-path coalescer is NOT changed here;
-    //! a fix (contiguous completed-prefix tracking so `last_synced` only
-    //! advances over a fully-written prefix) must come with this test as guard.
-
-    use super::*;
-
-    async fn alloc_entry(node: &ExtentNode, eid: u64) -> Rc<ExtentEntry> {
-        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
-            .await
-            .expect("alloc");
-        node.extents.get(&eid).expect("entry").clone()
-    }
-
-    async fn pwrite(entry: &Rc<ExtentEntry>, bytes: Vec<u8>, off: u64) {
-        let file_rc = entry.resident_file().expect("test extent resident");
-        let mut f: &CompioFile = &file_rc;
-        let BufResult(wr, _) = f.write_all_at(bytes, off).await;
-        wr.expect("pwrite");
-    }
-
-    /// Reproduce: out-of-order same-extent completion makes the coalescer ACK a
-    /// write that landed AFTER the covering fsync.
-    #[compio::test]
-    async fn p0_coalescer_acks_write_that_completed_after_fsync() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
-        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
-        let entry = alloc_entry(&node, 5001).await;
-
-        // ── Write B = [100,150) completing FIRST (higher offset). ──
-        // Write the real bytes, then advance the high-water + register, exactly
-        // as build_append_future does (write .await THEN pending_fsync.store).
-        pwrite(&entry, vec![0xBBu8; 50], 100).await;
-        entry.coalescer.pending_fsync.store(150, Ordering::SeqCst);
-        register_sync_waiter(&entry, 150)
-            .await
-            .expect("waiter chan")
-            .expect("fsync ok");
-        assert_eq!(
-            entry.coalescer.last_synced.load(Ordering::SeqCst),
-            150,
-            "the [100,150) fsync advanced last_synced to 150"
-        );
-
-        // ── Write A = [0,100) completing LATE (lower offset). ──
-        // Its bytes are written to the page cache NOW — i.e. AFTER the fsync
-        // above already ran. In production a power-loss here loses [0,100).
-        pwrite(&entry, vec![0xAAu8; 100], 0).await;
-        // Plain store — REGRESSES pending_fsync 150 -> 100 (the bug; a fetch_max
-        // would keep 150, but even that wouldn't make [0,100) durable).
-        entry.coalescer.pending_fsync.store(100, Ordering::SeqCst);
-        let acked = register_sync_waiter(&entry, 100)
-            .await
-            .expect("waiter chan");
-
-        // THE BUG, made deterministic:
-        assert!(
-            acked.is_ok(),
-            "coalescer ACKed the [0,100) append (durability claimed)"
-        );
-        assert_eq!(
-            entry.coalescer.last_synced.load(Ordering::SeqCst),
-            150,
-            "last_synced is UNCHANGED at 150 — proving the waiter(100) was \
-             satisfied by the `pending <= synced` NO-FSYNC branch. The [0,100) \
-             write that completed AFTER the 150 fsync was ACKed durable with no \
-             fsync covering it. This is the P0 #1 accounting bug."
-        );
-    }
-
-    /// Control: IN-ORDER completion (the common single-burst coalesced path) is
-    /// correct — each waiter is covered by a fsync issued after its write. This
-    /// isolates the bug to OUT-OF-ORDER completion, confirming the narrow
-    /// reachability (only same-extent appends straddling read bursts + io_uring
-    /// reordering trigger it).
-    #[compio::test]
-    async fn p0_in_order_completion_is_correctly_durable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
-        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
-        let entry = alloc_entry(&node, 5002).await;
-
-        pwrite(&entry, vec![0xAAu8; 100], 0).await;
-        entry.coalescer.pending_fsync.store(100, Ordering::SeqCst);
-        register_sync_waiter(&entry, 100)
-            .await
-            .expect("chan")
-            .expect("ok");
-        assert_eq!(entry.coalescer.last_synced.load(Ordering::SeqCst), 100);
-
-        pwrite(&entry, vec![0xBBu8; 50], 100).await;
-        entry.coalescer.pending_fsync.store(150, Ordering::SeqCst);
-        register_sync_waiter(&entry, 150)
-            .await
-            .expect("chan")
-            .expect("ok");
-        // In-order: the [100,150) write completed BEFORE its fsync, so
-        // last_synced legitimately advances to 150 with a covering fsync.
-        assert_eq!(
-            entry.coalescer.last_synced.load(Ordering::SeqCst),
-            150,
-            "in-order completion advances last_synced via a real covering fsync"
-        );
-    }
-}
 
 #[cfg(test)]
 mod ec5_commit_window_tests {

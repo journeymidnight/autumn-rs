@@ -14,11 +14,20 @@ Task scope: EN 写路径 owner-model 重写（用户拍板 big-bang 新写、只
   门：stream lib 114/114；append_bench errs=0 depth-scaling 保持（depth4/8/64 更高）；
   G2 130/130 durable + recovery 干净；system_putstream 7/7 真集群 append e2e。
 
-── 剩余步骤 ──
-  Step 2: seal/truncate/fence 搬进 owner → 删 per-await 复检 + op-lock。
-  Step 3: 长 op（delete/re_avali/convert/EC-shard/copy-meta）staging + 短 commit 消息进 owner。
-  Step 4: 内联 append_burst_frames 的 fsync + 删 coalescer + 删 offset 预留；最终 A/B。
-  每步过门（stream 测试 + G2 + 相关集成/chaos EC-delete）才 commit。
+── Step 2 done + committed（删 coalescer，内联 fsync）──
+  owner 已把 append 串成 burst，一个 burst 一次 sync_data 覆盖它 → 跨 burst 的 coalescer 冗余。
+  append 路径改内联 sync_data（pending_fsync 前、last_synced 后，保 fd_evictable）；删 coalescer_loop
+  + register_sync_waiter + CoalescerInner + 2 个 coalescer 回归测试 + mark_disk_offline（净 -410 行）。
+  Coalescer 结构剩两水位原子（last_synced/pending_fsync）。门：lib 112/112；append_bench 背靠背 A/B
+  无回归（inline 略好）；G2 130/130 durable；system_putstream 7/7。
+
+── 结论：re-check / op-lock / meta_write_lock 删除 = WON'T-DO（load-bearing，用户认同聚焦热路径）──
+  深挖确认：fence 复检守 eager owner_epoch fetch_max（G1 僵尸写者需它同步/快）——单线程下 eager 抬升
+  会落在 append 的 await 里，复检正是抓它；seal 复检守并发冷 EC op 的 seal（用户拍板 EC convert 等与
+  热路径无关、不搬进 owner，那要重构 ~1000 行 EC 代码换删 ~30 行便宜检查，风险/收益极差）。所以复检
+  整体 load-bearing、便宜、钉着 shipped-bug → 保留；offset 预留也留。
+  owner 重写净结果 = append 经干净的 per-extent owner 串行 + 内联 fsync，删掉 build_append_future 两阶段
+  并发机器 + coalescer；结构改善 + 净 -400 行，安全检查全保留。**EN owner 重写到此收官。**
 
 ─────────────────────────────────────────────────────────────────
 Date: 2026-08-05
