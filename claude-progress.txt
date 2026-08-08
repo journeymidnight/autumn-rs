@@ -1,8 +1,41 @@
-Date: 2026-08-05
+Date: 2026-08-08
 TaskStatus: not_completed
+Task scope: EN 写路径 owner-model 重写（已收官）+ fable 评审跟修 + GC lost-update 窗口调查（进行中）。
+  设计草案 scratchpad/en_actor_design.md (v2, fable 评审)；基线 scratchpad/en_bench_baseline.md。
+
+── fable review 跟修：owner mailbox 跨连接合批的 fence 旁路（design-breaking，已修）──
+  fable 复审 owner 重写 diff 发现：owner mailbox 是新的跨连接聚合点，一次 drain 可能把
+  僵尸写者(owner_epoch E)+接管新主(E+1)（或换连接重放的 retry）合进一个 burst；而
+  append_burst_frames 只按【首 slot】校验 owner_epoch+commit（这在"一批=单连接连续帧"时成立）。
+  → [new,zombie] 会把僵尸写在累加 offset 上 ACK 过 fence（acked-data loss）；
+    [zombie,new] 会因首 slot 陈旧把整批（含合法新主）拒成 LockedByOther。
+  修：owner_loop 在 group-commit 前把 drain 切成同质 run（owner_epoch 变化 OR
+    commit 不连续 `commit != prev.commit+prev.payload.len()` 即开新 run），每 run 首 slot
+    走完整 prologue、run 间串行。单写者流水线=单 epoch+连续 ⇒ 一个 run ⇒ 热路径零成本。
+  回归测试 owner_burst_splitter_tests（两 drain 序都验：僵尸恒被 fence、合法主恒 ACK）；
+  临时禁 splitter 证明两测都失败（zombie ACK=0 / 新主拒=5）再复原。
+  顺带清理：删死 OwnerState(write_cursor)、去 ExtentMsg 的 WIP allow、订正 DIRECTION 陈旧注释、
+  同步 crates/stream/CLAUDE.md（coalescer→owner 模型，note 4/24 + 新增 "Per-extent owner" 小节）。
+  门：stream lib 114/114（+2 新）。
+  fable 其余项 DEFERRED（非 active bug）：P2-1 handle_append 是 wire-dead 的 owner-bypass 写者
+  （MSG_APPEND 在 dispatch 前被拦；~12 测直接调它）；P2-2 删掉的 p0 accounting 测无替代守卫；
+  P2-3 跨 burst 流水线消失（A/B 已验无回归）；P3-5 Coalescer 名不副实（剩两水位原子）。
+
+── GC lost-update 窗口调查（用户质疑守卫时序图，进行中）──
+  用户指出：GC 搬迁 value 的两守卫（active/imm 复检 + VP-identity）只查 memtable+SST 快照，
+  但用户 Put 若只在 WAL 写入流水线里（Phase1 已 seq-assign+编码、Phase2 append 在飞、
+  Phase3 memtable-insert 未做）对两守卫都不可见；而 Phase1 已 bump seq_number ⇒ GC 随后
+  分配的 seq 更高 ⇒ 把旧值搬迁盖过用户新 Put（静默 lost update / 若 Put 是 Delete 则复活）。
+  已确认：GC 是独立并发 task（background_maintenance_loop）、与 partition_loop 在同 P-log 运行时
+  await 点交错；GC paged-SST lookup 前 drop(part) 借用（:2997）；maintenance_gate 只串行
+  GC↔compact↔split、不挡前台写；Phase1(start_write_batch)只 seq+encode 不插 memtable。
+  下一步：写确定性复现（GC drop 借用后 park→注入一个 Phase1+2 完成但 Phase3 前挂起的 Put→
+  放 GC→断言最终 Get 返回新值）；复现成立则上"in-flight write keys"精准守卫（reproduce-first）。
+
+── 以下为 owner 重写原始记录 ──
+Date: 2026-08-05
 Task scope: EN 写路径 owner-model 重写（用户拍板 big-bang 新写、只重写 EN、fable 设计+评审过）。
-  分多个 gated 步逐步推进；本 loop「按节奏逐步完成」。设计草案 scratchpad/en_actor_design.md
-  (v2, fable 评审)；基线 scratchpad/en_bench_baseline.md。
+  分多个 gated 步逐步推进；本 loop「按节奏逐步完成」。
 
 ── Step 1 done + committed（owner 路由 appends）──
   一个 per-extent owner task（懒启停、mailbox=queue+running 镜像 coalescer 无 lost-wake 生命

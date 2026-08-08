@@ -73,7 +73,9 @@ struct ExtentEntry {
     avali: AtomicU32,              // availability flag (non-zero = sealed)
     owner_epoch: AtomicI64,        // per-extent write fence, most recent owner revision seen
     disk_id: u64,                  // immutable after creation
-    // + durable_owner_revision, corrupt_meta (AtomicBool), coalescer state
+    // + durable_owner_revision, corrupt_meta (AtomicBool), durability
+    //   watermarks (last_synced / pending_fsync), owner mailbox (per-extent
+    //   single-writer append task)
 }
 ```
 
@@ -100,10 +102,10 @@ startup (same as PS).
 
 Two accessors:
 - **`resident_file() -> Option<Rc>`** (sync): the write/durability path
-  (`build_append_future`, `handle_append`, `truncate_to_commit`, the coalescer)
+  (`append_burst_frames` run by the per-extent owner, `truncate_to_commit`)
   resolves its fd ONCE in the prologue (while the seal re-checks just proved the
   extent open), HOLDS the `Rc` for the whole op, and treats `None` as
-  "concurrently sealed" → clean `CODE_PRECONDITION`. `build_append_future`
+  "concurrently sealed" → clean `CODE_PRECONDITION`. `append_burst_frames`
   MOVES the `Rc` into the boxed I/O future (NOT lazily at first poll).
 - **`extent_file(entry) -> Result<Rc>`** (async): every read / sealed-extent
   background op (read futures, copy, convert, re_avali, recovery, meta persist)
@@ -188,6 +190,37 @@ receiver so downstream RTTs overlap. LIMITATION: per-append store-and-forward
 stacks hop latencies; the win (writer egress 3x→1x) only exists where the
 writer NIC is the bottleneck (cross-host). Keep OFF on loopback.
 
+### Per-extent owner (write path) — appends serialized by one task
+
+All appends to an extent are MESSAGES (`ExtentMsg::Append`) to a single
+per-extent **owner task** (`send_to_owner` → `owner_loop`), lazily spawned on the
+first message and exiting when its mailbox drains (dropping its `Rc<ExtentEntry>`
+so a sealed/idle extent is never pinned past fd eviction; a later message
+respawns it — lost-wake-free by the single-thread enqueue/exit-recheck argument).
+This makes the write path single-writer BY CONSTRUCTION — the old fsync coalescer
++ its loop are DELETED (note 24). The ps-conn task stays the RPC engine: it builds
+the message + a `resp` oneshot, sends it to the owner, and batches the returned
+encoded frame into its existing vectored write.
+
+`owner_loop` drains its mailbox in bursts and runs each burst through
+`append_burst_frames` (the renamed `build_append_future`; still two-phase — a
+synchronous prologue reserves `extent.len`, the returned future does pwrite + one
+inline `sync_data`, a harmless vestige under the sole writer).
+
+INVARIANT (burst-splitter — load-bearing for the owner_epoch fence): the mailbox
+is a CROSS-CONNECTION aggregation point (a per-connection append batch never
+was), so ONE drain can merge appends from two writers — a fenced zombie at epoch
+E and the post-takeover owner at E+1, or a retry replayed on a fresh connection.
+`append_burst_frames` validates `owner_epoch` + `commit` from its FIRST slot ONLY.
+So `owner_loop` SPLITS each drain into homogeneous runs before group-committing: a
+new run starts whenever `owner_epoch` changes OR commit-contiguity breaks
+(`commit != prev.commit + prev.payload.len()`); each run's first slot then gets
+the full prologue fence/commit check against the LIVE `extent.len`/`owner_epoch`,
+and runs execute sequentially. Single-writer pipelining is single-epoch +
+contiguous ⇒ ONE run ⇒ zero hot-path cost. Without the split, `[new, zombie]`
+would ACK the zombie past the fence (acked-data loss) and `[zombie, new]` would
+reject the rightful owner. Tests: `owner_burst_splitter_tests`.
+
 ### Append protocol (eversion → seal → fencing → commit truncation → write)
 
 ```
@@ -216,21 +249,18 @@ Append(AppendReq via autumn-rpc binary frame):
            DURING the truncate I/O; writing past the new sealed_length corrupts
            subsequent reads. Fire CODE_PRECONDITION; client retries via the
            standard soft-error path.
-  6. Write payload (Direct path, routed through the fsync coalescer):
+  6. Write payload (Direct path, serialized by the per-extent OWNER — see
+     "Per-extent owner (write path)"). Appends are messages to ONE owner task
+     per extent, so the write is single-writer by construction:
        - write_vectored_all_at(start, payload)   (see note 25a: MUST be *_all)
-       - advance entry.coalescer.pending_fsync to end, ALWAYS (regardless of
-         must_sync) → LevelDB-style "always durable" without a per-write syscall.
-       - if must_sync: register_sync_waiter(extent, end) → await oneshot. The
-         coalescer is event-driven (RocksDB group-commit): the first waiter at
-         an idle extent triggers sync_data immediately; any pwrite completing
-         before the syscall returns rides along. No timer.
-       - Lazy spawn / clean exit: first register creates an mpsc wake channel
-         and spawns the loop; the loop parks on wake_rx between fsyncs and, on
-         "no work AND no waiters", sets wake_tx=None and returns. A future
-         register spawns a fresh task. Single-threaded compio makes this
-         race-free without locks.
-  7. Advance extent.len.
-  8. Return (offset=start, end=start+payload_len).
+       - ONE sync_data per drained burst: pending_fsync.store(end) BEFORE the
+         fsync, last_synced.store(end) AFTER — the two watermarks are all that
+         remains of the old Coalescer struct. must_sync no longer gates a
+         syscall (every burst fsyncs unconditionally); the flag stays on the
+         wire for back-compat.
+       - fsync error → fail the WHOLE burst (no len advance) + mark_disk_error.
+  7. Advance extent.len (AFTER the burst's fsync).
+  8. Return (offset=start, end=start+payload_len) per slot.
 ```
 
 Returning `end=N` means all data in `0..N` is written. Step 5 (commit-based
@@ -242,7 +272,7 @@ replacing a WAL.
 `StreamClient` computes `commit = min(commit_length on ALL replicas)` before
 each append. Any replica that got ahead (partially acknowledged data before a
 crash) is truncated back to the consensus point on the next append. Per-node
-durability comes from the fsync coalescer.
+durability comes from the per-extent owner's one-sync_data-per-burst (note 24).
 
 **This is a WAS stream layer: the append path is all-replica-ACK**
 (`apply_completion` acks only when every replica wrote), so committed length
@@ -628,7 +658,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
 
-4. **`must_sync` cost** — the per-extent fsync coalescer is event-driven (RocksDB group-commit). The flag controls only whether the caller WAITS: `true` registers a `(end_offset, oneshot)` waiter and awaits (first waiter at an idle extent triggers `sync_data` immediately, no timer floor; typical wait ~1 ms tmpfs / 5–15 ms NVMe); `false` advances `pending_fsync` and returns (the coalescer still makes those bytes durable on its next tick). `sync_data` is whole-file, so it covers prior `must_sync=false` bytes. Clients always pass `must_sync=true` (there is no `--nosync`); the flag is kept on the wire for back-compat.
+4. **`must_sync` cost** — no longer a behavioural knob. The per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs regardless of `must_sync`. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. Clients always pass `must_sync=true` (there is no `--nosync`); the flag is kept on the wire for back-compat only.
 
 5. **StreamClient is always `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers hold `Weak<StreamClient>` for the removal guard. Public API takes `&self`.
 
@@ -685,14 +715,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
     `.meta` durability: ALL `.meta` writers go through `meta_write_lock` (per-extent, DISTINCT from the EC op-lock to avoid self-deadlock). `write_meta_locked` reads the LIVE atomics under that lock (so a stale-snapshot fence persist can't clobber a concurrent seal's `.meta`) and writes ATOMICALLY: `.meta.tmp` → fsync → rename → **fsync parent dir** (else the ACKed fence can regress on a host crash). **Invariants: (1) never ACK an append whose fence isn't durable; (2) raise the in-memory bar synchronously, persist before publishing `durable`; (3) every `.meta` write holds `meta_write_lock` and reads live atomics.**
 
-24. **KNOWN, DEFERRED — the fsync coalescer can ACK an append whose bytes were written after the covering fsync, under out-of-order same-extent completion.** `pending_fsync.store(total_end)` is a PLAIN store after the pwrite await; if a high-offset write's CQE completes first and fsyncs, a late low-offset write can `store` a SMALLER `pending_fsync` and be satisfied by the `pending <= synced` no-fsync branch — crediting durability to bytes the fsync did not cover. **Structurally near-unreachable under current invariants** (not merely rare): same-extent page-cache ordering is enforced by (1) io_uring inline-FIFO for buffered writes, (2) `i_rwsem` serialising same-inode writes even when punted to io_wq, (3) single-writer SQE submission per extent (the worrying `FuturesUnordered` lives on the CQ side, not the SQ side). Loss is additionally observable ONLY under power-loss/kernel-panic (a process kill keeps un-fsynced page-cache writes), and all-replica-ACK + recovery re-replicate a single-replica loss. **NOT FIXED** (the correct fix — contiguous completed-prefix tracking so `last_synced` advances only over a fully-written prefix — touches the hottest coalescer path; a hand-rolled waiter-lifecycle state machine was attempted and reverted for self-producing bugs there). **The defer holds only while these assumptions hold** — any change that breaks one MUST re-validate the race and likely needs a separate per-extent SERIAL fsync-accounting redesign (RocksDB single-sequential-WAL-writer model), NOT state bolted onto the concurrent coalescer:
-    - buffered writes via `vfs_write_iter` (NOT `O_DIRECT`, which always punts to io_wq);
-    - `IORING_SETUP_DEFAULT` (NOT SQPOLL);
-    - single OS thread per io_uring (compio thread-per-core);
-    - single-writer per extent within a thread (P-log owns log_stream, P-sst owns row_stream);
-    - append-only writes (no partial-page RMW).
-
-    **Invariant for a future fix:** `last_synced` must never advance past the largest offset X such that ALL `[0,X)` pwrites have completed; land it WITH `p0_fsync_highwater_tests` + coco /findbugs. Cross-ref: note 4, the Commit protocol section.
+24. **RESOLVED by the per-extent owner model — the old fsync-coalescer out-of-order-completion durability race is gone.** The deleted coalescer credited durability via a plain `pending_fsync.store` after the pwrite await; under out-of-order same-extent CQE completion a late low-offset write could `store` a SMALLER `pending_fsync` and be satisfied by a `pending <= synced` no-fsync branch, crediting durability to bytes the fsync did not cover. The owner rewrite deleted the coalescer + its loop entirely: appends to one extent are now serialized through ONE owner task (see "Per-extent owner") that drains a burst, issues ONE `write_vectored_all_at`, and does ONE `sync_data` covering exactly that burst's bytes (`pending_fsync` before, `last_synced` after), with bursts run SEQUENTIALLY. There is no concurrent same-extent completion to reorder, so `last_synced` can never advance past an unwritten prefix. The pre-owner analysis had judged the race near-unreachable under io_uring inline-FIFO + `i_rwsem` + single-writer SQE submission; the owner makes that single-writer property STRUCTURAL rather than incidental. **Any change that reintroduces concurrent same-extent writes (e.g. resurrecting a per-request FU on the SQ side) MUST re-validate this** — the load-bearing premise is now "one owner task, one fsync per sequential burst", not the incidental kernel ordering. Cross-ref: note 4, the Commit protocol section.
 
 25a. **ENOSPC: disk health is a 3-state machine (`DiskHealth`: Online / Full / Faulted), the batched-append pwritev MUST be the `_all` form, and caller-ack ⊆ contiguous commit.**
     - **Every local file write MUST be a `*_all` form (or verify the count).** `build_append_future`'s batch path uses `write_vectored_all_at` (loops until done or a real error). POSIX pwritev on a nearly-full disk writes what fits and returns a SHORT count — `Ok(n)` from a raw positional write is NOT success; a partial append fsynced+ACKED reads its unwritten reserved tail back as zeros.
@@ -785,9 +808,8 @@ swallows panics). Two helpers in `extent_node.rs`:
   tick, owns no moved resource).
 - `en_spawn_failstop(name, fut)` — catch_unwind; normal return = expected lazy
   exit; PANIC → ERROR-log + `std::process::exit(1)`, for the per-extent
-  `coalescer_loop` (owns its moved wake-channel receiver, durability-critical;
-  restart-in-place is impossible + unsafe → fail-stop, EN restarts and recovers
-  from disk).
+  `owner_loop` (the durability-critical single writer; a panic mid-burst must not
+  silently strand queued appends → fail-stop, EN restarts and recovers from disk).
 
 **Bounded connect**: `ConnPool::get_client` wraps `RpcClient::connect` in a fixed
 `CONNECT_TIMEOUT` (5 s) so a blackholed peer (SYN dropped) can't hang a caller

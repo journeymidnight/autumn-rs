@@ -2122,22 +2122,22 @@ struct ReadSlot {
 // and the per-await seal/fence/fd-evict re-checks (their whole job is catching
 // concurrent mutators, which structural serialization makes impossible).
 //
-// DIRECTION (validated while reading the code): the append handling is modelled
-// on `handle_append`'s INLINE logic (prologue → pwrite → fence-recheck → advance
-// len AFTER fsync), NOT `build_append_future`'s two-phase reserve+io-future — that
-// machinery exists only to make CONCURRENT same-extent pwrites safe, and the
-// single owner has no concurrency, so `build_append_future` gets DELETED. Within
-// one drained burst the owner runs a LOCAL write cursor (advances per append)
-// while the durable `extent.len`/`last_synced` advance only after the burst's ONE
-// `sync_data` (snapshot-before-fsync group commit, replacing the coalescer). Reads
-// stay lock-free (clone `ExtentEntry.file`); the owner clones the fd per burst and
-// drops it on park → still gates `fd_evictable`.
+// SHAPE (as built): the owner drains its mailbox in bursts, splits each drain
+// into homogeneous runs (one owner_epoch + contiguous commits — see
+// `owner_loop`), and runs each through `append_burst_frames` (the renamed
+// `build_append_future`). That body kept its two-phase form (synchronous prologue
+// reserves `extent.len`, the returned future does pwrite + inline `sync_data`);
+// under the sole owner the reservation is a harmless vestige (one writer never
+// races itself), left to flatten in a later cleanup. Durability is one
+// `sync_data` per burst (`pending_fsync` before, `last_synced` after) — the fsync
+// coalescer + its loop are DELETED. Reads stay lock-free (clone
+// `ExtentEntry.file`); the owner clones the fd per burst and drops it on
+// exit → still gates `fd_evictable`.
 // ==================================================================
 
 /// A message to a per-extent owner task. The `resp` oneshot carries the handler
 /// result back to the ps-conn task, which batches the encoded frame into its
 /// existing vectored write (response batching stays on the conn).
-#[allow(dead_code)] // WIP: wired in a later step
 pub(crate) enum ExtentMsg {
     /// Append under the commit==extent.len ordering + owner_epoch fence.
     Append {
@@ -2153,19 +2153,6 @@ pub(crate) enum ExtentMsg {
     // staged long ops (ReAvaliCommit / ConvertCommit / EcShardCommit / Delete /
     // CopyMetaApply). SyncedLen / CommitLength are NOT messages — they stay
     // lock-free atomic reads of `last_synced` (fable P1-3).
-}
-
-/// State that ONLY the owner task may name/mutate (typed confinement, fable
-/// DB-1): a mutator that is not routed through the owner is then a compile
-/// error, not a latent race. NB: the fd is deliberately NOT here — it stays in
-/// `ExtentEntry.file: RefCell<Rc<CompioFile>>` so lock-free reads and fd-LRU
-/// eviction keep working (fable P1-4); the owner clones it per burst.
-#[allow(dead_code)] // WIP: fields firm up with the owner_loop body (next step)
-struct OwnerState {
-    /// Burst-local write cursor: the next pwrite offset. Seeded from the durable
-    /// `extent.len` at loop entry; advances per append within a burst; the
-    /// durable `extent.len` is bumped to it only AFTER the burst's fsync.
-    write_cursor: u64,
 }
 
 /// Owner mailbox state (under `ExtentEntry.owner`'s RefCell). `queue` is the
@@ -2373,31 +2360,58 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
             }
             continue;
         }
-        // Step 2 handles only Append; later steps add Truncate/Seal/Fence/commits.
-        // Order is preserved (mailbox is FIFO push→take), so slots stay in
-        // commit order == extent.len — the append_burst_frames prologue relies on it.
-        let mut slots: Vec<AppendSlot> = Vec::with_capacity(burst.len());
-        let mut resps: Vec<futures::channel::oneshot::Sender<Bytes>> =
-            Vec::with_capacity(burst.len());
+        // Split the drained burst into HOMOGENEOUS runs, then group-commit each.
+        //
+        // The mailbox is a NEW cross-connection aggregation point: appends from a
+        // fenced zombie writer (owner_epoch E) and the post-takeover owner (E+1),
+        // or a retry replayed on a fresh connection, can land in ONE drain. But
+        // `append_burst_frames` validates owner_epoch + commit from its FIRST slot
+        // only — a rule that was sound when a "batch" was, by construction,
+        // consecutive frames from ONE connection (one writer → one epoch,
+        // contiguous commits). Feeding heterogeneous slots to one burst would let
+        // a non-first slot bypass the fence (a zombie's E-epoch write ACKed inside
+        // an E+1 burst) or wrongly reject a whole burst on a leading stale slot.
+        // So start a fresh run whenever the owner_epoch changes OR commit
+        // contiguity breaks (commit != prev.commit + prev.payload.len()); each
+        // run's first slot then gets the FULL prologue check against the live
+        // extent.len / owner_epoch. Single-writer pipelining is single-epoch +
+        // contiguous ⇒ ONE run ⇒ zero hot-path cost. This splitter is now the home
+        // of the "first slot governs the batch" invariant the prologue relies on.
+        let mut runs: Vec<(
+            Vec<AppendSlot>,
+            Vec<futures::channel::oneshot::Sender<Bytes>>,
+        )> = Vec::new();
+        let mut prev_epoch_end: Option<(i64, u64)> = None; // (owner_epoch, commit + payload.len())
         for msg in burst {
             match msg {
                 ExtentMsg::Append { req, req_id, resp } => {
-                    slots.push(AppendSlot { req, req_id });
-                    resps.push(resp);
+                    let contiguous = matches!(
+                        prev_epoch_end,
+                        Some((pe, pend)) if pe == req.owner_epoch && pend == req.commit
+                    );
+                    if !contiguous {
+                        runs.push((Vec::new(), Vec::new()));
+                    }
+                    prev_epoch_end =
+                        Some((req.owner_epoch, req.commit + req.payload.len() as u64));
+                    let run = runs.last_mut().expect("a run was just pushed");
+                    run.0.push(AppendSlot { req, req_id });
+                    run.1.push(resp);
                 }
             }
         }
-        // Relocated build_append_future logic (still two-phase: prologue reserves
-        // extent.len synchronously, then the returned future does pwrite+fsync).
-        // The owner awaits both phases inline; being the SOLE writer, the
-        // reservation is harmless (a later cleanup step flattens it + inlines the
-        // fsync once seal/truncate/fence also move into the owner).
-        let frames = append_burst_frames(node.clone(), std::rc::Rc::clone(&extent), slots)
-            .await
-            .await;
-        // Per-slot frames in slot order == resps order.
-        for (frame, resp) in frames.into_iter().zip(resps.into_iter()) {
-            let _ = resp.send(frame);
+        // Each run is ONE group commit (prologue reserves extent.len
+        // synchronously, then the returned future does pwrite+fsync). Runs run
+        // SEQUENTIALLY so a later run's fence/commit prologue observes the prior
+        // run's durable extent.len / owner_epoch.
+        for (slots, resps) in runs {
+            let frames = append_burst_frames(node.clone(), std::rc::Rc::clone(&extent), slots)
+                .await
+                .await;
+            // Per-slot frames in slot order == resps order.
+            for (frame, resp) in frames.into_iter().zip(resps.into_iter()) {
+                let _ = resp.send(frame);
+            }
         }
     }
 }
@@ -2471,7 +2485,11 @@ async fn append_burst_frames(
         return batch_append_reject(slots, CODE_PRECONDITION);
     }
 
-    // 3. OwnerEpoch fencing: the first request's owner_epoch governs the batch.
+    // 3. OwnerEpoch fencing: the first slot's owner_epoch governs the batch. This
+    // is SOUND ONLY because `owner_loop`'s burst-splitter guarantees every slot
+    // here shares one owner_epoch and contiguous commits (a heterogeneous burst
+    // is split into homogeneous runs before reaching this prologue) — do not feed
+    // this fn a batch spanning multiple writers/epochs.
     let first = &slots[0].req;
     let owner_epoch = extent.owner_epoch.load(Ordering::SeqCst);
     if first.owner_epoch < owner_epoch {
@@ -9431,5 +9449,116 @@ mod fd_lru_chaos_tests {
             let got = file_pread(f, 0, 1500).await.expect("pread");
             assert_eq!(got, payload(i), "post-churn extent {eid} wrong");
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_burst_splitter_tests {
+    use super::*;
+
+    fn append_msg(
+        extent_id: u64,
+        eversion: u64,
+        commit: u64,
+        owner_epoch: i64,
+        payload: &[u8],
+        req_id: u32,
+    ) -> (ExtentMsg, futures::channel::oneshot::Receiver<Bytes>) {
+        let (tx, rx) = futures::channel::oneshot::channel::<Bytes>();
+        let msg = ExtentMsg::Append {
+            req: AppendReq {
+                extent_id,
+                eversion,
+                commit,
+                owner_epoch,
+                payload: Bytes::copy_from_slice(payload),
+            },
+            req_id,
+            resp: tx,
+        };
+        (msg, rx)
+    }
+
+    /// Decode the `AppendResp.code` out of the owner's encoded response frame.
+    fn resp_code(frame_bytes: Bytes) -> u8 {
+        let mut dec = FrameDecoder::new();
+        dec.feed(&frame_bytes);
+        let frame = dec
+            .try_decode()
+            .expect("decode")
+            .expect("one complete frame");
+        AppendResp::decode(frame.payload).expect("append resp").code
+    }
+
+    /// A single drained mailbox burst can merge appends from a fenced zombie
+    /// writer (owner_epoch E) and the post-takeover owner (E+1) — the owner
+    /// mailbox is a cross-connection aggregation point the per-connection batch
+    /// never was. `owner_loop`'s burst-splitter MUST validate each writer's
+    /// epoch independently: the zombie is always rejected (LockedByOther), the
+    /// rightful owner always ACKs — in BOTH drain orders. Pre-splitter, the
+    /// "first slot governs the batch" prologue made `[new, zombie]` ACK the
+    /// zombie past the fence (acked-data loss) and `[zombie, new]` reject the
+    /// rightful owner.
+    async fn run_mixed_epoch_burst(new_first: bool) -> (u8 /* new */, u8 /* zombie */) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("node");
+        let eid = 4242u64;
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+            .await
+            .expect("alloc");
+        let extent = node.extents.get(&eid).expect("entry").clone();
+        // Model a completed takeover: the new owner already fenced the extent to
+        // epoch 2 (in-memory bar raised). A paused-then-resumed old owner (epoch
+        // 1) still holds a connection and its in-flight append lands in the SAME
+        // mailbox drain as the new owner's.
+        extent
+            .owner_epoch
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        // Both writers append at commit=0 (fresh extent). Distinct epochs ⇒ the
+        // splitter puts each in its own run.
+        let (m_new, rx_new) = append_msg(eid, 1, 0, 2, b"NEWOWNER", 1);
+        let (m_old, rx_old) = append_msg(eid, 1, 0, 1, b"ZOMBIE", 2);
+
+        {
+            let mut mb = extent.owner.borrow_mut();
+            if new_first {
+                mb.queue.push(m_new);
+                mb.queue.push(m_old);
+            } else {
+                mb.queue.push(m_old);
+                mb.queue.push(m_new);
+            }
+            mb.running = true;
+        }
+        // Drive the owner to drain + process the burst, then exit (queue empty).
+        owner_loop(node.clone(), extent.clone()).await;
+
+        let new_code = resp_code(rx_new.await.expect("new resp"));
+        let old_code = resp_code(rx_old.await.expect("zombie resp"));
+        (new_code, old_code)
+    }
+
+    #[compio::test]
+    async fn zombie_epoch_rejected_when_drained_after_new_owner() {
+        let (new_code, zombie_code) = run_mixed_epoch_burst(true).await;
+        assert_eq!(new_code, CODE_OK, "rightful owner's append must ACK");
+        assert_eq!(
+            zombie_code, CODE_LOCKED_BY_OTHER,
+            "zombie (epoch 1) must be fenced even riding the new owner's drain — \
+             pre-splitter this ACKed past the fence (acked-data loss)"
+        );
+    }
+
+    #[compio::test]
+    async fn zombie_epoch_rejected_when_drained_before_new_owner() {
+        let (new_code, zombie_code) = run_mixed_epoch_burst(false).await;
+        assert_eq!(
+            new_code, CODE_OK,
+            "rightful owner's append must ACK even behind a leading stale slot — \
+             pre-splitter the whole burst was rejected on the first slot"
+        );
+        assert_eq!(zombie_code, CODE_LOCKED_BY_OTHER, "zombie must be fenced");
     }
 }
