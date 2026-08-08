@@ -39,7 +39,10 @@ Task scope: EN 写路径 owner-model 重写（已收官）+ fable 评审跟修 +
   在 VP-identity 命中后、seq 分配前若 key 在集合 ⇒ Err 中止本 extent 轮（不搬不 punch，下轮重试）。
   中止而非跳过=在飞写可能不提交、被扫值仍可能是活的、不能 punch。hash 碰撞只多一次无害中止。
   门：repro pre-fix 失败(v_old)/post-fix 过(v_new)；PS lib 204/204；GC 集成测试待跑确认无误伤。
-  热路径代价=每 key 约几个 HashMap op + 一次 FNV（~1% 写 CPU）——已在 CLAUDE.md 记，待用户认。
+  热路径代价=每 key 约几个 HashMap op + 一次 FNV（~1% 写 CPU）——已在 CLAUDE.md 记。
+  用户定案 2026-08-08：就用集合方案，接受这点热路径成本（评估过 reserved-marker=在 autumn
+  是陷阱、Titan-merge=条件搬迁破坏 relocate-then-punch 即时回收、watermark=翻转"memtable
+  只装已提交"不变量面最大，都比集合重）。GC 修完结。
   fable 其余项仍 DEFERRED（见上）。
 
 ── 以下为 owner 重写原始记录 ──
