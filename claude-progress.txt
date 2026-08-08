@@ -21,16 +21,26 @@ Task scope: EN 写路径 owner-model 重写（已收官）+ fable 评审跟修 +
   （MSG_APPEND 在 dispatch 前被拦；~12 测直接调它）；P2-2 删掉的 p0 accounting 测无替代守卫；
   P2-3 跨 burst 流水线消失（A/B 已验无回归）；P3-5 Coalescer 名不副实（剩两水位原子）。
 
-── GC lost-update 窗口调查（用户质疑守卫时序图，进行中）──
-  用户指出：GC 搬迁 value 的两守卫（active/imm 复检 + VP-identity）只查 memtable+SST 快照，
-  但用户 Put 若只在 WAL 写入流水线里（Phase1 已 seq-assign+编码、Phase2 append 在飞、
-  Phase3 memtable-insert 未做）对两守卫都不可见；而 Phase1 已 bump seq_number ⇒ GC 随后
-  分配的 seq 更高 ⇒ 把旧值搬迁盖过用户新 Put（静默 lost update / 若 Put 是 Delete 则复活）。
-  已确认：GC 是独立并发 task（background_maintenance_loop）、与 partition_loop 在同 P-log 运行时
-  await 点交错；GC paged-SST lookup 前 drop(part) 借用（:2997）；maintenance_gate 只串行
-  GC↔compact↔split、不挡前台写；Phase1(start_write_batch)只 seq+encode 不插 memtable。
-  下一步：写确定性复现（GC drop 借用后 park→注入一个 Phase1+2 完成但 Phase3 前挂起的 Put→
-  放 GC→断言最终 Get 返回新值）；复现成立则上"in-flight write keys"精准守卫（reproduce-first）。
+── GC lost-update 窗口：复现 + 修（用户质疑守卫时序图，已解）──
+  真因：GC 搬迁 value 的两守卫（active/imm 复检 + VP-identity）只查 memtable+SST 快照，
+  但 Put 若只在 WAL 写入流水线里（Phase1 已 seq-assign+编码、Phase2 durable、Phase3
+  memtable-insert 未做）对两守卫都不可见；而 Phase1 已 bump seq_number ⇒ GC 随后分配的 seq 更高
+  ⇒ 把旧值搬迁盖过用户新 Put（静默 lost update / Delete 则复活）。
+  确定性复现 crates/manager/tests/system_gc_inflight_wal_put.rs：两 test-only sync 点
+  （set_gc_verdict_pause 把 GC 停在 SST-lookup 后/裁决前；set_write_phase3_pause 把 Put 停在
+  Phase2 后/Phase3 前）。坑=Phase3 hold 会 stall partition_loop→force_gc RPC 走 partition_loop
+  死锁→改成【先触发 force_gc(GC 停在裁决)→再 hold Phase3+发 Put→放 GC→放 Phase3】；
+  另坑=force GC 要 X 权威 sealed（split 封 X 后加一次 roll 写evict PS cache）+ 要 durable_ckpt_vp
+  过 X（roll 后再 flush，否则 replay-floor guard 把 X 剔出 holes）。实证 pre-fix got=v_old（'A'）失败。
+  修（in-flight write keys 守卫）：PartitionData.inflight_write_keys（refcount 的 64-bit
+  FNV(user_key) 集合）；start_write_batch Phase1 seq-assign 同借用内 add、finish_write_batch
+  Phase3 memtable-insert 同借用内 release（insert↔release 间无 await ⇒ 每个 key 恒在 memtable
+  或集合其一）；Phase2 失败臂 + Phase1b encode-panic 臂也 release 防泄漏；process_gc_chunk
+  在 VP-identity 命中后、seq 分配前若 key 在集合 ⇒ Err 中止本 extent 轮（不搬不 punch，下轮重试）。
+  中止而非跳过=在飞写可能不提交、被扫值仍可能是活的、不能 punch。hash 碰撞只多一次无害中止。
+  门：repro pre-fix 失败(v_old)/post-fix 过(v_new)；PS lib 204/204；GC 集成测试待跑确认无误伤。
+  热路径代价=每 key 约几个 HashMap op + 一次 FNV（~1% 写 CPU）——已在 CLAUDE.md 记，待用户认。
+  fable 其余项仍 DEFERRED（见上）。
 
 ── 以下为 owner 重写原始记录 ──
 Date: 2026-08-05

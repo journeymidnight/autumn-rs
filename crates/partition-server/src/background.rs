@@ -76,6 +76,28 @@ pub fn set_gc_rate_bytes_per_sec(n: u64) -> bool {
     GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
 }
 
+/// Test sync-point: when set, `process_gc_chunk` parks a VP record's liveness
+/// verdict AFTER the SST lookup but BEFORE the post-await re-validation + seq
+/// allocation — the exact point at which a concurrent, seq-assigned-but-not-yet-
+/// committed Put must be visible. Lets a test interleave such a Put and prove the
+/// verdict does (pre-fix) / does not (post-fix) shadow it. One relaxed load per
+/// VP record; only ever set by tests.
+static GC_VERDICT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Count of GC verdicts that have PARKED on `GC_VERDICT_PAUSE`. Tests poll this
+/// to know GC has scanned the value and is holding at the verdict.
+static GC_VERDICT_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `GC_VERDICT_PAUSE`. Only tests call this.
+pub fn set_gc_verdict_pause(paused: bool) {
+    GC_VERDICT_PAUSE.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+fn gc_verdict_paused() -> bool {
+    GC_VERDICT_PAUSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Number of GC verdicts currently/previously PARKED on the pause.
+pub fn gc_verdict_parked_count() -> u64 {
+    GC_VERDICT_PARKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct CompactStats {
     pub input_tables: usize,
     pub output_tables: usize,
@@ -1299,6 +1321,35 @@ pub(crate) struct BatchData {
     phase2_started_at: Instant,
     valid: Vec<ValidatedEntry>,
     record_sizes: Vec<u32>,
+    /// Hashes of this batch's non-fence user keys, added to
+    /// `PartitionData.inflight_write_keys` in Phase 1 and removed in Phase 3.
+    /// Computed once here so Phase 3 needn't re-hash. See `inflight_key_hash`.
+    inflight_key_hashes: Vec<u64>,
+}
+
+/// 64-bit hash of a user key for `PartitionData.inflight_write_keys`. FNV-1a —
+/// fast, dependency-free, no allocation. Collisions only cause a spurious GC
+/// verdict abort (safe, retried next tick), so cryptographic strength is
+/// unnecessary.
+pub(crate) fn inflight_key_hash(user_key: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in user_key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Drop one in-flight reference for `kh` from `PartitionData.inflight_write_keys`
+/// (removing the entry at zero). Paired with the `+= 1` in `start_write_batch`;
+/// called once per key in Phase 3 (and on the Phase-1b encode-error abort).
+pub(crate) fn release_inflight_key(map: &mut HashMap<u64, u32>, kh: u64) {
+    if let Some(c) = map.get_mut(&kh) {
+        *c -= 1;
+        if *c == 0 {
+            map.remove(&kh);
+        }
+    }
 }
 
 /// In-flight batch: Phase1 done, Phase2 future running.
@@ -1342,10 +1393,11 @@ pub(crate) async fn start_write_batch(
     let phase1_started_at = Instant::now();
 
     // Phase 1a: validate + assign seq + collect entries.
-    let (mut valid, log_stream_id, part_sc, admission) = {
+    let (mut valid, inflight_key_hashes, log_stream_id, part_sc, admission) = {
         let mut p = part.borrow_mut();
 
         let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
+        let mut inflight_key_hashes: Vec<u64> = Vec::with_capacity(batch.len());
         for req in batch {
             let (user_key, op, value, expires_at) = match req.op {
                 WriteOp::Put {
@@ -1372,6 +1424,16 @@ pub(crate) async fn start_write_batch(
             p.seq_number += 1;
             let seq = p.seq_number;
             let internal_key = key_with_ts(&user_key, seq);
+            // Mark this key in-flight (seq assigned, not yet in the memtable) so
+            // a concurrent GC value-relocation can't shadow it (see
+            // `inflight_write_keys`). Fence-bump records never enter the memtable
+            // (Phase 3 skips them) and carry no VP, so GC never relocates them —
+            // exclude them to keep the add/remove symmetric.
+            if op != crate::OP_FENCE_BUMP {
+                let kh = inflight_key_hash(&user_key);
+                *p.inflight_write_keys.entry(kh).or_insert(0) += 1;
+                inflight_key_hashes.push(kh);
+            }
             valid.push(ValidatedEntry {
                 internal_key,
                 user_key,
@@ -1389,7 +1451,7 @@ pub(crate) async fn start_write_batch(
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
         let admission = p.rate_ctrl.clone();
-        (valid, log_stream_id, part_sc, admission)
+        (valid, inflight_key_hashes, log_stream_id, part_sc, admission)
     };
     // borrow_mut released here — safe to await below.
 
@@ -1445,9 +1507,19 @@ pub(crate) async fn start_write_batch(
             }
             (segments, record_sizes)
         })
-        .await
-        .map_err(|_| anyhow!("spawn_blocking encode panicked"))?;
-        result
+        .await;
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                // Encode panicked — the batch is abandoned before launch, so
+                // Phase 3 never runs; release its in-flight keys here.
+                let mut p = part.borrow_mut();
+                for kh in &inflight_key_hashes {
+                    release_inflight_key(&mut p.inflight_write_keys, *kh);
+                }
+                return Err(anyhow!("spawn_blocking encode panicked"));
+            }
+        }
     } else {
         // Small-batch fast path: encode inline. Spawn overhead would
         // dominate sub-4 MiB batches. Move each value's Bytes into the
@@ -1523,6 +1595,7 @@ pub(crate) async fn start_write_batch(
             phase2_started_at,
             valid,
             record_sizes,
+            inflight_key_hashes,
         },
         phase2_fut,
     }))
@@ -1560,9 +1633,29 @@ pub(crate) async fn finish_write_batch(
             for entry in bd.valid {
                 entry.resp.send_err(msg.clone());
             }
+            // The write FAILED — release its in-flight keys. Phase 3 never
+            // inserted them, and the OLD value stays correctly live, so a later
+            // GC value-relocation of it is fine.
+            {
+                let mut p = part.borrow_mut();
+                for kh in &bd.inflight_key_hashes {
+                    release_inflight_key(&mut p.inflight_write_keys, *kh);
+                }
+            }
             return Err(anyhow!(msg));
         }
     };
+
+    // Test-only sync point: hold this batch AFTER Phase 2 (seq assigned in
+    // Phase 1, bytes durable) but BEFORE the Phase-3 memtable insert — the
+    // "in-flight WAL queue" state. Parks with NO borrow held so a concurrent GC
+    // task runs; a background GC value-relocation must not shadow this write.
+    if crate::write_phase3_paused() {
+        crate::note_write_phase3_parked();
+        while crate::write_phase3_paused() {
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
 
     // Phase 3: insert into memtable + update VP head.
     //
@@ -1653,6 +1746,13 @@ pub(crate) async fn finish_write_batch(
         });
 
         p.active.insert_batch(iter);
+        // Phase 3 committed these keys to the memtable — release their in-flight
+        // marks now, under THIS borrow (NO await between the insert and the
+        // release), so a concurrent GC value-relocation always sees each key in
+        // EITHER the memtable OR inflight_write_keys, never neither.
+        for kh in &bd.inflight_key_hashes {
+            release_inflight_key(&mut p.inflight_write_keys, *kh);
+        }
         // BUG1: track the un-flushed LOG window (value
         // included) for the force-rotate; `mem_bytes` would only see the
         // ~24-byte VP for large values and never trip the 2 GiB gap.
@@ -3012,6 +3112,15 @@ async fn process_gc_chunk(
                     }
                 }
             }
+            // Test-only sync point: hold the verdict here (SST lookup done, no
+            // borrow held) so a test can inject a seq-assigned-but-not-yet-
+            // committed Put before the post-await re-validation runs.
+            if gc_verdict_paused() {
+                GC_VERDICT_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                while gc_verdict_paused() {
+                    compio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
             // Post-await validation under one borrow:
             // (a) did the key appear in active/imm during the await (a
             //     concurrent Put)? → the SST verdict is superseded; loop —
@@ -3059,6 +3168,29 @@ async fn process_gc_chunk(
             || vp.len != val_len as u64
         {
             continue;
+        }
+
+        // In-flight-write guard. The liveness lookup above sees only the
+        // memtable + SSTs, but a Put/Delete for this key can be seq-assigned
+        // (Phase 1, `start_write_batch`) yet not yet committed to the memtable
+        // (Phase 3 pending) — invisible above. Since Phase 1 already bumped
+        // `seq_number`, the relocation seq allocated below would be HIGHER than
+        // that in-flight write and shadow it (a silent lost-update,
+        // `system_gc_inflight_wal_put`); and we cannot safely `punch_holes` (the
+        // in-flight write may never commit, leaving THIS scanned value live). So
+        // ABORT this extent's GC round — no relocation, no punch. It retries next
+        // tick, by when the write has settled into the memtable where the
+        // active/imm guards above catch it. Hash key ⇒ a collision only costs a
+        // spurious abort (safe).
+        if part
+            .borrow()
+            .inflight_write_keys
+            .contains_key(&inflight_key_hash(&user_key))
+        {
+            return Err(anyhow::anyhow!(
+                "gc: key has an in-flight (seq-assigned, not-yet-committed) write \
+                 on extent {extent_id}; aborting round (retry next tick)"
+            ));
         }
 
         // Stage the WAL record into the batch under a brief borrow_mut

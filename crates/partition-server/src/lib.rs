@@ -116,6 +116,17 @@ static FLUSH_TEST_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// once per `commit_flush_outcome` success; read via `flush_commit_count`.
 static FLUSH_COMMITS: AtomicU64 = AtomicU64::new(0);
 
+/// Test sync-point: when set, `finish_write_batch` parks BEFORE its memtable
+/// insert (Phase 3). It models a Put that is seq-assigned (Phase 1) + WAL-durable
+/// (Phase 2) but not yet visible in the memtable — the "in-flight WAL queue"
+/// state a concurrent GC value-relocation must not shadow. One relaxed load per
+/// batch; only ever set by tests.
+static WRITE_PHASE3_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of Phase-3 inserts that have PARKED on `WRITE_PHASE3_PAUSE`. A test
+/// polls this to know a write is seq-assigned but not yet in the memtable.
+static WRITE_PHASE3_PARKED: AtomicU64 = AtomicU64::new(0);
+
 /// setter for the group-commit request cap. First-call-wins.
 /// `[1, 1_000_000]` clamp matches the legacy env-default behavior.
 pub fn set_max_write_batch(n: usize) -> bool {
@@ -166,6 +177,21 @@ fn flush_test_paused() -> bool {
 /// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
 pub fn flush_commit_count() -> u64 {
     FLUSH_COMMITS.load(Ordering::Relaxed)
+}
+/// Test sync-point control — see `WRITE_PHASE3_PAUSE`. Only tests call this.
+pub fn set_write_phase3_pause(paused: bool) {
+    WRITE_PHASE3_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn write_phase3_paused() -> bool {
+    WRITE_PHASE3_PAUSE.load(Ordering::Relaxed)
+}
+/// Number of Phase-3 inserts currently/previously PARKED on the pause. Tests
+/// poll this to know a held write is seq-assigned but not yet in the memtable.
+pub fn write_phase3_parked_count() -> u64 {
+    WRITE_PHASE3_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_write_phase3_parked() {
+    WRITE_PHASE3_PARKED.fetch_add(1, Ordering::Relaxed);
 }
 pub fn set_shutdown_timeout_ms(n: u64) -> bool {
     SHUTDOWN_TIMEOUT_MS_CELL
@@ -843,6 +869,16 @@ pub(crate) struct PartitionData {
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
     seq_number: u64,
+    /// User keys with a write in the WAL pipeline — seq assigned (Phase 1,
+    /// `start_write_batch`) but NOT yet in the memtable (Phase 3,
+    /// `finish_write_batch`). Keyed by a 64-bit hash of the user key, refcounted
+    /// for concurrent same-key writes. GC value-relocation consults this so it
+    /// never relocates the OLD value of a key whose NEWER write is
+    /// seq-assigned-but-not-yet-committed: Phase 1 already bumped `seq_number`,
+    /// so GC's relocation seq would be HIGHER and shadow that write (a silent
+    /// lost-update — `system_gc_inflight_wal_put`). A hash collision only costs a
+    /// spurious GC-round abort (safe, retried). Maintained on the hot write path.
+    inflight_write_keys: HashMap<u64, u32>,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -5711,6 +5747,7 @@ async fn partition_thread_main(
         compact_tx,
         gc_tx,
         seq_number: max_seq,
+        inflight_write_keys: HashMap::new(),
         log_stream_id,
         row_stream_id,
         meta_stream_id,

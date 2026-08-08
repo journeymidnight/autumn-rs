@@ -768,6 +768,25 @@ comes from the single source of truth `wal_record::value_offset_in_record` (V1
 `22+key_len` / V0 `17+key_len`). Recovery's VP reconstruction (`lib.rs`) uses the
 SAME helper. `crates/manager/tests/system_gc_multiversion_same_extent.rs`.
 
+INVARIANT (GC never relocates a key with an in-flight WAL write): the liveness
+lookup sees only the memtable + SSTs, but the write pipeline is 3-phase — Phase 1
+`start_write_batch` bumps `seq_number` + encodes the WAL record, Phase 2
+`append_batch` makes it durable, Phase 3 `finish_write_batch` inserts it into the
+memtable. A Put/Delete between Phase 1 and Phase 3 is seq-ASSIGNED but NOT yet in
+the memtable → invisible to the lookup. Because Phase 1 already bumped
+`seq_number`, GC's relocation seq (`seq_number += 1`) would be HIGHER and shadow
+that write (silent lost-update / a Delete would resurrect the value). So the write
+path maintains `PartitionData.inflight_write_keys` (a refcounted set of 64-bit
+`inflight_key_hash(user_key)`, add in Phase 1 under the seq-assign borrow, release
+in Phase 3 under the memtable-insert borrow — no await between insert and release,
+so every key is always in EITHER the memtable OR the set), and `process_gc_chunk`,
+after the VP-identity match and before the seq allocation, ABORTS the extent's GC
+round (Err — no relocation, no punch; retried next tick) if the key is in the set.
+Aborting (not skipping) is required: the in-flight write may never commit, so the
+scanned value could stay live and must not be punched. A hash collision only costs
+a spurious abort (safe). Cost is ~a couple HashMap ops + one FNV hash per key on
+the hot write path. `crates/manager/tests/system_gc_inflight_wal_put.rs`.
+
 **`run_gc` for one extent (streaming)**:
 ```
   0. Multi-frag rewrite pre-pass
