@@ -1,4 +1,27 @@
 Date: 2026-08-05
+TaskStatus: not_completed
+Task scope: EN 写路径 owner-model 重写（用户拍板 big-bang 新写、只重写 EN、fable 设计+评审过）。
+  分多个 gated 步逐步推进；本 loop「按节奏逐步完成」。设计草案 scratchpad/en_actor_design.md
+  (v2, fable 评审)；基线 scratchpad/en_bench_baseline.md。
+
+── Step 1 done + committed（owner 路由 appends）──
+  一个 per-extent owner task（懒启停、mailbox=queue+running 镜像 coalescer 无 lost-wake 生命
+  周期、排空即退出不 pin extent）成为 append 的唯一串行写者。两个 append 入口（批处理帧路径 +
+  chain 本地 append）改发 Append 消息给 owner；owner 排空 burst 跑迁移来的 append_burst_frames
+  （原 build_append_future 改名），逐 slot 帧经 oneshot 路由回；chain forward 仍留 conn。
+  无 wire 改动。coalescer 本步仍作 fsync 机制；per-await seal/fence 复检 + offset 预留也留
+  （seal/truncate/fence 还并发，下一步搬进 owner 才删）。
+  门：stream lib 114/114；append_bench errs=0 depth-scaling 保持（depth4/8/64 更高）；
+  G2 130/130 durable + recovery 干净；system_putstream 7/7 真集群 append e2e。
+
+── 剩余步骤 ──
+  Step 2: seal/truncate/fence 搬进 owner → 删 per-await 复检 + op-lock。
+  Step 3: 长 op（delete/re_avali/convert/EC-shard/copy-meta）staging + 短 commit 消息进 owner。
+  Step 4: 内联 append_burst_frames 的 fsync + 删 coalescer + 删 offset 预留；最终 A/B。
+  每步过门（stream 测试 + G2 + 相关集成/chaos EC-delete）才 commit。
+
+─────────────────────────────────────────────────────────────────
+Date: 2026-08-05
 TaskStatus: completed
 Task scope: close 两个"几乎完工"feature（用户"先把几乎完工的 close 了，不需要 coco review"）。
   重跑验收（树在 G1/G5/G2 后动过 wire/stream/PS）确认仍绿，再按规则从 feature_list 删除：

@@ -95,5 +95,56 @@ fn main() {
         println!("  ops/s:   {ops_sec:.0}");
         println!("  MB/s:    {mb_sec:.1}");
         println!("  lat:     {lat_us:.1} us/op");
+
+        // Pipelined depth sweep — this is the dimension the write-path rewrite
+        // touches (coalescer batching + concurrent pwrite). Fresh extent per
+        // depth, in-order commits (RpcClient's single writer_task serialises
+        // sends, so a sliding-window FuturesUnordered still delivers appends in
+        // commit order == extent.len; errors are counted to catch any reorder).
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let pipe_ops = 50_000u64;
+        println!("=== pipelined depth sweep (4KB, fresh extent per depth) ===");
+        for depth in [1usize, 4, 8, 16, 32, 64] {
+            let eid = 100u64 + depth as u64;
+            {
+                let payload = rkyv_encode(&AllocExtentReq { extent_id: eid });
+                client.call(MSG_ALLOC_EXTENT, payload).await.unwrap();
+            }
+            let mut errs = 0u64;
+            let start = Instant::now();
+            let mut inflight = FuturesUnordered::new();
+            let mut issued = 0u64;
+            let mk = |i: u64| {
+                AppendReq {
+                    extent_id: eid,
+                    eversion: 1,
+                    commit: i * payload.len() as u64,
+                    owner_epoch: 1,
+                    payload: payload.clone(),
+                }
+                .encode()
+            };
+            while issued < depth as u64 && issued < pipe_ops {
+                inflight.push(client.call(MSG_APPEND, mk(issued)));
+                issued += 1;
+            }
+            while let Some(r) = inflight.next().await {
+                if r.is_err() {
+                    errs += 1;
+                }
+                if issued < pipe_ops {
+                    inflight.push(client.call(MSG_APPEND, mk(issued)));
+                    issued += 1;
+                }
+            }
+            let el = start.elapsed();
+            let ops_sec = pipe_ops as f64 / el.as_secs_f64();
+            let mb_sec =
+                (pipe_ops as f64 * payload.len() as f64) / (1024.0 * 1024.0) / el.as_secs_f64();
+            let lat = el.as_micros() as f64 / pipe_ops as f64;
+            println!(
+                "  depth={depth:<3} {ops_sec:>8.0} ops/s  {mb_sec:>7.1} MB/s  {lat:>7.1} us/op  errs={errs}"
+            );
+        }
     });
 }

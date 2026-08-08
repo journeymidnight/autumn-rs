@@ -1136,6 +1136,15 @@ pub(crate) struct ExtentEntry {
     pub(crate) disk_id: u64,
     /// Phase 1: per-extent fsync coalescer state.
     pub(crate) coalescer: Coalescer,
+    /// [owner-model] this extent's per-extent owner mailbox. Mirrors the
+    /// coalescer's proven queue+wake+exit-when-idle lifecycle (fable P2-5): the
+    /// message `queue` AND the "task running" `wake_tx` live under ONE RefCell so
+    /// enqueue/spawn and drain/exit are atomic on the single-threaded runtime
+    /// (no lost-wake). The owner holds a strong `Rc<ExtentEntry>` while running
+    /// but EXITS when the queue drains (dropping the Rc) so it never pins a
+    /// sealed/idle extent past eviction. WIP: read by the owner wiring.
+    #[allow(dead_code)]
+    pub(crate) owner: RefCell<OwnerMailbox>,
     /// META-FAILCLOSED: set true at load time when the `.meta` sidecar is
     /// PRESENT but CORRUPT (CRC/magic/extent_id invalid — bit rot / torn
     /// write / power loss) while the `.dat` still exists. A corrupt `.meta`
@@ -2035,10 +2044,42 @@ async fn process_frames_backpressured(
             // reservation) so a pushed batch never stalls waiting to drain.
             backpressure!();
 
-            // Run ACL + build I/O future synchronously up to the pwritev
-            // await. Early rejection paths resolve immediately (no I/O).
-            let fut = build_append_future(node.clone(), extent, slots).await;
-            inflight.push(fut);
+            // [owner-model] route the append burst through this extent's owner
+            // task (the sole serial writer). Each slot becomes an Append message;
+            // the per-slot response frames come back on oneshots and are gathered
+            // (in slot order) into the same Vec<Bytes> the FU expected before.
+            let items: Vec<(u32, futures::channel::oneshot::Receiver<Bytes>)> = slots
+                .into_iter()
+                .map(|slot| {
+                    let req_id = slot.req_id;
+                    let (tx, rx) = futures::channel::oneshot::channel::<Bytes>();
+                    send_to_owner(
+                        &node,
+                        &extent,
+                        ExtentMsg::Append {
+                            req: slot.req,
+                            req_id,
+                            resp: tx,
+                        },
+                    );
+                    (req_id, rx)
+                })
+                .collect();
+            inflight.push(Box::pin(async move {
+                let mut out = Vec::with_capacity(items.len());
+                for (req_id, rx) in items {
+                    match rx.await {
+                        Ok(frame) => out.push(frame),
+                        Err(_) => out.push(err_bytes(
+                            req_id,
+                            MSG_APPEND,
+                            StatusCode::Internal,
+                            "owner dropped append response",
+                        )),
+                    }
+                }
+                out
+            }));
         } else if msg_type == MSG_APPEND_CHAIN {
             // chained append. One frame, one future (no same-extent
             // grouping: chained payloads are >= 64 KiB, pwritev coalescing
@@ -2085,10 +2126,29 @@ async fn process_frames_backpressured(
                 // Non-blocking ordered enqueue — see chain_forward_enqueue.
                 Some(node.chain_forward_enqueue(&chain[0], vec![prefix, append_bytes.clone()]))
             };
-            let local_fut =
-                build_append_future(node.clone(), extent, vec![AppendSlot { req, req_id }]).await;
+            // [owner-model] the LOCAL append goes through the owner (serial
+            // writer); the downstream forward stays here on the conn task and is
+            // joined below, exactly as before.
+            let (local_tx, local_rx) = futures::channel::oneshot::channel::<Bytes>();
+            send_to_owner(
+                &node,
+                &extent,
+                ExtentMsg::Append {
+                    req,
+                    req_id,
+                    resp: local_tx,
+                },
+            );
             inflight.push(Box::pin(async move {
-                let local_bytes = local_fut.await;
+                let local_bytes = vec![match local_rx.await {
+                    Ok(f) => f,
+                    Err(_) => err_bytes(
+                        req_id,
+                        MSG_APPEND,
+                        StatusCode::Internal,
+                        "owner dropped append response",
+                    ),
+                }];
                 let fwd_ok: Result<(), ChainFail> = match fwd_rx {
                     None => Ok(()),
                     Some(rx_back) => match rx_back.await {
@@ -2308,6 +2368,76 @@ struct ReadSlot {
     req_id: u32,
 }
 
+// ==================================================================
+// [owner-model] per-extent owner task — interface types (WIP, step 1).
+//
+// One owner task per RESIDENT extent owns the fd + ALL mutations. Every mutation
+// is an `ExtentMsg`, processed ONE AT A TIME, so mutations are STRUCTURALLY
+// serialized. This lets a later step delete: the op-lock (get_or_create_extent_op_lock),
+// the meta_write_lock, the synchronous offset reservation, the fsync coalescer,
+// and the per-await seal/fence/fd-evict re-checks (their whole job is catching
+// concurrent mutators, which structural serialization makes impossible).
+//
+// DIRECTION (validated while reading the code): the append handling is modelled
+// on `handle_append`'s INLINE logic (prologue → pwrite → fence-recheck → advance
+// len AFTER fsync), NOT `build_append_future`'s two-phase reserve+io-future — that
+// machinery exists only to make CONCURRENT same-extent pwrites safe, and the
+// single owner has no concurrency, so `build_append_future` gets DELETED. Within
+// one drained burst the owner runs a LOCAL write cursor (advances per append)
+// while the durable `extent.len`/`last_synced` advance only after the burst's ONE
+// `sync_data` (snapshot-before-fsync group commit, replacing the coalescer). Reads
+// stay lock-free (clone `ExtentEntry.file`); the owner clones the fd per burst and
+// drops it on park → still gates `fd_evictable`.
+// ==================================================================
+
+/// A message to a per-extent owner task. The `resp` oneshot carries the handler
+/// result back to the ps-conn task, which batches the encoded frame into its
+/// existing vectored write (response batching stays on the conn).
+#[allow(dead_code)] // WIP: wired in a later step
+pub(crate) enum ExtentMsg {
+    /// Append under the commit==extent.len ordering + owner_epoch fence.
+    Append {
+        req: AppendReq,
+        req_id: u32,
+        /// The owner sends back the ENCODED response frame (Frame::response or
+        /// Frame::error), matching the old build_append_future output, so the
+        /// ps-conn task batches it into its existing vectored write unchanged.
+        resp: futures::channel::oneshot::Sender<Bytes>,
+    },
+    // Later steps add: Truncate, Seal, FencePersist (the interleaving set that
+    // must move together with Append), plus the SHORT commit messages of the
+    // staged long ops (ReAvaliCommit / ConvertCommit / EcShardCommit / Delete /
+    // CopyMetaApply). SyncedLen / CommitLength are NOT messages — they stay
+    // lock-free atomic reads of `last_synced` (fable P1-3).
+}
+
+/// State that ONLY the owner task may name/mutate (typed confinement, fable
+/// DB-1): a mutator that is not routed through the owner is then a compile
+/// error, not a latent race. NB: the fd is deliberately NOT here — it stays in
+/// `ExtentEntry.file: RefCell<Rc<CompioFile>>` so lock-free reads and fd-LRU
+/// eviction keep working (fable P1-4); the owner clones it per burst.
+#[allow(dead_code)] // WIP: fields firm up with the owner_loop body (next step)
+struct OwnerState {
+    /// Burst-local write cursor: the next pwrite offset. Seeded from the durable
+    /// `extent.len` at loop entry; advances per append within a burst; the
+    /// durable `extent.len` is bumped to it only AFTER the burst's fsync.
+    write_cursor: u64,
+}
+
+/// Owner mailbox state (under `ExtentEntry.owner`'s RefCell). `queue` is the
+/// pending messages; `running` is true iff an owner task is live. The owner
+/// never PARKS (it processes a burst synchronously, and messages that arrive
+/// after it drains simply respawn it), so unlike the coalescer it needs no wake
+/// channel — a plain `running` flag suffices. Lost-wake-free by the same
+/// single-thread argument: enqueue (`send_to_owner`) and the owner's exit
+/// re-check both mutate this RefCell with NO await inside the borrow, so a
+/// message never lands in a queue the exiting owner won't drain.
+#[derive(Default)]
+pub(crate) struct OwnerMailbox {
+    queue: Vec<ExtentMsg>,
+    running: bool,
+}
+
 /// Encode a single error-response frame (`Frame::error` + `encode_status`).
 fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     Frame::error(
@@ -2442,7 +2572,93 @@ fn batch_append_reject(
 /// so a subsequent submit to the same extent sees the advanced len. The
 /// returned future then calls `write_vectored_at` with pwritev at the
 /// reserved offset.
-async fn build_append_future(
+// ==================================================================
+// [owner-model] per-extent owner task (step 2: append path).
+// ==================================================================
+
+/// Enqueue `msg` to `extent`'s owner mailbox, lazily spawning the owner task if
+/// none is running. Mirrors `register_sync_waiter`'s spawn coordination. The
+/// `borrow_mut` block has NO await, so on the single-threaded runtime the
+/// enqueue+spawn decision is atomic vs `owner_loop`'s exit re-check — a message
+/// never lands in a queue an exiting owner will not drain.
+fn send_to_owner(node: &ExtentNode, extent: &std::rc::Rc<ExtentEntry>, msg: ExtentMsg) {
+    let spawn = {
+        let mut mb = extent.owner.borrow_mut();
+        mb.queue.push(msg);
+        if mb.running {
+            false
+        } else {
+            mb.running = true;
+            true
+        }
+    };
+    if spawn {
+        let node2 = node.clone();
+        let ext2 = std::rc::Rc::clone(extent);
+        en_spawn_failstop("en_owner".to_string(), owner_loop(node2, ext2));
+    }
+}
+
+/// Per-extent owner task. Drains the mailbox in bursts and processes each burst
+/// as ONE group commit via `append_burst_frames` (the relocated
+/// `build_append_future` body). Exits when the queue drains — dropping its
+/// `Rc<ExtentEntry>` so a sealed/idle extent is never pinned past eviction;
+/// `send_to_owner` respawns on the next message. Lost-wake-free exit: see
+/// `OwnerMailbox`.
+async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
+    loop {
+        let burst: Vec<ExtentMsg> = {
+            let mut mb = extent.owner.borrow_mut();
+            std::mem::take(&mut mb.queue)
+        };
+        if burst.is_empty() {
+            // Exit re-check under ONE borrow (no await): if the queue is still
+            // empty, clear `running` and exit; else a message arrived between the
+            // take above and here — loop and drain it.
+            let exit = {
+                let mut mb = extent.owner.borrow_mut();
+                if mb.queue.is_empty() {
+                    mb.running = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if exit {
+                return;
+            }
+            continue;
+        }
+        // Step 2 handles only Append; later steps add Truncate/Seal/Fence/commits.
+        // Order is preserved (mailbox is FIFO push→take), so slots stay in
+        // commit order == extent.len — the append_burst_frames prologue relies on it.
+        let mut slots: Vec<AppendSlot> = Vec::with_capacity(burst.len());
+        let mut resps: Vec<futures::channel::oneshot::Sender<Bytes>> =
+            Vec::with_capacity(burst.len());
+        for msg in burst {
+            match msg {
+                ExtentMsg::Append { req, req_id, resp } => {
+                    slots.push(AppendSlot { req, req_id });
+                    resps.push(resp);
+                }
+            }
+        }
+        // Relocated build_append_future logic (still two-phase: prologue reserves
+        // extent.len synchronously, then the returned future does pwrite+fsync).
+        // The owner awaits both phases inline; being the SOLE writer, the
+        // reservation is harmless (a later cleanup step flattens it + inlines the
+        // fsync once seal/truncate/fence also move into the owner).
+        let frames = append_burst_frames(node.clone(), std::rc::Rc::clone(&extent), slots)
+            .await
+            .await;
+        // Per-slot frames in slot order == resps order.
+        for (frame, resp) in frames.into_iter().zip(resps.into_iter()) {
+            let _ = resp.send(frame);
+        }
+    }
+}
+
+async fn append_burst_frames(
     node: ExtentNode,
     extent: std::rc::Rc<ExtentEntry>,
     slots: Vec<AppendSlot>,
@@ -3800,6 +4016,7 @@ impl ExtentNode {
                         durable_owner_epoch: AtomicI64::new(meta.owner_epoch),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
+                        owner: RefCell::new(OwnerMailbox::default()),
                         corrupt_meta: AtomicBool::new(corrupt_meta),
                     }),
                 );
@@ -4398,6 +4615,7 @@ impl ExtentNode {
                 durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
+                owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
             }),
         );
@@ -6430,6 +6648,7 @@ impl ExtentNode {
                 durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
+                owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
             }),
         );
