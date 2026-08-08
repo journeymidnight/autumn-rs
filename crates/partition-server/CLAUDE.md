@@ -787,6 +787,38 @@ scanned value could stay live and must not be punched. A hash collision only cos
 a spurious abort (safe). Cost is ~a couple HashMap ops + one FNV hash per key on
 the hot write path. `crates/manager/tests/system_gc_inflight_wal_put.rs`.
 
+Timing — the in-flight set and the post-await re-check are COMPLEMENTARY; neither
+subsumes the other. A write moves through: Phase 1 (seq assigned + `set.add`) →
+Phase 3 (memtable insert + `set.remove`) → later flushed into a new SST. GC's
+verdict can land at any point, and the guard that catches it depends on where the
+write is (`V_old@5` is the value GC scans; the racing Put is `K = V_new`):
+
+```
+Case A — Put still in the WAL pipeline → the in-flight SET fires:
+ GC (background_maintenance_loop)                partition_loop (Put K = V_new)
+  T1 lookup_in_sst_via(K).await ── yields ─────▶ Phase 1: seq 5→6; inflight_write_keys.add(hash K)
+                                                 Phase 2: append (durable); Phase 3 PENDING
+  T3 resume; re-check: appeared_in_mem = FALSE   (K not in the memtable yet)
+     VP-identity: live VP == (E,O,L) → MATCH
+  T4 in-flight guard: set.has(hash K) → YES
+     ⇒ Err, ABORT the extent round               Phase 3: insert K@6=V_new; set.remove(hash K)
+     (no seq alloc, no relocate, no punch; retried next tick)
+
+Case B — Put finished during the await → the RE-CHECK fires:
+  T1 lookup_in_sst_via(K).await ── yields ─────▶ Phase 1→2→3 all run: insert K@6=V_new
+                                                 (set add THEN remove → now in memtable, not in set)
+  T3 resume; re-check: appeared_in_mem = TRUE ⇒ continue
+     retry: mem branch finds K@6=V_new; VP-identity: V_new ≠ scanned V_old → skip (V_old is dead)
+```
+
+INVARIANT (no gap): Phase 3 does `insert` then `set.remove` under ONE borrow with
+NO await between them, so at every instant K is in EITHER the set (Phase 1→3) OR
+the memtable (post-Phase 3) — never neither. A GC verdict landing before Phase 3
+is caught by the set (Case A); one landing after is caught by the re-check
+(Case B). Deleting the re-check re-opens Case B; the set alone can't (it's cleared
+at Phase 3). The pre-fix bug was the missing Case A: at T4, GC did
+`seq_number += 1 → 7` and relocated `V_old` at seq 7, shadowing `K@6 = V_new`.
+
 **`run_gc` for one extent (streaming)**:
 ```
   0. Multi-frag rewrite pre-pass
