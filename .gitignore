@@ -41,5 +41,9 @@ perf_baseline*.json
 
 # Tooling caches / generated lockfiles for nested crates
 .codex
-/python/Cargo.lock
+# python/Cargo.lock IS committed and pinned: the `autumn` PyO3 client links the
+# same wire crates as the core, so its rkyv family MUST match the core's root
+# Cargo.lock or the vllm/hermes native client silently drifts to a different
+# rkyv patch (0.8.17 vs core's 0.8.15) → same wire fingerprint, incompatible
+# bytes → `rkyv decode: failed` on EN-direct reads. Keep them in lockstep.
 .skillopt-sleep/
