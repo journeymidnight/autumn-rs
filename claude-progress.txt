@@ -1,6 +1,14 @@
 Date: 2026-08-11
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: 修复 autumn_kvcache 的 KV-load bug —— 线上 7B 对 hermes 固定长 prefix 输出 garbage。
+End-to-end 验证（2026-08-11）: 修复已合入 main（024cb00）并全集群停机重部到 024cb00。
+  vllm 加载权重（direct_read=false 绕过 024cb00 vllm 镜像 EN-direct read 的构建 wire 坏点）、
+  输出连贯、KV key 变 qwen7b_<fp>_0_1。换 Qwen2.5-Coder-7B-Instruct-AWQ（同架构同 tokenizer、
+  仅权重不同）后拿到独立 key qwen-coder7b_<fp>_0_1（171 vs 29 keys 两 tenant 共存不串读），
+  coder 输出连贯且代码风格 → 原 7B/32B 串读 bug 确认修复。hermes mem round-trip OK。
+遗留（另立项）: 024cb00 vllm-autumn 镜像 native 客户端 EN-direct read（direct_read=true）
+  wire 坏（构建不可重现，非 python 改动；89a429a 是好的）—— 现用 direct_read=false 绕过，
+  只影响权重加载速度。下次重建 vllm 时验证 EN-direct 是否恢复；根因疑似 rkyv/依赖未 pin 的构建漂移。
 Current summary: 根因两条，均已改代码 + 单测（47 passed，本地 uv run pytest）:
   1) BUG-KVC-LOAD-ATOMIC（fail-open external KV load）: vllm_connector.start_load_kv 改
      all-or-nothing（len(oks)==len(layers) and all(oks) 才注入，否则一层不注入）+ 记录失败
