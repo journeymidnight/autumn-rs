@@ -380,6 +380,10 @@ class _ReqMeta:
     # full block-aligned prefix; used to gather/scatter the paged KV tensor.
     slot_mapping: Any  # torch.Tensor at runtime
     is_store: bool
+    # The vLLM block-pool ids backing slot_mapping. Kept so a fail-closed load
+    # (BUG-KVC-LOAD-ATOMIC) can report exactly these blocks via
+    # get_block_ids_with_load_errors() → vLLM re-runs normal prefill for them.
+    block_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -388,8 +392,17 @@ class AutumnConnectorMetadata(KVConnectorMetadata):  # type: ignore[misc]
 
     requests: List[_ReqMeta] = field(default_factory=list)
 
-    def add(self, req_id: str, content_hash: str, slot_mapping: Any, is_store: bool) -> None:
-        self.requests.append(_ReqMeta(req_id, content_hash, slot_mapping, is_store))
+    def add(
+        self,
+        req_id: str,
+        content_hash: str,
+        slot_mapping: Any,
+        is_store: bool,
+        block_ids: Optional[List[int]] = None,
+    ) -> None:
+        self.requests.append(
+            _ReqMeta(req_id, content_hash, slot_mapping, is_store, list(block_ids or []))
+        )
 
 
 # ── torch helpers (worker side, vLLM runtime only) ──────────────────────────
@@ -602,6 +615,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._kv_caches: dict = {}
         self._layer_order: List[str] = []
         self._meta: Optional[AutumnConnectorMetadata] = None
+        # Blocks whose external KV load failed this step (BUG-KVC-LOAD-ATOMIC).
+        # start_load_kv fills this fail-closed (it injects NO KV for a request
+        # with any missing layer); get_block_ids_with_load_errors drains it so
+        # vLLM re-runs normal prefill for those tokens instead of decoding on
+        # half-loaded / uninitialised paged KV.
+        self._load_failed_block_ids: set = set()
         # Async save (see _MAX_INFLIGHT_SAVES). save_kv_layer only does the cheap
         # GPU-side gather (`_extract_layer` → a standalone tensor) and accumulates
         # it here (req_id -> [(layer_name, gpu_tensor)]); wait_for_save hands a
@@ -696,7 +715,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                     req_id, "store" if is_store else "load", num_tokens, len(block_ids),
                 )
                 continue
-            meta.add(req_id, chash, slots, is_store=is_store)
+            meta.add(req_id, chash, slots, is_store=is_store, block_ids=block_ids)
         return meta
 
     def request_finished(self, request: Any, block_ids: List[int]):
@@ -771,30 +790,39 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 templates.append(template)
                 stagings.append(np.empty(template.numel() * template.element_size(), dtype=np.uint8))
             oks = self._store.load_layers(rm.content_hash, layer_names, stagings)
-            for layer_name, template, staging, ok in zip(layer_names, templates, stagings, oks):
-                if not ok:
-                    # Anomalous: this request was admitted because the scheduler
-                    # saw the `__present__` marker, so every layer should be
-                    # present. Diagnose by what is actually POSSIBLE given the
-                    # config: at ttl=0 expiry is impossible, so a miss points at a
-                    # tenant/model identity collision (a DIFFERENT model wrote this
-                    # tenant) or a backend fault; with a TTL, a grace breach is
-                    # also possible. The position keeps its (uninitialised) paged
-                    # KV; surface it loudly rather than swallowing at debug.
-                    causes = (
-                        "possible TTL grace breach, tenant/model identity "
-                        "mismatch, or backend fault"
-                        if self._store.marker_ttl > 0
-                        else "ttl=0 rules out expiry — likely a tenant/model "
-                        "identity mismatch (a DIFFERENT model/engine wrote this "
-                        "tenant) or a backend fault"
-                    )
-                    log.warning(
-                        "external KV load miss after positive presence: req=%s "
-                        "layer=%s tenant=%s (prefix partially uncached — %s)",
-                        rm.req_id, layer_name, self._store.tenant, causes,
-                    )
-                    continue
+            if not (len(oks) == len(layer_names) and all(oks)):
+                # FAIL-CLOSED (BUG-KVC-LOAD-ATOMIC). This request was admitted
+                # because the scheduler saw the `__present__` marker, so every
+                # layer should be loadable — but at least one is not. Injecting
+                # only the layers that DID load leaves the rest holding
+                # uninitialised paged KV: the request would decode on a mix of
+                # loaded + garbage KV and silently emit wrong tokens (the live
+                # `external KV load miss after positive presence` incident).
+                # Inject NOTHING for this request and report its blocks so vLLM
+                # re-runs normal prefill (recompute) for them.
+                #
+                # Diagnose by what the config makes POSSIBLE: at ttl=0 expiry is
+                # impossible, so a miss points at a tenant/model identity
+                # collision (a DIFFERENT model wrote this tenant) or a backend
+                # fault; with a TTL a grace breach is also possible.
+                causes = (
+                    "possible TTL grace breach, tenant/model identity mismatch, "
+                    "or backend fault"
+                    if self._store.marker_ttl > 0
+                    else "ttl=0 rules out expiry — likely a tenant/model identity "
+                    "mismatch (a DIFFERENT model/engine wrote this tenant) or a "
+                    "backend fault"
+                )
+                n_missing = sum(1 for ok in oks if not ok) + (len(layer_names) - len(oks))
+                log.warning(
+                    "external KV load miss after positive presence: req=%s tenant=%s "
+                    "missing=%d/%d layers (prefix partially uncached — %s) — failing "
+                    "closed: injecting no KV, re-running prefill for its blocks",
+                    rm.req_id, self._store.tenant, n_missing, len(layer_names), causes,
+                )
+                self._load_failed_block_ids.update(rm.block_ids)
+                continue
+            for layer_name, template, staging in zip(layer_names, templates, stagings):
                 kv_layer = self._kv_caches[layer_name]
                 value = torch.from_numpy(staging).view(template.dtype).reshape(template.shape)
                 _inject_layer(kv_layer, value, rm.slot_mapping, self._is_mla, self._block_size)
@@ -802,6 +830,19 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
     def wait_for_layer_load(self, layer_name: str) -> None:
         # Phase 3a loads synchronously in start_load_kv; nothing to await.
         return None
+
+    def get_block_ids_with_load_errors(self) -> set:
+        """Blocks whose external KV load failed this step → vLLM re-runs prefill.
+
+        BUG-KVC-LOAD-ATOMIC fail-closed path: for any request with a missing
+        layer, `start_load_kv` injected NOTHING and recorded its blocks here.
+        Returning them tells vLLM to recompute those tokens instead of decoding
+        on uninitialised paged KV. Drain (return-and-clear) so each forward step
+        reports only the load errors it produced.
+        """
+        failed = self._load_failed_block_ids
+        self._load_failed_block_ids = set()
+        return failed
 
     def save_kv_layer(self, layer_name: str, kv_layer: "torch.Tensor", attn_metadata: Any, **kwargs: Any) -> None:
         meta = self._meta

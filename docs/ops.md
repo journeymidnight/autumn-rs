@@ -964,12 +964,27 @@ The namespace-side counterpart is `namespace-list` (registry rows: name / prefix
 
 ## autumn-kvcache tenant / model identity (BUG-KVC-TENANT)
 
-vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...` — the
-12-hex fingerprint carries the model's real identity (arch shape + weights
-source + optional `model_id`; see `python/autumn_kvcache/autumn_kvcache/_identity.py`).
-Without it, every model served via `autumn_vllm_loader`'s fixed local config
-dir shared ONE tenant and cross-read KV (live 2026-07: Qwen2.5-7B/32B both
-under `kvc/model-cfg_0_1/`). The fingerprint also folds in the two **layout
+vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...`. The
+`{model}` segment is the autumn **weights-path basename** (e.g. `qwen7b` from
+`model_loader_extra_config.path=models/qwen7b`), NOT the constant `/model-cfg`
+config dir that every `autumn_vllm_loader` model shares — so the readable
+segment ALONE distinguishes models even if the fingerprint ever degrades
+(2026-08-11: keys now read `qwen7b_<fp>_0_1`, not the old collision-prone
+`model-cfg_<fp>_0_1`). The 12-hex fingerprint carries the model's real identity
+(arch shape + weights source + optional `model_id`; see
+`python/autumn_kvcache/autumn_kvcache/_identity.py`). Before both, every model
+served via the fixed local config dir shared ONE tenant and cross-read KV
+(live 2026-07: Qwen2.5-7B/32B both under `kvc/model-cfg_0_1/`).
+
+**Load is fail-closed (BUG-KVC-LOAD-ATOMIC, 2026-08-11).** When the scheduler
+admits a request on the `__present__` marker but the worker cannot load EVERY
+layer (TTL grace breach / tenant mismatch / backend fault), the connector now
+injects NO KV for that request and reports its blocks via
+`get_block_ids_with_load_errors()` so vLLM re-runs normal prefill. Previously it
+injected the layers that loaded and skipped the rest → the request decoded on a
+mix of loaded + uninitialised paged KV and emitted **silent garbage** (the live
+symptom: `external KV load miss after positive presence` on layer 0..N). If you
+see that warning now it is followed by a recompute, not a wrong answer. The fingerprint also folds in the two **layout
 versions** — the running vLLM version (full `x.y.z`) and the connector's own
 `VLLM_KV_STORAGE_FORMAT` (`_keys.py`) — so the same model on a
 layout-incompatible stack never shares a tenant. Operational consequence:
@@ -994,7 +1009,7 @@ cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_ten
 
 # Manual verify on a live deployment: the connector logs its tenant + identity
 # sources at startup — two DIFFERENT models must log two different tenants:
-#   AutumnKVConnector role=... tenant=model-cfg_<fp>_0_1 ... identity={'layers': 64, ...}
+#   AutumnKVConnector role=... tenant=qwen7b_<fp>_0_1 ... identity={'layers': 28, ...}
 # and the stored keys must not share a tenant prefix:
 #   (autumn-client / python) list keys under kvc/ — one prefix per model.
 

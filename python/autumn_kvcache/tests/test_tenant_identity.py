@@ -113,8 +113,27 @@ def test_live_incident_7b_vs_32b_same_path_different_tenant():
     t7 = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/qwen7b"))
     t32 = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_32B), weights_path="models/qwen32b"))
     assert t7 != t32
-    # both still carry the readable model segment
-    assert t7.startswith("model-cfg_") and t32.startswith("model-cfg_")
+    # The readable model segment now comes from the weights-path BASENAME, so it
+    # ALONE distinguishes the two models — no longer the constant, useless
+    # `model-cfg` (which was the collision surface); the fingerprint still rides
+    # along after it.
+    assert t7.startswith("qwen7b_") and t32.startswith("qwen32b_")
+    assert "model-cfg" not in t7 and "model-cfg" not in t32
+
+
+def test_vllm_tenant_uses_weights_path_basename_not_config_dir():
+    """Key must be concise AND effective: the model segment is the autumn
+    weights-path BASENAME (per-model unique), never the constant `/model-cfg`
+    config-dir every autumn_vllm_loader model shares (the old collision surface)."""
+    t = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/qwen7b"))
+    assert t.startswith("qwen7b_")
+    assert "model-cfg" not in t
+    # a nested / trailing-slash path collapses to just the basename (concise)
+    t2 = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="/a/b/qwen7b/"))
+    assert t2.startswith("qwen7b_")
+    # no loader path (default loader) -> falls back to the config-dir model name
+    t3 = _tenant(fake_vllm_config(FakeModelConfig(model="/data/Llama-3-8B"), load_format="auto"))
+    assert t3.startswith("data_Llama-3-8B_")
 
 
 def test_same_arch_different_weights_path_different_tenant():
@@ -260,7 +279,7 @@ def test_vllm_tenant_keeps_tp_pp_semantics():
     tm = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B, use_mla=True),
                                   weights_path="models/q", tp_size=4, rank=2))
     assert not tm.endswith("_2_4")
-    assert tm != "model-cfg"  # fingerprint present
+    assert tm.startswith("q_") and tm != "q"  # weights-path basename + fingerprint
 
 
 def test_full_key_layout_with_fingerprint():
@@ -272,7 +291,7 @@ def test_full_key_layout_with_fingerprint():
     # the ClusterClient prepends `kvc/` (scope locked by construction). Option 3
     # dropped the tenant segment, so full_key no longer takes one.
     key = full_key(model, "v1/deadbeef/model.layers.0", "vllm")
-    assert key.startswith(b"model-cfg_")  # relative: starts at the model segment
+    assert key.startswith(b"qwen32b_")  # relative: model segment = weights-path basename
     assert key.endswith(b"/vllm/v1/deadbeef/model.layers.0")
     # No namespace prefix in the relative key — the binding owns it.
     assert not key.startswith(b"kvc/")

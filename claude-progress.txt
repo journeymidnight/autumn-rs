@@ -1,3 +1,20 @@
+Date: 2026-08-11
+TaskStatus: not_completed
+Task scope: 修复 autumn_kvcache 的 KV-load bug —— 线上 7B 对 hermes 固定长 prefix 输出 garbage。
+Current summary: 根因两条，均已改代码 + 单测（47 passed，本地 uv run pytest）:
+  1) BUG-KVC-LOAD-ATOMIC（fail-open external KV load）: vllm_connector.start_load_kv 改
+     all-or-nothing（len(oks)==len(layers) and all(oks) 才注入，否则一层不注入）+ 记录失败
+     请求 block_ids；新增 override get_block_ids_with_load_errors() 上报让 vLLM 重算回退；
+     _ReqMeta 带 block_ids。单测 tests/test_load_atomic.py。
+  2) tenant key 简洁+有效: _identity.tenant_cfg_from_vllm 用 autumn weights-path basename
+     (qwen7b) 当 model 段，替代恒定无效的 /model-cfg → key 从 model-cfg_<fp>_... 变
+     qwen7b_<fp>_...；tests/test_tenant_identity.py 同步（44 passed）。
+  feature_list BUG-KVC-LOAD-ATOMIC passes:true。
+Main gaps: 仅代码+单测；线上端到端未验证（须 rebuild vllm-autumn 镜像 + 重部署 vllm + hermes
+  复测长 prefix 不再 garbage）。清 kvc 缓存治标（已做过一次，hermes 仍 garbage=活 bug 确认）。
+Next steps: 提交（分支）→ CP 重建 vllm-autumn → 重部署 vllm 到 .95 → hermes 发长 prefix 验证。
+
+── 更早（术语定版任务）──
 Date: 2026-07-30
 TaskStatus: not_completed
 Task scope: 【实现完成，仅欠 coco】术语定版 —— zc→bulk 全量改名 + P-bulk→P-sst 腾词。
