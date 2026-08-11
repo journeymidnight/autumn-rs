@@ -273,6 +273,20 @@ def tenant_cfg_from_vllm(vllm_config: Any):
     tp_rank = tp_size = pp_rank = pp_size = None
     try:
         model = getattr(getattr(vllm_config, "model_config", None), "model", None)
+        # On the autumn_vllm_loader path `model_config.model` is a CONSTANT local
+        # config-dir (e.g. /model-cfg) shared by every model served that way — it
+        # identifies nothing and made the tenant key `model-cfg_<fp>_...` (the
+        # BUG-KVC-TENANT collision surface + noise). Prefer the autumn weights
+        # path BASENAME (e.g. `qwen7b`): per-model unique, so the key is concise
+        # AND model-distinguishing (`qwen7b_<fp>_...`) even if the fingerprint
+        # hash ever degrades. The FULL path still feeds the fingerprint (see
+        # vllm_identity_sources) for same-basename / different-parent safety.
+        lc = getattr(vllm_config, "load_config", None)
+        mle = getattr(lc, "model_loader_extra_config", None) if lc is not None else None
+        if isinstance(mle, dict):
+            wpath = mle.get("path")
+            if wpath:
+                model = str(wpath).rstrip("/").split("/")[-1] or model
     except Exception:  # noqa: BLE001
         pass
     try:
