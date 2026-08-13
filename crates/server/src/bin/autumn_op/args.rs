@@ -770,9 +770,11 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                     }
                     // Convenience: mark the namespace PROTECTED with owner = T.
-                    // (Full --with-tenant principal-create wrapping is deferred
-                    // to a later sub-delivery — this only sets the owner marker.)
-                    "--with-tenant" => {
+                    // (Full principal-create wrapping is deferred to a later
+                    // sub-delivery — this only sets the owner marker.)
+                    // `--tenant` is the canonical spelling (matches split /
+                    // presplit / mint-token); `--with-tenant` kept as an alias.
+                    "--tenant" | "--with-tenant" => {
                         i += 1;
                         owner_tenant = Some(val(&raw, i).to_owned());
                         i += 1;

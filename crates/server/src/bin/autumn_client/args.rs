@@ -173,6 +173,33 @@ fn val(raw: &[String], i: usize) -> &str {
     }
 }
 
+/// Parse a byte-size value with an optional binary suffix (`4096`, `4k`, `8m`,
+/// `1gib`). Same grammar as `autumn-op`'s `gc --max-size`, so `--size` reads
+/// consistently across both CLIs; a plain integer is still accepted.
+fn parse_size(s: &str) -> usize {
+    let t = s.trim();
+    let split = t
+        .bytes()
+        .position(|b| !b.is_ascii_digit() && b != b'.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let num: f64 = num.parse().unwrap_or_else(|_| {
+        eprintln!("--size: invalid number {s:?}");
+        std::process::exit(2);
+    });
+    let mul: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        other => {
+            eprintln!("--size: unknown suffix {other:?} (use k/m/g)");
+            std::process::exit(2);
+        }
+    };
+    (num * mul).round() as usize
+}
+
 pub(crate) fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = String::from("127.0.0.1:9001");
@@ -432,14 +459,6 @@ pub(crate) fn parse_args() -> Args {
             let mut group_commit_cap: Option<usize> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--bulk" => {
-                        // removed. Zero-copy is now the DEFAULT on the
-                        // UCX transport (writes always; reads when value >=
-                        // BULK_MIN_BYTES). Kept as a no-op so existing
-                        // perf_check.sh / scripts don't hard-fail; on TCP it
-                        // stays the regular path. Same spirit as --nosync.
-                        warn_zc_flag_deprecated_once();
-                    }
                     "--threads" | "-t" => {
                         i += 1;
                         threads = val(&raw, i).parse().expect("--threads must be a number");
@@ -450,7 +469,7 @@ pub(crate) fn parse_args() -> Args {
                     }
                     "--size" => {
                         i += 1;
-                        value_size = val(&raw, i).parse().expect("--size must be a number");
+                        value_size = parse_size(val(&raw, i));
                     }
                     "--nosync" => {
                         warn_nosync_deprecated_once();
@@ -561,7 +580,7 @@ pub(crate) fn parse_args() -> Args {
                     }
                     "--size" => {
                         i += 1;
-                        value_size = val(&raw, i).parse().expect("--size must be a number");
+                        value_size = parse_size(val(&raw, i));
                     }
                     "--partitions" => {
                         i += 1;
@@ -645,18 +664,6 @@ fn warn_nosync_deprecated_once() {
             "[autumn-client] note: --nosync was removed (LevelDB-style \
              coalescing makes writes always durable). Flag ignored, behaviour \
              unchanged from --sync."
-        );
-    });
-}
-
-fn warn_zc_flag_deprecated_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        eprintln!(
-            "[autumn-client] note: --bulk was removed. Zero-copy is now \
-             the DEFAULT on --transport ucx: writes always; reads when value \
-             >= {} B. On --transport tcp the regular path is used. Flag ignored.",
-            autumn_client::BULK_MIN_BYTES
         );
     });
 }
