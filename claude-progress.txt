@@ -1,3 +1,33 @@
+Date: 2026-08-13
+TaskStatus: not_completed
+Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。①CSS ②CLI 已做+推；③dashboard 抽离已规划待建。
+  ① CSS（done 5ddebb0）：dashboard_web.html :root token 对齐 examples/gallery（暖色+金 accent #c5a05e/
+    --surface/--radius/DM Mono），换掉硬编码蓝（switch/bar/选中行/按钮/JS 段色板/role tag）。纯 restyle。
+  ② CLI 一致性（done e01b686，用户选"consistency+aliases 不破坏"）：
+    - 修 --bulk 真 bug：perf-check 两个 "--bulk" arm，deprecated no-op 遮蔽 live parse → bulk 恒 0、
+      put_many/get_many 批量路径(main.rs:566/737)从不跑。删遮蔽 arm+死 fn。无脚本传裸 --bulk，不破坏。
+    - --size 支持字节后缀(perf-check+ycsb, parse_size, 同 gc --max-size)；namespace-create 认 --tenant
+      (canonical，--with-tenant alias)；CLAUDE.md 订正陈旧签名+加 CLI 约定注。
+  ③ dashboard 抽离（用户定案：port compose 进 autumn-op、build now、去掉 --dashboard-allow-mutations）——
+    未建。真相：manager /api 不是 autumn-op 透传而是富 in-process compose，5 个 JSON 契约要一字不差配
+    页面 JS（错一 key 白屏）。autumn-op 已能调 4 RPC（cluster_df/MSG_LIST_NODE_STATES/policy_candidates
+    /MSG_GET_CLUSTER_OVERVIEW）+ 已有 auto_state_str/override_kind_str/describe。会话过长，checkpoint 待建。
+    执行计划（严格 additive→最后删，每步编译过再 commit，树不破）：
+    1. autumn-op 新子命令：`overview [--json]`（4 RPC + 照 dashboard.rs overview_json(210-397) 的 json!
+       compose：df 块/node 合并/ps_roll/range-sort/amp/advisories）；partition-detail 复用现有
+       `info --part <id> --detail --json`（dashboard 注释自认等价）；`auto-policy upsert`(switches/
+       interval/cooldown/max→autopolicy_set)+`auto-policy delete <name>`（页面 policy 编辑器要）；
+       核对 `auto-policy status --json` 与 /api/policies 契约(policies_get_response 699-741)一致。
+    2. examples/dashboard 新 app（仿 gallery：cyper-axum+include_str!(static/index.html)）：/api/* 全
+       shell out 到 autumn-op；token-gated（--admin-token[-file] 必填，透传给 mutating 调用）；
+       static/index.html=移过来的(已 restyle)dashboard_web.html（顺手订正顶部 "Served by *.py" 陈旧注释）。
+    3. 删 manager dashboard（唯一破坏性步，放最后）：dashboard.rs+dashboard_web.html；manager.rs 去
+       start_dashboard+--dashboard-port/-listen+--dashboard-allow-mutations（controller 改纯 per-policy
+       --arm；--auto-policy-default 直接 seed Armed）。保留 auto-policy controller（独立 leader-fenced task）。
+    4. deploy/docs：deploy/overlays/vke/dashboard-service.yaml+k8s 指新 app；server CLAUDE.md manager 段去
+       --dashboard-*、docs/ops.md dashboard 段、examples README 更新。
+
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-11
 TaskStatus: completed
 Task scope: 修复 autumn_kvcache 的 KV-load bug —— 线上 7B 对 hermes 固定长 prefix 输出 garbage。
