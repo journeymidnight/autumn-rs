@@ -291,6 +291,9 @@ pub(crate) enum Command {
         full: bool,
     },
     PolicyCandidates,
+    /// Full dashboard overview JSON (df + nodes + partitions + amp + advisories).
+    /// Always emits JSON; consumed by the standalone dashboard (examples/dashboard).
+    Overview,
     /// M2: headless control of the in-manager auto-policy
     /// controller. `action` = status | activate | deactivate.
     AutoPolicy {
@@ -887,6 +890,7 @@ pub(crate) fn parse() -> Args {
             Command::Info { part, detail, full }
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
+        "overview" => Command::Overview,
         // M2: auto-policy <status|activate <name> [--arm]|deactivate>
         "auto-policy" | "auto_policy" => {
             let action = if i < raw.len() {

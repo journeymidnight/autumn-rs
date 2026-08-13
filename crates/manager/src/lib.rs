@@ -22,6 +22,7 @@ pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 // the manager process (all-in-one; the controller survives as long as the
 // manager leader does). axum over the compio-native cyper_axum::serve.
 mod dashboard;
+pub mod dashboard_compose;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
 

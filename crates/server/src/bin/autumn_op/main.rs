@@ -335,6 +335,7 @@ async fn run(args: Args) -> Result<()> {
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         // ---------------- cluster / partition read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
+        Command::Overview => cmd_overview(&client).await?,
         Command::AutoPolicy { action, name, arm } => {
             cmd_auto_policy(&client, args.json, &action, &name, arm).await?
         }
@@ -1286,6 +1287,37 @@ async fn cmd_auto_policy(
             }
         }
     }
+    Ok(())
+}
+
+/// Full dashboard overview JSON: call the four data RPCs and hand them to the
+/// shared `dashboard_compose::build_overview_json` (identical shape the
+/// in-manager dashboard emitted). Consumed by the standalone dashboard app.
+async fn cmd_overview(client: &ClusterClient) -> Result<()> {
+    let df = client.cluster_df().await?;
+    let ov_bytes = client
+        .mgr_call(MSG_GET_CLUSTER_OVERVIEW, rkyv_encode(&GetClusterOverviewReq {}))
+        .await
+        .context("cluster overview")?;
+    let ov: GetClusterOverviewResp = rkyv_decode(&ov_bytes).map_err(decode_err)?;
+    let ns_bytes = client
+        .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+        .await?;
+    let node_states: ListNodeStatesResp = rkyv_decode(&ns_bytes).map_err(|e| anyhow!(e))?;
+    // Advisories are leader-only + best-effort — an empty list is fine off-leader.
+    let candidates = client.policy_candidates().await.unwrap_or_default();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let out = autumn_manager::dashboard_compose::build_overview_json(
+        &df,
+        ov,
+        &node_states,
+        &candidates,
+        ts,
+    );
+    println!("{out}");
     Ok(())
 }
 
