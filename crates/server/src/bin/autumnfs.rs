@@ -34,7 +34,6 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use autumn_client::ClusterClient;

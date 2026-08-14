@@ -917,7 +917,8 @@ pub(crate) fn parse() -> Args {
         // admin
         "bootstrap" => {
             let mut replication = String::from("3+0");
-            let mut presplit = String::from("1:normal");
+            // --presplit is RETIRED (see the arm below); it never changes.
+            let presplit = String::from("1:normal");
             let mut log_ec: Option<(u32, u32)> = None;
             let mut row_ec: Option<(u32, u32)> = None;
             while i < raw.len() {
@@ -949,12 +950,6 @@ pub(crate) fn parse() -> Args {
                              \x20 autumn-op presplit --namespace kvc   --count 8 --hash-prefix '<model>/vllm/v1/'"
                         );
                         std::process::exit(2);
-                        #[allow(unreachable_code)]
-                        {
-                            i += 1;
-                            presplit = val(&raw, i).to_owned();
-                        }
-                        i += 1;
                     }
                     "--log-ec" => {
                         i += 1;

@@ -65,21 +65,11 @@ struct Args {
     auth_token_ttl_secs: Option<u64>,
     /// clock-skew leeway in seconds. `None` = library default 60.
     auth_clock_skew_secs: Option<u64>,
-    /// embedded web dashboard HTTP port. `None` = disabled
-    /// (no listener). Deploy layer defaults this on (cluster.sh / entrypoint /
-    /// autumn-deploy translate AUTUMN_DASHBOARD=1 → --dashboard-port 8799).
-    dashboard_port: Option<u16>,
-    /// Bind host for the dashboard. `None` = follow `--listen` (reachable
-    /// cluster-wide by default, per the on-by-default rollout decision). Pin to
-    /// 127.0.0.1 to keep the unauthenticated surface loopback-only.
-    dashboard_listen: Option<String>,
-    /// ARM cluster mutations — manual dashboard actions AND the
-    /// auto-policy controller leaving DryRun. Default OFF = read-only viewer.
-    dashboard_allow_mutations: bool,
-    /// seed this preset as the active policy (Armed)
-    /// on a FRESH cluster. Deploy layer passes `balanced`; unset = controller
-    /// stays Off (cluster.sh / tests). Armed is honored only with
-    /// `--dashboard-allow-mutations`.
+    /// seed this preset as the active policy (Armed) on a FRESH cluster. Deploy
+    /// layer passes `balanced`; unset = controller stays Off (cluster.sh /
+    /// tests). An Armed policy actuates (arming is per-policy via
+    /// `autumn-op auto-policy activate --arm`). The web dashboard is now a
+    /// standalone app (examples/dashboard) — the manager no longer serves it.
     auto_policy_default: Option<String>,
 }
 
@@ -100,9 +90,6 @@ fn parse_args() -> Args {
     let mut auth_protected_prefixes: Vec<String> = Vec::new();
     let mut auth_token_ttl_secs: Option<u64> = None;
     let mut auth_clock_skew_secs: Option<u64> = None;
-    let mut dashboard_port: Option<u16> = None;
-    let mut dashboard_listen: Option<String> = None;
-    let mut dashboard_allow_mutations = false;
     let mut auto_policy_default: Option<String> = None;
 
     let raw: Vec<String> = std::env::args().collect();
@@ -215,18 +202,6 @@ fn parse_args() -> Args {
                 auth_clock_skew_secs =
                     Some(raw[i].parse().expect("--auth-clock-skew-secs must be a number"));
             }
-            // ── embedded web dashboard ───────────────────
-            "--dashboard-port" => {
-                i += 1;
-                dashboard_port = Some(raw[i].parse().expect("--dashboard-port must be a port"));
-            }
-            "--dashboard-listen" => {
-                i += 1;
-                dashboard_listen = Some(raw[i].clone());
-            }
-            "--dashboard-allow-mutations" => {
-                dashboard_allow_mutations = true;
-            }
             "--auto-policy-default" => {
                 i += 1;
                 auto_policy_default = Some(raw[i].clone());
@@ -253,9 +228,6 @@ fn parse_args() -> Args {
         auth_protected_prefixes,
         auth_token_ttl_secs,
         auth_clock_skew_secs,
-        dashboard_port,
-        dashboard_listen,
-        dashboard_allow_mutations,
         auto_policy_default,
     }
 }
@@ -424,17 +396,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // embedded web dashboard + (M2+) auto-policy controller.
-    // Spawns its own compio TcpListener task; must be started BEFORE the
-    // blocking serve() below. Default bind follows --listen (on-by-default
-    // rollout); mutations are OFF unless --dashboard-allow-mutations.
-    // M2: one flag gates BOTH the dashboard's manual actions AND
-    // the auto-policy controller leaving DryRun. Set unconditionally — the
-    // controller loop runs even without --dashboard-port.
-    manager.set_dashboard_allow_mutations(args.dashboard_allow_mutations);
-    // seed the deploy-configured default active policy
-    // on a fresh cluster. Validate the preset name up front — a typo must fail
-    // loud at startup, not silently leave the controller Off.
+    // Leader-fenced auto-policy controller (the web dashboard is now a
+    // standalone app — see examples/dashboard).
+    // Seed the deploy-configured default active policy on a fresh cluster.
+    // Validate the preset name up front — a typo must fail loud at startup, not
+    // silently leave the controller Off. A seeded policy is Armed and actuates
+    // (arming is per-policy via `autumn-op auto-policy activate --arm`).
     if let Some(preset) = &args.auto_policy_default {
         if !AutumnManager::is_known_auto_policy_preset(preset) {
             anyhow::bail!(
@@ -443,26 +410,11 @@ async fn main() -> Result<()> {
             );
         }
         manager.set_auto_policy_default(preset.clone());
-        if !args.dashboard_allow_mutations {
-            tracing::warn!(
-                preset,
-                "--auto-policy-default set WITHOUT --dashboard-allow-mutations: the seeded \
-                 policy will run in DryRun (advisory only) until mutations are armed"
-            );
-        }
     }
-    // seed now — AFTER the flag is set. `new_with_etcd`
-    // already ran the first replay + election in the constructor (which recorded
-    // whether a config was persisted), so this seeds a fresh cluster and no-ops
-    // when a config already exists or no default was requested.
+    // `new_with_etcd` already ran the first replay + election in the constructor
+    // (which recorded whether a config was persisted), so this seeds a fresh
+    // cluster and no-ops when a config already exists or no default was requested.
     manager.apply_auto_policy_default();
-    if let Some(dport) = args.dashboard_port {
-        let dhost = args
-            .dashboard_listen
-            .clone()
-            .unwrap_or_else(|| args.bind_host.clone());
-        manager.start_dashboard(dhost, dport, args.dashboard_allow_mutations);
-    }
 
     tracing::info!("autumn-manager-server listening on {addr}");
     manager.serve(addr).await?;

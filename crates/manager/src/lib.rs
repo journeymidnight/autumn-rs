@@ -21,7 +21,6 @@ pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 // controller, folding the retired standalone Python `python/dashboard/` into
 // the manager process (all-in-one; the controller survives as long as the
 // manager leader does). axum over the compio-native cyper_axum::serve.
-mod dashboard;
 pub mod dashboard_compose;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
@@ -811,10 +810,6 @@ pub struct AutumnManager {
     /// `autoPolicy/config`? Set during replay, read by `apply_auto_policy_default`
     /// (which runs from the bin after flags are set) to decide whether to seed.
     pub(crate) auto_policy_had_persisted_config: Rc<Cell<bool>>,
-    /// M2: whether `--dashboard-allow-mutations` was set. ONE
-    /// flag gates BOTH manual dashboard actions AND the controller leaving
-    /// DryRun (user decision). Set from the bin; default false.
-    pub(crate) dashboard_allow_mutations: Rc<Cell<bool>>,
     /// per-node sliding-window of push-based failure reports from
     /// PSes. Eviction window = `report_disk_failure_window`; quorum
     /// threshold = `report_disk_failure_quorum` distinct
@@ -963,7 +958,6 @@ impl AutumnManager {
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
             auto_policy_default: Rc::new(RefCell::new(None)),
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
-            dashboard_allow_mutations: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
             // defaults match the legacy env defaults.
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
@@ -1453,12 +1447,6 @@ impl AutumnManager {
 
     // ── auto-policy controller config ──────────────────────────────────
 
-    /// Whether manual dashboard actions + the controller's Armed mode are
-    /// honored. Set from the bin (`--dashboard-allow-mutations`).
-    pub fn set_dashboard_allow_mutations(&self, v: bool) {
-        self.dashboard_allow_mutations.set(v);
-    }
-
     /// set the preset to seed as the active policy on
     /// a fresh cluster. Validated (must be a known preset) — an unknown name is a
     /// startup error, surfaced by the bin.
@@ -1502,19 +1490,11 @@ impl AutumnManager {
         st.mode = crate::auto_policy::AutoPolicyMode::Armed;
         tracing::info!(
             preset,
-            armed_honored = self.dashboard_allow_mutations.get(),
-            "seeded default active policy on a fresh cluster \
-             (Armed; actuation requires --dashboard-allow-mutations)"
+            "seeded default active policy on a fresh cluster (Armed → actuates)"
         );
     }
 
-    /// Are we the current etcd leader? Used by the dashboard to gate leader-only
-    /// endpoints (the RPC handlers gate via `self.leader.get()` directly).
-    pub(crate) fn is_leader(&self) -> bool {
-        self.leader.get()
-    }
-
-    /// Current controller state for `MSG_AUTOPOLICY_GET` + `/api/policies`.
+    /// Current controller state for `MSG_AUTOPOLICY_GET`.
     pub(crate) fn autopolicy_snapshot(&self) -> AutoPolicyGetResp {
         let st = self.auto_policy.borrow();
         AutoPolicyGetResp {
@@ -1522,7 +1502,9 @@ impl AutumnManager {
             message: String::new(),
             mode: st.mode.as_u8(),
             active: st.active.clone(),
-            allow_mutations: self.dashboard_allow_mutations.get(),
+            // No process-wide gate anymore — an Armed policy actuates. Kept on the
+            // wire (auto-policy status / the page) as "mutations are permitted".
+            allow_mutations: true,
             policies: st.all_policies(),
             log: st.log.iter().cloned().collect(),
         }
@@ -1805,125 +1787,6 @@ impl AutumnManager {
         }
     }
 
-    /// M3: actuate ONE manual dashboard action IN-PROCESS from a
-    /// STRUCTURED request (no CLI command string). `action` is the verb; the
-    /// typed ids carry the target(s). Dispatches to the SAME underlying ops as
-    /// the controller loop (no subprocess, no `autumn-op`). The dashboard
-    /// validates the action + required fields before calling this. Returns a
-    /// short human-readable outcome for the action log.
-    pub(crate) async fn actuate_action(
-        &self,
-        action: &str,
-        part_id: u64,
-        victim_part_id: u64,
-        extent_id: u64,
-        extent_ids: Vec<u64>,
-    ) -> Result<String> {
-        // Leader-only backstop (coco P1): split / gc / compact / forcegc send
-        // straight to the PS and would otherwise skip the leader check that
-        // merge/ec already do — a follower must never dispatch cluster mutations
-        // off its replay-stale metadata (the "only leader mutates" invariant).
-        self.ensure_leader().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let state = self.store.inner.borrow().clone();
-        match action {
-            "split" => {
-                let cand = PolicyCandidate {
-                    kind: POLICY_KIND_SPLIT,
-                    primary_part_id: part_id,
-                    secondary_part_id: 0,
-                    reason: "manual".to_string(),
-                    size_bytes: 0,
-                    req_per_sec: 0,
-                    imm_full_per_sec: 0,
-                    same_ps: false,
-                    last_op_at: 0,
-                };
-                self.auto_dispatch_split(&cand, &state).await?;
-                Ok(format!("split part {part_id} dispatched"))
-            }
-            "merge" => {
-                let req = MergePartitionsReq {
-                    survivor_part_id: part_id,
-                    victim_part_id,
-                    // Dashboard button: same posture as the controller. Forcing
-                    // through a declared boundary is a CLI-level deliberate act
-                    // (`autumn-op merge --force`), not a click.
-                    force: false,
-                };
-                let resp_bytes = self
-                    .handle_merge_partitions(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: MergePartitionsResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("merge: {}", resp.message);
-                }
-                Ok(format!("merge survivor={part_id} victim={victim_part_id} OK"))
-            }
-            "gc" => {
-                self.actuate_maintenance(
-                    part_id,
-                    autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC,
-                    vec![],
-                    &state,
-                )
-                .await?;
-                Ok(format!("gc part {part_id} dispatched"))
-            }
-            "compact" => {
-                self.actuate_maintenance(
-                    part_id,
-                    autumn_rpc::partition_rpc::MAINTENANCE_COMPACT,
-                    vec![],
-                    &state,
-                )
-                .await?;
-                Ok(format!("compact part {part_id} dispatched"))
-            }
-            "forcegc" => {
-                self.actuate_maintenance(
-                    part_id,
-                    autumn_rpc::partition_rpc::MAINTENANCE_FORCE_GC,
-                    extent_ids,
-                    &state,
-                )
-                .await?;
-                Ok(format!("forcegc part {part_id} dispatched"))
-            }
-            "force_ec_convert" => {
-                let req = ForceEcConvertReq { extent_id };
-                let resp_bytes = self
-                    .handle_force_ec_convert(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: ForceEcConvertResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("force_ec_convert: {}", resp.message);
-                }
-                Ok(format!("force_ec_convert extent {extent_id} OK"))
-            }
-            "rebalance" => {
-                // Phase B: manual dashboard trigger, same
-                // bounded per-tick batch as the armed controller.
-                let max_moves = self.policy.borrow().config.rebalance_max_moves_per_tick;
-                let req = RebalanceRegionsReq { max_moves };
-                let resp_bytes = self
-                    .handle_rebalance_regions(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: RebalanceRegionsResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("rebalance: {}", resp.message);
-                }
-                Ok(format!("rebalance moved {} partition(s)", resp.moved))
-            }
-            _ => anyhow::bail!("action '{action}' not allowed"),
-        }
-    }
-
     /// The leader-fenced auto-policy controller tick loop.
     ///
     /// **INVARIANT (leader-only):** every tick begins with `leader.get()` — no
@@ -1970,14 +1833,10 @@ impl AutumnManager {
             }
             self.auto_policy.borrow_mut().last_tick_at = now;
 
-            // Armed requires the process flag; else degrade to DryRun.
-            let armed = mode == crate::auto_policy::AutoPolicyMode::Armed
-                && self.dashboard_allow_mutations.get();
-            let block_note = if mode == crate::auto_policy::AutoPolicyMode::Armed && !armed {
-                " [blocked: --dashboard-allow-mutations not set]"
-            } else {
-                ""
-            };
+            // Actuate only when the active policy is Armed; DryRun records "would".
+            // (There is no longer a process-wide mutation gate — arming is per
+            // policy via `auto-policy activate --arm`.)
+            let armed = mode == crate::auto_policy::AutoPolicyMode::Armed;
 
             let candidates = self.policy.borrow().advisory_cache.clone();
             let cooldowns = self.auto_policy.borrow().cooldowns.clone();
@@ -2004,7 +1863,7 @@ impl AutumnManager {
                     self.auto_policy.borrow_mut().record(
                         now,
                         "would",
-                        format!("would: autumn-op {cmd_str}{block_note} ({desc})"),
+                        format!("would: autumn-op {cmd_str} ({desc})"),
                     );
                     continue;
                 }
