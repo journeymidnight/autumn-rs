@@ -15,7 +15,9 @@
 //! every `autumn-op` call; read-only ops ignore it, mutations (the Apply buttons
 //! and auto-policy) use it.
 
+use std::io::Read;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use axum::body::{Body, Bytes};
@@ -29,6 +31,15 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
 [--port 8799] [--listen 0.0.0.0] [--autumn-op autumn-op] \
 (--admin-token TOK | --admin-token-file FILE)";
+
+/// Hard deadline on each `autumn-op` subprocess. Without it a manager that
+/// ACCEPTS the connection but never answers hangs the HTTP handler forever
+/// and — worse — pins a spawn_blocking thread; enough hung calls exhaust the
+/// pool and wedge the whole dashboard. On expiry the child is killed + reaped
+/// (no zombie) and the call returns a timeout error, freeing the thread.
+/// Generous: read ops finish in ms; mutations only issue the RPC, they don't
+/// wait for completion.
+const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Config {
     manager: String,
@@ -55,20 +66,70 @@ impl Config {
                 .arg(&transport)
                 .arg("--admin-token")
                 .arg(&token)
-                .arg("--json");
+                .arg("--json")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
             for a in &args {
                 cmd.arg(a);
             }
-            match cmd.output() {
-                Ok(out) if out.status.success() => {
-                    (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return (format!("failed to exec {bin}: {e}"), false),
+            };
+            // Drain stdout/stderr on their own threads: a large reply must never
+            // fill the pipe buffer and deadlock the child while we poll for exit.
+            let mut so = child.stdout.take().expect("stdout piped");
+            let mut se = child.stderr.take().expect("stderr piped");
+            let t_out = std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = so.read_to_end(&mut b);
+                b
+            });
+            let t_err = std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = se.read_to_end(&mut b);
+                b
+            });
+            // Poll for exit until OP_TIMEOUT; on expiry kill + reap (closing the
+            // pipes also unblocks the reader threads), so a stuck manager frees
+            // this blocking thread instead of pinning it forever.
+            let deadline = Instant::now() + OP_TIMEOUT;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
                 }
-                Ok(out) => {
-                    let s = String::from_utf8_lossy(&out.stdout);
-                    let e = String::from_utf8_lossy(&out.stderr);
-                    (format!("{s}{e}").trim().to_string(), false)
-                }
-                Err(e) => (format!("failed to exec {bin}: {e}"), false),
+            };
+            let out = t_out.join().unwrap_or_default();
+            let err = t_err.join().unwrap_or_default();
+            match status {
+                Some(s) if s.success() => (String::from_utf8_lossy(&out).into_owned(), true),
+                Some(_) => (
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out),
+                        String::from_utf8_lossy(&err)
+                    )
+                    .trim()
+                    .to_string(),
+                    false,
+                ),
+                None => (
+                    format!("autumn-op timed out after {}s", OP_TIMEOUT.as_secs()),
+                    false,
+                ),
             }
         })
         .await
