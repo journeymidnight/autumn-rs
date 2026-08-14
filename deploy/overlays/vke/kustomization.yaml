@@ -12,7 +12,7 @@ kind: Kustomization
 
 resources:
   - ../../k8s                  # the generic base (deploy/k8s)
-  - dashboard-service.yaml       # internal-only dashboard access (ClusterIP)
+  - dashboard.yaml             # standalone autumn-dashboard app (Deployment + internal ClusterIP)
 
 images:
   # NOTE: the autumn-rs image is deliberately NOT pinned here — neither the
@@ -117,13 +117,6 @@ patches:
       - op: add
         path: /data/AUTUMN_EXTENT_SHARDS
         value: "4"
-      # Arm the embedded dashboard's mutations (action buttons + auto-policy
-      # controller leaving DryRun). Safe because the dashboard is exposed ONLY
-      # via internal ClusterIP (autumn-dashboard) — no internet path; reaching
-      # it requires kubectl port-forward access.
-      - op: add
-        path: /data/AUTUMN_DASHBOARD_ALLOW_MUTATIONS
-        value: "1"
   # NOTE (F-EN-DYNSHARD M2): the old per-pod EN Service port patch
   # (`^autumn-en-[0-9]+$` → 8 shard ports) and en-extra-services.yaml are GONE.
   # ENs advertise their pod IP and self-register every shard port; the manager

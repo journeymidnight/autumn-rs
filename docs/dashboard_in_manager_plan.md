@@ -1,5 +1,14 @@
 # Fold the web dashboard + auto-policy controller into `autumn-manager`
 
+> **SUPERSEDED (2026-08-14).** This plan was implemented and then partly reversed:
+> the **auto-policy controller stays in the manager** (leader-fenced, crash-safe),
+> but the **web dashboard was extracted back out into a standalone app**
+> (`examples/dashboard` → the `autumn-dashboard` binary) that drives the cluster
+> only through `autumn-op`, token-gated. The manager no longer serves a UI and the
+> `--dashboard-port/--dashboard-listen/--dashboard-allow-mutations` flags are gone;
+> arming is per-policy (Armed vs DryRun). Kept for historical context only — see
+> `docs/ops.md` and `crates/manager/CLAUDE.md` for current behaviour.
+
 **Status:** plan (approved decisions folded in 2026-07-04) — not yet started.
 **Produced by:** Fable planning sub-agent, grounded against real symbols (all verified to exist).
 

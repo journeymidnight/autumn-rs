@@ -222,7 +222,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-let DANGER=false, ALLOW=false, TIMER=null;
+let DANGER=false, TIMER=null;
 let PARTS=[];        // range-sorted compact partitions (overview)
 let FILTERED=[];     // after filter()
 let NEXT_OF={};      // part_id -> range successor (adjacency-safe merge)
@@ -241,7 +241,6 @@ function toast(msg,kind="ok"){ const d=document.createElement("div"); d.classNam
 async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
   const r=await fetch(path,opt); return r.json(); }
 async function act(action,label){
-  if(!ALLOW){ toast("Server is read-only — relaunch with --dashboard-allow-mutations to operate the cluster","bad"); return; }
   if(!DANGER){ toast("Turn on the Danger switch first to operate the cluster","bad"); return; }
   if(!confirm(`Confirm?\n\n  ${label||action.action}\n`)) return;
   const r=await api("/api/action",action);
@@ -419,8 +418,6 @@ async function overview(){
 function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
 async function loadPolicies(){
   const st=await api("/api/policies");
-  ALLOW=!!st.allow_mutations;
-  $("#dangerlbl").textContent = ALLOW?"🔓 Danger":"🔒 Read-only"; $("#danger").disabled=!ALLOW;
   const on=st.enabled&&st.active;
   $("#ctlstate").innerHTML = `<span class="dot ${on?"ok":"bad"}"></span>
     controller <b>${on?"running":"stopped"}</b> ${st.active?`· active policy: <b>${esc(st.active)}</b>`:"· no policy selected"}

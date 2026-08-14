@@ -17,10 +17,10 @@ mod rpc_handlers;
 #[doc(hidden)]
 pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 
-// embedded web dashboard + (M2+) leader-fenced auto-policy
-// controller, folding the retired standalone Python `python/dashboard/` into
-// the manager process (all-in-one; the controller survives as long as the
-// manager leader does). axum over the compio-native cyper_axum::serve.
+// Pure `/api/overview` composer, shared with `autumn-op overview` so the
+// standalone dashboard app (examples/dashboard) can render the same view the
+// manager used to serve. The manager itself no longer serves a web UI — only
+// the leader-fenced auto-policy controller below survives in-process.
 pub mod dashboard_compose;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
@@ -1297,8 +1297,9 @@ impl AutumnManager {
         let mgr = self.clone();
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
 
-        // M2: leader-fenced auto-policy controller (DEFAULT-OFF;
-        // ticks + actuates ONLY on the leader; Armed needs --dashboard-allow-mutations).
+        // Leader-fenced auto-policy controller (DEFAULT-OFF;
+        // ticks + actuates ONLY on the leader; actuation is gated per-policy by
+        // the Armed vs DryRun mode).
         let mgr = self.clone();
         Self::spawn_supervised("auto_policy", move || mgr.clone().auto_policy_tick_loop());
 
@@ -1463,9 +1464,9 @@ impl AutumnManager {
     /// seed the default active policy when the cluster
     /// has NO persisted `autoPolicy/config` (a fresh cluster). In-memory only —
     /// the moment an operator changes the config (or deactivates) it persists and
-    /// this never fires again for that cluster. `mode = Armed`, but Armed is
-    /// honored only when `--dashboard-allow-mutations` is also set (else the tick
-    /// loop degrades to DryRun with a WARN) — the two flags are orthogonal.
+    /// this never fires again for that cluster. `mode = Armed`, so a seeded
+    /// policy actuates on its own — arming is per-policy (Armed vs DryRun), with
+    /// no separate process-wide gate.
     ///
     /// Called from the bin AFTER `set_auto_policy_default`, because `new_with_etcd`
     /// runs the first replay + election in the constructor, before the flag exists.
@@ -1792,8 +1793,8 @@ impl AutumnManager {
     /// **INVARIANT (leader-only):** every tick begins with `leader.get()` — no
     /// candidate read, no decision, no actuation on a follower. DEFAULT-OFF: an
     /// `Off` mode (fresh cluster) does nothing, preserving pure-mechanism.
-    /// `Armed` actuates ONLY when `--dashboard-allow-mutations` is set, else it
-    /// degrades to DryRun with the reason logged. Registered under
+    /// `Armed` actuates; `DryRun` logs "would: …" but never mutates — the mode
+    /// is the only gate (per-policy, no process-wide flag). Registered under
     /// `spawn_supervised`. Replaces the retired Python `AutoPolicy` loop,
     /// hosted on the crash-safe leader instead of a killable webserver.
     async fn auto_policy_tick_loop(self) {

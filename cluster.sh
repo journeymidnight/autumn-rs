@@ -600,17 +600,9 @@ launch_manager() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         mgr_extra="$mgr_extra --metrics-port 9591"
     fi
-    # AUTUMN_DASHBOARD=1 serves the embedded web dashboard +
-    # auto-policy controller from the manager (default port 8799, below the
-    # 10000 ephemeral floor). OPT-IN in the test harness (avoid a surprise port
-    # on a shared box); deploy (autumn-deploy / k8s) enables it by default.
-    # AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1 arms manual actions + the controller
-    # (default: read-only viewer). autoPolicy runs ONLY on the leader.
-    if [[ "${AUTUMN_DASHBOARD:-0}" == "1" ]]; then
-        mgr_extra="$mgr_extra --dashboard-port ${AUTUMN_DASHBOARD_PORT:-8799}"
-        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-0}" == "1" ]] \
-            && mgr_extra="$mgr_extra --dashboard-allow-mutations"
-    fi
+    # The web dashboard is a separate app now (examples/dashboard → the
+    # autumn-dashboard binary); cluster.sh does not start it. Run it by hand
+    # against this cluster's manager + admin token when you want the UI.
     # unlike the deploy layer (entrypoint / autumn-deploy
     # default `balanced`), cluster.sh leaves the controller OFF by default so
     # chaos / perf / dev are unaffected. Set AUTUMN_AUTO_POLICY_DEFAULT=<preset> to

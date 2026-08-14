@@ -646,7 +646,8 @@ the mechanism/policy split — advisory emission stays a separable layer that ne
 self-dispatches). `AutoPolicyMode` = **Off → DryRun → Armed**. **INVARIANT: runs ONLY
 on the leader** (`leader.get()` gate every tick — no candidate read / decision /
 actuation on a follower). **DEFAULT-OFF** (a fresh cluster is pure-mechanism); `Armed`
-actuates only with `--dashboard-allow-mutations`, else degrades to DryRun.
+actuates, `DryRun` logs "would: …" but never mutates. The **mode is the whole gate**
+— arming is per-policy, with no separate process-wide flag.
 
 Actuation is in-process to the same ops the mechanism layer exposes: split →
 `auto_dispatch_split` (snapping to a sacred boundary); merge → the freeze-drain
@@ -669,23 +670,22 @@ never persisted, safest → most aggressive:
 | `aggressive` | split, ec, compact, gc, merge, rebalance |
 
 Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
-status|activate <name> [--arm]|deactivate`. Dashboard `/api/action` is STRUCTURED
-(`{"action":"split","part_id":7}` — no CLI command string), leader-gated +
-`--dashboard-allow-mutations`-gated + verb/field-validated.
+status|activate <name> [--arm]|deactivate`. Manual per-target actions go through
+`autumn-op` subcommands (`split`/`gc`/`compact`/`merge`/`force-ec-convert`/
+`rebalance`), leader-routed — the same underlying ops the controller uses.
 
-## Web dashboard
+## Web dashboard (standalone app)
 
-`dashboard.rs`: `axum` served by the compio-native `cyper_axum::serve` over a
-`compio::net::TcpListener` (`send_wrapper::SendWrapper` bridges axum's `Send` bound
-over the `!Send` manager). The page is `include_str!`'d (`dashboard_web.html`).
-Endpoints (byte-compatible with the retired Python contracts): `GET /` + `/healthz`;
-`/api/overview` (df + nodes + partitions + advisories, 1 s coalescing cache);
-`/api/partition/<id>`; `/api/policies` GET/POST; `/api/action`. Fed in-process via
-`compute_*_resp` pure builders extracted from the `handle_*` handlers (no self-RPC).
-Flags `--dashboard-port` / `--dashboard-listen` / `--dashboard-allow-mutations`;
-`spawn_supervised`. **Security posture (documented non-goal):** no per-request
-auth/TLS on the dashboard port (same as `--metrics-port`); default read-only,
-mutations opt-in; pair exposure with network ACLs.
+The manager **no longer serves a web UI** — the old in-manager `dashboard.rs`
+(axum over `cyper_axum::serve` + `include_str!` HTML) is gone. The dashboard is
+now a standalone app, `examples/dashboard` (the `autumn-dashboard` binary), which
+holds no cluster state and drives the cluster ONLY through `autumn-op` — so the
+wire schema stays in exactly one place. It is token-gated (`--admin-token[-file]`).
+
+What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`
+composer (df + nodes + partitions + amplification + advisories), shared with
+`autumn-op overview` so the app renders the same view the manager used to serve.
+Manual actions map to the allow-listed `autumn-op` subcommands above.
 
 ## GC lifetime, VP retention, both-zero reclaim
 

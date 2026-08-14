@@ -501,16 +501,13 @@ _start_managers() {
     local -a extra=()
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && extra+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && extra+=(--metrics-port 9591)
-    # F-DASH-IN-MGR + F-AUTOPOLICY-BOOT-DEFAULT: dashboard + auto-policy
-    # controller ON by default, and production defaults to ARMED steady-state
-    # maintenance (the `balanced` policy auto-runs gc + compaction + EC +
-    # rebalance on a fresh cluster). AUTUMN_DASHBOARD=0 disables the dashboard;
-    # AUTUMN_DASHBOARD_ALLOW_MUTATIONS=0 makes the policy advisory-only;
-    # AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> changes/disables the seeded policy.
-    if [[ "${AUTUMN_DASHBOARD:-1}" != "0" ]]; then
-        extra+=(--dashboard-port "${AUTUMN_DASHBOARD_PORT:-8799}")
-        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-1}" == "1" ]] && extra+=(--dashboard-allow-mutations)
-    fi
+    # Leader-fenced auto-policy controller, ON by default: production defaults to
+    # ARMED steady-state maintenance — the `balanced` policy is seeded Armed on a
+    # fresh cluster and auto-runs gc + compaction + EC + rebalance (no separate
+    # arming flag). AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> changes/disables it.
+    # The web dashboard is a separate app (examples/dashboard → the autumn-
+    # dashboard binary); run it yourself against this manager + admin token —
+    # `autumn-dashboard --manager <host>:9001 --admin-token-file <tok> --port 8799`.
     _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"
     [[ "$_auto_policy" != "off" && "$_auto_policy" != "0" ]] \
         && extra+=(--auto-policy-default "$_auto_policy")

@@ -111,18 +111,15 @@ run_manager() {
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)
-    # embedded web dashboard + auto-policy controller, ON by
-    # default (bound to --listen). Set AUTUMN_DASHBOARD=0 to disable.
-    # production deploy defaults to ARMED steady-state
-    # maintenance — the `balanced` policy (gc + compaction + EC + rebalance) runs
-    # automatically on a fresh cluster, and mutations are armed so it actuates.
-    # (cluster.sh / chaos / perf never set these envs, so they stay Off — dev/test
-    # unaffected.) Override: AUTUMN_DASHBOARD_ALLOW_MUTATIONS=0 for advisory-only,
+    # Leader-fenced auto-policy controller. Production deploy defaults to ARMED
+    # steady-state maintenance — the `balanced` policy (gc + compaction + EC +
+    # rebalance) is seeded Armed on a fresh cluster and actuates on its own (no
+    # separate arming flag). (cluster.sh / chaos / perf never set this env, so
+    # they stay Off — dev/test unaffected.) Override:
     # AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> to change/disable the seeded policy.
-    if [[ "${AUTUMN_DASHBOARD:-1}" != "0" ]]; then
-        args+=(--dashboard-port "${AUTUMN_DASHBOARD_PORT:-8799}")
-        [[ "${AUTUMN_DASHBOARD_ALLOW_MUTATIONS:-1}" == "1" ]] && args+=(--dashboard-allow-mutations)
-    fi
+    # The web dashboard is a separate app (examples/dashboard → the autumn-
+    # dashboard binary), not started here; deploy it on its own (e.g. the vke
+    # overlay's dashboard.yaml).
     _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"
     [[ "$_auto_policy" != "off" && "$_auto_policy" != "0" ]] \
         && args+=(--auto-policy-default "$_auto_policy")

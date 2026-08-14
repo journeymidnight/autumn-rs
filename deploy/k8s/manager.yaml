@@ -24,12 +24,6 @@ spec:
     - name: rpc
       port: 9001
       targetPort: 9001
-    # F-DASH-IN-MGR: the embedded dashboard rides this leader-gated Service, so
-    # `kubectl port-forward svc/autumn-manager 8799` (or an Ingress) always
-    # reaches the LEADER — where the controller runs + mutations are honored.
-    - name: dashboard
-      port: 8799
-      targetPort: 8799
 ---
 # Headless governing Service — StatefulSet pod identity/DNS. Not used for
 # discovery (managers coordinate via etcd, not peer DNS); it just satisfies the
@@ -90,10 +84,6 @@ spec:
             - configMapRef: { name: autumn-config }
           ports:
             - { name: rpc, containerPort: 9001 }
-            # F-DASH-IN-MGR: embedded web dashboard + auto-policy controller
-            # (ON by default via entrypoint AUTUMN_DASHBOARD; read-only unless
-            # AUTUMN_DASHBOARD_ALLOW_MUTATIONS=1).
-            - { name: dashboard, containerPort: 8799 }
           readinessProbe:
             # Leader-gated: `info` returns non-zero on a follower (NOT_LEADER),
             # so only the leader becomes a Service endpoint.

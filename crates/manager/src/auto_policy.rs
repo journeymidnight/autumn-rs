@@ -139,9 +139,9 @@ impl AutoPolicyState {
 
 /// Controller lifecycle — a state machine, NOT a bool ([[feedback_state_machine_not_bool]]).
 /// `Off` = nothing runs (a fresh cluster stays pure-mechanism). `DryRun` =
-/// the loop runs and logs "would: …" but never actuates. `Armed` = actuates, and
-/// is only honored when the process was started with `--dashboard-allow-mutations`
-/// (else it degrades to DryRun with a WARN). Byte values are wire/etcd-stable.
+/// the loop runs and logs "would: …" but never actuates. `Armed` = actuates.
+/// The mode is the whole gate — arming is per-policy, with no separate
+/// process-wide flag. Byte values are wire/etcd-stable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AutoPolicyMode {
     Off,

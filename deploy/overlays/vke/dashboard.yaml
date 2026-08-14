@@ -1,0 +1,81 @@
+# examples/dashboard as a standalone in-cluster app.
+#
+# The manager NO LONGER serves the dashboard. This small Deployment runs the
+# `autumn-dashboard` binary (same image), which holds no cluster state and drives
+# the cluster ONLY through `autumn-op` — the wire schema stays in one place. It
+# talks to the manager Service (`autumn-manager`, leader-gated) and is gated on
+# the admin token from the `autumn-authz` Secret (created once by deploy.sh).
+#
+# ClusterIP only — reachable in-cluster / via `kubectl port-forward svc/autumn-
+# dashboard 8799`, NEVER from the internet (no NodePort/LoadBalancer). The admin
+# token gates mutations; there is no per-request auth on the port itself, so pair
+# exposure with network ACLs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autumn-dashboard
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: dashboard
+    spec:
+      # This overlay's node pool (the vke kustomization pins StatefulSets/Jobs the
+      # same way; a Deployment isn't covered by those patches, so pin it here).
+      nodeSelector:
+        autumn-node: "true"
+      containers:
+        - name: dashboard
+          image: autumn-rs:latest
+          # Run the binary directly (bypass the entrypoint role dispatcher, like
+          # the bootstrap Job). Flags, not env — this app takes no AUTUMN_* env.
+          command:
+            - autumn-dashboard
+            - --manager
+            - autumn-manager:9001
+            - --admin-token-file
+            - /etc/autumn/authz/admin.token
+            - --listen
+            - 0.0.0.0
+            - --port
+            - "8799"
+          ports:
+            - { name: dashboard, containerPort: 8799 }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+          volumeMounts:
+            - name: authz
+              mountPath: /etc/autumn/authz
+              readOnly: true
+      volumes:
+        # REQUIRED (not optional): the dashboard is token-gated, so no Secret =
+        # no dashboard. deploy.sh provisions autumn-authz once before apply.
+        - name: authz
+          secret:
+            secretName: autumn-authz
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-dashboard
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+  ports:
+    - { name: dashboard, port: 8799, targetPort: 8799 }

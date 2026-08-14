@@ -190,10 +190,10 @@ policy（`crates/manager/src/policy.rs`）的 size 维度全部消费口径 ①�
 
 **当前爆炸半径评估**（重要，别夸大也别轻描淡写）：
 
-- auto-policy 默认 Off；部署层 dashboard 默认开但
-  `AUTUMN_DASHBOARD_ALLOW_MUTATIONS` 默认 0（entrypoint.sh:120 /
-  autumn-deploy:509）；内置 preset 里只有 `aggressive` 打开 merge/split
-  开关。所以**今天不会有自动误合并发生** —— 它是 advisory 毒药：
+- auto-policy 在 cluster.sh/chaos/perf 默认 Off；部署层默认 seed 的是
+  `balanced` preset（Armed），而 `balanced` **不含** merge/split 开关——
+  内置 preset 里只有 `aggressive` 打开 merge/split。所以**今天不会有自动
+  误合并发生** —— 它是 advisory 毒药：
   操作员看着 `policy-candidates` 的 MERGE 建议手动执行、或某天 arm 了
   aggressive preset，就会把一个 45 GB 承载的 partition 冻结-合并掉。
 - 误 merge **不丢数据**（stream splice，extent 全保留），但代价真实：

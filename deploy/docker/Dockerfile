@@ -39,7 +39,10 @@ COPY . .
 # default-features = false (key/schema modules only), so no libfuse3-dev is
 # needed in the builder. TCP transport only — the ucx feature is deliberately
 # off (RDMA-in-k8s needs hostNetwork + device plugins; see docs/k8s_deploy.md).
-RUN cargo build --release -p autumn-server
+# autumn-dashboard is the standalone web UI (examples/dashboard); it embeds its
+# HTML via include_str!, so the binary alone is self-contained, and it drives the
+# cluster only through the autumn-op we already ship.
+RUN cargo build --release -p autumn-server -p autumn-dashboard
 
 # Runtime: binaries link only libc/libgcc; bookworm-slim provides bash + getent
 # (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The kernel comes
@@ -52,6 +55,7 @@ COPY --from=builder \
     /build/target/release/autumn-client \
     /build/target/release/autumn-op \
     /build/target/release/autumnfs \
+    /build/target/release/autumn-dashboard \
     /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
