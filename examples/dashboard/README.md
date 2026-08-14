@@ -48,6 +48,21 @@ Apply buttons and auto-policy activate/deactivate) use it.
 The controller panel is **use** (select → DryRun / observe) → **Arm** (actuate) →
 **Stop** (Off), and the custom-policy editor (create/edit/delete) is fully wired.
 
+## Navigating the page (built for many partitions)
+
+The layout is **partition-server-first** so it stays legible when a cluster has
+thousands of partitions:
+
+1. **Vital signs** (topology / capacity / throughput / controller) read first.
+2. The **keyspace ribbon** (−∞ → +∞) shows every partition as a segment colored
+   by its owning PS — click any segment to scope.
+3. **Partition servers** are the primary drill-in: pick a PS card and the list
+   below shows *only that server's* partitions (dozens/hundreds, not the whole
+   keyspace). **All servers** restores the full list, virtual-scrolled.
+4. Selecting a partition opens the **detail drawer** — load metrics + per-extent
+   distribution, fetched lazily on expand.
+5. **Extent nodes** (storage layer) sit at the bottom; click one for its detail.
+
 ## Security posture
 
 Same as `--metrics-port`: no per-request auth/TLS on the dashboard port itself —
