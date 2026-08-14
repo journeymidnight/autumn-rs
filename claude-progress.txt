@@ -25,7 +25,12 @@ Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。�
           输出与 /api/policies 契约(policies_get_response 699-741: enabled/active/allow_mutations/
           policies[{name,desc,builtin,interval,cooldown,max_actions,switches{split,ec,compact,gc,merge,
           rebalance}}]/switch_order/log)一致，不一致则加个 dashboard-policies 子命令或调整。
-    2. examples/dashboard 新 app（仿 gallery：cyper-axum+include_str!(static/index.html)；不需 ClusterClient，
+    2. ✅ DONE 1f19928：examples/dashboard 新 app 已建（cyper-axum + include_str!(static/index.html)，
+       spawn_blocking 跑 autumn-op；token-gated --admin-token[-file] 必填；/api/overview→overview、
+       /api/partition/{id}→info --part --detail、/api/action 结构化{action,part_id,…}→argv(allow-list+
+       id 校验)、/api/policies→auto-policy status、/activate→activate/deactivate；upsert/delete 暂 501
+       stub 待 auto-policy upsert/delete 子命令）。构建过、启动/token-gate/usage 冒烟过。README+workspace 加了。
+       原 examples/dashboard 新 app 计划（仿 gallery：cyper-axum+include_str!(static/index.html)；不需 ClusterClient，
        用 spawn_blocking 跑 std::process::Command("autumn-op")；--manager/--port/--listen/--autumn-op/
        --admin-token[-file]/--transport）：
        - GET / → HTML；/api/overview→`autumn-op --json overview`；/api/partition/{id}→`info --part {id} --detail`。
