@@ -358,7 +358,16 @@ async function act(action,label){
   else toast("Failed: "+(r.error||"unknown"),"bad");
 }
 const esc = s => (s==null?"":String(s)).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
-const rlabel = (s,e)=>`[${esc(s)||"-∞"}, ${esc(e)||"+∞"})`;
+// Keys carry non-printable bytes (e.g. an fs range boundary is `fs/\x03\x01`).
+// Render those as \xNN (\uNNNN above 0xff) so control bytes are VISIBLE and each
+// boundary is distinct, instead of the browser collapsing them to blank — which
+// made every fs/ chunk read identically as `[fs/ , fs/ )`. Returns printable
+// ASCII; callers still esc() for HTML.
+const showKey = s => (s==null?"":String(s)).replace(/[^\x20-\x7e]/g, c=>{
+  const n=c.charCodeAt(0);
+  return n>0xff ? "\\u"+n.toString(16).padStart(4,"0") : "\\x"+n.toString(16).padStart(2,"0");
+});
+const rlabel = (s,e)=>`[${showKey(s)||"-∞"}, ${showKey(e)||"+∞"})`;
 
 // ── keyspace ribbon (PS-colored, doubles as picker) ──────────────────────────
 function renderRibbon(){
@@ -370,9 +379,9 @@ function renderRibbon(){
       style="flex:1;background:${psColor(p.ps_id)}${empty}" onclick='pick(${JSON.stringify(p.ps_id)})'></div>`;
   }).join("");
   // namespace boundary tick: first partition whose range enters an fs/kvc/mem prefix
-  let idx=-1; for(let i=0;i<PARTS.length;i++){ const e=String(PARTS[i].range_end||""); if(/^(fs|kvc|mem)\//.test(e)){ idx=i; break; } }
+  let idx=-1, nsName=""; for(let i=0;i<PARTS.length;i++){ const m=String(PARTS[i].range_end||"").match(/^(fs|kvc|mem)\//); if(m){ idx=i; nsName=m[1]; break; } }
   $("#scale").innerHTML = idx>=0
-    ? `<span class="ns-tick" style="left:${(100*idx/Math.max(1,PARTS.length)).toFixed(1)}%">${esc(String(PARTS[idx].range_end).slice(0,4))} namespace</span>`
+    ? `<span class="ns-tick" style="left:${(100*idx/Math.max(1,PARTS.length)).toFixed(1)}%">${esc(nsName)}/ namespace</span>`
     : "";
 }
 
