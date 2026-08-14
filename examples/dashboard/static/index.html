@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<!--
+  autumn-rs web dashboard — single self-contained page (no build, no deps).
+  Served by the standalone `autumn-dashboard` app (examples/dashboard), which
+  proxies every /api/* call to the `autumn-op` CLI. Scales to 数千 partition /
+  数万 extent via:
+    * range-ordered partition list with VIRTUAL SCROLLING (only visible rows
+      in the DOM);
+    * LAZY per-partition detail (extents + load metrics fetched only on expand);
+    * a fixed-height keyspace minimap (PS roll-up, bounded by PS count).
+  Endpoints:
+    GET  /api/overview            → compact range-sorted partitions + nodes + df
+    GET  /api/partition/<id>      → one partition's detail (metrics + extents)
+    POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
+    GET  /api/policies + POST /api/policies/{upsert,activate,delete}
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autumn-rs dashboard</title>
+<style>
+  :root {
+    /* aligned with examples/gallery — warm-dark palette + gold accent */
+    --bg:#0a0a0b; --panel:#131315; --panel2:#1a1a1d; --line:#2a2a2e;
+    --line-active:#4a4a50; --ink:#e8e6e3; --dim:#7a7880; --muted:#4a4850;
+    --accent:#c5a05e; --accent-dim:#8a7040; --ok:#50a868; --warn:#cf9b52;
+    --bad:#c45050; --bad-dim:#3a1818; --ec:#9d7cc9; --chip:#1a1a1d; --row:#1a1a1d;
+    --radius:6px;
+    --mono:'DM Mono','SF Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:300 13px/1.5 var(--mono); }
+  header { position:sticky; top:0; z-index:10; background:var(--panel);
+    border-bottom:1px solid var(--line); padding:9px 16px;
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:700; }
+  .grow { flex:1; }
+  .pill { background:var(--chip); border:1px solid var(--line); border-radius:999px;
+          padding:3px 10px; color:var(--dim); white-space:nowrap; }
+  .pill b { color:var(--ink); font-weight:600; }
+  .toggle { display:inline-flex; align-items:center; gap:7px; cursor:pointer; user-select:none; }
+  .toggle input { display:none; }
+  .switch { width:38px; height:20px; border-radius:999px; background:#3a3a3e; position:relative; transition:.15s; }
+  .switch::after { content:""; position:absolute; top:2px; left:2px; width:16px; height:16px;
+                   border-radius:50%; background:#fff; transition:.15s; }
+  .toggle input:checked + .switch { background:var(--bad); }
+  .toggle input:checked + .switch::after { transform:translateX(18px); }
+  main { padding:14px 16px; }
+  .nodestrip { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .node { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 10px; min-width:150px; }
+  .node .nid { font-weight:700; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+  .bar { height:5px; border-radius:3px; background:var(--line); margin-top:4px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--accent); }
+
+  /* keyspace minimap — whole −∞→+∞ as one bar, segmented by PS (bounded by PS count) */
+  .minimap-wrap { margin-bottom:12px; }
+  .minimap { display:flex; height:22px; border-radius:6px; overflow:hidden; border:1px solid var(--line); }
+  .seg { height:100%; min-width:2px; cursor:pointer; opacity:.85; }
+  .seg:hover { opacity:1; outline:1px solid #fff6; }
+  .legend { margin-top:5px; color:var(--dim); display:flex; gap:14px; flex-wrap:wrap; font-size:12px; }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px; }
+
+  .layout { display:flex; gap:14px; align-items:flex-start; }
+  .listpanel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+  .listhead { display:flex; align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--line); }
+  .listhead input { background:var(--bg); color:var(--ink); border:1px solid var(--line);
+    border-radius:6px; padding:4px 8px; font:inherit; width:240px; }
+  .listhead .cnt { color:var(--dim); }
+  /* virtual scroll viewport */
+  #vp { height:62vh; overflow-y:auto; position:relative; }
+  #spacer { position:relative; width:100%; }
+  .prow { position:absolute; left:0; right:0; height:34px; display:flex; align-items:center;
+    gap:10px; padding:0 12px; border-bottom:1px solid var(--row); cursor:pointer; }
+  .prow:hover { background:var(--row); }
+  .prow.sel { background:#201b12; box-shadow:inset 2px 0 0 var(--accent); }
+  .prow .rngcell { width:160px; flex:none; }
+  .rngmini { height:8px; background:var(--line); border-radius:2px; position:relative; }
+  .rngmini > i { position:absolute; top:0; bottom:0; background:var(--accent); border-radius:2px; }
+  .prow .pid { width:70px; flex:none; font-weight:700; }
+  .prow .psc { width:130px; flex:none; color:var(--dim); }
+  .prow .sz { width:70px; flex:none; text-align:right; }
+  .prow .ex { width:64px; flex:none; text-align:right; color:var(--dim); }
+  .prow .hot { flex:1; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--dim); }
+  .badge.hot { color:var(--warn); border-color:var(--warn); }
+  .caret { color:var(--dim); width:14px; flex:none; }
+
+  /* detail drawer */
+  .drawer { width:430px; flex:none; background:var(--panel); border:1px solid var(--line);
+    border-radius:12px; padding:12px 14px; position:sticky; top:64px; max-height:80vh; overflow:auto; }
+  .drawer.empty { color:var(--dim); }
+  .drawer h3 { margin:0 0 8px; font-size:14px; }
+  .kv { color:var(--dim); } .kv b { color:var(--ink); font-weight:600; }
+  .metrics { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; margin:8px 0; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+  .btn { background:#26262a; color:var(--ink); border:1px solid var(--line); border-radius:6px;
+         padding:3px 9px; font:inherit; font-size:12px; cursor:pointer; }
+  .btn:hover { border-color:var(--accent); }
+  .btn.warn:hover { border-color:var(--warn); }
+  .btn.bad { color:var(--bad); } .btn.bad:hover { border-color:var(--bad); }
+  .btn.xs { padding:1px 6px; font-size:11px; }
+  .extlist { margin-top:8px; display:flex; flex-direction:column; gap:5px; max-height:42vh; overflow:auto; }
+  .ext { background:var(--chip); border:1px solid var(--line); border-radius:7px; padding:4px 8px; font-size:12px;
+         display:flex; align-items:center; gap:8px; }
+  .ext.ec { border-color:var(--ec); }
+  .ext .eid { font-weight:600; }
+  .ext .tag { font-size:10px; padding:0 5px; border-radius:4px; background:var(--line); color:var(--dim); }
+  .ext .tag.role-log{color:#93b8c8} .ext .tag.role-row{color:#8fc48f} .ext .tag.role-meta{color:#bda6d0}
+  .ext .tag.ec{background:#2a2140;color:var(--ec)} .ext .tag.missing{color:var(--bad)}
+
+  .policies { margin-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; }
+  .adv { display:flex; align-items:center; gap:10px; padding:6px 0; border-top:1px solid var(--line); }
+  .adv:first-of-type { border-top:none; } .adv .desc { flex:1; }
+  .empty { color:var(--dim); padding:6px 0; }
+  .pol { border:1px solid var(--line); border-radius:9px; padding:8px 10px; margin-bottom:8px; }
+  .pol.active { border-color:var(--ok); box-shadow:0 0 0 1px var(--ok) inset; }
+  .pol-head { display:flex; align-items:center; gap:8px; }
+  .pol-head .pname { font-weight:700; }
+  .pol-head .tagb { font-size:10px; color:var(--dim); border:1px solid var(--line); border-radius:4px; padding:0 5px; }
+  .pol .sw { display:inline-block; font-size:11px; margin-right:6px; color:var(--dim); }
+  .pol .sw.on { color:var(--ok); }
+  .form { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-top:8px; }
+  .form label { color:var(--dim); display:inline-flex; align-items:center; gap:5px; }
+  .form input[type=text], .form input[type=number] {
+    background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:3px 6px; font:inherit; }
+  .form input[type=text]{ width:130px; } .form input[type=number]{ width:64px; }
+  .swbox { display:inline-flex; align-items:center; gap:4px; }
+  .log { max-height:160px; overflow:auto; font-size:12px; }
+  .log .row { padding:2px 0; border-top:1px dashed var(--line); }
+  .log .issued{color:var(--ok)} .log .refused{color:var(--warn)} .log .error{color:var(--bad)}
+  .ts { color:var(--dim); }
+  #toast { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:50; }
+  .t { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent);
+       border-radius:8px; padding:8px 12px; max-width:420px; box-shadow:0 4px 16px #0008; }
+  .t.ok{border-left-color:var(--ok)} .t.bad{border-left-color:var(--bad)}
+  .errbar { background:#2a1c1c; border:1px solid var(--bad); color:#ffd7d2; border-radius:8px;
+            padding:6px 10px; margin-bottom:12px; white-space:pre-wrap; }
+  @media(max-width:1100px){ .layout{flex-direction:column} .drawer{width:100%;position:static} .policies{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<header>
+  <h1>autumn-rs <span style="color:var(--dim);font-weight:400">dashboard</span></h1>
+  <span class="pill" id="cap">capacity …</span>
+  <span class="pill" id="scale"></span>
+  <span class="pill" id="perf"></span>
+  <span class="grow"></span>
+  <label class="pill" style="cursor:pointer">refresh
+    <select id="interval" style="background:transparent;border:none;color:var(--ink);font:inherit">
+      <option value="2000">2s</option><option value="5000" selected>5s</option>
+      <option value="10000">10s</option><option value="0">paused</option>
+    </select>
+  </label>
+  <span class="pill ts" id="age"></span>
+  <label class="toggle" title="Unlock cluster mutation buttons (dangerous)">
+    <input type="checkbox" id="danger"><span class="switch"></span>
+    <span id="dangerlbl">🔓 Danger</span>
+  </label>
+</header>
+
+<main>
+  <div id="errs"></div>
+  <div class="nodestrip" id="nodes"></div>
+
+  <div class="minimap-wrap">
+    <div class="minimap" id="minimap"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <div class="layout">
+    <div class="listpanel">
+      <div class="listhead">
+        <span style="font-weight:700">Partitions</span>
+        <span class="cnt" id="plcnt"></span>
+        <span class="grow"></span>
+        <input id="filter" placeholder="filter: part id / ps / range prefix">
+      </div>
+      <div id="vp"><div id="spacer"></div></div>
+    </div>
+    <div class="drawer empty" id="drawer">Click a partition on the left to view its extents and load detail (lazy-loaded)</div>
+  </div>
+
+  <div class="policies">
+    <div class="panel">
+      <h2>Policy advisories <span id="advcount" class="kv"></span></h2>
+      <div id="advisories"></div>
+    </div>
+    <div class="panel">
+      <h2>Auto-policy controller</h2>
+      <div id="ctlstate" style="margin-bottom:10px"></div>
+      <div id="pollist"></div>
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;color:var(--dim)">+ Create custom policy</summary>
+        <div class="form">
+          <label>name <input type="text" id="np_name" placeholder="my-policy"></label>
+          <span class="swbox"><input type="checkbox" id="sw_split"> split</span>
+          <span class="swbox"><input type="checkbox" id="sw_ec"> ec</span>
+          <span class="swbox"><input type="checkbox" id="sw_compact" checked> compact</span>
+          <span class="swbox"><input type="checkbox" id="sw_gc" checked> gc</span>
+          <span class="swbox"><input type="checkbox" id="sw_merge"> merge</span>
+          <span class="swbox"><input type="checkbox" id="sw_rebalance"> rebalance</span>
+        </div>
+        <div class="form">
+          <label>interval(s) <input type="number" id="np_interval" value="30" min="2"></label>
+          <label>cooldown(s) <input type="number" id="np_cooldown" value="180" min="0"></label>
+          <label>max/tick <input type="number" id="np_max" value="2" min="1"></label>
+          <button class="btn" id="np_save">Save policy</button>
+        </div>
+      </details>
+      <h2 style="margin-top:14px">Recent auto-actions</h2>
+      <div class="log" id="autolog"></div>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let DANGER=false, ALLOW=false, TIMER=null;
+let PARTS=[];        // range-sorted compact partitions (overview)
+let FILTERED=[];     // after filter()
+let NEXT_OF={};      // part_id -> range successor (adjacency-safe merge)
+let SELECTED=null;   // expanded part_id
+let NODES=[];        // enriched node rows (state + capacity + extent_count)
+let LAST_TOT={ts:0,size:0};  // for throughput (Δsize/Δt) estimate
+const ROWH=34;
+const PSCOLORS={};   // ps_id -> color (group by PS INSTANCE, not per-partition addr)
+const PALETTE=["#c5a05e","#50a868","#9d7cc9","#cf9b52","#c45050","#5aa8a0","#c77fb0","#c98a54","#7a94c0","#9ab84e"];
+function psColor(pid){ const k=String(pid); if(!(k in PSCOLORS)) PSCOLORS[k]=PALETTE[Object.keys(PSCOLORS).length%PALETTE.length]; return PSCOLORS[k]; }
+
+function fmtBytes(n){ if(n==null) return "-"; let f=n;
+  for(const u of ["B","K","M","G","T","P"]){ if(Math.abs(f)<1024||u==="P") return (u==="B"?f.toFixed(0):f.toFixed(1))+u; f/=1024; } }
+function toast(msg,kind="ok"){ const d=document.createElement("div"); d.className="t "+kind; d.textContent=msg;
+  $("#toast").appendChild(d); setTimeout(()=>d.remove(),5000); }
+async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
+  const r=await fetch(path,opt); return r.json(); }
+async function act(action,label){
+  if(!ALLOW){ toast("Server is read-only — relaunch with --dashboard-allow-mutations to operate the cluster","bad"); return; }
+  if(!DANGER){ toast("Turn on the Danger switch first to operate the cluster","bad"); return; }
+  if(!confirm(`Confirm?\n\n  ${label||action.action}\n`)) return;
+  const r=await api("/api/action",action);
+  if(r.ok){ toast("Issued: "+(label||action.action),"ok"); setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600); }
+  else toast("Failed: "+(r.error||"unknown"),"bad");
+}
+const esc = s => (s==null?"":String(s)).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
+const rlabel = (s,e)=>`[${esc(s)||"-∞"}, ${esc(e)||"+∞"})`;
+
+// ── nodes + minimap ─────────────────────────────────────────────────────────
+function nodeChip(n){
+  const st=n.auto_state||(n.online?"Online":"?");
+  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
+  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
+  return `<div class="node" style="cursor:pointer" onclick='openNode(${n.node_id})' title="Click for node detail">
+    <div><span class="dot ${dot}"></span><span class="nid">node ${n.node_id}</span>
+    <span class="kv"> ${esc(n.address||"")}</span></div>
+    <div class="kv">${st}${n.extent_count!=null?` · ${n.extent_count} ext`:""}${total?` · ${fmtBytes(free)} free`:""}</div>
+    ${total?`<div class="bar"><i style="width:${usedPct.toFixed(0)}%"></i></div>`:""}</div>`;
+}
+function openNode(id){
+  SELECTED=null; renderRows();
+  const n=NODES.find(x=>x.node_id===id)||{node_id:id};
+  const st=n.auto_state||(n.online?"Online":"?");
+  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
+  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
+  const ov = (n.override_kind && n.override_kind!=="-")
+    ? `<div class="errbar" style="margin-top:8px">override: <b>${esc(n.override_kind)}</b>${n.override_reason?` — ${esc(n.override_reason)}`:""}${n.override_set_by?` (by ${esc(n.override_set_by)})`:""}</div>` : "";
+  $("#drawer").classList.remove("empty");
+  $("#drawer").innerHTML=`<h3><span class="dot ${dot}"></span>Node #${id} <span class="kv" style="font-weight:400">${esc(n.address||"")}</span></h3>
+    <div class="metrics">
+      <span class="kv">state <b>${esc(st)}</b></span><span class="kv">heartbeat <b>${n.last_heartbeat_secs_ago!=null?n.last_heartbeat_secs_ago+"s ago":"-"}</b></span>
+      <span class="kv">extent shards <b>${n.extent_count!=null?n.extent_count:"-"}</b></span><span class="kv">extent bytes <b>${fmtBytes(n.extent_bytes)}</b></span>
+      <span class="kv">capacity <b>${total?fmtBytes(total):"-"}</b></span><span class="kv">free <b>${free!=null?fmtBytes(free):"-"}</b></span>
+      <span class="kv">suspected age <b>${n.suspected_age_secs!=null?n.suspected_age_secs+"s":"-"}</b></span><span class="kv">disk <b>${total?(usedPct.toFixed(0)+"% used"):"-"}</b></span>
+    </div>
+    ${total?`<div class="bar" style="height:8px"><i style="width:${usedPct.toFixed(0)}%"></i></div>`:""}
+    ${ov}
+    <div class="kv" style="margin-top:10px">This node hosts <b>${n.extent_count!=null?n.extent_count:"?"}</b> extent shards (replicas ∪ parity). Open a partition on the left to see the per-extent distribution.</div>`;
+}
+function renderMinimap(roll){
+  const total=roll.reduce((a,r)=>a+(r.n||0),0)||1;
+  $("#minimap").innerHTML = roll.map(r=>{
+    const w=100*(r.n/total);
+    return `<div class="seg" title="PS ${r.ps_id} (${esc(r.addr||"")}) · ${r.n} part · ${fmtBytes(r.size)}"
+      style="width:${w}%;background:${psColor(r.ps_id)}" onclick='jumpToPs(${r.ps_id})'></div>`;
+  }).join("");
+  $("#legend").innerHTML = roll.map(r=>`<span><i style="background:${psColor(r.ps_id)}"></i>PS ${r.ps_id} (${r.n})</span>`).join("");
+}
+function jumpToPs(psid){
+  const i=FILTERED.findIndex(p=>p.ps_id===psid);
+  if(i>=0) $("#vp").scrollTop=i*ROWH;
+}
+
+// ── virtualized partition list ──────────────────────────────────────────────
+function applyFilter(){
+  const q=$("#filter").value.trim().toLowerCase();
+  FILTERED = !q ? PARTS : PARTS.filter(p=>
+    String(p.part_id).includes(q) || (p.ps_addr||"").toLowerCase().includes(q) ||
+    (p.range_start||"").toLowerCase().startsWith(q));
+  $("#plcnt").textContent = `${FILTERED.length}${FILTERED.length!==PARTS.length?" / "+PARTS.length:""} · ${$("#scale").dataset.ps||"?"} PS`;
+  $("#spacer").style.height = (FILTERED.length*ROWH)+"px";
+  renderRows();
+}
+function renderRows(){
+  const vp=$("#vp"), top=vp.scrollTop, h=vp.clientHeight;
+  const start=Math.max(0,Math.floor(top/ROWH)-4);
+  const end=Math.min(FILTERED.length,Math.ceil((top+h)/ROWH)+4);
+  let html="";
+  for(let i=start;i<end;i++){
+    const p=FILTERED[i];
+    const iops = p.req_per_sec>0 ? `<span class="badge hot">${p.req_per_sec} iops</span>` : "";
+    html += `<div class="prow ${SELECTED===p.part_id?"sel":""}" style="top:${i*ROWH}px"
+        onclick='openDetail(${p.part_id})' title="${rlabel(p.range_start,p.range_end)}">
+      <span class="caret">${SELECTED===p.part_id?"▼":"▸"}</span>
+      <span class="rngcell"><div class="rngmini"><i style="left:0;right:0;background:${psColor(p.ps_id)}"></i></div></span>
+      <span class="pid">#${p.part_id}</span>
+      <span class="psc"><span class="dot" style="background:${psColor(p.ps_id)}"></span>${esc(p.ps_addr)}</span>
+      <span class="sz">${fmtBytes(p.live_size)}</span>
+      <span class="ex">${p.total_extents} ext</span>
+      <span class="iops" style="width:84px;flex:none;text-align:right">${iops}</span>
+      <span class="hot kv" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${rlabel(p.range_start,p.range_end)}</span>
+    </div>`;
+  }
+  $("#spacer").innerHTML = html;
+}
+
+// ── detail drawer (lazy) ────────────────────────────────────────────────────
+function nodeAddr(id){ const n=NODES.find(x=>x.node_id===id); return n?esc(n.address):""; }
+function extChip(e){
+  const cls=["ext",e.ec?"ec":"",e.open?"":"sealed"].join(" ");
+  const tag=e.ec?`<span class="tag ec">EC ${esc(e.ec_shape||"")}</span>`:`<span class="tag role-${e.role}">${e.role}</span>`;
+  const miss=e.missing?`<span class="tag missing">missing</span>`:"";
+  const btn=(DANGER&&!e.ec&&!e.open)?`<button class="btn xs" onclick='event.stopPropagation();act({action:"force_ec_convert",extent_id:${e.extent_id}},"EC convert extent ${e.extent_id}")'>→EC</button>`:"";
+  // Click-to-expand full extent detail (replica node addresses, refs, eversion).
+  const reps=(e.replicas||[]).map(id=>`${id}${nodeAddr(id)?" ("+nodeAddr(id)+")":""}`).join(", ")||"-";
+  return `<details class="${cls}" style="display:block">
+    <summary style="display:flex;align-items:center;gap:8px;list-style:none;cursor:pointer">
+      <span class="eid">#${e.extent_id}</span>${tag}<span class="kv">${fmtBytes(e.size)}</span>
+      <span class="grow" style="flex:1"></span><span class="kv">refs ${e.refs}</span>${miss}${btn}</summary>
+    <div class="metrics" style="margin:6px 0 2px">
+      <span class="kv">state <b>${e.open?"open":"sealed"}</b></span><span class="kv">size <b>${fmtBytes(e.size)}</b></span>
+      <span class="kv">EC <b>${e.ec?esc(e.ec_shape||"yes"):"replicated"}</b></span><span class="kv">eversion <b>${e.eversion}</b></span>
+      <span class="kv">refs <b>${e.refs}</b></span><span class="kv">role <b>${e.role}</b></span>
+    </div>
+    <div class="kv" style="font-size:11px">replicas: ${reps}</div>
+  </details>`;
+}
+async function openDetail(pid){
+  SELECTED=pid; renderRows();
+  const p=PARTS.find(x=>x.part_id===pid)||{};
+  const dr=$("#drawer"); dr.classList.remove("empty");
+  dr.innerHTML=`<h3>Partition #${pid} <span class="kv" style="font-weight:400">on ${esc(p.ps_addr||"?")}</span></h3>
+    <div class="kv">${rlabel(p.range_start,p.range_end)}</div>
+    <div class="kv" style="margin-top:6px">loading detail…</div>`;
+  const d=await api("/api/partition/"+pid);
+  const nxt=NEXT_OF[pid];
+  const acts = DANGER ? `<div class="actions">
+      <button class="btn" onclick='act({action:"split",part_id:${pid}},"split ${pid}")'>Split</button>
+      <button class="btn" onclick='act({action:"compact",part_id:${pid}},"compact ${pid}")'>Compact</button>
+      <button class="btn" onclick='act({action:"gc",part_id:${pid}},"GC ${pid}")'>GC</button>
+      ${nxt!=null?`<button class="btn warn" onclick='act({action:"merge",part_id:${pid},victim_part_id:${nxt}},"merge ${nxt} into ${pid} (adjacent)")'>⤵ Merge #${nxt}</button>`:""}
+    </div>` : "";
+  const inflight = (d.gc_inflight?'<span class="badge">GC…</span> ':"")+(d.compact_inflight?'<span class="badge">compact…</span>':"");
+  dr.innerHTML=`<h3>Partition #${pid} <span class="kv" style="font-weight:400">on ${esc(p.ps_addr||"?")}</span></h3>
+    <div class="kv">${rlabel(p.range_start,p.range_end)}</div>
+    ${acts}
+    <div class="metrics">
+      <span class="kv">IOPS <b>${d.req_per_sec||0}</b></span><span class="kv">p99 <b>${d.p99_us||0}µs</b></span>
+      <span class="kv">write <b>${fmtBytes(d.write_bytes_per_sec||0)}/s</b></span><span class="kv">read <b>${fmtBytes(d.read_bytes_per_sec||0)}/s</b></span>
+      <span class="kv">size <b>${fmtBytes(d.size_bytes||p.live_size)}</b></span><span class="kv">extents <b>${(d.extents||[]).length}</b></span>
+      <span class="kv">gc debt <b>${fmtBytes(d.gc_debt_bytes)}</b></span><span class="kv">compact pend <b>${fmtBytes(d.pending_compaction_bytes)}</b></span>
+      <span class="kv">sealed log ext <b>${d.sealed_log_extent_count||0}</b></span><span class="kv">${inflight}</span>
+    </div>
+    <h2 style="font-size:12px;color:var(--dim);margin:4px 0">Extents (${(d.extents||[]).length})</h2>
+    <div class="extlist">${(d.extents||[]).map(extChip).join("")||'<span class="empty">none</span>'}</div>
+    ${(d.errors&&d.errors.length)?`<div class="errbar" style="margin-top:8px">⚠ ${esc(d.errors.join("\n"))}</div>`:""}`;
+}
+
+// ── overview poll ───────────────────────────────────────────────────────────
+async function overview(){
+  let s; try{ s=await api("/api/overview"); }catch(e){ return; }
+  const df=s.df||{};
+  $("#cap").innerHTML = df.raw_total
+    ? `capacity <b>${fmtBytes(df.raw_used)}/${fmtBytes(df.raw_total)}</b> · free ${fmtBytes(df.raw_free)} · amp <b>${df.amplification>0?df.amplification.toFixed(2)+"x":"n/a"}</b>`
+    : "capacity n/a";
+  $("#scale").innerHTML = `<b>${s.part_count||0}</b> partition · <b>${s.ps_count||0}</b> PS`;
+  $("#scale").dataset.ps = s.ps_count||0;
+  // Real cluster throughput from PS-reported per-partition bytes/sec counters
+  // (write = Put value bytes, read = GET-served value bytes). Plus aggregate IOPS.
+  $("#perf").innerHTML = `IOPS <b>${s.total_req_per_sec||0}</b>`
+    + ` · W <b>${fmtBytes(s.total_write_bytes_per_sec||0)}/s</b>`
+    + ` · R <b>${fmtBytes(s.total_read_bytes_per_sec||0)}/s</b>`;
+  $("#age").textContent = "updated "+new Date((s.ts||Date.now()/1000)*1000).toLocaleTimeString();
+  $("#errs").innerHTML = (s.errors&&s.errors.length)?`<div class="errbar">⚠ ${esc(s.errors.join("\n"))}</div>`:"";
+  NODES = s.nodes||[];
+  $("#nodes").innerHTML = NODES.map(nodeChip).join("");
+  renderMinimap(s.ps_roll||[]);
+
+  PARTS = s.partitions||[];
+  NEXT_OF={}; for(let i=0;i<PARTS.length-1;i++) NEXT_OF[PARTS[i].part_id]=PARTS[i+1].part_id;
+  applyFilter();
+
+  // advisories
+  const adv=s.advisories||[];
+  $("#advcount").textContent = adv.length?`(${adv.length})`:"";
+  $("#advisories").innerHTML = adv.length ? adv.map(a=>`
+    <div class="adv"><span class="desc">${esc(a.desc)}</span>
+      ${a.action?`<button class="btn" onclick='act(${JSON.stringify(a.action)},"${esc(a.desc).replace(/"/g,"")}")'>Apply</button>`
+             :`<span class="kv">advisory-only</span>`}</div>`).join("")
+    : '<div class="empty">(none) — no policy advisories</div>';
+}
+
+// ── policies / controller ───────────────────────────────────────────────────
+function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
+async function loadPolicies(){
+  const st=await api("/api/policies");
+  ALLOW=!!st.allow_mutations;
+  $("#dangerlbl").textContent = ALLOW?"🔓 Danger":"🔒 Read-only"; $("#danger").disabled=!ALLOW;
+  const on=st.enabled&&st.active;
+  $("#ctlstate").innerHTML = `<span class="dot ${on?"ok":"bad"}"></span>
+    controller <b>${on?"running":"stopped"}</b> ${st.active?`· active policy: <b>${esc(st.active)}</b>`:"· no policy selected"}
+    ${st.active?`<button class="btn ${on?"bad":""}" style="margin-left:8px" onclick='toggleCtl(${!st.enabled})'>${on?"Stop":"Start"}</button>`:""}`;
+  $("#pollist").innerHTML = (st.policies||[]).map(p=>`
+    <div class="pol ${st.active===p.name?"active":""}">
+      <div class="pol-head"><span class="pname">${esc(p.name)}</span>
+        <span class="tagb">${p.builtin?"preset":"custom"}</span><span class="kv">· ${esc(p.desc)}</span>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn xs" onclick='activate("${esc(p.name)}")'>${st.active===p.name?"active":"use"}</button>
+        ${p.builtin?"":`<button class="btn xs bad" onclick='delPolicy("${esc(p.name)}")'>del</button>`}</div>
+      <div style="margin-top:5px">${swLine(p.switches)}
+        <span class="kv" style="margin-left:8px">i=${p.interval}s cd=${p.cooldown}s max=${p.max_actions}</span></div>
+    </div>`).join("");
+  $("#autolog").innerHTML = (st.log||[]).map(l=>`
+    <div class="row"><span class="ts">${new Date(l.ts*1000).toLocaleTimeString()}</span>
+      <span class="${l.level}"> ${l.level}</span> ${esc(l.msg)}${l.desc?` <span class="kv">(${esc(l.desc)})</span>`:""}</div>`).join("")
+    || '<div class="empty">(none)</div>';
+}
+async function activate(name){ await api("/api/policies/activate",{active:name}); loadPolicies(); }
+async function toggleCtl(en){
+  if(en && !confirm("Start the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
+  await api("/api/policies/activate",{enabled:en}); loadPolicies();
+}
+async function delPolicy(name){ if(confirm(`Delete policy "${name}"?`)){ await api("/api/policies/delete",{name}); loadPolicies(); } }
+$("#np_save").onclick=async()=>{
+  const name=$("#np_name").value.trim(); if(!name){ toast("Enter a policy name","bad"); return; }
+  const switches={split:$("#sw_split").checked,ec:$("#sw_ec").checked,compact:$("#sw_compact").checked,gc:$("#sw_gc").checked,merge:$("#sw_merge").checked,rebalance:$("#sw_rebalance").checked};
+  const r=await api("/api/policies/upsert",{name,switches,interval:+$("#np_interval").value,cooldown:+$("#np_cooldown").value,max_actions:+$("#np_max").value});
+  if(r.error){ toast(r.error,"bad"); } else { toast("Policy saved: "+name,"ok"); $("#np_name").value=""; loadPolicies(); }
+};
+
+// ── wiring ──────────────────────────────────────────────────────────────────
+$("#vp").onscroll = renderRows;
+$("#filter").oninput = applyFilter;
+$("#danger").onchange = e=>{ DANGER=e.target.checked; renderRows(); if(SELECTED!=null) openDetail(SELECTED); };
+window.onresize = renderRows;
+function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(()=>{overview(); loadPolicies();},ms); }
+$("#interval").onchange = schedule;
+overview(); loadPolicies(); schedule();
+</script>
+</body>
+</html>

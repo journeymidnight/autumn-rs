@@ -1,0 +1,21 @@
+[package]
+name = "autumn-dashboard"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# Standalone web dashboard. Presentation only — it proxies every /api/* call to
+# the `autumn-op` CLI, so it needs no direct manager RPC and no autumn-* crate
+# deps. The leader-fenced auto-policy CONTROLLER stays in the manager.
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+compio = { version = "0.18", features = ["macros", "net"] }
+axum = "0.8"
+cyper-axum = "0.8"
+send_wrapper = { version = "0.6", features = ["futures"] }
+serde_json = "1"
+
+[lints]
+workspace = true
