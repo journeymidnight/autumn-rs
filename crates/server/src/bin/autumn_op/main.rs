@@ -336,8 +336,29 @@ async fn run(args: Args) -> Result<()> {
         // ---------------- cluster / partition read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
         Command::Overview => cmd_overview(&client).await?,
-        Command::AutoPolicy { action, name, arm } => {
-            cmd_auto_policy(&client, args.json, &action, &name, arm).await?
+        Command::AutoPolicy {
+            action,
+            name,
+            arm,
+            switches,
+            interval,
+            cooldown,
+            max_actions,
+            desc,
+        } => {
+            cmd_auto_policy(
+                &client,
+                args.json,
+                &action,
+                &name,
+                arm,
+                &switches,
+                interval,
+                cooldown,
+                max_actions,
+                desc.as_deref(),
+            )
+            .await?
         }
         Command::Info { part, detail, full } => {
             run_info(&client, args.json, part, detail, full).await?;
@@ -1173,16 +1194,46 @@ async fn cmd_audit_log(client: &ClusterClient, json: bool, op: u8, node_id: u64,
     Ok(())
 }
 
-/// M2: headless control of the in-manager auto-policy controller.
+/// Map a comma-separated switch list (`split,gc,ec`) to the fixed 6-slot bool
+/// vector the controller stores, order `[split, ec, compact, gc, merge,
+/// rebalance]`. Unknown names are a hard error (a typo must not silently drop a
+/// switch). An empty list = all off.
+fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
+    let mut sw = vec![false; 6];
+    for tok in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let idx = match tok {
+            "split" => 0,
+            "ec" => 1,
+            "compact" => 2,
+            "gc" => 3,
+            "merge" => 4,
+            "rebalance" => 5,
+            other => bail!("unknown switch '{other}' (split|ec|compact|gc|merge|rebalance)"),
+        };
+        sw[idx] = true;
+    }
+    Ok(sw)
+}
+
+/// Headless control of the leader-fenced auto-policy controller.
 ///   auto-policy status
 ///   auto-policy activate <name> [--arm]   (select policy; --arm = actuate)
 ///   auto-policy deactivate                (mode → Off)
+///   auto-policy upsert <name> --switches split,gc,… [--interval N --cooldown N
+///                              --max N --desc "…"]   (create/replace a custom policy)
+///   auto-policy delete <name>             (remove a custom policy)
+#[allow(clippy::too_many_arguments)]
 async fn cmd_auto_policy(
     client: &ClusterClient,
     json: bool,
     action: &str,
     name: &str,
     arm: bool,
+    switches: &str,
+    interval: Option<u64>,
+    cooldown: Option<u64>,
+    max_actions: Option<u32>,
+    desc: Option<&str>,
 ) -> Result<()> {
     match action {
         "status" => {}
@@ -1221,7 +1272,47 @@ async fn cmd_auto_policy(
                 })
                 .await?;
         }
-        other => anyhow::bail!("unknown auto-policy action '{other}' (status|activate|deactivate)"),
+        "upsert" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy upsert requires a policy name");
+            }
+            // Clamp BEFORE the u32 cast so a huge value can't truncate to 0; the
+            // manager's sanitize_entry re-clamps as the authority.
+            let entry = MgrAutoPolicyEntry {
+                name: name.to_string(),
+                desc: desc.unwrap_or("custom policy").to_string(),
+                switches: parse_switch_csv(switches)?,
+                interval_sec: interval.unwrap_or(30).max(2),
+                cooldown_sec: cooldown.unwrap_or(180),
+                max_actions: max_actions.unwrap_or(2).clamp(1, 100),
+                builtin: false,
+            };
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_UPSERT,
+                    mode: 0,
+                    name: name.to_string(),
+                    entry: Some(entry),
+                })
+                .await?;
+        }
+        "delete" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy delete requires a policy name");
+            }
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_DELETE,
+                    mode: 0,
+                    name: name.to_string(),
+                    entry: None,
+                })
+                .await?;
+        }
+        other => anyhow::bail!(
+            "unknown auto-policy action '{other}' \
+             (status|activate|deactivate|upsert|delete)"
+        ),
     }
 
     // Always print the resulting state.

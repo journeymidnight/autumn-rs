@@ -294,12 +294,19 @@ pub(crate) enum Command {
     /// Full dashboard overview JSON (df + nodes + partitions + amp + advisories).
     /// Always emits JSON; consumed by the standalone dashboard (examples/dashboard).
     Overview,
-    /// M2: headless control of the in-manager auto-policy
-    /// controller. `action` = status | activate | deactivate.
+    /// Headless control of the leader-fenced auto-policy controller.
+    /// `action` = status | activate | deactivate | upsert | delete. The upsert
+    /// fields (`switches`/`interval`/`cooldown`/`max_actions`/`desc`) define a
+    /// custom policy; the rest are ignored by the read/select/delete actions.
     AutoPolicy {
         action: String,
         name: String,
         arm: bool,
+        switches: String,
+        interval: Option<u64>,
+        cooldown: Option<u64>,
+        max_actions: Option<u32>,
+        desc: Option<String>,
     },
     // cluster / partition admin (migrated from autumn-client)
     Bootstrap {
@@ -902,9 +909,34 @@ pub(crate) fn parse() -> Args {
             };
             let mut name = String::new();
             let mut arm = false;
+            let mut switches = String::new();
+            let mut interval: Option<u64> = None;
+            let mut cooldown: Option<u64> = None;
+            let mut max_actions: Option<u32> = None;
+            let mut desc: Option<String> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--arm" => arm = true,
+                    "--switches" => {
+                        switches = raw.get(i + 1).cloned().unwrap_or_default();
+                        i += 1;
+                    }
+                    "--interval" => {
+                        interval = raw.get(i + 1).and_then(|s| s.parse().ok());
+                        i += 1;
+                    }
+                    "--cooldown" => {
+                        cooldown = raw.get(i + 1).and_then(|s| s.parse().ok());
+                        i += 1;
+                    }
+                    "--max" => {
+                        max_actions = raw.get(i + 1).and_then(|s| s.parse().ok());
+                        i += 1;
+                    }
+                    "--desc" => {
+                        desc = raw.get(i + 1).cloned();
+                        i += 1;
+                    }
                     other if !other.starts_with('-') && name.is_empty() => {
                         name = other.to_string()
                     }
@@ -912,7 +944,16 @@ pub(crate) fn parse() -> Args {
                 }
                 i += 1;
             }
-            Command::AutoPolicy { action, name, arm }
+            Command::AutoPolicy {
+                action,
+                name,
+                arm,
+                switches,
+                interval,
+                cooldown,
+                max_actions,
+                desc,
+            }
         }
         // admin
         "bootstrap" => {

@@ -40,12 +40,13 @@ Apply buttons and auto-policy activate/deactivate) use it.
 | `GET /api/overview` | `autumn-op overview` (df + nodes + partitions + amplification + advisories) |
 | `GET /api/partition/{id}` | `autumn-op info --part {id} --detail` |
 | `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` |
-| `GET /api/policies` | `autumn-op auto-policy status` |
+| `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
 | `POST /api/policies/activate` | `autumn-op auto-policy activate <name> [--arm]` / `deactivate` |
+| `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
+| `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
 
-The custom-policy editor (`/api/policies/upsert`, `/delete`) returns `501` until
-`autumn-op auto-policy upsert/delete` land (follow-up); preset
-activate/deactivate works today.
+The controller panel is **use** (select → DryRun / observe) → **Arm** (actuate) →
+**Stop** (Off), and the custom-policy editor (create/edit/delete) is fully wired.
 
 ## Security posture
 

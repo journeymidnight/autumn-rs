@@ -296,13 +296,67 @@ async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
     )
 }
 
-/// The custom-policy editor (upsert/delete) needs `auto-policy upsert`/`delete`
-/// subcommands on autumn-op (follow-up); until then surface a clear message so
-/// the button never silently no-ops. Preset activate/deactivate already works.
-async fn policies_unsupported(_body: Bytes) -> Response<Body> {
+/// `POST /api/policies/upsert` — create/replace a custom policy. The page sends
+/// `{name, switches:{split,ec,…}, interval, cooldown, max_actions}`; map it onto
+/// `autumn-op auto-policy upsert <name> --switches <csv> --interval N …`.
+async fn policies_upsert(cfg: &Config, body: Bytes) -> Response<Body> {
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
+    };
+    let name = match v.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"policy name required"}"#.into()),
+    };
+    let sw = v.get("switches");
+    let enabled: Vec<&str> = SWITCH_ORDER
+        .iter()
+        .copied()
+        .filter(|k| sw.and_then(|s| s.get(*k)).and_then(|b| b.as_bool()) == Some(true))
+        .collect();
+    let mut args = vec!["auto-policy".into(), "upsert".into(), name];
+    // Always send --switches (even empty) so an all-off edit is explicit, not a
+    // "keep previous" no-op.
+    args.push("--switches".into());
+    args.push(enabled.join(","));
+    if let Some(iv) = v.get("interval").and_then(|x| x.as_u64()) {
+        args.push("--interval".into());
+        args.push(iv.to_string());
+    }
+    if let Some(cd) = v.get("cooldown").and_then(|x| x.as_u64()) {
+        args.push("--cooldown".into());
+        args.push(cd.to_string());
+    }
+    if let Some(mx) = v.get("max_actions").and_then(|x| x.as_u64()) {
+        args.push("--max".into());
+        args.push(mx.to_string());
+    }
+    if let Some(d) = v.get("desc").and_then(|x| x.as_str()) {
+        args.push("--desc".into());
+        args.push(d.to_string());
+    }
+    let (out, ok) = cfg.run_op(args).await;
     json_resp(
-        StatusCode::NOT_IMPLEMENTED,
-        r#"{"error":"custom-policy upsert/delete not wired yet — use preset activate/deactivate (autumn-op auto-policy upsert/delete is a follow-up)"}"#.into(),
+        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        serde_json::json!({ "ok": ok, "output": out }).to_string(),
+    )
+}
+
+/// `POST /api/policies/delete` — remove a custom policy: `{name}` →
+/// `autumn-op auto-policy delete <name>`.
+async fn policies_delete(cfg: &Config, body: Bytes) -> Response<Body> {
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
+    };
+    let name = match v.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"policy name required"}"#.into()),
+    };
+    let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "delete".into(), name]).await;
+    json_resp(
+        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        serde_json::json!({ "ok": ok, "output": out }).to_string(),
     )
 }
 
@@ -413,6 +467,16 @@ async fn main() -> Result<()> {
         let c = c.clone();
         SendWrapper::new(async move { policies_activate(&c, body).await })
     });
+    let c = SendWrapper::new(cfg.clone());
+    let upsert_route = post(move |body: Bytes| {
+        let c = c.clone();
+        SendWrapper::new(async move { policies_upsert(&c, body).await })
+    });
+    let c = SendWrapper::new(cfg.clone());
+    let delete_route = post(move |body: Bytes| {
+        let c = c.clone();
+        SendWrapper::new(async move { policies_delete(&c, body).await })
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -421,8 +485,8 @@ async fn main() -> Result<()> {
         .route("/api/action", action_route)
         .route("/api/policies", policies_route)
         .route("/api/policies/activate", activate_route)
-        .route("/api/policies/upsert", post(policies_unsupported))
-        .route("/api/policies/delete", post(policies_unsupported));
+        .route("/api/policies/upsert", upsert_route)
+        .route("/api/policies/delete", delete_route);
 
     let listener = compio::net::TcpListener::bind(format!("{listen}:{port}")).await?;
     tracing::info!(

@@ -16,8 +16,11 @@ Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。�
      4. deploy/docs（a494e18）：Dockerfile 出 autumn-dashboard 二进制；k8s vke 换 standalone Deployment+
         ClusterIP（挂 autumn-authz admin.token）；entrypoint/autumn-deploy/cluster.sh 去死 flag；ops.md+
         manager CLAUDE.md+旧 plan doc(标 SUPERSEDED)+UI 去 server read-only gate（token-gated 后只留 Danger 开关）。
-  可选后续（非阻塞，app 现 501-stub）：autumn-op `auto-policy upsert/delete` 子命令 → 打通 dashboard 自定义
-     policy 编辑器（preset activate/deactivate 已工作）。契约核对见 `auto-policy status --json` vs /api/policies。
+  ③ 收尾：autumn-op `auto-policy upsert/delete` 子命令已加（args.rs+main.rs：--switches csv/--interval/
+     --cooldown/--max/--desc → MgrAutoPolicyEntry → AUTOPOLICY_OP_UPSERT/DELETE），app 去掉 501-stub 真接线。
+     全端到端 live 验证（scratchpad/dash_smoke.sh：1-EN RF1+dashboard，非 authz+decoupled admin token）：
+     /api/overview、/api/policies(reshape 对)、/api/partition(merge metrics+extents 对)、
+     custom upsert(gc+compact,builtin=false)→readback→delete 全过。dashboard 无 stub，功能完整。
   有意保留残留：manager_rpc.rs AutoPolicyGetResp.allow_mutations 字段+注释仍提 --dashboard-allow-mutations
      —— 字段 wire-stable 且仍被 autumn-op status 消费（现恒 true）；改注释会动 WIRE 指纹→强行 bump wire 版本，
      一句注释不值当，故留。
