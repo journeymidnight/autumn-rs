@@ -3455,6 +3455,7 @@ impl PartitionServer {
                             sealed_log_extent_count,
                             open_tail_bytes,
                             open_tail_dead_bytes,
+                            maintenance_outcomes: vec![],
                         }
                     })
                     .collect()

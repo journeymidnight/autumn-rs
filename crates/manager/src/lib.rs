@@ -1674,6 +1674,7 @@ impl AutumnManager {
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             },
         );
         // (PS slice): authenticate the manager's own maintenance
@@ -2025,6 +2026,7 @@ impl AutumnManager {
                         gc_max_size: None,
                         gc_stream_debt: None,
                         gc_empty_only: false,
+                        op_id: 0,
                     },
                 );
                 let payload = match &admin_tok {

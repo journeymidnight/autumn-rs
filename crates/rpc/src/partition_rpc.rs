@@ -728,6 +728,12 @@ pub struct MaintenanceReq {
     /// possible GC — no rewrite, just punch_holes). Overrides
     /// `gc_ratio` / `gc_max_size` when true.
     pub gc_empty_only: bool,
+    /// manager op-ledger correlation id. `0` = untracked (the PS-local
+    /// maintenance scheduler and legacy SDK callers): the PS runs the op but
+    /// records no terminal `MaintenanceOutcome`. Non-zero = the manager
+    /// submitted this op through the ledger and wants the outcome reported back
+    /// (piggybacked on the load heartbeat).
+    pub op_id: u64,
 }
 
 pub const MAINTENANCE_COMPACT: u8 = 0;

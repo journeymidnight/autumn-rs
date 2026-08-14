@@ -229,6 +229,7 @@ fn p2_fence_floor_survives_ps_restart_via_checkpoint() {
             gc_max_size: None,
             gc_stream_debt: None,
             gc_empty_only: false,
+            op_id: 0,
         });
         let mb = ps
             .call(partition_rpc::MSG_MAINTENANCE, m)

@@ -123,6 +123,7 @@ async fn flush_partition(ps: &RpcClient) -> Result<(), String> {
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             }),
         )
         .await

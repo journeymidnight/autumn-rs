@@ -56,6 +56,7 @@ async fn ps_forcegc(
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             }),
         )
         .await

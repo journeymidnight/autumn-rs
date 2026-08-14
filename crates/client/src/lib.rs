@@ -4012,6 +4012,7 @@ impl ClusterClient {
             gc_max_size: params.max_size,
             gc_stream_debt: params.stream_debt,
             gc_empty_only: params.empty_only,
+            op_id: 0,
         };
         let resp_bytes = self
             .call_ps_for_part(part_id, MSG_MAINTENANCE, rkyv_encode(&req))
@@ -4163,6 +4164,7 @@ impl ClusterClient {
                     gc_max_size: None,
                     gc_stream_debt: None,
                     gc_empty_only: false,
+                    op_id: 0,
                 }),
             )
             .await?;

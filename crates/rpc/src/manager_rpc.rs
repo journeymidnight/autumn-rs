@@ -1126,6 +1126,13 @@ pub struct PartitionLoad {
     /// reclaimable WAL debt. Refreshed on the PS GC tick from the persisted SST
     /// discard maps; 0 until the first tick.
     pub open_tail_dead_bytes: u64,
+    /// Terminal outcomes (≤ the PS's small ring) of manager-submitted
+    /// maintenance ops (compact / gc / forcegc carrying a non-zero `op_id`).
+    /// Piggybacked on the 5 s heartbeat so the manager's op-ledger learns the
+    /// state + error string that would otherwise die in a PS `tracing::error!`.
+    /// Idempotent-retransmit: the manager reconciles by `op_id` and ignores
+    /// ones it doesn't know. Empty in the common (untracked / no recent op) case.
+    pub maintenance_outcomes: Vec<MaintenanceOutcome>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -1635,6 +1642,15 @@ pub const AUDIT_OP_CLEAR_NODE_OVERRIDE: u8 = 3;
 pub const AUDIT_OP_REMOVE_NODE: u8 = 4;
 pub const AUDIT_OP_FORCE_EC_CONVERT: u8 = 5;
 pub const AUDIT_OP_FORCE_ABANDON_EC_MARKER: u8 = 6;
+// Terminal outcomes of the async op-ledger triggers (durable history; the live
+// ledger is leader-local, these persist to etcd for post-failover forensics).
+// EC-convert reuses AUDIT_OP_FORCE_EC_CONVERT (5).
+pub const AUDIT_OP_SPLIT: u8 = 7;
+pub const AUDIT_OP_MERGE: u8 = 8;
+pub const AUDIT_OP_REBALANCE: u8 = 9;
+pub const AUDIT_OP_COMPACT: u8 = 10;
+pub const AUDIT_OP_GC: u8 = 11;
+pub const AUDIT_OP_FORCE_GC: u8 = 12;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2051,6 +2067,134 @@ pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
 // points for a namespace being CREATED; presplit runs against existing ones.
 pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 
+// ── Async op ledger ──────────────────────────────────────────────────────────
+//
+// Every long-running/mutating op (split/merge/rebalance/compact/gc/forcegc/
+// ec-convert) is submitted through the leader; the manager assigns an `op_id`,
+// actuates it in the background (reusing the auto-policy controller's actuation
+// path), and answers status queries. This recovers the failure reason that the
+// fire-and-forget maintenance ops used to drop, while keeping every trigger
+// non-blocking. The ledger is leader-local + in-memory (terminal history rides
+// the audit log); a query for an unknown/old id answers UNKNOWN, never a false
+// RUNNING.
+pub const MSG_OP_SUBMIT: u8 = 0x5C;
+pub const MSG_OP_QUERY: u8 = 0x5D;
+
+/// Op kinds. Distinct from `POLICY_KIND_*` (forcegc is not a policy kind, and
+/// the policy enum is a separate frozen wire surface). Append-only.
+pub const OP_KIND_SPLIT: u8 = 1;
+pub const OP_KIND_MERGE: u8 = 2;
+pub const OP_KIND_REBALANCE: u8 = 3;
+pub const OP_KIND_COMPACT: u8 = 4;
+pub const OP_KIND_GC: u8 = 5;
+pub const OP_KIND_FORCE_GC: u8 = 6;
+pub const OP_KIND_EC_CONVERT: u8 = 7;
+
+/// Op lifecycle — a state machine, not bools. `UNKNOWN` is never an initial
+/// state; it is the honest answer when the ledger cannot know (post-failover
+/// unknown id, or a PS-executed op whose outcome went missing past its TTL).
+pub const OP_STATE_PENDING: u8 = 0;
+pub const OP_STATE_RUNNING: u8 = 1;
+pub const OP_STATE_SUCCEEDED: u8 = 2;
+pub const OP_STATE_FAILED: u8 = 3;
+pub const OP_STATE_UNKNOWN: u8 = 4;
+
+/// One ledger entry — the queryable state of a submitted op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpRecord {
+    pub op_id: u64,
+    /// `OP_KIND_*`.
+    pub kind: u8,
+    /// primary target (part id); `0` = N/A (rebalance).
+    pub part_id: u64,
+    /// merge victim / ec extent id; `0` = N/A.
+    pub secondary_id: u64,
+    /// forcegc target extents.
+    pub extent_ids: Vec<u64>,
+    /// `OP_STATE_*`.
+    pub state: u8,
+    /// failure reason; empty unless `state == FAILED`.
+    pub error: String,
+    /// human outcome ("moved 3", forcegc advisory, "no eligible extents", …).
+    pub message: String,
+    /// "cli" / "dashboard" / "auto-policy" / "replay".
+    pub requested_by: String,
+    /// epoch seconds; `0` = not yet.
+    pub submitted_at: i64,
+    pub started_at: i64,
+    pub finished_at: i64,
+}
+
+/// A PS-executed maintenance op's terminal outcome, reported back to the
+/// manager's ledger on the load heartbeat (compact / gc / forcegc only — the
+/// manager-orchestrated kinds close their own ledger entry in-process).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MaintenanceOutcome {
+    pub op_id: u64,
+    /// `OP_KIND_COMPACT` / `OP_KIND_GC` / `OP_KIND_FORCE_GC`.
+    pub kind: u8,
+    /// terminal `OP_STATE_SUCCEEDED` / `OP_STATE_FAILED`.
+    pub state: u8,
+    /// failure reason; empty on success.
+    pub error: String,
+    /// human outcome (e.g. the forcegc replay-floor advisory).
+    pub message: String,
+    /// epoch seconds the op finished.
+    pub finished_at: i64,
+}
+
+/// `MSG_OP_SUBMIT` — a typed op spec (not a CLI string). Only the fields the
+/// `kind` needs are read; the rest are ignored. Leader-gated + admin-gated.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpSubmitReq {
+    /// `OP_KIND_*`.
+    pub kind: u8,
+    /// primary target (part id for split/compact/gc/forcegc; survivor for merge).
+    pub part_id: u64,
+    /// merge victim / ec extent id.
+    pub secondary_id: u64,
+    /// forcegc target extents.
+    pub extent_ids: Vec<u64>,
+    /// explicit split point (raw key bytes); `None` = median / declared-boundary.
+    pub at_key: Option<Vec<u8>>,
+    pub gc_ratio: Option<f64>,
+    pub gc_max_size: Option<u64>,
+    pub gc_stream_debt: Option<u64>,
+    pub gc_empty_only: bool,
+    /// rebalance move cap; `0` = manager default.
+    pub max_moves: u32,
+    /// merge --force (cross a declared boundary).
+    pub force: bool,
+    /// caller tag for the ledger ("cli" / "dashboard").
+    pub requested_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpSubmitResp {
+    pub code: u8,
+    pub message: String,
+    /// the assigned (or, on attach-dedup, the existing) op id.
+    pub op_id: u64,
+}
+
+/// `MSG_OP_QUERY` — `op_id != 0` → one record (`ops status`); `op_id == 0` →
+/// list (`ops list`), filtered by `active_only` / `kind_filter` (`0` = any) /
+/// `limit` (`0` = all).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpQueryReq {
+    pub op_id: u64,
+    pub active_only: bool,
+    pub kind_filter: u8,
+    pub limit: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpQueryResp {
+    pub code: u8,
+    pub message: String,
+    pub ops: Vec<OpRecord>,
+}
+
 // ── admin-token gating for cluster-mutating manager ops ──────────────────────
 //
 // A shared admin secret gates the control-plane ops that CHANGE the cluster but
@@ -2092,6 +2236,7 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_UPSERT_PARTITION
             | MSG_MERGE_PARTITIONS
             | MSG_MULTI_MODIFY_MERGE
+            | MSG_OP_SUBMIT
     )
     // UX-fix (M3): MSG_MULTI_MODIFY_MERGE (the raw merge txn) is
     // gated too. The manager invokes it IN-PROCESS (from handle_merge_partitions

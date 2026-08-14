@@ -146,6 +146,7 @@ async fn ps_flush(ps: &RpcClient, part_id: u64) {
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             }),
         )
         .await
@@ -178,6 +179,7 @@ async fn ps_compact(ps: &RpcClient, part_id: u64) {
                     gc_max_size: None,
                     gc_stream_debt: None,
                     gc_empty_only: false,
+                    op_id: 0,
                 }),
             )
             .await
@@ -209,6 +211,7 @@ async fn ps_gc(ps: &RpcClient, part_id: u64) {
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             }),
         )
         .await

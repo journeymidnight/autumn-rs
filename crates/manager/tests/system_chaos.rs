@@ -881,6 +881,7 @@ async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
                 gc_max_size: None,
                 gc_stream_debt: None,
                 gc_empty_only: false,
+                op_id: 0,
             }),
         )
         .await;
@@ -1227,6 +1228,7 @@ async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String,
                     gc_max_size: None,
                     gc_stream_debt: None,
                     gc_empty_only: false,
+                    op_id: 0,
                 }),
             )
             .await;
@@ -1293,6 +1295,7 @@ async fn do_force_gc(ctx: &NemesisCtx) -> Result<String, String> {
                     gc_max_size: None,
                     gc_stream_debt: None,
                     gc_empty_only: false,
+                    op_id: 0,
                 }),
             )
             .await;
@@ -1921,6 +1924,7 @@ async fn verify_gc_reclaim(
         gc_max_size: None,
         gc_stream_debt: None,
         gc_empty_only: false,
+        op_id: 0,
     };
 
     // Flush + major-compact everything, twice: advance the replay floor past all

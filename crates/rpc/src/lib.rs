@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 28;
-pub const WIRE_VERSION_MAX: u32 = 28;
+pub const WIRE_VERSION_MIN: u32 = 29;
+pub const WIRE_VERSION_MAX: u32 = 29;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -343,6 +343,17 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   (existing decode paths unaffected) that perturbs the hashed schema.
     //   Pre-R3 same-commit stop-world deploy ⇒ MIN=MAX=28 unchanged.
     (28, "bba50c4a490d2c0d"),
+    // v29: async op ledger — every long-running op (split/merge/rebalance/
+    // compact/gc/forcegc/ec-convert) is submitted through the leader and made
+    // queryable, recovering the failure reason the fire-and-forget maintenance
+    // ops used to drop. Wire additions: MSG_OP_SUBMIT (0x5C) / MSG_OP_QUERY
+    // (0x5D) + OpSubmitReq/Resp, OpQueryReq/Resp, OpRecord, MaintenanceOutcome,
+    // OP_KIND_*/OP_STATE_* (manager_rpc.rs); PartitionLoad grew
+    // `maintenance_outcomes` (outcomes piggyback the load heartbeat);
+    // MaintenanceReq grew `op_id` (partition_rpc.rs); MSG_OP_SUBMIT joined
+    // is_admin_mgr_msg; AUDIT_OP_* 7..=12 for durable terminal history. Pre-R3
+    // same-commit stop-world deploy ⇒ MIN=MAX=29.
+    (29, "b65437d410e5f2c6"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
