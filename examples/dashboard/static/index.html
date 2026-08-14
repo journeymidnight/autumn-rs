@@ -152,7 +152,9 @@
   .dh .swatch { width:9px; height:9px; border-radius:2px; }
   .dh .did { font-size:15px; font-weight:700; } .dh .on { color:var(--dim); font-weight:400; font-size:12px; }
   .drng { color:var(--dim); font-size:12px; }
-  .actions { display:flex; gap:6px; flex-wrap:wrap; margin:12px 0; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:12px 0; }
+  .actions.locked .btn { opacity:.5; }
+  .lockhint { color:var(--warn); font-size:11px; }
   .btn { background:#202024; color:var(--ink); border:1px solid var(--line); border-radius:6px;
     padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; transition:border-color .12s, color .12s; }
   .btn:hover { border-color:var(--accent); }
@@ -347,15 +349,20 @@ function psColor(pid){ const k=String(pid); if(!(k in PSCOLORS)) PSCOLORS[k]=PAL
 function fmtBytes(n){ if(n==null) return "-"; let f=n;
   for(const u of ["B","K","M","G","T","P"]){ if(Math.abs(f)<1024||u==="P") return (u==="B"?f.toFixed(0):f.toFixed(1))+u; f/=1024; } }
 function toast(msg,kind="ok"){ const d=document.createElement("div"); d.className="t "+kind; d.textContent=msg;
-  $("#toast").appendChild(d); setTimeout(()=>d.remove(),5000); }
+  $("#toast").appendChild(d); setTimeout(()=>d.remove(), kind==="bad"?12000:5000); }
 async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
   const r=await fetch(path,opt); return r.json(); }
 async function act(action,label){
   if(!DANGER){ toast("Turn on the Danger switch first to operate the cluster","bad"); return; }
   if(!confirm(`Confirm?\n\n  ${label||action.action}\n`)) return;
   const r=await api("/api/action",action);
+  // The /api/action reply is {ok, output}: output carries autumn-op's stdout on
+  // success and its FULL stderr (the manager's precondition/refusal message, or
+  // a timeout note) on failure. Surface that verbatim — never "unknown" — so the
+  // real reason (e.g. "cannot split: partition has overlapping keys",
+  // "refusing to merge …: sacred boundary", "timed out after 30s") is visible.
   if(r.ok){ toast("Issued: "+(label||action.action),"ok"); setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600); }
-  else toast("Failed: "+(r.error||"unknown"),"bad");
+  else toast("Failed: "+(label?label+" — ":"")+(r.output||r.error||"unknown reason (no output)"),"bad");
 }
 const esc = s => (s==null?"":String(s)).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
 // Keys carry non-printable bytes (e.g. an fs range boundary is `fs/\x03\x01`).
@@ -504,12 +511,17 @@ async function openDetail(pid){
     <div style="color:var(--dim);margin-top:8px">loading detail…</div>`;
   const d=await api("/api/partition/"+pid);
   const nxt=NEXT_OF[pid];
-  const acts = DANGER ? `<div class="actions">
+  // Always render the action buttons (even Danger-locked) so it's clear the ops
+  // exist and a click gives feedback — act() gates on Danger with a toast rather
+  // than the buttons silently not existing (which read as "nothing happens").
+  const mergeBtn = nxt!=null?`<button class="btn warn" onclick='act({action:"merge",part_id:${pid},victim_part_id:${nxt}},"merge ${nxt} into ${pid}")'>⤵ Merge #${nxt}</button>`:"";
+  const acts = `<div class="actions${DANGER?"":" locked"}">
       <button class="btn" onclick='act({action:"split",part_id:${pid}},"split ${pid}")'>Split</button>
       <button class="btn" onclick='act({action:"compact",part_id:${pid}},"compact ${pid}")'>Compact</button>
       <button class="btn" onclick='act({action:"gc",part_id:${pid}},"GC ${pid}")'>GC</button>
-      ${nxt!=null?`<button class="btn warn" onclick='act({action:"merge",part_id:${pid},victim_part_id:${nxt}},"merge ${nxt} into ${pid} (adjacent)")'>⤵ Merge #${nxt}</button>`:""}
-    </div>` : "";
+      ${mergeBtn}
+      ${DANGER?"":`<span class="lockhint">🔒 unlock <b>Danger</b> (top-right) to run these</span>`}
+    </div>`;
   const inflight = (d.gc_inflight?'<span class="hot">GC…</span> ':"")+(d.compact_inflight?'<span class="hot">compact…</span>':"");
   dr.innerHTML=`<div class="dh"><span class="swatch" style="background:${psColor(p.ps_id)}"></span>
       <span class="did">#${pid}</span><span class="on">on ${esc(p.ps_addr||"?")}</span></div>
