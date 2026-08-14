@@ -1,5 +1,23 @@
 Date: 2026-08-14
 TaskStatus: completed
+Task scope: dashboard 大规模可用性改版（用户："partition 非常多时应点 ps 才看这台机的 partitions" → "这套可以" → build+rollout）。
+  信息架构从"扁平上千行"改为 partition-server-first 三层下钻，色调一律不变（保留 :root dark+gold token）。
+  改动全在 examples/dashboard/static/index.html（include_str! 静态串，不影响 Rust 编译）+ README 导航说明。
+  - keyspace ribbon：每 partition 一段、按属主 PS 上色；点某 PS 段 → 整条只高亮该 PS、其余调暗，并 scope 列表。
+  - Partition servers 选择器（主入口）：PS 卡片（地址/分区数/容量/iops）→ 列表只列该机 partitions；
+    "All servers" 回全量虚拟滚动。filter header 仅在 scope 变化时重建（非每键/每轮询）→ 输入保持焦点跨 5s 刷新。
+  - vital-signs masthead；detail 抽屉+per-extent 不变；EN 存储节点降到底部小条。
+  验证：node --check JS 语法过；字段访问器与旧可用页 1:1（仅新增 a.kind，回退到 advisory action verb）；
+  提交 3cd8bfc 推 main → CP 构建 autumn-rs:3cd8bfc（dongmao-lerobot pipeline，run 54f67abb Succeeded）→
+  kubectl set image deployment/autumn-dashboard（ns autumn）滚动完成，pod READY，新镜像。
+  live 验证（port-forward）：served HTML 带 PS-first signature；/api/overview part_count=21 ps_count=3
+  nodes=5 errors=[]，ps_roll=[(1,7),(2,8),(3,6)]，partition 字段齐全 → 三层下钻可正确渲染。
+  同带上未推的 3b84692（run_op 30s 超时）。核心 manager/PS 未动（仅 index.html 变，无 wire 变更）。
+  仍待用户确认（未动）：kvc 多 split（需先把 auto-policy aggressive→balanced 停自动 merge，再定分区数）。
+
+─────────────────────────────────────────────────────────────────
+Date: 2026-08-14
+TaskStatus: completed
 Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。①CSS ②CLI ③dashboard 抽离 —— 全部完成并推 main。
   ① CSS（5ddebb0）：dashboard :root token 对齐 examples/gallery（暖色+金 accent），换掉硬编码蓝。
      现由 standalone app 的 static/index.html 承载同一 restyle。
