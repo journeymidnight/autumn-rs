@@ -1,51 +1,26 @@
-Date: 2026-08-13
-TaskStatus: not_completed
-Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。①CSS ②CLI 已做+推；③dashboard 抽离已规划待建。
-  ① CSS（done 5ddebb0）：dashboard_web.html :root token 对齐 examples/gallery（暖色+金 accent #c5a05e/
-    --surface/--radius/DM Mono），换掉硬编码蓝（switch/bar/选中行/按钮/JS 段色板/role tag）。纯 restyle。
-  ② CLI 一致性（done e01b686，用户选"consistency+aliases 不破坏"）：
-    - 修 --bulk 真 bug：perf-check 两个 "--bulk" arm，deprecated no-op 遮蔽 live parse → bulk 恒 0、
-      put_many/get_many 批量路径(main.rs:566/737)从不跑。删遮蔽 arm+死 fn。无脚本传裸 --bulk，不破坏。
-    - --size 支持字节后缀(perf-check+ycsb, parse_size, 同 gc --max-size)；namespace-create 认 --tenant
-      (canonical，--with-tenant alias)；CLAUDE.md 订正陈旧签名+加 CLI 约定注。
-  ③ dashboard 抽离（用户定案：port compose 进 autumn-op、build now、去掉 --dashboard-allow-mutations）——
-    未建。真相：manager /api 不是 autumn-op 透传而是富 in-process compose，5 个 JSON 契约要一字不差配
-    页面 JS（错一 key 白屏）。autumn-op 已能调 4 RPC（cluster_df/MSG_LIST_NODE_STATES/policy_candidates
-    /MSG_GET_CLUSTER_OVERVIEW）+ 已有 auto_state_str/override_kind_str/describe。会话过长，checkpoint 待建。
-    执行计划（严格 additive→最后删，每步编译过再 commit，树不破）：
-    1. autumn-op 新子命令：
-       ✅ DONE a9082a9：`overview`（4 RPC → 新 pub 纯函数 autumn_manager::dashboard_compose::
-          build_overview_json(df,ov,node_states,candidates,ts)，从 dashboard.rs overview_json 抽出、
-          页面 JSON 契约一字不差；helper node_*_str/candidate_to_action 复制进新模块，describe_candidate/
-          cooldown_key/policy_kind_str 用 auto_policy pub(crate)）。dashboard.rs 未动，仍工作。
-          partition-detail 直接复用 `info --part <id> --detail --json`（等价，无需新命令）。
-       ⬜ 待做：`auto-policy upsert`(switches/interval/cooldown/max→autopolicy_set RPC，
-          参 dashboard.rs policies_upsert_response + MgrAutoPolicyEntry + AUTOPOLICY_OP_UPSERT)
-          + `auto-policy delete <name>`(AUTOPOLICY_OP_DELETE)。核对现有 `auto-policy status --json`
-          输出与 /api/policies 契约(policies_get_response 699-741: enabled/active/allow_mutations/
-          policies[{name,desc,builtin,interval,cooldown,max_actions,switches{split,ec,compact,gc,merge,
-          rebalance}}]/switch_order/log)一致，不一致则加个 dashboard-policies 子命令或调整。
-    2. ✅ DONE 1f19928：examples/dashboard 新 app 已建（cyper-axum + include_str!(static/index.html)，
-       spawn_blocking 跑 autumn-op；token-gated --admin-token[-file] 必填；/api/overview→overview、
-       /api/partition/{id}→info --part --detail、/api/action 结构化{action,part_id,…}→argv(allow-list+
-       id 校验)、/api/policies→auto-policy status、/activate→activate/deactivate；upsert/delete 暂 501
-       stub 待 auto-policy upsert/delete 子命令）。构建过、启动/token-gate/usage 冒烟过。README+workspace 加了。
-       原 examples/dashboard 新 app 计划（仿 gallery：cyper-axum+include_str!(static/index.html)；不需 ClusterClient，
-       用 spawn_blocking 跑 std::process::Command("autumn-op")；--manager/--port/--listen/--autumn-op/
-       --admin-token[-file]/--transport）：
-       - GET / → HTML；/api/overview→`autumn-op --json overview`；/api/partition/{id}→`info --part {id} --detail`。
-       - POST /api/action：⚠️ 页面发的是【结构化】{action,part_id,victim_part_id,extent_id,...}（不是裸 argv！
-         见 dashboard.rs action_response+validate_action 785-）。app 要把它映射成 autumn-op argv：
-         split→`split <part>`; gc→`gc <part>`; compact→`compact <part>`; merge→`merge <survivor> <victim>`;
-         force_ec_convert→`force-ec-convert --extent <eid>`; rebalance→`rebalance`。注入 --admin-token。
-       - /api/policies→`auto-policy status`(核对 shape)；/activate{active|enabled}→`auto-policy activate|deactivate`;
-         /upsert /delete→上面新加的 auto-policy upsert/delete。token-gated：--admin-token[-file] 必填、透传给
-         mutating 调用。static/index.html=移过来的(已 restyle)dashboard_web.html（顺手订正顶部 "Served by *.py"）。
-    3. 删 manager dashboard（唯一破坏性步，放最后）：dashboard.rs+dashboard_web.html；manager.rs 去
-       start_dashboard+--dashboard-port/-listen+--dashboard-allow-mutations（controller 改纯 per-policy
-       --arm；--auto-policy-default 直接 seed Armed）。保留 auto-policy controller（独立 leader-fenced task）。
-    4. deploy/docs：deploy/overlays/vke/dashboard-service.yaml+k8s 指新 app；server CLAUDE.md manager 段去
-       --dashboard-*、docs/ops.md dashboard 段、examples README 更新。
+Date: 2026-08-14
+TaskStatus: completed
+Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。①CSS ②CLI ③dashboard 抽离 —— 全部完成并推 main。
+  ① CSS（5ddebb0）：dashboard :root token 对齐 examples/gallery（暖色+金 accent），换掉硬编码蓝。
+     现由 standalone app 的 static/index.html 承载同一 restyle。
+  ② CLI 一致性（e01b686，"consistency+aliases 不破坏"）：修 --bulk 真 bug（deprecated arm 遮蔽 live
+     parse→批量路径从不跑）；--size 认字节后缀(perf-check+ycsb)；namespace-create 认 --tenant；
+     server CLAUDE.md 订正签名+加 CLI 约定注。
+  ③ dashboard 抽离 —— 从 manager 拿掉、搬进 examples、token-gated（4 步全完）：
+     1. autumn-op `overview`（a9082a9）：4 RPC→新纯函数 dashboard_compose::build_overview_json，页面
+        JSON 契约一字不差；partition-detail 复用 `info --part --detail --json`。
+     2. examples/dashboard 新 app（1f19928）：cyper-axum+include_str!(index.html)，spawn_blocking 跑
+        autumn-op；token-gated；/api/{overview,partition,action(结构化→allow-list argv),policies,activate}。
+     3. 删 manager dashboard（e2d2c39）：删 dashboard.rs+html+死 actuate_action；去 --dashboard-* flags+
+        start_dashboard；controller 改纯 per-policy（seed=Armed 自行 actuate，无进程级 gate）。247 lib 测绿。
+     4. deploy/docs（a494e18）：Dockerfile 出 autumn-dashboard 二进制；k8s vke 换 standalone Deployment+
+        ClusterIP（挂 autumn-authz admin.token）；entrypoint/autumn-deploy/cluster.sh 去死 flag；ops.md+
+        manager CLAUDE.md+旧 plan doc(标 SUPERSEDED)+UI 去 server read-only gate（token-gated 后只留 Danger 开关）。
+  可选后续（非阻塞，app 现 501-stub）：autumn-op `auto-policy upsert/delete` 子命令 → 打通 dashboard 自定义
+     policy 编辑器（preset activate/deactivate 已工作）。契约核对见 `auto-policy status --json` vs /api/policies。
+  有意保留残留：manager_rpc.rs AutoPolicyGetResp.allow_mutations 字段+注释仍提 --dashboard-allow-mutations
+     —— 字段 wire-stable 且仍被 autumn-op status 消费（现恒 true）；改注释会动 WIRE 指纹→强行 bump wire 版本，
+     一句注释不值当，故留。
 
 ─────────────────────────────────────────────────────────────────
 Date: 2026-08-11

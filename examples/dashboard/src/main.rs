@@ -94,6 +94,76 @@ fn passthrough(out: String, ok: bool) -> Response<Body> {
     }
 }
 
+const SWITCH_ORDER: [&str; 6] = ["split", "ec", "compact", "gc", "merge", "rebalance"];
+
+/// `autumn-op auto-policy status --json` speaks its own shape; the page's
+/// contract (the one the manager used to serve) differs. Translate: `mode`
+/// string → `enabled` bool (+ pass `mode` through for the Off/DryRun/Armed
+/// distinction); each policy's `switches` `[bool;6]` → a named object;
+/// `interval_sec`/`cooldown_sec` → `interval`/`cooldown`; add `switch_order`.
+fn reshape_policies(out: String, ok: bool) -> Response<Body> {
+    if !ok {
+        return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": out }).to_string());
+    }
+    let v: serde_json::Value = match serde_json::from_str(&out) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_resp(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": format!("autumn-op status: bad json: {e}") }).to_string(),
+            )
+        }
+    };
+    let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("off");
+    let policies: Vec<serde_json::Value> = v
+        .get("policies")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    let sw = p.get("switches").and_then(|x| x.as_array());
+                    let g = |i: usize| sw.and_then(|a| a.get(i)).and_then(|b| b.as_bool()).unwrap_or(false);
+                    serde_json::json!({
+                        "name": p.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "desc": p.get("desc").cloned().unwrap_or(serde_json::Value::Null),
+                        "builtin": p.get("builtin").cloned().unwrap_or(serde_json::json!(false)),
+                        "interval": p.get("interval_sec").cloned().unwrap_or(serde_json::json!(0)),
+                        "cooldown": p.get("cooldown_sec").cloned().unwrap_or(serde_json::json!(0)),
+                        "max_actions": p.get("max_actions").cloned().unwrap_or(serde_json::json!(0)),
+                        "switches": {
+                            "split": g(0), "ec": g(1), "compact": g(2),
+                            "gc": g(3), "merge": g(4), "rebalance": g(5),
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "enabled": mode != "off",
+        "mode": mode,
+        "active": v.get("active").cloned().unwrap_or_else(|| serde_json::json!("")),
+        "allow_mutations": v.get("allow_mutations").cloned().unwrap_or_else(|| serde_json::json!(true)),
+        "policies": policies,
+        "switch_order": SWITCH_ORDER,
+        "log": v.get("log").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    json_resp(StatusCode::OK, body.to_string())
+}
+
+/// The controller's currently-active policy name (`""` if none / on error) —
+/// so a bare Arm toggle (no explicit policy) can target it.
+async fn current_active_policy(cfg: &Config) -> String {
+    let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "status".into()]).await;
+    if !ok {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| v.get("active").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 async fn index() -> Response<Body> {
     Response::builder()
         .header("content-type", "text/html; charset=utf-8")
@@ -112,10 +182,38 @@ async fn partition(cfg: &Config, id: String) -> Response<Body> {
         Ok(x) => x,
         Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad partition id"}"#.into()),
     };
-    let (out, ok) = cfg
+    // The page's detail drawer wants ONE flat object: PartitionLoad metrics AND
+    // the per-extent list. autumn-op splits these across two views — `--detail`
+    // gives the metrics, the plain scoped view gives `extents[]` — so fetch both
+    // and merge. (Neither alone renders the drawer completely.)
+    let (dout, dok) = cfg
         .run_op(vec!["info".into(), "--part".into(), pid.to_string(), "--detail".into()])
         .await;
-    passthrough(out, ok)
+    if !dok {
+        return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": dout }).to_string());
+    }
+    let mut detail: serde_json::Value = match serde_json::from_str(&dout) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_resp(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": format!("autumn-op detail: bad json: {e}") }).to_string(),
+            )
+        }
+    };
+    let (sout, sok) = cfg
+        .run_op(vec!["info".into(), "--part".into(), pid.to_string()])
+        .await;
+    // Best-effort: if the scoped view fails, keep the metrics (the drawer just
+    // shows an empty extent list) rather than 502 the whole panel.
+    if sok {
+        if let Ok(scoped) = serde_json::from_str::<serde_json::Value>(&sout) {
+            if let (Some(obj), Some(exts)) = (detail.as_object_mut(), scoped.get("extents")) {
+                obj.insert("extents".into(), exts.clone());
+            }
+        }
+    }
+    json_resp(StatusCode::OK, detail.to_string())
 }
 
 async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
@@ -154,28 +252,42 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
 
 async fn policies(cfg: &Config) -> Response<Body> {
     let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "status".into()]).await;
-    passthrough(out, ok)
+    reshape_policies(out, ok)
 }
 
+/// The page drives the controller with two independent-ish keys, which map onto
+/// autumn-op's coupled `activate <name> [--arm]` / `deactivate`:
+///   `{active:<name>}`            → `activate <name>`  (select, DryRun / observe)
+///   `{active:<name>, enabled:t}` → `activate <name> --arm`  (select + Arm)
+///   `{enabled:true}`  (no name)  → arm the CURRENT active policy
+///   `{enabled:false}`            → `deactivate`  (Off)
 async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
     };
-    let args = if let Some(name) = v.get("active").and_then(|x| x.as_str()) {
-        // activate <name>; the page's Armed toggle rides `enabled`.
-        let mut a = vec!["auto-policy".into(), "activate".into(), name.to_string()];
-        if v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false) {
+    let explicit = v.get("active").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let enabled = v.get("enabled").and_then(|x| x.as_bool());
+    let args: Vec<String> = if enabled == Some(false) {
+        vec!["auto-policy".into(), "deactivate".into()]
+    } else {
+        // Selecting or arming: resolve the target policy. Explicit `active` wins;
+        // a bare Arm toggle falls back to the controller's current active policy.
+        let name = match explicit {
+            Some(n) => n,
+            None => current_active_policy(cfg).await,
+        };
+        if name.is_empty() {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"no active policy — select one first"}"#.into(),
+            );
+        }
+        let mut a = vec!["auto-policy".into(), "activate".into(), name];
+        if enabled == Some(true) {
             a.push("--arm".into());
         }
         a
-    } else if v.get("enabled").and_then(|x| x.as_bool()) == Some(false) {
-        vec!["auto-policy".into(), "deactivate".into()]
-    } else {
-        return json_resp(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"expected {active:<name>} or {enabled:false}"}"#.into(),
-        );
     };
     let (out, ok) = cfg.run_op(args).await;
     json_resp(

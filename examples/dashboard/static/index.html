@@ -418,10 +418,13 @@ async function overview(){
 function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
 async function loadPolicies(){
   const st=await api("/api/policies");
-  const on=st.enabled&&st.active;
-  $("#ctlstate").innerHTML = `<span class="dot ${on?"ok":"bad"}"></span>
-    controller <b>${on?"running":"stopped"}</b> ${st.active?`· active policy: <b>${esc(st.active)}</b>`:"· no policy selected"}
-    ${st.active?`<button class="btn ${on?"bad":""}" style="margin-left:8px" onclick='toggleCtl(${!st.enabled})'>${on?"Stop":"Start"}</button>`:""}`;
+  const mode=st.mode||"off", active=st.active||"", live=mode!=="off";
+  const label = mode==="armed"?"running (armed)":mode==="dry_run"?"observing (dry-run)":"stopped";
+  let btns="";
+  if(active && mode!=="armed") btns+=`<button class="btn" style="margin-left:8px" onclick='armCtl()'>Arm</button>`;
+  if(active) btns+=`<button class="btn ${live?"bad":""}" style="margin-left:6px" onclick='stopCtl()'>Stop</button>`;
+  $("#ctlstate").innerHTML = `<span class="dot ${live?"ok":"bad"}"></span>
+    controller <b>${label}</b> ${active?`· active policy: <b>${esc(active)}</b>`:"· no policy selected"} ${btns}`;
   $("#pollist").innerHTML = (st.policies||[]).map(p=>`
     <div class="pol ${st.active===p.name?"active":""}">
       <div class="pol-head"><span class="pname">${esc(p.name)}</span>
@@ -437,11 +440,16 @@ async function loadPolicies(){
       <span class="${l.level}"> ${l.level}</span> ${esc(l.msg)}${l.desc?` <span class="kv">(${esc(l.desc)})</span>`:""}</div>`).join("")
     || '<div class="empty">(none)</div>';
 }
+// use → select the policy in DryRun (observe advisories, no actuation).
 async function activate(name){ await api("/api/policies/activate",{active:name}); loadPolicies(); }
-async function toggleCtl(en){
-  if(en && !confirm("Start the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
-  await api("/api/policies/activate",{enabled:en}); loadPolicies();
+// Arm → let the active policy actuate on the cluster.
+async function armCtl(){
+  const st=await api("/api/policies"); if(!st.active) return;
+  if(!confirm("Arm the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
+  await api("/api/policies/activate",{active:st.active,enabled:true}); loadPolicies();
 }
+// Stop → controller Off.
+async function stopCtl(){ await api("/api/policies/activate",{enabled:false}); loadPolicies(); }
 async function delPolicy(name){ if(confirm(`Delete policy "${name}"?`)){ await api("/api/policies/delete",{name}); loadPolicies(); } }
 $("#np_save").onclick=async()=>{
   const name=$("#np_name").value.trim(); if(!name){ toast("Enter a policy name","bad"); return; }
