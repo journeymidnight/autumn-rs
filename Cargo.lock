@@ -179,6 +179,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-dashboard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "compio",
+ "cyper-axum",
+ "send_wrapper",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autumn-etcd"
 version = "0.1.0"
 dependencies = [
