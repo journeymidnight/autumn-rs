@@ -452,28 +452,45 @@ pub(crate) enum Command {
 }
 
 pub(crate) fn parse() -> Args {
-    let raw: Vec<String> = std::env::args().collect();
+    // `--wait` / `--timeout SECS` are position-INDEPENDENT (they apply to the
+    // async op triggers regardless of whether they land before or after the
+    // subcommand, matching operator muscle memory `autumn-op compact 7 --wait`).
+    // Pre-filter them out so the per-subcommand parsers never see them.
+    let mut wait = false;
+    let mut wait_timeout = 600u64;
+    let raw: Vec<String> = {
+        let orig: Vec<String> = std::env::args().collect();
+        let mut out = Vec::with_capacity(orig.len());
+        let mut j = 0usize;
+        while j < orig.len() {
+            match orig[j].as_str() {
+                "--wait" => {
+                    wait = true;
+                    j += 1;
+                }
+                "--timeout" => {
+                    j += 1;
+                    wait_timeout = orig
+                        .get(j)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or_else(|| usage());
+                    j += 1;
+                }
+                _ => {
+                    out.push(orig[j].clone());
+                    j += 1;
+                }
+            }
+        }
+        out
+    };
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
     let mut transport = TransportKind::Tcp;
     let mut admin_token: Option<String> = None;
-    let mut wait = false;
-    let mut wait_timeout = 600u64;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--wait" => {
-                wait = true;
-                i += 1;
-            }
-            "--timeout" => {
-                i += 1;
-                wait_timeout = raw
-                    .get(i)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| usage());
-                i += 1;
-            }
             "--manager" => {
                 i += 1;
                 manager = raw.get(i).cloned().unwrap_or_else(|| usage());

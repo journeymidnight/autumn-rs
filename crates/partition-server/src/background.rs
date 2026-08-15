@@ -876,6 +876,16 @@ pub(crate) async fn background_maintenance_loop(
                     }
                     chosen
                 };
+                // op-ledger correlation for the terminal outcome (0 = untracked);
+                // derived here so EVERY GC exit path (incl. the early
+                // <2-extent / stream-info-error ones) can report it.
+                let gc_op_id = gc_task.op_id();
+                let is_force = matches!(gc_task, GcTask::Force { .. });
+                let gc_kind = if is_force {
+                    manager_rpc::OP_KIND_FORCE_GC
+                } else {
+                    manager_rpc::OP_KIND_GC
+                };
                 // fix MED-4: latch gc_inflight=1 at the very top of the
                 // loop iteration, not after maintenance_gate. The scheduler reads
                 // gc_inflight to gate duplicate dispatches; without the early
@@ -919,6 +929,14 @@ pub(crate) async fn background_maintenance_loop(
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("GC get_stream_info: {e}");
+                        record_maint_outcome(
+                            &metrics,
+                            gc_op_id,
+                            gc_kind,
+                            manager_rpc::OP_STATE_FAILED,
+                            format!("get_stream_info: {e}"),
+                            String::new(),
+                        );
                         stamp_last_gc();
                         clear_inflight(&metrics);
                         continue;
@@ -947,6 +965,14 @@ pub(crate) async fn background_maintenance_loop(
                     metrics
                         .gc_debt_bytes
                         .store(0, std::sync::atomic::Ordering::Relaxed);
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "no sealed extents to reclaim".to_string(),
+                    );
                     stamp_last_gc();
                     clear_inflight(&metrics);
                     continue;
@@ -1009,14 +1035,6 @@ pub(crate) async fn background_maintenance_loop(
                     .gc_debt_bytes
                     .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
-                let is_force = matches!(gc_task, GcTask::Force { .. });
-                // op-ledger correlation for the terminal outcome (0 = untracked).
-                let gc_op_id = gc_task.op_id();
-                let gc_kind = if is_force {
-                    manager_rpc::OP_KIND_FORCE_GC
-                } else {
-                    manager_rpc::OP_KIND_GC
-                };
                 // (extent_id, authoritative sealed_length) — validated ONCE at selection
                 // so the execution loop never re-reads (possibly stale) state before the
                 // destructive punch. See `authoritative_sealed_length`.
