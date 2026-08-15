@@ -77,7 +77,9 @@ Admin / observability CLI — the canonical interface to the manager control pla
 autumn-op [--manager 127.0.0.1:9001] [--json] [--transport tcp|ucx] [--admin-token TOK | --admin-token-file FILE] <COMMAND>
 ```
 
-Global `--admin-token` / `--admin-token-file`: attached as a signed payload prefix to mutating RPCs; read-only commands ignore it. `--json` on every command (the `info` schema is top-level `nodes / extents / streams / partitions` arrays).
+Global `--admin-token` / `--admin-token-file`: attached as a signed payload prefix to mutating RPCs; read-only commands ignore it. `--json` on every command (the `info` schema is top-level `nodes / extents / streams / partitions` arrays). Global `--wait [--timeout SECS]` (default 600) applies to the async op triggers below.
+
+**Async ops.** The seven long-running ops — `split` / `merge` / `rebalance` / `compact` / `gc` / `forcegc` / `force-ec-convert` — are **submitted through the leader's op-ledger** and return an `op_id` immediately (non-blocking). Query with `ops status <OP_ID>` or `ops list [--active] [--kind K] [--limit N]`; each op's state (pending/running/succeeded/failed/unknown) + the **failure reason** is retained (compact/gc/forcegc outcomes ride back on the PS load heartbeat). Pass global `--wait` to block until terminal and exit on the real outcome (non-zero on failure) — scripts/`presplit` that need the blocking error use it. A leader change answers an old id `unknown` (terminal history is in `audit-log`).
 
 | Category | Commands |
 |----------|----------|
@@ -86,6 +88,7 @@ Global `--admin-token` / `--admin-token-file`: attached as a signed payload pref
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hex]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `presplit <ns> <tenant> <rule>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...`, `upgrade-version --to <V>` |
 | Auth / tenancy | `gen-signing-key [--kid K]`, `principal-create --principal P --grant P... [--admin-token]`, `principal-delete --principal P`, `principal-list`, `mint-token --principal P --credential ...`, `namespace-create --name N [--tenant T] [--presplit hex,…] [--admin-token]`, `namespace-delete --name N`, `namespace-list` |
 | Auto-policy controller | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (`--arm` = Armed, else DryRun), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
+| Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. Leader-routed |
 
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 

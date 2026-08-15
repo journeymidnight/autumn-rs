@@ -155,6 +155,12 @@ pub(crate) struct Args {
     /// `set_admin_token`; read-only commands are unaffected. `None` = don't send
     /// a token (a token-less manager runs these bare; a token-ON manager refuses).
     pub(crate) admin_token: Option<String>,
+    /// `--wait`: for the async op triggers (split/merge/rebalance/compact/gc/
+    /// forcegc/force-ec-convert), block until the op reaches a terminal state
+    /// and print/exit on its real outcome, instead of returning the op id.
+    pub(crate) wait: bool,
+    /// `--timeout SECS` for `--wait` (default 600). 0 keeps the default.
+    pub(crate) wait_timeout: u64,
     pub(crate) cmd: Command,
 }
 
@@ -308,6 +314,14 @@ pub(crate) enum Command {
         max_actions: Option<u32>,
         desc: Option<String>,
     },
+    /// Query the async op-ledger. `op_id != 0` = `ops status <id>`; `op_id == 0`
+    /// = `ops list` filtered by `active` / `kind` / `limit`.
+    Ops {
+        op_id: u64,
+        active: bool,
+        kind: String,
+        limit: u32,
+    },
     // cluster / partition admin (migrated from autumn-client)
     Bootstrap {
         replication: String,
@@ -443,9 +457,23 @@ pub(crate) fn parse() -> Args {
     let mut json = false;
     let mut transport = TransportKind::Tcp;
     let mut admin_token: Option<String> = None;
+    let mut wait = false;
+    let mut wait_timeout = 600u64;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
+            "--wait" => {
+                wait = true;
+                i += 1;
+            }
+            "--timeout" => {
+                i += 1;
+                wait_timeout = raw
+                    .get(i)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| usage());
+                i += 1;
+            }
             "--manager" => {
                 i += 1;
                 manager = raw.get(i).cloned().unwrap_or_else(|| usage());
@@ -953,6 +981,56 @@ pub(crate) fn parse() -> Args {
                 cooldown,
                 max_actions,
                 desc,
+            }
+        }
+        // ops status <id> | ops list [--active] [--kind K] [--limit N]
+        "ops" => {
+            let action = raw.get(i).cloned().unwrap_or_else(|| "list".to_string());
+            i += 1;
+            let mut op_id = 0u64;
+            let mut active = false;
+            let mut kind = String::new();
+            let mut limit = 0u32;
+            if action == "status" {
+                op_id = raw.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("ops status requires an op id");
+                    usage()
+                });
+                i += 1;
+            } else if action != "list" {
+                // `ops <id>` shorthand for `ops status <id>`.
+                match action.parse::<u64>() {
+                    Ok(id) => op_id = id,
+                    Err(_) => {
+                        eprintln!("ops: expected `status <id>` or `list`");
+                        usage()
+                    }
+                }
+            }
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--active" => {
+                        active = true;
+                        i += 1;
+                    }
+                    "--kind" => {
+                        i += 1;
+                        kind = raw.get(i).cloned().unwrap_or_default();
+                        i += 1;
+                    }
+                    "--limit" => {
+                        i += 1;
+                        limit = raw.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            Command::Ops {
+                op_id,
+                active,
+                kind,
+                limit,
             }
         }
         // admin
@@ -1467,6 +1545,8 @@ pub(crate) fn parse() -> Args {
         json,
         transport,
         admin_token,
+        wait,
+        wait_timeout,
         cmd,
     }
 }

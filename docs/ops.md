@@ -37,6 +37,36 @@ and the per-crate `crates/*/CLAUDE.md`.
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
 "Web dashboard + auto-policy controller" below.)
 
+## Async ops (op-ledger)
+
+The seven long-running ops — `split` / `merge` / `rebalance` / `compact` / `gc` /
+`forcegc` / `force-ec-convert` — are **asynchronous and uniform**: `autumn-op`
+submits each to the leader's op-ledger and prints an `op_id` immediately instead
+of blocking. This recovers the failure reason that the old fire-and-forget
+`compact`/`gc` dropped — every op is queryable, including its error.
+
+```bash
+autumn-op compact 7                         # → submitted compact op <ID>
+autumn-op ops status <ID>                   # pending|running|succeeded|failed|unknown (+ error/message)
+autumn-op ops list --active                 # everything still in flight
+autumn-op ops list --kind gc --limit 20     # recent gc ops
+autumn-op gc 7 --wait --timeout 300         # block until terminal; non-zero exit on failure
+```
+
+- **`--wait [--timeout SECS]`** (global, default 600) blocks until the op reaches
+  a terminal state and exits on its real outcome — for scripts (and `presplit`
+  internally) that need the blocking error. Without it, poll `ops status`.
+- **Where outcomes come from**: split/merge/rebalance close in-process on the
+  leader; compact/gc/forcegc run on the PS and report their terminal outcome +
+  error back on the 5 s load heartbeat (so terminal state appears within
+  ~5–10 s); ec-convert closes when the conversion applies.
+- **Failover honesty**: the live ledger is leader-local (in-memory, cap 256).
+  After a leader change, `ops status <old-id>` answers `unknown` (never a false
+  `running`); durable terminal history is in `autumn-op audit-log`. A PS-executed
+  op whose outcome never arrives flips to `unknown` after 30 min.
+- **Dedup**: re-submitting the same target while one is in flight returns the
+  existing `op_id` ("attached") rather than double-dispatching.
+
 ## Auto-policy controller (in the manager)
 
 The manager only *emits* advisories (pure mechanism); the leader-fenced

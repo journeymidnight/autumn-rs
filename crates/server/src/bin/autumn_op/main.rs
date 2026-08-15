@@ -373,8 +373,9 @@ async fn run(args: Args) -> Result<()> {
             run_bootstrap(&client, args.json, &replication, &presplit, log_ec, row_ec).await?;
         }
         Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
-        Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, extent_id).await?,
-        Command::Split { part_id, point } => cmd_split(&client, args.json, part_id, point).await?,
+        Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id).await?,
+        Command::Split { part_id, point } => cmd_split(&client, args.json, args.wait, args.wait_timeout, part_id, point).await?,
+        Command::Ops { op_id, active, kind, limit } => cmd_ops(&client, args.json, op_id, active, &kind, limit).await?,
         Command::Presplit { namespace, tenant, rule, admin_token, force } => {
             // UX-fix: the recording token falls back to the GLOBAL
             // `--admin-token[-file]` (the position `usage()` documents) so an
@@ -393,11 +394,11 @@ async fn run(args: Args) -> Result<()> {
             }
             cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token, force).await?
         }
-        Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, survivor_part_id, victim_part_id, force).await?,
-        Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, max_moves).await?,
-        Command::Compact { part_id } => cmd_compact(&client, args.json, part_id).await?,
-        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, part_id, ratio, max_size, stream_debt, empty_only).await?,
-        Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, part_id, extent_ids).await?,
+        Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, args.wait, args.wait_timeout, survivor_part_id, victim_part_id, force).await?,
+        Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, args.wait, args.wait_timeout, max_moves).await?,
+        Command::Compact { part_id } => cmd_compact(&client, args.json, args.wait, args.wait_timeout, part_id).await?,
+        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, args.wait, args.wait_timeout, part_id, ratio, max_size, stream_debt, empty_only).await?,
+        Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, args.wait, args.wait_timeout, part_id, extent_ids).await?,
         Command::RegisterNode => {
             // Already handled by the pre-connect stub above.
             unreachable!("Command::RegisterNode handled before connect");
@@ -1670,27 +1671,219 @@ async fn cmd_set_stream_ec(client: &ClusterClient, json: bool, stream_id: u64, e
     Ok(())
 }
 
-async fn cmd_force_ec_convert(client: &ClusterClient, json: bool, extent_id: u64) -> Result<()> {
-    let req = rkyv_encode(&ForceEcConvertReq { extent_id });
-    let resp_bytes = client
-        .mgr_call(MSG_FORCE_EC_CONVERT, req)
-        .await
-        .context("force-ec-convert")?;
-    let resp: ForceEcConvertResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-    if resp.code != CODE_OK {
-        bail!("force-ec-convert: code={} {}", resp.code, resp.message);
+async fn cmd_force_ec_convert(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    extent_id: u64,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_EC_CONVERT,
+            secondary_id: extent_id,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Human name for an `OP_STATE_*`.
+fn op_state_name(s: u8) -> &'static str {
+    match s {
+        OP_STATE_PENDING => "pending",
+        OP_STATE_RUNNING => "running",
+        OP_STATE_SUCCEEDED => "succeeded",
+        OP_STATE_FAILED => "failed",
+        _ => "unknown",
     }
+}
+
+/// Human name for an `OP_KIND_*`.
+fn op_kind_name(k: u8) -> &'static str {
+    match k {
+        OP_KIND_SPLIT => "split",
+        OP_KIND_MERGE => "merge",
+        OP_KIND_REBALANCE => "rebalance",
+        OP_KIND_COMPACT => "compact",
+        OP_KIND_GC => "gc",
+        OP_KIND_FORCE_GC => "forcegc",
+        OP_KIND_EC_CONVERT => "ec-convert",
+        _ => "?",
+    }
+}
+
+/// `--kind` filter → `OP_KIND_*` (`0` = any / unrecognized).
+fn op_kind_from_str(s: &str) -> u8 {
+    match s {
+        "split" => OP_KIND_SPLIT,
+        "merge" => OP_KIND_MERGE,
+        "rebalance" => OP_KIND_REBALANCE,
+        "compact" => OP_KIND_COMPACT,
+        "gc" => OP_KIND_GC,
+        "forcegc" => OP_KIND_FORCE_GC,
+        "ec" | "ec-convert" => OP_KIND_EC_CONVERT,
+        _ => 0,
+    }
+}
+
+/// Submit an op to the ledger and print its id (async, default), or — with
+/// `--wait` — poll to a terminal state and print/exit on the real outcome
+/// (non-zero exit on FAILED/UNKNOWN/timeout).
+async fn submit_op_cli(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    req: OpSubmitReq,
+) -> Result<()> {
+    let kind = op_kind_name(req.kind).to_string();
+    let resp = client
+        .submit_op(req)
+        .await
+        .map_err(|e| anyhow!("submit {kind}: {e}"))?;
+    if resp.code != CODE_OK {
+        bail!("{kind}: {}", resp.message);
+    }
+    let op_id = resp.op_id;
+    if !wait {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "op_id": op_id,
+                    "kind": kind,
+                    "message": resp.message,
+                }))?
+            );
+        } else {
+            let note = if resp.message.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", resp.message)
+            };
+            println!("submitted {kind} op {op_id}{note}");
+            println!("  → autumn-op ops status {op_id}");
+        }
+        return Ok(());
+    }
+    // --wait: poll to terminal.
+    let timeout_s = if timeout_s == 0 { 600 } else { timeout_s };
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
+    loop {
+        let q = client
+            .op_query(OpQueryReq {
+                op_id,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("query op {op_id}: {e}"))?;
+        let rec = q.ops.into_iter().next().unwrap_or_default();
+        match rec.state {
+            OP_STATE_SUCCEEDED => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "op_id": op_id, "kind": kind, "state": "succeeded", "message": rec.message,
+                        }))?
+                    );
+                } else {
+                    println!("{kind} op {op_id} succeeded: {}", rec.message);
+                }
+                return Ok(());
+            }
+            OP_STATE_FAILED => bail!("{kind} op {op_id} failed: {}", rec.error),
+            OP_STATE_UNKNOWN => bail!("{kind} op {op_id} unknown: {}", rec.message),
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    bail!(
+                        "{kind} op {op_id} still {} after {timeout_s}s — still running; \
+                         `autumn-op ops status {op_id}` to keep watching",
+                        op_state_name(rec.state)
+                    );
+                }
+                compio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+/// `ops list [--active] [--kind K] [--limit N]` / `ops status <id>`.
+async fn cmd_ops(
+    client: &ClusterClient,
+    json: bool,
+    op_id: u64,
+    active: bool,
+    kind: &str,
+    limit: u32,
+) -> Result<()> {
+    let resp = client
+        .op_query(OpQueryReq {
+            op_id,
+            active_only: active,
+            kind_filter: op_kind_from_str(kind),
+            limit,
+        })
+        .await
+        .map_err(|e| anyhow!("ops: {e}"))?;
     if json {
+        let arr: Vec<_> = resp
+            .ops
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "op_id": o.op_id,
+                    "kind": op_kind_name(o.kind),
+                    "state": op_state_name(o.state),
+                    "part_id": o.part_id,
+                    "secondary_id": o.secondary_id,
+                    "error": o.error,
+                    "message": o.message,
+                    "requested_by": o.requested_by,
+                    "submitted_at": o.submitted_at,
+                    "finished_at": o.finished_at,
+                })
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "code": resp.code,
-                "extent_id": extent_id,
-                "message": resp.message,
-            }))?
+            serde_json::to_string_pretty(&serde_json::json!({ "ops": arr }))?
         );
-    } else {
-        println!("{}", resp.message);
+        return Ok(());
+    }
+    if resp.ops.is_empty() {
+        println!("(no ops)");
+        return Ok(());
+    }
+    for o in &resp.ops {
+        let target = if o.secondary_id != 0 {
+            format!("{}->{}", o.part_id, o.secondary_id)
+        } else if o.part_id != 0 {
+            o.part_id.to_string()
+        } else {
+            "-".to_string()
+        };
+        let tail = if !o.error.is_empty() {
+            format!("  ERROR: {}", o.error)
+        } else if !o.message.is_empty() {
+            format!("  {}", o.message)
+        } else {
+            String::new()
+        };
+        println!(
+            "op {:<20} {:<10} {:<9} target={}{}",
+            o.op_id,
+            op_kind_name(o.kind),
+            op_state_name(o.state),
+            target,
+            tail
+        );
     }
     Ok(())
 }
@@ -1698,6 +1891,8 @@ async fn cmd_force_ec_convert(client: &ClusterClient, json: bool, extent_id: u64
 async fn cmd_split(
     client: &ClusterClient,
     json: bool,
+    wait: bool,
+    timeout_s: u64,
     part_id: u64,
     point: SplitPoint,
 ) -> Result<()> {
@@ -1732,27 +1927,20 @@ async fn cmd_split(
         // GetRegions failed → skip precheck; let the authoritative PS call run.
     }
 
-    client
-        .split_at(part_id, at_key.clone())
-        .await
-        .map_err(|e| anyhow!("split: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "part_id": part_id,
-                "split_point": point.describe(),
-                // Echo the resolved raw wire key (hex); null = PS-median.
-                "at_key_hex": at_key.as_ref().map(|k| hex_encode(k)),
-            }))?
-        );
-    } else if at_key.is_some() {
-        println!("split ok (at {})", point.describe());
-    } else {
-        println!("split ok");
-    }
-    Ok(())
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_SPLIT,
+            part_id,
+            at_key,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// presplit a `{tenant}/{namespace}/` keyspace by its
@@ -1990,136 +2178,134 @@ async fn cmd_presplit(
     Ok(())
 }
 
-async fn cmd_merge(client: &ClusterClient, json: bool, survivor_part_id: u64, victim_part_id: u64, force: bool) -> Result<()> {
+async fn cmd_merge(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    survivor_part_id: u64,
+    victim_part_id: u64,
+    force: bool,
+) -> Result<()> {
     eprintln!(
         "Stop writes to partitions {survivor_part_id} and {victim_part_id} \
-         before continuing. The CLI will FLUSH both, then issue the manager merge. \
+         before continuing. The merge FLUSHes both, then the manager commits. \
          The survivor's PS picks up the wider range on the next region_sync (~2 s)."
     );
-    client
-        .merge_partitions(survivor_part_id, victim_part_id, force)
-        .await
-        .map_err(|e| anyhow!("merge: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "survivor": survivor_part_id,
-                "victim": victim_part_id,
-            }))?
-        );
-    } else {
-        println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
-    }
-    Ok(())
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_MERGE,
+            part_id: survivor_part_id,
+            secondary_id: victim_part_id,
+            force,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn cmd_rebalance(client: &ClusterClient, json: bool, max_moves: u32) -> Result<()> {
-    let moves = client
-        .rebalance_regions(max_moves)
-        .await
-        .map_err(|e| anyhow!("rebalance: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "moved": moves.len(),
-                "moves": moves
-                    .iter()
-                    .map(|m| serde_json::json!({
-                        "part_id": m.part_id,
-                        "from_ps": m.from_ps,
-                        "to_ps": m.to_ps,
-                    }))
-                    .collect::<Vec<_>>(),
-            }))?
-        );
-    } else if moves.is_empty() {
-        println!("rebalance: already balanced (0 moves)");
-    } else {
-        println!("rebalance: moved {} partition(s):", moves.len());
-        for m in &moves {
-            println!("  part {} : ps {} -> ps {}", m.part_id, m.from_ps, m.to_ps);
-        }
-    }
-    Ok(())
+async fn cmd_rebalance(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    max_moves: u32,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_REBALANCE,
+            max_moves,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn cmd_compact(client: &ClusterClient, json: bool, part_id: u64) -> Result<()> {
-    client
-        .compact(part_id)
-        .await
-        .map_err(|e| anyhow!("compact: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "part_id": part_id,
-            }))?
-        );
-    } else {
-        println!("compact triggered for partition {part_id}");
-    }
-    Ok(())
+async fn cmd_compact(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_COMPACT,
+            part_id,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn cmd_gc(client: &ClusterClient, json: bool, part_id: u64, ratio: Option<f64>, max_size: Option<u64>, stream_debt: Option<u64>, empty_only: bool) -> Result<()> {
-    let params = autumn_client::GcAutoParams {
-        ratio,
-        max_size,
-        stream_debt,
-        empty_only,
-    };
-    client
-        .gc_with_params(part_id, params.clone())
-        .await
-        .map_err(|e| anyhow!("gc: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "part_id": part_id,
-                "ratio": params.ratio,
-                "max_size": params.max_size,
-                "stream_debt": params.stream_debt,
-                "empty_only": params.empty_only,
-            }))?
-        );
-    } else {
-        println!(
-            "gc triggered for partition {part_id} (ratio={:?} max_size={:?} stream_debt={:?} empty_only={})",
-            params.ratio, params.max_size, params.stream_debt, params.empty_only
-        );
-    }
-    Ok(())
+#[allow(clippy::too_many_arguments)]
+async fn cmd_gc(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+    ratio: Option<f64>,
+    max_size: Option<u64>,
+    stream_debt: Option<u64>,
+    empty_only: bool,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_GC,
+            part_id,
+            gc_ratio: ratio,
+            gc_max_size: max_size,
+            gc_stream_debt: stream_debt,
+            gc_empty_only: empty_only,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-async fn cmd_force_gc(client: &ClusterClient, json: bool, part_id: u64, extent_ids: Vec<u64>) -> Result<()> {
-    let advisory = client
-        .force_gc(part_id, extent_ids.clone())
-        .await
-        .map_err(|e| anyhow!("forcegc: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "part_id": part_id,
-                "extents": extent_ids,
-                "advisory": advisory,
-            }))?
-        );
-    } else {
-        println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
-        if !advisory.is_empty() {
-            println!("  advisory: {advisory}");
-        }
-    }
-    Ok(())
+async fn cmd_force_gc(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+    extent_ids: Vec<u64>,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_FORCE_GC,
+            part_id,
+            extent_ids,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// M1c: `format` mints/reuses IDENTITY only (`node_uuid` +

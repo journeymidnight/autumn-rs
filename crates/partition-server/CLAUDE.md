@@ -1453,6 +1453,19 @@ Three fixes bound the restart replay window (worst case per partition =
     awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown).
     `compute_pending_compaction_bytes(part)` lives in `background.rs`.
 
+    **Async-op outcome reporting.** `PartitionMetrics.maintenance_outcomes` is a
+    bounded ring (cap 8) of terminal `MaintenanceOutcome{op_id, kind, state, error,
+    message}` for manager-submitted compact/gc/forcegc ops (those carrying a
+    non-zero `MaintenanceReq.op_id`; `op_id == 0` = the PS-local scheduler / legacy
+    SDK, recorded nowhere). `background_maintenance_loop` records the outcome at
+    each terminal exit (compact Ok/Err/skip/freeze-defer; the GC holes loop's
+    aggregate success / first-error) via `record_maint_outcome`. `report_load_loop`
+    copies the ring onto `PartitionLoad.maintenance_outcomes` every heartbeat
+    (idempotent retransmit — the ring isn't drained; the manager reconciles by
+    op_id once, so a dropped report self-heals). This is the ONLY channel that
+    carries a maintenance op's failure reason back — without it, a gc/compact error
+    dies in a `tracing::error!` invisible to the operator.
+
     The PS-level `maintenance_scheduler_loop` (5 s, main thread) is the primary trigger
     source: reads the gauges, computes `urgency = debt / threshold`, sorts desc,
     dispatches top-K minor compactions / GCs via Send-capable trigger channels in

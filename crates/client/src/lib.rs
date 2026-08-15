@@ -4120,6 +4120,33 @@ impl ClusterClient {
         Ok(resp.moves)
     }
 
+    /// Submit a long-running op to the manager's async op-ledger; returns the
+    /// assigned op id immediately (poll `op_query` for the outcome). The admin
+    /// token is prefixed automatically (MSG_OP_SUBMIT is in `is_admin_mgr_msg`).
+    pub async fn submit_op(
+        &self,
+        req: OpSubmitReq,
+    ) -> std::result::Result<OpSubmitResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(MSG_OP_SUBMIT, rkyv_encode(&req))
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
+    /// Query the op-ledger: `op_id != 0` → one record (UNKNOWN if the leader
+    /// doesn't know it); `op_id == 0` → a filtered list.
+    pub async fn op_query(
+        &self,
+        req: OpQueryReq,
+    ) -> std::result::Result<OpQueryResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(MSG_OP_QUERY, rkyv_encode(&req))
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
     /// query the manager's policy-engine advisory cache.
     pub async fn policy_candidates(
         &self,

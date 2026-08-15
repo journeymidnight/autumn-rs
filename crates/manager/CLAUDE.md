@@ -671,8 +671,44 @@ never persisted, safest → most aggressive:
 
 Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
 status|activate <name> [--arm]|deactivate`. Manual per-target actions go through
-`autumn-op` subcommands (`split`/`gc`/`compact`/`merge`/`force-ec-convert`/
-`rebalance`), leader-routed — the same underlying ops the controller uses.
+the async op-ledger below (`autumn-op split/gc/compact/merge/force-ec-convert/
+rebalance`), leader-routed — the same underlying ops the controller uses.
+
+## Async op-ledger (`op_ledger.rs`)
+
+Every long-running op (split/merge/rebalance/compact/gc/forcegc/ec-convert) is
+**submitted through the leader** (`MSG_OP_SUBMIT`), assigned an `op_id`, actuated
+in a background one-shot task that reuses `actuate_candidate`'s building blocks
+(`auto_dispatch_split` — now takes an explicit `at_key` override — /
+`handle_merge_partitions` / `handle_rebalance_regions` / `handle_force_ec_convert`
+/ `send_maintenance`), and made queryable (`MSG_OP_QUERY`). This recovers the
+failure reason the fire-and-forget maintenance ops used to drop.
+
+- **`OpLedger`** = leader-local, in-memory `VecDeque<OpRecord>` cap 256 (the
+  `ACTION_LOG_CAP` pattern). **State machine, not bools**: `Pending → Running →
+  Succeeded|Failed`, plus a synthesized `Unknown` — the honest answer for an
+  unknown/old id after a leader change (never a false `Running`). `op_id =
+  (epoch_ms<<16)|seq16` (non-zero — `0` is the query "list" sentinel).
+- **NOT etcd-persisted** — orchestration crash-safety already lives in the fenced
+  split/merge txns + EC inflight markers; the ledger is pure observability.
+  Durable terminal history rides the existing **audit log** (`AUDIT_OP_*` 7..12;
+  ec reuses `AUDIT_OP_FORCE_EC_CONVERT`), so post-failover forensics survive.
+- **Terminal reporting split**: manager-orchestrated kinds (split/merge/rebalance)
+  close their entry in-process on return; **PS-executed kinds (compact/gc/forcegc)
+  stay Running and are closed by the load heartbeat** — the PS records a
+  `MaintenanceOutcome{op_id,state,error}` in a small ring, piggybacks it on
+  `PartitionLoad`, and `handle_report_partition_load` reconciles by op_id
+  (`reconcile_outcome`, once) + audits. ec-convert closes via
+  `apply_ec_conversion_done → complete_ec(extent_id)`.
+- **TTL backstop**: a Running compact/gc/forcegc older than 30 min flips to
+  `Unknown` (`sweep_running_ttl`, on the leader policy tick) — a lost PS outcome
+  never sits Running forever. **Attach-dedup**: a resubmit of the same
+  `(kind, part_id, secondary_id)` while active returns the existing op_id.
+- **`--wait`** is a pure client-side poll over `MSG_OP_QUERY` — one execution
+  path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
+  (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is
+  empty). Deferred: `seed_ec_replay` (list a prior leader's in-flight EC ops on
+  promotion).
 
 ## Web dashboard (standalone app)
 
