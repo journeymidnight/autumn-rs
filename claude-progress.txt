@@ -1,3 +1,27 @@
+Date: 2026-08-15
+TaskStatus: completed
+Task scope: op 命令统一异步 + 可查状态（用户："所有 op 都应异步保持一致，只要能查当前状态"）。fable
+  agent 统一规划(scratchpad/ops_async_design.md)→用户定案:in-memory ledger+audit 持久、build 全 7 op。
+  5 阶段全完，每阶段编译+测试绿+推 main；live e2e 10/10。
+  ① 线材(c9e0a94,28→29 一次 bump,fp b65437d410e5f2c6):MSG_OP_SUBMIT/QUERY+OpSubmit/Query/Record+
+     MaintenanceOutcome+OP_KIND_*/OP_STATE_*;PartitionLoad.maintenance_outcomes;MaintenanceReq.op_id;
+     is_admin_mgr_msg+=SUBMIT;AUDIT_OP_* 7..12。
+  ② manager(7da6b3f):op_ledger.rs(VecDeque cap256,状态机 Pending→Running→Succeeded|Failed+合成 Unknown,
+     op_id=(ms<<16)|seq16 非零,attach-dedup,finish 幂等,sweep_running_ttl 30min);handle_op_submit(leader+admin
+     门,spawn catch_unwind actuation 复用 auto_dispatch_split(加 explicit at_key)/handle_merge/rebalance/
+     force_ec_convert/send_maintenance)+handle_op_query;EC 钩 apply_ec_conversion_done→complete_ec;TTL 挂 policy tick。
+     split/merge/rebalance 就地终态,compact/gc/forcegc+ec 留 Running。
+  ③ PS(cce6dcf):MaintenanceReq.op_id 穿 compact_tx(CompactTask)/GcTask{op_id};PartitionMetrics.
+     maintenance_outcomes 环(cap8);background_maintenance_loop 各终态点(compact Ok/Err/skip/freeze-defer;
+     GC 早退+holes 聚合)record_maint_outcome;report_load_loop 抄环上心跳;manager handle_report_partition_load
+     reconcile_outcome(按 op_id 一次)+audit。3 recovery 集测 in-batch 挂=既存 BlockCache 污染(对基线验过)。
+  ④ CLI/SDK/docs(491898a):ClusterClient.submit_op/op_query;autumn-op 7 触发改 submit+印 op_id、新 ops
+     status/list、全局 --wait/--timeout(位置无关,预过滤);presplit 留低阶 split_at。docs 全刷。
+  ⑤ e2e(fd187f0):--wait 位置无关修 + GC 两早退补 outcome(空分区 gc 曾卡 Running)。scratchpad/ops_smoke.sh
+     10/10:compact/gc/rebalance/split --wait 终态、split 分区+1、异步 submit→poll、ops list、unknown、admin 门。
+  残留/延后:seed_ec_replay(promotion 列上代 leader 在飞 EC)未接;GC 候选阶段极少数 infra 早退(916 类)未全补→
+     TTL 兜底。手工 op 现全异步+可查错;老低阶 SDK 阻塞法保留给测试/内部。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-14
 TaskStatus: completed
 Task scope: dashboard 大规模可用性改版（用户："partition 非常多时应点 ps 才看这台机的 partitions" → "这套可以" → build+rollout）。
