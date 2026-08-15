@@ -25,6 +25,30 @@ use crate::sstable::{
 pub(crate) const SCAN_READ_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 use crate::*;
 
+/// Record a terminal maintenance outcome onto the partition's heartbeat ring so
+/// the manager's op-ledger learns the state + error string. No-op for untracked
+/// ops (`op_id == 0`: the PS-local scheduler / legacy SDK).
+fn record_maint_outcome(
+    metrics: &PartitionMetrics,
+    op_id: u64,
+    kind: u8,
+    state: u8,
+    error: String,
+    message: String,
+) {
+    if op_id == 0 {
+        return;
+    }
+    metrics.push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
+        op_id,
+        kind,
+        state,
+        error,
+        message,
+        finished_at: crate::now_secs() as i64,
+    });
+}
+
 // the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
 // `--min-pipeline-batch` knob) is GONE. The gate required `n_inflight == 0
 // || pending >= 256` before launching a batch; whenever per-partition
@@ -263,7 +287,7 @@ pub(crate) fn compaction_output_vp_head(
 pub(crate) async fn background_maintenance_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
-    mut compact_rx: mpsc::Receiver<bool>,
+    mut compact_rx: mpsc::Receiver<CompactTask>,
     mut gc_rx: mpsc::Receiver<GcTask>,
     maintenance_gate: std::sync::Arc<crate::CompactionGate>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
@@ -307,7 +331,7 @@ pub(crate) async fn background_maintenance_loop(
         use std::task::Poll;
 
         enum Sel {
-            CompactRecv(Option<bool>),
+            CompactRecv(Option<CompactTask>),
             GcRecv(Option<GcTask>),
             CompactTimeout,
             GcTimeout,
@@ -417,11 +441,18 @@ pub(crate) async fn background_maintenance_loop(
                 // both senders are bounded; `now_or_never()` ensures
                 // we never block here.
                 use futures::stream::StreamExt;
-                let mut major = first;
+                let mut major = first.is_major;
+                // Carry a tracked op_id across the collapsed dispatches (prefer a
+                // non-zero id: a manual op coalescing with a scheduler tick still
+                // reports its outcome). Same-target manual ops share one id via
+                // the manager's attach-dedup, so two distinct non-zero ids here
+                // can't both be active.
+                let mut compact_op_id = first.op_id;
                 while let Some(Some(more)) = compact_rx.next().now_or_never() {
-                    if more {
+                    if more.is_major {
                         major = true;
                     }
+                    compact_op_id = compact_op_id.max(more.op_id);
                 }
                 // 2026-06-02 fix — refuse to start a new compact while a
                 // split / merge freeze is in flight. `try_complete_freeze_drain`
@@ -444,6 +475,14 @@ pub(crate) async fn background_maintenance_loop(
                         // clears (region_sync_loop drops + reopens the
                         // partition on split-survivor / merge-victim, or
                         // partition_loop clears the flag on rollback).
+                        record_maint_outcome(
+                            &p.metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
                         continue;
                     }
                 }
@@ -483,6 +522,14 @@ pub(crate) async fn background_maintenance_loop(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    record_maint_outcome(
+                        &metrics,
+                        compact_op_id,
+                        manager_rpc::OP_KIND_COMPACT,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "nothing to compact".to_string(),
+                    );
                     refresh_metrics(&part);
                     stamp_last_compact();
                     clear_compact_inflight();
@@ -512,6 +559,14 @@ pub(crate) async fn background_maintenance_loop(
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
+                    );
+                    record_maint_outcome(
+                        &metrics,
+                        compact_op_id,
+                        manager_rpc::OP_KIND_COMPACT,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "nothing to compact".to_string(),
                     );
                     refresh_metrics(&part);
                     stamp_last_compact();
@@ -550,8 +605,32 @@ pub(crate) async fn background_maintenance_loop(
                                 tracing::warn!("compaction truncate: {e}");
                             }
                         }
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_SUCCEEDED,
+                            String::new(),
+                            format!(
+                                "{} compaction: {} → {} tables",
+                                if major { "major" } else { "minor" },
+                                s.input_tables,
+                                s.output_tables
+                            ),
+                        );
                     }
-                    Err(e) => tracing::error!("compaction: {e}"),
+                    Err(e) => {
+                        let es = format!("{e}");
+                        tracing::error!("compaction: {es}");
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            es,
+                            String::new(),
+                        );
+                    }
                 }
                 // fix-r2 HIGH: stamp + refresh pending bytes BEFORE
                 // clearing compact_inflight. Round-2 audit caught that
@@ -763,11 +842,15 @@ pub(crate) async fn background_maintenance_loop(
                     // Acceptable.
                     let mut chosen = first;
                     while let Some(Some(more)) = gc_rx.next().now_or_never() {
+                        // Carry a tracked op_id across the collapse (prefer
+                        // non-zero, like the compact drain).
+                        let op_id = chosen.op_id().max(more.op_id());
                         chosen = match (chosen, more) {
                             (
-                                GcTask::Force { mut extent_ids },
+                                GcTask::Force { mut extent_ids, .. },
                                 GcTask::Force {
                                     extent_ids: more_eids,
+                                    ..
                                 },
                             ) => {
                                 for e in more_eids {
@@ -775,18 +858,20 @@ pub(crate) async fn background_maintenance_loop(
                                         extent_ids.push(e);
                                     }
                                 }
-                                GcTask::Force { extent_ids }
+                                GcTask::Force { extent_ids, op_id }
                             }
-                            (GcTask::Force { extent_ids }, GcTask::Auto(_)) => {
-                                GcTask::Force { extent_ids }
+                            (GcTask::Force { extent_ids, .. }, GcTask::Auto { .. }) => {
+                                GcTask::Force { extent_ids, op_id }
                             }
-                            (GcTask::Auto(_), GcTask::Force { extent_ids }) => {
-                                GcTask::Force { extent_ids }
+                            (GcTask::Auto { .. }, GcTask::Force { extent_ids, .. }) => {
+                                GcTask::Force { extent_ids, op_id }
                             }
                             // when two Auto ticks coalesce, keep the
                             // most-recent params (the operator's latest
                             // intent supersedes anything queued behind it).
-                            (GcTask::Auto(_), GcTask::Auto(p2)) => GcTask::Auto(p2),
+                            (GcTask::Auto { .. }, GcTask::Auto { params, .. }) => {
+                                GcTask::Auto { params, op_id }
+                            }
                         };
                     }
                     chosen
@@ -925,11 +1010,18 @@ pub(crate) async fn background_maintenance_loop(
                     .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
                 let is_force = matches!(gc_task, GcTask::Force { .. });
+                // op-ledger correlation for the terminal outcome (0 = untracked).
+                let gc_op_id = gc_task.op_id();
+                let gc_kind = if is_force {
+                    manager_rpc::OP_KIND_FORCE_GC
+                } else {
+                    manager_rpc::OP_KIND_GC
+                };
                 // (extent_id, authoritative sealed_length) — validated ONCE at selection
                 // so the execution loop never re-reads (possibly stale) state before the
                 // destructive punch. See `authoritative_sealed_length`.
                 let mut holes: Vec<(u64, u64)> = match gc_task {
-                    GcTask::Force { ref extent_ids } => {
+                    GcTask::Force { ref extent_ids, .. } => {
                         let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
                         let mut hs: Vec<(u64, u64)> = Vec::new();
                         let mut skipped = 0usize;
@@ -964,7 +1056,7 @@ pub(crate) async fn background_maintenance_loop(
                         }
                         hs
                     }
-                    GcTask::Auto(ref params) => {
+                    GcTask::Auto { ref params, .. } => {
                         let discards = tick_discards;
 
                         // candidate set is ALL sealed (non-tail) extents,
@@ -1136,6 +1228,14 @@ pub(crate) async fn background_maintenance_loop(
                     // fix HIGH-2 + r2: same stamp-then-clear rationale as
                     // the early-exit paths above. Cooldown engages even when
                     // there's nothing to punch.
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "no eligible extents to reclaim".to_string(),
+                    );
                     stamp_last_gc();
                     clear_inflight(&metrics);
                     continue;
@@ -1172,6 +1272,9 @@ pub(crate) async fn background_maintenance_loop(
                 // (`authoritative_sealed_length`) and carried here — do NOT re-read it
                 // from the (possibly stale) extent_info cache, or the check/use split
                 // re-opens the seed=583 stale-cache punch on a sealed extent.
+                let n_holes = holes.len();
+                // First failure across the batch → the op's reported error.
+                let mut gc_failed: Option<String> = None;
                 for (eid, sealed_length) in holes {
                     match run_gc(&part, eid, sealed_length).await {
                         Ok(()) => {
@@ -1191,9 +1294,30 @@ pub(crate) async fn background_maintenance_loop(
                                 cooldown_secs = dur.as_secs(),
                                 "GC run_gc extent: {e}"
                             );
+                            if gc_failed.is_none() {
+                                gc_failed = Some(format!("extent {eid}: {e}"));
+                            }
                             gc_failure_cooldown.insert(eid, (Instant::now(), dur));
                         }
                     }
+                }
+                match gc_failed {
+                    None => record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        format!("reclaimed {n_holes} extent(s)"),
+                    ),
+                    Some(err) => record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        err,
+                        String::new(),
+                    ),
                 }
                 // fix HIGH-2 + r2: stamp BEFORE clear so the scheduler
                 // doesn't see (inflight=0, last_gc_at=stale) and re-dispatch.

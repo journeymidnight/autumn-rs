@@ -866,7 +866,7 @@ pub(crate) struct PartitionData {
     /// queued for retry and keeps its vp).
     imm_vp_heads: RefCell<HashMap<usize, (u64, u64)>>,
     flush_tx: mpsc::UnboundedSender<()>,
-    compact_tx: mpsc::Sender<bool>,
+    compact_tx: mpsc::Sender<CompactTask>,
     gc_tx: mpsc::Sender<GcTask>,
     seq_number: u64,
     /// User keys with a write in the WAL pipeline — seq assigned (Phase 1,
@@ -1239,6 +1239,32 @@ pub struct PartitionMetrics {
     pub minor_compact_pending_bytes: std::sync::atomic::AtomicU64,
     /// count of sealed log_stream extents (informational).
     pub sealed_log_extent_count: std::sync::atomic::AtomicU32,
+    /// Terminal outcomes of manager-submitted maintenance ops (compact/gc/
+    /// forcegc carrying a non-zero op_id) — a bounded ring copied onto the load
+    /// heartbeat so the manager's op-ledger learns the state + error string that
+    /// would otherwise die in a PS `tracing::error!`.
+    pub maintenance_outcomes: parking_lot::Mutex<VecDeque<manager_rpc::MaintenanceOutcome>>,
+}
+
+/// Max terminal maintenance outcomes buffered for the heartbeat. Small — each
+/// retransmits until newer ones push it out (the manager reconciles by op_id,
+/// idempotently), so a couple of heartbeats' worth is plenty.
+const MAINT_OUTCOME_RING_CAP: usize = 8;
+
+impl PartitionMetrics {
+    /// Record a terminal maintenance outcome for the next heartbeat (bounded).
+    pub fn push_maintenance_outcome(&self, o: manager_rpc::MaintenanceOutcome) {
+        let mut r = self.maintenance_outcomes.lock();
+        r.push_back(o);
+        while r.len() > MAINT_OUTCOME_RING_CAP {
+            r.pop_front();
+        }
+    }
+    /// Snapshot (copy, not drain) the ring for the heartbeat — idempotent
+    /// retransmit covers a dropped report.
+    pub fn snapshot_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
+        self.maintenance_outcomes.lock().iter().cloned().collect()
+    }
 }
 
 impl PartitionData {
@@ -1469,16 +1495,31 @@ mod reader_pin_tests {
 // GC task
 // ---------------------------------------------------------------------------
 
+/// A compaction dispatch carrying its manager op-ledger correlation id
+/// (`op_id == 0` = untracked: the PS-local scheduler + legacy SDK callers).
+#[derive(Clone, Copy)]
+pub(crate) struct CompactTask {
+    pub is_major: bool,
+    pub op_id: u64,
+}
+
 pub(crate) enum GcTask {
     /// Pick GC candidates by policy. Parameters describe WHICH extents
     /// are eligible (multi-tier filtering). Default = standard
     /// `discard_ratio > 0.4` over all sealed non-tail extents (the
     /// original single-tier behaviour) PLUS empty-sealed slots that
-    /// the candidate-set fix unblocked.
-    Auto(GcAutoParams),
-    Force {
-        extent_ids: Vec<u64>,
-    },
+    /// the candidate-set fix unblocked. `op_id == 0` = untracked.
+    Auto { params: GcAutoParams, op_id: u64 },
+    Force { extent_ids: Vec<u64>, op_id: u64 },
+}
+
+impl GcTask {
+    /// The manager op-ledger correlation id (`0` = untracked).
+    pub(crate) fn op_id(&self) -> u64 {
+        match self {
+            GcTask::Auto { op_id, .. } | GcTask::Force { op_id, .. } => *op_id,
+        }
+    }
 }
 
 /// parameters passed by callers (CLI / external controller) to
@@ -1951,7 +1992,7 @@ struct PartitionHandle {
     // channel open regardless). #[allow] rather than delete to avoid churning
     // the PartitionHandle construction sites for a vestigial field.
     #[allow(dead_code)]
-    compact_trigger: mpsc::Sender<bool>,
+    compact_trigger: mpsc::Sender<CompactTask>,
     /// same shape for GC.
     #[allow(dead_code)]
     gc_trigger: mpsc::Sender<GcTask>,
@@ -3455,7 +3496,9 @@ impl PartitionServer {
                             sealed_log_extent_count,
                             open_tail_bytes,
                             open_tail_dead_bytes,
-                            maintenance_outcomes: vec![],
+                            maintenance_outcomes: handle
+                                .metrics
+                                .snapshot_maintenance_outcomes(),
                         }
                     })
                     .collect()
@@ -4063,7 +4106,7 @@ impl PartitionServer {
         // maintenance scheduler. The receivers go into `partition_thread_main`
         // and on into `background_compact_loop` / `background_gc_loop`. The
         // in-thread sender clones land in `PartitionData` via `partition_thread_main`.
-        let (compact_tx_main, compact_rx_main) = mpsc::channel::<bool>(1);
+        let (compact_tx_main, compact_rx_main) = mpsc::channel::<CompactTask>(1);
         let (gc_tx_main, gc_rx_main) = mpsc::channel::<GcTask>(1);
         let compact_tx_for_thread = compact_tx_main.clone();
         let gc_tx_for_thread = gc_tx_main.clone();
@@ -5503,8 +5546,8 @@ async fn partition_thread_main(
     // are cloned into `PartitionData` (replacing the old in-thread
     // channel) so loopback rpc handlers + the maintenance scheduler
     // (main thread) drain into the same receiver.
-    compact_tx: mpsc::Sender<bool>,
-    compact_rx: mpsc::Receiver<bool>,
+    compact_tx: mpsc::Sender<CompactTask>,
+    compact_rx: mpsc::Receiver<CompactTask>,
     gc_tx: mpsc::Sender<GcTask>,
     gc_rx: mpsc::Receiver<GcTask>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,

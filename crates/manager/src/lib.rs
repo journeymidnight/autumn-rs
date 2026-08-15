@@ -4905,6 +4905,42 @@ mod tests {
     }
 
     #[test]
+    fn report_load_reconciles_maintenance_outcome_into_ledger() {
+        let m = AutumnManager::new();
+        // Seed a RUNNING gc op directly (bypassing the spawned actuation, which
+        // in a bare test has no PS to reach).
+        let (op_id, _) =
+            m.ops
+                .borrow_mut()
+                .submit(OP_KIND_GC, 5, 0, vec![], "cli".to_string(), 1, 1_000_000);
+        m.ops.borrow_mut().set_running(op_id, 1);
+        // A heartbeat carrying the terminal outcome (as the PS would report it).
+        let load = PartitionLoad {
+            part_id: 5,
+            maintenance_outcomes: vec![MaintenanceOutcome {
+                op_id,
+                kind: OP_KIND_GC,
+                state: OP_STATE_FAILED,
+                error: "extent 9: precondition failed".to_string(),
+                message: String::new(),
+                finished_at: 10,
+            }],
+            ..Default::default()
+        };
+        let req = rkyv_encode(&ReportPartitionLoadReq { ps_id: 1, partitions: vec![load] });
+        run(async { m.handle_report_partition_load(req).await.unwrap() });
+        // The ledger entry is now terminal with the surfaced error string.
+        let q: OpQueryResp = rkyv_decode(&run(async {
+            m.handle_op_query(rkyv_encode(&OpQueryReq { op_id, ..Default::default() }))
+                .await
+                .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(q.ops[0].state, OP_STATE_FAILED);
+        assert_eq!(q.ops[0].error, "extent 9: precondition failed");
+    }
+
+    #[test]
     fn two_distinct_reporters_below_quorum_no_offline() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 7, 70);

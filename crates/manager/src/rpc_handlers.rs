@@ -4688,6 +4688,14 @@ impl AutumnManager {
         let req: ReportPartitionLoadReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let now = Self::epoch_seconds();
+        // Collect PS-reported maintenance outcomes before the loop consumes
+        // `req.partitions`; reconciled into the op-ledger after the metrics
+        // borrow is released (append_audit is async).
+        let outcomes: Vec<autumn_rpc::manager_rpc::MaintenanceOutcome> = req
+            .partitions
+            .iter()
+            .flat_map(|l| l.maintenance_outcomes.iter().cloned())
+            .collect();
         let mut p = self.policy.borrow_mut();
         // honour the configured `window_buckets / bucket_sec`
         // (was hardcoded `POLICY_WINDOW_BUCKETS / POLICY_BUCKET_SEC`,
@@ -4704,6 +4712,30 @@ impl AutumnManager {
                 .push_with_cap_and_bucket(now, load, cap, bucket_sec);
         }
         drop(p);
+        // Reconcile PS-executed op outcomes into the ledger (known op_id only,
+        // idempotent) and audit each terminal transition exactly once.
+        for o in outcomes {
+            let transitioned = self.ops.borrow_mut().reconcile_outcome(
+                o.op_id,
+                o.state,
+                o.error.clone(),
+                o.message.clone(),
+                now,
+            );
+            if transitioned {
+                self.append_audit(MgrAuditEntry {
+                    op: crate::op_kind_audit_code(o.kind),
+                    node_id: 0,
+                    extent_id: 0,
+                    by: "cli".to_string(),
+                    reason: String::new(),
+                    result_code: if o.state == OP_STATE_SUCCEEDED { 0 } else { 1 },
+                    result_message: if o.error.is_empty() { o.message } else { o.error },
+                    ts_ns: 0,
+                })
+                .await;
+            }
+        }
         Self::code_resp(CODE_OK, String::new())
     }
 

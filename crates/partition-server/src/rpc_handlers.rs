@@ -1748,6 +1748,7 @@ pub(crate) async fn handle_maintenance(
         let mut gc_tx = gc_tx;
         let (code, message) = match gc_tx.try_send(GcTask::Force {
             extent_ids: req.extent_ids,
+            op_id: req.op_id,
         }) {
             Ok(()) => (CODE_OK, advisory),
             Err(_) => (CODE_ERROR, "gc busy".to_string()),
@@ -1766,7 +1767,10 @@ pub(crate) async fn handle_maintenance(
     }
     let mut p = part.borrow_mut();
     let result = match req.op {
-        MAINTENANCE_COMPACT => p.compact_tx.try_send(true).map_err(|_| "compaction busy"),
+        MAINTENANCE_COMPACT => p
+            .compact_tx
+            .try_send(crate::CompactTask { is_major: true, op_id: req.op_id })
+            .map_err(|_| "compaction busy"),
         MAINTENANCE_AUTO_GC => {
             // decode multi-tier filter params from wire request.
             let params = crate::GcAutoParams {
@@ -1776,7 +1780,7 @@ pub(crate) async fn handle_maintenance(
                 empty_only: req.gc_empty_only,
             };
             p.gc_tx
-                .try_send(GcTask::Auto(params))
+                .try_send(GcTask::Auto { params, op_id: req.op_id })
                 .map_err(|_| "gc busy")
         }
         // MAINTENANCE_FORCE_GC handled above (advisory preview path).

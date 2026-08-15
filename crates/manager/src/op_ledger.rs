@@ -147,6 +147,35 @@ impl OpLedger {
         }
     }
 
+    /// Reconcile a PS-reported terminal maintenance outcome. Returns `true` iff
+    /// this call actually moved a KNOWN, still-active op to terminal — so the
+    /// caller audits exactly once (a heartbeat retransmit or an unknown op_id
+    /// returns `false`, an idempotent no-op).
+    pub(crate) fn reconcile_outcome(
+        &mut self,
+        op_id: u64,
+        state: u8,
+        error: String,
+        message: String,
+        now_s: i64,
+    ) -> bool {
+        if let Some(e) = self.find_mut(op_id) {
+            if Self::is_active(e.state) {
+                e.state = state;
+                e.error = error;
+                if !message.is_empty() {
+                    e.message = message;
+                }
+                e.finished_at = now_s;
+                if e.started_at == 0 {
+                    e.started_at = now_s;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Close the EC-convert entry whose target extent matches. EC identity is
     /// exact (extent_id) and the manager is the EC orchestrator, so this is
     /// authoritative, not inference.
@@ -294,6 +323,21 @@ mod tests {
         assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
         led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1); // past TTL
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn reconcile_outcome_transitions_once() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 1, 1_000_000);
+        led.set_running(id, 1);
+        assert!(led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 5));
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+        assert_eq!(q_one(&led, id).error, "boom");
+        // heartbeat retransmit → false (already terminal), state unchanged.
+        assert!(!led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 6));
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+        // unknown op_id → false.
+        assert!(!led.reconcile_outcome(999, OP_STATE_SUCCEEDED, String::new(), String::new(), 7));
     }
 
     #[test]
