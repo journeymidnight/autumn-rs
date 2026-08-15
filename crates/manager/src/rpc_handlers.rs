@@ -327,6 +327,8 @@ impl AutumnManager {
             MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
             MSG_AUTOPOLICY_SET => self.handle_autopolicy_set(payload).await,
             MSG_REBALANCE_REGIONS => self.handle_rebalance_regions(payload).await,
+            MSG_OP_SUBMIT => self.handle_op_submit(payload).await,
+            MSG_OP_QUERY => self.handle_op_query(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -4503,6 +4505,104 @@ impl AutumnManager {
             message: String::new(),
             moves,
             moved,
+        }))
+    }
+
+    /// `MSG_OP_SUBMIT` — record a long-running op in the ledger and actuate it in
+    /// the background, returning the assigned `op_id` immediately. Leader-gated +
+    /// admin-gated (the dispatch already stripped/verified the token prefix).
+    pub(crate) async fn handle_op_submit(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                op_id: 0,
+            }));
+        }
+        let req: OpSubmitReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Validate kind + the target its actuation needs, up front — a malformed
+        // submit is a request error (no ledger entry), not a FAILED op.
+        let need_part = matches!(
+            req.kind,
+            OP_KIND_SPLIT | OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC
+        );
+        let bad = match req.kind {
+            OP_KIND_SPLIT | OP_KIND_MERGE | OP_KIND_REBALANCE | OP_KIND_COMPACT | OP_KIND_GC
+            | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT => {
+                if need_part && req.part_id == 0 {
+                    Some("this op requires a part_id")
+                } else if req.kind == OP_KIND_MERGE
+                    && (req.part_id == 0 || req.secondary_id == 0)
+                {
+                    Some("merge requires survivor part_id + victim secondary_id")
+                } else if req.kind == OP_KIND_EC_CONVERT && req.secondary_id == 0 {
+                    Some("ec-convert requires an extent id (secondary_id)")
+                } else if req.kind == OP_KIND_FORCE_GC && req.extent_ids.is_empty() {
+                    Some("forcegc requires at least one extent id")
+                } else {
+                    None
+                }
+            }
+            _ => Some("unknown op kind"),
+        };
+        if let Some(msg) = bad {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: msg.to_string(),
+                op_id: 0,
+            }));
+        }
+
+        let (now_s, now_ms) = Self::now_s_ms();
+        let requested_by = if req.requested_by.is_empty() {
+            "cli".to_string()
+        } else {
+            req.requested_by.clone()
+        };
+        let (op_id, attached) = self.ops.borrow_mut().submit(
+            req.kind,
+            req.part_id,
+            req.secondary_id,
+            req.extent_ids.clone(),
+            requested_by,
+            now_s,
+            now_ms,
+        );
+        if attached {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: CODE_OK,
+                message: "attached to an in-flight op with the same target".to_string(),
+                op_id,
+            }));
+        }
+        // Actuate in the background; the caller polls `ops status`.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move { mgr.run_submitted_op(op_id, req).await }).detach();
+        Ok(rkyv_encode(&OpSubmitResp {
+            code: CODE_OK,
+            message: String::new(),
+            op_id,
+        }))
+    }
+
+    /// `MSG_OP_QUERY` — `ops status <id>` (one record, UNKNOWN if not in this
+    /// leader's ledger) or `ops list` (filtered). Leader-gated (a follower's
+    /// ledger is empty).
+    pub(crate) async fn handle_op_query(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpQueryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ops: vec![],
+            }));
+        }
+        let req: OpQueryReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let ops = self.ops.borrow().query(&req);
+        Ok(rkyv_encode(&OpQueryResp {
+            code: CODE_OK,
+            message: String::new(),
+            ops,
         }))
     }
 

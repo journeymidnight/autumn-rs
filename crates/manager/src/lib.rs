@@ -24,6 +24,41 @@ pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 pub mod dashboard_compose;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
+// The async op-ledger: every long-running op (split/merge/rebalance/compact/gc/
+// forcegc/ec-convert) is submitted through the leader, actuated in the
+// background, and made queryable — recovering the failure reason the
+// fire-and-forget maintenance ops used to drop.
+mod op_ledger;
+
+/// How a submitted op's actuation should transition its ledger entry.
+enum ActuationResult {
+    /// Closes the entry now — split / merge / rebalance complete synchronously
+    /// (their RPC returns the true outcome), and any kind that fails to dispatch.
+    Terminal {
+        state: u8,
+        error: String,
+        message: String,
+    },
+    /// Leaves the entry RUNNING — compact/gc/forcegc were enqueued on the PS
+    /// (the terminal outcome arrives on the load heartbeat), and ec-convert's
+    /// marker was acquired (closed by `apply_ec_conversion_done`). Carries an
+    /// advisory message (e.g. the forcegc replay-floor preview) to surface now.
+    Dispatched { message: String },
+}
+
+/// `OP_KIND_*` → the `AUDIT_OP_*` code for its durable terminal record.
+fn op_kind_audit_code(kind: u8) -> u8 {
+    match kind {
+        OP_KIND_SPLIT => AUDIT_OP_SPLIT,
+        OP_KIND_MERGE => AUDIT_OP_MERGE,
+        OP_KIND_REBALANCE => AUDIT_OP_REBALANCE,
+        OP_KIND_COMPACT => AUDIT_OP_COMPACT,
+        OP_KIND_GC => AUDIT_OP_GC,
+        OP_KIND_FORCE_GC => AUDIT_OP_FORCE_GC,
+        OP_KIND_EC_CONVERT => AUDIT_OP_FORCE_EC_CONVERT,
+        _ => 0,
+    }
+}
 
 pub(crate) use extent_delete::PendingDelete;
 
@@ -799,6 +834,10 @@ pub struct AutumnManager {
     /// runs ONLY on the leader and is DEFAULT-OFF (a fresh cluster stays
     /// pure-mechanism).
     pub(crate) auto_policy: Rc<RefCell<crate::auto_policy::AutoPolicyState>>,
+    /// leader-local, in-memory ledger of submitted long-running ops (the
+    /// queryable state + failure reason for split/merge/rebalance/compact/gc/
+    /// forcegc/ec-convert). Terminal outcomes also go to the durable audit log.
+    pub(crate) ops: Rc<RefCell<crate::op_ledger::OpLedger>>,
     /// preset to seed as the active policy (Armed) on
     /// a FRESH cluster — one with no persisted `autoPolicy/config`. Set from the
     /// bin (`--auto-policy-default <preset>`, deploy-layer default `balanced`);
@@ -956,6 +995,7 @@ impl AutumnManager {
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
+            ops: Rc::new(RefCell::new(crate::op_ledger::OpLedger::new())),
             auto_policy_default: Rc::new(RefCell::new(None)),
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
@@ -1093,7 +1133,7 @@ impl AutumnManager {
             same_ps: true,
             last_op_at: 0,
         };
-        self.auto_dispatch_split(&cand, &state).await
+        self.auto_dispatch_split(&cand, None, &state).await
     }
 
     /// test helper: orchestrate a MERGE for (survivor, victim) as
@@ -1338,6 +1378,10 @@ impl AutumnManager {
             if !self.leader.get() {
                 continue;
             }
+            // TTL backstop: flip any RUNNING PS-executed op (compact/gc/forcegc)
+            // whose terminal outcome never came back to UNKNOWN, keeping
+            // `ops status` honest instead of RUNNING forever.
+            self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
             let now = Self::epoch_seconds();
             let owners: HashMap<u64, u64> = {
                 let s = self.store.inner.borrow();
@@ -1644,16 +1688,17 @@ impl AutumnManager {
         })
     }
 
-    /// Send a MAINTENANCE op (gc / compact / forcegc) to a partition's owning PS
-    /// (in-process, same ConnPool as auto_dispatch_*). `extent_ids` is used only
-    /// by `MAINTENANCE_FORCE_GC`; gc/compact pass empty.
-    async fn actuate_maintenance(
+    /// Send a fully-populated MAINTENANCE request to its partition's owning PS
+    /// (in-process, same ConnPool as auto_dispatch_*) and return the decoded
+    /// response WITHOUT interpreting its code. The op-ledger path needs the raw
+    /// `MaintenanceResp` (op_id correlation + the forcegc advisory in `message`);
+    /// `actuate_maintenance` wraps this for the controller's fire-and-forget use.
+    async fn send_maintenance(
         &self,
-        part_id: u64,
-        op: u8,
-        extent_ids: Vec<u64>,
+        req: autumn_rpc::partition_rpc::MaintenanceReq,
         state: &autumn_common::MetadataState,
-    ) -> Result<()> {
+    ) -> Result<autumn_rpc::partition_rpc::MaintenanceResp> {
+        let part_id = req.part_id;
         let ps_addr = state
             .part_addrs
             .get(&part_id)
@@ -1665,18 +1710,7 @@ impl AutumnManager {
                     .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
             })
             .ok_or_else(|| anyhow::anyhow!("no address for part {part_id}"))?;
-        let payload = autumn_rpc::partition_rpc::rkyv_encode(
-            &autumn_rpc::partition_rpc::MaintenanceReq {
-                part_id,
-                op,
-                extent_ids,
-                gc_ratio: None,
-                gc_max_size: None,
-                gc_stream_debt: None,
-                gc_empty_only: false,
-                op_id: 0,
-            },
-        );
+        let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
         // (PS slice): authenticate the manager's own maintenance
         // call so the PS gate (when a token is configured) admits it.
         let payload = self.admin_prefix_ps(payload);
@@ -1690,9 +1724,34 @@ impl AutumnManager {
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let resp: autumn_rpc::partition_rpc::MaintenanceResp =
-            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Send a MAINTENANCE op (gc / compact / forcegc) to a partition's owning PS.
+    /// `extent_ids` is used only by `MAINTENANCE_FORCE_GC`; gc/compact pass empty.
+    /// Untracked (`op_id = 0`) — the controller's fire-and-forget path.
+    async fn actuate_maintenance(
+        &self,
+        part_id: u64,
+        op: u8,
+        extent_ids: Vec<u64>,
+        state: &autumn_common::MetadataState,
+    ) -> Result<()> {
+        let resp = self
+            .send_maintenance(
+                autumn_rpc::partition_rpc::MaintenanceReq {
+                    part_id,
+                    op,
+                    extent_ids,
+                    gc_ratio: None,
+                    gc_max_size: None,
+                    gc_stream_debt: None,
+                    gc_empty_only: false,
+                    op_id: 0,
+                },
+                state,
+            )
+            .await?;
         if resp.code != autumn_rpc::partition_rpc::CODE_OK {
             anyhow::bail!("maintenance code {}: {}", resp.code, resp.message);
         }
@@ -1711,7 +1770,7 @@ impl AutumnManager {
         state: &autumn_common::MetadataState,
     ) -> Result<()> {
         match cand.kind {
-            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, state).await,
+            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, None, state).await,
             POLICY_KIND_MERGE => {
                 let req = MergePartitionsReq {
                     survivor_part_id: cand.primary_part_id,
@@ -1786,6 +1845,209 @@ impl AutumnManager {
                 Ok(())
             }
             _ => anyhow::bail!("candidate kind {} not actionable", cand.kind),
+        }
+    }
+
+    /// Wall-clock as `(epoch_seconds, epoch_millis)`.
+    fn now_s_ms() -> (i64, i64) {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (d.as_secs() as i64, d.as_millis() as i64)
+    }
+
+    /// Background one-shot for a submitted op: mark RUNNING, actuate (reusing the
+    /// controller's dispatch), then record the terminal outcome + a durable audit
+    /// entry. A panic in the actuation records FAILED (compio catches the panic
+    /// itself, but without this the entry would sit RUNNING until the TTL sweep).
+    async fn run_submitted_op(&self, op_id: u64, spec: OpSubmitReq) {
+        let (now_s, _) = Self::now_s_ms();
+        self.ops.borrow_mut().set_running(op_id, now_s);
+        let state = (*self.store.inner.borrow()).clone();
+        let outcome = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.actuate_submitted_op(op_id, &spec, &state),
+        ))
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => ActuationResult::Terminal {
+                state: OP_STATE_FAILED,
+                error: "actuation task panicked".to_string(),
+                message: String::new(),
+            },
+        };
+        let (now_s, _) = Self::now_s_ms();
+        match outcome {
+            ActuationResult::Terminal {
+                state,
+                error,
+                message,
+            } => {
+                self.ops
+                    .borrow_mut()
+                    .finish(op_id, state, error.clone(), message.clone(), now_s);
+                let by = if spec.requested_by.is_empty() {
+                    "cli".to_string()
+                } else {
+                    spec.requested_by.clone()
+                };
+                // Forensics: node_id carries the primary target (part id, or 0 for
+                // rebalance); extent_id the secondary (ec/forcegc). The op code
+                // disambiguates. Best-effort — never fails the op.
+                self.append_audit(MgrAuditEntry {
+                    op: op_kind_audit_code(spec.kind),
+                    node_id: spec.part_id,
+                    extent_id: spec.secondary_id.max(spec.extent_ids.first().copied().unwrap_or(0)),
+                    by,
+                    reason: String::new(),
+                    result_code: if state == OP_STATE_SUCCEEDED { 0 } else { 1 },
+                    result_message: if error.is_empty() { message } else { error },
+                    ts_ns: 0,
+                })
+                .await;
+            }
+            ActuationResult::Dispatched { message } => {
+                // Stays RUNNING: compact/gc/forcegc close via the PS heartbeat,
+                // ec-convert via apply_ec_conversion_done. Surface the advisory
+                // (e.g. forcegc replay-floor preview) in `ops status` immediately.
+                if !message.is_empty() {
+                    self.ops.borrow_mut().set_message(op_id, message);
+                }
+            }
+        }
+    }
+
+    /// Dispatch ONE submitted op through the controller's actuation building
+    /// blocks and report how the ledger should transition.
+    async fn actuate_submitted_op(
+        &self,
+        op_id: u64,
+        spec: &OpSubmitReq,
+        state: &autumn_common::MetadataState,
+    ) -> ActuationResult {
+        let terminal_err = |e: String| ActuationResult::Terminal {
+            state: OP_STATE_FAILED,
+            error: e,
+            message: String::new(),
+        };
+        match spec.kind {
+            OP_KIND_SPLIT => {
+                let cand = PolicyCandidate {
+                    kind: POLICY_KIND_SPLIT,
+                    primary_part_id: spec.part_id,
+                    secondary_part_id: 0,
+                    reason: "manual".to_string(),
+                    size_bytes: 0,
+                    req_per_sec: 0,
+                    imm_full_per_sec: 0,
+                    same_ps: false,
+                    last_op_at: 0,
+                };
+                match self
+                    .auto_dispatch_split(&cand, spec.at_key.clone(), state)
+                    .await
+                {
+                    Ok(()) => ActuationResult::Terminal {
+                        state: OP_STATE_SUCCEEDED,
+                        error: String::new(),
+                        message: format!("split part {} dispatched", spec.part_id),
+                    },
+                    Err(e) => terminal_err(format!("{e:#}")),
+                }
+            }
+            OP_KIND_MERGE => {
+                let req = MergePartitionsReq {
+                    survivor_part_id: spec.part_id,
+                    victim_part_id: spec.secondary_id,
+                    force: spec.force,
+                };
+                match self.handle_merge_partitions(rkyv_encode(&req)).await {
+                    Ok(bytes) => match rkyv_decode::<MergePartitionsResp>(&bytes) {
+                        Ok(resp) if resp.code == CODE_OK => ActuationResult::Terminal {
+                            state: OP_STATE_SUCCEEDED,
+                            error: String::new(),
+                            message: format!(
+                                "merged part {} into {}",
+                                spec.secondary_id, spec.part_id
+                            ),
+                        },
+                        Ok(resp) => terminal_err(resp.message),
+                        Err(e) => terminal_err(format!("decode merge resp: {e}")),
+                    },
+                    Err((_, m)) => terminal_err(m),
+                }
+            }
+            OP_KIND_REBALANCE => {
+                let max_moves = if spec.max_moves != 0 {
+                    spec.max_moves
+                } else {
+                    self.policy.borrow().config.rebalance_max_moves_per_tick
+                };
+                let req = RebalanceRegionsReq { max_moves };
+                match self.handle_rebalance_regions(rkyv_encode(&req)).await {
+                    Ok(bytes) => match rkyv_decode::<RebalanceRegionsResp>(&bytes) {
+                        Ok(resp) if resp.code == CODE_OK => ActuationResult::Terminal {
+                            state: OP_STATE_SUCCEEDED,
+                            error: String::new(),
+                            message: format!("moved {} partition(s)", resp.moved),
+                        },
+                        Ok(resp) => terminal_err(resp.message),
+                        Err(e) => terminal_err(format!("decode rebalance resp: {e}")),
+                    },
+                    Err((_, m)) => terminal_err(m),
+                }
+            }
+            OP_KIND_EC_CONVERT => {
+                let req = ForceEcConvertReq {
+                    extent_id: spec.secondary_id,
+                };
+                match self.handle_force_ec_convert(rkyv_encode(&req)).await {
+                    Ok(bytes) => match rkyv_decode::<ForceEcConvertResp>(&bytes) {
+                        Ok(resp) if resp.code == CODE_OK => ActuationResult::Dispatched {
+                            message: if resp.message.is_empty() {
+                                "ec conversion started".to_string()
+                            } else {
+                                resp.message
+                            },
+                        },
+                        Ok(resp) => terminal_err(resp.message),
+                        Err(e) => terminal_err(format!("decode ec resp: {e}")),
+                    },
+                    Err((_, m)) => terminal_err(m),
+                }
+            }
+            OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC => {
+                use autumn_rpc::partition_rpc::{
+                    MAINTENANCE_AUTO_GC, MAINTENANCE_COMPACT, MAINTENANCE_FORCE_GC,
+                };
+                let (op, extent_ids) = match spec.kind {
+                    OP_KIND_COMPACT => (MAINTENANCE_COMPACT, vec![]),
+                    OP_KIND_GC => (MAINTENANCE_AUTO_GC, vec![]),
+                    _ => (MAINTENANCE_FORCE_GC, spec.extent_ids.clone()),
+                };
+                let req = autumn_rpc::partition_rpc::MaintenanceReq {
+                    part_id: spec.part_id,
+                    op,
+                    extent_ids,
+                    gc_ratio: spec.gc_ratio,
+                    gc_max_size: spec.gc_max_size,
+                    gc_stream_debt: spec.gc_stream_debt,
+                    gc_empty_only: spec.gc_empty_only,
+                    op_id,
+                };
+                match self.send_maintenance(req, state).await {
+                    Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
+                        ActuationResult::Dispatched {
+                            message: resp.message,
+                        }
+                    }
+                    Ok(resp) => {
+                        terminal_err(format!("maintenance code {}: {}", resp.code, resp.message))
+                    }
+                    Err(e) => terminal_err(format!("{e:#}")),
+                }
+            }
+            other => terminal_err(format!("unknown op kind {other}")),
         }
     }
 
@@ -1903,6 +2165,10 @@ impl AutumnManager {
     pub async fn auto_dispatch_split(
         &self,
         cand: &PolicyCandidate,
+        // Explicit split point (raw key bytes) from a manual `ops` submit. `Some`
+        // overrides the declared-boundary snap and is used verbatim; `None` keeps
+        // the controller's snap-to-declared-boundary-else-PS-median behavior.
+        explicit_at_key: Option<Vec<u8>>,
         state: &autumn_common::MetadataState,
     ) -> Result<()> {
         // Look up the owning PS via regions + ps_nodes.
@@ -1935,12 +2201,13 @@ impl AutumnManager {
         // (Auto-split is local/reactive, so it converges on "each partition owns
         // a run of whole lanes", NOT on a perfectly even parts-divides-lanes
         // split; that evenness stays a planned, presplit-time property.)
-        let at_key = self.declared_split_point_within(cand.primary_part_id);
+        let at_key = explicit_at_key
+            .or_else(|| self.declared_split_point_within(cand.primary_part_id));
         if let Some(k) = &at_key {
             tracing::info!(
                 part_id = cand.primary_part_id,
                 point = ?String::from_utf8_lossy(k),
-                "auto-split snapping to a declared presplit boundary"
+                "split point (explicit or snapped to a declared presplit boundary)"
             );
         }
         let payload =
@@ -4556,6 +4823,85 @@ mod tests {
         });
         let resp = run(async { m.handle_report_disk_failure(req).await.unwrap() });
         rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    #[test]
+    fn op_submit_rejects_bad_kind_and_missing_target() {
+        let m = AutumnManager::new(); // memory mode ⇒ leader = true
+        // unknown kind.
+        let r: OpSubmitResp = rkyv_decode(&run(async {
+            m.handle_op_submit(rkyv_encode(&OpSubmitReq { kind: 0, ..Default::default() }))
+                .await
+                .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(r.code, CODE_INVALID_ARGUMENT);
+        assert_eq!(r.op_id, 0);
+        // split with no part_id.
+        let r: OpSubmitResp = rkyv_decode(&run(async {
+            m.handle_op_submit(rkyv_encode(&OpSubmitReq {
+                kind: OP_KIND_SPLIT,
+                part_id: 0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(r.code, CODE_INVALID_ARGUMENT);
+        // merge missing victim.
+        let r: OpSubmitResp = rkyv_decode(&run(async {
+            m.handle_op_submit(rkyv_encode(&OpSubmitReq {
+                kind: OP_KIND_MERGE,
+                part_id: 3,
+                secondary_id: 0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(r.code, CODE_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn op_submit_records_pending_then_query_finds_it() {
+        let m = AutumnManager::new();
+        // A gc submit is accepted + recorded (the spawned actuation will fail to
+        // reach a PS in this bare test, but the ledger entry exists immediately).
+        let sub: OpSubmitResp = rkyv_decode(&run(async {
+            m.handle_op_submit(rkyv_encode(&OpSubmitReq {
+                kind: OP_KIND_GC,
+                part_id: 9,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(sub.code, CODE_OK);
+        assert_ne!(sub.op_id, 0);
+        // status <id> → the recorded op (Pending/Running/terminal — all valid,
+        // just not UNKNOWN and matching kind/target).
+        let q: OpQueryResp = rkyv_decode(&run(async {
+            m.handle_op_query(rkyv_encode(&OpQueryReq { op_id: sub.op_id, ..Default::default() }))
+                .await
+                .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(q.ops.len(), 1);
+        assert_eq!(q.ops[0].op_id, sub.op_id);
+        assert_eq!(q.ops[0].kind, OP_KIND_GC);
+        assert_eq!(q.ops[0].part_id, 9);
+        assert_ne!(q.ops[0].state, OP_STATE_UNKNOWN);
+        // an unknown id → synthesized UNKNOWN, never a false RUNNING.
+        let q: OpQueryResp = rkyv_decode(&run(async {
+            m.handle_op_query(rkyv_encode(&OpQueryReq { op_id: 777_777, ..Default::default() }))
+                .await
+                .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(q.ops[0].state, OP_STATE_UNKNOWN);
     }
 
     #[test]

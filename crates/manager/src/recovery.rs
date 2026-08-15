@@ -1680,6 +1680,19 @@ impl crate::AutumnManager {
             s.extents.insert(extent_id, updated);
         }
 
+        // Close any op-ledger EC-convert entry for this extent (authoritative —
+        // the manager IS the EC orchestrator; identity is exact by extent id).
+        {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_ec(
+                extent_id,
+                autumn_rpc::manager_rpc::OP_STATE_SUCCEEDED,
+                "ec conversion done".to_string(),
+                String::new(),
+                now_s,
+            );
+        }
+
         Ok(())
     }
 }
