@@ -1856,6 +1856,22 @@ impl AutumnManager {
         (d.as_secs() as i64, d.as_millis() as i64)
     }
 
+    /// Seed the op-ledger with the in-flight EC conversions from the (just-
+    /// replayed) etcd `ConvertToEc` markers, so `ops list` shows them as RUNNING
+    /// after a leader change. Unlike compact/gc (PS-local, unknowable post-
+    /// failover → UNKNOWN), an EC conversion is DURABLE — the marker survived and
+    /// this leader keeps converting it — so it belongs in the ledger, closing
+    /// normally via `complete_ec` when it applies (or the fence auto-abandon).
+    /// The original op_id died with the previous leader; a fresh "replay" op_id
+    /// carries the still-running work. Called on promotion; idempotent.
+    pub(crate) fn seed_ec_ledger_from_inflight(&self) {
+        let (ec_inflight, _rec) = self.inflight_snapshot_ec_recovery();
+        if !ec_inflight.is_empty() {
+            let (now_s, now_ms) = Self::now_s_ms();
+            self.ops.borrow_mut().seed_ec_replay(ec_inflight, now_s, now_ms);
+        }
+    }
+
     /// Background one-shot for a submitted op: mark RUNNING, actuate (reusing the
     /// controller's dispatch), then record the terminal outcome + a durable audit
     /// entry. A panic in the actuation records FAILED (compio catches the panic
@@ -2523,6 +2539,10 @@ impl AutumnManager {
         self.set_leader(true);
         self.displaced.set(false);
         self.leaderless_since.set(None);
+
+        // Seed the op-ledger with the in-flight EC conversions just replayed from
+        // etcd (see the method doc).
+        self.seed_ec_ledger_from_inflight();
 
         // ensure the cluster identity is imprinted in etcd. The
         // CAS uses create_revision==0, so only the first leader ever to
@@ -4902,6 +4922,41 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(q.ops[0].state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn promotion_seeds_ledger_from_inflight_ec_markers() {
+        let m = AutumnManager::new();
+        // Simulate an EC conversion in flight (as replay_from_etcd would rebuild
+        // from a durable ConvertToEc marker after a leader change).
+        m._test_mark_ec_inflight(88);
+        m.seed_ec_ledger_from_inflight();
+        // `ops list --kind ec` now shows it RUNNING under a replay op_id.
+        let q: OpQueryResp = rkyv_decode(&run(async {
+            m.handle_op_query(rkyv_encode(&OpQueryReq {
+                kind_filter: OP_KIND_EC_CONVERT,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(q.ops.len(), 1);
+        assert_eq!(q.ops[0].secondary_id, 88);
+        assert_eq!(q.ops[0].state, OP_STATE_RUNNING);
+        assert_eq!(q.ops[0].requested_by, "replay");
+        // idempotent across a re-promotion.
+        m.seed_ec_ledger_from_inflight();
+        let q2: OpQueryResp = rkyv_decode(&run(async {
+            m.handle_op_query(rkyv_encode(&OpQueryReq {
+                kind_filter: OP_KIND_EC_CONVERT,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(q2.ops.len(), 1);
     }
 
     #[test]

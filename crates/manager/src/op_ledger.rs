@@ -200,6 +200,44 @@ impl OpLedger {
         }
     }
 
+    /// On leader promotion, seed a synthetic RUNNING EC-convert entry per
+    /// in-flight `ConvertToEc` marker replayed from etcd. EC conversions are
+    /// DURABLE (the etcd marker; the new leader keeps converting), so the work is
+    /// genuinely still running and belongs in `ops list` — even though the
+    /// original op_id died with the previous leader's in-memory ledger. It closes
+    /// normally via `complete_ec(extent_id)` when the conversion applies (or the
+    /// abandon hook on a coordinator fence). compact/gc/forcegc are PS-local (NOT
+    /// in etcd) and cannot be seeded — an unknown id honestly answers UNKNOWN.
+    /// Idempotent across re-promotions (skips an already-tracked extent).
+    pub(crate) fn seed_ec_replay(
+        &mut self,
+        extent_ids: impl IntoIterator<Item = u64>,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        for extent_id in extent_ids {
+            if self.entries.iter().any(|e| {
+                e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
+            }) {
+                continue;
+            }
+            let op_id = self.next_id(now_ms);
+            self.entries.push_front(OpRecord {
+                op_id,
+                kind: OP_KIND_EC_CONVERT,
+                secondary_id: extent_id,
+                state: OP_STATE_RUNNING,
+                requested_by: "replay".to_string(),
+                submitted_at: now_s,
+                started_at: now_s,
+                ..Default::default()
+            });
+        }
+        while self.entries.len() > OP_LEDGER_CAP {
+            self.entries.pop_back();
+        }
+    }
+
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
     /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
     pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
@@ -358,6 +396,32 @@ mod tests {
         let r = q_one(&led, id2);
         assert_eq!(r.state, OP_STATE_FAILED);
         assert_eq!(r.error, "abandoned");
+    }
+
+    #[test]
+    fn seed_ec_replay_makes_inflight_ec_listable_and_closable() {
+        let mut led = OpLedger::new();
+        led.seed_ec_replay([55u64, 77], 100, 1_000_000);
+        let ecs = led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() });
+        assert_eq!(ecs.len(), 2);
+        assert!(ecs
+            .iter()
+            .all(|e| e.state == OP_STATE_RUNNING && e.requested_by == "replay"));
+        // idempotent: re-seeding an already-tracked extent doesn't duplicate.
+        led.seed_ec_replay([55u64], 101, 1_100_000);
+        assert_eq!(
+            led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() }).len(),
+            2
+        );
+        // a replayed entry closes normally when the conversion applies.
+        led.complete_ec(55, OP_STATE_SUCCEEDED, "done".into(), String::new(), 200);
+        let active = led.query(&OpQueryReq {
+            active_only: true,
+            kind_filter: OP_KIND_EC_CONVERT,
+            ..Default::default()
+        });
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].secondary_id, 77);
     }
 
     #[test]
