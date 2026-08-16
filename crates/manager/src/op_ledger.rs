@@ -349,6 +349,15 @@ mod tests {
         assert_eq!(q_one(&led, id).state, OP_STATE_SUCCEEDED);
         // a stray complete for an unknown extent is a no-op.
         led.complete_ec(999, OP_STATE_SUCCEEDED, "x".into(), String::new(), 11);
+        // abandon path: complete_ec can drive a terminal FAILED too (an EC
+        // whose marker was auto-abandoned on a coordinator fence — EC is not in
+        // the TTL sweep, so this is its terminal signal).
+        let (id2, _) = led.submit(OP_KIND_EC_CONVERT, 0, 77, vec![], "cli".into(), 0, 0);
+        led.set_running(id2, 0);
+        led.complete_ec(77, OP_STATE_FAILED, String::new(), "abandoned".into(), 20);
+        let r = q_one(&led, id2);
+        assert_eq!(r.state, OP_STATE_FAILED);
+        assert_eq!(r.error, "abandoned");
     }
 
     #[test]

@@ -151,6 +151,24 @@ impl AutumnManager {
             // commit_length (that re-breaks the three-concepts rule and fences
             // out the LIVE PS, the exact bug that made it check-only).
         }
+        // Close any op-ledger EC-convert entry for an abandoned extent: the
+        // conversion will never complete now, so `ops status` must go terminal
+        // (FAILED) instead of sitting RUNNING forever — EC is excluded from the
+        // maintenance TTL sweep (a legit conversion can be long), so this abandon
+        // hook is its authoritative terminal signal.
+        if !abandoned_ids.is_empty() {
+            let (now_s, _) = Self::now_s_ms();
+            let mut led = self.ops.borrow_mut();
+            for extent_id in &abandoned_ids {
+                led.complete_ec(
+                    *extent_id,
+                    autumn_rpc::manager_rpc::OP_STATE_FAILED,
+                    String::new(),
+                    "ec conversion abandoned — coordinator node fenced".to_string(),
+                    now_s,
+                );
+            }
+        }
         abandoned_ids
     }
 }
