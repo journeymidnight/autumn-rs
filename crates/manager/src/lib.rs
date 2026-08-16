@@ -1856,20 +1856,23 @@ impl AutumnManager {
         (d.as_secs() as i64, d.as_millis() as i64)
     }
 
-    /// Seed the op-ledger with the in-flight EC conversions from the (just-
-    /// replayed) etcd `ConvertToEc` markers, so `ops list` shows them as RUNNING
-    /// after a leader change. Unlike compact/gc (PS-local, unknowable post-
-    /// failover → UNKNOWN), an EC conversion is DURABLE — the marker survived and
-    /// this leader keeps converting it — so it belongs in the ledger, closing
-    /// normally via `complete_ec` when it applies (or the fence auto-abandon).
-    /// The original op_id died with the previous leader; a fresh "replay" op_id
-    /// carries the still-running work. Called on promotion; idempotent.
+    /// Seed the op-ledger with the in-flight EC conversions AND extent
+    /// recoveries from the (just-replayed) etcd markers, so `ops list` shows
+    /// them as RUNNING after a leader change. Unlike compact/gc (PS-local,
+    /// unknowable post-failover → UNKNOWN), both are DURABLE — the marker
+    /// survived and this leader keeps working the task — so they belong in the
+    /// ledger, closing normally via `complete_ec` / `complete_recovery`. The
+    /// original op_ids died with the previous leader; fresh "replay" ids carry
+    /// the still-running work. Called on promotion; idempotent.
     pub(crate) fn seed_ec_ledger_from_inflight(&self) {
-        let (ec_inflight, _rec) = self.inflight_snapshot_ec_recovery();
-        if !ec_inflight.is_empty() {
-            let (now_s, now_ms) = Self::now_s_ms();
-            self.ops.borrow_mut().seed_ec_replay(ec_inflight, now_s, now_ms);
+        let (ec_inflight, recovery_inflight) = self.inflight_snapshot_ec_recovery();
+        if ec_inflight.is_empty() && recovery_inflight.is_empty() {
+            return;
         }
+        let (now_s, now_ms) = Self::now_s_ms();
+        let mut led = self.ops.borrow_mut();
+        led.seed_replay(OP_KIND_EC_CONVERT, ec_inflight, now_s, now_ms);
+        led.seed_replay(OP_KIND_RECOVERY, recovery_inflight, now_s, now_ms);
     }
 
     /// Background one-shot for a submitted op: mark RUNNING, actuate (reusing the

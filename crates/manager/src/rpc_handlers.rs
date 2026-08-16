@@ -4528,6 +4528,13 @@ impl AutumnManager {
             OP_KIND_SPLIT | OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC
         );
         let bad = match req.kind {
+            // Recovery is AUTO-dispatched by the recovery loop (it repairs a
+            // degraded replica when one is detected); there is no meaningful
+            // operator "start a recovery" — it appears in the ledger on its own.
+            OP_KIND_RECOVERY => Some(
+                "recovery is auto-dispatched, not submittable — watch it with \
+                 `ops list --kind recovery`",
+            ),
             OP_KIND_SPLIT | OP_KIND_MERGE | OP_KIND_REBALANCE | OP_KIND_COMPACT | OP_KIND_GC
             | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT => {
                 if need_part && req.part_id == 0 {

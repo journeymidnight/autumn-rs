@@ -198,6 +198,28 @@ impl AutumnManager {
             // Both acquire AND RPC succeeded. Marker stays in place
             // until apply_recovery_done's atomic put_and_delete_txn
             // releases it (invariant I3).
+            //
+            // Op-ledger: the EN accepted the rebuild, so this extent's recovery
+            // is genuinely RUNNING — record it (create-or-count-attempt) so an
+            // operator can see it in `ops list --kind recovery` instead of only
+            // in aggregate `recovery-stats`.
+            {
+                let slot = {
+                    let s = self.store.inner.borrow();
+                    s.extents
+                        .get(&extent.extent_id)
+                        .and_then(|ex| Self::extent_slot(ex, replace_id))
+                        .unwrap_or(0) as u32
+                };
+                let (now_s, now_ms) = Self::now_s_ms();
+                self.ops.borrow_mut().note_recovery_dispatch(
+                    extent.extent_id,
+                    slot,
+                    candidate.node_id,
+                    now_s,
+                    now_ms,
+                );
+            }
             return Ok(());
         }
 
@@ -430,6 +452,15 @@ impl AutumnManager {
                 .insert(updated_extent.extent_id, updated_extent.clone());
         }
         self.commit_extent_inflight_release(updated_extent.extent_id);
+        // Op-ledger: the extent layout is repaired — close the recovery entry.
+        {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_recovery(
+                updated_extent.extent_id,
+                format!("recovered slot onto node {}", task.node_id),
+                now_s,
+            );
+        }
         Ok(())
     }
 
@@ -821,7 +852,22 @@ impl AutumnManager {
             // can show the reason, not just a count. Pre-this the call
             // sites passed `res.is_ok()` and the error was discarded.
             Err(e) => {
-                l.record_failure(extent_id, slot, now_s, &e.to_string());
+                let consecutive = l.record_failure(extent_id, slot, now_s, &e.to_string());
+                drop(l);
+                // Op-ledger: keep the entry RUNNING (the loop retries with
+                // exponential backoff — it never gives up) but carry the LAST
+                // failure + its code + the consecutive-failure count, so
+                // `ops status` shows a repair that is looping instead of
+                // converging. This is the reason recovery belongs in the ledger.
+                let (now_s2, now_ms) = Self::now_s_ms();
+                self.ops.borrow_mut().record_recovery_failure(
+                    extent_id,
+                    e.to_string(),
+                    Self::err_to_code(e),
+                    consecutive,
+                    now_s2,
+                    now_ms,
+                );
             }
         }
     }

@@ -1714,6 +1714,7 @@ fn op_kind_name(k: u8) -> &'static str {
         OP_KIND_GC => "gc",
         OP_KIND_FORCE_GC => "forcegc",
         OP_KIND_EC_CONVERT => "ec-convert",
+        OP_KIND_RECOVERY => "recovery",
         _ => "?",
     }
 }
@@ -1728,6 +1729,7 @@ fn op_kind_from_str(s: &str) -> u8 {
         "gc" => OP_KIND_GC,
         "forcegc" => OP_KIND_FORCE_GC,
         "ec" | "ec-convert" => OP_KIND_EC_CONVERT,
+        "recovery" => OP_KIND_RECOVERY,
         _ => 0,
     }
 }
@@ -1844,6 +1846,8 @@ async fn cmd_ops(
                     "part_id": o.part_id,
                     "secondary_id": o.secondary_id,
                     "error": o.error,
+                    "error_code": o.error_code,
+                    "attempts": o.attempts,
                     "message": o.message,
                     "requested_by": o.requested_by,
                     "submitted_at": o.submitted_at,
@@ -1869,19 +1873,28 @@ async fn cmd_ops(
         } else {
             "-".to_string()
         };
+        // Auto-retrying kinds carry a last-error WHILE still running, so show
+        // the attempt count + reason together — a repair looping on the same
+        // failure is the thing worth seeing.
+        let attempts = if o.attempts > 0 {
+            format!(" attempts={}", o.attempts)
+        } else {
+            String::new()
+        };
         let tail = if !o.error.is_empty() {
-            format!("  ERROR: {}", o.error)
+            format!("  ERROR[{}]: {}", o.error_code, o.error)
         } else if !o.message.is_empty() {
             format!("  {}", o.message)
         } else {
             String::new()
         };
         println!(
-            "op {:<20} {:<10} {:<9} target={}{}",
+            "op {:<20} {:<10} {:<9} target={}{}{}",
             o.op_id,
             op_kind_name(o.kind),
             op_state_name(o.state),
             target,
+            attempts,
             tail
         );
     }

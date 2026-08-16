@@ -2089,6 +2089,12 @@ pub const OP_KIND_COMPACT: u8 = 4;
 pub const OP_KIND_GC: u8 = 5;
 pub const OP_KIND_FORCE_GC: u8 = 6;
 pub const OP_KIND_EC_CONVERT: u8 = 7;
+/// Extent replica recovery. AUTO-dispatched (the recovery loop), never submitted
+/// by an operator — `MSG_OP_SUBMIT` refuses it. Tracked because it is the op an
+/// operator most needs to see: it runs unattended, retries with backoff, and its
+/// failure reason (`error` + `error_code`) and attempt count (`attempts`) were
+/// previously visible only in aggregate via `recovery-stats`.
+pub const OP_KIND_RECOVERY: u8 = 8;
 
 /// Op lifecycle — a state machine, not bools. `UNKNOWN` is never an initial
 /// state; it is the honest answer when the ledger cannot know (post-failover
@@ -2114,7 +2120,18 @@ pub struct OpRecord {
     /// `OP_STATE_*`.
     pub state: u8,
     /// failure reason; empty unless `state == FAILED`.
+    ///
+    /// EXCEPTION — auto-retrying kinds (recovery): populated WHILE still
+    /// `RUNNING` to carry the LAST attempt's failure, since the op keeps
+    /// retrying with backoff rather than going terminal. "running, 5 attempts,
+    /// last error: …" is the operator-actionable state.
     pub error: String,
+    /// Machine-readable failure class for `error` (`CODE_*`; `0` = none).
+    pub error_code: u8,
+    /// Progress counter, kind-specific (`0` = N/A). Recovery: dispatch attempts
+    /// / consecutive failures for this extent — the signal that a repair is
+    /// looping instead of converging.
+    pub attempts: u32,
     /// human outcome ("moved 3", forcegc advisory, "no eligible extents", …).
     pub message: String,
     /// "cli" / "dashboard" / "auto-policy" / "replay".

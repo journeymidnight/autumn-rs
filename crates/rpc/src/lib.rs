@@ -353,7 +353,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // MaintenanceReq grew `op_id` (partition_rpc.rs); MSG_OP_SUBMIT joined
     // is_admin_mgr_msg; AUDIT_OP_* 7..=12 for durable terminal history. Pre-R3
     // same-commit stop-world deploy ⇒ MIN=MAX=29.
-    (29, "b65437d410e5f2c6"),
+    //   v29 fingerprint refreshed IN PLACE (sanctioned pre-deploy refinement,
+    //   same precedent as v25 SD-2 / v27 / v28 ①②③ — v29 has never been
+    //   deployed): the ledger grew `OP_KIND_RECOVERY` (8) plus
+    //   `OpRecord.error_code` + `OpRecord.attempts`, so auto-dispatched extent
+    //   recoveries are listable with their retry count and last failure
+    //   reason/code (previously visible only in aggregate via `recovery-stats`).
+    (29, "1a66ee93fc84333c"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

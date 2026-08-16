@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 
 use autumn_rpc::manager_rpc::{
     OpQueryReq, OpRecord, OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_FORCE_GC, OP_KIND_GC,
-    OP_STATE_PENDING, OP_STATE_RUNNING, OP_STATE_UNKNOWN,
+    OP_KIND_RECOVERY, OP_STATE_PENDING, OP_STATE_RUNNING, OP_STATE_SUCCEEDED, OP_STATE_UNKNOWN,
 };
 
 /// Max live+recent entries kept (newest-first). Mirrors the auto-policy action
@@ -90,6 +90,8 @@ impl OpLedger {
             extent_ids,
             state: OP_STATE_PENDING,
             error: String::new(),
+            error_code: 0,
+            attempts: 0,
             message: String::new(),
             requested_by,
             submitted_at: now_s,
@@ -176,9 +178,35 @@ impl OpLedger {
         false
     }
 
-    /// Close the EC-convert entry whose target extent matches. EC identity is
-    /// exact (extent_id) and the manager is the EC orchestrator, so this is
-    /// authoritative, not inference.
+    /// Close the extent-scoped entry of `kind` whose target extent matches.
+    /// Identity is exact (extent_id) and the manager orchestrates both EC and
+    /// recovery, so this is authoritative, not inference.
+    fn complete_by_extent(
+        &mut self,
+        kind: u8,
+        extent_id: u64,
+        state: u8,
+        message: String,
+        error: String,
+        now_s: i64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.state = state;
+            e.message = message;
+            e.error = error;
+            if state == OP_STATE_SUCCEEDED {
+                e.error_code = 0;
+            }
+            e.finished_at = now_s;
+            if e.started_at == 0 {
+                e.started_at = now_s;
+            }
+        }
+    }
+
+    /// Close the EC-convert entry for `extent_id` (apply-done, or abandon).
     pub(crate) fn complete_ec(
         &mut self,
         extent_id: u64,
@@ -187,44 +215,135 @@ impl OpLedger {
         error: String,
         now_s: i64,
     ) {
+        self.complete_by_extent(OP_KIND_EC_CONVERT, extent_id, state, message, error, now_s);
+    }
+
+    /// Close the recovery entry for `extent_id` — called from
+    /// `apply_recovery_done` (the extent layout is repaired).
+    pub(crate) fn complete_recovery(&mut self, extent_id: u64, message: String, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            OP_STATE_SUCCEEDED,
+            message,
+            String::new(),
+            now_s,
+        );
+    }
+
+    /// A recovery dispatch was ACCEPTED by a target EN: create-or-refresh the
+    /// extent's RUNNING entry and count the attempt. Recovery is auto-dispatched
+    /// and retried, so one entry per extent accumulates attempts rather than
+    /// spawning an entry per try.
+    pub(crate) fn note_recovery_dispatch(
+        &mut self,
+        extent_id: u64,
+        slot: u32,
+        node_id: u64,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        let msg = format!("rebuilding slot {slot} on node {node_id}");
         if let Some(e) = self.entries.iter_mut().find(|e| {
-            e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
+            e.kind == OP_KIND_RECOVERY && e.secondary_id == extent_id && Self::is_active(e.state)
         }) {
-            e.state = state;
-            e.message = message;
-            e.error = error;
-            e.finished_at = now_s;
+            e.attempts = e.attempts.saturating_add(1);
+            e.message = msg;
+            e.state = OP_STATE_RUNNING;
             if e.started_at == 0 {
                 e.started_at = now_s;
             }
+            return;
+        }
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_RECOVERY,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            message: msg,
+            attempts: 1,
+            requested_by: "auto-recovery".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        while self.entries.len() > OP_LEDGER_CAP {
+            self.entries.pop_back();
         }
     }
 
-    /// On leader promotion, seed a synthetic RUNNING EC-convert entry per
-    /// in-flight `ConvertToEc` marker replayed from etcd. EC conversions are
-    /// DURABLE (the etcd marker; the new leader keeps converting), so the work is
-    /// genuinely still running and belongs in `ops list` — even though the
-    /// original op_id died with the previous leader's in-memory ledger. It closes
-    /// normally via `complete_ec(extent_id)` when the conversion applies (or the
-    /// abandon hook on a coordinator fence). compact/gc/forcegc are PS-local (NOT
+    /// A recovery dispatch attempt FAILED. The entry stays RUNNING (the loop
+    /// retries with exponential backoff — it never gives up), carrying the last
+    /// reason + code + the consecutive-failure count, so `ops status` shows
+    /// "running, N attempts, last error: …" instead of hiding the churn.
+    pub(crate) fn record_recovery_failure(
+        &mut self,
+        extent_id: u64,
+        reason: String,
+        error_code: u8,
+        consecutive_failures: u32,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_RECOVERY && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.error = reason;
+            e.error_code = error_code;
+            e.attempts = consecutive_failures.max(e.attempts);
+            return;
+        }
+        // First observation of this extent is a FAILURE (never got as far as an
+        // accepted dispatch) — still worth listing: a repair that can't even
+        // start is exactly what an operator needs to see.
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_RECOVERY,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            error: reason,
+            error_code,
+            attempts: consecutive_failures.max(1),
+            requested_by: "auto-recovery".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        while self.entries.len() > OP_LEDGER_CAP {
+            self.entries.pop_back();
+        }
+    }
+
+    /// On leader promotion, seed a synthetic RUNNING entry per in-flight
+    /// extent-scoped marker replayed from etcd (`kind` = EC_CONVERT or RECOVERY).
+    /// Both are DURABLE (the etcd marker survived; the new leader keeps working
+    /// the task), so the work is genuinely still running and belongs in
+    /// `ops list` — even though the original op_id died with the previous
+    /// leader's in-memory ledger. Each closes normally via
+    /// `complete_ec` / `complete_recovery`. compact/gc/forcegc are PS-local (NOT
     /// in etcd) and cannot be seeded — an unknown id honestly answers UNKNOWN.
     /// Idempotent across re-promotions (skips an already-tracked extent).
-    pub(crate) fn seed_ec_replay(
+    pub(crate) fn seed_replay(
         &mut self,
+        kind: u8,
         extent_ids: impl IntoIterator<Item = u64>,
         now_s: i64,
         now_ms: i64,
     ) {
         for extent_id in extent_ids {
-            if self.entries.iter().any(|e| {
-                e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
-            }) {
+            if self
+                .entries
+                .iter()
+                .any(|e| e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state))
+            {
                 continue;
             }
             let op_id = self.next_id(now_ms);
             self.entries.push_front(OpRecord {
                 op_id,
-                kind: OP_KIND_EC_CONVERT,
+                kind,
                 secondary_id: extent_id,
                 state: OP_STATE_RUNNING,
                 requested_by: "replay".to_string(),
@@ -399,16 +518,66 @@ mod tests {
     }
 
     #[test]
+    fn recovery_lifecycle_tracks_attempts_and_last_error() {
+        let mut led = OpLedger::new();
+        // dispatch accepted → RUNNING, attempts=1
+        led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
+        let recs = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() });
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].state, OP_STATE_RUNNING);
+        assert_eq!(recs[0].attempts, 1);
+        assert_eq!(recs[0].secondary_id, 42);
+        assert_eq!(recs[0].requested_by, "auto-recovery");
+        // a failed attempt keeps it RUNNING (the loop retries) but records the
+        // reason + code + consecutive count — the operator-actionable state.
+        led.record_recovery_failure(42, "no healthy target".into(), 3, 4, 110, 1_100_000);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_RUNNING, "recovery retries; never terminal on one failure");
+        assert_eq!(r.error, "no healthy target");
+        assert_eq!(r.error_code, 3);
+        assert_eq!(r.attempts, 4);
+        // a re-dispatch counts another attempt on the SAME entry (one op per
+        // extent, not one per try).
+        led.note_recovery_dispatch(42, 2, 9, 120, 1_200_000);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.attempts, 5);
+        assert_eq!(
+            led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() }).len(),
+            1
+        );
+        // apply_recovery_done → SUCCEEDED, and the stale error code is cleared.
+        led.complete_recovery(42, "recovered slot onto node 9".into(), 130);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_eq!(r.error_code, 0);
+    }
+
+    #[test]
+    fn recovery_failure_before_any_dispatch_still_listed() {
+        let mut led = OpLedger::new();
+        // a repair that can't even start (no candidate) must still be visible.
+        led.record_recovery_failure(9, "all recovery candidates rejected".into(), 3, 1, 5, 5_000);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_RUNNING);
+        assert_eq!(r.secondary_id, 9);
+        assert_eq!(r.error, "all recovery candidates rejected");
+    }
+
+    #[test]
     fn seed_ec_replay_makes_inflight_ec_listable_and_closable() {
         let mut led = OpLedger::new();
-        led.seed_ec_replay([55u64, 77], 100, 1_000_000);
+        led.seed_replay(OP_KIND_EC_CONVERT, [55u64, 77], 100, 1_000_000);
         let ecs = led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() });
         assert_eq!(ecs.len(), 2);
         assert!(ecs
             .iter()
             .all(|e| e.state == OP_STATE_RUNNING && e.requested_by == "replay"));
         // idempotent: re-seeding an already-tracked extent doesn't duplicate.
-        led.seed_ec_replay([55u64], 101, 1_100_000);
+        led.seed_replay(OP_KIND_EC_CONVERT, [55u64], 101, 1_100_000);
         assert_eq!(
             led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() }).len(),
             2
