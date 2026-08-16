@@ -60,6 +60,18 @@ autumn-op gc 7 --wait --timeout 300         # block until terminal; non-zero exi
   leader; compact/gc/forcegc run on the PS and report their terminal outcome +
   error back on the 5 s load heartbeat (so terminal state appears within
   ~5–10 s); ec-convert closes when the conversion applies.
+- **Auto-dispatched ops are tracked too.** Extent **recovery** (replica rebuild)
+  is never submitted by an operator — it appears in the ledger on its own when
+  the recovery loop dispatches it:
+  ```bash
+  autumn-op ops list --kind recovery
+  # op 1170…  recovery  running   target=0->12 attempts=3  ERROR[3]: all recovery candidates rejected
+  # op 1170…  recovery  succeeded target=0->10 attempts=1  recovered slot onto node 1
+  ```
+  A recovery **stays `running` while it retries** (the loop backs off but never
+  gives up), carrying `attempts` and the **last** failure reason + `error_code` —
+  so a repair that is looping instead of converging is visible per-extent, not
+  just in aggregate `recovery-stats`.
 - **Failover honesty**: the live ledger is leader-local (in-memory, cap 256).
   After a leader change, `ops status <old-id>` answers `unknown` (never a false
   `running`); durable terminal history is in `autumn-op audit-log`. A PS-executed

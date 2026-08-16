@@ -704,6 +704,22 @@ failure reason the fire-and-forget maintenance ops used to drop.
   `Unknown` (`sweep_running_ttl`, on the leader policy tick) — a lost PS outcome
   never sits Running forever. **Attach-dedup**: a resubmit of the same
   `(kind, part_id, secondary_id)` while active returns the existing op_id.
+- **Auto-dispatched kinds** (`OP_KIND_RECOVERY`): extent recovery is entered by
+  the recovery loop, not by a submit — `MSG_OP_SUBMIT` REFUSES it. Hooks:
+  `dispatch_recovery_task` (EN accepted the rebuild) → `note_recovery_dispatch`
+  (one entry per extent, counting `attempts`); `record_dispatch_outcome`'s Err
+  arm → `record_recovery_failure`, which **keeps the entry RUNNING** (the loop
+  retries with exponential backoff and never gives up) while carrying the last
+  reason + `error_code` (`err_to_code`) + consecutive-failure count;
+  `apply_recovery_done` → `complete_recovery`. This is why recovery belongs in
+  the ledger: a repair looping on the same failure is otherwise invisible
+  per-extent (only aggregate in `recovery-stats`).
+- **`error` on a RUNNING op is deliberate** for auto-retrying kinds — it is the
+  LAST attempt's failure, not a terminal verdict.
+- **Failover seeding is by durability, not by kind**: `seed_replay(kind, …)`
+  reconstructs RUNNING entries for BOTH EC-convert and recovery on promotion
+  (their etcd markers survived and this leader keeps working them);
+  compact/gc/forcegc are PS-local, so an old id honestly answers `Unknown`.
 - **`--wait`** is a pure client-side poll over `MSG_OP_QUERY` — one execution
   path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
   (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is
