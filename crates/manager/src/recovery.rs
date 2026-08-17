@@ -8,6 +8,13 @@ use autumn_rpc::manager_rpc::*;
 
 use crate::{AutumnManager, PendingDelete};
 
+/// The coordinator pinned by an EC dispatch marker: shard index 0 drives the
+/// conversion, so `target_nodes[0]` is the ONLY node whose completion report may
+/// be applied for that marker.
+fn params_coordinator(p: &MgrEcDispatchInflight) -> Option<u64> {
+    p.target_nodes.first().copied()
+}
+
 /// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
 /// `ex`, the `stream` whose `(K, M)` shape it converts to, and the authoritative
 /// ledger marker (`params`: target nodes / extra disks / post-EC eversion /
@@ -1180,6 +1187,23 @@ impl crate::AutumnManager {
                 // steer the layout.
                 for done in df.ec_done {
                     let params = match self.extent_inflight_payload_ec(done.extent_id) {
+                        Some(p) if params_coordinator(&p) != Some(node.node_id) => {
+                            // REPORTER IDENTITY: only the marker's own coordinator
+                            // may complete it. `new_eversion` is `live + 1` and a
+                            // released-then-reissued attempt reuses the SAME value,
+                            // so the eversion cross-check alone cannot separate
+                            // attempts: a stale report from a PREVIOUS attempt's
+                            // coordinator would otherwise apply the CURRENT
+                            // attempt's layout while its targets hold no shards.
+                            tracing::warn!(
+                                extent_id = done.extent_id,
+                                reporter = node.node_id,
+                                coordinator = ?params_coordinator(&p),
+                                "ec_done from a node that is not this marker's \
+                                 coordinator — IGNORING (marker retained)"
+                            );
+                            continue;
+                        }
                         Some(p) => p,
                         None => {
                             // No marker: an already-applied conversion re-reported
