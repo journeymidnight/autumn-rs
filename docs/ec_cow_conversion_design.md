@@ -99,16 +99,17 @@ manager's layout flip the **only** commit point.
 today:   stage .ec.dat ──▶ [each node renames .ec.dat → .dat] ──▶ manager applies
                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dangerous middle state
 
-design:  stage .ec.dat ──▶ manager flips layout in ONE etcd txn ──▶ lazy delete
-                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ atomic; sole commit point
+design:  stage .shard{i} ──▶ manager flips layout in ONE etcd txn ──▶ lazy delete
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ atomic; sole commit point
 ```
 
-- **Before the flip.** Every replica's `.dat` is untouched. `.ec.dat` is purely
-  additive staging. The layout says *replicated*; reads use `.dat` and are
-  correct. Nothing is at risk.
+- **Before the flip.** Every replica's `.dat` is untouched. `extent-{id}.shard{i}`
+  is purely additive staging. The layout says *replicated* with
+  `payload_location = InDat`; reads use `.dat` and are correct. Nothing is at
+  risk.
 - **The flip.** One leader-fenced etcd transaction sets `ec_converted`, the
-  `replicates`/`parity` layout, and the new `eversion`. There is no partial
-  flip.
+  `replicates`/`parity` layout, `payload_location = InShardFile`, and the new
+  `eversion`. There is no partial flip.
   **Precondition: all K+M targets have confirmed a durable staged shard.**
   (Under the old design this was a hardening patch; here it is the natural
   meaning of "prepared".)
@@ -116,26 +117,46 @@ design:  stage .ec.dat ──▶ manager flips layout in ONE etcd txn ──▶ 
   - a shard holder deletes its now-redundant `.dat`;
   - a node no longer in the layout becomes a **non-member** and is reaped by the
     membership-based reconcile (see §8).
-- **Rollback** is symmetric and free: delete `.ec.dat`. Nothing was ever
+- **Rollback** is symmetric and free: delete the staged shards. Nothing was ever
   destroyed, so any later attempt may pick a completely fresh assignment.
 
 ### 4.1 Which file does the EN serve?
 
-The two files coexist, so a shard read must reach `.ec.dat` and a replicated
-read must reach `.dat`. Derive the role from `eversion` rather than adding a
-notification:
+Both files can exist at once, so something must say which one is authoritative
+for a given read. That choice is **metadata owned by the manager** (§1), so the
+manager states it and the EN obeys. **The EN never infers its own role.**
 
-- When an EN durably stages its shard it records `ec_eversion` in `.meta`.
-- Every read already carries `eversion`, and the EN already enforces
-  `req.eversion < entry.eversion → CODE_EVERSION_MISMATCH`.
-- **Rule:** `req.eversion >= ec_eversion` ⇒ serve `.ec.dat`; otherwise serve
-  `.dat`.
+- The extent's layout carries a **`payload_location`**: `InDat` (a full replica,
+  or a legacy shard converted under the old scheme) or `InShardFile` (a CoW
+  shard). It is written by the flip, inside the same atomic transaction that
+  sets `ec_converted` and the new layout.
+- Reads already resolve the layout before dispatching — `read_with_layout`
+  (`crates/stream/src/client.rs:4102`) branches on `ex.ec_converted` to choose
+  `ec_subrange_read:4625` (shard reads) versus the replicated path. That decision
+  is already made against the authority; the request simply carries it down.
+- **Rule:** serve the file named by the request's `payload_location`. A request
+  that asks for a file the node does not have is an **error**, never a silent
+  fallback to the other file — returning shard bytes as a whole value (or the
+  reverse) is exactly the corruption this design exists to remove.
 
-This works because a client only obtains the post-flip `eversion` from the
-manager's authoritative layout — so the request's eversion *is* the role signal.
-It is monotone, needs no push, and requires no new EN state machine. Legacy
-extents converted under the old scheme (shard already in `.dat`, no `.ec.dat`)
-fall into the `else` branch unchanged (§7).
+This keeps the EN stateless with respect to its role: no new `.meta` field, no
+notification, no inference from a counter. It is also the natural extension
+point — a future re-encoding is a new `payload_location` value rather than
+another in-place mutation.
+
+### 4.2 Staging files are named by shard index
+
+A staged shard is written to **`extent-{id}.shard{i}`**, not to a single shared
+`.ec.dat`.
+
+The index is part of the filename, so a shard staged for one index can never be
+mistaken for another. That makes a whole class of failure structurally
+impossible rather than guarded: a node that staged shard *j* for one attempt and
+is assigned index *k* by a later attempt cannot satisfy a check for its own
+staged shard, because the file it would need does not exist. (Under a single
+shared staging name the two are indistinguishable — same extent and same K give
+the same file size — which is why an attempt-identity marker was needed at all;
+§5.)
 
 ---
 
@@ -148,7 +169,7 @@ crash-atomic is not merely simplified — it is deleted:
 |---|---|
 | the whole **commit phase**: `MSG_COMMIT_EC_SHARD`(12), `handle_commit_ec_shard:7906`, `commit_shard_local:5482`, `finish_ec_commit:5584` | per-node destructive publish |
 | `ec.commit` intent marker: `EcCommitMarker:254`, `ec_commit_marker_path:426`, `write_ec_commit_marker:5728`, `read_ec_commit_marker:5784`, the `load_extents` three-state replay | rename ↔ `save_meta` crash window |
-| `ec.prepared` attempt marker (`ec_prepared_marker_path:422` and its helpers) | staging outliving an attempt could be adopted by the next one |
+| `ec.prepared` attempt marker (`ec_prepared_marker_path:422` and its helpers) | staging outliving an attempt could be adopted by the next one — now impossible by construction (§4.2) |
 | the EC takeover state machine + `MSG_PROBE_EC_STATE` (`scratchpad/ec_takeover_design.md` §D) | deciding roll-forward vs roll-back from participant state |
 | the EC exception to "a node going offline releases its markers" | partial commits made release unsafe |
 
@@ -167,9 +188,8 @@ idempotent.*
 EC only satisfies that model under this design:
 
 - **Idempotent execution** — with no destructive step, a re-dispatch simply
-  re-stages (staging is created fresh; §9 requires the stripe-0 truncate that is
-  already in place). The source bytes remain on `.dat`, so a re-encode is always
-  possible.
+  re-stages into its own index-named file (§4.2). The source bytes remain on
+  `.dat`, so a re-encode is always possible.
 - **Safe release on offline** — releasing a marker before the flip destroys
   nothing, so a dead coordinator is handled by *release + re-derive*, with no
   probe and no constraint to preserve the previous assignment.
@@ -178,10 +198,11 @@ EC only satisfies that model under this design:
 
 ## 7. Migration and compatibility
 
-Extents converted under the old scheme have their shard in `.dat` and no
-`.ec.dat`. The §4.1 rule serves them from `.dat` (the `else` branch), so they
-keep working with no migration step and no rewrite. New conversions produce
-`.ec.dat` and leave `.dat` until cleanup. Both shapes coexist indefinitely; a
+Extents converted under the old scheme have their shard in `.dat`. They are
+exactly `payload_location = InDat`, which is the default for every pre-existing
+extent — so they keep working with no migration step, no rewrite, and no
+backfill. New conversions produce `extent-{id}.shard{i}` and flip to
+`InShardFile`, leaving `.dat` until cleanup. Both shapes coexist indefinitely; a
 node may hold one of each for different extents.
 
 Deployment is same-commit stop-the-world as always, so no mixed-version
@@ -191,7 +212,7 @@ negotiation is required.
 
 ## 8. Cost, and what it depends on
 
-- **Space is not meaningfully worse.** `.dat` and `.ec.dat` already coexist
+- **Space is not meaningfully worse.** `.dat` and the staged shard already coexist
   today during staging (the rename is what ends it). This design extends that
   window from "the 2PC" to "until cleanup runs", so the *peak* is unchanged and
   only its duration grows. Cleanup must therefore be driven, not best-effort.
@@ -226,11 +247,17 @@ tracked separately from this design.
 ## 10. Test plan
 
 **Unit (EN):**
-- stage → flip not yet applied → a read at the old eversion returns full data
-  from `.dat`; a read at the post-flip eversion returns shard bytes.
+- staged but not yet flipped → a read carrying `InDat` returns full data from
+  `.dat`; the staged shard is never reachable through it.
+- after the flip → a read carrying `InShardFile` returns shard bytes.
+- a read whose `payload_location` names a file the node does not hold **errors**
+  — it must never fall back to the other file.
+- a node assigned index *k* after having staged index *j* cannot satisfy a
+  check for shard *k* (structurally: the file does not exist).
 - re-stage after a partial attempt produces byte-identical staging (RS is
-  deterministic; stripe-0 truncate is in place).
-- legacy shape (shard in `.dat`, no `.ec.dat`) still serves shard reads.
+  deterministic).
+- legacy shape (shard in `.dat`, `payload_location = InDat`) still serves shard
+  reads unchanged.
 
 **Unit / system (manager):**
 - flip requires all K+M staged confirmations; a missing one blocks it.
