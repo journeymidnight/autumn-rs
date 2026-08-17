@@ -413,6 +413,16 @@ impl DiskFS {
     /// rename and the meta write (the `.dat` may be the shard while `.meta` is
     /// still pre-EC); `load_extents` replays it to write the consistent `.meta`.
     /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
+    /// `extent-{id}.ec.prepared` — records WHICH attempt produced the current
+    /// `.ec.dat` staging (its `new_eversion`). Without it the coordinator's
+    /// "prepare already done, skip to commit" check is size-only, and the
+    /// staging of a DIFFERENT attempt (same extent + same K ⇒ same size) would
+    /// satisfy it — committing stale, possibly wrong-shard-index staging over
+    /// live replicas. Written durably at the END of a full prepare.
+    fn ec_prepared_marker_path(&self, extent_id: u64) -> PathBuf {
+        self.extent_file_path(extent_id, "ec.prepared")
+    }
+
     fn ec_commit_marker_path(&self, extent_id: u64) -> PathBuf {
         self.extent_file_path(extent_id, "ec.commit")
     }
@@ -441,6 +451,7 @@ impl DiskFS {
             self.meta_path(extent_id),
             self.ec_staging_path(extent_id),
             self.ec_commit_marker_path(extent_id),
+            self.ec_prepared_marker_path(extent_id),
         ] {
             match compio::fs::remove_file(&path).await {
                 Ok(()) => {}
@@ -5368,10 +5379,22 @@ impl ExtentNode {
             })?;
         }
 
-        // create+write, NO truncate — earlier stripes must survive this open.
+        // Stripe 0 TRUNCATES; later stripes must NOT (earlier stripes of THIS
+        // attempt have to survive the open).
+        //
+        // The staging file carries no attempt identity, so without this a
+        // previous attempt's `.ec.dat` survives into the next one: a reissue
+        // with a different K leaves attempt #1's tail bytes past attempt #2's
+        // shard end, and `finish_ec_commit` derives the published length from
+        // the FILE SIZE — so the commit would publish a `.dat` longer than the
+        // real shard (a to-end shard read then returns an over-long shard and
+        // EC reconstruct fails). Truncating at the first stripe makes each
+        // attempt's staging exactly its own bytes. Same-K re-prepare was only
+        // ever safe because RS encode is deterministic; do not rely on that.
         let staging_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(shard_offset == 0)
             .open(&staging_path)
             .await
             .map_err(|e| {
@@ -5642,6 +5665,66 @@ impl ExtentNode {
 
     /// #5: write the EC commit-intent marker durably (tmp→sync→rename→dir-fsync).
     /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
+    /// Record that a FULL prepare for `new_eversion` completed (coordinator
+    /// stages itself LAST, so this also asserts every participant is staged).
+    /// Best-effort by contract: on failure the caller just loses the skip
+    /// optimisation and re-prepares, which is always safe.
+    async fn write_ec_prepared_marker(
+        &self,
+        disk: &DiskFS,
+        extent_id: u64,
+        new_eversion: u64,
+    ) -> Result<(), String> {
+        let path = disk.ec_prepared_marker_path(extent_id);
+        if let Some(parent) = path.parent() {
+            compio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("mkdir ec prepared marker {extent_id}: {e}"))?;
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .map_err(|e| format!("create ec prepared marker {extent_id}: {e}"))?;
+        let f = Rc::new(f);
+        file_pwrite_chunked(
+            f.clone(),
+            0,
+            Bytes::copy_from_slice(&new_eversion.to_le_bytes()),
+        )
+        .await
+        .map_err(|e| format!("write ec prepared marker {extent_id}: {e}"))?;
+        f.sync_data()
+            .await
+            .map_err(|e| format!("sync ec prepared marker {extent_id}: {e}"))?;
+        if let Some(dir) = path.parent() {
+            compio::fs::File::open(dir)
+                .await
+                .map_err(|e| format!("open prepared-marker dir {extent_id}: {e}"))?
+                .sync_all()
+                .await
+                .map_err(|e| format!("fsync prepared-marker dir {extent_id}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The `new_eversion` recorded by the last completed prepare, if any.
+    /// Absent / short / unreadable ⇒ `None` ⇒ the caller re-prepares (safe:
+    /// prepare is deterministic and truncates its staging at stripe 0).
+    async fn read_ec_prepared_marker(&self, disk: &DiskFS, extent_id: u64) -> Option<u64> {
+        let path = disk.ec_prepared_marker_path(extent_id);
+        let f = compio::fs::File::open(&path).await.ok()?;
+        let buf = vec![0u8; 8];
+        let res = f.read_exact_at(buf, 0).await;
+        let bytes = res.1;
+        if res.0.is_err() || bytes.len() < 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(bytes[0..8].try_into().ok()?))
+    }
+
     async fn write_ec_commit_marker(
         &self,
         disk: &DiskFS,
@@ -7415,7 +7498,19 @@ impl ExtentNode {
                 .disk_for(entry.disk_id)
                 .map_err(|e| (StatusCode::Internal, e))?;
             let staging = disk.ec_staging_path(extent_id);
-            if let Ok(meta) = compio::fs::metadata(&staging).await {
+            // The size check ALONE is not attempt-scoped: the same extent at the
+            // same K always yields the same shard size, so a PREVIOUS attempt's
+            // staging satisfies it. If that previous attempt assigned this node a
+            // different shard index, skipping prepare would commit stale,
+            // wrong-index staging over live replicas on every reused participant
+            // (`CommitEcShardReq` carries no shard index, so nobody downstream
+            // can catch it). Require the prepared-marker to name THIS attempt's
+            // `new_eversion`; anything else re-prepares (always safe).
+            let marker_matches =
+                self.read_ec_prepared_marker(&disk, extent_id).await == Some(new_eversion);
+            if !marker_matches {
+                false
+            } else if let Ok(meta) = compio::fs::metadata(&staging).await {
                 // Validate shard size matches expectation. If sealed_length
                 // is not yet known locally, we can't validate — fall through
                 // to the full path which syncs from manager first.
@@ -7681,6 +7776,22 @@ impl ExtentNode {
                     s += stripe_len;
                 }
 
+                // Prepare finished for ALL nodes (the coordinator stages itself
+                // last). Stamp WHICH attempt produced this staging so a later
+                // re-dispatch can tell "my completed prepare" from "some other
+                // attempt's leftovers" and skip only in the former case.
+                // Best-effort: a failure here only costs a re-prepare.
+                if let Ok(disk) = self.disk_for(entry.disk_id) {
+                    if let Err(e) = self
+                        .write_ec_prepared_marker(&disk, extent_id, new_eversion)
+                        .await
+                    {
+                        tracing::warn!(
+                            extent_id,
+                            "ec prepared-marker write failed (will re-prepare on retry): {e}"
+                        );
+                    }
+                }
                 tracing::info!(
                     extent_id,
                     per_shard,
@@ -7747,8 +7858,18 @@ impl ExtentNode {
         // coord node bumped owner-lock revisions on every extent the
         // coord touched, so a revived ghost coord's WriteShard with the
         // old owner_epoch is refused).
-        if req.owner_epoch > 0 {
-            if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+        // Serialise against a concurrent commit/convert on the SAME extent
+        // (a takeover-driven commit racing a resumed coordinator's local one
+        // would otherwise both pass their staging checks and one rename would
+        // fault a healthy disk). Same lock the convert path takes.
+        let op_lock = self.get_or_create_extent_op_lock(req.extent_id);
+        let _op_guard = op_lock.lock().await;
+
+        if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+            // Re-read UNDER the lock: a fence may have landed while we waited,
+            // and the staging write below must not proceed on a stale epoch.
+            // (`owner_epoch == 0` keeps the legacy no-fence behaviour.)
+            if req.owner_epoch > 0 {
                 let last = entry.owner_epoch.load(Ordering::SeqCst);
                 if req.owner_epoch < last {
                     return Ok(WriteShardResp {
@@ -7756,6 +7877,16 @@ impl ExtentNode {
                     }
                     .encode());
                 }
+            }
+            // META-FAILCLOSED: never stage onto a quarantined extent — a later
+            // commit would `save_meta` and silently CLEAR the quarantine,
+            // bypassing the fail-closed contract. Unconditional: this must hold
+            // for legacy epoch-0 callers too.
+            if entry.corrupt_meta.load(Ordering::SeqCst) {
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!("extent {}: quarantined (.meta corrupt)", req.extent_id),
+                ));
             }
         }
 
@@ -7784,9 +7915,17 @@ impl ExtentNode {
             }
         }
 
-        // owner-lock owner_epoch fence (see handle_write_shard).
-        if req.owner_epoch > 0 {
-            if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+        // Serialise against a concurrent convert/write-shard on this extent:
+        // two renames of the same staging file both pass their `metadata()`
+        // check, and the loser's NotFound would mark a HEALTHY disk Faulted.
+        let op_lock = self.get_or_create_extent_op_lock(req.extent_id);
+        let _op_guard = op_lock.lock().await;
+
+        // owner-lock owner_epoch fence (see handle_write_shard), re-read UNDER
+        // the lock so a fence that landed while we queued still rejects this
+        // commit BEFORE the irreversible rename.
+        if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+            if req.owner_epoch > 0 {
                 let last = entry.owner_epoch.load(Ordering::SeqCst);
                 if req.owner_epoch < last {
                     return Ok(CommitEcShardResp {
@@ -7794,6 +7933,14 @@ impl ExtentNode {
                     }
                     .encode());
                 }
+            }
+            // META-FAILCLOSED: committing would `save_meta` and clear the
+            // quarantine flag — refuse instead.
+            if entry.corrupt_meta.load(Ordering::SeqCst) {
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!("extent {}: quarantined (.meta corrupt)", req.extent_id),
+                ));
             }
         }
 
