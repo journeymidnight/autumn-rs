@@ -705,6 +705,17 @@ pub struct RecoveryTaskDone {
     pub ready_disk_id: u64,
 }
 
+/// One finished EC conversion, reported by the coordinator EN on its next `df`.
+/// Deliberately MINIMAL: the manager does NOT trust these fields as the layout
+/// to write — it applies the assignment PINNED in the etcd `ConvertToEc` marker
+/// and uses this only to (a) learn the conversion finished and (b) cross-check
+/// `new_eversion`. A mismatch is refused fail-loud rather than applied.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EcConvertDone {
+    pub extent_id: u64,
+    pub new_eversion: u64,
+}
+
 /// Df (disk-free + recovery heartbeat) request.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfReq {
@@ -724,6 +735,13 @@ pub struct DfReq {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
+    /// Completed EC conversions, drained on each `df` (same at-most-once
+    /// heartbeat channel as `done_tasks`). The coordinator EN ACKs
+    /// `MSG_CONVERT_TO_EC` immediately and encodes in the BACKGROUND, so this is
+    /// how the manager learns the 2PC actually finished — it then applies the
+    /// layout from the etcd marker's PINNED assignment. A lost report converges
+    /// via re-dispatch: the EN's idempotency guard re-reports (adopt).
+    pub ec_done: Vec<EcConvertDone>,
     /// (disk_id, DiskStatus) pairs (HashMap not used for rkyv compat).
     pub disk_status: Vec<(u64, DiskStatus)>,
     /// M1b: the EN's stable identity (empty = not registered).

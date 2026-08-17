@@ -261,6 +261,21 @@ impl AutumnManager {
     /// Recovery-kind sets in one ledger borrow. Replaces the prior
     /// `(let ec_inflight = self.ec_conversion_inflight.borrow(); let
     /// recovery_inflight = self.recovery_tasks.borrow())` pair.
+    /// The PINNED `ConvertToEc` parameters for `extent_id`, if a marker is held.
+    /// This is the authoritative assignment (target nodes / disks / shape /
+    /// eversion) chosen at the ORIGINAL dispatch and persisted to etcd — every
+    /// re-dispatch and the completion-apply MUST use it rather than recomputing,
+    /// or a second assignment could be written over the first one's shard bytes.
+    pub(crate) fn extent_inflight_payload_ec(
+        &self,
+        extent_id: u64,
+    ) -> Option<autumn_rpc::manager_rpc::MgrEcDispatchInflight> {
+        match self.inflight.borrow().get(&extent_id).and_then(|r| r.unpack()) {
+            Some((_, ExtentOpPayload::ConvertToEc(p))) => Some(p),
+            _ => None,
+        }
+    }
+
     pub(crate) fn inflight_snapshot_ec_recovery(
         &self,
     ) -> (

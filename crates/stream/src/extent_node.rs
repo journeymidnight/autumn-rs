@@ -1256,6 +1256,14 @@ pub struct ExtentNode {
     chain_fwd: Rc<RefCell<HashMap<String, futures::channel::mpsc::Sender<ChainFwdJob>>>>,
     recovery_done: Rc<RefCell<Vec<RecoveryTaskDone>>>,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
+    /// Finished EC conversions awaiting pickup by the next `df` (mirrors
+    /// `recovery_done` — the manager learns completion from the heartbeat,
+    /// not from the dispatch RPC's return).
+    ec_done: Rc<RefCell<Vec<crate::extent_rpc::EcConvertDone>>>,
+    /// EC conversions running in the background on this shard. The manager
+    /// re-dispatches from its durable marker every ~5 s, so without this guard
+    /// each tick would spawn another converter for the same extent.
+    ec_convert_inflight: Rc<DashMap<u64, ()>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     /// shard_idx / shard_count for per-shard extent ownership.
@@ -1328,6 +1336,8 @@ impl Clone for ExtentNode {
             chain_fwd: self.chain_fwd.clone(),
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
+            ec_done: self.ec_done.clone(),
+            ec_convert_inflight: self.ec_convert_inflight.clone(),
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
@@ -3008,6 +3018,8 @@ impl ExtentNode {
             chain_fwd: Rc::new(RefCell::new(HashMap::new())),
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
+            ec_done: Rc::new(std::cell::RefCell::new(Vec::new())),
+            ec_convert_inflight: Rc::new(DashMap::new()),
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
@@ -6500,8 +6512,14 @@ impl ExtentNode {
             }
         };
 
+        // Drain completed EC conversions (at-most-once, same contract as
+        // `done_tasks`): a report lost because the manager failed to apply it
+        // converges via re-dispatch → the EN's idempotent-skip adopt path.
+        let ec_done = std::mem::take(&mut *self.ec_done.borrow_mut());
+
         Ok(rkyv_encode(&DfResp {
             done_tasks,
+            ec_done,
             disk_status,
             // M1b: echo our own identity so the manager can
             // self-heal stored-location drift + detect pod-IP reuse. Empty when
@@ -7217,6 +7235,17 @@ impl ExtentNode {
         Ok(())
     }
 
+    /// ACCEPT an EC conversion and run it in the BACKGROUND (same shape as
+    /// `handle_require_recovery`): validate cheaply, guard against a duplicate
+    /// converter, spawn, and ACK immediately. Completion is reported to the
+    /// manager on the next `df` (`DfResp.ec_done`) — NOT by this RPC's return.
+    ///
+    /// Why not run it inline: an EC encode of a multi-GiB extent + K+M fan-out
+    /// can exceed the manager's RPC timeout, and a timeout is indistinguishable
+    /// from a dead coordinator — which is exactly why a stuck marker could never
+    /// be auto-released. Decoupling dispatch from completion removes that
+    /// ambiguity (the manager acts on a reported FACT), and stops one slow
+    /// extent from stalling the manager's dispatch loop.
     async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
         let req: ConvertToEcReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -7230,11 +7259,11 @@ impl ExtentNode {
             }
         }
 
-        let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
         let parity_shards = req.parity_shards as usize;
-        let new_eversion = req.eversion;
 
+        // Argument validation stays INLINE so a malformed request fails loudly
+        // on the RPC instead of dying in a detached task.
         if data_shards == 0 || parity_shards == 0 {
             return Err((
                 StatusCode::InvalidArgument,
@@ -7251,6 +7280,57 @@ impl ExtentNode {
                 ),
             ));
         }
+
+        // The manager re-dispatches from its durable marker every ~5 s; without
+        // this guard every tick would spawn another converter for the same
+        // extent (they would serialise on the per-extent lock, but pile up).
+        if self.ec_convert_inflight.contains_key(&req.extent_id) {
+            return code_resp(CODE_OK, "ec convert already running".to_string());
+        }
+        self.ec_convert_inflight.insert(req.extent_id, ());
+
+        let node = self.clone();
+        compio::runtime::spawn(async move {
+            let extent_id = req.extent_id;
+            let new_eversion = req.eversion;
+            match node.run_convert_to_ec_task(req).await {
+                Ok(()) => {
+                    // Report the completion for the next `df` pickup. This is
+                    // the ONLY signal the manager applies the layout on.
+                    node.ec_done
+                        .borrow_mut()
+                        .push(crate::extent_rpc::EcConvertDone {
+                            extent_id,
+                            new_eversion,
+                        });
+                    tracing::info!(extent_id, new_eversion, "EC convert done; queued for df report");
+                }
+                Err((_, msg)) => {
+                    // No report ⇒ the manager's marker stays ⇒ it re-dispatches
+                    // on its next tick. Nothing to roll back here: the 2PC's own
+                    // staging/commit markers own crash-safety.
+                    tracing::error!(extent_id, "EC convert failed (will be re-dispatched): {msg}");
+                }
+            }
+            node.ec_convert_inflight.remove(&extent_id);
+        })
+        .detach();
+
+        code_resp(CODE_OK, "ec convert accepted".to_string())
+    }
+
+    /// The actual EC conversion (prepare + 2PC commit). Runs detached; returns
+    /// `Ok(())` when the extent is durably EC-converted at `req.eversion` —
+    /// INCLUDING the idempotent-skip path, which is the "adopt" case that lets a
+    /// lost completion report converge on re-dispatch.
+    async fn run_convert_to_ec_task(
+        &self,
+        req: ConvertToEcReq,
+    ) -> std::result::Result<(), (StatusCode, String)> {
+        let extent_id = req.extent_id;
+        let data_shards = req.data_shards as usize;
+        let parity_shards = req.parity_shards as usize;
+        let new_eversion = req.eversion;
 
         // serialise concurrent EC conversion dispatches on this
         // extent. The manager-side `ec_conversion_inflight` set is purely
@@ -7305,7 +7385,11 @@ impl ExtentNode {
                     ),
                 ));
             }
-            return code_resp(CODE_OK, String::new());
+            // ADOPT: already EC-converted at this eversion. Report it as DONE so
+            // a completion lost before the manager's `df` pickup converges on
+            // the next re-dispatch (mirrors recovery's "local copy already
+            // complete — adopting" path).
+            return Ok(());
         }
 
         // gate cross-extent EC convert concurrency. Acquired AFTER
@@ -7641,7 +7725,7 @@ impl ExtentNode {
 
         tracing::info!(extent_id, new_eversion, "EC 2PC phase 2 (commit) complete");
 
-        code_resp(CODE_OK, String::new())
+        Ok(())
     }
 
     async fn handle_write_shard(&self, payload: Bytes) -> HandlerResult {

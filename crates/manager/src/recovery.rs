@@ -1171,6 +1171,47 @@ impl crate::AutumnManager {
                         }
                     }
                 }
+
+                // Apply every EC conversion the coordinator reported finished. The
+                // dispatch RPC only ACCEPTS; THIS is where a conversion becomes real.
+                // The layout comes from the etcd marker's PINNED assignment, never
+                // from the report — the report only says "it finished" and carries
+                // `new_eversion` for a cross-check, so a stale/forged report can't
+                // steer the layout.
+                for done in df.ec_done {
+                    let params = match self.extent_inflight_payload_ec(done.extent_id) {
+                        Some(p) => p,
+                        None => {
+                            // No marker: an already-applied conversion re-reported
+                            // (df is at-most-once but re-dispatch can re-adopt), or
+                            // an abandoned one. Benign — nothing to apply.
+                            tracing::debug!(
+                                extent_id = done.extent_id,
+                                "ec_done for an extent with no inflight marker; ignoring"
+                            );
+                            continue;
+                        }
+                    };
+                    if params.new_eversion != done.new_eversion {
+                        tracing::warn!(
+                            extent_id = done.extent_id,
+                            marker_eversion = params.new_eversion,
+                            reported_eversion = done.new_eversion,
+                            "ec_done eversion disagrees with the pinned marker — REFUSING to apply \
+                             (marker retained; re-dispatch will reconcile)"
+                        );
+                        continue;
+                    }
+                    let data_shards = params.data_shards as usize;
+                    self.finalize_ec_dispatch_after_convert(
+                        done.extent_id,
+                        params.target_nodes,
+                        params.extra_disk_ids,
+                        data_shards,
+                        params.new_eversion,
+                    )
+                    .await;
+                }
             }
 
             // cluster-df: publish this tick's RAW + physical snapshot (cheap —
@@ -1335,9 +1376,20 @@ impl crate::AutumnManager {
                 continue;
             }
             let (candidates, node_addrs) = self.collect_ec_dispatch_candidates();
-            for cand in candidates {
-                self.dispatch_one_ec_conversion(cand, &node_addrs).await;
-            }
+            // Dispatch CONCURRENTLY (bounded): these are now accept-ACKs, but a
+            // paged-out coordinator still burns its full RPC timeout, and
+            // serialising meant one such extent stalled every other conversion
+            // in the cluster for that tick. The cap keeps the fan-out (and the
+            // manager's socket use) bounded.
+            const EC_DISPATCH_CONCURRENCY: usize = 8;
+            let this = &self;
+            let addrs = &node_addrs;
+            futures::stream::StreamExt::for_each_concurrent(
+                futures::stream::iter(candidates),
+                EC_DISPATCH_CONCURRENCY,
+                move |cand| async move { this.dispatch_one_ec_conversion(cand, addrs).await },
+            )
+            .await;
         }
     }
 
@@ -1571,18 +1623,13 @@ impl crate::AutumnManager {
             }
         };
 
+        // NOTE: CODE_OK here means ACCEPTED, not DONE. The coordinator encodes
+        // in the background and reports completion on its next `df`
+        // (`DfResp.ec_done`), which `node_health_loop` turns into
+        // `finalize_ec_dispatch_after_convert`. The marker deliberately stays
+        // until then, so this dispatch is a safe idempotent re-send every tick.
         if rpc_ok {
-            // apply releases the ledger marker atomically with the
-            // `extents/<id>` etcd write; on failure the marker is kept for
-            // re-dispatch (see `finalize_ec_dispatch_after_convert`).
-            self.finalize_ec_dispatch_after_convert(
-                extent_id,
-                params.target_nodes,
-                params.extra_disk_ids,
-                data_shards,
-                params.new_eversion,
-            )
-            .await;
+            tracing::debug!(extent_id, "EC convert accepted by coordinator; awaiting df report");
         }
     }
 

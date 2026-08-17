@@ -850,6 +850,10 @@ pub struct ExtDfReq {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtDfResp {
     pub done_tasks: Vec<MgrRecoveryTaskDone>,
+    /// Completed EC conversions reported by the coordinator EN. MUST stay in
+    /// this position — this struct decodes the EN's `DfResp` bytes, so field
+    /// ORDER is the compatibility contract (see the note below).
+    pub ec_done: Vec<crate::extent_rpc::EcConvertDone>,
     pub disk_status: Vec<(u64, crate::extent_rpc::DiskStatus)>,
     /// M1b: the EN's echoed identity (see `extent_rpc::DfResp`).
     /// Appended in the SAME order as `DfResp` so the manager decodes the EN's

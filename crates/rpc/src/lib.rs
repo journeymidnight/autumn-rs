@@ -359,7 +359,16 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   `OpRecord.error_code` + `OpRecord.attempts`, so auto-dispatched extent
     //   recoveries are listable with their retry count and last failure
     //   reason/code (previously visible only in aggregate via `recovery-stats`).
-    (29, "1a66ee93fc84333c"),
+    //   v29 refreshed IN PLACE again (still undeployed): EC conversion moved to
+    //   the recovery model — the coordinator EN ACKs `MSG_CONVERT_TO_EC`
+    //   immediately and encodes in the BACKGROUND, reporting completion on its
+    //   next `df` via `DfResp.ec_done: Vec<EcConvertDone>` (mirrored in
+    //   `ExtDfResp` AT THE SAME FIELD POSITION — that struct decodes the EN's
+    //   `DfResp` bytes, so field order is the compatibility contract). This
+    //   removes the "RPC timeout vs dead EN" ambiguity that made a stuck EC
+    //   marker un-releasable, and unblocks conversions longer than one RPC
+    //   timeout.
+    (29, "a6979f12cd99a1c1"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
