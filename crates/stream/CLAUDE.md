@@ -349,7 +349,10 @@ a node comes back):
 - `heartbeat`: streams a "beat" every second (keep-alive for the manager).
 - `df`: returns per-disk `statvfs` + `extent_bytes` (EN self-reported per-disk
   extent footprint, summed by `disk_id`; the manager aggregates it into cluster
-  `physical_used`), and drains `recovery_done` to report completed recoveries.
+  `physical_used`), and drains BOTH `recovery_done` (completed recoveries) and
+  `ec_done` (completed EC conversions). **`df` is the completion channel for
+  every long-running EN task** — both are at-most-once (`mem::take`), and both
+  converge after a lost report via manager re-dispatch + the EN's adopt guard.
 - `handle_df` **ECHOES the EN's own identity** (`DfResp.node_uuid` /
   `advertise_addr` / `shard_ports`, from `self.registration`, empty when
   unset). The manager's `node_health_loop` uses the echo to self-heal
@@ -692,7 +695,21 @@ and from other crates' CLAUDE.md); do not renumber.
 
 16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on `parity.is_empty()`** — the manager pre-fills `parity` for every extent on an EC stream, so an open/pre-conversion extent has `parity != []` while still holding full replicated data on every K+M node. Only after `apply_ec_conversion_done` on a *sealed* extent does data physically split into K+M shards and `ec_converted` flip to `true`. Routing a pre-conversion extent through `ec_subrange_read` would compute `shard_size` from `sealed_length=0` and panic on the per-shard slice. Read dispatch (`read_with_layout`) and recovery dispatch (`run_recovery_task`) both branch on `ec_converted`. **Invariant:** `ec_converted == true` implies `sealed_length > 0`; never set `ec_converted` on an open extent.
 
-    **EC conversion is idempotent AND serialised on the coordinator.** `handle_convert_to_ec` acquires a per-extent `ec_conversion_locks` `Rc<Mutex<()>>` across the entire prepare+commit, and re-runs the idempotency guard under it: if the extent is already EC-converted at this eversion (`entry.eversion >= req.eversion && sealed_length > 0 && avali > 0`) it returns `CODE_OK` without re-encoding. Without this, a re-dispatched or leader-failover-racing convert re-encodes the ALREADY-shrunk local shard as if it were the original payload, producing sub-shards ≈ `original / K²` → silent short reads. The manager dedups convert candidates by `extent_id` (primary fix); the coordinator lock + idempotency is defense-in-depth.
+    **EC conversion is ACCEPT-then-BACKGROUND (same shape as recovery).**
+    `handle_convert_to_ec` validates, refuses a duplicate via `ec_convert_inflight`
+    (the manager re-dispatches from its durable marker every ~5 s, so without the
+    guard every tick would spawn another converter), spawns
+    `run_convert_to_ec_task`, and ACKs `CODE_OK = "accepted"` — **not "done"**. The
+    completion is pushed to `ec_done` and drained by the next `df`
+    (`DfResp.ec_done`), which is the ONLY signal the manager applies the layout on
+    (from the etcd marker's PINNED assignment; a reported `new_eversion` that
+    disagrees is REFUSED fail-loud). Rationale: an encode of a multi-GiB extent can
+    outlive any RPC timeout, and a timeout is indistinguishable from a dead
+    coordinator — that ambiguity is what made a stuck marker un-releasable. The
+    idempotent-skip path ALSO reports done (the ADOPT case), so a completion lost
+    to `df`'s at-most-once delivery converges on the next re-dispatch.
+
+    **EC conversion is idempotent AND serialised on the coordinator.** `run_convert_to_ec_task` acquires a per-extent `ec_conversion_locks` `Rc<Mutex<()>>` across the entire prepare+commit, and re-runs the idempotency guard under it: if the extent is already EC-converted at this eversion (`entry.eversion >= req.eversion && sealed_length > 0 && avali > 0`) it returns `CODE_OK` without re-encoding. Without this, a re-dispatched or leader-failover-racing convert re-encodes the ALREADY-shrunk local shard as if it were the original payload, producing sub-shards ≈ `original / K²` → silent short reads. The manager dedups convert candidates by `extent_id` (primary fix); the coordinator lock + idempotency is defense-in-depth.
 
 17. **Dead-replica recovery: closed-aware pool + append fanout timeout.** When an EN dies, autumn-rpc's `read_loop` sees EOF and clears `pending`, but the `Rc<RpcClient>` stays pooled. Three layers stop a caller hanging on a receiver that will never resolve: (a) `RpcClient::is_closed()` (set on `read_loop`/`writer_task` exit before `pending.clear()`); every `send_*` early-returns `ConnectionClosed`. (b) `ConnPool::get_client` skips + reconnects a closed entry; `send_vectored` evicts on submit error. (c) `launch_append` wraps each per-replica receiver in a bounded deadline (`StreamClientConfig.append_fanout_timeout`, default 5 s, clamped [200 ms, 60 s]; note 28 made this the BASE of a size-scaled deadline). `Elapsed` → soft error the retry loop escalates to `alloc_new_extent`. **Invariant:** any caller of `pool.send_vectored`/`call_vectored` against a peer that may go down MUST allow the surrounding logic to handle `Err` — never assume a returned receiver resolves.
 

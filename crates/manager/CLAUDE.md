@@ -716,6 +716,15 @@ failure reason the fire-and-forget maintenance ops used to drop.
   per-extent (only aggregate in `recovery-stats`).
 - **`error` on a RUNNING op is deliberate** for auto-retrying kinds — it is the
   LAST attempt's failure, not a terminal verdict.
+- **EC convert now uses the recovery model** (dispatch ≠ completion): the
+  coordinator EN ACKs "accepted" and encodes in the background;
+  `node_health_loop` applies each `DfResp.ec_done` report using the etcd
+  marker's PINNED assignment (`extent_inflight_payload_ec`), never the report's
+  own fields — a `new_eversion` mismatch is refused fail-loud and the marker
+  kept. `dispatch_one_ec_conversion` no longer finalizes on the RPC return; the
+  EC dispatch loop is bounded-concurrent (8) so one slow coordinator can't stall
+  the tick. This removes the "RPC timeout vs dead EN" ambiguity that made a stuck
+  marker un-releasable; a dead PINNED coordinator still needs fence→auto_abandon.
 - **Failover seeding is by durability, not by kind**: `seed_replay(kind, …)`
   reconstructs RUNNING entries for BOTH EC-convert and recovery on promotion
   (their etcd markers survived and this leader keeps working them);
