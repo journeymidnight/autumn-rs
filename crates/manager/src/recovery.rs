@@ -43,6 +43,62 @@ pub(crate) fn _test_arm_ec_apply_fail_once() {
 }
 
 impl AutumnManager {
+    /// Release Recovery markers whose pinned executor can no longer run them.
+    ///
+    /// This is the event that ends a marker's life when completion never comes.
+    /// It is evaluated LEVEL-TRIGGERED — re-derived from live node state every
+    /// tick rather than hooked onto the fence/remove/suspect transitions — so it
+    /// cannot miss an edge, needs no bookkeeping in three handlers, and
+    /// re-converges after a leader failover that never saw the transition.
+    ///
+    /// Safe unconditionally: nothing is committed until `apply_recovery_done`,
+    /// so releasing only discards an attempt. If the executor was in fact still
+    /// working and finishes later, its completion is refused (no marker) — and
+    /// the next tick re-detects the degraded slot, re-dispatches, and that node
+    /// ADOPTS its now verified-complete copy and re-reports. Convergent either
+    /// way.
+    ///
+    /// Returns the extents whose markers were released (for tests/diagnostics).
+    pub(crate) async fn release_recovery_markers_for_dead_executors(&self) -> Vec<u64> {
+        let dead: Vec<(u64, u64)> = {
+            let states = self.node_states.borrow();
+            let nodes = self.store.inner.borrow();
+            self.inflight
+                .borrow()
+                .values()
+                .filter_map(|rec| match rec.unpack() {
+                    Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) => {
+                        let gone = !nodes.nodes.contains_key(&t.node_id)
+                            || !states.state_of(t.node_id).is_online();
+                        gone.then_some((t.extent_id, t.node_id))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut released = Vec::new();
+        for (extent_id, node_id) in dead {
+            match self.drain_extent_inflight_marker(extent_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        extent_id,
+                        node_id,
+                        "released Recovery marker: its pinned executor is no longer online \
+                         — re-dispatch will pick a live target"
+                    );
+                    released.push(extent_id);
+                }
+                Err(e) => tracing::warn!(
+                    extent_id,
+                    node_id,
+                    "could not release the Recovery marker of a dead executor \
+                     (retried next tick): {e}"
+                ),
+            }
+        }
+        released
+    }
+
     /// Re-send an already-pinned Recovery marker to the node it named.
     ///
     /// This is the "standing instruction" half of the marker model. It NEVER
@@ -591,6 +647,8 @@ impl AutumnManager {
             // here — so it was removed.)
             let overrides = self.node_overrides.borrow().clone();
             let now_s = Self::epoch_seconds();
+
+            self.release_recovery_markers_for_dead_executors().await;
 
             // reseed the recovery rate limiter from the inflight
             // ledger so its counters reflect actually-in-flight recoveries.

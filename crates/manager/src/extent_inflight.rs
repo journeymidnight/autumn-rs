@@ -452,43 +452,17 @@ impl AutumnManager {
     /// general (Delete) one. Override with `AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`,
     /// default 120s, clamped >= 30.
     ///
-    /// REDUCED ROLE. The original rationale below assumed a held marker FROZE
-    /// re-dispatch, which made this timeout the only way back. That is no longer
-    /// true: a Recovery marker is now a standing instruction —
-    /// `dispatch_recovery_task` re-sends it to the node it pinned every tick, and
-    /// the EN answers an already-running task with an idempotent CODE_OK. So an
-    /// executor that restarted or silently gave up is picked up in one dispatch
-    /// tick, not in 120 s.
-    ///
-    /// What still needs this sweep is the case the re-send cannot fix: the pinned
-    /// target is GONE. The re-send is skipped for a non-Online node, so nothing
-    /// else currently releases that marker. Once release becomes event-driven
-    /// (node offline/fenced/removed → drop the markers it was executing), this
-    /// wall-clock path should be deleted outright — a timeout is a guess about
-    /// liveness, and the failure detector already knows the answer.
-    ///
-    /// Original rationale (found by decommission chaos, 2026-07-10): a fenced
-    /// node's healthy sealed replicas are relocated by `recovery_dispatch_loop`'s
-    /// fenced-slot dispatch. That dispatch acquires a Recovery marker and sends
-    /// REQUIRE_RECOVERY to a target EN; the EN's `run_recovery_task` gives up
-    /// after 10 × 10s = 100s WITHOUT reporting failure back, so the manager's
-    /// marker outlived the dead EN task and re-dispatch was frozen until this
-    /// sweep released it. At the old 600s the drain of a
-    /// live fenced node (hence `remove`) stalled ~10 min per stuck extent
-    /// (chaos: node never reached 0 shards within the test window). 120s is just
-    /// past the EN's own 100s give-up, so a Recovery marker older than this
-    /// definitely has no live EN task behind it; releasing it re-dispatches with
-    /// fresh state (recovery is idempotent + retries — the auto-release safety
-    /// argument, and the EN's `recovery_inflight` refuses any genuine
-    /// duplicate). Delete keeps the 600s general threshold (it has its own
-    /// retry queue); ConvertToEc stays WARN-only.
-    fn recovery_stale_threshold_secs() -> i64 {
-        std::env::var("AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(120)
-            .max(30)
-    }
+    // NOTE: the Recovery-specific stale threshold
+    // (`AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`, default 120 s) and its helper
+    // are GONE. It existed only because a held marker froze re-dispatch, which
+    // made a timeout the sole way back — and its value had to be hand-tuned to
+    // sit just past the EN's own 10 x 10 s internal give-up budget, a magic
+    // number pinned to another magic number (found by decommission chaos,
+    // 2026-07-10). Recovery markers are now standing instructions that are
+    // re-sent every tick, and a marker whose pinned executor is no longer online
+    // is released by `recovery_dispatch_loop` against live node state. Delete
+    // keeps the general 600 s threshold (it has its own retry queue);
+    // ConvertToEc stays WARN-only.
 
     /// sweep interval in seconds. Override with env
     /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`. Default 60s.
@@ -512,7 +486,6 @@ impl AutumnManager {
         // `recovery_stale_threshold_secs`). `.min(threshold_secs)` so a caller
         // (unit test) passing an even-shorter general threshold still wins —
         // recovery is never released LATER than the general threshold.
-        let recovery_threshold = Self::recovery_stale_threshold_secs().min(threshold_secs);
         // Snapshot stale candidates under a single ledger borrow so we
         // don't hold the borrow across the await.
         let stale: Vec<(u64, ExtentOpKind, i64)> = self
@@ -521,12 +494,23 @@ impl AutumnManager {
             .iter()
             .filter_map(|(eid, rec)| {
                 rec.kind().and_then(|kind| {
+                    // RECOVERY IS NOT SWEPT BY WALL CLOCK ANY MORE. A timeout is
+                    // a guess about liveness, and both cases it used to cover are
+                    // now handled by mechanisms that KNOW:
+                    //   - executor alive but its task died (restart / silent
+                    //     give-up) → the marker is a standing instruction and
+                    //     `dispatch_recovery_task` re-sends it every tick;
+                    //   - executor no longer online → `recovery_dispatch_loop`
+                    //     releases the marker (level-triggered against live node
+                    //     state, so no edge can be missed).
+                    // Deleting it also removes the brittle coupling that made the
+                    // threshold 120 s: it had to sit just past the EN's own
+                    // 10 x 10 s internal give-up budget.
+                    if matches!(kind, ExtentOpKind::Recovery) {
+                        return None;
+                    }
                     let age = now - rec.started_at;
-                    let eff_threshold = match kind {
-                        ExtentOpKind::Recovery => recovery_threshold,
-                        _ => threshold_secs,
-                    };
-                    if age >= eff_threshold {
+                    if age >= threshold_secs {
                         Some((*eid, kind, age))
                     } else {
                         None
@@ -799,6 +783,66 @@ mod tests {
     /// sweep auto-releases Recovery + Delete markers
     /// older than the threshold; ConvertToEc is WARN-only and survives;
     /// fresh markers stay alone; cleans `delete_progress` for Delete.
+    /// R3: a Recovery marker whose pinned executor is no longer online is
+    /// released — this is what replaced the wall-clock TTL. Level-triggered, so
+    /// it fires from live node state rather than from a transition hook.
+    #[test]
+    fn recovery_marker_released_when_pinned_executor_is_not_online() {
+        run(async {
+            let m = AutumnManager::new();
+            // `recovery_payload` pins node_id = 9, which is not registered here
+            // — i.e. the executor is gone as far as the manager can tell.
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .expect("recovery");
+            assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
+
+            let released = m.release_recovery_markers_for_dead_executors().await;
+            assert_eq!(released, vec![20], "a dead executor's marker must be released");
+            assert_eq!(
+                m.extent_inflight_op(20),
+                None,
+                "released so the next tick can re-dispatch to a LIVE target"
+            );
+        })
+    }
+
+    /// The converse, and the reason this cannot simply release everything: a
+    /// marker whose executor IS online is a healthy in-flight recovery and must
+    /// survive. (Its progress is kept alive by re-dispatch, not by this sweep.)
+    #[test]
+    fn recovery_marker_survives_while_its_executor_is_online() {
+        run(async {
+            let m = AutumnManager::new();
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .expect("recovery");
+            // Register node 9 and drive it to Online the way a heartbeat does.
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.nodes.insert(
+                    9,
+                    autumn_rpc::manager_rpc::MgrNodeInfo {
+                        node_id: 9,
+                        address: "127.0.0.1:9109".to_string(),
+                        disks: vec![90],
+                        shard_ports: vec![],
+                        control_address: "127.0.0.1:10109".to_string(),
+                        node_uuid: String::new(),
+                    },
+                );
+            }
+            m.node_states.borrow_mut().on_heartbeat_ok(9);
+
+            let released = m.release_recovery_markers_for_dead_executors().await;
+            assert!(
+                released.is_empty(),
+                "a live executor's marker must NOT be released: {released:?}"
+            );
+            assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
+        })
+    }
+
     #[test]
     fn sweep_auto_releases_stale_markers() {
         run(async {
@@ -836,18 +880,31 @@ mod tests {
                 .as_secs() as i64
                 + 7200;
             let released = m.sweep_stale_inflight_once(now_future, 1).await;
-            // only Recovery (20) + Delete (30) are auto-released.
-            // ConvertToEc (10) is WARN-only and survives.
+            // ONLY Delete (30) is released by wall clock now.
+            //   - ConvertToEc (10): WARN-only — releasing it could race the
+            //     coordinator's in-flight 2PC.
+            //   - Recovery (20): no longer swept AT ALL. A timeout is a guess
+            //     about liveness; both cases it used to cover now have
+            //     mechanisms that know — the marker is a standing instruction
+            //     re-sent every tick (executor alive but its task died), and
+            //     `recovery_dispatch_loop` releases markers whose pinned
+            //     executor is no longer online (executor gone).
             assert_eq!(
-                released, 2,
-                "only Recovery + Delete are released; ConvertToEc is WARN-only"
+                released, 1,
+                "only Delete is wall-clock released; ConvertToEc is WARN-only and \
+                 Recovery is no longer swept by time at all"
             );
             assert_eq!(
                 m.extent_inflight_op(10),
                 Some(ExtentOpKind::ConvertToEc),
                 "stale ConvertToEc marker must survive sweep"
             );
-            assert_eq!(m.extent_inflight_op(20), None);
+            assert_eq!(
+                m.extent_inflight_op(20),
+                Some(ExtentOpKind::Recovery),
+                "a Recovery marker must NOT be released by wall clock — it is \
+                 re-dispatched, and released on executor-not-online instead"
+            );
             assert_eq!(m.extent_inflight_op(30), None);
             // Delete progress entry also cleaned.
             assert!(
