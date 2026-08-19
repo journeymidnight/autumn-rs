@@ -649,6 +649,33 @@ first append would overwrite committed bytes).
 | `multi_modify_split(req)` | Forward partition split to manager |
 | `invalidate_stream(stream_id)` | Discard cached worker + init-lock; next append reloads the tail (used after split to prevent appending beyond a sealed tail) |
 
+**A read NAMES its payload file.** `ReadBytesReq` carries a `PayloadRef`
+(`payload_location` + `shard_index`) saying WHICH file on the target node to
+serve — `extent-{id}.dat` or `extent-{id}.shard{i}`. The EN serves that file or
+answers `CODE_PAYLOAD_NOT_HERE`; it never falls back to the other one, because
+returning shard bytes where a whole value was asked for (or the reverse) is
+silent corruption. The client sources the location from `ExtentInfo` (delivered
+beside `MgrExtentInfo` on `ExtentInfoResp`, since that struct is the persisted
+etcd value and cannot be widened) and the index from the slot it is reading —
+`slot` in the replicated/failover/hedge paths, `shard_idx` in `ec_subrange_read`,
+the peer's own `i` in `ec_reconstruct_shard_subrange` / `ec_read_full` /
+`run_ec_recovery_payload`. **Every peer is asked for ITS OWN shard**; before the
+file was named, EC shard recovery asked each peer for "the extent" and relied on
+that peer's `.dat` happening to be its shard.
+
+Two invariants make this safe rather than merely present:
+- **`InDat` is ONE identity whatever the slot** (`PayloadRef::for_extent`
+  normalises the index away). Otherwise replicated reads of one extent from
+  different slots would look like different files.
+- **The server's read batching groups by the FILE, not the extent.** One batch
+  resolves one fd for every slot in it, so two requests naming different files
+  must never share a batch. Both grouping sites (`MSG_READ_BYTES` and
+  `MSG_READ_BYTES_BULK`) key on `(extent_id, payload_ref())`.
+
+`read_plan` returns a typed `ReadRefusal` (`EversionStale` | `PayloadNotHere`)
+rather than a bare `None`, so the two refusals reach the client as distinct
+codes and each self-heals differently.
+
 **Read path** (`read_bytes_from_extent`): the start replica rotates by
 `(extent_id, offset)` hash so read IO spreads across all replicas; failover
 walks the rest in rotated order. **OPEN-tail extents rotate too** (an open

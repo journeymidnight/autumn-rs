@@ -271,6 +271,13 @@ impl AutumnManager {
                 }
             }
             self.store.inner.borrow_mut().extents.remove(&eid);
+            if let Err(e) = self.forget_payload_location(eid).await {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "both-zero sweep: could not drop the extent's payload-location key"
+                );
+            }
             if let Err(e) = self.enqueue_pending_deletes(vec![d]).await {
                 tracing::warn!(
                     extent_id = eid,

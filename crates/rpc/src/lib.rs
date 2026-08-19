@@ -375,7 +375,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   extent, so a reissued attempt reuses it; the nonce is what separates a
     //   completion report (or a staged stripe) belonging to one attempt from
     //   another's.
-    (29, "d0b7673fa49fa121"),
+    //   v29 refreshed IN PLACE again (still undeployed): a read now NAMES the
+    //   payload file it wants. `ReadBytesReq` grew `(payload_location,
+    //   shard_index)` (32 → 40 bytes; a 32-byte request still decodes, as
+    //   `InDat`), `extent_rpc::ExtentInfo` and `ExtentInfoResp` grew
+    //   `payload_location`, and `CODE_PAYLOAD_NOT_HERE` (7) is the refusal when
+    //   a node does not hold the named file. The manager keeps the location in
+    //   a sibling etcd key, so the persisted `MgrExtentInfo` is untouched and
+    //   every existing extent reads as `InDat`.
+    (29, "92b10b22701423fa"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

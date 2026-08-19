@@ -211,12 +211,13 @@ fn corrupt_of(payload: &[u8], start: usize, len: usize) -> Vec<u8> {
 
 /// Direct single-replica EN read of `[offset,len)` (raw `pread`, no PS proxy).
 async fn direct_read(en: &RpcClient, extent_id: u64, eversion: u64, offset: u64, len: u64) -> (u8, Vec<u8>) {
-    let req = extent_rpc::ReadBytesReq {
+    let req = extent_rpc::ReadBytesReq::new(
         extent_id,
         eversion,
         offset,
-        length: len,
-    };
+        len,
+        extent_rpc::PayloadRef::in_dat(),
+    );
     let resp = en
         .call(extent_rpc::MSG_READ_BYTES, req.encode())
         .await

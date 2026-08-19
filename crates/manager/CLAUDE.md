@@ -98,6 +98,7 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `next_id` | u64 | the ONLY id source (`alloc_ids`) |
 | `ownerLocks/<key>` | owner epoch | `owner_epoch` = the acquire's `mod_revision` |
 | `extent_inflight/<id>` | `MgrExtentInflightRecord` | unified in-flight ledger |
+| `extentLayout/<id>` | 1 byte | payload location; absent ⇒ `InDat` |
 | `extentDeleteRetry/<id>` | `MgrExtentDeleteRetry` | budget-exhausted delete retries |
 | `partitionLastOp/<id>` | i64 LE unix | last split/merge timestamp |
 | `node_override/<id>` | `MgrNodeOverride` | Fenced / Maintenance |
@@ -418,6 +419,17 @@ corruption.
 parity slot bits stay 0 and `recovery_dispatch_loop` fires `EXT_MSG_RE_AVALI` to the
 parity holder forever (idle-cluster RSS churn). The EN `handle_re_avali`
 short-circuits `CODE_OK` when `ec_converted`, self-healing legacy `avali`.
+
+**Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
+— `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN
+obeys; the EN never infers its own role. It lives in the sibling key
+`extentLayout/<id>` (absent ⇒ `InDat`) rather than in `MgrExtentInfo`, because
+that struct is the persisted `extents/<id>` value: widening it would make an
+existing cluster's stored extents fail rkyv validation on replay, which refuses
+leadership rather than degrading. It reaches readers on `ExtentInfoResp`
+alongside the extent. `handle_extent_info` fills it; extent deletion drops it.
+A legacy EC extent is `ec_converted = true, InDat` — the pre-CoW scheme renamed
+each shard over `.dat` — so it keeps working with no backfill.
 
 **Attempt identity (`attempt_nonce`).** A conversion attempt is identified by the
 etcd revision of the txn that created its marker — taken from that txn's own

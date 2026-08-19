@@ -405,7 +405,28 @@ shapes.
 2. **Persistence + wire plumbing, inert** (§7): sibling etcd key defaulting to
    `InDat`, `ExtentInfo.payload_location`, `ReadBytesReq (location, index)`,
    missing-file error code. Nothing writes `InShardFile`; every read carries
-   `InDat`; behaviour byte-identical.
+   `InDat`; behaviour byte-identical. **SHIPPED.**
+
+   Two things surfaced while building it that the design above did not
+   anticipate, both load-bearing:
+
+   - **The server batches reads by `extent_id` alone.** One batch resolves ONE
+     fd and serves every slot from it, so two requests naming different payload
+     files would have been answered out of one file. The grouping key had to
+     widen to the file identity. This is the same class of bug as serving the
+     wrong file directly — it just arrives through the batching path, which no
+     read-path audit of "who names a file" would have caught.
+   - **`InDat` must have ONE identity regardless of shard index.** A replicated
+     read carries the slot it read from; if that index survived into the file
+     identity, reads of one extent from different slots would look like
+     different files and stop batching. `PayloadRef::for_extent` normalises the
+     index away for `InDat`, where it names nothing.
+
+   The client-direct SDK path needed no change: `extent_read_descriptor` already
+   refuses `ec_converted` extents, and `InShardFile` is published only by the
+   flip, which sets `ec_converted` — so a shard file is unreachable from a
+   descriptor. That invariant is now checked explicitly there rather than
+   relied upon silently.
 3. **EN shard-holder model, inert** (§4.4): load/scan/delete/reconcile/df
    awareness of `.shard{i}`, the two-file entry, read-by-request-location with
    error-on-absent. Unit-testable with hand-planted files before any producer

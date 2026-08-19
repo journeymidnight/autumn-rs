@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
-fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
+/// `payload_location` rides beside `MgrExtentInfo` on the wire (it is not part
+/// of the persisted struct), so the caller passes what the manager reported.
+fn mgr_to_local_extent(e: &MgrExtentInfo, payload_location: u8) -> ExtentInfo {
     ExtentInfo {
         extent_id: e.extent_id,
         replicates: e.replicates.clone(),
@@ -21,6 +23,7 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
         replicate_disks: e.replicate_disks.clone(),
         parity_disks: e.parity_disks.clone(),
         ec_converted: e.ec_converted,
+        payload_location,
     }
 }
 use anyhow::{Context, Result};
@@ -915,6 +918,25 @@ pub(crate) struct ExtentEntry {
 }
 
 impl ExtentEntry {
+    /// Does this node hold the payload file a request NAMED?
+    ///
+    /// The answer must never be "close enough": serving `.dat` to a request for
+    /// a shard file (or the reverse) returns shard bytes as a whole value, the
+    /// exact corruption the location field exists to rule out. A caller naming
+    /// a file this node does not have is told so, and refreshes its layout.
+    fn holds_payload(&self, p: PayloadRef) -> bool {
+        match p.location {
+            // An entry exists because its `.dat` does — `load_extents` builds
+            // entries from `.dat` scans, and every producer of a payload file
+            // writes `.dat`.
+            PayloadLocation::InDat => true,
+            // Nothing writes shard files yet: the conversion scheme that
+            // produces them stages to `.ec.dat` and renames over `.dat`, which
+            // is `InDat`. Until a producer exists, naming one is always wrong.
+            PayloadLocation::InShardFile => false,
+        }
+    }
+
     /// replace the file handle. Safe by construction —
     /// `RefCell::borrow_mut` panics if any borrow is currently held,
     /// and concurrent readers have already cloned an `Rc<CompioFile>`
@@ -2016,6 +2038,11 @@ async fn process_frames_backpressured(
                 }
             };
             let anchor_extent = first_req.extent_id;
+            // Group by the PAYLOAD FILE, not just the extent. One batch
+            // resolves ONE fd and serves every slot from it, so two requests
+            // naming different files must never share a batch — that would
+            // answer one of them out of the other's file.
+            let anchor_payload = first_req.payload_ref();
             let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
             slots.push(ReadSlot {
                 req: first_req,
@@ -2024,7 +2051,9 @@ async fn process_frames_backpressured(
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent => {
+                    Ok(r) if r.extent_id == anchor_extent
+                        && r.payload_ref() == anchor_payload =>
+                    {
                         slots.push(ReadSlot {
                             req: r,
                             req_id: frames[i].req_id,
@@ -2083,6 +2112,8 @@ async fn process_frames_backpressured(
                 }
             };
             let anchor_extent = first_req.extent_id;
+            // Same file-identity grouping as the non-bulk path above.
+            let anchor_payload = first_req.payload_ref();
             let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
             slots.push(ReadSlot {
                 req: first_req,
@@ -2091,7 +2122,9 @@ async fn process_frames_backpressured(
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_BULK {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent => {
+                    Ok(r) if r.extent_id == anchor_extent
+                        && r.payload_ref() == anchor_payload =>
+                    {
                         slots.push(ReadSlot {
                             req: r,
                             req_id: frames[i].req_id,
@@ -2236,15 +2269,15 @@ fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
 /// Typed CODE (not a frame-level error) so the client's
 /// `read_bytes_from_extent` retry self-heals (invalidate cache + refetch)
 /// instead of seeing a generic transport error.
-fn eversion_mismatch_read_resp(req_id: u32, bulk: bool) -> Bytes {
+fn read_refusal_resp(req_id: u32, bulk: bool, why: ReadRefusal) -> Bytes {
     if bulk {
-        bulk_read_head(req_id, CODE_EVERSION_MISMATCH, "eversion mismatch", 0)
+        bulk_read_head(req_id, why.code(), why.message(), 0)
     } else {
         Frame::response(
             req_id,
             MSG_READ_BYTES,
             ReadBytesResp {
-                code: CODE_EVERSION_MISMATCH,
+                code: why.code(),
                 end: 0,
                 payload: Bytes::new(),
             }
@@ -2275,10 +2308,17 @@ fn eversion_mismatch_read_resp(req_id: u32, bulk: bool) -> Bytes {
 /// sealed extent has len==sealed_length, and EC shard reads carry explicit
 /// per-shard lengths, so clamping to the logical `sealed_length` there would
 /// be wrong.
-fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Option<(u64, u64, u64)> {
+fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Result<(u64, u64, u64), ReadRefusal> {
+    // The request NAMES a payload file; serving a different one would hand back
+    // shard bytes as a whole value (or the reverse), which is the corruption
+    // the location field exists to prevent. Refuse with its own code so the
+    // client refreshes the layout instead of retrying the same wrong file.
+    if !extent.holds_payload(req.payload_ref()) {
+        return Err(ReadRefusal::PayloadNotHere);
+    }
     let ev = extent.eversion.load(Ordering::SeqCst);
     if req.eversion < ev {
-        return None;
+        return Err(ReadRefusal::EversionStale);
     }
     let total_len = if extent.sealed.load(Ordering::SeqCst)
         && extent.sealed_length.load(Ordering::SeqCst) == 0
@@ -2293,7 +2333,34 @@ fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Option<(u64, u64, u64)
     } else {
         req.length.min(total_len.saturating_sub(read_offset))
     };
-    Some((total_len, read_offset, read_size))
+    Ok((total_len, read_offset, read_size))
+}
+
+/// Why a read cannot be served from this node as requested. Both are typed
+/// RESPONSE codes rather than frame errors, so the client's retry can tell them
+/// apart and self-heal: refetch the extent's metadata and try again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRefusal {
+    /// The caller's cached `eversion` is behind this node's.
+    EversionStale,
+    /// This node does not hold the payload file the request named.
+    PayloadNotHere,
+}
+
+impl ReadRefusal {
+    fn code(self) -> u8 {
+        match self {
+            Self::EversionStale => CODE_EVERSION_MISMATCH,
+            Self::PayloadNotHere => CODE_PAYLOAD_NOT_HERE,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::EversionStale => "eversion mismatch",
+            Self::PayloadNotHere => "payload file not held here",
+        }
+    }
 }
 
 /// The authoritative committed length reported to a length probe — shared by
@@ -2835,7 +2902,7 @@ fn build_read_future(
         // client fails over to a healthy replica.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
             for slot in slots {
-                out.push(eversion_mismatch_read_resp(slot.req_id, bulk));
+                out.push(read_refusal_resp(slot.req_id, bulk, ReadRefusal::EversionStale));
             }
             return out;
         }
@@ -2844,9 +2911,12 @@ fn build_read_future(
             let req = slot.req;
             // Eversion gate + length semantics live in `read_plan` (shared
             // with handle_read_bytes — see its doc for the eversion gate / P0-C).
-            let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
-                out.push(eversion_mismatch_read_resp(slot.req_id, bulk));
-                continue;
+            let (end, read_offset, read_size) = match read_plan(&extent, &req) {
+                Ok(plan) => plan,
+                Err(why) => {
+                    out.push(read_refusal_resp(slot.req_id, bulk, why));
+                    continue;
+                }
             };
 
             // use the caller-resolved, pinned fd for every slot
@@ -4688,17 +4758,18 @@ impl ExtentNode {
         extent_id: u64,
         eversion: u64,
         total_len: u64,
+        payload: PayloadRef,
     ) -> Result<Vec<u8>, String> {
         let sock: std::net::SocketAddr = parse_addr(addr).map_err(|e| e.to_string())?;
         if total_len == 0 {
-            return Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0).await;
+            return Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0, payload).await;
         }
         let chunk = FILE_IO_CHUNK_BYTES as u64;
         let mut out: Vec<u8> = Vec::with_capacity(total_len as usize);
         let mut offset: u64 = 0;
         while offset < total_len {
             let want = chunk.min(total_len - offset);
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want)
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
                 .await?;
             if got.is_empty() {
                 break;
@@ -4723,13 +4794,9 @@ impl ExtentNode {
         eversion: u64,
         offset: u64,
         length: u64,
+        payload: PayloadRef,
     ) -> Result<Vec<u8>, String> {
-        let req = ReadBytesReq {
-            extent_id,
-            eversion,
-            offset,
-            length,
-        };
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
         // BOUND this recovery source read. `rpc_oneshot`
         // (connect + write + read) is otherwise UNBOUNDED — under chaos churn a
         // source EN slowed / half-open by a network-partition or latency toxic
@@ -4816,6 +4883,16 @@ impl ExtentNode {
         // (coco P1): an unattempted source might still hold the full
         // `sealed_length`, so reconciling to a short consensus while any source
         // is unverified risks dropping data that exists out of reach.
+        // This helper's contract is the FULL extent, which a per-node shard
+        // file cannot satisfy — an EC'd extent is repaired by
+        // `run_ec_recovery_payload`, which reads shards by name. Refuse loudly
+        // rather than hand back a shard sized like a short read.
+        if PayloadLocation::from_byte(extent.payload_location) != PayloadLocation::InDat {
+            return Err(format!(
+                "extent {}: payload is not in .dat; full-extent copy does not apply",
+                extent.extent_id
+            ));
+        }
         let mut attempted = 0usize;
         let mut err_count = 0usize;
         let mut unverified = 0usize;
@@ -4862,6 +4939,7 @@ impl ExtentNode {
                 extent.eversion,
                 total,
                 &dest_f,
+                PayloadRef::in_dat(),
             )
             .await
             {
@@ -4939,6 +5017,7 @@ impl ExtentNode {
                     extent.eversion,
                     best_len,
                     &dest_f,
+                    PayloadRef::in_dat(),
                 )
                 .await?;
                 if got < best_len {
@@ -4987,9 +5066,10 @@ impl ExtentNode {
         eversion: u64,
         total: u64,
         dest_file: &Rc<CompioFile>,
+        payload: PayloadRef,
     ) -> Result<u64, String> {
         if total == 0 {
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0).await?;
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0, payload).await?;
             let n = got.len() as u64;
             if !got.is_empty() {
                 file_pwrite(dest_file.clone(), 0, Bytes::from(got))
@@ -5002,7 +5082,7 @@ impl ExtentNode {
         let mut offset: u64 = 0;
         while offset < total {
             let want = chunk.min(total - offset);
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want)
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
                 .await?;
             if got.is_empty() {
                 break;
@@ -5048,7 +5128,8 @@ impl ExtentNode {
         if resp.code != manager_rpc::CODE_OK {
             return Ok(None);
         }
-        Ok(resp.extent.map(|e| mgr_to_local_extent(&e)))
+        let loc = resp.payload_location;
+        Ok(resp.extent.map(|e| mgr_to_local_extent(&e, loc)))
     }
 
     async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, String>, String> {
@@ -5297,7 +5378,21 @@ impl ExtentNode {
             // ~sealed_length/K (well under the chunking threshold), so
             // keep the legacy to-end single read (total_len=0). Only the
             // replicated full-extent fetch needed chunking.
-            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion, 0).await
+            //
+            // Peer `i` is asked for shard `i` BY NAME. Before the payload file
+            // was named, this asked each peer for "the extent" and relied on
+            // that peer's `.dat` happening to be its own shard — true only
+            // because the pre-CoW scheme renamed the shard over `.dat`. Under a
+            // layout where the shard is a separate file, an unnamed read would
+            // return whatever `.dat` still held and feed it to the RS decode.
+            match Self::copy_bytes_from_source(
+                addr,
+                task.extent_id,
+                extent_info.eversion,
+                0,
+                PayloadRef::for_extent(extent_info.payload_location, i as u32),
+            )
+            .await
             {
                 Ok(shard_bytes) => {
                     // Trim to sealed length if the extent is sealed.
@@ -6116,13 +6211,16 @@ impl ExtentNode {
         // Eversion gate + length semantics live in `read_plan` (shared with
         // the batched build_read_future — see its doc for the eversion gate / P0-C and
         // why the mismatch is a typed RESPONSE, not an Err status).
-        let Some((end, read_offset, read_size)) = read_plan(&extent, &req) else {
-            return Ok(ReadBytesResp {
-                code: CODE_EVERSION_MISMATCH,
-                end: 0,
-                payload: Bytes::new(),
+        let (end, read_offset, read_size) = match read_plan(&extent, &req) {
+            Ok(plan) => plan,
+            Err(why) => {
+                return Ok(ReadBytesResp {
+                    code: why.code(),
+                    end: 0,
+                    payload: Bytes::new(),
+                }
+                .encode())
             }
-            .encode());
         };
 
         // Chunk pread to dodge the per-syscall INT_MAX cap on macOS /
@@ -7354,6 +7452,9 @@ impl ExtentNode {
                     mgr_info.eversion,
                     sealed_length,
                     &tmp_rc,
+                    // A full replica: this path publishes a complete `.dat`,
+                    // so a shard file is not a source it can use.
+                    PayloadRef::in_dat(),
                 )
                 .await
                 {
@@ -8504,13 +8605,7 @@ mod sealed_append_guard_tests {
         // A length=0 (read-to-end) read must return 0 bytes.
         let rd = ReadBytesResp::decode(
             node.handle_read_bytes(
-                ReadBytesReq {
-                    extent_id: 7100,
-                    eversion: 1,
-                    offset: 0,
-                    length: 0,
-                }
-                .encode(),
+                ReadBytesReq::new(7100, 1, 0, 0, PayloadRef::in_dat()).encode(),
             )
             .await
             .unwrap(),

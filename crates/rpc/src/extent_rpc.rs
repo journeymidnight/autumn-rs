@@ -235,25 +235,56 @@ impl AppendResp {
 
 // ── ReadBytes (hot path) ─────────────────────────────────────────────────────
 
-/// ReadBytesRequest: 32 bytes (u64-offset widening — offset/length are byte
+/// ReadBytesRequest: 40 bytes (u64-offset widening — offset/length are byte
 /// positions/spans in the extent, now > 4 GiB).
 /// ```text
 /// [extent_id: u64 LE][eversion: u64 LE][offset: u64 LE][length: u64 LE]
+/// [payload_location: u8][pad: 3][shard_index: u32 LE]
 /// ```
+///
+/// `payload_location` + `shard_index` NAME the file to serve from. Both are
+/// required: a node can legitimately hold shard files at two indices (two
+/// attempts, or a parity slot plus a data slot after a reassignment), so the
+/// location alone does not identify a file. The server serves the named file or
+/// answers `CODE_PAYLOAD_NOT_HERE` — never the other file.
+///
+/// `0, 0` = `(InDat, shard 0)`, which is what every pre-CoW caller means and
+/// what the pre-existing wire form decoded to.
 pub struct ReadBytesReq {
     pub extent_id: u64,
     pub eversion: u64,
     pub offset: u64,
     pub length: u64,
+    pub payload_location: u8,
+    pub shard_index: u32,
 }
 
 impl ReadBytesReq {
+    /// Build a request naming `payload` on the target node.
+    pub fn new(extent_id: u64, eversion: u64, offset: u64, length: u64, payload: PayloadRef) -> Self {
+        Self {
+            extent_id,
+            eversion,
+            offset,
+            length,
+            payload_location: payload.location.as_byte(),
+            shard_index: payload.shard_index,
+        }
+    }
+
+    pub fn payload_ref(&self) -> PayloadRef {
+        PayloadRef::for_extent(self.payload_location, self.shard_index)
+    }
+
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(32);
+        let mut buf = BytesMut::with_capacity(40);
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.eversion);
         buf.put_u64_le(self.offset);
         buf.put_u64_le(self.length);
+        buf.put_u8(self.payload_location);
+        buf.put_slice(&[0u8; 3]);
+        buf.put_u32_le(self.shard_index);
         buf.freeze()
     }
 
@@ -261,11 +292,27 @@ impl ReadBytesReq {
         if data.len() < 32 {
             return Err("read_bytes request too short");
         }
+        let extent_id = data.get_u64_le();
+        let eversion = data.get_u64_le();
+        let offset = data.get_u64_le();
+        let length = data.get_u64_le();
+        // The payload-file selector is a trailing addition, so a 32-byte
+        // request decodes to `(InDat, 0)` — exactly what it meant before the
+        // field existed.
+        let (payload_location, shard_index) = if data.len() >= 8 {
+            let loc = data.get_u8();
+            let _pad = data.get_uint_le(3);
+            (loc, data.get_u32_le())
+        } else {
+            (PAYLOAD_LOCATION_IN_DAT, 0)
+        };
         Ok(Self {
-            extent_id: data.get_u64_le(),
-            eversion: data.get_u64_le(),
-            offset: data.get_u64_le(),
-            length: data.get_u64_le(),
+            extent_id,
+            eversion,
+            offset,
+            length,
+            payload_location,
+            shard_index,
         })
     }
 }
@@ -595,6 +642,114 @@ pub const CODE_LOCKED_BY_OTHER: u8 = 5;
 /// stale `StreamClient.extent_info_cache` entry). The client must
 /// invalidate its cached `ExtentInfo` and refetch from the manager.
 pub const CODE_EVERSION_MISMATCH: u8 = 6;
+/// Returned by ReadBytes when this node does not hold the payload file the
+/// request NAMED (`payload_location` + `shard_index`).
+///
+/// It is deliberately distinct from `CODE_NOT_FOUND` ("no such extent here")
+/// and never a silent fallback to whichever payload file this node does hold:
+/// serving shard bytes as a whole value, or the reverse, is exactly the
+/// corruption the location field exists to prevent. The client's response is to
+/// refresh its layout from the manager and retry, which converges because the
+/// manager is the authority on where an extent's payload lives.
+pub const CODE_PAYLOAD_NOT_HERE: u8 = 7;
+
+/// Which file on an extent-node holds an extent's payload.
+///
+/// Both forms can exist on one node at once (a staged shard beside a still-live
+/// `.dat`), so the layout has to SAY which is authoritative rather than letting
+/// each node infer its own role. The manager owns this decision; the EN obeys
+/// it. Wire form is a `u8` — this codebase keeps rkyv-derived enums out of the
+/// schema (same reason `ExtentOpKind` is a byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadLocation {
+    /// `extent-{id}.dat` holds the payload: a full replica, or a shard written
+    /// by the pre-CoW conversion scheme, which renamed its shard over `.dat`.
+    /// This is the DEFAULT for every extent that predates the field.
+    InDat,
+    /// `extent-{id}.shard{i}` holds this node's shard; `.dat` is either absent
+    /// or a redundant full copy awaiting cleanup.
+    InShardFile,
+}
+
+pub const PAYLOAD_LOCATION_IN_DAT: u8 = 0;
+pub const PAYLOAD_LOCATION_IN_SHARD_FILE: u8 = 1;
+
+impl PayloadLocation {
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::InDat => PAYLOAD_LOCATION_IN_DAT,
+            Self::InShardFile => PAYLOAD_LOCATION_IN_SHARD_FILE,
+        }
+    }
+
+    /// An unknown byte decodes to `InDat`, never an error: it can only come
+    /// from a peer that knows a location this build does not, and the safe
+    /// reading of "I don't understand where the payload is" is the pre-existing
+    /// layout — which is also what an absent field means.
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            PAYLOAD_LOCATION_IN_SHARD_FILE => Self::InShardFile,
+            _ => Self::InDat,
+        }
+    }
+}
+
+impl Default for PayloadLocation {
+    fn default() -> Self {
+        Self::InDat
+    }
+}
+
+/// NAMES one payload file on one node: a location plus, when that location is
+/// `InShardFile`, which shard index.
+///
+/// Both halves are needed — a node can hold shard files at two different
+/// indices (two attempts, or a parity slot plus a data slot after a
+/// reassignment), so the location alone does not identify a file. They travel
+/// together as one value because every read path has to carry them through
+/// several layers, and a pair that must not be split is better modelled than
+/// remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PayloadRef {
+    pub location: PayloadLocation,
+    pub shard_index: u32,
+}
+
+impl PayloadRef {
+    /// The whole payload in `extent-{id}.dat` — a full replica, or a shard the
+    /// pre-CoW scheme renamed over `.dat`. The default, and what every extent
+    /// that predates the layout field means.
+    pub fn in_dat() -> Self {
+        Self {
+            location: PayloadLocation::InDat,
+            shard_index: 0,
+        }
+    }
+
+    pub fn shard(shard_index: u32) -> Self {
+        Self {
+            location: PayloadLocation::InShardFile,
+            shard_index,
+        }
+    }
+
+    /// Resolve against an extent's published layout: the extent says WHERE its
+    /// payload lives, the caller says WHICH shard it is reading.
+    ///
+    /// The index is dropped for `InDat`, because there it names nothing: one
+    /// `.dat` is the payload whatever slot the caller happens to be reading
+    /// from. Normalising here — rather than at each comparison — keeps this
+    /// value a true file identity, so the server can group two requests iff
+    /// they name the same file. (Without it, replicated reads of one extent
+    /// from different slots would carry different indices and stop batching,
+    /// even though every one of them means `.dat`.)
+    pub fn for_extent(payload_location: u8, shard_index: u32) -> Self {
+        match PayloadLocation::from_byte(payload_location) {
+            PayloadLocation::InDat => Self::in_dat(),
+            PayloadLocation::InShardFile => Self::shard(shard_index),
+        }
+    }
+}
 
 /// Convert a u8 code from binary wire format to autumn_rpc::StatusCode.
 pub fn code_to_status(code: u8) -> StatusCode {
@@ -603,6 +758,7 @@ pub fn code_to_status(code: u8) -> StatusCode {
         CODE_NOT_FOUND => StatusCode::NotFound,
         CODE_PRECONDITION => StatusCode::FailedPrecondition,
         CODE_EVERSION_MISMATCH => StatusCode::FailedPrecondition,
+        CODE_PAYLOAD_NOT_HERE => StatusCode::FailedPrecondition,
         _ => StatusCode::Internal,
     }
 }
@@ -648,6 +804,17 @@ pub struct ExtentInfo {
     /// so an open / pre-conversion extent has `parity != []` but
     /// still holds full replicated data on every K+M node.
     pub ec_converted: bool,
+    /// Where each member node keeps this extent's payload
+    /// (`PayloadLocation::from_byte`). `0` = `InDat`, which is both the default
+    /// and what every extent predating this field means — the manager stores it
+    /// beside `extents/<id>` rather than inside it, so old records decode
+    /// unchanged and simply read as `InDat`.
+    ///
+    /// `ec_converted` says the extent's bytes ARE shards; this says which FILE
+    /// they live in. The pre-CoW scheme renamed the shard over `.dat`, so a
+    /// legacy converted extent is `ec_converted = true, InDat` and keeps
+    /// working with no backfill.
+    pub payload_location: u8,
 }
 
 /// StreamInfo — stream ID and its ordered list of extent IDs.
@@ -1197,5 +1364,53 @@ mod chain_codec_tests {
         let (chain, rest) = decode_chain_prefix(full.freeze()).unwrap();
         assert!(chain.is_empty());
         assert_eq!(AppendReq::decode(rest).unwrap().extent_id, 1);
+    }
+
+    #[test]
+    fn read_bytes_req_roundtrips_the_named_payload_file() {
+        let req = ReadBytesReq::new(9, 4, 100, 200, PayloadRef::shard(3));
+        let got = ReadBytesReq::decode(req.encode()).unwrap();
+        assert_eq!(got.extent_id, 9);
+        assert_eq!(got.eversion, 4);
+        assert_eq!(got.offset, 100);
+        assert_eq!(got.length, 200);
+        assert_eq!(got.payload_ref(), PayloadRef::shard(3));
+    }
+
+    /// A request written before the payload selector existed is 32 bytes, and
+    /// means `.dat` — the same thing an explicit `InDat` means. Decoding it as
+    /// anything else would make an upgrade reinterpret in-flight reads.
+    #[test]
+    fn a_request_without_the_selector_decodes_as_in_dat() {
+        let mut legacy = BytesMut::with_capacity(32);
+        legacy.put_u64_le(9);
+        legacy.put_u64_le(4);
+        legacy.put_u64_le(100);
+        legacy.put_u64_le(200);
+        let got = ReadBytesReq::decode(legacy.freeze()).unwrap();
+        assert_eq!(got.payload_ref(), PayloadRef::in_dat());
+        assert_eq!(got.length, 200);
+    }
+
+    /// `InDat` names ONE file whatever slot the caller read from, so the shard
+    /// index must not survive into the identity — otherwise replicated reads of
+    /// one extent from different slots would look like different files and the
+    /// server would stop batching them.
+    #[test]
+    fn in_dat_has_one_identity_regardless_of_slot() {
+        assert_eq!(
+            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_DAT, 3),
+            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_DAT, 0)
+        );
+        assert_ne!(
+            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_SHARD_FILE, 3),
+            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_SHARD_FILE, 0),
+            "two shard files on one node are different files"
+        );
+    }
+
+    #[test]
+    fn an_unknown_location_byte_reads_as_in_dat() {
+        assert_eq!(PayloadLocation::from_byte(200), PayloadLocation::InDat);
     }
 }

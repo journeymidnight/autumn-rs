@@ -579,6 +579,14 @@ pub struct ExtentInfoResp {
     pub code: u8,
     pub message: String,
     pub extent: Option<MgrExtentInfo>,
+    /// Which payload file each member holds this extent's bytes in
+    /// (`extent_rpc::PayloadLocation`). It rides BESIDE `extent` rather than
+    /// inside `MgrExtentInfo` because that struct is the persisted
+    /// `extents/<id>` value: widening it would make an existing cluster's
+    /// stored extents fail rkyv validation on replay, which blocks leadership.
+    /// The manager keeps this in a sibling etcd key, absent ⇒ `InDat`, so every
+    /// pre-existing extent reads correctly with no backfill.
+    pub payload_location: u8,
 }
 
 // --- NodesInfo ---

@@ -1976,17 +1976,20 @@ impl AutumnManager {
     async fn handle_extent_info(&self, payload: Bytes) -> HandlerResult {
         let req: ExtentInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let payload_location = self.payload_location_of(req.extent_id).as_byte();
         let s = self.store.inner.borrow();
         match s.extents.get(&req.extent_id) {
             Some(e) => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_OK,
                 message: String::new(),
                 extent: Some(e.clone()),
+                payload_location,
             })),
             None => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_NOT_FOUND,
                 message: format!("extent {} not found", req.extent_id),
                 extent: None,
+                payload_location,
             })),
         }
     }
@@ -3151,6 +3154,15 @@ impl AutumnManager {
                         s.extents.remove(&eid);
                     }
                 }
+                for &eid in &extent_deletes {
+                    if let Err(e) = self.forget_payload_location(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the deleted extent's payload-location key"
+                        );
+                    }
+                }
                 // Each enqueue is an etcd CAS via the inflight ledger; errors
                 // are downgraded inside enqueue (WARN-logged) so a single
                 // failed acquire doesn't fail the whole punch_holes call.
@@ -3278,6 +3290,15 @@ impl AutumnManager {
                     }
                     for &eid in &extent_deletes {
                         s.extents.remove(&eid);
+                    }
+                }
+                for &eid in &extent_deletes {
+                    if let Err(e) = self.forget_payload_location(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the deleted extent's payload-location key"
+                        );
                     }
                 }
                 let _ = self.enqueue_pending_deletes(pending_deletes).await;

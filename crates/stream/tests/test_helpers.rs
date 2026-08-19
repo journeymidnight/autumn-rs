@@ -124,12 +124,20 @@ impl TestConn {
         offset: u64,
         length: u64,
     ) -> ReadBytesResp {
-        let req = ReadBytesReq {
-            extent_id,
-            eversion,
-            offset,
-            length,
-        };
+        self.read_bytes_from(extent_id, eversion, offset, length, PayloadRef::in_dat())
+            .await
+    }
+
+    /// `read_bytes` naming a specific payload file.
+    pub async fn read_bytes_from(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+        payload: PayloadRef,
+    ) -> ReadBytesResp {
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
         let resp = self
             .pool
             .call(&self.addr, MSG_READ_BYTES, req.encode())
@@ -148,12 +156,20 @@ impl TestConn {
         offset: u64,
         length: u64,
     ) -> (u8, Vec<u8>) {
-        let req = ReadBytesReq {
-            extent_id,
-            eversion,
-            offset,
-            length,
-        };
+        self.read_bytes_bulk_from(extent_id, eversion, offset, length, PayloadRef::in_dat())
+            .await
+    }
+
+    /// `read_bytes_bulk` naming a specific payload file.
+    pub async fn read_bytes_bulk_from(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+        payload: PayloadRef,
+    ) -> (u8, Vec<u8>) {
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
         let z = self
             .pool
             .call_into_pooled(

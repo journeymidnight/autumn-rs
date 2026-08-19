@@ -3,6 +3,7 @@ pub mod authz;
 pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
+mod extent_layout;
 mod fs_alloc;
 pub mod inode_lease;
 pub mod node_state;
@@ -735,6 +736,10 @@ pub struct AutumnManager {
     /// entry can only weaken the check to its pre-nonce behaviour — it can
     /// never reject a legitimate report.
     pub(crate) inflight_attempt_nonce: Rc<RefCell<HashMap<u64, u64>>>,
+    /// Which payload file holds each extent's bytes, for the extents that are
+    /// not in the default `InDat` shape. See `extent_layout.rs`; persisted at
+    /// the `extentLayout/` prefix, absent ⇒ `InDat`.
+    pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, u8>>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -1025,6 +1030,7 @@ impl AutumnManager {
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
+            extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
@@ -3052,6 +3058,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let failed_delete_raw = c
             .get_prefix(crate::extent_delete::EXTENT_DELETE_RETRY_PREFIX)
             .await?;
+        // Per-extent payload location. Only non-default (`InShardFile`) entries
+        // exist, so this prefix is empty on a cluster that has never converted
+        // an extent under the CoW scheme.
+        let extent_layout_raw = c
+            .get_prefix(crate::extent_layout::EXTENT_LAYOUT_PREFIX)
+            .await?;
         // persistent operator overrides + decommissioned tombstones.
         let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
@@ -3299,6 +3311,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 }
             }
         }
+        self.install_replayed_payload_locations(Self::decode_extent_layout_kvs(
+            extent_layout_raw.kvs.iter().filter_map(|kv| {
+                let id =
+                    Self::parse_id_from_key(crate::extent_layout::EXTENT_LAYOUT_PREFIX, &kv.key)
+                        .ok()?;
+                Some((id, kv.value.as_slice()))
+            }),
+        ));
         // rehydrate in-memory `delete_progress` from Delete-kind
         // ledger entries so the new leader's extent_delete_loop picks up
         // pending fanouts immediately. Attempts reset to 0 (correct

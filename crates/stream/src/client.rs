@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
-    FenceExtentResp, ProbeExtentReq,
+    FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, PAYLOAD_LOCATION_IN_DAT,
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
     encode_chain_prefix, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
     MSG_APPEND, MSG_APPEND_CHAIN, MSG_FENCE_EXTENT,
@@ -246,12 +246,10 @@ pub async fn read_extent_value_direct(
     offset: u64,
     length: u64,
 ) -> Result<bytes::Bytes> {
-    let req = ReadBytesReq {
-        extent_id,
-        eversion,
-        offset,
-        length,
-    };
+    // `.dat` by construction: `extent_read_descriptor` — the only producer of
+    // the descriptor this reads from — refuses any extent whose payload lives
+    // elsewhere, so the SDK never holds an address for a shard file.
+    let req = ReadBytesReq::new(extent_id, eversion, offset, length, PayloadRef::in_dat());
     let z = pool
         // BUG-READ-TIMEOUT-STORM: size-scale the deadline (was a fixed 3 s that
         // stormed on 8 MiB reads). This free fn holds no StreamClientConfig (the
@@ -2624,7 +2622,7 @@ impl StreamClient {
             .map(|(_, e)| e)
             .ok_or_else(|| anyhow!("tail extent {} not in response", tail_eid))?;
 
-        let extent = Self::mgr_to_extent_info(&mgr_extent);
+        let extent = Self::mgr_to_extent_info(&mgr_extent, PAYLOAD_LOCATION_IN_DAT);
         self.extent_info_cache
             .insert(extent.extent_id, extent.clone());
 
@@ -2685,7 +2683,7 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("check_commit: missing stream_info"))?;
         let extent = resp
             .last_ex_info
-            .map(|e| Self::mgr_to_extent_info(&e))
+            .map(|e| Self::mgr_to_extent_info(&e, PAYLOAD_LOCATION_IN_DAT))
             .ok_or_else(|| anyhow!("check_commit: missing last_ex_info"))?;
         Ok((stream, extent, resp.end))
     }
@@ -2740,7 +2738,7 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("alloc_new_extent: missing stream_info"))?;
         let extent = resp
             .last_ex_info
-            .map(|e| Self::mgr_to_extent_info(&e))
+            .map(|e| Self::mgr_to_extent_info(&e, PAYLOAD_LOCATION_IN_DAT))
             .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
         self.extent_info_cache
             .insert(extent.extent_id, extent.clone());
@@ -3594,7 +3592,7 @@ impl StreamClient {
         self.check_manager_resp(resp.code, &resp.message, "extent_info")?;
         let ex = resp
             .extent
-            .map(|e| Self::mgr_to_extent_info(&e))
+            .map(|e| Self::mgr_to_extent_info(&e, resp.payload_location))
             .ok_or_else(|| anyhow!("extent {} not found", extent_id))?;
         self.extent_info_cache.insert(extent_id, ex.clone());
         Ok(ex)
@@ -3897,7 +3895,14 @@ impl StreamClient {
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         let addr = &addrs[replica_idx];
         let (bytes, _end) = self
-            .read_shard_from_addr(addr, extent_id, ex.eversion, offset, want)
+            .read_shard_from_addr(
+                addr,
+                extent_id,
+                ex.eversion,
+                offset,
+                want,
+                PayloadRef::for_extent(ex.payload_location, replica_idx as u32),
+            )
             .await?;
         Ok((bytes, committed_end, node_id))
     }
@@ -4008,12 +4013,13 @@ impl StreamClient {
         let mut timeouts = 0usize;
         for &slot in &order {
             let addr = &addrs[slot];
-            let req = ReadBytesReq {
+            let req = ReadBytesReq::new(
                 extent_id,
-                eversion: ex.eversion,
+                ex.eversion,
                 offset,
                 length,
-            }
+                PayloadRef::for_extent(ex.payload_location, slot as u32),
+            )
             .encode();
             match self
                 .pool
@@ -4204,6 +4210,18 @@ impl StreamClient {
                 "extent {extent_id} is EC-converted; direct read not supported"
             ));
         }
+        // The descriptor names no payload file, so the SDK's direct read always
+        // asks for `.dat` (`read_extent_value_direct`). That is sound only
+        // while a shard-file extent is unreachable here — which the refusal
+        // above enforces, since `InShardFile` is published exclusively by the
+        // EC layout flip, which also sets `ec_converted`. Check it anyway: if
+        // that ever stops holding, the SDK must fall back to the proxy rather
+        // than read `.dat` bytes that are no longer the value.
+        if PayloadLocation::from_byte(ex.payload_location) != PayloadLocation::InDat {
+            return Err(anyhow!(
+                "extent {extent_id} keeps its payload outside .dat; direct read not supported"
+            ));
+        }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         // WAL self-heal A1: hand the client only avali-ELIGIBLE replicas
         // (an isolated bit-rotted slot must not be a client-direct read target
@@ -4306,7 +4324,14 @@ impl StreamClient {
         for &slot in &order[from..] {
             let addr = &addrs[slot];
             match self
-                .read_shard_from_addr(addr, ex.extent_id, ex.eversion, offset, length)
+                .read_shard_from_addr(
+                    addr,
+                    ex.extent_id,
+                    ex.eversion,
+                    offset,
+                    length,
+                    PayloadRef::for_extent(ex.payload_location, slot as u32),
+                )
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -4350,18 +4375,23 @@ impl StreamClient {
         // order (healthy-first), not necessarily `start`/`start+1`.
         let a0 = addrs[s0 % n].clone();
         let a1 = addrs[s1 % n].clone();
+        // Each arm asks its OWN slot for its own payload file — the two hedged
+        // reads are different slots, so a single hoisted ref would ask one node
+        // for the other's shard.
+        let p0 = PayloadRef::for_extent(ex.payload_location, (s0 % n) as u32);
+        let p1 = PayloadRef::for_extent(ex.payload_location, (s1 % n) as u32);
         let Some(sc) = self.self_weak.upgrade() else {
             // Client is shutting down — plain single read, no hedge.
             return self
-                .read_shard_from_addr(&a0, ex.extent_id, ex.eversion, offset, length)
+                .read_shard_from_addr(&a0, ex.extent_id, ex.eversion, offset, length, p0)
                 .await;
         };
         let (eid, ev) = (ex.extent_id, ex.eversion);
-        let spawn_read = |sc: Rc<StreamClient>, addr: String| {
+        let spawn_read = |sc: Rc<StreamClient>, addr: String, payload: PayloadRef| {
             let (tx, rx) = futures::channel::oneshot::channel();
             compio::runtime::spawn(async move {
                 let _ = tx.send(
-                    sc.read_shard_from_addr(&addr, eid, ev, offset, length)
+                    sc.read_shard_from_addr(&addr, eid, ev, offset, length, payload)
                         .await,
                 );
             })
@@ -4369,7 +4399,7 @@ impl StreamClient {
             rx
         };
 
-        let rx0 = spawn_read(sc.clone(), a0);
+        let rx0 = spawn_read(sc.clone(), a0, p0);
         futures::pin_mut!(rx0);
         let timer = compio::time::sleep(Duration::from_millis(read_hedge_ms()));
         futures::pin_mut!(timer);
@@ -4384,7 +4414,7 @@ impl StreamClient {
                         }
                         // First failed before the hedge window: sequential
                         // second read (no point hedging a known failure).
-                        flatten_hedge(spawn_read(sc, a1).await)
+                        flatten_hedge(spawn_read(sc, a1, p1).await)
                     }
                 };
             }
@@ -4393,7 +4423,7 @@ impl StreamClient {
 
         // Hedge window elapsed: race first vs second, first Ok wins. The
         // loser keeps running detached and cleans up via its own timeout.
-        let rx1 = spawn_read(sc, a1);
+        let rx1 = spawn_read(sc, a1, p1);
         futures::pin_mut!(rx1);
         match select(rx0, rx1).await {
             Either::Left((res0, rx1_pending)) => match flatten_hedge(res0) {
@@ -4517,6 +4547,7 @@ impl StreamClient {
         eversion: u64,
         offset: u64,
         length: u64,
+        payload: PayloadRef,
     ) -> Result<(Vec<u8>, u64)> {
         // u64-offset widening: a single MSG_READ_BYTES response is framed with
         // `payload_len: u32` (frame.rs), so a per-RPC read MUST stay under
@@ -4531,7 +4562,7 @@ impl StreamClient {
         let chunk = self.config.read_chunk_bytes;
         if length <= chunk {
             return self
-                .read_shard_chunk_from_addr(addr, extent_id, eversion, offset, length)
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, offset, length, payload)
                 .await;
         }
         let mut data: Vec<u8> = Vec::with_capacity(length as usize);
@@ -4543,7 +4574,7 @@ impl StreamClient {
         while cur < stop {
             let want = (stop - cur).min(chunk);
             let (piece, end) = self
-                .read_shard_chunk_from_addr(addr, extent_id, eversion, cur, want)
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, cur, want, payload)
                 .await?;
             if piece.is_empty() {
                 break;
@@ -4569,13 +4600,9 @@ impl StreamClient {
         eversion: u64,
         offset: u64,
         length: u64,
+        payload: PayloadRef,
     ) -> Result<(Vec<u8>, u64)> {
-        let req = ReadBytesReq {
-            extent_id,
-            eversion,
-            offset,
-            length,
-        };
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
         let resp_bytes = self
             .pool
             // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 3 s). This is the
@@ -4718,7 +4745,14 @@ impl StreamClient {
             .map(|&i| {
                 let (shard_idx, sh_off, sh_len) = shard_plan[i];
                 let addr = &addrs[shard_idx];
-                self.read_shard_from_addr(addr, extent_id, ex.eversion, sh_off, sh_len)
+                self.read_shard_from_addr(
+                    addr,
+                    extent_id,
+                    ex.eversion,
+                    sh_off,
+                    sh_len,
+                    PayloadRef::for_extent(ex.payload_location, shard_idx as u32),
+                )
             })
             .collect();
         let results = futures::future::join_all(read_futs).await;
@@ -4846,6 +4880,7 @@ impl StreamClient {
 
         let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
         let cached_eversion = ex.eversion;
+        let cached_location = ex.payload_location;
         // BUG-READ-TIMEOUT-STORM: capture the read IoDeadline (Copy) here where
         // `self.config` is reachable — the per-shard read runs inside a spawned
         // task that only captures a cloned `pool`, not `self`.
@@ -4858,12 +4893,14 @@ impl StreamClient {
             let addr_clone = addr.clone();
             let pool = self.pool.clone();
             compio::runtime::spawn(async move {
-                let req = ReadBytesReq {
+                // Shard `i` from the node that holds shard `i`.
+                let req = ReadBytesReq::new(
                     extent_id,
-                    eversion: cached_eversion,
-                    offset: sh_off,
-                    length: sh_len,
-                };
+                    cached_eversion,
+                    sh_off,
+                    sh_len,
+                    PayloadRef::for_extent(cached_location, i as u32),
+                );
                 // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 5 s). Sub-range
                 // is `sh_len` (≤ read_chunk_bytes, typically 64 MiB GC chunks).
                 let result: Result<Vec<u8>> = match pool
@@ -4999,6 +5036,7 @@ impl StreamClient {
         // `read_shard_from_addr`), so a shard > 4 GiB would also overflow the
         // frame `payload_len: u32` — a pre-existing hazard, out of scope here.
         let read_dl = self.config.read_deadline();
+        let cached_location = ex.payload_location;
         let shard_len = crate::erasure::shard_size(ex.sealed_length as usize, data_shards) as u64;
         for (i, addr) in addrs.into_iter().enumerate() {
             let mut tx = tx.clone();
@@ -5012,12 +5050,13 @@ impl StreamClient {
                 if !delay.is_zero() {
                     compio::time::sleep(delay).await;
                 }
-                let req = ReadBytesReq {
+                let req = ReadBytesReq::new(
                     extent_id,
-                    eversion: cached_eversion,
-                    offset: 0,
-                    length: 0,
-                };
+                    cached_eversion,
+                    0,
+                    0,
+                    PayloadRef::for_extent(cached_location, i as u32),
+                );
                 // Size-scaled per-shard deadline (BUG-READ-TIMEOUT-STORM) —
                 // without a bound, a paged-out / dead EN can keep its spawned
                 // task alive forever, and since the outer `while rx.next().await`
@@ -5155,7 +5194,12 @@ impl StreamClient {
         }
     }
 
-    fn mgr_to_extent_info(e: &MgrExtentInfo) -> ExtentInfo {
+    /// `payload_location` is not part of `MgrExtentInfo` (that struct is the
+    /// persisted etcd value); it arrives beside it. Callers that hold no
+    /// published location pass `PAYLOAD_LOCATION_IN_DAT` — sound because only a
+    /// SEALED extent can live outside `.dat`, and those callers are handling a
+    /// freshly allocated or just-committed tail.
+    fn mgr_to_extent_info(e: &MgrExtentInfo, payload_location: u8) -> ExtentInfo {
         ExtentInfo {
             extent_id: e.extent_id,
             replicates: e.replicates.clone(),
@@ -5168,6 +5212,7 @@ impl StreamClient {
             replicate_disks: e.replicate_disks.clone(),
             parity_disks: e.parity_disks.clone(),
             ec_converted: e.ec_converted,
+            payload_location,
         }
     }
 }
@@ -6038,6 +6083,8 @@ mod merge_ec_replay_tests {
                 replicate_disks: vec![],
                 parity_disks: vec![],
                 ec_converted: true,
+                // Legacy conversion shape: shards were renamed over `.dat`.
+                payload_location: PAYLOAD_LOCATION_IN_DAT,
             },
         );
 
