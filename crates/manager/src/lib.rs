@@ -834,6 +834,13 @@ pub struct AutumnManager {
     /// runs ONLY on the leader and is DEFAULT-OFF (a fresh cluster stays
     /// pure-mechanism).
     pub(crate) auto_policy: Rc<RefCell<crate::auto_policy::AutoPolicyState>>,
+    /// Consecutive reconcile rounds in which a node reported holding an extent
+    /// it is NOT a member of, keyed by `(node_id, extent_id)`. Residue is only
+    /// collected after the verdict has been stable for several rounds — a
+    /// momentarily-wrong view (mid-`apply_recovery_done` slot swap, a freshly
+    /// promoted leader) must never delete real data. Leader-local: a leader
+    /// change resets the counters, which only ever DELAYS a deletion.
+    pub(crate) reconcile_non_member: Rc<RefCell<HashMap<(u64, u64), u32>>>,
     /// leader-local, in-memory ledger of submitted long-running ops (the
     /// queryable state + failure reason for split/merge/rebalance/compact/gc/
     /// forcegc/ec-convert). Terminal outcomes also go to the durable audit log.
@@ -995,6 +1002,7 @@ impl AutumnManager {
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
+            reconcile_non_member: Rc::new(RefCell::new(HashMap::new())),
             ops: Rc::new(RefCell::new(crate::op_ledger::OpLedger::new())),
             auto_policy_default: Rc::new(RefCell::new(None)),
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
@@ -4925,6 +4933,110 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(q.ops[0].state, OP_STATE_UNKNOWN);
+    }
+
+    /// R4: residue is collected by MEMBERSHIP, not by "the manager forgot this
+    /// extent". A recovery that died mid-copy leaves a partial file that reloads
+    /// as an ordinary extent, so the extent stays very much alive and the old
+    /// existence-only predicate could never see it.
+    ///
+    /// And it is collected only after the verdict has HELD: the membership view
+    /// is momentarily wrong in normal operation (an `apply_recovery_done` slot
+    /// swap, a settling leader), and deleting real data on a transient is far
+    /// worse than holding residue a few minutes longer.
+    #[test]
+    fn reconcile_collects_non_members_only_after_the_verdict_holds() {
+        let m = AutumnManager::new();
+        // Extent 5 exists and node 7 is NOT one of its members.
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 2, 3];
+            s.extents.insert(5, ex);
+        }
+        let ask = || -> Vec<u64> {
+            let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 7,
+                    extent_ids: vec![5],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap();
+            resp.garbage
+        };
+        assert!(ask().is_empty(), "round 1: too early to delete");
+        assert!(ask().is_empty(), "round 2: still within the grace period");
+        assert_eq!(ask(), vec![5], "round 3: the verdict has held — collect it");
+    }
+
+    /// A node that IS a member must never be told to delete, no matter how many
+    /// rounds pass — and the counter must reset, so a node that briefly looked
+    /// like a non-member does not carry that history forever.
+    #[test]
+    fn reconcile_never_collects_a_member() {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 7, 3]; // node 7 IS a member
+            s.extents.insert(5, ex);
+        }
+        for round in 1..=5 {
+            let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 7,
+                    extent_ids: vec![5],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap();
+            assert!(resp.garbage.is_empty(), "round {round}: a member was collected");
+        }
+    }
+
+    /// A recovery TARGET is a non-member by construction — it is building the
+    /// copy that will make it one. Listing it would delete the recovery out from
+    /// under itself, so an in-flight marker suppresses collection entirely.
+    #[test]
+    fn reconcile_does_not_collect_an_extent_with_an_op_in_flight() {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 2, 3];
+            s.extents.insert(5, ex);
+        }
+        run(async {
+            m.acquire_extent_inflight(
+                5,
+                crate::extent_inflight::ExtentOpPayload::Recovery(MgrRecoveryTask {
+                    extent_id: 5,
+                    replace_id: 2,
+                    node_id: 7,
+                    start_time: 0,
+                }),
+            )
+            .await
+            .expect("acquire");
+        });
+        for round in 1..=5 {
+            let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 7,
+                    extent_ids: vec![5],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap();
+            assert!(
+                resp.garbage.is_empty(),
+                "round {round}: collected an extent with a recovery in flight"
+            );
+        }
     }
 
     #[test]

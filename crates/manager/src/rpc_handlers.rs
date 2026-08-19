@@ -5469,7 +5469,7 @@ impl AutumnManager {
     /// in `s.extents`. The node then unlinks the corresponding files.
     /// Best-effort: failure is logged on the node side but doesn't block
     /// startup. Read-only with respect to manager state.
-    async fn handle_reconcile_extents(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_reconcile_extents(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&ReconcileExtentsResp {
                 code: Self::err_to_code(&err),
@@ -5479,12 +5479,58 @@ impl AutumnManager {
         }
         let req: ReconcileExtentsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Two kinds of garbage, with deliberately different confidence:
+        //
+        //   1. the manager has FORGOTTEN the extent → collect immediately (it
+        //      cannot become a member of something that no longer exists);
+        //   2. the extent is alive but this node is NOT one of its members →
+        //      collect only after the verdict has held for several rounds.
+        //
+        // (2) is what reaps the residue of a recovery that died mid-copy: the
+        // partial file reloads as an ordinary extent, so the extent is very much
+        // alive and (1) can never see it — which is why such a stub used to
+        // survive forever. Membership is the right question because a non-member
+        // copy is referenced by no VP, no SST and no checkpoint.
+        //
+        // The grace period exists because the membership view is momentarily
+        // wrong in normal operation — `apply_recovery_done` swaps a slot, a
+        // freshly promoted leader is still settling — and deleting real data on a
+        // transient is far worse than holding residue for a few more minutes.
+        const NON_MEMBER_ROUNDS_BEFORE_GC: u32 = 3;
         let garbage: Vec<u64> = {
             let s = self.store.inner.borrow();
+            let mut seen = self.reconcile_non_member.borrow_mut();
+            // Only keep counters for extents this node still reports, so the map
+            // cannot grow without bound.
+            let reported: std::collections::HashSet<u64> = req.extent_ids.iter().copied().collect();
+            seen.retain(|(n, eid), _| *n != req.node_id || reported.contains(eid));
+
             req.extent_ids
                 .iter()
                 .copied()
-                .filter(|eid| !s.extents.contains_key(eid))
+                .filter(|eid| {
+                    let Some(ex) = s.extents.get(eid) else {
+                        // (1) unknown extent — immediate.
+                        seen.remove(&(req.node_id, *eid));
+                        return true;
+                    };
+                    if Self::extent_nodes(ex).contains(&req.node_id) {
+                        seen.remove(&(req.node_id, *eid));
+                        return false;
+                    }
+                    // A node running a recovery for this extent is a legitimate
+                    // non-member — it is BUILDING the copy it will become a
+                    // member with. The EN refuses such a delete anyway; not
+                    // listing it keeps the two sides from disagreeing.
+                    if self.extent_inflight_op(*eid).is_some() {
+                        seen.remove(&(req.node_id, *eid));
+                        return false;
+                    }
+                    // (2) non-member — count the rounds.
+                    let c = seen.entry((req.node_id, *eid)).or_insert(0);
+                    *c += 1;
+                    *c >= NON_MEMBER_ROUNDS_BEFORE_GC
+                })
                 .collect()
         };
         if !garbage.is_empty() {

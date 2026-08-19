@@ -3277,6 +3277,22 @@ impl ExtentNode {
             "startup reconcile: unlinking orphans",
         );
         for eid in &resp.garbage {
+            // NEVER unlink an extent this node is actively building or
+            // converting. The manager's garbage list now includes extents this
+            // node is not a MEMBER of — and a recovery target is by definition
+            // not yet a member, so without this guard the sweep would delete a
+            // recovery out from under itself. `handle_delete_extent` has always
+            // refused for the same reason; this path used to bypass it because
+            // the old list only ever named extents the manager had forgotten
+            // (which can never be a recovery target).
+            if self.recovery_inflight.contains_key(eid) || self.ec_convert_inflight.contains_key(eid)
+            {
+                tracing::debug!(
+                    extent_id = eid,
+                    "reconcile: skipping unlink — an op is in flight on this extent"
+                );
+                continue;
+            }
             // Drop in-memory entry and unlink files. Look up the disk
             // via the entry; if the entry is gone (concurrent delete),
             // fall back to scanning every disk.
