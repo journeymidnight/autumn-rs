@@ -903,6 +903,10 @@ pub struct ExtConvertToEcReq {
     /// `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch`. `0` =
     /// no-fence (legacy / memory-only mode).
     pub owner_epoch: i64,
+    /// Mirror of `extent_rpc::ConvertToEcReq::attempt_nonce` — which conversion
+    /// ATTEMPT this dispatch belongs to. Sourced from the in-flight marker's own
+    /// etcd creation revision, so it is unique per attempt and monotonic.
+    pub attempt_nonce: u64,
 }
 
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────

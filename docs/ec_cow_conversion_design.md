@@ -155,9 +155,27 @@ The nonce is also what lets the coordinator's prepare-skip be attempt-scoped
 (§5), and what stops a successor attempt's staging from being polluted by a
 zombie predecessor writing the same index file (§4.3).
 
-Persistence note: widening `MgrEcDispatchInflight` is an rkyv layout change that
-breaks replay of live markers (§7); carry the nonce in the sibling key introduced
-there, or require drained markers as an upgrade precondition.
+**As built.** The nonce is *the etcd revision of the txn that created the
+marker*, read from that txn's own response (`txn_fenced_revision`) and rebuilt on
+promotion from the key's `mod_revision`. This costs no new key and no persisted
+struct change, which matters more than it first appears: `MgrEcDispatchInflight`
+is nested in `MgrExtentInflightRecord` as an `Option`, so widening it shifts that
+struct's archived layout and every live marker — **recovery and delete
+included** — would fail rkyv validation on replay, blocking leadership on
+upgrade. The sibling key contemplated above was the alternative; etcd already
+storing this value made it unnecessary.
+
+Being a revision also makes nonces **monotonic**, which buys a guard a random
+nonce could not: a participant refuses a `WriteShard` whose nonce is *lower* than
+the attempt it is already staging. A merely-released coordinator (the routine
+case) keeps its `owner_epoch`, so that fence does not stop it interleaving
+stripes into its successor's staging file; the ordering does. That guard is
+in-memory — it arbitrates two live writers, and a restart falls back to the
+stripe-0 truncate and the epoch fence.
+
+`0` means "no attempt identity" (a pre-nonce marker or peer). A 0-nonce report
+completes only a 0-nonce marker, so an upgrade converges instead of wedging,
+while a 0-nonce report can never complete an identified attempt.
 
 ### 4.2 Which file does the EN serve?
 
@@ -382,8 +400,8 @@ schemes meet, and by then every reader, scanner, and cleaner understands both
 shapes.
 
 1. **Attempt nonce + reporter check against the CURRENT 2PC** (§4.1). Fixes
-   today's exposure independently; everything later inherits it. (Reporter check
-   shipped, `8282712`; nonce outstanding.)
+   today's exposure independently; everything later inherits it. **SHIPPED** —
+   reporter check `8282712`, nonce below.
 2. **Persistence + wire plumbing, inert** (§7): sibling etcd key defaulting to
    `InDat`, `ExtentInfo.payload_location`, `ReadBytesReq (location, index)`,
    missing-file error code. Nothing writes `InShardFile`; every read carries

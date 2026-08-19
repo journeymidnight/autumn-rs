@@ -419,6 +419,30 @@ parity slot bits stay 0 and `recovery_dispatch_loop` fires `EXT_MSG_RE_AVALI` to
 parity holder forever (idle-cluster RSS churn). The EN `handle_re_avali`
 short-circuits `CODE_OK` when `ec_converted`, self-healing legacy `avali`.
 
+**Attempt identity (`attempt_nonce`).** A conversion attempt is identified by the
+etcd revision of the txn that created its marker — taken from that txn's own
+response (`txn_fenced_revision`), held in `inflight_attempt_nonce` beside the
+ledger, and rebuilt on promotion from the key's `mod_revision`. It rides
+`ExtConvertToEcReq` → `WriteShardReq` → `EcConvertDone`, and
+`classify_ec_done(params, live_nonce, reporter, done)` is the single predicate
+deciding whether a completion report may be applied.
+
+Three checks, none redundant: **reporter identity** (only `target_nodes[0]`),
+**eversion**, and **attempt**. A released-and-reissued attempt can pick the SAME
+coordinator and carries the SAME `new_eversion` — it is `live + 1`, and an
+abandoned attempt never bumped the extent — so only the nonce separates them.
+Applying the wrong one flips the layout onto targets holding no shards, after
+which cleanup deletes the last full replicas. **Every rejection retains the
+marker.**
+
+The nonce is deliberately NOT in `MgrEcDispatchInflight`: that struct is nested
+as an `Option` in the persisted `MgrExtentInflightRecord`, so widening it shifts
+the archived layout and every live marker — recovery and delete too — would fail
+replay validation, blocking leadership on upgrade. Because dispatch and apply
+both read the same in-memory entry, a lost entry can only weaken the check to its
+pre-nonce strength; it can never reject a legitimate report. `0` = pre-nonce
+marker, and matches only a `0` report.
+
 Candidates are deduped by `extent_id` (a CoW-shared extent appears in both child
 streams; re-encoding an already-shrunk shard produces `original/K²` sub-shards). The
 coordinator `handle_convert_to_ec` is idempotent (already-converted at this eversion

@@ -368,7 +368,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   removes the "RPC timeout vs dead EN" ambiguity that made a stuck EC
     //   marker un-releasable, and unblocks conversions longer than one RPC
     //   timeout.
-    (29, "a6979f12cd99a1c1"),
+    //   v29 refreshed IN PLACE again (still undeployed): EC conversion gained a
+    //   per-attempt nonce — `ConvertToEcReq`/`ExtConvertToEcReq`, `WriteShardReq`
+    //   (binary header 44 → 52) and `EcConvertDone` all carry `attempt_nonce`.
+    //   `new_eversion` is `live + 1` and an abandoned attempt never bumps the
+    //   extent, so a reissued attempt reuses it; the nonce is what separates a
+    //   completion report (or a staged stripe) belonging to one attempt from
+    //   another's.
+    (29, "d0b7673fa49fa121"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

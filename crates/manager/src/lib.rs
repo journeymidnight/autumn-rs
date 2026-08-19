@@ -302,10 +302,33 @@ impl EtcdMirror {
         &self,
         success: Vec<autumn_etcd::proto::RequestOp>,
     ) -> Result<i64, AppError> {
-        let compare = vec![autumn_etcd::Cmp::value(
+        // No extra_cmp, so a held fence with `succeeded == false` is a
+        // server-side anomaly rather than a business CAS refusal.
+        self.txn_fenced_revision(vec![], success)
+            .await?
+            .ok_or_else(Self::empty_extra_cmp_err)
+    }
+
+    /// `txn_fenced` + the txn's COMMIT REVISION. `Ok(None)` is the soft CAS
+    /// refusal (`extra_cmp` failed under a held fence), matching
+    /// `txn_fenced`'s `Ok(false)`.
+    ///
+    /// The revision is what callers use as an identity for the thing the txn
+    /// created — an owner epoch, or an in-flight marker's attempt nonce. It
+    /// must come from THIS txn's response: a separate GET could observe a
+    /// concurrent same-key writer's revision, handing two creations one
+    /// identity, which is precisely what such an identity exists to prevent.
+    async fn txn_fenced_revision(
+        &self,
+        extra_cmp: Vec<autumn_etcd::proto::Compare>,
+        success: Vec<autumn_etcd::proto::RequestOp>,
+    ) -> Result<Option<i64>, AppError> {
+        let mut compare = Vec::with_capacity(1 + extra_cmp.len());
+        compare.push(autumn_etcd::Cmp::value(
             LEADER_KEY.as_bytes(),
             self.instance_id.as_bytes(),
-        )];
+        ));
+        compare.extend(extra_cmp);
         let txn = autumn_etcd::proto::TxnRequest {
             compare,
             success,
@@ -326,12 +349,10 @@ impl EtcdMirror {
                 .ok_or_else(|| {
                     AppError::Internal("etcd txn response missing header revision".to_string())
                 })?;
-            return Ok(rev);
+            return Ok(Some(rev));
         }
-        // Same fence-vs-anomaly diagnosis as `txn_fenced`; there is no
-        // extra_cmp here, so a held fence means a server-side anomaly.
         self.diagnose_post_txn_fence().await?;
-        Err(Self::empty_extra_cmp_err())
+        Ok(None)
     }
 
     async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<(), AppError> {
@@ -695,6 +716,25 @@ pub struct AutumnManager {
     /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
     /// the migration plan.
     pub(crate) inflight: Rc<RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>>,
+    /// Attempt identity for each live marker in `inflight`, keyed the same way:
+    /// the etcd revision of the txn that CREATED that marker. Unique per
+    /// attempt (a released-then-reissued marker is a different creation) and
+    /// monotonic (etcd revisions only grow), which is what lets an EN refuse a
+    /// stripe from an attempt older than the one it is staging.
+    ///
+    /// It rides beside the record rather than inside it because
+    /// `MgrEcDispatchInflight` is nested in the PERSISTED
+    /// `MgrExtentInflightRecord`: widening it changes that struct's archived
+    /// layout, and since the payloads are `Option<T>` the size shift would make
+    /// every live marker — recovery and delete included — fail to decode on
+    /// replay, blocking leadership on upgrade. etcd already stores this value
+    /// as the key's `mod_revision`, so replay rebuilds the map for free.
+    ///
+    /// A missing entry reads as `0` = "legacy attempt, no identity". Because
+    /// the dispatch and the completion-apply both read THIS map, a divergent
+    /// entry can only weaken the check to its pre-nonce behaviour — it can
+    /// never reject a legitimate report.
+    pub(crate) inflight_attempt_nonce: Rc<RefCell<HashMap<u64, u64>>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -984,6 +1024,7 @@ impl AutumnManager {
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
+            inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
@@ -3228,11 +3269,33 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     .unwrap_or(0);
                     (id, kv.value.as_slice())
                 }));
+            // Each marker's attempt nonce is the etcd revision that created it,
+            // which etcd hands back as the key's `mod_revision` — so the map is
+            // rebuilt from etcd itself rather than from anything we persisted.
+            // A marker is written once at acquire and never rewritten, so this
+            // is the same value the acquiring leader recorded.
+            let revs: HashMap<u64, i64> = extent_inflight_raw
+                .kvs
+                .iter()
+                .filter_map(|kv| {
+                    let id = Self::parse_id_from_key(
+                        crate::extent_inflight::EXTENT_INFLIGHT_PREFIX,
+                        &kv.key,
+                    )
+                    .ok()?;
+                    Some((id, kv.mod_revision))
+                })
+                .collect();
             let mut map = self.inflight.borrow_mut();
+            let mut nonces = self.inflight_attempt_nonce.borrow_mut();
             map.clear();
+            nonces.clear();
             for (id, rec) in decoded {
                 if id != 0 {
                     map.insert(id, rec);
+                    if let Some(rev) = revs.get(&id).filter(|r| **r > 0) {
+                        nonces.insert(id, *rev as u64);
+                    }
                 }
             }
         }

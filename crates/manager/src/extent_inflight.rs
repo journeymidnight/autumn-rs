@@ -219,21 +219,44 @@ impl AutumnManager {
 
         let record = MgrExtentInflightRecord::new(extent_id, payload, (*self.instance_id).clone());
 
-        if let Some(etcd) = &self.etcd {
+        // The attempt nonce is this creation's etcd revision, so it must come
+        // from the acquiring txn itself (see `txn_fenced_revision`). In memory
+        // mode there are no revisions; the store's monotonic counter stands in.
+        let nonce = if let Some(etcd) = &self.etcd {
             let key = Self::extent_inflight_key(extent_id);
             let value = rkyv_encode(&record).to_vec();
             let extra_cmp = vec![Cmp::create_revision(key.as_bytes(), 0)];
             let put_op = autumn_etcd::Op::put(key.as_bytes(), &value);
-            let acquired = etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await?;
-            if !acquired {
-                return Err(AppError::Precondition(format!(
-                    "extent {extent_id} already has an in-flight op (etcd CAS refused)"
-                )));
+            match etcd.txn_fenced_revision(extra_cmp, vec![put_op]).await? {
+                Some(rev) => rev as u64,
+                None => {
+                    return Err(AppError::Precondition(format!(
+                        "extent {extent_id} already has an in-flight op (etcd CAS refused)"
+                    )))
+                }
             }
-        }
+        } else {
+            let mut s = self.store.inner.borrow_mut();
+            s.next_revision += 1;
+            s.next_revision as u64
+        };
 
         self.inflight.borrow_mut().insert(extent_id, record);
+        self.inflight_attempt_nonce
+            .borrow_mut()
+            .insert(extent_id, nonce);
         Ok(())
+    }
+
+    /// Identity of the attempt currently in flight on `extent_id`; `0` when
+    /// there is no marker or it predates nonces. See
+    /// `AutumnManager::inflight_attempt_nonce`.
+    pub(crate) fn extent_inflight_nonce(&self, extent_id: u64) -> u64 {
+        self.inflight_attempt_nonce
+            .borrow()
+            .get(&extent_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// In-memory release of the inflight marker. Call AFTER the apply-done
@@ -242,6 +265,7 @@ impl AutumnManager {
     /// programming note 1).
     pub(crate) fn commit_extent_inflight_release(&self, extent_id: u64) {
         self.inflight.borrow_mut().remove(&extent_id);
+        self.inflight_attempt_nonce.borrow_mut().remove(&extent_id);
     }
 
     /// Read-only probe — returns the op kind currently in flight on
@@ -676,6 +700,39 @@ mod tests {
             assert!(matches!(err, AppError::Precondition(_)), "got {err:?}");
             // The original op's kind is unchanged.
             assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
+        })
+    }
+
+    /// A reissued attempt must get a DIFFERENT identity from the one it
+    /// replaced — that difference is the only thing separating the two
+    /// attempts' completion reports, since both carry the same coordinator and
+    /// the same `new_eversion` (see `recovery::classify_ec_done`).
+    #[test]
+    fn a_reissued_attempt_gets_a_fresh_nonce() {
+        run(async {
+            let m = AutumnManager::new();
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("acquire");
+            let first = m.extent_inflight_nonce(42);
+            assert_ne!(first, 0, "a live marker must have an identity");
+
+            // Abandon and reissue, exactly as a fenced coordinator would.
+            m.commit_extent_inflight_release(42);
+            assert_eq!(
+                m.extent_inflight_nonce(42),
+                0,
+                "a released marker leaves no identity behind"
+            );
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("re-acquire");
+
+            assert!(
+                m.extent_inflight_nonce(42) > first,
+                "the reissued attempt must be distinguishable from, and ordered after, \
+                 the one it replaced"
+            );
         })
     }
 

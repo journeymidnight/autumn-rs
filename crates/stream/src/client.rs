@@ -5983,6 +5983,7 @@ mod merge_ec_replay_tests {
                 eversion: EVERSION,
                 owner_epoch: 0,
                 shard_offset: 0,
+                attempt_nonce: 0,
                 payload: Bytes::from(shards[i].clone()),
             };
             let ws_resp = pool

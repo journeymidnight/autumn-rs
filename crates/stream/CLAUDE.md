@@ -744,6 +744,24 @@ and from other crates' CLAUDE.md); do not renumber.
     idempotent-skip path ALSO reports done (the ADOPT case), so a completion lost
     to `df`'s at-most-once delivery converges on the next re-dispatch.
 
+    **Attempt identity (`attempt_nonce`) rides the whole conversion.** The
+    manager stamps each attempt with the etcd revision that created its marker;
+    it flows `ConvertToEcReq` → `WriteShardReq` → `EcConvertDone`. Two EN-side
+    consequences: (a) the coordinator's `ec.prepared` marker records
+    `[new_eversion][attempt_nonce]` and the prepare-SKIP requires BOTH to match,
+    because `new_eversion` repeats across a reissued attempt (it is `live + 1`
+    and an abandoned attempt never bumped the extent) — a pre-nonce 8-byte
+    marker reads as short and simply re-prepares, which is always safe; (b)
+    `handle_write_shard` refuses a stripe whose nonce is LOWER than the attempt
+    already staging on this extent (`ec_stage_nonce`, compared under the op
+    lock). Nonces are etcd revisions, hence monotonic, which is what makes "this
+    writer is superseded" decidable. The `owner_epoch` fence does not cover
+    this: it only rises when the ex-coordinator was FENCED, whereas a routinely
+    RELEASED coordinator keeps its epoch and would otherwise interleave stripes
+    into its successor's staging file. `ec_stage_nonce` is in-memory (it
+    arbitrates two live writers); across a restart the stripe-0 truncate and the
+    epoch fence remain. `0` = pre-nonce peer, left unordered.
+
     **EC conversion is idempotent AND serialised on the coordinator.** `run_convert_to_ec_task` acquires a per-extent `ec_conversion_locks` `Rc<Mutex<()>>` across the entire prepare+commit, and re-runs the idempotency guard under it: if the extent is already EC-converted at this eversion (`entry.eversion >= req.eversion && sealed_length > 0 && avali > 0`) it returns `CODE_OK` without re-encoding. Without this, a re-dispatched or leader-failover-racing convert re-encodes the ALREADY-shrunk local shard as if it were the original payload, producing sub-shards ≈ `original / K²` → silent short reads. The manager dedups convert candidates by `extent_id` (primary fix); the coordinator lock + idempotency is defense-in-depth.
 
 17. **Dead-replica recovery: closed-aware pool + append fanout timeout.** When an EN dies, autumn-rpc's `read_loop` sees EOF and clears `pending`, but the `Rc<RpcClient>` stays pooled. Three layers stop a caller hanging on a receiver that will never resolve: (a) `RpcClient::is_closed()` (set on `read_loop`/`writer_task` exit before `pending.clear()`); every `send_*` early-returns `ConnectionClosed`. (b) `ConnPool::get_client` skips + reconnects a closed entry; `send_vectored` evicts on submit error. (c) `launch_append` wraps each per-replica receiver in a bounded deadline (`StreamClientConfig.append_fanout_timeout`, default 5 s, clamped [200 ms, 60 s]; note 28 made this the BASE of a size-scaled deadline). `Elapsed` → soft error the retry loop escalates to `alloc_new_extent`. **Invariant:** any caller of `pool.send_vectored`/`call_vectored` against a peer that may go down MUST allow the surrounding logic to handle `Err` — never assume a returned receiver resolves.

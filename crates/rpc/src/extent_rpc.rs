@@ -714,6 +714,18 @@ pub struct RecoveryTaskDone {
 pub struct EcConvertDone {
     pub extent_id: u64,
     pub new_eversion: u64,
+    /// Which ATTEMPT produced this report. Echoed back from
+    /// `ConvertToEcReq.attempt_nonce`; the manager refuses to apply a report
+    /// whose nonce is not the live marker's.
+    ///
+    /// `new_eversion` alone cannot separate attempts: it is `live + 1`, and an
+    /// abandoned attempt never bumps the extent's eversion, so a re-issued
+    /// attempt is handed the SAME value. A stale report from a previous
+    /// attempt's coordinator would then match the current marker and fire the
+    /// layout flip while the current attempt has staged nothing — after which
+    /// cleanup deletes the last full replicas. `0` = a legacy marker created
+    /// before nonces existed (accepted only against a marker that also has 0).
+    pub attempt_nonce: u64,
 }
 
 /// Df (disk-free + recovery heartbeat) request.
@@ -802,6 +814,12 @@ pub struct ConvertToEcReq {
     /// 2PC continues against bumped revisions on remote ENs is
     /// rejected with `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
     pub owner_epoch: i64,
+    /// Identity of THIS conversion attempt — the etcd revision that created
+    /// the manager's marker, so it is unique per attempt and monotonic across
+    /// them. The coordinator forwards it into every `WriteShardReq` and echoes
+    /// it in `EcConvertDone`; see `EcConvertDone::attempt_nonce` for what it
+    /// defends against. `0` = legacy / memory-only.
+    pub attempt_nonce: u64,
 }
 
 // ── CopyExtent (binary — large payload) ─────────────────────────────────────
@@ -873,7 +891,7 @@ impl CopyExtentResp {
 
 // ── WriteShard (binary — large payload) ─────────────────────────────────────
 
-/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE][shard_offset: u64 LE][payload...]
+/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE][shard_offset: u64 LE][attempt_nonce: u64 LE][payload...]
 ///
 /// `eversion` is the post-EC eversion the manager has decided on. The
 /// receiving extent node bumps `entry.eversion` to this value when it
@@ -892,7 +910,14 @@ impl CopyExtentResp {
 /// single RPC never exceeds the frame `payload_len: u32` ceiling — load-bearing
 /// once an extent (hence a shard) can exceed 4 GiB. `shard_offset = 0` with the
 /// whole shard as `payload` is the degenerate single-stripe form.
-pub const WRITE_SHARD_HEADER_LEN: usize = 44;
+///
+/// `attempt_nonce` identifies the conversion attempt this stripe belongs to
+/// (see `ConvertToEcReq::attempt_nonce`). Nonces are etcd revisions, hence
+/// MONOTONIC, which is what lets a receiver refuse a stripe from an attempt
+/// older than the one it is already staging — a coordinator whose marker was
+/// released keeps streaming into the same staging file that its successor is
+/// now filling.
+pub const WRITE_SHARD_HEADER_LEN: usize = 52;
 
 pub struct WriteShardReq {
     pub extent_id: u64,
@@ -901,6 +926,7 @@ pub struct WriteShardReq {
     pub eversion: u64,
     pub owner_epoch: i64,
     pub shard_offset: u64,
+    pub attempt_nonce: u64,
     pub payload: Bytes,
 }
 
@@ -913,6 +939,7 @@ impl WriteShardReq {
         buf.put_u64_le(self.eversion);
         buf.put_i64_le(self.owner_epoch);
         buf.put_u64_le(self.shard_offset);
+        buf.put_u64_le(self.attempt_nonce);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
@@ -927,6 +954,7 @@ impl WriteShardReq {
         let eversion = data.get_u64_le();
         let owner_epoch = data.get_i64_le();
         let shard_offset = data.get_u64_le();
+        let attempt_nonce = data.get_u64_le();
         let payload = data;
         Ok(Self {
             extent_id,
@@ -935,6 +963,7 @@ impl WriteShardReq {
             eversion,
             owner_epoch,
             shard_offset,
+            attempt_nonce,
             payload,
         })
     }

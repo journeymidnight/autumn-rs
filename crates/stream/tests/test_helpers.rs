@@ -195,6 +195,22 @@ impl TestConn {
         eversion: u64,
         payload: Vec<u8>,
     ) -> WriteShardResp {
+        self.write_shard_with_nonce(extent_id, shard_index, sealed_length, eversion, 0, payload)
+            .await
+    }
+
+    /// `write_shard` stamped with a conversion-attempt nonce. Nonces are etcd
+    /// revisions in production, so a LOWER one names a superseded attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_shard_with_nonce(
+        &self,
+        extent_id: u64,
+        shard_index: u32,
+        sealed_length: u64,
+        eversion: u64,
+        attempt_nonce: u64,
+        payload: Vec<u8>,
+    ) -> WriteShardResp {
         // added `owner_epoch`; tests use 0 (the documented
         // "no fence requested" wire-compat sentinel).
         let req = WriteShardReq {
@@ -205,6 +221,7 @@ impl TestConn {
             owner_epoch: 0,
             // whole-shard single-stripe write (offset 0) — the degenerate form.
             shard_offset: 0,
+            attempt_nonce,
             payload: Bytes::from(payload),
         };
         let resp = self

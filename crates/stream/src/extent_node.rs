@@ -1275,6 +1275,18 @@ pub struct ExtentNode {
     /// re-dispatches from its durable marker every ~5 s, so without this guard
     /// each tick would spawn another converter for the same extent.
     ec_convert_inflight: Rc<DashMap<u64, ()>>,
+    /// Highest conversion-attempt nonce this shard has staged a stripe for,
+    /// per extent. Nonces are etcd revisions and therefore MONOTONIC, so a
+    /// `WriteShard` carrying a LOWER one provably belongs to an attempt that
+    /// has since been superseded — a coordinator whose marker was released but
+    /// which is still streaming stripes into the same staging file its
+    /// successor is now filling. Without the ordering there is no way to tell
+    /// which of two writers is the live one.
+    ///
+    /// In-memory only: it guards a race between two live coordinators, which
+    /// is bounded by this process's lifetime. A restart forgets it, and the
+    /// stripe-0 truncate plus the `owner_epoch` fence remain the defence there.
+    ec_stage_nonce: Rc<DashMap<u64, u64>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     /// shard_idx / shard_count for per-shard extent ownership.
@@ -1349,6 +1361,7 @@ impl Clone for ExtentNode {
             recovery_inflight: self.recovery_inflight.clone(),
             ec_done: self.ec_done.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
+            ec_stage_nonce: self.ec_stage_nonce.clone(),
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
@@ -3049,6 +3062,7 @@ impl ExtentNode {
             recovery_inflight: Rc::new(DashMap::new()),
             ec_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             ec_convert_inflight: Rc::new(DashMap::new()),
+            ec_stage_nonce: Rc::new(DashMap::new()),
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
@@ -5701,6 +5715,9 @@ impl ExtentNode {
     /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
     /// Record that a FULL prepare for `new_eversion` completed (coordinator
     /// stages itself LAST, so this also asserts every participant is staged).
+    /// Payload = `[new_eversion: u64 LE][attempt_nonce: u64 LE]` — the nonce is
+    /// what makes the record attempt-scoped, since `new_eversion` repeats
+    /// across a released-and-reissued attempt.
     /// Best-effort by contract: on failure the caller just loses the skip
     /// optimisation and re-prepares, which is always safe.
     async fn write_ec_prepared_marker(
@@ -5708,6 +5725,7 @@ impl ExtentNode {
         disk: &DiskFS,
         extent_id: u64,
         new_eversion: u64,
+        attempt_nonce: u64,
     ) -> Result<(), String> {
         let path = disk.ec_prepared_marker_path(extent_id);
         if let Some(parent) = path.parent() {
@@ -5723,13 +5741,12 @@ impl ExtentNode {
             .await
             .map_err(|e| format!("create ec prepared marker {extent_id}: {e}"))?;
         let f = Rc::new(f);
-        file_pwrite_chunked(
-            f.clone(),
-            0,
-            Bytes::copy_from_slice(&new_eversion.to_le_bytes()),
-        )
-        .await
-        .map_err(|e| format!("write ec prepared marker {extent_id}: {e}"))?;
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&new_eversion.to_le_bytes());
+        payload[8..16].copy_from_slice(&attempt_nonce.to_le_bytes());
+        file_pwrite_chunked(f.clone(), 0, Bytes::copy_from_slice(&payload))
+            .await
+            .map_err(|e| format!("write ec prepared marker {extent_id}: {e}"))?;
         f.sync_data()
             .await
             .map_err(|e| format!("sync ec prepared marker {extent_id}: {e}"))?;
@@ -5744,19 +5761,25 @@ impl ExtentNode {
         Ok(())
     }
 
-    /// The `new_eversion` recorded by the last completed prepare, if any.
-    /// Absent / short / unreadable ⇒ `None` ⇒ the caller re-prepares (safe:
-    /// prepare is deterministic and truncates its staging at stripe 0).
-    async fn read_ec_prepared_marker(&self, disk: &DiskFS, extent_id: u64) -> Option<u64> {
+    /// The `(new_eversion, attempt_nonce)` recorded by the last completed
+    /// prepare, if any. Absent / short / unreadable ⇒ `None` ⇒ the caller
+    /// re-prepares (safe: prepare is deterministic and truncates its staging at
+    /// stripe 0). A pre-nonce 8-byte marker left by an older binary reads as
+    /// short here, so an upgraded node re-prepares once rather than trusting a
+    /// record whose attempt it cannot identify.
+    async fn read_ec_prepared_marker(&self, disk: &DiskFS, extent_id: u64) -> Option<(u64, u64)> {
         let path = disk.ec_prepared_marker_path(extent_id);
         let f = compio::fs::File::open(&path).await.ok()?;
-        let buf = vec![0u8; 8];
+        let buf = vec![0u8; 16];
         let res = f.read_exact_at(buf, 0).await;
         let bytes = res.1;
-        if res.0.is_err() || bytes.len() < 8 {
+        if res.0.is_err() || bytes.len() < 16 {
             return None;
         }
-        Some(u64::from_le_bytes(bytes[0..8].try_into().ok()?))
+        Some((
+            u64::from_le_bytes(bytes[0..8].try_into().ok()?),
+            u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+        ))
     }
 
     async fn write_ec_commit_marker(
@@ -7460,15 +7483,20 @@ impl ExtentNode {
         compio::runtime::spawn(async move {
             let extent_id = req.extent_id;
             let new_eversion = req.eversion;
+            let attempt_nonce = req.attempt_nonce;
             match node.run_convert_to_ec_task(req).await {
                 Ok(()) => {
                     // Report the completion for the next `df` pickup. This is
-                    // the ONLY signal the manager applies the layout on.
+                    // the ONLY signal the manager applies the layout on. The
+                    // nonce says WHICH attempt finished — without it a report
+                    // that outlived its own attempt is indistinguishable from
+                    // the live one's.
                     node.ec_done
                         .borrow_mut()
                         .push(crate::extent_rpc::EcConvertDone {
                             extent_id,
                             new_eversion,
+                            attempt_nonce,
                         });
                     tracing::info!(extent_id, new_eversion, "EC convert done; queued for df report");
                 }
@@ -7588,10 +7616,16 @@ impl ExtentNode {
             // different shard index, skipping prepare would commit stale,
             // wrong-index staging over live replicas on every reused participant
             // (`CommitEcShardReq` carries no shard index, so nobody downstream
-            // can catch it). Require the prepared-marker to name THIS attempt's
-            // `new_eversion`; anything else re-prepares (always safe).
-            let marker_matches =
-                self.read_ec_prepared_marker(&disk, extent_id).await == Some(new_eversion);
+            // can catch it).
+            //
+            // `new_eversion` does NOT scope this to an attempt: it is
+            // `live + 1`, and an abandoned attempt never bumped the extent, so
+            // a reissued attempt is handed the same value. The nonce is the
+            // attempt's own identity, so require the marker to name THIS
+            // attempt; anything else (including a pre-nonce marker written by
+            // an older binary) re-prepares, which is always safe.
+            let marker_matches = self.read_ec_prepared_marker(&disk, extent_id).await
+                == Some((new_eversion, req.attempt_nonce));
             if !marker_matches {
                 false
             } else if let Ok(meta) = compio::fs::metadata(&staging).await {
@@ -7828,6 +7862,7 @@ impl ExtentNode {
                             eversion: new_eversion,
                             owner_epoch: req.owner_epoch,
                             shard_offset: shard_off,
+                            attempt_nonce: req.attempt_nonce,
                             payload,
                         };
                         let sock = parse_addr(target_addr).map_err(|e| {
@@ -7867,7 +7902,7 @@ impl ExtentNode {
                 // Best-effort: a failure here only costs a re-prepare.
                 if let Ok(disk) = self.disk_for(entry.disk_id) {
                     if let Err(e) = self
-                        .write_ec_prepared_marker(&disk, extent_id, new_eversion)
+                        .write_ec_prepared_marker(&disk, extent_id, new_eversion, req.attempt_nonce)
                         .await
                     {
                         tracing::warn!(
@@ -7948,6 +7983,34 @@ impl ExtentNode {
         // fault a healthy disk). Same lock the convert path takes.
         let op_lock = self.get_or_create_extent_op_lock(req.extent_id);
         let _op_guard = op_lock.lock().await;
+
+        // ATTEMPT ORDERING: refuse a stripe from an attempt older than the one
+        // already staging here. The `owner_epoch` fence above only fires when
+        // the ex-coordinator was FENCED; a coordinator whose marker was merely
+        // released (the routine case — its node went offline, or the assignment
+        // was re-derived) keeps its epoch and would otherwise interleave its
+        // stripes with its successor's into the same staging file. Checked
+        // under the op lock so the compare-and-record is atomic against a
+        // concurrent stripe. Nonce 0 = a pre-nonce peer: left unordered rather
+        // than blocking it.
+        if req.attempt_nonce > 0 {
+            if let Some(seen) = self.ec_stage_nonce.get(&req.extent_id).map(|v| *v) {
+                if req.attempt_nonce < seen {
+                    tracing::warn!(
+                        extent_id = req.extent_id,
+                        shard_index = req.shard_index,
+                        stripe_nonce = req.attempt_nonce,
+                        staging_nonce = seen,
+                        "write_shard from a SUPERSEDED conversion attempt — refusing"
+                    );
+                    return Ok(WriteShardResp {
+                        code: CODE_LOCKED_BY_OTHER,
+                    }
+                    .encode());
+                }
+            }
+            self.ec_stage_nonce.insert(req.extent_id, req.attempt_nonce);
+        }
 
         if let Ok(entry) = self.ensure_extent(req.extent_id).await {
             // Re-read UNDER the lock: a fence may have landed while we waited,
@@ -9199,6 +9262,7 @@ mod wire_fence_tests {
             eversion: 7,
             owner_epoch: 99,
             shard_offset: 7_000_000_000, // > u32::MAX — exercises the u64 offset
+            attempt_nonce: 6_000_000_001,
             payload: Bytes::from_static(b"shard-bytes"),
         };
         let encoded = original.encode();
@@ -9209,6 +9273,7 @@ mod wire_fence_tests {
         assert_eq!(decoded.eversion, 7);
         assert_eq!(decoded.owner_epoch, 99);
         assert_eq!(decoded.shard_offset, 7_000_000_000);
+        assert_eq!(decoded.attempt_nonce, 6_000_000_001);
         assert_eq!(decoded.payload.as_ref(), b"shard-bytes");
     }
 
@@ -9221,6 +9286,7 @@ mod wire_fence_tests {
             eversion: 1,
             owner_epoch: 0,
             shard_offset: 0,
+            attempt_nonce: 0,
             payload: Bytes::new(),
         };
         let decoded = WriteShardReq::decode(original.encode()).unwrap();

@@ -15,6 +15,46 @@ fn params_coordinator(p: &MgrEcDispatchInflight) -> Option<u64> {
     p.target_nodes.first().copied()
 }
 
+/// Why a coordinator's `ec_done` report may not be applied to the live marker.
+/// Applying the wrong one flips the layout onto targets that hold no shards,
+/// after which cleanup deletes the last full replicas — so every rejection here
+/// RETAINS the marker and lets the re-dispatch reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EcDoneRejection {
+    /// The sender is not this marker's pinned coordinator.
+    NotCoordinator,
+    /// The report names a different post-EC eversion than the marker.
+    EversionMismatch,
+    /// Right coordinator, right eversion — but a DIFFERENT attempt.
+    DifferentAttempt,
+}
+
+/// May `done`, reported by `reporter`, be applied to the marker `params`
+/// (whose attempt identity is `live_nonce`)?
+///
+/// The three checks are not redundant. Reporter identity alone is satisfied by
+/// a reissued attempt that picked the same coordinator; `new_eversion` alone is
+/// satisfied by ANY attempt on this extent, because it is `live + 1` and an
+/// abandoned attempt never bumped the extent. Only the nonce distinguishes two
+/// attempts that agree on both.
+pub(crate) fn classify_ec_done(
+    params: &MgrEcDispatchInflight,
+    live_nonce: u64,
+    reporter: u64,
+    done: &autumn_rpc::extent_rpc::EcConvertDone,
+) -> Result<(), EcDoneRejection> {
+    if params_coordinator(params) != Some(reporter) {
+        return Err(EcDoneRejection::NotCoordinator);
+    }
+    if params.new_eversion != done.new_eversion {
+        return Err(EcDoneRejection::EversionMismatch);
+    }
+    if live_nonce != done.attempt_nonce {
+        return Err(EcDoneRejection::DifferentAttempt);
+    }
+    Ok(())
+}
+
 /// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
 /// `ex`, the `stream` whose `(K, M)` shape it converts to, and the authoritative
 /// ledger marker (`params`: target nodes / extra disks / post-EC eversion /
@@ -1326,43 +1366,29 @@ impl crate::AutumnManager {
                 // `new_eversion` for a cross-check, so a stale/forged report can't
                 // steer the layout.
                 for done in df.ec_done {
-                    let params = match self.extent_inflight_payload_ec(done.extent_id) {
-                        Some(p) if params_coordinator(&p) != Some(node.node_id) => {
-                            // REPORTER IDENTITY: only the marker's own coordinator
-                            // may complete it. `new_eversion` is `live + 1` and a
-                            // released-then-reissued attempt reuses the SAME value,
-                            // so the eversion cross-check alone cannot separate
-                            // attempts: a stale report from a PREVIOUS attempt's
-                            // coordinator would otherwise apply the CURRENT
-                            // attempt's layout while its targets hold no shards.
-                            tracing::warn!(
-                                extent_id = done.extent_id,
-                                reporter = node.node_id,
-                                coordinator = ?params_coordinator(&p),
-                                "ec_done from a node that is not this marker's \
-                                 coordinator — IGNORING (marker retained)"
-                            );
-                            continue;
-                        }
-                        Some(p) => p,
-                        None => {
-                            // No marker: an already-applied conversion re-reported
-                            // (df is at-most-once but re-dispatch can re-adopt), or
-                            // an abandoned one. Benign — nothing to apply.
-                            tracing::debug!(
-                                extent_id = done.extent_id,
-                                "ec_done for an extent with no inflight marker; ignoring"
-                            );
-                            continue;
-                        }
+                    let Some(params) = self.extent_inflight_payload_ec(done.extent_id) else {
+                        // No marker: an already-applied conversion re-reported
+                        // (df is at-most-once but re-dispatch can re-adopt), or
+                        // an abandoned one. Benign — nothing to apply.
+                        tracing::debug!(
+                            extent_id = done.extent_id,
+                            "ec_done for an extent with no inflight marker; ignoring"
+                        );
+                        continue;
                     };
-                    if params.new_eversion != done.new_eversion {
+                    let live_nonce = self.extent_inflight_nonce(done.extent_id);
+                    if let Err(why) = classify_ec_done(&params, live_nonce, node.node_id, &done) {
                         tracing::warn!(
                             extent_id = done.extent_id,
+                            reporter = node.node_id,
+                            coordinator = ?params_coordinator(&params),
                             marker_eversion = params.new_eversion,
                             reported_eversion = done.new_eversion,
-                            "ec_done eversion disagrees with the pinned marker — REFUSING to apply \
-                             (marker retained; re-dispatch will reconcile)"
+                            marker_nonce = live_nonce,
+                            reported_nonce = done.attempt_nonce,
+                            ?why,
+                            "REFUSING to apply this ec_done (marker retained; the live \
+                             attempt reports its own completion)"
                         );
                         continue;
                     }
@@ -1752,6 +1778,7 @@ impl crate::AutumnManager {
             target_addrs: ec_target_addrs,
             eversion: params.new_eversion,
             owner_epoch: params.owner_epoch,
+            attempt_nonce: self.extent_inflight_nonce(extent_id),
         });
 
         // 60 s ceiling so a paged-out / silently dead EN can't wedge the loop;
@@ -2008,6 +2035,97 @@ pub(crate) fn classify_df_echo(
         DfEchoAction::DriftWarn
     } else {
         DfEchoAction::Ok
+    }
+}
+
+#[cfg(test)]
+mod ec_done_attempt_tests {
+    use super::{classify_ec_done, EcDoneRejection};
+    use autumn_rpc::extent_rpc::EcConvertDone;
+    use autumn_rpc::manager_rpc::MgrEcDispatchInflight;
+
+    const COORD: u64 = 7;
+    const OTHER: u64 = 9;
+
+    fn marker(new_eversion: u64) -> MgrEcDispatchInflight {
+        MgrEcDispatchInflight {
+            extent_id: 1,
+            target_nodes: vec![COORD, OTHER, 11],
+            extra_disk_ids: vec![],
+            data_shards: 2,
+            new_eversion,
+            owner_epoch: 0,
+        }
+    }
+
+    fn done(new_eversion: u64, attempt_nonce: u64) -> EcConvertDone {
+        EcConvertDone {
+            extent_id: 1,
+            new_eversion,
+            attempt_nonce,
+        }
+    }
+
+    #[test]
+    fn the_live_attempts_own_report_applies() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, COORD, &done(5, 400)),
+            Ok(())
+        );
+    }
+
+    /// The hole the nonce exists to close, and the reason neither of the other
+    /// two checks can stand in for it: attempt A was abandoned and reissued as
+    /// B. B picked the SAME coordinator, and its `new_eversion` is identical
+    /// because it is `live + 1` and A never bumped the extent. A's late report
+    /// therefore passes the reporter check and the eversion check — and would
+    /// flip the layout onto B's targets, which have staged nothing.
+    #[test]
+    fn a_previous_attempts_late_report_is_refused() {
+        let reissued = marker(5);
+        let a_nonce = 400;
+        let b_nonce = 412;
+        assert_eq!(
+            classify_ec_done(&reissued, b_nonce, COORD, &done(5, a_nonce)),
+            Err(EcDoneRejection::DifferentAttempt),
+            "a report from the superseded attempt must not complete the live one"
+        );
+    }
+
+    #[test]
+    fn a_non_coordinator_is_refused_even_with_the_right_attempt() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, OTHER, &done(5, 400)),
+            Err(EcDoneRejection::NotCoordinator)
+        );
+    }
+
+    #[test]
+    fn a_disagreeing_eversion_is_refused() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, COORD, &done(6, 400)),
+            Err(EcDoneRejection::EversionMismatch)
+        );
+    }
+
+    /// A marker created before nonces existed carries 0, and so does the report
+    /// its coordinator sends. Such a pair still converges rather than wedging
+    /// forever — the check degrades to its pre-nonce strength, which is the
+    /// documented meaning of 0.
+    #[test]
+    fn a_pre_nonce_marker_and_report_still_apply() {
+        assert_eq!(classify_ec_done(&marker(5), 0, COORD, &done(5, 0)), Ok(()));
+    }
+
+    /// ...but a pre-nonce REPORT may not complete a marker that has an
+    /// identity: that is exactly the cross-attempt shape above, with the stale
+    /// attempt predating the upgrade.
+    #[test]
+    fn a_pre_nonce_report_cannot_complete_an_identified_attempt() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, COORD, &done(5, 0)),
+            Err(EcDoneRejection::DifferentAttempt)
+        );
     }
 }
 
