@@ -1431,6 +1431,24 @@ fn code_resp(code: u8, message: String) -> HandlerResult {
     Ok(rkyv_encode(&CodeResp { code, message }))
 }
 
+/// What a dispatched recovery should do about an extent this node ALREADY holds
+/// a copy of. Three states, not two: "cannot tell" must never be collapsed into
+/// "incomplete", because the action for incomplete is destructive.
+enum LocalCopyVerdict {
+    /// Verified complete against the manager's authoritative view — adopt it and
+    /// re-report done (the completion report was lost, not the data).
+    Complete,
+    /// The authoritative view was obtained and the local copy falls short of it.
+    /// Safe to discard: the manager only dispatches recovery to a node it does
+    /// NOT count as a member, so an incomplete copy there is referenced by no
+    /// VP, no SST, and no checkpoint.
+    Incomplete,
+    /// The manager was unreachable, or the extent's shape (EC'd / still open /
+    /// quarantined) makes the comparison meaningless. Refuse and retry later —
+    /// never destroy a copy whose completeness is unknown.
+    Unknown,
+}
+
 /// Build an `AppendResp` rejection frame: a guard rejected the append, so no
 /// bytes were written and `offset`/`end` are 0. Every append-protocol guard in
 /// `handle_append` (quarantine / eversion / seal / owner-epoch fence / commit)
@@ -6640,27 +6658,34 @@ impl ExtentNode {
         &self,
         task: &crate::extent_rpc::RecoveryTask,
         entry: &Rc<ExtentEntry>,
-    ) -> bool {
+    ) -> LocalCopyVerdict {
         let info = match self.extent_info_from_manager(task.extent_id).await {
             Ok(Some(info)) => info,
-            // Manager unreachable / extent unknown — keep the refusal; the
-            // orphan-reconcile sweep reaps a truly-deleted extent.
-            _ => return false,
+            // Manager unreachable / extent unknown — we cannot judge the local
+            // copy at all. NOT "incomplete": resetting on a failed lookup would
+            // destroy a complete replica whenever the manager blips.
+            _ => return LocalCopyVerdict::Unknown,
         };
         if info.ec_converted || !info.sealed {
-            return false;
+            // An EC'd or still-open extent is not a shape this comparison can
+            // judge (EC-shard adopt needs a `shard_size` comparison; an open
+            // extent has no authoritative length). Refuse, never reset.
+            return LocalCopyVerdict::Unknown;
         }
         if entry.corrupt_meta.load(Ordering::SeqCst) {
-            // META-FAILCLOSED quarantine: never report a quarantined copy
-            // as a healthy recovered replica.
-            return false;
+            // META-FAILCLOSED quarantine: never report a quarantined copy as a
+            // healthy recovered replica, and never silently overwrite it — the
+            // manager's repair path owns quarantined extents.
+            return LocalCopyVerdict::Unknown;
         }
         let local_ev = entry.eversion.load(Ordering::SeqCst);
         let local_len = entry.len.load(Ordering::SeqCst);
         let local_sealed = entry.sealed.load(Ordering::SeqCst)
             || entry.sealed_length.load(Ordering::SeqCst) > 0;
         if !(local_sealed && local_ev == info.eversion && local_len >= info.sealed_length) {
-            return false;
+            // We HAVE the authoritative view and the local copy falls short of
+            // it — provably incomplete.
+            return LocalCopyVerdict::Incomplete;
         }
         tracing::info!(
             extent_id = task.extent_id,
@@ -6674,7 +6699,7 @@ impl ExtentNode {
             task: task.clone(),
             ready_disk_id: entry.disk_id,
         });
-        true
+        LocalCopyVerdict::Complete
     }
 
     async fn handle_require_recovery(&self, payload: Bytes) -> HandlerResult {
@@ -6708,20 +6733,56 @@ impl ExtentNode {
             .get(&task.extent_id)
             .map(|v| Rc::clone(v.value()))
         {
-            // a local copy already exists. If it is a
-            // COMPLETED-but-unreported prior recovery (the df response
-            // carrying its RecoveryTaskDone was lost — see
-            // `try_adopt_completed_recovery`), adopt it: re-report done
-            // instead of refusing. Anything short of a verified-complete
-            // copy keeps the pre-existing refusal — recovery must never
-            // truncate-and-overwrite an existing local extent file.
-            if self.try_adopt_completed_recovery(&task, &entry).await {
-                return code_resp(CODE_OK, String::new());
+            // A local copy already exists. Recovery must be IDEMPOTENT here: the
+            // manager treats its marker as a standing instruction and re-sends
+            // it, so a permanent refusal is a permanent wedge.
+            match self.try_adopt_completed_recovery(&task, &entry).await {
+                // Completed-but-unreported prior recovery (the df response
+                // carrying its RecoveryTaskDone was lost): re-report done.
+                LocalCopyVerdict::Complete => return code_resp(CODE_OK, String::new()),
+                // Provably incomplete — the residue of an attempt that died
+                // mid-copy (`run_recovery_task` persists `.meta` LAST, so a
+                // crash leaves a partial `.dat` that reloads as an open extent).
+                // Refusing here poisons this (node, extent) pair forever: the
+                // orphan reconcile won't reap it either, because the extent
+                // itself is still very much alive. Drop the stub and rebuild.
+                //
+                // Safe because the manager only dispatches recovery to a node it
+                // does NOT count as a replica, so this copy is referenced by
+                // nothing; and the Complete arm above already took every copy
+                // that IS good. The rebuild re-creates the entry from scratch.
+                LocalCopyVerdict::Incomplete => {
+                    tracing::warn!(
+                        extent_id = task.extent_id,
+                        replace_id = task.replace_id,
+                        local_len = entry.len.load(Ordering::SeqCst),
+                        "require_recovery: discarding an incomplete local copy \
+                         (crashed prior attempt) and rebuilding"
+                    );
+                    self.extents.remove(&task.extent_id);
+                    self.fd_lru.forget(task.extent_id);
+                    if let Ok(disk) = self.disk_for(entry.disk_id) {
+                        if let Err(e) = disk.remove_extent_files(task.extent_id).await {
+                            // Not fatal: `run_recovery_task` truncates the
+                            // destination before refilling. Log and proceed.
+                            tracing::warn!(
+                                extent_id = task.extent_id,
+                                "require_recovery: could not unlink the incomplete copy: {e}"
+                            );
+                        }
+                    }
+                    // fall through to dispatch a fresh rebuild
+                }
+                // Cannot tell (manager unreachable / EC'd / open / quarantined).
+                // Keep refusing — destroying a copy of unknown completeness is
+                // strictly worse than making the manager retry.
+                LocalCopyVerdict::Unknown => {
+                    return code_resp(
+                        CODE_PRECONDITION,
+                        format!("extent {} already exists", task.extent_id),
+                    );
+                }
             }
-            return code_resp(
-                CODE_PRECONDITION,
-                format!("extent {} already exists", task.extent_id),
-            );
         }
 
         self.recovery_inflight.insert(task.extent_id, task.clone());
@@ -9791,5 +9852,119 @@ mod owner_burst_splitter_tests {
              pre-splitter the whole burst was rejected on the first slot"
         );
         assert_eq!(zombie_code, CODE_LOCKED_BY_OTHER, "zombie must be fenced");
+    }
+}
+
+#[cfg(test)]
+mod recovery_idempotence_tests {
+    //! A recovery that dies mid-copy leaves a PARTIAL `.dat` with no `.meta`
+    //! (`run_recovery_task` persists `.meta` last). On restart `load_extents`
+    //! reads `.dat` + absent `.meta` as a normal OPEN extent, so the extent id is
+    //! present in `self.extents` — and `handle_require_recovery` refuses every
+    //! future dispatch to that node with "already exists". Nothing reaps the
+    //! residue either: the orphan reconcile only removes extents the manager has
+    //! FORGOTTEN, and this extent is still very much alive. The (node, extent)
+    //! pair is poisoned until an operator deletes the file by hand.
+    //!
+    //! The marker side self-heals (the stale sweep releases it), which is what
+    //! makes this easy to miss — the cluster keeps trying, and keeps being told
+    //! "already exists" by the one node that holds a useless stub.
+    //!
+    //! These tests drive the REAL post-crash on-disk shape (partial `.dat`, no
+    //! `.meta`, discovered by `load_extents`), not a hand-built in-memory entry.
+    use super::*;
+
+    /// Lay down the residue a crashed mid-copy recovery leaves, then reload the
+    /// node from that directory the way a restart would.
+    async fn node_with_partial_extent(path: &std::path::Path, eid: u64) -> ExtentNode {
+        {
+            let node = ExtentNode::new(ExtentNodeConfig::new(path.to_path_buf(), 1))
+                .await
+                .expect("node1");
+            node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+                .await
+                .expect("alloc");
+            // Some bytes, but nothing that makes this a COMPLETE copy of the
+            // (sealed, larger) extent the manager knows about.
+            let entry = node.get_extent(eid).await.expect("entry");
+            let disk = node.disk_for(entry.disk_id).expect("disk");
+            let f = Rc::new(
+                OpenOptions::new()
+                    .write(true)
+                    .open(disk.extent_file_path(eid, "dat"))
+                    .await
+                    .expect("open dat"),
+            );
+            file_pwrite_chunked(f.clone(), 0, Bytes::from_static(b"half a copy"))
+                .await
+                .expect("write partial");
+            f.sync_data().await.expect("sync");
+            // The crash lands BEFORE the `.meta` persist — remove it so the
+            // reload sees exactly what a killed recovery leaves behind.
+            let _ = compio::fs::remove_file(disk.extent_file_path(eid, "meta")).await;
+        }
+        // Restart: `.dat` present, `.meta` absent ⇒ loaded as an open extent.
+        ExtentNode::new(
+            ExtentNodeConfig::new(path.to_path_buf(), 1)
+                // Unreachable on purpose: `try_adopt_completed_recovery` must
+                // fail to reach the manager, which is the case that must NOT be
+                // mistaken for "the copy is incomplete".
+                .with_manager_endpoint("127.0.0.1:1"),
+        )
+        .await
+        .expect("node2")
+    }
+
+    fn decode_code(resp: &Bytes) -> (u8, String) {
+        let r: CodeResp = rkyv_decode(resp).expect("decode CodeResp");
+        (r.code, r.message)
+    }
+
+    fn require_recovery_req(eid: u64) -> Bytes {
+        rkyv_encode(&RequireRecoveryReq {
+            task: crate::extent_rpc::RecoveryTask {
+                extent_id: eid,
+                replace_id: 7,
+                node_id: 1,
+                start_time: 0,
+            },
+        })
+    }
+
+    /// The CONSERVATIVE half of the triage, and the reason a dispatch cannot
+    /// simply reset whenever the adopt check says no: with the manager
+    /// UNREACHABLE we cannot tell a complete copy from an incomplete one, and
+    /// destroying a complete replica is far worse than making the manager retry.
+    /// "Unknown" must keep refusing.
+    ///
+    /// The other two verdicts need the manager's authoritative view, so they are
+    /// covered where a real one exists —
+    /// `manager/tests/system_extent_recovery.rs`:
+    /// `incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever`
+    /// (Incomplete) and `lost_recovery_completion_redispatch_adopts_local_copy`
+    /// (Complete).
+    #[compio::test]
+    async fn unknown_completeness_still_refuses_rather_than_resetting() {
+        const EID: u64 = 77_002;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = node_with_partial_extent(dir.path(), EID).await;
+        // Make the local copy look COMPLETE-ish locally (sealed with bytes), so
+        // the only thing standing between "adopt" and "reset" is the manager's
+        // authoritative view — which is unreachable here.
+        {
+            let entry = node.get_extent(EID).await.expect("entry");
+            entry.sealed.store(true, Ordering::SeqCst);
+            entry.sealed_length.store(11, Ordering::SeqCst);
+        }
+        let resp = node
+            .handle_require_recovery(require_recovery_req(EID))
+            .await
+            .expect("handler");
+        let (code, _msg) = decode_code(&resp);
+        assert_eq!(
+            code, CODE_PRECONDITION,
+            "with the manager unreachable the completeness of the local copy is UNKNOWN — \
+             it must be refused, never reset"
+        );
     }
 }

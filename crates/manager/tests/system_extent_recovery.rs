@@ -405,3 +405,163 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
         assert_eq!(data, b"data");
     });
 }
+
+/// Sibling of `lost_recovery_completion_redispatch_adopts_local_copy`, for the
+/// OTHER half of the triage: a local copy that is **provably incomplete**.
+///
+/// A recovery that dies mid-copy leaves a partial `.dat` (the `.meta` persist is
+/// LAST), which reloads as an ordinary open extent — so the extent id is present
+/// locally while holding nothing useful. The pre-fix handler refused every future
+/// dispatch to that node with "extent already exists", and nothing reaped the
+/// stub: the orphan reconcile only removes extents the MANAGER has forgotten, and
+/// this extent is still very much alive. That poisoned the (node, extent) pair
+/// permanently — recoverable only by an operator deleting the file.
+///
+/// Here the incomplete local copy is planted over the wire with `ALLOC_EXTENT`
+/// (an extent present locally, but empty and unsealed — the same shape a killed
+/// copy leaves), which keeps the test deterministic.
+#[test]
+fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
+    use autumn_rpc::extent_rpc as ext;
+    use autumn_stream::{ExtentNode, ExtentNodeConfig};
+
+    fn start_en_with_manager(
+        addr: std::net::SocketAddr,
+        dir: std::path::PathBuf,
+        disk_id: u64,
+        mgr_addr: std::net::SocketAddr,
+    ) {
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new().unwrap().block_on(async {
+                let cfg = ExtentNodeConfig::new(dir, disk_id)
+                    .with_manager_endpoint(mgr_addr.to_string());
+                let n = ExtentNode::new(cfg).await.expect("extent node");
+                let _ = n.serve(addr).await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n3_dir = tempfile::tempdir().expect("n3");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n3_addr = pick_addr();
+
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+    // n3 is the recovery target; it needs the manager endpoint so the triage can
+    // fetch the authoritative extent_info. Deliberately unregistered so only this
+    // test drains its `recovery_done`.
+    start_en_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
+        register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
+
+        let stream_id = create_stream(&mgr, 2).await;
+        let pool = Rc::new(ConnPool::new());
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "test-incomplete".to_string(),
+            1024 * 1024,
+            pool.clone(),
+        )
+        .await
+        .expect("connect sc");
+
+        let payload = b"incomplete-residue-test-payload";
+        let r = sc.append(stream_id, payload).await.expect("append");
+        let extent_id = r.extent_id;
+
+        let resp = mgr
+            .call(
+                MSG_STREAM_ALLOC_EXTENT,
+                rkyv_encode(&StreamAllocExtentReq {
+                    stream_id,
+                    owner_key: sc.owner_key().to_string(),
+                    owner_epoch: sc.owner_epoch(),
+                    seal_commit: Some(r.end),
+                    exclude_node_ids: vec![],
+                    seal_extent_id: 0,
+                }),
+            )
+            .await
+            .expect("seal");
+        let seal: StreamAllocExtentResp = rkyv_decode(&resp).expect("decode seal");
+        assert_eq!(seal.code, CODE_OK, "seal failed: {}", seal.message);
+
+        sc.invalidate_extent_cache(extent_id);
+        let ext_info = sc.get_extent_info(extent_id).await.expect("extent info");
+        let replace_id = ext_info.replicates[1];
+        assert!(ext_info.sealed_length > 0, "extent must be sealed with data");
+
+        let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
+
+        // Plant the residue: n3 now HOLDS this extent id, but empty + unsealed —
+        // exactly what a recovery killed mid-copy leaves behind.
+        let resp = en3
+            .call(
+                ext::MSG_ALLOC_EXTENT,
+                ext::rkyv_encode(&ext::AllocExtentReq { extent_id }),
+            )
+            .await
+            .expect("plant residue");
+        let code: ext::CodeResp = ext::rkyv_decode(&resp).expect("decode alloc");
+        assert_eq!(code.code, ext::CODE_OK, "planting residue failed: {}", code.message);
+
+        // Dispatch recovery. PRE-FIX this returns CODE_PRECONDITION
+        // "extent {id} already exists" — and would do so forever.
+        let task = ext::RecoveryTask {
+            extent_id,
+            replace_id,
+            node_id: 999,
+            start_time: 0,
+        };
+        let resp = en3
+            .call(
+                ext::MSG_REQUIRE_RECOVERY,
+                ext::rkyv_encode(&ext::RequireRecoveryReq { task: task.clone() }),
+            )
+            .await
+            .expect("require_recovery");
+        let code: ext::CodeResp = ext::rkyv_decode(&resp).expect("decode require_recovery");
+        assert_eq!(
+            code.code,
+            ext::CODE_OK,
+            "an INCOMPLETE local copy must be discarded and rebuilt, not refused \
+             forever (this is the permanent (node,extent) poisoning), got: {}",
+            code.message
+        );
+
+        // And the rebuild must actually complete — the discard is only correct if
+        // what follows is a real recovery.
+        let mut done: Vec<ext::RecoveryTaskDone> = Vec::new();
+        for _ in 0..50 {
+            compio::time::sleep(Duration::from_millis(200)).await;
+            let resp = en3
+                .call(
+                    ext::MSG_DF,
+                    ext::rkyv_encode(&ext::DfReq {
+                        tasks: vec![],
+                        disk_ids: vec![],
+                    }),
+                )
+                .await
+                .expect("df drain");
+            let df: ext::DfResp = ext::rkyv_decode(&resp).expect("decode df");
+            if !df.done_tasks.is_empty() {
+                done = df.done_tasks;
+                break;
+            }
+        }
+        assert_eq!(done.len(), 1, "the rebuild after discarding the stub must complete");
+        assert_eq!(done[0].task.extent_id, extent_id);
+        assert_eq!(done[0].task.replace_id, replace_id);
+    });
+}
