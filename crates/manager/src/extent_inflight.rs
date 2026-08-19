@@ -276,6 +276,20 @@ impl AutumnManager {
         }
     }
 
+    /// The PINNED recovery task for `extent_id`, if a Recovery marker is held.
+    /// The marker names its executor (`task.node_id`), so a re-dispatch goes back
+    /// to that node rather than re-running candidate selection — the assignment
+    /// is decided once, at acquire time.
+    pub(crate) fn extent_inflight_payload_recovery(
+        &self,
+        extent_id: u64,
+    ) -> Option<autumn_rpc::manager_rpc::MgrRecoveryTask> {
+        match self.inflight.borrow().get(&extent_id).and_then(|r| r.unpack()) {
+            Some((_, ExtentOpPayload::Recovery(t))) => Some(t),
+            _ => None,
+        }
+    }
+
     pub(crate) fn inflight_snapshot_ec_recovery(
         &self,
     ) -> (
@@ -438,14 +452,28 @@ impl AutumnManager {
     /// general (Delete) one. Override with `AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`,
     /// default 120s, clamped >= 30.
     ///
-    /// Rationale (found by decommission chaos, 2026-07-10): a fenced node's
-    /// healthy sealed replicas are relocated by `recovery_dispatch_loop`'s
+    /// REDUCED ROLE. The original rationale below assumed a held marker FROZE
+    /// re-dispatch, which made this timeout the only way back. That is no longer
+    /// true: a Recovery marker is now a standing instruction —
+    /// `dispatch_recovery_task` re-sends it to the node it pinned every tick, and
+    /// the EN answers an already-running task with an idempotent CODE_OK. So an
+    /// executor that restarted or silently gave up is picked up in one dispatch
+    /// tick, not in 120 s.
+    ///
+    /// What still needs this sweep is the case the re-send cannot fix: the pinned
+    /// target is GONE. The re-send is skipped for a non-Online node, so nothing
+    /// else currently releases that marker. Once release becomes event-driven
+    /// (node offline/fenced/removed → drop the markers it was executing), this
+    /// wall-clock path should be deleted outright — a timeout is a guess about
+    /// liveness, and the failure detector already knows the answer.
+    ///
+    /// Original rationale (found by decommission chaos, 2026-07-10): a fenced
+    /// node's healthy sealed replicas are relocated by `recovery_dispatch_loop`'s
     /// fenced-slot dispatch. That dispatch acquires a Recovery marker and sends
     /// REQUIRE_RECOVERY to a target EN; the EN's `run_recovery_task` gives up
     /// after 10 × 10s = 100s WITHOUT reporting failure back, so the manager's
-    /// marker outlives the dead EN task and — because `dispatch_recovery_task`
-    /// refuses-at-start on any held marker (`extent_inflight_op`) — re-dispatch
-    /// is frozen until this sweep releases it. At the old 600s the drain of a
+    /// marker outlived the dead EN task and re-dispatch was frozen until this
+    /// sweep released it. At the old 600s the drain of a
     /// live fenced node (hence `remove`) stalled ~10 min per stuck extent
     /// (chaos: node never reached 0 shards within the test window). 120s is just
     /// past the EN's own 100s give-up, so a Recovery marker older than this

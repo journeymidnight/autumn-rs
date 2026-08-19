@@ -43,6 +43,78 @@ pub(crate) fn _test_arm_ec_apply_fail_once() {
 }
 
 impl AutumnManager {
+    /// Re-send an already-pinned Recovery marker to the node it named.
+    ///
+    /// This is the "standing instruction" half of the marker model. It NEVER
+    /// re-runs candidate selection (the assignment was decided once, at acquire
+    /// time) and NEVER drains the marker: an unreachable executor is not
+    /// evidence that the task should be abandoned, only that this tick could not
+    /// reach it. Releasing a marker whose target is genuinely gone is an
+    /// event-driven decision (node offline/fenced/removed), not a timeout.
+    ///
+    /// Always `Ok`: a re-send is a keep-alive, not an attempt whose failure
+    /// should feed the (extent, slot) backoff.
+    async fn redispatch_pinned_recovery(&self, extent_id: u64) -> Result<(), AppError> {
+        let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
+            // Raced with a release — the next tick re-derives from scratch.
+            return Ok(());
+        };
+        // Don't spend a timeout on a node the manager already knows is not
+        // Online — a keep-alive to a corpse costs the whole dispatch tick, once
+        // per pinned marker. Releasing such a marker is event-driven (the node
+        // going offline/fenced/removed), not this path's job.
+        if !self
+            .node_states
+            .borrow()
+            .state_of(task.node_id)
+            .is_online()
+        {
+            return Ok(());
+        }
+        let addr = {
+            let s = self.store.inner.borrow();
+            match s.nodes.get(&task.node_id) {
+                Some(n) => {
+                    let base = Self::normalize_endpoint(&n.address);
+                    Self::shard_addr_for_extent(&base, &n.shard_ports, extent_id)
+                }
+                None => return Ok(()), // node gone from the map; offline handling owns it
+            }
+        };
+        let node_id = task.node_id;
+        let payload = rkyv_encode(&ExtRequireRecoveryReq { task });
+        match self
+            .conn_pool
+            .call_timeout(
+                &addr,
+                EXT_MSG_REQUIRE_RECOVERY,
+                payload,
+                // Short: this is a keep-alive to a node believed Online, not the
+                // initial dispatch. A slow answer just means we re-send next tick.
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(resp) => match rkyv_decode::<ExtCodeResp>(&resp) {
+                // CODE_OK covers both "started it" and "already running it".
+                Ok(r) if r.code == CODE_OK => {}
+                Ok(r) => tracing::debug!(
+                    extent_id,
+                    node_id,
+                    "recovery re-dispatch refused: {}",
+                    r.message
+                ),
+                Err(e) => tracing::debug!(extent_id, "recovery re-dispatch decode: {e}"),
+            },
+            Err(e) => tracing::debug!(
+                extent_id,
+                node_id,
+                "recovery re-dispatch unreachable: {e}"
+            ),
+        }
+        Ok(())
+    }
+
     pub(crate) async fn dispatch_recovery_task(
         &self,
         extent_id: u64,
@@ -55,7 +127,17 @@ impl AutumnManager {
         // read. The probe distinguishes "already-recovering (idempotent
         // OK)" from "different op in flight (caller retries)".
         match self.extent_inflight_op(extent_id) {
-            Some(crate::extent_inflight::ExtentOpKind::Recovery) => return Ok(()),
+            // A Recovery marker is a STANDING INSTRUCTION, not a "someone else
+            // has this, skip" flag: re-send it to the node it pinned. Skipping
+            // was what made a wall-clock TTL necessary — an executor that
+            // restarted (losing its in-memory in-flight set) or gave up silently
+            // left a marker nobody would ever act on again, so the only way back
+            // was to time the marker out. Re-sending covers those cases in one
+            // dispatch tick instead, and the EN answers an already-running task
+            // with CODE_OK (idempotent accept).
+            Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
+                return self.redispatch_pinned_recovery(extent_id).await;
+            }
             Some(_) => return Ok(()),
             None => {}
         }

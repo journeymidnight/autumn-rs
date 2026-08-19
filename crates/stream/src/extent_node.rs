@@ -6722,8 +6722,15 @@ impl ExtentNode {
         }
 
         if self.recovery_inflight.contains_key(&task.extent_id) {
+            // IDEMPOTENT ACCEPT, not a rejection. The manager treats its marker
+            // as a standing instruction and re-sends it every tick, so "I am
+            // already doing exactly this" is the request being satisfied — the
+            // same contract `handle_convert_to_ec` uses. Answering
+            // CODE_PRECONDITION here would make the manager's re-dispatch drain
+            // the marker of a HEALTHY in-flight recovery and go hunting for
+            // another candidate.
             return code_resp(
-                CODE_PRECONDITION,
+                CODE_OK,
                 format!("extent {} recovery already running", task.extent_id),
             );
         }
