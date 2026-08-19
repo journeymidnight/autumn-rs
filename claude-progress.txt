@@ -1,3 +1,51 @@
+Date: 2026-08-19 (c)
+TaskStatus: completed
+Task scope: EC CoW 第 2、3 步（用户："on disk layout 可以改，continue"）。§10 六步里的 2 和 3，都是
+  可单独上线、可回滚的 inert 步；第 4 步（两套方案同时在线的那一个 commit）未开工。
+  第 2 步 = 读请求【点名】要读哪个 payload 文件（575f352）。
+    动机：CoW 下 shard 是加在 .dat 旁边的新文件，两种形态同时存在，必须有人说哪个是权威的；
+    推断没有安全答案——把 .dat 喂给想读 shard 的请求 = 返回整值的头部，调用方还会拿去 RS 解码。
+    ReadBytesReq 加 (payload_location, shard_index)（32→40B，32B 老请求仍解成 InDat）；EN 服务被点名的
+    那个文件，否则答 CODE_PAYLOAD_NOT_HERE，绝不回落到另一个。位置存 sibling key extentLayout/<id>
+    （absent=InDat），不进 MgrExtentInfo：那是持久化的 extents/<id>，加字段会让老集群 replay 校验失败
+    →当不上 leader；absent=InDat 正好就是所有存量 extent 的真实形态（老方案把 shard 改名盖到 .dat）。
+    两个只有读代码才看得出、各自都能单独读错文件的点：
+      (a) EN 的读批处理只按 extent_id 聚合，一个 batch 解析【一个】fd 服务所有 slot ⇒ 点名不同文件的
+          两个请求会被同一个文件应答。聚合键必须扩成文件身份（两处 grouping 都改）。
+      (b) InDat 必须【不论 slot 都是同一个身份】：复制读带着自己的 slot，若 slot 混进文件身份，
+          同一 extent 从不同 slot 的读会看起来是不同文件而丢失批处理。PayloadRef::for_extent 对 InDat
+          把 index 归零。
+    EC shard recovery 现在【按名字】问每个 peer 要它自己的 shard——原来是问"这个 extent"，靠该 peer 的
+    .dat 恰好就是它的 shard（只有老方案改名才成立）。read_plan 的 None 改成具名 ReadRefusal（两种拒绝
+    对应两个码，各自自愈方式不同）。SDK direct 路径不用改：extent_read_descriptor 本来就拒 ec_converted，
+    而 InShardFile 只由 flip 发布，flip 必设 ec_converted——现在把这条不变量显式检查而不是默默依赖。
+  第 3 步 = EN 作为 shard holder 的生命周期（daea6a4）。
+    EN 的 extent 生命周期整个钉在 .dat 上：没人扫的文件会躲过所有清理、然后在下次重启时从系统里消失；
+    而"只有 shard 的 extent"在 manager 眼里像不存在——这正是重建副本变成 blocking orphan 的路径。
+    所以先让 discovery/删除/计账认识这个形态，再让任何东西去写它。
+    entry 记录真实持有：has_dat + shard_files(index→length)。同时两个 index 是合法瞬态（两次 attempt，
+    或重新分配后同时占 parity 槽和 data 槽）；权威由 extent 发布的 layout 定，不由这张表定。长度放表里
+    而不是另设计数器，避免"有哪些文件"和"占多少字节"漂移。
+    shard-only entry 不带 fd 且【绝不能创建 .dat】（extent_file 开文件不带 create 就是为这个）；它的 len
+    是 shard 长度，不是 extent 的 sealed_length；真 payload 文件旁边没有可解析的 .meta = META-FAILCLOSED
+    →quarantine，不允许 fail-open 到 owner_epoch 0。df 的 extent_bytes 要加 shard_bytes（转换中的节点
+    两者都持有，只算一个会低报 cluster-df 和 --min-alloc-free-bytes 门限读的那个数）。shard fd 不进 FdLru
+    （那个 cache 按"每 extent 一个 fd"计账）。reconcile 不用改就能看见 shard-only extent（它上报
+    self.extents，discovery 已把它们放进去）；还表达不了"留着 extent、删掉 .dat"——那是第 5 步。
+  门：rpc 60、stream 115 lib + payload_location 7 个新测（手工摆放文件，producer 之前就可测）+
+    ec_2pc/restart/delete/delete-race/multi-disk/cluster-df 全绿；manager 277 lib +
+    ec_failover/ec_integration/system_extent_recovery/silent_corruption_rot；clippy 警告数前后不变
+    （stream 20、manager 49）；每个新行为都做了非空验证（禁用该行为后精确地只有对应测试失败）。
+    live ec_smoke.sh 两步各跑一次都 PASS。
+    线材 v29 就地刷新两次（仍未部署）→ 最终 92b10b22701423fa。坑复记：指纹哈希整个 schema 文件，
+    【给 extent_rpc.rs 加测试也会变指纹】——所有 schema 改动做完再刷新一次，别中途刷。
+Next steps: 第 4 步（唯一不可回滚的那个 commit，两套方案同时在线）：staging 改写 .shard{i}（§5 列的守卫
+  一个都不能丢：per-extent op lock、post-lock owner_epoch 复读、stripe-0 truncate、corrupt_meta 拒绝、
+  mark_disk_error 接线）、不再发 commit phase、apply_ec_conversion_done 写 InShardFile + value-CAS(§4.5)、
+  EC 打开"coordinator 离线即释放 marker"。然后第 5 步 file-granular reconcile + cleanup driver（在它落地前
+  空间窗口无界，policy 驱动的 EC 要保持关闭），第 6 步 soak 后删 commit phase / ec.commit / ec.prepared。
+  另：§9 handle_re_avali truncate-in-place 审计仍未做。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-19 (b)
 TaskStatus: completed
 Task scope: EC CoW 改造第 1 步——per-attempt nonce（用户："其他的呢？"= 接着做 recovery 之外的部分）。
