@@ -1,3 +1,34 @@
+Date: 2026-08-19 (b)
+TaskStatus: completed
+Task scope: EC CoW 改造第 1 步——per-attempt nonce（用户："其他的呢？"= 接着做 recovery 之外的部分）。
+  docs/ec_cow_conversion_design.md §10 六步里的第 1 步，它"独立修掉今天的暴露面"，且后面每步都继承它。
+  真洞：ec_done 今天只验两件事——上报者是 marker 的 coordinator + new_eversion 对得上。两者都分不开
+  "两次 attempt"：被放弃的 attempt 从没 bump 过 extent，所以重发的 attempt 拿到同一个 new_eversion，
+  而重发很可能挑中同一个 coordinator。于是上一轮的迟到 report 两关全过 → 把 layout 翻到这一轮那批
+  "什么都没 stage" 的目标上 → 随后的 cleanup 删掉最后的完整副本 = 不可恢复丢数据。
+  实现（63c258e）：nonce = 创建 marker 那个 etcd txn 的 revision（txn_fenced_revision 从 txn 自身响应取，
+  不能事后 GET——并发同键写会让两次创建拿到同一个身份），promotion 时从 key 的 mod_revision 重建。
+  故意【不】加进 MgrEcDispatchInflight：它以 Option 嵌在持久化的 MgrExtentInflightRecord 里，加字段会移动
+  archived 布局 → 所有活 marker（含 recovery/delete）replay 校验失败 → 升级即当不上 leader。etcd 本来就存
+  mod_revision，所以连 sibling key 都不用（设计文档原本的备选）。
+  revision 还自带【单调】，换来随机 nonce 给不了的守卫：participant 拒收 nonce 低于当前正在 stage 的那轮的
+  stripe。owner_epoch fence 盖不住这个——它只在 ex-coord 被 FENCE 时才抬升，而"仅仅被释放"的 coord（离线/
+  重新派生的常规路径）epoch 不变，会把 stripe 混进后继者的 staging 文件。该守卫是内存态（仲裁两个活写者），
+  重启后回落到 stripe-0 truncate + epoch fence。
+  线材 v29 就地刷新（仍未部署）fp a6979f12→d0b7673fa49fa121：ConvertToEcReq/ExtConvertToEcReq/EcConvertDone
+  加 attempt_nonce，WriteShardReq 二进制头 44→52。0 = 无身份（旧 marker/旧 peer）：0 只能配 0，升级能收敛，
+  但 0 的 report 永远完成不了有身份的 attempt。
+  顺带可读性：apply 侧三个检查收进纯函数 classify_ec_done（三者互不冗余，各自都不足）；coordinator 的
+  prepare-skip 现在按 attempt 判定（原注释早就说它需要这个，只是当时只有 new_eversion 可用）。
+  门：stream 115 lib + ec_2pc 6（新增 superseded-stripe 拒收）、manager 274 lib（新增 6 个 classify_ec_done
+  + 1 个"重发 attempt 拿到新 nonce"）、ec_failover/ec_integration/update_stream_ec/apply_done_atomicity/
+  system_extent_recovery/offline_reconcile/node_lifecycle 全绿；clippy 警告数前后都是 49（未新增）。
+  两个新测都做了非空验证（把守卫改成 if false 后精确地只有对应测试失败）。
+  live e2e ec_smoke.sh（3EN RF1 + log-ec 2+1）PASS：force-ec-convert --wait → op succeeded、marker 已 drain。
+Next steps: §10 还剩 2~6 步未做（2 持久化+wire inert / 3 EN shard-holder inert / 4 scheme switch 单 commit /
+  5 file-granular reconcile + cleanup driver / 6 soak 后删 commit phase），以及 §9 的 handle_re_avali
+  truncate-in-place 审计。第 4 步是唯一两套方案同时在线的 commit，前面三步都是可单独上线、可回滚的。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-19
 TaskStatus: completed
 Task scope: recovery 侧按 marker 模型逐步落地（用户："/loop 先从 recovery 开始，逐步实现"）。
