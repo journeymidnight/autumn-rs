@@ -122,7 +122,8 @@ async fn bulk_read_rejects_short_range_instead_of_short_ok() {
     // Over-range bulk read (want 20, extent holds 10) → REJECTED, not OK+short.
     let (code, payload) = conn.read_bytes_bulk(eid, 1, 0, 20).await;
     assert_eq!(
-        code, CODE_PRECONDITION,
+        code,
+        CODE_PRECONDITION,
         "over-range bulk read must be rejected — CODE_OK+short payload would let \
          a truncated value reach a client (payload len {})",
         payload.len()
@@ -130,5 +131,8 @@ async fn bulk_read_rejects_short_range_instead_of_short_ok() {
 
     // Offset past the end entirely → same rejection.
     let (code, _p) = conn.read_bytes_bulk(eid, 1, 15, 4).await;
-    assert_eq!(code, CODE_PRECONDITION, "past-end bulk read must be rejected");
+    assert_eq!(
+        code, CODE_PRECONDITION,
+        "past-end bulk read must be rejected"
+    );
 }

@@ -92,6 +92,37 @@ concurrent reader releases its clone, so the fd can't dangle. `ec_conversion_
 locks` remains only as higher-level serialisation against concurrent EC
 dispatches on the staging path (not for memory safety).
 
+### Shard files (`extent-{id}.shard{i}`) — the EN as a shard holder
+
+An EC shard can live in its own ADDITIVE file beside `.dat`, so a conversion
+never modifies or replaces the replica it is derived from. The index is in the
+NAME, so a shard staged for one index can never be *served* as another.
+
+- **On-disk shapes.** `.dat` only (a full replica); `.dat` + `.shard{i}`
+  (converted, cleanup pending); `.shard{i}` only (cleanup done); shard-in-`.dat`
+  (the pre-CoW scheme, which renamed over `.dat` — `payload_location = InDat`).
+- **`ExtentEntry` tracks what exists**: `has_dat` plus `shard_files: index ->
+  length`. Two indices at once is a LEGAL transient (two attempts, or a parity
+  slot plus a data slot after a reassignment) — the extent's PUBLISHED layout,
+  not this map, decides which is authoritative. Lengths live in the map so
+  "which files exist" and "what they cost" cannot drift.
+- **Startup discovery** (`discover_shard_files`, second pass of `load_extents`)
+  attaches shard files to their extent, and builds an entry from `.meta` alone
+  for a shard-only holder. **A file nothing scans survives every cleanup and
+  then vanishes from the system at the next restart** — and a shard-only extent
+  that looks absent to the manager is how a rebuilt copy becomes a blocking
+  orphan. A shard-only entry carries NO fd and must never create `.dat`
+  (`extent_file` opens without `create` for exactly this reason); its `len` is
+  the shard's length, which is NOT the extent's `sealed_length`. No parseable
+  `.meta` beside a real payload file is META-FAILCLOSED → quarantine.
+- **`remove_extent_files` unlinks every `.shard{i}` found on disk**, and
+  **`df`'s `extent_bytes` adds `shard_bytes()` to `len`** — a node mid-conversion
+  legitimately holds both, and counting one under-reports the footprint that
+  cluster-df and the `--min-alloc-free-bytes` gate read.
+- Reads resolve their file through `payload_file(entry, PayloadRef)`: `.dat` via
+  the fd cache, a shard opened per use (read-only after staging, and keeping it
+  out of `FdLru` preserves that cache's one-fd-per-extent accounting).
+
 ### Bounded fd cache for SEALED extents (`FdLru`)
 
 Open/active extents keep their fd PINNED (`file = Some`). SEALED idle extents

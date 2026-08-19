@@ -430,7 +430,16 @@ shapes.
 3. **EN shard-holder model, inert** (§4.4): load/scan/delete/reconcile/df
    awareness of `.shard{i}`, the two-file entry, read-by-request-location with
    error-on-absent. Unit-testable with hand-planted files before any producer
-   exists.
+   exists. **SHIPPED.**
+
+   The reconcile needed no change to SEE shard-only extents: it reports whatever
+   is in `self.extents`, and startup discovery now puts them there. What it
+   still cannot express is "keep the extent, drop the `.dat`" — that is step 5.
+
+   `shard_files` holds `index -> length` rather than a set plus a byte counter,
+   so the footprint cannot drift from the file list. Shard fds are deliberately
+   NOT in `FdLru`: the cache accounts one fd per extent, and a second cached fd
+   per entry would silently over-commit the process budget.
 4. **The scheme switch, one commit**: staging goes to `.shard{i}` (retaining every
    guard in §5), the commit phase stops being sent, `apply_ec_conversion_done`
    writes `InShardFile` (+ value-CAS, §4.5), and marker release on

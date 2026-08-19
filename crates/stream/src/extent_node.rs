@@ -259,7 +259,10 @@ enum EcCommitMarker {
     Absent,
     /// A well-formed marker for an interrupted commit at `(new_eversion,
     /// sealed_length)` — the durable source of truth for the published `.dat`.
-    Valid { new_eversion: u64, sealed_length: u64 },
+    Valid {
+        new_eversion: u64,
+        sealed_length: u64,
+    },
     /// Present but unreadable / wrong size → commit state undeterminable →
     /// fail-closed (quarantine).
     Corrupt,
@@ -353,7 +356,8 @@ impl DiskFS {
     }
 
     fn set_faulted(&self) {
-        self.health.store(DiskHealth::Faulted as u8, Ordering::Relaxed);
+        self.health
+            .store(DiskHealth::Faulted as u8, Ordering::Relaxed);
     }
 
     /// Capacity-full: only upgrades Online → Full. NEVER downgrades a
@@ -410,6 +414,14 @@ impl DiskFS {
         self.extent_file_path(extent_id, "ec.dat")
     }
 
+    /// `extent-{id}.shard{i}` — this node's EC shard as an ADDITIVE file, so a
+    /// conversion never has to modify or replace the `.dat` it is derived from.
+    /// The index is in the NAME: a shard staged for one index can then never be
+    /// served as another, whatever the caller believes.
+    fn shard_path(&self, extent_id: u64, shard_index: u32) -> PathBuf {
+        self.extent_file_path(extent_id, &format!("shard{shard_index}"))
+    }
+
     /// #5 EC-COMMIT-ATOMIC: the commit-intent marker. Written durably BEFORE
     /// `commit_shard_local` renames `.ec.dat`→`.dat`, deleted after `save_meta`.
     /// Its presence on restart means the EC commit was interrupted between the
@@ -449,13 +461,20 @@ impl DiskFS {
     /// (second leg) handles the case where the extent's
     /// `extent-{id}.dat` is already gone but `.ec.dat` survived.
     async fn remove_extent_files(&self, extent_id: u64) -> Result<()> {
-        for path in [
+        // Shard files are named per index, so the set to unlink is whatever is
+        // actually on disk — a deleted extent that left a shard behind would be
+        // invisible to every accounting path and reappear at the next restart.
+        let mut paths = vec![
             self.extent_path(extent_id),
             self.meta_path(extent_id),
             self.ec_staging_path(extent_id),
             self.ec_commit_marker_path(extent_id),
             self.ec_prepared_marker_path(extent_id),
-        ] {
+        ];
+        for idx in self.shard_indices_for(extent_id).await {
+            paths.push(self.shard_path(extent_id, idx));
+        }
+        for path in paths {
             match compio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -539,6 +558,65 @@ impl DiskFS {
         } else {
             None
         }
+    }
+
+    /// Parse `extent-{id}.shard{i}` into `(extent_id, shard_index)`. Any other
+    /// shape — including `.dat`, `.ec.dat`, and the markers — is None.
+    fn parse_shard_file(name: &str) -> Option<(u64, u32)> {
+        let rest = name.strip_prefix("extent-")?;
+        let (id_str, idx_str) = rest.split_once(".shard")?;
+        Some((id_str.parse().ok()?, idx_str.parse().ok()?))
+    }
+
+    /// Scan all 256 hash subdirs for `extent-{id}.shard{i}` files.
+    ///
+    /// A shard file that nothing scans is a file that survives every cleanup
+    /// and then vanishes from the system at the next restart — so discovery is
+    /// part of the on-disk design, not an optimisation.
+    async fn scan_shard_files<F>(&self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(u64, u32),
+    {
+        for byte in 0u8..=255 {
+            let subdir = self.base_dir.join(format!("{byte:02x}"));
+            let dir = match std::fs::read_dir(&subdir) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for entry in dir {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some((id, idx)) = Self::parse_shard_file(&name) {
+                    callback(id, idx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every shard file this disk holds for `extent_id`. Used by delete (which
+    /// must not leave shards behind) and by the footprint accounting.
+    async fn shard_indices_for(&self, extent_id: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        let dir = self.extent_file_path(extent_id, "dat");
+        let Some(parent) = dir.parent().map(|p| p.to_path_buf()) else {
+            return out;
+        };
+        let Ok(rd) = std::fs::read_dir(&parent) else {
+            return out;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some((id, idx)) = Self::parse_shard_file(&name) {
+                if id == extent_id {
+                    out.push(idx);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// parse the extent_id out of an `extent-{id}.ec.dat`
@@ -765,7 +843,6 @@ impl Coalescer {
     }
 }
 
-
 /// (1C): supervise a RESTARTABLE extent-node background loop —
 /// catch_unwind, ERROR-log on panic/unexpected return, restart after 1 s. Use
 /// ONLY for re-derive-each-tick loops with no moved resource (the orphan
@@ -825,8 +902,26 @@ where
     .detach();
 }
 
-
 pub(crate) struct ExtentEntry {
+    /// Does `extent-{id}.dat` exist on disk?
+    ///
+    /// It is not implied by the entry existing any more: under the CoW
+    /// conversion a node can hold ONLY `extent-{id}.shard{i}`, with its `.dat`
+    /// already reclaimed. `holds_payload` reads this, so a read naming `.dat`
+    /// on a shard-only holder is refused instead of resurrecting an empty file.
+    has_dat: AtomicBool,
+    /// The shard indices this node holds files for.
+    ///
+    /// The shard files this node holds, `index -> byte length`.
+    ///
+    /// Two at once is a LEGAL transient — a node can be a target of two
+    /// attempts, or hold a parity slot and a data slot after a reassignment —
+    /// so this is a map, and the extent's published layout (not this map)
+    /// decides which one is authoritative. Lengths live here rather than in a
+    /// separate counter so "which files exist" and "how many bytes they cost"
+    /// cannot drift apart; `len` is the `.dat` length and says nothing about
+    /// them.
+    shard_files: RefCell<std::collections::BTreeMap<u32, u64>>,
     /// structural close of the type-level UB at the file-replacement
     /// path. This was previously `UnsafeCell<CompioFile>` and the replace
     /// path (`*entry.file.get() = new_file`) could dangle a concurrent
@@ -926,15 +1021,22 @@ impl ExtentEntry {
     /// a file this node does not have is told so, and refreshes its layout.
     fn holds_payload(&self, p: PayloadRef) -> bool {
         match p.location {
-            // An entry exists because its `.dat` does — `load_extents` builds
-            // entries from `.dat` scans, and every producer of a payload file
-            // writes `.dat`.
-            PayloadLocation::InDat => true,
-            // Nothing writes shard files yet: the conversion scheme that
-            // produces them stages to `.ec.dat` and renames over `.dat`, which
-            // is `InDat`. Until a producer exists, naming one is always wrong.
-            PayloadLocation::InShardFile => false,
+            PayloadLocation::InDat => self.has_dat.load(Ordering::SeqCst),
+            PayloadLocation::InShardFile => self.shard_files.borrow().contains_key(&p.shard_index),
         }
+    }
+
+    /// Record that `extent-{id}.shard{i}` exists here with `len` bytes.
+    fn note_shard_file(&self, shard_index: u32, len: u64) {
+        self.shard_files.borrow_mut().insert(shard_index, len);
+    }
+
+    /// Bytes this extent's shard files occupy on this node. `.dat` is `len` and
+    /// is counted separately — a node mid-conversion legitimately holds both,
+    /// and reporting only one would under-count the disk footprint that the
+    /// allocation gate and cluster-df both read.
+    fn shard_bytes(&self) -> u64 {
+        self.shard_files.borrow().values().sum()
     }
 
     /// replace the file handle. Safe by construction —
@@ -1099,7 +1201,11 @@ impl FdLru {
                     return;
                 }
                 // nth(skip): the `skip`-th least-recently-used still-tracked id.
-                self.by_seq.borrow().iter().nth(skip).map(|(&s, &id)| (s, id))
+                self.by_seq
+                    .borrow()
+                    .iter()
+                    .nth(skip)
+                    .map(|(&s, &id)| (s, id))
             };
             let Some((s, vid)) = victim else { return }; // scanned all → all in-use
             let evictable = self
@@ -1741,9 +1847,7 @@ impl ExtentNode {
             compio::runtime::spawn(async move {
                 use futures::StreamExt;
                 while let Some(job) = rx.next().await {
-                    let res = pool
-                        .send_vectored(&addr, MSG_APPEND_CHAIN, job.parts)
-                        .await;
+                    let res = pool.send_vectored(&addr, MSG_APPEND_CHAIN, job.parts).await;
                     let _ = job.rx_back.send(res);
                 }
             })
@@ -1973,32 +2077,34 @@ async fn process_frames_backpressured(
                         Err(_) => Err(ChainFail::Msg("chain forwarder gone".to_string())),
                         Ok(Err(e)) => Err(ChainFail::Msg(format!("chain forward submit: {e}"))),
                         Ok(Ok(rx)) => {
-                        // Bound the downstream wait — a wedged hop must not
-                        // pin this future forever (client times out anyway).
-                        match compio::time::timeout(CHAIN_FORWARD_TIMEOUT, rx).await {
-                            Err(_) => Err(ChainFail::Msg("chain forward timeout".to_string())),
-                            Ok(Err(_)) => Err(ChainFail::Msg("chain forward conn closed".to_string())),
-                            Ok(Ok(frame)) => {
-                                if frame.is_error() {
-                                    Err(ChainFail::Msg("chain downstream error".to_string()))
-                                } else {
-                                    match AppendResp::decode(frame.payload.clone()) {
-                                        Ok(r) if r.code == CODE_OK => Ok(()),
-                                        // coco P1: PRESERVE the downstream
-                                        // code (LockedByOther must reach the
-                                        // writer for self-eviction; NotFound
-                                        // drives alloc-new-extent) — surfaced
-                                        // below as a normal AppendResp with the
-                                        // downstream code, not a generic error.
-                                        Ok(r) => Err(ChainFail::Code(r.code)),
-                                        Err(e) => {
-                                            Err(ChainFail::Msg(format!("chain downstream decode: {e}")))
+                            // Bound the downstream wait — a wedged hop must not
+                            // pin this future forever (client times out anyway).
+                            match compio::time::timeout(CHAIN_FORWARD_TIMEOUT, rx).await {
+                                Err(_) => Err(ChainFail::Msg("chain forward timeout".to_string())),
+                                Ok(Err(_)) => {
+                                    Err(ChainFail::Msg("chain forward conn closed".to_string()))
+                                }
+                                Ok(Ok(frame)) => {
+                                    if frame.is_error() {
+                                        Err(ChainFail::Msg("chain downstream error".to_string()))
+                                    } else {
+                                        match AppendResp::decode(frame.payload.clone()) {
+                                            Ok(r) if r.code == CODE_OK => Ok(()),
+                                            // coco P1: PRESERVE the downstream
+                                            // code (LockedByOther must reach the
+                                            // writer for self-eviction; NotFound
+                                            // drives alloc-new-extent) — surfaced
+                                            // below as a normal AppendResp with the
+                                            // downstream code, not a generic error.
+                                            Ok(r) => Err(ChainFail::Code(r.code)),
+                                            Err(e) => Err(ChainFail::Msg(format!(
+                                                "chain downstream decode: {e}"
+                                            ))),
                                         }
                                     }
                                 }
                             }
                         }
-                    },
                     },
                 };
                 match fwd_ok {
@@ -2051,9 +2157,7 @@ async fn process_frames_backpressured(
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent
-                        && r.payload_ref() == anchor_payload =>
-                    {
+                    Ok(r) if r.extent_id == anchor_extent && r.payload_ref() == anchor_payload => {
                         slots.push(ReadSlot {
                             req: r,
                             req_id: frames[i].req_id,
@@ -2063,7 +2167,8 @@ async fn process_frames_backpressured(
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
-                        let bytes = err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
+                        let bytes =
+                            err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -2083,9 +2188,19 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
+            // Every slot in this batch names the SAME file (the grouping rule
+            // above), so one refusal answers all of them.
+            if !extent.holds_payload(anchor_payload) {
+                let bytes_list: Vec<Bytes> = slots
+                    .iter()
+                    .map(|s| read_refusal_resp(s.req_id, false, ReadRefusal::PayloadNotHere))
+                    .collect();
+                inflight.push(Box::pin(async move { bytes_list }));
+                continue;
+            }
             // resolve (re-open if evicted) the fd here, where we
             // have the node; pin it into the read future.
-            let file_rc = match node.extent_file(&extent).await {
+            let file_rc = match node.payload_file(&extent, anchor_payload).await {
                 Ok(f) => f,
                 Err(msg) => {
                     let p = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &msg);
@@ -2105,7 +2220,8 @@ async fn process_frames_backpressured(
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
                 Ok(r) => r,
                 Err(_) => {
-                    let bytes = bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
+                    let bytes =
+                        bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -2122,9 +2238,7 @@ async fn process_frames_backpressured(
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_BULK {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent
-                        && r.payload_ref() == anchor_payload =>
-                    {
+                    Ok(r) if r.extent_id == anchor_extent && r.payload_ref() == anchor_payload => {
                         slots.push(ReadSlot {
                             req: r,
                             req_id: frames[i].req_id,
@@ -2133,7 +2247,12 @@ async fn process_frames_backpressured(
                     }
                     Ok(_) => break,
                     Err(_) => {
-                        let bytes = bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
+                        let bytes = bulk_read_head(
+                            frames[i].req_id,
+                            CODE_ERROR,
+                            "malformed ReadBytesReq",
+                            0,
+                        );
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
@@ -2151,7 +2270,17 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
-            let file_rc = match node.extent_file(&extent).await {
+            // Same file-identity rule as the non-bulk path: one refusal covers
+            // the batch, because the batch is one file.
+            if !extent.holds_payload(anchor_payload) {
+                let bytes_list: Vec<Bytes> = slots
+                    .iter()
+                    .map(|s| read_refusal_resp(s.req_id, true, ReadRefusal::PayloadNotHere))
+                    .collect();
+                inflight.push(Box::pin(async move { bytes_list }));
+                continue;
+            }
+            let file_rc = match node.payload_file(&extent, anchor_payload).await {
                 Ok(f) => f,
                 Err(_msg) => {
                     let bytes_list: Vec<Bytes> = slots
@@ -2511,8 +2640,7 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
                     if !contiguous {
                         runs.push((Vec::new(), Vec::new()));
                     }
-                    prev_epoch_end =
-                        Some((req.owner_epoch, req.commit + req.payload.len() as u64));
+                    prev_epoch_end = Some((req.owner_epoch, req.commit + req.payload.len() as u64));
                     let run = runs.last_mut().expect("a run was just pushed");
                     run.0.push(AppendSlot { req, req_id });
                     run.1.push(resp);
@@ -2847,11 +2975,7 @@ async fn append_burst_frames(
             .into_iter()
             .enumerate()
             .map(|(k, req_id)| {
-                let end = if k + 1 < n {
-                    offsets[k + 1]
-                } else {
-                    total_end
-                };
+                let end = if k + 1 < n { offsets[k + 1] } else { total_end };
                 let offset = offsets[k];
                 // One allocation per response: the AppendResp payload
                 // (`[code:1][offset:8 LE][end:8 LE]`, 17 bytes) is written
@@ -2902,7 +3026,11 @@ fn build_read_future(
         // client fails over to a healthy replica.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
             for slot in slots {
-                out.push(read_refusal_resp(slot.req_id, bulk, ReadRefusal::EversionStale));
+                out.push(read_refusal_resp(
+                    slot.req_id,
+                    bulk,
+                    ReadRefusal::EversionStale,
+                ));
             }
             return out;
         }
@@ -3104,7 +3232,10 @@ impl ExtentNode {
                 extents: std::sync::atomic::AtomicU64::new(0),
                 disks: disk_slots,
             });
-            EN_SHARD_GAUGES.lock().unwrap().push(std::sync::Arc::downgrade(&g));
+            EN_SHARD_GAUGES
+                .lock()
+                .unwrap()
+                .push(std::sync::Arc::downgrade(&g));
             g
         };
 
@@ -3369,7 +3500,8 @@ impl ExtentNode {
             // refused for the same reason; this path used to bypass it because
             // the old list only ever named extents the manager had forgotten
             // (which can never be a recovery target).
-            if self.recovery_inflight.contains_key(eid) || self.ec_convert_inflight.contains_key(eid)
+            if self.recovery_inflight.contains_key(eid)
+                || self.ec_convert_inflight.contains_key(eid)
             {
                 tracing::debug!(
                     extent_id = eid,
@@ -3481,6 +3613,36 @@ impl ExtentNode {
     /// copy, recovery, meta-apply fsync). The write / append / coalescer /
     /// truncate durability path does NOT call this — it uses `file_rc()`
     /// synchronously (open extents are always resident).
+    /// Open the payload file a request NAMED. `.dat` goes through the fd cache
+    /// (`extent_file`); a shard file is opened per use — it is read-only after
+    /// staging, and keeping it out of the cache means the cache keeps its
+    /// one-fd-per-extent accounting rather than silently over-committing the
+    /// process fd budget.
+    async fn payload_file(
+        &self,
+        entry: &Rc<ExtentEntry>,
+        payload: PayloadRef,
+    ) -> Result<Rc<CompioFile>, String> {
+        match payload.location {
+            PayloadLocation::InDat => self.extent_file(entry).await,
+            PayloadLocation::InShardFile => {
+                let disk = self.disk_for(entry.disk_id)?;
+                let path = disk.shard_path(entry.extent_id, payload.shard_index);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(&path)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "open shard {} of extent {}: {e}",
+                            payload.shard_index, entry.extent_id
+                        )
+                    })?;
+                Ok(Rc::new(file))
+            }
+        }
+    }
+
     async fn extent_file(&self, entry: &Rc<ExtentEntry>) -> Result<Rc<CompioFile>, String> {
         let sealed = entry.sealed.load(Ordering::Relaxed);
         if let Some(f) = entry.resident_file() {
@@ -3877,6 +4039,8 @@ impl ExtentNode {
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
+                        has_dat: AtomicBool::new(true),
+                        shard_files: RefCell::new(Default::default()),
                         // at startup, do NOT keep SEALED extents'
                         // fds resident — that was the O(all-extents) open-fd
                         // storm. `file`/`len` were read above; drop the fd for
@@ -3972,9 +4136,9 @@ impl ExtentNode {
                                         // may be a shard with stale meta. FAIL-
                                         // CLOSED: quarantine; the marker stays for
                                         // a retry on the next restart.
-                                        Err((_, msg)) => quarantine(&format!(
-                                            "marker replay failed: {msg}"
-                                        )),
+                                        Err((_, msg)) => {
+                                            quarantine(&format!("marker replay failed: {msg}"))
+                                        }
                                     }
                                 }
                             }
@@ -3983,7 +4147,103 @@ impl ExtentNode {
                 }
             }
         }
+
+        self.discover_shard_files().await;
         Ok(())
+    }
+
+    /// Second startup pass: find every `extent-{id}.shard{i}` and attach it to
+    /// its extent.
+    ///
+    /// Two shapes exist. A node that still has its `.dat` (mid-conversion, or
+    /// awaiting cleanup) already has an entry from the `.dat` scan and just
+    /// records which shard files it also holds. A node whose `.dat` was already
+    /// reclaimed has NO entry from that scan — without this pass its shard
+    /// would be unreachable, unaccounted, and undeletable, and the extent would
+    /// look absent to the manager, which is how a rebuilt copy becomes a
+    /// blocking orphan.
+    ///
+    /// A shard-only entry deliberately carries NO fd: `.dat` does not exist and
+    /// must not be created (`extent_file` opens without `create` for exactly
+    /// this reason). Its `len` is the shard's length, which is NOT the extent's
+    /// `sealed_length` — the `.meta` keeps the extent-level truth.
+    async fn discover_shard_files(&self) {
+        for disk in self.disks.values() {
+            let mut found: Vec<(u64, u32)> = Vec::new();
+            if let Err(e) = disk.scan_shard_files(|id, idx| found.push((id, idx))).await {
+                tracing::warn!(
+                    disk_id = disk.disk_id,
+                    error = %e,
+                    "shard-file scan failed; shards on this disk stay unattached until the next restart"
+                );
+                continue;
+            }
+            for (extent_id, shard_index) in found {
+                if !self.owns_extent(extent_id) {
+                    continue;
+                }
+                let shard_len = compio::fs::metadata(&disk.shard_path(extent_id, shard_index))
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if let Some(entry) = self.extents.get(&extent_id) {
+                    entry.note_shard_file(shard_index, shard_len);
+                    continue;
+                }
+                // Shard-only holder: build the entry from `.meta` alone.
+                let meta = match compio::fs::read(disk.meta_path(extent_id)).await {
+                    Ok(buf) => Self::parse_meta(&buf, extent_id),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::error!(
+                            extent_id,
+                            error = %e,
+                            "META-FAILCLOSED: shard present but `.meta` unreadable — quarantining"
+                        );
+                        None
+                    }
+                };
+                // No parseable `.meta` beside a real payload file is the
+                // META-FAILCLOSED case: quarantine rather than fail open to
+                // eversion 1 / owner_epoch 0, which would let a stale writer
+                // through the fence.
+                let corrupt_meta = meta.is_none();
+                let meta = meta.unwrap_or(LocalExtentMeta {
+                    sealed_length: 0,
+                    eversion: 1,
+                    owner_epoch: 0,
+                    sealed: false,
+                    avali: 0,
+                });
+                let entry = Rc::new(ExtentEntry {
+                    has_dat: AtomicBool::new(false),
+                    shard_files: RefCell::new(Default::default()),
+                    file: RefCell::new(None),
+                    extent_id,
+                    len: AtomicU64::new(shard_len),
+                    eversion: AtomicU64::new(meta.eversion),
+                    sealed_length: AtomicU64::new(meta.sealed_length),
+                    sealed: AtomicBool::new(meta.sealed),
+                    avali: AtomicU32::new(meta.avali),
+                    owner_epoch: AtomicI64::new(meta.owner_epoch),
+                    durable_owner_epoch: AtomicI64::new(meta.owner_epoch),
+                    disk_id: disk.disk_id,
+                    coalescer: Coalescer::new(shard_len),
+                    owner: RefCell::new(OwnerMailbox::default()),
+                    corrupt_meta: AtomicBool::new(corrupt_meta),
+                });
+                entry.note_shard_file(shard_index, shard_len);
+                self.extents.insert(extent_id, entry);
+                tracing::info!(
+                    extent_id,
+                    shard_index,
+                    disk_id = disk.disk_id,
+                    shard_len,
+                    corrupt_meta,
+                    "loaded shard-only extent (no .dat on this node)"
+                );
+            }
+        }
     }
 
     /// Start the RPC server on a single-threaded compio runtime.
@@ -4444,9 +4704,7 @@ impl ExtentNode {
             let join = compio::runtime::spawn_blocking(move || -> std::io::Result<()> {
                 // SAFETY: fd is owned by `file`, kept alive by this scope.
                 #[cfg(target_os = "linux")]
-                let rc = unsafe {
-                    libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len_arg)
-                };
+                let rc = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len_arg) };
                 // Non-Linux: unreachable because `prealloc` is forced to 0
                 // above, but keep the branch compiling.
                 #[cfg(not(target_os = "linux"))]
@@ -4491,6 +4749,8 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
+                has_dat: AtomicBool::new(true),
+                shard_files: RefCell::new(Default::default()),
                 // freshly-allocated OPEN extent — pinned resident.
                 file: RefCell::new(Some(Rc::new(file))),
                 extent_id,
@@ -4714,10 +4974,7 @@ impl ExtentNode {
         // longer exists on disk. `pending_fsync` follows the same
         // shrink — the subsequent pwrite (if any) will store its own
         // larger end value via the regular coalescer path.
-        extent
-            .coalescer
-            .last_synced
-            .store(commit, Ordering::SeqCst);
+        extent.coalescer.last_synced.store(commit, Ordering::SeqCst);
         extent
             .coalescer
             .pending_fsync
@@ -4769,8 +5026,9 @@ impl ExtentNode {
         let mut offset: u64 = 0;
         while offset < total_len {
             let want = chunk.min(total_len - offset);
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
-                .await?;
+            let got =
+                Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
+                    .await?;
             if got.is_empty() {
                 break;
             }
@@ -5069,7 +5327,8 @@ impl ExtentNode {
         payload: PayloadRef,
     ) -> Result<u64, String> {
         if total == 0 {
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0, payload).await?;
+            let got =
+                Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0, payload).await?;
             let n = got.len() as u64;
             if !got.is_empty() {
                 file_pwrite(dest_file.clone(), 0, Bytes::from(got))
@@ -5082,8 +5341,9 @@ impl ExtentNode {
         let mut offset: u64 = 0;
         while offset < total {
             let want = chunk.min(total - offset);
-            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
-                .await?;
+            let got =
+                Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
+                    .await?;
             if got.is_empty() {
                 break;
             }
@@ -5492,17 +5752,15 @@ impl ExtentNode {
         // `sealed_length.max(shard_len)` from being polluted. (A tight
         // `<= ceil(sealed_length/K)` bound would need `data_shards` on the wire;
         // the loose bound is enough to stop the egregious sparse-file case.)
-        let stripe_end = shard_offset
-            .checked_add(stripe_len as u64)
-            .ok_or_else(|| {
-                (
-                    StatusCode::InvalidArgument,
-                    format!(
-                        "write_shard {extent_id}: shard_offset {shard_offset} + len {stripe_len} \
+        let stripe_end = shard_offset.checked_add(stripe_len as u64).ok_or_else(|| {
+            (
+                StatusCode::InvalidArgument,
+                format!(
+                    "write_shard {extent_id}: shard_offset {shard_offset} + len {stripe_len} \
                          overflows u64"
-                    ),
-                )
-            })?;
+                ),
+            )
+        })?;
         if stripe_end > sealed_length {
             return Err((
                 StatusCode::InvalidArgument,
@@ -6227,9 +6485,10 @@ impl ExtentNode {
         // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
-        // re-open on miss for an evicted sealed extent.
+        // re-open on miss for an evicted sealed extent; a shard file is opened
+        // by name. `read_plan` above already refused a file this node lacks.
         let rf = self
-            .extent_file(&extent)
+            .payload_file(&extent, req.payload_ref())
             .await
             .map_err(|e| (StatusCode::Internal, e))?;
         let data = file_pread_chunked(rf, read_offset, read_size as usize)
@@ -6626,6 +6885,8 @@ impl ExtentNode {
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
+                has_dat: AtomicBool::new(true),
+                shard_files: RefCell::new(Default::default()),
                 // freshly-created local extent (copy/recovery) —
                 // pinned resident; it's actively being written.
                 file: RefCell::new(Some(Rc::new(file))),
@@ -6679,8 +6940,10 @@ impl ExtentNode {
             std::collections::HashMap::new();
         for e in self.extents.iter() {
             let entry = e.value();
-            *extent_bytes_by_disk.entry(entry.disk_id).or_insert(0) +=
-                entry.len.load(std::sync::atomic::Ordering::Relaxed);
+            *extent_bytes_by_disk.entry(entry.disk_id).or_insert(0) += entry
+                .len
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(entry.shard_bytes());
         }
 
         let mut disk_status: Vec<(u64, DiskStatus)> = Vec::new();
@@ -6711,10 +6974,7 @@ impl ExtentNode {
                             total,
                             free,
                             online: disk.online(),
-                            extent_bytes: extent_bytes_by_disk
-                                .get(disk_id)
-                                .copied()
-                                .unwrap_or(0),
+                            extent_bytes: extent_bytes_by_disk.get(disk_id).copied().unwrap_or(0),
                         },
                     ));
                 }
@@ -6817,8 +7077,8 @@ impl ExtentNode {
         }
         let local_ev = entry.eversion.load(Ordering::SeqCst);
         let local_len = entry.len.load(Ordering::SeqCst);
-        let local_sealed = entry.sealed.load(Ordering::SeqCst)
-            || entry.sealed_length.load(Ordering::SeqCst) > 0;
+        let local_sealed =
+            entry.sealed.load(Ordering::SeqCst) || entry.sealed_length.load(Ordering::SeqCst) > 0;
         if !(local_sealed && local_ev == info.eversion && local_len >= info.sealed_length) {
             // We HAVE the authoritative view and the local copy falls short of
             // it — provably incomplete.
@@ -6855,7 +7115,10 @@ impl ExtentNode {
         let task = req.task;
 
         if self.manager_endpoint.is_none() {
-            return code_resp(CODE_PRECONDITION, "manager endpoint is not configured".to_string());
+            return code_resp(
+                CODE_PRECONDITION,
+                "manager endpoint is not configured".to_string(),
+            );
         }
 
         if self.recovery_inflight.contains_key(&task.extent_id) {
@@ -7002,7 +7265,10 @@ impl ExtentNode {
         if self.recovery_inflight.contains_key(&req.extent_id) {
             return code_resp(
                 CODE_PRECONDITION,
-                format!("extent {} recovery in flight; delete deferred", req.extent_id),
+                format!(
+                    "extent {} recovery in flight; delete deferred",
+                    req.extent_id
+                ),
             );
         }
 
@@ -7105,7 +7371,10 @@ impl ExtentNode {
         let extent = match self.get_extent(req.extent_id).await {
             Ok(v) => v,
             Err(_) => {
-                return code_resp(CODE_NOT_FOUND, format!("extent {} not found", req.extent_id));
+                return code_resp(
+                    CODE_NOT_FOUND,
+                    format!("extent {} not found", req.extent_id),
+                );
             }
         };
 
@@ -7133,7 +7402,10 @@ impl ExtentNode {
         {
             return code_resp(
                 CODE_ERROR,
-                format!("re_avali: seal not durable for extent {}: {e}", req.extent_id),
+                format!(
+                    "re_avali: seal not durable for extent {}: {e}",
+                    req.extent_id
+                ),
             );
         }
 
@@ -7221,7 +7493,10 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(req.extent_id, &e);
             return code_resp(
                 CODE_ERROR,
-                format!("re_avali: seal meta not durable for extent {}: {e}", req.extent_id),
+                format!(
+                    "re_avali: seal meta not durable for extent {}: {e}",
+                    req.extent_id
+                ),
             );
         }
 
@@ -7496,19 +7771,31 @@ impl ExtentNode {
         }
 
         // Atomic-replace: rename temp → .dat, fsync dir, reopen the handle.
-        compio::fs::rename(&tmp_path, &dat_path).await.map_err(|e| {
-            (
-                StatusCode::Internal,
-                format!("rename peercopy {extent_id}: {e}"),
-            )
-        })?;
+        compio::fs::rename(&tmp_path, &dat_path)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("rename peercopy {extent_id}: {e}"),
+                )
+            })?;
         if let Some(dir) = dat_path.parent() {
             compio::fs::File::open(dir)
                 .await
-                .map_err(|e| (StatusCode::Internal, format!("open dat dir {extent_id}: {e}")))?
+                .map_err(|e| {
+                    (
+                        StatusCode::Internal,
+                        format!("open dat dir {extent_id}: {e}"),
+                    )
+                })?
                 .sync_all()
                 .await
-                .map_err(|e| (StatusCode::Internal, format!("fsync dat dir {extent_id}: {e}")))?;
+                .map_err(|e| {
+                    (
+                        StatusCode::Internal,
+                        format!("fsync dat dir {extent_id}: {e}"),
+                    )
+                })?;
         }
         let new_file = OpenOptions::new()
             .read(true)
@@ -7599,13 +7886,20 @@ impl ExtentNode {
                             new_eversion,
                             attempt_nonce,
                         });
-                    tracing::info!(extent_id, new_eversion, "EC convert done; queued for df report");
+                    tracing::info!(
+                        extent_id,
+                        new_eversion,
+                        "EC convert done; queued for df report"
+                    );
                 }
                 Err((_, msg)) => {
                     // No report ⇒ the manager's marker stays ⇒ it re-dispatches
                     // on its next tick. Nothing to roll back here: the 2PC's own
                     // staging/commit markers own crash-safety.
-                    tracing::error!(extent_id, "EC convert failed (will be re-dispatched): {msg}");
+                    tracing::error!(
+                        extent_id,
+                        "EC convert failed (will be re-dispatched): {msg}"
+                    );
                 }
             }
             node.ec_convert_inflight.remove(&extent_id);
@@ -7905,15 +8199,14 @@ impl ExtentNode {
                             .min(stripe_len);
                         let mut buf = vec![0u8; stripe_len];
                         if avail > 0 {
-                            let read =
-                                file_pread_chunked(ecf.clone(), start as u64, avail)
-                                    .await
-                                    .map_err(|e| {
-                                        (
-                                            StatusCode::Internal,
-                                            format!("read extent {extent_id} @ {start}: {e}"),
-                                        )
-                                    })?;
+                            let read = file_pread_chunked(ecf.clone(), start as u64, avail)
+                                .await
+                                .map_err(|e| {
+                                (
+                                    StatusCode::Internal,
+                                    format!("read extent {extent_id} @ {start}: {e}"),
+                                )
+                            })?;
                             let n = read.len().min(stripe_len);
                             buf[..n].copy_from_slice(&read[..n]);
                         }
@@ -7925,13 +8218,15 @@ impl ExtentNode {
                     // doesn't re-clone the data stripes.
                     let pshards = parity_shards;
                     let (data_bufs, parity): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-                        compio::runtime::spawn_blocking(move || -> std::result::Result<_, String> {
-                            let refs: Vec<&[u8]> =
-                                data_bufs.iter().map(|v| v.as_slice()).collect();
-                            let parity = crate::erasure::ec_encode_stripe(&refs, pshards)
-                                .map_err(|e| e.to_string())?;
-                            Ok((data_bufs, parity))
-                        })
+                        compio::runtime::spawn_blocking(
+                            move || -> std::result::Result<_, String> {
+                                let refs: Vec<&[u8]> =
+                                    data_bufs.iter().map(|v| v.as_slice()).collect();
+                                let parity = crate::erasure::ec_encode_stripe(&refs, pshards)
+                                    .map_err(|e| e.to_string())?;
+                                Ok((data_bufs, parity))
+                            },
+                        )
                         .await
                         .map_err(|_| {
                             (
@@ -7940,7 +8235,10 @@ impl ExtentNode {
                             )
                         })?
                         .map_err(|e| {
-                            (StatusCode::Internal, format!("ec_encode_stripe failed: {e}"))
+                            (
+                                StatusCode::Internal,
+                                format!("ec_encode_stripe failed: {e}"),
+                            )
                         })?;
 
                     // Fan the stripe out: REMOTE shards (data 1..K, parity
@@ -7972,13 +8270,21 @@ impl ExtentNode {
                                 format!("parse addr {target_addr}: {e}"),
                             )
                         })?;
-                        let label =
-                            format!("WriteShard to {target_addr} shard {i} @ {shard_off}");
-                        ec_2pc_participant_rpc(sock, MSG_WRITE_SHARD, ws_req.encode(), &label, |b| {
-                            WriteShardResp::decode(b).map(|r| r.code).map_err(|e| {
-                                (StatusCode::Internal, format!("decode write_shard resp: {e}"))
-                            })
-                        })
+                        let label = format!("WriteShard to {target_addr} shard {i} @ {shard_off}");
+                        ec_2pc_participant_rpc(
+                            sock,
+                            MSG_WRITE_SHARD,
+                            ws_req.encode(),
+                            &label,
+                            |b| {
+                                WriteShardResp::decode(b).map(|r| r.code).map_err(|e| {
+                                    (
+                                        StatusCode::Internal,
+                                        format!("decode write_shard resp: {e}"),
+                                    )
+                                })
+                            },
+                        )
                         .await?;
                     }
 
@@ -8041,11 +8347,17 @@ impl ExtentNode {
                 )
             })?;
             let label = format!("CommitEcShard to {target_addr} shard {i}");
-            ec_2pc_participant_rpc(sock, MSG_COMMIT_EC_SHARD, commit_req.encode(), &label, |b| {
-                CommitEcShardResp::decode(b)
-                    .map(|r| r.code)
-                    .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))
-            })
+            ec_2pc_participant_rpc(
+                sock,
+                MSG_COMMIT_EC_SHARD,
+                commit_req.encode(),
+                &label,
+                |b| {
+                    CommitEcShardResp::decode(b)
+                        .map(|r| r.code)
+                        .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))
+                },
+            )
             .await?;
         }
 
@@ -8263,9 +8575,17 @@ mod enospc_disk_health_tests {
         assert_eq!(d.health(), DiskHealth::Faulted);
         assert!(!d.online() && !d.allocatable());
         d.set_full();
-        assert_eq!(d.health(), DiskHealth::Faulted, "set_full downgraded Faulted");
+        assert_eq!(
+            d.health(),
+            DiskHealth::Faulted,
+            "set_full downgraded Faulted"
+        );
         assert!(!d.try_clear_full());
-        assert_eq!(d.health(), DiskHealth::Faulted, "clear_full resurrected Faulted");
+        assert_eq!(
+            d.health(),
+            DiskHealth::Faulted,
+            "clear_full resurrected Faulted"
+        );
     }
 
     /// coco P1 (multi-shard): two DiskFS instances for the SAME dir share
@@ -8604,11 +8924,9 @@ mod sealed_append_guard_tests {
 
         // A length=0 (read-to-end) read must return 0 bytes.
         let rd = ReadBytesResp::decode(
-            node.handle_read_bytes(
-                ReadBytesReq::new(7100, 1, 0, 0, PayloadRef::in_dat()).encode(),
-            )
-            .await
-            .unwrap(),
+            node.handle_read_bytes(ReadBytesReq::new(7100, 1, 0, 0, PayloadRef::in_dat()).encode())
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -9404,7 +9722,6 @@ mod wire_fence_tests {
     }
 }
 
-
 #[cfg(test)]
 mod ec5_commit_window_tests {
     //! #5: the EC commit `rename(.ec.dat→.dat)` ↔ `save_meta` window. A crash
@@ -9455,7 +9772,11 @@ mod ec5_commit_window_tests {
         let entry = node.extents.get(&eid).expect("extent loaded");
         // PRE-FIX corruption: meta says the extent is `orig` long, but the file
         // is only the `shard` — a replicated read past `shard` short-reads.
-        assert_eq!(entry.sealed_length.load(SeqCst), orig as u64, "stale meta sealed_length");
+        assert_eq!(
+            entry.sealed_length.load(SeqCst),
+            orig as u64,
+            "stale meta sealed_length"
+        );
         assert_eq!(entry.len.load(SeqCst), shard as u64, ".dat is the shard");
         assert!(
             entry.len.load(SeqCst) < entry.sealed_length.load(SeqCst),
@@ -9490,7 +9811,11 @@ mod ec5_commit_window_tests {
         let node = ExtentNode::new(config.clone()).await.unwrap();
         let entry = node.extents.get(&eid).expect("extent loaded").clone();
         // eversion bumped to the marker's new_ev (was the stale 1).
-        assert_eq!(entry.eversion.load(SeqCst), new_ev, "eversion completed to marker's");
+        assert_eq!(
+            entry.eversion.load(SeqCst),
+            new_ev,
+            "eversion completed to marker's"
+        );
         // sealed_length kept = original, sealed flag set.
         assert_eq!(entry.sealed_length.load(SeqCst), orig as u64);
         assert!(entry.sealed.load(SeqCst), "EC-committed extent is sealed");
@@ -9597,11 +9922,20 @@ mod ec3_fence_handover_tests {
         // fence-handover push sent. Expectation: no-op (returns length), and
         // owner_epoch is UNCHANGED (no handover — that's why the push was dead).
         let resp = node
-            .handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch: 10 }.encode())
+            .handle_commit_length(
+                CommitLengthReq {
+                    extent_id: eid,
+                    owner_epoch: 10,
+                }
+                .encode(),
+            )
             .await
             .unwrap();
         let decoded = CommitLengthResp::decode(resp).unwrap();
-        assert_eq!(decoded.code, CODE_OK, "higher owner_epoch → no-op OK, not LOCKED");
+        assert_eq!(
+            decoded.code, CODE_OK,
+            "higher owner_epoch → no-op OK, not LOCKED"
+        );
         assert_eq!(
             entry.owner_epoch.load(SeqCst),
             5,
@@ -9610,7 +9944,13 @@ mod ec3_fence_handover_tests {
 
         // And a LOWER owner_epoch is still rejected (the check half is live).
         let resp = node
-            .handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch: 3 }.encode())
+            .handle_commit_length(
+                CommitLengthReq {
+                    extent_id: eid,
+                    owner_epoch: 3,
+                }
+                .encode(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -9789,7 +10129,10 @@ mod fd_lru_chaos_tests {
     fn payload(i: usize) -> Vec<u8> {
         let mut v = vec![0u8; 1500];
         for (j, b) in v.iter_mut().enumerate() {
-            *b = (i.wrapping_mul(2_654_435_761).wrapping_add(j.wrapping_mul(40_503)) & 0xff) as u8;
+            *b = (i
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(j.wrapping_mul(40_503))
+                & 0xff) as u8;
         }
         v
     }

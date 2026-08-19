@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::extent_rpc::{
-    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
-    FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, PAYLOAD_LOCATION_IN_DAT,
-    ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
-    encode_chain_prefix, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
-    MSG_APPEND, MSG_APPEND_CHAIN, MSG_FENCE_EXTENT,
-    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH,
+    encode_chain_prefix, AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo,
+    FenceExtentReq, FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp,
+    ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
+    CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
+    MSG_APPEND_CHAIN, MSG_COMMIT_LENGTH, MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES,
+    MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH, PAYLOAD_LOCATION_IN_DAT,
 };
 use crate::ConnPool;
 use anyhow::{anyhow, Result};
@@ -376,7 +376,11 @@ pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
 /// `replica_addrs_from_cache` resolves addresses in, so a read slot index maps
 /// back to its `node_id` (needed to consult the Suspected snapshot).
 pub(crate) fn replica_node_ids(ex: &ExtentInfo) -> Vec<u64> {
-    ex.replicates.iter().chain(ex.parity.iter()).copied().collect()
+    ex.replicates
+        .iter()
+        .chain(ex.parity.iter())
+        .copied()
+        .collect()
 }
 
 /// slot try-order for a REPLICATED read. Starts from the rotated
@@ -1080,7 +1084,11 @@ mod io_deadline_tests {
         // read's looser floor is more than offset by its smaller base, so a read
         // deadline is NOT simply "bigger because the floor is looser".
         let rd = cfg.read_deadline().for_len(8 << 20);
-        let wr = IoDeadline { base: cfg.append_fanout_timeout, floor_bytes_per_sec: cfg.append_floor_bytes_per_sec }.for_len(8 << 20);
+        let wr = IoDeadline {
+            base: cfg.append_fanout_timeout,
+            floor_bytes_per_sec: cfg.append_floor_bytes_per_sec,
+        }
+        .for_len(8 << 20);
         assert_eq!(rd, Duration::from_secs(5));
         assert_eq!(wr, Duration::from_secs(6));
     }
@@ -1092,7 +1100,9 @@ mod io_deadline_tests {
         assert!(is_liveness_timeout(&anyhow::anyhow!(
             "call_into_pooled timed out after 5s"
         )));
-        assert!(is_liveness_timeout(&anyhow::anyhow!("connect 1.2.3.4:9101 timed out after 5s")));
+        assert!(is_liveness_timeout(&anyhow::anyhow!(
+            "connect 1.2.3.4:9101 timed out after 5s"
+        )));
         assert!(!is_liveness_timeout(&anyhow::anyhow!(
             "direct read from 1.2.3.4:9101: code=locked"
         )));
@@ -1129,7 +1139,10 @@ mod io_deadline_tests {
         let sst = 256u64 * 1024 * 1024;
         let per_hop = d.for_len(sst);
         let chain = d.for_chain(sst, 3);
-        assert!(chain > per_hop, "chain budget must exceed the per-hop budget");
+        assert!(
+            chain > per_hop,
+            "chain budget must exceed the per-hop budget"
+        );
         assert!(chain <= IO_TIMEOUT_CAP);
     }
 
@@ -1144,7 +1157,8 @@ mod io_deadline_tests {
         // The 4 KiB WAL hot path must NOT regress: the scaled term for
         // 4 KiB at the default floor is ~0.5 ms.
         assert!(
-            d >= cfg.append_fanout_timeout && d < cfg.append_fanout_timeout + Duration::from_millis(100),
+            d >= cfg.append_fanout_timeout
+                && d < cfg.append_fanout_timeout + Duration::from_millis(100),
             "4 KiB deadline should stay ≈ base (5 s), got {d:?}"
         );
     }
@@ -1161,7 +1175,9 @@ mod io_deadline_tests {
             256 << 20,
         );
         let want = cfg.append_fanout_timeout
-            + Duration::from_secs_f64((256u64 << 20) as f64 / cfg.append_floor_bytes_per_sec as f64);
+            + Duration::from_secs_f64(
+                (256u64 << 20) as f64 / cfg.append_floor_bytes_per_sec as f64,
+            );
         assert!(
             d_sst >= want,
             "256 MiB SST deadline must be ≥ base + payload/floor ({want:?}), got {d_sst:?}"
@@ -1294,9 +1310,7 @@ enum StreamSubmitMsg {
     /// `commit` belongs to (its cached tail). The caller threads
     /// `tail_extent_id` into `alloc_new_extent` as `seal_extent_id` so a retried
     /// roll seals that exact extent (idempotent), never the freshly-rolled one.
-    SealCommit {
-        resp: oneshot::Sender<(u64, u64)>,
-    },
+    SealCommit { resp: oneshot::Sender<(u64, u64)> },
     /// Explicit shutdown.  Dropping the last Sender also exits the worker
     /// via channel close — this variant is kept for symmetry / tests.
     #[allow(dead_code)]
@@ -1456,11 +1470,7 @@ async fn apply_stream_submit_msg(
             );
             // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside the
             // commit so the caller can pin the seal to THIS extent.
-            let tail_eid = state
-                .tail
-                .as_ref()
-                .map(|t| t.extent.extent_id)
-                .unwrap_or(0);
+            let tail_eid = state.tail.as_ref().map(|t| t.extent.extent_id).unwrap_or(0);
             let _ = resp.send((state.commit, tail_eid));
             // Freeze the tail until ResetTail so no append lands past the
             // just-reported seal point (coco P1).
@@ -1814,14 +1824,15 @@ async fn launch_append(
         for seg in &payload_parts {
             parts.push(seg.clone());
         }
-        let rx_res = pool.send_vectored(&head_addr, MSG_APPEND_CHAIN, parts).await;
+        let rx_res = pool
+            .send_vectored(&head_addr, MSG_APPEND_CHAIN, parts)
+            .await;
         // Chained acks traverse every hop with store-and-forward latency —
         // budget generously (validated: deep 8M queues stack hop latencies).
         // BUG-FLUSH-TIMEOUT-LEAK: the per-hop budget is already size-scaled.
         //
         // coco P2: the cap is applied AFTER the hop multiplier (see `for_chain`).
-        let chain_timeout =
-            append_deadline.for_chain(size, tail.replica_addrs.len() as u32);
+        let chain_timeout = append_deadline.for_chain(size, tail.replica_addrs.len() as u32);
         let fut = async move {
             let res = match rx_res {
                 Err(e) => Err(anyhow!("{} chain submit error: {}", head_addr, e)),
@@ -2054,12 +2065,7 @@ impl StreamClient {
     /// forever. Observed (manager-HA chaos H2): with the old leader
     /// killed and a healthy standby leading, a PS opening a migrated
     /// partition hammered the dead address every 5 s for 20+ minutes.
-    async fn manager_call(
-        &self,
-        msg_type: u8,
-        req: Bytes,
-        timeout: Duration,
-    ) -> Result<Bytes> {
+    async fn manager_call(&self, msg_type: u8, req: Bytes, timeout: Duration) -> Result<Bytes> {
         match self
             .pool
             .call_timeout(self.manager_addr(), msg_type, req, timeout)
@@ -2136,8 +2142,7 @@ impl StreamClient {
                             //    rotating to a follower would just burn an
                             //    iteration on the NOT_LEADER it returns (coco P2,
                             //    the multi-manager HA regression).
-                            me.code == manager_rpc::CODE_NOT_LEADER
-                                || me.is_transient_conflict(),
+                            me.code == manager_rpc::CODE_NOT_LEADER || me.is_transient_conflict(),
                         ),
                         // Transport error (no ManagerError): rotate to try
                         // another manager.
@@ -5338,7 +5343,10 @@ mod pipeline_tests {
         state.rewind_or_poison(a_off, a_end - a_off); // A fails (hole)
         assert!(state.poisoned);
         let b = rx_b.try_recv().unwrap().expect("B must be resolved");
-        assert!(b.is_err(), "B acked Ok above a hole (would be seal-chopped)");
+        assert!(
+            b.is_err(),
+            "B acked Ok above a hole (would be seal-chopped)"
+        );
         assert_eq!(state.commit, 0, "commit must not cover the hole");
 
         // Order 2: A fails first, then B completes -> floor check fails B.
@@ -5627,7 +5635,10 @@ mod suspected_read_tests {
         let ex = ext(vec![10, 20, 30], vec![], false, 0);
         let s: HashSet<u64> = [20].into_iter().collect();
         let start = rotated_replica_start(ex.extent_id, 0, 3);
-        let mut expected: Vec<usize> = (0..3).map(|i| (start + i) % 3).filter(|&s| s != 1).collect();
+        let mut expected: Vec<usize> = (0..3)
+            .map(|i| (start + i) % 3)
+            .filter(|&s| s != 1)
+            .collect();
         expected.push(1); // suspected slot 1 appended at the back
         assert_eq!(replicated_read_order(&ex, 0, &s), expected);
     }
@@ -5674,7 +5685,10 @@ mod suspected_read_tests {
         let order = replicated_read_order(&ex, 0, &empty);
         let set: HashSet<usize> = order.iter().copied().collect();
         assert_eq!(set, [0, 2].into_iter().collect::<HashSet<usize>>());
-        assert!(!order.contains(&1), "avali-isolated slot must never be read");
+        assert!(
+            !order.contains(&1),
+            "avali-isolated slot must never be read"
+        );
     }
 
     #[test]
@@ -5685,10 +5699,7 @@ mod suspected_read_tests {
         let s: HashSet<u64> = [20].into_iter().collect();
         assert_eq!(healthy_eligible_slots(&ex, &s), vec![0, 2]);
         // Empty snapshot → exactly eligible_replica_slots (no behavior change).
-        assert_eq!(
-            healthy_eligible_slots(&ex, &HashSet::new()),
-            vec![0, 1, 2]
-        );
+        assert_eq!(healthy_eligible_slots(&ex, &HashSet::new()), vec![0, 1, 2]);
         // ALL eligible Suspected → fall back to all (never strand the read).
         let all: HashSet<u64> = [10, 20, 30].into_iter().collect();
         assert_eq!(healthy_eligible_slots(&ex, &all), vec![0, 1, 2]);
@@ -5738,7 +5749,7 @@ mod wire_compat_tests {
             owner_epoch: 7,
             seal_commit: None,
             exclude_node_ids: Vec::new(),
-                seal_extent_id: 0,
+            seal_extent_id: 0,
         };
         let bytes = rkyv_encode(&req);
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
@@ -5757,7 +5768,7 @@ mod wire_compat_tests {
             owner_epoch: 0,
             seal_commit: Some(1024),
             exclude_node_ids: vec![3, 5, 9101],
-                seal_extent_id: 0,
+            seal_extent_id: 0,
         };
         let bytes = rkyv_encode(&req);
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
@@ -6035,7 +6046,10 @@ mod merge_ec_replay_tests {
                 .call(&addr, MSG_WRITE_SHARD, ws.encode())
                 .await
                 .expect("write_shard RPC");
-            assert_eq!(WriteShardResp::decode(ws_resp).expect("decode").code, CODE_OK);
+            assert_eq!(
+                WriteShardResp::decode(ws_resp).expect("decode").code,
+                CODE_OK
+            );
 
             let cs = CommitEcShardReq {
                 extent_id,
@@ -6128,7 +6142,9 @@ mod manager_retry_tests {
     /// `acquire_owner_lock` and the closures under test never do real IO,
     /// so no manager is contacted (same pattern as merge_ec_replay_tests).
     fn test_client(n_mgrs: usize) -> Rc<StreamClient> {
-        let addrs = (0..n_mgrs).map(|i| format!("127.0.0.1:{}", i + 1)).collect();
+        let addrs = (0..n_mgrs)
+            .map(|i| format!("127.0.0.1:{}", i + 1))
+            .collect();
         StreamClient::construct(
             addrs,
             0,
@@ -6183,7 +6199,11 @@ mod manager_retry_tests {
             "punch_holes failed: precondition failed: stream cannot be empty after punch holes"
         );
 
-        let nf = ManagerError::new(manager_rpc::CODE_NOT_FOUND, "stream_info", "not found: stream 7");
+        let nf = ManagerError::new(
+            manager_rpc::CODE_NOT_FOUND,
+            "stream_info",
+            "not found: stream 7",
+        );
         assert!(!nf.is_owner_fence());
         assert!(!nf.to_string().contains("LockedByOther"));
     }
@@ -6249,7 +6269,10 @@ mod manager_retry_tests {
     async fn deterministic_codes_fail_fast() {
         for (code, msg) in [
             (manager_rpc::CODE_NOT_FOUND, "not found: stream 7"),
-            (manager_rpc::CODE_INVALID_ARGUMENT, "invalid argument: bad req"),
+            (
+                manager_rpc::CODE_INVALID_ARGUMENT,
+                "invalid argument: bad req",
+            ),
             (
                 manager_rpc::CODE_PRECONDITION,
                 "precondition failed: stream cannot be empty after punch holes",
@@ -6286,9 +6309,8 @@ mod manager_retry_tests {
     /// concurrent split/recovery/EC) becomes a hard append/roll failure.
     #[test]
     fn transient_conflict_preconditions_are_retryable() {
-        let mk = |msg: &str| {
-            ManagerError::new(manager_rpc::CODE_PRECONDITION, "alloc_new_extent", msg)
-        };
+        let mk =
+            |msg: &str| ManagerError::new(manager_rpc::CODE_PRECONDITION, "alloc_new_extent", msg);
         // The four real manager producers (verbatim marker phrases).
         for msg in [
             "extent 42 has in-flight ConvertToEc; defer alloc_extent until it completes",
@@ -6299,11 +6321,17 @@ mod manager_retry_tests {
             let e = mk(msg);
             assert!(e.is_transient_conflict(), "must be transient: {msg}");
             assert!(e.is_retryable(), "must retry: {msg}");
-            assert!(!e.is_owner_fence(), "transient conflict is not a fence: {msg}");
+            assert!(
+                !e.is_owner_fence(),
+                "transient conflict is not a fence: {msg}"
+            );
         }
         // The fence + a deterministic business rule are NOT transient → fail fast.
-        let fence =
-            ManagerError::new(manager_rpc::CODE_PRECONDITION, "stream_alloc_extent", &fence_message());
+        let fence = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "stream_alloc_extent",
+            &fence_message(),
+        );
         assert!(!fence.is_transient_conflict());
         assert!(!fence.is_retryable());
         let biz = ManagerError::new(
@@ -6344,7 +6372,11 @@ mod manager_retry_tests {
             })
             .await;
         res.expect("transient precondition must eventually succeed after retries");
-        assert_eq!(attempts.get(), 3, "must have retried the transient conflict");
+        assert_eq!(
+            attempts.get(),
+            3,
+            "must have retried the transient conflict"
+        );
     }
 
     /// coco P2 (multi-manager HA): a TRANSIENT precondition retry must NOT rotate

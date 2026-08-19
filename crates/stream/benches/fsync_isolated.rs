@@ -128,7 +128,11 @@ fn bench_group_commit(path: &Path, size: usize, group: usize, n_groups: usize) {
 
 fn main() {
     let dirs: Vec<PathBuf> = match std::env::var("AUTUMN_FSYNC_BENCH_DIRS") {
-        Ok(v) => v.split(',').filter(|s| !s.is_empty()).map(PathBuf::from).collect(),
+        Ok(v) => v
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
         Err(_) => ["/data03", "/data05", "/data08", "/tmp"]
             .iter()
             .map(PathBuf::from)

@@ -546,9 +546,6 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
                     .expect("post append");
             }
             let elapsed = t.elapsed();
-            println!(
-                "64 sequential appends on 3-rep stream: {:?}",
-                elapsed
-            );
+            println!("64 sequential appends on 3-rep stream: {:?}", elapsed);
         });
 }

@@ -342,7 +342,9 @@ fn client_routes_by_extent_hash() {
     // it landing on the other shard) so the test still exercises BOTH shards.
     let id_a = 200u64;
     let shard_a = shard_for_extent(id_a, 2);
-    let id_b = (id_a + 1..).find(|&i| shard_for_extent(i, 2) != shard_a).unwrap();
+    let id_b = (id_a + 1..)
+        .find(|&i| shard_for_extent(i, 2) != shard_a)
+        .unwrap();
 
     compio::runtime::Runtime::new()
         .unwrap()
@@ -350,10 +352,7 @@ fn client_routes_by_extent_hash() {
             let base = format!("127.0.0.1:{}", shard_ports[0]);
             let pool = ConnPool::new();
 
-            for (id, payload) in [
-                (id_a, &b"hello-shard-a"[..]),
-                (id_b, &b"shard-b-world"[..]),
-            ] {
+            for (id, payload) in [(id_a, &b"hello-shard-a"[..]), (id_b, &b"shard-b-world"[..])] {
                 let routed = shard_addr_for_extent(&base, &shard_ports, id);
                 let expect_port = shard_ports[shard_for_extent(id, 2) as usize];
                 assert_eq!(routed, format!("127.0.0.1:{expect_port}"));

@@ -30,8 +30,14 @@ async fn df_reports_summed_extent_len_per_disk() {
     // Two extents with known lengths on the single disk.
     assert_eq!(conn.alloc_extent(101).await.code, CODE_OK);
     assert_eq!(conn.alloc_extent(102).await.code, CODE_OK);
-    assert_eq!(conn.append(101, 1, 0, 0, vec![0u8; 4096]).await.code, CODE_OK);
-    assert_eq!(conn.append(102, 1, 0, 0, vec![0u8; 2048]).await.code, CODE_OK);
+    assert_eq!(
+        conn.append(101, 1, 0, 0, vec![0u8; 4096]).await.code,
+        CODE_OK
+    );
+    assert_eq!(
+        conn.append(102, 1, 0, 0, vec![0u8; 2048]).await.code,
+        CODE_OK
+    );
 
     // df now sums entry.len across the disk's extents (4096 + 2048).
     let df = conn.df(vec![], vec![]).await;
@@ -43,8 +49,15 @@ async fn df_reports_summed_extent_len_per_disk() {
     );
 
     // A further append grows the footprint by exactly the appended bytes.
-    assert_eq!(conn.append(101, 1, 4096, 0, vec![0u8; 1000]).await.code, CODE_OK);
+    assert_eq!(
+        conn.append(101, 1, 4096, 0, vec![0u8; 1000]).await.code,
+        CODE_OK
+    );
     let df2 = conn.df(vec![], vec![]).await;
     let ext2: u64 = df2.disk_status.iter().map(|(_, st)| st.extent_bytes).sum();
-    assert_eq!(ext2, 4096 + 2048 + 1000, "footprint tracks live extent length");
+    assert_eq!(
+        ext2,
+        4096 + 2048 + 1000,
+        "footprint tracks live extent length"
+    );
 }

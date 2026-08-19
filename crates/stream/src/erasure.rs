@@ -82,10 +82,7 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
 /// chunked write path produces an on-disk EC layout identical to the
 /// whole-extent encode — reads (`ec_subrange_read` / `ec_read_full`) are
 /// unaffected by which encode path wrote the shards.
-pub fn ec_encode_stripe(
-    data_stripes: &[&[u8]],
-    parity_shards: usize,
-) -> Result<Vec<Vec<u8>>> {
+pub fn ec_encode_stripe(data_stripes: &[&[u8]], parity_shards: usize) -> Result<Vec<Vec<u8>>> {
     let data_shards = data_stripes.len();
     if data_shards == 0 {
         return Err(anyhow!("data_stripes must be non-empty"));
