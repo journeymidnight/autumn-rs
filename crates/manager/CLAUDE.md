@@ -293,10 +293,12 @@ Invariants:
 **Stale sweep** (`extent_inflight_stale_sweep_loop`): tick
 `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60 s, floor 1); stale threshold
 `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600 s, floor 60). `started_at`
-is in the persisted record so the clock survives failover. Recovery + Delete markers
-auto-release safely (sweep touches only the marker, never `extents/<id>` or an EN;
-recovery re-drains, delete is idempotent). **ConvertToEc is WARN-only and NEVER
-auto-released** — releasing it races the original EN dispatch and can record a
+is in the persisted record so the clock survives failover. **Only Delete markers
+auto-release on wall-clock** (sweep touches only the marker, never `extents/<id>`
+or an EN; delete is idempotent). **Recovery has NO TTL** — a marker is released
+by an EVENT (its pinned executor stops being Online, or the recovery completes),
+never by elapsed time; see the Recovery section. **ConvertToEc is WARN-only and
+NEVER auto-released** — releasing it races the original EN dispatch and can record a
 different parity assignment than the bytes that physically landed (silent EC
 corruption); operator inspects EN state and clears manually.
 
@@ -309,6 +311,36 @@ does a per-disk health check first (offline `disk_id` → dispatch immediately),
 probes `commit_length` (or `re_avali` for known-lagging replicas). On no-response /
 error, dispatch `require_recovery` to a healthy candidate. In-flight recoveries live
 in the unified inflight ledger so a double-dispatch is impossible across failover.
+
+**The marker is a STANDING INSTRUCTION, not a do-not-disturb flag.** A marker pins
+one `(extent, executor)` assignment; the leader keeps RE-SENDING that exact RPC
+(`redispatch_pinned_recovery`, 5 s timeout, skipped when the pinned node is not
+Online so a keep-alive to a corpse can't eat the whole dispatch tick) and **never
+drains the marker on an RPC failure**. That is what makes an EN restart
+self-healing without a TTL: the EN loses its in-memory `recovery_inflight`, the
+next re-send simply starts it again, and every EN answer is idempotent by
+contract (already-running → `CODE_OK`; complete local copy → re-report done;
+incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
+**Release is EVENT-driven, at exactly two points:** `apply_recovery_done` (the
+work finished) and `release_recovery_markers_for_dead_executors` (level-triggered
+each tick — the pinned node is gone from `s.nodes` or no longer Online → drop the
+marker so re-derivation picks a live target). **There is deliberately NO
+wall-clock TTL**: a timeout is indistinguishable from a slow-but-progressing
+rebuild, and releasing on one races the executor still writing the copy. Never
+re-introduce a TTL, and never drain a Recovery marker on a dispatch error.
+
+**Residue is collected by MEMBERSHIP** (`handle_reconcile_extents`): the garbage
+list is "extents you are not in `replicates ++ parity` of", NOT "extents I have
+forgotten". A recovery that died mid-copy leaves a partial `.dat` on a node whose
+extent is still very much alive, so the forgotten-extent predicate could never
+see it and the stub leaked forever. Guards: `NON_MEMBER_ROUNDS_BEFORE_GC = 3`
+consecutive rounds (the membership view is transiently wrong during an
+`apply_recovery_done` slot swap or a settling leader, and deleting live data on a
+transient is far worse than holding residue a few minutes) and an
+`extent_inflight_op` check (a recovery target is by construction a non-member —
+it is BUILDING the copy that will make it one). Counters are leader-local and
+pruned to what the node still reports, so a leader change only ever DELAYS a
+deletion.
 
 **Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): a slot is
 rebuilt only when its node's override is `Fenced`; `auto_disk` reverts to the legacy
@@ -732,8 +764,7 @@ failure reason the fire-and-forget maintenance ops used to drop.
 - **`--wait`** is a pure client-side poll over `MSG_OP_QUERY` — one execution
   path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
   (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is
-  empty). Deferred: `seed_ec_replay` (list a prior leader's in-flight EC ops on
-  promotion).
+  empty).
 
 ## Web dashboard (standalone app)
 

@@ -1,3 +1,40 @@
+Date: 2026-08-19
+TaskStatus: completed
+Task scope: recovery 侧按 marker 模型逐步落地（用户："/loop 先从 recovery 开始，逐步实现"）。
+  设计=docs/ec_cow_conversion_design.md 定的统一模型：marker 是【常驻指令】——leader 反复重发、
+  无 TTL、按执行者存活释放、执行者必须幂等；残骸按【成员判据】回收。4 步各自编译+测试绿+推 main。
+  R1(8f1a0fd) EN 幂等化：try_adopt_completed_recovery 返回三态 LocalCopyVerdict（Complete 收养并
+     补报 done / Incomplete 丢弃重建 / Unknown 拒绝重试）。真 bug=崩在半路的 recovery 留下部分 .dat，
+     重载成普通 open extent，旧代码永久回"already exists"→该 (node,extent) 永久毒化，而 orphan
+     reconcile 也看不见它（extent 本身活着）。三态是关键：Incomplete 的动作是破坏性的，"看不出来"
+     绝不能塌进"不完整"（manager 不可达 / EC / 未封 / quarantine 一律 Unknown）。
+  R2(96df88a) marker=常驻指令：EN 对"正在跑同一个 recovery"改答 CODE_OK（幂等接受，与
+     handle_convert_to_ec 同契约；答 PRECONDITION 会让 leader 把健康在飞任务的 marker 抽掉另找目标）；
+     manager 加 redispatch_pinned_recovery（5s 超时、非 Online 直接跳过免得给尸体发心跳吃掉整轮、
+     恒返回 Ok、绝不因 RPC 失败 drain marker）。EN 重启即自愈：它丢了内存态，下一次重发再跑一遍。
+  R3(1964eaf) 释放改事件驱动 + 删 TTL：release_recovery_markers_for_dead_executors（level-triggered，
+     每轮扫 pinned 执行者是否还在 s.nodes 且 Online）；删掉 sweep_stale_inflight_once 的 Recovery 分支
+     与 recovery_stale_threshold_secs。理由=超时与"慢但在推进"不可区分，按时间释放会和还在写的执行者
+     对撞。现在只剩 Delete 走 wall-clock。
+  R4(e563472) 残骸按成员判据回收：handle_reconcile_extents 的 garbage 从"manager 已遗忘的 extent"
+     改成"你不在 replicates++parity 里的 extent"（前者永远看不到崩溃残骸——extent 还活着）；
+     加 NON_MEMBER_ROUNDS_BEFORE_GC=3 宽限（成员视图在 apply_recovery_done 换槽/leader 刚稳定时会短暂
+     不准，误删真数据远比多留几分钟残骸严重；计数器 leader-local 且按上报裁剪，换 leader 只会推迟删除）
+     + extent_inflight 在飞守卫（recovery 目标按定义就是非成员，正在造那份将使它成为成员的副本；
+     EN 侧 reconcile unlink 同样跳过 recovery_inflight/ec_convert_inflight，与 handle_delete_extent 对齐）。
+  门：stream lib 115、manager lib 267、5 个 recovery 集成测（含 2 个新增：不完整副本被丢弃重建而非
+     永久拒绝、重复下发是幂等接受）。live e2e scratchpad/recovery_smoke.sh（4EN RF3，kill+fence 一台）
+     PASS：3 个 recovery 在 ledger 里 running→succeeded，attempts=1。
+  过程教训：e2e 一度报 PARTIAL 而它自己打印的 ops list 明明全 succeeded —— 是断言缺陷不是产品问题：
+     "所有 recovery op 都 succeeded"在活集群永远收敛不了（被 fence 的节点持续产生新 recovery，
+     日志里 rolled open tail(s) off fenced node(s)）。改成正确的静默条件：无 active + 至少一个 succeeded。
+  文档：crates/stream/CLAUDE.md（require_recovery 三态幂等 + orphan reconcile 成员判据/宽限/在飞守卫）、
+     crates/manager/CLAUDE.md（Recovery 段加 marker 模型与两个释放点、stale sweep 段订正"只有 Delete
+     走 TTL"、删掉与实现矛盾的 seed_ec_replay 遗留行）。
+Next steps: recovery 这条线收口。剩 EC 的 CoW 改造（docs/ec_cow_conversion_design.md §10 六步，
+  从 per-attempt nonce 起）—— 量级另一档，建议单独起一轮；未开工。
+  另延后：handle_re_avali 的 truncate-in-place 审计（CoW 文档 §9）、handle_fence_extent 的 fence-on-absent。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-15
 TaskStatus: completed
 Task scope: op 命令统一异步 + 可查状态（用户："所有 op 都应异步保持一致，只要能查当前状态"）。fable

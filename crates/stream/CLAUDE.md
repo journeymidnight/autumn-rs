@@ -312,9 +312,32 @@ quorum-min: it neither seals nor truncates, so its worst case is a short read
 
 ### Recovery (`require_recovery` RPC)
 
-Triggered by the manager when a replica node fails:
-1. Validate manager endpoint configured, extent absent locally, no in-flight
-   recovery for this extent.
+Triggered by the manager when a replica node fails. **The request is a STANDING
+INSTRUCTION, re-sent every tick from the manager's durable marker, so every
+answer must be idempotent — a permanent refusal is a permanent wedge:**
+1. Validate the manager endpoint is configured, then answer idempotently:
+   - **already recovering this extent** → `CODE_OK` ("I am already doing exactly
+     this" is the request being satisfied — the same contract
+     `handle_convert_to_ec` uses). A `CODE_PRECONDITION` here would make the
+     manager drain the marker of a HEALTHY in-flight recovery and go hunting for
+     another target.
+   - **a local copy exists** → `try_adopt_completed_recovery` returns a THREE-state
+     `LocalCopyVerdict` (never two — the action for Incomplete is destructive, so
+     "cannot tell" must never collapse into it):
+     `Complete` (sealed, `eversion` equal, `len >= sealed_length` vs the
+     manager's authoritative view) → re-push `RecoveryTaskDone` and `CODE_OK`
+     (the completion report was lost, not the data);
+     `Incomplete` (authoritative view obtained and the copy falls short) →
+     **discard it and rebuild** — `run_recovery_task` persists `.meta` LAST, so a
+     crash mid-copy leaves a partial `.dat` that reloads as an ordinary open
+     extent, and refusing on it poisons that (node, extent) pair FOREVER (the
+     orphan reconcile won't reap it either — the extent is alive; only its
+     MEMBERSHIP says the copy is garbage). Safe because the manager dispatches
+     recovery only to a NON-member, so the stub is referenced by no VP, no SST
+     and no checkpoint;
+     `Unknown` (manager unreachable, or EC'd / still-open / quarantined — shapes
+     this comparison cannot judge) → refuse `CODE_PRECONDITION` and let the
+     manager retry. **Never destroy a copy of unknown completeness.**
 2. Spawn background `run_recovery_task` **with retry** (up to 10 attempts, 10 s
    backoff): fetch `ExtentInfo` for replica addresses; stream the full extent
    chunk-by-chunk from a healthy peer (`stream_extent_from_sources`); truncate
@@ -408,13 +431,25 @@ belt-and-braces for leader-failover where `pending_extent_deletes` is lost but
 `ExtentNode::new` spawns `spawn_reconcile_orphans_loop()` after
 `load_extents()`: runs immediately, then every 5 minutes. Each iteration ships
 every locally-loaded (shard-owned) `extent_id` to the manager via
-`MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the subset no longer in
-`s.extents`; the node unlinks those via `remove_extent_files`. A single
+`MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the subset **this node is not
+a MEMBER of** (`replicates ++ parity`), not merely the subset it has forgotten —
+crash residue from a died-mid-copy recovery belongs to an extent that is very
+much alive, so a "forgotten extent" predicate can never see it. The node unlinks
+those via `remove_extent_files`, **skipping any extent with a live
+`recovery_inflight` / `ec_convert_inflight`** — a recovery target is by
+construction not yet a member, so without that guard the sweep would delete a
+recovery out from under itself (`handle_delete_extent` has always refused for the
+same reason; this path used to bypass it safely only because the old list could
+never name a recovery target). The manager side counts
+`NON_MEMBER_ROUNDS_BEFORE_GC = 3` consecutive rounds before listing a non-member,
+because the membership view is momentarily wrong in normal operation (an
+`apply_recovery_done` slot swap, a settling leader) and deleting real data on a
+transient is far worse than holding residue for a few more minutes. A single
 iteration handles both cold-start (a failed first attempt recovers on the next
 tick) and steady-state. Per-sweep failures log at WARN; the loop continues. It
 is a backstop for: exhausted `MSG_DELETE_EXTENT` retries, manager restart losing
-`pending_extent_deletes`, EC-conversion leftovers, any path that drops refs to 0
-unilaterally. Generous cadence is fine for a backstop; if a node scales to 10k+
+`pending_extent_deletes`, EC-conversion leftovers, crashed-recovery residue, any
+path that drops refs to 0 unilaterally. Generous cadence is fine for a backstop; if a node scales to 10k+
 extents, switch to chunked rotation.
 
 ### Concurrency control: `ConcurrencyController`
