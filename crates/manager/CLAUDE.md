@@ -420,6 +420,21 @@ parity slot bits stay 0 and `recovery_dispatch_loop` fires `EXT_MSG_RE_AVALI` to
 parity holder forever (idle-cluster RSS churn). The EN `handle_re_avali`
 short-circuits `CODE_OK` when `ec_converted`, self-healing legacy `avali`.
 
+**The layout flip is the SINGLE commit point.** `apply_ec_conversion_done`
+moves membership, eversion, `avali` AND `payload_location = InShardFile` in ONE
+leader-fenced transaction, value-CAS'd against the snapshot the decision was
+computed from. All three parts are load-bearing: a location published separately
+from the layout it belongs to would, for the width of the gap, send readers to a
+file the layout does not yet say anyone holds; and the CAS states explicitly
+what today rests implicitly on the inflight ledger serialising per-extent ops.
+Before the flip nothing is committed — the shards are additive files no reader
+is pointed at — so **an EC marker whose coordinator is gone is now released**
+like a recovery marker (`release_recovery_markers_for_dead_executors`), and the
+successor is free to choose a different assignment. "Gone" means absent from the
+cluster or `Suspected`, NOT merely "not Online": a freshly registered node sits
+in `Suspend` until its first `df`, and abandoning on that makes a conversion
+that outlives one tick impossible.
+
 **Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
 — `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN
 obeys; the EN never infers its own role. It lives in the sibling key

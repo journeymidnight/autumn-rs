@@ -1,22 +1,24 @@
-//! EC 2PC crash-safety tests.
+//! EC conversion staging, and the RETAINED legacy commit path.
 //!
-//! Verifies that the two-phase commit protocol for EC conversion
-//! preserves data integrity under all intermediate states:
+//! Conversion no longer publishes anything node-by-node: `WriteShard` stages
+//! into `extent-{id}.shard{i}`, an additive file, and the manager's layout flip
+//! is the single commit point. So the properties that matter here are that
+//! staging never disturbs `.dat`, that it is idempotent and attempt-scoped, and
+//! that nothing is left in a state needing a decision.
 //!
-//! - Phase 1 (prepare / WriteShard): shard data goes to `.ec.dat`,
-//!   original `.dat` stays intact.
-//! - Phase 2 (commit / CommitEcShard): atomic rename `.ec.dat` → `.dat`,
-//!   eversion bumped.
-//! - Idempotency: both prepare and commit can be safely retried.
-//! - Crash between phases: original data is still readable.
+//! The commit half (`MSG_COMMIT_EC_SHARD`, the `.ec.dat` rename, the
+//! `ec.commit` marker) is RETAINED as repair code for a node upgraded while
+//! holding a mid-rename crash state. Nothing in this build creates `.ec.dat`,
+//! so those tests PLANT one, which is exactly the situation the code is for.
 
 mod test_helpers;
 
 use autumn_stream::extent_rpc::{CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_OK};
 use test_helpers::{pick_addr, start_node, TestConn};
 
-/// After WriteShard (Phase 1 prepare), original data must still be
-/// readable — the shard goes to `.ec.dat` staging, not `.dat`.
+/// Staging must not disturb the replica it is derived from: the shard goes to
+/// its own file, and `.dat` still serves the whole value. This is what makes an
+/// abandoned attempt free — there is nothing to undo.
 #[compio::test]
 async fn prepare_preserves_original_data() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
@@ -48,8 +50,9 @@ async fn prepare_preserves_original_data() {
     assert_eq!(&read.payload[..], &original[..]);
 }
 
-/// After CommitEcShard (Phase 2 commit), the shard data replaces the
-/// original and the eversion is bumped.
+/// RETAINED repair path: a `.ec.dat` left by the pre-CoW binary is published by
+/// `CommitEcShard`, replacing `.dat` and bumping the eversion. An upgraded node
+/// still has to be able to finish what the old one started.
 #[compio::test]
 async fn commit_switches_to_shard_data() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
@@ -64,12 +67,9 @@ async fn commit_switches_to_shard_data() {
     conn.append(extent_id, 1, 0, 0, original).await;
 
     let shard_payload = vec![0xCDu8; 1024];
-    let ws = conn
-        .write_shard(extent_id, 0, 2048, 5, shard_payload.clone())
-        .await;
-    assert_eq!(ws.code, CODE_OK);
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &shard_payload);
 
-    // Phase 2: commit — renames .ec.dat → .dat, bumps eversion to 5.
+    // Commit — renames .ec.dat → .dat, bumps eversion to 5.
     let cs = conn.commit_ec_shard(extent_id, 2048, 5).await;
     assert_eq!(cs.code, CODE_OK, "commit_ec_shard should succeed");
 
@@ -87,8 +87,8 @@ async fn commit_switches_to_shard_data() {
     assert_eq!(&ok.payload[..], &shard_payload[..]);
 }
 
-/// WriteShard is idempotent: calling it twice with the same shard size
-/// succeeds (the second call is a no-op).
+/// Staging is idempotent: re-running it is how a re-dispatched attempt makes
+/// progress, so a second identical `WriteShard` must succeed.
 #[compio::test]
 async fn idempotent_prepare() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
@@ -150,8 +150,8 @@ async fn a_superseded_attempts_stripe_is_refused() {
     assert_eq!(still_ok.code, CODE_OK);
 }
 
-/// CommitEcShard is idempotent: calling it after the staging file is
-/// already renamed (eversion already at target) succeeds.
+/// RETAINED repair path: committing twice is safe — the second call finds the
+/// staging already renamed and the eversion already at target.
 #[compio::test]
 async fn idempotent_commit() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
@@ -163,8 +163,7 @@ async fn idempotent_commit() {
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
     let shard = vec![0xBBu8; 256];
-    let ws = conn.write_shard(extent_id, 0, 256, 4, shard).await;
-    assert_eq!(ws.code, CODE_OK);
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &shard);
 
     let cs1 = conn.commit_ec_shard(extent_id, 256, 4).await;
     assert_eq!(cs1.code, CODE_OK);
@@ -174,9 +173,9 @@ async fn idempotent_commit() {
     assert_eq!(cs2.code, CODE_OK, "idempotent commit must succeed");
 }
 
-/// Simulates a crash between Phase 1 and Phase 2: the staging file
-/// (.ec.dat) exists alongside the original (.dat). Original data must
-/// still be readable. Completing Phase 2 afterwards must succeed.
+/// RETAINED repair path: the crash state the old scheme could leave — `.ec.dat`
+/// beside `.dat`. The original must still read, and finishing the commit must
+/// still work, because an upgraded node inherits exactly this.
 #[compio::test]
 async fn crash_between_prepare_and_commit_preserves_data() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
@@ -191,10 +190,9 @@ async fn crash_between_prepare_and_commit_preserves_data() {
     let append = conn.append(extent_id, 1, 0, 0, original.clone()).await;
     assert_eq!(append.code, CODE_OK);
 
-    // Prepare: shard goes to .ec.dat
+    // The interrupted state: staging beside the live `.dat`.
     let shard = vec![0x22u8; 2048];
-    let ws = conn.write_shard(extent_id, 0, 4096, 6, shard.clone()).await;
-    assert_eq!(ws.code, CODE_OK);
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &shard);
 
     // Simulate "crash" state: both .ec.dat and .dat exist.
     // Original data is still intact and readable.

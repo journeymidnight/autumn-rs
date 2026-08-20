@@ -73,12 +73,11 @@ async fn batch_append_rejects_sealed_extent_with_low_commit() {
     assert_eq!(w1.code, CODE_OK);
     assert_eq!(w1.end, 10);
 
-    // Seal the extent by writing a shard and committing it.
-    // write_shard creates .ec.dat; commit_ec_shard renames .ec.dat→.dat,
+    // Seal the extent via the legacy conversion shape: planted `.ec.dat` (as
+    // the pre-CoW binary left it) published by the retained commit path, which
     // bumps eversion and sets sealed_length + avali.
     let shard_data = b"shard_data".to_vec();
-    let ws = conn.write_shard(eid, 0, 10, 2, shard_data).await;
-    assert_eq!(ws.code, CODE_OK);
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), eid, &shard_data);
     let cs = conn.commit_ec_shard(eid, 10, 2).await;
     assert_eq!(cs.code, CODE_OK);
 

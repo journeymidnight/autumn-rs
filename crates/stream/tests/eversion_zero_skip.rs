@@ -44,8 +44,9 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
     // to the shard payload (mimicking post-EC state where a value at
     // offset > shard_len no longer fits).
     let shard_payload = vec![0xABu8; 1024];
-    let ws = conn.write_shard(extent_id, 0, 1024, 5, shard_payload).await;
-    assert_eq!(ws.code, CODE_OK, "write_shard should succeed");
+    // Legacy conversion shape: staging planted as the pre-CoW binary left it,
+    // then published by the retained commit path.
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &shard_payload);
     let cs = conn.commit_ec_shard(extent_id, 1024, 5).await;
     assert_eq!(cs.code, CODE_OK, "commit_ec_shard should succeed");
 
@@ -89,11 +90,9 @@ async fn batched_read_returns_eversion_mismatch_response() {
     let extent_id: u64 = 7778;
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
-    // 2PC: prepare (write .ec.dat) + commit (rename + bump eversion to 7).
-    let ws = conn
-        .write_shard(extent_id, 0, 1024, 7, vec![0xCDu8; 1024])
-        .await;
-    assert_eq!(ws.code, CODE_OK);
+    // Legacy conversion shape: planted staging + the retained commit path,
+    // which bumps eversion to 7.
+    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &vec![0xCDu8; 1024]);
     let cs = conn.commit_ec_shard(extent_id, 1024, 7).await;
     assert_eq!(cs.code, CODE_OK);
 

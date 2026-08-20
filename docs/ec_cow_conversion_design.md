@@ -444,6 +444,29 @@ shapes.
    guard in §5), the commit phase stops being sent, `apply_ec_conversion_done`
    writes `InShardFile` (+ value-CAS, §4.5), and marker release on
    coordinator-offline is enabled for EC. Old-scheme repair code stays.
+   **SHIPPED.**
+
+   Three things the plan above did not account for:
+
+   - **EC shard recovery wrote its rebuilt shard into `.dat`.** Correct while a
+     shard WAS `.dat`; under this design it would leave the node serving shard
+     bytes to anyone asking for the whole value, and the shard the layout points
+     at missing. It now writes the file the layout names.
+   - **`read_plan` bounded reads by the extent's length, not the file's.** A
+     shard is `sealed_length / K` while the `.dat` beside it (awaiting cleanup)
+     holds the whole extent, so a to-end shard read asked for several times the
+     shard's size. The bound now comes from the file being read.
+   - **"Cannot run it any more" is not "is not Online".** Enabling marker release
+     for EC with an `is_online()` predicate abandoned every attempt whose
+     coordinator was still in `Suspend` — the state a freshly registered node
+     sits in until its first `df` — so conversion could never outlive one tick.
+     The predicate is now "gone from the cluster, or `Suspected`". Caught by
+     `ec_failover`, not by unit tests.
+
+   Consequence for tests: `WriteShard` + `CommitEcShard` no longer composes, so
+   fixtures that used it to make an extent "EC-converted at eversion N" now
+   plant a `.ec.dat` — which is precisely the state the retained repair code
+   exists for, making that coverage more faithful than it was.
 5. **File-granular reconcile + cleanup driver** (§8). Until this lands, flips are
    allowed but the space window is unbounded — keep policy-driven EC arming off.
 6. **After a soak and one release boundary**: delete the commit phase and the

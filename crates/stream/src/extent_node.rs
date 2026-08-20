@@ -2449,12 +2449,27 @@ fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Result<(u64, u64, u64)
     if req.eversion < ev {
         return Err(ReadRefusal::EversionStale);
     }
-    let total_len = if extent.sealed.load(Ordering::SeqCst)
-        && extent.sealed_length.load(Ordering::SeqCst) == 0
-    {
-        0
-    } else {
-        extent.len.load(Ordering::SeqCst)
+    // The length bound belongs to the FILE being read. A shard is
+    // `sealed_length / K` bytes while `.dat` — which may still be sitting
+    // beside it, awaiting cleanup — holds the whole extent, so taking the
+    // extent-level length here would let a to-end shard read ask for several
+    // times the shard's size.
+    let total_len = match req.payload_ref().location {
+        PayloadLocation::InShardFile => extent
+            .shard_files
+            .borrow()
+            .get(&req.shard_index)
+            .copied()
+            .unwrap_or(0),
+        PayloadLocation::InDat => {
+            if extent.sealed.load(Ordering::SeqCst)
+                && extent.sealed_length.load(Ordering::SeqCst) == 0
+            {
+                0
+            } else {
+                extent.len.load(Ordering::SeqCst)
+            }
+        }
     };
     let read_offset = req.offset;
     let read_size = if req.length == 0 {
@@ -5476,6 +5491,7 @@ impl ExtentNode {
         // resolve (re-open if evicted) + pin the recovery dest fd
         // once for the writeback + sync below.
         let rf = self.extent_file(&extent).await?;
+        let mut wrote_shard_file = false;
         let payload_len = if !extent_info.ec_converted && extent_info.sealed_length == 0 {
             // a sealed-EMPTY extent (`sealed_length == 0` — e.g.
             // an open tail that the fence drain rolled empty, then recovery
@@ -5502,15 +5518,55 @@ impl ExtentNode {
             // reconstruct the missing shard for this node's slot. Shard-sized
             // buffering (≈ sealed_length / K), not full-extent; a streaming RS
             // decode would be a further optimization.
-            let payload = self.run_ec_recovery_payload(&task, &extent_info).await?;
+            let (payload, shard_index) =
+                self.run_ec_recovery_payload(&task, &extent_info).await?;
             let len = payload.len() as u64;
-            rf.set_len(0).await.map_err(|e| e.to_string())?;
-            file_pwrite_chunked(rf.clone(), 0, Bytes::from(payload))
-                .await
-                .map_err(|e| e.to_string())?;
+            // The rebuilt shard goes back into the file the layout NAMES. On an
+            // extent converted under the CoW scheme that is
+            // `extent-{id}.shard{i}` — writing it into `.dat` would leave this
+            // node serving shard bytes to anyone still asking for the whole
+            // value, and leave the shard the layout points at missing. A
+            // legacy converted extent (shard renamed over `.dat`) keeps its
+            // old shape.
+            if PayloadLocation::from_byte(extent_info.payload_location)
+                == PayloadLocation::InShardFile
+            {
+                let disk = self.disk_for(extent.disk_id)?;
+                let path = disk.shard_path(task.extent_id, shard_index);
+                if let Some(parent) = path.parent() {
+                    compio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| format!("mkdir for rebuilt shard {}: {e}", task.extent_id))?;
+                }
+                let f = Rc::new(
+                    OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&path)
+                        .await
+                        .map_err(|e| format!("create rebuilt shard {}: {e}", task.extent_id))?,
+                );
+                file_pwrite_chunked(f.clone(), 0, Bytes::from(payload))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                f.sync_data().await.map_err(|e| e.to_string())?;
+                self.fsync_staging_dir(task.extent_id, &path).await.map_err(|(_, m)| m)?;
+                extent.note_shard_file(shard_index, len);
+                wrote_shard_file = true;
+            } else {
+                rf.set_len(0).await.map_err(|e| e.to_string())?;
+                file_pwrite_chunked(rf.clone(), 0, Bytes::from(payload))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             len
         };
-        rf.sync_data().await.map_err(|e| e.to_string())?;
+        // The shard file was already synced by name; `.dat` is not this
+        // extent's payload in that case and must not be truncated or synced.
+        if !wrote_shard_file {
+            rf.sync_data().await.map_err(|e| e.to_string())?;
+        }
 
         // verify-after-sync — a concurrent apply_extent_meta_durable
         // (triggered by handle_re_avali or another append's seal-confirm branch)
@@ -5590,7 +5646,7 @@ impl ExtentNode {
         &self,
         task: &crate::extent_rpc::RecoveryTask,
         extent_info: &ExtentInfo,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, u32), String> {
         let data_shards = extent_info.replicates.len();
         let parity_shards = extent_info.parity.len();
         let n = data_shards + parity_shards;
@@ -5683,7 +5739,7 @@ impl ExtentNode {
         // offload RS reconstruct (CPU-bound, GF(256) polynomial math
         // over up-to-data_shards × per-shard MiB) to the blocking pool so
         // recovery doesn't stall the extent-node compio runtime.
-        compio::runtime::spawn_blocking(move || {
+        let rebuilt = compio::runtime::spawn_blocking(move || {
             crate::erasure::ec_reconstruct_shard(
                 shards,
                 data_shards,
@@ -5693,7 +5749,8 @@ impl ExtentNode {
         })
         .await
         .map_err(|_| "EC reconstruct task panicked".to_string())?
-        .map_err(|e| format!("EC reconstruct failed: {e}"))
+        .map_err(|e| format!("EC reconstruct failed: {e}"))?;
+        Ok((rebuilt, replacing_index as u32))
     }
 
     /// 2PC Phase 1 (prepare): write a single EC shard to a staging file
@@ -5738,7 +5795,10 @@ impl ExtentNode {
         let disk = self
             .disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
-        let staging_path = disk.ec_staging_path(extent_id);
+        // The shard is an ADDITIVE file named by its index — `.dat` is never
+        // touched, so nothing has to be undone if this attempt is abandoned,
+        // and a shard staged for one index can never be served as another.
+        let staging_path = disk.shard_path(extent_id, shard_index as u32);
         let stripe_len = stripe_data.len();
 
         // coco P1 bounds guard: a malformed / stale WriteShard with a huge
@@ -5826,13 +5886,24 @@ impl ExtentNode {
         // stripes — only the first stripe actually creates the file).
         self.fsync_staging_dir(extent_id, &staging_path).await?;
 
+        // Publish the file to this node's own view: `holds_payload` must say
+        // yes before the layout flip can send a reader here, and `df` must
+        // count these bytes (the node now holds `.dat` AND a shard).
+        let known = entry
+            .shard_files
+            .borrow()
+            .get(&(shard_index as u32))
+            .copied()
+            .unwrap_or(0);
+        entry.note_shard_file(shard_index as u32, known.max(stripe_end));
+
         tracing::debug!(
             extent_id,
             shard_index,
             shard_offset,
             stripe_len,
             sealed_length,
-            "EC prepare: shard stripe written to staging"
+            "EC prepare: shard stripe written to its shard file"
         );
         Ok(())
     }
@@ -7994,24 +8065,21 @@ impl ExtentNode {
         // via `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` (clamped [1, 16]).
         let _ec_permit = self.concurrency_ctrl.acquire_ec_convert().await;
 
-        // ── Check if coordinator's .ec.dat exists (prior prepare completed) ──
+        // ── Has THIS attempt already staged every shard? ──
         //
-        // If the coordinator's own staging file exists with the expected
-        // shard size, a prior prepare phase completed for ALL nodes
-        // (coordinator prepares itself last). Skip RS-encode and jump
-        // straight to Phase 2 (commit).
+        // The coordinator stages its own shard LAST, so its shard file being
+        // complete means every participant's is too. Skipping then costs
+        // nothing and re-reports the completion the manager may have lost.
         let coordinator_prepared = {
             let disk = self
                 .disk_for(entry.disk_id)
                 .map_err(|e| (StatusCode::Internal, e))?;
-            let staging = disk.ec_staging_path(extent_id);
+            // The coordinator is `target_addrs[0]`, hence shard 0.
+            let staging = disk.shard_path(extent_id, 0);
             // The size check ALONE is not attempt-scoped: the same extent at the
             // same K always yields the same shard size, so a PREVIOUS attempt's
-            // staging satisfies it. If that previous attempt assigned this node a
-            // different shard index, skipping prepare would commit stale,
-            // wrong-index staging over live replicas on every reused participant
-            // (`CommitEcShardReq` carries no shard index, so nobody downstream
-            // can catch it).
+            // staging satisfies it — and reporting "done" off another attempt's
+            // bytes would flip the layout onto shards this attempt never wrote.
             //
             // `new_eversion` does NOT scope this to an attempt: it is
             // `live + 1`, and an abandoned attempt never bumped the extent, so
@@ -8327,46 +8395,29 @@ impl ExtentNode {
             } // !recovered
         }
 
-        // ── Phase 2 (commit): rename .ec.dat → .dat on all nodes ──
-        // Remote nodes first, coordinator last.
-        for (i, target_addr) in req.target_addrs.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            let commit_req = CommitEcShardReq {
-                extent_id,
-                sealed_length,
-                eversion: new_eversion,
-                // Tier 2: see WriteShardReq site above.
-                owner_epoch: req.owner_epoch,
-            };
-            let sock = parse_addr(target_addr).map_err(|e| {
-                (
-                    StatusCode::Internal,
-                    format!("parse addr {target_addr}: {e}"),
-                )
-            })?;
-            let label = format!("CommitEcShard to {target_addr} shard {i}");
-            ec_2pc_participant_rpc(
-                sock,
-                MSG_COMMIT_EC_SHARD,
-                commit_req.encode(),
-                &label,
-                |b| {
-                    CommitEcShardResp::decode(b)
-                        .map(|r| r.code)
-                        .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))
-                },
-            )
-            .await?;
-        }
-
-        // Coordinator commits itself LAST. After this, the idempotency
-        // guard (eversion bump) ensures future retries are a no-op.
-        self.commit_shard_local(extent_id, sealed_length, new_eversion)
-            .await?;
-
-        tracing::info!(extent_id, new_eversion, "EC 2PC phase 2 (commit) complete");
+        // ── No commit phase. ──
+        //
+        // Nothing was published, so nothing has to be flipped node-by-node: the
+        // shards are additive files and every `.dat` is untouched. The single
+        // commit point is the manager's layout flip, driven by the completion
+        // report below.
+        //
+        // This is what removes the middle state the old scheme could not
+        // classify. A per-node rename left the cluster with "some renamed, some
+        // not", and a crashed coordinator gave nobody the authority to decide
+        // roll-forward or roll-back — which is what made a stuck marker
+        // un-releasable. Abandoning an attempt now costs a delete of files no
+        // reader is pointed at.
+        //
+        // The receiving side (`handle_commit_ec_shard` / `commit_shard_local` /
+        // the `ec.commit` marker replay) is RETAINED as repair code for nodes
+        // upgraded mid-rename; it is simply never driven from here.
+        tracing::info!(
+            extent_id,
+            new_eversion,
+            attempt_nonce = req.attempt_nonce,
+            "EC shards staged on every target; awaiting the manager's layout flip"
+        );
 
         Ok(())
     }

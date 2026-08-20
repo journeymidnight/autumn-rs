@@ -788,6 +788,25 @@ and from other crates' CLAUDE.md); do not renumber.
 
 16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on `parity.is_empty()`** — the manager pre-fills `parity` for every extent on an EC stream, so an open/pre-conversion extent has `parity != []` while still holding full replicated data on every K+M node. Only after `apply_ec_conversion_done` on a *sealed* extent does data physically split into K+M shards and `ec_converted` flip to `true`. Routing a pre-conversion extent through `ec_subrange_read` would compute `shard_size` from `sealed_length=0` and panic on the per-shard slice. Read dispatch (`read_with_layout`) and recovery dispatch (`run_recovery_task`) both branch on `ec_converted`. **Invariant:** `ec_converted == true` implies `sealed_length > 0`; never set `ec_converted` on an open extent.
 
+    **Conversion is COPY-ON-WRITE: it adds files, it never replaces one.**
+    `WriteShard` stages into `extent-{id}.shard{i}`; `.dat` is never renamed,
+    truncated or overwritten, so an abandoned attempt costs a delete of files no
+    reader is pointed at and a successor may pick a completely different
+    assignment. **There is no commit phase** — the manager's layout flip is the
+    single commit point. The old per-node rename left "some renamed, some not",
+    a middle state nobody could classify, which is what made a stuck marker
+    un-releasable. `handle_commit_ec_shard` / `commit_shard_local` /
+    `finish_ec_commit` / the `ec.commit` replay are RETAINED as repair code for
+    a node upgraded mid-rename; nothing in this build creates a `.ec.dat`.
+
+    Consequences elsewhere: **EC shard recovery writes its rebuilt shard to the
+    file the layout NAMES** (`.shard{i}` when `InShardFile`) — writing it into
+    `.dat` would leave the node serving shard bytes to whoever still asks for
+    the whole value, and the shard the layout points at missing. And
+    **`read_plan` bounds a shard read by the SHARD file's length**, not the
+    extent's: a shard is `sealed_length / K` while the `.dat` beside it (awaiting
+    cleanup) holds the whole extent.
+
     **EC conversion is ACCEPT-then-BACKGROUND (same shape as recovery).**
     `handle_convert_to_ec` validates, refuses a duplicate via `ec_convert_inflight`
     (the manager re-dispatches from its durable marker every ~5 s, so without the

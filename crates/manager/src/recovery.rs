@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use autumn_common::AppError;
+use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 
 use crate::{AutumnManager, PendingDelete};
@@ -83,7 +84,8 @@ pub(crate) fn _test_arm_ec_apply_fail_once() {
 }
 
 impl AutumnManager {
-    /// Release Recovery markers whose pinned executor can no longer run them.
+    /// Release markers whose pinned executor can no longer run them — both
+    /// Recovery (its target) and ConvertToEc (its coordinator).
     ///
     /// This is the event that ends a marker's life when completion never comes.
     /// It is evaluated LEVEL-TRIGGERED — re-derived from live node state every
@@ -91,25 +93,47 @@ impl AutumnManager {
     /// cannot miss an edge, needs no bookkeeping in three handlers, and
     /// re-converges after a leader failover that never saw the transition.
     ///
-    /// Safe unconditionally: nothing is committed until `apply_recovery_done`,
-    /// so releasing only discards an attempt. If the executor was in fact still
-    /// working and finishes later, its completion is refused (no marker) — and
-    /// the next tick re-detects the degraded slot, re-dispatches, and that node
-    /// ADOPTS its now verified-complete copy and re-reports. Convergent either
-    /// way.
+    /// Safe unconditionally, and for the same reason in both cases: nothing is
+    /// committed until the manager applies it, so releasing only discards an
+    /// ATTEMPT. If the executor was in fact still working and finishes later,
+    /// its completion is refused — recovery for want of a marker, EC for want
+    /// of a matching attempt nonce — and the next tick re-derives the work.
+    ///
+    /// EC could not be released this way under the old scheme: a coordinator
+    /// that had begun renaming shards over `.dat` left a middle state nobody
+    /// could classify, so abandoning it risked destroying the last full
+    /// replicas. Now the shards are additive files no reader is pointed at,
+    /// so a released attempt costs only the space until cleanup, and the
+    /// successor is free to pick a completely different assignment.
     ///
     /// Returns the extents whose markers were released (for tests/diagnostics).
     pub(crate) async fn release_recovery_markers_for_dead_executors(&self) -> Vec<u64> {
         let dead: Vec<(u64, u64)> = {
             let states = self.node_states.borrow();
             let nodes = self.store.inner.borrow();
+            // "Cannot run it any more" is NOT "is not Online". A freshly
+            // registered node sits in `Suspend` until its first df — it has
+            // simply not been proven yet, and abandoning its attempt every tick
+            // means a conversion that takes longer than one tick can never
+            // finish. The states that mean it will not finish on its own are:
+            // gone from the cluster, or `Suspected` (it WAS alive and stopped
+            // answering). Fenced / decommissioned nodes are handled by their
+            // own sweeps, which also quarantine the work.
+            let is_gone = |node_id: u64| {
+                !nodes.nodes.contains_key(&node_id) || states.state_of(node_id).is_suspected()
+            };
             self.inflight
                 .borrow()
                 .values()
                 .filter_map(|rec| match rec.unpack() {
+                    Some((_, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p))) => {
+                        // The coordinator drives the whole conversion; if it is
+                        // gone, the attempt is not going to finish.
+                        let coord = params_coordinator(&p)?;
+                        is_gone(coord).then_some((p.extent_id, coord))
+                    }
                     Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) => {
-                        let gone = !nodes.nodes.contains_key(&t.node_id)
-                            || !states.state_of(t.node_id).is_online();
+                        let gone = is_gone(t.node_id);
                         gone.then_some((t.extent_id, t.node_id))
                     }
                     _ => None,
@@ -123,15 +147,15 @@ impl AutumnManager {
                     tracing::info!(
                         extent_id,
                         node_id,
-                        "released Recovery marker: its pinned executor is no longer online \
-                         — re-dispatch will pick a live target"
+                        "released marker: its pinned executor is no longer online \
+                         — re-derivation will pick a live one"
                     );
                     released.push(extent_id);
                 }
                 Err(e) => tracing::warn!(
                     extent_id,
                     node_id,
-                    "could not release the Recovery marker of a dead executor \
+                    "could not release the marker of a dead executor \
                      (retried next tick): {e}"
                 ),
             }
@@ -1920,12 +1944,15 @@ impl crate::AutumnManager {
         // the new EC-converted shape but etcd still showed the pre-EC
         // shape — replay rolled in-memory back later, but in the
         // window concurrent reads observed EC state that wasn't durable.
-        let updated = {
+        let (updated, baseline) = {
             let s = self.store.inner.borrow();
             let ex = s
                 .extents
                 .get(&extent_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
+            // The snapshot this decision is computed from — the flip is CAS'd
+            // against it below.
+            let baseline = rkyv_encode(ex).to_vec();
 
             let mut all_disks = ex.replicate_disks.clone();
             all_disks.extend_from_slice(&extra_disk_ids);
@@ -1944,18 +1971,35 @@ impl crate::AutumnManager {
             // post-EC the extent has K+M shards across K+M nodes;
             // every slot is available by construction.
             new_ex.avali = Self::all_bits(target_nodes.len());
-            new_ex
+            (new_ex, baseline)
         };
 
+        // THE COMMIT POINT. Everything before it is additive — shard files that
+        // no reader is pointed at — and everything after is driven cleanup. So
+        // membership, eversion and the payload LOCATION all move in ONE
+        // transaction: a location published separately from the layout it
+        // belongs to would, for the width of the gap, send readers to a file
+        // the layout does not yet say anyone holds.
         if let Some(etcd) = &self.etcd {
-            // Bundle the marker delete into the same etcd txn
-            // as the `extents/<id>` put. This was previously two separate
-            // etcd round-trips, now atomic. The in-memory apply happens
-            // ONLY after this txn lands.
-            let key = format!("extents/{}", extent_id);
-            let val = rkyv_encode(&updated).to_vec();
-            etcd.put_and_delete_txn(vec![(key, val)], vec![Self::extent_inflight_key(extent_id)])
-                .await?;
+            let puts = vec![
+                (format!("extents/{}", extent_id), rkyv_encode(&updated).to_vec()),
+                (
+                    crate::extent_layout::extent_layout_key(extent_id),
+                    vec![PayloadLocation::InShardFile.as_byte()],
+                ),
+            ];
+            // Value-CAS against the snapshot the decision was made on. The
+            // per-extent inflight ledger already serialises stream-layer ops on
+            // this extent, so a concurrent mutation should be impossible —
+            // state that dependency rather than leaving it implicit, because
+            // the cost of being wrong is a recovery slot swap or a seal being
+            // clobbered by a flip computed from a stale clone.
+            etcd.put_delete_txn_cas(
+                puts,
+                vec![Self::extent_inflight_key(extent_id)],
+                vec![(format!("extents/{}", extent_id), baseline)],
+            )
+            .await?;
         }
 
         // only after etcd success do we apply to in-memory.
@@ -1963,6 +2007,7 @@ impl crate::AutumnManager {
             let mut s = self.store.inner.borrow_mut();
             s.extents.insert(extent_id, updated);
         }
+        self.commit_payload_location(extent_id, PayloadLocation::InShardFile);
 
         // Close any op-ledger EC-convert entry for this extent (authoritative —
         // the manager IS the EC orchestrator; identity is exact by extent id).

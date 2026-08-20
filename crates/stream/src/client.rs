@@ -5958,8 +5958,8 @@ fn flatten_hedge(
 mod merge_ec_replay_tests {
     use super::*;
     use crate::extent_rpc::{
-        rkyv_decode, AllocExtentReq, AllocExtentResp, CommitEcShardReq, CommitEcShardResp,
-        WriteShardReq, WriteShardResp, MSG_ALLOC_EXTENT, MSG_COMMIT_EC_SHARD, MSG_WRITE_SHARD,
+        rkyv_decode, AllocExtentReq, AllocExtentResp, WriteShardReq, WriteShardResp,
+        MSG_ALLOC_EXTENT, MSG_WRITE_SHARD, PAYLOAD_LOCATION_IN_SHARD_FILE,
     };
 
     fn pick_addr() -> std::net::SocketAddr {
@@ -6013,8 +6013,10 @@ mod merge_ec_replay_tests {
             "shard ({shard_size}) must be strictly smaller than logical ({L})"
         );
 
-        // Distribute one EC shard per node: alloc → write_shard (prepare) →
-        // commit_ec_shard (commit). Mirrors the manager's EC-convert 2PC.
+        // Distribute one EC shard per node: alloc → write_shard, which stages
+        // into `extent-{id}.shard{i}`. There is no per-node commit — the
+        // manager's layout flip is the commit point, and this test stands in
+        // for it by publishing `InShardFile` in the cached ExtentInfo below.
         let pool = Rc::new(ConnPool::new());
         for i in 0..N {
             let addr = addrs[i].to_string();
@@ -6051,20 +6053,6 @@ mod merge_ec_replay_tests {
                 CODE_OK
             );
 
-            let cs = CommitEcShardReq {
-                extent_id,
-                sealed_length: L as u64,
-                eversion: EVERSION,
-                owner_epoch: 0,
-            };
-            let cs_resp = pool
-                .call(&addr, MSG_COMMIT_EC_SHARD, cs.encode())
-                .await
-                .expect("commit_ec_shard RPC");
-            assert_eq!(
-                CommitEcShardResp::decode(cs_resp).expect("decode").code,
-                CODE_OK
-            );
         }
 
         // Build a StreamClient WITHOUT touching a manager: `construct` skips
@@ -6097,8 +6085,9 @@ mod merge_ec_replay_tests {
                 replicate_disks: vec![],
                 parity_disks: vec![],
                 ec_converted: true,
-                // Legacy conversion shape: shards were renamed over `.dat`.
-                payload_location: PAYLOAD_LOCATION_IN_DAT,
+                // What the layout flip publishes: each member serves its shard
+                // from its own file.
+                payload_location: PAYLOAD_LOCATION_IN_SHARD_FILE,
             },
         );
 

@@ -269,3 +269,21 @@ impl TestConn {
         CommitEcShardResp::decode(resp).expect("decode CommitEcShardResp")
     }
 }
+
+/// Plant an `extent-{id}.ec.dat` exactly as the PRE-CoW binary would have left
+/// it, so a test can drive the RETAINED commit path (`MSG_COMMIT_EC_SHARD` and
+/// the `ec.commit` marker replay) — the repair code for a node upgraded
+/// mid-rename. Nothing in this build creates `.ec.dat` any more: conversion
+/// stages into `extent-{id}.shard{i}` and the manager's layout flip is the
+/// only commit point.
+pub fn plant_legacy_ec_staging(root: &std::path::Path, extent_id: u64, bytes: &[u8]) {
+    for byte in 0u8..=255 {
+        let sub = root.join(format!("{byte:02x}"));
+        if sub.join(format!("extent-{extent_id}.dat")).exists() {
+            std::fs::write(sub.join(format!("extent-{extent_id}.ec.dat")), bytes)
+                .expect("plant .ec.dat");
+            return;
+        }
+    }
+    panic!("no .dat found for extent {extent_id}");
+}
