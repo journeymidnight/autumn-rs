@@ -1,3 +1,38 @@
+Date: 2026-08-20
+TaskStatus: completed
+Task scope: EC CoW 第 4 步——方案切换（用户："go"）。§10 里唯一"两套方案同时在线"的那个 commit（0e8f4b6）。
+  转换从此【只加文件，不替换文件】：WriteShard 写 extent-{id}.shard{i} 就结束，不 rename、无 per-node
+  commit；manager 的 layout flip 是唯一提交点，一个 CAS 过的 txn 里同时落 membership/eversion/
+  payload_location=InShardFile。
+  它消掉的是"没人能分类的中间态"：per-node rename 会让集群停在"有的改名了有的没有"，coordinator 死在
+  里面时没有任何一方有权决定 roll-forward 还是 roll-back——这正是 marker 卡死无法释放的原因，也是
+  "放弃一次 attempt 可能毁掉最后的完整副本"的原因。现在放弃 = 删掉几个没有任何 reader 指向的文件，
+  所以 EC marker 的 coordinator 没了就能像 recovery marker 一样释放，后继者可以挑完全不同的分配。
+  三个只有代码（和一个集成测试）才知道的点：
+   1. EC shard recovery 把重建出来的 shard 写进了 .dat。在"shard 就是 .dat"的年代是对的；在本设计下
+      会让该节点把 shard 字节喂给任何还在要整值的读者，同时 layout 指向的那个 shard 文件根本不存在。
+      改成写 layout 点名的那个文件。
+   2. read_plan 用 extent 的长度而不是【被读文件】的长度做界。shard 是 sealed_length/K，而旁边等着被
+      清理的 .dat 还装着整个 extent ⇒ 一个 to-end shard 读会要到好几倍于 shard 的长度。界改成按文件取。
+   3. "跑不动了" ≠ "不是 Online"。给 EC 打开 marker 释放时用 is_online() 做判据，会把 coordinator 还处于
+      Suspend（新注册节点在第一次 df 之前的状态）的 attempt 每个 tick 放弃一次 ⇒ 任何跨过一个 tick 的
+      转换永远完不成。判据改成"已不在集群 或 Suspected"。是 ec_failover 抓到的，单测抓不到。
+  连带：WriteShard + CommitEcShard 不再能组合（prepare 已经不写 .ec.dat 了），所以那些拿这对 RPC 当
+  【fixture】制造"EC 转换到 eversion N"的测试改成直接摆一个 .ec.dat ——那正是保留的修复代码存在的场景，
+  覆盖比原来更真实。retained repair code（handle_commit_ec_shard/commit_shard_local/finish_ec_commit/
+  ec.commit replay）全部保留，只是不再被驱动；本 build 不再有任何路径会创建 .ec.dat。
+  门：stream 115 lib + 11 个 test 二进制、manager 277 lib + ec_failover/ec_integration/update_stream_ec/
+  system_extent_recovery/silent_corruption_rot/offline_reconcile、rpc 60。
+  live 3EN 实证：转换成功、marker drain、【8 个 64KiB 值 flip 之后逐个读回字节一致】(RS 解码，全栈)，
+  磁盘上 coordinator 仍持有【未被触碰的】524632B .dat + 262316B shard0（= /K）——CoW 不变量成立。
+  运维：force-ec-convert 现在每次都打 WARN——cleanup driver 未落地前，转换后两种形态会同时占盘且
+  【没有任何东西回收】。§8 要求 policy 驱动的 EC 保持关闭直到第 5 步；auto-policy 默认 Off，但
+  balanced/aggressive 预设里含 ec，谁要 arm 需自行知晓这个空间窗口。
+Next steps: 第 5 步 file-granular reconcile + cleanup driver（reconcile 现在只能表达"这些 extent 你不该
+  有"，表达不了"留着 extent、删掉 .dat"；member 节点的清理还要 repoint entry + persist meta，只有
+  非成员才是纯删）。之后第 6 步：soak + 一个 release 边界后删 commit phase / ec.commit / ec.prepared
+  （ec.prepared 只有在 nonce 完全接管它的角色后才能删）。§9 handle_re_avali truncate-in-place 审计仍未做。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-19 (c)
 TaskStatus: completed
 Task scope: EC CoW 第 2、3 步（用户："on disk layout 可以改，continue"）。§10 六步里的 2 和 3，都是

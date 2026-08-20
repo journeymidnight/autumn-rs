@@ -5045,6 +5045,18 @@ impl AutumnManager {
             );
         }
 
+        // Until the cleanup driver lands, a converted extent keeps BOTH forms:
+        // the shards, and the `.dat` they were derived from. Per extent that
+        // peak is unchanged (they always coexisted mid-conversion) — what has
+        // changed is the DURATION, which is now unbounded. Say so on every
+        // conversion, because the fleet-aggregate cost is the operator's to
+        // watch and nothing reclaims it yet.
+        tracing::warn!(
+            extent_id,
+            "EC conversion started: the pre-conversion .dat is NOT reclaimed yet \
+             (no cleanup driver) — both forms occupy disk until one exists"
+        );
+
         Self::force_ec_resp(
             CODE_OK,
             format!(
