@@ -469,6 +469,29 @@ shapes.
    exists for, making that coverage more faithful than it was.
 5. **File-granular reconcile + cleanup driver** (§8). Until this lands, flips are
    allowed but the space window is unbounded — keep policy-driven EC arming off.
+   **SHIPPED.** The window is now bounded by the sweep interval (5 min, or
+   immediately on EN restart).
+
+   No separate driver was needed: the reconcile IS the driver once its answer
+   carries a placement, because "keep exactly the named payload file" subsumes
+   post-flip cleanup, rollback residue, and non-member garbage under one rule.
+
+   **The live test deleted a live extent**, and the cause was not in this step.
+   The EN does not know its own node_id and reported `0`; R4's membership
+   predicate makes such a caller a member of nothing, so its whole disk reads as
+   garbage — and since the grace counter is keyed `(node, extent)`, three nodes
+   all reporting `0` shared one counter and consumed the entire grace period in
+   a single round each. Before R4 the predicate was existence-based and did not
+   depend on the reporter at all, so `node_id: 0` was harmless; the sender's
+   comment said so, and was true when written. **A membership predicate makes
+   the reporter's identity load-bearing, and nothing propagated that.** The
+   answer is now identity-resolved (`node_id`, else `node_uuid`) and fails
+   closed: a caller the manager cannot identify is told nothing.
+
+   Worth stating as a rule for the remaining steps: when a predicate changes
+   from a property of the OBJECT to a property of the RELATIONSHIP between the
+   object and the asker, every input that identifies the asker becomes
+   load-bearing — including ones previously documented as diagnostic.
 6. **After a soak and one release boundary**: delete the commit phase and the
    `ec.commit` machinery (subject to §7), and `ec.prepared` only once the nonce
    has taken over its role.

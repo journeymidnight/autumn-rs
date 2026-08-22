@@ -1,3 +1,37 @@
+Date: 2026-08-22
+TaskStatus: completed
+Task scope: EC CoW 第 5 步——file-granular reconcile + cleanup（用户："start"）。commit 2d4a5fd。
+  reconcile 的回答从 extent 粒度改成【文件粒度】：garbage（不是成员→全删）+ placements（每个 extent 带
+  payload_location + 这个节点自己的 slot）。节点据此推导出"我该持有的那【一个】payload 文件"，其余全是残骸。
+  转换后清 .dat、被放弃 attempt 的 shard 回滚、非成员垃圾——三件事一条规则搞定，不需要第二套机制，
+  也不需要 intent marker（清理中途崩溃靠启动 discovery 重新推导磁盘现状收敛）。第 4 步开的空间窗口就此关闭
+  （现在由 sweep 周期 5min 界定，EN 重启则立即）。没有单独写 driver：reconcile 一旦会发 placement，它本身就是 driver。
+  删 payload 文件是破坏性的，三道门：①要留的那个文件必须【已经在本地】（.dat 只在确实持有被点名的 shard 之后
+  才删——否则 placement 早于 staging 到达就会删掉本节点唯一的副本）②该 extent 无在飞 op ③只由 manager 决定。
+  manager 侧对【任何有在飞 ledger op 的 extent 一律不给判决】——participant 正在 stage 的 shard 是当前 layout
+  没点名的文件，而节点侧的 ec_convert_inflight 只看得见本节点自己 coordinate 的转换。
+  ── live 测试删掉了一个活的 extent（比我在测的东西更严重，且根因不在第 5 步）──
+  EN 不知道自己的 node_id，一直报 0。R4 的成员判据下，报 0 = 不是任何 extent 的成员 = 整块盘都是垃圾；
+  又因为宽限计数器 key 是 (node, extent)，三个节点全报 0 ⇒ 共用同一个计数器 ⇒ 每人报一次就把三轮宽限烧完，
+  第三个来问的节点被告知删除一个已转换的 extent，它就删了。R4 之前判据是"manager 还认不认识这个 extent"，
+  【根本不依赖上报者】，所以 node_id=0 当时确实无害——发送侧那行注释"manager 只拿它记日志"写下时是真的。
+  修：请求带上 EN 真正拥有的 node_uuid，manager 解析 node_id→uuid，解析不出来就【什么判决都不给】(fail closed)。
+  三个 R4 单测当初伪造了一个 manager 从不知道的 node_id——正是这个虚构掩盖了 bug；现在它们先注册节点，
+  另加两个新测钉死 fail-closed 与 uuid 解析。教训写进设计文档：判据从"对象的属性"变成"对象与提问者的关系"时，
+  所有标识提问者的输入都变成 load-bearing，包括此前被注释为"仅诊断用"的那些。
+  顺带修掉第 3 步的一个重复计数：shard-only entry 把 shard 字节同时放进 len 和 shard_files，
+  导致每个已清理的 extent 在 df 里翻倍（len 语义 = .dat 长度，没有 .dat 就是 0）。
+  门：rpc 60、stream 115 lib + placement_cleanup 6（新）+ payload_location 8 + 其余全绿、
+  manager 279 lib + ec_failover/ec_integration/offline_reconcile/system_extent_recovery/node_lifecycle/
+  silent_corruption_rot/e2e_lifecycle；clippy 数不变(60)；破坏性守卫都做了非空验证。
+  live 3EN 实证：转换后重启 EN → 三个节点各剩【一个】262316B 的 shard，【所有 pre-conversion .dat 全部回收】，
+  8 个 64KiB 值在【全集群没有任何 .dat】的情况下仍逐个字节一致。
+Next steps: 第 6 步（soak + 一个 release 边界后）：删 commit phase(MSG_COMMIT_EC_SHARD/commit_shard_local/
+  finish_ec_commit)、ec.commit marker 及其 load_extents 三态重放；ec.prepared 只有在 nonce 完全接管它的角色
+  之后才能删。注意 §7：这些是【升级中途崩在 rename 里】的节点的修复代码，删之前要么确认没有活的老格式状态，
+  要么加 EN 启动 fail-loud 前置检查。§9 handle_re_avali truncate-in-place 审计仍未做。
+  可选：cleanup backlog 的 admission gate（§8）——目前窗口已由 sweep 界定，backlog 堆积仅在 reconcile 卡住时发生。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-20
 TaskStatus: completed
 Task scope: EC CoW 第 4 步——方案切换（用户："go"）。§10 里唯一"两套方案同时在线"的那个 commit（0e8f4b6）。
