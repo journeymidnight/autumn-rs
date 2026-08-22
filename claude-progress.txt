@@ -1,3 +1,29 @@
+Date: 2026-08-22 (b)
+TaskStatus: completed
+Task scope: §9 handle_re_avali truncate-in-place 审计（设计文档最后一个未做项）。commit 28520d7。
+  设计文档问的是"re_avali 的目标会不会是 manager 仍然计数的副本(avali 位还置着)"。字面答案是【不会】：
+  唯一的下发点(recovery.rs)只在 `(ex.avali & bit) == 0` 时才发 RE_AVALI。
+  但【这个问题问错了】——avali==0 不等于"落后"：manager CLAUDE.md 的 seal-over-reachable 写着
+  "封存时不可达的成员，它的 avali 位就是不置"。也就是说一个仅仅【当时不可达】的成员会带着 avali=0，
+  而它手上可能是全集群【最长】的那份副本；而 stream_extent_from_sources 选源时遍历成员列表，
+  【根本不看 avali】——所以这份文件恰恰就是别的节点做 recovery 时会去拉的源。
+  不被计数让它【更】暴露而不是更安全：没有任何人在看着它。
+  先复现（house rule）：crates/manager/tests/re_avali_no_destroy.rs —— extent 封在高于目标持有量的长度、
+  唯一的 peer 被杀 → 修复不可能成功 → 实测把 4096 字节干成了 0。
+  修：re_avali 改走 peer_copy_full_extent_to_dat（先写 temp、拿到完整 sealed_length 才 atomic rename），
+  修不成就是 no-op。它【没有】reconcile-down 是这条路径上的有意为之：拿更短的 peer 副本盖掉更长的本地副本，
+  正是 re_avali 绝不能做的交易。recovery 继续用 stream_extent_from_sources——它的目标要么是全新的、
+  要么是被证明不完整的残骸，没有东西可失去。【选哪个 helper 的判据是"目标有没有东西可失去"，不是 avali 位】。
+  两个测试互相独立验证过：把修复还原成旧代码 → destroy 测试挂、repair 测试仍过（所以"只会拒绝"的假修复
+  不会被误认成修复）。repair 测试也是 re_avali 有史以来第一份覆盖。
+  门：stream 115 lib、manager 279 lib + re_avali_no_destroy 2 + ec_failover/ec_integration/offline_reconcile/
+  system_extent_recovery/system_recovery_vp_seed/silent_corruption_rot、stream payload_location/
+  placement_cleanup/ec_2pc/extent_restart 全绿。
+Next steps: EC CoW 只剩第 6 步，且【被设计本身 gate 住】：删 commit phase / ec.commit / ec.prepared 要等
+  "soak + 一个 release 边界"。它删的是【升级时崩在 rename 中途】的节点的修复代码，现在删等于赌没有那种状态。
+  真要做时按 §7：要么确认全集群无活的老格式状态(无 .ec.dat/.ec.commit/无老 marker)，要么加 EN 启动 fail-loud 前置检查。
+  ec.prepared 另有前提：nonce 完全接管它的角色之后才能删。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-22
 TaskStatus: completed
 Task scope: EC CoW 第 5 步——file-granular reconcile + cleanup（用户："start"）。commit 2d4a5fd。
