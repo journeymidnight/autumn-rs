@@ -5030,6 +5030,7 @@ mod tests {
     #[test]
     fn reconcile_collects_non_members_only_after_the_verdict_holds() {
         let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
         // Extent 5 exists and node 7 is NOT one of its members.
         {
             let mut s = m.store.inner.borrow_mut();
@@ -5041,6 +5042,7 @@ mod tests {
             let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
+                    node_uuid: String::new(),
                     extent_ids: vec![5],
                 }))
                 .await
@@ -5054,12 +5056,85 @@ mod tests {
         assert_eq!(ask(), vec![5], "round 3: the verdict has held — collect it");
     }
 
+    /// A reporter the manager cannot identify gets NO verdict — not an empty
+    /// membership.
+    ///
+    /// This is the difference between "you are not a member of anything" and "I
+    /// don't know who you are", and it is worth a live extent: the EN does not
+    /// know its own node_id, so it once reported 0. Against a membership
+    /// predicate that made every extent on the node look like garbage, and
+    /// because the grace counter is keyed by (node, extent), three nodes each
+    /// reporting once shared ONE counter and burned the whole grace period in a
+    /// single round apiece. The third node was told to delete a live extent,
+    /// and did.
+    #[test]
+    fn reconcile_gives_no_verdict_to_an_unidentified_reporter() {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 2, 3];
+            s.extents.insert(5, ex);
+        }
+        // Ten rounds — far past the grace period — from a caller with neither a
+        // known id nor a known uuid.
+        for round in 1..=10 {
+            let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 0,
+                    node_uuid: String::new(),
+                    extent_ids: vec![5],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap();
+            assert!(
+                resp.garbage.is_empty() && resp.placements.is_empty(),
+                "round {round}: gave a verdict to a caller it cannot identify"
+            );
+        }
+    }
+
+    /// A node that knows only its UUID (which is all an EN knows — the manager
+    /// assigns node ids) must still get a real answer.
+    #[test]
+    fn reconcile_identifies_a_reporter_by_uuid() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.nodes.get_mut(&7).unwrap().node_uuid = "uuid-of-7".to_string();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 7, 3]; // node 7 IS a member, at slot 1
+            s.extents.insert(5, ex);
+        }
+        let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+            m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                node_id: 0,
+                node_uuid: "uuid-of-7".to_string(),
+                extent_ids: vec![5],
+            }))
+            .await
+            .unwrap()
+        }))
+        .unwrap();
+        assert!(resp.garbage.is_empty(), "a member was collected");
+        assert_eq!(resp.placements.len(), 1);
+        assert_eq!(resp.placements[0].extent_id, 5);
+        assert_eq!(
+            resp.placements[0].shard_index, 1,
+            "the placement must carry this node's own slot"
+        );
+    }
+
     /// A node that IS a member must never be told to delete, no matter how many
     /// rounds pass — and the counter must reset, so a node that briefly looked
     /// like a non-member does not carry that history forever.
     #[test]
     fn reconcile_never_collects_a_member() {
         let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
         {
             let mut s = m.store.inner.borrow_mut();
             let mut ex = test_extent(5, 1, 0);
@@ -5070,6 +5145,7 @@ mod tests {
             let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
+                    node_uuid: String::new(),
                     extent_ids: vec![5],
                 }))
                 .await
@@ -5086,6 +5162,7 @@ mod tests {
     #[test]
     fn reconcile_does_not_collect_an_extent_with_an_op_in_flight() {
         let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
         {
             let mut s = m.store.inner.borrow_mut();
             let mut ex = test_extent(5, 1, 0);
@@ -5109,6 +5186,7 @@ mod tests {
             let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
+                    node_uuid: String::new(),
                     extent_ids: vec![5],
                 }))
                 .await

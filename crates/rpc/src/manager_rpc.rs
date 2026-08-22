@@ -788,17 +788,50 @@ pub struct RegisterPartitionAddrReq {
 // queue was lost to a manager restart).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ReconcileExtentsReq {
+    /// The reporter's numeric id, or `0` when it does not know it — the EN is
+    /// told its UUID at format time, not its id.
     pub node_id: u64,
+    /// The reporter's STABLE identity, which the manager resolves to a node_id.
+    ///
+    /// This is load-bearing, not diagnostic: every verdict in the response is
+    /// relative to "what should THIS node hold", so a reporter the manager
+    /// cannot identify gets NO verdict at all. Empty only from a node that was
+    /// started without `--advertise` (test/pre-registration).
+    pub node_uuid: String,
     pub extent_ids: Vec<u64>,
+}
+
+/// Where ONE node should keep ONE extent's payload — the manager's answer to
+/// "what am I supposed to be holding?".
+///
+/// This is what makes the reconcile file-granular. An extent-granular answer
+/// can only say "you should not have this extent at all"; it cannot say **keep
+/// the extent, drop the `.dat`**, which is exactly the post-conversion cleanup.
+/// From `(payload_location, shard_index)` the node derives the ONE payload file
+/// it should hold, and anything else it holds for that extent is residue —
+/// covering both a redundant pre-conversion `.dat` and the shards of an
+/// abandoned attempt, with no second mechanism.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentPlacement {
+    pub extent_id: u64,
+    /// `extent_rpc::PayloadLocation` as a byte.
+    pub payload_location: u8,
+    /// This node's position in `replicates ++ parity`, which IS its shard index
+    /// when the location is `InShardFile`. Meaningless (and 0) for `InDat`.
+    pub shard_index: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ReconcileExtentsResp {
     pub code: u8,
     pub message: String,
-    /// Subset of `req.extent_ids` that the manager no longer knows about.
-    /// Node should unlink the corresponding `.dat` + `.meta` files.
+    /// Subset of `req.extent_ids` this node is not a member of. Delete
+    /// everything: `.dat`, `.meta`, and every shard file.
     pub garbage: Vec<u64>,
+    /// Placement for each reported extent this node IS a member of. An extent
+    /// reported by the node but absent from BOTH lists has no verdict this
+    /// round (the manager is unsure) and must be left strictly alone.
+    pub placements: Vec<ExtentPlacement>,
 }
 
 // ── Extent node RPC types needed by the manager ────────────────────────────

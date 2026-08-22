@@ -166,9 +166,27 @@ CoW-shared across partitions after a split, so **never delete an extent with
 hands it to `enqueue_pending_deletes`. `extent_delete_loop` (2 s) fans out
 `EXT_MSG_DELETE_EXTENT` to each replica; after 60 failed sweeps the entry moves to
 the persisted `extentDeleteRetry/` queue (`extent_delete_retry_loop`, 1 min,
-exponential backoff 60 s → 1 hr). Orphan `.dat`/`.meta` are the reconcile backstop:
-on EN startup the node sends every loaded `extent_id` via `MSG_RECONCILE_EXTENTS`
-and unlinks the subset no longer in `s.extents`. Etcd-first ordering: the queue push
+exponential backoff 60 s → 1 hr). Orphan files are the reconcile backstop: on EN startup (and every 5 min) the node
+sends every loaded `extent_id` via `MSG_RECONCILE_EXTENTS` and the manager
+answers **file-granularly** — `garbage` (not a member: delete everything) plus
+`placements` (`payload_location` + this node's slot as its shard index). The node
+keeps the ONE named payload file and drops the rest, which is how a converted
+extent's redundant `.dat` is reclaimed and how an abandoned attempt's shards are
+swept, under one rule. **Any extent with an in-flight ledger op is omitted from
+both lists** — its file set is mid-change, and only the manager knows about an
+attempt driven from another node.
+
+**The reporter must be IDENTIFIED or it gets no verdict at all.** Every answer
+is relative to one node ("you are not a member of this", "your payload is in
+that file"), so the manager resolves `node_id`, else `node_uuid`, and on failure
+returns empty lists with a WARN. This is not defensive coding: the EN does not
+know its own node_id (the manager assigns it) and once reported `0`, which under
+a membership predicate made every extent on it look like garbage — and because
+the grace counter is keyed `(node, extent)`, three nodes reporting `0` shared ONE
+counter and burned the entire grace period in a single round each. The third
+node was told to delete a live extent. Identity was diagnostic before membership
+made it load-bearing; a node without `--advertise` now gets no cleanup, which is
+the correct direction to fail. Etcd-first ordering: the queue push
 happens only after the mirror returns OK, so a failed mirror never schedules a stale
 unlink.
 

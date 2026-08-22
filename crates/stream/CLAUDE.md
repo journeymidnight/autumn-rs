@@ -462,8 +462,32 @@ belt-and-braces for leader-failover where `pending_extent_deletes` is lost but
 `ExtentNode::new` spawns `spawn_reconcile_orphans_loop()` after
 `load_extents()`: runs immediately, then every 5 minutes. Each iteration ships
 every locally-loaded (shard-owned) `extent_id` to the manager via
-`MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the subset **this node is not
-a MEMBER of** (`replicates ++ parity`), not merely the subset it has forgotten —
+`MSG_RECONCILE_EXTENTS = 0x31`. The answer is **file-granular**: `garbage`
+(extents this node is not a member of — delete everything) plus `placements`
+(`extent_id, payload_location, shard_index` for each extent it IS a member of).
+From a placement the node derives the ONE payload file it should hold; anything
+else it holds for that extent is residue. That single rule covers both halves of
+CoW-conversion cleanup — dropping the redundant pre-conversion `.dat` after the
+flip, and dropping an abandoned attempt's shards when the layout still says
+`InDat` — with no second mechanism and no intent marker (a crash mid-cleanup is
+resolved by startup discovery re-deriving what is on disk).
+
+**An extent in NEITHER list has no verdict and is left strictly alone.** The
+manager omits any extent with an in-flight ledger op, because its file set is
+mid-change: a participant staging a shard for a not-yet-flipped conversion holds
+a file the current layout does not name, and the node-side `ec_convert_inflight`
+guard only sees conversions THIS node coordinates.
+
+Deleting a payload file is destructive, so `apply_placements` gates it three
+ways: **the keeper must already be here** (`.dat` is dropped only once the named
+shard is actually held — otherwise a placement arriving before staging finishes
+would delete the only copy), **no in-flight op**, and **only the manager
+decides** (a node holding a complete shard beside a complete `.dat` cannot tell
+which one the cluster is pointed at). The `.dat` transition stops serving
+(`has_dat=false`, `len=0`, fd dropped, `FdLru::forget`) BEFORE the unlink, so no
+read resolves an fd to a file that is about to vanish.
+
+The rest of the sweep returns the subset **this node is not a MEMBER of** (`replicates ++ parity`), not merely the subset it has forgotten —
 crash residue from a died-mid-copy recovery belongs to an extent that is very
 much alive, so a "forgotten extent" predicate can never see it. The node unlinks
 those via `remove_extent_files`, **skipping any extent with a live

@@ -1031,10 +1031,23 @@ impl ExtentEntry {
         self.shard_files.borrow_mut().insert(shard_index, len);
     }
 
-    /// Bytes this extent's shard files occupy on this node. `.dat` is `len` and
-    /// is counted separately — a node mid-conversion legitimately holds both,
-    /// and reporting only one would under-count the disk footprint that the
-    /// allocation gate and cluster-df both read.
+    /// Forget a shard file this node no longer holds. Call AFTER the unlink, so
+    /// the entry never advertises a file that is gone.
+    fn forget_shard_file(&self, shard_index: u32) {
+        self.shard_files.borrow_mut().remove(&shard_index);
+    }
+
+    fn shard_index_list(&self) -> Vec<u32> {
+        self.shard_files.borrow().keys().copied().collect()
+    }
+
+    /// Bytes this extent's shard files occupy on this node.
+    ///
+    /// `.dat` is `len`, counted separately: a node mid-conversion legitimately
+    /// holds BOTH, so reporting one under-counts the footprint the allocation
+    /// gate and cluster-df read. The converse matters just as much — `len` is
+    /// the `.dat` length and is 0 when there is no `.dat`, or the two would
+    /// double-count the same bytes.
     fn shard_bytes(&self) -> u64 {
         self.shard_files.borrow().values().sum()
     }
@@ -3471,10 +3484,13 @@ impl ExtentNode {
             return Ok(());
         }
         let req = manager_rpc::rkyv_encode(&manager_rpc::ReconcileExtentsReq {
-            // node_id 0 — the extent-node doesn't track its own node_id
-            // (assigned by manager at register-time, not threaded down).
-            // Manager uses this only for logging.
+            // The EN does not track its own node_id (the manager assigns it at
+            // register time); its UUID is the identity it does hold, and the
+            // manager resolves the two. Sending an unidentified request is not
+            // an option: every verdict in the answer is "what should THIS node
+            // hold", so the manager answers nothing without knowing who asked.
             node_id: 0,
+            node_uuid: self.registration.node_uuid.clone(),
             extent_ids: extent_ids.clone(),
         });
         // 10 s — read-only manager call (returns subset of submitted
@@ -3498,6 +3514,7 @@ impl ExtentNode {
                 resp.message,
             ));
         }
+        self.apply_placements(&resp.placements).await;
         if resp.garbage.is_empty() {
             return Ok(());
         }
@@ -3544,6 +3561,99 @@ impl ExtentNode {
             }
         }
         Ok(())
+    }
+
+    /// Drop the payload files the manager says this node should NOT be
+    /// holding for extents it IS a member of — the "keep the extent, drop the
+    /// `.dat`" half of the reconcile, plus the shards of an abandoned attempt.
+    ///
+    /// The rule is one sentence: an extent has exactly ONE payload file here,
+    /// the one the placement names; everything else is residue. Both post-flip
+    /// cleanup and rollback cleanup fall out of it, with no second mechanism
+    /// and no intent marker — a crash mid-cleanup is resolved by startup
+    /// discovery re-deriving what is on disk.
+    ///
+    /// Deleting a payload file is DESTRUCTIVE, so it is gated three ways:
+    ///
+    /// 1. **The keeper must already be here.** `.dat` is dropped only once this
+    ///    node actually holds the shard file the layout names. Otherwise a
+    ///    placement arriving before the shard is staged — or naming a shard
+    ///    this node never received — would delete the only copy it has.
+    /// 2. **No in-flight op on the extent**, matching the garbage path and
+    ///    `handle_delete_extent`: a recovery is mid-write into one of these
+    ///    files.
+    /// 3. **Only the manager decides.** The location comes from the placement;
+    ///    the node never infers from what it happens to hold. A node with a
+    ///    complete shard beside a complete `.dat` cannot tell which one the
+    ///    cluster is pointed at — only the layout knows.
+    async fn apply_placements(&self, placements: &[manager_rpc::ExtentPlacement]) {
+        for p in placements {
+            let want = PayloadRef::for_extent(p.payload_location, p.shard_index);
+            let Some(entry) = self.extents.get(&p.extent_id).map(|e| Rc::clone(e.value())) else {
+                continue;
+            };
+            if self.recovery_inflight.contains_key(&p.extent_id)
+                || self.ec_convert_inflight.contains_key(&p.extent_id)
+            {
+                continue;
+            }
+            if !entry.holds_payload(want) {
+                // The file we are told to keep is not here yet. Never delete
+                // the other one on the strength of an instruction we cannot
+                // yet satisfy.
+                continue;
+            }
+            let Ok(disk) = self.disk_for(entry.disk_id) else {
+                continue;
+            };
+
+            // Residual shard files: every index except the kept one.
+            let stale_shards: Vec<u32> = entry
+                .shard_index_list()
+                .into_iter()
+                .filter(|i| want.location != PayloadLocation::InShardFile || *i != want.shard_index)
+                .collect();
+            for idx in stale_shards {
+                let path = disk.shard_path(p.extent_id, idx);
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) | Err(_) => {}
+                }
+                entry.forget_shard_file(idx);
+                tracing::info!(
+                    extent_id = p.extent_id,
+                    shard_index = idx,
+                    "reconcile: dropped a shard file this node should not hold"
+                );
+            }
+
+            // A redundant `.dat`, once the shard that replaced it is in hand.
+            if want.location == PayloadLocation::InShardFile && entry.has_dat.load(Ordering::SeqCst)
+            {
+                // Order matters: stop serving `.dat` BEFORE unlinking it, so no
+                // read can resolve an fd to a file that is about to vanish.
+                entry.has_dat.store(false, Ordering::SeqCst);
+                entry.len.store(0, Ordering::SeqCst);
+                *entry.file.borrow_mut() = None;
+                self.fd_lru.forget(p.extent_id);
+                if let Err(e) = compio::fs::remove_file(&disk.extent_path(p.extent_id)).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        // Left for the next sweep; the entry already stopped
+                        // serving it, which is the part that must not be wrong.
+                        tracing::warn!(
+                            extent_id = p.extent_id,
+                            error = %e,
+                            "reconcile: could not unlink the redundant .dat (retried next sweep)"
+                        );
+                        continue;
+                    }
+                }
+                tracing::info!(
+                    extent_id = p.extent_id,
+                    shard_index = want.shard_index,
+                    "reconcile: reclaimed the pre-conversion .dat; this node now serves its shard"
+                );
+            }
+        }
     }
 
     /// does this shard own `extent_id`?
@@ -4235,7 +4345,11 @@ impl ExtentNode {
                     shard_files: RefCell::new(Default::default()),
                     file: RefCell::new(None),
                     extent_id,
-                    len: AtomicU64::new(shard_len),
+                    // `len` is the `.dat` length, and there is no `.dat` here.
+                    // The shard's bytes are accounted in `shard_files`; putting
+                    // them in both would double-count this extent in every
+                    // footprint `df` reports.
+                    len: AtomicU64::new(0),
                     eversion: AtomicU64::new(meta.eversion),
                     sealed_length: AtomicU64::new(meta.sealed_length),
                     sealed: AtomicBool::new(meta.sealed),
@@ -4243,7 +4357,7 @@ impl ExtentNode {
                     owner_epoch: AtomicI64::new(meta.owner_epoch),
                     durable_owner_epoch: AtomicI64::new(meta.owner_epoch),
                     disk_id: disk.disk_id,
-                    coalescer: Coalescer::new(shard_len),
+                    coalescer: Coalescer::new(0),
                     owner: RefCell::new(OwnerMailbox::default()),
                     corrupt_meta: AtomicBool::new(corrupt_meta),
                 });
@@ -8559,6 +8673,21 @@ impl ExtentNode {
             .await?;
 
         Ok(CommitEcShardResp { code: CODE_OK }.encode())
+    }
+
+    /// Run the placement-cleanup pass directly, for integration tests that
+    /// exercise the destructive half without standing up a manager to answer a
+    /// reconcile. `(extent_id, payload_location, shard_index)` per placement.
+    pub async fn test_apply_placements(&self, placements: &[(u64, u8, u32)]) {
+        let ps: Vec<manager_rpc::ExtentPlacement> = placements
+            .iter()
+            .map(|(extent_id, payload_location, shard_index)| manager_rpc::ExtentPlacement {
+                extent_id: *extent_id,
+                payload_location: *payload_location,
+                shard_index: *shard_index,
+            })
+            .collect();
+        self.apply_placements(&ps).await;
     }
 
     /// Expose the recovery_inflight map for integration tests. The Rc clone

@@ -383,7 +383,18 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   a node does not hold the named file. The manager keeps the location in
     //   a sibling etcd key, so the persisted `MgrExtentInfo` is untouched and
     //   every existing extent reads as `InDat`.
-    (29, "92b10b22701423fa"),
+    //   v29 refreshed IN PLACE again (still undeployed): the reconcile answer
+    //   became FILE-granular — `ReconcileExtentsResp` grew `placements:
+    //   Vec<ExtentPlacement{extent_id, payload_location, shard_index}>` beside
+    //   `garbage`. An extent-granular answer can only say "you should not have
+    //   this extent"; it cannot say "keep the extent, drop the `.dat`", which
+    //   is the post-conversion cleanup. An extent in NEITHER list has no
+    //   verdict this round and is left alone.
+    //   Same in-place v29 refresh also gave `ReconcileExtentsReq` a
+    //   `node_uuid`: every verdict in the answer is relative to ONE node, and
+    //   the EN knows only its uuid (the manager assigns node ids), so a
+    //   reporter it cannot resolve gets no verdict at all.
+    (29, "3b8bde9f7e73931b"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

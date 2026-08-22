@@ -5045,16 +5045,15 @@ impl AutumnManager {
             );
         }
 
-        // Until the cleanup driver lands, a converted extent keeps BOTH forms:
-        // the shards, and the `.dat` they were derived from. Per extent that
-        // peak is unchanged (they always coexisted mid-conversion) — what has
-        // changed is the DURATION, which is now unbounded. Say so on every
-        // conversion, because the fleet-aggregate cost is the operator's to
-        // watch and nothing reclaims it yet.
-        tracing::warn!(
+        // Both forms coexist from staging until the reconcile reclaims the
+        // pre-conversion `.dat` (see `apply_placements`), so the window is
+        // bounded by the sweep interval rather than unbounded — but a stalled
+        // reconcile still holds it open, which is worth a line when a
+        // conversion begins.
+        tracing::info!(
             extent_id,
-            "EC conversion started: the pre-conversion .dat is NOT reclaimed yet \
-             (no cleanup driver) — both forms occupy disk until one exists"
+            "EC conversion started: both the shards and the pre-conversion .dat \
+             occupy disk until the reconcile reclaims the .dat"
         );
 
         Self::force_ec_resp(
@@ -5497,9 +5496,11 @@ impl AutumnManager {
         }
     }
 
-    /// extent-node startup orphan reconcile. Node sends every
-    /// `extent_id` it found on disk; we return those that are no longer
-    /// in `s.extents`. The node then unlinks the corresponding files.
+    /// Tell a node what it should be holding. It sends every `extent_id` it
+    /// found on disk; the answer sorts them into `garbage` (not a member —
+    /// delete everything) and `placements` (a member — here is the ONE payload
+    /// file you should have). Anything the node holds beyond that is residue.
+    ///
     /// Best-effort: failure is logged on the node side but doesn't block
     /// startup. Read-only with respect to manager state.
     pub(crate) async fn handle_reconcile_extents(&self, payload: Bytes) -> HandlerResult {
@@ -5508,10 +5509,50 @@ impl AutumnManager {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
                 garbage: Vec::new(),
+                placements: Vec::new(),
             }));
         }
         let req: ReconcileExtentsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // WHO IS ASKING? Every verdict below is relative to one node — "you are
+        // not a member of this", "your payload lives in that file" — so an
+        // unidentified reporter gets NO verdict. Answering with a node_id of 0
+        // would make the caller a member of nothing and mark its entire disk as
+        // garbage, and because the grace counter is keyed by (node, extent),
+        // several unidentified nodes would share one counter and burn the grace
+        // in a single round each. FAIL CLOSED: never tell a caller you cannot
+        // identify to delete anything.
+        let node_id = {
+            let s = self.store.inner.borrow();
+            if req.node_id != 0 && s.nodes.contains_key(&req.node_id) {
+                Some(req.node_id)
+            } else if !req.node_uuid.is_empty() {
+                s.nodes
+                    .iter()
+                    .find(|(_, n)| n.node_uuid == req.node_uuid)
+                    .map(|(id, _)| *id)
+            } else {
+                None
+            }
+        };
+        let Some(node_id) = node_id else {
+            tracing::warn!(
+                reported_node_id = req.node_id,
+                node_uuid = %req.node_uuid,
+                local_extents = req.extent_ids.len(),
+                "reconcile_extents: cannot identify the reporting node — returning no verdict \
+                 (nothing is deleted on behalf of an unidentified caller)"
+            );
+            return Ok(rkyv_encode(&ReconcileExtentsResp {
+                code: CODE_OK,
+                message: "reporter not identified; no verdict".to_string(),
+                garbage: Vec::new(),
+                placements: Vec::new(),
+            }));
+        };
+        let req = ReconcileExtentsReq { node_id, ..req };
+
         // Two kinds of garbage, with deliberately different confidence:
         //
         //   1. the manager has FORGOTTEN the extent → collect immediately (it
@@ -5530,6 +5571,7 @@ impl AutumnManager {
         // freshly promoted leader is still settling — and deleting real data on a
         // transient is far worse than holding residue for a few more minutes.
         const NON_MEMBER_ROUNDS_BEFORE_GC: u32 = 3;
+        let mut placements: Vec<ExtentPlacement> = Vec::new();
         let garbage: Vec<u64> = {
             let s = self.store.inner.borrow();
             let mut seen = self.reconcile_non_member.borrow_mut();
@@ -5547,16 +5589,31 @@ impl AutumnManager {
                         seen.remove(&(req.node_id, *eid));
                         return true;
                     };
-                    if Self::extent_nodes(ex).contains(&req.node_id) {
+                    // An op in flight on this extent means the file set is
+                    // MID-CHANGE, so no verdict can be given: a participant
+                    // staging a shard for a not-yet-flipped conversion holds a
+                    // file the current layout does not name, and a recovery
+                    // target is writing the copy that will make it a member.
+                    // The node-side guards only see the ops that node itself
+                    // runs — the manager is the only party that knows about an
+                    // attempt driven from elsewhere.
+                    if self.extent_inflight_op(*eid).is_some() {
                         seen.remove(&(req.node_id, *eid));
                         return false;
                     }
-                    // A node running a recovery for this extent is a legitimate
-                    // non-member — it is BUILDING the copy it will become a
-                    // member with. The EN refuses such a delete anyway; not
-                    // listing it keeps the two sides from disagreeing.
-                    if self.extent_inflight_op(*eid).is_some() {
+                    if let Some(slot) = Self::extent_nodes(ex)
+                        .iter()
+                        .position(|n| *n == req.node_id)
+                    {
                         seen.remove(&(req.node_id, *eid));
+                        // A member: tell it WHICH file it should be holding, so
+                        // it can drop the other one. The slot in
+                        // `replicates ++ parity` is this node's shard index.
+                        placements.push(ExtentPlacement {
+                            extent_id: *eid,
+                            payload_location: self.payload_location_of(*eid).as_byte(),
+                            shard_index: slot as u32,
+                        });
                         return false;
                     }
                     // (2) non-member — count the rounds.
@@ -5578,6 +5635,7 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             garbage,
+            placements,
         }))
     }
 

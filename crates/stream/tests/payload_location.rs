@@ -277,3 +277,43 @@ async fn df_counts_shard_bytes() {
         "the shard file's bytes must appear in the disk footprint"
     );
 }
+
+/// A shard-only extent must be counted ONCE. `len` is the `.dat` length and
+/// there is no `.dat`, so if the shard's bytes were also parked there, every
+/// converted extent would inflate the footprint that cluster-df and the
+/// allocation free-space gate both read.
+#[compio::test]
+async fn a_shard_only_extent_is_counted_once() {
+    let node_dir = tempfile::tempdir().expect("node tempdir");
+    let addr = pick_addr();
+    start_node(node_dir.path(), addr).await;
+    let conn = TestConn::new(addr);
+
+    let extent_id: u64 = 9114;
+    assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
+    assert_eq!(
+        conn.append(extent_id, 1, 0, 0, vec![0x33u8; 2048]).await.code,
+        CODE_OK
+    );
+
+    // Post-cleanup shape: shard only, `.dat` reclaimed.
+    let dir = extent_dir(node_dir.path(), extent_id);
+    std::fs::write(dir.join(format!("extent-{extent_id}.shard0")), vec![9u8; 700])
+        .expect("plant shard");
+    std::fs::remove_file(dir.join(format!("extent-{extent_id}.dat"))).expect("drop .dat");
+
+    let addr2 = pick_addr();
+    start_node(node_dir.path(), addr2).await;
+    let bytes: u64 = TestConn::new(addr2)
+        .df(vec![], vec![])
+        .await
+        .disk_status
+        .iter()
+        .map(|(_, d)| d.extent_bytes)
+        .sum();
+
+    assert_eq!(
+        bytes, 700,
+        "a shard-only extent must report exactly its shard's bytes"
+    );
+}

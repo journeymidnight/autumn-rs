@@ -237,6 +237,19 @@ pub fn start_partition_server_stoppable(
 
 /// Register an extent node with the manager.
 pub async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> RegisterNodeResp {
+    register_node_with_uuid(mgr, addr, disk_uuid, "").await
+}
+
+/// `register_node` that also gives the node its own stable identity — what a
+/// real EN does at startup with `--advertise`. Needed by anything that asks the
+/// manager a question ABOUT a specific node (the reconcile answers "what should
+/// THIS node hold", so it must be able to resolve the caller).
+pub async fn register_node_with_uuid(
+    mgr: &RpcClient,
+    addr: &str,
+    disk_uuid: &str,
+    node_uuid: &str,
+) -> RegisterNodeResp {
     let resp = mgr
         .call(
             MSG_REGISTER_NODE,
@@ -245,7 +258,7 @@ pub async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> Regi
                 disk_uuids: vec![disk_uuid.to_string()],
                 shard_ports: vec![],
                 control_address: String::new(),
-                node_uuid: String::new(),
+                node_uuid: node_uuid.to_string(),
             }),
         )
         .await

@@ -97,9 +97,27 @@ fn startup_reconcile_unlinks_orphans() {
     let n_addr = pick_addr();
     let n_dir_path = n_dir.path().to_path_buf();
     let mgr_addr_str = mgr_addr.to_string();
+    // Register FIRST, so the node exists in the manager before it asks: every
+    // reconcile verdict is relative to one node, and a reporter the manager
+    // cannot identify is told nothing (it would otherwise look like a member of
+    // nothing, i.e. its whole disk is garbage).
+    let n_addr_str = n_addr.to_string();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        register_node_with_uuid(
+            &RpcClient::connect(mgr_addr).await.expect("mgr"),
+            &n_addr_str,
+            "disk-f109-rec-1",
+            "uuid-f109-rec-1",
+        )
+        .await;
+    });
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let cfg = ExtentNodeConfig::new(n_dir_path, 8001).with_manager_endpoint(mgr_addr_str);
+            let cfg = ExtentNodeConfig::new(n_dir_path, 8001)
+                .with_manager_endpoint(mgr_addr_str)
+                // A real boot self-registers with `--advertise`; the uuid it
+                // carries is how the manager knows which node is asking.
+                .with_registration("uuid-f109-rec-1", n_addr.to_string(), vec![]);
             let n = ExtentNode::new(cfg).await.expect("extent node new");
             let _ = n.serve(n_addr).await;
         });
@@ -107,17 +125,6 @@ fn startup_reconcile_unlinks_orphans() {
     std::thread::sleep(Duration::from_millis(400));
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        // Register the node so the manager has a `MgrNodeInfo` for it
-        // (not strictly needed for reconcile, but matches a real boot).
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
-        let _ = mgr; // keep alive
-        register_node(
-            &RpcClient::connect(mgr_addr).await.expect("mgr"),
-            &n_addr.to_string(),
-            "uuid-f109-rec-1",
-        )
-        .await;
-
         // Reconcile happens during ExtentNode::new (BEFORE serve()), so
         // by the time we observe the dir, the orphan should already be
         // unlinked. Poll briefly to absorb any startup jitter.
