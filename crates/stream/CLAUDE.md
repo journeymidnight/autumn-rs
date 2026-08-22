@@ -395,8 +395,25 @@ a node comes back):
   `EXT_MSG_REQUIRE_RECOVERY` → `run_ec_recovery_payload`. The OK also auto-heals
   buggy `avali` etcd values (the manager ORs in the parity-slot bit on OK).
 - If local data >= `sealed_length` → already up to date, return OK.
-- Otherwise copy full extent from peers, truncate, rewrite, sync (acquires an
-  `acquire_recovery()` permit for the peer-fetch, same shared pool as recovery).
+- Otherwise **temp-then-publish** via `peer_copy_full_extent_to_dat` (acquires an
+  `acquire_recovery()` permit, same shared pool as recovery).
+
+  **Never `stream_extent_from_sources` here.** That helper truncates the
+  destination to 0 before each source attempt, which is correct when the
+  destination has nothing to lose (a fresh or provably-incomplete recovery
+  target) and DESTRUCTIVE here, where the destination is an existing copy: if
+  no source can deliver, the replica ends up holding less than it started with
+  (reproduced 4096 → 0 in `crates/manager/tests/re_avali_no_destroy.rs`).
+
+  Those bytes are worth protecting even though `avali == 0` is what aimed
+  repair at this replica. **`avali == 0` does not mean "lagging"** — a member
+  merely UNREACHABLE at seal time has its bit left unset (manager CLAUDE.md,
+  seal-over-reachable) while possibly holding the LONGEST copy in the cluster,
+  and `stream_extent_from_sources` picks its sources from the member list
+  WITHOUT consulting `avali`, so this file is exactly what another node's
+  recovery would rebuild from. The absence of reconcile-down in
+  `peer_copy_full_extent_to_dat` is deliberate on this path: adopting a SHORTER
+  peer copy over a longer local one is the trade re_avali must not make.
 
 ### Heartbeat & Df
 

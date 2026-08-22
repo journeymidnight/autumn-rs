@@ -390,6 +390,22 @@ via temp-then-publish (`peer_copy_full_extent_to_dat:7188`).
 manager still counts (i.e. whether its `avali` bit can be set at that moment). If
 it can, move that path to temp-then-publish. Tracked separately from this design.
 
+**RESOLVED — and the question above was the wrong one.** The literal answer is
+no: the sole dispatcher (`recovery.rs`) fires only when `(ex.avali & bit) == 0`.
+But `avali == 0` does not mean "lagging". A member merely UNREACHABLE at seal
+time has its bit left unset (seal-over-reachable) while possibly holding the
+LONGEST copy in the cluster — and `stream_extent_from_sources` selects its
+sources from the member list WITHOUT consulting `avali`, so that copy is exactly
+what another node's recovery would rebuild from. Being uncounted made the file
+*more* exposed, not less: nothing was watching it.
+
+Reproduced (`crates/manager/tests/re_avali_no_destroy.rs`): an extent sealed
+above what the target holds, its only peer down — the refill destroys 4096 bytes
+and leaves 0. Fixed by routing re_avali through `peer_copy_full_extent_to_dat`.
+Recovery keeps `stream_extent_from_sources`: truncate-to-0 is correct when the
+destination has nothing to lose and destructive when it is an existing copy —
+that distinction, not the `avali` bit, is what selects the right helper.
+
 ---
 
 ## 10. Implementation order

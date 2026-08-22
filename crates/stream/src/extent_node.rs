@@ -7639,29 +7639,34 @@ impl ExtentNode {
         // (env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`, default 2).
         let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
 
-        // Stage C: stream the full extent from a healthy peer chunk-by-chunk
-        // straight into the file (peak = one FILE_IO_CHUNK_BYTES chunk) instead
-        // of buffering the whole extent in a Vec before writeback. stream_*
-        // succeeds only on a full sealed_length transfer (a short/failed source
-        // is retried against the next, all-failed → Err → CODE_ERROR), so the
-        // pre-this explicit "payload too short" check is subsumed.
-        let payload_len = match self
-            .stream_extent_from_sources(&extent_info, &[], &extent)
+        // TEMP-THEN-PUBLISH. The destination here is an EXISTING copy, so it
+        // has something to lose: `stream_extent_from_sources` truncates the
+        // destination to 0 before each source attempt, and if no source can
+        // deliver, this replica is left holding LESS than it started with —
+        // reproduced as 4096 bytes → 0 in
+        // `crates/manager/tests/re_avali_no_destroy.rs`.
+        //
+        // Those bytes matter. `avali == 0` is what aims repair at this replica,
+        // but it does not mean "lagging": a member that was merely UNREACHABLE
+        // when the extent was sealed has its bit left unset (manager
+        // CLAUDE.md, seal-over-reachable) while possibly holding the LONGEST
+        // copy in the cluster — and every recovery elsewhere picks its sources
+        // from the member list without consulting `avali`, so this file is
+        // exactly what another node would rebuild from.
+        //
+        // `peer_copy_full_extent_to_dat` streams into a temp and atomic-renames
+        // only once a FULL `sealed_length` copy has landed, so a repair that
+        // cannot succeed is a no-op. It also deliberately has no reconcile-down
+        // for an over-promised seal: adopting a SHORTER peer copy over a longer
+        // local one is precisely the trade this path must not make. Recovery
+        // keeps `stream_extent_from_sources` — its destination is a fresh or
+        // provably-incomplete replica, which has nothing to lose.
+        if let Err((_, msg)) = self
+            .peer_copy_full_extent_to_dat(req.extent_id, &extent, &extent_info, extent_info.sealed_length)
             .await
         {
-            Ok(n) => n,
-            Err(err) => {
-                return code_resp(CODE_ERROR, err);
-            }
-        };
-        // re_avali repairs a SEALED extent — re-open on miss.
-        self.extent_file(&extent)
-            .await
-            .map_err(|e| (StatusCode::Internal, e))?
-            .sync_data()
-            .await
-            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        extent.len.store(payload_len, Ordering::SeqCst);
+            return code_resp(CODE_ERROR, msg);
+        }
 
         // P0-A (coco): the post-repair seal `.meta` must be durable before we
         // report success — the data is now filled + fsync'd, but if this
