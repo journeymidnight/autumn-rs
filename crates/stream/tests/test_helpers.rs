@@ -22,14 +22,18 @@ pub fn pick_addr() -> SocketAddr {
 
 /// Start an ExtentNode on the given address (single-disk).
 /// Returns after the server is listening.
-pub async fn start_node(data_dir: &std::path::Path, addr: SocketAddr) {
+pub async fn start_node(data_dir: &std::path::Path, addr: SocketAddr) -> ExtentNode {
     let config = ExtentNodeConfig::new(data_dir.to_path_buf(), 1);
     let node = ExtentNode::new(config).await.expect("create ExtentNode");
+    // The returned handle SHARES state with the served node (Rc interior), so a
+    // test can drive it directly as well as over RPC.
+    let served = node.clone();
     compio::runtime::spawn(async move {
-        let _ = node.serve(addr).await;
+        let _ = served.serve(addr).await;
     })
     .detach();
     compio::time::sleep(Duration::from_millis(120)).await;
+    node
 }
 
 /// Start a multi-disk ExtentNode.
@@ -248,42 +252,4 @@ impl TestConn {
         WriteShardResp::decode(resp).expect("decode WriteShardResp")
     }
 
-    pub async fn commit_ec_shard(
-        &self,
-        extent_id: u64,
-        sealed_length: u64,
-        eversion: u64,
-    ) -> CommitEcShardResp {
-        let req = CommitEcShardReq {
-            extent_id,
-            sealed_length,
-            eversion,
-            // tests pass 0 (no-fence sentinel).
-            owner_epoch: 0,
-        };
-        let resp = self
-            .pool
-            .call(&self.addr, MSG_COMMIT_EC_SHARD, req.encode())
-            .await
-            .expect("commit_ec_shard RPC");
-        CommitEcShardResp::decode(resp).expect("decode CommitEcShardResp")
-    }
-}
-
-/// Plant an `extent-{id}.ec.dat` exactly as the PRE-CoW binary would have left
-/// it, so a test can drive the RETAINED commit path (`MSG_COMMIT_EC_SHARD` and
-/// the `ec.commit` marker replay) — the repair code for a node upgraded
-/// mid-rename. Nothing in this build creates `.ec.dat` any more: conversion
-/// stages into `extent-{id}.shard{i}` and the manager's layout flip is the
-/// only commit point.
-pub fn plant_legacy_ec_staging(root: &std::path::Path, extent_id: u64, bytes: &[u8]) {
-    for byte in 0u8..=255 {
-        let sub = root.join(format!("{byte:02x}"));
-        if sub.join(format!("extent-{extent_id}.dat")).exists() {
-            std::fs::write(sub.join(format!("extent-{extent_id}.ec.dat")), bytes)
-                .expect("plant .ec.dat");
-            return;
-        }
-    }
-    panic!("no .dat found for extent {extent_id}");
 }

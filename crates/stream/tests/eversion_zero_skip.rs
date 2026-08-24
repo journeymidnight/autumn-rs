@@ -31,24 +31,24 @@ use test_helpers::{pick_addr, start_node, TestConn};
 async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
-    start_node(node_dir.path(), addr).await;
+    let node = start_node(node_dir.path(), addr).await;
     let conn = TestConn::new(addr);
 
     let extent_id: u64 = 7777;
     let alloc = conn.alloc_extent(extent_id).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    // Pretend we're the EC coordinator's 2PC: WriteShard (prepare) writes
-    // the shard to .ec.dat, then CommitEcShard (commit) renames it to
-    // .dat and bumps eversion from 0 to 5, shrinking the on-disk file
-    // to the shard payload (mimicking post-EC state where a value at
-    // offset > shard_len no longer fits).
-    let shard_payload = vec![0xABu8; 1024];
-    // Legacy conversion shape: staging planted as the pre-CoW binary left it,
-    // then published by the retained commit path.
-    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &shard_payload);
-    let cs = conn.commit_ec_shard(extent_id, 1024, 5).await;
-    assert_eq!(cs.code, CODE_OK, "commit_ec_shard should succeed");
+    // Post-EC shape: 1024 bytes of content, sealed at that length, eversion
+    // bumped to 5. A value at an offset past the end no longer fits — which is
+    // what the stale-eversion read below is reaching for.
+    let payload = vec![0xABu8; 1024];
+    assert_eq!(
+        conn.append(extent_id, 1, 0, 0, payload).await.code,
+        CODE_OK
+    );
+    node.test_seal_local(extent_id, 1024, 5)
+        .await
+        .expect("seal");
 
     // A client with stale ExtentInfo (eversion=0 cached when the extent
     // was open) attempts to read past the shard boundary. Pre-fix the
@@ -84,17 +84,16 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
 async fn batched_read_returns_eversion_mismatch_response() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
-    start_node(node_dir.path(), addr).await;
+    let node = start_node(node_dir.path(), addr).await;
     let conn = TestConn::new(addr);
 
     let extent_id: u64 = 7778;
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
-    // Legacy conversion shape: planted staging + the retained commit path,
-    // which bumps eversion to 7.
-    test_helpers::plant_legacy_ec_staging(node_dir.path(), extent_id, &vec![0xCDu8; 1024]);
-    let cs = conn.commit_ec_shard(extent_id, 1024, 7).await;
-    assert_eq!(cs.code, CODE_OK);
+    // Post-seal shape: sealed at 1024, eversion bumped to 7.
+    node.test_seal_local(extent_id, 1024, 7)
+        .await
+        .expect("seal");
 
     // Stale non-zero eversion — pre-fix this hit the batched path's
     // FailedPrecondition error frame, bypassing the client's

@@ -22,7 +22,11 @@ pub const MSG_COPY_EXTENT: u8 = 8;
 pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
 pub const MSG_DELETE_EXTENT: u8 = 11;
-pub const MSG_COMMIT_EC_SHARD: u8 = 12;
+// 12 = MSG_COMMIT_EC_SHARD — retired with the per-node commit phase. EC
+//      conversion is copy-on-write: a shard is staged as an ADDITIVE
+//      `extent-{id}.shard{i}` file and the manager's layout flip is the sole
+//      commit point, so no node ever publishes a shard over its own `.dat`.
+//      The number stays reserved — msg_type values are append-only.
 // 13 = MSG_SYNC_EXTENT — retired when the fsync barrier was
 //      folded into `start_write_batch`'s rotation-trigger `must_sync=true`
 //      batch promotion. A later phase retires the rotation barrier in turn,
@@ -1149,65 +1153,6 @@ impl WriteShardResp {
     pub fn decode(data: Bytes) -> Result<Self, &'static str> {
         if data.is_empty() {
             return Err("write_shard response too short");
-        }
-        Ok(Self { code: data[0] })
-    }
-}
-
-// ── CommitEcShard (binary — phase-2 of 2PC EC conversion) ────────────────────
-
-/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE]
-///
-/// `owner_epoch` fence — see `WriteShardReq` for semantics.
-pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 32;
-
-pub struct CommitEcShardReq {
-    pub extent_id: u64,
-    pub sealed_length: u64,
-    pub eversion: u64,
-    pub owner_epoch: i64,
-}
-
-impl CommitEcShardReq {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(COMMIT_EC_SHARD_HEADER_LEN);
-        buf.put_u64_le(self.extent_id);
-        buf.put_u64_le(self.sealed_length);
-        buf.put_u64_le(self.eversion);
-        buf.put_i64_le(self.owner_epoch);
-        buf.freeze()
-    }
-
-    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < COMMIT_EC_SHARD_HEADER_LEN {
-            return Err("commit_ec_shard request too short");
-        }
-        let extent_id = data.get_u64_le();
-        let sealed_length = data.get_u64_le();
-        let eversion = data.get_u64_le();
-        let owner_epoch = data.get_i64_le();
-        Ok(Self {
-            extent_id,
-            sealed_length,
-            eversion,
-            owner_epoch,
-        })
-    }
-}
-
-/// CommitEcShardResponse: [code: u8]
-pub struct CommitEcShardResp {
-    pub code: u8,
-}
-
-impl CommitEcShardResp {
-    pub fn encode(&self) -> Bytes {
-        Bytes::copy_from_slice(&[self.code])
-    }
-
-    pub fn decode(data: Bytes) -> Result<Self, &'static str> {
-        if data.is_empty() {
-            return Err("commit_ec_shard response too short");
         }
         Ok(Self { code: data[0] })
     }

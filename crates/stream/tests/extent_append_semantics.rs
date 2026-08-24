@@ -61,7 +61,7 @@ async fn append_with_mid_byte_commit_truncates_and_succeeds() {
 async fn batch_append_rejects_sealed_extent_with_low_commit() {
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
-    start_node(node_dir.path(), addr).await;
+    let node = start_node(node_dir.path(), addr).await;
     let conn = TestConn::new(addr);
 
     let eid: u64 = 2001;
@@ -73,13 +73,9 @@ async fn batch_append_rejects_sealed_extent_with_low_commit() {
     assert_eq!(w1.code, CODE_OK);
     assert_eq!(w1.end, 10);
 
-    // Seal the extent via the legacy conversion shape: planted `.ec.dat` (as
-    // the pre-CoW binary left it) published by the retained commit path, which
-    // bumps eversion and sets sealed_length + avali.
-    let shard_data = b"shard_data".to_vec();
-    test_helpers::plant_legacy_ec_staging(node_dir.path(), eid, &shard_data);
-    let cs = conn.commit_ec_shard(eid, 10, 2).await;
-    assert_eq!(cs.code, CODE_OK);
+    // Seal the extent (length 10, eversion 2) so the append below hits the
+    // sealed guard rather than a length check.
+    node.test_seal_local(eid, 10, 2).await.expect("seal");
 
     // Attempt an append with commit=5 (lower than file_start).
     // The batch path's sealed check (step 2) should reject immediately.

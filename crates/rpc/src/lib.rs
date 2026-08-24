@@ -394,7 +394,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   `node_uuid`: every verdict in the answer is relative to ONE node, and
     //   the EN knows only its uuid (the manager assigns node ids), so a
     //   reporter it cannot resolve gets no verdict at all.
-    (29, "3b8bde9f7e73931b"),
+    //   v29 refreshed IN PLACE again (still undeployed): the per-node EC commit
+    //   phase is GONE. `MSG_COMMIT_EC_SHARD` (12) is retired to a reserved
+    //   tombstone and `CommitEcShardReq/Resp` are deleted — conversion stages an
+    //   additive `extent-{id}.shard{i}` and the manager's layout flip is the
+    //   sole commit point, so no node publishes a shard over its own `.dat`.
+    (29, "33423f04bcc34c69"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
