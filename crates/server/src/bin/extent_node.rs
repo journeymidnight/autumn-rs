@@ -104,6 +104,8 @@ struct Args {
     /// a fresh pod IP is picked up automatically. When unset, the EN relies on
     /// the location `autumn-op format` stamped (the pre-M1 behavior).
     advertise: Option<String>,
+    /// Refuse to start on any pre-copy-on-write EC state. See the arg parser.
+    refuse_legacy_ec_state: bool,
 }
 
 fn parse_args() -> Args {
@@ -130,6 +132,7 @@ fn parse_args() -> Args {
     let mut fd_cache_cap: Option<usize> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut advertise: Option<String> = None;
+    let mut refuse_legacy_ec_state = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -258,6 +261,15 @@ fn parse_args() -> Args {
                 i += 1;
                 advertise = Some(args[i].clone());
             }
+            // Refuse to start if any pre-copy-on-write EC state is present
+            // (`.ec.dat` staging / an `.ec.commit` intent marker). Off by
+            // default — the retained repair path handles those states, so
+            // refusing by default would break a working upgrade. Start the
+            // whole fleet WITH it to establish that no node holds such state,
+            // which is the precondition for deleting that repair path.
+            "--refuse-legacy-ec-state" => {
+                refuse_legacy_ec_state = true;
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -279,6 +291,7 @@ fn parse_args() -> Args {
         port,
         data_dirs,
         manager,
+        refuse_legacy_ec_state,
         shard_stride,
         bind_host,
         transport,
@@ -792,6 +805,7 @@ fn main() -> Result<()> {
         // capture parallelism / inflight-cap tunable overrides for the thread.
         let ec_par = args.ec_convert_parallelism;
         let rec_par = args.recovery_parallelism;
+        let refuse_legacy = args.refuse_legacy_ec_state;
         let inflight = args.inflight_cap;
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
@@ -863,6 +877,7 @@ fn main() -> Result<()> {
                             cfg = cfg.with_manager_endpoint(mgr);
                         }
                         cfg = cfg.with_shard(shard_idx, shards_for_thread, siblings);
+                        cfg = cfg.with_refuse_legacy_ec_state(refuse_legacy);
                         if let Some((nu, adv, ports)) = reg_for_cfg {
                             cfg = cfg.with_registration(nu, adv, ports);
                         }
@@ -984,6 +999,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         }
 
         let mut config = ExtentNodeConfig::new_multi(args.data_dirs.clone());
+        config = config.with_refuse_legacy_ec_state(args.refuse_legacy_ec_state);
         if let Some(mgr) = args.manager.clone() {
             config = config.with_manager_endpoint(mgr);
         }

@@ -1930,3 +1930,33 @@ Three traps this script exists to encode, all of which cost a run to find:
 - **Restart the ENs only.** The PS serves the reads being verified; killing it
   makes the final check fail as `connect PS … failed`, which reads like a
   data-plane break and is not one.
+
+### Establishing the precondition for deleting the EC commit-phase repair code
+
+Conversion no longer creates `extent-{id}.ec.dat` or `extent-{id}.ec.commit`;
+it stages to `extent-{id}.shard{i}` and the manager's layout flip is the only
+commit point. The code that finishes an old-style rename is RETAINED, because a
+node upgraded while holding a mid-rename crash state still needs it.
+
+Deleting that code is only safe once no node holds such state. Every EN reports
+what it finds at startup:
+
+```
+ERROR ... LEGACY EC STATE: files from the pre-copy-on-write conversion scheme
+          are present ... ec_dat=[…] ec_commit=[…]
+```
+
+Reporting is the default on purpose — the repair path handles those states, so
+refusing to start would break an upgrade that works. To turn "we think the
+fleet is clean" into "every node said so", restart the fleet with:
+
+```bash
+autumn-extent-node ... --refuse-legacy-ec-state
+```
+
+A node holding old-scheme state then refuses to start, naming the extents. Let
+that node start WITHOUT the flag so the retained repair path finishes them, and
+re-check. When every node starts under the flag, the deletion stops being a bet.
+
+Note `extent-{id}.ec.prepared` is CURRENT-scheme (it records which attempt
+staged a shard) and is not legacy state — it is not flagged.

@@ -619,18 +619,6 @@ impl DiskFS {
         out
     }
 
-    /// parse the extent_id out of an `extent-{id}.ec.dat`
-    /// staging filename. Returns None for any other shape (including
-    /// `extent-{id}.dat`).
-    fn parse_ec_staging_extent_id(name: &str) -> Option<u64> {
-        if name.starts_with("extent-") && name.ends_with(".ec.dat") {
-            let id_str = &name["extent-".len()..name.len() - ".ec.dat".len()];
-            id_str.parse().ok()
-        } else {
-            None
-        }
-    }
-
     /// scan all 256 hash subdirs for `extent-{id}.ec.dat`
     /// staging files. Returns the extent_ids that have a `.ec.dat` on
     /// disk. Used by the reconcile loop to also report ec-staging
@@ -640,6 +628,19 @@ impl DiskFS {
     /// reconcile). Sync — wraps `std::fs::read_dir`. Acceptable for
     /// a 5-minute sweep; 256 directory reads is cheap.
     fn scan_ec_staging_extent_ids(&self) -> Vec<u64> {
+        self.scan_by_suffix(".ec.dat")
+    }
+
+    /// Extents still holding an `extent-{id}.ec.commit` intent marker.
+    ///
+    /// A marker that survives `load_extents` is one the replay could NOT
+    /// resolve (it quarantines rather than guessing), so this is the residue
+    /// that would be orphaned if the commit-phase repair code were deleted.
+    fn scan_ec_commit_marker_ids(&self) -> Vec<u64> {
+        self.scan_by_suffix(".ec.commit")
+    }
+
+    fn scan_by_suffix(&self, suffix: &str) -> Vec<u64> {
         let mut out = Vec::new();
         for byte in 0u8..=255 {
             let subdir = self.base_dir.join(format!("{byte:02x}"));
@@ -650,8 +651,12 @@ impl DiskFS {
             for entry in dir.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if let Some(id) = Self::parse_ec_staging_extent_id(&name) {
-                    out.push(id);
+                if let Some(rest) = name.strip_prefix("extent-") {
+                    if let Some(id_str) = rest.strip_suffix(suffix) {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            out.push(id);
+                        }
+                    }
                 }
             }
         }
@@ -723,6 +728,12 @@ pub struct ExtentNodeConfig {
     /// `None` = not self-registered (`--advertise` unset) → the manager skips
     /// the echo-based drift-heal / imposter checks.
     pub registration: Option<NodeRegistration>,
+    /// Refuse to start if any pre-copy-on-write EC state (`.ec.dat` staging or
+    /// an `.ec.commit` intent marker) is present. Default false: the retained
+    /// repair path handles those states, so refusing by default would break a
+    /// working upgrade. Turn it on fleet-wide to ESTABLISH that no node holds
+    /// such state — the precondition for deleting that repair path.
+    pub refuse_legacy_ec_state: bool,
 }
 
 impl ExtentNodeConfig {
@@ -738,6 +749,7 @@ impl ExtentNodeConfig {
             recovery_parallelism: 2,
             inflight_cap: 64,
             registration: None,
+            refuse_legacy_ec_state: false,
         }
     }
 
@@ -754,6 +766,7 @@ impl ExtentNodeConfig {
             recovery_parallelism: 2,
             inflight_cap: 64,
             registration: None,
+            refuse_legacy_ec_state: false,
         }
     }
 
@@ -788,6 +801,13 @@ impl ExtentNodeConfig {
             advertise_addr: advertise_addr.into(),
             shard_ports,
         });
+        self
+    }
+
+    /// See the field docs: reporting is the default; this turns it into a
+    /// refusal, which is how the fleet-wide precondition is established.
+    pub fn with_refuse_legacy_ec_state(mut self, refuse: bool) -> Self {
+        self.refuse_legacy_ec_state = refuse;
         self
     }
 
@@ -1428,6 +1448,8 @@ pub struct ExtentNode {
     /// is bounded by this process's lifetime. A restart forgets it, and the
     /// stripe-0 truncate plus the `owner_epoch` fence remain the defence there.
     ec_stage_nonce: Rc<DashMap<u64, u64>>,
+    /// See `ExtentNodeConfig::refuse_legacy_ec_state`.
+    refuse_legacy_ec_state: bool,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     /// shard_idx / shard_count for per-shard extent ownership.
@@ -1503,6 +1525,7 @@ impl Clone for ExtentNode {
             ec_done: self.ec_done.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
+            refuse_legacy_ec_state: self.refuse_legacy_ec_state,
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
@@ -3292,6 +3315,7 @@ impl ExtentNode {
             ec_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             ec_convert_inflight: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
+            refuse_legacy_ec_state: config.refuse_legacy_ec_state,
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
@@ -4274,6 +4298,56 @@ impl ExtentNode {
         }
 
         self.discover_shard_files().await;
+        self.report_legacy_ec_state()?;
+        Ok(())
+    }
+
+    /// Surface any state left by the PRE-CoW conversion scheme, which staged to
+    /// `extent-{id}.ec.dat` and renamed it over `.dat` under an
+    /// `extent-{id}.ec.commit` intent marker. Nothing in this build creates
+    /// either file: conversion stages to `extent-{id}.shard{i}` and the
+    /// manager's layout flip is the only commit point.
+    ///
+    /// So anything found here came from a node that ran the old binary — and it
+    /// is exactly what the RETAINED commit-phase repair code exists to finish.
+    /// This runs AFTER `load_extents`, whose marker replay resolves what it can
+    /// and quarantines what it cannot, so what remains is genuinely unresolved.
+    ///
+    /// **Reporting, not refusing, is the default — deliberately.** The repair
+    /// path handles these states correctly today, so failing to start would
+    /// break a legitimate upgrade that works. The point is to make the state
+    /// impossible to MISS, so an operator can establish the precondition for
+    /// deleting that repair code: no node holds old-scheme state. Once that is
+    /// established fleet-wide (start every node with `--refuse-legacy-ec-state`
+    /// and see them all come up), the deletion stops being a bet.
+    fn report_legacy_ec_state(&self) -> Result<()> {
+        let mut staging: Vec<u64> = Vec::new();
+        let mut markers: Vec<u64> = Vec::new();
+        for disk in self.disks.values() {
+            staging.extend(disk.scan_ec_staging_extent_ids());
+            markers.extend(disk.scan_ec_commit_marker_ids());
+        }
+        if staging.is_empty() && markers.is_empty() {
+            return Ok(());
+        }
+        staging.sort_unstable();
+        markers.sort_unstable();
+        if self.refuse_legacy_ec_state {
+            return Err(anyhow::anyhow!(
+                "legacy EC state from the pre-copy-on-write conversion scheme is present and                  --refuse-legacy-ec-state was given: {} extent(s) with .ec.dat staging {:?},                  {} with an .ec.commit intent marker {:?}. Let this node start WITHOUT that                  flag so the retained commit-phase repair can finish them, then re-check.",
+                staging.len(),
+                staging,
+                markers.len(),
+                markers,
+            ));
+        }
+        tracing::error!(
+            ec_dat_count = staging.len(),
+            ec_dat = ?staging,
+            ec_commit_count = markers.len(),
+            ec_commit = ?markers,
+            "LEGACY EC STATE: files from the pre-copy-on-write conversion scheme are present.              The retained commit-phase repair path owns them and nothing in this build creates              more. This node is NOT clean for the purpose of deleting that repair code."
+        );
         Ok(())
     }
 
