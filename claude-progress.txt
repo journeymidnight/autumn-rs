@@ -1,3 +1,23 @@
+Date: 2026-08-24 (b)
+TaskStatus: completed
+Task scope: §7 升级前置检查（第 6 步的解锁手段）。commit b66af8d。
+  本 build 已经不会再产生 extent-{id}.ec.dat / .ec.commit（转换只写 .shard{i}，manager 的 layout flip
+  是唯一提交点）。所以这两个文件只可能来自跑老二进制的节点，而它们正是【保留的 commit-phase 修复代码】
+  存在的理由。删那批代码的前提 = 全集群没有任何节点还持有这种状态，而在此之前唯一的验证手段是
+  登录每台机器去 find。
+  实现：EN 启动时扫描（放在 load_extents 【之后】，这样 marker replay 能解决的已经解决、解决不了的已
+  quarantine，剩下的才是真·未决残骸），ERROR 日志列出 extent id。
+  【默认只报告不拒绝，这是刻意的】：保留的修复路径今天能正确处理这些状态，默认拒启动会打断一个本来
+  能work的升级。--refuse-legacy-ec-state 才变成拒绝 —— 这才是"建立前置条件"的手段：全集群带 flag 起一遍，
+  全起来了，第 6 步就从"赌"变成"查过了"。
+  最关键的测试是【反向】那个：只有当前格式文件的节点（含 .ec.prepared —— 它是当前方案的，不是 legacy）
+  必须在 flag 下【干净启动】。误报和它要找的状态无法区分，而且会卡住它本来要解锁的那次升级。
+  顺带删掉被重构孤立的 parse_ec_staging_extent_id。
+  门：stream 115 lib + legacy_ec_state 4 + placement_cleanup/payload_location/ec_2pc/extent_restart/
+  multi_disk、manager 279 lib + ec_failover；clippy 19 不变（注意：git stash 不带 -u 会漏掉未跟踪的
+  测试文件，导致基线编译不同、warning 计数假性暴涨，比对时要 stash -u）。
+  ops.md 写了操作步骤。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-24
 TaskStatus: completed
 Task scope: v29 EC CoW 跨机验证（用户选 A）。脚本入库 scripts/ec_crosshost_verify.sh。

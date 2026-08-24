@@ -348,6 +348,20 @@ alternative, if they are to be deleted, is an enforced upgrade precondition (no
 live `ConvertToEc` markers, no `.ec.dat` / `.ec.commit` on any node) with a
 fail-loud check at EN startup.
 
+**SHIPPED (the check).** Every EN scans at startup — after `load_extents`, so
+the marker replay has resolved what it can and quarantined what it cannot — and
+ERROR-logs whatever remains, naming the extents. `--refuse-legacy-ec-state`
+turns that into a refusal.
+
+Reporting, not refusing, is the DEFAULT, and the distinction is the whole point:
+the retained repair path handles these states correctly today, so refusing by
+default would break an upgrade that works. The flag exists to *establish* the
+precondition — start the fleet with it, and when every node comes up, step 6
+stops being a bet. Note `.ec.prepared` is current-scheme (it records which
+attempt staged a shard) and is deliberately not flagged; the test that a clean
+node starts under the flag is what keeps that honest, since a false positive
+would be indistinguishable from the state being looked for.
+
 **Live old-scheme markers at upgrade.** Define this explicitly: either drain them
 before upgrading (recommended — and required anyway if the nonce rides in a
 widened struct), or have the new code recognise an old-shape marker and refuse to
