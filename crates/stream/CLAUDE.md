@@ -836,9 +836,14 @@ and from other crates' CLAUDE.md); do not renumber.
     assignment. **There is no commit phase** — the manager's layout flip is the
     single commit point. The old per-node rename left "some renamed, some not",
     a middle state nobody could classify, which is what made a stuck marker
-    un-releasable. `handle_commit_ec_shard` / `commit_shard_local` /
-    `finish_ec_commit` / the `ec.commit` replay are RETAINED as repair code for
-    a node upgraded mid-rename; nothing in this build creates a `.ec.dat`.
+    un-releasable. The commit phase is DELETED — `MSG_COMMIT_EC_SHARD` is a reserved
+    tombstone and `.ec.dat` / `.ec.commit` no longer exist anywhere in the
+    codebase. (They were retained briefly as repair code for a node upgraded
+    mid-rename; on a development cluster with no historical data there was
+    nothing to repair.) **`ec.prepared` remains**: it is the durable carrier of
+    the attempt nonce, which travels in the request while the shard file on
+    disk carries none — without it a coordinator cannot tell whether its
+    staging came from THIS attempt and must re-encode on every re-dispatch.
 
     Consequences elsewhere: **EC shard recovery writes its rebuilt shard to the
     file the layout NAMES** (`.shard{i}` when `InShardFile`) — writing it into

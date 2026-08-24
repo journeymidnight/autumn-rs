@@ -341,31 +341,10 @@ usual (same-commit stop-world deploy).
 **Legacy shards.** Extents converted under the old scheme have their shard in
 `.dat` and are `InDat` by default — they keep working with no backfill.
 
-**Pre-upgrade crash states.** `ec.commit` replay and the `recovered` heuristic
-must be **retained as frozen repair code**, not deleted with the commit phase: a
-node upgraded while holding a mid-rename crash state still needs them. The
-alternative, if they are to be deleted, is an enforced upgrade precondition (no
-live `ConvertToEc` markers, no `.ec.dat` / `.ec.commit` on any node) with a
-fail-loud check at EN startup.
-
-**SHIPPED (the check).** Every EN scans at startup — after `load_extents`, so
-the marker replay has resolved what it can and quarantined what it cannot — and
-ERROR-logs whatever remains, naming the extents. `--refuse-legacy-ec-state`
-turns that into a refusal.
-
-Reporting, not refusing, is the DEFAULT, and the distinction is the whole point:
-the retained repair path handles these states correctly today, so refusing by
-default would break an upgrade that works. The flag exists to *establish* the
-precondition — start the fleet with it, and when every node comes up, step 6
-stops being a bet. Note `.ec.prepared` is current-scheme (it records which
-attempt staged a shard) and is deliberately not flagged; the test that a clean
-node starts under the flag is what keeps that honest, since a false positive
-would be indistinguishable from the state being looked for.
-
-**Live old-scheme markers at upgrade.** Define this explicitly: either drain them
-before upgrading (recommended — and required anyway if the nonce rides in a
-widened struct), or have the new code recognise an old-shape marker and refuse to
-act on it until an operator clears it.
+**Pre-upgrade crash states — N/A.** This landed on an active development
+cluster with no historical data, so the commit-phase repair code was deleted
+outright rather than retained (§10 step 6). On a cluster that HAD run the old
+scheme, that code would have to stay until every node was proven clean.
 
 ---
 
@@ -522,9 +501,18 @@ shapes.
    from a property of the OBJECT to a property of the RELATIONSHIP between the
    object and the asker, every input that identifies the asker becomes
    load-bearing — including ones previously documented as diagnostic.
-6. **After a soak and one release boundary**: delete the commit phase and the
-   `ec.commit` machinery (subject to §7), and `ec.prepared` only once the nonce
-   has taken over its role.
+6. **Delete the commit phase** and the `ec.commit` machinery. **SHIPPED** — no
+   soak was needed: this is an active development cluster with no historical
+   data, so there was no old-scheme state to repair and nothing to migrate. The
+   `.ec.dat` apparatus went with it, as did the upgrade-precondition check built
+   one step earlier: with no migration to gate, it was ceremony.
+
+   **`ec.prepared` stays**, contrary to the table in §5. The nonce did not
+   subsume it — it MOVED INTO it. The nonce travels in the request; the shard
+   file on disk carries none; so the marker is the only durable record binding
+   "this staging" to "this attempt", and without it a coordinator must re-encode
+   on every re-dispatch. §4.3 anticipated the shape of this ("naming protects
+   serving, not staging confirmation") but predicted the wrong resolution.
 
 This sits **after** the recovery-side work that establishes the same model on a
 lower-risk path: `handle_require_recovery` becomes idempotent (complete ⇒ adopt,

@@ -1,5 +1,32 @@
-Date: 2026-08-24 (b)
+Date: 2026-08-24 (c)
 TaskStatus: completed
+Task scope: EC CoW 第 6 步 —— 删掉 commit phase（commit 4362b07）。用户定调：
+  【现在是 active 开发阶段，相当于全新集群，不考虑任何历史数据/迁移】。所以原本 gate 住第 6 步的
+  "soak + 升级前置条件"整个不成立——它保护的是不存在的数据。直接删。
+  删掉：MSG_COMMIT_EC_SHARD(12，按本仓库惯例退成保留号+墓碑注释) + CommitEcShardReq/Resp、
+  handle_commit_ec_shard、commit_shard_local、finish_ec_commit、ec.commit intent marker 及其
+  load_extents 三态重放、以及整套 .ec.dat 机制（staging path / scanner / reconcile 的 ec-staging
+  orphan 上报）。转换只写 additive 的 extent-{id}.shard{i}，manager 的 layout flip 是唯一提交点，
+  上面这些永远不可能再被驱动。
+  §7 那个 --refuse-legacy-ec-state 检查【也一起删了】（用户："这个什么破玩意就不要了"）——它是几小时前
+  为"删除前证明全集群干净"加的，没有迁移要 gate 时纯属仪式。ops.md 的对应 runbook 一并删除。
+  【ec.prepared 保留】，与设计文档 §5 表格的说法相反：nonce 没有取代它，nonce【住进了】它。
+  nonce 走在请求里，磁盘上的 shard 文件本身不带 nonce ⇒ 没有这个 marker，coordinator 无法判断
+  本地 staging 是不是本次 attempt 的，只能每次 re-dispatch 都重新编码。§4.3 预见到了形状
+  （"命名保护的是 serving，不是 staging confirmation"）但对结论判断错了。
+  测试连带：两个 suite 之前拿 WriteShard+CommitEcShard 当【fixture】造"sealed 到 eversion N 的 extent"，
+  现在改成走具名的 test_seal_local——本来就更诚实，它们从来测的不是 commit 路径，只是借它的副作用。
+  （踩坑：test_seal_local 只写元数据，而老 fixture 的 rename 顺带把 shard payload 变成了 .dat 内容，
+  所以还要先 append 真实字节。）ec5_commit_window_tests 测的是 rename<->save_meta 崩溃窗口，
+  窗口没了就一起删；ec_2pc_crash_safety 改名 ec_staging（已经没有 2PC 了）。
+  净效果：-1107 / +77 行。
+  门：rpc 60、stream 110 lib + ec_staging/eversion_zero_skip/append_semantics/payload_location/
+  placement_cleanup/restart/delete/multi_disk、manager 279 lib + ec_failover/ec_integration/
+  update_stream_ec/system_extent_recovery/offline_reconcile/re_avali_no_destroy 全绿；
+  live 3EN 实证：转换成功、marker drain、.dat 全回收、8 个值在全集群无 .dat 下逐字节一致。
+─────────────────────────────────────────────────────────────────
+Date: 2026-08-24 (b)
+TaskStatus: superseded (§7 的检查已于同日随第 6 步一并删除，见上)
 Task scope: §7 升级前置检查（第 6 步的解锁手段）。commit b66af8d。
   本 build 已经不会再产生 extent-{id}.ec.dat / .ec.commit（转换只写 .shard{i}，manager 的 layout flip
   是唯一提交点）。所以这两个文件只可能来自跑老二进制的节点，而它们正是【保留的 commit-phase 修复代码】
