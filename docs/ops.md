@@ -1891,3 +1891,42 @@ checkpoint reload + WAL replay; tables=0 = pure WAL replay).
 Mechanism has teeth: a standalone check (write file A with `fsync`, file B
 without, `clear-cache`) shows A survives and B is dropped — so a real durability
 gap would surface as LOST keys.
+
+## EC copy-on-write conversion — cross-host verification
+
+`scripts/ec_crosshost_verify.sh` exercises the whole EC conversion line across
+TWO machines, which is the shape single-host loopback cannot test: manager + PS
++ EN0 on this host, EN1 + EN2 on the peer, `2+1` erasure coding, so shards fan
+out over the network and two of the three holders are remote.
+
+```bash
+# Build first — the peer's release tree is whatever was last shipped to it, and
+# the script scp's these binaries over.
+cargo build --release --workspace
+bash scripts/ec_crosshost_verify.sh
+```
+
+Edit `L6` / `R6` at the top for your two hosts; the peer is reached through
+`.claude/skills/remote-autumn/remote-autumn.sh` (ssh -p 2222).
+
+What it asserts, in order: the conversion op reaches `succeeded`; all 8 × 64 KiB
+values read back byte-identical **after the layout flip**; every EN restarts and
+its reconcile reclaims the pre-conversion `.dat` **on both hosts**; the same
+values still read back byte-identical with **no `.dat` anywhere in the cluster**.
+PASS requires all four. A converted extent should end as one `.shard{i}` per
+node at `sealed_length / K` bytes.
+
+Three traps this script exists to encode, all of which cost a run to find:
+
+- **`--listen` defaults to `0.0.0.0`** on both the EN and the PS — the IPv4
+  wildcard, which refuses the IPv6 address they advertise. Pass `--listen <v6>`
+  explicitly on every node or the manager's `df` never connects and every node
+  sits `Suspected`. (When `df` has never once succeeded, `list-nodes` prints
+  `HB_AGO`/`SUSP_AGE` in the hundreds of seconds — that is an absent baseline,
+  not stale state. Don't chase it.)
+- **A peer data dir keeps its `cluster_id`.** Re-running against a fresh manager
+  makes `autumn-op format` refuse to join a different cluster — that guard
+  working, not a failure. Wipe the peer dirs between runs.
+- **Restart the ENs only.** The PS serves the reads being verified; killing it
+  makes the final check fail as `connect PS … failed`, which reads like a
+  data-plane break and is not one.

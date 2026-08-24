@@ -1,3 +1,29 @@
+Date: 2026-08-24
+TaskStatus: completed
+Task scope: v29 EC CoW 跨机验证（用户选 A）。脚本入库 scripts/ec_crosshost_verify.sh。
+  动机：v29 攒了 5 步改动(nonce/payload location/shard-holder/方案切换/file-granular reconcile)，
+  全部只在单机 loopback 验过；本项目反复吃过 loopback 藏 bug 的亏(SO_RCVBUF 窗口冻结 6× 写吞吐，单机看不见)。
+  形状：manager + PS + EN0 在 ::14，EN1/EN2 在 ::15，EC 2+1 ⇒ 分片跨网扇出、3 个持有者里 2 个在远端。
+  实测这轮的 coordinator 落在【远端】en1，它把一个 shard 推回 ::14——真正的跨机路径。
+  结果 PASS：
+    转换成功 → 8×64KiB 跨机读回逐字节一致 → 重启全部 EN 触发 reconcile →
+    两台机上 pre-conversion .dat 【全部回收】(日志实证 "reclaimed the pre-conversion .dat;
+    this node now serves its shard" 在 ::14 和 ::15 都出现) → 再读一遍仍逐字节一致、全集群无 .dat。
+  ── 三个坑都是【测试脚本自己的】，产品侧零改动 ──
+   1. EN/PS 的 --listen 默认 0.0.0.0（IPv4 通配），却 advertise IPv6 地址 ⇒ manager 拨 v6 被拒、
+      节点全 Suspected。两端都要显式 --listen <v6>。（顺带：list-nodes 在 df 从没成功过时
+      HB_AGO/SUSP_AGE 显示成几百秒的假值，看着像"陈旧状态"，实际是没有基线——排查时别被带偏。）
+   2. 远端 data dir 残留上一轮的 cluster_id ⇒ format 拒绝加入不同集群。这是 cluster_id 守卫【正确工作】，
+      不是 bug；脚本每轮要先 rm -rf 远端 dir。
+   3. 重启 EN 那步我写了 kill "${PIDS[-1]}" 且注释成 "PS stays"——PIDS[-1] 恰恰【就是 PS】。
+      于是 8 个读全挂在 "connect PS ... failed"，看起来像"清理后跨机读坏了"。
+      教训：读失败先看是不是【服务端还活着】，再怀疑数据面；把 stderr 丢进 /dev/null 会让这种事多花两轮。
+  另：管道 `| tail -N` 会缓冲到进程结束，后台跑长脚本时没法增量观察——直接重定向到文件。
+     pkill -f 会匹配到自己的命令行(exit 144)，用 pgrep+逐个 kill。
+Next steps: 跨机已过 ⇒ 第 6 步的前置从"没跑过真集群"降级为"没部署过"。真要做仍按 §7：
+  要么确认全集群无老格式状态，要么加 EN 启动 fail-loud 前置检查(推荐，便宜且把"赌"变成"检查")。
+  auto-policy 的 ec arm 现在功能上具备条件(空间窗口已关、跨机验过)，但从未在自动驱动下跑过，要 arm 建议先小范围观察。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-22 (b)
 TaskStatus: completed
 Task scope: §9 handle_re_avali truncate-in-place 审计（设计文档最后一个未做项）。commit 28520d7。
