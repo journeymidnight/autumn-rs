@@ -1414,6 +1414,109 @@ async fn nemesis_loop(
 
 // ── Checker ────────────────────────────────────────────────────────────
 
+/// After the nemesis stops and the cluster settles, NOTHING should still be in
+/// flight. Every long-running op either finished or was abandoned; either way it
+/// has a terminal state, and no marker should still pin an extent.
+///
+/// This checks a class the per-key checks structurally cannot see. A leaked
+/// RUNNING entry loses no data — but for EC it makes `submit` attach-dedup to a
+/// corpse and return without actuating, so every later convert of that extent is
+/// a silent no-op; and a marker left pinned refuses EC dispatch and every
+/// PS-layer op on its extent, blocking that extent's GC indefinitely. Both are
+/// invisible to a reader and to `verify_extent_accounting`, and both are exactly
+/// what a nemesis full of kills, fences and partitions is likely to produce.
+async fn verify_no_ops_left_in_flight(mgr: &RpcClient) -> Vec<String> {
+    let mut errors = Vec::new();
+    let resp = match mgr
+        .call(
+            MSG_OP_QUERY,
+            rkyv_encode(&OpQueryReq {
+                op_id: 0,
+                // Ask for EVERYTHING, then filter. "0 active" is only
+                // meaningful if the ledger saw traffic at all — a check that
+                // cannot distinguish "converged" from "never used" is not a
+                // check, so the count is reported either way.
+                active_only: false,
+                kind_filter: 0,
+                limit: 256,
+            }),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!("op-ledger query failed: {e:?}"));
+            return errors;
+        }
+    };
+    let resp: OpQueryResp = match rkyv_decode(&resp) {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!("op-ledger query undecodable: {e}"));
+            return errors;
+        }
+    };
+    let active: Vec<&OpRecord> = resp
+        .ops
+        .iter()
+        .filter(|o| o.state == OP_STATE_PENDING || o.state == OP_STATE_RUNNING)
+        .collect();
+    eprintln!(
+        "chaos: op ledger holds {} record(s), {} still active",
+        resp.ops.len(),
+        active.len()
+    );
+    for op in active {
+        errors.push(format!(
+            "op {} kind={} target={}/{} still ACTIVE (state={}) after quiesce — \
+             attempts={} last_error={:?}",
+            op.op_id,
+            op.kind,
+            op.part_id,
+            op.secondary_id,
+            op.state,
+            op.attempts,
+            op.error
+        ));
+    }
+    errors
+}
+
+/// Any EC marker still pinned after the cluster has settled. A pinned marker
+/// refuses EC dispatch, `force-ec-convert`, and every PS-layer op on that
+/// extent, so this is a silent, permanent block on the extent's GC.
+async fn verify_no_ec_markers_pinned(mgr: &RpcClient) -> Vec<String> {
+    let mut errors = Vec::new();
+    let resp = match mgr
+        .call(
+            MSG_LIST_EC_INFLIGHT_MARKERS,
+            rkyv_encode(&ListEcInflightMarkersReq {}),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!("ec-marker query failed: {e:?}"));
+            return errors;
+        }
+    };
+    let resp: ListEcInflightMarkersResp = match rkyv_decode(&resp) {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push(format!("ec-marker query undecodable: {e}"));
+            return errors;
+        }
+    };
+    for m in &resp.markers {
+        errors.push(format!(
+            "EC marker on extent {} still pinned after quiesce (age {}s) — \
+             the extent's GC is blocked until it drains",
+            m.extent_id, m.age_secs
+        ));
+    }
+    errors
+}
+
 /// Lines the system emits when something is STRUCTURALLY wrong — every one of
 /// these is a place the code chose to fail loudly rather than continue.
 ///
@@ -2879,6 +2982,16 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let liveness_errors = verify_write_liveness(&router, &topo).await;
         eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
 
+        // Nothing should still be in flight now that the nemesis has stopped
+        // and the cluster has settled.
+        eprintln!("chaos: verifying nothing is left in flight (op ledger + EC markers)");
+        let mut inflight_errors = verify_no_ops_left_in_flight(&mgr).await;
+        inflight_errors.extend(verify_no_ec_markers_pinned(&mgr).await);
+        eprintln!(
+            "chaos: in-flight verify: errors={}",
+            inflight_errors.len()
+        );
+
         // A run that acked nothing VERIFIED nothing. Every per-key check below
         // is vacuously satisfied by an empty `expected`, so without this the
         // report reads "0 mismatches, 0 not_found" — indistinguishable from a
@@ -2928,6 +3041,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         }
 
         if !workload_errors.is_empty()
+            || !inflight_errors.is_empty()
             || !mismatches.is_empty()
             || !not_found.is_empty()
             || !range_errors.is_empty()
@@ -2955,7 +3069,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 )
             };
             panic!(
-                "chaos verify FAILED\nWHY: {why}\nworkload: {}\nlogs: {}\n— mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
+                "chaos verify FAILED\nWHY: {why}\nworkload: {}\nlogs: {}\n— mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} inflight_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\ninflight_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
                 if workload_errors.is_empty() {
                     format!("acked={acked_total} failed={failed_total}")
                 } else {
@@ -2968,6 +3082,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 liveness_errors.len(),
                 accounting_errors.len(),
                 reclaim_errors.len(),
+                inflight_errors.len(),
                 mismatches2.len(),
                 not_found2.len(),
                 accounting_errors2.len(),
@@ -2977,6 +3092,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 liveness_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 accounting_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 reclaim_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
+                inflight_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
                 mismatches2.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 not_found2.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 accounting_errors2.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
