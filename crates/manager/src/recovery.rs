@@ -166,6 +166,46 @@ impl AutumnManager {
         released
     }
 
+    /// Re-send EVERY pinned Recovery marker, once per tick.
+    ///
+    /// The marker IS the work list. Previously the re-send was reachable only
+    /// through the per-slot scan below, so it fired only while that slot still
+    /// looked like it needed recovery — which makes the "standing instruction"
+    /// stop standing the moment the slot stops qualifying.
+    ///
+    /// Concretely: fence a node, recovery is dispatched and pins a marker, the
+    /// target restarts (losing its in-memory in-flight set, so nothing is
+    /// running), then the operator clears the fence. Now no slot is eligible, so
+    /// nothing re-sends; the target is Online, so nothing releases. The marker
+    /// pins that extent forever — and a pinned marker refuses EC dispatch,
+    /// `force-ec-convert`, and every PS-layer op on the extent (punch, truncate,
+    /// split, alloc), so its GC is blocked silently and indefinitely. The escape
+    /// was to re-fence, or to fence-and-remove a healthy node.
+    ///
+    /// Driving the re-send from the marker list makes the marker's life depend
+    /// on the marker alone: it is re-sent until it completes or its executor
+    /// stops being able to run it.
+    async fn resend_pinned_recovery_markers(&self) {
+        let pinned: Vec<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, rec)| match rec.kind() {
+                Some(crate::extent_inflight::ExtentOpKind::Recovery) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for extent_id in pinned {
+            if let Err(e) = self.redispatch_pinned_recovery(extent_id).await {
+                tracing::warn!(
+                    extent_id,
+                    error = %e,
+                    "re-sending a pinned recovery marker failed; retried next tick"
+                );
+            }
+        }
+    }
+
     /// Re-send an already-pinned Recovery marker to the node it named.
     ///
     /// This is the "standing instruction" half of the marker model. It NEVER
@@ -780,6 +820,7 @@ impl AutumnManager {
             let now_s = Self::epoch_seconds();
 
             self.release_recovery_markers_for_dead_executors().await;
+            self.resend_pinned_recovery_markers().await;
 
             // reseed the recovery rate limiter from the inflight
             // ledger so its counters reflect actually-in-flight recoveries.
