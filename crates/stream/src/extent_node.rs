@@ -7931,46 +7931,23 @@ impl ExtentNode {
 
             // Peer-copy gap if local file is short.
             let local_len = entry.len.load(Ordering::SeqCst);
-            // detect crash between rename(.ec.dat → .dat) and
-            // save_meta in commit_shard_local. .dat is the shard file
-            // (len = shard_size), .meta has old eversion, no staging
-            // file exists. Fix meta and skip to Phase 2.
-            let expected_shard =
-                crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
-            let recovered =
-                local_len < sealed_length && local_len == expected_shard && !coordinator_prepared;
-            if recovered {
-                tracing::info!(
-                    extent_id,
-                    local_len,
-                    sealed_length,
-                    new_eversion,
-                    "detected post-rename/pre-save_meta crash, recovering meta"
-                );
-                entry
-                    .sealed_length
-                    .store(sealed_length.max(local_len), Ordering::SeqCst);
-                // P0-C: sealed_length > 0 ⇒ sealed.
-                entry.sealed.store(true, Ordering::SeqCst);
-                entry.avali.store(1, Ordering::SeqCst);
-                if new_eversion > 0 {
-                    entry.eversion.store(new_eversion, Ordering::SeqCst);
-                }
-                // P0-D: same fail-closed rule as the prepare-path seal above —
-                // an EC-converted extent whose post-convert eversion/seal is
-                // not durable would restart with the PRE-convert sidecar
-                // (stale eversion over shard-shaped data = the exact
-                // corruption family the eversion-gate guards against).
-                if let Err(e) = self.save_meta(extent_id, &entry).await {
-                    self.mark_disk_error_for_extent(extent_id, &e);
-                    return Err((
-                        StatusCode::Unavailable,
-                        format!(
-                            "extent {extent_id}: post-convert .meta persist failed (fail-closed): {e}"
-                        ),
-                    ));
-                }
-            } else if local_len < sealed_length {
+            // A short local copy is fetched from a peer before encoding.
+            //
+            // There used to be a branch here that treated `local_len ==
+            // ceil(sealed_length/K)` as "this node crashed between
+            // rename(.ec.dat → .dat) and save_meta", fixed up the meta, and
+            // SKIPPED the entire prepare — no encode, no WriteShard to anyone —
+            // then reported the conversion done. Under copy-on-write no rename
+            // ever happens, so its premise is unreachable, but its TRIGGER was
+            // not: a lagging coordinator (sealed-over-reachable legitimately
+            // seals above a down node's length, which is why the peer-copy
+            // below exists) whose length happened to equal the shard size would
+            // report done having staged nothing. The nonce and reporter checks
+            // authenticate the ATTEMPT, not the WORK, so the flip committed
+            // onto a layout no node held a shard for: every read
+            // CODE_PAYLOAD_NOT_HERE, 0 of K shards for reconstruct, and no way
+            // back.
+            if local_len < sealed_length {
                 let mgr_info = mgr_info_opt.ok_or_else(|| {
                     (
                         StatusCode::Unavailable,
@@ -7996,7 +7973,7 @@ impl ExtentNode {
                 );
             }
 
-            if !recovered {
+            {
                 // ── Phase 1 (prepare): CHUNKED RS-encode + streamed fanout ──
                 //
                 // RS over GF(256) is byte-wise per offset, so each shard is
