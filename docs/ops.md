@@ -1894,6 +1894,43 @@ Mechanism has teeth: a standalone check (write file A with `fsync`, file B
 without, `clear-cache`) shows A survives and B is dropped — so a real durability
 gap would surface as LOST keys.
 
+## Chaos: reading a failure
+
+`cargo test -p autumn-manager --test system_chaos -- --ignored --nocapture`
+
+The report is ordered so the first thing you read is the cause, not the symptom:
+
+1. **`write failures by reason`** — the workload's rejected writes, tallied by
+   PS code / RPC error / routing failure. A chaos workload MUST tolerate failed
+   writes (that is the point of a nemesis), so the tally is the only thing that
+   separates "faults are landing" from "nothing works".
+2. **`WORKLOAD ACKED NOTHING`** — a hard failure. Every per-key invariant is
+   vacuous over an empty expectation set, so a run that wrote nothing would
+   otherwise report `0 mismatches, 0 not_found` and pass. If you see this, fix
+   the workload before reading anything below it.
+3. **`WHY:`** — a scan of the EN subprocess logs for fail-loud markers
+   (`WAL-FAILSTOP`, `META-FAILCLOSED`, quarantine, stale VP, refused EC
+   completions, superseded attempts, disk-offline, supervised-loop panics).
+   **Their absence is the sharper finding**: the invariant broke while every
+   layer believed it was fine. `logs:` gives the directory to dig in.
+4. The per-category counts and samples.
+
+Manager and PS run in-process, so their tracing goes to the test's own stderr,
+not to `logs:`. Only EN logs are on disk — which is the right surface anyway,
+since recovery, EC conversion, quarantine and disk health all live there.
+
+**The trap this encodes.** For five weeks `system_chaos` reported "all
+invariants OK" while every single write was rejected with `NamespaceUnknown`:
+Layer-A namespace validation is always on, and the test wrote bare keys. Nothing
+caught it because a chaos workload is *supposed* to swallow write failures —
+the tolerance that makes it correct is what let 100% rejection look like normal
+nemesis pressure. Ordinary tests were never exposed: `support::ps_put` retries
+and then panics, so a rejected write fails loudly there.
+
+Chaos keys are `mem/{b|q}{kid:06}` under the built-in `mem` namespace
+(`CHAOS_NS`). A new chaos scenario must namespace its keys or every write will
+be refused.
+
 ## EC copy-on-write conversion — what an operator sees
 
 Conversion is **copy-on-write**: the EN stages each shard as an ADDITIVE file

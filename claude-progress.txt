@@ -1,3 +1,36 @@
+Date: 2026-08-25
+TaskStatus: completed
+Task scope: 文档去迁移化 + 跑 chaos + 给 chaos 加失败原因诊断（用户："如果不考虑升级，更新设计文档和
+  ops.md，然后跑 chaos 测试，需要增加检查失败原因的"）。commit de90e9c。
+  ① 文档：设计文档 §7 从 "Persistence, migration, and legacy" 改写成 "Persistence and wire"——
+     没有历史数据就没有迁移约束；保留"sibling key 仍是更好的设计"的独立理由（marker 身份是 etcd 已知的
+     事实，复制进 value 只会让两者不一致），并单独记一句【真要升级时需要什么】(0 哨兵语义)以免以后重新发现。
+     crash matrix 里两行 pre-upgrade 场景删掉。ops.md：删掉 EC 相关的"升级前置条件"runbook，
+     新增【EC CoW 运维视图】：一次转换的 5 个阶段各自对应哪条日志证据、卡住时看哪里、盘上应该长什么样
+     （每节点一个 sealed_length/K 的 shard + .meta，coordinator 多一个 16B 的 .ec.prepared 属正常）。
+     另修正一处会误导人的旧步骤：让运维去 grep "phase 2 (commit) complete"——那条日志已经不存在了。
+  ② chaos 跑出真问题（而且不是 EC 的）：system_chaos 从 2026-07-18 Layer-A 命名空间强制落地(f5336db)起，
+     【五周来一直在"写 0 个 key"的情况下报 all invariants OK】。因为 expected 集合为空时，逐 key 检查
+     全部真空成立 ⇒ 0 mismatches / 0 not_found 和"干净跑完"完全无法区分；只有 write-liveness 探针有异议，
+     而它读起来像"分区卡住"，不像"这次测试什么都没验"。
+     根因：workload 写的是裸 key（b000021），Layer-A 要求 {已注册ns}/...，全部被 NamespaceUnknown 拒。
+     【为什么只有它中招】：chaos workload 天然要容忍写失败（有 nemesis 在注入故障），
+     而这份"正确的容忍"恰恰让 100% 失败看起来像正常的故障压力。普通测试不受影响——
+     support::ps_put 重试 30 次后 panic，被拒的写会响亮失败。
+  ③ 按用户要求加的"失败原因"三件套（这也正是把两小时的谜题变成一行答案的东西）：
+     - workload 记录【为什么】失败并按原因汇总（原来 5 个失败点只加计数、把原因全丢了）；
+     - acked==0 直接判定失败并明说"下面所有不变量都是真空的"——不能对空输入永远通过的检查不叫检查；
+     - 结论先说 WHY：扫 EN 子进程日志里的 fail-loud 标记（WAL-FAILSTOP/META-FAILCLOSED/quarantine/
+       stale VP/被拒的 EC 完成/superseded attempt/disk OFFLINE/supervised loop panic）。
+       【标记不存在本身是更尖锐的发现】：不变量崩了而每一层都以为自己没事。
+       故意排除噪声项：nemesis 下 LOCKED_BY_OTHER 正是 fencing 应有的样子，df 失败是杀节点的目的。
+     修法本身只有一个常量：key 改成 mem/{b|q}{kid}（mem 是内建命名空间，无需注册），分区范围跟着改。
+  门：system_chaos 现在【真的】过了——400 keys、0 mismatch、0 not_found、quiesce 后回收 2 个 extent、
+  无 fail-loud 标记；system_ps_failover_chaos 2/2、chaos_inode_lease_replay_failclosed 2/2；workspace 0 error。
+Next steps: 其余 chaos 脚本（scripts/*_chaos.sh 共 13 个）尚未在本轮验证；若要继续，建议先跑
+  transport/manager_ha/selfheal 这几个覆盖面最大的，并注意同类"真空通过"风险——凡是容忍写失败的 harness
+  都要检查它是否真的写进去了。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-24 (c)
 TaskStatus: completed
 Task scope: EC CoW 第 6 步 —— 删掉 commit phase（commit 4362b07）。用户定调：
