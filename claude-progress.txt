@@ -58,6 +58,67 @@ Task scope: EC CoW 第 6 步 —— 删掉 commit phase（commit 4362b07）。�
   update_stream_ec/system_extent_recovery/offline_reconcile/re_avali_no_destroy 全绿；
   live 3EN 实证：转换成功、marker drain、.dat 全回收、8 个值在全集群无 .dat 下逐字节一致。
 ─────────────────────────────────────────────────────────────────
+Date: 2026-08-25 (b)
+TaskStatus: completed
+Task scope: fable 对抗审查 5 个面(ec/recovery/gc+compact/自动删除/错误报告+自动重试) → 修 → 更新 system_chaos。
+  【5 个 P0/HIGH，其中 3 个是本会话自己写的代码，2 个是长期潜伏的】：
+  1. a78376a P0 apply_placements 删掉正在 staging 的 shard。placement 是 manager 在【回答时刻】算的、
+     节点【稍后】才应用；这中间转换可能开始，而【participant 上没有任何本地标记】(ec_convert_inflight
+     只在 coordinator 上)。于是过期的"payload 在 .dat"判决删掉了 coordinator 正在写的 shard；下一个
+     stripe 发现文件没了就重建并按自己的 offset pwrite ⇒ 前面 stripe 的位置全是【零洞】。flip 照样发布
+     (报告来自同一 attempt，nonce/reporter 全过) ⇒ 读到零 + CODE_OK。三重修：op-lock 串行化、
+     拒绝"说 InDat 但本地已 staging"的矛盾判决、offset>0 而文件消失时【响亮失败】而不是静默重建。
+     (我第一版守卫用"本节点是否曾 staging"做判据 → 会永远跳过清理、.dat 永不回收；靠"真 staging 而非
+      摆文件"的测试抓到。)
+  2. a78376a HIGH marker 有五种死法，只有两个成功钩子会关 ledger。EC 既不在 TTL 扫描内，
+     submit 又对任何 ACTIVE 目标 attach-dedup 且【attach 后直接返回不 actuate】⇒ 一条泄漏的 RUNNING
+     记录让该 extent 之后所有 force-ec-convert 变成静默 no-op，除非重启 leader。改成在【唯一的 drain 漏斗】
+     里关闭，覆盖现在和将来所有路径；顺带把 3 处 `let _ =` 换成真处理。
+  3. 12ec612 HIGH apply_recovery_done 不校验完成报告是否属于活着的 marker。释放路径的注释明说
+     "如果执行者还在跑、之后完成了，它的完成会被拒绝"——【这个拒绝根本不存在】。df 抖一下就会让节点
+     Suspected→marker 释放；若此时 extent 被 EC 转换，老执行者迟到的【转换前完整副本】报告会把槽位
+     换到持有 .dat 的节点上、而 layout 说的是 shard 文件，被换掉的节点变成非成员后【真正的 shard 被
+     reconcile 回收】。这是 EC nonce 那个洞的 recovery 孪生体，用同样方式关闭。
+     注意顺序：门要放在 EC-inflight defer【之后】(ledger 每 extent 只允许一个 op，所以转换期间到达的
+     recovery 完成永远没有 marker，放前面会吞掉更具体的判决)。
+  4. be1bb9b P0(GC) 【任何活过两代 GC 的大值会被静默丢失】。GC 自己搬迁写的 WAL 记录 op=1 不带
+     OP_VALUE_POINTER(同一次搬迁的 memtable entry 却带)，recovery 靠长度兜底照样能重建，
+     但【GC 自己的扫描没有兜底】⇒ 该记录在它刚被搬进去的那个 extent 下一次 GC 时被当成 chunk blob 跳过、
+     不搬迁、然后连同活着的 VP 一起 punch。现有 GC 测试全是单代，看不见。
+     真正的缺陷是【扫描和重放对"什么是 VP 记录"的判据不一致】——改成两边共用同一个谓词。
+  5. 85e426b P0(EC) 一个"rename 后崩溃"的残留分支能【什么都没 stage 就报告转换完成】。CoW 下 rename
+     根本不存在，但它的【触发条件】还在：seal-over-reachable 合法地封在落后成员长度之上，于是一个落后的
+     coordinator 只要 local_len 恰好等于 ceil(S/K) 就跳过整个 prepare 并返回 Ok。
+     nonce/reporter 校验的是【这次 attempt】、不是【干了什么活】，所以报告是真的、flip 提交到一个
+     没有任何节点持有 shard 的 layout ⇒ 永久不可读、0/K 无法重建、没有反向转换工具。
+  6. 8f2c83a P0(EC/recovery) 多 shard EN 上完成报告【被困在兄弟 shard 里】。manager 每个 node 只发一次 df
+     (故意的：handle_df 会 take 队列，第二个调用者会 drain-and-discard)且拨的是 shard 0 的控制口，
+     而队列是 per-ExtentNode 的、由【拥有该 extent 的 shard】写入 ⇒ 生产形态(shard 数=核数)下
+     (N-1)/N 的 extent 转换永远无法提交(marker 永久钉住、GC 被阻)、重建好的副本永远不被应用。
+     修法是【共享队列】而不是加第二个 df 调用者，形状照抄 shared_disk_health；
+     但必须【按 node(data dirs) 而不是按进程】键控——测试套件在一个进程里跑多个逻辑 EN，
+     进程级共享会让一个 node 的 df 抽走另一个的完成报告，而 manager 会拒绝非 coordinator 上报的 ec_done，
+     恰好会让"证明转换能提交"的多 EN 测试失败。两个方向都断言了。
+  system_chaos 更新：①加"静默后不得有任何在飞"检查(ledger active + EC marker)——这个类别数据检查
+  【结构上看不见】：泄漏的 RUNNING 不丢数据但让后续转换变静默 no-op，钉住的 marker 无限期阻塞该 extent 的 GC。
+  ②检查同时报告 ledger【总记录数】，因为"0 active"在 ledger 从没被用过时是真空成立的——这立刻发现
+  nemesis 全程只留 1 条记录(它直接调 handler，不走 submit)。③把 EC nemesis 改走 MSG_OP_SUBMIT
+  (即 autumn-op 的路径)⇒ 每轮 5 条记录且都到达终态。
+  门：stream 110 lib + payload_location 9/placement_cleanup 8/ec_staging 3/restart/multi_disk/delete_race、
+  manager 283 lib + ec_failover/ec_integration/system_extent_recovery/silent_corruption_rot/
+  re_avali_no_destroy/offline_reconcile/system_gc_*(含 --ignored)、partition-server 205 lib、rpc 60；
+  system_chaos 真过(400 keys/0 mismatch/8 extent 回收/0 在飞)；live 3EN EC smoke PASS。
+  每个修复的守卫都做了【非空验证】(禁用后精确地只有对应测试失败)。
+  坑：改 wire schema 后 system_chaos 会在 setup 就挂——它 shell 出去调【磁盘上的】autumn-op/
+  autumn-extent-node 二进制，必须先 cargo build -p autumn-server(同 cluster.sh 那个老坑)。
+Next steps: 审查里剩下的 P1/P2/P3 尚未处理，按价值排：
+  ① EC P1-3 已 flip 的 shard 文件可被"被释放的僵尸 coordinator"截断/覆写(nonce floor 在 placement 落地时
+     被清掉、重启也会清)——建议：layout 已是 InShardFile 时拒绝 nonce 不匹配的 WriteShard。
+  ② EC P1-4 coordinator 自己的本地 staging【不登记 ec_stage_nonce】⇒ 修复①的 coordinator 形状漏洞仍在。
+  ③ GC P0-2/P0-3(评审给的是 P0，我尚未独立验证)：relocation 跨 rotation 的 seq 顺序问题；
+     pickup_tables 的 take(COMPACT_N) 可能让 truncate 删掉仍被引用的 SST。【下一轮优先验证这两个】。
+  ④ errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-24 (b)
 TaskStatus: superseded (§7 的检查已于同日随第 6 步一并删除，见上)
 Task scope: §7 升级前置检查（第 6 步的解锁手段）。commit b66af8d。
