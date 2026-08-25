@@ -1219,9 +1219,11 @@ $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 #   peak RAM = (K+M)x64MiB regardless of extent size. Manual check: seal a
 #   >1 GiB extent (writes roll it), `autumn-op set-stream-ec --stream S --ec
 #   3+1` then `force-ec-convert --extent E`, confirm the EN logs "phase 1
-#   (prepare) complete ... (chunked)" + "phase 2 (commit) complete", then
-#   `get-stream` the value back -> sha256 must match (chunk-encoded shards are
-#   byte-identical to a whole-extent encode). Override stripe size with
+#   (prepare) complete ... (chunked)" and then "EC shards staged on every
+#   target; awaiting the manager's layout flip" (there is NO commit phase —
+#   see the EC copy-on-write section below), then `get-stream` the value back
+#   -> sha256 must match (chunk-encoded shards are byte-identical to a
+#   whole-extent encode). Override stripe size with
 #   AUTUMN_EXTENT_EC_STRIPE_BYTES on the EN to force many stripes on a smaller
 #   extent. Repro script: the isolated memory-mode loopback recipe (manager
 #   w/o --etcd, 4 single-shard ENs, 1 PS) used in dev.
@@ -1891,6 +1893,49 @@ checkpoint reload + WAL replay; tables=0 = pure WAL replay).
 Mechanism has teeth: a standalone check (write file A with `fsync`, file B
 without, `clear-cache`) shows A survives and B is dropped — so a real durability
 gap would surface as LOST keys.
+
+## EC copy-on-write conversion — what an operator sees
+
+Conversion is **copy-on-write**: the EN stages each shard as an ADDITIVE file
+`extent-{id}.shard{i}` and never touches the `.dat` it was derived from. The
+manager's layout flip is the **only** commit point. There is no per-node commit,
+no rename, and no intent marker — an abandoned attempt costs a delete of files
+no reader is pointed at.
+
+**The life of one conversion**, and where to look if it stalls:
+
+| stage | evidence |
+|---|---|
+| dispatched | manager marker in `autumn-op extent-health` / `list-ec-inflight-markers` |
+| staging | EN log `EC 2PC phase 1 (prepare) complete ... (chunked)` |
+| staged | EN log `EC shards staged on every target; awaiting the manager's layout flip` |
+| committed | `autumn-op ops list --kind ec` → `succeeded`; the marker drains |
+| reclaimed | EN log `reconcile: reclaimed the pre-conversion .dat; this node now serves its shard` |
+
+The last row lags the others by up to one reconcile sweep (5 min, or immediately
+on EN restart). Until it happens the extent occupies BOTH forms — that is
+expected, not a leak.
+
+On-disk, a converted extent should end as exactly one `extent-{id}.shard{i}` per
+member, each `sealed_length / K` bytes, plus `.meta`. The coordinator also keeps
+`extent-{id}.ec.prepared` (16 bytes), which records which ATTEMPT staged the
+shards; it is current-scheme state, not residue.
+
+```bash
+find <data-dir> -name 'extent-<ID>.*' -printf '%f(%s) '
+```
+
+**If a conversion never reaches `succeeded`:**
+
+- `ops list --kind ec` carries the last failure reason and an attempt count.
+- A marker whose coordinator went offline is released automatically and
+  re-derived onto a live node — "gone" means absent from the cluster or
+  `Suspected`, NOT merely "not Online" (a freshly registered node is `Suspend`
+  until its first `df`, and abandoning on that would make any conversion longer
+  than one tick impossible).
+- A completion report from a superseded attempt is refused by nonce, logged as
+  `ec_done is from a DIFFERENT conversion attempt than the live marker`. That is
+  the system protecting itself, not an error to chase.
 
 ## EC copy-on-write conversion — cross-host verification
 

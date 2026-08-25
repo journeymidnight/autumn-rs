@@ -45,7 +45,9 @@ mod support;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -483,15 +485,26 @@ async fn refresh_topology(mgr: &RpcClient, topo: &Topology) {
 
 /// Number of distinct keys per writer prefix. Both the writers and the
 /// no-phantom range checker use this so the "valid key space" is one source of
-/// truth: keys are exactly `{b|q}{kid:06}` for `kid in [0, CHAOS_KEY_COUNT)`.
+/// truth: keys are exactly `{CHAOS_NS}{b|q}{kid:06}` for `kid in [0, CHAOS_KEY_COUNT)`.
 const CHAOS_KEY_COUNT: u32 = 200;
 
-/// Parse a chaos key `{b|q}{6 ASCII digits}` → its `kid`, or None if it is not a
+/// Every chaos key lives under this namespace.
+///
+/// Layer-A namespace validation is ALWAYS on (the manager seeds the built-in
+/// registry unconditionally), so the PS rejects any write whose key is not
+/// `{registered-ns}/…` with `NamespaceUnknown`. `mem` is one of the built-ins,
+/// so using it needs no registration step. Before this, every write in the run
+/// was rejected and the checker still reported "0 mismatches, 0 not_found" —
+/// vacuously true over an empty expectation set.
+const CHAOS_NS: &str = "mem/";
+
+/// Parse a chaos key `{CHAOS_NS}{b|q}{6 ASCII digits}` → its `kid`, or None if it is not a
 /// well-formed key any writer could have produced. Used by the no-phantom range
 /// check: a range MUST NOT return a key outside this space (a malformed key, a
 /// kid the writers never use, or a sibling key leaked across a split/merge
 /// boundary would all be data-corruption signals).
 fn chaos_kid(key: &[u8]) -> Option<u32> {
+    let key = key.strip_prefix(CHAOS_NS.as_bytes())?;
     if key.len() == 7
         && (key[0] == b'b' || key[0] == b'q')
         && key[1..].iter().all(u8::is_ascii_digit)
@@ -540,13 +553,24 @@ async fn writer_loop(
     stop: Arc<AtomicBool>,
     writes_acked: Arc<AtomicU64>,
     writes_failed: Arc<AtomicU64>,
+    // Why writes failed, keyed by reason. A bare count cannot distinguish
+    // "the nemesis is doing its job" from "the cluster never worked", and
+    // those want opposite responses from whoever reads the report.
+    write_failures: Arc<Mutex<BTreeMap<String, u64>>>,
     mut lcg: Lcg,
 ) {
+    let note = |why: &str| {
+        *write_failures
+            .lock()
+            .expect("write_failures")
+            .entry(why.to_string())
+            .or_insert(0) += 1;
+    };
     let mut seq: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         seq += 1;
         let kid = lcg.range(0, key_count as u64) as u32;
-        let key = format!("{}{:06}", key_prefix as char, kid).into_bytes();
+        let key = format!("{CHAOS_NS}{}{:06}", key_prefix as char, kid).into_bytes();
         let value = make_value(&key, seq);
         let part_id = topo.route(&key);
 
@@ -565,8 +589,9 @@ async fn writer_loop(
         // rather than panic the writer task.
         let client = match router.try_client_for(part_id).await {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
                 writes_failed.fetch_add(1, Ordering::Relaxed);
+                note(&format!("route failed (no part_addr): {e}"));
                 compio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -593,6 +618,7 @@ async fn writer_loop(
                 eprintln!("writer[{name}]: PUT TIMED OUT (5s) part_id={part_id} — uncertain, dropping key from expected");
                 expected.borrow_mut().remove(&key);
                 writes_failed.fetch_add(1, Ordering::Relaxed);
+                note("put timed out (5s, outcome uncertain)");
                 continue;
             }
         };
@@ -610,15 +636,18 @@ async fn writer_loop(
                     expected.borrow_mut().insert(key, value);
                     writes_acked.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(_) => {
+                Ok(r) => {
                     writes_failed.fetch_add(1, Ordering::Relaxed);
+                    note(&format!("PS rejected: code={}", r.code));
                 }
-                Err(_) => {
+                Err(e) => {
                     writes_failed.fetch_add(1, Ordering::Relaxed);
+                    note(&format!("PutResp decode failed: {e}"));
                 }
             },
-            Err(_) => {
+            Err(e) => {
                 writes_failed.fetch_add(1, Ordering::Relaxed);
+                note(&format!("put RPC failed: {e}"));
                 compio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -1384,6 +1413,63 @@ async fn nemesis_loop(
 }
 
 // ── Checker ────────────────────────────────────────────────────────────
+
+/// Lines the system emits when something is STRUCTURALLY wrong — every one of
+/// these is a place the code chose to fail loudly rather than continue.
+///
+/// A chaos failure accompanied by one of these names the subsystem instantly.
+/// A chaos failure with NONE of them is a different and worse finding: the
+/// invariant broke while every layer believed it was fine.
+///
+/// Deliberately excludes the noisy-but-normal: `CODE_LOCKED_BY_OTHER` is how
+/// fencing is SUPPOSED to look during a nemesis run, and a `df RPC failed` is
+/// the expected consequence of killing a node.
+const FAIL_LOUD_MARKERS: &[&str] = &[
+    "WAL-FAILSTOP",                       // WAL replay refused to guess
+    "META-FAILCLOSED",                    // `.meta` unreadable → extent quarantined
+    "quarantin",                          // any quarantine decision
+    "stale_vp_offset_past_sealed_length", // a VP points past the seal
+    "REFUSING to apply",                  // an EC completion was rejected
+    "SUPERSEDED conversion attempt",      // a stripe from a dead attempt
+    "cannot identify the reporting node", // reconcile refused to answer
+    "payload file not held here",         // a read named a file this node lacks
+    "disk OFFLINE",                       // a persist failure took a disk down
+    "bg_loop",                            // a supervised loop panicked and restarted
+    "panicked",
+];
+
+/// Grep the EN subprocess logs for fail-loud markers.
+///
+/// The manager and PS run in-process here, so their tracing goes to the test's
+/// own stderr; the ENs are real subprocesses and theirs is on disk. That is the
+/// right surface anyway — recovery, EC conversion, quarantine and disk-health
+/// all live on the EN, which is what this test exists to exercise.
+fn scan_en_fail_loud(log_dir: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return hits;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let Some(name) = name else { continue };
+        if !name.starts_with("en-") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in body.lines() {
+            if let Some(m) = FAIL_LOUD_MARKERS.iter().find(|m| line.contains(**m)) {
+                // Keep the tail: the message, not the ANSI-coloured timestamp.
+                let trimmed = line.chars().rev().take(240).collect::<String>();
+                let trimmed: String = trimmed.chars().rev().collect();
+                hits.push(format!("[{name}] <{m}> {trimmed}"));
+            }
+        }
+    }
+    hits
+}
 
 /// Decode the `seq` field that `make_value` embedded so verify
 /// diagnostics can show "expected seq=N got seq=M" — far more useful
@@ -2525,7 +2611,8 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let row = create_stream_kp(&mgr, cfg.ec_k, cfg.ec_m).await;
         let meta = create_stream_kp(&mgr, cfg.ec_k, cfg.ec_m).await;
         let part_id = 9001u64;
-        upsert_partition(&mgr, part_id, log, row, meta, b"a", b"z").await;
+        // The range must bracket the namespaced keys, not the bare ones.
+        upsert_partition(&mgr, part_id, log, row, meta, b"mem/a", b"mem/z").await;
 
         // -------- Start PS (in-process) --------
         let ps_addr = pick_addr();
@@ -2542,6 +2629,8 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let stop = Arc::new(AtomicBool::new(false));
         let writes_acked = Arc::new(AtomicU64::new(0));
         let writes_failed = Arc::new(AtomicU64::new(0));
+        let write_failures: Arc<Mutex<BTreeMap<String, u64>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
         let reads_ok = Arc::new(AtomicU64::new(0));
         let reads_miss = Arc::new(AtomicU64::new(0));
         let nemesis_events = Arc::new(AtomicU64::new(0));
@@ -2555,10 +2644,11 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let stop = stop.clone();
             let writes_acked = writes_acked.clone();
             let writes_failed = writes_failed.clone();
+            let write_failures = write_failures.clone();
             let lcg = Lcg::new(cfg.seed.wrapping_add(101));
             async move {
                 writer_loop(
-                    "w1", router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, lcg,
+                    "w1", router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
                 )
                 .await;
             }
@@ -2570,10 +2660,11 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let stop = stop.clone();
             let writes_acked = writes_acked.clone();
             let writes_failed = writes_failed.clone();
+            let write_failures = write_failures.clone();
             let lcg = Lcg::new(cfg.seed.wrapping_add(202));
             async move {
                 writer_loop(
-                    "w2", router, topo, expected, b'q', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, lcg,
+                    "w2", router, topo, expected, b'q', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
                 )
                 .await;
             }
@@ -2788,7 +2879,56 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let liveness_errors = verify_write_liveness(&router, &topo).await;
         eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
 
-        if !mismatches.is_empty()
+        // A run that acked nothing VERIFIED nothing. Every per-key check below
+        // is vacuously satisfied by an empty `expected`, so without this the
+        // report reads "0 mismatches, 0 not_found" — indistinguishable from a
+        // clean run — while the cluster was in fact never writable.
+        let acked_total = writes_acked.load(Ordering::Relaxed);
+        let failed_total = writes_failed.load(Ordering::Relaxed);
+        let failure_tally = {
+            let m = write_failures.lock().expect("write_failures");
+            let mut v: Vec<(String, u64)> = m.iter().map(|(k, c)| (k.clone(), *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v
+        };
+        if !failure_tally.is_empty() {
+            eprintln!("chaos: write failures by reason (acked={acked_total} failed={failed_total}):");
+            for (why, count) in failure_tally.iter().take(12) {
+                eprintln!("  {count:6}  {why}");
+            }
+        }
+        let mut workload_errors: Vec<String> = Vec::new();
+        if acked_total == 0 {
+            workload_errors.push(format!(
+                "WORKLOAD ACKED NOTHING — 0 writes accepted, {failed_total} failed. Every \
+                 per-key invariant below is vacuous; this run verified nothing. Top reasons: {}",
+                failure_tally
+                    .iter()
+                    .take(5)
+                    .map(|(w, c)| format!("{c}× {w}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+
+        // WHY, before WHAT. The counts below say an invariant broke; this says
+        // which layer noticed something first — and its ABSENCE is itself a
+        // finding, because it means the break was silent.
+        let fail_loud = scan_en_fail_loud(&log_dir);
+        if fail_loud.is_empty() {
+            eprintln!("chaos: no fail-loud markers in any EN log");
+        } else {
+            eprintln!(
+                "chaos: {} fail-loud marker line(s) in the EN logs:",
+                fail_loud.len()
+            );
+            for l in fail_loud.iter().take(20) {
+                eprintln!("  {l}");
+            }
+        }
+
+        if !workload_errors.is_empty()
+            || !mismatches.is_empty()
             || !not_found.is_empty()
             || !range_errors.is_empty()
             || !liveness_errors.is_empty()
@@ -2798,8 +2938,30 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             || !not_found2.is_empty()
             || !accounting_errors2.is_empty()
         {
+            let why = if fail_loud.is_empty() {
+                "NO fail-loud marker in any EN log — the invariant broke SILENTLY, \
+                 which is a worse finding than a loud failure: no layer noticed"
+                    .to_string()
+            } else {
+                format!(
+                    "{} fail-loud marker line(s) — start here:\n  {}",
+                    fail_loud.len(),
+                    fail_loud
+                        .iter()
+                        .take(20)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n  ")
+                )
+            };
             panic!(
-                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
+                "chaos verify FAILED\nWHY: {why}\nworkload: {}\nlogs: {}\n— mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
+                if workload_errors.is_empty() {
+                    format!("acked={acked_total} failed={failed_total}")
+                } else {
+                    workload_errors.join("; ")
+                },
+                log_dir.display(),
                 mismatches.len(),
                 not_found.len(),
                 range_errors.len(),

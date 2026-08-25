@@ -158,12 +158,13 @@ zombie predecessor writing the same index file (§4.3).
 **As built.** The nonce is *the etcd revision of the txn that created the
 marker*, read from that txn's own response (`txn_fenced_revision`) and rebuilt on
 promotion from the key's `mod_revision`. This costs no new key and no persisted
-struct change, which matters more than it first appears: `MgrEcDispatchInflight`
-is nested in `MgrExtentInflightRecord` as an `Option`, so widening it shifts that
-struct's archived layout and every live marker — **recovery and delete
-included** — would fail rkyv validation on replay, blocking leadership on
-upgrade. The sibling key contemplated above was the alternative; etcd already
-storing this value made it unnecessary.
+struct change. The alternative was widening `MgrEcDispatchInflight`, which is
+nested in `MgrExtentInflightRecord` as an `Option` — so the change would shift
+that struct's archived layout and make every live marker (recovery and delete
+included) fail rkyv validation on replay. That is only a hard blocker across an
+upgrade, which does not apply here; it is still the worse design, because a
+marker's identity is a fact etcd already knows and duplicating it into the value
+invites the two to disagree.
 
 Being a revision also makes nonces **monotonic**, which buys a guard a random
 nonce could not: a participant refuses a `WriteShard` whose nonce is *lower* than
@@ -173,9 +174,9 @@ stripes into its successor's staging file; the ordering does. That guard is
 in-memory — it arbitrates two live writers, and a restart falls back to the
 stripe-0 truncate and the epoch fence.
 
-`0` means "no attempt identity" (a pre-nonce marker or peer). A 0-nonce report
-completes only a 0-nonce marker, so an upgrade converges instead of wedging,
-while a 0-nonce report can never complete an identified attempt.
+`0` means "no attempt identity". A 0-nonce report completes only a 0-nonce
+marker, and can never complete an identified attempt — so the sentinel is inert
+in normal operation and would let a mixed fleet converge if one ever existed.
 
 ### 4.2 Which file does the EN serve?
 
@@ -185,8 +186,8 @@ EN obeys — the EN never infers its own role.**
 
 The request must carry **both**:
 
-- **`payload_location`** — `InDat` (full replica, or a legacy shard converted
-  under the old scheme) or `InShardFile`.
+- **`payload_location`** — `InDat` (the whole payload is in `.dat`) or
+  `InShardFile`.
 - **the shard index** — a node can legitimately hold shard files at two different
   indices (different attempts, or a parity slot plus a data slot after a
   reassignment), so the location alone does not name a file.
@@ -243,8 +244,7 @@ and then vanishes from the system at the next restart** — so this is part of t
 design, not an implementation detail.
 
 - **On-disk shape.** A shard holder has `extent-{id}.shard{i}` + `.meta`. A
-  pre-cleanup holder still also has `.dat`. A legacy holder has its shard *in*
-  `.dat` and no shard file.
+  pre-cleanup holder still also has `.dat`.
 - **Startup discovery.** `load_extents` must build an entry from a shard file
   when `.dat` is absent, recording the index found. Two shard files at different
   indices is a legal transient — record both; the layout decides which is
@@ -324,27 +324,33 @@ raises the odds of a stale cross-attempt report (§4.1).
 
 ---
 
-## 7. Persistence, migration, and legacy
+## 7. Persistence and wire
 
-**`payload_location` must not widen a persisted rkyv struct.** `MgrExtentInfo` is
-stored in etcd and decoded on replay; adding a field makes an existing cluster's
-stored values undecodable, which blocks leadership — the opposite of a free
-migration. Carry it (and the §4.1 nonce) in a **sibling etcd key** keyed by extent
-id, absent ⇒ `InDat`. That is what makes "every pre-existing extent defaults to
-`InDat`" actually true.
+**This landed on an active development cluster with no historical data**, so
+nothing below is a migration constraint — there is no old state to decode, no
+old-scheme shard to keep working, and no upgrade to converge. What remains is
+the shape that was built, and the reason each choice is still the right one on
+its own merits.
 
-**Wire.** `ExtentInfo` gains `payload_location`; `ReadBytesReq` gains
-`(payload_location, shard_index)`; plus a distinct error code for "the requested
-payload file is not held here". WIRE fingerprint refresh + version decision as
-usual (same-commit stop-world deploy).
+**`payload_location` lives in a sibling etcd key**, not in `MgrExtentInfo`.
+Originally that was to avoid making an existing cluster's stored extents
+undecodable on replay. With no such cluster the argument no longer binds, but
+the shape stays: the location is per-extent metadata with a meaningful default
+(`absent ⇒ InDat`), so a key that exists only for the extents that deviate is
+smaller and simpler than a field every record must carry.
 
-**Legacy shards.** Extents converted under the old scheme have their shard in
-`.dat` and are `InDat` by default — they keep working with no backfill.
+**Wire.** `ExtentInfo` carries `payload_location`; `ReadBytesReq` carries
+`(payload_location, shard_index)`; `CODE_PAYLOAD_NOT_HERE` is the refusal when a
+node does not hold the named file. Deploys are same-commit stop-the-world, so a
+schema edit is a fingerprint refresh plus a version decision — not a
+compatibility window.
 
-**Pre-upgrade crash states — N/A.** This landed on an active development
-cluster with no historical data, so the commit-phase repair code was deleted
-outright rather than retained (§10 step 6). On a cluster that HAD run the old
-scheme, that code would have to stay until every node was proven clean.
+**One thing a real upgrade WOULD need**, recorded so it is not rediscovered: the
+`0` sentinel on `attempt_nonce` and `payload_location` means "no identity / the
+pre-existing layout". Those defaults are what would let old records and old
+peers converge. They cost nothing and are already in place; a cluster with
+history would additionally have to keep the commit-phase repair code (§10 step
+6) until every node was proven clean.
 
 ---
 
@@ -530,7 +536,6 @@ membership-based reconcile with grace.
 - after the flip → a read carrying `(InShardFile, i)` returns shard *i*.
 - a read naming a payload file the node does not hold **errors** — never falls
   back to the other file.
-- legacy shape (shard in `.dat`, `InDat`) serves shard reads unchanged.
 - startup discovery builds an entry from a shard file with no `.dat`; two shard
   files at different indices are both recorded.
 - `remove_extent_files` / reconcile scans / `extent_bytes` all see `.shard{i}`.
@@ -556,8 +561,6 @@ membership-based reconcile with grace.
 | **(K,M) changed between attempts over residue** | stale-shape staging never adopted |
 | delete / `punch_holes` of a flipped extent | shard files unlinked; no orphans |
 | EC shard recovery under the new naming | rebuilds into `.shard{i}` |
-| pre-upgrade `.ec.commit` state on an upgraded EN | resolved by retained replay (§7) |
-| pre-upgrade etcd values | decode unchanged; default `InDat` |
 | leader failover between staged-confirm and flip | marker replay → re-dispatch → adopt-report → flip |
 | `FdLru` holding an unlinked fd across cleanup | no stale reads; fd released |
 
