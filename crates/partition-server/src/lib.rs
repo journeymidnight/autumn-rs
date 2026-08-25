@@ -566,6 +566,30 @@ const VALUE_THROTTLE: usize = 4 * 1024;
 const VALUE_POINTER_SIZE: usize = 24;
 const OP_VALUE_POINTER: u8 = 0x80;
 
+/// Does this WAL record's value hold a ValuePointer?
+///
+/// **GC's scan and the replay MUST answer this identically.** GC decides what
+/// to relocate from the scan and then punches the extent; recovery decides what
+/// to reconstruct from the replay. If the two disagree about a record, GC
+/// relocates a set that does not match what is actually live and then destroys
+/// the originals.
+///
+/// They did disagree. GC's own relocation writes its WAL record with a bare
+/// `op = 1` — its memtable insert sets `1 | OP_VALUE_POINTER`, but the record on
+/// disk does not — while the scan required the flag and the replay accepted
+/// either the flag OR an over-threshold length. So a relocated value was
+/// reconstructed correctly by recovery, and invisible to the NEXT GC of the
+/// extent it had just been moved into: skipped as if it were a chunk blob, not
+/// relocated, and punched while its ValuePointer was still live. Any large
+/// value that survived two GC generations was silently lost.
+///
+/// The length arm also covers records written before the flag existed, which is
+/// why the replay had it in the first place.
+#[inline]
+fn record_carries_value_pointer(op: u8, value_len: usize) -> bool {
+    op & OP_VALUE_POINTER != 0 || value_len > VALUE_THROTTLE
+}
+
 /// BUG-LEASE-2 Phase 2: WAL record op for a fence-floor bump. Emitted into
 /// the SAME group-commit batch as (and BEFORE) the write whose
 /// `check_and_bump_fence` raised the per-ino floor, so the floor is durable
@@ -1351,7 +1375,39 @@ mod bug1_wal_gap_tests {
     //! `log_bytes` tracks true log growth (crosses the gap) while `mem_bytes`
     //! stays VP-sized (never would), so `partition_loop`'s gap check must read
     //! `log_bytes()`.
-    use super::{max_wal_gap, MemEntry, Memtable, OP_VALUE_POINTER};
+    use super::{
+        max_wal_gap, record_carries_value_pointer, MemEntry, Memtable, OP_VALUE_POINTER,
+        VALUE_THROTTLE,
+    };
+
+    /// GC decides what to relocate from its SCAN and then punches the extent;
+    /// recovery decides what to reconstruct from the REPLAY. If those two
+    /// classify a record differently, GC destroys originals it never moved.
+    ///
+    /// The record GC itself writes when relocating is the case that broke: its
+    /// memtable entry carried the VP flag, its WAL record did not, the replay
+    /// accepted it anyway on length, and the next GC scan of the extent it had
+    /// just been moved into skipped it as a chunk blob — then punched. Any
+    /// large value surviving two GC generations was silently lost.
+    #[test]
+    fn the_scan_and_the_replay_agree_on_a_gc_written_record() {
+        let big = VALUE_THROTTLE + 1;
+
+        // What GC writes today: flagged, and over threshold.
+        assert!(record_carries_value_pointer(1 | OP_VALUE_POINTER, big));
+        // What GC used to write: bare op, over threshold. The replay always
+        // accepted this; the scan must too, or records already on disk are
+        // relocated by neither and punched by GC.
+        assert!(
+            record_carries_value_pointer(1, big),
+            "a bare-op large record is a ValuePointer to the replay, so it must be one to GC"
+        );
+        // A small inline value is not a ValuePointer either way.
+        assert!(!record_carries_value_pointer(1, 16));
+        // The fence-bump record must stay invisible to the VP scan: 8 bytes,
+        // no flag.
+        assert!(!record_carries_value_pointer(super::OP_FENCE_BUMP, 8));
+    }
 
     #[test]
     fn wal_gap_uses_log_bytes_not_mem_bytes_for_large_values() {
@@ -8400,7 +8456,7 @@ async fn recover_partition(
                     + crate::wal_record::PAYLOAD_HEADER as u64
                     + key.len() as u64
                     + value.len() as u64;
-                let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
+                let mem_entry = if record_carries_value_pointer(op, value.len()) {
                     // VP detection: new WAL has VP flag in op; old WAL uses
                     // value size as fallback. The reconstructed VP.offset MUST
                     // equal the value's true on-disk offset for BOTH envelope

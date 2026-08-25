@@ -3191,7 +3191,11 @@ async fn process_gc_chunk(
         let val_len = value.len();
         let _ = expires_at; // used downstream by GcRecord builder
 
-        if op & OP_VALUE_POINTER == 0 {
+        // Same predicate the replay uses — see `record_carries_value_pointer`.
+        // GC relocates from this scan and then punches the extent, so a record
+        // the replay treats as a ValuePointer and this scan skips is a value
+        // destroyed while live.
+        if !crate::record_carries_value_pointer(op, val_len) {
             continue;
         }
         let user_key = parse_key(key).to_vec();
@@ -3362,8 +3366,15 @@ async fn process_gc_chunk(
         // (yield between chunks), so the copy is acceptable on this cold
         // path.
         let value_bytes = Bytes::copy_from_slice(value);
-        let (hdr_seg, val_seg, crc_seg) =
-            crate::wal_record::encode_v1_segments(1u8, &internal_key, value_bytes, expires_at);
+        // Mark the record as carrying a ValuePointer, matching the memtable
+        // entry this same relocation inserts. Leaving it bare made GC's own
+        // output invisible to GC's next scan.
+        let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
+            1u8 | crate::OP_VALUE_POINTER,
+            &internal_key,
+            value_bytes,
+            expires_at,
+        );
         let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
         batch.segments.push(hdr_seg);
         if !value.is_empty() {
