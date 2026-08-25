@@ -2028,6 +2028,7 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
     let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
 
     if head_size < head_threshold {
+        let head_total = tables.iter().filter(|t| t.extent_id == head_extent).count();
         let chosen: Vec<TableMeta> = tables
             .iter()
             .filter(|t| t.extent_id == head_extent)
@@ -2064,7 +2065,16 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
                 break;
             }
         }
-        if ci == chosen_sorted.len() && compact_tbls.len() >= 2 {
+        // `truncate_id` asks the manager to delete every extent BEFORE it, so
+        // returning it asserts the head extent is fully drained. That holds only
+        // if the chosen set was the WHOLE head extent — `take(COMPACT_N)` caps
+        // it, so with more head tables than that, compaction consumes the oldest
+        // few and the rest stay live inside the extent this would delete. Their
+        // keys become unservable and the checkpoint references an SST in a
+        // deleted extent, so the partition does not reopen. Compact them anyway;
+        // just don't claim the extent is empty.
+        if ci == chosen_sorted.len() && chosen_sorted.len() == head_total && compact_tbls.len() >= 2
+        {
             return (compact_tbls, truncate_id);
         }
         if compact_tbls.len() >= 2 {
@@ -4684,5 +4694,64 @@ mod fence_classifier_tests {
         // Generic errors must not classify.
         let plain = anyhow::anyhow!("replica 1 rpc error: connection reset");
         assert!(!is_locked_by_other(&plain));
+    }
+}
+
+#[cfg(test)]
+mod compaction_truncate_tests {
+    use super::pickup_tables;
+    use crate::TableMeta;
+
+    fn t(extent_id: u64, last_seq: u64, size: u64) -> TableMeta {
+        TableMeta {
+            extent_id,
+            offset: 0,
+            len: size,
+            estimated_size: size,
+            last_seq,
+        }
+    }
+
+    /// `truncate_id` tells the manager to drop every extent BEFORE it — so
+    /// returning the second extent means "the head extent is fully drained".
+    /// That claim is only true if compaction consumed EVERY table in the head
+    /// extent, not just the ones it chose.
+    ///
+    /// The head-extent rule arms once the head is a minority of total bytes,
+    /// which many small SSTs satisfy. With more than COMPACT_N of them, the
+    /// oldest COMPACT_N are compacted and the rest stay live — pointing into an
+    /// extent the truncate is about to delete. The partition then cannot serve
+    /// those keys, and its checkpoint references an SST in a deleted extent, so
+    /// it does not reopen.
+    #[test]
+    fn head_extent_is_only_truncated_once_every_one_of_its_tables_is_consumed() {
+        // Head extent 10 holds 8 small SSTs; extent 11 holds one big one, so
+        // the head is well under HEAD_RATIO of the total and the rule arms.
+        let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * 1024 * 1024)).collect();
+        tables.push(t(11, 100, 4 * 1024 * 1024 * 1024));
+
+        let (picked, truncate_id) = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        assert!(!picked.is_empty(), "the head-extent rule should have armed");
+        assert!(
+            picked.len() < 8,
+            "precondition: not all head tables fit in one compaction"
+        );
+        assert_eq!(
+            truncate_id, 0,
+            "asked to truncate past extent 10 while {} of its tables are still live",
+            8 - picked.len()
+        );
+    }
+
+    /// The case truncation exists for: the head extent fits in one compaction,
+    /// so after it there is genuinely nothing left there.
+    #[test]
+    fn a_fully_consumed_head_extent_is_truncated() {
+        let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * 1024 * 1024)).collect();
+        tables.push(t(11, 100, 4 * 1024 * 1024 * 1024));
+
+        let (picked, truncate_id) = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        assert_eq!(picked.len(), 3, "all three head tables should compact");
+        assert_eq!(truncate_id, 11, "head extent is drained, so it can go");
     }
 }
