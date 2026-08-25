@@ -317,3 +317,50 @@ async fn a_shard_only_extent_is_counted_once() {
         "a shard-only extent must report exactly its shard's bytes"
     );
 }
+
+/// The manager makes exactly ONE `df` call per node and dials shard 0, but a
+/// completion is queued by whichever shard OWNS the extent. Per-instance queues
+/// meant every completion for an extent owned by shard 1..N was pushed where
+/// nothing ever read — conversions could never commit and rebuilt replicas were
+/// never applied, on (N-1)/N of a production EN's extents.
+///
+/// The queues are shared per NODE, so two shards over the same data dirs see
+/// each other's reports; two different nodes must not.
+#[compio::test]
+async fn shards_of_one_node_share_their_completion_queue() {
+    use autumn_stream::{ExtentNode, ExtentNodeConfig};
+
+    let d = tempfile::tempdir().expect("tempdir");
+    let other = tempfile::tempdir().expect("tempdir2");
+
+    // Two shards of the SAME node: same data dir, different shard index.
+    let shard0 = ExtentNode::new(
+        ExtentNodeConfig::new(d.path().to_path_buf(), 1)
+            .with_shard(0, 2, vec![String::new(), String::new()]),
+    )
+    .await
+    .expect("shard 0");
+    let shard1 = ExtentNode::new(
+        ExtentNodeConfig::new(d.path().to_path_buf(), 1)
+            .with_shard(1, 2, vec![String::new(), String::new()]),
+    )
+    .await
+    .expect("shard 1");
+    // A different node entirely.
+    let elsewhere = ExtentNode::new(ExtentNodeConfig::new(other.path().to_path_buf(), 1))
+        .await
+        .expect("other node");
+
+    shard1.test_push_ec_done(4242, 7);
+
+    assert_eq!(
+        elsewhere.test_take_ec_done(),
+        vec![],
+        "a different node must not see this node's completions — in-process test          clusters run several ENs, and the manager refuses an ec_done reported by          a node that is not the marker's coordinator"
+    );
+    assert_eq!(
+        shard0.test_take_ec_done(),
+        vec![(4242, 7)],
+        "shard 0 serves the node's df, so it must drain what shard 1 completed"
+    );
+}

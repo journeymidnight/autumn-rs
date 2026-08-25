@@ -268,6 +268,82 @@ struct DiskFS {
 /// same physical dir share ONE state; distinct dirs (in-process tests,
 /// real multi-disk) stay isolated. Entries are tiny and bounded by the
 /// number of distinct data dirs ever opened in the process.
+/// The completion queues every shard of this process pushes into.
+///
+/// A long-running EN task (recovery, EC conversion) reports finishing by
+/// queueing here; the manager drains the queue on its next `df`. But the
+/// manager makes exactly ONE `df` call per NODE — deliberately, because
+/// `handle_df` takes the queue, so a second caller would drain-and-discard —
+/// and it dials the registered control address, which is shard 0's.
+///
+/// Each shard is a separate `ExtentNode` with its own state, so a per-instance
+/// queue meant every completion for an extent owned by shard 1..N was pushed
+/// somewhere nothing ever read. The conversion could never commit (its marker
+/// pinned the extent forever, blocking that extent's GC), and a rebuilt replica
+/// was never applied (the slot stayed silently unrepaired). On a production EN,
+/// where shard count is core count, that is (N-1)/N of the extents.
+///
+/// Sharing the queues across the process fixes it without adding a second `df`
+/// caller: shard 0 drains what every shard produced. Same shape as
+/// `shared_disk_health`, which shares disk state across shards for the same
+/// structural reason. `Arc<Mutex<..>>` rather than `Rc<RefCell<..>>` because
+/// shards are separate OS threads.
+#[derive(Clone, Default)]
+pub(crate) struct DoneQueues {
+    recovery: std::sync::Arc<std::sync::Mutex<Vec<RecoveryTaskDone>>>,
+    ec: std::sync::Arc<std::sync::Mutex<Vec<crate::extent_rpc::EcConvertDone>>>,
+}
+
+impl DoneQueues {
+    fn push_recovery(&self, d: RecoveryTaskDone) {
+        self.recovery.lock().expect("recovery_done").push(d);
+    }
+    fn push_ec(&self, d: crate::extent_rpc::EcConvertDone) {
+        self.ec.lock().expect("ec_done").push(d);
+    }
+    fn take_recovery(&self) -> Vec<RecoveryTaskDone> {
+        std::mem::take(&mut *self.recovery.lock().expect("recovery_done"))
+    }
+    fn take_ec(&self) -> Vec<crate::extent_rpc::EcConvertDone> {
+        std::mem::take(&mut *self.ec.lock().expect("ec_done"))
+    }
+}
+
+/// One set of queues per NODE, keyed by its data directories.
+///
+/// Not per process. In production those coincide — one EN process serves one
+/// node — but the test suites run several logical ENs in a single process, and
+/// a process-wide queue would let one node's `df` drain another's completions.
+/// That is not merely untidy: the manager refuses an `ec_done` reported by a
+/// node that is not the marker's coordinator, so cross-talk would make
+/// conversions fail to commit in exactly the multi-EN tests that are supposed
+/// to prove they do.
+///
+/// The data dirs are the right key because every shard of one node opens the
+/// SAME `--data` dirs, and two different nodes never do — the same reasoning
+/// `shared_disk_health` uses one field over.
+fn shared_done_queues(disks: &[(PathBuf, Option<u64>)]) -> DoneQueues {
+    static Q: std::sync::Mutex<Option<HashMap<String, DoneQueues>>> =
+        std::sync::Mutex::new(None);
+    let mut key_parts: Vec<String> = disks
+        .iter()
+        .map(|(dir, _)| {
+            dir.canonicalize()
+                .unwrap_or_else(|_| dir.clone())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    key_parts.sort();
+    let key = key_parts.join("|");
+    Q.lock()
+        .expect("done queues")
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
 fn shared_disk_health(base_dir: &std::path::Path) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
     static CELLS: std::sync::Mutex<
         Option<HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicU8>>>,
@@ -1344,12 +1420,12 @@ pub struct ExtentNode {
     /// and hands the response receiver back through the job's oneshot so
     /// downstream RTTs still overlap.
     chain_fwd: Rc<RefCell<HashMap<String, futures::channel::mpsc::Sender<ChainFwdJob>>>>,
-    recovery_done: Rc<RefCell<Vec<RecoveryTaskDone>>>,
+    /// Shared across every shard of this process — see `DoneQueues`.
+    done: DoneQueues,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// Finished EC conversions awaiting pickup by the next `df` (mirrors
     /// `recovery_done` — the manager learns completion from the heartbeat,
     /// not from the dispatch RPC's return).
-    ec_done: Rc<RefCell<Vec<crate::extent_rpc::EcConvertDone>>>,
     /// EC conversions running in the background on this shard. The manager
     /// re-dispatches from its durable marker every ~5 s, so without this guard
     /// each tick would spawn another converter for the same extent.
@@ -1436,9 +1512,8 @@ impl Clone for ExtentNode {
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
             chain_fwd: self.chain_fwd.clone(),
-            recovery_done: self.recovery_done.clone(),
+            done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
-            ec_done: self.ec_done.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
             shard_idx: self.shard_idx,
@@ -3166,6 +3241,9 @@ impl ExtentNode {
     const META_SIZE: usize = Self::META_SIZE_V2;
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
+        // Keyed by the data dirs, which every shard of this node shares — see
+        // `shared_done_queues`. Captured before `config.disks` is consumed.
+        let done = shared_done_queues(&config.disks);
         // Build DiskFS instances for all configured disks.
         let mut disk_map: HashMap<u64, Rc<DiskFS>> = HashMap::new();
         for (dir, maybe_disk_id) in config.disks {
@@ -3225,9 +3303,8 @@ impl ExtentNode {
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
             chain_fwd: Rc::new(RefCell::new(HashMap::new())),
-            recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
+            done,
             recovery_inflight: Rc::new(DashMap::new()),
-            ec_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             ec_convert_inflight: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
             shard_idx: config.shard_idx,
@@ -6812,9 +6889,9 @@ impl ExtentNode {
         }
 
         let done_tasks = {
-            let mut done = self.recovery_done.borrow_mut();
+            let mut done = self.done.take_recovery();
             if req.tasks.is_empty() {
-                std::mem::take(&mut *done)
+                done
             } else {
                 let wanted = req
                     .tasks
@@ -6835,7 +6912,10 @@ impl ExtentNode {
                         remaining.push(status);
                     }
                 }
-                *done = remaining;
+                // Put back what this caller did not ask for.
+                for status in remaining {
+                    self.done.push_recovery(status);
+                }
                 matched
             }
         };
@@ -6843,7 +6923,7 @@ impl ExtentNode {
         // Drain completed EC conversions (at-most-once, same contract as
         // `done_tasks`): a report lost because the manager failed to apply it
         // converges via re-dispatch → the EN's idempotent-skip adopt path.
-        let ec_done = std::mem::take(&mut *self.ec_done.borrow_mut());
+        let ec_done = self.done.take_ec();
 
         Ok(rkyv_encode(&DfResp {
             done_tasks,
@@ -6922,7 +7002,7 @@ impl ExtentNode {
             sealed_length = info.sealed_length,
             "require_recovery: local copy already complete — adopting (lost-completion re-dispatch)"
         );
-        self.recovery_done.borrow_mut().push(RecoveryTaskDone {
+        self.done.push_recovery(RecoveryTaskDone {
             task: task.clone(),
             ready_disk_id: entry.disk_id,
         });
@@ -7031,7 +7111,7 @@ impl ExtentNode {
                 match node.run_recovery_task(task.clone()).await {
                     Ok(done) => {
                         node.recovery_inflight.remove(&extent_id);
-                        node.recovery_done.borrow_mut().push(done);
+                        node.done.push_recovery(done);
                         return;
                     }
                     Err(e) => {
@@ -7714,13 +7794,11 @@ impl ExtentNode {
                     // nonce says WHICH attempt finished — without it a report
                     // that outlived its own attempt is indistinguishable from
                     // the live one's.
-                    node.ec_done
-                        .borrow_mut()
-                        .push(crate::extent_rpc::EcConvertDone {
-                            extent_id,
-                            new_eversion,
-                            attempt_nonce,
-                        });
+                    node.done.push_ec(crate::extent_rpc::EcConvertDone {
+                        extent_id,
+                        new_eversion,
+                        attempt_nonce,
+                    });
                     tracing::info!(
                         extent_id,
                         new_eversion,
@@ -8255,7 +8333,26 @@ impl ExtentNode {
         Ok(WriteShardResp { code: CODE_OK }.encode())
     }
 
-        /// Seal an extent locally, for integration tests that need one in the
+        /// Queue an EC completion as the owning shard would, for tests that need to
+    /// prove the node's `df` shard drains it.
+    pub fn test_push_ec_done(&self, extent_id: u64, new_eversion: u64) {
+        self.done.push_ec(crate::extent_rpc::EcConvertDone {
+            extent_id,
+            new_eversion,
+            attempt_nonce: 0,
+        });
+    }
+
+    /// Drain queued EC completions as `handle_df` does, as `(extent_id, eversion)`.
+    pub fn test_take_ec_done(&self) -> Vec<(u64, u64)> {
+        self.done
+            .take_ec()
+            .into_iter()
+            .map(|d| (d.extent_id, d.new_eversion))
+            .collect()
+    }
+
+    /// Seal an extent locally, for integration tests that need one in the
     /// post-seal shape (sealed, at a chosen length and eversion).
     ///
     /// In production only a manager-driven path seals an EN's extent
