@@ -5575,10 +5575,15 @@ impl AutumnManager {
         let garbage: Vec<u64> = {
             let s = self.store.inner.borrow();
             let mut seen = self.reconcile_non_member.borrow_mut();
-            // Only keep counters for extents this node still reports, so the map
-            // cannot grow without bound.
+            // Only keep counters for extents this SHARD still reports, so the
+            // map cannot grow without bound. Scoping to the shard matters: its
+            // siblings share this node_id and report disjoint extents, so a
+            // node-wide prune would let each sibling erase the others' grace
+            // and no verdict would ever reach three rounds.
             let reported: std::collections::HashSet<u64> = req.extent_ids.iter().copied().collect();
-            seen.retain(|(n, eid), _| *n != req.node_id || reported.contains(eid));
+            seen.retain(|(n, sh, eid), _| {
+                *n != req.node_id || *sh != req.shard_idx || reported.contains(eid)
+            });
 
             req.extent_ids
                 .iter()
@@ -5586,7 +5591,7 @@ impl AutumnManager {
                 .filter(|eid| {
                     let Some(ex) = s.extents.get(eid) else {
                         // (1) unknown extent — immediate.
-                        seen.remove(&(req.node_id, *eid));
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
                         return true;
                     };
                     // An op in flight on this extent means the file set is
@@ -5598,14 +5603,14 @@ impl AutumnManager {
                     // runs — the manager is the only party that knows about an
                     // attempt driven from elsewhere.
                     if self.extent_inflight_op(*eid).is_some() {
-                        seen.remove(&(req.node_id, *eid));
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
                         return false;
                     }
                     if let Some(slot) = Self::extent_nodes(ex)
                         .iter()
                         .position(|n| *n == req.node_id)
                     {
-                        seen.remove(&(req.node_id, *eid));
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
                         // A member: tell it WHICH file it should be holding, so
                         // it can drop the other one. The slot in
                         // `replicates ++ parity` is this node's shard index.
@@ -5617,7 +5622,7 @@ impl AutumnManager {
                         return false;
                     }
                     // (2) non-member — count the rounds.
-                    let c = seen.entry((req.node_id, *eid)).or_insert(0);
+                    let c = seen.entry((req.node_id, req.shard_idx, *eid)).or_insert(0);
                     *c += 1;
                     *c >= NON_MEMBER_ROUNDS_BEFORE_GC
                 })

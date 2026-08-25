@@ -399,7 +399,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   tombstone and `CommitEcShardReq/Resp` are deleted — conversion stages an
     //   additive `extent-{id}.shard{i}` and the manager's layout flip is the
     //   sole commit point, so no node publishes a shard over its own `.dat`.
-    (29, "33423f04bcc34c69"),
+    //   v29 refreshed IN PLACE again (still undeployed): `ReconcileExtentsReq`
+    //   grew `shard_idx`. Every shard of an EN reconciles its own disjoint
+    //   extents under one shared node_id, so without it the manager's grace
+    //   counters — pruned to what the reporter still holds — were wiped by
+    //   every sibling's report and no verdict could reach three rounds.
+    (29, "43314a4c668430bc"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -885,7 +885,8 @@ pub struct AutumnManager {
     /// momentarily-wrong view (mid-`apply_recovery_done` slot swap, a freshly
     /// promoted leader) must never delete real data. Leader-local: a leader
     /// change resets the counters, which only ever DELAYS a deletion.
-    pub(crate) reconcile_non_member: Rc<RefCell<HashMap<(u64, u64), u32>>>,
+    /// Keyed `(node_id, shard_idx, extent_id)` — see `ReconcileExtentsReq`.
+    pub(crate) reconcile_non_member: Rc<RefCell<HashMap<(u64, u32, u64), u32>>>,
     /// leader-local, in-memory ledger of submitted long-running ops (the
     /// queryable state + failure reason for split/merge/rebalance/compact/gc/
     /// forcegc/ec-convert). Terminal outcomes also go to the durable audit log.
@@ -5119,6 +5120,7 @@ mod tests {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
                     node_uuid: String::new(),
+                    shard_idx: 0,
                     extent_ids: vec![5],
                 }))
                 .await
@@ -5159,6 +5161,7 @@ mod tests {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 0,
                     node_uuid: String::new(),
+                    shard_idx: 0,
                     extent_ids: vec![5],
                 }))
                 .await
@@ -5189,6 +5192,7 @@ mod tests {
             m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                 node_id: 0,
                 node_uuid: "uuid-of-7".to_string(),
+                shard_idx: 0,
                 extent_ids: vec![5],
             }))
             .await
@@ -5202,6 +5206,46 @@ mod tests {
             resp.placements[0].shard_index, 1,
             "the placement must carry this node's own slot"
         );
+    }
+
+    /// Sibling shards of one EN share a node_id and report DISJOINT extents.
+    /// The grace counters are pruned to "what the reporter still holds", so
+    /// without scoping that prune to the reporting shard each sibling erases the
+    /// others' progress and no verdict ever reaches three rounds — the backstop
+    /// silently stops collecting anything.
+    #[test]
+    fn sibling_shards_do_not_erase_each_others_grace() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for eid in [5u64, 6] {
+                let mut ex = test_extent(eid, 1, 0);
+                ex.replicates = vec![1, 2, 3]; // node 7 is a member of neither
+                s.extents.insert(eid, ex);
+            }
+        }
+        let ask = |shard: u32, eid: u64| -> Vec<u64> {
+            let resp: ReconcileExtentsResp = rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 7,
+                    node_uuid: String::new(),
+                    shard_idx: shard,
+                    extent_ids: vec![eid],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap();
+            resp.garbage
+        };
+        // Two shards report in an interleaved fashion, as they would in life.
+        for _ in 0..2 {
+            assert!(ask(0, 5).is_empty());
+            assert!(ask(1, 6).is_empty());
+        }
+        assert_eq!(ask(0, 5), vec![5], "shard 0's grace was reset by its sibling");
+        assert_eq!(ask(1, 6), vec![6], "shard 1's grace was reset by its sibling");
     }
 
     /// A node that IS a member must never be told to delete, no matter how many
@@ -5222,6 +5266,7 @@ mod tests {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
                     node_uuid: String::new(),
+                    shard_idx: 0,
                     extent_ids: vec![5],
                 }))
                 .await
@@ -5263,6 +5308,7 @@ mod tests {
                 m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
                     node_id: 7,
                     node_uuid: String::new(),
+                    shard_idx: 0,
                     extent_ids: vec![5],
                 }))
                 .await

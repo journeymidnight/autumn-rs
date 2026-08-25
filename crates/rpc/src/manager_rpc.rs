@@ -798,6 +798,14 @@ pub struct ReconcileExtentsReq {
     /// cannot identify gets NO verdict at all. Empty only from a node that was
     /// started without `--advertise` (test/pre-registration).
     pub node_uuid: String,
+    /// Which shard of that node is reporting.
+    ///
+    /// Every shard runs its own reconcile over a DISJOINT set of extents, and
+    /// they all share one `node_id`. Without this the manager cannot tell one
+    /// shard's silence about an extent from the others', and its grace counters
+    /// — pruned to "what the reporter still holds" — would be wiped by every
+    /// sibling's report.
+    pub shard_idx: u32,
     pub extent_ids: Vec<u64>,
 }
 

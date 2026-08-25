@@ -3405,6 +3405,7 @@ impl ExtentNode {
             // hold", so the manager answers nothing without knowing who asked.
             node_id: 0,
             node_uuid: self.registration.node_uuid.clone(),
+            shard_idx: self.shard_idx,
             extent_ids: extent_ids.clone(),
         });
         // 10 s — read-only manager call (returns subset of submitted

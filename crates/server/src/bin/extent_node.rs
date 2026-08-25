@@ -856,6 +856,22 @@ fn main() -> Result<()> {
                                         Some((node_uuid, adv.clone(), reg_shard_ports.clone()));
                                 }
                             }
+                        } else if manager.is_some() {
+                            // Sibling shards need the node's IDENTITY even though
+                            // they don't register a LOCATION (only shard 0 is
+                            // dialed by the manager's df, so only it echoes an
+                            // advertise address).
+                            //
+                            // Every shard runs its own reconcile, for its own
+                            // disjoint set of extents, and the manager answers
+                            // nothing to a reporter it cannot identify. Without
+                            // the uuid here, shards 1..N got NO verdict — so on
+                            // any multi-core EN the orphan backstop and the
+                            // post-conversion `.dat` reclaim were dead for
+                            // (N-1)/N of the disk, silently.
+                            if let Ok((node_uuid, _)) = read_node_identity(&data_dirs) {
+                                reg_for_cfg = Some((node_uuid, String::new(), Vec::new()));
+                            }
                         }
 
                         let mut cfg = ExtentNodeConfig::new_multi(data_dirs);
