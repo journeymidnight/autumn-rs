@@ -518,11 +518,13 @@ impl AutumnManager {
         // CAVEAT (pre-existing, deferred): the df handler
         // mem::take's recovery_done once, so THIS completion is consumed
         // and NOT re-delivered — the "retry next tick" the old comment
-        // promised does not happen. Convergence is instead via the
-        // stale-marker sweep (releases the kept marker, ~10 min ceiling)
-        // followed by recovery_dispatch_loop re-evaluating the now-EC'd
-        // extent's per-slot health and re-recovering any genuinely-missing
-        // shard. A manager-side completion-retry queue would converge
+        // promised does not happen. Convergence is via the dispatch loop
+        // re-evaluating the now-EC'd extent's per-slot health and re-recovering
+        // any genuinely-missing shard. (An older comment here credited the
+        // stale-marker sweep with releasing the kept marker on a ~10 min
+        // ceiling; that sweep no longer touches Recovery markers at all —
+        // release is event-driven now — so it was describing a mechanism that
+        // had been deleted.) A manager-side completion-retry queue would converge
         // faster but is a new mechanism in a revert-prone path — deferred
         // until the slow-convergence is reproduced as real harm (stale-marker
         // sweep + orphan-reconcile backstop correctness today).
@@ -535,6 +537,39 @@ impl AutumnManager {
                 "ec conversion in flight on extent {}; deferring recovery apply",
                 task.extent_id
             )));
+        }
+
+        // ATTEMPT IDENTITY, the recovery twin of `classify_ec_done`.
+        //
+        // A completion must be the one this marker asked for. Without this, ANY
+        // arriving `RecoveryTaskDone` was applied — including one from an
+        // executor whose marker was released while it kept working, which is a
+        // case the release path explicitly contemplates ("if the executor was
+        // in fact still working and finishes later, its completion is refused").
+        // That refusal did not exist; this is it.
+        //
+        // What it cost: release the marker (a df blip is enough to make the
+        // pinned node Suspected), let the extent be EC-converted, then let the
+        // old executor finish its PRE-conversion full copy and report. The slot
+        // was swapped onto a node holding a whole `.dat` while the layout says
+        // the payload is a shard file — and the replaced node, now a
+        // non-member, has its real shard reaped by the reconcile. The manager
+        // shows every slot available while the stripe silently runs one copy
+        // short.
+        match self.extent_inflight_payload_recovery(task.extent_id) {
+            Some(pinned)
+                if pinned.node_id == task.node_id && pinned.replace_id == task.replace_id => {}
+            other => {
+                tracing::warn!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    pinned = ?other.map(|p| (p.node_id, p.replace_id)),
+                    "recovery completion does not match the live marker — REFUSING to apply \
+                     (a released attempt finishing late, or a report for another assignment)"
+                );
+                return Ok(());
+            }
         }
 
         // precheck — if `task.node_id` is already present in this

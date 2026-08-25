@@ -5018,6 +5018,82 @@ mod tests {
         assert_eq!(q.ops[0].state, OP_STATE_UNKNOWN);
     }
 
+    /// A recovery completion must match the LIVE marker. The release path
+    /// explicitly contemplates an executor that keeps working after its marker
+    /// is dropped ("if it finishes later, its completion is refused") — this is
+    /// that refusal, and it did not exist.
+    ///
+    /// What it cost: a df blip makes the pinned node Suspected, so the marker
+    /// is released routinely. If the extent is then EC-converted, the old
+    /// executor's late report of a PRE-conversion full copy would swap the slot
+    /// onto a node holding a `.dat` while the layout names a shard file — and
+    /// the replaced node, now a non-member, gets its real shard reaped.
+    #[test]
+    fn recovery_completion_from_a_released_attempt_is_refused() {
+        let m = AutumnManager::new();
+        let extent_id = 42;
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(extent_id, 1, 0);
+            ex.replicates = vec![1, 3, 5];
+            ex.sealed = true;
+            ex.sealed_length = 100;
+            s.extents.insert(extent_id, ex);
+        }
+        // No marker: the attempt was released while its executor kept working.
+        let done = MgrRecoveryTaskDone {
+            task: MgrRecoveryTask {
+                extent_id,
+                replace_id: 3,
+                node_id: 9,
+                start_time: 0,
+            },
+            ready_disk_id: 99,
+        };
+        run(async { m.apply_recovery_done(done).await }).expect("refusal is not an error");
+        let s = m.store.inner.borrow();
+        assert_eq!(
+            s.extents.get(&extent_id).unwrap().replicates,
+            vec![1, 3, 5],
+            "a completion with no live marker must not swap the slot"
+        );
+    }
+
+    /// The same completion, WITH the marker that asked for it, applies.
+    #[test]
+    fn recovery_completion_matching_the_marker_applies() {
+        let m = AutumnManager::new();
+        let extent_id = 43;
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(extent_id, 1, 0);
+            ex.replicates = vec![1, 3, 5];
+            ex.sealed = true;
+            ex.sealed_length = 100;
+            s.extents.insert(extent_id, ex);
+        }
+        let task = MgrRecoveryTask {
+            extent_id,
+            replace_id: 3,
+            node_id: 9,
+            start_time: 0,
+        };
+        m._test_mark_recovery_inflight(extent_id, task.clone());
+        run(async {
+            m.apply_recovery_done(MgrRecoveryTaskDone {
+                task,
+                ready_disk_id: 99,
+            })
+            .await
+        })
+        .expect("apply");
+        let s = m.store.inner.borrow();
+        assert!(
+            s.extents.get(&extent_id).unwrap().replicates.contains(&9),
+            "the pinned executor's completion must take the slot"
+        );
+    }
+
     /// R4: residue is collected by MEMBERSHIP, not by "the manager forgot this
     /// extent". A recovery that died mid-copy leaves a partial file that reloads
     /// as an ordinary extent, so the extent stays very much alive and the old
