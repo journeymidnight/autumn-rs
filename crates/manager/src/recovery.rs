@@ -56,6 +56,45 @@ pub(crate) fn classify_ec_done(
     Ok(())
 }
 
+/// The owner-lock epoch to stamp on an EC conversion's participant writes:
+/// the CURRENT epoch of whichever partition's stream holds `extent_id`, or 0
+/// when no partition claims it (no fence).
+///
+/// Resolved FRESH on every dispatch, never frozen into the marker. The epoch is
+/// re-acquired — and bumped — on every `open_partition`, so any routine PS
+/// reopen (a restart, a rebalance, a `LockedByOther` self-eviction) between the
+/// marker's creation and a re-dispatch raises the ENs' per-extent floor above a
+/// frozen value. Every participant then answers `CODE_LOCKED_BY_OTHER`, the
+/// conversion can never finish, the marker is never released, and that extent's
+/// GC is refused forever ("has in-flight EC conversion") — an unbounded space
+/// leak from an ordinary restart.
+///
+/// Refreshing keeps the fence's actual purpose intact: it exists to stop a
+/// FENCED ex-coordinator's ghost writes, and that ghost still carries the older
+/// epoch it captured, so it is still rejected. Only the live dispatch moves up.
+/// The rest of the marker (targets, disks, eversion) stays pinned — a re-derived
+/// ASSIGNMENT would corrupt EC; a re-read fence would not.
+pub(crate) fn dispatch_owner_epoch_for_extent(
+    state: &autumn_common::store::MetadataState,
+    extent_id: u64,
+) -> i64 {
+    for part in state.partitions.values() {
+        let streams = [part.log_stream, part.row_stream, part.meta_stream];
+        for sid in streams {
+            if state
+                .streams
+                .get(&sid)
+                .map(|st| st.extent_ids.contains(&extent_id))
+                .unwrap_or(false)
+            {
+                let key = format!("partition/{}", part.part_id);
+                return state.owner_epochs.get(&key).copied().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 /// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
 /// `ex`, the `stream` whose `(K, M)` shape it converts to, and the authoritative
 /// ledger marker (`params`: target nodes / extra disks / post-EC eversion /
@@ -1906,13 +1945,18 @@ impl crate::AutumnManager {
         // persists, closing the read-side stale-cache window. Tier 2:
         // owner_epoch lets the coord stamp WriteShard / CommitEcShard for
         // EN-side fence rejection of a ghost ex-coord.
+        let live_owner_epoch = {
+            let st = self.store.inner.borrow();
+            dispatch_owner_epoch_for_extent(&st, extent_id)
+        };
+
         let payload = rkyv_encode(&ExtConvertToEcReq {
             extent_id,
             data_shards: data_shards as u32,
             parity_shards: parity_shards as u32,
             target_addrs: ec_target_addrs,
             eversion: params.new_eversion,
-            owner_epoch: params.owner_epoch,
+            owner_epoch: live_owner_epoch,
             attempt_nonce: self.extent_inflight_nonce(extent_id),
         });
 
@@ -2507,5 +2551,86 @@ mod ec_apply_fail_tests {
                 "apply success must flip ec_converted in memory"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod ec_dispatch_owner_epoch_tests {
+    use super::dispatch_owner_epoch_for_extent;
+    use autumn_common::store::MetadataState;
+    use autumn_rpc::manager_rpc::{MgrPartitionMeta, MgrStreamInfo};
+
+    const EXTENT: u64 = 12;
+    const PART: u64 = 9001;
+
+    /// A partition owning `EXTENT` on its log stream, whose owner lock sits at
+    /// `epoch`.
+    fn state_at(epoch: i64) -> MetadataState {
+        let mut s = MetadataState::default();
+        s.streams.insert(
+            1,
+            MgrStreamInfo {
+                stream_id: 1,
+                extent_ids: vec![7, EXTENT],
+                ..Default::default()
+            },
+        );
+        s.partitions.insert(
+            PART,
+            MgrPartitionMeta {
+                part_id: PART,
+                log_stream: 1,
+                row_stream: 2,
+                meta_stream: 3,
+                rg: None,
+            },
+        );
+        s.owner_epochs.insert(format!("partition/{PART}"), epoch);
+        s
+    }
+
+    /// The regression. The epoch is re-acquired — and bumped — on every
+    /// `open_partition`, so a PS restart between the marker's creation and a
+    /// re-dispatch leaves any frozen copy BELOW the ENs' per-extent floor. Every
+    /// participant then answers `CODE_LOCKED_BY_OTHER` and the conversion can
+    /// never finish: the marker is pinned forever and the extent's GC is refused
+    /// forever with "has in-flight EC conversion".
+    ///
+    /// Observed in system_chaos: a coordinator re-dispatched every 5 s, each
+    /// time failing `WriteShard ... shard 1 @ 0`, holding extent 12's marker for
+    /// the entire run on an otherwise-quiesced cluster.
+    #[test]
+    fn resolves_the_epoch_live_so_a_partition_reopen_cannot_strand_a_conversion() {
+        let frozen = dispatch_owner_epoch_for_extent(&state_at(100), EXTENT);
+        assert_eq!(frozen, 100, "baseline: the epoch at marker-creation time");
+
+        // The PS reopens the partition (restart / rebalance / self-eviction).
+        let after_reopen = state_at(200);
+        assert_eq!(
+            dispatch_owner_epoch_for_extent(&after_reopen, EXTENT),
+            200,
+            "a re-dispatch must carry the CURRENT epoch; stamping the frozen {frozen} \
+             is below the ENs' floor and is refused by every participant forever"
+        );
+    }
+
+    /// The fence's real purpose is preserved: it rejects a FENCED ex-coordinator,
+    /// which still holds the epoch it captured. Refreshing moves only the live
+    /// dispatch up, so the ghost stays strictly below the floor.
+    #[test]
+    fn a_ghost_coordinators_captured_epoch_stays_below_the_refreshed_one() {
+        let ghost_captured = dispatch_owner_epoch_for_extent(&state_at(100), EXTENT);
+        let live = dispatch_owner_epoch_for_extent(&state_at(200), EXTENT);
+        assert!(
+            ghost_captured < live,
+            "a refreshed dispatch must still outrank the ghost's stale epoch"
+        );
+    }
+
+    /// No partition claims the extent ⇒ no fence (0), rather than inheriting some
+    /// unrelated partition's epoch.
+    #[test]
+    fn an_unclaimed_extent_gets_no_fence() {
+        assert_eq!(dispatch_owner_epoch_for_extent(&state_at(100), 4242), 0);
     }
 }

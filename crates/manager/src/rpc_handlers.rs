@@ -4991,26 +4991,13 @@ impl AutumnManager {
         // multiple partitions' streams; any of them works because all
         // sharing partitions hold the same owner_lock owner_epoch at any
         // moment (revisions are bumped uniformly by the fence-handover).
+        // Seed only. The dispatch loop re-resolves this every tick
+        // (`dispatch_owner_epoch_for_extent`) because the epoch is bumped by any
+        // partition reopen; a frozen value fences the conversion out of its own
+        // participants forever.
         let dispatch_revision: i64 = {
             let s = self.store.inner.borrow();
-            let mut found: i64 = 0;
-            'outer: for part in s.partitions.values() {
-                let streams = [part.log_stream, part.row_stream, part.meta_stream];
-                for sid in streams {
-                    if s.streams
-                        .get(&sid)
-                        .map(|st| st.extent_ids.contains(&extent_id))
-                        .unwrap_or(false)
-                    {
-                        let key = format!("partition/{}", part.part_id);
-                        if let Some(&rev) = s.owner_epochs.get(&key) {
-                            found = rev;
-                        }
-                        break 'outer;
-                    }
-                }
-            }
-            found
+            crate::recovery::dispatch_owner_epoch_for_extent(&s, extent_id)
         };
 
         let dispatch_record = MgrEcDispatchInflight {

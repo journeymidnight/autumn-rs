@@ -404,7 +404,12 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   extents under one shared node_id, so without it the manager's grace
     //   counters — pruned to what the reporter still holds — were wiped by
     //   every sibling's report and no verdict could reach three rounds.
-    (29, "43314a4c668430bc"),
+    //   v29 refreshed IN PLACE again (still undeployed): `code_description` now
+    //   names CODE_LOCKED_BY_OTHER and CODE_PAYLOAD_NOT_HERE, and callers print
+    //   the numeric code beside it. No struct changed — but rendering every
+    //   unnamed code as the bare word "error" made a permanently fenced EC
+    //   conversion read like a generic transient being retried.
+    (29, "5d9d13ff8722b503"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -1580,7 +1580,10 @@ async fn ec_2pc_participant_rpc(
             if code != CODE_OK {
                 return Err((
                     StatusCode::Internal,
-                    format!("{label}: code={}", code_description(code)),
+                    // The NUMBER as well as the name — an unnamed code would
+                    // otherwise render as one generic word and hide which
+                    // guard refused.
+                    format!("{label}: code={code} ({})", code_description(code)),
                 ));
             }
             Ok(())
@@ -3464,7 +3467,7 @@ impl ExtentNode {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(()),
         };
-        let mut extent_ids: Vec<u64> = self
+        let extent_ids: Vec<u64> = self
             .extents
             .iter()
             .map(|e| *e.key())
@@ -8302,6 +8305,19 @@ impl ExtentNode {
             if req.owner_epoch > 0 {
                 let last = entry.owner_epoch.load(Ordering::SeqCst);
                 if req.owner_epoch < last {
+                    // Loud, like the attempt-nonce refusal beside it. A silent
+                    // return leaves the coordinator's log as the only trace, and
+                    // it can only report a code — so a conversion stuck behind
+                    // this fence looks, from every log in the cluster, like a
+                    // generic transient error being retried.
+                    tracing::warn!(
+                        extent_id = req.extent_id,
+                        shard_index = req.shard_index,
+                        req_owner_epoch = req.owner_epoch,
+                        local_owner_epoch = last,
+                        "write_shard fenced: the caller's owner_epoch is below this \
+                         extent's floor — refusing"
+                    );
                     return Ok(WriteShardResp {
                         code: CODE_LOCKED_BY_OTHER,
                     }

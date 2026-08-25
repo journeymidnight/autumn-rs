@@ -774,7 +774,14 @@ pub fn code_description(code: u8) -> &'static str {
         CODE_NOT_FOUND => "not found",
         CODE_PRECONDITION => "precondition failed",
         CODE_EVERSION_MISMATCH => "eversion mismatch (stale client cache)",
-        _ => "error",
+        CODE_LOCKED_BY_OTHER => "fenced by a newer owner (stale owner_epoch)",
+        CODE_PAYLOAD_NOT_HERE => "payload not in the named file on this node",
+        // Callers MUST print the numeric code alongside this string. Rendering
+        // every unnamed code as one generic word collapses distinct refusals
+        // into the same useless message — a stale-fence rejection reading as
+        // "error" is what hid a permanently wedged EC conversion behind an
+        // ordinary-looking retry log.
+        _ => "unrecognised status code",
     }
 }
 
