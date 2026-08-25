@@ -38,10 +38,29 @@ Next steps（按价值排序，都不是本轮引入的）：
      commit 之后，被 seal 甩掉。要先复现再动刀。
   2) chaos 的失败原因现在看得见了，剩下两类值得追：41 次 "key is out of range"（split 后 SDK 路由没刷新，
      本该自愈）、4 次 "PS rejected: code=7"。都被 workload 容忍，但都不该稳定出现。
-  3) 评审剩余未处理项：EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6；
-     GC P0-2（relocation seq 跨 memtable rotation 被 replay dedup 丢掉）已读代码但【尚未复现，未修】——
-     它与 FuturesOrdered 那条"rotated active 必须是连续 seq 区间"的不变量正面冲突，因为 GC 是另一个 task，
-     从同一个计数器取 seq 却不在那条流水线里。下一轮应从这条开始。
+  3) 评审剩余未处理项：EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+  4) GC P0-2（GC 重定位 seq vs 并发 flush 的 SST）——【机制链条已坐实，但复现 harness 没跑通，未修】。
+     已确认的每一环（都是读代码+既有测试自述，不是推断）：
+       a. replay 去重的 soundness 论证【明确且唯一地】建立在 FuturesOrdered 上，recover_partition
+          注释原文："Per source the dedup IS sound because partition_loop uses FuturesOrdered —
+          Phase 3 memtable inserts run in strict seq order, so a flushed SST satisfies
+          'every seq <= last_seq is in this SST or an earlier one'."
+       b. GC 从同一个 p.seq_number 取号，却跑在 background_maintenance_loop 上，【不在那条流水线里】：
+          flush_gc_batch 先分配 seq → append_segments().await → 才 insert_batch，中间是敞开的窗口。
+       c. 去重代码 `if ts <= extent_dedup { continue; }`（lib.rs:8446）对 GC 记录【没有任何豁免】，
+          GC 写的 op = 1|OP_VALUE_POINTER 正好走这条路径。
+       d. replay-floor guard 不构成防护：system_gc_inflight_wal_put 自己的注释就写明
+          "the flush advances durable_ckpt_vp PAST X so the replay-floor guard no longer protects X"。
+          丢的是 GC 自己那条在 replay 窗口【内】的记录，被 dedup 丢掉，不是被 punch 掉。
+     卡在哪：复现需要"崩溃在 GC 记录进 SST 之前"。graceful shutdown 会 flush active（把记录写进 SST）
+     从而掩盖 bug，所以必须硬崩溃；照 system_crash_mid_compact 的 drop(ps1)+新 PS 接管模式写了，
+     但 PS2 起不来（30s 连不上）。【已做对照实验：把 pause 全关掉、GC 正常跑完，PS2 同样起不来】
+     ⇒ 是 harness 问题不是被测行为，怀疑与"split 出两个分区 + ps1 线程仍存活 + sticky rebalance
+     不把 region 迁走"有关（system_crash_mid_compact 不 split 所以不撞）。
+     按 house rule【复现不出来就不修】：本轮不动 GC 的 seq 逻辑，未跑通的测试和它专用的
+     GC_RELOCATE_PAUSE hook 都已回滚，不留半成品。
+     下一轮的正确起点是先解决"怎么让一个分区在 active 未 flush 的状态下被另一个 PS 接管"——
+     这是个可复用的 harness 能力（G 系列崩溃测试都需要），值得单独做对，而不是塞进这条 bug 里。
 ─────────────────────────────────────────────────────────────
 Date: 2026-08-25
 TaskStatus: completed
