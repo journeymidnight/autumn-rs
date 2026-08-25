@@ -943,20 +943,36 @@ async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
     }
     let extent_id = stream.extent_ids[0];
 
-    let force_resp = ctx
+    // Go through the OPERATOR path — submit → ledger → status — not the
+    // handler underneath it. `autumn-op force-ec-convert` submits; the nemesis
+    // called the handler directly, so a whole chaos run left ONE ledger record
+    // and the submit path was effectively untested under fault injection. That
+    // is exactly where a leaked RUNNING entry hides: attach-dedup then makes
+    // every later convert of the extent a silent no-op, which no data check can
+    // see and the post-run in-flight check now can.
+    let submit = ctx
         .mgr
         .call(
-            MSG_FORCE_EC_CONVERT,
-            rkyv_encode(&ForceEcConvertReq { extent_id }),
+            MSG_OP_SUBMIT,
+            rkyv_encode(&OpSubmitReq {
+                kind: OP_KIND_EC_CONVERT,
+                part_id: 0,
+                secondary_id: extent_id,
+                extent_ids: vec![extent_id],
+                at_key: None,
+                requested_by: "chaos-nemesis".to_string(),
+                max_moves: 0,
+                ..Default::default()
+            }),
         )
         .await
-        .map_err(|e| format!("force_ec rpc: {e}"))?;
-    let r: ForceEcConvertResp =
-        rkyv_decode(&force_resp).map_err(|e| format!("decode force_ec: {e}"))?;
+        .map_err(|e| format!("op_submit rpc: {e}"))?;
+    let r: OpSubmitResp =
+        rkyv_decode(&submit).map_err(|e| format!("decode op_submit: {e}"))?;
     if r.code != CODE_OK && r.code != CODE_PRECONDITION {
-        return Err(format!("force_ec refused: {}", r.message));
+        return Err(format!("ec submit refused: {}", r.message));
     }
-    Ok(format!("force_ec extent {extent_id}"))
+    Ok(format!("ec submit extent {extent_id} (op {})", r.op_id))
 }
 
 async fn do_fence_unfence(ctx: &NemesisCtx) -> Result<String, String> {
