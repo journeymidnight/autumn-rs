@@ -596,6 +596,17 @@ so TTL partitions eventually clean up without explicit triggers.
 - **Head-extent**: if the oldest extent's tables are < 30% of total data
   (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it — clears old extents to
   enable `truncate` on `row_stream` (freeing disk/logStream extents).
+
+  INVARIANT: `truncate_id` is returned ONLY when the chosen set is the WHOLE head
+  extent. `handle_truncate` removes every extent BEFORE the target
+  (`extent_ids[..pos]`), so returning it asserts the head is fully drained — and
+  `take(COMPACT_N)` caps the set. With more head-extent tables than that,
+  compaction consumes the oldest few while the rest stay live inside the extent
+  this would delete: their keys become unservable and the persisted checkpoint
+  references an SST in a deleted extent, so the partition does not reopen.
+  Compaction still proceeds in that case; it just doesn't claim the extent is
+  empty. `background::compaction_truncate_tests` pins both directions (a
+  partially-consumed head is not truncated; a fully-consumed one still is).
 - **Size-tiered**: sort tables by sequence, find consecutive "small" tables
   (< 32MB = `COMPACT_RATIO * MAX_SKIP_LIST`), pick up to `COMPACT_N`.
 

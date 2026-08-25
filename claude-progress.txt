@@ -1,3 +1,48 @@
+Date: 2026-08-25 (b)
+TaskStatus: completed
+Task scope: /loop 第 N 轮——把 fable 评审挖出的两个 P0 收口，并让 chaos 真正跑绿（commit b5a4dff、4040dbe）。
+  ① compaction truncate（P0，先复现后修）：pickup_tables 的 head-extent 策略里，
+     `chosen = 该 extent 的表 .take(COMPACT_N)`，但返回 truncate_id 等于向 manager 断言
+     "这个 extent 已经空了"——handle_truncate 删的是 extent_ids[..pos]，即目标之前的全部。
+     head extent 的表数超过 COMPACT_N 时，压掉最老的 5 张、其余仍活在这个即将被删的 extent 里：
+     这些 key 不可服务，且 checkpoint 指向已删 extent 里的 SST ⇒ 分区打不开。
+     复现：pickup_tables 是纯函数，8 张小 head 表 + 1 张大表 ⇒ 选 5 张却照样返回 truncate_id（断言失败）。
+     修：谓词改成"chosen 覆盖 head extent 的全部表"。压缩照常进行，只是不再声称 extent 空了。
+     配套第二个测试钉住 truncate 存在的理由（一次压完的 head 仍要被 truncate），杜绝"永不 truncate"式假修。
+  ② EC 转换被自己的 fence 永久卡死（P0，chaos 复现）：WriteShard 上盖的 owner_epoch 在 marker 创建时
+     取一次、之后每轮重发都原样复用。但该 epoch 在每次 open_partition 都会重新获取并抬高——
+     marker 建好后任何一次常规 PS 重开（重启/rebalance/LockedByOther 自逐）都会把 EN 的 per-extent
+     floor 抬到冻结值之上，此后每个 participant 都回 CODE_LOCKED_BY_OTHER：转换永远完不成 ⇒
+     marker 永不释放 ⇒ 该 extent 的 GC 永远被拒（"has in-flight EC conversion"）＝一次普通重启换来无界空间泄漏。
+     证据：coordinator 每 5s 重发一次、每次都停在 WriteShard shard 1 @ 0，在已静默的集群上把 extent 12
+     的 marker 攥了整轮，force-GC 只回收到 1 个 extent。
+     修：dispatch 时用 dispatch_owner_epoch_for_extent 现取；submit 侧只是用同一个 resolver 播种。
+     【为什么这样仍然安全】fence 的作用是挡被 fence 掉的旧 coordinator 的幽灵写，而幽灵手里仍是它当初
+     捕获的旧 epoch，照样低于 floor；抬高的只有活着的那次 dispatch。marker 的其余字段（targets/disks/
+     eversion）必须继续钉死——重新推导 ASSIGNMENT 会把 layout 写到根本没有 shard 的节点上。
+  ③ 这次为什么查了几个小时而不是看一行日志（两处诊断，顺手修掉）：
+     - code_description 把所有没列名字的 code 一律渲染成光秃秃的 "error"，于是 CODE_LOCKED_BY_OTHER(5)
+       ——一个精确、永久、可行动的判决——传到运维眼里是 "code=error"，读起来就像个正在重试的普通瞬时错误。
+       现在给该 code 和 PAYLOAD_NOT_HERE 起了名字，且调用方一律把数字打在名字旁边。WIRE 指纹就地刷新（v29 未部署）。
+     - owner_epoch fence 是静默 return，而紧挨着的 attempt-nonce 守卫是 WARN：于是拒绝方的日志一片空白，
+       只剩 coordinator 的日志，而它只能报一个 code。现在也 warn，并带上两侧 epoch。
+  门：system_chaos 现在【通过】（同一个复现它的 harness）——op ledger 0 活跃、0 个 EC marker 被钉住、
+  in-flight errors 0、quiesce 后回收 5 个 extent（修前 1 个）、400 keys 0 mismatch 0 not_found。
+  单测 rpc 60 / stream 110 / manager 286 / ps 207 全绿；ec_failover、ec_integration、ec_staging、
+  payload_location、placement_cleanup、re_avali_no_destroy、system_compact_unflushed_vp_head、
+  system_crash_mid_compact(含 --ignored)、system_split_forcegc_stale_cache、system_gc_multiversion_same_extent 全绿。
+Next steps（按价值排序，都不是本轮引入的）：
+  1) system_merge 的 split_merge_split_with_concurrent_writes 挂在 57.7% merge-window 丢失——
+     已确认【与本轮改动无关】（改前改后同样失败、同样的 missing keys）。领先假设＝评审提的
+     merge-freeze 项：freeze 并不停 PS 自己的 GC / timer-armed compaction，它们的写落在 merge 已捕获的
+     commit 之后，被 seal 甩掉。要先复现再动刀。
+  2) chaos 的失败原因现在看得见了，剩下两类值得追：41 次 "key is out of range"（split 后 SDK 路由没刷新，
+     本该自愈）、4 次 "PS rejected: code=7"。都被 workload 容忍，但都不该稳定出现。
+  3) 评审剩余未处理项：EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6；
+     GC P0-2（relocation seq 跨 memtable rotation 被 replay dedup 丢掉）已读代码但【尚未复现，未修】——
+     它与 FuturesOrdered 那条"rotated active 必须是连续 seq 区间"的不变量正面冲突，因为 GC 是另一个 task，
+     从同一个计数器取 seq 却不在那条流水线里。下一轮应从这条开始。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-25
 TaskStatus: completed
 Task scope: 文档去迁移化 + 跑 chaos + 给 chaos 加失败原因诊断（用户："如果不考虑升级，更新设计文档和

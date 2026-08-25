@@ -480,6 +480,21 @@ Applying the wrong one flips the layout onto targets holding no shards, after
 which cleanup deletes the last full replicas. **Every rejection retains the
 marker.**
 
+**The fence epoch is resolved LIVE on every dispatch; only the ASSIGNMENT is
+pinned.** `dispatch_owner_epoch_for_extent(state, extent_id)` re-reads the
+owner-lock epoch of whichever partition's stream holds the extent, and the submit
+path merely seeds through the same resolver. The epoch is re-acquired — and
+bumped — on every `open_partition`, so a value frozen at marker-creation time
+falls below the ENs' per-extent floor after any routine PS reopen (restart,
+rebalance, `LockedByOther` self-eviction); every participant then answers
+`CODE_LOCKED_BY_OTHER`, the conversion never finishes, the marker is never
+released, and that extent's GC is refused forever with "has in-flight EC
+conversion" — an unbounded space leak from an ordinary restart. Refreshing keeps
+what the fence is FOR: it rejects a FENCED ex-coordinator, which still carries
+the older epoch it captured, so the ghost stays below the floor while only the
+live dispatch moves up. Do NOT extend this to the targets/disks/eversion — a
+re-derived assignment writes a layout onto nodes holding no shards.
+
 The nonce is deliberately NOT in `MgrEcDispatchInflight`: that struct is nested
 as an `Option` in the persisted `MgrExtentInflightRecord`, so widening it shifts
 the archived layout and every live marker — recovery and delete too — would fail
