@@ -142,7 +142,10 @@ impl AutumnManager {
         };
         let mut released = Vec::new();
         for (extent_id, node_id) in dead {
-            match self.drain_extent_inflight_marker(extent_id).await {
+            match self
+                .drain_extent_inflight_marker(extent_id, "its pinned executor is no longer online")
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         extent_id,
@@ -373,7 +376,17 @@ impl AutumnManager {
                     // recovery_inflight tracks it; we'll re-dispatch
                     // on the next tick and the EN-side check will idempotently
                     // refuse the duplicate.
-                    let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    if let Err(e) = self
+                        .drain_extent_inflight_marker(extent.extent_id, "dispatch RPC failed")
+                        .await
+                    {
+                        tracing::warn!(
+                            extent_id = extent.extent_id,
+                            error = %e,
+                            "could not release the marker after a failed dispatch; it stays \
+                             pinned to that candidate until the node goes offline"
+                        );
+                    }
                     // release the limiter slot we took above.
                     self.recovery_limiter
                         .borrow_mut()
@@ -384,7 +397,17 @@ impl AutumnManager {
             let r: ExtCodeResp = match rkyv_decode(&resp) {
                 Ok(v) => v,
                 Err(_) => {
-                    let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    if let Err(e) = self
+                        .drain_extent_inflight_marker(extent.extent_id, "the target refused the rebuild")
+                        .await
+                    {
+                        tracing::warn!(
+                            extent_id = extent.extent_id,
+                            error = %e,
+                            "could not release the marker after a refusal; it stays pinned \
+                             to that candidate until the node goes offline"
+                        );
+                    }
                     // release the limiter slot we took above.
                     self.recovery_limiter
                         .borrow_mut()
@@ -396,7 +419,16 @@ impl AutumnManager {
                 // EN rejected (e.g. extent exists locally already, or
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
-                let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                if let Err(e) = self
+                    .drain_extent_inflight_marker(extent.extent_id, "the dispatch response was undecodable")
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        error = %e,
+                        "could not release the marker after an undecodable response"
+                    );
+                }
                 // release the limiter slot we took above.
                 self.recovery_limiter
                     .borrow_mut()
@@ -1614,7 +1646,10 @@ impl crate::AutumnManager {
     fn spawn_drain_stale_ec_marker(&self, extent_id: u64) {
         let mgr = self.clone();
         compio::runtime::spawn(async move {
-            if let Err(e) = mgr.drain_extent_inflight_marker(extent_id).await {
+            if let Err(e) = mgr
+                .drain_extent_inflight_marker(extent_id, "the marker no longer matches the extent")
+                .await
+            {
                 // WARN (not debug): a persistent drain failure leaks the marker
                 // and re-fires every ~5 s; it must be visible at prod log level,
                 // matching this loop's other warns (the no-swallow principle).
@@ -1906,7 +1941,26 @@ impl crate::AutumnManager {
     /// extent that has been deleted or that has incompatible state (e.g.,
     /// already EC-converted) — best-effort cleanup so the next tick's
     /// candidate set shrinks. Idempotent.
-    async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
+    /// Drop an in-flight marker AND close whatever op-ledger entry it backed.
+    ///
+    /// These must happen together. A marker has five ways to die — dead
+    /// executor, three dispatch-failure paths, and the stale-marker drains —
+    /// but the ledger was only ever closed by the two SUCCESS hooks. Every
+    /// other path left the entry RUNNING forever, because neither EC nor
+    /// recovery is covered by the TTL sweep.
+    ///
+    /// For EC that is not merely a cosmetic lie: `submit` attach-dedups on any
+    /// ACTIVE (kind, target), and `handle_op_submit` returns WITHOUT actuating
+    /// on an attach — so a leaked RUNNING entry makes every future
+    /// `force-ec-convert` of that extent a no-op that reports success, with no
+    /// escape short of a leader restart. Closing here, at the single funnel,
+    /// covers every present and future drop path.
+    async fn drain_extent_inflight_marker(
+        &self,
+        extent_id: u64,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let kind = self.extent_inflight_op(extent_id);
         if let Some(etcd) = &self.etcd {
             // Use `put_and_delete_txn` (one-element delete list) so the leader
             // fence applies. A `false` return from the underlying CAS is
@@ -1916,6 +1970,28 @@ impl crate::AutumnManager {
                 .await?;
         }
         self.commit_extent_inflight_release(extent_id);
+        // Only after the marker is really gone — a failed drain above returns
+        // early and leaves the entry RUNNING, which is then accurate.
+        let (now_s, _) = Self::now_s_ms();
+        match kind {
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => {
+                self.ops.borrow_mut().complete_ec(
+                    extent_id,
+                    autumn_rpc::manager_rpc::OP_STATE_FAILED,
+                    String::new(),
+                    format!("conversion abandoned: {reason}"),
+                    now_s,
+                );
+            }
+            Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
+                self.ops.borrow_mut().abandon_recovery(
+                    extent_id,
+                    format!("recovery abandoned: {reason}"),
+                    now_s,
+                );
+            }
+            _ => {}
+        }
         Ok(())
     }
 

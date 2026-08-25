@@ -203,3 +203,95 @@ async fn after_cleanup_the_node_serves_the_shard_and_not_a_resurrected_dat() {
     );
     assert!(!dat(d.path(), eid).exists());
 }
+
+/// A placement is computed by the manager at ANSWER time and applied by the
+/// node LATER. A conversion can start in that window — and a PARTICIPANT
+/// staging a shard has no local marker (`ec_convert_inflight` is set only on
+/// the coordinator), so nothing on this node knows the staging exists.
+///
+/// Applying the stale `InDat` verdict then deletes the shard mid-flight. The
+/// coordinator's next stripe recreates the file and pwrites at its offset,
+/// leaving ZERO HOLES where the earlier stripes were — and the flip publishes
+/// it, because the completion report is from the same attempt and passes every
+/// nonce/reporter check. Reads return zeros with CODE_OK.
+#[compio::test]
+async fn a_stale_placement_must_not_delete_a_shard_being_staged() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let eid = 9210;
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, vec![0x5Au8; 3000]).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+
+    // A conversion begins: this node is a PARTICIPANT and stages stripe 0 of
+    // shard 1. It sets no local inflight marker — only the coordinator does.
+    let stripe = vec![0xC7u8; 500];
+    assert_eq!(
+        conn.write_shard_with_nonce(eid, 1, 1500, 5, 4242, stripe.clone())
+            .await
+            .code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert!(shard(d.path(), eid, 1).exists(), "staging did not land");
+
+    // A placement computed BEFORE the conversion started now arrives.
+    node.test_apply_placements(&[(eid, PAYLOAD_LOCATION_IN_DAT, 0)])
+        .await;
+
+    assert!(
+        shard(d.path(), eid, 1).exists(),
+        "cleanup deleted a shard that an in-flight attempt is still staging; \
+         the coordinator's next stripe would recreate it with zero holes and \
+         the flip would publish that as this node's shard"
+    );
+}
+
+/// The other side of the guard above: after the flip, cleanup must still run on
+/// a node that REALLY staged (not one with a planted file). The stage marker is
+/// per-extent and never expires on its own, so a guard that keyed only on "has
+/// this node ever staged?" would skip cleanup forever and the `.dat` would never
+/// be reclaimed — the whole point of the step.
+#[compio::test]
+async fn cleanup_runs_after_a_real_staging_once_the_flip_is_published() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let eid = 9211;
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, vec![0x5Au8; 3000]).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    // Stage the whole shard through the real path, so the node carries a live
+    // stage marker for this extent.
+    assert_eq!(
+        conn.write_shard_with_nonce(eid, 2, 1500, 5, 4242, vec![0xC7u8; 1500])
+            .await
+            .code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+
+    // The manager flips the layout and the next reconcile names this node's
+    // shard. Cleanup must reclaim the now-redundant `.dat`.
+    node.test_apply_placements(&[(eid, PAYLOAD_LOCATION_IN_SHARD_FILE, 2)])
+        .await;
+
+    assert!(shard(d.path(), eid, 2).exists(), "the named shard must survive");
+    assert!(
+        !dat(d.path(), eid).exists(),
+        "the pre-conversion .dat was not reclaimed — cleanup never ran"
+    );
+}

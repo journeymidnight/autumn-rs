@@ -3511,6 +3511,47 @@ impl ExtentNode {
             {
                 continue;
             }
+            // A placement is computed by the manager at ANSWER time and applied
+            // HERE, later. A conversion can start in that window, and a
+            // PARTICIPANT staging a shard sets no local marker — the guard
+            // above only sees conversions THIS node coordinates. So the two
+            // checks that matter are below.
+            //
+            // Serialize against the stripe writer, which holds this same lock
+            // per stripe. Without it the delete lands BETWEEN two stripes.
+            let op_lock = self.get_or_create_extent_op_lock(p.extent_id);
+            let _op_guard = op_lock.lock().await;
+            // The dangerous shape is a verdict that CONTRADICTS live staging:
+            // it says the payload is still in `.dat` (so every shard here is
+            // residue) while an attempt has staged shards on this node. That
+            // combination means the verdict predates the attempt, and acting on
+            // it deletes a shard the coordinator is still writing.
+            //
+            // A verdict of `InShardFile` cannot be stale in that way — the
+            // manager only publishes it by flipping the layout, which happens
+            // after every target confirmed. So that case proceeds, and clearing
+            // the stage marker there is what lets cleanup run at all.
+            let staged_here = self.ec_stage_nonce.contains_key(&p.extent_id);
+            match want.location {
+                PayloadLocation::InDat if staged_here => {
+                    // Cannot tell locally whether that attempt is live or
+                    // abandoned — only the manager knows, and its answer is the
+                    // stale thing. Leaving a shard costs space; deleting a live
+                    // one costs the shard. Wait for a fresher verdict (or a
+                    // restart, which clears this map).
+                    tracing::debug!(
+                        extent_id = p.extent_id,
+                        "reconcile: skipping cleanup — this verdict says .dat while an \
+                         attempt has staged shards here, so it predates the attempt"
+                    );
+                    continue;
+                }
+                PayloadLocation::InShardFile => {
+                    // The flip happened; this attempt is over.
+                    self.ec_stage_nonce.remove(&p.extent_id);
+                }
+                PayloadLocation::InDat => {}
+            }
             if !entry.holds_payload(want) {
                 // The file we are told to keep is not here yet. Never delete
                 // the other one on the strength of an instruction we cannot
@@ -5811,6 +5852,21 @@ impl ExtentNode {
         // EC reconstruct fails). Truncating at the first stripe makes each
         // attempt's staging exactly its own bytes. Same-K re-prepare was only
         // ever safe because RS encode is deterministic; do not rely on that.
+        // Stripe 0 creates (and truncates); a LATER stripe must find the file
+        // already there. If it does not, this attempt's staging was removed out
+        // from under it — recreating it here would silently leave zero holes
+        // where the earlier stripes were, and the flip would publish that as
+        // this node's shard. Fail the stripe; the coordinator restarts the
+        // attempt from stripe 0.
+        if shard_offset > 0 && compio::fs::metadata(&staging_path).await.is_err() {
+            let msg = format!(
+                "write_shard {extent_id}/{shard_index}: staging file vanished before \
+                 stripe @{shard_offset} — this attempt's staging was clobbered; refusing to \
+                 recreate it with holes"
+            );
+            tracing::error!("{msg}");
+            return Err((StatusCode::FailedPrecondition, msg));
+        }
         let staging_file = OpenOptions::new()
             .create(true)
             .write(true)

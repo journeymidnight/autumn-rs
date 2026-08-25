@@ -220,6 +220,19 @@ impl OpLedger {
 
     /// Close the recovery entry for `extent_id` — called from
     /// `apply_recovery_done` (the extent layout is repaired).
+    /// Close a recovery entry that ended WITHOUT completing — its marker was
+    /// dropped, so nothing will report it done.
+    pub(crate) fn abandon_recovery(&mut self, extent_id: u64, reason: String, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            autumn_rpc::manager_rpc::OP_STATE_FAILED,
+            String::new(),
+            reason,
+            now_s,
+        );
+    }
+
     pub(crate) fn complete_recovery(&mut self, extent_id: u64, message: String, now_s: i64) {
         self.complete_by_extent(
             OP_KIND_RECOVERY,
@@ -430,6 +443,42 @@ mod tests {
         // finish is idempotent — a late heartbeat retransmit can't reopen it.
         led.finish(id, OP_STATE_FAILED, "boom".into(), String::new(), 200);
         assert_eq!(q_one(&led, id).state, OP_STATE_SUCCEEDED);
+    }
+
+    /// A marker can die five ways; only two of them used to close the ledger.
+    /// For EC a leaked RUNNING entry is not cosmetic: `submit` attach-dedups on
+    /// any ACTIVE (kind, target) and the caller returns WITHOUT actuating, so
+    /// every future convert of that extent silently does nothing.
+    #[test]
+    fn an_abandoned_ec_op_stops_blocking_future_submits() {
+        let mut led = OpLedger::new();
+        let (first, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 100, 100_000);
+        assert!(!attached);
+        led.set_running(first, 100);
+
+        // While it is RUNNING, a resubmit attaches and actuates nothing.
+        let (again, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 101, 101_000);
+        assert!(attached, "a live op should dedup");
+        assert_eq!(again, first);
+
+        // The marker is dropped for any reason — the entry must close.
+        led.complete_ec(
+            55,
+            OP_STATE_FAILED,
+            String::new(),
+            "conversion abandoned: its pinned executor is no longer online".into(),
+            110,
+        );
+
+        let (fresh, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 120, 120_000);
+        assert!(
+            !attached,
+            "an abandoned conversion must not block the operator's retry forever"
+        );
+        assert_ne!(fresh, first);
     }
 
     #[test]
