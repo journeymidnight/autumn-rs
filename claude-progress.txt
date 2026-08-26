@@ -32,6 +32,18 @@ Task scope: 一整天的自主循环,21 条流水已压缩成本条(规则 12)�
   ✗ compaction 的 vp_head MAX — 跳过 input 只会让 MAX 变小(更保守)
   ✗ checkpoint union 的排序 — 按 [旧, 新] 拼接 + get 用 rev() ⇒ 新 SST 先查,顺序正确
   ⇒ 读侧两大框架(replay 起点太靠后 / 读到旧 SST)【均已排除】。
+【累积回归检查(19 commit 之后)】全部单测绿:rpc 60 / stream 110 / manager 293 / ps 208 / client 41;
+  workspace 构建 0 error 0 warning;system_merge 9/9(--ignored)。
+  期间遇到一次 system_merge 的 merge_refuses_non_adjacent_partitions 失败,原因是
+  `RpcClient::connect(ps_addr).unwrap()` 撞 ConnectionRefused ——【真 flaky,非回归】:
+  start_partition_server 只固定 sleep 300ms,而 PS 的 listener 要等【所有分区 recover 完】才 bind,
+  该测试有 2 个分区,忙碌机器上就不够。重跑即过。
+  【失败的尝试(已回滚,记下来免得重试)】把 support::start_partition_server 的固定 sleep 换成
+  "轮询到可连接"(照搬 killable helper 的模式)⇒ 结果【更糟】:8过1败 变成 7过2败,
+  且耗时 104s→207s,失败的换成了 auto_dispatch_merge/split 两个原本正常的测试。
+  改 support 会影响所有测试,而我没验证"每个 PS 都会在 60s 内 bind"这个前提就推广了。已 git checkout 回滚。
+  若要再修,应【局部处理】(只在该测试里重试连接),或者接受这个低频 flaky。
+
 【下一步(按价值)】
   1) F1+F4 转【写入侧】:查 split 窗口内已 ACK 的写去了哪里。依据是 got_seq 落后 32–432
      ——【有界且不归零】,更像一批连续的写整体消失,而非读到某个旧快照。
