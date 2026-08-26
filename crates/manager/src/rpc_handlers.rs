@@ -2248,6 +2248,13 @@ impl AutumnManager {
         if ex.sealed {
             // Sealed extent (possibly empty: sealed_length may be 0) → its
             // committed length is fixed at sealed_length, no probe needed.
+            tracing::info!(
+                target: "ccl_trace",
+                stream_id = req.stream_id,
+                extent_id = ex.extent_id,
+                sealed_length = ex.sealed_length,
+                "check_commit_length: tail already SEALED (short-circuit)"
+            );
             return Ok(rkyv_encode(&CheckCommitLengthResp {
                 code: CODE_OK,
                 message: String::new(),
@@ -2324,6 +2331,15 @@ impl AutumnManager {
                 }
             }
         }
+        tracing::info!(
+            target: "ccl_trace",
+            stream_id = req.stream_id,
+            extent_id = ex.extent_id,
+            responses = ?responses,
+            recovering = ?recovering,
+            members = ?members,
+            "check_commit_length: probe responses"
+        );
         let end = match Self::compute_commit_seal(
             &members,
             &recovering,
@@ -3396,6 +3412,15 @@ impl AutumnManager {
 
         let req: MultiModifySplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let mms_started = std::time::Instant::now();
+        tracing::info!(
+            target: "mms_trace",
+            part_id = req.part_id,
+            log_sealed = req.log_stream_sealed_length,
+            row_sealed = req.row_stream_sealed_length,
+            meta_sealed = req.meta_stream_sealed_length,
+            "multi_modify_split entered"
+        );
 
         // #6: serialize splits per partition. A PS that retries
         // multi_modify_split against a SLOW manager (each call timing out but
@@ -3653,6 +3678,13 @@ impl AutumnManager {
                         .await
                         .map_err(|e| Self::err_to_status(&e))?;
                 }
+                tracing::info!(
+                    target: "mms_trace",
+                    part_id = left.part_id,
+                    right_part_id = right.part_id,
+                    elapsed_ms = mms_started.elapsed().as_millis() as u64,
+                    "multi_modify_split etcd txn COMMITTED"
+                );
 
                 // Phase 3: Apply to in-memory store AFTER etcd success.
                 // Verify moved up before the Phase-2 mirror; here we only
@@ -3678,7 +3710,16 @@ impl AutumnManager {
 
                 Self::code_resp(CODE_OK, String::new())
             }
-            Err(err) => Self::code_resp(Self::err_to_code(&err), err.to_string()),
+            Err(err) => {
+                tracing::info!(
+                    target: "mms_trace",
+                    part_id = req.part_id,
+                    elapsed_ms = mms_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "multi_modify_split refused"
+                );
+                Self::code_resp(Self::err_to_code(&err), err.to_string())
+            }
         }
     }
 

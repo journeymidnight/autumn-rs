@@ -417,10 +417,24 @@ distinct from the PS `RateController` (byte-rate) and the RAM-permit
 partition's open tail on a fenced node never drains and `remove_node` never unblocks.
 `drain_fenced_open_tails` (each recovery tick) finds OPEN tails with a fenced member,
 resolves the serving PS and sends `MSG_ROLL_TAILS` (30 s per-partition cooldown); the
-PS idempotently seals+rolls (log/meta via the WAL-self-heal `seal_and_roll_tail`, row
-via the drain-to-zero barrier). The dispatch pre-filter keys on `!ex.sealed` (STATE),
+PS idempotently seals+rolls (log/meta via `seal_and_roll_tail`, row via the
+drain-to-zero barrier). The dispatch pre-filter keys on `!ex.sealed` (STATE),
 not `sealed_length == 0`, so an authoritative sealed-EMPTY extent gets its fenced
 slots rebuilt instead of referencing the node forever.
+
+INVARIANT (live-writer roll): the tails this sweep targets belong to a SERVING
+partition, so the PS-side roll MUST go through the live stream worker
+(SealCommit quiesce → authoritative seal pinned to that tail → ResetTail) —
+`StreamClient::seal_and_roll_tail` does this whenever a per-stream worker
+exists. A bare manager probe-seal behind a live writer freezes `sealed_length`
+while the writer (and the ENs, which learn seals only lazily) keep appending
+and ACKING onto the same extent; every post-seal acked byte is then invisible
+to committed-clamped replay and to CoW split children — the chaos
+(`stale_vp_offset_past_sealed_length` child wedge / silent stale reads)
+acked-write-loss family. The PS also DEFERS the roll while the partition is
+frozen for split/merge: those orchestrations capture per-stream commit lengths
+and the manager seals whatever extent is the tail at commit time, so a roll in
+that window would get the captured length stamped onto its fresh empty extent.
 
 **Placement hard-exclusion.** `placement_excluded_node_ids()` = Fenced ∪ Maintenance
 (overrides) ∪ Suspected (`node_states`) — threaded as `hard_excluded` into

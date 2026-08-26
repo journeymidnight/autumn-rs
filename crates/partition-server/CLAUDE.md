@@ -1713,6 +1713,27 @@ Three fixes bound the restart replay window (worst case per partition =
     gc/compact inflight, sealed log extents). Emission is metric-major (all samples of one
     metric contiguous after its `# TYPE` line — the Prometheus text format requires it).
 
+## MSG_ROLL_TAILS (`handle_roll_tails`) — rolling a LIVE partition's tails
+
+The manager's fence-drain sweep asks the serving PS to seal+roll open tails whose
+replica set includes a Fenced node. Two load-bearing rules (their violation was
+the chaos acked-write-loss family; repro
+`crates/manager/tests/system_roll_tails_live_writer.rs`):
+- **The roll goes through the LIVE stream worker.** log/meta roll via
+  `part_sc.seal_and_roll_tail`, row via the P-sst barrier (`seal_and_roll=true`,
+  drains the FU to zero first) — and `seal_and_roll_tail` itself is
+  live-writer-aware (stream CLAUDE.md note 32): with a worker present it does
+  SealCommit quiesce → authoritative seal pinned to that tail → ResetTail. A
+  bare probe-seal behind the live writer lets it keep appending + ACKing onto
+  the manager-sealed extent (ENs learn seals lazily), stranding acked bytes
+  above `sealed_length` — silently lost to any recovery/CoW child.
+- **Deferred while `frozen_for_split` / `frozen_for_merge`.** Split/merge
+  capture per-stream commit lengths and the manager seals whatever extent is
+  the CURRENT tail at commit time; a roll inside that window swaps the tail so
+  the captured length gets stamped onto the roll's fresh empty extent (sealed
+  longer than any replica holds → CoW child unreadable). The roll is
+  best-effort + sweep-retried, so deferring just delays it past the freeze.
+
 ## WAL-FAILSTOP — mid-stream log_stream corruption fails recovery, not silent skip
 
 INVARIANT: the log_stream replay decoder must FAIL LOUD on a `DecodeOne::Corrupt`

@@ -1,3 +1,48 @@
+Date: 2026-08-26 (b)
+TaskStatus: completed
+Task scope: F1+F4 已 ack 写丢失(split 右孩子 wedge / 静默旧值)——根因、修复、验证。上一轮的
+  "转写入侧"判断正确,排除记录全部成立(读侧确实无罪)。
+【根因(trace 实证,非推断)】fence-drain 的 MSG_ROLL_TAILS 对【活分区】的 tail 用裸 probe seal:
+  seal_and_roll_tail = alloc_new_extent(None,0)——该原语自己的注释写明只服务"worker 尚未
+  spawn"的 recovery self-heal;handle_roll_tails 却对 live 分区的 log/meta 直接调用,row 走
+  barrier(drain 了 P-sst 在飞但同样不动 worker)。它不 quiesce worker、不 ResetTail,而 EN
+  【永远不知道 manager seal】(seal 只写 manager 元数据;EN 靠 eversion mismatch 惰性得知,
+  stale writer 的 cached eversion 恰好等于 EN 本地值 ⇒ 永不触发)。于是 manager 把
+  sealed_length 冻在 L0,活 writer 继续往同一 extent append 且【继续 ACK 客户端】——此后每个
+  acked 字节都悬在 sealed_length 之上:
+  - checkpoint/SST 落进或引用 ghost 区 ⇒ CoW split 右孩子永久打不开
+    stale_vp_offset_past_sealed_length(F1;两个子形态都复现:log 版=WAL replay
+    length=67108864 那条,row 版="read SST from rowStream"那条);
+  - 否则 committed-clamp replay 在 seal 处干净停下,acked 尾巴无声消失(F4,无任何
+    fail-loud——每层各自"正确")。
+  q*-only 不对称的结构性解释:split 成功路径左孩子 in-place narrow【不重放、memtable 全保留】
+  ⇒ b* 永不受害;右孩子从被剪的流重建 ⇒ 只有右半 keyspace 暴露。
+【复现】动作集收窄为 split,fence,latency,kill,flush ⇒ 39 次预修复运行 7 次 F1(≈18%,全动作集
+  原为 1/25);每次命中 trace 链一致:roll_trace(活 tail 被 roll)→ alloc-seal
+  seal_path="probe" → ckpt/SST vp 落在 seal 之后 → split → 右孩子 stale_vp。确定性复现:
+  crates/manager/tests/system_roll_tails_live_writer.rs 两场景(loud=roll log+row 后右孩子
+  永不可读;silent=roll 全三条后 acked key 变 NOT_FOUND),修复前 2/2 精确失败(非真空:断言
+  roll 真的执行且长出新 tail),修复后 2/2 绿。
+【修复】① StreamClient::seal_and_roll_tail 改 live-writer-aware:存在活 worker ⇒ SealCommit
+  handshake(quiesce→精确 all-replica-acked commit,冻住旧 tail)→ alloc(Some(commit),
+  钉住 tail_id)→ ResetTail 到新 tail——与 append 失败 roll 完全同机制;无 worker(WAL
+  self-heal pre-worker)⇒ 原 probe 路径不变(无 writer 可竞争)。② handle_roll_tails 在
+  frozen_for_split/merge 期间 defer(split/merge 把 captured commit length 盖到"提交时刻的
+  tail"上,窗口内换 tail 会把 captured 长度盖到 roll 出的空 extent 上);sweep 30s cooldown
+  自动重试。③ P-sst barrier seal_and_roll 分支的失实注释更正。
+【新增常驻诊断(target 过滤 INFO,默认静默)】split_trace(捕获的三元组+vp+freeze 耗时)/
+  mms_trace(manager split 进入/提交/拒绝+耗时)/ ccl_trace(commit_length 探针 per-replica
+  响应或 sealed 短路)/ ckpt_trace(checkpoint vp+落点)/ recover_trace(replay 起点选择)/
+  roll_trace(活 tail roll)。这次定位=一次命中读全链,别删。
+【门】stream 110 / ps 208 / manager 293 lib 全绿;system_roll_tails_live_writer 2/2;
+  system_merge --ignored 9/9;clippy 警告数前后同为 16。修复后 chaos(同收窄动作集)39 跑:
+  0 F1 / 0 F4(38 PASS + 1 次 create_stream 起集群 flake,workload 未启动,与数据面无关)。
+  P(修复后 38 跑全 0 | 预修复 18% 命中率) ≈ 5e-4。
+【残留(记录未修,reproduce-first)】① split capture→manager Phase-1 间一个【已在飞】的 roll
+  仍可换 tail(freeze defer 只挡新 roll);关死需 multi_modify_split 携带 captured tail
+  extent ids(wire 变更)。未观察到。② F3(VP 大值读 wedged/timeout,kid%8==0,b/q 都有)
+  与本修无关且在收窄动作集(无 EC)下也出现过 1 次——下一优先。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26
 TaskStatus: not_completed
 Task scope: 一整天的自主循环,21 条流水已压缩成本条(规则 12)。保留【结论 + 排除记录 + 下一步】,删掉过程叙述。

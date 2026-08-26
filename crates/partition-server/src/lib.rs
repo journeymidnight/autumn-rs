@@ -7960,6 +7960,22 @@ async fn recover_partition(
                 recovered_vp_off = r.vp_offset;
             }
         }
+        tracing::info!(
+            target: "recover_trace",
+            part_id = _part_id,
+            log_stream_id,
+            meta_stream_id,
+            chosen_pos,
+            recovered_vp_eid,
+            recovered_vp_off,
+            n_meta_records = meta_records.len(),
+            meta_vps = ?meta_records
+                .iter()
+                .map(|r| (r.vp_extent_id, r.vp_offset, r.locs.len()))
+                .collect::<Vec<_>>(),
+            log_extent_ids = ?log_extent_ids,
+            "recover_partition: replay start chosen"
+        );
         // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
         // post-split appear in both partitions' records pointing at the
         // same physical bytes; we keep one entry.
@@ -8911,7 +8927,18 @@ pub(crate) async fn save_table_locs_raw(
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     data.extend_from_slice(&payload);
-    stream_client.append(meta_stream_id, &data).await?;
+    let ckpt_result = stream_client.append(meta_stream_id, &data).await?;
+    tracing::info!(
+        target: "ckpt_trace",
+        meta_stream_id,
+        vp_extent_id,
+        vp_offset,
+        n_tables = locs.locs.len(),
+        ckpt_extent = ckpt_result.extent_id,
+        ckpt_offset = ckpt_result.offset,
+        ckpt_end = ckpt_result.end,
+        "checkpoint published"
+    );
     let info = stream_client.get_stream_info(meta_stream_id).await?;
     if info.extent_ids.len() > 1 {
         let last = *info.extent_ids.last().unwrap();
@@ -9795,8 +9822,13 @@ async fn flush_worker_loop(
                 done.send();
             }
             if req.seal_and_roll {
-                // seal + roll the row tail off a fenced node.
-                // seal_and_roll_tail invalidates the cache internally. Best-
+                // seal + roll the row tail off a fenced node. The inflight FU
+                // was drained to zero above, and `seal_and_roll_tail` is
+                // live-writer-safe: with the row worker alive it quiesces via
+                // the SealCommit handshake, seals at the worker's exact
+                // all-replica-acked commit, and ResetTails the worker onto the
+                // fresh extent — so no later flush can append to (and ack
+                // into) the ghost region above the sealed length. Best-
                 // effort: on error (e.g. all replicas unreachable → manager
                 // Precondition) log + still ACK; the manager sweep retries on
                 // its cooldown.

@@ -277,6 +277,25 @@ pub(crate) async fn handle_roll_tails(
     }
     let mut rolled = 0u32;
     for (stream_id, expected_tail) in req.entries {
+        // Never roll while a split/merge freeze holds this partition: the
+        // orchestration has (or is about to) capture per-stream commit lengths
+        // and the manager applies them to whatever extent is the CURRENT tail
+        // at commit time. A roll landing inside that window swaps the tail,
+        // so the captured length would be stamped onto the roll's fresh empty
+        // extent (sealed longer than any replica holds → the CoW child cannot
+        // read it). The roll is best-effort with a manager-side retry
+        // cooldown, so skipping here just defers it past the freeze.
+        if part.borrow().frozen_for_split.get().is_some()
+            || part.borrow().frozen_for_merge.get().is_some()
+        {
+            tracing::info!(
+                target: "roll_trace",
+                part_id,
+                stream_id,
+                "roll_tails: partition frozen for split/merge — deferring roll"
+            );
+            continue;
+        }
         // Idempotency: skip if the tail already rolled (current != expected).
         let cur_tail = match part_sc.get_stream_info(stream_id).await {
             Ok(info) => info.extent_ids.last().copied().unwrap_or(0),
@@ -302,6 +321,14 @@ pub(crate) async fn handle_roll_tails(
                 rolled += 1;
             }
         } else if stream_id == log_id || stream_id == meta_id {
+            tracing::info!(
+                target: "roll_trace",
+                part_id,
+                stream_id,
+                expected_tail,
+                kind = if stream_id == log_id { "log" } else { "meta" },
+                "roll_tails: sealing+rolling live tail"
+            );
             match part_sc.seal_and_roll_tail(stream_id).await {
                 Ok(()) => rolled += 1,
                 Err(e) => {
@@ -1422,6 +1449,27 @@ pub(crate) async fn handle_split_part(
         .commit_length(meta_stream_id)
         .await
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
+    {
+        let p = part.borrow();
+        tracing::info!(
+            target: "split_trace",
+            part_id = req.part_id,
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            log_end,
+            row_end,
+            meta_end,
+            vp_extent_id = p.vp_extent_id,
+            vp_offset = p.vp_offset,
+            freeze_elapsed_ms = p
+                .frozen_for_split
+                .get()
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(u64::MAX),
+            "split captured commit lengths"
+        );
+    }
 
     // synchronous P-log → P-sst barrier. Sent BEFORE
     // `multi_modify_split` so that any failure here is cleanly abortable:
@@ -1571,12 +1619,26 @@ pub(crate) async fn handle_split_part(
                 break;
             }
             Err(err) => {
+                tracing::info!(
+                    target: "split_trace",
+                    part_id = req.part_id,
+                    freeze_elapsed_ms = freeze_at.elapsed().as_millis() as u64,
+                    error = %err,
+                    "split multi_modify_split attempt failed"
+                );
                 split_err = err.to_string();
                 compio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
             }
         }
     }
+    tracing::info!(
+        target: "split_trace",
+        part_id = req.part_id,
+        split_ok,
+        freeze_elapsed_ms = freeze_at.elapsed().as_millis() as u64,
+        "split commit phase done"
+    );
 
     if !split_ok {
         // unfreeze on multi_modify_split failure so the partition

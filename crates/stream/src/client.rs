@@ -2521,6 +2521,14 @@ impl StreamClient {
         l
     }
 
+    /// Lookup-only: the per-stream worker's Sender IF one is live.
+    /// Never spawns. Used by `seal_and_roll_tail` to decide between the
+    /// live-writer roll (quiesce the worker first) and the probe roll
+    /// (no writer exists, a manager-side probe seal is race-free).
+    fn existing_stream_worker(&self, stream_id: u64) -> Option<mpsc::Sender<StreamSubmitMsg>> {
+        self.stream_workers.borrow().get(&stream_id).cloned()
+    }
+
     /// Get or spawn the per-stream worker, returning a cloned Sender.
     fn stream_worker_sender(&self, stream_id: u64) -> mpsc::Sender<StreamSubmitMsg> {
         if let Some(tx) = self.stream_workers.borrow().get(&stream_id) {
@@ -2879,27 +2887,59 @@ impl StreamClient {
         }
     }
 
-    /// WAL self-heal A4: seal-and-roll the current OPEN tail of `stream_id` via
-    /// the manager probe (seal-over-reachable) and alloc a fresh tail.
+    /// Seal-and-roll the current OPEN tail of `stream_id`, safely for BOTH
+    /// caller shapes:
     ///
-    /// Used by recovery when replay finds the OPEN tail corrupt: an open extent
-    /// has no `avali` to clear, so it can't be isolated in place. Sealing freezes
-    /// it at the committed length (the acked prefix is on every committed member
-    /// under all-replica-ACK, so `min`-over-reachable ≥ acked — no acked data
-    /// lost; bytes beyond are un-acked speculation, correctly dropped) and turns
-    /// it into a SEALED extent. This method ONLY performs the manager-side
-    /// seal-and-roll; the caller decides what to do next. The recovery caller
-    /// (`self_heal_replay_chunk`) invalidates the extent cache, re-fetches the
-    /// now-sealed ExtentInfo, and runs the sealed cross-read on the same window in
-    /// the same pass — isolating the bad replica via A5 without depending on a
-    /// retried open.
+    /// **Live writer (a per-stream worker exists — the fence-drain
+    /// `MSG_ROLL_TAILS` path):** the roll MUST go through the worker. A bare
+    /// manager probe-seal behind a live worker's back freezes the manager's
+    /// `sealed_length` while the worker — whose cached tail and the ENs' local
+    /// state know nothing of the seal (seal state propagates to ENs lazily,
+    /// and the writer's cached eversion still matches the ENs') — keeps
+    /// appending to the SAME extent and keeps getting client ACKs. Every byte
+    /// acked after the seal sits above `sealed_length`: recovery's
+    /// committed-clamped replay stops at the seal (silent loss of acked
+    /// writes), and any checkpoint/SST that lands in or references the ghost
+    /// region wedges a CoW split child with
+    /// `stale_vp_offset_past_sealed_length` (the chaos acked-write-loss family, reproduced by
+    /// `system_roll_tails_live_writer`). So: SealCommit handshake (quiesce →
+    /// the worker's exact all-replica-acked commit; freezes the doomed tail
+    /// against new appends), authoritative seal+alloc PINNED to that tail
+    /// (note 20/32a idempotent-roll rules), then `ResetTail` so the writer
+    /// resumes on the fresh extent — the same mechanics as the append-failure
+    /// roll.
     ///
-    /// Does NOT touch the per-stream worker (recovery runs before it spawns) —
-    /// it is a pure manager RPC + cache update. Fenced by `self.owner_epoch`
-    /// (the recovering PS holds the partition owner lock). The new fresh tail is
-    /// picked up by `ensure_tail_initialised` when the worker later spawns (the
-    /// old tail now reports sealed → alloc fresh, the standard path).
+    /// **No live writer (WAL self-heal A4 during recovery, pre-worker):**
+    /// manager probe (seal-over-reachable) + fresh tail. Race-free because
+    /// there is no writer to race: `min`-over-reachable ≥ acked under
+    /// all-replica-ACK, and the fresh tail is picked up by
+    /// `ensure_tail_initialised` when the worker later spawns (the old tail
+    /// now reports sealed → alloc fresh, the standard path).
     pub async fn seal_and_roll_tail(&self, stream_id: u64) -> Result<()> {
+        if let Some(tx) = self.existing_stream_worker(stream_id) {
+            let (seal_commit, seal_eid) = self.seal_commit_watermark(stream_id, &tx).await?;
+            if seal_eid != 0 {
+                // If alloc fails here the worker is left `sealing = true`;
+                // that is self-healing: the next append soft-errors and the
+                // public-API retry path escalates to its own
+                // SealCommit+alloc+ResetTail roll (and the fence-drain sweep
+                // retries on its cooldown).
+                let (_, new_ext) = self
+                    .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                    .await?;
+                let new_tail = self.build_stream_tail(new_ext).await?;
+                let mut tx_clone = tx.clone();
+                tx_clone
+                    .send(StreamSubmitMsg::ResetTail { tail: new_tail })
+                    .await
+                    .map_err(|_| anyhow!("stream {stream_id} worker gone mid-roll"))?;
+                return Ok(());
+            }
+            // Worker exists but never initialised a tail (seal_eid == 0):
+            // nothing acked through it — fall through to the probe roll.
+            // (SealCommit left it `sealing = true`; the first append's
+            // ResetTail onto the fresh tail clears the flag.)
+        }
         // None seal_commit (probe) → seal_extent_id=0 (no specific target).
         self.alloc_new_extent(stream_id, None, 0).await?;
         Ok(())

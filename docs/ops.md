@@ -692,10 +692,17 @@ What fencing triggers (all automatic):
   extents (0-byte membership swap).
 - **Open tails**: recovery only rebuilds sealed extents, so the manager's drain
   sweep (every 2 s tick, 30 s per-partition cooldown) asks the owning PS to
-  seal + roll any OPEN tail with a fenced replica (`MSG_ROLL_TAILS`). The old
-  tail seals (lenient probe — a dead fenced replica doesn't block), a
-  fresh tail rolls on healthy nodes, and the next recovery tick rebuilds the
-  now-sealed extent. An idle partition therefore drains with no client writes.
+  seal + roll any OPEN tail with a fenced replica (`MSG_ROLL_TAILS`). On a
+  SERVING partition the roll quiesces the live stream writer first (SealCommit
+  handshake) and seals at its exact all-replica-acked commit, then redirects
+  the writer onto a fresh tail on healthy nodes — so a busy partition drains
+  without losing acked writes (a bare probe-seal behind a live writer was the
+  cause of the split-child `stale_vp_offset_past_sealed_length` wedge / silent
+  stale-read family; regression `system_roll_tails_live_writer`). With no live
+  writer it seals by lenient probe (a dead fenced replica doesn't block). The
+  next recovery tick rebuilds the now-sealed extent; an idle partition
+  therefore drains with no client writes. The PS defers the roll while the
+  partition is frozen for a split/merge (retried after the freeze).
 
 Watching progress:
 
