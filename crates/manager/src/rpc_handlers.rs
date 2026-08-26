@@ -1074,7 +1074,7 @@ impl AutumnManager {
         }
         // Compute the etcd-first update under a read-only borrow (no mutation
         // until the persist succeeds — coco I5).
-        let updated: Result<MgrExtentInfo, (u8, String)> = {
+        let updated: Result<(MgrExtentInfo, u32), (u8, String)> = {
             let s = self.store.inner.borrow();
             // I4 fencing: the reporter must be the current partition owner.
             let owner_key = format!("partition/{}", req.partition_id);
@@ -1170,6 +1170,7 @@ impl AutumnManager {
                         .copied()
                         .collect();
                     let mut cleared = 0u32;
+                    let mut cleared_mask = 0u32; // which slots this report darkened
                     let mut found = 0u32; // reported nodes that ARE replicas
                     for nid in &req.corrupt_node_ids {
                         if let Some(slot) = slots.iter().position(|s| s == nid) {
@@ -1183,6 +1184,7 @@ impl AutumnManager {
                             let bit = 1u32 << slot;
                             if new_ex.avali & bit != 0 {
                                 new_ex.avali &= !bit;
+                                cleared_mask |= bit;
                                 cleared += 1;
                             }
                         }
@@ -1227,11 +1229,11 @@ impl AutumnManager {
                         }));
                     }
                     new_ex.eversion += 1;
-                    Ok(new_ex)
+                    Ok((new_ex, cleared_mask))
                 }
             }
         };
-        let updated = match updated {
+        let (updated, cleared_bits) = match updated {
             Ok(u) => u,
             Err((code, message)) => {
                 return Ok(rkyv_encode(&ReportCorruptReplicaResp { code, message }))
@@ -1254,6 +1256,23 @@ impl AutumnManager {
             return Ok(rkyv_encode(&ReportCorruptReplicaResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
+            }));
+        }
+        // Record WHY these slots went dark. A clear `avali` bit alone reads as
+        // "behind", which the dispatch loop tries to heal with re_avali — a
+        // length comparison a full-length rotted replica passes. Worse, under
+        // the default `fenced_only` gate the loop skips the slot entirely, so
+        // without this mark the extent stays at RF-1 with no repair path.
+        if let Err(err) = self
+            .mark_slots_corrupt(updated.extent_id, cleared_bits)
+            .await
+        {
+            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                code: Self::err_to_code(&err),
+                message: format!(
+                    "isolated extent {} but could not record the corrupt slots ({err});                      retry so the rebuild is scheduled",
+                    updated.extent_id
+                ),
             }));
         }
         // Verify-at-apply (coco P1 #1, the same pattern): a concurrent mutator
@@ -3162,6 +3181,11 @@ impl AutumnManager {
                             "could not drop the deleted extent's payload-location key"
                         );
                     }
+                    // Same lifetime as the payload location: the extent is gone, so the
+                    // mark describing its slots must not outlive it.
+                    if let Err(e) = self.forget_corrupt_slots(eid).await {
+                        tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
+                    }
                 }
                 // Each enqueue is an etcd CAS via the inflight ledger; errors
                 // are downgraded inside enqueue (WARN-logged) so a single
@@ -3299,6 +3323,11 @@ impl AutumnManager {
                             error = %e,
                             "could not drop the deleted extent's payload-location key"
                         );
+                    }
+                    // Same lifetime as the payload location: the extent is gone, so the
+                    // mark describing its slots must not outlive it.
+                    if let Err(e) = self.forget_corrupt_slots(eid).await {
+                        tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
                     }
                 }
                 let _ = self.enqueue_pending_deletes(pending_deletes).await;

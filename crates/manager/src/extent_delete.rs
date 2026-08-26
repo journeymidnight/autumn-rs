@@ -278,6 +278,11 @@ impl AutumnManager {
                     "both-zero sweep: could not drop the extent's payload-location key"
                 );
             }
+            // Same lifetime as the payload location: the extent is gone, so the
+            // mark describing its slots must not outlive it.
+            if let Err(e) = self.forget_corrupt_slots(eid).await {
+                tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
+            }
             if let Err(e) = self.enqueue_pending_deletes(vec![d]).await {
                 tracing::warn!(
                     extent_id = eid,

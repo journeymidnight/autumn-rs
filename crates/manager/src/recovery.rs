@@ -807,6 +807,20 @@ impl AutumnManager {
                 .insert(updated_extent.extent_id, updated_extent.clone());
         }
         self.commit_extent_inflight_release(updated_extent.extent_id);
+        // The rebuilt slot holds fresh bytes copied from a healthy peer, so the
+        // corrupt mark that scheduled this rebuild has been satisfied. Clearing
+        // it also stops the slot from being force-dispatched every tick.
+        if let Some(slot) = Self::extent_slot(&updated_extent, task.node_id) {
+            if let Err(e) = self.clear_corrupt_slot(updated_extent.extent_id, slot).await {
+                tracing::warn!(
+                    extent_id = updated_extent.extent_id,
+                    slot,
+                    error = %e,
+                    "rebuilt a corrupt slot but could not clear its mark; it will be \
+                     re-dispatched until the mark clears"
+                );
+            }
+        }
         // Op-ledger: the extent layout is repaired — close the recovery entry.
         {
             let (now_s, _) = Self::now_s_ms();
@@ -962,7 +976,15 @@ impl AutumnManager {
                     // explicitly fence before we dispatch recovery. The
                     // backoff-from-failure path still applies once a
                     // dispatch attempt does fire.
-                    if gate_mode == RecoveryGateMode::FencedOnly && !is_fenced {
+                    // A slot a partition owner PROVED corrupt is rebuilt
+                    // regardless of the gate. Corruption is a stronger signal
+                    // than the conditions the gate exists to wait for — the
+                    // owner replayed those bytes and found them wrong — and
+                    // re_avali cannot repair it (it only compares length, which
+                    // a full-length rotted replica passes). Without this the
+                    // extent stays isolated at RF-1 forever with no repair path.
+                    let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
+                    if gate_mode == RecoveryGateMode::FencedOnly && !is_fenced && !is_corrupt {
                         continue;
                     }
 
@@ -970,7 +992,7 @@ impl AutumnManager {
                     // rebuilt regardless of probe outcome (the whole
                     // point of fence is to migrate data off). Skip the
                     // disk + probe shortcuts and dispatch immediately.
-                    if is_fenced {
+                    if is_fenced || is_corrupt {
                         self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
                             .await;
                         continue;

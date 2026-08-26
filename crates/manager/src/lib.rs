@@ -3,6 +3,7 @@ pub mod authz;
 pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
+mod extent_corrupt;
 mod extent_layout;
 mod fs_alloc;
 pub mod inode_lease;
@@ -740,6 +741,9 @@ pub struct AutumnManager {
     /// not in the default `InDat` shape. See `extent_layout.rs`; persisted at
     /// the `extentLayout/` prefix, absent ⇒ `InDat`.
     pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, u8>>>,
+    /// Slots proven to hold corrupt bytes, per extent (see `extent_corrupt`).
+    /// Distinct from a clear `avali` bit, which cannot say WHY a slot is out.
+    pub(crate) extent_corrupt_slots: Rc<RefCell<HashMap<u64, u32>>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -1032,6 +1036,7 @@ impl AutumnManager {
             inflight: Rc::new(RefCell::new(HashMap::new())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
+            extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
@@ -3065,6 +3070,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let extent_layout_raw = c
             .get_prefix(crate::extent_layout::EXTENT_LAYOUT_PREFIX)
             .await?;
+        // Per-extent corrupt slots. A rebuild scheduled by a corrupt report
+        // must survive the leader change that interrupted it, or the extent is
+        // left isolated at RF-1 with the reason gone.
+        let extent_corrupt_raw = c
+            .get_prefix(crate::extent_corrupt::EXTENT_CORRUPT_PREFIX)
+            .await?;
         // persistent operator overrides + decommissioned tombstones.
         let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
@@ -3316,6 +3327,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             extent_layout_raw.kvs.iter().filter_map(|kv| {
                 let id =
                     Self::parse_id_from_key(crate::extent_layout::EXTENT_LAYOUT_PREFIX, &kv.key)
+                        .ok()?;
+                Some((id, kv.value.as_slice()))
+            }),
+        ));
+        self.install_replayed_corrupt_slots(Self::decode_extent_corrupt_kvs(
+            extent_corrupt_raw.kvs.iter().filter_map(|kv| {
+                let id =
+                    Self::parse_id_from_key(crate::extent_corrupt::EXTENT_CORRUPT_PREFIX, &kv.key)
                         .ok()?;
                 Some((id, kv.value.as_slice()))
             }),

@@ -363,7 +363,26 @@ deletion.
 
 **Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): a slot is
 rebuilt only when its node's override is `Fenced`; `auto_disk` reverts to the legacy
-"rebuild on `disk.online == false`".
+"rebuild on `disk.online == false`". **A slot marked CORRUPT bypasses the gate**
+(see below) — corruption is a stronger signal than what the gate waits for.
+
+**Corrupt slots (`extent_corrupt.rs`, sibling key `extentCorrupt/<id>` → u32
+bitmap).** A clear `avali` bit says a slot is not serving; it cannot say WHY,
+and the two reasons need opposite handling. *Behind* → `re_avali` refetches the
+missing tail. *Corrupt* → `re_avali` CANNOT help: its whole test is
+`local_len >= sealed_length`, which a full-length rotted replica passes. So
+`handle_report_corrupt_replica` records the darkened slots here in addition to
+clearing their bits, and `recovery_dispatch_loop` force-dispatches a marked slot
+regardless of `gate_mode`. `apply_recovery_done` clears the mark (the rebuilt
+slot holds fresh bytes copied from a healthy peer), and extent deletion drops
+the key alongside `extentLayout/`. **Without the mark the extent stays at RF-1
+forever**: the gate skips the slot before it ever reads `avali`, so the copy is
+isolated, unrepaired and silent. Sibling key rather than a `MgrExtentInfo` field
+for the same reason as `extentLayout` — widening the persisted `extents/<id>`
+value breaks rkyv replay validation, which refuses leadership.
+Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
+prerequisite that the loop can act at all is pinned by
+`system_recovery_loop_drives.rs`.
 
 **Node health loop** (`node_health_loop`, 2 s) is the **single** `EXT_MSG_DF` caller
 per node. **INVARIANT: never add a second `df` caller.** The EN's `handle_df`

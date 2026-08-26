@@ -1,3 +1,38 @@
+Date: 2026-08-26 (c)
+TaskStatus: not_completed
+Task scope: /loop ①corrupt replica【已修复并验证】 ②op 可观测性【未开始】。
+  ①-f【前置基建:让 recovery loop 在集成测试里可驱动】(commit ed4c652)
+     上一轮"loop 完全不动"的根因是两条叠加,都不是 bug:
+       (主) EN 没配 manager endpoint —— handle_require_recovery 第一步就校验它,未配则拒绝,
+            于是每个候选都是"看起来合格但拒绝一切"⇒ manager 报 "all recovery candidates rejected"。
+            support::start_extent_node 从来没设过;silent_corruption_rot.rs 自己那份 helper
+            却带 mgr 参数 —— 说明这事曾被知道但没推广。新增 start_extent_node_with_manager。
+       (次) 需要非成员节点作为重建目标;RF=2 + 2 节点时人人都是成员,无处可去。
+     两个测试钉住,第二个让第一个可信:有 spare 时 fence 成员会驱动重建完成;
+     没有时 loop 惰性 ⇒ 今后任何"什么都没发生"的断言必须自带 spare,否则真空。
+     【诊断靠的是上一轮加的 leader 日志事件】——那条 "all recovery candidates rejected"
+     正是此前无处可查的原因,自己救了自己。
+  ①-g【真 bug 复现 + 修复】(本轮)
+     真正的缺陷不是"隔离被撤销"(那条链因 gate 不可达),而是【隔离了但没有修复路径】:
+     corrupt 上报只清 avali bit、不 fence 任何东西,默认 fenced_only gate 在读 avali【之前】
+     就 continue 掉该 slot ⇒ extent 永久停在 RF-1,静默、无告警、无修复,除非人工 fence。
+     复现:3EN+RF2+spare,上报 corrupt 后断言该副本最终被重建 —— 30s 超时失败(非真空,
+     同配置在 drives 测试里能重建)。修后 4.3s 完成。
+     修法(照 extentLayout 的 sibling-key 模式,不动 rkyv 布局):
+       新模块 extent_corrupt.rs + `extentCorrupt/<id>` → u32 位图 + 内存影子 + replay 挂载;
+       上报时在 avali 持久化【之后】记录被熄灭的 slot(失败则返回错误让 PS 重试);
+       recovery_dispatch_loop:标记过的 slot 【无视 gate】直接 dispatch_and_record;
+       apply_recovery_done 清位(重建后字节已从健康 peer 拷贝);extent 删除时随 extentLayout 一起丢弃。
+     门:manager lib 288、system_corrupt_replica_rebuild、system_recovery_loop_drives 2/2、
+     ec_failover、re_avali_no_destroy 2/2、system_recovery_vp_seed、system_chaos(--ignored)全绿。
+  ②op 可观测性:未开始。设计见 memory project_op_observability_redesign(三层:live 带进度% /
+     终态入 etcd+rotate / dashboard 走 RPC 向 leader 要)。
+Next steps:
+  1) 做 ②。起点建议:先做"live 状态带百分比",因为数据都在手边只是没上报
+     (GC 有 cur/sealed_length、compact 有 input/output tables、recovery 有已拷字节、EC 有 stripe 序号)。
+  2) 然后终态入 etcd + rotate(现 audit 只存 result_code 0/1,error 全文在调用点就丢)。
+  3) 最后 dashboard 侧的读取 RPC。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (b)
 TaskStatus: not_completed
 Task scope: /loop ①corrupt replica ②op 可观测性。本轮做 ① 的复现,结论:【原报告链路不可达,且我的第一版测试是真空的】,未修。
