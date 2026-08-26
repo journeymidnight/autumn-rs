@@ -1295,3 +1295,32 @@ fn support_binary_path(name: &str) -> std::path::PathBuf {
     );
     p
 }
+
+/// Like `start_extent_node`, but wires the node's MANAGER ENDPOINT.
+///
+/// Required by any test that expects the recovery dispatch loop to act.
+/// `handle_require_recovery` validates the manager endpoint before anything
+/// else and refuses outright when it is unset, so a node started without one is
+/// a valid-looking recovery candidate that rejects every dispatch. The manager
+/// then reports "all recovery candidates rejected" and the loop makes no
+/// progress — while an assertion of the form "membership did not change" passes
+/// vacuously.
+///
+/// Also needed for the EN's own manager round-trips: fetching `ExtentInfo` for
+/// replica addresses, and reporting completion.
+pub fn start_extent_node_with_manager(
+    addr: SocketAddr,
+    dir: std::path::PathBuf,
+    disk_id: u64,
+    mgr_addr: SocketAddr,
+) {
+    let mgr = mgr_addr.to_string();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let cfg = ExtentNodeConfig::new(dir, disk_id).with_manager_endpoint(mgr);
+            let n = ExtentNode::new(cfg).await.expect("extent node");
+            let _ = n.serve(addr).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+}
