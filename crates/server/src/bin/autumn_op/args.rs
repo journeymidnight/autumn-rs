@@ -26,7 +26,7 @@ fn usage() -> ! {
     );
     eprintln!("  cluster-version              persisted cluster_version + manager wire interval (R1)");
     eprintln!();
-    eprintln!("rolling upgrade (R1, docs/rolling_upgrade_design.md):");
+    eprintln!("upgrade versioning:");
     eprintln!("  upgrade-version [--to N]     bump cluster_version (default current+1); run ONLY");
     eprintln!("                               after every member binary is upgraded; not rollbackable");
     eprintln!();

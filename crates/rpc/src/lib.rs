@@ -76,7 +76,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// silently decoding garbage (rkyv has no cross-version compat).
 pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 
-/// R1 (rolling upgrade design): the wire-version interval this binary
+/// The wire-version interval this binary
 /// speaks. `MAX` is the version of the schema compiled into this binary;
 /// `MIN` is the oldest peer version it can still interoperate with.
 /// Bump discipline (enforced by `wire_version_registry_tests`):
@@ -89,7 +89,7 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///     before it; deploys stay same-commit.
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
-///     window (design §5: compat window is exactly N ↔ N-1).
+///     window (the compat window is exactly N ↔ N-1).
 pub const WIRE_VERSION_MIN: u32 = 29;
 pub const WIRE_VERSION_MAX: u32 = 29;
 
@@ -409,7 +409,7 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   the numeric code beside it. No struct changed — but rendering every
     //   unnamed code as the bare word "error" made a permanently fenced EC
     //   conversion read like a generic transient being retried.
-    (29, "5d9d13ff8722b503"),
+    (29, "b189600e72bfcc1f"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
@@ -464,7 +464,7 @@ clean tree (and fix its WIRE_VERSION_FINGERPRINTS registry)."
 fp={WIRE_FINGERPRINT}, peer=[{remote_min},{remote_max}] fp={remote_fp} — \
 no common wire version (rkyv wire structs have no implicit cross-version \
 compatibility; a mixed deploy decodes garbage silently). Upgrade one step at a \
-time (compat window is N ↔ N-1, docs/rolling_upgrade_design.md §5), or rebuild \
+time (compat window is N ↔ N-1), or rebuild \
 this binary/wheel from the cluster's commit."
     ))
 }

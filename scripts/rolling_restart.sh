@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# rolling_restart.sh — R0 of docs/rolling_upgrade_design.md
+# rolling_restart.sh — SAME-BINARY rolling restart.
+#
+# autumn does NOT support rolling UPGRADES: a version change is stop-the-world
+# (full stop, swap binaries, full start). This script restarts a cluster that
+# is already running one binary — for config changes, host maintenance, or
+# clearing a wedged process.
 #
 # Programmatic rolling restart of a running autumn-rs cluster, one process
 # at a time, with a convergence gate + write-liveness probe between every
@@ -7,7 +12,7 @@
 # aborts the whole procedure, leaving the cluster in its current (still
 # serving) state for the operator to inspect.
 #
-# Order (design §6 — most-depended-on end first):
+# Order (most-depended-on end first):
 #   1. extent-nodes, one by one   (EN gate: node Online + recovery quiet)
 #   2. partition server           (PS gate: every partition routed)
 #   3. manager                    (gate: leader back + all nodes Online)

@@ -964,7 +964,7 @@ pub struct AutumnManager {
     pub(crate) cluster_id: Rc<RefCell<String>>,
     /// R1 rolling upgrade: persisted cluster_version (etcd
     /// `autumn-rs/cluster_version`, ASCII decimal). The operator-bumped
-    /// feature gate from docs/rolling_upgrade_design.md §3-R1 — new wire
+    /// operator-driven feature gate — new wire
     /// forms / persisted formats versioned N may only be EMITTED once
     /// this reaches N. CAS-seeded to the first leader's
     /// `WIRE_VERSION_MAX` by `imprint_cluster_version`; bumped only via

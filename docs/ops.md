@@ -17,7 +17,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Data-plane authz setup](#data-plane-authz-setup)
 - [CLI cheatsheet](#cli-cheatsheet)
 - [Chaos suites](#chaos-suites)
-- [Rolling restart & upgrade versioning](#rolling-restart-r0-of-docsrolling_upgrade_designmd)
+- [Rolling restart & upgrade versioning](#rolling-restart--upgrade-versioning)
 - [Test matrix](#test-matrix)
 - [Inode-lease + close-to-open coherence (in flight)](#inode-lease--close-to-open-coherence-in-flight)
 
@@ -1507,12 +1507,12 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   accounting_checker_tests`.
 ```
 
-## Rolling restart (R0 of docs/rolling_upgrade_design.md)
+## Rolling restart & upgrade versioning
 
 Same-binary rolling restart of a live cluster — one process at a time, a
 convergence gate + per-partition write-liveness probe between every step,
 fail-stop on the first gate that doesn't converge. Order: EN one-by-one →
-PS → manager (most-depended-on end first, design §6).
+PS → manager (most-depended-on end first).
 
 ```bash
 # cluster must already be running (any cluster.sh start/reset shape)
@@ -1588,7 +1588,7 @@ Phase B, not yet shipped.)
 
 ### cluster_version + wire-version interval (R1)
 
-R1 lays the version-skew foundation: every binary carries a wire-version
+Version-skew foundation: every binary carries a wire-version
 interval `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]` (crates/rpc), the startup
 check accepts interval overlap instead of WIRE-1's fingerprint equality, and
 the manager persists an operator-bumped `cluster_version` in etcd (ASCII
