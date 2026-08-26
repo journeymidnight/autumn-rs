@@ -1,3 +1,29 @@
+Date: 2026-08-26 (u)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 验证 union 假设,结果【部分排除】:排序是对的,但 union 确实会带入已淘汰的旧 SST。
+  【已排除:排序错乱】lib.rs:7966 附近
+     union 的实现是:`for r in &meta_records { for loc in &r.locs { if seen.insert(key) { all_locs.push(..) } } }`
+     —— 按 meta_records 顺序拼接、按 (extent_id,offset,len) 去重、【不排序】。
+     对 split 右孩子,meta_records = [CoW 共享旧 extent 的 checkpoint, 自己新 tail 的 checkpoint]
+     ⇒ all_locs = [旧 SST..., 新 SST...],而 get 用 sst_readers.rev() ⇒ 【新 SST 先查】。
+     顺序正确 ⇒ "旧 SST 被当成更新的"不成立。
+  【仍然可疑但不足以解释 F4:union 会加载已被 compaction 淘汰的旧 SST】
+     新 checkpoint 只列存活的 SST;旧 checkpoint 里那些已被淘汰的 SST 仍会被 union 进来并打开。
+     但它们排在前面,只有在【新 SST 都没有该 key】时才会被读到 —— 而那种情况下
+     读到 split 时刻的值【本来就是对的】。所以这条不能直接产生 got_seq < expected_seq。
+     (副作用仍在:多打开一批本该消失的 SST,浪费 fd/内存,且让 has_overlap/GC 账目变复杂。)
+  【F4 的解释再次落空 —— 现在两大类框架都被排除】
+     (1) replay 起点太靠后:四条来源全排除(上上轮);
+     (2) 读到旧 SST:排序正确,且 fall-through 到旧 SST 的情形本身是正确行为(本轮)。
+     ⇒ 下一轮【不要再从机制猜起】。应回到最硬的证据:
+        F4 丢的 22 个 key 全是 q*,且 got_seq 落后 32–432(不是落后到 0,是【落后一段】)。
+        "落后一段固定量级"更像【某一批写整体丢失】,而不是"读到某个旧快照"。
+        建议查:split 期间 freeze/drain 的窗口里,已 ACK 的写是否可能未进入任何 SST 也未进入 WAL replay 范围
+        ——即 write path 侧,而不是 read path 侧。
+Next steps:
+  1) 按上面的新方向:从【写入侧】查 split 窗口内已 ACK 的写去了哪里(而非从读侧猜)。
+  2) F3 单独查 EC+VP 读链;3) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (t)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 换方向后立刻找到一个【贴合全部证据】的新假设:checkpoint union 把旧 SST 带进右孩子。
