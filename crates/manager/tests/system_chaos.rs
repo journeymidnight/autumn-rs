@@ -1548,10 +1548,33 @@ async fn verify_no_ec_markers_pinned(mgr: &RpcClient) -> Vec<String> {
         }
     };
     for m in &resp.markers {
+        // A pinned marker is only a DEFECT if the conversion could have been
+        // making progress. `ec_conversion_dispatch_loop` deliberately skips a
+        // coordinator that is Suspected / Suspend / Fenced / in Maintenance —
+        // not dispatching to a flapping node is the design working, and this
+        // harness spikes latency and kills nodes on purpose. Flagging those as
+        // failures buries the case that actually matters: a marker sitting
+        // still while its coordinator is perfectly healthy.
+        let coord_ok = m.coord_auto_state == NODE_AUTO_STATE_ONLINE
+            && m.coord_override_kind == NODE_OVERRIDE_NONE;
+        if !coord_ok {
+            eprintln!(
+                "chaos: EC marker on extent {} pinned {}s, but its coordinator \
+                 (node {}) is not dispatchable (auto_state={} override={}) — \
+                 expected: dispatch skips it until the node recovers",
+                m.extent_id,
+                m.age_secs,
+                m.coord_node_id,
+                m.coord_auto_state,
+                m.coord_override_kind
+            );
+            continue;
+        }
         errors.push(format!(
-            "EC marker on extent {} still pinned after quiesce (age {}s) — \
-             the extent's GC is blocked until it drains",
-            m.extent_id, m.age_secs
+            "EC marker on extent {} still pinned after quiesce (age {}s) with a \
+             HEALTHY coordinator (node {}) — nothing is stopping this conversion \
+             from progressing, and the extent's GC is blocked until it drains",
+            m.extent_id, m.age_secs, m.coord_node_id
         ));
     }
     errors

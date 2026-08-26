@@ -1,3 +1,28 @@
+Date: 2026-08-26 (q)
+TaskStatus: not_completed
+Task scope: 自主循环 —— F2 的断言分级(commit 见下)。产品代码未动,仅改 chaos 断言。
+  【发现:响应里早就有 coordinator 状态,断言却没用】
+     ListEcInflightMarkersResp 的 InflightWithCoordState 已带 coord_node_id / coord_auto_state /
+     coord_override_kind,而 verify_no_ec_markers_pinned 只用了 extent_id + age_secs
+     ⇒ 白白扔掉了区分"卡住"与"合理等待"所需的全部信息。不需要改 wire。
+  【判据】marker 钉住【只在 coordinator 健康时】才是缺陷:
+     ec_conversion_dispatch_loop 【设计上】跳过 Suspected/Suspend/Fenced/Maintenance 的 coordinator,
+     而这个 harness 正是故意制造 latency spike 和 kill。把那些算失败,
+     恰恰【淹没了真正要紧的情况】——coordinator 完全健康,marker 却纹丝不动。
+     改后:coordinator 不可派发 → 打印说明并跳过;coordinator 健康却钉住 → 才报失败(措辞点明"nothing is
+     stopping this conversion from progressing")。
+  【⚠️ 验证状态要诚实:新分支未被触发】改后连跑 4 次 chaos 全绿,但 4 次里
+     【0 次出现 pinned marker】(ec_expected=0 且 ec_failed=0)⇒ 新加的两条分支一次都没执行到。
+     所以:已证明【无回归】,【未证明】分类逻辑在真实场景下正确。
+     下次 F2 复现(此前 2/25)时才会真正走到这两条分支,届时看输出属于哪一类。
+Next steps(未变):
+  1) F1+F4(split 右孩子 replay 起点,2/25,最值得修):读 (a) split flush 与 commit_length 捕获之间
+     vp 能否前进;(b) duplicate_stream 的 meta_stream seal 是否让右孩子读到旧 checkpoint;
+     (c) CoW 共享 extent 下 recover_partition 的 chosen_pos/first_pos_by_eid。
+     【已排除的方向】vp 太小 → 多 replay → 幂等不丢;所以要找的是"replay 起点太靠后"的原因。
+  2) F3 单独查 EC+VP 读链(仅 VP、读不到、持久)。
+  3) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (p)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 【修掉本 session 唯一一个已确诊未修的 bug】:get 的 GC-pin false-NotFound。
