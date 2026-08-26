@@ -1726,7 +1726,16 @@ the chaos acked-write-loss family; repro
   SealCommit quiesce → authoritative seal pinned to that tail → ResetTail. A
   bare probe-seal behind the live writer lets it keep appending + ACKing onto
   the manager-sealed extent (ENs learn seals lazily), stranding acked bytes
-  above `sealed_length` — silently lost to any recovery/CoW child.
+  above `sealed_length` — silently lost to any recovery/CoW child. THIRD
+  manifestation, no child needed: a LARGE value acked into the ghost window is
+  stored as a ValuePointer into `[sealed_length, …)` of the sealed extent, so
+  once the reader's extent-info cache refreshes to the sealed view, every GET
+  of that key is refused (`stale_vp_offset_past_sealed_length`) FOREVER — the
+  serving parent itself cannot read its own acked big values, while equally
+  ghosted SMALL values keep reading fine from the memtable. In chaos this wore
+  the "big-values-only persistent not_found/timeout" mask (kid%8==0, both
+  writer prefixes — both partitions' tails were rolled) until the verifier
+  stopped swallowing frame-level GET errors.
 - **Deferred while `frozen_for_split` / `frozen_for_merge`.** Split/merge
   capture per-stream commit lengths and the manager seals whatever extent is
   the CURRENT tail at commit time; a roll inside that window swaps the tail so

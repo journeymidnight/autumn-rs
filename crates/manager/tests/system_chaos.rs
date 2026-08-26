@@ -1665,7 +1665,10 @@ async fn verify_per_key(
     for (key, want) in expected {
         let part_id = topo.route(key);
         if wedged_parts.contains(&part_id) {
-            not_found.push(String::from_utf8_lossy(key).into_owned());
+            not_found.push(format!(
+                "{} [skipped: partition {part_id} already marked wedged]",
+                String::from_utf8_lossy(key)
+            ));
             continue;
         }
         let mut got: Option<Vec<u8>> = None;
@@ -1739,7 +1742,15 @@ async fn verify_per_key(
                     Ok(r) => last_status = Some((r.code, r.message)),
                     Err(e) => last_status = Some((255, format!("undecodable GetResp: {e}"))),
                 },
-                Err(_) => {
+                Err(e) => {
+                    // A frame-level RPC error (FLAG_ERROR response / transport
+                    // failure) carries the WHY — e.g. a VP read refused with
+                    // stale_vp_offset_past_sealed_length. Swallowing it here
+                    // rendered exactly that failure as "[no response —
+                    // wedged/timeout]" and sent an entire investigation after
+                    // a hang that never existed. 254 = rpc-level error marker
+                    // (255 = undecodable body).
+                    last_status = Some((254, format!("rpc error: {e}")));
                     compio::time::sleep(Duration::from_millis(300)).await;
                     continue;
                 }

@@ -47,8 +47,25 @@ Task scope: F1+F4 已 ack 写丢失(split 右孩子 wedge / 静默旧值)——�
   v29 未部署 → 指纹就地刷新 fad8cec20c7f20ba。测试:
   system_roll_tails_live_writer::in_flight_roll_racing_split_commit_child_still_opens
   (修前精确失败=非真空,修后 3/3 全绿)。
-【残留②=F3(VP 大值读 wedged/timeout,kid%8==0,b/q 都有)与本修无关且在收窄动作集
-  (无 EC)下也出现过 1 次——下一优先。
+【残留②=F3 已定根因(后续会话,同日):同一根因的第三种表现,无需 EC】
+  证据链(pre-fix 命中 run_11 seed=754894795 的 trace,硬证据非推断):
+  fence-roll 在 20:11:41 把【两个分区】的活 log tail 都 probe-seal(extent 21@2680866 /
+  extent 22@4678198),随后两个分区的 checkpoint vp 分别落在 seal 之后 684KB / 2.2MB
+  ——ghost 窗口里被 ack 的写继续落盘。大值(kid%8==0)在该窗口的 VP 指向
+  [sealed_length,…) ⇒ extent-info cache 一旦刷新成 sealed 视图(node kill 触发
+  replica-lookup-fail invalidate),该 key 的每次 GET 永久被拒
+  stale_vp_offset_past_sealed_length;小值在 memtable 里照常可读 ⇒ 精确解释全部指纹:
+  仅大值/b+q 双前缀(两条 tail 都被 roll,不需要 split 孩子)/持久(sealed_length 不可变)/
+  post-reclaim 不变/EN 无 fail-loud(拒绝在客户端)。旧假设"EC-converted VP 读链"退役
+  (run_11 无 EC 动作)。
+  【为什么三次调查都被标签骗】verify_per_key 对 client.call 的 Err(_)(FLAG_ERROR 帧=
+  真正的错误原因,含 stale_vp_offset 文本)静默 sleep+continue,10 次后标成
+  "[no response — wedged/timeout]"——log 里 0 条 "GET TIMED OUT",且 verify 耗时
+  31s≈10key×10×300ms,与 5s 超时不符,坐实是被吞的错误帧而非挂起。
+  修:①根因即 live-writer roll 修复(ghost 窗口不再存在)——post-fix 39+16 跑 0 F3;
+  ②verifier 把 rpc 层错误记进 last_status(code=254)+ wedged-parts 快速跳过键带标签,
+  下次任何同类失败直接带原因;③system_roll_tails_live_writer 的 ghost 值每 4 个改 8KiB
+  (>VALUE_THROTTLE ⇒ 结构性走 VP 路径),把大值 ghost 的写读端到端钉进回归。
 ─────────────────────────────────────────────────────────────
 Date: 2026-08-26
 TaskStatus: not_completed

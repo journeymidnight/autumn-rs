@@ -74,6 +74,21 @@ async fn roll_tails(ps: &RpcClient, part_id: u64, entries: Vec<(u64, u64)>) -> u
     resp.rolled
 }
 
+/// Post-roll ("ghost window" pre-fix) value for key `t{i:03}`. Every 4th is
+/// 8 KiB — above the 4 KiB VALUE_THROTTLE, so it is stored as a ValuePointer
+/// whose bytes must be FETCHED from the log extent on read (the small ones
+/// read straight from the memtable/SST). Non-vacuity for the VP arm is
+/// structural: 8192 > VALUE_THROTTLE guarantees the VP path.
+fn ghost_value(i: u32) -> Vec<u8> {
+    let mut v = format!("ghost{i:03}").into_bytes();
+    if i % 4 == 0 {
+        while v.len() < 8192 {
+            v.push(b'G');
+        }
+    }
+    v
+}
+
 /// Shared scenario driver. `roll_meta_too` selects between the loud and
 /// silent pre-fix shapes; the assertions cover both: the split child must
 /// open AND serve the post-roll acked values.
@@ -133,13 +148,20 @@ fn run_scenario(part_id: u64, ps_id: u64, roll_meta_too: bool) {
 
         // Phase 3: MORE acked writes after the roll — pre-fix these landed on
         // the just-sealed extents (the ghost window). Ghost keys sort ABOVE
-        // the split point so they belong to the RIGHT child.
+        // the split point so they belong to the RIGHT child. Every 4th value
+        // is LARGE (8 KiB > the 4 KiB VALUE_THROTTLE) so it takes the
+        // ValuePointer path: the value bytes live in the log extent and a
+        // read must fetch them — the memtable holds only the pointer. This
+        // pins the third manifestation of the ghost window (the chaos
+        // "big-values-only persistent read failure" shape): a VP pointing
+        // past a stale seal is refused with stale_vp_offset on every read,
+        // while an equally-ghosted small value still reads from the memtable.
         for i in 0u32..20 {
             ps_put(
                 &ps,
                 part_id,
                 format!("t{i:03}").as_bytes(),
-                format!("ghost{i:03}").as_bytes(),
+                &ghost_value(i),
             )
             .await;
         }
@@ -205,16 +227,16 @@ fn run_scenario(part_id: u64, ps_id: u64, roll_meta_too: bool) {
         );
         for i in 0u32..20 {
             let key = format!("t{i:03}");
-            let want = format!("ghost{i:03}");
+            let want = ghost_value(i);
             let got = psr_get(&router, right_part, key.as_bytes()).await;
             assert_eq!(
                 got.code,
                 partition_rpc::CODE_OK,
-                "right child lost acked post-roll key {key}"
+                "right child lost acked post-roll key {key} (len {})",
+                want.len()
             );
             assert_eq!(
-                got.value,
-                want.as_bytes(),
+                got.value, want,
                 "right child serves a STALE value for acked post-roll key {key}"
             );
         }
