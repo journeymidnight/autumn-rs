@@ -1,3 +1,29 @@
+Date: 2026-08-26 (l)
+TaskStatus: not_completed
+Task scope: 自主循环 —— F3(静默丢 acked 写)缩小到 VP 路径;顺带发现一处 fail-open。未改产品代码。
+  【F3 决定性线索:丢的全是大值(VP)】丢的 24 个 key 的 kid【全部能被 8 整除】,
+     而 chaos 的 make_value 里:`big = kid.is_multiple_of(8)` → 8192 字节(> 4KiB VALUE_THROTTLE)
+     ⇒ 这些 key 全部走 ValuePointer 路径(值在 log_stream,VP 在 SSTable)。小值一个没丢。
+     ⇒ F3 不是随机丢失,是【VP 路径专属】。序列:EcConvert extent 12(log extent)→ SIGKILL node 1。
+     即:EC 转换一个存有 live VP 的 log extent 时杀节点 ⇒ 大 value 读不到,且【持久】
+     (post_reclaim 仍是同样 24 个 key,不是瞬时窗口)。
+  【顺带发现,已记未修:get 的 VP 路径有一处 fail-open】
+     rpc_handlers.rs get_value_inner:VP 值在 `acquire_reader_pin` 拿不到 pin 时
+     (GC 持 writer pin)直接 `return Ok(GetOutcome::NotFound)`。
+     【同一个文件里 sst_lookup_paged_retry 的注释明写 "NEVER a false NotFound"】——
+     这里却让一个 live key 在 GC 窗口期读起来像"不存在",而 NotFound 对客户端是终态、不会重试。
+     注释自称 "the client falls back / retries",但 GetResp 的 NotFound 不触发重试路径。
+     【判断】不是 F3 的成因(F3 持久,pin 窗口瞬时),但它本身违反了本文件已明确的原则,值得单独修。
+Next steps:
+  1) 【F3】查 EC 转换后的 VP 读路径:extent_read_descriptor 拒绝 EC'd extent(shard bytes ≠ value),
+     VP 读要走 ec_subrange_read 解码。查这条链上有没有把"shard 缺失/解码失败"吞成 NotFound 的地方
+     ——F3 的特征(持久 + 静默 + 仅 VP)与"EC 后读不回来但不报错"高度吻合。
+     复现:chaos 约 1/13;命中标志是 not_found 的 kid 全是 8 的倍数。
+  2) 修上面那处 GC-pin fail-open:应返回可重试的错误(Unavailable/FailedPrecondition)而非 NotFound,
+     或在 pin 等待后重试。注意 relocate-then-punch 保证 live 值会先被重定位,
+     所以"GC 要删它"不足以推出"它不存在"。
+  3) F1 转查 vp 侧;F2 改断言;评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (k)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 13 次 chaos 统计,把"间歇 flaky"分解成【三种不同的失败】。未改产品代码。
