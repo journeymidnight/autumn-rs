@@ -1,3 +1,30 @@
+Date: 2026-08-26 (i)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 追 split 右孩子 wedge(A)。【把矛盾收窄到一个具体机制,并架好捕获器;未抓到根因,未修】。
+  【推理链收窄】症状是 checkpoint 的 vp_offset(8946242)落在 split 给 log tail 的 seal(5372990)之外。
+     逐条排除:
+       - flush 屏障 await_extent_synced_to 要求【ALL replicas】的 last_synced >= vp_offset,
+         且 replica_addrs_for_extent 不做健康筛选(不会因为 fence/suspected 缩小集合)⇒ 副本集合不是变量;
+       - split 用 part_sc.commit_length()(all-replica min),而 last_synced <= len ⇒
+         正常情况下 commit_length >= vp_offset。
+     ⇒ 结论:【只有 `len` 回退过】才能解释 commit < 已 checkpoint 的 vp。
+     而 len 回退的唯一来源是 commit-based truncation(append 前 `local len > header.commit → truncate`),
+     即某个 writer 发出了偏小的 header.commit。
+  【发现的诊断缺口 + 已修】truncate_to_commit 是【唯一把 extent 变短的路径】,而它【完全没有日志】。
+     beyond-commit 的字节按定义是未 ack 的,丢掉是对的;但如果 writer 给出的 commit 低于已 ack 的量,
+     acked 数据就在这里消失,而没有任何记录。已加 warn(extent_id/prev_len/commit/dropped)。
+  【验证:低噪声高信号】加日志后连跑 3 次 chaos:全通过,stale_vp 0 次,
+     【truncate warn 也是 0 次】——说明这条路径在健康运行里根本不触发,
+     所以它一旦出现就是异常信号,不会淹没在噪声里。
+  【频率】stale_vp 6 次运行命中 1 次(~1/6),比上轮估的 1/3 低。
+Next steps:
+  1) 继续跑 chaos 直到 stale_vp 命中(~1/6),这次日志里会有 truncate warn 说明是谁把 len 截短的
+     (extent_id + prev_len → commit + dropped 字节数)。有了那一行就能反推是哪个 writer 发的小 commit。
+     若命中 stale_vp 却【没有】truncate warn,则上面的推理链有漏 —— 那本身是更重要的发现,
+     说明 len 没回退,问题在 vp 侧(checkpoint 记了一个不该记的 vp)。
+  2) 改 verify_no_ec_markers_pinned 的断言:带 coordinator 状态与 age 门限,区分"卡住"和"合理等待 flapping coordinator"。
+  3) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (h)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 给上轮记的"chaos 间歇失败"建立频率并分类。【本轮未改产品代码】,只跑测试+记录。

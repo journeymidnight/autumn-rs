@@ -5048,6 +5048,24 @@ impl ExtentNode {
         let Some(f) = extent.resident_file() else {
             return Err("extent sealed (fd evicted) during commit-reconcile".to_string());
         };
+        // This is the ONLY path that makes an extent shorter, and it ran
+        // silently. Beyond-commit bytes are un-acked by definition, so dropping
+        // them is correct — but if a writer ever supplies a commit BELOW what
+        // was already acked, this is where acked data disappears, and nothing
+        // recorded that it happened. A checkpointed vp_head landing past a
+        // later seal (`stale_vp_offset_past_sealed_length`, which wedges the
+        // partition on reopen) can only be explained by `len` going backwards,
+        // so this line is the evidence that diagnosis needs.
+        let prev_len = extent.len.load(Ordering::SeqCst);
+        if commit < prev_len {
+            tracing::warn!(
+                extent_id = extent.extent_id,
+                prev_len,
+                commit,
+                dropped = prev_len - commit,
+                "truncating extent to the writer's commit — beyond-commit bytes dropped"
+            );
+        }
         f.set_len(commit).await.map_err(|e| e.to_string())?;
         // fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
