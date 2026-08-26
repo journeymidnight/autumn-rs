@@ -1,19 +1,13 @@
 # Copy-on-write EC conversion — design
 
-**Status:** design, not implemented. **Revised after an adversarial review**
-(`scratchpad/ec_cow_review.md`) that found two P0s and six P1s in the first
-draft; every finding is folded in below. Supersedes the takeover state machine
-in `scratchpad/ec_takeover_design.md` — that document's *findings* remain valid
-and are tracked here; its *solution* (a probe RPC + roll-forward/roll-back state
-machine) is unnecessary under this design.
+How an extent is converted from 3-way replication to EC shards. The shard is
+staged as an **additive** file beside the untouched `.dat`, and the manager's
+layout flip is the **sole** commit point — so before the flip nothing is
+committed and an abandoned attempt costs only the deletion of files no reader is
+pointed at.
 
-**Already shipped from this line of work:** the reporter-identity check on
-completion reports (commit `8282712`) — §4.1 explains why it is only half the
-mechanism.
-
-**Origin:** "what happens when the EN executing an EC conversion dies" has no
-good answer today. Tracing *why* led to one root cause and to the invariant
-below.
+This is what the code does; `crates/stream/CLAUDE.md` and
+`crates/manager/CLAUDE.md` carry the per-crate invariants.
 
 ---
 
@@ -51,45 +45,7 @@ manager, not a filesystem operation.
 
 ---
 
-## 2. What the current design does, and what it costs
-
-`run_convert_to_ec_task` (`crates/stream/src/extent_node.rs`) runs a 2PC:
-
-1. **Prepare** — the coordinator RS-encodes and streams each shard to its
-   target's staging file `extent-{id}.ec.dat` (`write_shard_stripe_local`,
-   `MSG_WRITE_SHARD` = 10).
-2. **Commit** — every participant **renames `.ec.dat` → `.dat`**
-   (`commit_shard_local:5482` → `finish_ec_commit:5584`, driven remotely by
-   `MSG_COMMIT_EC_SHARD` = 12 / `handle_commit_ec_shard:7906`), destroying that
-   node's full replica, then persists a new `eversion`.
-3. The manager applies the layout (`apply_ec_conversion_done`,
-   `crates/manager/src/recovery.rs:1707`).
-
-The rename in step 2 is the invariant violation, and it is the origin of every
-hard problem here:
-
-- **A middle state exists that nobody can classify.** Between the first and last
-  rename, some nodes hold shards while the layout still says *replicated*. It can
-  be neither rolled back nor forward without probing every node.
-- **Re-encoding becomes impossible.** Once a participant renames, the full bytes
-  are gone from that node — so the coordinator can no longer re-derive the
-  shards. This, not marker bookkeeping, is why a dead coordinator cannot simply
-  be replaced.
-- **The marker cannot be auto-released.** `extent_inflight_stale_sweep_loop`
-  refuses to release `ConvertToEc` markers (WARN-only) for exactly this reason,
-  so a stuck conversion needs an operator.
-- **The rename needs its own crash machinery.** The `extent-{id}.ec.commit`
-  intent marker (`EcCommitMarker:254`, `write_ec_commit_marker:5728`,
-  `read_ec_commit_marker:5784`, the three-state replay in `load_extents`) exists
-  *only* to make rename↔`save_meta` atomic.
-- **Attempt identity had to be bolted on.** Staging survives a failed attempt and
-  carries no identity, so a re-dispatch under a different assignment could skip
-  prepare and commit stale, wrong-index staging over live replicas. The
-  `ec.prepared` marker (`ec_prepared_marker_path:422`) closes that today.
-
----
-
-## 3. Why the textbook CoW does not apply here
+## 2. Why the textbook CoW does not apply here
 
 The usual fix (HDFS EC reconstruction, WAS/Colossus) writes the encoded form to
 a **new object/generation** and flips a pointer. Not available here: a
@@ -101,17 +57,14 @@ conversion.** (Verified during review.)
 
 ---
 
-## 4. Design
+## 3. Design
 
 Keep the extent id. Make the shard an **additive second file**, and make the
 manager's layout flip the **only** commit point.
 
 ```
-today:   stage .ec.dat ──▶ [each node renames .ec.dat → .dat] ──▶ manager applies
-                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ middle state nobody can classify
-
-design:  stage .shard{i} ──▶ manager flips layout in ONE etcd txn ──▶ driven cleanup
-                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ atomic; sole commit point
+stage .shard{i} ──▶ manager flips layout in ONE etcd txn ──▶ driven cleanup
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ atomic; sole commit point
 ```
 
 - **Before the flip.** Every replica's `.dat` is untouched; `extent-{id}.shard{i}`
@@ -120,16 +73,16 @@ design:  stage .shard{i} ──▶ manager flips layout in ONE etcd txn ──�
 - **The flip.** One leader-fenced etcd transaction sets `ec_converted`, the
   `replicates`/`parity` layout, `payload_location = InShardFile`, and the new
   `eversion`. **Precondition: all K+M targets confirmed a durable staged shard
-  *for this attempt* (§4.1).**
-- **After the flip.** Convergence is driven by the reconcile (§8): shard holders
+  *for this attempt* (§3.1).**
+- **After the flip.** Convergence is driven by the reconcile (§6): shard holders
   drop their now-redundant `.dat`; nodes no longer in the layout drop everything.
 - **Rollback** is symmetric and free: delete the staged shards. Nothing was
   destroyed, so a later attempt may pick a completely fresh assignment.
 
-### 4.1 Attempt identity (the precondition's teeth)
+### 3.1 Attempt identity (the precondition's teeth)
 
-The flip precondition is only as good as the evidence behind it, and today that
-evidence cannot distinguish attempts:
+The flip precondition is only as good as the evidence behind it, and the
+completion report alone cannot distinguish attempts:
 
 - The apply trigger is the coordinator's df-carried `EcConvertDone
   {extent_id, new_eversion}` (`crates/rpc/src/extent_rpc.rs:714`).
@@ -137,7 +90,7 @@ evidence cannot distinguish attempts:
   and an abandoned attempt never bumps the extent's eversion — so **a re-issued
   attempt gets the same `new_eversion` as the one it replaced**.
 
-Because §6 makes marker release routine, a stale report from a previous attempt's
+Because §4 makes marker release routine, a stale report from a previous attempt's
 coordinator can therefore match the *current* marker and fire the flip while the
 current attempt has staged nothing. Post-flip cleanup would then delete the last
 full replicas → unrecoverable loss.
@@ -149,11 +102,11 @@ full replicas → unrecoverable loss.
   `EcConvertDone`. The apply refuses any report whose nonce does not match the
   live marker; a staging write carrying a stale nonce is refused by the EN.
 - **Reporter identity** — only `target_nodes[0]` may complete its own marker.
-  *(Shipped, `8282712`.)* This is the belt; the nonce is the braces.
+  This is the belt; the nonce is the braces.
 
-The nonce is also what lets the coordinator's prepare-skip be attempt-scoped
-(§5), and what stops a successor attempt's staging from being polluted by a
-zombie predecessor writing the same index file (§4.3).
+The nonce is also what lets the coordinator's prepare-skip be attempt-scoped,
+and what stops a successor attempt's staging from being polluted by a
+zombie predecessor writing the same index file (§3.3).
 
 **As built.** The nonce is *the etcd revision of the txn that created the
 marker*, read from that txn's own response (`txn_fenced_revision`) and rebuilt on
@@ -178,7 +131,7 @@ stripe-0 truncate and the epoch fence.
 marker, and can never complete an identified attempt — so the sentinel is inert
 in normal operation and would let a mixed fleet converge if one ever existed.
 
-### 4.2 Which file does the EN serve?
+### 3.2 Which file does the EN serve?
 
 Both files can exist at once, so something must say which is authoritative. That
 choice is metadata owned by the manager (§1), so **the manager states it and the
@@ -198,7 +151,7 @@ Reads already resolve the layout before dispatching — `read_with_layout`
 already made against the authority rather than adding one.
 
 **Rule:** serve the file named by `(payload_location, shard_index)`. A request
-naming a file the node does not hold is an **error** (a distinct code, §7), never
+naming a file the node does not hold is an **error** (a distinct code, §5), never
 a silent fallback to the other file — returning shard bytes as a whole value, or
 the reverse, is exactly the corruption this design exists to remove. The client
 treats that error as "refresh the layout and retry", which converges because the
@@ -220,22 +173,22 @@ The client-direct path is the one that must not be missed: the SDK holds a
 descriptor and reads an EN with no further manager round-trip, so a stale
 descriptor must fail loudly rather than read the wrong file.
 
-### 4.3 Staging files are named by shard index
+### 3.3 Staging files are named by shard index
 
-A staged shard is written to **`extent-{id}.shard{i}`**, not a single shared
-`.ec.dat`. The index is in the filename, so a shard staged for one index can
-never be *served* as another.
+A staged shard is written to **`extent-{id}.shard{i}`**. The index is in the
+filename, so a shard staged for one index can never be *served* as another —
+which a single shared staging name could not prevent.
 
-Note the limit found in review: naming protects **serving**, not **staging
+Note the limit of naming: it protects **serving**, not **staging
 confirmation**. A node reused at the *same* index across two attempts holds a
 same-size file — and for shard 0 the content is even byte-identical — so "the
 file exists and has the right size" still cannot confirm that *this* attempt
-prepared it. That confirmation is the nonce's job (§4.1), which is why
-`ec.prepared` may only be deleted once the nonce subsumes it (§5).
+prepared it. That confirmation is the nonce's job (§3.1), which is why
+`ec.prepared` may only be deleted once the nonce subsumes it.
 
-### 4.4 The EN's shard-holder model
+### 3.4 The EN's shard-holder model
 
-The EN's entire extent lifecycle is keyed to `extent-{id}.dat` today:
+The EN's entire extent lifecycle is keyed to `extent-{id}.dat`:
 `load_extents` builds entries from `.dat` scans
 (`crates/stream/src/extent_node.rs:3665-3710`, `parse_extent_id:525`),
 `remove_extent_files:448` unlinks a fixed set, and the reconcile scans look for
@@ -262,7 +215,7 @@ design, not an implementation detail.
   or a converted cluster under-reports physical usage to `df` and to the
   `--min-alloc-free-bytes` admission gate.
 
-### 4.5 The flip transaction
+### 3.5 The flip transaction
 
 `apply_ec_conversion_done` (`crates/manager/src/recovery.rs:1707`, txn at
 `:1759-1767`) was verified during review to be atomic and leader-fenced, with
@@ -271,39 +224,12 @@ clean crash windows on either side. Two additions:
 - Write `payload_location` in that same transaction (never a second write).
 - **Value-CAS `extents/<id>` against the snapshot the decision was made on**, so
   a concurrent mutation (recovery slot swap, seal) cannot be clobbered by a flip
-  computed from a stale clone. Today's safety rests on the inflight ledger
-  serialising per-extent operations — state that dependency explicitly rather
-  than leaving it implicit.
+  computed from a stale clone. The CAS states explicitly what would otherwise
+  rest implicitly on the inflight ledger serialising per-extent operations.
 
 ---
 
-## 5. What this removes — and what must NOT be swept with it
-
-Because there is no rename, the machinery that existed to make the rename
-crash-atomic goes away:
-
-| removed | why it existed | gated on |
-|---|---|---|
-| the commit phase: `MSG_COMMIT_EC_SHARD`(12), `handle_commit_ec_shard:7906`, `commit_shard_local:5482`, `finish_ec_commit:5584` | per-node destructive publish | step 6 (§10) |
-| `ec.commit` marker + its `load_extents` three-state replay | rename ↔ `save_meta` crash window | **retain as frozen repair code** — §7 |
-| `ec.prepared` attempt marker | staging outliving an attempt | ONLY after the §4.1 nonce takes over its role |
-| the takeover state machine + `MSG_PROBE_EC_STATE` | deciding roll-forward vs roll-back | immediately (never built) |
-
-**Guards that must survive the deletions** — they are not rename-related and were
-shipped in `50be92f` against real holes:
-
-- the per-extent op lock around staging writes;
-- the post-lock `owner_epoch` re-read (a fenced zombie must not stage);
-- stripe-0 truncate on the staging file;
-- the `corrupt_meta` (META-FAILCLOSED) refusal;
-- `mark_disk_error_for_extent` wiring on every staging write/sync failure.
-
-The 2PC collapses to **1PC (stage) + one atomic metadata flip** — but only the
-*commit* half is deleted.
-
----
-
-## 6. Interaction with the marker model
+## 4. Interaction with the marker model
 
 The agreed model: *the marker is a standing instruction the leader re-sends until
 the desired state is reached; it never expires by wall clock; it is released by
@@ -313,31 +239,23 @@ offline/fenced/removed); the executing RPCs must be idempotent.*
 EC satisfies that model only under this design:
 
 - **Idempotent execution** — no destructive step, so a re-dispatch re-stages into
-  its own index-named file (§4.3) under a fresh nonce (§4.1). The source bytes
+  its own index-named file (§3.3) under a fresh nonce (§3.1). The source bytes
   remain on `.dat`, so a re-encode is always possible.
 - **Safe release on offline** — releasing a marker before the flip destroys
   nothing, so a dead coordinator is handled by *release + re-derive*, with no
   probe and no constraint to preserve the previous assignment.
 
 The nonce is what makes the second bullet safe: routine release is precisely what
-raises the odds of a stale cross-attempt report (§4.1).
+raises the odds of a stale cross-attempt report (§3.1).
 
 ---
 
-## 7. Persistence and wire
+## 5. Persistence and wire
 
-**This landed on an active development cluster with no historical data**, so
-nothing below is a migration constraint — there is no old state to decode, no
-old-scheme shard to keep working, and no upgrade to converge. What remains is
-the shape that was built, and the reason each choice is still the right one on
-its own merits.
-
-**`payload_location` lives in a sibling etcd key**, not in `MgrExtentInfo`.
-Originally that was to avoid making an existing cluster's stored extents
-undecodable on replay. With no such cluster the argument no longer binds, but
-the shape stays: the location is per-extent metadata with a meaningful default
-(`absent ⇒ InDat`), so a key that exists only for the extents that deviate is
-smaller and simpler than a field every record must carry.
+**`payload_location` lives in a sibling etcd key**, not in `MgrExtentInfo`. It
+is per-extent metadata with a meaningful default (`absent ⇒ InDat`), so a key
+that exists only for the extents that deviate is smaller and simpler than a
+field every record must carry.
 
 **Wire.** `ExtentInfo` carries `payload_location`; `ReadBytesReq` carries
 `(payload_location, shard_index)`; `CODE_PAYLOAD_NOT_HERE` is the refusal when a
@@ -345,225 +263,27 @@ node does not hold the named file. Deploys are same-commit stop-the-world, so a
 schema edit is a fingerprint refresh plus a version decision — not a
 compatibility window.
 
-**One thing a real upgrade WOULD need**, recorded so it is not rediscovered: the
-`0` sentinel on `attempt_nonce` and `payload_location` means "no identity / the
-pre-existing layout". Those defaults are what would let old records and old
-peers converge. They cost nothing and are already in place; a cluster with
-history would additionally have to keep the commit-phase repair code (§10 step
-6) until every node was proven clean.
-
 ---
 
-## 8. Cost, cleanup, and the reconcile contract
+## 6. Cost, cleanup, and the reconcile contract
 
-- **Per extent the peak is unchanged** — `.dat` and the staged shard already
-  coexist today; the flip is what used to end that. What changes is the
-  *duration*.
+- **Per extent the peak is two copies** — `.dat` and the staged shard coexist
+  from staging until cleanup lands, so the cost is the *duration* of that
+  window, not a new peak.
 - **Fleet-aggregate is not unchanged.** With cleanup stalled (manager down, node
   isolated, reconcile backlogged) every converting extent holds both forms for as
   long as the stall lasts. Conversions must therefore be **admission-gated on
   cleanup backlog**, and policy-driven EC arming should stay off until the
-  cleanup driver exists (§10 step 5). Manual `force-ec-convert` meanwhile is
-  acceptable with a loud WARN.
+  cleanup driver exists. Manual `force-ec-convert` meanwhile is acceptable with
+  a loud WARN.
 - **Cleanup is not "deletion only" on member nodes.** A shard holder must also
-  repoint its entry and persist meta (§4.4). Only non-member cleanup is a pure
+  repoint its entry and persist meta (§3.4). Only non-member cleanup is a pure
   delete.
-- **The reconcile must be file-granular.** Today's answer is extent-granular
-  ("which extents should you not hold"), which cannot express "keep the extent,
-  drop the `.dat`". The response must carry, per extent, the `payload_location`
-  and the node's assigned index; the EN derives its own file set from that. The
-  same answer cleans rollback residue on member nodes.
-- **Accounting**: shard bytes must be visible to `extent_bytes` (§4.4).
+- **The reconcile is file-granular.** An extent-granular answer ("which extents
+  should you not hold") cannot express "keep the extent, drop the `.dat`", so
+  the response carries, per extent, the `payload_location` and the node's
+  assigned index; the EN derives its own file set from that. The same answer
+  cleans rollback residue on member nodes.
+- **Accounting**: shard bytes must be visible to `extent_bytes` (§3.4).
 
 ---
-
-## 9. A related violation to audit
-
-`stream_extent_from_sources:4742` truncates the destination to 0 before each
-source attempt, and `handle_re_avali:6875` uses it to repair a *lagging existing
-replica*. A crash mid-refill leaves a short file where a complete one used to be
-— the "neither state" §1 forbids. The recovery peer-copy path already avoids this
-via temp-then-publish (`peer_copy_full_extent_to_dat:7188`).
-
-**Action:** determine whether `handle_re_avali`'s target can be a replica the
-manager still counts (i.e. whether its `avali` bit can be set at that moment). If
-it can, move that path to temp-then-publish. Tracked separately from this design.
-
-**RESOLVED — and the question above was the wrong one.** The literal answer is
-no: the sole dispatcher (`recovery.rs`) fires only when `(ex.avali & bit) == 0`.
-But `avali == 0` does not mean "lagging". A member merely UNREACHABLE at seal
-time has its bit left unset (seal-over-reachable) while possibly holding the
-LONGEST copy in the cluster — and `stream_extent_from_sources` selects its
-sources from the member list WITHOUT consulting `avali`, so that copy is exactly
-what another node's recovery would rebuild from. Being uncounted made the file
-*more* exposed, not less: nothing was watching it.
-
-Reproduced (`crates/manager/tests/re_avali_no_destroy.rs`): an extent sealed
-above what the target holds, its only peer down — the refill destroys 4096 bytes
-and leaves 0. Fixed by routing re_avali through `peer_copy_full_extent_to_dat`.
-Recovery keeps `stream_extent_from_sources`: truncate-to-0 is correct when the
-destination has nothing to lose and destructive when it is an existing copy —
-that distinction, not the `avali` bit, is what selects the right helper.
-
----
-
-## 10. Implementation order
-
-Chosen to minimise the window in which both schemes are live. Steps 2–3 are
-individually shippable and revert-safe; step 4 is the only commit where the two
-schemes meet, and by then every reader, scanner, and cleaner understands both
-shapes.
-
-1. **Attempt nonce + reporter check against the CURRENT 2PC** (§4.1). Fixes
-   today's exposure independently; everything later inherits it. **SHIPPED** —
-   reporter check `8282712`, nonce below.
-2. **Persistence + wire plumbing, inert** (§7): sibling etcd key defaulting to
-   `InDat`, `ExtentInfo.payload_location`, `ReadBytesReq (location, index)`,
-   missing-file error code. Nothing writes `InShardFile`; every read carries
-   `InDat`; behaviour byte-identical. **SHIPPED.**
-
-   Two things surfaced while building it that the design above did not
-   anticipate, both load-bearing:
-
-   - **The server batches reads by `extent_id` alone.** One batch resolves ONE
-     fd and serves every slot from it, so two requests naming different payload
-     files would have been answered out of one file. The grouping key had to
-     widen to the file identity. This is the same class of bug as serving the
-     wrong file directly — it just arrives through the batching path, which no
-     read-path audit of "who names a file" would have caught.
-   - **`InDat` must have ONE identity regardless of shard index.** A replicated
-     read carries the slot it read from; if that index survived into the file
-     identity, reads of one extent from different slots would look like
-     different files and stop batching. `PayloadRef::for_extent` normalises the
-     index away for `InDat`, where it names nothing.
-
-   The client-direct SDK path needed no change: `extent_read_descriptor` already
-   refuses `ec_converted` extents, and `InShardFile` is published only by the
-   flip, which sets `ec_converted` — so a shard file is unreachable from a
-   descriptor. That invariant is now checked explicitly there rather than
-   relied upon silently.
-3. **EN shard-holder model, inert** (§4.4): load/scan/delete/reconcile/df
-   awareness of `.shard{i}`, the two-file entry, read-by-request-location with
-   error-on-absent. Unit-testable with hand-planted files before any producer
-   exists. **SHIPPED.**
-
-   The reconcile needed no change to SEE shard-only extents: it reports whatever
-   is in `self.extents`, and startup discovery now puts them there. What it
-   still cannot express is "keep the extent, drop the `.dat`" — that is step 5.
-
-   `shard_files` holds `index -> length` rather than a set plus a byte counter,
-   so the footprint cannot drift from the file list. Shard fds are deliberately
-   NOT in `FdLru`: the cache accounts one fd per extent, and a second cached fd
-   per entry would silently over-commit the process budget.
-4. **The scheme switch, one commit**: staging goes to `.shard{i}` (retaining every
-   guard in §5), the commit phase stops being sent, `apply_ec_conversion_done`
-   writes `InShardFile` (+ value-CAS, §4.5), and marker release on
-   coordinator-offline is enabled for EC. Old-scheme repair code stays.
-   **SHIPPED.**
-
-   Three things the plan above did not account for:
-
-   - **EC shard recovery wrote its rebuilt shard into `.dat`.** Correct while a
-     shard WAS `.dat`; under this design it would leave the node serving shard
-     bytes to anyone asking for the whole value, and the shard the layout points
-     at missing. It now writes the file the layout names.
-   - **`read_plan` bounded reads by the extent's length, not the file's.** A
-     shard is `sealed_length / K` while the `.dat` beside it (awaiting cleanup)
-     holds the whole extent, so a to-end shard read asked for several times the
-     shard's size. The bound now comes from the file being read.
-   - **"Cannot run it any more" is not "is not Online".** Enabling marker release
-     for EC with an `is_online()` predicate abandoned every attempt whose
-     coordinator was still in `Suspend` — the state a freshly registered node
-     sits in until its first `df` — so conversion could never outlive one tick.
-     The predicate is now "gone from the cluster, or `Suspected`". Caught by
-     `ec_failover`, not by unit tests.
-
-   Consequence for tests: `WriteShard` + `CommitEcShard` no longer composes, so
-   fixtures that used it to make an extent "EC-converted at eversion N" now
-   plant a `.ec.dat` — which is precisely the state the retained repair code
-   exists for, making that coverage more faithful than it was.
-5. **File-granular reconcile + cleanup driver** (§8). Until this lands, flips are
-   allowed but the space window is unbounded — keep policy-driven EC arming off.
-   **SHIPPED.** The window is now bounded by the sweep interval (5 min, or
-   immediately on EN restart).
-
-   No separate driver was needed: the reconcile IS the driver once its answer
-   carries a placement, because "keep exactly the named payload file" subsumes
-   post-flip cleanup, rollback residue, and non-member garbage under one rule.
-
-   **The live test deleted a live extent**, and the cause was not in this step.
-   The EN does not know its own node_id and reported `0`; R4's membership
-   predicate makes such a caller a member of nothing, so its whole disk reads as
-   garbage — and since the grace counter is keyed `(node, extent)`, three nodes
-   all reporting `0` shared one counter and consumed the entire grace period in
-   a single round each. Before R4 the predicate was existence-based and did not
-   depend on the reporter at all, so `node_id: 0` was harmless; the sender's
-   comment said so, and was true when written. **A membership predicate makes
-   the reporter's identity load-bearing, and nothing propagated that.** The
-   answer is now identity-resolved (`node_id`, else `node_uuid`) and fails
-   closed: a caller the manager cannot identify is told nothing.
-
-   Worth stating as a rule for the remaining steps: when a predicate changes
-   from a property of the OBJECT to a property of the RELATIONSHIP between the
-   object and the asker, every input that identifies the asker becomes
-   load-bearing — including ones previously documented as diagnostic.
-6. **Delete the commit phase** and the `ec.commit` machinery. **SHIPPED** — no
-   soak was needed: this is an active development cluster with no historical
-   data, so there was no old-scheme state to repair and nothing to migrate. The
-   `.ec.dat` apparatus went with it, as did the upgrade-precondition check built
-   one step earlier: with no migration to gate, it was ceremony.
-
-   **`ec.prepared` stays**, contrary to the table in §5. The nonce did not
-   subsume it — it MOVED INTO it. The nonce travels in the request; the shard
-   file on disk carries none; so the marker is the only durable record binding
-   "this staging" to "this attempt", and without it a coordinator must re-encode
-   on every re-dispatch. §4.3 anticipated the shape of this ("naming protects
-   serving, not staging confirmation") but predicted the wrong resolution.
-
-This sits **after** the recovery-side work that establishes the same model on a
-lower-risk path: `handle_require_recovery` becomes idempotent (complete ⇒ adopt,
-incomplete ⇒ reset and rebuild); recovery's marker becomes a standing instruction
-and its wall-clock sweep is deleted; offline/fence releases that node's markers;
-membership-based reconcile with grace.
-
----
-
-## 11. Test plan
-
-**Unit (EN):**
-- staged but not flipped → a read carrying `InDat` returns full data from `.dat`;
-  the staged shard is unreachable through it.
-- after the flip → a read carrying `(InShardFile, i)` returns shard *i*.
-- a read naming a payload file the node does not hold **errors** — never falls
-  back to the other file.
-- startup discovery builds an entry from a shard file with no `.dat`; two shard
-  files at different indices are both recorded.
-- `remove_extent_files` / reconcile scans / `extent_bytes` all see `.shard{i}`.
-
-**Unit / system (manager):**
-- the flip requires all K+M staged confirmations **carrying the live nonce**; a
-  stale-nonce or wrong-reporter report is refused and the marker retained.
-- marker release before the flip leaves the extent fully replicated and readable;
-  a later attempt with a *different* assignment succeeds.
-
-**Crash / interleaving matrix — every row must self-heal:**
-
-| scenario | expected |
-|---|---|
-| kill mid-encode on the coordinator | re-dispatch re-encodes; no state to reconcile |
-| some targets staged, then kill before flip | re-stage the rest, or release + fresh assignment |
-| coordinator dies permanently before flip | marker released on offline; fresh assignment; no probe |
-| kill immediately after the flip txn | conversion is done; cleanup is idempotent |
-| kill during cleanup / shard-holder restart mid-cleanup | startup discovery resolves; cleanup re-runs |
-| **full-cluster stop/start mid-window** | shards discovered; extents servable |
-| **stale cross-attempt `ec_done`** | refused by nonce + reporter; no flip |
-| **prepare-skip under permuted reuse** | nonce mismatch forces a full re-stage |
-| **(K,M) changed between attempts over residue** | stale-shape staging never adopted |
-| delete / `punch_holes` of a flipped extent | shard files unlinked; no orphans |
-| EC shard recovery under the new naming | rebuilds into `.shard{i}` |
-| leader failover between staged-confirm and flip | marker replay → re-dispatch → adopt-report → flip |
-| `FdLru` holding an unlinked fd across cleanup | no stale reads; fd released |
-
-**Harnesses:** `crates/manager/src/ec_g4_wedge_harness.rs`; the live 3-EN
-`scratchpad/ec_smoke.sh` extended with coordinator kill/SIGSTOP at each point
-above; `scratchpad/recovery_smoke.sh` for the shared df/reconcile paths.
