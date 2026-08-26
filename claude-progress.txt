@@ -1,3 +1,34 @@
+Date: 2026-08-26 (e)
+TaskStatus: not_completed
+Task scope: /loop ②op 可观测性【第一二层已完成;第三层未做】。
+  ②-2【DONE:终态入 etcd + rotate】(commit 199ee35)
+     另开 `opLog/<ts_ns>_<seq>` 前缀,【值就是 OpRecord 本身】——读回来直接解码成
+     `ops status` 已经在渲染的形状,不用维护第二套 schema。
+     【为什么不扩 audit】audit 答的是"谁要求做什么"(每个 admin RPC 都写、留 90 天、
+     只存 result_code 0/1,error 全文在调用点就丢);op 历史答的是"这次跑成什么样",必须带原因。
+     混在一个前缀里等于把两种保留策略和两类消费者搅在一起。
+     【解耦手法】终态转换同步入队(queue_terminal,五个终态路径都经 finish/reconcile_outcome/
+     complete_by_extent 三个函数),async 调用方排空(flush_op_log)⇒ etcd 写永远不在 borrow_mut 里,
+     ledger 保持纯同步结构。排空点:PS 心跳里【outcome 循环之后】(本次心跳的终态立刻落盘,
+     不必等下一拍)+ policy tick 兜底(覆盖没有 PS 上报的 recovery/ec-convert)。
+     【rotate 按条数不按时间】op 量由集群活动驱动而非时钟:按时间窗两头都不准——安静一周几乎不留,
+     compaction 风暴一小时写的比人翻得完的还多。按条数(OP_LOG_CAP=2000)最坏情况可预测;
+     每 200 次写摊销一次扫描(rotate 要读一次 prefix,不该每写一次都做)。
+     写历史是 best-effort(同 audit):因为历史写不进去就让 op 失败,等于把可观测性缺口变成故障。
+     门:manager lib 293(新增 4 个单测)+ system_corrupt_replica_rebuild +
+     system_recovery_loop_drives + system_chaos(--ignored)全绿。
+  ②-3【TODO:dashboard 走 RPC 向 leader 要】
+     dashboard 是 standalone、只 shell 到 autumn-op,拿不到 leader 的文件 ⇒ 必须走 RPC。
+     建议【新开 MSG_OP_HISTORY】而不是给 OpQueryReq 加 include_history 布尔:
+     "现在在跑什么"和"历史上跑成什么样"是两个问题,数据源也不同(内存 ledger vs etcd opLog),
+     混进一个 RPC 会让 leader-gating 和分页语义都变含糊。
+     要做:wire(OpHistoryReq{kind/since/limit} + Resp{Vec<OpRecord>})+ manager handler
+     (读 opLog prefix、解码、过滤、按 key 倒序)+ dispatch 注册 + autumn-op 子命令 + 指纹刷新。
+Next steps:
+  1) 做 ②-3(见上)。注意 opLog 的 key 是定宽零填充的,所以 range 扫描天然按时间有序,
+     倒序取最近 N 条只需从尾部截。
+  2) 三层做完后可考虑:让 dashboard 真正消费它(examples/dashboard 加一个视图)。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (d)
 TaskStatus: not_completed
 Task scope: /loop ②op 可观测性【第一层 live 进度已完成 commit d2bfe8b;第二三层未做】。
