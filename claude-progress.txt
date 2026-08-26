@@ -1,3 +1,30 @@
+Date: 2026-08-26 (f)
+TaskStatus: completed
+Task scope: /loop ①corrupt replica ②op 可观测性 —— 【两项全部完成】。
+  ②-3【DONE:dashboard 走 RPC 向 leader 要】(commit f50d901)
+     新开 MSG_OP_HISTORY(0x5E)+ OpHistoryReq/Resp,【没有】给 OpQueryReq 加 include_history 布尔:
+     "现在在跑什么"(leader 本地内存 ring)和"历史上跑成什么样"(etcd)是两个问题、两个数据源,
+     混一个 RPC 会让 leader-gating 和分页语义都变含糊。
+     读取利用 key 布局:opLog key 定宽零填充 ⇒ prefix 扫描天然按时间有序,"最近 N 条"就是尾部切片,
+     不需要按解码字段排序,也不依赖 etcd 的返回顺序。解不开的行【跳过并 warn】而不是让整个查询失败——
+     历史是诊断用的,一行坏了不能连累其余。
+     CLI:`autumn-op ops history [--kind K] [--since UNIX] [--limit N]`,
+     渲染走【与 ops list 同一个 formatter】(提取成 render_ops)⇒ 运维看到的格式不因记录是活的还是历史的而变。
+     顺带把历史写入改成【每次 drain 一个 txn 批量写】:drain 挂在 PS 心跳上,一批完成如果逐条 etcd 往返,
+     就等于把 N 次串行往返压在维持 fleet liveness 的路径上——那正是最不能加延迟的地方。
+     wire 指纹就地刷新(v29 未部署)。
+  【chaos flaky 说明】期间遇到一次 chaos 失败(303s,平时 77-80s),但随后连跑两次 78.34s / 79.86s 均通过,
+     且失败那次的现象与本轮改动无关。已改批量写降低心跳路径延迟。若再见 300s+ 的 chaos,先怀疑环境
+     (机器负载 / etcd 端口)而非 op-log。
+  门:rpc 60 / manager 293 / ps 207 / client 41 + system_corrupt_replica_rebuild + chaos ×2 全绿。
+Next steps(本轮任务已完;以下是仍开着的旧项,按价值排序):
+  1) system_merge 的 split_merge_split_with_concurrent_writes 57.7% merge-window 丢失(与本轮无关,
+     领先假设=merge freeze 不停 PS 自己的 GC/timer-armed compaction)。要先复现再动刀。
+  2) chaos 里稳定出现的两类写失败:59 次 "key is out of range"(split 后 SDK 路由没刷新,本该自愈)、
+     8 次 "PS rejected: code=7"。都被 workload 容忍,但都不该稳定出现。
+  3) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+  4) 可选:让 examples/dashboard 真正消费 ops history(加一个视图)。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (e)
 TaskStatus: not_completed
 Task scope: /loop ②op 可观测性【第一二层已完成;第三层未做】。

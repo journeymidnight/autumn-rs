@@ -845,7 +845,22 @@ failure reason the fire-and-forget maintenance ops used to drop.
   clock, so a time window bounds it badly in both directions — a quiet week
   keeps nothing, a compaction storm writes more in an hour than anyone will page
   through. Best-effort like audit: failing an op because its history could not
-  be written would turn an observability gap into an outage.
+  be written would turn an observability gap into an outage. Writes are BATCHED
+  into one txn per drain — the drain sits on the PS load heartbeat, so a burst
+  of completions must not become N serial etcd round-trips on the path that
+  keeps fleet liveness accounting current.
+- **Reading history** is `MSG_OP_HISTORY` (`handle_op_history` → `read_op_log`),
+  deliberately a SEPARATE message from `MSG_OP_QUERY` rather than a flag on it:
+  the two answer different questions ("what is running" vs "how did past runs
+  turn out") off different sources (a leader-local ring vs etcd), so folding
+  them together blurs both the leader-gating and the paging semantics. Keys are
+  fixed-width zero-padded, so the prefix scan is already in timestamp order and
+  "most recent N" is a tail slice — no sorting by a decoded field and no
+  dependence on etcd's return order. An undecodable row is skipped with a
+  warning: history is diagnostic, and one bad row must not deny the rest.
+  Surfaced as `autumn-op ops history [--kind K] [--since UNIX] [--limit N]`,
+  rendered through the SAME formatter as `ops list` so an operator reads one
+  format whether a record is live or historical.
 - **Terminal reporting split**: manager-orchestrated kinds (split/merge/rebalance)
   close their entry in-process on return; **PS-executed kinds (compact/gc/forcegc)
   stay Running and are closed by the load heartbeat** — the PS records a
