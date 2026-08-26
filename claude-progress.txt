@@ -1,3 +1,28 @@
+Date: 2026-08-26 (b)
+TaskStatus: not_completed
+Task scope: /loop ①corrupt replica ②op 可观测性。本轮做 ① 的复现,结论:【原报告链路不可达,且我的第一版测试是真空的】,未修。
+  ①-d【推断链缺一环,原报告部分错误】上一轮记的四环链条里,第二环不成立:
+     recovery_dispatch_loop 在 `if (ex.avali & bit) == 0` 之【前】有
+     `if gate_mode == FencedOnly && !is_fenced { continue; }`,而 AUTUMN_MGR_RECOVERY_GATE
+     默认就是 fenced_only,corrupt 上报又不会把节点标成 Fenced ⇒ 那段 RE_AVALI 代码
+     在默认配置下【根本执行不到】。改 auto_disk 再测,同样不触发。
+  ①-e【真正的教训:第一版测试真空通过】按"隔离应保持"写的断言 15s 内一直绿,
+     avali 稳定在 0b0010。但补上非真空探针(fence 掉 victim,断言 recovery 循环必须有动作)后
+     【探针失败】——连 FENCED 节点都没触发任何重建 ⇒ 循环在该测试环境里对这个 extent 完全不动作,
+     所以"隔离保持住了"这个绿是【什么都没证明】。差点把真空绿当成"没问题"结案。
+     与上一轮 GC P0-2 同型:harness 不到位时,断言无意义;区别是这次非真空探针当场抓住了。
+     附带观察(未追):fence 后 extent_info 的 replicates 顺序从 [3,1] 变成 [1,3],而 avali 未随之调整。
+  ①【结论】按 house rule 复现不出来就不修:corrupt 隔离相关代码本轮【一行未改】,
+     未跑通的测试已删除不留半成品。上一轮那个 `let _` 吞错误修复(0115b14)独立有效,保留。
+  ②op 可观测性:未开始。
+Next steps:
+  1) 先解决前置能力:【让 recovery dispatch loop 在集成测试里真正动起来】。
+     这是可复用基建(任何 recovery/re_avali/隔离相关断言都依赖它),且必须自带非真空探针。
+     查清为什么 fence 掉节点后循环仍无动作(memory-mode? 扫描前置条件? 需要更久?)。
+  2) 有了它再回头判定 corrupt 隔离:默认 fenced_only 下真正的问题可能不是"隔离被撤销",
+     而是"隔离后【没有修复路径】"——没人会重建这个 corrupt 副本,extent 长期少一个可用副本。
+  3) 然后做 ②(设计见 memory project_op_observability_redesign)。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26
 TaskStatus: not_completed
 Task scope: /loop ①修 corrupt replica 隔离失效 ②op 可观测性设计+实现。本轮只完成 ① 的定性与一处吞错误修复。
