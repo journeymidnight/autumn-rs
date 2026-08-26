@@ -1,3 +1,34 @@
+Date: 2026-08-26 (g)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 清掉台账 next steps 的 #1 和 #2,并发现一个新的间歇失败。
+  #1【CLOSED,非 bug】system_merge 的 split_merge_split_with_concurrent_writes 57.8% "丢失":
+     它跑的是【未编排】的裸 MSG_MULTI_MODIFY_MERGE(flush→commit→drop handles→reload),
+     损失窗口 = manager 耗时 × 写速率,【没有任何东西给它设界】。20% 是当初那台机器的经验值,
+     忙一点的机器上就漂到 58%。
+     【怎么确认的,不是推断】把 helper 指向生产路径 MSG_MERGE_PARTITIONS 后同一个测试立刻通过;
+     而隔壁 orchestrated_merge_zero_loss_concurrent_writes 早就在测同场景走 freeze-drain 的【零丢失】。
+     保证已经有人守了。所以把断言【方向反转】:这个测试的职责是【对照组】——断言拓扑存活 +
+     无保护路径确实有损失。给有损的那一臂设上界是在测机器不是测代码。
+     顺带删掉说 freeze-drain "Stage 2/3, deferred" 的过时注释(早已上线)。
+     helper 没动:整体换路径会打破 merge_refuses_non_adjacent_partitions(它测裸 handler 自己的校验)。
+     commit 4952c86,system_merge 9/9。
+  #2【CLOSED,非 bug】chaos 里稳定出现的两类写失败,都是集群【正确拒绝】+ workload 正确记为失败:
+     - "key is out of range"(42-59 次):workload 用 region_epoch: 0(跳过检查)+ 自维护路由表,
+       【故意绕开】SDK 的 epoch-mismatch→refresh→retry 自愈。split 后它的表短暂陈旧,PS 拒绝错路由的 key。
+       看到它反而说明 admission ordering(epoch → in_range)在工作。
+     - "code=7" = CODE_UNAVAILABLE(2-8 次):merge freeze 期间 PS 停写。这是 freeze-drain 在干活;
+       merge 期间【没有】它才是问题。
+     已把这两条结论固化进 chaos 输出的标注(commit 3125085),免得每次重新调查一小时。
+  【新发现,未查】chaos 间歇失败:4 次运行里至少 2 次 FAILED,症状 inflight_errors=2 +
+     gc-reclaim 只回收 1 个 extent(正常 5-7)。与第一轮修的 EC frozen owner_epoch(4040dbe)【同症状】,
+     但那条已修且这次 op ledger 是 0 active。可能还有别的路径让 EC marker 钉住。
+     【不是本轮引入的】——本轮只动了测试断言和输出标注。
+Next steps:
+  1) 查上面那个间歇失败:inflight_errors=2 的具体内容(EC marker 钉住?),
+     先多跑几次统计频率,再看 EN 日志里 WriteShard 的拒绝原因(现在 code 会带名字了)。
+  2) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+  3) 可选:让 examples/dashboard 真正消费 ops history。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (f)
 TaskStatus: completed
 Task scope: /loop ①corrupt replica ②op 可观测性 —— 【两项全部完成】。
