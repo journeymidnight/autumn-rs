@@ -1,3 +1,29 @@
+Date: 2026-08-26 (m)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 发现 chaos 的 not_found 是【折叠过的】,已修诊断(commit ed74e12)。产品代码未动。
+  【为什么这条很重要:它让上一轮的结论站不住】
+     verify_per_key 的重试循环里:`Ok(r) if r.code == CODE_OK => 成功` / `Ok(_) => {}`
+     —— 任何【非 OK 的 code 被静默丢弃】继续重试,10 次耗尽后一律 push 进 not_found。
+     所以 chaos 报的 "not_found" 同时包含:
+       (a) 真的 CODE_NOT_FOUND(key 不存在)
+       (b) 读【失败】(Internal / FailedPrecondition / eversion mismatch / decode 失败……)
+     ⇒ F3 的 24 个 key 未必是"条目从 LSM 里消失",同样可能是"条目好好的,值读不回来"。
+     这两者机制完全不同,而 harness 把区别抹掉了 —— 上一轮据此推断"VP 条目消失"是【不成立的】。
+  【已修】记录最后一次非 OK 的 (code, message),输出时区分:
+     真 NOT_FOUND 只打 key;其它打 "key [read failed: code=N msg]";一次响应都没有的打 "[no response — wedged/timeout]"。
+  【模式复现第三次】本 session 已修的同型诊断缺口:
+     ① code_description 把未命名 code 折叠成 "error"(EC fence 被误读成瞬时错误)
+     ② truncate_to_commit 静默截短 extent(唯一让长度回退的路径,零日志)
+     ③ 本条:chaos 把所有非 OK 读结果折叠成 not_found
+     教训一致:【拒绝/失败到达运维时若不带原因,每次都要重查一遍】。
+  【进行中】改后连跑 6 次 chaos 收集数据,期望命中 F3 时能直接看到真实 code。结果未出。
+Next steps:
+  1) 看 6 次结果;若命中 F3,not_found 行会带 "[read failed: code=N ...]" 或确认是真 NOT_FOUND。
+     - 若是读失败 ⇒ 查 EC-converted extent 的 VP 读链(ec_subrange_read 解码 / shard 缺失)。
+     - 若是真 NOT_FOUND ⇒ 才轮到"条目消失"方向(compaction 丢 VP 条目 / replay dedup)。
+  2) 修 get 的 GC-pin false-NotFound(rpc_handlers.rs get_value_inner):应返回可重试错误而非 NotFound。
+  3) F1 转查 vp 侧;F2 改 EC marker 断言;评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (l)
 TaskStatus: not_completed
 Task scope: 自主循环 —— F3(静默丢 acked 写)缩小到 VP 路径;顺带发现一处 fail-open。未改产品代码。
