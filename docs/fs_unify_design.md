@@ -1,342 +1,245 @@
-# Design: unify `autumn-fuse` + `autumn-fsspec` into one filesystem
+# Design: one filesystem, several front-ends
 
-> **UPDATE 2026-07-09 — the `autumn_fsspec` facade (M3) was REMOVED** (thin
-> wrapper over `autumn.Fs`, unused; no `autumn://` URL surface anymore). The
-> shared inode core (M1) + the `autumn.Fs` PyO3 binding (M2) + the lease fencing
-> (M4) all STAY — they back `autumn-fuse` and `autumn_vllm_loader`. This doc is
-> kept as the design record of that shared core; the fsspec-facade sections are
-> historical.
-
-**Status: APPROVED 2026-07-03 — decisions locked, implementation started (M0).**
-User decisions on the open questions:
-- **Q1 → option (ii)**: WRITE-only leases; reads stay coherent via
-  `poll_invalidations` + `cache_is_stale` (no per-read manager RTT).
-- **Q2 → option (B)**: manager-side `AllocInodes(n) → base` RPC; the manager
-  persists the counter to etcd **with CAS** (txn on mod_revision), so even a
-  leader-transition window cannot hand out overlapping ranges.
-- **Q5 → lean surface**: file/dir/size/mtime/read/write/rename/unlink only —
-  no mode/uid/gid/symlink fidelity through the Python facade.
-
-Original context: requested 2026-07-03 after
-the observation that a POSIX mount and a Python fsspec client, both being
-*filesystem* surfaces, should be **one system** (shared on-disk layout **and**
-shared lease/fencing), not two coexisting namespaces.
-
-The `autumn_fsspec` adapter as first built uses its own `fs/`-prefixed,
-path-keyed namespace — safe to run beside a fuse mount, but the two see
-different files and neither fences the other. This doc specifies how to make
-them the *same* filesystem.
+`autumn-fuse` (kernel POSIX mount), `autumnfs` (mount-free CLI) and the PyO3
+`autumn.Fs` binding are **one filesystem**, not three namespaces. They share one
+on-disk inode layout, one Rust FS core, one manager-granted inode counter and
+one per-inode lease, so a file created through any of them is visible and
+byte-identical through the others and concurrent writers are fenced against each
+other.
 
 ---
 
 ## 1. Goal & non-goals
 
-**Goal.** One filesystem, two front-ends:
-- `autumn-fuse` — kernel POSIX mount (unchanged UX).
-- `autumn_fsspec` — Python `autumn://` client.
+**Goal.** One filesystem, several front-ends over one shared Rust FS core:
 
-A file created through either is visible and byte-identical through the other,
-and concurrent writers are fenced by the **same per-inode lease** so they can't
-corrupt each other. Both front-ends sit on **one shared Rust FS core**.
+- `autumn-fuse` — kernel POSIX mount (`fuser::Filesystem`).
+- `autumnfs` — CLI (`ls`/`stat`/`mkdir`/`cat`/`put`/`get`/`rm`/`touch`) that
+  talks to the cluster directly, no mount needed. Sole writer of lane-striped
+  large files.
+- `autumn.Fs` — PyO3 binding; `autumn_vllm_loader` reads model weights through it.
 
-**Non-goals (v1).**
+**Non-goals.**
 - Full POSIX semantics on the Python side (hardlinks, mode/uid/gid fidelity,
-  O_APPEND races). fsspec is an object-store-shaped API; we map it onto the
-  inode layout, not the reverse.
-- Reimplementing the namespace/lease logic in Python. The core stays in Rust,
-  bound via PyO3 — one implementation, no drift.
-- Cross-host distributed POSIX locking beyond what the existing inode lease
-  already provides.
+  O_APPEND races). The Python surface is deliberately lean: file/dir, size,
+  mtime, read/write/rename/unlink.
+- Reimplementing namespace/lease logic in Python. The core stays in Rust, bound
+  via PyO3 — one implementation, no drift.
+- Cross-host distributed POSIX locking beyond what the inode lease provides.
 
 ---
 
-## 2. What exists today (grounded in code)
+## 2. The filesystem, grounded in code
 
-### 2.1 fuse on-disk layout (`crates/fuse/src/{key,schema}.rs` — un-feature-gated)
+### 2.1 On-disk layout (`crates/fuse/src/{key,schema,geom}.rs` — un-feature-gated)
+
+Keys below are RELATIVE; the client prepends the `fs/` namespace (one global
+tree, no tenant/volume segment — `FsState` connects with `scoped("fs")`).
+
 | prefix | key | value |
 |---|---|---|
-| `0x01` | `[0x01][ino u64BE]` | `InodeMeta` (rkyv): mode/uid/gid/size/nlink/times, `inline_data` (≤4 KiB), `symlink_target` |
+| `0x01` | `[0x01][ino u64BE]` | `InodeMeta` (rkyv): mode/uid/gid/size/nlink/times, `inline_data` (≤4 KiB), `symlink_target`, `stripe` |
 | `0x02` | `[0x02][parent_ino u64BE][name]` | `DirentValue { child_inode, file_type }` |
-| `0x03` | `[0x03][ino u64BE][logical_off u64BE]` | extent bytes (variable, ≤ `MAX_EXTENT` = 8 MiB) |
-| `0x04` | `[0x04][field]` | superblock (incl. `next_inode` counter) |
+| `0x03` | `[0x03][ino u64BE][logical_off u64BE]` | extent bytes, ≤ `MAX_EXTENT` = 8 MiB (non-striped file) |
+| `0x03` | `[0x03][lane u8][ino u64BE][logical_off u64BE]` | extent bytes of a lane-striped file |
+| `0x04` | `[0x04][field]` | superblock: `next_inode` (migration floor only), `schema_version`, `stripe_geom`, `rmtomb/[ino]` |
 
-Files: inline ≤ 4 KiB in `InodeMeta.inline_data`; larger → variable extents
-keyed by logical offset (range-scan `[0x03][ino]` yields them in order).
-`ROOT_INO = 1`, `INODE_ALLOC_BATCH = 1000`.
+Files: inline ≤ `INLINE_THRESHOLD` = 4 KiB in `InodeMeta.inline_data`; larger →
+variable extents keyed by logical offset (a range-scan of the extent prefix
+yields them in order). `ROOT_INO = 1`, `INODE_ALLOC_BATCH = 1000`,
+`SCHEMA_VERSION = 3` (stamped in `[0x04]schema_version`; mismatch fails the
+mount loud).
 
-### 2.2 Namespace core ops (already ~pure over `ClusterClient` + `key`/`schema`)
-- `meta.rs`: `alloc_inode`, `get_inode`, `put_inode`, `new_file_meta`, `new_dir_meta`
-- `dir.rs`: `lookup`, `readdir`, `mkdir`, `rmdir`, `rename`
-- `extent.rs`: `write_region`, `extents_snapshot`, `truncate_extents`, `delete_all_extents`, `clean_beyond_eof`, `remove_unreachable_inode`
-- `write.rs`: `write`, `flush_inode`, `truncate` · `read.rs`: `prepare`/`execute`/`read`
+A file is stamped `InodeMeta.stripe = Some(StripeLayout { lanes, unit_bytes })`
+at create when it is striped; the stamp is immutable and the reader branches on
+it to pick the key layout, so non-striped files stay correct with no migration.
+`lane = (off / unit_bytes) % lanes` sits HIGH in the key so lane boundaries
+`[0x03][lane]` are static (ino-independent) and the fs can be pre-split into
+lane partitions at bootstrap. `DEFAULT_STRIPE_LANES = 24` when the fs declares
+no `[0x04]stripe_geom`.
 
-These take `&mut FsState`. **Coupling to `fuser` is thin** — only the return-side
-`InodeMeta → fuser::FileAttr` / `fuser::FileType` conversions in `meta.rs`/`dir.rs`.
-The KV logic itself is `fuser`-free. `dispatch.rs` (1668 lines) is the actual
-FUSE-protocol glue (the `fuser::Filesystem` trait impl) and stays fuse-only.
+### 2.2 Namespace core ops (pure over `ClusterClient` + `key`/`schema`)
 
-### 2.3 Lease is ALREADY a reusable client library (`crates/client/src/lease.rs`)
+- `meta.rs`: `alloc_inode`, `get_inode`, `put_inode`, `new_file_meta`,
+  `new_dir_meta`, `ensure_root`, `ensure_schema_version`
+- `dir.rs`: `lookup`, `lookup_opt`, `resolve`, `readdir`, `mkdir`, `create`,
+  `rmdir`, `unlink`, `rename`
+- `extent.rs`: `write_region`, `extents_snapshot`, `truncate_extents`,
+  `delete_all_extents`, `clean_beyond_eof`, `remove_unreachable_inode`,
+  `sweep_unlink_tombstones`
+- `write.rs`: `write`, `flush_inode`, `truncate` · `read.rs`: `prepare` /
+  `execute` / `read` / `read_into` · `geom.rs`: `read_stripe_geom` /
+  `write_stripe_geom`
+
+These take `&mut FsState` and return plain data (`InodeMeta`, `DirentValue`,
+`ReaddirEntry` with a `DT_*` byte, byte buffers) — **no `fuser` types**.
+`attr.rs` is the single fuse-gated conversion point (`inode_to_attr`,
+`dt_to_filetype`); `dispatch.rs` + `ops.rs` are the FUSE-protocol glue and stay
+fuse-only.
+
+### 2.3 Lease library (`crates/client/src/lease.rs`)
+
 Framework-agnostic, `ClusterClient`-based:
+
 - `acquire(cluster, client: &DaemonClientId, ino, mode) -> AcquireResult`
   (+ `acquire_force`, `acquire_with_preempt_wait`)
-- `release(...)`, `heartbeat(...)`, `poll_invalidations(...)`, `apply_invalidation`, `cache_is_stale`
+- `release`, `heartbeat`, `poll_invalidations`, `apply_invalidation`,
+  `cache_is_stale`
 - `DaemonClientId::new_fuse(host)`; modes `LEASE_MODE_READ` / `LEASE_MODE_WRITE`
-- writer-XOR-readers per inode, fenced by `lease_epoch` (manager
-  `MgrInodeLeaseInfo.version`); manager pushes `WriterClosed`/`LeaseRevoked`
-  for close-to-open coherence.
+- One writer per inode, fenced by `lease_epoch` (manager
+  `MgrInodeLeaseInfo.version`); the manager pushes `WriterClosed` /
+  `LeaseRevoked` for close-to-open coherence.
 
-**Implication:** the two hard parts (lease protocol; namespace KV logic) are
-already reusable or nearly so. The work is *decoupling + binding + a facade*,
-not new distributed-systems design.
-
-### 2.4 The one real prerequisite bug — inode allocator is not CAS
-`meta.rs:alloc_inode` does a **non-atomic RMW** on the `next_inode` counter:
-```rust
-let current = kv_get(next_inode_key);          // read
-kv_put(next_inode_key, current + BATCH);       // write — NO compare-and-swap
-```
-Safe for a single allocator; two concurrent allocators (fuse + fsspec, or two
-mounts) can both read `current` and claim the same [current, current+BATCH)
-batch → **duplicate inodes → corruption**. Making fsspec a co-equal writer
-requires fixing this (§6). (Arguably a latent multi-mount bug in fuse already.)
+Full protocol: `docs/autumn_fs_lease_plan.md`.
 
 ---
 
-## 3. Target architecture
+## 3. Architecture
 
 ```
-        ┌──────────────────────┐        ┌──────────────────────────┐
-        │  autumn-fuse (bin)   │        │  autumn_fsspec (Python)  │
-        │  fuser::Filesystem   │        │  AbstractFileSystem      │
-        │  dispatch.rs + kernel│        │  path↔inode facade       │
-        │  page-cache invalid. │        │  lease on open/close     │
-        └──────────┬───────────┘        └────────────┬─────────────┘
-                   │  InodeMeta/FileAttr              │  PyO3
-                   ▼                                  ▼
-        ┌───────────────────────────────────────────────────────────┐
-        │   SHARED FS CORE  (feature-independent Rust)               │
-        │   namespace: alloc_inode(CAS) · lookup/readdir/mkdir/…     │
-        │   data: write_region · read · truncate · extents_snapshot  │
-        │   lease: autumn_client::lease (acquire/heartbeat/release)  │
-        │   returns plain InodeMeta/DirentValue (NO fuser types)     │
-        └───────────────────────────┬───────────────────────────────┘
-                                    │ ClusterClient (put/get/range/CAS)
-                                    ▼
-                     partition layer (ordered KV) · manager (leases)
+   ┌──────────────────────┐  ┌──────────────────┐  ┌────────────────────────┐
+   │  autumn-fuse (bin)   │  │ autumnfs (CLI)   │  │ autumn.Fs (PyO3)       │
+   │  fuser::Filesystem   │  │ path↔inode ops   │  │ path↔inode facade      │
+   │  dispatch.rs + attr.rs│ │ striped writes   │  │ sync bridge to compio  │
+   │  kernel page-cache inv│ │                  │  │ lease on write         │
+   └──────────┬───────────┘  └────────┬─────────┘  └───────────┬────────────┘
+              │  InodeMeta/FileAttr    │                        │  PyO3
+              ▼                        ▼                        ▼
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │   SHARED FS CORE  (`core` feature — no fuser)                          │
+   │   namespace: alloc_inode (manager grant) · lookup/readdir/mkdir/…      │
+   │   data: write_region · read · truncate · extents_snapshot · geom       │
+   │   lease: autumn_client::lease + lease_tasks (heartbeat/poll/evict)     │
+   │   returns plain InodeMeta/DirentValue (NO fuser types)                 │
+   └───────────────────────────────┬───────────────────────────────────────┘
+                                   │ ClusterClient (put/get/range, fenced put)
+                                   ▼
+                    partition layer (ordered KV) · manager (leases, inode alloc)
 ```
 
 Two decisions embodied here:
-1. **Core returns plain data** (`InodeMeta`, `DirentValue`, byte buffers). The
-   `→ fuser::FileAttr` conversion moves *up* into `dispatch.rs` (fuse-only). The
-   Python binding converts to its own dict/`info` shape.
-2. **`FsState` splits** into (a) a lean **`FsCore`** (the `ClusterClient`, the
-   inode-alloc cursor, the `DaemonClientId`, `held_leases`, `invalidations`) that
-   both front-ends own, and (b) FUSE-runtime-only caches (`inodes` InodeState
-   map, per-inode `WriteBuffer`, `kernel_invalidator`, `notify_inval_failed`,
-   `lookup_count`) that stay in the fuse binary. The Python side keeps its own,
-   simpler per-open state.
 
-### 3.1 Crate layout options
-- **(a) In-place in `crates/fuse`** — move the pure core behind a *new default*
-  feature (e.g. `core`) and gate only the `fuser`-touching bits behind `fuse`.
-  `python/` deps `autumn-fuse` with `default-features=false, features=["core"]`.
-  Least churn; keeps history.
-- **(b) New `crates/fs-core`** — extract `key`/`schema`/`meta`/`dir`/`extent`/
-  `read`/`write` into a standalone crate; `autumn-fuse` and `python/` both dep it.
-  Cleaner boundary, more moving of files.
+1. **The core returns plain data.** `InodeMeta`, `DirentValue`, byte buffers.
+   The `→ fuser::FileAttr` conversion lives up in `attr.rs`/`dispatch.rs`
+   (fuse-only); the Python binding converts to its own dict/`info` shape.
+2. **`FsState` is the shared piece.** It owns the `ClusterClient`, the
+   inode-alloc cursor, the `DaemonClientId`, held leases, the invalidation map
+   and `direct_read`. FUSE-runtime-only caches (the `InodeState` map, per-inode
+   `WriteBuffer`, `kernel_invalidator`, `lookup_count`) live in the fuse binary;
+   the Python side keeps its own, simpler per-open state.
 
-Recommendation: **(a) first** (feature split, low risk), promote to (b) later if
-the boundary proves stable. Either way the diff to *behavior* is nil — it's a
-visibility/typing refactor guarded by the existing fuse test suite.
+### 3.1 Feature split
+
+The core lives in `crates/fuse` behind the `core` feature (`meta`/`dir`/
+`extent`/`read`/`write`/`state`/`geom`/`lease_tasks` + `key`/`schema`; extra
+deps are only `libc` and `compio`). `fuse = ["core", "fuser", "clap", …]` is the
+default and adds the kernel-mount machinery. `python/` depends on `autumn-fuse`
+with `default-features = false, features = ["core"]`.
+
+**Invariant:** core files never import `fuser` — `cargo tree --features core`
+must show a fuser count of 0, and every new core→fuser conversion goes in
+`attr.rs`.
 
 ---
 
-## 4. PyO3 FS-core API (new, in `python/src/`)
+## 4. PyO3 FS-core API (`python/src/fs.rs`)
 
-A new `autumn.Fs` class (beside `Client`/`BatchClient`/`Memory`), one compio
-worker thread hosting an `FsCore`, async methods bridged like `Client`:
+`autumn.Fs` sits beside `Client` and `BatchClient`. One dedicated compio worker
+thread owns the `!Send` `FsState`; each sync Python method ships a job to that
+worker and blocks for the result.
 
 ```
-Fs.connect(manager, *, host=None) -> Fs      # DaemonClientId::new_fuse(host)
+Fs.connect(manager, *, host=None, principal=None, credential=None,
+           direct_read=False) -> Fs        # DaemonClientId::new_fuse(host)
   # path resolution + metadata
-  resolve(path) -> ino | None                 # walk dirents from ROOT_INO
-  getattr(ino) -> InodeInfo(dict)             # InodeMeta as a dict
+  resolve(path) -> ino | None              # walk dirents from ROOT_INO
+  getattr(ino) -> dict                     # size/type/mtime/mode
   readdir(ino) -> list[(name, ino, kind)]
   lookup(parent_ino, name) -> (ino, kind) | None
-  # mutations (each fences via lease as in §5)
+  # mutations
   mkdir(parent, name, mode) -> ino
-  create(parent, name, mode) -> ino           # empty file
+  create(parent, name, mode) -> ino        # empty file
   unlink(parent, name); rmdir(parent, name); rename(...)
   # data
-  read(ino, offset, size) -> bytes            # read::read
-  write(ino, offset, data) -> n               # write::write (buffered→extents)
-  flush(ino); truncate(ino, size)
-  # leases (explicit, for the facade to drive)
-  acquire(ino, mode) -> lease_epoch; heartbeat(ino); release(ino)
+  read(ino, offset, size) -> bytes
+  read_into(ino, offset, buf) -> n         # buffer-protocol dest, no bytes copy
+  write(ino, offset, data) -> n            # buffered → extents
+  flush(ino); truncate(ino, size); forget(ino)
+  # leases (explicit, so the caller drives the fence — §5)
+  acquire(ino, mode) -> lease_epoch; heartbeat(ino) -> bool; release(ino)
 ```
 
-`InodeInfo` carries what fsspec `info()` needs (size, type, mtime, mode). The
-binding reuses the *same* `FsCore` methods the fuse binary calls — no logic
-duplicated in Python.
+`principal` + `credential` are a both-or-neither pair enforced by `connect`.
+The binding calls the *same* core functions the fuse binary calls, so there is
+no Python-side reimplementation to drift.
 
 ---
 
-## 5. Lease flow (the "one system" guarantee)
+## 5. Lease flow
 
-The facade drives the existing lease library exactly as the fuse dispatcher does:
-
-- **Open for read** (`cat_file`, read `open`): `acquire(ino, READ)`. Honor
-  `poll_invalidations` / `cache_is_stale(ino, lease_epoch, inv)` so a write by
-  the fuse side (or another client) that bumped the epoch forces a re-`getattr`
-  + extent rescan before serving bytes (close-to-open coherence).
-- **Open for write** (`wb`/`ab`/`pipe_file`): `acquire(ino, WRITE)`. Writer-XOR
-  means a concurrent fuse writer holding the lease makes us wait/`RevokePending`;
-  we hold the write lease across the whole write, **`heartbeat` on a timer**
-  (TTL renewal) for long multi-GB uploads, and `release` on close/flush.
-- **Crash safety.** A Python script that dies mid-write stops heartbeating; the
-  manager expires the lease after its TTL and a fuse mount (or a retry) can take
-  over — the fencing epoch guarantees the dead writer's late RPCs are refused.
-  This is precisely why fsspec must join the lease system rather than blind-write.
-
-**Open design question (Q1):** leases cost a manager RTT per open. For
-read-mostly dataset loading (thousands of small `info`/`cat` calls), per-open
-READ leases may be wasteful. Options: (i) always lease (simplest, correct);
-(ii) lease only writes, and for reads rely on epoch-stamped `getattr` +
-invalidation without a formal read lease; (iii) a process-lifetime "session"
-lease cache with lazy renewal. Recommend **(ii)** — write-fenced, read-coherent,
-cheap — but call it out for your decision.
+- **Reads** take no lease. Coherence comes from fresh reads plus the
+  invalidation poll: the binding only caches on write and `forget`s the inode on
+  release, and the fuse mount compares `InodeState.cached_version` against the
+  lease version at Open.
+- **Writes** take `acquire(ino, WRITE)`. One writer per inode means a concurrent
+  holder makes the second caller fail with a conflict. The write lease is held
+  across the whole write and heartbeated on a timer (`lease_tasks.rs`, 5 s) so
+  multi-GB uploads keep it alive, then released on close/flush.
+- **Fencing.** Writes carry `WriteLease { inode_hint, lease_epoch }`; the PS
+  keeps a fence floor per inode, so a deposed writer's late RPCs are rejected
+  server-side. Client-side, the invalidation poll marks a revoked lease and
+  `write`/`flush`/`truncate` fast-fail on it. Anonymous writes
+  (`WriteLease::ANON`, `lease_epoch = 0`) bypass the fence by design.
+- **Crash safety.** A process that dies mid-write stops heartbeating; the
+  manager expires the lease after its TTL and another front-end can take over —
+  the epoch fence is what makes that safe.
 
 ---
 
-## 6. Inode allocator → crash-safe, multi-writer (prerequisite)
+## 6. Inode allocation
 
-Two ways to make allocation safe for concurrent allocators:
+Inode numbers come from the manager, not from a client-side counter:
+`ClusterClient::alloc_inodes(count, floor, volume)` → `MSG_ALLOC_INODES`
+(`0x53`) → `crates/manager/src/fs_alloc.rs`.
 
-- **(A) CAS on the KV counter.** Add a compare-and-swap put to the SDK
-  (`put_if_eq(key, expected, new)`); `alloc_inode` loops read→CAS until it wins
-  its batch. Minimal, stays client-side. Needs a PS-level CAS primitive (check
-  whether one exists; the memtable is single-writer per partition so a
-  conditional put is cheap to add).
-- **(B) Manager-side `AllocInodes(n) -> base` RPC.** The manager (leader-fenced,
-  crash-safe — cf. `[[feedback_orchestrator_must_be_crash_safe]]`) owns the
-  counter and hands out ranges. Most robust; matches how the manager already
-  grants owner/lease epochs. Slightly more work.
+- The authoritative counter is the etcd key `autumn-rs/fs/next_inode` (strict
+  big-endian u64; malformed → refuse loudly).
+- Every grant is a read → `txn_fenced` value-CAS loop with the leader fence
+  prepended, so concurrent allocators can never receive overlapping ranges and a
+  deposed leader's grant loses the transaction.
+- `floor` is a migration floor: the counter is raised to at least this value
+  before granting and never rewinds. The fuse mount passes the legacy
+  `[0x04]next_inode` value on its first batch; that KV key is advisory-only
+  afterwards.
+- Callers refill in `INODE_ALLOC_BATCH` = 1000 batches. `handle_alloc_inodes` is
+  leader-gated; a follower refuses with NOT_LEADER.
+- This is deliberately *not* `alloc_ids` (which numbers manager entities
+  replayed from etcd prefixes); inode numbers are fs-layer data with their own
+  key.
 
-Recommendation: **(B)** if we want the allocator to be authoritative and
-crash-safe like the rest of the control plane; **(A)** if we want to keep it in
-the data plane and a CAS put is easy to add. **Open question (Q2)** for you.
-
-Either way this is a **standalone, independently-shippable fix** that also
-hardens multi-mount fuse today — worth doing first (Milestone 0).
-
----
-
-## 7. fsspec facade rewrite
-
-`AutumnFileSystem` methods re-expressed over `autumn.Fs` (inode layout):
-
-| fsspec | maps to |
-|---|---|
-| `_strip_protocol` / path norm | unchanged |
-| `info(path)` | `resolve(path)` → `getattr(ino)` → `{size,type,mtime}` |
-| `ls(path)` | `resolve` → `readdir(ino)` → child names + per-child `getattr` (real dirents now — no keys-only-range dance) |
-| `_open(rb)` / `cat_file` | `resolve`+`acquire(READ)`; `read(ino, off, size)` |
-| `_open(wb/ab)` | `create`/resolve + `acquire(WRITE)`; buffered `write(ino,…)`; `flush`+`release` on close |
-| `pipe_file` | create + write + flush + release |
-| `rm_file` / `rm` | `unlink` / `rmdir` (recursive walk) |
-| `mkdir`/`makedirs` | `mkdir` per component |
-
-Wins: real directories (no s3fs-style implicit-dir emulation, no keys-only-range
-manifest fetch); shared files with fuse; POSIX metadata. The current chunked
-`fs/` layout, manifests, and the `ls`-via-multi-get logic are **retired**.
+`AllocInodesReq.volume` is frozen into the wire but **dormant**: the fuse layer
+passes an empty volume, so there is a single global counter. The lease/fence
+plane keys on the bare ino, so per-volume inode numbers would collide across
+volumes and produce cross-volume write-lease conflicts. Isolation between trees
+comes from the namespace prefix, not the inode number.
 
 ---
 
-## 8. Migration & compatibility
+## 7. Known limits
 
-- **No data migration needed.** `autumn_fsspec` is unreleased; the only `fs/`
-  data is throwaway test data. Clean cutover — delete the `fs/` layout code.
-- **fuse on-disk format unchanged** — we only refactor *where its code lives*
-  and *what types it returns*, guarded by the existing fuse test suite.
-- **kvcache/memory untouched** — they use `kvc/`/`doc/`… ASCII namespaces,
-  disjoint from the `0x01–0x04` fuse layout.
-- **Rollback story** intact — `[[feedback_stopworld_restart_primary]]`: no
-  persistent-format change, so stop-world restart is safe.
-
----
-
-## 9. Test matrix
-
-- **Cross-surface interop (headless):** write a file via `autumn.Fs` (the core),
-  read it back byte-identical via `autumn.Fs`; and — with a real mount in CI that
-  supports FUSE — write via the mount, read via fsspec and vice versa.
-- **Fencing:** two `Fs` clients (distinct `DaemonClientId`) both open the same
-  inode for write → second gets `RevokePending`/waits; kill the first without
-  release → after TTL the second acquires; the first's late `write` is refused
-  (epoch fence). Mirror the existing inode-lease manager tests.
-- **Allocator concurrency:** N concurrent `create()` across 2+ clients → all
-  inodes unique (the §6 fix; fails today).
-- **Coherence:** fuse writes+closes, fsspec read sees new bytes (invalidation /
-  `cache_is_stale`).
-- **Existing fuse suite stays green** (the refactor is behavior-preserving).
-- **datasets round-trip** still passes over the new backing layout.
-
----
-
-## 10. Risks / open questions
-
-- **Q1 (read leases):** always-lease vs write-only-lease + epoch-coherent reads.
-  Recommend write-only + coherent reads (§5).
-- **Q2 (allocator):** CAS-in-SDK vs manager `AllocInodes` RPC (§6).
-- **Q3 (batch waste):** `INODE_ALLOC_BATCH=1000` per allocator means a
-  short-lived Python script that creates one file burns a 1000-inode batch.
-  Fine (inodes are u64), but consider a smaller batch or manager-side single
-  alloc for the client identity.
-- **Q4 (perf on tiny ops):** every `info`/`ls` becomes a dirent walk + getattr
-  RTTs. For huge dataset trees this is more chatty than the current single
-  range-scan. Mitigate with a short-lived path→ino + attr cache honoring
-  invalidations. Measure before optimizing.
-- **Q5 (POSIX surface breadth):** confirm the Python surface only needs
-  file/dir/size/read/write (not mode/uid/gid/symlink fidelity) for the
-  datasets/checkpoints use case, so we can keep the facade lean.
-- **Concurrency model:** the core is `!Send` compio-thread-local (like `Client`);
-  the PyO3 binding uses the same single-worker-thread bridge — fine.
-- **Preemption into the FS surfaces — DEFERRED (user, 2026-07-04).**
-  The mechanism is fully built + tested (`lease::acquire_force` /
-  `acquire_with_preempt_wait`; manager `WillRevokeIn` grace → 2PC force-revoke;
-  `bug_lease_4_force_revoke_2pc` / `lease_preempt`), and the VICTIM side is
-  already wired in M4 (poll marks `revoked` → write fast-fails + PS epoch fence).
-  Only the PREEMPTOR side is unwired: the fuse mount + `autumn.Fs` use non-force
-  `acquire`, so a WRITE conflict fails immediately (facade → `BlockingIOError`)
-  rather than bounded-wait-then-preempt. Deferred because the target workload is
-  single-writer (dataset prep / model upload / checkpoint) — no contention in the
-  normal case, and mutual `force` writers risk livelock. Wire an opt-in
-  preempt-write entry (`Fs.acquire(ino,"w",preempt_wait_ms=…)` + a facade `force`
-  flag) only when a real "stuck lease blocks the pipeline" need is measured
-  (reproduce-before-fixing).
-
----
-
-## 11. Phased plan
-
-| M | Deliverable | Acceptance |
-|---|---|---|
-| **M0** ✅ **DONE 2026-07-03** | Inode allocator → crash-safe multi-writer: manager `MSG_ALLOC_INODES` (0x53, WIRE v11) grants `[base, base+count)` via leader-fenced etcd **value-CAS** on `autumn-rs/fs/next_inode` (`crates/manager/src/fs_alloc.rs`); fuse `alloc_inode` refills batches from it, passing the legacy `[0x04]next_inode` value as the migration **floor** (+ best-effort legacy-key refresh for disaster rebuilds); `ClusterClient::alloc_inodes(count, floor)` | ✅ 16-way concurrent grants disjoint (memory) + 8-way over real etcd CAS; floor raises-never-rewinds; persisted watermark exact (BE u64); **follower refuses NOT_LEADER** (split-brain guard); count=0 refused; fuse suite green (lib 44 + fuse_lease_1 6/6 + fuse_lease_2 2/2 + system_fuse_read — all incl. `--ignored`); rpc/manager/client lib tests green; wire registry v11 fingerprint recorded |
-| **M1** ✅ **DONE 2026-07-03** | Decouple FS core from `fuser`: new `core` feature (meta/dir/extent/read/write/state + key/schema; only extra dep = libc) with `fuse = ["core", …]`; new fuse-gated **`attr.rs`** = the ONLY core→fuser conversion point (`inode_to_attr`/`dt_to_filetype` moved out of meta/dir); `dir::lookup`/`mkdir` return `(ino, InodeMeta)`, `ReaddirEntry` moved to `schema` with `kind: DT_*` byte (bridge re-exports); dispatch/ops convert at the reply boundary; `S_IF*` mode-format consts made `pub` | ✅ `cargo build --no-default-features --features core` clean, **fuser count in `cargo tree` = 0**; default build 0 warnings; fuse lib 44 + core-only 12 tests; manager fuse e2e (lease 6/6 + 2/2 + system_fuse_read) green incl. `--ignored`; workspace builds; **fuse_chaos PASS (65 files)** — behavior-preservation gold standard |
-| **M2** ✅ **DONE 2026-07-03** | PyO3 `autumn.Fs` binding (§4) over the core + `autumn_client::lease` (`python/src/fs.rs`): a sync-blocking façade (like `Memory`) — a dedicated compio worker owns the `!Send` `FsState`, jobs take `&mut FsState` via a `for<'a> FnOnce(&'a mut FsState) -> LocalBoxFuture<'a,()>` boxed closure. Full §4 surface: resolve/getattr/readdir/lookup/mkdir/create/unlink/rmdir/rename/read/write/flush/truncate + lease acquire/heartbeat/release. Core additions (single source, no fuse↔binding drift): `dir::create`/`dir::unlink`/`dir::resolve`, `meta::ensure_root` (fail-loud, no local seed — all inodes via the M0 manager grant), `FsState::new_with_host` (no env read). `dispatch.rs` Create/Unlink/init_root refactored to call the shared core. | ✅ headless py e2e (`python/tests/run_fs_e2e.sh`, isolated memory-mode cluster): create/write/flush/read byte-exact (inline + 10 MiB multi-extent + ranged across the 8 MiB boundary + EOF clamp), getattr/resolve/readdir/lookup, mkdir/rename/truncate/unlink, lease acquire→heartbeat→release smoke, **CROSS-INSTANCE byte-exact** (write via one `Fs`, read via a second + a committed shrink visible cross-client). Behavior preservation: fuse lib 44, fuse e2e `fuse_lease_1` 6/6 (incl. `fuse_create_acquires_writer_lease` + two-mount `init_root`) + `fuse_lease_2` 2/2 + `system_fuse_read` (write/read/truncate/delete_all_extents), core-only build with **fuser count = 0**, workspace build |
-| **M3** ✅ **DONE 2026-07-03** | `autumn_fsspec` rewritten as a thin facade over `autumn.Fs` (§7): `info`/`ls`→`resolve`+`readdir` (real dirents), `cat_file`→`read`, write/`pipe_file`→auto-`mkdir`+`create`+`write`+`flush` (overwrite truncates-first for exact size), `mkdir`/`rm`/`mv`→`mkdir`/`unlink`+`rmdir`/`rename`. Fully synchronous (no asyncio bridge — `Fs` is sync). **Retired** the `fs/` chunked-manifest layout (`_layout.py`, `_bridge.py`, `fake_kv.py` deleted). Offline runs the SAME facade over a Python inode tree (`tests/fake_fs.py`, mirrors the `Fs` sync API). | ✅ offline 28 (`test_fs_offline` size-boundary round-trips/ranged/ls/info/dirs/mkdir/rm/overwrite-shrink/append/exclusive/mv/root-bucket + `test_datasets_offline` save_to_disk/load_from_disk + load_dataset('json') + `test_vllm_loader_offline` + `test_models_offline` upload/materialize SHA-verified); **live 9** over a real cluster (`run_fsspec_e2e.sh` isolated bring-up) — 0 B–5 MiB round-trips + cross-extent ranged, ls/find/rm, overwrite-shrink exact, cross-boundary append, exclusive create, **datasets round-trip**. Shared layout: fsspec + fuse now see the same inode keys |
-| **M4** ✅ **DONE 2026-07-03** | Lease integration + fencing (§5, §9). The per-session lease background tasks (heartbeat + invalidation poll + revoked-eviction) extracted from the fuse-gated `dispatch.rs` into the fuser-free **`lease_tasks.rs`** (core); the PyO3 binding spawns them with `None` invalidator (headless) so a facade's WRITE lease is heartbeated for long writes + marked revoked on preemption. Binding gains `Fs.forget(ino)` (evict cache) + a revoked-write fast-fail. `autumn_fsspec` acquires the WRITE lease around every write (`pipe_file` + buffered `_initiate_upload`→`_upload_chunk`), releasing + `forget`ing on close — close-to-open coherence for cross-client reads (per Q1: write-only leases, reads coherent by fresh-read since the binding caches only on write). | ✅ **fencing** (`run_fs_lease_e2e.sh`, two distinct `DaemonClientId`): write-lease XOR (A holds ⇒ B conflicts; A releases ⇒ B acquires) + cross-client coherence + `forget()` evicts a stale cache; **facade coherence** (`test_e2e_cluster.py::test_cross_facade_coherence`: write via one `AutumnFileSystem`, read latest via an independent one); fsspec live 10 + offline 30 green on the lease path; fuse suite green after the extraction (`fuse_lease_1` 6/6 + `fuse_lease_2` 2/2 + `system_fuse_read`); core-only build `fuser`=0. **write-via-mount/read-via-fsspec byte-identity VERIFIED on a real `/dev/fuse` mount** (`run_mount_fsspec_interop.sh`): file written through the autumn-fuse kernel mount reads byte-exact via fsspec and vice versa (37 B + 10 MiB each way), directories interop both ways — genuinely one filesystem. |
-
-M0 and M1 are independently valuable and low-risk; M2–M4 deliver the unified
-filesystem. Estimated scope: M0 small, M1 medium (mechanical), M2 medium, M3
-medium, M4 medium — several focused sessions, each commit-clean.
-
----
-
-## 12. Recommendation
-
-Proceed **M0 → M4** in order, deciding Q1 (write-only leases) and Q2
-(allocator: manager RPC vs SDK CAS) before M0/M2. The design reuses the two
-hard existing pieces (lease lib, namespace core) and the net new work is a
-type-decoupling refactor + a PyO3 surface + a facade — no new distributed-systems
-invention. Ship M0 first regardless (it fixes a latent multi-mount hazard).
+- **Preemption is victim-side only.** The mechanism exists end to end
+  (`lease::acquire_force` / `acquire_with_preempt_wait`; manager `WillRevokeIn`
+  grace → deferred-push force-revoke), and the victim side is wired: the poll
+  marks the lease revoked, writes fast-fail, the PS epoch fence backstops. The
+  *preemptor* side is not: the fuse mount and `autumn.Fs` use non-force
+  `acquire`, so a WRITE conflict fails immediately rather than
+  bounded-wait-then-preempt. The target workload is single-writer (dataset prep
+  / model upload / checkpoint) and mutual `force` writers risk livelock.
+- **The fuse mount cannot write striped files.** `write::write` /
+  `write::truncate` return "not supported yet; use autumnfs" for an inode with
+  `meta.stripe` set. The mount *reads* striped files fine; striped writes are
+  `autumnfs`-only.
+- **`rename` is not atomic.** It is a sequence of unfenced KV operations.
+- **Path→inode walks are chatty.** Every `info`/`ls` is a dirent walk plus a
+  `getattr` round trip, which is more RPCs than a single range scan over a
+  path-keyed layout would be.

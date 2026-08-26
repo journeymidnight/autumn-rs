@@ -4751,6 +4751,32 @@ impl AutumnManager {
                 now,
             );
             if transitioned {
+                // EVENT vs STATE: the ledger answers "how is this op doing"
+                // and is a bounded in-memory ring that dies with the leader;
+                // the audit entry records only a 0/1 result_code. Neither
+                // preserves WHY. Emit the reason to the leader log, where it
+                // is durable and can be scraped (the dashboard surfaces
+                // notifications by reading these lines). Fires once per op —
+                // `transitioned` is the idempotent first-claim.
+                if o.state != OP_STATE_SUCCEEDED {
+                    tracing::error!(
+                        target: "autumn::op_event",
+                        op_id = o.op_id,
+                        kind = o.kind,
+                        state = o.state,
+                        error = %o.error,
+                        message = %o.message,
+                        "maintenance op FAILED"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "autumn::op_event",
+                        op_id = o.op_id,
+                        kind = o.kind,
+                        message = %o.message,
+                        "maintenance op succeeded"
+                    );
+                }
                 self.append_audit(MgrAuditEntry {
                     op: crate::op_kind_audit_code(o.kind),
                     node_id: 0,

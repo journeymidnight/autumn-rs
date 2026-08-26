@@ -1,246 +1,172 @@
-# autumn-fs 多客户端 / 多 daemon 一致性计划
+# autumn-fs 多客户端一致性：inode lease
 
-**日期**: 2026-06-05
-**状态**: 设计草案（待立项实施）
-**关联代码**: `crates/fuse/`、`crates/ioring/`、`crates/manager/`、`crates/fuse/src/key.rs`
-**关联记忆**: [[project_fuse_extents_ioring_ucx]]、[[project_three_interfaces]]
+**关联代码**: `crates/manager/src/inode_lease.rs`（lease 注册表 + revoke loop）·
+`crates/manager/src/rpc_handlers.rs`（4 个 handler + long-poll）·
+`crates/client/src/lease.rs`（SDK 客户端）·
+`crates/fuse/src/lease_tasks.rs`（per-session 心跳 / poll / 驱逐后台任务）·
+`crates/fuse/src/key.rs`（fs key schema）
+**关联记忆**: [[project_three_interfaces]]、[[project_fs_unify_complete]]
 
 ---
 
-## 1. 目标
+## 1. 一致性语义
 
-让 autumn-rs 在「**同时跑** `autumn-fuse` + `autumn-ioring-daemon`」以及「**多主机同时挂载** `autumn-fuse`」这两类场景下，保持读写一致性，并且**不引入第二个元数据系统**。
+同一棵 fs 树可以被多个前端同时打开：内核挂载 `autumn-fuse`、CLI `autumnfs`、
+PyO3 `autumn.Fs`（`autumn_vllm_loader` 走这条）。manager 的 inode lease 给这些
+前端下列语义：
 
-具体一致性语义：
+| 场景 | 语义 |
+|------|------|
+| 多客户端并发读同一文件 | 安全：读 lease 可多持有者共存 |
+| 多客户端并发写同一文件 | 单写者：第二个 `acquire(WRITE)` 返回 Conflict |
+| writer 写 → reader 读（不同进程 / 不同主机） | close-to-open：writer release 后立即可见 |
+| 同一 mount 内部并发 | 安全（单线程 compio） |
+| 不同前端并跑同一 ino | 同一套 lease/invalidation 覆盖——manager 不区分客户端家族 |
 
-| 场景 | 当前 | 目标 |
-|------|------|------|
-| 多 mount 并发读同一文件 | ✅ 安全（只读） | ✅ 安全 |
-| 多 mount 并发写同一文件 | ⚠️ Last-write-wins，缓存不失效 | ✅ 单写者 + reader cache 失效推送 |
-| writer 写 → reader 读（不同进程 / 不同主机） | ⚠️ 缓存最长 30s 才看到 | ✅ close-to-open coherence（writer close 立即对 reader 可见）|
-| 同一 mount 内部并发 | ✅ 已安全（单线程 compio） | ✅ 不变 |
-| autumn-fuse + autumn-ioring-daemon 并跑同一文件 | ⚠️ 各自 cache 不互通 | ✅ 同一 lease/invalidation 机制覆盖 |
-
-非目标（**Non-goals，明确不做**）：
+非目标（明确不做）：
 - POSIX byte-range locking（`fcntl(F_SETLK)`）
-- 同文件并发**写者**的 chunk-slice 合并（JuiceFS 用 slice 模型；我们走 single-writer-lease）
+- 同文件并发**写者**的 chunk-slice 合并（JuiceFS 用 slice 模型；这里走 single-writer-lease）
 - 跨集群联邦
-- 强一致 directory rename（保持现有"非原子 rename"限制，独立工作）
+- 原子 rename：`dir::rename` 是多次无事务 KV 操作，lease 不改变这一点
 
----
+## 2. 为什么 lease 长在 manager 里
 
-## 2. 与 JuiceFS 的关键架构差异
+manager + etcd 已经承担 JuiceFS 里那个**外置** metadata 服务的角色，所以
+inode lease 直接复用 manager 的 etcd lease 原语（与 stream 层 `acquire_owner_lock`
+同源），不引入第二个元数据系统、也不引入 Redis。所有前端都只是该 manager 的
+lease 客户端；manager 对客户端家族一视同仁（`kind` 只是诊断标签），这正是
+"多种前端并跑同一文件"能成立的原因。
 
-| | JuiceFS | autumn-rs |
-|---|---------|-----------|
-| 元数据后端 | **外置**（Redis / TiKV / 自家 metasrv） | **内置**（manager + etcd，已存在） |
-| 数据后端 | 对象存储（S3 兼容） | autumn partition layer |
-| Lease 服务 | metadata 服务自己提供 | **复用 manager 的 etcd lease 原语**（`acquire_owner_lock` 同款） |
-| Invalidation 通道 | metadata 服务 → 客户端 push | **新加**（manager → fuse/ioring 客户端） |
+lease 状态全部在 **manager 进程内 + etcd**，**不在数据 KV 里加键**——fs key
+schema（`fs/` namespace 下 `0x01` InodeMeta / `0x02` DirentValue / `0x03` extent /
+`0x04` superblock）不因 lease 而改动。
 
-**核心结论：autumn-rs 已经具备 JuiceFS 那个"metadata 服务"角色（manager + etcd），不需要额外引入 Redis。**所有协调放进 manager，fuse 和 ioring daemon 都作为该 manager 的客户端订阅 invalidation 事件。
+## 3. 数据模型
 
----
-
-## 3. 数据模型与不变量
-
-复用已有的 fuse key schema（`crates/fuse/src/key.rs:1-20`），**不动**：
-```
-0x01 → InodeMeta
-0x02 → DirentValue
-0x03 → File extent
-0x04 → Superblock
-```
-
-新增的状态全部在 **manager 进程内 + etcd 持久化**（不在数据 KV 里加键）。
-
-### 3.1 InodeLease — 新增 manager 状态
+### 3.1 InodeLeaseState
 
 ```rust
-struct InodeLease {
+pub struct InodeLeaseState {
     ino: u64,
-    writer: Option<ClientId>,        // Some = 单写者；None = 无 writer
-    readers: HashSet<ClientId>,      // 当前持读 lease 的客户端集合
-    version: u64,                    // 单调，每次 writer close +1（C2O coherence 标记）
-    expires_at: SystemTime,          // TTL，writer 异常未续约 → 自动释放
+    writer: Option<ClientKey>,               // 至多一个写者
+    writer_diag_host: String,                // 诊断用
+    writer_expires_at: Option<Instant>,
+    readers: BTreeMap<ClientKey, Instant>,   // 读者可与写者共存
+    version: u64,                            // writer close / revoke 时 +1
+    pending_revoke_at: Option<Instant>,      // force-acquire 的 grace 窗口
 }
 ```
 
-- 持久化在 etcd `inode_leases/{ino}`，由 manager 序列化（与现有 `regions/` 同形态）
-- TTL 默认 30s，客户端持锁期间 5s 心跳续约（同 stream 的 owner_lock）
+- **写者 lease 持久化**在 etcd `inode_leases/{ino}`（leader-fenced）；**读者 lease
+  只在内存**——failover 后读者集合丢失是良性的（客户端重连即整体失效缓存）。
+- TTL = `DEFAULT_LEASE_TTL_SECS` 30s；客户端每 5s 心跳续约（`lease_tasks.rs`）。
+- force-revoke 的宽限期 `DEFAULT_REVOKE_GRACE` = 5s；revoke 扫描周期
+  `REVOKE_TICK` = 1s；每客户端 inbox 上限 `MAX_INBOX_EVENTS` = 1024。
+- `version` 在 inode 条目的**整个生命周期**内单调（`last_version` 影子值跨
+  remove/re-create 保住 high-water mark），所以重新 acquire 绝不会把某个陈旧
+  reader 缓存正持有的 `(ino, version)` 再发一次。
 
-### 3.2 ClientId
+### 3.2 MgrClientId
 
 ```rust
-struct ClientId {
-    daemon: DaemonKind,   // Fuse | IoRing
-    instance: Uuid,       // 进程启动时生成，断线重连保持
-    host: String,         // 诊断用
-}
+pub struct MgrClientId { kind: u8, uuid: [u8; 16], host: String }
 ```
 
-manager 不区分客户端来自 fuse 还是 ioring —— 同一套 lease 协议，**这是"两 daemon 并跑"的关键**。
+`kind` ∈ {`LEASE_CLIENT_KIND_FUSE` = 1, `LEASE_CLIENT_KIND_IORING` = 2}，**仅供
+`autumn-op` 标注哪个前端持有 lease**。lease 身份是 `(kind, uuid)`；`host` 是纯诊断
+字段，manager 从不比较它。`uuid` 在客户端进程启动时生成一次，之后每个 lease RPC
+复用（断线重连不换）。
 
----
+## 4. 协议（4 个 manager RPC，`0x46`–`0x49`）
 
-## 4. 协议
-
-### 4.1 Open
+### 4.1 Acquire（`MSG_ACQUIRE_LEASE` = 0x46）
 
 ```
-Client → Manager: AcquireLease { ino, mode: Read|Write }
+Client → Manager: AcquireLeaseReq { client, ino, mode: READ|WRITE, force }
 Manager:
-  if mode == Write:
-    if writer != Some(self): wait (或返回 Conflict 让 client poll)
-    else: writer = Some(self), version unchanged
-  if mode == Read:
-    readers.insert(self)
-  return InodeLease { version, writer_present: bool }
-
-Client: 缓存 (ino, version)；用 version 标记后续 cache 项的"代"
+  mode == WRITE 且 writer 被别人持有:
+      force == false → WriteConflict（客户端映射成 EBUSY / EAGAIN）
+      force == true  → 首次推 WillRevokeIn 给现持有者并起 grace 窗口，
+                       返回 RevokePending { eta_ms }；grace 到期后的
+                       force-acquire 强收（version+1，推 LeaseRevoked）再授予
+  mode == READ  → 加入 readers 集合
+→ AcquireLeaseResp { code, lease: MgrInodeLeaseInfo { version, writer_present, ttl_secs } }
 ```
 
-### 4.2 Read 路径
+客户端把返回的 `version` 当作缓存的"代"（`InodeState.cached_version`）：不符
+即丢弃缓存的 `InodeMeta` / extent map 重建。
+
+### 4.2 读路径
+
+客户端**不是**每次 read 都问 manager 要 version。它依赖 §4.5 的 invalidation
+long-poll；`cache_is_stale(ino, lease_epoch, inv)` 用 poll 收到的事件判定缓存是否
+被超越，没有事件就认为缓存有效。
+
+### 4.3 Release（`MSG_RELEASE_LEASE` = 0x47）
 
 ```
-Client.read(ino, off, len):
-  if cached_version(ino) == server_version(ino): use cache
-  else: invalidate cache, re-scan extents from KV
-  fetch missing extents via SDK
-```
-
-注意：客户端**不每次 read 都 ping manager 检查 version**。它依赖 invalidation push（4.4）；只在没收到 push 时假定 cache 有效。
-
-### 4.3 Close
-
-```
-Client → Manager: ReleaseLease { ino }
 Manager:
-  if writer == Some(self):
-    writer = None
-    version += 1    ← close-to-open coherence trigger
-    push InvalidateInode { ino, new_version } to all readers in readers set
-  else:
-    readers.remove(self)
+  writer == 调用者 → writer = None; version += 1;
+                     推 WriterClosed 给该 ino 的所有 readers   ← close-to-open 触发点
+  否则            → readers.remove(调用者)（幂等：没持有返回 NotHeld）
 ```
 
-Writer close 之前，client 先把所有 dirty buffer 排干（已有的 `flush_inode` 调用）→ 落 KV → 然后才 ReleaseLease。这样 reader 收到 invalidation 时，新数据已在 KV。
+写者在 ReleaseLease **之前**排干脏写缓冲（`flush_inode`）落 KV，所以 reader 收到
+invalidation 时新数据已经在 KV 里。
 
-### 4.4 Invalidation Push 通道
+### 4.4 Heartbeat（`MSG_HEARTBEAT_LEASE` = 0x48）
 
-新增 manager RPC：**`SubscribeInvalidations`**（长连接 / streaming）。
+续约成功返回 `Renewed{version, writer_present, ttl_secs}`；`NotHeld` 表示
+manager 已 revoke / 过期该 lease，客户端必须丢缓存并重新 acquire。
 
-```
-Client → Manager: SubscribeInvalidations { client_id }
-Manager → Client: stream of InvalidateInode { ino, version, kind }
-```
+### 4.5 Invalidation 通道（`MSG_POLL_INVALIDATIONS` = 0x49）
 
-`kind`:
-- `WriterClosed` — writer 释放，version 自增
-- `LeaseRevoked` — manager 强收 lease（writer 异常 / 抢占）
-- `MetaChanged` — inode meta（size / mode）变了，dirent 变了
+autumn-rpc 是 req/resp 模型（无 streaming RPC），所以推送做成**服务端 long-poll**：
+handler 先排空该客户端 inbox，空则挂起最多 `LONG_POLL_WAIT` = 10s 等事件；
+`ClientInbox::push` 在返回前唤醒挂起的 waker，所以"writer close → reader 看见新
+字节"是毫秒级而不是一个 poll 周期。每个 inbox 至多挂一个 waker，被顶掉的那个
+long-poll 以 `Canceled`（= 无事件，重试）收场。
 
-autumn-rpc 现状是 req/resp 模型，**没有 streaming RPC**。要么扩 autumn-rpc 加 streaming，要么用一个常驻 long-poll TCP 连接（manager 累积事件，客户端 poll 一次拿一批）。**倾向后者**（小改动，autumn-rpc 不动）。
+事件 `MgrInvalidation { ino, version, kind }`，`kind`：
 
-### 4.5 异常处理
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `LEASE_INVAL_WRITER_CLOSED` | 1 | 写者释放，version 已自增 |
+| `LEASE_INVAL_LEASE_REVOKED` | 2 | manager 强收 lease（TTL 过期 / 被抢占） |
+| `LEASE_INVAL_META_CHANGED` | 3 | **溢出哨兵**：`ino == 0` 表示 inbox 溢出，客户端须整体失效 |
+| `LEASE_INVAL_WILL_REVOKE_IN` | 4 | 推给当前写者：有人 force-acquire，`version` 字段复用为宽限毫秒数 |
+
+## 5. 异常与恢复
 
 | 情况 | 处理 |
 |------|------|
-| Writer 没续约 → TTL 过期 | manager 自动 revoke writer，version +1，push 给 readers |
-| Reader 没续约 → TTL 过期 | manager 静默从 readers 集合移除 |
-| Manager failover (leader 切换) | 新 leader 从 etcd 读 lease 状态恢复；客户端 subscribe 重连，根据返回的 current version 决定是否 invalidate 本地 cache |
-| 客户端 invalidation 通道断开 | 客户端**保守**：所有 cached inode 失效，下次 read 重新拉 |
+| Writer 没续约 → TTL 过期 | manager 自动 revoke writer，version +1，推给 readers |
+| Reader 没续约 → TTL 过期 | 静默从 readers 集合移除 |
+| Manager failover | 新 leader 从 etcd 重装写者 lease（`install_persisted_writer`，deadline 按 TTL 夹紧防时钟漂移）；读者集合丢失是良性的 |
+| 客户端 poll 通道断开 / 收到溢出哨兵 | 客户端**保守**：丢弃全部持有的 lease + 缓存，下次读重新拉 |
+| force-revoke 的 etcd 持久化失败 | `acquire_with_force_deferred` 把推送暂存，持久化失败即丢弃暂存并 `revert_writer_acquire` 回滚内存态——客户端绝不会看到"没真正发生的 revoke" |
 
----
+`tick(now)` 的顺序是**先捕获 readers 集合再驱逐过期 readers**（writer revoke →
+reader expiry → drop-empty-inode → push），所以卡在写者 TTL 边界过期的 reader 仍
+能收到推送。
 
-## 5. 阶段划分
+## 6. 不变量与代码约束
 
-按用户指定优先级：**phase 1 = autumn-ioring-daemon + inode-level lease + close-to-open coherence**，其他阶段排队。
+1. **manager 是唯一 lease 决策者**。客户端不本地决定"我先写"——写路径先 Acquire，
+   `acquire` 在别人持写者槽时同步返回 `WriteConflict`。
+2. **写者的 ReleaseLease 排在脏缓冲 flush 之后**。反过来 readers 会看到 version+1
+   却读不到新数据。同理 manager 侧 `version` 自增排在推送**之前**，reader 拿到的
+   事件与新代号总是配对的。
+3. **客户端缓存一律按 version 标记**。extent map / write buffer / inode meta 的每份
+   缓存都带 `cached_version`；invalidation 到达一票否决。
+4. **poll 通道断线 = 失效全部 cache**。不做"乐观保留"——部分失效是脚枪；溢出哨兵
+   （`MetaChanged` + `ino == 0`）走同一条整体失效路径。
+5. **续约失败 = 自我 revoke**。`heartbeat` 返回 `NotHeld` 的客户端不得假装还持有，
+   否则会与新写者对撞。被 revoke 的租约上的写操作快失败（`autumn.Fs` 与 mount 都
+   有这道门），PS 侧另有 `(inode_hint, lease_epoch)` 的 fence floor 兜底。
+6. **写租约在第一次 Put 之前拿到**。没有"先写后申请"的乐观协议——ValuePointer /
+   extent 结构没有 CAS 可供事后回退。无租约的匿名写不参与围栏（`WriteLease::ANON`，
+   `lease_epoch = 0`），单前端场景照常工作。
 
-### Phase 1（优先）— ioring daemon 接入 lease
-
-**范围**:
-- manager 加 InodeLease 状态 + 4 个 RPC：`AcquireLease`、`ReleaseLease`、`HeartbeatLease`、`SubscribeInvalidations`
-- autumn-ioring-daemon 的 `Opcode::Open` 申请 lease（mode 来自 `O_RDONLY` / `O_RDWR`，flag 加到 OpenReq）
-- `Opcode::Close` 释放 lease
-- daemon 内 `OpenedExtents` 缓存按 (ino, version) 标记；invalidation 到达时丢弃
-- daemon 启动开一个常驻 subscribe 连接，事件 → 同一 compio runtime 的 invalidator task
-
-**验收**:
-- 两个 ioring daemon 同时跑（不同 host），同时写同一 ino → 后者 AcquireLease 返回 Conflict，应用收到错误
-- 一个 daemon 写完 close → 另一个 daemon 同 ino 的 Open 立即看到新 version → cache 失效 → 读到新数据
-- daemon 异常 kill → 30s 后 lease 自动 revoke → 第二个能 acquire
-
-**不做**:
-- autumn-fuse 接入（Phase 2）
-- 跨 daemon 类型混用（fuse + ioring 同 ino 并发）—— Phase 2 完成后自然就能用
-- 抢占（先返回 Conflict，让客户端自己决定 retry）
-
-### Phase 2 — autumn-fuse 接入同一套 lease
-
-**范围**:
-- fuse 的 `open` / `release` 回调对接 lease（带上 mode）
-- fuse 的 `InodeState.extents` 缓存按 version 标记
-- fuse kernel attribute cache（`attr_timeout=30s`）失效：收到 push → 调用 `fuser::notify_inval_inode()` 让内核也丢
-- 处理 fuse 特有问题：write buffer 在 invalidation 时怎么办（drop 还是 force-flush？ → drop + 错误返给上层，writer 应已先 release）
-
-**验收**:
-- 一台 host fuse mount 写文件，另一台 host fuse mount 读 → 写者 close 后立即可见
-- fuse + ioring daemon 同时跑同 ino —— writer 切换时正确 invalidate
-
-### Phase 3 — 抢占 / Revoke / 多 writer 协调
-
-**范围**:
-- `AcquireLease` 支持 `force=true`：manager 主动 revoke 当前 writer，等其 flush + release，再给新申请者
-- writer revoke 协议：manager push `WillRevokeIn { 5s }` → writer flush → push `Revoked`
-- 类似 NFSv4 delegations 的回收
-
-**优先级**: 低。Phase 1+2 已经能跑 sglang 多副本场景（writer 是 cp、reader 是 sglang，writer 短任务自然 close）。
-
----
-
-## 6. 不变量与代码约束（写代码时必须遵守）
-
-1. **manager 是唯一 lease 决策者**。客户端绝不能本地决定"我先写"——必须先 Acquire。
-2. **writer 的 ReleaseLease 必须在 dirty buffer flush 之后**。否则 readers 看到 version+1 但 KV 没新数据 → 读到旧值或空。
-3. **客户端 cache 一定要按 version 标记**。任何"我缓存了 ino X 的 extent map / write buffer / inode meta"都必须带 version；invalidation 到达时一票否决。
-4. **subscribe 断线 = 失效全部 cache**。不要"乐观保留"。
-5. **lease 续约失败 = 自我 revoke**。client 不能假装还持有 —— 否则可能跟新 writer 撞写。
-6. **AcquireLease Write 必须在第一次 Put 之前**。不允许"先写后申请"的乐观协议（autumn-rs 的 ValuePointer / extent 结构没有 CAS 来事后回退）。
-
----
-
-## 7. 风险
-
-| 风险 | 影响 | 缓解 |
-|------|------|------|
-| invalidation 通道延迟 / 丢失 → reader 看不到 close-to-open | 读到旧数据 | (a) 客户端定期主动 poll version 兜底（如 1s 心跳同时报告 known versions）；(b) Phase 1 内置抖动测试 |
-| writer crash → 30s TTL 内 reader 看不到任何新数据 | 30s 的不可读窗口 | TTL 可调；运维场景接受 |
-| lease 数量爆炸（百万 inode 同时打开） | manager 内存 + etcd 压力 | (a) lease 粒度按"打开"而非"存在"（关闭即释放）；(b) etcd 只持久化 writer-lease，reader-lease 内存即可（客户端断线由 subscribe 心跳兜底）|
-| 与现有 `acquire_owner_lock(stream)` 的命名/语义混淆 | 维护难度 | 命名分开（`InodeLease` vs `OwnerLock`），manager 内部数据结构也分开 |
-| autumn-rpc 没有 streaming → invalidation 通道改造大 | 实现周期长 | 用常驻 TCP + manager-buffer + client-poll 替代，autumn-rpc 不动 |
-
----
-
-## 8. 实施前置
-
-立项 Phase 1 之前需要确认：
-
-1. **autumn-rpc 长连接 / streaming 决定**：用常驻 poll 还是真 streaming？倾向 poll（小动作）。
-2. **manager etcd schema**：InodeLease 序列化用 rkyv 还是 prost？跟现有 `regions/` 对齐用 prost。
-3. **OpenReq 加 mode 字段**：wire 不兼容，需要 ring 协议 bump `RING_VERSION`。
-4. **fuse Phase 2 时是否同时升级 fuser 依赖**：`notify_inval_inode` 需要 fuser ≥ 某版本，确认现版本支持。
-
----
-
-## 9. 立项后的 feature 拆分（待 commit 进 feature_list.md）
-
-| Feature | 范围 | 验收 |
-|---------|------|------|
-| inode-lease 状态机 + RPC | manager 加 InodeLease + 4 个 RPC + etcd 持久化 | 单元测试 + 多客户端 acquire/release |
-| daemon 客户端 lease | ioring daemon Open/Close 接 lease | 两 daemon 并跑互斥写测试 |
-| invalidation long-poll 通道 | invalidation push 通道（常驻 poll） | writer close → reader 1s 内 invalidate |
-| close-to-open cache 失效 | OpenedExtents version 标记 + cache 失效 | e2e：两个 daemon 读写同 ino，cache 正确失效 |
-| fuse 挂载 lease | fuse open/release 接 lease | 与 ioring 互操作 |
-| fuse 内核 cache 失效 | fuse kernel cache invalidate (`notify_inval_inode`) | multi-host fuse mount 验证 |
-| force-revoke / writer revoke 抢占 | force-revoke + writer revoke 协议 | 抢占测试 |
+消费端还有两条派生规则：cache-stale 的读**必须先重载 extent 再服务**，否则返回
+EIO——绝不能拿 pre-close 的字节应付。

@@ -1217,6 +1217,20 @@ impl AutumnManager {
                 // failure + its code + the consecutive-failure count, so
                 // `ops status` shows a repair that is looping instead of
                 // converging. This is the reason recovery belongs in the ledger.
+                // The ledger carries STATE ("this repair is looping"), and it is
+                // a 256-entry in-memory ring that dies with the leader — so it
+                // cannot also be the record of what went wrong. Emit the EVENT
+                // to the leader log, where it is durable, greppable and
+                // alertable. Recovery backs off exponentially (cap 300 s), so
+                // this is at most one line per extent per 5 min.
+                tracing::warn!(
+                    extent_id,
+                    slot,
+                    consecutive_failures = consecutive,
+                    error_code = Self::err_to_code(e),
+                    error = %e,
+                    "recovery dispatch failed; will retry with backoff"
+                );
                 let (now_s2, now_ms) = Self::now_s_ms();
                 self.ops.borrow_mut().record_recovery_failure(
                     extent_id,
