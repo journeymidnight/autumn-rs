@@ -1,3 +1,29 @@
+Date: 2026-08-26 (s)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 读 compaction_output_vp_head,结果是【排除】。上轮的主要候选不成立,需要新思路。
+  【排除依据(读代码,非推断)】background.rs compaction_output_vp_head:
+     - 对每个 input vp_head,若其 extent 不在本分区 log_extent_ids 里 → `continue` 跳过该 input。
+       跳过任何 input 只会让 MAX 【不变或变小】(MAX 取最大),即起点【更早 = 更保守】,不会更靠后。
+     - 全部被跳过时的 fallback 是 `log_extent_ids.first()` + offset 0 —— 【最保守】的可能值。
+     - pos_by_eid 用 first-occurrence(`or_insert`),与 recovery 的 first_pos_by_eid 一致。
+     ⇒ 这个函数【不会】把 replay 起点推得太靠后。
+  【当前状态:F1+F4 的"起点太靠后"路径已全部排除】
+     已排除:(1) recover_partition 两处 chosen_pos 选择(都取最早 + 保守 fallback);
+             (2) compaction 的 vp_head MAX(本轮);
+             (3) 副本集合变化(replica_addrs_for_extent 不做健康筛选);
+             (4) truncate → last_synced 回退(统计上 0/12,已降级)。
+     ⇒ 【假设本身可能有问题】。"replay 起点太靠后"是从症状反推的,但四条可能来源都被排除,
+        说明要么漏了一条路径,要么 F4 的机制根本不是"replay 跳过"。
+  【下一轮建议:回到证据,别再沿着假设往下挖】
+     F4 的原始事实只有两条:(a) 丢的 key 全是 q*(= split 右孩子);(b) got_seq < expected_seq 32–432。
+     (b) 也可以由【右孩子读到了源分区的旧 SST 而非自己的新数据】解释 —— 不需要 replay 跳过:
+     例如右孩子的 tables/checkpoint 选择读到了 CoW 共享的【旧】SST 集合。
+     建议先查 recover_partition 选 checkpoint 的逻辑(读 meta_stream 最后一个非空 extent),
+     确认右孩子读到的是【它自己的】checkpoint 而不是源分区在 split 后又写的那个。
+Next steps:
+  1) 按上面的新方向查(checkpoint 选择,而非 replay 起点)。
+  2) F3 单独查 EC+VP 读链;3) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (r)
 TaskStatus: not_completed
 Task scope: 自主循环 —— F1+F4 用排除法收敛到【compaction 的 vp_head MAX】。产品代码未动。
