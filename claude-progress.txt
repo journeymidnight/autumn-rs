@@ -1,3 +1,29 @@
+Date: 2026-08-26 (o)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 【F1 与 F4 统一为同一根因方向】,搜索空间大幅缩小。产品代码未动。
+  【统一的依据(不是"都静默"这种弱依据)】
+    - chaos key = mem/b{000..199} + mem/q{000..199},共 400 个;split 用 at_key: None ⇒ PS 取【median】;
+      排序后 b* 全在 q* 之前,中位数正好落在两者交界 ⇒ 【q* 全部进右孩子】。
+    - F4 丢的 key 【全部是 q*】(w1 的 b* 一个没碰)⇒ 丢失发生在【split 右孩子】。
+    - F1 的 wedge 发生在 part 22,也是【split 右孩子】。
+    ⇒ 两者是【同一位置 + 同一机制维度】的连续谱,而不只是"都静默":
+        replay 起点超出 extent 末尾 → 读越界 → wedge(F1)
+        replay 起点仍在 extent 内但太靠后 → 跳过中间一段 → 丢最后的写(F4)
+      F4 的 got_seq 比 expected 小 32–432,正是"从太靠后的位置开始 replay"的表现。
+  【与 F3 的区别仍然保持】F3 仅 VP(kid 全为 8 的倍数)、读不到、持久 —— 不并入本条。
+    合并 F1/F4 的依据是同一位置+同一维度;F3 缺这个依据,别再重蹈之前把不同失败混为一谈的覆辙。
+  【方向反转】此前一直在问"seal 为何短于 vp";现在应反过来问【右孩子继承的 checkpoint vp 为何会超过 seal】。
+    右孩子的 checkpoint 来自 duplicate 出来的 meta_stream(即源分区的 checkpoint)。
+    需要查的三点:
+      (a) split 的 flush_memtable_locked 与 commit_length 捕获之间,vp 是否还能前进;
+      (b) duplicate_stream 对 meta_stream 的 seal 是否可能切掉【最新】checkpoint,让右孩子读到旧的;
+      (c) 右孩子 open 时 recover_partition 选 chosen_pos 的逻辑(first_pos_by_eid)在 CoW 共享 extent 下是否正确。
+  【统计】19+6=25 次运行:F1×1 F2×2 F3×1 F4×1 reclaim×1,其余 ok。单模式 ~1/25 ⇒ 不再靠 hunt。
+Next steps:
+  1) 按上面 (a)(b)(c) 读代码;这条不需要复现就能推进,且 F1+F4 合起来占 2/25,是最值得修的。
+  2) 修 get 的 GC-pin false-NotFound(独立、明确、低风险)。
+  3) F3 单独查 EC+VP 读链;F2 改 EC marker 断言;评审剩余 P1。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (n)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 新标签跑 6 次;F3 未命中(累计 1/19),但抓到【第四种失败 F4:acked 写的 lost update】。产品代码未动。
