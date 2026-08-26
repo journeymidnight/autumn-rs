@@ -1,3 +1,32 @@
+Date: 2026-08-26 (n)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 新标签跑 6 次;F3 未命中(累计 1/19),但抓到【第四种失败 F4:acked 写的 lost update】。产品代码未动。
+  【F4(新,最严重的一类)】f3run2:mismatches=22,读到的是【旧版本】而不是读不到。
+     证据(scratchpad/f3_2.log):
+       mem/q000185 expected seq=4797 got seq=4653;q000007 4859→4515;q000131 4775→4343 …
+       got seq 【永远小于】expected seq(差 32–432)。
+     【两个强模式】
+       (a) 全部是 `q` 前缀 —— 只有 writer w2 的 key,w1 的 `b*` 【一个都没有】⇒ 按 writer/分区聚集,不是随机。
+       (b) kid 【不是】8 的倍数为主(185/7/158/100/131/117/125/88/166/52 混合)
+           ⇒ 与 F3 不同,【不是 VP 专属】,普通小值也丢。
+     序列:LatencySpike → FenceUnfence → Split → SIGKILL+restart node 1。
+     chaos 只把 CODE_OK 记进 expected ⇒ 这些是【确认过的写】被丢回旧版本 = acked-write loss。
+     且 "no fail-loud markers in any EN log" —— 又是静默。
+  【F3 vs F4 的区别要保持清楚,别再合并】
+     F3:仅 VP(kid 全为 8 的倍数)、读不到、持久。
+     F4:混合大小值、读到旧值、按 writer 聚集。
+     两者共同点只有"静默 + acked 丢失",机制很可能不同。
+  【运行统计(19 次累计)】F1 stale_vp 1 次;F2 EC marker 2 次;F3 VP not_found 1 次;
+     F4 mismatch 1 次;reclaim_errors 1 次;其余 ok。
+     ⇒ 单个失败模式都 ~1/19,靠 hunt 撞见效率很低;应转向【代码可读】的路径。
+Next steps:
+  1) F4 优先级最高(acked 写读回旧值 = 最直接的正确性破坏)。入手:全部是同一 writer 的 key,
+     且序列含 Split + SIGKILL ⇒ 查 split 后新分区的 WAL replay 是否丢了最后一段
+     (与 F1 的 vp/seal 方向可能同源)。b* 与 q* 落在 split 的不同侧是关键线索:
+     先确认 split 的 mid_key 是否恰好把 q* 分到新分区。
+  2) 修已定位的 get GC-pin false-NotFound(rpc_handlers.rs get_value_inner)——独立、明确、低风险。
+  3) F1 转查 vp 侧;F2 改 EC marker 断言;评审剩余 P1。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (m)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 发现 chaos 的 not_found 是【折叠过的】,已修诊断(commit ed74e12)。产品代码未动。
