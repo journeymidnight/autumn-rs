@@ -87,10 +87,18 @@ paths); `--manager`-less offline/test runs are exempt. HOST must be an IP — th
 binary stays DNS-free, the shell resolves names.
 
 - The advertise PORT is shard 0's port **as seen by peers**. It normally equals
-  `--port`; a difference is accepted with a WARN (NAT/proxy case) and the
-  REGISTERED ports derive from the advertise port: `advertise_port + i*stride`
-  (stride default 10) for data, `advertise_port + 1000 + i*stride` for control.
-  The BIND ports still derive from `--port`, so the two differ behind a proxy.
+  `--port`; a difference is accepted with a WARN (NAT/proxy case), and the
+  REGISTERED `shard_ports` derive from the advertise port
+  (`advertise_port + i*shard_stride`, stride default 10) while the BIND ports
+  derive from `--port` — the two differ only behind a proxy.
+- The registered `control_address` is a SINGLE address,
+  `advertise_host:(advertise_port + 1000)` = shard 0's control port, because the
+  manager's df dials shard 0 only. Locally each shard binds
+  `control_port_base + i*shard_stride`, where `control_port_base` is
+  `--control-port` or `--port + 1000`. Under UCX the registered
+  `control_address` is EMPTY (a second `ucp_listener` on the same RoCE device
+  can't bind, so control RPCs ride the data listener and df falls back to the
+  data addr); TCP keeps a separate control port for head-of-line isolation.
 - Registration runs where `verify_manager_cluster_id` runs: on shard 0's compio
   runtime, before the shards serve. `read_node_identity` → the pure
   `build_register_req` → `register_with_manager`.

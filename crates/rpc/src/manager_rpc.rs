@@ -2103,7 +2103,7 @@ pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 // admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
 // admin-token gated — same posture as MSG_TENANT_CREATE/DELETE). The registry is
 // the authoritative source for D7 Layer-A (writes must fall in a registered
-// namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md §7.1.
+// namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md.
 pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
 pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
 // admin → manager (leader-gated): list the full registry (rich rows). The 5 s
@@ -2498,7 +2498,7 @@ pub struct TenantDeleteReq {
 /// leader failover. Modelled on `MgrTenantAccount` (string-keyed etcd prefix +
 /// rkyv + fail-loud replay). Registry granularity = top-level family (`fs/` is
 /// ONE row, not one per volume — the app owns the sub-structure; Layer-A only
-/// checks top-level membership). See docs/key_namespace_split_design.md §3.7③.
+/// checks top-level membership). See docs/key_namespace_split_design.md.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrNamespace {
     /// Namespace name (`[a-z0-9._-]+`, single path segment). The etcd key is

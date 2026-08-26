@@ -110,7 +110,7 @@ impl std::error::Error for AutumnError {}
 /// prefixing — for admin / cross-namespace tooling — but the PS still enforces
 /// Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never authorization.
 /// (Historical: tenant-first `{tenant}/{ns}/` and pre-that `{ns}/{tenant}/` were
-/// retired 2026-07-19 — see docs/key_namespace_split_design.md §8.)
+/// retired 2026-07-19 — see docs/key_namespace_split_design.md.)
 #[derive(Clone, Debug)]
 pub enum NamespaceBinding {
     Scoped {

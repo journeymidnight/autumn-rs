@@ -74,7 +74,7 @@ namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个
 `extent::flush_appends` 的 append keys，为性能直调 `get_many_*`/`put_many_fenced`
 绕过 `kv_*`）同样交裸 `key::*`——client 一处 prepend，与元数据路径一致。授权 =
 `principal-create --grant fs/` + `--credential-file`（principal 名在文件里，authz
-开了就整个 `fs/` 受保护）。详见 docs/key_namespace_split_design.md §8。
+开了就整个 `fs/` 受保护）。详见 docs/key_namespace_split_design.md。
 
 ### 变长 extent
 

@@ -121,7 +121,7 @@ pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 /// (`namespace/<name>` → rkyv'd `MgrNamespace`). Replayed on leader failover;
 /// mutated only via the admin namespace-create/delete RPCs. The three built-in
 /// families (`fs`/`kvc`/`mem`) are CAS-preregistered on first leader promotion
-/// (`seed_builtin_namespaces`). See docs/key_namespace_split_design.md §3.7③.
+/// (`seed_builtin_namespaces`). See docs/key_namespace_split_design.md.
 pub const NAMESPACE_PREFIX: &str = "namespace/";
 
 /// D2: the built-in namespace families, CAS-preregistered by the first
