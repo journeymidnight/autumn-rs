@@ -1,3 +1,33 @@
+Date: 2026-08-26 (t)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 换方向后立刻找到一个【贴合全部证据】的新假设:checkpoint union 把旧 SST 带进右孩子。
+  【机制(读代码得到,尚未验证是否真的出错)】
+     recover_partition 不是"读最后一个 checkpoint",而是调用 read_all_table_locations:
+     它遍历 meta_stream 的【每一个】非空 extent,各取【最后一条】TableLocations,然后【union】。
+     注释写明这是为 post-merge 设计的:拼接后的 stream 含两个 source 的 meta extent,
+     只读最后一个会丢掉一半 table set。
+     但【split 右孩子也走这条路径】:它的 meta_stream = CoW 共享的旧 extent + 自己新 alloc 的 tail。
+     ⇒ union 会把【源分区的旧 checkpoint】与【右孩子自己的新 checkpoint】合并,
+       于是加载【两套 SST】,其中包含已被 compaction 淘汰的旧 SST。
+     而 get 的查找是 "newest first"(sst_readers 逆序);若 union 后的排序把旧 SST 当成更新的,
+     读到的就是【旧版本】。
+  【为什么它比之前的假设更好:同时解释 F4 的两条原始事实】
+     (a) 只有 q* 受影响 —— 旧 SST 是源分区的,右半边(q*)的数据在其中是 split 时刻的旧版本;
+     (b) got_seq < expected_seq(落后 32–432)—— 正是"读到旧 SST 里的旧版本"的表现,
+         【不需要】replay 跳过(上一轮已把 replay 起点的所有来源排除)。
+     也与 F1 相容:union 进来的旧 checkpoint 带着旧 vp,可能指向已被 split seal 截断的位置 ⇒ stale_vp。
+  【下一步验证(具体、可做)】
+     1. 看 union 之后 tables / sst_readers 的【排序依据】(按 seq_num? 按 extent 位置?),
+        确认旧 SST 会不会排在新 SST 之后(= 被当成更新的)。
+     2. 确认 split 的 duplicate_stream 是否给右孩子 seal 了共享 meta tail;
+        若 seal 了,右孩子读到的旧 checkpoint 是 split 之前的(应当是正确的基线),
+        那问题就在【union 的排序】而非"读到了不该读的记录"。
+     3. 若确认,最小修法方向:union 只对【post-merge】的多 source 场景成立;
+        split 右孩子应只取属于自己的那一份,或按 seq_num 正确排序后去重。
+Next steps:
+  1) 按上面 1-2 验证;这条不需要复现,读代码即可。
+  2) F3 单独查 EC+VP 读链;3) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (s)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 读 compaction_output_vp_head,结果是【排除】。上轮的主要候选不成立,需要新思路。
