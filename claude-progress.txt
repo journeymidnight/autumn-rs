@@ -1,3 +1,27 @@
+Date: 2026-08-26 (p)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 【修掉本 session 唯一一个已确诊未修的 bug】:get 的 GC-pin false-NotFound。
+  【为什么可以直接修,不违反 reproduce-first】这不是从现象推断出来的机制假设,
+     而是代码里明写着 `return Ok(GetOutcome::NotFound)`,与【同一个文件】里
+     sst_lookup_paged_retry 的注释 "a real read error ... NEVER a false NotFound" 直接冲突。
+     确定性问题,读得出来,不需要复现。
+  【修法与依据】GC 持 writer pin 只说明 punch 即将发生,【不说明这个值没了】——
+     relocate-then-punch 保证 live 值先被重定位,所以 live key 的字节要么还在原处、要么已重写到别处。
+     原注释自称 "the client falls back / retries",但 NotFound 对客户端是【终态】,做不到它宣称的事。
+     改为 StatusCode::Unavailable → 客户端映射成 AutumnError::ConnectionError = 【可重试】;
+     pin 只在 punch 期间持有,重试要么读到原字节、要么读到重定位后的 VP。
+  【测试】新增单测钉住让该分支可达的前提:writer pin 持有时 reader 被拒、释放后恢复。
+     若这个前提哪天不成立,Unavailable 分支就成了死代码,被它替换掉的 false-NotFound 可能悄悄回来。
+  门:ps lib 208(新增 1)、system_gc_multiversion_same_extent、system_split_forcegc_stale_cache、
+     system_gc_inflight_wal_put、system_chaos(--ignored)全绿。
+Next steps(未变,按价值):
+  1) F1+F4(split 右孩子 replay 起点,2/25):读 (a) split flush 与 commit_length 捕获之间 vp 能否前进;
+     (b) duplicate_stream 对 meta_stream 的 seal 是否让右孩子读到旧 checkpoint;
+     (c) CoW 共享 extent 下 recover_partition 的 chosen_pos/first_pos_by_eid 是否正确。
+  2) F3 单独查 EC+VP 读链(仅 VP、读不到、持久)。
+  3) F2 改 EC marker 断言(带 coordinator 状态 + age 门限)。
+  4) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (o)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 【F1 与 F4 统一为同一根因方向】,搜索空间大幅缩小。产品代码未动。

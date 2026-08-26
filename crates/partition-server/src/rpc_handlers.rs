@@ -691,11 +691,28 @@ async fn get_value_inner(
         match crate::acquire_reader_pin(pin) {
             Some(g) => Some(g),
             None => {
-                // GC has acquired the writer pin on this extent — the bytes
-                // are about to be deleted. Surface as NotFound rather than
-                // racing the punch_holes RPC.
+                // GC holds the writer pin on this extent. That means a punch is
+                // imminent — it does NOT mean this value is gone: GC relocates
+                // every live in-range value BEFORE punching (relocate-then-
+                // punch), so a live key's bytes are either still here or already
+                // rewritten elsewhere.
+                //
+                // This used to answer NotFound, which the comment justified as
+                // "the client falls back / retries". It cannot: NotFound is
+                // terminal on the client, so a live key read during a GC window
+                // came back as absent — a false miss, exactly what
+                // `sst_lookup_paged_retry` in this file refuses to produce.
+                // Unavailable maps to a RETRYABLE client error, and the pin is
+                // held only for the length of the punch, so the retry finds
+                // either the original bytes or the relocated VP.
                 record_read(0, false, 0);
-                return Ok(GetOutcome::NotFound);
+                return Err((
+                    StatusCode::Unavailable,
+                    format!(
+                        "extent {} is being reclaimed by GC; retry",
+                        vp.extent_id
+                    ),
+                ));
             }
         }
     } else {
@@ -2029,5 +2046,49 @@ mod map_storage_error_tests {
         assert_eq!(code, StatusCode::FailedPrecondition);
         assert!(msg.contains("extent=7"));
         assert!(msg.contains("sealed_length=80"));
+    }
+}
+
+#[cfg(test)]
+mod gc_pin_read_outcome_tests {
+    use crate::{acquire_reader_pin, try_acquire_writer_pin};
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicI64;
+
+    /// The read path asks for a reader pin before resolving a ValuePointer, and
+    /// gets `None` exactly while GC holds the writer pin. What it does with that
+    /// `None` is the whole question: answering NotFound tells the client the key
+    /// does not exist, which is terminal and wrong — GC relocates every live
+    /// value before punching, so a live key is either still in place or already
+    /// rewritten. `get_value_inner` now returns Unavailable, which the SDK maps
+    /// to a retryable error.
+    ///
+    /// This pins the precondition that makes that branch reachable at all: a
+    /// held writer pin denies readers, and releasing it lets them back in. If
+    /// this ever stops holding, the Unavailable branch is dead code and the
+    /// false-NotFound it replaced could quietly return.
+    #[test]
+    fn a_held_writer_pin_denies_readers_until_released() {
+        let pin = Rc::new(AtomicI64::new(0));
+        assert!(
+            acquire_reader_pin(pin.clone()).is_some(),
+            "an idle extent must serve reads"
+        );
+
+        assert!(try_acquire_writer_pin(&pin), "GC takes the writer pin");
+        assert!(
+            acquire_reader_pin(pin.clone()).is_none(),
+            "while GC holds it the read path gets None — the branch that used to \
+             answer a false NotFound"
+        );
+
+        // Release the way GC does, then readers must be admitted again: this is
+        // why Unavailable-and-retry is the correct answer rather than a
+        // terminal miss.
+        pin.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            acquire_reader_pin(pin).is_some(),
+            "after the punch completes the retry must succeed"
+        );
     }
 }
