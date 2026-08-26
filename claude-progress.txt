@@ -1,3 +1,32 @@
+Date: 2026-08-26 (d)
+TaskStatus: not_completed
+Task scope: /loop ②op 可观测性【第一层 live 进度已完成 commit d2bfe8b;第二三层未做】。
+  ②-1【DONE:live 状态带进度】
+     数据本来就在(run_gc 每 chunk 有 cur vs sealed_length),只是从没离开过 partition。
+     链路:PS 在自己的循环里发样本 → 搭 PartitionLoad 心跳(与终态 ring 并列)→ manager 折进 ledger →
+     autumn-op ops 渲染。
+     【关键设计决定】用【原始计数】不是百分比,遵循 cluster-df 既有规则(wire 传事实,消费端算比例):
+     光给 "50%" 分不清"2 张表"还是"50 GB",而运维要判断等不等得起,需要量级。
+     CLI 按 kind 用对单位(gc/forcegc 是字节、compact 是表数)——给字节印 "3/8" 或给表数印 "3.0 MB" 都误导。
+     【progress 是样本不是累加器】,由此决定实现:每 chunk(64MiB)一把短锁而非每条记录;
+     单槽而非 ring(过期样本无价值 ⇒ 丢一次心跳零代价、无需重传);update_progress 只碰 RUNNING
+     (PS 每次心跳重发 outcome ring,样本可能【晚于】自己 op 的终态到达,不能重开已关闭的 op
+     或复活被 cap 淘汰的);同一心跳里先应用样本再应用终态;record_maint_outcome(所有终态出口的
+     唯一必经处)清槽,避免已完成的 op 永远显示在飞。
+     wire 指纹就地刷新(v29 未部署)。门:rpc 60 / manager 289 / ps 207 + 4 个集成 + chaos 全绿。
+  ②-2【TODO:终态日志入 etcd + rotate】
+     现状缺口:ledger 是 cap256 内存环 + leader 换即失;audit log 虽在 etcd(90 天)但只存
+     `result_code: 0/1`,error 全文在调用点就丢(rpc_handlers.rs 的 append_audit 处)。
+     要做:终态记录(含 error 全文 + progress 终值)写 etcd,按条数/时间 rotate。
+  ②-3【TODO:dashboard 走 RPC 向 leader 要】
+     dashboard 是 standalone、只 shell 到 autumn-op,拿不到 leader 日志文件 ⇒ 必须走 RPC。
+     要么扩 MSG_OP_QUERY,要么新增 op-log 查询 RPC(leader-gated)。
+Next steps:
+  1) 做 ②-2:先定 etcd key 形状(参考 mgr_audit_log/<ts_ns>_<seq> 的既有模式)与 rotate 策略,
+     再决定是扩 audit entry 还是另开 opLog/ 前缀。倾向另开——audit 是"谁做了什么"的操作审计,
+     op 终态是"这次跑成什么样",两者保留期与消费者都不同。
+  2) 再做 ②-3。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (c)
 TaskStatus: not_completed
 Task scope: /loop ①corrupt replica【已修复并验证】 ②op 可观测性【未开始】。
