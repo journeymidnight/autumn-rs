@@ -39,21 +39,6 @@ Next steps（按价值排序，都不是本轮引入的）：
   2) chaos 的失败原因现在看得见了，剩下两类值得追：41 次 "key is out of range"（split 后 SDK 路由没刷新，
      本该自愈）、4 次 "PS rejected: code=7"。都被 workload 容忍，但都不该稳定出现。
   3) 评审剩余未处理项：EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
-  4) GC P0-2（GC 重定位 seq vs 并发 flush 的 SST）——【机制已坐实，未复现，未修】。
-     四点硬结论（读代码/既有测试自述，非推断；重查很贵，别再走一遍）：
-       a. replay 去重的 soundness 论证【明确且唯一】建立在 FuturesOrdered 上（recover_partition 注释原文）。
-       b. GC 从同一个 p.seq_number 取号却跑在 background_maintenance_loop 上，不在那条流水线里：
-          flush_gc_batch 分配 seq → append_segments().await → 才 insert_batch。
-       c. 去重 `if ts <= extent_dedup { continue; }`（lib.rs:8446）对 GC 记录无豁免。
-       d. replay-floor guard 不构成防护（system_gc_inflight_wal_put 注释自述 flush 会把
-          durable_ckpt_vp 推过该 extent）；丢的是 replay 窗口【内】的 GC 记录，死于 dedup 而非 punch。
-     两次尝试都卡在【触发方式】而非机制：
-       - 进程内 PS + GC pause hook：hook 能用，但 in-process PS 停不掉（非 stoppable 永不退出会争
-         owner_epoch 把接管方 wedge 死；stoppable 的 graceful drain 会 flush，正好掩盖 bug）。
-       - 子进程 PS（本轮交付的 killable harness）：能真崩溃，但进程内静态 hook 对子进程无效。
-     ⇒ 这两条互斥。下一轮要么给窗口找一个跨进程的触发方式（如用 toxiproxy 拖慢 GC append 所走的
-        EN，chaos 已有这套设施），要么接受概率性触发（放大 GC batch 让 append 变长）并多次运行。
-     按 house rule【复现不出来就不修】：GC seq 逻辑至今一行未动。
 ─────────────────────────────────────────────────────────────
 Date: 2026-08-25
 TaskStatus: completed
