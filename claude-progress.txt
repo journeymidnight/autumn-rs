@@ -1,3 +1,41 @@
+Date: 2026-08-26 (h)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 给上轮记的"chaos 间歇失败"建立频率并分类。【本轮未改产品代码】,只跑测试+记录。
+  3 次运行 2 次失败,但【是两个完全不同的失败】,之前把它们混为一谈了:
+  【A. 严重 — 真问题,未修】run1:split 右孩子打不开 → 200/400 key 读不到
+     证据(日志留在 scratchpad/chaos_freq_1.log,seed=1787741844459):
+       nemesis: FenceUnfence OK — fence+unfence node 1
+       nemesis: Split OK — split part 9001
+       → partition thread failed: recover_partition: failed to read extent 12 after 10 attempts:
+         stale_vp_offset_past_sealed_length: extent=12 offset=8946242 length=67108864 sealed_length=5372990
+       → verify: ROUTE FAILED key=... part_id=22 — no part_addr, marking partition wedged
+       → per-key verify: total=400 mismatches=0 not_found=200
+     part 22 是 split 出的【右孩子】。右孩子继承源分区 duplicate 出来的 meta_stream checkpoint,
+     那个 checkpoint 的 vp_offset=8946242;而 split 把 log tail seal 在 commit_length=5372990。
+     ⇒ replay 起点【超过】seal 长度 ⇒ 右孩子永远打不开。
+     与 memory 里 project_split_underseal_vp_past_sealed 【同型但不同】:那条的根因是
+     apply_reset_tail 清零 commit 导致 seal(0),已修;这次 sealed_length 非 0,是 seal 短于 checkpoint 的 vp。
+     待验证的假设:FenceUnfence 之后该副本仍算 committed member 但数据落后,split 捕获 commit_length
+     取 min 时被它拉低 ⇒ seal 短于已 flush 并 checkpoint 的 vp。
+     【注意】按理 all-replica-ACK + flush 的 await_log_synced_to 屏障应保证 checkpoint 的 vp 在所有副本 durable,
+     所以 commit_length 不该低于它 —— 这个矛盾正是下一步要查的点。
+  【B. 轻微 — 疑似测试太严,非产品 bug】run3:EC marker 钉 43s,数据完好(not_found=0)
+       inflight: op ... kind=7 target=0/12 still ACTIVE attempts=0 last_error=""
+       nemesis 序列:EcConvert OK — ec submit extent 12 → LatencySpike en-0 (node 1) +500ms
+     attempts=0 + last_error="" ⇒ dispatch 从没失败过,也没完成。EC dispatch 会【跳过】状态为
+     Suspected/Fenced/Maintenance/Suspend 的 coordinator(设计如此,避免 flap 期刷日志),
+     而 latency spike 正打在 node 1 上会让它 df 超时转 Suspected ⇒ 合理地不派发。
+     但 verify_no_ec_markers_pinned 是"只要有 marker 就报错",不看 age、不看 coordinator 状态
+     ⇒ 一个正在健康等待的 convert 也会被判失败。
+Next steps:
+  1) 查 A(严重):先确认矛盾点 —— checkpoint 的 vp 明明有 await_log_synced_to 屏障保证 all-replica durable,
+     为什么 split 捕获的 commit_length 会低于它?看 handle_multi_modify_split 的 commit_length 捕获
+     与 compute_commit_seal 的成员筛选(recovering_nodes_for_extent 是否把刚 unfence 的节点排除)。
+     复现脚本:直接重跑 system_chaos --ignored,约 1/3 命中;命中标志是日志里出现 stale_vp_offset。
+  2) 改 B 的断言:让 verify_no_ec_markers_pinned 带上 coordinator 状态与 age 门限,
+     区分"卡住"和"合理等待一个 flapping coordinator"。
+  3) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (g)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 清掉台账 next steps 的 #1 和 #2,并发现一个新的间歇失败。
