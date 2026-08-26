@@ -1646,6 +1646,8 @@ async fn verify_per_key(
             continue;
         }
         let mut got: Option<Vec<u8>> = None;
+        // Last non-OK answer seen, so an exhausted retry loop can say WHY.
+        let mut last_status: Option<(u8, String)> = None;
         for _attempt in 0..10 {
             // try_client_for never panics (vs `client_for` which does
             // after AUTUMN_TEST_ROUTER_RETRIES exhausted). If routing
@@ -1704,8 +1706,15 @@ async fn verify_per_key(
                         got = Some(r.value);
                         break;
                     }
-                    Ok(_) => {}
-                    Err(_) => {}
+                    // Keep WHY the read did not succeed. Folding every non-OK
+                    // code into the same silent retry means a key that the PS
+                    // reported an ERROR for (a VP whose log_stream read failed,
+                    // a stale eversion, a precondition) is reported below as
+                    // "not_found" — indistinguishable from the key genuinely
+                    // not existing, which sends the next investigation after
+                    // the wrong mechanism entirely.
+                    Ok(r) => last_status = Some((r.code, r.message)),
+                    Err(e) => last_status = Some((255, format!("undecodable GetResp: {e}"))),
                 },
                 Err(_) => {
                     compio::time::sleep(Duration::from_millis(300)).await;
@@ -1726,7 +1735,21 @@ async fn verify_per_key(
                     got_seq
                 ));
             }
-            None => not_found.push(String::from_utf8_lossy(key).into_owned()),
+            None => not_found.push(match &last_status {
+                // A real miss: the PS answered NOT_FOUND, the key is absent.
+                Some((c, _)) if *c == partition_rpc::CODE_NOT_FOUND => {
+                    String::from_utf8_lossy(key).into_owned()
+                }
+                // Anything else is a READ FAILURE wearing a miss's clothes.
+                Some((c, m)) => format!(
+                    "{} [read failed: code={c} {m}]",
+                    String::from_utf8_lossy(key)
+                ),
+                None => format!(
+                    "{} [no response — wedged/timeout]",
+                    String::from_utf8_lossy(key)
+                ),
+            }),
         }
     }
     (total, mismatches, not_found)
