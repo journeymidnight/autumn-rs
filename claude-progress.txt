@@ -1,3 +1,33 @@
+Date: 2026-08-26 (k)
+TaskStatus: not_completed
+Task scope: 自主循环 —— 13 次 chaos 统计,把"间歇 flaky"分解成【三种不同的失败】。未改产品代码。
+  【累计 13 次运行的分类】(日志在 scratchpad/{chaos_freq_,chaos_tr_,hunt_}*.log)
+    F1 stale_vp → split 右孩子 wedge → 200/400 key 丢 —— 1/13
+       序列:FenceUnfence node1 → Split。extent=12 offset=8946242 sealed_length=5372990。
+    F2 EC marker 钉住(43s)→ 数据完好 not_found=0 —— 2/13
+       序列:EcConvert → LatencySpike on coordinator's node。疑似断言太严(EC dispatch 本就跳过
+       Suspected/Fenced coordinator),非产品 bug。
+    F3【最严重】静默丢 24 个【已 ack】的 key —— 1/13
+       序列:LatencySpike → FenceUnfence → EcConvert extent 12 → SIGKILL+restart node 1。
+       `writes acked=10456 failed=0`(零写失败!)、无 wedge、无 EC marker、
+       【no fail-loud markers in any EN log】——每一层都以为自己没事。
+  【负面证据:上轮的 truncate 假设被削弱】加了 truncate warn 之后跑了 12 次,
+     【trunc_warn = 0/12】。若 F1 依赖 truncate(truncate 是该链条的必要条件),
+     truncate 的频率应 >= stale_vp 的频率;实测 truncate 更罕见 ⇒ 削弱"truncate→last_synced 降低→seal 短"这条解释。
+     【严格说】F1 那次(run1)是在加日志【之前】跑的,所以它没有 trunc_warn 只能说明日志不存在,
+     不能直接证明那次没发生 truncate。这是统计论证不是证明,但足以把它降级为次要假设。
+  【矛盾仍未解决】flush 屏障保证所有副本 last_synced >= vp;commit_length 返回 last_synced;
+     append 在 EN fsync 之后才返回 ⇒ min last_synced >= vp。那 seal 为何会短于 vp,目前【无解释】。
+     若 truncate 不是原因,则问题在 vp 侧:checkpoint 记了一个不该记的 vp。
+Next steps(按严重性重排):
+  1) 【F3 优先】acked 写丢失 + 完全静默,比 F1 更严重(F1 至少 fail-loud 了)。
+     入手点:EcConvert + 杀 coordinator/participant 的交互。先在 EC 的 apply/读路径找"静默"的位置
+     ——本项目反复出现的模式是【破坏性操作没留痕】(已修过 EC fence 静默、truncate 静默)。
+  2) F1:改查 vp 侧。给 checkpoint 写入(save_table_locs_raw)加一条记录 vp 的日志,
+     命中时可与 seal 长度对照,判断是 vp 记错还是 seal 记错。
+  3) F2:改 verify_no_ec_markers_pinned 断言(带 coordinator 状态 + age 门限),把它从失败降级为信息。
+  4) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (j)
 TaskStatus: not_completed
 Task scope: 自主循环 —— split 右孩子 wedge(A)的【机制链已完整打通,只差"谁发的小 commit"】。未改产品代码。
