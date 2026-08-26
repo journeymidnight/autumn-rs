@@ -824,10 +824,28 @@ failure reason the fire-and-forget maintenance ops used to drop.
   Succeeded|Failed`, plus a synthesized `Unknown` — the honest answer for an
   unknown/old id after a leader change (never a false `Running`). `op_id =
   (epoch_ms<<16)|seq16` (non-zero — `0` is the query "list" sentinel).
-- **NOT etcd-persisted** — orchestration crash-safety already lives in the fenced
-  split/merge txns + EC inflight markers; the ledger is pure observability.
-  Durable terminal history rides the existing **audit log** (`AUDIT_OP_*` 7..12;
-  ec reuses `AUDIT_OP_FORCE_EC_CONVERT`), so post-failover forensics survive.
+- **The LEDGER is not etcd-persisted** — orchestration crash-safety already
+  lives in the fenced split/merge txns + EC inflight markers; the ledger is pure
+  live state.
+- **Durable terminal history is `op_log.rs`** (`opLog/<ts_ns>_<seq>` → the
+  `OpRecord` itself, so history decodes into exactly what `ops status`
+  renders). This is SEPARATE from the audit log on purpose: audit answers "who
+  asked for what", is written for every admin RPC, keeps 90 days, and stores
+  only `result_code: 0/1` — the error text is discarded at its call site. Op
+  history answers "how did this run turn out" and must carry the reason.
+  Every terminal transition queues its record synchronously
+  (`queue_terminal`, reached from all five terminal paths via `finish` /
+  `reconcile_outcome` / `complete_by_extent`); an async caller drains the queue
+  (`flush_op_log`) so the etcd write never sits inside a `borrow_mut`. Drained
+  from the PS load heartbeat right AFTER the outcome loop (so a completion is
+  durable without waiting a heartbeat) and from the policy tick as a backstop
+  for kinds no PS reports (recovery, ec-convert).
+  **Rotation is by COUNT** (`OP_LOG_CAP`), amortised one sweep per
+  `OP_LOG_GC_EVERY` writes: op volume tracks cluster activity rather than the
+  clock, so a time window bounds it badly in both directions — a quiet week
+  keeps nothing, a compaction storm writes more in an hour than anyone will page
+  through. Best-effort like audit: failing an op because its history could not
+  be written would turn an observability gap into an outage.
 - **Terminal reporting split**: manager-orchestrated kinds (split/merge/rebalance)
   close their entry in-process on return; **PS-executed kinds (compact/gc/forcegc)
   stay Running and are closed by the load heartbeat** — the PS records a

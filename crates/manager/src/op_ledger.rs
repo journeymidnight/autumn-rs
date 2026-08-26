@@ -33,9 +33,28 @@ pub(crate) struct OpLedger {
     /// newest at the front.
     entries: VecDeque<OpRecord>,
     seq: u16,
+    /// Terminal records not yet written to durable history (see `op_log`).
+    pending_log: Vec<OpRecord>,
 }
 
 impl OpLedger {
+    /// Terminal records awaiting a write to durable history. Filled
+    /// synchronously wherever an op goes terminal, drained by an async caller —
+    /// so the ledger stays a plain synchronous structure and the etcd write
+    /// never sits inside a `borrow_mut`.
+    pub(crate) fn drain_pending_log(&mut self) -> Vec<OpRecord> {
+        std::mem::take(&mut self.pending_log)
+    }
+
+    /// Queue `op_id`'s current record for history, if it is terminal.
+    fn queue_terminal(&mut self, op_id: u64) {
+        if let Some(e) = self.entries.iter().find(|e| e.op_id == op_id) {
+            if e.state != OP_STATE_RUNNING && e.state != OP_STATE_PENDING {
+                self.pending_log.push(e.clone());
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -136,6 +155,7 @@ impl OpLedger {
         message: String,
         now_s: i64,
     ) {
+        let mut went_terminal = false;
         if let Some(e) = self.find_mut(op_id) {
             if Self::is_active(e.state) {
                 e.state = state;
@@ -147,7 +167,11 @@ impl OpLedger {
                 if e.started_at == 0 {
                     e.started_at = now_s;
                 }
+                went_terminal = true;
             }
+        }
+        if went_terminal {
+            self.queue_terminal(op_id);
         }
     }
 
@@ -163,6 +187,7 @@ impl OpLedger {
         message: String,
         now_s: i64,
     ) -> bool {
+        let mut moved = false;
         if let Some(e) = self.find_mut(op_id) {
             if Self::is_active(e.state) {
                 e.state = state;
@@ -174,10 +199,13 @@ impl OpLedger {
                 if e.started_at == 0 {
                     e.started_at = now_s;
                 }
-                return true;
+                moved = true;
             }
         }
-        false
+        if moved {
+            self.queue_terminal(op_id);
+        }
+        moved
     }
 
     /// Close the extent-scoped entry of `kind` whose target extent matches.
@@ -192,6 +220,7 @@ impl OpLedger {
         error: String,
         now_s: i64,
     ) {
+        let mut closed = None;
         if let Some(e) = self.entries.iter_mut().find(|e| {
             e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state)
         }) {
@@ -205,6 +234,10 @@ impl OpLedger {
             if e.started_at == 0 {
                 e.started_at = now_s;
             }
+            closed = Some(e.op_id);
+        }
+        if let Some(id) = closed {
+            self.queue_terminal(id);
         }
     }
 
@@ -549,6 +582,45 @@ mod tests {
         assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
         led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1); // past TTL
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn terminal_records_are_queued_for_history_exactly_once() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+        assert!(
+            led.drain_pending_log().is_empty(),
+            "a RUNNING op has no history to write yet"
+        );
+
+        assert!(led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 5));
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].op_id, id);
+        assert_eq!(
+            queued[0].error, "boom",
+            "history must carry the error text the ledger ring would later evict"
+        );
+
+        // Draining is destructive, so a second flush writes nothing again.
+        assert!(led.drain_pending_log().is_empty());
+
+        // A heartbeat retransmit of the same outcome is a no-op and must not
+        // queue a duplicate history record.
+        assert!(!led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 6));
+        assert!(led.drain_pending_log().is_empty());
+    }
+
+    #[test]
+    fn extent_keyed_completions_are_queued_too() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_RECOVERY, 0, 77, vec![], "auto".into(), 0, 0);
+        led.set_running(id, 0);
+        led.complete_recovery(77, "rebuilt".into(), 9);
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1, "recovery closes by extent id, not op id");
+        assert_eq!(queued[0].state, OP_STATE_SUCCEEDED);
     }
 
     #[test]

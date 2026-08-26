@@ -4834,6 +4834,10 @@ impl AutumnManager {
                 .await;
             }
         }
+        // Write this heartbeat's own terminal records to durable history —
+        // after the loop above queued them, so a completion does not wait for
+        // the next heartbeat to become durable.
+        self.flush_op_log().await;
         Self::code_resp(CODE_OK, String::new())
     }
 

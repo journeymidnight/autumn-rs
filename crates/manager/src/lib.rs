@@ -4,6 +4,7 @@ pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
 mod extent_corrupt;
+mod op_log;
 mod extent_layout;
 mod fs_alloc;
 pub mod inode_lease;
@@ -741,6 +742,10 @@ pub struct AutumnManager {
     /// not in the default `InDat` shape. See `extent_layout.rs`; persisted at
     /// the `extentLayout/` prefix, absent ⇒ `InDat`.
     pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, u8>>>,
+    /// Per-process sequence + amortised-rotation counter for the durable
+    /// op-log (see `op_log`).
+    pub(crate) op_log_seq: Cell<u64>,
+    pub(crate) op_log_writes_since_gc: Cell<u32>,
     /// Slots proven to hold corrupt bytes, per extent (see `extent_corrupt`).
     /// Distinct from a clear `avali` bit, which cannot say WHY a slot is out.
     pub(crate) extent_corrupt_slots: Rc<RefCell<HashMap<u64, u32>>>,
@@ -1037,6 +1042,8 @@ impl AutumnManager {
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
+            op_log_seq: Cell::new(0),
+            op_log_writes_since_gc: Cell::new(0),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
@@ -1443,6 +1450,10 @@ impl AutumnManager {
             // whose terminal outcome never came back to UNKNOWN, keeping
             // `ops status` honest instead of RUNNING forever.
             self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
+            // Backstop drain: kinds no PS reports (recovery, ec-convert) close
+            // outside the load heartbeat, so without this their history would
+            // wait for unrelated PS traffic.
+            self.flush_op_log().await;
             let now = Self::epoch_seconds();
             let owners: HashMap<u64, u64> = {
                 let s = self.store.inner.borrow();
