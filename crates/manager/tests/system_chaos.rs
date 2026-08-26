@@ -488,6 +488,30 @@ async fn refresh_topology(mgr: &RpcClient, topo: &Topology) {
 /// truth: keys are exactly `{CHAOS_NS}{b|q}{kid:06}` for `kid in [0, CHAOS_KEY_COUNT)`.
 const CHAOS_KEY_COUNT: u32 = 200;
 
+/// Annotate a write-failure reason that is EXPECTED given how this harness
+/// drives the cluster, so nobody re-investigates it as a defect.
+///
+/// Both cases below are the cluster refusing a write it SHOULD refuse, and the
+/// workload correctly counting it as failed rather than acked — the invariant
+/// they protect is that a rejected write never enters `expected[]`.
+fn expected_rejection_note(why: &str) -> &'static str {
+    if why.contains("key is out of range") {
+        // The workload stamps `region_epoch: 0` (skip-check) and keeps its own
+        // routing table, so it deliberately bypasses the SDK's
+        // epoch-mismatch → refresh → retry self-heal. After a split its table
+        // is briefly stale and the PS rejects the misrouted key. Seeing this
+        // means admission ordering (epoch → in_range) is working.
+        return "   [expected: harness routes with region_epoch=0, stale post-split]";
+    }
+    if why.contains("code=7") {
+        // CODE_UNAVAILABLE — the PS halting writes while frozen for a merge.
+        // This is the freeze-drain doing its job; its absence during a merge
+        // would be the finding.
+        return "   [expected: CODE_UNAVAILABLE = writes halted during merge freeze]";
+    }
+    ""
+}
+
 /// Every chaos key lives under this namespace.
 ///
 /// Layer-A namespace validation is ALWAYS on (the manager seeds the built-in
@@ -3023,7 +3047,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         if !failure_tally.is_empty() {
             eprintln!("chaos: write failures by reason (acked={acked_total} failed={failed_total}):");
             for (why, count) in failure_tally.iter().take(12) {
-                eprintln!("  {count:6}  {why}");
+                eprintln!("  {count:6}  {why}{}", expected_rejection_note(why));
             }
         }
         let mut workload_errors: Vec<String> = Vec::new();
