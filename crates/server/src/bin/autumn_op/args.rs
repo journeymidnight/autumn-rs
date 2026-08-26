@@ -26,6 +26,12 @@ fn usage() -> ! {
     );
     eprintln!("  cluster-version              persisted cluster_version + manager wire interval (R1)");
     eprintln!();
+    eprintln!("op observability:");
+    eprintln!("  ops status <id>              live state of one op, incl. progress");
+    eprintln!("  ops list [--active] [--kind K] [--limit N]   live ledger (leader-local)");
+    eprintln!("  ops history [--kind K] [--since UNIX] [--limit N]");
+    eprintln!("                               durable terminal history from etcd, newest first");
+    eprintln!();
     eprintln!("upgrade versioning:");
     eprintln!("  upgrade-version [--to N]     bump cluster_version (default current+1); run ONLY");
     eprintln!("                               after every member binary is upgraded; not rollbackable");
@@ -320,6 +326,12 @@ pub(crate) enum Command {
         op_id: u64,
         active: bool,
         kind: String,
+        limit: u32,
+    },
+    /// Durable terminal history from etcd, as opposed to `Ops`' live ledger.
+    OpsHistory {
+        kind: String,
+        since_unix: i64,
         limit: u32,
     },
     // cluster / partition admin (migrated from autumn-client)
@@ -1001,6 +1013,7 @@ pub(crate) fn parse() -> Args {
             }
         }
         // ops status <id> | ops list [--active] [--kind K] [--limit N]
+        //   | ops history [--kind K] [--since UNIX] [--limit N]
         "ops" => {
             let action = raw.get(i).cloned().unwrap_or_else(|| "list".to_string());
             i += 1;
@@ -1008,18 +1021,21 @@ pub(crate) fn parse() -> Args {
             let mut active = false;
             let mut kind = String::new();
             let mut limit = 0u32;
+            let mut since_unix = 0i64;
             if action == "status" {
                 op_id = raw.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
                     eprintln!("ops status requires an op id");
                     usage()
                 });
                 i += 1;
-            } else if action != "list" {
+            } else if action != "list" && action != "history" {
                 // `ops <id>` shorthand for `ops status <id>`.
                 match action.parse::<u64>() {
                     Ok(id) => op_id = id,
                     Err(_) => {
-                        eprintln!("ops: expected `status <id>` or `list`");
+                        eprintln!(
+                            "ops: expected `status <id>`, `list`, or `history`"
+                        );
                         usage()
                     }
                 }
@@ -1035,6 +1051,11 @@ pub(crate) fn parse() -> Args {
                         kind = raw.get(i).cloned().unwrap_or_default();
                         i += 1;
                     }
+                    "--since" => {
+                        i += 1;
+                        since_unix = val(&raw, i).parse().unwrap_or(0);
+                        i += 1;
+                    }
                     "--limit" => {
                         i += 1;
                         limit = raw.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1043,11 +1064,19 @@ pub(crate) fn parse() -> Args {
                     _ => break,
                 }
             }
-            Command::Ops {
-                op_id,
-                active,
-                kind,
-                limit,
+            if action == "history" {
+                Command::OpsHistory {
+                    kind,
+                    since_unix,
+                    limit,
+                }
+            } else {
+                Command::Ops {
+                    op_id,
+                    active,
+                    kind,
+                    limit,
+                }
             }
         }
         // admin

@@ -329,6 +329,7 @@ impl AutumnManager {
             MSG_REBALANCE_REGIONS => self.handle_rebalance_regions(payload).await,
             MSG_OP_SUBMIT => self.handle_op_submit(payload).await,
             MSG_OP_QUERY => self.handle_op_query(payload).await,
+            MSG_OP_HISTORY => self.handle_op_history(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -4657,6 +4658,31 @@ impl AutumnManager {
         let req: OpQueryReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let ops = self.ops.borrow().query(&req);
         Ok(rkyv_encode(&OpQueryResp {
+            code: CODE_OK,
+            message: String::new(),
+            ops,
+        }))
+    }
+
+    /// Read durable terminal history (`opLog/`), newest first.
+    ///
+    /// Leader-gated like `handle_op_query`, but for a different reason: the
+    /// ledger is leader-local state a follower simply does not have, whereas
+    /// this reads etcd, which any instance could reach. Gating anyway keeps one
+    /// answer to "where do I ask about ops" and avoids a follower serving a
+    /// view its own replay may lag.
+    pub(crate) async fn handle_op_history(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpHistoryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ops: vec![],
+            }));
+        }
+        let req: OpHistoryReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let ops = self.read_op_log(req.kind_filter, req.since_unix, req.limit).await;
+        Ok(rkyv_encode(&OpHistoryResp {
             code: CODE_OK,
             message: String::new(),
             ops,

@@ -376,6 +376,7 @@ async fn run(args: Args) -> Result<()> {
         Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id).await?,
         Command::Split { part_id, point } => cmd_split(&client, args.json, args.wait, args.wait_timeout, part_id, point).await?,
         Command::Ops { op_id, active, kind, limit } => cmd_ops(&client, args.json, op_id, active, &kind, limit).await?,
+        Command::OpsHistory { kind, since_unix, limit } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
         Command::Presplit { namespace, tenant, rule, admin_token, force } => {
             // UX-fix: the recording token falls back to the GLOBAL
             // `--admin-token[-file]` (the position `usage()` documents) so an
@@ -1856,9 +1857,32 @@ async fn cmd_ops(
         })
         .await
         .map_err(|e| anyhow!("ops: {e}"))?;
+    render_ops(&resp.ops, json)
+}
+
+/// Durable terminal history from the leader. Same rendering as `cmd_ops` so an
+/// operator reads one format whether the record is live or historical.
+async fn cmd_ops_history(
+    client: &ClusterClient,
+    json: bool,
+    kind: &str,
+    since_unix: i64,
+    limit: u32,
+) -> Result<()> {
+    let resp = client
+        .op_history(autumn_rpc::manager_rpc::OpHistoryReq {
+            kind_filter: op_kind_from_str(kind),
+            since_unix,
+            limit,
+        })
+        .await
+        .map_err(|e| anyhow!("ops history: {e}"))?;
+    render_ops(&resp.ops, json)
+}
+
+fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<()> {
     if json {
-        let arr: Vec<_> = resp
-            .ops
+        let arr: Vec<_> = ops
             .iter()
             .map(|o| {
                 serde_json::json!({
@@ -1883,11 +1907,11 @@ async fn cmd_ops(
         );
         return Ok(());
     }
-    if resp.ops.is_empty() {
+    if ops.is_empty() {
         println!("(no ops)");
         return Ok(());
     }
-    for o in &resp.ops {
+    for o in ops {
         let target = if o.secondary_id != 0 {
             format!("{}->{}", o.part_id, o.secondary_id)
         } else if o.part_id != 0 {
@@ -1938,6 +1962,7 @@ async fn cmd_ops(
     }
     Ok(())
 }
+
 
 async fn cmd_split(
     client: &ClusterClient,

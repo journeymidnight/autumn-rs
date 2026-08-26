@@ -2141,6 +2141,13 @@ pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
 // RUNNING.
 pub const MSG_OP_SUBMIT: u8 = 0x5C;
 pub const MSG_OP_QUERY: u8 = 0x5D;
+/// Durable terminal history from etcd (`opLog/`), as opposed to `MSG_OP_QUERY`'s
+/// live in-memory ledger. Deliberately a separate message rather than a flag on
+/// the query: the two answer different questions ("what is running" vs "how did
+/// past runs turn out") off different data sources (a leader-local ring vs
+/// etcd), so folding them together would blur both the leader-gating and the
+/// paging semantics.
+pub const MSG_OP_HISTORY: u8 = 0x5E;
 
 /// Op kinds. Distinct from `POLICY_KIND_*` (forcegc is not a policy kind, and
 /// the policy enum is a separate frozen wire surface). Append-only.
@@ -2294,6 +2301,25 @@ pub struct OpQueryReq {
     pub active_only: bool,
     pub kind_filter: u8,
     pub limit: u32,
+}
+
+/// `MSG_OP_HISTORY` — read terminal records from durable history, newest first.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpHistoryReq {
+    /// `OP_KIND_*`, or `0` for every kind.
+    pub kind_filter: u8,
+    /// Only records that finished at or after this unix second. `0` = no bound.
+    pub since_unix: i64,
+    /// Cap on returned records. `0` → a server-side default.
+    pub limit: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpHistoryResp {
+    pub code: u8,
+    pub message: String,
+    /// Newest first.
+    pub ops: Vec<OpRecord>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]

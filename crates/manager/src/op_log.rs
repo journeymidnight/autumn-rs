@@ -51,30 +51,43 @@ impl AutumnManager {
     /// Best-effort, exactly like `append_audit`: the operation itself already
     /// finished, and failing it because its history could not be written would
     /// turn an observability gap into an outage.
-    pub(crate) async fn append_op_log(&self, rec: &OpRecord) {
+    /// Write a batch of terminal records to durable history in ONE etcd txn.
+    ///
+    /// Batched rather than one round-trip per record because the caller is the
+    /// PS load heartbeat: a burst of completions would otherwise put N serial
+    /// etcd round-trips on the path that keeps the fleet's liveness accounting
+    /// current, which is exactly where added latency hurts most.
+    ///
+    /// Best-effort, like `append_audit`: the ops themselves already finished,
+    /// and failing them because their history could not be written would turn
+    /// an observability gap into an outage.
+    pub(crate) async fn append_op_log_batch(&self, recs: &[OpRecord]) {
+        if recs.is_empty() {
+            return;
+        }
+        let Some(etcd) = &self.etcd else {
+            return; // memory mode: no history to keep
+        };
         let ts_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let seq = self.op_log_seq.get().wrapping_add(1).max(1);
-        self.op_log_seq.set(seq);
-        let key = op_log_key(ts_ns, seq);
-        let value = rkyv_encode(rec).to_vec();
-
-        let Some(etcd) = &self.etcd else {
-            return; // memory mode: no history to keep
-        };
-        if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
+        let mut puts = Vec::with_capacity(recs.len());
+        for rec in recs {
+            let seq = self.op_log_seq.get().wrapping_add(1).max(1);
+            self.op_log_seq.set(seq);
+            puts.push((op_log_key(ts_ns, seq), rkyv_encode(rec).to_vec()));
+        }
+        if let Err(e) = etcd.put_msgs_txn(puts).await {
             tracing::warn!(
-                op_id = rec.op_id,
-                kind = rec.kind,
+                records = recs.len(),
                 error = %e,
-                "failed to persist the op-log record (continuing anyway)"
+                "failed to persist op-log records (continuing anyway)"
             );
             return;
         }
 
-        let n = self.op_log_writes_since_gc.get() + 1;
+        let n = self.op_log_writes_since_gc.get() + recs.len() as u32;
         if n < OP_LOG_GC_EVERY {
             self.op_log_writes_since_gc.set(n);
             return;
@@ -91,9 +104,52 @@ impl AutumnManager {
     /// borrow so the etcd writes happen outside it.
     pub(crate) async fn flush_op_log(&self) {
         let pending = self.ops.borrow_mut().drain_pending_log();
-        for rec in &pending {
-            self.append_op_log(rec).await;
+        self.append_op_log_batch(&pending).await;
+    }
+
+    /// Read terminal history, NEWEST FIRST.
+    ///
+    /// Keys are fixed-width zero-padded, so the prefix scan is already in
+    /// timestamp order and "the most recent N" is a tail slice — no sorting by
+    /// a decoded field, and no dependence on etcd's return order.
+    ///
+    /// A record that fails to decode is skipped with a warning rather than
+    /// failing the query: history is diagnostic, and one unreadable row must
+    /// not deny an operator the rest of it.
+    pub(crate) async fn read_op_log(
+        &self,
+        kind_filter: u8,
+        since_unix: i64,
+        limit: u32,
+    ) -> Vec<OpRecord> {
+        const DEFAULT_LIMIT: u32 = 50;
+        let limit = if limit == 0 { DEFAULT_LIMIT } else { limit } as usize;
+        let Some(etcd) = &self.etcd else {
+            return Vec::new();
+        };
+        let c = etcd.client.clone();
+        let listed = match c.get_prefix(OP_LOG_PREFIX).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "op-log read could not list the prefix");
+                return Vec::new();
+            }
+        };
+        let mut rows: Vec<(Vec<u8>, OpRecord)> = Vec::with_capacity(listed.kvs.len());
+        for kv in &listed.kvs {
+            match autumn_rpc::manager_rpc::rkyv_decode::<OpRecord>(&kv.value) {
+                Ok(rec) => rows.push((kv.key.clone(), rec)),
+                Err(e) => tracing::warn!(error = %e, "skipping an undecodable op-log record"),
+            }
         }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.into_iter()
+            .rev() // newest first
+            .map(|(_, r)| r)
+            .filter(|r| kind_filter == 0 || r.kind == kind_filter)
+            .filter(|r| since_unix == 0 || r.finished_at >= since_unix)
+            .take(limit)
+            .collect()
     }
 
     /// Trim the history back to `OP_LOG_CAP`, oldest first. Leader-only by

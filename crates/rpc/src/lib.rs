@@ -413,7 +413,10 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   grew `progress_done`/`progress_total` and PartitionLoad grew
     //   `active_maintenance: Vec<MaintenanceProgress>` — raw counts, not a
     //   percentage, so the consumer keeps both the ratio and the magnitude.
-    (29, "7bf2e6cfe9a692dd"),
+    //   v29 refreshed IN PLACE again (still undeployed): MSG_OP_HISTORY (0x5E)
+    //   + OpHistoryReq/Resp — durable terminal op history read from etcd, kept
+    //   a separate message from the live-ledger MSG_OP_QUERY.
+    (29, "a36f63cbf8efe51c"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

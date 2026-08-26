@@ -4147,6 +4147,22 @@ impl ClusterClient {
         rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
     }
 
+    /// Read durable terminal op history from the leader (etcd-backed), as
+    /// opposed to `op_query`'s live in-memory ledger.
+    pub async fn op_history(
+        &self,
+        req: autumn_rpc::manager_rpc::OpHistoryReq,
+    ) -> std::result::Result<autumn_rpc::manager_rpc::OpHistoryResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(
+                autumn_rpc::manager_rpc::MSG_OP_HISTORY,
+                rkyv_encode(&req),
+            )
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
     /// query the manager's policy-engine advisory cache.
     pub async fn policy_candidates(
         &self,
