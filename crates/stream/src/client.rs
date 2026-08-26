@@ -3440,6 +3440,16 @@ impl StreamClient {
         Ok(end)
     }
 
+    /// Like `commit_length`, but ALSO returns the id of the tail extent the
+    /// value was measured on. Split captures use this so the manager can
+    /// verify at commit time that each tail is still the one the length was
+    /// captured for (a concurrent roll otherwise gets the captured length
+    /// stamped onto its fresh empty tail).
+    pub async fn commit_length_with_tail(&self, stream_id: u64) -> Result<(u64, u64)> {
+        let (_stream, extent, end) = self.check_commit(stream_id).await?;
+        Ok((end, extent.extent_id))
+    }
+
     /// Committed length of the stream's tail extent, but ONLY when that tail
     /// is still OPEN (`!sealed`). A SEALED tail's length is already counted in
     /// the manager's `sealed_length` sum, so returning it here would
@@ -5202,6 +5212,7 @@ impl StreamClient {
         mid_key: Vec<u8>,
         part_id: u64,
         sealed_lengths: [u64; 3],
+        tail_extent_ids: [u64; 3],
         timeout: Duration,
     ) -> Result<()> {
         let req = manager_rpc::rkyv_encode(&MultiModifySplitReq {
@@ -5212,6 +5223,9 @@ impl StreamClient {
             log_stream_sealed_length: sealed_lengths[0],
             row_stream_sealed_length: sealed_lengths[1],
             meta_stream_sealed_length: sealed_lengths[2],
+            log_tail_extent_id: tail_extent_ids[0],
+            row_tail_extent_id: tail_extent_ids[1],
+            meta_tail_extent_id: tail_extent_ids[2],
         });
         // Per-call timeout is caller-chosen (#6): the PS split path bounds it
         // SHORT so the whole freeze critical section stays under FREEZE_TTL —

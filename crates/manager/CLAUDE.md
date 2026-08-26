@@ -195,7 +195,11 @@ unlink.
 ### `multi_modify_split`
 
 Atomically splits one partition into left + right:
-1. Validate owner epoch; validate `mid_key` inside the range.
+1. Validate owner epoch; validate `mid_key` inside the range; verify the
+   request's captured tail extent ids still match each stream's CURRENT tail
+   (refuse `split captured tail moved` otherwise — a roll that landed after
+   the PS's capture would get the captured length stamped onto its fresh
+   empty tail; 0 = no claim, skip).
 2. `alloc_ids(4)` → new log/row/meta stream ids + new part id.
 3. `duplicate_stream` each of the 3 streams at its sealed length (shares extents).
 4. Left range → `[start, mid)`; right created as `[mid, end)` with new stream ids.
@@ -435,6 +439,14 @@ acked-write-loss family. The PS also DEFERS the roll while the partition is
 frozen for split/merge: those orchestrations capture per-stream commit lengths
 and the manager seals whatever extent is the tail at commit time, so a roll in
 that window would get the captured length stamped onto its fresh empty extent.
+A roll ALREADY IN FLIGHT when the freeze begins slips past that defer — which
+is why `handle_multi_modify_split` verifies the request's captured tail ids
+(`MultiModifySplitReq.log/row/meta_tail_extent_id`) against the CURRENT tails
+in Phase 1 and refuses (`split captured tail moved`, Precondition) when any
+moved; the PS aborts immediately (deterministic for those captures) and the
+client's retried split re-captures. Deterministic repro of both halves:
+`crates/manager/tests/system_roll_tails_live_writer.rs`
+(`in_flight_roll_racing_split_commit_child_still_opens`).
 
 **Placement hard-exclusion.** `placement_excluded_node_ids()` = Fenced ∪ Maintenance
 (overrides) ∪ Suspected (`node_states`) — threaded as `hard_excluded` into

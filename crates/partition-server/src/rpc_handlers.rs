@@ -307,6 +307,16 @@ pub(crate) async fn handle_roll_tails(
         if cur_tail != expected_tail {
             continue; // already rolled by a natural write or a prior sweep
         }
+        // TEST SYNC-POINT: hold the roll here (freeze/idempotency checks done,
+        // seal not yet issued) so a test can start a split freeze and reach its
+        // commit phase while this roll is "in flight". Off in production (one
+        // relaxed load; only `set_roll_tails_pause` sets it).
+        if crate::roll_tails_paused() {
+            crate::note_roll_tails_parked();
+            while crate::roll_tails_paused() {
+                compio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
         if stream_id == row_id {
             // row_stream single-writer invariant: seal+roll on P-sst's sst_sc
             // via the row-invalidate barrier (drains inflight to zero first).
@@ -1437,16 +1447,21 @@ pub(crate) async fn handle_split_part(
     // The `?` above still aborts on a genuine commit_length Err (unreachable
     // replica, the hazard documented above), so OK+0 = genuinely empty,
     // never a masked failure → safe to seal at 0.
-    let log_end = part_sc
-        .commit_length(log_stream_id)
+    // Capture each commit length TOGETHER WITH the tail extent it was
+    // measured on; the manager refuses the commit if any tail moved in
+    // between (e.g. a fence-drain roll already in flight when the freeze
+    // began) — sealing the roll's fresh empty tail at this captured length
+    // would wedge the CoW child permanently.
+    let (log_end, log_tail_eid) = part_sc
+        .commit_length_with_tail(log_stream_id)
         .await
         .map_err(|e| unfreeze_on_err(e, "log_stream"))?;
-    let row_end = part_sc
-        .commit_length(row_stream_id)
+    let (row_end, row_tail_eid) = part_sc
+        .commit_length_with_tail(row_stream_id)
         .await
         .map_err(|e| unfreeze_on_err(e, "row_stream"))?;
-    let meta_end = part_sc
-        .commit_length(meta_stream_id)
+    let (meta_end, meta_tail_eid) = part_sc
+        .commit_length_with_tail(meta_stream_id)
         .await
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
     {
@@ -1572,6 +1587,17 @@ pub(crate) async fn handle_split_part(
         }
     }
 
+    // TEST SYNC-POINT: hold the split here (captures + barrier done, manager
+    // commit not yet issued) so a test can land a concurrent tail roll inside
+    // this window. Off in production (one relaxed load; only
+    // `set_split_commit_pause` sets it).
+    if crate::split_commit_paused() {
+        crate::note_split_commit_parked();
+        while crate::split_commit_paused() {
+            compio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     // Call multi_modify_split on the manager. #6: the freeze only guarantees a
     // STABLE commit_length while it is HELD. If `check_freeze_ttls` auto-
     // unfreezes (this handler exceeded FREEZE_TTL) and a split then commits, it
@@ -1610,6 +1636,7 @@ pub(crate) async fn handle_split_part(
                 mid.clone(),
                 req.part_id,
                 [log_end, row_end, meta_end],
+                [log_tail_eid, row_tail_eid, meta_tail_eid],
                 SPLIT_CALL_TIMEOUT,
             )
             .await
@@ -1626,7 +1653,14 @@ pub(crate) async fn handle_split_part(
                     error = %err,
                     "split multi_modify_split attempt failed"
                 );
-                split_err = err.to_string();
+                split_err = format!("{err:#}");
+                // "captured tail moved" is DETERMINISTIC for these captured
+                // values — every retry re-sends the same stale capture and
+                // gets the same refusal. Abort now; the client retries the
+                // whole split, whose fresh capture sees the rolled tails.
+                if split_err.contains("split captured tail moved") {
+                    break;
+                }
                 compio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
             }

@@ -38,10 +38,17 @@ Task scope: F1+F4 已 ack 写丢失(split 右孩子 wedge / 静默旧值)——�
   system_merge --ignored 9/9;clippy 警告数前后同为 16。修复后 chaos(同收窄动作集)39 跑:
   0 F1 / 0 F4(38 PASS + 1 次 create_stream 起集群 flake,workload 未启动,与数据面无关)。
   P(修复后 38 跑全 0 | 预修复 18% 命中率) ≈ 5e-4。
-【残留(记录未修,reproduce-first)】① split capture→manager Phase-1 间一个【已在飞】的 roll
-  仍可换 tail(freeze defer 只挡新 roll);关死需 multi_modify_split 携带 captured tail
-  extent ids(wire 变更)。未观察到。② F3(VP 大值读 wedged/timeout,kid%8==0,b/q 都有)
-  与本修无关且在收窄动作集(无 EC)下也出现过 1 次——下一优先。
+【残留①已复现并修复(后续会话,同日)】"已在飞的 roll 换 tail" 用两个测试同步点
+  (set_roll_tails_pause / set_split_commit_pause,模式同 set_flush_test_pause)确定性复现:
+  HEAD 上 split 把 captured length 盖到 roll 出的空 tail 上 → 右孩子永不可读(精确失败)。
+  修=wire:MultiModifySplitReq 携带 log/row/meta_tail_extent_id(捕获时的 tail;0=skip),
+  manager Phase-1 校验当前 tail 一致否则 Precondition "split captured tail moved";
+  PS 对该错误立即 abort(确定性,重试无意义),客户端重发 split 重新捕获即成功。
+  v29 未部署 → 指纹就地刷新 fad8cec20c7f20ba。测试:
+  system_roll_tails_live_writer::in_flight_roll_racing_split_commit_child_still_opens
+  (修前精确失败=非真空,修后 3/3 全绿)。
+【残留②=F3(VP 大值读 wedged/timeout,kid%8==0,b/q 都有)与本修无关且在收窄动作集
+  (无 EC)下也出现过 1 次——下一优先。
 ─────────────────────────────────────────────────────────────
 Date: 2026-08-26
 TaskStatus: not_completed

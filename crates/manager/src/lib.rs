@@ -7261,6 +7261,9 @@ mod tests {
                 log_stream_sealed_length: 500,
                 row_stream_sealed_length: 500,
                 meta_stream_sealed_length: 500,
+            log_tail_extent_id: 0,
+            row_tail_extent_id: 0,
+            meta_tail_extent_id: 0,
             });
             let resp = m.handle_multi_modify_split(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();
@@ -8570,6 +8573,9 @@ mod tests {
                 log_stream_sealed_length: 500,
                 row_stream_sealed_length: 500,
                 meta_stream_sealed_length: 500,
+            log_tail_extent_id: 0,
+            row_tail_extent_id: 0,
+            meta_tail_extent_id: 0,
             });
             let resp = m.handle_multi_modify_split(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();

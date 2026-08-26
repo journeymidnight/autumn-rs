@@ -3524,6 +3524,39 @@ impl AutumnManager {
                     }
                 }
 
+                // The three sealed lengths were captured by the PS for
+                // SPECIFIC tail extents. compute_duplicate_stream seals
+                // whatever extent is the CURRENT tail, so if a tail moved
+                // between the capture and this commit (a fence-drain roll
+                // already in flight when the split froze — it sealed the
+                // captured tail itself and appended a fresh empty one), the
+                // captured length would be stamped onto the roll's fresh
+                // EMPTY tail: "sealed" longer than any replica holds, and the
+                // CoW child's replay can never read it. Refuse; the PS aborts
+                // and the client retries the split with a fresh capture.
+                // `0` = no capture claim (legacy caller / test) → skip.
+                for (label, sid, captured_tail) in [
+                    ("log", src_meta.log_stream, req.log_tail_extent_id),
+                    ("row", src_meta.row_stream, req.row_tail_extent_id),
+                    ("meta", src_meta.meta_stream, req.meta_tail_extent_id),
+                ] {
+                    if captured_tail == 0 {
+                        continue;
+                    }
+                    let cur_tail = s
+                        .streams
+                        .get(&sid)
+                        .and_then(|st| st.extent_ids.last().copied())
+                        .unwrap_or(0);
+                    if cur_tail != captured_tail {
+                        return Err(AppError::Precondition(format!(
+                            "split captured tail moved: {label} stream {sid} tail is now \
+                             {cur_tail}, commit length was captured for {captured_tail}; \
+                             retry split with a fresh capture"
+                        )));
+                    }
+                }
+
                 // snapshot pre-mutation eversions so Phase-3 can verify
                 // no concurrent mutator ran during Phase-2's etcd await.
                 let pre_bump_eversion = Self::snapshot_stream_extent_eversions(
@@ -7350,6 +7383,9 @@ mod split_inflight_guard_tests {
             log_stream_sealed_length: 1,
             row_stream_sealed_length: 1,
             meta_stream_sealed_length: 1,
+            log_tail_extent_id: 0,
+            row_tail_extent_id: 0,
+            meta_tail_extent_id: 0,
         };
         let payload: Bytes = rkyv_encode(&req);
         let resp = run(async { m.handle_multi_modify_split(payload).await.unwrap() });

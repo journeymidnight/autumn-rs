@@ -416,7 +416,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   v29 refreshed IN PLACE again (still undeployed): MSG_OP_HISTORY (0x5E)
     //   + OpHistoryReq/Resp — durable terminal op history read from etcd, kept
     //   a separate message from the live-ledger MSG_OP_QUERY.
-    (29, "a36f63cbf8efe51c"),
+    //   v29 refreshed IN PLACE again (still undeployed): MultiModifySplitReq
+    //   grew `log/row/meta_tail_extent_id` — the tail extents the three sealed
+    //   lengths were CAPTURED FOR. The manager refuses the split commit when a
+    //   tail moved between the PS's capture and the commit (a fence-drain roll
+    //   in flight when the split froze), because compute_duplicate_stream
+    //   seals the CURRENT tail: the captured length would be stamped onto the
+    //   roll's fresh empty extent, sealed longer than any replica holds, and
+    //   the CoW child's replay could never read it. `0` = no claim (skip).
+    (29, "fad8cec20c7f20ba"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

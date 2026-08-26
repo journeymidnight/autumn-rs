@@ -718,7 +718,8 @@ first append would overwrite committed bytes).
 | `punch_holes(stream_id, extent_ids[])` | GC: remove extents from a stream |
 | `truncate(stream_id, extent_id)` | Remove all extents before extent_id |
 | `get_stream_info` / `get_extent_info` | Query manager metadata |
-| `multi_modify_split(req)` | Forward partition split to manager |
+| `multi_modify_split(mid, part, sealed_lengths, tail_extent_ids, timeout)` | Forward partition split to manager; `tail_extent_ids` = the tails the lengths were captured for (manager refuses `split captured tail moved` if any current tail differs) |
+| `commit_length_with_tail(stream_id)` | `commit_length` + the tail extent id it was measured on (split capture) |
 | `invalidate_stream(stream_id)` | Discard cached worker + init-lock; next append reloads the tail (used after split to prevent appending beyond a sealed tail) |
 
 **A read NAMES its payload file.** `ReadBytesReq` carries a `PayloadRef`

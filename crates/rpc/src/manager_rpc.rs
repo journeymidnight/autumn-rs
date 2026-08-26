@@ -714,6 +714,18 @@ pub struct MultiModifySplitReq {
     pub log_stream_sealed_length: u64,
     pub row_stream_sealed_length: u64,
     pub meta_stream_sealed_length: u64,
+    /// The tail extent ids the three sealed lengths were CAPTURED FOR. The
+    /// manager seals whatever extent is the CURRENT tail at commit time, so it
+    /// MUST refuse (Precondition, caller re-captures and retries) when a tail
+    /// moved between the PS's capture and the commit — e.g. a fence-drain roll
+    /// already in flight when the split froze the partition. Without the check
+    /// the captured length gets stamped onto the roll's fresh EMPTY tail,
+    /// which is then "sealed" longer than any replica holds and permanently
+    /// wedges the CoW child's replay. `0` = no capture claim (legacy callers /
+    /// tests) — the check is skipped for that stream.
+    pub log_tail_extent_id: u64,
+    pub row_tail_extent_id: u64,
+    pub meta_tail_extent_id: u64,
 }
 
 // Response: CodeResp

@@ -178,6 +178,49 @@ fn flush_test_paused() -> bool {
 pub fn flush_commit_count() -> u64 {
     FLUSH_COMMITS.load(Ordering::Relaxed)
 }
+/// Test sync-point: parks `handle_split_part` AFTER its commit-length
+/// captures + P-sst barrier, BEFORE `multi_modify_split` — the window where a
+/// concurrent tail roll invalidates the captured lengths. Only tests set it.
+static SPLIT_COMMIT_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of splits that have PARKED on `SPLIT_COMMIT_PAUSE` (tests poll it to
+/// know the captures are done and the handler is held pre-commit).
+static SPLIT_COMMIT_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `SPLIT_COMMIT_PAUSE`. Only tests call this.
+pub fn set_split_commit_pause(paused: bool) {
+    SPLIT_COMMIT_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn split_commit_paused() -> bool {
+    SPLIT_COMMIT_PAUSE.load(Ordering::Relaxed)
+}
+pub fn split_commit_parked_count() -> u64 {
+    SPLIT_COMMIT_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_split_commit_parked() {
+    SPLIT_COMMIT_PARKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test sync-point: parks `handle_roll_tails` AFTER its freeze/idempotency
+/// checks, BEFORE the seal+roll — modelling a roll already in flight when a
+/// split's freeze begins. Only tests set it.
+static ROLL_TAILS_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of roll entries that have PARKED on `ROLL_TAILS_PAUSE`.
+static ROLL_TAILS_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `ROLL_TAILS_PAUSE`. Only tests call this.
+pub fn set_roll_tails_pause(paused: bool) {
+    ROLL_TAILS_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn roll_tails_paused() -> bool {
+    ROLL_TAILS_PAUSE.load(Ordering::Relaxed)
+}
+pub fn roll_tails_parked_count() -> u64 {
+    ROLL_TAILS_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_roll_tails_parked() {
+    ROLL_TAILS_PARKED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Test sync-point control — see `WRITE_PHASE3_PAUSE`. Only tests call this.
 pub fn set_write_phase3_pause(paused: bool) {
     WRITE_PHASE3_PAUSE.store(paused, Ordering::Relaxed);
