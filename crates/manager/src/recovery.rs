@@ -1020,8 +1020,21 @@ impl AutumnManager {
                             {
                                 if let Ok(r) = rkyv_decode::<ExtCodeResp>(&resp) {
                                     if r.code == CODE_OK {
-                                        let _ =
-                                            self.mark_extent_available(ex.extent_id, slot).await;
+                                        if let Err(e) =
+                                            self.mark_extent_available(ex.extent_id, slot).await
+                                        {
+                                            // Swallowing this left the slot's
+                                            // bit clear while the loop believed
+                                            // it had healed, so the next tick
+                                            // re-sent RE_AVALI forever.
+                                            tracing::warn!(
+                                                extent_id = ex.extent_id,
+                                                slot,
+                                                error = %e,
+                                                "re_avali reported OK but marking the slot \
+                                                 available failed; will retry next tick"
+                                            );
+                                        }
                                         continue;
                                     }
                                 }

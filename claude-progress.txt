@@ -1,3 +1,29 @@
+Date: 2026-08-26
+TaskStatus: not_completed
+Task scope: /loop ①修 corrupt replica 隔离失效 ②op 可观测性设计+实现。本轮只完成 ① 的定性与一处吞错误修复。
+  ①-a【链路已坐实,四环全在】corrupt 隔离活不过一个 recovery tick:
+     handle_report_corrupt_replica(rpc_handlers.rs:1066) 的隔离手段【只有】清 avali bit,无其它持久标记
+     → recovery_dispatch_loop(recovery.rs:997)看到 `(ex.avali & bit) == 0` 就发 EXT_MSG_RE_AVALI
+     → EN handle_re_avali 的判据是 `local_len >= sealed_length` 就 CODE_OK,而 bit-rot 副本【长度是满的】
+     → manager `mark_extent_available` 把 bit 重新置上 ⇒ 隔离被自动撤销。
+     【根因】`avali == 0` 承载了两个不同语义:"副本落后"(RE_AVALI 能修)和"副本内容损坏"
+     (RE_AVALI 修不了,它只看长度)。与 memory 里 re_avali 那条"avali==0 不代表 lagging"同型。
+  ①-b【已修】上面第四步的 `let _ = self.mark_extent_available(...)` 吞错误(违反 no-let-underscore 规则):
+     吞掉后 bit 仍是清的而循环以为已治愈 ⇒ 下一 tick 无限重发 RE_AVALI。改为 warn + 下轮重试。
+  ①-c【设计定稿,未实现】用本仓已有的 sibling-key 模式(照 extentLayout/<id>):
+     新增 `extentCorrupt/<extent_id>` → u32 位图,记录哪些 slot 被报告为内容损坏。
+     - handle_report_corrupt_replica:清 avali bit 的同时,在【同一个 leader-fenced txn】里写该 key
+     - recovery_dispatch_loop:slot 命中 corrupt 位 ⇒ 【跳过 RE_AVALI 快捷路径】,直接 dispatch_and_record
+       走 recovery 重建(EN recovery 从 peer 拉完整数据覆盖本地,这才是 bit-rot 真正需要的)
+     - apply_recovery_done:重建成功后清掉该 slot 的 corrupt 位
+     选 sibling key 而非给 MgrExtentInfo 加字段:后者会改 rkyv 布局使所有已存 extents/<id> 失效。
+  ②op 可观测性:未开始。设计见 memory `project_op_observability_redesign`(用户 2026-08-26 定的三层)。
+Next steps:
+  1) 实现 ①-c,并按 house rule【先复现】:构造 sealed extent + 上报 corrupt → 断言隔离在
+     N 个 recovery tick 后仍然成立(当前会在 1 tick 内失效)。killable PS harness 已可用。
+  2) 再做 ②:live 状态带百分比(GC 有 cur/sealed_length、compact 有 input/output tables、
+     recovery 有已拷字节、EC 有 stripe 序号 —— 数据都在,没上报)+ 终态入 etcd+rotate + dashboard 走 RPC。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-25 (b)
 TaskStatus: completed
 Task scope: /loop 第 N 轮——把 fable 评审挖出的两个 P0 收口，并让 chaos 真正跑绿（commit b5a4dff、4040dbe）。
