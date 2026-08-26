@@ -39,6 +39,10 @@ fn record_maint_outcome(
     if op_id == 0 {
         return;
     }
+    // The op is terminal, so any progress sample is now stale. Leaving it would
+    // show a finished op as forever mid-flight; every terminal exit routes
+    // through here, so this is the one place that cannot be forgotten.
+    metrics.clear_maintenance_progress();
     metrics.push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
         op_id,
         kind,
@@ -1294,7 +1298,7 @@ pub(crate) async fn background_maintenance_loop(
                 // First failure across the batch → the op's reported error.
                 let mut gc_failed: Option<String> = None;
                 for (eid, sealed_length) in holes {
-                    match run_gc(&part, eid, sealed_length).await {
+                    match run_gc(&part, eid, sealed_length, gc_op_id).await {
                         Ok(()) => {
                             // success → clear any prior failure stamp so
                             // a transient EC fall-back hiccup doesn't suppress
@@ -2999,6 +3003,7 @@ pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
     sealed_length: u64,
+    op_id: u64,
 ) -> Result<()> {
     let (log_stream_id, rg, part_sc, rate_ctrl) = {
         let p = part.borrow();
@@ -3039,6 +3044,15 @@ pub(crate) async fn run_gc(
     let mut rate_limiter = GcRateLimiter::new();
 
     while cur < sealed_length {
+        // Publish how far this extent's scan has got. Once per chunk (64 MiB by
+        // default), never per record, so the cost is one short lock per tens of
+        // MB. Bytes rather than a percentage: an operator deciding whether to
+        // wait needs the magnitude, and the consumer can divide.
+        {
+            let p = part.borrow();
+            p.metrics
+                .set_maintenance_progress(op_id, manager_rpc::OP_KIND_GC, cur, sealed_length);
+        }
         let want = (sealed_length - cur).min(chunk_bytes as u64);
         let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
         if chunk.is_empty() {

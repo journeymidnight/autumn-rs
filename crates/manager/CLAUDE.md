@@ -851,6 +851,19 @@ failure reason the fire-and-forget maintenance ops used to drop.
   per-extent (only aggregate in `recovery-stats`).
 - **`error` on a RUNNING op is deliberate** for auto-retrying kinds — it is the
   LAST attempt's failure, not a terminal verdict.
+- **Live progress** (`OpRecord.progress_done` / `progress_total`) is carried as
+  RAW COUNTS, never a percentage — the wire carries facts and the consumer
+  derives the ratio (the same rule cluster-df follows). A bare "50%" cannot
+  distinguish two tables from fifty gigabytes, and an operator deciding whether
+  to wait needs the magnitude; `autumn-op ops` renders both, in the unit the
+  kind actually measures (bytes for gc/forcegc, tables for compact). PS-executed
+  kinds publish a sample from their own loop
+  (`PartitionMetrics::set_maintenance_progress`, once per GC chunk — never per
+  record) which rides `PartitionLoad.active_maintenance`. `update_progress`
+  touches only RUNNING entries, so a sample arriving after the outcome — the
+  PS re-sends its outcome ring every heartbeat — can neither reopen a closed op
+  nor resurrect one the cap evicted. `record_maint_outcome` clears the sample at
+  every terminal exit, so a finished op never shows as forever mid-flight.
 - **EC convert now uses the recovery model** (dispatch ≠ completion): the
   coordinator EN ACKs "accepted" and encodes in the background;
   `node_health_loop` applies each `DfResp.ec_done` report using the etcd

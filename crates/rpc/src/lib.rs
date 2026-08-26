@@ -409,7 +409,11 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   the numeric code beside it. No struct changed — but rendering every
     //   unnamed code as the bare word "error" made a permanently fenced EC
     //   conversion read like a generic transient being retried.
-    (29, "b189600e72bfcc1f"),
+    //   v29 refreshed IN PLACE again (still undeployed): op progress. OpRecord
+    //   grew `progress_done`/`progress_total` and PartitionLoad grew
+    //   `active_maintenance: Vec<MaintenanceProgress>` — raw counts, not a
+    //   percentage, so the consumer keeps both the ratio and the magnitude.
+    (29, "7bf2e6cfe9a692dd"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

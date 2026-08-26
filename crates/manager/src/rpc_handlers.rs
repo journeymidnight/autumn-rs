@@ -4753,6 +4753,11 @@ impl AutumnManager {
             .iter()
             .flat_map(|l| l.maintenance_outcomes.iter().cloned())
             .collect();
+        let load_progress: Vec<autumn_rpc::manager_rpc::MaintenanceProgress> = req
+            .partitions
+            .iter()
+            .flat_map(|l| l.active_maintenance.iter().cloned())
+            .collect();
         let mut p = self.policy.borrow_mut();
         // honour the configured `window_buckets / bucket_sec`
         // (was hardcoded `POLICY_WINDOW_BUCKETS / POLICY_BUCKET_SEC`,
@@ -4769,6 +4774,16 @@ impl AutumnManager {
                 .push_with_cap_and_bucket(now, load, cap, bucket_sec);
         }
         drop(p);
+        // Live progress for whatever this partition is running now. Applied
+        // BEFORE the terminal outcomes below so a sample and its own op's
+        // completion arriving in the same heartbeat cannot leave the entry
+        // showing progress on a closed op — `update_progress` only touches
+        // RUNNING entries, and the outcome flips it terminal afterwards.
+        for p in &load_progress {
+            self.ops
+                .borrow_mut()
+                .update_progress(p.op_id, p.done, p.total);
+        }
         // Reconcile PS-executed op outcomes into the ledger (known op_id only,
         // idempotent) and audit each terminal transition exactly once.
         for o in outcomes {

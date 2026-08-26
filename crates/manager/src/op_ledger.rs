@@ -84,6 +84,8 @@ impl OpLedger {
         let op_id = self.next_id(now_ms);
         self.entries.push_front(OpRecord {
             op_id,
+            progress_done: 0,
+            progress_total: 0,
             kind,
             part_id,
             secondary_id,
@@ -370,6 +372,24 @@ impl OpLedger {
         }
     }
 
+    /// Record the latest progress sample for a RUNNING op. Ignores unknown ids
+    /// and terminal entries: a sample that arrives after the outcome (the PS
+    /// keeps resending its ring) must not reopen a closed op or resurrect one
+    /// the cap already evicted.
+    pub(crate) fn update_progress(&mut self, op_id: u64, done: u64, total: u64) {
+        if op_id == 0 {
+            return;
+        }
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.op_id == op_id && e.state == OP_STATE_RUNNING)
+        {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
     /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
     pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
@@ -529,6 +549,39 @@ mod tests {
         assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
         led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1); // past TTL
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn progress_tracks_a_running_op_and_ignores_late_or_unknown_samples() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+
+        led.update_progress(id, 3 * 1024, 8 * 1024);
+        let r = q_one(&led, id);
+        assert_eq!((r.progress_done, r.progress_total), (3 * 1024, 8 * 1024));
+
+        // Later sample wins — progress is a sample, not an accumulator.
+        led.update_progress(id, 7 * 1024, 8 * 1024);
+        assert_eq!(q_one(&led, id).progress_done, 7 * 1024);
+
+        // The PS keeps resending its outcome ring, so a progress sample can
+        // arrive AFTER the op went terminal. It must not reopen it or move the
+        // counters on a closed op.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 5));
+        led.update_progress(id, 8 * 1024, 8 * 1024);
+        let done = q_one(&led, id);
+        assert_eq!(done.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            done.progress_done,
+            7 * 1024,
+            "a sample arriving after the outcome must not touch a terminal entry"
+        );
+
+        // Unknown / untracked ids are ignored rather than synthesizing entries.
+        led.update_progress(999, 1, 2);
+        led.update_progress(0, 1, 2);
+        assert_eq!(q_one(&led, 999).state, OP_STATE_UNKNOWN);
     }
 
     #[test]

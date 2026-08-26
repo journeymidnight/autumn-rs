@@ -1704,6 +1704,28 @@ fn op_state_name(s: u8) -> &'static str {
     }
 }
 
+/// Render a progress count in the unit its kind actually measures. GC and
+/// forcegc scan bytes; compaction counts tables. Printing "3/8" for bytes, or
+/// "3.0 MB" for tables, would both be wrong in a way that misleads.
+fn human_bytes_or_count(kind: u8, n: u64) -> String {
+    use autumn_rpc::manager_rpc::{OP_KIND_FORCE_GC, OP_KIND_GC};
+    if kind != OP_KIND_GC && kind != OP_KIND_FORCE_GC {
+        return n.to_string();
+    }
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
 /// Human name for an `OP_KIND_*`.
 fn op_kind_name(k: u8) -> &'static str {
     match k {
@@ -1881,6 +1903,21 @@ async fn cmd_ops(
         } else {
             String::new()
         };
+        // Progress arrives as raw counts; the percentage is derived here so the
+        // operator sees both the ratio and the magnitude — "50%" alone cannot
+        // distinguish two tables from fifty gigabytes.
+        let progress = if o.progress_total > 0 {
+            let pct = (o.progress_done.min(o.progress_total) as f64 / o.progress_total as f64)
+                * 100.0;
+            format!(
+                " {:.0}% ({}/{})",
+                pct,
+                human_bytes_or_count(o.kind, o.progress_done),
+                human_bytes_or_count(o.kind, o.progress_total)
+            )
+        } else {
+            String::new()
+        };
         let tail = if !o.error.is_empty() {
             format!("  ERROR[{}]: {}", o.error_code, o.error)
         } else if !o.message.is_empty() {
@@ -1889,11 +1926,12 @@ async fn cmd_ops(
             String::new()
         };
         println!(
-            "op {:<20} {:<10} {:<9} target={}{}{}",
+            "op {:<20} {:<10} {:<9} target={}{}{}{}",
             o.op_id,
             op_kind_name(o.kind),
             op_state_name(o.state),
             target,
+            progress,
             attempts,
             tail
         );

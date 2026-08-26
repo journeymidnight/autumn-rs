@@ -1190,6 +1190,11 @@ pub struct PartitionLoad {
     /// Idempotent-retransmit: the manager reconciles by `op_id` and ignores
     /// ones it doesn't know. Empty in the common (untracked / no recent op) case.
     pub maintenance_outcomes: Vec<MaintenanceOutcome>,
+    /// Latest progress sample for whatever maintenance op this partition is
+    /// running now. Empty when idle. At most one entry today — the merged
+    /// GC/compaction loop runs one at a time by construction — but carried as a
+    /// list so a second concurrent kind would not need a wire change.
+    pub active_maintenance: Vec<MaintenanceProgress>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -2191,12 +2196,41 @@ pub struct OpRecord {
     pub attempts: u32,
     /// human outcome ("moved 3", forcegc advisory, "no eligible extents", …).
     pub message: String,
+    /// Live progress of a RUNNING op, as raw counts — bytes for gc/recovery,
+    /// tables for compact, stripes for ec. `total == 0` means "not reported"
+    /// (either the kind has no natural denominator, or none has arrived yet).
+    ///
+    /// Raw counts, NOT a percentage: the wire carries facts and the consumer
+    /// derives the ratio, the same rule cluster-df follows. A percentage alone
+    /// cannot distinguish "2 of 4 tables" from "50 GB of 100 GB", and an
+    /// operator deciding whether to wait needs the magnitude.
+    pub progress_done: u64,
+    pub progress_total: u64,
     /// "cli" / "dashboard" / "auto-policy" / "replay".
     pub requested_by: String,
     /// epoch seconds; `0` = not yet.
     pub submitted_at: i64,
     pub started_at: i64,
     pub finished_at: i64,
+}
+
+/// Live progress of a maintenance op currently running on a PS, piggybacked on
+/// the load heartbeat beside the terminal `MaintenanceOutcome` ring.
+///
+/// Separate from the outcome ring because the two answer different questions
+/// and have different lifetimes: an outcome is terminal and must survive until
+/// the manager claims it, while progress is a sample that is worthless once
+/// superseded. Sending the latest sample every heartbeat means a dropped report
+/// costs nothing.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MaintenanceProgress {
+    pub op_id: u64,
+    /// `OP_KIND_COMPACT` / `OP_KIND_GC` / `OP_KIND_FORCE_GC`.
+    pub kind: u8,
+    /// Units consumed and the denominator, in whatever unit fits the kind
+    /// (bytes scanned for gc, tables merged for compact).
+    pub done: u64,
+    pub total: u64,
 }
 
 /// A PS-executed maintenance op's terminal outcome, reported back to the

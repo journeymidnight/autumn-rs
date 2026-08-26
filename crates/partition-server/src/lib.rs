@@ -1268,6 +1268,11 @@ pub struct PartitionMetrics {
     /// heartbeat so the manager's op-ledger learns the state + error string that
     /// would otherwise die in a PS `tracing::error!`.
     pub maintenance_outcomes: parking_lot::Mutex<VecDeque<manager_rpc::MaintenanceOutcome>>,
+    /// Latest progress sample for the maintenance op running right now, or
+    /// None when idle. A single slot, not a ring: progress is a sample that is
+    /// worthless once superseded, and the merged GC/compaction loop runs one op
+    /// at a time by construction.
+    pub maintenance_progress: parking_lot::Mutex<Option<manager_rpc::MaintenanceProgress>>,
 }
 
 /// Max terminal maintenance outcomes buffered for the heartbeat. Small — each
@@ -1284,6 +1289,33 @@ impl PartitionMetrics {
             r.pop_front();
         }
     }
+    /// Publish how far the currently-running maintenance op has got. Called
+    /// from the op's own loop, so the cost must stay trivial — one short lock,
+    /// once per GC chunk / compaction table, never per record.
+    pub fn set_maintenance_progress(&self, op_id: u64, kind: u8, done: u64, total: u64) {
+        if op_id == 0 {
+            return; // PS-local scheduler run: nothing on the manager to update.
+        }
+        *self.maintenance_progress.lock() = Some(manager_rpc::MaintenanceProgress {
+            op_id,
+            kind,
+            done,
+            total,
+        });
+    }
+
+    /// Drop the progress slot — the op finished (its terminal state travels in
+    /// the outcome ring). Leaving a stale sample would show a finished op as
+    /// forever mid-flight.
+    pub fn clear_maintenance_progress(&self) {
+        *self.maintenance_progress.lock() = None;
+    }
+
+    /// Snapshot the live progress sample for the heartbeat.
+    pub fn snapshot_maintenance_progress(&self) -> Vec<manager_rpc::MaintenanceProgress> {
+        self.maintenance_progress.lock().iter().cloned().collect()
+    }
+
     /// Snapshot (copy, not drain) the ring for the heartbeat — idempotent
     /// retransmit covers a dropped report.
     pub fn snapshot_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
@@ -3555,6 +3587,9 @@ impl PartitionServer {
                             maintenance_outcomes: handle
                                 .metrics
                                 .snapshot_maintenance_outcomes(),
+                            active_maintenance: handle
+                                .metrics
+                                .snapshot_maintenance_progress(),
                         }
                     })
                     .collect()
