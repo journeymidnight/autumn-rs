@@ -1181,3 +1181,117 @@ pub fn decode_last_table_locations(data: &[u8]) -> TableLocations {
     }
     last.expect("no valid TableLocations record")
 }
+
+// ── Crash-takeover harness: a PS that can be SIGKILLed ─────────────────
+
+/// A partition server running as a CHILD PROCESS, so a test can SIGKILL it.
+///
+/// This exists because neither in-process helper can express a real crash, and
+/// the difference is not cosmetic — it decides what is durable at takeover:
+///
+/// - `start_partition_server` spawns a DETACHED thread that serves forever.
+///   Dropping the test's client only closes the client; the server keeps
+///   running and heartbeating, so a takeover PS contests the per-partition
+///   `owner_epoch` and its open/serve wedges (its listener never binds, so the
+///   takeover client cannot even connect).
+/// - `start_partition_server_stoppable` exits cleanly, but `shutdown()` is a
+///   GRACEFUL DRAIN: it rotates the active memtable and flushes every imm
+///   before the thread exits. Anything that lived only in the un-flushed
+///   memtable is made durable on the way out — which is precisely the state a
+///   crash test needs to LOSE.
+///
+/// SIGKILL on a child leaves the durable state exactly where a power cut would,
+/// and it is what production actually experiences. The child is spawned from
+/// the same `target/debug/autumn-ps` the cluster scripts use, so a test also
+/// exercises the real binary's startup path rather than a bespoke in-test one.
+///
+/// Build first: `cargo build -p autumn-server --bins`.
+pub struct KillablePs {
+    child: std::process::Child,
+    ps_id: u64,
+    killed: bool,
+}
+
+impl KillablePs {
+    /// SIGKILL the PS and reap it. No drain, no flush — the on-disk state is
+    /// whatever was already durable. Returns once the process is gone, so a
+    /// takeover PS started after this cannot contest the dead one's epoch.
+    pub fn kill(&mut self) {
+        if self.killed {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.killed = true;
+    }
+}
+
+impl Drop for KillablePs {
+    fn drop(&mut self) {
+        // A leaked PS child would keep heartbeating into the next test's
+        // manager and contest owner locks.
+        self.kill();
+        let _ = self.ps_id;
+    }
+}
+
+/// Spawn `autumn-ps` as a child process bound to `ps_addr`. Waits until its
+/// listener actually accepts before returning, so callers never race startup.
+pub fn start_partition_server_killable(
+    ps_id: u64,
+    mgr_addr: SocketAddr,
+    ps_addr: SocketAddr,
+) -> KillablePs {
+    let bin = support_binary_path("autumn-ps");
+    let child = std::process::Command::new(bin)
+        .arg("--psid")
+        .arg(ps_id.to_string())
+        .arg("--manager")
+        .arg(mgr_addr.to_string())
+        .arg("--port")
+        .arg(ps_addr.port().to_string())
+        .arg("--bind-host")
+        .arg(ps_addr.ip().to_string())
+        .arg("--advertise")
+        .arg(ps_addr.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn autumn-ps");
+
+    let ps = KillablePs {
+        child,
+        ps_id,
+        killed: false,
+    };
+    // The PS binds its listener only after every assigned partition finishes
+    // recovery, so a fixed sleep is not a reliable ready signal.
+    for _ in 0..600 {
+        if std::net::TcpStream::connect_timeout(&ps_addr, Duration::from_millis(200)).is_ok() {
+            return ps;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("autumn-ps {ps_id} never accepted on {ps_addr}");
+}
+
+/// `target/debug/<name>`, honouring `CARGO_TARGET_DIR`.
+fn support_binary_path(name: &str) -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf();
+    let dir = match std::env::var("CARGO_TARGET_DIR") {
+        Ok(d) => std::path::PathBuf::from(d).join("debug"),
+        Err(_) => workspace.join("target").join("debug"),
+    };
+    let p = dir.join(name);
+    assert!(
+        p.exists(),
+        "binary {name} not found at {} — run `cargo build -p autumn-server --bins` first",
+        p.display()
+    );
+    p
+}
