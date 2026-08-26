@@ -1,3 +1,33 @@
+Date: 2026-08-26 (j)
+TaskStatus: not_completed
+Task scope: 自主循环 —— split 右孩子 wedge(A)的【机制链已完整打通,只差"谁发的小 commit"】。未改产品代码。
+  【完整链条(逐环读代码确认,非推断)】
+    1. flush 屏障 await_extent_synced_to 要求【ALL replicas】last_synced >= vp_offset 才写 checkpoint;
+       replica_addrs_for_extent 不做健康筛选 ⇒ 副本集合不是变量。
+    2. handle_commit_length 对【open extent 返回 last_synced】(不是 entry.len)——
+       这是刻意的:entry.len 在 pwrite 前就被预留(build_append_future 第 7 步),
+       返回它会让 manager seal 到未 fsync 的位置。
+    3. truncate_to_commit 里:`len.store(commit)` 之后【也把 last_synced.store(commit)】
+       (注释写明:那些字节已不在盘上,而 last_synced 正是 MSG_COMMIT_LENGTH 返回的东西)。
+    4. ⇒ 某个 writer 发出偏小的 header.commit → truncate 把 last_synced 降到该值
+       → 之后的 seal probe(compute_commit_seal = min over members)读到降低后的值
+       → seal 短于已 checkpoint 的 vp → replay 起点越界 → 右孩子 wedge + 丢 key。
+    降 last_synced 本身【是对的】(字节确实没了)。缺口在【谁发出了低于已 ack 位置的 commit】。
+  【新增可疑点,未验证】seal_and_roll_tail 用 `alloc_new_extent(stream_id, None, 0)` 即【probe 模式】。
+     而 stream CLAUDE.md note 20 明确写 `None` 是 "genuine new-owner takeover ONLY",
+     并警告 probe 会捕获 speculative 字节。但 drain_fenced_open_tails 会在【活跃 writer 正在写】时
+     经 MSG_ROLL_TAILS 调它 —— 与 note 20 的适用条件不符。run1 的 nemesis 序列正是
+     FenceUnfence(→ 触发 drain_fenced_open_tails → ROLL_TAILS)紧接着 Split(第二次 seal)。
+     【下一步要验证的正是这条】:probe seal 与并发写 + truncate 的交互。
+  【捕获器已就位】truncate_to_commit 的 warn(prev_len/commit/dropped)在上一轮加好并验证了低噪声。
+  【本轮 hunt 进度】7 次批量运行中,已完成的都是 ok / stale_vp=0 / trunc_warn=0(命中率 ~1/6,尚未命中)。
+Next steps:
+  1) 继续 hunt 直到命中;命中时看 truncate warn 的 prev_len→commit,反推是哪个 writer。
+     【反向判据】若命中 stale_vp 却无 truncate warn,则第 3-4 环不成立,问题在 vp 侧(checkpoint 记了不该记的 vp)。
+  2) 独立于 hunt,可先审 seal_and_roll_tail 的 probe 用法是否违反 note 20 的适用条件
+     ——这条不需要复现就能读出结论,若确实违反,再判断它能否产生"seal 短于 vp"。
+  3) 改 verify_no_ec_markers_pinned 断言(带 coordinator 状态 + age 门限)。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (i)
 TaskStatus: not_completed
 Task scope: 自主循环 —— 追 split 右孩子 wedge(A)。【把矛盾收窄到一个具体机制,并架好捕获器;未抓到根因,未修】。
