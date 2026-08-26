@@ -1,3 +1,29 @@
+Date: 2026-08-26 (r)
+TaskStatus: not_completed
+Task scope: 自主循环 —— F1+F4 用排除法收敛到【compaction 的 vp_head MAX】。产品代码未动。
+  【已排除:replay 起点的选择逻辑本身】
+     recover_partition 的两处 chosen_pos 选择(meta_records 循环 lib.rs:7942 附近、
+     SST reader 循环 :8099 附近)【都取最小 position】(`pos < chosen_pos`,tie-break 取更小 offset)
+     ⇒ 选择是保守的,宁可多 replay,不会"选得太靠后"。
+     另:vp 指向的 extent 不在 stream 里时那条记录被 continue 跳过,但 fallback 同样取最小 ⇒ 也不会变靠后。
+  【剩下唯一会【推进】replay 起点的地方:compaction】
+     partition-server CLAUDE.md 明写:do_compact 用【MAX over INPUT SSTs' vp_heads by STREAM POSITION】
+     stamp 输出 SST + meta checkpoint,并说明这样"ADVANCES the GC replay floor"。
+     ⇒ 若这个 MAX 算大了,replay 起点就太靠后,正好产生 F4(跳过中间一段)/ F1(越过 extent 末尾)。
+  【为什么这条与 split 右孩子高度吻合】
+     右孩子继承的是【CoW 共享的 SST】,它们的 vp_head 指向【源分区】的位置;
+     MAX 的计算依据是 "first-occurrence index into log_extent_ids",而右孩子的 log_extent_ids
+     是 duplicate 来的。CoW 之后 extent 的位置/重复情况与源分区不同,
+     若 first-occurrence 映射在右孩子这边解析出不同的 position,MAX 就可能选出一个
+     【对右孩子不安全】的更靠后的 vp。
+  Next steps:
+  1) 【下一轮从这里开始】读 do_compact 的 vp_head MAX 计算(background.rs,compaction_vp_head_tests 附近):
+     - MAX 是否只在【本分区自己的 log_extent_ids】上解析 position;
+     - CoW 共享 SST(vp_head 来自源分区)在右孩子的列表里解析出的 position 是否仍然正确;
+     - 右孩子首次 compaction 后 checkpoint 的 vp 是否可能超过它自己 replay 所需的起点。
+     已有单测 compaction_vp_head_tests 可作为改动的对照。
+  2) F3 单独查 EC+VP 读链;3) 评审剩余 P1 批次。
+─────────────────────────────────────────────────────────────
 Date: 2026-08-26 (q)
 TaskStatus: not_completed
 Task scope: 自主循环 —— F2 的断言分级(commit 见下)。产品代码未动,仅改 chaos 断言。
