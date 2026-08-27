@@ -49,7 +49,7 @@ PIDS+=($!); wait_port "$PS_PORT" 20 || { echo "[e2e] FAIL PS"; tail -8 "$WORK/ps
 sleep 4  # register + open partition
 
 echo "[e2e] running tests/e2e.rs"
-AUTUMN_MEMORY_E2E_MANAGER="$MGR" cargo test -p autumn-memory --test e2e -- --ignored --nocapture \
+AUTUMN_MEMORY_E2E_MANAGER="$MGR" cargo test -p autumn-memory --test e2e --test scan_boundary -- --ignored --nocapture \
   >"$WORK/e2e.log" 2>&1
 RC=$?
 echo "===== e2e exit: $RC ====="; tail -8 "$WORK/e2e.log"

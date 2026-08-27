@@ -191,14 +191,14 @@ impl MemoryStore {
             }
             let last_key = res.entries[n - 1].key.clone();
             for e in res.entries {
-                // The PS serves `start` as an INCLUSIVE user-key bound, and the
-                // `last_key+\0` successor idiom does NOT exclude the boundary
-                // key: the MVCC internal encoding (`user ++ 0x00 ++ inv-seq`)
-                // sorts `K+"\0"` at ts=MAX BEFORE K's own versions, so K is
-                // served again as the next page's first entry. Drop anything
-                // at-or-before the previous page's tail — without this, every
-                // page boundary double-counts one key (a >page_limit corpus
-                // made `reconcile()` report `docs` high by one per boundary).
+                // `RangeReq.start` is INCLUSIVE and there is no way to ask for
+                // "after K" — see its field docs. So resume from the previous
+                // page's last key and drop that key when it comes back as this
+                // page's first entry.
+                //
+                // Do NOT try to skip it with a `K + 0x00` successor: internal
+                // keys are `user ++ 0x00 ++ BE(MAX - seq)`, so `K + 0x00` seeks
+                // BEFORE all of K's own versions and K is served again anyway.
                 if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
                     continue;
                 }
@@ -214,7 +214,6 @@ impl MemoryStore {
             }
             prev_last = Some(last_key.clone());
             start = last_key;
-            start.push(0u8);
         }
         Ok(out)
     }

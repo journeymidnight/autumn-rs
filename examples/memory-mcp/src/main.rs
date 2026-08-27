@@ -231,10 +231,9 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
         }
         let last = res.entries[n - 1].key.clone();
         for e in res.entries {
-            // The resume start is served inclusively (the `+\0` successor does
-            // not exclude the boundary key — see MemoryStore::scan_keys), so
-            // the previous page's tail comes back first: skip it rather than
-            // deleting (and counting) it twice.
+            // `RangeReq.start` is INCLUSIVE and cannot express "after K", so
+            // the previous page's tail comes back as this page's first entry:
+            // skip it rather than deleting (and counting) it twice.
             if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
                 continue;
             }
@@ -246,7 +245,6 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
         }
         prev_last = Some(last.clone());
         start = last;
-        start.push(0);
     }
     Ok(total)
 }
