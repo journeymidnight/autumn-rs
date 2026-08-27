@@ -424,7 +424,11 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   seals the CURRENT tail: the captured length would be stamped onto the
     //   roll's fresh empty extent, sealed longer than any replica holds, and
     //   the CoW child's replay could never read it. `0` = no claim (skip).
-    (29, "fad8cec20c7f20ba"),
+        //   v29 refreshed IN PLACE again (still undeployed): RangeReq.start now
+    //   documents that it is INCLUSIVE and that neither `K+0x00` nor
+    //   `K+0x01` expresses "resume after K" — comment-only, but the
+    //   fingerprint hashes whole schema files.
+    (29, "3193599e8b211638"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -1213,6 +1213,35 @@ turn-ON edge, never a false reject.
   that makes fuse write `fs/…`. In-process test managers run memory-mode and never
   seed builtins, so Layer-A is OFF in the suite unless a test `namespace-create`s.
 
+## Range paging: `start` is INCLUSIVE, and the client cannot express "after K"
+
+`RangeReq.start` begins the scan at that key, inclusive. There is deliberately
+no exclusive form, and the two constructions a caller reaches for are both
+wrong — in OPPOSITE directions. Internal keys are
+`user_key ++ 0x00 ++ BE(u64::MAX - seq)` and `parse_key` strips a FIXED-width
+suffix rather than scanning for the separator, so **a user key may legally
+contain `0x00`**:
+
+- `K ++ 0x00` sorts BEFORE every version of K (small seq ⇒ inverted-seq leads
+  with `0xFF`, and `0x00 < 0xFF`), so the boundary key is re-served: a silent
+  DOUBLE-COUNT at every page boundary. Found via `memory-mcp`'s doc corpus,
+  which was the first index large enough to need a second page.
+- `K ++ 0x01` skips any real user key of the form `K ++ 0x00 ++ …` — silent
+  DATA LOSS, and this repo has such keys (fs keys are binary
+  `[0x03][lane][ino][off]`, big-endian integers full of zero bytes).
+
+So the only correct idiom is: pass the previous page's LAST key and DROP the
+first returned entry, which is that same key. `MemoryStore::scan_keys` and
+`memory-mcp`'s `wipe_agent` both do this; `crates/autumn-memory/tests/
+scan_boundary.rs` pins the property (300 docs, page 128 — pre-fix the reconcile
+counted 302).
+
+**The clean fix, not yet done:** a server-computed OPAQUE page cursor on
+`RangeResp`. The encoding belongs on the server, and `cur_end_key` already
+establishes the cursor idea one level up (cross-partition ResumeSpan); this
+would be the same idea at page granularity, and would let every caller drop its
+dedupe. Until then, this section is the contract.
+
 ## region_epoch check (TiKV-style)
 
 Each `PartitionData` carries `region_epoch: u64`, populated at open from

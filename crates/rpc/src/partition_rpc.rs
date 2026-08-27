@@ -584,6 +584,31 @@ pub struct HeadResp {
 pub struct RangeReq {
     pub part_id: u64,
     pub prefix: Vec<u8>,
+    /// Where the scan begins, **INCLUSIVE** — an entry whose key equals
+    /// `start` IS returned.
+    ///
+    /// There is no way for a caller to express "resume strictly after key K",
+    /// and the two obvious tricks are both WRONG in opposite directions.
+    /// Internal keys are `user_key ++ 0x00 ++ BE(u64::MAX - seq)` and
+    /// `parse_key` strips a fixed-width suffix rather than scanning for the
+    /// separator, so a user key may legally contain `0x00`:
+    ///
+    /// - `K ++ 0x00` sorts BEFORE every version of K (its inverted-seq byte is
+    ///   `0xFF` for small seq, and `0x00 < 0xFF`), so the boundary key comes
+    ///   back again — a silent double-count across page boundaries.
+    /// - `K ++ 0x01` skips any real user key of the form `K ++ 0x00 ++ …` —
+    ///   silent data loss, and this repo has such keys (fs keys are binary:
+    ///   `[0x03][lane][ino][off]`, big-endian integers full of zero bytes).
+    ///
+    /// So paginate by passing the previous page's LAST key and dropping the
+    /// first returned entry, which is that same key. `MemoryStore::scan_keys`
+    /// and `memory-mcp`'s `wipe_agent` both do exactly that; the property is
+    /// pinned by `crates/autumn-memory/tests/scan_boundary.rs`.
+    ///
+    /// The clean fix is a server-computed opaque page cursor on `RangeResp`
+    /// (the encoding belongs on the server, and `cur_end_key` already
+    /// establishes the cursor idea one level up, at partition granularity).
+    /// Until that exists, this comment is the contract.
     pub start: Vec<u8>,
     pub limit: u32,
     /// See `PutReq.region_epoch`. Especially important for range:
