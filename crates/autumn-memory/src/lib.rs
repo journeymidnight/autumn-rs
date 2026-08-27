@@ -182,6 +182,7 @@ impl MemoryStore {
     ) -> Result<Vec<Vec<u8>>, AutumnError> {
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut start: Vec<u8> = Vec::new();
+        let mut prev_last: Option<Vec<u8>> = None;
         loop {
             let res = self.client.range(prefix, &start, self.page_limit).await?;
             let n = res.entries.len();
@@ -190,6 +191,17 @@ impl MemoryStore {
             }
             let last_key = res.entries[n - 1].key.clone();
             for e in res.entries {
+                // The PS serves `start` as an INCLUSIVE user-key bound, and the
+                // `last_key+\0` successor idiom does NOT exclude the boundary
+                // key: the MVCC internal encoding (`user ++ 0x00 ++ inv-seq`)
+                // sorts `K+"\0"` at ts=MAX BEFORE K's own versions, so K is
+                // served again as the next page's first entry. Drop anything
+                // at-or-before the previous page's tail — without this, every
+                // page boundary double-counts one key (a >page_limit corpus
+                // made `reconcile()` report `docs` high by one per boundary).
+                if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
+                    continue;
+                }
                 out.push(e.key);
                 if let Some(m) = max_items {
                     if out.len() >= m {
@@ -200,8 +212,9 @@ impl MemoryStore {
             if n < self.page_limit as usize {
                 break;
             }
+            prev_last = Some(last_key.clone());
             start = last_key;
-            start.push(0u8); // exclusive successor of last_key
+            start.push(0u8);
         }
         Ok(out)
     }

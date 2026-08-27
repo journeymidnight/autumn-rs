@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Download a Model2Vec static embedding model and convert it to the compact
-`M2VS` int8 table the codebase-memory `--features static-embed` build loads.
+`M2VS` int8 table the memory-mcp `--features static-embed` build loads.
 
 Model2Vec is a distilled token→vector lookup table (no transformer at inference),
 so the "model" is one `[vocab, dim]` float matrix + a `tokenizer.json`. We

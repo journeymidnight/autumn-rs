@@ -46,8 +46,9 @@ self-healing extents.
 - **Agent memory** — `autumn-memory`: episodic logs, a fact store, an
   associative graph, and retrieval that combines **BM25** (CJK-aware), **IVF
   vector search**, and **hybrid RRF** — entirely client-side on plain KV. A
-  Rust example app (web UI + **MCP** `--mcp` stdio) sits on it — `codebase-memory`
-  indexes this repo's own source; recall P99 ≈ 25 ms on the agent turn loop.
+  Rust example app (web UI + **MCP** `--mcp` stdio) sits on it — `memory-mcp`
+  ingests code (this repo's own source) and/or markdown docs; recall P99 ≈ 25 ms
+  on the agent turn loop.
 
 **The engine underneath:**
 - **Fast by construction** — thread-per-core on io_uring (compio), custom binary
@@ -144,17 +145,18 @@ caches survive restarts and are shared across inference instances. Setup +
 design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
 [`docs/hicache_l3_interface.md`](docs/hicache_l3_interface.md).
 
-### Agent memory — web UI + MCP
+### Agent memory — MCP server + web UI
 
-**`examples/codebase-memory`** sits on `autumn-memory` (an Axum web UI + an MCP
-`--mcp` stdio mode, so any MCP host — Claude Code/Desktop, Cursor — gets the same
-tools): it indexes a codebase (autumn-rs itself), searches it (lexical / vector /
-hybrid), and walks the call graph (callers / callees / trace) — in the browser or
-as MCP tools for Claude.
+**`examples/memory-mcp`** sits on `autumn-memory` (an MCP `--mcp` stdio mode, so
+any MCP host — Claude Code/Desktop, Cursor — gets the same tools, plus an Axum
+web UI): it puts a corpus into autumn — a Rust codebase (tree-sitter symbols +
+call graph) and/or markdown documents (heading-aware chunks + outline) — and
+serves retrieval back (lexical / vector / hybrid search, graph walks:
+callers / callees / trace for code, document outlines for prose).
 
 ```bash
-cargo run -p codebase-memory -- 127.0.0.1:9001 --root crates/autumn-memory   # web UI at :5180
-claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- 127.0.0.1:9001 --mcp
+cargo run -p memory-mcp -- 127.0.0.1:9001 --docs docs   # ingest docs/ + code, web UI at :5100
+claude mcp add autumn-memory -- cargo run -q -p memory-mcp -- 127.0.0.1:9001 --mcp
 ```
 
 Lexical (BM25) recall needs no embedder; vector/hybrid take a caller-supplied

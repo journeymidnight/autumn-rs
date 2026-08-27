@@ -1,3 +1,39 @@
+Date: 2026-08-27
+TaskStatus: completed
+Task scope: memory-mcp —— codebase-memory 例子泛化成"一个 MCP server,两种 ingester(代码/文档)",
+  按用户判断合并而非另起第二个例子;不动 hermes-autumn-memory(只加 scope 说明行)。
+【做了什么】
+  1. 重命名 examples/codebase-memory → examples/memory-mcp(crate/binary/workspace/README/
+     `claude mcp add autumn-memory -- cargo run -q -p memory-mcp …`;默认 tenant codebase→memory,
+     cluster.sh authz spec 改 memory.cred/mem/memory/;ops.md、autumn_memory_plan、
+     key_namespace_split_design、autumn-memory CLAUDE.md 交叉引用全刷)。
+  2. 新增 src/docs.rs:markdown/纯文本 ingester —— 按 ATX heading 切 section(fence 内 # 屏蔽),
+     超 ~2.8KB 按段落再切+一段重叠;chunk id = "<relpath>#L<start>-L<end>"(与代码 id "::" 不撞);
+     索引文本前置 "file › heading › …" breadcrumb;heading 层级落成 Document→Section CONTAINS
+     outline(同一套图走法)。4 个单测(层级/fence/切分重叠/无 heading 纯文本)。
+  3. MCP 面从 5 tool → 9:新增 ingest_documents(运行时服务端路径 ingest)/ search_docs /
+     list_documents / document_outline;search_code 与 search_docs 用 meta.kind 做 corpus 过滤
+     (超采 k*3+8 再截),互不漏;/search 加 corpus=code|docs|all;get_symbol 两种 id 通吃。
+  4. 顺手修了一个真 bug(deterministic 复现后才动手):PS 把 range start 当【含】user-key 下界,
+     而 "last_key+\0" 续扫惯用法排不掉边界 key(MVCC 内部编码 user++0x00++inv-seq 让 K+"\0"@tsMAX
+     排在 K 自己版本之前)⇒ 每页边界重复 1 个 key ⇒ >page_limit 语料 reconcile() docs 虚高、
+     is_clean 误报 false。修在 autumn-memory scan_keys(+例子 wipe_agent)加边界去重;
+     PS 侧契约问题【没动】(热读路径,留给 owner 决定)。回归测试 tests/scan_boundary.rs
+     (live-cluster,#[ignore] 门同 e2e.rs)。
+  5. ops.md:替换掉整段已失效的 Phase-2 Python 验证(python memory glue 在 5a07a60 已删,
+     文档还在教人跑不存在的脚本)→ 换成 memory-mcp 双语料+MCP stdio 实测步骤。
+【验证(全部真集群实跑)】cluster.sh start 3;--root crates/autumn-memory --docs docs →
+  stats {"docs":555,"edges":893,"is_clean":true,"symbols":574}(修 bug 前 docs=556/is_clean=false);
+  docs 检索带 file+heading path+行号(ops.md#L1127-L1179 [ …> Turnkey dev cluster with authz]);
+  corpus=code 不漏 prose(doc 词查询 → NO HITS);MCP stdio 全链:initialize/9 tools/search_docs/
+  ingest_documents(运行时加 crates/manager/CLAUDE.md → 45 chunks 立即可检索)/list_documents/
+  document_outline(heading 树带 depth)/search_code;--reset 全清重建 exact。
+  门:autumn-memory --lib 22 绿 + e2e --ignored 5/5 绿 + scan_boundary 绿;memory-mcp 4 单测绿;
+  clippy 两 crate 0 新告警。
+【坑】pkill -f 带路径又自杀了一次(exit 144,用 pkill -x);旧 README 记载的 /graph 路由与
+  Graph tab 实际不存在(新 README 已按现状写)。
+Next steps: 无 —— 功能闭环。PS range 含边界 start 的契约问题(见上 4)可另立条目定夺。
+
 Date: 2026-08-26 (b)
 TaskStatus: completed
 Task scope: F1+F4 已 ack 写丢失(split 右孩子 wedge / 静默旧值)——根因、修复、验证。上一轮的

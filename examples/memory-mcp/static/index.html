@@ -113,7 +113,7 @@ footer a { color:var(--accent); text-decoration:none; } footer a:hover { text-de
 <body>
 <div class="shell">
   <header>
-    <h1>codebase <em>memory</em></h1>
+    <h1>memory<em>-mcp</em> <span style="opacity:.55;font-size:.55em">code view</span></h1>
     <nav class="nav">
       <button id="nav-search" class="on" onclick="showView('search')">Search</button>
       <button id="nav-mcp" onclick="showView('mcp')">MCP</button>
@@ -153,11 +153,11 @@ footer a { color:var(--accent); text-decoration:none; } footer a:hover { text-de
   <div id="view-mcp">
     <footer>
       <h3>Use with <em>Claude</em> via MCP</h3>
-      <p>Give Claude this codebase index as tools. The same binary speaks MCP over stdio with
+      <p>Give any MCP client this memory as tools — code search + call graph, and document ingest/retrieval (search_docs, ingest_documents). The same binary speaks MCP over stdio with
          <code>--mcp</code> (no extra process, no Python — it queries this already-indexed agent).
          Run from the autumn-rs repo root. In <b>Claude Code</b>:</p>
       <div class="cmd">
-        <code id="mcp-cmd"><span class="prompt">$ </span><span id="mcp-line">claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- 127.0.0.1:9001 --mcp</span></code>
+        <code id="mcp-cmd"><span class="prompt">$ </span><span id="mcp-line">claude mcp add autumn-memory -- cargo run -q -p memory-mcp -- 127.0.0.1:9001 --mcp</span></code>
         <button class="copy" onclick="copyCmd()">copy</button>
       </div>
       <p class="tools">Tools exposed: <b>search_code</b> · <b>get_symbol</b> · <b>find_callers</b> · <b>find_callees</b> · <b>trace_call_path</b>.
@@ -179,7 +179,7 @@ function badge(k){ return `<span class="badge" style="color:${kcol(k)}">${esc(k)
   const cfg = await j("/config");
   $("m-sym").textContent = cfg.symbols; $("m-edge").textContent = cfg.edges; $("m-emb").textContent = cfg.embedder;
   const ag = (cfg.agent && cfg.agent !== "default") ? ` --agent ${cfg.agent}` : "";
-  $("mcp-line").textContent = `claude mcp add codebase-memory -- cargo run -q -p codebase-memory -- ${cfg.manager || "127.0.0.1:9001"}${ag} --mcp`;
+  $("mcp-line").textContent = `claude mcp add autumn-memory -- cargo run -q -p memory-mcp -- ${cfg.manager || "127.0.0.1:9001"}${ag} --mcp`;
   const seg = $("modes");
   (cfg.modes || ["lexical"]).forEach((m,i) => {
     const b = document.createElement("button");

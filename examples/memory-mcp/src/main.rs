@@ -1,15 +1,19 @@
-//! codebase-memory — index a Rust codebase (autumn-rs itself, by default) into
-//! autumn-memory and search it from a browser, with a CALLS graph you can walk.
+//! memory-mcp — put a corpus into autumn and serve retrieval from it to any
+//! MCP client. Two ingesters share one store: a Rust-code indexer
+//! (tree-sitter: symbols + a CALLS/CONTAINS graph) and a markdown/plain-text
+//! ingester (heading-aware chunks + a CONTAINS outline). The same binary is a
+//! web UI for the code corpus and, with `--mcp`, a stdio MCP server over both.
 //! A Rust example (like `gallery`): Axum on the compio runtime over
 //! `autumn-memory` directly.
 //!
 //! Usage:
-//!   cargo run -p codebase-memory -- [MANAGER] [--root PATH]
-//!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index]
+//!   cargo run -p memory-mcp -- [MANAGER] [--root PATH] [--docs PATH]...
+//!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index] [--mcp]
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
-//! Then open http://127.0.0.1:5100 .
+//! Then open http://127.0.0.1:5100 (or register the --mcp form with Claude).
 
 use autumn_memory::embed;
+mod docs;
 mod indexer;
 mod store;
 
@@ -29,7 +33,7 @@ use send_wrapper::SendWrapper;
 use serde_json::{json, Value};
 
 use embed::Embedder;
-use store::Code;
+use store::{Code, Corpus};
 
 const LISTEN_PORT: u16 = 5100;
 
@@ -106,7 +110,8 @@ async fn h_search(app: &App, p: P) -> Result<Response<Body>, AppError> {
         mode
     };
     let k: usize = opt(&p, "k", "10").parse().unwrap_or(10);
-    let hits = app.code.search_code(q, mode, k).await?;
+    let corpus = Corpus::parse(opt(&p, "corpus", "code"));
+    let hits = app.code.search(q, mode, k, corpus).await?;
     Ok(json_ok(&json!({ "hits": hits })))
 }
 
@@ -190,6 +195,8 @@ fn router(shared: Shared) -> Router {
 struct Args {
     manager: String,
     root: Option<PathBuf>,
+    /// document trees/files (`--docs`, repeatable) ingested at startup.
+    docs: Vec<PathBuf>,
     tenant: String,
     agent: String,
     /// path to the tenant credential (from `autumn-op tenant-create`,
@@ -214,6 +221,7 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
     let client = store.client();
     let prefix = autumn_memory::keys::agent_prefix(tenant, agent);
     let mut start: Vec<u8> = Vec::new();
+    let mut prev_last: Option<Vec<u8>> = None;
     let mut total = 0usize;
     loop {
         let res = client.range(&prefix, &start, 512).await?;
@@ -223,14 +231,22 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
         }
         let last = res.entries[n - 1].key.clone();
         for e in res.entries {
+            // The resume start is served inclusively (the `+\0` successor does
+            // not exclude the boundary key — see MemoryStore::scan_keys), so
+            // the previous page's tail comes back first: skip it rather than
+            // deleting (and counting) it twice.
+            if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
+                continue;
+            }
             client.delete(&e.key).await?;
             total += 1;
         }
         if n < 512 {
             break;
         }
+        prev_last = Some(last.clone());
         start = last;
-        start.push(0); // exclusive successor of the last key
+        start.push(0);
     }
     Ok(total)
 }
@@ -239,7 +255,8 @@ fn parse_args() -> Args {
     let mut a = Args {
         manager: "127.0.0.1:9001".into(),
         root: None,
-        tenant: "codebase".into(),
+        docs: Vec::new(),
+        tenant: "memory".into(),
         agent: "default".into(),
         credential_file: std::env::var("AUTUMN_CREDENTIAL_FILE").ok().filter(|s| !s.is_empty()),
         host: "127.0.0.1".into(),
@@ -255,6 +272,11 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--root" => a.root = it.next().map(PathBuf::from),
+            "--docs" => {
+                if let Some(p) = it.next() {
+                    a.docs.push(PathBuf::from(p));
+                }
+            }
             "--tenant" => a.tenant = it.next().unwrap_or(a.tenant),
             "--agent" => a.agent = it.next().unwrap_or(a.agent),
             "--credential-file" => a.credential_file = it.next(),
@@ -299,14 +321,23 @@ fn build_embedder(a: &Args) -> Embedder {
 
 fn mcp_tool_defs() -> Value {
     let id = json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]});
+    let query = json!({"type":"object","properties":{"query":{"type":"string"},"mode":{"type":"string"},"k":{"type":"integer"}},"required":["query"]});
     json!([
-        {"name":"search_code","description":"Search the indexed codebase (mode: lexical|vector|hybrid|auto). Returns symbols with source, kind, file:line, score.",
-         "inputSchema":{"type":"object","properties":{"query":{"type":"string"},"mode":{"type":"string"},"k":{"type":"integer"}},"required":["query"]}},
-        {"name":"get_symbol","description":"Full source + metadata for a symbol id (e.g. 'src/lib.rs::MemoryStore::add_edge').","inputSchema":id},
+        {"name":"search_code","description":"Search the indexed codebase (mode: lexical|vector|hybrid|auto). Returns symbols with source, kind, file:line, score. Code only — use search_docs for prose.",
+         "inputSchema": query},
+        {"name":"get_symbol","description":"Full text + metadata for an id — a code symbol ('src/lib.rs::MemoryStore::add_edge') or a document chunk ('docs/ops.md#L10-L42').","inputSchema":id},
         {"name":"find_callers","description":"Symbols that call `id`.","inputSchema":id},
         {"name":"find_callees","description":"Symbols that `id` calls.","inputSchema":id},
         {"name":"trace_call_path","description":"Bounded call-path from `id` (direction out=callees, in=callers).",
-         "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"}},"required":["id"]}}
+         "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"}},"required":["id"]}},
+        {"name":"ingest_documents","description":"Ingest markdown/plain-text (.md/.markdown/.txt) from `path` (file or directory, server-side) into the memory store: heading-aware chunks, BM25+vector indexed, heading hierarchy as a CONTAINS outline. Upserts by chunk id; returns counts.",
+         "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+        {"name":"search_docs","description":"Search ingested documents (mode: lexical|vector|hybrid|auto). Returns chunks with text, source file, heading path, line range, score — enough to cite 'file › headings, lines a-b'.",
+         "inputSchema": query},
+        {"name":"list_documents","description":"List ingested document files.",
+         "inputSchema":{"type":"object","properties":{}}},
+        {"name":"document_outline","description":"Heading outline of an ingested document (`id` = its file path, from list_documents or a chunk's `file`), depth-tagged.",
+         "inputSchema":id}
     ])
 }
 
@@ -314,15 +345,14 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto") {
+        "auto" => "hybrid",
+        m => m,
+    };
+    let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
     let data: Value = match name {
-        "search_code" => {
-            let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto") {
-                "auto" => "hybrid",
-                m => m,
-            };
-            let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-            json!(code.search_code(&s("query"), mode, k).await?)
-        }
+        "search_code" => json!(code.search(&s("query"), mode, k, Corpus::Code).await?),
+        "search_docs" => json!(code.search(&s("query"), mode, k, Corpus::Docs).await?),
         "get_symbol" => code.get_symbol(&s("id")).await?.unwrap_or(Value::Null),
         "find_callers" => json!(code.callers(&s("id")).await?),
         "find_callees" => json!(code.callees(&s("id")).await?),
@@ -330,6 +360,23 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
             let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
             json!(code.trace(&s("id"), dir).await?)
         }
+        "ingest_documents" => {
+            let path = PathBuf::from(s("path"));
+            if !path.exists() {
+                return Ok(json!({"content":[{"type":"text",
+                    "text":format!("path not found: {}", path.display())}],"isError":true}));
+            }
+            let (files, chunks, edges) = docs::ingest_path(&code.store, &code.emb, &path).await?;
+            if chunks > 0 {
+                let r = code.store.reconcile().await?;
+                code.store
+                    .train_centroids(((r.docs as usize) / 20).clamp(1, 64), 25, 7)
+                    .await?;
+            }
+            json!({"files": files, "chunks": chunks, "edges": edges})
+        }
+        "list_documents" => json!(code.documents().await?),
+        "document_outline" => json!(code.outline(&s("id")).await?),
         other => {
             return Ok(json!({"content":[{"type":"text","text":format!("unknown tool {other}")}],"isError":true}))
         }
@@ -358,7 +405,7 @@ async fn run_mcp_stdio(code: &Code) -> Result<()> {
         let result: Option<Value> = match method {
             "initialize" => Some(json!({
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "codebase-memory", "version": "0.1.0"},
+                "serverInfo": {"name": "memory-mcp", "version": "0.1.0"},
                 "capabilities": {"tools": {}}
             })),
             "tools/list" => Some(json!({ "tools": mcp_tool_defs() })),
@@ -433,7 +480,7 @@ async fn main() -> Result<()> {
     // MCP stdio mode: speak JSON-RPC over stdin/stdout against the existing
     // index (no HTTP, no indexing — index via the web app first).
     if args.mcp {
-        tracing::info!("codebase-memory MCP stdio server (agent={})", args.agent);
+        tracing::info!("memory-mcp MCP stdio server (agent={})", args.agent);
         return run_mcp_stdio(&code).await;
     }
 
@@ -474,6 +521,18 @@ async fn main() -> Result<()> {
         tracing::info!("agent already indexed ({symbols} symbols) — serving it; --reindex to rebuild");
     }
 
+    let mut doc_chunks = 0usize;
+    for d in &args.docs {
+        tracing::info!("ingesting documents from {} ...", d.display());
+        let (f, c, e) = docs::ingest_path(&store, &emb, d).await?;
+        tracing::info!("ingested {c} chunks ({e} outline edges) from {f} files");
+        doc_chunks += c;
+    }
+    if doc_chunks > 0 {
+        let r = store.reconcile().await?;
+        store.train_centroids(((r.docs as usize) / 20).clamp(1, 64), 25, 7).await?;
+    }
+
     let cfg = json!({
         "tenant": args.tenant, "agent": args.agent, "manager": args.manager,
         "embedder": emb.name(), "dim": emb.dim(),
@@ -486,7 +545,7 @@ async fn main() -> Result<()> {
     let listener =
         compio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
     tracing::info!(
-        "codebase-memory → http://{}:{}  ({} symbols, embedder={})",
+        "memory-mcp → http://{}:{}  ({} symbols, embedder={})",
         args.host,
         args.port,
         symbols,

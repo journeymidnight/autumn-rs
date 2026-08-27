@@ -4,9 +4,9 @@
 
 Framework-agnostic **AI-agent-memory** core, built as a pure client-side
 library over `autumn-client::ClusterClient` (no daemon, no server-side change).
-Consumers are Rust: the `examples/codebase-memory` app uses the crate directly
-(web UI + MCP) to index/search a codebase and walk its call graph. Design +
-rationale: `docs/autumn_memory_plan.md`.
+Consumers are Rust: the `examples/memory-mcp` app uses the crate directly
+(MCP server + web UI) to ingest a corpus — code symbols and/or markdown chunks —
+search it, and walk its graph. Design + rationale: `docs/autumn_memory_plan.md`.
 
 `MemoryStore` is `!Send` (single-thread compio, like the whole client surface)
 — drive its async methods on a compio runtime.
@@ -35,7 +35,7 @@ hashing — always available) and, behind the **`static-embed`** feature,
 `StaticTableEmbedder` (a Model2Vec-style int8 lookup table, needs `tokenizers`).
 `Embedder` dispatches; all emit an `EMBED_DIM`-length L2-normalized vector.
 Errors are a local `EmbedError` (the core takes no `anyhow` dep). The `gallery`-
-style example `examples/codebase-memory` uses it.
+style example `examples/memory-mcp` uses it.
 
 ## Lexical recall — BM25-on-KV (`recall.rs`, plan §7 词法腿)
 
@@ -146,6 +146,14 @@ An OFF-hot-path integrity audit + heal (the plan's per-phase acceptance tool):
 - `repair_stats()`: rewrites `meta/stats` from a fresh `doc/` recount (no IVF
   scan). MUST run in a writer-quiesced maintenance window — it is itself a
   read-then-write with no CAS, so a concurrent write would be clobbered.
+- **Page-boundary dedupe in `scan_keys`**: the PS serves a range `start` as an
+  INCLUSIVE user-key bound, and the `last_key+"\0"` resume idiom does NOT
+  exclude the boundary key — the MVCC internal encoding (`user ++ 0x00 ++
+  inv-seq`) sorts `K+"\0"` at ts=MAX *before* K's own versions, so K comes
+  back as the next page's first entry. `scan_keys` drops any entry at-or-before
+  the previous page's tail; without it every audit over a >`page_limit` corpus
+  over-counted one key per page boundary (`is_clean()` false-alarmed).
+  Regression: `tests/scan_boundary.rs` (live-cluster, like `e2e.rs`).
 
 This is the deliberate answer to the **multi-writer `meta/stats` RMW race**:
 `update_stats` is read-modify-write, so two processes writing the SAME agent
@@ -168,4 +176,5 @@ in autumn (Phase 0, plan §16); a single trusted org can run on prefixes alone.
 prefix isolation in `keys.rs`; tokenizer incl. plural-fold + CJK in `recall.rs`;
 BM25 monotonicity; vector cosine / kmeans / IVF in `vector.rs`). The async store
 ops + reconcile/repair are exercised e2e against a live cluster (`tests/e2e.rs`
-+ the isolated-cluster harness `tests/run_e2e.sh`).
++ the isolated-cluster harness `tests/run_e2e.sh`); `tests/scan_boundary.rs`
+pins the page-boundary dedupe (reconcile over a >page corpus counts exactly).

@@ -13,7 +13,7 @@ members = [
   "crates/fuse",
   "crates/autumn-memory",
   "examples/gallery",
-  "examples/codebase-memory",
+  "examples/memory-mcp",
   "examples/dashboard",
 ]
 default-members = [

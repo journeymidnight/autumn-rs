@@ -632,26 +632,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "codebase-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "autumn-client",
- "autumn-memory",
- "axum",
- "bytes",
- "compio",
- "cyper-axum",
- "futures",
- "send_wrapper",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-rust",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1955,6 +1935,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "memory-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autumn-client",
+ "autumn-memory",
+ "axum",
+ "bytes",
+ "compio",
+ "cyper-axum",
+ "futures",
+ "send_wrapper",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]

@@ -1,5 +1,10 @@
 # Hermes agent on autumn-rs (vLLM + autumn-kvcache + autumn-memory)
 
+> Scope: a **deployment integration demo** (vLLM + KV-cache + a Hermes-specific
+> Python memory provider on k8s). For the general-purpose memory example — an
+> MCP server any agent can use for ingest + retrieval — see
+> [`examples/memory-mcp`](../memory-mcp/).
+
 Deployment **glue**, kept out of autumn-rs core on purpose: the core exposes only
 the Rust `autumn-memory` lib + the stable `mem/` key schema
 (`crates/autumn-memory/src/keys.rs`, `docs/autumn_memory_plan.md §6`). Each agent

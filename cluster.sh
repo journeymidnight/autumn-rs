@@ -1039,7 +1039,7 @@ do_start() {
     # per-example tenant credentials into $DATA_ROOT/authz/. Idempotent — a
     # tenant whose .cred already exists is left alone so restarts keep working.
     # The examples read their cred via AUTUMN_CREDENTIAL_FILE / --credential-file:
-    #   codebase-memory --credential-file $DATA_ROOT/authz/codebase.cred
+    #   memory-mcp --credential-file $DATA_ROOT/authz/memory.cred
     #   AUTUMN_CREDENTIAL_FILE=$DATA_ROOT/authz/gallery.cred gallery <mgr>
     # BUG-BENCH-NS-UNREGISTERED: register `bench` on EVERY cluster, not just an
     # authz one. Layer-A is active whenever the namespace registry is non-empty —
@@ -1075,11 +1075,11 @@ do_start() {
         # default (no all-ns master key). Cred file = two-line `principal:`/
         # `credential:` form (read_credential_file carries the name).
         #   fs/  → fuse mount / autumnfs        kvc/ → kvcache loader
-        #   gallery/ → gallery example          mem/codebase/ → codebase-memory
+        #   gallery/ → gallery example          mem/memory/ → memory-mcp
         for _spec in "fs fs/ $_az/fs.cred" \
                      "kvc kvc/ $_az/kvc.cred" \
                      "gallery gallery/ $_az/gallery.cred" \
-                     "codebase mem/codebase/ $_az/codebase.cred"; do
+                     "memory mem/memory/ $_az/memory.cred"; do
             read -r _p _grant _out <<< "$_spec"
             [[ -s "$_out" ]] && continue
             "${_ao[@]}" --json principal-create --principal "$_p" --grant "$_grant" --admin-token "$_atok" \
@@ -1089,7 +1089,7 @@ do_start() {
         done
         echo "[cluster] authz ON: signing key + admin token + per-family creds in $_az/"
         echo "[cluster]   fuse/autumnfs: --credential-file $_az/fs.cred"
-        echo "[cluster]   codebase-memory: --credential-file $_az/codebase.cred"
+        echo "[cluster]   memory-mcp: --credential-file $_az/memory.cred"
         echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi
 

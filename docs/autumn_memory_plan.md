@@ -3,7 +3,7 @@
 **关联文档**: [autumn_kvcache_plan.md](./autumn_kvcache_plan.md) ·
 [data_plane_authz_design.md](./data_plane_authz_design.md)
 **关联代码**: `crates/autumn-memory/`（`keys.rs` / `recall.rs` / `vector.rs` /
-`graph.rs` / `embed.rs`）· `examples/codebase-memory`（Rust 消费者 + MCP）·
+`graph.rs` / `embed.rs`）· `examples/memory-mcp`（Rust 消费者 + MCP）·
 `examples/hermes-autumn-memory`（Hermes 部署 glue）
 **关联记忆**: [[project_agent_memory_backend_fit]] · [[project_three_interfaces]] ·
 [[feedback_no_parallel_data_plane]] · [[feedback_client_side_complexity_first]]
@@ -66,7 +66,7 @@ split、跨集群共享、原生 TTL。
 runtime 上。key schema 与召回打分(BM25 / IVF / RRF)都在 Rust 里,一处实现。
 
 消费者两类:
-- **Rust 直接用 crate**(`examples/codebase-memory` = web UI + MCP server 一个二进制)。
+- **Rust 直接用 crate**(`examples/memory-mcp` = web UI + MCP server 一个二进制)。
 - **非 Rust 适配器按 `mem/` key schema 复刻**(`examples/hermes-autumn-memory/hermes_provider.py`
   在 `autumn.Client` 上字节忠实地复刻情景/事实/词法搜索)。**契约是 key schema
   (§6),不是某个语言绑定**——这是 adapter 能长在核心库之外的原因。
@@ -377,7 +377,7 @@ embedding。两条供给路径:
   暴露 `search`/`fetch`/`add`/`update`/`delete`。ChatGPT 普通模式只认 `search`+`fetch`
   (写工具要 Developer Mode)→ 命名给 search+fetch 对。通用触达但 model-invoked。避免
   长驻 HTTP/SSE MCP + REST daemon(除非企业要治理 gateway,那时无状态可多副本)。
-  `examples/codebase-memory` 的同一个二进制加 `--mcp` 就是 stdio MCP server。
+  `examples/memory-mcp` 的同一个二进制加 `--mcp` 就是 stdio MCP server。
 - **(b) REST API**(仅企业治理 gateway 形态):`add/search/get_all/get/update/delete`。
 - **(c) 原生适配器**(零额外进程,纯 client):Hermes MemoryProvider(§13);其它框架
   (LangGraph `BaseStore`、Mem0 `VectorStoreBase`、OpenAI Agents SDK Session)按同一

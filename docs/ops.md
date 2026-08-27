@@ -831,19 +831,18 @@ Requirements / caveats:
 ## autumn-memory verification
 
 `crates/autumn-memory` turns the cluster into an AI-agent-memory backend
-(episodic logs, fact KV, BM25 + vector + hybrid retrieval). Design:
+(episodic logs, fact KV, BM25 + vector + hybrid retrieval, a graph). Design:
 [`autumn_memory_plan.md`](autumn_memory_plan.md); crate guide:
-`crates/autumn-memory/CLAUDE.md`. The Python stack sits on the Rust core:
-`autumn.Memory` (PyO3) → `autumn_memory.AutumnMemory` (JSON + embedder hook) →
-framework shells (stdio MCP server / LangGraph `BaseStore` / Hermes
-`MemoryProvider`). Lexical (BM25) search needs no embedder; vector / hybrid use
-the optional embedder.
+`crates/autumn-memory/CLAUDE.md`. Consumers are Rust — the `memory-mcp`
+example (MCP server + web UI, `examples/memory-mcp/README.md`) uses the crate
+directly. Lexical (BM25) search needs no embedder; vector / hybrid use the
+optional embedder.
 
-**Manual verification (Phase 1 — Rust core):**
+**Manual verification (Rust core):**
 
 ```bash
 cargo build --workspace                    # build the debug binaries first
-cargo test -p autumn-memory                # 19 pure unit tests (keys / BM25 / IVF / RRF)
+cargo test -p autumn-memory                # pure unit tests (keys / BM25 / IVF / RRF)
 
 # Full e2e against an ISOLATED throwaway cluster (memory-only manager, 1 EN,
 # 1 PS, loopback, no etcd — does not touch any other cluster; tears down after):
@@ -853,50 +852,35 @@ bash crates/autumn-memory/tests/run_e2e.sh
 # Or run the e2e against an already-running cluster:
 AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
   cargo test -p autumn-memory --test e2e -- --ignored --nocapture
+
+# Page-boundary regression (reconcile over a >page corpus counts exactly):
+AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
+  cargo test -p autumn-memory --test scan_boundary -- --ignored --nocapture
 ```
 
-**Manual verification (Phase 2 — Python binding + MCP server):**
+**Manual verification (memory-mcp example — both corpora + MCP):**
 
 ```bash
-# Ergonomic layer (autumn.Memory + AutumnMemory) against an isolated cluster,
-# with a fake embedder so the vector/hybrid legs also run (builds a throwaway
-# venv + cluster, tears down):
-bash python/autumn_memory/tests/run_smoke.sh
-#   → "ERG SMOKE OK: AutumnMemory full surface (json + embedder hook)"
+./cluster.sh start 3
+# code corpus (one crate for speed) + this repo's markdown docs:
+./target/release/memory-mcp 127.0.0.1:9001 --root crates/autumn-memory --docs docs &
 
-# MCP server driven through a REAL MCP client over the SDK in-memory transport
-# (full tool surface: search/fetch/add/update/delete + episodic + facts):
-bash python/autumn_memory_mcp/tests/run_mcp_test.sh
-#   → "MCP INPROC OK: full tool surface ..." and "===== mcp-test exit: 0 ====="
+curl -s http://127.0.0.1:5100/stats
+#   → {"docs":554,"edges":882,"is_clean":true,"symbols":573}  (counts move with the corpus)
+curl -s 'http://127.0.0.1:5100/search?q=add%20a%20graph%20edge&corpus=code&mode=lexical&k=3'
+#   → code symbols only (e.g. src/lib.rs::MemoryStore::add_edge)
+curl -s 'http://127.0.0.1:5100/search?q=turnkey%20authz%20credentials&corpus=docs&mode=lexical&k=3'
+#   → doc chunks with file + heading path + line range (e.g. docs/ops.md#L1127-L1179)
+curl -s 'http://127.0.0.1:5100/members?id=docs/ops.md'      # document outline root
 
-# LangGraph BaseStore adapter (get/put/search/filter/query/list_namespaces/delete/ttl):
-bash python/autumn_memory_langgraph/tests/run_store_test.sh
-#   → "LANGGRAPH STORE OK: BaseStore surface ..." and "===== lg-store-test exit: 0 ====="
-
-# Embedder client (OpenAI-compatible /embeddings; mock server, no cluster needed):
-bash python/autumn_memory/tests/run_embedder_test.sh
-#   → "EMBEDDER OK: ..." and "===== embedder-test exit: 0 ====="
-
-# Hermes MemoryProvider adapter, driven against the REAL Hermes ABC (clone it
-# first) — register/init/sync_turn→prefetch recall/tools/built-in-write mirror:
-git clone https://github.com/NousResearch/hermes-agent "${HERMES_DIR:-/tmp/hermes-agent}"
-bash python/hermes_memory_autumn/tests/run_hermes_test.sh
-#   → "HERMES PROVIDER OK: real MemoryProvider ABC ..." and "===== hermes-test exit: 0 ====="
-
-# Real-model semantic e2e: starts a local sglang embedding server + cluster and
-# checks semantic recall with NO lexical overlap (needs a free GPU + a venv from
-# the run above). The harness keeps sglang as a child of the one run.
-EMBED_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct EMBED_GPU=7 \
-  bash python/autumn_memory/tests/run_real_embed.sh
-#   → "REAL EMBED OK: vector + hybrid semantic recall ..." and "===== real-embed-test exit: 0 ====="
-
-# Launch the stdio server for a real host (config via env or CLI flags):
-AUTUMN_MEMORY_MANAGER=127.0.0.1:9001 AUTUMN_MEMORY_AGENT=my-agent \
-  python -m autumn_memory_mcp             # or the `autumn-memory-mcp` console script
-# Enable semantic (vector/hybrid) search by pointing at an OpenAI-compatible
-# /embeddings endpoint (sglang / vLLM / OpenAI):
-#   AUTUMN_MEMORY_EMBED_URL=http://127.0.0.1:30000/v1 \
-#   AUTUMN_MEMORY_EMBED_MODEL=BAAI/bge-m3 python -m autumn_memory_mcp
+# MCP stdio round-trip (initialize / tools/list / a doc search):
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"leader election","k":2}}}' \
+  | ./target/release/memory-mcp 127.0.0.1:9001 --mcp 2>/dev/null
+#   → serverInfo name "memory-mcp"; 9 tools; chunk hits with headings + line spans
+./cluster.sh stop
 ```
 
 ## fs stripe geometry: lanes vs partitions
@@ -1132,10 +1116,10 @@ end-to-end. `AUTUMN_AUTH=1` generates a signing key + admin token under
 namespace, and mints per-example tenant credentials:
 
 ```bash
-AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,codebase.cred,gallery.cred}
+AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,memory.cred,gallery.cred}
 
-# codebase-memory (mem/codebase/, protected) — pass its tenant credential:
-./target/release/codebase-memory --credential-file /tmp/autumn-rs/authz/codebase.cred
+# memory-mcp (mem/memory/, protected) — pass its tenant credential:
+./target/release/memory-mcp --credential-file /tmp/autumn-rs/authz/memory.cred
 
 # gallery (gallery/gallery/, protected) — Scoped client, credential via env:
 AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
@@ -1145,7 +1129,7 @@ AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
 Both examples now bind a namespace scope (`{ns}/{tenant}/`, prepended by the SDK)
 and auth via `--credential-file` / `AUTUMN_CREDENTIAL_FILE` (the SDK auto-mints
 short-TTL tokens). Override the scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`
-(gallery) or `--tenant` (codebase-memory). Tune protection with
+(gallery) or `--tenant` (memory-mcp). Tune protection with
 `AUTUMN_AUTH_PROTECTED_PREFIXES` (default `mem/,gallery/`); an unprotected
 namespace needs no credential.
 

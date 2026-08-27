@@ -192,7 +192,7 @@ token；prod 集群两层全开。
 ```bash
 autumn-op principal-create fs   --grant fs/    # → fs.cred   （fuse / autumnfs）
 autumn-op principal-create kvc  --grant kvc/   # → kvc.cred  （kvcache loader）
-autumn-op principal-create mem  --grant mem/   # → mem.cred  （codebase-memory）
+autumn-op principal-create mem  --grant mem/   # → mem.cred  （memory-mcp）
 ```
 
 - **数据面只出示凭据**，没有 `--tenant` / `--principal` flag：principal 名字随
