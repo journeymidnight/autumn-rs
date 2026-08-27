@@ -478,8 +478,9 @@ impl SstReader {
         Ok(Arc::new(DecodedBlock::decode(win.slice(start..end), &bo.key)?))
     }
 
-    /// Find the block index whose base key is <= `target_key` using binary search.
-    /// Returns the index of the block that could contain `target_key`.
+    /// Find the block index whose base key is <= `target_key` (internal-key
+    /// comparator order) using binary search. Returns the index of the block
+    /// that could contain `target_key`.
     pub fn find_block_for_key(&self, target_key: &[u8]) -> usize {
         if self.block_offsets.is_empty() {
             return 0;
@@ -489,7 +490,7 @@ impl SstReader {
         let mut hi = self.block_offsets.len();
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.block_offsets[mid].key.as_slice() <= target_key {
+            if crate::cmp_internal_keys(&self.block_offsets[mid].key, target_key).is_le() {
                 lo = mid;
             } else {
                 hi = mid;
@@ -510,10 +511,7 @@ mod window_tests {
     use crate::sstable::builder::SstBuilder;
 
     fn ikey(user: &[u8], seq: u64) -> Vec<u8> {
-        let mut k = user.to_vec();
-        k.push(0);
-        k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
-        k
+        crate::key_with_ts(user, seq)
     }
 
     /// Multi-block SST: >1000 entries forces several blocks (per-block

@@ -6,15 +6,6 @@ use super::format::{
     MAX_ENTRIES_PER_BLOCK,
 };
 
-/// Strip the 9-byte MVCC suffix (1 null separator + 8-byte timestamp) from an internal key
-/// to get the user key. Used for bloom filter hashing.
-fn parse_user_key(internal_key: &[u8]) -> &[u8] {
-    if internal_key.len() <= 9 {
-        internal_key
-    } else {
-        &internal_key[..internal_key.len() - 9]
-    }
-}
 
 /// Builds a block-based SSTable in memory.
 ///
@@ -83,7 +74,8 @@ impl SstBuilder {
 
     /// Add one entry to the SSTable.
     ///
-    /// `internal_key` is a MVCC key (user_key + 8-byte inverted timestamp).
+    /// `internal_key` is a MVCC key (user_key ++ 8-byte inverted-seq suffix);
+    /// callers must add entries in `cmp_internal_keys` order.
     /// `op` = 1 for put, 2 for delete, 0x81 (1|OP_VALUE_POINTER) for value-pointer.
     /// `value` bytes are appended verbatim (may be actual value or 16-byte ValuePointer).
     /// `expires_at` = 0 means no expiry.
@@ -98,7 +90,7 @@ impl SstBuilder {
         }
 
         // Track metadata
-        let ts = parse_seq(internal_key);
+        let ts = crate::parse_ts(internal_key);
         if ts > self.seq_num {
             self.seq_num = ts;
         }
@@ -112,8 +104,8 @@ impl SstBuilder {
         }
         self.biggest_key = internal_key.to_vec();
 
-        // Bloom filter: hash on user key only (strip 8-byte ts suffix)
-        self.bloom.add_user_key(parse_user_key(internal_key));
+        // Bloom filter: hash on user key only (strip the fixed-width suffix)
+        self.bloom.add_user_key(crate::parse_key(internal_key));
 
         // Prefix compression
         let overlap = if self.base_key.is_empty() {
@@ -230,16 +222,6 @@ impl SstBuilder {
     }
 }
 
-/// Parse the MVCC sequence number from an internal key.
-/// Internal key = user_key ++ BigEndian(u64::MAX - seq), so seq = u64::MAX - stored.
-fn parse_seq(internal_key: &[u8]) -> u64 {
-    if internal_key.len() < 8 {
-        return 0;
-    }
-    let suffix: [u8; 8] = internal_key[internal_key.len() - 8..].try_into().unwrap();
-    u64::MAX - u64::from_be_bytes(suffix)
-}
-
 /// Length of the common prefix of two byte slices.
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
@@ -252,10 +234,7 @@ mod tests {
     use crate::sstable::reader::SstReader;
 
     fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
-        let mut k = user_key.to_vec();
-        k.push(0u8); // null separator
-        k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
-        k
+        crate::key_with_ts(user_key, seq)
     }
 
     #[test]
@@ -382,7 +361,7 @@ mod tests {
 
         let mut seen = Vec::new();
         while let Some(item) = it.item() {
-            seen.push(parse_user_key(&item.key).to_vec());
+            seen.push(crate::parse_key(&item.key).to_vec());
             it.next();
         }
 
@@ -415,7 +394,7 @@ mod tests {
 
         let mut seen = Vec::new();
         while let Some(item) = it.item() {
-            seen.push(parse_user_key(&item.key).to_vec());
+            seen.push(crate::parse_key(&item.key).to_vec());
             it.next();
         }
 

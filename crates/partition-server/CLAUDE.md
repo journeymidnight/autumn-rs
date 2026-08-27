@@ -127,17 +127,46 @@ requests by partition id.
 
 ## MVCC Key Encoding
 
-Internal (storage) key = `user_key ++ 0x00 ++ BigEndian(u64::MAX - seq_number)`
+Internal (storage) key = `user_key ++ BigEndian(u64::MAX - seq_number)` — no
+separator byte.
 
-The null byte (`0x00`) is a **separator** between the user key and the inverted
-sequence number. INVARIANT: without it, a user key that is a prefix of another
-(`"mykey"` vs `"mykey1"`) sorts incorrectly in internal-key space —
-`"mykey\x00..."` sorts before `"mykey1\x00..."` because `0x00 < '1'`.
+**Order is NOT raw byte order.** The total order over internal keys is
+`cmp_internal_keys` (lib.rs): split off the fixed-width 8-byte suffix, compare
+the user keys first, then the suffixes. Every comparison of internal keys MUST
+go through it — the memtable's `BTreeMap` is keyed by the `InternalKey`
+newtype whose `Ord` is this comparator, and every SST-side comparison
+(block-index binary search `find_block_for_key`, in-block binary searches in
+`BlockIterator::seek` / the `lookup_in_sst*` family, merge-iterator
+min-selection, `MemtableIterator` sort/seek, `handle_range`'s SST pre-filter
+and mem/SST two-way merge) calls it explicitly. Equality needs no special
+casing: comparator-equality coincides with byte equality.
+
+Why a comparator and not byte order: under raw byte comparison a short user
+key's suffix bytes (leading `0xFF`, since seq is small) compare against a
+longer user key's CONTENT bytes, so `"mykey"` sorts after `"mykey1"` —
+user-key order inverted. An earlier encoding worked around that with a `0x00`
+separator between user key and suffix, exploiting that `0x00` is the smallest
+byte — but that only restores prefix ordering for user keys that contain no
+`0x00` themselves, and user keys are arbitrary bytes (`parse_key` strips a
+fixed-width suffix, nothing validates content; fs keys are binary
+`[0x03][lane][ino][off]` full of zero bytes). `"a"` vs `"a\x00b"` still
+inverted, which made `"a"` unfindable by `seek_user_key` and broke scan order.
+The explicit comparator states the intent directly and is correct for
+arbitrary user keys.
 
 The **inverted** sequence ensures that for the same user key, newer writes
-(higher seq) sort **before** older writes in byte order. Lookup uses
-`seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest
-possible internal key for this user key — then returns the first (newest) entry.
+(higher seq) sort **before** older writes. Lookup uses `seek_user_key`, which
+seeks to `key_with_ts(user_key, u64::MAX)` = `user_key ++ BE(0)` — the
+smallest possible internal key for this user key — then returns the first
+(newest) entry.
+
+**Persistent-format consequence**: SST entries (and block base keys /
+MetaBlock smallest/biggest) are physically ordered by, and WAL record keys
+are parsed under, this encoding. Data written under the old separator
+encoding is NOT readable — old SSTs binary-search wrong (present keys come
+back not-found) and old WAL keys mis-split (9-byte vs 8-byte suffix). There
+is deliberately NO migration (pre-existing dev clusters must be rebuilt from
+empty; the change landed while no cluster held data worth keeping).
 
 ## SST VP dependency tracking (`vp_deps`)
 
@@ -1213,34 +1242,27 @@ turn-ON edge, never a false reject.
   that makes fuse write `fs/…`. In-process test managers run memory-mode and never
   seed builtins, so Layer-A is OFF in the suite unless a test `namespace-create`s.
 
-## Range paging: `start` is INCLUSIVE, and the client cannot express "after K"
+## Range paging: `start` is INCLUSIVE; "after K" = `K ++ 0x00`
 
-`RangeReq.start` begins the scan at that key, inclusive. There is deliberately
-no exclusive form, and the two constructions a caller reaches for are both
-wrong — in OPPOSITE directions. Internal keys are
-`user_key ++ 0x00 ++ BE(u64::MAX - seq)` and `parse_key` strips a FIXED-width
-suffix rather than scanning for the separator, so **a user key may legally
-contain `0x00`**:
+`RangeReq.start` begins the scan at that key, inclusive. To resume strictly
+after key K, pass `K ++ 0x00` — exact for arbitrary user keys, because:
 
-- `K ++ 0x00` sorts BEFORE every version of K (small seq ⇒ inverted-seq leads
-  with `0xFF`, and `0x00 < 0xFF`), so the boundary key is re-served: a silent
-  DOUBLE-COUNT at every page boundary. Found via `memory-mcp`'s doc corpus,
-  which was the first index large enough to need a second page.
-- `K ++ 0x01` skips any real user key of the form `K ++ 0x00 ++ …` — silent
-  DATA LOSS, and this repo has such keys (fs keys are binary
-  `[0x03][lane][ino][off]`, big-endian integers full of zero bytes).
+- `K ++ 0x00` is K's immediate successor in user-key byte order (every user
+  key > K is ≥ `K ++ 0x00`), and
+- the internal-key comparator orders by user key FIRST, so the seek lands
+  after every MVCC version of K and at-or-before every version of every later
+  user key — a real `K ++ 0x00 ++ …` key included (start is inclusive).
 
-So the only correct idiom is: pass the previous page's LAST key and DROP the
-first returned entry, which is that same key. `MemoryStore::scan_keys` and
-`memory-mcp`'s `wipe_agent` both do this; `crates/autumn-memory/tests/
-scan_boundary.rs` pins the property (300 docs, page 128 — pre-fix the reconcile
-counted 302).
+Nothing is double-counted and nothing is skipped. `MemoryStore::scan_keys`
+and `memory-mcp`'s `wipe_agent` paginate this way;
+`crates/autumn-memory/tests/scan_boundary.rs` pins the page-boundary property.
 
-**The clean fix, not yet done:** a server-computed OPAQUE page cursor on
-`RangeResp`. The encoding belongs on the server, and `cur_end_key` already
-establishes the cursor idea one level up (cross-partition ResumeSpan); this
-would be the same idea at page granularity, and would let every caller drop its
-dedupe. Until then, this section is the contract.
+History: under the old separator encoding (raw-byte order over
+`user ++ 0x00 ++ suffix`) this idiom was a trap — `K ++ 0x00` seeked BEFORE
+K's own versions (boundary key re-served, silent double-count at every page
+boundary), while `K ++ 0x01` silently LOST any `K ++ 0x00 ++ …` key — so
+callers had to pass the previous page's last key and drop the duplicate. The
+comparator removed that whole class of construct-a-key-just-after-K bugs.
 
 ## region_epoch check (TiKV-style)
 

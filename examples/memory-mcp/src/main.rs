@@ -221,7 +221,6 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
     let client = store.client();
     let prefix = autumn_memory::keys::agent_prefix(tenant, agent);
     let mut start: Vec<u8> = Vec::new();
-    let mut prev_last: Option<Vec<u8>> = None;
     let mut total = 0usize;
     loop {
         let res = client.range(&prefix, &start, 512).await?;
@@ -231,20 +230,17 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
         }
         let last = res.entries[n - 1].key.clone();
         for e in res.entries {
-            // `RangeReq.start` is INCLUSIVE and cannot express "after K", so
-            // the previous page's tail comes back as this page's first entry:
-            // skip it rather than deleting (and counting) it twice.
-            if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
-                continue;
-            }
             client.delete(&e.key).await?;
             total += 1;
         }
         if n < 512 {
             break;
         }
-        prev_last = Some(last.clone());
+        // `RangeReq.start` is INCLUSIVE; `last ++ 0x00` resumes strictly
+        // after `last` (exact successor — see the field's docs), so the
+        // boundary key is neither re-deleted nor double-counted.
         start = last;
+        start.push(0);
     }
     Ok(total)
 }

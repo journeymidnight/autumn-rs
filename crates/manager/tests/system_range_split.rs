@@ -182,9 +182,11 @@ fn range_scan_with_limit_and_pagination_after_split() {
             if !page.has_more || page.entries.is_empty() {
                 break;
             }
-            // Next page starts after the last key (0x01 > 0x00 separator in MVCC encoding)
+            // Next page starts strictly after the last key: `K ++ 0x00` is
+            // the exact successor under the PS's user-key-first internal-key
+            // comparator (`RangeReq.start` docs).
             start_key = page.entries.last().unwrap().key.clone();
-            start_key.push(0x01);
+            start_key.push(0x00);
         }
 
         assert_eq!(

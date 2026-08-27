@@ -3467,7 +3467,7 @@ pub(crate) fn lookup_in_sst_seq_opt(reader: &SstReader, user_key: &[u8], use_blo
         let Ok(key) = block.get_key(mid) else {
             return 0;
         };
-        if key.as_slice() < target.as_slice() {
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -3543,7 +3543,7 @@ pub(crate) async fn lookup_in_sst_via(
         let key = block
             .get_key(mid)
             .map_err(|e| anyhow!("sst block entry decode: {e}"))?;
-        if key.as_slice() < target.as_slice() {
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -3592,7 +3592,7 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let key = block.get_key(mid).ok()?;
-        if key.as_slice() < target.as_slice() {
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -4380,7 +4380,7 @@ mod lookup_block_boundary_tests {
     /// point-lookup block-boundary bug. When a user_key's newest entry is
     /// the FIRST entry (base_key) of an SST block, `find_block_for_key`
     /// (last block with base <= target) selected the PRECEDING block (whose
-    /// base <= target = `user_key++0x00++BE(0)`), and the single-block
+    /// base <= target = `user_key++BE(0)`), and the single-block
     /// binary search ran off the end → `lookup_in_sst` returned None →
     /// the read fell through to an older SST and returned a STALE value.
     /// `lookup_in_sst` must hop to the next block's first entry in that

@@ -399,7 +399,7 @@ striping)。
   改**:让 `range_scan_sst_merge` 顺带 `resolve_value`(先穷尽客户端再上服务端)。
 - ⚠️ **无快照/时点读**,latest-wins,旧版 GC 丢弃 → 双时态走 key schema(§6)。
 - ⚠️ `put_stream_begin` **忽略 `expires_at`** → 带 TTL 的对象不能走它(§8.5 契约 4)。
-- key 编码 `user_key ++ 0x00 ++ BE(u64::MAX - seq)`,MVCC seq 仅内部。
+- key 编码 `user_key ++ BE(u64::MAX - seq)`(排序用 user-key 优先的比较器,非裸字节序),MVCC seq 仅内部。
 
 ## 14. 竞品定位 / 性能
 

@@ -570,33 +570,87 @@ impl Drop for CompactionPermit {
 // ---------------------------------------------------------------------------
 // MVCC internal-key helpers
 // ---------------------------------------------------------------------------
+//
+// Internal (storage) key = `user_key ++ BigEndian(u64::MAX - seq)`.
+//
+// ORDER IS NOT BYTE ORDER. Every comparison of internal keys MUST go through
+// `cmp_internal_keys`, which compares the user key first and the fixed-width
+// inverted-seq suffix second. Raw byte comparison is wrong whenever one user
+// key is a proper prefix of another: the shorter key's suffix bytes (leading
+// 0xFF for small seq) would compare against the longer key's CONTENT bytes,
+// sorting `"mykey"` after `"mykey1"`. An earlier encoding worked around that
+// with a 0x00 separator byte between user key and suffix — which restored
+// prefix ordering only for user keys that contain no 0x00 themselves, and the
+// system permits arbitrary bytes in user keys (`"a"` vs `"a\x00b"` inverted).
+// The explicit comparator is correct for arbitrary user keys and needs no
+// separator byte at all.
 
+/// Width of the internal-key suffix: `BE(u64::MAX - seq)`.
 const TS_BYTES: usize = 8;
-const TS_SIZE: usize = TS_BYTES + 1;
+
+/// Split an internal key into `(user_key, inverted-seq suffix)`. A
+/// well-formed internal key is always ≥ `TS_BYTES` long (`key_with_ts` output
+/// for an empty user key is exactly `TS_BYTES`); anything shorter is treated
+/// degenerately as `(whole, empty)`.
+#[inline]
+fn split_internal_key(internal_key: &[u8]) -> (&[u8], &[u8]) {
+    if internal_key.len() < TS_BYTES {
+        (internal_key, &[])
+    } else {
+        internal_key.split_at(internal_key.len() - TS_BYTES)
+    }
+}
+
+/// THE total order over MVCC internal keys: user key first (byte order),
+/// then the inverted-seq suffix — so distinct user keys sort in user-key
+/// order regardless of length/content, and versions of the same user key
+/// sort newest (highest seq) first.
+///
+/// Byte-equality coincides with comparator-equality (two keys compare Equal
+/// iff both halves match, i.e. the keys are identical), so `==` on internal
+/// keys stays plain byte equality.
+#[inline]
+pub(crate) fn cmp_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (ua, sa) = split_internal_key(a);
+    let (ub, sb) = split_internal_key(b);
+    ua.cmp(ub).then_with(|| sa.cmp(sb))
+}
 
 pub(crate) fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(user_key.len() + TS_SIZE);
+    let mut out = Vec::with_capacity(user_key.len() + TS_BYTES);
     out.extend_from_slice(user_key);
-    out.push(0u8);
     out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
     out
 }
 
 pub(crate) fn parse_key(internal_key: &[u8]) -> &[u8] {
-    if internal_key.len() <= TS_SIZE {
-        return internal_key;
-    }
-    &internal_key[..internal_key.len() - TS_SIZE]
+    split_internal_key(internal_key).0
 }
 
 pub(crate) fn parse_ts(internal_key: &[u8]) -> u64 {
-    if internal_key.len() <= TS_SIZE {
-        return 0;
+    let (_, suffix) = split_internal_key(internal_key);
+    match <[u8; TS_BYTES]>::try_from(suffix) {
+        Ok(b) => u64::MAX - u64::from_be_bytes(b),
+        Err(_) => 0, // degenerate short key
     }
-    let b: [u8; 8] = internal_key[internal_key.len() - TS_BYTES..]
-        .try_into()
-        .unwrap();
-    u64::MAX - u64::from_be_bytes(b)
+}
+
+/// Internal key with the comparator as its `Ord` — the memtable's BTreeMap
+/// key type, so tree walks and `range()` seeks follow `cmp_internal_keys`
+/// instead of raw byte order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InternalKey(Vec<u8>);
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_internal_keys(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +786,7 @@ pub(crate) struct MemEntry {
 // Linearizability is preserved by the RwLock (see Programming Notes in
 // crates/partition-server/CLAUDE.md).
 pub(crate) struct Memtable {
-    data: parking_lot::RwLock<BTreeMap<Vec<u8>, MemEntry>>,
+    data: parking_lot::RwLock<BTreeMap<InternalKey, MemEntry>>,
     bytes: AtomicU64,
     /// BUG1: LOG bytes (the actual WAL records appended to
     /// log_stream for this memtable's entries — VALUE included), tracked
@@ -759,7 +813,7 @@ impl Memtable {
         // autumn's MVCC-encoded keys are unique per (user_key, seq) so collisions
         // only occur under replay-idempotent recovery, where dropping the prior
         // identical value is safe.
-        let _ = self.data.write().insert(key, entry);
+        let _ = self.data.write().insert(InternalKey(key), entry);
         self.bytes.fetch_add(size, Ordering::Relaxed);
     }
 
@@ -778,7 +832,7 @@ impl Memtable {
         let mut guard = self.data.write();
         let mut total = 0u64;
         for (k, v, s) in items {
-            let _ = guard.insert(k, v);
+            let _ = guard.insert(InternalKey(k), v);
             total += s;
         }
         drop(guard);
@@ -805,25 +859,26 @@ impl Memtable {
     }
 
     fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
-        let seek = key_with_ts(user_key, u64::MAX);
+        let seek = InternalKey(key_with_ts(user_key, u64::MAX));
         let guard = self.data.read();
-        // First internal key >= seek is the newest version of `user_key` (the
-        // MVCC suffix is inverted-seq, so newest sorts first). Return it iff its
-        // user-key prefix matches; otherwise this user_key has no entry.
+        // First internal key >= seek (comparator order) is the newest version
+        // of `user_key` (the MVCC suffix is inverted-seq, so newest sorts
+        // first). Return it iff the user key matches; otherwise this user_key
+        // has no entry.
         let (k, v) = guard.range(seek..).next()?;
-        (parse_key(k) == user_key).then(|| v.clone())
+        (parse_key(&k.0) == user_key).then(|| v.clone())
     }
 
     /// diag: return the newest seq for `user_key` (or 0 if absent).
     /// Used by `MSG_DIAG_TRACE_KEY` only — not on any hot path.
     pub(crate) fn seek_user_key_seq(&self, user_key: &[u8]) -> u64 {
-        let seek = key_with_ts(user_key, u64::MAX);
+        let seek = InternalKey(key_with_ts(user_key, u64::MAX));
         let guard = self.data.read();
         let Some((k, _)) = guard.range(seek..).next() else {
             return 0;
         };
-        if parse_key(k) == user_key {
-            parse_ts(k)
+        if parse_key(&k.0) == user_key {
+            parse_ts(&k.0)
         } else {
             0
         }
@@ -834,7 +889,7 @@ impl Memtable {
         guard
             .iter()
             .map(|(k, v)| IterItem {
-                key: k.clone(),
+                key: k.0.clone(),
                 op: v.op,
                 value: v.value.clone(),
                 expires_at: v.expires_at,
@@ -849,7 +904,7 @@ impl Memtable {
     pub(crate) fn for_each<F: FnMut(&[u8], &MemEntry)>(&self, mut f: F) {
         let guard = self.data.read();
         for (k, v) in guard.iter() {
-            f(k.as_slice(), v);
+            f(k.0.as_slice(), v);
         }
     }
 }
@@ -10136,21 +10191,75 @@ mod tests {
 
     #[test]
     fn mvcc_key_encoding() {
+        use std::cmp::Ordering;
+
+        // Same user key: newer (higher seq) sorts FIRST. Same-length keys,
+        // so comparator order and byte order agree here.
         let uk = b"hello";
         let k1 = key_with_ts(uk, 1);
         let k2 = key_with_ts(uk, 2);
         let k3 = key_with_ts(uk, 100);
-        assert!(k3 < k2);
-        assert!(k2 < k1);
+        assert_eq!(cmp_internal_keys(&k3, &k2), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&k2, &k1), Ordering::Less);
         assert_eq!(parse_key(&k1), uk.as_slice());
         assert_eq!(parse_ts(&k1), 1);
         assert_eq!(parse_ts(&k3), 100);
 
-        let ka = key_with_ts(b"mykey", 1);
+        // A user key that is a strict prefix of another must sort in
+        // user-key order — for EVERY version pairing, including the one
+        // where raw byte order would invert (the short key's 0xFF-leading
+        // suffix vs the long key's content byte).
+        let ka_new = key_with_ts(b"mykey", u64::MAX - 1);
+        let ka_old = key_with_ts(b"mykey", 1);
         let kb = key_with_ts(b"mykey1", 2);
-        assert!(ka < kb);
-        assert_eq!(parse_key(&ka), b"mykey");
+        assert_eq!(cmp_internal_keys(&ka_new, &kb), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&ka_old, &kb), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&kb, &ka_old), Ordering::Greater);
+        assert_eq!(parse_key(&ka_old), b"mykey");
         assert_eq!(parse_key(&kb), b"mykey1");
+
+        // Equality is byte equality.
+        assert_eq!(cmp_internal_keys(&ka_old, &ka_old.clone()), Ordering::Equal);
+    }
+
+    #[test]
+    fn mvcc_key_encoding_embedded_zero_and_round_trip() {
+        use std::cmp::Ordering;
+
+        // `"a"` vs `"a\x00b"`: the case the old 0x00-separator encoding got
+        // wrong. Every version of "a" must sort before every version of
+        // "a\x00b".
+        for seq_a in [1u64, 2, u64::MAX - 1] {
+            for seq_ab in [1u64, 2, u64::MAX - 1] {
+                let a = key_with_ts(b"a", seq_a);
+                let ab = key_with_ts(b"a\x00b", seq_ab);
+                assert_eq!(
+                    cmp_internal_keys(&a, &ab),
+                    Ordering::Less,
+                    "a@{seq_a} must sort before a\\0b@{seq_ab}"
+                );
+            }
+        }
+
+        // Round trip: parse_key/parse_ts recover exactly what key_with_ts
+        // encoded, for arbitrary bytes (embedded 0x00, trailing 0x00, 0xFF,
+        // empty key) and boundary seqs.
+        for uk in [
+            b"".as_ref(),
+            b"\x00",
+            b"a\x00b",
+            b"a\x00",
+            b"\x00\x00\x00",
+            b"\xff\xff",
+            b"plain",
+        ] {
+            for ts in [0u64, 1, 42, u64::MAX - 1, u64::MAX] {
+                let k = key_with_ts(uk, ts);
+                assert_eq!(k.len(), uk.len() + TS_BYTES);
+                assert_eq!(parse_key(&k), uk, "user key round trip for {uk:?}@{ts}");
+                assert_eq!(parse_ts(&k), ts, "ts round trip for {uk:?}@{ts}");
+            }
+        }
     }
 
     #[test]
@@ -10526,12 +10635,117 @@ mod tests {
         }
         let snapshot = mt.snapshot_sorted();
         assert_eq!(snapshot.len(), 10);
-        // Verify sorted by internal key
+        // Verify sorted by internal key (comparator order)
         for i in 1..snapshot.len() {
             assert!(
-                snapshot[i - 1].key <= snapshot[i].key,
+                cmp_internal_keys(&snapshot[i - 1].key, &snapshot[i].key).is_le(),
                 "snapshot should be sorted"
             );
+        }
+    }
+
+    // ── internal-key ordering with embedded 0x00 in user keys ────────────────
+    //
+    // `"a"` vs `"a\x00b"`: a user key that CONTAINS 0x00 and extends a
+    // shorter user key. The old separator encoding
+    // (`user ++ 0x00 ++ BE(MAX-seq)`) made `"a\x00b"`'s CONTENT bytes
+    // compare against `"a"`'s inverted-seq bytes, sorting every version of
+    // `"a\x00b"` BEFORE every version of `"a"` — inverted user-key order,
+    // which broke seek_user_key ("a" unfindable) and scan order. These
+    // tests pin the behavior-level consequences (get + scan + SST lookup).
+
+    #[test]
+    fn memtable_get_user_key_with_embedded_zero_neighbor() {
+        let mt = Memtable::new();
+        for (uk, seq, val) in [
+            (b"a\x00b".as_ref(), 1u64, b"deep".as_ref()),
+            (b"a".as_ref(), 2u64, b"shallow".as_ref()),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: val.to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let got = mt.seek_user_key(b"a").expect("\"a\" must be found");
+        assert_eq!(got.value, b"shallow");
+        let got = mt.seek_user_key(b"a\x00b").expect("\"a\\0b\" must be found");
+        assert_eq!(got.value, b"deep");
+    }
+
+    #[test]
+    fn memtable_scan_order_with_embedded_zero_follows_user_key_order() {
+        let mt = Memtable::new();
+        // Insert out of order; two versions of "a" so newest-first is
+        // asserted across the boundary too.
+        for (uk, seq) in [
+            (b"a\x00b".as_ref(), 5u64),
+            (b"a".as_ref(), 3),
+            (b"a".as_ref(), 7),
+            (b"b".as_ref(), 4),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: seq.to_string().into_bytes(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let got: Vec<(Vec<u8>, Vec<u8>)> = mt
+            .snapshot_sorted()
+            .into_iter()
+            .map(|it| (parse_key(&it.key).to_vec(), it.value))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"7".to_vec()),
+                (b"a".to_vec(), b"3".to_vec()),
+                (b"a\x00b".to_vec(), b"5".to_vec()),
+                (b"b".to_vec(), b"4".to_vec()),
+            ],
+            "scan must follow user-key order (\"a\" before \"a\\0b\"), newest version first"
+        );
+    }
+
+    #[test]
+    fn sst_lookup_user_key_with_embedded_zero_neighbor() {
+        // Same key shape through the FULL flush path: memtable → SST bytes →
+        // point lookup. Physical SST order comes from the memtable's order,
+        // so a wrong order breaks the reader's binary search.
+        let mt = Memtable::new();
+        for (uk, seq, val) in [
+            (b"a\x00b".as_ref(), 1u64, b"deep".as_ref()),
+            (b"a".as_ref(), 2u64, b"shallow".as_ref()),
+            (b"c".as_ref(), 3u64, b"cc".as_ref()),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: val.to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let (bytes, _last_seq) = build_sst_bytes(&mt, 0, 0);
+        let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
+        for (uk, want) in [
+            (b"a".as_ref(), b"shallow".as_ref()),
+            (b"a\x00b".as_ref(), b"deep".as_ref()),
+            (b"c".as_ref(), b"cc".as_ref()),
+        ] {
+            let (_op, val, _exp) = crate::background::lookup_in_sst(&reader, uk)
+                .unwrap_or_else(|| panic!("{uk:?} must be found in SST"));
+            assert_eq!(&val[..], want);
         }
     }
 

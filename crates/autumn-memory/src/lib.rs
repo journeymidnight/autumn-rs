@@ -182,7 +182,6 @@ impl MemoryStore {
     ) -> Result<Vec<Vec<u8>>, AutumnError> {
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut start: Vec<u8> = Vec::new();
-        let mut prev_last: Option<Vec<u8>> = None;
         loop {
             let res = self.client.range(prefix, &start, self.page_limit).await?;
             let n = res.entries.len();
@@ -191,17 +190,6 @@ impl MemoryStore {
             }
             let last_key = res.entries[n - 1].key.clone();
             for e in res.entries {
-                // `RangeReq.start` is INCLUSIVE and there is no way to ask for
-                // "after K" — see its field docs. So resume from the previous
-                // page's last key and drop that key when it comes back as this
-                // page's first entry.
-                //
-                // Do NOT try to skip it with a `K + 0x00` successor: internal
-                // keys are `user ++ 0x00 ++ BE(MAX - seq)`, so `K + 0x00` seeks
-                // BEFORE all of K's own versions and K is served again anyway.
-                if prev_last.as_deref().is_some_and(|p| e.key.as_slice() <= p) {
-                    continue;
-                }
                 out.push(e.key);
                 if let Some(m) = max_items {
                     if out.len() >= m {
@@ -212,8 +200,13 @@ impl MemoryStore {
             if n < self.page_limit as usize {
                 break;
             }
-            prev_last = Some(last_key.clone());
+            // `RangeReq.start` is INCLUSIVE; `last ++ 0x00` is the exact
+            // "strictly after last" start (see the field's docs: the PS
+            // compares user keys first, so this skips exactly last's own
+            // MVCC versions and nothing else — no boundary duplicate to
+            // drop, no `last ++ 0x00 ++ …` key lost).
             start = last_key;
+            start.push(0);
         }
         Ok(out)
     }

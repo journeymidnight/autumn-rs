@@ -120,7 +120,8 @@ in the consumer.
   resolver should still drop a hit whose `doc/{id}` is gone (`get_memory` →
   None) — the MCP `_resolve` does — covering any in-flight/expiry race.
 - Pagination resumes EXCLUSIVELY via the successor of the last key
-  (`last_key ++ 0x00`).
+  (`last_key ++ 0x00`) — exact under the PS's user-key-first internal-key
+  comparator (`RangeReq.start` docs).
 
 ## Index reconcile / repair (`reconcile` / `repair_stats`, plan §16)
 
@@ -146,14 +147,13 @@ An OFF-hot-path integrity audit + heal (the plan's per-phase acceptance tool):
 - `repair_stats()`: rewrites `meta/stats` from a fresh `doc/` recount (no IVF
   scan). MUST run in a writer-quiesced maintenance window — it is itself a
   read-then-write with no CAS, so a concurrent write would be clobbered.
-- **Page-boundary dedupe in `scan_keys`**: the PS serves a range `start` as an
-  INCLUSIVE user-key bound, and the `last_key+"\0"` resume idiom does NOT
-  exclude the boundary key — the MVCC internal encoding (`user ++ 0x00 ++
-  inv-seq`) sorts `K+"\0"` at ts=MAX *before* K's own versions, so K comes
-  back as the next page's first entry. `scan_keys` drops any entry at-or-before
-  the previous page's tail; without it every audit over a >`page_limit` corpus
-  over-counted one key per page boundary (`is_clean()` false-alarmed).
-  Regression: `tests/scan_boundary.rs` (live-cluster, like `e2e.rs`).
+- **Page-boundary resume in `scan_keys`**: the PS serves a range `start` as an
+  INCLUSIVE user-key bound, and `scan_keys` resumes each page with
+  `last_key ++ 0x00` — the exact "strictly after last" start, because the PS
+  orders internal keys with a user-key-first comparator (`cmp_internal_keys`;
+  the fixed-width inverted-seq suffix only breaks ties). The boundary key is
+  neither re-served (double-count) nor can a real `last ++ 0x00 ++ …` key be
+  skipped. Regression: `tests/scan_boundary.rs` (live-cluster, like `e2e.rs`).
 
 This is the deliberate answer to the **multi-writer `meta/stats` RMW race**:
 `update_stats` is read-modify-write, so two processes writing the SAME agent

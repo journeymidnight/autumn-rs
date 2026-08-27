@@ -1500,6 +1500,15 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 
 ## Rolling restart & upgrade versioning
 
+**Deploy note (2026-08-27, MVCC internal-key comparator):** the partition
+layer's internal-key encoding is `user_key ++ BE(u64::MAX - seq)` ordered by a
+user-key-first comparator (no `0x00` separator byte). SSTs and WAL records
+written under the older separator encoding are NOT readable — present keys
+come back not-found and replay mis-splits keys. There is no migration: a
+cluster carrying pre-change partition data must be rebuilt from empty
+(`cluster.sh reset` on dev). Same-commit stop-world deploys after that
+boundary are unaffected.
+
 Same-binary rolling restart of a live cluster — one process at a time, a
 convergence gate + per-partition write-liveness probe between every step,
 fail-stop on the first gate that doesn't converge. Order: EN one-by-one →

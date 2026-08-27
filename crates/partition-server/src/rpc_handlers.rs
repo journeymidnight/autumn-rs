@@ -941,14 +941,14 @@ pub(crate) async fn handle_range(
         // coco P2 (kept from Stage-1): pre-filter by SST key range — skip
         // SSTs entirely before the scan start (biggest < seek) and, when a
         // prefix bounds the scan, SSTs entirely after it. smallest/biggest
-        // are INTERNAL keys (user ++ 0x00 ++ inv-seq); seek_key sorts
-        // before every real entry of start_user_key, so
-        // `biggest < seek_key` is exact.
+        // are INTERNAL keys (user ++ inv-seq), so the comparison MUST be
+        // `cmp_internal_keys`; seek_key sorts before every real entry of
+        // start_user_key, so `biggest < seek_key` is exact.
         let readers_snap: Vec<std::sync::Arc<SstReader>> = p
             .sst_readers
             .iter()
             .filter(|r| {
-                if r.biggest_key() < seek_key.as_slice() {
+                if crate::cmp_internal_keys(r.biggest_key(), &seek_key).is_lt() {
                     return false;
                 }
                 if !req.prefix.is_empty() {
@@ -1058,7 +1058,7 @@ async fn range_scan_sst_merge(
                 item
             }
             (Some(mk), Some(sk)) => {
-                if mk <= sk {
+                if crate::cmp_internal_keys(mk, sk).is_le() {
                     let item = mem_it.item().unwrap().clone();
                     let uk_owned = parse_key(mk).to_vec();
                     mem_it.next();

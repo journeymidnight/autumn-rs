@@ -424,11 +424,18 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   seals the CURRENT tail: the captured length would be stamped onto the
     //   roll's fresh empty extent, sealed longer than any replica holds, and
     //   the CoW child's replay could never read it. `0` = no claim (skip).
-        //   v29 refreshed IN PLACE again (still undeployed): RangeReq.start now
+    //   v29 refreshed IN PLACE again (still undeployed): RangeReq.start now
     //   documents that it is INCLUSIVE and that neither `K+0x00` nor
     //   `K+0x01` expresses "resume after K" — comment-only, but the
     //   fingerprint hashes whole schema files.
-    (29, "3193599e8b211638"),
+    //   v29 refreshed IN PLACE again (still undeployed): RangeReq.start's
+    //   doc updated for the PS's internal-key comparator (user key first,
+    //   fixed-width inverted-seq suffix second; no separator byte) —
+    //   `K ++ 0x00` is now the exact "resume strictly after K" start.
+    //   Comment-only; no struct changed. NOTE the same commit changes the
+    //   PS's PERSISTED SST/WAL key ordering — old partition data is
+    //   unreadable; a dev cluster must be rebuilt.
+    (29, "9cb798979a60ed87"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

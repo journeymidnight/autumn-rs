@@ -15,7 +15,7 @@ use super::reader::SstReader;
 
 #[derive(Debug, Clone)]
 pub struct IterItem {
-    pub key: Vec<u8>, // internal key (user_key + 8-byte MVCC suffix)
+    pub key: Vec<u8>, // internal key (user_key ++ 8-byte inverted-seq suffix)
     pub op: u8,
     pub value: Vec<u8>,
     pub expires_at: u64,
@@ -71,7 +71,7 @@ impl BlockIterator {
             let mid = lo + (hi - lo) / 2;
             match self.block.get_entry(mid) {
                 Ok((key, _, _, _)) => {
-                    if key.as_slice() < target {
+                    if crate::cmp_internal_keys(&key, target).is_lt() {
                         lo = mid + 1;
                     } else {
                         hi = mid;
@@ -406,7 +406,7 @@ impl AsyncMergeIterator {
         for (i, it) in self.iters.iter().enumerate() {
             if let Some(item) = it.item() {
                 if best.is_none()
-                    || item.key < best.unwrap().key
+                    || crate::cmp_internal_keys(&item.key, &best.unwrap().key).is_lt()
                     || (item.key == best.unwrap().key && i < best_iter_idx.unwrap())
                 {
                     best = Some(item);
@@ -476,7 +476,7 @@ impl MergeIterator {
         for (i, it) in self.iters.iter().enumerate() {
             if let Some(item) = it.item() {
                 if best.is_none()
-                    || item.key < best.unwrap().key
+                    || crate::cmp_internal_keys(&item.key, &best.unwrap().key).is_lt()
                     || (item.key == best.unwrap().key && i < best_iter_idx.unwrap())
                 {
                     best = Some(item);
@@ -528,7 +528,7 @@ pub struct MemtableIterator {
 
 impl MemtableIterator {
     pub fn new(mut entries: Vec<IterItem>) -> Self {
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        entries.sort_by(|a, b| crate::cmp_internal_keys(&a.key, &b.key));
         MemtableIterator { entries, idx: 0 }
     }
 
@@ -545,7 +545,9 @@ impl MemtableIterator {
     }
 
     pub fn seek(&mut self, target: &[u8]) {
-        self.idx = self.entries.partition_point(|e| e.key.as_slice() < target);
+        self.idx = self
+            .entries
+            .partition_point(|e| crate::cmp_internal_keys(&e.key, target).is_lt());
     }
 
     #[allow(dead_code)]
@@ -560,10 +562,7 @@ mod tests {
     use crate::sstable::builder::SstBuilder;
 
     fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
-        let mut k = user_key.to_vec();
-        k.push(0u8); // null separator
-        k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
-        k
+        crate::key_with_ts(user_key, seq)
     }
 
     fn build_sst(entries: &[(&[u8], u64, &[u8])]) -> Arc<SstReader> {

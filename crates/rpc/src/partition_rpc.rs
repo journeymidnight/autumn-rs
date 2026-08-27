@@ -587,28 +587,23 @@ pub struct RangeReq {
     /// Where the scan begins, **INCLUSIVE** — an entry whose key equals
     /// `start` IS returned.
     ///
-    /// There is no way for a caller to express "resume strictly after key K",
-    /// and the two obvious tricks are both WRONG in opposite directions.
-    /// Internal keys are `user_key ++ 0x00 ++ BE(u64::MAX - seq)` and
-    /// `parse_key` strips a fixed-width suffix rather than scanning for the
-    /// separator, so a user key may legally contain `0x00`:
-    ///
-    /// - `K ++ 0x00` sorts BEFORE every version of K (its inverted-seq byte is
-    ///   `0xFF` for small seq, and `0x00 < 0xFF`), so the boundary key comes
-    ///   back again — a silent double-count across page boundaries.
-    /// - `K ++ 0x01` skips any real user key of the form `K ++ 0x00 ++ …` —
-    ///   silent data loss, and this repo has such keys (fs keys are binary:
-    ///   `[0x03][lane][ino][off]`, big-endian integers full of zero bytes).
-    ///
-    /// So paginate by passing the previous page's LAST key and dropping the
-    /// first returned entry, which is that same key. `MemoryStore::scan_keys`
-    /// and `memory-mcp`'s `wipe_agent` both do exactly that; the property is
+    /// To resume strictly after key K, pass `K ++ 0x00`. That is exact for
+    /// arbitrary user keys: `K ++ 0x00` is K's immediate successor in
+    /// user-key byte order (every user key > K is >= `K ++ 0x00`), and the
+    /// PS orders internal keys with a comparator that compares user keys
+    /// FIRST (`cmp_internal_keys` — the fixed-width inverted-seq suffix only
+    /// breaks ties), so the seek lands after every MVCC version of K and
+    /// before every version of every later key — a real key that IS
+    /// `K ++ 0x00 ++ …` included (inclusive start, nothing skipped, nothing
+    /// double-counted). `MemoryStore::scan_keys` and `memory-mcp`'s
+    /// `wipe_agent` paginate exactly that way; the page-boundary property is
     /// pinned by `crates/autumn-memory/tests/scan_boundary.rs`.
     ///
-    /// The clean fix is a server-computed opaque page cursor on `RangeResp`
-    /// (the encoding belongs on the server, and `cur_end_key` already
-    /// establishes the cursor idea one level up, at partition granularity).
-    /// Until that exists, this comment is the contract.
+    /// (Under the older separator encoding — `user ++ 0x00 ++ suffix`
+    /// compared as raw bytes — this idiom double-counted the boundary key
+    /// and `K ++ 0x01` lost `K ++ 0x00 ++ …` keys, which forced a
+    /// pass-last-key-and-drop-the-duplicate dance. The comparator removed
+    /// the whole trap.)
     pub start: Vec<u8>,
     pub limit: u32,
     /// See `PutReq.region_epoch`. Especially important for range:

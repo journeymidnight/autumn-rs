@@ -2030,18 +2030,14 @@ async fn verify_per_partition_range(
                 prev_key = Some(k.clone());
                 got.insert(k);
             }
-            // Advance cursor STRICTLY PAST every MVCC version of `last`. The
-            // internal key is `user_key ++ 0x00 ++ BE(u64::MAX - seq)`, so
-            // `last`'s versions span `last\x00\x00…` (newest) … `last\x00\xff…`
-            // (oldest). Appending 0x00 (the old `push(0)`) makes the PS seek
-            // `key_with_ts(last\x00, MAX) = last\x00\x00…`, which lands BEFORE
-            // `last`'s older versions → the page re-returns `last` forever
-            // (the old HashSet-dedup hid this; the no-duplicate/order check
-            // above surfaces it). Appending 0x01 makes the seek
-            // `last\x01\x00…` > `last\x00\xff…`, clearing all of `last`'s
-            // versions while staying below the next user key.
+            // Advance cursor STRICTLY PAST every MVCC version of `last`:
+            // `last ++ 0x00` is the exact user-key successor, and the PS
+            // orders internal keys user-key-first (`cmp_internal_keys`), so
+            // this start skips exactly `last`'s own versions and nothing
+            // else (`RangeReq.start` docs). The no-duplicate/order check
+            // above would surface any regression of that contract.
             let mut next = last;
-            next.push(1);
+            next.push(0);
             cursor = next;
             // Hit cur_end_key (partition end)?
             if !r.cur_end_key.is_empty() && cursor >= r.cur_end_key {

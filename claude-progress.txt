@@ -1,3 +1,35 @@
+Date: 2026-08-27 (b)
+TaskStatus: completed
+Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比较器(user-key 优先)。
+  内部 key 从 `user ++ 0x00 ++ BE(MAX-seq)` 改为 `user ++ BE(MAX-seq)`,排序不再是裸字节序,
+  统一走 `cmp_internal_keys`(先比 user key,再比定宽 8B inverted-seq 后缀)。
+【为什么】旧分隔符只是模拟"先比 user key":对含 0x00 的 user key 失效("a" vs "a\x00b" 反序,
+  "a" 会被 seek_user_key 查不到、扫描顺序颠倒——三个 pre-change 复现测试都实证失败)。
+【比较点枚举方法】三路:①从生产者流向追(key_with_ts/SST decode/WAL replay 的 key 流经处);
+  ②全 crate 文本扫(比较运算符/sort/partition_point/binary_search/BTreeMap/range/min-select);
+  ③Memtable 换 InternalKey newtype 让编译器逼出遗漏。共 13 个比较点全改:Memtable BTreeMap Ord
+  (newtype,不外溢)、MemtableIterator sort+seek、BlockIterator::seek、Async/sync MergeIterator
+  min-select、find_block_for_key、rpc_handlers biggest_key 预滤+mem/SST 两路 merge `mk<=sk`、
+  background 三份 lookup_in_sst* 二分。等值比较/用户键级比较(bloom 两侧都是 user key、
+  compaction 去重、split 扫描、in_range)核实不受影响。builder.rs 本地 parse_user_key(硬编码 9)/
+  parse_seq 删掉统一走 crate::parse_key/parse_ts;TS_SIZE(9) 常量删除只留 TS_BYTES(8);
+  wal_record.rs 无后缀宽度依赖(key 带长度前缀)核实不用动。
+【持久格式后果(无迁移,故意的)】旧 SST/WAL 在新比较器下"查不到已存在的 key"级不可读;
+  dev 集群必须重建。ops.md 加 deploy note;partition-server CLAUDE.md 两节重写(MVCC Key
+  Encoding + Range paging)。
+【顺带落地】比较器使 `K ++ 0x00` 成为精确的"严格在 K 之后"续扫起点(user-key 后继+user-key
+  优先排序):RangeReq.start 文档改契约(WIRE v29 指纹原地刷新 9cb798979a60ed87,注释-only);
+  scan_keys/wipe_agent 改独占续扫删掉 dedupe(有意反转 dd15047——当时比较器还不存在,
+  dedupe 是对的);system_chaos/system_range_split 游标 push(1)/push(0x01)→push(0)。
+【验证】partition-server 212(208+4 新:embedded-zero get/scan/SST 三个 pre-change 实证 FAIL,
+  round-trip/前缀对/版本序在两棵树都过——与任务预期一致 #2 翻转);manager 293/stream 110/
+  rpc 60/client 41/autumn-memory 22 全绿;system_chaos --ignored ×3 过;system_merge 9/9;
+  run_e2e.sh 活集群 e2e 5/5 + scan_boundary 1/1(即新比较器+新续扫 idiom 的真集群验证);
+  clippy 无新告警。
+【已知无关噪音】integration.rs 三个 recovery 测试"同批挂/单跑过"在改动前基线同样挂
+  (stash 实证),属既有跨测试进程态污染,未在本任务处理。
+Next steps: 无。
+
 Date: 2026-08-27
 TaskStatus: completed
 Task scope: memory-mcp —— codebase-memory 例子泛化成"一个 MCP server,两种 ingester(代码/文档)",
