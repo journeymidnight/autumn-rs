@@ -1,2 +1,0 @@
-# Built wheels are artifacts, not source.
-*.whl

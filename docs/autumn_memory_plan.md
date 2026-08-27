@@ -3,8 +3,7 @@
 **关联文档**: [autumn_kvcache_plan.md](./autumn_kvcache_plan.md) ·
 [data_plane_authz_design.md](./data_plane_authz_design.md)
 **关联代码**: `crates/autumn-memory/`（`keys.rs` / `recall.rs` / `vector.rs` /
-`graph.rs` / `embed.rs`）· `examples/memory-mcp`（Rust 消费者 + MCP）·
-`examples/hermes-autumn-memory`（Hermes 部署 glue）
+`graph.rs` / `embed.rs`）· `examples/memory-mcp`（Rust 消费者 + MCP）
 **关联记忆**: [[project_agent_memory_backend_fit]] · [[project_three_interfaces]] ·
 [[feedback_no_parallel_data_plane]] · [[feedback_client_side_complexity_first]]
 
@@ -67,9 +66,9 @@ runtime 上。key schema 与召回打分(BM25 / IVF / RRF)都在 Rust 里,一处
 
 消费者两类:
 - **Rust 直接用 crate**(`examples/memory-mcp` = web UI + MCP server 一个二进制)。
-- **非 Rust 适配器按 `mem/` key schema 复刻**(`examples/hermes-autumn-memory/hermes_provider.py`
-  在 `autumn.Client` 上字节忠实地复刻情景/事实/词法搜索)。**契约是 key schema
-  (§6),不是某个语言绑定**——这是 adapter 能长在核心库之外的原因。
+- **非 Rust 适配器按 `mem/` key schema 复刻**——在任意语言的客户端上按 §6 的 key
+  schema 重建情景/事实/词法搜索即可。**契约是 key schema(§6),不是某个语言绑定**
+  ——这是 adapter 能长在核心库之外的原因。
 
 ```
 ┌─ 多个 agent(同一 sglang 之上)─────────────────────────────┐
@@ -109,7 +108,7 @@ runtime 上。key schema 与召回打分(BM25 / IVF / RRF)都在 Rust 里,一处
 | autumn 内置向量 ANN / 倒排引擎(变 Qdrant/tantivy) | 并行数据面 [[feedback_no_parallel_data_plane]] + 匹配不完;检索 = posting-on-KV(中小)或 sidecar(重) |
 | **turbopuffer 当 autumn 的检索层 / 后端** | turbopuffer 闭源托管 + 建在 S3 + 无换后端接口,autumn 非 S3 兼容→插不进;并列用 = daemon + 并行数据面 + 第三方托管 + autumn 被边缘化(目标没了) |
 | 客户端进程内加载**神经** embedding 模型 | N agent 各加载 N 份炸显存;走远程端点或零 GPU 的静态表 embedder(§11) |
-| 依赖引擎 MVCC 做「时点/历史」记忆 | 客户端读不到历史、旧版 compaction 丢弃(§14);双时态在应用层 key schema 显式做 |
+| 依赖引擎 MVCC 做「时点/历史」记忆 | 客户端读不到历史、旧版 compaction 丢弃(§13);双时态在应用层 key schema 显式做 |
 | 服务端二级索引 / 谓词扫描 / 聚合 / hybrid 融合 | partition 只保证 key 有序;过滤/打分/RRF 在客户端做 |
 | 等「记忆专用协议标准」 | 不存在:A2A/AGNTCY=agent-to-agent 非记忆;OpenMemory MCP 只是跑在 MCP 上的产品;**MCP=事实唯一通用答案** |
 
@@ -122,7 +121,7 @@ runtime 上。key schema 与召回打分(BM25 / IVF / RRF)都在 Rust 里,一处
 | 语义 semantic | 向量ANN 或 point-get+前缀list;supersede | ✅ 存储契合 / 检索见 §7 |
 | 过程 procedural | point-get by name | ✅ 普通命名 KV |
 | 图 | 邻接表前缀扫 | ✅ `graph.rs`(§6) |
-| 双时态 | 有效期查询 | ❌ 不原生(有效期编 key,§14) |
+| 双时态 | 有效期查询 | ❌ 不原生(有效期编 key,§13) |
 
 ## 6. Key 格式
 
@@ -166,7 +165,7 @@ namespace 内子前缀,不是 SDK 的 tenant 概念。
 - IVF 桶 id 是**定长 4 字节 BE**,所以 `ivf/{4B}{vec_id}` 按 offset 解析(那 4 字节可能
   含 `0x2F`,绝不当分隔符)。`ivf_meta/` 与 `ivf/` 不互为前缀(`ivf_` ≠ `ivf/`),所以
   vptr / 质心对桶扫描不可见。
-- 每 key 可带 **TTL**(`expires_at`,§14)。
+- 每 key 可带 **TTL**(`expires_at`,§13)。
 - **双时态**用 immutable `fact/{entity}/{valid_from}/{txid}`,「关闭旧有效期」不原地覆盖
   而是 append-only correction/interval record;一个 bitemporal update 用
   `commit_marker/txid` 标完整提交;重建历史只读 committed txid 并按 txid 去重
@@ -257,7 +256,7 @@ marker = **多 key、常跨分区、无事务、无快照、无 CAS** 的派生�
 3. **`meta/stats` 的多写者 RMW 竞态被容忍,不被序列化。** 危害低(只歪 idf / avgdl 的
    打分,绝不改变"哪些 doc 被找到"——posting 与 doc 记录是 per-doc 的,无跨 doc 竞态),
    且需要"多进程写同一 agent"的非主流拓扑。所以不给热路径加 per-writer 分片或服务端
-   原子自增,而是**容忍漂移 + 用 §16 的 `reconcile` 检出 + `repair_stats` 在热路径之外
+   原子自增,而是**容忍漂移 + 用 §15 的 `reconcile` 检出 + `repair_stats` 在热路径之外
    修**。
 4. **一次逻辑写只算一个 `expires_at` 复用到所有 key**(避免客户端 clock skew 让同一批
    key 错位过期);TTL 对象**禁用 `put_stream_begin`**——它当前忽略 `expires_at`。
@@ -379,36 +378,15 @@ embedding。两条供给路径:
   长驻 HTTP/SSE MCP + REST daemon(除非企业要治理 gateway,那时无状态可多副本)。
   `examples/memory-mcp` 的同一个二进制加 `--mcp` 就是 stdio MCP server。
 - **(b) REST API**(仅企业治理 gateway 形态):`add/search/get_all/get/update/delete`。
-- **(c) 原生适配器**(零额外进程,纯 client):Hermes MemoryProvider(§13);其它框架
+- **(c) 原生适配器**(零额外进程,纯 client):在宿主框架的语言里直接照 §6 的 key
+  schema 实现;其它框架
   (LangGraph `BaseStore`、Mem0 `VectorStoreBase`、OpenAI Agents SDK Session)按同一
   key schema 复刻即可。
 
 **满足 Mem0 后端契约**:实现 `VectorStoreBase`(11 方法);`search` 不要求 ANN,暴力/IVF
 都合规;无独立关键词后端接口,hybrid Mem0 自融合,可 override `keyword_search()`。
 
-## 13. Hermes Agent 适配器
-
-「hermes」= Nous Research **Hermes Agent**(开源 Python runtime,跑
-vLLM/SGLang/OpenAI-compat)。适配器在 `examples/hermes-autumn-memory/hermes_provider.py`
-——**一个文件里两层**:`AutumnMemory`(在 `autumn.Client` 上按 §6 key schema 复刻情景 /
-事实 / 词法搜索)+ `AutumnMemoryProvider`(Hermes `MemoryProvider` 适配 + 同步桥)。
-
-| 钩子 | 约束 | autumn 侧 |
-|---|---|---|
-| `initialize(context)` | 拿 endpoint / tenant / agent / 凭据 | 开 `autumn.Client` + 推命名空间 |
-| `sync_turn(turn)` | **必须非阻塞** | fire-and-forget:append 情景日志 |
-| `queue_prefetch(query)` / `prefetch(query)` | **必须快** | 近期情景前缀扫 + 有界词法扫,拼 context |
-| `on_memory_write(namespace, key, value)` | 镜像内置 MEMORY.md/USER.md | 写进 `fact/` |
-| `get_tool_schemas()` / `handle_tool_call(...)` | 可选 | 给模型 `memory_search`/`memory_store` 工具 |
-| `shutdown()` | 收尾 | flush + 关闭桥 |
-
-它是**部署 glue,故意留在核心之外**:核心只暴露 Rust `autumn-memory` lib 加稳定的
-`mem/` key schema,每个 agent 在这个 schema 上长自己的 memory 人机工程。
-`MemoryProvider` ABC 随 hermes 版本漂移——**接一个新 hermes 版本前先核对方法名/签名**。
-
-**边界**:Hermes 内置的 MEMORY.md/USER.md 故意本地小,不替换,只 `on_memory_write` 镜像。
-
-## 14. autumn 客户端面约束
+## 13. autumn 客户端面约束
 
 **能力**:point CRUD;每-key **TTL**(`expires_at`,经 `put_many` +
 `ClusterClient::ttl_to_expires_at`);**前缀 `range(prefix, start, limit)`**(有序/分页/
@@ -423,7 +401,7 @@ striping)。
 - ⚠️ `put_stream_begin` **忽略 `expires_at`** → 带 TTL 的对象不能走它(§8.5 契约 4)。
 - key 编码 `user_key ++ 0x00 ++ BE(u64::MAX - seq)`,MVCC seq 仅内部。
 
-## 15. 竞品定位 / 性能
+## 14. 竞品定位 / 性能
 
 **定位**:≈「**turbopuffer 的索引哲学**(SPFresh + BM25 posting-on-storage)+
 **sqlite-vec/FTS5 的无-daemon 接入** + **FoundationDB 的 layer 基质**」。市面无完全对应
@@ -440,7 +418,7 @@ Mem0/Zep/Letta 作为托管服务(autumn-memory 是它们底下可建的后端);
   ——turbopuffer 的核心优化(NVMe cache 掩盖 S3)在此既派不上用场、又正好是 autumn 的
   结构强项;**全面超过不能也不必**(不同 workload)。
 
-## 16. 完整性检查与验收
+## 15. 完整性检查与验收
 
 派生索引是可丢弃、可重建的(§8.5 契约 6),所以正确性靠**热路径之外的审计 + 修复**,
 不靠热路径加锁:
@@ -464,9 +442,9 @@ index-reconcile 检查(主记录↔posting↔统计一致性、orphan/stale post
 **Non-goals(直到外部需求)**:autumn 内置 ANN/倒排引擎、图遍历下推、服务端 hybrid
 融合、记忆专用 wire 协议、默认 daemon。
 
-## 17. 开放问题
+## 16. 开放问题
 
-① `prefetch` 的两跳(§14)是否逼出「value 携带 range」的服务端改 —— 实测决定;
+① `prefetch` 的两跳(§13)是否逼出「value 携带 range」的服务端改 —— 实测决定;
 ② 全局共享质心的训练/再训练触发(冷启 vs 周期;SPFresh LIRE 增量);
 ③ 双时态 key schema 的 valid-time 编码;
 ④ 量化档(int8/binary)——当前 posting 存 f32(`[dim u32 LE][f32 LE]*dim`),换档看召回
