@@ -30,6 +30,28 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (d)
+TaskStatus: completed
+Task scope: 评审剩余 11 项全部处理完毕(EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、
+  recovery F3/F5/F6)。本轮完成最后两项:delete F4 正解 + delete F3(用户批准 wire 变更)。
+【delete F4 正解 (3b66df9)】上一次在 reconcile 端加守卫被撤回;这次改在【源头】:manager 用
+  RAII guard 把正在分配的 extent id 放进 allocating_extents,reconcile 对这些 id 不下判决。
+  orphan 清理时序完全不变——非分配中的残留仍然一轮清完(offline_reconcile 钉住这点)。
+【delete F3 (3b66df9)】DeleteExtentReq 加 node_uuid,EN 在动任何东西前校验;空 uuid=未指定、
+  跳过(与 classify_df_echo 同约定)。身份必须随重试一起持久化,所以
+  pending_addrs: Vec<String> → pending_targets: Vec<DeleteTarget>{addr,node_uuid},
+  内存态与 etcd 持久态都改。
+  【发现的隐患(已加双向交叉引用,未重构)】manager_rpc.rs 有 19 个 Ext* 结构是
+  extent_rpc.rs 的【镜像】——manager 用前者编码、EN 用后者解码,只改一边就是静默 rkyv 乱解码,
+  而两个文件哈希进【同一个】指纹所以指纹抓不到。本次两边都改了,并让 round-trip 测试用真结构
+  解码镜像产生的字节。WIRE v29 原地刷新 9cb798979a60ed87 → 2137fdbb94408a98。
+【教训】cargo build --workspace 不编译 test target;改 wire 结构必须用 --all-targets,
+  否则 stream 的测试 helper 编译失败要到跑测试时才发现(本轮踩到)。
+【唯一遗留:EC P1-3 的重启窗口】ec_stage_nonce 是内存态,目标节点重启后封存丢失,直到下一轮
+  reconcile 重新封存(≤5 分钟)。彻底关闭需要节点侧持久记录 payload location,而 .meta 没有
+  该字段 ⇒ 持久格式变更。需用户决策后再做。
+Next steps: 无待办。可选:EC P1-3 残留(.meta 加 payload location 字段,需决策)。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (c)
 TaskStatus: not_completed
 Task scope: EC P1-3 复现并修复;delete F4 撤回。

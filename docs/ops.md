@@ -1496,6 +1496,19 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   GC-leak classes that the per-key/range checkers can't see. Pure-logic unit
 #   tests run in plain `cargo test` (no cluster): `... --test system_chaos
 #   accounting_checker_tests`.
+# extent delete carries a target identity
+# What to expect: an EN that refuses a delete logs
+#   `delete_extent addressed to a DIFFERENT node — refusing` at WARN, with
+#   `for_node` / `this_node` uuids. Seeing this means a manager is retrying a
+#   delete against an address now owned by a different node — almost always a
+#   torn-down cluster whose persisted retries are still running against a host
+#   that a NEW cluster reuses. Nothing was deleted; the correct action is to
+#   stop the old manager, not to clear the warning.
+# Manual check: start a node with `--advertise` (so it has a uuid), allocate an
+#   extent, then send a delete naming a different uuid — the file must survive
+#   and the WARN must appear; naming the node's own uuid must unlink it.
+#   Unit-level equivalent:
+#   `cargo test -p autumn-stream --lib delete_extent_refuses`.
 ```
 
 ## Rolling restart & upgrade versioning
