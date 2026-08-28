@@ -30,6 +30,33 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (c)
+TaskStatus: not_completed
+Task scope: EC P1-3 复现并修复;delete F4 撤回。
+【EC P1-3 已复现并修复 (63e104d)】复现是确定性的——状态机 bug,不需要并发:
+  nonce 100 staged shard0 → 投 InShardFile placement → nonce 99 重放 stripe。
+  修复前节点回 CODE_OK,且磁盘上是僵尸的字节。测试先断言磁盘内容(那才是危害)再断言拒绝码。
+  根因:flip 是唯一提交点且【无 rename】,staging 文件就是线上 shard;而 apply_placements 在
+  InShardFile 判决时把 nonce floor【删掉】。改为封存(EC_STAGING_SEALED),且封存压过 nonce-0
+  透传;staged_here 排除 SEALED 以免挡住清理;extent 被遗忘的 5 处同步清 claim。
+  【残留(写进代码注释)】ec_stage_nonce 是内存态,本节点重启会重开窗口直到下一轮 reconcile
+  重新封存。要彻底关闭需要节点侧【持久】记录 payload location——.meta 没有该字段,属持久格式
+  变更(停机类),需用户决策。
+【delete F4 已撤回 (40c8778 → 63e104d)】它弄挂了
+  offline_reconcile::startup_reconcile_unlinks_orphans,而我提交前【只跑了 lib 测试】。
+  教训:改 reconcile/recovery 行为必须跑对应的集成测试二进制,lib 覆盖不到。
+  两半在推敲后都站不住:
+  ① 三轮宽限为了关一个 ~10s 窗口(review 自己说自愈、无 acked 数据丢失),把【全部】 orphan
+     残留从 5 分钟拖到 15 分钟。
+  ② 失忆守卫("extent 表空而节点报告非空")与"全新集群+一个游离文件"信号完全相同——那正是
+     该测试的构造;而它想保护的 memory-mode 重启场景里,数据本来就已不可读(review 原文)。
+  真正的修法在【源头】:alloc 路径把正在分配的 extent id 公布出来,让 reconcile 过滤器跳过。
+  这样 orphan 清理时序完全不变。下一轮做这个。
+Next steps:
+  1) delete F4 正解:alloc 侧公布 in-progress extent id(不改 orphan 清理时序)。
+  2) 需用户决策两项:(a) delete F3 要在 wire 加集群/节点身份 ⇒ 扰动 WIRE_FINGERPRINT、停机升级;
+     (b) EC P1-3 残留要在 .meta 加 payload location 字段 ⇒ 持久格式变更。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (b)
 TaskStatus: not_completed
 Task scope: 处理评审剩余项 EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
