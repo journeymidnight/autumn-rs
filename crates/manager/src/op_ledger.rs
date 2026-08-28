@@ -77,6 +77,19 @@ impl OpLedger {
         state == OP_STATE_PENDING || state == OP_STATE_RUNNING
     }
 
+    /// May a PS-reported terminal outcome still be written onto this entry?
+    ///
+    /// Active states, obviously — but UNKNOWN too. UNKNOWN is not a verdict,
+    /// it is this ledger admitting it lost track (`sweep_running_ttl`), and the
+    /// PS keeps retransmitting the real outcome on every 5 s load report. If
+    /// UNKNOWN were terminal the truth would be refused forever and never reach
+    /// the audit log, which is where this module promises terminal outcomes
+    /// live. A REAL terminal state is not superseded: a retransmit after a
+    /// genuine transition stays an idempotent no-op.
+    fn accepts_terminal_report(state: u8) -> bool {
+        Self::is_active(state) || state == OP_STATE_UNKNOWN
+    }
+
     /// Submit a new op, or ATTACH to an in-flight one with the same target
     /// `(kind, part_id, secondary_id)`. Returns `(op_id, attached)`; attach turns
     /// an impatient re-run into a status watch (the PS cap-1 channels + the
@@ -176,9 +189,10 @@ impl OpLedger {
     }
 
     /// Reconcile a PS-reported terminal maintenance outcome. Returns `true` iff
-    /// this call actually moved a KNOWN, still-active op to terminal — so the
-    /// caller audits exactly once (a heartbeat retransmit or an unknown op_id
-    /// returns `false`, an idempotent no-op).
+    /// this call actually moved a KNOWN op that was still accepting a report
+    /// (active, or UNKNOWN — see `accepts_terminal_report`) to terminal — so
+    /// the caller audits exactly once. A retransmit onto an already-terminal
+    /// entry, or an unknown op_id, returns `false`: an idempotent no-op.
     pub(crate) fn reconcile_outcome(
         &mut self,
         op_id: u64,
@@ -189,7 +203,7 @@ impl OpLedger {
     ) -> bool {
         let mut moved = false;
         if let Some(e) = self.find_mut(op_id) {
-            if Self::is_active(e.state) {
+            if Self::accepts_terminal_report(e.state) {
                 e.state = state;
                 e.error = error;
                 if !message.is_empty() {
@@ -654,6 +668,48 @@ mod tests {
         led.update_progress(999, 1, 2);
         led.update_progress(0, 1, 2);
         assert_eq!(q_one(&led, 999).state, OP_STATE_UNKNOWN);
+    }
+
+    /// The 30-min TTL flip to UNKNOWN must not be terminal. The PS keeps
+    /// retransmitting the true outcome on every load report; refusing it would
+    /// discard the real SUCCEEDED/FAILED and its reason, and the audit log —
+    /// which this module promises holds terminal outcomes — would never see it.
+    /// Reachable without any fault: `autumn-op compact` fanned over many
+    /// partitions of one PS queues behind its concurrency permits, and the
+    /// queue wait counts against the TTL because RUNNING is set at submit.
+    #[test]
+    fn a_late_authoritative_outcome_supersedes_unknown() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 0, 100_000);
+        led.set_running(id, 0);
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 10);
+        assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN, "precondition: TTL flip");
+
+        assert!(
+            led.reconcile_outcome(
+                id,
+                OP_STATE_FAILED,
+                "disk full".to_string(),
+                String::new(),
+                OP_RUNNING_TTL_SECS + 20,
+            ),
+            "a late PS-reported outcome must be accepted onto an UNKNOWN entry"
+        );
+        let r = q_one(&led, id);
+        assert_eq!(r.state, OP_STATE_FAILED);
+        assert_eq!(r.error, "disk full", "the failure reason must survive");
+
+        assert!(
+            !led.reconcile_outcome(
+                id,
+                OP_STATE_SUCCEEDED,
+                String::new(),
+                String::new(),
+                OP_RUNNING_TTL_SECS + 30,
+            ),
+            "a genuine terminal state is NOT superseded by a later retransmit"
+        );
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
     }
 
     #[test]
