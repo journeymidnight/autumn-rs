@@ -287,6 +287,13 @@ impl AsyncTableIterator {
         }
     }
 
+    /// How far this iterator has walked, and how far it has to go, in SST
+    /// data blocks — the unit a merge actually advances in, and one the reader
+    /// already knows without touching the stream.
+    pub fn block_progress(&self) -> (u64, u64) {
+        (self.block_idx as u64, self.reader.block_count() as u64)
+    }
+
     pub fn valid(&self) -> bool {
         self.block_iter.as_ref().is_some_and(|bi| bi.valid())
     }
@@ -402,6 +409,15 @@ impl AsyncMergeIterator {
 
     pub fn valid(&self) -> bool {
         self.iters.iter().any(|it| it.valid())
+    }
+
+    /// Merge progress as `(blocks consumed, blocks total)` summed over the
+    /// inputs. Exact and free: every term is already in memory.
+    pub fn block_progress(&self) -> (u64, u64) {
+        self.iters
+            .iter()
+            .map(|it| it.block_progress())
+            .fold((0, 0), |(d, t), (id, it_total)| (d + id, t + it_total))
     }
 
     /// Return the current minimum key across all valid iterators.

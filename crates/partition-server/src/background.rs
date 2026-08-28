@@ -587,7 +587,7 @@ pub(crate) async fn background_maintenance_loop(
                 // peak RAM (each do_compact holds ~2x SST bytes).
                 let _permit = concurrency_ctrl.acquire_compact().await;
                 // compact_inflight already latched at top of recv arm.
-                let result = do_compact(&part, compact_tbls, major).await;
+                let result = do_compact(&part, compact_tbls, major, compact_op_id).await;
                 match result {
                     Ok(s) => {
                         tracing::info!(
@@ -694,7 +694,7 @@ pub(crate) async fn background_maintenance_loop(
                         metrics
                             .compact_inflight
                             .store(1, std::sync::atomic::Ordering::Relaxed);
-                        let result = do_compact(&part, tbls, true).await;
+                        let result = do_compact(&part, tbls, true, /* no submitted op */ 0).await;
                         match result {
                             Ok(s) => {
                                 tracing::info!(
@@ -776,7 +776,7 @@ pub(crate) async fn background_maintenance_loop(
                         metrics
                             .compact_inflight
                             .store(1, std::sync::atomic::Ordering::Relaxed);
-                        let result = do_compact(&part, compact_tbls, false).await;
+                        let result = do_compact(&part, compact_tbls, false, /* no submitted op */ 0).await;
                         match result {
                             Ok(s) => {
                                 tracing::info!(
@@ -1298,7 +1298,7 @@ pub(crate) async fn background_maintenance_loop(
                 // First failure across the batch → the op's reported error.
                 let mut gc_failed: Option<String> = None;
                 for (eid, sealed_length) in holes {
-                    match run_gc(&part, eid, sealed_length, gc_op_id).await {
+                    match run_gc(&part, eid, sealed_length, gc_op_id, gc_kind).await {
                         Ok(()) => {
                             // success → clear any prior failure stamp so
                             // a transient EC fall-back hiccup doesn't suppress
@@ -2260,6 +2260,7 @@ pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
     tbls: Vec<TableMeta>,
     major: bool,
+    op_id: u64,
 ) -> Result<CompactStats> {
     if tbls.is_empty() {
         return Ok(CompactStats {
@@ -2385,7 +2386,30 @@ pub(crate) async fn do_compact(
     let mut output_bytes = 0u64;
     let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
 
+    // Sampling cadence for the progress report below. Blocks, not entries, are
+    // what a merge advances in, so a few thousand entries is far less than one
+    // block on any realistic value size — the sample is cheap and the number it
+    // publishes only changes at block boundaries anyway.
+    const PROGRESS_SAMPLE_ENTRIES: u64 = 4096;
+    // Primed so the FIRST entry publishes. That sample is `(0, total)`, which
+    // is what tells an operator the denominator — waiting 4096 entries to
+    // reveal how big the job is defeats the point of reporting at all.
+    let mut since_progress = PROGRESS_SAMPLE_ENTRIES;
+
     while merge.valid() {
+        // Publish how much of the input the merge has consumed, in SST data
+        // blocks. Both terms are already in memory, so this costs no I/O.
+        since_progress += 1;
+        if since_progress >= PROGRESS_SAMPLE_ENTRIES {
+            since_progress = 0;
+            let (done, total) = merge.block_progress();
+            part.borrow().metrics.set_maintenance_progress(
+                op_id,
+                manager_rpc::OP_KIND_COMPACT,
+                done,
+                total,
+            );
+        }
         // Snapshot the current item's needed fields. We can't hold the
         // `&IterItem` borrow across `merge.next()` (mutable borrow), and
         // an intermediate chunk emit is async, so copy out.
@@ -3006,6 +3030,9 @@ pub(crate) async fn run_gc(
     extent_id: u64,
     sealed_length: u64,
     op_id: u64,
+    // `OP_KIND_GC` or `OP_KIND_FORCE_GC` — the caller knows which task this
+    // is, and progress filed under the wrong kind is worse than none.
+    op_kind: u8,
 ) -> Result<()> {
     let (log_stream_id, rg, part_sc, rate_ctrl) = {
         let p = part.borrow();
@@ -3053,7 +3080,7 @@ pub(crate) async fn run_gc(
         {
             let p = part.borrow();
             p.metrics
-                .set_maintenance_progress(op_id, manager_rpc::OP_KIND_GC, cur, sealed_length);
+                .set_maintenance_progress(op_id, op_kind, cur, sealed_length);
         }
         let want = (sealed_length - cur).min(chunk_bytes as u64);
         let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
