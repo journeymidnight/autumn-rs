@@ -2274,7 +2274,7 @@ pub(crate) async fn do_compact(
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u64)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (readers, row_stream_id, meta_stream_id, rg, part_sc, row_append_tx, rate_ctrl) = {
+    let (readers, row_stream_id, meta_stream_id, rg, part_sc, part_cache, row_append_tx, rate_ctrl) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -2288,6 +2288,7 @@ pub(crate) async fn do_compact(
             p.meta_stream_id,
             p.rg.clone(),
             p.stream_client.clone(),
+            p.block_cache.clone(),
             p.row_append_tx.clone(),
             p.rate_ctrl.clone(),
         )
@@ -2320,6 +2321,7 @@ pub(crate) async fn do_compact(
             AsyncTableIterator::new(
                 r.clone(),
                 part_sc.clone(),
+                part_cache.clone(),
                 FetchMode::Window(SCAN_READ_WINDOW_BYTES),
             )
         })
@@ -3264,8 +3266,8 @@ async fn process_gc_chunk(
             // paged SST lookup awaits — snapshot + drop borrow.
             let readers: Vec<Arc<SstReader>> = p.sst_readers.to_vec();
             let sc = p.stream_client.clone();
+            let cache = p.block_cache.clone();
             drop(p);
-            let cache = crate::global_block_cache().clone();
             let mut found = None;
             for r in readers.iter().rev() {
                 // coco P0: a read ERROR must abort this extent's GC
@@ -3653,12 +3655,14 @@ pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
 pub(crate) async fn sst_user_key_versions(
     readers: &[Arc<SstReader>],
     sc: &Rc<StreamClient>,
+    cache: &Arc<crate::sstable::BlockCache>,
 ) -> Result<BTreeMap<Vec<u8>, (u8, u64)>> {
     let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
     for reader in readers.iter().rev() {
         let mut it = AsyncTableIterator::new(
             reader.clone(),
             sc.clone(),
+            cache.clone(),
             FetchMode::Window(SCAN_READ_WINDOW_BYTES),
         );
         it.rewind().await?;

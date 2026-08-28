@@ -51,9 +51,6 @@ fn pick_addr() -> SocketAddr {
 }
 
 fn start_manager(addr: SocketAddr) {
-    // block cache is process-global — clear it so a prior in-process test's
-    // block can't be served for this test's same-id extent.
-    autumn_partition_server::clear_global_block_cache();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = AutumnManager::new();

@@ -270,11 +270,16 @@ pub struct AsyncTableIterator {
 }
 
 impl AsyncTableIterator {
-    pub fn new(reader: Arc<SstReader>, sc: Rc<StreamClient>, mode: FetchMode) -> Self {
+    pub fn new(
+        reader: Arc<SstReader>,
+        sc: Rc<StreamClient>,
+        cache: Arc<BlockCache>,
+        mode: FetchMode,
+    ) -> Self {
         AsyncTableIterator {
             reader,
             sc,
-            cache: crate::global_block_cache().clone(),
+            cache,
             mode,
             block_idx: 0,
             block_iter: None,

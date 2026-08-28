@@ -135,12 +135,6 @@ impl BlockCache {
     /// clusters in one process reuses low extent ids, so a fresh cluster must
     /// start from an empty cache or it can be served a prior cluster's block
     /// for the same `(extent_id, offset)`. Diagnostic / test use only.
-    pub fn clear(&self) {
-        let mut g = self.inner.lock();
-        g.map.clear();
-        g.bytes = 0;
-    }
-
     /// TEST-ONLY diagnostic snapshot: `(bytes, entries, hits, misses)`.
     #[cfg(test)]
     pub fn stats(&self) -> (usize, usize, u64, u64) {

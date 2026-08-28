@@ -90,12 +90,6 @@ pub fn pick_stable_port_pair() -> u16 {
 
 /// Start a manager (no etcd) on its own thread.
 pub fn start_manager(mgr_addr: SocketAddr) {
-    // Each test is a fresh logical cluster that reuses low extent ids, but the
-    // SST block cache is process-GLOBAL and keyed by (extent_id, offset). Clear
-    // it so a prior in-process test's block can't be served for this test's
-    // same-id extent (which surfaces as stale_vp_offset_past_sealed_length on a
-    // later test in the same binary). Harmless in production (one cluster/proc).
-    autumn_partition_server::clear_global_block_cache();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = AutumnManager::new();

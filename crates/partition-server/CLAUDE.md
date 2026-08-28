@@ -444,10 +444,15 @@ Get(key, part_id):
 
 `SstReader` does NOT keep SST bytes resident: production readers (flush / compact
 / recovery) are PAGED — only MetaBlock state stays in memory; data blocks are
-fetched on demand from row_stream through the process-wide bounded `BlockCache`
+fetched on demand from row_stream through a bounded `BlockCache`
 (`--sst-block-cache-bytes`, default 512 MB, sampled-LRU; keys =
 `(extent_id, abs_off)`; NO compaction invalidation needed — extent ids are never
-reused, stale entries age out). Recovery opens SSTs from the META TAIL ONLY
+reused, stale entries age out). The cache is owned by the `PartitionServer` and
+shared by every partition it opens — NOT a process-global: `(extent_id, abs_off)`
+is unique only within ONE cluster, and a PS serves exactly one. (Production has
+one PS per process, so this is the same single cache either way; what it rules
+out is a harness running several in-process clusters aliasing each other's
+blocks — which silently served one cluster's data to another.) Recovery opens SSTs from the META TAIL ONLY
 (last-4-bytes → meta region) and the WAL replay streams in 64 MB chunked-carry
 (`decode_records_chunk`), so restart RSS = replay-window bound, dataset-independent.
 
@@ -463,7 +468,7 @@ Invariants:
   `lookup_in_sst` (sync) serves resident readers only and ERRORS on paged ones —
   never silently misses.
 - Iteration is ASYNC (`AsyncTableIterator` / `AsyncMergeIterator`, fetch blocks on
-  demand). `FetchMode::Cached` (range — per-block via the global BlockCache) vs
+  demand). `FetchMode::Cached` (range — per-block via the PS's BlockCache) vs
   `FetchMode::Window(8MiB)` (do_compact / split unique_user_keys — sequential bulk
   windows BYPASSING the cache, scan-resistant; one RPC per window; peak read memory
   = inputs × one window). The async API returns Result — a block-read error ABORTS

@@ -27,7 +27,34 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   run_e2e.sh 活集群 e2e 5/5 + scan_boundary 1/1(即新比较器+新续扫 idiom 的真集群验证);
   clippy 无新告警。
 【已知无关噪音】integration.rs 三个 recovery 测试"同批挂/单跑过"在改动前基线同样挂
-  (stash 实证),属既有跨测试进程态污染,未在本任务处理。
+  (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
+Next steps: 无。
+
+Date: 2026-08-28
+TaskStatus: completed
+Task scope: SST BlockCache 由进程全局改为 PartitionServer 实例持有,修掉 integration.rs
+  三个 recovery 测试的跨集群污染。
+【症状】cargo test -p autumn-manager --test integration 稳定 10 passed / 3 failed
+  (recovery_replays_log_stream 等),replay 读回空值。形状酷似 on-disk 排序损坏,
+  在验 96a5c01(内部 key 比较器)时已经差点被误判成格式回归。
+【定位过程,含两个被证伪的假设】
+  ① "并发竞态" —— 证伪:--test-threads=1 同样挂(2/2);给 13 个测试加互斥锁串行化也无效。
+  ② "start_manager 少清一次缓存" —— 证伪:照 support/mod.rs 补上 clear 后依然挂。
+  真因:harness 从不关闭集群(drop(ps) 只丢客户端,PS/EN/manager 线程 detached 永生),
+  测试 B 清完缓存后,测试 A 仍活着的 PS 继续往全局缓存塞它的 extent 6 —— 清一次在结构上
+  就拦不住。判据:把 BlockCache::get 改成恒返回 None,3/3 全绿(启用则稳定挂,确定性因果)。
+【修法】删掉 SST_BLOCK_CACHE / global_block_cache() / clear_global_block_cache(),
+  cache 变成 PartitionServer 字段,沿 metrics_arc 既有那条路传进 partition_thread_main
+  → PartitionData 字段。三个取值点改从手上已有的 part.borrow() 取;AsyncTableIterator::new
+  / sst_user_key_versions / range_scan_sst_merge 各加一个 cache 参数(cache 走的就是
+  stream_client 现成的传递链,没开新路径)。BlockCache::clear 随之退役。
+【为什么生产零影响】键 (extent_id, offset) 只在单个集群内唯一;一个 PS 只服务一个集群,
+  一个进程只有一个 PS ⇒ 全局与 per-PS 在生产上是同一个 cache、同样 512MB、同样命中行为。
+  改动把"进程里恰好只有一个集群"这个不成文假设变成结构保证。
+【验证】integration 连跑 3 次 13/13(单次绿不算数);删掉 clear 后原本靠它保护的
+  system_split_gallery_originals 3/3、system_correlated_2of3_loss 2/2 仍过;
+  lib 测试 partition-server 212 / manager 293 / stream 110 / rpc 60 / client 41 全绿;
+  clippy 无新告警。partition-server CLAUDE.md 对应两处已改。
 Next steps: 无。
 
 Date: 2026-08-27

@@ -31,7 +31,6 @@ const ADMIN: &str = "layer-a-admin";
 
 /// A memory-mode manager WITH an admin token (namespace-create is admin-gated).
 fn start_manager_with_admin(mgr_addr: SocketAddr) {
-    autumn_partition_server::clear_global_block_cache();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = autumn_manager::AutumnManager::new();

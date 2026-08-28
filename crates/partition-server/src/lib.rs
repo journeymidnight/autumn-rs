@@ -311,10 +311,15 @@ fn max_write_batch() -> usize {
 ///
 /// Default = 8 → up to 8 × 30 MB = 240 MB worst-case memory per partition.
 /// Range clamped to [1, 64]. Overridable via `set_ps_inflight_cap`.
-/// process-wide bounded SST block cache (paged readers only).
+/// Capacity of a `PartitionServer`'s SST block cache (paged readers only).
+/// The cache ITSELF is per-`PartitionServer` (`PartitionServer::block_cache`,
+/// handed to every partition it opens) — only this size knob is process-wide.
+///
+/// The cache keys blocks on `(extent_id, offset)`, which is unique only WITHIN
+/// one cluster. One PS serves one cluster, so a per-PS cache can never alias;
+/// a process-global one silently could, and did in test harnesses that run
+/// several in-process clusters at once.
 static SST_BLOCK_CACHE_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static SST_BLOCK_CACHE: std::sync::OnceLock<std::sync::Arc<crate::sstable::BlockCache>> =
-    std::sync::OnceLock::new();
 
 pub fn set_sst_block_cache_bytes(n: usize) -> bool {
     if !(16 * 1024 * 1024..=256 * 1024 * 1024 * 1024).contains(&n) {
@@ -323,22 +328,9 @@ pub fn set_sst_block_cache_bytes(n: usize) -> bool {
     SST_BLOCK_CACHE_BYTES_CELL.set(n).is_ok()
 }
 
-pub(crate) fn global_block_cache() -> &'static std::sync::Arc<crate::sstable::BlockCache> {
-    SST_BLOCK_CACHE.get_or_init(|| {
-        let cap = *SST_BLOCK_CACHE_BYTES_CELL.get_or_init(|| 512 * 1024 * 1024);
-        std::sync::Arc::new(crate::sstable::BlockCache::new(cap))
-    })
-}
-
-/// Clear the process-global SST block cache. Diagnostic / test-harness use
-/// only: the cache keys on `(extent_id, offset)` and assumes extent ids are
-/// globally unique within the process (true for one production cluster). A
-/// test harness that spins up multiple independent clusters in one process
-/// reuses low extent ids, so it must clear the cache between clusters or a
-/// prior cluster's block can be served for this cluster's same-id extent
-/// (surfacing as `stale_vp_offset_past_sealed_length`).
-pub fn clear_global_block_cache() {
-    global_block_cache().clear();
+fn new_block_cache() -> std::sync::Arc<crate::sstable::BlockCache> {
+    let cap = *SST_BLOCK_CACHE_BYTES_CELL.get_or_init(|| 512 * 1024 * 1024);
+    std::sync::Arc::new(crate::sstable::BlockCache::new(cap))
 }
 
 /// staleness predicate: has the live `sst_readers` set changed since a
@@ -1030,6 +1022,9 @@ pub(crate) struct PartitionData {
     /// to one record, closing the post-merge two-source region-shift window).
     durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
+    /// This partition's SST block cache, owned by the `PartitionServer` and
+    /// shared by all of its partitions (see `PartitionServer::block_cache`).
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
     /// sender to the per-partition bulk thread. Always present —
     /// `open_partition` returns Err if P-sst fails to spawn, so the
     /// partition is never half-opened with no flush channel.
@@ -2312,6 +2307,10 @@ pub struct PartitionServer {
     /// just drained for process exit. `Cell` suffices — `shutdown()` and
     /// the region-sync tick both run on the single-threaded main compio
     /// runtime.
+    /// SST block cache for every partition this PS opens. Per-PS, not
+    /// process-global: its keys `(extent_id, offset)` are unique only within
+    /// one cluster, and one PS serves exactly one cluster.
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
     shutting_down: Cell<bool>,
 }
 
@@ -3221,6 +3220,7 @@ impl PartitionServer {
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
                             shutting_down: Cell::new(false),
+                            block_cache: new_block_cache(),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -4290,6 +4290,8 @@ impl PartitionServer {
         // is moved into the partition thread and threaded into PartitionData.
         let metrics_for_thread = std::sync::Arc::new(PartitionMetrics::default());
         let metrics_for_handle = metrics_for_thread.clone();
+        // Every partition of this PS shares the PS's one block cache.
+        let block_cache_for_thread = self.block_cache.clone();
         // build the compact + GC trigger channels on the main thread
         // so `PartitionHandle` can hold a Send `mpsc::Sender` for the
         // maintenance scheduler. The receivers go into `partition_thread_main`
@@ -4326,6 +4328,7 @@ impl PartitionServer {
                         drain_rx,
                         cpu_bulk,
                         metrics_for_thread,
+                        block_cache_for_thread,
                         compact_tx_for_thread,
                         compact_rx_main,
                         gc_tx_for_thread,
@@ -5731,6 +5734,7 @@ async fn partition_thread_main(
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     cpu_bulk: Option<usize>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
     // trigger channels created on the main thread; the senders
     // are cloned into `PartitionData` (replacing the old in-thread
     // channel) so loopback rpc handlers + the maintenance scheduler
@@ -5993,6 +5997,7 @@ async fn partition_thread_main(
         // incarnation's first flush commit acks (see the field doc).
         durable_ckpt_vp: Cell::new((0, 0)),
         stream_client: part_sc.clone(),
+        block_cache: block_cache.clone(),
         flush_req_tx: flush_req_tx.clone(),
         row_append_tx: row_append_tx.clone(),
         row_invalidate_tx: row_invalidate_tx.clone(),

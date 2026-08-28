@@ -605,11 +605,14 @@ async fn sst_lookup_paged_retry(
     'sst_lookup: loop {
         attempt += 1;
         // Borrow scoped to the snapshot — released before any await.
-        let (readers, sc) = {
+        let (readers, sc, cache) = {
             let p = part.borrow();
-            (p.sst_readers.to_vec(), p.stream_client.clone())
+            (
+                p.sst_readers.to_vec(),
+                p.stream_client.clone(),
+                p.block_cache.clone(),
+            )
         };
-        let cache = crate::global_block_cache().clone();
         for reader in readers.iter().rev() {
             match lookup_in_sst_via(reader, key, &sc, &cache).await {
                 Ok(Some(r)) => return Ok(Some(r)),
@@ -962,6 +965,7 @@ pub(crate) async fn handle_range(
             .cloned()
             .collect();
         let sc_snap = p.stream_client.clone();
+        let cache_snap = p.block_cache.clone();
         let now = now_secs();
         let check_overlap = p.has_overlap.get() != 0;
         let part_rg = p.rg.clone();
@@ -973,6 +977,7 @@ pub(crate) async fn handle_range(
             mem_items,
             &readers_snap,
             &sc_snap,
+            &cache_snap,
             now,
             check_overlap,
             &part_rg,
@@ -1015,6 +1020,7 @@ async fn range_scan_sst_merge(
     mem_items: Vec<IterItem>,
     readers_snap: &[std::sync::Arc<SstReader>],
     sc_snap: &Rc<StreamClient>,
+    cache_snap: &std::sync::Arc<crate::sstable::BlockCache>,
     now: u64,
     check_overlap: bool,
     part_rg: &autumn_rpc::manager_rpc::MgrRange,
@@ -1024,7 +1030,12 @@ async fn range_scan_sst_merge(
 
     let mut sst_iters: Vec<AsyncTableIterator> = Vec::with_capacity(readers_snap.len());
     for r in readers_snap.iter().rev() {
-        let mut it = AsyncTableIterator::new(r.clone(), sc_snap.clone(), FetchMode::Cached);
+        let mut it = AsyncTableIterator::new(
+            r.clone(),
+            sc_snap.clone(),
+            cache_snap.clone(),
+            FetchMode::Cached,
+        );
         it.seek(seek_key).await?;
         sst_iters.push(it);
     }
@@ -1307,11 +1318,15 @@ pub(crate) async fn handle_split_part(
         // async window scan over the (paged) SSTs — snapshot readers +
         // sc under one brief borrow, drop, await (note 15). Reader set is
         // stable: this path holds maintenance_gate.
-        let (uuk_readers, uuk_sc) = {
+        let (uuk_readers, uuk_sc, uuk_cache) = {
             let p = part.borrow();
-            (p.sst_readers.to_vec(), p.stream_client.clone())
+            (
+                p.sst_readers.to_vec(),
+                p.stream_client.clone(),
+                p.block_cache.clone(),
+            )
         };
-        let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc)
+        let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc, &uuk_cache)
             .await
             .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
         // coco P2: sample the memtable AFTER the (long) SST scan, so
