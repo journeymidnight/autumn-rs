@@ -30,6 +30,32 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (g)
+TaskStatus: completed
+Task scope: op 可观测性收口——按用户定调:split/merge/rebalance 一步操作【不做进度、结果进日志】;
+  ec_convert / recovery【必须有进度】。
+【单步 op 的结果进 leader 日志 (695cb55)】核实发现:它们的终态早就进了 ledger / audit / etcd
+  历史,但 leader 的 tracing 日志里【一个字都没有】——运维 tail manager.log 时看不到 split 成没成。
+  补 INFO(成功)/ WARN(失败带原因)。对无进度的 kind,这条日志就是它们的全部叙事。
+【ec/recovery 进度 (695cb55)】DfResp 加 op_progress: Vec<ExtentOpProgress>,live 样本搭在
+  终态本来就走的那趟 df 上,与 PS 把 compact/gc 搭在 load 心跳上同构。
+  【按 extent_id 键,不是 op_id】——节点根本不知道 manager 的 op id,而这两类在 ledger 里都是
+  extent-scoped,所以由 manager 解析(update_progress_by_extent)。
+  EC 每条带采样一次(分母=本节点整个 shard);recovery 每拷贝块采样一次(分母=sealed_length),
+  经回调穿进 stream_one_source(它是静态方法,拿不到 &self)。
+  【清理与 inflight 标记同生命周期】三处 remove 全部跟着 clear_op_progress——留下陈旧样本会让
+  ops status 显示一个"卡在 60%"的修复,比不显示更糟。update_progress_by_extent 还拒绝写非
+  RUNNING 条目,所以与完成同一趟 df 到达的样本不会复活已关闭的记录。
+【顺带】op_kind_name 从 CLI 移到 manager_rpc 常量旁(manager 打日志、CLI 渲染,标签飘了纯属
+  给运维添乱);ops_contract.sh 加自有端口段的前置清理(上一轮遗留 etcd 占端口,症状是
+  "address already in use" 却指向不属于本次运行的进程——仓库里踩过的老坑)。
+【进度覆盖终态】8 个 kind:gc/forcegc/compact(PS 心跳)+ ec-convert/recovery(EN df)有百分比;
+  split/merge/rebalance 按用户定调【故意不做】,结果在 leader 日志 + audit + ops history。
+【验证】WIRE v29 原地刷新 86490609d727073d → f8b58703a0162c62;lib rpc 60/stream 116/
+  manager 297/ps 212/common 15/client 41;stream 16 个测试二进制;7 个 manager 集成二进制;
+  system_chaos 7/7;ops contract 绿;clippy 干净。
+Next steps: 无待办。op 可观测性三层全部落地。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (f)
 TaskStatus: not_completed
 Task scope: op 可观测性三层——补齐进度上报与 dashboard 消费面。
