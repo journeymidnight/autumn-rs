@@ -5744,45 +5744,25 @@ impl AutumnManager {
                 *n != req.node_id || *sh != req.shard_idx || reported.contains(eid)
             });
 
-            // Amnesia guard. A manager whose extent table is EMPTY while nodes
-            // report extents cannot tell "the cluster really is empty" from "I
-            // lost my metadata" — and only one of those makes a fleet-wide
-            // unlink correct. Reachable without any fault: a memory-mode
-            // manager (no etcd) forgets every extent on restart, so the next
-            // sweep of every node would otherwise be told to wipe its disk.
-            // A genuinely empty cluster reports no extents, so this refuses
-            // nothing that GC would have reclaimed.
-            if s.extents.is_empty() && !req.extent_ids.is_empty() {
-                tracing::warn!(
-                    node_id = req.node_id,
-                    reported = req.extent_ids.len(),
-                    "reconcile_extents: this manager knows of NO extents while the node \
-                     reports some — issuing no garbage (lost metadata, not an empty cluster)"
-                );
-                return Ok(rkyv_encode(&ReconcileExtentsResp {
-                    code: CODE_OK,
-                    message: String::new(),
-                    garbage: Vec::new(),
-                    placements: Vec::new(),
-                }));
-            }
-
             req.extent_ids
                 .iter()
                 .copied()
                 .filter(|eid| {
                     let Some(ex) = s.extents.get(eid) else {
-                        // (1) unknown extent. NOT immediate: an extent's files
-                        // exist on its nodes BEFORE `extents/<id>` is published
-                        // (`place_extents_with_fallback` allocates on each node,
-                        // the etcd commit follows), so a sweep answered inside
-                        // that window would order the deletion of an extent that
-                        // was just legitimately created. Same grace as the
-                        // non-member case below — three rounds outlast the
-                        // commit window by orders of magnitude.
-                        let c = seen.entry((req.node_id, req.shard_idx, *eid)).or_insert(0);
-                        *c += 1;
-                        return *c >= NON_MEMBER_ROUNDS_BEFORE_GC;
+                        // (1) unknown extent — immediate.
+                        //
+                        // KNOWN GAP (delete review F4, deliberately NOT patched
+                        // here — see claude-progress.txt 2026-08-28): an extent's
+                        // files exist on its nodes BEFORE `extents/<id>` is
+                        // published, so a sweep answered inside that window
+                        // condemns an extent that was just created. Every guard
+                        // tried at THIS point either delays real orphan cleanup
+                        // for every extent or cannot be told apart from a fresh
+                        // cluster with a stray file. The fix belongs at the
+                        // source: have the alloc path publish its in-progress
+                        // extent ids so this filter can skip them.
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        return true;
                     };
                     // An op in flight on this extent means the file set is
                     // MID-CHANGE, so no verdict can be given: a participant

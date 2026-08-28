@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 /// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
 /// `payload_location` rides beside `MgrExtentInfo` on the wire (it is not part
 /// of the persisted struct), so the caller passes what the manager reported.
+/// `ec_stage_nonce` value meaning "staging is CLOSED for this extent" — the
+/// layout was flipped, so the shard file is live and no attempt may write it.
+///
+/// A real nonce is an etcd revision, so it is always below this and always
+/// refused by `claim_ec_staging`.
+const EC_STAGING_SEALED: u64 = u64::MAX;
+
 fn mgr_to_local_extent(e: &MgrExtentInfo, payload_location: u8) -> ExtentInfo {
     ExtentInfo {
         extent_id: e.extent_id,
@@ -3541,6 +3548,7 @@ impl ExtentNode {
             // fall back to scanning every disk.
             let entry = self.extents.remove(eid).map(|(_, v)| v);
             self.fd_lru.forget(*eid);
+            self.ec_stage_nonce.remove(eid);
             if let Some(entry) = entry {
                 if let Some(disk) = self.disks.get(&entry.disk_id) {
                     if let Err(e) = disk.remove_extent_files(*eid).await {
@@ -3612,7 +3620,13 @@ impl ExtentNode {
             // manager only publishes it by flipping the layout, which happens
             // after every target confirmed. So that case proceeds, and clearing
             // the stage marker there is what lets cleanup run at all.
-            let staged_here = self.ec_stage_nonce.contains_key(&p.extent_id);
+            // SEALED is not staging — it is the opposite — so it must not make
+            // this look like a live attempt and block cleanup forever.
+            let staged_here = self
+                .ec_stage_nonce
+                .get(&p.extent_id)
+                .map(|v| *v)
+                .is_some_and(|n| n != EC_STAGING_SEALED);
             match want.location {
                 PayloadLocation::InDat if staged_here => {
                     // Cannot tell locally whether that attempt is live or
@@ -3628,8 +3642,20 @@ impl ExtentNode {
                     continue;
                 }
                 PayloadLocation::InShardFile => {
-                    // The flip happened; this attempt is over.
-                    self.ec_stage_nonce.remove(&p.extent_id);
+                    // The flip happened — and it is the ONLY commit point, with
+                    // no rename: the file every attempt was staging into is now
+                    // the live shard. Clearing the floor here (what this used to
+                    // do) left a coordinator whose attempt was superseded before
+                    // the flip unordered against anything, so its late stripe was
+                    // accepted and written straight over live data. Seal instead:
+                    // staging for this extent is closed for good.
+                    //
+                    // RESIDUAL: `ec_stage_nonce` is in-memory, so a restart of
+                    // THIS node reopens the window until its next reconcile
+                    // round re-seals. Closing that needs a durable per-node
+                    // record of the payload location; `.meta` has no such field
+                    // today, and adding one is a persistent-format change.
+                    self.seal_ec_staging(p.extent_id);
                 }
                 PayloadLocation::InDat => {}
             }
@@ -5740,6 +5766,7 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(task.extent_id, &e.to_string());
             self.extents.remove(&task.extent_id);
             self.fd_lru.forget(task.extent_id);
+            self.ec_stage_nonce.remove(&task.extent_id);
             return Err(format!(
                 "recovery of extent {} completed but .meta persist failed (fail-closed): {e}",
                 task.extent_id
@@ -5907,16 +5934,29 @@ impl ExtentNode {
     /// Callers must hold this extent's op lock so compare-and-record is atomic
     /// against a concurrent stripe.
     fn claim_ec_staging(&self, extent_id: u64, attempt_nonce: u64) -> bool {
+        let seen = self.ec_stage_nonce.get(&extent_id).map(|v| *v);
+        // SEALED wins over everything, including the nonce-0 pass-through: once
+        // the layout is flipped the staged file IS the live shard, so there is
+        // no such thing as a legitimate stripe for it any more.
+        if seen == Some(EC_STAGING_SEALED) {
+            return false;
+        }
         if attempt_nonce == 0 {
             return true;
         }
-        if let Some(seen) = self.ec_stage_nonce.get(&extent_id).map(|v| *v) {
+        if let Some(seen) = seen {
             if attempt_nonce < seen {
                 return false;
             }
         }
         self.ec_stage_nonce.insert(extent_id, attempt_nonce);
         true
+    }
+
+    /// Mark this extent's staging CLOSED: the manager flipped the layout, so
+    /// the file every attempt was staging into is now live data.
+    fn seal_ec_staging(&self, extent_id: u64) {
+        self.ec_stage_nonce.insert(extent_id, EC_STAGING_SEALED);
     }
 
     async fn write_shard_stripe_local(
@@ -6887,6 +6927,7 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(req.extent_id, &e);
             self.extents.remove(&req.extent_id);
             self.fd_lru.forget(req.extent_id);
+            self.ec_stage_nonce.remove(&req.extent_id);
             return Err((StatusCode::Internal, e));
         }
 
@@ -7141,6 +7182,7 @@ impl ExtentNode {
                     );
                     self.extents.remove(&task.extent_id);
                     self.fd_lru.forget(task.extent_id);
+                    self.ec_stage_nonce.remove(&task.extent_id);
                     if let Ok(disk) = self.disk_for(entry.disk_id) {
                         if let Err(e) = disk.remove_extent_files(task.extent_id).await {
                             // Not fatal: `run_recovery_task` truncates the
@@ -7280,6 +7322,7 @@ impl ExtentNode {
         // fails with NotFound rather than racing the unlink.
         let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
         self.fd_lru.forget(req.extent_id);
+        self.ec_stage_nonce.remove(&req.extent_id);
 
         // Locate the file. Prefer the in-memory entry's disk_id (exact
         // match for the file that was actually created); fall back to
@@ -10249,7 +10292,92 @@ mod recovery_idempotence_tests {
                 !node.claim_ec_staging(eid, 100),
                 "the nonce-0 pass-through must not lower the floor"
             );
+
+            // Once the layout is flipped the file is live: nothing may write it
+            // again — not a newer attempt, and not a pre-nonce peer either.
+            node.seal_ec_staging(eid);
+            assert!(
+                !node.claim_ec_staging(eid, 999),
+                "a sealed extent refuses even a NEWER attempt"
+            );
+            assert!(
+                !node.claim_ec_staging(eid, 0),
+                "a sealed extent refuses a pre-nonce peer too — the nonce-0 \
+                 pass-through must not be a way around the seal"
+            );
         }
+    }
+
+    /// REPRODUCTION (EC P1-3). After the manager flips an extent's layout to
+    /// InShardFile the conversion is committed and the staged file BECOMES the
+    /// live shard — there is no rename, the flip is the only commit point. Yet
+    /// `apply_placements` REMOVES this node's attempt-nonce floor on that
+    /// verdict, so a coordinator whose attempt was superseded before the flip
+    /// is no longer ordered against anything: its late stripe is accepted and
+    /// written straight over live data.
+    ///
+    /// Deterministic, no concurrency needed — it is a state-machine bug, not a
+    /// race.
+    #[compio::test]
+    async fn superseded_write_shard_after_the_flip_overwrites_the_live_shard() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 4242u64;
+        let live = Bytes::from_static(b"WINNING-ATTEMPT-SHARD-BYTES");
+
+        let ws = |nonce: u64, payload: Bytes| {
+            WriteShardReq {
+                extent_id: eid,
+                shard_index: 0,
+                sealed_length: 4096,
+                eversion: 2,
+                owner_epoch: 0,
+                shard_offset: 0,
+                attempt_nonce: nonce,
+                payload,
+            }
+            .encode()
+        };
+
+        // The winning attempt (nonce 100) stages shard 0.
+        let resp = node.handle_write_shard(ws(100, live.clone())).await.expect("stage");
+        assert_eq!(
+            WriteShardResp::decode(resp.clone()).expect("decode").code,
+            CODE_OK,
+            "the winning attempt must be able to stage"
+        );
+
+        // The manager flips the layout: this file is now the live shard.
+        node.apply_placements(&[manager_rpc::ExtentPlacement {
+            extent_id: eid,
+            payload_location: PayloadLocation::InShardFile.as_byte(),
+            shard_index: 0,
+        }])
+        .await;
+
+        // A coordinator superseded BEFORE the flip retries its stripe.
+        let resp = node
+            .handle_write_shard(ws(99, Bytes::from_static(b"ZOMBIE-OVERWRITE-BYTES!!!!!")))
+            .await
+            .expect("late write");
+        // THE HARM first: whatever the response code says, the committed shard
+        // file must still hold the winning attempt's bytes.
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let disk = node.disk_for(entry.disk_id).expect("disk");
+        let on_disk = std::fs::read(disk.shard_path(eid, 0)).expect("read shard");
+        assert_eq!(
+            on_disk,
+            live.to_vec(),
+            "the committed shard file was overwritten by a superseded attempt"
+        );
+        // And the mechanism: it should have been refused outright.
+        assert_eq!(
+            WriteShardResp::decode(resp.clone()).expect("decode").code,
+            CODE_LOCKED_BY_OTHER,
+            "a stripe from a superseded attempt must be refused once the layout is committed"
+        );
     }
 
     fn decode_code(resp: &Bytes) -> (u8, String) {
