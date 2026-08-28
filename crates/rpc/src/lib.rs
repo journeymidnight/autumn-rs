@@ -456,7 +456,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   `one_definition_only` now makes a reintroduced mirror a build error,
     //   which is a stronger guarantee than the fingerprint could ever give
     //   here: both files feed the SAME hash, so it can never distinguish them.
-    (29, "86490609d727073d"),
+    //   v29 refreshed IN PLACE again (still undeployed): `DfResp` gained
+    //   `op_progress: Vec<ExtentOpProgress>` — live samples for the
+    //   extent-scoped ops the NODE executes (EC conversion, recovery), which
+    //   previously reported only their terminal outcome, so a multi-hour
+    //   conversion showed a bare RUNNING. Keyed by extent_id because the node
+    //   never learns the manager's op id. `manager_rpc` also gained
+    //   `op_kind_name` (display mapping, moved out of the CLI so it has one
+    //   definition).
+    (29, "f8b58703a0162c62"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -437,6 +437,22 @@ impl OpLedger {
         }
     }
 
+    /// Apply a progress sample the EXTENT NODE reported for an extent-scoped
+    /// op (EC conversion / recovery).
+    ///
+    /// Keyed by extent because the node never learns the manager's op id, while
+    /// both kinds carry their extent in `secondary_id` here. Only a RUNNING
+    /// entry is touched: a sample that arrives after the op closed must not
+    /// re-animate a terminal record.
+    pub(crate) fn update_progress_by_extent(&mut self, kind: u8, extent_id: u64, done: u64, total: u64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind && e.secondary_id == extent_id && e.state == OP_STATE_RUNNING
+        }) {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
     /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
     pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
@@ -677,6 +693,45 @@ mod tests {
     /// Reachable without any fault: `autumn-op compact` fanned over many
     /// partitions of one PS queues behind its concurrency permits, and the
     /// queue wait counts against the TTL because RUNNING is set at submit.
+    /// EC conversion and recovery are executed by the extent node, which knows
+    /// only the extent id — the manager resolves that to its own op. A sample
+    /// must land on the RUNNING entry of the MATCHING kind, and must never
+    /// re-animate one that already closed.
+    #[test]
+    fn extent_keyed_progress_lands_on_the_right_running_op() {
+        let mut led = OpLedger::new();
+        let (ec, _) = led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 0, 100_000);
+        led.set_running(ec, 0);
+        let (rec, _) = led.submit(OP_KIND_RECOVERY, 0, 55, vec![55], "auto".into(), 0, 100_001);
+        led.set_running(rec, 0);
+
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 55, 3, 8);
+        assert_eq!(
+            (q_one(&led, ec).progress_done, q_one(&led, ec).progress_total),
+            (3, 8)
+        );
+        assert_eq!(
+            (q_one(&led, rec).progress_done, q_one(&led, rec).progress_total),
+            (0, 0),
+            "the same extent has two ops; kind is what tells them apart"
+        );
+
+        // An extent nobody is running: dropped, not mis-filed.
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 999, 1, 2);
+        assert_eq!(q_one(&led, ec).progress_done, 3);
+
+        // A sample racing the completion must not touch a closed entry.
+        led.complete_ec(55, OP_STATE_SUCCEEDED, String::new(), String::new(), 9);
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 55, 7, 8);
+        let r = q_one(&led, ec);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            (r.progress_done, r.progress_total),
+            (3, 8),
+            "a terminal record keeps the last sample it had; it is not re-opened"
+        );
+    }
+
     #[test]
     fn a_late_authoritative_outcome_supersedes_unknown() {
         let mut led = OpLedger::new();

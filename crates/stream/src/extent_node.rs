@@ -1454,6 +1454,15 @@ pub struct ExtentNode {
     /// re-dispatches from its durable marker every ~5 s, so without this guard
     /// each tick would spawn another converter for the same extent.
     ec_convert_inflight: Rc<DashMap<u64, ()>>,
+    /// Live progress for the extent-scoped ops this node EXECUTES, keyed by
+    /// extent_id → `(kind, done, total)`.
+    ///
+    /// EC conversion and recovery run in the background for minutes to hours
+    /// and used to report only their terminal outcome, so `ops status` showed
+    /// a bare RUNNING for the whole time. `handle_df` samples this map, which
+    /// is why it is a plain overwrite per update and not a queue: a lost
+    /// sample costs nothing, the next `df` carries a fresher one.
+    op_progress: Rc<DashMap<u64, (u8, u64, u64)>>,
     /// Highest conversion-attempt nonce this shard has staged a stripe for,
     /// per extent. Nonces are etcd revisions and therefore MONOTONIC, so a
     /// `WriteShard` carrying a LOWER one provably belongs to an attempt that
@@ -1539,6 +1548,7 @@ impl Clone for ExtentNode {
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
+            op_progress: self.op_progress.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
@@ -3333,6 +3343,7 @@ impl ExtentNode {
             done,
             recovery_inflight: Rc::new(DashMap::new()),
             ec_convert_inflight: Rc::new(DashMap::new()),
+            op_progress: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
@@ -5429,6 +5440,17 @@ impl ExtentNode {
                 continue;
             }
             attempted += 1;
+            // Report bytes copied as they land, so a long rebuild shows a
+            // ratio instead of a bare RUNNING. Reset per source: a failed
+            // source truncates the destination and the next one restarts at 0.
+            let on_progress = |done: u64| {
+                self.note_op_progress(
+                    extent.extent_id,
+                    autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+                    done,
+                    total,
+                );
+            };
             match Self::stream_one_source(
                 sock,
                 addr,
@@ -5437,6 +5459,7 @@ impl ExtentNode {
                 total,
                 &dest_f,
                 PayloadRef::in_dat(),
+                &on_progress,
             )
             .await
             {
@@ -5515,6 +5538,8 @@ impl ExtentNode {
                     best_len,
                     &dest_f,
                     PayloadRef::in_dat(),
+                    // Progress is reported by the recovery path only.
+                    &|_| {},
                 )
                 .await?;
                 if got < best_len {
@@ -5564,6 +5589,10 @@ impl ExtentNode {
         total: u64,
         dest_file: &Rc<CompioFile>,
         payload: PayloadRef,
+        // Called with the bytes transferred so far, once per chunk. Recovering
+        // a 16 GiB extent runs for minutes; without this the ledger shows a
+        // bare RUNNING for the whole time.
+        on_progress: &dyn Fn(u64),
     ) -> Result<u64, String> {
         if total == 0 {
             let got =
@@ -5593,6 +5622,7 @@ impl ExtentNode {
                 .await
                 .map_err(|e| e.to_string())?;
             offset += got_len;
+            on_progress(offset);
             if got_len < want {
                 break; // short read — source has no more data
             }
@@ -6003,6 +6033,19 @@ impl ExtentNode {
     /// `pwrite`-at-offset is idempotent, so a retry that re-streams from 0
     /// rewrites the same bytes at the same offsets. No truncate: stripes from
     /// different offsets coexist; the file grows to `shard_size` at the last.
+    /// Publish how far an extent-scoped op has got, for the next `df` to carry.
+    /// Overwrite, not append: only the newest sample is worth sending.
+    fn note_op_progress(&self, extent_id: u64, kind: u8, done: u64, total: u64) {
+        self.op_progress.insert(extent_id, (kind, done, total));
+    }
+
+    /// Stop reporting progress for an op that ended, whichever way it ended.
+    /// A stale sample would leave `ops status` showing a repair frozen at 60%
+    /// long after it finished or was abandoned.
+    fn clear_op_progress(&self, extent_id: u64) {
+        self.op_progress.remove(&extent_id);
+    }
+
     /// Claim this node's EC staging for `extent_id` on behalf of `attempt_nonce`,
     /// or refuse if a NEWER attempt already claimed it.
     ///
@@ -7128,6 +7171,19 @@ impl ExtentNode {
             node_uuid: self.registration.node_uuid.clone(),
             advertise_addr: self.registration.advertise_addr.clone(),
             shard_ports: self.registration.shard_ports.clone(),
+            op_progress: self
+                .op_progress
+                .iter()
+                .map(|e| {
+                    let (kind, done, total) = *e.value();
+                    crate::extent_rpc::ExtentOpProgress {
+                        extent_id: *e.key(),
+                        kind,
+                        done,
+                        total,
+                    }
+                })
+                .collect(),
         }))
     }
 
@@ -7305,6 +7361,8 @@ impl ExtentNode {
                 match node.run_recovery_task(task.clone()).await {
                     Ok(done) => {
                         node.recovery_inflight.remove(&extent_id);
+            node.clear_op_progress(extent_id);
+                        node.clear_op_progress(extent_id);
                         node.done.push_recovery(done);
                         return;
                     }
@@ -7870,6 +7928,8 @@ impl ExtentNode {
                     // A full replica: this path publishes a complete `.dat`,
                     // so a shard file is not a source it can use.
                     PayloadRef::in_dat(),
+                    // Progress is reported by the recovery path only.
+                    &|_| {},
                 )
                 .await
                 {
@@ -8041,6 +8101,7 @@ impl ExtentNode {
                 }
             }
             node.ec_convert_inflight.remove(&extent_id);
+            node.clear_op_progress(extent_id);
         })
         .detach();
 
@@ -8428,6 +8489,15 @@ impl ExtentNode {
                     .await?;
 
                     s += stripe_len;
+                    // One sample per stripe (64 MiB by default), never per
+                    // byte. `per_shard` is this node's whole shard, so the
+                    // ratio is this conversion's real completion.
+                    self.note_op_progress(
+                        extent_id,
+                        autumn_rpc::manager_rpc::OP_KIND_EC_CONVERT,
+                        s as u64,
+                        per_shard as u64,
+                    );
                 }
 
                 // Prepare finished for ALL nodes (the coordinator stages itself
@@ -10661,6 +10731,51 @@ mod recovery_idempotence_tests {
             WriteShardResp::decode(resp).expect("decode").code,
             CODE_LOCKED_BY_OTHER,
             "the seal must be re-derived from `.meta` on load, not lost with the process"
+        );
+    }
+
+    /// EC conversion and recovery run for minutes to hours on the node and used
+    /// to surface only a terminal outcome. Progress now rides the same `df`
+    /// those outcomes do — and stops riding it the moment the op ends, so
+    /// `ops status` never shows a repair frozen at a stale percentage.
+    #[compio::test]
+    async fn df_carries_live_op_progress_and_drops_it_when_the_op_ends() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let df = || async {
+            let resp = node
+                .handle_df(rkyv_encode(&DfReq {
+                    tasks: vec![],
+                    disk_ids: vec![],
+                }))
+                .await
+                .expect("df");
+            let r: DfResp = rkyv_decode(&resp).expect("decode DfResp");
+            r.op_progress
+        };
+
+        assert!(df().await.is_empty(), "nothing in flight, nothing reported");
+
+        node.note_op_progress(77, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 3, 8);
+        let got = df().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].extent_id, got[0].kind, got[0].done, got[0].total),
+            (77, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 3, 8)
+        );
+
+        // A newer sample replaces the older one — this is a sample, not a queue.
+        node.note_op_progress(77, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 6, 8);
+        let got = df().await;
+        assert_eq!(got.len(), 1, "one entry per extent, overwritten");
+        assert_eq!(got[0].done, 6);
+
+        node.clear_op_progress(77);
+        assert!(
+            df().await.is_empty(),
+            "a finished op must stop reporting; a stale 75% is worse than none"
         );
     }
 

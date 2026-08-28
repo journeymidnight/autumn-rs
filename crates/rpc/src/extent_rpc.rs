@@ -920,8 +920,29 @@ pub struct DfReq {
 /// self-heal stored-location drift and detect pod-IP reuse (a DIFFERENT process
 /// answering at a stored address → `node_uuid` mismatch → refuse to heal). All
 /// three are empty when the EN was not launched with `--advertise` (test /
-/// pre-M1 deployments) → the manager skips the echo checks. Appended (not
-/// inserted) so the rkyv layout stays compatible with `manager_rpc::DfResp`.
+/// pre-M1 deployments) → the manager skips the echo checks.
+/// How far one extent-scoped op this node is EXECUTING has got.
+///
+/// EC conversion and recovery both run in the background on the extent node
+/// and reported only their terminal outcome on `df` — so an operator watching
+/// a multi-hour conversion had a RUNNING row and nothing else. These are live
+/// samples riding the same `df` as those outcomes, mirroring what the PS
+/// already piggybacks on its load heartbeat for compact/gc.
+///
+/// Keyed by `extent_id`, not op_id: the node never learns the manager's op id,
+/// while both kinds are extent-scoped in the ledger, so the manager resolves
+/// it. Raw counts, not a percentage — the consumer derives the ratio, and the
+/// magnitude is what tells an operator whether to wait.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentOpProgress {
+    pub extent_id: u64,
+    /// `manager_rpc::OP_KIND_EC_CONVERT` or `OP_KIND_RECOVERY`.
+    pub kind: u8,
+    /// Bytes for recovery, shard bytes encoded for EC.
+    pub done: u64,
+    pub total: u64,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
@@ -940,6 +961,10 @@ pub struct DfResp {
     pub advertise_addr: String,
     /// M1b: the shard ports this EN process actually binds.
     pub shard_ports: Vec<u16>,
+    /// Live progress for the extent-scoped ops this node is running
+    /// (EC conversion, recovery). A sample, not a ledger: whatever is in
+    /// flight at df time, empty when nothing is.
+    pub op_progress: Vec<ExtentOpProgress>,
 }
 
 /// RequireRecovery request: start a background recovery task.

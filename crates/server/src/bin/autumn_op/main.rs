@@ -1728,20 +1728,6 @@ fn human_bytes_or_count(kind: u8, n: u64) -> String {
 }
 
 /// Human name for an `OP_KIND_*`.
-fn op_kind_name(k: u8) -> &'static str {
-    match k {
-        OP_KIND_SPLIT => "split",
-        OP_KIND_MERGE => "merge",
-        OP_KIND_REBALANCE => "rebalance",
-        OP_KIND_COMPACT => "compact",
-        OP_KIND_GC => "gc",
-        OP_KIND_FORCE_GC => "forcegc",
-        OP_KIND_EC_CONVERT => "ec-convert",
-        OP_KIND_RECOVERY => "recovery",
-        _ => "?",
-    }
-}
-
 /// `--kind` filter → `OP_KIND_*` (`0` = any / unrecognized).
 fn op_kind_from_str(s: &str) -> u8 {
     match s {

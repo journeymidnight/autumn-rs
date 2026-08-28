@@ -19,6 +19,16 @@ BIN=target/debug
 W=/tmp/ops-contract; PB=21000
 MGR="127.0.0.1:$((PB+1))"; EN=$((PB+101)); PS=$((PB+201)); DASH=$((PB+301))
 rm -rf "$W"; mkdir -p "$W/en0" "$W/ps1"
+
+# A previous run that died before its trap fired leaves an etcd squatting on
+# these ports, and the only symptom is "address already in use" from a process
+# that is not this run's. Clear our OWN port band first — matched by port, never
+# by process name, so this cannot reach a real cluster's etcd.
+for p in $((PB+401)) $((PB+402)) $((PB+1)) $((PB+101)) $((PB+201)) $((PB+301)); do
+  owner=$(ss -ltnp 2>/dev/null | grep ":$p " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  [ -n "${owner:-}" ] && { echo "[pre] freeing :$p (pid $owner)"; kill -9 "$owner" 2>/dev/null; }
+done
+sleep 1
 PIDS=(); cleanup(){ for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
 trap cleanup EXIT
 wait_port(){ for _ in $(seq 1 25); do ss -ltn 2>/dev/null | grep -q ":$1\b" && return 0; sleep 1; done; return 1; }

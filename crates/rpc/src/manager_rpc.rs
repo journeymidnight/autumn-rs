@@ -2083,6 +2083,23 @@ pub const OP_KIND_EC_CONVERT: u8 = 7;
 /// previously visible only in aggregate via `recovery-stats`.
 pub const OP_KIND_RECOVERY: u8 = 8;
 
+/// Display name for an `OP_KIND_*`, next to the constants so the mapping has
+/// ONE definition — the manager logs it and the CLI renders it, and a label
+/// that drifts between them is a needless way to confuse an operator.
+pub fn op_kind_name(kind: u8) -> &'static str {
+    match kind {
+        OP_KIND_SPLIT => "split",
+        OP_KIND_MERGE => "merge",
+        OP_KIND_REBALANCE => "rebalance",
+        OP_KIND_COMPACT => "compact",
+        OP_KIND_GC => "gc",
+        OP_KIND_FORCE_GC => "forcegc",
+        OP_KIND_EC_CONVERT => "ec-convert",
+        OP_KIND_RECOVERY => "recovery",
+        _ => "?",
+    }
+}
+
 /// Op lifecycle — a state machine, not bools. `UNKNOWN` is never an initial
 /// state; it is the honest answer when the ledger cannot know (post-failover
 /// unknown id, or a PS-executed op whose outcome went missing past its TTL).

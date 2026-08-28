@@ -1619,6 +1619,20 @@ impl crate::AutumnManager {
                     }
                 }
 
+                // Live progress for the ops this node is EXECUTING. Applied
+                // before the terminal reports below so a sample that arrives in
+                // the same `df` as the completion cannot overwrite the closed
+                // entry — `update_progress_by_extent` only touches RUNNING, and
+                // the completion runs after.
+                for p in &df.op_progress {
+                    self.ops.borrow_mut().update_progress_by_extent(
+                        p.kind,
+                        p.extent_id,
+                        p.done,
+                        p.total,
+                    );
+                }
+
                 // Apply every EC conversion the coordinator reported finished. The
                 // dispatch RPC only ACCEPTS; THIS is where a conversion becomes real.
                 // The layout comes from the etcd marker's PINNED assignment, never

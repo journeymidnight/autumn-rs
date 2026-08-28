@@ -2013,6 +2013,30 @@ impl AutumnManager {
                 self.ops
                     .borrow_mut()
                     .finish(op_id, state, error.clone(), message.clone(), now_s);
+                // Say what happened in the LEADER'S LOG too. The outcome already
+                // reaches the ledger (queryable), the audit trail and the durable
+                // op history — but none of those is what an operator tailing
+                // `manager.log` during a split is watching. These kinds finish in
+                // one step and carry no progress, so this line IS their story.
+                if state == OP_STATE_SUCCEEDED {
+                    tracing::info!(
+                        op_id,
+                        kind = op_kind_name(spec.kind),
+                        part_id = spec.part_id,
+                        secondary_id = spec.secondary_id,
+                        message = %message,
+                        "op succeeded"
+                    );
+                } else {
+                    tracing::warn!(
+                        op_id,
+                        kind = op_kind_name(spec.kind),
+                        part_id = spec.part_id,
+                        secondary_id = spec.secondary_id,
+                        error = %error,
+                        "op FAILED"
+                    );
+                }
                 let by = if spec.requested_by.is_empty() {
                     "cli".to_string()
                 } else {

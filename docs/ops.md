@@ -1532,10 +1532,18 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   an empty list there reads as "nothing failed".
 # The dashboard shows both at GET /api/ops; it asks the leader through
 #   autumn-op, never a file.
-# Manual check: `$AO ops list --active` during a large compact/gc must show a
-#   percentage AND the raw counts (gc = bytes of the extent scanned, compact =
-#   SST data blocks merged); after it finishes, `$AO ops history --limit 5`
-#   must carry its outcome, with the error text in full for a failure.
+# Which kinds report progress: gc + forcegc (extent bytes scanned), compact
+#   (SST data blocks merged) — sampled by the PS onto its load heartbeat; and
+#   ec-convert (shard bytes encoded) + recovery (bytes copied) — sampled by the
+#   EXTENT NODE onto `df`, keyed by extent_id since the node never learns the
+#   op id. split/merge/rebalance are single-step and carry NO progress by
+#   design; their result is in the leader log ("op succeeded" / "op FAILED"),
+#   the audit trail and `ops history`.
+# Manual check: `$AO ops list --active` during a large compact/gc, or during an
+#   `$AO force-ec-convert` / a node rebuild, must show a percentage AND the raw
+#   counts; after it finishes, `$AO ops history --limit 5` must carry its
+#   outcome, with the error text in full for a failure. A finished op must stop
+#   reporting a percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
 #   `bash examples/dashboard/tests/ops_contract.sh`.
 ```
