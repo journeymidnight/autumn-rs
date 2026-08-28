@@ -30,6 +30,48 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (b)
+TaskStatus: not_completed
+Task scope: 处理评审剩余项 EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
+【三份 review 原文已抢救】它们只存在于会话记录里(台账只有标签)。从 transcript 提取,存
+  scratchpad/review_{errors,delete,recovery}.md。下次直接读这三个文件,别再重新评审。
+【已完成 6 项 + 核实 3 项其实早已修完】
+  - errors F3/F4/F5:核实【已修】,台账 Next steps 落后。未知子命令已具名报错;gc 单趟解析拒绝
+    未知 token、merge/compact/rebalance 均拒尾随;ops.md 陈旧 tenant-first 段落已重写(仅存
+    一处明写"已于 2026-07-19 退役")。
+  - delete F5 (87498bd):reconcile 陈旧 shard unlink 吞错后照样 forget_shard_file + 打成功日志
+    → EIO 时文件还在但 df 不再计数、holds_payload 变 false(卡住后续 .dat 回收)。对齐下方 .dat
+    分支既有正确写法。
+  - recovery F6 (87498bd):is_transient_conflict 裸子串 vs 四个生产者的裸字面量,无共享源无配对
+    测试。新增 autumn_common::alloc_conflict 同时持有【消息构造函数】和分类器(比共享常量更强:
+    调用点没有改写措辞的机会),builders_pair_with_classifier 跑真实 builder 过真实分类器。
+  - delete F4 (40c8778):case-1 garbage(manager 没有该 extent 记录)立即判死,既无宽限也够不到
+    inflight 守卫。两个可达输入:①新分配 extent 的文件先于 etcd 提交存在于 EN(place_extents_
+    with_fallback 在前)②memory-mode manager 重启后忘记所有 extent ⇒ 全队列立即擦盘。修=case-1
+    同享三轮宽限 + 【失忆守卫】(extents 表空而节点报告非空 ⇒ 不下任何 garbage,WARN)。
+  - recovery F5 (ce50e3e):任一候选被限流就整轮返回 Ok ⇒ record_success 删除退避条目。mass fence
+    时失败槽 300s 退避每 tick 被重置为 2s。修=返回 DispatchOutcome::{Dispatched,Deferred},且
+    只有【没有任何候选越过限流器】(attempted 标志)才算 Deferred;Deferred 不动退避账目。
+  - recovery F3 (e1cbcda):30 分钟 TTL 翻 UNKNOWN 后 reconcile_outcome 永久拒收 PS 每 5s 重传的
+    权威结果 ⇒ 真实 SUCCEEDED/FAILED 及原因永不进 etcd audit。UNKNOWN 是"跟丢了"不是判决,
+    改为可被终态报告覆盖;真终态仍不可被覆盖(审计恰好一次的契约不变)。
+  - EC P1-4 (0dabbf8):coordinator 写自己 shard 0 走 write_shard_stripe_local,绕过 write_shard
+    里的 nonce 登记 ⇒ 它自己的节点上 ec_stage_nonce 无记录。后果不止排序:reconcile 的
+    staged_here 守卫在该节点恒 false,陈旧 InDat 判决会删掉正在写的 shard。抽 claim_ec_staging
+    两路共用。
+【剩余 2 项,都需要先决策再动手,故 not_completed】
+  1) EC P1-3(已 flip 的 shard 可被僵尸 coordinator 覆写):根因已定——reconcile 收到
+     InShardFile 判决时把 nonce floor【删除】,而 flip 后 staging 文件【就是】线上 shard 文件
+     (无 rename,flip 是唯一提交点),此后任何迟到 WriteShard 都无 floor 可挡。
+     难点在【持久信号】:把 floor 改成封存值只能挡住活集群窗口,DashMap 重启即失;而"持有
+     shard 且无 .dat"这个可从磁盘推出的信号对【纯 parity 目标】不成立。
+     按仓库规则(机制/并发 bug 先复现),下一轮应先构造复现再定持久化方案,别在 EC 路径凭推断动刀。
+  2) delete F3(DeleteExtentReq 只有 extent_id,无集群/节点身份;持久重试队列永不过期 ⇒ 集群 A
+     拆除后其重试队列可删掉同址新起的集群 B 的活 extent):修复需要在 wire 上加 cluster_id 或
+     目标 node_uuid 回显 ⇒ 扰动 WIRE_FINGERPRINT、需要版本决策(停机全量升级)。
+     这是用户该拍板的事,不自行推进。
+Next steps: 上面两项,按顺序:先给 EC P1-3 做复现,再就 delete F3 的 wire 变更请示。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28
 TaskStatus: completed
 Task scope: SST BlockCache 由进程全局改为 PartitionServer 实例持有,修掉 integration.rs
