@@ -243,6 +243,16 @@ impl OpLedger {
             e.error = error;
             if state == OP_STATE_SUCCEEDED {
                 e.error_code = 0;
+                // Snap progress to complete. The last sample and the completion
+                // arrive in the same `df` window, and progress refuses to write
+                // onto a closed entry — so a finished conversion was left
+                // showing its second-to-last sample (75% on a real 1 GiB run).
+                // A SUCCEEDED op IS done; reporting less is the misleading
+                // answer. A FAILED one keeps its last real sample, because
+                // "died at 56%" is information.
+                if e.progress_total > 0 {
+                    e.progress_done = e.progress_total;
+                }
             }
             e.finished_at = now_s;
             if e.started_at == 0 {
@@ -720,16 +730,27 @@ mod tests {
         led.update_progress_by_extent(OP_KIND_EC_CONVERT, 999, 1, 2);
         assert_eq!(q_one(&led, ec).progress_done, 3);
 
-        // A sample racing the completion must not touch a closed entry.
+        // A sample racing the completion must not touch a closed entry — but a
+        // SUCCEEDED op reads as complete, not as whatever sample landed last.
+        // (Observed on a live 1 GiB conversion: it finished showing 75%.)
         led.complete_ec(55, OP_STATE_SUCCEEDED, String::new(), String::new(), 9);
         led.update_progress_by_extent(OP_KIND_EC_CONVERT, 55, 7, 8);
         let r = q_one(&led, ec);
         assert_eq!(r.state, OP_STATE_SUCCEEDED);
         assert_eq!(
             (r.progress_done, r.progress_total),
-            (3, 8),
-            "a terminal record keeps the last sample it had; it is not re-opened"
+            (8, 8),
+            "a succeeded op is complete; the racing sample must not re-open it either"
         );
+
+        // A FAILED op keeps its last real sample — "died at 3/8" is information.
+        let (ec2, _) = led.submit(OP_KIND_EC_CONVERT, 0, 56, vec![56], "cli".into(), 0, 100_002);
+        led.set_running(ec2, 0);
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 56, 3, 8);
+        led.complete_ec(56, OP_STATE_FAILED, "boom".into(), String::new(), 9);
+        let r = q_one(&led, ec2);
+        assert_eq!(r.state, OP_STATE_FAILED);
+        assert_eq!((r.progress_done, r.progress_total), (3, 8));
     }
 
     #[test]

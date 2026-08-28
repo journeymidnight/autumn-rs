@@ -1546,6 +1546,17 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   reporting a percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
 #   `bash examples/dashboard/tests/ops_contract.sh`.
+#   LIVE EC-conversion progress: `bash scripts/ec_convert_progress.sh` — spins a
+#   4-EN cluster (EC 3+1 needs four targets), rolls a 1 GiB log extent, converts
+#   it and polls once a second. Measured 2026-08-28 on loopback: samples appear
+#   ~5 s in (the marker is acquired before encoding starts, so `--` first),
+#   advance one 64 MiB stripe at a time, and land on 100% at SUCCEEDED. The
+#   denominator is THIS node's shard, ceil(extent / K), not the whole extent.
+# Known harness note: only a ROLL seals an extent — restarting the PS replays
+#   and keeps appending to the same open tail. And `autumn-client perf-check`
+#   does not exit reliably once the log extent rolls (the cluster is fine
+#   through it: the roll completes, the new tail's replicas agree, the manager
+#   keeps probing) — the script caps it with `timeout -s KILL`.
 ```
 
 ## Rolling restart & upgrade versioning
