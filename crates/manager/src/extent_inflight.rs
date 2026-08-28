@@ -7,7 +7,7 @@
 //! |-------------------------------------------------------------|------------------------|
 //! | `ec_conversion_inflight: HashSet<u64>`                      | in-memory              |
 //! | `pending_ec_dispatch: HashMap<u64, MgrEcDispatchInflight>`  | etcd `ecConversionInflight/<id>` |
-//! | `recovery_tasks: HashMap<u64, MgrRecoveryTask>`             | etcd `recoveryTasks/<id>` |
+//! | `recovery_tasks: HashMap<u64, RecoveryTask>`             | etcd `recoveryTasks/<id>` |
 //! | `pending_extent_deletes: VecDeque<PendingDelete>`           | in-memory              |
 //!
 //! Phase 0 (this commit) adds the infrastructure types + acquire / release /
@@ -19,7 +19,7 @@
 //! full plan and PS-layer ↔ stream-layer interaction model.
 
 use autumn_etcd::Cmp;
-use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrEcDispatchInflight, MgrRecoveryTask};
+use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrEcDispatchInflight, RecoveryTask};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use autumn_common::error::AppError;
@@ -102,7 +102,7 @@ pub struct MgrExtentInflightRecord {
     /// the leader-fence pattern; useful for diagnostics.
     pub leader_id: String,
     pub ec_payload: Option<MgrEcDispatchInflight>,
-    pub recovery_payload: Option<MgrRecoveryTask>,
+    pub recovery_payload: Option<RecoveryTask>,
     pub delete_payload: Option<PersistedPendingDelete>,
 }
 
@@ -112,7 +112,7 @@ pub struct MgrExtentInflightRecord {
 #[derive(Clone, Debug)]
 pub enum ExtentOpPayload {
     ConvertToEc(MgrEcDispatchInflight),
-    Recovery(MgrRecoveryTask),
+    Recovery(RecoveryTask),
     Delete(PersistedPendingDelete),
 }
 
@@ -307,7 +307,7 @@ impl AutumnManager {
     pub(crate) fn extent_inflight_payload_recovery(
         &self,
         extent_id: u64,
-    ) -> Option<autumn_rpc::manager_rpc::MgrRecoveryTask> {
+    ) -> Option<autumn_rpc::manager_rpc::RecoveryTask> {
         match self.inflight.borrow().get(&extent_id).and_then(|r| r.unpack()) {
             Some((_, ExtentOpPayload::Recovery(t))) => Some(t),
             _ => None,
@@ -366,7 +366,7 @@ impl AutumnManager {
     /// test-only convenience for the Recovery op kind. Mirrors
     /// `_test_mark_ec_inflight` but inserts a Recovery payload.
     #[cfg(test)]
-    pub(crate) fn _test_mark_recovery_inflight(&self, extent_id: u64, task: MgrRecoveryTask) {
+    pub(crate) fn _test_mark_recovery_inflight(&self, extent_id: u64, task: RecoveryTask) {
         let payload = ExtentOpPayload::Recovery(task);
         let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
         self.inflight.borrow_mut().insert(extent_id, record);
@@ -658,7 +658,7 @@ mod tests {
     }
 
     fn recovery_payload(extent_id: u64) -> ExtentOpPayload {
-        ExtentOpPayload::Recovery(MgrRecoveryTask {
+        ExtentOpPayload::Recovery(RecoveryTask {
             extent_id,
             replace_id: 1,
             node_id: 9,
@@ -800,7 +800,7 @@ mod tests {
             started_at: 0,
             leader_id: "test".to_string(),
             ec_payload: None,
-            recovery_payload: Some(MgrRecoveryTask::default()),
+            recovery_payload: Some(RecoveryTask::default()),
             delete_payload: None,
         };
         assert!(

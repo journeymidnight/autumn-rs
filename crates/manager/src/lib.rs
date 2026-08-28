@@ -4588,7 +4588,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let base = Self::normalize_endpoint(addr);
         let shard_ports = self.shard_ports_for_addr(&base);
         let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
-        let payload = rkyv_encode(&ExtAllocExtentReq { extent_id });
+        let payload = rkyv_encode(&AllocExtentReq { extent_id });
         // 10 s — alloc_extent is a fast op (create empty file pair +
         // sidecar fsync). A paged-out EN that doesn't respond inside
         // 10 s is treated as a failed candidate; the caller's
@@ -4603,7 +4603,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r: ExtAllocExtentResp = rkyv_decode(&resp).map_err(AppError::Internal)?;
+        let r: AllocExtentResp = rkyv_decode(&resp).map_err(AppError::Internal)?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "alloc_extent failed: {}",
@@ -5108,8 +5108,8 @@ mod tests {
             s.extents.insert(extent_id, ex);
         }
         // No marker: the attempt was released while its executor kept working.
-        let done = MgrRecoveryTaskDone {
-            task: MgrRecoveryTask {
+        let done = RecoveryTaskDone {
+            task: RecoveryTask {
                 extent_id,
                 replace_id: 3,
                 node_id: 9,
@@ -5139,7 +5139,7 @@ mod tests {
             ex.sealed_length = 100;
             s.extents.insert(extent_id, ex);
         }
-        let task = MgrRecoveryTask {
+        let task = RecoveryTask {
             extent_id,
             replace_id: 3,
             node_id: 9,
@@ -5147,7 +5147,7 @@ mod tests {
         };
         m._test_mark_recovery_inflight(extent_id, task.clone());
         run(async {
-            m.apply_recovery_done(MgrRecoveryTaskDone {
+            m.apply_recovery_done(RecoveryTaskDone {
                 task,
                 ready_disk_id: 99,
             })
@@ -5359,7 +5359,7 @@ mod tests {
         run(async {
             m.acquire_extent_inflight(
                 5,
-                crate::extent_inflight::ExtentOpPayload::Recovery(MgrRecoveryTask {
+                crate::extent_inflight::ExtentOpPayload::Recovery(RecoveryTask {
                     extent_id: 5,
                     replace_id: 2,
                     node_id: 7,
@@ -6911,7 +6911,7 @@ mod tests {
                 .extents
                 .insert(extent_id, ex.clone());
 
-            let task = MgrRecoveryTask {
+            let task = RecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 7, // already in parity[]
@@ -6919,7 +6919,7 @@ mod tests {
             };
             m._test_mark_recovery_inflight(extent_id, task.clone());
 
-            let done = MgrRecoveryTaskDone {
+            let done = RecoveryTaskDone {
                 task,
                 ready_disk_id: 99,
             };
@@ -6976,7 +6976,7 @@ mod tests {
             };
             m.store.inner.borrow_mut().extents.insert(extent_id, ex);
 
-            let task = MgrRecoveryTask {
+            let task = RecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 9, // fresh node, NOT in extent_nodes
@@ -6984,7 +6984,7 @@ mod tests {
             };
             m._test_mark_recovery_inflight(extent_id, task.clone());
 
-            let done = MgrRecoveryTaskDone {
+            let done = RecoveryTaskDone {
                 task,
                 ready_disk_id: 88,
             };
@@ -7047,13 +7047,13 @@ mod tests {
             // recovery completion).
             m._test_mark_ec_inflight(extent_id);
 
-            let task = MgrRecoveryTask {
+            let task = RecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 9,
                 start_time: 0,
             };
-            let done = MgrRecoveryTaskDone {
+            let done = RecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 99,
             };
@@ -7157,13 +7157,13 @@ mod tests {
             // the ConvertToEc marker alone is what triggers the defer.
             // apply_recovery_done's defense-in-depth check fires and
             // refuses to apply, preserving the EC's pending eversion bump.
-            let task = MgrRecoveryTask {
+            let task = RecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 9,
                 start_time: 0,
             };
-            let done = MgrRecoveryTaskDone {
+            let done = RecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 99,
             };
@@ -7593,7 +7593,7 @@ mod tests {
             // Simulate active recovery on victim's row_stream extent.
             m._test_mark_recovery_inflight(
                 201,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id: 201,
                     replace_id: 999,
                     node_id: 1,
@@ -7996,7 +7996,7 @@ mod tests {
             // Mark this extent as in-flight for recovery.
             m._test_mark_recovery_inflight(
                 extent_id,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id,
                     replace_id: 1,
                     node_id: 9,
@@ -8077,7 +8077,7 @@ mod tests {
             // extent_a is being recovered — truncate should be refused.
             m._test_mark_recovery_inflight(
                 extent_a,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id: extent_a,
                     replace_id: 1,
                     node_id: 9,
@@ -8152,7 +8152,7 @@ mod tests {
             // Recovery is in flight.
             m._test_mark_recovery_inflight(
                 extent_id,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id,
                     replace_id: 1,
                     node_id: 9,
@@ -8575,7 +8575,7 @@ mod tests {
             // Tail is under active recovery: alloc_extent must refuse.
             m._test_mark_recovery_inflight(
                 tail_id,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id: tail_id,
                     replace_id: 0,
                     node_id: 1,
@@ -8688,7 +8688,7 @@ mod tests {
             // Simulate recovery in flight on the log_stream's extent.
             m._test_mark_recovery_inflight(
                 log_extent,
-                MgrRecoveryTask {
+                RecoveryTask {
                     extent_id: log_extent,
                     replace_id: 0,
                     node_id: 2,

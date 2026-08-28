@@ -581,7 +581,7 @@ impl AutumnManager {
     }
 
     async fn try_delete_one(&self, target: &DeleteTarget, extent_id: u64) -> bool {
-        let payload = rkyv_encode(&ExtDeleteExtentReq {
+        let payload = rkyv_encode(&DeleteExtentReq {
             extent_id,
             node_uuid: target.node_uuid.clone(),
         });
@@ -603,7 +603,7 @@ impl AutumnManager {
             Ok(v) => v,
             Err(_) => return false,
         };
-        match rkyv_decode::<ExtCodeResp>(&resp) {
+        match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
             Ok(r) => r.code == CODE_OK,
             Err(_) => false,
         }

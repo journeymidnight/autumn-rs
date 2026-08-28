@@ -316,7 +316,7 @@ pub struct MgrEcDispatchInflight {
     pub data_shards: u32,
     pub new_eversion: u64,
     /// Tier 2: owner-lock owner_epoch the manager held when this
-    /// dispatch was authorised. Threaded into `ExtConvertToEcReq.owner_epoch`
+    /// dispatch was authorised. Threaded into `ConvertToEcReq.owner_epoch`
     /// → `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch` so a
     /// fenced ex-coord whose in-flight 2PC continues with the OLD owner_epoch
     /// is rejected by remote ENs via the existing `req.owner_epoch <
@@ -441,21 +441,24 @@ pub struct MgrPsDetail {
     pub address: String,
 }
 
-/// Recovery task descriptor.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct MgrRecoveryTask {
-    pub extent_id: u64,
-    pub replace_id: u64,
-    pub node_id: u64,
-    pub start_time: i64,
-}
-
-/// Completed recovery task.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct MgrRecoveryTaskDone {
-    pub task: MgrRecoveryTask,
-    pub ready_disk_id: u64,
-}
+// ── Extent-service messages ─────────────────────────────────────────────────
+//
+// The manager is a CLIENT of the extent service, so these are re-exported from
+// `extent_rpc` — the one definition both sides use — rather than redefined
+// here. They used to be mirrored (`ExtDfReq`, `MgrRecoveryTask`, …), with the
+// manager encoding through this file's copy while the node decoded through
+// `extent_rpc`'s: a field added to one side only was then a silent rkyv
+// mis-decode, and no fingerprint could catch it because BOTH files hash into
+// the same one. `extent_rpc`'s `one_definition_only` turns that into a build
+// error now.
+//
+// `CodeResp` is deliberately NOT re-exported: this module has its own, for the
+// manager service's own RPCs, so extent-service call sites name
+// `extent_rpc::CodeResp` explicitly rather than shadowing it.
+pub use crate::extent_rpc::{
+    AllocExtentReq, AllocExtentResp, ConvertToEcReq, DeleteExtentReq, DfReq, DfResp, ReAvaliReq,
+    RecoveryTask, RecoveryTaskDone, RequireRecoveryReq,
+};
 
 // ── Generic response ────────────────────────────────────────────────────────
 
@@ -858,73 +861,6 @@ pub struct ReconcileExtentsResp {
 // The manager calls extent nodes for alloc/commit_length/re_avali/df/recovery/ec.
 // These duplicate the minimal subset from extent_rpc.rs to avoid manager→stream dep.
 
-/// AllocExtent request (manager → extent node).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtAllocExtentReq {
-    pub extent_id: u64,
-}
-
-/// AllocExtent response (extent node → manager).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtAllocExtentResp {
-    pub code: u8,
-    pub disk_id: u64,
-    pub message: String,
-}
-
-/// ReAvali request (manager → extent node).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtReAvaliReq {
-    pub extent_id: u64,
-    pub eversion: u64,
-}
-
-/// Generic code response from extent node.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtCodeResp {
-    pub code: u8,
-    pub message: String,
-}
-
-/// RequireRecovery request (manager → extent node).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtRequireRecoveryReq {
-    pub task: MgrRecoveryTask,
-}
-
-/// Df request (manager → extent node).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtDfReq {
-    pub tasks: Vec<MgrRecoveryTask>,
-    pub disk_ids: Vec<u64>,
-}
-
-/// Df response (extent node → manager).
-///
-/// `disk_status` now nests the canonical `extent_rpc::DiskStatus`
-/// (the pure-wire `ExtDiskStatus` mirror was deleted — it had no manager
-/// domain equivalent, so it was pure duplication with twin-drift risk).
-/// `done_tasks` keeps the manager DOMAIN type `MgrRecoveryTaskDone`
-/// (persisted in etcd `recoveryTasks/`, woven into the inflight
-/// ledger) — that is a legitimate domain/wire separation, NOT a mirror,
-/// so it is intentionally preserved. rkyv layout is unchanged either way.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtDfResp {
-    pub done_tasks: Vec<MgrRecoveryTaskDone>,
-    /// Completed EC conversions reported by the coordinator EN. MUST stay in
-    /// this position — this struct decodes the EN's `DfResp` bytes, so field
-    /// ORDER is the compatibility contract (see the note below).
-    pub ec_done: Vec<crate::extent_rpc::EcConvertDone>,
-    pub disk_status: Vec<(u64, crate::extent_rpc::DiskStatus)>,
-    /// M1b: the EN's echoed identity (see `extent_rpc::DfResp`).
-    /// Appended in the SAME order as `DfResp` so the manager decodes the EN's
-    /// `DfResp` bytes into this struct unchanged. Empty when the EN did not
-    /// self-register (`--advertise` unset).
-    pub node_uuid: String,
-    pub advertise_addr: String,
-    pub shard_ports: Vec<u16>,
-}
-
 // --- UpdateStreamEc (FOPS-03) ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateStreamEcReq {
@@ -938,45 +874,6 @@ pub struct UpdateStreamEcResp {
     pub code: u8,
     pub message: String,
     pub stream: Option<MgrStreamInfo>,
-}
-
-/// DeleteExtent request (manager → extent node).
-///
-/// MIRRORS `extent_rpc::DeleteExtentReq` and must stay byte-identical to it:
-/// the manager encodes with this definition and the node decodes with that
-/// one, so a field added to only one side is a silent rkyv mis-decode that no
-/// fingerprint catches (both files are hashed into the same one). Edit both.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtDeleteExtentReq {
-    pub extent_id: u64,
-    /// Which node must execute this delete — see
-    /// `extent_rpc::DeleteExtentReq::node_uuid` for why the one
-    /// data-destroying RPC needs an identity. Empty = unspecified.
-    pub node_uuid: String,
-}
-
-/// ConvertToEc request (manager → extent node coordinator).
-///
-/// `eversion` is the new manager-decided eversion that every target
-/// node (data + parity) must adopt locally during the conversion.
-/// Pairs with `apply_ec_conversion_done` on the manager so that
-/// subsequent stale-cache reads see a mismatch and refresh.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct ExtConvertToEcReq {
-    pub extent_id: u64,
-    pub data_shards: u32,
-    pub parity_shards: u32,
-    pub target_addrs: Vec<String>,
-    pub eversion: u64,
-    /// Tier 2: owner-lock owner_epoch threaded from the manager's
-    /// `MgrEcDispatchInflight.owner_epoch`. Coord forwards into each
-    /// `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch`. `0` =
-    /// no-fence (legacy / memory-only mode).
-    pub owner_epoch: i64,
-    /// Mirror of `extent_rpc::ConvertToEcReq::attempt_nonce` — which conversion
-    /// ATTEMPT this dispatch belongs to. Sourced from the in-flight marker's own
-    /// etcd creation revision, so it is unique per attempt and monotonic.
-    pub attempt_nonce: u64,
 }
 
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────

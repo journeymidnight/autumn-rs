@@ -443,7 +443,20 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   reused) but not across one, where a torn-down cluster's persisted
     //   delete retries can unlink a NEW cluster's live extent that reuses the
     //   id at the same address. Empty uuid = unspecified, check skipped.
-    (29, "2137fdbb94408a98"),
+    //   v29 refreshed IN PLACE again (still undeployed): the extent-service
+    //   messages `manager_rpc` used to MIRROR are now re-exports of the
+    //   `extent_rpc` definitions — `ExtAllocExtentReq/Resp`, `ExtCodeResp`,
+    //   `ExtConvertToEcReq`, `ExtDeleteExtentReq`, `ExtDfReq/Resp`,
+    //   `ExtReAvaliReq`, `ExtRequireRecoveryReq`, `MgrRecoveryTask(Done)` are
+    //   gone as separate types and their call sites name the canonical ones.
+    //   (Older notes above still use the retired names; they describe the
+    //   schema as it stood then.) rkyv layout is unchanged — the mirrors were
+    //   field-identical, which is exactly why divergence would have been
+    //   silent — but the hashed schema files changed. `extent_rpc`'s
+    //   `one_definition_only` now makes a reintroduced mirror a build error,
+    //   which is a stronger guarantee than the fingerprint could ever give
+    //   here: both files feed the SAME hash, so it can never distinguish them.
+    (29, "86490609d727073d"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

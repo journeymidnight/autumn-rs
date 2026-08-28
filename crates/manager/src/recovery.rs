@@ -297,7 +297,7 @@ impl AutumnManager {
             }
         };
         let node_id = task.node_id;
-        let payload = rkyv_encode(&ExtRequireRecoveryReq { task });
+        let payload = rkyv_encode(&RequireRecoveryReq { task });
         match self
             .conn_pool
             .call_timeout(
@@ -310,7 +310,7 @@ impl AutumnManager {
             )
             .await
         {
-            Ok(resp) => match rkyv_decode::<ExtCodeResp>(&resp) {
+            Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
                 // CODE_OK covers both "started it" and "already running it".
                 Ok(r) if r.code == CODE_OK => {}
                 Ok(r) => tracing::debug!(
@@ -415,7 +415,7 @@ impl AutumnManager {
             // recovery targets a specific extent_id → route to owner shard.
             let addr = Self::shard_addr_for_extent(&base, &candidate.shard_ports, extent_id);
 
-            let task = MgrRecoveryTask {
+            let task = RecoveryTask {
                 extent_id,
                 replace_id,
                 node_id: candidate.node_id,
@@ -450,7 +450,7 @@ impl AutumnManager {
                 Err(other) => return Err(other),
             }
 
-            let payload = rkyv_encode(&ExtRequireRecoveryReq { task });
+            let payload = rkyv_encode(&RequireRecoveryReq { task });
             // 30 s ceiling — REQUIRE_RECOVERY only kicks off the
             // background `run_recovery_task` on the EN; the EN returns
             // OK immediately. A paged-out / dead EN otherwise wedges
@@ -491,7 +491,7 @@ impl AutumnManager {
                     continue;
                 }
             };
-            let r: ExtCodeResp = match rkyv_decode(&resp) {
+            let r: autumn_rpc::extent_rpc::CodeResp = match rkyv_decode(&resp) {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
@@ -610,7 +610,7 @@ impl AutumnManager {
 
     pub(crate) async fn apply_recovery_done(
         &self,
-        done_task: MgrRecoveryTaskDone,
+        done_task: RecoveryTaskDone,
     ) -> Result<(), AppError> {
         let task = &done_task.task;
 
@@ -1050,7 +1050,7 @@ impl AutumnManager {
                             // re_avali on specific extent → owner shard.
                             let addr =
                                 Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
-                            let payload = rkyv_encode(&ExtReAvaliReq {
+                            let payload = rkyv_encode(&ReAvaliReq {
                                 extent_id: ex.extent_id,
                                 eversion: ex.eversion,
                             });
@@ -1068,7 +1068,7 @@ impl AutumnManager {
                                 )
                                 .await
                             {
-                                if let Ok(r) = rkyv_decode::<ExtCodeResp>(&resp) {
+                                if let Ok(r) = rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
                                     if r.code == CODE_OK {
                                         if let Err(e) =
                                             self.mark_extent_available(ex.extent_id, slot).await
@@ -1430,7 +1430,7 @@ impl crate::AutumnManager {
                 // (std::mem::take). We apply ALL of it below, so no
                 // completion is ever discarded (the merge's whole point).
                 // P0: bound DF at 5 s via control_pool.call_timeout.
-                let payload = rkyv_encode(&ExtDfReq {
+                let payload = rkyv_encode(&DfReq {
                     tasks: Vec::new(),
                     disk_ids: Vec::new(),
                 });
@@ -1463,7 +1463,7 @@ impl crate::AutumnManager {
                         continue;
                     }
                 };
-                let df: ExtDfResp = match rkyv_decode(&resp) {
+                let df: DfResp = match rkyv_decode(&resp) {
                     Ok(v) => v,
                     Err(_) => {
                         cdf_per_node.push((
@@ -2039,7 +2039,7 @@ impl crate::AutumnManager {
             dispatch_owner_epoch_for_extent(&st, extent_id)
         };
 
-        let payload = rkyv_encode(&ExtConvertToEcReq {
+        let payload = rkyv_encode(&ConvertToEcReq {
             extent_id,
             data_shards: data_shards as u32,
             parity_shards: parity_shards as u32,
@@ -2063,7 +2063,7 @@ impl crate::AutumnManager {
             .await;
 
         let rpc_ok = match result {
-            Ok(resp_data) => match rkyv_decode::<ExtCodeResp>(&resp_data) {
+            Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
                 Ok(r) if r.code == CODE_OK => true,
                 Ok(r) => {
                     tracing::warn!("EC conversion failed for extent {extent_id}: {}", r.message);
@@ -2250,7 +2250,7 @@ impl crate::AutumnManager {
             new_ex.replicate_disks = all_disks[..data_shards].to_vec();
             new_ex.parity_disks = all_disks[data_shards..].to_vec();
             // Use the eversion sent in-band to the extent nodes via
-            // ExtConvertToEcReq. Manager + every shard host now agree on
+            // ConvertToEcReq. Manager + every shard host now agree on
             // the same post-EC eversion.
             new_ex.eversion = new_eversion;
             // post-EC the extent has K+M shards across K+M nodes;

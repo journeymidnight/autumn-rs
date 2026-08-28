@@ -76,6 +76,23 @@ first frame with CrcMismatch instead of reaching the version handshake).
   the G1 zombie-writer fix; see stream CLAUDE.md note 31).
 - **`manager_rpc.rs`** / **`partition_rpc.rs`** — manager and PS wire schemas
   (rkyv structs + `MSG_*` constants), the most-referenced surface in the crate.
+  The extent-service messages the manager sends are **re-exported** from
+  `extent_rpc`, never redefined: `AllocExtentReq/Resp`, `ConvertToEcReq`,
+  `DeleteExtentReq`, `DfReq/Resp`, `ReAvaliReq`, `RequireRecoveryReq`,
+  `RecoveryTask(Done)`. `CodeResp` is the exception — `manager_rpc` keeps its
+  own, for the manager service's own RPCs, so extent-service call sites write
+  `extent_rpc::CodeResp`.
+
+  **One definition per message, enforced at compile time.** These used to be
+  mirrored (`ExtDfReq`, `ExtDeleteExtentReq`, `MgrRecoveryTask`, …): the
+  manager encoded through its copy while the node decoded through
+  `extent_rpc`'s, so a field added to one side only was a silent rkyv
+  mis-decode — and the fingerprint could not catch it, because both files hash
+  into the SAME one. `extent_rpc`'s `one_definition_only!` block is an identity
+  function per message that compiles only while the two paths name the same
+  type, so reintroducing a mirror is a build error. A domain type that
+  genuinely needs to differ from its wire form must convert at the encode site;
+  a same-shaped copy encoded directly is a mirror, not a separation.
 - **`cap_token.rs`** — Ed25519 capability-token codec for data-plane authz: the
   manager (leader) signs short-TTL tokens with a private key, the PS verifies
   with the public key only (asymmetric — a compromised PS can verify, never

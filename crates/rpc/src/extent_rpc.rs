@@ -921,7 +921,7 @@ pub struct DfReq {
 /// answering at a stored address → `node_uuid` mismatch → refuse to heal). All
 /// three are empty when the EN was not launched with `--advertise` (test /
 /// pre-M1 deployments) → the manager skips the echo checks. Appended (not
-/// inserted) so the rkyv layout stays compatible with `manager_rpc::ExtDfResp`.
+/// inserted) so the rkyv layout stays compatible with `manager_rpc::DfResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
@@ -963,10 +963,6 @@ pub struct ReAvaliReq {
 }
 
 /// DeleteExtent request: unlink the physical extent file (`.dat` + `.meta`).
-///
-/// MIRRORED by `manager_rpc::ExtDeleteExtentReq`, which is what the manager
-/// actually encodes with — the two definitions must stay byte-identical or the
-/// decode silently yields garbage. Edit both.
 ///
 /// Sent by the manager after an extent's refcount drops to 0
 /// (`punch_holes` / `truncate` paths). Idempotent: a missing extent on the
@@ -1185,6 +1181,41 @@ impl WriteShardResp {
     }
 }
 
+
+/// ONE type per extent-service message, checked by the compiler.
+///
+/// `manager_rpc` names these too, because the manager is a client of this
+/// service — but as re-exports of the definitions here, not as its own copies.
+/// It used to define its own (`ExtDfReq`, `ExtDeleteExtentReq`, …), and since
+/// the manager encoded with those while the node decoded with these, a field
+/// added to one side only was a silent rkyv mis-decode. No fingerprint could
+/// catch it either: both files hash into the same one.
+///
+/// Each identity function below compiles only while the two paths name the
+/// SAME type, so reintroducing a mirror struct is a build error rather than a
+/// runtime corruption. `CodeResp` is absent on purpose — `manager_rpc` has its
+/// own, for the manager service's own RPCs.
+const _: () = {
+    macro_rules! one_definition_only {
+        ($($t:ident),+ $(,)?) => { $(
+            #[allow(dead_code, non_snake_case)]
+            fn $t(x: crate::manager_rpc::$t) -> $t { x }
+        )+ };
+    }
+    one_definition_only!(
+        AllocExtentReq,
+        AllocExtentResp,
+        ConvertToEcReq,
+        DeleteExtentReq,
+        DfReq,
+        DfResp,
+        ReAvaliReq,
+        RecoveryTask,
+        RecoveryTaskDone,
+        RequireRecoveryReq,
+    );
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,17 +1231,6 @@ mod tests {
         assert_eq!(decoded.extent_id, req.extent_id);
         assert_eq!(decoded.node_uuid, req.node_uuid);
 
-        // The manager encodes with its MIRROR of this struct and the node
-        // decodes with this one, so the two layouts must agree byte for byte.
-        // Decoding the mirror's bytes here is what would catch a field added
-        // to only one side.
-        let mirrored = rkyv_encode(&crate::manager_rpc::ExtDeleteExtentReq {
-            extent_id: req.extent_id,
-            node_uuid: req.node_uuid.clone(),
-        });
-        let cross: DeleteExtentReq = rkyv_decode(&mirrored).expect("mirror decode");
-        assert_eq!(cross.extent_id, req.extent_id);
-        assert_eq!(cross.node_uuid, req.node_uuid);
     }
 
     #[test]
