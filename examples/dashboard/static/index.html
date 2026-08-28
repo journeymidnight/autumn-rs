@@ -15,6 +15,8 @@
     GET  /api/partition/<id>      → one partition's detail (metrics + extents)
     POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
     GET  /api/policies + POST /api/policies/{upsert,activate,delete}
+    GET  /api/ops                 → {live, history} — running ops with progress,
+                                    and terminal outcomes with their reason
 -->
 <html lang="zh">
 <head>
@@ -36,6 +38,16 @@
   body { margin:0; color:var(--ink); font:300 13px/1.55 var(--mono);
     font-variant-numeric:tabular-nums; -webkit-font-smoothing:antialiased;
     background:radial-gradient(1200px 500px at 78% -10%, #16130c 0%, transparent 60%), var(--bg); }
+  .ops-row { display:grid; grid-template-columns:64px 84px 1fr 92px; gap:10px; align-items:center;
+    padding:7px 10px; border-bottom:1px solid var(--line); font-size:12px; }
+  .ops-row:last-child { border-bottom:none; }
+  .ops-kind { color:var(--accent); font-weight:600; }
+  .ops-msg { color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ops-msg.bad { color:var(--bad); white-space:normal; }
+  .ops-when { color:var(--muted); text-align:right; font-variant-numeric:tabular-nums; }
+  .bar { position:relative; height:5px; border-radius:3px; background:var(--panel2); overflow:hidden; }
+  .bar > i { position:absolute; inset:0 auto 0 0; background:var(--accent); }
+  .ops-empty { padding:12px 10px; color:var(--muted); font-size:12px; }
   .eyebrow { font-size:10px; font-weight:500; letter-spacing:.16em; text-transform:uppercase; color:var(--dim); }
   b { font-weight:600; }
   :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:3px; }
@@ -324,6 +336,13 @@
     </div>
   </div>
 
+  <section class="ops">
+    <span class="eyebrow">Maintenance ops · running now</span>
+    <div id="ops_live"></div>
+    <span class="eyebrow" style="display:block;margin-top:14px">Recent outcomes · durable history</span>
+    <div id="ops_hist"></div>
+  </section>
+
   <section class="ennodes">
     <span class="eyebrow">Extent nodes · storage layer</span>
     <div class="en-grid" id="nodes"></div>
@@ -570,6 +589,66 @@ function openNode(id){
     <div style="color:var(--dim);margin-top:10px">Hosts <b>${n.extent_count!=null?n.extent_count:"?"}</b> extent shards (replicas ∪ parity). Open a partition to see its per-extent distribution.</div>`;
 }
 
+// ── maintenance ops ──────────────────────────────────────────────────────────
+// Two lists because they answer different questions. `live` is the leader's
+// in-memory ledger — bounded, and gone when the leader changes — so it is the
+// only place a percentage exists. `history` is the durable etcd log, and the
+// only place a FAILURE REASON survives; that is why a failed row shows its
+// error in full rather than truncating it like a running row's message.
+function opsTarget(o){
+  if(o.secondary_id) return `${o.part_id}\u2192${o.secondary_id}`;
+  return o.part_id ? String(o.part_id) : "\u2014";
+}
+function opsAgo(ts){
+  if(!ts) return "";
+  const d = Math.max(0, Math.floor(Date.now()/1000) - ts);
+  if(d < 60) return `${d}s ago`;
+  if(d < 3600) return `${Math.floor(d/60)}m ago`;
+  if(d < 86400) return `${Math.floor(d/3600)}h ago`;
+  return `${Math.floor(d/86400)}d ago`;
+}
+function renderLiveOps(ops){
+  const el = $("#ops_live");
+  if(!ops.length){ el.innerHTML = `<div class="ops-empty">Nothing running.</div>`; return; }
+  el.innerHTML = ops.map(o => {
+    // Raw counts on the wire; the ratio is derived here. Show the magnitude
+    // too — "50%" cannot tell two tables from fifty gigabytes, and that is
+    // what decides whether an operator waits.
+    let prog = `<span class="ops-msg">${esc(o.message||o.state)}</span>`;
+    if(o.progress_total > 0){
+      const pct = Math.min(100, Math.round(o.progress_done / o.progress_total * 100));
+      prog = `<div><div class="bar"><i style="width:${pct}%"></i></div>
+        <div class="ops-msg" style="margin-top:3px">${pct}% \u00b7 ${o.progress_done} / ${o.progress_total}</div></div>`;
+    }
+    return `<div class="ops-row">
+      <span class="ops-kind">${esc(o.kind)}</span>
+      <span>${esc(opsTarget(o))}</span>
+      ${prog}
+      <span class="ops-when">${esc(opsAgo(o.started_at||o.submitted_at))}</span>
+    </div>`;
+  }).join("");
+}
+function renderOpsHistory(ops, err){
+  const el = $("#ops_hist");
+  if(err){ el.innerHTML = `<div class="ops-empty">History unavailable: ${esc(err)}</div>`; return; }
+  if(!ops.length){ el.innerHTML = `<div class="ops-empty">No terminal records yet.</div>`; return; }
+  el.innerHTML = ops.map(o => {
+    const failed = o.state !== "succeeded";
+    const why = failed ? (o.error || o.message || o.state) : (o.message || o.state);
+    return `<div class="ops-row">
+      <span class="ops-kind">${esc(o.kind)}</span>
+      <span>${esc(opsTarget(o))}</span>
+      <span class="ops-msg${failed?" bad":""}">${esc(why)}</span>
+      <span class="ops-when">${esc(opsAgo(o.finished_at))}</span>
+    </div>`;
+  }).join("");
+}
+async function loadOps(){
+  let s; try{ s=await api("/api/ops"); }catch(e){ return; }
+  renderLiveOps(s.live||[]);
+  renderOpsHistory(s.history||[], s.history_error);
+}
+
 // ── overview poll ────────────────────────────────────────────────────────────
 async function overview(){
   let s; try{ s=await api("/api/overview"); }catch(e){ return; }
@@ -658,9 +737,9 @@ $("#vp").onscroll = renderRows;
 $("#danger").onchange = e=>{ DANGER=e.target.checked; $("#dangerlbl").textContent = DANGER?"Danger unlocked":"Danger locked";
   renderRows(); if(SELECTED!=null) openDetail(SELECTED); };
 window.onresize = renderRows;
-function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(()=>{overview(); loadPolicies();},ms); }
+function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(()=>{overview(); loadPolicies(); loadOps();},ms); }
 $("#interval").onchange = schedule;
-overview(); loadPolicies(); schedule();
+overview(); loadPolicies(); loadOps(); schedule();
 </script>
 </body>
 </html>

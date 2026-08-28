@@ -121,18 +121,27 @@ impl AutumnManager {
         kind_filter: u8,
         since_unix: i64,
         limit: u32,
-    ) -> Vec<OpRecord> {
+    ) -> Result<Vec<OpRecord>, String> {
         const DEFAULT_LIMIT: u32 = 50;
         let limit = if limit == 0 { DEFAULT_LIMIT } else { limit } as usize;
+        // An empty answer must not stand in for "there is nowhere to read
+        // from". Both cases below return no records, and a caller that cannot
+        // tell them apart shows an operator "nothing failed" when the truth is
+        // "nothing is being recorded" — the failure mode this log exists to
+        // prevent.
         let Some(etcd) = &self.etcd else {
-            return Vec::new();
+            return Err(
+                "no durable store: this manager runs memory-only, so terminal op outcomes \
+                 are not persisted (the live ledger still answers `ops list`)"
+                    .to_string(),
+            );
         };
         let c = etcd.client.clone();
         let listed = match c.get_prefix(OP_LOG_PREFIX).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(error = %e, "op-log read could not list the prefix");
-                return Vec::new();
+                return Err(format!("op-log read failed: {e}"));
             }
         };
         let mut rows: Vec<(Vec<u8>, OpRecord)> = Vec::with_capacity(listed.kvs.len());
@@ -143,13 +152,14 @@ impl AutumnManager {
             }
         }
         rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.into_iter()
+        Ok(rows
+            .into_iter()
             .rev() // newest first
             .map(|(_, r)| r)
             .filter(|r| kind_filter == 0 || r.kind == kind_filter)
             .filter(|r| since_unix == 0 || r.finished_at >= since_unix)
             .take(limit)
-            .collect()
+            .collect())
     }
 
     /// Trim the history back to `OP_LOG_CAP`, oldest first. Leader-only by

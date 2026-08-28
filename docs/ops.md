@@ -1522,6 +1522,22 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   (`xxd -s 41 -l 1 <disk>/<hash>/extent-<id>.meta`), restart that EN, and
 #   confirm the boot log reports it sealed. Unit-level equivalent:
 #   `cargo test -p autumn-stream --lib the_ec_staging_seal_survives_a_restart`.
+# op observability: live progress + durable history
+# Two questions, two sources. `autumn-op ops list --active` reads the LEADER's
+#   in-memory ledger — the only place a running op's progress exists, and it
+#   dies with the leader. `autumn-op ops history` reads the etcd-backed log —
+#   the only place a terminal op's FAILURE REASON survives.
+# A memory-only manager (no --etcd) persists NO history: `ops history` now fails
+#   loudly with "no durable store" rather than printing an empty list, because
+#   an empty list there reads as "nothing failed".
+# The dashboard shows both at GET /api/ops; it asks the leader through
+#   autumn-op, never a file.
+# Manual check: `$AO ops list --active` during a large compact/gc must show a
+#   percentage AND the raw counts (gc = bytes of the extent scanned, compact =
+#   SST data blocks merged); after it finishes, `$AO ops history --limit 5`
+#   must carry its outcome, with the error text in full for a failure.
+#   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
+#   `bash examples/dashboard/tests/ops_contract.sh`.
 ```
 
 ## Rolling restart & upgrade versioning

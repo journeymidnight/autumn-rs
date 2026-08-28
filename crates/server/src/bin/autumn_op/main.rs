@@ -1877,6 +1877,12 @@ async fn cmd_ops_history(
         })
         .await
         .map_err(|e| anyhow!("ops history: {e}"))?;
+    // An unreadable log is not an empty one. A memory-only manager persists no
+    // terminal outcomes at all, and printing "(no ops)" there would tell an
+    // operator that nothing failed.
+    if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+        return Err(anyhow!("ops history: {}", resp.message));
+    }
     render_ops(&resp.ops, json)
 }
 
@@ -1896,7 +1902,15 @@ fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<(
                     "attempts": o.attempts,
                     "message": o.message,
                     "requested_by": o.requested_by,
+                    // Raw counts, like the wire carries them — the consumer
+                    // derives the ratio. `progress_total == 0` = not reported.
+                    // The text renderer below shows a percentage; JSON must
+                    // still hand over the magnitude, since that is what a
+                    // consumer needs to decide whether to wait.
+                    "progress_done": o.progress_done,
+                    "progress_total": o.progress_total,
                     "submitted_at": o.submitted_at,
+                    "started_at": o.started_at,
                     "finished_at": o.finished_at,
                 })
             })

@@ -4764,12 +4764,19 @@ impl AutumnManager {
         }
         let req: OpHistoryReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        let ops = self.read_op_log(req.kind_filter, req.since_unix, req.limit).await;
-        Ok(rkyv_encode(&OpHistoryResp {
-            code: CODE_OK,
-            message: String::new(),
-            ops,
-        }))
+        // A readable-but-empty log and an unreadable one are different answers.
+        match self.read_op_log(req.kind_filter, req.since_unix, req.limit).await {
+            Ok(ops) => Ok(rkyv_encode(&OpHistoryResp {
+                code: CODE_OK,
+                message: String::new(),
+                ops,
+            })),
+            Err(message) => Ok(rkyv_encode(&OpHistoryResp {
+                code: CODE_ERROR,
+                message,
+                ops: vec![],
+            })),
+        }
     }
 
     // ── handle_get_policy_candidates / handle_report_partition_load ──

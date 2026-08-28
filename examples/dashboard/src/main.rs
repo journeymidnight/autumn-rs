@@ -237,6 +237,64 @@ async fn overview(cfg: &Config) -> Response<Body> {
     passthrough(out, ok)
 }
 
+/// `/api/ops` — one round trip for the ops panel.
+///
+/// Two sources, deliberately kept apart in the reply because they answer
+/// different questions and have different lifetimes: `live` is the leader's
+/// in-memory ledger (what is running NOW, with progress), and `history` is the
+/// durable etcd log (what finished, with the failure reason). The ledger is a
+/// bounded ring that dies with the leader, so an op absent from `live` is not
+/// necessarily gone — it is in `history`.
+///
+/// Both come from the leader over RPC via `autumn-op`; the dashboard never
+/// reads a file.
+async fn ops(cfg: &Config) -> Response<Body> {
+    let arr = |out: String, ok: bool| -> Result<serde_json::Value, String> {
+        if !ok {
+            return Err(out);
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&out).map_err(|e| format!("autumn-op ops: bad json: {e}"))?;
+        Ok(v.get("ops").cloned().unwrap_or_else(|| serde_json::json!([])))
+    };
+
+    let (live_out, live_ok) = cfg
+        .run_op(vec!["ops".into(), "list".into(), "--active".into()])
+        .await;
+    let live = match arr(live_out, live_ok) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": e }).to_string())
+        }
+    };
+
+    // History is best-effort: a cluster with no durable store still has a live
+    // ledger, and an ops panel that shows nothing because the log is
+    // unavailable is worse than one that shows what is running.
+    let (hist_out, hist_ok) = cfg
+        .run_op(vec![
+            "ops".into(),
+            "history".into(),
+            "--limit".into(),
+            "50".into(),
+        ])
+        .await;
+    let (history, history_error) = match arr(hist_out, hist_ok) {
+        Ok(v) => (v, serde_json::Value::Null),
+        Err(e) => (serde_json::json!([]), serde_json::json!(e)),
+    };
+
+    json_resp(
+        StatusCode::OK,
+        serde_json::json!({
+            "live": live,
+            "history": history,
+            "history_error": history_error,
+        })
+        .to_string(),
+    )
+}
+
 async fn partition(cfg: &Config, id: String) -> Response<Body> {
     // Numeric id only — never interpolate a raw path segment into argv.
     let pid: u64 = match id.parse() {
@@ -524,6 +582,11 @@ async fn main() -> Result<()> {
         SendWrapper::new(async move { policies(&c).await })
     });
     let c = SendWrapper::new(cfg.clone());
+    let ops_route = get(move || {
+        let c = c.clone();
+        SendWrapper::new(async move { ops(&c).await })
+    });
+    let c = SendWrapper::new(cfg.clone());
     let activate_route = post(move |body: Bytes| {
         let c = c.clone();
         SendWrapper::new(async move { policies_activate(&c, body).await })
@@ -542,6 +605,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/overview", overview_route)
+        .route("/api/ops", ops_route)
         .route("/api/partition/{id}", partition_route)
         .route("/api/action", action_route)
         .route("/api/policies", policies_route)

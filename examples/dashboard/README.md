@@ -41,6 +41,7 @@ Apply buttons and auto-policy activate/deactivate) use it.
 | `GET /api/partition/{id}` | `autumn-op info --part {id} --detail` |
 | `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` |
 | `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
+| `GET /api/ops` | `autumn-op ops list --active` + `ops history` → `{live, history, history_error}` |
 | `POST /api/policies/activate` | `autumn-op auto-policy activate <name> [--arm]` / `deactivate` |
 | `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
@@ -68,3 +69,24 @@ thousands of partitions:
 Same as `--metrics-port`: no per-request auth/TLS on the dashboard port itself —
 pair exposure with network ACLs. The admin token gates *mutations* against the
 manager, not access to the page.
+
+## Maintenance-ops panel
+
+`/api/ops` returns two lists, kept apart because they answer different
+questions and have different lifetimes. `live` is the leader's in-memory
+ledger — a bounded ring that dies with the leader, and the only place a running
+op's progress exists. `history` is the etcd-backed log, and the only place a
+terminal op's failure reason survives. An op missing from `live` is therefore
+not necessarily gone; it is in `history`.
+
+A manager started without `--etcd` persists no history at all. That comes back
+as `history_error` rather than an empty list, and the panel says so — an empty
+list would read as "nothing failed".
+
+Contract test (isolated cluster with its own etcd, asserts the shape and that a
+record carries the progress counts and the error text):
+
+```bash
+cargo build --workspace
+bash examples/dashboard/tests/ops_contract.sh
+```
