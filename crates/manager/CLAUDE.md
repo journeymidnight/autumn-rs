@@ -365,6 +365,21 @@ it is BUILDING the copy that will make it one). Counters are leader-local and
 pruned to what the node still reports, so a leader change only ever DELAYS a
 deletion.
 
+A third guard covers the OTHER predicate, "extents I have no record of", which
+is still condemned immediately (startup reconcile is expected to clear orphans
+in one round): `allocating_extents` holds an id for the length of its
+allocation, because `place_extents_with_fallback` creates the files on the nodes
+BEFORE the etcd commit publishes `extents/<id>`, and a sweep answered inside
+that window would otherwise order the deletion of an extent that was just
+created. It is an RAII guard, so no error path can leave an id stuck in it.
+
+**Deletes name their target.** Each `DeleteTarget` in a pending/persisted delete
+carries the node's `node_uuid` next to its address, and the node refuses a
+request addressed to a different uuid. Address alone is not identity: a
+persisted retry outlives the address's ownership, and extent ids restart from
+small integers in the next cluster on that host — see the stream guide's
+"Delete extent" section.
+
 **Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): a slot is
 rebuilt only when its node's override is `Fenced`; `auto_disk` reverts to the legacy
 "rebuild on `disk.online == false`". **A slot marked CORRUPT bypasses the gate**

@@ -198,7 +198,11 @@ impl TestConn {
     }
 
     pub async fn delete_extent(&self, extent_id: u64) -> CodeResp {
-        let payload = rkyv_encode(&DeleteExtentReq { extent_id });
+        let payload = rkyv_encode(&DeleteExtentReq {
+            extent_id,
+            // Unspecified: the helper drives whichever node it is pointed at.
+            node_uuid: String::new(),
+        });
         let resp = self
             .pool
             .call(&self.addr, MSG_DELETE_EXTENT, payload)

@@ -75,7 +75,7 @@ impl ExtentOpKind {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PersistedPendingDelete {
     pub extent_id: u64,
-    pub pending_addrs: Vec<String>,
+    pub pending_targets: Vec<crate::extent_delete::DeleteTarget>,
 }
 
 /// Full in-flight record. One per extent_id in the `extent_inflight/`
@@ -375,9 +375,16 @@ impl AutumnManager {
     /// test-only convenience for the Delete op kind.
     #[cfg(test)]
     pub(crate) fn _test_mark_delete_inflight(&self, extent_id: u64, pending_addrs: Vec<String>) {
+        let pending_targets: Vec<crate::extent_delete::DeleteTarget> = pending_addrs
+            .into_iter()
+            .map(|addr| crate::extent_delete::DeleteTarget {
+                addr,
+                node_uuid: String::new(),
+            })
+            .collect();
         let payload = ExtentOpPayload::Delete(PersistedPendingDelete {
             extent_id,
-            pending_addrs,
+            pending_targets,
         });
         let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
         self.inflight.borrow_mut().insert(extent_id, record);
@@ -662,7 +669,13 @@ mod tests {
     fn delete_payload(extent_id: u64) -> ExtentOpPayload {
         ExtentOpPayload::Delete(PersistedPendingDelete {
             extent_id,
-            pending_addrs: vec!["127.0.0.1:9101".to_string(), "127.0.0.1:9102".to_string()],
+            pending_targets: ["127.0.0.1:9101", "127.0.0.1:9102"]
+                .into_iter()
+                .map(|a| crate::extent_delete::DeleteTarget {
+                    addr: a.to_string(),
+                    node_uuid: String::new(),
+                })
+                .collect(),
         })
     }
 
@@ -919,7 +932,10 @@ mod tests {
                 30,
                 crate::extent_delete::PendingDelete {
                     extent_id: 30,
-                    pending_addrs: vec!["127.0.0.1:9101".to_string()],
+                    pending_targets: vec![crate::extent_delete::DeleteTarget {
+                        addr: "127.0.0.1:9101".to_string(),
+                        node_uuid: String::new(),
+                    }],
                     attempts: 0,
                 },
             );

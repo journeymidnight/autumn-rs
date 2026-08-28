@@ -963,12 +963,32 @@ pub struct ReAvaliReq {
 }
 
 /// DeleteExtent request: unlink the physical extent file (`.dat` + `.meta`).
+///
+/// MIRRORED by `manager_rpc::ExtDeleteExtentReq`, which is what the manager
+/// actually encodes with — the two definitions must stay byte-identical or the
+/// decode silently yields garbage. Edit both.
+///
 /// Sent by the manager after an extent's refcount drops to 0
 /// (`punch_holes` / `truncate` paths). Idempotent: a missing extent on the
 /// receiving node returns `CODE_OK`, so manager retries are safe.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DeleteExtentReq {
     pub extent_id: u64,
+    /// WHICH node this delete is for. The one RPC that destroys data used to
+    /// name only an extent id and execute for whoever answered at that
+    /// address — less identity checking than the read-only `df`, which already
+    /// echoes a uuid to catch imposters.
+    ///
+    /// Within one cluster an id is never reused, so a late delete is at worst
+    /// an idempotent no-op. ACROSS clusters ids restart from small integers: if
+    /// cluster A is torn down while its manager still holds persisted delete
+    /// retries, and cluster B comes up on the same host and ports (shared-host
+    /// port bases, pod-IP reuse), A's retry unlinks B's LIVE extent with the
+    /// matching id. The target echoes its own identity here to refuse that.
+    ///
+    /// Empty = unspecified (a legacy persisted retry entry, or a test caller):
+    /// the receiver skips the check, matching `classify_df_echo`.
+    pub node_uuid: String,
 }
 
 /// ConvertToEc request: EC-encode a sealed extent and distribute shards.
@@ -1173,10 +1193,24 @@ mod tests {
     fn delete_extent_req_round_trip() {
         let req = DeleteExtentReq {
             extent_id: 0xdead_beef_cafe_0042,
+            node_uuid: "uuid-target-node".to_string(),
         };
         let bytes = rkyv_encode(&req);
         let decoded: DeleteExtentReq = rkyv_decode(&bytes).expect("decode");
         assert_eq!(decoded.extent_id, req.extent_id);
+        assert_eq!(decoded.node_uuid, req.node_uuid);
+
+        // The manager encodes with its MIRROR of this struct and the node
+        // decodes with this one, so the two layouts must agree byte for byte.
+        // Decoding the mirror's bytes here is what would catch a field added
+        // to only one side.
+        let mirrored = rkyv_encode(&crate::manager_rpc::ExtDeleteExtentReq {
+            extent_id: req.extent_id,
+            node_uuid: req.node_uuid.clone(),
+        });
+        let cross: DeleteExtentReq = rkyv_decode(&mirrored).expect("mirror decode");
+        assert_eq!(cross.extent_id, req.extent_id);
+        assert_eq!(cross.node_uuid, req.node_uuid);
     }
 
     #[test]

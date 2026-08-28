@@ -10,9 +10,9 @@
 //! the persistence of "delete in flight on this extent" is now
 //! the unified inflight ledger (`extent_inflight/<id>` etcd prefix +
 //! `AutumnManager.inflight` in-memory map). The ledger entry's payload
-//! carries a snapshot of `pending_addrs` so a new leader's
+//! carries a snapshot of `pending_targets` so a new leader's
 //! `replay_from_etcd` can restart the delete fanout after failover.
-//! Per-attempt live state (pending_addrs as they ack, attempts
+//! Per-attempt live state (pending_targets as they ack, attempts
 //! counter) lives in `AutumnManager.delete_progress` — in-memory only;
 //! a new leader's first attempt is its own "attempt 1", which is
 //! correct.
@@ -50,10 +50,26 @@ pub(crate) fn extent_delete_retry_key(extent_id: u64) -> String {
 /// (resets after a manager restart — recomputed retry timing is
 /// equivalent to "try now" which is acceptable since the queue is
 /// already a backstop path).
+/// One replica a delete still owes an ack, named by BOTH where to send it and
+/// WHICH node must execute it.
+///
+/// The address alone is not identity: this entry is persisted and retried for
+/// as long as an hour, outliving the address's ownership. `node_uuid` is what
+/// the target checks before unlinking, so a retry that survives its cluster
+/// cannot destroy a different cluster's extent that happens to share the id.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DeleteTarget {
+    /// Shard-routed address for this extent.
+    pub addr: String,
+    /// Stable identity of the node that must execute it. Empty = the node had
+    /// no registered uuid, so the target will skip its identity check.
+    pub node_uuid: String,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrExtentDeleteRetry {
     pub extent_id: u64,
-    pub pending_addrs: Vec<String>,
+    pub pending_targets: Vec<DeleteTarget>,
     pub attempts: u32,
     pub last_attempt_at: i64,
 }
@@ -65,10 +81,9 @@ pub struct MgrExtentDeleteRetry {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingDelete {
     pub extent_id: u64,
-    /// Already shard-routed addresses for every replica that still
-    /// owes us an ack. Drained as each one acks. Entry leaves
-    /// `delete_progress` when this Vec is empty.
-    pub pending_addrs: Vec<String>,
+    /// Every replica that still owes us an ack, by address AND identity.
+    /// Drained as each one acks. Entry leaves `delete_progress` when empty.
+    pub pending_targets: Vec<DeleteTarget>,
     /// Sweep counter. After `MAX_ATTEMPTS` failed sweeps, drop the
     /// entry; reconcile path will catch the orphan on next node boot.
     pub attempts: u32,
@@ -133,11 +148,11 @@ impl AutumnManager {
         deletes: Vec<PendingDelete>,
     ) -> Result<(), AppError> {
         for d in deletes {
-            // Acquire ledger entry with a snapshot of pending_addrs.
+            // Acquire ledger entry with a snapshot of pending_targets.
             let payload = crate::extent_inflight::ExtentOpPayload::Delete(
                 crate::extent_inflight::PersistedPendingDelete {
                     extent_id: d.extent_id,
-                    pending_addrs: d.pending_addrs.clone(),
+                    pending_targets: d.pending_targets.clone(),
                 },
             );
             match self.acquire_extent_inflight(d.extent_id, payload).await {
@@ -225,7 +240,7 @@ impl AutumnManager {
                 v.push((
                     PendingDelete {
                         extent_id: *eid,
-                        pending_addrs: Self::snapshot_replica_addrs(&s.nodes, *eid, ex),
+                        pending_targets: Self::snapshot_replica_targets(&s.nodes, *eid, ex),
                         attempts: 0,
                     },
                     rkyv_encode(ex).to_vec(),
@@ -331,11 +346,11 @@ impl AutumnManager {
             let mut keep: HashMap<u64, PendingDelete> = HashMap::new();
             for mut entry in batch {
                 let mut still_pending = Vec::new();
-                let addrs = std::mem::take(&mut entry.pending_addrs);
-                for addr in addrs {
-                    let acked = self.try_delete_one(&addr, entry.extent_id).await;
+                let targets = std::mem::take(&mut entry.pending_targets);
+                for target in targets {
+                    let acked = self.try_delete_one(&target, entry.extent_id).await;
                     if !acked {
-                        still_pending.push(addr);
+                        still_pending.push(target);
                     }
                 }
                 if still_pending.is_empty() {
@@ -350,7 +365,7 @@ impl AutumnManager {
                     self.release_delete_marker(entry.extent_id).await;
                     continue;
                 }
-                entry.pending_addrs = still_pending;
+                entry.pending_targets = still_pending;
                 entry.attempts += 1;
                 if entry.attempts < MAX_ATTEMPTS {
                     keep.insert(entry.extent_id, entry);
@@ -358,7 +373,7 @@ impl AutumnManager {
                     tracing::warn!(
                         extent_id = entry.extent_id,
                         attempts = entry.attempts,
-                        remaining_replicas = entry.pending_addrs.len(),
+                        remaining_replicas = entry.pending_targets.len(),
                         "extent delete: max retries exhausted in primary loop; \
                          moving to persisted retry queue",
                     );
@@ -374,7 +389,7 @@ impl AutumnManager {
                     // an independent etcd record orthogonal to the
                     // inflight ledger.
                     if let Err(e) = self
-                        .persist_failed_delete(entry.extent_id, entry.pending_addrs.clone())
+                        .persist_failed_delete(entry.extent_id, entry.pending_targets.clone())
                         .await
                     {
                         tracing::error!(
@@ -427,19 +442,20 @@ impl AutumnManager {
     /// Takes `&HashMap<u64, MgrNodeInfo>` (not `&MetadataState`) so it
     /// composes with a concurrent `s.extents.get_mut(...)` partial
     /// borrow on the other side of the `MetadataState` struct.
-    pub(crate) fn snapshot_replica_addrs(
+    pub(crate) fn snapshot_replica_targets(
         nodes: &HashMap<u64, MgrNodeInfo>,
         extent_id: u64,
         extent: &MgrExtentInfo,
-    ) -> Vec<String> {
+    ) -> Vec<DeleteTarget> {
         let mut addrs = Vec::with_capacity(extent.replicates.len() + extent.parity.len());
         for nid in extent.replicates.iter().chain(extent.parity.iter()) {
             if let Some(n) = nodes.get(nid) {
-                addrs.push(Self::shard_addr_for_extent(
-                    &n.address,
-                    &n.shard_ports,
-                    extent_id,
-                ));
+                addrs.push(DeleteTarget {
+                    addr: Self::shard_addr_for_extent(&n.address, &n.shard_ports, extent_id),
+                    // Empty for a node with no registered uuid (legacy /
+                    // no `--advertise`); the target then skips its check.
+                    node_uuid: n.node_uuid.clone(),
+                });
             }
             // Missing node_id (deregistered) → silently skip; its files
             // are already unreachable.
@@ -453,11 +469,11 @@ impl AutumnManager {
     pub(crate) async fn persist_failed_delete(
         &self,
         extent_id: u64,
-        pending_addrs: Vec<String>,
+        pending_targets: Vec<DeleteTarget>,
     ) -> Result<(), AppError> {
         let entry = MgrExtentDeleteRetry {
             extent_id,
-            pending_addrs,
+            pending_targets,
             attempts: 0,
             last_attempt_at: epoch_seconds(),
         };
@@ -509,7 +525,7 @@ impl AutumnManager {
             for mut entry in due {
                 let extent_id = entry.extent_id;
                 let mut still_pending = Vec::new();
-                let addrs = std::mem::take(&mut entry.pending_addrs);
+                let addrs = std::mem::take(&mut entry.pending_targets);
                 for addr in addrs {
                     let acked = self.try_delete_one(&addr, extent_id).await;
                     if !acked {
@@ -536,7 +552,7 @@ impl AutumnManager {
                                 extent_id,
                                 MgrExtentDeleteRetry {
                                     extent_id,
-                                    pending_addrs: Vec::new(),
+                                    pending_targets: Vec::new(),
                                     attempts: entry.attempts.saturating_add(1),
                                     last_attempt_at: now,
                                 },
@@ -545,7 +561,7 @@ impl AutumnManager {
                     }
                     continue;
                 }
-                entry.pending_addrs = still_pending;
+                entry.pending_targets = still_pending;
                 entry.attempts = entry.attempts.saturating_add(1);
                 entry.last_attempt_at = now;
                 if let Some(etcd) = &self.etcd {
@@ -564,8 +580,12 @@ impl AutumnManager {
         }
     }
 
-    async fn try_delete_one(&self, addr: &str, extent_id: u64) -> bool {
-        let payload = rkyv_encode(&ExtDeleteExtentReq { extent_id });
+    async fn try_delete_one(&self, target: &DeleteTarget, extent_id: u64) -> bool {
+        let payload = rkyv_encode(&ExtDeleteExtentReq {
+            extent_id,
+            node_uuid: target.node_uuid.clone(),
+        });
+        let addr = target.addr.as_str();
         // 10 s — DELETE_EXTENT is a single fs::remove pair on EN.
         // Bounded so the per-2 s sweep loop doesn't get stuck behind
         // one paged-out EN; the failed delete just gets retried on

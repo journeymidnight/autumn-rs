@@ -456,15 +456,27 @@ Idempotent unlink of the physical `.dat` + `.meta` after the manager confirms
 `extent_delete_loop`.
 
 ```
-handle_delete_extent(extent_id):
-  1. shard ownership: if !owns_extent → forward to sibling shard.
-  2. if recovery_inflight.contains_key(id) → return CODE_PRECONDITION
+handle_delete_extent(extent_id, node_uuid):
+  1. identity: if both uuids are non-empty and differ → CODE_LOCKED_BY_OTHER.
+  2. shard ownership: if !owns_extent → forward to sibling shard.
+  3. if recovery_inflight.contains_key(id) → return CODE_PRECONDITION
      (manager retries; once recovery clears, next retry succeeds).
-  3. extents.remove(id) — subsequent appends fail fast NotFound.
-  4. DiskFS::remove_extent_files(id): remove_file(.dat) + remove_file(.meta);
+  4. extents.remove(id) — subsequent appends fail fast NotFound.
+  5. DiskFS::remove_extent_files(id): remove_file(.dat) + remove_file(.meta);
      NotFound → Ok(()) (idempotent, retries are safe).
-  5. Returns CODE_OK | CODE_PRECONDITION | CODE_ERROR.
+  6. Returns CODE_OK | CODE_LOCKED_BY_OTHER | CODE_PRECONDITION | CODE_ERROR.
 ```
+
+**Identity check** (step 1): the request names WHICH node must execute it, and
+a mismatch is refused before anything is touched. Extent ids are unique only
+within a cluster, while the manager's delete retries are persisted and retried
+for up to an hour — outliving the address's ownership. Cluster A torn down with
+retries outstanding, cluster B up on the same host and ports (shared-host port
+bases, pod-IP reuse), and A's retry unlinks B's live extent with the matching
+id. An empty uuid on either side means "unspecified" and skips the check, the
+same convention `classify_df_echo` uses for `df`. The manager carries the uuid
+in each `DeleteTarget` alongside the address, so a persisted retry keeps its
+target identity across a leader change.
 
 **Recovery-vs-delete mutual exclusion** (step 2) prevents two data-loss paths:
 (a) **resurrection** — `run_recovery_task`'s `ensure_extent(create:true)` after

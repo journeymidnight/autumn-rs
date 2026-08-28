@@ -895,6 +895,16 @@ pub struct AutumnManager {
     /// change resets the counters, which only ever DELAYS a deletion.
     /// Keyed `(node_id, shard_idx, extent_id)` — see `ReconcileExtentsReq`.
     pub(crate) reconcile_non_member: Rc<RefCell<HashMap<(u64, u32, u64), u32>>>,
+    /// Extent ids whose files have been created on their nodes but whose
+    /// `extents/<id>` record is not published yet.
+    ///
+    /// Allocation creates the files FIRST (`place_extents_with_fallback`) and
+    /// commits to etcd after, so inside that window a node's reconcile report
+    /// names an extent the store has no record of — which the orphan filter
+    /// would otherwise read as garbage and order deleted seconds after it was
+    /// legitimately created. Held only for the length of one allocation, by an
+    /// RAII guard, so no error path can leave an id stuck here.
+    pub(crate) allocating_extents: Rc<RefCell<std::collections::HashSet<u64>>>,
     /// leader-local, in-memory ledger of submitted long-running ops (the
     /// queryable state + failure reason for split/merge/rebalance/compact/gc/
     /// forcegc/ec-convert). Terminal outcomes also go to the durable audit log.
@@ -1030,6 +1040,21 @@ impl Default for AutumnManager {
     }
 }
 
+/// Keeps an extent id in `AutumnManager::allocating_extents` for as long as its
+/// allocation is in flight, and removes it on drop — including on every early
+/// return and error path, which is the point of making it a guard rather than a
+/// pair of calls.
+pub(crate) struct AllocatingExtentGuard {
+    set: Rc<RefCell<std::collections::HashSet<u64>>>,
+    extent_id: u64,
+}
+
+impl Drop for AllocatingExtentGuard {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.extent_id);
+    }
+}
+
 impl AutumnManager {
     pub fn new() -> Self {
         Self {
@@ -1062,6 +1087,7 @@ impl AutumnManager {
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
             reconcile_non_member: Rc::new(RefCell::new(HashMap::new())),
+            allocating_extents: Rc::new(RefCell::new(std::collections::HashSet::new())),
             ops: Rc::new(RefCell::new(crate::op_ledger::OpLedger::new())),
             auto_policy_default: Rc::new(RefCell::new(None)),
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
@@ -1114,6 +1140,17 @@ impl AutumnManager {
     /// binary's main() after CLI parsing; the public API mirrors the
     /// existing `set_auto_split` / `set_policy_config` pattern.
     /// `quorum` is clamped to at least 1.
+    /// Announce that `extent_id`'s files are being created on their nodes, so
+    /// the orphan reconcile gives no verdict on it until the guard drops (which
+    /// is after the allocation has either committed or failed).
+    pub(crate) fn mark_allocating(&self, extent_id: u64) -> AllocatingExtentGuard {
+        self.allocating_extents.borrow_mut().insert(extent_id);
+        AllocatingExtentGuard {
+            set: self.allocating_extents.clone(),
+            extent_id,
+        }
+    }
+
     pub fn set_report_disk_failure_config(&self, window: Duration, quorum: usize) {
         self.report_disk_failure_window.set(window);
         self.report_disk_failure_quorum.set(quorum.max(1));
@@ -3364,7 +3401,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                         *id,
                         crate::extent_delete::PendingDelete {
                             extent_id: p.extent_id,
-                            pending_addrs: p.pending_addrs,
+                            pending_targets: p.pending_targets,
                             attempts: 0,
                         },
                     );
@@ -8423,6 +8460,68 @@ mod tests {
             assert_eq!(
                 ev_after, eversion_before,
                 "eversion must not be bumped when alloc_extent is rejected mid-EC"
+            );
+        })
+    }
+
+    /// An extent whose allocation is in flight must get NO reconcile verdict.
+    /// Its files are created on the nodes before `extents/<id>` is published,
+    /// so a sweep answered inside that window would otherwise read it as an
+    /// orphan and order the deletion of an extent that was just created.
+    /// Residue that is NOT mid-allocation must still be condemned in one round
+    /// — the orphan sweep's whole job.
+    #[test]
+    fn reconcile_gives_no_verdict_while_an_allocation_is_in_flight() {
+        run(async {
+            let m = AutumnManager::new();
+            let node_id = 1u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.nodes.insert(
+                    node_id,
+                    MgrNodeInfo {
+                        node_id,
+                        address: "127.0.0.1:9101".to_string(),
+                        disks: vec![1],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: "uuid-alloc-guard".to_string(),
+                    },
+                );
+            }
+            let newborn = 900u64;
+            let orphan = 901u64;
+
+            async fn garbage(m: &AutumnManager, ids: Vec<u64>) -> Vec<u64> {
+                let req = rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 1,
+                    node_uuid: "uuid-alloc-guard".to_string(),
+                    shard_idx: 0,
+                    extent_ids: ids,
+                });
+                let resp = m.handle_reconcile_extents(req).await.unwrap();
+                let r: ReconcileExtentsResp = rkyv_decode(&resp).unwrap();
+                assert_eq!(r.code, CODE_OK, "reconcile rejected: {}", r.message);
+                r.garbage
+            }
+
+            {
+                let _allocating = m.mark_allocating(newborn);
+                let g = garbage(&m, vec![newborn, orphan]).await;
+                assert!(
+                    !g.contains(&newborn),
+                    "an extent mid-allocation must not be condemned"
+                );
+                assert!(
+                    g.contains(&orphan),
+                    "real residue must still be collected in the same round"
+                );
+            }
+
+            // Guard dropped (allocation committed or failed): no more shield.
+            assert!(
+                garbage(&m, vec![newborn, orphan]).await.contains(&newborn),
+                "once the allocation is over the id is ordinary residue again"
             );
         })
     }

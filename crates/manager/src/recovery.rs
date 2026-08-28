@@ -803,7 +803,10 @@ impl AutumnManager {
                 let _ = self
                     .enqueue_pending_deletes(vec![PendingDelete {
                         extent_id: task.extent_id,
-                        pending_addrs: vec![addr],
+                        pending_targets: vec![crate::extent_delete::DeleteTarget {
+                            addr,
+                            node_uuid: String::new(),
+                        }],
                         attempts: 0,
                     }])
                     .await;

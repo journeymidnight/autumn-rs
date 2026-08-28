@@ -1794,6 +1794,10 @@ impl AutumnManager {
         }
         let mut fallback_iter = fallback_nodes.into_iter();
 
+        // The files go onto the nodes BEFORE this allocation is published, so
+        // shield the id from the orphan reconcile until the guard drops at the
+        // end of this handler — by which point it has committed or failed.
+        let _allocating = self.mark_allocating(extent_id);
         let Some((node_ids, disk_ids)) = self
             .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
             .await
@@ -2785,6 +2789,10 @@ impl AutumnManager {
         }
         let mut fallback_iter = fallback_nodes.into_iter();
 
+        // The files go onto the nodes BEFORE this allocation is published, so
+        // shield the id from the orphan reconcile until the guard drops at the
+        // end of this handler — by which point it has committed or failed.
+        let _allocating = self.mark_allocating(extent_id);
         let Some((node_ids, disk_ids)) = self
             .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
             .await
@@ -3029,10 +3037,10 @@ impl AutumnManager {
             if let Some(extent) = s.extents.get(&eid) {
                 if extent.refs == 1 && extent.vp_table_refs == 0 && !ec_inflight_set.contains(&eid)
                 {
-                    let pending_addrs = Self::snapshot_replica_addrs(&s.nodes, eid, extent);
+                    let pending_targets = Self::snapshot_replica_targets(&s.nodes, eid, extent);
                     pending_deletes.push(PendingDelete {
                         extent_id: eid,
-                        pending_addrs,
+                        pending_targets,
                         attempts: 0,
                     });
                 }
@@ -4035,6 +4043,9 @@ impl AutumnManager {
             fallback_nodes.shuffle(&mut rand::thread_rng());
         }
         let mut fallback_iter = fallback_nodes.into_iter();
+        // Same shield as the other two allocation paths: files first, publish
+        // after, so the new tail must not look like an orphan in between.
+        let _allocating = self.mark_allocating(p1.new_tail_id);
         let Some((final_node_ids, final_disk_ids)) = self
             .place_extents_with_fallback(&p1.selected_nodes, &mut fallback_iter, p1.new_tail_id)
             .await
@@ -5734,6 +5745,7 @@ impl AutumnManager {
         let garbage: Vec<u64> = {
             let s = self.store.inner.borrow();
             let mut seen = self.reconcile_non_member.borrow_mut();
+            let allocating = self.allocating_extents.borrow();
             // Only keep counters for extents this SHARD still reports, so the
             // map cannot grow without bound. Scoping to the shard matters: its
             // siblings share this node_id and report disjoint extents, so a
@@ -5748,19 +5760,21 @@ impl AutumnManager {
                 .iter()
                 .copied()
                 .filter(|eid| {
+                    if allocating.contains(eid) {
+                        // Mid-allocation: its files are on the nodes but its
+                        // record is not published yet. No verdict — condemning
+                        // it here would order the deletion of an extent that was
+                        // just legitimately created.
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        return false;
+                    }
                     let Some(ex) = s.extents.get(eid) else {
-                        // (1) unknown extent — immediate.
-                        //
-                        // KNOWN GAP (delete review F4, deliberately NOT patched
-                        // here — see claude-progress.txt 2026-08-28): an extent's
-                        // files exist on its nodes BEFORE `extents/<id>` is
-                        // published, so a sweep answered inside that window
-                        // condemns an extent that was just created. Every guard
-                        // tried at THIS point either delays real orphan cleanup
-                        // for every extent or cannot be told apart from a fresh
-                        // cluster with a stray file. The fix belongs at the
-                        // source: have the alloc path publish its in-progress
-                        // extent ids so this filter can skip them.
+                        // (1) unknown extent — immediate. Safe now that the
+                        // mid-allocation case is filtered above: an id the store
+                        // has no record of AND no allocation in flight for really
+                        // is residue, and startup reconcile is expected to clear
+                        // it in ONE round
+                        // (`offline_reconcile::startup_reconcile_unlinks_orphans`).
                         seen.remove(&(req.node_id, req.shard_idx, *eid));
                         return true;
                     };

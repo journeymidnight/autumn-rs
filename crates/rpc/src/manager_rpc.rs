@@ -941,9 +941,18 @@ pub struct UpdateStreamEcResp {
 }
 
 /// DeleteExtent request (manager → extent node).
+///
+/// MIRRORS `extent_rpc::DeleteExtentReq` and must stay byte-identical to it:
+/// the manager encodes with this definition and the node decodes with that
+/// one, so a field added to only one side is a silent rkyv mis-decode that no
+/// fingerprint catches (both files are hashed into the same one). Edit both.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtDeleteExtentReq {
     pub extent_id: u64,
+    /// Which node must execute this delete — see
+    /// `extent_rpc::DeleteExtentReq::node_uuid` for why the one
+    /// data-destroying RPC needs an identity. Empty = unspecified.
+    pub node_uuid: String,
 }
 
 /// ConvertToEc request (manager → extent node coordinator).

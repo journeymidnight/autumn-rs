@@ -435,7 +435,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   Comment-only; no struct changed. NOTE the same commit changes the
     //   PS's PERSISTED SST/WAL key ordering — old partition data is
     //   unreadable; a dev cluster must be rebuilt.
-    (29, "9cb798979a60ed87"),
+    //   v29 refreshed IN PLACE again (still undeployed): `DeleteExtentReq`
+    //   (and its `manager_rpc::ExtDeleteExtentReq` mirror) grew `node_uuid`,
+    //   the identity the target checks before unlinking. The one RPC that
+    //   destroys data previously named only an extent id and ran for whoever
+    //   answered at that address — fine within a cluster (ids are never
+    //   reused) but not across one, where a torn-down cluster's persisted
+    //   delete retries can unlink a NEW cluster's live extent that reuses the
+    //   id at the same address. Empty uuid = unspecified, check skipped.
+    (29, "2137fdbb94408a98"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

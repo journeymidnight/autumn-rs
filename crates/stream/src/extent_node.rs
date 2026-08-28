@@ -7260,6 +7260,36 @@ impl ExtentNode {
         let req: DeleteExtentReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // IS THIS DELETE FOR US? Extent ids are unique only within a cluster,
+        // and a manager's persisted delete retries outlive the cluster: torn
+        // down A retrying against an address now owned by B's node would unlink
+        // B's live extent with the same id. Refuse before touching anything.
+        // Either side leaving the uuid empty means "unspecified" (a legacy
+        // persisted entry, a node started without `--advertise`), which skips
+        // the check exactly like `classify_df_echo` does for `df`.
+        {
+            let reg = &self.registration;
+            if !req.node_uuid.is_empty()
+                && !reg.node_uuid.is_empty()
+                && req.node_uuid != reg.node_uuid
+            {
+                tracing::warn!(
+                    extent_id = req.extent_id,
+                    for_node = %req.node_uuid,
+                    this_node = %reg.node_uuid,
+                    "delete_extent addressed to a DIFFERENT node — refusing \
+                     (a stale retry from another cluster reusing this address?)"
+                );
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_LOCKED_BY_OTHER,
+                    message: format!(
+                        "delete_extent is for node {}, this node is {}",
+                        req.node_uuid, reg.node_uuid
+                    ),
+                }));
+            }
+        }
+
         // forward to owner shard so each shard only ever
         // touches the extents whose ids hash to it.
         if !self.owns_extent(req.extent_id) {
@@ -10378,6 +10408,52 @@ mod recovery_idempotence_tests {
             CODE_LOCKED_BY_OTHER,
             "a stripe from a superseded attempt must be refused once the layout is committed"
         );
+    }
+
+    /// The one RPC that destroys data must check WHO it is for. A manager's
+    /// persisted delete retries outlive their cluster, and extent ids restart
+    /// from small integers in the next one — so a retry landing on a reused
+    /// address must not unlink the live extent that happens to share the id.
+    #[compio::test]
+    async fn delete_extent_refuses_a_request_addressed_to_another_node() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(
+            ExtentNodeConfig::new(dir.path().to_path_buf(), 1)
+                .with_registration("uuid-this-node", "127.0.0.1:9101", vec![]),
+        )
+        .await
+        .expect("node");
+        let eid = 7u64;
+        let entry = node.ensure_extent(eid).await.expect("create extent");
+        let path = node.disk_for(entry.disk_id).expect("disk").extent_path(eid);
+        assert!(path.exists(), "precondition: the extent file exists");
+
+        let del = |uuid: &str| {
+            rkyv_encode(&DeleteExtentReq {
+                extent_id: eid,
+                node_uuid: uuid.to_string(),
+            })
+        };
+
+        let resp = node
+            .handle_delete_extent(del("uuid-some-other-node"))
+            .await
+            .expect("call");
+        let (code, msg) = decode_code(&resp);
+        assert_eq!(
+            code, CODE_LOCKED_BY_OTHER,
+            "a delete for a different node must be refused: {msg}"
+        );
+        assert!(
+            path.exists(),
+            "the extent file must survive a delete addressed to another node"
+        );
+
+        // The rightful target still works — and so does an unspecified uuid,
+        // which is how a legacy persisted retry entry arrives.
+        let resp = node.handle_delete_extent(del("uuid-this-node")).await.expect("call");
+        assert_eq!(decode_code(&resp).0, CODE_OK, "the addressed node must proceed");
+        assert!(!path.exists(), "the extent file must be gone");
     }
 
     fn decode_code(resp: &Bytes) -> (u8, String) {
