@@ -5890,6 +5890,35 @@ impl ExtentNode {
     /// `pwrite`-at-offset is idempotent, so a retry that re-streams from 0
     /// rewrites the same bytes at the same offsets. No truncate: stripes from
     /// different offsets coexist; the file grows to `shard_size` at the last.
+    /// Claim this node's EC staging for `extent_id` on behalf of `attempt_nonce`,
+    /// or refuse if a NEWER attempt already claimed it.
+    ///
+    /// Two things depend on the claim being recorded, which is why BOTH staging
+    /// paths call this and not just the RPC one:
+    ///  - attempt ordering, so a released-but-alive coordinator cannot
+    ///    interleave its stripes with its successor's into the same file (the
+    ///    `owner_epoch` fence only fires when the ex-coordinator was FENCED,
+    ///    not when its marker was merely released);
+    ///  - the reconcile guard, which skips a cleanup verdict that says `.dat`
+    ///    while an attempt has staged shards here. Unclaimed staging is
+    ///    invisible to it, so a stale verdict deletes a shard being written.
+    ///
+    /// Nonce 0 = a pre-nonce peer: left unordered rather than blocked.
+    /// Callers must hold this extent's op lock so compare-and-record is atomic
+    /// against a concurrent stripe.
+    fn claim_ec_staging(&self, extent_id: u64, attempt_nonce: u64) -> bool {
+        if attempt_nonce == 0 {
+            return true;
+        }
+        if let Some(seen) = self.ec_stage_nonce.get(&extent_id).map(|v| *v) {
+            if attempt_nonce < seen {
+                return false;
+            }
+        }
+        self.ec_stage_nonce.insert(extent_id, attempt_nonce);
+        true
+    }
+
     async fn write_shard_stripe_local(
         &self,
         extent_id: u64,
@@ -8103,6 +8132,22 @@ impl ExtentNode {
                     .extent_file(&entry)
                     .await
                     .map_err(|e| (StatusCode::Internal, e))?;
+                // Claim staging for THIS attempt on the coordinator's OWN node,
+                // exactly as every remote target does through write_shard. The
+                // coordinator writes its shard 0 locally, bypassing that RPC, so
+                // without this its node holds staged shards it has no record of:
+                // a superseded attempt's local stripes go unordered against its
+                // successor's, and reconcile's "a verdict saying .dat while an
+                // attempt stages here predates the attempt" guard reads false
+                // here and deletes the shard being written.
+                if !self.claim_ec_staging(extent_id, req.attempt_nonce) {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "extent {extent_id}: a newer EC attempt already stages on this node"
+                        ),
+                    ));
+                }
                 let mut s = 0usize;
                 while s < per_shard {
                     let stripe_len = (per_shard - s).min(stripe_bytes);
@@ -8310,23 +8355,17 @@ impl ExtentNode {
         // under the op lock so the compare-and-record is atomic against a
         // concurrent stripe. Nonce 0 = a pre-nonce peer: left unordered rather
         // than blocking it.
-        if req.attempt_nonce > 0 {
-            if let Some(seen) = self.ec_stage_nonce.get(&req.extent_id).map(|v| *v) {
-                if req.attempt_nonce < seen {
-                    tracing::warn!(
-                        extent_id = req.extent_id,
-                        shard_index = req.shard_index,
-                        stripe_nonce = req.attempt_nonce,
-                        staging_nonce = seen,
-                        "write_shard from a SUPERSEDED conversion attempt — refusing"
-                    );
-                    return Ok(WriteShardResp {
-                        code: CODE_LOCKED_BY_OTHER,
-                    }
-                    .encode());
-                }
+        if !self.claim_ec_staging(req.extent_id, req.attempt_nonce) {
+            tracing::warn!(
+                extent_id = req.extent_id,
+                shard_index = req.shard_index,
+                stripe_nonce = req.attempt_nonce,
+                "write_shard from a SUPERSEDED conversion attempt — refusing"
+            );
+            return Ok(WriteShardResp {
+                code: CODE_LOCKED_BY_OTHER,
             }
-            self.ec_stage_nonce.insert(req.extent_id, req.attempt_nonce);
+            .encode());
         }
 
         if let Ok(entry) = self.ensure_extent(req.extent_id).await {
@@ -10179,6 +10218,38 @@ mod recovery_idempotence_tests {
         )
         .await
         .expect("node2")
+    }
+
+    /// The staging claim is what orders two EC attempts on one node, and both
+    /// staging paths (the write_shard RPC and the coordinator's own local
+    /// shard) go through it. A newer attempt takes over; an older one is
+    /// refused; nonce 0 (a pre-nonce peer) is left unordered rather than
+    /// blocked.
+    #[compio::test]
+    async fn ec_staging_claim_orders_attempts() {
+        {
+            let dir = tempfile::tempdir().expect("tmp");
+            let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+                .await
+                .expect("node");
+            let eid = 42u64;
+
+            assert!(node.claim_ec_staging(eid, 100), "first claim wins");
+            assert!(node.claim_ec_staging(eid, 100), "same attempt may keep staging");
+            assert!(node.claim_ec_staging(eid, 101), "a newer attempt takes over");
+            assert!(
+                !node.claim_ec_staging(eid, 100),
+                "a superseded attempt must be refused once a newer one claimed"
+            );
+            assert!(
+                node.claim_ec_staging(eid, 0),
+                "nonce 0 is a pre-nonce peer: unordered, not blocked"
+            );
+            assert!(
+                !node.claim_ec_staging(eid, 100),
+                "the nonce-0 pass-through must not lower the floor"
+            );
+        }
     }
 
     fn decode_code(resp: &Bytes) -> (u8, String) {
