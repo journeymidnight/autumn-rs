@@ -2526,9 +2526,9 @@ impl AutumnManager {
             // entirely different, healthy nodes.
             if !tail.sealed {
                 if let Some(op) = self.extent_inflight_op(tail_id) {
-                    let msg = format!(
-                        "extent {tail_id} has in-flight {op:?}; \
-                         defer alloc_extent until it completes"
+                    let msg = autumn_common::alloc_conflict::inflight_defer_message(
+                        tail_id,
+                        &format!("{op:?}"),
                     );
                     return Self::alloc_reject(CODE_PRECONDITION, msg);
                 }
@@ -2870,10 +2870,8 @@ impl AutumnManager {
                 Some(live) => {
                     let baseline = &stream_after.extent_ids[..stream_after.extent_ids.len() - 1];
                     if live.extent_ids.as_slice() != baseline {
-                        let msg = format!(
-                            "stream {} membership changed during alloc_extent; \
-                             retry with fresh snapshot",
-                            req.stream_id
+                        let msg = autumn_common::alloc_conflict::membership_changed_message(
+                            req.stream_id,
                         );
                         return Self::alloc_reject(CODE_PRECONDITION, msg);
                     }
@@ -2902,10 +2900,10 @@ impl AutumnManager {
                 }
             };
             if live_eversion != expected_eversion {
-                let msg = format!(
-                    "extent {} eversion changed during alloc_extent \
-                     ({} -> {}); retry with fresh snapshot",
-                    tail.extent_id, expected_eversion, live_eversion
+                let msg = autumn_common::alloc_conflict::eversion_changed_message(
+                    tail.extent_id,
+                    expected_eversion,
+                    live_eversion,
                 );
                 return Self::alloc_reject(CODE_PRECONDITION, msg);
             }

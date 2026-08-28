@@ -84,19 +84,17 @@ impl ManagerError {
 
     /// A `CODE_PRECONDITION` that is a TRANSIENT concurrency conflict — the
     /// manager telling the client to re-pull a fresh snapshot or wait for an
-    /// in-flight op, NOT a deterministic verdict. Coupled (by message, like
-    /// `is_owner_fence`) to the `handle_stream_alloc_extent` producers: the
-    /// inflight-ledger "defer alloc_extent until it completes"
-    /// (rpc_handlers.rs) and the stream-membership / tail-eversion
-    /// verify-at-apply + etcd mirror value-CAS "retry with [a] fresh snapshot"
-    /// (rpc_handlers.rs + lib.rs, manager note 33). These clear within a tick
-    /// or two. The owner fence ("owner_epoch mismatch") and deterministic
-    /// business-rule preconditions ("stream cannot be empty …") contain
-    /// neither marker → they stay fail-fast.
+    /// in-flight op, NOT a deterministic verdict. These clear within a tick
+    /// or two; the owner fence and deterministic business-rule preconditions
+    /// ("stream cannot be empty …") do not, and stay fail-fast.
+    ///
+    /// Coupled by message, like `is_owner_fence` — but the coupling lives in
+    /// `autumn_common::alloc_conflict`, which owns BOTH the manager-side
+    /// message builders and this matcher, with a test running every real
+    /// builder through it. Nothing here or in the manager writes the text.
     fn is_transient_conflict(&self) -> bool {
         self.code == manager_rpc::CODE_PRECONDITION
-            && (self.message.contains("fresh snapshot")
-                || self.message.contains("until it completes"))
+            && autumn_common::alloc_conflict::is_transient_alloc_conflict_message(&self.message)
     }
 
     /// Codes worth another attempt on a rotated / later manager:

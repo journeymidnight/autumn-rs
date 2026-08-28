@@ -3651,8 +3651,21 @@ impl ExtentNode {
                 .collect();
             for idx in stale_shards {
                 let path = disk.shard_path(p.extent_id, idx);
-                match compio::fs::remove_file(&path).await {
-                    Ok(()) | Err(_) => {}
+                // Same rule as the `.dat` branch below: the entry may only stop
+                // advertising a file once the file is actually gone. Forgetting
+                // it after a failed unlink leaves the bytes on disk while `df`
+                // stops counting them and `holds_payload` goes false — which
+                // also blocks the later `.dat` reclaim for the InShardFile case.
+                if let Err(e) = compio::fs::remove_file(&path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            extent_id = p.extent_id,
+                            shard_index = idx,
+                            error = %e,
+                            "reconcile: could not unlink a stale shard file (retried next sweep)"
+                        );
+                        continue;
+                    }
                 }
                 entry.forget_shard_file(idx);
                 tracing::info!(

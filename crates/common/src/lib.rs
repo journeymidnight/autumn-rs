@@ -1,3 +1,4 @@
+pub mod alloc_conflict;
 pub mod cpu_pin;
 pub mod error;
 pub mod metrics;

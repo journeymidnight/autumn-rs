@@ -484,8 +484,7 @@ impl EtcdMirror {
         match self.txn_fenced(extra_cmp, ops, vec![]).await? {
             true => Ok(()),
             false => Err(AppError::Precondition(
-                "stream changed concurrently (CAS conflict); retry with a fresh snapshot"
-                    .to_string(),
+                autumn_common::alloc_conflict::cas_conflict_message(),
             )),
         }
     }
