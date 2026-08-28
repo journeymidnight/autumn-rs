@@ -30,6 +30,35 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (f)
+TaskStatus: not_completed
+Task scope: op 可观测性三层——补齐进度上报与 dashboard 消费面。
+【核实修正】上一轮我说"MSG_OP_HISTORY 零消费方"是错的:CLI 其实早就接好了
+  (autumn-op ops history --kind/--since/--limit → SDK op_history → MSG_OP_HISTORY)。
+  搜 MSG_OP_HISTORY 搜不到是因为 CLI 走的是 SDK 方法名。第三层真正缺的只有 dashboard。
+【已完成 (0ca8a13)】compact 进度上报:AsyncMergeIterator::block_progress 汇总各输入迭代器的
+  block_idx / reader.block_count(),块是 merge 真正推进的单位、两项都已在内存里,零 I/O。
+  每 4096 条采样一次,且【首条即报】——首个样本是 (0,total),那才是告诉操作员活有多大的那个数。
+  另修:run_gc 把 kind 硬编码成 OP_KIND_GC,forcegc 的进度一直报在错的 kind 下。
+  两处 Sel::CompactTimeout(过期/周期触发)传 op_id=0(untracked)。
+【已完成 (1e15dc4)】dashboard /api/ops + 面板:live(leader 内存 ledger,唯一有进度的地方)
+  与 history(etcd 日志,唯一留住失败原因的地方)分开返回,都经 autumn-op 走 RPC 问 leader。
+  【顺带修掉一个 fail-open】read_op_log 在无 etcd / 列举失败时都静默返回空 Vec,handler 还包
+  CODE_OK ⇒ memory-only manager 对"有没有失败"这个问题回答"没有 op"。改为返回原因,CLI 也
+  改成 fail-loud(原先打印 "(no ops)")。这个洞正是我第一次跑 contract 测试【空转通过】暴露的。
+  render_ops 的 JSON 还漏了 progress_done/progress_total/started_at(文本渲染有、JSON 没有)。
+  contract 测试 examples/dashboard/tests/ops_contract.sh:隔离集群【带 etcd】——故意要求 etcd,
+  因为对 memory-only manager 跑 history 恒空、字段断言会空转通过。
+【未完成:两类 op 仍无进度】
+  1) split / merge:manager 只发一条 RPC(MSG_SPLIT_PART)、活是 PS 干的,所以进度得从 PS 侧
+     经心跳报回来,不是 manager 侧能补的。
+  2) ec / recovery:EN 执行,而 DfResp 目前没有进度通道 —— 要加字段(wire 变更)。
+     两者形状相同,一个字段可同时覆盖。
+【未测】AsyncMergeIterator::block_progress 没有单测:构造 AsyncTableIterator 需要
+  Rc<StreamClient>(async + 要连 manager),本 crate 内没有便宜的接缝;算术是三行、编译期可查,
+  周边压缩路径由既有集成测试覆盖。不编造只跑空 vec 的测试。
+Next steps: 上面两类进度(ec/recovery 需要 DfResp 加字段,需确认 wire 变更)。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (e)
 TaskStatus: completed
 Task scope: EC P1-3 的最后残留——把 payload location 持久化进 .meta,使 EC staging 封存跨重启存活。
