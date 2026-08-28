@@ -7853,6 +7853,40 @@ mod tests {
         assert_eq!(picked.len(), 3);
     }
 
+    /// A dispatch tick that never reached an RPC (every candidate capped by the
+    /// rate limiter) must not be filed as a success: `record_success` DELETES
+    /// the backoff entry, so during a mass fence — exactly when the limiter
+    /// binds — a persistently failing slot would have its 300 s backoff reset
+    /// to 2 s every tick and retry at nearly full rate.
+    #[test]
+    fn deferred_dispatch_leaves_recovery_backoff_intact() {
+        run(async {
+            let m = AutumnManager::new();
+            let (eid, slot, now) = (77u64, 1u32, 1_000i64);
+            for _ in 0..3 {
+                m.recovery_limiter
+                    .borrow_mut()
+                    .record_failure(eid, slot, now, "boom");
+            }
+            assert!(
+                m.recovery_limiter.borrow().in_backoff(eid, slot, now),
+                "precondition: three failures must put the slot in backoff"
+            );
+
+            m.record_dispatch_outcome(eid, slot, now, &Ok(crate::recovery::DispatchOutcome::Deferred));
+            assert!(
+                m.recovery_limiter.borrow().in_backoff(eid, slot, now),
+                "a rate-limited deferral says nothing about this slot — backoff must survive"
+            );
+
+            m.record_dispatch_outcome(eid, slot, now, &Ok(crate::recovery::DispatchOutcome::Dispatched));
+            assert!(
+                !m.recovery_limiter.borrow().in_backoff(eid, slot, now),
+                "an actual dispatch does clear the backoff"
+            );
+        })
+    }
+
     // ── extent-node delete vs in-flight recovery ────────────────────────────
 
     /// dispatch_recovery_task must return Ok without populating recovery_tasks

@@ -122,6 +122,18 @@ pub(crate) fn _test_arm_ec_apply_fail_once() {
     EC_APPLY_FAIL_ONCE.with(|c| c.set(true));
 }
 
+/// What one `dispatch_recovery_task` tick actually did — the distinction the
+/// rate limiter needs, because "we did not try" must not be filed as "we
+/// tried and it worked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchOutcome {
+    /// A target accepted the rebuild (or one was already running).
+    Dispatched,
+    /// Every candidate was capped by the rate limiter and no RPC was
+    /// attempted. Retry next tick; leave backoff accounting alone.
+    Deferred,
+}
+
 impl AutumnManager {
     /// Release markers whose pinned executor can no longer run them — both
     /// Recovery (its target) and ConvertToEc (its coordinator).
@@ -256,10 +268,10 @@ impl AutumnManager {
     ///
     /// Always `Ok`: a re-send is a keep-alive, not an attempt whose failure
     /// should feed the (extent, slot) backoff.
-    async fn redispatch_pinned_recovery(&self, extent_id: u64) -> Result<(), AppError> {
+    async fn redispatch_pinned_recovery(&self, extent_id: u64) -> Result<DispatchOutcome, AppError> {
         let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
             // Raced with a release — the next tick re-derives from scratch.
-            return Ok(());
+            return Ok(DispatchOutcome::Dispatched);
         };
         // Don't spend a timeout on a node the manager already knows is not
         // Online — a keep-alive to a corpse costs the whole dispatch tick, once
@@ -271,7 +283,7 @@ impl AutumnManager {
             .state_of(task.node_id)
             .is_online()
         {
-            return Ok(());
+            return Ok(DispatchOutcome::Dispatched);
         }
         let addr = {
             let s = self.store.inner.borrow();
@@ -280,7 +292,8 @@ impl AutumnManager {
                     let base = Self::normalize_endpoint(&n.address);
                     Self::shard_addr_for_extent(&base, &n.shard_ports, extent_id)
                 }
-                None => return Ok(()), // node gone from the map; offline handling owns it
+                // node gone from the map; offline handling owns it
+                None => return Ok(DispatchOutcome::Dispatched),
             }
         };
         let node_id = task.node_id;
@@ -314,14 +327,14 @@ impl AutumnManager {
                 "recovery re-dispatch unreachable: {e}"
             ),
         }
-        Ok(())
+        Ok(DispatchOutcome::Dispatched)
     }
 
     pub(crate) async fn dispatch_recovery_task(
         &self,
         extent_id: u64,
         replace_id: u64,
-    ) -> Result<(), AppError> {
+    ) -> Result<DispatchOutcome, AppError> {
         // any in-flight stream-layer op on this
         // extent blocks recovery dispatch. This was previously three
         // separate ad-hoc checks (recovery_tasks dedup, ec_conversion_inflight,
@@ -340,7 +353,7 @@ impl AutumnManager {
             Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
                 return self.redispatch_pinned_recovery(extent_id).await;
             }
-            Some(_) => return Ok(()),
+            Some(_) => return Ok(DispatchOutcome::Dispatched),
             None => {}
         }
 
@@ -376,6 +389,10 @@ impl AutumnManager {
         }
 
         let mut rate_limited = false;
+        // Did any candidate get PAST the limiter and still not work out? That
+        // is a real failure and must back off, even if a different candidate
+        // was capped in the same tick (see the deferral check at the tail).
+        let mut attempted = false;
         for candidate in &candidates {
             // gate this (source -> target) dispatch on the rate
             // limiter (reseeded from the ledger at the top of the dispatch
@@ -393,6 +410,7 @@ impl AutumnManager {
                 rate_limited = true;
                 continue;
             }
+            attempted = true;
             let base = Self::normalize_endpoint(&candidate.address);
             // recovery targets a specific extent_id → route to owner shard.
             let addr = Self::shard_addr_for_extent(&base, &candidate.shard_ports, extent_id);
@@ -428,7 +446,7 @@ impl AutumnManager {
                 .await
             {
                 Ok(()) => {}
-                Err(AppError::Precondition(_)) => return Ok(()),
+                Err(AppError::Precondition(_)) => return Ok(DispatchOutcome::Dispatched),
                 Err(other) => return Err(other),
             }
 
@@ -540,16 +558,23 @@ impl AutumnManager {
                     now_ms,
                 );
             }
-            return Ok(());
+            return Ok(DispatchOutcome::Dispatched);
         }
 
-        // if we never reached the RPC because every candidate was
-        // rate-limited, this is a deferral, not a failure. Return Ok so
-        // the dispatch loop records success (no backoff) and retries next
-        // tick once the limiter has headroom. A genuine all-candidates-
-        // RPC-rejected outcome (rate_limited == false) still backs off.
-        if rate_limited {
-            return Ok(());
+        // Never reached an RPC because every candidate was capped: a deferral,
+        // not a failure. It is reported as such — NOT as success — because
+        // success CLEARS the accumulated backoff. During a mass fence, which is
+        // exactly when the limiter binds, treating deferrals as successes reset
+        // a persistently failing slot's 300 s backoff to 2 s every tick, so its
+        // 30 s-timeout dispatches recurred at nearly full tick rate and starved
+        // the sequential dispatch loop.
+        //
+        // `attempted` keeps this honest: if any candidate got past the limiter
+        // and failed, the tick FAILED, however many others were capped —
+        // otherwise one capped candidate would mask every real failure beside
+        // it, and that tick's reason would be recorded nowhere.
+        if rate_limited && !attempted {
+            return Ok(DispatchOutcome::Deferred);
         }
         Err(AppError::Precondition(
             "all recovery candidates rejected".to_string(),
@@ -1236,11 +1261,23 @@ impl AutumnManager {
         extent_id: u64,
         slot: u32,
         now_s: i64,
-        res: &Result<(), AppError>,
+        res: &Result<DispatchOutcome, AppError>,
     ) {
         let mut l = self.recovery_limiter.borrow_mut();
         match res {
-            Ok(()) => l.record_success(extent_id, slot),
+            Ok(DispatchOutcome::Dispatched) => l.record_success(extent_id, slot),
+            // A deferral is neither: the tick never got to try, so it says
+            // nothing about whether this slot is healthy. Touching the backoff
+            // either way would be a lie — clearing it (what `record_success`
+            // does) is the one that hurts, since it lets a failing slot retry
+            // at full rate for as long as the limiter stays saturated.
+            Ok(DispatchOutcome::Deferred) => {
+                tracing::debug!(
+                    extent_id,
+                    slot,
+                    "recovery dispatch deferred (every candidate rate-limited); backoff untouched"
+                );
+            }
             // Capture WHY it failed so `recovery-stats`
             // can show the reason, not just a count. Pre-this the call
             // sites passed `res.is_ok()` and the error was discarded.
