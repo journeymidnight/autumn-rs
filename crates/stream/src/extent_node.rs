@@ -4,7 +4,7 @@ use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
@@ -931,6 +931,11 @@ pub(crate) struct ExtentEntry {
     /// already reclaimed. `holds_payload` reads this, so a read naming `.dat`
     /// on a shard-only holder is refused instead of resurrecting an empty file.
     has_dat: AtomicBool,
+    /// `extent_rpc::PayloadLocation` as a byte — which file holds this node's
+    /// payload, as last told by the manager and PERSISTED in `.meta`.
+    /// `InShardFile` means the conversion committed here, which is what
+    /// `load_extents` re-derives the EC staging seal from after a restart.
+    payload_location: AtomicU8,
     /// The shard indices this node holds files for.
     ///
     /// The shard files this node holds, `index -> byte length`.
@@ -1285,6 +1290,18 @@ struct LocalExtentMeta {
     owner_epoch: i64,
     sealed: bool,
     avali: u32,
+    /// Which file holds this node's payload for the extent
+    /// (`extent_rpc::PayloadLocation` as a byte).
+    ///
+    /// Durable because it is the only thing that survives a restart to say an
+    /// EC conversion COMMITTED here. The staged shard file becomes the live
+    /// one at the manager's layout flip — there is no rename — so after the
+    /// flip no attempt may write it again. That refusal is driven by an
+    /// in-memory seal, which a restart would otherwise drop, reopening the
+    /// window for a superseded coordinator's late stripe to overwrite live
+    /// data. V0/V1 records and every extent written before this field read as
+    /// `InDat`, which is the documented default.
+    payload_location: u8,
 }
 
 // ─── ConcurrencyController ──────────────────────────────────
@@ -3650,12 +3667,39 @@ impl ExtentNode {
                     // accepted and written straight over live data. Seal instead:
                     // staging for this extent is closed for good.
                     //
-                    // RESIDUAL: `ec_stage_nonce` is in-memory, so a restart of
-                    // THIS node reopens the window until its next reconcile
-                    // round re-seals. Closing that needs a durable per-node
-                    // record of the payload location; `.meta` has no such field
-                    // today, and adding one is a persistent-format change.
                     self.seal_ec_staging(p.extent_id);
+                    // And make the seal survive a restart. The seal itself is
+                    // in-memory; `.meta`'s payload_location is what
+                    // `discover_shard_files` re-derives it from on the next
+                    // boot. Written only on the transition — a reconcile round
+                    // repeats this verdict every few minutes and re-fsyncing
+                    // `.meta` each time would be pure I/O.
+                    let already = entry.payload_location.load(Ordering::SeqCst)
+                        == PayloadLocation::InShardFile.as_byte();
+                    if !already {
+                        entry
+                            .payload_location
+                            .store(PayloadLocation::InShardFile.as_byte(), Ordering::SeqCst);
+                        // Never write `.meta` for a quarantined extent:
+                        // `save_meta` would silently clear the quarantine and
+                        // bypass the fail-closed contract.
+                        if entry.corrupt_meta.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                extent_id = p.extent_id,
+                                "layout committed to a shard file but `.meta` is quarantined — \
+                                 the staging seal holds in memory only until recovery rebuilds it"
+                            );
+                        } else if let Err(e) = self.save_meta(p.extent_id, &entry).await {
+                            // Not fatal: the in-memory seal is already in place,
+                            // and the next reconcile round retries the persist.
+                            tracing::warn!(
+                                extent_id = p.extent_id,
+                                error = %e,
+                                "could not persist the committed payload location \
+                                 (retried next sweep); the staging seal is in memory meanwhile"
+                            );
+                        }
+                    }
                 }
                 PayloadLocation::InDat => {}
             }
@@ -3969,6 +4013,7 @@ impl ExtentNode {
         // `sealed_length > 0 ⇒ sealed` at write time.
         let sealed = entry.sealed.load(Ordering::SeqCst) || sealed_length > 0;
         let avali = entry.avali.load(Ordering::SeqCst);
+        let payload_location = entry.payload_location.load(Ordering::SeqCst);
 
         // P0-C: always write V2 (52 bytes with CRC32C trailer over [0..48]).
         let mut buf = [0u8; Self::META_SIZE_V2];
@@ -3978,7 +4023,8 @@ impl ExtentNode {
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
         buf[32..40].copy_from_slice(&owner_epoch.to_le_bytes());
         buf[40] = u8::from(sealed);
-        // buf[41..44] reserved padding (left zero).
+        buf[41] = payload_location;
+        // buf[42..44] reserved padding (left zero).
         buf[44..48].copy_from_slice(&avali.to_le_bytes());
         let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V2 - 4]);
         buf[48..52].copy_from_slice(&crc.to_le_bytes());
@@ -4126,12 +4172,19 @@ impl ExtentNode {
         // invariant `sealed_length > 0 ⇒ sealed` is enforced on the V2 path
         // too (a corrupt-but-CRC-valid record claiming long-but-unsealed is
         // upgraded to sealed, fail-closed).
-        let (sealed, avali) = if v2 {
+        let (sealed, avali, payload_location) = if v2 {
             let sealed = buf[40] != 0 || sealed_length > 0;
             let avali = u32::from_le_bytes(buf[44..48].try_into().ok()?);
-            (sealed, avali)
+            // buf[41] was reserved padding, so it is 0 — i.e. InDat — in every
+            // record written before the field existed. Same layout, same size,
+            // same CRC coverage: no migration, no version bump.
+            (sealed, avali, buf[41])
         } else {
-            (sealed_length > 0, if sealed_length > 0 { 1 } else { 0 })
+            (
+                sealed_length > 0,
+                if sealed_length > 0 { 1 } else { 0 },
+                autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT,
+            )
         };
         Some(LocalExtentMeta {
             sealed_length,
@@ -4139,6 +4192,7 @@ impl ExtentNode {
             owner_epoch,
             sealed,
             avali,
+            payload_location,
         })
     }
 
@@ -4199,6 +4253,7 @@ impl ExtentNode {
                     owner_epoch: 0,
                     sealed: false,
                     avali: 0,
+                    payload_location: autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT,
                 };
                 let (meta, corrupt_meta) = match compio::fs::read(disk.meta_path(extent_id)).await {
                     Ok(buf) => match Self::parse_meta(&buf, extent_id) {
@@ -4240,6 +4295,7 @@ impl ExtentNode {
                     extent_id,
                     Rc::new(ExtentEntry {
                         has_dat: AtomicBool::new(true),
+                        payload_location: AtomicU8::new(meta.payload_location),
                         shard_files: RefCell::new(Default::default()),
                         // at startup, do NOT keep SEALED extents'
                         // fds resident — that was the O(all-extents) open-fd
@@ -4346,9 +4402,11 @@ impl ExtentNode {
                     owner_epoch: 0,
                     sealed: false,
                     avali: 0,
+                    payload_location: autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT,
                 });
                 let entry = Rc::new(ExtentEntry {
                     has_dat: AtomicBool::new(false),
+                    payload_location: AtomicU8::new(meta.payload_location),
                     shard_files: RefCell::new(Default::default()),
                     file: RefCell::new(None),
                     extent_id,
@@ -4379,6 +4437,31 @@ impl ExtentNode {
                     "loaded shard-only extent (no .dat on this node)"
                 );
             }
+        }
+
+        // Re-derive the EC staging seal from what `.meta` says. `InShardFile`
+        // means the manager flipped this extent's layout, so the file every
+        // attempt was staging into is now the LIVE shard and no attempt may
+        // write it again. The seal itself is in-memory; without this pass a
+        // restart would drop it and reopen the window for a superseded
+        // coordinator's late stripe to overwrite live data.
+        let sealed: Vec<u64> = self
+            .extents
+            .iter()
+            .filter(|e| {
+                e.value().payload_location.load(Ordering::SeqCst)
+                    == autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE
+            })
+            .map(|e| *e.key())
+            .collect();
+        for extent_id in &sealed {
+            self.seal_ec_staging(*extent_id);
+        }
+        if !sealed.is_empty() {
+            tracing::info!(
+                count = sealed.len(),
+                "EC staging sealed on load for extents whose layout is committed to a shard file"
+            );
         }
     }
 
@@ -4885,6 +4968,9 @@ impl ExtentNode {
             extent_id,
             Rc::new(ExtentEntry {
                 has_dat: AtomicBool::new(true),
+                // A freshly created extent holds its payload in `.dat`; a
+                // conversion only ever moves it via the manager's layout flip.
+                payload_location: AtomicU8::new(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT),
                 shard_files: RefCell::new(Default::default()),
                 // freshly-allocated OPEN extent — pinned resident.
                 file: RefCell::new(Some(Rc::new(file))),
@@ -6896,6 +6982,9 @@ impl ExtentNode {
             req.extent_id,
             Rc::new(ExtentEntry {
                 has_dat: AtomicBool::new(true),
+                // A freshly created extent holds its payload in `.dat`; a
+                // conversion only ever moves it via the manager's layout flip.
+                payload_location: AtomicU8::new(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT),
                 shard_files: RefCell::new(Default::default()),
                 // freshly-created local extent (copy/recovery) —
                 // pinned resident; it's actively being written.
@@ -9285,6 +9374,55 @@ mod ec_lock_tests {
 mod meta_crc_tests {
     use super::*;
 
+    /// `payload_location` rides in what used to be reserved padding — same
+    /// size, same magic, same CRC coverage — so every record written before
+    /// the field has a zero there, which IS `InDat`, the documented default.
+    /// That is what makes this a same-layout change with no migration.
+    #[test]
+    fn v2_payload_location_round_trips_and_old_records_read_as_in_dat() {
+        let extent_id = 0xdead_beef_cafe_0043u64;
+        let build_v2 = |loc_byte: u8| {
+            let mut buf = [0u8; ExtentNode::META_SIZE_V2];
+            buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V2);
+            buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+            buf[16..24].copy_from_slice(&4096u64.to_le_bytes()); // sealed_length
+            buf[24..32].copy_from_slice(&7u64.to_le_bytes()); // eversion
+            buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // owner_epoch
+            buf[40] = 1; // sealed
+            buf[41] = loc_byte;
+            buf[44..48].copy_from_slice(&3u32.to_le_bytes()); // avali
+            let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V2 - 4]);
+            buf[48..52].copy_from_slice(&crc.to_le_bytes());
+            buf
+        };
+
+        let parsed = ExtentNode::parse_meta(
+            &build_v2(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE),
+            extent_id,
+        )
+        .expect("V2 parse");
+        assert_eq!(
+            parsed.payload_location,
+            autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE
+        );
+
+        // A pre-field record: the byte is whatever the old writer left, i.e. 0.
+        let parsed = ExtentNode::parse_meta(&build_v2(0), extent_id).expect("V2 parse");
+        assert_eq!(
+            parsed.payload_location,
+            autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT,
+            "a record from before the field must read as InDat, never as committed"
+        );
+
+        // The field is inside the CRC'd region, so flipping it is detected.
+        let mut tampered = build_v2(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT);
+        tampered[41] = autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE;
+        assert!(
+            ExtentNode::parse_meta(&tampered, extent_id).is_none(),
+            "payload_location is CRC-protected like every other field"
+        );
+    }
+
     /// round-trip through V1 meta save/parse with CRC validation.
     #[test]
     fn v1_round_trip() {
@@ -10454,6 +10592,76 @@ mod recovery_idempotence_tests {
         let resp = node.handle_delete_extent(del("uuid-this-node")).await.expect("call");
         assert_eq!(decode_code(&resp).0, CODE_OK, "the addressed node must proceed");
         assert!(!path.exists(), "the extent file must be gone");
+    }
+
+    /// The staging seal must survive a RESTART of the target node.
+    ///
+    /// The seal itself is in-memory, so before `.meta` carried the payload
+    /// location a reboot dropped it: until the next reconcile round re-sealed
+    /// (up to 5 minutes) a superseded coordinator's late stripe was accepted
+    /// again and overwrote the committed shard. This is the same scenario as
+    /// `superseded_write_shard_after_the_flip_overwrites_the_live_shard`, with
+    /// a restart inserted between the flip and the zombie's retry.
+    #[compio::test]
+    async fn the_ec_staging_seal_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let eid = 4243u64;
+        let live = Bytes::from_static(b"WINNING-ATTEMPT-SHARD-BYTES");
+        let ws = |nonce: u64, payload: Bytes| {
+            WriteShardReq {
+                extent_id: eid,
+                shard_index: 0,
+                sealed_length: 4096,
+                eversion: 2,
+                owner_epoch: 0,
+                shard_offset: 0,
+                attempt_nonce: nonce,
+                payload,
+            }
+            .encode()
+        };
+
+        let shard_path = {
+            let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+                .await
+                .expect("node");
+            let resp = node.handle_write_shard(ws(100, live.clone())).await.expect("stage");
+            assert_eq!(
+                WriteShardResp::decode(resp).expect("decode").code,
+                CODE_OK,
+                "the winning attempt must be able to stage"
+            );
+            node.apply_placements(&[manager_rpc::ExtentPlacement {
+                extent_id: eid,
+                payload_location: PayloadLocation::InShardFile.as_byte(),
+                shard_index: 0,
+            }])
+            .await;
+            let entry = node.ensure_extent(eid).await.expect("entry");
+            node.disk_for(entry.disk_id).expect("disk").shard_path(eid, 0)
+        };
+
+        // Restart: a fresh node over the same data dir, with no memory of the
+        // flip beyond what `.meta` records.
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("restarted node");
+
+        let resp = node
+            .handle_write_shard(ws(99, Bytes::from_static(b"ZOMBIE-OVERWRITE-BYTES!!!!!")))
+            .await
+            .expect("late write");
+        let on_disk = std::fs::read(&shard_path).expect("read shard");
+        assert_eq!(
+            on_disk,
+            live.to_vec(),
+            "after a restart the committed shard must still be intact"
+        );
+        assert_eq!(
+            WriteShardResp::decode(resp).expect("decode").code,
+            CODE_LOCKED_BY_OTHER,
+            "the seal must be re-derived from `.meta` on load, not lost with the process"
+        );
     }
 
     fn decode_code(resp: &Bytes) -> (u8, String) {

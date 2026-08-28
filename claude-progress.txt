@@ -30,6 +30,29 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-28 (e)
+TaskStatus: completed
+Task scope: EC P1-3 的最后残留——把 payload location 持久化进 .meta,使 EC staging 封存跨重启存活。
+【为什么能零迁移】.meta V2 是定长 52 字节,其中 [41..44] 是保留填充、恒为 0;而
+  PayloadLocation::InDat == 0 且文档早已写明它是"该字段出现之前所有 extent 的默认值"。
+  于是新字段占 buf[41] —— 同大小、同 magic、同 CRC 覆盖范围(crc 覆盖 [0..48]),老记录读出来
+  就是 InDat。符合仓库规则"要么同布局要么带迁移"的前一种,不需要 reset、不需要版本位。
+【接线】① write_meta_locked 写 entry.payload_location;② parse_meta 读 buf[41](V0/V1 恒 InDat);
+  ③ ExtentEntry 加 AtomicU8 字段,四处构造点填好;④ discover_shard_files 收尾统一扫一遍,
+  凡 InShardFile 就 seal_ec_staging —— 一处覆盖 .dat 与 shard-only 两条加载路径;
+  ⑤ apply_placements 的 InShardFile arm 落地时 store + save_meta,【只在状态翻转时写】
+  (该判决每轮 reconcile 都会重复,每次刷盘纯属浪费),且【隔离态不写】(save_meta 会静默清掉
+  quarantine,违反 fail-closed 契约)。
+【测试】the_ec_staging_seal_survives_a_restart:staged→flip→【重启】→僵尸 nonce 重放,
+  断言先验磁盘字节再验拒绝码。非空转已验:让 parse_meta 忽略 buf[41] 后,重启后线上 shard
+  确实被覆盖成 ZOMBIE-OVERWRITE-BYTES。另加 meta 编解码测试:V2 往返、老记录读作 InDat、
+  篡改该字节被 CRC 抓住。
+【验证】stream lib 115(113+2)、manager 296、rpc 60、ps 212、common 15、client 41;
+  stream 16 个测试二进制;ec_integration/ec_failover/offline_reconcile/system_extent_recovery/
+  physical_deletion/e2e_lifecycle/update_stream_ec 全绿;system_chaos 7/7;clippy 干净。
+  stream CLAUDE.md 的 .meta 布局表原先只画到 V1(早已过时),按现状重写为 V2。
+Next steps: 无待办。EC 评审全部条目至此关闭。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (d)
 TaskStatus: completed
 Task scope: 评审剩余 11 项全部处理完毕(EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、

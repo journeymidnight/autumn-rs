@@ -1509,6 +1509,19 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   and the WARN must appear; naming the node's own uuid must unlink it.
 #   Unit-level equivalent:
 #   `cargo test -p autumn-stream --lib delete_extent_refuses`.
+# EC staging seal is durable (.meta payload_location)
+# What to expect: after the manager flips an extent's layout to a shard file,
+#   the owning EN persists that in `.meta` byte 41 and refuses any further
+#   WriteShard for it — `write_shard from a SUPERSEDED conversion attempt` at
+#   WARN, or a bare refusal once sealed. On boot the EN logs
+#   `EC staging sealed on load ...` with the count it re-derived. A count of 0
+#   on a node that holds shard files means the flip never reached its `.meta`
+#   (check for the quarantine warning next to it) — the seal then holds only in
+#   memory until the next reconcile round re-persists it.
+# Manual check: convert an extent, confirm `.meta` byte 41 == 1 on a target
+#   (`xxd -s 41 -l 1 <disk>/<hash>/extent-<id>.meta`), restart that EN, and
+#   confirm the boot log reports it sealed. Unit-level equivalent:
+#   `cargo test -p autumn-stream --lib the_ec_staging_seal_survives_a_restart`.
 ```
 
 ## Rolling restart & upgrade versioning

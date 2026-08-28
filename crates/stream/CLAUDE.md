@@ -38,16 +38,33 @@ created on-demand (matches the 256 subdirs `autumn-op format` creates).
 
 Each extent file pair:
 - `extent-{id}.dat` — raw data (append-only during active use)
-- `extent-{id}.meta` — 40-byte binary sidecar (+ CRC trailer in V1):
+- `extent-{id}.meta` — 52-byte binary sidecar. V2 is what every write emits;
+  V0 (40 B, no CRC) and V1 (44 B) are still parsed for records written before
+  it, and derive `sealed` / `avali` from `sealed_length > 0`.
 
 | Bytes | Field |
 |-------|-------|
-| 0–7 | Magic: `EXTMETA\0` (V0) or `EXTMETA\x01` (V1) |
+| 0–7 | Magic: `EXTMETA\0` (V0), `EXTMETA\x01` (V1), `EXTMETA\x02` (V2) |
 | 8–15 | `extent_id` (le u64) |
 | 16–23 | `sealed_length` (le u64) |
 | 24–31 | `eversion` (le u64) |
 | 32–39 | `owner_epoch` (le i64) |
-| 40–43 | CRC32C of bytes 0–39 (V1 only) |
+| 40 | `sealed` flag (V2) |
+| 41 | `payload_location` — `PayloadLocation` as a byte (V2) |
+| 42–43 | reserved, zero |
+| 44–47 | `avali` (le u32) (V2) |
+| 48–51 | CRC32C of bytes 0–47 (V2; V1 puts a CRC of 0–39 at 40–43) |
+
+`payload_location` is the durable answer to "did an EC conversion COMMIT here",
+and it is the reason a restart cannot reopen the overwrite window: the manager's
+layout flip is the only commit point and there is no rename, so the staged shard
+file BECOMES the live one, after which no attempt may write it. That refusal
+runs off an in-memory seal (`EC_STAGING_SEALED`), which `discover_shard_files`
+re-derives from this byte on every boot. It rides in what was reserved padding —
+same size, same magic, same CRC coverage — so a record written before the field
+has a zero there, which IS `InDat`, the documented default: same layout, no
+migration. Written only on the InDat→InShardFile transition, never on a
+quarantined extent (`save_meta` would silently clear the quarantine).
 
 `ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the
 first online **allocatable** disk. `df()` returns real `statvfs` stats per disk.
