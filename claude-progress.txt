@@ -30,6 +30,34 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-29
+TaskStatus: completed
+Task scope: 换 seed 重跑 chaos。结果:抓到并修掉一个 liveness wedge (abca022)。
+【4 个随机 seed 全过】20260829/777/31337/4242,各 400 keys、in-flight verify errors=0。
+  seed 4242 的 399 keys 不是丢数据:4 个 PUT 超时被正确丢出预期集(超时=结果不确定),
+  reads miss=0。
+【覆盖面不够,补定向】随机 nemesis 很少抽到 EC:4 个 seed 里只有 31337 抽到一次,而且
+  【被跳过】("no sealed extents")。纯 ec 动作集 9 次全跳 —— 因为只有滚动才封口,60s 跑不出滚动。
+  必须配 split/merge/gc 才有 sealed extent 可转。
+【抓到的 bug】ec,kill,split,merge,gc 组合下:一个 EC 转换永不完成,每 5s 重派发,
+  WriteShard 恒被拒 req_owner_epoch=24 / local_owner_epoch=27;marker 永久 pinned,
+  该 extent GC 一直被拒 = 无界泄漏。【无数据丢失】(mismatches=0 not_found=0),是 liveness。
+  根因:dispatch_owner_epoch_for_extent 返回【第一个】引用该 extent 的 partition 的 epoch,
+  而 split/merge 后 extent 是 CoW 共享 —— 两个 partition 各持 owner lock,EN 围栏由实际写者
+  抬高,取到另一个就低于围栏;重派发又解析到同一个错 partition ⇒ 永不收敛。
+  "第一个"取决于 HashMap 迭代序,所以只在 split/merge 共享过该 extent 时复现。
+  【不是本轮回归】该函数来自上一轮 4040dbe(修的是"marker 建时冻结"那一半),今天没 commit
+  碰过派发路径。修 = 取 MAX(围栏只升不降;单 partition 时行为不变)。
+  单测 cow_shared_extent_resolves_to_the_highest_owner_epoch 确定性复现(返回 24 应为 27)。
+【修后验证】同一 seed+动作组合转绿:invariants OK 400 keys、in-flight errors=0、
+  stale owner_epoch 拒绝 0 次、EC convert failed 0 次、reclaimed 8 extents(wedge 那轮 0)。
+  4 个原 seed 全部重跑通过;manager lib 298。
+【运维事实(已写进 ops.md)】① 一轮 chaos 烧掉约 5 万个回环临时端口,TIME-WAIT 各约 60s 回收
+  ⇒ 连跑必须等回收(门限 <2000),否则 EADDRNOTAVAIL 被 verify 读成 wedged partition,
+  表现为"几乎所有 key not_found 且 mismatches=0"——那是端口耗尽的指纹,不是丢数据。
+  ② EcConvert nemesis 需要先有 sealed extent,单独跑 ec 动作集等于什么都没测。
+Next steps: 无待办。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-28 (g)
 TaskStatus: completed
 Task scope: op 可观测性收口——按用户定调:split/merge/rebalance 一步操作【不做进度、结果进日志】;

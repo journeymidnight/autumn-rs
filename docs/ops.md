@@ -1552,6 +1552,17 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   ~5 s in (the marker is acquired before encoding starts, so `--` first),
 #   advance one 64 MiB stripe at a time, and land on 100% at SUCCEEDED. The
 #   denominator is THIS node's shard, ceil(extent / K), not the whole extent.
+# chaos: pacing between runs is MANDATORY
+# One `system_chaos` run burns ~50k loopback ephemeral ports, and TIME-WAIT
+#   decays over ~60 s each — so back-to-back runs hit EADDRNOTAVAIL mid-run and
+#   the verify reads that as a wedged partition: `not_found` on nearly every
+#   key with `mismatches=0`. That shape is port exhaustion, NOT data loss (real
+#   loss shows mismatches, or a SUBSET of not_founds). Gate each run on
+#   `ss -tan | grep -c TIME-WAIT` < ~2000 and WAIT for the drain, don't skip.
+# chaos: the EcConvert nemesis needs something to seal an extent first — it
+#   logs "skipped — no sealed extents" otherwise, so an `ec`-only action list
+#   converts nothing. Pair it with split/merge/gc (they roll streams), e.g.
+#   `AUTUMN_CHAOS_ACTIONS=ec,kill,split,merge,gc`.
 # Known harness note: only a ROLL seals an extent — restarting the PS replays
 #   and keeps appending to the same open tail. And `autumn-client perf-check`
 #   does not exit reliably once the log extent rolls (the cluster is fine
