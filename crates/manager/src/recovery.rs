@@ -78,6 +78,17 @@ pub(crate) fn dispatch_owner_epoch_for_extent(
     state: &autumn_common::store::MetadataState,
     extent_id: u64,
 ) -> i64 {
+    // The MAX over every partition that references this extent, not the first
+    // one found. After a split or a merge the extent is CoW-SHARED, so two
+    // partitions carry it on their streams with independent owner locks — and
+    // the EN's per-extent fence floor is raised by whichever of them writes.
+    // Returning the other one's epoch hands the coordinator a value below the
+    // floor, every WriteShard answers CODE_LOCKED_BY_OTHER, and because the
+    // re-dispatch resolves the same wrong partition again it never converges:
+    // the marker stays pinned and that extent's GC is refused for good.
+    // Fencing floors only rise, so the max is the safe answer, and it is
+    // unchanged when a single partition references the extent.
+    let mut epoch = 0;
     for part in state.partitions.values() {
         let streams = [part.log_stream, part.row_stream, part.meta_stream];
         for sid in streams {
@@ -88,11 +99,12 @@ pub(crate) fn dispatch_owner_epoch_for_extent(
                 .unwrap_or(false)
             {
                 let key = format!("partition/{}", part.part_id);
-                return state.owner_epochs.get(&key).copied().unwrap_or(0);
+                epoch = epoch.max(state.owner_epochs.get(&key).copied().unwrap_or(0));
+                break;
             }
         }
     }
-    0
+    epoch
 }
 
 /// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
@@ -2690,6 +2702,52 @@ mod ec_dispatch_owner_epoch_tests {
         );
         s.owner_epochs.insert(format!("partition/{PART}"), epoch);
         s
+    }
+
+    /// A CoW-shared extent: after a split (or merge) the SAME extent is on two
+    /// partitions' streams, each with its own owner lock. The EN's per-extent
+    /// fence floor is raised by whichever owner writes, so resolving to the
+    /// OTHER partition's epoch hands the coordinator a stale value and every
+    /// WriteShard comes back `CODE_LOCKED_BY_OTHER` — forever, because the
+    /// re-dispatch keeps resolving the same wrong partition. Observed live
+    /// (chaos, ec+kill+split+merge): `req_owner_epoch=24 local_owner_epoch=27`,
+    /// re-dispatched every 5 s, the marker pinned and that extent's GC refused
+    /// for the rest of the run.
+    ///
+    /// Fencing floors only rise, so the MAX across the partitions that
+    /// reference the extent is the only safe answer — and it is unchanged when
+    /// just one references it.
+    #[test]
+    fn cow_shared_extent_resolves_to_the_highest_owner_epoch() {
+        let mut s = state_at(24);
+        // The split child: its own log stream also carries EXTENT (CoW), and it
+        // holds the newer owner lock.
+        const CHILD: u64 = 9002;
+        s.streams.insert(
+            4,
+            MgrStreamInfo {
+                stream_id: 4,
+                extent_ids: vec![EXTENT],
+                ..Default::default()
+            },
+        );
+        s.partitions.insert(
+            CHILD,
+            MgrPartitionMeta {
+                part_id: CHILD,
+                log_stream: 4,
+                row_stream: 5,
+                meta_stream: 6,
+                rg: None,
+            },
+        );
+        s.owner_epochs.insert(format!("partition/{CHILD}"), 27);
+
+        assert_eq!(
+            dispatch_owner_epoch_for_extent(&s, EXTENT),
+            27,
+            "must not depend on which partition is visited first"
+        );
     }
 
     /// The regression. The epoch is re-acquired — and bumped — on every
