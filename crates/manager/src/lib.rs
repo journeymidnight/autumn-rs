@@ -2154,13 +2154,35 @@ impl AutumnManager {
                 };
                 match self.handle_force_ec_convert(rkyv_encode(&req)).await {
                     Ok(bytes) => match rkyv_decode::<ForceEcConvertResp>(&bytes) {
-                        Ok(resp) if resp.code == CODE_OK => ActuationResult::Dispatched {
-                            message: if resp.message.is_empty() {
+                        Ok(resp) if resp.code == CODE_OK => {
+                            // CODE_OK is idempotent-OK, and covers a shape where
+                            // NOTHING was started: the extent is already
+                            // converted. `Dispatched` leaves the entry RUNNING
+                            // for `apply_ec_conversion_done` to close — and for
+                            // an already-converted extent that call never comes,
+                            // so the entry runs forever (EC is not in
+                            // `sweep_running_ttl`'s kinds either, so it never
+                            // even ages to UNKNOWN).
+                            //
+                            // Ask the MARKER whether a conversion is actually in
+                            // flight, not the response message — message
+                            // matching is how classifiers drift out of step with
+                            // their producers.
+                            let message = if resp.message.is_empty() {
                                 "ec conversion started".to_string()
                             } else {
                                 resp.message
-                            },
-                        },
+                            };
+                            if self.extent_inflight_payload_ec(spec.secondary_id).is_some() {
+                                ActuationResult::Dispatched { message }
+                            } else {
+                                ActuationResult::Terminal {
+                                    state: OP_STATE_SUCCEEDED,
+                                    error: String::new(),
+                                    message,
+                                }
+                            }
+                        }
                         Ok(resp) => terminal_err(resp.message),
                         Err(e) => terminal_err(format!("decode ec resp: {e}")),
                     },
@@ -7945,6 +7967,73 @@ mod tests {
                 !m.recovery_limiter.borrow().in_backoff(eid, slot, now),
                 "an actual dispatch does clear the backoff"
             );
+        })
+    }
+
+    /// Submitting an EC convert for an ALREADY-converted extent must close its
+    /// ledger entry, not leave it RUNNING.
+    ///
+    /// `handle_force_ec_convert` answers CODE_OK for that case — correct as an
+    /// idempotent RPC — but CODE_OK was mapped to `Dispatched`, which parks the
+    /// entry waiting for `apply_ec_conversion_done`. That call never comes for
+    /// an extent nobody is converting, and EC is not one of
+    /// `sweep_running_ttl`'s kinds, so the entry never even ages to UNKNOWN:
+    /// `ops list --active` shows a phantom conversion until the ring evicts it.
+    ///
+    /// Found by chaos: rounds with TWO EcConvert events failed with
+    /// `inflight_errors=1` (seeds 110005, 110010) while rounds with one passed —
+    /// the second submit lands after the first has closed, so it does not
+    /// attach, and the extent is converted by then.
+    #[test]
+    fn ec_convert_on_an_already_converted_extent_does_not_park_the_op() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 12u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.extents.insert(
+                    extent_id,
+                    MgrExtentInfo {
+                        extent_id,
+                        sealed_length: 4096,
+                        sealed: true,
+                        ec_converted: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            let spec = OpSubmitReq {
+                kind: OP_KIND_EC_CONVERT,
+                secondary_id: extent_id,
+                extent_ids: vec![extent_id],
+                requested_by: "cli".to_string(),
+                ..Default::default()
+            };
+            let (op_id, _) = m.ops.borrow_mut().submit(
+                spec.kind,
+                spec.part_id,
+                spec.secondary_id,
+                spec.extent_ids.clone(),
+                spec.requested_by.clone(),
+                0,
+                1,
+            );
+            m.run_submitted_op(op_id, spec).await;
+
+            let rec = m
+                .ops
+                .borrow()
+                .query(&OpQueryReq {
+                    op_id,
+                    ..Default::default()
+                })
+                .remove(0);
+            assert_ne!(
+                rec.state, OP_STATE_RUNNING,
+                "an op that started nothing must not be left RUNNING: {}",
+                rec.message
+            );
+            assert_eq!(rec.state, OP_STATE_SUCCEEDED);
         })
     }
 
