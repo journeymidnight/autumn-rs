@@ -30,6 +30,30 @@ Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比
   (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
 Next steps: 无。
 
+Date: 2026-08-30
+TaskStatus: completed
+Task scope: chaos 多轮 soak(10 轮:5 随机全动作 + 5 定向组合)。结果 8 过 2 挂,
+  两次失败同一根因,已修 (efbb28e)。
+【失败指纹高度一致】两轮都是 inflight_errors=1、其余全零(mismatches/not_found/range/
+  accounting/reclaim 都是 0),且都恰好有【2 次 EcConvert】;只有 1 次 EcConvert 的轮次全过。
+  这个"失败轮 vs 通过轮的唯一差异"直接把假设钉死,不用猜。
+【根因】第二次提交发生在第一次转换【已关闭之后】⇒ 不 attach ⇒ 新建 ledger 条目;
+  而此时 extent 已是 EC,handle_force_ec_convert 回 CODE_OK "already ec_converted"
+  (作为幂等 RPC 正确),但 actuation 把所有 CODE_OK 一律映射成 Dispatched ⇒ 条目停在 RUNNING,
+  等一个永不到来的 apply_ec_conversion_done。而 sweep_running_ttl 只覆盖 compact/gc/forcegc,
+  EC 连 30 分钟翻 UNKNOWN 都轮不到,只能等 256 环淘汰 ⇒ ops list --active 里长期挂着幽灵转换。
+  修 = 问【marker】是否真有转换在飞,而不是读响应消息(消息匹配正是本 session 已经修过一次的
+  分类器漂移反模式)。无数据面影响,是 ledger 卫生问题。
+【一个被我自己否掉的改动】同时把 complete_by_extent 改成关闭该 extent 的【全部】active 条目,
+  然后撤销了:submit 在条目 active 时会 attach,所以两个 active 条目根本不可能共存 ——
+  我为它写的测试在【未修复的代码上也通过】,正是这一点暴露了它是死代码。
+【测试】ec_convert_on_an_already_converted_extent_does_not_park_the_op 走真实路径
+  (run_submitted_op),旧映射下失败并报 "extent 12 already ec_converted"。
+  两个失败 seed 重跑转绿,且触发条件仍在(各 2 次 EcConvert)、in-flight verify 零错。
+【本轮 soak 覆盖】EcConvert 出现在 7/10 轮(定向组合是关键——纯随机约 1/4 命中率,
+  纯 ec 动作集则因"无 sealed extent"全跳过)。manager lib 299。
+Next steps: 无待办。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-29
 TaskStatus: completed
 Task scope: 换 seed 重跑 chaos。结果:抓到并修掉一个 liveness wedge (abca022)。
