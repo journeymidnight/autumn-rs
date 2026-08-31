@@ -596,6 +596,11 @@ function openNode(id){
 // only place a FAILURE REASON survives; that is why a failed row shows its
 // error in full rather than truncating it like a running row's message.
 function opsTarget(o){
+  // `secondary_id` means different things per kind, so the arrow form is not
+  // universal: for merge it is survivor->victim, but for the extent-scoped
+  // kinds part_id is 0 and secondary_id is an EXTENT — rendering those as
+  // "0->12" reads like a partition move that never happened.
+  if(o.kind === "ec-convert" || o.kind === "recovery") return `extent ${o.secondary_id}`;
   if(o.secondary_id) return `${o.part_id}\u2192${o.secondary_id}`;
   return o.part_id ? String(o.part_id) : "\u2014";
 }

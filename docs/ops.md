@@ -1546,6 +1546,10 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   reporting a percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
 #   `bash examples/dashboard/tests/ops_contract.sh`.
+#   Dashboard: the panel shows the same numbers — verified live through
+#   GET /api/ops during a conversion (18.6% → 37.2% → 55.8% → 74.4%, then
+#   `succeeded 100%` in history). Render check without a cluster:
+#   `node examples/dashboard/tests/render_check.js`.
 #   LIVE EC-conversion progress: `bash scripts/ec_convert_progress.sh` — spins a
 #   4-EN cluster (EC 3+1 needs four targets), rolls a 1 GiB log extent, converts
 #   it and polls once a second. Measured 2026-08-28 on loopback: samples appear

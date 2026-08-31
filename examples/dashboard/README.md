@@ -90,3 +90,16 @@ record carries the progress counts and the error text):
 cargo build --workspace
 bash examples/dashboard/tests/ops_contract.sh
 ```
+
+Render check (no cluster, no browser) — lifts the panel's own functions out of
+`index.html` at run time and feeds them a real `/api/ops` payload, asserting an
+operator gets the percentage AND the raw counts, the bar width, the right
+target for each kind, and a failed row's reason:
+
+```bash
+node examples/dashboard/tests/render_check.js
+```
+
+Measured live (1 GiB extent, EC 3+1): `/api/ops` carried
+`ec-convert running 18.6% → 37.2% → 55.8% → 74.4%`, then the op moved to
+`history` as `succeeded 100%`.
