@@ -173,7 +173,14 @@ fn main() -> Result<()> {
                 let mut state = match connect.await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!(error = %e, "failed to connect to cluster");
+                        // `{:#}` (anyhow's alternate Display) walks the cause
+                        // chain. Plain `%e` prints only the outermost context,
+                        // which turns every connect failure into the same
+                        // uninformative line — a wire-version mismatch, a
+                        // rejected credential and an unreachable manager all
+                        // looked identical, and one of them cost a long
+                        // misdirected authz investigation.
+                        tracing::error!(error = %format_args!("{e:#}"), "failed to connect to cluster");
                         return;
                     }
                 };
@@ -202,7 +209,7 @@ fn main() -> Result<()> {
                     )
                     .await
                 {
-                    tracing::error!(error = %e, "cluster did not become ready in 60s");
+                    tracing::error!(error = %format_args!("{e:#}"), "cluster did not become ready in 60s");
                     return;
                 }
                 tracing::info!("cluster ready (all partition listeners reachable)");

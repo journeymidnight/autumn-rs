@@ -166,7 +166,7 @@ impl FsState {
             credential,
         )
         .await
-        .context("connect to manager (authz)")?;
+        .context("connect to manager (with credential)")?;
         Ok(Self::from_client(client, host))
     }
 

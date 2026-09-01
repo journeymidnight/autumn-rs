@@ -137,7 +137,7 @@ fn main() -> Result<()> {
                     secret,
                 )
                 .await
-                .context("connect to manager (authz)")?
+                .context("connect to manager (with credential)")?
             }
             None => ClusterClient::connect(&args.manager, "fs")
                 .await
