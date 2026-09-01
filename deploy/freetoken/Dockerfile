@@ -44,15 +44,17 @@ FROM ${BASE_REGISTRY}${CUDA_IMAGE}
 # ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
 #   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror.
 #   CARGO_MIRROR   : crates.io registry mirror for the wheel build.
-#   PIP_INDEX_URL  : PyPI mirror. On the VKE nodes the DEFAULT index resolves
-#     pypi.org fine but downloads wheels from files.pythonhosted.org, which is
-#     slow/blocked there — a build sits with no output for many minutes. Use
-#     https://mirrors.ivolces.com/pypi/simple/.
+#   PIP_INDEX_URL  : PyPI mirror. The DEFAULT index resolves pypi.org fine but
+#     downloads wheels from files.pythonhosted.org, which is slow/blocked from
+#     the CN build pool — a build sits with no output for many minutes.
+#     Use mirrors.aliyun.com, NOT mirrors.ivolces.com: the ivolces PyPI mirror
+#     does not carry `freetoken` at all (`from versions: none`, build #55), while
+#     aliyun has the cp310-cp313 manylinux wheels.
 #   APT_MIRROR     : Ubuntu apt mirror BASE URL (e.g. https://mirrors.aliyun.com).
 ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_MIRROR=
-ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG APT_MIRROR=
 # torch for CUDA 13 is not on PyPI proper; it comes from PyTorch's own index.
 # Kept separate from PIP_INDEX_URL so a mirror can serve everything else.
@@ -74,11 +76,32 @@ RUN if [ -n "$APT_MIRROR" ]; then \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-dev python3-venv \
-      curl ca-certificates git build-essential pkg-config libssl-dev \
-      libfuse3-3 fuse3 numactl \
+      curl wget ca-certificates git build-essential pkg-config libssl-dev \
+      libfuse3-3 fuse3 numactl aria2 \
  && rm -rf /var/lib/apt/lists/* \
  && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
  && python3 -m pip install --no-cache-dir --upgrade pip "maturin>=1,<2"
+
+# ── oniond: Volcengine TOS model downloader ───────────────────────────────────
+# Model weights come from the internal TOS bucket, not HuggingFace: it is
+# in-network, needs no AK/SK, and pulls with aria2 in parallel — where hf-mirror
+# is an internet round trip for every one of 44 shards.
+# Installed the way lerobot-agent-console does: pull the .deb from the ivolces
+# extra-tools mirror, extract just the two binaries (its aria2-byted dependency
+# is skipped), and point aria2c_byted at the stock aria2c. amd64-only, which
+# this CUDA base is.
+ARG ONIOND_MIRROR=http://mirrors.ivolces.com/extra-tools/debian
+ARG ONIOND_DEB=onion-ai-data_2.4.6_amd64.deb
+RUN cd /tmp \
+    && wget -q "${ONIOND_MIRROR}/pool/main/o/onion-ai-data/${ONIOND_DEB}" -O "${ONIOND_DEB}" \
+    && dpkg-deb -x "${ONIOND_DEB}" /tmp/onion-extract \
+    && cp /tmp/onion-extract/usr/bin/hfd /tmp/onion-extract/usr/bin/oniond /usr/local/bin/ \
+    && chmod +x /usr/local/bin/hfd /usr/local/bin/oniond \
+    && ln -sf /usr/bin/aria2c /usr/local/bin/aria2c_byted \
+    && rm -rf /tmp/onion-extract "/tmp/${ONIOND_DEB}" \
+    && oniond help >/dev/null 2>&1 || true
+# Default bucket for `oniond list` / `oniond download` (override with -e BUCKET=).
+ENV BUCKET=ai-infra
 
 # `autumn-fuse` mounts the fs/ namespace so FreeToken can read weights as files.
 # Lifted from the core image rather than rebuilt: one Rust build, one binary,

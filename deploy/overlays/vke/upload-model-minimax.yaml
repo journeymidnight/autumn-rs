@@ -1,4 +1,4 @@
-# One-shot: fetch nvidia/MiniMax-M2.5-NVFP4 from HF and load it into autumn fs/.
+# One-shot: fetch nvidia/MiniMax-M2.5-NVFP4 (oniond, HF fallback) into autumn fs/.
 #
 # Not part of the overlay's resources — it is an operator action, run once per
 # model, and a Job's pod template is immutable so re-running means deleting it
@@ -14,7 +14,8 @@
 # want a different shape, change it BEFORE running this.
 #
 # Uses the freetoken image because it is the only one carrying both halves:
-# python/pip for the HF download, and autumnfs for the upload.
+# oniond (plus python as an HF fallback) for the download, and autumnfs for the
+# upload.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -43,19 +44,33 @@ spec:
               AF="autumnfs --manager $M --credential-file $CRED"
               echo "manager=$M  repo=$REPO  dest=$DEST"
 
-              python3 -m pip install --no-cache-dir -q "huggingface_hub[cli]"
-
-              # hf-mirror serves the weights; the direct endpoint is unusable
-              # from these nodes. --max-workers is the download parallelism.
-              export HF_ENDPOINT=https://hf-mirror.com
-              echo ">>> downloading (~130 GiB, resumable)"
-              hf download "$REPO" --local-dir /scratch/model --max-workers 8
+              # oniond pulls from the internal TOS bucket: in-network, no AK/SK,
+              # aria2 in parallel. It is org-less, so `nvidia/MiniMax-M2.5-NVFP4`
+              # is listed as `MiniMax-M2.5-NVFP4`, and it lands the files at
+              # <dir>/<name>/. Fall back to HF only if the bucket lacks it —
+              # that path is 44 shards of internet round trip.
+              NAME="${REPO##*/}"
+              mkdir -p /scratch
+              echo ">>> checking oniond bucket ($BUCKET) for '$NAME'"
+              if oniond list model 2>/dev/null | sed 's/^[| ]*//; s/[| ]*$//' | grep -qx "$NAME"; then
+                echo ">>> oniond download model $NAME (~130 GiB, aria2 progress follows)"
+                oniond download model "$NAME" --dir /scratch
+                SRC=/scratch/$NAME
+              else
+                echo ">>> '$NAME' NOT in the oniond bucket — falling back to HF"
+                python3 -m pip install --no-cache-dir -q "huggingface_hub[cli]"
+                export HF_ENDPOINT=https://hf-mirror.com
+                hf download "$REPO" --local-dir /scratch/model --max-workers 8
+                SRC=/scratch/model
+              fi
+              [ -d "$SRC" ] && [ -n "$(ls -A "$SRC")" ] || { echo "download produced nothing at $SRC"; exit 1; }
+              echo ">>> downloaded $(du -sh "$SRC" | cut -f1) to $SRC"
 
               echo ">>> uploading to autumn fs/$DEST"
               $AF mkdir models 2>/dev/null || true
               $AF mkdir "$DEST" 2>/dev/null || true
 
-              cd /scratch/model
+              cd "$SRC"
               n=0; total=$(find . -type f | wc -l)
               # autumnfs put takes ONE file; there is no recursive form. Files
               # land striped across the 24 declared lanes automatically, so this
@@ -71,12 +86,15 @@ spec:
               echo ">>> verifying"
               $AF ls "$DEST" | head -20
               echo ">>> local vs cluster file count"
-              echo "local:   $(find /scratch/model -type f | wc -l)"
+              echo "local:   $(find "$SRC" -type f | wc -l)"
               echo "cluster: $($AF ls "$DEST" | wc -l)  (top level only)"
               echo ">>> done"
           env:
             - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "0" }
-            - { name: PIP_INDEX_URL, value: "https://mirrors.ivolces.com/pypi/simple/" }
+            - { name: PIP_INDEX_URL, value: "https://mirrors.aliyun.com/pypi/simple/" }
+            # oniond's bucket; baked into the image but explicit here so it is
+            # visible at the call site.
+            - { name: BUCKET, value: "ai-infra" }
           volumeMounts:
             - { name: scratch, mountPath: /scratch }
             - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
