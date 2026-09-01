@@ -274,3 +274,24 @@
 - **Status**: `passes: false` (2026-09-01) — 阻塞后续移植工作。已搬入的
   `hashing.py`(与 sglang 逐位一致) 与 `host_pool.py` 大概率不受影响；
   `storage.py`/`backend_factory.py` 取决于 (2) 的结论。
+
+### F-FT-DSV4-KV-SCOPE — DeepSeek-V4 在 FreeToken 上要不要接 autumn KV
+- **Trigger** (2026-09-01, 用户问"FreeToken 现在的 hicache 支持 DSV4 了吗"后核实上游):
+  **FreeToken 至今没有任何 HiCache**。上游 `a2538a4`(2026-09-01，仅落后本地 2 个无关 commit)
+  全树搜 `HiCache` 只命中 `kvcache/base.py:197` 那行 `# TODO: support HiCache`；
+  `hicache`/`HiCacheStorage`/`host_pool`/`L3`/`storage_backend` 全部 0 命中，
+  `kvcache/` 目录里没有任何分层缓存文件。
+- **所以 DSV4 的 KV 现状**: 能工作，但**纯显存**（`dsv4_paged_pool.py` 614 行 +
+  `swa_radix_cache.py`，四组 buffer: window/cmp/idx/state_ring）。autumn 接不进去不是
+  因为不兼容，而是**没有可接的地方**。
+- **完整代价（若要接）**: 把 sglang 的 unified 分层缓存移植进一个**完全没有分层缓存**的引擎，
+  并为 DSV4 那四组 buffer 写 sidecar 映射 + autumn 侧 v2（已完成，efeea3c）。
+  这是 FreeToken 侧的活，远大于最初估的"移植 HiRadixCache 1427 行"。
+- **便宜的替代**: DSV4 就用 FreeToken 自带的显存 KV，不接 autumn；autumn 的 v2 留给
+  **真正的 sglang** 用（它已经在调 v2）。单副本部署下损失有限 —— L3 的主要价值是
+  **跨副本**前缀复用，而当前规划就是 1 副本。
+- **Acceptance**: 明确记录选哪条；若选替代方案，FreeToken 的 `--cache-type` 保持默认
+  （DSV4 会被强制成 swa_radix），不做 HiCache 移植，autumn v2 的验证改用真 sglang。
+- **Status**: `passes: false` (2026-09-01) — 待用户定夺。**注意**: 本条的前身结论
+  （"sglang 上游没有 SWA+HiCache，那一档是原创设计"）是错的，见 F-HICACHE-PORT-REBASE；
+  真实约束是 DSV4 需要 sidecar 池 ⇒ v2 接口，而非上游未解。
