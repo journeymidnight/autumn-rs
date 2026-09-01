@@ -121,5 +121,4 @@
 - **Acceptance**: 在 authz 开启的集群上 `autumn-op --credential-file fs.cred presplit
   --namespace fs --lanes 24 --parts 6` 成功切分并写入声明；`autumn-op info` 显示 6 个分区
   跨 3 个 PS；收窄守卫仍生效（不带 `--force` 的 `--lanes 2` 被拒）。
-- **Status**: `passes: false` (2026-09-01) — 已在活集群复现。本轮先跳过 presplit
-  （单分区不影响 FUSE 探测），上传模型之前必须先修。
+- **Status**: `passes: false` (2026-09-01) — 已在活集群复现；代码已按 Scope 修（autumn-op 加全局 `--credential-file`，`connect_raw` 后 `set_principal_credential`；Raw binding 下 `validate_credential_scope` 是 no-op，故只装载 token、不做任何 clamp）。**待活集群验证**后才转 true。

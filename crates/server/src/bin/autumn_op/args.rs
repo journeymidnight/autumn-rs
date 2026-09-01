@@ -11,6 +11,11 @@ fn usage() -> ! {
     eprintln!("usage: autumn-op [--manager addr] [--json] [--admin-token-file F] <command>");
     eprintln!("  --admin-token-file F: authorize cluster-mutating ops (fence/remove/merge/create-stream/…)");
     eprintln!("    when the manager was started with --admin-token-file. Read-only ops ignore it.");
+    eprintln!("  --credential-file F: data-plane capability (`<principal>\\n<hex>`), for the admin");
+    eprintln!("    subcommands that read/write partition keys rather than only calling the manager");
+    eprintln!("    (e.g. `presplit --namespace fs`, which reads the declared stripe geometry).");
+    eprintln!("    The admin token does NOT satisfy the partition server; when authz is on it");
+    eprintln!("    protects every key, so those commands need this too.");
     eprintln!();
     eprintln!("read / observability commands:");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
@@ -161,6 +166,15 @@ pub(crate) struct Args {
     /// `set_admin_token`; read-only commands are unaffected. `None` = don't send
     /// a token (a token-less manager runs these bare; a token-ON manager refuses).
     pub(crate) admin_token: Option<String>,
+    /// data-plane credential (`--credential-file`), as
+    /// `(principal, secret)`. The admin token authorizes CONTROL-plane RPCs; it
+    /// does nothing for a partition-server read. Some admin subcommands do touch
+    /// the data plane — `presplit --namespace fs` reads the declared stripe
+    /// geometry before overwriting it — and under PROTECT-EVERYTHING every key
+    /// needs a capability token, so those need a credential too. `None` = connect
+    /// without one (fine on an authz-off cluster, and for every command that
+    /// only talks to the manager).
+    pub(crate) credential: Option<(String, Vec<u8>)>,
     /// `--wait`: for the async op triggers (split/merge/rebalance/compact/gc/
     /// forcegc/force-ec-convert), block until the op reaches a terminal state
     /// and print/exit on its real outcome, instead of returning the op id.
@@ -500,6 +514,7 @@ pub(crate) fn parse() -> Args {
     let mut json = false;
     let mut transport = TransportKind::Tcp;
     let mut admin_token: Option<String> = None;
+    let mut credential: Option<(String, Vec<u8>)> = None;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -535,6 +550,26 @@ pub(crate) fn parse() -> Args {
             "--admin-token-file" => {
                 i += 1;
                 admin_token = Some(read_secret_file(&raw.get(i).cloned().unwrap_or_else(|| usage())));
+                i += 1;
+            }
+            // data-plane credential, for the admin subcommands that read or write
+            // partition keys rather than only talking to the manager.
+            "--credential-file" => {
+                i += 1;
+                let path = raw.get(i).cloned().unwrap_or_else(|| usage());
+                match autumn_client::read_credential_file(&path) {
+                    Ok((principal, secret)) if !principal.is_empty() => {
+                        credential = Some((principal, secret));
+                    }
+                    Ok(_) => {
+                        eprintln!("--credential-file {path}: missing principal name (expected '<principal>\n<hex>')");
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        std::process::exit(2);
+                    }
+                }
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -1591,6 +1626,7 @@ pub(crate) fn parse() -> Args {
         json,
         transport,
         admin_token,
+        credential,
         wait,
         wait_timeout,
         cmd,
