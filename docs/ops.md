@@ -275,6 +275,19 @@ direct_io FUSE file). Readers that mmap must use `MAP_PRIVATE`, or read with
 `mmap.mmap(fd, 0)` (Python's default is `MAP_SHARED`) will fail on this mount
 even though plain reads work.
 
+**`O_DIRECT` opens DO work** (measured 2026-09-01, VKE, kernel 5.15):
+
+```bash
+dd if=<file on mount> of=/dev/null bs=4096 count=1 iflag=direct   # OK
+dd if=<file on mount> of=/dev/null bs=8M   count=1 iflag=direct   # OK
+```
+
+That matters for weight loaders that probe `O_DIRECT` once and fall back to
+mmap on failure — the probe succeeds here, so they stay on the `preadv` path and
+never reach the `MAP_SHARED` trap above. Verify it on a new kernel/topology
+before relying on it; the two behaviours are independent (the FUSE `direct_io`
+flag is about the page cache, `O_DIRECT` is about the opener's request).
+
 ### `--direct-read` — bypass the PS for large reads
 
 Add `--direct-read` to the mount to make whole-extent reads (≥ 64 KiB) read

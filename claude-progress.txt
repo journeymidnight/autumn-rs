@@ -1119,6 +1119,50 @@ Main gaps:
   - FreeToken 镜像 + freetoken-autumn CP 流水线未建；freetoken.yaml 未写；
     hermes MCP 接线未做；核心 v29 未滚。
 
+【2026-09-01 续：线上全量重建到 v29，挖出 3 个陈旧配置】
+用户拍板"数据可以全毁"⇒ 走全量重建（v28→v29 跨了 96a5c01 的 MVCC 比较器改动，
+旧 SST/WAL 不可读、无迁移，见 docs/ops.md:1620）。删 vLLM + 4 个 STS + 6 个 PVC
+（58GB 逻辑数据，qwen72b/7b/coder7b 全弃），deploy.sh 重建。
+NOTE: delete sts / delete pvc 被 auto-mode 分类器拦，需用户用 `!` 跑；delete deploy /
+delete job / delete pod / apply 都放行。
+
+重建过程中暴露 3 个"cluster.sh 早改了、k8s 路径没跟上"的陈旧配置，均已修复：
+  1. deploy.sh --restart 的选择器 `-l 'component!=etcd'` —— pod 标的是
+     `app.kubernetes.io/component`，`!=` 匹配不存在的 key 恒为真 ⇒ 实测匹配 18 个 pod
+     （含 etcd、别的负载、已完成的 Job pod），只该匹配 10 个。修成双 label 选择器
+     并在删除前打印待删集合。(cd76db2)
+  2. AUTUMN_BOOTSTRAP_PRESPLIT=32 喂 `bootstrap --presplit`，切的是 RAW keyspace ——
+     namespace-blind，`{ns}/` 布局下所有切点都排在真实 key 之前，**一直什么也没切**
+     （overlay 注释还写着"32 个分区"）。v29 binary 直接 fail-loud 拒绝该 flag 才暴露。
+     overlay 去掉该值；entrypoint 改成拒绝而非静默忽略。(3fb2585)
+  3. bootstrap Job 没挂 autumn-authz，但 ConfigMap 已把 AUTUMN_ADMIN_TOKEN_FILE 指向
+     该路径 ⇒ 路径指向不存在的文件 ⇒ "admin token invalid"。加 optional 挂载 +
+     传 flag。(3fb2585) 修完仍失败：flag 被加在 `bootstrap` 子命令之后，而
+     `--admin-token-file` 是 GLOBAL flag（全局解析循环遇到第一个非 flag 就 break），
+     被子命令解析器丢弃。移到子命令之前，与 cluster.sh 一致。(9c23776)
+
+【授权姿态的实测事实】manager.rs:310-311 —— 未给 --auth-protected-prefix 时编译期默认
+  **只保护 `mem/`**。k8s ConfigMap 没设该变量 ⇒ 本集群 `fs/` 与 `kvc/` 数据面 authz
+  **不生效**，FUSE 挂载与 kvcache 连接器都不需要凭据。(cluster.sh 里"有 signing key
+  就保护一切"的注释与 binary 实际默认不符，注释陈旧。)
+
+【FreeToken 侧的两个决定性事实（改变了模型选择）】
+  - NVFP4 在 4090(sm_89) 上可行但非硬件 FP4：moe/nvfp4_backends.py 的 marlin 覆盖
+    sm_80-99（W4A16，内核内反量化），但它借 vLLM 的 AOT wheel，而 vLLM pin
+    transformers>=4.56,<5，与 FreeToken 核心的 >=5.5 冲突（pyproject.toml:81-85 明写
+    "不是可锁定的 extra"）⇒ 先用 --nvfp4-backend triton（无依赖冲突）。
+  - **FP8 会废掉 hybrid**：moe/cpu_executor.py:71 的 CPU 端白名单
+    _WFMT_IDS = {bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0}，**不含 fp8_block**；
+    喂 FP8 checkpoint 会抛 NotImplementedError 并要求改用 --moe-backend offload。
+    ⇒ 早先"fp8 bank"的选项会静默关掉 hybrid，作废。GLM-5.2-NVFP4 正好在白名单内。
+
+【HiCache 移植进度】FreeToken 克隆分支 `hicache-autumn`，commit 74bf63a：
+  storage.py(531,搬) + backend_factory.py(213,搬,裁到只留 dynamic) +
+  ops.py(222,搬,控制器原语) + hashing.py(73,新写,已验证与 sglang 逐位一致 500/500) +
+  host_pool.py(205,新写,L2 pinned 页池,未验证——Mac 无 torch) +
+  tests/kvcache/test_hicache_host_pool.py(145,待镜像内跑)。
+  未做：controller、DSA 族 KV 读出路径、调度器 6 处钩子、第三种 ref 类别。
+
 Next steps:
   1. 提交本轮改动 → 推 main → CP 构建 autumn-rs @ HEAD(流水线从 main HEAD 取源)。
   2. 用新镜像跑 F-FT-FUSE-ODIRECT 探测(生死线，失败则 FUSE 方案改道)。

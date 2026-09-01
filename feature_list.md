@@ -95,4 +95,31 @@
 - **Trigger** (2026-09-01): FreeToken 的 FTW reader 开局探测一次 O_DIRECT（`checkpoint/ftw.py`），成功走 8MiB chunk 多线程 `preadv`，**失败则回退到整片 `mmap.mmap(fd, 0, prot=PROT_READ)`**。Python `mmap.mmap` 不传 `flags` 默认 **MAP_SHARED**，而 `autumn-fuse` 对每个 open 无条件返回 **FOPEN_DIRECT_IO**（`crates/fuse/src/ops.rs`），内核对 direct_io 的 FUSE 文件拒绝 MAP_SHARED（`ENODEV`）。⇒ 若 O_DIRECT 探测失败，**两条加载路径同时死**。另：raw-safetensors 的 `--expert-load parallel` 用无回退的 `O_RDONLY|O_DIRECT` 且只捕获 `NotImplementedError`，在不支持的挂载上会直接崩。
 - **Scope**: 在挂了 autumn-fuse 的 Linux pod 里对挂载点上一个 ≥4096 字节的文件执行 `os.open(p, os.O_RDONLY|os.O_DIRECT)`。若失败，给 `autumn-fuse` 加 `--direct-io <bool>` 开关（`ops.rs` 目前硬编码 `reply.opened(fh, 1)`），让 mmap 回退路径可用；或改为本地盘暂存权重。
 - **Acceptance**: 探测结果被记录到 `docs/ops.md`；FreeToken 能从挂载点完成一次权重加载，且日志中未出现 `O_DIRECT unsupported ... using mmap fallback` 之后的 ENODEV 失败。
-- **Status**: `passes: false` (2026-09-01) — 阻塞在 F-IMG-FUSE-MCP 的镜像构建（没有 autumn-fuse 二进制就无法验证）。
+- **Status**: `passes: true` (2026-09-01) — 活集群实测通过。3.2 节点、v29 镜像、autumn-fuse sidecar 挂 `fs/`（authz 开，带 fs.cred）：buffered 读 OK；`dd iflag=direct bs=4096` **OK**；`bs=8M iflag=direct`（= FTW 的分块尺寸）**OK**。⇒ FTW reader 的 O_DIRECT 探测会成功、走多线程 `preadv` 快路，那条会因 MAP_SHARED 撞 ENODEV 的整片 mmap 回退不会被触发。同轮顺带验证 `autumnfs put` 12 MiB → 自动 striped ×24 lanes → FUSE 挂载读回，链路通。仍保留的约束：**FUSE 上禁用 `--expert-load parallel`**（它用无回退的 O_DIRECT 且只捕获 NotImplementedError）。
+
+### BUG-PRESPLIT-NO-CRED — `autumn-op presplit --namespace fs` 在开了 authz 的集群上无法执行
+- **Trigger** (2026-09-01, 线上 v29 全量重建时实测): 新集群 bootstrap 后执行
+  `autumn-op --admin-token-file F presplit --namespace fs --lanes 24 --parts 6`，报
+  `presplit: read existing stripe geometry: permission denied: protected key requires a
+  capability token (no AUTH_HELLO on this connection)`。
+  根因：`main.rs:2076-2088` 的"禁止静默收窄 lane 宽度"守卫（注释标为 UX-fix M5，较新迁入）
+  会做一次**裸数据面读** `client.get(b"fs/" ++ stripe_geom_key())`，但 autumn-op 走的是
+  `connect_raw`（无 AUTH_HELLO），而 PS 端是 PROTECT-EVERYTHING
+  （`crates/partition-server/src/authz.rs:221-226`：开了 authz 就每个 key 都要 token，
+  `protected_prefixes` 列表已退休）。而 **`presplit` 子命令没有任何 `--credential-file` 参数**
+  —— 全仓只有 `mint-token` 接受它（`args.rs:813`）。admin token 是控制面凭据，不满足数据面检查。
+- **为什么以前能跑**: 那个 read-before-write 守卫是后加的；在它出现之前 presplit 不碰数据面，
+  所以 2026-07-20 那次 reset 的 `presplit --namespace fs --lanes 6` 能成功。属回归。
+- **影响**: 开了 authz 的集群**无法给 fs 做 lane presplit**。而 presplit 必须在写入任何数据
+  之前做（数据落盘后 CoW 重叠会让多数切点 `has_overlap` 失败），所以这挡住的是新集群 bring-up
+  的关键一步 —— 只能退回单分区，大文件上传/读取拿不到跨分区并行。
+- **Scope**: 给 autumn-op 加**全局** `--credential-file`（与 `--admin-token-file` 同一层），
+  在需要数据面访问的子命令上用 `connect_with_credential` 取代 `connect_raw`。
+  presplit 是当前唯一已知的受害者，但任何未来做数据面读写的 admin 子命令都同此。
+  次选（不推荐）：把守卫里的 PermissionDenied 当作"无既有声明"处理 —— 会让守卫在开了 authz
+  的集群上静默失效，正是它要防的那个 harm。
+- **Acceptance**: 在 authz 开启的集群上 `autumn-op --credential-file fs.cred presplit
+  --namespace fs --lanes 24 --parts 6` 成功切分并写入声明；`autumn-op info` 显示 6 个分区
+  跨 3 个 PS；收窄守卫仍生效（不带 `--force` 的 `--lanes 2` 被拒）。
+- **Status**: `passes: false` (2026-09-01) — 已在活集群复现。本轮先跳过 presplit
+  （单分区不影响 FUSE 探测），上传模型之前必须先修。
