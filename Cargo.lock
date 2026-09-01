@@ -312,6 +312,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-s3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autumn-client",
+ "autumn-fuse",
+ "axum",
+ "compio",
+ "cyper-axum",
+ "futures",
+ "send_wrapper",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autumn-server"
 version = "0.1.0"
 dependencies = [

@@ -123,3 +123,90 @@
   跨 3 个 PS；收窄守卫仍生效（不带 `--force` 的 `--lanes 2` 被拒）。
 - **Status**: `passes: true` (2026-09-01) — 活集群验证通过。`autumn-op --admin-token-file T --credential-file fs.cred presplit --namespace fs --lanes 24 --parts 6` → `declared fs stripe geometry: 24 lanes × 8 MiB units` + `4/5 cut points applied`，`fs` 得到 6 个分区跨 3 个 PS 均摊 2/2/2。
   **踩到的次生坑（值得记）**: 第一次重试只切成 1/5，因为 FUSE O_DIRECT 探测时往 `fs/` 写了个 12 MiB 测试文件 —— 正是本条 Scope 里写明的"presplit 必须在写入任何数据之前"。恢复路径按 `docs/ops.md` 有效：删文件 → `autumn-op compact <part>`（两个分区都要）→ 重跑 presplit。删除只留 tombstone，不 compact 的话 `has_overlap` 依旧。
+
+### F-S3-GATEWAY — 只读 S3 兼容网关（把 SGLang / FreeToken 接上 runai_streamer 快路）
+- **Trigger** (2026-09-01): `autumn_vllm_loader`（`--load-format autumn`）**只对 vLLM 有效** ——
+  46ed345 已修正文档中"一套实现同时服务 vLLM 和 SGLang"的错误说法。实测确认 SGLang 无插件位：
+  `srt/configs/load_config.py:15` 是封闭 `LoadFormat` 枚举，`srt/model_loader/loader.py:3106`
+  `get_model_loader` 是硬编码 if 链，全树无 `register_model_loader`。因此 SGLang 与 FreeToken
+  目前只能走 FUSE 挂载（Recipe B，非流式快路）。
+  但 **SGLang 原生支持 `--load-format runai_streamer`**（`load_config.py:34`，
+  `utils/runai_utils.py:12` `SUPPORTED_SCHEMES = ["s3://","gs://","az://"]`，
+  `model_loader/weight_utils.py:1144-1147` 把 `AWS_ENDPOINT_URL` 转成 `RUNAI_STREAMER_S3_ENDPOINT`），
+  vLLM 同样支持。⇒ 一个 S3 端点可同时把两个引擎抬到并发流式读，且不需要改任何引擎代码。
+- **Scope**: 只读、只实现 runai 真正调用的 3 个操作（调用链已从本机
+  `runai-model-streamer 0.15.6` 逐层核实）：
+  - `ListObjectsV2` ← `list_safetensors()` → `s3_glob(path, ["*.safetensors"])`
+  - `GetObject` + `Range` ← `SafetensorsMetadata.from_files()` 先取 8 字节头长再取 header JSON，
+    随后按 chunk 取张量。**所有 tensor 的 offset/size 来自 safetensors header 自解析
+    （`safetensors_pytorch.py:206`），不依赖对象大小查询。**
+  - `GetObject`（整取）← 引擎侧 `pull_files` 拉 config.json / tokenizer。
+  必须满足 AWS SDK C++ 的严格解析：`ListBucketResult` XML（`Contents/Key/Size/LastModified/ETag`
+  + `prefix`/`delimiter`/`continuation-token`）、Range 请求回 **206** + 精确
+  `Content-Range: bytes a-b/total` 与 `Content-Length`、**path-style 寻址**、HTTP/1.1 keep-alive。
+  **不验签**：忽略 `Authorization` 头（客户端仍需假的 `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY`，
+  因为 AWS SDK 的凭据链在发请求前就会自检）。读穿 `autumn.Fs`，属 adapter，不是并行数据面。
+- **明确不做**: PUT / DELETE / multipart / versioning / ACL / CORS / 虚拟主机寻址 / SigV4 校验。
+- **部署形态**: 每 GPU 节点 sidecar（长跳 EN→sidecar 走 RDMA，只在 localhost 付一段 HTTP），
+  避免单点网关成为带宽瓶颈并省掉 HA 设计。
+- **Acceptance**:
+  (a) `aws --endpoint-url ... s3 ls` / `s3 cp` 能列出并取回 `fs/` 下的对象，字节精确；
+  (b) SGLang `--load-format runai_streamer --model-path s3://<bucket>/<model>` 加载成功，
+      推理输出与同模型本地盘加载一致；
+  (c) vLLM 同上；
+  (d) A/B：与现有 `--load-format autumn` 原生 loader 对比吞吐，比值记入 `docs/model_loading.md`
+      —— 这个数字是 F-S3-RUNAI-PLUGIN 是否值得做的判据。
+- **Status**: `passes: false` (2026-09-01) — 网关已实现（`examples/s3-gateway`，二进制 `autumn-s3`，
+  ~600 行 + 5 单测），本机 3 节点集群验证到位；(b)(c) 引擎级端到端未跑，故不置 true。
+  **已过的**：
+  - boto3（真 botocore/AWS SDK）：`list_buckets` / `list_objects_v2`（prefix+delimiter+
+    `encoding-type=url`）/ `head_object` / `get_object` / ranged `get_object` / 官方 paginator
+    翻页 / typed `NoSuchKey` + `NotImplemented`，全过。
+  - **真 `runai-model-streamer` 0.15.6 端到端字节精确**：`list_safetensors` → 逐 shard 读
+    `bytes=0-7` 头长 → header JSON → 各张量 chunk，3 个张量 bytes_exact=True。这正是 SGLang
+    runai loader 内部跑的那段代码。
+  - 边界：206 + 精确 `Content-Range`、末段越界钳位、`bytes=-N` 后缀、416 带 `bytes＊/size`、
+    404 `NoSuchKey`、写操作回 `NotImplemented`、64 并发 ranged GET 全 206 无 panic。
+  - 幂等实现细节：`FsState` 用**异步** mutex 而非 `RefCell`（`RefCell` 在第二个并发请求就
+    `already borrowed` panic，而流式读天然并发）；读路径按 fuse dispatcher 的分法拆成
+    `prepare`（持锁、只做路由）+ `execute`（无锁、真 I/O），所以并发 GET 仍然重叠扇出。
+  - **(d) A/B 已测**（2 GiB shard，loopback）：native `read_into` 8 线程 **1327 MB/s** /
+    裸 HTTP 过网关 **1290 MB/s（native 的 97%）** / runai→网关 **~600 MB/s（45%）** /
+    runai→本地页缓存文件 20–33 GB/s。⇒ **HTTP 这一跳几乎免费，网关不是瓶颈，runai 的张量
+    流水线也不是**；瓶颈在 `libstreamers3.so` 包的 **aws-c-s3 CRT 客户端**——它每个 8 MiB
+    chunk 开一条新 TCP（2 GiB 用了 241 连接 / 259 请求），每块都吃冷拥塞窗口；
+    `TARGET_GBPS` / `MAX_CONNECTIONS` / `CHUNK_BYTESIZE` 全扫过，548–633 MB/s 纹丝不动。
+    网关自身 keep-alive 正常（curl 复用连接）。
+  **踩到的坑（已写进 ops.md）**：aws-c-s3 认 `HTTP_PROXY` 但**不认 `NO_PROXY`** —— 环境里有
+  代理时，boto3 侧的 list 正常（boto3 认 NO_PROXY），每个权重读却全挂在
+  `AWS_ERROR_S3_INTERNAL_ERROR` 且**不开任何 socket**。"lists fine, every read fails" 是指纹。
+  **仍缺**：(b) SGLang 真起服务加载一个真模型；(c) vLLM 同（本机无 vLLM）。
+
+### F-S3-RUNAI-PLUGIN — 用 runai 后端插件 ABI 承载 autumn 原生传输【条件性，等 F-S3-GATEWAY 的数字】
+- **Trigger** (2026-09-01): `libstreamer.so`（未 strip）里存在一套可插拔后端 C ABI，按**裸 soname**
+  `dlopen`，因此 `LD_LIBRARY_PATH` 即可接管，无需 patch 上游。反出的签名：
+  `obj_open_backend(void**)` / `obj_close_backend(void*)` /
+  `obj_create_client(void*, const ObjectClientConfig_t*, void**)` / `obj_remove_client(void*)` /
+  `obj_remove_all_clients(void*)` /
+  `obj_request_read(void*, const char* path, ObjectRange_t, char* dst, size_t)` /
+  `obj_wait_for_completions(void*, ObjectCompletionEvent_t*, unsigned, unsigned*, ObjectWaitMode_t)` /
+  `obj_cancel_all_reads(void*)` / `obj_get_backend_shutdown_policy()`。
+  `obj_request_read` 收 `char* dst`，形状与 `read_into` 一致 ⇒ 可 RDMA 零拷贝直落 runai 的
+  pinned buffer，同时覆盖 vLLM 与 SGLang。
+- **Scope（若启动）**: 实现上述 ABI 的 `.so` + 配套的 `runai_model_streamer_s3` Python 替身
+  （`s3_glob` / `pull_files` 在 Python 侧，不在 .so 里，**两个产物缺一不可**）。
+- **已知代价（决定为何设为条件性）**:
+  ① 插件名是三个 static const（`obj_plugin_s3_name` / `_gcs_` / `_azure_`），
+     `get_libstreamers_plugin_type()` 硬编码三选一、无 env 覆盖 ⇒ 只能**冒充
+     `libstreamers3.so`**，同进程内 autumn 与真 S3 二选一，且 URI 仍须写成 `s3://`；
+  ② C ABI 无版本号、结构体布局需从上游头文件抄，上游改字段 ⇒ **内存损坏而非干净报错**。
+- **启动判据（已有数字，2026-09-01）**: 判据原文是"网关达原生 ~85% 则不做，掉到 60% 以下才启动"。
+  实测 runai→网关 = 原生的 **45%** ⇒ **判据已触发**。而且测量把损失定位得很准：裸 HTTP 过网关
+  是原生的 97%，runai 的张量流水线本地跑 33 GB/s，**丢的那一段恰好就是 aws-c-s3 CRT 客户端**
+  —— 也正是本 feature 要替换掉的那个组件（`libstreamers3.so` 就是 CRT 的包装）。所以
+  "插件会继承同样的天花板"这个反对意见不成立。
+  **但先做便宜的事**：CRT 每 8 MiB 开一条新连接是首要嫌疑，先查有没有让它复用连接的办法
+  （上游 issue / `aws-c-s3` 版本 / 别的 env），能修好就不必写插件。
+- **Acceptance（若启动）**: vLLM 与 SGLang 均可经 `--load-format runai_streamer` 走 autumn 原生传输，
+  字节精确；吞吐 ≥ 现有 `--load-format autumn` 原生 loader。
+- **Status**: `passes: false` (2026-09-01) — 条件性，未启动，等 F-S3-GATEWAY 的 A/B 数字。

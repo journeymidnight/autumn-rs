@@ -2143,3 +2143,81 @@ Three traps this script exists to encode, all of which cost a run to find:
 - **Restart the ENs only.** The PS serves the reads being verified; killing it
   makes the final check fail as `connect PS … failed`, which reads like a
   data-plane break and is not one.
+
+## S3 gateway — serving autumn weights to engines with no loader plugin
+
+`autumn-s3` is a read-only, unauthenticated S3 endpoint over the `fs/` tree. It
+exists so SGLang and FreeToken — neither of which has a loader plugin seam —
+can use their built-in `--load-format runai_streamer` to stream weights
+concurrently, with no engine patches. `aws s3` and every other S3 client work
+against it too.
+
+Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
+autumn `fs/models/llama/x.safetensors`.
+
+```bash
+# 1. Run it next to the engine (per-GPU-node sidecar keeps the RDMA hop long
+#    and the HTTP hop on loopback).
+autumn-s3 --manager 127.0.0.1:9000 --port 9100 \
+          --credential-file /secrets/fs.cred      # omit when authz is off
+
+# 2. Smoke it with the aws CLI. The credentials are DUMMY — the gateway never
+#    looks at the Authorization header — but the SDK's credential chain runs
+#    BEFORE the request is sent, so they must be set to something.
+export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_EC2_METADATA_DISABLED=true
+aws --endpoint-url http://127.0.0.1:9100 s3 ls
+aws --endpoint-url http://127.0.0.1:9100 s3 ls s3://models/llama/
+aws --endpoint-url http://127.0.0.1:9100 s3 cp s3://models/llama/config.json -
+
+# 3. Ranged read (what the streamer actually issues) must answer 206 with an
+#    exact Content-Range:
+curl -s -D- -o /dev/null -H 'Range: bytes=0-7' \
+     http://127.0.0.1:9100/models/llama/model-00001.safetensors
+#   → HTTP/1.1 206 Partial Content
+#     content-range: bytes 0-7/<size>
+
+# 4. Verify the streamer path itself (no GPU needed). This is the exact code
+#    SGLang's runai loader runs:
+pip install runai-model-streamer-s3     # the AWS-SDK plugin; NOT in the base package
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    AWS_ENDPOINT_URL=http://127.0.0.1:9100 \
+    AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_EC2_METADATA_DISABLED=true \
+    python3 -c "
+from runai_model_streamer import list_safetensors, SafetensorsStreamer
+with SafetensorsStreamer() as st:
+    st.stream_files(list_safetensors('s3://models/llama'))
+    print(sorted(n for n, _ in st.get_tensors()))"
+
+# 5. Serve with SGLang (same env; the proxy unset matters here too):
+export AWS_ENDPOINT_URL=http://127.0.0.1:9100
+python -m sglang.launch_server --model-path s3://models/llama \
+       --load-format runai_streamer
+# vLLM takes the same URL; on vLLM prefer --load-format autumn (native, RDMA
+# zero-copy) unless you are A/B-ing the two.
+```
+
+Not supported, by design: PUT/DELETE, multipart, versioning, ACLs,
+virtual-host addressing (use path-style, which is what `--endpoint-url`
+selects), and SigV4 verification. Anything else answers `NotImplemented`.
+
+Gotchas:
+- **`HTTP_PROXY` silently swallows the streamer.** The Run:ai streamer's S3
+  backend is aws-c-s3 (the CRT client), which honours `HTTP_PROXY`/`HTTPS_PROXY`
+  and **ignores `NO_PROXY`** — verified: with `NO_PROXY` already listing
+  `127.0.0.1`, every read still went to the proxy and came back
+  `AWS_ERROR_S3_INTERNAL_ERROR` / "File access error", with no socket ever
+  opened to the gateway. UNSET the proxy variables for the engine process:
+  ```bash
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy python -m sglang.launch_server ...
+  ```
+  The boto3-side listing is unaffected (it does honour `NO_PROXY`), so the
+  symptom is "the model directory lists fine, then every weight read fails".
+- **The CRT sends absolute-form request lines** (`GET http://host:port/bucket/key`)
+  rather than origin-form. The gateway handles both; a reverse proxy in front of
+  it may not.
+- **path-style only.** A client configured for virtual-host addressing resolves
+  `bucket.host` and never reaches the gateway.
+- **An undelimited listing walks the tree.** `aws s3 ls --recursive` from a
+  bucket root is capped at 100k entries and logs a warning; prefer a prefix.
+- **Listing costs one inode lookup per key** (for size/mtime). Fine for a model
+  directory; not a directory-crawler substitute.

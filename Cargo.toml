@@ -15,6 +15,7 @@ members = [
   "examples/gallery",
   "examples/memory-mcp",
   "examples/dashboard",
+  "examples/s3-gateway",
 ]
 default-members = [
   "crates/common",

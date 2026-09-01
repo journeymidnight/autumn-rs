@@ -157,10 +157,63 @@ vllm serve /path/to/model_dir --load-format autumn \
     --model-loader-extra-config '{"manager":"mgr:9001","path":"models/llama-3-8b","transport":"ucx","direct_read":true}'
 ```
 
-The alternative zero-engine-code fast path is an **S3-compatible gateway** in
-front of autumn + stock `--load-format runai_streamer` (`AWS_ENDPOINT_URL` +
-path-style). Good as a first milestone / A/B baseline; add it if/when an S3
-surface exists.
+For engines with no loader seam, Recipe D below is the streaming path.
+
+## Recipe D — `autumn-s3` gateway + stock `runai_streamer` (SGLang / FreeToken / any S3 client)
+
+`autumn-s3` (`examples/s3-gateway`) is a read-only, unauthenticated
+S3 endpoint over the `fs/` tree. It serves only what the Run:ai streamer
+issues — `ListObjectsV2`, ranged `GetObject`, whole `GetObject` — which is
+enough for **SGLang's built-in `--load-format runai_streamer`**, and so gives
+the engines that cannot register a loader a concurrent streaming weight path
+with no engine patches. Every other S3 tool (`aws s3`, `s3fs`, `datasets`)
+reads autumn through it as a side effect.
+
+Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
+autumn `fs/models/llama/x.safetensors`.
+
+```bash
+autumn-s3 --manager mgr:9001 --port 9100 --credential-file /secrets/fs.cred
+
+pip install runai-model-streamer-s3     # the AWS-SDK plugin; NOT in the base package
+export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x   # dummy; never verified
+export AWS_ENDPOINT_URL=http://127.0.0.1:9100
+python -m sglang.launch_server --model-path s3://models/llama \
+       --load-format runai_streamer
+```
+
+### Measured (2026-09-01, 3-node local cluster, 2 GiB safetensors shard, loopback)
+
+| path | MB/s | vs native |
+|---|---|---|
+| `autumn.Fs.read_into`, 8 threads (**Recipe C's data path**) | **1327** | 100% |
+| raw HTTP `GET` through the gateway (1–16 streams) | **1290** | **97%** |
+| `runai-model-streamer` → gateway (concurrency 4–32) | **~600** | 45% |
+| `runai-model-streamer` → local page-cached file | 20000–33000 | — |
+
+The HTTP hop itself costs almost nothing: raw reads through the gateway land
+within 3% of the native binding, and the gateway holds connections open (curl
+reuses them). The streamer's tensor pipeline is not the limit either — it does
+33 GB/s off local files.
+
+**The loss is inside aws-c-s3, the CRT client that `libstreamers3.so` wraps.**
+It opens roughly one TCP connection per 8 MiB chunk (241 connections for 259
+requests on the 2 GiB shard), so every chunk pays a cold congestion window.
+Raising `RUNAI_STREAMER_S3_TARGET_GBPS`, `_MAX_CONNECTIONS` and
+`_CHUNK_BYTESIZE` moves nothing (548–633 MB/s across the sweep).
+
+That localizes the remaining gap precisely: it is not the gateway, and not the
+streamer — it is the S3 client between them, which is exactly the component a
+Run:ai backend plugin would replace.
+
+Run it as a **per-GPU-node sidecar**: the long hop (EN → sidecar) keeps RDMA,
+and only the loopback hop pays HTTP. A single central gateway would make itself
+the bandwidth bottleneck and need its own HA story.
+
+The trade against Recipe C is the data path: the gateway is HTTP/TCP with two
+extra copies, where the native loader is `read_into` straight into a pinned
+buffer over UCX. Use C on vLLM; use D where C cannot register. Operational
+detail, including the path-style requirement, is in `docs/ops.md`.
 
 ## Datasets
 
@@ -175,7 +228,8 @@ weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
 | situation | use |
 |---|---|
 | **vLLM** serving an autumn model (the default) | **C** — `autumn_vllm_loader`, `--load-format autumn` (zero-copy) |
-| **SGLang / FreeToken** (no loader plugin seam) | **B** (FUSE mount) — C cannot register there |
+| **SGLang / FreeToken** (no loader plugin seam) | **D** — `autumn-s3` + `--load-format runai_streamer`; **B** (FUSE mount) if you cannot add the sidecar |
+| any S3-speaking tool (`aws s3`, datasets, checkpoints) | **D** — `autumn-s3` |
 | other engine / no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
 | want no copy-out / ephemeral nodes | **B** (FUSE + `eager`) |
 | loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |

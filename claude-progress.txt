@@ -1,3 +1,38 @@
+Date: 2026-09-01
+TaskStatus: not_completed
+Task scope: 只读 S3 兼容网关 autumn-s3(examples/s3-gateway),把没有 loader 插件位的引擎
+  (SGLang / FreeToken)接上它们内建的 --load-format runai_streamer。
+【为什么做】46ed345 坐实 autumn_vllm_loader 是 vLLM-only:SGLang 的 LoadFormat 是封闭枚举
+  (configs/load_config.py:15) + get_model_loader 硬编码 if 链(model_loader/loader.py:3106),
+  全树无 register_model_loader。但 SGLang 原生带 RUNAI_STREAMER,而 runai 只会说 S3。
+  ⇒ 一个 S3 端点同时喂 vLLM + SGLang,零引擎改动。
+【实现】examples/s3-gateway(bin autumn-s3),~600 行 + 5 单测。只做 runai 真正发的三件事:
+  ListObjectsV2 / ranged GetObject / 整取 GetObject。不验签(忽略 Authorization),
+  只走 path-style。bucket = fs/ 下第一级目录。读穿 autumn-fuse 的 core 层,所以 lane 条带、
+  EN-direct、authz 全部自动继承(是 adapter,不是第二数据面)。
+【一个真 bug,不是 lint】FsState 最初用 Rc<RefCell<>>:每个命名空间操作都在持有 &mut 的情况下
+  await RPC,第二个并发请求就 already-borrowed panic —— 而流式读天然并发,这是常态不是角落。
+  改成异步 mutex,并按 fuse dispatcher 的分法把读拆成 prepare(持锁,只路由)+ execute(无锁,真 I/O),
+  并发 GET 仍然重叠扇出。64 并发 ranged GET 验证:全 206,零 panic。
+【验证】boto3(真 botocore)全套过:list_buckets/list_objects_v2(prefix+delimiter+encoding-type=url)/
+  head_object/get_object/ranged/官方 paginator/typed NoSuchKey+NotImplemented。
+  **真 runai-model-streamer 0.15.6 端到端字节精确**(list → bytes=0-7 头长 → header JSON →
+  各张量 chunk,3 张量全 exact)。边界:206+精确 Content-Range、末段钳位、bytes=-N、
+  416 带 bytes*/size、写回 NotImplemented。
+【A/B 数字(2 GiB shard, loopback)】native read_into 8 线程 1327 MB/s;裸 HTTP 过网关 1290
+  (native 的 97%);runai→网关 ~600 (45%);runai→本地页缓存 20-33 GB/s。
+  ⇒ HTTP 这一跳几乎免费,网关不是瓶颈,runai 流水线也不是。瓶颈是 libstreamers3.so 包的
+  **aws-c-s3 CRT 客户端**:每 8 MiB chunk 开一条新 TCP(2 GiB = 241 连接/259 请求),
+  每块吃冷拥塞窗口;TARGET_GBPS/MAX_CONNECTIONS/CHUNK_BYTESIZE 全扫过 548-633 纹丝不动;
+  网关自身 keep-alive 正常(curl 复用)。这把 F-S3-RUNAI-PLUGIN 的启动判据(<60%)打开了,
+  而且证明"插件会继承同样天花板"这个反对意见不成立——插件替换的正是 CRT 那一段。
+【坑(已写 ops.md)】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY:有代理的环境里 boto3 侧 list 正常
+  (boto3 认 NO_PROXY),每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。
+  指纹 = "目录列得好好的,读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
+Main gaps: (b) SGLang 真起服务加载真模型未跑;(c) vLLM 同(本机无 vLLM);
+  跨机(非 loopback)未测;CRT 连接复用是否有办法修未查。
+Next steps: 查 aws-c-s3 连接复用(便宜的修,能成就不必写插件);再决定 F-S3-RUNAI-PLUGIN。
+
 Date: 2026-08-27 (b)
 TaskStatus: completed
 Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比较器(user-key 优先)。

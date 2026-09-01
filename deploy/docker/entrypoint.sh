@@ -406,6 +406,30 @@ run_fuse() {
     exec autumn-fuse "${args[@]}"
 }
 
+run_s3() {
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    wait_for_manager "$mgr"
+
+    local -a args=(
+        --manager "$mgr"
+        --listen "${AUTUMN_S3_LISTEN:-0.0.0.0}"
+        --port "${AUTUMN_S3_PORT:-9100}"
+    )
+    # Same fs/ credential the fuse role uses — the gateway reads the same tree,
+    # and authz gates READS too, so this is required once fs/ is protected.
+    [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
+        && args+=(--credential-file "$AUTUMN_CREDENTIAL_FILE")
+    [[ -n "${AUTUMN_S3_DIRECT_READ:-}" ]] \
+        && args+=(--direct-read "$AUTUMN_S3_DIRECT_READ")
+    # Distinct daemon identity per pod so the manager's lease registry can tell
+    # gateways apart (HOSTNAME is set by the orchestrator).
+    [[ -n "${HOSTNAME:-}" ]] && args+=(--host "s3-$HOSTNAME")
+
+    log "exec autumn-s3 ${args[*]}"
+    exec autumn-s3 "${args[@]}"
+}
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
@@ -416,6 +440,7 @@ case "${1:-}" in
     ps)           run_ps ;;
     bootstrap)    run_bootstrap ;;
     fuse)         run_fuse ;;
-    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|<command...>" ;;
+    s3)           run_s3 ;;
+    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|s3|<command...>" ;;
     *)            exec "$@" ;;
 esac
