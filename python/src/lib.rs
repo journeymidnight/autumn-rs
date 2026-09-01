@@ -1002,7 +1002,7 @@ impl BatchClient {
     #[new]
     // D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
     // (keyword-only, after the perf knobs); `principal` + `credential` are the
-    // OPTIONAL authz identity (细化三 rename from `tenant=`).
+    // OPTIONAL authz identity (renamed from `tenant=` in refinement 3).
     #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
     fn new(
         py: Python<'_>,

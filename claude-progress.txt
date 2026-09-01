@@ -1,6 +1,6 @@
-Date: 2026-09-01 (b)
-TaskStatus: completed
-Task scope: 真引擎验收 S3 网关(vLLM 0.28 + SGLang 0.5.10),然后删掉 autumn_vllm_loader。
+Date: 2026-09-01
+TaskStatus: not_completed
+Task scope: ingest 慢的根因与修复 + graph 改成图数据库 API + 代码注释去中文行话。
 【真引擎结果(Qwen3-8B / 16 GiB / 单张 H200)】
   vLLM 0.28   本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5/19.0 | 已退役 loader 18.23/18.25
   SGLang 0.5.10 本地盘 35.7                  | 网关 37.1
@@ -64,6 +64,34 @@ Task scope: 只读 S3 兼容网关 autumn-s3(examples/s3-gateway),把没有 load
 【坑(已写 ops.md)】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY:有代理的环境里 boto3 侧 list 正常
   (boto3 认 NO_PROXY),每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。
   指纹 = "目录列得好好的,读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
+【ingest 慢的根因与修复（6b3a408）】
+  剖析结论: ingest ~99% 在等待。真集群 0.53s/chunk vs loopback 0.02s/chunk；
+  reconcile 阶段 84s 墙钟 / 1.9s CPU。成本单位是**往返**，不是字节也不是 CPU。
+  已做:
+  - `begin_bulk_index`/`flush_stats` 延迟 `meta/stats`。原本每篇文档 2 次往返写一个计数器，
+    同时它也是 ingest 循环无法并发的原因（单 key 并发 RMW 丢更新）。
+  - 循环拆成顺序 CPU 段（id/embedding/大纲父节点解析，确实有顺序依赖）+ 并发 I/O 段。
+  - bulk 窗口内 memoize centroid 表（index_vector 原本每篇都重读重解一次）。
+  - 剩下的 `for k in keys { get(k).await }` 全部换成 get_many/delete_many：
+    reconcile 的 doc/vptr 遍历、train_centroids 的向量读、两条向量检索路径、
+    index_memory 与 delete_memory 的 posting 回收。
+  顺带挖出一个真 bug: RPC 写路径的 writev 没有按 IOV_MAX 分段，宽批次
+  （1075 iovec / 仅 57KB）被内核按**条数**拒绝(errno 40)，写线程直接退出，
+  对上表现为 "connection closed" / `batch_put op status=1`。已按 IOV_MAX(1024) 分段。
+  代码里那段 instrumentation 当初就是为了证实/证伪 IOV_MAX 假设留的 —— 这次证实了。
+  本地 3 节点验证: 368 chunks ingest 干净，reconcile is_clean（延迟统计与重数一致），
+  lexical/hybrid 检索与大纲均正常。**pod 内复测仍待做**（需先出镜像）。
+
+【graph 改成图数据库 API（7ae8ccb）】
+  用户意见: graph 部分不该局限于 code。核心层本来就是 domain-agnostic 的，
+  问题在 memory-mcp 只暴露了两个写死的边类型，从外面看就是个代码索引。
+  已加 graph_upsert_node/get_node/delete_node/add_edge/delete_edge/neighbors/
+  traverse/nodes（MCP）+ /graph/* 只读 HTTP 路由；callers/callees/members/outline/
+  trace 变成固定边类型+方向的简写。17 个 MCP 工具。
+
+【代码注释里的中文行话已清理】
+  词法腿→lexical leg、向量腿→vector leg、口径→measure 等；中文**测试语料**保留（那是数据）。
+
 Main gaps: (b) SGLang 真起服务加载真模型未跑;(c) vLLM 同(本机无 vLLM);跨机(非 loopback)未测。
 Next steps: 找一台有 vLLM/SGLang 的环境跑 (b)(c);跨机重测 A/B(loopback 掩盖了网络成本)。
 
@@ -1290,14 +1318,15 @@ Task scope: 承上条 rollout。本轮：项目边界拆分、FreeToken 镜像�
   ⇒ 规则：任何"上游没有 X"的结论，先确认所查快照与上游的距离。
 
 Main gaps:
-  - BM25 批量化提速未实测（pod 内基准 mmbench 运行中）
+  - ingest 提速只在本地 3 节点验证过；**pod 内复测未做**（要等新镜像）
   - autumn v2 未测（此处无足够新的 sglang）
   - HiCache 移植对标错误未修（照 HiRadixCache 而非 UnifiedRadixCache），见 F-HICACHE-PORT-REBASE
   - 模型未上传；FreeToken 未部署；freetoken.yaml 仍是 sidecar 形态，需改单容器
   - CP 流水线仍指 autumn-rs 的旧路径
 
 Next steps:
-  1. 读 mmbench 结果，确认批量化实际提速；据此定 memory-mcp 的 startupProbe 预算。
+  1. 出新镜像后在 pod 内复测 ingest（日志已按阶段打耗时 + ms/chunk），
+     据此定 memory-mcp 的 startupProbe 预算。
   2. freetoken.yaml 改单容器形态（同 memory-mcp）。
   3. 流水线改指 buda 仓库。
   4. 上传模型（oniond，bucket 里有没有 MiniMax-M2.5-NVFP4 待验）。
