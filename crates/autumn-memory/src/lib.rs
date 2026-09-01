@@ -374,10 +374,39 @@ impl MemoryStore {
         let old_len = old.as_ref().map(|d| d.doc_len).unwrap_or(0);
         let is_new = old.is_none();
 
-        // 1. postings (existence markers) for current terms
-        for term in tf_map.keys() {
-            let pk = keys::idx_posting_key(&self.tenant, &self.agent, term, doc_id);
-            self.put_kv(&pk, &[], ttl).await?;
+        // 1. postings (existence markers) for current terms — ONE batched write.
+        //
+        // These were written one term at a time, which is a round trip per
+        // UNIQUE TERM per document. The CJK tokenizer emits unigrams, so a
+        // ~1.5 KB Chinese chunk carries several hundred distinct terms, and
+        // ingest cost a few hundred serial RTTs per chunk: measured 0.53 s per
+        // chunk against a real cluster (~1 ms RTT) versus ~0.02 s on loopback,
+        // i.e. the whole cost was latency, not work. A 5164-chunk corpus came
+        // to ~45 minutes and read as a hang.
+        //
+        // Postings are empty-value existence markers, so batching them is
+        // exactly what `put_many` is for. They are still written BEFORE the doc
+        // record, which stays the commit point: a partial posting set with no
+        // doc record is invisible to search (`search_lexical` resolves postings
+        // through `doc/{id}`), while the reverse would let a doc be found with
+        // terms missing from the index.
+        let expires_at = if ttl == 0 {
+            0
+        } else {
+            ClusterClient::ttl_to_expires_at(ttl)
+        };
+        let posting_keys: Vec<Vec<u8>> = tf_map
+            .keys()
+            .map(|term| keys::idx_posting_key(&self.tenant, &self.agent, term, doc_id))
+            .collect();
+        if !posting_keys.is_empty() {
+            let items: Vec<(&[u8], Bytes, u64)> = posting_keys
+                .iter()
+                .map(|k| (k.as_slice(), Bytes::new(), expires_at))
+                .collect();
+            for r in self.client.put_many(&items).await {
+                r?;
+            }
         }
         // 2. the doc record — the COMMIT POINT
         let doc = recall::IndexedDoc {
