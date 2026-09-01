@@ -121,4 +121,5 @@
 - **Acceptance**: 在 authz 开启的集群上 `autumn-op --credential-file fs.cred presplit
   --namespace fs --lanes 24 --parts 6` 成功切分并写入声明；`autumn-op info` 显示 6 个分区
   跨 3 个 PS；收窄守卫仍生效（不带 `--force` 的 `--lanes 2` 被拒）。
-- **Status**: `passes: false` (2026-09-01) — 已在活集群复现；代码已按 Scope 修（autumn-op 加全局 `--credential-file`，`connect_raw` 后 `set_principal_credential`；Raw binding 下 `validate_credential_scope` 是 no-op，故只装载 token、不做任何 clamp）。**待活集群验证**后才转 true。
+- **Status**: `passes: true` (2026-09-01) — 活集群验证通过。`autumn-op --admin-token-file T --credential-file fs.cred presplit --namespace fs --lanes 24 --parts 6` → `declared fs stripe geometry: 24 lanes × 8 MiB units` + `4/5 cut points applied`，`fs` 得到 6 个分区跨 3 个 PS 均摊 2/2/2。
+  **踩到的次生坑（值得记）**: 第一次重试只切成 1/5，因为 FUSE O_DIRECT 探测时往 `fs/` 写了个 12 MiB 测试文件 —— 正是本条 Scope 里写明的"presplit 必须在写入任何数据之前"。恢复路径按 `docs/ops.md` 有效：删文件 → `autumn-op compact <part>`（两个分区都要）→ 重跑 presplit。删除只留 tombstone，不 compact 的话 `has_overlap` 依旧。
