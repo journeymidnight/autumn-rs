@@ -1,0 +1,186 @@
+# ⚠️ NOT in kustomization.yaml yet, on purpose. Four values below are
+# PLACEHOLDER_* and cannot be guessed:
+#   PLACEHOLDER_MEM / PLACEHOLDER_CPU / PLACEHOLDER_PIN_GB — sized from the
+#     checkpoint's real expert-bank footprint (moe/expert_banks.py
+#     bank_bytes_estimate), which needs the model downloaded first. Every one of
+#     them is resident and non-reclaimable, so a guess that is too low OOM-kills
+#     the pod and one that is too high wastes a node.
+#   IMAGE_AUTUMN_RS / IMAGE_FREETOKEN — the same commit SHA, per the WIRE
+#     lockstep rule.
+# Fill them, apply this file directly to check it, and only then add it to the
+# overlay's resources list.
+#
+# FreeToken — MoE serving on one RTX 4090, weights read from the autumn fs/ mount.
+#
+# Node is not a preference, it is a constraint: FreeToken needs driver r580+
+# (CUDA 13) and 192.168.3.2 (8× RTX 4090, driver 580.105.08) is the only node
+# that qualifies — 192.168.0.102 is a 4090D on driver 550 and cannot run it.
+# That node's CPU (Xeon 8457C) also carries avx512_bf16 + avx_vnni, which is the
+# top tier FreeToken's CPU-MoE kernel dispatches to.
+#
+# Hybrid execution keeps the routed experts in HOST RAM and computes part of
+# them on the CPU, so host memory sets the model ceiling and VRAM only has to
+# hold the dense weights, one layer's expert slots, and the KV pages.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: freetoken
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
+spec:
+  # ClusterIP, never a LoadBalancer: `ft serve` has NO authentication of any
+  # kind — no API key, no bearer, nothing in server/. Put an authenticating
+  # gateway in front of it before anything outside the cluster reaches it.
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
+  ports:
+    - { name: http, port: 1919, targetPort: 1919 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: freetoken
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
+spec:
+  replicas: 1
+  # Recreate, NOT RollingUpdate: one replica pinned to one GPU. A surge-first
+  # rollout would wait for a new pod that cannot schedule until the old one
+  # releases the card, and the old one waits for the new one to be ready.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
+    spec:
+      # K8s injects AUTUMN_MANAGER_PORT=tcp://<ip>:9001 from the ClusterIP
+      # Service, which collides with the entrypoint's own env convention.
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+
+      # Native sidecar (k8s >= 1.29; this cluster is 1.34). An initContainer with
+      # restartPolicy: Always starts BEFORE the app containers and keeps running,
+      # which is exactly the ordering we need — a plain sidecar container would
+      # race `ft serve` against the mount and lose on a cold start.
+      initContainers:
+        - name: fuse
+          image: IMAGE_AUTUMN_RS
+          restartPolicy: Always
+          args: ["fuse"]
+          env:
+            - { name: AUTUMN_MANAGER,          value: "autumn-manager:9001" }
+            - { name: AUTUMN_FUSE_MOUNTPOINT,  value: "/mnt/autumn" }
+            - { name: AUTUMN_CREDENTIAL_FILE,  value: "/etc/autumn/cred/fs.cred" }
+          securityContext:
+            # Mounting needs /dev/fuse and SYS_ADMIN. privileged is the blunt
+            # form; capabilities.add:[SYS_ADMIN] + a /dev/fuse device plugin is
+            # tighter if the cluster grows a policy that forbids privileged.
+            privileged: true
+          volumeMounts:
+            - name: mnt
+              mountPath: /mnt/autumn
+              # Bidirectional: the mount this container makes must become
+              # visible in the app container's namespace. Without the
+              # propagation pair the app sees an empty directory and the model
+              # path silently does not exist.
+              mountPropagation: Bidirectional
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+          startupProbe:
+            exec: { command: ["sh", "-c", "mountpoint -q /mnt/autumn"] }
+            periodSeconds: 3
+            failureThreshold: 40      # ~2 min: cluster connect + partition probe
+
+      containers:
+        - name: freetoken
+          image: IMAGE_FREETOKEN
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              # autumn's Rust client parses a SocketAddr — IP literals only, no
+              # DNS — so the manager has to be resolved before anything dials it.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+
+              # Calibrate the PCIe/CPU bandwidth split once per GPU. The profile
+              # is cached by GPU UUID and does not transfer between machines;
+              # without it `--moe-backend auto` never upgrades to hybrid. We pass
+              # hybrid explicitly below, so this is for the fetch/compute ratio.
+              ft bench bw || echo "bench bw failed — hybrid will use its default split"
+
+              exec ft serve \
+                --model /mnt/autumn/models/glm52 \
+                --host 0.0.0.0 --port 1919 \
+                --moe-backend hybrid \
+                --nvfp4-backend triton \
+                --page-size 64 \
+                --expert-load serial \
+                --tool-call-parser glm --reasoning-parser glm
+          ports:
+            - { name: http, containerPort: 1919 }
+          env:
+            # Bound how much host memory gets pinned. FreeToken otherwise tries
+            # to cudaHostRegister the ENTIRE expert bank set (_pin_budget_bytes
+            # returns None on Linux = uncapped), which under a cgroup limit ends
+            # in an mlock failure rather than a graceful fallback.
+            - { name: FREETOKEN_PIN_BUDGET_GB, value: "PLACEHOLDER_PIN_GB" }
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              # requests == limits keeps this pod Guaranteed, which is what lets
+              # a static CPU manager hand it exclusive cores. The CPU MoE kernel
+              # pins one worker per physical core and spins on a barrier; a cfs
+              # quota without exclusive cores wrecks that (its own comment: "SMT
+              # oversubscription thrashes the spin-barrier").
+              cpu: "PLACEHOLDER_CPU"
+              memory: PLACEHOLDER_MEM
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "PLACEHOLDER_CPU"
+              memory: PLACEHOLDER_MEM
+          securityContext:
+            capabilities:
+              # Pinned host memory counts against RLIMIT_MEMLOCK, and k8s has no
+              # ulimit field. IPC_LOCK is how a container is allowed to lock more
+              # than the runtime default.
+              add: ["IPC_LOCK"]
+          volumeMounts:
+            - name: mnt
+              mountPath: /mnt/autumn
+              readOnly: true
+              # HostToContainer: receive the sidecar's mount, don't propagate
+              # anything back.
+              mountPropagation: HostToContainer
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+            # Triton/JIT kernel cache + the `ft bench bw` profile. On emptyDir it
+            # is rebuilt every pod start; point it at a PVC if JIT compile time
+            # on cold start turns out to matter.
+            - { name: ftcache, mountPath: /root/.cache }
+          startupProbe:
+            # Weight load from the mount dominates cold start, and a large MoE
+            # takes minutes. Generous budget, then a tight liveness.
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+            failureThreshold: 120     # 20 min
+          readinessProbe:
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+          livenessProbe:
+            # A failed /v1/cache/rebuild latches the server into
+            # maintenance_state == "failed" and answers 503 forever; only a
+            # restart clears it, so failing liveness on that is correct.
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - { name: mnt, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
+        # Torch's multiprocessing needs more than the 64 MiB default /dev/shm.
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
+        - { name: ftcache, emptyDir: {} }
