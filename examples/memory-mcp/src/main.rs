@@ -95,20 +95,37 @@ fn opt<'a>(p: &'a P, k: &str, d: &'a str) -> &'a str {
     p.get(k).map(String::as_str).filter(|s| !s.is_empty()).unwrap_or(d)
 }
 
+/// What `mode=auto` resolves to.
+///
+/// It has to ask whether the EMBEDDER is semantic, not whether a vector index
+/// exists. The previous version tested `cfg["modes"].len() > 1` — but `modes` is
+/// a hardcoded `["lexical","vector","hybrid"]`, so that was a constant `true`
+/// and `auto` always meant `hybrid`; the MCP path did not even check, mapping
+/// `auto` straight to `hybrid`.
+///
+/// With the default `HashEmbedder` the vector leg is noise, and RRF fusion
+/// pulls that noise into the top ranks: on a corpus of Chinese Buddhist texts,
+/// `坐禅` under `lexical` returned five on-topic passages, while the same query
+/// under the `auto` default put vector noise at ranks 1-2. Anyone who asked for
+/// nothing in particular — which is every MCP `search_docs` call — got the
+/// degraded channel.
+///
+/// An explicit `mode=vector` / `mode=hybrid` is still honoured: this only
+/// decides what "no preference" means.
+fn auto_mode(emb: &embed::Embedder) -> &'static str {
+    if emb.is_semantic() {
+        "hybrid"
+    } else {
+        "lexical"
+    }
+}
+
 // -- handlers ---------------------------------------------------------------
 
 async fn h_search(app: &App, p: P) -> Result<Response<Body>, AppError> {
     let q = req(&p, "q")?;
     let mode = opt(&p, "mode", "auto");
-    let mode = if mode == "auto" {
-        if app.cfg["modes"].as_array().map(|a| a.len() > 1).unwrap_or(false) {
-            "hybrid"
-        } else {
-            "lexical"
-        }
-    } else {
-        mode
-    };
+    let mode = if mode == "auto" { auto_mode(&app.code.emb) } else { mode };
     let k: usize = opt(&p, "k", "10").parse().unwrap_or(10);
     let corpus = Corpus::parse(opt(&p, "corpus", "code"));
     let hits = app.code.search(q, mode, k, corpus).await?;
@@ -340,7 +357,7 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto") {
-        "auto" => "hybrid",
+        "auto" => auto_mode(&code.emb),
         m => m,
     };
     let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
@@ -530,6 +547,10 @@ async fn main() -> Result<()> {
     let cfg = json!({
         "tenant": args.tenant, "agent": args.agent, "manager": args.manager,
         "embedder": emb.name(), "dim": emb.dim(),
+        // Consumed by `auto_mode`, and worth exposing: a caller comparing
+        // `mode=vector` results against `lexical` needs to know which of the
+        // two the index can actually support.
+        "embedder_semantic": emb.is_semantic(),
         "modes": ["lexical", "vector", "hybrid"],
         "root": root.display().to_string(),
         "files": files, "symbols": symbols, "edges": edges,

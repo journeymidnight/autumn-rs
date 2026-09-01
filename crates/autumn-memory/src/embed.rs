@@ -177,6 +177,23 @@ impl Embedder {
         }
     }
 
+    /// Whether this embedder's vectors carry MEANING, i.e. whether nearby
+    /// vectors imply related text.
+    ///
+    /// `HashEmbedder` is a signed-FNV bag-of-words projection: deterministic and
+    /// useful for exercising the vector path, but two texts about the same topic
+    /// land no closer than two unrelated ones. Vector and hybrid search over it
+    /// return noise, so anything CHOOSING a retrieval mode on the user's behalf
+    /// must ask this rather than assume a vector index means vector search
+    /// works.
+    pub fn is_semantic(&self) -> bool {
+        match self {
+            Embedder::Hash(_) => false,
+            #[cfg(feature = "static-embed")]
+            Embedder::Static(_) => true,
+        }
+    }
+
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         match self {
             Embedder::Hash(h) => Ok(h.embed(text)),
