@@ -1238,4 +1238,69 @@ Next steps:
   3. 核心 stop-the-world 滚 v29，紧接着 autumn-op rebalance(重启后 partition 会全挤在一个 PS)。
   4. 之后按计划文件的工作流 B~F 推进。
 
+Date: 2026-09-01 (b)
+TaskStatus: not_completed
+Task scope: 承上条 rollout。本轮：项目边界拆分、FreeToken 镜像打通、memory-mcp 上集群、
+  autumn KV v2 实现、BM25 倒排批量化。
+
+【项目边界（用户拍板）】FreeToken+MCP 是 autumn 的**用户**，不该住在 autumn 仓库里。
+  已拆出 github.com/thesues/buda（public）：docker/Dockerfile.freetoken + k8s/{freetoken,
+  upload-model-minimax,memory-mcp}.yaml。autumn-rs 保留：集群本体、all-roles 镜像、
+  autumn-fuse、memory-mcp 源码。判据="这个负载不存在了，这东西还在吗"。
+  后果：CP 流水线 freetoken-autumn 要改指 buda 仓库 + docker/Dockerfile.freetoken；
+  且 AUTUMN_IMAGE 不能再用 ${SCM_COMMIT_ID}（两仓 commit 空间不重合），WIRE 锁步从
+  自动退回手动维护。
+
+【FreeToken 镜像已打通】52411e5 构建成功并实测：ft/oniond/hfd/autumn-fuse/autumnfs/
+  autumn-op/nvcc/aria2c 全在，torch 2.11.0+cu130、freetoken 0.1.2、autumn PyO3
+  (Client/BatchClient/Fs/set_transport)、autumn_kvcache 均可 import。
+  踩到的坑：(a) ivolces 的 PyPI 镜像**没有 freetoken 包**（from versions: none）→ 改用
+  aliyun，且给 freetoken 单独一个 FREETOKEN_INDEX_URL，不受流水线传的 PIP_INDEX_URL 影响
+  （否则"正确性依赖有人记得改流水线参数"）；(b) oniond 运行时需要 jq，镜像未装。
+
+【mountPropagation 在本集群不生效 —— 推翻 sidecar 形态】
+  memory-mcp 用 fuse sidecar + Bidirectional/HostToContainer 起不来，主容器看不到挂载。
+  实测：特权 sidecar 里 `grep -c "shared:" /proc/self/mountinfo` = **0**，FUSE 挂载
+  PROPAGATION=private、父挂载是容器根 overlay。字段被 API server 接受但**节点侧没兑现**
+  （kubelet 未配 rshared）。改成**单容器**（autumn-fuse 后台进程 + 应用同容器）后成功 ——
+  同一 mount namespace，不需要传播。代价：整个容器 privileged。FreeToken 的 manifest
+  也要同样改。
+
+【memory-mcp 慢的真因（真 bug，已修）】crates/autumn-memory/src/lib.rs:378 BM25 倒排
+  **逐词项串行写**，每个独立词项一次 RTT。CJK unigram 分词下一个 ~1.5KB 中文 chunk 有
+  几百个独立字 ⇒ 每 chunk 几百次串行往返。三步隔离证据：(1) 挂载无辜——17 文件在隔离
+  pod 每个 0 秒读完；(2) 最小复现 20KB/15chunk = 8 秒 = 0.53s/chunk；(3) 本地 loopback
+  ~0.02s/chunk，差 25 倍 = RTT 之比。5164 chunk × 0.53s ≈ 45 分钟，表现为"挂死"。
+  已改 put_many 批量（同文件别处早有批量，注释还写着 "batched (was serial)"）。
+  **提速幅度待 pod 内实测**（本地 loopback 测不出这个问题）。
+
+【autumn KV v2 已实现（efeea3c，未测）】batch_exists_v2/batch_get_v2/batch_set_v2。
+  两个易错点已处理：存在性用 **KV keys 按池 scope 后的形式**探测（transfer.keys 只贡献
+  长度）；页视图按**拥有该索引的池**解析（v2 下解错池会静默读到错误字节，形状一样）。
+  key schema 天然支持：full_key(tenant, hash, pool)，KV 池段就是 "kv" == PoolName.KV，
+  所以 KV key 与 v1 逐字节相同，是加法不是迁移。v2 类型独立 import 且容忍缺失。
+
+【三次"上游有没有 X"的教训】
+  1. sglang: 我基于落后 6232 commit 的克隆断言"没有 SWA+HiCache" —— 错。上游有
+     UnifiedRadixCache(3120 行)+unified_cache/ 子包，ComponentType{FULL,SWA,MAMBA,C128}。
+     且 SGLANG_ENABLE_UNIFIED_RADIX_TREE 已废弃（unified 成默认），HiRadixCache 已是死代码。
+  2. FreeToken runai_streamer: 0 命中 —— 它没有 loader 抽象层，S3 网关对它无用，
+     FUSE 仍是唯一路径。
+  3. FreeToken HiCache: 上游 a2538a4 仍只有 TODO 注释，**完全没有分层缓存**。
+  ⇒ 规则：任何"上游没有 X"的结论，先确认所查快照与上游的距离。
+
+Main gaps:
+  - BM25 批量化提速未实测（pod 内基准 mmbench 运行中）
+  - autumn v2 未测（此处无足够新的 sglang）
+  - HiCache 移植对标错误未修（照 HiRadixCache 而非 UnifiedRadixCache），见 F-HICACHE-PORT-REBASE
+  - 模型未上传；FreeToken 未部署；freetoken.yaml 仍是 sidecar 形态，需改单容器
+  - CP 流水线仍指 autumn-rs 的旧路径
+
+Next steps:
+  1. 读 mmbench 结果，确认批量化实际提速；据此定 memory-mcp 的 startupProbe 预算。
+  2. freetoken.yaml 改单容器形态（同 memory-mcp）。
+  3. 流水线改指 buda 仓库。
+  4. 上传模型（oniond，bucket 里有没有 MiniMax-M2.5-NVFP4 待验）。
+  5. DSV4 vs MiniMax 的 KV 取舍待用户定（F-FT-DSV4-KV-SCOPE）。
+
 （更早任务历史见 git log；本文件按规则 12 定期裁剪，保持整洁。）
