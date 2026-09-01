@@ -57,10 +57,21 @@ kubectl kustomize "$here" \
     | kubectl apply -f -
 
 if [[ "${1:-}" == "--restart" ]]; then
-    # Stop-the-world restart: every role except etcd. WIRE-version bumps require
-    # this (rkyv has no cross-version compat); it also forces a full recovery,
-    # which is what you measure PS reopen time with.
-    echo ">>> $(date +%T) stop-the-world restart (all roles except etcd)"
-    kubectl delete pod -n autumn -l 'component!=etcd'
+    # Stop-the-world restart: every autumn role except etcd. WIRE-version bumps
+    # require this (rkyv has no cross-version compat); it also forces a full
+    # recovery, which is what you measure PS reopen time with.
+    #
+    # The selector must be BOTH label keys. The pods label with
+    # `app.kubernetes.io/component`, never a bare `component`, so the old
+    # `-l 'component!=etcd'` was true for every pod in the namespace — it matched
+    # 18 pods on the live cluster (etcd, unrelated app pods and completed Job
+    # pods included) instead of the 10 core ones. Deleting etcd here would take
+    # the control plane's store down alongside everything that depends on it.
+    # `app.kubernetes.io/name=autumn` also keeps the blast radius inside this
+    # deployment, so a co-tenant workload in the namespace is never touched.
+    sel='app.kubernetes.io/name=autumn,app.kubernetes.io/component!=etcd'
+    echo ">>> $(date +%T) stop-the-world restart (all autumn roles except etcd)"
+    kubectl get pods -n autumn -l "$sel" -o name
+    kubectl delete pod -n autumn -l "$sel"
     kubectl get pods -n autumn -w
 fi
