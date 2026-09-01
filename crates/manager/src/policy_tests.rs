@@ -1282,7 +1282,7 @@ fn rebalance_advisory_disabled_when_threshold_zero() {
 }
 
 // ===========================================================================
-// est_live口径 tests (design doc §3.3 D3)
+// est_live measure tests (design doc §3.3 D3)
 // ===========================================================================
 
 use crate::policy::{effective_size_bytes, est_live_bytes, partition_sealed_sums};
@@ -1376,7 +1376,7 @@ fn partition_sealed_sums_dedups_and_degrades() {
 }
 
 /// The headline fix: a VP-heavy partition (LSM-resident 741 MB, ~55 GiB of
-/// sealed stream bytes) reaches SPLIT_SIZE_HARD under the new口径 — the old
+/// sealed stream bytes) reaches SPLIT_SIZE_HARD under the new measure — the old
 /// `size_bytes`-only predicate could never fire here.
 #[test]
 fn est_live_vp_load_split_fires_despite_small_lsm() {
@@ -1411,7 +1411,7 @@ fn est_live_vp_load_split_fires_despite_small_lsm() {
     assert_eq!(out.len(), 1, "expected exactly the split candidate: {out:?}");
     assert_eq!(out[0].kind, POLICY_KIND_SPLIT);
     assert_eq!(out[0].primary_part_id, 17);
-    // The SIZE column (candidate.size_bytes) carries the new口径.
+    // The SIZE column (candidate.size_bytes) carries the new measure.
     assert_eq!(out[0].size_bytes, 55 * GIB);
     assert!(
         out[0].reason.contains("est_live"),
@@ -1498,7 +1498,7 @@ fn est_live_vp_partition_not_a_merge_candidate() {
     let now = 1_700_000_000;
     let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
     let cold = PartitionLoad {
-        size_bytes: 200 * 1024 * 1024, // both look tiny to the old口径
+        size_bytes: 200 * 1024 * 1024, // both look tiny to the old measure
         req_per_sec: 1,
         ..Default::default()
     };
@@ -1551,7 +1551,7 @@ fn est_live_underflow_clamps_and_cold_pair_still_merges() {
     assert_eq!(out[0].kind, POLICY_KIND_MERGE);
 }
 
-/// The hot/cold size dimension consumes the same口径: a VP-heavy partition
+/// The hot/cold size dimension consumes the same measure: a VP-heavy partition
 /// (tiny LSM-resident, 60 GiB sealed) registers as size-hot.
 #[test]
 fn hot_cold_size_dimension_sees_est_live() {
@@ -1587,5 +1587,5 @@ fn hot_cold_size_dimension_sees_est_live() {
     assert_eq!(cands.len(), 1, "size-hot via est_live expected: {cands:?}");
     assert_eq!(cands[0].kind, POLICY_KIND_HOT_COLD);
     assert_eq!(cands[0].primary_part_id, 300);
-    assert_eq!(cands[0].size_bytes, 60 * GIB, "SIZE column carries the new口径");
+    assert_eq!(cands[0].size_bytes, 60 * GIB, "SIZE column carries the new measure");
 }

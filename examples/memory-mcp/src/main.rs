@@ -532,16 +532,24 @@ async fn main() -> Result<()> {
         tracing::info!("agent already indexed ({symbols} symbols) — serving it; --reindex to rebuild");
     }
 
+    // Timed per phase: ingest is round-trip-bound, so when it feels slow the
+    // useful question is WHICH phase, and per-chunk ms is the number that
+    // compares across corpora and across clusters.
     let mut doc_chunks = 0usize;
     for d in &args.docs {
         tracing::info!("ingesting documents from {} ...", d.display());
+        let t0 = std::time::Instant::now();
         let (f, c, e) = docs::ingest_path(&store, &emb, d).await?;
-        tracing::info!("ingested {c} chunks ({e} outline edges) from {f} files");
+        let ms = t0.elapsed().as_millis();
+        let per = if c > 0 { ms as f64 / c as f64 } else { 0.0 };
+        tracing::info!("ingested {c} chunks ({e} outline edges) from {f} files in {ms} ms ({per:.1} ms/chunk)");
         doc_chunks += c;
     }
     if doc_chunks > 0 {
+        let t0 = std::time::Instant::now();
         let r = store.reconcile().await?;
         store.train_centroids(((r.docs as usize) / 20).clamp(1, 64), 25, 7).await?;
+        tracing::info!("reconcile + train_centroids in {} ms", t0.elapsed().as_millis());
     }
 
     let cfg = json!({

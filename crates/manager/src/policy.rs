@@ -536,7 +536,7 @@ impl PolicyEngine {
                 primary_part_id: part_id,
                 secondary_part_id: 0,
                 reason,
-                // The SIZE column of `policy-candidates` — the new口径.
+                // The SIZE column of `policy-candidates` — the new measure.
                 size_bytes: recent_eff,
                 req_per_sec: recent.req_per_sec,
                 imm_full_per_sec: recent.imm_full_per_sec,
@@ -1068,7 +1068,7 @@ impl PolicyEngine {
                 None => continue,
             };
             // the size dimension consumes
-            // `effective_size_bytes` (same口径 as split/merge) so a VP-heavy
+            // `effective_size_bytes` (same measure as split/merge) so a VP-heavy
             // partition registers as size-hot even though its LSM-resident
             // `size_bytes` is tiny (`sealed_sums` from
             // `partition_sealed_sums(state)`, computed once per tick in

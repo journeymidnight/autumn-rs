@@ -188,9 +188,9 @@ pub(crate) struct Args {
 ///
 /// The wire (SPLIT_PART) only ever carries a RAW byte key (partition layer is
 /// namespace-agnostic, D5). This enum is the CLI-side INTENT; `resolve_at_key`
-/// lowers it to the raw wire key. Per the §3.4 CLI refinement (细化三 term
-/// rule: prefixes are an implementation detail, the user面 speaks only
-/// namespace/tenant):
+/// lowers it to the raw wire key. Per the §3.4 CLI refinement (refinement 3's
+/// term rule: prefixes are an implementation detail, the user-facing surface
+/// speaks only namespace/tenant):
 /// - `Median` — no explicit point; PS picks the median (legacy).
 /// - `Namespaced { namespace, tenant, suffix }` — the normal operator form.
 ///   The cut key = `"{tenant}/{namespace}/" ++ suffix` (TENANT-FIRST). An EMPTY
@@ -1247,8 +1247,8 @@ pub(crate) fn parse() -> Args {
             }
             let part_id: u64 = num_arg(&raw, i, "PARTID");
             i += 1;
-            // (D4). CLI user面 speaks namespace/tenant, never
-            // raw prefix bytes (§3.4 CLI refinement / 细化三). Forms:
+            // (D4). The CLI's user-facing surface speaks namespace/tenant,
+            // never raw prefix bytes (§3.4 CLI refinement / refinement 3). Forms:
             //   split <PART>                                    → median (legacy)
             //   split <PART> --namespace NS --tenant T [--at S | --at-hex HEX]
             //        → cut at "NS/T/" ++ suffix; empty/omitted suffix = the

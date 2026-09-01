@@ -938,6 +938,31 @@ printf '%s\n' \
 ./cluster.sh stop
 ```
 
+**Ingest throughput must be measured against a REAL cluster, never loopback.**
+Ingest is round-trip-bound, so loopback (~0.02 s/chunk) hides the cost that
+dominates in a pod (~0.53 s/chunk before batching, i.e. ~45 min for a
+5164-chunk corpus, which reads as a hang). To time it where it counts, run the
+ingest from inside the cluster:
+
+Startup ingest logs each phase's elapsed time, so a pod's own log is the
+measurement — no separate harness:
+
+```bash
+kubectl -n autumn logs deploy/memory-mcp | grep -E 'ms/chunk|reconcile \+ train'
+#   → ingested 5164 chunks (5164 outline edges) from 31 files in ... ms (... ms/chunk)
+#   → reconcile + train_centroids in ... ms
+```
+
+Re-measure with `--reindex` (rebuilds the code corpus) or by pointing `--docs`
+at a fresh corpus; a re-ingest of unchanged docs is an upsert and stays
+representative of the write path.
+
+If a change makes this slower, look for a `for k in keys { get(k).await }` loop
+first — see "Round trips are the cost model" in `crates/autumn-memory/CLAUDE.md`.
+A bulk ingest must also bracket itself with `begin_bulk_index()` /
+`flush_stats()`; skipping the flush leaves `meta/stats` understating the corpus
+until `repair_stats` runs (and `/stats` will show it).
+
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single

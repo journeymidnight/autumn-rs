@@ -1,7 +1,7 @@
 //! Stage 2 — PS-side data-plane authorization enforcement.
 //!
-//! The PS is the KV-layer enforcement point (per the design decision "auth 在
-//! kv 层做"). It holds ONLY the manager's PUBLIC verifying keys (fetched via
+//! The PS is the KV-layer enforcement point (per the design decision that auth
+//! is enforced at the KV layer). It holds ONLY the manager's PUBLIC verifying keys (fetched via
 //! `MSG_GET_AUTHZ_CONFIG`), verifies a capability token ONCE per connection
 //! (`MSG_AUTH_HELLO`), and does a per-request byte `starts_with` + `exp` check.
 //! It NEVER calls the manager to enforce — the data plane is independent of the

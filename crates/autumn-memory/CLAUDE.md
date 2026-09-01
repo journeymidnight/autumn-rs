@@ -135,6 +135,40 @@ in the consumer.
   (`last_key ++ 0x00`) — exact under the PS's user-key-first internal-key
   comparator (`RangeReq.start` docs).
 
+## Round trips are the cost model — batch every key loop
+
+Everything here is `{scan keys} → {point-get each}` over a network KV, so the
+unit of cost is the ROUND TRIP, not the byte or the CPU cycle. Measured on the
+live cluster (~1 ms RTT): an ingest was 0.53 s per chunk against the cluster
+versus 0.02 s on loopback, and its reconcile phase burned 84 s of wall clock
+for 1.9 s of CPU — 98% of ingest was waiting, and none of it was work.
+
+The rule that follows: **a `for k in keys { client.get(k).await }` loop is a
+bug.** Use `get_many` / `put_many` / `delete_many`, chunked (256) so one batch
+never becomes an unbounded frame. Sites that follow it: `search_lexical`'s
+candidate fetch, `index_memory`'s postings write and stale-term reap,
+`delete_memory`'s reap, `reconcile`'s doc and vptr walks (via `get_all`),
+`train_centroids`' vector read, and both vector search paths.
+
+Two more ingest-specific levers, both opened explicitly by the caller and
+closed by `flush_stats`:
+
+- **`begin_bulk_index()` defers `meta/stats`.** The per-document
+  read-modify-write of one counter key was two round trips per document, AND
+  the reason a bulk loop had to stay serial — concurrent writers to a single
+  key lose updates. Deferring makes the counter STALE for the window (idf/avgdl
+  seen by a concurrent reader reflect the pre-ingest corpus), which is the same
+  eventual consistency `repair_stats` already exists for. Deltas are exact:
+  call `flush_stats` on the ERROR path too, or a partial ingest silently
+  understates the corpus.
+- The same flag memoises the **centroid table**, which `index_vector` otherwise
+  re-reads and re-decodes for every single document.
+
+With stats deferred the ingest loop is order-independent, so `memory-mcp`'s
+`ingest_path` splits into a sequential CPU pass (chunking, ids, embeddings, and
+outline-parent resolution, which IS order-dependent through `path_owner`) and a
+concurrent I/O pass with a bounded number of chunks in flight.
+
 ## Index reconcile / repair (`reconcile` / `repair_stats`, plan §16)
 
 An OFF-hot-path integrity audit + heal (the plan's per-phase acceptance tool):

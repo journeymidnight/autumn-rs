@@ -28,7 +28,7 @@ mod graph;
 mod recall;
 mod vector;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +65,13 @@ pub struct MemoryStore {
     default_ttl: u64,
     page_limit: u32,
     seq: Cell<u32>,
+    /// When set, `update_stats` accumulates here instead of doing I/O.
+    /// `Some((d_docs, d_len))` = a bulk index is open; see `begin_bulk_index`.
+    pending_stats: Cell<Option<(i64, i64)>>,
+    /// Centroid table memoised for the duration of a bulk index. Outer `None`
+    /// = nothing cached; inner `None` = the index is untrained, which is a
+    /// real answer worth caching too.
+    centroid_cache: RefCell<Option<Option<Rc<vector::Centroids>>>>,
 }
 
 impl MemoryStore {
@@ -124,6 +131,8 @@ impl MemoryStore {
             default_ttl: 0,
             page_limit: 256,
             seq: Cell::new(0),
+            pending_stats: Cell::new(None),
+            centroid_cache: RefCell::new(None),
         }
     }
 
@@ -325,7 +334,7 @@ pub struct ScoredDoc {
 }
 
 impl MemoryStore {
-    // -- BM25-on-KV lexical retrieval (plan §7 词法腿) ------------------------
+    // -- BM25-on-KV lexical retrieval (plan §7 lexical leg) -------------------
 
     async fn read_stats(&self) -> Result<(u64, u64), AutumnError> {
         let skey = keys::stats_key(&self.tenant, &self.agent);
@@ -339,6 +348,23 @@ impl MemoryStore {
     }
 
     async fn update_stats(&self, d_docs: i64, d_len: i64) -> Result<(), AutumnError> {
+        // Bulk mode: accumulate and return. This is what makes a bulk ingest
+        // both fast and correct.
+        //
+        // Fast: the per-document path was a read-modify-write of one key, so a
+        // 5164-chunk corpus paid 10328 round trips for a counter.
+        //
+        // Correct: that RMW is also why the ingest loop could not be run
+        // concurrently. Concurrent writers to a single key lose updates — the
+        // crate already documents that hazard for multi-PROCESS writers, and
+        // overlapping the loop would have made it happen inside one process on
+        // every ingest. Accumulating in a `Cell` sidesteps it: the read and
+        // write of the cell straddle no await point, so on this single-threaded
+        // runtime they cannot interleave.
+        if let Some((n0, s0)) = self.pending_stats.get() {
+            self.pending_stats.set(Some((n0 + d_docs, s0 + d_len)));
+            return Ok(());
+        }
         let (n, s) = self.read_stats().await?;
         let n = (n as i64 + d_docs).max(0) as u64;
         let s = (s as i64 + d_len).max(0) as u64;
@@ -348,6 +374,43 @@ impl MemoryStore {
         self.client
             .put(&keys::stats_key(&self.tenant, &self.agent), &buf)
             .await
+    }
+
+    /// Defer `meta/stats` maintenance until [`flush_stats`](Self::flush_stats).
+    ///
+    /// For bulk ingest. Without it every indexed document pays a read-modify-
+    /// write of a single counter key, which is both the largest fixed cost in
+    /// an ingest and the reason the caller's loop has to stay serial.
+    ///
+    /// The deltas are exact — nothing is dropped, only postponed — but the
+    /// counter is STALE for the duration, so BM25 idf/avgdl computed by a
+    /// concurrent reader reflect the pre-ingest corpus. That is the same
+    /// eventual-consistency the crate already accepts for stats (see
+    /// `repair_stats`), narrowed to a window the caller opens deliberately.
+    ///
+    /// Idempotent: calling it while a bulk is already open keeps the running
+    /// total rather than discarding it.
+    pub fn begin_bulk_index(&self) {
+        if self.pending_stats.get().is_none() {
+            self.pending_stats.set(Some((0, 0)));
+        }
+    }
+
+    /// Apply everything accumulated since [`begin_bulk_index`] in ONE update,
+    /// and leave bulk mode. A no-op when no bulk is open.
+    ///
+    /// Call it even on the error path of a partial ingest: the documents that
+    /// did land are real, and skipping this leaves the counter understating the
+    /// corpus until someone runs `repair_stats`.
+    pub async fn flush_stats(&self) -> Result<(), AutumnError> {
+        self.centroid_cache.borrow_mut().take();
+        let Some((d_docs, d_len)) = self.pending_stats.take() else {
+            return Ok(());
+        };
+        if d_docs == 0 && d_len == 0 {
+            return Ok(());
+        }
+        self.update_stats(d_docs, d_len).await
     }
 
     /// Index (or re-index) a searchable memory document. `text` is tokenized
@@ -418,10 +481,19 @@ impl MemoryStore {
         self.put_kv(&dkey, &doc.encode(), ttl).await?;
         // 3. post-commit cleanup: drop postings for terms removed since last index
         if let Some(o) = old {
-            for term in o.terms.keys() {
-                if !doc.terms.contains_key(term) {
-                    let pk = keys::idx_posting_key(&self.tenant, &self.agent, term, doc_id);
-                    self.client.delete(&pk).await?;
+            // Batched for the same reason the writes above are: re-indexing an
+            // edited chunk can drop hundreds of terms, and one delete per term
+            // is one round trip per term.
+            let stale: Vec<Vec<u8>> = o
+                .terms
+                .keys()
+                .filter(|t| !doc.terms.contains_key(*t))
+                .map(|t| keys::idx_posting_key(&self.tenant, &self.agent, t, doc_id))
+                .collect();
+            if !stale.is_empty() {
+                let refs: Vec<&[u8]> = stale.iter().map(|k| k.as_slice()).collect();
+                for r in self.client.delete_many(&refs).await {
+                    r?;
                 }
             }
         }
@@ -445,9 +517,18 @@ impl MemoryStore {
             },
             None => return Ok(()),
         };
-        for term in doc.terms.keys() {
-            let pk = keys::idx_posting_key(&self.tenant, &self.agent, term, doc_id);
-            self.client.delete(&pk).await?;
+        // One batched reap, not one round trip per term — a CJK document
+        // carries hundreds of distinct terms.
+        let pks: Vec<Vec<u8>> = doc
+            .terms
+            .keys()
+            .map(|term| keys::idx_posting_key(&self.tenant, &self.agent, term, doc_id))
+            .collect();
+        if !pks.is_empty() {
+            let refs: Vec<&[u8]> = pks.iter().map(|k| k.as_slice()).collect();
+            for r in self.client.delete_many(&refs).await {
+                r?;
+            }
         }
         self.client.delete(&dkey).await?;
         self.update_stats(-1, -(doc.doc_len as i64)).await
@@ -562,19 +643,36 @@ impl MemoryStore {
 }
 
 impl MemoryStore {
-    // -- SPFresh-IVF-on-KV vector retrieval (plan §7 向量腿) ------------------
+    // -- SPFresh-IVF-on-KV vector retrieval (plan §7 vector leg) --------------
     // Vectors are caller-supplied (`&[f32]`); embedding is sglang's job.
 
-    async fn load_centroids(&self) -> Result<Option<vector::Centroids>, AutumnError> {
+    /// Load the centroid table, memoised while a bulk index is open.
+    ///
+    /// `index_vector` needs it for EVERY document, so an uncached read is a
+    /// round trip (plus a full decode of the k×dim table) per chunk — pure
+    /// repetition, since the table only changes in `train_centroids`, which the
+    /// caller runs after the ingest, not during it. The cache is scoped to the
+    /// bulk window rather than left on permanently so a long-lived store still
+    /// sees another writer's retraining.
+    async fn load_centroids(&self) -> Result<Option<Rc<vector::Centroids>>, AutumnError> {
+        if let Some(hit) = self.centroid_cache.borrow().as_ref() {
+            return Ok(hit.clone());
+        }
         let key = keys::ivf_centroids_key(&self.tenant, &self.agent);
-        Ok(self
+        let got = self
             .client
             .get(&key)
             .await?
-            .and_then(|b| vector::Centroids::decode(&b)))
+            .and_then(|b| vector::Centroids::decode(&b))
+            .map(Rc::new);
+        if self.pending_stats.get().is_some() {
+            *self.centroid_cache.borrow_mut() = Some(got.clone());
+        }
+        Ok(got)
     }
 
     async fn store_centroids(&self, c: &vector::Centroids) -> Result<(), AutumnError> {
+        self.centroid_cache.borrow_mut().take();
         let key = keys::ivf_centroids_key(&self.tenant, &self.agent);
         self.client.put(&key, &c.encode()).await
     }
@@ -657,13 +755,14 @@ impl MemoryStore {
         let all = keys::ivf_all_prefix(&self.tenant, &self.agent);
         let key_list = self.scan_keys(&all, None).await?;
         let mut items: Vec<(String, u32, Vec<f32>)> = Vec::new();
-        for k in &key_list {
+        let vals = self.get_all(&key_list).await?;
+        for (k, val) in key_list.iter().zip(vals) {
             let (Some(vid), Some(oc)) =
                 (keys::ivf_all_vec_id(k, &all), keys::ivf_all_centroid(k, &all))
             else {
                 continue;
             };
-            if let Some(b) = self.client.get(k).await? {
+            if let Some(b) = val {
                 if let Some(v) = vector::decode_vec(&b) {
                     items.push((vid, oc, v));
                 }
@@ -718,15 +817,24 @@ impl MemoryStore {
                 .collect(),
             _ => return self.search_vector_bruteforce(&q, top_k).await,
         };
-        let mut best: HashMap<String, f32> = HashMap::new();
+        // Collect the probed buckets' keys first, then read them in one batch:
+        // a point-get per candidate put the whole probe on the round-trip
+        // critical path, and this is the query path.
+        let mut cand: Vec<(String, Vec<u8>)> = Vec::new();
         for centroid in buckets {
             let bprefix = keys::ivf_bucket_prefix(&self.tenant, &self.agent, centroid);
             for k in self.scan_keys(&bprefix, None).await? {
                 let vid = keys::ivf_vec_id(&k, &bprefix);
-                if let Some(b) = self.client.get(&k).await? {
-                    if let Some(v) = vector::decode_vec(&b) {
-                        rerank_insert(&mut best, vid, vector::cosine(&q, &v));
-                    }
+                cand.push((vid, k));
+            }
+        }
+        let mut best: HashMap<String, f32> = HashMap::new();
+        let ckeys: Vec<Vec<u8>> = cand.iter().map(|(_, k)| k.clone()).collect();
+        let vals = self.get_all(&ckeys).await?;
+        for ((vid, _), val) in cand.into_iter().zip(vals) {
+            if let Some(b) = val {
+                if let Some(v) = vector::decode_vec(&b) {
+                    rerank_insert(&mut best, vid, vector::cosine(&q, &v));
                 }
             }
         }
@@ -740,11 +848,13 @@ impl MemoryStore {
     ) -> Result<Vec<(String, f32)>, AutumnError> {
         let all = keys::ivf_all_prefix(&self.tenant, &self.agent);
         let mut best: HashMap<String, f32> = HashMap::new();
-        for k in self.scan_keys(&all, None).await? {
-            let Some(vid) = keys::ivf_all_vec_id(&k, &all) else {
+        let key_list = self.scan_keys(&all, None).await?;
+        let vals = self.get_all(&key_list).await?;
+        for (k, val) in key_list.iter().zip(vals) {
+            let Some(vid) = keys::ivf_all_vec_id(k, &all) else {
                 continue;
             };
-            if let Some(b) = self.client.get(&k).await? {
+            if let Some(b) = val {
                 if let Some(v) = vector::decode_vec(&b) {
                     rerank_insert(&mut best, vid, vector::cosine(query, &v));
                 }
@@ -866,15 +976,29 @@ impl MemoryStore {
 
     /// Recount live docs + Σ doc_len from the authoritative `doc/{id}` records
     /// (the BM25-stats ground truth). Scans `doc/` only — no IVF work.
+    /// Point-get many keys, batched. `reconcile` walks every doc and every
+    /// vptr, and a serial `get` per key made it one round trip per document:
+    /// measured at 84 s wall for ~2 s of CPU, i.e. 98% waiting. Chunked so a
+    /// large corpus doesn't build one enormous request.
+    async fn get_all(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, AutumnError> {
+        const BATCH: usize = 256;
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH) {
+            let refs: Vec<&[u8]> = chunk.iter().map(|k| k.as_slice()).collect();
+            for r in self.client.get_many(&refs).await {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
     async fn recount_doc_stats(&self) -> Result<(u64, u64), AutumnError> {
         let doc_keys = self.scan_keys(&keys::doc_prefix(&self.tenant, &self.agent), None).await?;
         let (mut docs, mut sum_len) = (0u64, 0u64);
-        for k in &doc_keys {
-            if let Some(b) = self.client.get(k).await? {
-                if let Some(d) = recall::IndexedDoc::decode(&b) {
-                    docs += 1;
-                    sum_len += d.doc_len as u64;
-                }
+        for b in self.get_all(&doc_keys).await?.into_iter().flatten() {
+            if let Some(d) = recall::IndexedDoc::decode(&b) {
+                docs += 1;
+                sum_len += d.doc_len as u64;
             }
         }
         Ok((docs, sum_len))
@@ -915,10 +1039,11 @@ impl MemoryStore {
         let vpre = keys::ivf_vptr_prefix(&self.tenant, &self.agent);
         let vptr_keys = self.scan_keys(&vpre, None).await?;
         let mut vptr: HashMap<String, u32> = HashMap::new();
-        for k in &vptr_keys {
+        let vptr_vals = self.get_all(&vptr_keys).await?;
+        for (k, val) in vptr_keys.iter().zip(vptr_vals) {
             let vid = keys::ivf_vptr_vec_id(k, &vpre);
             // A key that vanished between scan and get is not an inconsistency.
-            if let Some(b) = self.client.get(k).await? {
+            if let Some(b) = val {
                 match read_u32(&b) {
                     Some(c) => {
                         vptr.insert(vid, c);

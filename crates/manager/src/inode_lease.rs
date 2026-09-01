@@ -8,7 +8,7 @@
 //!
 //! Only the writer lease is persisted to etcd
 //! (`inode_leases/<ino>`); reader leases live in memory only. The
-//! plan's rationale (§6 / §7 "lease 数量爆炸"): a reader subscribing
+//! plan's rationale (§6 / §7, on lease-count explosion): a reader subscribing
 //! again after a manager failover invalidates all of its cache up
 //! front, so losing the reader set on failover is benign.
 //!
@@ -43,7 +43,7 @@ pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 /// Default grace window the manager gives a writer
 /// to flush + voluntarily release after a peer's
 /// `AcquireLease(force=true)`. Matches plan §5 Phase 3 "writer
-/// revoke 协议: WillRevokeIn { 5s }". Tunable per-registry via
+/// revoke protocol: WillRevokeIn { 5s }". Tunable per-registry via
 /// `LeaseRegistry::with_ttl_and_revoke_grace`.
 pub const DEFAULT_REVOKE_GRACE: Duration = Duration::from_secs(5);
 
@@ -60,7 +60,7 @@ pub const MAX_INBOX_EVENTS: usize = 1024;
 /// Stable in-memory key for a client. Equivalent to the wire
 /// `MgrClientId` but with the diagnostic `host` field stripped so two
 /// processes that report different hostnames for the same UUID still
-/// hash to the same entry (plan §3.2: "host 诊断用").
+/// hash to the same entry (plan §3.2: for host-side diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientKey {
     pub kind: u8,

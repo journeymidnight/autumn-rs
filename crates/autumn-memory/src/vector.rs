@@ -1,5 +1,5 @@
 //! Vector retrieval primitives (SPFresh-IVF-on-KV) for autumn-memory — plan §7
-//! 向量腿. Pure, deterministic, no I/O — the embedder lives elsewhere (sglang);
+//! The vector leg. Pure, deterministic, no I/O — the embedder lives elsewhere (sglang);
 //! this module only does the math + (de)serialization that the IVF index needs.
 //!
 //! IVF (inverted file): k-means partitions the corpus into `nlist` centroids,

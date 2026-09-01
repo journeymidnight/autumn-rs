@@ -503,6 +503,36 @@ impl RpcClient {
     }
 }
 
+/// Kernels cap a single `writev` at `IOV_MAX` iovecs (1024 on both Linux and
+/// macOS) and reject anything longer — EINVAL on Linux, EMSGSIZE on macOS —
+/// regardless of how few BYTES it carries. A 1075-iovec, 57 KB frame hit
+/// exactly that and killed the writer task, surfacing to callers as an opaque
+/// "connection closed" and to the PS as `batch_put op status=1`.
+///
+/// The count scales with the number of KEYS in a batch, not their size, so any
+/// wide `put_many`/`delete_many` can reach it — which is why it only showed up
+/// once ingest started issuing large batches concurrently.
+///
+/// Writing the chunks back to back on the same writer preserves wire order: the
+/// writer task is the sole owner of the socket and awaits each chunk in turn,
+/// so a frame is still contiguous from the peer's point of view.
+const IOV_MAX: usize = 1024;
+
+async fn write_vectored_chunked(writer: &mut WriteHalf, bufs: Vec<Bytes>) -> std::io::Result<()> {
+    if bufs.len() <= IOV_MAX {
+        let BufResult(r, _) = writer.write_vectored_all(bufs).await;
+        return r;
+    }
+    let mut rest = bufs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        let BufResult(r, _) = writer.write_vectored_all(rest).await;
+        r?;
+        rest = tail;
+    }
+    Ok(())
+}
+
 /// SQ task: owns WriteHalf, drains the submit queue, writes to the socket.
 ///
 /// Sequential writes preserve per-caller submit order on the wire. If a
@@ -535,10 +565,7 @@ async fn writer_task(
                 let BufResult(r, _) = writer.write_all(bytes).await;
                 r
             }
-            SubmitMsg::Vectored { bufs, .. } => {
-                let BufResult(r, _) = writer.write_vectored_all(bufs).await;
-                r
-            }
+            SubmitMsg::Vectored { bufs, .. } => write_vectored_chunked(&mut writer, bufs).await,
         };
 
         if let Err(e) = result {
@@ -547,8 +574,10 @@ async fn writer_task(
             // (iov_count, total_bytes, errno.raw_os_error()) rather than
             // just a downstream "submit error: connection closed" cascade.
             // The original concern speculated about `IOV_MAX`
-            // exhaustion; in practice the shape logged here lets us
-            // confirm or reject that hypothesis from a single bench run.
+            // exhaustion, and the instrumentation CONFIRMED it: a 1075-iovec
+            // write of only 57 KB failed with errno 40. `write_vectored_chunked`
+            // now caps the count, so an `iov_count` at or below `IOV_MAX` here
+            // means a genuine socket error, not this shape.
             tracing::warn!(
                 addr = %peer_addr,
                 req_id,

@@ -1710,7 +1710,7 @@ pub(crate) async fn handle_split_part(
                 .to_string(),
         ));
     }
-    // #6 VERDICT (2026-06-15, /loop — 证伪): the stale-seal SILENT write-loss is
+    // #6 VERDICT (2026-06-15, /loop — falsified): the stale-seal SILENT write-loss is
     // STRUCTURALLY PRECLUDED, not merely unreproduced. The loss requires the
     // manager's `multi_modify_split` etcd commit to LAND (succeed) at a wall-
     // clock time AFTER this PS auto-unfroze (>= split_deadline = 20 s) and acked

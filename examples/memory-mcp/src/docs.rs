@@ -231,7 +231,20 @@ pub async fn ingest_path(
     }
     paths.sort();
 
-    let (mut n_chunk, mut n_edge) = (0usize, 0usize);
+    // Ingest runs in two passes, because the two halves have opposite needs.
+    //
+    // Pass 1 is strictly sequential: outline parents resolve through
+    // `path_owner`, where a chunk hangs under the FIRST chunk seen at its
+    // longest known heading prefix. That is order-dependent by construction, so
+    // it cannot be parallelised — but it is also pure CPU (chunking, ids,
+    // embeddings), which is not where the time goes.
+    //
+    // Pass 2 is the I/O, and profiling put ~99% of ingest wall-clock there
+    // while the CPU sat idle: it was one document per round trip, serialised.
+    // Nothing in it is order-dependent — ids and parents are already decided —
+    // so it runs with several requests in flight.
+    let mut work: Vec<PendingChunk> = Vec::new();
+    let mut doc_nodes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut n_file = 0usize;
     for path in &paths {
         let Ok(bytes) = std::fs::read(path) else {
@@ -255,9 +268,7 @@ pub async fn ingest_path(
             "name": fname, "kind": "Document", "file": relpath,
             "start": 1, "end": total_lines,
         });
-        store
-            .put_node(&relpath, "Document", &serde_json::to_vec(&doc_meta)?, None)
-            .await?;
+        doc_nodes.push((relpath.clone(), serde_json::to_vec(&doc_meta)?));
 
         // Heading-path → node id of the first chunk at that path, for outline
         // parent resolution (child hangs under its longest known prefix).
@@ -276,10 +287,7 @@ pub async fn ingest_path(
                 "headings": c.headings, "start": c.start_line, "end": c.end_line,
             });
             let meta_b = serde_json::to_vec(&meta)?;
-            store.index_memory(&id, &indexed, &meta_b, None).await?;
-            store.index_vector(&id, &emb.embed(&indexed)?, None).await?;
-            store.put_node(&id, "Section", &meta_b, None).await?;
-            n_chunk += 1;
+            let vector = emb.embed(&indexed)?;
 
             let key = c.headings.join("\u{1}");
             let parent = (0..c.headings.len())
@@ -287,12 +295,77 @@ pub async fn ingest_path(
                 .map(|n| c.headings[..n].join("\u{1}"))
                 .find_map(|k| path_owner.get(&k).cloned())
                 .unwrap_or_else(|| relpath.clone());
-            store.add_edge(&parent, "CONTAINS", &id, &[], None).await?;
-            n_edge += 1;
-            path_owner.entry(key).or_insert(id);
+            path_owner.entry(key).or_insert_with(|| id.clone());
+
+            work.push(PendingChunk { id, indexed, meta_b, vector, parent });
         }
     }
+
+    let (n_chunk, n_edge) = (work.len(), work.len());
+
+    // Defer the `meta/stats` read-modify-write to a single update at the end.
+    // Per document it was two round trips for a counter, and — because
+    // concurrent writers to one key lose updates — it is also what pass 2 would
+    // otherwise race on.
+    store.begin_bulk_index();
+    let res = write_all(store, doc_nodes, work).await;
+    // Flush on both paths: a partial ingest still wrote real documents, and
+    // dropping their deltas would leave the corpus stats understated until
+    // someone ran a repair.
+    let flushed = store.flush_stats().await;
+    res?;
+    flushed?;
+
     Ok((n_file, n_chunk, n_edge))
+}
+
+/// One chunk's work, with every order-dependent decision already made.
+struct PendingChunk {
+    id: String,
+    indexed: String,
+    meta_b: Vec<u8>,
+    vector: Vec<f32>,
+    parent: String,
+}
+
+/// How many chunks are in flight at once. Sized to keep the pipe full without
+/// letting one ingest monopolise the partition servers it shares with live
+/// queries; each chunk is itself several round trips.
+const INGEST_CONCURRENCY: usize = 16;
+
+/// Pass 2: the I/O. `Document` nodes go first so an edge never names a parent
+/// that is not there yet.
+async fn write_all(
+    store: &MemoryStore,
+    doc_nodes: Vec<(String, Vec<u8>)>,
+    work: Vec<PendingChunk>,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt};
+
+    let mut docs = stream::iter(doc_nodes)
+        .map(|(relpath, meta)| async move {
+            store.put_node(&relpath, "Document", &meta, None).await
+        })
+        .buffer_unordered(INGEST_CONCURRENCY);
+    while let Some(r) = docs.next().await {
+        r?;
+    }
+
+    let mut chunks = stream::iter(work)
+        .map(|w| async move {
+            // Kept in order within a chunk: `index_memory` commits the doc only
+            // after its postings land, and the node should exist before an edge
+            // points at it.
+            store.index_memory(&w.id, &w.indexed, &w.meta_b, None).await?;
+            store.index_vector(&w.id, &w.vector, None).await?;
+            store.put_node(&w.id, "Section", &w.meta_b, None).await?;
+            store.add_edge(&w.parent, "CONTAINS", &w.id, &[], None).await
+        })
+        .buffer_unordered(INGEST_CONCURRENCY);
+    while let Some(r) = chunks.next().await {
+        r?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

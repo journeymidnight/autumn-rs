@@ -8,7 +8,8 @@
 //!   - pre-BUG2 (floor == MIN): E0 is protected → the reclaim assertion FAILS (red).
 //!   - post-BUG2 (floor == durable_ckpt_vp, in a later extent): E0 is reclaimed (green).
 //!
-//! Data-safety (the user's concern — "一定确保不会丢失数据"): 4 "cold" keys live
+//! Data-safety (the user's concern — data must under no circumstances be
+//! lost): 4 "cold" keys live
 //! ENTIRELY inside E0. GC must relocate-then-punch them (never drop a live value
 //! whose naming checkpoint is durable). After a crash + same-id takeover the new
 //! PS's `recover_partition` must find EVERY key — the cold ones (now relocated

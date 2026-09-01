@@ -580,7 +580,7 @@ fn main() -> Result<()> {
     }
     let _ = autumn_transport::init_with(args.transport);
 
-    // the EN is the fd大户 — `ExtentNode::load_extents` opens every
+    // the EN is by far the biggest fd consumer — `ExtentNode::load_extents` opens every
     // owned extent's data file at startup and the fd-LRU cache keeps up to
     // `--fd-cache-cap` of them open. The default RLIMIT_NOFILE soft limit (often
     // 1024) is far too small — a multi-disk node with 16 GiB extents already

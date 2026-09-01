@@ -1,4 +1,4 @@
-//! Lexical retrieval (BM25-on-KV) for autumn-memory — plan §7 词法腿.
+//! Lexical retrieval (BM25-on-KV) for autumn-memory — plan §7 lexical leg.
 //!
 //! The inverted index lives as ordinary autumn keys: `idx/{term}/{doc_id}` is
 //! an EXISTENCE marker (empty value) so candidate discovery is a pure

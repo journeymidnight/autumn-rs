@@ -4770,8 +4770,8 @@ impl StreamClient {
         // a data shard whose node the manager believes Suspected is
         // reconstructed from parity IMMEDIATELY — its direct shard read is NOT
         // issued, so the `join_all` below never blocks on a flaky node's full
-        // RPC timeout before reconstruction starts (the user's "EC → 直接重新
-        // 计算, 不用等请求超时"). Soft hint: if reconstruction can't gather K
+        // RPC timeout before reconstruction starts (the user's "on EC, reconstruct
+        // immediately rather than waiting for the request to time out"). Soft hint: if reconstruction can't gather K
         // healthy shards it still launches to every peer
         // (`ec_reconstruct_shard_subrange` races first-K-wins), so a mistaken
         // Suspected mark only costs a little extra parity traffic, never

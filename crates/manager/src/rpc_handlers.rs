@@ -5288,7 +5288,7 @@ impl AutumnManager {
     /// / extent count) + per-node extent-shard count, computed entirely from
     /// in-memory state with NO extent-node probe and NO per-extent array on the
     /// wire. Bounded by partition + node count, so a web dashboard scales to
-    /// 数千 partition / 数万 extent. Leader-gated (a follower's `regions` /
+    /// thousands of partitions / tens of thousands of extents. Leader-gated (a follower's `regions` /
     /// `extents` are replay-stale; the dashboard should scrape the leader).
     /// Pure builder for the cluster overview (no encode). Shared by the
     /// `MSG_GET_CLUSTER_OVERVIEW` handler and the in-process embedded dashboard
@@ -6569,7 +6569,7 @@ impl AutumnManager {
     // Plan reference: `docs/autumn_fs_lease_plan.md`. Manager is the
     // single decision-maker (§6 invariant 1); writer leases are
     // persisted to etcd (§3.1) while reader leases stay in-memory only
-    // (§7 "lease 数量爆炸"). Every etcd write routes through
+    // (§7, on lease-count explosion). Every etcd write routes through
     // `put_msgs_txn` / `put_and_delete_txn` so the leader fence
     // travels with it.
 

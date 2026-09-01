@@ -1581,7 +1581,7 @@ impl AutumnManager {
         // Stage D: hot/cold imbalance (kind = POLICY_KIND_HOT_COLD), ridden
         // on the same advisory_cache for `client info` rendering.
         // the size dimension consumes the same
-        // effective-size口径 as split/merge (sealed sums + PS-reported
+        // effective-size measure as split/merge (sealed sums + PS-reported
         // open-tail/debt gauges), so a VP-heavy partition is visible to it.
         let sealed_sums = crate::policy::partition_sealed_sums(state);
         cands.append(&mut p.compute_hot_cold_advisory(owners, &sealed_sums, now));
@@ -2818,7 +2818,7 @@ impl AutumnManager {
     /// enforce the rollback-safety bound (coco P1): a persisted value
     /// ABOVE this binary's WIRE_VERSION_MAX means the cluster was bumped
     /// past what this binary speaks — i.e. an old binary was rolled back
-    /// AFTER the bump, exactly the "bump 后不可滚回" rule from design
+    /// AFTER the bump, exactly the "a bump can never roll back" rule from design
     /// §3-R1. Fail closed: the error propagates out of replay /
     /// imprint, so this manager refuses to install the state (and a
     /// replay failure prevents it from becoming leader) instead of

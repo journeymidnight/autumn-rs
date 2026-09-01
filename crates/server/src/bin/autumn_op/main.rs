@@ -2821,7 +2821,7 @@ async fn run_bootstrap(
 /// `MSG_GET_CLUSTER_OVERVIEW` RPC: per-partition rollup (range / ps /
 /// live_size / extent count, range-sorted) + per-node extent-shard count —
 /// NO per-extent array, NO per-PS discard probe. Bounded by partition + node
-/// count, so it scales to 数千 partition / 数万 extent. Per-partition extents
+/// count, so it scales to thousands of partitions / tens of thousands of extents. Per-partition extents
 /// are fetched lazily via `info --part P` (scoped).
 async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
     let bytes = client

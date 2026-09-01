@@ -2168,7 +2168,8 @@ async fn read_extent_id_set(etcd_endpoint: &str) -> std::collections::HashSet<u6
     set
 }
 
-/// POSITIVE reclamation check (user ask: "GC 后 extent 确定可以被删除"). After the
+/// POSITIVE reclamation check (user ask: after GC, an extent must definitely
+/// be deletable). After the
 /// workload quiesces, a final flush → major-compact → FORCE-GC pass MUST
 /// physically DELETE extents: the chaos run created dead data (overwritten
 /// versions, out-of-range post-split keys, superseded SSTs), and a working GC +
