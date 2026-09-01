@@ -358,11 +358,19 @@ Presplit per namespace AFTER bootstrap instead:
     # on the admin token whenever one is configured — and the deploy configures
     # one unconditionally. Same `-s` (non-empty file) idiom as run_manager, so an
     # authz-off cluster with no Secret mounted still bootstraps.
+    #
+    # `--admin-token-file` is a GLOBAL flag and must precede the subcommand: the
+    # global parse loop stops at the first non-flag, so anything after
+    # `bootstrap` is left to the subcommand's own parser, which drops it — the
+    # token then never reaches the client and the manager answers "admin token
+    # invalid". Matches cluster.sh, which places it the same way.
+    local -a admin=()
     if [[ -s "${AUTUMN_ADMIN_TOKEN_FILE:-/nonexistent}" ]]; then
-        args+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
+        admin=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
     fi
-    log "autumn-op bootstrap ${args[*]}"
-    autumn-op --manager "$mgr" --transport "$TRANSPORT" bootstrap "${args[@]}"
+    log "autumn-op ${admin[*]:-} bootstrap ${args[*]}"
+    autumn-op --manager "$mgr" --transport "$TRANSPORT" \
+        ${admin[@]+"${admin[@]}"} bootstrap "${args[@]}"
     log "bootstrap complete"
 }
 
