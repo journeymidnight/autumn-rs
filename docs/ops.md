@@ -2160,6 +2160,8 @@ autumn `fs/models/llama/x.safetensors`.
 #    and the HTTP hop on loopback).
 autumn-s3 --manager 127.0.0.1:9000 --port 9100 \
           --credential-file /secrets/fs.cred      # omit when authz is off
+# --workers N (default 8, capped at core count) — accept threads, SO_REUSEPORT.
+# One thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
 
 # 2. Smoke it with the aws CLI. The credentials are DUMMY — the gateway never
 #    looks at the Authorization header — but the SDK's credential chain runs

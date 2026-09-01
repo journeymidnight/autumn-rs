@@ -22,6 +22,7 @@ mod objects;
 mod s3;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -52,7 +53,15 @@ struct Args {
     host: String,
     credential_file: Option<PathBuf>,
     direct_read: bool,
+    workers: usize,
 }
+
+/// Accept threads to run by default. The gateway is CPU-bound on socket work,
+/// not on autumn reads: an AWS-CRT client drains its sockets slowly enough that
+/// each body write fragments into many partial writes, and a single accept
+/// thread saturates well below what the read path can deliver. It is also a
+/// sidecar, so it should not claim every core on a GPU node.
+const DEFAULT_WORKERS: usize = 8;
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
@@ -62,6 +71,9 @@ fn parse_args() -> Result<Args> {
         host: "autumn-s3".into(),
         credential_file: None,
         direct_read: true,
+        workers: std::thread::available_parallelism()
+            .map(|n| n.get().min(DEFAULT_WORKERS))
+            .unwrap_or(1),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -76,11 +88,12 @@ fn parse_args() -> Result<Args> {
             "--host" => a.host = val()?,
             "--credential-file" => a.credential_file = Some(PathBuf::from(val()?)),
             "--direct-read" => a.direct_read = val()?.parse().context("--direct-read")?,
+            "--workers" => a.workers = val()?.parse().context("--workers")?,
             "-h" | "--help" => {
                 println!(
                     "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
                      \x20            [--host <daemon-identity>] [--credential-file <path>]\n\
-                     \x20            [--direct-read true|false]"
+                     \x20            [--direct-read true|false] [--workers N]"
                 );
                 std::process::exit(0);
             }
@@ -89,6 +102,9 @@ fn parse_args() -> Result<Args> {
     }
     if a.manager.is_empty() {
         bail!("--manager is required");
+    }
+    if a.workers == 0 {
+        bail!("--workers must be at least 1");
     }
     Ok(a)
 }
@@ -252,8 +268,92 @@ fn xml(body: String) -> Response {
         .into_response()
 }
 
-#[compio::main]
-async fn main() -> Result<()> {
+/// One SO_REUSEPORT listener. Every worker binds the same address; the kernel
+/// spreads incoming connections across them, so N accept threads share the load
+/// without a hand-off (passing an accepted socket between io_uring runtimes is
+/// not free, and would put the contention back on one thread).
+fn reuseport_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    // The point of the exercise: without this the second worker's bind fails.
+    sock.set_reuse_port(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(sock.into())
+}
+
+/// Serve on one thread: its own compio runtime, its own `FsState` (so workers
+/// share no lock), its own listener.
+fn serve_worker(
+    idx: usize,
+    args: &Args,
+    credential: Option<(String, Vec<u8>)>,
+    addr: SocketAddr,
+) -> Result<()> {
+    let rt = compio::runtime::Runtime::new().context("compio runtime")?;
+    rt.block_on(async move {
+        // A distinct daemon identity per worker: the manager keys its lease
+        // registry on it, and two workers sharing one would look like a single
+        // client reconnecting.
+        let host = format!("{}-{idx}", args.host);
+        let mut state = match credential {
+            Some((who, secret)) => {
+                FsState::new_with_host_credential(&args.manager, host, &who, secret).await?
+            }
+            None => FsState::new_with_host(&args.manager, host).await?,
+        };
+        state.direct_read = args.direct_read;
+        let fs: Fs = Rc::new(futures::lock::Mutex::new(state));
+
+        let listener = compio::net::TcpListener::from_std(reuseport_listener(addr)?)?;
+        cyper_axum::serve(listener, router(fs)).await?;
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
+fn router(fs: Fs) -> Router {
+    let f = SendWrapper::new(fs.clone());
+    let buckets_route = get(move || {
+        let f = f.clone();
+        SendWrapper::new(async move { list_buckets(&f).await })
+    });
+    let f = SendWrapper::new(fs.clone());
+    let bucket_route = get(move |Path(b): Path<String>, Query(q): Query<HashMap<String, String>>| {
+        let f = f.clone();
+        SendWrapper::new(async move { list_objects(&f, b, q).await })
+    });
+    let f = SendWrapper::new(fs.clone());
+    let g = SendWrapper::new(fs);
+    let object_route = get(
+        move |Path((b, k)): Path<(String, String)>, headers: HeaderMap| {
+            let f = f.clone();
+            SendWrapper::new(async move { get_object(&f, b, k, headers).await })
+        },
+    )
+    .head(move |Path((b, k)): Path<(String, String)>| {
+        let g = g.clone();
+        SendWrapper::new(async move { head_object(&g, b, k).await })
+    });
+
+    // Every mutating verb answers with a parseable S3 <Error> rather than
+    // axum's bare 405, so a client that tries to write gets "NotImplemented"
+    // instead of an empty body it cannot decode.
+    Router::new()
+        .route("/", buckets_route)
+        .route("/{bucket}", bucket_route)
+        .route("/{bucket}/{*key}", object_route)
+        .fallback(|| async { S3Error::not_implemented("this operation").into_response() })
+        .method_not_allowed_fallback(|| async {
+            S3Error::not_implemented("writing through this gateway").into_response()
+        })
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -278,60 +378,43 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let mut state = match credential {
-        Some((who, secret)) => {
-            FsState::new_with_host_credential(&args.manager, args.host.clone(), &who, secret).await?
-        }
-        None => FsState::new_with_host(&args.manager, args.host.clone()).await?,
-    };
-    state.direct_read = args.direct_read;
-    let fs: Fs = Rc::new(futures::lock::Mutex::new(state));
+    let addr: SocketAddr = format!("{}:{}", args.listen, args.port)
+        .parse()
+        .with_context(|| format!("--listen/--port: {}:{}", args.listen, args.port))?;
 
-    let f = SendWrapper::new(fs.clone());
-    let buckets_route = get(move || {
-        let f = f.clone();
-        SendWrapper::new(async move { list_buckets(&f).await })
-    });
-    let f = SendWrapper::new(fs.clone());
-    let bucket_route = get(move |Path(b): Path<String>, Query(q): Query<HashMap<String, String>>| {
-        let f = f.clone();
-        SendWrapper::new(async move { list_objects(&f, b, q).await })
-    });
-    let f = SendWrapper::new(fs.clone());
-    let g = SendWrapper::new(fs.clone());
-    let object_route = get(
-        move |Path((b, k)): Path<(String, String)>, headers: HeaderMap| {
-            let f = f.clone();
-            SendWrapper::new(async move { get_object(&f, b, k, headers).await })
-        },
-    )
-    .head(move |Path((b, k)): Path<(String, String)>| {
-        let g = g.clone();
-        SendWrapper::new(async move { head_object(&g, b, k).await })
-    });
-
-    // Every mutating verb answers with a parseable S3 <Error> rather than
-    // axum's bare 405, so a client that tries to write gets "NotImplemented"
-    // instead of an empty body it cannot decode.
-    let app = Router::new()
-        .route("/", buckets_route)
-        .route("/{bucket}", bucket_route)
-        .route("/{bucket}/{*key}", object_route)
-        .fallback(|| async { S3Error::not_implemented("this operation").into_response() })
-        .method_not_allowed_fallback(|| async {
-            S3Error::not_implemented("writing through this gateway").into_response()
-        });
-
-    let listener =
-        compio::net::TcpListener::bind(format!("{}:{}", args.listen, args.port)).await?;
     tracing::info!(
         manager = %args.manager,
         authz = args.credential_file.is_some(),
         direct_read = args.direct_read,
-        "autumn-s3 (read-only, unauthenticated) on http://{}:{}",
-        args.listen,
-        args.port
+        workers = args.workers,
+        "autumn-s3 (read-only, unauthenticated) on http://{addr}"
     );
-    cyper_axum::serve(listener, app).await?;
+
+    let mut handles = Vec::with_capacity(args.workers);
+    for idx in 0..args.workers {
+        let args = Args {
+            manager: args.manager.clone(),
+            listen: args.listen.clone(),
+            port: args.port,
+            host: args.host.clone(),
+            credential_file: args.credential_file.clone(),
+            direct_read: args.direct_read,
+            workers: args.workers,
+        };
+        let cred = credential.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("autumn-s3-{idx}"))
+                .spawn(move || serve_worker(idx, &args, cred, addr))?,
+        );
+    }
+    // A worker only returns on error; surface the first one and let the process
+    // die rather than silently serving on fewer threads than asked for.
+    for h in handles {
+        match h.join() {
+            Ok(r) => r?,
+            Err(_) => bail!("a gateway worker thread panicked"),
+        }
+    }
     Ok(())
 }

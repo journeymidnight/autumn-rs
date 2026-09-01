@@ -21,6 +21,7 @@ axum = "0.8"
 cyper-axum = "0.8"
 send_wrapper = { version = "0.6", features = ["futures"] }
 futures = "0.3"
+socket2 = { version = "0.5", features = ["all"] }
 autumn-fuse = { path = "../../crates/fuse", default-features = false, features = ["core"] }
 autumn-client = { path = "../../crates/client" }
 

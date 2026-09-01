@@ -187,28 +187,24 @@ python -m sglang.launch_server --model-path s3://models/llama \
 | path | MB/s | vs native |
 |---|---|---|
 | `autumn.Fs.read_into`, 8 threads (**Recipe C's data path**) | **1327** | 100% |
-| raw HTTP `GET` through the gateway (1–16 streams) | **1290** | 97% |
-| plain HTTP replaying the CRT's pattern (16–256 workers) | **1430** | 108% |
-| `runai-model-streamer` → gateway (concurrency 4–32) | **~600** | 45% |
-| `runai-model-streamer` → **MinIO**, same box/file/loopback | **2700–2830** | (reference) |
+| plain HTTP replaying the streamer's access pattern | 1430 | 108% |
+| **`runai-model-streamer` → gateway (default 8 workers)** | **~1300** | **98%** |
+| `runai-model-streamer` → gateway, `--workers 1` | 557 | 42% |
+| `runai-model-streamer` → MinIO (local page cache, reference) | 2700–2830 | — |
 
-The HTTP hop itself is nearly free: a plain HTTP client replaying the streamer's
-exact access pattern (257 × 8 MiB ranged GETs, a fresh connection per chunk —
-which is what the CRT does) gets **1430 MB/s through the gateway**, and holds
-that from 16 to 256 concurrent workers.
+**Recipe D lands within a couple of percent of Recipe C's data path.** The HTTP
+hop costs almost nothing on loopback; both paths are bounded by autumn's read
+path, not by the transport between the gateway and the engine.
 
-**The gap is the gateway, not the streamer.** The same runai build reads
-2.8 GB/s from MinIO on the same loopback with the same file. Serving the CRT
-costs the gateway **2.1× more CPU and 4.1× more `io_uring_enter` calls per
-byte** than serving the plain client (9608 vs 2329 for the same 2 GiB): the CRT
-drains its sockets slowly enough that each 8 MiB body write fragments into many
-partial writes, and the gateway runs all 240 of those connections on **one
-compio thread**, where MinIO spreads them over every core.
-
-The fix is to give the gateway more than one accept thread (SO_REUSEPORT across
-N compio runtimes, the same thread-per-core shape the rest of autumn uses); it
-is tracked as its own feature. Until then, treat ~600 MB/s as Recipe D's
-current number, not its ceiling.
+Getting there took one fix worth knowing about. The gateway was originally a
+single compio thread, which capped runai at 557 MB/s while a plain HTTP client
+doing the *same* 257 × 8 MiB ranged GETs got 1430. MinIO settled the attribution
+— the same runai build reads 2.8 GB/s from it on the same loopback, so the CRT
+client was never the problem. Serving the CRT cost the gateway 2.1× more CPU and
+4.1× more `io_uring_enter` calls per byte (9608 vs 2329): it drains its sockets
+slowly enough that each 8 MiB body write fragments into many partial writes, and
+one thread drowns in the syscalls. `--workers N` (SO_REUSEPORT, one compio
+runtime and one `FsState` each) fixes it; the knee is at 4 and it plateaus after.
 
 Run it as a **per-GPU-node sidecar**: the long hop (EN → sidecar) keeps RDMA,
 and only the loopback hop pays HTTP. A single central gateway would make itself

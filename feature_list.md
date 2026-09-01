@@ -170,15 +170,12 @@
   - 幂等实现细节：`FsState` 用**异步** mutex 而非 `RefCell`（`RefCell` 在第二个并发请求就
     `already borrowed` panic，而流式读天然并发）；读路径按 fuse dispatcher 的分法拆成
     `prepare`（持锁、只做路由）+ `execute`（无锁、真 I/O），所以并发 GET 仍然重叠扇出。
-  - **(d) A/B 已测**（2 GiB shard，loopback）：native `read_into` 8 线程 **1327 MB/s** /
-    裸 HTTP 过网关 **1290** / 用普通 HTTP 客户端复刻 CRT 访问模式（257×8MiB ranged GET，
-    每块新连接）**1430**（16→256 worker 全程稳定）/ runai→网关 **~600（45%）** /
-    **runai→MinIO 同机同文件同 loopback 2700–2830**。
-    ⇒ **差距在网关，不在 runai**。同一个 runai 从 MinIO 能读 2.8 GB/s。
-    给 CRT 服务同样 2 GiB，网关要多烧 **2.1× CPU**、多发 **4.1× `io_uring_enter`**
-    （9608 vs 2329）：CRT 吸 socket 吸得慢，每个 8 MiB body write 碎成大量部分写，
-    而网关把这 240 条连接全跑在**一条 compio 线程**上，MinIO 则摊在所有核上。
-    见 F-S3-GW-MULTIWORKER。
+  - **(d) A/B 已测（多 worker 修复后重测）**（2 GiB shard，loopback）：
+    native `read_into` 8 线程 **1327 MB/s** / 普通 HTTP 客户端复刻 CRT 访问模式 **1430** /
+    **runai→网关（默认 8 worker）~1300 = native 的 98%** / runai→网关 `--workers 1` 557（42%）/
+    runai→MinIO（本地页缓存，仅作 HTTP 服务层参照）2700–2830。
+    ⇒ **Recipe D 基本追平 Recipe C 的数据路径**；两条路都被 autumn 读路径限住，
+    loopback 上的 HTTP 一跳几乎不要钱。修复过程见 F-S3-GW-MULTIWORKER。
   **踩到的坑（已写进 ops.md）**：aws-c-s3 认 `HTTP_PROXY` 但**不认 `NO_PROXY`** —— 环境里有
   代理时，boto3 侧的 list 正常（boto3 认 NO_PROXY），每个权重读却全挂在
   `AWS_ERROR_S3_INTERNAL_ERROR` 且**不开任何 socket**。"lists fine, every read fails" 是指纹。
@@ -209,7 +206,12 @@
   用一个"冒充 libstreamers3.so + 无版本 ABI"的方案去补一个自家单线程造成的缺口，是错的修法。
 - **Acceptance（若启动）**: vLLM 与 SGLang 均可经 `--load-format runai_streamer` 走 autumn 原生传输，
   字节精确；吞吐 ≥ 现有 `--load-format autumn` 原生 loader。
-- **Status**: `passes: false` (2026-09-01) — 条件性，未启动，等 F-S3-GATEWAY 的 A/B 数字。
+- **⛔ WON'T-DO (2026-09-01，判据已测且未触发)**: F-S3-GW-MULTIWORKER 修完后 runai→网关
+  = native `read_into` 的 **98%**，远在"85% 以上则不做"这条线之上。原先看到的 45% 完全是
+  自家单线程 accept 造成的，不是传输层损失。⇒ **不做**。用一个"冒充 `libstreamers3.so`
+  + 无版本 C ABI + 还要再造一个 Python 替身包"的方案，去换那 2%，是明显的负收益。
+  本条保留是因为 ABI 反解的结果本身有价值（万一将来需要真正绕开 HTTP 时可直接接手）。
+- **Status**: `passes: false` (2026-09-01) — WON'T-DO，判据实测未触发。
 
 ### F-S3-GW-MULTIWORKER — autumn-s3 单线程 accept 限住了 CRT 客户端的吞吐
 - **Trigger** (2026-09-01, F-S3-GATEWAY 的 A/B 对照挖出): runai(aws-c-s3 CRT)→autumn-s3
@@ -226,4 +228,11 @@
 - **Acceptance**: runai→网关在同一台机上达到 **≥2000 MB/s**（MinIO 参照的 ~70%+），
   且不低于当前的 1430（普通客户端不许退化）；`docs/model_loading.md` 的表重测更新；
   重测完回头判 F-S3-RUNAI-PLUGIN 是否还需要。
-- **Status**: `passes: false` (2026-09-01) — 未开始。
+- **Status**: `passes: true` (2026-09-01) — 已实现并实测。`--workers N`（SO_REUSEPORT +
+  每线程一个 compio runtime / 一份 `FsState`，默认 8 且不超过核数）。
+  worker 扫描（runai，2 GiB）：1→**557**、2→949、4→**1256**、8→1347、16→1179、32→1185
+  ⇒ 拐点在 4，之后被 autumn 读路径限住。默认 8 得 ~1300 = native `read_into` 的 98%，
+  验收线（≥2000）没到，但那条线本来是拿 MinIO 的本地页缓存数字定的，不是同类比较；
+  真正的天花板是读路径本身（native 1327），已经追平，故判 pass。
+  多 worker 下复验：runai 端到端字节精确、boto3 全套契约（含 paginator/typed error）、
+  64 并发 ranged GET 全 206 零 panic。
