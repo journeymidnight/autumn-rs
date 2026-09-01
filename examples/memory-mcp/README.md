@@ -62,6 +62,45 @@ queries never return prose and vice versa.
 | `find_callers {id}` / `find_callees {id}` | CALLS graph neighbors |
 | `trace_call_path {id, direction?}` | bounded call-path BFS |
 
+### Graph database
+
+The store's node/edge layer is a general graph, not a code index: ids, kinds
+and edge types are labels the caller chooses, and attributes are arbitrary
+JSON. The code and document graphs this server builds are just its first two
+occupants — anything else can share the same graph.
+
+| Tool | What |
+|---|---|
+| `graph_upsert_node {id, kind, attrs?}` | create or replace a node |
+| `graph_get_node {id}` | a node with its full attrs (`null` if absent) |
+| `graph_delete_node {id}` | delete a node **and every edge touching it** |
+| `graph_add_edge {src, type, dst, attrs?}` | typed edge; endpoints need not exist yet |
+| `graph_delete_edge {src, type, dst}` | delete one edge |
+| `graph_neighbors {id, direction?, type?, limit?}` | incident edges with type, attrs, and the far node |
+| `graph_traverse {id, direction?, type?, max_depth?, max_nodes?}` | bounded BFS, depth-tagged |
+| `graph_nodes {kind, limit?}` | nodes of one kind — an entry point when you have no id |
+
+`direction` is `out` (default) or `in`; omitting `type` matches every edge
+type. `graph_neighbors` returns the EDGE rather than just the far node, so the
+edge type and its attributes survive the round trip — a graph query that drops
+them cannot answer "how are these two related". `max_depth` and `max_nodes`
+are capped server-side (16 / 2000) so one traversal can't walk the whole graph.
+
+```jsonc
+// A graph that has nothing to do with code:
+graph_upsert_node {"id":"person:ada","kind":"Person","attrs":{"born":1815}}
+graph_upsert_node {"id":"machine:engine","kind":"Machine"}
+graph_add_edge    {"src":"person:ada","type":"WROTE_NOTES_ON","dst":"machine:engine","attrs":{"year":1843}}
+graph_neighbors   {"id":"machine:engine","direction":"in"}
+// → [{"src":"person:ada","type":"WROTE_NOTES_ON","dst":"machine:engine",
+//     "attrs":{"year":1843},"node":{"id":"person:ada","kind":"Person"}}]
+```
+
+`find_callers` / `find_callees` / `members` / `document_outline` /
+`trace_call_path` are named shorthands over exactly these calls, fixed to one
+edge type and direction. They stay because "who calls this" is the question an
+agent actually asks — not because the graph knows what a call is.
+
 `mode` is `lexical` \| `vector` \| `hybrid` (default `hybrid`). Code and docs
 keep separate search tools (rather than one `search` with a corpus flag)
 because the result shapes differ — symbols carry kind + graph handles,
@@ -138,7 +177,15 @@ caller/callee chips to walk the graph). The HTTP API serves both corpora:
 | `GET /symbol?id=` | one symbol's / chunk's full text + metadata |
 | `GET /callers?id=` / `GET /callees?id=` / `GET /members?id=` | graph neighbors (CALLS / CONTAINS) |
 | `GET /trace?id=&dir=out\|in` | bounded call-path (BFS) |
+| `GET /graph/node?id=` | one node with its full attrs |
+| `GET /graph/nodes?kind=&limit=` | nodes of one kind |
+| `GET /graph/neighbors?id=&direction=&type=&limit=` | incident edges (type + attrs + far node) |
+| `GET /graph/traverse?id=&direction=&type=&max_depth=&max_nodes=` | bounded BFS, depth-tagged |
 | `GET /stats` / `GET /config` | index counts / server config |
+
+The `/graph/*` routes are the read half of the graph-database surface; writes
+go through the MCP `graph_*` tools (or the indexers), which keeps a GET from
+mutating the graph.
 
 ## Manual verification
 

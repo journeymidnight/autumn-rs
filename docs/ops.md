@@ -934,7 +934,27 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"leader election","k":2}}}' \
   | ./target/release/memory-mcp 127.0.0.1:9001 --mcp 2>/dev/null
-#   → serverInfo name "memory-mcp"; 9 tools; chunk hits with headings + line spans
+#   → serverInfo name "memory-mcp"; 17 tools; chunk hits with headings + line spans
+
+# Graph database — nodes/edges with NO relation to code or documents. The point
+# of the check is that arbitrary kinds and edge types round-trip, and that
+# deleting a node takes its edges with it (`is_clean` stays true).
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"graph_upsert_node","arguments":{"id":"person:ada","kind":"Person","attrs":{"born":1815}}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"graph_upsert_node","arguments":{"id":"machine:engine","kind":"Machine"}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"graph_add_edge","arguments":{"src":"person:ada","type":"WROTE_NOTES_ON","dst":"machine:engine","attrs":{"year":1843}}}}' \
+  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"graph_neighbors","arguments":{"id":"machine:engine","direction":"in"}}}' \
+  '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"graph_delete_node","arguments":{"id":"person:ada"}}}' \
+  '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"graph_delete_node","arguments":{"id":"machine:engine"}}}' \
+  | ./target/release/memory-mcp 127.0.0.1:9001 --mcp --no-index 2>/dev/null
+#   → id 5 returns the edge with its type, attrs {"year":1843} and the far node
+curl -s http://127.0.0.1:5100/stats     # is_clean still true after the deletes
+
+# Read half over HTTP (writes go through MCP, so no GET mutates):
+curl -s 'http://127.0.0.1:5100/graph/nodes?kind=Document&limit=2'
+curl -s 'http://127.0.0.1:5100/graph/neighbors?id=docs/ops.md&type=CONTAINS&limit=1'
+curl -s 'http://127.0.0.1:5100/graph/traverse?id=docs/ops.md&max_depth=1&max_nodes=2'
 ./cluster.sh stop
 ```
 

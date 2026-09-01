@@ -2,9 +2,17 @@
 //! the web UI and the MCP server. One store holds two corpora side by side —
 //! code symbols (kinds Function/Method/Struct/…) and document chunks (kinds
 //! Document/Section) — and search filters by corpus so `search_code` never
-//! returns prose and `search_docs` never returns symbols. The graph methods
-//! expose CALLS edges as callers/callees/a bounded trace, and CONTAINS edges
-//! as members (impl/mod for code, heading outline for documents).
+//! returns prose and `search_docs` never returns symbols.
+//!
+//! The graph is a GENERAL graph database, not a code index. `MemoryStore`'s
+//! node/edge layer is already domain-agnostic — ids and edge types are opaque
+//! strings, attributes are opaque bytes — but only two hard-wired edge types
+//! were ever reachable from outside, so callers could read a CALLS or CONTAINS
+//! graph the indexer had built and nothing else. The `graph_*` methods below
+//! expose the layer as it actually is: create and delete nodes and typed
+//! edges, list by kind, walk neighbours, traverse. `callers` / `callees` /
+//! `members` / `outline` / `trace` remain as named shorthands for the two
+//! edge types this binary's own indexers write.
 
 use std::rc::Rc;
 
@@ -61,10 +69,15 @@ impl Code {
         match self.store.get_node(id).await {
             Ok(Some(n)) => {
                 let m = Self::meta_of(&n.attrs);
-                let mut b = json!({"id": id, "kind": n.kind, "name": m.get("name"),
-                                   "file": m.get("file"), "start": m.get("start")});
-                if let Some(h) = m.get("headings") {
-                    b["headings"] = h.clone();
+                let mut b = json!({"id": id, "kind": n.kind});
+                // Only the attributes that are actually there. `file` / `start`
+                // are what this binary's code and document indexers write; a
+                // node from any other caller has neither, and emitting them as
+                // nulls made every generic graph result look code-shaped.
+                for f in ["name", "file", "start", "headings"] {
+                    if let Some(v) = m.get(f).filter(|v| !v.is_null()) {
+                        b[f] = v.clone();
+                    }
                 }
                 Some(b)
             }
@@ -134,34 +147,29 @@ impl Code {
         Ok(out)
     }
 
+    // The named shorthands. Each is one edge type and one direction over the
+    // generic walk above — kept because "who calls this" is what a caller
+    // actually asks, not because the graph knows what a call is.
+
+    async fn far_briefs(&self, id: &str, dir: &str, etype: &str) -> Result<Vec<Value>> {
+        Ok(self
+            .graph_neighbors(id, dir, Some(etype), None)
+            .await?
+            .into_iter()
+            .filter_map(|e| e.get("node").cloned())
+            .collect())
+    }
+
     pub async fn callers(&self, id: &str) -> Result<Vec<Value>> {
-        let mut v = Vec::new();
-        for e in self.store.in_edges(id, Some("CALLS"), None).await? {
-            if let Some(b) = self.brief(&e.src).await {
-                v.push(b);
-            }
-        }
-        Ok(v)
+        self.far_briefs(id, "in", "CALLS").await
     }
 
     pub async fn callees(&self, id: &str) -> Result<Vec<Value>> {
-        let mut v = Vec::new();
-        for e in self.store.out_edges(id, Some("CALLS"), None).await? {
-            if let Some(b) = self.brief(&e.dst).await {
-                v.push(b);
-            }
-        }
-        Ok(v)
+        self.far_briefs(id, "out", "CALLS").await
     }
 
     pub async fn members(&self, id: &str) -> Result<Vec<Value>> {
-        let mut v = Vec::new();
-        for e in self.store.out_edges(id, Some("CONTAINS"), None).await? {
-            if let Some(b) = self.brief(&e.dst).await {
-                v.push(b);
-            }
-        }
-        Ok(v)
+        self.far_briefs(id, "out", "CONTAINS").await
     }
 
     /// The ingested document files (their per-file `Document` nodes).
@@ -178,31 +186,135 @@ impl Code {
     /// Heading outline of one document (or subtree of one section): BFS over
     /// CONTAINS from `id`, each entry tagged with its depth.
     pub async fn outline(&self, id: &str) -> Result<Vec<Value>> {
+        self.graph_traverse(id, "out", Some("CONTAINS"), 8, 500).await
+    }
+
+    pub async fn trace(&self, id: &str, dir: &str) -> Result<Vec<Value>> {
+        self.graph_traverse(id, dir, Some("CALLS"), 6, 200).await
+    }
+
+    // -- graph database ------------------------------------------------------
+    // Generic node/edge access. `kind` and `etype` are caller-defined labels;
+    // `attrs` is caller-defined JSON. Nothing here knows about code.
+
+    /// A node as the graph sees it: id, kind, and its attributes. Distinct
+    /// from `brief`, which projects the few fields this binary's own indexers
+    /// happen to write — a caller storing its own schema needs all of them
+    /// back, so `attrs` is returned whole (parsed when it is JSON, otherwise
+    /// as a lossy string, since the store keeps opaque bytes).
+    pub async fn graph_get_node(&self, id: &str) -> Result<Option<Value>> {
+        Ok(self.store.get_node(id).await?.map(|n| {
+            let attrs = serde_json::from_slice::<Value>(&n.attrs)
+                .unwrap_or_else(|_| json!(String::from_utf8_lossy(&n.attrs)));
+            json!({"id": id, "kind": n.kind, "attrs": attrs})
+        }))
+    }
+
+    pub async fn graph_put_node(&self, id: &str, kind: &str, attrs: &Value) -> Result<Value> {
+        let bytes = serde_json::to_vec(attrs)?;
+        self.store.put_node(id, kind, &bytes, None).await?;
+        Ok(json!({"id": id, "kind": kind}))
+    }
+
+    /// Deletes the node AND every edge touching it — a dangling edge is worse
+    /// than a missing one, and `reconcile` counts them as damage.
+    pub async fn graph_delete_node(&self, id: &str) -> Result<Value> {
+        self.store.delete_node(id).await?;
+        Ok(json!({"id": id, "deleted": true}))
+    }
+
+    pub async fn graph_add_edge(
+        &self,
+        src: &str,
+        etype: &str,
+        dst: &str,
+        attrs: &Value,
+    ) -> Result<Value> {
+        let bytes = serde_json::to_vec(attrs)?;
+        self.store.add_edge(src, etype, dst, &bytes, None).await?;
+        Ok(json!({"src": src, "type": etype, "dst": dst}))
+    }
+
+    pub async fn graph_delete_edge(&self, src: &str, etype: &str, dst: &str) -> Result<Value> {
+        self.store.delete_edge(src, etype, dst).await?;
+        Ok(json!({"src": src, "type": etype, "dst": dst, "deleted": true}))
+    }
+
+    /// Edges incident to `id`. `dir` is "out" (default) or "in"; `etype` None
+    /// means every type. Returns the EDGE, not just the far node, so the edge
+    /// type and attributes survive the round trip — a graph query that drops
+    /// them can't answer "how are these two related".
+    pub async fn graph_neighbors(
+        &self,
+        id: &str,
+        dir: &str,
+        etype: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let edges = if dir == "in" {
+            self.store.in_edges(id, etype, limit).await?
+        } else {
+            self.store.out_edges(id, etype, limit).await?
+        };
         let mut v = Vec::new();
-        for (nid, depth) in self.store.bfs(id, Dir::Out, Some("CONTAINS"), 8, 500).await? {
-            if let Some(mut b) = self.brief(&nid).await {
-                b["depth"] = json!(depth);
-                v.push(b);
+        for e in edges {
+            let other = if dir == "in" { &e.src } else { &e.dst };
+            let mut o = json!({"src": e.src, "type": e.etype, "dst": e.dst});
+            if !e.attrs.is_empty() {
+                if let Ok(a) = serde_json::from_slice::<Value>(&e.attrs) {
+                    o["attrs"] = a;
+                }
             }
+            // The far node's brief, when it has one. A node id with no record
+            // is a dangling edge, and the edge itself is still worth returning.
+            if let Some(b) = self.brief(other).await {
+                o["node"] = b;
+            }
+            v.push(o);
         }
         Ok(v)
     }
 
-    pub async fn trace(&self, id: &str, dir: &str) -> Result<Vec<Value>> {
+    /// Bounded BFS from `start`. `max_depth` / `max_nodes` are the fan-out
+    /// guards; both are capped server-side so one query can't walk the graph.
+    pub async fn graph_traverse(
+        &self,
+        start: &str,
+        dir: &str,
+        etype: Option<&str>,
+        max_depth: u32,
+        max_nodes: usize,
+    ) -> Result<Vec<Value>> {
         let d = if dir == "in" { Dir::In } else { Dir::Out };
         let mut v = Vec::new();
-        for (nid, depth) in self.store.bfs(id, d, Some("CALLS"), 6, 200).await? {
-            if let Some(mut b) = self.brief(&nid).await {
-                b["depth"] = json!(depth);
-                v.push(b);
-            }
+        for (nid, depth) in self
+            .store
+            .bfs(start, d, etype, max_depth.min(16), max_nodes.min(2000))
+            .await?
+        {
+            let mut b = self.brief(&nid).await.unwrap_or_else(|| json!({"id": nid}));
+            b["depth"] = json!(depth);
+            v.push(b);
+        }
+        Ok(v)
+    }
+
+    /// Node ids of one kind — the graph's index of last resort, and how a
+    /// caller finds an entry point without already knowing an id.
+    pub async fn graph_nodes(&self, kind: &str, limit: Option<usize>) -> Result<Vec<Value>> {
+        let mut v = Vec::new();
+        for id in self.store.nodes_by_kind(kind, Some(limit.unwrap_or(500).min(2000))).await? {
+            v.push(self.brief(&id).await.unwrap_or_else(|| json!({"id": id})));
         }
         Ok(v)
     }
 
     pub async fn stats(&self) -> Result<Value> {
         let r = self.store.reconcile().await?;
-        Ok(json!({"symbols": r.nodes, "edges": r.edges, "docs": r.docs, "is_clean": r.is_clean()}))
+        // `nodes` is the graph-database name; `symbols` is kept as an alias
+        // because the bundled web UI reads it.
+        Ok(json!({"nodes": r.nodes, "symbols": r.nodes, "edges": r.edges,
+                  "docs": r.docs, "is_clean": r.is_clean()}))
     }
 
 }

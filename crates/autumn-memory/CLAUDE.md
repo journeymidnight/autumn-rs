@@ -107,6 +107,16 @@ then `edge` (commit); `delete_edge` removes `edge` then `redge`. Domain-agnostic
 (ids / edge-types opaque strings, attrs opaque bytes) — code-graph schema lives
 in the consumer.
 
+**This is a general graph database, and consumers should expose it as one.**
+The layer has always been domain-agnostic, but `memory-mcp` only ever surfaced
+two hard-wired edge types (`CALLS`, `CONTAINS`), so from outside it looked like
+a code index — a caller could read the graph its indexers had built and nothing
+else. It now exposes the layer as it is (`graph_*` tools + `/graph/*` routes:
+upsert/delete node and typed edge, list by kind, neighbours, bounded traverse),
+with callers/callees/members/outline/trace kept as named shorthands pinned to
+one edge type and direction. A new consumer should follow that shape rather
+than adding another pair of domain verbs.
+
 - Reserved `mem/` namespace separates these from fuse / kvcache / client keys.
 - Dynamic components are **percent-encoded** (`q`/`unq`) so a `/` inside a
   tenant/agent/session/namespace/key can't forge a separator or another

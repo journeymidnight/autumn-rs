@@ -148,6 +148,32 @@ async fn h_callees(app: &App, p: P) -> Result<Response<Body>, AppError> {
 async fn h_members(app: &App, p: P) -> Result<Response<Body>, AppError> {
     Ok(json_ok(&json!({ "symbols": app.code.members(req(&p, "id")?).await? })))
 }
+// Graph database over HTTP — the same surface as the `graph_*` MCP tools, so
+// the web UI and a curl-wielding operator reach the graph the same way an
+// agent does. Reads only: mutations go through MCP (or the indexers), which
+// keeps a GET from writing.
+async fn h_graph_node(app: &App, p: P) -> Result<Response<Body>, AppError> {
+    let n = app.code.graph_get_node(req(&p, "id")?).await?;
+    Ok(json_ok(&json!({ "node": n })))
+}
+async fn h_graph_neighbors(app: &App, p: P) -> Result<Response<Body>, AppError> {
+    let et = p.get("type").map(String::as_str).filter(|s| !s.is_empty());
+    let lim = p.get("limit").and_then(|v| v.parse::<usize>().ok());
+    let dir = opt(&p, "direction", "out");
+    Ok(json_ok(&json!({ "edges": app.code.graph_neighbors(req(&p, "id")?, dir, et, lim).await? })))
+}
+async fn h_graph_traverse(app: &App, p: P) -> Result<Response<Body>, AppError> {
+    let et = p.get("type").map(String::as_str).filter(|s| !s.is_empty());
+    let depth = p.get("max_depth").and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
+    let nodes = p.get("max_nodes").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
+    let dir = opt(&p, "direction", "out");
+    Ok(json_ok(&json!({ "path": app.code.graph_traverse(req(&p, "id")?, dir, et, depth, nodes).await? })))
+}
+async fn h_graph_nodes(app: &App, p: P) -> Result<Response<Body>, AppError> {
+    let lim = p.get("limit").and_then(|v| v.parse::<usize>().ok());
+    Ok(json_ok(&json!({ "nodes": app.code.graph_nodes(req(&p, "kind")?, lim).await? })))
+}
+
 async fn h_trace(app: &App, p: P) -> Result<Response<Body>, AppError> {
     let id = req(&p, "id")?;
     Ok(json_ok(&json!({ "path": app.code.trace(id, opt(&p, "dir", "out")).await? })))
@@ -205,6 +231,10 @@ fn router(shared: Shared) -> Router {
         .route("/callees", get(q!(h_callees)))
         .route("/members", get(q!(h_members)))
         .route("/trace", get(q!(h_trace)))
+        .route("/graph/node", get(q!(h_graph_node)))
+        .route("/graph/neighbors", get(q!(h_graph_neighbors)))
+        .route("/graph/traverse", get(q!(h_graph_traverse)))
+        .route("/graph/nodes", get(q!(h_graph_nodes)))
 }
 
 // -- args + embedder --------------------------------------------------------
@@ -348,7 +378,26 @@ fn mcp_tool_defs() -> Value {
         {"name":"list_documents","description":"List ingested document files.",
          "inputSchema":{"type":"object","properties":{}}},
         {"name":"document_outline","description":"Heading outline of an ingested document (`id` = its file path, from list_documents or a chunk's `file`), depth-tagged.",
-         "inputSchema":id}
+         "inputSchema":id},
+
+        // Graph database. The store's node/edge layer is domain-agnostic, so
+        // these are not code tools: ids, kinds and edge types are whatever the
+        // caller decides. The code/document graphs this server builds are just
+        // one occupant of the same graph.
+        {"name":"graph_upsert_node","description":"Create or replace a node. `id` and `kind` are caller-defined labels; `attrs` is arbitrary JSON stored with it.",
+         "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string"},"attrs":{"type":"object"}},"required":["id","kind"]}},
+        {"name":"graph_get_node","description":"A node with its full attrs, or null if absent.","inputSchema":id},
+        {"name":"graph_delete_node","description":"Delete a node and every edge touching it.","inputSchema":id},
+        {"name":"graph_add_edge","description":"Create a typed edge src -[type]-> dst, with optional JSON `attrs`. Endpoints need not exist yet.",
+         "inputSchema":{"type":"object","properties":{"src":{"type":"string"},"type":{"type":"string"},"dst":{"type":"string"},"attrs":{"type":"object"}},"required":["src","type","dst"]}},
+        {"name":"graph_delete_edge","description":"Delete one edge src -[type]-> dst.",
+         "inputSchema":{"type":"object","properties":{"src":{"type":"string"},"type":{"type":"string"},"dst":{"type":"string"}},"required":["src","type","dst"]}},
+        {"name":"graph_neighbors","description":"Edges incident to `id`. direction out (default) or in; `type` filters the edge type, omit for all. Returns each edge with its type, attrs and the far node.",
+         "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer"}},"required":["id"]}},
+        {"name":"graph_traverse","description":"Bounded breadth-first walk from `id`, each node tagged with its depth. direction out (default) or in; `type` filters the edge type; max_depth/max_nodes bound the fan-out.",
+         "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"type":{"type":"string"},"max_depth":{"type":"integer"},"max_nodes":{"type":"integer"}},"required":["id"]}},
+        {"name":"graph_nodes","description":"List nodes of one `kind` — how to find an entry point without already knowing an id.",
+         "inputSchema":{"type":"object","properties":{"kind":{"type":"string"},"limit":{"type":"integer"}},"required":["kind"]}}
     ])
 }
 
@@ -388,6 +437,35 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
         }
         "list_documents" => json!(code.documents().await?),
         "document_outline" => json!(code.outline(&s("id")).await?),
+
+        "graph_upsert_node" => {
+            let attrs = args.get("attrs").cloned().unwrap_or_else(|| json!({}));
+            code.graph_put_node(&s("id"), &s("kind"), &attrs).await?
+        }
+        "graph_get_node" => code.graph_get_node(&s("id")).await?.unwrap_or(Value::Null),
+        "graph_delete_node" => code.graph_delete_node(&s("id")).await?,
+        "graph_add_edge" => {
+            let attrs = args.get("attrs").cloned().unwrap_or_else(|| json!({}));
+            code.graph_add_edge(&s("src"), &s("type"), &s("dst"), &attrs).await?
+        }
+        "graph_delete_edge" => code.graph_delete_edge(&s("src"), &s("type"), &s("dst")).await?,
+        "graph_neighbors" => {
+            let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
+            let et = args.get("type").and_then(|v| v.as_str());
+            let lim = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            json!(code.graph_neighbors(&s("id"), dir, et, lim).await?)
+        }
+        "graph_traverse" => {
+            let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
+            let et = args.get("type").and_then(|v| v.as_str());
+            let depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+            let nodes = args.get("max_nodes").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+            json!(code.graph_traverse(&s("id"), dir, et, depth, nodes).await?)
+        }
+        "graph_nodes" => {
+            let lim = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            json!(code.graph_nodes(&s("kind"), lim).await?)
+        }
         other => {
             return Ok(json!({"content":[{"type":"text","text":format!("unknown tool {other}")}],"isError":true}))
         }
