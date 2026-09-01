@@ -44,6 +44,27 @@ except Exception:  # noqa: BLE001
     HiCacheStorageConfig = None  # type: ignore[assignment]
     _SGLANG_AVAILABLE = False
 
+try:
+    # v2 multi-pool types. Imported SEPARATELY from the v1 ABC above, and
+    # tolerated missing: they landed later than v1, so a sglang without them
+    # must still be able to load this backend and run the v1 path. When they
+    # are absent the v2 methods below degrade to the ABC's NotImplementedError,
+    # which is exactly what a v1-only deployment expects.
+    from sglang.srt.mem_cache.hicache_storage import (
+        PoolHitPolicy,
+        PoolName,
+        PoolTransfer,
+        PoolTransferResult,
+    )
+
+    _SGLANG_V2_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    PoolHitPolicy = None  # type: ignore[assignment]
+    PoolName = None  # type: ignore[assignment]
+    PoolTransfer = None  # type: ignore[assignment]
+    PoolTransferResult = None  # type: ignore[assignment]
+    _SGLANG_V2_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
 # Reserved pool name. MVP only supports the "kv" pool; the slot is in the
@@ -336,6 +357,161 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             count += 1
         log.debug("batch_exists n=%d hit=%d", len(keys), count)
         return count
+
+    # ── v2 multi-pool ──────────────────────────────────────────────────────
+    #
+    # v2 exists for models whose prefix reuse needs MORE than the KV pool: a
+    # sliding-window pool, a Mamba SSM state pool, a DSA indexer, DeepSeek-V4's
+    # compressed regions, MTP draft KV. sglang calls these "sidecar" pools, and
+    # a backend that only implements v1 makes those models unusable — the
+    # controller calls batch_exists_v2 and gets NotImplementedError.
+    #
+    # The key schema already anticipated this: `full_key(tenant, hash, pool)`
+    # puts the pool in its own path segment, and the KV pool's segment is "kv",
+    # which is what `PoolName.KV` stringifies to. So v2 keys for the KV pool are
+    # byte-identical to v1's — this is additive, not a migration.
+
+    def _pool_page_view(self, pool_name, idx: int):
+        """Page view resolved against the pool that OWNS the index.
+
+        v1 could assume one host pool. Under v2 each transfer names its pool and
+        `host_indices` index into that pool's buffer, so resolving them against
+        the KV pool would read the wrong bytes — silently, since the shapes
+        match. `registered_pools` is filled by the ABC's default
+        `register_mem_host_pool_v2`; the KV pool also arrives via the v1
+        `register_mem_pool_host`, so fall back to it for KV.
+        """
+        pools = getattr(self, "registered_pools", None) or {}
+        pool = pools.get(pool_name)
+        if pool is None and str(pool_name) == DEFAULT_POOL_NAME:
+            pool = self._mem_pool_host
+        if pool is None:
+            raise RuntimeError(
+                f"no host pool registered for {pool_name!r}; "
+                f"known={sorted(str(k) for k in pools)}"
+            )
+        page = pool.get_data_page(int(idx), flat=True)
+        if hasattr(page, "view") and hasattr(page, "dtype") and hasattr(page, "numpy"):
+            try:
+                import torch
+
+                return page.view(torch.uint8).numpy()
+            except ImportError:
+                return page.numpy()
+        return page
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        """Longest usable prefix, folded across every pool.
+
+        Fold semantics, matching the reference backends: start from the KV
+        prefix, then narrow it by each sidecar pool's own boundary. A sidecar
+        that is missing pages SHRINKS the answer — serving a prefix whose KV is
+        present but whose window state is not would run attention over state
+        that was never restored.
+
+        Note which keys are probed: the KV `keys`, re-scoped into each pool's
+        segment. `transfer.keys` is used only for its LENGTH, to size the
+        trailing window. That is the contract, and it is easy to get wrong.
+        """
+        if not _SGLANG_V2_AVAILABLE:
+            raise NotImplementedError("sglang v2 pool types unavailable")
+
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count = {str(PoolName.KV): kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            name = str(transfer.name)
+            try:
+                present = self._pool_prefix_flags(name, keys[:kv_pages])
+            except Exception as e:  # noqa: BLE001
+                # A probe failure must not be read as "present": treat the pool
+                # as a total miss and let the prefix shrink to zero.
+                log.debug("batch_exists_v2 probe error pool=%s: %r", name, e)
+                final_pages = 0
+                break
+
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = next(
+                    (i for i in range(kv_pages) if not present[i]), kv_pages
+                )
+            else:  # TRAILING_PAGES — only the tail window has to be there
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = 0
+                for prefix_len in range(kv_pages, 0, -1):
+                    lo = max(0, prefix_len - trailing)
+                    if all(present[i] for i in range(lo, prefix_len)):
+                        boundary = prefix_len
+                        break
+
+            if boundary:
+                hit_count[name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        log.debug(
+            "batch_exists_v2 kv=%d final=%d pools=%s", kv_pages, final_pages, hit_count
+        )
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _pool_prefix_flags(self, pool_name: str, keys) -> List[bool]:
+        """Per-key presence within one pool's segment (NOT a prefix length).
+
+        `batch_exists` answers a prefix question and early-outs on a cold key[0];
+        the v2 fold needs the whole vector, because a TRAILING_PAGES pool can be
+        absent at the head and present at the tail.
+        """
+        if not keys:
+            return []
+        full_keys = [self._full_key(k, pool_name) for k in keys]
+        return list(run(lambda: self._client.batch_head(full_keys)))
+
+    def _batch_v2(self, transfers, transfer_fn, verb: str):
+        """Shared shape for batch_get_v2 / batch_set_v2.
+
+        One pool's failure is reported for that pool only — the controller
+        decides what a partial result means, and collapsing the whole call would
+        hide which pool actually broke.
+        """
+        results = {}
+        for t in transfers or []:
+            name = str(t.name)
+            t_keys = list(t.keys or [])
+            if not t_keys:
+                results[name] = []
+                continue
+            full_keys = [self._full_key(k, name) for k in t_keys]
+            try:
+                starts = _page_start_indices(t_keys, t.host_indices)
+                views = [self._pool_page_view(t.name, i) for i in starts]
+                results[name] = list(transfer_fn(full_keys, views))
+            except Exception as e:  # noqa: BLE001
+                log.debug("batch %s_v2 pool=%s error (n=%d): %r",
+                          verb, name, len(t_keys), e)
+                self._stats[f"{verb}_error"] += len(t_keys)
+                results[name] = [False] * len(t_keys)
+                continue
+            for ok in results[name]:
+                if verb == "get":
+                    self._stats["get_hit" if ok else "get_miss"] += 1
+                else:
+                    self._stats["set_ok" if ok else "set_error"] += 1
+        return results
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        if not _SGLANG_V2_AVAILABLE:
+            raise NotImplementedError("sglang v2 pool types unavailable")
+        return self._batch_v2(transfers, self._batch.get_into, "get")
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        if not _SGLANG_V2_AVAILABLE:
+            raise NotImplementedError("sglang v2 pool types unavailable")
+        return self._batch_v2(
+            transfers,
+            lambda fk, views: self._batch.put_from(fk, views, self._ttl_secs),
+            "set",
+        )
 
     # ── v0 thin wrappers (off hot path once interface_v1=1) ────────────────
 
