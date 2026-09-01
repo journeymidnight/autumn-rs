@@ -236,3 +236,30 @@
   真正的天花板是读路径本身（native 1327），已经追平，故判 pass。
   多 worker 下复验：runai 端到端字节精确、boto3 全套契约（含 paginator/typed error）、
   64 并发 ranged GET 全 206 零 panic。
+
+### F-HICACHE-PORT-REBASE — HiCache 移植的对标对象需重新评估（上游已换架构）
+- **Trigger** (2026-09-01, 用户指出后核实): 已完成的移植（FreeToken 分支 `hicache-autumn`，
+  commit 74bf63a）对标 sglang 的 `HiRadixCache`(1427 行, 仅 plain radix)，并基于"上游没有
+  SWA+HiCache 组合"这一判断把模型选择限死在 plain radix 档。**该判断是错的** —— 它出自本地
+  sglang 克隆 `a757c1e3f`(2026-04-06)，而该克隆落后上游 **6232 个 commit**。
+  上游（`fb8d7eedda`, 2026-09-02 实测）实际有 `unified_radix_cache.py` 的
+  `UnifiedRadixCache(BasePrefixCache)`(3120 行) + 整个 `unified_cache/` 子包，
+  `ComponentType {FULL, SWA, MAMBA, C128}` 把混合模型的复用规则按 component 拆解
+  （FULL 整段前缀可复用、SWA 只覆盖尾部窗口，DeepSeek-V4 = FULL+SWA），
+  开关 `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`；且分层缓存是**统一进去的**而非外挂子类
+  （import `HybridCacheController`/`PoolTransfer`/`SidecarPoolSpec`，内部有
+  `_OngoingWriteThrough`/`_OngoingLoadBack`/`_OngoingPrefetch`/`evict_host`）。
+- **教训（比结论更重要）**: 在陈旧克隆里 grep 不到 ≠ 上游没有。本仓库的计划文件原本就标注过
+  该克隆偏旧，但确认 v1 接口存在后就不再追究其年龄，随后基于同一快照做了"上游没有 X"的断言。
+  **任何"上游没有/不支持 X"的结论，必须先确认所查快照与上游的距离。**
+- **Scope**: 重新评估三件事再决定是否继续按原方案移植：(1) `UnifiedRadixCache` 对 sglang
+  调度器的耦合深度（3120 行 + 10 个子模块，比 HiRadixCache 大一个量级）；(2) 它与
+  `HiCacheStorage` L3 接口的关系 —— autumn 的 `AutumnKVCacheStorage` 对齐的是 v1
+  (`batch_get_v1`/`batch_set_v1`/`interface_v1`)，而新 import 出现 `PoolTransfer`/
+  `SidecarPoolSpec`，L3 可能已演进，需确认能否原样插上；(3) 移植 Unified 相对"只覆盖
+  plain radix"的实际代价差。
+- **Acceptance**: 有一份基于**当前上游**的对比结论，明确说明选哪条路及理由；若改走 Unified，
+  已搬入 FreeToken 的四个文件（storage/backend_factory/ops/hashing）需复核是否仍对标。
+- **Status**: `passes: false` (2026-09-01) — 阻塞后续移植工作。已搬入的
+  `hashing.py`(与 sglang 逐位一致) 与 `host_pool.py` 大概率不受影响；
+  `storage.py`/`backend_factory.py` 取决于 (2) 的结论。
