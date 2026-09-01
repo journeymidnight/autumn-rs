@@ -55,10 +55,22 @@ Posting-on-KV, done directly:
   BM25 (`bm25_term`, k1=1.2 b=0.75) over each doc's current term map → top-k.
   `df` ≈ posting count (stale-orphan over-count is bounded; idf robust).
 - Tokenizer: lowercase + maximal-alphanumeric runs + small stopword set +
-  conservative plural folding; **CJK** (Han / kana / Hangul) is tokenized per
-  codepoint (unigram) so single-character queries match (在中文里单字常是整词,
-  如 猫/狗) without Latin-vs-CJK length-norm skew — bigram precision is a future
-  refinement. Values are opaque `meta` bytes.
+  conservative plural folding; **CJK** (Han / kana / Hangul) emits BOTH the
+  per-codepoint unigram (单字常是整词, 如 猫/狗 — keeps single-character queries
+  working) AND the adjacent bigram inside one run. A bigram never bridges
+  punctuation, whitespace or Latin, so it only ever joins characters the writer
+  wrote together.
+  Bigrams are searchable but **not length-bearing**: `doc_len` still counts
+  unigrams + Latin terms only, so BM25's length normalization keeps the
+  no-Latin-vs-CJK-skew property that unigram-only had.
+  Why: unigram alone loses phrase structure and that loses real searches —
+  measured, `慧能` (a proper name whose second character 能 is extremely common)
+  returned four passages from three unrelated sutras and none from the one he
+  wrote. The design had assumed the hybrid vector leg would supply phrase
+  precision; it cannot, because the default `HashEmbedder` is non-semantic and
+  `mode=auto` therefore resolves to lexical.
+  Cost ≈ 2n index entries for an n-character CJK run (postings are empty-value
+  markers, so entries not bytes). Values are opaque `meta` bytes.
 
 Values are **opaque bytes** — the caller/adapter chooses the encoding (JSON,
 rkyv, …); the core never imposes one.

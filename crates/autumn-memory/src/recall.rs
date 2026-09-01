@@ -33,11 +33,32 @@ pub(crate) fn is_stopword(t: &str) -> bool {
 /// CJK & kana/hangul codepoint blocks (Han, Hiragana, Katakana, Hangul + their
 /// extensions). These scripts have no whitespace word boundaries, so a
 /// maximal-alphanumeric run would swallow a whole sentence into one term. We
-/// tokenize them per **codepoint** (unigram): each character is its own term.
-/// That keeps single-character queries working (in Chinese a lone character is
-/// often a full word — 猫 = cat, 狗 = dog) and keeps `doc_len` honest (no
-/// Latin-vs-CJK length-norm skew); the hybrid vector leg supplies phrase-level
-/// precision. Bigram segmentation is a future precision refinement.
+/// tokenize them per **codepoint** (unigram) AND emit the adjacent **bigram**
+/// of every neighbouring pair inside one run.
+///
+/// Unigrams alone keep single-character queries working (in Chinese a lone
+/// character is often a whole word — 猫 = cat, 狗 = dog), but they lose the
+/// query's phrase structure, and that loses real searches. Measured on a corpus
+/// of Chinese Buddhist texts: `慧能` — the name of the Sixth Patriarch, author
+/// of one of the indexed sutras — returned four passages from three OTHER
+/// sutras and not one from his own. Split into `慧` + `能`, the common character
+/// `能` (able / can) appears in nearly every document, so BM25 ranked whichever
+/// text used it most.
+///
+/// The bigram fixes exactly that: `慧能` also emits the term `慧能`, which is
+/// rare, so it dominates scoring for the phrase while the unigrams still serve
+/// single-character queries. Index and query both run through this function, so
+/// the two stay symmetric for free.
+///
+/// This was always the plan — the previous version of this comment called
+/// bigrams "a future precision refinement" and said the hybrid vector leg
+/// supplied phrase-level precision in the meantime. It does not: the default
+/// embedder is `HashEmbedder`, a bag-of-words hash whose vectors carry no
+/// meaning, so `mode=auto` resolves to lexical and there is no second leg to
+/// lean on. The compensation the design assumed was never there.
+///
+/// Cost: roughly 2n terms for an n-character CJK run instead of n. Postings are
+/// empty-value existence markers, so this is index entries, not bytes of value.
 ///
 /// NOTE: the index is a DERIVED artifact — the authoritative `doc/{id}` record
 /// keeps the original `text`, so changing this tokenizer never loses data; a
@@ -67,8 +88,24 @@ fn is_cjk(ch: char) -> bool {
 /// Tokenize into lowercase alphanumeric terms (dropping stopwords + plural-
 /// folding), with CJK codepoints emitted as individual unigram terms.
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    tokenize_inner(text).0
+}
+
+/// `(terms, length_bearing_count)`.
+///
+/// Bigrams are searchable but do NOT count toward `doc_len`. BM25 normalises by
+/// document length, and letting an n-character CJK run contribute 2n-1 while an
+/// n-word Latin run contributes n would penalise CJK-heavy documents in a mixed
+/// corpus — the exact Latin-vs-CJK skew that emitting unigrams was chosen to
+/// avoid in the first place. The bigram is a precision device, not more
+/// document; length stays measured in the tokens a reader would count.
+fn tokenize_inner(text: &str) -> (Vec<String>, u32) {
+    let mut base_len: u32 = 0;
     let mut out = Vec::new();
     let mut cur = String::new();
+    // The previous character, when it was CJK and immediately precedes the
+    // current one. Cleared by anything else so bigrams stay inside one run.
+    let mut prev_cjk: Option<char> = None;
     for ch in text.chars() {
         // Require alphanumeric so kana-block punctuation / combining marks fall
         // through to the separator branch instead of becoming bogus terms.
@@ -76,21 +113,42 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
             // flush the pending Latin/alnum run, then emit this CJK char as its
             // own term (no case-fold / no plural-fold — neither applies to CJK).
             if !cur.is_empty() {
+                let before = out.len();
                 push_term(&mut out, std::mem::take(&mut cur));
+                base_len += (out.len() - before) as u32;
+            }
+            // The bigram joins this char to the previous one ONLY when that one
+            // was CJK and directly adjacent. Punctuation, spaces and Latin all
+            // reset `prev_cjk`, so a bigram never bridges a boundary the writer
+            // put there — 「慧能」and「能仁」stay distinct from a 能 that merely
+            // follows a comma.
+            if let Some(prev) = prev_cjk {
+                let mut bi = String::with_capacity(8);
+                bi.push(prev);
+                bi.push(ch);
+                out.push(bi);
             }
             out.push(ch.to_string());
+            base_len += 1;
+            prev_cjk = Some(ch);
+            continue;
         } else if ch.is_alphanumeric() {
             for lc in ch.to_lowercase() {
                 cur.push(lc);
             }
         } else if !cur.is_empty() {
+            let before = out.len();
             push_term(&mut out, std::mem::take(&mut cur));
+            base_len += (out.len() - before) as u32;
         }
+        prev_cjk = None;
     }
     if !cur.is_empty() {
+        let before = out.len();
         push_term(&mut out, cur);
+        base_len += (out.len() - before) as u32;
     }
-    out
+    (out, base_len)
 }
 
 fn push_term(out: &mut Vec<String>, t: String) {
@@ -131,8 +189,7 @@ fn fold_plural(t: &str) -> String {
 
 /// Term frequencies + total token count (doc_len) for a document.
 pub(crate) fn term_freqs(text: &str) -> (HashMap<String, u32>, u32) {
-    let toks = tokenize(text);
-    let len = toks.len() as u32;
+    let (toks, len) = tokenize_inner(text);
     let mut tf: HashMap<String, u32> = HashMap::new();
     for t in toks {
         *tf.entry(t).or_insert(0) += 1;
@@ -247,6 +304,84 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    // ── CJK bigram tokenization ────────────────────────────────────────────
+    //
+    // These pin the behaviour that motivated bigrams: a two-character proper
+    // noun whose second character is common must not be drowned out by
+    // documents that merely use that common character a lot.
+
+    #[test]
+    fn cjk_emits_unigrams_and_adjacent_bigrams() {
+        let t = super::tokenize("慧能");
+        assert!(t.contains(&"慧".to_string()), "unigram 慧 missing: {t:?}");
+        assert!(t.contains(&"能".to_string()), "unigram 能 missing: {t:?}");
+        assert!(t.contains(&"慧能".to_string()), "bigram 慧能 missing: {t:?}");
+    }
+
+    #[test]
+    fn single_cjk_char_still_tokenizes() {
+        // A lone character is often a whole word in Chinese; bigrams must not
+        // cost us that query.
+        assert_eq!(super::tokenize("猫"), vec!["猫".to_string()]);
+    }
+
+    #[test]
+    fn bigrams_do_not_bridge_a_boundary() {
+        // 能 follows a comma, so 慧能 is NOT a phrase the writer wrote.
+        let t = super::tokenize("慧，能");
+        assert!(t.contains(&"慧".to_string()));
+        assert!(t.contains(&"能".to_string()));
+        assert!(
+            !t.contains(&"慧能".to_string()),
+            "bigram bridged punctuation: {t:?}"
+        );
+    }
+
+    #[test]
+    fn bigrams_do_not_bridge_latin() {
+        let t = super::tokenize("慧a能");
+        assert!(!t.contains(&"慧能".to_string()), "bigram bridged latin: {t:?}");
+    }
+
+    #[test]
+    fn bigram_is_rarer_than_its_common_half() {
+        // The failure this fixes, in miniature: a corpus where 能 is everywhere
+        // but 慧能 appears once. Term frequency across documents is what BM25
+        // scores on, so the discriminating term has to be the bigram.
+        let corpus = [
+            "慧能大师说法",          // the one document about 慧能
+            "能够如是能行能住",      // 能 everywhere, 慧能 nowhere
+            "不能不能亦复不能",
+        ];
+        let counts: Vec<(usize, usize)> = corpus
+            .iter()
+            .map(|d| {
+                let t = super::tokenize(d);
+                (
+                    t.iter().filter(|x| x.as_str() == "能").count(),
+                    t.iter().filter(|x| x.as_str() == "慧能").count(),
+                )
+            })
+            .collect();
+        // 能 is common across the corpus...
+        assert!(counts[1].0 > counts[0].0, "setup wrong: {counts:?}");
+        // ...but the bigram occurs only in the document that is actually about it.
+        assert_eq!(counts[0].1, 1, "{counts:?}");
+        assert_eq!(counts[1].1, 0, "{counts:?}");
+        assert_eq!(counts[2].1, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn query_and_index_tokenize_identically() {
+        // Symmetry is what makes the bigram usable at query time; both sides go
+        // through the same function, and this pins that they stay that way.
+        let doc = super::tokenize("六祖慧能坛经");
+        let query = super::tokenize("慧能");
+        for q in &query {
+            assert!(doc.contains(q), "query term {q:?} not produced for the doc: {doc:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -281,23 +416,39 @@ mod tests {
     fn cjk_unigram_tokenization() {
         // a CJK run becomes per-character terms (not one swallowed token), so a
         // single-character query can match a longer doc.
-        assert_eq!(tokenize("我喜欢猫"), vec!["我", "喜", "欢", "猫"]);
+        // Unigrams in reading order, each preceded by its bigram with the
+        // previous character. The unigram stream is what this test originally
+        // pinned and it is unchanged; the bigrams are additive.
+        assert_eq!(
+            tokenize("我喜欢猫"),
+            vec!["我", "我喜", "喜", "喜欢", "欢", "欢猫", "猫"]
+        );
         assert_eq!(query_terms("猫"), vec!["猫"]);
         let (tf, len) = term_freqs("我喜欢猫");
+        // doc_len still counts 4: bigrams are searchable but not length-bearing,
+        // so BM25's normalisation is unchanged by adding them.
         assert_eq!(len, 4);
         assert_eq!(tf.get("猫"), Some(&1));
-        // mixed Latin + CJK: Latin runs stay whole + lowercased, CJK splits
-        assert_eq!(tokenize("AI很强mode"), vec!["ai", "很", "强", "mode"]);
-        // Japanese kana + Korean hangul also split per codepoint
-        assert_eq!(tokenize("ねこ"), vec!["ね", "こ"]);
-        assert_eq!(tokenize("고양이"), vec!["고", "양", "이"]);
+        assert_eq!(tf.get("欢猫"), Some(&1));
+        // mixed Latin + CJK: Latin runs stay whole + lowercased, CJK splits, and
+        // no bigram bridges the Latin boundary on either side.
+        let mixed = tokenize("AI很强mode");
+        assert_eq!(mixed, vec!["ai", "很", "很强", "强", "mode"]);
+        // Japanese kana + Korean hangul: same treatment, since the same runs of
+        // script have the same absent word boundaries.
+        assert_eq!(tokenize("ねこ"), vec!["ね", "ねこ", "こ"]);
+        assert_eq!(tokenize("고양이"), vec!["고", "고양", "양", "양이", "이"]);
         // repeated CJK char accumulates term frequency
         assert_eq!(term_freqs("猫猫狗").0.get("猫"), Some(&2));
         // kana-block PUNCTUATION (・ U+30FB) is a separator, not a term — it
         // must not pollute candidates (coco P2)
-        assert_eq!(tokenize("東京・大阪"), vec!["東", "京", "大", "阪"]);
+        // The separator's job is now doubly visible: 東京 and 大阪 each pair up,
+        // and NO 京大 bigram spans the punctuation.
+        let jp = tokenize("東京・大阪");
+        assert_eq!(jp, vec!["東", "東京", "京", "大", "大阪", "阪"]);
+        assert!(!jp.contains(&"京大".to_string()), "bigram crossed ・: {jp:?}");
         // halfwidth katakana is covered too (coco P3)
-        assert_eq!(tokenize("ｱｲｳ"), vec!["ｱ", "ｲ", "ｳ"]);
+        assert_eq!(tokenize("ｱｲｳ"), vec!["ｱ", "ｱｲ", "ｲ", "ｲｳ", "ｳ"]);
     }
 
     #[test]
