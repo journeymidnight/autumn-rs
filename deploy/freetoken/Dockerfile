@@ -135,8 +135,16 @@ RUN python3 -m pip install --no-cache-dir --index-url ${TORCH_INDEX_URL} "torch>
 # the fact the model choice rests on (fp8 experts cannot run on the CPU side, so
 # an FP8 checkpoint silently loses hybrid and falls back to pure offload).
 ARG FREETOKEN_SPEC=freetoken[accel]==0.1.2
+# Its own index, NOT PIP_INDEX_URL. Not every mirror carries this package: the
+# ivolces PyPI mirror answers `from versions: none` for it (build #55 died
+# there), and a caller who sets PIP_INDEX_URL for speed should not have to know
+# that. Pinning the index here means the build works whatever the general mirror
+# is, which is the difference between a Dockerfile that is correct and one that
+# is correct only when someone remembers a pipeline parameter.
+ARG FREETOKEN_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 RUN FREETOKEN_ALLOW_CUDA_MISMATCH=0 \
-    python3 -m pip install --no-cache-dir "${FREETOKEN_SPEC}"
+    python3 -m pip install --no-cache-dir \
+      --index-url "${FREETOKEN_INDEX_URL}" "${FREETOKEN_SPEC}"
 
 # ── the autumn client + its kvcache adapters ──────────────────────────────────
 WORKDIR /src
