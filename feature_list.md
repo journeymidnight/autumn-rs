@@ -171,12 +171,14 @@
     `already borrowed` panic，而流式读天然并发）；读路径按 fuse dispatcher 的分法拆成
     `prepare`（持锁、只做路由）+ `execute`（无锁、真 I/O），所以并发 GET 仍然重叠扇出。
   - **(d) A/B 已测**（2 GiB shard，loopback）：native `read_into` 8 线程 **1327 MB/s** /
-    裸 HTTP 过网关 **1290 MB/s（native 的 97%）** / runai→网关 **~600 MB/s（45%）** /
-    runai→本地页缓存文件 20–33 GB/s。⇒ **HTTP 这一跳几乎免费，网关不是瓶颈，runai 的张量
-    流水线也不是**；瓶颈在 `libstreamers3.so` 包的 **aws-c-s3 CRT 客户端**——它每个 8 MiB
-    chunk 开一条新 TCP（2 GiB 用了 241 连接 / 259 请求），每块都吃冷拥塞窗口；
-    `TARGET_GBPS` / `MAX_CONNECTIONS` / `CHUNK_BYTESIZE` 全扫过，548–633 MB/s 纹丝不动。
-    网关自身 keep-alive 正常（curl 复用连接）。
+    裸 HTTP 过网关 **1290** / 用普通 HTTP 客户端复刻 CRT 访问模式（257×8MiB ranged GET，
+    每块新连接）**1430**（16→256 worker 全程稳定）/ runai→网关 **~600（45%）** /
+    **runai→MinIO 同机同文件同 loopback 2700–2830**。
+    ⇒ **差距在网关，不在 runai**。同一个 runai 从 MinIO 能读 2.8 GB/s。
+    给 CRT 服务同样 2 GiB，网关要多烧 **2.1× CPU**、多发 **4.1× `io_uring_enter`**
+    （9608 vs 2329）：CRT 吸 socket 吸得慢，每个 8 MiB body write 碎成大量部分写，
+    而网关把这 240 条连接全跑在**一条 compio 线程**上，MinIO 则摊在所有核上。
+    见 F-S3-GW-MULTIWORKER。
   **踩到的坑（已写进 ops.md）**：aws-c-s3 认 `HTTP_PROXY` 但**不认 `NO_PROXY`** —— 环境里有
   代理时，boto3 侧的 list 正常（boto3 认 NO_PROXY），每个权重读却全挂在
   `AWS_ERROR_S3_INTERNAL_ERROR` 且**不开任何 socket**。"lists fine, every read fails" 是指纹。
@@ -200,13 +202,28 @@
      `get_libstreamers_plugin_type()` 硬编码三选一、无 env 覆盖 ⇒ 只能**冒充
      `libstreamers3.so`**，同进程内 autumn 与真 S3 二选一，且 URI 仍须写成 `s3://`；
   ② C ABI 无版本号、结构体布局需从上游头文件抄，上游改字段 ⇒ **内存损坏而非干净报错**。
-- **启动判据（已有数字，2026-09-01）**: 判据原文是"网关达原生 ~85% 则不做，掉到 60% 以下才启动"。
-  实测 runai→网关 = 原生的 **45%** ⇒ **判据已触发**。而且测量把损失定位得很准：裸 HTTP 过网关
-  是原生的 97%，runai 的张量流水线本地跑 33 GB/s，**丢的那一段恰好就是 aws-c-s3 CRT 客户端**
-  —— 也正是本 feature 要替换掉的那个组件（`libstreamers3.so` 就是 CRT 的包装）。所以
-  "插件会继承同样的天花板"这个反对意见不成立。
-  **但先做便宜的事**：CRT 每 8 MiB 开一条新连接是首要嫌疑，先查有没有让它复用连接的办法
-  （上游 issue / `aws-c-s3` 版本 / 别的 env），能修好就不必写插件。
+- **启动判据（2026-09-01 修正后：未触发）**: 判据原文是"网关达原生 ~85% 则不做，掉到 60%
+  以下才启动"。初测 runai→网关 = 45% 看似触发，但 MinIO 对照推翻了归因：**CRT 客户端本身
+  不慢**（同机同文件从 MinIO 读 2.8 GB/s），慢的是本网关的单线程 accept。
+  ⇒ **判据应在 F-S3-GW-MULTIWORKER 修完后重测**，在那之前本 feature **不启动**。
+  用一个"冒充 libstreamers3.so + 无版本 ABI"的方案去补一个自家单线程造成的缺口，是错的修法。
 - **Acceptance（若启动）**: vLLM 与 SGLang 均可经 `--load-format runai_streamer` 走 autumn 原生传输，
   字节精确；吞吐 ≥ 现有 `--load-format autumn` 原生 loader。
 - **Status**: `passes: false` (2026-09-01) — 条件性，未启动，等 F-S3-GATEWAY 的 A/B 数字。
+
+### F-S3-GW-MULTIWORKER — autumn-s3 单线程 accept 限住了 CRT 客户端的吞吐
+- **Trigger** (2026-09-01, F-S3-GATEWAY 的 A/B 对照挖出): runai(aws-c-s3 CRT)→autumn-s3
+  只有 ~600 MB/s，而同一个 runai→MinIO（同机、同 2 GiB 文件、同 loopback）**2700–2830 MB/s**。
+  排除法做完了：用普通 HTTP 客户端复刻 CRT 的访问模式（257×8MiB ranged GET、每块新连接、
+  16→256 并发）过同一个网关是 **1430 MB/s**，所以既不是访问模式、也不是并发数、也不是
+  autumn 读路径。实测网关服务 CRT 时多烧 **2.1× CPU**、多发 **4.1× `io_uring_enter`**
+  （9608 vs 2329 / 同样 2 GiB），线程占用 84%。CRT 吸 socket 慢 ⇒ 8 MiB body write 碎成
+  大量部分写 ⇒ 单线程 event loop 被 syscall 淹没；MinIO 是 Go 多线程摊到所有核。
+- **Scope**: 让 `autumn-s3` 用 N 个 accept 线程 —— SO_REUSEPORT + 每线程一个 compio runtime
+  和一份自己的 `FsState`（与 autumn 其余部分同样的 thread-per-core 形状；网关无状态，
+  这不违反 [[feedback_no_multiworker_per_partition]]，那条约束的是分区内扇出）。
+  加 `--workers N`（默认取核数，上限合理值）。
+- **Acceptance**: runai→网关在同一台机上达到 **≥2000 MB/s**（MinIO 参照的 ~70%+），
+  且不低于当前的 1430（普通客户端不许退化）；`docs/model_loading.md` 的表重测更新；
+  重测完回头判 F-S3-RUNAI-PLUGIN 是否还需要。
+- **Status**: `passes: false` (2026-09-01) — 未开始。

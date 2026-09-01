@@ -187,24 +187,28 @@ python -m sglang.launch_server --model-path s3://models/llama \
 | path | MB/s | vs native |
 |---|---|---|
 | `autumn.Fs.read_into`, 8 threads (**Recipe C's data path**) | **1327** | 100% |
-| raw HTTP `GET` through the gateway (1–16 streams) | **1290** | **97%** |
+| raw HTTP `GET` through the gateway (1–16 streams) | **1290** | 97% |
+| plain HTTP replaying the CRT's pattern (16–256 workers) | **1430** | 108% |
 | `runai-model-streamer` → gateway (concurrency 4–32) | **~600** | 45% |
-| `runai-model-streamer` → local page-cached file | 20000–33000 | — |
+| `runai-model-streamer` → **MinIO**, same box/file/loopback | **2700–2830** | (reference) |
 
-The HTTP hop itself costs almost nothing: raw reads through the gateway land
-within 3% of the native binding, and the gateway holds connections open (curl
-reuses them). The streamer's tensor pipeline is not the limit either — it does
-33 GB/s off local files.
+The HTTP hop itself is nearly free: a plain HTTP client replaying the streamer's
+exact access pattern (257 × 8 MiB ranged GETs, a fresh connection per chunk —
+which is what the CRT does) gets **1430 MB/s through the gateway**, and holds
+that from 16 to 256 concurrent workers.
 
-**The loss is inside aws-c-s3, the CRT client that `libstreamers3.so` wraps.**
-It opens roughly one TCP connection per 8 MiB chunk (241 connections for 259
-requests on the 2 GiB shard), so every chunk pays a cold congestion window.
-Raising `RUNAI_STREAMER_S3_TARGET_GBPS`, `_MAX_CONNECTIONS` and
-`_CHUNK_BYTESIZE` moves nothing (548–633 MB/s across the sweep).
+**The gap is the gateway, not the streamer.** The same runai build reads
+2.8 GB/s from MinIO on the same loopback with the same file. Serving the CRT
+costs the gateway **2.1× more CPU and 4.1× more `io_uring_enter` calls per
+byte** than serving the plain client (9608 vs 2329 for the same 2 GiB): the CRT
+drains its sockets slowly enough that each 8 MiB body write fragments into many
+partial writes, and the gateway runs all 240 of those connections on **one
+compio thread**, where MinIO spreads them over every core.
 
-That localizes the remaining gap precisely: it is not the gateway, and not the
-streamer — it is the S3 client between them, which is exactly the component a
-Run:ai backend plugin would replace.
+The fix is to give the gateway more than one accept thread (SO_REUSEPORT across
+N compio runtimes, the same thread-per-core shape the rest of autumn uses); it
+is tracked as its own feature. Until then, treat ~600 MB/s as Recipe D's
+current number, not its ceiling.
 
 Run it as a **per-GPU-node sidecar**: the long hop (EN → sidecar) keeps RDMA,
 and only the loopback hop pays HTTP. A single central gateway would make itself

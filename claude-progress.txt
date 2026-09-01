@@ -19,19 +19,27 @@ Task scope: 只读 S3 兼容网关 autumn-s3(examples/s3-gateway),把没有 load
   **真 runai-model-streamer 0.15.6 端到端字节精确**(list → bytes=0-7 头长 → header JSON →
   各张量 chunk,3 张量全 exact)。边界:206+精确 Content-Range、末段钳位、bytes=-N、
   416 带 bytes*/size、写回 NotImplemented。
-【A/B 数字(2 GiB shard, loopback)】native read_into 8 线程 1327 MB/s;裸 HTTP 过网关 1290
-  (native 的 97%);runai→网关 ~600 (45%);runai→本地页缓存 20-33 GB/s。
-  ⇒ HTTP 这一跳几乎免费,网关不是瓶颈,runai 流水线也不是。瓶颈是 libstreamers3.so 包的
-  **aws-c-s3 CRT 客户端**:每 8 MiB chunk 开一条新 TCP(2 GiB = 241 连接/259 请求),
-  每块吃冷拥塞窗口;TARGET_GBPS/MAX_CONNECTIONS/CHUNK_BYTESIZE 全扫过 548-633 纹丝不动;
-  网关自身 keep-alive 正常(curl 复用)。这把 F-S3-RUNAI-PLUGIN 的启动判据(<60%)打开了,
-  而且证明"插件会继承同样天花板"这个反对意见不成立——插件替换的正是 CRT 那一段。
+【A/B 数字(2 GiB shard, loopback)】native read_into 8 线程 1327;裸 HTTP 过网关 1290;
+  普通 HTTP 客户端复刻 CRT 访问模式(257x8MiB ranged GET/每块新连接,16->256 并发) 1430;
+  runai→网关 ~600 (45%);**runai→MinIO 同机同文件同 loopback 2700-2830**。
+【归因(中途自我推翻一次,记录教训)】我先说瓶颈是 aws-c-s3 CRT 客户端(理由:241 连接/259 请求,
+  "每块吃冷拥塞窗口")——**错了,两条都被自己的对照证伪**:①普通客户端按同样的每块新连接模式
+  跑是 1430(比持久连接的 928 还快),所以连接 churn 不是成本;②MinIO 对照决定性——同一个 runai
+  从 MinIO 读 2.8 GB/s,CRT 本身根本不慢。
+  真因:网关服务 CRT 时多烧 2.1x CPU、多发 4.1x io_uring_enter(9608 vs 2329/同样 2 GiB),
+  线程占用 84%。CRT 吸 socket 慢 ⇒ 每个 8 MiB body write 碎成大量部分写 ⇒ **单条 compio
+  线程被 syscall 淹没**;MinIO 是 Go 多线程摊到所有核。⇒ 新开 F-S3-GW-MULTIWORKER
+  (SO_REUSEPORT + 每线程一个 runtime/FsState)。F-S3-RUNAI-PLUGIN 的判据**不成立**,
+  改成"多 worker 修完后重测再判"——不能拿冒充 libstreamers3.so 去补自家单线程的洞。
+【教训】"排除了 A 和 C,所以是 B" 在没有 B 的独立参照时不算证明。MinIO 这个参照实现只花了
+  几分钟,却直接推翻了归因。下次定位第三方组件慢之前,先找一个已知good的对照端。
 【坑(已写 ops.md)】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY:有代理的环境里 boto3 侧 list 正常
   (boto3 认 NO_PROXY),每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。
   指纹 = "目录列得好好的,读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
-Main gaps: (b) SGLang 真起服务加载真模型未跑;(c) vLLM 同(本机无 vLLM);
-  跨机(非 loopback)未测;CRT 连接复用是否有办法修未查。
-Next steps: 查 aws-c-s3 连接复用(便宜的修,能成就不必写插件);再决定 F-S3-RUNAI-PLUGIN。
+Main gaps: 网关单线程 accept 限住 CRT 吞吐(F-S3-GW-MULTIWORKER,未修);
+  (b) SGLang 真起服务加载真模型未跑;(c) vLLM 同(本机无 vLLM);跨机(非 loopback)未测。
+Next steps: 实现 F-S3-GW-MULTIWORKER(SO_REUSEPORT + N 个 compio runtime,各持一份 FsState),
+  目标 runai→网关 >=2000 MB/s;修完重测 A/B 表,再判 F-S3-RUNAI-PLUGIN 是否还需要。
 
 Date: 2026-08-27 (b)
 TaskStatus: completed
