@@ -31,7 +31,14 @@ and the per-crate `crates/*/CLAUDE.md`.
 | `autumn-client` | — | Data-plane CLI (put/get/del/head/ls/perf-check) |
 | `autumn-op` | — | Admin CLI (bootstrap/split/merge/compact/gc/info/df/format) |
 | `autumn-stream-cli` | — | Low-level stream debugging |
-| `autumn-fuse` | — | FUSE mount of the KV namespace |
+| `autumn-fuse` | — | FUSE mount of the `fs/` namespace (entrypoint role `fuse`) |
+| `autumn-dashboard` | 8799 | Standalone web UI (drives the cluster via `autumn-op`) |
+| `memory-mcp` | 5100 (HTTP mode) | autumn-memory retrieval; `--mcp` = stdio MCP server |
+
+All of the above ship in the container image (`deploy/docker/Dockerfile`);
+`entrypoint.sh` dispatches `manager|extent-node|ps|bootstrap|fuse`, and anything
+else is exec'd verbatim, so `autumn-dashboard` / `memory-mcp` / the CLIs run as
+plain commands.
 
 `autumn-client --help` / `autumn-op --help` lists subcommands. (The standalone
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
@@ -229,9 +236,44 @@ and refuse a loopback bind (legacy shm-only loopback needs an explicit
 `UCX_TLS=posix,cma,tcp,self` and has ≥64K transfers known-broken — the
 loopback chaos harnesses set it themselves). Explicit env always wins.
 
-**In Kubernetes**, run autumn-fuse as a privileged per-node DaemonSet (mounts
-`/dev/fuse`, `--manager autumn-manager:9001`) — a consumer workload on the app
-nodes, separate from the storage StatefulSets.
+**In Kubernetes**, the shipped image carries `autumn-fuse` and the entrypoint
+dispatches it as the `fuse` role, so a consumer pod mounts the `fs/` namespace
+with a sidecar rather than a per-node DaemonSet (a DaemonSet works too, but a
+sidecar keeps the mount's lifetime tied to the one workload that needs it):
+
+```yaml
+containers:
+  - name: fuse
+    image: <CR>/autumn-rs:<tag>
+    args: ["fuse"]
+    env:
+      - { name: AUTUMN_FUSE_MOUNTPOINT, value: /mnt/autumn }
+      - { name: AUTUMN_CREDENTIAL_FILE, value: /etc/autumn/cred/fs.cred }
+    securityContext:
+      privileged: true            # or capabilities.add:[SYS_ADMIN] + /dev/fuse device
+    volumeMounts:
+      - { name: mnt, mountPath: /mnt/autumn, mountPropagation: Bidirectional }
+      - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+  - name: app
+    volumeMounts:
+      - { name: mnt, mountPath: /mnt/autumn, mountPropagation: HostToContainer }
+volumes:
+  - { name: mnt, emptyDir: {} }
+```
+
+The propagation pair is what makes the sidecar's mount visible to the app
+container; without it the app sees an empty directory. The entrypoint clears a
+stale mount (`fusermount3 -u`) before mounting, so a crashed daemon does not
+wedge the next start. Env → flag: `AUTUMN_MANAGER`, `AUTUMN_FUSE_MOUNTPOINT`,
+`AUTUMN_CREDENTIAL_FILE`, `AUTUMN_FUSE_DIRECT_READ`, `AUTUMN_FUSE_ALLOW_OTHER`.
+
+⚠️ **The mount sets `FOPEN_DIRECT_IO` on every open** (`crates/fuse/src/ops.rs`),
+so the kernel serves no page cache for it — and a **`MAP_SHARED` mmap of a file
+on this mount fails with `ENODEV`** (the kernel refuses shared mappings on a
+direct_io FUSE file). Readers that mmap must use `MAP_PRIVATE`, or read with
+`pread`/`preadv`. This bites model loaders: a loader that falls back to
+`mmap.mmap(fd, 0)` (Python's default is `MAP_SHARED`) will fail on this mount
+even though plain reads work.
 
 ### `--direct-read` — bypass the PS for large reads
 

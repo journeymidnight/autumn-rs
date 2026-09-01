@@ -34,20 +34,38 @@ RUN if [ -n "$CARGO_MIRROR" ]; then \
         "registry = \"$CARGO_MIRROR\"" \
         >> "$CARGO_HOME/config.toml"; \
     fi
+# libfuse3-dev + pkg-config are for `-p autumn-fuse`, which builds the MOUNT
+# binary (fuser 0.15 links libfuse3). autumn-server alone would not need them —
+# it pulls autumn-fuse with default-features = false (key/schema modules only) —
+# but the fuse daemon is now shipped so a consumer pod can mount the `fs/`
+# namespace as a POSIX filesystem (docs/ops.md "Fuse daemon runbook").
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libfuse3-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
-# -p autumn-server builds exactly the server binaries. It pulls autumn-fuse with
-# default-features = false (key/schema modules only), so no libfuse3-dev is
-# needed in the builder. TCP transport only — the ucx feature is deliberately
-# off (RDMA-in-k8s needs hostNetwork + device plugins; see docs/k8s_deploy.md).
+# -p autumn-server builds exactly the server binaries. TCP transport only — the
+# ucx feature is deliberately off (RDMA-in-k8s needs hostNetwork + device
+# plugins; see docs/k8s_deploy.md).
 # autumn-dashboard is the standalone web UI (examples/dashboard); it embeds its
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
-RUN cargo build --release -p autumn-server -p autumn-dashboard
+# autumn-fuse is the FUSE mount daemon (default features = the `fuse` feature).
+# memory-mcp is the stdio MCP server over autumn-memory; it ships so an agent
+# pod (hermes) can register it as a local stdio MCP server instead of needing a
+# long-running HTTP/SSE MCP daemon (docs/autumn_memory_plan.md §12).
+RUN cargo build --release \
+    -p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp
 
-# Runtime: binaries link only libc/libgcc; bookworm-slim provides bash + getent
-# (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The kernel comes
-# from the k8s node and must be >= 5.15 (compio uses io_uring).
+# Runtime: the server binaries link only libc/libgcc; bookworm-slim provides
+# bash + getent (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The
+# kernel comes from the k8s node and must be >= 5.15 (compio uses io_uring).
+# fuse3 is for autumn-fuse: it brings libfuse3 (the binary links it) plus the
+# fusermount3 setuid helper, which fuser needs both to mount and to clean up a
+# stale mount after a crashed daemon.
 FROM ${BASE_REGISTRY}library/debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fuse3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder \
     /build/target/release/autumn-manager-server \
     /build/target/release/autumn-extent-node \
@@ -56,6 +74,8 @@ COPY --from=builder \
     /build/target/release/autumn-op \
     /build/target/release/autumnfs \
     /build/target/release/autumn-dashboard \
+    /build/target/release/autumn-fuse \
+    /build/target/release/memory-mcp \
     /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

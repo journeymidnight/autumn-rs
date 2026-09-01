@@ -352,6 +352,38 @@ run_bootstrap() {
     log "bootstrap complete"
 }
 
+run_fuse() {
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    local mp="${AUTUMN_FUSE_MOUNTPOINT:-/mnt/autumn}"
+
+    # A crashed daemon leaves the mount entry behind; the next mount on the same
+    # path then fails with EBUSY / "Transport endpoint is not connected". Clear
+    # it best-effort before mounting (no-op on a clean start).
+    if mountpoint -q "$mp" 2>/dev/null; then
+        log "stale mount at $mp — unmounting"
+        fusermount3 -u "$mp" || log "fusermount3 -u failed (continuing)"
+    fi
+    mkdir -p "$mp"
+
+    wait_for_manager "$mgr"
+
+    local -a args=(
+        --manager "$mgr" --mountpoint "$mp" --transport "$TRANSPORT"
+    )
+    # The mount covers the WHOLE fs/ namespace; the credential names its own
+    # principal. Required when the cluster protects fs/, omitted on authz-off.
+    [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
+        && args+=(--credential-file "$AUTUMN_CREDENTIAL_FILE")
+    # Both default ON in the binary; only pass a flag when overriding to false.
+    [[ -n "${AUTUMN_FUSE_DIRECT_READ:-}" ]] \
+        && args+=(--direct-read "$AUTUMN_FUSE_DIRECT_READ")
+    [[ "${AUTUMN_FUSE_ALLOW_OTHER:-0}" == "1" ]] && args+=(--allow-other)
+
+    log "exec autumn-fuse ${args[*]}"
+    exec autumn-fuse "${args[@]}"
+}
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
@@ -361,6 +393,7 @@ case "${1:-}" in
     extent-node)  run_extent_node ;;
     ps)           run_ps ;;
     bootstrap)    run_bootstrap ;;
-    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|<command...>" ;;
+    fuse)         run_fuse ;;
+    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|<command...>" ;;
     *)            exec "$@" ;;
 esac

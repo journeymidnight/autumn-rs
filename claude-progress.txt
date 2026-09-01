@@ -1080,4 +1080,49 @@ Main gaps（非阻塞，后续可选）:
 
 Next steps: 无待办，G2 收口。
 
+Date: 2026-09-01
+TaskStatus: not_completed
+Task scope: 线上 rollout 重新规划 —— 删 vLLM，改用 FreeToken 跑 MoE(hybrid，4090)，
+  权重走 autumn fuse，KV 走"移植 sglang HiCache 进 FreeToken + 复用 autumn 已有 L3 后端"，
+  hermes 以 stdio 子进程接 memory-mcp。核心同时 v28→v29 stop-the-world。
+  完整计划见 ~/.claude/plans/ok-kubectl-autumn-rollout-volc-cp-build-soft-lightning.md。
+
+【本轮已完成】F-IMG-FUSE-MCP 的代码部分:
+  - deploy/docker/Dockerfile: builder 加 libfuse3-dev+pkg-config，构建扩到
+    `-p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp`；runtime 加 fuse3
+    并拷出两个新二进制。
+  - entrypoint.sh: 加 `fuse` role（挂载前 fusermount3 -u 清理崩溃残留；env→flag 全在
+    entrypoint，不进 Rust）。
+  - docs/ops.md: 二进制表补齐 4 个；k8s fuse 从"应做成 DaemonSet"的一句话换成可执行的
+    sidecar manifest（mountPropagation Bidirectional/HostToContainer 配对），并写明
+    FOPEN_DIRECT_IO ⇒ MAP_SHARED mmap 会 ENODEV 这条后果。
+  - 验证: bash -n、deploy/validate.sh 全绿(role 分派表含 fuse)、cargo build -p memory-mcp
+    通过、cargo check -p autumn-fuse 通过(macOS 只能 type-check，链接要靠 Linux 构建)。
+
+【关键现场事实(已实测，供后续会话直接用)】
+  - 集群里确实有 4090，火山 label 是内部代号: 192.168.3.2 = `GPU` = 8×RTX4090 24G,
+    driver 580.105.08, Xeon 8457C(avx512_bf16+avx_vnni+amx_bf16), 743G 内存, GPU 全空闲无 taint。
+    192.168.0.102 = `X3C` = 1×4090D 但 driver 550.144.03 < FreeToken 要求的 r580 ⇒ 不可用。
+  - FreeToken 无 TP(args.py:640 直接报错)，多卡只能 DP 且每副本一份完整专家权重在宿主内存。
+  - FreeToken 的 --cache-type 会被引擎按模型族强制改写: DSV4/gpt-oss→swa_radix、
+    Qwen3.5/3.6-MoE→hybrid_radix，而这两个 cache 都不继承 BasePrefixCache。
+    ⇒ HiCache 移植只在 plain radix 路径便宜，故模型选 GLM-5.2-NVFP4(MLA+DSA，留在 plain radix)。
+  - autumn 侧 L3 零改动: sglang 的 `dynamic` 后端按 module_path/class_name 用 importlib 加载，
+    而 `interface_v1` 正是 AutumnKVCacheStorage 已声明的那个零拷贝开关。
+    autumn 后端对 L2 host pool 只依赖一个方法: get_data_page(idx, flat=True)。
+
+Main gaps:
+  - F-FT-FUSE-ODIRECT 是先决条件且未验(阻塞在镜像构建): 若 O_DIRECT 探测在 autumn-fuse 上
+    失败，FTW 的 mmap 回退会因 MAP_SHARED 被 ENODEV 拒 ⇒ 两条加载路径同时死。
+  - HiCache 移植全套未开工(页哈希/L2 host pool/DSA 族 KV 读出/L1↔L2 搬运/调度器 6 处钩子/
+    第三种 ref 类别/hi_radix 注册/--hicache-* 参数)。
+  - FreeToken 镜像 + freetoken-autumn CP 流水线未建；freetoken.yaml 未写；
+    hermes MCP 接线未做；核心 v29 未滚。
+
+Next steps:
+  1. 提交本轮改动 → 推 main → CP 构建 autumn-rs @ HEAD(流水线从 main HEAD 取源)。
+  2. 用新镜像跑 F-FT-FUSE-ODIRECT 探测(生死线，失败则 FUSE 方案改道)。
+  3. 核心 stop-the-world 滚 v29，紧接着 autumn-op rebalance(重启后 partition 会全挤在一个 PS)。
+  4. 之后按计划文件的工作流 B~F 推进。
+
 （更早任务历史见 git log；本文件按规则 12 定期裁剪，保持整洁。）
