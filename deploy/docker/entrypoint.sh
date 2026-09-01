@@ -342,10 +342,24 @@ run_bootstrap() {
     local -a args=(--replication "${AUTUMN_REPLICATION:-${meta_repl}+0}")
     [[ -n "$log_ec" ]] && args+=(--log-ec "$log_ec")
     [[ -n "$row_ec" ]] && args+=(--row-ec "$row_ec")
+    # AUTUMN_BOOTSTRAP_PRESPLIT is RETIRED. It fed `bootstrap --presplit`, which
+    # cut the RAW keyspace at hex points; those are namespace-blind, so under the
+    # `{ns}/` key layout every cut point sorts below every real key and the split
+    # silently did nothing. `autumn-op bootstrap` now rejects the flag outright.
+    # Refuse here too rather than dropping it quietly — an operator who sets this
+    # wants their keyspace split, and silence would leave them on one partition.
     if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
-        local n_parts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
-        [[ "$n_parts" =~ ^[0-9]+$ ]] || die "AUTUMN_BOOTSTRAP_PRESPLIT must start with a partition count"
-        args+=(--presplit "${n_parts}:hexstring")
+        die "AUTUMN_BOOTSTRAP_PRESPLIT is retired (raw-keyspace presplit is namespace-blind).
+Presplit per namespace AFTER bootstrap instead:
+  autumn-op presplit --namespace fs  --lanes 24 --parts N --admin-token-file F
+  autumn-op presplit --namespace kvc --count N --hash-prefix '<model>/...'"
+    fi
+    # Bootstrap sends CREATE_STREAM / UPSERT_PARTITION, which the manager gates
+    # on the admin token whenever one is configured — and the deploy configures
+    # one unconditionally. Same `-s` (non-empty file) idiom as run_manager, so an
+    # authz-off cluster with no Secret mounted still bootstraps.
+    if [[ -s "${AUTUMN_ADMIN_TOKEN_FILE:-/nonexistent}" ]]; then
+        args+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
     fi
     log "autumn-op bootstrap ${args[*]}"
     autumn-op --manager "$mgr" --transport "$TRANSPORT" bootstrap "${args[@]}"

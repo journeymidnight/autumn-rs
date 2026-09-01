@@ -101,13 +101,19 @@ patches:
       - op: replace
         path: /data/AUTUMN_EXPECT_NODES
         value: "5"
-      # Presplit at bootstrap so writes fan out across N group-commit pipelines
-      # instead of serializing on one. Benchmarked (write, 4K, RF=3 on NVMe,
-      # single-shard EN): p1 7.7k → p8 35k → p16 59k → p32 65k ops/s — the write
-      # ceiling flattens past ~16 as a single EN io_uring core saturates.
-      - op: add
-        path: /data/AUTUMN_BOOTSTRAP_PRESPLIT
-        value: "32"
+      # NOTE: AUTUMN_BOOTSTRAP_PRESPLIT is deliberately NOT set. It fed
+      # `autumn-op bootstrap --presplit`, which cut the RAW keyspace at hex
+      # points — namespace-blind, so under the `{ns}/` key layout every cut
+      # point sorted below every real key and the presplit silently did
+      # nothing. The binary now rejects the flag outright, which is how this
+      # was caught: bootstrap CrashLoopBackOff'd on the v29 image.
+      #
+      # Presplit per namespace AFTER bootstrap instead (see docs/ops.md):
+      #   autumn-op presplit --namespace fs  --lanes 24 --parts 6 --admin-token-file F
+      #   autumn-op presplit --namespace kvc --count 8 --hash-prefix '<model>/…'
+      # The write-fanout benchmark the old value cited (p1 7.7k → p32 65k ops/s,
+      # 4K RF=3 on NVMe) still argues for splitting — it just has to happen on a
+      # namespace, where the cut points land among real keys.
       # Multi-shard extent nodes: 4 io_uring cores per EN (shard = extent_id % 4)
       # instead of one, to push past the single-EN-core write ceiling.
       # F-EN-DYNSHARD M2: the EN self-registers all 4 shard ports at startup and
