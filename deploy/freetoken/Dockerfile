@@ -2,7 +2,7 @@
 #
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace to build the wheel):
 #   docker build -f deploy/freetoken/Dockerfile \
-#     --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
+#     --build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/ \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
@@ -34,7 +34,7 @@ ARG CUDA_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu22.04
 # Deliberately NOT prefixed with BASE_REGISTRY: that knob exists to route the
 # PUBLIC base images through a mirror, and this one is a full private-registry
 # reference already (`<host>.cr.volces.com/<ns>/autumn-rs:<sha>`). Prefixing it
-# would produce `docker.m.daocloud.io/<host>.cr.volces.com/...` and fail to pull.
+# would produce `hub-cache-cn-beijing.cr.volces.com/<host>.cr.volces.com/...` and fail to pull.
 ARG AUTUMN_IMAGE=autumn-rs:latest
 
 FROM ${AUTUMN_IMAGE} AS autumncore
@@ -48,7 +48,7 @@ FROM ${BASE_REGISTRY}${CUDA_IMAGE}
 #     pypi.org fine but downloads wheels from files.pythonhosted.org, which is
 #     slow/blocked there — a build sits with no output for many minutes. Use
 #     https://mirrors.ivolces.com/pypi/simple/.
-#   APT_MIRROR     : Ubuntu apt mirror BASE URL (e.g. https://mirrors.volces.com).
+#   APT_MIRROR     : Ubuntu apt mirror BASE URL (e.g. https://mirrors.aliyun.com).
 ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
 ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 ARG CARGO_MIRROR=

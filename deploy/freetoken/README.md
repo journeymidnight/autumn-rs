@@ -65,7 +65,7 @@ Built by the Volcengine CP pipeline, not locally (this repo's images are; see
 
 ```bash
 docker build -f deploy/freetoken/Dockerfile \
-  --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
+  --build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/ \
   --build-arg PIP_INDEX_URL=https://mirrors.ivolces.com/pypi/simple/ \
   --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
   --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
