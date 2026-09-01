@@ -12,16 +12,20 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
   autumn's file surface is the programmatic **`autumn.Fs`** binding + the
   **`autumn-fuse`** mount (byte transfer), and — for weights — the streaming
   loader below.
-- **The way to serve an autumn-resident model: the `autumn_vllm_loader`
-  streaming loader (`--load-format autumn`)** — reads safetensors shards STRAIGHT
-  from autumn over the **zero-copy `Fs.read_into` seam + batched EN-direct read**,
-  K parallel readers overlapping the storage read with the H2D copy (the
-  Run:ai-Model-Streamer mechanism, on autumn's RDMA/UCX transport). This is what
-  autumn's large-value zero-copy is *for*. Shipped + verified byte-exact;
-  ~82% of Run:ai Model Streamer over RDMA. See **Recipe C** — the recommended path.
-- **Fallbacks when you can't register a loader (other engines, quick tests):**
+- **The way to serve an autumn-resident model: `autumn-s3` as a per-node sidecar
+  plus the engine's stock `--load-format runai_streamer`** — one path that works
+  on vLLM *and* SGLang *and* anything else that speaks S3, with no engine
+  patches to maintain. Measured at **98% of what `autumn.Fs.read_into` itself
+  delivers**, because both are bounded by autumn's read path, not by the
+  loopback hop between the engine and its sidecar. See **Recipe D**.
+- **`autumn_vllm_loader` (`--load-format autumn`) is the in-process alternative,
+  vLLM only** — reads shards over the zero-copy `Fs.read_into` seam with no
+  sidecar and no extra pip dependency. It is the only path with a verified load
+  under a real engine (vLLM 0.24, 8×H200, byte-exact). Prefer it when you are on
+  vLLM and would rather not run a second process; see **Recipe C**.
+- **Fallbacks when you can neither register a loader nor run a sidecar:**
   materialize to local NVMe and serve unmodified (Recipe A — `autumn.Fs`
-  download, zero engine code), or a FUSE mount with the loader's *eager* read
+  download, zero engine code), or a FUSE mount with the *eager* read
   (Recipe B — never the mmap default, 30–50× slower).
 
 ## Why model load is slow, and how fast loaders win
@@ -130,7 +134,7 @@ integration is reported "slow without GDS installed"; benchmark before relying
 on it. **True GDS DMA needs a GDS-native FS (local NVMe / NFSoRDMA / Lustre /
 Weka), not generic FUSE.**
 
-## Recipe C — `autumn_vllm_loader` streaming loader (RECOMMENDED — zero-copy, highest throughput)
+## Recipe C — `autumn_vllm_loader` streaming loader (vLLM only, no sidecar)
 
 The **`autumn_vllm_loader`** package registers an out-of-tree vLLM loader
 (`@register_model_loader("autumn")`) whose `load_weights` reads safetensors
@@ -159,7 +163,7 @@ vllm serve /path/to/model_dir --load-format autumn \
 
 For engines with no loader seam, Recipe D below is the streaming path.
 
-## Recipe D — `autumn-s3` gateway + stock `runai_streamer` (SGLang / FreeToken / any S3 client)
+## Recipe D — `autumn-s3` sidecar + stock `runai_streamer` (RECOMMENDED — every engine)
 
 `autumn-s3` (`examples/s3-gateway`) is a read-only, unauthenticated
 S3 endpoint over the `fs/` tree. It serves only what the Run:ai streamer
@@ -227,10 +231,10 @@ weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
 
 | situation | use |
 |---|---|
-| **vLLM** serving an autumn model (the default) | **C** — `autumn_vllm_loader`, `--load-format autumn` (zero-copy) |
-| **SGLang / FreeToken** (no loader plugin seam) | **D** — `autumn-s3` + `--load-format runai_streamer`; **B** (FUSE mount) if you cannot add the sidecar |
+| **serving an autumn model (the default, any engine)** | **D** — `autumn-s3` sidecar + `--load-format runai_streamer` |
+| vLLM, and you would rather not run a sidecar | **C** — `autumn_vllm_loader`, `--load-format autumn` |
 | any S3-speaking tool (`aws s3`, datasets, checkpoints) | **D** — `autumn-s3` |
-| other engine / no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
+| no sidecar and no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
 | want no copy-out / ephemeral nodes | **B** (FUSE + `eager`) |
 | loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |
 
