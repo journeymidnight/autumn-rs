@@ -62,10 +62,19 @@ default / **`eager`**=read whole file to RAM then to GPU / `torchao`),
 `safetensors_prefetch_num_threads` (8), `safetensors_prefetch_block_size`
 (16 MiB).
 
-**SGLang** reuses vLLM's loader model (same `--load-format`, same mmap default),
-and adds `remote`/`layered` plus GPU-to-GPU RDMA weight transfer between live
-instances (R-Fork / P2P — fastest of all, but needs a live source replica, not
-a cold start). **TensorRT-LLM** builds a prebuilt engine loaded from local disk;
+**SGLang** looks like vLLM's loader model from the outside (same `--load-format`
+spelling, same mmap default) and adds `remote`/`layered` plus GPU-to-GPU RDMA
+weight transfer between live instances (R-Fork / P2P — fastest of all, but needs
+a live source replica, not a cold start).
+
+⚠️ **It is NOT the same registry.** Re-checked 2026-09-01 against sglang
+`a757c1e3f`: `python/sglang/srt/model_loader/` imports nothing from vLLM, there
+is no `register_model_loader` anywhere in the tree, and `get_model_loader`
+(`model_loader/loader.py:3105`) is a hardcoded if-chain over a closed
+`LoadFormat` enum. An out-of-tree loader has nowhere to register, so
+**`--load-format autumn` does not work on SGLang** — Recipe C is vLLM-only.
+On SGLang use Recipe B (FUSE mount) or Recipe A (materialize), or patch sglang
+to add a `LoadFormat` variant and a branch. **TensorRT-LLM** builds a prebuilt engine loaded from local disk;
 no serve-time streaming-from-object-storage path.
 
 ## Recipe A — materialize to local, serve unmodified (fallback: any engine, no loader)
@@ -129,8 +138,13 @@ shards straight from autumn via the zero-copy `Fs.read_into` seam (+ batched EN
 direct-read), K parallel readers feeding `model.load_weights(...)` — the
 Run:ai-streamer pipeline on autumn's transport. config.json + tokenizer stay on
 vLLM's local `model=` path (the weights-from-a-streaming-backend split, like
-runai_streamer/tensorizer). One implementation serves both vLLM and SGLang
-(shared loader registry).
+runai_streamer/tensorizer).
+
+This is **vLLM-only**. An earlier revision of this doc claimed one
+implementation served both vLLM and SGLang via a shared loader registry; that is
+not true of current SGLang, which maintains its own loader with no extension
+point (see the SGLang note above). Engines without a loader seam — SGLang,
+FreeToken — read weights through Recipe B instead.
 
 **Verified end-to-end** (vLLM 0.24, 8×H200): loads `gte-Qwen2-1.5B` from autumn,
 embedding **byte-exact vs the default local-disk loader**; over RDMA reaches
@@ -160,7 +174,8 @@ weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
 
 | situation | use |
 |---|---|
-| **vLLM / SGLang serving an autumn model (the default)** | **C** — `autumn_vllm_loader`, `--load-format autumn` (zero-copy) |
+| **vLLM** serving an autumn model (the default) | **C** — `autumn_vllm_loader`, `--load-format autumn` (zero-copy) |
+| **SGLang / FreeToken** (no loader plugin seam) | **B** (FUSE mount) — C cannot register there |
 | other engine / no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
 | want no copy-out / ephemeral nodes | **B** (FUSE + `eager`) |
 | loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |

@@ -64,7 +64,7 @@ Built by the Volcengine CP pipeline, not locally (this repo's images are; see
 `deploy/docker/Dockerfile` for the core one). Build context is the **repo root**:
 
 ```bash
-docker build -f examples/freetoken-autumn/Dockerfile \
+docker build -f deploy/freetoken/Dockerfile \
   --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
   --build-arg PIP_INDEX_URL=https://mirrors.ivolces.com/pypi/simple/ \
   --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \

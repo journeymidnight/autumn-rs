@@ -1,7 +1,7 @@
 # FreeToken + autumn image — MoE serving with weights read from an autumn FUSE mount.
 #
 # Build context = autumn-rs REPO ROOT (needs the Rust workspace to build the wheel):
-#   docker build -f examples/freetoken-autumn/Dockerfile \
+#   docker build -f deploy/freetoken/Dockerfile \
 #     --build-arg BASE_REGISTRY=docker.m.daocloud.io/ \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
