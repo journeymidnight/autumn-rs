@@ -132,7 +132,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self.storage_config = storage_config
         # BUG-KVC-TENANT: on the sglang path `model_name` is the served
         # `--model-path` — normally a real identity (sglang has no equivalent
-        # of autumn_vllm_loader's fixed config dir), so the default tenant
+        # of a fixed config dir shared by several models), so the default tenant
         # format is UNCHANGED (no key invalidation for existing sglang
         # deployments). `HiCacheStorageConfig` carries no architecture info to
         # fingerprint from, so the escape hatch for deployments where the path

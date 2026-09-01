@@ -1,3 +1,27 @@
+Date: 2026-09-01 (b)
+TaskStatus: completed
+Task scope: 真引擎验收 S3 网关(vLLM 0.28 + SGLang 0.5.10),然后删掉 autumn_vllm_loader。
+【真引擎结果(Qwen3-8B / 16 GiB / 单张 H200)】
+  vLLM 0.28   本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5/19.0 | 已退役 loader 18.23/18.25
+  SGLang 0.5.10 本地盘 35.7                  | 网关 37.1
+  三条路径贪心解码补全与本地盘**逐 token 相同**。网关 vs loader 差 1.6-4%。
+  SGLang 上 loader 根本注册不了(封闭 LoadFormat 枚举),网关能跑——这就是删它的理由。
+【删除】python/autumn_vllm_loader/ 整包删除;docs/model_loading.md 去掉旧 Recipe C 并把网关
+  重编号为 Recipe C(RECOMMENDED);README/ops.md/fs_unify_design/autumn_fs_lease_plan/
+  autumn_kvcache_plan/kvcache README 与注释里的引用全部改写成不依赖该包的描述。
+【注意:kvcache 里留了一处惰性分支】_identity.py 仍会读 model_loader_extra_config["path"]
+  作为 tenant 指纹来源。那是 loader 的键,现在不会再有人设;**但机制要留着**——它防的是
+  BUG-KVC-TENANT(多个模型共用一个固定 config 目录 ⇒ tenant 撞车),而 Recipe A(materialize)
+  和 Recipe B(FUSE mount)照样能造出那个局面。网关路径下 model= 是 s3://models/<name>,
+  每模型唯一,那个撞车面自然消失。注释已改成不点名已删包。
+【环境坑】SGLang 0.5.10 需要 runai-model-streamer>=0.16(0.15.6 不导出 ObjectStorageModel);
+  共享机器不动系统包,用 `uv pip install --no-deps --target <dir>` + PYTHONPATH 覆盖
+  (带 deps 装会拉进 torch/torchvision 把系统的盖掉 → "operator torchvision::nms does not exist")。
+  sglang.Engine 用 spawn 起子进程,测试脚本必须有 if __name__ == "__main__" 守卫。
+【已知无关噪音】python/autumn_kvcache 全套跑 test_no_hit_dedup.py 3 挂,单跑该文件 6/6 过;
+  HEAD 上同样(stash 实证),是既有跨测试状态污染,本轮未处理。
+Next steps: 跨机重测(loopback 掩盖网络成本)。
+
 Date: 2026-09-01
 TaskStatus: not_completed
 Task scope: 只读 S3 兼容网关 autumn-s3(examples/s3-gateway),把没有 loader 插件位的引擎

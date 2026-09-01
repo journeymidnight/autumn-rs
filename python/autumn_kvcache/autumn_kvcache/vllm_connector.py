@@ -520,7 +520,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._block_size = block_size
         # BUG-KVC-TENANT: the tenant MUST carry the model's real identity.
         # `model_name` alone is the served path, which is a CONSTANT local dir
-        # under autumn_vllm_loader — the fingerprint (arch shape + weights
+        # when one config dir is shared — the fingerprint (arch shape + weights
         # source, see _identity.py) is what actually separates models.
         fingerprint = getattr(tenant_cfg, "model_fingerprint", None)
         self._tenant_suffix = build_tenant_suffix(tenant_cfg, fingerprint)
@@ -529,7 +529,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "no model-identity fingerprint derivable from vllm_config — "
                 "tenant %r falls back to the model path only and WILL collide "
                 "if two different models are served with the same path (e.g. "
-                "autumn_vllm_loader's fixed config dir). Set "
+                "a fixed config dir shared by several models). Set "
                 "kv_connector_extra_config['model_id'] to disambiguate.",
                 self._tenant_suffix,
             )

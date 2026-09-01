@@ -17,13 +17,8 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
   on vLLM *and* SGLang *and* anything else that speaks S3, with no engine
   patches to maintain. Measured at **98% of what `autumn.Fs.read_into` itself
   delivers**, because both are bounded by autumn's read path, not by the
-  loopback hop between the engine and its sidecar. See **Recipe D**.
-- **`autumn_vllm_loader` (`--load-format autumn`) is the in-process alternative,
-  vLLM only** — reads shards over the zero-copy `Fs.read_into` seam with no
-  sidecar and no extra pip dependency. It is the only path with a verified load
-  under a real engine (vLLM 0.24, 8×H200, byte-exact). Prefer it when you are on
-  vLLM and would rather not run a second process; see **Recipe C**.
-- **Fallbacks when you can neither register a loader nor run a sidecar:**
+  loopback hop between the engine and its sidecar. See **Recipe C**.
+- **Fallbacks when you cannot run a sidecar:**
   materialize to local NVMe and serve unmodified (Recipe A — `autumn.Fs`
   download, zero engine code), or a FUSE mount with the *eager* read
   (Recipe B — never the mmap default, 30–50× slower).
@@ -75,10 +70,9 @@ a live source replica, not a cold start).
 `a757c1e3f`: `python/sglang/srt/model_loader/` imports nothing from vLLM, there
 is no `register_model_loader` anywhere in the tree, and `get_model_loader`
 (`model_loader/loader.py:3105`) is a hardcoded if-chain over a closed
-`LoadFormat` enum. An out-of-tree loader has nowhere to register, so
-**`--load-format autumn` does not work on SGLang** — Recipe C is vLLM-only.
-On SGLang use Recipe B (FUSE mount) or Recipe A (materialize), or patch sglang
-to add a `LoadFormat` variant and a branch. **TensorRT-LLM** builds a prebuilt engine loaded from local disk;
+`LoadFormat` enum. An out-of-tree loader has nowhere to register, which is why autumn serves
+weights through an S3 endpoint rather than a per-engine plugin — SGLang's own
+`runai_streamer` needs no patch. **TensorRT-LLM** builds a prebuilt engine loaded from local disk;
 no serve-time streaming-from-object-storage path.
 
 ## Recipe A — materialize to local, serve unmodified (fallback: any engine, no loader)
@@ -134,36 +128,7 @@ integration is reported "slow without GDS installed"; benchmark before relying
 on it. **True GDS DMA needs a GDS-native FS (local NVMe / NFSoRDMA / Lustre /
 Weka), not generic FUSE.**
 
-## Recipe C — `autumn_vllm_loader` streaming loader (vLLM only, no sidecar)
-
-The **`autumn_vllm_loader`** package registers an out-of-tree vLLM loader
-(`@register_model_loader("autumn")`) whose `load_weights` reads safetensors
-shards straight from autumn via the zero-copy `Fs.read_into` seam (+ batched EN
-direct-read), K parallel readers feeding `model.load_weights(...)` — the
-Run:ai-streamer pipeline on autumn's transport. config.json + tokenizer stay on
-vLLM's local `model=` path (the weights-from-a-streaming-backend split, like
-runai_streamer/tensorizer).
-
-This is **vLLM-only**. An earlier revision of this doc claimed one
-implementation served both vLLM and SGLang via a shared loader registry; that is
-not true of current SGLang, which maintains its own loader with no extension
-point (see the SGLang note above). Engines without a loader seam — SGLang,
-FreeToken — read weights through Recipe B instead.
-
-**Verified end-to-end** (vLLM 0.24, 8×H200): loads `gte-Qwen2-1.5B` from autumn,
-embedding **byte-exact vs the default local-disk loader**; over RDMA reaches
-~82% of Run:ai Model Streamer's local-page-cache throughput.
-Package: `python/autumn_vllm_loader/` (+ `tests/run_vllm_e2e.sh`).
-
-```bash
-pip install -e python/autumn_vllm_loader   # env needs the `autumn` SDK + torch + vllm
-vllm serve /path/to/model_dir --load-format autumn \
-    --model-loader-extra-config '{"manager":"mgr:9001","path":"models/llama-3-8b","transport":"ucx","direct_read":true}'
-```
-
-For engines with no loader seam, Recipe D below is the streaming path.
-
-## Recipe D — `autumn-s3` sidecar + stock `runai_streamer` (RECOMMENDED — every engine)
+## Recipe C — `autumn-s3` sidecar + stock `runai_streamer` (RECOMMENDED — every engine)
 
 `autumn-s3` (`examples/s3-gateway`) is a read-only, unauthenticated
 S3 endpoint over the `fs/` tree. It serves only what the Run:ai streamer
@@ -190,13 +155,13 @@ python -m sglang.launch_server --model-path s3://models/llama \
 
 | path | MB/s | vs native |
 |---|---|---|
-| `autumn.Fs.read_into`, 8 threads (**Recipe C's data path**) | **1327** | 100% |
+| `autumn.Fs.read_into`, 8 threads (the raw binding, as a ceiling) | **1327** | 100% |
 | plain HTTP replaying the streamer's access pattern | 1430 | 108% |
 | **`runai-model-streamer` → gateway (default 8 workers)** | **~1300** | **98%** |
 | `runai-model-streamer` → gateway, `--workers 1` | 557 | 42% |
 | `runai-model-streamer` → MinIO (local page cache, reference) | 2700–2830 | — |
 
-**Recipe D lands within a couple of percent of Recipe C's data path.** The HTTP
+**The sidecar lands within a couple of percent of the raw binding.** The HTTP
 hop costs almost nothing on loopback; both paths are bounded by autumn's read
 path, not by the transport between the gateway and the engine.
 
@@ -214,10 +179,21 @@ Run it as a **per-GPU-node sidecar**: the long hop (EN → sidecar) keeps RDMA,
 and only the loopback hop pays HTTP. A single central gateway would make itself
 the bandwidth bottleneck and need its own HA story.
 
-The trade against Recipe C is the data path: the gateway is HTTP/TCP with two
-extra copies, where the native loader is `read_into` straight into a pinned
-buffer over UCX. Use C on vLLM; use D where C cannot register. Operational
-detail, including the path-style requirement, is in `docs/ops.md`.
+### Verified under real engines (2026-09-01, Qwen3-8B, 16 GiB, one H200)
+
+| engine | path | engine-init seconds | output |
+|---|---|---|---|
+| vLLM 0.28 | local disk | 23.3 cold / 14.4 with a warm page cache | reference |
+| vLLM 0.28 | **`autumn-s3` sidecar** | **18.5 / 19.0** | byte-identical |
+| SGLang 0.5.10 | local disk | 35.7 | reference |
+| SGLang 0.5.10 | **`autumn-s3` sidecar** | **37.1** | byte-identical |
+
+Greedy decoding, same prompts; the completions match the local-disk run token for
+token on both engines. The numbers are whole-engine init, not weight load alone —
+on a 16 GiB model that is most of it, on a 0.5 B model it is noise.
+
+Operational detail, including the path-style requirement and the `HTTP_PROXY`
+trap, is in `docs/ops.md`.
 
 ## Datasets
 
@@ -231,11 +207,10 @@ weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
 
 | situation | use |
 |---|---|
-| **serving an autumn model (the default, any engine)** | **D** — `autumn-s3` sidecar + `--load-format runai_streamer` |
-| vLLM, and you would rather not run a sidecar | **C** — `autumn_vllm_loader`, `--load-format autumn` |
-| any S3-speaking tool (`aws s3`, datasets, checkpoints) | **D** — `autumn-s3` |
-| no sidecar and no loader hook / quick test | **A** (materialize via `autumn.Fs`) |
-| want no copy-out / ephemeral nodes | **B** (FUSE + `eager`) |
+| **serving an autumn model (the default, any engine)** | **C** — `autumn-s3` sidecar + `--load-format runai_streamer` |
+| any S3-speaking tool (`aws s3`, datasets, checkpoints) | **C** — `autumn-s3` |
+| cannot run a sidecar / quick test | **A** (materialize via `autumn.Fs`) |
+| want no copy-out on ephemeral nodes | **B** (FUSE + `eager`) |
 | loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |
 
 ### Sources

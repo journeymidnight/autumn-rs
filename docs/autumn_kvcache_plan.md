@@ -328,7 +328,7 @@ wire key = kvc/{tenant_suffix}/vllm/{VLLM_KV_STORAGE_FORMAT}/{content_hash}/{lay
   kv_heads / head / vocab / model_type / dtype / quant / MLA）+ 权重来源
   （`load_format`，autumn loader 时再加 `model_loader_extra_config["path"]`）+
   可选 `kv_connector_extra_config["model_id"]`。vLLM 路径上这个指纹是**必需**的：
-  `autumn_vllm_loader` 把 config/tokenizer 钉死在本地固定目录，`model_config.model`
+  共享一个本地 config 目录的部署把 config/tokenizer 钉死在固定路径，`model_config.model`
   对所有这样 serve 的模型都是同一个字符串，没有指纹就会两个模型共用一个 tenant
   互相串读 KV（层数不同时是可见告警，同形状模型则是**无声**错误）。指纹跨进程
   确定（同部署 → 同 tenant，否则缓存永 miss）。

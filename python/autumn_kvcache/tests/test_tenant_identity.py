@@ -5,7 +5,7 @@ No cluster, no vllm, no torch, no `autumn` native module required:
     cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q
 
 Covers the live incident class: Qwen2.5-7B-AWQ and Qwen2.5-32B-AWQ served via
-autumn_vllm_loader (both with model path `/model-cfg`, same tokenizer ⇒ same
+a shared config dir (both with model path `/model-cfg`, same tokenizer ⇒ same
 token ids ⇒ same content hash) MUST land in different tenants; and the
 stability requirement: the same deployment MUST fingerprint identically across
 processes or the external cache never hits.
@@ -124,7 +124,7 @@ def test_live_incident_7b_vs_32b_same_path_different_tenant():
 def test_vllm_tenant_uses_weights_path_basename_not_config_dir():
     """Key must be concise AND effective: the model segment is the autumn
     weights-path BASENAME (per-model unique), never the constant `/model-cfg`
-    config-dir every autumn_vllm_loader model shares (the old collision surface)."""
+    config-dir several models can share (the old collision surface)."""
     t = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/qwen7b"))
     assert t.startswith("qwen7b_")
     assert "model-cfg" not in t
@@ -138,7 +138,7 @@ def test_vllm_tenant_uses_weights_path_basename_not_config_dir():
 
 def test_same_arch_different_weights_path_different_tenant():
     """Two finetunes of the same architecture stored at different autumn paths
-    (the autumn_vllm_loader case) must NOT share a tenant."""
+    (the shared-config-dir case) must NOT share a tenant."""
     a = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/qwen7b-base"))
     b = _tenant(fake_vllm_config(FakeModelConfig(**QWEN_7B), weights_path="models/qwen7b-sft"))
     assert a != b

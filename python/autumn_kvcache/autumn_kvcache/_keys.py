@@ -12,7 +12,7 @@ pages into the SAME autumn keyspace:
                      pp_size)` scoping so two models / parallel ranks never
                      collide. The fingerprint (BUG-KVC-TENANT, `_identity.py`)
                      exists because the model *path* alone is NOT an identity:
-                     `autumn_vllm_loader` deployments serve every model from
+                     A deployment that serves every model from
                      the same fixed local config dir.
 - `pool`           — `kv` for sglang, `vllm` for the vLLM connector (separate
                      keyspaces; also the v2 multi-pool reservation slot).
@@ -90,7 +90,7 @@ def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     `model_fingerprint` (BUG-KVC-TENANT, see `_identity.py`) carries the
     model's REAL identity (architecture shape + weights source). It is
     REQUIRED on the vLLM connector path, where `model_name` is just the local
-    config-dir path and is constant across models under `autumn_vllm_loader`
+    config-dir path, which is constant across models when one config dir is shared
     — without it two different models silently share one tenant and cross-read
     KV (live incident: Qwen2.5-7B/32B both under `model-cfg_0_1`). When None
     (sglang default, or an unfingerprintable config) the format is exactly the

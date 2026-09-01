@@ -130,7 +130,7 @@ version (`VLLM_KV_STORAGE_FORMAT`, bumped whenever the extract/inject byte
 layout changes).
 
 This exists because the model *path* is not an identity: with
-`autumn_vllm_loader` every model is served from the same fixed local config
+a shared config dir, every model is served from the same fixed local config
 dir, so two different models used to share one tenant and cross-read each
 other's KV (observed live: Qwen2.5-7B and 32B under one tenant; a same-shape
 pair would have been silently wrong). Set

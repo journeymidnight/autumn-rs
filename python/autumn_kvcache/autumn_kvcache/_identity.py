@@ -1,6 +1,6 @@
 """Model-identity fingerprint for tenant isolation (BUG-KVC-TENANT).
 
-Why this exists — the live incident: `autumn_vllm_loader` deployments pin the
+Why this exists — the live incident: deployments that pin the
 served path to a constant local dir (config/tokenizer in e.g. `/model-cfg`,
 weights streamed from autumn), so vLLM's `model_config.model` is the SAME
 string for every model served that way. `build_tenant_suffix` inherited
@@ -214,7 +214,7 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
             src["load_format"] = str(fmt).lower()
         mle = getattr(lc, "model_loader_extra_config", None)
         if isinstance(mle, dict):
-            # autumn_vllm_loader: `path` = the autumn dir holding the weights.
+            # A weights-streaming loader may name its source dir here (`path`).
             # THE strongest identity on the deployment path that broke
             # model_name — two models must live at two paths. (The `manager`
             # endpoint is deliberately excluded: the same weights reached via
@@ -273,7 +273,7 @@ def tenant_cfg_from_vllm(vllm_config: Any):
     tp_rank = tp_size = pp_rank = pp_size = None
     try:
         model = getattr(getattr(vllm_config, "model_config", None), "model", None)
-        # On the autumn_vllm_loader path `model_config.model` is a CONSTANT local
+        # When weights come from a streaming loader, `model_config.model` can be a CONSTANT local
         # config-dir (e.g. /model-cfg) shared by every model served that way — it
         # identifies nothing and made the tenant key `model-cfg_<fp>_...` (the
         # BUG-KVC-TENANT collision surface + noise). Prefer the autumn weights

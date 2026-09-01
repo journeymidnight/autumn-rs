@@ -156,9 +156,7 @@
   (c) vLLM 同上；
   (d) A/B：与现有 `--load-format autumn` 原生 loader 对比吞吐，比值记入 `docs/model_loading.md`
       —— 这个数字是 F-S3-RUNAI-PLUGIN 是否值得做的判据。
-- **Status**: `passes: false` (2026-09-01) — 网关已实现（`examples/s3-gateway`，二进制 `autumn-s3`，
-  ~600 行 + 5 单测），本机 3 节点集群验证到位；(b)(c) 引擎级端到端未跑，故不置 true。
-  **已过的**：
+- **验证明细**：网关实现在 `examples/s3-gateway`（二进制 `autumn-s3`，~600 行 + 5 单测）。
   - boto3（真 botocore/AWS SDK）：`list_buckets` / `list_objects_v2`（prefix+delimiter+
     `encoding-type=url`）/ `head_object` / `get_object` / ranged `get_object` / 官方 paginator
     翻页 / typed `NoSuchKey` + `NotImplemented`，全过。
@@ -179,7 +177,20 @@
   **踩到的坑（已写进 ops.md）**：aws-c-s3 认 `HTTP_PROXY` 但**不认 `NO_PROXY`** —— 环境里有
   代理时，boto3 侧的 list 正常（boto3 认 NO_PROXY），每个权重读却全挂在
   `AWS_ERROR_S3_INTERNAL_ERROR` 且**不开任何 socket**。"lists fine, every read fails" 是指纹。
-  **仍缺**：(b) SGLang 真起服务加载一个真模型；(c) vLLM 同（本机无 vLLM）。
+  - **(b)(c) 真引擎端到端已过**（2026-09-01，Qwen3-8B / 16 GiB / 单张 H200）：
+
+    | 引擎 | 路径 | engine-init 秒 | 输出 |
+    |---|---|---|---|
+    | vLLM 0.28 | 本地盘 | 23.3 冷 / 14.4 页缓存热 | 基准 |
+    | vLLM 0.28 | **网关** | **18.5 / 19.0** | 逐字相同 |
+    | SGLang 0.5.10 | 本地盘 | 35.7 | 基准 |
+    | SGLang 0.5.10 | **网关** | **37.1** | 逐字相同 |
+
+    贪心解码同 prompt，两个引擎的补全都与本地盘逐 token 一致。同轮对照已退役的
+    in-process loader：vLLM 上 18.23/18.25 vs 网关 18.54/19.0，差 1.6–4%。
+    **⇒ 该 loader 已删除**（本条 Trigger 写的"只对 vLLM 有效"正是删它的理由）。
+    坑：SGLang 0.5.10 要 `runai-model-streamer>=0.16`（0.15.6 不导出 `ObjectStorageModel`）。
+- **Status**: `passes: true` (2026-09-01) — 全部验收项通过。仍未测：跨机（loopback 掩盖网络成本）。
 
 ### F-S3-RUNAI-PLUGIN — 用 runai 后端插件 ABI 承载 autumn 原生传输【条件性，等 F-S3-GATEWAY 的数字】
 - **Trigger** (2026-09-01): `libstreamer.so`（未 strip）里存在一套可插拔后端 C ABI，按**裸 soname**

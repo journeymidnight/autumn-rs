@@ -319,7 +319,7 @@ read-bytes counter tracks the read. The same flag exists on every direct-read
 frontend, all DEFAULT ON now (2026-07-09): fuse `--direct-read` (default true),
 python `BatchClient(manager, ..., direct=True)`, `autumn.Fs.connect(...,
 direct_read=True)`, kvcache `AutumnKVConnector` (`extra_config.direct_read`),
-`autumn_vllm_loader` (`extra_config.direct_read`). Mixed-size batches route per
+the `autumn-s3` gateway (`--direct-read`). Mixed-size batches route per
 item — sub-64 KiB values still go through the PS; on a topology where ENs aren't
 client-reachable each item falls back to the proxy and the client logs one WARN.
 
@@ -327,7 +327,7 @@ client-reachable each item falls back to the proxy and the client logs one WARN.
 
 `autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
-file surface (`autumn_vllm_loader` reads model weights through it). Headless
+file surface (the `autumn-s3` gateway reads model weights through it). Headless
 correctness (self-contained isolated memory-mode cluster — builds the wheel,
 boots manager+EN+PS, drives the full `Fs` surface + a cross-instance byte-exact
 check, tears down):
@@ -1058,7 +1058,7 @@ The namespace-side counterpart is `namespace-list` (registry rows: name / prefix
 vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...`. The
 `{model}` segment is the autumn **weights-path basename** (e.g. `qwen7b` from
 `model_loader_extra_config.path=models/qwen7b`), NOT the constant `/model-cfg`
-config dir that every `autumn_vllm_loader` model shares — so the readable
+config dir that several models can share — so the readable
 segment ALONE distinguishes models even if the fingerprint ever degrades
 (2026-08-11: keys now read `qwen7b_<fp>_0_1`, not the old collision-prone
 `model-cfg_<fp>_0_1`). The 12-hex fingerprint carries the model's real identity
