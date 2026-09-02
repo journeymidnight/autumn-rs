@@ -147,7 +147,53 @@ code re-index) · `--reset` (wipe agent first) · `--tenant` / `--agent`
 clusters: `cluster.sh` mints `$DATA_ROOT/authz/memory.cred` granting
 `mem/memory/`) · `--host` / `--port` · `--mcp` (stdio MCP server; indexes
 nothing at startup — ingest via the tools or a prior run) · `--embed-model` /
-`--tokenizer` (below).
+`--tokenizer` (below) · `--eval FILE` and the `--eval-*` flags (below).
+
+## Measuring retrieval quality (`--eval`)
+
+Search quality has knobs — the tokenizer, BM25's constants, RRF fusion, which
+leg `auto` picks, `NPROBE`, chunk size — and no unit test can tell you whether
+turning one made search better. `--eval` scores a labelled query set against
+the ingested corpus, so a change to any of them produces a number instead of an
+impression.
+
+```bash
+# Build the index once, score it, and compare against the committed baseline.
+cargo run --release -p memory-mcp -- 127.0.0.1:9001 --agent eval \
+    --docs /path/to/corpus --eval examples/memory-mcp/eval/sutra.jsonl
+
+cargo run --release -p memory-mcp -- 127.0.0.1:9001 --agent eval \
+    --eval examples/memory-mcp/eval/sutra.jsonl \
+    --eval-baseline examples/memory-mcp/eval/baseline.json    # exit 1 = regression
+```
+
+Per mode (`lexical` / `vector` / `hybrid`) it reports `hit@1/@5/@k`, `MRR@k`,
+`P@k` and `FP@k`, prints every miss with the top 3 hits it got instead, and
+diffs both the metrics and the per-query ranks against the baseline — so a
+regression names the query that broke, not just a number that fell.
+
+The goldset (`eval/sutra.jsonl`) is JSONL with `#` comment lines. Each query
+labels relevance the cheapest way that is still true:
+
+```jsonl
+{"q":"慧能","expect_file":["liuzu-tanjing.md"],"reject_substr":["智慧能"],"why":"..."}
+{"q":"无念为宗","expect_substr":["无念为宗"]}
+```
+
+`expect_file` (any chunk of these files) · `expect_substr` (hit text contains
+it) · `expect_id` (exact chunk id) · `reject_substr` (a known-wrong hit,
+overrides every positive). At least one positive label is required.
+
+Flags: `--eval FILE` · `--eval-k N` (default 10) · `--eval-modes a,b` ·
+`--eval-baseline FILE` · `--eval-update-baseline` (opt-in; a self-updating
+baseline records regressions instead of catching them) · `--eval-tolerance F`
+(default 0.01) · `--eval-out FILE`.
+
+Two things to know before trusting a comparison: eval mode never indexes code
+(it would move the document corpus's BM25 statistics), so give it its own
+`--agent`; and passing `--docs` retrains the IVF centroids, which shifts
+vector/hybrid on its own — build the index once, then evaluate without
+`--docs`. `docs/ops.md` has the full runbook and the reference numbers.
 
 ## Embedder
 

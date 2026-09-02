@@ -578,8 +578,18 @@ impl MemoryStore {
         const RECALL_GET_CHUNK: usize = 256;
         let cand_list: Vec<(String, Vec<String>)> = cands.into_iter().collect();
         let trim_at = top_k.saturating_mul(8).max(64);
-        let by_score =
-            |a: &ScoredDoc, b: &ScoredDoc| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal);
+        // Same total order as `top_k_sorted`: ties by doc id. Candidates arrive
+        // in `HashMap` order, so a score-only comparator leaves tied documents
+        // in per-process-random order — and the streaming trim below then keeps
+        // an arbitrary subset of them. With id as the tiebreak the trim is
+        // exact (a document in the true top-k can never rank below the kept
+        // top-k of any prefix) AND stable across runs.
+        let by_score = |a: &ScoredDoc, b: &ScoredDoc| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        };
 
         let mut scored: Vec<ScoredDoc> = Vec::new();
         for chunk in cand_list.chunks(RECALL_GET_CHUNK) {
@@ -1466,7 +1476,51 @@ fn rerank_insert(best: &mut HashMap<String, f32>, id: String, score: f32) {
 
 fn top_k_sorted(best: HashMap<String, f32>, top_k: usize) -> Vec<(String, f32)> {
     let mut out: Vec<(String, f32)> = best.into_iter().collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties break by doc id, which is what makes this a TOTAL order and the
+    // result reproducible. Sorting by score alone left ties in `HashMap`
+    // iteration order — random per process — so two runs of the same query
+    // against the same index could return different documents, not merely a
+    // different order: `truncate` cuts through the tied group. RRF makes that
+    // the common case rather than a corner one, because a fused score is a sum
+    // of `1/(k+rank)` terms and any two documents holding the same rank in one
+    // leg and absent from the other are exactly equal. Retrieval quality cannot
+    // be measured against a baseline that moves on its own.
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     out.truncate(top_k);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `top_k_sorted` must be a TOTAL order, or a baseline cannot be compared
+    /// against: its input is a `HashMap`, whose iteration order is randomised
+    /// per process, so a score-only comparator lets `truncate` keep a different
+    /// subset of a tied group on every run.
+    #[test]
+    fn top_k_breaks_ties_by_id_so_results_are_reproducible() {
+        let tied = || {
+            let mut m: HashMap<String, f32> = HashMap::new();
+            for id in ["d", "b", "a", "c"] {
+                m.insert(id.to_string(), 0.5); // one fully tied group
+            }
+            m.insert("z".into(), 0.9);
+            m
+        };
+        let first = top_k_sorted(tied(), 3);
+        assert_eq!(first[0].0, "z", "score still dominates the tiebreak");
+        assert_eq!(
+            first.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["z", "a", "b"],
+        );
+        // Same input, fresh HashMaps: the cut through the tied group is stable.
+        for _ in 0..16 {
+            assert_eq!(top_k_sorted(tied(), 3), first);
+        }
+    }
 }

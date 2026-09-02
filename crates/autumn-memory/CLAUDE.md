@@ -141,6 +141,17 @@ than adding another pair of domain verbs.
   vptr current; `train` updates vptr on re-bucket. Belt-and-suspenders: a
   resolver should still drop a hit whose `doc/{id}` is gone (`get_memory` →
   None) — the MCP `_resolve` does — covering any in-flight/expiry race.
+- **Ranked results are a TOTAL order: score first, then doc id.** Every
+  ranking path (`search_lexical`'s streaming top-k, `top_k_sorted` for the
+  vector and hybrid legs) collects candidates out of a `HashMap`, whose
+  iteration order is randomised per process. Sorting by score alone therefore
+  left tied documents in random order — and since ranking ends in `truncate`,
+  two runs of the same query against the same index could return DIFFERENT
+  documents, not merely a different order. RRF makes ties the common case, not
+  a corner one: a fused score is a sum of `1/(k+rank)` terms, so any two
+  documents holding the same rank in one leg and absent from the other are
+  exactly equal. Breaking ties by id costs nothing and is what lets a
+  retrieval-quality baseline exist at all (`memory-mcp --eval`).
 - Pagination resumes EXCLUSIVELY via the successor of the last key
   (`last_key ++ 0x00`) — exact under the PS's user-key-first internal-key
   comparator (`RangeReq.start` docs).
@@ -219,6 +230,29 @@ per-doc, no cross-doc race) — and it needs a non-primary multi-process-same-
 agent topology. So rather than serialize the hot write path (per-writer shards
 or a server-side atomic increment — rejected as hot-path / server complexity),
 we **tolerate the drift and detect + `repair_stats` it off the hot path**.
+
+## Retrieval quality is measured, not argued (`memory-mcp --eval`)
+
+The tokenizer, BM25's `k1`/`b`, whether bigrams count toward `doc_len`, RRF
+fusion, `NPROBE`, the centroid count — every one of them changes what search
+returns, and the unit tests here (term emission, BM25 monotonicity) can all
+pass while a query that used to find the right passage stops finding it. That
+happened twice before there was a measurement.
+
+`memory-mcp --eval` scores a labelled query set against an ingested corpus and
+diffs it against a committed baseline, per mode, down to the per-query rank.
+Runbook + reference numbers: `docs/ops.md`, "Retrieval-quality eval". Two
+properties of this crate that the harness depends on, and that a change here
+must preserve:
+
+- the total order above — without it the baseline moves on its own;
+- the lexical leg is fully deterministic across index rebuilds, while the
+  vector and hybrid legs are NOT: `train_centroids` re-initialises k-means from
+  the current IVF scan order, which is the previous training's bucketing, so a
+  re-ingest settles into a different local optimum. Measured on a 5164-chunk
+  corpus: no retrain → all three modes byte-identical; retrain → lexical
+  unchanged, vector and hybrid both move. Not a bug; it means a baseline
+  comparison must not straddle a retrain.
 
 ## Multi-tenant isolation (plan §9.5)
 

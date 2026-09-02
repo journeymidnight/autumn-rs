@@ -11,9 +11,17 @@
 //!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index] [--mcp]
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
 //! Then open http://127.0.0.1:5100 (or register the --mcp form with Claude).
+//!
+//! Retrieval-quality run (scores the ingested corpus against a labelled query
+//! set and exits — see `eval.rs`):
+//!   cargo run -p memory-mcp -- [MANAGER] --agent eval \
+//!       --docs /path/to/corpus --eval eval/sutra.jsonl \
+//!       [--eval-k 10] [--eval-modes lexical,hybrid] \
+//!       [--eval-baseline eval/baseline.json [--eval-update-baseline]]
 
 use autumn_memory::embed;
 mod docs;
+mod eval;
 mod indexer;
 mod store;
 
@@ -259,6 +267,18 @@ struct Args {
     mcp: bool,
     embed_model: Option<String>,
     tokenizer: Option<String>,
+    /// Goldset path — presence switches the binary into evaluation mode:
+    /// ingest (if `--docs`), score, report, exit. No server.
+    eval: Option<PathBuf>,
+    eval_k: usize,
+    eval_modes: Vec<String>,
+    eval_baseline: Option<PathBuf>,
+    /// Write the baseline instead of comparing against it. Opt-in, because a
+    /// baseline that updates itself records the regression instead of catching
+    /// it.
+    eval_update_baseline: bool,
+    eval_tolerance: f64,
+    eval_out: Option<PathBuf>,
 }
 
 /// Delete every key under `mem/{tenant}/{agent}/` — a complete wipe of this
@@ -308,6 +328,13 @@ fn parse_args() -> Args {
         mcp: false,
         embed_model: None,
         tokenizer: None,
+        eval: None,
+        eval_k: 10,
+        eval_modes: Vec::new(),
+        eval_baseline: None,
+        eval_update_baseline: false,
+        eval_tolerance: 0.01,
+        eval_out: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -329,6 +356,20 @@ fn parse_args() -> Args {
             "--mcp" => a.mcp = true,
             "--embed-model" => a.embed_model = it.next(),
             "--tokenizer" => a.tokenizer = it.next(),
+            "--eval" => a.eval = it.next().map(PathBuf::from),
+            "--eval-k" => a.eval_k = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.eval_k),
+            "--eval-modes" => {
+                a.eval_modes = it
+                    .next()
+                    .map(|s| s.split(',').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect())
+                    .unwrap_or_default()
+            }
+            "--eval-baseline" => a.eval_baseline = it.next().map(PathBuf::from),
+            "--eval-update-baseline" => a.eval_update_baseline = true,
+            "--eval-tolerance" => {
+                a.eval_tolerance = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.eval_tolerance)
+            }
+            "--eval-out" => a.eval_out = it.next().map(PathBuf::from),
             s if !s.starts_with("--") => a.manager = s.to_string(),
             other => tracing::warn!("ignoring unknown arg `{other}`"),
         }
@@ -518,6 +559,57 @@ async fn run_mcp_stdio(code: &Code) -> Result<()> {
     Ok(())
 }
 
+/// Evaluation mode: score the ingested corpus against the goldset, print the
+/// report, and hand back the process exit status — nonzero only when a
+/// baseline comparison found a regression, so a shell `&&` and CI agree.
+async fn run_eval(code: &Code, a: &Args, retrained: bool) -> Result<i32> {
+    let path = a.eval.as_ref().expect("called only in eval mode");
+    let queries = eval::load(path)?;
+    let modes: Vec<String> = if a.eval_modes.is_empty() {
+        ["lexical", "vector", "hybrid"].iter().map(|s| s.to_string()).collect()
+    } else {
+        a.eval_modes.clone()
+    };
+    println!(
+        "eval: {} queries x {} modes, k={}, embedder={} (semantic={}), agent=mem/{}/{}",
+        queries.len(),
+        modes.len(),
+        a.eval_k,
+        code.emb.name(),
+        code.emb.is_semantic(),
+        a.tenant,
+        a.agent,
+    );
+    let mut report = eval::run(code, &queries, a.eval_k, &modes).await?;
+    // Stamped into the report so a baseline says what produced it: the same
+    // goldset scored against a different corpus, or with a different embedder,
+    // is a different measurement wearing the same numbers.
+    report["corpus"] = json!(a.docs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+    report["embedder"] = json!(code.emb.name());
+    report["retrained"] = json!(retrained);
+    if let Some(out) = &a.eval_out {
+        std::fs::write(out, serde_json::to_vec_pretty(&report)?)?;
+        println!("\nreport -> {}", out.display());
+    }
+    let Some(baseline) = &a.eval_baseline else {
+        return Ok(0);
+    };
+    if a.eval_update_baseline {
+        std::fs::write(baseline, serde_json::to_vec_pretty(&report)?)?;
+        println!("\nbaseline updated -> {}", baseline.display());
+        return Ok(0);
+    }
+    if !baseline.exists() {
+        println!(
+            "\nno baseline at {} yet — rerun with --eval-update-baseline to record this run",
+            baseline.display()
+        );
+        return Ok(0);
+    }
+    let base: Value = serde_json::from_slice(&std::fs::read(baseline)?)?;
+    Ok(i32::from(eval::compare(&report, &base, a.eval_tolerance)))
+}
+
 #[compio::main]
 async fn main() -> Result<()> {
     // Logs go to stderr — in --mcp mode stdout is the JSON-RPC channel.
@@ -590,7 +682,11 @@ async fn main() -> Result<()> {
     let mut files = 0usize;
     let mut symbols = 0u64;
     let mut edges = 0u64;
-    if !args.no_index && (args.reset || args.reindex || already == 0) {
+    // Evaluation scores the DOCUMENT corpus, and the code indexer would put
+    // thousands of symbols into the same agent's BM25 stats — changing idf and
+    // avgdl for every document query. So eval mode never indexes code; point it
+    // at its own agent and give it only `--docs`.
+    if args.eval.is_none() && !args.no_index && (args.reset || args.reindex || already == 0) {
         tracing::info!("indexing {} ...", root.display());
         let (f, s, e) = indexer::index_path(&store, &emb, &root).await?;
         files = f;
@@ -628,6 +724,13 @@ async fn main() -> Result<()> {
         let r = store.reconcile().await?;
         store.train_centroids(((r.docs as usize) / 20).clamp(1, 64), 25, 7).await?;
         tracing::info!("reconcile + train_centroids in {} ms", t0.elapsed().as_millis());
+    }
+
+    if args.eval.is_some() {
+        let status = run_eval(&code, &args, doc_chunks > 0).await?;
+        // `exit` rather than a returned Err: a regression is a verdict, not a
+        // crash, and the caller wants the code without a backtrace above it.
+        std::process::exit(status);
     }
 
     let cfg = json!({

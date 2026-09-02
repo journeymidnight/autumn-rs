@@ -1,0 +1,71 @@
+# Goldset for `memory-mcp --eval`. Corpus: 17 Chinese Buddhist books (14 sutra
+# volumes of 佛教十三经 plus four modern works). Labels were derived from the
+# corpus, not from memory: every expect_file below was checked against the term's
+# actual per-file occurrence counts.
+#
+# One JSON object per query. `#` lines and blank lines are comments.
+# Judgment: relevant if the hit's file ends with an expect_file, OR its text
+# contains an expect_substr, OR its id is an expect_id. `reject_substr` marks a
+# hit as a known-wrong answer and overrides every positive.
+#
+# A note on what the labels can and cannot say: nobody has judged all ~5000
+# chunks, so `hit@n` (did the query find something right) is the honest metric
+# and `P@k` is comparable between runs rather than absolute.
+
+# -- A. proper nouns, where a query's characters also occur in another sense ---
+# The regression class that produced the CJK bigram tokenizer: 慧能 occurs in 14
+# of 17 files, but in most of them it is the tail of 智慧能… — a bigram that
+# spans a word boundary, not the patriarch. The two 坛經 volumes are his.
+{"q":"慧能","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md"],"reject_substr":["智慧能"],"why":"proper noun whose second character is extremely common; the 智慧能 passages are the known wrong answer"}
+{"q":"惠能","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md","zhengxin-de-fojiao.md"],"why":"the spelling the corpus itself calls correct — must reach the same books as 慧能"}
+{"q":"神秀","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md"],"why":"71/55 occurrences in the two 坛經 volumes, 3 elsewhere — a ranking test, not an existence test"}
+{"q":"弘忍","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md"],"why":"same shape as 神秀; 56/42 vs 3 in 維摩詰經"}
+{"q":"菩提本无树","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md"],"why":"a five-character quotation — tests that a phrase survives unigram+bigram tokenization"}
+{"q":"时时勤拂拭","expect_file":["liuzu-tanjing.md","fjsj-tan-jing.md"],"why":"the counter-verse to 菩提本无树; both must be reachable, not just the famous one"}
+{"q":"无念为宗","expect_substr":["无念为宗"],"why":"substring label: the hit must literally contain the phrase, so a topical near-miss does not count"}
+
+# -- B. terms that occur in exactly one book (existence, and precision) -------
+{"q":"五十阴魔","expect_file":["fjsj-lengyan-jing.md"],"why":"unique to 楞嚴經 (8 occurrences, 0 elsewhere)"}
+{"q":"七处征心","expect_file":["fjsj-lengyan-jing.md"],"why":"unique to 楞嚴經; single occurrence — the hardest recall case in the set"}
+{"q":"二十五圆通","expect_file":["fjsj-lengyan-jing.md"],"why":"unique to 楞嚴經 (8)"}
+{"q":"三性三无性","expect_file":["fjsj-jieshenmi-jing.md"],"why":"unique to 解深密經; single occurrence"}
+{"q":"观世音菩萨普门品","expect_file":["fjsj-fahua-jing.md"],"why":"unique to 法華經 (6); a long compound noun"}
+{"q":"常不轻菩萨","expect_file":["fjsj-fahua-jing.md"],"why":"unique to 法華經 (16)"}
+{"q":"药草喻","expect_file":["fjsj-fahua-jing.md"],"why":"unique to 法華經; single occurrence"}
+{"q":"十重四十八轻","expect_file":["fjsj-fanwang-jing.md"],"why":"23 in 梵網經, 1 in 成佛之道 — the precept count that identifies the book"}
+{"q":"四十八愿","expect_file":["fjsj-wuliangshou-jing.md"],"why":"12 in 無量壽經 vs 1 each in three others"}
+{"q":"鹅卵石","expect_file":["zhengnian-de-qiji.md"],"why":"unique to 正念的奇蹟 (11); a modern-prose term with no scriptural register"}
+{"q":"洗碗","expect_file":["zhengnian-de-qiji.md"],"why":"unique to 正念的奇蹟 (44) — the book's signature example"}
+{"q":"三个绝妙的答案","expect_file":["zhengnian-de-qiji.md"],"why":"a chapter title, unique; tests that headings are searchable through the breadcrumb"}
+{"q":"初学者的心","expect_file":["chanzhe-de-chuxin.md"],"why":"unique to 禪者的初心 (6)"}
+{"q":"烟酒赌博","expect_file":["zhengxin-de-fojiao.md"],"why":"unique to 正信的佛教; single occurrence, in a heading"}
+
+# -- C. terms present nearly everywhere but owned by one book (ranking) -------
+# These separate a retriever that finds the term from one that ranks the book
+# about it first. Every one of them also appears once in the shared preface of
+# all 14 sutra volumes, which is the boilerplate the ranking must beat.
+{"q":"维摩诘","expect_file":["fjsj-weimojie-jing.md"],"why":"567 occurrences vs =<14 in fourteen other files"}
+{"q":"不二法门","expect_file":["fjsj-weimojie-jing.md"],"why":"100 vs =<5; the chapter 維摩詰經 is famous for"}
+{"q":"圆觉","expect_file":["fjsj-yuanjue-jing.md"],"why":"219 vs =<10"}
+{"q":"阿弥陀佛","expect_file":["fjsj-wuliangshou-jing.md"],"why":"226 vs =<11"}
+{"q":"授记","expect_file":["fjsj-fahua-jing.md"],"why":"95 vs =<19"}
+{"q":"幻化","expect_file":["fjsj-yuanjue-jing.md"],"why":"40 vs =<12"}
+{"q":"色不异空","expect_file":["fjsj-jingang-xin-jing.md"],"why":"7 in 心經 and exactly 1 in each of thirteen shared prefaces — the near-duplicate boilerplate must not outrank the real content"}
+{"q":"应无所住而生其心","expect_file":["fjsj-jingang-xin-jing.md","fjsj-tan-jing.md","liuzu-tanjing.md"],"why":"the 金剛經 line that the 壇經 is built around; same preface-boilerplate hazard"}
+{"q":"无常","expect_file":["fjsj-lengqie-jing.md"],"why":"203 in 楞伽經, next highest 63 — a very common word where the ranking still has an owner"}
+
+# -- D. natural-language questions -------------------------------------------
+# 正信的佛教 is written as a list of questions, so its headings are the query.
+{"q":"信仰佛教必须吃素吗","expect_file":["zhengxin-de-fojiao.md"],"why":"question-shaped query matching a question-shaped heading"}
+{"q":"佛陀是创世主吗","expect_file":["zhengxin-de-fojiao.md"],"why":"as above"}
+{"q":"什么叫大乘和小乘","expect_file":["zhengxin-de-fojiao.md"],"why":"as above"}
+{"q":"佛教是世界性的宗教吗","expect_file":["zhengxin-de-fojiao.md"],"why":"as above"}
+{"q":"如何在日常生活中保持正念","expect_file":["zhengnian-de-qiji.md"],"why":"paraphrase, not quotation: no heading uses these words in this order"}
+{"q":"坐禅的时候应该保持什么姿势","expect_file":["chanzhe-de-chuxin.md"],"why":"paraphrase; 姿勢 is 39 in 禪者的初心 vs 16/1 elsewhere"}
+{"q":"什么是初心","expect_file":["chanzhe-de-chuxin.md"],"why":"short question; 初心 is 16 there but also 11 in 楞嚴經 in a different sense"}
+
+# -- E. very short queries (the reason the tokenizer keeps CJK unigrams) ------
+{"q":"杏","expect_file":["zhengnian-de-qiji.md"],"why":"single character, unique to one book (杏樹, 6) — a unigram-only recall case"}
+{"q":"碗","expect_file":["zhengnian-de-qiji.md"],"why":"single character, 55 vs 12 in 楞嚴經 — unigram recall plus ranking"}
+{"q":"蒲团","expect_file":["chanzhe-de-chuxin.md"],"why":"two characters, 4 vs 1 — a low-frequency term where idf has to do the work"}
+{"q":"正念日","expect_file":["zhengnian-de-qiji.md"],"why":"three characters whose prefix 正念 appears in 14 files; tests that the longer term wins"}

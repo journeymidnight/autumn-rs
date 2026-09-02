@@ -1,10 +1,14 @@
 Date: 2026-09-02
-TaskStatus: not_completed
-Task scope: (上一条见文末 2026-09-02 条) 账本整理——把 2026-09-01 的三条重叠条目合并成一条"当前状态"（其中第一条的
-  头部被改成 ingest/graph 而正文仍是 S3 网关，已拆开归位），按规则 12 裁掉 08-28 及更早
-  （约 30 条，靠 git log 与各 crate CLAUDE.md 追溯）。feature_list 删掉 5 条已 pass 的条目
-  + F-HICACHE-PORT-REBASE（用户 2026-09-02 定：那是别的项目的事，移植本体随 da91d38 去了
-  ../buda）。S3 网关跨机重测经用户确认**不需要**，不再列为待办。无代码改动。
+TaskStatus: completed
+Task scope: 给 autumn-memory 的检索路径装上可测量的护栏——固定语料 + 41 条标注查询 +
+  逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
+  清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），
+  逐条核对现状后用户只选了 eval set，语料指定 /data/dongmao_dev/md（17 部佛典，6 MB，
+  5164 chunk）。清单核对结果：BM25 早已完整实现（含 CJK bigram），结构感知 chunking 已有
+  一半（heading 切段 + breadcrumb 前置），metadata filter 只有检索后按 kind 过滤，
+  dedupe / version freshness / eval set 三项完全没有。
+遗留（非本次任务，来自上一条会话，仍 not_completed）：ingest 提速改动的**pod 内复测数字
+  仍未拿到**（loopback 量不出来，RTT 太小）。详情与三起事故见文末 2026-09-02 条。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   examples/s3-gateway（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
@@ -72,6 +76,38 @@ Task scope: (上一条见文末 2026-09-02 条) 账本整理——把 2026-09-01
   callers/callees/members/outline/trace 退化成固定边类型+方向的简写。17 个 MCP 工具。(7ae8ccb)
   本地 3 节点验证：368 chunks ingest 干净、reconcile is_clean、lexical/hybrid 与大纲正常。
   **pod 内复测仍待做**（需先出镜像；日志已按阶段打耗时 + ms/chunk，据此定 startupProbe 预算）。
+
+  **检索质量 eval 已落地（`memory-mcp --eval`，2026-09-02）**：goldset
+  `examples/memory-mcp/eval/sutra.jsonl`（41 条，JSONL + `#` 注释；判据 expect_file /
+  expect_substr / expect_id + reject_substr），基线
+  `examples/memory-mcp/eval/baseline.json`，逐 mode 报 hit@1/@5/@k、MRR@k、P@k、FP@k，
+  每条 miss 打印 top-3，比对时同时 diff 指标与**逐查询名次**（回退会点名是哪条查询坏了）。
+  实测（hash embedder，k=10）：lexical hit@1 0.976 / MRR 0.988，vector 0.146 / 0.269，
+  hybrid 0.610 / 0.772。⇒ **首次量化了 96c96ca 那个判断**：非语义 embedder 下 RRF 融合
+  把 MRR 从 0.988 拖到 0.772，`auto` 解析成 lexical 是对的，改这条规则前必须重测这一行。
+  唯一没排第一的 lexical 查询正是 `慧能`（rank 2）——事故当事人还在。
+  **eval 是活的（已验证会红）**：把 CJK bigram 从分词器里去掉重跑，EXIT=1 且点名
+  `"慧能": rank 2 → miss`。
+  **两个副产品**：
+  ① 修了一个会让基线自己漂移的真缺陷——`top_k_sorted` 与 `search_lexical` 从 HashMap
+     收集后只按分数排序，同分顺序随进程随机，而排序末尾是 truncate ⇒ **同一查询两次跑
+     可能返回不同的文档**（不只是顺序不同）。RRF 让同分成为常态（分数是 1/(k+rank) 之和）。
+     改成 (score, doc_id) 全序，单测钉住。
+  ② 实测确立了 eval 的可复现边界：**不重训则三个 mode 逐字节相同；一旦带 --docs 触发
+     train_centroids 重训，lexical 纹丝不动而 vector/hybrid 双双漂移**（k-means 从当前
+     IVF 扫描序＝上一次的分桶重新初始化，落到不同局部最优）。不是 bug，但基线比对不能跨
+     一次重训——report 里记 `retrained`，compare 会打 NOTE。
+  **负结果（别重做）**：`--reset` 清一个 5164 chunk 语料要删 198 万 key、耗时 9 分 48 秒；
+  把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380→3418 key/s），因为
+  `delete_many` 不是批量 RPC 而是并发上限 32 的客户端扇出，而单分区写 8 线程就到 30K ops/s
+  ⇒ 瓶颈是 694 次 range 扫描（每页 512 键 133 ms），不是删除。改动已回滚，立账
+  F-MEM-WIPE-COST；绕行是用 `./cluster.sh reset`（秒级）而不是 `--reset`。
+  **未做（用户只选了 eval set）**：metadata filter 下推 posting、dedupe、version
+  freshness（chunk id = path#L起-L止，文件一编辑行号漂移 ⇒ 旧 chunk 永久滞留可被检索到，
+  唯一清理手段是全量 wipe）、chunker 兜底按行切（中文长段落被硬切在句中）。
+  **用户另提的问题（待定）**：模型自身知识 vs RAG 检索结果如何区分归因。答复要点＝
+  无上下文对照组（最便宜最硬）＋反事实污染探针＋强制引用后程序化校验；这是端到端 RAG
+  eval，与本次的检索 eval 是两层，需接生成模型。**是否立账等用户定。**
 
 【当前状态 5：kvcache v2 多池接口已实现但未测】
   efeea3c 实现 sglang HiCacheStorage 的 v2 多池接口（SWA / Mamba / DSA indexer / MTP draft

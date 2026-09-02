@@ -14,6 +14,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [WAL replay self-heal](#wal-replay-self-heal-log_stream-bit-rot--truncated-replica)
 - [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
 - [autumn-memory verification](#autumn-memory-verification)
+- [Retrieval-quality eval (`memory-mcp --eval`)](#retrieval-quality-eval-memory-mcp---eval)
 - [Data-plane authz setup](#data-plane-authz-setup)
 - [CLI cheatsheet](#cli-cheatsheet)
 - [Chaos suites](#chaos-suites)
@@ -982,6 +983,85 @@ first — see "Round trips are the cost model" in `crates/autumn-memory/CLAUDE.m
 A bulk ingest must also bracket itself with `begin_bulk_index()` /
 `flush_stats()`; skipping the flush leaves `meta/stats` understating the corpus
 until `repair_stats` runs (and `/stats` will show it).
+
+## Retrieval-quality eval (`memory-mcp --eval`)
+
+Every knob on the retrieval path — the tokenizer, BM25's `k1`/`b`, RRF fusion,
+which leg `auto` picks, `NPROBE`, the centroid count, chunk size and overlap —
+used to be tuned by argument, with the unit tests unable to tell whether a
+change made search better or worse. Two incidents were caught by a person
+reading results, not by a test. `--eval` scores a labelled query set against an
+ingested corpus and compares it to a committed baseline.
+
+Goldset: `examples/memory-mcp/eval/sutra.jsonl` (41 queries, JSONL + `#`
+comments; each query labels relevance by `expect_file` / `expect_substr` /
+`expect_id`, and may mark known-wrong hits with `reject_substr`).
+Baseline: `examples/memory-mcp/eval/baseline.json`.
+Corpus used for the committed baseline: `/data/dongmao_dev/md` — 17 Chinese
+Buddhist books, 6 MB, 5164 chunks. It is deliberately NOT in the repo (size and
+provenance); point `--docs` at your own copy and re-baseline if it differs.
+
+```bash
+cargo build --release -p memory-mcp
+AUTUMN_DATA_ROOT=/tmp/autumn-eval ./cluster.sh reset 1
+
+# 1. Build the index ONCE (ingest + reconcile + train_centroids), then score it.
+./target/release/memory-mcp 127.0.0.1:9001 --agent eval \
+    --docs /data/dongmao_dev/md --eval examples/memory-mcp/eval/sutra.jsonl
+#   → ingested 5164 chunks ... (12.9 ms/chunk on loopback)
+#   → mode=lexical  hit@1 0.976  hit@5 1.000  hit@k 1.000  MRR@k 0.988 ...
+
+# 2. Every later run reuses that index — no --docs. THIS is the reproducible
+#    loop, and the one a baseline comparison is valid across.
+./target/release/memory-mcp 127.0.0.1:9001 --agent eval \
+    --eval examples/memory-mcp/eval/sutra.jsonl \
+    --eval-baseline examples/memory-mcp/eval/baseline.json
+echo $?   # 0 = no regression, 1 = something got worse
+```
+
+**Passing `--docs` retrains the IVF centroids, and that alone moves
+vector/hybrid.** Measured on this corpus: with no retrain, all three modes are
+byte-identical across runs; with a retrain, lexical is unchanged while vector
+and hybrid both shift (k-means re-initialises from the current IVF scan order —
+the previous training's bucketing — so it settles into a different local
+optimum). The report records `retrained`, and `compare` prints a NOTE when
+either side of the comparison rebuilt. Do not chase a vector/hybrid delta
+across a rebuild.
+
+Reference numbers on the corpus above (`hash` embedder, k=10, 41 queries):
+
+| mode | hit@1 | hit@5 | hit@k | MRR@k | P@k |
+|---|---|---|---|---|---|
+| lexical | 0.976 | 1.000 | 1.000 | 0.988 | 0.712 |
+| vector  | 0.146 | 0.415 | 0.512 | 0.269 | 0.107 |
+| hybrid  | 0.610 | 1.000 | 1.000 | 0.772 | 0.485 |
+
+The vector row is the non-semantic `HashEmbedder` behaving as documented, and
+the hybrid row is the cost of fusing it with a good lexical leg — which is why
+`auto` resolves to `lexical` unless the embedder is semantic. Re-measure the
+hybrid row before changing that rule.
+
+**Check the eval is still alive** (a goldset that cannot go red is decoration).
+Disable the CJK bigram emission in `crates/autumn-memory/src/recall.rs`
+(the `if let Some(prev) = prev_cjk` block in the tokenizer), rebuild, ingest
+into a scratch agent, and score against the baseline:
+
+```bash
+./target/release/memory-mcp 127.0.0.1:9001 --agent eval-nobigram \
+    --docs /data/dongmao_dev/md --eval examples/memory-mcp/eval/sutra.jsonl \
+    --eval-modes lexical --eval-baseline examples/memory-mcp/eval/baseline.json
+#   → EXIT=1, and: WORSE lexical "慧能": rank 2 → miss
+```
+
+`--eval-update-baseline` overwrites the baseline instead of comparing. Use it
+only when the corpus or goldset changed on purpose — a baseline that updates
+itself records the regression instead of catching it.
+
+**Getting a clean agent: reset the CLUSTER, not the agent.** `--reset` deletes
+the agent's keys, and a document corpus is mostly BM25 postings — 5164 chunks
+is ~2 million keys. Measured: ~3.4k keys/s, i.e. **~10 minutes** for a full
+corpus, and it is scan-bound rather than write-bound (the partition itself
+sustains 30k writes/s at 8 threads). `./cluster.sh reset 1` takes seconds.
 
 ## fs stripe geometry: lanes vs partitions
 
