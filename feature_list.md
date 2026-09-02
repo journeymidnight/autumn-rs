@@ -15,7 +15,9 @@
 ## Active
 
 ### F-EC-REPLAY-SELFHEAL — EC 重放路径拿不到 R2/R3 的自愈，且它唯一处理的哨兵是服务端不会发的那个
-- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): `read_committed_bytes_from_extent`（`crates/stream/src/client.rs` 的第二个 2-attempt 循环）**只处理 `EversionStale`**；`PayloadNotHere` 与 `EcGatherOneShort` 作为硬错误直接冒泡，没有 invalidate/refetch。而这条路正是 PS 对 EC 转换过的 log extent 做 **WAL 重放**走的路（`partition-server/src/lib.rs` 的 MERGE-EC-REPLAY 注释指明）。
+- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): `read_committed_bytes_from_extent`（`crates/stream/src/client.rs` 的第二个 2-attempt 循环）**只处理 `EversionStale`**；`PayloadNotHere` 与 `EcGatherOneShort` 作为硬错误直接冒泡，没有 invalidate/refetch。而这条路正是 PS 打开分区时 `recover_partition` 按 64 MiB 分块**重放 log stream** 走的路。
+  **为什么重放会遇到 EC**（没有"EC WAL"这种东西，链条是四步）：PS 的 WAL 记录写进 log stream → `--log-ec K+M` 是 bootstrap 参数，设的是 log stream **封口之后**的 EC 编码形状（4 EN 默认 3+1、≥5 默认 4+1，即默认开启）→ 该 stream 已封口的 extent 被转成 EC → 重放读到它们。
+  **暴露面是负载/时机相关的**：EC 只作用于已封口 extent，若 replay floor 很新则那些 extent 可能还开着（未封口即不会 EC）；真正会撞上的是**距上次 checkpoint 很久、或长时间宕机后恢复**的分区。
 - **更糟的一半**: 服务端 `read_plan` 是**先查 `holds_payload` 再查 eversion**（`extent_node.rs:2503-2512`），所以缓存里的 `payload_location` 陈旧时，EN 回的是 `PAYLOAD_NOT_HERE` 而**不是** `EversionStale` ⇒ 这个循环唯一会处理的哨兵，恰恰是服务端在该场景下不会发的那个。后果是重放响亮失败（可用性问题，非损坏），且这条路上没有任何东西会驱逐缓存 ⇒ **单个 StreamClient 生命周期内不收敛**。
 - **Scope**: 把 `is_payload_not_here` / `is_ec_gather_one_short` 两条臂接进该循环，语义与主读路径一致（invalidate → 重取 → 重新规划；one-short 带抖动，payload-not-here 不睡）。注意两个循环的重试预算要各自独立，别叠成 4 次。
 - **Acceptance**: 构造"客户端缓存 payload_location 陈旧 + extent 已 EC 转换"的重放，验证第一次 `PAYLOAD_NOT_HERE` 后自动刷新布局并成功；同一 StreamClient 内重复重放不再持续失败；两个循环各自最多重试一次（用注入计数断言，别只断言最终成功）。
