@@ -66,6 +66,17 @@ pub fn is_admin_ps_msg(msg_type: u8) -> bool {
 //   pub const MSG_PUT_CHUNK:  u8 = 0x4A;  // RESERVED (was multipart upload)
 //   pub const MSG_PUT_COMMIT: u8 = 0x4B;  // RESERVED (was multipart upload)
 //   pub const MSG_PUT_ABORT:  u8 = 0x4C;  // RESERVED (was multipart upload)
+//
+// Batched GET with the values encoded INLINE in the response was REMOVED in
+// wire v33, superseded by `MSG_BATCH_GET_BULK` (0x5B). 0x54 stays RESERVED for
+// the same reason as the block above, and for one specific to it: the peer
+// version gate is skip-on-transport-failure at bootstrap and the PS does not
+// re-check per connection, so a stale binary CAN still put a 0x54 frame on the
+// wire. Today that dies as `unknown msg_type`; if 0x54 were reassigned to
+// another keyed request, a `BatchGetReq {u64, u64, Vec<Vec<u8>>}` that happened
+// to bytecheck as the new type would be silently misread instead.
+//
+//   pub const MSG_BATCH_GET:  u8 = 0x54;  // RESERVED (was inline batched GET)
 
 // partition merge — sent to the SURVIVOR's PS.
 pub const MSG_MERGE_PART: u8 = 0x4D;
@@ -161,16 +172,12 @@ pub const MSG_BATCH_PUT: u8 = 0x53;
 /// was sent, which is not something to guess at).
 pub const MSG_BATCH_PUT_BULK: u8 = 0x5A;
 
-/// Batched GET: N keys on the SAME partition in ONE frame. Symmetric to
-/// `MSG_BATCH_PUT` — values are returned inline in the response (a
-/// rkyv `BatchGetResp { code, statuses, values }`). NotFound is a
-/// per-key status, not a per-batch error.
-pub const MSG_BATCH_GET: u8 = 0x54;
-
 /// Batched GET whose values come back OUT of the rkyv response: ctrl carries
 /// per-key status and value length, the raw response tail carries the values.
 /// The read mirror of `MSG_BATCH_PUT_BULK`, and the request shape is exactly
-/// `MSG_BATCH_GET`'s (`BatchGetReq`) — only the answer changes.
+/// `BatchGetReq` — it replaced an inline form (0x54) that encoded every value
+/// into the rkyv response, and 0x54 is retired rather than kept as a second way
+/// to do the same thing.
 ///
 /// The inline form copies every value byte four times on this side alone
 /// (`to_vec` out of the memtable result, twice through `rkyv_encode`, and again
@@ -353,8 +360,8 @@ pub struct BatchPutBulkReq {
 }
 
 /// Ctrl tail of a `MSG_BATCH_GET_BULK` response (after the leading code byte).
-/// `statuses[i]` uses the same values as `BatchGetItem::status` (0 = found,
-/// 1 = not found, 2 = error) and `value_lens[i]` is that key's slice of the
+/// `statuses[i]` is 0 = found, 1 = not found, 2 = error, and `value_lens[i]` is
+/// that key's slice of the
 /// response tail — `0` for every non-found status.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct BatchGetBulkCtrl {
@@ -368,23 +375,6 @@ pub struct BatchGetReq {
     pub part_id: u64,
     pub region_epoch: u64,
     pub keys: Vec<Vec<u8>>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct BatchGetItem {
-    /// 0 = OK (value present), 1 = NotFound, other = error.
-    pub status: u8,
-    pub value: Vec<u8>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct BatchGetResp {
-    /// Batch-level code: `CODE_OK` if the request was acceptable;
-    /// per-key statuses live in `items`. Stale-epoch and wrong-partition
-    /// surface here.
-    pub code: u8,
-    pub message: String,
-    pub items: Vec<BatchGetItem>,
 }
 
 /// diagnostic: trace where a user_key's MVCC entries live across
@@ -962,7 +952,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_BATCH_PUT => rkyv_decode::<BatchPutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
-        MSG_BATCH_GET | MSG_BATCH_GET_BULK => rkyv_decode::<BatchGetReq>(payload)
+        MSG_BATCH_GET_BULK => rkyv_decode::<BatchGetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_DIAG_PARTITION_VP => rkyv_decode::<DiagPartitionVpReq>(payload)
@@ -993,7 +983,6 @@ mod msg_type_tests {
             MSG_PUT_BULK,
             MSG_BATCH_PUT,
             MSG_BATCH_PUT_BULK,
-            MSG_BATCH_GET,
             MSG_BATCH_GET_BULK,
             MSG_GET_REDIRECT,
             MSG_GET_REDIRECT_MANY,

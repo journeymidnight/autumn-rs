@@ -136,7 +136,8 @@ clock_skew_secs, admin_token, cluster_id, …}` → 本地缓存
   新增一个带 key 的读写 RPC 而忘了加 arm = 一个 authz 旁路。
   当前有 arm 的：`MSG_GET` / `MSG_GET_BULK` / `MSG_GET_REDIRECT` /
   `MSG_GET_REDIRECT_MANY` / `MSG_HEAD` / `MSG_DELETE` / `MSG_PUT` /
-  `MSG_PUT_BULK` / `MSG_RANGE` / `MSG_BATCH_GET` / `MSG_BATCH_PUT`。
+  `MSG_PUT_BULK` / `MSG_RANGE` / `MSG_BATCH_PUT` / `MSG_BATCH_PUT_BULK` /
+  `MSG_BATCH_GET_BULK`。
 - **解不开的帧放行**：gate 与真正的 handler 用**同一次** decode
   （rkyv 的走 `rkyv_decode`，`MSG_PUT_BULK` 走 `parse_put_bulk_meta`），
   这里解不开的 handler 那里也解不开 → 会被 `InvalidArgument` 拒，永远不会吐字节。

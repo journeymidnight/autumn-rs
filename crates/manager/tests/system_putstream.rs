@@ -486,7 +486,8 @@ fn put_many_small_values_take_the_batched_bulk_path() {
 /// next batched read is answered with `FailedPrecondition`. `get_many` must
 /// refresh and return the values, NOT surface an error per key.
 ///
-/// This is a regression test with a story: the inline `MSG_BATCH_GET` reported a
+/// This is a regression test with a story: the inline batched-get form (since
+/// retired) reported a
 /// stale epoch as a frame-level ERROR, which the SDK downcast into
 /// `PreconditionFailed` and recovered from. The bulk reply is a normal response
 /// frame carrying its status in ctrl, so the same condition arrived as `Ok(code

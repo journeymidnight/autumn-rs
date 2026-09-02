@@ -19,8 +19,8 @@ use autumn_rpc::cap_token::{verify_token, AuthReject};
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
-    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET,
-    MSG_BATCH_GET_BULK, MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
+    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET_BULK,
+    MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
     MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
@@ -331,7 +331,7 @@ pub fn authz_check(
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
-        // carries a USER KEY per item — gate each like MSG_BATCH_GET.
+        // carries a USER KEY per item — gate each like MSG_BATCH_GET_BULK.
         MSG_GET_REDIRECT_MANY => {
             let r = partition_rpc::rkyv_decode::<GetRedirectManyReq>(payload).ok()?;
             for item in &r.items {
@@ -367,9 +367,7 @@ pub fn authz_check(
             let r = partition_rpc::rkyv_decode::<RangeReq>(payload).ok()?;
             check_range(&r.prefix, principal, inner, now)
         }
-        // Both batched read forms carry the same `BatchGetReq`; only the
-        // response shape differs, and authz never looks at responses.
-        MSG_BATCH_GET | MSG_BATCH_GET_BULK => {
+        MSG_BATCH_GET_BULK => {
             let r = partition_rpc::rkyv_decode::<BatchGetReq>(payload).ok()?;
             for k in &r.keys {
                 if let Some(d) = check_key(k, principal, inner, now) {
@@ -782,11 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn batched_bulk_read_keys_are_gated_like_the_inline_form() {
+    fn batched_bulk_read_keys_are_gated() {
         // `authz_check`'s match also ends in a catch-all that ADMITS, so a
         // batched READ with no arm would hand back values for keys the caller
-        // has no grant on. Both batch-read msg types carry the same request, so
-        // the arm covers them together — this pins that it actually does.
+        // has no grant on.
         let inner = inner_with(vec![]);
         let p = acme();
         let mk = |k2: &[u8]| {
@@ -797,16 +794,15 @@ mod tests {
             })
             .to_vec()
         };
-        for msg in [MSG_BATCH_GET, MSG_BATCH_GET_BULK] {
-            assert!(
-                authz_check(msg, &mk(b"acme/mem/2"), Some(&p), &inner, 0).is_none(),
-                "in-grant keys must pass ({msg:#x})"
-            );
-            assert!(
-                authz_check(msg, &mk(b"other/mem/2"), Some(&p), &inner, 0).is_some(),
-                "an out-of-grant key must be refused ({msg:#x})"
-            );
-        }
+        let msg = MSG_BATCH_GET_BULK;
+        assert!(
+            authz_check(msg, &mk(b"acme/mem/2"), Some(&p), &inner, 0).is_none(),
+            "in-grant keys must pass"
+        );
+        assert!(
+            authz_check(msg, &mk(b"other/mem/2"), Some(&p), &inner, 0).is_some(),
+            "an out-of-grant key must be refused"
+        );
     }
 
     #[test]

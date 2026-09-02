@@ -571,7 +571,7 @@ impl MemoryStore {
         // a long posting list → was hundreds of serial round-trips), but an
         // UNBOUNDED `get_many` over EVERY candidate would pull all their bodies
         // into one frame (OOM / frame-limit at scale, since BM25 has no early
-        // termination). So chunk: one `MSG_BATCH_GET` per RECALL_GET_CHUNK
+        // termination). So chunk: one batched-read frame per RECALL_GET_CHUNK
         // candidates, score the chunk, keep only a streaming top-k → memory +
         // frame size stay bounded. Result i ⇔ chunk[i]; a per-key error still
         // propagates (matches the old `?`).

@@ -132,7 +132,6 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_GET_REDIRECT_MANY => handle_get_redirect_many(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
-        partition_rpc::MSG_BATCH_GET => handle_batch_get(payload, part).await,
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
         // SPLIT_PART must NOT be invoked inline through
         // dispatch_partition_rpc — handle_split_part awaits an internal
@@ -177,8 +176,8 @@ pub(crate) enum GetOutcome {
     Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
 }
 
-/// `MSG_BATCH_GET_BULK` — the same resolve loop as `handle_batch_get`, but the
-/// values leave as their own iovecs instead of being copied into the response.
+/// `MSG_BATCH_GET_BULK` — resolve each key with `get_value`, then let the values
+/// leave as their own iovecs instead of copying them into the response.
 ///
 /// `get_value` already hands back a `Bytes` (for a VP read it aliases the pool
 /// buffer), so the inline form's `v.to_vec()` was pure loss; everything after it
@@ -265,65 +264,6 @@ pub(crate) async fn handle_batch_get_bulk(
     )
 }
 
-/// `MSG_BATCH_GET`: N keys on the SAME partition in one frame, values encoded
-/// INLINE in a `BatchGetResp`. Superseded by `handle_batch_get_bulk` — the SDK's
-/// `get_many` no longer sends this — and unlike its replacement it is dispatched
-/// through `partition_loop`'s mpsc, so it queues behind the single-writer
-/// group-commit actor. Kept because the wire form is still accepted; per-key
-/// lookup reuses `get_value`, so VP resolution and read-pin semantics are
-/// identical either way.
-pub(crate) async fn handle_batch_get(
-    payload: Bytes,
-    part: &Rc<RefCell<PartitionData>>,
-) -> HandlerResult {
-    let req: partition_rpc::BatchGetReq =
-        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-    // Quick epoch check up front so a stale-routed batch fails fast
-    // (without re-decoding for each key).
-    {
-        let p = part.borrow();
-        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
-    }
-    let mut items: Vec<partition_rpc::BatchGetItem> = Vec::with_capacity(req.keys.len());
-    for key in req.keys.into_iter() {
-        // Re-encode each per-key GetReq and route through `get_value`
-        // so VP resolution / read-pin / not-found / out-of-range
-        // semantics are IDENTICAL to a per-key MSG_GET. Per-call
-        // borrow of `part` is brief (lookup_in_memtable + clone of
-        // stream_client, see `get_value`); cheaper than fan-out
-        // overhead on N separate frames.
-        let inner = partition_rpc::rkyv_encode(&GetReq {
-            part_id: 0, // not used inside get_value — routing already done
-            region_epoch: req.region_epoch,
-            key,
-            offset: 0,
-            length: 0,
-        });
-        match get_value(inner, part).await {
-            Ok(GetOutcome::Value(v)) => items.push(partition_rpc::BatchGetItem {
-                status: 0,
-                value: v.to_vec(),
-            }),
-            Ok(GetOutcome::NotFound) => items.push(partition_rpc::BatchGetItem {
-                status: 1,
-                value: Vec::new(),
-            }),
-            // get_value (redirect=false) never yields Redirect.
-            Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
-            Err(_) => items.push(partition_rpc::BatchGetItem {
-                status: 2,
-                value: Vec::new(),
-            }),
-        }
-    }
-    Ok(partition_rpc::rkyv_encode(
-        &partition_rpc::BatchGetResp {
-            code: CODE_OK,
-            message: String::new(),
-            items,
-        },
-    ))
-}
 
 /// rkyv-framed GET (generic SDK path).
 /// seal + roll the requested open tails so a fenced node's

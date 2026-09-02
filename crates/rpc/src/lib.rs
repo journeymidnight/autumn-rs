@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 32;
-pub const WIRE_VERSION_MAX: u32 = 32;
+pub const WIRE_VERSION_MIN: u32 = 33;
+pub const WIRE_VERSION_MAX: u32 = 33;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -501,6 +501,13 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // `BulkResp` now carries that tail verbatim, since lossy UTF-8 would
     // corrupt binary statuses. Pre-R3: MIN=MAX=32.
     (32, "58a279d2f64a5206"),
+    // v33: the inline `MSG_BATCH_GET` (0x54) and its `BatchGetResp`/`BatchGetItem`
+    // are deleted. `MSG_BATCH_GET_BULK` replaced it in v32 and nothing sent the
+    // old form afterwards; on a same-commit deploy a second, slower way to do
+    // the same read is not a rollback path, it is the shape `must_sync` had
+    // right before it became a fail-open switch nobody remembered. `BatchGetReq`
+    // stays — the bulk form uses it unchanged. Pre-R3: MIN=MAX=33.
+    (33, "699f4edcec554d41"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

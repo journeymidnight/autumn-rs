@@ -466,7 +466,13 @@ chunk.
 
 ### Server-side BATCH_GET also shipped (untested in perf-check yet)
 
-`MSG_BATCH_GET` mirrors PUT on the read path:
+> Superseded: this read form was replaced by `MSG_BATCH_GET_BULK` in wire v32
+> and deleted in v33. The reply now carries per-key status and length in ctrl
+> with the values in the frame's raw tail, and it is served on the connection
+> task rather than through `partition_loop`. The measurements below stand as
+> the record of what the inline form did; do not build against it.
+
+`MSG_BATCH_GET` mirrored PUT on the read path:
 `handle_batch_get` (in `rpc_handlers.rs`) runs INLINE on ps-conn,
 takes one rkyv-decode of `BatchGetReq`, loops over keys reusing
 `get_value` per key, and packs all values into ONE

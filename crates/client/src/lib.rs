@@ -3250,8 +3250,10 @@ impl ClusterClient {
         )))
     }
 
-    /// batched point reads — the ONE client-side fan-out primitive
-    /// (no server `MSG_BATCH_GET`). All batch-read callers route through this:
+    /// batched point reads — the ONE client-side fan-out primitive. (Its first
+    /// branch delegates the homogeneous-small case to `get_many`, which IS
+    /// server-batched; everything else fans out per key from here.) All
+    /// batch-read callers route through this:
     /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
     /// daemon. Each item is read concurrently (sliding window of `concurrency` —
     /// callers pass `BATCH_GET_DEFAULT_CONCURRENCY` or their own tuned cap, e.g.
@@ -3269,8 +3271,8 @@ impl ClusterClient {
         &self,
         items: &mut [GetManyItem<'_>],
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
-        // Homogeneous small whole-value case → MSG_BATCH_GET (server
-        // batches per partition; measured 4× lower read p99 on
+        // Homogeneous small whole-value case → `get_many`, i.e. one
+        // server-batched frame per partition (measured 4× lower read p99 on
         // loopback). Conditions: every item is a whole-value read
         // (offset == 0 && length == 0) whose dest is below the bulk
         // threshold. Mixed / range / large-bulk inputs fall through to
@@ -3378,9 +3380,9 @@ impl ClusterClient {
     ///
     /// Wire: one `MSG_BATCH_GET_BULK` per owning partition — keys in ctrl, and
     /// every value back in the reply's raw tail rather than inside the rkyv
-    /// response. The PS serves it on the ps-conn task, next to `MSG_GET_BULK`;
-    /// the older inline `MSG_BATCH_GET` went through `partition_loop`, so a
-    /// batched read queued behind the single-writer group-commit actor.
+    /// response. The PS serves it on the ps-conn task, next to `MSG_GET_BULK`,
+    /// so a batched read no longer queues behind the single-writer
+    /// group-commit actor.
     ///
     /// When to use `get_many` vs `get_many_into`:
     /// - **`get_many`** — when you don't know the value sizes (or

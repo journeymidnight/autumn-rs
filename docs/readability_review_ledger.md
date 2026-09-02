@@ -127,9 +127,10 @@ items).
 - PS lib test suite showed a 1/182 one-off flake (name not captured; 8
   subsequent runs + 5 baseline runs all green) — pre-existing timing
   sensitivity, watch for recurrence.
-- PS remaining clippy await_holding_refcell_ref ×4 (pre-existing, down from
-  5): rpc_handlers get_value_inner re-borrow p across resolve_value drop
-  path, handle_range, handle_batch_get ~703, background.rs:2659 (GC) — all
+- PS remaining clippy await_holding_refcell_ref ×3 (pre-existing, down from
+  5, and from 4 once `handle_batch_get` was deleted with wire v33):
+  rpc_handlers get_value_inner re-borrow p across resolve_value drop
+  path, handle_range, background.rs:2659 (GC) — all
   are the documented drop-before-await idiom the lexical lint can't see
   through; each should be block-scoped like get_value_inner/handle_head now
   are IF touched for other reasons (background 2659 is GC = revert-prone,
