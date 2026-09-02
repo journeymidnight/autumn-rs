@@ -672,10 +672,31 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             match read::prepare(state, ino, offset, size).await {
                 Ok(plan) => {
                     compio::runtime::spawn(async move {
-                        match read::execute(plan).await {
-                            Ok(data) => fuse_reply.data(&data),
-                            Err(e) => {
+                        // BOUNDED. This is the one FUSE op that answers the
+                        // kernel off the dispatcher, so it is also the one that
+                        // can leave the kernel waiting forever: every other op
+                        // goes through `call_sync`, whose REPLY_TIMEOUT ends in
+                        // `reply.error(EIO)` no matter what the cluster does.
+                        //
+                        // FUSE has no timeout of its own. A read that never
+                        // answers parks its caller in uninterruptible sleep
+                        // permanently — unkillable, holding whatever locks it
+                        // held — and if that caller is a container runtime
+                        // thread stat-ing a path, the whole node stops being
+                        // able to start containers. An unreachable manager or a
+                        // stalled extent read must degrade to EIO, not to a
+                        // wedged node.
+                        match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
+                            Ok(Ok(data)) => fuse_reply.data(&data),
+                            Ok(Err(e)) => {
                                 tracing::warn!(error = %e, "fuse read execute failed");
+                                fuse_reply.error(libc::EIO);
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    timeout_secs = REPLY_TIMEOUT.as_secs(),
+                                    "fuse read timed out — replying EIO"
+                                );
                                 fuse_reply.error(libc::EIO);
                             }
                         }
