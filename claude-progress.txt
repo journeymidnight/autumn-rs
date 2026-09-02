@@ -1,5 +1,5 @@
 Date: 2026-09-02
-TaskStatus: completed
+TaskStatus: not_completed
 Task scope: 给 autumn-memory 的检索路径装上可测量的护栏——固定语料 + 41 条标注查询 +
   逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
   清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），
@@ -304,3 +304,21 @@ Next steps: 无。
   补录进 oniond 桶(裸名,不带 @nvidia 后缀),否则只能跨太平洋 22 MiB/s。
   关键认知: oniond 快 8.4 倍**靠的是并发不是带宽**(单流 ~4 MiB/s x ~45 条),
   所以串行 autumnfs put 达不到 187 MiB/s 基线是可预期的,并行化 put 循环才是杠杆。
+
+【2026-09-02 方向变更(用户定):autumn 数据全部丢弃,坏节点下线,集群重建】
+  触发: 5 台 autumn-node 的 containerd 逐台卡死。**根因假设已从"火山的问题"改为"我们的问题"**:
+  全集群 21 台节点都是 containerd 1.6.38-vke.18(控制台报的"与集群 2.1.9 不一致"是全局漂移,
+  不区分好坏),而垮掉的恰好是且只有跑过 **autumn-fuse privileged pod** 的那 5 台;
+  192.168.3.2 做了几百 GiB 的 autumnfs CLI 工作但从未挂过 FUSE,全程健康。
+  机制假设: 残留的 FUSE 挂载(守护进程已死或卡住)会让触碰该挂载点的系统调用永久 D 状态阻塞,
+  而 containerd 建/拆 sandbox 时要遍历挂载点 ⇒ 运行时本身被阻塞。这解释了三个症状,
+  也解释了"已在跑的进程完全不受影响"。已派 subagent(fable)只读审计 crates/fuse。
+  重点怀疑: fuser 是否设了 AutoUnmount;init 失败后内核已挂载但守护进程退出的那条路
+  (生产里见过两次 `init failed: fs reply timeout`);被丢弃却没回复内核的 FUSE 请求;
+  以及 `--force --grace-period=0` 让启动脚本的 `trap fusermount3 -u` 不执行(我今天干过多次)。
+
+  新顺序: 修 FUSE bug -> 用户下线坏节点、重建集群 -> 重新 bootstrap + **presplit(必须在任何数据落盘前)**
+  -> 上传模型 -> 重新 ingest -> 才能测 train_centroids 批量化的效果。
+  本地已有 buda 的 markdown 副本,集群里没有不可再生的数据,可以放心全毁。
+  dsv4 的 156 GiB 在 pod dl-dsv4-cj4dc 的 emptyDir 里(节点 192.168.3.2,不在下线名单),**别删**。
+  在拿到 FUSE 结论前,**不要再起任何带 FUSE 挂载的 pod**(含 memory-mcp 和基准 pod)。
