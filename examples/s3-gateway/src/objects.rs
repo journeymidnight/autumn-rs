@@ -13,7 +13,7 @@ use autumn_fuse::schema::{DT_DIR, DT_REG};
 use autumn_fuse::state::FsState;
 use autumn_fuse::{dir, meta};
 
-use super::s3::ObjectRow;
+use crate::s3::ObjectRow;
 
 /// `FsState` is `!Send` by design (it holds `Rc`s into the compio runtime), so
 /// the whole gateway runs on one compio thread.

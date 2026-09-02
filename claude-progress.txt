@@ -15,38 +15,37 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
   **不要再起任何带 FUSE 挂载的 pod**。另有上一条会话的遗留：ingest 提速改动的 pod 内
   复测数字仍未拿到（loopback 量不出来，RTT 太小）。
 
-【2026-09-02 direct-read/EC 的两步 + s3 网关搬进 PS】
-  (1) **EC 拒绝类型化 + 一个真的用户可见延迟 bug**（已推 8abef44）：`extent_read_descriptor`
-  把"EC 转换过"/"payload 不在 .dat"/"真故障"三件事一律当 `Err`，于是 PS 对前两者也打 WARN
-  —— ≥4 EN 就默认装 EC，等于每次大值读一条告警，真故障淹死在里面。改成
-  `ReadDescriptor::Direct | NotDirect(EcConverted|PayloadOutsideDat)`，真故障仍是 `Err`；
-  `EcConverted` 降 debug、`PayloadOutsideDat` 反而升 WARN（它要求 payload_location 与
-  ec_converted 不一致，而这两个字段是同一个 etcd 事务发布的，属于不该发生）。
-  **真 bug**：批量重定向对拒绝回 `Unavailable` ⇒ SDK 当瞬时错误，烧满 10 次刷新退避
-  （≈9~13 秒）才轮到逐项代理回退 —— EC 集群上每次批量直读都卡这么久，而 `--direct-read`
-  默认是开的。改回 `FailedPrecondition`（在确定性短路集合里）立即降级。
-  EC 直读本体按用户顺序**只立账不实现**（F-EC-DIRECT-READ）；账里更正了一条初版写错的
-  论断：**别指望 k 路扇出提速**——shard_size 是按 extent 算的（seal 阈值 16 GiB、下限
+【2026-09-02 direct-read 对 EC 不友好：已修（8abef44）】
+  `extent_read_descriptor` 把"EC 转换过"/"payload 不在 .dat"/"真故障"三件事一律当 `Err`，
+  于是 PS 对前两者也打 WARN —— ≥4 EN 就默认装 EC，等于每次大值读一条告警，真故障淹死在
+  里面。改成 `ReadDescriptor::Direct | NotDirect(EcConverted|PayloadOutsideDat)`，真故障仍
+  是 `Err`；`EcConverted` 降 debug、`PayloadOutsideDat` 反而升 WARN（它要求 payload_location
+  与 ec_converted 不一致，而这两个字段是同一个 etcd 事务发布的，属于不该发生）。
+  **顺带修掉一个真的用户可见延迟 bug**：批量重定向对拒绝回 `Unavailable` ⇒ SDK 当瞬时错误，
+  烧满 10 次刷新退避（≈9~13 秒）才轮到逐项代理回退 —— EC 集群上每次批量直读都卡这么久，
+  而 `--direct-read` 默认开着。改回 `FailedPrecondition`（在确定性短路集合里）立即降级。
+  EC 直读本体按用户顺序**只立账不实现**（F-EC-DIRECT-READ）。账里更正了一条初版写错的
+  论断：**别指望 k 路扇出提速** —— shard_size 是按 extent 算的（seal 阈值 16 GiB、下限
   1 GiB），k=4 时每片数 GiB，一个 8 MiB 的 value 只落 1~2 片，永远不是 k 片。
-  (2) **s3 网关从 examples 搬进 PS**（`--s3-gateway`，默认 false，独立 OS 线程）：
-  `examples/s3-gateway` 整个 crate 退役，Dockerfile / entrypoint 的 s3 role / 5 处文档迁移。
-  真集群 e2e 三轮：ListObjectsV2、整体 GetObject（3 MB striped×24 lanes）、Range 206、
-  写被拒为 S3 NotImplemented、分区数据面同时 24K ops/s，全部字节精确。
-  【fable 评审挖出的、我写的注释比代码承诺得多的四处，已全部改正】
-    · `panic = "abort"`（release）⇒ 网关线程一 panic **带走整个 PS**；我原话"worker 死掉
-      不会拖垮 PS"只对"返回 Err"成立。sidecar 时代 panic 只死 sidecar —— 这是搬进程内
-      换来的真实代价，改不掉，只能写清楚。
-    · 传输是进程级 `OnceLock`：`--transport ucx` 的 PS 会让网关也走 UCX（未验证，且 fuse
-      core 有 UCX 栈 abort 前科，叠加 panic=abort 就是 PS 宕机）。启动时打 WARN，不阻断。
-    · **`--cpuset` 根本管不住网关线程**（它只喂给分区/shard runtime 给自己线程钉核，
-      不设进程亲和掩码）。要限制得对进程 `taskset`。
-    · "省掉一次拷贝、网关不出存储节点" —— 后半句错：副本选择是哈希轮转、无本地性偏好，
-      多节点集群上多数读仍来自远端 EN。**站得住的说法只有**：GPU 节点少收一次
-      （sidecar 时代它先网络收、再 loopback 收）。
-  【我自己在自查/验证中又抓到两处】监督线程按 handle 顺序 join ⇒ 低序号 worker 不死就
-    报不出高序号的死讯（改成 worker 用 mpsc 自报 + Drop guard 让 panic 也能上报）；
-    以及"bind 提前使端口占用致命"是错的 —— **SO_REUSEPORT 下端口被别的进程占着照样
-    bind 成功**，两个 PS 的网关同端口会各分走一半连接（已写进注释与 ops.md）。
+
+【2026-09-02 s3 网关搬进 PS：做完又整体 revert（用户拍板"划不来"）】
+  实现过一版 `autumn-ps --s3-gateway`（默认 false、独立 OS 线程、真集群 e2e 三轮全过），
+  推为 6f922b9，随后用户判定不划算，整体 `git revert`（不 force-push）。网关**留在
+  `examples/s3-gateway`**。
+  **为什么划不来（评审挖出来的代价，重做前先读这三条）**：
+    · **`panic = "abort"`**（release profile）⇒ 网关线程一 panic **带走整个 PS**。
+      "worker 死了不拖垮 PS"只对"返回 Err"成立。sidecar 时代 panic 只死 sidecar ——
+      这是搬进程内换来的真实代价，**进程内无法消除**。
+    · **传输是进程级 `OnceLock`**：`--transport ucx` 的 PS 会让网关也走 UCX（未验证，
+      且 fuse core 有 UCX 栈 abort 前科，叠加 panic=abort 就是 PS 宕机）。
+    · **`--cpuset` 管不住网关线程**（它只喂给分区/shard runtime 给自己钉核，不设进程
+      亲和掩码）⇒ 网关会跑到分区线程的核上，也躲不开租户核。
+  **收益比原以为的小**：唯一站得住的好处是 GPU 节点少收一次（sidecar 时代它先网络收、
+  再 loopback 收）。"网关不出存储节点"是错的 —— 副本选择是哈希轮转、无本地性偏好，
+  多节点集群上多数读仍来自远端 EN。
+  【顺带记两条通用坑，与本次去留无关】SO_REUSEPORT 下端口被别的进程占着**照样 bind
+  成功**（两个网关同端口会各分走一半连接，不会有一个拒绝启动）；监督线程按 handle 顺序
+  `join` 会让高序号 worker 的死讯被低序号挡住，要让 worker 自报（Drop guard 才能覆盖 panic）。
 
 【2026-09-02 批量 RPC 零拷贝（wire v31 + v32），并纠正一次错误结论】
   用户指出 bulk 判据加错了量：加在**单条 value** 上，所以 256×4 KiB 的批量哪怕在线上是

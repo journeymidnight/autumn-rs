@@ -402,7 +402,7 @@ read-bytes counter tracks the read. The same flag exists on every direct-read
 frontend, all DEFAULT ON now (2026-07-09): fuse `--direct-read` (default true),
 python `BatchClient(manager, ..., direct=True)`, `autumn.Fs.connect(...,
 direct_read=True)`, kvcache `AutumnKVConnector` (`extra_config.direct_read`),
-the S3 gateway (`--s3-gateway-direct-read`). Mixed-size batches route per
+the `autumn-s3` gateway (`--direct-read`). Mixed-size batches route per
 item — sub-64 KiB values still go through the PS; on a topology where ENs aren't
 client-reachable each item falls back to the proxy and the client logs one WARN.
 
@@ -410,7 +410,7 @@ client-reachable each item falls back to the proxy and the client logs one WARN.
 
 `autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
-file surface (the S3 gateway reads model weights through it). Headless
+file surface (the `autumn-s3` gateway reads model weights through it). Headless
 correctness (self-contained isolated memory-mode cluster — builds the wheel,
 boots manager+EN+PS, drives the full `Fs` surface + a cross-instance byte-exact
 check, tears down):
@@ -2413,48 +2413,22 @@ Three traps this script exists to encode, all of which cost a run to find:
 
 ## S3 gateway — serving autumn weights to engines with no loader plugin
 
-A read-only, unauthenticated S3 endpoint over the `fs/` tree, **hosted by the
-partition server** behind `--s3-gateway` (default off). It exists so SGLang and
-FreeToken — neither of which has a loader plugin seam — can use their built-in
-`--load-format runai_streamer` to stream weights concurrently, with no engine
-patches. `aws s3` and every other S3 client work against it too.
-
-It runs on its own OS threads with their own compio runtimes and its own
-per-worker `FsState`, so it shares no runtime and no lock with the partition
-threads. It does NOT share their CPU budget the way the flag names suggest:
-`--cpuset` feeds the pinning the partition/shard runtimes apply to their own
-threads, not a process affinity mask, and these threads pin nothing — `taskset`
-the process if the gateway must stay off particular cores.
-
-It used to be a separate `autumn-s3` binary deployed as a per-node sidecar.
-Hosting it here saves one copy ON THE ENGINE'S NODE: a sidecar received the
-bytes over the network and sent them again over loopback, and now that node
-receives them once. It does not make the reads local — replica choice is a hash
-rotation with no locality preference, so on a multi-node cluster most reads
-still come from a remote extent node.
-
-Two couplings to know about. The transport is process-wide, so a
-`--transport ucx` partition server gives the gateway UCX connections (unverified
-— it warns at startup and TCP is the tested path). And the release profile sets
-`panic = "abort"`, so a PANIC in a gateway thread takes the partition server
-down; only an error return is contained. On SIGTERM the partitions drain and
-then the gateway threads are killed mid-request, so in-flight engine GETs
-reset.
+`autumn-s3` is a read-only, unauthenticated S3 endpoint over the `fs/` tree. It
+exists so SGLang and FreeToken — neither of which has a loader plugin seam —
+can use their built-in `--load-format runai_streamer` to stream weights
+concurrently, with no engine patches. `aws s3` and every other S3 client work
+against it too.
 
 Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
 autumn `fs/models/llama/x.safetensors`.
 
 ```bash
-# 1. Turn it on where the partition server runs.
-autumn-ps --psid 1 --manager 127.0.0.1:9001 --s3-gateway --s3-gateway-port 9100 \
-          --s3-gateway-credential-file /secrets/fs.cred   # omit when authz is off
-# --s3-gateway-workers N (default 8) — accept threads, SO_REUSEPORT.
+# 1. Run it next to the engine (per-GPU-node sidecar keeps the RDMA hop long
+#    and the HTTP hop on loopback).
+autumn-s3 --manager 127.0.0.1:9000 --port 9100 \
+          --credential-file /secrets/fs.cred      # omit when authz is off
+# --workers N (default 8, capped at core count) — accept threads, SO_REUSEPORT.
 # One thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
-# A worker that RETURNS AN ERROR is logged loudly and does not take the
-# partition server with it — check for "s3 gateway worker stopped". A worker
-# that PANICS does: the release profile is panic=abort. An unbindable address
-# is fatal at startup; a port another process already holds is NOT, because
-# SO_REUSEPORT lets two gateways split the connections instead of one refusing.
 
 # 2. Smoke it with the aws CLI. The credentials are DUMMY — the gateway never
 #    looks at the Authorization header — but the SDK's credential chain runs
@@ -2487,8 +2461,8 @@ with SafetensorsStreamer() as st:
 export AWS_ENDPOINT_URL=http://127.0.0.1:9100
 python -m sglang.launch_server --model-path s3://models/llama \
        --load-format runai_streamer
-# vLLM takes the same URL and the same load format — the native `autumn` loader
-# it used to have was deleted, because it only ever worked on vLLM.
+# vLLM takes the same URL; on vLLM prefer --load-format autumn (native, RDMA
+# zero-copy) unless you are A/B-ing the two.
 ```
 
 Not supported, by design: PUT/DELETE, multipart, versioning, ACLs,

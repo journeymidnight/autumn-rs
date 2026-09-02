@@ -313,6 +313,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-s3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autumn-client",
+ "autumn-fuse",
+ "axum",
+ "compio",
+ "cyper-axum",
+ "futures",
+ "send_wrapper",
+ "socket2 0.5.10",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autumn-server"
 version = "0.1.0"
 dependencies = [
@@ -325,20 +342,16 @@ dependencies = [
  "autumn-rpc",
  "autumn-stream",
  "autumn-transport",
- "axum",
  "bytes",
  "clap",
  "compio",
- "cyper-axum",
  "futures",
  "libc",
  "pprof",
  "rand 0.8.5",
  "rkyv",
- "send_wrapper",
  "serde",
  "serde_json",
- "socket2 0.5.10",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",

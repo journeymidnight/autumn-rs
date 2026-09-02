@@ -134,10 +134,9 @@ ino = fs.resolve("/models/llama-3-8b")
 
 Large files are transparently chunked (8 MiB, zero-copy reads). For serving a
 model that lives in autumn (vLLM / SGLang), see
-[`docs/model_loading.md`](docs/model_loading.md) — start the partition server
-with `--s3-gateway` and point any engine's stock `--load-format runai_streamer`
-at it. Loads byte-identically to local disk on vLLM and SGLang, with no engine
-patches.
+[`docs/model_loading.md`](docs/model_loading.md) — run `autumn-s3` as a per-node
+sidecar and point any engine's stock `--load-format runai_streamer` at it. Loads
+byte-identically to local disk on vLLM and SGLang, with no engine patches.
 
 ### Inference KV cache — sglang / vLLM
 

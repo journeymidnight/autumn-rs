@@ -12,7 +12,7 @@
 ## 1. 一致性语义
 
 同一棵 fs 树可以被多个前端同时打开：内核挂载 `autumn-fuse`、CLI `autumnfs`、
-PyO3 `autumn.Fs`（PS 托管的 S3 网关走这条）。manager 的 inode lease 给这些
+PyO3 `autumn.Fs`（`autumn-s3` 网关走这条）。manager 的 inode lease 给这些
 前端下列语义：
 
 | 场景 | 语义 |
