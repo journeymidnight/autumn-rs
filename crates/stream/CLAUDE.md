@@ -740,7 +740,7 @@ first append would overwrite committed bytes).
 | `append_batch_repeated(stream_id, block, count)` | Repeat one block N times |
 | `read_bytes_from_extent(extent_id, offset, length)` | Read from extent (details below) |
 | `read_committed_bytes_from_extent(...)` | Like the plain read but `length` CLAMPED to the committed end (details below) |
-| `extent_read_descriptor(extent_id)` | `(eversion, replica addrs)` for a client-direct read; REFUSES EC-converted extents (shard bytes ≠ value); drops Suspected addresses |
+| `extent_read_descriptor(extent_id)` | `ReadDescriptor::Direct{eversion, replica addrs}` for a client-direct read, or `NotDirect(EcConverted \| PayloadOutsideDat)` — a DECLINE, not an `Err`, so a caller can log the routine one quietly and the impossible one loudly (`NotDirect::log`); genuine faults stay `Err`. Drops Suspected addresses |
 | `read_extent_value_direct(pool, addr, …)` (free fn) | One-shot bulk EN read for MSG_GET_REDIRECT holders; short read = Err |
 | `read_last_extent_data(stream_id)` | Read last non-empty extent |
 | `punch_holes(stream_id, extent_ids[])` | GC: remove extents from a stream |

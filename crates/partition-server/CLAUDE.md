@@ -525,8 +525,13 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   is deliberately unprotected: a GC punch in the gap is a failed EN read → proxy
   fallback (extents unlink whole + eversion fence ⇒ never a torn read); `_vp_pin`
   drops at return exactly as the whole-value path.
-- EC-converted extents NEVER get a descriptor (`extent_read_descriptor` refuses;
-  shard bytes ≠ value) — falls back to `handle_get`.
+- EC-converted extents NEVER get a descriptor (`extent_read_descriptor` declines;
+  shard bytes ≠ value). The single-key handler answers inline instead
+  (`extent_id: 0` + the value, one round trip); the BATCHED handler fails the
+  whole batch with `FailedPrecondition` so the client's per-item proxy fallback
+  runs immediately — `Unavailable` there cost ~9-13 s of deterministic retry
+  backoff per call, because the SDK reads it as transient and a decline never
+  stops being true.
 - Short reads under CODE_OK are FAILURES in `read_extent_value_direct` (same
   "got < need" rule as `read_value_from_log`).
 - Inline values / small VPs / sub-64 KiB / offset past value end: inline in the

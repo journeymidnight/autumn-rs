@@ -2042,6 +2042,69 @@ struct SuspectedCache {
 /// `Suspected` soft-timeout is ~10 s, so a 2 s-stale view is plenty fresh.
 const SUSPECTED_REFRESH_TTL: Duration = Duration::from_secs(2);
 
+/// Why an extent cannot be read directly from an EN. Neither is an error the
+/// caller must handle — both mean "serve this read through the partition
+/// server" — but they are not equally ordinary, and `log` below encodes which
+/// is which so a caller cannot get the severity wrong by accident.
+///
+/// Keeping them out of `Err` is the point. They used to be `anyhow!` strings
+/// alongside genuine faults (a manager lookup that failed, a decode that
+/// broke), so the only way to tell an expected decline from a real problem was
+/// to match on prose — and the caller, having no way to tell, logged all of it
+/// at WARN. On a cluster with EC armed that is one warning per large read
+/// forever, which is how a real fault gets to hide in plain sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotDirect {
+    /// Holds RS shards, not the payload: a single-EN raw read would hand the
+    /// caller shard bytes as if they were the value.
+    EcConverted,
+    /// The payload is not in `.dat`, and the descriptor names no payload file,
+    /// so a direct reader would read the wrong bytes.
+    PayloadOutsideDat,
+}
+
+impl NotDirect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotDirect::EcConverted => "extent is EC-converted (holds RS shards)",
+            NotDirect::PayloadOutsideDat => "extent keeps its payload outside .dat",
+        }
+    }
+
+    /// Log a decline at the severity it deserves.
+    ///
+    /// `EcConverted` is routine: on a cluster with EC armed it is true of every
+    /// large read of that extent, forever, so warning about it drowns anything
+    /// worth reading. `PayloadOutsideDat` is the opposite — it can only fire
+    /// when an extent's payload has moved to a shard file while `ec_converted`
+    /// is still false, and the manager publishes those two in ONE etcd
+    /// transaction, so it should be unreachable. Costing nothing in a healthy
+    /// cluster is exactly why it can afford to be loud.
+    pub fn log(self, extent_id: u64, what: &str) {
+        match self {
+            NotDirect::EcConverted => {
+                tracing::debug!(extent_id, reason = self.as_str(), "{what}")
+            }
+            NotDirect::PayloadOutsideDat => tracing::warn!(
+                extent_id,
+                reason = self.as_str(),
+                "{what} — payload location and ec_converted disagree, which they \
+                 are published together to prevent"
+            ),
+        }
+    }
+}
+
+/// The answer to "can this extent be read straight from an EN, and where".
+pub enum ReadDescriptor {
+    Direct {
+        eversion: u64,
+        replica_addrs: Vec<String>,
+    },
+    /// Not an error — see [`NotDirect`].
+    NotDirect(NotDirect),
+}
+
 impl StreamClient {
     /// Current manager address (round-robin index).
     fn manager_addr(&self) -> &str {
@@ -4246,7 +4309,7 @@ impl StreamClient {
     /// the manager on cache miss. The PS embeds these in a MSG_GET_REDIRECT
     /// response so the client can read value bytes straight from an EN
     /// without a manager round-trip of its own.
-    pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<(u64, Vec<String>)> {
+    pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<ReadDescriptor> {
         // the external client picks its OWN hash-rotated start over the
         // returned addrs (crates/client/src/lib.rs), so reordering can't route
         // around a flaky node — a Suspected address must be EXCLUDED outright
@@ -4259,9 +4322,7 @@ impl StreamClient {
         // go through ec_subrange_read; refuse the descriptor so the PS
         // falls back to the proxy path.
         if ex.ec_converted {
-            return Err(anyhow!(
-                "extent {extent_id} is EC-converted; direct read not supported"
-            ));
+            return Ok(ReadDescriptor::NotDirect(NotDirect::EcConverted));
         }
         // The descriptor names no payload file, so the SDK's direct read always
         // asks for `.dat` (`read_extent_value_direct`). That is sound only
@@ -4271,9 +4332,7 @@ impl StreamClient {
         // that ever stops holding, the SDK must fall back to the proxy rather
         // than read `.dat` bytes that are no longer the value.
         if PayloadLocation::from_byte(ex.payload_location) != PayloadLocation::InDat {
-            return Err(anyhow!(
-                "extent {extent_id} keeps its payload outside .dat; direct read not supported"
-            ));
+            return Ok(ReadDescriptor::NotDirect(NotDirect::PayloadOutsideDat));
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         // WAL self-heal A1: hand the client only avali-ELIGIBLE replicas
@@ -4287,7 +4346,10 @@ impl StreamClient {
             healthy_eligible_slots(&ex, &c.nodes)
         };
         let filtered: Vec<String> = slots.into_iter().map(|s| addrs[s].clone()).collect();
-        Ok((ex.eversion, filtered))
+        Ok(ReadDescriptor::Direct {
+            eversion: ex.eversion,
+            replica_addrs: filtered,
+        })
     }
 
     /// Replicated-mode read with per-replica failover. Used both for the

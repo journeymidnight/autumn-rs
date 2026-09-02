@@ -2988,12 +2988,12 @@ impl ClusterClient {
             });
             // Both discards below used to be silent, and between them they ate
             // the only explanation the system produced. The batch handler
-            // refuses with a NAMED reason — "extent N is EC-converted; direct
-            // read not supported" and friends — and that text died here, so a
-            // direct read failing on every single item looked like nothing at
-            // all from the client, nothing in the PS log, and nothing in the EN
-            // log (the ENs are never reached). Leaving descriptors `None` is
-            // still correct: phase C falls back per item. Just say why.
+            // answers with a NAMED reason — the extent is EC-converted, or its
+            // payload is not in `.dat` — and that text died here, so a direct
+            // read failing on every single item looked like nothing at all from
+            // the client, nothing in the PS log, and nothing in the EN log (the
+            // ENs are never reached). Leaving descriptors `None` is still
+            // correct: phase C falls back per item. Just say why.
             match self
                 .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
                 .await

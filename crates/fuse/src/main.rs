@@ -217,7 +217,15 @@ fn main() -> Result<()> {
                 };
                 state.direct_read = args.direct_read;
                 if args.direct_read {
-                    tracing::info!("direct-read ON (default): ≥64 KiB reads go EN-direct, bypassing the PS (falls back to proxy per read if ENs unreachable)");
+                    tracing::info!(
+                        "direct-read ON (default): ≥64 KiB reads go EN-direct, bypassing the PS \
+                         (falls back to proxy per read if ENs unreachable). NOTE: an extent that \
+                         has been converted to EC is always served through the PS instead — it \
+                         holds RS shards, not the value — so on a cluster with EC armed this \
+                         applies to fewer and fewer reads as extents convert. Bootstrap arms EC from \
+                         four extent nodes up (3+1 at four, 4+1 at five or more), so that is the \
+                         common case, not a corner one."
+                    );
                 } else {
                     tracing::info!("direct-read OFF (--direct-read false): all reads via PS proxy");
                 }

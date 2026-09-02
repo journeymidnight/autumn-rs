@@ -5,6 +5,7 @@
 //! push directly into the SQ/CQ pipeline's pending queue. Only read ops and
 //! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
 
+use autumn_stream::client::ReadDescriptor;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -174,6 +175,44 @@ pub(crate) enum GetOutcome {
     /// large full-value VP — the caller (handle_get_redirect) sends
     /// a descriptor instead of resolving the bytes through this PS.
     Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
+}
+
+/// Answer a `MSG_GET_REDIRECT` in the "no redirect, value is inline" form.
+///
+/// `extent_id: 0` is the shape the success path already emits when there is
+/// nothing to redirect to, and the client already handles it, so the read costs
+/// ONE round trip rather than the two a client-side proxy retry would. Answering
+/// with a `GetResp` here instead — which this used to do — is a wire-contract
+/// violation the client can only discover as an opaque rkyv decode failure,
+/// since rkyv carries no type tag to catch a handler answering msg_type X with
+/// struct Y.
+async fn answer_get_redirect_inline(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    match get_value(payload, part).await? {
+        GetOutcome::NotFound => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+            code: CODE_NOT_FOUND,
+            message: "key not found".to_string(),
+            value: vec![],
+            extent_id: 0,
+            value_offset: 0,
+            value_len: 0,
+            eversion: 0,
+            replica_addrs: vec![],
+        })),
+        GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+            code: CODE_OK,
+            message: String::new(),
+            value: value.into(),
+            extent_id: 0,
+            value_offset: 0,
+            value_len: 0,
+            eversion: 0,
+            replica_addrs: vec![],
+        })),
+        GetOutcome::Redirect { .. } => unreachable!("get_value never redirects"),
+    }
 }
 
 /// `MSG_BATCH_GET_BULK` — resolve each key with `get_value`, then let the values
@@ -440,7 +479,10 @@ pub(crate) async fn handle_get_redirect(
         } => {
             let sc = part.borrow().stream_client.clone();
             match sc.extent_read_descriptor(extent_id).await {
-                Ok((eversion, replica_addrs)) => {
+                Ok(ReadDescriptor::Direct {
+                    eversion,
+                    replica_addrs,
+                }) => {
                     Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -452,28 +494,21 @@ pub(crate) async fn handle_get_redirect(
                         replica_addrs,
                     }))
                 }
-                // Descriptor lookup failed (manager blip / cache miss):
-                // resolve through the proxy path instead — redirect is an
-                // optimization, never a correctness dependency.
+                // Redirect is an optimization, never a correctness dependency:
+                // both arms below answer the read inline, in the shape this
+                // message type promises (`extent_id: 0` + the value), so the
+                // client is served in ONE round trip either way.
                 //
-                // The `Err(_)` here threw away the only explanation that
-                // existed. `extent_read_descriptor` refuses with a specific
-                // reason ("extent N is EC-converted", "keeps its payload
-                // outside .dat", or a manager lookup failure), and every one of
-                // them was discarded — so a client seeing 100% failure on this
-                // path got no reason from the PS, nothing in the PS log, and
-                // nothing in the EN log (the ENs are never contacted). Three
-                // silent channels, and the failure then presented as an opaque
-                // rkyv decode error at the client. Log it.
-                //
-                // Note this arm answers a MSG_GET_REDIRECT with a `GetResp`,
-                // not a `GetRedirectResp` — a wire-contract violation that is
-                // what MAKES the client's decode fail. The client now degrades
-                // to the proxy on an undecodable descriptor, but the right fix
-                // is for this arm to return the inline shape above
-                // (`extent_id: 0` + value), which costs one round trip instead
-                // of two. Left as-is here only because that needs the resolved
-                // value rather than an encoded response.
+                // They are split because they are different events. A decline
+                // is a permanent property of the extent and expected on any
+                // cluster with EC armed — true for every large read of it,
+                // forever. A lookup that FAILED is a manager problem. Logging
+                // both at WARN, which is what a single `Err` arm forced, meant
+                // the second could never be seen among the first.
+                Ok(ReadDescriptor::NotDirect(why)) => {
+                    why.log(extent_id, "get_redirect: answering inline");
+                    return answer_get_redirect_inline(payload, part).await;
+                }
                 Err(e) => {
                     tracing::warn!(
                         extent_id,
@@ -499,35 +534,7 @@ pub(crate) async fn handle_get_redirect(
                     // inline" form the success path above already emits and the
                     // client already handles, so this costs ONE round trip
                     // rather than the two a client-side proxy retry would.
-                    match get_value(payload, part).await? {
-                        GetOutcome::NotFound => {
-                            Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
-                                code: CODE_NOT_FOUND,
-                                message: "key not found".to_string(),
-                                value: vec![],
-                                extent_id: 0,
-                                value_offset: 0,
-                                value_len: 0,
-                                eversion: 0,
-                                replica_addrs: vec![],
-                            }))
-                        }
-                        GetOutcome::Value(value) => {
-                            Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
-                                code: CODE_OK,
-                                message: String::new(),
-                                value: value.into(),
-                                extent_id: 0,
-                                value_offset: 0,
-                                value_len: 0,
-                                eversion: 0,
-                                replica_addrs: vec![],
-                            }))
-                        }
-                        GetOutcome::Redirect { .. } => {
-                            unreachable!("get_value never redirects")
-                        }
-                    }
+                    answer_get_redirect_inline(payload, part).await
                 }
             }
         }
@@ -591,7 +598,10 @@ pub(crate) async fn handle_get_redirect_many(
             } => {
                 let sc = part.borrow().stream_client.clone();
                 match sc.extent_read_descriptor(extent_id).await {
-                    Ok((eversion, replica_addrs)) => GetRedirectResp {
+                    Ok(ReadDescriptor::Direct {
+                        eversion,
+                        replica_addrs,
+                    }) => GetRedirectResp {
                         code: CODE_OK,
                         message: String::new(),
                         value: vec![],
@@ -611,7 +621,50 @@ pub(crate) async fn handle_get_redirect_many(
                     // via the per-item proxy path (get_range_direct_into →
                     // call_ps_for_key, which refreshes). The batched redirect is
                     // an optimization, never a correctness dependency.
+                    // A decline and a failure both end the batch the same way —
+                    // the client re-reads every item through the proxy — but they
+                    // are not the same event, and until they were logged apart
+                    // there was no way to tell an EC cluster doing the expected
+                    // thing from a manager that had stopped answering. Which one
+                    // this is also decides whether a per-item "skip me" signal
+                    // would buy anything: it only helps if batches are MIXED, and
+                    // that is what these two lines let us find out before adding
+                    // wire surface for it.
+                    Ok(ReadDescriptor::NotDirect(why)) => {
+                        why.log(extent_id, "get_redirect_many: batch falls back to proxy");
+                        // FailedPrecondition, NOT Unavailable — and the
+                        // difference is seconds of latency per call, not
+                        // tidiness. `Unavailable` maps to `ConnectionError`,
+                        // which the SDK classifies as transient and retries
+                        // through MAX_PS_REFRESHES with backoff (~9 s) before
+                        // the caller ever reaches its per-item proxy fallback.
+                        // A decline is deterministic — every retry gets the
+                        // same answer, because the extent is still EC — so on a
+                        // cluster with EC armed that was a ~9-13 s stall on
+                        // EVERY batched direct read touching a converted
+                        // extent, with `--direct-read` on by default.
+                        // `FailedPrecondition` is in `call_ps_for_part`'s
+                        // deterministic short-circuit set, so it surfaces at
+                        // once and the caller proxies immediately.
+                        //
+                        // Scoped to THIS message: `call_ps_for_key` reads
+                        // FailedPrecondition as a stale region epoch and
+                        // refreshes routing. That is why the status is chosen
+                        // per call site rather than per error kind.
+                        return Err((
+                            StatusCode::FailedPrecondition,
+                            format!(
+                                "redirect declined for extent {extent_id}: {}",
+                                why.as_str()
+                            ),
+                        ));
+                    }
                     Err(e) => {
+                        tracing::warn!(
+                            extent_id,
+                            error = %e,
+                            "get_redirect_many: descriptor lookup FAILED — batch falls back to proxy"
+                        );
                         return Err((
                             StatusCode::Unavailable,
                             format!("redirect descriptor lookup failed: {e}"),
