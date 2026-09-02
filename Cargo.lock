@@ -306,6 +306,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "libc",
+ "rancor",
  "rkyv",
  "thiserror 2.0.18",
  "tracing",
