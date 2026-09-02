@@ -246,9 +246,25 @@ pub async fn ingest_path(
     let mut work: Vec<PendingChunk> = Vec::new();
     let mut doc_nodes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut n_file = 0usize;
+    let mut n_unreadable = 0usize;
     for path in &paths {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
+        // A file we cannot read is REPORTED, not skipped.
+        //
+        // `collect_docs` already established this path exists and matched its
+        // extension, so a read failing here means the file is unreadable, not
+        // absent — a broken mount, a permission problem, an I/O error. Silently
+        // continuing turned exactly that into "ingested 0 chunks from 0 files"
+        // after 389 seconds, with the server then coming up healthy and simply
+        // returning nothing for every query. A retrieval service that indexes
+        // nothing and says so only in a count nobody reads is worse than one
+        // that fails to start.
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "ingest: cannot read file");
+                n_unreadable += 1;
+                continue;
+            }
         };
         let text = String::from_utf8_lossy(&bytes);
         let chunks = chunk_markdown(&text);
@@ -299,6 +315,19 @@ pub async fn ingest_path(
 
             work.push(PendingChunk { id, indexed, meta_b, vector, parent });
         }
+    }
+
+    // Every candidate unreadable is a failure, not an empty corpus. Say so
+    // loudly rather than returning zeros the caller will log as a success.
+    if n_unreadable > 0 && n_file == 0 {
+        anyhow::bail!(
+            "ingest: all {n_unreadable} candidate file(s) under {} were unreadable — \
+             refusing to report an empty ingest as success",
+            root.display()
+        );
+    }
+    if n_unreadable > 0 {
+        tracing::warn!(unreadable = n_unreadable, indexed = n_file, "ingest: some files unreadable");
     }
 
     let (n_chunk, n_edge) = (work.len(), work.len());
