@@ -1,6 +1,6 @@
 Date: 2026-09-02
-TaskStatus: completed
-Task scope: 账本整理——把 2026-09-01 的三条重叠条目合并成一条"当前状态"（其中第一条的
+TaskStatus: not_completed
+Task scope: (上一条见文末 2026-09-02 条) 账本整理——把 2026-09-01 的三条重叠条目合并成一条"当前状态"（其中第一条的
   头部被改成 ingest/graph 而正文仍是 S3 网关，已拆开归位），按规则 12 裁掉 08-28 及更早
   （约 30 条，靠 git log 与各 crate CLAUDE.md 追溯）。feature_list 删掉 5 条已 pass 的条目
   + F-HICACHE-PORT-REBASE（用户 2026-09-02 定：那是别的项目的事，移植本体随 da91d38 去了
@@ -193,3 +193,39 @@ Next steps: 无。
 
 
 （更早任务历史见 git log 与各 crate CLAUDE.md；本文件按规则 12 定期裁剪，保持整洁。）
+
+【2026-09-02 ingest 提速 + 一次线上事故】
+  ingest 慢的根因是**往返次数**,不是计算。同语料 5164 chunks 在真集群实测(改前):
+    写入循环 177.7s (34.4 ms/chunk) + reconcile/train 101.1s = 278.7s
+  已做(6b3a408): begin_bulk_index/flush_stats 延迟 meta/stats(它既是每篇 2 次往返,
+  也是循环无法并发的原因——单 key 并发 RMW 丢更新); 循环拆成顺序 CPU 段 + 并发 I/O 段;
+  bulk 窗口内 memoize centroid 表; 其余 `for k in keys { get(k).await }` 全部换批量。
+  **改后数字仍未拿到** —— 见下面的事故。
+  注意: **loopback 测不出这个改动**。本地 A/B 1.85s vs 1.87s,因为 RTT 只有 ~20µs,
+  往返差被每 chunk 5ms 的实际工作淹没。这类改动只能在 pod 里量。
+
+  事故一(不是我们的 bug): 三台 autumn-node(192.168.2.216/3.242/1.128)的 containerd
+  卡死——kubelet 心跳正常、节点 Ready 无 taint,但**无法在既有容器里起新进程、也无法新建容器**。
+  表现: exec 全挂(kube-system 的 pod 也一样)、exec 型 readiness 失败但 0 重启、
+  pod 卡 Terminating、新 pod 卡 Pending 且 kubelet 事件数为 0。manager 因此卡死 3 小时。
+  处置: cordon + 强删无 PVC 的 pod(manager/ps 无 PVC,秒级恢复)。EN 有 PVC,不能强删。
+  详见 memory/vke-k8s-deploy-gotchas.md 的 2026-09-01 条。
+
+  事故二(我的 bug): **翻译一句注释改掉了 WIRE_FINGERPRINT**。build.rs 按字节哈希
+  manager_rpc.rs 等 5 个文件,注释也算。我把 "数千 partition" 翻成英文 → fingerprint
+  从 f8b58703 变成 a30446,滚到一半时新 manager 与老 ps-0 互相握手失败。
+  而且检查是**不对称**的: 新二进制看老 peer 匹配注册表 → 放行; 老二进制看新 peer
+  不匹配注册表 → 判 fraud。所以新客户端连老集群一直是好的,直到 manager 先滚才炸。
+  修复(00fd992): 原样还原该文件 + 在 build.rs(不在哈希集合内)写警示。
+  教训: **部署前必须跑 `cargo test -p autumn-rpc`** —— registry_pins_current_schema_to_max_version
+  就是拦这个的,我只跑了 cargo check 和 memory/mcp 的测试。
+
+  事故三(顺带发现的真 bug,已修在 6b3a408): RPC 写路径的 writev 没按 IOV_MAX 分段。
+  宽批量 → 1131 个 iovec / 仅 76KB → 内核按**条数**拒绝(Linux errno 90 / macOS 40) →
+  写线程退出 → PS 的 log stream poisoned **且 PS 进程崩溃重启**,对上表现为
+  `batch_put op status=1`。它一直潜伏在线上,是新的并发批量把它变可达的。
+
+  buda 侧 upload 脚本修了三类 bug(1f9d073/90c7667/d66ee18): oniond 的
+  `list | grep -qx` 在 pipefail 下**匹配成功反而判失败**(SIGPIPE 141),所以 oniond 分支
+  从来没进过; HF 回退缺 HF_HUB_DISABLE_XET=1 会被 xethub CAS 打 401; 失败的模型静默跳过。
+  oniond 实测 ~200 MiB/s,比公网 HF 的 21.4 MiB/s 快约 10 倍。
