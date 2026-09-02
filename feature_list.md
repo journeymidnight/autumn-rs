@@ -14,6 +14,19 @@
 
 ## Active
 
+### F-EC-REPLAY-SELFHEAL — EC 重放路径拿不到 R2/R3 的自愈，且它唯一处理的哨兵是服务端不会发的那个
+- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): `read_committed_bytes_from_extent`（`crates/stream/src/client.rs` 的第二个 2-attempt 循环）**只处理 `EversionStale`**；`PayloadNotHere` 与 `EcGatherOneShort` 作为硬错误直接冒泡，没有 invalidate/refetch。而这条路正是 PS 对 EC 转换过的 log extent 做 **WAL 重放**走的路（`partition-server/src/lib.rs` 的 MERGE-EC-REPLAY 注释指明）。
+- **更糟的一半**: 服务端 `read_plan` 是**先查 `holds_payload` 再查 eversion**（`extent_node.rs:2503-2512`），所以缓存里的 `payload_location` 陈旧时，EN 回的是 `PAYLOAD_NOT_HERE` 而**不是** `EversionStale` ⇒ 这个循环唯一会处理的哨兵，恰恰是服务端在该场景下不会发的那个。后果是重放响亮失败（可用性问题，非损坏），且这条路上没有任何东西会驱逐缓存 ⇒ **单个 StreamClient 生命周期内不收敛**。
+- **Scope**: 把 `is_payload_not_here` / `is_ec_gather_one_short` 两条臂接进该循环，语义与主读路径一致（invalidate → 重取 → 重新规划；one-short 带抖动，payload-not-here 不睡）。注意两个循环的重试预算要各自独立，别叠成 4 次。
+- **Acceptance**: 构造"客户端缓存 payload_location 陈旧 + extent 已 EC 转换"的重放，验证第一次 `PAYLOAD_NOT_HERE` 后自动刷新布局并成功；同一 StreamClient 内重复重放不再持续失败；两个循环各自最多重试一次（用注入计数断言，别只断言最终成功）。
+- **Status**: `passes: false` (2026-09-02)
+
+### F-EC-RETRY-TESTS — R2 的"边界"回归测试实际上测不到边界
+- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): 账本称"3 个回归测试锁住边界"，但那几个测试只钉了**哨兵的管道**：`multi_short_is_not_retryable` 自己手搓一个字符串错误再断言"它不是类型化哨兵" —— **即使生产代码在 `success == K-2` 时挂上哨兵，这个测试照样通过**。真正要守的三件事一件没测：`ec_reconstruct_shard_subrange` 的计数逻辑（何时才算 one-short）、`attempt == 0` 的只重试一次、以及 R1 的"缺失分片答上来就逐字返回"。同文件的 `manager_retry_tests` 是反例，它确实驱动了自己的重试循环。
+- **Scope**: 让测试驱动真实函数而不是构造错误对象 —— 注入可控的 per-shard 结果（成功/短读/错误/超时），断言：K-1 成功才挂哨兵、K-2 不挂；重试恰好发生一次；R1 那条路返回的字节与分片内容逐字相同且**跳过** RS。
+- **Acceptance**: 把生产代码的判据从 `success + 1 == data_shards` 改成 `success + 2 == data_shards`，测试必须变红（消融验证）；把 `attempt == 0` 去掉，测试必须变红。
+- **Status**: `passes: false` (2026-09-02)
+
 ### F-EC-DIRECT-READ — 客户端直读 EC extent（k 个 EN 并行取分片，不必经 PS 代理）
 - **Trigger** (2026-09-02, 用户报 `get_redirect: descriptor lookup failed — answering inline extent_id=63 error=extent 63 is EC-converted; direct read not supported`，并在权衡后拍板"EC 开路线 2"): `--direct-read` 在**默认配置下会自己失效**——≥5 EN 的集群 bootstrap 默认 `--log-ec 4+1`，`balanced` 自动策略一装，sealed extent 陆续转 EC，而 `extent_read_descriptor` 对 EC extent 一律拒绝（EC 存的是 RS 分片，单 EN 裸读会把分片字节当值返回＝数据损坏）。于是每次大值读都悄悄退化成经 PS 的代理读。
 - **为什么可做且不需要在客户端引入 RS 解码（已在代码中核实）**: EC 的数据布局是**顺序切片**而非块内交织——`erasure::shard_size(payload_len, k) = ceil(payload_len/k)`，值依次铺满前 k 个数据分片、最后一个零填充、不存长度尾（`sealed_length` 权威）。所以 `value = shard0 ‖ … ‖ shard_{k-1}`，任一子区间只覆盖**连续的一段分片**，`ec_subrange_read` 正是这么算 plan 的（`start_shard = start/shard_size`）。**happy path 无需解码**；RS 重建只在某个分片所在节点不可用时才需要，而那条路客户端可以直接退回 PS 代理，因此 `reed-solomon-erasure` 不进客户端。

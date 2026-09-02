@@ -545,18 +545,26 @@ Next steps: 无。
   R2 已做(1e3ca75): EcGatherOneShort 类型化 sentinel + 顶层一次重试(带 jitter,
      先 invalidate 再重取 ExtentInfo)。**只在 success == K-1 时重试** —— 两个及以上短缺
      说明真的凑不齐 K,重试只会把响亮的失败拖成缓慢的失败。3 个回归测试锁住边界。
-  R3 已做(7bf986a): CODE_PAYLOAD_NOT_HERE 类型化,走刷新布局的重试(无 pause)。
+  R3 已做(a0ddecc): CODE_PAYLOAD_NOT_HERE 类型化,走刷新布局的重试(无 pause)。
      此前客户端**一处都没引用过这个码**,服务端契约的另一半从来没实现。
-  R4(a)(b) 已做(2d57ca8): 两处静默降级加 WARN(带 extent/shard/完整错误链);
+  R4(a)(b) 已做(2d57ca8),但**当时漏了第三条、也是最持久的一条入口**(2026-09-02 评审发现,
+     已补): 进入 needs_reconstruct 有三条臂 —— 短读、读错误、**以及 Suspected 预过滤**,
+     第三条在任何尝试之前就把分片转去重建,而它完全静默。一个长期 Suspected 的死节点
+     因此每次读都无声走 RS,正是"看不见地耗着冗余"。现已加 WARN(extent/shard/node)。
+     两处静默降级加 WARN(带 extent/shard/完整错误链);
      shortfall 消息带 extent_id;PS 的 map_storage_error 改 `{e:#}` 保留错误链
      (此前只送最外层 Display,把"哪个 peer 因为什么失败"这半截丢在了 wire 边界上)。
 
-  **R4(c) 有意未做,需要用户决策**: 反复失败的分片走 corrupt-replica 通道让 manager 重建。
-  风险: `report_corrupt_replica` 的动作是**隔离**该副本(清 avali)。4+1 上隔离一个槽就只剩 4,
-  而 RS 正好需要 4 —— **冗余归零**。把瞬时故障误判成损坏,这个"修复"会让情况更糟,
-  而且正好发生在集群已不健康时。安全实现需要跨请求的 (extent,shard) 持久失败计数 +
-  非瞬时错误分类 + 阈值,还要拿到读路径上没有的 partition_id/log_stream_id。
-  R4(a)(b) 已经让退化分片**可见**;自动隔离是有代价的策略决定,不该顺手做。
+  **R4(c) 不做,理由比原先记的更硬(2026-09-02 评审更正)**: 反复失败的分片走 corrupt-replica
+  通道让 manager 重建 —— **这条路根本走不通**: manager 的 `handle_report_corrupt_replica`
+  对 EC extent **直接拒绝**(manager/src/rpc_handlers.rs:1148-1156,"replicated corrupt-replica
+  isolation does not apply (EC shard repair routes through recovery)")。
+  ⚠️ 原先记的理由是**错的**,留在这里作为反例:曾写"隔离一个槽 ⇒ 4+1 只剩 4 而 RS 正好要 4,
+  冗余归零",但那个危害**无法经该 RPC 发生**,manager 已经 fail-close 了;清 avali 只存在于
+  复制模式那条臂,而它需要读路径根本没有的 partition-owner epoch 围栏与 stream 成员范围。
+  写错的代价是会让后来人以为"只差一个策略决定就能做"。
+  真正缺的便宜东西是**每 (extent,shard) 退化的计数器**(op 可观测性重设计里已有位置),
+  而不是自动隔离。R4(a)(b) 已经让退化分片可见。
 
 【2026-09-02 更正:FreeToken 从未挂起 —— 我的第三次同型仪器错误】
   事实: MiniMax 的加载**成功完成了**。串行专家构建 09:28:39 开始、09:49:38 打出

@@ -3951,20 +3951,10 @@ impl StreamClient {
                     self.invalidate_extent_cache(extent_id);
                     continue;
                 }
-                // R2: one retry for a gather that came up exactly one shard
-                // short. Same shape as the eversion arm and for the same
-                // reason — the useful part is re-planning from FRESH
-                // ExtentInfo, since retrying against the cached copy just
-                // re-asks the same wrong node the same wrong question. The
-                // jittered pause only spaces the attempts; every gather is
-                // already a K-way read amplification, and a tight or unbounded
-                // retry multiplies load exactly when the cluster is degraded,
-                // which is how the read-timeout storm was born.
-                // R3: the EN told us our layout is stale. Refetching is the
-                // designed response and the server's contract says so; without
-                // this arm the refusal was indistinguishable from any other
-                // failure and the read degraded to reconstruct on every
-                // attempt, forever.
+                // The EN told us our layout is stale. Refetching is the designed
+                // response and the server's contract says so; without this arm
+                // the refusal was indistinguishable from any other failure and
+                // the read degraded to reconstruct on every attempt, forever.
                 Err(e) if attempt == 0 && is_payload_not_here(&e) => {
                     tracing::warn!(
                         extent_id,
@@ -3974,6 +3964,15 @@ impl StreamClient {
                     self.invalidate_extent_cache(extent_id);
                     continue;
                 }
+                // One retry for a gather that came up exactly one shard short.
+                // Same shape as the eversion arm and for the same reason — the
+                // useful part is re-planning from FRESH ExtentInfo, since
+                // retrying against the cached copy just re-asks the same wrong
+                // node the same wrong question. The jittered pause only spaces
+                // the attempts; every gather is already a K-way read
+                // amplification, and a tight or unbounded retry multiplies load
+                // exactly when the cluster is degraded, which is how the
+                // read-timeout storm was born.
                 Err(e) if attempt == 0 && is_ec_gather_one_short(&e) => {
                     tracing::warn!(
                         extent_id,
@@ -3981,7 +3980,18 @@ impl StreamClient {
                         "ec: gather one shard short — refreshing extent info and retrying once"
                     );
                     self.invalidate_extent_cache(extent_id);
-                    let jitter = 100 + (extent_id.wrapping_mul(2654435761) % 200);
+                    // Per-CALL, not per-extent. Hashing the extent id alone
+                    // gave every reader of one extent the identical sleep, so
+                    // the herd this exists to break up stayed in lockstep — and
+                    // a read-hot weight file is precisely many readers on one
+                    // extent. The extent term still spreads load ACROSS
+                    // extents; the clock term spreads it within one.
+                    let spread = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos() as u64)
+                        .unwrap_or(0);
+                    let jitter =
+                        100 + (extent_id.wrapping_mul(2654435761) ^ spread.wrapping_mul(6364136223846793005)) % 200;
                     compio::time::sleep(std::time::Duration::from_millis(jitter)).await;
                     continue;
                 }
@@ -4931,6 +4941,21 @@ impl StreamClient {
         for (i, &(shard_idx, _, _)) in shard_plan.iter().enumerate() {
             let nid = node_ids.get(shard_idx).copied().unwrap_or(0);
             if self.is_node_suspected(nid) {
+                // The THIRD way into a reconstruct, and the one that lasts: a
+                // short read and a read error each get a warning, but a node the
+                // manager has marked Suspected is diverted here before anything
+                // is even attempted — so a node that stays Suspected turns every
+                // read of its shards into a parity reconstruct, indefinitely,
+                // and used to say nothing at all while doing it. At 4+1 that is
+                // one hiccup away from unavailable, which is exactly the state
+                // worth hearing about.
+                tracing::warn!(
+                    extent_id,
+                    shard = shard_idx,
+                    node_id = nid,
+                    "EC read: shard's node is Suspected — reconstructing from parity \
+                     instead of reading it (redundancy is spent while this lasts)"
+                );
                 needs_reconstruct.push(i);
             } else {
                 to_read.push(i);
