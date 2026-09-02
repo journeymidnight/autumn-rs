@@ -998,6 +998,53 @@ and from other crates' CLAUDE.md); do not renumber.
 
 32. **`seal_and_roll_tail` is live-writer-aware — a LIVE stream's tail may only be sealed through its worker.** The manager learns a seal immediately, but the ENs learn it only LAZILY (nothing pushes seals; the append path detects them only via an eversion mismatch that a stale writer never triggers, since its cached eversion equals the ENs'). So a bare manager probe-seal (`alloc_new_extent(None, 0)`) behind a live per-stream worker freezes `sealed_length` while the worker keeps appending to the SAME extent and keeps ACKing clients — every post-seal acked byte sits above `sealed_length`, invisible to committed-clamped replay and to CoW split children (the chaos acked-write-loss family: `stale_vp_offset_past_sealed_length` child wedge / silent-stale reads; deterministic repro `crates/manager/tests/system_roll_tails_live_writer.rs`). `seal_and_roll_tail` therefore branches on `existing_stream_worker(stream_id)` (lookup-only, never spawns): worker present → SealCommit handshake (quiesce → the worker's exact all-replica-acked commit, freezes the doomed tail) → `alloc_new_extent(Some(commit), tail_id)` (notes 20/22 idempotent-roll rules) → `ResetTail` onto the fresh extent — identical mechanics to the append-failure roll; worker absent (WAL self-heal A4 runs before the worker spawns) → the original probe roll, race-free because there is no writer to race. **Invariant: never manager-seal a stream tail that a live worker may still be appending to without first quiescing THAT worker via SealCommit and redirecting it via ResetTail.** If the alloc fails after SealCommit, the worker is left `sealing = true` — self-healing: the next append soft-errors into the public-API retry path, which performs its own quiesced roll.
 
+33. **Client-side EC corruption reporting — considered and REJECTED (do not build).**
+    The proposal (the EC-hardening round's deferred item): when an EC shard read
+    fails, have the reader call `report_corrupt_replica` so the manager marks the
+    slot corrupt and force-dispatches a rebuild past the recovery gate. Rejected
+    because the signal does not exist at this layer, not because the plumbing is
+    expensive:
+    - **A failed shard read cannot mean corruption.** No shard-content checksum
+      exists anywhere: `WriteShardReq` carries none, the `.meta` CRC covers only
+      the 48-byte sidecar, and the bulk read's `value_crc32c` is computed at read
+      time from whatever is on disk (transport integrity only). A bit-rotted
+      shard therefore reads back CLEAN — the one failure class that IS corruption
+      never fails a shard read; rot surfaces later at the partition layer (SST
+      block CRC / WAL record CRC) or never (VP value reads have no CRC). What
+      DOES fail a shard read: timeout/connect (congestion or a dead node —
+      Suspected avoidance, note 27, and operator fencing already handle both),
+      `CODE_PAYLOAD_NOT_HERE` (stale layout → the typed refresh; or a genuinely
+      missing shard file), or the META-FAILCLOSED quarantine — which
+      `build_read_future` deliberately DISGUISES as an `EversionStale` refusal so
+      clients fail over, meaning a client-side classifier cannot even tell
+      quarantine from ordinary staleness.
+    - **False-positive blast radius on 4+1 is metastable.** Isolating one slot
+      leaves K of K: every read of the extent degrades to
+      `ec_reconstruct_shard_subrange` (zero slack, K× wire traffic) and the
+      forced rebuild reads shard-size × K more — while the dominant real cause of
+      failed shard reads is LOAD, so the mechanism amplifies exactly the overload
+      that triggered it, across every extent that hiccuped in the same window. A
+      cross-request per-(extent,shard) failure counter does not repair this:
+      N timeouts is stronger congestion evidence, not corruption evidence.
+    - **The manager refuses it today anyway**: `handle_report_corrupt_replica`
+      rejects EC-converted extents by design (EC `avali` bits mean shard
+      availability; the replicated isolation semantics don't apply). The
+      deferral's plumbing blocker turned out cheap — `owner_epoch` and
+      `reporter_part_id` already live on `StreamClient` and
+      `ReportCorruptReplicaReq` already carries every field, so no wire change
+      would be needed — which is why THIS note records the evidential argument
+      as the reason.
+    - **What closes the real gaps instead.** (a) Rot needs EN-side first-party
+      evidence: a shard-content checksum written at staging plus a background
+      scrub, reporting through the existing df channel — a future feature, and a
+      wire change to stage. (b) A missing shard file / quarantined holder is
+      first-party EN knowledge too; today's repair is an operator fence of the
+      node (force-dispatches every slot → `run_ec_recovery_payload`). The
+      manager side is already EC-ready for a trustworthy source: the corrupt-slot
+      bitmap is slot-indexed over `replicates ++ parity` and the recovery-gate
+      bypass + EC shard rebuild work for shard slots — only the report entry
+      point's EC refusal would need an EC-aware variant.
+
 ---
 
 ## RPC wire protocol (`extent_rpc.rs`, in autumn-rpc)

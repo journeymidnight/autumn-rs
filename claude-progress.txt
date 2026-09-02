@@ -618,3 +618,49 @@ Next steps: 无。
   可操作的教训: 断言"什么都没发生"之前,先问这个仪器**能不能看见**要找的东西。
   具体到本仓库: 进程级 I/O 用 `rchar` 不用 `read_bytes`(FUSE 不走块设备),
   但两者都看不见 mmap —— 那要看 `minflt/majflt`。
+
+【2026-09-02 R4(c) 客户端上报分片损坏：评估后否决，不做】
+  结论写进 crates/stream/CLAUDE.md 的 Programming Note 33，此处只记决定。
+  否决理由不是当初推迟时说的"4+1 上隔离一个 slot 只剩 K、误判代价大"——那条其实
+  走不到：`handle_report_corrupt_replica` 对 `ec_converted` 本来就返回 CODE_PRECONDITION。
+  真正的理由更根本：**真正的位腐坏根本不会让分片读失败**。分片写入没有内容校验和
+  （`WriteShardReq` 只有 extent_id/shard_index/sealed_length/eversion/owner_epoch/
+  shard_offset/attempt_nonce/payload），`.meta` 的 CRC 只覆盖 52 字节 sidecar，批量读的
+  CRC 是 EN 读取时从磁盘字节现算的（只保证传输完整性）。烂掉的分片会干净地读回来，
+  gather 照样成功 —— 这个上报器能抓到的实际损坏是零。它能看到的全是拥塞超时、
+  PAYLOAD_NOT_HERE、以及 EN 隔离时**故意伪装成 EversionStale** 的拒绝（好让客户端
+  故障转移），客户端在原理上无法区分。管道成本反而很便宜（owner_epoch /
+  reporter_part_id 已在 StreamClient 上，不需要 wire bump）——特此点明：否决是因为
+  证据不成立，不是因为成本。
+  **顺带查出一个真缺口**：默认 `fenced_only` 门控下，`recovery.rs` 的 gate 检查之前
+  就 `continue` 了，所以磁盘离线派发 / re_avali 自愈 / 存活探测全都够不着 —— 一个节点
+  健康、但分片文件真丢了或持有者被隔离的 EC extent，今天没有任何自动修复，只能人工
+  fence。正确解法是 EN 侧的一等证据（staging 时写分片校验和 + 后台巡检走 df 通道上报），
+  不是客户端推断；manager 侧的 corrupt-slot 位图和 gate 旁路本来就是 slot 泛型的，
+  等那个存在时只需给上报入口加一个 EC 感知的变体。
+
+【2026-09-02 EC 转换参与者不落盘封存状态：已修】
+  实机发现：一个封存在 17 GiB 的 EC extent，5 个持有者里只有协调者的 `.meta` 是
+  sealed=1/eversion=2，另外 4 个全是 sealed=0/sealed_length=0/eversion=1，而分片文件
+  完全正确。staging 故意不写 `.meta`（废弃的 CoW 尝试只该值几个待删文件，且此时
+  new_eversion 还是投机值），所以布局翻转才是持有者第一次能durable地知道封存 ——
+  而 `apply_placements` 在那里只写了 payload_location。这不是"懒加载"而是**治不好**：
+  所有自愈路径都汇进 `apply_extent_meta_durable`，它会去开 `.dat` 做预写 fsync，而
+  清理已经把 `.dat` 删了、`extent_file` 对纯分片条目又故意不创建，于是自愈器永久报错，
+  re_avali 返回 CODE_ERROR 而不是文档承诺的自动痊愈。同一节点经**恢复**路径到达同一
+  状态就会写对全套 —— 这个不对称是它是缺陷而非设计的判据。修复带 needs_seal_heal，
+  已部署的集群下一次 reconcile 会自愈。回归测试消融跑复现线上确切形态。
+
+【2026-09-02 memory-mcp 加 HTTP MCP 传输】
+  stdio MCP server 必须由客户端 spawn，等于每个消费者都要这个二进制、它的 autumn 凭据
+  和生命周期 —— 对一个想指向"自己不拥有的检索"的 web UI 是错误的耦合。`POST /mcp`
+  用同一套 dispatch（stdio 循环里那段 inline match 被抽走共用，不是复制一份），所以两个
+  传输在"提供哪些工具"上不可能漂移。buda 的 webui 因此不带 autumn 客户端、不受 WIRE
+  锁步约束。
+
+【2026-09-02 --direct-read 的测量已作废，需重测】
+  在 a83a1be（EC 尚不支持直读）上实测 autumn-fuse：direct-read=false 76 MiB/s，
+  true 22 MiB/s，慢 3.5 倍。机制查实为**丢掉批量**而非多一个 RTT：`get_redirect_many`
+  只要批中有一个 EC extent 就整批以 FailedPrecondition 退回，客户端转入逐项代理。
+  但 `1de0005 feat(ec): serve direct reads from EC extents` 之后这个前提已不成立，
+  **该数字对新代码无效，必须重测**。

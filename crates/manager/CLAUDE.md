@@ -402,6 +402,17 @@ value breaks rkyv replay validation, which refuses leadership.
 Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
 prerequisite that the loop can act at all is pinned by
 `system_recovery_loop_drives.rs`.
+`handle_report_corrupt_replica` REFUSES EC-converted extents by design (EC
+`avali` bits mean shard availability, and the reporter's evidence — a
+CRC-failed WAL decode plus a clean replica found — only exists for full
+replicas). Extending the report to the EC READ path (client infers corruption
+from a failed shard read) was considered and REJECTED: no shard-content
+checksum exists, so real rot reads back clean while the failures a reader does
+see are congestion/absence — see `crates/stream/CLAUDE.md` note 33 for the
+full argument and what should exist instead. The bitmap + gate bypass here are
+already slot-generic over `replicates ++ parity`, so a future trustworthy
+EN-side evidence source (staged shard checksum + scrub) only needs an EC-aware
+report entry point.
 
 **Node health loop** (`node_health_loop`, 2 s) is the **single** `EXT_MSG_DF` caller
 per node. **INVARIANT: never add a second `df` caller.** The EN's `handle_df`
