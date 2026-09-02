@@ -2,7 +2,11 @@
 //! MCP client. Two ingesters share one store: a Rust-code indexer
 //! (tree-sitter: symbols + a CALLS/CONTAINS graph) and a markdown/plain-text
 //! ingester (heading-aware chunks + a CONTAINS outline). The same binary is a
-//! web UI for the code corpus and, with `--mcp`, a stdio MCP server over both.
+//! web UI for the code corpus, and an MCP server over both on TWO transports:
+//! `--mcp` speaks stdio, and `POST /mcp` speaks the same JSON-RPC over HTTP.
+//! They share one dispatch (`mcp_dispatch`), so the two can't drift apart in
+//! which tools they offer. HTTP is what lets a consumer treat this as a URL
+//! rather than a process it must spawn, credential and supervise.
 //! A Rust example (like `gallery`): Axum on the compio runtime over
 //! `autumn-memory` directly.
 //!
@@ -10,7 +14,8 @@
 //!   cargo run -p memory-mcp -- [MANAGER] [--root PATH] [--docs PATH]...
 //!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index] [--mcp]
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
-//! Then open http://127.0.0.1:5100 (or register the --mcp form with Claude).
+//! Then open http://127.0.0.1:5100 — or point an MCP client at the stdio
+//! `--mcp` form, or at `http://127.0.0.1:5100/mcp`.
 //!
 //! Retrieval-quality run (scores the ingested corpus against a labelled query
 //! set and exits — see `eval.rs`):
@@ -35,7 +40,7 @@ use autumn_memory::MemoryStore;
 use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{Response, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use send_wrapper::SendWrapper;
 use serde_json::{json, Value};
@@ -229,6 +234,24 @@ fn router(shared: Shared) -> Router {
             }
         }};
     }
+    // POST + a raw body, which neither `q!` (query params) nor `s!` (no args)
+    // covers. The body is taken as a String rather than `Json<Value>` so a
+    // malformed request answers our own -32700-shaped message instead of axum's
+    // generic 422, which an MCP client reports as an unusable server.
+    macro_rules! mcp {
+        ($h:path) => {{
+            let s = SendWrapper::new(shared.clone());
+            move |body: String| {
+                let s = s.clone();
+                SendWrapper::new(async move {
+                    match $h(&s, body).await {
+                        Ok(r) => r,
+                        Err(e) => to_response(e),
+                    }
+                })
+            }
+        }};
+    }
     Router::new()
         .route("/", get(index_handler))
         .route("/config", get(s!(h_config)))
@@ -243,6 +266,7 @@ fn router(shared: Shared) -> Router {
         .route("/graph/neighbors", get(q!(h_graph_neighbors)))
         .route("/graph/traverse", get(q!(h_graph_traverse)))
         .route("/graph/nodes", get(q!(h_graph_nodes)))
+        .route("/mcp", post(mcp!(h_mcp)))
 }
 
 // -- args + embedder --------------------------------------------------------
@@ -514,6 +538,94 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text": serde_json::to_string(&data)?}]}))
 }
 
+/// One JSON-RPC method dispatch, shared by BOTH transports. `Ok(None)` means the
+/// method is unknown — the caller decides what that costs: stdio and HTTP both
+/// answer -32601 for a request, and stay silent for a notification. Keeping the
+/// dispatch here (rather than duplicating the match per transport) is what makes
+/// "the HTTP server exposes the same tools as the stdio one" a property of the
+/// code instead of a promise in a comment.
+async fn mcp_dispatch(code: &Code, method: &str, params: Value) -> Result<Option<Value>> {
+    Ok(match method {
+        "initialize" => Some(json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "memory-mcp", "version": "0.1.0"},
+            "capabilities": {"tools": {}}
+        })),
+        "tools/list" => Some(json!({ "tools": mcp_tool_defs() })),
+        "tools/call" => Some(mcp_tool_call(code, &params).await?),
+        "ping" => Some(json!({})),
+        _ => None,
+    })
+}
+
+/// Answer ONE JSON-RPC message. Returns `None` for a notification (no `id`),
+/// which the HTTP layer turns into 202 Accepted with no body, per the MCP
+/// streamable-HTTP transport.
+async fn mcp_one(code: &Code, msg: &Value) -> Option<Value> {
+    let id = msg.get("id").cloned();
+    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+    let outcome = mcp_dispatch(code, method, params).await.map_err(|e| format!("{e:#}"));
+    mcp_envelope(id, outcome)
+}
+
+/// Build the JSON-RPC reply envelope. Split out from `mcp_one` because this is
+/// the part with the rules worth pinning, and it needs no `Code` — so a test can
+/// reach the real function instead of re-stating its output as a literal.
+///
+/// `None` means "write nothing": a notification carries no `id`, so it gets no
+/// reply even when the dispatch failed. There is nobody to tell.
+fn mcp_envelope(id: Option<Value>, outcome: std::result::Result<Option<Value>, String>) -> Option<Value> {
+    let id = id?;
+    Some(match outcome {
+        Ok(Some(r)) => json!({"jsonrpc":"2.0","id":id,"result":r}),
+        // -32601 keeps the connection usable. An HTTP 4xx here would make a
+        // client mark the whole server dead over one unknown method.
+        Ok(None) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}),
+        Err(msg) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":msg}}),
+    })
+}
+
+/// Shape the HTTP response body. The reply must MIRROR the request's shape: a
+/// client that sent a bare object indexes the response directly, and handing it
+/// a one-element array breaks it. `None` = 202 with no body (all notifications).
+fn mcp_reply_body(was_batch: bool, mut replies: Vec<Value>) -> Option<Value> {
+    if replies.is_empty() {
+        return None;
+    }
+    Some(if was_batch { json!(replies) } else { replies.remove(0) })
+}
+
+/// `POST /mcp` — the same MCP server as `--mcp`, over HTTP instead of stdin.
+///
+/// Why this exists: a stdio MCP server has to be SPAWNED by its client, so every
+/// consumer needs this binary, its autumn credential and its lifecycle. Over HTTP
+/// the server is just a URL, which is what lets a web UI point hermes at
+/// `http://memory-mcp:5100/mcp` and own neither.
+///
+/// Accepts a single JSON-RPC object or a batch array. A batch of only
+/// notifications answers 202 with no body, same as a single one.
+async fn h_mcp(app: &App, body: String) -> Result<Response<Body>, AppError> {
+    let msg: Value = serde_json::from_str(&body)
+        .map_err(|e| AppError::Bad(format!("mcp: request is not JSON: {e}")))?;
+    let replies: Vec<Value> = match &msg {
+        Value::Array(batch) => {
+            let mut out = Vec::with_capacity(batch.len());
+            for m in batch {
+                if let Some(r) = mcp_one(&app.code, m).await {
+                    out.push(r);
+                }
+            }
+            out
+        }
+        _ => mcp_one(&app.code, &msg).await.into_iter().collect(),
+    };
+    match mcp_reply_body(msg.is_array(), replies) {
+        Some(payload) => Ok(json_ok(&payload)),
+        None => Ok(resp(Vec::new(), "application/json", StatusCode::ACCEPTED)),
+    }
+}
+
 async fn run_mcp_stdio(code: &Code) -> Result<()> {
     use std::io::Write;
     let stdin = std::io::stdin();
@@ -532,19 +644,8 @@ async fn run_mcp_stdio(code: &Code) -> Result<()> {
         };
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let result: Option<Value> = match method {
-            "initialize" => Some(json!({
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "memory-mcp", "version": "0.1.0"},
-                "capabilities": {"tools": {}}
-            })),
-            "tools/list" => Some(json!({ "tools": mcp_tool_defs() })),
-            "tools/call" => {
-                Some(mcp_tool_call(code, &msg.get("params").cloned().unwrap_or_else(|| json!({}))).await?)
-            }
-            "ping" => Some(json!({})),
-            _ => None, // notifications (no id) or unknown
-        };
+        let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+        let result: Option<Value> = mcp_dispatch(code, method, params).await?;
         // Only requests (with an id) get a response; notifications are silent.
         if let Some(id) = id {
             let env = match result {
@@ -757,4 +858,60 @@ async fn main() -> Result<()> {
     );
     cyper_axum::serve(listener, router(shared)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mcp_http_tests {
+    use super::*;
+
+    // These call the real framing functions. The dispatch itself needs a live
+    // `Code` and is exercised by the stdio path; what is new here — and what
+    // these pin — is the envelope and body shaping.
+
+    #[test]
+    fn a_notification_gets_no_reply_even_when_the_dispatch_failed() {
+        // No `id` => nobody to answer. Emitting an error envelope for a
+        // notification makes a client correlate it against a request it never
+        // sent.
+        assert_eq!(mcp_envelope(None, Ok(Some(json!({})))), None);
+        assert_eq!(mcp_envelope(None, Ok(None)), None);
+        assert_eq!(mcp_envelope(None, Err("boom".into())), None);
+    }
+
+    #[test]
+    fn an_unknown_method_is_method_not_found_and_keeps_the_id() {
+        let env = mcp_envelope(Some(json!(7)), Ok(None)).expect("a request gets a reply");
+        assert_eq!(env["error"]["code"], -32601);
+        assert_eq!(env["id"], 7);
+        assert_eq!(env["jsonrpc"], "2.0");
+    }
+
+    #[test]
+    fn a_dispatch_error_is_internal_error_carrying_the_chain() {
+        let env = mcp_envelope(Some(json!("abc")), Err("outer: inner".into())).unwrap();
+        assert_eq!(env["error"]["code"], -32603);
+        assert_eq!(env["error"]["message"], "outer: inner");
+        assert_eq!(env["id"], "abc", "a string id must survive as a string");
+    }
+
+    #[test]
+    fn the_reply_shape_mirrors_the_request_shape() {
+        let one = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        assert!(mcp_reply_body(false, vec![one.clone()]).unwrap().is_object());
+        assert!(mcp_reply_body(true, vec![one.clone()]).unwrap().is_array());
+        // All-notifications => nothing to send => 202 with no body.
+        assert_eq!(mcp_reply_body(true, vec![]), None);
+        assert_eq!(mcp_reply_body(false, vec![]), None);
+    }
+
+    #[test]
+    fn tool_defs_are_the_one_list_both_transports_serve() {
+        let defs = mcp_tool_defs();
+        let arr = defs.as_array().expect("tool defs are an array");
+        assert!(!arr.is_empty(), "an MCP server with no tools is not useful");
+        for d in arr {
+            assert!(d.get("name").and_then(|n| n.as_str()).is_some(), "every tool needs a name");
+            assert!(d.get("inputSchema").is_some(), "every tool needs an inputSchema");
+        }
+    }
 }
