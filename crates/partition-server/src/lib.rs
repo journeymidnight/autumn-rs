@@ -4738,11 +4738,12 @@ fn spawn_ps_read(
     .boxed_local()
 }
 
-/// R4 — push a completed response `(head, Option<value>)` into `tx_bufs`.
-/// `head` (frame header + any meta) goes first; for MSG_GET_BULK the `value`
-/// (aliasing the RegPool buffer, no copy) goes immediately after so the next
-/// `write_vectored_all` emits both as one contiguous wire frame. Keeping the
-/// pair adjacent preserves per-connection in-order reply semantics.
+/// R4 — push a completed response `(head, values)` into `tx_bufs`. `head`
+/// (frame header + any meta) goes first; the bulk reads' values (aliasing the
+/// RegPool buffer / the resolved read, no copy) go immediately after — one for
+/// MSG_GET_BULK, one per key for MSG_BATCH_GET_BULK — so the next vectored
+/// flush emits them as one contiguous wire frame. Keeping a reply's buffers
+/// adjacent preserves per-connection in-order reply semantics.
 #[inline]
 fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
     let (head, values) = done;
@@ -5222,11 +5223,14 @@ fn push_one_frame_to_inflight(
     // in the mock-loop unit tests (which only drive writes) → GET delegates.
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-    // R4: each completion is `(head, Option<value>)` — `Some(value)` ONLY
-    // for MSG_GET_BULK, whose value `Bytes` aliases the RegPool buffer and is
-    // emitted as its own iovec (no concat copy). All other frames are `(frame,
-    // None)`. The drain sites push `head` then `value` consecutively into
-    // `tx_bufs` so one `write_vectored_all` flushes them as a single wire frame.
+    // R4: each completion is `(head, values)` — non-empty only for the bulk
+    // reads, whose value `Bytes` alias the RegPool buffer / the resolved read
+    // and are emitted as their own iovecs (no concat copy): one for
+    // MSG_GET_BULK, one per key for MSG_BATCH_GET_BULK. Every other frame
+    // carries none. The drain sites push `head` then its values consecutively
+    // into
+    // `tx_bufs` so one vectored flush emits them as a single wire frame
+    // (segmented at IOV_MAX, since a batched read contributes one buffer per value).
     inflight: &mut FuturesUnordered<
         futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
     >,
@@ -5482,8 +5486,9 @@ async fn handle_ps_connection(
     let mut principal: Option<crate::authz::BoundPrincipal> = None;
 
     let cap = ps_conn_inflight_cap();
-    // R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_BULK
-    // (value aliases the RegPool buffer, emitted as its own iovec — no concat).
+    // R4: completion = `(head, values)`; non-empty only for the bulk reads
+    // (values alias the RegPool buffer / the resolved read, each emitted as its
+    // own iovec — no concat copy).
     let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>> =
         FuturesUnordered::new();
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
@@ -5673,7 +5678,13 @@ async fn handle_ps_connection(
                         }
                         if !tx_bufs.is_empty() {
                             let bufs = std::mem::take(&mut tx_bufs);
-                            let _ = writer.write_vectored_all(bufs).await.0;
+                            // Best-effort on the way out, but still segmented:
+                            // this drain collects EVERY remaining reply at once,
+                            // so it is the widest `tx_bufs` a connection ever
+                            // builds — exactly where an iovec-count rejection
+                            // would silently discard all of them.
+                            let _ =
+                                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await;
                         }
                         return Ok(());
                     }

@@ -177,14 +177,6 @@ pub(crate) enum GetOutcome {
     Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
 }
 
-/// MSG_BATCH_GET: N keys on the SAME partition in ONE frame, all
-/// resolved in this single handler invocation. The handler runs INLINE
-/// on the ps-conn task (reads never go through `partition_loop`'s
-/// mpsc), so the only "batching" benefit here is amortising the wire-
-/// frame overhead: one decode of `BatchGetReq`, one encode of
-/// `BatchGetResp` carrying all values, vs N independent GET round
-/// trips. Per-key value lookup reuses the existing `get_value`
-/// internal so VP resolution + read-pin semantics are unchanged.
 /// `MSG_BATCH_GET_BULK` — the same resolve loop as `handle_batch_get`, but the
 /// values leave as their own iovecs instead of being copied into the response.
 ///
@@ -273,6 +265,13 @@ pub(crate) async fn handle_batch_get_bulk(
     )
 }
 
+/// `MSG_BATCH_GET`: N keys on the SAME partition in one frame, values encoded
+/// INLINE in a `BatchGetResp`. Superseded by `handle_batch_get_bulk` — the SDK's
+/// `get_many` no longer sends this — and unlike its replacement it is dispatched
+/// through `partition_loop`'s mpsc, so it queues behind the single-writer
+/// group-commit actor. Kept because the wire form is still accepted; per-key
+/// lookup reuses `get_value`, so VP resolution and read-pin semantics are
+/// identical either way.
 pub(crate) async fn handle_batch_get(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,

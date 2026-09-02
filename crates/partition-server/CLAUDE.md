@@ -400,8 +400,10 @@ group-commit actor, which is what serving it locally fixes. Measured on a 41-que
 search workload over a 5164-chunk corpus: -7.5% end-to-end wall clock over loopback
 TCP, where the batched read is only part of the work.
 
-One reply now contributes N buffers to the connection's `tx_bufs`, so both reply
-paths segment at IOV_MAX (`autumn_rpc::client::write_vectored_chunked`): the kernel
+One reply now contributes N buffers to the connection's `tx_bufs`, so every reply
+path segments at IOV_MAX (the batched drain, the depth-1 fast path, and the EOF
+drain — the last collects EVERY remaining reply at once and is the widest
+`tx_bufs` a connection ever builds) (`autumn_rpc::client::write_vectored_chunked`): the kernel
 rejects a `writev` by iovec COUNT no matter how few bytes it carries, and that
 rejection kills the writer. Before this, a reply contributed at most two buffers
 and the cap was unreachable.

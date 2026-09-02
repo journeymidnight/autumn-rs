@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
+use autumn_rpc::partition_rpc;
 
 use support::*;
 
@@ -477,6 +478,103 @@ fn put_many_small_values_take_the_batched_bulk_path() {
                 "get_many value {vi} came back wrong — check the reply tail cursor"
             );
             vi += 1;
+        }
+    });
+}
+
+/// A split moves the keys and invalidates every cached region epoch, so the
+/// next batched read is answered with `FailedPrecondition`. `get_many` must
+/// refresh and return the values, NOT surface an error per key.
+///
+/// This is a regression test with a story: the inline `MSG_BATCH_GET` reported a
+/// stale epoch as a frame-level ERROR, which the SDK downcast into
+/// `PreconditionFailed` and recovered from. The bulk reply is a normal response
+/// frame carrying its status in ctrl, so the same condition arrived as `Ok(code
+/// = 3)`, the recovery branch became unreachable, and every key in the group
+/// came back as an error on any split or merge — a data-plane regression that
+/// no test noticed because nothing exercised `get_many` across a topology
+/// change.
+#[test]
+#[ignore]
+fn get_many_recovers_from_a_stale_epoch_after_a_split() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        // Inlined rather than via `boot_cluster` because the split has to be
+        // issued to the PS directly, and only this scope knows its address.
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 125).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 12501, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        let ps_addr = pick_addr();
+        start_partition_server(125, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1500)).await;
+        let ps = RpcClient::connect(ps_addr).await.unwrap();
+        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("ClusterClient::connect");
+        cluster.set_rpc_timeout(Duration::from_secs(15));
+
+        // Spread across the keyspace so the split has somewhere to cut, and
+        // sized so the group crosses the bulk threshold.
+        const N: usize = 48;
+        let keys: Vec<Vec<u8>> = (0..N).map(|i| format!("sk-{i:03}").into_bytes()).collect();
+        let values: Vec<bytes::Bytes> = (0..N)
+            .map(|i| bytes::Bytes::from(vec![(i % 251) as u8 + 1; 4096 + i * 32]))
+            .collect();
+        let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+            .iter()
+            .zip(&values)
+            .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+            .collect();
+        for r in cluster.put_many(&items).await {
+            r.expect("put");
+        }
+
+        // Prime the SDK's routing + epoch cache — without this the first read
+        // after the split would refresh anyway and prove nothing.
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        for r in cluster.get_many(&refs).await {
+            assert!(r.is_ok(), "pre-split read failed: {r:?}");
+        }
+
+        ps_flush(&ps, 12501).await;
+        let resp = ps
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
+                    part_id: 12501,
+                    at_key: None,
+                }),
+            )
+            .await
+            .expect("split rpc");
+        let split_resp: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&resp).expect("decode split resp");
+        assert_eq!(
+            split_resp.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            split_resp.message
+        );
+
+        // The read that regressed: the client still holds the pre-split epoch.
+        for (i, r) in cluster.get_many(&refs).await.into_iter().enumerate() {
+            assert_eq!(
+                r.as_ref()
+                    .unwrap_or_else(|e| panic!("key {i} errored after the split: {e}"))
+                    .as_deref(),
+                Some(values[i].as_ref()),
+                "key {i} came back wrong after the split"
+            );
         }
     });
 }

@@ -2615,6 +2615,49 @@ fn batch_append_reject(
     Box::pin(async move { out })
 }
 
+/// `write_vectored_all_at`, segmented at `IOV_MAX`.
+///
+/// A kernel rejects a `writev`/`pwritev` by iovec COUNT (EINVAL on Linux,
+/// EMSGSIZE on macOS) no matter how few bytes it carries, and the count here
+/// scales with the number of APPENDS coalesced for one extent, not their size —
+/// one iovec per request. The same limit already killed the RPC writer once at
+/// 1075 iovecs for 57 KB, which is why `autumn_rpc::client::write_vectored_chunked`
+/// exists; this is the file-offset twin of it.
+///
+/// Getting it wrong here is worse than a failed write: a count rejection arrives
+/// as an ERROR, not a short write, and the caller answers an error from this path
+/// by marking the DISK bad — so an iovec overflow would be diagnosed as failing
+/// hardware and pull the node into recovery.
+///
+/// Each chunk keeps the `_all` semantics the ENOSPC fix depends on (loop until
+/// every byte lands or a real error surfaces), and the offset advances by exactly
+/// the bytes the previous chunks carried, so the concatenation on disk is
+/// identical to what one giant pwritev would have written.
+async fn write_vectored_all_at_chunked(
+    // `mut` on the BINDING, not the file: the trait method takes `&mut self` and
+    // the impl is on `&File`, so what has to be mutable is the reference.
+    mut f: &CompioFile,
+    bufs: Vec<Bytes>,
+    at: u64,
+) -> std::io::Result<()> {
+    const IOV_MAX: usize = 1024;
+    if bufs.len() <= IOV_MAX {
+        let BufResult(r, _) = f.write_vectored_all_at(bufs, at).await;
+        return r;
+    }
+    let mut rest = bufs;
+    let mut off = at;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        let n: u64 = rest.iter().map(|b| b.len() as u64).sum();
+        let BufResult(r, _) = f.write_vectored_all_at(rest, off).await;
+        r?;
+        off += n;
+        rest = tail;
+    }
+    Ok(())
+}
+
 /// Build the async future that performs ACL + pwritev for a same-extent
 /// APPEND batch. ACL early rejections resolve the future as an immediate
 /// pre-encoded Vec<Bytes> with no I/O.
@@ -2989,7 +3032,7 @@ async fn append_burst_frames(
         // The fd `Rc` (resolved+pinned in the prologue above) is moved into this
         // future; the write runs on it. It survives any concurrent
         // `replace_file` / LRU-evict until our I/O completes.
-        let mut f: &CompioFile = &file_rc;
+        let f: &CompioFile = &file_rc;
         // ENOSPC-1 CORRUPTION FIX: `write_vectored_all_at`, NOT the raw
         // `write_vectored_at`. POSIX pwritev on a nearly-full disk writes
         // what fits and returns the SHORT count — only a zero-fit write
@@ -3001,7 +3044,7 @@ async fn append_burst_frames(
         // zeros). The `_all` form loops until every byte is written or a
         // real error (ENOSPC once nothing fits) surfaces — errors here
         // reject the batch, never ack.
-        let BufResult(wr, _) = f.write_vectored_all_at(bufs, file_start).await;
+        let wr = write_vectored_all_at_chunked(f, bufs, file_start).await;
         if let Err(e) = wr {
             let msg = e.to_string();
             node.mark_disk_error_for_extent(extent_id, &msg);
@@ -4642,7 +4685,8 @@ impl ExtentNode {
     ///          are ready, and streams out responses immediately as they
     ///          finish rather than waiting for a burst boundary.
     ///       2. Flush accumulated `tx_bufs` with ONE `write_vectored_all`
-    ///          syscall (amortises writev across multiple ready completions).
+    ///          syscall (amortises writev across multiple ready completions),
+    ///          segmented at IOV_MAX — `tx_bufs` grows with request COUNT.
     ///       3. Decide what to wait on:
     ///           - `!has_inflight`  → await the read future alone.
     ///           - `at_cap`         → await completion alone (back-pressure:
@@ -4704,10 +4748,12 @@ impl ExtentNode {
             }
 
             // (2) Flush accumulated responses with ONE vectored write.
+            // Segmented at IOV_MAX: `tx_bufs` holds one response per append in
+            // the batch and accumulates across completions, so its length tracks
+            // request COUNT — the axis the kernel rejects on.
             if !tx_bufs.is_empty() {
                 let bufs = std::mem::take(&mut tx_bufs);
-                let BufResult(result, _) = writer.write_vectored_all(bufs).await;
-                result?;
+                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await?;
             }
 
             // (3) Decide what to wait on.
@@ -4782,7 +4828,11 @@ impl ExtentNode {
                             }
                             if !tx_bufs.is_empty() {
                                 let bufs = std::mem::take(&mut tx_bufs);
-                                let _ = writer.write_vectored_all(bufs).await.0;
+                                // Best-effort on the way out, but still segmented:
+                                // the peer is owed as much of the drain as fits.
+                                let _ =
+                                    autumn_rpc::client::write_vectored_chunked(&mut writer, bufs)
+                                        .await;
                             }
                             return Ok(());
                         }

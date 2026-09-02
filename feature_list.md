@@ -21,7 +21,8 @@
   2. **`UcxWriteHalf` 没有 `write_vectored`**（`transport/src/ucx/endpoint.rs:462` 只实现了 `write`）⇒ compio 退化成逐 buffer 发送，一个 256-op 批量在 UCX 上发 259 次。**注意：据此推断"UCX 上会更慢"已被实测否决（+61%）**，所以这不是回归修复而是纯优化；补 `UCP_DATATYPE_IOV` 还能让现有单值 bulk 路径（现在也是 4 次 send）一起受益。
   3. **`MSG_BATCH_GET`(0x54) 现在没有发送方**：SDK 的 `get_many` 已全量改走 bulk 形式，PS 侧 handler 仍在。要么删掉（同 commit 部署，删是安全的），要么明确写清"保留作为回退路径"。留着不表态就是下一个 `must_sync`。
 - **Acceptance**: (1) 批量尾巴走 recv-into-pooled 后，UCX 上批量写吞吐进一步上升且 `PS write-recv bulk engaged` 计数增长；(2) UCX 单次 `writev` 发出整批（可用 ucx 计数器或 strace 佐证），且既有 perf 不退；(3) `MSG_BATCH_GET` 或被删除、或在 `partition_rpc.rs` 里写明保留理由。
-- **Status**: `passes: false` (2026-09-02) — 主体已实现并验收（单测 838 全绿；`put_many_small_values_take_the_batched_bulk_path` 逐字节覆盖写+读两条新路径，含"未命中不占尾巴字节"）。
+- **Status**: `passes: false` (2026-09-02) — 主体已实现并验收（单测全绿；`put_many_small_values_take_the_batched_bulk_path` 逐字节覆盖写+读两条新路径，含"未命中不占尾巴字节"；`get_many_recovers_from_a_stale_epoch_after_a_split` 覆盖 split 后的 epoch 陈旧恢复，已用消融验证撤掉修复即变红）。
+- **已修的一个自引入回归（记下来当教训）**: bulk 回复是**正常的 FLAG_RESPONSE 帧**，状态在 ctrl 的 code 里，不是 FLAG_ERROR ⇒ epoch 陈旧到客户端手里是 `Ok(code=3)` 而非 `Err(PreconditionFailed)`，于是 `get_many` 里那段 refresh+逐键回退**变成死代码**，split/merge 后整组 key 直接报错。修法是在 `call_ps_for_part_pooled` 里把确定性 code 转成 typed error（并同时补上兄弟函数都有的"确定性失败不烧 MAX_PS_REFRESHES 退避"）。**教训：把一条 RPC 从 error-frame 语义换成 code-in-reply 语义时，所有靠 `Err` 分类的上层恢复逻辑都会静默失效。**
 
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。

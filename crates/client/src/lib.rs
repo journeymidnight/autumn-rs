@@ -2252,10 +2252,38 @@ impl ClusterClient {
                         },
                     };
                     match outcome {
-                        Ok(z) => return Ok(z),
+                        // A bulk reply is a normal FLAG_RESPONSE frame, so its
+                        // status arrives in `code` — NOT as an `Err` the routing
+                        // loop can see. Deterministic codes have to be converted
+                        // here or a caller's refresh-and-retry fallback is
+                        // unreachable: `get_many` keys its stale-epoch recovery
+                        // off `PreconditionFailed`, and without this every key in
+                        // the group surfaced an error on any split or merge
+                        // instead of being transparently retried.
+                        Ok(z) => match z.code {
+                            partition_rpc::CODE_PRECONDITION
+                            | partition_rpc::CODE_REGION_EPOCH_STALE => {
+                                // `z.message` is the ctrl read as text, which is
+                                // meaningless when the ctrl is a rkyv struct — so
+                                // say what happened rather than echo bytes.
+                                return Err(AutumnError::PreconditionFailed(
+                                    "region epoch stale".to_string(),
+                                ));
+                            }
+                            _ => return Ok(z),
+                        },
                         Err(e) => {
                             self.ps_conns.borrow_mut().remove(&ps_addr);
-                            last_err = Some(e.to_string());
+                            // Same rule as `call_ps_for_part`: a deterministic
+                            // failure (authz, malformed, misroute-to-nothing)
+                            // must not burn MAX_PS_REFRESHES of backoff before
+                            // the caller sees it.
+                            match rpc_status_to_error(e) {
+                                ae @ (AutumnError::PreconditionFailed(_)
+                                | AutumnError::InvalidArgument(_)
+                                | AutumnError::ValueTooLarge { .. }) => return Err(ae),
+                                ae => last_err = Some(ae.to_string()),
+                            }
                         }
                     }
                 }
