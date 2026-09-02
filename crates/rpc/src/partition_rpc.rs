@@ -131,6 +131,36 @@ pub const MSG_PUT_BULK: u8 = 0x51;
 /// shape as `MSG_PUT`).
 pub const MSG_BATCH_PUT: u8 = 0x53;
 
+/// Batched PUT with the values OUT of the rkyv payload: ctrl carries the keys
+/// and per-op value LENGTHS, the raw frame tail carries the values back to
+/// back. Same shape as `MSG_PUT_BULK`, extended to N ops.
+///
+/// Why this exists next to `MSG_BATCH_PUT`: the bulk/non-bulk choice used to be
+/// made per ITEM (`bulk_worthwhile(value.len())`), so a batch of 256 x 4 KiB
+/// went down the copying path — each value copied out of the caller's `Bytes`,
+/// again into the rkyv frame, and a third time by the PS's full deserialize —
+/// even though the frame it produced was a megabyte, far past the size where
+/// zero-copy pays for itself. The threshold was being applied to the wrong
+/// quantity: what decides whether a transfer is worth sending as its own iovec
+/// is how much data the FRAME carries, and a batch is the thing that makes a
+/// frame big. Measured at the old per-item threshold (same rig, same payload,
+/// the only difference being which side of it the value fell on): zero-copy was
+/// worth +24% write and +51% read throughput.
+///
+/// Selection is therefore on the GROUP's total value bytes: the client uses
+/// this form when a partition's share of a `put_many` reaches
+/// `BULK_MIN_BYTES`, and the inline `MSG_BATCH_PUT` below it.
+///
+/// Integrity: the values ride the raw tail, which the frame CRC does not cover
+/// (transport integrity only) — the same trade `MSG_PUT_BULK` already makes,
+/// and the reason the small-batch form is kept rather than replaced.
+///
+/// Wire: ctrl = rkyv `BatchPutBulkReq`, tail = `ops[0].value ++ ops[1].value
+/// ++ ...`. `sum(value_len)` MUST equal the tail length; the PS rejects the
+/// whole frame otherwise (a mismatch means the two halves disagree about what
+/// was sent, which is not something to guess at).
+pub const MSG_BATCH_PUT_BULK: u8 = 0x5A;
+
 /// Batched GET: N keys on the SAME partition in ONE frame. Symmetric to
 /// `MSG_BATCH_PUT` — values are returned inline in the response (a
 /// rkyv `BatchGetResp { code, statuses, values }`). NotFound is a
@@ -281,6 +311,27 @@ pub struct BatchPutResp {
     /// was batch-level (e.g. wrong part_id / stale epoch). Otherwise
     /// has `req.ops.len()` entries.
     pub statuses: Vec<u8>,
+}
+
+/// One op inside a `BatchPutBulkReq`: everything `BatchPutOp` carries except
+/// the value itself, which lives in the frame's raw tail — `value_len` says
+/// how much of it belongs to this op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutBulkOp {
+    pub key: Vec<u8>,
+    pub value_len: u32,
+    pub expires_at: u64,
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
+/// Ctrl block of `MSG_BATCH_PUT_BULK`. The response is a plain `BatchPutResp`,
+/// identical to the inline form's — only the request side differs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutBulkReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub ops: Vec<BatchPutBulkOp>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -846,6 +897,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_BATCH_PUT_BULK => rkyv_decode::<BatchPutBulkReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_DELETE => rkyv_decode::<DeleteReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -907,7 +961,9 @@ mod msg_type_tests {
             MSG_MERGE_PART,
             MSG_MERGE_FREEZE,
             MSG_GET_BULK,
+            MSG_PUT_BULK,
             MSG_BATCH_PUT,
+            MSG_BATCH_PUT_BULK,
             MSG_BATCH_GET,
             MSG_GET_REDIRECT,
             MSG_GET_REDIRECT_MANY,
@@ -931,6 +987,26 @@ mod msg_type_tests {
         // replay floor. Assert the arm resolves the real part_id.
         let payload = rkyv_encode(&DiagPartitionVpReq { part_id: 4242 });
         assert_eq!(extract_part_id(MSG_DIAG_PARTITION_VP, &payload), 4242);
+    }
+
+    #[test]
+    fn extract_part_id_covers_batch_put_bulk() {
+        // Same regression, and it bit during development: a keyed data RPC with
+        // no arm here resolves to 0, the conn layer compares that against the
+        // partition it serves, and every frame comes back NotFound — the whole
+        // batched write path fails while looking like a routing problem.
+        let payload = rkyv_encode(&BatchPutBulkReq {
+            part_id: 77,
+            region_epoch: 3,
+            ops: vec![BatchPutBulkOp {
+                key: b"k".to_vec(),
+                value_len: 4,
+                expires_at: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+            }],
+        });
+        assert_eq!(extract_part_id(MSG_BATCH_PUT_BULK, &payload), 77);
     }
 }
 

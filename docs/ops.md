@@ -15,6 +15,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
 - [autumn-memory verification](#autumn-memory-verification)
 - [Retrieval-quality eval (`memory-mcp --eval`)](#retrieval-quality-eval-memory-mcp---eval)
+- [A/B-ing a wire-path change](#ab-ing-a-wire-path-change-and-the-three-traps-that-fake-the-answer)
 - [Data-plane authz setup](#data-plane-authz-setup)
 - [CLI cheatsheet](#cli-cheatsheet)
 - [Chaos suites](#chaos-suites)
@@ -1964,6 +1965,64 @@ registry): any wire-schema edit fails `cargo test -p autumn-rpc` until you
 record the new fingerprint and consciously decide MIN/MAX. Rolling back a
 binary past a `cluster_version` bump is refused at manager startup
 (fail-closed in replay).
+
+## A/B-ing a wire-path change (and the three traps that fake the answer)
+
+A change that only moves bytes around — zero-copy vs copy, inline vs iovec —
+cannot be judged from one number. The recipe that produced the
+`MSG_BATCH_PUT_BULK` decision:
+
+```bash
+# Two binaries differing ONLY in the branch under test, against ONE cluster.
+cargo build --release -p autumn-server                      # variant A (new path)
+cp target/release/autumn-client /tmp/ac-new
+# edit the selection to force the old path, rebuild, snapshot as /tmp/ac-old
+# (for UCX add --features autumn-server/ucx to BOTH builds)
+
+AUTUMN_DATA_ROOT=/data08/autumn-bulk AUTUMN_EXTENT_BASE_PORT=20000 \
+  AUTUMN_EXTENT_SHARDS=8 ./cluster.sh reset 1
+/tmp/ac-new ... perf-check --bulk 64 --size 32768     # WARMUP, discard
+/tmp/ac-old ... perf-check --bulk 64 --size 32768     # alternate, 2+ samples each
+/tmp/ac-new ... perf-check --bulk 64 --size 32768
+```
+
+**Trap 1 — the first run after `cluster.sh reset` is garbage.** Observed 42
+ops/s and 5.33 MB/s on runs that repeated at 25 688 ops/s and 447 MB/s moments
+later. Always warm up and discard; never compare a post-reset run against a warm
+one.
+
+**Trap 2 — pick an operating point where the resource under test is the
+bottleneck.** 4 KiB batch writes sit on the single-partition ~30k ops/s ceiling
+(that ceiling was measured at 64-byte values, so it is op-bound, not byte-bound):
+zero-copy measured 103.7 vs 103.8 MB/s there — a true null that says nothing
+about copies. The same change is +16% at 32 KiB. Before believing a null result,
+check ops/s against the known ceiling.
+
+**Trap 3 — loopback TCP is the transport where zero-copy matters least.** The
+same change is ~+61% over RoCE at 4 KiB, the size where TCP showed nothing. To
+get real RDMA on ONE host, bind a RoCE NIC IP — `rc` loops back inside the HCA:
+
+```bash
+AUTUMN_BIND_HOST="[fdbd:dc62:3:300::14]" AUTUMN_TRANSPORT=ucx \
+  UCX_NET_DEVICES=mlx5_2:1 ./cluster.sh reset 1      # derives rc_mlx5,ud_mlx5,tcp,self
+# client must carry the SAME UCX_TLS + UCX_NET_DEVICES and the RoCE manager addr
+```
+
+Do NOT reach for `UCX_TLS=posix,cma,tcp,self` to get UCX on 127.0.0.1: it is the
+legacy escape hatch, `cluster.sh` warns that ≥64 KiB transfers are known-broken
+there, and a batched frame is ≥64 KiB by construction — both arms of the A/B
+land in the broken region and the numbers mean nothing. `mlx5_2` is the storage
+NIC here; `mlx5_1` is the GPU's, so pinning `mlx5_2:1` also keeps the bench off
+the tenant's card.
+
+Byte correctness is a separate question from throughput, and `perf-check` does
+not check it — it never compares what it read against what it wrote. Cover a new
+write path with an ignored system test that reads every value back:
+
+```bash
+cargo test -p autumn-manager --test system_putstream -- --ignored put_many
+#   → put_many_small_values_take_the_batched_bulk_path ... ok
+```
 
 ## Test matrix
 

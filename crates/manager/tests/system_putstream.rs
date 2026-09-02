@@ -398,6 +398,61 @@ fn put_many_mixed_sizes() {
     });
 }
 
+/// `put_many` where the values are individually small but ADD UP past the bulk
+/// threshold — the `MSG_BATCH_PUT_BULK` path, where every value is a slice of
+/// one raw frame tail rather than a field inside the rkyv payload.
+///
+/// Each value gets distinct content and a distinct length, so an off-by-one in
+/// the PS-side cursor (`off += len` walking the tail) shows up as one key
+/// returning its neighbour's bytes rather than as an error. Lengths vary on
+/// purpose: with uniform lengths a cursor bug that skipped or double-counted
+/// would still land on a value boundary and read as correct.
+#[test]
+#[ignore]
+fn put_many_small_values_take_the_batched_bulk_path() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 123, 12301).await;
+
+        // 64 values, none of them bulk on its own (max 8 KiB < 64 KiB), but
+        // ~330 KiB together — comfortably over the threshold the group is now
+        // measured against.
+        const N: usize = 64;
+        let keys: Vec<Vec<u8>> = (0..N).map(|i| format!("bb-{i:03}").into_bytes()).collect();
+        let values: Vec<bytes::Bytes> = (0..N)
+            .map(|i| {
+                let len = 4096 + i * 64; // distinct length per op
+                bytes::Bytes::from(vec![(i % 251) as u8 + 1; len]) // distinct content
+            })
+            .collect();
+        let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+            .iter()
+            .zip(&values)
+            .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+            .collect();
+
+        for (i, r) in cluster.put_many(&items).await.into_iter().enumerate() {
+            assert!(r.is_ok(), "put {i}: {r:?}");
+        }
+        for (i, (k, v)) in keys.iter().zip(&values).enumerate() {
+            assert_eq!(
+                cluster.get(k).await.unwrap().as_deref(),
+                Some(v.as_ref()),
+                "value {i} came back wrong — check the tail cursor"
+            );
+        }
+    });
+}
+
 /// `head_many` + `delete_many` batched fan-out. `head_many` over present +
 /// absent keys returns correct `found`/`value_length`; `delete_many` removes the
 /// present keys (verified gone via `get`).

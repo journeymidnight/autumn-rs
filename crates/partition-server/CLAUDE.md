@@ -352,7 +352,20 @@ reserved).
 ### `MSG_BATCH_PUT` (0x53) — server-batched Put
 
 One frame carries `BatchPutReq { part_id, region_epoch,
-ops: Vec<BatchPutOp{key, value, expires_at}> }`. The SDK
+ops: Vec<BatchPutOp{key, value, expires_at}> }`, values INLINE in the rkyv
+payload. Its zero-copy twin `MSG_BATCH_PUT_BULK` (0x5A) carries the same keys
+plus per-op `value_len` in ctrl and the values themselves in the frame's raw
+tail; `enqueue_batch_put_bulk` hands each op a `Bytes` SLICE of that tail
+straight to `WriteOp::Put`. The client picks between them on the GROUP's total
+value bytes (`bulk_worthwhile(sum)`), not on each item's — a batch of 256 x 4 KiB
+is a megabyte on the wire however small each item looks, and the inline form
+copies every one of those bytes three times on the client and up to three times
+again on this side (`extract_part_id`, Layer-A and the enqueue each fully
+deserialize the frame). Measured against the inline form: +16% write throughput
+at 32 KiB values over loopback TCP and ~+61% at 4 KiB over RoCE. At 4 KiB over
+loopback TCP the two are identical, because that point sits on the
+single-partition ~30k ops/s ceiling where no byte-side saving can show — pick
+the operating point before concluding anything from a batch-write benchmark. The SDK
 (`ClusterClient::batch_put`) groups items by owning partition and emits one frame
 per partition. Server side (`enqueue_batch_put`):
 1. Decode the frame ONCE on the ps-conn task.

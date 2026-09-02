@@ -1819,6 +1819,45 @@ impl ClusterClient {
     /// PS connection (the post-`kill -9`-then-restart window) without
     /// waiting the full 30 s `rpc_timeout`. See
     /// `first_attempt_effective_timeout`.
+    /// `ps_call_with_timeout` for a value-separable request whose tail is made
+    /// of N buffers (`MSG_BATCH_PUT_BULK`).
+    ///
+    /// The timeout is on awaiting the RESPONSE, not on the send: it never
+    /// abandons a frame mid-`writev`, it gives up on a reply that is not
+    /// coming. The inline batch this replaces went through
+    /// `ps_call_with_timeout`, so without one here every batch big enough to
+    /// take the bulk path would have silently traded a bounded wait for an
+    /// unbounded one — and the bound exists for a specific case: a PS killed
+    /// with `kill -9` leaves connections that accept writes and never answer.
+    pub async fn ps_call_bulk_multi(
+        &self,
+        ps_addr: &str,
+        msg_type: u8,
+        ctrl: Bytes,
+        values: Vec<Bytes>,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
+        let client = self.get_ps_client(ps_addr).await?;
+        let call = client.call_vectored_bulk_multi(msg_type, vec![ctrl], values);
+        let outcome = match timeout {
+            None => call.await,
+            Some(t) => match compio::time::timeout(t, call).await {
+                Ok(r) => r,
+                Err(_) => Err(autumn_rpc::RpcError::Status {
+                    code: autumn_rpc::StatusCode::Unavailable,
+                    message: format!("MSG_BATCH_PUT_BULK timed out after {t:?}"),
+                }),
+            },
+        };
+        match outcome {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                self.ps_conns.borrow_mut().remove(ps_addr);
+                Err(anyhow::Error::new(rpc_status_to_error(e)))
+            }
+        }
+    }
+
     pub async fn ps_call_with_timeout(
         &self,
         ps_addr: &str,
@@ -2129,6 +2168,57 @@ impl ClusterClient {
     /// window — e.g. `compact <new_part_id>` issued immediately
     /// after split can land while the new partition's part_addr
     /// isn't registered yet.
+    /// `call_ps_for_part` for a multi-value bulk request. Same routing,
+    /// refresh and deterministic-error rules; the only difference is that the
+    /// values travel as their own iovecs instead of inside `payload`. Not
+    /// admin-gated — `MSG_BATCH_PUT_BULK` is a data-plane write, so there is no
+    /// admin-token prefix to apply.
+    async fn call_ps_for_part_bulk(
+        &self,
+        part_id: u64,
+        msg_type: u8,
+        ctrl: Bytes,
+        values: Vec<Bytes>,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        debug_assert!(!autumn_rpc::partition_rpc::is_admin_ps_msg(msg_type));
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let ps_addr = self
+                .resolve_part_id(part_id)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            // Same fast-fail-on-attempt-0 bound the inline batch path uses.
+            let t = self.first_attempt_effective_timeout(attempt);
+            match self
+                .ps_call_bulk_multi(&ps_addr, msg_type, ctrl.clone(), values.clone(), t)
+                .await
+            {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    match e.downcast::<AutumnError>() {
+                        Ok(
+                            ae @ (AutumnError::PreconditionFailed(_)
+                            | AutumnError::InvalidArgument(_)
+                            | AutumnError::ValueTooLarge { .. }),
+                        ) => {
+                            return Err(ae);
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
+                    if !self.refresh_and_backoff(&mut attempt).await {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(AutumnError::ConnectionError(format!(
+            "ps_call_bulk(part {part_id}) after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+
     async fn call_ps_for_part(
         &self,
         part_id: u64,
@@ -3332,25 +3422,61 @@ impl ClusterClient {
         }
         for (part_id, group) in groups {
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let ops: Vec<partition_rpc::BatchPutOp> = group
-                .iter()
-                .map(|(_, k, v, ttl)| partition_rpc::BatchPutOp {
-                    inode_hint: lease.inode_hint,
-                    lease_epoch: lease.lease_epoch,
-                    key: k.clone(),
-                    value: v.to_vec(),
-                    expires_at: *ttl,
-                })
-                .collect();
-            let payload = rkyv_encode(&partition_rpc::BatchPutReq {
-                part_id,
-                region_epoch,
-                ops,
-            });
-            let resp_bytes = match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload)
+            // Bulk on the GROUP's total value bytes, not on each item's.
+            // `bulk_worthwhile` answers "is this transfer big enough that
+            // sending it as its own iovec beats the per-op framing cost", and
+            // for a batch the transfer is the whole frame — 256 x 4 KiB is a
+            // megabyte on the wire however small each item looks. Deciding per
+            // item sent every batch of small values down the copying path no
+            // matter how much it added up to.
+            let group_bytes: usize = group.iter().map(|(_, _, v, _)| v.len()).sum();
+            let call = if bulk_worthwhile(group_bytes) {
+                let ops: Vec<partition_rpc::BatchPutBulkOp> = group
+                    .iter()
+                    .map(|(_, k, v, ttl)| partition_rpc::BatchPutBulkOp {
+                        inode_hint: lease.inode_hint,
+                        lease_epoch: lease.lease_epoch,
+                        key: k.clone(),
+                        value_len: v.len() as u32,
+                        expires_at: *ttl,
+                    })
+                    .collect();
+                let ctrl = rkyv_encode(&partition_rpc::BatchPutBulkReq {
+                    part_id,
+                    region_epoch,
+                    ops,
+                });
+                // `clone` on a `Bytes` is a refcount bump: the values reach
+                // `writev` as the caller's own buffers, never copied.
+                let values: Vec<bytes::Bytes> =
+                    group.iter().map(|(_, _, v, _)| v.clone()).collect();
+                self.call_ps_for_part_bulk(
+                    part_id,
+                    partition_rpc::MSG_BATCH_PUT_BULK,
+                    ctrl,
+                    values,
+                )
                 .await
-            {
+            } else {
+                let ops: Vec<partition_rpc::BatchPutOp> = group
+                    .iter()
+                    .map(|(_, k, v, ttl)| partition_rpc::BatchPutOp {
+                        inode_hint: lease.inode_hint,
+                        lease_epoch: lease.lease_epoch,
+                        key: k.clone(),
+                        value: v.to_vec(),
+                        expires_at: *ttl,
+                    })
+                    .collect();
+                let payload = rkyv_encode(&partition_rpc::BatchPutReq {
+                    part_id,
+                    region_epoch,
+                    ops,
+                });
+                self.call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload)
+                    .await
+            };
+            let resp_bytes = match call {
                 Ok(b) => b,
                 Err(AutumnError::PreconditionFailed(_)) => {
                     // Stale region_epoch: server returns FailedPrecondition

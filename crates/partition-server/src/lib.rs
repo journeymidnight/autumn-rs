@@ -7106,10 +7106,11 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
-            partition_rpc::MSG_BATCH_PUT => {
+            partition_rpc::MSG_BATCH_PUT | partition_rpc::MSG_BATCH_PUT_BULK => {
                 // Reject the whole batch with CODE_UNAVAILABLE — client
                 // refreshes routing + retries each per-op (or the whole
-                // batch).
+                // batch). Both batch forms answer with the same `BatchPutResp`,
+                // so one arm covers them.
                 let resp = partition_rpc::BatchPutResp {
                     code: CODE_UNAVAILABLE,
                     message: "partition frozen for merge — refresh routing and retry"
@@ -7179,6 +7180,17 @@ async fn handle_incoming_req(
         partition_rpc::MSG_BATCH_PUT => {
             let p = part.borrow();
             enqueue_batch_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        partition_rpc::MSG_BATCH_PUT_BULK => {
+            let p = part.borrow();
+            enqueue_batch_put_bulk(
                 req,
                 pending,
                 part_region_epoch,
@@ -7600,6 +7612,128 @@ fn enqueue_batch_put(
             op: WriteOp::Put {
                 user_key: Bytes::from(op.key),
                 value: Bytes::from(op.value),
+                expires_at: op.expires_at,
+            },
+            resp: WriteResponder::BatchPut {
+                accum: Rc::clone(&accum),
+                idx: i,
+            },
+        });
+    }
+}
+
+/// `MSG_BATCH_PUT_BULK` enqueue — the zero-copy batch. Identical admission and
+/// accumulator behaviour to `enqueue_batch_put`; the only difference is where
+/// the values come from. `req.payload` is the rkyv ctrl and `req.bulk_value` is
+/// the raw tail holding every value back to back, so each op's value is a
+/// `Bytes` SLICE of that tail — a refcount bump, not a copy. The inline form
+/// pays a full deserialize here, which allocates and copies a `Vec` per value.
+///
+/// `sum(value_len)` must equal the tail length. A mismatch means ctrl and tail
+/// disagree about what was sent; there is no safe way to guess which is right,
+/// so the whole frame is refused.
+fn enqueue_batch_put_bulk(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    part_rg: Option<&Range>,
+) {
+    let batch =
+        match partition_rpc::rkyv_decode::<partition_rpc::BatchPutBulkReq>(&req.payload) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+                return;
+            }
+        };
+    if batch.region_epoch != 0 && batch.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, batch.region_epoch
+            ),
+        )));
+        return;
+    }
+    let values = req.bulk_value.unwrap_or_default();
+    let declared: u64 = batch.ops.iter().map(|op| op.value_len as u64).sum();
+    if declared != values.len() as u64 {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::InvalidArgument,
+            format!(
+                "batch bulk tail is {} bytes but ops declare {declared}",
+                values.len()
+            ),
+        )));
+        return;
+    }
+    // Whole-batch rejection on an oversized op, exactly as the inline form
+    // does — mixing inline and streamed writes in one batch is not supported.
+    for op in &batch.ops {
+        if op.value_len as usize > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+            let _ = req.resp_tx.send(Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "batch op value {} bytes exceeds inline cap {} — use per-op PutStream",
+                    op.value_len, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+                ),
+            )));
+            return;
+        }
+    }
+    let n = batch.ops.len();
+    if n == 0 {
+        let resp = partition_rpc::BatchPutResp {
+            code: CODE_OK,
+            message: String::new(),
+            statuses: Vec::new(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let accum = BatchPutAccumulator::new(req.resp_tx, n);
+    let mut off = 0usize;
+    for (i, op) in batch.ops.into_iter().enumerate() {
+        // Slice before any early `continue`, so a skipped op still advances the
+        // cursor — otherwise one rejected op would shift every value after it.
+        let len = op.value_len as usize;
+        let value = values.slice(off..off + len);
+        off += len;
+        if let Some(rg) = part_rg {
+            if !in_range(rg, &op.key) {
+                accum.record(i, 2);
+                continue;
+            }
+        }
+        if let Some(floors_cell) = fence_floors {
+            let bump = {
+                let mut floors = floors_cell.borrow_mut();
+                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
+            };
+            match bump {
+                Err(_msg) => {
+                    accum.record(i, CODE_FENCED);
+                    continue;
+                }
+                Ok(true) => {
+                    pending.push(WriteRequest {
+                        op: WriteOp::FenceBump {
+                            ino: op.inode_hint,
+                            epoch: op.lease_epoch,
+                        },
+                        resp: WriteResponder::Fence,
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        pending.push(WriteRequest {
+            op: WriteOp::Put {
+                user_key: Bytes::from(op.key),
+                value,
                 expires_at: op.expires_at,
             },
             resp: WriteResponder::BatchPut {

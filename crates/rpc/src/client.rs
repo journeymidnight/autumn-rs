@@ -398,6 +398,47 @@ impl RpcClient {
     /// its own iovec and is NEVER crc-scanned by the sender — value integrity
     /// is the transport's + the storage layer's. Wire:
     /// `[head][ctrl parts…][crc][value]`.
+    /// `call_vectored_bulk` with N value buffers instead of one. The frame is
+    /// unchanged — its header carries a single tail LENGTH, and that length is
+    /// the sum — but the buffers stay separate all the way into `writev`, so
+    /// nothing is concatenated to send them. Sending N values used to require
+    /// copying them into one contiguous buffer first, which is exactly the copy
+    /// a bulk transfer exists to avoid; the writer already took a `Vec<Bytes>`,
+    /// so only this entry point was missing. The receiver splits the tail using
+    /// lengths the caller put in `ctrl_parts`.
+    pub async fn call_vectored_bulk_multi(
+        &self,
+        msg_type: u8,
+        ctrl_parts: Vec<Bytes>,
+        values: Vec<Bytes>,
+    ) -> Result<Bytes, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
+        let value_len: usize = values.iter().map(|v| v.len()).sum();
+        let head =
+            crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, value_len);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+
+        let crc = crate::frame::compute_ctrl_crc(&head, &ctrl_parts);
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(3 + ctrl_parts.len() + values.len());
+        bufs.push(Bytes::copy_from_slice(&head));
+        bufs.extend(ctrl_parts);
+        bufs.push(Bytes::copy_from_slice(&crc));
+        bufs.extend(values);
+
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+
+        Self::await_response(rx).await
+    }
+
     pub async fn call_vectored_bulk(
         &self,
         msg_type: u8,

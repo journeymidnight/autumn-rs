@@ -19,7 +19,8 @@ use autumn_rpc::cap_token::{verify_token, AuthReject};
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
-    HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT, MSG_DELETE, MSG_GET,
+    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT,
+    MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
     MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
@@ -384,6 +385,18 @@ pub fn authz_check(
             }
             None
         }
+        // The zero-copy batch carries its keys in ctrl exactly like the inline
+        // form; only the values moved to the frame tail, and authz never looked
+        // at values. `payload` here is the ctrl block.
+        MSG_BATCH_PUT_BULK => {
+            let r = partition_rpc::rkyv_decode::<BatchPutBulkReq>(payload).ok()?;
+            for op in &r.ops {
+                if let Some(d) = check_key(&op.key, principal, inner, now) {
+                    return Some(d);
+                }
+            }
+            None
+        }
         // Catch-all = ADMIT ungated. Correct ONLY for non-key-scoped ops
         // (maintenance / split / merge / discards / diag) and AUTH_HELLO (bound
         // by the connection loop). A new KEYED data RPC landing here is an authz
@@ -455,6 +468,15 @@ pub fn check_layer_a(
         }
         MSG_BATCH_PUT => {
             let r = partition_rpc::rkyv_decode::<BatchPutReq>(payload).ok()?;
+            for op in &r.ops {
+                if !in_a_namespace(&op.key, &inner.namespaces) {
+                    return reject(&op.key);
+                }
+            }
+            None
+        }
+        MSG_BATCH_PUT_BULK => {
+            let r = partition_rpc::rkyv_decode::<BatchPutBulkReq>(payload).ok()?;
             for op in &r.ops {
                 if !in_a_namespace(&op.key, &inner.namespaces) {
                     return reject(&op.key);
@@ -755,6 +777,31 @@ mod tests {
         // A raw key with no `{ns}/` structure is rejected too.
         let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
+    }
+
+    #[test]
+    fn layer_a_batch_put_bulk_is_gated_like_the_inline_form() {
+        // The msg_type match in `check_layer_a` ends in `_ => None`, which
+        // means "not a put-class op, nothing to enforce" — so a keyed write
+        // that nobody adds an arm for is admitted with its namespace never
+        // checked. This test is what makes adding one non-optional.
+        let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
+        let mk = |k2: &[u8]| {
+            rkyv_encode(&partition_rpc::BatchPutBulkReq {
+                part_id: 1,
+                region_epoch: 0,
+                ops: vec![
+                    partition_rpc::BatchPutBulkOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/1".to_vec(), value_len: 4, expires_at: 0 },
+                    partition_rpc::BatchPutBulkOp { inode_hint: 0, lease_epoch: 0, key: k2.to_vec(), value_len: 4, expires_at: 0 },
+                ],
+            })
+            .to_vec()
+        };
+        assert!(check_layer_a(MSG_BATCH_PUT_BULK, &mk(b"kvc/2"), &inner).is_none());
+        assert!(matches!(
+            check_layer_a(MSG_BATCH_PUT_BULK, &mk(b"scratch/2"), &inner),
+            Some((StatusCode::NamespaceUnknown, _))
+        ));
     }
 
     #[test]

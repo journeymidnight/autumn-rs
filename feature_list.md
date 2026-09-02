@@ -14,22 +14,25 @@
 
 ## Active
 
-### F-BATCHPUT-ZC — `MSG_BATCH_PUT` 的值走零拷贝（已测量，判定暂不做；含可无 wire 变更拿到的子集）
-- **Trigger** (2026-09-02, 用户: "MSG_BATCH_PUT 应当默认是 bulk 的"): `MSG_PUT_BULK`(≥64 KiB) 的 value 是**零拷贝**（客户端从 `Bytes` 直接当 iovec 发，PS 从 frame 切片），而 `MSG_BATCH_PUT`(<64 KiB) 的 value 要拷 **三次**：客户端 `v.to_vec()` ①、rkyv 编码进帧 ②、PS 侧 `rkyv_decode::<BatchPutReq>` 是完整反序列化而非 archived 借用 ③。拷贝成本随 value 线性涨、却一直涨到 64 KiB 阈值才突然归零 —— 断崖方向是反的。frame 层本就支持（`request_zc(ctrl, value)`：ctrl 走 CRC、value 是裸尾巴），做法是把 N 个 value 拼进那条尾巴、长度写进 ctrl，不需要新帧概念。
-- **实测（2026-09-02，单节点 RF=1 / 8 分区 / 16 线程 × depth 8 / cpuset 隔离 / /data08）**:
+### F-BATCH-ZC — 批量 RPC 的值走零拷贝（写侧已实现并验收；读侧 + 两项加固待做）
+- **Trigger** (2026-09-02, 用户: "如何 BATCH 凑出了超过 64K，明显用 bulk 更快，但是现在没有这个能力"): bulk 判据加在**单条 value** 上（`bulk_worthwhile(v.len())`），所以 256×4 KiB 的批量哪怕在线上是 1 MiB 的一帧也走拷贝路径。判据加错了量——决定一次传输值不值得独占 iovec 的是**帧**有多大，而把帧撑大的正是批量。
+- **写侧已实现（wire v31）**: `MSG_BATCH_PUT_BULK`(0x5A)，ctrl 带 key + `value_len`，N 条 value 走 frame 裸尾巴；选择改按**分组总字节**。帧格式没动（`value_len` 本就是尾巴总长，切点写在 ctrl 里）。`call_vectored_bulk_multi` 收 `Vec<Bytes>`（writev 本来就吃 Vec）。PS 侧 `enqueue_batch_put_bulk` 从尾巴切 `Bytes` 直喂 `WriteOp::Put`（下游本就收 `Bytes`）。authz 两层都加了 arm（catch-all 是放行，漏加即绕过）。
+- **实测（同集群、两个只差一行的客户端二进制交替取样）**:
 
-  | value | 端到端 ops/s | MB/s | 三次拷贝 µs/op | 拷贝 CPU(折 1 核) | 其中 PS decode |
-  |---|---|---|---|---|---|
-  | 4 KiB | 27152 | 106 | 4.6 | 12% | 1.6% |
-  | 32 KiB | 13726 | 429 | 34.9 | 48% | 8% |
-  | 64 KiB−1 | 7002 | 438 | 84.9 | 59% | 9% |
+  | 传输 / 值 | inline | zerocopy | Δ |
+  |---|---|---|---|
+  | TCP loopback 4 KiB | 103.8 | 103.7 | 0%（op 绑定区间，见下） |
+  | TCP loopback 32 KiB | 450.6 | 523.1 | **+16%** |
+  | RoCE(rc_mlx5) 4 KiB | 57.9（47.2/68.5 抖动) | 93.3（93.26/93.43 稳） | **约 +61%** |
 
-  拷贝分解（256 op/批）：4K = to_vec 0.625ms + encode 0.409 + decode 0.153；32K = 3.736 + 3.708 + 1.487；64K−1 = 4.677 + **13.797** + 3.267（encode 在 64K 超线性跳变，疑似 rkyv 缓冲扩容）。
-- **判定：暂不做（用户 2026-09-02 提出，主 agent 测后判定）**。理由是**吞吐从 32 KiB 起平在 430~440 MB/s 不动**（32K 429 / 64K 438）⇒ 该路径是带宽/IO 绑定而非 CPU 绑定，去掉拷贝**不抬高天花板**，不值得再付一次 wire 变更（v31 + 全停全启）。
-- **什么条件下翻案（写清楚免得重测）**: autumn 客户端是**单线程 compio**；bench 把客户端两次拷贝摊到 16 线程所以每线程仅 2.5%，但一个**独自**跑到 430 MB/s 的单线程写者要为此吃掉整颗核的 ~40%。一旦出现"单个客户端进程成为写瓶颈"的负载（今天没有：memory-mcp ingest 是往返绑定、fuse 走 ≥64 KiB 的 bulk 路），本条立刻从"不值得"翻成"必须做"。
-- **可先做的子集（不需要任何 wire 变更）**: 只消掉拷贝 ③ —— PS 侧把 `rkyv_decode::<BatchPutReq>`（完整反序列化）换成 archived 借用，值以 frame 背后的 `Bytes` 切片交给下游。省 PS 一颗核的 8~9%。**前置确认**：`WriteRequest` 及其下游（memtable / log_stream append）能否持 frame-backed `Bytes` 而非 `Vec`（`MSG_PUT_BULK` 已经这么做，链路大概率通）。
-- **Acceptance（真要做时）**: 32 KiB 与 64 KiB−1 两档的端到端 ops/s 相对上表**显著上升**（不是只在微基准里省了 CPU）；`--bulk 256` 路径字节精确；wire 版本与指纹按纪律登记。
-- **Status**: `passes: false` (2026-09-02) — 已测量、判定暂不做。
+  4 KiB/TCP 的 0% 是**测量区间**不是无效：103.8 MB/s ÷ 4 KiB ≈ 26.5K ops/s，正压在单分区 ~30K ops/s 的 op 天花板上（该天花板是用 64 字节值测的，与拷贝无关）。
+- **推翻的两个先前判断（都写下来免得再犯）**: ①「带宽绑定，去掉拷贝抬不动天花板」——错，选错了操作点也选错了传输；②「批量已经摊薄了 bulk 的收益」——错，inline 批量对**逐字节**拷贝一点没摊薄，而且 `extract_part_id` 为读一个 `part_id` 就把整帧完整反序列化、`check_layer_a` 再来一遍，一个 256-op 帧多约 1500 次分配。
+- **仍待做**:
+  1. **读侧 `MSG_BATCH_GET_BULK`**：`get_many` 的值 inline 在 rkyv 响应里（PS 侧 `v.to_vec()` + 两次 `rkyv_encode` + `Frame::encode` 再拷一遍并**把 value 也纳入 CRC 扫描**，客户端解码再拷两次），而零拷贝的 `MSG_GET_BULK` 只有逐条版 ⇒ 批量与零拷贝同样互斥。逐条 A/B 显示读侧收益（+50.6%）**大于**写侧（+23.8%），且读没有 fsync 天花板。顺带能修一个真缺陷：`MSG_BATCH_GET` **不在 serve-local 名单里**，它绕进 `partition_loop`，批量读会阻塞 group-commit actor（`client/src/lib.rs` 里 `get_many` 的文档注释声称"reads never go through partition_loop"，是错的）。需要两处结构改动：连接完成类型 `(Bytes, Option<Bytes>)` 要扩成 `Vec<Bytes>`；`lib.rs` 连接 flush 的 `write_vectored_all` **没有 IOV_MAX 分段**（既有潜在问题，N 值响应会把它变成真问题）。
+  2. **F4 加固**：`drain_bulk_writes` 只认 `MSG_PUT_BULK`，所以批量的尾巴拿不到 recv-into-pooled 快路（UCX 上没有注册内存 RDMA 收），批量路径天花板结构性低于逐条 bulk。
+  3. **F5 已实测否决，但根因还在**：`UcxWriteHalf` 只实现 `write` 没实现 `write_vectored`（`transport/src/ucx/endpoint.rs:462`），compio 退化成逐 buffer 发送。审计据此推断 UCX 上小值批量可能更慢；**实测相反（+61%）**，所以不改。但补 `UCP_DATATYPE_IOV` 仍是干净的优化，且能让既有的单值 bulk 路径（现在也是 4 次 send）受益。
+- **Acceptance（读侧）**: 32 KiB 与 4 KiB 两档读吞吐相对 inline 显著上升；`get_many` 逐字节正确（每 key 内容与长度都不同，能抓出游标错位）；批量读不再占用 `partition_loop`。
+- **Status**: `passes: false` (2026-09-02) — 写侧已实现、已验收（单测 837 全绿 + `put_many_small_values_take_the_batched_bulk_path` 逐字节 e2e），读侧与两项加固未做。
 
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。

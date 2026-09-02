@@ -131,10 +131,16 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
 - `put_many(items: &[(key, Bytes, expires_at)]) → Vec<Result<()>>` — **public batched
   write.** Third tuple field is `expires_at` (Unix-epoch seconds; `0` = no TTL); convert
   a relative TTL with `ClusterClient::ttl_to_expires_at(ttl_secs)`. SDK groups by owning
-  partition: values < 64 KiB → one `MSG_BATCH_PUT` per partition (server decodes one
-  frame, atomically injects all ops into `partition_loop.pending`); values ≥ 64 KiB →
-  per-op `MSG_PUT_BULK` fanned out CONCURRENTLY via
-  `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)`. Result `i` matches `items[i]`.
+  partition. An item ≥ 64 KiB leaves the batch entirely and goes per-op
+  `MSG_PUT_BULK`, fanned out CONCURRENTLY via
+  `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)`. What remains is sent as ONE frame
+  per partition, and which frame depends on the GROUP's total value bytes, not on any
+  single item's: ≥ 64 KiB → `MSG_BATCH_PUT_BULK` (keys and `value_len`s in ctrl, the
+  values as their own iovecs in the raw tail — `Bytes::clone` is a refcount bump, so no
+  value byte is copied on the way to `writev`); below that → `MSG_BATCH_PUT` with the
+  values inline in the rkyv payload, which keeps them under the frame CRC. The
+  threshold is on the sum because what earns a transfer its own iovec is how much the
+  FRAME carries, and batching is what makes a frame big. Result `i` matches `items[i]`.
 - `put_many_fenced(items, lease: WriteLease) → Vec<Result<()>>` — lease-fenced
   `put_many`: every item stamped with the SAME `(inode_hint, lease_epoch)` (one inode's
   flush). A fenced item returns `AutumnError::Fenced` in its result slot.

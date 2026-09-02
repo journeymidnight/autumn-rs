@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 30;
-pub const WIRE_VERSION_MAX: u32 = 30;
+pub const WIRE_VERSION_MIN: u32 = 31;
+pub const WIRE_VERSION_MAX: u32 = 31;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -474,6 +474,19 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // shifts the layout, so this is a same-commit deploy like every other
     // schema change here. Pre-R3: MIN=MAX=30.
     (30, "d3b49bd995789e83"),
+    // v31: `MSG_BATCH_PUT_BULK` (0x5A) + `BatchPutBulkReq`/`BatchPutBulkOp` —
+    // a batched PUT whose values ride the frame's raw tail as their own iovecs
+    // instead of being copied into the rkyv payload. The bulk decision moved
+    // from the ITEM's size to the GROUP's total, because what makes a transfer
+    // worth its own iovec is how much the FRAME carries and a batch is what
+    // makes a frame big. Measured against the inline form on the same rig:
+    // +16% write throughput at 32 KiB values over loopback TCP, and ~+61% at
+    // 4 KiB values over RoCE (rc_mlx5) — the transport that matters, where the
+    // inline path also swung 47-68 MB/s run to run while the bulk path held
+    // 93.3. At 4 KiB over loopback TCP the two are identical, because that
+    // operating point sits on the single-partition ~30k ops/s ceiling where no
+    // byte-side saving can show. Pre-R3: MIN=MAX=31.
+    (31, "564167951e81d407"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
