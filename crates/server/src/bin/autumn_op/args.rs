@@ -14,6 +14,8 @@ fn usage() -> ! {
     eprintln!("  --credential-file F: data-plane capability (`<principal>\\n<hex>`), for the admin");
     eprintln!("    subcommands that read/write partition keys rather than only calling the manager");
     eprintln!("    (e.g. `presplit --namespace fs`, which reads the declared stripe geometry).");
+    eprintln!("    Both --admin-token[-file] and --credential-file may appear BEFORE or AFTER");
+    eprintln!("    the subcommand — position does not matter.");
     eprintln!("    The admin token does NOT satisfy the partition server; when authz is on it");
     eprintln!("    protects every key, so those commands need this too.");
     eprintln!();
@@ -477,6 +479,63 @@ pub(crate) enum Command {
     PrincipalList,
 }
 
+/// Find `--admin-token[-file]` and `--credential-file` anywhere in argv.
+///
+/// Position-independence is the point — see the comment at the call site.
+/// Values are consumed positionally, and the value of any OTHER flag is skipped,
+/// so `--principal --admin-token` cannot be misread as the token flag. The last
+/// occurrence wins, matching what the per-subcommand loops already do.
+fn prescan_secret_flags(raw: &[String]) -> (Option<String>, Option<(String, Vec<u8>)>) {
+    let mut token: Option<String> = None;
+    let mut cred: Option<(String, Vec<u8>)> = None;
+    let mut k = 1usize;
+    while k < raw.len() {
+        match raw[k].as_str() {
+            "--admin-token" if k + 1 < raw.len() => {
+                token = Some(raw[k + 1].clone());
+                k += 2;
+            }
+            "--admin-token-file" if k + 1 < raw.len() => {
+                token = Some(read_secret_file(&raw[k + 1]));
+                k += 2;
+            }
+            "--credential-file" if k + 1 < raw.len() => {
+                let path = &raw[k + 1];
+                match autumn_client::read_credential_file(path) {
+                    Ok((principal, secret)) if !principal.is_empty() => {
+                        cred = Some((principal, secret));
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "--credential-file {path}: missing principal name (expected '<principal>\n<hex>')"
+                        );
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        std::process::exit(2);
+                    }
+                }
+                k += 2;
+            }
+            // Skip another flag's VALUE so `--principal --admin-token` can't be
+            // misread as the token flag. But boolean flags (`--json`, `--force`)
+            // have no value, and blindly skipping one token past them would
+            // swallow the very flag we are looking for — so only skip a token
+            // that isn't itself a flag.
+            f if f.starts_with('-') => {
+                if k + 1 < raw.len() && !raw[k + 1].starts_with('-') {
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+            _ => k += 1,
+        }
+    }
+    (token, cred)
+}
+
 pub(crate) fn parse() -> Args {
     // `--wait` / `--timeout SECS` are position-INDEPENDENT (they apply to the
     // async op triggers regardless of whether they land before or after the
@@ -510,11 +569,24 @@ pub(crate) fn parse() -> Args {
         }
         out
     };
+    // FLAG POSITION MUST NOT MATTER for the two secret-bearing flags.
+    //
+    // This was inconsistent in a way that cost real time to diagnose: `presplit`
+    // read `--credential-file` ONLY from the global position (before the
+    // subcommand), while `principal-create` read `--admin-token-file` ONLY from
+    // its own (after it) — the subcommand parsers declare a LOCAL `admin_token`
+    // that shadows the global one, then reject it as empty. Each refused the
+    // other's placement with a bare usage dump naming neither the flag nor the
+    // position, so a correct-looking command read as "this build lacks that
+    // flag". Both placements now work for every subcommand.
+    let (scanned_admin_token, scanned_credential) = prescan_secret_flags(&raw);
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
     let mut transport = TransportKind::Tcp;
-    let mut admin_token: Option<String> = None;
-    let mut credential: Option<(String, Vec<u8>)> = None;
+    let mut admin_token: Option<String> = scanned_admin_token.clone();
+    let mut credential: Option<(String, Vec<u8>)> = scanned_credential;
+    // Seeds the per-subcommand parsers below; their own flag, if given, wins.
+    let global_admin_token = scanned_admin_token.unwrap_or_default();
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -759,7 +831,7 @@ pub(crate) fn parse() -> Args {
         "principal-create" => {
             let mut principal = String::new();
             let mut grants: Vec<String> = Vec::new();
-            let mut admin_token = String::new();
+            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--principal" => {
@@ -784,6 +856,11 @@ pub(crate) fn parse() -> Args {
                         admin_token = read_secret_file(val(&raw, i));
                         i += 1;
                     }
+                    // Read by `prescan_secret_flags`; skipped here so position
+                    // never matters.
+                    "--credential-file" => {
+                        i += 2;
+                    }
                     _ => break,
                 }
             }
@@ -800,7 +877,7 @@ pub(crate) fn parse() -> Args {
         }
         "principal-delete" => {
             let mut principal = String::new();
-            let mut admin_token = String::new();
+            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--principal" => {
@@ -817,6 +894,11 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                         admin_token = read_secret_file(val(&raw, i));
                         i += 1;
+                    }
+                    // Read by `prescan_secret_flags`; skipped here so position
+                    // never matters.
+                    "--credential-file" => {
+                        i += 2;
                     }
                     _ => break,
                 }
@@ -863,7 +945,7 @@ pub(crate) fn parse() -> Args {
             let mut name = String::new();
             let mut owner_tenant: Option<String> = None;
             let mut presplit: Vec<Vec<u8>> = Vec::new();
-            let mut admin_token = String::new();
+            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--name" => {
@@ -897,6 +979,11 @@ pub(crate) fn parse() -> Args {
                         admin_token = read_secret_file(val(&raw, i));
                         i += 1;
                     }
+                    // Read by `prescan_secret_flags`; skipped here so position
+                    // never matters.
+                    "--credential-file" => {
+                        i += 2;
+                    }
                     _ => break,
                 }
             }
@@ -913,7 +1000,7 @@ pub(crate) fn parse() -> Args {
         "namespace-delete" => {
             let mut name = String::new();
             let mut force = false;
-            let mut admin_token = String::new();
+            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--name" => {
@@ -934,6 +1021,11 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                         admin_token = read_secret_file(val(&raw, i));
                         i += 1;
+                    }
+                    // Read by `prescan_secret_flags`; skipped here so position
+                    // never matters.
+                    "--credential-file" => {
+                        i += 2;
                     }
                     _ => break,
                 }
@@ -1320,7 +1412,8 @@ pub(crate) fn parse() -> Args {
             let mut parts: Option<usize> = None;
             let mut hash_prefix: Option<String> = None;
             let mut agents: Option<Vec<String>> = None;
-            let mut presplit_admin_token: Option<String> = None;
+            let mut presplit_admin_token: Option<String> =
+                    (!global_admin_token.is_empty()).then(|| global_admin_token.clone());
             let mut presplit_force = false;
             let num = |v: &str, what: &str| -> u64 {
                 v.trim().parse().unwrap_or_else(|_| {
@@ -1342,6 +1435,10 @@ pub(crate) fn parse() -> Args {
                     "--parts" => { i += 1; parts = Some(num(val(&raw, i), "--parts") as usize); i += 1; }
                     "--admin-token" => { i += 1; presplit_admin_token = Some(val(&raw, i).to_owned()); i += 1; }
                     "--admin-token-file" => { i += 1; presplit_admin_token = Some(read_secret_file(val(&raw, i))); i += 1; }
+                    // Already read by `prescan_secret_flags`; accepted (and
+                    // skipped) here only so the flag may follow the subcommand
+                    // as well as precede it.
+                    "--credential-file" => { i += 2; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
                     "--force" => { i += 1; presplit_force = true; }
                     "--agents" => {
@@ -2557,5 +2654,34 @@ mod lane_parts_tests {
         // Degenerate = no cuts (striping still applies; it's placement that's a no-op).
         assert!(presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 1 }).unwrap().is_empty());
         assert!(presplit_suffixes(&PresplitRule::FsLanes { lanes: 1, parts: 1 }).unwrap().is_empty());
+    }
+
+    /// `--admin-token[-file]` and `--credential-file` must work in BOTH
+    /// positions, for every subcommand.
+    ///
+    /// They used to be split: `presplit` took the credential only before the
+    /// subcommand, `principal-create` took the token only after it, and each
+    /// rejected the other placement with a usage dump that named neither the
+    /// flag nor the position — so a correct-looking command read as an
+    /// unsupported flag. This pins the prescan that fixed it, including the
+    /// boolean-flag case that would otherwise swallow the following flag.
+    #[test]
+    fn secret_flags_are_position_independent() {
+        let argv = |v: &[&str]| -> Vec<String> {
+            std::iter::once("autumn-op".to_string())
+                .chain(v.iter().map(|s| s.to_string()))
+                .collect()
+        };
+        let tok = |a: &[&str]| super::prescan_secret_flags(&argv(a)).0;
+
+        // After the subcommand, before it, and either side of a boolean flag.
+        assert_eq!(tok(&["principal-create", "--admin-token", "T"]).as_deref(), Some("T"));
+        assert_eq!(tok(&["--admin-token", "T", "principal-create"]).as_deref(), Some("T"));
+        assert_eq!(tok(&["--json", "--admin-token", "T", "presplit"]).as_deref(), Some("T"));
+        assert_eq!(tok(&["presplit", "--force", "--admin-token", "T"]).as_deref(), Some("T"));
+
+        // A flag's VALUE is never mistaken for the flag itself.
+        assert_eq!(tok(&["principal-create", "--principal", "--admin-token"]), None);
+        assert_eq!(tok(&["presplit", "--namespace", "fs"]), None);
     }
 }

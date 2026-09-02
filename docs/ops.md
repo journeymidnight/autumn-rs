@@ -1396,6 +1396,8 @@ AUTUMN_ADMIN_TOKEN_FILE=/path/admin.token \
 #    or an in-namespace sub-prefix (`mem/acme/`):
 AO="./target/release/autumn-op --manager 127.0.0.1:9001"
 $AO principal-create --principal acme --grant mem/acme/ --admin-token-file /path/admin.token > /path/acme.cred
+# `--admin-token[-file]` and `--credential-file` work BEFORE or AFTER the
+# subcommand — position does not matter (it used to, differently per command).
 
 # 4) Use it from the SDK / autumn-memory (auto-mints + renews tokens,
 #    AUTH_HELLOs each PS connection; principal read from the credential file):
