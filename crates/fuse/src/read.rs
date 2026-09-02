@@ -80,17 +80,56 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
         }
     }
 
-    let meta = get_inode(state, ino).await?;
-    let file_size = meta.size;
+    let mut meta = get_inode(state, ino).await?;
+    let mut file_size = meta.size;
 
     if offset >= file_size {
-        return Ok(ReadPlan {
-            inline_result: Some(Vec::new()),
-            actual_size: 0,
-            client: state.client.clone(),
-            direct_read: state.direct_read,
-            chunks: Vec::new(),
-        });
+        // CONFIRM the EOF against KV before reporting it.
+        //
+        // This clamp is the only path in the whole stack that can answer a
+        // FUSE read with FEWER bytes than requested — everything else that
+        // cannot serve a range returns a full-length zero fill. So a size that
+        // is merely stale-small does not degrade the answer, it TRUNCATES the
+        // file, and a sequential reader takes the empty reply as end-of-file
+        // and stops. Silently: no error, no log, and the caller cannot tell
+        // this from a real EOF.
+        //
+        // Staleness here is not hypothetical. `InodeState` is pinned across
+        // opens by the kernel's dentry refcount and is only reloaded when a
+        // fresh lease acquire reports a higher version, so a meta captured
+        // once outlives every reopen until the kernel forgets the dentry.
+        // Observed: a mount served EOF at 64 MiB for a 5 GB file for about
+        // twenty minutes, through repeated opens, and then healed on its own
+        // with nothing recorded anywhere.
+        //
+        // Checking the extent map instead would not work: for a striped file
+        // the map is COMPUTED from this same size, so it is stale in exactly
+        // the cases that matter. One cache-bypassing GET is the honest test,
+        // and it costs one round trip per EOF-boundary event — once at the end
+        // of a sequential scan, never on an in-bounds read.
+        let (fresh, changed) = crate::meta::get_inode_uncached(state, ino).await?;
+        if changed {
+            tracing::warn!(
+                ino,
+                offset,
+                cached_size = file_size,
+                fresh_size = fresh.size,
+                "read: cached inode size was stale at EOF — refusing to truncate"
+            );
+        }
+        // Rebind the whole meta, not just the size — `inline_data` below is
+        // read from it and must come from the same snapshot.
+        file_size = fresh.size;
+        meta = fresh;
+        if offset >= file_size {
+            return Ok(ReadPlan {
+                inline_result: Some(Vec::new()),
+                actual_size: 0,
+                client: state.client.clone(),
+                direct_read: state.direct_read,
+                chunks: Vec::new(),
+            });
+        }
     }
 
     let read_end = std::cmp::min(offset + size as u64, file_size);

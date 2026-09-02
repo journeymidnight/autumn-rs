@@ -183,6 +183,33 @@ pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
     Ok(meta)
 }
 
+/// Re-read inode metadata from KV, BYPASSING the cache, and refresh the cached
+/// copy if it moved.
+///
+/// The cache is pinned across opens by the kernel's dentry refcount, so a meta
+/// captured once — mid-upload, say — survives every reopen until the kernel
+/// FORGETs the dentry. That is how a mount comes to believe a 5 GB file is
+/// 64 MiB and serves clean EOF against it for twenty minutes. Callers use this
+/// where believing a stale size CORRUPTS the answer rather than merely dating
+/// it. Returns the fresh meta and whether it differed.
+pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeMeta, bool)> {
+    let k = key::inode_key(ino);
+    let value = state.kv_get(&k).await?;
+    let fresh: InodeMeta = schema::decode_inode_meta(&value)
+        .map_err(|e| anyhow!("decode InodeMeta for ino {}: {}", ino, e))?;
+    let mut changed = false;
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        if is.meta.size != fresh.size {
+            changed = true;
+            is.meta = fresh.clone();
+            // The striped extent map is COMPUTED from size, so a stale size
+            // yields a self-consistently stale map. Drop it with the meta.
+            is.extents = None;
+        }
+    }
+    Ok((fresh, changed))
+}
+
 /// Write inode metadata to KV store and update cache.
 pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Result<()> {
     let k = key::inode_key(ino);
