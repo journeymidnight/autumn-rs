@@ -40,7 +40,20 @@ fn map_storage_error(e: &anyhow::Error) -> (StatusCode, String) {
     if let Some(stale) = e.chain().find_map(|c| c.downcast_ref::<StaleVpOffset>()) {
         return (StatusCode::FailedPrecondition, stale.to_string());
     }
-    (StatusCode::Internal, e.to_string())
+    // `{e:#}` — the WHOLE chain, not just the outermost context.
+    //
+    // `to_string()` sends only the last context added, and every EC read
+    // failure arrives here wrapped: the outer layer says
+    // "ec_reconstruct_shard_subrange: only 3/4 shards available", the inner
+    // one says WHICH peer failed and why — timeout, short read, payload not
+    // here. The inner half is the entire diagnostic value and it was being
+    // dropped at the wire boundary, so an operator saw a symptom with no
+    // cause and no hint that a cause existed. Costs a longer string on a path
+    // that is already an error.
+    //
+    // StaleVpOffset above keeps `to_string()` deliberately: its Display is a
+    // parsed wire contract, not a human message.
+    (StatusCode::Internal, format!("{e:#}"))
 }
 
 /// TiKV-style routing-freshness check shared by the read handlers

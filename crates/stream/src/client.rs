@@ -4887,6 +4887,17 @@ impl StreamClient {
                     let want = shard_plan[i].2 as usize;
                     if bytes.len() != want {
                         // short read — treat same as failure; reconstruct.
+                        // R4: SAY SO. A shard that has been reconstruct-only
+                        // for weeks is invisible today, and with M=1 that means
+                        // sitting one hiccup away from data-unavailable with no
+                        // signal at all.
+                        tracing::warn!(
+                            extent_id,
+                            shard = shard_plan[i].0,
+                            got = bytes.len(),
+                            want,
+                            "ec: short shard read — degrading to reconstruct"
+                        );
                         needs_reconstruct.push(i);
                         continue;
                     }
@@ -4897,6 +4908,15 @@ impl StreamClient {
                     if is_eversion_stale(&e) {
                         return Err(anyhow::Error::new(EversionStale));
                     }
+                    // R4: same reasoning as the short-read arm — this was the
+                    // silent one. `{e:#}` so the chain survives; the outermost
+                    // Display alone is what made this class unreadable.
+                    tracing::warn!(
+                        extent_id,
+                        shard = shard_plan[i].0,
+                        error = %format_args!("{e:#}"),
+                        "ec: shard read failed — degrading to reconstruct"
+                    );
                     needs_reconstruct.push(i);
                 }
             }
@@ -5000,10 +5020,22 @@ impl StreamClient {
         // `self.config` is reachable — the per-shard read runs inside a spawned
         // task that only captures a cloned `pool`, not `self`.
         let read_dl = self.config.read_deadline();
+        // R1: ASK THE MISSING SHARD'S NODE TOO.
+        //
+        // Skipping it made 4+1 behave like "all four survivors must answer",
+        // which is one unit of slack tighter than the data actually has. And
+        // the skip is often unearned: a shard lands here whenever its direct
+        // read failed OR its node merely appeared in the Suspected snapshot —
+        // in the latter case nobody asked it anything. Suspected is not dead,
+        // and a mistaken mark then costs availability rather than the "little
+        // extra parity traffic" the comment above the skip promises.
+        //
+        // Including it restores 4-of-5. It runs in the same parallel race, so
+        // it costs no wall-clock, just one more sh_len RPC. And if it answers,
+        // its bytes ARE the answer — `missing_shard_idx < data_shards` is
+        // enforced above, so this is a data shard, never parity — which lets
+        // the receive loop return them directly and skip RS entirely.
         for (i, addr) in addrs.iter().enumerate() {
-            if i == missing_shard_idx {
-                continue;
-            }
             let mut tx_clone = tx.clone();
             let addr_clone = addr.clone();
             let pool = self.pool.clone();
@@ -5061,6 +5093,17 @@ impl StreamClient {
         while let Some((idx, result)) = futures::StreamExt::next(&mut rx).await {
             match result {
                 Ok(bytes) => {
+                    // The "missing" shard answered after all — its bytes are
+                    // the sub-range verbatim (it is a data shard; see the
+                    // guard above), so there is nothing to reconstruct.
+                    if idx == missing_shard_idx {
+                        tracing::debug!(
+                            extent_id,
+                            shard = missing_shard_idx,
+                            "ec_reconstruct: missing shard answered on retry — no RS needed"
+                        );
+                        return Ok(bytes);
+                    }
                     shards[idx] = Some(bytes);
                     success += 1;
                     if success >= data_shards {
@@ -5078,7 +5121,7 @@ impl StreamClient {
 
         if success < data_shards {
             return Err(last_err.context(format!(
-                "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
+                "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
             )));
         }
 
