@@ -19,6 +19,13 @@ crc32c.workspace = true
 # is the shared wire+crypto home so signer and verifier never drift.
 ed25519-dalek = "2"
 rkyv = { version = "0.8.15", features = ["alloc"] }
+# rkyv's own `alloc` does NOT reach rancor's, and rancor is what carries the
+# TEXT of a validation failure. Without this a decode error is literally
+# "failed without error information; enable debug assertions and the `alloc`
+# feature in rancor" — which is what an operator saw while a 130 GiB weight
+# load stalled, with nothing in the PS or EN logs either. Direct dep purely so
+# cargo's feature unification turns it on for the whole graph.
+rancor = { version = "0.1", features = ["alloc"] }
 thiserror.workspace = true
 futures = "0.3"
 tracing = "0.1"

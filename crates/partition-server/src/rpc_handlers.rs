@@ -516,7 +516,33 @@ pub(crate) async fn handle_get_redirect(
                 // Descriptor lookup failed (manager blip / cache miss):
                 // resolve through the proxy path instead — redirect is an
                 // optimization, never a correctness dependency.
-                Err(_) => handle_get(payload, part).await,
+                //
+                // The `Err(_)` here threw away the only explanation that
+                // existed. `extent_read_descriptor` refuses with a specific
+                // reason ("extent N is EC-converted", "keeps its payload
+                // outside .dat", or a manager lookup failure), and every one of
+                // them was discarded — so a client seeing 100% failure on this
+                // path got no reason from the PS, nothing in the PS log, and
+                // nothing in the EN log (the ENs are never contacted). Three
+                // silent channels, and the failure then presented as an opaque
+                // rkyv decode error at the client. Log it.
+                //
+                // Note this arm answers a MSG_GET_REDIRECT with a `GetResp`,
+                // not a `GetRedirectResp` — a wire-contract violation that is
+                // what MAKES the client's decode fail. The client now degrades
+                // to the proxy on an undecodable descriptor, but the right fix
+                // is for this arm to return the inline shape above
+                // (`extent_id: 0` + value), which costs one round trip instead
+                // of two. Left as-is here only because that needs the resolved
+                // value rather than an encoded response.
+                Err(e) => {
+                    tracing::warn!(
+                        extent_id,
+                        error = %e,
+                        "get_redirect: descriptor lookup failed — answering via the proxy path"
+                    );
+                    handle_get(payload, part).await
+                }
             }
         }
     }

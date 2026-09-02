@@ -2958,19 +2958,43 @@ impl ClusterClient {
                 region_epoch,
                 items: req_items,
             });
-            if let Ok(resp_bytes) = self
+            // Both discards below used to be silent, and between them they ate
+            // the only explanation the system produced. The batch handler
+            // refuses with a NAMED reason — "extent N is EC-converted; direct
+            // read not supported" and friends — and that text died here, so a
+            // direct read failing on every single item looked like nothing at
+            // all from the client, nothing in the PS log, and nothing in the EN
+            // log (the ENs are never reached). Leaving descriptors `None` is
+            // still correct: phase C falls back per item. Just say why.
+            match self
                 .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
                 .await
             {
-                if let Ok(resp) =
-                    rkyv_decode::<partition_rpc::GetRedirectManyResp>(&resp_bytes)
-                {
-                    if resp.results.len() == idxs.len() {
-                        for (&i, r) in idxs.iter().zip(resp.results.into_iter()) {
-                            descriptors[i] = Some(r);
+                Ok(resp_bytes) => match rkyv_decode::<partition_rpc::GetRedirectManyResp>(
+                    &resp_bytes,
+                ) {
+                    Ok(resp) => {
+                        if resp.results.len() == idxs.len() {
+                            for (&i, r) in idxs.iter().zip(resp.results.into_iter()) {
+                                descriptors[i] = Some(r);
+                            }
+                        } else {
+                            tracing::warn!(
+                                got = resp.results.len(),
+                                want = idxs.len(),
+                                "direct-read: batch descriptor count mismatch — per-item proxy fallback"
+                            );
                         }
                     }
-                }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "direct-read: undecodable batch descriptor response — per-item proxy fallback"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "direct-read: batch descriptor lookup refused — per-item proxy fallback"
+                ),
             }
         }
         // Phase C — fan out: read each item's PRE-RESOLVED descriptor straight
