@@ -37,6 +37,9 @@
 11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不堆放验证步骤。
 12. 如果claude-progress.txt,feature-list太长, 定期清理删除, 保持整洁
 13. 在注释，commit description， 尤其是代码内容里面， 不要写类似于Fxxx这种feature号
+14. commit message 里**禁止**出现 `Claude-Session: https://claude.ai/code/session_...`
+    这一行。session 链接是内部的、会失效的，对以后读 `git log` 的人毫无意义。
+    `Co-Authored-By: Claude ...` 可以保留。（已经进了历史的不要回改、不要 force-push。）
 
 
 ### claude-progress.txt 约定
