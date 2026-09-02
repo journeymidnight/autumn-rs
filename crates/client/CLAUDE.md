@@ -170,7 +170,12 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   `read_extent_value_direct`), taking the PS off the large-value DATA path (cross-host
   throughput win). Sub-64 KiB items stay on the proxy `get_range` path, so MIXED batches
   route per item. **Per item, ANY direct-read failure falls back to the proxy** — degrades
-  gracefully where ENs aren't client-reachable. The call-vs-`get_many_into` DECISION is
+  gracefully where ENs aren't client-reachable. That includes a PS DECLINE: the
+  batched descriptor call answers `CODE_PRECONDITION` for the individual items
+  it cannot serve directly (`redirect_item_action` → `Proxy`), and only those
+  items pay a proxy read. Declining the whole batch instead was measured 3.5x
+  slower than never trying direct reads, because every key then paid its own
+  redirect round trip on top of the proxy read. The call-vs-`get_many_into` DECISION is
   TOPOLOGY-dependent, so it's a frontend-owned flag (fuse `--direct-read`, python
   `BatchClient(direct=…)` / `autumn.Fs.connect(direct_read=…)` / kvcache / vLLM-loader),
   DEFAULT ON — safe because size-gated AND proxy fallback is authoritative. First fallback

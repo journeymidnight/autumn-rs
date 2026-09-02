@@ -537,10 +537,25 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   when the shards are not in shard files (pre-CoW conversions kept them in
   `.dat` and are never backfilled, so a shard-addressed read could only collect
   refusals). On a decline the single-key handler answers inline (`extent_id: 0`
-  + the value, one round trip); the BATCHED handler fails the whole batch with
-  `FailedPrecondition` so the client's per-item proxy fallback runs immediately
-  — `Unavailable` there cost ~9-13 s of deterministic retry backoff per call,
-  because the SDK reads it as transient.
+  + the value, one round trip). The BATCHED handler declines **per item**:
+  that item gets `CODE_PRECONDITION` with an empty value, every other item in
+  the batch keeps its descriptor, and the client proxies only the declined one.
+  It does NOT inline the value there — a batch declining broadly during a model
+  load would aggregate hundreds of 8 MiB values into one GB-scale frame.
+  **Failing the whole batch on one decline was measured at 3.5x slower than not
+  attempting direct reads at all** (76 -> 22 MiB/s on a cluster where 16 of 39
+  extents declined): the client dropped every descriptor and re-read each key
+  through `get_range_direct_into`, which pays its own redirect round trip before
+  proxying, so one batched proxy read became a redirect RTT plus a proxy RTT per
+  key. A lookup ERROR still fails the batch: it is usually batch-wide (the
+  manager is unreachable), though it can be per-extent — a GC punch racing a
+  stale VP makes `fetch_extent_info` error for one id. That is a window, not a
+  steady state, and it is not the deterministic case the marker is for.
+- **Client ordering is load-bearing** (`redirect_item_action`, autumn-client): a
+  declined item is `CODE_PRECONDITION` + empty `value` + `extent_id == 0`, which
+  is indistinguishable from an inline empty value except by the code. Testing
+  `extent_id` first fills the caller's buffer with nothing and reports a
+  successful read.
 - Short reads under CODE_OK are FAILURES in `read_extent_value_direct` (same
   "got < need" rule as `read_value_from_log`).
 - Inline values / small VPs / sub-64 KiB / offset past value end: inline in the
@@ -1306,6 +1321,51 @@ turn-ON edge, never a false reject.
   that makes fuse write `fs/…`. In-process test managers run memory-mode and never
   seed builtins, so Layer-A is OFF in the suite unless a test `namespace-create`s.
 
+## Range memtable window
+
+`handle_range` sees a WINDOW of the memtable, not all of it:
+`collect_mem_items_for_range(part, seek, cap)` takes `[seek, ...)` from the
+active memtable and each imm, at most `cap = max(4 x limit, 4096)` entries per
+run, and does NOT clone values (`RangeEntry.value` is always empty — range
+answers keys).
+
+The full snapshot it replaced (`collect_mem_items` → `snapshot_sorted`, still
+used by the split path, which genuinely needs everything) cloned every key and
+every value in the memtable AND every imm, then sorted the result — O(memtable)
+per REQUEST, independent of the page limit. Measured in release: 66.5 ms at
+500k entries of 64-byte values, 124 ms at 512-byte values, 212 ms at 1M
+entries. That fixed per-page cost is what made a full-prefix walk quadratic: a
+2M-key wipe spent 588 s, nearly all of it re-snapshotting. Windowed, the same
+page costs a flat ~215 µs and the wipe is bounded by the partition's write
+ceiling instead.
+
+**The BOUND is correctness, not tuning.** When a run truncates,
+`collect_mem_items_for_range` returns the MINIMUM last-key over the truncated
+runs — the first point past which ANY run goes blind. Reading past it would
+serve SST entries whose newest version is a memtable entry the scan never
+loaded: in the wipe workload, keys whose tombstone is outside the window.
+Ablation: with the bound removed, 1024 deleted keys come back starting exactly
+at the window boundary.
+
+**The window MUST NOT be visible on the wire.** At the bound the merge REFILLS —
+another window from `Excluded(bound)` — and keeps going; it never returns a
+short page because it ran out of window. `has_more` stays `out.len() == limit`
+and a short page still means the prefix is exhausted. Reporting truncation
+instead silently drops keys two ways, both verified in-repo: four consumers
+(`wipe_agent`, `MemoryStore::scan_keys`, two fuse extent loops) page by
+`n < limit` and never read `has_more`, so they stop early; and
+`ClusterClient::range` advances its cursor to the partition's END key on a page
+it believes complete, so a truncated page in a non-last partition leaves a
+permanent gap in the middle of the scan.
+
+Exhaustion is the subtle case: with a bound set, BOTH iterators running dry
+proves nothing, because the memtable may hold more past the window. So
+exhaustion refills too, and only a refill that comes back empty ends the scan.
+Ablation: one user key with more unflushed versions than the window holds, and
+nothing in an SST — stopping at the bound returns a 1-entry page and calls the
+prefix finished while every later key is still in the memtable. Refills
+terminate because each one starts strictly past the previous bound.
+
 ## Range paging: `start` is INCLUSIVE; "after K" = `K ++ 0x00`
 
 `RangeReq.start` begins the scan at that key, inclusive. To resume strictly
@@ -1425,8 +1485,10 @@ initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...
 - `MergeIterator`: N-way merge of TableIterators; for duplicate internal keys, the
   lower-index (newer) iterator wins; `next()` advances ALL iterators at the current
   minimum key.
-- `MemtableIterator`: snapshot of memtable entries as sorted Vec; `partition_point`
-  for seek.
+- `MemtableIterator`: a sorted `Vec` of memtable entries; `partition_point` for
+  seek. It does NOT own a view of the whole memtable — what it holds is whatever
+  the caller collected. The range path deliberately gives it a WINDOW (see
+  "Range memtable window"); the split path gives it everything.
 
 ## Key Constants
 

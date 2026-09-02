@@ -1140,11 +1140,18 @@ into a scratch agent, and score against the baseline:
 only when the corpus or goldset changed on purpose — a baseline that updates
 itself records the regression instead of catching it.
 
-**Getting a clean agent: reset the CLUSTER, not the agent.** `--reset` deletes
-the agent's keys, and a document corpus is mostly BM25 postings — 5164 chunks
-is ~2 million keys. Measured: ~3.4k keys/s, i.e. **~10 minutes** for a full
-corpus, and it is scan-bound rather than write-bound (the partition itself
-sustains 30k writes/s at 8 threads). `./cluster.sh reset 1` takes seconds.
+**Getting a clean agent.** `--reset` deletes the agent's keys, and a document
+corpus is mostly BM25 postings — 5164 chunks is ~2 million keys. Measured on a
+local 3-node cluster: **68 s**, or ~29k keys/s, which is the single-partition
+write ceiling — the wipe is now bounded by how fast one partition accepts
+deletes, so more speed means more partitions, not a faster client.
+
+It used to take ~10 minutes at 3.4k keys/s, and the difference is worth knowing
+if you are reading an older run: the range scan was re-snapshotting the whole
+memtable on every page (see the partition-server guide, "Range memtable
+window"), which also made a `delete_many` batching experiment look worthless at
+the time. `./cluster.sh reset 1` is still the fastest way to a clean slate if
+you do not need the rest of the cluster's data.
 
 ## fs stripe geometry: lanes vs partitions
 

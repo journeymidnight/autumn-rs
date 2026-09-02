@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 34;
-pub const WIRE_VERSION_MAX: u32 = 34;
+pub const WIRE_VERSION_MIN: u32 = 35;
+pub const WIRE_VERSION_MAX: u32 = 35;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -516,6 +516,17 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // that ignored the discriminator would read shard bytes as a value. Same
     // reason the descriptor used to be refused for EC entirely.
     (34, "f98d5faa6834f357"),
+    // v35: a `MSG_GET_REDIRECT_MANY` item may answer `CODE_PRECONDITION` = "this
+    // item alone cannot be read directly, proxy it". No struct change, but the
+    // SEMANTICS of an existing field changed: a v34 client meeting one reads it
+    // as a per-item error and fails every declined key — deterministic and
+    // loud, but wrong, and on an EC cluster that is most large reads. Refusing
+    // at the handshake says so plainly; keeping v34 and rewriting its hash
+    // would have refused too, but as "wire-version fraud, rebuild from a clean
+    // tree", which is the wrong story for a deliberate upgrade.
+    // Previously ONE declining extent failed the WHOLE batch, measured 3.5x
+    // slower than not attempting direct reads at all.
+    (35, "49d0b42b87d433fd"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

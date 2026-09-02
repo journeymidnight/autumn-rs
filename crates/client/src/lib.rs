@@ -292,6 +292,43 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
     }
 }
 
+/// What a `GetRedirectResp` tells the caller to do with ONE item.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RedirectItemAction {
+    NotFound,
+    /// Copy `resp.value` — the value was small enough to ride inline.
+    Inline,
+    /// Read the range through the PS proxy: the PS declined a direct read for
+    /// this item alone.
+    Proxy,
+    /// Read straight from the extent nodes named by the descriptor.
+    Descriptor,
+    /// A real failure — the caller surfaces `resp.code` as an error.
+    Error,
+}
+
+/// Decide what one redirect response means, as a pure function so the ORDER of
+/// the tests is testable without a cluster.
+///
+/// The order is the whole point. A declined item carries `CODE_PRECONDITION`,
+/// an EMPTY `value` and `extent_id == 0`, so:
+///   * testing `extent_id == 0` first reads it as an inline value, fills the
+///     caller's buffer with nothing and reports a successful zero-length read —
+///     a silent hole in a model weight or a file page;
+///   * running it through `check_ps_code` first turns a routine per-item
+///     decline into a hard error for the whole call.
+/// Both were live shapes of this code, which is why this is a function with
+/// tests rather than four `if`s in an async method.
+pub(crate) fn redirect_item_action(resp: &GetRedirectResp) -> RedirectItemAction {
+    match resp.code {
+        partition_rpc::CODE_NOT_FOUND => RedirectItemAction::NotFound,
+        partition_rpc::CODE_PRECONDITION => RedirectItemAction::Proxy,
+        partition_rpc::CODE_OK if resp.extent_id == 0 => RedirectItemAction::Inline,
+        partition_rpc::CODE_OK => RedirectItemAction::Descriptor,
+        _ => RedirectItemAction::Error,
+    }
+}
+
 /// Shared response-code guard: bail with the mapped `code_to_error` when a
 /// PS (partition-server) response body carries a non-OK application code.
 /// PS-ONLY — `code_to_error` maps `partition_rpc::CODE_*`; manager
@@ -3225,9 +3262,12 @@ impl ClusterClient {
     /// read one item using a PRE-RESOLVED redirect descriptor
     /// (from the batched `MSG_GET_REDIRECT_MANY`) — the descriptor-consuming tail
     /// of `get_range_direct_into`, factored out so the batch path skips the
-    /// per-item `MSG_GET_REDIRECT` round-trip. Inline (`extent_id == 0`) copies
-    /// straight in; a descriptor drives `read_redirect_replicas`; ALL-replica
-    /// failure falls back to the proxy bulk path (`get_range_into`). Returns
+    /// per-item `MSG_GET_REDIRECT` round-trip. `redirect_item_action` decides
+    /// which of four things the response is: an inline value copies straight
+    /// in, a descriptor drives `read_redirect_replicas`, a per-item DECLINE
+    /// goes to the proxy (`get_range_into`) with no second redirect round trip,
+    /// and ALL-replica failure on a descriptor falls back to that same proxy.
+    /// Returns
     /// `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled) or `None`.
     async fn apply_redirect_desc(
         &self,
@@ -3237,22 +3277,31 @@ impl ClusterClient {
         length: u32,
         dest: &mut [u8],
     ) -> std::result::Result<Option<usize>, AutumnError> {
-        if resp.code == partition_rpc::CODE_NOT_FOUND {
-            return Ok(None);
+        match redirect_item_action(resp) {
+            RedirectItemAction::NotFound => Ok(None),
+            RedirectItemAction::Error => {
+                check_ps_code(resp.code, &resp.message)?;
+                unreachable!("Error is returned only for a non-OK, non-handled code")
+            }
+            // Declined for THIS item only — proxy it directly. Not via
+            // `get_range_direct_into`: that would pay a second redirect round
+            // trip to be told the same thing.
+            RedirectItemAction::Proxy => self.get_range_into(key, offset, length, dest).await,
+            RedirectItemAction::Inline => {
+                let v = &resp.value;
+                let nn = v.len().min(dest.len());
+                dest[..nn].copy_from_slice(&v[..nn]);
+                Ok(Some(v.len()))
+            }
+            RedirectItemAction::Descriptor => {
+                if let Some(v) = self.read_from_descriptor(resp).await {
+                    let nn = v.len().min(dest.len());
+                    dest[..nn].copy_from_slice(&v[..nn]);
+                    return Ok(Some(v.len()));
+                }
+                self.get_range_into(key, offset, length, dest).await
+            }
         }
-        check_ps_code(resp.code, &resp.message)?;
-        if resp.extent_id == 0 {
-            let v = &resp.value;
-            let nn = v.len().min(dest.len());
-            dest[..nn].copy_from_slice(&v[..nn]);
-            return Ok(Some(v.len()));
-        }
-        if let Some(v) = self.read_from_descriptor(resp).await {
-            let nn = v.len().min(dest.len());
-            dest[..nn].copy_from_slice(&v[..nn]);
-            return Ok(Some(v.len()));
-        }
-        self.get_range_into(key, offset, length, dest).await
     }
 
     /// bulk GET: read a key's value into `dest` with ONE copy. The value is
@@ -5570,6 +5619,67 @@ mod namespace_binding_tests {
         for bad in ["", "acme/sub", "Acme", "a b", "a:b", "a/", "/x"] {
             assert!(!super::is_valid_scope_segment(bad), "{bad} should be rejected");
         }
+    }
+}
+
+#[cfg(test)]
+mod redirect_item_action_tests {
+    use super::{redirect_item_action, RedirectItemAction};
+    use autumn_rpc::partition_rpc::{self, GetRedirectResp};
+
+    fn resp(code: u8, extent_id: u64, value: Vec<u8>) -> GetRedirectResp {
+        GetRedirectResp {
+            code,
+            message: String::new(),
+            value,
+            extent_id,
+            value_offset: 0,
+            value_len: 0,
+            eversion: 0,
+            replica_addrs: vec![],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
+        }
+    }
+
+    /// The one that matters: a declined item looks EXACTLY like an inline
+    /// empty value (`extent_id == 0`, `value == []`) and is told apart only by
+    /// its code. Deciding on `extent_id` first would fill the caller's buffer
+    /// with nothing and report a successful read.
+    #[test]
+    fn a_declined_item_is_proxied_not_read_as_an_empty_inline_value() {
+        let declined = resp(partition_rpc::CODE_PRECONDITION, 0, vec![]);
+        assert_eq!(redirect_item_action(&declined), RedirectItemAction::Proxy);
+    }
+
+    #[test]
+    fn ok_with_no_extent_is_inline_and_with_an_extent_is_a_descriptor() {
+        assert_eq!(
+            redirect_item_action(&resp(partition_rpc::CODE_OK, 0, b"hi".to_vec())),
+            RedirectItemAction::Inline
+        );
+        // An inline EMPTY value is legal (a zero-length value) and must stay
+        // inline — it is the code, not the length, that marks a decline.
+        assert_eq!(
+            redirect_item_action(&resp(partition_rpc::CODE_OK, 0, vec![])),
+            RedirectItemAction::Inline
+        );
+        assert_eq!(
+            redirect_item_action(&resp(partition_rpc::CODE_OK, 7, vec![])),
+            RedirectItemAction::Descriptor
+        );
+    }
+
+    #[test]
+    fn not_found_and_real_errors_stay_distinct() {
+        assert_eq!(
+            redirect_item_action(&resp(partition_rpc::CODE_NOT_FOUND, 0, vec![])),
+            RedirectItemAction::NotFound
+        );
+        assert_eq!(
+            redirect_item_action(&resp(partition_rpc::CODE_ERROR, 0, vec![])),
+            RedirectItemAction::Error
+        );
     }
 }
 

@@ -164,6 +164,16 @@ fn push_term(out: &mut Vec<String>, t: String) {
 /// Index + query both run through `tokenize`, so the folding stays symmetric.
 /// (Full Porter/Snowball via `rust-stemmers` is a possible follow-up.)
 fn fold_plural(t: &str) -> String {
+    // Every rule below indexes BYTES, and every rule below is about English
+    // morphology, so a token that is not ASCII is both unfoldable and unsafe to
+    // slice: `100µs` is 6 bytes, ends in `s`, and `&t[n - 2..]` lands inside the
+    // two bytes of `µ` and panics. The tokenizer accumulates any Unicode
+    // alphanumeric that is not CJK, so this is reachable from ordinary prose —
+    // `µs`, `naïves`, Greek, Cyrillic — and it took down the whole ingest, not
+    // one document.
+    if !t.is_ascii() {
+        return t.to_string();
+    }
     let n = t.len();
     if n < 4 || !t.ends_with('s') {
         return t.to_string();
@@ -304,6 +314,22 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// Tokenizing must not panic on a non-ASCII token that ends in `s`.
+    ///
+    /// `fold_plural` slices by BYTE, so `100µs` (6 bytes, ends in `s`) used to
+    /// index into the middle of `µ` and panic. The tokenizer keeps any Unicode
+    /// alphanumeric that is not CJK, so this reached the indexing path from
+    /// ordinary prose and killed the whole ingest run, not one document.
+    #[test]
+    fn non_ascii_tokens_ending_in_s_do_not_panic() {
+        for text in ["100µs", "naïves", "χρόνος", "1µs and 2µs", "résumés"] {
+            let t = super::tokenize(text);
+            assert!(!t.is_empty(), "no terms from {text:?}");
+        }
+        // still folds real ASCII plurals
+        assert!(super::tokenize("errors").contains(&"error".to_string()));
+    }
+
     // ── CJK bigram tokenization ────────────────────────────────────────────
     //
     // These pin the behaviour that motivated bigrams: a two-character proper

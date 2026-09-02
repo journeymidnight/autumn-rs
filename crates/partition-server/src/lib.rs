@@ -889,6 +889,54 @@ impl Memtable {
             .collect()
     }
 
+    /// Snapshot ONLY the entries at or after `seek`, at most `cap` of them, and
+    /// WITHOUT cloning values.
+    ///
+    /// `handle_range` used to call `snapshot_sorted`, which clones every key AND
+    /// every value in the whole memtable. Both halves are waste for a range
+    /// page: the scan walks forward from one seek point so it never looks at
+    /// anything before it, and `RangeEntry.value` is always empty (range answers
+    /// keys). The cost was O(memtable) per REQUEST regardless of the page limit
+    /// — measured at 65 ms for a 500k-entry memtable of 64-byte values and
+    /// 125 ms at 512-byte values, before the scan examined a single key. That
+    /// fixed cost per page is what made a full-prefix delete quadratic: every
+    /// page of 512 keys paid for the entire remaining memtable.
+    ///
+    /// Returns `(items, truncated)`. `truncated` = there are more entries at or
+    /// after `seek` than `cap`, so this view is authoritative only up to the
+    /// last returned key — the caller must not emit anything past it.
+    pub(crate) fn snapshot_range_keys(
+        &self,
+        from: std::ops::Bound<&[u8]>,
+        cap: usize,
+    ) -> (Vec<IterItem>, bool) {
+        debug_assert!(cap > 0, "a zero-cap window is blind, not truncated");
+        use std::ops::Bound;
+        let lo = match from {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(k) => Bound::Included(InternalKey(k.to_vec())),
+            // Resuming past a previous window's last key: EXCLUDED rather than
+            // key arithmetic, because an internal key ends in a fixed-width
+            // suffix that `cmp_internal_keys` splits off — appending a byte to
+            // "get the successor" would move the split and compare a different
+            // user key.
+            Bound::Excluded(k) => Bound::Excluded(InternalKey(k.to_vec())),
+        };
+        let guard = self.data.read();
+        let mut it = guard.range((lo, Bound::Unbounded));
+        let mut items = Vec::with_capacity(cap.min(guard.len()));
+        for (k, v) in it.by_ref().take(cap) {
+            items.push(IterItem {
+                key: k.0.clone(),
+                op: v.op,
+                value: Vec::new(),
+                expires_at: v.expires_at,
+            });
+        }
+        let truncated = it.next().is_some();
+        (items, truncated)
+    }
+
     /// Iterate the memtable entries in ascending key order under a read lock
     /// and hand each entry to `f`. Used by `build_sst_bytes` and `rotate_active`
     /// to avoid allocating an intermediate snapshot Vec when the caller just
@@ -12289,6 +12337,80 @@ mod partition_listener_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod write_batch_fastpath_tests {
+
+/// MEASUREMENT (not a guard): what one `range` page costs as a function of the
+/// MEMTABLE's size, independent of how many entries the page returns.
+///
+/// `handle_range` used to call `collect_mem_items`, which is `snapshot_sorted`
+/// over the active memtable plus every imm — each of which CLONES every key and
+/// every value into a fresh `Vec<IterItem>`. That work is O(memtable), and it
+/// happened per request, so a 512-entry page over a hot partition paid for the
+/// whole memtable before it looked at a single key. It now takes a capped
+/// window instead and refills as needed; `collect_mem_items` survives for the
+/// split path, which genuinely needs everything.
+///
+/// Run with: cargo test -p autumn-partition-server --lib memtable_snapshot_cost -- --nocapture --ignored
+#[test]
+#[ignore = "measurement, not an assertion — prints a table"]
+fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
+    fn fill(n: usize, val_len: usize) -> Memtable {
+        let mt = Memtable::new();
+        let items: Vec<(Vec<u8>, MemEntry, u64)> = (0..n)
+            .map(|i| {
+                let key = crate::key_with_ts(format!("mem/agent/post/{i:012}").as_bytes(), i as u64);
+                (
+                    key,
+                    MemEntry {
+                        op: 1,
+                        value: vec![b'v'; val_len],
+                        expires_at: 0,
+                    },
+                    (32 + val_len) as u64,
+                )
+            })
+            .collect();
+        mt.insert_batch(items);
+        mt
+    }
+
+    fn timed<T>(reps: u32, mut f: impl FnMut() -> T) -> std::time::Duration {
+        std::hint::black_box(f());
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(f());
+        }
+        t0.elapsed() / reps
+    }
+
+    // Where a page starts does not matter to the OLD cost and is the whole
+    // story for the new one, so seek to the middle: the window there is full,
+    // which is the windowed path's worst case.
+    println!("\n  entries   value_len   full snapshot   windowed (cap 4096)");
+    for &(n, val_len) in &[
+        (10_000usize, 64usize),
+        (100_000, 64),
+        (500_000, 64),
+        (1_000_000, 64),
+        (500_000, 512),
+    ] {
+        let mt = fill(n, val_len);
+        let seek = crate::key_with_ts(
+            format!("mem/agent/post/{:012}", n / 2).as_bytes(),
+            u64::MAX,
+        );
+        let full = timed(3, || mt.snapshot_sorted().len());
+        let windowed = timed(20, || {
+            mt.snapshot_range_keys(std::ops::Bound::Included(seek.as_slice()), 4096)
+                .0
+                .len()
+        });
+        println!("  {n:>9}   {val_len:>9}   {full:>13.1?}   {windowed:>19.1?}");
+    }
+    println!(
+        "\n  A 512-entry page returns ~512 entries no matter which row it is on;\n  \
+         the cost above is what the page pays BEFORE looking at any of them.\n"
+    );
+}
     use super::*;
 
     /// test 1 — Single-frame passthrough: one Put per TCP read,

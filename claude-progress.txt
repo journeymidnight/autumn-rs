@@ -42,6 +42,41 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
   验证走 `autumn-s3` —— `autumnfs` 直接读 KV 布局、根本不过 fuse core，测不到这条路径；
   另外条带化会把每个 value 切到 64 KiB 直读阈值以下（两个坑都写进 docs/ops.md 了）。
 
+【2026-09-02 F-MEM-WIPE-COST：瓶颈测准并移除（588 s → 68.1 s），但没打到"分钟以内"】
+  账本说"先测准扫描为何这么慢，再决定改法"，测准的结果不是当初怀疑的 tombstone 让 seek 变贵，
+  而是 `handle_range` **每次请求**都把整个 memtable + 全部 imm 克隆成一个 Vec 再排序
+  （`collect_mem_items` → `snapshot_sorted` → `MemtableIterator::new` 里还有一次 sort），
+  而且连 value 一起克隆——range 的 `RangeEntry.value` 恒为空，那些 value 一个都用不上。
+  这笔开销是 O(memtable)、与 page limit 无关。release 实测：50 万条 64B value = 66.5 ms、
+  512B value = 124 ms、100 万条 = 212 ms —— 和现场那个 133 ms/页几乎重合。
+  改法：从 seek 点起取**窗口**（cap = max(4×limit, 4096)，不克隆 value）。每页固定 ~215 µs，
+  与 memtable 大小无关。窗口截断时返回一个 bound，merge 循环越过 bound 就停下并置 has_more；
+  这个 bound 是**正确性关键**而不是优化：SST 里的 key 可能被窗口外的 memtable tombstone 遮蔽，
+  越过 bound 继续读会把已删除的 key 复活。消融实测正是如此——去掉 bound，1024 个已删 key 从
+  **k-004096**（正好窗口边界）开始全部回来。
+  端到端（同一份 1,987,843 key 的语料）：588 s → 253.5 s（只修扫描）。再把逐 key 删除换成
+  `delete_many` → **70.2 s = 29,190 key/s**，压在单分区 ~30K ops/s 写天花板上。完整性直接
+  验过（wipe 后前缀扫描返回空；三次运行删除计数都精确等于 1,987,843）。
+
+  **fable 在这个改动里挖出两个我自引入的静默丢 key 洞，都已改设计**（不是补丁）：
+  ① `truncated_early` 只在"选中项越过 bound"时置位，而合并自然耗尽（两边迭代器都空）时不置位
+  —— 窗口截断 + 无 SST 尾部的形状下，`has_more` 退回 `out.len()==limit`，短页报 false，
+  客户端就此停止而 memtable 里还有 key。
+  ② 更糟：SDK 的 `range_bound` 每轮把游标推进到 `cur_end_key`（分区**末尾**键），这在旧不变量
+  `has_more ⟺ count == limit` 下才安全；截断页又短又 has_more=true 会让游标直接跳过截断点，
+  多分区扫描结果**中间出现永久空洞**。另有四处消费者（wipe_agent / scan_keys / 两处 fuse
+  extent 循环）按 `n < limit → break` 分页、根本不看 has_more。
+  修法是让**窗口在 wire 上不可见**：撞到 bound 就从 `Excluded(bound)` 再取一个窗口继续合并，
+  `has_more` 恢复成 `out.len()==limit`，短页重新等价于"扫完了"，四个消费者一个都不用改。
+  耗尽也要先 refill——有 bound 时两边都空什么都证明不了。消融验证：改回 stop-at-bound，
+  "热键版本数超过窗口"那个测试只返回 `[k-hot]`（正是 fable 预测的形状），墓碑那个也红。
+  **这推翻了账本里那条"delete_many 无收益"的负结果**：当初的测量没错，但它是透过扫描瓶颈测的，
+  删除侧再快也显示不出来。教训 = 负结果要连同"当时的瓶颈在哪"一起记，否则换了瓶颈就失效。
+  剩下的 68 s 是单分区写天花板，客户端侧动不了;要进一分钟内得给 mem 命名空间多分区。
+  **顺带修一个真 panic**：`fold_plural` 按字节切片，`100µs` 这种 token（6 字节、以 s 结尾）
+  会切进 'µ' 中间 panic，整个 ingest 进程直接挂。tokenizer 会把任何非 CJK 的 Unicode
+  alphanumeric 攒成 token，所以普通散文就能触发。已加非 ASCII 早退 + 消融验证过的回归测试。
+
 【2026-09-02 F-BATCH-ZC-REST 收尾两项：已完成】
   ① `drain_bulk_writes` 之前只认 `MSG_PUT_BULK`，于是 `MSG_BATCH_PUT_BULK` 的尾巴拿不到
   recv-into-pooled 快路——要先在 FrameDecoder 的 BytesMut 里攒一遍（一次应用层拷贝），

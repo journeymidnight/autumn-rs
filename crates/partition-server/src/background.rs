@@ -3658,6 +3658,51 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     None
 }
 
+/// The RANGE path's memtable view: one capped WINDOW from `from` onward, values
+/// dropped. See `Memtable::snapshot_range_keys` for why the full snapshot the
+/// range path used to take is O(memtable) per page.
+///
+/// Returns the items plus an optional BOUND. `Some(k)` means at least one
+/// memtable ran out of window at `k`, so beyond `k` this view may be missing
+/// entries and the caller must not emit a key it cannot prove is the newest
+/// version. The bound is the MINIMUM last-key over the truncated runs — the
+/// first point past which ANY run goes blind.
+///
+/// The bound is a signal to REFILL, not to stop: `range_scan_sst_merge` calls
+/// this again from `Excluded(bound)` and keeps merging. Stopping instead makes
+/// the window visible on the wire, and it cannot be made visible safely — see
+/// the invariant in `handle_range`.
+pub(crate) fn collect_mem_items_for_range(
+    part: &PartitionData,
+    from: std::ops::Bound<&[u8]>,
+    cap: usize,
+) -> (Vec<IterItem>, Option<Vec<u8>>) {
+    let mut items: Vec<IterItem> = Vec::new();
+    let mut bound: Option<Vec<u8>> = None;
+    let note = |chunk: &[IterItem], truncated: bool, bound: &mut Option<Vec<u8>>| {
+        if !truncated {
+            return;
+        }
+        let Some(last) = chunk.last() else { return };
+        let replace = match bound.as_deref() {
+            Some(b) => crate::cmp_internal_keys(&last.key, b).is_lt(),
+            None => true,
+        };
+        if replace {
+            *bound = Some(last.key.clone());
+        }
+    };
+    let (chunk, truncated) = part.active.snapshot_range_keys(from, cap);
+    note(&chunk, truncated, &mut bound);
+    items.extend(chunk);
+    for imm in part.imm.iter().rev() {
+        let (chunk, truncated) = imm.snapshot_range_keys(from, cap);
+        note(&chunk, truncated, &mut bound);
+        items.extend(chunk);
+    }
+    (items, bound)
+}
+
 pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
     let mut items = part.active.snapshot_sorted();
     for imm in part.imm.iter().rev() {

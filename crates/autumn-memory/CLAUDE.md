@@ -55,7 +55,10 @@ Posting-on-KV, done directly:
   BM25 (`bm25_term`, k1=1.2 b=0.75) over each doc's current term map → top-k.
   `df` ≈ posting count (stale-orphan over-count is bounded; idf robust).
 - Tokenizer: lowercase + maximal-alphanumeric runs + small stopword set +
-  conservative plural folding; **CJK** (Han / kana / Hangul) emits BOTH the
+  conservative plural folding (**ASCII tokens only** — the folding rules index
+  BYTES and are English morphology either way, so a non-ASCII token is returned
+  untouched; `100µs` is 6 bytes and ends in `s`, and slicing it panicked the
+  whole ingest); **CJK** (Han / kana / Hangul) emits BOTH the
   per-codepoint unigram (单字常是整词, 如 猫/狗 — keeps single-character queries
   working) AND the adjacent bigram inside one run. A bigram never bridges
   punctuation, whitespace or Latin, so it only ever joins characters the writer

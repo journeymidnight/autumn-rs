@@ -308,6 +308,13 @@ struct Args {
 /// Delete every key under `mem/{tenant}/{agent}/` — a complete wipe of this
 /// agent's memory (nodes/edges/docs/postings/vectors/stats), so a following
 /// re-index starts clean (no stale symbols removed from the code).
+///
+/// The page is deleted with one `delete_many` rather than a key-at-a-time
+/// loop. That is the crate's own round-trip rule, but it is worth noting WHY
+/// it took two attempts: measured against a serial loop it once showed no gain
+/// at all (3380 vs 3418 keys/s), which was true and misleading — the scan side
+/// was costing ~130 ms per page, so nothing on the delete side could show.
+/// With the scan fixed the same change is worth ~3x.
 async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<usize> {
     let client = store.client();
     let prefix = autumn_memory::keys::agent_prefix(tenant, agent);
@@ -320,8 +327,9 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
             break;
         }
         let last = res.entries[n - 1].key.clone();
-        for e in res.entries {
-            client.delete(&e.key).await?;
+        let keys: Vec<&[u8]> = res.entries.iter().map(|e| e.key.as_slice()).collect();
+        for r in client.delete_many(&keys).await {
+            r?;
             total += 1;
         }
         if n < 512 {

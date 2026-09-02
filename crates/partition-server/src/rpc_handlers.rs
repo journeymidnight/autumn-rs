@@ -679,54 +679,55 @@ pub(crate) async fn handle_get_redirect_many(
                         ec_data_shards: 0,
                         ec_sealed_length: 0,
                     },
-                    // Descriptor lookup failed (manager blip / EC-converted /
-                    // cache miss). Do NOT inline the (large) value here — the
-                    // single handler inlines ONE, but a mass descriptor failure
-                    // during a model load would aggregate hundreds of 8 MiB
-                    // values into one GB-scale response frame (coco P1 = OOM /
-                    // over-cap frame). FAIL the batch instead: the client leaves
-                    // this partition's descriptors unset and re-reads each item
-                    // via the per-item proxy path (get_range_direct_into →
-                    // call_ps_for_key, which refreshes). The batched redirect is
-                    // an optimization, never a correctness dependency.
-                    // A decline and a failure both end the batch the same way —
-                    // the client re-reads every item through the proxy — but they
-                    // are not the same event, and until they were logged apart
-                    // there was no way to tell an EC cluster doing the expected
-                    // thing from a manager that had stopped answering. Which one
-                    // this is also decides whether a per-item "skip me" signal
-                    // would buy anything: it only helps if batches are MIXED, and
-                    // that is what these two lines let us find out before adding
-                    // wire surface for it.
+                    // A DECLINE is per ITEM, never per batch. This extent
+                    // cannot be read directly — a data shard's node is
+                    // Suspected, or a pre-copy-on-write conversion left the
+                    // payload outside `.dat` — but the other keys in the batch
+                    // are usually fine, so answer `CODE_PRECONDITION` for this
+                    // one and let the client proxy exactly it.
+                    //
+                    // Failing the WHOLE batch (what this did) was measured at
+                    // 3.5x SLOWER than not attempting direct reads at all, on a
+                    // cluster where some extents declined: the client dropped
+                    // every descriptor and re-read each key through
+                    // `get_range_direct_into`, which pays its OWN redirect
+                    // round trip before proxying. One batched proxy read became
+                    // a redirect RTT plus a proxy RTT per key. The batch is an
+                    // optimization, but throwing it away is not free.
+                    //
+                    // Deliberately NOT inlining the value here, which is the
+                    // other way to answer a decline: the single-key handler
+                    // inlines ONE, while a batch that declined broadly during a
+                    // model load would aggregate hundreds of 8 MiB values into
+                    // one GB-scale frame. An empty marker costs nothing and the
+                    // client already has a proxy path.
                     Ok(ReadDescriptor::NotDirect(why)) => {
-                        why.log(extent_id, "get_redirect_many: batch falls back to proxy");
-                        // FailedPrecondition, NOT Unavailable — and the
-                        // difference is seconds of latency per call, not
-                        // tidiness. `Unavailable` maps to `ConnectionError`,
-                        // which the SDK classifies as transient and retries
-                        // through MAX_PS_REFRESHES with backoff (~9 s) before
-                        // the caller ever reaches its per-item proxy fallback.
-                        // A decline is deterministic — every retry gets the
-                        // same answer, because the extent is still EC — so on a
-                        // cluster with EC armed that was a ~9-13 s stall on
-                        // EVERY batched direct read touching a converted
-                        // extent, with `--direct-read` on by default.
-                        // `FailedPrecondition` is in `call_ps_for_part`'s
-                        // deterministic short-circuit set, so it surfaces at
-                        // once and the caller proxies immediately.
-                        //
-                        // Scoped to THIS message: `call_ps_for_key` reads
-                        // FailedPrecondition as a stale region epoch and
-                        // refreshes routing. That is why the status is chosen
-                        // per call site rather than per error kind.
-                        return Err((
-                            StatusCode::FailedPrecondition,
-                            format!(
+                        why.log(extent_id, "get_redirect_many: item falls back to proxy");
+                        GetRedirectResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
                                 "redirect declined for extent {extent_id}: {}",
                                 why.as_str()
                             ),
-                        ));
+                            value: vec![],
+                            extent_id: 0,
+                            value_offset: 0,
+                            value_len: 0,
+                            eversion: 0,
+                            replica_addrs: vec![],
+                            ec_data_shards: 0,
+                            ec_sealed_length: 0,
+                        }
                     }
+                    // A lookup ERROR is not a decline. It is USUALLY batch-wide
+                    // (this PS cannot reach the manager), which is why the whole
+                    // batch fails here and the client proxies everything. It can
+                    // also be per-extent — `fetch_extent_info` errors when the
+                    // manager answers with no such extent, which a GC punch
+                    // racing a stale VP produces — and for those this costs the
+                    // batch. That case is a window rather than a steady state,
+                    // and it behaved this way before the per-item marker
+                    // existed; the marker is for the DETERMINISTIC decline.
                     Err(e) => {
                         tracing::warn!(
                             extent_id,
@@ -1148,11 +1149,26 @@ pub(crate) async fn handle_range(
     // the snapshot, redo the WHOLE scan once against the fresh set (range
     // is limit-bounded; one redo on a rare race is cheaper than mid-scan
     // resume bookkeeping). Unchanged set or second failure = real error.
+    // How much memtable one WINDOW holds. Generous relative to the page — the
+    // point is to stop paying O(memtable) per request, not to shave the window
+    // — and it is purely an internal batch size: `range_scan_sst_merge` refills
+    // as often as it needs to, so the window is never visible on the wire.
+    //
+    // INVARIANT: the window MUST NOT change what a page reports. `has_more` is
+    // `out.len() == limit` and a short page still means "prefix exhausted",
+    // because four in-repo consumers page by exactly that (`wipe_agent`,
+    // `MemoryStore::scan_keys`, and the fuse extent/tombstone loops all break
+    // on `n < limit` and never read `has_more`), and `ClusterClient::range`
+    // advances its cursor to the partition's END key on any page it believes
+    // complete. Reporting truncation instead of hiding it silently drops keys
+    // in both: the caller stops early, or the cursor jumps the gap.
+    let mem_cap = (req.limit as usize).saturating_mul(4).max(4096);
     let mut attempt = 0u32;
     let out = loop {
         attempt += 1;
         let p = part.borrow();
-        let mem_items = collect_mem_items(&p);
+        let (mem_items, mem_bound) =
+            collect_mem_items_for_range(&p, std::ops::Bound::Included(&seek_key), mem_cap);
         // Unfiltered Arc snapshot for change detection (the scan set below
         // is pre-filtered, so it can't be ptr-compared against live state).
         let full_snap: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
@@ -1202,6 +1218,9 @@ pub(crate) async fn handle_range(
             now,
             check_overlap,
             &part_rg,
+            mem_bound,
+            part,
+            mem_cap,
         )
         .await
         {
@@ -1245,7 +1264,11 @@ async fn range_scan_sst_merge(
     now: u64,
     check_overlap: bool,
     part_rg: &autumn_rpc::manager_rpc::MgrRange,
+    mem_bound: Option<Vec<u8>>,
+    part: &Rc<RefCell<PartitionData>>,
+    mem_cap: usize,
 ) -> anyhow::Result<Vec<RangeEntry>> {
+    let mut mem_bound = mem_bound;
     let mut mem_it = MemtableIterator::new(mem_items);
     mem_it.seek(seek_key);
 
@@ -1266,6 +1289,62 @@ async fn range_scan_sst_merge(
     let mut last_user_key: Option<Vec<u8>> = None;
 
     loop {
+        // REFILL before deciding anything, whenever the next key to consider
+        // is at or past the point where the memtable view goes blind.
+        //
+        // The exhaustion case is the subtle one: with a bound set, BOTH
+        // iterators running dry proves nothing — the memtable may hold more
+        // past the window, and treating that as end-of-scan is how a page ends
+        // early with `has_more == false`. So exhaustion refills too, and only a
+        // refill that finds nothing ends the scan.
+        //
+        // The check runs BEFORE the selection below, not after: selecting
+        // advances an iterator, and an item pulled and then rejected for being
+        // past the bound would be lost.
+        if let Some(b) = mem_bound.clone() {
+            let next_key = match (mem_it.valid(), merge.valid()) {
+                (true, true) => {
+                    let mk = mem_it.item().map(|i| i.key.clone());
+                    let sk = merge.item().map(|i| i.key.clone());
+                    match (mk, sk) {
+                        (Some(m), Some(s)) => {
+                            Some(if crate::cmp_internal_keys(&m, &s).is_le() { m } else { s })
+                        }
+                        (m, s) => m.or(s),
+                    }
+                }
+                (true, false) => mem_it.item().map(|i| i.key.clone()),
+                (false, true) => merge.item().map(|i| i.key.clone()),
+                (false, false) => None,
+            };
+            let refill = match &next_key {
+                None => true,
+                Some(k) => crate::cmp_internal_keys(k, &b).is_gt(),
+            };
+            if refill {
+                let (items, next_bound) = {
+                    let p = part.borrow();
+                    crate::background::collect_mem_items_for_range(
+                        &p,
+                        std::ops::Bound::Excluded(b.as_slice()),
+                        mem_cap,
+                    )
+                };
+                let empty = items.is_empty();
+                mem_it = MemtableIterator::new(items);
+                mem_bound = next_bound;
+                if empty && mem_bound.is_none() {
+                    // The memtable really is exhausted past the old bound; the
+                    // SST side (if any) can now be trusted to the end.
+                    if !merge.valid() {
+                        break;
+                    }
+                }
+                // No seek: the refill was `Excluded(b)`, so every entry in the
+                // new window already sorts strictly after the old bound.
+                continue;
+            }
+        }
         let mem_key = if mem_it.valid() {
             mem_it.item().map(|i| i.key.as_slice())
         } else {

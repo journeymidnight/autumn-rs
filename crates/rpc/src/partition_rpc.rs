@@ -246,11 +246,30 @@ pub struct AuthHelloResp {
 /// response for `MSG_GET_REDIRECT` (rkyv).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetRedirectResp {
+    /// `CODE_OK` — either a descriptor (`extent_id != 0`) or an inline value.
+    /// `CODE_NOT_FOUND` — no such key.
+    /// `CODE_PRECONDITION` — **this item alone** cannot be read directly (its
+    /// shards' node is Suspected, or a pre-copy-on-write conversion left the
+    /// payload outside `.dat`); read it through the PS proxy. Only
+    /// `MSG_GET_REDIRECT_MANY` produces it, and it is per ITEM, not per batch:
+    /// declining the whole batch turned one batched proxy read into a redirect
+    /// round trip PLUS a proxy round trip for every key in it, measured at
+    /// 3.5x slower than not attempting direct reads at all on a cluster where
+    /// some extents declined.
+    /// A client MUST test this code BEFORE the `extent_id == 0` inline arm —
+    /// a declined item carries an empty `value`, so reading it as inline
+    /// silently fills the caller's buffer with nothing and reports success.
     pub code: u8,
     pub message: String,
-    /// Inline value when no redirect applies (`extent_id == 0`).
+    /// The value itself, when `code == CODE_OK` and `extent_id == 0`. Empty on
+    /// every other code — including a `CODE_PRECONDITION` decline, which is why
+    /// `code` must be tested first.
     pub value: Vec<u8>,
-    /// 0 = no redirect (value is inline above).
+    /// The extent to read from. `0` means there is no extent to read: either
+    /// the value is inline in `value` above (`CODE_OK`), or this item was
+    /// declined and must be proxied (`CODE_PRECONDITION`). **`extent_id == 0`
+    /// alone does NOT mean inline** — reading it that way serves a declined
+    /// item's empty `value` as if it were the value.
     pub extent_id: u64,
     /// Byte offset of the VALUE bytes inside the extent (the PS already
     /// skipped the WAL record framing + key, so the client reads value

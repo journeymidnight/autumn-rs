@@ -42,7 +42,21 @@
 - **⚠️ 已排除的解法（负结果，别重做）**: 把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380 → 3418 key/s）。原因：`ClusterClient::delete_many` 不是批量 RPC，而是并发上限 32 的客户端扇出；而同集群 `perf-check` 显示单分区写 1 线程 9.2K ops/s、8 线程即达 30K ops/s 天花板 ⇒ 删除本身只该占约 12 s，104 s 里的绝大部分是 **694 次 range 扫描**（每页 512 键约 133 ms）。改动已回滚（按 `feedback_no_defensive_fixes_for_imaginary_bugs`：没有实测收益的优化不留）。**真正的瓶颈是前缀扫描，不是删除。**
 - **Scope（真要做时）**: 先测准扫描为何这么慢（一页 512 键 133 ms 与 30K ops/s 的写路径不相称；怀疑 tombstone 累积后 iterator seek 变贵，需要在 PS 侧计时确认），再决定是加服务端前缀删除（一次 RPC 删一个前缀，PS 内部直接下 range tombstone），还是仅优化扫描。**在测准之前不要动客户端。**
 - **Acceptance**: 清一个 5164 chunk 语料（约 200 万 key）从 ~10 分钟降到分钟以内，且有 PS 侧分段计时证明瓶颈确实被移走；`reconcile` 在清空后 `is_clean`。
-- **Status**: `passes: false` (2026-09-02) — **有可用绕行**：拿干净 agent 用 `./cluster.sh reset`（秒级）而不是 `--reset`，已写进 `docs/ops.md`「Retrieval-quality eval」。故只是运维摩擦，不是阻塞。
+- **Status**: `passes: false` (2026-09-02) — **瓶颈已测准并移除，但没打到"分钟以内"这条线**。
+  实测（同一份 1,987,843 key 的语料，本机 3 节点 --3disk）：**588 s → 70.2 s**（8.4×，
+  29,190 key/s）。完整性直接验过：wipe 后前缀扫描返回空，且三次独立运行的删除计数都精确等于
+  1,987,843（扫描若提前结束，计数会变少）。
+  第一步是扫描：`handle_range` 每次请求都把**整个 memtable + 全部 imm** 克隆成 Vec 再排序
+  （`collect_mem_items` → `snapshot_sorted`），而且连 value 一起克隆——range 返回的
+  `RangeEntry.value` 恒为空，那些 value 是纯浪费。这笔开销是 O(memtable) 且与 page limit
+  无关：release 实测 50 万条 64B value = 66.5 ms、512B value = 124 ms、100 万条 = 212 ms，
+  和现场观察到的 133 ms/页对得上。改成从 seek 点起的**窗口**快照（cap = max(4×limit, 4096)、
+  不克隆 value），每页固定 ~215 µs，与 memtable 大小无关。
+  第二步是删除：把逐 key 删除换成 `delete_many`，只修扫描时是 253.5 s，加上批量删除后
+  70.2 s = **29,190 key/s**，正好压在单分区 ~30K ops/s 的写天花板上。**上面那条"负结果"
+  由此被推翻**——当初测不出收益是因为扫描占了全程的绝大部分，删除侧再快也显示不出来；
+  瓶颈换了以后同一个改动值 3.6×。教训：负结果必须连同"当时的瓶颈在哪"一起记。
+  剩下的 70 s 是单分区写天花板，客户端侧再优化不动了；要进一分钟内需要 `mem` 命名空间多分区。
 
 ### BUG-KVC-MM-ALIAS — 多模态请求取不到 mm hash 时仍然缓存（跨图片 KV 串读）
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:193`；**已复核代码为真**): `_request_extra_keys()` 已经识别出"有 `mm_features` 但取不到任何 mm hash"这一情况并打 warning，注释甚至写明 "its prefix hash would collide across DIFFERENT images sharing the same placeholder token ids (false-alias → wrong output)" —— 然后**照样返回不含 disambiguator 的 keys 并继续缓存**（"the connector still caches (best-effort)"）。VLM 场景下同尺寸不同图片的 placeholder token 序列可以完全相同 ⇒ 用户 B 可能读到用户 A 的视觉 KV：错误输出 + **跨请求信息泄漏**。
