@@ -243,6 +243,22 @@ pub fn encode_bulk_response_head(
     message: &str,
     value_len: usize,
 ) -> Bytes {
+    encode_bulk_response_head_bytes(req_id, msg_type, code, message.as_bytes(), value_len)
+}
+
+/// `encode_bulk_response_head` for a ctrl tail that is NOT text. The layout is
+/// unchanged — `[code:1][tail…]`, CRC'd, with the raw values following — so
+/// `parse_bulk_ctrl` reads it the same way; only the interpretation of the tail
+/// differs. A batched bulk read puts its per-key statuses and value lengths
+/// here, which is what lets one reply carry N values and still be splittable.
+pub fn encode_bulk_response_head_bytes(
+    req_id: u32,
+    msg_type: u8,
+    code: u8,
+    ctrl_tail: &[u8],
+    value_len: usize,
+) -> Bytes {
+    let message = ctrl_tail;
     let ctrl_len = 1 + message.len();
     let wire_payload_len = CTRL_OVERHEAD + ctrl_len + value_len;
     let mut buf = BytesMut::with_capacity(HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len + CRC_LEN);
@@ -252,7 +268,7 @@ pub fn encode_bulk_response_head(
     buf.put_u32_le(wire_payload_len as u32);
     buf.put_u32_le(ctrl_len as u32);
     buf.put_u8(code);
-    buf.extend_from_slice(message.as_bytes());
+    buf.extend_from_slice(message);
     let crc = crc32c::crc32c(&buf[..]);
     buf.put_u32_le(crc);
     buf.freeze()

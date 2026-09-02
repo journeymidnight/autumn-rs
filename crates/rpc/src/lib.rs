@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 31;
-pub const WIRE_VERSION_MAX: u32 = 31;
+pub const WIRE_VERSION_MIN: u32 = 32;
+pub const WIRE_VERSION_MAX: u32 = 32;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -487,6 +487,20 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // operating point sits on the single-partition ~30k ops/s ceiling where no
     // byte-side saving can show. Pre-R3: MIN=MAX=31.
     (31, "564167951e81d407"),
+    // v32: `MSG_BATCH_GET_BULK` (0x5B) + `BatchGetBulkCtrl` — the read mirror
+    // of v31. Request shape is unchanged (`BatchGetReq`); the REPLY moves its
+    // values out of the rkyv response into the frame's raw tail, keeping only
+    // per-key status and length in the CRC'd ctrl. The inline form copied every
+    // value byte four times on the server — out of the memtable result, twice
+    // through `rkyv_encode`, once more assembling the frame — and then CRC'd
+    // all of it, because a normal response protects its whole payload. It also
+    // ran through `partition_loop`, so a batched read queued behind the
+    // single-writer group-commit actor; the bulk form is served on the
+    // connection task next to `MSG_GET_BULK`. `frame.rs` gained
+    // `encode_bulk_response_head_bytes` (same layout, binary ctrl tail) and
+    // `BulkResp` now carries that tail verbatim, since lossy UTF-8 would
+    // corrupt binary statuses. Pre-R3: MIN=MAX=32.
+    (32, "58a279d2f64a5206"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

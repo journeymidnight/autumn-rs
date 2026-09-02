@@ -19,8 +19,8 @@ use autumn_rpc::cap_token::{verify_token, AuthReject};
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
-    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET, MSG_BATCH_PUT,
-    MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
+    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET,
+    MSG_BATCH_GET_BULK, MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
     MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
@@ -367,7 +367,9 @@ pub fn authz_check(
             let r = partition_rpc::rkyv_decode::<RangeReq>(payload).ok()?;
             check_range(&r.prefix, principal, inner, now)
         }
-        MSG_BATCH_GET => {
+        // Both batched read forms carry the same `BatchGetReq`; only the
+        // response shape differs, and authz never looks at responses.
+        MSG_BATCH_GET | MSG_BATCH_GET_BULK => {
             let r = partition_rpc::rkyv_decode::<BatchGetReq>(payload).ok()?;
             for k in &r.keys {
                 if let Some(d) = check_key(k, principal, inner, now) {
@@ -777,6 +779,34 @@ mod tests {
         // A raw key with no `{ns}/` structure is rejected too.
         let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
         assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
+    }
+
+    #[test]
+    fn batched_bulk_read_keys_are_gated_like_the_inline_form() {
+        // `authz_check`'s match also ends in a catch-all that ADMITS, so a
+        // batched READ with no arm would hand back values for keys the caller
+        // has no grant on. Both batch-read msg types carry the same request, so
+        // the arm covers them together — this pins that it actually does.
+        let inner = inner_with(vec![]);
+        let p = acme();
+        let mk = |k2: &[u8]| {
+            partition_rpc::rkyv_encode(&BatchGetReq {
+                part_id: 1,
+                region_epoch: 0,
+                keys: vec![b"acme/mem/1".to_vec(), k2.to_vec()],
+            })
+            .to_vec()
+        };
+        for msg in [MSG_BATCH_GET, MSG_BATCH_GET_BULK] {
+            assert!(
+                authz_check(msg, &mk(b"acme/mem/2"), Some(&p), &inner, 0).is_none(),
+                "in-grant keys must pass ({msg:#x})"
+            );
+            assert!(
+                authz_check(msg, &mk(b"other/mem/2"), Some(&p), &inner, 0).is_some(),
+                "an out-of-grant key must be refused ({msg:#x})"
+            );
+        }
     }
 
     #[test]

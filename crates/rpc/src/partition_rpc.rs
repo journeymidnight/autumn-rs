@@ -167,6 +167,24 @@ pub const MSG_BATCH_PUT_BULK: u8 = 0x5A;
 /// per-key status, not a per-batch error.
 pub const MSG_BATCH_GET: u8 = 0x54;
 
+/// Batched GET whose values come back OUT of the rkyv response: ctrl carries
+/// per-key status and value length, the raw response tail carries the values.
+/// The read mirror of `MSG_BATCH_PUT_BULK`, and the request shape is exactly
+/// `MSG_BATCH_GET`'s (`BatchGetReq`) — only the answer changes.
+///
+/// The inline form copies every value byte four times on this side alone
+/// (`to_vec` out of the memtable result, twice through `rkyv_encode`, and again
+/// when `Frame::encode` builds the wire buffer) and then CRC-scans all of it,
+/// because a normal response frame protects its whole payload. Here the values
+/// ride the raw tail under transport integrity — the same trade `MSG_GET_BULK`
+/// already makes — while statuses and lengths stay inside the CRC'd ctrl, so a
+/// truncated or reordered reply is still detected structurally.
+///
+/// Served on the connection task next to `MSG_GET_BULK`, not through
+/// `partition_loop`: batched reads have no business queueing behind the
+/// single-writer group-commit actor.
+pub const MSG_BATCH_GET_BULK: u8 = 0x5B;
+
 /// redirect GET. Same request shape as MSG_GET (`GetReq`). For a
 /// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
 /// DESCRIPTOR (extent + the value's exact byte range inside the extent +
@@ -332,6 +350,17 @@ pub struct BatchPutBulkReq {
     pub part_id: u64,
     pub region_epoch: u64,
     pub ops: Vec<BatchPutBulkOp>,
+}
+
+/// Ctrl tail of a `MSG_BATCH_GET_BULK` response (after the leading code byte).
+/// `statuses[i]` uses the same values as `BatchGetItem::status` (0 = found,
+/// 1 = not found, 2 = error) and `value_lens[i]` is that key's slice of the
+/// response tail — `0` for every non-found status.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetBulkCtrl {
+    pub message: String,
+    pub statuses: Vec<u8>,
+    pub value_lens: Vec<u32>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -933,7 +962,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_BATCH_PUT => rkyv_decode::<BatchPutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
-        MSG_BATCH_GET => rkyv_decode::<BatchGetReq>(payload)
+        MSG_BATCH_GET | MSG_BATCH_GET_BULK => rkyv_decode::<BatchGetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_DIAG_PARTITION_VP => rkyv_decode::<DiagPartitionVpReq>(payload)
@@ -965,6 +994,7 @@ mod msg_type_tests {
             MSG_BATCH_PUT,
             MSG_BATCH_PUT_BULK,
             MSG_BATCH_GET,
+            MSG_BATCH_GET_BULK,
             MSG_GET_REDIRECT,
             MSG_GET_REDIRECT_MANY,
             MSG_AUTH_HELLO,

@@ -2219,6 +2219,58 @@ impl ClusterClient {
         )))
     }
 
+    /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
+    /// the reply's ctrl and its raw tail come back separately, the tail already
+    /// in a pool buffer (RDMA'd straight into it on UCX). Used by the batched
+    /// bulk read, where the tail holds every value at once.
+    async fn call_ps_for_part_pooled(
+        &self,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> std::result::Result<autumn_rpc::client::BulkResp, AutumnError> {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let ps_addr = self
+                .resolve_part_id(part_id)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            match self.get_ps_client(&ps_addr).await {
+                Ok(client) => {
+                    let call = client.call_into_pooled(msg_type, payload.clone());
+                    // Cancel-safe like every other pooled call: a timed-out
+                    // call's buffer returns to the pool via the read loop.
+                    let outcome = match self.first_attempt_effective_timeout(attempt) {
+                        None => call.await,
+                        Some(t) => match compio::time::timeout(t, call).await {
+                            Ok(r) => r,
+                            Err(_) => Err(autumn_rpc::RpcError::status(
+                                StatusCode::Unavailable,
+                                format!("bulk batch read timed out after {t:?}"),
+                            )),
+                        },
+                    };
+                    match outcome {
+                        Ok(z) => return Ok(z),
+                        Err(e) => {
+                            self.ps_conns.borrow_mut().remove(&ps_addr);
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if !self.refresh_and_backoff(&mut attempt).await {
+                break;
+            }
+        }
+        Err(AutumnError::ConnectionError(format!(
+            "ps_call_pooled(part {part_id}) after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+
     async fn call_ps_for_part(
         &self,
         part_id: u64,
@@ -3272,10 +3324,11 @@ impl ClusterClient {
     /// dest buffers.** Mirror of `put_many`. SDK allocates a
     /// `Vec<u8>` per returned value; result `i` matches `keys[i]`.
     ///
-    /// Wire: one `MSG_BATCH_GET` per owning partition. The PS handler
-    /// runs INLINE on the ps-conn task (reads never go through
-    /// `partition_loop`), so the win is amortising one wire frame +
-    /// one rkyv decode over N keys.
+    /// Wire: one `MSG_BATCH_GET_BULK` per owning partition — keys in ctrl, and
+    /// every value back in the reply's raw tail rather than inside the rkyv
+    /// response. The PS serves it on the ps-conn task, next to `MSG_GET_BULK`;
+    /// the older inline `MSG_BATCH_GET` went through `partition_loop`, so a
+    /// batched read queued behind the single-writer group-commit actor.
     ///
     /// When to use `get_many` vs `get_many_into`:
     /// - **`get_many`** — when you don't know the value sizes (or
@@ -3337,11 +3390,16 @@ impl ClusterClient {
                 region_epoch,
                 keys: keys_payload,
             });
-            let resp_bytes = match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_GET, payload)
+            // MSG_BATCH_GET_BULK: the values come back in the reply's raw
+            // tail (one pool buffer, RDMA'd into on UCX) with only statuses
+            // and lengths in ctrl. The inline form copied every value byte
+            // four times on the server and CRC-scanned all of it, because a
+            // normal response frame protects its whole payload.
+            let z = match self
+                .call_ps_for_part_pooled(part_id, partition_rpc::MSG_BATCH_GET_BULK, payload)
                 .await
             {
-                Ok(b) => b,
+                Ok(z) => z,
                 Err(AutumnError::PreconditionFailed(_)) => {
                     // Same stale-epoch handling as batch_put — see comment
                     // there. Fall back to per-key `get_bound` (call_ps_for_key
@@ -3363,8 +3421,8 @@ impl ClusterClient {
                     continue;
                 }
             };
-            let resp: partition_rpc::BatchGetResp = match rkyv_decode(&resp_bytes) {
-                Ok(r) => r,
+            let ctrl: partition_rpc::BatchGetBulkCtrl = match rkyv_decode(&z.ctrl) {
+                Ok(c) => c,
                 Err(e) => {
                     fail_slots(&mut results, group.iter().copied(), || {
                         AutumnError::ServerError(e.clone())
@@ -3372,26 +3430,44 @@ impl ClusterClient {
                     continue;
                 }
             };
-            if resp.code != partition_rpc::CODE_OK {
+            if z.code != partition_rpc::CODE_OK {
                 fail_slots(&mut results, group.iter().copied(), || {
-                    code_to_error(resp.code, resp.message.clone())
+                    code_to_error(z.code, ctrl.message.clone())
                 });
                 continue;
             }
-            if resp.items.len() != group.len() {
+            // Two shape checks, because the values are only findable through
+            // ctrl: one status per key, and lengths that account for exactly
+            // the tail that arrived. Either mismatch means the two halves of
+            // the reply disagree, and a wrong split would hand back another
+            // key's bytes as if they were this one's.
+            let tail: &[u8] = z.buf.as_ref();
+            let declared: usize = ctrl.value_lens.iter().map(|l| *l as usize).sum();
+            if ctrl.statuses.len() != group.len()
+                || ctrl.value_lens.len() != group.len()
+                || declared != tail.len()
+            {
                 let mismatch = format!(
-                    "get_many: items len {} != group len {}",
-                    resp.items.len(),
-                    group.len()
+                    "get_many: {} statuses / {} lens / {declared} declared bytes for {} keys and a {}-byte tail",
+                    ctrl.statuses.len(),
+                    ctrl.value_lens.len(),
+                    group.len(),
+                    tail.len(),
                 );
                 fail_slots(&mut results, group.iter().copied(), || {
                     AutumnError::ServerError(mismatch.clone())
                 });
                 continue;
             }
-            for (&idx, item) in group.iter().zip(resp.items.into_iter()) {
-                results[idx] = match item.status {
-                    0 => Ok(Some(item.value)),
+            let mut off = 0usize;
+            for ((&idx, &status), &len) in
+                group.iter().zip(ctrl.statuses.iter()).zip(ctrl.value_lens.iter())
+            {
+                let len = len as usize;
+                let value = &tail[off..off + len];
+                off += len;
+                results[idx] = match status {
+                    0 => Ok(Some(value.to_vec())),
                     1 => Ok(None),
                     s => Err(AutumnError::ServerError(format!(
                         "get_many op status={s}"

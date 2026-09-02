@@ -14,25 +14,14 @@
 
 ## Active
 
-### F-BATCH-ZC — 批量 RPC 的值走零拷贝（写侧已实现并验收；读侧 + 两项加固待做）
-- **Trigger** (2026-09-02, 用户: "如何 BATCH 凑出了超过 64K，明显用 bulk 更快，但是现在没有这个能力"): bulk 判据加在**单条 value** 上（`bulk_worthwhile(v.len())`），所以 256×4 KiB 的批量哪怕在线上是 1 MiB 的一帧也走拷贝路径。判据加错了量——决定一次传输值不值得独占 iovec 的是**帧**有多大，而把帧撑大的正是批量。
-- **写侧已实现（wire v31）**: `MSG_BATCH_PUT_BULK`(0x5A)，ctrl 带 key + `value_len`，N 条 value 走 frame 裸尾巴；选择改按**分组总字节**。帧格式没动（`value_len` 本就是尾巴总长，切点写在 ctrl 里）。`call_vectored_bulk_multi` 收 `Vec<Bytes>`（writev 本来就吃 Vec）。PS 侧 `enqueue_batch_put_bulk` 从尾巴切 `Bytes` 直喂 `WriteOp::Put`（下游本就收 `Bytes`）。authz 两层都加了 arm（catch-all 是放行，漏加即绕过）。
-- **实测（同集群、两个只差一行的客户端二进制交替取样）**:
-
-  | 传输 / 值 | inline | zerocopy | Δ |
-  |---|---|---|---|
-  | TCP loopback 4 KiB | 103.8 | 103.7 | 0%（op 绑定区间，见下） |
-  | TCP loopback 32 KiB | 450.6 | 523.1 | **+16%** |
-  | RoCE(rc_mlx5) 4 KiB | 57.9（47.2/68.5 抖动) | 93.3（93.26/93.43 稳） | **约 +61%** |
-
-  4 KiB/TCP 的 0% 是**测量区间**不是无效：103.8 MB/s ÷ 4 KiB ≈ 26.5K ops/s，正压在单分区 ~30K ops/s 的 op 天花板上（该天花板是用 64 字节值测的，与拷贝无关）。
-- **推翻的两个先前判断（都写下来免得再犯）**: ①「带宽绑定，去掉拷贝抬不动天花板」——错，选错了操作点也选错了传输；②「批量已经摊薄了 bulk 的收益」——错，inline 批量对**逐字节**拷贝一点没摊薄，而且 `extract_part_id` 为读一个 `part_id` 就把整帧完整反序列化、`check_layer_a` 再来一遍，一个 256-op 帧多约 1500 次分配。
+### F-BATCH-ZC-REST — 批量零拷贝的三项收尾（主体已实现，wire v31/v32）
+- **背景**: 批量 RPC 的值原本被拷来拷去，因为 bulk 判据加在**单条 value** 上，而决定一次传输值不值得独占 iovec 的是**帧**有多大。已实现 `MSG_BATCH_PUT_BULK`(0x5A, v31) 与 `MSG_BATCH_GET_BULK`(0x5B, v32)，判据改按分组总字节。实测：写侧 TCP/32K **+16%**、RoCE/4K **约 +61%**；读侧真实查询负载端到端 **-7.5%**（loopback TCP，且 `get_many` 只占该负载一部分）。
 - **仍待做**:
-  1. **读侧 `MSG_BATCH_GET_BULK`**：`get_many` 的值 inline 在 rkyv 响应里（PS 侧 `v.to_vec()` + 两次 `rkyv_encode` + `Frame::encode` 再拷一遍并**把 value 也纳入 CRC 扫描**，客户端解码再拷两次），而零拷贝的 `MSG_GET_BULK` 只有逐条版 ⇒ 批量与零拷贝同样互斥。逐条 A/B 显示读侧收益（+50.6%）**大于**写侧（+23.8%），且读没有 fsync 天花板。顺带能修一个真缺陷：`MSG_BATCH_GET` **不在 serve-local 名单里**，它绕进 `partition_loop`，批量读会阻塞 group-commit actor（`client/src/lib.rs` 里 `get_many` 的文档注释声称"reads never go through partition_loop"，是错的）。需要两处结构改动：连接完成类型 `(Bytes, Option<Bytes>)` 要扩成 `Vec<Bytes>`；`lib.rs` 连接 flush 的 `write_vectored_all` **没有 IOV_MAX 分段**（既有潜在问题，N 值响应会把它变成真问题）。
-  2. **F4 加固**：`drain_bulk_writes` 只认 `MSG_PUT_BULK`，所以批量的尾巴拿不到 recv-into-pooled 快路（UCX 上没有注册内存 RDMA 收），批量路径天花板结构性低于逐条 bulk。
-  3. **F5 已实测否决，但根因还在**：`UcxWriteHalf` 只实现 `write` 没实现 `write_vectored`（`transport/src/ucx/endpoint.rs:462`），compio 退化成逐 buffer 发送。审计据此推断 UCX 上小值批量可能更慢；**实测相反（+61%）**，所以不改。但补 `UCP_DATATYPE_IOV` 仍是干净的优化，且能让既有的单值 bulk 路径（现在也是 4 次 send）受益。
-- **Acceptance（读侧）**: 32 KiB 与 4 KiB 两档读吞吐相对 inline 显著上升；`get_many` 逐字节正确（每 key 内容与长度都不同，能抓出游标错位）；批量读不再占用 `partition_loop`。
-- **Status**: `passes: false` (2026-09-02) — 写侧已实现、已验收（单测 837 全绿 + `put_many_small_values_take_the_batched_bulk_path` 逐字节 e2e），读侧与两项加固未做。
+  1. **`drain_bulk_writes` 只认 `MSG_PUT_BULK`**（`partition-server/src/lib.rs`，判定在 `msg_type != MSG_PUT_BULK`）⇒ `MSG_BATCH_PUT_BULK` 的尾巴拿不到 recv-into-pooled 快路：≥64 KiB 的尾巴要在 `FrameDecoder` 的 BytesMut 里攒一遍（一次应用层拷贝），UCX 上也没有注册内存 RDMA 收。批量路径的天花板因此结构性低于逐条 bulk。做法是让那条 prologue 也认新类型（它的 ctrl 是 rkyv 变长，不像 `MSG_PUT_BULK` 的定长 meta，需要先按 ctrl_len 读完再定位尾巴）。
+  2. **`UcxWriteHalf` 没有 `write_vectored`**（`transport/src/ucx/endpoint.rs:462` 只实现了 `write`）⇒ compio 退化成逐 buffer 发送，一个 256-op 批量在 UCX 上发 259 次。**注意：据此推断"UCX 上会更慢"已被实测否决（+61%）**，所以这不是回归修复而是纯优化；补 `UCP_DATATYPE_IOV` 还能让现有单值 bulk 路径（现在也是 4 次 send）一起受益。
+  3. **`MSG_BATCH_GET`(0x54) 现在没有发送方**：SDK 的 `get_many` 已全量改走 bulk 形式，PS 侧 handler 仍在。要么删掉（同 commit 部署，删是安全的），要么明确写清"保留作为回退路径"。留着不表态就是下一个 `must_sync`。
+- **Acceptance**: (1) 批量尾巴走 recv-into-pooled 后，UCX 上批量写吞吐进一步上升且 `PS write-recv bulk engaged` 计数增长；(2) UCX 单次 `writev` 发出整批（可用 ucx 计数器或 strace 佐证），且既有 perf 不退；(3) `MSG_BATCH_GET` 或被删除、或在 `partition_rpc.rs` 里写明保留理由。
+- **Status**: `passes: false` (2026-09-02) — 主体已实现并验收（单测 838 全绿；`put_many_small_values_take_the_batched_bulk_path` 逐字节覆盖写+读两条新路径，含"未命中不占尾巴字节"）。
 
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。

@@ -74,6 +74,11 @@ pub struct BulkResp {
     pub buf: autumn_transport::PooledBuf,
     pub code: u8,
     pub message: String,
+    /// The ctrl block after the leading code byte, verbatim. `message` is the
+    /// same bytes read as text, which is right for the single-value bulk reads
+    /// whose ctrl IS an error string — but a batched reply puts binary there
+    /// (per-key statuses and value lengths), and lossy UTF-8 would corrupt it.
+    pub ctrl: Bytes,
 }
 
 impl std::fmt::Debug for BulkResp {
@@ -559,7 +564,10 @@ impl RpcClient {
 /// so a frame is still contiguous from the peer's point of view.
 const IOV_MAX: usize = 1024;
 
-async fn write_vectored_chunked(writer: &mut WriteHalf, bufs: Vec<Bytes>) -> std::io::Result<()> {
+pub async fn write_vectored_chunked(
+    writer: &mut WriteHalf,
+    bufs: Vec<Bytes>,
+) -> std::io::Result<()> {
     if bufs.len() <= IOV_MAX {
         let BufResult(r, _) = writer.write_vectored_all(bufs).await;
         return r;
@@ -717,13 +725,17 @@ async fn read_loop(
                         return Err(e.into());
                     }
                 };
-                let (code, message) = {
+                let (code, message, ctrl_tail) = {
                     let ctrl = decoder
                         .peek_ctrl(prologue.ctrl_len)
                         .expect("prologue verified => ctrl buffered");
                     match crate::frame::parse_bulk_ctrl(ctrl) {
-                        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned()),
-                        None => (0, String::new()), // empty ctrl = OK, no msg
+                        Some((c, m)) => (
+                            c,
+                            String::from_utf8_lossy(m).into_owned(),
+                            Bytes::copy_from_slice(m),
+                        ),
+                        None => (0, String::new(), Bytes::new()), // empty ctrl = OK, no msg
                     }
                 };
                 let value_len = prologue.value_len;
@@ -772,6 +784,7 @@ async fn read_loop(
                             buf: pb,
                             code,
                             message,
+                            ctrl: ctrl_tail,
                         }));
                     }
                     _ => unreachable!("bulk_pending checked above"),
@@ -857,9 +870,13 @@ fn finish_into_pooled_from_frame(
     ctrl: &[u8],
     value: &[u8],
 ) {
-    let (code, message) = match crate::frame::parse_bulk_ctrl(ctrl) {
-        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned()),
-        None => (0, String::new()), // empty ctrl = OK, no message
+    let (code, message, ctrl_tail) = match crate::frame::parse_bulk_ctrl(ctrl) {
+        Some((c, m)) => (
+            c,
+            String::from_utf8_lossy(m).into_owned(),
+            Bytes::copy_from_slice(m),
+        ),
+        None => (0, String::new(), Bytes::new()), // empty ctrl = OK, no message
     };
     let mut pb = autumn_transport::regpool_acquire(value.len());
     {
@@ -870,6 +887,7 @@ fn finish_into_pooled_from_frame(
         buf: pb,
         code,
         message,
+        ctrl: ctrl_tail,
     }));
 }
 

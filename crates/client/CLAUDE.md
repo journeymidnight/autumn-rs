@@ -145,9 +145,16 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   `put_many`: every item stamped with the SAME `(inode_hint, lease_epoch)` (one inode's
   flush). A fenced item returns `AutumnError::Fenced` in its result slot.
 - `get_many(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` — **simpler batched read.**
-  SDK allocates a `Vec<u8>` per value; one `MSG_BATCH_GET` per partition. Use when you
-  don't know value sizes, don't want to pre-alloc dests, or values are < 64 KiB (bulk
-  wouldn't engage).
+  SDK allocates a `Vec<u8>` per value; one `MSG_BATCH_GET_BULK` per partition, whose
+  reply carries every value in the frame's raw tail with only per-key status and length
+  in ctrl (the SDK slices the tail and copies each value out once, which this API's
+  return type requires anyway). Use when you don't know value sizes or don't want to
+  pre-alloc dests. The older inline `MSG_BATCH_GET` put the values inside the rkyv
+  response, which cost four server-side copies of every value byte plus a CRC pass over
+  all of them, and was served through `partition_loop` — so a batched read queued behind
+  the single-writer group-commit actor. Measured on a 41-query search workload over a
+  5164-chunk corpus: -7.5% end-to-end wall clock, on loopback TCP, where `get_many` is
+  only part of the work.
 - `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **bulk batched
   read.** Use when values ≥ 64 KiB AND you have caller-owned dest buffers (sglang pages /
   torch tensors). Each `GetManyItem` = `{key, offset, length, dest}`. The bulk recv lands

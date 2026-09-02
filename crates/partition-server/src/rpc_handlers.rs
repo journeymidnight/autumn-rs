@@ -185,6 +185,94 @@ pub(crate) enum GetOutcome {
 /// `BatchGetResp` carrying all values, vs N independent GET round
 /// trips. Per-key value lookup reuses the existing `get_value`
 /// internal so VP resolution + read-pin semantics are unchanged.
+/// `MSG_BATCH_GET_BULK` — the same resolve loop as `handle_batch_get`, but the
+/// values leave as their own iovecs instead of being copied into the response.
+///
+/// `get_value` already hands back a `Bytes` (for a VP read it aliases the pool
+/// buffer), so the inline form's `v.to_vec()` was pure loss; everything after it
+/// — two copies through `rkyv_encode`, another when `Frame::encode` assembles
+/// the wire buffer, and a CRC pass over the lot — is avoided by putting the
+/// values in the tail and only the statuses and lengths in ctrl.
+///
+/// A batch-level failure (stale epoch) answers with a non-OK code and no
+/// values; per-key outcomes ride `statuses`, exactly as the inline form does.
+pub(crate) async fn handle_batch_get_bulk(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Vec<Bytes>) {
+    let fail = |code: StatusCode, msg: String| {
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetBulkCtrl {
+            message: msg,
+            statuses: Vec::new(),
+            value_lens: Vec::new(),
+        });
+        (
+            autumn_rpc::frame::encode_bulk_response_head_bytes(
+                req_id,
+                partition_rpc::MSG_BATCH_GET_BULK,
+                code as u8,
+                &ctrl,
+                0,
+            ),
+            Vec::new(),
+        )
+    };
+    let req: partition_rpc::BatchGetReq = match partition_rpc::rkyv_decode(&payload) {
+        Ok(r) => r,
+        Err(e) => return fail(StatusCode::InvalidArgument, e),
+    };
+    {
+        let p = part.borrow();
+        if let Err((code, msg)) = check_region_epoch(p.part_id, p.region_epoch, req.region_epoch) {
+            drop(p);
+            return fail(code, msg);
+        }
+    }
+    let n = req.keys.len();
+    let mut statuses: Vec<u8> = Vec::with_capacity(n);
+    let mut value_lens: Vec<u32> = Vec::with_capacity(n);
+    let mut values: Vec<Bytes> = Vec::with_capacity(n);
+    for key in req.keys.into_iter() {
+        // Route each key through `get_value` for the same VP resolution /
+        // read-pin / not-found / out-of-range semantics as a per-key MSG_GET.
+        let inner = partition_rpc::rkyv_encode(&GetReq {
+            part_id: 0, // routing already done
+            region_epoch: req.region_epoch,
+            key,
+            offset: 0,
+            length: 0,
+        });
+        let (status, value) = match get_value(inner, part).await {
+            Ok(GetOutcome::Value(v)) => (0u8, v),
+            Ok(GetOutcome::NotFound) => (1u8, Bytes::new()),
+            Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
+            Err(_) => (2u8, Bytes::new()),
+        };
+        statuses.push(status);
+        value_lens.push(value.len() as u32);
+        if !value.is_empty() {
+            values.push(value);
+        }
+    }
+    let total: usize = value_lens.iter().map(|l| *l as usize).sum();
+    let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetBulkCtrl {
+        message: String::new(),
+        statuses,
+        value_lens,
+    });
+    (
+        autumn_rpc::frame::encode_bulk_response_head_bytes(
+            req_id,
+            partition_rpc::MSG_BATCH_GET_BULK,
+            CODE_OK,
+            &ctrl,
+            total,
+        ),
+        values,
+    )
+}
+
 pub(crate) async fn handle_batch_get(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,

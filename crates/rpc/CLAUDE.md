@@ -270,7 +270,7 @@ mixed deploy fails SILENTLY with garbage decodes). Hashing the schema source (no
 the commit) keeps dev flows sane: unrelated edits don't perturb it, any
 wire-struct edit does — even a comment.
 
-- **`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX`** (currently 31/31) declare the
+- **`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX`** (currently 32/32) declare the
   interval this binary speaks. `wire_compat_check(remote_fp, remote_min,
   remote_max)` accepts iff fingerprints are equal (same-build fast path) OR the
   intervals overlap. A peer reporting `max == 0` (empty/pre-WIRE) is refused.

@@ -4744,12 +4744,12 @@ fn spawn_ps_read(
 /// `write_vectored_all` emits both as one contiguous wire frame. Keeping the
 /// pair adjacent preserves per-connection in-order reply semantics.
 #[inline]
-fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
-    let (head, value) = done;
+fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
+    let (head, values) = done;
     tx_bufs.push(head);
-    if let Some(value) = value {
-        tx_bufs.push(value);
-    }
+    // N buffers, not one: a batched bulk read answers with a value per key, and
+    // each stays its own iovec so the reply costs no concatenation copy.
+    tx_bufs.extend(values);
 }
 
 /// UCX + TCP — drain LARGE `MSG_PUT_BULK` frames at the FRONT
@@ -4783,7 +4783,7 @@ async fn drain_bulk_writes(
     req_tx: &mpsc::Sender<PartitionRequest>,
     owner_part: u64,
     inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
@@ -4896,7 +4896,7 @@ async fn drain_bulk_writes(
             async move {
                 (
                     delegate_round_trip(tx, req_id, MSG_PUT_BULK, meta_key, Some(value)).await,
-                    None,
+                    Vec::new(),
                 )
             }
             .boxed_local(),
@@ -4917,9 +4917,9 @@ fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> B
 }
 
 /// (Option B) — serve a GET / GET_ZC LOCALLY in the ps-conn task (no req_tx
-/// hop / partition_loop detour). Returns `(head, Some(value))` for MSG_GET_BULK
+/// hop / partition_loop detour). Returns `(head, vec![value])` for MSG_GET_BULK
 /// (value-separable: value aliases the RegPool buffer, emitted as its own iovec)
-/// or `(frame, None)` for MSG_GET. `handle_get` borrows the partition only across
+/// or `(frame, vec![])` for MSG_GET. `handle_get` borrows the partition only across
 /// synchronous code (drops it before the `resolve_value` await), so on the
 /// single-threaded P-log runtime concurrent reads never overlap a borrow with
 /// each other or with `partition_loop`'s `borrow_mut` writes.
@@ -4928,12 +4928,16 @@ async fn serve_get_local(
     msg_type: u8,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
-) -> (Bytes, Option<Bytes>) {
+) -> (Bytes, Vec<Bytes>) {
     let t0 = Instant::now();
-    let out = if msg_type == MSG_GET_BULK {
+    let out = if msg_type == partition_rpc::MSG_BATCH_GET_BULK {
+        // N values, each its own iovec — served here rather than through
+        // partition_loop so a batched read never queues behind group commit.
+        crate::rpc_handlers::handle_batch_get_bulk(req_id, payload, part).await
+    } else if msg_type == MSG_GET_BULK {
         // handle_get_bulk never errors (status rides in the meta code).
         let (head, value) = crate::rpc_handlers::handle_get_bulk(req_id, payload, part).await;
-        (head, Some(value))
+        (head, vec![value])
     } else {
         let frame = match crate::rpc_handlers::handle_get(payload, part).await {
             Ok(p) => Frame::response(req_id, msg_type, p),
@@ -4944,7 +4948,7 @@ async fn serve_get_local(
             ),
         }
         .encode();
-        (frame, None)
+        (frame, Vec::new())
     };
     // LAT-1: GET latency (inline serve incl. VP resolve).
     part.borrow()
@@ -4974,7 +4978,7 @@ async fn serve_read_local(
     msg_type: u8,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
-) -> (Bytes, Option<Bytes>) {
+) -> (Bytes, Vec<Bytes>) {
     let result = if msg_type == MSG_RANGE {
         crate::rpc_handlers::handle_range(payload, part).await
     } else {
@@ -4989,7 +4993,7 @@ async fn serve_read_local(
         ),
     }
     .encode();
-    (frame, None)
+    (frame, Vec::new())
 }
 
 /// Delegate a request to `partition_loop` over the same-thread mpsc and await its
@@ -5204,7 +5208,7 @@ fn authz_gate(
 }
 
 /// push ONE frame onto `inflight`, encoded into a
-/// LocalBoxFuture<(Bytes, Option<Bytes>)>.  Shared by `push_frames_to_inflight`
+/// LocalBoxFuture<(Bytes, Vec<Bytes>)>.  Shared by `push_frames_to_inflight`
 /// (slow-path drain) and any caller that already has a single frame in hand.
 ///
 /// Misrouted frames synth an error frame with no mpsc hop.  Caller must
@@ -5224,7 +5228,7 @@ fn push_one_frame_to_inflight(
     // None)`. The drain sites push `head` then `value` consecutively into
     // `tx_bufs` so one `write_vectored_all` flushes them as a single wire frame.
     inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
     >,
     // connection authz runtime + per-connection bound principal.
     authz: &crate::authz::AuthzState,
@@ -5242,20 +5246,20 @@ fn push_one_frame_to_inflight(
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
-        inflight.push(async move { (reply, None) }.boxed_local());
+        inflight.push(async move { (reply, Vec::new()) }.boxed_local());
         return;
     }
     // (PS slice): gate + strip the admin prefix off split /
     // maintenance BEFORE part-id extraction (the prefix would misroute otherwise).
     if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
-        inflight.push(async move { (reply, None) }.boxed_local());
+        inflight.push(async move { (reply, Vec::new()) }.boxed_local());
         return;
     }
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
         let bytes = misroute_frame(req_id, msg_type, part_id, owner_part);
-        inflight.push(async move { (bytes, None) }.boxed_local());
+        inflight.push(async move { (bytes, Vec::new()) }.boxed_local());
         return;
     }
 
@@ -5263,7 +5267,10 @@ fn push_one_frame_to_inflight(
     // partition_loop detour) — reads need a consistent PartitionData snapshot,
     // not the single-writer group-commit actor. part == None is unit-test mode →
     // fall through to the delegate.
-    if msg_type == MSG_GET || msg_type == MSG_GET_BULK {
+    if matches!(
+        msg_type,
+        MSG_GET | MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK
+    ) {
         if let Some(part) = part {
             let part_c = part.clone();
             inflight.push(
@@ -5293,7 +5300,7 @@ fn push_one_frame_to_inflight(
         async move {
             (
                 delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
-                None,
+                Vec::new(),
             )
         }
         .boxed_local(),
@@ -5321,7 +5328,7 @@ async fn push_frames_to_inflight(
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
     inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
@@ -5375,7 +5382,7 @@ async fn d1_fast_path_round_trip(
     // connection authz runtime + per-connection bound principal.
     authz: &crate::authz::AuthzState,
     principal: &mut Option<crate::authz::BoundPrincipal>,
-) -> (Bytes, Option<Bytes>) {
+) -> (Bytes, Vec<Bytes>) {
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let mut payload = frame.payload;
@@ -5385,21 +5392,24 @@ async fn d1_fast_path_round_trip(
     // AUTH_HELLO bind / per-request gate (synchronous, before the
     // first await). A handled frame returns its reply directly.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
-        return (reply, None);
+        return (reply, Vec::new());
     }
     // (PS slice): admin gate + strip before part-id extraction.
     if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
-        return (reply, None);
+        return (reply, Vec::new());
     }
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
-        return (misroute_frame(req_id, msg_type, part_id, owner_part), None);
+        return (misroute_frame(req_id, msg_type, part_id, owner_part), Vec::new());
     }
 
     // (Option B): d=1 GET served locally too — same rationale as
     // push_one_frame_to_inflight. part == None (unit tests) → delegate.
-    if msg_type == MSG_GET || msg_type == MSG_GET_BULK {
+    if matches!(
+        msg_type,
+        MSG_GET | MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK
+    ) {
         if let Some(part) = part {
             return serve_get_local(req_id, msg_type, payload, part).await;
         }
@@ -5415,7 +5425,7 @@ async fn d1_fast_path_round_trip(
     let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
     (
         delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
-        None,
+        Vec::new(),
     )
 }
 
@@ -5474,7 +5484,7 @@ async fn handle_ps_connection(
     let cap = ps_conn_inflight_cap();
     // R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_BULK
     // (value aliases the RegPool buffer, emitted as its own iovec — no concat).
-    let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Option<Bytes>)>> =
+    let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>> =
         FuturesUnordered::new();
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
 
@@ -5489,11 +5499,14 @@ async fn handle_ps_connection(
             push_resp(&mut tx_bufs, done);
         }
 
-        // (B) Flush accumulated replies with ONE vectored write.
+        // (B) Flush accumulated replies with ONE vectored write — segmented at
+        // IOV_MAX, because the kernel rejects a `writev` by iovec COUNT
+        // regardless of how few bytes it carries, and that rejection kills the
+        // writer. One reply used to contribute at most two buffers, so the cap
+        // was unreachable; a batched read reply contributes one per value.
         if !tx_bufs.is_empty() {
             let bufs = std::mem::take(&mut tx_bufs);
-            let BufResult(result, _) = writer.write_vectored_all(bufs).await;
-            result?;
+            autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await?;
         }
 
         // (C) Decide what to wait on.
@@ -5556,7 +5569,7 @@ async fn handle_ps_connection(
                         if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
                             // Engage fast path.
                             PS_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (head, value) = d1_fast_path_round_trip(
+                            let (head, values) = d1_fast_path_round_trip(
                                 frame,
                                 &req_tx,
                                 &part,
@@ -5565,19 +5578,19 @@ async fn handle_ps_connection(
                                 &mut principal,
                             )
                             .await;
-                            // R4: MSG_GET_BULK returns a separate value iovec
-                            // — write [head, value] vectored; everything else is
-                            // a single frame via write_all (no regression).
-                            match value {
-                                None => {
-                                    let BufResult(wr, _) = writer.write_all(head).await;
-                                    wr?;
-                                }
-                                Some(value) => {
-                                    let BufResult(wr, _) =
-                                        writer.write_vectored_all(vec![head, value]).await;
-                                    wr?;
-                                }
+                            // R4: a bulk reply returns its value(s) as separate
+                            // iovecs — write [head, values..] vectored, chunked
+                            // at IOV_MAX; a reply with none is a single frame
+                            // via write_all (no regression).
+                            if values.is_empty() {
+                                let BufResult(wr, _) = writer.write_all(head).await;
+                                wr?;
+                            } else {
+                                let mut bufs = Vec::with_capacity(1 + values.len());
+                                bufs.push(head);
+                                bufs.extend(values);
+                                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs)
+                                    .await?;
                             }
                             read_fut = Some(spawn_ps_read(reader, buf));
                             continue;

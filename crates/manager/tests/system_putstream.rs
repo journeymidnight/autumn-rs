@@ -450,6 +450,34 @@ fn put_many_small_values_take_the_batched_bulk_path() {
                 "value {i} came back wrong — check the tail cursor"
             );
         }
+
+        // Read them back the same way they were written: one batched bulk
+        // reply carrying every value in its tail. The lengths differ per key,
+        // so a cursor slip on the READ side shows up as one key returning its
+        // neighbour's bytes rather than as an error. A missing key is included
+        // to pin that not-found contributes zero bytes to the tail without
+        // shifting the values after it.
+        let mut probe: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        probe.insert(7, b"bb-absent");
+        let got = cluster.get_many(&probe).await;
+        assert_eq!(got.len(), probe.len());
+        assert_eq!(
+            got[7].as_ref().expect("absent key is a status, not an error"),
+            &None,
+            "a missing key must not consume tail bytes"
+        );
+        let mut vi = 0usize;
+        for (pi, g) in got.iter().enumerate() {
+            if pi == 7 {
+                continue;
+            }
+            assert_eq!(
+                g.as_ref().unwrap().as_deref(),
+                Some(values[vi].as_ref()),
+                "get_many value {vi} came back wrong — check the reply tail cursor"
+            );
+            vi += 1;
+        }
     });
 }
 

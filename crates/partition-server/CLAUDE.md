@@ -381,16 +381,34 @@ per partition. Server side (`enqueue_batch_put`):
 Frozen-for-merge rejection returns `CODE_UNAVAILABLE` per-op via the same
 accumulator.
 
-### `MSG_BATCH_GET` (0x54) — server-batched Get
+### `MSG_BATCH_GET_BULK` (0x5B) — server-batched Get, values out of the payload
 
-`BatchGetReq { part_id, region_epoch, keys: Vec<Vec<u8>> }` →
-`BatchGetResp { items: Vec<BatchGetItem{ status, value }> }`. Server side
-(`handle_batch_get`) runs INLINE on the ps-conn task (no partition_loop hop, same
-as `handle_get`): decode once, brief `borrow()` to snapshot readers/state, loop
-`get_value` per key, pack into one frame. NO zero-copy for the response
-(rkyv-encoded, values inline). For ≥ 64 KiB reads where each value needs its own
-dest, callers use the client `get_many_into` (per-key `MSG_GET_BULK` into
-caller-owned dests, fan-out via `fan_out_collect`).
+Request is `MSG_BATCH_GET`'s (`BatchGetReq { part_id, region_epoch, keys }`); the
+REPLY differs. `handle_batch_get_bulk` loops `get_value` per key exactly like the
+inline form, then answers with `BatchGetBulkCtrl { message, statuses, value_lens }`
+in the CRC'd ctrl and every value concatenated in the frame's raw tail, each still
+its own iovec. `get_value` already returns a `Bytes` (a VP read aliases the pool
+buffer), so the inline form's `v.to_vec()` was pure loss, and so was everything
+after it: two copies through `rkyv_encode`, another when `Frame::encode` builds
+the wire buffer, and a CRC pass over all of it, because a normal response frame
+protects its whole payload.
+
+Served on the ps-conn task next to `MSG_GET_BULK` (`serve_get_local`). The inline
+`MSG_BATCH_GET` (0x54) is still handled but no longer sent by the SDK, and it goes
+through `partition_loop` — a batched read queued behind the single-writer
+group-commit actor, which is what serving it locally fixes. Measured on a 41-query
+search workload over a 5164-chunk corpus: -7.5% end-to-end wall clock over loopback
+TCP, where the batched read is only part of the work.
+
+One reply now contributes N buffers to the connection's `tx_bufs`, so both reply
+paths segment at IOV_MAX (`autumn_rpc::client::write_vectored_chunked`): the kernel
+rejects a `writev` by iovec COUNT no matter how few bytes it carries, and that
+rejection kills the writer. Before this, a reply contributed at most two buffers
+and the cap was unreachable.
+
+For ≥ 64 KiB reads where each value needs its own dest, callers still use the
+client `get_many_into` (per-key `MSG_GET_BULK` into caller-owned dests, fan-out via
+`fan_out_collect`).
 
 ## Open-tail size probe for the cluster overview
 

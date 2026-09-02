@@ -15,6 +15,32 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
   **不要再起任何带 FUSE 挂载的 pod**。另有上一条会话的遗留：ingest 提速改动的 pod 内
   复测数字仍未拿到（loopback 量不出来，RTT 太小）。
 
+【2026-09-02 批量 RPC 零拷贝（wire v31 + v32），并纠正一次错误结论】
+  用户指出 bulk 判据加错了量：加在**单条 value** 上，所以 256×4 KiB 的批量哪怕在线上是
+  1 MiB 的一帧也走拷贝路径。已实现 `MSG_BATCH_PUT_BULK`(0x5A,v31) 与
+  `MSG_BATCH_GET_BULK`(0x5B,v32)，判据改按**分组总字节**；帧格式没动（`value_len` 本就是
+  尾巴总长，切点写进 ctrl）。PS 侧从尾巴切 `Bytes` 直喂 `WriteOp::Put`（下游本就收 Bytes）。
+  实测（同集群、只差一行的两个二进制交替取样）：
+    写 TCP loopback 4 KiB   103.8 → 103.7   0%（**op 绑定区间**，见下）
+    写 TCP loopback 32 KiB  450.6 → 523.1   +16%
+    写 RoCE(rc_mlx5) 4 KiB   57.9 →  93.3   约 +61%（inline 还在 47~68 抖，bulk 稳 93.3）
+    读 真实查询负载(41 query/5164 chunk)  13054 → 12070 ms  -7.5%
+  **我先判定"不值得做"是错的，两处错因都记下来**：①测量点选在单分区 ~30K ops/s 的 op
+  天花板上（26.5K ops/s），省 CPU 根本显示不出来；②只测了 loopback TCP，而零拷贝最占
+  便宜的恰恰是生产用的 RDMA。另一个被 fable 审计从代码上驳回的推理：我以为"批量已摊薄
+  bulk 收益"，实际 inline 批量对逐字节拷贝一点没摊薄，且 `extract_part_id` 为读一个
+  part_id 就把整帧完整反序列化、`check_layer_a` 再来一遍，一个 256-op 帧多约 1500 次分配。
+  【顺带修的真问题】连接回复路径的 `write_vectored_all` **没有 IOV_MAX 分段**（一条回复
+  以前最多 2 个 buffer 所以够不着上限，N 值回复能够着；内核按**条数**拒绝且会打死写线程）；
+  `get_many`/PS 指南里"batched read 不走 partition_loop"的说法是**错的**（它确实绕
+  partition_loop、会阻塞 group-commit），新形式改成在连接线程上服务后才成立。
+  【踩坑记录，已写进 docs/ops.md「A/B-ing a wire-path change」】①`cluster.sh reset` 后
+  第一跑是垃圾（见过 42 ops/s 和 5.33 MB/s，随后复测 25688 和 447）；②要选对操作点；
+  ③别用 `UCX_TLS=posix,cma,tcp,self` 在 127.0.0.1 上测 UCX——cluster.sh 自己警告 ≥64K
+  已知坏，而批量帧天然 ≥64K，两臂都落在坏区间；单机要真 RDMA 就绑 RoCE IP + `mlx5_2:1`。
+  遗留三项在 feature_list F-BATCH-ZC-REST（recv-into-pooled 快路、UCX IOV 发送、
+  已无发送方的 `MSG_BATCH_GET` 去留）。
+
 【2026-09-02 perf check（单机，租户在场 + cpuset 隔离）：无代码回归】
   布局：EN1 68-75 / PS 92-123（租户 sglang 散在 5/25/32/40/67/158/164/172/181，避开），
   `AUTUMN_EXTENT_BASE_PORT=20000`，`--3disk`，`AUTUMN_DATA_ROOT=/data05/autumn-rs`。
