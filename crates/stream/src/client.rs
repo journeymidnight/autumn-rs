@@ -295,10 +295,52 @@ pub async fn read_extent_value_direct(
     offset: u64,
     length: u64,
 ) -> Result<bytes::Bytes> {
-    // `.dat` by construction: `extent_read_descriptor` — the only producer of
-    // the descriptor this reads from — refuses any extent whose payload lives
-    // elsewhere, so the SDK never holds an address for a shard file.
-    let req = ReadBytesReq::new(extent_id, eversion, offset, length, PayloadRef::in_dat());
+    // `.dat` by construction: for a REPLICATED extent `extent_read_descriptor`
+    // hands out addresses only when the payload is in `.dat`. An EC extent gets
+    // a different descriptor and `read_extent_shard_direct` below, because its
+    // bytes live in per-shard files and the offset means something else.
+    read_extent_direct(pool, addr, extent_id, eversion, offset, length, PayloadRef::in_dat()).await
+}
+
+/// One DATA SHARD's sub-range of an EC extent, straight from the node that
+/// holds it.
+///
+/// `offset` is SHARD-RELATIVE — the caller converts from the extent's logical
+/// offset using the geometry in `ReadDescriptor::Ec`. Getting that wrong reads
+/// real bytes from the wrong place, so the conversion lives in one place on the
+/// caller's side and is unit-tested there.
+pub async fn read_extent_shard_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    shard_index: u32,
+    offset: u64,
+    length: u64,
+) -> Result<bytes::Bytes> {
+    read_extent_direct(
+        pool,
+        addr,
+        extent_id,
+        eversion,
+        offset,
+        length,
+        PayloadRef::shard(shard_index),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_extent_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    length: u64,
+    payload: PayloadRef,
+) -> Result<bytes::Bytes> {
+    let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
     let z = pool
         // BUG-READ-TIMEOUT-STORM: size-scale the deadline (was a fixed 3 s that
         // stormed on 8 MiB reads). This free fn holds no StreamClientConfig (the
@@ -2106,6 +2148,15 @@ const SUSPECTED_REFRESH_TTL: Duration = Duration::from_secs(2);
 /// forever, which is how a real fault gets to hide in plain sight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotDirect {
+    /// EC, but not in a shape a client can read directly — its shards are not
+    /// in per-shard files, so there is nothing for a shard-addressed read to
+    /// name. Pre-CoW conversions are like this and are never backfilled.
+    EcNotShardAddressable,
+    /// EC, and a node holding one of the data shards is Suspected. Unlike the
+    /// two below this is TRANSIENT: a shard has no second home, so there is
+    /// nothing to rotate to, and the proxy path can rebuild it from parity
+    /// while this one cannot.
+    EcShardNodeSuspected,
     /// Holds RS shards, not the payload: a single-EN raw read would hand the
     /// caller shard bytes as if they were the value.
     EcConverted,
@@ -2117,6 +2168,10 @@ pub enum NotDirect {
 impl NotDirect {
     pub fn as_str(self) -> &'static str {
         match self {
+            NotDirect::EcNotShardAddressable => {
+                "extent is EC-converted but its shards are not in shard files"
+            }
+            NotDirect::EcShardNodeSuspected => "a data shard's node is Suspected",
             NotDirect::EcConverted => "extent is EC-converted (holds RS shards)",
             NotDirect::PayloadOutsideDat => "extent keeps its payload outside .dat",
         }
@@ -2133,7 +2188,9 @@ impl NotDirect {
     /// cluster is exactly why it can afford to be loud.
     pub fn log(self, extent_id: u64, what: &str) {
         match self {
-            NotDirect::EcConverted => {
+            NotDirect::EcConverted
+            | NotDirect::EcNotShardAddressable
+            | NotDirect::EcShardNodeSuspected => {
                 tracing::debug!(extent_id, reason = self.as_str(), "{what}")
             }
             NotDirect::PayloadOutsideDat => tracing::warn!(
@@ -2148,9 +2205,29 @@ impl NotDirect {
 
 /// The answer to "can this extent be read straight from an EN, and where".
 pub enum ReadDescriptor {
+    /// Replicated: every address is a full copy, so read any one of them.
     Direct {
         eversion: u64,
         replica_addrs: Vec<String>,
+    },
+    /// Erasure coded: `shard_addrs[i]` holds DATA SHARD `i` and nothing else.
+    ///
+    /// A reader does not need to decode anything. The payload is laid out as
+    /// `shard0 ‖ … ‖ shard_{k-1}` with `shard_size = ceil(sealed_length / k)`
+    /// (last shard zero-padded, no length trailer — `sealed_length` is
+    /// authoritative), so any byte range covers a CONTIGUOUS run of shards and
+    /// each one is read at its own offset. Reed-Solomon is for RECONSTRUCTING
+    /// a shard whose node will not answer; a reader that cannot do that falls
+    /// back to the partition server, which can.
+    ///
+    /// Every shard's bytes live on exactly one node, so unlike `Direct` there
+    /// is no peer to rotate to — which is why this is refused outright when any
+    /// of those nodes is Suspected (see the call site).
+    Ec {
+        eversion: u64,
+        shard_addrs: Vec<String>,
+        data_shards: u32,
+        sealed_length: u64,
     },
     /// Not an error — see [`NotDirect`].
     NotDirect(NotDirect),
@@ -4411,13 +4488,48 @@ impl StreamClient {
         // (coco P2). Refresh the snapshot here too (this is a read path).
         self.maybe_refresh_suspected();
         let ex = self.fetch_extent_info(extent_id).await?;
-        // coco P1: an EC-converted extent holds RS shards, not the
-        // full payload — a single-EN raw read would hand the client shard
-        // bytes as if they were the value (data corruption). EC reads must
-        // go through ec_subrange_read; refuse the descriptor so the PS
-        // falls back to the proxy path.
+        // An EC-converted extent holds RS shards, not the payload, so the
+        // REPLICATED descriptor above would be data corruption: its contract is
+        // "read any address for the whole range", and each of these nodes holds
+        // one slice. It gets its own descriptor instead, carrying the geometry
+        // that lets a reader address the right shard at the right offset.
+        //
+        // Refused outright if ANY data-shard node is Suspected. There is no
+        // peer to rotate to for a given byte, so a direct read of a shard on a
+        // dead node buys a full RPC timeout before the proxy fallback even
+        // starts — the shape of the read-timeout storm this codebase already
+        // paid for once. The proxy path can reconstruct that shard from parity;
+        // this one cannot, so it declines while it still costs nothing.
         if ex.ec_converted {
-            return Ok(ReadDescriptor::NotDirect(NotDirect::EcConverted));
+            let data_shards = ex.replicates.len();
+            if data_shards == 0 {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
+            }
+            // A shard-addressed read names `PayloadRef::shard(i)`, and an EN
+            // refuses a payload file it does not hold. Conversions predating the
+            // CoW layout left their shard bytes in `.dat` and are never
+            // backfilled, so handing out a descriptor for one would buy a round
+            // of EN refusals before the proxy fallback every single time — the
+            // old blanket refusal was free by comparison.
+            if PayloadLocation::from_byte(ex.payload_location) != PayloadLocation::InShardFile {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
+            }
+            let node_ids = replica_node_ids(&ex);
+            let any_suspected = (0..data_shards)
+                .any(|i| self.is_node_suspected(node_ids.get(i).copied().unwrap_or(0)));
+            if any_suspected {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcShardNodeSuspected));
+            }
+            // Positional by shard index, exactly as `ec_subrange_read` indexes
+            // them — NOT filtered, since dropping an entry would silently shift
+            // every shard after it onto the wrong node.
+            let shard_addrs = self.replica_addrs_for_extent(&ex).await?;
+            return Ok(ReadDescriptor::Ec {
+                eversion: ex.eversion,
+                shard_addrs,
+                data_shards: data_shards as u32,
+                sealed_length: ex.sealed_length,
+            });
         }
         // The descriptor names no payload file, so the SDK's direct read always
         // asks for `.dat` (`read_extent_value_direct`). That is sound only

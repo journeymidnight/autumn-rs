@@ -259,10 +259,30 @@ pub struct GetRedirectResp {
     pub value_len: u64,
     /// EN-side eversion fence for the read.
     pub eversion: u64,
-    /// Replica addresses (shard-routed) so the client needs no manager
-    /// round-trip. Read any replica — VP extents referenced by live
-    /// reads are sealed or all-replica-acked at the VP offset.
+    /// Where to read from, and what the entries mean depends on
+    /// `ec_data_shards`:
+    ///
+    /// * `0` — replicated. Every entry is a full copy; read ANY of them (VP
+    ///   extents referenced by live reads are sealed or all-replica-acked at
+    ///   the VP offset), which is why the client rotates its start by a hash.
+    /// * `k > 0` — erasure coded. Entry `i` is the node holding DATA SHARD
+    ///   `i`, positionally, and holds only its own slice of the payload. There
+    ///   is no choice of peer for a given byte.
     pub replica_addrs: Vec<String>,
+    /// `0` = replicated. Otherwise the number of DATA shards `k`, which with
+    /// `sealed_length` gives the client the geometry it needs to read an
+    /// EC extent directly.
+    ///
+    /// The payload is laid out as `shard0 ‖ shard1 ‖ … ‖ shard_{k-1}` with
+    /// `shard_size = ceil(sealed_length / k)` and the last shard zero-padded,
+    /// so a byte range covers a CONTIGUOUS run of shards and each shard is
+    /// read at its own offset. That is why no Reed-Solomon decode is needed to
+    /// serve a read: decoding is for RECONSTRUCTING a shard whose node cannot
+    /// answer, and a client that cannot do that falls back to the proxy.
+    pub ec_data_shards: u32,
+    /// The extent's sealed length — the denominator of `shard_size`. Zero and
+    /// meaningless when `ec_data_shards == 0`.
+    pub ec_sealed_length: u64,
 }
 
 /// resolve MANY redirect descriptors in ONE PS call — the

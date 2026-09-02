@@ -213,6 +213,8 @@ async fn answer_get_redirect_inline(
             value_len: 0,
             eversion: 0,
             replica_addrs: vec![],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
         })),
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
             code: CODE_OK,
@@ -223,6 +225,8 @@ async fn answer_get_redirect_inline(
             value_len: 0,
             eversion: 0,
             replica_addrs: vec![],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
         })),
         GetOutcome::Redirect { .. } => unreachable!("get_value never redirects"),
     }
@@ -474,6 +478,8 @@ pub(crate) async fn handle_get_redirect(
             value_len: 0,
             eversion: 0,
             replica_addrs: vec![],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
         })),
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
             code: CODE_OK,
@@ -484,6 +490,8 @@ pub(crate) async fn handle_get_redirect(
             value_len: 0,
             eversion: 0,
             replica_addrs: vec![],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
         })),
         GetOutcome::Redirect {
             extent_id,
@@ -492,6 +500,28 @@ pub(crate) async fn handle_get_redirect(
         } => {
             let sc = part.borrow().stream_client.clone();
             match sc.extent_read_descriptor(extent_id).await {
+                // Erasure coded: same response shape, but `replica_addrs` is
+                // positional by shard and the geometry fields tell the client
+                // so. A client too old to know about them sees `replica_addrs`
+                // and would read shard bytes as the value — which is why this
+                // is a wire-version bump rather than an additive field.
+                Ok(ReadDescriptor::Ec {
+                    eversion,
+                    shard_addrs,
+                    data_shards,
+                    sealed_length,
+                }) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    value: vec![],
+                    extent_id,
+                    value_offset,
+                    value_len,
+                    eversion,
+                    replica_addrs: shard_addrs,
+                    ec_data_shards: data_shards,
+                    ec_sealed_length: sealed_length,
+                })),
                 Ok(ReadDescriptor::Direct {
                     eversion,
                     replica_addrs,
@@ -505,6 +535,8 @@ pub(crate) async fn handle_get_redirect(
                         value_len,
                         eversion,
                         replica_addrs,
+                        ec_data_shards: 0,
+                        ec_sealed_length: 0,
                     }))
                 }
                 // Redirect is an optimization, never a correctness dependency:
@@ -532,7 +564,7 @@ pub(crate) async fn handle_get_redirect(
                     //
                     // This used to delegate to `handle_get`, which encodes a
                     // `GetResp` — three fields where the client is decoding an
-                    // eight-field `GetRedirectResp`. rkyv carries no type tag,
+                    // ten-field `GetRedirectResp`. rkyv carries no type tag,
                     // so nothing catches a handler answering msg_type X with
                     // struct Y; the client's bytecheck simply fails, and the
                     // operator gets "rkyv decode: failed" with no hint that the
@@ -578,6 +610,8 @@ pub(crate) async fn handle_get_redirect_many(
         value_len: 0,
         eversion: 0,
         replica_addrs: vec![],
+        ec_data_shards: 0,
+        ec_sealed_length: 0,
     };
     let inline = |value: Vec<u8>| GetRedirectResp {
         code: CODE_OK,
@@ -588,6 +622,8 @@ pub(crate) async fn handle_get_redirect_many(
         value_len: 0,
         eversion: 0,
         replica_addrs: vec![],
+        ec_data_shards: 0,
+        ec_sealed_length: 0,
     };
     let mut results = Vec::with_capacity(req.items.len());
     for item in &req.items {
@@ -611,6 +647,23 @@ pub(crate) async fn handle_get_redirect_many(
             } => {
                 let sc = part.borrow().stream_client.clone();
                 match sc.extent_read_descriptor(extent_id).await {
+                    Ok(ReadDescriptor::Ec {
+                        eversion,
+                        shard_addrs,
+                        data_shards,
+                        sealed_length,
+                    }) => GetRedirectResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        value: vec![],
+                        extent_id,
+                        value_offset,
+                        value_len,
+                        eversion,
+                        replica_addrs: shard_addrs,
+                        ec_data_shards: data_shards,
+                        ec_sealed_length: sealed_length,
+                    },
                     Ok(ReadDescriptor::Direct {
                         eversion,
                         replica_addrs,
@@ -623,6 +676,8 @@ pub(crate) async fn handle_get_redirect_many(
                         value_len,
                         eversion,
                         replica_addrs,
+                        ec_data_shards: 0,
+                        ec_sealed_length: 0,
                     },
                     // Descriptor lookup failed (manager blip / EC-converted /
                     // cache miss). Do NOT inline the (large) value here — the

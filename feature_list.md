@@ -29,12 +29,12 @@
 - **Acceptance**: 把生产代码的判据从 `success + 1 == data_shards` 改成 `success + 2 == data_shards`，测试必须变红（消融验证）；把 `attempt == 0` 去掉，测试必须变红。
 - **Status**: `passes: false` (2026-09-02)
 
-### F-EC-DIRECT-READ — 客户端直读 EC extent（k 个 EN 并行取分片，不必经 PS 代理）
-- **Trigger** (2026-09-02, 用户报 `get_redirect: descriptor lookup failed — answering inline extent_id=63 error=extent 63 is EC-converted; direct read not supported`，并在权衡后拍板"EC 开路线 2"): `--direct-read` 在**默认配置下会自己失效**——≥5 EN 的集群 bootstrap 默认 `--log-ec 4+1`，`balanced` 自动策略一装，sealed extent 陆续转 EC，而 `extent_read_descriptor` 对 EC extent 一律拒绝（EC 存的是 RS 分片，单 EN 裸读会把分片字节当值返回＝数据损坏）。于是每次大值读都悄悄退化成经 PS 的代理读。
-- **为什么可做且不需要在客户端引入 RS 解码（已在代码中核实）**: EC 的数据布局是**顺序切片**而非块内交织——`erasure::shard_size(payload_len, k) = ceil(payload_len/k)`，值依次铺满前 k 个数据分片、最后一个零填充、不存长度尾（`sealed_length` 权威）。所以 `value = shard0 ‖ … ‖ shard_{k-1}`，任一子区间只覆盖**连续的一段分片**，`ec_subrange_read` 正是这么算 plan 的（`start_shard = start/shard_size`）。**happy path 无需解码**；RS 重建只在某个分片所在节点不可用时才需要，而那条路客户端可以直接退回 PS 代理，因此 `reed-solomon-erasure` 不进客户端。
-- **⚠️ 不要指望扇出收益（初版写错了，已按代码更正）**: `shard_size` 是**按 extent** 算的，不是按 value——log extent 的封口阈值默认 16 GiB、下限 clamp 1 GiB，所以 k=4 时每个分片 ≥256 MiB、通常数 GiB。一个 8 MiB 的 value 因此**只落在 1 个（偶尔 2 个）分片**上，永远不会是 k 个。⇒ EC 直读**通常也只联系 1 个 EN**，和复制直读一样，而且**选择更少**（分片子区间只在某一个节点上，没有副本轮转可用，节点不可用只能退代理）。所以本 feature 的价值是**让直读在 EC 集群上继续存在**（消除"默认配置下自己失效"），不是提速；验收 (e) 很可能测不出提升，那是结构决定的，不是实现没做好。
-- **Scope**: (1) 重定向描述符要能表达 EC 形态——除 `eversion`/地址表外还需 `data_shards`、`sealed_length`（推出 `shard_size`）、`payload_location`；`extent_read_descriptor` 对 EC extent 从"拒绝"改为返回 EC 描述符（`ReadDescriptor` 已经是类型化的枚举，加一个变体）。(2) 客户端按 (offset,length) 算分片 plan，向对应 EN 并行发**带 `PayloadRef::shard(i)` 的分片子区间读**，按序拼接。(3) 任一分片读失败 → 退回现有 PS 代理路径（不在客户端做重建）。(4) `PayloadLocation != InDat` 的非 EC 情形仍然拒绝。(5) wire 版本按纪律 bump + 指纹登记。
-- **Acceptance**: (a) 单测覆盖 plan 计算——跨 1/2/k 个分片、起止都不对齐 `shard_size`、末分片零填充区不得被读进结果、`length=0`（读到尾）；(b) 真集群 e2e：写入 → 强制 EC 转换（`autumn-op force-ec-convert`）→ 用直读读回，**字节精确**，且与经代理读的结果逐字节一致；(c) 杀掉持有某个数据分片的 EN，同一读仍然正确（退回代理），不返回分片字节；(d) 直读打开时 EC 读**不再**产生 `descriptor lookup failed` 日志；(e) 有一组对照数字说明 EC 直读相对代理读的吞吐变化——**预期是"打平或略好"，不是倍数**（理由见上）；若明显更差要查为什么。
+### BUG-EC-PARTICIPANT-UNSEALED — EC 转换的参与者从不落盘封存状态，重启后那个纯分片 extent 在它眼里可写
+- **Trigger** (2026-09-02, 用户在排查一起 EC 读故障时顺手挖出，非该故障的原因): 同一个 extent，协调者与参与者的持久状态不一致 —— en-0（协调者）`sealed=1 / sealed_length=17183737326 / eversion=2 / avali=7`，en-1..4（参与者）全是 `sealed=0 / sealed_length=0 / eversion=1 / avali=0`。
+- **已核实（我自己读的代码，不是转述）**: `write_shard_stripe_local`（`crates/stream/src/extent_node.rs`，全长 153 行）里 **`save_meta` 出现 0 次**，从不写 `entry.sealed`、不写 `avali`，`sealed_length` 只作越界校验用；`apply_placements` 后来只补写了 `payload_location`。而 append 的封存判据是 **`sealed_length > 0 || avali > 0`**（见 stream/CLAUDE.md 附录的 append 协议第 3 步），参与者持久化的这两个值**都是 0** ⇒ 参与者重启后，该 extent 在它眼里既未封存也无 avali 位，**这道闸门不会拒绝写入**。
+- **未追到底的部分（不要跳过这一步）**: 闸门有洞是确定的，**危害链条还没走完**。参与者的 `.dat` 通常是空的（分片在独立文件里），所以一次被放行的 append 落在 `.dat` 上、而读按 `payload_location=InShardFile` 去读分片文件——**直接的字节损坏未被证明**。真正要查的是：这样的 extent 在参与者眼里"未封存"之后，recovery / seal / avali 重建这些路径会不会把它当成开着的尾巴处理。按仓库规矩（`feedback_reproduce_before_fixing_mechanism_bugs`）**先复现再修**。
+- **Scope（复现后）**: 参与者在写完自己的分片后必须落盘封存状态（`sealed=1` + `sealed_length` + `eversion` + 自己的 `avali` 位），也就是 `write_shard_stripe_local` 或 `apply_placements` 尾部补一次 `save_meta`。注意这是**持久态布局改动**，按升级纪律要么同布局要么带迁移。
+- **Acceptance**: 构造"EC 转换完成 → 杀掉参与者 → 重启"，断言重启后的参与者认为该 extent 已封存（`sealed` 与 `sealed_length` 非零），且对它的 append 被 `CODE_PRECONDITION` 拒绝；转换后再读，字节精确。
 - **Status**: `passes: false` (2026-09-02)
 
 ### F-BATCH-ZC-REST — 批量零拷贝的三项收尾（主体已实现，wire v31/v32）

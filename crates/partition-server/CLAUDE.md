@@ -525,13 +525,22 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   is deliberately unprotected: a GC punch in the gap is a failed EN read → proxy
   fallback (extents unlink whole + eversion fence ⇒ never a torn read); `_vp_pin`
   drops at return exactly as the whole-value path.
-- EC-converted extents NEVER get a descriptor (`extent_read_descriptor` declines;
-  shard bytes ≠ value). The single-key handler answers inline instead
-  (`extent_id: 0` + the value, one round trip); the BATCHED handler fails the
-  whole batch with `FailedPrecondition` so the client's per-item proxy fallback
-  runs immediately — `Unavailable` there cost ~9-13 s of deterministic retry
-  backoff per call, because the SDK reads it as transient and a decline never
-  stops being true.
+- An EC-converted extent gets an EC descriptor (`ec_data_shards > 0` +
+  `ec_sealed_length`), and `replica_addrs` then means something else: entry `i`
+  is the node holding DATA SHARD `i`, holding only its slice — not an
+  interchangeable copy. The client reads the shards its range covers and
+  concatenates; no RS decode is needed to SERVE a read, only to RECONSTRUCT a
+  shard whose node will not answer, which the client cannot do and the proxy
+  can.
+- It is still DECLINED when a data shard's node is Suspected (no second home to
+  rotate to, and finding that out via an RPC timeout is the expensive way), or
+  when the shards are not in shard files (pre-CoW conversions kept them in
+  `.dat` and are never backfilled, so a shard-addressed read could only collect
+  refusals). On a decline the single-key handler answers inline (`extent_id: 0`
+  + the value, one round trip); the BATCHED handler fails the whole batch with
+  `FailedPrecondition` so the client's per-item proxy fallback runs immediately
+  — `Unavailable` there cost ~9-13 s of deterministic retry backoff per call,
+  because the SDK reads it as transient.
 - Short reads under CODE_OK are FAILURES in `read_extent_value_direct` (same
   "got < need" rule as `read_value_from_log`).
 - Inline values / small VPs / sub-64 KiB / offset past value end: inline in the

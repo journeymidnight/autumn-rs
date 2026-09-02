@@ -578,9 +578,17 @@ mod credential_file_tests {
     }
 }
 
-/// latches after the first direct-read→proxy fallback so the
-/// warning fires exactly once per process (default-ON direct-read on a topology
-/// where ENs aren't client-reachable would otherwise warn on every large read).
+/// Latches after the first EC direct read that SUCCEEDS, so an operator gets
+/// one line saying the path is live and no per-read noise after it.
+static EC_DIRECT_ANNOUNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Latches after the first EC direct read that falls back to the proxy — the
+/// EC counterpart of `DIRECT_FALLBACK_WARNED` below.
+static EC_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Latches after the first replicated direct-read→proxy fallback so the warning
+/// fires exactly once per process (default-ON direct read on a topology where
+/// ENs aren't client-reachable would otherwise warn on every large read).
 static DIRECT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -881,6 +889,52 @@ pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Tunable via `set_first_attempt_timeout`; `None` disables the
 /// fast-fail (every attempt uses the full `rpc_timeout`).
 pub const DEFAULT_FIRST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which DATA SHARDS an EC extent's byte range covers, and where inside each.
+///
+/// Returns `(shard_index, shard_relative_offset, len)` in ascending shard
+/// order, or `None` when the range is not serviceable from data shards alone —
+/// in which case the caller must fall back to the partition server rather than
+/// guess.
+///
+/// The geometry, which is the whole reason no decode is needed: the payload is
+/// `shard0 ‖ shard1 ‖ … ‖ shard_{k-1}` with `shard_size = ceil(sealed_length /
+/// k)`, the last shard zero-padded, and no length trailer — `sealed_length` is
+/// authoritative. A range therefore covers a CONTIGUOUS run of shards. Reading
+/// past `sealed_length` would return padding as if it were data, so a range
+/// that does is refused here rather than trimmed.
+fn ec_shard_plan(
+    sealed_length: u64,
+    data_shards: u32,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<(u32, u64, u64)>> {
+    let k = data_shards as u64;
+    if k == 0 || sealed_length == 0 {
+        return None;
+    }
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let end = offset.checked_add(len)?;
+    if end > sealed_length {
+        return None;
+    }
+    let shard_size = sealed_length.div_ceil(k).max(1);
+    let first = offset / shard_size;
+    let last = (end - 1) / shard_size;
+    if last >= k {
+        return None;
+    }
+    let mut plan = Vec::with_capacity((last - first + 1) as usize);
+    for shard in first..=last {
+        let base = shard * shard_size;
+        let lo = offset.max(base) - base;
+        let hi = end.min(base + shard_size) - base;
+        plan.push((shard as u32, lo, hi - lo));
+    }
+    Some(plan)
+}
 
 impl ClusterClient {
     /// Current manager address.
@@ -2695,12 +2749,136 @@ impl ClusterClient {
         if resp.extent_id == 0 {
             return Ok(Some(bytes::Bytes::from(resp.value)));
         }
-        if let Some(v) = self.read_redirect_replicas(&resp).await {
+        if let Some(v) = self.read_from_descriptor(&resp).await {
             return Ok(Some(v));
         }
         // All replicas failed → proxy fallback re-resolves through the PS
         // (fresh VP after GC rewrite / fresh eversion after EC conversion).
         Ok(self.get(key).await?.map(bytes::Bytes::from))
+    }
+
+    /// Serve a read from whatever the descriptor turned out to describe.
+    ///
+    /// One entry point on purpose: the replicated and EC forms share a struct
+    /// and differ only by `ec_data_shards`, so a call site that reached for the
+    /// replicated reader directly would read shard bytes as a value. There are
+    /// three such call sites and this is the only thing they should call.
+    async fn read_from_descriptor(&self, resp: &GetRedirectResp) -> Option<bytes::Bytes> {
+        if resp.ec_data_shards > 0 {
+            return self.read_ec_shards(resp).await;
+        }
+        self.read_redirect_replicas(resp).await
+    }
+
+    /// Read a value out of an EC extent by fetching only the DATA SHARDS it
+    /// covers, straight from the nodes that hold them.
+    ///
+    /// No Reed-Solomon decode happens here, and that is not a shortcut: the
+    /// payload is a plain concatenation of the data shards, so a byte range is
+    /// a contiguous run of shard sub-ranges. Decoding is for RECONSTRUCTING a
+    /// shard whose node will not answer, which this cannot do — so any failure
+    /// returns `None` and the caller falls back to the partition server, which
+    /// can. That is also why the descriptor is refused up front when a shard's
+    /// node is Suspected: unlike a replicated read there is no second copy to
+    /// rotate to, and finding that out via a timeout is the expensive way.
+    async fn read_ec_shards(&self, resp: &GetRedirectResp) -> Option<bytes::Bytes> {
+        let Some(plan) = ec_shard_plan(
+            resp.ec_sealed_length,
+            resp.ec_data_shards,
+            resp.value_offset,
+            resp.value_len,
+        ) else {
+            tracing::debug!(
+                extent_id = resp.extent_id,
+                sealed_length = resp.ec_sealed_length,
+                data_shards = resp.ec_data_shards,
+                offset = resp.value_offset,
+                len = resp.value_len,
+                "EC direct read: range not serviceable from data shards — proxying"
+            );
+            return None;
+        };
+        if plan.is_empty() {
+            return Some(bytes::Bytes::new());
+        }
+        if resp.replica_addrs.len() < resp.ec_data_shards as usize {
+            // Positional by shard index: a short list means some shard has no
+            // address and every index past the gap would name the wrong node.
+            tracing::warn!(
+                extent_id = resp.extent_id,
+                addrs = resp.replica_addrs.len(),
+                data_shards = resp.ec_data_shards,
+                "EC descriptor has fewer addresses than data shards — proxying \
+                 (positional mapping cannot be trusted)"
+            );
+            return None;
+        }
+        let futs = plan.iter().map(|&(shard, off, len)| async move {
+            autumn_stream::read_extent_shard_direct(
+                &self.en_pool,
+                &resp.replica_addrs[shard as usize],
+                resp.extent_id,
+                resp.eversion,
+                shard,
+                off,
+                len,
+            )
+            .await
+        });
+        let parts = fan_out_collect(futs, BATCH_GET_DEFAULT_CONCURRENCY).await;
+        let mut out = bytes::BytesMut::with_capacity(resp.value_len as usize);
+        for (i, r) in parts.into_iter().enumerate() {
+            match r {
+                // Length is already exact — `read_extent_shard_direct` rejects a
+                // short read rather than returning it, because short bytes
+                // concatenated here would be silently wrong data, not an error.
+                Ok(b) => out.extend_from_slice(&b),
+                Err(e) => {
+                    // Loud once, then debug — the same shape as the replicated
+                    // path's fallback warning, and for the same reason: falling
+                    // back is correct but SLOW, and on an EC-armed cluster this
+                    // is the path that carries the large reads. Without it the
+                    // degradation is invisible again, which is the state this
+                    // whole change exists to leave behind.
+                    if !EC_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            extent_id = resp.extent_id,
+                            shard = plan[i].0,
+                            error = %e,
+                            "EC direct read fell back to the PS proxy (shard node not \
+                             client-reachable?) — large reads take the proxy path"
+                        );
+                    } else {
+                        tracing::debug!(
+                            extent_id = resp.extent_id,
+                            shard = plan[i].0,
+                            error = %e,
+                            "EC direct read failed on a shard — falling back to the PS proxy"
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        // One line the first time this works, then debug. Whether EC direct
+        // read is actually in play is otherwise unanswerable from outside: a
+        // decline and a success both end in correct bytes, so the only
+        // difference an operator can see is which machines did the work.
+        if !EC_DIRECT_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                extent_id = resp.extent_id,
+                data_shards = resp.ec_data_shards,
+                shards_read = plan.len(),
+                "EC direct read active: reading data shards straight from their nodes"
+            );
+        } else {
+            tracing::debug!(
+                extent_id = resp.extent_id,
+                shards_read = plan.len(),
+                "EC direct read"
+            );
+        }
+        Some(out.freeze())
     }
 
     /// Shared EN-direct-read replica loop for `MSG_GET_REDIRECT` descriptors
@@ -2899,7 +3077,7 @@ impl ClusterClient {
             dest[..n].copy_from_slice(&v[..n]);
             return Ok(Some(v.len()));
         }
-        if let Some(v) = self.read_redirect_replicas(&resp).await {
+        if let Some(v) = self.read_from_descriptor(&resp).await {
             let n = v.len().min(dest.len());
             dest[..n].copy_from_slice(&v[..n]);
             return Ok(Some(v.len()));
@@ -3069,7 +3247,7 @@ impl ClusterClient {
             dest[..nn].copy_from_slice(&v[..nn]);
             return Ok(Some(v.len()));
         }
-        if let Some(v) = self.read_redirect_replicas(resp).await {
+        if let Some(v) = self.read_from_descriptor(resp).await {
             let nn = v.len().min(dest.len());
             dest[..nn].copy_from_slice(&v[..nn]);
             return Ok(Some(v.len()));
@@ -5391,6 +5569,90 @@ mod namespace_binding_tests {
         }
         for bad in ["", "acme/sub", "Acme", "a b", "a:b", "a/", "/x"] {
             assert!(!super::is_valid_scope_segment(bad), "{bad} should be rejected");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ec_shard_plan_tests {
+    use super::ec_shard_plan;
+
+    // 4+1 over 10 bytes: shard_size = ceil(10/4) = 3, so the shards hold
+    // logical [0,3) [3,6) [6,9) [9,10) — the last one is 1 real byte plus 2
+    // bytes of padding that must never be read.
+    const LEN: u64 = 10;
+    const K: u32 = 4;
+
+    #[test]
+    fn a_range_inside_one_shard_reads_only_that_shard() {
+        assert_eq!(ec_shard_plan(LEN, K, 4, 2), Some(vec![(1, 1, 2)]));
+    }
+
+    #[test]
+    fn an_unaligned_range_splits_at_the_shard_boundary() {
+        // [2,7) spans shards 0,1,2 and is aligned to neither end.
+        assert_eq!(
+            ec_shard_plan(LEN, K, 2, 5),
+            Some(vec![(0, 2, 1), (1, 0, 3), (2, 0, 1)])
+        );
+    }
+
+    #[test]
+    fn the_whole_value_covers_every_shard_and_sums_to_its_length() {
+        let plan = ec_shard_plan(LEN, K, 0, LEN).expect("whole value is serviceable");
+        assert_eq!(plan.len(), K as usize, "one entry per data shard: {plan:?}");
+        assert_eq!(plan.iter().map(|e| e.2).sum::<u64>(), LEN);
+        // The last shard contributes only its REAL byte; asking for the full
+        // shard_size there would hand back zero padding as data.
+        assert_eq!(plan.last().copied(), Some((3, 0, 1)));
+    }
+
+    #[test]
+    fn padding_is_never_reachable() {
+        // sealed_length is authoritative: one byte past it is not a short read
+        // to be trimmed, it is a range this path must refuse so the caller
+        // proxies instead of receiving zeros.
+        assert_eq!(ec_shard_plan(LEN, K, LEN - 1, 2), None);
+        assert_eq!(ec_shard_plan(LEN, K, LEN, 1), None);
+    }
+
+    #[test]
+    fn empty_and_degenerate_inputs() {
+        assert_eq!(ec_shard_plan(LEN, K, 5, 0), Some(Vec::new()));
+        assert_eq!(ec_shard_plan(0, K, 0, 1), None, "no payload");
+        assert_eq!(ec_shard_plan(LEN, 0, 0, 1), None, "k=0 would divide by zero");
+        assert_eq!(ec_shard_plan(LEN, K, u64::MAX, 1), None, "offset+len overflow");
+    }
+
+    #[test]
+    fn an_exactly_divisible_payload_has_no_padding_shard() {
+        // 12 over 4 = 3 each, so every shard is full and the last entry is a
+        // whole shard rather than a short tail.
+        assert_eq!(
+            ec_shard_plan(12, 4, 0, 12),
+            Some(vec![(0, 0, 3), (1, 0, 3), (2, 0, 3), (3, 0, 3)])
+        );
+    }
+
+    #[test]
+    fn plan_offsets_reconstruct_the_original_byte_order() {
+        // The contract the reader depends on: concatenating the planned pieces
+        // in order yields exactly the requested logical range. Model the extent
+        // as bytes 0..LEN laid out shard by shard and check the round trip.
+        let shard_size = LEN.div_ceil(K as u64);
+        for offset in 0..LEN {
+            for len in 1..=(LEN - offset) {
+                let plan = ec_shard_plan(LEN, K, offset, len).expect("in range");
+                let mut got = Vec::new();
+                for (shard, lo, n) in plan {
+                    let base = shard as u64 * shard_size;
+                    for b in 0..n {
+                        got.push((base + lo + b) as u8);
+                    }
+                }
+                let want: Vec<u8> = (offset..offset + len).map(|b| b as u8).collect();
+                assert_eq!(got, want, "offset={offset} len={len}");
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
 - [autumn-memory verification](#autumn-memory-verification)
 - [Retrieval-quality eval (`memory-mcp --eval`)](#retrieval-quality-eval-memory-mcp---eval)
+- [Direct read on EC extents](#direct-read-on-ec-extents)
 - [A/B-ing a wire-path change](#ab-ing-a-wire-path-change-and-the-three-traps-that-fake-the-answer)
 - [Data-plane authz setup](#data-plane-authz-setup)
 - [CLI cheatsheet](#cli-cheatsheet)
@@ -1965,6 +1966,65 @@ registry): any wire-schema edit fails `cargo test -p autumn-rpc` until you
 record the new fingerprint and consciously decide MIN/MAX. Rolling back a
 binary past a `cluster_version` bump is refused at manager startup
 (fail-closed in replay).
+
+## Direct read on EC extents
+
+`--direct-read` reads a value straight from an extent node instead of proxying
+through the partition server. It used to refuse EC-converted extents outright,
+which is why the flag quietly stopped applying on any cluster with EC armed —
+bootstrap arms it from four extent nodes up, so that is the common case.
+
+It now reads EC extents by fetching only the DATA SHARDS the value covers. No
+Reed-Solomon decode happens on the client: the payload is a plain concatenation
+`shard0 ‖ … ‖ shard_{k-1}` with `shard_size = ceil(sealed_length / k)`, so a
+byte range is a contiguous run of shard sub-ranges. Decoding is for
+RECONSTRUCTING a shard whose node will not answer — the client cannot, so any
+failure falls back to the partition server, which can.
+
+**Do not expect a fan-out speedup.** `shard_size` is per EXTENT, and extents
+seal at 16 GiB by default (1 GiB floor), so at k=4 each shard is gigabytes. A
+typical 8 MiB value lands in ONE shard — measured on a live 3+1 cluster, a
+667 KB value read `shards_read=1`. The point of this is that direct read keeps
+working on an EC cluster, not that it goes faster.
+
+Whether it is actually in play is otherwise unanswerable from outside, since a
+decline and a success both end in correct bytes. The client says so once:
+
+```
+EC direct read active: reading data shards straight from their nodes
+  extent_id=16 data_shards=3 shards_read=1
+```
+
+and warns once if it ever falls back (`EC direct read fell back to the PS
+proxy`). Declines are logged by the PARTITION SERVER at debug, with the reason:
+a data shard's node is Suspected (transient), or the shards are not in shard
+files (a pre-CoW conversion, permanent for that extent).
+
+To exercise it by hand, note two traps that make a test pass without touching
+the path at all:
+
+- **`autumnfs` does not use it.** It reads the KV layout directly rather than
+  through the fuse core, so `direct_read` never applies. Drive it with
+  `autumn-s3` (or a fuse mount) instead — both go through `FsState`.
+- **Striping can put every value under the threshold.** Direct read engages at
+  64 KiB. A 300 KB file striped across 24 lanes stores ~12.5 KB per value and
+  never qualifies; size the file so `size / lanes >= 64 KiB`.
+
+```bash
+# 4 nodes → log stream EC 3+1 by default
+AUTUMN_DATA_ROOT=/data08/ec ./cluster.sh reset 4
+autumnfs --manager 127.0.0.1:9001 put big.bin /ec/big.bin      # >= 1.5 MiB
+# Seal its log extent: restart the PS at the 1 GiB floor and fill past it,
+# since there is no operator command that seals a partition's tail.
+autumn-ps --psid 1 ... --max-extent-size-bytes 1073741824
+autumn-op --admin-token-file <tok> force-ec-convert --extent <ID>
+autumn-op --admin-token-file <tok> info --part <PID>   # wait for "ec":true
+autumn-s3 --manager 127.0.0.1:9001 --port 9100 --direct-read true &
+curl -s http://127.0.0.1:9100/ec/big.bin -o out.bin && cmp big.bin out.bin
+```
+
+Killing a node that holds one of the data shards must keep the read
+byte-correct — it declines to the proxy, which rebuilds the shard from parity.
 
 ## A/B-ing a wire-path change (and the three traps that fake the answer)
 

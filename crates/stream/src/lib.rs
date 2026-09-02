@@ -9,7 +9,7 @@ pub mod extent_node;
 pub use autumn_rpc::extent_rpc;
 
 pub use client::{
-    read_extent_value_direct, set_append_chain_min_bytes, set_read_hedge_ms, AppendResult,
+    read_extent_shard_direct, read_extent_value_direct, set_append_chain_min_bytes, set_read_hedge_ms, AppendResult,
     StaleVpOffset, StreamClient,
 };
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};

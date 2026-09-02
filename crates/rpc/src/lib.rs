@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 33;
-pub const WIRE_VERSION_MAX: u32 = 33;
+pub const WIRE_VERSION_MIN: u32 = 34;
+pub const WIRE_VERSION_MAX: u32 = 34;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -508,6 +508,14 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // right before it became a fail-open switch nobody remembered. `BatchGetReq`
     // stays — the bulk form uses it unchanged. Pre-R3: MIN=MAX=33.
     (33, "699f4edcec554d41"),
+    // v34: `GetRedirectResp` gained `ec_data_shards` + `ec_sealed_length`, so a
+    // redirect can describe an EC extent instead of refusing to. The fields are
+    // additive but the version is NOT optional: `replica_addrs` changes meaning
+    // when `ec_data_shards > 0` — entries become positional data-shard homes
+    // holding one slice each, not interchangeable full copies — and a client
+    // that ignored the discriminator would read shard bytes as a value. Same
+    // reason the descriptor used to be refused for EC entirely.
+    (34, "f98d5faa6834f357"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
