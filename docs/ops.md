@@ -1142,9 +1142,17 @@ itself records the regression instead of catching it.
 
 **Getting a clean agent.** `--reset` deletes the agent's keys, and a document
 corpus is mostly BM25 postings — 5164 chunks is ~2 million keys. Measured on a
-local 3-node cluster: **68 s**, or ~29k keys/s, which is the single-partition
-write ceiling — the wipe is now bounded by how fast one partition accepts
-deletes, so more speed means more partitions, not a faster client.
+local 3-node cluster: **70 s**, or ~29k keys/s. It is now delete-bound, not
+scan-bound — `memory-mcp` logs a `wipe breakdown` line (pages / scan_ms /
+delete_ms) at the end of every wipe, and the split is ~2.8 s of scanning to
+~68 s of deleting.
+
+That ~30k keys/s is NOT a partition ceiling, despite looking like one: splitting
+the namespace four ways (data verified spread 46/21/13/20%), raising the delete
+fan-out from 32 to 256, and growing the page from 512 to 4096 keys each moved it
+by less than 10%, and the ingest that writes the same keys lands at the same
+rate. See `F-KV-CLIENT-30K` in the feature list — do not "fix" this by adding
+partitions.
 
 It used to take ~10 minutes at 3.4k keys/s, and the difference is worth knowing
 if you are reading an older run: the range scan was re-snapshotting the whole

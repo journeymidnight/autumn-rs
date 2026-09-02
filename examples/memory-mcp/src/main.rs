@@ -320,15 +320,24 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
     let prefix = autumn_memory::keys::agent_prefix(tenant, agent);
     let mut start: Vec<u8> = Vec::new();
     let mut total = 0usize;
+    let mut scan_ns = 0u128;
+    let mut del_ns = 0u128;
+    let mut pages = 0u64;
     loop {
+        let t = std::time::Instant::now();
         let res = client.range(&prefix, &start, 512).await?;
+        scan_ns += t.elapsed().as_nanos();
+        pages += 1;
         let n = res.entries.len();
         if n == 0 {
             break;
         }
         let last = res.entries[n - 1].key.clone();
         let keys: Vec<&[u8]> = res.entries.iter().map(|e| e.key.as_slice()).collect();
-        for r in client.delete_many(&keys).await {
+        let t = std::time::Instant::now();
+        let results = client.delete_many(&keys).await;
+        del_ns += t.elapsed().as_nanos();
+        for r in results {
             r?;
             total += 1;
         }
@@ -341,6 +350,17 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
         start = last;
         start.push(0);
     }
+    // Split the wall clock, because guessing which half a prefix wipe spends its
+    // time in has been wrong twice. It used to be ~88% scan (the range path
+    // re-snapshotted the whole memtable per page); after that was fixed it is
+    // ~95% delete, and knowing which is which is the difference between fixing
+    // it and optimising the wrong end.
+    tracing::info!(
+        pages,
+        scan_ms = (scan_ns / 1_000_000) as u64,
+        delete_ms = (del_ns / 1_000_000) as u64,
+        "wipe breakdown"
+    );
     Ok(total)
 }
 
