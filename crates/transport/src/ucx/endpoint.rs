@@ -52,7 +52,7 @@
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
 use crate::ucx::worker::{ucs_err, with_thread_ctx};
-use compio::buf::{IoBuf, IoBufMut};
+use compio::buf::{IoBuf, IoBufMut, IoVectoredBuf};
 use compio::BufResult;
 use std::cell::Cell;
 use std::io;
@@ -396,6 +396,9 @@ impl compio::io::AsyncWrite for UcxConn {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         ucx_send(self.ep.ptr(), buf).await
     }
+    async fn write_vectored<T: IoVectoredBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        ucx_send_vectored(self.ep.ptr(), buf).await
+    }
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -461,6 +464,9 @@ impl UcxReadHalf {
 impl compio::io::AsyncWrite for UcxWriteHalf {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         ucx_send(self.ep.ptr(), buf).await
+    }
+    async fn write_vectored<T: IoVectoredBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        ucx_send_vectored(self.ep.ptr(), buf).await
     }
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -546,6 +552,85 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
             } else {
                 BufResult(
                     Err(ucs_err(status, "ucp_stream_send cb")),
+                    ManuallyDrop::into_inner(buf),
+                )
+            }
+        }
+    }
+}
+
+/// Vectored send — ONE `ucp_stream_send_nbx` for the whole buffer list, via
+/// `UCP_DATATYPE_IOV`.
+///
+/// Without this the trait default applies, and it sends only the FIRST
+/// non-empty buffer, so `write_vectored_all` walks the list one send at a
+/// time: a 256-op batched write left here as 259 separate sends. TCP has had
+/// the sendmsg-with-N-iovecs path all along; this is the UCX counterpart.
+///
+/// UCX reads the iov ARRAY itself — not just the payloads it points at — for
+/// the duration of the operation, so the array follows the SAME rule the
+/// payload buffers do: held in `ManuallyDrop`, freed only on a path that
+/// reached completion. On `InflightSlot`'s cancel-overflow path the guard
+/// returns with UCX still owning every pointer it was handed, and a plain local
+/// would be freed there while UCX may still read it.
+async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResult<usize, T> {
+    let buf = ManuallyDrop::new(buf);
+    let mut iov: Vec<ucp_dt_iov_t> = Vec::new();
+    let mut total = 0usize;
+    for s in buf.iter_slice() {
+        if s.is_empty() {
+            continue;
+        }
+        total += s.len();
+        iov.push(ucp_dt_iov_t {
+            buffer: s.as_ptr() as *mut c_void,
+            length: s.len(),
+        });
+    }
+    if total == 0 {
+        return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
+    }
+    let iov = ManuallyDrop::new(iov);
+
+    let slot = slot_acquire();
+
+    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
+    params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE) as u32;
+    params.cb.send = Some(cb_send);
+    params.user_data = slot as *mut c_void;
+    params.datatype = ucp_dt_type::UCP_DATATYPE_IOV as ucp_datatype_t;
+
+    // With UCP_DATATYPE_IOV the "buffer" is the iov array and the "count" is
+    // the number of entries, not a byte length.
+    let r = unsafe { ucp_stream_send_nbx(ep, iov.as_ptr() as *const c_void, iov.len(), &params) };
+    // Every arm below is reached only once UCX is DONE with the operation
+    // (`await_pending` returns only when the slot completes; a mid-await drop
+    // unwinds through the guard and never gets here), so freeing the array is
+    // safe here — and NOT freeing it on the drop path is the point.
+    match classify_ptr(r) {
+        PtrStatus::Done => {
+            unsafe { slot_release(slot) };
+            drop(ManuallyDrop::into_inner(iov));
+            BufResult(Ok(total), ManuallyDrop::into_inner(buf))
+        }
+        PtrStatus::Err(st) => {
+            unsafe { slot_release(slot) };
+            drop(ManuallyDrop::into_inner(iov));
+            BufResult(
+                Err(ucs_err(st, "ucp_stream_send_nbx(iov)")),
+                ManuallyDrop::into_inner(buf),
+            )
+        }
+        PtrStatus::Pending(req) => {
+            let (status, _) = await_pending(req, slot, SPIN_ITERS).await;
+            drop(ManuallyDrop::into_inner(iov));
+            if status == ucs_status_t::UCS_OK {
+                BufResult(Ok(total), ManuallyDrop::into_inner(buf))
+            } else {
+                BufResult(
+                    Err(ucs_err(status, "ucp_stream_send(iov) cb")),
                     ManuallyDrop::into_inner(buf),
                 )
             }

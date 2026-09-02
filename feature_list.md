@@ -37,16 +37,6 @@
 - **Acceptance**: 构造"EC 转换完成 → 杀掉参与者 → 重启"，断言重启后的参与者认为该 extent 已封存（`sealed` 与 `sealed_length` 非零），且对它的 append 被 `CODE_PRECONDITION` 拒绝；转换后再读，字节精确。
 - **Status**: `passes: false` (2026-09-02)
 
-### F-BATCH-ZC-REST — 批量零拷贝的三项收尾（主体已实现，wire v31/v32）
-- **背景**: 批量 RPC 的值原本被拷来拷去，因为 bulk 判据加在**单条 value** 上，而决定一次传输值不值得独占 iovec 的是**帧**有多大。已实现 `MSG_BATCH_PUT_BULK`(0x5A, v31) 与 `MSG_BATCH_GET_BULK`(0x5B, v32)，判据改按分组总字节。实测：写侧 TCP/32K **+16%**、RoCE/4K **约 +61%**；读侧真实查询负载端到端 **-7.5%**（loopback TCP，且 `get_many` 只占该负载一部分）。
-- **仍待做**:
-  1. **`drain_bulk_writes` 只认 `MSG_PUT_BULK`**（`partition-server/src/lib.rs`，判定在 `msg_type != MSG_PUT_BULK`）⇒ `MSG_BATCH_PUT_BULK` 的尾巴拿不到 recv-into-pooled 快路：≥64 KiB 的尾巴要在 `FrameDecoder` 的 BytesMut 里攒一遍（一次应用层拷贝），UCX 上也没有注册内存 RDMA 收。批量路径的天花板因此结构性低于逐条 bulk。做法是让那条 prologue 也认新类型（它的 ctrl 是 rkyv 变长，不像 `MSG_PUT_BULK` 的定长 meta，需要先按 ctrl_len 读完再定位尾巴）。
-  2. **`UcxWriteHalf` 没有 `write_vectored`**（`transport/src/ucx/endpoint.rs:462` 只实现了 `write`）⇒ compio 退化成逐 buffer 发送，一个 256-op 批量在 UCX 上发 259 次。**注意：据此推断"UCX 上会更慢"已被实测否决（+61%）**，所以这不是回归修复而是纯优化；补 `UCP_DATATYPE_IOV` 还能让现有单值 bulk 路径（现在也是 4 次 send）一起受益。
-  3. ~~**`MSG_BATCH_GET`(0x54) 没有发送方**~~ —— **已删除（wire v33）**：常量、`BatchGetResp`/`BatchGetItem`、handler、dispatch、authz arm、`extract_part_id` arm 全部移除，`BatchGetReq` 保留给 bulk 形式；0x54 按本文件既有先例进 RESERVED 注释块（peer 版本闸是 bootstrap 时 skip-on-transport-failure 且 PS 不逐连接复查，所以陈旧二进制仍能发出 0x54 帧——今天干净地死在 `unknown msg_type`，一旦复用该号就可能被静默误解）。
-- **Acceptance**: (1) 批量尾巴走 recv-into-pooled 后，UCX 上批量写吞吐进一步上升且 `PS write-recv bulk engaged` 计数增长；(2) UCX 单次 `writev` 发出整批（可用 ucx 计数器或 strace 佐证），且既有 perf 不退；(3) `MSG_BATCH_GET` 或被删除、或在 `partition_rpc.rs` 里写明保留理由。
-- **Status**: `passes: false` (2026-09-02) — 主体已实现并验收（单测全绿；`put_many_small_values_take_the_batched_bulk_path` 逐字节覆盖写+读两条新路径，含"未命中不占尾巴字节"；`get_many_recovers_from_a_stale_epoch_after_a_split` 覆盖 split 后的 epoch 陈旧恢复，已用消融验证撤掉修复即变红）。
-- **已修的一个自引入回归（记下来当教训）**: bulk 回复是**正常的 FLAG_RESPONSE 帧**，状态在 ctrl 的 code 里，不是 FLAG_ERROR ⇒ epoch 陈旧到客户端手里是 `Ok(code=3)` 而非 `Err(PreconditionFailed)`，于是 `get_many` 里那段 refresh+逐键回退**变成死代码**，split/merge 后整组 key 直接报错。修法是在 `call_ps_for_part_pooled` 里把确定性 code 转成 typed error（并同时补上兄弟函数都有的"确定性失败不烧 MAX_PS_REFRESHES 退避"）。**教训：把一条 RPC 从 error-frame 语义换成 code-in-reply 语义时，所有靠 `Err` 分类的上层恢复逻辑都会静默失效。**
-
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。
 - **⚠️ 已排除的解法（负结果，别重做）**: 把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380 → 3418 key/s）。原因：`ClusterClient::delete_many` 不是批量 RPC，而是并发上限 32 的客户端扇出；而同集群 `perf-check` 显示单分区写 1 线程 9.2K ops/s、8 线程即达 30K ops/s 天花板 ⇒ 删除本身只该占约 12 s，104 s 里的绝大部分是 **694 次 range 扫描**（每页 512 键约 133 ms）。改动已回滚（按 `feedback_no_defensive_fixes_for_imaginary_bugs`：没有实测收益的优化不留）。**真正的瓶颈是前缀扫描，不是删除。**

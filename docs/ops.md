@@ -2046,6 +2046,22 @@ AUTUMN_DATA_ROOT=/data08/autumn-bulk AUTUMN_EXTENT_BASE_PORT=20000 \
 /tmp/ac-new ... perf-check --bulk 64 --size 32768
 ```
 
+**Confirming the PS actually took the zero-copy recv path.** A/B numbers can
+move for reasons unrelated to the branch you edited, so check the branch
+directly: the partition server logs one line the first time a bulk write tail
+lands in a pooled buffer.
+
+```bash
+grep -m1 "PS write-recv bulk engaged" /tmp/autumn-rs-logs/ps.log
+#  ... msg_type=90 transport="tcp(pooled)"   (90 = 0x5A = MSG_BATCH_PUT_BULK,
+#                                             81 = 0x51 = MSG_PUT_BULK)
+```
+
+It is logged ONCE per process, so absence after a long run means the path never
+engaged — most often because the tail was under 64 KiB, or because authz is on
+(which skips this fast path deliberately, so the gate can enforce uniformly on
+the normal decode path).
+
 **Trap 1 — the first run after `cluster.sh reset` is garbage.** Observed 42
 ops/s and 5.33 MB/s on runs that repeated at 25 688 ops/s and 447 MB/s moments
 later. Always warm up and discard; never compare a post-reset run against a warm

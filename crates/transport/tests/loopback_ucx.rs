@@ -200,3 +200,8 @@ async fn drop_recv_into_registered_mid_await_is_safe() {
 
     let _ = server.await;
 }
+
+#[compio::test]
+async fn write_vectored_one_shot() {
+    common::write_vectored_one_shot_at(UcxTransport, bind_addr()).await;
+}

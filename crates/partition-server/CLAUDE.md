@@ -582,26 +582,39 @@ timeout-ability, see autumn-rpc CLAUDE "Why pooled-only"). Cancel-safety of the
 registered recv lives in the read_loop that OWNS the `PooledBuf` (returns it to
 the pool on cancel).
 
-### PS write-recv zero-copy (`MSG_PUT_BULK`, large values)
+### PS write-recv zero-copy (bulk writes, large values)
 
 Symmetric on the WRITE recv side. `drain_bulk_writes` (`lib.rs`) runs in the ps-conn
 read loop right after `decoder.feed`, BEFORE the normal decode: if the FRONT frame
-is a `MSG_PUT_BULK` whose value is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
-recvs the value straight into a `PooledBuf` instead of letting `FrameDecoder`
-accumulate (and copy) it. Mechanics:
-- `peek_header` + `peek_payload` read the frame header and the
-  `[part_id][..][key_len][key]` meta WITHOUT consuming, to locate the value
-  boundary. Gated on `part_id == owner_part` and the size band
-  `[64 KiB, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
-- Consume the header+meta+key, `drain_into` any buffered value prefix into the
+is a bulk write whose raw tail is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
+recvs that tail straight into a `PooledBuf` instead of letting `FrameDecoder`
+accumulate (and copy) it. BOTH value-separable write shapes qualify —
+`MSG_PUT_BULK` (one value, fixed 44-byte binary meta then the key) and
+`MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every op's value back to back). The batch
+form is where the biggest tails are, since the client routes any individually-large
+value to per-op `MSG_PUT_BULK` and a batch's tail is therefore a SUM of small ones.
+Mechanics:
+- `peek_bulk_prologue` verifies the ctrl CRC and yields `ctrl_len` + tail length
+  WITHOUT consuming, so the decision is made only on CRC-protected header fields
+  and the stream stays alignable whatever the ctrl says. Gated on
+  `part_id == owner_part`; part_id comes from fixed binary offsets for the
+  single-value form and from `extract_part_id` (an rkyv decode, the same one the
+  normal dispatch would have paid) for the batch.
+- Size band: both require `>= 64 KiB`; only the single-value form also requires
+  `<= AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT`, because `enqueue_put_bulk` rejects
+  above it. A batch tail has no such ceiling (it is a sum over ops, each capped
+  downstream) and needs none: declining does not make the bytes go away, it makes
+  `FrameDecoder` reserve the same count plus a copy.
+- Consume the prologue, `drain_into` any buffered tail prefix into the
   `PooledBuf`, recv the remainder (UCX `recv_into` registered / TCP
-  `read_exact_into_pooled` owned). The V1 frame-crc trailer is consumed off the
-  wire (stream alignment) but not validated — value integrity is the transport's
-  job. Normal (non-bulk) frames keep their V1 frame-CRC.
-- The value rides onward as `Bytes::from_owner(pb)` via a
-  `PartitionRequest.bulk_value: Option<Bytes>` field; `payload` carries only
-  `[meta][key]`. `enqueue_put_bulk` uses `bulk_value` directly when present. The PS→EN
-  `append_batch` send is already rcache-zero-copy (UCX) / Arc-Bytes (TCP).
+  `read_exact_into_pooled` owned). Nothing follows the tail (v28 removed the
+  per-value CRC — value integrity is the transport's job).
+- The tail rides onward as `Bytes::from_owner(pb)` via a
+  `PartitionRequest.bulk_value: Option<Bytes>` field; `payload` carries the ctrl.
+  `enqueue_put_bulk` / `enqueue_batch_put_bulk` use `bulk_value` directly when
+  present — provenance-blind, so a frame behaves identically whichever path
+  delivered it. The PS→EN `append_batch` send is already rcache-zero-copy (UCX) /
+  Arc-Bytes (TCP).
 - Cancel-safe on both transports: `drain_bulk_writes` owns the `PooledBuf` across the
   recv (UCX `InflightSlot` drains the NIC on drop; TCP compio retains the owned
   buffer until the read CQE lands). The d=1 fast path is skipped when
@@ -1249,8 +1262,8 @@ pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
   emitted and the frame NEVER reaches serve/delegate.
 
 **`drain_bulk_writes` is SKIPPED when authz is ON** (`!gate_active()`) — the bulk
-write-recv fast path bypasses `authz_gate`, so with authz on a large `MSG_PUT_BULK` is
-left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
+write-recv fast path bypasses `authz_gate`, so with authz on a large bulk write
+(`MSG_PUT_BULK` / `MSG_BATCH_PUT_BULK`) is left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
 enforces uniformly (one value copy — acceptable; large writes are rare on `mem/`).
 Never re-enable it under authz without moving the key check into it.
 
@@ -1284,7 +1297,7 @@ turn-ON edge, never a false reject.
   (Layer-A only prevents creating UNOWNED data via writes; reads/deletes are
   Layer-B's job).
 - **Layer-B** (`authz_check`) runs after, gated by `is_enabled`.
-- **`drain_bulk_writes` gate** is skipped when `!gate_active()` so a large `MSG_PUT_BULK`
+- **`drain_bulk_writes` gate** is skipped when `!gate_active()` so a large bulk write
   flows through the FrameDecoder path where the gate enforces BOTH layers.
 - Deploy note: builtin namespaces (`fs/`,`kvc/`,`mem/`) are CAS-registered on the
   first leader of any etcd-backed cluster → registry non-empty → Layer-A ON. So raw

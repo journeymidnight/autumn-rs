@@ -25,3 +25,8 @@ async fn half_close() {
 async fn many_concurrent_1k() {
     common::many_concurrent_at(TcpTransport, loopback(), 1000).await;
 }
+
+#[compio::test]
+async fn write_vectored_one_shot() {
+    common::write_vectored_one_shot_at(TcpTransport, loopback()).await;
+}

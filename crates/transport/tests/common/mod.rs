@@ -80,6 +80,52 @@ pub async fn half_close_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
     let _ = server.await;
 }
 
+/// One `write_vectored` must ship EVERY buffer, not just the first.
+///
+/// This is the property the trait default does NOT have: it writes the first
+/// non-empty buffer and returns its length, so a transport that inherits the
+/// default returns `first.len()` here instead of the total. Asserting on the
+/// RETURN VALUE (rather than only on the bytes the peer eventually sees) is
+/// what makes this catch it — `write_vectored_all` would loop and the peer
+/// would receive everything either way.
+///
+/// The empty buffer in the middle is deliberate: a skipped-but-counted entry
+/// would shift every byte after it.
+pub async fn write_vectored_one_shot_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
+    let parts: Vec<Vec<u8>> = vec![
+        vec![b'a'; 7],
+        vec![b'b'; 4096],
+        Vec::new(),
+        vec![b'c'; 1],
+        vec![b'd'; 64 * 1024],
+    ];
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let mut expect = Vec::with_capacity(total);
+    for p in &parts {
+        expect.extend_from_slice(p);
+    }
+
+    let mut listener = t.bind(addr).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let server = compio::runtime::spawn(async move {
+        let (c, _) = listener.accept().await.unwrap();
+        let (mut r, _w) = c.into_split();
+        let BufResult(res, got) = r.read_exact(vec![0u8; total]).await;
+        res.expect("read_exact");
+        got
+    });
+
+    let c = t.connect(bound).await.unwrap();
+    let (_r, mut w) = c.into_split();
+    let BufResult(res, _) = w.write_vectored(parts).await;
+    assert_eq!(
+        res.expect("write_vectored"),
+        total,
+        "one write_vectored must ship every buffer (a per-buffer fallback returns only the first)"
+    );
+    assert_eq!(server.await.unwrap(), expect, "bytes must arrive in order");
+}
+
 // ---------------- internals ----------------
 
 async fn echo_n(c: Conn, n: usize) {

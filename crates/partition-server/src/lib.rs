@@ -4753,21 +4753,28 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
     tx_bufs.extend(values);
 }
 
-/// UCX + TCP — drain LARGE `MSG_PUT_BULK` frames at the FRONT
-/// of `decoder`, recv'ing each value straight into a `PooledBuf` instead of
-/// letting `FrameDecoder` accumulate it (which would copy the whole value into
+/// UCX + TCP — drain LARGE value-separable write frames at the FRONT of
+/// `decoder`, recv'ing the raw tail straight into a `PooledBuf` instead of
+/// letting `FrameDecoder` accumulate it (which would copy the whole thing into
 /// the decoder buffer). On UCX the buffer is registered → RDMA recv, no off-wire
 /// copy; on TCP the value is recv'd via a compio owned read
 /// (`read_exact_into_pooled`) → only the unavoidable kernel→userspace copy
-/// remains (the app-level FrameDecoder copy is gone). Each is routed as a
-/// `PartitionRequest { payload = [meta][key], bulk_value = Some(value) }` so
-/// `enqueue_put_bulk` uses the value directly (no concat back). Returns as soon as
-/// the front frame is NOT an eligible large `MSG_PUT_BULK` (the caller then runs
-/// the normal decode path on the remainder).
+/// remains (the app-level FrameDecoder copy is gone). The frame is routed as a
+/// `PartitionRequest { payload = ctrl, bulk_value = Some(tail) }` so the enqueue
+/// uses the bytes directly (no concat back). Returns as soon as the front frame
+/// is NOT an eligible large bulk write (the caller then runs the normal decode
+/// path on the remainder).
 ///
-/// v28 (unified wire CRC): the frame's ctrl (`[meta][key]`) is CRC-protected
-/// together with the header — `peek_bulk_prologue` VERIFIES it before the value
-/// recv commits, so a flipped part_id/key_len/lease field fails loud. The raw
+/// BOTH bulk write shapes qualify: `MSG_PUT_BULK` (one value, fixed 44-byte
+/// binary meta then the key) and `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every
+/// op's value back to back, sliced per op downstream). Recognising only the
+/// single-value form left the batch path structurally slower than the per-item
+/// one it exists to beat: its tail is by definition the batch's whole value
+/// payload, so it is exactly the buffer worth keeping off the decoder.
+///
+/// v28 (unified wire CRC): the frame's ctrl is CRC-protected together with the
+/// header — `peek_bulk_prologue` VERIFIES it before the value recv commits, so
+/// a flipped part_id/key_len/lease/value_len field fails loud. The raw
 /// value tail carries no frame CRC (transport integrity: UCX NIC ICRC / TCP
 /// kernel segment checksum — measured the per-value crc at ~20% of a
 /// core @ 8 MiB) and there is no trailer after the value to consume.
@@ -4794,7 +4801,8 @@ async fn drain_bulk_writes(
         let Some((req_id, msg_type, _flags, _payload_len)) = decoder.peek_header() else {
             return Ok(());
         };
-        if msg_type != MSG_PUT_BULK || req_id == 0 {
+        let is_batch = msg_type == partition_rpc::MSG_BATCH_PUT_BULK;
+        if (msg_type != MSG_PUT_BULK && !is_batch) || req_id == 0 {
             return Ok(()); // not a bulk write at the front → normal path
         }
         // Wait for the full prologue ([header][ctrl_len][meta+key][crc]) and
@@ -4803,42 +4811,60 @@ async fn drain_bulk_writes(
         let prologue = match decoder.peek_bulk_prologue() {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(()), // need more bytes (prologue is tiny)
-            Err(e) => return Err(anyhow!("MSG_PUT_BULK prologue: {e}")),
+            Err(e) => return Err(anyhow!("bulk write prologue (msg_type={msg_type:#x}): {e}")),
         };
         let ctrl_len = prologue.ctrl_len;
         let value_len = prologue.value_len;
-        if value_len < AUTUMN_PS_BULK_RECV_MIN_BYTES
-            || value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
-        {
-            // Below threshold, or over the inline cap (enqueue_put_bulk rejects
-            // the latter) — let the normal path handle it.
+        if value_len < AUTUMN_PS_BULK_RECV_MIN_BYTES {
+            return Ok(()); // below threshold → the proven decode path
+        }
+        // The single-value form caps at the inline limit (`enqueue_put_bulk`
+        // rejects above it, so recv'ing it would be wasted work). The BATCH
+        // form has no equivalent ceiling: its tail is the SUM over ops, each of
+        // which is individually capped downstream, and a batch of 256 x 32 KiB
+        // legitimately exceeds any per-value limit. No ceiling is needed to
+        // bound the allocation either — declining here does not make the bytes
+        // go away, it makes `FrameDecoder` accumulate the same count plus a
+        // copy.
+        if !is_batch && value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
             return Ok(());
         }
-        if ctrl_len < PUT_BULK_HEADER_LEN {
-            return Ok(()); // malformed meta → let normal decode reject it
-        }
-        let (part_id, key_len) = {
+        // Parse enough of the ctrl to route. The two forms carry it
+        // differently: the single-value form is a fixed 44-byte binary meta
+        // then the key, the batch form is a variable-length rkyv struct, so
+        // only the batch pays a decode — the same one `push_one_frame_to_inflight`
+        // would have paid had this frame gone down the normal path.
+        let part_id = if is_batch {
             let ctrl = decoder
                 .peek_ctrl(ctrl_len)
                 .expect("prologue verified => ctrl buffered");
-            (
-                u64::from_le_bytes(ctrl[0..8].try_into().unwrap()),
-                u32::from_le_bytes(ctrl[24..28].try_into().unwrap()) as usize,
-            )
+            partition_rpc::extract_part_id(msg_type, ctrl)
+        } else {
+            if ctrl_len < PUT_BULK_HEADER_LEN {
+                return Ok(()); // malformed meta → let normal decode reject it
+            }
+            let ctrl = decoder
+                .peek_ctrl(ctrl_len)
+                .expect("prologue verified => ctrl buffered");
+            let key_len = u32::from_le_bytes(ctrl[24..28].try_into().unwrap()) as usize;
+            // v28: ctrl must be exactly [meta][key] — a declared key_len that
+            // disagrees with ctrl_len is malformed; the normal path rejects it.
+            if PUT_BULK_HEADER_LEN.checked_add(key_len) != Some(ctrl_len) {
+                return Ok(());
+            }
+            u64::from_le_bytes(ctrl[0..8].try_into().unwrap())
         };
         if part_id != owner_part {
             return Ok(()); // mis-routed → normal path synths the NotFound
         }
-        // v28: ctrl must be exactly [meta][key] — a declared key_len that
-        // disagrees with ctrl_len is malformed; the normal path rejects it.
-        if PUT_BULK_HEADER_LEN.checked_add(key_len) != Some(ctrl_len) {
-            return Ok(());
-        }
-        let meta_key = Bytes::copy_from_slice(
+        // The ctrl travels on as the request payload: `[meta][key]` for the
+        // single-value form, the rkyv `BatchPutBulkReq` for the batch. Small
+        // either way — it is the VALUES that stay off this copy.
+        let ctrl_bytes = Bytes::copy_from_slice(
             decoder
                 .peek_ctrl(ctrl_len)
                 .expect("prologue verified => ctrl buffered"),
-        ); // small copy
+        );
 
         // Back-pressure before adding another in-flight reply.
         while inflight.len() >= cap {
@@ -4866,7 +4892,7 @@ async fn drain_bulk_writes(
                 let n = reader.recv_into(&mut dest[filled..], reg).await?;
                 if n == 0 {
                     return Err(anyhow!(
-                        "eof mid MSG_PUT_BULK value (got {filled}/{value_len})"
+                        "eof mid bulk write value (msg_type={msg_type:#x}, got {filled}/{value_len})"
                     ));
                 }
                 filled += n;
@@ -4877,7 +4903,9 @@ async fn drain_bulk_writes(
             pb = reader
                 .read_exact_into_pooled(pb, filled, value_len)
                 .await
-                .map_err(|e| anyhow!("eof/io mid MSG_PUT_BULK value (tcp bulk-recv): {e}"))?;
+                .map_err(|e| {
+                    anyhow!("eof/io mid bulk write value (msg_type={msg_type:#x}, tcp bulk-recv): {e}")
+                })?;
         }
         let value = Bytes::from_owner(pb);
 
@@ -4885,8 +4913,9 @@ async fn drain_bulk_writes(
         if PS_BULK_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             tracing::info!(
                 value_len,
+                msg_type,
                 transport = if reader.is_ucx() { "ucx(registered)" } else { "tcp(pooled)" },
-                "PS write-recv bulk engaged (MSG_PUT_BULK recv into pooled buffer; UCX / TCP)"
+                "PS write-recv bulk engaged (bulk write value recv into pooled buffer; UCX / TCP)"
             );
         }
 
@@ -4896,13 +4925,13 @@ async fn drain_bulk_writes(
         inflight.push(
             async move {
                 (
-                    delegate_round_trip(tx, req_id, MSG_PUT_BULK, meta_key, Some(value)).await,
+                    delegate_round_trip(tx, req_id, msg_type, ctrl_bytes, Some(value)).await,
                     Vec::new(),
                 )
             }
             .boxed_local(),
         );
-        // Loop to handle a possible next large MSG_PUT_BULK at the new front.
+        // Loop to handle a possible next large bulk write at the new front.
     }
 }
 
@@ -5529,14 +5558,14 @@ async fn handle_ps_connection(
                 PsReadBurst::Data { buf, n, mut reader } => {
                     decoder.feed(&buf[..n]);
 
-                    // recv any LARGE MSG_PUT_BULK value(s) at the
+                    // recv any LARGE bulk-write tail(s) at the
                     // front straight into a PooledBuf (UCX registered RDMA / TCP
                     // compio owned read — no FrameDecoder accumulation copy)
                     // before the normal decode buffers them. May push write
                     // replies onto `inflight`, which disables the d=1 fast path
                     // below (guarded by is_empty()).
-                    // when authz is ON, skip the bulk-recv fast path so
-                    // large MSG_PUT_BULK flows through the normal FrameDecoder path
+                    // when authz is ON, skip the bulk-recv fast path so a
+                    // large bulk write flows through the normal FrameDecoder path
                     // where `push_one_frame_to_inflight`'s gate enforces the key
                     // prefix uniformly (the bulk path bypasses that dispatch). The
                     // perf cost (a value copy on large authz-gated writes) is
@@ -5691,7 +5720,7 @@ async fn handle_ps_connection(
                     PsReadBurst::Err { e, .. } => return Err(e.into()),
                     PsReadBurst::Data { buf, n, mut reader } => {
                         decoder.feed(&buf[..n]);
-                        // recv large MSG_PUT_BULK values into
+                        // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
                         // D7: skip when EITHER layer is on
                         // (see the idle-branch note) so a large PUT_ZC is enforced
@@ -12792,6 +12821,123 @@ mod write_batch_fastpath_tests {
             drop(client_wr);
             let _ = conn_handle.await;
             let _ = loop_handle.await;
+        });
+    }
+
+    /// A `MSG_BATCH_PUT_BULK` whose TAIL clears the bulk threshold must be
+    /// recv'd straight into a pooled buffer, exactly like the single-value
+    /// `MSG_PUT_BULK`.
+    ///
+    /// The batch form is where the biggest tails actually are — the client
+    /// routes any individually-large value to per-op `MSG_PUT_BULK`, so a
+    /// batch's tail is a SUM of small values and can be megabytes. Recognising
+    /// only the single-value form left that sum to be accumulated (and copied)
+    /// inside `FrameDecoder`.
+    ///
+    /// `PS_BULK_WRITE_RECV_HITS` is the observable: both paths hand the enqueue
+    /// the same `bulk_value`, so the value bytes alone cannot tell them apart.
+    /// Asserting the delta is what makes this red when the recognition is
+    /// removed.
+    #[test]
+    fn batch_put_bulk_tail_is_recvd_into_a_pooled_buffer() {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let before = PS_BULK_WRITE_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 11,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
+            });
+
+            // Values are individually well under the 64 KiB threshold and add
+            // up well over it — the shape the batch bulk form exists for.
+            // Distinct lengths AND contents so a tail-cursor slip reads as one
+            // op holding its neighbour's bytes.
+            const N: usize = 24;
+            let values: Vec<Vec<u8>> = (0..N)
+                .map(|i| vec![(i % 251) as u8 + 1; 4096 + i * 64])
+                .collect();
+            let ops: Vec<partition_rpc::BatchPutBulkOp> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| partition_rpc::BatchPutBulkOp {
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                    key: format!("bpb-{i:03}").into_bytes(),
+                    value_len: v.len() as u32,
+                    expires_at: 0,
+                })
+                .collect();
+            let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchPutBulkReq {
+                part_id: 11,
+                region_epoch: 0,
+                ops,
+            });
+            let tail: Vec<u8> = values.concat();
+            assert!(
+                tail.len() > AUTUMN_PS_BULK_RECV_MIN_BYTES,
+                "the tail must clear the threshold or this tests nothing"
+            );
+
+            let head = autumn_rpc::frame::encode_vectored_head(
+                7001,
+                partition_rpc::MSG_BATCH_PUT_BULK,
+                0,
+                ctrl.len(),
+                tail.len(),
+            );
+            let crc = autumn_rpc::frame::compute_ctrl_crc(&head, std::slice::from_ref(&ctrl));
+            let mut wire = Vec::with_capacity(head.len() + ctrl.len() + 4 + tail.len());
+            wire.extend_from_slice(&head);
+            wire.extend_from_slice(&ctrl);
+            wire.extend_from_slice(&crc);
+            wire.extend_from_slice(&tail);
+
+            let (client_rd, mut client_wr) = client.into_split();
+            let BufResult(r, _) = client_wr.write_all(wire).await;
+            r.expect("write");
+
+            let req = req_rx.next().await.expect("request delivered");
+            assert_eq!(req.msg_type, partition_rpc::MSG_BATCH_PUT_BULK);
+            assert_eq!(
+                req.payload.as_ref(),
+                ctrl.as_ref(),
+                "ctrl must travel on as the request payload"
+            );
+            let got = req.bulk_value.clone().expect("tail rides as bulk_value");
+            assert_eq!(got.as_ref(), tail.as_slice(), "tail must arrive intact");
+
+            let after = PS_BULK_WRITE_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after - before,
+                1,
+                "the batch tail must take the pooled recv path (before={before}, after={after})"
+            );
+
+            // BOTH halves — the socket only closes when the last one drops, and
+            // `handle_ps_connection` returns on EOF.
+            drop(req);
+            drop(client_rd);
+            drop(client_wr);
+            drop(req_rx);
+            let _ = conn_handle.await;
         });
     }
 

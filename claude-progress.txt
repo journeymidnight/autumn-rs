@@ -42,6 +42,27 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
   验证走 `autumn-s3` —— `autumnfs` 直接读 KV 布局、根本不过 fuse core，测不到这条路径；
   另外条带化会把每个 value 切到 64 KiB 直读阈值以下（两个坑都写进 docs/ops.md 了）。
 
+【2026-09-02 F-BATCH-ZC-REST 收尾两项：已完成】
+  ① `drain_bulk_writes` 之前只认 `MSG_PUT_BULK`，于是 `MSG_BATCH_PUT_BULK` 的尾巴拿不到
+  recv-into-pooled 快路——要先在 FrameDecoder 的 BytesMut 里攒一遍（一次应用层拷贝），
+  UCX 上也没有注册内存 RDMA 收。这恰好是最该省的那块：客户端把单个 ≥64 KiB 的值都路由到
+  逐条 `MSG_PUT_BULK`，所以一个 batch 的尾巴按定义是"一堆小值的和"，动辄兆级。现在两种形状
+  都认。两处形状差异：batch 的 ctrl 是变长 rkyv（part_id 走 `extract_part_id`，就是正常派发
+  路径本来也要付的那次解码），且**不设 64 MiB 上限**——那是单值形状里 `enqueue_put_bulk` 的
+  拒绝线，batch 的尾巴是各 op 之和、每个 op 在下游单独受限；也不需要上限来兜住分配：拒绝
+  并不能让这些字节消失，只会让 FrameDecoder 预留同样多再加一次拷贝。
+  ② `UcxWriteHalf`/`UcxConn` 补上 `write_vectored`（`UCP_DATATYPE_IOV`，一次
+  `ucp_stream_send_nbx` 发完整批）。此前用的是 compio 的 trait 默认实现——它只发第一个非空
+  buffer 并返回该 buffer 的长度，于是 `write_vectored_all` 一个 buffer 一次 send，一个
+  256-op 批量在 UCX 上发 259 次。TCP 早就走 sendmsg 多 iovec，这是 UCX 的对应实现。
+  两项都用消融验证过：去掉识别后计数器 delta=0（应为 1）；去掉 IOV 后真 RoCE 上
+  `write_vectored` 返回 7 而不是 69640。
+  **fable 评审挖出一个我自引入的 MEDIUM**：`InflightSlot` 在 SPIN_CAP 溢出时会带着
+  "UCX 仍持有指针"直接返回并泄漏 slot——payload 靠 `ManuallyDrop` 满足这条约定，而我的 iov
+  数组是普通局部变量，会在那条路径上被释放而 UCX 可能还在读它。已改成同样的 `ManuallyDrop`
+  规则（只在真正完成的分支释放）。fable 同时逐条核对了批量快路的对齐/part_id=0 哨兵/去掉
+  上限/authz/enqueue 等价五点，均安全。
+
 【2026-09-02 s3 网关搬进 PS：做完又整体 revert（用户拍板"划不来"）】
   实现过一版 `autumn-ps --s3-gateway`（默认 false、独立 OS 线程、真集群 e2e 三轮全过），
   推为 6f922b9，随后用户判定不划算，整体 `git revert`（不 force-push）。
