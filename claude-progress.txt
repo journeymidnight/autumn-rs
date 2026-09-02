@@ -1,5 +1,5 @@
 Date: 2026-09-02
-TaskStatus: completed
+TaskStatus: not_completed
 Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API + FUSE 节点故障根因修复 + 集群重建。
   逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
   清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），
@@ -499,3 +499,35 @@ Next steps: 无。
   ■ 未做
     FreeToken 本身未部署(镜像刚就绪)。hermes-autumn / vllm-autumn 仍是 wire 29,
     要用需按同样方式(AUTUMN_IMAGE 指向带源码的 tag)重建。
+
+【2026-09-02 未完成:EC 4+1 子范围重建的零冗余(已定位,未修)】
+  症状: >=64 KiB 的读在负载下随机失败 —— `ec_reconstruct_shard_subrange: only S/4 shards
+  available (missing=N, ...)`。**missing=N 是分片索引不是数量**。空载复现不出来(20/20 通过)。
+  机制: 重建时代码跳过缺失分片自己的节点(client.rs:4941-4944),于是 4+1 变成"剩下 4 个必须
+  全部在 ~3.03s 内应答"——零冗余。而很多时候那个分片只是被 Suspected 跳过
+  (client.rs:4784-4791),节点根本没被问过。哪些偏移会触发是确定的(静态 offset->shard 映射),
+  会不会失败是负载相关的。283 GiB 读密集的权重数据坐在这个结构上。
+
+  加固方案(subagent 给出,按最小优先,**均未实施**):
+  R1 重建时把缺失分片的节点也加入并行竞速 —— 4-of-4 恢复成 4-of-5,拿回数据本有的那格冗余。
+     并行发出,零墙钟成本,只多一个 128KiB RPC。~10 行,不引入重试语义。
+     **动手前要核实的前提**: "缺失分片直接返回其字节"只在它是数据分片(非校验分片)时成立。
+  R2 把 shortfall 变成类型化 sentinel,接入已有的 EversionStale 2 次尝试循环
+     (client.rs:3832-3842)。**仅当 success == K-1**(只差一个 peer)才重试;带 jitter;
+     必须先 invalidate + 重取 ExtentInfo,否则是拿旧状态问同一个错节点。
+  R3 认 CODE_PAYLOAD_NOT_HERE 为类型化信号(extent_node.rs:2503-2510 的契约),走同一条自愈路径。
+  R4 **保持响亮**(这条让 R1-R3 安全): 降级读要 WARN(4826-4839 现在完全静默);
+     shortfall 消息带 extent_id + 各 peer 的错误;PS 的 map_storage_error 用 {e:#}
+     (rpc_handlers.rs:42,现在只送最外层 Display);**反复失败的分片走 corrupt-replica 通道
+     上报,让 manager 重建它** —— 否则重试只是把响亮的失败变成缓慢的失败,而 M=1 时
+     下一次失败就是数据不可用。
+  重试禁止事项: 只重试一次;success<=K-2 不重试;不复用陈旧状态;不接受短读(部分字节进 RS
+  是静默损坏);不重试确定性拒绝;不复活 ec_read_full_and_slice(4813-4819 故意移除的);不静默成功。
+
+【本人两次仪器错误,同一形状,记以自省】
+  1. 用 `ops history` 证伪 EC 假设 —— auto-policy 的 EC 转换绕过 op ledger,该工具对它天然失明。
+     **空结果来自看不见目标的仪器,和阴性结果长得一模一样。** 被 subagent 顶回来,它是对的。
+  2. 用 `dd 2>/dev/null | wc -c` 探测 —— I/O 错误和 0 字节读都得到 0,**无法区分**。
+     据此断言存在"静默截断",并让 subagent 花两轮论证一个伪事实。
+  两次都是"失败伪装成成功",而这正是我当天一直在别处指出的模式。
+  `2>/dev/null` 之于 dd,等同于 `e.to_string()` 之于 PS 的错误链:**都丢掉了区分失败与缺席的通道**。
