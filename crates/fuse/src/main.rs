@@ -59,7 +59,15 @@ struct Args {
     /// falls back to the PS proxy (the client warns once). DEFAULT ON; disable
     /// with `--direct-read false` on a topology that keeps EN data ports on a
     /// PS-only subnet (fallback works but wastes one redirect RTT per extent).
-    #[arg(long, default_value = "true")]
+    // `action = Set` is what makes `--direct-read false` actually parse. With
+    // clap 4's derive, a plain `bool` field becomes a valueless SetTrue flag and
+    // `default_value = "true"` is inert — so the form this flag's own help text
+    // and startup log both tell operators to use was rejected with "unexpected
+    // argument 'false'", and there was NO way to turn direct reads off. That
+    // matters more than a usability wart: the size-gated EN-direct path is the
+    // one an operator needs to disable when it misbehaves, and the escape hatch
+    // was documented but absent.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     direct_read: bool,
 }
 
