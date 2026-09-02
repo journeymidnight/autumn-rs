@@ -539,9 +539,56 @@ pub(crate) async fn handle_get_redirect(
                     tracing::warn!(
                         extent_id,
                         error = %e,
-                        "get_redirect: descriptor lookup failed — answering via the proxy path"
+                        "get_redirect: descriptor lookup failed — answering inline"
                     );
-                    handle_get(payload, part).await
+                    // Answer in the shape THIS message type promises.
+                    //
+                    // This used to delegate to `handle_get`, which encodes a
+                    // `GetResp` — three fields where the client is decoding an
+                    // eight-field `GetRedirectResp`. rkyv carries no type tag,
+                    // so nothing catches a handler answering msg_type X with
+                    // struct Y; the client's bytecheck simply fails, and the
+                    // operator gets "rkyv decode: failed" with no hint that the
+                    // PS had already read the correct value and put it in the
+                    // response. That is a wire-contract violation, and it is
+                    // reached on EVERY large read of an EC-converted extent —
+                    // which an armed `balanced` auto-policy produces on any
+                    // cluster with >= 5 ENs, since bootstrap defaults those to
+                    // --log-ec 4+1 and presplit children inherit the shape.
+                    //
+                    // `extent_id: 0` is the "PS declined to redirect, value is
+                    // inline" form the success path above already emits and the
+                    // client already handles, so this costs ONE round trip
+                    // rather than the two a client-side proxy retry would.
+                    match get_value(payload, part).await? {
+                        GetOutcome::NotFound => {
+                            Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+                                code: CODE_NOT_FOUND,
+                                message: "key not found".to_string(),
+                                value: vec![],
+                                extent_id: 0,
+                                value_offset: 0,
+                                value_len: 0,
+                                eversion: 0,
+                                replica_addrs: vec![],
+                            }))
+                        }
+                        GetOutcome::Value(value) => {
+                            Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+                                code: CODE_OK,
+                                message: String::new(),
+                                value: value.into(),
+                                extent_id: 0,
+                                value_offset: 0,
+                                value_len: 0,
+                                eversion: 0,
+                                replica_addrs: vec![],
+                            }))
+                        }
+                        GetOutcome::Redirect { .. } => {
+                            unreachable!("get_value never redirects")
+                        }
+                    }
                 }
             }
         }
