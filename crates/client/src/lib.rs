@@ -2585,8 +2585,29 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: GetRedirectResp =
-            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        // An undecodable descriptor must DEGRADE, not fail the read.
+        //
+        // This used to `?` straight out, which broke the contract stated in
+        // this path's own doc comment ("ANY direct-read failure falls back to
+        // the proxy") and skipped both the per-replica retry and the proxy
+        // fallback sitting a few lines below. It also destroyed the diagnosis:
+        // whatever the PS actually said — an error frame, a shape this build
+        // does not know — reached the operator as the bare string
+        // "rkyv decode: failed", naming neither the cause nor the fact that a
+        // working proxy path went unused. It stalled a 130 GiB weight load at
+        // 435 MB with the extent nodes never contacted, and the identical
+        // signature had been misfiled as version skew three weeks earlier.
+        //
+        // WARN so the condition stays visible, then take the path the caller
+        // would have taken with direct reads off.
+        let resp: GetRedirectResp = match rkyv_decode(&resp_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "direct-read: undecodable redirect descriptor — falling back to the PS proxy");
+                return Ok(self.get(key).await?.map(bytes::Bytes::from));
+            }
+        };
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
@@ -2763,8 +2784,29 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: GetRedirectResp =
-            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        // An undecodable descriptor must DEGRADE, not fail the read.
+        //
+        // This used to `?` straight out, which broke the contract stated in
+        // this path's own doc comment ("ANY direct-read failure falls back to
+        // the proxy") and skipped both the per-replica retry and the proxy
+        // fallback sitting a few lines below. It also destroyed the diagnosis:
+        // whatever the PS actually said — an error frame, a shape this build
+        // does not know — reached the operator as the bare string
+        // "rkyv decode: failed", naming neither the cause nor the fact that a
+        // working proxy path went unused. It stalled a 130 GiB weight load at
+        // 435 MB with the extent nodes never contacted, and the identical
+        // signature had been misfiled as version skew three weeks earlier.
+        //
+        // WARN so the condition stays visible, then take the path the caller
+        // would have taken with direct reads off.
+        let resp: GetRedirectResp = match rkyv_decode(&resp_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "direct-read: undecodable redirect descriptor — falling back to the PS proxy");
+                return self.get_range_into(key, offset, length, dest).await;
+            }
+        };
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
