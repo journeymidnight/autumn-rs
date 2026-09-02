@@ -130,7 +130,7 @@ Weka), not generic FUSE.**
 
 ## Recipe C — `autumn-s3` sidecar + stock `runai_streamer` (RECOMMENDED — every engine)
 
-`autumn-s3` (`examples/s3-gateway`) is a read-only, unauthenticated
+`autumn-s3` (`crates/server/src/bin/autumn_s3/`) is a read-only, unauthenticated
 S3 endpoint over the `fs/` tree. It serves only what the Run:ai streamer
 issues — `ListObjectsV2`, ranged `GetObject`, whole `GetObject` — which is
 enough for **SGLang's built-in `--load-format runai_streamer`**, and so gives

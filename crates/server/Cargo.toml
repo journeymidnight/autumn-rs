@@ -28,11 +28,33 @@ path = "src/bin/autumn_op/main.rs"
 name = "autumnfs"
 path = "src/bin/autumnfs.rs"
 
+# Read-only S3 gateway over the `fs/` tree. It exists so inference engines with
+# no loader plugin seam (SGLang, FreeToken) can stream weights through their
+# built-in `--load-format runai_streamer`, which speaks S3 and nothing else.
+# Its own process, deployed as a per-node sidecar — hosting it inside the
+# partition server was tried and reverted (see claude-progress.txt: with
+# `panic = "abort"` a gateway panic would abort the partition server, the
+# transport is a process-wide OnceLock the PS initialises, and `--cpuset` does
+# not confine threads that pin nothing).
+[[bin]]
+name = "autumn-s3"
+path = "src/bin/autumn_s3/main.rs"
+
 [dependencies]
 # autumnfs reuses the ungated `key` + `schema` modules. `default-features = false`
 # skips the fuser/libc/clap fuse-mount deps; we only need the bookkeeping
 # structs + KV-key encoders, no kernel-side FUSE plumbing.
-autumn-fuse = { path = "../fuse", default-features = false }
+# `core` = the fuser-FREE filesystem layer (same one the PyO3 `autumn.Fs`
+# binding uses). `autumnfs` needs only key/schema/geom, which sit outside the
+# gate; `autumn-s3` reads through the full core.
+autumn-fuse = { path = "../fuse", default-features = false, features = ["core"] }
+# `autumn-s3` only. rustc never links an `--extern` crate a binary does not
+# reference, so the other six binaries in this package pay build time, not size
+# — measured on debug builds, where there is no LTO to credit for it.
+axum = "0.8"
+cyper-axum = "0.8"
+send_wrapper = { version = "0.6", features = ["futures"] }
+socket2 = { version = "0.5", features = ["all"] }
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true

@@ -94,6 +94,43 @@ Global `--admin-token` / `--admin-token-file`: attached as a signed payload pref
 
 **CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope), `--tenant` (←`--with-tenant`, `namespace-create`), `--principal` (←`--tenant`, `mint-token`). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), the per-command `--admin-token` duplicating the global one, and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
 
+### `autumn-s3` (`src/bin/autumn_s3/`)
+
+Read-only, unauthenticated S3 endpoint over the `fs/` tree, in its own process.
+It exists so inference engines with no loader plugin seam (SGLang, FreeToken)
+can stream weights through their built-in `--load-format runai_streamer`, which
+speaks S3 and nothing else; every other S3 tool reads autumn through it as a
+side effect. Serves only what that streamer issues — `ListObjectsV2`, ranged
+`GetObject`, whole `GetObject` — and answers every mutating verb with a
+parseable S3 `NotImplemented`. Requests are served whatever their
+`Authorization` header says, including none.
+
+```
+autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
+          [--host <daemon-identity>] [--credential-file <path>]
+          [--direct-read true|false]
+```
+
+- Reads go through `autumn-fuse`'s `core` layer — the same one the PyO3
+  `autumn.Fs` binding uses — so lane striping, EN-direct reads and authz apply
+  unchanged. An adapter over the partition layer, not a second data plane.
+- `--workers` (default `min(cores, 8)`) accept threads, each with its own compio
+  runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One
+  thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
+- `--host` names the daemon identity each worker registers under (the entrypoint
+  passes `s3-$HOSTNAME`); workers append their index.
+- Being a binary of this package rather than an example also means a plain
+  `cargo build --release` produces it — examples were never in
+  `default-members`, so it used to be skipped, which is the shape of the
+  stale-release-binary trap the chaos and perf runbooks warn about.
+- **Its own process, on purpose.** Hosting it inside `autumn-ps` behind a flag
+  was implemented, verified end to end, and reverted: the release profile sets
+  `panic = "abort"` so a gateway panic would abort the partition server, the
+  transport is a process-wide `OnceLock` the PS initialises (a `--transport ucx`
+  server would hand the gateway UCX connections, which nothing has exercised),
+  and `--cpuset` cannot confine threads that pin nothing. See
+  `claude-progress.txt` before proposing the move again.
+
 ### `autumnfs` (`src/bin/autumnfs.rs`)
 
 Offline POSIX-ish CLI over the fuse on-disk schema, **without** mounting — `ls / mkdir / cp` from any shell against a running cluster, for inspection, scripted setup, CI seeding.

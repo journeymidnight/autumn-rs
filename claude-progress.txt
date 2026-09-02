@@ -30,8 +30,14 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
 
 【2026-09-02 s3 网关搬进 PS：做完又整体 revert（用户拍板"划不来"）】
   实现过一版 `autumn-ps --s3-gateway`（默认 false、独立 OS 线程、真集群 e2e 三轮全过），
-  推为 6f922b9，随后用户判定不划算，整体 `git revert`（不 force-push）。网关**留在
-  `examples/s3-gateway`**。
+  推为 6f922b9，随后用户判定不划算，整体 `git revert`（不 force-push）。
+  **随后用户又定"它不算 example"**，于是从 `examples/s3-gateway` 搬到
+  `crates/server/src/bin/autumn_s3/`，成为 autumn-server 包的一等二进制，与 manager /
+  extent-node / ps / client / op / autumnfs 并列。**仍是独立进程**，所以下面那三条代价
+  一条都不适用；这次只是位置变了，代码逐字未改（三个文件 100% rename）。
+  连带：`-p autumn-server` 已会构建它 ⇒ Dockerfile 少一个 `-p autumn-s3`；entrypoint 的
+  `s3` role 不用动；且它现在**进了默认构建**（examples 从不在 default-members，以前
+  `cargo build --release` 会跳过它 —— 正是 chaos/perf 那条"用了陈旧 release 二进制"的坑）。
   **为什么划不来（评审挖出来的代价，重做前先读这三条）**：
     · **`panic = "abort"`**（release profile）⇒ 网关线程一 panic **带走整个 PS**。
       "worker 死了不拖垮 PS"只对"返回 Err"成立。sidecar 时代 panic 只死 sidecar ——
@@ -89,7 +95,7 @@ Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API +
   ⚠️ 环境隐患：/data05 已 95% 满（剩 176G），下次跑 perf 前先清，否则迟早造出下一个假回归。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
-  examples/s3-gateway（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
+  `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
   读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：
     vLLM 0.28    本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5
     SGLang 0.5.10 本地盘 35.7                   | 网关 37.1
