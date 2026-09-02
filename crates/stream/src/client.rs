@@ -37,6 +37,30 @@ fn is_eversion_stale(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EversionStale>())
 }
 
+/// The EN says it does not hold the payload file this request named.
+///
+/// A typed refusal with a designed meaning: the server's `ReadBytesReq` doc
+/// states it serves the named file or answers `CODE_PAYLOAD_NOT_HERE`, never
+/// the other file, "so the client refreshes the layout instead of retrying the
+/// same wrong file". The client never implemented the other half — the code
+/// fell into the generic `!= CODE_OK` arm and became a string — so the
+/// designed self-heal did not exist and a stale `payload_location` degraded
+/// into reconstruct-forever instead of one refetch.
+#[derive(Debug)]
+struct PayloadNotHere;
+
+impl std::fmt::Display for PayloadNotHere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("payload not on this node (stale layout)")
+    }
+}
+
+impl std::error::Error for PayloadNotHere {}
+
+fn is_payload_not_here(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<PayloadNotHere>())
+}
+
 /// An EC sub-range gather that came up exactly ONE shard short.
 ///
 /// Typed so the read loop can retry it, the way it already retries a stale
@@ -197,6 +221,12 @@ fn parse_read_bytes_resp(
     };
     if resp.code == CODE_EVERSION_MISMATCH {
         return Err(anyhow::Error::new(EversionStale).context(site()));
+    }
+    // Typed like the eversion mismatch beside it, and for the same reason:
+    // both mean "your cached layout is wrong", and both are fixed by
+    // refetching rather than by retrying the same request.
+    if resp.code == crate::extent_rpc::CODE_PAYLOAD_NOT_HERE {
+        return Err(anyhow::Error::new(PayloadNotHere).context(site()));
     }
     if resp.code != CODE_OK {
         return Err(anyhow!(
@@ -3930,6 +3960,20 @@ impl StreamClient {
                 // already a K-way read amplification, and a tight or unbounded
                 // retry multiplies load exactly when the cluster is degraded,
                 // which is how the read-timeout storm was born.
+                // R3: the EN told us our layout is stale. Refetching is the
+                // designed response and the server's contract says so; without
+                // this arm the refusal was indistinguishable from any other
+                // failure and the read degraded to reconstruct on every
+                // attempt, forever.
+                Err(e) if attempt == 0 && is_payload_not_here(&e) => {
+                    tracing::warn!(
+                        extent_id,
+                        error = %format_args!("{e:#}"),
+                        "ec: payload not on the named node — refreshing extent layout"
+                    );
+                    self.invalidate_extent_cache(extent_id);
+                    continue;
+                }
                 Err(e) if attempt == 0 && is_ec_gather_one_short(&e) => {
                     tracing::warn!(
                         extent_id,
@@ -6711,6 +6755,19 @@ mod ec_gather_retry_tests {
             "ec_reconstruct_shard_subrange: only 1/4 shards available for sub-range reconstruct",
         );
         assert!(!is_ec_gather_one_short(&e));
+    }
+
+    /// The layout-stale refusal is typed and distinct from the other two —
+    /// it must refresh WITHOUT the gather arm's pause, since nothing is
+    /// contended, only misaddressed.
+    #[test]
+    fn payload_not_here_is_its_own_class() {
+        let e = anyhow::Error::new(PayloadNotHere).context("read_shard shard 2 from 10.0.0.1");
+        assert!(is_payload_not_here(&e));
+        assert!(!is_eversion_stale(&e) && !is_ec_gather_one_short(&e));
+        // And a generic failure must not be mistaken for it.
+        let g = anyhow!("read_shard shard 2 from 10.0.0.1: code=error");
+        assert!(!is_payload_not_here(&g));
     }
 
     /// The two retryable classes stay distinct: each arm invalidates and
