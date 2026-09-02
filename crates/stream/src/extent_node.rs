@@ -3730,10 +3730,30 @@ impl ExtentNode {
                     // `.meta` each time would be pure I/O.
                     let already = entry.payload_location.load(Ordering::SeqCst)
                         == PayloadLocation::InShardFile.as_byte();
+                    // The flip also carries a fact staging deliberately never
+                    // wrote: the extent IS sealed (only a sealed extent can be
+                    // EC-converted), at the manager's sealed_length and
+                    // post-flip eversion. Staging writes no `.meta` — an
+                    // abandoned CoW attempt must cost only deleted files — so
+                    // the flip is the FIRST point a participant may persist the
+                    // seal, and it is also effectively the last: the `.dat`
+                    // this same sweep reclaims below is what the seal healer
+                    // (`apply_extent_meta_durable` via append-refresh /
+                    // re_avali) used to need, so a holder that misses it here
+                    // kept `sealed=0 / eversion=1` under a live shard file
+                    // forever and reloaded as an OPEN extent on every boot.
+                    // `needs_seal_heal` also fires when the location byte was
+                    // persisted by a pre-fix binary (or a crash landed between
+                    // the two), healing existing clusters on their next sweep;
+                    // once sealed it is false and the steady state does no I/O.
+                    let needs_seal_heal = !entry.sealed.load(Ordering::SeqCst)
+                        && entry.sealed_length.load(Ordering::SeqCst) == 0;
                     if !already {
                         entry
                             .payload_location
                             .store(PayloadLocation::InShardFile.as_byte(), Ordering::SeqCst);
+                    }
+                    if !already || needs_seal_heal {
                         // Never write `.meta` for a quarantined extent:
                         // `save_meta` would silently clear the quarantine and
                         // bypass the fail-closed contract.
@@ -3743,15 +3763,52 @@ impl ExtentNode {
                                 "layout committed to a shard file but `.meta` is quarantined — \
                                  the staging seal holds in memory only until recovery rebuilds it"
                             );
-                        } else if let Err(e) = self.save_meta(p.extent_id, &entry).await {
-                            // Not fatal: the in-memory seal is already in place,
-                            // and the next reconcile round retries the persist.
-                            tracing::warn!(
-                                extent_id = p.extent_id,
-                                error = %e,
-                                "could not persist the committed payload location \
-                                 (retried next sweep); the staging seal is in memory meanwhile"
-                            );
+                        } else {
+                            match self.extent_info_from_manager(p.extent_id).await {
+                                Ok(Some(info)) if info.sealed || info.sealed_length > 0 => {
+                                    // One save_meta (inside the durable applier)
+                                    // carries the seal AND the payload location —
+                                    // `write_meta_locked` reads the live atomics.
+                                    if let Err(e) = self
+                                        .apply_extent_meta_durable(p.extent_id, &entry, &info)
+                                        .await
+                                    {
+                                        // The applier already fail-closed (disk
+                                        // marked); the in-memory seal + staging
+                                        // seal hold meanwhile.
+                                        tracing::warn!(
+                                            extent_id = p.extent_id,
+                                            error = %e,
+                                            "reconcile: could not persist the committed layout's \
+                                             seal; the staging seal is in memory meanwhile"
+                                        );
+                                    }
+                                }
+                                res => {
+                                    // Manager unreachable, or no authoritative
+                                    // sealed view right now. The staging seal's
+                                    // restart-survival must not wait on the
+                                    // manager, so persist the payload location
+                                    // alone; the seal fields retry via
+                                    // `needs_seal_heal` on a later sweep.
+                                    if let Err(e) = res {
+                                        tracing::warn!(
+                                            extent_id = p.extent_id,
+                                            error = %e,
+                                            "reconcile: seal fetch failed at layout commit \
+                                             (seal persist retried next sweep)"
+                                        );
+                                    }
+                                    if let Err(e) = self.save_meta(p.extent_id, &entry).await {
+                                        tracing::warn!(
+                                            extent_id = p.extent_id,
+                                            error = %e,
+                                            "could not persist the committed payload location; \
+                                             the staging seal is in memory meanwhile"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -5187,24 +5244,36 @@ impl ExtentNode {
             // appends); nothing false is persisted, and on restart the OLD
             // (unsealed) `.meta` is the safe state — the manager re-applies the
             // seal on next contact (the ordering invariant).
-            // resolve (re-open if the sealed extent was fd-evicted)
-            // before the durability fsync. Fail-closed on a reopen error.
-            let seal_f = self.extent_file(extent).await?;
-            if let Err(e) = seal_f.sync_data().await {
-                tracing::error!(
-                    extent_id,
-                    sealed_length = ex.sealed_length,
-                    error = %e,
-                    "P0-A: .dat fsync failed before seal meta — disk OFFLINE, NOT persisting sealed meta",
-                );
-                self.mark_disk_error_for_extent(extent_id, &e.to_string());
-                // P0-A (coco): PROPAGATE the failure (was `-> bool`, swallowed)
-                // so callers (handle_re_avali / append meta-refresh / copy)
-                // map it to an error instead of reporting CODE_OK for a replica
-                // whose seal is not durable + whose disk is now offline.
-                return Err(format!(
-                    ".dat fsync failed before seal meta for extent {extent_id}: {e}"
-                ));
+            if ex.ec_converted && !extent.has_dat.load(Ordering::SeqCst) {
+                // Shard-only holder (EC-converted, `.dat` reclaimed or never
+                // held): there is no `.dat` whose durability the sealed `.meta`
+                // depends on — the payload is the SHARD file, and both of its
+                // writers (conversion staging and recovery rebuild) sync_data +
+                // parent-dir-fsync before acking. `extent_file` deliberately
+                // never creates `.dat` for such an entry, so resolving it here
+                // would fail the whole call and leave the seal impossible to
+                // ever persist on this node. Skip straight to the sidecar
+                // persist below.
+            } else {
+                // resolve (re-open if the sealed extent was fd-evicted)
+                // before the durability fsync. Fail-closed on a reopen error.
+                let seal_f = self.extent_file(extent).await?;
+                if let Err(e) = seal_f.sync_data().await {
+                    tracing::error!(
+                        extent_id,
+                        sealed_length = ex.sealed_length,
+                        error = %e,
+                        "P0-A: .dat fsync failed before seal meta — disk OFFLINE, NOT persisting sealed meta",
+                    );
+                    self.mark_disk_error_for_extent(extent_id, &e.to_string());
+                    // P0-A (coco): PROPAGATE the failure (was `-> bool`, swallowed)
+                    // so callers (handle_re_avali / append meta-refresh / copy)
+                    // map it to an error instead of reporting CODE_OK for a replica
+                    // whose seal is not durable + whose disk is now offline.
+                    return Err(format!(
+                        ".dat fsync failed before seal meta for extent {extent_id}: {e}"
+                    ));
+                }
             }
             // P0-A: a save_meta failure must likewise not be swallowed — the
             // seal is not durable, so flag the disk for recovery + propagate.
@@ -9004,6 +9073,73 @@ mod sealed_append_guard_tests {
             assert_eq!(
                 resp.code, CODE_PRECONDITION,
                 "P0-C: sealed-empty must reject a ghost append AFTER restart"
+            );
+        }
+    }
+
+    /// A shard-only holder (EC-converted extent whose pre-conversion `.dat`
+    /// the reconcile cleanup reclaimed) must still be able to persist a
+    /// manager seal. `apply_extent_meta_durable` used to resolve the `.dat`
+    /// fd unconditionally for its pre-persist fsync; with no `.dat` that open
+    /// fails, so every heal path (append eversion-refresh, re_avali, the
+    /// layout-commit seal persist) errored forever and the holder's `.meta`
+    /// kept `sealed=0 / eversion=1` under a live shard file — reloading the
+    /// extent as OPEN on every boot.
+    #[compio::test]
+    async fn ec_shard_only_holder_seal_persists_without_dat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        {
+            let config = ExtentNodeConfig::new(path.clone(), 1);
+            let node = ExtentNode::new(config).await.expect("node");
+
+            // Stage a shard the way a conversion participant does, then mimic
+            // the post-flip reconcile's `.dat` reclaim so only the shard file
+            // remains.
+            node.write_shard_stripe_local(4242, 1, 0, 8, 2, Bytes::from(vec![7u8; 4]))
+                .await
+                .expect("stage shard stripe");
+            let entry = node.extents.get(&4242).expect("entry").clone();
+            entry.has_dat.store(false, Ordering::SeqCst);
+            entry.len.store(0, Ordering::SeqCst);
+            *entry.file.borrow_mut() = None;
+            let disk = node.disk_for(entry.disk_id).expect("disk");
+            compio::fs::remove_file(&disk.extent_path(4242))
+                .await
+                .expect("reclaim .dat");
+            entry
+                .payload_location
+                .store(PAYLOAD_LOCATION_IN_SHARD_FILE, Ordering::SeqCst);
+
+            let ex = ExtentInfo {
+                extent_id: 4242,
+                sealed: true,
+                sealed_length: 8,
+                eversion: 3,
+                avali: 0b11,
+                ec_converted: true,
+                ..Default::default()
+            };
+            node.apply_extent_meta_durable(4242, &entry, &ex)
+                .await
+                .expect("a shard-only holder must persist the seal without a .dat");
+        }
+
+        // Restart: the persisted seal must reload with the shard-only entry.
+        {
+            let config = ExtentNodeConfig::new(path, 1);
+            let node = ExtentNode::new(config).await.expect("node reload");
+            let entry = node.extents.get(&4242).expect("shard-only extent must reload");
+            assert!(
+                entry.sealed.load(Ordering::SeqCst),
+                "seal flag must survive the restart"
+            );
+            assert_eq!(entry.sealed_length.load(Ordering::SeqCst), 8);
+            assert_eq!(entry.eversion.load(Ordering::SeqCst), 3);
+            assert!(
+                !entry.has_dat.load(Ordering::SeqCst),
+                "still a shard-only holder after reload"
             );
         }
     }

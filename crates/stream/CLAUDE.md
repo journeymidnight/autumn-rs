@@ -130,8 +130,9 @@ NAME, so a shard staged for one index can never be *served* as another.
   that looks absent to the manager is how a rebuilt copy becomes a blocking
   orphan. A shard-only entry carries NO fd and must never create `.dat`
   (`extent_file` opens without `create` for exactly this reason); its `len` is
-  the shard's length, which is NOT the extent's `sealed_length`. No parseable
-  `.meta` beside a real payload file is META-FAILCLOSED → quarantine.
+  0 (`len` is the `.dat` length — the shard's bytes live in `shard_files` so
+  `df` doesn't double-count), and neither is the extent's `sealed_length`. No
+  parseable `.meta` beside a real payload file is META-FAILCLOSED → quarantine.
 - **`remove_extent_files` unlinks every `.shard{i}` found on disk**, and
   **`df`'s `extent_bytes` adds `shard_bytes()` to `len`** — a node mid-conversion
   legitimately holds both, and counting one under-reports the footprint that
@@ -531,6 +532,31 @@ decides** (a node holding a complete shard beside a complete `.dat` cannot tell
 which one the cluster is pointed at). The `.dat` transition stops serving
 (`has_dat=false`, `len=0`, fd dropped, `FdLru::forget`) BEFORE the unlink, so no
 read resolves an fd to a file that is about to vanish.
+
+**The InShardFile placement application persists the extent's SEAL, not only
+the location byte.** Staging deliberately writes no `.meta` (an abandoned CoW
+attempt must cost only deleted files, and `new_eversion` is speculative until
+the flip — persisting it early would strand `EversionStale` on a node whose
+`.dat` still serves reads; a staging-time `sealed_length` stamp would also
+bypass the P0-A short-replica guard). So the flip is the FIRST point a shard
+holder may durably learn the seal, and effectively the last: the seal healer
+(`apply_extent_meta_durable`) is otherwise reached only via append-refresh /
+re_avali, which a sealed EC extent's holders never see. `apply_placements`
+therefore fetches the manager's `ExtentInfo` on the InShardFile transition (or
+when the location byte is already persisted but the entry is unsealed — heals
+records written before this behavior existed) and runs
+`apply_extent_meta_durable`, whose single `save_meta` carries seal + location.
+Without this every holder except the coordinator kept `sealed=0 / eversion=1`
+under a live shard file forever and reloaded as an OPEN extent (observed live:
+a 17 GiB EC extent with four of five holders all-zero). Manager unreachable →
+persist the location alone (restart-survival of the staging seal never waits on
+the manager) and retry the seal on a later sweep. `apply_extent_meta_durable`
+itself skips its pre-persist `.dat` fsync for an `ec_converted` holder with
+`has_dat=false` — a shard-only holder has no `.dat`, and its shard's durability
+was established by the staging/rebuild writer — instead of failing the heal on
+the `extent_file` open. Tests: `ec_flip_persists_seal_on_every_shard_holder`
+(manager crate, system), `ec_shard_only_holder_seal_persists_without_dat`
+(unit); both ablation-verified red on the pre-fix code.
 
 The rest of the sweep returns the subset **this node is not a MEMBER of** (`replicates ++ parity`), not merely the subset it has forgotten —
 crash residue from a died-mid-copy recovery belongs to an extent that is very
