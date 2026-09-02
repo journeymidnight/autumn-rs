@@ -282,6 +282,46 @@ The single-container form — run `autumn-fuse` and the app in ONE container, no
 volume, no propagation — avoids the escape entirely and is what the live
 `memory-mcp` deployment uses. Prefer it unless a sidecar is genuinely required.
 
+**Acceptance test for the mount-leak fix — run this on any new cluster before
+trusting it with real work.** The failure it guards against cost us five nodes,
+and nothing in the normal happy path exercises it: the daemon has to die
+*ungracefully* for the bug to show. Kill it the way Kubernetes actually kills
+things.
+
+```bash
+# 1. Mount, on a node you can afford to lose.
+kubectl -n autumn run fusekill --restart=Never \
+  --image=<CR>/autumn-rs:<tag> --overrides='{"spec":{"nodeName":"<NODE>",
+  "containers":[{"name":"f","image":"<CR>/autumn-rs:<tag>","securityContext":
+  {"privileged":true},"command":["bash","-lc"],"args":["autumn-fuse --manager
+  $M --mountpoint /mnt/autumn --transport tcp --credential-file
+  /etc/autumn/cred/fs.cred & sleep 3600"]}]}}'
+kubectl -n autumn exec fusekill -- sh -c 'grep autumn /proc/mounts'   # mounted
+
+# 2. Kill it the worst way — SIGKILL, no grace, so no trap and no Drop run.
+kubectl -n autumn delete pod fusekill --force --grace-period=0
+
+# 3. The node must still be able to start a container. This is the whole test.
+kubectl -n autumn run afterkill --restart=Never --image=<CR>/autumn-rs:<tag> \
+  --overrides='{"spec":{"nodeName":"<NODE>"}}' --command -- sh -c 'echo NODE_OK'
+kubectl -n autumn get pod afterkill -w
+```
+
+`afterkill` reaching `Completed` within a minute or so is a pass. If it sits in
+`ContainerCreating` with NO kubelet events at all — no `Pulling`, no `Created` —
+the mount leaked and that node is wedged: `kubectl exec` into unrelated pods
+there will hang next, and only a reboot (or the surgical unwedge below) clears
+it. Note that `kubectl get nodes` will keep saying `Ready` the whole time, and
+every already-running pod keeps serving, so the node looks fine.
+
+**Surgical unwedge, no reboot:** on the node, `ls /sys/fs/fuse/connections/` —
+each directory is a live connection; one with `waiting` > 0 and no `autumn-fuse`
+process behind it is the corpse. `echo 1 > /sys/fs/fuse/connections/<N>/abort`
+aborts it, and every process blocked on it gets an error instead of staying in
+uninterruptible sleep. Confirm the shape first with `grep fuse /proc/self/mountinfo`
+(never `stat` the path) and `cat /proc/<pid>/stack` on any process in state `D`
+— expect `fuse_*` / `request_wait_answer` frames.
+
 The entrypoint clears a stale mount before mounting, and it deliberately does
 NOT use `mountpoint -q`: that stats the path, which is the one thing guaranteed
 to hang on a stale FUSE mount, so the recovery check would itself wedge the
