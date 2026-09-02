@@ -342,3 +342,59 @@ Next steps: 无。
   本地已有 buda 的 markdown 副本,集群里没有不可再生的数据,可以放心全毁。
   dsv4 的 156 GiB 在 pod dl-dsv4-cj4dc 的 emptyDir 里(节点 192.168.3.2,不在下线名单),**别删**。
   在拿到 FUSE 结论前,**不要再起任何带 FUSE 挂载的 pod**(含 memory-mcp 和基准 pod)。
+
+【2026-09-02 下半场:FUSE 根因、集群重建、上传实测】
+  ■ FUSE 把节点搞死的根因(已修,344a37f)
+    挂载 FUSE 后内核成为进程的客户端:mountpoint 下的 stat() 会把调用者置于 D 状态
+    等守护进程应答,而 D 状态杀不掉。容器运行时建/拆 sandbox、exec 都要 stat 挂载点,
+    所以只要一个线程踩进去就永远回不来、还攥着锁 ⇒ 节点起不了任何新容器,
+    但已在跑的进程完全正常(它们不经过 containerd),节点还一直 Ready(心跳不碰挂载点)。
+    四处修复:
+      1. MountOption::AutoUnmount —— 主修复。以前唯一的卸载路径是优雅退出时的
+         Mount::drop,SIGKILL/OOM/未处理的 SIGTERM 全都会留下活挂载。
+         它还把残余的"永久阻塞"变成"调用方拿到错误"。
+      2. 异步 Read 加超时(REPLY_TIMEOUT)。**这条可能才是真凶**:守护进程"死了"内核会
+         中止连接给 ENOTCONN;真正永久阻塞的是"活着但不应答",而昨晚 manager 卡死 3 小时
+         期间 autumn-fuse 正是这个状态。其他 op 走 call_sync 有超时兜底,只有 Read 没有。
+      3. Read 的 unbounded_send 失败时把 reply 取回来回 EIO(原来直接丢弃,注释还错写成
+         "fuser 会超时"—— FUSE 没有超时)。
+      4. entrypoint 的挂载前清理不再用 `mountpoint -q`(那是一次 stat,必然卡在残留挂载上,
+         于是"清理崩溃前任"的检查把接任者卡死),改读 /proc/mounts + 惰性卸载。
+    实测:pod 挂载后 --force --grace-period=0 强杀,节点 16 秒内正常建起新容器。
+    注意:该测试**不具判别力**(死掉的守护进程本来就给 ENOTCONN),对照组用户叫停了。
+    相关性证据:21 台同版本节点,只有跑过 FUSE 挂载的 5 台垮掉;192.168.3.2 做了几百 GiB
+    autumnfs CLI 工作、从未挂过 FUSE,全程健康。
+
+  ■ 集群已重建(用户决定丢弃全部数据)
+    5 EN(local-path)+ 3 PS + 1 etcd + 1 manager,镜像 344a37f,分布在 6 个节点。
+    storage 节点池现 8 台(坏的 2 台已下线,新增 5 台并打了 autumn-node 标签)。
+    **fs 已 presplit:24 lanes × 8 MiB,5/5 切点,7 分区跨 3 PS** —— 在空 keyspace 上做的。
+    principal fs/kvc/mem 重建,autumn-credential Secret 已更新。
+    坑:AUTUMN_BOOTSTRAP_PRESPLIT 已退役,必须 bootstrap 之后手动跑 presplit --namespace。
+
+  ■ 集群是 WIRE 30 不是 29 —— 我的疏忽
+    rebase 时带进了别人的 b1a5a6c(把 wire 29→30),我没检查就构建部署了。
+    N↔N-1 兼容窗口救不了(两边都是单版本区间,无交集)。
+    ⇒ freetoken-autumn / hermes-autumn / vllm-autumn 全部过期,需在同 commit 重建。
+    规则记进 memory: **rebase/pull 后、构建部署前,先 grep WIRE_VERSION_M 和线上对一遍**。
+
+  ■ 上传实测(dsv4,45/76 时的数)
+    大文件 ≥1GiB: 19 个 / 379 秒 / 63.33 GiB = **171 MiB/s**,达 187 基线的 91%。
+    小文件固定开销仅 0.04 秒/个,25 个合计 1 秒;大文件耗时紧聚在 19–21 秒无长尾。
+    ⇒ **并行化 put 循环不是杠杆**。原因:声明 24 lanes 后单个 put 在存储层已跨 24 分区,
+    "串行循环"≠"单流"。oniond 的类比不成立——那边瓶颈是 per-HTTP-connection。
+    通用教训:伸手要并发之前,先看下层是不是已经并行了。
+
+  ■ autumn-op 标志位置修复(ced7f2f)
+    --admin-token[-file] 只认子命令后、--credential-file 只认全局,两者不一致且报错
+    既不提标志名也不提位置。改为预扫描 argv,位置无关;7 种组合实测 + 回归测试。
+    实现坑:预扫描要跳过"别的标志的值",但布尔标志(--json/--force)没有值,
+    无脑跳 2 会吞掉紧随其后的目标标志。
+
+  ■ 下一步(顺序有依赖)
+    1. 上传两模型完成(进行中)
+    2. **重传 buda markdown 到 fs/docs/buda**(随集群清掉了;用户本地有副本)
+    3. 部 memory-mcp(镜像 344a37f;清单在 ../buda/k8s/memory-mcp.yaml,单容器形态)
+    4. 补测 train_centroids 批量化后 reconcile 从 88.3s 降到多少 —— 这是本轮 ingest
+       优化唯一还没落地的数字(写入循环那半已实测 177.7s → 77.2s / 34.4 → 15.0 ms/chunk)
+    待用户定:要不要重建 freetoken-autumn 镜像(wire 30)。
