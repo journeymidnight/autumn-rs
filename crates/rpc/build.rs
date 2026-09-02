@@ -26,6 +26,13 @@ fn main() {
         // fingerprint, exactly like the other wire-schema files.
         "src/cap_token.rs",
     ];
+    // These files are hashed BYTE FOR BYTE, comments included. A pure-cosmetic
+    // edit to one of them — reformatting, a typo fix, translating a comment —
+    // changes WIRE_FINGERPRINT and makes the build reject every already-deployed
+    // peer with "wire-version fraud", even though the schema is identical. That
+    // is not hypothetical: translating one Chinese comment in manager_rpc.rs
+    // split a live cluster mid-rollout. Touch these files only for real schema
+    // changes; leave their prose alone.
     let mut h = DefaultHasher::new();
     for f in &files {
         println!("cargo:rerun-if-changed={f}");

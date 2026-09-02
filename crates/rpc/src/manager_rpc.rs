@@ -175,8 +175,7 @@ pub const MSG_CLUSTER_DF: u8 = 0x4D;
 /// Dashboard-oriented compact cluster overview (observability batch 2).
 /// Returns a per-partition rollup (range / ps / live_size / extent count) and a
 /// per-node extent count WITHOUT the giant per-extent array that `MSG_STREAM_INFO`
-/// (full dump) ships — so a web dashboard scales to thousands of partitions /
-/// tens of thousands of extents
+/// (full dump) ships — so a web dashboard scales to 数千 partition / 数万 extent
 /// (browser payload + refresh cost bounded by PARTITION count, not extent count).
 /// Per-partition extents are fetched lazily via scoped `MSG_STREAM_INFO`.
 pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
