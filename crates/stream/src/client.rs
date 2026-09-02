@@ -37,6 +37,27 @@ fn is_eversion_stale(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EversionStale>())
 }
 
+/// An EC sub-range gather that came up exactly ONE shard short.
+///
+/// Typed so the read loop can retry it, the way it already retries a stale
+/// eversion. Only the one-short case carries this: at two or more short the
+/// extent genuinely lacks K available shards right now, a retry would almost
+/// certainly fail again, and delaying the loud error helps nobody.
+#[derive(Debug)]
+struct EcGatherOneShort;
+
+impl std::fmt::Display for EcGatherOneShort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ec sub-range gather one shard short")
+    }
+}
+
+impl std::error::Error for EcGatherOneShort {}
+
+fn is_ec_gather_one_short(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<EcGatherOneShort>())
+}
+
 /// BUG-MGR-RETRY-CLASS: typed error for a manager RPC that ANSWERED with a
 /// non-OK code. Pre-fix `check_manager_resp` flattened the code into an
 /// anyhow string, so `retry_manager_call` could not tell a transient
@@ -3900,6 +3921,26 @@ impl StreamClient {
                     self.invalidate_extent_cache(extent_id);
                     continue;
                 }
+                // R2: one retry for a gather that came up exactly one shard
+                // short. Same shape as the eversion arm and for the same
+                // reason — the useful part is re-planning from FRESH
+                // ExtentInfo, since retrying against the cached copy just
+                // re-asks the same wrong node the same wrong question. The
+                // jittered pause only spaces the attempts; every gather is
+                // already a K-way read amplification, and a tight or unbounded
+                // retry multiplies load exactly when the cluster is degraded,
+                // which is how the read-timeout storm was born.
+                Err(e) if attempt == 0 && is_ec_gather_one_short(&e) => {
+                    tracing::warn!(
+                        extent_id,
+                        error = %format_args!("{e:#}"),
+                        "ec: gather one shard short — refreshing extent info and retrying once"
+                    );
+                    self.invalidate_extent_cache(extent_id);
+                    let jitter = 100 + (extent_id.wrapping_mul(2654435761) % 200);
+                    compio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -5120,6 +5161,15 @@ impl StreamClient {
         }
 
         if success < data_shards {
+            // One short is worth one more look on refreshed state — a peer that
+            // blew a ~3 s deadline, an address that has since rotated, a shard a
+            // recovery has moved. Two or more short is not: the extent really
+            // does lack K right now, and retrying only delays the error.
+            if success + 1 == data_shards {
+                return Err(anyhow::Error::new(EcGatherOneShort).context(format!(
+                    "ec_reconstruct_shard_subrange: one shard short (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len}): {last_err:#}"
+                )));
+            }
             return Err(last_err.context(format!(
                 "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
             )));
@@ -6634,5 +6684,43 @@ mod manager_retry_tests {
             2,
             "exactly one rotation per failure (NOT_LEADER must not double-rotate)"
         );
+    }
+}
+
+#[cfg(test)]
+mod ec_gather_retry_tests {
+    use super::*;
+
+    /// The one-short sentinel is what gates the retry, and it must survive
+    /// being wrapped in context — the shortfall site attaches a message.
+    #[test]
+    fn one_short_sentinel_survives_context() {
+        let e = anyhow::Error::new(EcGatherOneShort)
+            .context("ec_reconstruct_shard_subrange: one shard short (extent=63)");
+        assert!(is_ec_gather_one_short(&e));
+        assert!(!is_eversion_stale(&e));
+    }
+
+    /// Two-or-more short must NOT carry it. Retrying there cannot help — the
+    /// extent genuinely lacks K available shards — and it would only delay a
+    /// loud error into a slow one, which is the trade this whole change set
+    /// exists to avoid.
+    #[test]
+    fn multi_short_is_not_retryable() {
+        let e = anyhow!("no shard responses").context(
+            "ec_reconstruct_shard_subrange: only 1/4 shards available for sub-range reconstruct",
+        );
+        assert!(!is_ec_gather_one_short(&e));
+    }
+
+    /// The two retryable classes stay distinct: each arm invalidates and
+    /// re-plans, but only the gather arm pauses, and conflating them would
+    /// make an eversion refresh sleep for no reason.
+    #[test]
+    fn eversion_and_gather_sentinels_do_not_alias() {
+        let ev = anyhow::Error::new(EversionStale);
+        let gs = anyhow::Error::new(EcGatherOneShort);
+        assert!(is_eversion_stale(&ev) && !is_ec_gather_one_short(&ev));
+        assert!(is_ec_gather_one_short(&gs) && !is_eversion_stale(&gs));
     }
 }
