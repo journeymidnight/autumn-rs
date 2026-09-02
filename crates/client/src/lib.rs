@@ -3090,16 +3090,14 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
-    /// batched zero-copy writes — the write mirror of `get_many_into`,
-    /// built on the shared `fan_out_collect`. Pure client-side fan-out (no server
-    /// `MSG_BATCH_PUT`): each `(key, value)` is written concurrently (sliding window
-    /// of `concurrency`) over the per-partition multiplexed PS connections. Per item
-    /// the bulk decision
-    /// is `bulk_worthwhile(value.len())`: >= 64 KiB → `put_bulk` (`MSG_PUT_BULK`, value
-    /// sent as its own iovec from the `Bytes` backing memory; RDMA on UCX when that
-    /// memory is registered); else `put` (`MSG_PUT`). Values are `Bytes` so the bulk
-    /// path needs no copy (`clone` = Arc bump). Result `i` matches `items[i]`:
-    /// `Ok(())` = stored, `Err` = that item's RPC failed (others still ran).
+    /// batched writes — the write mirror of `get_many`. Each item is routed by
+    /// `bulk_worthwhile(value.len())`: >= 64 KiB → its own `MSG_PUT_BULK` (the
+    /// value travels as its own iovec straight from the `Bytes` backing memory,
+    /// RDMA on UCX when that memory is registered, so `clone` = Arc bump and
+    /// nothing is copied); everything smaller is grouped by owning partition and
+    /// packed into ONE `MSG_BATCH_PUT` frame per partition. Result `i` matches
+    /// `items[i]`: `Ok(())` = stored, `Err` = that item's RPC failed (others
+    /// still ran).
     #[allow(clippy::type_complexity)]
     pub async fn put_many(
         &self,
@@ -3347,7 +3345,6 @@ impl ClusterClient {
             let payload = rkyv_encode(&partition_rpc::BatchPutReq {
                 part_id,
                 region_epoch,
-                must_sync: true,
                 ops,
             });
             let resp_bytes = match self

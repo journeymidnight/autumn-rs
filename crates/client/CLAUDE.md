@@ -85,7 +85,9 @@ one staging memcpy into a `ValueBuf` for a stable address (UCX-optimal — the g
 demo's choice). The copy count is decided by who allocates the source buffer, not by
 the API suffix.
 
-- `put(key, value, must_sync)` — write a key-value pair.
+- `put(key, value)` — write a key-value pair. Always durable: there is no
+  sync flag to pass (the extent-node fsync coalescer makes every write durable
+  before it ACKs).
 - `get(key) → Option<Vec<u8>>` — read, `None` if not found.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
   **bulk read, ZERO SDK-side copies** — the CORE every bulk read routes through. The value

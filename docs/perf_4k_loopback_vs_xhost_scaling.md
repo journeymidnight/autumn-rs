@@ -393,7 +393,7 @@ Implemented server-side batched PUT:
 
 * Wire (`crates/rpc/src/partition_rpc.rs`): `MSG_BATCH_PUT = 0x53`,
   `MSG_BATCH_GET = 0x54`, rkyv `BatchPutReq { part_id, region_epoch,
-  must_sync, ops: Vec<BatchPutOp{key, value, expires_at}> }` +
+  ops: Vec<BatchPutOp{key, value, expires_at}> }` +
   symmetric Resp / GET shapes.
 * PS server: `BatchPutAccumulator` (Rc<RefCell> shared one-shot reply
   across N ops) + `WriteResponder::BatchPut { accum, idx }` +

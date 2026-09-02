@@ -14,7 +14,7 @@ Java YCSB — see caveats.
 | EN storage | local **Solidigm 3.84 TB NVMe** (`nvme0n1`), NOT the 40 GB cloud root disk |
 | EN sharding | **4 shards** (`AUTUMN_EXTENT_SHARDS=4`, cpuset 0-3) |
 | Partitions | 32 (`AUTUMN_BOOTSTRAP_PRESPLIT=32`), ~11 per PS |
-| Durability | RF=3, **every write fsync'd** (`must_sync=true`), TCP transport |
+| Durability | RF=3, **every write fsync'd** (unconditional), TCP transport |
 | Admission tune | `MAX_IMM_DEPTH=8`, `MAJOR_COMPACT_PARALLELISM=8`, compact-rate unlimited |
 | Deploy | `deploy/overlays/vke` (see `docs/k8s_deploy.md`) |
 

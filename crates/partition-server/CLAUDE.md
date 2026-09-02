@@ -183,7 +183,7 @@ live values out before `punch_holes` drops `refs`
 ## Write Path: Put / Delete (Group Commit)
 
 ```
-Put(key, value, part_id, must_sync):
+Put(key, value, part_id):
   1. ps-conn task: decode frame; push
      `async { clone req_tx → send PartitionRequest → await oneshot resp →
               encode Frame::response }` onto the per-conn inflight FU.
@@ -351,7 +351,7 @@ reserved).
 
 ### `MSG_BATCH_PUT` (0x53) — server-batched Put
 
-One frame carries `BatchPutReq { part_id, region_epoch, must_sync,
+One frame carries `BatchPutReq { part_id, region_epoch,
 ops: Vec<BatchPutOp{key, value, expires_at}> }`. The SDK
 (`ClusterClient::batch_put`) groups items by owning partition and emits one frame
 per partition. Server side (`enqueue_batch_put`):
@@ -1438,11 +1438,11 @@ Three fixes bound the restart replay window (worst case per partition =
    covered — logStream contains all records newer than the last SSTable flush.
 
 6. **Group commit batching + durability.** `partition_loop` drains up to
-   MAX_WRITE_BATCH (256) requests per RPC cycle; the batch's `must_sync` is the OR of
-   caller flags only. Durability lives in two complementary places:
+   MAX_WRITE_BATCH (256) requests per RPC cycle. Durability lives in two
+   complementary places:
    - **Per-write coverage**: the extent-node's per-extent fsync coalescer fires
      `sync_data` every 1–5 ms; every append's bytes become durable within one coalesce
-     window regardless of `AppendReq.must_sync`.
+     window, unconditionally.
    - **Flush barrier**: `flush_one_imm` calls
      `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST.
      INVARIANT: **ALL log_stream replicas** (not quorum-min) must report `last_synced >=
@@ -1451,8 +1451,9 @@ Three fixes bound the restart replay window (worst case per partition =
      min-commit truncation on an un-synced replica orphans the VP (the
      `stale_vp_offset_past_sealed_length` class). On a healthy cluster this waits ≈ 0.
    The fsync work is entirely background (latency-invisible); every Put pays only the
-   1–5 ms coalesce floor. The `must_sync` field is kept for wire back-compat but is
-   always true in practice.
+   1–5 ms coalesce floor. No wire field can opt out: `AppendReq` lost its `must_sync`
+   byte when the coalescer landed, and `BatchPutReq` — the last struct still carrying
+   one, write-only and never read here — lost it at wire v30.
 
 7. **Per-partition StreamClient** — each `PartitionData` holds its own
    `stream_client: Arc<StreamClient>` (no Mutex) via `new_with_owner_epoch`.

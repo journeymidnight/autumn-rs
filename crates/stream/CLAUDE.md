@@ -273,7 +273,7 @@ reject the rightful owner. Tests: `owner_burst_splitter_tests`.
 
 ```
 Append(AppendReq via autumn-rpc binary frame):
-  1. Decode (extent_id, eversion, commit, revision, must_sync, payload).
+  1. Decode (extent_id, eversion, commit, revision, payload).
   2. Eversion check:
        client eversion > local → fetch ExtentInfo from manager, apply if sealed
        client eversion < local → reject (PRECONDITION_FAILED)
@@ -303,9 +303,8 @@ Append(AppendReq via autumn-rpc binary frame):
        - write_vectored_all_at(start, payload)   (see note 25a: MUST be *_all)
        - ONE sync_data per drained burst: pending_fsync.store(end) BEFORE the
          fsync, last_synced.store(end) AFTER — the two watermarks are all that
-         remains of the old Coalescer struct. must_sync no longer gates a
-         syscall (every burst fsyncs unconditionally); the flag stays on the
-         wire for back-compat.
+         remains of the old Coalescer struct. Every burst fsyncs
+         unconditionally; there is no flag that can skip it.
        - fsync error → fail the WHOLE burst (no len advance) + mark_disk_error.
   7. Advance extent.len (AFTER the burst's fsync).
   8. Return (offset=start, end=start+payload_len) per slot.
@@ -644,7 +643,7 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
 ### Append data flow (public API drives retry)
 
 ```
-append*(stream_id, payload, must_sync):
+append*(stream_id, payload):
   1. stream_worker_sender(stream_id): look up or lazily spawn the per-stream
      compio task (returns cloned mpsc::Sender<StreamSubmitMsg>, cap=256).
   2. ensure_tail_initialised(stream_id): first caller (under per-stream init
@@ -694,7 +693,7 @@ append*(stream_id, payload, must_sync):
 │     1. opportunistic CQ drain via inflight.next().now_or_never() │
 │     2. n_inflight==0 → await submit_rx ; at_cap → await inflight │
 │        else → select(submit_rx, inflight.next())                │
-│  Messages: Append{payload_parts, must_sync, revision, ack_tx} ;  │
+│  Messages: Append{payload_parts, revision, ack_tx} ;             │
 │     ResetTail{tail} ; SeedCursor{cursor} ;                       │
 │     SealCommit{resp} (note 20) ; Shutdown                        │
 └─────────────────────────────────────────────────────────────────┘
@@ -737,8 +736,8 @@ first append would overwrite committed bytes).
 
 | Method | Purpose |
 |--------|---------|
-| `append_batch(stream_id, blocks[], must_sync)` | Concatenate blocks, single append |
-| `append_batch_repeated(stream_id, block, count, must_sync)` | Repeat one block N times |
+| `append_batch(stream_id, blocks[])` | Concatenate blocks, single append |
+| `append_batch_repeated(stream_id, block, count)` | Repeat one block N times |
 | `read_bytes_from_extent(extent_id, offset, length)` | Read from extent (details below) |
 | `read_committed_bytes_from_extent(...)` | Like the plain read but `length` CLAMPED to the committed end (details below) |
 | `extent_read_descriptor(extent_id)` | `(eversion, replica addrs)` for a client-direct read; REFUSES EC-converted extents (shard bytes ≠ value); drops Suspected addresses |
@@ -825,7 +824,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
 
-4. **`must_sync` cost** — no longer a behavioural knob. The per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs regardless of `must_sync`. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. Clients always pass `must_sync=true` (there is no `--nosync`); the flag is kept on the wire for back-compat only.
+4. **Durability is not a knob** — the per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. There is no `--nosync` and no `must_sync` flag: the byte was removed from `AppendReq`, and `BatchPutReq` lost the last surviving copy at wire v30.
 
 5. **StreamClient is always `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers hold `Weak<StreamClient>` for the removal guard. Public API takes `&self`.
 
@@ -855,7 +854,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 14. **Read-side eversion freshness after EC conversion** — `StreamClient` passes its cached `ex.eversion` in every `ReadBytesReq`. A server reads reject `req.eversion < entry.eversion` with a `CODE_EVERSION_MISMATCH` **response** (not a frame-level error — the batched path must reach the client's `is_eversion_stale` detection), enforced in BOTH `handle_read_bytes` and `build_read_future`. The client surfaces `EversionStale` and runs a 2-attempt loop that `invalidate_extent_cache` + refetches `ExtentInfo` once; `read_replicated_with_failover` and `ec_subrange_read` fail-fast on it (every replica reports the same mismatch). **Invariant:** `entry.eversion` defaults to 1 on alloc (matches `MgrExtentInfo{eversion:1}`), so any `req.eversion = 0` is by construction stale (only bench/test fixtures pass 0). Never re-add a `> 0` "pass 0 to skip" clause — it silently let a stale-cached open-extent read scrape bytes from a shrunken post-EC shard.
 
-15. **CPU-bound work MUST run on the blocking pool** — RS `ec_encode`/`ec_decode`/`ec_reconstruct_shard` take 100–300 ms per 128 MiB. All callers (`handle_convert_to_ec`, `run_ec_recovery_payload`, `ec_read_full`) wrap the call in `compio::runtime::spawn_blocking`; otherwise the compio event loop stalls while user RPCs queue. **Any new CPU-bound work in this crate (RS math, large CRC, large compression, big sort) MUST be wrapped in `spawn_blocking`.** Error plumbing is double `.map_err`+`?` (join-time panic-Box, then the inner erasure `Result`). Out of scope: WAL CRC32C on must_sync small writes (bounded ≤ 2 MiB, amortised).
+15. **CPU-bound work MUST run on the blocking pool** — RS `ec_encode`/`ec_decode`/`ec_reconstruct_shard` take 100–300 ms per 128 MiB. All callers (`handle_convert_to_ec`, `run_ec_recovery_payload`, `ec_read_full`) wrap the call in `compio::runtime::spawn_blocking`; otherwise the compio event loop stalls while user RPCs queue. **Any new CPU-bound work in this crate (RS math, large CRC, large compression, big sort) MUST be wrapped in `spawn_blocking`.** Error plumbing is double `.map_err`+`?` (join-time panic-Box, then the inner erasure `Result`). Out of scope: WAL CRC32C on small writes (bounded ≤ 2 MiB, amortised).
 
 16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on `parity.is_empty()`** — the manager pre-fills `parity` for every extent on an EC stream, so an open/pre-conversion extent has `parity != []` while still holding full replicated data on every K+M node. Only after `apply_ec_conversion_done` on a *sealed* extent does data physically split into K+M shards and `ec_converted` flip to `true`. Routing a pre-conversion extent through `ec_subrange_read` would compute `shard_size` from `sealed_length=0` and panic on the per-shard slice. Read dispatch (`read_with_layout`) and recovery dispatch (`run_recovery_task`) both branch on `ec_converted`. **Invariant:** `ec_converted == true` implies `sealed_length > 0`; never set `ec_converted` on an open extent.
 

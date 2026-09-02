@@ -763,7 +763,6 @@ mod tests {
         let ok = rkyv_encode(&BatchPutReq {
             part_id: 1,
             region_epoch: 0,
-            must_sync: true,
             ops: vec![
                 partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/1".to_vec(), value: vec![], expires_at: 0 },
                 partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/2".to_vec(), value: vec![], expires_at: 0 },
@@ -774,7 +773,6 @@ mod tests {
         let bad = rkyv_encode(&BatchPutReq {
             part_id: 1,
             region_epoch: 0,
-            must_sync: true,
             ops: vec![
                 partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"kvc/1".to_vec(), value: vec![], expires_at: 0 },
                 partition_rpc::BatchPutOp { inode_hint: 0, lease_epoch: 0, key: b"scratch/2".to_vec(), value: vec![], expires_at: 0 },

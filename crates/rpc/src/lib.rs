@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 29;
-pub const WIRE_VERSION_MAX: u32 = 29;
+pub const WIRE_VERSION_MIN: u32 = 30;
+pub const WIRE_VERSION_MAX: u32 = 30;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -465,6 +465,15 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     //   `op_kind_name` (display mapping, moved out of the CLI so it has one
     //   definition).
     (29, "f8b58703a0162c62"),
+    // v30: `BatchPutReq` lost `must_sync`. `PutReq` and `AppendReq` dropped
+    // theirs when every write became durable through the extent-node fsync
+    // coalescer; the batch form outlived that pass. It was write-only — the
+    // three construction sites all set `true` and no PS code path ever read
+    // it — so a peer that still sends the field is not asking for anything
+    // different, but rkyv has no cross-version decode and the extra bool
+    // shifts the layout, so this is a same-commit deploy like every other
+    // schema change here. Pre-R3: MIN=MAX=30.
+    (30, "d3b49bd995789e83"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
