@@ -314,6 +314,26 @@ there will hang next, and only a reboot (or the surgical unwedge below) clears
 it. Note that `kubectl get nodes` will keep saying `Ready` the whole time, and
 every already-running pod keeps serving, so the node looks fine.
 
+**Telling a STALLED FUSE read from a merely slow one — without touching the
+mount.** They look identical in a consumer's log: a large read simply produces
+no output either way. The obvious check is the trap, because `ls`, `stat`, `du`
+or anything else that walks the mountpoint is precisely what blocks forever if
+the daemon has stopped answering, so the diagnostic joins the casualties and
+takes your shell with it. Sample the reader's byte counter instead:
+
+```bash
+# In the pod, on the process doing the reading (not the mount):
+for i in 1 2 3; do grep read_bytes /proc/<pid>/io; sleep 10; done
+```
+
+Growing = slow, not stuck. Frozen with the process alive = stuck; then confirm
+from the daemon side with `grep fuse /proc/self/mountinfo` and
+`cat /sys/fs/fuse/connections/*/waiting`, and look for the reader in state `D`.
+The general rule this comes from, which cost us hours today in another form:
+**a live PID is not progress.** A frozen `hf download` held its PID for 26
+minutes while transferring nothing, and reporting an ETA off process liveness
+would have been wrong by hours. Trust byte counters, not process existence.
+
 **Surgical unwedge, no reboot:** on the node, `ls /sys/fs/fuse/connections/` —
 each directory is a live connection; one with `waiting` > 0 and no `autumn-fuse`
 process behind it is the corpse. `echo 1 > /sys/fs/fuse/connections/<N>/abort`
