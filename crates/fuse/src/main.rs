@@ -128,6 +128,29 @@ fn main() -> Result<()> {
     let mut options = vec![
         fuser::MountOption::FSName("autumn-fuse".to_string()),
         fuser::MountOption::DefaultPermissions,
+        // AutoUnmount is not optional, and its absence took down five
+        // Kubernetes nodes.
+        //
+        // Without it the ONLY unmount path is `Mount::drop` on a graceful
+        // return from main. SIGKILL (`kubectl delete pod --force
+        // --grace-period=0`, an OOM kill, a node evicting us), SIGTERM with no
+        // handler, and any abort all skip Drop — and the kernel mount survives
+        // with NO server behind it. From then on, every `stat()` that crosses
+        // that path blocks in uninterruptible sleep forever, because nothing is
+        // left to answer the kernel's FUSE request. A container runtime walks
+        // and stats mount points on every sandbox create and teardown, so the
+        // first of its threads to touch the corpse wedges, and the node stops
+        // being able to start ANY container while every already-running process
+        // keeps working — which is exactly what we saw, on five nodes, one at a
+        // time, over two hours, fixable only by rebooting.
+        //
+        // With AutoUnmount, fusermount3 holds the mount and drops it as soon as
+        // our /dev/fuse fd closes, for ANY reason including SIGKILL. fuser adds
+        // AllowOther implicitly here (it needs allow_root or allow_other for
+        // fusermount's auto_unmount) and enforces the ACL in userspace itself —
+        // see fuser 0.15 session.rs. Both the daemon and its consumer run as
+        // root in our images, so that costs us nothing.
+        fuser::MountOption::AutoUnmount,
         // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
         // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
         // out across the file's variable-length extents (≤ 8 MiB each)

@@ -250,21 +250,26 @@ impl Filesystem for AutumnFs {
         // call_sync std::mpsc reply, capping aggregate FUSE read
         // throughput at ~13 k ops/s regardless of client/dispatcher
         // concurrency.
-        if self
-            .tx
-            .unbounded_send(FsRequest::Read {
-                ino,
-                offset,
-                size,
-                fuse_reply: reply,
-            })
-            .is_err()
-        {
-            // Channel closed — bridge gone. The unbounded_send swallowed
-            // ownership of `reply` so we can't reply with an error here;
-            // returning lets fuser time out. Should never happen in
-            // production unless the compio thread crashed.
-            tracing::error!("fuse Read: bridge channel closed");
+        if let Err(e) = self.tx.unbounded_send(FsRequest::Read {
+            ino,
+            offset,
+            size,
+            fuse_reply: reply,
+        }) {
+            // Channel closed — the bridge is gone. Recover `reply` out of the
+            // rejected message and answer EIO.
+            //
+            // This used to just log and return, on the reasoning that "fuser
+            // times out". It does not: FUSE has no timeout, so a request the
+            // daemon never answers leaves that caller blocked in
+            // uninterruptible sleep FOREVER, holding whatever locks it held.
+            // Every other op here is safe because `call_sync`'s timeout still
+            // ends with `reply.error(EIO)`; Read was the one path that could
+            // strand the kernel, precisely because it hands `reply` away.
+            tracing::error!("fuse Read: bridge channel closed — replying EIO");
+            if let FsRequest::Read { fuse_reply, .. } = e.into_inner() {
+                fuse_reply.error(libc::EIO);
+            }
         }
     }
 

@@ -263,9 +263,30 @@ volumes:
 ```
 
 The propagation pair is what makes the sidecar's mount visible to the app
-container; without it the app sees an empty directory. The entrypoint clears a
-stale mount (`fusermount3 -u`) before mounting, so a crashed daemon does not
-wedge the next start. Env → flag: `AUTUMN_MANAGER`, `AUTUMN_FUSE_MOUNTPOINT`,
+container; without it the app sees an empty directory.
+
+**Know what `Bidirectional` costs you before reaching for it.** It exists to let
+the sidecar's mount escape into the host mount namespace so the app container
+can see it — which also means a mount that outlives the pod. Pair that with a
+daemon that dies without unmounting and the leak is node-level, not pod-level:
+every `stat()` crossing the corpse blocks in uninterruptible sleep, a container
+runtime stats mount points on every sandbox create and teardown, and the node
+stops being able to start any container while everything already running carries
+on normally. Only a reboot or a host-side `umount -l` clears it. We lost five
+nodes to exactly this shape. `MountOption::AutoUnmount` (now always set, see
+`crates/fuse/src/main.rs`) is what closes it — fusermount3 drops the mount as
+soon as the daemon's fd closes, SIGKILL included. **Do not run a build without
+that fix under `Bidirectional`.**
+
+The single-container form — run `autumn-fuse` and the app in ONE container, no
+volume, no propagation — avoids the escape entirely and is what the live
+`memory-mcp` deployment uses. Prefer it unless a sidecar is genuinely required.
+
+The entrypoint clears a stale mount before mounting, and it deliberately does
+NOT use `mountpoint -q`: that stats the path, which is the one thing guaranteed
+to hang on a stale FUSE mount, so the recovery check would itself wedge the
+replacement container. It reads `/proc/mounts` (pure VFS metadata, never blocks)
+and unmounts lazily (`fusermount3 -uz`). Env → flag: `AUTUMN_MANAGER`, `AUTUMN_FUSE_MOUNTPOINT`,
 `AUTUMN_CREDENTIAL_FILE`, `AUTUMN_FUSE_DIRECT_READ`, `AUTUMN_FUSE_ALLOW_OTHER`.
 
 ⚠️ **The mount sets `FOPEN_DIRECT_IO` on every open** (`crates/fuse/src/ops.rs`),

@@ -382,9 +382,20 @@ run_fuse() {
     # A crashed daemon leaves the mount entry behind; the next mount on the same
     # path then fails with EBUSY / "Transport endpoint is not connected". Clear
     # it best-effort before mounting (no-op on a clean start).
-    if mountpoint -q "$mp" 2>/dev/null; then
-        log "stale mount at $mp — unmounting"
-        fusermount3 -u "$mp" || log "fusermount3 -u failed (continuing)"
+    #
+    # NEVER test this with `mountpoint -q`. That stats the path, and a stale
+    # FUSE mount whose server is gone blocks stat() in uninterruptible sleep
+    # forever — so the check meant to recover from a crashed predecessor is
+    # itself what hangs the replacement, silently, before it logs anything.
+    # /proc/mounts is pure VFS metadata and never blocks. The unmount is lazy
+    # for the same reason: plain `fusermount3 -u` can block on the dead
+    # connection, while `-uz` detaches the subtree immediately so nothing that
+    # follows (mkdir, the new mount) can trip over the corpse.
+    if grep -qs " ${mp} fuse" /proc/mounts; then
+        log "stale mount at $mp — lazy unmounting"
+        fusermount3 -uz "$mp" 2>/dev/null \
+            || umount -l "$mp" 2>/dev/null \
+            || log "lazy unmount failed (continuing)"
     fi
     mkdir -p "$mp"
 
