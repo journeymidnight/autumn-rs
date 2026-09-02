@@ -17,7 +17,7 @@ other.
 - `autumnfs` — CLI (`ls`/`stat`/`mkdir`/`cat`/`put`/`get`/`rm`/`touch`) that
   talks to the cluster directly, no mount needed. Sole writer of lane-striped
   large files.
-- `autumn.Fs` — PyO3 binding; the `autumn-s3` gateway and any Python caller read through it.
+- `autumn.Fs` — PyO3 binding; the partition server's hosted S3 gateway and any Python caller read through it.
 
 **Non-goals.**
 - Full POSIX semantics on the Python side (hardlinks, mode/uid/gid fidelity,

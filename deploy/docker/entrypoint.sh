@@ -284,6 +284,21 @@ run_ps() {
     )
     [[ -n "${AUTUMN_PS_CPUSET:-}" ]] && args+=(--cpuset "$AUTUMN_PS_CPUSET")
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9701)
+    # S3 gateway, hosted by this partition server on its own OS threads
+    # (AUTUMN_S3=1 to enable; off by default). It reads the same fs/ tree the
+    # fuse role does, and authz gates READS too, so the credential is required
+    # once fs/ is protected.
+    if [[ "${AUTUMN_S3:-0}" == "1" ]]; then
+        args+=(--s3-gateway)
+        args+=(--s3-gateway-listen "${AUTUMN_S3_LISTEN:-0.0.0.0}")
+        args+=(--s3-gateway-port "${AUTUMN_S3_PORT:-9100}")
+        [[ -n "${AUTUMN_S3_WORKERS:-}" ]] \
+            && args+=(--s3-gateway-workers "$AUTUMN_S3_WORKERS")
+        [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
+            && args+=(--s3-gateway-credential-file "$AUTUMN_CREDENTIAL_FILE")
+        [[ -n "${AUTUMN_S3_DIRECT_READ:-}" ]] \
+            && args+=(--s3-gateway-direct-read "$AUTUMN_S3_DIRECT_READ")
+    fi
     local pair env_name flag
     for pair in "${PS_TUNABLES[@]}"; do
         env_name="${pair%%:*}"; flag="${pair#*:}"
@@ -418,27 +433,11 @@ run_fuse() {
 }
 
 run_s3() {
-    local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
-    wait_for_manager "$mgr"
-
-    local -a args=(
-        --manager "$mgr"
-        --listen "${AUTUMN_S3_LISTEN:-0.0.0.0}"
-        --port "${AUTUMN_S3_PORT:-9100}"
-    )
-    # Same fs/ credential the fuse role uses — the gateway reads the same tree,
-    # and authz gates READS too, so this is required once fs/ is protected.
-    [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
-        && args+=(--credential-file "$AUTUMN_CREDENTIAL_FILE")
-    [[ -n "${AUTUMN_S3_DIRECT_READ:-}" ]] \
-        && args+=(--direct-read "$AUTUMN_S3_DIRECT_READ")
-    # Distinct daemon identity per pod so the manager's lease registry can tell
-    # gateways apart (HOSTNAME is set by the orchestrator).
-    [[ -n "${HOSTNAME:-}" ]] && args+=(--host "s3-$HOSTNAME")
-
-    log "exec autumn-s3 ${args[*]}"
-    exec autumn-s3 "${args[@]}"
+    die "the s3 role is gone: the gateway is now hosted by the partition server.
+Set AUTUMN_S3=1 on the ps role (plus AUTUMN_S3_PORT / AUTUMN_S3_WORKERS /
+AUTUMN_CREDENTIAL_FILE as needed) instead of running a separate container.
+It serves on the PS's own OS threads, which also drops the loopback copy a
+sidecar paid on the engine's node."
 }
 
 # ---------------------------------------------------------------------------
@@ -452,6 +451,6 @@ case "${1:-}" in
     bootstrap)    run_bootstrap ;;
     fuse)         run_fuse ;;
     s3)           run_s3 ;;
-    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|s3|<command...>" ;;
+    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|<command...>" ;;
     *)            exec "$@" ;;
 esac

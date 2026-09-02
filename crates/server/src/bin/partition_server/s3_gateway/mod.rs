@@ -1,5 +1,25 @@
-//! `autumn-s3` — a read-only, unauthenticated S3-compatible gateway over
-//! autumn's `fs/` tree.
+//! A read-only, unauthenticated S3-compatible gateway over autumn's `fs/`
+//! tree, served by the partition server when `--s3-gateway` is on (default
+//! off).
+//!
+//! It runs on its OWN OS threads with their own compio runtimes and its own
+//! per-worker `FsState`, so it shares no runtime and no lock with the partition
+//! threads: an engine hammering the gateway cannot take accept latency away
+//! from partition traffic.
+//!
+//! It does NOT share their CPU budget in the way the flag names suggest.
+//! `--cpuset` populates a list that the partition and shard runtimes consult
+//! when pinning THEIR OWN threads; it does not set a process affinity mask, and
+//! these threads pin nothing. They inherit whatever mask the process was
+//! launched with — so on a box where the cpuset exists to dodge a tenant, the
+//! gateway will not dodge it. `taskset` the process if that matters.
+//!
+//! What moving it off the engine's node buys is one copy on that node: a
+//! sidecar received the bytes over the network and sent them again over
+//! loopback, and now the engine's node receives them once. It does NOT make the
+//! reads local — replica choice is a hash rotation with no locality preference
+//! (`ClusterClient`), so on a multi-node cluster most of these reads still come
+//! from a remote extent node.
 //!
 //! It exists for one reason: inference engines that have no loader plugin seam
 //! still ship a `runai_streamer` load format, and that streamer speaks S3.
@@ -46,68 +66,21 @@ const CHUNK: u64 = 8 << 20;
 /// S3's default and maximum page size.
 const DEFAULT_MAX_KEYS: usize = 1000;
 
-struct Args {
-    manager: String,
-    listen: String,
-    port: u16,
-    host: String,
-    credential_file: Option<PathBuf>,
-    direct_read: bool,
-    workers: usize,
+/// What the gateway needs from the partition server that hosts it. The manager
+/// address is the PS's; the credential is NOT — the gateway reads `fs/` as a
+/// client, so it needs a principal granted that prefix, which the partition
+/// server's own data-plane identity is not.
+#[derive(Clone)]
+pub struct Config {
+    pub manager: String,
+    pub listen: String,
+    pub port: u16,
+    pub host: String,
+    pub credential_file: Option<PathBuf>,
+    pub direct_read: bool,
+    pub workers: usize,
 }
 
-/// Accept threads to run by default. The gateway is CPU-bound on socket work,
-/// not on autumn reads: an AWS-CRT client drains its sockets slowly enough that
-/// each body write fragments into many partial writes, and a single accept
-/// thread saturates well below what the read path can deliver. It is also a
-/// sidecar, so it should not claim every core on a GPU node.
-const DEFAULT_WORKERS: usize = 8;
-
-fn parse_args() -> Result<Args> {
-    let mut a = Args {
-        manager: String::new(),
-        listen: "0.0.0.0".into(),
-        port: 9000,
-        host: "autumn-s3".into(),
-        credential_file: None,
-        direct_read: true,
-        workers: std::thread::available_parallelism()
-            .map(|n| n.get().min(DEFAULT_WORKERS))
-            .unwrap_or(1),
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        let mut val = || {
-            it.next()
-                .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
-        };
-        match flag.as_str() {
-            "--manager" => a.manager = val()?,
-            "--listen" => a.listen = val()?,
-            "--port" => a.port = val()?.parse().context("--port")?,
-            "--host" => a.host = val()?,
-            "--credential-file" => a.credential_file = Some(PathBuf::from(val()?)),
-            "--direct-read" => a.direct_read = val()?.parse().context("--direct-read")?,
-            "--workers" => a.workers = val()?.parse().context("--workers")?,
-            "-h" | "--help" => {
-                println!(
-                    "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
-                     \x20            [--host <daemon-identity>] [--credential-file <path>]\n\
-                     \x20            [--direct-read true|false] [--workers N]"
-                );
-                std::process::exit(0);
-            }
-            other => bail!("unknown flag {other} (try --help)"),
-        }
-    }
-    if a.manager.is_empty() {
-        bail!("--manager is required");
-    }
-    if a.workers == 0 {
-        bail!("--workers must be at least 1");
-    }
-    Ok(a)
-}
 
 /// `GET /` — the buckets are the `fs/` root's subdirectories.
 async fn list_buckets(fs: &Fs) -> Response {
@@ -291,15 +264,16 @@ fn reuseport_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
 /// share no lock), its own listener.
 fn serve_worker(
     idx: usize,
-    args: &Args,
+    args: &Config,
     credential: Option<(String, Vec<u8>)>,
-    addr: SocketAddr,
+    listener: std::net::TcpListener,
 ) -> Result<()> {
     let rt = compio::runtime::Runtime::new().context("compio runtime")?;
     rt.block_on(async move {
-        // A distinct daemon identity per worker: the manager keys its lease
-        // registry on it, and two workers sharing one would look like a single
-        // client reconnecting.
+        // A per-worker label, for humans. The lease registry keys on a fresh
+        // UUID per `FsState`, not on this string, so identical names could not
+        // collide — the suffix exists so `autumn-op` listings say which worker
+        // a connection belongs to.
         let host = format!("{}-{idx}", args.host);
         let mut state = match credential {
             Some((who, secret)) => {
@@ -310,7 +284,7 @@ fn serve_worker(
         state.direct_read = args.direct_read;
         let fs: Fs = Rc::new(futures::lock::Mutex::new(state));
 
-        let listener = compio::net::TcpListener::from_std(reuseport_listener(addr)?)?;
+        let listener = compio::net::TcpListener::from_std(listener)?;
         cyper_axum::serve(listener, router(fs)).await?;
         Ok::<_, anyhow::Error>(())
     })
@@ -353,23 +327,33 @@ fn router(fs: Fs) -> Router {
         })
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let args = parse_args()?;
-
+/// Start the gateway on `cfg.workers` dedicated OS threads and return.
+///
+/// Fails fast on what an operator can fix before traffic arrives: an unreadable
+/// credential, an unparseable address, an address that cannot be bound. It does
+/// NOT catch a credential the manager rejects — that surfaces on the first
+/// connect, inside a worker — nor a port another process already holds, because
+/// SO_REUSEPORT is what lets the workers share one port and it lets a second
+/// process share it too.
+///
+/// A worker that RETURNS AN ERROR is logged loudly and does not take the
+/// partition server with it: serving partitions is this process's job and a
+/// read-only gateway is not worth dropping partitions for. **A worker that
+/// PANICS is a different matter** — the release profile sets
+/// `panic = "abort"`, so any panic anywhere in this process, gateway included,
+/// aborts the partition server. That is the price of hosting the gateway
+/// in-process instead of beside the engine, where a panic cost only the
+/// sidecar; it cannot be bought back without a process boundary.
+pub fn spawn(cfg: Config) -> Result<()> {
     // Read the credential up front so a bad path fails at startup rather than
     // as a mid-stream PermissionDenied. The principal travels in the file.
-    let credential: Option<(String, Vec<u8>)> = match &args.credential_file {
+    let credential: Option<(String, Vec<u8>)> = match &cfg.credential_file {
         Some(path) => {
             let (principal, secret) = autumn_client::read_credential_file(path)?;
             if principal.is_empty() {
                 bail!(
-                    "--credential-file {}: missing principal name (expected '<principal>\\n<hex>')",
+                    "--s3-gateway-credential-file {}: missing principal name \
+                     (expected '<principal>\\n<hex>')",
                     path.display()
                 );
             }
@@ -378,43 +362,95 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let addr: SocketAddr = format!("{}:{}", args.listen, args.port)
+    let addr: SocketAddr = format!("{}:{}", cfg.listen, cfg.port)
         .parse()
-        .with_context(|| format!("--listen/--port: {}:{}", args.listen, args.port))?;
+        .with_context(|| format!("--s3-gateway-listen/--s3-gateway-port: {}:{}", cfg.listen, cfg.port))?;
 
     tracing::info!(
-        manager = %args.manager,
-        authz = args.credential_file.is_some(),
-        direct_read = args.direct_read,
-        workers = args.workers,
-        "autumn-s3 (read-only, unauthenticated) on http://{addr}"
+        manager = %cfg.manager,
+        authz = cfg.credential_file.is_some(),
+        direct_read = cfg.direct_read,
+        workers = cfg.workers,
+        "s3 gateway (read-only, unauthenticated) on http://{addr}"
     );
 
-    let mut handles = Vec::with_capacity(args.workers);
-    for idx in 0..args.workers {
-        let args = Args {
-            manager: args.manager.clone(),
-            listen: args.listen.clone(),
-            port: args.port,
-            host: args.host.clone(),
-            credential_file: args.credential_file.clone(),
-            direct_read: args.direct_read,
-            workers: args.workers,
-        };
-        let cred = credential.clone();
-        handles.push(
-            std::thread::Builder::new()
-                .name(format!("autumn-s3-{idx}"))
-                .spawn(move || serve_worker(idx, &args, cred, addr))?,
+    // Each worker reports its own exit rather than the supervisor joining
+    // handles in order. Joining in order means a worker's death is invisible
+    // until every LOWER-indexed worker has also died — worker 3 could be gone
+    // for hours while the supervisor blocks on worker 0, which is exactly the
+    // silence this supervisor exists to prevent. A channel reports in the
+    // order deaths actually happen.
+    // Bind every listener HERE, not inside the workers. Binding on the worker
+    // threads meant an unusable address killed all of them at startup while
+    // `spawn` had already returned `Ok`, leaving a partition server running
+    // with no gateway and only log lines to say so. Binding first makes that
+    // what the flag implies: fatal.
+    //
+    // Note what this does NOT catch. These listeners set SO_REUSEPORT — that is
+    // how N workers share one port — so a port already held by ANOTHER process
+    // binds successfully. Two partition servers with the gateway on the same
+    // port on the same host will each get a share of the connections rather
+    // than one of them refusing to start.
+    let mut listeners = Vec::with_capacity(cfg.workers);
+    for _ in 0..cfg.workers {
+        listeners.push(
+            reuseport_listener(addr)
+                .with_context(|| format!("binding the s3 gateway on {addr}"))?,
         );
     }
-    // A worker only returns on error; surface the first one and let the process
-    // die rather than silently serving on fewer threads than asked for.
-    for h in handles {
-        match h.join() {
-            Ok(r) => r?,
-            Err(_) => bail!("a gateway worker thread panicked"),
-        }
+
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, String)>();
+    for (idx, listener) in listeners.into_iter().enumerate() {
+        let cfg = cfg.clone();
+        let cred = credential.clone();
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name(format!("autumn-s3-{idx}"))
+            .spawn(move || {
+                // Report from a guard's Drop, not after the call: a worker that
+                // PANICS never reaches the line after it, so with 7 of 8 healthy
+                // the eighth's death produced no log at all — "silently serving
+                // on fewer threads than asked for", which is the failure this
+                // supervisor exists to prevent. Drop runs during unwind, so the
+                // panic is reported like any other exit. (Release builds set
+                // `panic = "abort"`, so there is no unwind and the process is
+                // already gone — see the note on the failure policy above.)
+                struct Report(usize, std::sync::mpsc::Sender<(usize, String)>, String);
+                impl Drop for Report {
+                    fn drop(&mut self) {
+                        let _ = self.1.send((self.0, std::mem::take(&mut self.2)));
+                    }
+                }
+                let mut report = Report(idx, tx, "panicked".to_string());
+                report.2 = match serve_worker(idx, &cfg, cred, listener) {
+                    Ok(()) => "returned".to_string(),
+                    Err(e) => format!("{e:#}"),
+                };
+            })?;
     }
+    // Drop the template sender so the channel closes when the last worker is
+    // gone (or has panicked), which is what ends the supervisor's loop.
+    drop(tx);
+
+    let n = cfg.workers;
+    std::thread::Builder::new()
+        .name("autumn-s3-sup".into())
+        .spawn(move || {
+            let mut stopped = 0usize;
+            while let Ok((idx, why)) = rx.recv() {
+                stopped += 1;
+                tracing::error!(
+                    worker = idx,
+                    remaining = n - stopped,
+                    error = %why,
+                    "s3 gateway worker stopped; the partition server keeps serving partitions"
+                );
+            }
+            tracing::error!(
+                reported = stopped,
+                workers = n,
+                "s3 gateway is DOWN — no worker is still serving"
+            );
+        })?;
     Ok(())
 }

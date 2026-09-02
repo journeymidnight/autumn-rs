@@ -14,7 +14,7 @@ path = "src/bin/extent_node.rs"
 
 [[bin]]
 name = "autumn-ps"
-path = "src/bin/partition_server.rs"
+path = "src/bin/partition_server/main.rs"
 
 [[bin]]
 name = "autumn-client"
@@ -32,7 +32,15 @@ path = "src/bin/autumnfs.rs"
 # autumnfs reuses the ungated `key` + `schema` modules. `default-features = false`
 # skips the fuser/libc/clap fuse-mount deps; we only need the bookkeeping
 # structs + KV-key encoders, no kernel-side FUSE plumbing.
-autumn-fuse = { path = "../fuse", default-features = false }
+# `core` = the fuser-FREE filesystem layer (same one the PyO3 `autumn.Fs`
+# binding uses), which is what `autumnfs` and the hosted S3 gateway read through.
+autumn-fuse = { path = "../fuse", default-features = false, features = ["core"] }
+# The S3 gateway the partition server hosts behind `--s3-gateway` (default off):
+# axum on the compio runtime, SO_REUSEPORT so its worker threads share one port.
+axum = "0.8"
+cyper-axum = "0.8"
+send_wrapper = { version = "0.6", features = ["futures"] }
+socket2 = { version = "0.5", features = ["all"] }
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true

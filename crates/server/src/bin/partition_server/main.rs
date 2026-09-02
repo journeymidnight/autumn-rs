@@ -27,6 +27,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
+mod s3_gateway;
+
 struct Args {
     port: u16,
     psid: u64,
@@ -73,6 +75,21 @@ struct Args {
     append_chain_min_bytes: Option<u32>,
     /// bounded SST block cache capacity (bytes). None = 512 MiB.
     sst_block_cache_bytes: Option<usize>,
+    /// Serve the read-only S3 gateway from this process (default OFF). It runs
+    /// on its own OS threads, so it never competes with the partition threads
+    /// for the runtime or for a lock — but it DOES compete for CPU, and
+    /// `--cpuset` does not confine it: that flag feeds the pinning the
+    /// partition/shard runtimes do to their own threads, not a process affinity
+    /// mask. Use `taskset` on the process to bound the gateway.
+    s3_gateway: bool,
+    s3_gateway_listen: String,
+    s3_gateway_port: u16,
+    s3_gateway_workers: usize,
+    /// Credential for the gateway's own reads. The PS's data-plane identity is
+    /// not reusable here: the gateway reads `fs/` as a client, so it needs a
+    /// principal granted that prefix.
+    s3_gateway_credential_file: Option<std::path::PathBuf>,
+    s3_gateway_direct_read: bool,
     gc_read_chunk_bytes: Option<u32>,
     gc_batch_records: Option<usize>,
     gc_batch_bytes: Option<usize>,
@@ -140,6 +157,19 @@ fn parse_args() -> Args {
     let mut read_hedge_ms: Option<u64> = None;
     let mut append_chain_min_bytes: Option<u32> = None;
     let mut sst_block_cache_bytes: Option<usize> = None;
+    let mut s3_gateway = false;
+    let mut s3_gateway_listen = "0.0.0.0".to_string();
+    let mut s3_gateway_port: u16 = 9000;
+    // The gateway is socket-bound, not read-bound: an AWS-CRT client drains
+    // slowly enough that each body write fragments, and one accept thread
+    // saturates well below what the read path delivers. Eight is the knee —
+    // capped by available parallelism so a two-core cgroup does not get eight
+    // accept threads.
+    let mut s3_gateway_workers: usize = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(8);
+    let mut s3_gateway_credential_file: Option<std::path::PathBuf> = None;
+    let mut s3_gateway_direct_read = true;
     let mut gc_read_chunk_bytes: Option<u32> = None;
     let mut gc_batch_records: Option<usize> = None;
     let mut gc_batch_bytes: Option<usize> = None;
@@ -394,6 +424,35 @@ fn parse_args() -> Args {
                 i += 1;
                 pprof_threads = Some(args[i].clone());
             }
+            "--s3-gateway" => s3_gateway = true,
+            "--s3-gateway-listen" => {
+                i += 1;
+                s3_gateway_listen = args[i].clone();
+            }
+            "--s3-gateway-port" => {
+                i += 1;
+                s3_gateway_port = args[i].parse().expect("--s3-gateway-port must be a number");
+            }
+            "--s3-gateway-workers" => {
+                i += 1;
+                s3_gateway_workers = args[i]
+                    .parse()
+                    .expect("--s3-gateway-workers must be a number");
+                if s3_gateway_workers == 0 {
+                    eprintln!("error: --s3-gateway-workers must be at least 1");
+                    std::process::exit(2);
+                }
+            }
+            "--s3-gateway-credential-file" => {
+                i += 1;
+                s3_gateway_credential_file = Some(std::path::PathBuf::from(args[i].clone()));
+            }
+            "--s3-gateway-direct-read" => {
+                i += 1;
+                s3_gateway_direct_read = args[i]
+                    .parse()
+                    .expect("--s3-gateway-direct-read must be true or false");
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: autumn-ps --psid <ID> [OPTIONS]");
                 eprintln!();
@@ -429,6 +488,13 @@ fn parse_args() -> Args {
                 );
                 eprintln!("                       PS uses cpuset_len/2 as max partition budget.");
                 eprintln!("  --conn-threads <N>   [DEPRECATED] accepted but ignored");
+                eprintln!("  --s3-gateway         serve the read-only S3 gateway from this");
+                eprintln!("                       process (default OFF), on its own OS threads");
+                eprintln!("  --s3-gateway-listen <HOST>   default 0.0.0.0");
+                eprintln!("  --s3-gateway-port <PORT>     default 9000");
+                eprintln!("  --s3-gateway-workers <N>     accept threads, default 8");
+                eprintln!("  --s3-gateway-credential-file <PATH>  principal granted `fs/`");
+                eprintln!("  --s3-gateway-direct-read <true|false>  default true");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg: {other}"),
@@ -483,6 +549,12 @@ fn parse_args() -> Args {
         read_hedge_ms,
         append_chain_min_bytes,
         sst_block_cache_bytes,
+        s3_gateway,
+        s3_gateway_listen,
+        s3_gateway_port,
+        s3_gateway_workers,
+        s3_gateway_credential_file,
+        s3_gateway_direct_read,
         gc_read_chunk_bytes,
         gc_batch_records,
         gc_batch_bytes,
@@ -789,6 +861,43 @@ async fn main() -> Result<()> {
             .detach();
             tracing::info!(period_secs = secs, "regpool periodic log armed");
         }
+    }
+
+    // The hosted S3 gateway. Started AFTER the partition server is up, on its
+    // own OS threads with their own compio runtimes. A startup failure it can
+    // see here — unreadable credential, unparseable address, port in use — is
+    // fatal on purpose: an operator who asked for the gateway should not get a
+    // partition server that quietly did not start one. A credential the manager
+    // REJECTS is not visible until the first connect, on the worker threads, so
+    // that one costs error lines rather than an exit.
+    //
+    // Two couplings worth knowing about, neither of them fixable here. The
+    // transport is a process-wide `OnceLock` the partition server already
+    // initialised, so a `--transport ucx` server gives the gateway UCX
+    // connections — a configuration nothing has exercised. And the release
+    // profile sets `panic = "abort"`, so a panic in a gateway thread takes the
+    // partition server with it; only an error RETURN is contained.
+    if args.s3_gateway {
+        if !matches!(args.transport, TransportKind::Tcp) {
+            tracing::warn!(
+                transport = ?args.transport,
+                "s3 gateway will use this server's transport, not TCP — the transport is \
+                 process-wide. That path is unverified, and the fuse core has a history of \
+                 aborting on the UCX stack, which with panic=abort would take this partition \
+                 server down. Prefer --transport tcp on a server that hosts the gateway."
+            );
+        }
+        s3_gateway::spawn(s3_gateway::Config {
+            manager: args.manager.clone(),
+            listen: args.s3_gateway_listen.clone(),
+            port: args.s3_gateway_port,
+            // Each worker appends its index; the manager keys its lease
+            // registry on this, so it must not collide with another daemon.
+            host: format!("ps{}-s3", args.psid),
+            credential_file: args.s3_gateway_credential_file.clone(),
+            direct_read: args.s3_gateway_direct_read,
+            workers: args.s3_gateway_workers,
+        })?;
     }
 
     // Observability batch 1: /metrics endpoint. `partitions` is

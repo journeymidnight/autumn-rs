@@ -53,11 +53,12 @@ COPY . .
 # memory-mcp is the stdio MCP server over autumn-memory; it ships so an agent
 # pod (hermes) can register it as a local stdio MCP server instead of needing a
 # long-running HTTP/SSE MCP daemon (docs/autumn_memory_plan.md §12).
-# autumn-s3 is the read-only S3 gateway (examples/s3-gateway); it lets engines
-# with no loader plugin seam (SGLang, FreeToken) stream weights via their
-# built-in runai_streamer. See docs/model_loading.md Recipe D.
+# The read-only S3 gateway — which lets engines with no loader plugin seam
+# (SGLang, FreeToken) stream weights via their built-in runai_streamer — is no
+# longer its own binary: `autumn-ps --s3-gateway` hosts it on its own OS
+# threads. See docs/model_loading.md.
 RUN cargo build --release \
-    -p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp -p autumn-s3
+    -p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp
 
 # Ship the SOURCE the Python client is built from, in this image.
 #
@@ -110,7 +111,6 @@ COPY --from=builder \
     /build/target/release/autumn-dashboard \
     /build/target/release/autumn-fuse \
     /build/target/release/memory-mcp \
-    /build/target/release/autumn-s3 \
     /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

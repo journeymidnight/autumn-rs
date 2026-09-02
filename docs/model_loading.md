@@ -12,8 +12,9 @@ lives in autumn. Researched 2026-07-03; pin your vLLM/SGLang versions —
   autumn's file surface is the programmatic **`autumn.Fs`** binding + the
   **`autumn-fuse`** mount (byte transfer), and — for weights — the streaming
   loader below.
-- **The way to serve an autumn-resident model: `autumn-s3` as a per-node sidecar
-  plus the engine's stock `--load-format runai_streamer`** — one path that works
+- **The way to serve an autumn-resident model: the partition server's hosted S3
+  gateway (`--s3-gateway`) plus the engine's stock `--load-format
+  runai_streamer`** — one path that works
   on vLLM *and* SGLang *and* anything else that speaks S3, with no engine
   patches to maintain. Measured at **98% of what `autumn.Fs.read_into` itself
   delivers**, because both are bounded by autumn's read path, not by the
@@ -128,10 +129,16 @@ integration is reported "slow without GDS installed"; benchmark before relying
 on it. **True GDS DMA needs a GDS-native FS (local NVMe / NFSoRDMA / Lustre /
 Weka), not generic FUSE.**
 
-## Recipe C — `autumn-s3` sidecar + stock `runai_streamer` (RECOMMENDED — every engine)
+## Recipe C — the partition server's S3 gateway + stock `runai_streamer` (RECOMMENDED — every engine)
 
-`autumn-s3` (`examples/s3-gateway`) is a read-only, unauthenticated
-S3 endpoint over the `fs/` tree. It serves only what the Run:ai streamer
+`autumn-ps --s3-gateway` (default off) serves a read-only, unauthenticated
+S3 endpoint over the `fs/` tree from the partition server process, on its own
+OS threads. It was once a separate `autumn-s3` binary run as a per-node
+sidecar; hosting it in the partition server saves one copy on the ENGINE'S node
+— a sidecar received the bytes over the network and sent them again over
+loopback, and now that node receives them once. It does not make the reads
+local: replica choice is a hash rotation with no locality preference, so on a
+multi-node cluster most reads still come from a remote extent node. It serves only what the Run:ai streamer
 issues — `ListObjectsV2`, ranged `GetObject`, whole `GetObject` — which is
 enough for **SGLang's built-in `--load-format runai_streamer`**, and so gives
 the engines that cannot register a loader a concurrent streaming weight path
@@ -142,7 +149,9 @@ Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
 autumn `fs/models/llama/x.safetensors`.
 
 ```bash
-autumn-s3 --manager mgr:9001 --port 9100 --credential-file /secrets/fs.cred
+# On the storage node, as part of the partition server:
+autumn-ps --psid 1 --manager mgr:9001 --s3-gateway --s3-gateway-port 9100 \
+          --s3-gateway-credential-file /secrets/fs.cred
 
 pip install runai-model-streamer-s3     # the AWS-SDK plugin; NOT in the base package
 export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x   # dummy; never verified
@@ -184,9 +193,9 @@ the bandwidth bottleneck and need its own HA story.
 | engine | path | engine-init seconds | output |
 |---|---|---|---|
 | vLLM 0.28 | local disk | 23.3 cold / 14.4 with a warm page cache | reference |
-| vLLM 0.28 | **`autumn-s3` sidecar** | **18.5 / 19.0** | byte-identical |
+| vLLM 0.28 | **S3 gateway** (measured as a sidecar) | **18.5 / 19.0** | byte-identical |
 | SGLang 0.5.10 | local disk | 35.7 | reference |
-| SGLang 0.5.10 | **`autumn-s3` sidecar** | **37.1** | byte-identical |
+| SGLang 0.5.10 | **S3 gateway** (measured as a sidecar) | **37.1** | byte-identical |
 
 Greedy decoding, same prompts; the completions match the local-disk run token for
 token on both engines. The numbers are whole-engine init, not weight load alone —
@@ -207,8 +216,8 @@ weights: **materialize to local** via a fuse mount (or `autumn.Fs`), then point
 
 | situation | use |
 |---|---|
-| **serving an autumn model (the default, any engine)** | **C** — `autumn-s3` sidecar + `--load-format runai_streamer` |
-| any S3-speaking tool (`aws s3`, datasets, checkpoints) | **C** — `autumn-s3` |
+| **serving an autumn model (the default, any engine)** | **C** — `autumn-ps --s3-gateway` + `--load-format runai_streamer` |
+| any S3-speaking tool (`aws s3`, datasets, checkpoints) | **C** — the hosted S3 gateway |
 | cannot run a sidecar / quick test | **A** (materialize via `autumn.Fs`) |
 | want no copy-out on ephemeral nodes | **B** (FUSE + `eager`) |
 | loading a **dataset** (not weights) | materialize to local (`autumn.Fs`), then load |

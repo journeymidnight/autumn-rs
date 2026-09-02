@@ -34,7 +34,7 @@ autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001
 - **Static shard ports**: shard count = the `--cpuset` / `--cpu-start` core count; sibling shard *i* listens on `port + i * shard_stride` (`--shard-stride`, default 10). Control ports default to `port + 1000` (override `--control-port`).
 - **Requires pre-formatting**: each `--data` dir MUST be formatted by `autumn-op format` first — the EN refuses to start without the sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`, `node_uuid`). It cross-checks each dir's `cluster_id`, then fetches the manager's via `MSG_GET_CLUSTER_ID` and refuses on mismatch. `disk_id` comes from the sentinel; `--disk-id` and `--shards` are migration-error stubs (exit 2).
 
-### `autumn-ps` (`src/bin/partition_server.rs`)
+### `autumn-ps` (`src/bin/partition_server/main.rs`)
 
 **Default port**: 9201
 
@@ -44,6 +44,7 @@ autumn-ps --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--ad
 
 - `--psid`: **required**, unique partition-server ID across the cluster. `--data`: directory for local WAL files (`part-{id}.wal`). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address).
 - Startup: connect to manager → `RegisterPs(ps_id, advertise_addr)` → `GetRegions()` for assigned partitions → `open_partition()` (replay from streams) each → serve `PartitionKv` gRPC.
+- `--s3-gateway` (default OFF) additionally serves the read-only S3 gateway over the `fs/` tree from this process — `src/bin/partition_server/s3_gateway/`, which is the former `examples/s3-gateway` binary. Companion flags: `--s3-gateway-listen` (0.0.0.0), `--s3-gateway-port` (9000), `--s3-gateway-workers` (min(cores, 8)), `--s3-gateway-credential-file`, `--s3-gateway-direct-read` (true). It runs on its own OS threads with their own compio runtimes and per-worker `FsState`, so it shares no runtime and no lock with the partition threads — but it shares the process, and that has three consequences worth knowing: `--cpuset` does NOT confine it (that flag feeds the pinning the partition/shard runtimes apply to their own threads, not a process affinity mask); the transport is a process-wide `OnceLock`, so a `--transport ucx` server hands the gateway UCX connections (unverified, warns at startup); and the release profile's `panic = "abort"` means a gateway PANIC takes the partition server down, while an error return is contained and logged.
 
 ### `autumn-client` (`src/bin/autumn_client/`)
 
