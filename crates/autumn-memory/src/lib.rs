@@ -784,19 +784,39 @@ impl MemoryStore {
             cs: cs.clone(),
         })
         .await?;
+        // Re-bucket in three batched PHASES rather than three writes per
+        // vector. This loop was 2-3 serial round trips per vector — 10k+ of
+        // them for a 5k-document corpus, which measured at 88 s and was the
+        // whole cost of `reconcile + train_centroids` once the reads were
+        // batched. The vectors themselves are already in memory.
+        //
+        // The phase ORDER carries the same guarantee the per-vector loop did,
+        // and must not be reordered: the new posting exists before any vptr
+        // names its bucket, and an old posting is dropped only after the vptr
+        // has moved off it. Deleting first would leave a vptr pointing at a
+        // bucket with no posting — an entry `delete_vector` can never reap.
+        let mut postings: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(items.len());
+        let mut vptrs: Vec<(Vec<u8>, Bytes)> = Vec::with_capacity(items.len());
+        let mut stale: Vec<Vec<u8>> = Vec::new();
         for (vid, oc, v) in &items {
             let nc = vector::nearest(v, &cs) as u32;
-            let nk = keys::ivf_posting_key(&self.tenant, &self.agent, nc, vid);
-            self.put_kv(&nk, &vector::encode_vec(v), 0).await?;
+            postings.push((
+                keys::ivf_posting_key(&self.tenant, &self.agent, nc, vid),
+                Bytes::from(vector::encode_vec(v)),
+            ));
             // keep the reverse pointer accurate after re-bucketing (so a later
             // delete reaps the posting from its CURRENT bucket).
-            let vptr = keys::ivf_vptr_key(&self.tenant, &self.agent, vid);
-            self.put_kv(&vptr, &nc.to_be_bytes(), 0).await?;
+            vptrs.push((
+                keys::ivf_vptr_key(&self.tenant, &self.agent, vid),
+                Bytes::copy_from_slice(&nc.to_be_bytes()),
+            ));
             if nc != *oc {
-                let ok = keys::ivf_posting_key(&self.tenant, &self.agent, *oc, vid);
-                self.client.delete(&ok).await?;
+                stale.push(keys::ivf_posting_key(&self.tenant, &self.agent, *oc, vid));
             }
         }
+        self.put_all(&postings).await?;
+        self.put_all(&vptrs).await?;
+        self.delete_all(&stale).await?;
         Ok(cs.len())
     }
 
@@ -990,6 +1010,32 @@ impl MemoryStore {
             }
         }
         Ok(out)
+    }
+
+    /// Write many keys, batched and chunked like `get_all`. TTL-free: every
+    /// caller of this is index maintenance, whose lifetime is the doc's.
+    async fn put_all(&self, items: &[(Vec<u8>, Bytes)]) -> Result<(), AutumnError> {
+        const BATCH: usize = 256;
+        for chunk in items.chunks(BATCH) {
+            let refs: Vec<(&[u8], Bytes, u64)> =
+                chunk.iter().map(|(k, v)| (k.as_slice(), v.clone(), 0u64)).collect();
+            for r in self.client.put_many(&refs).await {
+                r?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete many keys, batched and chunked. A no-op on an empty slice.
+    async fn delete_all(&self, keys: &[Vec<u8>]) -> Result<(), AutumnError> {
+        const BATCH: usize = 256;
+        for chunk in keys.chunks(BATCH) {
+            let refs: Vec<&[u8]> = chunk.iter().map(|k| k.as_slice()).collect();
+            for r in self.client.delete_many(&refs).await {
+                r?;
+            }
+        }
+        Ok(())
     }
 
     async fn recount_doc_stats(&self) -> Result<(u64, u64), AutumnError> {
@@ -1200,26 +1246,27 @@ impl MemoryStore {
     /// Bounded by the node's degree (out-scan `edge/{id}/` + in-scan
     /// `redge/{id}/`) — potentially many point-deletes for a hub node.
     pub async fn delete_node(&self, id: &str) -> Result<(), AutumnError> {
+        // Collect every key first, delete in batches: a hub node's degree can
+        // be thousands, and two point-deletes per edge is two round trips per
+        // edge.
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
         // Outgoing edges: drop each forward edge + its reverse marker.
         let sp = keys::edge_src_prefix(&self.tenant, &self.agent, id);
         for k in self.scan_keys(&sp, None).await? {
             if let Some((etype, dst)) = keys::edge_parse_tail(&k, &sp) {
-                self.client.delete(&k).await?;
-                self.client
-                    .delete(&keys::redge_key(&self.tenant, &self.agent, id, &etype, &dst))
-                    .await?;
+                doomed.push(keys::redge_key(&self.tenant, &self.agent, id, &etype, &dst));
+                doomed.push(k);
             }
         }
         // Incoming edges: drop the forward edge (by rebuilding its key) + marker.
         let rp = keys::redge_dst_prefix(&self.tenant, &self.agent, id);
         for k in self.scan_keys(&rp, None).await? {
             if let Some((etype, src)) = keys::redge_parse_tail(&k, &rp) {
-                self.client
-                    .delete(&keys::edge_key(&self.tenant, &self.agent, &src, &etype, id))
-                    .await?;
-                self.client.delete(&k).await?;
+                doomed.push(keys::edge_key(&self.tenant, &self.agent, &src, &etype, id));
+                doomed.push(k);
             }
         }
+        self.delete_all(&doomed).await?;
         // The by-kind index marker (need the kind — read the record first).
         if let Some(node) = self.get_node(id).await? {
             self.client
