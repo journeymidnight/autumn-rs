@@ -265,3 +265,42 @@ Next steps: 无。
   `list | grep -qx` 在 pipefail 下**匹配成功反而判失败**(SIGPIPE 141),所以 oniond 分支
   从来没进过; HF 回退缺 HF_HUB_DISABLE_XET=1 会被 xethub CAS 打 401; 失败的模型静默跳过。
   oniond 实测 ~200 MiB/s,比公网 HF 的 21.4 MiB/s 快约 10 倍。
+
+【2026-09-02 收尾状态 — 阻塞在节点上,不在代码上】
+  实测(真集群,同语料 5164 chunks,agent 隔离):
+    写入循环   177.7s (34.4 ms/chunk)  ->  77.2s (15.0 ms/chunk)   2.3x
+    reconcile+train  101.1s -> 88.3s   仅 1.14x
+  第二半没动的原因已定位并已修(1f7456a): train_centroids 的重新分桶是**串行写**,
+  每个向量 2-3 次往返,5164 个就是一万多次;我之前只批量化了它的读。改成三段批量写
+  (新 posting -> vptr -> 删旧 posting,顺序不可调换,否则 vptr 指向空桶无法回收)。
+  顺带批量化 delete_node 的边回收。**镜像 a433c7d 已出,但没测成** —— 见下。
+
+  阻塞: **5 台 autumn-node 的 containerd 全部卡死**(约 2 小时内逐台沦陷)。
+  已跑的进程照常服务,但任何节点都建不了新容器,所以起不了基准 pod。
+  写入仍可用但重度退化: 实测 mkdir 21s / 64KiB put 60s(正常毫秒级)。
+  VKE 控制台的故障诊断也报"节点诊断数据采集异常,可能是由于节点无法创建Pod" —— 独立印证。
+  处置只能靠**从火山引擎控制台逐台重启节点**(用「重启」不是「下线」,大概率要强制),
+  每台起来后 kubectl uncordon(我 cordon 了 4 台)。实例 ID:
+    192.168.2.216 i-yeprglc35s5i3z3ocg1r   en-4
+    192.168.1.128 i-yeprglc35swh2yp8jc4p   en-3
+    192.168.0.26  i-yeprglc35s4c5qvl856f   en-0, ps-1
+    192.168.1.127 i-yeprglc35swh2yp8hi95   en-1, manager-0, ps-0
+    192.168.3.242 i-yeprglc35swh2yp4ips4   en-2, etcd-0
+  本机无 volc CLI / 无 SDK / 环境里无 AK-SK,也 SSH 不到节点 ⇒ agent 无法自行重启。
+
+  集群现状: 核心已滚到 a433c7d(manager + ps-0/ps-1),PS 已从 3 缩到 2(ps-2 卡在
+  Terminating,等节点重启自然消失)。EN 仍在 9c23776c —— fingerprint 已还原,新旧兼容,
+  且 EN 的 PV 是 node-pinned 本地盘(storageClass autumn-en-local + nodeAffinity),
+  **调度不走也不能强删**,只能等节点修好再滚。**EN/etcd 的 PVC 绝对不能删**
+  (EN 删了会在别处建空盘;etcd 是 reclaimPolicy=Delete,删了等于抹掉集群元数据)。
+
+  下次接手第一步: 节点恢复后 uncordon -> 起 mmbench(scratchpad/mmbench.json,
+  换个 agent 名) -> 确认 reconcile+train 从 88.3s 降到多少 -> 再把 memory-mcp
+  Deployment 滚到新镜像(它现在还是 efeea3c)。
+
+  模型上传(buda,由 upload-watch 跑): dsv4 156 GiB 已用 oniond 下完并校验(180 MiB/s),
+  数据在 pod dl-dsv4-cj4dc 的 emptyDir 里,**别删那个 pod**。minimax 的 HF 下载已死
+  (40/130 GiB,httpx.ConnectTimeout,进程活着但冻结) —— 需要把 MiniMax-M2.5-NVFP4
+  补录进 oniond 桶(裸名,不带 @nvidia 后缀),否则只能跨太平洋 22 MiB/s。
+  关键认知: oniond 快 8.4 倍**靠的是并发不是带宽**(单流 ~4 MiB/s x ~45 条),
+  所以串行 autumnfs put 达不到 187 MiB/s 基线是可预期的,并行化 put 循环才是杠杆。
