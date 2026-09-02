@@ -14,6 +14,23 @@
 
 ## Active
 
+### F-BATCHPUT-ZC — `MSG_BATCH_PUT` 的值走零拷贝（已测量，判定暂不做；含可无 wire 变更拿到的子集）
+- **Trigger** (2026-09-02, 用户: "MSG_BATCH_PUT 应当默认是 bulk 的"): `MSG_PUT_BULK`(≥64 KiB) 的 value 是**零拷贝**（客户端从 `Bytes` 直接当 iovec 发，PS 从 frame 切片），而 `MSG_BATCH_PUT`(<64 KiB) 的 value 要拷 **三次**：客户端 `v.to_vec()` ①、rkyv 编码进帧 ②、PS 侧 `rkyv_decode::<BatchPutReq>` 是完整反序列化而非 archived 借用 ③。拷贝成本随 value 线性涨、却一直涨到 64 KiB 阈值才突然归零 —— 断崖方向是反的。frame 层本就支持（`request_zc(ctrl, value)`：ctrl 走 CRC、value 是裸尾巴），做法是把 N 个 value 拼进那条尾巴、长度写进 ctrl，不需要新帧概念。
+- **实测（2026-09-02，单节点 RF=1 / 8 分区 / 16 线程 × depth 8 / cpuset 隔离 / /data08）**:
+
+  | value | 端到端 ops/s | MB/s | 三次拷贝 µs/op | 拷贝 CPU(折 1 核) | 其中 PS decode |
+  |---|---|---|---|---|---|
+  | 4 KiB | 27152 | 106 | 4.6 | 12% | 1.6% |
+  | 32 KiB | 13726 | 429 | 34.9 | 48% | 8% |
+  | 64 KiB−1 | 7002 | 438 | 84.9 | 59% | 9% |
+
+  拷贝分解（256 op/批）：4K = to_vec 0.625ms + encode 0.409 + decode 0.153；32K = 3.736 + 3.708 + 1.487；64K−1 = 4.677 + **13.797** + 3.267（encode 在 64K 超线性跳变，疑似 rkyv 缓冲扩容）。
+- **判定：暂不做（用户 2026-09-02 提出，主 agent 测后判定）**。理由是**吞吐从 32 KiB 起平在 430~440 MB/s 不动**（32K 429 / 64K 438）⇒ 该路径是带宽/IO 绑定而非 CPU 绑定，去掉拷贝**不抬高天花板**，不值得再付一次 wire 变更（v31 + 全停全启）。
+- **什么条件下翻案（写清楚免得重测）**: autumn 客户端是**单线程 compio**；bench 把客户端两次拷贝摊到 16 线程所以每线程仅 2.5%，但一个**独自**跑到 430 MB/s 的单线程写者要为此吃掉整颗核的 ~40%。一旦出现"单个客户端进程成为写瓶颈"的负载（今天没有：memory-mcp ingest 是往返绑定、fuse 走 ≥64 KiB 的 bulk 路），本条立刻从"不值得"翻成"必须做"。
+- **可先做的子集（不需要任何 wire 变更）**: 只消掉拷贝 ③ —— PS 侧把 `rkyv_decode::<BatchPutReq>`（完整反序列化）换成 archived 借用，值以 frame 背后的 `Bytes` 切片交给下游。省 PS 一颗核的 8~9%。**前置确认**：`WriteRequest` 及其下游（memtable / log_stream append）能否持 frame-backed `Bytes` 而非 `Vec`（`MSG_PUT_BULK` 已经这么做，链路大概率通）。
+- **Acceptance（真要做时）**: 32 KiB 与 64 KiB−1 两档的端到端 ops/s 相对上表**显著上升**（不是只在微基准里省了 CPU）；`--bulk 256` 路径字节精确；wire 版本与指纹按纪律登记。
+- **Status**: `passes: false` (2026-09-02) — 已测量、判定暂不做。
+
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。
 - **⚠️ 已排除的解法（负结果，别重做）**: 把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380 → 3418 key/s）。原因：`ClusterClient::delete_many` 不是批量 RPC，而是并发上限 32 的客户端扇出；而同集群 `perf-check` 显示单分区写 1 线程 9.2K ops/s、8 线程即达 30K ops/s 天花板 ⇒ 删除本身只该占约 12 s，104 s 里的绝大部分是 **694 次 range 扫描**（每页 512 键约 133 ms）。改动已回滚（按 `feedback_no_defensive_fixes_for_imaginary_bugs`：没有实测收益的优化不留）。**真正的瓶颈是前缀扫描，不是删除。**

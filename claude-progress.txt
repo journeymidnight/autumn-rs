@@ -7,8 +7,28 @@ Task scope: 给 autumn-memory 的检索路径装上可测量的护栏——固�
   5164 chunk）。清单核对结果：BM25 早已完整实现（含 CJK bigram），结构感知 chunking 已有
   一半（heading 切段 + breadcrumb 前置），metadata filter 只有检索后按 kind 过滤，
   dedupe / version freshness / eval set 三项完全没有。
-遗留（非本次任务，来自上一条会话，仍 not_completed）：ingest 提速改动的**pod 内复测数字
-  仍未拿到**（loopback 量不出来，RTT 太小）。详情与三起事故见文末 2026-09-02 条。
+  本会话后续又完成两件（均已推 main）：wire v30 删掉最后一个 `must_sync`；以及按用户要求
+  测量 `MSG_BATCH_PUT` 零拷贝化的收益并判定暂不做（见 feature_list F-BATCHPUT-ZC）。
+**TaskStatus 为何仍是 not_completed**：不是本会话的工作没做完（上述三项都已验收并推送），
+  而是**另一条并行会话的集群事故仍在阻塞**——5 台 autumn-node 的 containerd 卡死，根因
+  假设已改判为 autumn-fuse 残留挂载，详见文末 2026-09-02 方向变更条。那条结论出来前
+  **不要再起任何带 FUSE 挂载的 pod**。另有上一条会话的遗留：ingest 提速改动的 pod 内
+  复测数字仍未拿到（loopback 量不出来，RTT 太小）。
+
+【2026-09-02 perf check（单机，租户在场 + cpuset 隔离）：无代码回归】
+  布局：EN1 68-75 / PS 92-123（租户 sglang 散在 5/25/32/40/67/158/164/172/181，避开），
+  `AUTUMN_EXTENT_BASE_PORT=20000`，`--3disk`，`AUTUMN_DATA_ROOT=/data05/autumn-rs`。
+    tcp 4K   写 67,489（过）        读 403,513 vs 基线 1,373,914 = 29% ⚠
+    tcp 8M   写 241（基线 210=115%）读 757（6.3 GB/s，过）
+    ucx 4K   写 61,526（过）        读 1,128,447（过）
+    ucx 8M   **写卡死在 0，已知配置故障**（perf_check 的 ucx 腿自 export
+             `UCX_TLS=posix,cma,tcp,self`，posix 大消息在 PS→EN 那跳 stall；
+             skill 标注这些 8M 数字 known-broken，真 UCX 大消息要 RoCE 跨机）
+  tcp-4K 读那条 29% 是**陈旧基线**（空箱时代录的，账本已有"旧代码 A/B 同样下跌"）。
+  本次多了一条更硬的证据：**同一次运行里 UCX 读跑到 113 万**，机器照样能做 >100 万读/秒
+  ⇒ 不是整机被压垮，是只压 TCP 路径（loopback 小包读吃内核 softirq/调度，UCX 走 shm 绕开）。
+  且 403K 远高于上次记录的 230K ⇒ **cpuset 隔离确实有效**。基线未动（不擅自 update）。
+  ⚠️ 环境隐患：/data05 已 95% 满（剩 176G），下次跑 perf 前先清，否则迟早造出下一个假回归。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   examples/s3-gateway（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
