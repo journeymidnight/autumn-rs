@@ -40,6 +40,15 @@
 14. commit message 里**禁止**出现 `Claude-Session: https://claude.ai/code/session_...`
     这一行。session 链接是内部的、会失效的，对以后读 `git log` 的人毫无意义。
     `Co-Authored-By: Claude ...` 可以保留。（已经进了历史的不要回改、不要 force-push。）
+15. **每次代码写完都要派 fable subagent 做独立评审**，在自测通过之后、写 commit 之前。
+    不是可选项。理由是实测有效：它抓到过一个自引入的高危回归——批量读的状态从
+    FLAG_ERROR 帧改成 ctrl 里的 code 之后，上层靠 `Err(PreconditionFailed)` 触发的
+    refresh+回退变成死代码，split/merge 后整组 key 直接报错，而当时全量单测和逐字节
+    e2e **全绿**。同轮还抓到漏掉的 writev 分段点和被"焊在一起"的文档注释。
+    - prompt 要给全：改了哪些文件、意图、已有的测量数字，并要求它区分
+      「代码里验证过」与「推断」。
+    - **它的推断项当假设对待**，别直接采信：它曾推断某改动在 UCX 上会更慢，实测 +61%。
+    - 评审挖出的高危项，修完要补一条能证明"没有修复时会红"的回归测试（消融验证）。
 
 
 ### claude-progress.txt 约定
