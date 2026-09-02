@@ -94,13 +94,22 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
         // and stops. Silently: no error, no log, and the caller cannot tell
         // this from a real EOF.
         //
-        // Staleness here is not hypothetical. `InodeState` is pinned across
-        // opens by the kernel's dentry refcount and is only reloaded when a
-        // fresh lease acquire reports a higher version, so a meta captured
-        // once outlives every reopen until the kernel forgets the dentry.
-        // Observed: a mount served EOF at 64 MiB for a 5 GB file for about
-        // twenty minutes, through repeated opens, and then healed on its own
-        // with nothing recorded anywhere.
+        // The staleness this guards against is REACHABLE, not observed.
+        // `InodeState` is pinned across opens by the kernel's dentry refcount
+        // and is reloaded only when a fresh lease acquire reports a higher
+        // version, so a meta captured once outlives every reopen until the
+        // kernel forgets the dentry — and nothing consumes the invalidation
+        // events the lease poll already delivers.
+        //
+        // Honesty about provenance, because the commit that added this claimed
+        // more: it was written after reads at some offsets of a 5 GB file
+        // returned nothing while a contemporaneous stat showed the full size.
+        // Those probes ran `dd ... 2>/dev/null | wc -c`, which reports 0 for an
+        // I/O ERROR exactly as it does for a zero-length read, so they never
+        // distinguished truncation from EIO — and the simpler reading is that
+        // they were EC reconstruct failures on a 4+1 layout with no gather
+        // slack. Treat this check as closing a real hole in the code, not as
+        // the fix for a diagnosed incident.
         //
         // Checking the extent map instead would not work: for a striped file
         // the map is COMPUTED from this same size, so it is stale in exactly
