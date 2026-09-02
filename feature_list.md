@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-08-05
+**Last updated:** 2026-09-02
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,14 +14,6 @@
 
 ## Active
 
-### BUG-KVC-LOAD-ATOMIC — external KV load 是 fail-open：部分 layer 加载失败仍继续推理
-- **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:773`；**已复核代码为真**): scheduler 见 `__present__` marker 后就告诉 vLLM 这些 token 不用再 prefill。worker 侧 `start_load_kv()` 拿 `oks = load_layers(...)` 后是**边检查边注入**：`if not ok: log.warning(); continue`。于是任一 layer 缺失时，前面的 layer 已写进 paged cache、失败的 layer 保持**未初始化**内容，请求进入"部分新 KV + 部分旧/未初始化 KV"的混合态且无法回滚，继续推理 → 静默错误输出。**这不是假想**：BUG-KVC-TENANT 那次线上事故的表现就正是 `external KV load miss after positive presence`（layer 0..3）+ garbage output。
-- **现状是有意为之，不是疏忽**: 代码注释明写"The position keeps its (uninitialised) paged KV; surface it loudly rather than swallowing at debug" —— 当时的选择是**响亮告警但继续服务**。本条要重新定的是这个姿态：正确性优先 ⇒ 应 fail-closed。
-- **Scope**: `start_load_kv()` 改 all-or-nothing —— 先 `len(oks) == len(layer_names) and all(oks)` 再注入任何 layer；任一失败则一个都不注入并走 vLLM 的 external-load-failure 回退（若该 vLLM 版本支持 `get_block_ids_with_load_errors()` 之类上报路径就接上，否则至少保证该请求退回正常 prefill 而不是带着半截 KV 跑）。可选加固：marker value 带 `num_layers`/每层 byte length，加载前先校验。
-- **Acceptance**: 单测 —— 构造 `load_layers` 返回 `[True, False, True]`，断言**零** layer 被注入且该请求走回退；线上/离线注入一次故意的 layer 缺失，确认输出不再是 garbage 而是正常（重算）结果。
-- **Status**: `passes: true` (2026-08-11) — 曾 `passes: false` (2026-07-22, coco 发现 + 主 agent 复核) — cross-ref `BUG-KVC-TENANT`（那次事故的下游放大器就是本条的 fail-open）。
-  **用户定调 2026-07-22**（在 "fix BUG-KVC-TENANT" 之后说「剩下的 2 个你看着办，一般不需要」）: 本条**不做**，留在 backlog 只作记录。真要动之前，先复核它的触发条件是否已经在线上出现过。
-  **2026-08-11 触发条件已在线上复核出现 + 用户明确要求修复**: 活集群 7B 对 hermes 固定长 prefix 输出满屏 garbage，vllm 日志每层刷 `external KV load miss after positive presence`。按既定 Scope 修复：`start_load_kv` 改 all-or-nothing（`len(oks)==len(layer_names) and all(oks)` 才注入，否则一层不注入）+ 记录失败请求的 block_ids，新增 override `get_block_ids_with_load_errors()` 上报给 vLLM 走重算回退。单测 `tests/test_load_atomic.py`（[True,False,True]→零注入+上报 blocks；短 oks→fail-closed；全 True→注入全部）。同批把 tenant key 改简洁+有效：`tenant_cfg_from_vllm` 用 autumn weights-path basename（`qwen7b`）替代恒定无效的 `/model-cfg` 段（`_identity.py`），key 从 `model-cfg_<fp>_...` 变 `qwen7b_<fp>_...`；`tests/test_tenant_identity.py` 同步。
 ### BUG-KVC-MM-ALIAS — 多模态请求取不到 mm hash 时仍然缓存（跨图片 KV 串读）
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:193`；**已复核代码为真**): `_request_extra_keys()` 已经识别出"有 `mm_features` 但取不到任何 mm hash"这一情况并打 warning，注释甚至写明 "its prefix hash would collide across DIFFERENT images sharing the same placeholder token ids (false-alias → wrong output)" —— 然后**照样返回不含 disambiguator 的 keys 并继续缓存**（"the connector still caches (best-effort)"）。VLM 场景下同尺寸不同图片的 placeholder token 序列可以完全相同 ⇒ 用户 B 可能读到用户 A 的视觉 KV：错误输出 + **跨请求信息泄漏**。
 - **Scope**: `_request_extra_keys()` 改返回 `Optional[List[str]]`，无法区分多模态内容时返回 `None`；load 路径 `get_num_new_matched_tokens()` 见 `None` 直接 `return 0, False`，store 路径 `build_connector_meta()` 见 `None` 直接跳过保存（= 该请求不participate external KV，纯文本请求不受影响）。优先复用 vLLM 自身的 BlockHash / extra keys，而不是在 connector 里 best-effort 猜字段名。
@@ -89,110 +81,9 @@
 - **Trigger** (2026-09-01, FreeToken rollout 规划时发现): 镜像只 build `-p autumn-server -p autumn-dashboard`，`autumn-fuse`（挂载守护进程）和 `memory-mcp` 都不在里面。前者导致"从 autumn fuse 读模型权重"在 k8s 上无法实现（`docs/ops.md` 只有一句"应做成 privileged DaemonSet"的说明，仓库里没有任何 FUSE manifest）；后者导致 hermes 无法以 stdio 子进程方式接 MCP —— 而 stdio 是 `memory-mcp` 唯一的传输方式，`docs/autumn_memory_plan.md:378` 明确不建议常驻 HTTP/SSE MCP。
 - **Scope**: `deploy/docker/Dockerfile` builder 段加 `libfuse3-dev`+`pkg-config`（fuser 0.15 链接 libfuse3），构建改 `-p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp`；runtime 段加 `fuse3`（libfuse3 + fusermount3 setuid helper）并拷出两个二进制。`entrypoint.sh` 加 `fuse` role（env→flag：`AUTUMN_MANAGER`/`AUTUMN_FUSE_MOUNTPOINT`/`AUTUMN_CREDENTIAL_FILE`/`AUTUMN_FUSE_DIRECT_READ`/`AUTUMN_FUSE_ALLOW_OTHER`），挂载前 `fusermount3 -u` 清理崩溃残留。`docs/ops.md` 补 sidecar manifest + mountPropagation 配对 + FOPEN_DIRECT_IO 的 mmap 后果。
 - **Acceptance**: (a) `deploy/validate.sh` 通过且 role 分派表含 `fuse`；(b) Linux 上镜像构建成功、`autumn-fuse --help` / `memory-mcp --help` 在镜像里可执行；(c) sidecar 挂载后主容器能在 `/mnt/autumn` 看到 `fs/` 内容（mountPropagation 配对生效）；(d) 杀掉 fuse 容器再拉起，不因残留挂载点 EBUSY。
-- **Status**: `passes: false` (2026-09-01) — 本地已改完并通过 `bash -n` + `deploy/validate.sh` + `cargo build -p memory-mcp` + `cargo check -p autumn-fuse`；(b)(c)(d) 需 Linux 镜像构建与活集群验证。
+- **Status**: `passes: false` (2026-09-01；2026-09-02 收窄) — (a) 通过；(b) 镜像里有 `autumn-fuse` 且在 v29 集群上真挂载成功（`dd iflag=direct` 4K/8M 两档都过），但 `memory-mcp --help` 未在镜像里单独跑过。**(c) 的形态已被推翻**：本集群 kubelet 未配 rshared，mountPropagation 不兑现（特权 sidecar 内 `grep -c "shared:" /proc/self/mountinfo` = 0），sidecar 主容器看不到挂载；可行形态是**单容器**（autumn-fuse 后台进程与应用同 mount namespace，整容器 privileged）。⇒ 本条剩余工作 = `docs/ops.md` 的 sidecar manifest 改写成单容器形态 + (b) 的 memory-mcp 检查 + (d) 杀容器重拉不因残留挂载点 EBUSY。
 
-### F-FT-FUSE-ODIRECT — 确认 FreeToken 能否从 autumn-fuse 挂载点加载权重【先决条件】
-- **Trigger** (2026-09-01): FreeToken 的 FTW reader 开局探测一次 O_DIRECT（`checkpoint/ftw.py`），成功走 8MiB chunk 多线程 `preadv`，**失败则回退到整片 `mmap.mmap(fd, 0, prot=PROT_READ)`**。Python `mmap.mmap` 不传 `flags` 默认 **MAP_SHARED**，而 `autumn-fuse` 对每个 open 无条件返回 **FOPEN_DIRECT_IO**（`crates/fuse/src/ops.rs`），内核对 direct_io 的 FUSE 文件拒绝 MAP_SHARED（`ENODEV`）。⇒ 若 O_DIRECT 探测失败，**两条加载路径同时死**。另：raw-safetensors 的 `--expert-load parallel` 用无回退的 `O_RDONLY|O_DIRECT` 且只捕获 `NotImplementedError`，在不支持的挂载上会直接崩。
-- **Scope**: 在挂了 autumn-fuse 的 Linux pod 里对挂载点上一个 ≥4096 字节的文件执行 `os.open(p, os.O_RDONLY|os.O_DIRECT)`。若失败，给 `autumn-fuse` 加 `--direct-io <bool>` 开关（`ops.rs` 目前硬编码 `reply.opened(fh, 1)`），让 mmap 回退路径可用；或改为本地盘暂存权重。
-- **Acceptance**: 探测结果被记录到 `docs/ops.md`；FreeToken 能从挂载点完成一次权重加载，且日志中未出现 `O_DIRECT unsupported ... using mmap fallback` 之后的 ENODEV 失败。
-- **Status**: `passes: true` (2026-09-01) — 活集群实测通过。3.2 节点、v29 镜像、autumn-fuse sidecar 挂 `fs/`（authz 开，带 fs.cred）：buffered 读 OK；`dd iflag=direct bs=4096` **OK**；`bs=8M iflag=direct`（= FTW 的分块尺寸）**OK**。⇒ FTW reader 的 O_DIRECT 探测会成功、走多线程 `preadv` 快路，那条会因 MAP_SHARED 撞 ENODEV 的整片 mmap 回退不会被触发。同轮顺带验证 `autumnfs put` 12 MiB → 自动 striped ×24 lanes → FUSE 挂载读回，链路通。仍保留的约束：**FUSE 上禁用 `--expert-load parallel`**（它用无回退的 O_DIRECT 且只捕获 NotImplementedError）。
-
-### BUG-PRESPLIT-NO-CRED — `autumn-op presplit --namespace fs` 在开了 authz 的集群上无法执行
-- **Trigger** (2026-09-01, 线上 v29 全量重建时实测): 新集群 bootstrap 后执行
-  `autumn-op --admin-token-file F presplit --namespace fs --lanes 24 --parts 6`，报
-  `presplit: read existing stripe geometry: permission denied: protected key requires a
-  capability token (no AUTH_HELLO on this connection)`。
-  根因：`main.rs:2076-2088` 的"禁止静默收窄 lane 宽度"守卫（注释标为 UX-fix M5，较新迁入）
-  会做一次**裸数据面读** `client.get(b"fs/" ++ stripe_geom_key())`，但 autumn-op 走的是
-  `connect_raw`（无 AUTH_HELLO），而 PS 端是 PROTECT-EVERYTHING
-  （`crates/partition-server/src/authz.rs:221-226`：开了 authz 就每个 key 都要 token，
-  `protected_prefixes` 列表已退休）。而 **`presplit` 子命令没有任何 `--credential-file` 参数**
-  —— 全仓只有 `mint-token` 接受它（`args.rs:813`）。admin token 是控制面凭据，不满足数据面检查。
-- **为什么以前能跑**: 那个 read-before-write 守卫是后加的；在它出现之前 presplit 不碰数据面，
-  所以 2026-07-20 那次 reset 的 `presplit --namespace fs --lanes 6` 能成功。属回归。
-- **影响**: 开了 authz 的集群**无法给 fs 做 lane presplit**。而 presplit 必须在写入任何数据
-  之前做（数据落盘后 CoW 重叠会让多数切点 `has_overlap` 失败），所以这挡住的是新集群 bring-up
-  的关键一步 —— 只能退回单分区，大文件上传/读取拿不到跨分区并行。
-- **Scope**: 给 autumn-op 加**全局** `--credential-file`（与 `--admin-token-file` 同一层），
-  在需要数据面访问的子命令上用 `connect_with_credential` 取代 `connect_raw`。
-  presplit 是当前唯一已知的受害者，但任何未来做数据面读写的 admin 子命令都同此。
-  次选（不推荐）：把守卫里的 PermissionDenied 当作"无既有声明"处理 —— 会让守卫在开了 authz
-  的集群上静默失效，正是它要防的那个 harm。
-- **Acceptance**: 在 authz 开启的集群上 `autumn-op --credential-file fs.cred presplit
-  --namespace fs --lanes 24 --parts 6` 成功切分并写入声明；`autumn-op info` 显示 6 个分区
-  跨 3 个 PS；收窄守卫仍生效（不带 `--force` 的 `--lanes 2` 被拒）。
-- **Status**: `passes: true` (2026-09-01) — 活集群验证通过。`autumn-op --admin-token-file T --credential-file fs.cred presplit --namespace fs --lanes 24 --parts 6` → `declared fs stripe geometry: 24 lanes × 8 MiB units` + `4/5 cut points applied`，`fs` 得到 6 个分区跨 3 个 PS 均摊 2/2/2。
-  **踩到的次生坑（值得记）**: 第一次重试只切成 1/5，因为 FUSE O_DIRECT 探测时往 `fs/` 写了个 12 MiB 测试文件 —— 正是本条 Scope 里写明的"presplit 必须在写入任何数据之前"。恢复路径按 `docs/ops.md` 有效：删文件 → `autumn-op compact <part>`（两个分区都要）→ 重跑 presplit。删除只留 tombstone，不 compact 的话 `has_overlap` 依旧。
-
-### F-S3-GATEWAY — 只读 S3 兼容网关（把 SGLang / FreeToken 接上 runai_streamer 快路）
-- **Trigger** (2026-09-01): `autumn_vllm_loader`（`--load-format autumn`）**只对 vLLM 有效** ——
-  46ed345 已修正文档中"一套实现同时服务 vLLM 和 SGLang"的错误说法。实测确认 SGLang 无插件位：
-  `srt/configs/load_config.py:15` 是封闭 `LoadFormat` 枚举，`srt/model_loader/loader.py:3106`
-  `get_model_loader` 是硬编码 if 链，全树无 `register_model_loader`。因此 SGLang 与 FreeToken
-  目前只能走 FUSE 挂载（Recipe B，非流式快路）。
-  但 **SGLang 原生支持 `--load-format runai_streamer`**（`load_config.py:34`，
-  `utils/runai_utils.py:12` `SUPPORTED_SCHEMES = ["s3://","gs://","az://"]`，
-  `model_loader/weight_utils.py:1144-1147` 把 `AWS_ENDPOINT_URL` 转成 `RUNAI_STREAMER_S3_ENDPOINT`），
-  vLLM 同样支持。⇒ 一个 S3 端点可同时把两个引擎抬到并发流式读，且不需要改任何引擎代码。
-- **Scope**: 只读、只实现 runai 真正调用的 3 个操作（调用链已从本机
-  `runai-model-streamer 0.15.6` 逐层核实）：
-  - `ListObjectsV2` ← `list_safetensors()` → `s3_glob(path, ["*.safetensors"])`
-  - `GetObject` + `Range` ← `SafetensorsMetadata.from_files()` 先取 8 字节头长再取 header JSON，
-    随后按 chunk 取张量。**所有 tensor 的 offset/size 来自 safetensors header 自解析
-    （`safetensors_pytorch.py:206`），不依赖对象大小查询。**
-  - `GetObject`（整取）← 引擎侧 `pull_files` 拉 config.json / tokenizer。
-  必须满足 AWS SDK C++ 的严格解析：`ListBucketResult` XML（`Contents/Key/Size/LastModified/ETag`
-  + `prefix`/`delimiter`/`continuation-token`）、Range 请求回 **206** + 精确
-  `Content-Range: bytes a-b/total` 与 `Content-Length`、**path-style 寻址**、HTTP/1.1 keep-alive。
-  **不验签**：忽略 `Authorization` 头（客户端仍需假的 `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY`，
-  因为 AWS SDK 的凭据链在发请求前就会自检）。读穿 `autumn.Fs`，属 adapter，不是并行数据面。
-- **明确不做**: PUT / DELETE / multipart / versioning / ACL / CORS / 虚拟主机寻址 / SigV4 校验。
-- **部署形态**: 每 GPU 节点 sidecar（长跳 EN→sidecar 走 RDMA，只在 localhost 付一段 HTTP），
-  避免单点网关成为带宽瓶颈并省掉 HA 设计。
-- **Acceptance**:
-  (a) `aws --endpoint-url ... s3 ls` / `s3 cp` 能列出并取回 `fs/` 下的对象，字节精确；
-  (b) SGLang `--load-format runai_streamer --model-path s3://<bucket>/<model>` 加载成功，
-      推理输出与同模型本地盘加载一致；
-  (c) vLLM 同上；
-  (d) A/B：与现有 `--load-format autumn` 原生 loader 对比吞吐，比值记入 `docs/model_loading.md`
-      —— 这个数字是 F-S3-RUNAI-PLUGIN 是否值得做的判据。
-- **验证明细**：网关实现在 `examples/s3-gateway`（二进制 `autumn-s3`，~600 行 + 5 单测）。
-  - boto3（真 botocore/AWS SDK）：`list_buckets` / `list_objects_v2`（prefix+delimiter+
-    `encoding-type=url`）/ `head_object` / `get_object` / ranged `get_object` / 官方 paginator
-    翻页 / typed `NoSuchKey` + `NotImplemented`，全过。
-  - **真 `runai-model-streamer` 0.15.6 端到端字节精确**：`list_safetensors` → 逐 shard 读
-    `bytes=0-7` 头长 → header JSON → 各张量 chunk，3 个张量 bytes_exact=True。这正是 SGLang
-    runai loader 内部跑的那段代码。
-  - 边界：206 + 精确 `Content-Range`、末段越界钳位、`bytes=-N` 后缀、416 带 `bytes＊/size`、
-    404 `NoSuchKey`、写操作回 `NotImplemented`、64 并发 ranged GET 全 206 无 panic。
-  - 幂等实现细节：`FsState` 用**异步** mutex 而非 `RefCell`（`RefCell` 在第二个并发请求就
-    `already borrowed` panic，而流式读天然并发）；读路径按 fuse dispatcher 的分法拆成
-    `prepare`（持锁、只做路由）+ `execute`（无锁、真 I/O），所以并发 GET 仍然重叠扇出。
-  - **(d) A/B 已测（多 worker 修复后重测）**（2 GiB shard，loopback）：
-    native `read_into` 8 线程 **1327 MB/s** / 普通 HTTP 客户端复刻 CRT 访问模式 **1430** /
-    **runai→网关（默认 8 worker）~1300 = native 的 98%** / runai→网关 `--workers 1` 557（42%）/
-    runai→MinIO（本地页缓存，仅作 HTTP 服务层参照）2700–2830。
-    ⇒ **Recipe D 基本追平 Recipe C 的数据路径**；两条路都被 autumn 读路径限住，
-    loopback 上的 HTTP 一跳几乎不要钱。修复过程见 F-S3-GW-MULTIWORKER。
-  **踩到的坑（已写进 ops.md）**：aws-c-s3 认 `HTTP_PROXY` 但**不认 `NO_PROXY`** —— 环境里有
-  代理时，boto3 侧的 list 正常（boto3 认 NO_PROXY），每个权重读却全挂在
-  `AWS_ERROR_S3_INTERNAL_ERROR` 且**不开任何 socket**。"lists fine, every read fails" 是指纹。
-  - **(b)(c) 真引擎端到端已过**（2026-09-01，Qwen3-8B / 16 GiB / 单张 H200）：
-
-    | 引擎 | 路径 | engine-init 秒 | 输出 |
-    |---|---|---|---|
-    | vLLM 0.28 | 本地盘 | 23.3 冷 / 14.4 页缓存热 | 基准 |
-    | vLLM 0.28 | **网关** | **18.5 / 19.0** | 逐字相同 |
-    | SGLang 0.5.10 | 本地盘 | 35.7 | 基准 |
-    | SGLang 0.5.10 | **网关** | **37.1** | 逐字相同 |
-
-    贪心解码同 prompt，两个引擎的补全都与本地盘逐 token 一致。同轮对照已退役的
-    in-process loader：vLLM 上 18.23/18.25 vs 网关 18.54/19.0，差 1.6–4%。
-    **⇒ 该 loader 已删除**（本条 Trigger 写的"只对 vLLM 有效"正是删它的理由）。
-    坑：SGLang 0.5.10 要 `runai-model-streamer>=0.16`（0.15.6 不导出 `ObjectStorageModel`）。
-- **Status**: `passes: true` (2026-09-01) — 全部验收项通过。仍未测：跨机（loopback 掩盖网络成本）。
-
-### F-S3-RUNAI-PLUGIN — 用 runai 后端插件 ABI 承载 autumn 原生传输【条件性，等 F-S3-GATEWAY 的数字】
+### F-S3-RUNAI-PLUGIN — 用 runai 后端插件 ABI 承载 autumn 原生传输【WON'T-DO，判据实测未触发】
 - **Trigger** (2026-09-01): `libstreamer.so`（未 strip）里存在一套可插拔后端 C ABI，按**裸 soname**
   `dlopen`，因此 `LD_LIBRARY_PATH` 即可接管，无需 patch 上游。反出的签名：
   `obj_open_backend(void**)` / `obj_close_backend(void*)` /
@@ -224,57 +115,6 @@
   本条保留是因为 ABI 反解的结果本身有价值（万一将来需要真正绕开 HTTP 时可直接接手）。
 - **Status**: `passes: false` (2026-09-01) — WON'T-DO，判据实测未触发。
 
-### F-S3-GW-MULTIWORKER — autumn-s3 单线程 accept 限住了 CRT 客户端的吞吐
-- **Trigger** (2026-09-01, F-S3-GATEWAY 的 A/B 对照挖出): runai(aws-c-s3 CRT)→autumn-s3
-  只有 ~600 MB/s，而同一个 runai→MinIO（同机、同 2 GiB 文件、同 loopback）**2700–2830 MB/s**。
-  排除法做完了：用普通 HTTP 客户端复刻 CRT 的访问模式（257×8MiB ranged GET、每块新连接、
-  16→256 并发）过同一个网关是 **1430 MB/s**，所以既不是访问模式、也不是并发数、也不是
-  autumn 读路径。实测网关服务 CRT 时多烧 **2.1× CPU**、多发 **4.1× `io_uring_enter`**
-  （9608 vs 2329 / 同样 2 GiB），线程占用 84%。CRT 吸 socket 慢 ⇒ 8 MiB body write 碎成
-  大量部分写 ⇒ 单线程 event loop 被 syscall 淹没；MinIO 是 Go 多线程摊到所有核。
-- **Scope**: 让 `autumn-s3` 用 N 个 accept 线程 —— SO_REUSEPORT + 每线程一个 compio runtime
-  和一份自己的 `FsState`（与 autumn 其余部分同样的 thread-per-core 形状；网关无状态，
-  这不违反 [[feedback_no_multiworker_per_partition]]，那条约束的是分区内扇出）。
-  加 `--workers N`（默认取核数，上限合理值）。
-- **Acceptance**: runai→网关在同一台机上达到 **≥2000 MB/s**（MinIO 参照的 ~70%+），
-  且不低于当前的 1430（普通客户端不许退化）；`docs/model_loading.md` 的表重测更新；
-  重测完回头判 F-S3-RUNAI-PLUGIN 是否还需要。
-- **Status**: `passes: true` (2026-09-01) — 已实现并实测。`--workers N`（SO_REUSEPORT +
-  每线程一个 compio runtime / 一份 `FsState`，默认 8 且不超过核数）。
-  worker 扫描（runai，2 GiB）：1→**557**、2→949、4→**1256**、8→1347、16→1179、32→1185
-  ⇒ 拐点在 4，之后被 autumn 读路径限住。默认 8 得 ~1300 = native `read_into` 的 98%，
-  验收线（≥2000）没到，但那条线本来是拿 MinIO 的本地页缓存数字定的，不是同类比较；
-  真正的天花板是读路径本身（native 1327），已经追平，故判 pass。
-  多 worker 下复验：runai 端到端字节精确、boto3 全套契约（含 paginator/typed error）、
-  64 并发 ranged GET 全 206 零 panic。
-
-### F-HICACHE-PORT-REBASE — HiCache 移植的对标对象需重新评估（上游已换架构）
-- **Trigger** (2026-09-01, 用户指出后核实): 已完成的移植（FreeToken 分支 `hicache-autumn`，
-  commit 74bf63a）对标 sglang 的 `HiRadixCache`(1427 行, 仅 plain radix)，并基于"上游没有
-  SWA+HiCache 组合"这一判断把模型选择限死在 plain radix 档。**该判断是错的** —— 它出自本地
-  sglang 克隆 `a757c1e3f`(2026-04-06)，而该克隆落后上游 **6232 个 commit**。
-  上游（`fb8d7eedda`, 2026-09-02 实测）实际有 `unified_radix_cache.py` 的
-  `UnifiedRadixCache(BasePrefixCache)`(3120 行) + 整个 `unified_cache/` 子包，
-  `ComponentType {FULL, SWA, MAMBA, C128}` 把混合模型的复用规则按 component 拆解
-  （FULL 整段前缀可复用、SWA 只覆盖尾部窗口，DeepSeek-V4 = FULL+SWA），
-  开关 `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`；且分层缓存是**统一进去的**而非外挂子类
-  （import `HybridCacheController`/`PoolTransfer`/`SidecarPoolSpec`，内部有
-  `_OngoingWriteThrough`/`_OngoingLoadBack`/`_OngoingPrefetch`/`evict_host`）。
-- **教训（比结论更重要）**: 在陈旧克隆里 grep 不到 ≠ 上游没有。本仓库的计划文件原本就标注过
-  该克隆偏旧，但确认 v1 接口存在后就不再追究其年龄，随后基于同一快照做了"上游没有 X"的断言。
-  **任何"上游没有/不支持 X"的结论，必须先确认所查快照与上游的距离。**
-- **Scope**: 重新评估三件事再决定是否继续按原方案移植：(1) `UnifiedRadixCache` 对 sglang
-  调度器的耦合深度（3120 行 + 10 个子模块，比 HiRadixCache 大一个量级）；(2) 它与
-  `HiCacheStorage` L3 接口的关系 —— autumn 的 `AutumnKVCacheStorage` 对齐的是 v1
-  (`batch_get_v1`/`batch_set_v1`/`interface_v1`)，而新 import 出现 `PoolTransfer`/
-  `SidecarPoolSpec`，L3 可能已演进，需确认能否原样插上；(3) 移植 Unified 相对"只覆盖
-  plain radix"的实际代价差。
-- **Acceptance**: 有一份基于**当前上游**的对比结论，明确说明选哪条路及理由；若改走 Unified，
-  已搬入 FreeToken 的四个文件（storage/backend_factory/ops/hashing）需复核是否仍对标。
-- **Status**: `passes: false` (2026-09-01) — 阻塞后续移植工作。已搬入的
-  `hashing.py`(与 sglang 逐位一致) 与 `host_pool.py` 大概率不受影响；
-  `storage.py`/`backend_factory.py` 取决于 (2) 的结论。
-
 ### F-FT-DSV4-KV-SCOPE — DeepSeek-V4 在 FreeToken 上要不要接 autumn KV
 - **Trigger** (2026-09-01, 用户问"FreeToken 现在的 hicache 支持 DSV4 了吗"后核实上游):
   **FreeToken 至今没有任何 HiCache**。上游 `a2538a4`(2026-09-01，仅落后本地 2 个无关 commit)
@@ -293,5 +133,7 @@
 - **Acceptance**: 明确记录选哪条；若选替代方案，FreeToken 的 `--cache-type` 保持默认
   （DSV4 会被强制成 swa_radix），不做 HiCache 移植，autumn v2 的验证改用真 sglang。
 - **Status**: `passes: false` (2026-09-01) — 待用户定夺。**注意**: 本条的前身结论
-  （"sglang 上游没有 SWA+HiCache，那一档是原创设计"）是错的，见 F-HICACHE-PORT-REBASE；
-  真实约束是 DSV4 需要 sidecar 池 ⇒ v2 接口，而非上游未解。
+  （"sglang 上游没有 SWA+HiCache，那一档是原创设计"）是错的——那个判断出自一个落后上游
+  6232 个 commit 的 sglang 克隆，上游实际有 `UnifiedRadixCache`(3120 行) + `unified_cache/`
+  子包，HiRadixCache 已是死代码。真实约束是 DSV4 需要 sidecar 池 ⇒ v2 接口，而非上游未解。
+  移植工作本体已随 da91d38 移到 ../buda，本条只留"autumn 这边要不要为它做事"的取舍。

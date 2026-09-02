@@ -1,132 +1,112 @@
-Date: 2026-09-01
-TaskStatus: not_completed
-Task scope: ingest 慢的根因与修复 + graph 改成图数据库 API + 代码注释去中文行话。
-【真引擎结果(Qwen3-8B / 16 GiB / 单张 H200)】
-  vLLM 0.28   本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5/19.0 | 已退役 loader 18.23/18.25
-  SGLang 0.5.10 本地盘 35.7                  | 网关 37.1
-  三条路径贪心解码补全与本地盘**逐 token 相同**。网关 vs loader 差 1.6-4%。
-  SGLang 上 loader 根本注册不了(封闭 LoadFormat 枚举),网关能跑——这就是删它的理由。
-【删除】python/autumn_vllm_loader/ 整包删除;docs/model_loading.md 去掉旧 Recipe C 并把网关
-  重编号为 Recipe C(RECOMMENDED);README/ops.md/fs_unify_design/autumn_fs_lease_plan/
-  autumn_kvcache_plan/kvcache README 与注释里的引用全部改写成不依赖该包的描述。
-【注意:kvcache 里留了一处惰性分支】_identity.py 仍会读 model_loader_extra_config["path"]
-  作为 tenant 指纹来源。那是 loader 的键,现在不会再有人设;**但机制要留着**——它防的是
-  BUG-KVC-TENANT(多个模型共用一个固定 config 目录 ⇒ tenant 撞车),而 Recipe A(materialize)
-  和 Recipe B(FUSE mount)照样能造出那个局面。网关路径下 model= 是 s3://models/<name>,
-  每模型唯一,那个撞车面自然消失。注释已改成不点名已删包。
-【环境坑】SGLang 0.5.10 需要 runai-model-streamer>=0.16(0.15.6 不导出 ObjectStorageModel);
-  共享机器不动系统包,用 `uv pip install --no-deps --target <dir>` + PYTHONPATH 覆盖
-  (带 deps 装会拉进 torch/torchvision 把系统的盖掉 → "operator torchvision::nms does not exist")。
-  sglang.Engine 用 spawn 起子进程,测试脚本必须有 if __name__ == "__main__" 守卫。
-【已知无关噪音】python/autumn_kvcache 全套跑 test_no_hit_dedup.py 3 挂,单跑该文件 6/6 过;
-  HEAD 上同样(stash 实证),是既有跨测试状态污染,本轮未处理。
-Next steps: 跨机重测(loopback 掩盖网络成本)。
-
-Date: 2026-09-01
-TaskStatus: not_completed
-Task scope: 只读 S3 兼容网关 autumn-s3(examples/s3-gateway),把没有 loader 插件位的引擎
-  (SGLang / FreeToken)接上它们内建的 --load-format runai_streamer。
-【为什么做】46ed345 坐实 autumn_vllm_loader 是 vLLM-only:SGLang 的 LoadFormat 是封闭枚举
-  (configs/load_config.py:15) + get_model_loader 硬编码 if 链(model_loader/loader.py:3106),
-  全树无 register_model_loader。但 SGLang 原生带 RUNAI_STREAMER,而 runai 只会说 S3。
-  ⇒ 一个 S3 端点同时喂 vLLM + SGLang,零引擎改动。
-【实现】examples/s3-gateway(bin autumn-s3),~600 行 + 5 单测。只做 runai 真正发的三件事:
-  ListObjectsV2 / ranged GetObject / 整取 GetObject。不验签(忽略 Authorization),
-  只走 path-style。bucket = fs/ 下第一级目录。读穿 autumn-fuse 的 core 层,所以 lane 条带、
-  EN-direct、authz 全部自动继承(是 adapter,不是第二数据面)。
-【一个真 bug,不是 lint】FsState 最初用 Rc<RefCell<>>:每个命名空间操作都在持有 &mut 的情况下
-  await RPC,第二个并发请求就 already-borrowed panic —— 而流式读天然并发,这是常态不是角落。
-  改成异步 mutex,并按 fuse dispatcher 的分法把读拆成 prepare(持锁,只路由)+ execute(无锁,真 I/O),
-  并发 GET 仍然重叠扇出。64 并发 ranged GET 验证:全 206,零 panic。
-【验证】boto3(真 botocore)全套过:list_buckets/list_objects_v2(prefix+delimiter+encoding-type=url)/
-  head_object/get_object/ranged/官方 paginator/typed NoSuchKey+NotImplemented。
-  **真 runai-model-streamer 0.15.6 端到端字节精确**(list → bytes=0-7 头长 → header JSON →
-  各张量 chunk,3 张量全 exact)。边界:206+精确 Content-Range、末段钳位、bytes=-N、
-  416 带 bytes*/size、写回 NotImplemented。
-【A/B 数字(2 GiB shard, loopback)】native read_into 8 线程 1327;裸 HTTP 过网关 1290;
-  普通 HTTP 客户端复刻 CRT 访问模式(257x8MiB ranged GET/每块新连接,16->256 并发) 1430;
-  runai→网关 ~600 (45%);**runai→MinIO 同机同文件同 loopback 2700-2830**。
-【归因(中途自我推翻一次,记录教训)】我先说瓶颈是 aws-c-s3 CRT 客户端(理由:241 连接/259 请求,
-  "每块吃冷拥塞窗口")——**错了,两条都被自己的对照证伪**:①普通客户端按同样的每块新连接模式
-  跑是 1430(比持久连接的 928 还快),所以连接 churn 不是成本;②MinIO 对照决定性——同一个 runai
-  从 MinIO 读 2.8 GB/s,CRT 本身根本不慢。
-  真因:网关服务 CRT 时多烧 2.1x CPU、多发 4.1x io_uring_enter(9608 vs 2329/同样 2 GiB),
-  线程占用 84%。CRT 吸 socket 慢 ⇒ 每个 8 MiB body write 碎成大量部分写 ⇒ **单条 compio
-  线程被 syscall 淹没**;MinIO 是 Go 多线程摊到所有核。
-【已修(同轮)】F-S3-GW-MULTIWORKER:`--workers N`,SO_REUSEPORT + 每线程一个 compio runtime
-  和一份自己的 FsState(默认 8,不超核数)。worker 扫描(runai,2 GiB):1→557、2→949、4→1256、
-  8→1347、16→1179、32→1185,拐点在 4。**默认 8 得 ~1300 = native read_into(1327) 的 98%**。
-  多 worker 下复验:runai 端到端字节精确、boto3 全套契约、64 并发 ranged GET 全 206 零 panic。
-【F-S3-RUNAI-PLUGIN ⇒ WON'T-DO】判据("网关达 native 85% 以上则不做")实测 98%,未触发。
-  拿"冒充 libstreamers3.so + 无版本 C ABI + 再造一个 Python 替身包"换那 2%,负收益。
-【教训】"排除了 A 和 C,所以是 B" 在没有 B 的独立参照时不算证明。MinIO 这个参照实现只花了
-  几分钟,却直接推翻了归因。下次定位第三方组件慢之前,先找一个已知good的对照端。
-【坑(已写 ops.md)】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY:有代理的环境里 boto3 侧 list 正常
-  (boto3 认 NO_PROXY),每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。
-  指纹 = "目录列得好好的,读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
-【ingest 慢的根因与修复（6b3a408）】
-  剖析结论: ingest ~99% 在等待。真集群 0.53s/chunk vs loopback 0.02s/chunk；
-  reconcile 阶段 84s 墙钟 / 1.9s CPU。成本单位是**往返**，不是字节也不是 CPU。
-  已做:
-  - `begin_bulk_index`/`flush_stats` 延迟 `meta/stats`。原本每篇文档 2 次往返写一个计数器，
-    同时它也是 ingest 循环无法并发的原因（单 key 并发 RMW 丢更新）。
-  - 循环拆成顺序 CPU 段（id/embedding/大纲父节点解析，确实有顺序依赖）+ 并发 I/O 段。
-  - bulk 窗口内 memoize centroid 表（index_vector 原本每篇都重读重解一次）。
-  - 剩下的 `for k in keys { get(k).await }` 全部换成 get_many/delete_many：
-    reconcile 的 doc/vptr 遍历、train_centroids 的向量读、两条向量检索路径、
-    index_memory 与 delete_memory 的 posting 回收。
-  顺带挖出一个真 bug: RPC 写路径的 writev 没有按 IOV_MAX 分段，宽批次
-  （1075 iovec / 仅 57KB）被内核按**条数**拒绝(errno 40)，写线程直接退出，
-  对上表现为 "connection closed" / `batch_put op status=1`。已按 IOV_MAX(1024) 分段。
-  代码里那段 instrumentation 当初就是为了证实/证伪 IOV_MAX 假设留的 —— 这次证实了。
-  本地 3 节点验证: 368 chunks ingest 干净，reconcile is_clean（延迟统计与重数一致），
-  lexical/hybrid 检索与大纲均正常。**pod 内复测仍待做**（需先出镜像）。
-
-【graph 改成图数据库 API（7ae8ccb）】
-  用户意见: graph 部分不该局限于 code。核心层本来就是 domain-agnostic 的，
-  问题在 memory-mcp 只暴露了两个写死的边类型，从外面看就是个代码索引。
-  已加 graph_upsert_node/get_node/delete_node/add_edge/delete_edge/neighbors/
-  traverse/nodes（MCP）+ /graph/* 只读 HTTP 路由；callers/callees/members/outline/
-  trace 变成固定边类型+方向的简写。17 个 MCP 工具。
-
-【代码注释里的中文行话已清理】
-  词法腿→lexical leg、向量腿→vector leg、口径→measure 等；中文**测试语料**保留（那是数据）。
-
-Main gaps: (b) SGLang 真起服务加载真模型未跑;(c) vLLM 同(本机无 vLLM);跨机(非 loopback)未测。
-Next steps: 找一台有 vLLM/SGLang 的环境跑 (b)(c);跨机重测 A/B(loopback 掩盖了网络成本)。
-
-Date: 2026-08-27 (b)
+Date: 2026-09-02
 TaskStatus: completed
-Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比较器(user-key 优先)。
-  内部 key 从 `user ++ 0x00 ++ BE(MAX-seq)` 改为 `user ++ BE(MAX-seq)`,排序不再是裸字节序,
-  统一走 `cmp_internal_keys`(先比 user key,再比定宽 8B inverted-seq 后缀)。
-【为什么】旧分隔符只是模拟"先比 user key":对含 0x00 的 user key 失效("a" vs "a\x00b" 反序,
-  "a" 会被 seek_user_key 查不到、扫描顺序颠倒——三个 pre-change 复现测试都实证失败)。
-【比较点枚举方法】三路:①从生产者流向追(key_with_ts/SST decode/WAL replay 的 key 流经处);
-  ②全 crate 文本扫(比较运算符/sort/partition_point/binary_search/BTreeMap/range/min-select);
-  ③Memtable 换 InternalKey newtype 让编译器逼出遗漏。共 13 个比较点全改:Memtable BTreeMap Ord
-  (newtype,不外溢)、MemtableIterator sort+seek、BlockIterator::seek、Async/sync MergeIterator
-  min-select、find_block_for_key、rpc_handlers biggest_key 预滤+mem/SST 两路 merge `mk<=sk`、
-  background 三份 lookup_in_sst* 二分。等值比较/用户键级比较(bloom 两侧都是 user key、
-  compaction 去重、split 扫描、in_range)核实不受影响。builder.rs 本地 parse_user_key(硬编码 9)/
-  parse_seq 删掉统一走 crate::parse_key/parse_ts;TS_SIZE(9) 常量删除只留 TS_BYTES(8);
-  wal_record.rs 无后缀宽度依赖(key 带长度前缀)核实不用动。
-【持久格式后果(无迁移,故意的)】旧 SST/WAL 在新比较器下"查不到已存在的 key"级不可读;
-  dev 集群必须重建。ops.md 加 deploy note;partition-server CLAUDE.md 两节重写(MVCC Key
-  Encoding + Range paging)。
-【顺带落地】比较器使 `K ++ 0x00` 成为精确的"严格在 K 之后"续扫起点(user-key 后继+user-key
-  优先排序):RangeReq.start 文档改契约(WIRE v29 指纹原地刷新 9cb798979a60ed87,注释-only);
-  scan_keys/wipe_agent 改独占续扫删掉 dedupe(有意反转 dd15047——当时比较器还不存在,
-  dedupe 是对的);system_chaos/system_range_split 游标 push(1)/push(0x01)→push(0)。
-【验证】partition-server 212(208+4 新:embedded-zero get/scan/SST 三个 pre-change 实证 FAIL,
-  round-trip/前缀对/版本序在两棵树都过——与任务预期一致 #2 翻转);manager 293/stream 110/
-  rpc 60/client 41/autumn-memory 22 全绿;system_chaos --ignored ×3 过;system_merge 9/9;
-  run_e2e.sh 活集群 e2e 5/5 + scan_boundary 1/1(即新比较器+新续扫 idiom 的真集群验证);
-  clippy 无新告警。
-【已知无关噪音】integration.rs 三个 recovery 测试"同批挂/单跑过"在改动前基线同样挂
-  (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 已于 2026-08-28 根因并修复,见下条。
-Next steps: 无。
+Task scope: 账本整理——把 2026-09-01 的三条重叠条目合并成一条"当前状态"（其中第一条的
+  头部被改成 ingest/graph 而正文仍是 S3 网关，已拆开归位），按规则 12 裁掉 08-28 及更早
+  （约 30 条，靠 git log 与各 crate CLAUDE.md 追溯）。feature_list 删掉 5 条已 pass 的条目
+  + F-HICACHE-PORT-REBASE（用户 2026-09-02 定：那是别的项目的事，移植本体随 da91d38 去了
+  ../buda）。S3 网关跨机重测经用户确认**不需要**，不再列为待办。无代码改动。
 
+【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
+  examples/s3-gateway（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
+  读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：
+    vLLM 0.28    本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5
+    SGLang 0.5.10 本地盘 35.7                   | 网关 37.1
+  三条路径贪心解码补全与本地盘**逐 token 相同**。`--workers`（SO_REUSEPORT，默认 8，
+  拐点 4）修掉单 accept 线程瓶颈后，runai→网关 ~1300 = native `read_into` 的 98%
+  ⇒ F-S3-RUNAI-PLUGIN 判据("网关达 native 85% 以上则不做")未触发，WON'T-DO。
+  `python/autumn_vllm_loader/` 整包已删（57e7e60）：它只对 vLLM 有效，SGLang 的 LoadFormat
+  是封闭枚举、全树无 register_model_loader，网关才是两边都能跑的那条路。
+  FreeToken 没有 loader 抽象层也没有 runai_streamer ⇒ 对它网关无用，FUSE 是唯一路径。
+  注意：`python/autumn_kvcache/_identity.py` 仍读 `model_loader_extra_config["path"]` 当
+  tenant 指纹来源。那是已删 loader 的键，现在不会有人设，但**机制要留着**——它防的是
+  BUG-KVC-TENANT（多模型共用固定 config 目录 ⇒ tenant 撞车），Recipe A/B 照样能造出该局面。
+  【教训】"排除了 A 和 C，所以是 B" 在没有 B 的独立参照时不算证明。MinIO 这个参照实现
+  只花几分钟就推翻了"CRT 客户端慢"的归因（真因是自家单线程 accept）。定位第三方组件慢
+  之前，先起一个 known-good 对照端。
+  【坑（已写 ops.md）】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY：有代理的环境里 boto3 侧
+  list 正常，每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。指纹 =
+  "目录列得好好的，读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
+
+【当前状态 2：线上 v29 已全量重建】
+  用户拍板"数据可以全毁" ⇒ v28→v29 跨了 96a5c01 的 MVCC 比较器改动（旧 SST/WAL 不可读、
+  无迁移，见 docs/ops.md），删 vLLM + 4 个 STS + 6 个 PVC（58GB 逻辑数据）后 deploy.sh 重建。
+  重建暴露 3 个"cluster.sh 早改了、k8s 路径没跟上"的陈旧配置，均已修复：
+    1. deploy.sh --restart 的选择器 `-l 'component!=etcd'`——pod 标的是
+       `app.kubernetes.io/component`，`!=` 匹配不存在的 key 恒为真 ⇒ 实测匹配 18 个 pod
+       （含 etcd、别的负载、已完成的 Job pod），只该匹配 10 个。(cd76db2)
+    2. AUTUMN_BOOTSTRAP_PRESPLIT=32 切的是 RAW keyspace，namespace-blind ⇒ `{ns}/` 布局下
+       **一直什么也没切**。overlay 去掉该值；entrypoint 改成拒绝而非静默忽略。(3fb2585)
+    3. bootstrap Job 没挂 autumn-authz 却指了 AUTUMN_ADMIN_TOKEN_FILE；补挂后仍失败，因为
+       `--admin-token-file` 是 GLOBAL flag，被加在子命令之后会被丢弃。(3fb2585 + 9c23776)
+  运维坑：`kubectl delete sts` / `delete pvc` 被 auto-mode 分类器拦，需用户用 `!` 跑；
+  delete deploy / delete job / delete pod / apply 都放行。
+  **授权姿态的实测事实**：manager.rs 未给 --auth-protected-prefix 时编译期默认**只保护
+  `mem/`**。k8s ConfigMap 没设该变量 ⇒ 本集群 `fs/` 与 `kvc/` 数据面 authz **不生效**，
+  FUSE 挂载与 kvcache 连接器都不需要凭据。（cluster.sh 里"有 signing key 就保护一切"的
+  注释与 binary 实际默认不符，注释陈旧。）
+
+【当前状态 3：mountPropagation 在本集群不生效 ⇒ FUSE 只能单容器】
+  实测：特权 sidecar 里 `grep -c "shared:" /proc/self/mountinfo` = **0**，FUSE 挂载
+  PROPAGATION=private、父挂载是容器根 overlay。Bidirectional/HostToContainer 被 API server
+  接受但**节点侧没兑现**（kubelet 未配 rshared）。改成**单容器**（autumn-fuse 后台进程 +
+  应用同容器，同一 mount namespace）后成功，代价是整个容器 privileged。
+  ⇒ docs/ops.md 里那份 sidecar manifest 与本集群不符，需改写成单容器形态（待办）。
+  与之相关：v29 镜像里确实有 `autumn-fuse`，`dd iflag=direct` 4K/8M 两档在挂载点上都过
+  ⇒ FTW reader 的 O_DIRECT 快路可用，不会踩 MAP_SHARED/ENODEV 的 mmap 回退。
+  仍保留的约束：FUSE 上禁用 `--expert-load parallel`（无回退的 O_DIRECT，只捕获
+  NotImplementedError）。
+
+【当前状态 4：memory-mcp / autumn-memory —— ingest 提速 + graph API】
+  ingest ~99% 在等待，成本单位是**往返**不是字节/CPU（真集群 0.53s/chunk vs loopback
+  0.02s/chunk）。已做：`begin_bulk_index`/`flush_stats` 延迟 `meta/stats`（原本每篇 2 次
+  往返写一个计数器，也正是 ingest 循环无法并发的原因——单 key 并发 RMW 丢更新）；循环拆成
+  顺序 CPU 段 + 并发 I/O 段；bulk 窗口内 memoize centroid 表；所有
+  `for k in keys { get(k).await }` 换成 get_many/delete_many。(6b3a408)
+  BM25 倒排原本**逐词项串行写**，CJK unigram 分词下一个 ~1.5KB 中文 chunk 有几百个独立字
+  ⇒ 每 chunk 几百次串行往返，5164 chunk × 0.53s ≈ 45 分钟，表现为"挂死"。已改批量。(cda9171)
+  顺带挖出一个真 bug：RPC 写路径的 writev 没按 IOV_MAX 分段，宽批次（1075 iovec / 仅 57KB）
+  被内核按**条数**拒绝(errno 40)，写线程直接退出，对上表现为 "connection closed" /
+  `batch_put op status=1`。已按 IOV_MAX(1024) 分段。
+  graph 层改成通用图数据库 API（不再局限于代码索引）：graph_upsert_node/get_node/
+  delete_node/add_edge/delete_edge/neighbors/traverse/nodes + `/graph/*` 只读 HTTP 路由；
+  callers/callees/members/outline/trace 退化成固定边类型+方向的简写。17 个 MCP 工具。(7ae8ccb)
+  本地 3 节点验证：368 chunks ingest 干净、reconcile is_clean、lexical/hybrid 与大纲正常。
+  **pod 内复测仍待做**（需先出镜像；日志已按阶段打耗时 + ms/chunk，据此定 startupProbe 预算）。
+
+【当前状态 5：kvcache v2 多池接口已实现但未测】
+  efeea3c 实现 sglang HiCacheStorage 的 v2 多池接口（SWA / Mamba / DSA indexer / MTP draft
+  等 sidecar pool）。KV 键与 v1 逐字节相同（`full_key(tenant, hash, pool)` 的 pool 段本就
+  独立，KV 段就是 "kv"）⇒ 加法，不是迁移。存在性探测把 KV 键重新 scope 进各池的段
+  （transfer.keys 只贡献长度），折叠**取窄**（sidecar 缺页则缩短可用前缀），探测出错一律
+  算 miss；页视图按**拥有该索引的池**解析（解错池会静默读到错误字节，形状一样）。
+  v2 类型独立 import 且容忍缺失，老 sglang 仍走 v1。**本机没有够新的 sglang，未跑过。**
+
+【项目边界（用户拍板）】FreeToken + 其上的 MCP 部署是 autumn 的**用户**，已拆出到
+  github.com/thesues/buda：Dockerfile.freetoken + k8s/{freetoken,upload-model-minimax,
+  memory-mcp}.yaml。autumn-rs 保留集群本体、all-roles 镜像、autumn-fuse、memory-mcp 源码。
+  判据 = "这个负载不存在了，这东西还在吗"。后果：CP 流水线 freetoken-autumn 要改指 buda 仓库，
+  且 AUTUMN_IMAGE 不能再用 ${SCM_COMMIT_ID}（两仓 commit 空间不重合），WIRE 锁步退回手动维护。
+
+【规则：任何"上游没有 X"的结论，先确认所查快照与上游的距离】三次栽在这上面：
+  ① sglang——基于落后 6232 commit 的克隆断言"没有 SWA+HiCache"，错（上游 UnifiedRadixCache
+  3120 行 + unified_cache/ 子包，HiRadixCache 已是死代码）；② FreeToken 无 runai_streamer；
+  ③ FreeToken 至今**完全没有分层缓存**（上游 a2538a4 只有一行 TODO 注释）。
+
+【环境坑（供后续会话直接用）】
+  - SGLang 0.5.10 需要 runai-model-streamer>=0.16（0.15.6 不导出 ObjectStorageModel）；
+    共享机器不动系统包，用 `uv pip install --no-deps --target <dir>` + PYTHONPATH 覆盖
+    （带 deps 装会拉进 torch/torchvision 盖掉系统的 → "operator torchvision::nms does not exist"）。
+  - sglang.Engine 用 spawn 起子进程，测试脚本必须有 `if __name__ == "__main__"` 守卫。
+  - python/autumn_kvcache 全套跑 test_no_hit_dedup.py 3 挂、单跑该文件 6/6 过；HEAD 上同样
+    （stash 实证），是既有跨测试状态污染，未处理。
+
+Next steps:
+  1. 出新镜像后在 pod 内复测 ingest，据此定 memory-mcp 的 startupProbe 预算。
+  2. docs/ops.md 的 FUSE sidecar manifest 改写成单容器形态（mountPropagation 本集群不兑现）。
+  3. F-IMG-FUSE-MCP 残余验收：镜像内 `memory-mcp --help`、杀容器重拉不因残留挂载点 EBUSY。
+  4. kvcache v2 多池接口找一个够新的 sglang 实测（本机 sglang 0.5.10 太旧）。
+  5. CP 流水线改指 buda 仓库（FreeToken 部署本身已不属本仓库）。
+─────────────────────────────────────────────────────────────────
 Date: 2026-08-30
 TaskStatus: completed
 Task scope: chaos 多轮 soak(10 轮:5 随机全动作 + 5 定向组合)。结果 8 过 2 挂,
@@ -179,1157 +159,37 @@ Task scope: 换 seed 重跑 chaos。结果:抓到并修掉一个 liveness wedge 
   ② EcConvert nemesis 需要先有 sealed extent,单独跑 ec 动作集等于什么都没测。
 Next steps: 无待办。
 ─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (g)
+Date: 2026-08-27 (b)
 TaskStatus: completed
-Task scope: op 可观测性收口——按用户定调:split/merge/rebalance 一步操作【不做进度、结果进日志】;
-  ec_convert / recovery【必须有进度】。
-【单步 op 的结果进 leader 日志 (695cb55)】核实发现:它们的终态早就进了 ledger / audit / etcd
-  历史,但 leader 的 tracing 日志里【一个字都没有】——运维 tail manager.log 时看不到 split 成没成。
-  补 INFO(成功)/ WARN(失败带原因)。对无进度的 kind,这条日志就是它们的全部叙事。
-【ec/recovery 进度 (695cb55)】DfResp 加 op_progress: Vec<ExtentOpProgress>,live 样本搭在
-  终态本来就走的那趟 df 上,与 PS 把 compact/gc 搭在 load 心跳上同构。
-  【按 extent_id 键,不是 op_id】——节点根本不知道 manager 的 op id,而这两类在 ledger 里都是
-  extent-scoped,所以由 manager 解析(update_progress_by_extent)。
-  EC 每条带采样一次(分母=本节点整个 shard);recovery 每拷贝块采样一次(分母=sealed_length),
-  经回调穿进 stream_one_source(它是静态方法,拿不到 &self)。
-  【清理与 inflight 标记同生命周期】三处 remove 全部跟着 clear_op_progress——留下陈旧样本会让
-  ops status 显示一个"卡在 60%"的修复,比不显示更糟。update_progress_by_extent 还拒绝写非
-  RUNNING 条目,所以与完成同一趟 df 到达的样本不会复活已关闭的记录。
-【顺带】op_kind_name 从 CLI 移到 manager_rpc 常量旁(manager 打日志、CLI 渲染,标签飘了纯属
-  给运维添乱);ops_contract.sh 加自有端口段的前置清理(上一轮遗留 etcd 占端口,症状是
-  "address already in use" 却指向不属于本次运行的进程——仓库里踩过的老坑)。
-【进度覆盖终态】8 个 kind:gc/forcegc/compact(PS 心跳)+ ec-convert/recovery(EN df)有百分比;
-  split/merge/rebalance 按用户定调【故意不做】,结果在 leader 日志 + audit + ops history。
-【验证】WIRE v29 原地刷新 86490609d727073d → f8b58703a0162c62;lib rpc 60/stream 116/
-  manager 297/ps 212/common 15/client 41;stream 16 个测试二进制;7 个 manager 集成二进制;
-  system_chaos 7/7;ops contract 绿;clippy 干净。
-Next steps: 无待办。op 可观测性三层全部落地。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (f)
-TaskStatus: not_completed
-Task scope: op 可观测性三层——补齐进度上报与 dashboard 消费面。
-【核实修正】上一轮我说"MSG_OP_HISTORY 零消费方"是错的:CLI 其实早就接好了
-  (autumn-op ops history --kind/--since/--limit → SDK op_history → MSG_OP_HISTORY)。
-  搜 MSG_OP_HISTORY 搜不到是因为 CLI 走的是 SDK 方法名。第三层真正缺的只有 dashboard。
-【已完成 (0ca8a13)】compact 进度上报:AsyncMergeIterator::block_progress 汇总各输入迭代器的
-  block_idx / reader.block_count(),块是 merge 真正推进的单位、两项都已在内存里,零 I/O。
-  每 4096 条采样一次,且【首条即报】——首个样本是 (0,total),那才是告诉操作员活有多大的那个数。
-  另修:run_gc 把 kind 硬编码成 OP_KIND_GC,forcegc 的进度一直报在错的 kind 下。
-  两处 Sel::CompactTimeout(过期/周期触发)传 op_id=0(untracked)。
-【已完成 (1e15dc4)】dashboard /api/ops + 面板:live(leader 内存 ledger,唯一有进度的地方)
-  与 history(etcd 日志,唯一留住失败原因的地方)分开返回,都经 autumn-op 走 RPC 问 leader。
-  【顺带修掉一个 fail-open】read_op_log 在无 etcd / 列举失败时都静默返回空 Vec,handler 还包
-  CODE_OK ⇒ memory-only manager 对"有没有失败"这个问题回答"没有 op"。改为返回原因,CLI 也
-  改成 fail-loud(原先打印 "(no ops)")。这个洞正是我第一次跑 contract 测试【空转通过】暴露的。
-  render_ops 的 JSON 还漏了 progress_done/progress_total/started_at(文本渲染有、JSON 没有)。
-  contract 测试 examples/dashboard/tests/ops_contract.sh:隔离集群【带 etcd】——故意要求 etcd,
-  因为对 memory-only manager 跑 history 恒空、字段断言会空转通过。
-【未完成:两类 op 仍无进度】
-  1) split / merge:manager 只发一条 RPC(MSG_SPLIT_PART)、活是 PS 干的,所以进度得从 PS 侧
-     经心跳报回来,不是 manager 侧能补的。
-  2) ec / recovery:EN 执行,而 DfResp 目前没有进度通道 —— 要加字段(wire 变更)。
-     两者形状相同,一个字段可同时覆盖。
-【未测】AsyncMergeIterator::block_progress 没有单测:构造 AsyncTableIterator 需要
-  Rc<StreamClient>(async + 要连 manager),本 crate 内没有便宜的接缝;算术是三行、编译期可查,
-  周边压缩路径由既有集成测试覆盖。不编造只跑空 vec 的测试。
-Next steps: 上面两类进度(ec/recovery 需要 DfResp 加字段,需确认 wire 变更)。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (e)
-TaskStatus: completed
-Task scope: EC P1-3 的最后残留——把 payload location 持久化进 .meta,使 EC staging 封存跨重启存活。
-【为什么能零迁移】.meta V2 是定长 52 字节,其中 [41..44] 是保留填充、恒为 0;而
-  PayloadLocation::InDat == 0 且文档早已写明它是"该字段出现之前所有 extent 的默认值"。
-  于是新字段占 buf[41] —— 同大小、同 magic、同 CRC 覆盖范围(crc 覆盖 [0..48]),老记录读出来
-  就是 InDat。符合仓库规则"要么同布局要么带迁移"的前一种,不需要 reset、不需要版本位。
-【接线】① write_meta_locked 写 entry.payload_location;② parse_meta 读 buf[41](V0/V1 恒 InDat);
-  ③ ExtentEntry 加 AtomicU8 字段,四处构造点填好;④ discover_shard_files 收尾统一扫一遍,
-  凡 InShardFile 就 seal_ec_staging —— 一处覆盖 .dat 与 shard-only 两条加载路径;
-  ⑤ apply_placements 的 InShardFile arm 落地时 store + save_meta,【只在状态翻转时写】
-  (该判决每轮 reconcile 都会重复,每次刷盘纯属浪费),且【隔离态不写】(save_meta 会静默清掉
-  quarantine,违反 fail-closed 契约)。
-【测试】the_ec_staging_seal_survives_a_restart:staged→flip→【重启】→僵尸 nonce 重放,
-  断言先验磁盘字节再验拒绝码。非空转已验:让 parse_meta 忽略 buf[41] 后,重启后线上 shard
-  确实被覆盖成 ZOMBIE-OVERWRITE-BYTES。另加 meta 编解码测试:V2 往返、老记录读作 InDat、
-  篡改该字节被 CRC 抓住。
-【验证】stream lib 115(113+2)、manager 296、rpc 60、ps 212、common 15、client 41;
-  stream 16 个测试二进制;ec_integration/ec_failover/offline_reconcile/system_extent_recovery/
-  physical_deletion/e2e_lifecycle/update_stream_ec 全绿;system_chaos 7/7;clippy 干净。
-  stream CLAUDE.md 的 .meta 布局表原先只画到 V1(早已过时),按现状重写为 V2。
-Next steps: 无待办。EC 评审全部条目至此关闭。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (d)
-TaskStatus: completed
-Task scope: 评审剩余 11 项全部处理完毕(EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、
-  recovery F3/F5/F6)。本轮完成最后两项:delete F4 正解 + delete F3(用户批准 wire 变更)。
-【delete F4 正解 (3b66df9)】上一次在 reconcile 端加守卫被撤回;这次改在【源头】:manager 用
-  RAII guard 把正在分配的 extent id 放进 allocating_extents,reconcile 对这些 id 不下判决。
-  orphan 清理时序完全不变——非分配中的残留仍然一轮清完(offline_reconcile 钉住这点)。
-【delete F3 (3b66df9)】DeleteExtentReq 加 node_uuid,EN 在动任何东西前校验;空 uuid=未指定、
-  跳过(与 classify_df_echo 同约定)。身份必须随重试一起持久化,所以
-  pending_addrs: Vec<String> → pending_targets: Vec<DeleteTarget>{addr,node_uuid},
-  内存态与 etcd 持久态都改。
-  【发现的隐患(已加双向交叉引用,未重构)】manager_rpc.rs 有 19 个 Ext* 结构是
-  extent_rpc.rs 的【镜像】——manager 用前者编码、EN 用后者解码,只改一边就是静默 rkyv 乱解码,
-  而两个文件哈希进【同一个】指纹所以指纹抓不到。本次两边都改了,并让 round-trip 测试用真结构
-  解码镜像产生的字节。WIRE v29 原地刷新 9cb798979a60ed87 → 2137fdbb94408a98。
-【教训】cargo build --workspace 不编译 test target;改 wire 结构必须用 --all-targets,
-  否则 stream 的测试 helper 编译失败要到跑测试时才发现(本轮踩到)。
-【唯一遗留:EC P1-3 的重启窗口】ec_stage_nonce 是内存态,目标节点重启后封存丢失,直到下一轮
-  reconcile 重新封存(≤5 分钟)。彻底关闭需要节点侧持久记录 payload location,而 .meta 没有
-  该字段 ⇒ 持久格式变更。需用户决策后再做。
-Next steps: 无待办。可选:EC P1-3 残留(.meta 加 payload location 字段,需决策)。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (c)
-TaskStatus: not_completed
-Task scope: EC P1-3 复现并修复;delete F4 撤回。
-【EC P1-3 已复现并修复 (63e104d)】复现是确定性的——状态机 bug,不需要并发:
-  nonce 100 staged shard0 → 投 InShardFile placement → nonce 99 重放 stripe。
-  修复前节点回 CODE_OK,且磁盘上是僵尸的字节。测试先断言磁盘内容(那才是危害)再断言拒绝码。
-  根因:flip 是唯一提交点且【无 rename】,staging 文件就是线上 shard;而 apply_placements 在
-  InShardFile 判决时把 nonce floor【删掉】。改为封存(EC_STAGING_SEALED),且封存压过 nonce-0
-  透传;staged_here 排除 SEALED 以免挡住清理;extent 被遗忘的 5 处同步清 claim。
-  【残留(写进代码注释)】ec_stage_nonce 是内存态,本节点重启会重开窗口直到下一轮 reconcile
-  重新封存。要彻底关闭需要节点侧【持久】记录 payload location——.meta 没有该字段,属持久格式
-  变更(停机类),需用户决策。
-【delete F4 已撤回 (40c8778 → 63e104d)】它弄挂了
-  offline_reconcile::startup_reconcile_unlinks_orphans,而我提交前【只跑了 lib 测试】。
-  教训:改 reconcile/recovery 行为必须跑对应的集成测试二进制,lib 覆盖不到。
-  两半在推敲后都站不住:
-  ① 三轮宽限为了关一个 ~10s 窗口(review 自己说自愈、无 acked 数据丢失),把【全部】 orphan
-     残留从 5 分钟拖到 15 分钟。
-  ② 失忆守卫("extent 表空而节点报告非空")与"全新集群+一个游离文件"信号完全相同——那正是
-     该测试的构造;而它想保护的 memory-mode 重启场景里,数据本来就已不可读(review 原文)。
-  真正的修法在【源头】:alloc 路径把正在分配的 extent id 公布出来,让 reconcile 过滤器跳过。
-  这样 orphan 清理时序完全不变。下一轮做这个。
-Next steps:
-  1) delete F4 正解:alloc 侧公布 in-progress extent id(不改 orphan 清理时序)。
-  2) 需用户决策两项:(a) delete F3 要在 wire 加集群/节点身份 ⇒ 扰动 WIRE_FINGERPRINT、停机升级;
-     (b) EC P1-3 残留要在 .meta 加 payload location 字段 ⇒ 持久格式变更。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28 (b)
-TaskStatus: not_completed
-Task scope: 处理评审剩余项 EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
-【三份 review 原文已抢救】它们只存在于会话记录里(台账只有标签)。从 transcript 提取,存
-  scratchpad/review_{errors,delete,recovery}.md。下次直接读这三个文件,别再重新评审。
-【已完成 6 项 + 核实 3 项其实早已修完】
-  - errors F3/F4/F5:核实【已修】,台账 Next steps 落后。未知子命令已具名报错;gc 单趟解析拒绝
-    未知 token、merge/compact/rebalance 均拒尾随;ops.md 陈旧 tenant-first 段落已重写(仅存
-    一处明写"已于 2026-07-19 退役")。
-  - delete F5 (87498bd):reconcile 陈旧 shard unlink 吞错后照样 forget_shard_file + 打成功日志
-    → EIO 时文件还在但 df 不再计数、holds_payload 变 false(卡住后续 .dat 回收)。对齐下方 .dat
-    分支既有正确写法。
-  - recovery F6 (87498bd):is_transient_conflict 裸子串 vs 四个生产者的裸字面量,无共享源无配对
-    测试。新增 autumn_common::alloc_conflict 同时持有【消息构造函数】和分类器(比共享常量更强:
-    调用点没有改写措辞的机会),builders_pair_with_classifier 跑真实 builder 过真实分类器。
-  - delete F4 (40c8778):case-1 garbage(manager 没有该 extent 记录)立即判死,既无宽限也够不到
-    inflight 守卫。两个可达输入:①新分配 extent 的文件先于 etcd 提交存在于 EN(place_extents_
-    with_fallback 在前)②memory-mode manager 重启后忘记所有 extent ⇒ 全队列立即擦盘。修=case-1
-    同享三轮宽限 + 【失忆守卫】(extents 表空而节点报告非空 ⇒ 不下任何 garbage,WARN)。
-  - recovery F5 (ce50e3e):任一候选被限流就整轮返回 Ok ⇒ record_success 删除退避条目。mass fence
-    时失败槽 300s 退避每 tick 被重置为 2s。修=返回 DispatchOutcome::{Dispatched,Deferred},且
-    只有【没有任何候选越过限流器】(attempted 标志)才算 Deferred;Deferred 不动退避账目。
-  - recovery F3 (e1cbcda):30 分钟 TTL 翻 UNKNOWN 后 reconcile_outcome 永久拒收 PS 每 5s 重传的
-    权威结果 ⇒ 真实 SUCCEEDED/FAILED 及原因永不进 etcd audit。UNKNOWN 是"跟丢了"不是判决,
-    改为可被终态报告覆盖;真终态仍不可被覆盖(审计恰好一次的契约不变)。
-  - EC P1-4 (0dabbf8):coordinator 写自己 shard 0 走 write_shard_stripe_local,绕过 write_shard
-    里的 nonce 登记 ⇒ 它自己的节点上 ec_stage_nonce 无记录。后果不止排序:reconcile 的
-    staged_here 守卫在该节点恒 false,陈旧 InDat 判决会删掉正在写的 shard。抽 claim_ec_staging
-    两路共用。
-【剩余 2 项,都需要先决策再动手,故 not_completed】
-  1) EC P1-3(已 flip 的 shard 可被僵尸 coordinator 覆写):根因已定——reconcile 收到
-     InShardFile 判决时把 nonce floor【删除】,而 flip 后 staging 文件【就是】线上 shard 文件
-     (无 rename,flip 是唯一提交点),此后任何迟到 WriteShard 都无 floor 可挡。
-     难点在【持久信号】:把 floor 改成封存值只能挡住活集群窗口,DashMap 重启即失;而"持有
-     shard 且无 .dat"这个可从磁盘推出的信号对【纯 parity 目标】不成立。
-     按仓库规则(机制/并发 bug 先复现),下一轮应先构造复现再定持久化方案,别在 EC 路径凭推断动刀。
-  2) delete F3(DeleteExtentReq 只有 extent_id,无集群/节点身份;持久重试队列永不过期 ⇒ 集群 A
-     拆除后其重试队列可删掉同址新起的集群 B 的活 extent):修复需要在 wire 上加 cluster_id 或
-     目标 node_uuid 回显 ⇒ 扰动 WIRE_FINGERPRINT、需要版本决策(停机全量升级)。
-     这是用户该拍板的事,不自行推进。
-Next steps: 上面两项,按顺序:先给 EC P1-3 做复现,再就 delete F3 的 wire 变更请示。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-28
-TaskStatus: completed
-Task scope: SST BlockCache 由进程全局改为 PartitionServer 实例持有,修掉 integration.rs
-  三个 recovery 测试的跨集群污染。
-【症状】cargo test -p autumn-manager --test integration 稳定 10 passed / 3 failed
-  (recovery_replays_log_stream 等),replay 读回空值。形状酷似 on-disk 排序损坏,
-  在验 96a5c01(内部 key 比较器)时已经差点被误判成格式回归。
-【定位过程,含两个被证伪的假设】
-  ① "并发竞态" —— 证伪:--test-threads=1 同样挂(2/2);给 13 个测试加互斥锁串行化也无效。
-  ② "start_manager 少清一次缓存" —— 证伪:照 support/mod.rs 补上 clear 后依然挂。
-  真因:harness 从不关闭集群(drop(ps) 只丢客户端,PS/EN/manager 线程 detached 永生),
-  测试 B 清完缓存后,测试 A 仍活着的 PS 继续往全局缓存塞它的 extent 6 —— 清一次在结构上
-  就拦不住。判据:把 BlockCache::get 改成恒返回 None,3/3 全绿(启用则稳定挂,确定性因果)。
-【修法】删掉 SST_BLOCK_CACHE / global_block_cache() / clear_global_block_cache(),
-  cache 变成 PartitionServer 字段,沿 metrics_arc 既有那条路传进 partition_thread_main
-  → PartitionData 字段。三个取值点改从手上已有的 part.borrow() 取;AsyncTableIterator::new
-  / sst_user_key_versions / range_scan_sst_merge 各加一个 cache 参数(cache 走的就是
-  stream_client 现成的传递链,没开新路径)。BlockCache::clear 随之退役。
-【为什么生产零影响】键 (extent_id, offset) 只在单个集群内唯一;一个 PS 只服务一个集群,
-  一个进程只有一个 PS ⇒ 全局与 per-PS 在生产上是同一个 cache、同样 512MB、同样命中行为。
-  改动把"进程里恰好只有一个集群"这个不成文假设变成结构保证。
-【验证】integration 连跑 3 次 13/13(单次绿不算数);删掉 clear 后原本靠它保护的
-  system_split_gallery_originals 3/3、system_correlated_2of3_loss 2/2 仍过;
-  lib 测试 partition-server 212 / manager 293 / stream 110 / rpc 60 / client 41 全绿;
-  clippy 无新告警。partition-server CLAUDE.md 对应两处已改。
+Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比较器(user-key 优先)。
+  内部 key 从 `user ++ 0x00 ++ BE(MAX-seq)` 改为 `user ++ BE(MAX-seq)`,排序不再是裸字节序,
+  统一走 `cmp_internal_keys`(先比 user key,再比定宽 8B inverted-seq 后缀)。
+【为什么】旧分隔符只是模拟"先比 user key":对含 0x00 的 user key 失效("a" vs "a\x00b" 反序,
+  "a" 会被 seek_user_key 查不到、扫描顺序颠倒——三个 pre-change 复现测试都实证失败)。
+【比较点枚举方法】三路:①从生产者流向追(key_with_ts/SST decode/WAL replay 的 key 流经处);
+  ②全 crate 文本扫(比较运算符/sort/partition_point/binary_search/BTreeMap/range/min-select);
+  ③Memtable 换 InternalKey newtype 让编译器逼出遗漏。共 13 个比较点全改:Memtable BTreeMap Ord
+  (newtype,不外溢)、MemtableIterator sort+seek、BlockIterator::seek、Async/sync MergeIterator
+  min-select、find_block_for_key、rpc_handlers biggest_key 预滤+mem/SST 两路 merge `mk<=sk`、
+  background 三份 lookup_in_sst* 二分。等值比较/用户键级比较(bloom 两侧都是 user key、
+  compaction 去重、split 扫描、in_range)核实不受影响。builder.rs 本地 parse_user_key(硬编码 9)/
+  parse_seq 删掉统一走 crate::parse_key/parse_ts;TS_SIZE(9) 常量删除只留 TS_BYTES(8);
+  wal_record.rs 无后缀宽度依赖(key 带长度前缀)核实不用动。
+【持久格式后果(无迁移,故意的)】旧 SST/WAL 在新比较器下"查不到已存在的 key"级不可读;
+  dev 集群必须重建。ops.md 加 deploy note;partition-server CLAUDE.md 两节重写(MVCC Key
+  Encoding + Range paging)。
+【顺带落地】比较器使 `K ++ 0x00` 成为精确的"严格在 K 之后"续扫起点(user-key 后继+user-key
+  优先排序):RangeReq.start 文档改契约(WIRE v29 指纹原地刷新 9cb798979a60ed87,注释-only);
+  scan_keys/wipe_agent 改独占续扫删掉 dedupe(有意反转 dd15047——当时比较器还不存在,
+  dedupe 是对的);system_chaos/system_range_split 游标 push(1)/push(0x01)→push(0)。
+【验证】partition-server 212(208+4 新:embedded-zero get/scan/SST 三个 pre-change 实证 FAIL,
+  round-trip/前缀对/版本序在两棵树都过——与任务预期一致 #2 翻转);manager 293/stream 110/
+  rpc 60/client 41/autumn-memory 22 全绿;system_chaos --ignored ×3 过;system_merge 9/9;
+  run_e2e.sh 活集群 e2e 5/5 + scan_boundary 1/1(即新比较器+新续扫 idiom 的真集群验证);
+  clippy 无新告警。
+【已知无关噪音】integration.rs 三个 recovery 测试"同批挂/单跑过"在改动前基线同样挂
+  (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 根因是进程全局 SST BlockCache 的跨集群污染,已修 (20e6a27)。
 Next steps: 无。
 
-Date: 2026-08-27
-TaskStatus: completed
-Task scope: memory-mcp —— codebase-memory 例子泛化成"一个 MCP server,两种 ingester(代码/文档)",
-  按用户判断合并而非另起第二个例子;不动 hermes-autumn-memory(只加 scope 说明行)。
-【做了什么】
-  1. 重命名 examples/codebase-memory → examples/memory-mcp(crate/binary/workspace/README/
-     `claude mcp add autumn-memory -- cargo run -q -p memory-mcp …`;默认 tenant codebase→memory,
-     cluster.sh authz spec 改 memory.cred/mem/memory/;ops.md、autumn_memory_plan、
-     key_namespace_split_design、autumn-memory CLAUDE.md 交叉引用全刷)。
-  2. 新增 src/docs.rs:markdown/纯文本 ingester —— 按 ATX heading 切 section(fence 内 # 屏蔽),
-     超 ~2.8KB 按段落再切+一段重叠;chunk id = "<relpath>#L<start>-L<end>"(与代码 id "::" 不撞);
-     索引文本前置 "file › heading › …" breadcrumb;heading 层级落成 Document→Section CONTAINS
-     outline(同一套图走法)。4 个单测(层级/fence/切分重叠/无 heading 纯文本)。
-  3. MCP 面从 5 tool → 9:新增 ingest_documents(运行时服务端路径 ingest)/ search_docs /
-     list_documents / document_outline;search_code 与 search_docs 用 meta.kind 做 corpus 过滤
-     (超采 k*3+8 再截),互不漏;/search 加 corpus=code|docs|all;get_symbol 两种 id 通吃。
-  4. 顺手修了一个真 bug(deterministic 复现后才动手):PS 把 range start 当【含】user-key 下界,
-     而 "last_key+\0" 续扫惯用法排不掉边界 key(MVCC 内部编码 user++0x00++inv-seq 让 K+"\0"@tsMAX
-     排在 K 自己版本之前)⇒ 每页边界重复 1 个 key ⇒ >page_limit 语料 reconcile() docs 虚高、
-     is_clean 误报 false。修在 autumn-memory scan_keys(+例子 wipe_agent)加边界去重;
-     PS 侧契约问题【没动】(热读路径,留给 owner 决定)。回归测试 tests/scan_boundary.rs
-     (live-cluster,#[ignore] 门同 e2e.rs)。
-  5. ops.md:替换掉整段已失效的 Phase-2 Python 验证(python memory glue 在 5a07a60 已删,
-     文档还在教人跑不存在的脚本)→ 换成 memory-mcp 双语料+MCP stdio 实测步骤。
-【验证(全部真集群实跑)】cluster.sh start 3;--root crates/autumn-memory --docs docs →
-  stats {"docs":555,"edges":893,"is_clean":true,"symbols":574}(修 bug 前 docs=556/is_clean=false);
-  docs 检索带 file+heading path+行号(ops.md#L1127-L1179 [ …> Turnkey dev cluster with authz]);
-  corpus=code 不漏 prose(doc 词查询 → NO HITS);MCP stdio 全链:initialize/9 tools/search_docs/
-  ingest_documents(运行时加 crates/manager/CLAUDE.md → 45 chunks 立即可检索)/list_documents/
-  document_outline(heading 树带 depth)/search_code;--reset 全清重建 exact。
-  门:autumn-memory --lib 22 绿 + e2e --ignored 5/5 绿 + scan_boundary 绿;memory-mcp 4 单测绿;
-  clippy 两 crate 0 新告警。
-【坑】pkill -f 带路径又自杀了一次(exit 144,用 pkill -x);旧 README 记载的 /graph 路由与
-  Graph tab 实际不存在(新 README 已按现状写)。
-Next steps: 无 —— 功能闭环。PS range 含边界 start 的契约问题(见上 4)可另立条目定夺。
 
-Date: 2026-08-26 (b)
-TaskStatus: completed
-Task scope: F1+F4 已 ack 写丢失(split 右孩子 wedge / 静默旧值)——根因、修复、验证。上一轮的
-  "转写入侧"判断正确,排除记录全部成立(读侧确实无罪)。
-【根因(trace 实证,非推断)】fence-drain 的 MSG_ROLL_TAILS 对【活分区】的 tail 用裸 probe seal:
-  seal_and_roll_tail = alloc_new_extent(None,0)——该原语自己的注释写明只服务"worker 尚未
-  spawn"的 recovery self-heal;handle_roll_tails 却对 live 分区的 log/meta 直接调用,row 走
-  barrier(drain 了 P-sst 在飞但同样不动 worker)。它不 quiesce worker、不 ResetTail,而 EN
-  【永远不知道 manager seal】(seal 只写 manager 元数据;EN 靠 eversion mismatch 惰性得知,
-  stale writer 的 cached eversion 恰好等于 EN 本地值 ⇒ 永不触发)。于是 manager 把
-  sealed_length 冻在 L0,活 writer 继续往同一 extent append 且【继续 ACK 客户端】——此后每个
-  acked 字节都悬在 sealed_length 之上:
-  - checkpoint/SST 落进或引用 ghost 区 ⇒ CoW split 右孩子永久打不开
-    stale_vp_offset_past_sealed_length(F1;两个子形态都复现:log 版=WAL replay
-    length=67108864 那条,row 版="read SST from rowStream"那条);
-  - 否则 committed-clamp replay 在 seal 处干净停下,acked 尾巴无声消失(F4,无任何
-    fail-loud——每层各自"正确")。
-  q*-only 不对称的结构性解释:split 成功路径左孩子 in-place narrow【不重放、memtable 全保留】
-  ⇒ b* 永不受害;右孩子从被剪的流重建 ⇒ 只有右半 keyspace 暴露。
-【复现】动作集收窄为 split,fence,latency,kill,flush ⇒ 39 次预修复运行 7 次 F1(≈18%,全动作集
-  原为 1/25);每次命中 trace 链一致:roll_trace(活 tail 被 roll)→ alloc-seal
-  seal_path="probe" → ckpt/SST vp 落在 seal 之后 → split → 右孩子 stale_vp。确定性复现:
-  crates/manager/tests/system_roll_tails_live_writer.rs 两场景(loud=roll log+row 后右孩子
-  永不可读;silent=roll 全三条后 acked key 变 NOT_FOUND),修复前 2/2 精确失败(非真空:断言
-  roll 真的执行且长出新 tail),修复后 2/2 绿。
-【修复】① StreamClient::seal_and_roll_tail 改 live-writer-aware:存在活 worker ⇒ SealCommit
-  handshake(quiesce→精确 all-replica-acked commit,冻住旧 tail)→ alloc(Some(commit),
-  钉住 tail_id)→ ResetTail 到新 tail——与 append 失败 roll 完全同机制;无 worker(WAL
-  self-heal pre-worker)⇒ 原 probe 路径不变(无 writer 可竞争)。② handle_roll_tails 在
-  frozen_for_split/merge 期间 defer(split/merge 把 captured commit length 盖到"提交时刻的
-  tail"上,窗口内换 tail 会把 captured 长度盖到 roll 出的空 extent 上);sweep 30s cooldown
-  自动重试。③ P-sst barrier seal_and_roll 分支的失实注释更正。
-【新增常驻诊断(target 过滤 INFO,默认静默)】split_trace(捕获的三元组+vp+freeze 耗时)/
-  mms_trace(manager split 进入/提交/拒绝+耗时)/ ccl_trace(commit_length 探针 per-replica
-  响应或 sealed 短路)/ ckpt_trace(checkpoint vp+落点)/ recover_trace(replay 起点选择)/
-  roll_trace(活 tail roll)。这次定位=一次命中读全链,别删。
-【门】stream 110 / ps 208 / manager 293 lib 全绿;system_roll_tails_live_writer 2/2;
-  system_merge --ignored 9/9;clippy 警告数前后同为 16。修复后 chaos(同收窄动作集)39 跑:
-  0 F1 / 0 F4(38 PASS + 1 次 create_stream 起集群 flake,workload 未启动,与数据面无关)。
-  P(修复后 38 跑全 0 | 预修复 18% 命中率) ≈ 5e-4。
-【残留①已复现并修复(后续会话,同日)】"已在飞的 roll 换 tail" 用两个测试同步点
-  (set_roll_tails_pause / set_split_commit_pause,模式同 set_flush_test_pause)确定性复现:
-  HEAD 上 split 把 captured length 盖到 roll 出的空 tail 上 → 右孩子永不可读(精确失败)。
-  修=wire:MultiModifySplitReq 携带 log/row/meta_tail_extent_id(捕获时的 tail;0=skip),
-  manager Phase-1 校验当前 tail 一致否则 Precondition "split captured tail moved";
-  PS 对该错误立即 abort(确定性,重试无意义),客户端重发 split 重新捕获即成功。
-  v29 未部署 → 指纹就地刷新 fad8cec20c7f20ba。测试:
-  system_roll_tails_live_writer::in_flight_roll_racing_split_commit_child_still_opens
-  (修前精确失败=非真空,修后 3/3 全绿)。
-【残留②=F3 已定根因(后续会话,同日):同一根因的第三种表现,无需 EC】
-  证据链(pre-fix 命中 run_11 seed=754894795 的 trace,硬证据非推断):
-  fence-roll 在 20:11:41 把【两个分区】的活 log tail 都 probe-seal(extent 21@2680866 /
-  extent 22@4678198),随后两个分区的 checkpoint vp 分别落在 seal 之后 684KB / 2.2MB
-  ——ghost 窗口里被 ack 的写继续落盘。大值(kid%8==0)在该窗口的 VP 指向
-  [sealed_length,…) ⇒ extent-info cache 一旦刷新成 sealed 视图(node kill 触发
-  replica-lookup-fail invalidate),该 key 的每次 GET 永久被拒
-  stale_vp_offset_past_sealed_length;小值在 memtable 里照常可读 ⇒ 精确解释全部指纹:
-  仅大值/b+q 双前缀(两条 tail 都被 roll,不需要 split 孩子)/持久(sealed_length 不可变)/
-  post-reclaim 不变/EN 无 fail-loud(拒绝在客户端)。旧假设"EC-converted VP 读链"退役
-  (run_11 无 EC 动作)。
-  【为什么三次调查都被标签骗】verify_per_key 对 client.call 的 Err(_)(FLAG_ERROR 帧=
-  真正的错误原因,含 stale_vp_offset 文本)静默 sleep+continue,10 次后标成
-  "[no response — wedged/timeout]"——log 里 0 条 "GET TIMED OUT",且 verify 耗时
-  31s≈10key×10×300ms,与 5s 超时不符,坐实是被吞的错误帧而非挂起。
-  修:①根因即 live-writer roll 修复(ghost 窗口不再存在)——post-fix 39+16 跑 0 F3;
-  ②verifier 把 rpc 层错误记进 last_status(code=254)+ wedged-parts 快速跳过键带标签,
-  下次任何同类失败直接带原因;③system_roll_tails_live_writer 的 ghost 值每 4 个改 8KiB
-  (>VALUE_THROTTLE ⇒ 结构性走 VP 路径),把大值 ghost 的写读端到端钉进回归。
-─────────────────────────────────────────────────────────────
-Date: 2026-08-26
-TaskStatus: not_completed
-Task scope: 一整天的自主循环,21 条流水已压缩成本条(规则 12)。保留【结论 + 排除记录 + 下一步】,删掉过程叙述。
-【已修并验证】
-  - compaction 只在 head extent 的表【全部】被消费后才 truncate(此前会删掉仍活着的 SST → 分区打不开)。
-  - EC 转换的 owner_epoch 【每轮现取】而非冻结在 marker 里(冻结值在任何一次常规 PS 重开后就低于 EN floor,
-    participant 全拒 → marker 永不释放 → 该 extent GC 永久被拒)。
-  - corrupt 副本【会被重建】:新增 sibling key `extentCorrupt/<id>` 位图,标记过的 slot 无视 recovery gate。
-    此前只清 avali bit,默认 fenced_only gate 在读 avali 之前就跳过该 slot ⇒ extent 永久停在 RF-1。
-  - recovery 的 `let _ = mark_extent_available(...)` 吞错误(吞掉后 bit 仍是清的而循环以为已治愈 ⇒ 无限重发)。
-  - get 的 false-NotFound:GC 持 writer pin 时 live key 读起来像不存在;改为可重试的 Unavailable。
-  - op 可观测性三层全部落地:live 进度(原始计数非百分比)/ 终态入 etcd `opLog/` + 按条数 rotate /
-    MSG_OP_HISTORY 查询 RPC + `autumn-op ops history`。
-【诊断缺口三修(同一个病:失败到达运维时不带原因)】
-  ① code_description 把未命名 code 折叠成 "error";② truncate_to_commit 静默截短 extent(唯一让长度回退的路径);
-  ③ chaos 把所有非 OK 的读结果折叠成 not_found。教训:折叠过的标签会让每次调查都从错误的机制开始。
-【判定为非 bug】
-  - system_merge 的 57.8% "丢失":测的是【无 freeze 保护】的裸 MSG_MULTI_MODIFY_MERGE,损失窗口无界,
-    20% 只是经验阈值。生产路径 MSG_MERGE_PARTITIONS 的零丢失已由 orchestrated_merge_zero_loss 守卫。
-    断言已反转为【对照组】(断言拓扑存活 + 无保护路径确实有损失)。
-  - chaos 的两类写失败:"key is out of range"(workload 用 region_epoch=0 + 自维护路由,故意绕开 SDK 自愈)
-    和 code=7(CODE_UNAVAILABLE = merge freeze 停写)。都是集群正确拒绝,已在输出里标注。
-【chaos 间歇失败已分解为四类(25 次运行统计)】
-  F1 split 右孩子 wedge(stale_vp,200/400 key 丢)1/25;F2 EC marker 钉住(数据完好)2/25;
-  F3 静默丢 24 个【已 ack】的 VP 值(丢的 kid 全是 8 的倍数 = 全部大值)1/25;
-  F4 22 个 key 读回旧版本(全部 q* = split 右孩子范围;got_seq 落后 32–432)1/25。
-  F2 的断言已分级(coordinator 不可派发时不算失败);F1+F4 已合并为同一根因方向(同一位置 + 同一机制维度)。
-【F1+F4 的排除记录(最有价值,别重走)】
-  ✗ 副本集合变化 — replica_addrs_for_extent 不做健康筛选
-  ✗ truncate → last_synced 回退 — 加日志后 0/12,统计上降级
-  ✗ recover_partition 两处 chosen_pos — 都取最早 + 保守 fallback
-  ✗ compaction 的 vp_head MAX — 跳过 input 只会让 MAX 变小(更保守)
-  ✗ checkpoint union 的排序 — 按 [旧, 新] 拼接 + get 用 rev() ⇒ 新 SST 先查,顺序正确
-  ⇒ 读侧两大框架(replay 起点太靠后 / 读到旧 SST)【均已排除】。
-【累积回归检查(19 commit 之后)】全部单测绿:rpc 60 / stream 110 / manager 293 / ps 208 / client 41;
-  workspace 构建 0 error 0 warning;system_merge 9/9(--ignored)。
-  期间遇到一次 system_merge 的 merge_refuses_non_adjacent_partitions 失败,原因是
-  `RpcClient::connect(ps_addr).unwrap()` 撞 ConnectionRefused ——【真 flaky,非回归】:
-  start_partition_server 只固定 sleep 300ms,而 PS 的 listener 要等【所有分区 recover 完】才 bind,
-  该测试有 2 个分区,忙碌机器上就不够。重跑即过。
-  【失败的尝试(已回滚,记下来免得重试)】把 support::start_partition_server 的固定 sleep 换成
-  "轮询到可连接"(照搬 killable helper 的模式)⇒ 结果【更糟】:8过1败 变成 7过2败,
-  且耗时 104s→207s,失败的换成了 auto_dispatch_merge/split 两个原本正常的测试。
-  改 support 会影响所有测试,而我没验证"每个 PS 都会在 60s 内 bind"这个前提就推广了。已 git checkout 回滚。
-  若要再修,应【局部处理】(只在该测试里重试连接),或者接受这个低频 flaky。
-
-【下一步(按价值)】
-  1) F1+F4 转【写入侧】:查 split 窗口内已 ACK 的写去了哪里。依据是 got_seq 落后 32–432
-     ——【有界且不归零】,更像一批连续的写整体消失,而非读到某个旧快照。
-  2) F3:查 EC-converted extent 的 VP 读链(仅 VP、读不到、持久)。
-  3) 评审剩余未处理项:EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
-  4) 已知但未修的小项:checkpoint union 会打开已被 compaction 淘汰的旧 SST(浪费 fd + 账目混乱,非正确性问题)。
-─────────────────────────────────────────────────────────────
-Date: 2026-08-25 (b)
-TaskStatus: completed
-Task scope: /loop 第 N 轮——把 fable 评审挖出的两个 P0 收口，并让 chaos 真正跑绿（commit b5a4dff、4040dbe）。
-  ① compaction truncate（P0，先复现后修）：pickup_tables 的 head-extent 策略里，
-     `chosen = 该 extent 的表 .take(COMPACT_N)`，但返回 truncate_id 等于向 manager 断言
-     "这个 extent 已经空了"——handle_truncate 删的是 extent_ids[..pos]，即目标之前的全部。
-     head extent 的表数超过 COMPACT_N 时，压掉最老的 5 张、其余仍活在这个即将被删的 extent 里：
-     这些 key 不可服务，且 checkpoint 指向已删 extent 里的 SST ⇒ 分区打不开。
-     复现：pickup_tables 是纯函数，8 张小 head 表 + 1 张大表 ⇒ 选 5 张却照样返回 truncate_id（断言失败）。
-     修：谓词改成"chosen 覆盖 head extent 的全部表"。压缩照常进行，只是不再声称 extent 空了。
-     配套第二个测试钉住 truncate 存在的理由（一次压完的 head 仍要被 truncate），杜绝"永不 truncate"式假修。
-  ② EC 转换被自己的 fence 永久卡死（P0，chaos 复现）：WriteShard 上盖的 owner_epoch 在 marker 创建时
-     取一次、之后每轮重发都原样复用。但该 epoch 在每次 open_partition 都会重新获取并抬高——
-     marker 建好后任何一次常规 PS 重开（重启/rebalance/LockedByOther 自逐）都会把 EN 的 per-extent
-     floor 抬到冻结值之上，此后每个 participant 都回 CODE_LOCKED_BY_OTHER：转换永远完不成 ⇒
-     marker 永不释放 ⇒ 该 extent 的 GC 永远被拒（"has in-flight EC conversion"）＝一次普通重启换来无界空间泄漏。
-     证据：coordinator 每 5s 重发一次、每次都停在 WriteShard shard 1 @ 0，在已静默的集群上把 extent 12
-     的 marker 攥了整轮，force-GC 只回收到 1 个 extent。
-     修：dispatch 时用 dispatch_owner_epoch_for_extent 现取；submit 侧只是用同一个 resolver 播种。
-     【为什么这样仍然安全】fence 的作用是挡被 fence 掉的旧 coordinator 的幽灵写，而幽灵手里仍是它当初
-     捕获的旧 epoch，照样低于 floor；抬高的只有活着的那次 dispatch。marker 的其余字段（targets/disks/
-     eversion）必须继续钉死——重新推导 ASSIGNMENT 会把 layout 写到根本没有 shard 的节点上。
-  ③ 这次为什么查了几个小时而不是看一行日志（两处诊断，顺手修掉）：
-     - code_description 把所有没列名字的 code 一律渲染成光秃秃的 "error"，于是 CODE_LOCKED_BY_OTHER(5)
-       ——一个精确、永久、可行动的判决——传到运维眼里是 "code=error"，读起来就像个正在重试的普通瞬时错误。
-       现在给该 code 和 PAYLOAD_NOT_HERE 起了名字，且调用方一律把数字打在名字旁边。WIRE 指纹就地刷新（v29 未部署）。
-     - owner_epoch fence 是静默 return，而紧挨着的 attempt-nonce 守卫是 WARN：于是拒绝方的日志一片空白，
-       只剩 coordinator 的日志，而它只能报一个 code。现在也 warn，并带上两侧 epoch。
-  门：system_chaos 现在【通过】（同一个复现它的 harness）——op ledger 0 活跃、0 个 EC marker 被钉住、
-  in-flight errors 0、quiesce 后回收 5 个 extent（修前 1 个）、400 keys 0 mismatch 0 not_found。
-  单测 rpc 60 / stream 110 / manager 286 / ps 207 全绿；ec_failover、ec_integration、ec_staging、
-  payload_location、placement_cleanup、re_avali_no_destroy、system_compact_unflushed_vp_head、
-  system_crash_mid_compact(含 --ignored)、system_split_forcegc_stale_cache、system_gc_multiversion_same_extent 全绿。
-Next steps（按价值排序，都不是本轮引入的）：
-  1) system_merge 的 split_merge_split_with_concurrent_writes 挂在 57.7% merge-window 丢失——
-     已确认【与本轮改动无关】（改前改后同样失败、同样的 missing keys）。领先假设＝评审提的
-     merge-freeze 项：freeze 并不停 PS 自己的 GC / timer-armed compaction，它们的写落在 merge 已捕获的
-     commit 之后，被 seal 甩掉。要先复现再动刀。
-  2) chaos 的失败原因现在看得见了，剩下两类值得追：41 次 "key is out of range"（split 后 SDK 路由没刷新，
-     本该自愈）、4 次 "PS rejected: code=7"。都被 workload 容忍，但都不该稳定出现。
-  3) 评审剩余未处理项：EC P1-3/P1-4、errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
-─────────────────────────────────────────────────────────────
-Date: 2026-08-25
-TaskStatus: completed
-Task scope: 文档去迁移化 + 跑 chaos + 给 chaos 加失败原因诊断（用户："如果不考虑升级，更新设计文档和
-  ops.md，然后跑 chaos 测试，需要增加检查失败原因的"）。commit de90e9c。
-  ① 文档：设计文档 §7 从 "Persistence, migration, and legacy" 改写成 "Persistence and wire"——
-     没有历史数据就没有迁移约束；保留"sibling key 仍是更好的设计"的独立理由（marker 身份是 etcd 已知的
-     事实，复制进 value 只会让两者不一致），并单独记一句【真要升级时需要什么】(0 哨兵语义)以免以后重新发现。
-     crash matrix 里两行 pre-upgrade 场景删掉。ops.md：删掉 EC 相关的"升级前置条件"runbook，
-     新增【EC CoW 运维视图】：一次转换的 5 个阶段各自对应哪条日志证据、卡住时看哪里、盘上应该长什么样
-     （每节点一个 sealed_length/K 的 shard + .meta，coordinator 多一个 16B 的 .ec.prepared 属正常）。
-     另修正一处会误导人的旧步骤：让运维去 grep "phase 2 (commit) complete"——那条日志已经不存在了。
-  ② chaos 跑出真问题（而且不是 EC 的）：system_chaos 从 2026-07-18 Layer-A 命名空间强制落地(f5336db)起，
-     【五周来一直在"写 0 个 key"的情况下报 all invariants OK】。因为 expected 集合为空时，逐 key 检查
-     全部真空成立 ⇒ 0 mismatches / 0 not_found 和"干净跑完"完全无法区分；只有 write-liveness 探针有异议，
-     而它读起来像"分区卡住"，不像"这次测试什么都没验"。
-     根因：workload 写的是裸 key（b000021），Layer-A 要求 {已注册ns}/...，全部被 NamespaceUnknown 拒。
-     【为什么只有它中招】：chaos workload 天然要容忍写失败（有 nemesis 在注入故障），
-     而这份"正确的容忍"恰恰让 100% 失败看起来像正常的故障压力。普通测试不受影响——
-     support::ps_put 重试 30 次后 panic，被拒的写会响亮失败。
-  ③ 按用户要求加的"失败原因"三件套（这也正是把两小时的谜题变成一行答案的东西）：
-     - workload 记录【为什么】失败并按原因汇总（原来 5 个失败点只加计数、把原因全丢了）；
-     - acked==0 直接判定失败并明说"下面所有不变量都是真空的"——不能对空输入永远通过的检查不叫检查；
-     - 结论先说 WHY：扫 EN 子进程日志里的 fail-loud 标记（WAL-FAILSTOP/META-FAILCLOSED/quarantine/
-       stale VP/被拒的 EC 完成/superseded attempt/disk OFFLINE/supervised loop panic）。
-       【标记不存在本身是更尖锐的发现】：不变量崩了而每一层都以为自己没事。
-       故意排除噪声项：nemesis 下 LOCKED_BY_OTHER 正是 fencing 应有的样子，df 失败是杀节点的目的。
-     修法本身只有一个常量：key 改成 mem/{b|q}{kid}（mem 是内建命名空间，无需注册），分区范围跟着改。
-  门：system_chaos 现在【真的】过了——400 keys、0 mismatch、0 not_found、quiesce 后回收 2 个 extent、
-  无 fail-loud 标记；system_ps_failover_chaos 2/2、chaos_inode_lease_replay_failclosed 2/2；workspace 0 error。
-Next steps: 其余 chaos 脚本（scripts/*_chaos.sh 共 13 个）尚未在本轮验证；若要继续，建议先跑
-  transport/manager_ha/selfheal 这几个覆盖面最大的，并注意同类"真空通过"风险——凡是容忍写失败的 harness
-  都要检查它是否真的写进去了。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-24 (c)
-TaskStatus: completed
-Task scope: EC CoW 第 6 步 —— 删掉 commit phase（commit 4362b07）。用户定调：
-  【现在是 active 开发阶段，相当于全新集群，不考虑任何历史数据/迁移】。所以原本 gate 住第 6 步的
-  "soak + 升级前置条件"整个不成立——它保护的是不存在的数据。直接删。
-  删掉：MSG_COMMIT_EC_SHARD(12，按本仓库惯例退成保留号+墓碑注释) + CommitEcShardReq/Resp、
-  handle_commit_ec_shard、commit_shard_local、finish_ec_commit、ec.commit intent marker 及其
-  load_extents 三态重放、以及整套 .ec.dat 机制（staging path / scanner / reconcile 的 ec-staging
-  orphan 上报）。转换只写 additive 的 extent-{id}.shard{i}，manager 的 layout flip 是唯一提交点，
-  上面这些永远不可能再被驱动。
-  §7 那个 --refuse-legacy-ec-state 检查【也一起删了】（用户："这个什么破玩意就不要了"）——它是几小时前
-  为"删除前证明全集群干净"加的，没有迁移要 gate 时纯属仪式。ops.md 的对应 runbook 一并删除。
-  【ec.prepared 保留】，与设计文档 §5 表格的说法相反：nonce 没有取代它，nonce【住进了】它。
-  nonce 走在请求里，磁盘上的 shard 文件本身不带 nonce ⇒ 没有这个 marker，coordinator 无法判断
-  本地 staging 是不是本次 attempt 的，只能每次 re-dispatch 都重新编码。§4.3 预见到了形状
-  （"命名保护的是 serving，不是 staging confirmation"）但对结论判断错了。
-  测试连带：两个 suite 之前拿 WriteShard+CommitEcShard 当【fixture】造"sealed 到 eversion N 的 extent"，
-  现在改成走具名的 test_seal_local——本来就更诚实，它们从来测的不是 commit 路径，只是借它的副作用。
-  （踩坑：test_seal_local 只写元数据，而老 fixture 的 rename 顺带把 shard payload 变成了 .dat 内容，
-  所以还要先 append 真实字节。）ec5_commit_window_tests 测的是 rename<->save_meta 崩溃窗口，
-  窗口没了就一起删；ec_2pc_crash_safety 改名 ec_staging（已经没有 2PC 了）。
-  净效果：-1107 / +77 行。
-  门：rpc 60、stream 110 lib + ec_staging/eversion_zero_skip/append_semantics/payload_location/
-  placement_cleanup/restart/delete/multi_disk、manager 279 lib + ec_failover/ec_integration/
-  update_stream_ec/system_extent_recovery/offline_reconcile/re_avali_no_destroy 全绿；
-  live 3EN 实证：转换成功、marker drain、.dat 全回收、8 个值在全集群无 .dat 下逐字节一致。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-25 (b)
-TaskStatus: completed
-Task scope: fable 对抗审查 5 个面(ec/recovery/gc+compact/自动删除/错误报告+自动重试) → 修 → 更新 system_chaos。
-  【5 个 P0/HIGH，其中 3 个是本会话自己写的代码，2 个是长期潜伏的】：
-  1. a78376a P0 apply_placements 删掉正在 staging 的 shard。placement 是 manager 在【回答时刻】算的、
-     节点【稍后】才应用；这中间转换可能开始，而【participant 上没有任何本地标记】(ec_convert_inflight
-     只在 coordinator 上)。于是过期的"payload 在 .dat"判决删掉了 coordinator 正在写的 shard；下一个
-     stripe 发现文件没了就重建并按自己的 offset pwrite ⇒ 前面 stripe 的位置全是【零洞】。flip 照样发布
-     (报告来自同一 attempt，nonce/reporter 全过) ⇒ 读到零 + CODE_OK。三重修：op-lock 串行化、
-     拒绝"说 InDat 但本地已 staging"的矛盾判决、offset>0 而文件消失时【响亮失败】而不是静默重建。
-     (我第一版守卫用"本节点是否曾 staging"做判据 → 会永远跳过清理、.dat 永不回收；靠"真 staging 而非
-      摆文件"的测试抓到。)
-  2. a78376a HIGH marker 有五种死法，只有两个成功钩子会关 ledger。EC 既不在 TTL 扫描内，
-     submit 又对任何 ACTIVE 目标 attach-dedup 且【attach 后直接返回不 actuate】⇒ 一条泄漏的 RUNNING
-     记录让该 extent 之后所有 force-ec-convert 变成静默 no-op，除非重启 leader。改成在【唯一的 drain 漏斗】
-     里关闭，覆盖现在和将来所有路径；顺带把 3 处 `let _ =` 换成真处理。
-  3. 12ec612 HIGH apply_recovery_done 不校验完成报告是否属于活着的 marker。释放路径的注释明说
-     "如果执行者还在跑、之后完成了，它的完成会被拒绝"——【这个拒绝根本不存在】。df 抖一下就会让节点
-     Suspected→marker 释放；若此时 extent 被 EC 转换，老执行者迟到的【转换前完整副本】报告会把槽位
-     换到持有 .dat 的节点上、而 layout 说的是 shard 文件，被换掉的节点变成非成员后【真正的 shard 被
-     reconcile 回收】。这是 EC nonce 那个洞的 recovery 孪生体，用同样方式关闭。
-     注意顺序：门要放在 EC-inflight defer【之后】(ledger 每 extent 只允许一个 op，所以转换期间到达的
-     recovery 完成永远没有 marker，放前面会吞掉更具体的判决)。
-  4. be1bb9b P0(GC) 【任何活过两代 GC 的大值会被静默丢失】。GC 自己搬迁写的 WAL 记录 op=1 不带
-     OP_VALUE_POINTER(同一次搬迁的 memtable entry 却带)，recovery 靠长度兜底照样能重建，
-     但【GC 自己的扫描没有兜底】⇒ 该记录在它刚被搬进去的那个 extent 下一次 GC 时被当成 chunk blob 跳过、
-     不搬迁、然后连同活着的 VP 一起 punch。现有 GC 测试全是单代，看不见。
-     真正的缺陷是【扫描和重放对"什么是 VP 记录"的判据不一致】——改成两边共用同一个谓词。
-  5. 85e426b P0(EC) 一个"rename 后崩溃"的残留分支能【什么都没 stage 就报告转换完成】。CoW 下 rename
-     根本不存在，但它的【触发条件】还在：seal-over-reachable 合法地封在落后成员长度之上，于是一个落后的
-     coordinator 只要 local_len 恰好等于 ceil(S/K) 就跳过整个 prepare 并返回 Ok。
-     nonce/reporter 校验的是【这次 attempt】、不是【干了什么活】，所以报告是真的、flip 提交到一个
-     没有任何节点持有 shard 的 layout ⇒ 永久不可读、0/K 无法重建、没有反向转换工具。
-  6. 8f2c83a P0(EC/recovery) 多 shard EN 上完成报告【被困在兄弟 shard 里】。manager 每个 node 只发一次 df
-     (故意的：handle_df 会 take 队列，第二个调用者会 drain-and-discard)且拨的是 shard 0 的控制口，
-     而队列是 per-ExtentNode 的、由【拥有该 extent 的 shard】写入 ⇒ 生产形态(shard 数=核数)下
-     (N-1)/N 的 extent 转换永远无法提交(marker 永久钉住、GC 被阻)、重建好的副本永远不被应用。
-     修法是【共享队列】而不是加第二个 df 调用者，形状照抄 shared_disk_health；
-     但必须【按 node(data dirs) 而不是按进程】键控——测试套件在一个进程里跑多个逻辑 EN，
-     进程级共享会让一个 node 的 df 抽走另一个的完成报告，而 manager 会拒绝非 coordinator 上报的 ec_done，
-     恰好会让"证明转换能提交"的多 EN 测试失败。两个方向都断言了。
-  system_chaos 更新：①加"静默后不得有任何在飞"检查(ledger active + EC marker)——这个类别数据检查
-  【结构上看不见】：泄漏的 RUNNING 不丢数据但让后续转换变静默 no-op，钉住的 marker 无限期阻塞该 extent 的 GC。
-  ②检查同时报告 ledger【总记录数】，因为"0 active"在 ledger 从没被用过时是真空成立的——这立刻发现
-  nemesis 全程只留 1 条记录(它直接调 handler，不走 submit)。③把 EC nemesis 改走 MSG_OP_SUBMIT
-  (即 autumn-op 的路径)⇒ 每轮 5 条记录且都到达终态。
-  门：stream 110 lib + payload_location 9/placement_cleanup 8/ec_staging 3/restart/multi_disk/delete_race、
-  manager 283 lib + ec_failover/ec_integration/system_extent_recovery/silent_corruption_rot/
-  re_avali_no_destroy/offline_reconcile/system_gc_*(含 --ignored)、partition-server 205 lib、rpc 60；
-  system_chaos 真过(400 keys/0 mismatch/8 extent 回收/0 在飞)；live 3EN EC smoke PASS。
-  每个修复的守卫都做了【非空验证】(禁用后精确地只有对应测试失败)。
-  坑：改 wire schema 后 system_chaos 会在 setup 就挂——它 shell 出去调【磁盘上的】autumn-op/
-  autumn-extent-node 二进制，必须先 cargo build -p autumn-server(同 cluster.sh 那个老坑)。
-Next steps: 审查里剩下的 P1/P2/P3 尚未处理，按价值排：
-  ① EC P1-3 已 flip 的 shard 文件可被"被释放的僵尸 coordinator"截断/覆写(nonce floor 在 placement 落地时
-     被清掉、重启也会清)——建议：layout 已是 InShardFile 时拒绝 nonce 不匹配的 WriteShard。
-  ② EC P1-4 coordinator 自己的本地 staging【不登记 ec_stage_nonce】⇒ 修复①的 coordinator 形状漏洞仍在。
-  ③ GC P0-2/P0-3(评审给的是 P0，我尚未独立验证)：relocation 跨 rotation 的 seq 顺序问题；
-     pickup_tables 的 take(COMPACT_N) 可能让 truncate 删掉仍被引用的 SST。【下一轮优先验证这两个】。
-  ④ errors F3/F4/F5、delete F3/F4/F5、recovery F3/F5/F6。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-24 (b)
-TaskStatus: superseded (§7 的检查已于同日随第 6 步一并删除，见上)
-Task scope: §7 升级前置检查（第 6 步的解锁手段）。commit b66af8d。
-  本 build 已经不会再产生 extent-{id}.ec.dat / .ec.commit（转换只写 .shard{i}，manager 的 layout flip
-  是唯一提交点）。所以这两个文件只可能来自跑老二进制的节点，而它们正是【保留的 commit-phase 修复代码】
-  存在的理由。删那批代码的前提 = 全集群没有任何节点还持有这种状态，而在此之前唯一的验证手段是
-  登录每台机器去 find。
-  实现：EN 启动时扫描（放在 load_extents 【之后】，这样 marker replay 能解决的已经解决、解决不了的已
-  quarantine，剩下的才是真·未决残骸），ERROR 日志列出 extent id。
-  【默认只报告不拒绝，这是刻意的】：保留的修复路径今天能正确处理这些状态，默认拒启动会打断一个本来
-  能work的升级。--refuse-legacy-ec-state 才变成拒绝 —— 这才是"建立前置条件"的手段：全集群带 flag 起一遍，
-  全起来了，第 6 步就从"赌"变成"查过了"。
-  最关键的测试是【反向】那个：只有当前格式文件的节点（含 .ec.prepared —— 它是当前方案的，不是 legacy）
-  必须在 flag 下【干净启动】。误报和它要找的状态无法区分，而且会卡住它本来要解锁的那次升级。
-  顺带删掉被重构孤立的 parse_ec_staging_extent_id。
-  门：stream 115 lib + legacy_ec_state 4 + placement_cleanup/payload_location/ec_2pc/extent_restart/
-  multi_disk、manager 279 lib + ec_failover；clippy 19 不变（注意：git stash 不带 -u 会漏掉未跟踪的
-  测试文件，导致基线编译不同、warning 计数假性暴涨，比对时要 stash -u）。
-  ops.md 写了操作步骤。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-24
-TaskStatus: completed
-Task scope: v29 EC CoW 跨机验证（用户选 A）。脚本入库 scripts/ec_crosshost_verify.sh。
-  动机：v29 攒了 5 步改动(nonce/payload location/shard-holder/方案切换/file-granular reconcile)，
-  全部只在单机 loopback 验过；本项目反复吃过 loopback 藏 bug 的亏(SO_RCVBUF 窗口冻结 6× 写吞吐，单机看不见)。
-  形状：manager + PS + EN0 在 ::14，EN1/EN2 在 ::15，EC 2+1 ⇒ 分片跨网扇出、3 个持有者里 2 个在远端。
-  实测这轮的 coordinator 落在【远端】en1，它把一个 shard 推回 ::14——真正的跨机路径。
-  结果 PASS：
-    转换成功 → 8×64KiB 跨机读回逐字节一致 → 重启全部 EN 触发 reconcile →
-    两台机上 pre-conversion .dat 【全部回收】(日志实证 "reclaimed the pre-conversion .dat;
-    this node now serves its shard" 在 ::14 和 ::15 都出现) → 再读一遍仍逐字节一致、全集群无 .dat。
-  ── 三个坑都是【测试脚本自己的】，产品侧零改动 ──
-   1. EN/PS 的 --listen 默认 0.0.0.0（IPv4 通配），却 advertise IPv6 地址 ⇒ manager 拨 v6 被拒、
-      节点全 Suspected。两端都要显式 --listen <v6>。（顺带：list-nodes 在 df 从没成功过时
-      HB_AGO/SUSP_AGE 显示成几百秒的假值，看着像"陈旧状态"，实际是没有基线——排查时别被带偏。）
-   2. 远端 data dir 残留上一轮的 cluster_id ⇒ format 拒绝加入不同集群。这是 cluster_id 守卫【正确工作】，
-      不是 bug；脚本每轮要先 rm -rf 远端 dir。
-   3. 重启 EN 那步我写了 kill "${PIDS[-1]}" 且注释成 "PS stays"——PIDS[-1] 恰恰【就是 PS】。
-      于是 8 个读全挂在 "connect PS ... failed"，看起来像"清理后跨机读坏了"。
-      教训：读失败先看是不是【服务端还活着】，再怀疑数据面；把 stderr 丢进 /dev/null 会让这种事多花两轮。
-  另：管道 `| tail -N` 会缓冲到进程结束，后台跑长脚本时没法增量观察——直接重定向到文件。
-     pkill -f 会匹配到自己的命令行(exit 144)，用 pgrep+逐个 kill。
-Next steps: 跨机已过 ⇒ 第 6 步的前置从"没跑过真集群"降级为"没部署过"。真要做仍按 §7：
-  要么确认全集群无老格式状态，要么加 EN 启动 fail-loud 前置检查(推荐，便宜且把"赌"变成"检查")。
-  auto-policy 的 ec arm 现在功能上具备条件(空间窗口已关、跨机验过)，但从未在自动驱动下跑过，要 arm 建议先小范围观察。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-22 (b)
-TaskStatus: completed
-Task scope: §9 handle_re_avali truncate-in-place 审计（设计文档最后一个未做项）。commit 28520d7。
-  设计文档问的是"re_avali 的目标会不会是 manager 仍然计数的副本(avali 位还置着)"。字面答案是【不会】：
-  唯一的下发点(recovery.rs)只在 `(ex.avali & bit) == 0` 时才发 RE_AVALI。
-  但【这个问题问错了】——avali==0 不等于"落后"：manager CLAUDE.md 的 seal-over-reachable 写着
-  "封存时不可达的成员，它的 avali 位就是不置"。也就是说一个仅仅【当时不可达】的成员会带着 avali=0，
-  而它手上可能是全集群【最长】的那份副本；而 stream_extent_from_sources 选源时遍历成员列表，
-  【根本不看 avali】——所以这份文件恰恰就是别的节点做 recovery 时会去拉的源。
-  不被计数让它【更】暴露而不是更安全：没有任何人在看着它。
-  先复现（house rule）：crates/manager/tests/re_avali_no_destroy.rs —— extent 封在高于目标持有量的长度、
-  唯一的 peer 被杀 → 修复不可能成功 → 实测把 4096 字节干成了 0。
-  修：re_avali 改走 peer_copy_full_extent_to_dat（先写 temp、拿到完整 sealed_length 才 atomic rename），
-  修不成就是 no-op。它【没有】reconcile-down 是这条路径上的有意为之：拿更短的 peer 副本盖掉更长的本地副本，
-  正是 re_avali 绝不能做的交易。recovery 继续用 stream_extent_from_sources——它的目标要么是全新的、
-  要么是被证明不完整的残骸，没有东西可失去。【选哪个 helper 的判据是"目标有没有东西可失去"，不是 avali 位】。
-  两个测试互相独立验证过：把修复还原成旧代码 → destroy 测试挂、repair 测试仍过（所以"只会拒绝"的假修复
-  不会被误认成修复）。repair 测试也是 re_avali 有史以来第一份覆盖。
-  门：stream 115 lib、manager 279 lib + re_avali_no_destroy 2 + ec_failover/ec_integration/offline_reconcile/
-  system_extent_recovery/system_recovery_vp_seed/silent_corruption_rot、stream payload_location/
-  placement_cleanup/ec_2pc/extent_restart 全绿。
-Next steps: EC CoW 只剩第 6 步，且【被设计本身 gate 住】：删 commit phase / ec.commit / ec.prepared 要等
-  "soak + 一个 release 边界"。它删的是【升级时崩在 rename 中途】的节点的修复代码，现在删等于赌没有那种状态。
-  真要做时按 §7：要么确认全集群无活的老格式状态(无 .ec.dat/.ec.commit/无老 marker)，要么加 EN 启动 fail-loud 前置检查。
-  ec.prepared 另有前提：nonce 完全接管它的角色之后才能删。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-22
-TaskStatus: completed
-Task scope: EC CoW 第 5 步——file-granular reconcile + cleanup（用户："start"）。commit 2d4a5fd。
-  reconcile 的回答从 extent 粒度改成【文件粒度】：garbage（不是成员→全删）+ placements（每个 extent 带
-  payload_location + 这个节点自己的 slot）。节点据此推导出"我该持有的那【一个】payload 文件"，其余全是残骸。
-  转换后清 .dat、被放弃 attempt 的 shard 回滚、非成员垃圾——三件事一条规则搞定，不需要第二套机制，
-  也不需要 intent marker（清理中途崩溃靠启动 discovery 重新推导磁盘现状收敛）。第 4 步开的空间窗口就此关闭
-  （现在由 sweep 周期 5min 界定，EN 重启则立即）。没有单独写 driver：reconcile 一旦会发 placement，它本身就是 driver。
-  删 payload 文件是破坏性的，三道门：①要留的那个文件必须【已经在本地】（.dat 只在确实持有被点名的 shard 之后
-  才删——否则 placement 早于 staging 到达就会删掉本节点唯一的副本）②该 extent 无在飞 op ③只由 manager 决定。
-  manager 侧对【任何有在飞 ledger op 的 extent 一律不给判决】——participant 正在 stage 的 shard 是当前 layout
-  没点名的文件，而节点侧的 ec_convert_inflight 只看得见本节点自己 coordinate 的转换。
-  ── live 测试删掉了一个活的 extent（比我在测的东西更严重，且根因不在第 5 步）──
-  EN 不知道自己的 node_id，一直报 0。R4 的成员判据下，报 0 = 不是任何 extent 的成员 = 整块盘都是垃圾；
-  又因为宽限计数器 key 是 (node, extent)，三个节点全报 0 ⇒ 共用同一个计数器 ⇒ 每人报一次就把三轮宽限烧完，
-  第三个来问的节点被告知删除一个已转换的 extent，它就删了。R4 之前判据是"manager 还认不认识这个 extent"，
-  【根本不依赖上报者】，所以 node_id=0 当时确实无害——发送侧那行注释"manager 只拿它记日志"写下时是真的。
-  修：请求带上 EN 真正拥有的 node_uuid，manager 解析 node_id→uuid，解析不出来就【什么判决都不给】(fail closed)。
-  三个 R4 单测当初伪造了一个 manager 从不知道的 node_id——正是这个虚构掩盖了 bug；现在它们先注册节点，
-  另加两个新测钉死 fail-closed 与 uuid 解析。教训写进设计文档：判据从"对象的属性"变成"对象与提问者的关系"时，
-  所有标识提问者的输入都变成 load-bearing，包括此前被注释为"仅诊断用"的那些。
-  顺带修掉第 3 步的一个重复计数：shard-only entry 把 shard 字节同时放进 len 和 shard_files，
-  导致每个已清理的 extent 在 df 里翻倍（len 语义 = .dat 长度，没有 .dat 就是 0）。
-  门：rpc 60、stream 115 lib + placement_cleanup 6（新）+ payload_location 8 + 其余全绿、
-  manager 279 lib + ec_failover/ec_integration/offline_reconcile/system_extent_recovery/node_lifecycle/
-  silent_corruption_rot/e2e_lifecycle；clippy 数不变(60)；破坏性守卫都做了非空验证。
-  live 3EN 实证：转换后重启 EN → 三个节点各剩【一个】262316B 的 shard，【所有 pre-conversion .dat 全部回收】，
-  8 个 64KiB 值在【全集群没有任何 .dat】的情况下仍逐个字节一致。
-Next steps: 第 6 步（soak + 一个 release 边界后）：删 commit phase(MSG_COMMIT_EC_SHARD/commit_shard_local/
-  finish_ec_commit)、ec.commit marker 及其 load_extents 三态重放；ec.prepared 只有在 nonce 完全接管它的角色
-  之后才能删。注意 §7：这些是【升级中途崩在 rename 里】的节点的修复代码，删之前要么确认没有活的老格式状态，
-  要么加 EN 启动 fail-loud 前置检查。§9 handle_re_avali truncate-in-place 审计仍未做。
-  可选：cleanup backlog 的 admission gate（§8）——目前窗口已由 sweep 界定，backlog 堆积仅在 reconcile 卡住时发生。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-20
-TaskStatus: completed
-Task scope: EC CoW 第 4 步——方案切换（用户："go"）。§10 里唯一"两套方案同时在线"的那个 commit（0e8f4b6）。
-  转换从此【只加文件，不替换文件】：WriteShard 写 extent-{id}.shard{i} 就结束，不 rename、无 per-node
-  commit；manager 的 layout flip 是唯一提交点，一个 CAS 过的 txn 里同时落 membership/eversion/
-  payload_location=InShardFile。
-  它消掉的是"没人能分类的中间态"：per-node rename 会让集群停在"有的改名了有的没有"，coordinator 死在
-  里面时没有任何一方有权决定 roll-forward 还是 roll-back——这正是 marker 卡死无法释放的原因，也是
-  "放弃一次 attempt 可能毁掉最后的完整副本"的原因。现在放弃 = 删掉几个没有任何 reader 指向的文件，
-  所以 EC marker 的 coordinator 没了就能像 recovery marker 一样释放，后继者可以挑完全不同的分配。
-  三个只有代码（和一个集成测试）才知道的点：
-   1. EC shard recovery 把重建出来的 shard 写进了 .dat。在"shard 就是 .dat"的年代是对的；在本设计下
-      会让该节点把 shard 字节喂给任何还在要整值的读者，同时 layout 指向的那个 shard 文件根本不存在。
-      改成写 layout 点名的那个文件。
-   2. read_plan 用 extent 的长度而不是【被读文件】的长度做界。shard 是 sealed_length/K，而旁边等着被
-      清理的 .dat 还装着整个 extent ⇒ 一个 to-end shard 读会要到好几倍于 shard 的长度。界改成按文件取。
-   3. "跑不动了" ≠ "不是 Online"。给 EC 打开 marker 释放时用 is_online() 做判据，会把 coordinator 还处于
-      Suspend（新注册节点在第一次 df 之前的状态）的 attempt 每个 tick 放弃一次 ⇒ 任何跨过一个 tick 的
-      转换永远完不成。判据改成"已不在集群 或 Suspected"。是 ec_failover 抓到的，单测抓不到。
-  连带：WriteShard + CommitEcShard 不再能组合（prepare 已经不写 .ec.dat 了），所以那些拿这对 RPC 当
-  【fixture】制造"EC 转换到 eversion N"的测试改成直接摆一个 .ec.dat ——那正是保留的修复代码存在的场景，
-  覆盖比原来更真实。retained repair code（handle_commit_ec_shard/commit_shard_local/finish_ec_commit/
-  ec.commit replay）全部保留，只是不再被驱动；本 build 不再有任何路径会创建 .ec.dat。
-  门：stream 115 lib + 11 个 test 二进制、manager 277 lib + ec_failover/ec_integration/update_stream_ec/
-  system_extent_recovery/silent_corruption_rot/offline_reconcile、rpc 60。
-  live 3EN 实证：转换成功、marker drain、【8 个 64KiB 值 flip 之后逐个读回字节一致】(RS 解码，全栈)，
-  磁盘上 coordinator 仍持有【未被触碰的】524632B .dat + 262316B shard0（= /K）——CoW 不变量成立。
-  运维：force-ec-convert 现在每次都打 WARN——cleanup driver 未落地前，转换后两种形态会同时占盘且
-  【没有任何东西回收】。§8 要求 policy 驱动的 EC 保持关闭直到第 5 步；auto-policy 默认 Off，但
-  balanced/aggressive 预设里含 ec，谁要 arm 需自行知晓这个空间窗口。
-Next steps: 第 5 步 file-granular reconcile + cleanup driver（reconcile 现在只能表达"这些 extent 你不该
-  有"，表达不了"留着 extent、删掉 .dat"；member 节点的清理还要 repoint entry + persist meta，只有
-  非成员才是纯删）。之后第 6 步：soak + 一个 release 边界后删 commit phase / ec.commit / ec.prepared
-  （ec.prepared 只有在 nonce 完全接管它的角色后才能删）。§9 handle_re_avali truncate-in-place 审计仍未做。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-19 (c)
-TaskStatus: completed
-Task scope: EC CoW 第 2、3 步（用户："on disk layout 可以改，continue"）。§10 六步里的 2 和 3，都是
-  可单独上线、可回滚的 inert 步；第 4 步（两套方案同时在线的那一个 commit）未开工。
-  第 2 步 = 读请求【点名】要读哪个 payload 文件（575f352）。
-    动机：CoW 下 shard 是加在 .dat 旁边的新文件，两种形态同时存在，必须有人说哪个是权威的；
-    推断没有安全答案——把 .dat 喂给想读 shard 的请求 = 返回整值的头部，调用方还会拿去 RS 解码。
-    ReadBytesReq 加 (payload_location, shard_index)（32→40B，32B 老请求仍解成 InDat）；EN 服务被点名的
-    那个文件，否则答 CODE_PAYLOAD_NOT_HERE，绝不回落到另一个。位置存 sibling key extentLayout/<id>
-    （absent=InDat），不进 MgrExtentInfo：那是持久化的 extents/<id>，加字段会让老集群 replay 校验失败
-    →当不上 leader；absent=InDat 正好就是所有存量 extent 的真实形态（老方案把 shard 改名盖到 .dat）。
-    两个只有读代码才看得出、各自都能单独读错文件的点：
-      (a) EN 的读批处理只按 extent_id 聚合，一个 batch 解析【一个】fd 服务所有 slot ⇒ 点名不同文件的
-          两个请求会被同一个文件应答。聚合键必须扩成文件身份（两处 grouping 都改）。
-      (b) InDat 必须【不论 slot 都是同一个身份】：复制读带着自己的 slot，若 slot 混进文件身份，
-          同一 extent 从不同 slot 的读会看起来是不同文件而丢失批处理。PayloadRef::for_extent 对 InDat
-          把 index 归零。
-    EC shard recovery 现在【按名字】问每个 peer 要它自己的 shard——原来是问"这个 extent"，靠该 peer 的
-    .dat 恰好就是它的 shard（只有老方案改名才成立）。read_plan 的 None 改成具名 ReadRefusal（两种拒绝
-    对应两个码，各自自愈方式不同）。SDK direct 路径不用改：extent_read_descriptor 本来就拒 ec_converted，
-    而 InShardFile 只由 flip 发布，flip 必设 ec_converted——现在把这条不变量显式检查而不是默默依赖。
-  第 3 步 = EN 作为 shard holder 的生命周期（daea6a4）。
-    EN 的 extent 生命周期整个钉在 .dat 上：没人扫的文件会躲过所有清理、然后在下次重启时从系统里消失；
-    而"只有 shard 的 extent"在 manager 眼里像不存在——这正是重建副本变成 blocking orphan 的路径。
-    所以先让 discovery/删除/计账认识这个形态，再让任何东西去写它。
-    entry 记录真实持有：has_dat + shard_files(index→length)。同时两个 index 是合法瞬态（两次 attempt，
-    或重新分配后同时占 parity 槽和 data 槽）；权威由 extent 发布的 layout 定，不由这张表定。长度放表里
-    而不是另设计数器，避免"有哪些文件"和"占多少字节"漂移。
-    shard-only entry 不带 fd 且【绝不能创建 .dat】（extent_file 开文件不带 create 就是为这个）；它的 len
-    是 shard 长度，不是 extent 的 sealed_length；真 payload 文件旁边没有可解析的 .meta = META-FAILCLOSED
-    →quarantine，不允许 fail-open 到 owner_epoch 0。df 的 extent_bytes 要加 shard_bytes（转换中的节点
-    两者都持有，只算一个会低报 cluster-df 和 --min-alloc-free-bytes 门限读的那个数）。shard fd 不进 FdLru
-    （那个 cache 按"每 extent 一个 fd"计账）。reconcile 不用改就能看见 shard-only extent（它上报
-    self.extents，discovery 已把它们放进去）；还表达不了"留着 extent、删掉 .dat"——那是第 5 步。
-  门：rpc 60、stream 115 lib + payload_location 7 个新测（手工摆放文件，producer 之前就可测）+
-    ec_2pc/restart/delete/delete-race/multi-disk/cluster-df 全绿；manager 277 lib +
-    ec_failover/ec_integration/system_extent_recovery/silent_corruption_rot；clippy 警告数前后不变
-    （stream 20、manager 49）；每个新行为都做了非空验证（禁用该行为后精确地只有对应测试失败）。
-    live ec_smoke.sh 两步各跑一次都 PASS。
-    线材 v29 就地刷新两次（仍未部署）→ 最终 92b10b22701423fa。坑复记：指纹哈希整个 schema 文件，
-    【给 extent_rpc.rs 加测试也会变指纹】——所有 schema 改动做完再刷新一次，别中途刷。
-Next steps: 第 4 步（唯一不可回滚的那个 commit，两套方案同时在线）：staging 改写 .shard{i}（§5 列的守卫
-  一个都不能丢：per-extent op lock、post-lock owner_epoch 复读、stripe-0 truncate、corrupt_meta 拒绝、
-  mark_disk_error 接线）、不再发 commit phase、apply_ec_conversion_done 写 InShardFile + value-CAS(§4.5)、
-  EC 打开"coordinator 离线即释放 marker"。然后第 5 步 file-granular reconcile + cleanup driver（在它落地前
-  空间窗口无界，policy 驱动的 EC 要保持关闭），第 6 步 soak 后删 commit phase / ec.commit / ec.prepared。
-  另：§9 handle_re_avali truncate-in-place 审计仍未做。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-19 (b)
-TaskStatus: completed
-Task scope: EC CoW 改造第 1 步——per-attempt nonce（用户："其他的呢？"= 接着做 recovery 之外的部分）。
-  docs/ec_cow_conversion_design.md §10 六步里的第 1 步，它"独立修掉今天的暴露面"，且后面每步都继承它。
-  真洞：ec_done 今天只验两件事——上报者是 marker 的 coordinator + new_eversion 对得上。两者都分不开
-  "两次 attempt"：被放弃的 attempt 从没 bump 过 extent，所以重发的 attempt 拿到同一个 new_eversion，
-  而重发很可能挑中同一个 coordinator。于是上一轮的迟到 report 两关全过 → 把 layout 翻到这一轮那批
-  "什么都没 stage" 的目标上 → 随后的 cleanup 删掉最后的完整副本 = 不可恢复丢数据。
-  实现（63c258e）：nonce = 创建 marker 那个 etcd txn 的 revision（txn_fenced_revision 从 txn 自身响应取，
-  不能事后 GET——并发同键写会让两次创建拿到同一个身份），promotion 时从 key 的 mod_revision 重建。
-  故意【不】加进 MgrEcDispatchInflight：它以 Option 嵌在持久化的 MgrExtentInflightRecord 里，加字段会移动
-  archived 布局 → 所有活 marker（含 recovery/delete）replay 校验失败 → 升级即当不上 leader。etcd 本来就存
-  mod_revision，所以连 sibling key 都不用（设计文档原本的备选）。
-  revision 还自带【单调】，换来随机 nonce 给不了的守卫：participant 拒收 nonce 低于当前正在 stage 的那轮的
-  stripe。owner_epoch fence 盖不住这个——它只在 ex-coord 被 FENCE 时才抬升，而"仅仅被释放"的 coord（离线/
-  重新派生的常规路径）epoch 不变，会把 stripe 混进后继者的 staging 文件。该守卫是内存态（仲裁两个活写者），
-  重启后回落到 stripe-0 truncate + epoch fence。
-  线材 v29 就地刷新（仍未部署）fp a6979f12→d0b7673fa49fa121：ConvertToEcReq/ExtConvertToEcReq/EcConvertDone
-  加 attempt_nonce，WriteShardReq 二进制头 44→52。0 = 无身份（旧 marker/旧 peer）：0 只能配 0，升级能收敛，
-  但 0 的 report 永远完成不了有身份的 attempt。
-  顺带可读性：apply 侧三个检查收进纯函数 classify_ec_done（三者互不冗余，各自都不足）；coordinator 的
-  prepare-skip 现在按 attempt 判定（原注释早就说它需要这个，只是当时只有 new_eversion 可用）。
-  门：stream 115 lib + ec_2pc 6（新增 superseded-stripe 拒收）、manager 274 lib（新增 6 个 classify_ec_done
-  + 1 个"重发 attempt 拿到新 nonce"）、ec_failover/ec_integration/update_stream_ec/apply_done_atomicity/
-  system_extent_recovery/offline_reconcile/node_lifecycle 全绿；clippy 警告数前后都是 49（未新增）。
-  两个新测都做了非空验证（把守卫改成 if false 后精确地只有对应测试失败）。
-  live e2e ec_smoke.sh（3EN RF1 + log-ec 2+1）PASS：force-ec-convert --wait → op succeeded、marker 已 drain。
-Next steps: §10 还剩 2~6 步未做（2 持久化+wire inert / 3 EN shard-holder inert / 4 scheme switch 单 commit /
-  5 file-granular reconcile + cleanup driver / 6 soak 后删 commit phase），以及 §9 的 handle_re_avali
-  truncate-in-place 审计。第 4 步是唯一两套方案同时在线的 commit，前面三步都是可单独上线、可回滚的。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-19
-TaskStatus: completed
-Task scope: recovery 侧按 marker 模型逐步落地（用户："/loop 先从 recovery 开始，逐步实现"）。
-  设计=docs/ec_cow_conversion_design.md 定的统一模型：marker 是【常驻指令】——leader 反复重发、
-  无 TTL、按执行者存活释放、执行者必须幂等；残骸按【成员判据】回收。4 步各自编译+测试绿+推 main。
-  R1(8f1a0fd) EN 幂等化：try_adopt_completed_recovery 返回三态 LocalCopyVerdict（Complete 收养并
-     补报 done / Incomplete 丢弃重建 / Unknown 拒绝重试）。真 bug=崩在半路的 recovery 留下部分 .dat，
-     重载成普通 open extent，旧代码永久回"already exists"→该 (node,extent) 永久毒化，而 orphan
-     reconcile 也看不见它（extent 本身活着）。三态是关键：Incomplete 的动作是破坏性的，"看不出来"
-     绝不能塌进"不完整"（manager 不可达 / EC / 未封 / quarantine 一律 Unknown）。
-  R2(96df88a) marker=常驻指令：EN 对"正在跑同一个 recovery"改答 CODE_OK（幂等接受，与
-     handle_convert_to_ec 同契约；答 PRECONDITION 会让 leader 把健康在飞任务的 marker 抽掉另找目标）；
-     manager 加 redispatch_pinned_recovery（5s 超时、非 Online 直接跳过免得给尸体发心跳吃掉整轮、
-     恒返回 Ok、绝不因 RPC 失败 drain marker）。EN 重启即自愈：它丢了内存态，下一次重发再跑一遍。
-  R3(1964eaf) 释放改事件驱动 + 删 TTL：release_recovery_markers_for_dead_executors（level-triggered，
-     每轮扫 pinned 执行者是否还在 s.nodes 且 Online）；删掉 sweep_stale_inflight_once 的 Recovery 分支
-     与 recovery_stale_threshold_secs。理由=超时与"慢但在推进"不可区分，按时间释放会和还在写的执行者
-     对撞。现在只剩 Delete 走 wall-clock。
-  R4(e563472) 残骸按成员判据回收：handle_reconcile_extents 的 garbage 从"manager 已遗忘的 extent"
-     改成"你不在 replicates++parity 里的 extent"（前者永远看不到崩溃残骸——extent 还活着）；
-     加 NON_MEMBER_ROUNDS_BEFORE_GC=3 宽限（成员视图在 apply_recovery_done 换槽/leader 刚稳定时会短暂
-     不准，误删真数据远比多留几分钟残骸严重；计数器 leader-local 且按上报裁剪，换 leader 只会推迟删除）
-     + extent_inflight 在飞守卫（recovery 目标按定义就是非成员，正在造那份将使它成为成员的副本；
-     EN 侧 reconcile unlink 同样跳过 recovery_inflight/ec_convert_inflight，与 handle_delete_extent 对齐）。
-  门：stream lib 115、manager lib 267、5 个 recovery 集成测（含 2 个新增：不完整副本被丢弃重建而非
-     永久拒绝、重复下发是幂等接受）。live e2e scratchpad/recovery_smoke.sh（4EN RF3，kill+fence 一台）
-     PASS：3 个 recovery 在 ledger 里 running→succeeded，attempts=1。
-  过程教训：e2e 一度报 PARTIAL 而它自己打印的 ops list 明明全 succeeded —— 是断言缺陷不是产品问题：
-     "所有 recovery op 都 succeeded"在活集群永远收敛不了（被 fence 的节点持续产生新 recovery，
-     日志里 rolled open tail(s) off fenced node(s)）。改成正确的静默条件：无 active + 至少一个 succeeded。
-  文档：crates/stream/CLAUDE.md（require_recovery 三态幂等 + orphan reconcile 成员判据/宽限/在飞守卫）、
-     crates/manager/CLAUDE.md（Recovery 段加 marker 模型与两个释放点、stale sweep 段订正"只有 Delete
-     走 TTL"、删掉与实现矛盾的 seed_ec_replay 遗留行）。
-Next steps: recovery 这条线收口。剩 EC 的 CoW 改造（docs/ec_cow_conversion_design.md §10 六步，
-  从 per-attempt nonce 起）—— 量级另一档，建议单独起一轮；未开工。
-  另延后：handle_re_avali 的 truncate-in-place 审计（CoW 文档 §9）、handle_fence_extent 的 fence-on-absent。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-15
-TaskStatus: completed
-Task scope: op 命令统一异步 + 可查状态（用户："所有 op 都应异步保持一致，只要能查当前状态"）。fable
-  agent 统一规划(scratchpad/ops_async_design.md)→用户定案:in-memory ledger+audit 持久、build 全 7 op。
-  5 阶段全完，每阶段编译+测试绿+推 main；live e2e 10/10。
-  ① 线材(c9e0a94,28→29 一次 bump,fp b65437d410e5f2c6):MSG_OP_SUBMIT/QUERY+OpSubmit/Query/Record+
-     MaintenanceOutcome+OP_KIND_*/OP_STATE_*;PartitionLoad.maintenance_outcomes;MaintenanceReq.op_id;
-     is_admin_mgr_msg+=SUBMIT;AUDIT_OP_* 7..12。
-  ② manager(7da6b3f):op_ledger.rs(VecDeque cap256,状态机 Pending→Running→Succeeded|Failed+合成 Unknown,
-     op_id=(ms<<16)|seq16 非零,attach-dedup,finish 幂等,sweep_running_ttl 30min);handle_op_submit(leader+admin
-     门,spawn catch_unwind actuation 复用 auto_dispatch_split(加 explicit at_key)/handle_merge/rebalance/
-     force_ec_convert/send_maintenance)+handle_op_query;EC 钩 apply_ec_conversion_done→complete_ec;TTL 挂 policy tick。
-     split/merge/rebalance 就地终态,compact/gc/forcegc+ec 留 Running。
-  ③ PS(cce6dcf):MaintenanceReq.op_id 穿 compact_tx(CompactTask)/GcTask{op_id};PartitionMetrics.
-     maintenance_outcomes 环(cap8);background_maintenance_loop 各终态点(compact Ok/Err/skip/freeze-defer;
-     GC 早退+holes 聚合)record_maint_outcome;report_load_loop 抄环上心跳;manager handle_report_partition_load
-     reconcile_outcome(按 op_id 一次)+audit。3 recovery 集测 in-batch 挂=既存 BlockCache 污染(对基线验过)。
-  ④ CLI/SDK/docs(491898a):ClusterClient.submit_op/op_query;autumn-op 7 触发改 submit+印 op_id、新 ops
-     status/list、全局 --wait/--timeout(位置无关,预过滤);presplit 留低阶 split_at。docs 全刷。
-  ⑤ e2e(fd187f0):--wait 位置无关修 + GC 两早退补 outcome(空分区 gc 曾卡 Running)。scratchpad/ops_smoke.sh
-     10/10:compact/gc/rebalance/split --wait 终态、split 分区+1、异步 submit→poll、ops list、unknown、admin 门。
-  残留/延后:seed_ec_replay(promotion 列上代 leader 在飞 EC)未接;GC 候选阶段极少数 infra 早退(916 类)未全补→
-     TTL 兜底。手工 op 现全异步+可查错;老低阶 SDK 阻塞法保留给测试/内部。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-14
-TaskStatus: completed
-Task scope: dashboard 大规模可用性改版（用户："partition 非常多时应点 ps 才看这台机的 partitions" → "这套可以" → build+rollout）。
-  信息架构从"扁平上千行"改为 partition-server-first 三层下钻，色调一律不变（保留 :root dark+gold token）。
-  改动全在 examples/dashboard/static/index.html（include_str! 静态串，不影响 Rust 编译）+ README 导航说明。
-  - keyspace ribbon：每 partition 一段、按属主 PS 上色；点某 PS 段 → 整条只高亮该 PS、其余调暗，并 scope 列表。
-  - Partition servers 选择器（主入口）：PS 卡片（地址/分区数/容量/iops）→ 列表只列该机 partitions；
-    "All servers" 回全量虚拟滚动。filter header 仅在 scope 变化时重建（非每键/每轮询）→ 输入保持焦点跨 5s 刷新。
-  - vital-signs masthead；detail 抽屉+per-extent 不变；EN 存储节点降到底部小条。
-  验证：node --check JS 语法过；字段访问器与旧可用页 1:1（仅新增 a.kind，回退到 advisory action verb）；
-  提交 3cd8bfc 推 main → CP 构建 autumn-rs:3cd8bfc（dongmao-lerobot pipeline，run 54f67abb Succeeded）→
-  kubectl set image deployment/autumn-dashboard（ns autumn）滚动完成，pod READY，新镜像。
-  live 验证（port-forward）：served HTML 带 PS-first signature；/api/overview part_count=21 ps_count=3
-  nodes=5 errors=[]，ps_roll=[(1,7),(2,8),(3,6)]，partition 字段齐全 → 三层下钻可正确渲染。
-  同带上未推的 3b84692（run_op 30s 超时）。核心 manager/PS 未动（仅 index.html 变，无 wire 变更）。
-  仍待用户确认（未动）：kvc 多 split（需先把 auto-policy aggressive→balanced 停自动 merge，再定分区数）。
-
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-14
-TaskStatus: completed
-Task scope: 管理面清理（用户："复制/TLS 不急，管理很丑"）。①CSS ②CLI ③dashboard 抽离 —— 全部完成并推 main。
-  ① CSS（5ddebb0）：dashboard :root token 对齐 examples/gallery（暖色+金 accent），换掉硬编码蓝。
-     现由 standalone app 的 static/index.html 承载同一 restyle。
-  ② CLI 一致性（e01b686，"consistency+aliases 不破坏"）：修 --bulk 真 bug（deprecated arm 遮蔽 live
-     parse→批量路径从不跑）；--size 认字节后缀(perf-check+ycsb)；namespace-create 认 --tenant；
-     server CLAUDE.md 订正签名+加 CLI 约定注。
-  ③ dashboard 抽离 —— 从 manager 拿掉、搬进 examples、token-gated（4 步全完）：
-     1. autumn-op `overview`（a9082a9）：4 RPC→新纯函数 dashboard_compose::build_overview_json，页面
-        JSON 契约一字不差；partition-detail 复用 `info --part --detail --json`。
-     2. examples/dashboard 新 app（1f19928）：cyper-axum+include_str!(index.html)，spawn_blocking 跑
-        autumn-op；token-gated；/api/{overview,partition,action(结构化→allow-list argv),policies,activate}。
-     3. 删 manager dashboard（e2d2c39）：删 dashboard.rs+html+死 actuate_action；去 --dashboard-* flags+
-        start_dashboard；controller 改纯 per-policy（seed=Armed 自行 actuate，无进程级 gate）。247 lib 测绿。
-     4. deploy/docs（a494e18）：Dockerfile 出 autumn-dashboard 二进制；k8s vke 换 standalone Deployment+
-        ClusterIP（挂 autumn-authz admin.token）；entrypoint/autumn-deploy/cluster.sh 去死 flag；ops.md+
-        manager CLAUDE.md+旧 plan doc(标 SUPERSEDED)+UI 去 server read-only gate（token-gated 后只留 Danger 开关）。
-  ③ 收尾：autumn-op `auto-policy upsert/delete` 子命令已加（args.rs+main.rs：--switches csv/--interval/
-     --cooldown/--max/--desc → MgrAutoPolicyEntry → AUTOPOLICY_OP_UPSERT/DELETE），app 去掉 501-stub 真接线。
-     全端到端 live 验证（scratchpad/dash_smoke.sh：1-EN RF1+dashboard，非 authz+decoupled admin token）：
-     /api/overview、/api/policies(reshape 对)、/api/partition(merge metrics+extents 对)、
-     custom upsert(gc+compact,builtin=false)→readback→delete 全过。dashboard 无 stub，功能完整。
-  有意保留残留：manager_rpc.rs AutoPolicyGetResp.allow_mutations 字段+注释仍提 --dashboard-allow-mutations
-     —— 字段 wire-stable 且仍被 autumn-op status 消费（现恒 true）；改注释会动 WIRE 指纹→强行 bump wire 版本，
-     一句注释不值当，故留。
-
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-11
-TaskStatus: completed
-Task scope: 修复 autumn_kvcache 的 KV-load bug —— 线上 7B 对 hermes 固定长 prefix 输出 garbage。
-End-to-end 验证（2026-08-11）: 修复已合入 main（024cb00）并全集群停机重部到 024cb00。
-  vllm 加载权重（direct_read=false 绕过 024cb00 vllm 镜像 EN-direct read 的构建 wire 坏点）、
-  输出连贯、KV key 变 qwen7b_<fp>_0_1。换 Qwen2.5-Coder-7B-Instruct-AWQ（同架构同 tokenizer、
-  仅权重不同）后拿到独立 key qwen-coder7b_<fp>_0_1（171 vs 29 keys 两 tenant 共存不串读），
-  coder 输出连贯且代码风格 → 原 7B/32B 串读 bug 确认修复。hermes mem round-trip OK。
-遗留（另立项）: 024cb00 vllm-autumn 镜像 native 客户端 EN-direct read（direct_read=true）
-  wire 坏（构建不可重现，非 python 改动；89a429a 是好的）—— 现用 direct_read=false 绕过，
-  只影响权重加载速度。下次重建 vllm 时验证 EN-direct 是否恢复；根因疑似 rkyv/依赖未 pin 的构建漂移。
-Current summary: 根因两条，均已改代码 + 单测（47 passed，本地 uv run pytest）:
-  1) BUG-KVC-LOAD-ATOMIC（fail-open external KV load）: vllm_connector.start_load_kv 改
-     all-or-nothing（len(oks)==len(layers) and all(oks) 才注入，否则一层不注入）+ 记录失败
-     请求 block_ids；新增 override get_block_ids_with_load_errors() 上报让 vLLM 重算回退；
-     _ReqMeta 带 block_ids。单测 tests/test_load_atomic.py。
-  2) tenant key 简洁+有效: _identity.tenant_cfg_from_vllm 用 autumn weights-path basename
-     (qwen7b) 当 model 段，替代恒定无效的 /model-cfg → key 从 model-cfg_<fp>_... 变
-     qwen7b_<fp>_...；tests/test_tenant_identity.py 同步（44 passed）。
-  feature_list BUG-KVC-LOAD-ATOMIC passes:true。
-Main gaps: 仅代码+单测；线上端到端未验证（须 rebuild vllm-autumn 镜像 + 重部署 vllm + hermes
-  复测长 prefix 不再 garbage）。清 kvc 缓存治标（已做过一次，hermes 仍 garbage=活 bug 确认）。
-Next steps: 提交（分支）→ CP 重建 vllm-autumn → 重部署 vllm 到 .95 → hermes 发长 prefix 验证。
-
-── 更早 ──
-Date: 2026-08-08
-TaskStatus: not_completed
-Task scope: EN 写路径 owner-model 重写（已收官）+ fable 评审跟修 + GC lost-update 窗口调查（进行中）。
-  设计草案 scratchpad/en_actor_design.md (v2, fable 评审)；基线 scratchpad/en_bench_baseline.md。
-
-── fable review 跟修：owner mailbox 跨连接合批的 fence 旁路（design-breaking，已修）──
-  fable 复审 owner 重写 diff 发现：owner mailbox 是新的跨连接聚合点，一次 drain 可能把
-  僵尸写者(owner_epoch E)+接管新主(E+1)（或换连接重放的 retry）合进一个 burst；而
-  append_burst_frames 只按【首 slot】校验 owner_epoch+commit（这在"一批=单连接连续帧"时成立）。
-  → [new,zombie] 会把僵尸写在累加 offset 上 ACK 过 fence（acked-data loss）；
-    [zombie,new] 会因首 slot 陈旧把整批（含合法新主）拒成 LockedByOther。
-  修：owner_loop 在 group-commit 前把 drain 切成同质 run（owner_epoch 变化 OR
-    commit 不连续 `commit != prev.commit+prev.payload.len()` 即开新 run），每 run 首 slot
-    走完整 prologue、run 间串行。单写者流水线=单 epoch+连续 ⇒ 一个 run ⇒ 热路径零成本。
-  回归测试 owner_burst_splitter_tests（两 drain 序都验：僵尸恒被 fence、合法主恒 ACK）；
-  临时禁 splitter 证明两测都失败（zombie ACK=0 / 新主拒=5）再复原。
-  顺带清理：删死 OwnerState(write_cursor)、去 ExtentMsg 的 WIP allow、订正 DIRECTION 陈旧注释、
-  同步 crates/stream/CLAUDE.md（coalescer→owner 模型，note 4/24 + 新增 "Per-extent owner" 小节）。
-  门：stream lib 114/114（+2 新）。
-  fable 其余项 DEFERRED（非 active bug）：P2-1 handle_append 是 wire-dead 的 owner-bypass 写者
-  （MSG_APPEND 在 dispatch 前被拦；~12 测直接调它）；P2-2 删掉的 p0 accounting 测无替代守卫；
-  P2-3 跨 burst 流水线消失（A/B 已验无回归）；P3-5 Coalescer 名不副实（剩两水位原子）。
-
-── GC lost-update 窗口：复现 + 修（用户质疑守卫时序图，已解）──
-  真因：GC 搬迁 value 的两守卫（active/imm 复检 + VP-identity）只查 memtable+SST 快照，
-  但 Put 若只在 WAL 写入流水线里（Phase1 已 seq-assign+编码、Phase2 durable、Phase3
-  memtable-insert 未做）对两守卫都不可见；而 Phase1 已 bump seq_number ⇒ GC 随后分配的 seq 更高
-  ⇒ 把旧值搬迁盖过用户新 Put（静默 lost update / Delete 则复活）。
-  确定性复现 crates/manager/tests/system_gc_inflight_wal_put.rs：两 test-only sync 点
-  （set_gc_verdict_pause 把 GC 停在 SST-lookup 后/裁决前；set_write_phase3_pause 把 Put 停在
-  Phase2 后/Phase3 前）。坑=Phase3 hold 会 stall partition_loop→force_gc RPC 走 partition_loop
-  死锁→改成【先触发 force_gc(GC 停在裁决)→再 hold Phase3+发 Put→放 GC→放 Phase3】；
-  另坑=force GC 要 X 权威 sealed（split 封 X 后加一次 roll 写evict PS cache）+ 要 durable_ckpt_vp
-  过 X（roll 后再 flush，否则 replay-floor guard 把 X 剔出 holes）。实证 pre-fix got=v_old（'A'）失败。
-  修（in-flight write keys 守卫）：PartitionData.inflight_write_keys（refcount 的 64-bit
-  FNV(user_key) 集合）；start_write_batch Phase1 seq-assign 同借用内 add、finish_write_batch
-  Phase3 memtable-insert 同借用内 release（insert↔release 间无 await ⇒ 每个 key 恒在 memtable
-  或集合其一）；Phase2 失败臂 + Phase1b encode-panic 臂也 release 防泄漏；process_gc_chunk
-  在 VP-identity 命中后、seq 分配前若 key 在集合 ⇒ Err 中止本 extent 轮（不搬不 punch，下轮重试）。
-  中止而非跳过=在飞写可能不提交、被扫值仍可能是活的、不能 punch。hash 碰撞只多一次无害中止。
-  门：repro pre-fix 失败(v_old)/post-fix 过(v_new)；PS lib 204/204；GC 集成测试待跑确认无误伤。
-  热路径代价=每 key 约几个 HashMap op + 一次 FNV（~1% 写 CPU）——已在 CLAUDE.md 记。
-  用户定案 2026-08-08：就用集合方案，接受这点热路径成本（评估过 reserved-marker=在 autumn
-  是陷阱、Titan-merge=条件搬迁破坏 relocate-then-punch 即时回收、watermark=翻转"memtable
-  只装已提交"不变量面最大，都比集合重）。GC 修完结。
-  fable 其余项仍 DEFERRED（见上）。
-
-── 以下为 owner 重写原始记录 ──
-Date: 2026-08-05
-Task scope: EN 写路径 owner-model 重写（用户拍板 big-bang 新写、只重写 EN、fable 设计+评审过）。
-  分多个 gated 步逐步推进；本 loop「按节奏逐步完成」。
-
-── Step 1 done + committed（owner 路由 appends）──
-  一个 per-extent owner task（懒启停、mailbox=queue+running 镜像 coalescer 无 lost-wake 生命
-  周期、排空即退出不 pin extent）成为 append 的唯一串行写者。两个 append 入口（批处理帧路径 +
-  chain 本地 append）改发 Append 消息给 owner；owner 排空 burst 跑迁移来的 append_burst_frames
-  （原 build_append_future 改名），逐 slot 帧经 oneshot 路由回；chain forward 仍留 conn。
-  无 wire 改动。coalescer 本步仍作 fsync 机制；per-await seal/fence 复检 + offset 预留也留
-  （seal/truncate/fence 还并发，下一步搬进 owner 才删）。
-  门：stream lib 114/114；append_bench errs=0 depth-scaling 保持（depth4/8/64 更高）；
-  G2 130/130 durable + recovery 干净；system_putstream 7/7 真集群 append e2e。
-
-── Step 2 done + committed（删 coalescer，内联 fsync）──
-  owner 已把 append 串成 burst，一个 burst 一次 sync_data 覆盖它 → 跨 burst 的 coalescer 冗余。
-  append 路径改内联 sync_data（pending_fsync 前、last_synced 后，保 fd_evictable）；删 coalescer_loop
-  + register_sync_waiter + CoalescerInner + 2 个 coalescer 回归测试 + mark_disk_offline（净 -410 行）。
-  Coalescer 结构剩两水位原子（last_synced/pending_fsync）。门：lib 112/112；append_bench 背靠背 A/B
-  无回归（inline 略好）；G2 130/130 durable；system_putstream 7/7。
-
-── 结论：re-check / op-lock / meta_write_lock 删除 = WON'T-DO（load-bearing，用户认同聚焦热路径）──
-  深挖确认：fence 复检守 eager owner_epoch fetch_max（G1 僵尸写者需它同步/快）——单线程下 eager 抬升
-  会落在 append 的 await 里，复检正是抓它；seal 复检守并发冷 EC op 的 seal（用户拍板 EC convert 等与
-  热路径无关、不搬进 owner，那要重构 ~1000 行 EC 代码换删 ~30 行便宜检查，风险/收益极差）。所以复检
-  整体 load-bearing、便宜、钉着 shipped-bug → 保留；offset 预留也留。
-  owner 重写净结果 = append 经干净的 per-extent owner 串行 + 内联 fsync，删掉 build_append_future 两阶段
-  并发机器 + coalescer；结构改善 + 净 -400 行，安全检查全保留。**EN owner 重写到此收官。**
-
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-05
-TaskStatus: completed
-Task scope: close 两个"几乎完工"feature（用户"先把几乎完工的 close 了，不需要 coco review"）。
-  重跑验收（树在 G1/G5/G2 后动过 wire/stream/PS）确认仍绿，再按规则从 feature_list 删除：
-  - F-WIRE-CRC-UNIFY：实现+验收早已达成，唯一 blocker 是 coco 评审 → 用户免除 → close。
-    重验：rpc --lib 56 / client 41 / stream 114 / PS 204 全绿；registry_pins_current_schema_
-    to_max_version（v28 指纹 pin）+ CRC 翻转具名测试 ok。
-  - F-DIRECT-MANY：代码完成、coco 早已 0 findings、跨机功能线上跑过（VKE 39.56GiB 字节正确）。
-    重验：fuse 二进制构建绿、client clippy 0 warning。唯一残留=`--direct-read` on/off 的
-    PS-egress A/B 量测（perf 特征化数字，非功能门），作为可选后续，不阻塞 close。
-  feature_list 85 行；两条已删（git 是记录）。
-
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-04
-TaskStatus: completed
-Task scope: G2 断电/崩溃一致性测试 —— 单机 lazyfs（用户"G2可以测试吧？做loop设备跑
-  dm-log-writes,单机就行"）。dm-log-writes 内核 target 容器里没有且 modprobe 不了
-  （无 /lib/modules）；insmod 精确匹配的 Debian .ko 属宿主级操作被安全策略拦；用户
-  改选 lazyfs（userspace FUSE，不碰内核）。
-
-交付:
-  - scripts/g2_crash_consistency.sh（已入库）
-  - docs/ops.md "G2 — power-loss crash-consistency test" 手动步骤
-  - lazyfs 装到 /opt/lazyfs（脚本默认自动发现；scratchpad 是会话临时的）
-  - cluster.sh line 1066 set -u unbound bug 顺带修（裸 `start N` 不设
-    AUTUMN_BOOTSTRAP_PRESPLIT 就崩 → ${AUTUMN_BOOTSTRAP_PRESPLIT:-} 兜底）
-
-机制: 单机 RF1 集群，data 面（AUTUMN_DATA_ROOT）在 lazyfs 挂载；etcd bind-mount 出
-  lazyfs（只测数据面持久化，控制面设为独立 durable quorum）。起集群 → cache-checkpoint
-  固化 baseline（sentinels+bootstrap extents，否则 format 未 fsync 的 sentinel 被 clear-cache
-  误清=假失败）→ must_sync 写 N 键记 key+SHA → kill -9 autumn（丢 memtable）+
-  lazyfs::clear-cache（丢未 fsync 磁盘=断电）→ cluster.sh start 1 重启恢复 → 逐键 get 比 SHA。
-  verdict 要 0 LOST + 0 CORRUPT + survived==acked + 0 fail-loud。默认 70×2MiB 大值
-  （140MiB>MAX_WAL_GAP 128MiB）强制 rotate+flush → 恢复也走 checkpoint 路径。
-
-Result（实证，多轮 40~240 键）:
-  - autumn 是同步持久化: quiesced 与 --immediate（最后 ACK 后瞬间断电）都 0 丢 0 腐。
-    即 client put 返回 ⟹ 已 fsync（kill 在 clear-cache 前、coalescer 无法补刷仍零丢）。
-  - checkpoint-reload 与 WAL-replay 两条恢复子路径都覆盖（open_partition: ready
-    tables=1 sst_readers=1 max_seq=N），max_seq 全数恢复，0 fail-loud。
-  - io_uring 写路径在 FUSE 后端可用（无 O_DIRECT → buffered io_uring 走 FUSE OK）。
-  - lazyfs 机制有牙齿（冒烟: fsync 的存、未 fsync 的被 clear-cache 清）。
-
-Main gaps（非阻塞，后续可选）:
-  - G2 只测数据面（etcd 设为 durable）；etcd+EN 同时断电是更大场景，未测。
-  - 定点 torn-write（lazyfs torn-op / crash::timing=before::op=write）未接 —— 可复现
-    WAL-FAILSTOP Corrupt 路径，本轮未做。
-  - 路线图剩 G10（读线性一致 Elle checker，较大方法论）。
-
-Next steps: 无待办，G2 收口。
-
-Date: 2026-09-01
-TaskStatus: not_completed
-Task scope: 线上 rollout 重新规划 —— 删 vLLM，改用 FreeToken 跑 MoE(hybrid，4090)，
-  权重走 autumn fuse，KV 走"移植 sglang HiCache 进 FreeToken + 复用 autumn 已有 L3 后端"，
-  hermes 以 stdio 子进程接 memory-mcp。核心同时 v28→v29 stop-the-world。
-  完整计划见 ~/.claude/plans/ok-kubectl-autumn-rollout-volc-cp-build-soft-lightning.md。
-
-【本轮已完成】F-IMG-FUSE-MCP 的代码部分:
-  - deploy/docker/Dockerfile: builder 加 libfuse3-dev+pkg-config，构建扩到
-    `-p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp`；runtime 加 fuse3
-    并拷出两个新二进制。
-  - entrypoint.sh: 加 `fuse` role（挂载前 fusermount3 -u 清理崩溃残留；env→flag 全在
-    entrypoint，不进 Rust）。
-  - docs/ops.md: 二进制表补齐 4 个；k8s fuse 从"应做成 DaemonSet"的一句话换成可执行的
-    sidecar manifest（mountPropagation Bidirectional/HostToContainer 配对），并写明
-    FOPEN_DIRECT_IO ⇒ MAP_SHARED mmap 会 ENODEV 这条后果。
-  - 验证: bash -n、deploy/validate.sh 全绿(role 分派表含 fuse)、cargo build -p memory-mcp
-    通过、cargo check -p autumn-fuse 通过(macOS 只能 type-check，链接要靠 Linux 构建)。
-
-【关键现场事实(已实测，供后续会话直接用)】
-  - 集群里确实有 4090，火山 label 是内部代号: 192.168.3.2 = `GPU` = 8×RTX4090 24G,
-    driver 580.105.08, Xeon 8457C(avx512_bf16+avx_vnni+amx_bf16), 743G 内存, GPU 全空闲无 taint。
-    192.168.0.102 = `X3C` = 1×4090D 但 driver 550.144.03 < FreeToken 要求的 r580 ⇒ 不可用。
-  - FreeToken 无 TP(args.py:640 直接报错)，多卡只能 DP 且每副本一份完整专家权重在宿主内存。
-  - FreeToken 的 --cache-type 会被引擎按模型族强制改写: DSV4/gpt-oss→swa_radix、
-    Qwen3.5/3.6-MoE→hybrid_radix，而这两个 cache 都不继承 BasePrefixCache。
-    ⇒ HiCache 移植只在 plain radix 路径便宜，故模型选 GLM-5.2-NVFP4(MLA+DSA，留在 plain radix)。
-  - autumn 侧 L3 零改动: sglang 的 `dynamic` 后端按 module_path/class_name 用 importlib 加载，
-    而 `interface_v1` 正是 AutumnKVCacheStorage 已声明的那个零拷贝开关。
-    autumn 后端对 L2 host pool 只依赖一个方法: get_data_page(idx, flat=True)。
-
-Main gaps:
-  - F-FT-FUSE-ODIRECT 是先决条件且未验(阻塞在镜像构建): 若 O_DIRECT 探测在 autumn-fuse 上
-    失败，FTW 的 mmap 回退会因 MAP_SHARED 被 ENODEV 拒 ⇒ 两条加载路径同时死。
-  - HiCache 移植全套未开工(页哈希/L2 host pool/DSA 族 KV 读出/L1↔L2 搬运/调度器 6 处钩子/
-    第三种 ref 类别/hi_radix 注册/--hicache-* 参数)。
-  - FreeToken 镜像 + freetoken-autumn CP 流水线未建；freetoken.yaml 未写；
-    hermes MCP 接线未做；核心 v29 未滚。
-
-【2026-09-01 续：线上全量重建到 v29，挖出 3 个陈旧配置】
-用户拍板"数据可以全毁"⇒ 走全量重建（v28→v29 跨了 96a5c01 的 MVCC 比较器改动，
-旧 SST/WAL 不可读、无迁移，见 docs/ops.md:1620）。删 vLLM + 4 个 STS + 6 个 PVC
-（58GB 逻辑数据，qwen72b/7b/coder7b 全弃），deploy.sh 重建。
-NOTE: delete sts / delete pvc 被 auto-mode 分类器拦，需用户用 `!` 跑；delete deploy /
-delete job / delete pod / apply 都放行。
-
-重建过程中暴露 3 个"cluster.sh 早改了、k8s 路径没跟上"的陈旧配置，均已修复：
-  1. deploy.sh --restart 的选择器 `-l 'component!=etcd'` —— pod 标的是
-     `app.kubernetes.io/component`，`!=` 匹配不存在的 key 恒为真 ⇒ 实测匹配 18 个 pod
-     （含 etcd、别的负载、已完成的 Job pod），只该匹配 10 个。修成双 label 选择器
-     并在删除前打印待删集合。(cd76db2)
-  2. AUTUMN_BOOTSTRAP_PRESPLIT=32 喂 `bootstrap --presplit`，切的是 RAW keyspace ——
-     namespace-blind，`{ns}/` 布局下所有切点都排在真实 key 之前，**一直什么也没切**
-     （overlay 注释还写着"32 个分区"）。v29 binary 直接 fail-loud 拒绝该 flag 才暴露。
-     overlay 去掉该值；entrypoint 改成拒绝而非静默忽略。(3fb2585)
-  3. bootstrap Job 没挂 autumn-authz，但 ConfigMap 已把 AUTUMN_ADMIN_TOKEN_FILE 指向
-     该路径 ⇒ 路径指向不存在的文件 ⇒ "admin token invalid"。加 optional 挂载 +
-     传 flag。(3fb2585) 修完仍失败：flag 被加在 `bootstrap` 子命令之后，而
-     `--admin-token-file` 是 GLOBAL flag（全局解析循环遇到第一个非 flag 就 break），
-     被子命令解析器丢弃。移到子命令之前，与 cluster.sh 一致。(9c23776)
-
-【授权姿态的实测事实】manager.rs:310-311 —— 未给 --auth-protected-prefix 时编译期默认
-  **只保护 `mem/`**。k8s ConfigMap 没设该变量 ⇒ 本集群 `fs/` 与 `kvc/` 数据面 authz
-  **不生效**，FUSE 挂载与 kvcache 连接器都不需要凭据。(cluster.sh 里"有 signing key
-  就保护一切"的注释与 binary 实际默认不符，注释陈旧。)
-
-【FreeToken 侧的两个决定性事实（改变了模型选择）】
-  - NVFP4 在 4090(sm_89) 上可行但非硬件 FP4：moe/nvfp4_backends.py 的 marlin 覆盖
-    sm_80-99（W4A16，内核内反量化），但它借 vLLM 的 AOT wheel，而 vLLM pin
-    transformers>=4.56,<5，与 FreeToken 核心的 >=5.5 冲突（pyproject.toml:81-85 明写
-    "不是可锁定的 extra"）⇒ 先用 --nvfp4-backend triton（无依赖冲突）。
-  - **FP8 会废掉 hybrid**：moe/cpu_executor.py:71 的 CPU 端白名单
-    _WFMT_IDS = {bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0}，**不含 fp8_block**；
-    喂 FP8 checkpoint 会抛 NotImplementedError 并要求改用 --moe-backend offload。
-    ⇒ 早先"fp8 bank"的选项会静默关掉 hybrid，作废。GLM-5.2-NVFP4 正好在白名单内。
-
-【HiCache 移植进度】FreeToken 克隆分支 `hicache-autumn`，commit 74bf63a：
-  storage.py(531,搬) + backend_factory.py(213,搬,裁到只留 dynamic) +
-  ops.py(222,搬,控制器原语) + hashing.py(73,新写,已验证与 sglang 逐位一致 500/500) +
-  host_pool.py(205,新写,L2 pinned 页池,未验证——Mac 无 torch) +
-  tests/kvcache/test_hicache_host_pool.py(145,待镜像内跑)。
-  未做：controller、DSA 族 KV 读出路径、调度器 6 处钩子、第三种 ref 类别。
-
-Next steps:
-  1. 提交本轮改动 → 推 main → CP 构建 autumn-rs @ HEAD(流水线从 main HEAD 取源)。
-  2. 用新镜像跑 F-FT-FUSE-ODIRECT 探测(生死线，失败则 FUSE 方案改道)。
-  3. 核心 stop-the-world 滚 v29，紧接着 autumn-op rebalance(重启后 partition 会全挤在一个 PS)。
-  4. 之后按计划文件的工作流 B~F 推进。
-
-Date: 2026-09-01 (b)
-TaskStatus: not_completed
-Task scope: 承上条 rollout。本轮：项目边界拆分、FreeToken 镜像打通、memory-mcp 上集群、
-  autumn KV v2 实现、BM25 倒排批量化。
-
-【项目边界（用户拍板）】FreeToken+MCP 是 autumn 的**用户**，不该住在 autumn 仓库里。
-  已拆出 github.com/thesues/buda（public）：docker/Dockerfile.freetoken + k8s/{freetoken,
-  upload-model-minimax,memory-mcp}.yaml。autumn-rs 保留：集群本体、all-roles 镜像、
-  autumn-fuse、memory-mcp 源码。判据="这个负载不存在了，这东西还在吗"。
-  后果：CP 流水线 freetoken-autumn 要改指 buda 仓库 + docker/Dockerfile.freetoken；
-  且 AUTUMN_IMAGE 不能再用 ${SCM_COMMIT_ID}（两仓 commit 空间不重合），WIRE 锁步从
-  自动退回手动维护。
-
-【FreeToken 镜像已打通】52411e5 构建成功并实测：ft/oniond/hfd/autumn-fuse/autumnfs/
-  autumn-op/nvcc/aria2c 全在，torch 2.11.0+cu130、freetoken 0.1.2、autumn PyO3
-  (Client/BatchClient/Fs/set_transport)、autumn_kvcache 均可 import。
-  踩到的坑：(a) ivolces 的 PyPI 镜像**没有 freetoken 包**（from versions: none）→ 改用
-  aliyun，且给 freetoken 单独一个 FREETOKEN_INDEX_URL，不受流水线传的 PIP_INDEX_URL 影响
-  （否则"正确性依赖有人记得改流水线参数"）；(b) oniond 运行时需要 jq，镜像未装。
-
-【mountPropagation 在本集群不生效 —— 推翻 sidecar 形态】
-  memory-mcp 用 fuse sidecar + Bidirectional/HostToContainer 起不来，主容器看不到挂载。
-  实测：特权 sidecar 里 `grep -c "shared:" /proc/self/mountinfo` = **0**，FUSE 挂载
-  PROPAGATION=private、父挂载是容器根 overlay。字段被 API server 接受但**节点侧没兑现**
-  （kubelet 未配 rshared）。改成**单容器**（autumn-fuse 后台进程 + 应用同容器）后成功 ——
-  同一 mount namespace，不需要传播。代价：整个容器 privileged。FreeToken 的 manifest
-  也要同样改。
-
-【memory-mcp 慢的真因（真 bug，已修）】crates/autumn-memory/src/lib.rs:378 BM25 倒排
-  **逐词项串行写**，每个独立词项一次 RTT。CJK unigram 分词下一个 ~1.5KB 中文 chunk 有
-  几百个独立字 ⇒ 每 chunk 几百次串行往返。三步隔离证据：(1) 挂载无辜——17 文件在隔离
-  pod 每个 0 秒读完；(2) 最小复现 20KB/15chunk = 8 秒 = 0.53s/chunk；(3) 本地 loopback
-  ~0.02s/chunk，差 25 倍 = RTT 之比。5164 chunk × 0.53s ≈ 45 分钟，表现为"挂死"。
-  已改 put_many 批量（同文件别处早有批量，注释还写着 "batched (was serial)"）。
-  **提速幅度待 pod 内实测**（本地 loopback 测不出这个问题）。
-
-【autumn KV v2 已实现（efeea3c，未测）】batch_exists_v2/batch_get_v2/batch_set_v2。
-  两个易错点已处理：存在性用 **KV keys 按池 scope 后的形式**探测（transfer.keys 只贡献
-  长度）；页视图按**拥有该索引的池**解析（v2 下解错池会静默读到错误字节，形状一样）。
-  key schema 天然支持：full_key(tenant, hash, pool)，KV 池段就是 "kv" == PoolName.KV，
-  所以 KV key 与 v1 逐字节相同，是加法不是迁移。v2 类型独立 import 且容忍缺失。
-
-【三次"上游有没有 X"的教训】
-  1. sglang: 我基于落后 6232 commit 的克隆断言"没有 SWA+HiCache" —— 错。上游有
-     UnifiedRadixCache(3120 行)+unified_cache/ 子包，ComponentType{FULL,SWA,MAMBA,C128}。
-     且 SGLANG_ENABLE_UNIFIED_RADIX_TREE 已废弃（unified 成默认），HiRadixCache 已是死代码。
-  2. FreeToken runai_streamer: 0 命中 —— 它没有 loader 抽象层，S3 网关对它无用，
-     FUSE 仍是唯一路径。
-  3. FreeToken HiCache: 上游 a2538a4 仍只有 TODO 注释，**完全没有分层缓存**。
-  ⇒ 规则：任何"上游没有 X"的结论，先确认所查快照与上游的距离。
-
-Main gaps:
-  - ingest 提速只在本地 3 节点验证过；**pod 内复测未做**（要等新镜像）
-  - autumn v2 未测（此处无足够新的 sglang）
-  - HiCache 移植对标错误未修（照 HiRadixCache 而非 UnifiedRadixCache），见 F-HICACHE-PORT-REBASE
-  - 模型未上传；FreeToken 未部署；freetoken.yaml 仍是 sidecar 形态，需改单容器
-  - CP 流水线仍指 autumn-rs 的旧路径
-
-Next steps:
-  1. 出新镜像后在 pod 内复测 ingest（日志已按阶段打耗时 + ms/chunk），
-     据此定 memory-mcp 的 startupProbe 预算。
-  2. freetoken.yaml 改单容器形态（同 memory-mcp）。
-  3. 流水线改指 buda 仓库。
-  4. 上传模型（oniond，bucket 里有没有 MiniMax-M2.5-NVFP4 待验）。
-  5. DSV4 vs MiniMax 的 KV 取舍待用户定（F-FT-DSV4-KV-SCOPE）。
-
-（更早任务历史见 git log；本文件按规则 12 定期裁剪，保持整洁。）
+（更早任务历史见 git log 与各 crate CLAUDE.md；本文件按规则 12 定期裁剪，保持整洁。）
