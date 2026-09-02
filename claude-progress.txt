@@ -557,3 +557,21 @@ Next steps: 无。
   而且正好发生在集群已不健康时。安全实现需要跨请求的 (extent,shard) 持久失败计数 +
   非瞬时错误分类 + 阈值,还要拿到读路径上没有的 partition_id/log_stream_id。
   R4(a)(b) 已经让退化分片**可见**;自动隔离是有代价的策略决定,不该顺手做。
+
+【2026-09-02 更正:FreeToken 从未挂起 —— 我的第三次同型仪器错误】
+  事实: MiniMax 的加载**成功完成了**。串行专家构建 09:28:39 开始、09:49:38 打出
+  "Free memory after initialization: 1.84 GiB" —— 21 分钟,慢但正常。
+  我的错误: 用 `rchar` + 5 秒 CPU 采样判定"完全静止、0 I/O",据此宣布挂起。
+  但串行路径走的是**文件 mmap**(expert_banks.py 注释明写 "reclaimable file mmap"),
+  而 **mmap 的缺页不计入 rchar**。仪器看不见那种活动。
+
+  三次同型错误,记在一起因为它们不是三个偶然:
+    1. `ops history` 看不见 auto-policy 的 EC 转换(绕过 op ledger)-> 误证伪了正确假设
+    2. `dd 2>/dev/null | wc -c` 分不清 I/O 错误和 0 字节读 -> 误报"静默截断",
+       还让 subagent 花两轮论证一个伪事实
+    3. `rchar` 看不见 mmap 缺页 -> 误报"FreeToken 挂起"
+  共同形状: **用一个对目标现象天然失明的仪器测量,把空结果当成阴性结果。**
+  而这恰恰是我当天一直在别处指出的那个模式(失败伪装成成功)的镜像版本。
+  可操作的教训: 断言"什么都没发生"之前,先问这个仪器**能不能看见**要找的东西。
+  具体到本仓库: 进程级 I/O 用 `rchar` 不用 `read_bytes`(FUSE 不走块设备),
+  但两者都看不见 mmap —— 那要看 `minflt/majflt`。
