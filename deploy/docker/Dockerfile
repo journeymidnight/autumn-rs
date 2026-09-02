@@ -59,6 +59,31 @@ COPY . .
 RUN cargo build --release \
     -p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp -p autumn-s3
 
+# Ship the SOURCE the Python client is built from, in this image.
+#
+# Every consumer image that embeds the autumn client (freetoken-autumn,
+# vllm-autumn, hermes-autumn) built the wheel from its own autumn-rs checkout,
+# so the wheel's wire version came from whatever commit that checkout was at
+# while its `autumn-fuse`/`autumnfs` binaries were lifted from a SEPARATELY
+# pinned autumn-rs image. Nothing forced the two to agree, and a wheel at one
+# wire version with binaries at another is a build that looks fine and dies at
+# the handshake — or, if the fingerprint happens to match across a layout drift,
+# decodes garbage silently.
+#
+# Carrying the source here makes that unbuildable: a consumer copies BOTH the
+# binaries and the sources from one image tag, so they are the same commit by
+# construction, and that tag becomes its only version knob. It also frees the
+# consumer's Dockerfile from needing the autumn-rs repo as its build context.
+#
+# Source rather than a prebuilt wheel on purpose. The wheel is a native
+# extension, so it is bound to the builder's glibc AND (no abi3 here) its exact
+# CPython version. This image is Debian bookworm (glibc 2.36); freetoken-autumn
+# is CUDA-on-Ubuntu-22.04 (glibc 2.35, Python 3.10). A wheel built here would be
+# tagged manylinux_2_36 and pip would refuse it there — or, tagged plain linux,
+# install and then fail at import on a missing GLIBC_2.36. Letting the consumer
+# compile against its own runtime sidesteps all of that; it costs 8 MB here and
+# a Rust toolchain in the consumer's BUILD stage, which it already had.
+
 # Runtime: the server binaries link only libc/libgcc; bookworm-slim provides
 # bash + getent (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The
 # kernel comes from the k8s node and must be >= 5.15 (compio uses io_uring).
@@ -69,6 +94,12 @@ FROM ${BASE_REGISTRY}library/debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fuse3 \
     && rm -rf /var/lib/apt/lists/*
+# The Rust workspace sources a consumer needs to build the Python client, so it
+# can take the client and the binaries from ONE tag and never mismatch the wire
+# version. ~8 MB. Nothing in this image uses them; there is no toolchain here.
+COPY --from=builder /build/Cargo.toml /build/Cargo.lock /usr/local/share/autumn/src/
+COPY --from=builder /build/crates/ /usr/local/share/autumn/src/crates/
+COPY --from=builder /build/python/ /usr/local/share/autumn/src/python/
 COPY --from=builder \
     /build/target/release/autumn-manager-server \
     /build/target/release/autumn-extent-node \
