@@ -1,6 +1,6 @@
 Date: 2026-09-02
-TaskStatus: not_completed
-Task scope: 给 autumn-memory 的检索路径装上可测量的护栏——固定语料 + 41 条标注查询 +
+TaskStatus: completed
+Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API + FUSE 节点故障根因修复 + 集群重建。
   逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
   清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），
   逐条核对现状后用户只选了 eval set，语料指定 /data/dongmao_dev/md（17 部佛典，6 MB，
@@ -398,3 +398,46 @@ Next steps: 无。
     4. 补测 train_centroids 批量化后 reconcile 从 88.3s 降到多少 —— 这是本轮 ingest
        优化唯一还没落地的数字(写入循环那半已实测 177.7s → 77.2s / 34.4 → 15.0 ms/chunk)
     待用户定:要不要重建 freetoken-autumn 镜像(wire 30)。
+
+【2026-09-02 收尾:全部落地,数字已实测】
+  ■ ingest 性能——本轮目标,已完成(真集群,5164 chunks,同语料)
+      写入循环        177.7s (34.4 ms/chunk)  ->  71.3s (13.8)   2.5x
+      reconcile+train 101.1s                  ->  14.6s          6.9x
+      端到端          278.7s                  ->  85.9s          **3.2x**
+    最后这次还是在 MiniMax 130 GiB 上传同时抢同一批 PS/EN 的情况下测的,干净环境只会更快。
+    关键认知:批量化**读**只让 reconcile 从 101→88s(14%),因为成本从来不在读;
+    真凶是 train_centroids 里逐向量 2-3 次往返的**串行重新分桶**(5164 个向量 = 一万多次往返),
+    改成三段批量写后塌成 14.6s。顺序不可调换:新 posting -> vptr -> 删旧 posting。
+    另:**loopback 测不出这个改动**(本地 A/B 1.85 vs 1.87s),RTT 只有 ~20µs 会淹没往返差。
+
+  ■ CJK bigram 已在重建索引上验证
+    `慧能` 命中《六祖坛经》的惠能传记条目 + 《维摩诘经》思想价值段;`坐禅` 命中《禅者的初心》
+    真正讲坐禅的两章。注意语料里「惠能」「慧能」两种写法都有——bigram 提供区分度、
+    unigram 保住召回,正是当初的设计意图(bigram 不计入长度归一化)。
+
+  ■ 镜像携带源码(方案 C′,e67b5c7 + buda 560bc86)——消费方 wire 不一致从此不可构建
+    autumn-rs 镜像带 /usr/local/share/autumn/src(7.5MB:crates/ + python/ + Cargo.*),
+    消费方 COPY --from 取源码、用自己的 glibc/Python 编 wheel。AUTUMN_IMAGE 成为唯一版本旋钮。
+    **为什么不直接放 wheel**:PyO3 crate 无 abi3,wheel 绑定构建方 glibc + 精确 CPython。
+    autumn-rs 是 bookworm(glibc 2.36),freetoken 是 CUDA/Ubuntu22.04(2.35, py3.10)——
+    放 wheel 会被 pip 按 manylinux_2_36 拒绝,或装上后 import 报 GLIBC_2.36 not found。
+    freetoken-autumn:560bc86 已构建成功并核对 AUTUMN_IMAGE=e67b5c7,二进制与 wheel 同源。
+    注:本地无法编 python/ crate(stable 工具链缺 compio-buf 要的 nightly feature),
+    也无法编 autumn-fuse(缺 libfuse3 pkg-config)——这两个只能靠镜像构建验证。
+
+  ■ 模型上传:283.73 GiB 已入库,0 FAIL
+    串行 autumnfs put 稳定 **170 MiB/s**(基线 91%)。两个独立样本:dsv4 168 / minimax 172,
+    平均分片差 34% 而速率只差 2% ⇒ 是路径属性不是数据形状。
+    **并行化 put 循环不是杠杆**:单次固定开销 0.04s,25 个小文件合计 1s。
+    原因是 24 lanes 让单次 put 已跨 24 分区扇出,"串行循环"≠"单流"。
+    通用教训:伸手要并发之前,先看下层是不是已经并行了。
+
+  ■ 集群现状(可直接接手)
+    5 EN + 3 PS + 1 etcd + 1 manager @ e67b5c7,wire 30,8 台 storage 节点。
+    fs presplit 24 lanes/6 分区;mem 已切。principal fs/kvc/mem 重建,Secret 已更新。
+    fs/models/{dsv4-flash,minimax-m25} 已就位;fs/docs/buda 17 篇语料已回位(sha256 校验)。
+    memory-mcp 在线服务。dl-dsv4-cj4dc pod 仍握着 285.7GiB 本地副本(待全量 size 校验后释放)。
+
+  ■ 未做
+    FreeToken 本身未部署(镜像刚就绪)。hermes-autumn / vllm-autumn 仍是 wire 29,
+    要用需按同样方式(AUTUMN_IMAGE 指向带源码的 tag)重建。
