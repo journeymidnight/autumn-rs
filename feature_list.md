@@ -14,15 +14,6 @@
 
 ## Active
 
-### F-EC-REPLAY-SELFHEAL — EC 重放路径拿不到 R2/R3 的自愈，且它唯一处理的哨兵是服务端不会发的那个
-- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): `read_committed_bytes_from_extent`（`crates/stream/src/client.rs` 的第二个 2-attempt 循环）**只处理 `EversionStale`**；`PayloadNotHere` 与 `EcGatherOneShort` 作为硬错误直接冒泡，没有 invalidate/refetch。而这条路正是 PS 打开分区时 `recover_partition` 按 64 MiB 分块**重放 log stream** 走的路。
-  **为什么重放会遇到 EC**（没有"EC WAL"这种东西，链条是四步）：PS 的 WAL 记录写进 log stream → `--log-ec K+M` 是 bootstrap 参数，设的是 log stream **封口之后**的 EC 编码形状（4 EN 默认 3+1、≥5 默认 4+1，即默认开启）→ 该 stream 已封口的 extent 被转成 EC → 重放读到它们。
-  **暴露面是负载/时机相关的**：EC 只作用于已封口 extent，若 replay floor 很新则那些 extent 可能还开着（未封口即不会 EC）；真正会撞上的是**距上次 checkpoint 很久、或长时间宕机后恢复**的分区。
-- **更糟的一半**: 服务端 `read_plan` 是**先查 `holds_payload` 再查 eversion**（`extent_node.rs:2503-2512`），所以缓存里的 `payload_location` 陈旧时，EN 回的是 `PAYLOAD_NOT_HERE` 而**不是** `EversionStale` ⇒ 这个循环唯一会处理的哨兵，恰恰是服务端在该场景下不会发的那个。后果是重放响亮失败（可用性问题，非损坏），且这条路上没有任何东西会驱逐缓存 ⇒ **单个 StreamClient 生命周期内不收敛**。
-- **Scope**: 把 `is_payload_not_here` / `is_ec_gather_one_short` 两条臂接进该循环，语义与主读路径一致（invalidate → 重取 → 重新规划；one-short 带抖动，payload-not-here 不睡）。注意两个循环的重试预算要各自独立，别叠成 4 次。
-- **Acceptance**: 构造"客户端缓存 payload_location 陈旧 + extent 已 EC 转换"的重放，验证第一次 `PAYLOAD_NOT_HERE` 后自动刷新布局并成功；同一 StreamClient 内重复重放不再持续失败；两个循环各自最多重试一次（用注入计数断言，别只断言最终成功）。
-- **Status**: `passes: false` (2026-09-02)
-
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
 - **Trigger** (2026-09-02, 建 F-MEM-EVAL 时实测撞上): `wipe_agent` 按页 `range(512)` + 逐 key 删除，清一个 5164 chunk 的文档语料要删 **1,987,843 个 key**，耗时 **9 分 48 秒**（3380 key/s）。文档语料的 key 绝大部分是 BM25 posting（一个中文 chunk 几百个不同 term），所以 key 数是 chunk 数的约 385 倍。
 - **⚠️ 已排除的解法（负结果，别重做）**: 把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380 → 3418 key/s）。原因：`ClusterClient::delete_many` 不是批量 RPC，而是并发上限 32 的客户端扇出；而同集群 `perf-check` 显示单分区写 1 线程 9.2K ops/s、8 线程即达 30K ops/s 天花板 ⇒ 删除本身只该占约 12 s，104 s 里的绝大部分是 **694 次 range 扫描**（每页 512 键约 133 ms）。改动已回滚（按 `feedback_no_defensive_fixes_for_imaginary_bugs`：没有实测收益的优化不留）。**真正的瓶颈是前缀扫描，不是删除。**
@@ -228,17 +219,18 @@
 - **Acceptance**: fence a node while its partition has no serving PS → tails still drain; live-writer race test proves no acked-data truncation.
 - **Status**: `passes: false` (deferred — trigger condition not yet observed in practice; rebalancer reassigns partitions within seconds in all runs so far).
 
-### F-FS-WRITE-STRIPE — fuse MOUNT write-path large-file striping (B2 of F-FS-STRIPE)
-- **Trigger** (2026-07-19, 从已完成的 F-FS-STRIPE 抽出剩余项): F-FS-STRIPE 的 autumnfs 路径已 done（write/read/rm striped、字节精确、突破单分区、连续 pipeline），但 **fuse MOUNT 的写路径 striping 延后**——现状 fuse 读/删 striped 正确（stripe-aware），但 mount 内的 write/truncate 对 striped 文件是 fail-loud 拒绝（不是自己写 striped）。
-- **Scope**: 让 fuse mount 的写路径（`crates/fuse` write/extent）也能对大文件按 lane 分裂写（stripe key `[0x03][lane][ino][off]`），复用 autumnfs 已验证的 auto-detect lane 逻辑；truncate/删 striped 已支持。streaming 写（不像 autumnfs 上传时已知文件大小）要在写超过 STRIPE_THRESHOLD 时决定 stripe 布局并写 `InodeMeta.stripe`。
-- **Acceptance**: fuse mount 写一个 >64 MiB 文件 → 落成 N-lane striped；autumnfs / 另一 mount cold-read 回字节精确；小文件（≤阈值）仍单分区；与 autumnfs 互通。
-- **Status**: `passes: false` (2026-07-19, 从 F-FS-STRIPE 完成条目抽出) — 独立 deferred；破 ~450 单机聚合墙需真跨机集群（非代码），MAX_EXTENT 最优在满资源硬件另测（本 rig：≤8 MiB 越小越好）。cross-ref F-FS-STRIPE（autumnfs 路径已 done，git 历史）。
-- **⛔ WON'T-DO (2026-07-22, 用户拍板「Fuse mount 可以不做 lanes」)**: 条带写是 **autumnfs 独有能力**，fuse mount 不实现。mount 现有行为保持：对条带文件的 write/truncate **fail-loud 拒绝**，读/rm 仍 stripe-aware 正确。理由：条带针对的是大文件灌入（模型权重），那条路径本来就走 autumnfs；mount 的价值是 POSIX 兼容而非峰值吞吐。注意 F-FS-GEOM-DECLARED 删掉 64 MiB 阈值后本条**已无技术障碍**（lane 函数是增量的，不需要预先知道大小）—— 这是产品取舍，不是做不了。要复活的话工作量是机械的。
 ### F-IMG-FUSE-MCP — 把 autumn-fuse + memory-mcp 打进容器镜像
 - **Trigger** (2026-09-01, FreeToken rollout 规划时发现): 镜像只 build `-p autumn-server -p autumn-dashboard`，`autumn-fuse`（挂载守护进程）和 `memory-mcp` 都不在里面。前者导致"从 autumn fuse 读模型权重"在 k8s 上无法实现（`docs/ops.md` 只有一句"应做成 privileged DaemonSet"的说明，仓库里没有任何 FUSE manifest）；后者导致 hermes 无法以 stdio 子进程方式接 MCP —— 而 stdio 是 `memory-mcp` 唯一的传输方式，`docs/autumn_memory_plan.md:378` 明确不建议常驻 HTTP/SSE MCP。
 - **Scope**: `deploy/docker/Dockerfile` builder 段加 `libfuse3-dev`+`pkg-config`（fuser 0.15 链接 libfuse3），构建改 `-p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp`；runtime 段加 `fuse3`（libfuse3 + fusermount3 setuid helper）并拷出两个二进制。`entrypoint.sh` 加 `fuse` role（env→flag：`AUTUMN_MANAGER`/`AUTUMN_FUSE_MOUNTPOINT`/`AUTUMN_CREDENTIAL_FILE`/`AUTUMN_FUSE_DIRECT_READ`/`AUTUMN_FUSE_ALLOW_OTHER`），挂载前 `fusermount3 -u` 清理崩溃残留。`docs/ops.md` 补 sidecar manifest + mountPropagation 配对 + FOPEN_DIRECT_IO 的 mmap 后果。
 - **Acceptance**: (a) `deploy/validate.sh` 通过且 role 分派表含 `fuse`；(b) Linux 上镜像构建成功、`autumn-fuse --help` / `memory-mcp --help` 在镜像里可执行；(c) sidecar 挂载后主容器能在 `/mnt/autumn` 看到 `fs/` 内容（mountPropagation 配对生效）；(d) 杀掉 fuse 容器再拉起，不因残留挂载点 EBUSY。
 - **Status**: `passes: false` (2026-09-01；2026-09-02 收窄) — (a) 通过；(b) 镜像里有 `autumn-fuse` 且在 v29 集群上真挂载成功（`dd iflag=direct` 4K/8M 两档都过），但 `memory-mcp --help` 未在镜像里单独跑过。**(c) 的形态已被推翻**：本集群 kubelet 未配 rshared，mountPropagation 不兑现（特权 sidecar 内 `grep -c "shared:" /proc/self/mountinfo` = 0），sidecar 主容器看不到挂载；可行形态是**单容器**（autumn-fuse 后台进程与应用同 mount namespace，整容器 privileged）。⇒ 本条剩余工作 = `docs/ops.md` 的 sidecar manifest 改写成单容器形态 + (b) 的 memory-mcp 检查 + (d) 杀容器重拉不因残留挂载点 EBUSY。
+  **2026-09-03 进展**：文档那半**已做** —— `docs/ops.md` 现在把单容器形态放在前面并给了完整
+  manifest，sidecar 降为可选并在前面加了节点前置检查（特权 pod 内
+  `grep -c "shared:" /proc/self/mountinfo`，本集群返回 0 = 该形态在此不兑现）；单容器 manifest
+  的就绪探测用 `/proc/mounts` 而非 `mountpoint -q`（后者对尸体挂载会永久阻塞，是本仓库已知坑）。
+  **(b) 与 (d) 仍未做，且本机做不了**：开发机上没有 docker/podman/nerdctl，两条都要构建主机
+  或集群。下次在有容器运行时的机器上补：`docker run --rm <img> memory-mcp --help`，以及杀掉
+  fuse 容器再拉起验证不因残留挂载点 EBUSY（docs/ops.md 里已有那份 acceptance 脚本）。
 
 ### F-FT-DSV4-KV-SCOPE — DeepSeek-V4 在 FreeToken 上要不要接 autumn KV
 - **Trigger** (2026-09-01, 用户问"FreeToken 现在的 hicache 支持 DSV4 了吗"后核实上游):

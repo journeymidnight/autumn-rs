@@ -240,9 +240,46 @@ and refuse a loopback bind (legacy shm-only loopback needs an explicit
 loopback chaos harnesses set it themselves). Explicit env always wins.
 
 **In Kubernetes**, the shipped image carries `autumn-fuse` and the entrypoint
-dispatches it as the `fuse` role, so a consumer pod mounts the `fs/` namespace
-with a sidecar rather than a per-node DaemonSet (a DaemonSet works too, but a
-sidecar keeps the mount's lifetime tied to the one workload that needs it):
+dispatches it as the `fuse` role. Two shapes work, and the one to reach for
+first is the single-container form — `autumn-fuse` and the app in ONE container,
+sharing a mount namespace, with no volume and no propagation at all:
+
+```yaml
+containers:
+  - name: app
+    image: <CR>/autumn-rs:<tag>          # or your app image + the two binaries
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        autumn-fuse --manager "$AUTUMN_MANAGER" --mountpoint /mnt/autumn &
+        # Wait via /proc/mounts, never `mountpoint -q`: that stats the path, and
+        # a half-started mount whose daemon then died blocks stat() forever.
+        until grep -qs " /mnt/autumn fuse" /proc/mounts; do sleep 0.2; done
+        exec <your app>
+    env:
+      - { name: AUTUMN_MANAGER, value: autumn-manager:9001 }
+      - { name: AUTUMN_CREDENTIAL_FILE, value: /etc/autumn/cred/fs.cred }
+    securityContext:
+      privileged: true            # or capabilities.add:[SYS_ADMIN] + /dev/fuse device
+    volumeMounts:
+      - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+```
+
+It costs privileged on the whole container, and it is what the live `memory-mcp`
+deployment uses.
+
+**The sidecar form needs something from the NODE that many clusters do not
+give you.** Check before designing around it — from a privileged pod:
+
+```bash
+grep -c "shared:" /proc/self/mountinfo    # 0 => mountPropagation will not work here
+```
+
+On the cluster this was written against that returns **0**: kubelet is not
+configured with a shared root mount, so `Bidirectional` / `HostToContainer` are
+accepted by the API server and simply not honoured on the node — the FUSE mount
+comes up `private`, and the app container sees an empty directory with no error
+anywhere. Only use the sidecar below when that check returns non-zero.
 
 ```yaml
 containers:
@@ -265,7 +302,8 @@ volumes:
 ```
 
 The propagation pair is what makes the sidecar's mount visible to the app
-container; without it the app sees an empty directory.
+container; without it — or on a node that does not honour it — the app sees an
+empty directory.
 
 **Know what `Bidirectional` costs you before reaching for it.** It exists to let
 the sidecar's mount escape into the host mount namespace so the app container
@@ -280,9 +318,8 @@ nodes to exactly this shape. `MountOption::AutoUnmount` (now always set, see
 soon as the daemon's fd closes, SIGKILL included. **Do not run a build without
 that fix under `Bidirectional`.**
 
-The single-container form — run `autumn-fuse` and the app in ONE container, no
-volume, no propagation — avoids the escape entirely and is what the live
-`memory-mcp` deployment uses. Prefer it unless a sidecar is genuinely required.
+The single-container form above avoids this escape entirely: nothing propagates,
+so nothing can outlive the pod. That is the second reason to prefer it.
 
 **Acceptance test for the mount-leak fix — run this on any new cluster before
 trusting it with real work.** The failure it guards against cost us five nodes,

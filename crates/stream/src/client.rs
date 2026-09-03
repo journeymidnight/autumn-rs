@@ -97,6 +97,23 @@ enum ReadRetry {
     GatherOneShort,
 }
 
+/// Spacing between a gather's two attempts.
+///
+/// Per-CALL, not per-extent. Hashing the extent id alone gave every reader of
+/// one extent the identical sleep, so the herd this exists to break up stayed in
+/// lockstep — and a read-hot weight file is precisely many readers on one
+/// extent. The extent term still spreads load ACROSS extents; the clock term
+/// spreads it within one.
+fn gather_retry_pause(extent_id: u64) -> std::time::Duration {
+    let spread = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = 100
+        + (extent_id.wrapping_mul(2654435761) ^ spread.wrapping_mul(6364136223846793005)) % 200;
+    std::time::Duration::from_millis(jitter)
+}
+
 /// Tag a one-short gather so the read loop can recognise it.
 ///
 /// Its own function because the tag is a seam: the counting rule and the
@@ -4192,22 +4209,7 @@ impl StreamClient {
                         // keeps a degraded cluster from being hit by the whole
                         // herd at once.
                         if kind == ReadRetry::GatherOneShort {
-                            // Per-CALL, not per-extent. Hashing the extent id
-                            // alone gave every reader of one extent the identical
-                            // sleep, so the herd this exists to break up stayed
-                            // in lockstep — and a read-hot weight file is
-                            // precisely many readers on one extent. The extent
-                            // term still spreads load ACROSS extents; the clock
-                            // term spreads it within one.
-                            let spread = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.subsec_nanos() as u64)
-                                .unwrap_or(0);
-                            let jitter = 100
-                                + (extent_id.wrapping_mul(2654435761)
-                                    ^ spread.wrapping_mul(6364136223846793005))
-                                    % 200;
-                            compio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                            compio::time::sleep(gather_retry_pause(extent_id)).await;
                         }
                         continue;
                     }
@@ -4264,11 +4266,50 @@ impl StreamClient {
                 // already clamped `want` to `committed_end - offset`, so the
                 // returned bytes are correct; only the reported end was wrong.
                 Ok((bytes, _read_end)) => return Ok((bytes, committed_end)),
-                Err(e) if attempt == 0 && is_eversion_stale(&e) => {
-                    self.invalidate_extent_cache(extent_id);
-                    continue;
-                }
-                Err(e) => return Err(e),
+                // Same policy as the plain read, and it has to be: this is the
+                // path a partition's WAL replay takes, 64 MiB at a time, and a
+                // log stream's sealed extents are EC-encoded by default, so the
+                // EC failure classes reach this loop as readily as the other
+                // one. This loop used to recover from `EversionStale` alone —
+                // and that is the class the node does NOT send for a stale
+                // layout, because `read_plan` tests `holds_payload` before
+                // eversion and answers PAYLOAD_NOT_HERE instead.
+                //
+                // What that cost, precisely, because the two halves differ:
+                //   - Replicated path: `read_err_fail_fast` already evicts the
+                //     layout cache for any non-eversion error, so the caller's
+                //     next attempt healed. One warn and one 2 s stall per stale
+                //     extent — recovered, not wedged.
+                //   - EC path: `ec_subrange_read` never calls that, so nothing
+                //     evicted anything, and the failure repeated across every
+                //     one of `recover_partition`'s ten attempts. That open
+                //     really did fail.
+                // Handling the classes here heals both inside the single call.
+                //
+                // `attempt` is this loop's own, so the budget stays one retry
+                // here regardless of what the plain read already spent. It does
+                // stack with the caller's ten, which is bounded and fine.
+                Err(e) => match read_retry_action(attempt, &e) {
+                    None => return Err(e),
+                    Some(kind) => {
+                        if kind != ReadRetry::EversionStale {
+                            tracing::warn!(
+                                extent_id,
+                                offset,
+                                error = %format_args!("{e:#}"),
+                                "committed read: refreshing extent layout and retrying once"
+                            );
+                        }
+                        self.invalidate_extent_cache(extent_id);
+                        if kind == ReadRetry::GatherOneShort {
+                            // Spaced for the reason the plain read spaces it: a
+                            // gather is a K-way read amplification and replay
+                            // runs them back to back.
+                            compio::time::sleep(gather_retry_pause(extent_id)).await;
+                        }
+                        continue;
+                    }
+                },
             }
         }
         unreachable!("read_committed_bytes_from_extent: 2-attempt loop must terminate")
