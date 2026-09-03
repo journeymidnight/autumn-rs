@@ -264,6 +264,21 @@ redirect RTT。落点：`FsState.direct_read` → `ReadPlan.direct_read` → `ex
    互不重叠的 extent，`put_many` 流水）。
 4. 标记 dirty。
 
+**缓冲是 MOVE 给 flush 的，不是拷给它的。** `write_region` 取 `&mut FsState`，而缓冲就住在
+里面，所以数据没法借着跨这个调用——原来的答案是 `wb.buf[..wb.len].to_vec()`，每次 flush
+新分配并拷贝整块 64 MiB，实测占一次 4 GiB 写的 12%。现在用 `mem::take` 搬走，用完由
+`reclaim_buffer` 把 Vec **原样**还回去（不 clear——`mem::take` 留下的是 len-0 的 Vec，
+clear 过的缓冲会让 fill 每轮都跑 `resize(.., 0)`，把下一行就要覆盖的字节先清零一遍，
+等于每次 flush 一次 64 MiB memset）。`wb.len` 是长度的唯一真源，三个消费者都按它切片，
+所以 `wb.len` 之后的陈旧字节永远读不到。实测 197 → 234 MiB/s。
+
+**两条看着显然但实测更慢的路，别再走**：`max_write` 从 1 MiB 提到 8 MiB（248→219 MiB/s）；
+`WRITE_BUF_EXTENTS` 从 8 加到 16/32（248→234/229）。写路径的瓶颈不在单次请求大小，也不在
+一次 flush 的深度。
+
+**分段计时留在代码里**（`fuse write breakdown`，每 16 次 flush 一行）：上面这两个假设和
+"to_vec 无所谓"都是靠它否掉的。
+
 ### Flush
 `extent::write_region`：对齐区间直接 Put；非对齐落在已有 extent 内 → RMW（读旧值、
 覆盖子区间、回写）。之后更新 `InodeMeta.size`。

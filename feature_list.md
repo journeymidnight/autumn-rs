@@ -104,7 +104,23 @@
   以及 `write_region` 的非对齐 RMW 分支。
 - **Acceptance**: 同一集群同一文件，fuse mount 写吞吐进到 CLI 的 90% 以内；
   `fuse_chaos.sh` 的 T1/T3 与 RMW 守卫仍绿（写路径不能为了吞吐牺牲崩溃一致性）。
-- **Status**: `passes: false` (2026-09-03) —— 只立账。
+- **进展 (2026-09-03)**: 先加了分段计时（`fuse write breakdown`，每 16 次 flush 一行），
+  4 GiB 写的拆分是 fill 0.7 s / **`to_vec` 2.5 s** / `write_region` 12~13 s / 约 4 s
+  在这两者之外（即 `write()` 之外）。
+  **已做**: 干掉 flush 时那次 `to_vec()`——它每次 flush 新分配并拷贝整块 64 MiB，只是为了
+  拿到一个能在 `write_region(&mut FsState, ...)` 调用期间持有的 owned buffer。改成
+  `mem::take` + 用完把分配**原样**还回去（不 clear：`mem::take` 留下的是 len-0 的 Vec，
+  clear 过的缓冲会让 fill 每轮都跑 `resize(.., 0)`，把 `copy_from_slice` 下一行就要覆盖的
+  字节先清零一遍——每次 flush 一次 64 MiB memset，是 fable 评审指出来的）。
+  干净交替 A/B（新集群、每轮删文件重写、每轮字节校验）：**197 → 234 MiB/s，+19%**，
+  三对全部同向。（拆开看：去 `to_vec` 约 +15%，去 `clear` 约 +5%、三对里一对打平。）
+  **已否证、别重试**（都实测更慢，已回退）：`max_write` 1 MiB → 8 MiB（248→219）；
+  `WRITE_BUF_EXTENTS` 8 → 16/32（248→234/229）。
+  **剩下的**: 真正的流水化。`write_region` 自己是 12 s / 4 GiB ≈ 338 MiB/s，已经接近 CLI 的
+  345；差距在它两边那 4 s 没有和它重叠。要让缓冲在上一次 flush 在途时继续填，就得让
+  `write_region` 不再独占 `&mut FsState`（每 inode 一个在途 flush + 完成后合并 extent map），
+  同时守住 CLAUDE.md 的顺序不变量（extent put 全副本 ACK 后才持久化 inode-meta size）。
+- **Status**: `passes: false` (2026-09-03) —— 第一步已落地（+15%），流水化未做。
 - **读侧另立 F-FUSE-READ-GAP**（下一条）。⚠️ 本条最初记的读数表是**错的**，已删除：
   当时用 `autumnfs get <本地文件>` 对比 fuse 的 `dd of=/dev/null`，前者多付了一次 4 GiB
   的本地盘写，把 CLI 压到 ~800 MiB/s，于是得出"fuse 读更快"的反向结论。用 `cat >/dev/null`

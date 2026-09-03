@@ -20,14 +20,80 @@
 //! `crate::extent`; this module only manages the in-memory buffer + inode meta.
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::extent;
 use crate::meta::{get_inode, now_ts, put_inode};
 use crate::schema::*;
 use crate::state::FsState;
 
+// Where the write path's wall clock goes, logged once per FLUSH_LOG_EVERY
+// flushes (1 GiB written). Guessing this has been wrong three times in a row —
+// a bigger `max_write` and a deeper write buffer both looked obviously right
+// and both measured SLOWER — so the split is kept rather than re-derived. On a
+// 4 GiB write it reads roughly: fill 0.7 s, write_region 12 s, and ~4 s that is
+// in neither, i.e. outside this function entirely (the FUSE bridge, the
+// dispatcher, dd's own read of the source).
+//
+// Reading the line: the counters are PROCESS-GLOBAL — every inode, every mount
+// and every PyO3 `Fs` worker in this process sum into them — so it describes a
+// single-stream copy well and a mixed workload not at all. `total_in_write_ms`
+// is added after each call returns while the sub-timers are added inside it, so
+// the parts can exceed the total by up to one in-flight call; and a FAILED
+// flush adds to the time but not to `flushes`/`mib`, which skews the ratios
+// after an error.
+static FILL_NS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+/// Time spent MOVING the filled buffer out at flush. Near zero by construction
+/// now; kept because it was 12% of a 4 GiB write when it was a copy, and the
+/// number is what proves it is gone.
+static COPY_NS: AtomicU64 = AtomicU64::new(0);
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+const FLUSH_LOG_EVERY: u64 = 16;
+
+/// Hand a flushed buffer's allocation back to the inode so the next fill reuses
+/// it.
+///
+/// The buffer is installed AS-IS, length included. Clearing it would look
+/// tidier and would cost a 64 MiB memset per flush: `mem::take` leaves a len-0
+/// `Vec` behind, so a cleared buffer makes the fill loop's
+/// `resize(wb.len + to_copy, 0)` run on every iteration, zero-writing exactly
+/// the bytes `copy_from_slice` overwrites on the next line. Keeping the length
+/// restores the steady state the copying version happened to have. Stale bytes
+/// past `wb.len` are never read: `wb.len` is the length of record and all three
+/// consumers — the fill, the flush, and `flush_inode` — slice `[..wb.len]`.
+///
+/// The two early returns and the capacity test are unreachable today: one
+/// request runs to completion before the next is dispatched (`main.rs`'s
+/// dispatch loop and `python/src/fs.rs`'s job loop each hold `&mut FsState`
+/// across a whole op), so nothing can drop the inode or grow a new buffer while
+/// this flush is in flight. They are what a pipelined writer would reach first
+/// — but such a writer needs MORE than this: the test looks only at capacity,
+/// so against a genuinely concurrent refill it could install over live buffered
+/// bytes. Unreachable, not handled.
+fn reclaim_buffer(state: &mut FsState, ino: u64, buf: Vec<u8>) {
+    let Some(is) = state.inodes.get_mut(&ino) else {
+        return;
+    };
+    let Some(wb) = is.write_buf.as_mut() else {
+        return;
+    };
+    if wb.buf.capacity() < buf.capacity() {
+        wb.buf = buf;
+    }
+}
+
 /// Write data to a file. Returns bytes written.
 pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
+    let t_total = std::time::Instant::now();
+    let r = write_inner(state, ino, offset, data).await;
+    TOTAL_NS.fetch_add(t_total.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
+
+async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
     // Reject a negative offset (symmetric with `read::prepare`). The kernel FUSE
     // path never sends one, but a direct core caller (the PyO3 `autumn.Fs`
     // binding, M2) could — and `offset as u64` would wrap to a huge
@@ -96,6 +162,7 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
 
     while !remaining.is_empty() {
         // Copy as much as fits into the buffer.
+        let t_fill = std::time::Instant::now();
         let (flush_needed, copied) = {
             let is = state.inodes.get_mut(&ino).unwrap();
             let wb = is.write_buf.as_mut().unwrap();
@@ -108,6 +175,7 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
             wb.len += to_copy;
             (wb.len >= WRITE_BUF_CAP, to_copy)
         };
+        FILL_NS.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
         written += copied;
         remaining = &remaining[copied..];
 
@@ -117,17 +185,61 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
             // pipelines the puts via `put_many` (server-batched per partition).
             // Pre-pipelining we drained one MAX_EXTENT at a time → single
             // serial put → `cp` ceiling was `MAX_EXTENT / RPC_RTT`.
-            let (flush_offset, flush_data) = {
+            // MOVE the buffer out rather than copying it. `write_region` needs
+            // `&mut FsState`, which owns the buffer, so the data cannot simply
+            // be borrowed across the call — the previous answer was
+            // `wb.buf[..wb.len].to_vec()`, a fresh 64 MiB allocation and copy
+            // per flush that measured 2.5 s of a 20 s 4 GiB write (12%), on top
+            // of the copy the kernel's bytes already paid getting INTO the
+            // buffer. `mem::take` is O(1); the `Vec` is handed back below so
+            // the next fill reuses the allocation instead of growing a new
+            // 64 MiB one.
+            let t_copy = std::time::Instant::now();
+            let (flush_offset, flush_len, flush_buf) = {
                 let is = state.inodes.get_mut(&ino).unwrap();
                 let wb = is.write_buf.as_mut().unwrap();
                 let fo = wb.offset;
-                let fd: Vec<u8> = wb.buf[..wb.len].to_vec();
-                wb.offset = fo + wb.len as i64;
+                let n = wb.len;
+                let buf = std::mem::take(&mut wb.buf);
+                wb.offset = fo + n as i64;
                 wb.len = 0;
-                (fo, fd)
+                (fo, n, buf)
             };
+            COPY_NS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
-            extent::write_region(state, ino, flush_offset as u64, &flush_data, file_size).await?;
+            let t_flush = std::time::Instant::now();
+            let n = flush_len as u64;
+            let res = extent::write_region(
+                state,
+                ino,
+                flush_offset as u64,
+                &flush_buf[..flush_len],
+                file_size,
+            )
+            .await;
+            FLUSH_NS.fetch_add(t_flush.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // Return the allocation whether or not the flush succeeded — on the
+            // error path the buffer is empty anyway, and a caller that retries
+            // should not pay for a fresh 64 MiB.
+            reclaim_buffer(state, ino, flush_buf);
+            res?;
+            FLUSH_BYTES.fetch_add(n, Ordering::Relaxed);
+            let f = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
+            if f % FLUSH_LOG_EVERY == 0 {
+                let fill = FILL_NS.load(Ordering::Relaxed) / 1_000_000;
+                let cp = COPY_NS.load(Ordering::Relaxed) / 1_000_000;
+                let fl = FLUSH_NS.load(Ordering::Relaxed) / 1_000_000;
+                let mb = FLUSH_BYTES.load(Ordering::Relaxed) / 1_048_576;
+                tracing::info!(
+                    flushes = f,
+                    mib = mb,
+                    fill_ms = fill,
+                    buf_handoff_ms = cp,
+                    write_region_ms = fl,
+                    total_in_write_ms = TOTAL_NS.load(Ordering::Relaxed) / 1_000_000,
+                    "fuse write breakdown"
+                );
+            }
         }
     }
 
