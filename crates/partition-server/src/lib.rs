@@ -8561,6 +8561,16 @@ async fn recover_partition(
         0
     };
     let active = Memtable::new();
+    if chosen_pos == usize::MAX && !tables.is_empty() {
+        tracing::warn!(
+            part_id = _part_id,
+            tables = tables.len(),
+            log_extents = log_extent_ids.len(),
+            "recovery: no SST or checkpoint replay cursor resolved — replaying the WHOLE log \
+             stream. Expect a slow open proportional to the log, once. A cursor naming an \
+             extent that was reclaimed is the known way to reach this."
+        );
+    }
 
     // WAL self-heal A3: per-extent set of replica node_ids whose copy of a
     // log_stream chunk failed to decode during replay. Populated by
@@ -8582,9 +8592,44 @@ async fn recover_partition(
     // to the WRONG source region. We replay each extent only at its
     // FIRST occurrence (which has the correct source-region dedup).
     let replay_extents: Option<Vec<(usize, u64, u64)>> =
-        if chosen_pos == usize::MAX && tables.is_empty() {
-            // No checkpoint and no SSTs: replay everything from offset 0 of
+        if chosen_pos == usize::MAX {
+            // No resolvable replay cursor: replay everything from offset 0 of
             // every extent — dedup by first occurrence.
+            //
+            // This used to require `tables.is_empty()`, and everything else fell
+            // through to `None` — replay NOTHING. That is a silent loss of every
+            // acked-but-un-flushed write, and it is reachable: a cursor may name
+            // an extent that no longer exists, because recovery seeds the write
+            // cursor to the committed log TAIL and a freshly-rolled tail has zero
+            // committed bytes, so the seed is `(E, 0)`. Once E leaves the tail
+            // slot it is sealed-empty, which every reclaimer treats as free —
+            // `gc_extent_punchable` is `sealed_length == 0 || pos < floor`, so
+            // even the replay floor does not protect it. Compaction then makes
+            // "no cursor resolves" the common case rather than a corner, because
+            // it stamps every output SST with the newest input's vp_head.
+            // Regression: `system_empty_vp_cursor`.
+            //
+            // Over-replaying is safe, though not by the mechanism it looks like.
+            // Per-source dedup cannot exist here: a `records_meta` entry needs
+            // its vp to resolve through `first_pos_by_eid`, and that lookup
+            // failing for EVERY record is what produced `chosen_pos == MAX` in
+            // the first place. So `records_meta` is empty and the single
+            // whole-stream region applies, with `src_max = max_seq` — the global
+            // union over every loaded SST. Every replayed record therefore has
+            // `ts > max_seq >= every entry seq already flushed`, so no flushed
+            // version is re-inserted, and memtable keys are MVCC-unique per
+            // (user_key, seq) with newest-first reads, so nothing shadows a newer
+            // one. Reclamation is prefix-only or empty-only, so a later tombstone
+            // can never be lost while its earlier put is kept.
+            //
+            // What the global union costs is the inverse error, and only in one
+            // corner: on a post-merge spliced log it can SKIP a survivor record
+            // whose ts is below the victim's max. Narrow, and strictly better
+            // than what it replaces — which skipped everything.
+            //
+            // The cost is reading the log from the start on a recovery that has
+            // lost its cursor. That is one-shot: the first flush afterwards
+            // re-stamps a live cursor.
             let mut seen: HashSet<u64> = HashSet::new();
             Some(
                 log_extent_ids
@@ -8634,7 +8679,7 @@ async fn recover_partition(
     // each replayed extent's committed end, so the LAST (tail) extent wins. SAFE:
     // reads are committed-clamped, so the tail is ≥ every replayed record — a
     // flush of the recovered active never stamps a vp_head past its own content.
-    // Defaults to the replay-min for the no-replay branch (empty recovered active
+    // Defaults to the replay-min when no cursor resolved (empty recovered active
     // ⇒ no rotation ⇒ the seed is inert there).
     let mut tail_eid = recovered_vp_eid;
     let mut tail_off = recovered_vp_off;

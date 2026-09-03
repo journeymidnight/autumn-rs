@@ -157,7 +157,7 @@ fn random_delay() -> Duration {
 ///   are skipped — recovery skips them too.
 /// - **floor 0** when none resolve (nothing flushed yet, or all vp_head extents
 ///   gone): protect every non-empty extent, matching recovery's replay-from-0
-///   path and its `chosen_pos==MAX` no-replay fallback.
+///   path and its `chosen_pos==MAX` whole-log fallback.
 pub(crate) fn gc_replay_floor(
     log_extent_ids: &[u64],
     sst_vp_extent_ids: impl IntoIterator<Item = u64>,
@@ -251,7 +251,8 @@ pub(crate) fn gc_extent_punchable(
 /// extents already gone): replay from the FIRST log extent at offset 0 — the
 /// maximally-conservative safe anchor (recovery replays everything and dedups).
 /// NOT `(0,0)`: with a non-empty output table set that leaves recovery's
-/// `chosen_pos == usize::MAX` on the no-replay branch = loss (see
+/// `chosen_pos == usize::MAX`, which now costs a whole-log replay rather than
+/// the silent loss it used to (see
 /// `recover_partition`'s `replay_extents` selection).
 pub(crate) fn compaction_output_vp_head(
     input_vp_heads: impl IntoIterator<Item = (u64, u64)>,
@@ -988,7 +989,7 @@ pub(crate) async fn background_maintenance_loop(
                 // at/after the floor — recovery replays the log_stream from there
                 // forward, so punching it drops records recovery needs (un-flushed
                 // small values not yet in any SST, or the vp_head extent itself →
-                // chosen_pos==MAX → no replay at all). Only extents strictly BEFORE
+                // chosen_pos==MAX → a whole-log replay). Only extents strictly BEFORE
                 // the floor are fully flushed and safe to reclaim. Running on the
                 // SAME task as compaction (the only op that REMOVES SSTs and could
                 // raise the floor) means `readers_snapshot` matches the durable
@@ -2339,8 +2340,9 @@ pub(crate) async fn do_compact(
     // `log_extent_ids` is load-bearing for the output vp_head below, so a fetch
     // failure MUST NOT be swallowed into an empty list (coco P1): an empty list
     // makes `compaction_output_vp_head` fall back to `(0, 0)`, and recovery then
-    // takes the no-replay branch (`chosen_pos == usize::MAX` with a non-empty
-    // table set) → the acked-but-un-flushed WAL tail is lost. Abort the
+    // takes the whole-log fallback (`chosen_pos == usize::MAX`) → a slow open on
+    // every recovery, and before that fallback existed, silent loss of the
+    // acked-but-un-flushed WAL tail. Abort the
     // compaction instead — this is BEFORE any row_stream append, so nothing is
     // half-published; the maintenance loop retries next tick.
     let log_extent_ids = part_sc.get_stream_info(log_stream_id).await?.extent_ids;
@@ -4723,7 +4725,7 @@ mod compaction_vp_head_tests {
     fn falls_back_to_first_extent_when_none_resolve() {
         let log = [10u64, 11, 12];
         // No input resolves → replay from the first log extent, offset 0
-        // (conservative full replay — NEVER (0,0), the recovery no-replay branch).
+        // (conservative full replay — NEVER (0,0), which forfeits the cursor).
         assert_eq!(
             compaction_output_vp_head([(0u64, 5u64), (99, 5)], &log),
             (10, 0)

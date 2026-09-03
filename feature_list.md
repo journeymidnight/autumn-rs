@@ -201,40 +201,6 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
-### BUG-EMPTY-VP-CURSOR-PUNCH — 一个指向零字节 extent 的重放游标被回收后，恢复"什么都不重放"【已定位，未复现，未修】
-- **Trigger** (2026-09-03, fable 对 F-SEALED-EMPTY-SWEEP 的对抗性安全评审)：安全论证里"sealed 且
-  sealed_length=0 ⇒ 没有任何 VP/SST/checkpoint 引用它"对**字节**成立，对**重放游标**不成立。链条四步，
-  每一步都在代码里核实过：
-  1. **游标会被种到空 extent 上**：`recover_partition` 的重放循环（`partition-server/src/lib.rs`
-     ~8707）在 `committed_end == start_off` 时推进 tail 种子，注释明写包含"刚 roll 出来、还没有已提交
-     数据的 open tail" ⇒ 得到 `(E, 0)` 而 E 零字节。merge splice 掉一个 victim 的 `sealed=true,
-     sealed_length=0` 旧 tail 也是同一形态。
-  2. **游标会被落成持久 checkpoint**：`rotate_active` 抓 `(vp_extent_id, vp_offset)`，flush 把它盖进
-     SST 与 meta_stream checkpoint。首次 append 会覆盖种子，但"先 rotate 后 append"可达（WAL-gap
-     强制 rotate、split/merge freeze-drain、`flush_memtable_locked`）。
-  3. **E 随后变成 sealed-empty 非尾巴**：首次 append 失败 ⇒ failure-roll 按 `Some(0)` 封口；或它本来
-     就是 merge splice 来的 sealed-empty，被下一次 alloc 用 `already_sealed` 越过。
-  4. **没有任何一层保护空的游标 extent**：`gc_extent_punchable`（`background.rs`:218）就是
-     `sealed_length == 0 || pos < replay_floor_pos` —— **空的一律可 punch，直接绕过重放下限**。
-- **危害**：checkpoint 的 `vp_extent_id` 解析不到就被跳过；若**全部**解析不到而 SST 集非空，
-  `chosen_pos == usize::MAX` ⇒ `replay_extents = None` ⇒ **一条 WAL 都不重放**。仓库自己的注释
-  （`background.rs` ~2340）就把这条分支称作 "the acked-but-un-flushed WAL tail is **lost**"。
-  表现是分区**干净地打开**，而已 ACK 的写入不见了——静默，没有任何东西 fail loud。
-  "全部解析不到"并不罕见：compaction 把输出 SST 统一盖成输入里**流位置最大**的 vp_head（也就是
-  `(E,0)`），而 GC 的 raise-to-durable-ckpt 本来就会 punch 掉位置更靠前的那些。
-- **不是本轮引入的**：GC 与客户端的 `reclaim_abandoned_empty_tail` 今天就在按同一谓词删空 extent。
-  F-SEALED-EMPTY-SWEEP 会把它**扩到全集群、每 60s、包括没有 PS 在服务的分区**，所以那条被卡在这条后面。
-- **Scope（复现之后）**: 二选一，fable 判断 (a) 更小且严格更安全 ——
-  (a) **恢复侧**：`chosen_pos == usize::MAX` 且 tables 非空时，从位置 0 用现有的 seq/来源区间去重重放，
-      而不是不重放（代码本来就依赖该去重容忍过度重放）；
-  (b) **PS 侧**：永不盖出指向"零已提交字节 extent"的 vp_head（改盖前一个 extent 的 committed end，
-      重放位置等价）。
-- **Acceptance**: 先按 `feedback_reproduce_before_fixing_mechanism_bugs` **复现**——构造 checkpoint 的
-  vp_head 指向空 extent、punch 掉它、重启，断言已 ACK 的写入**丢了**（红）；修完转绿。消融：把修复
-  去掉必须重新变红。
-- **Status**: `passes: false` (2026-09-03) — 已定位未复现。**动它之前先复现**，这是重放路径，
-  是本仓库最不能凭推断动刀的地方。
-
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB
   逻辑数据（47×）。客户端侧已修两处（size-scaled append deadline、roll-away 时
@@ -251,8 +217,10 @@
 - **Status**: `passes: false` (2026-07-14；2026-09-03 更新) — **实现完成、测试通过、评审过，但故意不上线**。
   代码在 `crates/manager/src/extent_delete.rs`（`sealed_empty_sweep_candidates` 纯谓词 + 6 单测；
   `sealed_empty_sweep_once`/`_loop`），`start_runtime_tasks` 里**没有** spawn，附了不 spawn 的理由；
-  三条谓词消融各自咬住不同断言。**阻塞在 [BUG-EMPTY-VP-CURSOR-PUNCH] 上**：manager 看不见 PS 的
+  三条谓词消融各自咬住不同断言。曾阻塞在重放游标类上（现已修）：manager 看不见 PS 的
   vp_head，所以 sweep 无法过滤掉"被 checkpoint 游标指着的空 extent"，而那一类会静默丢失已 ACK 的写。
+  **阻塞已解除**（BUG-EMPTY-VP-CURSOR-PUNCH 已复现并修复：恢复侧在游标全解析不到时改为全量重放）——
+  但解除阻塞不等于验收通过，**仍未 spawn**，下面两条还差着。
   验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
   `mirror_stream_extent_mutation` 在内存模式下是**彻底 no-op**，所以现有两条集成测试覆盖的是选择逻辑与
   内存态 apply，**不是** plan 基线与 txn 之间的 CAS 耦合；那需要 etcd 后端的集群。

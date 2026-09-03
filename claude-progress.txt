@@ -76,6 +76,31 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   **两条诚实标注**：内存模式下 `mirror_stream_extent_mutation` 是彻底 no-op ⇒ 两条"集成测试"覆盖的是
   选择与内存态 apply，不是 CAS 耦合；inflight 重检查进程内开不出窗口，消融全绿，已标为未覆盖。
 
+【2026-09-03 BUG-EMPTY-VP-CURSOR-PUNCH：复现 → 修复 → 消融，静默丢失已 ACK 写入】
+  这是本会话最重的一条，而且**不是本轮引入的**，是 shipped 代码里的潜伏类。
+  链条：恢复把写游标种成 committed tail，而刚 roll 出来的尾巴零字节 ⇒ 游标 = `(E, 0)`；
+  下一次 rotate 把它盖进 SST 和 meta checkpoint；E 离开尾巴位后就是 sealed-empty，
+  而 `gc_extent_punchable` 是 `sealed_length == 0 || pos < floor` —— **空的一律可回收，
+  重放下限保护不了它**；游标解析不到就跳过，若全部解析不到而 tables 非空 ⇒ `chosen_pos == MAX`
+  ⇒ 旧代码**一条 WAL 都不重放**。compaction 把输出 SST 统一盖成流位置最大的 vp_head，
+  所以"全都解析不到"是常态而非corner。
+  **复现**（`crates/manager/tests/system_empty_vp_cursor.rs`，真集群真重启）：修复前 `a-*`（已进 SST）
+  幸存、`c-*`（**已 ACK** 未 flush）**全部消失**，分区干净打开、无任何告警。
+  **修复**：`chosen_pos == usize::MAX && tables.is_empty()` → `chosen_pos == usize::MAX`。
+  红 → 绿 → 消融重新变红；215 单测 + 8 个恢复/重放系统测试全绿。
+  **fable 抓到我注释里一条 materially false 的话**（已核实并改）：我写"按来源区间去重"，
+  但那条路**不会执行** —— `records_meta` 每项都要 `first_pos_by_eid` 命中，而"全都不命中"正是
+  `chosen_pos == MAX` 的成因 ⇒ 必然走全局并集那条 legacy 路径。过度重放依然安全
+  （ts > 全局 max ≥ 任何已 flush 的 seq），但机制不是我写的那个；另有一个**欠重放**的窄 corner
+  （post-merge 多来源时可能跳过 ts ≤ victim max 的 survivor 记录），严格优于"全丢",已记在注释里。
+  另外补了：全量重放分支的 WARN（它会读整条日志，必须自报）、4 处仍把"不重放分支"当现状的陈旧注释。
+  **一条建议我没采纳并写明理由**：改用 `start_partition_server_stoppable` 会走优雅 drain 从而 flush，
+  把测试依赖的"未 flush 的 C"冲掉 ⇒ 测试会**假绿**。
+  **一处保真度缺口如实标注**：生产回收者是 PS 的 GC，但本 harness 里 AUTO_GC 什么都没收
+  （fable 查明是设计使然：非空 extent 的选择是 discard 驱动的，而本测试不删不覆盖 ⇒ discard=0；
+  且第二次 roll 之前 E 还是尾巴、本就被排除）。测试改用与 `run_gc` 空路径**逐字节相同**的
+  `MSG_STREAM_PUNCH_HOLES`，所以钉住的是"回收游标 extent 的后果"，不是"GC 就是回收者"。
+
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
   读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：
