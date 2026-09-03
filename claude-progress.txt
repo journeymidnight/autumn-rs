@@ -101,6 +101,19 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   且第二次 roll 之前 E 还是尾巴、本就被排除）。测试改用与 `run_gc` 空路径**逐字节相同**的
   `MSG_STREAM_PUNCH_HOLES`，所以钉住的是"回收游标 extent 的后果"，不是"GC 就是回收者"。
 
+【2026-09-03 F-SEALED-EMPTY-SWEEP 上线 + 撞出一条既有 EC bug】
+  阻塞（重放游标类）解除后补齐验收：新增 `sealed_empty_sweep_etcd.rs`，真 etcd + aux 客户端直查，
+  场景就是"writer roll 完尾巴就死、从没 punch"；消融掉持久化那步精确变红。之后 spawn 了它。
+  **fable 给了一条能推翻我的检查,而它成立了**：chaos 通过**不等于** sweep 被执行过——那个泄漏形态
+  本身账目干净（refs=1、一个成员），所以账目阶段无论 sweep 跑没跑都是绿的。实测 grep 两轮日志，
+  `sealed-empty sweep` 出现 **0 次**。所以 chaos 只证明"开着它不打扰既有不变量"，
+  已在账本里把 chaos 那半标回未完成，并写明要真覆盖需在 harness 里显式造出这个形态。
+  **顺带撞出 BUG-EC-CONVERT-STALL-HEALTHY-COORD**（已立账、已复现）：EC 转换 quiesce 后仍 ACTIVE、
+  attempts=0、last_error 空、协调者健康，该 extent 的 GC 被卡住；chaos 判词是
+  "the invariant broke SILENTLY"。**归因做了一半**：同样失败在 sweep 关闭时逐字复现 ⇒ 与本条无关；
+  未单独对照重放修复之前的版本（机制不相干）。时序敏感：加 `RUST_LOG=autumn_manager=info` 后
+  必现，不加时曾两次通过 —— 判定修好必须多次跑带 RUST_LOG 的那条配方。
+
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
   读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：

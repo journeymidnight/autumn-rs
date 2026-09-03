@@ -201,6 +201,31 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
+### BUG-EC-CONVERT-STALL-HEALTHY-COORD — EC 转换在协调者健康的情况下永不完成，卡住该 extent 的 GC【已复现，未修】
+- **Trigger** (2026-09-03, 给 F-SEALED-EMPTY-SWEEP 补 chaos 验收时撞上)：chaos verify 的
+  in-flight 阶段报 `op ... kind=7 target=0/12 still ACTIVE (state=1) after quiesce —
+  attempts=0 last_error=""; EC marker on extent 12 still pinned after quiesce (age 44s) with a
+  HEALTHY coordinator (node N) — nothing is stopping this conversion from progressing, and the
+  extent's GC is blocked until it drains`。chaos 自己的判词是 **"NO fail-loud marker in any EN log
+  —— the invariant broke SILENTLY"**。
+- **复现配方**（本机可复现，非推断）：
+  `RUST_LOG=autumn_manager=info AUTUMN_CHAOS_SEED=603 AUTUMN_CHAOS_DURATION_SECS=45 \
+   AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 cargo test -p autumn-manager --test system_chaos \
+   chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored`
+  **时序敏感**：同一 seed 不加 `RUST_LOG` 时曾通过两次，加上之后两次都失败（日志开销改变了时序）。
+  所以判定它是否修好，必须**多次**跑带 `RUST_LOG` 的这一条，不能只跑一次。
+- **归因已做一半**：同样的失败在 **sweep 关闭时逐字复现**（同 kind、同 extent、同措辞），
+  所以与 F-SEALED-EMPTY-SWEEP 无关。**未做**：没有单独对照今天的重放修复（84545c9）之前的版本，
+  尽管机制上不相干（重放只改 `recover_partition` 的窗口，这里卡的是 EC 转换派发）。
+  cross-ref memory `project_ec_frozen_owner_epoch_wedge`（曾修的 owner_epoch 永久 fence 两半）与
+  `project_chaos_coverage_gaps_20260619`（"EC apply-fail 吞→wedge" 早被列为覆盖缺口）。
+- **Scope（复现之后）**: 查 attempts=0 且 last_error 为空的 ACTIVE EC op 为何不再被派发——
+  重点看 `ec_conversion_dispatch_loop` 的候选过滤与 ledger attach 语义（历史上"第二次提交发生在
+  第一次转换已关闭之后 ⇒ 不 attach ⇒ 新建条目"是同族的坑）。
+- **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
+  让它停止派发的（不是"加了重试就好了"）。
+- **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。
+
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB
   逻辑数据（47×）。客户端侧已修两处（size-scaled append deadline、roll-away 时
@@ -219,9 +244,16 @@
   `sealed_empty_sweep_once`/`_loop`），`start_runtime_tasks` 里**没有** spawn，附了不 spawn 的理由；
   三条谓词消融各自咬住不同断言。曾阻塞在重放游标类上（现已修）：manager 看不见 PS 的
   vp_head，所以 sweep 无法过滤掉"被 checkpoint 游标指着的空 extent"，而那一类会静默丢失已 ACK 的写。
-  **阻塞已解除**（BUG-EMPTY-VP-CURSOR-PUNCH 已复现并修复：恢复侧在游标全解析不到时改为全量重放）——
-  但解除阻塞不等于验收通过，**仍未 spawn**，下面两条还差着。
-  验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
+  **2026-09-03：已上线（spawn 了）。** 阻塞解除（BUG-EMPTY-VP-CURSOR-PUNCH 已复现并修复：
+  恢复侧游标全解析不到时改为全量重放，所以回收游标指向的空 extent 现在的代价是"开得慢"而非丢数据）。
+  验收里"杀 writer 在 seal 与 punch 之间"的集成半**已做**：`crates/manager/tests/sealed_empty_sweep_etcd.rs`
+  用真 etcd + aux 客户端直查，消融掉持久化那步会精确变红（`etcd still holds extents/N`）。
+  **chaos 那半仍不算数,而且理由要记住**：实测 grep 两轮 chaos 日志，`sealed-empty sweep` 出现
+  **0 次** —— chaos 从没造出这个形态，所以它只证明"开着这个循环不打扰既有不变量"
+  （同 seed 在 sweep 开/关下结果逐字相同），**不证明 sweep 本身在 chaos 下正确**。
+  要真覆盖，得在 harness 里显式造一个 sealed-empty 非尾巴成员再跑。
+  另注：seed 603 目前**本来就红**（见 BUG-EC-CONVERT-STALL-HEALTHY-COORD），与本条无关。
+  旧文（仍适用）：验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
   `mirror_stream_extent_mutation` 在内存模式下是**彻底 no-op**，所以现有两条集成测试覆盖的是选择逻辑与
   内存态 apply，**不是** plan 基线与 txn 之间的 CAS 耦合；那需要 etcd 后端的集群。
   另：inflight ledger 的"计划后、mutation 前"窗口已改成每个 plan 重读一次，但该重检查**没有测试覆盖**

@@ -1437,27 +1437,27 @@ impl AutumnManager {
             mgr.clone().extent_both_zero_sweep_loop()
         });
 
-        // NOT SPAWNED. `sealed_empty_sweep_loop` is written, tested and reviewed,
-        // and it stays off until the replay-cursor class below is closed.
+        // Backstop for sealed-empty non-tail stream members: a punch that failed,
+        // a writer that died between the seal and the punch, and the backlog on a
+        // cluster poisoned before the writer-side reclaim existed. That leak was
+        // 10.4 TB against 222 GB of logical data on a live cluster.
         //
-        // Its predicate is sound for every reference class that points at BYTES:
-        // seal >= acked holds on all three seal branches, so a sealed-at-zero
-        // extent holds no acked byte and no ValuePointer, SST or checkpoint
-        // CONTENT can live there. But a checkpoint also carries a replay CURSOR,
-        // and the partition server deliberately produces cursors naming a
-        // zero-byte extent at offset 0 (`recover_partition` seeds the tail that
-        // way for a freshly-rolled empty tail; a merge splice does the same).
-        // Recovery's answer to a cursor it cannot resolve is to skip it, and if
-        // NOTHING resolves while SSTs exist it replays nothing at all — a branch
-        // this repo already names as losing the acked-but-un-flushed WAL tail.
-        // The manager cannot see PS vp_heads, so the sweep cannot filter on it.
-        //
-        // The class is not introduced here — `gc_extent_punchable` is
-        // `sealed_length == 0 || pos < floor`, so GC already punches empty
-        // extents ahead of the replay floor, and the client-side
-        // `reclaim_abandoned_empty_tail` does too. What this sweep would add is
-        // reach: every stream, every 60 s, including partitions whose PS is gone.
-        // That is the wrong thing to switch on before the cursor is safe.
+        // Held off until the replay-cursor class was closed, because the one
+        // reference class the manager cannot see is a checkpoint's replay cursor,
+        // which the partition server deliberately points at zero-byte extents.
+        // Reclaiming one used to make recovery replay NOTHING; it now replays the
+        // whole log instead, so the cost is a slow open rather than a partition
+        // that comes back short. Not a blanket guarantee: the whole-log fallback
+        // dedups against the GLOBAL max seq, which on a post-merge spliced log
+        // can still skip a survivor record below the victim's max — a narrow
+        // corner documented where it happens, and one this loop makes marginally
+        // easier to reach by losing cursors more often. See
+        // `system_empty_vp_cursor` and the fallback's own comment.
+        let mgr = self.clone();
+        Self::spawn_supervised("sealed_empty_sweep", move || {
+            mgr.clone().sealed_empty_sweep_loop()
+        });
+
         // policy advisory tick.
         let mgr = self.clone();
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());

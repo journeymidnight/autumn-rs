@@ -99,10 +99,6 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the sealed-empty backstop runs.
-// Off until the replay-cursor class is closed — see the un-spawn note in
-// `start_runtime_tasks`. Kept compiled and tested so the prerequisite is the
-// only thing between here and switching it on.
-#[allow(dead_code)]
 const SEALED_EMPTY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Extents reclaimed per sealed-empty tick.
@@ -116,7 +112,6 @@ const SEALED_EMPTY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// tick, the ~40k backlog that motivated this drains in roughly ten HOURS, not
 /// minutes. That is the intended trade for a backstop — the leak is already
 /// there and stable, and the foreground path is not.
-#[allow(dead_code)]
 const SEALED_EMPTY_SWEEP_MAX_PER_TICK: usize = 64;
 
 /// backoff cadence for the persisted retry loop. Each
@@ -352,8 +347,10 @@ impl AutumnManager {
     /// (the manager is not a fenced writer) and no empty-stream refusal (the tail
     /// exclusion makes it unreachable). The inflight refusal it DOES need is done
     /// per plan below.
-    #[allow(dead_code)]
-    pub(crate) async fn sealed_empty_sweep_once(&self) -> usize {
+    ///
+    /// `pub` so an integration test can drive exactly one tick of it; the loop
+    /// below is the only production caller.
+    pub async fn sealed_empty_sweep_once(&self) -> usize {
         if !self.leader.get() {
             return 0;
         }
@@ -510,7 +507,6 @@ impl AutumnManager {
         reclaimed
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn sealed_empty_sweep_loop(self) {
         loop {
             compio::time::sleep(SEALED_EMPTY_SWEEP_INTERVAL).await;
@@ -858,7 +854,6 @@ pub(crate) struct SweepMember {
 ///    extent reports `sealed_length == 0` while holding data.
 ///  - **an inflight-ledger extent is deferred**, not skipped forever — a
 ///    recovery or EC conversion naming it may be about to write.
-#[allow(dead_code)]
 pub(crate) fn sealed_empty_sweep_candidates(members: &[SweepMember]) -> Vec<u64> {
     let Some((_tail, rest)) = members.split_last() else {
         return Vec::new();
