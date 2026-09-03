@@ -216,6 +216,10 @@ fn main() -> Result<()> {
                     }
                 };
                 state.direct_read = args.direct_read;
+                // Only the mount: every non-write request goes through
+                // `dispatch::handle_request`, which drains an in-flight flush
+                // before the handler runs. Nothing else has that funnel.
+                state.pipelined_writes = true;
                 if args.direct_read {
                     tracing::info!(
                         "direct-read ON (default): ≥64 KiB reads go EN-direct, bypassing the PS \

@@ -218,6 +218,27 @@ pub async fn init_root(state: &mut FsState) -> Result<()> {
 
 /// Process a single FsRequest. Returns false if the loop should exit (Destroy).
 pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
+    // One place for the MOUNT, so no handler here can forget. A pipelined
+    // append flush leaves the inode's extent map missing its extents and its
+    // bytes not yet durable, and only a contiguous write to that same inode may
+    // proceed on that view (`write::write` plans purely from the buffer's own
+    // offset and drains itself for every other shape). Everything else — reads,
+    // stat, rename, unlink, fsync, readdir — waits here for a complete picture.
+    //
+    // This funnel is why `FsState::pipelined_writes` is set by the mount and
+    // nothing else: the PyO3 `autumn.Fs` worker calls the core ops directly and
+    // never passes through here, so a pipelined flush would be invisible to its
+    // reads.
+    //
+    // Logging the error here is NOT how it gets reported — this drain runs
+    // ahead of the fsync handler and would otherwise consume the only copy.
+    // `drain_pending` sticks the failure to the inode, and `flush_inode`
+    // returns it, so fsync/release/truncate still fail.
+    if !matches!(req, FsRequest::Write { .. }) {
+        if let Err(e) = write::drain_all_pending(state).await {
+            tracing::warn!(error = %e, "pending append flush failed (fsync will report it)");
+        }
+    }
     match req {
         FsRequest::Init { reply } => {
             let result = init_root(state).await;
@@ -438,6 +459,8 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     InodeState {
                         meta: meta.clone(),
                         write_buf: None,
+            pending_flush: None,
+            flush_error: None,
                         dirty: false,
                         open_count: 1,
                         extents: None,
@@ -642,6 +665,8 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         InodeState {
                             meta,
                             write_buf: None,
+            pending_flush: None,
+            flush_error: None,
                             dirty: false,
                             open_count: 1,
                             extents: None,

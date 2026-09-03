@@ -148,7 +148,7 @@ fn floor_and_next(ext: &[(u64, u32)], pos: u64) -> (Option<(u64, u32)>, Option<u
 }
 
 /// Insert or update `(start, len)` in a sorted extent map.
-fn upsert(ext: &mut Vec<(u64, u32)>, start: u64, len: u32) {
+pub(crate) fn upsert(ext: &mut Vec<(u64, u32)>, start: u64, len: u32) {
     match ext.binary_search_by_key(&start, |&(s, _)| s) {
         Ok(i) => ext[i].1 = len,
         Err(i) => ext.insert(i, (start, len)),
@@ -164,6 +164,119 @@ fn upsert(ext: &mut Vec<(u64, u32)>, start: u64, len: u32) {
 /// - **Overwrite (rare for model files):** `offset` falls inside an existing
 ///   extent → read-modify-write that extent in place (its start key is kept, so
 ///   no overlap is introduced); the value may grow up to the next start / cap.
+/// The self-contained half of a PURE-APPEND flush: the keys, their values and
+/// the extent-map updates they will imply, owning all of it.
+///
+/// Splitting the flush this way is what lets the mount overlap the network with
+/// the kernel. `write_region` holds `&mut FsState` across its puts, and the
+/// dispatcher runs one request to completion at a time, so while a flush is in
+/// flight NOTHING is being filled — measured, a 4 GiB write spent 12 s in the
+/// puts and 4 s beside them with the two never overlapping. The read path has
+/// had this shape for a while (`read::prepare` under `&mut state`, then a
+/// spawned `read::execute` that owns its plan), which is why reads already
+/// overlap and writes did not.
+pub struct AppendPlan {
+    keys: Vec<Vec<u8>>,
+    values: Vec<Bytes>,
+    upserts: Vec<(u64, u32)>,
+    lease: autumn_client::WriteLease,
+}
+
+impl AppendPlan {
+    /// The extent-map updates this plan will imply once its puts land.
+    pub fn upserts(&self) -> &[(u64, u32)] {
+        &self.upserts
+    }
+}
+
+/// Plan a flush that is a PURE APPEND — every byte lands past the end of every
+/// existing extent, so no read-modify-write, no hole-filling and no
+/// beyond-EOF residue is involved. Returns `None` for anything else, and the
+/// caller must then use the inline `write_region`, which handles those shapes
+/// and is not safe to run against a stale extent map.
+///
+/// "Stale" is the crux: a spawned flush's extents are not in the map until it
+/// is drained, so a plan made while one is in flight is working from an
+/// incomplete picture. That is harmless HERE — the positions come from the
+/// buffer's own offset, not from the map, and every one of them is past
+/// everything the map could be missing — and it is exactly what makes the RMW
+/// branch unsafe to pipeline, since it would read a stale extent and write back
+/// a merge of the wrong bytes.
+pub async fn plan_append_only(
+    state: &mut FsState,
+    ino: u64,
+    offset: u64,
+    data: &[u8],
+    file_size: u64,
+) -> Result<Option<AppendPlan>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    // A striped inode is not this path's business (the mount refuses striped
+    // writes upstream); bail rather than compute lane keys here.
+    if state
+        .inodes
+        .get(&ino)
+        .and_then(|is| is.meta.stripe.as_ref())
+        .is_some()
+    {
+        return Ok(None);
+    }
+    // Same guard `write_region` opens with: beyond-EOF residue needs the
+    // sweep, which mutates. Refuse instead of pipelining it.
+    if offset > file_size {
+        return Ok(None);
+    }
+    let ext = extents_snapshot(state, ino, file_size, None).await?;
+    if ext
+        .iter()
+        .any(|&(s, l)| s >= file_size || s + l as u64 > offset)
+    {
+        return Ok(None);
+    }
+    let lease = state.write_lease_for(ino);
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut upserts = Vec::new();
+    let mut pos = offset;
+    let mut rest = data;
+    while !rest.is_empty() {
+        // Every chunk is fresh territory by the check above, so the cap is the
+        // extent size alone — there is no following extent to stop short of.
+        let n = ((pos + MAX_EXTENT as u64).min(pos + rest.len() as u64) - pos) as usize;
+        keys.push(key::extent_key(ino, pos));
+        values.push(Bytes::copy_from_slice(&rest[..n]));
+        upserts.push((pos, n as u32));
+        pos += n as u64;
+        rest = &rest[n..];
+    }
+    Ok(Some(AppendPlan {
+        keys,
+        values,
+        upserts,
+        lease,
+    }))
+}
+
+/// The spawnable half of an append flush: it needs only the client, so it can
+/// run while the dispatcher goes back to serving the kernel. The caller applies
+/// `plan.upserts()` to the extent map when it drains this.
+pub async fn execute_append(
+    client: std::rc::Rc<autumn_client::ClusterClient>,
+    plan: &AppendPlan,
+) -> Result<()> {
+    let items: Vec<(&[u8], Bytes, u64)> = plan
+        .keys
+        .iter()
+        .zip(plan.values.iter())
+        .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+        .collect();
+    for r in client.put_many_fenced(&items, plan.lease).await {
+        r.map_err(|e| anyhow!("KV put: {e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn write_region(
     state: &mut FsState,
     ino: u64,

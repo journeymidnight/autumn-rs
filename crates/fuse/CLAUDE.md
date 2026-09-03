@@ -297,6 +297,35 @@ clear 过的缓冲会让 fill 每轮都跑 `resize(.., 0)`，把下一行就要�
 守卫在 `scripts/fuse_chaos.sh` 的 T3。（`RENAME_NOREPLACE` 到不了我们这儿，VFS 先返回
 EEXIST，但同样被拒。）
 
+### 写流水化（`pipelined_writes`，只有 mount 开）
+
+**纯追加**的 flush 拆成两半：`extent::plan_append_only` 在 `&mut FsState` 下规划（要读
+extent map），`extent::execute_append` 只需要 `Rc<ClusterClient>`，spawn 出去。于是上一批
+64 MiB 在网络上飞的时候，dispatcher 回去继续从内核收下一批。读路径一直是这个形状
+（`read::prepare` + spawn `read::execute`），这也正是读能扇出而写不能的原因。
+实测 **249 → 338 MiB/s（+36%）**，达到 CLI 345 的 98%。
+
+不需要第二块缓冲：`plan` 里的 values 本来就是 `Bytes::copy_from_slice` 拷出来的自有数据，
+所以规划一结束缓冲就自由了。
+
+**只有纯追加走这条路。** RMW / 空洞 / EOF 之后的残留一律回落到 inline `write_region`——
+它们要读 extent map，而在途 flush 的 extent 还没进图。`plan_append_only` 的判据
+（`offset > file_size`、`s >= file_size`、`s + l > offset` 任一成立就返回 None）就是这个边界。
+
+**drain 放在 dispatcher 一个点上**（非 Write 请求一律先 drain），而不是逐调用点审计——
+那种清单只在下一个 handler 加进来之前是完整的。**这也是 `pipelined_writes` 默认关、只由
+mount 打开的原因**：PyO3 的 `autumn.Fs` worker 直接调核心 op，根本不过这个 dispatcher，
+开了流水化它的 `read` 会读到在途 flush 那段的零。
+
+**失败的 flush 要粘在 inode 上**（`InodeState.flush_error`），不能只靠返回值：dispatcher 的
+drain 跑在 fsync handler **之前**且只打日志，会把唯一一份错误消费掉；`flush_inode` 随后看到
+没有 pending，就会持久化一个覆盖了丢失区域的 size —— **fsync 回报成功，文件里留着零洞**。
+现在 `flush_inode` 先取这个粘性错误并返回，才轮到持久化 size。
+⚠️ 这条的可达形状是 **extent key 和 inode key 落在不同分区**（`[0x03][ino][off]` 与
+`[0x01][ino]` 排序相隔很远，split 后必然分开）而 extent 那边不可用；租约撤销**不是**——
+`put_inode` 同样带围栏，两边一起失败。`scripts/fuse_chaos.sh` 的 fsync 守卫杀整个集群，
+**隔离不了这一条**（meta put 也会失败），要真正隔离需要冻结单个分区。
+
 ### Flush
 `extent::write_region`：对齐区间直接 Put；非对齐落在已有 extent 内 → RMW（读旧值、
 覆盖子区间、回写）。之后更新 `InodeMeta.size`。

@@ -56,6 +56,99 @@ static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 const FLUSH_LOG_EVERY: u64 = 16;
 
+/// Wait for this inode's in-flight append flush, if any, and apply its
+/// extent-map updates.
+///
+/// EVERY path that reads the extent map, publishes the inode's size, or writes
+/// anywhere but contiguously past the buffer MUST come through here first —
+/// while a flush is pending the map is missing its extents and the bytes are
+/// not durable. The dispatcher does it for every request that is not a write
+/// (`dispatch::handle_request`), so the obligation here is only the write
+/// path's own non-contiguous shapes.
+///
+/// A failed flush is recorded on the inode as well as returned, because the
+/// caller here is often the dispatcher's blanket drain, which only logs. The
+/// report the application actually sees comes from `flush_inode` (fsync,
+/// release, truncate, periodic sync), which consumes that record BEFORE it
+/// would persist a size covering the bytes that never landed. Without the
+/// record, fsync answered success over a hole.
+///
+/// It cannot surface at the `write()` that started it — that call returned
+/// before the puts ran. That is ordinary writeback; the loser is a caller that
+/// ignores both later writes and `fsync`.
+pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
+    let Some(pending) = state
+        .inodes
+        .get_mut(&ino)
+        .and_then(|is| is.pending_flush.take())
+    else {
+        return Ok(());
+    };
+    let res = pending
+        .task
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("append flush task: {e:?}")));
+    match &res {
+        // Apply the map updates only on success: a failed put wrote nothing,
+        // and recording the extent would make a later read believe in bytes
+        // that are not there.
+        Ok(()) => {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                if let Some(ext) = is.extents.as_mut() {
+                    for &(start, len) in &pending.upserts {
+                        crate::extent::upsert(ext, start, len);
+                    }
+                }
+            }
+        }
+        // STICK the failure to the inode as well as returning it. Returning
+        // alone is not enough: the dispatcher drains ahead of every non-write
+        // handler and only logs, so the fsync that must report this would find
+        // nothing pending and acknowledge success over the missing bytes.
+        Err(e) => {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                if is.flush_error.is_none() {
+                    is.flush_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+    res
+}
+
+/// Take this inode's recorded flush failure, if any. Reporting CONSUMES it —
+/// one report per failure, like `errseq_t`: the caller has been told, and a
+/// later unrelated fsync should not fail again for it.
+fn take_flush_error(state: &mut FsState, ino: u64) -> Option<String> {
+    state
+        .inodes
+        .get_mut(&ino)
+        .and_then(|is| is.flush_error.take())
+}
+
+/// Drain every inode's pending flush. The dispatcher calls this ahead of any
+/// request that is not a write, so no other operation can observe a half-
+/// applied extent map — one place instead of an audit of every call site.
+pub async fn drain_all_pending(state: &mut FsState) -> Result<()> {
+    let inos: Vec<u64> = state
+        .inodes
+        .iter()
+        .filter(|(_, is)| is.pending_flush.is_some())
+        .map(|(ino, _)| *ino)
+        .collect();
+    let mut first_err = None;
+    for ino in inos {
+        if let Err(e) = drain_pending(state, ino).await {
+            tracing::warn!(ino, error = %e, "pending append flush failed");
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Hand a flushed buffer's allocation back to the inode so the next fill reuses
 /// it.
 ///
@@ -68,14 +161,12 @@ const FLUSH_LOG_EVERY: u64 = 16;
 /// past `wb.len` are never read: `wb.len` is the length of record and all three
 /// consumers — the fill, the flush, and `flush_inode` — slice `[..wb.len]`.
 ///
-/// The two early returns and the capacity test are unreachable today: one
-/// request runs to completion before the next is dispatched (`main.rs`'s
-/// dispatch loop and `python/src/fs.rs`'s job loop each hold `&mut FsState`
-/// across a whole op), so nothing can drop the inode or grow a new buffer while
-/// this flush is in flight. They are what a pipelined writer would reach first
-/// — but such a writer needs MORE than this: the test looks only at capacity,
-/// so against a genuinely concurrent refill it could install over live buffered
-/// bytes. Unreachable, not handled.
+/// The two early returns and the capacity test remain unreachable: this is
+/// called synchronously, before anything is spawned and while `&mut FsState` is
+/// still held, so no other operation can drop the inode or grow a new buffer in
+/// between. That is a property of the CALL SITE, not of this function — the
+/// capacity test looks only at capacity, so against a genuinely concurrent
+/// refill it could install over live buffered bytes.
 fn reclaim_buffer(state: &mut FsState, ino: u64, buf: Vec<u8>) {
     let Some(is) = state.inodes.get_mut(&ino) else {
         return;
@@ -132,6 +223,8 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
     {
         let cur_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
         if offset as u64 > cur_size {
+            // Reads and rewrites the extent map, so nothing may be in flight.
+            drain_pending(state, ino).await?;
             extent::clean_beyond_eof(state, ino, cur_size).await?;
         }
     }
@@ -146,6 +239,11 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
         }
     };
     if needs_flush {
+        // `flush_inode` drains for us. Do NOT drain unconditionally here: the
+        // contiguous case only copies into the buffer and touches no extent
+        // map, and waiting on the in-flight flush at every 1 MiB write is
+        // exactly the serialization the pipelining exists to remove (measured:
+        // it put the whole gain back, 242 vs the 244 it started from).
         flush_inode(state, ino).await?;
     }
 
@@ -213,19 +311,53 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
             let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
             let t_flush = std::time::Instant::now();
             let n = flush_len as u64;
-            let res = extent::write_region(
+            // The previous flush must land before this one is planned: its
+            // extents are not in the map yet, and two in flight would make the
+            // failure of either impossible to attribute.
+            drain_pending(state, ino).await?;
+            let plan = extent::plan_append_only(
                 state,
                 ino,
                 flush_offset as u64,
                 &flush_buf[..flush_len],
                 file_size,
             )
-            .await;
+            .await?;
+            let plan = if state.pipelined_writes { plan } else { None };
+            let res = match plan {
+                // Pure append: hand the puts to a spawned task and go back to
+                // the kernel. The plan owns copies of the bytes, so the buffer
+                // is free the moment it exists — no second buffer, and the fill
+                // of the NEXT 64 MiB overlaps these puts instead of waiting.
+                Some(plan) => {
+                    reclaim_buffer(state, ino, flush_buf);
+                    let client = state.client.clone();
+                    let upserts = plan.upserts().to_vec();
+                    let task = compio::runtime::spawn(async move {
+                        extent::execute_append(client, &plan).await
+                    });
+                    if let Some(is) = state.inodes.get_mut(&ino) {
+                        is.pending_flush = Some(crate::schema::PendingFlush { task, upserts });
+                    }
+                    Ok(())
+                }
+                // Anything else — read-modify-write, a hole, beyond-EOF residue
+                // — stays inline, because those read the extent map and it is
+                // only complete while nothing is in flight.
+                None => {
+                    let r = extent::write_region(
+                        state,
+                        ino,
+                        flush_offset as u64,
+                        &flush_buf[..flush_len],
+                        file_size,
+                    )
+                    .await;
+                    reclaim_buffer(state, ino, flush_buf);
+                    r
+                }
+            };
             FLUSH_NS.fetch_add(t_flush.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            // Return the allocation whether or not the flush succeeded — on the
-            // error path the buffer is empty anyway, and a caller that retries
-            // should not pay for a fresh 64 MiB.
-            reclaim_buffer(state, ino, flush_buf);
             res?;
             FLUSH_BYTES.fetch_add(n, Ordering::Relaxed);
             let f = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -267,6 +399,19 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
 
 /// Flush all buffered writes for an inode.
 pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
+    // Drain first: this publishes the inode's size and reads the extent map,
+    // and the crash-consistency rule is that extent puts ACK before a size
+    // that covers them is persisted.
+    let drained = drain_pending(state, ino).await;
+    // Report a failure from ANY earlier flush of this inode, including one the
+    // dispatcher's drain already consumed, and do it BEFORE persisting a size
+    // that would cover the bytes that never landed. This is the whole point of
+    // `flush_error`: fsync must not answer success over a hole.
+    if let Some(msg) = take_flush_error(state, ino) {
+        return Err(anyhow::anyhow!("earlier write flush failed: {msg}"));
+    }
+    drained?;
+
     // Extract buffered chunk data (if any) to drain before persisting meta.
     let (buf_data, buf_offset, buf_len) = {
         let is = match state.inodes.get_mut(&ino) {
@@ -329,6 +474,8 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
         InodeState {
             meta,
             write_buf: None,
+            pending_flush: None,
+            flush_error: None,
             dirty: false,
             open_count: 0,
             extents: None,

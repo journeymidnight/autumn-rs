@@ -105,6 +105,17 @@ pub struct FsState {
     /// each `ReadPlan` at `prepare` time so the spawned `read::execute` task
     /// (which holds no `&FsState`) can pick the batch primitive.
     pub direct_read: bool,
+
+    /// Whether a buffer flush may run as a SPAWNED task while the caller goes
+    /// back to serving requests (see `write::write`). Off by default and turned
+    /// on ONLY by the fuse mount, because pipelining is safe exactly where the
+    /// drain discipline exists: the mount funnels every non-write operation
+    /// through `dispatch::handle_request`, which drains first. The PyO3
+    /// `autumn.Fs` worker calls the core ops directly and never goes through
+    /// that dispatcher, so with pipelining on, a `read` right after a `write`
+    /// would miss the in-flight flush's extents and return zeros for bytes the
+    /// write acknowledged.
+    pub pipelined_writes: bool,
 }
 
 impl FsState {
@@ -184,6 +195,7 @@ impl FsState {
             notify_inval_failed: Rc::new(RefCell::new(HashSet::new())),
             kernel_invalidator: RefCell::new(None),
             direct_read: false,
+            pipelined_writes: false,
         }
     }
 

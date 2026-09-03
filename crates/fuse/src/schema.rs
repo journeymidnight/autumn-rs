@@ -257,6 +257,12 @@ pub struct ReaddirEntry {
 }
 
 /// Runtime write buffer state for a single inode (compio thread-local).
+/// A spawned append flush plus the extent-map updates to apply when it lands.
+pub struct PendingFlush {
+    pub task: compio::runtime::JoinHandle<anyhow::Result<()>>,
+    pub upserts: Vec<(u64, u32)>,
+}
+
 pub struct WriteBuffer {
     /// Buffer storage, capacity = [`WRITE_BUF_CAP`].
     pub buf: Vec<u8>,
@@ -286,6 +292,26 @@ impl WriteBuffer {
 pub struct InodeState {
     pub meta: InodeMeta,
     pub write_buf: Option<WriteBuffer>,
+    /// An append flush whose puts are still in flight, with the extent-map
+    /// updates it will imply once they land. This is what lets the mount
+    /// overlap the network with the kernel: the dispatcher goes back to filling
+    /// the next buffer instead of waiting here.
+    ///
+    /// While this is `Some`, the extent map is INCOMPLETE and the inode's
+    /// on-disk size must not be published. Only ever set when
+    /// `FsState::pipelined_writes` is on, which is the fuse MOUNT alone: its
+    /// dispatcher drains ahead of every non-write request, and no other
+    /// front-end has that funnel.
+    pub pending_flush: Option<PendingFlush>,
+    /// A failed flush, held until someone reports it.
+    ///
+    /// The failure cannot be delivered to the `write` that started it — that
+    /// call returned before the puts ran — so it is kept here until a path that
+    /// MUST see it consumes it (`write::flush_inode`, i.e. fsync / release /
+    /// truncate / the periodic sync). Without this the dispatcher's drain,
+    /// which runs ahead of the fsync handler and only logs, would consume the
+    /// error first and fsync would then acknowledge success over a hole.
+    pub flush_error: Option<String>,
     pub dirty: bool,
     pub open_count: u32,
     /// runtime extent map: sorted `(logical_start, value_len)` of this
