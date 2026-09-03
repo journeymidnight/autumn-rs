@@ -1571,9 +1571,14 @@ async fn verify_no_ec_markers_pinned(mgr: &RpcClient) -> Vec<String> {
             continue;
         }
         errors.push(format!(
-            "EC marker on extent {} still pinned after quiesce (age {}s) with a \
-             HEALTHY coordinator (node {}) — nothing is stopping this conversion \
-             from progressing, and the extent's GC is blocked until it drains",
+            "EC marker on extent {} still pinned after quiesce (age {}s); its \
+             COORDINATOR (node {}) is healthy, and the extent's GC is blocked \
+             until it drains. This check does NOT look at the PARTICIPANTS, and \
+             a conversion that keeps failing on one of them looks exactly like \
+             this — the marker carries attempts=0 and no error because the \
+             coordinator's failure never reaches the manager, so the only record \
+             is that EN's own log. Grep the coordinator's log for \
+             'EC convert failed' before concluding nothing is wrong downstream.",
             m.extent_id, m.age_secs, m.coord_node_id
         ));
     }

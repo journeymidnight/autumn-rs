@@ -125,6 +125,14 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   每 5s 重新派发、每次被协调者**接受**、然后永不完成。所以问题在 accept-ACK **之后**，
   不在 manager 的候选选择。`attempts=0` 同时说明重新派发不计数，"卡多久/试几次"本身不可观测。
   诊断代码保留（覆盖的是真实的静默丢弃路径），但如实记明这次复现里它们没触发。
+  **根因随后定死在 EN 日志里**：`EC convert failed: WriteShard to 127.0.0.1:15009 shard 1 @ 0:
+  Connection refused` —— 每 5s 一次、9 次全同。转换**每次都真的失败**，卡在写某个**参与者**分片上；
+  失败只进 EN 自己的日志，manager 的 marker 永远 `attempts=0 / last_error=""` ⇒ 无人重选目标、
+  无人报警、该 extent 的 GC 被永久挡住。EN 的 `CODE_OK` 同时是"已接受"和"已在跑"，manager 分不清。
+  **两处自我纠正**：① "加 RUST_LOG 必现"是两样本外推，实测 8 轮 4 过 4 挂、与 RUST_LOG 无关；
+  ② chaos 断言写着"nothing is stopping this conversion"，但它**只查协调者不查参与者** ——
+  这句话把我引开了大半程，已改成点明它的盲区并指向 EN 日志。
+  修复未做，Scope 写在账本里（观测先于行为：先让失败回到 op ledger，再谈参与者不可达怎么处理）。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，

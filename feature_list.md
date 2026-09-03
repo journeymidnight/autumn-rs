@@ -212,8 +212,8 @@
   `RUST_LOG=autumn_manager=info AUTUMN_CHAOS_SEED=603 AUTUMN_CHAOS_DURATION_SECS=45 \
    AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 cargo test -p autumn-manager --test system_chaos \
    chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored`
-  **时序敏感**：同一 seed 不加 `RUST_LOG` 时曾通过两次，加上之后两次都失败（日志开销改变了时序）。
-  所以判定它是否修好，必须**多次**跑带 `RUST_LOG` 的这一条，不能只跑一次。
+  **约 50% 的 flake**（seed 603 实测 8 轮 4 过 4 挂），**与 `RUST_LOG` 无关**。
+  所以判定它是否修好必须**连跑多轮**，单轮绿说明不了任何事。
 - **归因已做一半**：同样的失败在 **sweep 关闭时逐字复现**（同 kind、同 extent、同措辞），
   所以与 F-SEALED-EMPTY-SWEEP 无关。**未做**：没有单独对照今天的重放修复（84545c9）之前的版本，
   尽管机制上不相干（重放只改 `recover_partition` 的窗口，这里卡的是 EC 转换派发）。
@@ -227,8 +227,25 @@
   所以问题**不在 manager 的候选选择**，而在"accept-ACK 之后"：节点侧要么没做完，要么做完了没让
   marker 落地（`finalize_ec_dispatch_after_convert` 没跑或失败）。`attempts=0` 也说明重新派发这条
   路径根本不计数，这本身让"卡了多久/试了几次"不可观测。
-- **下一步**: 去看 EN 侧该 extent 的转换日志（chaos 把 EN 起成子进程），确认它到底是没开始、
-  做到一半、还是做完了但回报丢了；同时查 accept-ACK 之后由谁负责推进与销 marker。
+- **根因已定 (2026-09-03)，证据在 EN 日志里**：
+  `EC convert failed (will be re-dispatched): WriteShard to 127.0.0.1:15009 shard 1 @ 0:
+   Connection refused (os error 111) extent_id=12` —— **每 5 秒一次，9 次全同**。
+  转换不是没跑、也不是跑完丢了回报：它**每次都真的失败**，卡在向某个**参与者**写分片上。
+  链条因此闭合：EN 的 `CODE_OK` 语义是"已接受"（且已有转换在飞时直接回 `CODE_OK("already
+  running")`），失败只写进 EN 自己的日志 ⇒ manager 的 marker 永远是 `attempts=0 / last_error=""`
+  ⇒ 没有任何东西重新选目标或把它报出来 ⇒ 该 extent 的 GC 被永久挡住。
+  **频率实测约 50%**（seed 603 跑 8 轮 4 过 4 挂）；**与 `RUST_LOG` 无关**——我先前写的
+  "加 RUST_LOG 必现"是两个样本的过度概括，已作废。
+  **chaos 的断言本身误导**：它只查协调者却写着 "nothing is stopping this conversion from
+  progressing"。已改成点明它不看参与者、并指向 EN 日志里的 `EC convert failed`。
+  查到这一步用掉的时间，一半花在被那句话引开。
+- **Scope（未做）**: 两件事，**观测先于行为**——
+  1. **让失败可见**：协调者的失败必须回到 manager 的 op ledger（`attempts` 递增 + `last_error`），
+     否则运维只能靠 grep 某台 EN 的日志。对齐 memory `feedback_error_event_vs_op_state` 与
+     `project_op_observability_redesign`。注意 EN 的 "already running" 也回 `CODE_OK`，
+     manager 现在无法区分"刚接受"与"正在重试第 9 次"。
+  2. **参与者不可达时怎么办**：重新选目标、还是把 op 判为失败并释放 marker（现在是无限重试且
+     GC 一直被挡）。这一步要先想清楚 2PC 的安全性，别在 revert-prone 区凭推断动刀。
 - **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
   让它停止派发的（不是"加了重试就好了"）。
 - **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。

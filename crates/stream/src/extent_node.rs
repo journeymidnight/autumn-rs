@@ -8252,8 +8252,17 @@ impl ExtentNode {
         // now uses the shared `extent_op_lock` helper (same
         // map, broadened semantic). handle_re_avali and the
         // delete try-lock route through the same lock.
+        // Stage markers, because the failure mode this path actually exhibits is
+        // neither Ok nor Err: the task stops reporting entirely, and the caller
+        // then answers every manager re-dispatch with "already running" —
+        // CODE_OK — so the manager logs an accept every tick while the marker is
+        // pinned forever with attempts=0 and no error. Without these two lines
+        // there is nothing to say whether it never got the op lock or never got
+        // past the first read. See BUG-EC-CONVERT-STALL-HEALTHY-COORD.
+        tracing::debug!(extent_id, new_eversion, "ec convert: waiting for the extent op lock");
         let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;
+        tracing::debug!(extent_id, "ec convert: op lock held; reading the extent");
 
         let entry = self.get_extent(extent_id).await?;
         let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
