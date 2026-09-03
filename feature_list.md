@@ -167,6 +167,16 @@
 - **Acceptance**: 单测 —— (a) 有 `mm_features.identifier` 时不同图片得到不同 hash；(b) `mm_features` 存在但字段取不到 hash 时**既不 load 也不 save**（当前会 save）；(c) 无多模态的纯文本请求行为不变。
 - **Status**: `passes: false` (2026-07-22) — cross-ref memory `project_kvcache_vlm_mmhash_unverified`（"mm_hash 漏 key"曾是已修 bug，本条是它的残留 fail-open 面）。
   **用户定调 2026-07-22**（在 "fix BUG-KVC-TENANT" 之后说「剩下的 2 个你看着办，一般不需要」）: 本条**不做**，留在 backlog 只作记录。真要动之前，先复核它的触发条件是否已经在线上出现过。
+  **复核结果 (2026-09-03)：门槛未过，维持不做。** 触发条件等价于"部署在用的 vLLM 不再通过
+  connector 读的那两个名字暴露 mm hash"。实测本机 `vllm-env` = **vLLM 0.28.0**（也就是
+  S3 网关真引擎验证用的那个版本），`MultiModalFeatureSpec` 的字段是
+  `['data','modality','identifier','mm_position','mm_hash']` —— `identifier` 与 `mm_hash`
+  **两个都在**，而 `_request_extra_keys` 第 177 行取的正是这两个（`identifier` or `mm_hash`）。
+  所以 fail-open 那条分支在当前部署上够不着。fail-open 本体仍在（`vllm_connector.py` ~193：
+  打 warning 然后照样返回不含 disambiguator 的 keys），代码没动。
+  **下次复核只需重跑这一条**：`python -c "import dataclasses; from vllm.multimodal.inputs
+  import MultiModalFeatureSpec as S; print([f.name for f in dataclasses.fields(S)])"` ——
+  升级后这两个名字若消失或改名，门槛即刻成立。
 ### BUG-KVC-PARTIAL-PREFIX — chunked prefill 下可能为"部分 KV"发布完整 prefix marker【假说，未复现】
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:675`): store 路径按**完整 prompt** 的 block-aligned prefix 算 `content_hash`，但 slot 来自当前调度步的 `block_ids`；代码只检查 `_slot_len(slots) == 0`，**没有**检查 `== num_tokens`。coco 推断：chunked prefill / token budget 不足时当前 step 只覆盖部分 prefix，保存的 KV 少于 `num_tokens`，而 `wait_for_save()` 只校验 layer 数齐全就 `mark_present(content_hash)` → 把部分 KV 伪装成完整 prefix 命中。
 - **⚠️ 未验证**: 这条依赖"vLLM 会在 prefix 未全部计算完时就调用 save"这一假设，**没有复现**。按 house rule（`feedback_reproduce_before_fixing_mechanism_bugs` / `feedback_no_defensive_fixes_for_imaginary_bugs`）：**先复现再改**，不许凭推断在这条热路径上动刀。
