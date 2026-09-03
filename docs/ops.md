@@ -2018,9 +2018,17 @@ files (a pre-CoW conversion, permanent for that extent).
 To exercise it by hand, note two traps that make a test pass without touching
 the path at all:
 
-- **`autumnfs` does not use it.** It reads the KV layout directly rather than
-  through the fuse core, so `direct_read` never applies. Drive it with
-  `autumn-s3` (or a fuse mount) instead — both go through `FsState`.
+- **`autumnfs` takes `--direct-read` too** (default true, same as a mount). It
+  reads the KV layout directly rather than through the fuse core, so it does not
+  inherit the mount's setting — it has its own flag, and until it did, every
+  `autumnfs get`/`cat` proxied through the partition server no matter how the
+  cluster was configured.
+- **Measure a read with `cat > /dev/null`, never `get <local-file>`.** The
+  download's own write to local disk caps the whole thing at ~800 MiB/s and
+  hides everything above it. Measured on a 4 GiB file, EC 2+1, loopback TCP:
+  `get` to a file 797 MiB/s, `cat > /dev/null` 769 (direct off) and 1552-2053
+  (direct on) — i.e. the file write erased a 2x difference and, compared
+  against a fuse `dd of=/dev/null`, inverted which client looked faster.
 - **Striping can put every value under the threshold.** Direct read engages at
   64 KiB. A 300 KB file striped across 24 lanes stores ~12.5 KB per value and
   never qualifies; size the file so `size / lanes >= 64 KiB`.

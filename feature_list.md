@@ -105,14 +105,32 @@
 - **Acceptance**: 同一集群同一文件，fuse mount 写吞吐进到 CLI 的 90% 以内；
   `fuse_chaos.sh` 的 T1/T3 与 RMW 守卫仍绿（写路径不能为了吞吐牺牲崩溃一致性）。
 - **Status**: `passes: false` (2026-09-03) —— 只立账。
-- **同批实测的读数（4 GiB 未条带化文件，3 块真盘 /data03+/data05+/data08，loopback TCP，
-  EN page cache 热）供参照——读不是问题，别顺手"优化"它**:
-  | | autumnfs CLI | fuse direct=true | fuse direct=false |
-  |---|---|---|---|
-  | 复制 3× | 809 MiB/s | **974** | 836 |
-  | EC 2+1 | 753 MiB/s | **885** | 801 |
-  EC 的代价是 5~9%，两条路径上都一致。CLI 读永远走 PS 代理（`get_many_into`，窗口 8 个
-  extent = 64 MiB），**`autumnfs` 根本没有 `--direct-read`**；fuse 默认开着。
+- **读侧另立 F-FUSE-READ-GAP**（下一条）。⚠️ 本条最初记的读数表是**错的**，已删除：
+  当时用 `autumnfs get <本地文件>` 对比 fuse 的 `dd of=/dev/null`，前者多付了一次 4 GiB
+  的本地盘写，把 CLI 压到 ~800 MiB/s，于是得出"fuse 读更快"的反向结论。用 `cat >/dev/null`
+  重测后结论完全翻转，见下条。
+
+### F-FUSE-READ-GAP — fuse mount 读只有 autumnfs CLI 的一半
+- **Trigger** (2026-09-03): 同集群（3 块真盘、EC 2+1）、同一个 4 GiB 未条带化文件、
+  全部读到 `/dev/null`、direct-read 都开：
+  | 路径 | direct=true | direct=false |
+  |---|---|---|
+  | autumnfs CLI (`cat`) | **1552~2053 MiB/s** | 769 |
+  | fuse mount (`dd bs=8M`) | **936 MiB/s** | 498 |
+  | 裸 KV（`perf-check` 1 线程 depth 8，8 MiB 值） | 2522 MB/s | — |
+  | 本地 NVMe 单流 O_DIRECT bs=8M | 4512 MiB/s | — |
+- **两条结论**:
+  1. **CLI 已经接近裸 KV 的天花板**（2053 vs 2522），所以 fuse 那 936 是 fuse 自己丢的，
+     不是集群丢的。
+  2. **"8 MiB extent 太小"这个假设被否证**：同样 8 MiB、同样 depth 8，裸 KV 就有 2522 MB/s。
+     extent 尺寸不是限制项（至少对 CLI 这条路不是）。
+- **Scope**: 找 fuse 读路径丢掉的那 2×。已知嫌疑：单线程 dispatcher 上的
+  内核回复拷贝、`read::execute` 的每请求粒度（内核按 `max_read` 下发，不是按 extent），
+  以及每次 `read` 都重新 `prepare` 一遍 ChunkSpec。**先分段计时再动手**。
+- **Acceptance**: fuse 单流读进到 CLI 的 80% 以内，且 `fuse_chaos.sh` 全绿。
+- **Status**: `passes: false` (2026-09-03) —— 只立账。
+- **测量方法论（本条是踩出来的）**: 比较读吞吐时**两边都必须读到 `/dev/null`**。
+  `autumnfs get <file>` 自带一次本地盘写，会把结果钉在 ~800 MiB/s 并**反转**结论。
 
 ### BUG-KVC-MM-ALIAS — 多模态请求取不到 mm hash 时仍然缓存（跨图片 KV 串读）
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:193`；**已复核代码为真**): `_request_extra_keys()` 已经识别出"有 `mm_features` 但取不到任何 mm hash"这一情况并打 warning，注释甚至写明 "its prefix hash would collide across DIFFERENT images sharing the same placeholder token ids (false-alias → wrong output)" —— 然后**照样返回不含 disambiguator 的 keys 并继续缓存**（"the connector still caches (best-effort)"）。VLM 场景下同尺寸不同图片的 placeholder token 序列可以完全相同 ⇒ 用户 B 可能读到用户 A 的视觉 KV：错误输出 + **跨请求信息泄漏**。

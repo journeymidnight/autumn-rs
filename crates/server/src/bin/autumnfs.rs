@@ -66,6 +66,16 @@ struct Args {
     #[arg(long)]
     credential_file: Option<PathBuf>,
 
+    /// Read extents STRAIGHT from the extent nodes instead of proxying every
+    /// byte through the partition server (default true, same as a fuse mount).
+    /// Applies per extent at or above 64 KiB; anything smaller stays on the
+    /// proxy path, and ANY direct read that fails falls back to the proxy, so
+    /// this is a routing choice and never a correctness one. Turn it off when
+    /// the extent nodes' data ports are not reachable from this host — then
+    /// each large extent would pay a pointless redirect round trip first.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    direct_read: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -162,11 +172,13 @@ fn main() -> Result<()> {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
-            Cmd::Cat { path } => cmd_cat(&cluster, &path).await,
+            Cmd::Cat { path } => cmd_cat(&cluster, &path, args.direct_read).await,
             Cmd::Put { local, remote } => {
                 cmd_put(&cluster, &local, &remote).await
             }
-            Cmd::Get { remote, local } => cmd_get(&cluster, &remote, &local).await,
+            Cmd::Get { remote, local } => {
+                cmd_get(&cluster, &remote, &local, args.direct_read).await
+            }
             Cmd::Rm { path } => cmd_rm(&cluster, &path).await,
             Cmd::Touch { path } => cmd_touch(&cluster, &path).await,
         }
@@ -557,6 +569,7 @@ async fn read_file_to_writer(
     ino: u64,
     meta: &InodeMeta,
     out: &mut dyn Write,
+    direct_read: bool,
 ) -> Result<()> {
     if !is_reg(meta) {
         bail!("not a regular file");
@@ -636,7 +649,25 @@ async fn read_file_to_writer(
                 dest: buf.as_mut_slice(),
             })
             .collect();
-        let res = cluster.get_many_into(&mut items).await;
+        // `get_many_direct` reads every extent at or above 64 KiB STRAIGHT from
+        // an extent node, taking the partition server off the data path — the
+        // whole point of a bulk download. It is the same call the fuse mount
+        // makes, and it degrades the same way: sub-threshold items stay on the
+        // proxy, and any direct read that fails falls back to it per item, so
+        // the proxy is still the authority. Measured on a 4 GiB file over
+        // loopback TCP against an EC 2+1 cluster — where there is no separate
+        // NIC to take out of the path, so this is the gain at its SMALLEST:
+        // 769 MiB/s off, 1552-2053 on, against a raw-KV ceiling of 2522 MB/s
+        // at the same shape (1 thread, depth 8, 8 MiB values).
+        //
+        // Measure this with `cat > /dev/null`, never `get <local-file>`: the
+        // download's own write to local disk caps the whole thing at ~800 MiB/s
+        // and hides every difference above it.
+        let res = if direct_read {
+            cluster.get_many_direct(&mut items).await
+        } else {
+            cluster.get_many_into(&mut items).await
+        };
         drop(items); // release the &mut borrows of `bufs` before reading them
         for ((off, _), (r, buf)) in chunk.iter().zip(res.iter().zip(bufs.iter())) {
             let n = match r {
@@ -659,23 +690,28 @@ async fn read_file_to_writer(
     Ok(())
 }
 
-async fn cmd_cat(cluster: &ClusterClient, path: &str) -> Result<()> {
+async fn cmd_cat(cluster: &ClusterClient, path: &str, direct_read: bool) -> Result<()> {
     let (ino, _, _, meta) = resolve(cluster, path).await?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    read_file_to_writer(cluster, ino, &meta, &mut out).await
+    read_file_to_writer(cluster, ino, &meta, &mut out, direct_read).await
 }
 
-async fn cmd_get(cluster: &ClusterClient, remote: &str, local: &PathBuf) -> Result<()> {
+async fn cmd_get(
+    cluster: &ClusterClient,
+    remote: &str,
+    local: &PathBuf,
+    direct_read: bool,
+) -> Result<()> {
     let (ino, _, _, meta) = resolve(cluster, remote).await?;
     if local.as_os_str() == "-" {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        read_file_to_writer(cluster, ino, &meta, &mut out).await
+        read_file_to_writer(cluster, ino, &meta, &mut out, direct_read).await
     } else {
         let mut f = std::fs::File::create(local)
             .with_context(|| format!("create local file {}", local.display()))?;
-        read_file_to_writer(cluster, ino, &meta, &mut f).await
+        read_file_to_writer(cluster, ino, &meta, &mut f, direct_read).await
     }
 }
 
