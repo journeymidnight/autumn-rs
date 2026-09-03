@@ -88,6 +88,32 @@
 - **Status**: `passes: false` (2026-09-02) —— 只立账。这不阻塞任何东西：需要吞吐的
   消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
 
+### F-FUSE-WRITE-PIPELINE — fuse mount 的写还是"填满再排空"，CLI 早就换成连续流水了
+- **Trigger** (2026-09-03, 用户报"fuse 感觉慢特别多"后实测): 同一集群同一个 4 GiB 文件，
+  **autumnfs CLI put 345 MiB/s，fuse mount 写 208 MiB/s**（慢 40%）。而**读侧 fuse 反而更快**
+  （见下表），所以这不是"fuse 整体慢"，是写路径单独落后。
+- **机制（已在代码里核实，非推断）**: `crates/fuse/src/write.rs` 的注释自己写着
+  "A full buffer flushes the WHOLE buffer at once via `extent::write_region`" ——
+  64 MiB 缓冲填满 → 整块排空 → 再填。填的时候网络闲着，排的时候 CPU 闲着，两段不重叠。
+  `autumnfs.rs::publish_file` 里有一段注释正是在讲它**换掉**了这个形状：
+  "(A): CONTINUOUS write pipeline. The old window-of-8 + full-barrier drain kept only
+  ~window/lanes puts in flight per lane — thin group-commit batches"，并且改用 RegPool
+  的 `ValueBuf` 复用地址。**这个优化只做在了 CLI 上，fuse 写路径没跟上。**
+- **Scope**: 把 fuse 的 flush 从 barrier 改成连续流水（缓冲一满就交出去、立刻接着收下一段），
+  参考 `publish_file` 的形状。注意 fuse 侧的额外约束：单线程 dispatcher、per-inode 缓冲、
+  以及 `write_region` 的非对齐 RMW 分支。
+- **Acceptance**: 同一集群同一文件，fuse mount 写吞吐进到 CLI 的 90% 以内；
+  `fuse_chaos.sh` 的 T1/T3 与 RMW 守卫仍绿（写路径不能为了吞吐牺牲崩溃一致性）。
+- **Status**: `passes: false` (2026-09-03) —— 只立账。
+- **同批实测的读数（4 GiB 未条带化文件，3 块真盘 /data03+/data05+/data08，loopback TCP，
+  EN page cache 热）供参照——读不是问题，别顺手"优化"它**:
+  | | autumnfs CLI | fuse direct=true | fuse direct=false |
+  |---|---|---|---|
+  | 复制 3× | 809 MiB/s | **974** | 836 |
+  | EC 2+1 | 753 MiB/s | **885** | 801 |
+  EC 的代价是 5~9%，两条路径上都一致。CLI 读永远走 PS 代理（`get_many_into`，窗口 8 个
+  extent = 64 MiB），**`autumnfs` 根本没有 `--direct-read`**；fuse 默认开着。
+
 ### BUG-KVC-MM-ALIAS — 多模态请求取不到 mm hash 时仍然缓存（跨图片 KV 串读）
 - **Trigger** (2026-07-22, coco deep inspect `vllm_connector.py:193`；**已复核代码为真**): `_request_extra_keys()` 已经识别出"有 `mm_features` 但取不到任何 mm hash"这一情况并打 warning，注释甚至写明 "its prefix hash would collide across DIFFERENT images sharing the same placeholder token ids (false-alias → wrong output)" —— 然后**照样返回不含 disambiguator 的 keys 并继续缓存**（"the connector still caches (best-effort)"）。VLM 场景下同尺寸不同图片的 placeholder token 序列可以完全相同 ⇒ 用户 B 可能读到用户 A 的视觉 KV：错误输出 + **跨请求信息泄漏**。
 - **Scope**: `_request_extra_keys()` 改返回 `Optional[List[str]]`，无法区分多模态内容时返回 `None`；load 路径 `get_num_new_matched_tokens()` 见 `None` 直接 `return 0, False`，store 路径 `build_connector_meta()` 见 `None` 直接跳过保存（= 该请求不participate external KV，纯文本请求不受影响）。优先复用 vLLM 自身的 BlockHash / extra keys，而不是在 connector 里 best-effort 猜字段名。

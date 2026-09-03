@@ -472,6 +472,12 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_MAX_WAL_GAP:-}" ]]; then
         tunable_args+=(--max-wal-gap "$AUTUMN_PS_MAX_WAL_GAP")
     fi
+    # Per-extent seal threshold. Mostly needed to TEST anything EC: conversion
+    # only ever touches SEALED extents, and at the 16 GiB default a test corpus
+    # never rolls one, so an EC cluster quietly stays fully replicated.
+    if [[ -n "${AUTUMN_PS_MAX_EXTENT_SIZE_BYTES:-}" ]]; then
+        tunable_args+=(--max-extent-size-bytes "$AUTUMN_PS_MAX_EXTENT_SIZE_BYTES")
+    fi
     if [[ -n "${AUTUMN_PS_SHUTDOWN_TIMEOUT_MS:-}" ]]; then
         tunable_args+=(--shutdown-timeout-ms "$AUTUMN_PS_SHUTDOWN_TIMEOUT_MS")
     fi
