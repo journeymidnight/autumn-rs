@@ -162,10 +162,13 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
         d2.path().to_path_buf(),
         d3.path().to_path_buf(),
     ];
-    let txs = [
-        start_extent_node_with_cmds(n1_addr, dirs[0].clone(), 1, &mgr_str),
-        start_extent_node_with_cmds(n2_addr, dirs[1].clone(), 2, &mgr_str),
-        start_extent_node_with_cmds(n3_addr, dirs[2].clone(), 3, &mgr_str),
+    // `Option` slots, so one node can be stopped (drop its Sender -> its command
+    // loop hits Disconnected -> the runtime drops and the listener closes)
+    // without shifting the indices the rest of the test routes by.
+    let mut txs: Vec<Option<Sender<NodeCmd>>> = vec![
+        Some(start_extent_node_with_cmds(n1_addr, dirs[0].clone(), 1, &mgr_str)),
+        Some(start_extent_node_with_cmds(n2_addr, dirs[1].clone(), 2, &mgr_str)),
+        Some(start_extent_node_with_cmds(n3_addr, dirs[2].clone(), 3, &mgr_str)),
     ];
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -266,6 +269,8 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
                 .unwrap_or_else(|| panic!("holder node {holder} not in registered set"));
             let (ack_tx, ack_rx) = channel();
             txs[ni]
+                .as_ref()
+                .unwrap()
                 .send(NodeCmd::ApplyPlacements(
                     vec![(extent_id, PAYLOAD_LOCATION_IN_SHARD_FILE, shard_index as u32)],
                     ack_tx,
@@ -317,5 +322,105 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
                 "node {holder}: .meta eversion must match the manager's post-flip eversion"
             );
         }
+
+        // Read the bytes back BEFORE anything is taken down: the conversion must
+        // not have disturbed them. This has to precede the restart below, which
+        // moves a shard holder to a port the manager does not know — a gather
+        // that still routes to the old address just times out, which would say
+        // nothing about the conversion.
+        let (got, _) = client
+            .read_bytes_from_extent(extent_id, 0, payload.len() as u64)
+            .await
+            .expect("read back after conversion");
+        assert_eq!(
+            got, payload,
+            "converted extent must still serve the original bytes"
+        );
+
+        // What the restarted holder believes about this extent.
+        //
+        // Restarting is the load-bearing part. Probing the node that is still
+        // running proves nothing: it learned the seal in memory during the
+        // conversion, so it answers from `entry.sealed` whatever the `.meta`
+        // says. Only a process that had to reload from disk can tell the two
+        // apart — the `.dat` was reclaimed at the flip, so this extent comes
+        // back as a shard-only entry whose state is read entirely from `.meta`.
+        //
+        // Same directory, fresh port: the probe talks to the node directly, so
+        // the manager need not learn about the new process, and a new port
+        // avoids racing the old listener's teardown.
+        let coordinator = ex.replicates[0];
+        let victim = *shard_holders
+            .iter()
+            .find(|h| **h != coordinator)
+            .expect("a participant distinct from the coordinator");
+        let vi = node_ids.iter().position(|id| *id == victim).unwrap();
+        drop(txs[vi].take());
+        std::thread::sleep(Duration::from_millis(600));
+        let restart_addr = pick_addr();
+        let _restarted = start_extent_node_with_cmds(
+            restart_addr,
+            dirs[vi].clone(),
+            (vi + 1) as u64,
+            &mgr_str,
+        );
+
+        {
+            let holder = &victim;
+            let node = RpcClient::connect(restart_addr)
+                .await
+                .expect("connect restarted holder");
+
+            // MSG_PROBE_EXTENT is the assertion that actually discriminates,
+            // because it answers from local atomics only — no fence check, no
+            // manager fetch, so nothing can heal the state out from under it.
+            // A sealed extent reports its `sealed_length`; the pre-fix
+            // participant reloads as OPEN and reports 0.
+            let pr = node
+                .call(
+                    autumn_rpc::extent_rpc::MSG_PROBE_EXTENT,
+                    autumn_rpc::extent_rpc::ProbeExtentReq { extent_id }.encode(),
+                )
+                .await
+                .expect("probe rpc to restarted holder");
+            let pr = autumn_rpc::extent_rpc::ProbeExtentResp::decode(pr)
+                .expect("decode ProbeExtentResp");
+            assert_eq!(
+                pr.code,
+                autumn_rpc::extent_rpc::CODE_OK,
+                "holder {holder}: restarted node does not know the extent at all"
+            );
+            assert_eq!(
+                pr.length, ex.sealed_length,
+                "holder {holder}: a restarted shard holder must reload the extent as SEALED at the \
+                 manager's length (0 means it came back OPEN — the defect)"
+            );
+            let ap = node
+                .call(
+                    autumn_rpc::extent_rpc::MSG_APPEND,
+                    autumn_rpc::extent_rpc::AppendReq {
+                        extent_id,
+                        eversion: ex.eversion,
+                        commit: 0,
+                        owner_epoch: 0,
+                        payload: vec![0xABu8; 64].into(),
+                    }
+                    .encode(),
+                )
+                .await
+                .expect("append rpc to holder");
+            let ap = autumn_rpc::extent_rpc::AppendResp::decode(ap).expect("decode AppendResp");
+            // The ledger's other clause. Weaker than the probe above and worth
+            // knowing why: with the caller's eversion AHEAD of the reloaded one,
+            // as it is here, the append path refreshes from the manager before
+            // reaching the seal gate, so this answers CODE_PRECONDITION with or
+            // without the fix. It pins the contract, not the regression.
+            assert_eq!(
+                ap.code,
+                autumn_rpc::extent_rpc::CODE_PRECONDITION,
+                "holder {holder}: a RESTARTED shard holder must refuse an append"
+            );
+        }
+
     });
 }

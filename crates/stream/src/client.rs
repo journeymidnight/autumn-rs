@@ -82,6 +82,140 @@ fn is_ec_gather_one_short(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EcGatherOneShort>())
 }
 
+/// Why a failed read attempt is worth one more try.
+///
+/// The variants differ in what the caller logs and whether it pauses first, but
+/// they share the rule that matters: refreshing the cached layout is the point,
+/// and it is worth doing exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRetry {
+    /// The extent's layout moved under us (replica -> EC, most often).
+    EversionStale,
+    /// The EN says the payload is not on the node we named.
+    PayloadNotHere,
+    /// The gather came up exactly one shard short.
+    GatherOneShort,
+}
+
+/// Tag a one-short gather so the read loop can recognise it.
+///
+/// Its own function because the tag is a seam: the counting rule and the
+/// classifier are both tested, but nothing bound them together, and swapping
+/// this `EcGatherOneShort` for a plain `anyhow!` left every test in the crate
+/// green while the one-short retry silently stopped happening. Building the
+/// error here lets one test walk the whole chain — verdict, error, classifier.
+fn one_short_error(
+    extent_id: u64,
+    missing_shard_idx: usize,
+    sh_off: u64,
+    sh_len: u64,
+    last_err: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(EcGatherOneShort).context(format!(
+        "ec_reconstruct_shard_subrange: one shard short (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len}): {last_err:#}"
+    ))
+}
+
+/// What a shard gather produced.
+#[derive(Debug)]
+enum GatherOutcome {
+    /// The "missing" shard answered after all. It is a DATA shard (the caller
+    /// enforces `missing_shard_idx < data_shards`), so its bytes are the
+    /// sub-range verbatim and RS must be SKIPPED — not merely avoidable.
+    Verbatim(Vec<u8>),
+    /// K shards in hand; reconstruct from these.
+    Ready(Vec<Option<Vec<u8>>>),
+    /// Exactly one shard short — the retryable case.
+    OneShort { last_err: anyhow::Error },
+    /// Two or more short: the extent really does lack K right now.
+    Short {
+        success: usize,
+        last_err: anyhow::Error,
+    },
+    /// A shard reported a stale layout; that propagates immediately rather than
+    /// being counted as a miss, so the caller can refresh.
+    Stale(anyhow::Error),
+}
+
+/// Drain per-shard results into a verdict.
+///
+/// Split out of `ec_reconstruct_shard_subrange` so the counting rules can be
+/// driven with injected results instead of a cluster — which is the only way to
+/// test them, since the interesting cases (exactly K-1 answers, the missing
+/// shard answering late, a stale-layout shard) do not arise on demand from real
+/// nodes. It takes a stream rather than a collected vector so that the
+/// stop-as-soon-as-K-arrive behaviour, which is what keeps a slow straggler off
+/// the read's critical path, stays inside the function under test.
+async fn ec_gather_collect<S>(
+    rx: &mut S,
+    n: usize,
+    data_shards: usize,
+    missing_shard_idx: usize,
+    mut last_err: anyhow::Error,
+) -> GatherOutcome
+where
+    S: futures::Stream<Item = (usize, Result<Vec<u8>>)> + Unpin,
+{
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+    let mut success: usize = 0;
+    while let Some((idx, result)) = futures::StreamExt::next(rx).await {
+        match result {
+            Ok(bytes) => {
+                if idx == missing_shard_idx {
+                    return GatherOutcome::Verbatim(bytes);
+                }
+                shards[idx] = Some(bytes);
+                success += 1;
+                if success >= data_shards {
+                    break;
+                }
+            }
+            Err(e) => {
+                if is_eversion_stale(&e) {
+                    return GatherOutcome::Stale(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    if success >= data_shards {
+        return GatherOutcome::Ready(shards);
+    }
+    // One short is worth one more look on refreshed state — a peer that blew a
+    // ~3 s deadline, an address that has since rotated, a shard a recovery has
+    // moved. Two or more short is not: the extent really does lack K right now,
+    // and retrying only delays the error.
+    if success + 1 == data_shards {
+        GatherOutcome::OneShort { last_err }
+    } else {
+        GatherOutcome::Short { success, last_err }
+    }
+}
+
+/// Retry policy for `read_bytes_from_extent`: `None` means give the error to the
+/// caller.
+///
+/// Pure, and separate from the loop, because the two rules encoded here are
+/// worth testing without a cluster. Retrying at most once is the load-bearing
+/// half — every EC gather is already a K-way read amplification, so an unbounded
+/// retry multiplies load exactly when the cluster is degraded, which is how the
+/// read-timeout storm was born. The classification is the other half: an error
+/// that is not one of these three is not made better by asking again.
+fn read_retry_action(attempt: usize, err: &anyhow::Error) -> Option<ReadRetry> {
+    if attempt != 0 {
+        return None;
+    }
+    if is_eversion_stale(err) {
+        Some(ReadRetry::EversionStale)
+    } else if is_payload_not_here(err) {
+        Some(ReadRetry::PayloadNotHere)
+    } else if is_ec_gather_one_short(err) {
+        Some(ReadRetry::GatherOneShort)
+    } else {
+        None
+    }
+}
+
 /// BUG-MGR-RETRY-CLASS: typed error for a manager RPC that ANSWERED with a
 /// non-OK code. Pre-fix `check_manager_resp` flattened the code into an
 /// anyhow string, so `retry_manager_call` could not tell a transient
@@ -4024,55 +4158,60 @@ impl StreamClient {
             let ex = self.fetch_extent_info(extent_id).await?;
             match self.read_with_layout(extent_id, offset, length, &ex).await {
                 Ok(r) => return Ok(r),
-                Err(e) if attempt == 0 && is_eversion_stale(&e) => {
-                    self.invalidate_extent_cache(extent_id);
-                    continue;
-                }
-                // The EN told us our layout is stale. Refetching is the designed
-                // response and the server's contract says so; without this arm
-                // the refusal was indistinguishable from any other failure and
-                // the read degraded to reconstruct on every attempt, forever.
-                Err(e) if attempt == 0 && is_payload_not_here(&e) => {
-                    tracing::warn!(
-                        extent_id,
-                        error = %format_args!("{e:#}"),
-                        "ec: payload not on the named node — refreshing extent layout"
-                    );
-                    self.invalidate_extent_cache(extent_id);
-                    continue;
-                }
-                // One retry for a gather that came up exactly one shard short.
-                // Same shape as the eversion arm and for the same reason — the
-                // useful part is re-planning from FRESH ExtentInfo, since
-                // retrying against the cached copy just re-asks the same wrong
-                // node the same wrong question. The jittered pause only spaces
-                // the attempts; every gather is already a K-way read
-                // amplification, and a tight or unbounded retry multiplies load
-                // exactly when the cluster is degraded, which is how the
-                // read-timeout storm was born.
-                Err(e) if attempt == 0 && is_ec_gather_one_short(&e) => {
-                    tracing::warn!(
-                        extent_id,
-                        error = %format_args!("{e:#}"),
-                        "ec: gather one shard short — refreshing extent info and retrying once"
-                    );
-                    self.invalidate_extent_cache(extent_id);
-                    // Per-CALL, not per-extent. Hashing the extent id alone
-                    // gave every reader of one extent the identical sleep, so
-                    // the herd this exists to break up stayed in lockstep — and
-                    // a read-hot weight file is precisely many readers on one
-                    // extent. The extent term still spreads load ACROSS
-                    // extents; the clock term spreads it within one.
-                    let spread = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos() as u64)
-                        .unwrap_or(0);
-                    let jitter =
-                        100 + (extent_id.wrapping_mul(2654435761) ^ spread.wrapping_mul(6364136223846793005)) % 200;
-                    compio::time::sleep(std::time::Duration::from_millis(jitter)).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
+                Err(e) => match read_retry_action(attempt, &e) {
+                    None => return Err(e),
+                    Some(kind) => {
+                        match kind {
+                            // The layout moved under us. Refetching is the whole
+                            // point; without it the first GET after a
+                            // replica -> EC flip pays up to 3 x call_timeout
+                            // against stale replicas before anything sees the
+                            // new layout.
+                            ReadRetry::EversionStale => {}
+                            // The EN told us our layout is stale. Refetching is
+                            // the designed response and the server's contract
+                            // says so; without this class the refusal was
+                            // indistinguishable from any other failure and the
+                            // read degraded to reconstruct on every attempt,
+                            // forever.
+                            ReadRetry::PayloadNotHere => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "ec: payload not on the named node — refreshing extent layout"
+                            ),
+                            ReadRetry::GatherOneShort => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "ec: gather one shard short — refreshing extent info and retrying once"
+                            ),
+                        }
+                        self.invalidate_extent_cache(extent_id);
+                        // Only the gather pauses. The useful part of every retry
+                        // here is re-planning from FRESH ExtentInfo, but a gather
+                        // is a K-way read amplification, so spacing the attempts
+                        // keeps a degraded cluster from being hit by the whole
+                        // herd at once.
+                        if kind == ReadRetry::GatherOneShort {
+                            // Per-CALL, not per-extent. Hashing the extent id
+                            // alone gave every reader of one extent the identical
+                            // sleep, so the herd this exists to break up stayed
+                            // in lockstep — and a read-hot weight file is
+                            // precisely many readers on one extent. The extent
+                            // term still spreads load ACROSS extents; the clock
+                            // term spreads it within one.
+                            let spread = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.subsec_nanos() as u64)
+                                .unwrap_or(0);
+                            let jitter = 100
+                                + (extent_id.wrapping_mul(2654435761)
+                                    ^ spread.wrapping_mul(6364136223846793005))
+                                    % 200;
+                            compio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                        }
+                        continue;
+                    }
+                },
             }
         }
         unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
@@ -5308,53 +5447,42 @@ impl StreamClient {
         }
         drop(tx);
 
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
-        let mut success: usize = 0;
-        let mut last_err =
+        let no_responses =
             anyhow!("ec_reconstruct_shard_subrange: no shard responses for extent {extent_id}");
-        while let Some((idx, result)) = futures::StreamExt::next(&mut rx).await {
-            match result {
-                Ok(bytes) => {
-                    // The "missing" shard answered after all — its bytes are
-                    // the sub-range verbatim (it is a data shard; see the
-                    // guard above), so there is nothing to reconstruct.
-                    if idx == missing_shard_idx {
-                        tracing::debug!(
-                            extent_id,
-                            shard = missing_shard_idx,
-                            "ec_reconstruct: missing shard answered on retry — no RS needed"
-                        );
-                        return Ok(bytes);
-                    }
-                    shards[idx] = Some(bytes);
-                    success += 1;
-                    if success >= data_shards {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if is_eversion_stale(&e) {
-                        return Err(e);
-                    }
-                    last_err = e;
-                }
+        let shards = match ec_gather_collect(
+            &mut rx,
+            n,
+            data_shards,
+            missing_shard_idx,
+            no_responses,
+        )
+        .await
+        {
+            GatherOutcome::Verbatim(bytes) => {
+                tracing::debug!(
+                    extent_id,
+                    shard = missing_shard_idx,
+                    "ec_reconstruct: missing shard answered on retry — no RS needed"
+                );
+                return Ok(bytes);
             }
-        }
-
-        if success < data_shards {
-            // One short is worth one more look on refreshed state — a peer that
-            // blew a ~3 s deadline, an address that has since rotated, a shard a
-            // recovery has moved. Two or more short is not: the extent really
-            // does lack K right now, and retrying only delays the error.
-            if success + 1 == data_shards {
-                return Err(anyhow::Error::new(EcGatherOneShort).context(format!(
-                    "ec_reconstruct_shard_subrange: one shard short (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len}): {last_err:#}"
+            GatherOutcome::Ready(shards) => shards,
+            GatherOutcome::Stale(e) => return Err(e),
+            GatherOutcome::OneShort { last_err } => {
+                return Err(one_short_error(
+                    extent_id,
+                    missing_shard_idx,
+                    sh_off,
+                    sh_len,
+                    last_err,
+                ));
+            }
+            GatherOutcome::Short { success, last_err } => {
+                return Err(last_err.context(format!(
+                    "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
                 )));
             }
-            return Err(last_err.context(format!(
-                "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
-            )));
-        }
+        };
 
         // RS reconstruction is CPU-bound; offload to blocking pool.
         let result = compio::runtime::spawn_blocking(move || {
@@ -6871,6 +6999,160 @@ mod manager_retry_tests {
 #[cfg(test)]
 mod ec_gather_retry_tests {
     use super::*;
+
+    // The tests below drive the real decision functions with injected per-shard
+    // results. The sentinel-classification tests further down do NOT: they build
+    // an error by hand and assert the classifier's verdict on it, which stays
+    // green however production tags its own errors. Keep them for the plumbing,
+    // but these are the ones that hold the rules.
+
+    fn ok(idx: usize, b: &[u8]) -> (usize, Result<Vec<u8>>) {
+        (idx, Ok(b.to_vec()))
+    }
+    fn fail(idx: usize) -> (usize, Result<Vec<u8>>) {
+        (idx, Err(anyhow!("shard {idx}: read failed")))
+    }
+    fn gather(
+        items: Vec<(usize, Result<Vec<u8>>)>,
+        n: usize,
+        k: usize,
+        missing: usize,
+    ) -> GatherOutcome {
+        let mut rx = futures::stream::iter(items);
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
+            ec_gather_collect(&mut rx, n, k, missing, anyhow!("no shard responses")).await
+        })
+    }
+
+    /// K-1 answers is the retryable verdict; K-2 is not. This is the rule the
+    /// whole one-short retry rests on, and the ablation named in the ledger
+    /// (`success + 1` -> `success + 2`) flips both halves of it.
+    #[test]
+    fn one_short_is_retryable_and_two_short_is_not() {
+        // 4+1 with shard 0 missing: K=4, so one short is three usable answers.
+        let one_short = gather(
+            vec![ok(1, b"b"), ok(2, b"c"), ok(3, b"d"), fail(4)],
+            5,
+            4,
+            0,
+        );
+        assert!(
+            matches!(one_short, GatherOutcome::OneShort { .. }),
+            "3 of 4 shards must be the retryable one-short verdict, got {one_short:?}"
+        );
+
+        let two_short = gather(vec![ok(1, b"b"), ok(2, b"c"), fail(3), fail(4)], 5, 4, 0);
+        assert!(
+            matches!(two_short, GatherOutcome::Short { success: 2, .. }),
+            "2 of 4 shards must be terminal, not retryable, got {two_short:?}"
+        );
+    }
+
+    /// When the shard we were told is missing answers, its bytes ARE the answer:
+    /// returned verbatim, with RS skipped rather than merely made unnecessary.
+    #[test]
+    fn the_missing_shard_answering_returns_its_bytes_verbatim() {
+        let payload = b"the missing shard's own bytes".to_vec();
+        let out = gather(
+            vec![ok(1, b"parity-ish"), (0, Ok(payload.clone())), ok(2, b"x")],
+            5,
+            4,
+            0,
+        );
+        match out {
+            GatherOutcome::Verbatim(got) => assert_eq!(got, payload),
+            other => panic!("missing shard answered but the gather did not return it: {other:?}"),
+        }
+    }
+
+    /// K answers ends the gather; a straggler behind them is never awaited. That
+    /// is what keeps one slow peer off the read's critical path.
+    #[test]
+    fn the_gather_stops_as_soon_as_k_shards_arrive() {
+        let mut rx = futures::stream::iter(vec![
+            ok(1, b"a"),
+            ok(2, b"b"),
+            ok(3, b"c"),
+            ok(4, b"d"),
+            fail(9), // a straggler that must never be consumed
+        ]);
+        let out = compio::runtime::Runtime::new().unwrap().block_on(async {
+            let out = ec_gather_collect(&mut rx, 5, 4, 0, anyhow!("none")).await;
+            // The straggler is still queued — the gather returned without it.
+            let leftover = futures::StreamExt::next(&mut rx).await;
+            assert!(
+                matches!(leftover, Some((9, Err(_)))),
+                "the gather consumed the straggler instead of returning at K"
+            );
+            out
+        });
+        assert!(matches!(out, GatherOutcome::Ready(_)), "got {out:?}");
+    }
+
+    /// A stale-layout shard aborts the gather instead of counting as one more
+    /// miss — the caller has to refresh, and calling it a miss would send it down
+    /// the one-short path with a wrong reason.
+    #[test]
+    fn a_stale_layout_shard_aborts_the_gather() {
+        let stale = (1usize, Err(anyhow::Error::new(EversionStale)));
+        let out = gather(vec![stale, ok(2, b"b"), ok(3, b"c")], 5, 4, 0);
+        assert!(matches!(out, GatherOutcome::Stale(_)), "got {out:?}");
+    }
+
+    /// The chain, end to end: a one-short gather must produce an error the read
+    /// loop actually recognises as retryable. Without this, the counting rule
+    /// and the classifier are each tested and the glue between them is not —
+    /// replacing the sentinel with a plain `anyhow!` used to leave every test in
+    /// the crate green while the retry quietly stopped happening.
+    #[test]
+    fn a_one_short_verdict_produces_an_error_the_read_loop_retries() {
+        let out = gather(
+            vec![ok(1, b"b"), ok(2, b"c"), ok(3, b"d"), fail(4)],
+            5,
+            4,
+            0,
+        );
+        let GatherOutcome::OneShort { last_err } = out else {
+            panic!("expected OneShort, got {out:?}");
+        };
+        let tagged = one_short_error(7, 0, 0, 4096, last_err);
+        assert_eq!(
+            read_retry_action(0, &tagged),
+            Some(ReadRetry::GatherOneShort),
+            "the one-short verdict must survive error construction as a retryable class"
+        );
+    }
+
+    /// Exactly one retry, and only for the three classes that a refreshed layout
+    /// can actually fix. The ledger's second ablation (dropping `attempt == 0`)
+    /// flips the second half of each pair.
+    #[test]
+    fn a_read_retries_at_most_once_and_only_for_recoverable_classes() {
+        let stale = anyhow::Error::new(EversionStale);
+        let not_here = anyhow::Error::new(PayloadNotHere);
+        let one_short = anyhow::Error::new(EcGatherOneShort);
+        let other = anyhow!("connection reset by peer");
+
+        assert_eq!(read_retry_action(0, &stale), Some(ReadRetry::EversionStale));
+        assert_eq!(
+            read_retry_action(0, &not_here),
+            Some(ReadRetry::PayloadNotHere)
+        );
+        assert_eq!(
+            read_retry_action(0, &one_short),
+            Some(ReadRetry::GatherOneShort)
+        );
+        assert_eq!(read_retry_action(0, &other), None, "an unrecoverable error must not be retried");
+
+        // Second attempt: no class is retried again.
+        assert_eq!(read_retry_action(1, &stale), None);
+        assert_eq!(read_retry_action(1, &not_here), None);
+        assert_eq!(
+            read_retry_action(1, &one_short),
+            None,
+            "a second retry multiplies K-way read amplification on a degraded cluster"
+        );
+    }
 
     /// The one-short sentinel is what gates the retry, and it must survive
     /// being wrapped in context — the shortfall site attaches a message.

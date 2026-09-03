@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-02
+**Last updated:** 2026-09-03
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -21,20 +21,6 @@
 - **更糟的一半**: 服务端 `read_plan` 是**先查 `holds_payload` 再查 eversion**（`extent_node.rs:2503-2512`），所以缓存里的 `payload_location` 陈旧时，EN 回的是 `PAYLOAD_NOT_HERE` 而**不是** `EversionStale` ⇒ 这个循环唯一会处理的哨兵，恰恰是服务端在该场景下不会发的那个。后果是重放响亮失败（可用性问题，非损坏），且这条路上没有任何东西会驱逐缓存 ⇒ **单个 StreamClient 生命周期内不收敛**。
 - **Scope**: 把 `is_payload_not_here` / `is_ec_gather_one_short` 两条臂接进该循环，语义与主读路径一致（invalidate → 重取 → 重新规划；one-short 带抖动，payload-not-here 不睡）。注意两个循环的重试预算要各自独立，别叠成 4 次。
 - **Acceptance**: 构造"客户端缓存 payload_location 陈旧 + extent 已 EC 转换"的重放，验证第一次 `PAYLOAD_NOT_HERE` 后自动刷新布局并成功；同一 StreamClient 内重复重放不再持续失败；两个循环各自最多重试一次（用注入计数断言，别只断言最终成功）。
-- **Status**: `passes: false` (2026-09-02)
-
-### F-EC-RETRY-TESTS — R2 的"边界"回归测试实际上测不到边界
-- **Trigger** (2026-09-02, fable 对 R1-R4 的评审): 账本称"3 个回归测试锁住边界"，但那几个测试只钉了**哨兵的管道**：`multi_short_is_not_retryable` 自己手搓一个字符串错误再断言"它不是类型化哨兵" —— **即使生产代码在 `success == K-2` 时挂上哨兵，这个测试照样通过**。真正要守的三件事一件没测：`ec_reconstruct_shard_subrange` 的计数逻辑（何时才算 one-short）、`attempt == 0` 的只重试一次、以及 R1 的"缺失分片答上来就逐字返回"。同文件的 `manager_retry_tests` 是反例，它确实驱动了自己的重试循环。
-- **Scope**: 让测试驱动真实函数而不是构造错误对象 —— 注入可控的 per-shard 结果（成功/短读/错误/超时），断言：K-1 成功才挂哨兵、K-2 不挂；重试恰好发生一次；R1 那条路返回的字节与分片内容逐字相同且**跳过** RS。
-- **Acceptance**: 把生产代码的判据从 `success + 1 == data_shards` 改成 `success + 2 == data_shards`，测试必须变红（消融验证）；把 `attempt == 0` 去掉，测试必须变红。
-- **Status**: `passes: false` (2026-09-02)
-
-### BUG-EC-PARTICIPANT-UNSEALED — EC 转换的参与者从不落盘封存状态，重启后那个纯分片 extent 在它眼里可写
-- **Trigger** (2026-09-02, 用户在排查一起 EC 读故障时顺手挖出，非该故障的原因): 同一个 extent，协调者与参与者的持久状态不一致 —— en-0（协调者）`sealed=1 / sealed_length=17183737326 / eversion=2 / avali=7`，en-1..4（参与者）全是 `sealed=0 / sealed_length=0 / eversion=1 / avali=0`。
-- **已核实（我自己读的代码，不是转述）**: `write_shard_stripe_local`（`crates/stream/src/extent_node.rs`，全长 153 行）里 **`save_meta` 出现 0 次**，从不写 `entry.sealed`、不写 `avali`，`sealed_length` 只作越界校验用；`apply_placements` 后来只补写了 `payload_location`。而 append 的封存判据是 **`sealed_length > 0 || avali > 0`**（见 stream/CLAUDE.md 附录的 append 协议第 3 步），参与者持久化的这两个值**都是 0** ⇒ 参与者重启后，该 extent 在它眼里既未封存也无 avali 位，**这道闸门不会拒绝写入**。
-- **未追到底的部分（不要跳过这一步）**: 闸门有洞是确定的，**危害链条还没走完**。参与者的 `.dat` 通常是空的（分片在独立文件里），所以一次被放行的 append 落在 `.dat` 上、而读按 `payload_location=InShardFile` 去读分片文件——**直接的字节损坏未被证明**。真正要查的是：这样的 extent 在参与者眼里"未封存"之后，recovery / seal / avali 重建这些路径会不会把它当成开着的尾巴处理。按仓库规矩（`feedback_reproduce_before_fixing_mechanism_bugs`）**先复现再修**。
-- **Scope（复现后）**: 参与者在写完自己的分片后必须落盘封存状态（`sealed=1` + `sealed_length` + `eversion` + 自己的 `avali` 位），也就是 `write_shard_stripe_local` 或 `apply_placements` 尾部补一次 `save_meta`。注意这是**持久态布局改动**，按升级纪律要么同布局要么带迁移。
-- **Acceptance**: 构造"EC 转换完成 → 杀掉参与者 → 重启"，断言重启后的参与者认为该 extent 已封存（`sealed` 与 `sealed_length` 非零），且对它的 append 被 `CODE_PRECONDITION` 拒绝；转换后再读，字节精确。
 - **Status**: `passes: false` (2026-09-02)
 
 ### F-MEM-WIPE-COST — `memory-mcp --reset` 在真实语料上要 10 分钟（扫描绑定，非写绑定）
@@ -243,38 +229,6 @@
 - **Scope**: `deploy/docker/Dockerfile` builder 段加 `libfuse3-dev`+`pkg-config`（fuser 0.15 链接 libfuse3），构建改 `-p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp`；runtime 段加 `fuse3`（libfuse3 + fusermount3 setuid helper）并拷出两个二进制。`entrypoint.sh` 加 `fuse` role（env→flag：`AUTUMN_MANAGER`/`AUTUMN_FUSE_MOUNTPOINT`/`AUTUMN_CREDENTIAL_FILE`/`AUTUMN_FUSE_DIRECT_READ`/`AUTUMN_FUSE_ALLOW_OTHER`），挂载前 `fusermount3 -u` 清理崩溃残留。`docs/ops.md` 补 sidecar manifest + mountPropagation 配对 + FOPEN_DIRECT_IO 的 mmap 后果。
 - **Acceptance**: (a) `deploy/validate.sh` 通过且 role 分派表含 `fuse`；(b) Linux 上镜像构建成功、`autumn-fuse --help` / `memory-mcp --help` 在镜像里可执行；(c) sidecar 挂载后主容器能在 `/mnt/autumn` 看到 `fs/` 内容（mountPropagation 配对生效）；(d) 杀掉 fuse 容器再拉起，不因残留挂载点 EBUSY。
 - **Status**: `passes: false` (2026-09-01；2026-09-02 收窄) — (a) 通过；(b) 镜像里有 `autumn-fuse` 且在 v29 集群上真挂载成功（`dd iflag=direct` 4K/8M 两档都过），但 `memory-mcp --help` 未在镜像里单独跑过。**(c) 的形态已被推翻**：本集群 kubelet 未配 rshared，mountPropagation 不兑现（特权 sidecar 内 `grep -c "shared:" /proc/self/mountinfo` = 0），sidecar 主容器看不到挂载；可行形态是**单容器**（autumn-fuse 后台进程与应用同 mount namespace，整容器 privileged）。⇒ 本条剩余工作 = `docs/ops.md` 的 sidecar manifest 改写成单容器形态 + (b) 的 memory-mcp 检查 + (d) 杀容器重拉不因残留挂载点 EBUSY。
-
-### F-S3-RUNAI-PLUGIN — 用 runai 后端插件 ABI 承载 autumn 原生传输【WON'T-DO，判据实测未触发】
-- **Trigger** (2026-09-01): `libstreamer.so`（未 strip）里存在一套可插拔后端 C ABI，按**裸 soname**
-  `dlopen`，因此 `LD_LIBRARY_PATH` 即可接管，无需 patch 上游。反出的签名：
-  `obj_open_backend(void**)` / `obj_close_backend(void*)` /
-  `obj_create_client(void*, const ObjectClientConfig_t*, void**)` / `obj_remove_client(void*)` /
-  `obj_remove_all_clients(void*)` /
-  `obj_request_read(void*, const char* path, ObjectRange_t, char* dst, size_t)` /
-  `obj_wait_for_completions(void*, ObjectCompletionEvent_t*, unsigned, unsigned*, ObjectWaitMode_t)` /
-  `obj_cancel_all_reads(void*)` / `obj_get_backend_shutdown_policy()`。
-  `obj_request_read` 收 `char* dst`，形状与 `read_into` 一致 ⇒ 可 RDMA 零拷贝直落 runai 的
-  pinned buffer，同时覆盖 vLLM 与 SGLang。
-- **Scope（若启动）**: 实现上述 ABI 的 `.so` + 配套的 `runai_model_streamer_s3` Python 替身
-  （`s3_glob` / `pull_files` 在 Python 侧，不在 .so 里，**两个产物缺一不可**）。
-- **已知代价（决定为何设为条件性）**:
-  ① 插件名是三个 static const（`obj_plugin_s3_name` / `_gcs_` / `_azure_`），
-     `get_libstreamers_plugin_type()` 硬编码三选一、无 env 覆盖 ⇒ 只能**冒充
-     `libstreamers3.so`**，同进程内 autumn 与真 S3 二选一，且 URI 仍须写成 `s3://`；
-  ② C ABI 无版本号、结构体布局需从上游头文件抄，上游改字段 ⇒ **内存损坏而非干净报错**。
-- **启动判据（2026-09-01 修正后：未触发）**: 判据原文是"网关达原生 ~85% 则不做，掉到 60%
-  以下才启动"。初测 runai→网关 = 45% 看似触发，但 MinIO 对照推翻了归因：**CRT 客户端本身
-  不慢**（同机同文件从 MinIO 读 2.8 GB/s），慢的是本网关的单线程 accept。
-  ⇒ **判据应在 F-S3-GW-MULTIWORKER 修完后重测**，在那之前本 feature **不启动**。
-  用一个"冒充 libstreamers3.so + 无版本 ABI"的方案去补一个自家单线程造成的缺口，是错的修法。
-- **Acceptance（若启动）**: vLLM 与 SGLang 均可经 `--load-format runai_streamer` 走 autumn 原生传输，
-  字节精确；吞吐 ≥ 现有 `--load-format autumn` 原生 loader。
-- **⛔ WON'T-DO (2026-09-01，判据已测且未触发)**: F-S3-GW-MULTIWORKER 修完后 runai→网关
-  = native `read_into` 的 **98%**，远在"85% 以上则不做"这条线之上。原先看到的 45% 完全是
-  自家单线程 accept 造成的，不是传输层损失。⇒ **不做**。用一个"冒充 `libstreamers3.so`
-  + 无版本 C ABI + 还要再造一个 Python 替身包"的方案，去换那 2%，是明显的负收益。
-  本条保留是因为 ABI 反解的结果本身有价值（万一将来需要真正绕开 HTTP 时可直接接手）。
-- **Status**: `passes: false` (2026-09-01) — WON'T-DO，判据实测未触发。
 
 ### F-FT-DSV4-KV-SCOPE — DeepSeek-V4 在 FreeToken 上要不要接 autumn KV
 - **Trigger** (2026-09-01, 用户问"FreeToken 现在的 hicache 支持 DSV4 了吗"后核实上游):
