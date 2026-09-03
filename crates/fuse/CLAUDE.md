@@ -257,6 +257,67 @@ Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 （EN 不可达）。若 EN 数据口在 PS-only 子网，用 `--direct-read false` 省掉每 extent 一个
 redirect RTT。落点：`FsState.direct_read` → `ReadPlan.direct_read` → `execute` 选原语。
 
+### 读 I/O 线程池（`read_pool.rs`，`--read-io-threads`，默认 2）
+
+compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程，它发出的句柄全是
+`!Send`。所以这里的"多线程"和仓库里别处一个意思（PS 的 P-log / P-sst 就是这样）：**一组
+各自独立的单线程 runtime，各自持有自己的连接，靠 channel 喂只含 Send 数据的活。**
+
+读路径能这么切，是因为 `prepare` / `execute` 早就分好了：`prepare` 那一半才需要
+`&mut FsState`（inode 缓存、写缓冲 flush、extent map），`execute` 一点都不需要 ——
+它只拿着一份 `(key, 子区间, dest 偏移)` 的计划和一个 client。派发线程仍是**唯一**读写
+`FsState` 的人，所以 lease 一致性、extent map 的语义一个字都没变。
+
+跨线程送的是 `ReadJob`，**不需要 unsafe impl Send**：`ChunkSpec` 全是自有数据，
+`fuser::ReplyData` 因为 `ReplySender` 带 `Send + Sync` 超 trait 而天然 Send。client
+**不跨线程** —— 每个 worker 自己连（同样 scope 到整个 `fs/`，所以计划里的相对 key
+解析结果一致），job 里没有任何 `Rc`。
+
+- **round-robin 派发，不按 inode 哈希**。读之间没有任何顺序要求（每个读回自己的内核
+  请求，`prepare` 已经把依赖状态的部分都解完了），而哈希会把"多个线程读同一个大文件"
+  这种模型加载形状全压回一个线程。两种路由实测吞吐**没有可分辨的差别**（差值落在同一
+  配置重复跑的波动里），所以取简单、且不牺牲那个形状的那个。
+- **worker 里必须 spawn，不能 inline await**：inline 会把并发上限压到线程数，比单
+  runtime 还差。池子买的是"同样并发、更多 CPU"，不是更少并发。
+- **job 不能丢**。派发失败（没配池子、或所有 worker 的 channel 都关了 = 线程死了）时
+  `submit` 把 job **原样还回来**，调用方在自己的 runtime 上跑。丢掉不是静默的
+  ——`fuser::ReplyRaw::Drop` 会替没发出的回复答 EIO —— 但把"集群本来能服务的读"变成 EIO
+  仍然是用户可见的失败，而且靠那个 Drop 等于把正确性押在 fuser 版本细节上。
+  `submit_round_robin` 有单测钉这四种情况（空池 / 轮转 / 跳过死 worker / 全死回退）。
+- **就绪等待有上限**（`READY_TIMEOUT` 20s）。建池时 fuse session **已经挂载**，请求正在
+  桥里排队，所以一个连不上的 worker 会卡住整个挂载点的系统调用；而裸 TCP connect 到黑洞
+  manager 只受 SYN 重试约束（分钟级）。放弃一个 worker 只损吞吐，不损正确性。
+- **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。
+- ⚠️ **UCX 下未测**。上面全部数字是 loopback TCP。`--transport ucx` 时池子会按线程数多开
+  UCX worker，而本仓库记录过 UCX worker 创建走**宿主级 devx 自旋锁**、以及 fuse 在 UCX 上
+  的 daemon 崩溃（TCP 不崩）。默认二进制不带 `ucx` feature（`--transport ucx` 直接 panic），
+  所以这条路要专门构建才够得着。真跑 UCX mount 时先用 `--read-io-threads 0` 对照。
+
+**为什么要做**：8 并发读时 mount 在 ~2600 MiB/s 到顶，8 流反而掉到 ~2070，而 8 个
+`autumnfs` CLI 进程读同一批文件、走同一条 loopback TCP 能到 5466。守护进程的 compio
+线程被钉在一个核上（per-thread CPU 时间：compio 394 jiffies vs 内核通道读线程 3）。
+每个字节要在那一个线程上过约三次（网络收进 pooled buffer → memcpy 进结果 → 回复写
+`/dev/fuse`）。实测（8 个独立 1 GiB 文件，每轮核对字节数，两轮同向）：
+
+| `--read-io-threads` | p=1 | p=4 | p=8 |
+|---|---|---|---|
+| 0（旧行为） | 885 / 878 | 2006 / 2066 | 2211 / 2213 |
+| 2（默认） | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
+| 4 | 710 / 739 | 2937 / 2776 | 4763 / 4488 |
+
+p=8 在 t=4 上到 5186~5396（第二轮实验）= CLI 那 5466 的 95%~99% —— mount 不再是瓶颈。
+p=1 在 700~940 之间来回，跨配置看不出趋势（是噪声，不是回归）—— 单流是**每请求延迟
+绑定**的，内核对一个同步读者不并发下发 FUSE 请求，池子改不了这一点。
+
+机制本身也验过（p=8，per-thread CPU jiffies）：派发线程从**打满变空闲**，总量几乎守恒
+—— 是同一份活摊开到多个核，不是加了开销侥幸变快：
+
+| `--read-io-threads` | MiB/s | `-com`（派发） | worker 各线程 | 合计 |
+|---|---|---|---|---|
+| 0 | 1874 | **435** | — | 435 |
+| 2 | 3318 | 7 | 220 / 207 | 427 |
+| 4 | 4542 | 7 | 118 / 96 / 102 / 96 | 412 |
+
 ### Write（带缓冲）
 1. 懒分配 `WriteBuffer`（容量 `WRITE_BUF_CAP`=64 MiB）。
 2. gap 检测（写偏移不连续）→ flush 当前缓冲。
@@ -364,6 +425,7 @@ core` 可独立编译，唯一额外依赖 libc；返回裸 `InodeMeta`/`DT_*`�
 | `bridge.rs` | `FsRequest` enum、FUSE↔compio channel 桥接 |
 | `ops.rs` | `fuser::Filesystem` trait 实现（readdir 在 reply 边界做 DT_*→FileType）|
 | `dispatch.rs` | compio 侧派发循环（lookup/mkdir 在此转 FileAttr；lease 三方法 `pub use` 自 `lease_tasks`）|
+| `read_pool.rs` | 读 I/O 线程池（N 个独立 compio runtime + 各自的 ClusterClient；`ReadJob` 载 `fuser::ReplyData` 跨线程）|
 
 不变量：core 文件**禁止 import fuser**（`cargo tree --features core` 中 fuser 计数
 为 0）；新的 core→fuser 转换一律进 `attr.rs`。PyO3 `autumn.Fs`（`python/src/fs.rs`）
@@ -398,7 +460,8 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 `autumn-fuse` 参数：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
 `--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
-cluster 一致）、`--direct-read`（default true）。内核缓存 `attr_timeout` /
+cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 2；
+`0` = 全部读留在派发线程，即池子之前的行为）。内核缓存 `attr_timeout` /
 `entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
 
 ## 关键依赖文件

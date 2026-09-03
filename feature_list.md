@@ -106,6 +106,8 @@
   内核回复拷贝、`read::execute` 的每请求粒度（内核按 `max_read` 下发，不是按 extent），
   以及每次 `read` 都重新 `prepare` 一遍 ChunkSpec。**先分段计时再动手**。
 - **Acceptance**: fuse 单流读进到 CLI 的 80% 以内，且 `fuse_chaos.sh` 全绿。
+- **Status**: `passes: false` (2026-09-03) — `fuse_chaos.sh` 全绿（77 文件，默认 2 线程池跑过），
+  但单流那一半到不了，理由见下。
 - **进展 (2026-09-03)**: **`fuser` 的 feature 从 `abi-7-12` 提到 `abi-7-28`，读 +81%**
   （交替 A/B：898 → 1621 MiB/s，三对全部同向）。根因：`FUSE_MAX_PAGES` 和 INIT 应答的
   `max_pages` 字段在 fuser 里都在 `#[cfg(feature = "abi-7-28")]` 后面，缺了它内核把**每个**
@@ -146,15 +148,30 @@
   8 流 2070 是**饱和后加并发只剩争用**。CLI 能到 5466 是因为 8 个进程 = 8 个 compio 线程。
 - **不是 TCP**：同一条 loopback、同一集群、同一批文件，CLI 跑到 5466 MiB/s。
 - **⚠️ "守护进程侧预读是唯一杠杆"这条结论作废**：预读省的是延迟，而 4 流以上该线程已经
-  CPU 饱和，预读只会让它更忙。真正的杠杆是：
-  1. **多线程化**（按 inode 分片）。`FsState` 是 `!Send`，但读路径已经不需要它——
-     `read::execute` 是 spawn 的且自带 plan，只有 `prepare` 需要状态，所以
-     "一个状态线程 + N 个 I/O 线程"是可行形状。
-  2. **减少每字节拷贝**：`execute` 先 `vec![0u8; n]`（分配+清零）再填，可以直接填进回复
-     缓冲。当前每字节约 3 次拷贝（网络收进 pool → memcpy 到 Vec → 写回 `/dev/fuse`），
-     2.6 GB/s 时是 ~8 GB/s 内存流量压在一个核上。
-- **验收线要重议**: "80% of CLI 单流" 建立在 CLI 的 3010 上，而 mount 单流受同一个线程
-  的延迟绑定；更有意义的口径是聚合吞吐（现 2600 vs CLI 5400），且它指向多线程化。
+  CPU 饱和，预读只会让它更忙。
+- **✅ 已做：读 I/O 线程池**（`crates/fuse/src/read_pool.rs`，`--read-io-threads`，默认 2）。
+  N 个独立单线程 compio runtime，各自持 `ClusterClient`；`prepare` 仍独占派发线程上的
+  `FsState`，只有 `execute` 跨线程（`ReadJob` 天然 Send —— `fuser::ReplyData` 因
+  `ReplySender: Send + Sync` 而 Send）。round-robin 派发；派发不出去就把 job 还回来在本地跑。
+  实测（8 个独立 1 GiB 文件，每轮核对字节数，两轮同向）：
+  | `--read-io-threads` | p=1 | p=4 | p=8 |
+  |---|---|---|---|
+  | 0（旧） | 885 / 878 | 2006 / 2066 | 2211 / 2213 |
+  | 2（默认） | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
+  | 4 | 710 / 739 | 2937 / 2776 | **4763 / 4488**（另一轮 5186~5396）|
+  机制也验过（p=8 per-thread jiffies）：派发线程 435 → 7，总量 435/427/412 **几乎守恒**
+  —— 同一份活摊开到多核，不是加开销侥幸变快。t=4 的 p=8 = CLI 5466 的 95%~99%。
+- **验收状态：`passes: false`，而且这条验收线量的是错的东西**。"80% of CLI 单流" 到不了
+  （mount p=1 ≈ 880 vs CLI 3010 = 29%），因为**单流是每请求延迟绑定**：内核对一个同步
+  读者不并发下发 FUSE 请求（bdi `read_ahead_kb` 128→32768 实测完全无效），线程池按定义
+  改不了它。**聚合吞吐已经追平 CLI**。要动单流只剩守护进程侧预读，而那要和 lease /
+  `cached_version` 失效那套对齐，属于设计决策。验收口径按规则不改写，只记状态。
+- **剩下的第二杠杆（未做）**：减少每字节拷贝 —— `execute` 先 `vec![0u8; n]`（分配+清零）
+  再填，可以直接填进回复缓冲。当前每字节约 3 次（网络收进 pool → memcpy 到 Vec → 写回
+  `/dev/fuse`）。
+- **⚠️ UCX 下未测**：所有数字是 loopback TCP，且默认二进制不带 `ucx` feature；本机只有
+  `lo` 有 IPv4（无 RoCE IP），跨机不可用，所以这条路本会话够不着。UCX worker 创建走宿主级
+  devx 自旋锁 + fuse 在 UCX 上崩过 daemon，真跑 UCX mount 先拿 `--read-io-threads 0` 对照。
 - **测量方法论（本条是踩出来的）**: 比较读吞吐时**两边都必须读到 `/dev/null`**。
   `autumnfs get <file>` 自带一次本地盘写，会把结果钉在 ~800 MiB/s 并**反转**结论。
 

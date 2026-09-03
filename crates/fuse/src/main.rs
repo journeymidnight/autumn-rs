@@ -69,6 +69,21 @@ struct Args {
     // was documented but absent.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     direct_read: bool,
+
+    /// Number of read I/O threads. Each is its own compio runtime with its own
+    /// cluster client, and prepared reads are handed to them round-robin so the
+    /// bytes do not all cross the dispatcher thread.
+    ///
+    /// The dispatcher is one thread and, at four concurrent readers and up, it
+    /// was the ceiling: pinned at ~100% of a core while eight `autumnfs` CLI
+    /// processes — eight runtimes — pushed 2x the mount's throughput over the
+    /// same loopback TCP. Reads split cleanly because `read::prepare` is the
+    /// only half that touches filesystem state.
+    ///
+    /// `0` keeps every read on the dispatcher (the pre-pool behaviour). Costs
+    /// one manager connection and one connection pool per thread.
+    #[arg(long, default_value_t = 2)]
+    read_io_threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -119,6 +134,9 @@ fn main() -> Result<()> {
     );
 
     // Create the bridge channel
+    // The pool's workers each connect for themselves, so they need their own copy.
+    let pool_credential = credential.clone();
+
     let bridge = FuseBridge::new();
     let tx = bridge.tx.clone();
     let mut rx = bridge.rx;
@@ -255,6 +273,16 @@ fn main() -> Result<()> {
                 }
                 tracing::info!("cluster ready (all partition listeners reachable)");
 
+                // After readiness, so the workers' own `connect` sees the same
+                // regions the dispatcher just waited for.
+                let read_pool = autumn_fuse::read_pool::ReadPool::new(
+                    args.read_io_threads,
+                    &manager_addr,
+                    pool_credential,
+                )
+                .await;
+                let read_pool = (!read_pool.is_empty()).then_some(read_pool);
+
                 // Build the invalidator that the
                 // poll loop calls per WriterClosed/LeaseRevoked
                 // event. `inval_inode(ino, 0, 0)` drops both
@@ -307,7 +335,9 @@ fn main() -> Result<()> {
 
                     match compio::time::timeout(remaining, rx.next()).await {
                         Ok(Some(req)) => {
-                            if !dispatch::handle_request(&mut state, req).await {
+                            if !dispatch::handle_request(&mut state, req, read_pool.as_ref())
+                                .await
+                            {
                                 tracing::info!("received Destroy, shutting down");
                                 break;
                             }

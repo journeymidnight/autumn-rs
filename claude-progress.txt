@@ -1,5 +1,31 @@
-Date: 2026-09-02
-TaskStatus: not_completed
+Date: 2026-09-03
+TaskStatus: completed
+Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 2）—— 把 F-FUSE-READ-GAP 的
+  根因（守护进程单个 compio 线程 CPU 饱和）实际修掉。
+
+【2026-09-03 fuse 读 I/O 线程池：已实现并验收】
+  形状：N 个独立单线程 compio runtime，各自 `ClusterClient`，`futures::mpsc` 喂 `ReadJob`。
+  能这么切是因为 `prepare`/`execute` 早就分好了 —— `prepare` 那一半才要 `&mut FsState`，
+  仍然独占派发线程；`execute` 只拿 (key, 子区间, dest 偏移) 的计划。`ReadJob` 天然 Send
+  （`fuser::ReplyData` 因 `ReplySender: Send + Sync` 而 Send），client 不跨线程。
+  round-robin 派发（和 ino 哈希实测无可分辨差别，取不牺牲"多线程读同一大文件"的那个）；
+  派发不出去就把 job 原样还回来在本地跑。`--read-io-threads 0` = 回退到旧行为。
+  结果（8 个独立 1 GiB 文件，核对字节数，两轮同向）：p=8 2211 → 3705(t=2) → 4763~5396(t=4)，
+  t=4 达 CLI 5466 的 95%~99%。机制验过：p=8 的 per-thread jiffies 派发线程 435 → 7，
+  总量 435/427/412 几乎守恒 —— 同一份活摊开到多核。
+  验证：`cargo test -p autumn-fuse --lib` 54 绿（含 4 条 submit 路由单测）、core feature 单独
+  可编、workspace release 绿、`fuse_chaos.sh` 两次 PASS（77/78 文件，默认 2 线程跑过）。
+  fable 评审：无高危；采纳 4 条 —— ①"丢 job = 内核永久挂"是**夸大**（fuser 0.15.1 的
+  `ReplyRaw::Drop` 会答 EIO），注释已改准 ②`ready_rx.await` 无上限而 session 已挂载 ⇒
+  连不上的 worker 会卡住整个挂载点的系统调用，加 `READY_TIMEOUT` 20s ③threads=0 还打
+  "pool ready" 日志 ④clippy `manual_ok_err`。
+  **未覆盖**：UCX。默认二进制不带 ucx feature，本机只有 lo 有 IPv4（无 RoCE IP）、跨机不可用。
+  UCX worker 创建走宿主级 devx 自旋锁 + fuse 在 UCX 上崩过 daemon ⇒ 真跑 UCX mount 要先拿
+  `--read-io-threads 0` 对照。
+  **F-FUSE-READ-GAP 仍 `passes: false`**：验收线写的是"单流进到 CLI 的 80%"，而单流是每请求
+  延迟绑定的（内核对同步读者不并发下发；bdi read_ahead_kb 128→32768 实测完全无效），
+  线程池按定义改不了。聚合吞吐已追平 CLI。按规则不改写验收口径，只记状态。
+
 Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API + FUSE 节点故障根因修复 + 集群重建。
   逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
   清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），

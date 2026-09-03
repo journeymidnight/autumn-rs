@@ -11,6 +11,7 @@ use crate::bridge::*;
 use crate::dir;
 use crate::meta::*;
 use crate::read;
+use crate::read_pool::{ReadJob, ReadPool};
 use crate::schema::InodeState;
 use crate::state::{FsState, FuseLease};
 use crate::write;
@@ -217,7 +218,14 @@ pub async fn init_root(state: &mut FsState) -> Result<()> {
 }
 
 /// Process a single FsRequest. Returns false if the loop should exit (Destroy).
-pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
+/// `pool`, when present, is where a prepared read goes instead of this thread's
+/// runtime — see `read_pool`. `None` keeps every read on the dispatcher, which
+/// is what the lease tests and any non-mount driver want.
+pub async fn handle_request(
+    state: &mut FsState,
+    req: FsRequest,
+    pool: Option<&ReadPool>,
+) -> bool {
     // One place for the MOUNT, so no handler here can forget. A pipelined
     // append flush leaves the inode's extent map missing its extents and its
     // bytes not yet durable, and only a contiguous write to that same inode may
@@ -685,48 +693,80 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             size,
             fuse_reply,
         } => {
-            // Async-reply two-phase read (autumn-fuse perf fix #1):
-            // - prepare under dispatcher's `&mut state` (cheap routing
+            // Two-phase, async-reply read:
+            // - `prepare` under the dispatcher's `&mut state` (cheap routing
             //   lookups + inode cache hit, no real I/O);
-            // - spawn `execute` to do the parallel chunk fanout;
-            // - the spawned task replies to fuser DIRECTLY via the
-            //   shipped `ReplyData`, bypassing the std::mpsc reply hop.
-            // The fuser kernel-channel reader thread is then free to
-            // read the next /dev/fuse request immediately, so concurrent
-            // FUSE reads can actually overlap.
+            // - the plan goes to a read-pool worker thread when one exists, or
+            //   to this runtime when none does;
+            // - whoever executes it replies to fuser DIRECTLY via the shipped
+            //   `ReplyData`, bypassing the std::mpsc reply hop.
+            // The fuser kernel-channel reader thread is then free to read the
+            // next /dev/fuse request immediately, so concurrent FUSE reads can
+            // actually overlap.
             match read::prepare(state, ino, offset, size).await {
                 Ok(plan) => {
-                    compio::runtime::spawn(async move {
-                        // BOUNDED. This is the one FUSE op that answers the
-                        // kernel off the dispatcher, so it is also the one that
-                        // can leave the kernel waiting forever: every other op
-                        // goes through `call_sync`, whose REPLY_TIMEOUT ends in
-                        // `reply.error(EIO)` no matter what the cluster does.
-                        //
-                        // FUSE has no timeout of its own. A read that never
-                        // answers parks its caller in uninterruptible sleep
-                        // permanently — unkillable, holding whatever locks it
-                        // held — and if that caller is a container runtime
-                        // thread stat-ing a path, the whole node stops being
-                        // able to start containers. An unreachable manager or a
-                        // stalled extent read must degrade to EIO, not to a
-                        // wedged node.
-                        match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
-                            Ok(Ok(data)) => fuse_reply.data(&data),
-                            Ok(Err(e)) => {
-                                tracing::warn!(error = %e, "fuse read execute failed");
-                                fuse_reply.error(libc::EIO);
+                    // Inline data / EOF is already the answer. Handing it to a
+                    // worker would buy a thread hop for a memcpy.
+                    if let Some(inline) = plan.inline_result {
+                        fuse_reply.data(&inline);
+                        return true;
+                    }
+                    let job = ReadJob {
+                        chunks: plan.chunks,
+                        actual_size: plan.actual_size,
+                        direct_read: plan.direct_read,
+                        reply: fuse_reply,
+                    };
+                    // Back on this runtime when there is no pool, or when every
+                    // worker's channel is closed (a dead thread). The job is
+                    // handed back rather than dropped, so no read is answered
+                    // EIO just because the pool would not take it.
+                    let job = match pool {
+                        Some(p) => p.submit(job).err(),
+                        None => Some(job),
+                    };
+                    if let Some(job) = job {
+                        let plan = read::ReadPlan {
+                            inline_result: None,
+                            actual_size: job.actual_size,
+                            client: state.client.clone(),
+                            chunks: job.chunks,
+                            direct_read: job.direct_read,
+                        };
+                        let fuse_reply = job.reply;
+                        compio::runtime::spawn(async move {
+                            // BOUNDED. This is the one FUSE op that answers the
+                            // kernel off the dispatcher, so it is also the one
+                            // that can leave the kernel waiting forever: every
+                            // other op goes through `call_sync`, whose
+                            // REPLY_TIMEOUT ends in `reply.error(EIO)` no matter
+                            // what the cluster does.
+                            //
+                            // FUSE has no timeout of its own. A read that never
+                            // answers parks its caller in uninterruptible sleep
+                            // permanently — unkillable, holding whatever locks it
+                            // held — and if that caller is a container runtime
+                            // thread stat-ing a path, the whole node stops being
+                            // able to start containers. An unreachable manager or
+                            // a stalled extent read must degrade to EIO, not to a
+                            // wedged node.
+                            match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
+                                Ok(Ok(data)) => fuse_reply.data(&data),
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "fuse read execute failed");
+                                    fuse_reply.error(libc::EIO);
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        timeout_secs = REPLY_TIMEOUT.as_secs(),
+                                        "fuse read timed out — replying EIO"
+                                    );
+                                    fuse_reply.error(libc::EIO);
+                                }
                             }
-                            Err(_) => {
-                                tracing::warn!(
-                                    timeout_secs = REPLY_TIMEOUT.as_secs(),
-                                    "fuse read timed out — replying EIO"
-                                );
-                                fuse_reply.error(libc::EIO);
-                            }
-                        }
-                    })
-                    .detach();
+                        })
+                        .detach();
+                    }
                 }
                 Err(e) => {
                     let errno = if e.to_string().contains("not found") {

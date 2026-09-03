@@ -40,6 +40,8 @@ pub mod bridge;
 pub mod dispatch;
 #[cfg(feature = "fuse")]
 pub mod ops;
+#[cfg(feature = "fuse")]
+pub mod read_pool;
 
 /// Re-export `fuser` so downstream test crates (autumn-manager
 /// inode-lease tests) can name the bridge-handler reply types

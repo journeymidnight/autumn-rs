@@ -80,7 +80,7 @@ async fn dispatch_open(
         flags,
         reply: tx,
     };
-    dispatch::handle_request(state, req).await;
+    dispatch::handle_request(state, req, None).await;
     rx.recv_timeout(Duration::from_secs(10))
         .map_err(|_| anyhow::anyhow!("reply timeout"))?
 }
@@ -92,7 +92,7 @@ async fn dispatch_release(state: &mut FsState, ino: u64) -> anyhow::Result<()> {
         flush: false,
         reply: tx,
     };
-    dispatch::handle_request(state, req).await;
+    dispatch::handle_request(state, req, None).await;
     rx.recv_timeout(Duration::from_secs(10))
         .map_err(|_| anyhow::anyhow!("reply timeout"))?
 }
@@ -347,7 +347,7 @@ async fn dispatch_create(
         flags,
         reply: tx,
     };
-    dispatch::handle_request(state, req).await;
+    dispatch::handle_request(state, req, None).await;
     rx.recv_timeout(Duration::from_secs(10))
         .map_err(|_| anyhow::anyhow!("reply timeout"))?
 }
