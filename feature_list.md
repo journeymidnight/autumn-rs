@@ -219,9 +219,16 @@
   尽管机制上不相干（重放只改 `recover_partition` 的窗口，这里卡的是 EC 转换派发）。
   cross-ref memory `project_ec_frozen_owner_epoch_wedge`（曾修的 owner_epoch 永久 fence 两半）与
   `project_chaos_coverage_gaps_20260619`（"EC apply-fail 吞→wedge" 早被列为覆盖缺口）。
-- **Scope（复现之后）**: 查 attempts=0 且 last_error 为空的 ACTIVE EC op 为何不再被派发——
-  重点看 `ec_conversion_dispatch_loop` 的候选过滤与 ledger attach 语义（历史上"第二次提交发生在
-  第一次转换已关闭之后 ⇒ 不 attach ⇒ 新建条目"是同族的坑）。
+- **诊断进展 (2026-09-03)，把方向掐掉了一半**：原假设是"候选被派发循环静默过滤掉"。
+  给 `collect_ec_dispatch_candidates` 的三个静默 `continue` 都加了诊断（recovery 持有 / 协调者不可
+  派发 / **没有任何带 EC 形状的 stream 列出该 extent**，最后这条是 WARN，因为它不是"下次再试"而是
+  永久卡死）后复跑：**一条都没触发**。真相在日志里：`EC convert accepted by coordinator
+  extent_id=12` 出现 **9 次** —— 它每 5 秒被重新派发、每次都被协调者**接受**、然后永不完成。
+  所以问题**不在 manager 的候选选择**，而在"accept-ACK 之后"：节点侧要么没做完，要么做完了没让
+  marker 落地（`finalize_ec_dispatch_after_convert` 没跑或失败）。`attempts=0` 也说明重新派发这条
+  路径根本不计数，这本身让"卡了多久/试了几次"不可观测。
+- **下一步**: 去看 EN 侧该 extent 的转换日志（chaos 把 EN 起成子进程），确认它到底是没开始、
+  做到一半、还是做完了但回报丢了；同时查 accept-ACK 之后由谁负责推进与销 marker。
 - **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
   让它停止派发的（不是"加了重试就好了"）。
 - **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。
@@ -248,10 +255,14 @@
   恢复侧游标全解析不到时改为全量重放，所以回收游标指向的空 extent 现在的代价是"开得慢"而非丢数据）。
   验收里"杀 writer 在 seal 与 punch 之间"的集成半**已做**：`crates/manager/tests/sealed_empty_sweep_etcd.rs`
   用真 etcd + aux 客户端直查，消融掉持久化那步会精确变红（`etcd still holds extents/N`）。
-  **chaos 那半仍不算数,而且理由要记住**：实测 grep 两轮 chaos 日志，`sealed-empty sweep` 出现
-  **0 次** —— chaos 从没造出这个形态，所以它只证明"开着这个循环不打扰既有不变量"
-  （同 seed 在 sweep 开/关下结果逐字相同），**不证明 sweep 本身在 chaos 下正确**。
-  要真覆盖，得在 harness 里显式造一个 sealed-empty 非尾巴成员再跑。
+  **chaos 那半：先记成 0 次执行，随后被自己的日志推翻，最终结论是"覆盖但不可靠"。**
+  第一轮 grep `sealed-empty sweep` 得 0 次，我据此下了"chaos 从不造出这个形态"的结论 —— 那是
+  **单轮样本的过度概括**。后续同 seed 的一轮里它触发了两次（`stream_id=13 count=1`、
+  `stream_id=20 count=1`），也就是 chaos **确实**会造出 sealed-empty 非尾巴成员并被 sweep 回收，
+  且那几轮的账目校验（`refs == 列出它的 stream 数` + 无悬空成员）全绿 —— 这才是真的 sweep 证据。
+  但它是**时序相关**的（sweep 每 60s 一 tick，chaos 跑约 92s，只有 1~2 次机会），所以
+  "跑一轮 chaos 绿"**不能**当作 sweep 的稳定回归守卫。要可靠覆盖，仍需在 harness 里显式造出
+  这个形态、或把 sweep 间隔在 chaos 下调小。
   另注：seed 603 目前**本来就红**（见 BUG-EC-CONVERT-STALL-HEALTHY-COORD），与本条无关。
   旧文（仍适用）：验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
   `mirror_stream_extent_mutation` 在内存模式下是**彻底 no-op**，所以现有两条集成测试覆盖的是选择逻辑与

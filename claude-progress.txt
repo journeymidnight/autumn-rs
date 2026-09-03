@@ -104,15 +104,27 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
 【2026-09-03 F-SEALED-EMPTY-SWEEP 上线 + 撞出一条既有 EC bug】
   阻塞（重放游标类）解除后补齐验收：新增 `sealed_empty_sweep_etcd.rs`，真 etcd + aux 客户端直查，
   场景就是"writer roll 完尾巴就死、从没 punch"；消融掉持久化那步精确变红。之后 spawn 了它。
-  **fable 给了一条能推翻我的检查,而它成立了**：chaos 通过**不等于** sweep 被执行过——那个泄漏形态
-  本身账目干净（refs=1、一个成员），所以账目阶段无论 sweep 跑没跑都是绿的。实测 grep 两轮日志，
-  `sealed-empty sweep` 出现 **0 次**。所以 chaos 只证明"开着它不打扰既有不变量"，
-  已在账本里把 chaos 那半标回未完成，并写明要真覆盖需在 harness 里显式造出这个形态。
+  **fable 给了一条能推翻我的检查(chaos 绿 ≠ sweep 跑过,因为泄漏形态本身账目干净),我照做了,
+  然后我自己的结论又被下一轮日志推翻**：第一轮 grep 得 0 次，我据此写下"chaos 从不造出这个形态"
+  并提交了 —— 那是**单轮样本的过度概括**。后一轮同 seed 里它触发了两次
+  （`stream_id=13 count=1`、`stream_id=20 count=1`），账目校验同时全绿。
+  最终结论是"**覆盖但不可靠**"：确实会命中，但每 60s 才一 tick、chaos 只跑约 92s，
+  所以不能当稳定回归守卫。账本已改正。教训与今天另外两次同型：**单轮 grep 的阴性结果，
+  和"这条路径不存在"长得一模一样**。
   **顺带撞出 BUG-EC-CONVERT-STALL-HEALTHY-COORD**（已立账、已复现）：EC 转换 quiesce 后仍 ACTIVE、
   attempts=0、last_error 空、协调者健康，该 extent 的 GC 被卡住；chaos 判词是
   "the invariant broke SILENTLY"。**归因做了一半**：同样失败在 sweep 关闭时逐字复现 ⇒ 与本条无关；
   未单独对照重放修复之前的版本（机制不相干）。时序敏感：加 `RUST_LOG=autumn_manager=info` 后
   必现，不加时曾两次通过 —— 判定修好必须多次跑带 RUST_LOG 的那条配方。
+
+【2026-09-03 BUG-EC-CONVERT-STALL-HEALTHY-COORD 诊断进展：方向掐掉一半】
+  原假设：候选被 `collect_ec_dispatch_candidates` 静默过滤。给它三个静默 `continue` 都加了诊断
+  （recovery 持有 / 协调者不可派发 / 没有带 EC 形状的 stream 列出该 extent —— 最后一条是 WARN，
+  因为它是永久卡死而非"下次再试"）后复跑：**一条都没触发**，假设被否掉。
+  真相在既有日志里：`EC convert accepted by coordinator extent_id=12` 出现 **9 次** ——
+  每 5s 重新派发、每次被协调者**接受**、然后永不完成。所以问题在 accept-ACK **之后**，
+  不在 manager 的候选选择。`attempts=0` 同时说明重新派发不计数，"卡多久/试几次"本身不可观测。
+  诊断代码保留（覆盖的是真实的静默丢弃路径），但如实记明这次复现里它们没触发。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，

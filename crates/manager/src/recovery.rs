@@ -1945,9 +1945,21 @@ impl crate::AutumnManager {
             .collect();
         let overrides_snap = self.node_overrides.borrow().clone();
 
+        // Every arm that drops a candidate says WHY.
+        //
+        // A marker whose candidate is filtered out stays ACTIVE with attempts=0
+        // and an empty last_error forever, and the extent's GC is blocked behind
+        // it — so a silent `continue` here is indistinguishable from "nothing to
+        // do" and leaves an operator with a pinned conversion and no thread to
+        // pull. This is the same shape as the EC diagnostic black hole recorded
+        // earlier: two adjacent guards, one logging and one not.
         let mut candidates = Vec::new();
         for (eid, params) in pending {
             if recovery_inflight_extents.contains(&eid) {
+                tracing::debug!(
+                    extent_id = eid,
+                    "ec dispatch: deferring — a recovery holds this extent"
+                );
                 continue;
             }
             if let Some(coord) = params.target_nodes.first() {
@@ -1957,6 +1969,13 @@ impl crate::AutumnManager {
                     .unwrap_or(crate::node_state::NodeAutoState::Online);
                 let is_overridden = overrides_snap.contains_key(coord);
                 if auto_st.is_suspected() || auto_st.is_suspend() || is_overridden {
+                    tracing::debug!(
+                        extent_id = eid,
+                        coordinator = *coord,
+                        ?auto_st,
+                        is_overridden,
+                        "ec dispatch: deferring — coordinator is not dispatchable"
+                    );
                     continue;
                 }
             }
@@ -1983,7 +2002,22 @@ impl crate::AutumnManager {
                 .cloned()
             {
                 Some(st) => st,
-                None => continue,
+                None => {
+                    // WARN, not debug, and not silent: unlike the two arms above
+                    // this is not a "try again next tick" state. Nothing in this
+                    // loop will ever make a stream adopt the extent, so the
+                    // marker is pinned for good and the extent's GC with it.
+                    // Reachable when the extent's membership moved to streams
+                    // that carry no EC shape (split/merge splice, punch), or the
+                    // owning stream's parity was set to 0 after the marker.
+                    tracing::warn!(
+                        extent_id = eid,
+                        target_nodes = ?params.target_nodes,
+                        "ec dispatch: NO stream with an EC shape lists this extent — the marker \
+                         cannot progress and is pinning the extent's GC; it needs draining"
+                    );
+                    continue;
+                }
             };
             candidates.push(EcDispatchCandidate { ex, stream, params });
         }
