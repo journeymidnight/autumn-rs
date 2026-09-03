@@ -16,6 +16,28 @@ fn params_coordinator(p: &MgrEcDispatchInflight) -> Option<u64> {
     p.target_nodes.first().copied()
 }
 
+/// Did this CODE_OK answer mean a NEW conversion started, or that the
+/// coordinator is already working on one?
+///
+/// Both answers are CODE_OK and both quote the last failure for as long as it
+/// stands (the coordinator clears it on success, not when a new attempt begins).
+/// Telling them apart is what keeps a long healthy conversion from being counted
+/// as failing once every five seconds.
+fn ec_accept_started_new(message: &str) -> bool {
+    message.starts_with("ec convert accepted")
+}
+
+/// How many consecutive failed EC conversion attempts before the marker is
+/// dropped.
+///
+/// At the loop's ~5 s cadence this is a couple of minutes of uninterrupted
+/// failure — long enough that an ordinary node restart rides through it, short
+/// enough that a node which is not coming back stops holding the extent's GC.
+/// Erring low is cheap: `policy` re-proposes from extent state, so an early
+/// give-up costs one more conversion later, while erring high costs unbounded
+/// un-reclaimable garbage.
+const EC_ABANDON_AFTER_CONSECUTIVE_FAILURES: u32 = 24;
+
 /// Why a coordinator's `ec_done` report may not be applied to the live marker.
 /// Applying the wrong one flips the layout onto targets that hold no shards,
 /// after which cleanup deletes the last full replicas — so every rejection here
@@ -2122,6 +2144,12 @@ impl crate::AutumnManager {
             )
             .await;
 
+        // Set when the coordinator's answer carried its previous attempt's
+        // failure; read after the match to decide whether to give up.
+        let mut carried_failure: Option<String> = None;
+        // True when the coordinator started a NEW conversion rather than
+        // answering a re-send it was already working on.
+        let mut started_new = false;
         let rpc_ok = match result {
             Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
                 Ok(r) if r.code == CODE_OK => {
@@ -2136,7 +2164,7 @@ impl crate::AutumnManager {
                     // A FRESH accept means a conversion actually started; the
                     // coordinator says "already running" when this re-send hit
                     // one it is still working on. Only the former is an attempt.
-                    let started_new = r.message.starts_with("ec convert accepted");
+                    started_new = ec_accept_started_new(&r.message);
                     // The marker may have been drained while this response was in
                     // flight (up to a minute). Refresh an existing entry, but do
                     // not resurrect one — a RUNNING entry with no marker behind
@@ -2161,7 +2189,8 @@ impl crate::AutumnManager {
                             // ("(os error 111)"), so it ate the error's last
                             // character.
                             let why = why.strip_suffix(')').unwrap_or(why).to_string();
-                            ops.record_ec_failure(extent_id, why);
+                            ops.record_ec_failure(extent_id, why.clone());
+                            carried_failure = Some(why);
                         }
                     }
                     true
@@ -2182,6 +2211,78 @@ impl crate::AutumnManager {
                 false
             }
         };
+
+        // Give up on a conversion whose participant will not come back.
+        //
+        // The target set is pinned when the marker is created and nothing
+        // re-picks it, so a dead participant makes every re-dispatch fail the
+        // same way, forever — and the extent's GC is refused the whole time. One
+        // unreachable node holding an extent's garbage indefinitely is the worse
+        // outcome, so after enough consecutive failures the marker is dropped.
+        //
+        // What abandoning costs, stated exactly, because the easy version of this
+        // sentence is wrong twice. `policy` does propose EC conversion from
+        // EXTENT STATE (not converted, sealed, big enough), so the extent returns
+        // to the candidate pool — but the auto-policy controller is DEFAULT-OFF
+        // and armed per policy, so on an unarmed cluster nothing re-proposes and
+        // the extent simply stays replicated until an operator acts. And the
+        // re-proposed target set is only fresh in its EXTRAS: targets start from
+        // `ex.replicates`, so a dead replica-holder is re-picked every time until
+        // recovery re-replicates the extent away from it.
+        //
+        // Even so, giving up beats the alternative: an extent whose GC is refused
+        // indefinitely. And this deliberately does not re-target in place —
+        // rewriting a marker's assignment mid-2PC lets old and new participants
+        // hold staging for the same extent, and the attempt-identity rules that
+        // keep that safe are exactly where this subsystem has been bitten.
+        //
+        // Only failures the coordinator REPORTS count. A coordinator that is
+        // itself unreachable takes the `rpc_ok = false` path, never carries a
+        // reason, and so never trips this — that shape is left to the fence
+        // sweep, which abandons on a fenced coordinator.
+        // Only a FRESH accept counts. The coordinator clears its remembered
+        // failure on success, not when a new attempt starts, so both CODE_OK
+        // messages keep quoting the last failure for as long as it stands —
+        // "already running (last attempt failed: X)" every five seconds while a
+        // perfectly healthy multi-GiB encode runs. Counting those would abandon
+        // any conversion that takes longer than the threshold and had ever
+        // hiccuped, which is the opposite of the intent. Gating on `started_new`
+        // counts each FAILED ATTEMPT exactly once, since a new attempt only
+        // starts after the previous one ended.
+        if let Some(why) = carried_failure.filter(|_| started_new) {
+            let n = {
+                let mut m = self.ec_consecutive_failures.borrow_mut();
+                let e = m.entry(extent_id).or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            if n >= EC_ABANDON_AFTER_CONSECUTIVE_FAILURES {
+                let coord = params.target_nodes.first().copied().unwrap_or(0);
+                tracing::error!(
+                    extent_id,
+                    attempts = n,
+                    coordinator = coord,
+                    "EC convert failed {n} times in a row ({why}) — abandoning the marker so the \
+                     extent's GC can proceed. It stays replicated until something re-proposes the \
+                     conversion: the auto-policy controller if it is armed for EC, otherwise an \
+                     operator"
+                );
+                if self
+                    .abandon_ec_marker(extent_id, coord, "repeated_failure")
+                    .await
+                {
+                    // (the release funnel already cleared the tally)
+                    let (now_s, _) = Self::now_s_ms();
+                    self.ops.borrow_mut().complete_ec(
+                        extent_id,
+                        autumn_rpc::manager_rpc::OP_STATE_FAILED,
+                        "abandoned after repeated failures".to_string(),
+                        why,
+                        now_s,
+                    );
+                }
+            }
+        }
 
         // NOTE: CODE_OK here means ACCEPTED, not DONE. The coordinator encodes
         // in the background and reports completion on its next `df`
@@ -2868,5 +2969,31 @@ mod ec_dispatch_owner_epoch_tests {
     #[test]
     fn an_unclaimed_extent_gets_no_fence() {
         assert_eq!(dispatch_owner_epoch_for_extent(&state_at(100), 4242), 0);
+    }
+}
+
+#[cfg(test)]
+mod ec_abandon_counting_tests {
+    use super::ec_accept_started_new;
+
+    /// The coordinator answers CODE_OK either way, and quotes its last failure
+    /// in both. Only a fresh accept means an attempt actually ran and failed;
+    /// counting the other would abandon a healthy multi-GiB conversion that once
+    /// hiccuped, at one phantom failure every five seconds.
+    #[test]
+    fn only_a_fresh_accept_counts_as_an_attempt() {
+        assert!(ec_accept_started_new("ec convert accepted"));
+        assert!(ec_accept_started_new(
+            "ec convert accepted (previous attempt failed: WriteShard refused)"
+        ));
+
+        assert!(!ec_accept_started_new("ec convert already running"));
+        assert!(
+            !ec_accept_started_new(
+                "ec convert already running (last attempt failed: WriteShard refused)"
+            ),
+            "a re-send into a live conversion must not count, however loudly it \
+             quotes an old failure"
+        );
     }
 }

@@ -43,11 +43,61 @@ pub fn advisory_key(extent_id: u64) -> String {
 }
 
 impl AutumnManager {
-    /// invoked from `handle_fence_node` AFTER the override has
-    /// been persisted to etcd + owner-lock owner_epoch bumps.
+    /// Abandon ONE extent's ConvertToEc marker: delete it and leave the advisory
+    /// breadcrumb, atomically. Returns whether the marker actually went away.
     ///
-    /// Returns the list of extent_ids whose markers were abandoned, so
-    /// the caller can audit the chain.
+    /// The one place a ConvertToEc marker is dropped. Both callers — the fence
+    /// sweep and the repeated-failure give-up — go through this txn, so there is
+    /// no second way to release one.
+    ///
+    /// The delete carries no compare, and what makes that safe is not local: a
+    /// dispatch response can be a minute old, so the tally that decides to
+    /// abandon must not survive a release. Every release funnels through
+    /// `commit_extent_inflight_release`, which clears it. Breaking that coupling
+    /// re-opens abandoning on a stale count.
+    pub(crate) async fn abandon_ec_marker(
+        &self,
+        extent_id: u64,
+        coord_node_id: u64,
+        reason: &str,
+    ) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let advisory = MgrEcAdvisoryEntry {
+            extent_id,
+            original_coord_node_id: coord_node_id,
+            reason: reason.to_string(),
+            set_at: now,
+        };
+        let key = advisory_key(extent_id);
+        let marker_key = format!("{}{}", EXTENT_INFLIGHT_PREFIX, extent_id);
+        let bytes = rkyv_encode(&advisory).to_vec();
+        if let Some(etcd) = &self.etcd {
+            let ops = vec![
+                Op::put(key.as_bytes(), &bytes),
+                Op::delete(marker_key.as_bytes()),
+            ];
+            if let Err(e) = etcd.txn_fenced(vec![], ops, vec![]).await {
+                tracing::warn!(
+                    extent_id,
+                    reason,
+                    error = %e,
+                    "failed to abandon inflight marker; will retry"
+                );
+                return false;
+            }
+        }
+        self.commit_extent_inflight_release(extent_id);
+        true
+    }
+
+    /// Invoked from `handle_fence_node` AFTER the override has been persisted to
+    /// etcd + owner-lock owner_epoch bumps.
+    ///
+    /// Returns the list of extent_ids whose markers were abandoned, so the
+    /// caller can audit the chain.
     pub(crate) async fn auto_abandon_for_fenced_node(&self, fenced_node: u64) -> Vec<u64> {
         // Snapshot under one borrow: the extent_ids whose ledger payload is
         // ConvertToEc AND whose target_nodes[0] (the coordinator) is the
@@ -68,40 +118,13 @@ impl AutumnManager {
                 .collect()
         };
         let abandoned_ids: Vec<u64> = abandoned.clone();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         for extent_id in &abandoned {
-            // Atomic etcd txn: delete the inflight marker + put the
-            // advisory entry. The fence path will not be safe until
-            // BOTH effects land, so we route via `txn_fenced`.
-            let advisory = MgrEcAdvisoryEntry {
-                extent_id: *extent_id,
-                original_coord_node_id: fenced_node,
-                reason: "fence_abandon".to_string(),
-                set_at: now,
-            };
-            let key = advisory_key(*extent_id);
-            let marker_key = format!("{}{}", EXTENT_INFLIGHT_PREFIX, extent_id);
-            let bytes = rkyv_encode(&advisory).to_vec();
-            if let Some(etcd) = &self.etcd {
-                let ops = vec![
-                    Op::put(key.as_bytes(), &bytes),
-                    Op::delete(marker_key.as_bytes()),
-                ];
-                if let Err(e) = etcd.txn_fenced(vec![], ops, vec![]).await {
-                    tracing::warn!(
-                        extent_id = *extent_id,
-                        fenced_node,
-                        error = %e,
-                        "failed to abandon inflight marker; will retry next fence"
-                    );
-                    continue;
-                }
+            if !self
+                .abandon_ec_marker(*extent_id, fenced_node, "fence_abandon")
+                .await
+            {
+                continue;
             }
-            // In-memory release follows etcd success.
-            self.commit_extent_inflight_release(*extent_id);
             tracing::warn!(
                 extent_id = *extent_id,
                 fenced_node,
@@ -170,5 +193,51 @@ impl AutumnManager {
             }
         }
         abandoned_ids
+    }
+}
+
+#[cfg(test)]
+mod abandon_tests {
+    use crate::AutumnManager;
+
+    fn run<F: std::future::Future<Output = ()>>(f: F) {
+        compio::runtime::Runtime::new().unwrap().block_on(f);
+    }
+
+    /// Giving up on a conversion has to actually free the extent: the marker is
+    /// what refuses its GC, so a "failed" op that leaves the marker behind fixes
+    /// nothing. This is the whole point of abandoning rather than just logging.
+    #[test]
+    fn abandoning_releases_the_marker_that_was_blocking_gc() {
+        run(async {
+            let m = AutumnManager::new();
+            m._test_mark_ec_inflight(91);
+            assert!(
+                m.extent_inflight_op(91).is_some(),
+                "precondition: the marker is what blocks this extent's GC"
+            );
+
+            assert!(m.abandon_ec_marker(91, 3, "repeated_failure").await);
+            assert!(
+                m.extent_inflight_op(91).is_none(),
+                "the extent must be free once the conversion is abandoned"
+            );
+        })
+    }
+
+    /// Abandoning one extent must not disturb another conversion in flight.
+    #[test]
+    fn abandoning_one_extent_leaves_the_others_alone() {
+        run(async {
+            let m = AutumnManager::new();
+            m._test_mark_ec_inflight(92);
+            m._test_mark_ec_inflight(93);
+            assert!(m.abandon_ec_marker(92, 3, "repeated_failure").await);
+            assert!(m.extent_inflight_op(92).is_none());
+            assert!(
+                m.extent_inflight_op(93).is_some(),
+                "an unrelated conversion must survive"
+            );
+        })
     }
 }

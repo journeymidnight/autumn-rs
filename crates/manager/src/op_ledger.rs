@@ -415,7 +415,9 @@ impl OpLedger {
 
     /// The coordinator reported that its LAST conversion attempt failed.
     ///
-    /// The entry stays RUNNING — the dispatch loop never gives up — but it now
+    /// The entry stays RUNNING while the dispatch loop keeps retrying — it gives
+    /// up only after `EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, which completes the
+    /// entry as FAILED through `complete_ec` rather than here — but it now
     /// carries the reason, so `ops status` shows why an extent has been
     /// converting for an hour instead of leaving the only record in one EN's
     /// log. Symmetric with `record_recovery_failure`, except the reason arrives

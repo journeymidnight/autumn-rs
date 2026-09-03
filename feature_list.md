@@ -201,6 +201,31 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
+### F-EC-STAGING-RECLAIM — 放弃/失败的 EC 转换在参与者上留下的 `.ec.dat` staging 无人清理
+- **Trigger** (2026-09-03, 做 EC "重试到头就放弃 marker" 时发现的配套缺口): 一次失败的转换会把
+  已经写成功的分片留成 `.ec.dat` staging。今天清理它的只有两条路，都覆盖不到本情形：
+  ① `remove_extent_files`——要等该 extent 整体被删（refs→0）；
+  ② orphan reconcile 的第二条腿——只处理 `.dat` 已经没了而 `.ec.dat` 还在。
+  而放弃 marker 之后，extent **仍然活着**（复制形态），`.dat` 在、`.ec.dat` 也在 ⇒ 两条都不管。
+  下一次转换会重写它，所以不是无界泄漏；但若 policy 因为尺寸/配置不再提名它，就一直占着。
+- **形状（用户定 2026-09-03：由 EN 的 reconcile 清理）**: reconcile 的 wire 契约已经是对的形状——
+  EN 上报持有的 extent，manager 回 `garbage`（整删）与 `placements`（该是 `InDatFile` 还是
+  `InShardFile`），EN 已按 `placements` 翻转布局。只差一步：判定为 `InDatFile`（没转换、也没转换
+  在飞）时，该节点上的 `.ec.dat` 就是陈旧的。
+- **⚠️ 判据必须来自 manager，不能让 EN 本地猜（已核实）**: `ec_convert_inflight` **只在协调者上设**
+  （全仓仅一处 `insert`，在 `handle_convert_to_ec`）。参与者收的是 `WriteShard`，**它自己不知道有
+  转换正在进行**。所以若让 EN 用"本地有没有在飞"来决定，协调者上对、**参与者上永远是"没有在飞"**
+  ⇒ 会在 `WriteShard` 写到一半时删掉 staging，破坏进行中的 2PC——正是本子系统历史上出过静默损坏
+  的地方。只有 manager 知道 marker 在不在，判据必须随 verdict 下发。
+- **Scope**: `ExtentPlacement` 增加一个"该 extent 当前没有 EC 转换在飞"的位；EN 仅在收到
+  `InDatFile` **且**该位为真时 unlink `.ec.dat`。**这是改 wire**（指纹变 ⇒ `WIRE_VERSION` 要 bump，
+  按全停全启纪律走）。
+- **Acceptance**: 单测 —— 参与者收到 `InDatFile` + 无转换在飞 ⇒ staging 被删；**转换在飞时同样的
+  verdict 不得删**（消融：去掉那个位的检查必须变红）。集成 —— 让一次转换因参与者不可达而被放弃，
+  断言其 staging 在下一轮 reconcile 后消失，且 extent 仍可正常读。
+- **Status**: `passes: false` (2026-09-03) — 与 BUG-EC-CONVERT-STALL 的"放弃 marker"配套，
+  用户定「分开做、分开评审」。
+
 ### BUG-EC-CONVERT-STALL-HEALTHY-COORD — EC 转换在协调者健康的情况下永不完成，卡住该 extent 的 GC【已复现，未修】
 - **Trigger** (2026-09-03, 给 F-SEALED-EMPTY-SWEEP 补 chaos 验收时撞上)：chaos verify 的
   in-flight 阶段报 `op ... kind=7 target=0/12 still ACTIVE (state=1) after quiesce —
@@ -254,9 +279,28 @@
   现在 marker 不在就只刷新不新建。两条都有单测且消融验证。
   **已知的呈现瑕疵（有意保留）**：`ec_last_error` 只在成功时清除，所以一次健康的长转换期间，
   ledger 会一直显示上一次的失败原因。改成"开始时清除"会让"在飞时卡死"重新变成瞎子，更糟。
-- **② 行为：仍未做** —— 参与者不可达时该重新选目标、还是把 op 判失败并释放 marker
-  （现在是无限重试且该 extent 的 GC 一直被挡）。要先想清楚 2PC 的安全性，
-  别在 revert-prone 区凭推断动刀。
+- **② 行为：已做 (2026-09-03，用户定"选 B：放弃并释放")**。连续
+  `EC_ABANDON_AFTER_CONSECUTIVE_FAILURES = 24` 次失败（约 2 分钟）后，走与 fence 路径**同一个**
+  txn 放弃 marker（`abandon_ec_marker`，已把 fence sweep 也改成调它，不留第二条释放路径），
+  并把 ledger 上的 op 完成为 FAILED。extent 随即解封，GC 可以进行。
+  **评审抓到一条会让特性反转的 bug（已修）**：`ec_last_error` 只在成功时清除，两种 CODE_OK 消息
+  都会一直引用它 ⇒ 一次"早先失败过一次、之后健康跑很久"的转换，每 5 秒被重复计一次失败，
+  任何超过阈值时长的转换都会**在健康运行中被放弃**。改成只在 `started_new`（真的开了新一次尝试）
+  时计数，已抽成 `ec_accept_started_new` 并有消融验证的单测。
+  **安全性论证已写进代码**（它与 `extent_inflight.rs` 里"自动释放正是 rich marker 要防的失败模式"
+  那条既有不变量冲突，所以必须显式论证而不是绕过）：EN 侧**没有 commit 阶段**（分片是按索引追加的
+  staging，`.dat` 不动，唯一 commit 点是 manager 那次 nonce 校验的 flip）；nonce 不匹配的完成报告被
+  `DifferentAttempt` 拒绝、无 marker 的报告被忽略；参与者 staging 由 `claim_ec_staging` 按 nonce 定序。
+  该不变量的注释已补上"若将来重新引入 EN 侧 commit、或让 flip 接受不匹配 nonce 的报告，本例外作废"。
+  **三处如实标注的边界**：
+  ① **阈值没有端到端覆盖** —— 24 次×5s ≈ 2 分钟，而 chaos 整场 45 秒，够不到；所以 chaos seed 603
+     那个约 50% 的失败**不会**被这条消除（它在 quiesce 时是 `attempts=9`）。
+  ② **"policy 会重新提名"有前提** —— auto-policy 控制器**默认关闭**、按 policy 逐条 arm；没 arm 的
+     集群上没有东西重新提名，extent 就停在复制形态直到运维介入。而且重发的目标集合只有 **extras** 是
+     新的：目标从 `ex.replicates` 起算，死掉的副本持有者每次都会被重新选中，除非 recovery 先把它换掉。
+  ③ **协调者自己不可达那一形态不受本条覆盖** —— 那走 `rpc_ok = false`，不带回原因、不计数，
+     留给 fence sweep 处理。
+  剩余的 staging 清理拆成 [F-EC-STAGING-RECLAIM]（用户定"分开做、分开评审"）。
 - **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
   让它停止派发的（不是"加了重试就好了"）。
 - **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。

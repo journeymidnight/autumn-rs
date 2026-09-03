@@ -266,6 +266,12 @@ impl AutumnManager {
     pub(crate) fn commit_extent_inflight_release(&self, extent_id: u64) {
         self.inflight.borrow_mut().remove(&extent_id);
         self.inflight_attempt_nonce.borrow_mut().remove(&extent_id);
+        // The consecutive-failure tally belongs to the marker, not the extent.
+        // Clearing it here — the single funnel every release goes through —
+        // means a conversion that succeeded after a few failures does not leave
+        // the NEXT conversion of the same extent starting part-way to being
+        // abandoned.
+        self.ec_consecutive_failures.borrow_mut().remove(&extent_id);
     }
 
     /// Read-only probe — returns the op kind currently in flight on
@@ -427,12 +433,28 @@ impl AutumnManager {
     /// coordinator serialises the two, but the manager state can
     /// still record the second dispatch's `target_nodes` while the first
     /// dispatch's bytes are what hit disk. This is exactly the failure
-    /// mode the rich EC-dispatch marker was added to prevent. The remediation for
-    /// a stuck ConvertToEc marker is operator intervention via Python
-    /// ops (`etcdctl get extent_inflight/<id>` + inspect EN state +
-    /// decide whether to manually delete the marker after confirming EN
-    /// finished). The WARN log fires every sweep tick so operators get
-    /// the signal.
+    /// mode the rich EC-dispatch marker was added to prevent. That is why THIS
+    /// sweep stays WARN-only and leaves a stuck marker to operator judgement
+    /// (`etcdctl get extent_inflight/<id>` + inspect EN state + decide whether to
+    /// delete it after confirming the EN finished). The WARN log fires every
+    /// sweep tick so operators get the signal.
+    ///
+    /// **Repeated-failure abandon is a deliberate exception, and here is why it
+    /// is safe** (`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, recovery.rs): the
+    /// danger above is a live EN dispatch applying its layout after a second
+    /// dispatch changed the assignment. Since this doc was written, three things
+    /// closed that: there is no EN-side commit phase at all (shards are additive
+    /// per-index staging, `.dat` is untouched, and the manager's nonce-checked
+    /// flip is the ONLY commit point); a completion report whose nonce does not
+    /// match the live marker is refused as `DifferentAttempt`, and a report with
+    /// no marker at all is ignored; and participant staging is nonce-ordered by
+    /// `claim_ec_staging`, whose contract names the released-but-alive
+    /// coordinator explicitly. So a late report from an abandoned attempt cannot
+    /// commit anything, and cannot poison a successor — the coordinator's
+    /// idempotent-skip keys on eversion, which only the manager's flip advances.
+    /// Any future change that reintroduces an EN-side commit, or makes the flip
+    /// accept a report without matching the live nonce, invalidates this and the
+    /// abandon must go back to operator-only.
     ///
     /// **Leader-failover-as-reconcile invariant:** when the leader
     /// changes, the new leader's `replay_from_etcd` rebuilds the
@@ -750,6 +772,23 @@ mod tests {
     }
 
     /// Phase 0: in-memory release clears the probe.
+    /// The consecutive-failure tally belongs to the MARKER. A conversion that
+    /// succeeds after a few failures must not leave the extent's next
+    /// conversion starting part-way to being abandoned.
+    #[test]
+    fn releasing_a_marker_clears_the_ec_failure_tally() {
+        run(async {
+            let m = crate::AutumnManager::new();
+            m.ec_consecutive_failures.borrow_mut().insert(77, 5);
+            m.commit_extent_inflight_release(77);
+            assert_eq!(
+                m.ec_consecutive_failures.borrow().get(&77).copied(),
+                None,
+                "a released marker must not leave its failure count behind"
+            );
+        })
+    }
+
     #[test]
     fn commit_extent_inflight_release_clears_probe() {
         run(async {

@@ -716,6 +716,18 @@ pub struct AutumnManager {
     /// caller reaches the setter. A by-value cell would leave the setter with no
     /// effect at all.
     sealed_empty_sweep_interval: Rc<Cell<Duration>>,
+    /// Consecutive failed EC conversion attempts, per extent.
+    ///
+    /// A conversion whose PARTICIPANT is unreachable fails identically forever:
+    /// the target set is pinned in the marker when it is created and nothing
+    /// re-picks it, so every re-dispatch writes a shard to the same dead node.
+    /// The marker stays, and the extent's GC is refused for as long as it does —
+    /// so one unreachable node can hold an extent's garbage indefinitely.
+    ///
+    /// In memory on purpose. A leader change resets the count, which costs one
+    /// more round of retries before the new leader gives up; abandoning is not
+    /// urgent enough to earn a persisted field and the wire change with it.
+    ec_consecutive_failures: Rc<RefCell<HashMap<u64, u32>>>,
     etcd: Option<EtcdMirror>,
     /// Owned via `Rc` so `EtcdMirror` (cloned from this) can use the same
     /// identity in its leader-fence compare without shipping a string per
@@ -1077,6 +1089,7 @@ impl AutumnManager {
             sealed_empty_sweep_interval: Rc::new(Cell::new(
                 crate::extent_delete::SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT,
             )),
+            ec_consecutive_failures: Rc::new(RefCell::new(HashMap::new())),
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
