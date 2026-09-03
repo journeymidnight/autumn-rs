@@ -144,7 +144,19 @@
   内核回复拷贝、`read::execute` 的每请求粒度（内核按 `max_read` 下发，不是按 extent），
   以及每次 `read` 都重新 `prepare` 一遍 ChunkSpec。**先分段计时再动手**。
 - **Acceptance**: fuse 单流读进到 CLI 的 80% 以内，且 `fuse_chaos.sh` 全绿。
-- **Status**: `passes: false` (2026-09-03) —— 只立账。
+- **进展 (2026-09-03)**: **`fuser` 的 feature 从 `abi-7-12` 提到 `abi-7-28`，读 +81%**
+  （交替 A/B：898 → 1621 MiB/s，三对全部同向）。根因：`FUSE_MAX_PAGES` 和 INIT 应答的
+  `max_pages` 字段在 fuser 里都在 `#[cfg(feature = "abi-7-28")]` 后面，缺了它内核把**每个**
+  请求夹在 32 页 = 128 KiB —— `ops.rs` 里 `set_max_write(1 MiB)` 从写下来那天起就是空转的
+  （4 GiB 的写产生 32768 次 128 KiB 调用；开了之后是 4096 次 1 MiB）。1 MiB 是内核 256 页
+  夹逼后的真实上限，设 4/8 MiB 请求数不变。
+  ⚠️ **这次升级本身带进一个静默数据丢失**（fable 评审抓到，已修+守卫）：`FUSE_RENAME2`
+  从 7-23 起会被解析并派发给同一个 `rename`，而我们忽略 flags、底下是 POSIX 覆盖语义。
+  实测 `RENAME_EXCHANGE` **返回成功**却做单向 rename，目标内容直接没了。现在 `flags != 0`
+  一律 EINVAL，守卫在 `scripts/fuse_chaos.sh` T3。教训：**抬 ABI 地板时要看的是"落到已实现
+  方法上"的新 opcode，不是拿 ENOSYS 的那些**。
+  **剩下的**: fuse 读 1621 vs CLI 2996（同集群同文件）= 54%，验收线是 80%。下一步要给读路径
+  加分段计时，别再猜。
 - **测量方法论（本条是踩出来的）**: 比较读吞吐时**两边都必须读到 `/dev/null`**。
   `autumnfs get <file>` 自带一次本地盘写，会把结果钉在 ~800 MiB/s 并**反转**结论。
 

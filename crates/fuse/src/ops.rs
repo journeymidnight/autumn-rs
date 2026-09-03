@@ -40,14 +40,29 @@ impl Filesystem for AutumnFs {
         _req: &Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        // Bump max_read so a userspace `pread(8 MiB)` arrives as ONE
-        // FUSE read() call instead of 64 × 128 KiB. With the parallel
-        // chunk fetch in `read::execute` (autumn-fuse perf fix #2),
-        // a single 8 MiB FUSE read fans out 32 concurrent chunk RPCs;
-        // the kernel default 128 KiB cap forced single-chunk reads
-        // and hid the parallelism win on 8 M workloads. 1 MiB is the
-        // sweet spot — matches the 1 MiB write buffer (3FS reference)
-        // and keeps fuser's per-request buffer reasonable.
+        // Ask for big requests, so a userspace 8 MiB read or write arrives as
+        // few FUSE calls rather than a stream of 128 KiB ones.
+        //
+        // `set_max_write` does nothing without the `abi-7-28` feature on the
+        // `fuser` dependency: `FUSE_MAX_PAGES` and the INIT reply's `max_pages`
+        // field are both compiled out below it, and without them the kernel
+        // clamps EVERY request to its 32-page default — 128 KiB. Built against
+        // `abi-7-12` this line was inert for as long as it had existed; a 4 GiB
+        // write arrived as 32768 calls of 128 KiB and reads were chopped the
+        // same way, worth 45% of the read path (898 -> 1621 MiB/s on a 4 GiB
+        // file, alternating A/B, when the feature was enabled).
+        //
+        // 1 MiB is not a tuning choice, it is the ceiling: the kernel clamps
+        // `max_pages` to FUSE_MAX_MAX_PAGES (256), so asking for 4 or 8 MiB
+        // changes nothing — measured, the request count stays at exactly 4096
+        // for 4 GiB either way. (Linux 6.10+ makes that clamp a sysctl, so it
+        // is the ceiling on this kernel, not a constant of the protocol.)
+        //
+        // `set_max_readahead` is a DIFFERENT story and is inert either way:
+        // `KernelConfig::new` caps it at whatever the kernel offered in its own
+        // INIT, and the setter returns `Err` above that — swallowed here. It is
+        // kept because it costs nothing and becomes real if a mount ever
+        // negotiates a larger readahead, not because it does anything today.
         let _ = config.set_max_readahead(16 * 1024 * 1024);
         let _ = config.set_max_write(1024 * 1024);
         match self.send(|reply| FsRequest::Init { reply }) {
@@ -170,9 +185,29 @@ impl Filesystem for AutumnFs {
         old_name: &OsStr,
         new_parent: u64,
         new_name: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
+        // `renameat2` flags are NOT supported, and saying so is load-bearing:
+        // the rename below is a plain POSIX clobbering rename, so honouring a
+        // flag we cannot implement by ignoring it DESTROYS data. Reproduced
+        // with `RENAME_EXCHANGE` (2) on a mount: the call returned SUCCESS and
+        // performed a one-way rename, leaving the destination holding the
+        // source's bytes and the destination's own content gone.
+        //
+        // This became reachable when the `fuser` dependency moved to
+        // `abi-7-28`: below `abi-7-23` the `FUSE_RENAME2` opcode is not parsed,
+        // so the kernel got ENOSYS, set `no_rename2` and answered the caller
+        // EINVAL itself. The flags argument existed before that and was
+        // ignored safely only because nothing could ever set it.
+        //
+        // `RENAME_NOREPLACE` (1) does not reach us at all — the VFS answers
+        // EEXIST before dispatching — but it is refused here too rather than
+        // relying on that.
+        if flags != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
         match self.send(|r| FsRequest::Rename {
             old_parent,
             old_name: old_name.to_owned(),

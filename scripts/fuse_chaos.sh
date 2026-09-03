@@ -324,6 +324,35 @@ else
     fail "T3: same-path rename destroyed the file"
 fi
 
+# renameat2 FLAGS must be refused, not ignored. The mount does a plain POSIX
+# clobbering rename, so a flag it cannot honour destroys data if it is dropped:
+# with the flag ignored, RENAME_EXCHANGE returned SUCCESS and performed a
+# one-way rename, leaving the destination holding the source's bytes and its
+# own content gone. This became reachable when `fuser` moved to `abi-7-28` —
+# below abi-7-23 the RENAME2 opcode is not parsed, so the kernel answered
+# EINVAL itself and the ignored flag could never be set.
+say "T3: renameat2 flags refused (RENAME_EXCHANGE must not silently swap)"
+printf 'AAAA%.0s' $(seq 1 64) > "$MNT/rn_ex_a"
+printf 'BBBB%.0s' $(seq 1 64) > "$MNT/rn_ex_b"
+python3 - "$MNT" <<'PYEOF'
+import ctypes, ctypes.util, os, sys
+libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+mp = sys.argv[1]
+a, b = f"{mp}/rn_ex_a", f"{mp}/rn_ex_b"
+# 316 = renameat2 on x86_64; AT_FDCWD = -100; RENAME_EXCHANGE = 2
+rc = libc.syscall(316, -100, a.encode(), -100, b.encode(), 2)
+ok = rc != 0 and os.path.exists(a) and os.path.exists(b) \
+     and open(a, "rb").read().startswith(b"AAAA") \
+     and open(b, "rb").read().startswith(b"BBBB")
+sys.exit(0 if ok else 1)
+PYEOF
+if [ $? -eq 0 ]; then
+    say "T3: renameat2(RENAME_EXCHANGE) refused, both files intact OK"
+else
+    fail "T3: renameat2(RENAME_EXCHANGE) was not refused — one file's content is gone"
+fi
+rm -f "$MNT/rn_ex_a" "$MNT/rn_ex_b"
+
 # NOTE — RMW (partial in-place overwrite) under PS failover is covered by the
 # DEDICATED, deterministic `scripts/fuse_rmw_chaos.sh` (single-PS, no migration
 # churn, so the verify read can't wedge on part_addr reconvergence the way a

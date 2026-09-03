@@ -41,7 +41,9 @@ use crate::state::FsState;
 // is added after each call returns while the sub-timers are added inside it, so
 // the parts can exceed the total by up to one in-flight call; and a FAILED
 // flush adds to the time but not to `flushes`/`mib`, which skews the ratios
-// after an error.
+// after an error. Everything is CUMULATIVE for the life of the process and
+// never reset, so a second copy through the same daemon reads as double — take
+// the numbers from a fresh mount, or subtract.
 static FILL_NS: AtomicU64 = AtomicU64::new(0);
 static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
 /// Time spent MOVING the filled buffer out at flush. Near zero by construction
@@ -51,6 +53,7 @@ static COPY_NS: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 const FLUSH_LOG_EVERY: u64 = 16;
 
 /// Hand a flushed buffer's allocation back to the inode so the next fill reuses
@@ -88,6 +91,7 @@ fn reclaim_buffer(state: &mut FsState, ino: u64, buf: Vec<u8>) {
 /// Write data to a file. Returns bytes written.
 pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
     let t_total = std::time::Instant::now();
+    WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     let r = write_inner(state, ino, offset, data).await;
     TOTAL_NS.fetch_add(t_total.elapsed().as_nanos() as u64, Ordering::Relaxed);
     r
@@ -237,6 +241,7 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
                     buf_handoff_ms = cp,
                     write_region_ms = fl,
                     total_in_write_ms = TOTAL_NS.load(Ordering::Relaxed) / 1_000_000,
+                    write_calls = WRITE_CALLS.load(Ordering::Relaxed),
                     "fuse write breakdown"
                 );
             }

@@ -32,12 +32,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 rkyv = { version = "0.8", features = ["alloc"] }
-# F-fuse-lease-2: `abi-7-12` unlocks `Notifier::inval_inode` /
-# `inval_entry` — required so the per-mount invalidation poll loop
-# can drop the kernel's attribute + page cache on per-ino
-# `WriterClosed` events. Brings the close-to-open coherence
-# guarantee all the way through to the kernel boundary.
-fuser = { version = "0.15", optional = true, features = ["abi-7-12"] }
+# Two floors, both load-bearing:
+#   abi-7-12 — `Notifier::inval_inode` / `inval_entry`, so the per-mount
+#     invalidation poll loop can drop the kernel's attribute + page cache on a
+#     per-ino `WriterClosed` event. That is what carries close-to-open
+#     coherence all the way to the kernel boundary.
+#   abi-7-28 — `FUSE_MAX_PAGES` and the INIT reply's `max_pages` field, both of
+#     which are `#[cfg]`-compiled-out below it. Without them the kernel clamps
+#     EVERY request to its 32-page default of 128 KiB, which made
+#     `set_max_write` in `ops.rs::init` inert and cost the read path 45%
+#     (898 -> 1621 MiB/s on a 4 GiB file when it was enabled).
+# Raising this floor makes new opcodes reachable: check what lands on a method
+# we already implement, not just what gets ENOSYS. `FUSE_RENAME2` is the one
+# that did — see the flags guard in `ops.rs::rename`.
+fuser = { version = "0.15", optional = true, features = ["abi-7-28"] }
 libc = { version = "0.2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 crossbeam-channel = { version = "0.5", optional = true }

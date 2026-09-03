@@ -272,12 +272,30 @@ clear 过的缓冲会让 fill 每轮都跑 `resize(.., 0)`，把下一行就要�
 等于每次 flush 一次 64 MiB memset）。`wb.len` 是长度的唯一真源，三个消费者都按它切片，
 所以 `wb.len` 之后的陈旧字节永远读不到。实测 197 → 234 MiB/s。
 
-**两条看着显然但实测更慢的路，别再走**：`max_write` 从 1 MiB 提到 8 MiB（248→219 MiB/s）；
-`WRITE_BUF_EXTENTS` 从 8 加到 16/32（248→234/229）。写路径的瓶颈不在单次请求大小，也不在
+**`WRITE_BUF_EXTENTS` 从 8 加到 16/32 实测更慢（248→234/229），别再走**——写路径的瓶颈不在
 一次 flush 的深度。
+
+**`max_write` 也不是旋钮，但理由和上面不同**：内核把 `max_pages` 夹在 `FUSE_MAX_MAX_PAGES`
+(256)，所以 1 MiB 已经是每请求上限，设 4/8 MiB 请求数恒为 4096（4 GiB）。
+⚠️ 我一度记过"1→8 MiB 更慢（248→219）"——**那是错的**：当时 `fuser` 还是 `abi-7-12`，
+`FUSE_MAX_PAGES` 被编译掉，两侧都在发 128 KiB，测到的是纯噪声。
 
 **分段计时留在代码里**（`fuse write breakdown`，每 16 次 flush 一行）：上面这两个假设和
 "to_vec 无所谓"都是靠它否掉的。
+
+### 内核协商（`ops.rs::init`）—— `abi-7-28` 是性能地板，也是新风险面
+
+`fuser` 必须开 `abi-7-28`：`FUSE_MAX_PAGES` 与 INIT 应答的 `max_pages` 字段都在这个 feature
+后面，缺了它内核把**每个**请求夹在 32 页 = 128 KiB，`set_max_write` 形同虚设。实测把它打开，
+读 **898 → 1621 MiB/s（+81%）**，写不变（写不受请求数限制）。1 MiB 是内核 256 页夹逼后的
+真实上限，设更大无效。
+
+**抬 ABI 地板会让新 opcode 变得可达，要看的是"落到我们已实现的方法上"的那些，不是拿 ENOSYS
+的那些。** `FUSE_RENAME2` 就是：7-23 起 fuser 会解析它并派发给同一个 `Filesystem::rename`
+并带上 flags，而我们的实现忽略 flags、底下是 POSIX 覆盖语义 —— 实测 `RENAME_EXCHANGE`
+**返回成功**却做了单向 rename，目标那份内容直接没了。现在 `flags != 0` 一律 EINVAL；
+守卫在 `scripts/fuse_chaos.sh` 的 T3。（`RENAME_NOREPLACE` 到不了我们这儿，VFS 先返回
+EEXIST，但同样被拒。）
 
 ### Flush
 `extent::write_region`：对齐区间直接 Put；非对齐落在已有 extent 内 → RMW（读旧值、
