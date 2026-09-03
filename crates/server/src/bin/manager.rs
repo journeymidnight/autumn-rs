@@ -356,6 +356,9 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
         manager.set_policy_config(cfg);
+        // Same intent: a 60 s backstop is invisible in a short-lived dev or
+        // test cluster, so fast mode shortens it too.
+        manager.set_sealed_empty_sweep_interval(std::time::Duration::from_secs(5));
         tracing::warn!(
             "--policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
         );

@@ -702,6 +702,20 @@ pub(crate) struct ClusterCapSnapshot {
 pub struct AutumnManager {
     pub store: MetadataStore,
     leader: Rc<Cell<bool>>,
+    /// How often the sealed-empty backstop ticks. Adjustable for the same reason
+    /// `PolicyConfig` is: a 60 s loop is invisible inside a short-lived dev or
+    /// test cluster.
+    ///
+    /// No operator-facing flag exposes it — the only callers are
+    /// `--policy-fast-mode` and in-process tests, so today it is a dev knob. It
+    /// WOULD be the lever for draining a large pre-fix backlog faster than the
+    /// ten hours 64-per-60s implies, once something exposes it.
+    ///
+    /// `Rc`, not a plain `Cell`, and that is load-bearing: `AutumnManager` is
+    /// Clone and every background loop holds its own clone, taken before any
+    /// caller reaches the setter. A by-value cell would leave the setter with no
+    /// effect at all.
+    sealed_empty_sweep_interval: Rc<Cell<Duration>>,
     etcd: Option<EtcdMirror>,
     /// Owned via `Rc` so `EtcdMirror` (cloned from this) can use the same
     /// identity in its leader-fence compare without shipping a string per
@@ -1060,6 +1074,9 @@ impl AutumnManager {
         Self {
             store: MetadataStore::new(),
             leader: Rc::new(Cell::new(true)),
+            sealed_empty_sweep_interval: Rc::new(Cell::new(
+                crate::extent_delete::SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT,
+            )),
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
@@ -1222,6 +1239,19 @@ impl AutumnManager {
     /// fast-mode the full policy_tick_loop.
     pub fn set_policy_config(&self, config: crate::policy::PolicyConfig) {
         self.policy.borrow_mut().set_config(config);
+    }
+
+    /// Shorten (or lengthen) the sealed-empty backstop's period. See the field.
+    ///
+    /// Floored at one second. Zero would spin: on a follower the tick returns at
+    /// its first statement, so the sleep is the loop's only suspension point.
+    /// And this is a reclaim-RATE knob, not just a cadence — the per-tick cap of
+    /// `SEALED_EMPTY_SWEEP_MAX_PER_TICK` is calibrated against the default
+    /// period, so halving the period doubles the reclaim rate and the etcd churn
+    /// that comes with it.
+    pub fn set_sealed_empty_sweep_interval(&self, every: Duration) {
+        self.sealed_empty_sweep_interval
+            .set(every.max(Duration::from_secs(1)));
     }
 
     pub async fn force_auto_split(&self, part_id: u64) -> Result<()> {

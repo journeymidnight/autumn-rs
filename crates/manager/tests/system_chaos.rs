@@ -70,6 +70,22 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
             let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint])
                 .await
                 .expect("new manager with etcd");
+            // The sealed-empty backstop keeps its 60 s default here, deliberately.
+            //
+            // Shortening it to 5 s was tried, to stop the sweep's chaos coverage
+            // depending on whether its single tick happens to land (measured:
+            // zero reclaims in one run, two in the next). It does raise the odds,
+            // but it also ticks four to six times inside `verify_gc_reclaim`'s
+            // window, and that check fails only on `total_reclaimed == 0 &&
+            // any_protected` where `total_reclaimed` is ANY shrinkage of the
+            // extent set. One sweep reclaim in that window flips it to 1 and
+            // suppresses the "reclamation is STUCK" error while force-GC is
+            // still reporting PROTECTED extents — masking the pinned-replay-floor
+            // bug the check exists for. Making one guard likelier by weakening
+            // another is a bad trade, especially when the sweep already has unit
+            // tests and an etcd-backed one. Its chaos coverage stays
+            // probabilistic; making it deterministic means building the
+            // sealed-empty shape here on purpose.
             let _ = manager.serve(mgr_addr).await;
         });
     });
@@ -2302,7 +2318,25 @@ async fn verify_gc_reclaim(
     let total_reclaimed = before.difference(&after).count();
     let gc_reclaimed = mid.difference(&after).count();
 
-    if total_reclaimed == 0 {
+    // Attribute to the GC WINDOW, not the whole run. `total_reclaimed` counts
+    // any shrinkage since `before`, including a background reclaim that has
+    // nothing to do with the force-GC under test — the sealed-empty sweep is one,
+    // and a single reclaim of its kind landing here would report the quiesce as
+    // working while it reclaimed nothing at all. `gc_reclaimed` is measured from
+    // `mid`, after the force-GC dispatch, so it is the narrower and honest
+    // question: did THIS phase move anything?
+    if gc_reclaimed == 0 && any_protected {
+        errors.push(format!(
+            "GC-RECLAIM: the force-GC phase DELETED 0 extents WHILE force-GC reported \
+             PROTECTED extents — reclamation is STUCK (a pinned replay floor is holding \
+             reclaimable data). before={} mid={} after={} (total shrinkage since before={}, \
+             which may include unrelated background reclaims)",
+            before.len(),
+            mid.len(),
+            after.len(),
+            total_reclaimed
+        ));
+    } else if total_reclaimed == 0 {
         if any_protected {
             // A pinned replay floor is holding reclaimable extents even after
             // flush + MAJOR-compact — the real "compact-then-forceg won't

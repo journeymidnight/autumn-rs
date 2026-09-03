@@ -98,8 +98,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// NO stream).
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often the sealed-empty backstop runs.
-const SEALED_EMPTY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Default period of the sealed-empty backstop; see
+/// `AutumnManager::set_sealed_empty_sweep_interval`.
+pub(crate) const SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Extents reclaimed per sealed-empty tick.
 ///
@@ -509,7 +510,7 @@ impl AutumnManager {
 
     pub(crate) async fn sealed_empty_sweep_loop(self) {
         loop {
-            compio::time::sleep(SEALED_EMPTY_SWEEP_INTERVAL).await;
+            compio::time::sleep(self.sealed_empty_sweep_interval.get()).await;
             self.sealed_empty_sweep_once().await;
         }
     }

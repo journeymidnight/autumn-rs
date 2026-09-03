@@ -280,6 +280,17 @@
   恢复侧游标全解析不到时改为全量重放，所以回收游标指向的空 extent 现在的代价是"开得慢"而非丢数据）。
   验收里"杀 writer 在 seal 与 punch 之间"的集成半**已做**：`crates/manager/tests/sealed_empty_sweep_etcd.rs`
   用真 etcd + aux 客户端直查，消融掉持久化那步会精确变红（`etcd still holds extents/N`）。
+  **2026-09-03 追加：试过把 chaos 里的 sweep 间隔调短，然后撤回了。** 60s 间隔在约 90s 的
+  chaos 里只给一次 tick，命中与否靠运气；调到 5s 确实提高了概率（实测 0/0/2 次），但它同时会在
+  `verify_gc_reclaim` 那约 20s 的窗口里 tick 4~6 次，而那个检查只在
+  `total_reclaimed == 0 && any_protected` 时报错、且 `total_reclaimed` 数的是 extent 集合的
+  **任意**收缩 —— 一次 sweep 回收就能把它顶成 1，从而**掩盖掉"回收卡死"**这个针对 pinned replay
+  floor 的守卫。**为了让一个守卫更容易触发而削弱另一个,是坏交易**，何况 sweep 已有单测 + etcd
+  集成测试。所以 chaos 保持 60s 默认；间隔旋钮保留给 `--policy-fast-mode`（并加了 1s 下限，
+  因为 0 会自旋：follower 上该 tick 第一句就返回，sleep 是唯一的挂起点）。
+  **顺带补强了那个掩盖通道本身**（它先前就存在，只是我的改动会放大它）：`any_protected` 时改用
+  `gc_reclaimed`（从 force-GC 派发之后的 `mid` 起算）而非 `total_reclaimed`，问的是"**这一阶段**
+  有没有回收动过"。seed 583 ×3、seed 603 ×2 均无误报。
   **chaos 那半：先记成 0 次执行，随后被自己的日志推翻，最终结论是"覆盖但不可靠"。**
   第一轮 grep `sealed-empty sweep` 得 0 次，我据此下了"chaos 从不造出这个形态"的结论 —— 那是
   **单轮样本的过度概括**。后续同 seed 的一轮里它触发了两次（`stream_id=13 count=1`、

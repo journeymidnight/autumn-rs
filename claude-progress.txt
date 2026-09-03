@@ -138,6 +138,17 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   force-ec-convert 全部静默空操作。两条都改了、都有消融验证的单测。
   **行为那半仍未做**（参与者不可达 = 重选目标还是判失败），涉及 2PC 安全性，不凭推断动。
 
+【2026-09-03 一次被自己撤回的改动：chaos 里调快 sweep 间隔】
+  动机是我自己标出的缺口（sweep 的 chaos 覆盖靠运气）。加了可调间隔（`Rc<Cell<Duration>>` +
+  setter，仿 `set_policy_config`），chaos 设 5s。评审指出**这会让 chaos 变弱**：
+  `verify_gc_reclaim` 只在 `total_reclaimed == 0 && any_protected` 报错，而 `total_reclaimed`
+  是 extent 集合的任意收缩 —— sweep 在那约 20s 窗口里 tick 4~6 次，一次回收就把它顶成 1，
+  掩盖掉"回收卡死"这个守卫。**撤回 chaos 侧的 5s**，旋钮留给 fast-mode（加 1s 下限防自旋）。
+  顺带把那个先前就存在的掩盖通道补强：`any_protected` 时改看 `gc_reclaimed`（force-GC 派发之后
+  起算）。seed 583 ×3、603 ×2 无误报。
+  教训记一条：**为了让一个守卫更容易触发而削弱另一个守卫，是坏交易**——尤其当被加强的那个
+  已经有单测和集成测试覆盖时。
+
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
   读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：
