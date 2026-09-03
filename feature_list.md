@@ -201,11 +201,63 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
-### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members
-- **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): the live 5-node wedge (10.4 TB leaked / 222 GB logical, 47×) was fixed two ways in `crates/stream/src/client.rs` — size-scaled append deadlines (`effective_append_timeout`) and writer-side reclaim of a tail sealed at commit=0 on roll-away (`reclaim_abandoned_empty_tail`, best-effort punch). The reclaim is CLIENT-side and best-effort: if the punch (or the authoritative `extent_info` re-fetch) fails — manager briefly unreachable, extent momentarily in a Recovery/EC ledger op — or the writer process dies right after the roll, that one sealed-empty extent still leaks forever (same unreclaimable shape: `sealed=true, sealed_length=0`, refs≥1, non-tail stream member, referenced by no VP/SST/checkpoint, invisible to accounting, skipped by GC/truncate/orphan-reconcile). A cluster already poisoned by the pre-fix bug also holds ~40k such extents that the writer-side fix will never revisit.
-- **Scope (when triggered)**: leader-only manager sweep (mirror `extent_both_zero_sweep_loop`, extent_delete.rs): for each stream, any member extent that is (a) NOT the tail (`extent_ids.last()`), (b) `sealed == true && sealed_length == 0` (authoritative empty seal — manager state note 32), and (c) not in the F207 inflight ledger → remove from `streams/<id>` membership (value-CAS per note 33) + refs-- (extent CAS) → existing pending-delete queue unlinks the physical files. Safety = the same argument as the writer-side reclaim: under caller-ack ⊆ commit (stream note 25a) + seal ≥ acked (notes 20/22), a sealed-AT-0 extent has no acked byte ⇒ nothing can reference it. CoW: refs-- only; delete at refs 0. Also drains the pre-fix backlog on an upgraded cluster (the 40k-extent case) — rate-limit the sweep (N extents/tick).
-- **Acceptance**: unit test — a sealed-empty non-tail member is swept, a sealed-empty TAIL and a sealed-nonzero member are NOT, an inflight-ledger extent is deferred; integration — kill the writer between seal and punch (or force the punch to fail once), assert the sweep reclaims the extent within one sweep interval; chaos regression (seed 603 + 769351064 class) green.
-- **Status**: `passes: false` (2026-07-14) — deferred: the writer-side reclaim closes the death-spiral producer; this is the backstop for writer-death/punch-failure residuals + pre-fix backlog cleanup. Cross-ref stream CLAUDE.md note 28; manager CLAUDE.md notes 32/33/41.
+### BUG-EMPTY-VP-CURSOR-PUNCH — 一个指向零字节 extent 的重放游标被回收后，恢复"什么都不重放"【已定位，未复现，未修】
+- **Trigger** (2026-09-03, fable 对 F-SEALED-EMPTY-SWEEP 的对抗性安全评审)：安全论证里"sealed 且
+  sealed_length=0 ⇒ 没有任何 VP/SST/checkpoint 引用它"对**字节**成立，对**重放游标**不成立。链条四步，
+  每一步都在代码里核实过：
+  1. **游标会被种到空 extent 上**：`recover_partition` 的重放循环（`partition-server/src/lib.rs`
+     ~8707）在 `committed_end == start_off` 时推进 tail 种子，注释明写包含"刚 roll 出来、还没有已提交
+     数据的 open tail" ⇒ 得到 `(E, 0)` 而 E 零字节。merge splice 掉一个 victim 的 `sealed=true,
+     sealed_length=0` 旧 tail 也是同一形态。
+  2. **游标会被落成持久 checkpoint**：`rotate_active` 抓 `(vp_extent_id, vp_offset)`，flush 把它盖进
+     SST 与 meta_stream checkpoint。首次 append 会覆盖种子，但"先 rotate 后 append"可达（WAL-gap
+     强制 rotate、split/merge freeze-drain、`flush_memtable_locked`）。
+  3. **E 随后变成 sealed-empty 非尾巴**：首次 append 失败 ⇒ failure-roll 按 `Some(0)` 封口；或它本来
+     就是 merge splice 来的 sealed-empty，被下一次 alloc 用 `already_sealed` 越过。
+  4. **没有任何一层保护空的游标 extent**：`gc_extent_punchable`（`background.rs`:218）就是
+     `sealed_length == 0 || pos < replay_floor_pos` —— **空的一律可 punch，直接绕过重放下限**。
+- **危害**：checkpoint 的 `vp_extent_id` 解析不到就被跳过；若**全部**解析不到而 SST 集非空，
+  `chosen_pos == usize::MAX` ⇒ `replay_extents = None` ⇒ **一条 WAL 都不重放**。仓库自己的注释
+  （`background.rs` ~2340）就把这条分支称作 "the acked-but-un-flushed WAL tail is **lost**"。
+  表现是分区**干净地打开**，而已 ACK 的写入不见了——静默，没有任何东西 fail loud。
+  "全部解析不到"并不罕见：compaction 把输出 SST 统一盖成输入里**流位置最大**的 vp_head（也就是
+  `(E,0)`），而 GC 的 raise-to-durable-ckpt 本来就会 punch 掉位置更靠前的那些。
+- **不是本轮引入的**：GC 与客户端的 `reclaim_abandoned_empty_tail` 今天就在按同一谓词删空 extent。
+  F-SEALED-EMPTY-SWEEP 会把它**扩到全集群、每 60s、包括没有 PS 在服务的分区**，所以那条被卡在这条后面。
+- **Scope（复现之后）**: 二选一，fable 判断 (a) 更小且严格更安全 ——
+  (a) **恢复侧**：`chosen_pos == usize::MAX` 且 tables 非空时，从位置 0 用现有的 seq/来源区间去重重放，
+      而不是不重放（代码本来就依赖该去重容忍过度重放）；
+  (b) **PS 侧**：永不盖出指向"零已提交字节 extent"的 vp_head（改盖前一个 extent 的 committed end，
+      重放位置等价）。
+- **Acceptance**: 先按 `feedback_reproduce_before_fixing_mechanism_bugs` **复现**——构造 checkpoint 的
+  vp_head 指向空 extent、punch 掉它、重启，断言已 ACK 的写入**丢了**（红）；修完转绿。消融：把修复
+  去掉必须重新变红。
+- **Status**: `passes: false` (2026-09-03) — 已定位未复现。**动它之前先复现**，这是重放路径，
+  是本仓库最不能凭推断动刀的地方。
+
+### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
+- **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB
+  逻辑数据（47×）。客户端侧已修两处（size-scaled append deadline、roll-away 时
+  `reclaim_abandoned_empty_tail` best-effort punch），但那是客户端且 best-effort：punch 或权威 re-fetch
+  失败、或 writer 在 seal 与 punch 之间死掉，那个 extent 就永远泄漏（`sealed=true, sealed_length=0`、
+  refs≥1、非尾巴的 stream 成员、无人引用、GC/truncate/orphan-reconcile 各自因"它没有那个字段"全部跳过）。
+  修复前被污染的集群另有约 4 万个这种 extent，客户端修复永远不会再访问它们。
+- **Scope**: leader-only manager sweep，谓词 = 非尾巴 + `sealed && sealed_length == 0` + 不在 inflight
+  ledger；复用 punch-holes 的变更路径（`compute_extent_ref_drops` → value-CAS 的
+  `mirror_stream_extent_mutation` → pending-delete 队列）。限速 N extent/tick。
+- **Acceptance**: 单测 —— sealed-empty 非尾巴要扫、sealed-empty **尾巴**与 sealed 非空**不扫**、
+  inflight 的推迟；集成 —— 在 seal 与 punch 之间杀掉 writer（或让 punch 失败一次），断言 sweep 在一个
+  周期内回收；chaos 回归（seed 603 + 769351064 类）绿。
+- **Status**: `passes: false` (2026-07-14；2026-09-03 更新) — **实现完成、测试通过、评审过，但故意不上线**。
+  代码在 `crates/manager/src/extent_delete.rs`（`sealed_empty_sweep_candidates` 纯谓词 + 6 单测；
+  `sealed_empty_sweep_once`/`_loop`），`start_runtime_tasks` 里**没有** spawn，附了不 spawn 的理由；
+  三条谓词消融各自咬住不同断言。**阻塞在 [BUG-EMPTY-VP-CURSOR-PUNCH] 上**：manager 看不见 PS 的
+  vp_head，所以 sweep 无法过滤掉"被 checkpoint 游标指着的空 extent"，而那一类会静默丢失已 ACK 的写。
+  验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
+  `mirror_stream_extent_mutation` 在内存模式下是**彻底 no-op**，所以现有两条集成测试覆盖的是选择逻辑与
+  内存态 apply，**不是** plan 基线与 txn 之间的 CAS 耦合；那需要 etcd 后端的集群。
+  另：inflight ledger 的"计划后、mutation 前"窗口已改成每个 plan 重读一次，但该重检查**没有测试覆盖**
+  （计划期谓词已排除 inflight，内存模式下那些 await 不挂起，进程内开不出窗口），代码里已如实标注。
 
 ### F-EN-SHARD-AUTO — default EN shard count to CPU cores (format-side), not a hand-set env
 - **Trigger** (2026-07-13, user: "EN 分片确实是核数导向,但目前是手动 env,不是自动...对于集群配置有好处,记下来,以后做"): EN sharding IS core-oriented — `AUTUMN_EXTENT_SHARDS` should track io_uring cores (one shard = `extent_id % shard_count`), but it's a MANUAL env (default 1). Operators must hand-count cores AND keep three things in lockstep. It is NOT a simple "read `available_parallelism()` in the EN" because shard_count is coupled through a chain: **(a)** EN ports are static/registered-once — `autumn-op format --shard-ports <csv>` stamps the N ports into etcd and the manager routes by that list forever (stream CLAUDE.md "EN ports are FUNDAMENTALLY static"); a runtime-auto shard count would desync from etcd → manager black-holes shards 1..N. **(b)** the k8s overlay Service must enumerate exactly `shard_count` data+control ports (`9101+i*10` / `10101+i*10`); auto-shard needs the Service port list generated too. **(c)** `AUTUMN_EXPECT_NODES` / presplit sizing are tuned against the shard fan-out.

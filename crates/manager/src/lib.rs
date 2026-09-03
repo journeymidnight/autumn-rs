@@ -1437,6 +1437,27 @@ impl AutumnManager {
             mgr.clone().extent_both_zero_sweep_loop()
         });
 
+        // NOT SPAWNED. `sealed_empty_sweep_loop` is written, tested and reviewed,
+        // and it stays off until the replay-cursor class below is closed.
+        //
+        // Its predicate is sound for every reference class that points at BYTES:
+        // seal >= acked holds on all three seal branches, so a sealed-at-zero
+        // extent holds no acked byte and no ValuePointer, SST or checkpoint
+        // CONTENT can live there. But a checkpoint also carries a replay CURSOR,
+        // and the partition server deliberately produces cursors naming a
+        // zero-byte extent at offset 0 (`recover_partition` seeds the tail that
+        // way for a freshly-rolled empty tail; a merge splice does the same).
+        // Recovery's answer to a cursor it cannot resolve is to skip it, and if
+        // NOTHING resolves while SSTs exist it replays nothing at all — a branch
+        // this repo already names as losing the acked-but-un-flushed WAL tail.
+        // The manager cannot see PS vp_heads, so the sweep cannot filter on it.
+        //
+        // The class is not introduced here — `gc_extent_punchable` is
+        // `sealed_length == 0 || pos < floor`, so GC already punches empty
+        // extents ahead of the replay floor, and the client-side
+        // `reclaim_abandoned_empty_tail` does too. What this sweep would add is
+        // reach: every stream, every 60 s, including partitions whose PS is gone.
+        // That is the wrong thing to switch on before the cursor is safe.
         // policy advisory tick.
         let mgr = self.clone();
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
@@ -4891,7 +4912,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
-    async fn mirror_stream_extent_mutation(
+    pub(crate) async fn mirror_stream_extent_mutation(
         &self,
         stream: &MgrStreamInfo,
         extent_puts: &[MgrExtentInfo],
@@ -8068,6 +8089,171 @@ mod tests {
                 ),
                 "recovery_tasks must NOT be populated when delete is queued"
             );
+        })
+    }
+
+    /// The backstop reclaims what the writer-side reclaim did not.
+    ///
+    /// Scope, so the coverage is not overread: `AutumnManager::new()` has no
+    /// etcd, and `mirror_stream_extent_mutation` is a no-op without one. So this
+    /// exercises the selection and the in-memory apply, NOT the value-CAS
+    /// coupling between the plan baseline and the txn — that needs an
+    /// etcd-backed cluster, and the ledger's own acceptance asks for it.
+    ///
+    /// Shape of the leak, verbatim from the live incident: a non-tail member
+    /// sealed at length 0, refs >= 1, referenced by no VP, SST or checkpoint,
+    /// and skipped by GC, truncate and orphan-reconcile alike because each of
+    /// those keys on something this extent does not have. The writer punches its
+    /// own on roll-away, but that is best-effort and client-side; here it never
+    /// ran.
+    #[test]
+    fn the_sweep_reclaims_a_sealed_empty_member_the_writer_abandoned() {
+        run(async {
+            let m = AutumnManager::new();
+            m.leader.set(true);
+
+            let stream_id = 70u64;
+            let (leaked, live, tail) = (701u64, 702u64, 703u64);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![leaked, live, tail],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                let mut ex = make_ec_extent(leaked, 1);
+                ex.sealed = true;
+                ex.sealed_length = 0;
+                ex.refs = 1;
+                s.extents.insert(leaked, ex);
+                s.extents.insert(live, make_ec_extent(live, 1));
+                let mut t = make_ec_extent(tail, 1);
+                t.sealed = false;
+                t.sealed_length = 0;
+                s.extents.insert(tail, t);
+            }
+
+            let reclaimed = m.sealed_empty_sweep_once().await;
+            assert_eq!(reclaimed, 1, "the leaked member must be reclaimed");
+
+            let s = m.store.inner.borrow();
+            let members = &s.streams.get(&stream_id).unwrap().extent_ids;
+            assert_eq!(
+                members,
+                &vec![live, tail],
+                "only the leaked member leaves the stream"
+            );
+            assert!(
+                !s.extents.contains_key(&leaked),
+                "its last ref is gone, so the record goes with it"
+            );
+            assert!(
+                s.extents.contains_key(&live) && s.extents.contains_key(&tail),
+                "the sweep must not touch the members it did not name"
+            );
+        })
+    }
+
+    /// A stream listing the same extent twice is refused, not reclaimed.
+    ///
+    /// `retain` drops every occurrence while the refs mutation decrements once,
+    /// so sweeping it would leave `refs > 0, in no stream` — precisely the
+    /// orphan the sibling both-zero sweep refuses to reap and logs for
+    /// investigation. Duplicates cannot be created any more, but this sweep
+    /// exists FOR the clusters that predate that fix.
+    #[test]
+    fn the_sweep_refuses_a_member_a_stream_lists_twice() {
+        run(async {
+            let m = AutumnManager::new();
+            m.leader.set(true);
+
+            let stream_id = 72u64;
+            let (dupd, tail) = (721u64, 722u64);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![dupd, dupd, tail],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                let mut ex = make_ec_extent(dupd, 1);
+                ex.sealed = true;
+                ex.sealed_length = 0;
+                ex.refs = 2;
+                s.extents.insert(dupd, ex);
+                s.extents.insert(tail, make_ec_extent(tail, 1));
+            }
+
+            assert_eq!(
+                m.sealed_empty_sweep_once().await,
+                0,
+                "a duplicated member must be refused, not under-decremented"
+            );
+            let s = m.store.inner.borrow();
+            assert_eq!(
+                s.streams.get(&stream_id).unwrap().extent_ids,
+                vec![dupd, dupd, tail],
+                "membership must be untouched"
+            );
+            assert_eq!(s.extents.get(&dupd).unwrap().refs, 2, "refs must be untouched");
+        })
+    }
+
+    /// An extent a recovery is working on is DEFERRED, not swept: the op naming
+    /// it may be about to write, and the sweep gets another tick either way.
+    #[test]
+    fn the_sweep_defers_a_member_an_inflight_op_still_names() {
+        run(async {
+            let m = AutumnManager::new();
+            m.leader.set(true);
+
+            let stream_id = 71u64;
+            let (leaked, tail) = (711u64, 712u64);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![leaked, tail],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                let mut ex = make_ec_extent(leaked, 1);
+                ex.sealed = true;
+                ex.sealed_length = 0;
+                s.extents.insert(leaked, ex);
+                s.extents.insert(tail, make_ec_extent(tail, 1));
+            }
+            m._test_mark_recovery_inflight(
+                leaked,
+                RecoveryTask {
+                    extent_id: leaked,
+                    replace_id: 1,
+                    node_id: 7,
+                    start_time: 0,
+                },
+            );
+
+            assert_eq!(
+                m.sealed_empty_sweep_once().await,
+                0,
+                "an inflight-ledger extent must be left for a later tick"
+            );
+            let s = m.store.inner.borrow();
+            assert!(s.streams.get(&stream_id).unwrap().extent_ids.contains(&leaked));
         })
     }
 

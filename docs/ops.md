@@ -508,6 +508,38 @@ human `df` prints the breakdown `logical: sealed=… + open_tail=… = footprint
 A high `amp` (>> replication factor) now genuinely means an EC/replication issue,
 not just un-sealed data.
 
+### `amplification` far above the replication factor — the sealed-empty leak
+
+If `df` shows amplification many times the replication factor and the number does
+NOT come down after GC, suspect leaked sealed-empty extents. The shape is an
+extent that is still a member of a stream, `sealed = true` with
+`sealed_length = 0`, referenced by no ValuePointer, SST or checkpoint — so it is
+counted in nothing and reclaimed by nothing. It cost one live cluster 10.4 TB
+against 222 GB of logical data (47x) before the writer-side reclaim landed.
+
+The manager runs a leader-only backstop for it (`sealed_empty_sweep_loop`, every
+60 s). Watch it work:
+
+```bash
+# on the LEADER (a follower's sweep is a no-op by design)
+grep 'sealed-empty sweep' <manager log>
+#   ... reclaimed leaked non-tail members   stream_id=.. count=..
+#   ... deferring                           (an op claimed the extent mid-sweep)
+#   ... skipping reclaim, investigate       (a stream lists one extent twice)
+```
+
+Two things to expect rather than escalate. It reclaims at most **64 extents per
+tick**, so a cluster carrying a large pre-fix backlog drains over hours, not
+minutes — deliberately, because each reclaim is an etcd CAS plus a delete fanout
+and the foreground path matters more than the backlog. And `deferring` is normal:
+a recovery or EC conversion holding the extent gets it back on a later tick.
+
+The `skipping reclaim, investigate` line is NOT routine. It means a stream's
+membership names the same extent more than once, which is a refs-accounting bug;
+the sweep refuses that extent rather than under-decrementing it into a different
+kind of orphan. Capture the stream and extent ids from the log before anything
+else touches them.
+
 ### WAL debt (dead large-value bytes) in `df`
 
 `df` also prints `WAL debt: <bytes> dead (<pct>% of footprint, GC-reclaimable;

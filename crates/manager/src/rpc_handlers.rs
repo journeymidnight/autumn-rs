@@ -3004,7 +3004,7 @@ impl AutumnManager {
     /// snapshot; otherwise refs is decremented (eversion bumped) into
     /// `extent_puts`. Pure read over `s` (returns clones). Shared by
     /// handle_stream_punch_holes + handle_truncate.
-    fn compute_extent_ref_drops(
+    pub(crate) fn compute_extent_ref_drops(
         s: &autumn_common::MetadataState,
         removed: &HashSet<u64>,
         ec_inflight_set: &HashSet<u64>,

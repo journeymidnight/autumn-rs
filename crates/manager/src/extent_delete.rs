@@ -98,6 +98,27 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// NO stream).
 const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the sealed-empty backstop runs.
+// Off until the replay-cursor class is closed — see the un-spawn note in
+// `start_runtime_tasks`. Kept compiled and tested so the prerequisite is the
+// only thing between here and switching it on.
+#[allow(dead_code)]
+const SEALED_EMPTY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Extents reclaimed per sealed-empty tick.
+///
+/// Rate-limited because the first tick on a cluster poisoned before the
+/// writer-side reclaim landed has a large backlog to work through — tens of
+/// thousands of extents on the one this was written for — and each reclaimed
+/// extent costs an etcd CAS plus a delete fanout. Draining that over minutes is
+/// deliberate; doing it in one tick would put a metadata storm in front of the
+/// foreground path. Be concrete about what that buys and costs: at 64 per 60 s
+/// tick, the ~40k backlog that motivated this drains in roughly ten HOURS, not
+/// minutes. That is the intended trade for a backstop — the leak is already
+/// there and stable, and the foreground path is not.
+#[allow(dead_code)]
+const SEALED_EMPTY_SWEEP_MAX_PER_TICK: usize = 64;
+
 /// backoff cadence for the persisted retry loop. Each
 /// `MgrExtentDeleteRetry` increments `attempts` once per attempt; the
 /// backoff for the next try is `RETRY_BACKOFF_BASE * 2^min(attempts, MAX_SHIFT)`,
@@ -312,6 +333,189 @@ impl AutumnManager {
             tracing::info!(reclaimed, "both-zero sweep reclaimed orphan extent(s)");
         }
         reclaimed
+    }
+
+    /// Backstop for sealed-empty non-tail members the writer never reclaimed.
+    ///
+    /// The writer punches its own abandoned tail on roll-away, but that is
+    /// client-side and best-effort: if the punch or the authoritative re-fetch
+    /// fails, or the writer dies right after the roll, the extent stays
+    /// `sealed=true, sealed_length=0` with refs >= 1 forever — a member of a
+    /// stream, referenced by nothing, and invisible to GC, truncate and orphan
+    /// reconcile alike. That shape is what leaked 10.4 TB against 222 GB of
+    /// logical data on a live cluster.
+    ///
+    /// Reuses the punch-holes MUTATION — same `compute_extent_ref_drops`, same
+    /// value-CAS'd `mirror_stream_extent_mutation`, same pending-delete queue —
+    /// so this adds a new way to CHOOSE extents, not a second way to remove them.
+    /// It does NOT inherit that handler's guards: there is no `ensure_owner_epoch`
+    /// (the manager is not a fenced writer) and no empty-stream refusal (the tail
+    /// exclusion makes it unreachable). The inflight refusal it DOES need is done
+    /// per plan below.
+    #[allow(dead_code)]
+    pub(crate) async fn sealed_empty_sweep_once(&self) -> usize {
+        if !self.leader.get() {
+            return 0;
+        }
+        let (ec_inflight, recovery_inflight) = self.inflight_snapshot_ec_recovery();
+
+        // Plan under ONE borrow, with no await inside it: the mutation below
+        // re-borrows, and the etcd CAS is what makes a concurrent change lose.
+        let plans: Vec<(u64, MgrStreamInfo, Vec<u8>, std::collections::HashSet<u64>)> = {
+            let s = self.store.inner.borrow();
+            let mut budget = SEALED_EMPTY_SWEEP_MAX_PER_TICK;
+            let mut out = Vec::new();
+            for (sid, st) in s.streams.iter() {
+                if budget == 0 {
+                    break;
+                }
+                let members: Vec<SweepMember> = st
+                    .extent_ids
+                    .iter()
+                    .map(|eid| {
+                        // A member with no extent record is NOT swept: `sealed`
+                        // defaults false, so it fails the predicate. That is a
+                        // different leak and not this sweep's to guess at.
+                        let ex = s.extents.get(eid);
+                        SweepMember {
+                            extent_id: *eid,
+                            sealed: ex.is_some_and(|e| e.sealed),
+                            sealed_length: ex.map_or(0, |e| e.sealed_length),
+                            inflight: recovery_inflight.contains(eid)
+                                || ec_inflight.contains(eid),
+                        }
+                    })
+                    .collect();
+                let mut cands = sealed_empty_sweep_candidates(&members);
+                // A stream that lists the same extent twice would have its refs
+                // UNDER-decremented: `retain` drops every occurrence while
+                // `compute_extent_ref_drops` decrements once, leaving
+                // `refs > 0, in no stream` — the exact orphan the sibling sweep
+                // refuses to reap. New duplicates are prevented at the merge, but
+                // this sweep's stated target is a cluster poisoned BEFORE that,
+                // so refuse and say so rather than quietly make it worse.
+                cands.retain(|id| {
+                    let n = st.extent_ids.iter().filter(|m| *m == id).count();
+                    if n > 1 {
+                        tracing::error!(
+                            stream_id = *sid,
+                            extent_id = *id,
+                            occurrences = n,
+                            "sealed-empty sweep: extent listed more than once in one stream \
+                             (refs accounting bug) — skipping reclaim, investigate"
+                        );
+                    }
+                    n == 1
+                });
+                if cands.is_empty() {
+                    continue;
+                }
+                cands.truncate(budget);
+                budget -= cands.len();
+                let removed: std::collections::HashSet<u64> = cands.into_iter().collect();
+                let mut updated = st.clone();
+                updated.extent_ids.retain(|id| !removed.contains(id));
+                out.push((*sid, updated, rkyv_encode(st).to_vec(), removed));
+            }
+            out
+        };
+
+        let mut reclaimed = 0usize;
+        for (stream_id, updated, baseline, removed) in plans {
+            // Re-read the ledger HERE, not from the snapshot taken before the
+            // loop. Recovery deliberately targets sealed-empty extents, and by
+            // the second plan that snapshot is separated from this mutation by
+            // the previous iteration's awaits — a marker acquired in that window
+            // would be invisible. `handle_stream_punch_holes` has no equivalent
+            // gap: it snapshots and refuses inside one synchronous borrow.
+            // Nothing else guards this; the per-extent CAS compares the extent
+            // record, and acquiring a ledger marker does not touch it.
+            //
+            // Untested, and not testable in-process: the plan-time predicate
+            // already drops anything the pre-loop snapshot named, so this fires
+            // only for a marker acquired DURING the sweep — and with no etcd the
+            // awaits above do not actually suspend, so the harness cannot open
+            // that window. Ablating this check leaves every test green. It is
+            // here because the window is real against a live etcd, not because
+            // something proves it fires.
+            let drops = {
+                let s = self.store.inner.borrow();
+                let (ec_now, rec_now) = self.inflight_snapshot_ec_recovery();
+                if removed.iter().any(|id| ec_now.contains(id) || rec_now.contains(id)) {
+                    None
+                } else {
+                    Some(Self::compute_extent_ref_drops(&s, &removed, &ec_now))
+                }
+            };
+            let Some((extent_puts, extent_deletes, pending_deletes, extent_cas)) = drops else {
+                tracing::info!(
+                    stream_id,
+                    "sealed-empty sweep: an op claimed one of these extents mid-sweep — deferring"
+                );
+                continue;
+            };
+            // etcd first; on failure the in-memory store is untouched and the
+            // next tick re-plans from whatever actually persisted.
+            if let Err(e) = self
+                .mirror_stream_extent_mutation(
+                    &updated,
+                    &extent_puts,
+                    &extent_deletes,
+                    Some(baseline),
+                    extent_cas,
+                )
+                .await
+            {
+                tracing::warn!(
+                    stream_id,
+                    count = removed.len(),
+                    error = %e,
+                    "sealed-empty sweep: could not persist the membership drop; retrying next tick"
+                );
+                continue;
+            }
+            {
+                let mut s = self.store.inner.borrow_mut();
+                if let Some(st) = s.streams.get_mut(&stream_id) {
+                    *st = updated.clone();
+                }
+                for ex in &extent_puts {
+                    s.extents.insert(ex.extent_id, ex.clone());
+                }
+                for eid in &extent_deletes {
+                    s.extents.remove(eid);
+                }
+            }
+            for &eid in &extent_deletes {
+                if let Err(e) = self.forget_payload_location(eid).await {
+                    tracing::warn!(extent_id = eid, error = %e, "sealed-empty sweep: payload-location key survives the extent");
+                }
+                if let Err(e) = self.forget_corrupt_slots(eid).await {
+                    tracing::warn!(extent_id = eid, error = %e, "sealed-empty sweep: corrupt-slot mark survives the extent");
+                }
+            }
+            // Each enqueue is an etcd CAS via the inflight ledger, and its
+            // errors are already downgraded to WARN inside `enqueue_pending_deletes`
+            // so one failed acquire cannot abandon the rest of the batch. The
+            // membership drop is already durable either way; an extent whose
+            // fanout did not start is picked up by node-startup reconcile.
+            let _ = self.enqueue_pending_deletes(pending_deletes).await;
+            tracing::info!(
+                stream_id,
+                count = removed.len(),
+                "sealed-empty sweep: reclaimed leaked non-tail members"
+            );
+            reclaimed += removed.len();
+        }
+        reclaimed
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn sealed_empty_sweep_loop(self) {
+        loop {
+            compio::time::sleep(SEALED_EMPTY_SWEEP_INTERVAL).await;
+            self.sealed_empty_sweep_once().await;
+        }
     }
 
     /// EXTENT10-AUTORECLAIM background loop (leader-only via the gate inside
@@ -607,5 +811,122 @@ impl AutumnManager {
             Ok(r) => r.code == CODE_OK,
             Err(_) => false,
         }
+    }
+}
+
+/// One stream member, as the sealed-empty sweep sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SweepMember {
+    pub extent_id: u64,
+    pub sealed: bool,
+    pub sealed_length: u64,
+    /// Currently named by the inflight ledger (recovery / EC conversion).
+    pub inflight: bool,
+}
+
+/// Which members a sealed-empty sweep may reclaim, given a stream's `extent_ids`
+/// IN ORDER.
+///
+/// A sealed-at-zero extent should hold no acked byte — under caller-ack ⊆ commit
+/// and seal ≥ acked — so nothing should reference it, and nothing looks at it
+/// either: it is invisible to accounting, GC and truncate alike. That is both
+/// what makes it reclaimable and what made it leak. The writer reclaims its own
+/// on roll-away, best-effort; this is the backstop for the ones that got away (a
+/// punch that failed, a writer that died between the seal and the punch) and for
+/// the backlog on a cluster poisoned before that fix.
+///
+/// Two things to be honest about, because "nothing can reference it" is a claim
+/// about the ABSENCE of a bug class rather than a structural property:
+///  - The repo documents under-seal bugs that produced `sealed=true,
+///    sealed_length=0` on extents that DID hold acked data (the split CoW-tail
+///    seal, `stale_vp_offset_past_sealed_length`). Those are believed fixed. If
+///    one recurs, this sweep changes the failure from a loud wedge with the
+///    bytes still on disk into an unlink within a minute.
+///  - The predicate is the same branch PS GC already takes — `gc_extent_punchable`
+///    punches `sealed_length == 0` unconditionally, ahead of the replay floor. So
+///    the hazard is not new. What IS new is scope: GC walks one partition's
+///    log_stream, this walks every stream, including partitions whose PS is gone
+///    or whose GC is stalled.
+///
+/// Three exclusions, each load-bearing:
+///  - **the tail is never swept.** It is the live append target; `sealed=false`
+///    normally, but a tail sealed at 0 is a roll that has not landed yet, and
+///    the writer's own reclaim owns that case. Skipping it also keeps the stream
+///    non-empty, which the membership mutation requires.
+///  - **`sealed_length > 0` is never swept**, and neither is an UNSEALED member:
+///    only an authoritative empty seal proves there is nothing to lose. An open
+///    extent reports `sealed_length == 0` while holding data.
+///  - **an inflight-ledger extent is deferred**, not skipped forever — a
+///    recovery or EC conversion naming it may be about to write.
+#[allow(dead_code)]
+pub(crate) fn sealed_empty_sweep_candidates(members: &[SweepMember]) -> Vec<u64> {
+    let Some((_tail, rest)) = members.split_last() else {
+        return Vec::new();
+    };
+    rest.iter()
+        .filter(|m| m.sealed && m.sealed_length == 0 && !m.inflight)
+        .map(|m| m.extent_id)
+        .collect()
+}
+
+#[cfg(test)]
+mod sealed_empty_sweep_tests {
+    use super::*;
+
+    fn m(extent_id: u64, sealed: bool, sealed_length: u64, inflight: bool) -> SweepMember {
+        SweepMember {
+            extent_id,
+            sealed,
+            sealed_length,
+            inflight,
+        }
+    }
+
+    #[test]
+    fn a_sealed_empty_non_tail_member_is_swept() {
+        let members = [m(1, true, 0, false), m(2, true, 4096, false), m(3, false, 0, false)];
+        assert_eq!(sealed_empty_sweep_candidates(&members), vec![1]);
+    }
+
+    #[test]
+    fn the_tail_is_never_swept_even_sealed_at_zero() {
+        // A tail sealed at 0 is a roll that has not landed; the writer's own
+        // reclaim owns it. Sweeping it would also empty a single-member stream.
+        let members = [m(1, true, 4096, false), m(2, true, 0, false)];
+        assert!(sealed_empty_sweep_candidates(&members).is_empty());
+        assert!(sealed_empty_sweep_candidates(&[m(9, true, 0, false)]).is_empty());
+        assert!(sealed_empty_sweep_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_sealed_member_with_bytes_is_never_swept() {
+        let members = [m(1, true, 1, false), m(2, true, 0, false)];
+        // Only the tail is left out here, so 1 is judged on its own merits.
+        assert!(!sealed_empty_sweep_candidates(&members).contains(&1));
+    }
+
+    #[test]
+    fn an_unsealed_member_is_never_swept() {
+        // An OPEN extent reports sealed_length == 0 while holding data — the one
+        // shape that must never be mistaken for an empty seal.
+        let members = [m(1, false, 0, false), m(2, true, 0, false)];
+        assert!(!sealed_empty_sweep_candidates(&members).contains(&1));
+    }
+
+    #[test]
+    fn an_inflight_member_is_deferred() {
+        let members = [m(1, true, 0, true), m(2, true, 0, false), m(3, true, 8, false)];
+        // 2 goes; 1 waits for the recovery / EC conversion naming it.
+        assert_eq!(sealed_empty_sweep_candidates(&members), vec![2]);
+    }
+
+    #[test]
+    fn sweeping_can_never_empty_a_stream() {
+        // Every member sealed-at-zero: the tail still survives, so the
+        // membership mutation cannot produce the empty stream it rejects.
+        let members: Vec<SweepMember> = (1..=5).map(|i| m(i, true, 0, false)).collect();
+        let swept = sealed_empty_sweep_candidates(&members);
+        assert_eq!(swept.len(), members.len() - 1);
+        assert!(!swept.contains(&5));
     }
 }

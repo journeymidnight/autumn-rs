@@ -1004,6 +1004,47 @@ under-count must never let the sweep delete a still-membered extent; a
 both-zero-but-in-a-stream extent is ERROR-logged + skipped). Delete is etcd-first
 value-CAS on the snapshot, then in-memory remove + `enqueue_pending_deletes`.
 
+**Sealed-empty member sweep** (`sealed_empty_sweep_loop`, leader-only, 60 s, 64
+extents/tick). The other leak shape: an extent that IS a stream member, at
+`sealed == true && sealed_length == 0`, refs ≥ 1, referenced by no VP/SST/
+checkpoint. Nothing else looks at it — GC keys on discard bytes, truncate on the
+head extent, the both-zero sweep on non-membership — which is why the live 5-node
+incident leaked 10.4 TB against 222 GB logical. The writer punches its own
+abandoned tail on roll-away (`reclaim_abandoned_empty_tail`), but that is
+client-side and best-effort; this is the backstop for a failed punch, a writer
+that died between seal and punch, and the backlog on a cluster poisoned before
+that fix. **Candidate gate** (`sealed_empty_sweep_candidates`, pure + unit-tested):
+NOT the stream's tail, `sealed && sealed_length == 0`, and not named by the
+recovery/EC inflight ledger. It then REUSES the punch-holes mutation
+(`compute_extent_ref_drops` → value-CAS'd `mirror_stream_extent_mutation` →
+`enqueue_pending_deletes`), so it is a new way to CHOOSE extents, not a second way
+to remove them.
+
+INVARIANTS, each with a reason it is not optional:
+- **The tail is never swept.** It is the live append target, the writer's own
+  reclaim owns a tail sealed at 0, and skipping it is also what keeps the stream
+  non-empty — which the membership mutation refuses.
+- **Only an authoritative empty seal.** An OPEN extent also reports
+  `sealed_length == 0` while holding data; `sealed` is the bit that distinguishes
+  them, and it is immutable once set.
+- **The inflight ledger is re-read per plan**, not taken from a snapshot before
+  the loop. Recovery deliberately targets sealed-empty extents, and by the second
+  plan a pre-loop snapshot is separated from the mutation by the previous
+  iteration's awaits. `handle_stream_punch_holes` has no such gap (it snapshots
+  and refuses inside one synchronous borrow); this sweep must re-read to match.
+- **A stream listing an extent twice is refused and ERROR-logged**, never swept:
+  `retain` drops every occurrence while the refs mutation decrements once, which
+  would manufacture the `refs > 0, in no stream` orphan the both-zero sweep
+  refuses to reap.
+
+Scope worth knowing: PS GC already punches `sealed_length == 0` unconditionally
+ahead of the replay floor, so the predicate is not novel — but GC walks one
+partition's log_stream, and this walks EVERY stream, including row/meta streams
+and partitions whose PS is gone. The safety argument is caller-ack ⊆ commit +
+seal ≥ acked ⇒ a sealed-at-zero extent has no acked byte. That is a claim about
+the absence of an under-seal bug class, not a structural property; if one recurs,
+this turns a loud wedge with bytes still on disk into an unlink within a minute.
+
 ## Cluster identity, version, and capacity
 
 **`cluster_id`** (`autumn-rs/cluster_id`): CAS-imprinted to a UUID by the first leader

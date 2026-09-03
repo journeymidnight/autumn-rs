@@ -1,6 +1,8 @@
 Date: 2026-09-03
 TaskStatus: completed
-Task scope: ① fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
+Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 实现完成但**故意未上线**
+  （评审挖出的重放游标类阻塞它，已立 BUG-EMPTY-VP-CURSOR-PUNCH）；
+  ① fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
   根因（守护进程单个 compio 线程 CPU 饱和）实际修掉；② 两条 EC 测试从"钉管道"改成"能变红"；
   ③ 复核 BUG-KVC-MM-ALIAS 的触发门槛（未过，维持不做）；④ 本文件按规则 12 清理
   （736 行 → 262 行，删掉已完成工作的叙述——git 历史是它们的记录）。
@@ -54,6 +56,25 @@ Task scope: ① fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—
   vLLM 不再通过 connector 读的那两个名字暴露 mm hash。实测 `vllm-env` = **vLLM 0.28.0**，
   `MultiModalFeatureSpec` 字段含 `identifier` 与 `mm_hash` 两者，而 `_request_extra_keys`
   取的正是这两个 ⇒ fail-open 分支在当前部署上够不着。代码未动，复核方法已写进账本条目。
+
+【2026-09-03 F-SEALED-EMPTY-SWEEP：写完、测完、评审完，然后决定不上线】
+  目标形态是那次 10.4 TB / 222 GB（47×）泄漏留下的残余：`sealed=true, sealed_length=0`、refs≥1、
+  非尾巴的 stream 成员。实现刻意复用 punch-holes 的变更路径（只加"挑选"的新方式，不加第二条删除路径），
+  选择逻辑抽成纯谓词 + 6 单测，三条消融各自咬住不同断言，308 测试绿。
+  **fable 对抗性安全评审推翻了安全论证的一半**（我自己复核了四条链接，全部属实）：
+  "sealed-at-zero ⇒ 没人引用它"对**字节**成立（seal ≥ acked 在三条封口分支上都成立），
+  对**重放游标**不成立 —— PS 会**故意**造出指向零字节 extent 的 `(E,0)` 游标，而
+  `gc_extent_punchable` 是 `sealed_length == 0 || pos < floor`，空的一律可 punch、绕过重放下限；
+  游标解析不到就被跳过，若全部解析不到而 SST 非空 ⇒ `chosen_pos == usize::MAX` ⇒ **一条 WAL 都不重放**，
+  仓库自己的注释就管这叫 "the acked-but-un-flushed WAL tail is lost"。
+  ⇒ **代码留在树里、测试留着、`start_runtime_tasks` 里不 spawn**（附不 spawn 的理由与死代码豁免），
+  阻塞项立成 BUG-EMPTY-VP-CURSOR-PUNCH（**不是本轮引入的**：GC 与客户端 reclaim 今天就在这么删）。
+  主评审另抓到 6 条，全部核实并修：`inflight_snapshot_ec_recovery` 返回 `(ec, rec)` 而我是全仓唯一写反的；
+  ledger 快照跨 await 不复查（改成每 plan 重读）；重复成员会 under-decrement refs（改成拒绝 + ERROR）；
+  "reuses punch-holes exactly"夸大（它没继承那些守卫）；"drains over minutes"实为 ~10.4 小时；
+  文档块又一次被焊到上一个函数的 doc 上。
+  **两条诚实标注**：内存模式下 `mirror_stream_extent_mutation` 是彻底 no-op ⇒ 两条"集成测试"覆盖的是
+  选择与内存态 apply，不是 CAS 耦合；inflight 重检查进程内开不出窗口，消融全绿，已标为未覆盖。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
