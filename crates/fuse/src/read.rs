@@ -62,7 +62,50 @@ pub struct ChunkSpec {
 
 /// Phase 1: dispatcher-side synchronous-ish prep. Holds `&mut state` briefly for
 /// the inode cache + write-buf flush. No route resolution, no long awaits.
+// Where a read's wall clock goes, logged once per 1024 reads. Kept for the same
+// reason as the write side's: five guesses about this path were wrong before it
+// was measured (see the ledger entry F-FUSE-READ-GAP for the list).
+//
+// On a 4 GiB single-stream read it reads roughly: prepare 8 ms, alloc 97 ms,
+// fill 1840 ms, and ~550 ms in neither — i.e. essentially all of it is the
+// cluster round trip, 449 us per 1 MiB request, taken one at a time.
+//
+// Process-global and never reset, like the write side's: take the numbers from
+// a fresh mount.
+static R_PREPARE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static R_ALLOC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static R_FILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static R_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static R_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn read_probe_log() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = R_CALLS.fetch_add(1, Relaxed) + 1;
+    if n % 1024 == 0 {
+        tracing::info!(
+            reads = n,
+            mib = R_BYTES.load(Relaxed) / 1_048_576,
+            prepare_ms = R_PREPARE_NS.load(Relaxed) / 1_000_000,
+            alloc_ms = R_ALLOC_NS.load(Relaxed) / 1_000_000,
+            fill_ms = R_FILL_NS.load(Relaxed) / 1_000_000,
+            "fuse read breakdown"
+        );
+    }
+}
+
 pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> Result<ReadPlan> {
+    let __t = std::time::Instant::now();
+    let __r = prepare_inner(state, ino, offset, size).await;
+    R_PREPARE_NS.fetch_add(__t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    __r
+}
+
+async fn prepare_inner(
+    state: &mut FsState,
+    ino: u64,
+    offset: i64,
+    size: u32,
+) -> Result<ReadPlan> {
     if offset < 0 {
         return Err(anyhow!("negative offset"));
     }
@@ -279,8 +322,15 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     if let Some(inline) = plan.inline_result {
         return Ok(inline);
     }
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = std::time::Instant::now();
     let mut result = vec![0u8; plan.actual_size];
+    R_ALLOC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    R_BYTES.fetch_add(plan.actual_size as u64, Relaxed);
+    let t = std::time::Instant::now();
     fill_region(plan.client, plan.chunks, &mut result, plan.direct_read).await?;
+    R_FILL_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    read_probe_log();
     Ok(result)
 }
 
