@@ -2220,15 +2220,19 @@ impl crate::AutumnManager {
         // unreachable node holding an extent's garbage indefinitely is the worse
         // outcome, so after enough consecutive failures the marker is dropped.
         //
-        // What abandoning costs, stated exactly, because the easy version of this
-        // sentence is wrong twice. `policy` does propose EC conversion from
-        // EXTENT STATE (not converted, sealed, big enough), so the extent returns
-        // to the candidate pool — but the auto-policy controller is DEFAULT-OFF
-        // and armed per policy, so on an unarmed cluster nothing re-proposes and
-        // the extent simply stays replicated until an operator acts. And the
-        // re-proposed target set is only fresh in its EXTRAS: targets start from
-        // `ex.replicates`, so a dead replica-holder is re-picked every time until
-        // recovery re-replicates the extent away from it.
+        // What abandoning costs. `policy` proposes EC conversion from EXTENT STATE
+        // (not converted, sealed, big enough), so the extent returns to the
+        // candidate pool and gets converted again — the deploy layer seeds
+        // `balanced` Armed, and that preset has EC on. (The BINARY default is
+        // Off, which is what cluster.sh, chaos and perf run with, so nothing
+        // re-proposes there.)
+        //
+        // The one thing re-proposing does NOT fix by itself: the target set is
+        // only fresh in its EXTRAS. Targets start from `ex.replicates`, so a dead
+        // replica-holder is re-picked every time until recovery re-replicates the
+        // extent away from it — the conversion then fails and is abandoned again,
+        // at the cost of one encode attempt per round rather than a permanently
+        // blocked GC.
         //
         // Even so, giving up beats the alternative: an extent whose GC is refused
         // indefinitely. And this deliberately does not re-target in place —
@@ -2263,9 +2267,9 @@ impl crate::AutumnManager {
                     attempts = n,
                     coordinator = coord,
                     "EC convert failed {n} times in a row ({why}) — abandoning the marker so the \
-                     extent's GC can proceed. It stays replicated until something re-proposes the \
-                     conversion: the auto-policy controller if it is armed for EC, otherwise an \
-                     operator"
+                     extent's GC can proceed. An armed auto-policy re-proposes the conversion from \
+                     extent state; if this repeats, the participant is still unreachable and needs \
+                     recovery to move the extent off it"
                 );
                 if self
                     .abandon_ec_marker(extent_id, coord, "repeated_failure")

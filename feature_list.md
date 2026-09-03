@@ -295,9 +295,14 @@
   **三处如实标注的边界**：
   ① **阈值没有端到端覆盖** —— 24 次×5s ≈ 2 分钟，而 chaos 整场 45 秒，够不到；所以 chaos seed 603
      那个约 50% 的失败**不会**被这条消除（它在 quiesce 时是 `attempts=9`）。
-  ② **"policy 会重新提名"有前提** —— auto-policy 控制器**默认关闭**、按 policy 逐条 arm；没 arm 的
-     集群上没有东西重新提名，extent 就停在复制形态直到运维介入。而且重发的目标集合只有 **extras** 是
-     新的：目标从 `ex.replicates` 起算，死掉的副本持有者每次都会被重新选中，除非 recovery 先把它换掉。
+  ② **"policy 会重新提名"成立**（我一度写成"默认关闭"，那是**只看二进制默认值的误判**，已更正）：
+     两条部署路径都默认 `AUTUMN_AUTO_POLICY_DEFAULT:-balanced`（`deploy/docker/entrypoint.sh`、
+     `deploy/baremetal/autumn-deploy`）且 seeded **Armed**，而 `balanced` 的开关是
+     `[split=false, **ec=true**, compact=true, gc=true, merge=false, rebalance=true]` —— EC 是开的。
+     二进制默认 Off 只影响 cluster.sh / chaos / perf。
+     **但重发的目标集合只有 extras 是新的**：目标从 `ex.replicates` 起算，死掉的副本持有者每次都会
+     被重新选中，除非 recovery 先把 extent 从它上面挪走 —— 于是"转换→失败→放弃"会按轮重复，
+     代价是每轮一次编码尝试，而不是 GC 被永久挡住。
   ③ **协调者自己不可达那一形态不受本条覆盖** —— 那走 `rpc_ok = false`，不带回原因、不计数，
      留给 fence sweep 处理。
   剩余的 staging 清理拆成 [F-EC-STAGING-RECLAIM]（用户定"分开做、分开评审"）。
