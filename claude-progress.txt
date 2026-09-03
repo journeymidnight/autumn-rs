@@ -1,7 +1,9 @@
 Date: 2026-09-03
 TaskStatus: completed
-Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
-  根因（守护进程单个 compio 线程 CPU 饱和）实际修掉。
+Task scope: ① fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
+  根因（守护进程单个 compio 线程 CPU 饱和）实际修掉；② 两条 EC 测试从"钉管道"改成"能变红"；
+  ③ 复核 BUG-KVC-MM-ALIAS 的触发门槛（未过，维持不做）；④ 本文件按规则 12 清理
+  （736 行 → 262 行，删掉已完成工作的叙述——git 历史是它们的记录）。
 
 【2026-09-03 fuse 读 I/O 线程池：已实现并验收】
   形状：N 个独立单线程 compio runtime，各自 `ClusterClient`，`futures::mpsc` 喂 `ReadJob`。
@@ -29,175 +31,29 @@ Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 
   延迟绑定的（内核对同步读者不并发下发；bdi read_ahead_kb 128→32768 实测完全无效），
   线程池按定义改不了。聚合吞吐已追平 CLI。按规则不改写验收口径，只记状态。
 
-Task scope: ingest 提速(已完成 3.2x)+ CJK bigram + graph 图数据库 API + FUSE 节点故障根因修复 + 集群重建。
-  逐 mode 指标 + 提交进仓库的基线（`memory-mcp --eval`）。起因是用户带来的一份 RAG 建议
-  清单（semantic-ish chunking / BM25 / metadata filter / dedupe+freshness / eval set），
-  逐条核对现状后用户只选了 eval set，语料指定 /data/dongmao_dev/md（17 部佛典，6 MB，
-  5164 chunk）。清单核对结果：BM25 早已完整实现（含 CJK bigram），结构感知 chunking 已有
-  一半（heading 切段 + breadcrumb 前置），metadata filter 只有检索后按 kind 过滤，
-  dedupe / version freshness / eval set 三项完全没有。
-  本会话后续又完成两件（均已推 main）：wire v30 删掉最后一个 `must_sync`；以及按用户要求
-  测量 `MSG_BATCH_PUT` 零拷贝化的收益并判定暂不做（见 feature_list F-BATCHPUT-ZC）。
-**TaskStatus 为何仍是 not_completed**：不是本会话的工作没做完（上述三项都已验收并推送），
-  而是**另一条并行会话的集群事故仍在阻塞**——5 台 autumn-node 的 containerd 卡死，根因
-  假设已改判为 autumn-fuse 残留挂载，详见文末 2026-09-02 方向变更条。那条结论出来前
-  **不要再起任何带 FUSE 挂载的 pod**。另有上一条会话的遗留：ingest 提速改动的 pod 内
-  复测数字仍未拿到（loopback 量不出来，RTT 太小）。
+【2026-09-03 两条 EC 测试改造：验收达成，账本条目已销】
+  BUG-EC-PARTICIPANT-UNSEALED —— 本体早被 2b8e488 修掉（在 HEAD，测试今天跑仍绿），
+  原测试只覆盖验收三句里的第一句。补齐另外两句时**我差点自己造一条假测试**：对重启后的
+  参与者发 MSG_APPEND，消融下照样返回 CODE_PRECONDITION。原因是 append 在 seal 闸门**之前**
+  发现 `local_eversion < req.eversion` 会先去 manager 拉一次并在内存里自愈。我据此写下
+  "没有任何 eversion 值能区分两种状态"——**fable 实测推翻了它**：`MSG_PROBE_EXTENT` 只读本地
+  原子量、无 fence、不问 manager，修复下报 8192、消融下报 0。现在钉住缺陷的是这条 probe 断言
+  （我自己复跑消融确认变红），append 那条降级为契约检查并在注释里写明。
+  **顺带修正爆炸半径**：seal 没落盘时，带重载 eversion 的 append 能过 eversion/seal/fence
+  三道闸门，拦住字节落盘的是已被回收的 `.dat`——而 flip 的清扫对 unlink 失败是"容忍并重试"，
+  所以存在 `.dat` 幸存的崩溃窗口。不是"只是一个一直失败的 heal"。
+  F-EC-RETRY-TESTS —— 把两个判决点从网络驱动的方法里抽出来（`read_retry_action` 与
+  `ec_gather_collect`，后者收 `Stream` 所以"凑够 K 就提前返回"留在被测函数内），行为不变
+  （抖动公式、哪一类才 sleep 都逐行核过）。验收要求的两条消融都变红；原有 4 条哨兵测试在
+  两次消融下全绿——正是账本的指控。评审又指出剩下的一条缝：把 `EcGatherOneShort` 换成普通
+  `anyhow!`，126 个测试全绿而重试静默失效；挂哨兵处已抽成 `one_short_error` 并补了走完
+  "判决→造错误→分类"整条链的测试，消融验证变红。
 
-【2026-09-02 direct-read 对 EC 不友好：已修（8abef44）】
-  `extent_read_descriptor` 把"EC 转换过"/"payload 不在 .dat"/"真故障"三件事一律当 `Err`，
-  于是 PS 对前两者也打 WARN —— ≥4 EN 就默认装 EC，等于每次大值读一条告警，真故障淹死在
-  里面。改成 `ReadDescriptor::Direct | NotDirect(EcConverted|PayloadOutsideDat)`，真故障仍
-  是 `Err`；`EcConverted` 降 debug、`PayloadOutsideDat` 反而升 WARN（它要求 payload_location
-  与 ec_converted 不一致，而这两个字段是同一个 etcd 事务发布的，属于不该发生）。
-  **顺带修掉一个真的用户可见延迟 bug**：批量重定向对拒绝回 `Unavailable` ⇒ SDK 当瞬时错误，
-  烧满 10 次刷新退避（≈9~13 秒）才轮到逐项代理回退 —— EC 集群上每次批量直读都卡这么久，
-  而 `--direct-read` 默认开着。改回 `FailedPrecondition`（在确定性短路集合里）立即降级。
-  EC 直读本体随后也做了（见下条）。有一条初版写错的论断在此更正：**别指望 k 路扇出提速**
-  —— shard_size 是按 extent 算的（seal 阈值 16 GiB、下限 1 GiB），k=4 时每片数 GiB，
-  一个 8 MiB 的 value 只落 1~2 片，永远不是 k 片。
-
-【2026-09-02 EC + direct-read：已实现】
-  descriptor 从二态变三态：`Direct`（复制，随便读一个副本）/ `Ec`（`replica_addrs[i]` =
-  持有**数据分片 i** 的节点）/ `NotDirect(..)`。客户端不做 RS 解码就能服务读 —— EC 载荷
-  是 `shard0 ‖ … ‖ shard_{k-1}` 的顺序拼接、`shard_size = ceil(sealed_length/k)`，所以一段
-  字节区间就是若干分片子区间的连续拼接；解码只在**重建**取不到的分片时才需要，客户端做不了、
-  代理做得了，于是任何失败都回退 PS。纯函数 `ec_shard_plan` 承担全部算术（7 个单测，含对
-  照模型的穷举往返），fable 审查逐项核对它与服务端 `ec_subrange_read` 规划器等价。
-  两处拒绝保留：数据分片所在节点 Suspected（分片没有第二个家，靠 RPC 超时发现太贵），
-  以及分片不在 shard 文件里（CoW 之前的转换留在 `.dat`，从不回填，按分片寻址只会收到拒绝）。
-  wire v34（GetRedirectResp 加 3 个字段）。活集群验证过：3+1 的日志流 EC，16 MB 文件，
-  `shards_read=1` 字节精确；`kill -9` 掉一个数据分片节点后仍字节精确（一次回退）。
-  验证走 `autumn-s3` —— `autumnfs` 直接读 KV 布局、根本不过 fuse core，测不到这条路径；
-  另外条带化会把每个 value 切到 64 KiB 直读阈值以下（两个坑都写进 docs/ops.md 了）。
-
-【2026-09-02 F-MEM-WIPE-COST：瓶颈测准并移除（588 s → 68.1 s），但没打到"分钟以内"】
-  账本说"先测准扫描为何这么慢，再决定改法"，测准的结果不是当初怀疑的 tombstone 让 seek 变贵，
-  而是 `handle_range` **每次请求**都把整个 memtable + 全部 imm 克隆成一个 Vec 再排序
-  （`collect_mem_items` → `snapshot_sorted` → `MemtableIterator::new` 里还有一次 sort），
-  而且连 value 一起克隆——range 的 `RangeEntry.value` 恒为空，那些 value 一个都用不上。
-  这笔开销是 O(memtable)、与 page limit 无关。release 实测：50 万条 64B value = 66.5 ms、
-  512B value = 124 ms、100 万条 = 212 ms —— 和现场那个 133 ms/页几乎重合。
-  改法：从 seek 点起取**窗口**（cap = max(4×limit, 4096)，不克隆 value）。每页固定 ~215 µs，
-  与 memtable 大小无关。窗口截断时返回一个 bound，merge 循环越过 bound 就停下并置 has_more；
-  这个 bound 是**正确性关键**而不是优化：SST 里的 key 可能被窗口外的 memtable tombstone 遮蔽，
-  越过 bound 继续读会把已删除的 key 复活。消融实测正是如此——去掉 bound，1024 个已删 key 从
-  **k-004096**（正好窗口边界）开始全部回来。
-  端到端（同一份 1,987,843 key 的语料）：588 s → 253.5 s（只修扫描）。再把逐 key 删除换成
-  `delete_many` → **70.2 s = 29,190 key/s**。完整性直接
-  验过（wipe 后前缀扫描返回空；三次运行删除计数都精确等于 1,987,843）。
-
-  **fable 在这个改动里挖出两个我自引入的静默丢 key 洞，都已改设计**（不是补丁）：
-  ① `truncated_early` 只在"选中项越过 bound"时置位，而合并自然耗尽（两边迭代器都空）时不置位
-  —— 窗口截断 + 无 SST 尾部的形状下，`has_more` 退回 `out.len()==limit`，短页报 false，
-  客户端就此停止而 memtable 里还有 key。
-  ② 更糟：SDK 的 `range_bound` 每轮把游标推进到 `cur_end_key`（分区**末尾**键），这在旧不变量
-  `has_more ⟺ count == limit` 下才安全；截断页又短又 has_more=true 会让游标直接跳过截断点，
-  多分区扫描结果**中间出现永久空洞**。另有四处消费者（wipe_agent / scan_keys / 两处 fuse
-  extent 循环）按 `n < limit → break` 分页、根本不看 has_more。
-  修法是让**窗口在 wire 上不可见**：撞到 bound 就从 `Excluded(bound)` 再取一个窗口继续合并，
-  `has_more` 恢复成 `out.len()==limit`，短页重新等价于"扫完了"，四个消费者一个都不用改。
-  耗尽也要先 refill——有 bound 时两边都空什么都证明不了。消融验证：改回 stop-at-bound，
-  "热键版本数超过窗口"那个测试只返回 `[k-hot]`（正是 fable 预测的形状），墓碑那个也红。
-  **这推翻了账本里那条"delete_many 无收益"的负结果**：当初的测量没错，但它是透过扫描瓶颈测的，
-  删除侧再快也显示不出来。教训 = 负结果要连同"当时的瓶颈在哪"一起记，否则换了瓶颈就失效。
-  剩下的 ~68 s 我一度归因成"单分区写天花板、多分区就能解决"——**那是错的**。补测四组变量
-  （分区 1→4、删除并发 32→256、页 512→4096、以及 4 分区×256 并发那格），删除耗时始终
-  68~74 s;客户端只吃 16% 单核,盘 fsync p50 56~60 µs / K=256 摊薄 237K ops/s,都不是瓶颈;
-  ingest 走批量 put 也是同样的 ~30K key/s。已另立 **F-KV-CLIENT-30K**。
-  注意反向断言"多分区无用"同样不成立:4 分区那轮先用了并发 32,两个实验各把对方的变量钉在
-  了限制值上,补跑的 4×256 才是有效否证。`memory-mcp` 现在每次 wipe 打一行
-  `wipe breakdown`(页数/扫描 ms/删除 ms)——这条分段计时是终结连续猜错的唯一手段,留在代码里。
-  **顺带修一个真 panic**：`fold_plural` 按字节切片，`100µs` 这种 token（6 字节、以 s 结尾）
-  会切进 'µ' 中间 panic，整个 ingest 进程直接挂。tokenizer 会把任何非 CJK 的 Unicode
-  alphanumeric 攒成 token，所以普通散文就能触发。已加非 ASCII 早退 + 消融验证过的回归测试。
-
-【2026-09-02 F-BATCH-ZC-REST 收尾两项：已完成】
-  ① `drain_bulk_writes` 之前只认 `MSG_PUT_BULK`，于是 `MSG_BATCH_PUT_BULK` 的尾巴拿不到
-  recv-into-pooled 快路——要先在 FrameDecoder 的 BytesMut 里攒一遍（一次应用层拷贝），
-  UCX 上也没有注册内存 RDMA 收。这恰好是最该省的那块：客户端把单个 ≥64 KiB 的值都路由到
-  逐条 `MSG_PUT_BULK`，所以一个 batch 的尾巴按定义是"一堆小值的和"，动辄兆级。现在两种形状
-  都认。两处形状差异：batch 的 ctrl 是变长 rkyv（part_id 走 `extract_part_id`，就是正常派发
-  路径本来也要付的那次解码），且**不设 64 MiB 上限**——那是单值形状里 `enqueue_put_bulk` 的
-  拒绝线，batch 的尾巴是各 op 之和、每个 op 在下游单独受限；也不需要上限来兜住分配：拒绝
-  并不能让这些字节消失，只会让 FrameDecoder 预留同样多再加一次拷贝。
-  ② `UcxWriteHalf`/`UcxConn` 补上 `write_vectored`（`UCP_DATATYPE_IOV`，一次
-  `ucp_stream_send_nbx` 发完整批）。此前用的是 compio 的 trait 默认实现——它只发第一个非空
-  buffer 并返回该 buffer 的长度，于是 `write_vectored_all` 一个 buffer 一次 send，一个
-  256-op 批量在 UCX 上发 259 次。TCP 早就走 sendmsg 多 iovec，这是 UCX 的对应实现。
-  两项都用消融验证过：去掉识别后计数器 delta=0（应为 1）；去掉 IOV 后真 RoCE 上
-  `write_vectored` 返回 7 而不是 69640。
-  **fable 评审挖出一个我自引入的 MEDIUM**：`InflightSlot` 在 SPIN_CAP 溢出时会带着
-  "UCX 仍持有指针"直接返回并泄漏 slot——payload 靠 `ManuallyDrop` 满足这条约定，而我的 iov
-  数组是普通局部变量，会在那条路径上被释放而 UCX 可能还在读它。已改成同样的 `ManuallyDrop`
-  规则（只在真正完成的分支释放）。fable 同时逐条核对了批量快路的对齐/part_id=0 哨兵/去掉
-  上限/authz/enqueue 等价五点，均安全。
-
-【2026-09-02 s3 网关搬进 PS：做完又整体 revert（用户拍板"划不来"）】
-  实现过一版 `autumn-ps --s3-gateway`（默认 false、独立 OS 线程、真集群 e2e 三轮全过），
-  推为 6f922b9，随后用户判定不划算，整体 `git revert`（不 force-push）。
-  **随后用户又定"它不算 example"**，于是从 `examples/s3-gateway` 搬到
-  `crates/server/src/bin/autumn_s3/`，成为 autumn-server 包的一等二进制，与 manager /
-  extent-node / ps / client / op / autumnfs 并列。**仍是独立进程**，所以下面那三条代价
-  一条都不适用；这次只是位置变了，代码逐字未改（三个文件 100% rename）。
-  连带：`-p autumn-server` 已会构建它 ⇒ Dockerfile 少一个 `-p autumn-s3`；entrypoint 的
-  `s3` role 不用动；且它现在**进了默认构建**（examples 从不在 default-members，以前
-  `cargo build --release` 会跳过它 —— 正是 chaos/perf 那条"用了陈旧 release 二进制"的坑）。
-  **为什么划不来（评审挖出来的代价，重做前先读这三条）**：
-    · **`panic = "abort"`**（release profile）⇒ 网关线程一 panic **带走整个 PS**。
-      "worker 死了不拖垮 PS"只对"返回 Err"成立。sidecar 时代 panic 只死 sidecar ——
-      这是搬进程内换来的真实代价，**进程内无法消除**。
-    · **传输是进程级 `OnceLock`**：`--transport ucx` 的 PS 会让网关也走 UCX（未验证，
-      且 fuse core 有 UCX 栈 abort 前科，叠加 panic=abort 就是 PS 宕机）。
-    · **`--cpuset` 管不住网关线程**（它只喂给分区/shard runtime 给自己钉核，不设进程
-      亲和掩码）⇒ 网关会跑到分区线程的核上，也躲不开租户核。
-  **收益比原以为的小**：唯一站得住的好处是 GPU 节点少收一次（sidecar 时代它先网络收、
-  再 loopback 收）。"网关不出存储节点"是错的 —— 副本选择是哈希轮转、无本地性偏好，
-  多节点集群上多数读仍来自远端 EN。
-  【顺带记两条通用坑，与本次去留无关】SO_REUSEPORT 下端口被别的进程占着**照样 bind
-  成功**（两个网关同端口会各分走一半连接，不会有一个拒绝启动）；监督线程按 handle 顺序
-  `join` 会让高序号 worker 的死讯被低序号挡住，要让 worker 自报（Drop guard 才能覆盖 panic）。
-
-【2026-09-02 批量 RPC 零拷贝（wire v31 + v32），并纠正一次错误结论】
-  用户指出 bulk 判据加错了量：加在**单条 value** 上，所以 256×4 KiB 的批量哪怕在线上是
-  1 MiB 的一帧也走拷贝路径。已实现 `MSG_BATCH_PUT_BULK`(0x5A,v31) 与
-  `MSG_BATCH_GET_BULK`(0x5B,v32)，判据改按**分组总字节**；帧格式没动（`value_len` 本就是
-  尾巴总长，切点写进 ctrl）。PS 侧从尾巴切 `Bytes` 直喂 `WriteOp::Put`（下游本就收 Bytes）。
-  实测（同集群、只差一行的两个二进制交替取样）：
-    写 TCP loopback 4 KiB   103.8 → 103.7   0%（**op 绑定区间**，见下）
-    写 TCP loopback 32 KiB  450.6 → 523.1   +16%
-    写 RoCE(rc_mlx5) 4 KiB   57.9 →  93.3   约 +61%（inline 还在 47~68 抖，bulk 稳 93.3）
-    读 真实查询负载(41 query/5164 chunk)  13054 → 12070 ms  -7.5%
-  **我先判定"不值得做"是错的，两处错因都记下来**：①测量点选在单分区 ~30K ops/s 的 op
-  天花板上（26.5K ops/s），省 CPU 根本显示不出来；②只测了 loopback TCP，而零拷贝最占
-  便宜的恰恰是生产用的 RDMA。另一个被 fable 审计从代码上驳回的推理：我以为"批量已摊薄
-  bulk 收益"，实际 inline 批量对逐字节拷贝一点没摊薄，且 `extract_part_id` 为读一个
-  part_id 就把整帧完整反序列化、`check_layer_a` 再来一遍，一个 256-op 帧多约 1500 次分配。
-  【顺带修的真问题】连接回复路径的 `write_vectored_all` **没有 IOV_MAX 分段**（一条回复
-  以前最多 2 个 buffer 所以够不着上限，N 值回复能够着；内核按**条数**拒绝且会打死写线程）；
-  `get_many`/PS 指南里"batched read 不走 partition_loop"的说法是**错的**（它确实绕
-  partition_loop、会阻塞 group-commit），新形式改成在连接线程上服务后才成立。
-  【踩坑记录，已写进 docs/ops.md「A/B-ing a wire-path change」】①`cluster.sh reset` 后
-  第一跑是垃圾（见过 42 ops/s 和 5.33 MB/s，随后复测 25688 和 447）；②要选对操作点；
-  ③别用 `UCX_TLS=posix,cma,tcp,self` 在 127.0.0.1 上测 UCX——cluster.sh 自己警告 ≥64K
-  已知坏，而批量帧天然 ≥64K，两臂都落在坏区间；单机要真 RDMA 就绑 RoCE IP + `mlx5_2:1`。
-  遗留三项在 feature_list F-BATCH-ZC-REST（recv-into-pooled 快路、UCX IOV 发送、
-  已无发送方的 `MSG_BATCH_GET` 去留）。
-
-【2026-09-02 perf check（单机，租户在场 + cpuset 隔离）：无代码回归】
-  布局：EN1 68-75 / PS 92-123（租户 sglang 散在 5/25/32/40/67/158/164/172/181，避开），
-  `AUTUMN_EXTENT_BASE_PORT=20000`，`--3disk`，`AUTUMN_DATA_ROOT=/data05/autumn-rs`。
-    tcp 4K   写 67,489（过）        读 403,513 vs 基线 1,373,914 = 29% ⚠
-    tcp 8M   写 241（基线 210=115%）读 757（6.3 GB/s，过）
-    ucx 4K   写 61,526（过）        读 1,128,447（过）
-    ucx 8M   **写卡死在 0，已知配置故障**（perf_check 的 ucx 腿自 export
-             `UCX_TLS=posix,cma,tcp,self`，posix 大消息在 PS→EN 那跳 stall；
-             skill 标注这些 8M 数字 known-broken，真 UCX 大消息要 RoCE 跨机）
-  tcp-4K 读那条 29% 是**陈旧基线**（空箱时代录的，账本已有"旧代码 A/B 同样下跌"）。
-  本次多了一条更硬的证据：**同一次运行里 UCX 读跑到 113 万**，机器照样能做 >100 万读/秒
-  ⇒ 不是整机被压垮，是只压 TCP 路径（loopback 小包读吃内核 softirq/调度，UCX 走 shm 绕开）。
-  且 403K 远高于上次记录的 230K ⇒ **cpuset 隔离确实有效**。基线未动（不擅自 update）。
-  ⚠️ 环境隐患：/data05 已 95% 满（剩 176G），下次跑 perf 前先清，否则迟早造出下一个假回归。
+【2026-09-03 BUG-KVC-MM-ALIAS 复核：门槛未过，维持不做】
+  账本对这条的规定是"真要动之前先复核触发条件是否已在线上出现过"。触发条件等价于部署在用的
+  vLLM 不再通过 connector 读的那两个名字暴露 mm hash。实测 `vllm-env` = **vLLM 0.28.0**，
+  `MultiModalFeatureSpec` 字段含 `identifier` 与 `mm_hash` 两者，而 `_request_extra_keys`
+  取的正是这两个 ⇒ fail-open 分支在当前部署上够不着。代码未动，复核方法已写进账本条目。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
@@ -332,309 +188,8 @@ Next steps:
   4. kvcache v2 多池接口找一个够新的 sglang 实测（本机 sglang 0.5.10 太旧）。
   5. CP 流水线改指 buda 仓库（FreeToken 部署本身已不属本仓库）。
 ─────────────────────────────────────────────────────────────────
-Date: 2026-08-30
-TaskStatus: completed
-Task scope: chaos 多轮 soak(10 轮:5 随机全动作 + 5 定向组合)。结果 8 过 2 挂,
-  两次失败同一根因,已修 (efbb28e)。
-【失败指纹高度一致】两轮都是 inflight_errors=1、其余全零(mismatches/not_found/range/
-  accounting/reclaim 都是 0),且都恰好有【2 次 EcConvert】;只有 1 次 EcConvert 的轮次全过。
-  这个"失败轮 vs 通过轮的唯一差异"直接把假设钉死,不用猜。
-【根因】第二次提交发生在第一次转换【已关闭之后】⇒ 不 attach ⇒ 新建 ledger 条目;
-  而此时 extent 已是 EC,handle_force_ec_convert 回 CODE_OK "already ec_converted"
-  (作为幂等 RPC 正确),但 actuation 把所有 CODE_OK 一律映射成 Dispatched ⇒ 条目停在 RUNNING,
-  等一个永不到来的 apply_ec_conversion_done。而 sweep_running_ttl 只覆盖 compact/gc/forcegc,
-  EC 连 30 分钟翻 UNKNOWN 都轮不到,只能等 256 环淘汰 ⇒ ops list --active 里长期挂着幽灵转换。
-  修 = 问【marker】是否真有转换在飞,而不是读响应消息(消息匹配正是本 session 已经修过一次的
-  分类器漂移反模式)。无数据面影响,是 ledger 卫生问题。
-【一个被我自己否掉的改动】同时把 complete_by_extent 改成关闭该 extent 的【全部】active 条目,
-  然后撤销了:submit 在条目 active 时会 attach,所以两个 active 条目根本不可能共存 ——
-  我为它写的测试在【未修复的代码上也通过】,正是这一点暴露了它是死代码。
-【测试】ec_convert_on_an_already_converted_extent_does_not_park_the_op 走真实路径
-  (run_submitted_op),旧映射下失败并报 "extent 12 already ec_converted"。
-  两个失败 seed 重跑转绿,且触发条件仍在(各 2 次 EcConvert)、in-flight verify 零错。
-【本轮 soak 覆盖】EcConvert 出现在 7/10 轮(定向组合是关键——纯随机约 1/4 命中率,
-  纯 ec 动作集则因"无 sealed extent"全跳过)。manager lib 299。
-Next steps: 无待办。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-29
-TaskStatus: completed
-Task scope: 换 seed 重跑 chaos。结果:抓到并修掉一个 liveness wedge (abca022)。
-【4 个随机 seed 全过】20260829/777/31337/4242,各 400 keys、in-flight verify errors=0。
-  seed 4242 的 399 keys 不是丢数据:4 个 PUT 超时被正确丢出预期集(超时=结果不确定),
-  reads miss=0。
-【覆盖面不够,补定向】随机 nemesis 很少抽到 EC:4 个 seed 里只有 31337 抽到一次,而且
-  【被跳过】("no sealed extents")。纯 ec 动作集 9 次全跳 —— 因为只有滚动才封口,60s 跑不出滚动。
-  必须配 split/merge/gc 才有 sealed extent 可转。
-【抓到的 bug】ec,kill,split,merge,gc 组合下:一个 EC 转换永不完成,每 5s 重派发,
-  WriteShard 恒被拒 req_owner_epoch=24 / local_owner_epoch=27;marker 永久 pinned,
-  该 extent GC 一直被拒 = 无界泄漏。【无数据丢失】(mismatches=0 not_found=0),是 liveness。
-  根因:dispatch_owner_epoch_for_extent 返回【第一个】引用该 extent 的 partition 的 epoch,
-  而 split/merge 后 extent 是 CoW 共享 —— 两个 partition 各持 owner lock,EN 围栏由实际写者
-  抬高,取到另一个就低于围栏;重派发又解析到同一个错 partition ⇒ 永不收敛。
-  "第一个"取决于 HashMap 迭代序,所以只在 split/merge 共享过该 extent 时复现。
-  【不是本轮回归】该函数来自上一轮 4040dbe(修的是"marker 建时冻结"那一半),今天没 commit
-  碰过派发路径。修 = 取 MAX(围栏只升不降;单 partition 时行为不变)。
-  单测 cow_shared_extent_resolves_to_the_highest_owner_epoch 确定性复现(返回 24 应为 27)。
-【修后验证】同一 seed+动作组合转绿:invariants OK 400 keys、in-flight errors=0、
-  stale owner_epoch 拒绝 0 次、EC convert failed 0 次、reclaimed 8 extents(wedge 那轮 0)。
-  4 个原 seed 全部重跑通过;manager lib 298。
-【运维事实(已写进 ops.md)】① 一轮 chaos 烧掉约 5 万个回环临时端口,TIME-WAIT 各约 60s 回收
-  ⇒ 连跑必须等回收(门限 <2000),否则 EADDRNOTAVAIL 被 verify 读成 wedged partition,
-  表现为"几乎所有 key not_found 且 mismatches=0"——那是端口耗尽的指纹,不是丢数据。
-  ② EcConvert nemesis 需要先有 sealed extent,单独跑 ec 动作集等于什么都没测。
-Next steps: 无待办。
-─────────────────────────────────────────────────────────────────
-Date: 2026-08-27 (b)
-TaskStatus: completed
-Task scope: MVCC 内部 key 编码重构——去掉 0x00 分隔符,改显式比较器(user-key 优先)。
-  内部 key 从 `user ++ 0x00 ++ BE(MAX-seq)` 改为 `user ++ BE(MAX-seq)`,排序不再是裸字节序,
-  统一走 `cmp_internal_keys`(先比 user key,再比定宽 8B inverted-seq 后缀)。
-【为什么】旧分隔符只是模拟"先比 user key":对含 0x00 的 user key 失效("a" vs "a\x00b" 反序,
-  "a" 会被 seek_user_key 查不到、扫描顺序颠倒——三个 pre-change 复现测试都实证失败)。
-【比较点枚举方法】三路:①从生产者流向追(key_with_ts/SST decode/WAL replay 的 key 流经处);
-  ②全 crate 文本扫(比较运算符/sort/partition_point/binary_search/BTreeMap/range/min-select);
-  ③Memtable 换 InternalKey newtype 让编译器逼出遗漏。共 13 个比较点全改:Memtable BTreeMap Ord
-  (newtype,不外溢)、MemtableIterator sort+seek、BlockIterator::seek、Async/sync MergeIterator
-  min-select、find_block_for_key、rpc_handlers biggest_key 预滤+mem/SST 两路 merge `mk<=sk`、
-  background 三份 lookup_in_sst* 二分。等值比较/用户键级比较(bloom 两侧都是 user key、
-  compaction 去重、split 扫描、in_range)核实不受影响。builder.rs 本地 parse_user_key(硬编码 9)/
-  parse_seq 删掉统一走 crate::parse_key/parse_ts;TS_SIZE(9) 常量删除只留 TS_BYTES(8);
-  wal_record.rs 无后缀宽度依赖(key 带长度前缀)核实不用动。
-【持久格式后果(无迁移,故意的)】旧 SST/WAL 在新比较器下"查不到已存在的 key"级不可读;
-  dev 集群必须重建。ops.md 加 deploy note;partition-server CLAUDE.md 两节重写(MVCC Key
-  Encoding + Range paging)。
-【顺带落地】比较器使 `K ++ 0x00` 成为精确的"严格在 K 之后"续扫起点(user-key 后继+user-key
-  优先排序):RangeReq.start 文档改契约(WIRE v29 指纹原地刷新 9cb798979a60ed87,注释-only);
-  scan_keys/wipe_agent 改独占续扫删掉 dedupe(有意反转 dd15047——当时比较器还不存在,
-  dedupe 是对的);system_chaos/system_range_split 游标 push(1)/push(0x01)→push(0)。
-【验证】partition-server 212(208+4 新:embedded-zero get/scan/SST 三个 pre-change 实证 FAIL,
-  round-trip/前缀对/版本序在两棵树都过——与任务预期一致 #2 翻转);manager 293/stream 110/
-  rpc 60/client 41/autumn-memory 22 全绿;system_chaos --ignored ×3 过;system_merge 9/9;
-  run_e2e.sh 活集群 e2e 5/5 + scan_boundary 1/1(即新比较器+新续扫 idiom 的真集群验证);
-  clippy 无新告警。
-【已知无关噪音】integration.rs 三个 recovery 测试"同批挂/单跑过"在改动前基线同样挂
-  (stash 实证),属既有跨测试进程态污染,未在本任务处理。→ 根因是进程全局 SST BlockCache 的跨集群污染,已修 (20e6a27)。
-Next steps: 无。
-
-
-（更早任务历史见 git log 与各 crate CLAUDE.md；本文件按规则 12 定期裁剪，保持整洁。）
-
-【2026-09-02 ingest 提速 + 一次线上事故】
-  ingest 慢的根因是**往返次数**,不是计算。同语料 5164 chunks 在真集群实测(改前):
-    写入循环 177.7s (34.4 ms/chunk) + reconcile/train 101.1s = 278.7s
-  已做(6b3a408): begin_bulk_index/flush_stats 延迟 meta/stats(它既是每篇 2 次往返,
-  也是循环无法并发的原因——单 key 并发 RMW 丢更新); 循环拆成顺序 CPU 段 + 并发 I/O 段;
-  bulk 窗口内 memoize centroid 表; 其余 `for k in keys { get(k).await }` 全部换批量。
-  **改后数字仍未拿到** —— 见下面的事故。
-  注意: **loopback 测不出这个改动**。本地 A/B 1.85s vs 1.87s,因为 RTT 只有 ~20µs,
-  往返差被每 chunk 5ms 的实际工作淹没。这类改动只能在 pod 里量。
-
-  事故一(不是我们的 bug): 三台 autumn-node(192.168.2.216/3.242/1.128)的 containerd
-  卡死——kubelet 心跳正常、节点 Ready 无 taint,但**无法在既有容器里起新进程、也无法新建容器**。
-  表现: exec 全挂(kube-system 的 pod 也一样)、exec 型 readiness 失败但 0 重启、
-  pod 卡 Terminating、新 pod 卡 Pending 且 kubelet 事件数为 0。manager 因此卡死 3 小时。
-  处置: cordon + 强删无 PVC 的 pod(manager/ps 无 PVC,秒级恢复)。EN 有 PVC,不能强删。
-  详见 memory/vke-k8s-deploy-gotchas.md 的 2026-09-01 条。
-
-  事故二(我的 bug): **翻译一句注释改掉了 WIRE_FINGERPRINT**。build.rs 按字节哈希
-  manager_rpc.rs 等 5 个文件,注释也算。我把 "数千 partition" 翻成英文 → fingerprint
-  从 f8b58703 变成 a30446,滚到一半时新 manager 与老 ps-0 互相握手失败。
-  而且检查是**不对称**的: 新二进制看老 peer 匹配注册表 → 放行; 老二进制看新 peer
-  不匹配注册表 → 判 fraud。所以新客户端连老集群一直是好的,直到 manager 先滚才炸。
-  修复(00fd992): 原样还原该文件 + 在 build.rs(不在哈希集合内)写警示。
-  教训: **部署前必须跑 `cargo test -p autumn-rpc`** —— registry_pins_current_schema_to_max_version
-  就是拦这个的,我只跑了 cargo check 和 memory/mcp 的测试。
-
-  事故三(顺带发现的真 bug,已修在 6b3a408): RPC 写路径的 writev 没按 IOV_MAX 分段。
-  宽批量 → 1131 个 iovec / 仅 76KB → 内核按**条数**拒绝(Linux errno 90 / macOS 40) →
-  写线程退出 → PS 的 log stream poisoned **且 PS 进程崩溃重启**,对上表现为
-  `batch_put op status=1`。它一直潜伏在线上,是新的并发批量把它变可达的。
-
-  buda 侧 upload 脚本修了三类 bug(1f9d073/90c7667/d66ee18): oniond 的
-  `list | grep -qx` 在 pipefail 下**匹配成功反而判失败**(SIGPIPE 141),所以 oniond 分支
-  从来没进过; HF 回退缺 HF_HUB_DISABLE_XET=1 会被 xethub CAS 打 401; 失败的模型静默跳过。
-  oniond 实测 ~200 MiB/s,比公网 HF 的 21.4 MiB/s 快约 10 倍。
-
-【2026-09-02 收尾状态 — 阻塞在节点上,不在代码上】
-  实测(真集群,同语料 5164 chunks,agent 隔离):
-    写入循环   177.7s (34.4 ms/chunk)  ->  77.2s (15.0 ms/chunk)   2.3x
-    reconcile+train  101.1s -> 88.3s   仅 1.14x
-  第二半没动的原因已定位并已修(1f7456a): train_centroids 的重新分桶是**串行写**,
-  每个向量 2-3 次往返,5164 个就是一万多次;我之前只批量化了它的读。改成三段批量写
-  (新 posting -> vptr -> 删旧 posting,顺序不可调换,否则 vptr 指向空桶无法回收)。
-  顺带批量化 delete_node 的边回收。**镜像 a433c7d 已出,但没测成** —— 见下。
-
-  阻塞: **5 台 autumn-node 的 containerd 全部卡死**(约 2 小时内逐台沦陷)。
-  已跑的进程照常服务,但任何节点都建不了新容器,所以起不了基准 pod。
-  写入仍可用但重度退化: 实测 mkdir 21s / 64KiB put 60s(正常毫秒级)。
-  VKE 控制台的故障诊断也报"节点诊断数据采集异常,可能是由于节点无法创建Pod" —— 独立印证。
-  处置只能靠**从火山引擎控制台逐台重启节点**(用「重启」不是「下线」,大概率要强制),
-  每台起来后 kubectl uncordon(我 cordon 了 4 台)。实例 ID:
-    192.168.2.216 i-yeprglc35s5i3z3ocg1r   en-4
-    192.168.1.128 i-yeprglc35swh2yp8jc4p   en-3
-    192.168.0.26  i-yeprglc35s4c5qvl856f   en-0, ps-1
-    192.168.1.127 i-yeprglc35swh2yp8hi95   en-1, manager-0, ps-0
-    192.168.3.242 i-yeprglc35swh2yp4ips4   en-2, etcd-0
-  本机无 volc CLI / 无 SDK / 环境里无 AK-SK,也 SSH 不到节点 ⇒ agent 无法自行重启。
-
-  集群现状: 核心已滚到 a433c7d(manager + ps-0/ps-1),PS 已从 3 缩到 2(ps-2 卡在
-  Terminating,等节点重启自然消失)。EN 仍在 9c23776c —— fingerprint 已还原,新旧兼容,
-  且 EN 的 PV 是 node-pinned 本地盘(storageClass autumn-en-local + nodeAffinity),
-  **调度不走也不能强删**,只能等节点修好再滚。**EN/etcd 的 PVC 绝对不能删**
-  (EN 删了会在别处建空盘;etcd 是 reclaimPolicy=Delete,删了等于抹掉集群元数据)。
-
-  下次接手第一步: 节点恢复后 uncordon -> 起 mmbench(scratchpad/mmbench.json,
-  换个 agent 名) -> 确认 reconcile+train 从 88.3s 降到多少 -> 再把 memory-mcp
-  Deployment 滚到新镜像(它现在还是 efeea3c)。
-
-  模型上传(buda,由 upload-watch 跑): dsv4 156 GiB 已用 oniond 下完并校验(180 MiB/s),
-  数据在 pod dl-dsv4-cj4dc 的 emptyDir 里,**别删那个 pod**。minimax 的 HF 下载已死
-  (40/130 GiB,httpx.ConnectTimeout,进程活着但冻结) —— 需要把 MiniMax-M2.5-NVFP4
-  补录进 oniond 桶(裸名,不带 @nvidia 后缀),否则只能跨太平洋 22 MiB/s。
-  关键认知: oniond 快 8.4 倍**靠的是并发不是带宽**(单流 ~4 MiB/s x ~45 条),
-  所以串行 autumnfs put 达不到 187 MiB/s 基线是可预期的,并行化 put 循环才是杠杆。
-
-【2026-09-02 方向变更(用户定):autumn 数据全部丢弃,坏节点下线,集群重建】
-  触发: 5 台 autumn-node 的 containerd 逐台卡死。**根因假设已从"火山的问题"改为"我们的问题"**:
-  全集群 21 台节点都是 containerd 1.6.38-vke.18(控制台报的"与集群 2.1.9 不一致"是全局漂移,
-  不区分好坏),而垮掉的恰好是且只有跑过 **autumn-fuse privileged pod** 的那 5 台;
-  192.168.3.2 做了几百 GiB 的 autumnfs CLI 工作但从未挂过 FUSE,全程健康。
-  机制假设: 残留的 FUSE 挂载(守护进程已死或卡住)会让触碰该挂载点的系统调用永久 D 状态阻塞,
-  而 containerd 建/拆 sandbox 时要遍历挂载点 ⇒ 运行时本身被阻塞。这解释了三个症状,
-  也解释了"已在跑的进程完全不受影响"。已派 subagent(fable)只读审计 crates/fuse。
-  重点怀疑: fuser 是否设了 AutoUnmount;init 失败后内核已挂载但守护进程退出的那条路
-  (生产里见过两次 `init failed: fs reply timeout`);被丢弃却没回复内核的 FUSE 请求;
-  以及 `--force --grace-period=0` 让启动脚本的 `trap fusermount3 -u` 不执行(我今天干过多次)。
-
-  新顺序: 修 FUSE bug -> 用户下线坏节点、重建集群 -> 重新 bootstrap + **presplit(必须在任何数据落盘前)**
-  -> 上传模型 -> 重新 ingest -> 才能测 train_centroids 批量化的效果。
-  本地已有 buda 的 markdown 副本,集群里没有不可再生的数据,可以放心全毁。
-  dsv4 的 156 GiB 在 pod dl-dsv4-cj4dc 的 emptyDir 里(节点 192.168.3.2,不在下线名单),**别删**。
-  在拿到 FUSE 结论前,**不要再起任何带 FUSE 挂载的 pod**(含 memory-mcp 和基准 pod)。
-
-【2026-09-02 下半场:FUSE 根因、集群重建、上传实测】
-  ■ FUSE 把节点搞死的根因(已修,344a37f)
-    挂载 FUSE 后内核成为进程的客户端:mountpoint 下的 stat() 会把调用者置于 D 状态
-    等守护进程应答,而 D 状态杀不掉。容器运行时建/拆 sandbox、exec 都要 stat 挂载点,
-    所以只要一个线程踩进去就永远回不来、还攥着锁 ⇒ 节点起不了任何新容器,
-    但已在跑的进程完全正常(它们不经过 containerd),节点还一直 Ready(心跳不碰挂载点)。
-    四处修复:
-      1. MountOption::AutoUnmount —— 主修复。以前唯一的卸载路径是优雅退出时的
-         Mount::drop,SIGKILL/OOM/未处理的 SIGTERM 全都会留下活挂载。
-         它还把残余的"永久阻塞"变成"调用方拿到错误"。
-      2. 异步 Read 加超时(REPLY_TIMEOUT)。**这条可能才是真凶**:守护进程"死了"内核会
-         中止连接给 ENOTCONN;真正永久阻塞的是"活着但不应答",而昨晚 manager 卡死 3 小时
-         期间 autumn-fuse 正是这个状态。其他 op 走 call_sync 有超时兜底,只有 Read 没有。
-      3. Read 的 unbounded_send 失败时把 reply 取回来回 EIO(原来直接丢弃,注释还错写成
-         "fuser 会超时"—— FUSE 没有超时)。
-      4. entrypoint 的挂载前清理不再用 `mountpoint -q`(那是一次 stat,必然卡在残留挂载上,
-         于是"清理崩溃前任"的检查把接任者卡死),改读 /proc/mounts + 惰性卸载。
-    实测:pod 挂载后 --force --grace-period=0 强杀,节点 16 秒内正常建起新容器。
-    注意:该测试**不具判别力**(死掉的守护进程本来就给 ENOTCONN),对照组用户叫停了。
-    相关性证据:21 台同版本节点,只有跑过 FUSE 挂载的 5 台垮掉;192.168.3.2 做了几百 GiB
-    autumnfs CLI 工作、从未挂过 FUSE,全程健康。
-
-  ■ 集群已重建(用户决定丢弃全部数据)
-    5 EN(local-path)+ 3 PS + 1 etcd + 1 manager,镜像 344a37f,分布在 6 个节点。
-    storage 节点池现 8 台(坏的 2 台已下线,新增 5 台并打了 autumn-node 标签)。
-    **fs 已 presplit:24 lanes × 8 MiB,5/5 切点,7 分区跨 3 PS** —— 在空 keyspace 上做的。
-    principal fs/kvc/mem 重建,autumn-credential Secret 已更新。
-    坑:AUTUMN_BOOTSTRAP_PRESPLIT 已退役,必须 bootstrap 之后手动跑 presplit --namespace。
-
-  ■ 集群是 WIRE 30 不是 29 —— 我的疏忽
-    rebase 时带进了别人的 b1a5a6c(把 wire 29→30),我没检查就构建部署了。
-    N↔N-1 兼容窗口救不了(两边都是单版本区间,无交集)。
-    ⇒ freetoken-autumn / hermes-autumn / vllm-autumn 全部过期,需在同 commit 重建。
-    规则记进 memory: **rebase/pull 后、构建部署前,先 grep WIRE_VERSION_M 和线上对一遍**。
-
-  ■ 上传实测(dsv4,45/76 时的数)
-    大文件 ≥1GiB: 19 个 / 379 秒 / 63.33 GiB = **171 MiB/s**,达 187 基线的 91%。
-    小文件固定开销仅 0.04 秒/个,25 个合计 1 秒;大文件耗时紧聚在 19–21 秒无长尾。
-    ⇒ **并行化 put 循环不是杠杆**。原因:声明 24 lanes 后单个 put 在存储层已跨 24 分区,
-    "串行循环"≠"单流"。oniond 的类比不成立——那边瓶颈是 per-HTTP-connection。
-    通用教训:伸手要并发之前,先看下层是不是已经并行了。
-
-  ■ autumn-op 标志位置修复(ced7f2f)
-    --admin-token[-file] 只认子命令后、--credential-file 只认全局,两者不一致且报错
-    既不提标志名也不提位置。改为预扫描 argv,位置无关;7 种组合实测 + 回归测试。
-    实现坑:预扫描要跳过"别的标志的值",但布尔标志(--json/--force)没有值,
-    无脑跳 2 会吞掉紧随其后的目标标志。
-
-  ■ 下一步(顺序有依赖)
-    1. 上传两模型完成(进行中)
-    2. **重传 buda markdown 到 fs/docs/buda**(随集群清掉了;用户本地有副本)
-    3. 部 memory-mcp(镜像 344a37f;清单在 ../buda/k8s/memory-mcp.yaml,单容器形态)
-    4. 补测 train_centroids 批量化后 reconcile 从 88.3s 降到多少 —— 这是本轮 ingest
-       优化唯一还没落地的数字(写入循环那半已实测 177.7s → 77.2s / 34.4 → 15.0 ms/chunk)
-    待用户定:要不要重建 freetoken-autumn 镜像(wire 30)。
-
-【2026-09-02 收尾:全部落地,数字已实测】
-  ■ ingest 性能——本轮目标,已完成(真集群,5164 chunks,同语料)
-      写入循环        177.7s (34.4 ms/chunk)  ->  71.3s (13.8)   2.5x
-      reconcile+train 101.1s                  ->  14.6s          6.9x
-      端到端          278.7s                  ->  85.9s          **3.2x**
-    最后这次还是在 MiniMax 130 GiB 上传同时抢同一批 PS/EN 的情况下测的,干净环境只会更快。
-    关键认知:批量化**读**只让 reconcile 从 101→88s(14%),因为成本从来不在读;
-    真凶是 train_centroids 里逐向量 2-3 次往返的**串行重新分桶**(5164 个向量 = 一万多次往返),
-    改成三段批量写后塌成 14.6s。顺序不可调换:新 posting -> vptr -> 删旧 posting。
-    另:**loopback 测不出这个改动**(本地 A/B 1.85 vs 1.87s),RTT 只有 ~20µs 会淹没往返差。
-
-  ■ CJK bigram 已在重建索引上验证
-    `慧能` 命中《六祖坛经》的惠能传记条目 + 《维摩诘经》思想价值段;`坐禅` 命中《禅者的初心》
-    真正讲坐禅的两章。注意语料里「惠能」「慧能」两种写法都有——bigram 提供区分度、
-    unigram 保住召回,正是当初的设计意图(bigram 不计入长度归一化)。
-
-  ■ 镜像携带源码(方案 C′,e67b5c7 + buda 560bc86)——消费方 wire 不一致从此不可构建
-    autumn-rs 镜像带 /usr/local/share/autumn/src(7.5MB:crates/ + python/ + Cargo.*),
-    消费方 COPY --from 取源码、用自己的 glibc/Python 编 wheel。AUTUMN_IMAGE 成为唯一版本旋钮。
-    **为什么不直接放 wheel**:PyO3 crate 无 abi3,wheel 绑定构建方 glibc + 精确 CPython。
-    autumn-rs 是 bookworm(glibc 2.36),freetoken 是 CUDA/Ubuntu22.04(2.35, py3.10)——
-    放 wheel 会被 pip 按 manylinux_2_36 拒绝,或装上后 import 报 GLIBC_2.36 not found。
-    freetoken-autumn:560bc86 已构建成功并核对 AUTUMN_IMAGE=e67b5c7,二进制与 wheel 同源。
-    注:本地无法编 python/ crate(stable 工具链缺 compio-buf 要的 nightly feature),
-    也无法编 autumn-fuse(缺 libfuse3 pkg-config)——这两个只能靠镜像构建验证。
-
-  ■ 模型上传:283.73 GiB 已入库,0 FAIL
-    串行 autumnfs put 稳定 **170 MiB/s**(基线 91%)。两个独立样本:dsv4 168 / minimax 172,
-    平均分片差 34% 而速率只差 2% ⇒ 是路径属性不是数据形状。
-    **并行化 put 循环不是杠杆**:单次固定开销 0.04s,25 个小文件合计 1s。
-    原因是 24 lanes 让单次 put 已跨 24 分区扇出,"串行循环"≠"单流"。
-    通用教训:伸手要并发之前,先看下层是不是已经并行了。
-
-  ■ 集群现状(可直接接手)
-    5 EN + 3 PS + 1 etcd + 1 manager @ e67b5c7,wire 30,8 台 storage 节点。
-    fs presplit 24 lanes/6 分区;mem 已切。principal fs/kvc/mem 重建,Secret 已更新。
-    fs/models/{dsv4-flash,minimax-m25} 已就位;fs/docs/buda 17 篇语料已回位(sha256 校验)。
-    memory-mcp 在线服务。dl-dsv4-cj4dc pod 仍握着 285.7GiB 本地副本(待全量 size 校验后释放)。
-
-  ■ 未做
-    FreeToken 本身未部署(镜像刚就绪)。hermes-autumn / vllm-autumn 仍是 wire 29,
-    要用需按同样方式(AUTUMN_IMAGE 指向带源码的 tag)重建。
-
-【2026-09-02 未完成:EC 4+1 子范围重建的零冗余(已定位,未修)】
-  症状: >=64 KiB 的读在负载下随机失败 —— `ec_reconstruct_shard_subrange: only S/4 shards
-  available (missing=N, ...)`。**missing=N 是分片索引不是数量**。空载复现不出来(20/20 通过)。
-  机制: 重建时代码跳过缺失分片自己的节点(client.rs:4941-4944),于是 4+1 变成"剩下 4 个必须
-  全部在 ~3.03s 内应答"——零冗余。而很多时候那个分片只是被 Suspected 跳过
-  (client.rs:4784-4791),节点根本没被问过。哪些偏移会触发是确定的(静态 offset->shard 映射),
-  会不会失败是负载相关的。283 GiB 读密集的权重数据坐在这个结构上。
-
-  加固方案(subagent 给出,按最小优先) —— **R1/R2/R3/R4(a)(b) 已实施并推送,R4(c) 有意未做**:
-  R1 重建时把缺失分片的节点也加入并行竞速 —— 4-of-4 恢复成 4-of-5,拿回数据本有的那格冗余。
-     并行发出,零墙钟成本,只多一个 128KiB RPC。~10 行,不引入重试语义。
-     **动手前要核实的前提**: "缺失分片直接返回其字节"只在它是数据分片(非校验分片)时成立。
-  R2 把 shortfall 变成类型化 sentinel,接入已有的 EversionStale 2 次尝试循环
-     (client.rs:3832-3842)。**仅当 success == K-1**(只差一个 peer)才重试;带 jitter;
-     必须先 invalidate + 重取 ExtentInfo,否则是拿旧状态问同一个错节点。
-  R3 认 CODE_PAYLOAD_NOT_HERE 为类型化信号(extent_node.rs:2503-2510 的契约),走同一条自愈路径。
-  R4 **保持响亮**(这条让 R1-R3 安全): 降级读要 WARN(4826-4839 现在完全静默);
-     shortfall 消息带 extent_id + 各 peer 的错误;PS 的 map_storage_error 用 {e:#}
-     (rpc_handlers.rs:42,现在只送最外层 Display);**反复失败的分片走 corrupt-replica 通道
-     上报,让 manager 重建它** —— 否则重试只是把响亮的失败变成缓慢的失败,而 M=1 时
-     下一次失败就是数据不可用。
-  重试禁止事项: 只重试一次;success<=K-2 不重试;不复用陈旧状态;不接受短读(部分字节进 RS
-  是静默损坏);不重试确定性拒绝;不复活 ec_read_full_and_slice(4813-4819 故意移除的);不静默成功。
-
+（以下三条是 2026-08-30 那轮 chaos soak 与后续会话留下的自省/否决记录，与当次任务状态无关，
+  单独保留是因为它们讲的是**方法**，不是某个已完成的改动。）
 【本人两次仪器错误,同一形状,记以自省】
   1. 用 `ops history` 证伪 EC 假设 —— auto-policy 的 EC 转换绕过 op ledger,该工具对它天然失明。
      **空结果来自看不见目标的仪器,和阴性结果长得一模一样。** 被 subagent 顶回来,它是对的。
@@ -709,28 +264,8 @@ Next steps: 无。
   不是客户端推断；manager 侧的 corrupt-slot 位图和 gate 旁路本来就是 slot 泛型的，
   等那个存在时只需给上报入口加一个 EC 感知的变体。
 
-【2026-09-02 EC 转换参与者不落盘封存状态：已修】
-  实机发现：一个封存在 17 GiB 的 EC extent，5 个持有者里只有协调者的 `.meta` 是
-  sealed=1/eversion=2，另外 4 个全是 sealed=0/sealed_length=0/eversion=1，而分片文件
-  完全正确。staging 故意不写 `.meta`（废弃的 CoW 尝试只该值几个待删文件，且此时
-  new_eversion 还是投机值），所以布局翻转才是持有者第一次能durable地知道封存 ——
-  而 `apply_placements` 在那里只写了 payload_location。这不是"懒加载"而是**治不好**：
-  所有自愈路径都汇进 `apply_extent_meta_durable`，它会去开 `.dat` 做预写 fsync，而
-  清理已经把 `.dat` 删了、`extent_file` 对纯分片条目又故意不创建，于是自愈器永久报错，
-  re_avali 返回 CODE_ERROR 而不是文档承诺的自动痊愈。同一节点经**恢复**路径到达同一
-  状态就会写对全套 —— 这个不对称是它是缺陷而非设计的判据。修复带 needs_seal_heal，
-  已部署的集群下一次 reconcile 会自愈。回归测试消融跑复现线上确切形态。
-
-【2026-09-02 memory-mcp 加 HTTP MCP 传输】
-  stdio MCP server 必须由客户端 spawn，等于每个消费者都要这个二进制、它的 autumn 凭据
-  和生命周期 —— 对一个想指向"自己不拥有的检索"的 web UI 是错误的耦合。`POST /mcp`
-  用同一套 dispatch（stdio 循环里那段 inline match 被抽走共用，不是复制一份），所以两个
-  传输在"提供哪些工具"上不可能漂移。buda 的 webui 因此不带 autumn 客户端、不受 WIRE
-  锁步约束。
-
-【2026-09-02 --direct-read 的测量已作废，需重测】
-  在 a83a1be（EC 尚不支持直读）上实测 autumn-fuse：direct-read=false 76 MiB/s，
-  true 22 MiB/s，慢 3.5 倍。机制查实为**丢掉批量**而非多一个 RTT：`get_redirect_many`
-  只要批中有一个 EC extent 就整批以 FailedPrecondition 退回，客户端转入逐项代理。
-  但 `1de0005 feat(ec): serve direct reads from EC extents` 之后这个前提已不成立，
-  **该数字对新代码无效，必须重测**。
+【2026-09-03 --direct-read 已重测（早先那批数字曾被判作废）】
+  作废的是 a83a1be（EC 尚不支持直读）上的数字：false 76 MiB/s vs true 22，慢 3.5 倍。
+  `1de0005 feat(ec): serve direct reads from EC extents` 之后前提已不成立。重测（同集群、
+  3 块真盘、EC 2+1、同一个 4 GiB 文件）：**direct-read=true 现在更快**——
+  autumnfs CLI 1552~2053 vs false 769；fuse mount 936 vs false 498。默认开着是对的。
