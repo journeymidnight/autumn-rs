@@ -2124,7 +2124,48 @@ impl crate::AutumnManager {
 
         let rpc_ok = match result {
             Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
-                Ok(r) if r.code == CODE_OK => true,
+                Ok(r) if r.code == CODE_OK => {
+                    // CODE_OK is "accepted", so count the ACCEPT, and read the
+                    // message: the coordinator puts its previous attempt's
+                    // failure there because there is nowhere else for it to go
+                    // (the conversion runs in the background, long after this
+                    // response). Without both halves the ledger shows attempts=0
+                    // and no error for a conversion that has been failing for an
+                    // hour, and the extent's GC is blocked the whole time.
+                    let (now_s, now_ms) = Self::now_s_ms();
+                    // A FRESH accept means a conversion actually started; the
+                    // coordinator says "already running" when this re-send hit
+                    // one it is still working on. Only the former is an attempt.
+                    let started_new = r.message.starts_with("ec convert accepted");
+                    // The marker may have been drained while this response was in
+                    // flight (up to a minute). Refresh an existing entry, but do
+                    // not resurrect one — a RUNNING entry with no marker behind
+                    // it is never closed, and it makes later force-ec-convert
+                    // calls on this extent attach-dedup into silent no-ops.
+                    let marker_still_held = self.inflight.borrow().contains_key(&extent_id);
+                    {
+                        let mut ops = self.ops.borrow_mut();
+                        let coord = params.target_nodes.first().copied().unwrap_or(0);
+                        ops.note_ec_dispatch(
+                            extent_id,
+                            coord,
+                            started_new,
+                            marker_still_held,
+                            now_s,
+                            now_ms,
+                        );
+                        if let Some(why) = r.message.split_once("failed: ").map(|(_, w)| w) {
+                            // ONE closing paren — the one this message's own
+                            // wrapper added. `trim_end_matches` repeats, and the
+                            // reason itself commonly ends in a paren
+                            // ("(os error 111)"), so it ate the error's last
+                            // character.
+                            let why = why.strip_suffix(')').unwrap_or(why).to_string();
+                            ops.record_ec_failure(extent_id, why);
+                        }
+                    }
+                    true
+                }
                 Ok(r) => {
                     tracing::warn!("EC conversion failed for extent {extent_id}: {}", r.message);
                     false

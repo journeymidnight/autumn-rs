@@ -345,6 +345,90 @@ impl OpLedger {
         }
     }
 
+    /// An EC conversion dispatch reached the coordinator: refresh the extent's
+    /// RUNNING entry, and count the attempt only when a NEW conversion actually
+    /// started.
+    ///
+    /// Recovery has counted attempts and carried its last error for a long time;
+    /// EC conversion had neither, so a conversion failing on every try read as
+    /// `attempts=0, last_error=""` — indistinguishable from one that had just
+    /// begun, while the extent's GC stayed blocked behind it.
+    ///
+    /// It is NOT the twin of `note_recovery_dispatch`, and the difference
+    /// matters. Recovery dispatches only when it (re)acquires a marker, so its
+    /// attempts are rebuild starts. The EC loop re-sends every few seconds for
+    /// the whole life of the marker, and the coordinator answers CODE_OK to a
+    /// re-send it is already working on. Counting every response would inflate
+    /// `attempts` by roughly twelve a minute on a perfectly healthy multi-GiB
+    /// conversion — a number that reads as churn when nothing is wrong. So
+    /// `started_new` (a fresh accept, not an "already running") is what counts.
+    ///
+    /// `create` is false when the manager no longer holds this extent's marker.
+    /// The response can arrive up to a minute after the send, and a fence in
+    /// that window closes the entry; recreating it would leave a RUNNING entry
+    /// with no marker behind it and nothing to ever close it — which silently
+    /// turns every later `force-ec-convert` of that extent into a no-op via
+    /// attach-dedup.
+    pub(crate) fn note_ec_dispatch(
+        &mut self,
+        extent_id: u64,
+        coord_node_id: u64,
+        started_new: bool,
+        create: bool,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        let msg = format!("converting on node {coord_node_id}");
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            if started_new {
+                e.attempts = e.attempts.saturating_add(1);
+            }
+            e.message = msg;
+            e.state = OP_STATE_RUNNING;
+            if e.started_at == 0 {
+                e.started_at = now_s;
+            }
+            return;
+        }
+        if !create {
+            return;
+        }
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_EC_CONVERT,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            message: msg,
+            attempts: 1,
+            requested_by: "auto-ec".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        while self.entries.len() > OP_LEDGER_CAP {
+            self.entries.pop_back();
+        }
+    }
+
+    /// The coordinator reported that its LAST conversion attempt failed.
+    ///
+    /// The entry stays RUNNING — the dispatch loop never gives up — but it now
+    /// carries the reason, so `ops status` shows why an extent has been
+    /// converting for an hour instead of leaving the only record in one EN's
+    /// log. Symmetric with `record_recovery_failure`, except the reason arrives
+    /// on the NEXT dispatch's response rather than from a failed dispatch: the
+    /// conversion runs in the background after a CODE_OK accept.
+    pub(crate) fn record_ec_failure(&mut self, extent_id: u64, reason: String) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.error = reason;
+        }
+    }
+
     /// A recovery dispatch attempt FAILED. The entry stays RUNNING (the loop
     /// retries with exponential backoff — it never gives up), carrying the last
     /// reason + code + the consecutive-failure count, so `ops status` shows
@@ -821,6 +905,74 @@ mod tests {
         let r = q_one(&led, id2);
         assert_eq!(r.state, OP_STATE_FAILED);
         assert_eq!(r.error, "abandoned");
+    }
+
+    /// EC conversion must track what recovery tracks. A conversion failing on
+    /// every attempt used to read as attempts=0 with no error, which is
+    /// indistinguishable from one that just started — while the extent's GC
+    /// stayed blocked behind it.
+    #[test]
+    fn ec_dispatch_counts_accepts_and_keeps_the_coordinators_reason() {
+        let mut led = OpLedger::default();
+
+        led.note_ec_dispatch(12, 7, true, true, 100, 100_000);
+        let recs = led.query(&OpQueryReq::default());
+        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
+        assert_eq!(r.kind, OP_KIND_EC_CONVERT);
+        assert_eq!(r.attempts, 1);
+        assert_eq!(r.state, OP_STATE_RUNNING);
+
+        // Re-dispatches accumulate on ONE entry rather than spawning one each.
+        for t in 1..9 {
+            led.note_ec_dispatch(12, 7, true, true, 100 + t, 100_000 + t * 1000);
+        }
+        let recs = led.query(&OpQueryReq::default());
+        let ec: Vec<_> = recs.iter().filter(|r| r.secondary_id == 12).collect();
+        assert_eq!(ec.len(), 1, "one entry per extent, not one per try");
+        assert_eq!(ec[0].attempts, 9);
+
+        // A re-send the coordinator answers with "already running" is a manager
+        // ping, not a try. Counting it would inflate a healthy multi-GiB
+        // conversion by roughly twelve a minute and read as churn.
+        for t in 9..20 {
+            led.note_ec_dispatch(12, 7, false, true, 100 + t, 100_000 + t * 1000);
+        }
+        let recs = led.query(&OpQueryReq::default());
+        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
+        assert_eq!(r.attempts, 9, "pings must not count as attempts");
+
+        // The coordinator's reason lands on that entry, and the op stays RUNNING
+        // because the dispatch loop never gives up.
+        led.record_ec_failure(12, "WriteShard to 127.0.0.1:15009 shard 1: refused".into());
+        let recs = led.query(&OpQueryReq::default());
+        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
+        assert!(r.error.contains("WriteShard"), "error was {:?}", r.error);
+        assert_eq!(r.state, OP_STATE_RUNNING);
+        assert_eq!(r.attempts, 9, "recording a failure must not reset the count");
+    }
+
+    /// A dispatch response can arrive a minute after the send, and a fence in
+    /// that window closes the entry. Recreating it then would leave a RUNNING
+    /// entry with no marker behind it — and nothing ever closes those, so every
+    /// later force-ec-convert of the extent attach-dedups into a silent no-op.
+    #[test]
+    fn a_response_arriving_after_the_marker_is_gone_creates_no_phantom_entry() {
+        let mut led = OpLedger::default();
+        led.note_ec_dispatch(31, 4, true, /*create=*/ false, 100, 100_000);
+        assert!(
+            led.query(&OpQueryReq::default())
+                .iter()
+                .all(|r| r.secondary_id != 31),
+            "no entry may be resurrected once the marker is gone"
+        );
+
+        // With the marker still held it does create, and a later marker-less
+        // response still refreshes that live entry.
+        led.note_ec_dispatch(31, 4, true, true, 101, 101_000);
+        led.note_ec_dispatch(31, 4, true, false, 102, 102_000);
+        let recs = led.query(&OpQueryReq::default());
+        let r = recs.iter().find(|r| r.secondary_id == 31).expect("entry");
+        assert_eq!(r.attempts, 2, "refresh-only still counts a real try");
     }
 
     #[test]

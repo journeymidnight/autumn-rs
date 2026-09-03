@@ -239,13 +239,21 @@
   **chaos 的断言本身误导**：它只查协调者却写着 "nothing is stopping this conversion from
   progressing"。已改成点明它不看参与者、并指向 EN 日志里的 `EC convert failed`。
   查到这一步用掉的时间，一半花在被那句话引开。
-- **Scope（未做）**: 两件事，**观测先于行为**——
-  1. **让失败可见**：协调者的失败必须回到 manager 的 op ledger（`attempts` 递增 + `last_error`），
-     否则运维只能靠 grep 某台 EN 的日志。对齐 memory `feedback_error_event_vs_op_state` 与
-     `project_op_observability_redesign`。注意 EN 的 "already running" 也回 `CODE_OK`，
-     manager 现在无法区分"刚接受"与"正在重试第 9 次"。
-  2. **参与者不可达时怎么办**：重新选目标、还是把 op 判为失败并释放 marker（现在是无限重试且
-     GC 一直被挡）。这一步要先想清楚 2PC 的安全性，别在 revert-prone 区凭推断动刀。
+- **① 观测：已做 (2026-09-03)**。EN 记住每个 extent 上次转换失败的原因，并在下一次 `CODE_OK`
+  的**消息**里带回（响应本来就有 message 字段，不动 wire）；op_ledger 补 `note_ec_dispatch` /
+  `record_ec_failure`；dispatch 的 `CODE_OK` 分支同时记 attempt 与带回的原因。
+  **端到端实测**：marker 从 `attempts=0 last_error=""` 变成
+  `attempts=9 last_error="WriteShard to 127.0.0.1:32463 shard 1 @ 0: Connection refused (os error 111)"`。
+  评审改掉两处我做错的：**(a)** attempts 原本数的是 manager 的 ping（EC 每 5s 重发、"已在跑"
+  也回 CODE_OK）⇒ 一次健康的多 GiB 转换会以每分钟 ~12 虚增；现在只在**新转换真的开始**时计数。
+  **(b)** 响应最长 60s 才回来，期间若 fence 关掉了条目，这个 CODE_OK 会**凭空重建 RUNNING 条目
+  而 marker 已没**，且永不关闭 ⇒ 之后 `force-ec-convert` 全部 attach-dedup 成静默空操作；
+  现在 marker 不在就只刷新不新建。两条都有单测且消融验证。
+  **已知的呈现瑕疵（有意保留）**：`ec_last_error` 只在成功时清除，所以一次健康的长转换期间，
+  ledger 会一直显示上一次的失败原因。改成"开始时清除"会让"在飞时卡死"重新变成瞎子，更糟。
+- **② 行为：仍未做** —— 参与者不可达时该重新选目标、还是把 op 判失败并释放 marker
+  （现在是无限重试且该 extent 的 GC 一直被挡）。要先想清楚 2PC 的安全性，
+  别在 revert-prone 区凭推断动刀。
 - **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
   让它停止派发的（不是"加了重试就好了"）。
 - **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。

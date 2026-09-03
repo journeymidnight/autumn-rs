@@ -1454,6 +1454,15 @@ pub struct ExtentNode {
     /// re-dispatches from its durable marker every ~5 s, so without this guard
     /// each tick would spawn another converter for the same extent.
     ec_convert_inflight: Rc<DashMap<u64, ()>>,
+    /// Why this extent's last EC conversion attempt failed.
+    ///
+    /// The coordinator's failures used to exist only in its own log: the manager
+    /// re-dispatches every few seconds, this node answers CODE_OK because
+    /// CODE_OK means ACCEPTED, and the ledger marker therefore sat at attempts=0
+    /// with no error while a conversion failed forever and the extent's GC
+    /// stayed blocked behind it. Carrying the reason back on the next accept
+    /// costs nothing on the wire — the response already has a message field.
+    ec_last_error: Rc<DashMap<u64, String>>,
     /// Live progress for the extent-scoped ops this node EXECUTES, keyed by
     /// extent_id → `(kind, done, total)`.
     ///
@@ -1548,6 +1557,7 @@ impl Clone for ExtentNode {
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
+            ec_last_error: self.ec_last_error.clone(),
             op_progress: self.op_progress.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
             shard_idx: self.shard_idx,
@@ -3386,6 +3396,7 @@ impl ExtentNode {
             done,
             recovery_inflight: Rc::new(DashMap::new()),
             ec_convert_inflight: Rc::new(DashMap::new()),
+            ec_last_error: Rc::new(DashMap::new()),
             op_progress: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
             shard_idx: config.shard_idx,
@@ -8181,8 +8192,22 @@ impl ExtentNode {
         // The manager re-dispatches from its durable marker every ~5 s; without
         // this guard every tick would spawn another converter for the same
         // extent (they would serialise on the per-extent lock, but pile up).
+        // Both answers below are CODE_OK — "accepted" and "already running" are
+        // equally not-an-error — so the MESSAGE is the only place the manager can
+        // learn that the previous attempt died, and which of the two states this
+        // one is.
+        let prior_failure = self
+            .ec_last_error
+            .get(&req.extent_id)
+            .map(|e| e.value().clone());
         if self.ec_convert_inflight.contains_key(&req.extent_id) {
-            return code_resp(CODE_OK, "ec convert already running".to_string());
+            return code_resp(
+                CODE_OK,
+                match &prior_failure {
+                    Some(why) => format!("ec convert already running (last attempt failed: {why})"),
+                    None => "ec convert already running".to_string(),
+                },
+            );
         }
         self.ec_convert_inflight.insert(req.extent_id, ());
 
@@ -8203,6 +8228,7 @@ impl ExtentNode {
                         new_eversion,
                         attempt_nonce,
                     });
+                    node.ec_last_error.remove(&extent_id);
                     tracing::info!(
                         extent_id,
                         new_eversion,
@@ -8213,6 +8239,7 @@ impl ExtentNode {
                     // No report ⇒ the manager's marker stays ⇒ it re-dispatches
                     // on its next tick. Nothing to roll back here: the 2PC's own
                     // staging/commit markers own crash-safety.
+                    node.ec_last_error.insert(extent_id, msg.clone());
                     tracing::error!(
                         extent_id,
                         "EC convert failed (will be re-dispatched): {msg}"
@@ -8224,7 +8251,13 @@ impl ExtentNode {
         })
         .detach();
 
-        code_resp(CODE_OK, "ec convert accepted".to_string())
+        code_resp(
+            CODE_OK,
+            match prior_failure {
+                Some(why) => format!("ec convert accepted (previous attempt failed: {why})"),
+                None => "ec convert accepted".to_string(),
+            },
+        )
     }
 
     /// The actual EC conversion (prepare + 2PC commit). Runs detached; returns
@@ -8252,13 +8285,15 @@ impl ExtentNode {
         // now uses the shared `extent_op_lock` helper (same
         // map, broadened semantic). handle_re_avali and the
         // delete try-lock route through the same lock.
-        // Stage markers, because the failure mode this path actually exhibits is
-        // neither Ok nor Err: the task stops reporting entirely, and the caller
-        // then answers every manager re-dispatch with "already running" —
-        // CODE_OK — so the manager logs an accept every tick while the marker is
-        // pinned forever with attempts=0 and no error. Without these two lines
-        // there is nothing to say whether it never got the op lock or never got
-        // past the first read. See BUG-EC-CONVERT-STALL-HEALTHY-COORD.
+        // Stage markers: without them there is nothing to say whether an attempt
+        // never got the extent op lock or never got past the first read, and the
+        // difference is a deadlock versus a slow peer.
+        //
+        // They are what ruled out the deadlock theory for
+        // BUG-EC-CONVERT-STALL-HEALTHY-COORD. The stall's signature used to be a
+        // marker pinned with attempts=0 and no error, because the failure only
+        // reached this node's log; it now shows rising attempts and the reason,
+        // which the manager reads off the next dispatch's response message.
         tracing::debug!(extent_id, new_eversion, "ec convert: waiting for the extent op lock");
         let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;

@@ -132,7 +132,11 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   **两处自我纠正**：① "加 RUST_LOG 必现"是两样本外推，实测 8 轮 4 过 4 挂、与 RUST_LOG 无关；
   ② chaos 断言写着"nothing is stopping this conversion"，但它**只查协调者不查参与者** ——
   这句话把我引开了大半程，已改成点明它的盲区并指向 EN 日志。
-  修复未做，Scope 写在账本里（观测先于行为：先让失败回到 op ledger，再谈参与者不可达怎么处理）。
+  **观测那半随后做完并端到端验证**：marker 现在是 `attempts=9 last_error="WriteShard ... refused"`。
+  评审又抓到我两处做错的：attempts 原本数的是 manager 的 ping 而非真实尝试（健康的长转换会虚增
+  每分钟 ~12）；以及响应迟到 60s 时会凭空重建一个没有 marker 的 RUNNING 条目，导致之后
+  force-ec-convert 全部静默空操作。两条都改了、都有消融验证的单测。
+  **行为那半仍未做**（参与者不可达 = 重选目标还是判失败），涉及 2PC 安全性，不凭推断动。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
