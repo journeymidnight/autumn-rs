@@ -257,7 +257,7 @@ Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 （EN 不可达）。若 EN 数据口在 PS-only 子网，用 `--direct-read false` 省掉每 extent 一个
 redirect RTT。落点：`FsState.direct_read` → `ReadPlan.direct_read` → `execute` 选原语。
 
-### 读 I/O 线程池（`read_pool.rs`，`--read-io-threads`，默认 2）
+### 读 I/O 线程池（`read_pool.rs`，`--read-io-threads`，默认 4）
 
 compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程，它发出的句柄全是
 `!Send`。所以这里的"多线程"和仓库里别处一个意思（PS 的 P-log / P-sst 就是这样）：**一组
@@ -287,7 +287,10 @@ compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程�
 - **就绪等待有上限**（`READY_TIMEOUT` 20s）。建池时 fuse session **已经挂载**，请求正在
   桥里排队，所以一个连不上的 worker 会卡住整个挂载点的系统调用；而裸 TCP connect 到黑洞
   manager 只受 SYN 重试约束（分钟级）。放弃一个 worker 只损吞吐，不损正确性。
-- **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。
+- **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。**更大的一项是
+  每线程的注册缓冲池**——`REGPOOL_CAP_BYTES` 是 **per-thread** 上限（默认 512 MiB），规则是
+  `cap × threads < RLIMIT_MEMLOCK`。默认 4 把带池线程从 1 抬到 5，最坏情况下 mount 常驻的
+  缓冲内存跟着抬（TCP 上是普通堆内存，UCX 上是 **pin 住的页**，计入 RLIMIT_MEMLOCK）。
 - ⚠️ **UCX 下未测**。上面全部数字是 loopback TCP。`--transport ucx` 时池子会按线程数多开
   UCX worker，而本仓库记录过 UCX worker 创建走**宿主级 devx 自旋锁**、以及 fuse 在 UCX 上
   的 daemon 崩溃（TCP 不崩）。默认二进制不带 `ucx` feature（`--transport ucx` 直接 panic），
@@ -302,8 +305,8 @@ compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程�
 | `--read-io-threads` | p=1 | p=4 | p=8 |
 |---|---|---|---|
 | 0（旧行为） | 885 / 878 | 2006 / 2066 | 2211 / 2213 |
-| 2（默认） | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
-| 4 | 710 / 739 | 2937 / 2776 | 4763 / 4488 |
+| 2 | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
+| 4（默认） | 710 / 739 | 2937 / 2776 | 4763 / 4488 |
 
 p=8 在 t=4 上到 5186~5396（第二轮实验）= CLI 那 5466 的 95%~99% —— mount 不再是瓶颈。
 p=1 在 700~940 之间来回，跨配置看不出趋势（是噪声，不是回归）—— 单流是**每请求延迟
@@ -460,7 +463,7 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 `autumn-fuse` 参数：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
 `--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
-cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 2；
+cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 4；
 `0` = 全部读留在派发线程，即池子之前的行为）。内核缓存 `attr_timeout` /
 `entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
 

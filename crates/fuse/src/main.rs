@@ -80,9 +80,23 @@ struct Args {
     /// same loopback TCP. Reads split cleanly because `read::prepare` is the
     /// only half that touches filesystem state.
     ///
+    /// Four is where eight concurrent readers stopped being limited by the
+    /// mount: 2211 -> 3705 -> 4763 MiB/s at 0 / 2 / 4 threads, against 5466 for
+    /// eight separate CLI processes on the same files — so 87% of that at four
+    /// threads, and a rerun of the same cell landed 5186-5396 (95-99%). Going
+    /// higher was not measured. Single-stream reads showed no trend across any
+    /// of these settings; a synchronous reader is latency-bound because the
+    /// kernel does not appear to issue concurrent FUSE reads for one, which is
+    /// also why every readahead knob measured flat.
+    ///
+    /// Each thread carries its own registered-buffer pool, capped per thread
+    /// (`REGPOOL_CAP_BYTES`, 512 MiB by default), so raising this raises the
+    /// mount's worst-case retained buffer memory with it — and on UCX those
+    /// pages are pinned and count against RLIMIT_MEMLOCK.
+    ///
     /// `0` keeps every read on the dispatcher (the pre-pool behaviour). Costs
     /// one manager connection and one connection pool per thread.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 4)]
     read_io_threads: usize,
 }
 

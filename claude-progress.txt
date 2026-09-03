@@ -1,6 +1,6 @@
 Date: 2026-09-03
 TaskStatus: completed
-Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 2）—— 把 F-FUSE-READ-GAP 的
+Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
   根因（守护进程单个 compio 线程 CPU 饱和）实际修掉。
 
 【2026-09-03 fuse 读 I/O 线程池：已实现并验收】
@@ -14,7 +14,7 @@ Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 2）—— 
   t=4 达 CLI 5466 的 95%~99%。机制验过：p=8 的 per-thread jiffies 派发线程 435 → 7，
   总量 435/427/412 几乎守恒 —— 同一份活摊开到多核。
   验证：`cargo test -p autumn-fuse --lib` 54 绿（含 4 条 submit 路由单测）、core feature 单独
-  可编、workspace release 绿、`fuse_chaos.sh` 两次 PASS（77/78 文件，默认 2 线程跑过）。
+  可编、workspace release 绿、`fuse_chaos.sh` 三次 PASS（77/78/78 文件；末次跑在默认的 4 线程上，日志确认 `threads=4`）。
   fable 评审：无高危；采纳 4 条 —— ①"丢 job = 内核永久挂"是**夸大**（fuser 0.15.1 的
   `ReplyRaw::Drop` 会答 EIO），注释已改准 ②`ready_rx.await` 无上限而 session 已挂载 ⇒
   连不上的 worker 会卡住整个挂载点的系统调用，加 `READY_TIMEOUT` 20s ③threads=0 还打
@@ -22,6 +22,9 @@ Task scope: fuse 读的 I/O 线程池（`--read-io-threads`，默认 2）—— 
   **未覆盖**：UCX。默认二进制不带 ucx feature，本机只有 lo 有 IPv4（无 RoCE IP）、跨机不可用。
   UCX worker 创建走宿主级 devx 自旋锁 + fuse 在 UCX 上崩过 daemon ⇒ 真跑 UCX mount 要先拿
   `--read-io-threads 0` 对照。
+  默认取 4（用户定）：p=8 3705 → 4763~5396。代价里最大的一项不是连接而是**每线程的注册
+  缓冲池**（`REGPOOL_CAP_BYTES` per-thread 512 MiB，规则 `cap × threads < RLIMIT_MEMLOCK`），
+  容器侧补了 `AUTUMN_FUSE_READ_IO_THREADS` env→flag 翻译，受限 pod 能不换镜像调回 0。
   **F-FUSE-READ-GAP 仍 `passes: false`**：验收线写的是"单流进到 CLI 的 80%"，而单流是每请求
   延迟绑定的（内核对同步读者不并发下发；bdi read_ahead_kb 128→32768 实测完全无效），
   线程池按定义改不了。聚合吞吐已追平 CLI。按规则不改写验收口径，只记状态。

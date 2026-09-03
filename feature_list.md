@@ -106,8 +106,8 @@
   内核回复拷贝、`read::execute` 的每请求粒度（内核按 `max_read` 下发，不是按 extent），
   以及每次 `read` 都重新 `prepare` 一遍 ChunkSpec。**先分段计时再动手**。
 - **Acceptance**: fuse 单流读进到 CLI 的 80% 以内，且 `fuse_chaos.sh` 全绿。
-- **Status**: `passes: false` (2026-09-03) — `fuse_chaos.sh` 全绿（77 文件，默认 2 线程池跑过），
-  但单流那一半到不了，理由见下。
+- **Status**: `passes: false` (2026-09-03) — `fuse_chaos.sh` 全绿（78 文件，跑在默认的 4 线程池上；
+  日志确认 `threads=4`），但单流那一半到不了，理由见下。
 - **进展 (2026-09-03)**: **`fuser` 的 feature 从 `abi-7-12` 提到 `abi-7-28`，读 +81%**
   （交替 A/B：898 → 1621 MiB/s，三对全部同向）。根因：`FUSE_MAX_PAGES` 和 INIT 应答的
   `max_pages` 字段在 fuser 里都在 `#[cfg(feature = "abi-7-28")]` 后面，缺了它内核把**每个**
@@ -149,7 +149,7 @@
 - **不是 TCP**：同一条 loopback、同一集群、同一批文件，CLI 跑到 5466 MiB/s。
 - **⚠️ "守护进程侧预读是唯一杠杆"这条结论作废**：预读省的是延迟，而 4 流以上该线程已经
   CPU 饱和，预读只会让它更忙。
-- **✅ 已做：读 I/O 线程池**（`crates/fuse/src/read_pool.rs`，`--read-io-threads`，默认 2）。
+- **✅ 已做：读 I/O 线程池**（`crates/fuse/src/read_pool.rs`，`--read-io-threads`，默认 4）。
   N 个独立单线程 compio runtime，各自持 `ClusterClient`；`prepare` 仍独占派发线程上的
   `FsState`，只有 `execute` 跨线程（`ReadJob` 天然 Send —— `fuser::ReplyData` 因
   `ReplySender: Send + Sync` 而 Send）。round-robin 派发；派发不出去就把 job 还回来在本地跑。
@@ -157,8 +157,8 @@
   | `--read-io-threads` | p=1 | p=4 | p=8 |
   |---|---|---|---|
   | 0（旧） | 885 / 878 | 2006 / 2066 | 2211 / 2213 |
-  | 2（默认） | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
-  | 4 | 710 / 739 | 2937 / 2776 | **4763 / 4488**（另一轮 5186~5396）|
+  | 2 | 882 / 805 | 2965 / 2445 | 3705 / 3081 |
+  | 4（默认） | 710 / 739 | 2937 / 2776 | **4763 / 4488**（另一轮 5186~5396）|
   机制也验过（p=8 per-thread jiffies）：派发线程 435 → 7，总量 435/427/412 **几乎守恒**
   —— 同一份活摊开到多核，不是加开销侥幸变快。t=4 的 p=8 = CLI 5466 的 95%~99%。
 - **验收状态：`passes: false`，而且这条验收线量的是错的东西**。"80% of CLI 单流" 到不了

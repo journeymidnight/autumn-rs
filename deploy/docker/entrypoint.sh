@@ -412,6 +412,11 @@ run_fuse() {
     [[ -n "${AUTUMN_FUSE_DIRECT_READ:-}" ]] \
         && args+=(--direct-read "$AUTUMN_FUSE_DIRECT_READ")
     [[ "${AUTUMN_FUSE_ALLOW_OTHER:-0}" == "1" ]] && args+=(--allow-other)
+    # Read I/O threads (binary default 4). Each carries its own client and its own
+    # registered-buffer pool, so a memory- or connection-constrained pod wants a
+    # way down to 0 (every read back on the dispatcher) without a new image.
+    [[ -n "${AUTUMN_FUSE_READ_IO_THREADS:-}" ]] \
+        && args+=(--read-io-threads "$AUTUMN_FUSE_READ_IO_THREADS")
 
     log "exec autumn-fuse ${args[*]}"
     exec autumn-fuse "${args[@]}"
