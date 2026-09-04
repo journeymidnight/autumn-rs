@@ -6435,6 +6435,40 @@ impl ExtentNode {
         })
     }
 
+/// How many bytes one EC shard read should ask for.
+///
+/// `0` means "read to end" and takes `copy_bytes_from_source`'s SINGLE-shot
+/// branch — one request for the whole shard. That is what this path used to
+/// pass, on the stated assumption that a shard is "well under the chunking
+/// threshold". It is not: a shard is `ceil(sealed_length / K)`, so a full
+/// 17 GiB extent at K=4 gives ~4 GiB against a `FILE_IO_CHUNK_BYTES` of
+/// 256 MiB.
+///
+/// On the live cluster every peer read FAILED — deterministically, in under a
+/// second, on four extents, with the shards present, the layout correct and
+/// every peer reachable. Sub-second rules OUT the 30 s per-request timeout,
+/// which is what the size first suggested. The likely mechanism is the frame
+/// encoder's unguarded `payload_len as u32`: that shard is 4,294,996,716
+/// bytes = `u32::MAX + 29,421`, so the length wraps to ~29 KB, the peer ships
+/// a header that disagrees with the body, and the reader fails the CRC at
+/// once. Both mechanisms are cured the same way, and neither can be confirmed
+/// from the error this path used to produce.
+///
+/// Returning the exact length puts the read on the chunking loop, where every
+/// request is <= `FILE_IO_CHUNK_BYTES` — far from the u32 edge and inside the
+/// timeout budget. It MUST equal `erasure::shard_size` — the length the
+/// encoder actually wrote, padding included — or the reader and writer
+/// disagree about shard geometry.
+pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
+    if sealed_length == 0 || data_shards == 0 {
+        // Unreachable in production — convert refuses an unsealed extent and
+        // the manager only ever sets `ec_converted` with K >= 1 — so this is
+        // the caller's cue to fail loudly, not a shape to read to end.
+        return 0;
+    }
+    crate::erasure::shard_size(sealed_length as usize, data_shards) as u64
+}
+
     /// For an EC extent: copy one shard from each of the `data_shards` healthy peers,
     /// then reconstruct the shard that belongs to the recovering node's slot.
     async fn run_ec_recovery_payload(
@@ -6475,6 +6509,21 @@ impl ExtentNode {
         // Per-peer failure reasons, folded into the final error.
         let mut why: Vec<String> = Vec::new();
 
+        // Exact shard length, and the reader's expectation of every peer.
+        // `0` cannot happen for a converted extent (convert refuses an
+        // unsealed one, and the manager sets `ec_converted` only with K >= 1),
+        // so it means the manager's record and this extent disagree — fail
+        // loudly rather than fall back to an unbounded read with no length to
+        // check the answer against.
+        let want = Self::ec_shard_read_len(extent_info.sealed_length, data_shards);
+        if want == 0 {
+            return Err(format!(
+                "EC recovery: extent {} is ec_converted with sealed_length={} and K={} \
+                 — manager state inconsistent",
+                task.extent_id, extent_info.sealed_length, data_shards
+            ));
+        }
+
         for (i, &node_id) in all_node_ids.iter().enumerate() {
             if i == replacing_index {
                 // This is the missing shard slot — leave as None.
@@ -6489,9 +6538,10 @@ impl ExtentNode {
                 continue;
             };
             // EC shard read — each peer holds a shard of size
-            // ~sealed_length/K (well under the chunking threshold), so
-            // keep the legacy to-end single read (total_len=0). Only the
-            // replicated full-extent fetch needed chunking.
+            // The read is CHUNKED, by exact shard length. It used to pass
+            // total_len=0 (read-to-end) because a shard was assumed "well
+            // under the chunking threshold"; a shard is ceil(sealed_length/K),
+            // which on a full extent is gigabytes.
             //
             // Peer `i` is asked for shard `i` BY NAME. Before the payload file
             // was named, this asked each peer for "the extent" and relied on
@@ -6503,21 +6553,27 @@ impl ExtentNode {
                 addr,
                 task.extent_id,
                 extent_info.eversion,
-                0,
+                want,
                 PayloadRef::for_extent(extent_info.payload_location, i as u32),
             )
             .await
             {
                 Ok(shard_bytes) => {
-                    // Trim to sealed length if the extent is sealed.
-                    let shard = if extent_info.sealed_length > 0
-                        && shard_bytes.len() > extent_info.sealed_length as usize
-                    {
-                        shard_bytes[..extent_info.sealed_length as usize].to_vec()
-                    } else {
-                        shard_bytes
-                    };
-                    shards[i] = Some(shard);
+                    // EXACT length, not a trim. The old trim (to sealed_length)
+                    // was dead — a shard is ceil(L/K) <= L — and the read path
+                    // answers a short read with CODE_OK: `copy_bytes_from_source`
+                    // stops at the short chunk and returns Ok(partial). K shards
+                    // short by the SAME amount then reconstruct happily, and a
+                    // silently truncated shard is written back as authoritative.
+                    // The RS decoder only catches shards of DIFFERING length.
+                    if shard_bytes.len() as u64 != want {
+                        why.push(format!(
+                            "shard {i} (node {node_id} at {addr}): got {} of {want} bytes",
+                            shard_bytes.len()
+                        ));
+                        continue;
+                    }
+                    shards[i] = Some(shard_bytes);
                     collected += 1;
                     if collected >= data_shards {
                         break; // Enough shards to reconstruct.
@@ -6538,15 +6594,13 @@ impl ExtentNode {
         }
 
         if collected < data_shards {
-            // The per-shard size is in the message because the read is a
-            // SINGLE unchunked request (`total_len = 0`) on the assumption that
-            // a shard is "well under the chunking threshold" — which is
-            // sealed_length / K, and on a full 17 GiB extent that is ~4.3 GiB
-            // against a FILE_IO_CHUNK_BYTES of 256 MiB.
-            let per_shard = extent_info.sealed_length / data_shards.max(1) as u64;
+            // The per-shard size is in the message because shard geometry is
+            // what made this fail: the read is chunked BY that length, and a
+            // peer disagreeing about it is now reported per peer above.
+            let per_shard = want;
             return Err(format!(
                 "EC recovery: only {collected}/{data_shards} shards available for extent {} \
-                 (per-shard ~{:.2} GiB, single unchunked read): {}",
+                 (per-shard ~{:.2} GiB): {}",
                 task.extent_id,
                 per_shard as f64 / (1u64 << 30) as f64,
                 if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
@@ -11931,5 +11985,75 @@ mod recovery_idempotence_tests {
             "with the manager unreachable the completeness of the local copy is UNKNOWN — \
              it must be refused, never reset"
         );
+    }
+}
+
+#[cfg(test)]
+mod ec_shard_read_len_tests {
+    use super::{ExtentNode, FILE_IO_CHUNK_BYTES};
+
+    /// The bug this fixes. A `0` here takes `copy_bytes_from_source`'s
+    /// single-shot branch — one request for the whole shard, against a 30 s
+    /// timeout whose own comment sizes it for a 256 MiB chunk. On the live
+    /// cluster that was a 4 GiB shard: every peer timed out, the rebuild
+    /// reported `0/4 shards available`, and EC recovery could not repair a
+    /// large extent at all.
+    #[test]
+    fn a_large_shard_is_read_in_chunks_not_in_one_request() {
+        // A full extent: 17 GiB sealed, 4+1.
+        let sealed = 17_179_986_864u64;
+        let len = ExtentNode::ec_shard_read_len(sealed, 4);
+        assert_ne!(
+            len, 0,
+            "0 means read-to-end, which is the single unbounded request that timed out"
+        );
+        assert!(
+            len > FILE_IO_CHUNK_BYTES as u64,
+            "the premise: this shard is {len} bytes, past the {FILE_IO_CHUNK_BYTES}-byte \
+             chunk size, so it MUST go through the chunking loop"
+        );
+        let requests = len.div_ceil(FILE_IO_CHUNK_BYTES as u64);
+        assert!(
+            requests >= 16,
+            "expected the read to be split into many bounded requests, got {requests}"
+        );
+    }
+
+    /// Anchored on the ENCODER, not on the function under test. Asserting
+    /// `ec_shard_read_len == shard_size` was tautological: the fn is one line
+    /// calling `shard_size`, so any change breaking both together still
+    /// passed. This runs a real encode and pins the read length to the length
+    /// of the bytes that come out — padded last data shard and parity
+    /// included. If the two ever drift, K shards short by the same amount
+    /// reconstruct without complaint and a truncated shard is written back as
+    /// authoritative.
+    #[test]
+    fn the_read_length_is_exactly_what_the_encoder_emits() {
+        for k in [2usize, 3, 4] {
+            for len in [1usize, k - 1, k + 1, 1000, (64 << 20) + 3] {
+                let payload = vec![0xA5u8; len];
+                let shards = crate::erasure::ec_encode(&payload, k, 1)
+                    .unwrap_or_else(|e| panic!("encode k={k} len={len}: {e}"));
+                let want = ExtentNode::ec_shard_read_len(len as u64, k);
+                for (i, sh) in shards.iter().enumerate() {
+                    assert_eq!(
+                        sh.len() as u64,
+                        want,
+                        "k={k} len={len} shard {i}: encoder wrote {} bytes, reader asks for {want}",
+                        sh.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `0` is the "manager state is inconsistent" signal, not a read shape:
+    /// convert refuses an unsealed extent and `ec_converted` is only set with
+    /// K >= 1, so neither input is reachable. The caller turns it into a loud
+    /// error rather than an unbounded read with nothing to check the answer against.
+    #[test]
+    fn an_impossible_geometry_yields_the_zero_sentinel() {
+        assert_eq!(ExtentNode::ec_shard_read_len(0, 4), 0);
+        assert_eq!(ExtentNode::ec_shard_read_len(1000, 0), 0);
     }
 }
