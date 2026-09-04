@@ -48,7 +48,23 @@
   `BATCH_PUT_DEFAULT_CONCURRENCY = 32`（`crates/client/src/lib.rs:639`），memory-mcp 与
   autumn-memory 里**没有任何** env/flag 能改它（已全量 grep）。所以那一行要么是改了常量重编，
   要么当时旋的是别的东西。重测前先确认旋钮真的接到了扇出宽度上。
-- **Status**: `passes: false` (2026-09-02；2026-09-04 补机制假说) —— 仍只立账，不阻塞任何东西：
+- **2026-09-04 机制已实测确认，上面那条假说对了一半**：串行点确实在"单分区单连接"上，
+  但真正的上限是那条连接的**在飞数**，而不是连接数本身：
+  `ps_conn_inflight_cap`(默认 **4**) ÷ WAL append **1.39 ms** = **2,878 ops/s**，
+  实测 2,722（109,086 key / 40.07 s），吻合 95%。
+  **那 1.39 ms 的 ~95% 是跨 AZ 复制，不是磁盘**：日志流三副本分处 cn-beijing-b/d/e，
+  而 `apply_completion` 要求**每个副本都 ack、没有 quorum**⇒ 延迟 = max-of-3 次往返。
+  同 AZ RTT 23 µs，跨 AZ 388–399 µs（17 倍，两组独立数据）。EN 侧 pwrite+fsync 实测
+  0.059–0.062 ms，只占 4% —— 也就是说本条最初"已排除磁盘"是**对的**，错的是由此推出的
+  "往上层找"：写路径受**复制网络**约束，不在 SDK 里。
+  副本放置是 `crates/manager/src/lib.rs:3775` 的 `pool.shuffle(&mut rng).take(count)`，
+  **manager 全无 zone/rack 概念**（已 grep），所以三区分布是随机抽样结果，不是持久性设计。
+  ⇒ **两条可动的杠杆**：(a) `ps_conn_inflight_cap` 4→32 —— `AUTUMN_PS_CONN_INFLIGHT_CAP`
+  已在 `deploy/docker/entrypoint.sh` 的 `PS_TUNABLES` 表里，**不用改代码也不用换镜像**，
+  加环境变量 + 重启 PS 即可；预期**超线性**（EN 现在批大小≈1，每个 append 单独 fsync，
+  提高在飞数才让 group commit 生效，且 EN 只有 39% 忙）。(b) 把存储收进单个 AZ，
+  1.39 ms → ~0.11 ms。**上一条假说里"先测跨页流水"的建议已被取代** —— 串行点找到了。
+- **Status**: `passes: false` (2026-09-02；2026-09-04 补机制假说；2026-09-04 机制已实测) —— 仍只立账，不阻塞任何东西：
   需要吞吐的消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
   **本轮没有测量**：验收后半（"改动后吞吐提升可复现"）是延迟敏感的，而本机当时有 2600 个
   sglang/ray 进程、load 8+、热核散布在高低两段，按 `feedback_perf_check_cpu_gate` 隔离不出
@@ -72,25 +88,23 @@
 - **Acceptance**: a fresh deploy with no `AUTUMN_EXTENT_SHARDS` set brings up one shard per core, `format` registers the matching ports, the Service exposes them, and the manager routes to all shards; the manual env still overrides.
 - **Status**: `passes: false` (2026-07-13) — recorded for later per user. Deploy/format-layer change (entrypoint + format + overlay), NOT an EN-process change; the coupling chain above is the reason it's "manual by design" today, not a bug.
 
-### F-FT-DSV4-KV-SCOPE — DeepSeek-V4 在 FreeToken 上要不要接 autumn KV
-- **Trigger** (2026-09-01, 用户问"FreeToken 现在的 hicache 支持 DSV4 了吗"后核实上游):
-  **FreeToken 至今没有任何 HiCache**。上游 `a2538a4`(2026-09-01，仅落后本地 2 个无关 commit)
-  全树搜 `HiCache` 只命中 `kvcache/base.py:197` 那行 `# TODO: support HiCache`；
-  `hicache`/`HiCacheStorage`/`host_pool`/`L3`/`storage_backend` 全部 0 命中，
-  `kvcache/` 目录里没有任何分层缓存文件。
-- **所以 DSV4 的 KV 现状**: 能工作，但**纯显存**（`dsv4_paged_pool.py` 614 行 +
-  `swa_radix_cache.py`，四组 buffer: window/cmp/idx/state_ring）。autumn 接不进去不是
-  因为不兼容，而是**没有可接的地方**。
-- **完整代价（若要接）**: 把 sglang 的 unified 分层缓存移植进一个**完全没有分层缓存**的引擎，
-  并为 DSV4 那四组 buffer 写 sidecar 映射 + autumn 侧 v2（已完成，efeea3c）。
-  这是 FreeToken 侧的活，远大于最初估的"移植 HiRadixCache 1427 行"。
-- **便宜的替代**: DSV4 就用 FreeToken 自带的显存 KV，不接 autumn；autumn 的 v2 留给
-  **真正的 sglang** 用（它已经在调 v2）。单副本部署下损失有限 —— L3 的主要价值是
-  **跨副本**前缀复用，而当前规划就是 1 副本。
-- **Acceptance**: 明确记录选哪条；若选替代方案，FreeToken 的 `--cache-type` 保持默认
-  （DSV4 会被强制成 swa_radix），不做 HiCache 移植，autumn v2 的验证改用真 sglang。
-- **Status**: `passes: false` (2026-09-01) — 待用户定夺。**注意**: 本条的前身结论
-  （"sglang 上游没有 SWA+HiCache，那一档是原创设计"）是错的——那个判断出自一个落后上游
-  6232 个 commit 的 sglang 克隆，上游实际有 `UnifiedRadixCache`(3120 行) + `unified_cache/`
-  子包，HiRadixCache 已是死代码。真实约束是 DSV4 需要 sidecar 池 ⇒ v2 接口，而非上游未解。
-  移植工作本体已随 da91d38 移到 ../buda，本条只留"autumn 这边要不要为它做事"的取舍。
+### BUG-KVC-POOLNAME-STR — `str(PoolName.KV)` 在 py≥3.11 得到 `'PoolName.KV'` 而非 `'kv'`
+- **Trigger** (2026-09-04, fable 评审 L3 接口解析改动时顺带发现，**在本次改动之外**):
+  `PoolName` 是 `(str, Enum)`。py≤3.10 的 `str()` 返回值 `'kv'`，**py≥3.11 返回限定名
+  `'PoolName.KV'`**（`enum` 的 `__str__` 在 3.11 改过）。`sglang_backend.py` 有三处
+  假设了前者：~398 的注释（"the KV pool's segment is 'kv', which is what
+  `PoolName.KV` stringifies to"）、413 的 `str(pool_name) == DEFAULT_POOL_NAME`
+  比较、447 的 `hit_count = {str(PoolName.KV): kv_pages}` 键名。评审在 3.9.6 与 3.13.8
+  两个版本上实测确认。
+- **影响范围（未查证的那半）**: FreeToken 侧传的是普通字符串（`"dsv4_full"`/`"dsv4_window"`）
+  且只读 `kv_hit_pages`，**不受影响**。sglang 侧是否会把 enum 成员送进 `transfer.name`
+  **未查证** —— 评审只能确认 controller 是从上游调用者转发 `transfer.name` 的。若会，
+  后果是 v2 的 KV key 落到 `"PoolName.KV"` 这个段下（与 v1 不再字节一致，跨版本读不到），
+  且 `batch_exists_v2` 的结果字典键名对不上。
+- **Scope**: 三处统一改成取 `.value`（或 `PoolName.KV.value`），并加一条断言/单测把
+  "v2 的 KV 段必须与 v1 字节一致"钉住 —— 那是 v2 设计时明确写下的性质
+  （"v2 keys for the KV pool are byte-identical to v1's — this is additive, not a migration"）。
+- **Acceptance**: 先查证 sglang 是否真的传 enum 成员（传字符串则本条降级为整洁性修补）；
+  修后在 py≥3.11 上 v1/v2 的 KV key 逐字节相同。
+- **Status**: `passes: false` (2026-09-04) — 既有缺陷，非本轮引入；当前唯一的消费者
+  （FreeToken）不触发，故不阻塞 L3 上线。

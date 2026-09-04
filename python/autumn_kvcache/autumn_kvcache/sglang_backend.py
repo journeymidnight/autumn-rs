@@ -18,7 +18,9 @@ partition layer's memtable + block cache serves as the implicit DRAM tier.
 
 from __future__ import annotations
 
+import importlib
 import logging
+import sys
 from typing import List, Optional
 
 import autumn
@@ -27,38 +29,102 @@ from ._bridge import run, run_on, new_loop
 from ._identity import fingerprint_from_sources, read_credential_pair as _read_credential_pair
 from ._keys import build_tenant_suffix, full_key, pool_prefix
 
-try:
-    from sglang.srt.mem_cache.hicache_storage import (
-        HiCacheStorage,
-        HiCacheStorageConfig,
-    )
+# The interface this adapter implements is sglang's, but sglang is not the only
+# engine that carries it: an engine may vendor the same module rather than
+# depend on the whole runtime. FreeToken does exactly that — its only sglang
+# requirement is `sglang-kernel` (which imports as `sgl_kernel`), so
+# `sglang.srt.…` is absent there while `freetoken.kvcache.hicache.storage`
+# holds the same symbols.
+#
+# Trying the vendored module second matters more than it looks. Without it the
+# import below merely falls through to `object`, which is silent: the class
+# still constructs, and the first v2 call fails with AttributeError on
+# `register_mem_host_pool_v2` — inside an engine that treats a failed tier as
+# "no tier". The result is a KV cache that is configured, reports no error, and
+# stores nothing.
+_IFACE_MODULES = (
+    "sglang.srt.mem_cache.hicache_storage",
+    "freetoken.kvcache.hicache.storage",
+)
 
+
+def _iface_candidates():
+    """Interface modules to try, the host's own first.
+
+    Already-imported beats installed. Every host imports its interface before it
+    asks for a backend — sglang's `backend_factory` imports `hicache_storage` at
+    module top, FreeToken's `attach` does `from .storage import
+    HiCacheStorageConfig` before `import_module`ing this one — so what is in
+    `sys.modules` names the HOST, while a fresh import in tuple order names only
+    what happens to be installed.
+
+    The difference bites in an image carrying both (a FreeToken image that also
+    has sglang pulled in by something else). Both factories gate on
+    `issubclass(backend_class, HiCacheStorage)` against their OWN class, so
+    binding the wrong one is rejected by the host — as the same silent "no L3"
+    this whole block exists to prevent.
+    """
+    out = []
+    for mod_name in _IFACE_MODULES:
+        mod = sys.modules.get(mod_name)
+        # A `None` entry is the import system's "this failed"; treat it as absent.
+        if mod is not None and mod not in out:
+            out.append(mod)
+    for mod_name in _IFACE_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001
+            # Broad, not just ImportError: a present-but-broken engine stack can
+            # raise at import (e.g. flashinfer version-check RuntimeError) and
+            # must not crash the adapter — the data-plane smoke test imports
+            # this with no model stack at all.
+            continue
+        if mod not in out:
+            out.append(mod)
+    return out
+
+
+def _names(mod, names):
+    """Every `names` symbol from `mod`, or None if it does not carry them all."""
+    try:
+        return tuple(getattr(mod, n) for n in names)
+    except AttributeError:
+        return None
+
+
+# ONE module supplies both halves. Taking v1 from one and v2 from another would
+# build a class whose base is one engine's ABC while its pool types are
+# another's — a combination no host produces, and one that would pass the
+# adapter's own tests while failing a host factory's issubclass gate.
+_iface = None
+_v1 = None
+for _cand in _iface_candidates():
+    _v1 = _names(_cand, ("HiCacheStorage", "HiCacheStorageConfig"))
+    if _v1 is not None:
+        _iface = _cand
+        break
+
+if _v1 is not None:
+    HiCacheStorage, HiCacheStorageConfig = _v1
     _SGLANG_AVAILABLE = True
-except Exception:  # noqa: BLE001
-    # Fall back to `object` so the module is importable without sglang
-    # installed (smoke tests + standalone usage). Catch broad Exception, not
-    # just ImportError: a present-but-broken sglang stack can raise at import
-    # (e.g. flashinfer version-check RuntimeError) and must not crash the
-    # adapter — the data-plane smoke test imports this without a model stack.
+else:
+    # Fall back to `object` so the module is importable with no engine at all
+    # (smoke tests + standalone usage).
     HiCacheStorage = object  # type: ignore[misc,assignment]
     HiCacheStorageConfig = None  # type: ignore[assignment]
     _SGLANG_AVAILABLE = False
 
-try:
-    # v2 multi-pool types. Imported SEPARATELY from the v1 ABC above, and
-    # tolerated missing: they landed later than v1, so a sglang without them
-    # must still be able to load this backend and run the v1 path. When they
-    # are absent the v2 methods below degrade to the ABC's NotImplementedError,
-    # which is exactly what a v1-only deployment expects.
-    from sglang.srt.mem_cache.hicache_storage import (
-        PoolHitPolicy,
-        PoolName,
-        PoolTransfer,
-        PoolTransferResult,
-    )
-
+# v2 multi-pool types, from the SAME module the ABC came from. Tolerated
+# missing: they landed later than v1, so an engine without them must still be
+# able to load this backend and run the v1 path. When they are absent the v2
+# methods below degrade to NotImplementedError, which is exactly what a v1-only
+# deployment expects.
+_v2 = _names(_iface, ("PoolHitPolicy", "PoolName", "PoolTransfer", "PoolTransferResult")) \
+    if _iface is not None else None
+if _v2 is not None:
+    PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult = _v2
     _SGLANG_V2_AVAILABLE = True
-except Exception:  # noqa: BLE001
+else:
     PoolHitPolicy = None  # type: ignore[assignment]
     PoolName = None  # type: ignore[assignment]
     PoolTransfer = None  # type: ignore[assignment]
