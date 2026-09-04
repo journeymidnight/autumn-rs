@@ -529,7 +529,7 @@ impl AutumnManager {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
-                        .drain_extent_inflight_marker(extent.extent_id, "the target refused the rebuild")
+                        .drain_extent_inflight_marker(extent.extent_id, "the dispatch response was undecodable")
                         .await
                     {
                         tracing::warn!(
@@ -551,13 +551,13 @@ impl AutumnManager {
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
                 if let Err(e) = self
-                    .drain_extent_inflight_marker(extent.extent_id, "the dispatch response was undecodable")
+                    .drain_extent_inflight_marker(extent.extent_id, "the target refused the rebuild")
                     .await
                 {
                     tracing::warn!(
                         extent_id = extent.extent_id,
                         error = %e,
-                        "could not release the marker after an undecodable response"
+                        "could not release the marker after the target refused the rebuild"
                     );
                 }
                 // release the limiter slot we took above.
@@ -590,6 +590,19 @@ impl AutumnManager {
                     candidate.node_id,
                     now_s,
                     now_ms,
+                );
+                // The op ledger is a leader-local ring of 256 that dies with the
+                // leader, so it cannot answer "was this ever dispatched?" from a
+                // log file after the fact. Say it here too: this and the apply
+                // below are the two events a reader needs to tell a repair that
+                // ran from one that never started, and both used to be silent
+                // while a benign duplicate report was a WARN.
+                tracing::info!(
+                    extent_id = extent.extent_id,
+                    executor = candidate.node_id,
+                    replacing = replace_id,
+                    slot,
+                    "recovery dispatched: rebuilding this slot onto a healthy node"
                 );
             }
             return Ok(DispatchOutcome::Dispatched);
@@ -694,17 +707,73 @@ impl AutumnManager {
         // non-member, has its real shard reaped by the reconcile. The manager
         // shows every slot available while the stripe silently runs one copy
         // short.
-        match self.extent_inflight_payload_recovery(task.extent_id) {
+        //
+        // Refusing is one behaviour but several events, and reporting them all
+        // in the loudest available words put the alarm on the most ordinary one.
+        // The ledger ALONE cannot separate them — an absent marker looks the
+        // same whether the work landed or was thrown away — so the LAYOUT is
+        // asked as well: an applied rebuild has already moved this slot onto
+        // `task.node_id`, and an attempt that never applied has not.
+        //
+        //  - re-send echo (routine): the manager re-sends a pinned recovery
+        //    every 2 s, and one landing after the rebuild finished but before
+        //    the executor's next `df` drained its queue makes that executor
+        //    adopt its complete local copy and report AGAIN. The first copy
+        //    applies and releases the marker; every later one arrives here. The
+        //    slot already names the executor, so it is verifiably a duplicate of
+        //    work that IS committed. Quiet, like the EC twin
+        //    (`ec_done for an extent with no inflight marker; ignoring`).
+        //  - a released attempt finishing late: the marker went (a df blip is
+        //    enough to make its executor Suspected) and nothing applied, so the
+        //    slot still names the node this report wants to replace. This is the
+        //    near-miss the guard was built for — the narrative above — and it
+        //    stays loud even though the ledger is empty.
+        //  - a completion for a DIFFERENT live assignment: loud.
+        let pinned_recovery = self.extent_inflight_payload_recovery(task.extent_id);
+        let already_applied = {
+            let s = self.store.inner.borrow();
+            s.extents
+                .get(&task.extent_id)
+                .is_some_and(|ex| Self::extent_slot(ex, task.node_id).is_some())
+        };
+        match pinned_recovery {
             Some(pinned)
                 if pinned.node_id == task.node_id && pinned.replace_id == task.replace_id => {}
-            other => {
+            None if already_applied => {
+                tracing::debug!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    "recovery completion re-reported after its rebuild was already applied \
+                     (a standing-instruction re-send the executor adopted); ignoring — benign"
+                );
+                return Ok(());
+            }
+            None => {
+                // Deliberately NOT "no inflight marker": another kind may hold
+                // the ledger slot (a Delete acquired once refs hit 0), and this
+                // path must not assert something it did not check.
                 tracing::warn!(
                     extent_id = task.extent_id,
                     reported_node = task.node_id,
                     reported_replace = task.replace_id,
-                    pinned = ?other.map(|p| (p.node_id, p.replace_id)),
-                    "recovery completion does not match the live marker — REFUSING to apply \
-                     (a released attempt finishing late, or a report for another assignment)"
+                    other_op = ?self.extent_inflight_op(task.extent_id),
+                    "recovery completion with NO live recovery marker and no sign the \
+                     rebuild was applied — REFUSING (an attempt whose marker was released \
+                     while its executor kept working; applying it could swap the slot onto \
+                     a copy the current layout does not describe)"
+                );
+                return Ok(());
+            }
+            Some(pinned) => {
+                tracing::warn!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    pinned = ?(pinned.node_id, pinned.replace_id),
+                    "recovery completion names a DIFFERENT assignment than the live marker \
+                     — REFUSING to apply (the marker is retained; its own executor reports \
+                     its own completion)"
                 );
                 return Ok(());
             }
@@ -892,6 +961,13 @@ impl AutumnManager {
                 now_s,
             );
         }
+        tracing::info!(
+            extent_id = updated_extent.extent_id,
+            executor = task.node_id,
+            replaced = task.replace_id,
+            eversion = updated_extent.eversion,
+            "recovery applied: the slot now points at the rebuilt copy"
+        );
         Ok(())
     }
 

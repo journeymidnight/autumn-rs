@@ -1,8 +1,40 @@
 Date: 2026-09-04
 TaskStatus: completed
 Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD 定谳为 harness 故障并修复；
-  ③ BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS 修复 —— 那条 nemesis 从来没执行过，现在每轮都跑，
-  并补上"fence 确实驱动了 recovery"的断言（该条账本条目已销）；④ 立账 F-RECOVERY-PATH-SILENT。
+  ③ BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS 修复（那条 nemesis 从来没执行过）；
+  ④ F-RECOVERY-PATH-SILENT 修复（recovery 派发/应用可见，重复上报不再 WARN）。四条账本条目全销。
+
+【2026-09-04 F-RECOVERY-PATH-SILENT：把信号扶正】
+  改动三处：① `dispatch_recovery_task` 成功派发打 INFO（extent/executor/replacing/slot）；
+  ② `apply_recovery_done` 成功打 INFO（换掉哪个槽位、新 eversion）；
+  ③ 把 marker 校验的失败按**证据**分支，不是按 marker 在不在。
+  **评审在这里救了我一次**：我第一版是"没有 marker ⇒ DEBUG benign"，而这个守卫真正要防的
+  那个事故（marker 被 df 抖动释放 → extent 被 EC 转换 → 旧执行者晚到的整份 .dat 完成把槽位
+  换到布局没描述的副本上）**恰恰也落在"没有 marker"这一支** —— 我等于把唯一的告警灭了。
+  改成再问一次**布局**：已应用的重建会把该槽位挪到 `task.node_id` 上，没应用的不会。
+  于是三支 —— 回声（槽位已是它 ⇒ 可验证的重复 ⇒ DEBUG）、被释放的晚到完成（槽位还没动
+  ⇒ WARN）、指向另一个在飞 assignment（WARN）。DEBUG 那条也不再宣称 "no inflight marker"
+  （ledger 位可能被 Delete 占着），改成报出实际占用的 op 种类。
+  验收（真集群日志，按顺序读得出来）：seed 604/605/607 三轮
+  `dispatched=5/2/4  applied=5/2/4  benign=4/0/4  REFUSING=0`。
+  也就是说：每一次派发都应用了，过去会刷 WARN 的重复现在走 benign，而假警报归零。
+  单测四条：重复只应用一次、指向别的 assignment 被拒（且 marker 必须留存）、
+  以及**直接钉住日志级别本身**的 `the_echo_is_quiet_and_the_released_attempt_is_loud`
+  （前三条把两个 tracing 宏对调也照样绿 —— 交付物本身没被钉住，评审指出的）。
+  消融：去掉身份守卫 ⇒ 三条 marker 测试全红；对调两个宏 ⇒ 级别测试红在"回声不该是警告"；
+  去掉布局判据 ⇒ 红在"被释放的晚到完成必须响"。
+  顺手修了同一函数里两个**互相写反**的 drain 原因（解码失败那支写着"目标拒绝了"，
+  目标拒绝那支写着"响应无法解码"）—— 本轮的主题就是让日志能讲清楚派发的故事。
+
+【2026-09-04 我上一轮 ship 了一条会误报的断言（当轮发现并修好）】
+  上一个 commit 里的 `verify_fence_drove_a_recovery` 断言"KillThenFence 跑过 ⇒ ledger 里必须有
+  recovery op"。第一次带 `RUST_LOG=info` 复跑就红了 —— 而且是**误报**：recovery 只管 SEALED
+  extent，45 秒一轮里被 fence 的那台**可能一个 sealed 槽位都没持有**（实测 seed 603/606 stranded=0）。
+  修法不是删断言，是补上它的前提：在 fence **还立着的时候**从 etcd 数一下受害节点占了几个
+  sealed 槽位（`sealed_extents_naming`，读失败返回 0 ⇒ 只会漏报不会误报），只有 >0 才断言。
+  实测 seed 603 stranded=0 跳过、604 stranded=3 ⇒ 4 条 op、605 stranded=1 ⇒ 1 条、606 stranded=0 跳过。
+  **教训：断言的前提要和被测机制的定义域对齐**（recovery 的定义域是 sealed extent，不是"动作跑过"）。
+
 
 【2026-09-04 KillThenFence 从未执行：修复 + 把"跑没跑过"变成可见】
   预算门 `min_healthy = (K+M).max(3)+1 = 5`，而集群就是按 5 台起的、`healthy_count()` 上限 5

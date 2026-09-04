@@ -43,7 +43,7 @@
 
 mod support;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::collections::BTreeMap;
@@ -878,6 +878,22 @@ struct NemesisCtx {
     dead: RefCell<Vec<u64>>,
     /// Proxy names currently disabled (NetworkPartition action).
     partitioned: RefCell<Vec<String>>,
+    /// etcd, for reading extent state at the moment a fault lands.
+    etcd_endpoint: String,
+    /// Most sealed extent slots any single `KillThenFence` stranded on its
+    /// victim, sampled while the fence was standing.
+    ///
+    /// This is the PRECONDITION for expecting a rebuild. Recovery only rebuilds
+    /// SEALED extents, and in a 45 s round the victim may hold none — so
+    /// "KillThenFence ran" alone cannot demand a recovery op without failing on
+    /// luck.
+    ///
+    /// Deliberately WEAKER than the truth in both directions, so it can only
+    /// under-assert. Zero here does not prove nothing was repaired: the fence
+    /// sweep also seals and rolls the victim's OPEN tails, which this does not
+    /// count. And above zero it is not sufficient either — a counted extent can
+    /// be occupied by a delete or a conversion, which dispatches nothing.
+    fence_stranded_sealed: Cell<usize>,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
     /// Per action: how many times it was chosen, and how many times it acted.
@@ -1229,6 +1245,17 @@ async fn do_kill_then_fence(ctx: &NemesisCtx) -> Result<String, String> {
         return Err(format!("fence refused: {}", r.message));
     }
     ctx.fenced.borrow_mut().push(victim_node_id);
+
+    // How much did this fence actually strand? Sampled WHILE it stands, because
+    // by verify time the node is unfenced and healthy again and the question is
+    // unanswerable. Only a SEALED extent is recovery's business, so this is the
+    // precondition for expecting a rebuild at all.
+    let stranded = sealed_extents_naming(&ctx.etcd_endpoint, victim_node_id).await;
+    ctx.fence_stranded_sealed
+        .set(ctx.fence_stranded_sealed.get().max(stranded));
+    eprintln!(
+        "nemesis: fence on node {victim_node_id} stranded {stranded} sealed extent slot(s)"
+    );
 
     // Hold long enough for recovery to dispatch (every 2 s tick).
     compio::time::sleep(Duration::from_millis(5000)).await;
@@ -1839,9 +1866,11 @@ mod nemesis_budget_tests {
 /// stay green and the tally would still report `KillThenFence 1/1` — the same
 /// "green while uncovered" shape this round was opened to close, one layer down.
 ///
-/// Only asserted for rounds where the action actually ran. The ledger is a
-/// leader-local ring of 256, so this reads what is still in it, not a total.
-async fn verify_fence_drove_a_recovery(mgr: &RpcClient) -> Vec<String> {
+/// Only asserted for rounds where a fence actually stranded a SEALED extent —
+/// recovery's only business — since a round with nothing to repair legitimately
+/// produces no op. The ledger is a leader-local ring of 256, so this reads what
+/// is still in it, not a total.
+async fn verify_fence_drove_a_recovery(mgr: &RpcClient, stranded: usize) -> Vec<String> {
     let resp = match mgr
         .call(
             MSG_OP_QUERY,
@@ -1862,13 +1891,12 @@ async fn verify_fence_drove_a_recovery(mgr: &RpcClient) -> Vec<String> {
         Err(e) => return vec![format!("recovery-op query undecodable: {e}")],
     };
     if resp.ops.is_empty() {
-        return vec![
-            "KillThenFence ran, but the op ledger holds NO recovery op at all — the fence \
-             never drove a rebuild. Either dispatch is not firing for a fenced node, or the \
-             extents it held needed none; the first is a product regression this suite is \
-             supposed to catch and would otherwise pass green"
-                .to_string(),
-        ];
+        return vec![format!(
+            "a fence stranded {stranded} sealed extent slot(s), but the op ledger holds NO \
+             recovery op — fence-gated dispatch did not fire. Without this check that is a \
+             green run: nothing else asserts a rebuild happened, and the action tally still \
+             reports KillThenFence as having run"
+        )];
     }
     eprintln!(
         "chaos: fence drove {} recovery op(s): {}",
@@ -2453,6 +2481,33 @@ async fn verify_extent_accounting(etcd_endpoint: &str) -> (Vec<String>, usize, u
         }
     }
     last
+}
+
+/// How many SEALED extents name `node_id` as a member.
+///
+/// Recovery's whole job is sealed extents, so this is the number of slots a
+/// fence on that node has just stranded — the precondition for expecting a
+/// rebuild. Read from etcd rather than the manager because it is asked WHILE
+/// the fence stands, and the answer stops existing once the node is restored.
+///
+/// A read failure returns 0, which makes the caller's assertion weaker, never
+/// wrong: it can only cause a missing rebuild to go unreported, not a healthy
+/// round to fail.
+async fn sealed_extents_naming(etcd_endpoint: &str, node_id: u64) -> usize {
+    let Ok(client) = autumn_etcd::EtcdClient::connect(etcd_endpoint).await else {
+        return 0;
+    };
+    let Ok(resp) = client.get_prefix("extents/").await else {
+        return 0;
+    };
+    resp.kvs
+        .iter()
+        .filter_map(|kv| rkyv_decode::<MgrExtentInfo>(&kv.value).ok())
+        .filter(|ex| {
+            ex.sealed
+                && (ex.replicates.contains(&node_id) || ex.parity.contains(&node_id))
+        })
+        .count()
 }
 
 /// Set of all extent_ids the manager currently tracks in etcd. Used to measure
@@ -3234,6 +3289,8 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             nemesis_errors: nemesis_errors.clone(),
             proxy_faults: proxy_faults.clone(),
             action_tally: RefCell::new(Default::default()),
+            etcd_endpoint: etcd_endpoint.clone(),
+            fence_stranded_sealed: Cell::new(0),
             ec_k: cfg.ec_k,
             ec_m: cfg.ec_m,
         });
@@ -3473,13 +3530,18 @@ runs ACROSS rounds is uncovered, not unlucky.",
         eprintln!("chaos: verifying nothing is left in flight (op ledger + EC markers)");
         let mut inflight_errors = verify_no_ops_left_in_flight(&mgr).await;
         inflight_errors.extend(verify_no_ec_markers_pinned(&mgr).await);
-        let fence_ran = nemesis_ctx
-            .action_tally
-            .borrow()
-            .get("KillThenFence")
-            .is_some_and(|(_, ok)| *ok > 0);
-        if fence_ran {
-            inflight_errors.extend(verify_fence_drove_a_recovery(&mgr).await);
+        // Only demand a rebuild when a fence actually stranded something. A
+        // round where the victim held no sealed extent has nothing to recover,
+        // and asserting on "the action ran" alone fails on luck.
+        let stranded = nemesis_ctx.fence_stranded_sealed.get();
+        if stranded > 0 {
+            inflight_errors.extend(verify_fence_drove_a_recovery(&mgr, stranded).await);
+        } else {
+            eprintln!(
+                "chaos: no fence stranded a sealed extent this round — the fence-drove-a-\
+                 recovery check has nothing to assert on (open tails the fence sweep rolls \
+                 are not counted, so this is not proof that nothing was repaired)"
+            );
         }
         eprintln!(
             "chaos: in-flight verify: errors={}",

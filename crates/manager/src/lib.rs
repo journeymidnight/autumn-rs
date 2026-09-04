@@ -5205,6 +5205,14 @@ mod tests {
     /// executor's late report of a PRE-conversion full copy would swap the slot
     /// onto a node holding a `.dat` while the layout names a shard file — and
     /// the replaced node, now a non-member, gets its real shard reaped.
+    ///
+    /// The refusal is one behaviour but two events, and they are reported
+    /// differently: NO marker (this test) is also what a re-send echo looks
+    /// like, so it is benign and quiet — see
+    /// `a_repeated_recovery_completion_applies_once_and_is_benign_after`. A
+    /// marker that EXISTS and names someone else is the hazard described above
+    /// and stays loud — see `a_completion_for_another_assignment_is_refused`.
+    /// Both refuse; only the second warns.
     #[test]
     fn recovery_completion_from_a_released_attempt_is_refused() {
         let m = AutumnManager::new();
@@ -7179,6 +7187,251 @@ mod tests {
             assert_eq!(ex_after.eversion, 4, "eversion must be bumped on apply");
             assert_eq!(ex_after.avali, 0xF, "slot 0 avali bit should be set");
         })
+    }
+
+    /// The SAME completion arriving twice must apply once and then be a
+    /// no-event, not a warning.
+    ///
+    /// This is routine, not an edge case: the manager re-sends a pinned
+    /// recovery every 2 s, so a re-send landing after the rebuild finished but
+    /// before the executor's next `df` drained its queue makes the executor
+    /// adopt its complete local copy and report AGAIN. Both copies arrive in one
+    /// batch. The first applies and releases the marker; the second finds
+    /// nothing to match. Reporting that as `REFUSING to apply` put the loudest
+    /// line in the recovery path on its most ordinary event, while the two
+    /// events a reader actually needs — dispatched, applied — were silent.
+    #[test]
+    fn a_repeated_recovery_completion_applies_once_and_is_benign_after() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 31u64;
+            m.store.inner.borrow_mut().extents.insert(
+                extent_id,
+                MgrExtentInfo {
+                    extent_id,
+                    replicates: vec![1, 3, 5],
+                    parity: vec![7],
+                    eversion: 3,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 100_000,
+                    sealed: true,
+                    avali: 0xE,
+                    replicate_disks: vec![10, 11, 12],
+                    parity_disks: vec![13],
+                    ec_converted: true,
+                },
+            );
+            let task = RecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 9,
+                start_time: 0,
+            };
+            m._test_mark_recovery_inflight(extent_id, task.clone());
+            let done = || RecoveryTaskDone {
+                task: task.clone(),
+                ready_disk_id: 88,
+            };
+
+            assert!(m.apply_recovery_done(done()).await.is_ok(), "first apply");
+            let after_first = {
+                let s = m.store.inner.borrow();
+                let ex = s.extents.get(&extent_id).unwrap();
+                (ex.replicates.clone(), ex.eversion, ex.avali)
+            };
+            assert_eq!(after_first.0, vec![9, 3, 5], "the slot was rebuilt");
+            assert_eq!(after_first.1, 4, "eversion bumped once");
+
+            // The duplicate. It must be accepted as a no-op — and above all it
+            // must not bump eversion a second time or re-touch the layout.
+            assert!(
+                m.apply_recovery_done(done()).await.is_ok(),
+                "a repeated completion must not be an error"
+            );
+            let after_second = {
+                let s = m.store.inner.borrow();
+                let ex = s.extents.get(&extent_id).unwrap();
+                (ex.replicates.clone(), ex.eversion, ex.avali)
+            };
+            assert_eq!(
+                after_second, after_first,
+                "the duplicate changed the extent; it must be inert"
+            );
+        })
+    }
+
+    /// The case the guard was actually built for stays loud and inert: a
+    /// completion naming an assignment the live marker does not.
+    ///
+    /// Splitting this from the duplicate above is the whole point — a released
+    /// attempt finishing late can swap the slot onto a node holding a full
+    /// `.dat` while the layout says the payload is a shard file, which is real
+    /// corruption. It must not be reported in the same words as a re-send echo.
+    #[test]
+    fn a_completion_for_another_assignment_is_refused() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 32u64;
+            m.store.inner.borrow_mut().extents.insert(
+                extent_id,
+                MgrExtentInfo {
+                    extent_id,
+                    replicates: vec![1, 3, 5],
+                    parity: vec![7],
+                    eversion: 3,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 100_000,
+                    sealed: true,
+                    avali: 0xE,
+                    replicate_disks: vec![10, 11, 12],
+                    parity_disks: vec![13],
+                    ec_converted: true,
+                },
+            );
+            // The marker names node 9 as the executor.
+            m._test_mark_recovery_inflight(
+                extent_id,
+                RecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id: 9,
+                    start_time: 0,
+                },
+            );
+            // A DIFFERENT executor reports the same slot.
+            let done = RecoveryTaskDone {
+                task: RecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id: 11,
+                    start_time: 0,
+                },
+                ready_disk_id: 88,
+            };
+            assert!(m.apply_recovery_done(done).await.is_ok(), "refusal is not an error");
+            // The marker must SURVIVE. The refusal is only safe because the
+            // assignment it names is still standing, so its own executor's
+            // completion can still apply; dropping it here would strand the
+            // rebuild that is legitimately in progress.
+            assert!(
+                m.extent_inflight_payload_recovery(extent_id).is_some(),
+                "the live marker was dropped by a refusal meant to protect it"
+            );
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(
+                ex.replicates,
+                vec![1, 3, 5],
+                "a completion from an executor the marker does not name was applied"
+            );
+            assert_eq!(ex.eversion, 3, "eversion must not move");
+        })
+    }
+
+    /// The DELIVERABLE of the split is which of these is loud, and nothing above
+    /// tests that — swapping the two `tracing` macros passes every assertion in
+    /// this file. So capture the events and assert the levels directly.
+    ///
+    /// The distinction is not cosmetic. Both refuse, but one is the manager's
+    /// own re-send echoing back and the other is an attempt whose marker was
+    /// released while its executor kept working — the case the guard exists for,
+    /// and the one that used to hide inside the same words as the echo.
+    #[test]
+    fn the_echo_is_quiet_and_the_released_attempt_is_loud() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Levels(Arc<Mutex<Vec<(Level, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg(String);
+                impl tracing::field::Visit for Msg {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        v: &dyn std::fmt::Debug,
+                    ) {
+                        if f.name() == "message" {
+                            self.0 = format!("{v:?}");
+                        }
+                    }
+                }
+                let mut m = Msg(String::new());
+                event.record(&mut m);
+                if m.0.contains("recovery completion") {
+                    self.0.lock().unwrap().push((*event.metadata().level(), m.0));
+                }
+            }
+        }
+
+        let seen = Levels::default();
+        let events = seen.0.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(seen).with(
+                tracing_subscriber::filter::LevelFilter::TRACE,
+            ),
+        );
+
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 33u64;
+            let ex = |replicates: Vec<u64>| MgrExtentInfo {
+                extent_id,
+                replicates,
+                parity: vec![7],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 100_000,
+                sealed: true,
+                avali: 0xF,
+                replicate_disks: vec![10, 11, 12],
+                parity_disks: vec![13],
+                ec_converted: true,
+            };
+            let done = |node_id: u64| RecoveryTaskDone {
+                task: RecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id,
+                    start_time: 0,
+                },
+                ready_disk_id: 88,
+            };
+
+            // ECHO: the rebuild already applied, so node 9 IS in the layout and
+            // node 1 is gone. No marker, and verifiable duplicate work.
+            m.store.inner.borrow_mut().extents.insert(extent_id, ex(vec![9, 3, 5]));
+            assert!(m.apply_recovery_done(done(9)).await.is_ok());
+
+            // RELEASED ATTEMPT: nothing applied — node 1 still holds the slot
+            // and node 9 is nowhere in the layout. Same empty ledger.
+            m.store.inner.borrow_mut().extents.insert(extent_id, ex(vec![1, 3, 5]));
+            assert!(m.apply_recovery_done(done(9)).await.is_ok());
+        });
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "expected one event per refusal, got {got:?}");
+        assert_eq!(
+            got[0].0,
+            Level::DEBUG,
+            "the manager's own re-send echo must not be a warning: {}",
+            got[0].1
+        );
+        assert_eq!(
+            got[1].0,
+            Level::WARN,
+            "an attempt whose marker was released while it kept working must stay loud: {}",
+            got[1].1
+        );
     }
 
     // ── eversion lost-update during EC conversion await ────────────────────
