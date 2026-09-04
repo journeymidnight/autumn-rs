@@ -62,8 +62,27 @@
   单条 PS 连接 / 单个 compio 事件循环上。**先定位到具体的串行点再改**，不要先猜。
 - **Acceptance**: 有一个能解释 30K 的具体机制（火焰图或分段计时指到某一处），
   且改动后单进程写吞吐提升可复现。
-- **Status**: `passes: false` (2026-09-02) —— 只立账。这不阻塞任何东西：需要吞吐的
-  消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
+- **2026-09-04 机制假说（纯读代码得出，未测量）——它一次解释掉上表全部四个变量**：
+  wipe 的 scan 是 `range(prefix, start, 512)`，返回的是 **512 个连续 key**；连续 key 落在
+  **同一个分区**。而 client 用的是**每分区一条多路复用连接**（`crates/client/src/lib.rs`
+  多处注释："per-partition multiplexed connections"）。于是每一页的 `delete_many`
+  实际上只打**一个分区、一条连接**，与集群有几个分区无关。
+  - 分区 1→4 无效：每页仍然只落一个分区，多出来的连接这一页根本用不到；
+  - 并发 32→256 无效：全部排在同一条连接上，只是队列更深；
+  - 页大小无效：还是单分区批次，只是更大；
+  - CPU/盘无效：本来就不是资源绑定。
+  而 perf-check 多线程能到 98~162K，是因为 key 随机散布**且**16 线程 ⇒ 多条连接同时在飞。
+  **可证伪的预测**：把"扫描/删除"改成跨页流水（不同页打不同分区）应该能线性scale，
+  而在**同一页内**加并发不会。先测这个，别再动上表那四个变量。
+- **⚠️ 上表"删除并发 32→256"那一行今天无法复现**：`delete_many` 的扇出宽度是**编译期常量**
+  `BATCH_PUT_DEFAULT_CONCURRENCY = 32`（`crates/client/src/lib.rs:639`），memory-mcp 与
+  autumn-memory 里**没有任何** env/flag 能改它（已全量 grep）。所以那一行要么是改了常量重编，
+  要么当时旋的是别的东西。重测前先确认旋钮真的接到了扇出宽度上。
+- **Status**: `passes: false` (2026-09-02；2026-09-04 补机制假说) —— 仍只立账，不阻塞任何东西：
+  需要吞吐的消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
+  **本轮没有测量**：验收后半（"改动后吞吐提升可复现"）是延迟敏感的，而本机当时有 2600 个
+  sglang/ray 进程、load 8+、热核散布在高低两段，按 `feedback_perf_check_cpu_gate` 隔离不出
+  干净的核段 ⇒ 测出来的每操作延迟只会是噪声。等安静的机器或用 cpuset 隔离后再测。
 
 ### F-FUSE-READ-GAP — fuse mount 读只有 autumnfs CLI 的一半
 - **Trigger** (2026-09-03): 同集群（3 块真盘、EC 2+1）、同一个 4 GiB 未条带化文件、
@@ -200,56 +219,6 @@
 - **Scope（真要做时）**: (1) 写侧对 sealed extent 落 **per-extent/block content checksum**（`.meta` 里加一段覆盖 `.dat` 内容的 CRC/xxhash；注意不能进 append 热路径的每帧 CRC，只在 seal 时对最终内容算一次）；(2) EN 读时（至少 sealed 全值读 + recovery 重填读）验内容 checksum，错则走**现有副本轮转/failover 绕开**坏副本（隔离路径已存在，缺的是检测触发器）；(3) recovery/EC 转换前加内容校验，**拒绝**把校验失败的副本洗成权威/编进 parity；(4) 后台 **scrub loop**：低速重哈希 sealed extent，mismatch 则清该副本 `avali` 位交给 recovery 重建。
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
-
-### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
-- **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB
-  逻辑数据（47×）。客户端侧已修两处（size-scaled append deadline、roll-away 时
-  `reclaim_abandoned_empty_tail` best-effort punch），但那是客户端且 best-effort：punch 或权威 re-fetch
-  失败、或 writer 在 seal 与 punch 之间死掉，那个 extent 就永远泄漏（`sealed=true, sealed_length=0`、
-  refs≥1、非尾巴的 stream 成员、无人引用、GC/truncate/orphan-reconcile 各自因"它没有那个字段"全部跳过）。
-  修复前被污染的集群另有约 4 万个这种 extent，客户端修复永远不会再访问它们。
-- **Scope**: leader-only manager sweep，谓词 = 非尾巴 + `sealed && sealed_length == 0` + 不在 inflight
-  ledger；复用 punch-holes 的变更路径（`compute_extent_ref_drops` → value-CAS 的
-  `mirror_stream_extent_mutation` → pending-delete 队列）。限速 N extent/tick。
-- **Acceptance**: 单测 —— sealed-empty 非尾巴要扫、sealed-empty **尾巴**与 sealed 非空**不扫**、
-  inflight 的推迟；集成 —— 在 seal 与 punch 之间杀掉 writer（或让 punch 失败一次），断言 sweep 在一个
-  周期内回收；chaos 回归（seed 603 + 769351064 类）绿。
-- **Status**: `passes: false` (2026-07-14；2026-09-03 更新) — **实现完成、测试通过、评审过，但故意不上线**。
-  代码在 `crates/manager/src/extent_delete.rs`（`sealed_empty_sweep_candidates` 纯谓词 + 6 单测；
-  `sealed_empty_sweep_once`/`_loop`），`start_runtime_tasks` 里**没有** spawn，附了不 spawn 的理由；
-  三条谓词消融各自咬住不同断言。曾阻塞在重放游标类上（现已修）：manager 看不见 PS 的
-  vp_head，所以 sweep 无法过滤掉"被 checkpoint 游标指着的空 extent"，而那一类会静默丢失已 ACK 的写。
-  **2026-09-03：已上线（spawn 了）。** 阻塞解除（BUG-EMPTY-VP-CURSOR-PUNCH 已复现并修复：
-  恢复侧游标全解析不到时改为全量重放，所以回收游标指向的空 extent 现在的代价是"开得慢"而非丢数据）。
-  验收里"杀 writer 在 seal 与 punch 之间"的集成半**已做**：`crates/manager/tests/sealed_empty_sweep_etcd.rs`
-  用真 etcd + aux 客户端直查，消融掉持久化那步会精确变红（`etcd still holds extents/N`）。
-  **2026-09-03 追加：试过把 chaos 里的 sweep 间隔调短，然后撤回了。** 60s 间隔在约 90s 的
-  chaos 里只给一次 tick，命中与否靠运气；调到 5s 确实提高了概率（实测 0/0/2 次），但它同时会在
-  `verify_gc_reclaim` 那约 20s 的窗口里 tick 4~6 次，而那个检查只在
-  `total_reclaimed == 0 && any_protected` 时报错、且 `total_reclaimed` 数的是 extent 集合的
-  **任意**收缩 —— 一次 sweep 回收就能把它顶成 1，从而**掩盖掉"回收卡死"**这个针对 pinned replay
-  floor 的守卫。**为了让一个守卫更容易触发而削弱另一个,是坏交易**，何况 sweep 已有单测 + etcd
-  集成测试。所以 chaos 保持 60s 默认；间隔旋钮保留给 `--policy-fast-mode`（并加了 1s 下限，
-  因为 0 会自旋：follower 上该 tick 第一句就返回，sleep 是唯一的挂起点）。
-  **顺带补强了那个掩盖通道本身**（它先前就存在，只是我的改动会放大它）：`any_protected` 时改用
-  `gc_reclaimed`（从 force-GC 派发之后的 `mid` 起算）而非 `total_reclaimed`，问的是"**这一阶段**
-  有没有回收动过"。seed 583 ×3、seed 603 ×2 均无误报。
-  **chaos 那半：先记成 0 次执行，随后被自己的日志推翻，最终结论是"覆盖但不可靠"。**
-  第一轮 grep `sealed-empty sweep` 得 0 次，我据此下了"chaos 从不造出这个形态"的结论 —— 那是
-  **单轮样本的过度概括**。后续同 seed 的一轮里它触发了两次（`stream_id=13 count=1`、
-  `stream_id=20 count=1`），也就是 chaos **确实**会造出 sealed-empty 非尾巴成员并被 sweep 回收，
-  且那几轮的账目校验（`refs == 列出它的 stream 数` + 无悬空成员）全绿 —— 这才是真的 sweep 证据。
-  但它是**时序相关**的（sweep 每 60s 一 tick，chaos 跑约 92s，只有 1~2 次机会），所以
-  "跑一轮 chaos 绿"**不能**当作 sweep 的稳定回归守卫。要可靠覆盖，仍需在 harness 里显式造出
-  这个形态、或把 sweep 间隔在 chaos 下调小。
-  另注（2026-09-04 更新）：当初写这条时 seed 603 本来就红，那是 chaos harness 的
-  toxiproxy 修复空操作导致的，已修（见 git 历史 `fix(chaos): a network partition the
-  harness reported healed was still standing`），seed 603 现在是绿的。
-  旧文（仍适用）：验收里"杀 writer / punch 失败"的集成半与 chaos 半**仍未做**：`AutumnManager::new()` 没有 etcd，
-  `mirror_stream_extent_mutation` 在内存模式下是**彻底 no-op**，所以现有两条集成测试覆盖的是选择逻辑与
-  内存态 apply，**不是** plan 基线与 txn 之间的 CAS 耦合；那需要 etcd 后端的集群。
-  另：inflight ledger 的"计划后、mutation 前"窗口已改成每个 plan 重读一次，但该重检查**没有测试覆盖**
-  （计划期谓词已排除 inflight，内存模式下那些 await 不挂起，进程内开不出窗口），代码里已如实标注。
 
 ### F-EN-SHARD-AUTO — default EN shard count to CPU cores (format-side), not a hand-set env
 - **Trigger** (2026-07-13, user: "EN 分片确实是核数导向,但目前是手动 env,不是自动...对于集群配置有好处,记下来,以后做"): EN sharding IS core-oriented — `AUTUMN_EXTENT_SHARDS` should track io_uring cores (one shard = `extent_id % shard_count`), but it's a MANUAL env (default 1). Operators must hand-count cores AND keep three things in lockstep. It is NOT a simple "read `available_parallelism()` in the EN" because shard_count is coupled through a chain: **(a)** EN ports are static/registered-once — `autumn-op format --shard-ports <csv>` stamps the N ports into etcd and the manager routes by that list forever (stream CLAUDE.md "EN ports are FUNDAMENTALLY static"); a runtime-auto shard count would desync from etcd → manager black-holes shards 1..N. **(b)** the k8s overlay Service must enumerate exactly `shard_count` data+control ports (`9101+i*10` / `10101+i*10`); auto-shard needs the Service port list generated too. **(c)** `AUTUMN_EXPECT_NODES` / presplit sizing are tuned against the shard fan-out.

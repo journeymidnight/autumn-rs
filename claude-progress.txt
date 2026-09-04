@@ -2,7 +2,25 @@ Date: 2026-09-04
 TaskStatus: completed
 Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD 定谳为 harness 故障并修复；
   ③ BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS 修复（那条 nemesis 从来没执行过）；
-  ④ F-RECOVERY-PATH-SILENT 修复（recovery 派发/应用可见，重复上报不再 WARN）。四条账本条目全销。
+  ④ F-RECOVERY-PATH-SILENT 修复（recovery 派发/应用可见，重复上报不再 WARN）；
+  ⑤ F-SEALED-EMPTY-SWEEP 逐条复核后销账（它早已上线，只是标题陈旧）。五条账本条目全销。
+  剩余 backlog 12 条，绝大多数等用户定夺或缺容器/安静机器，见文末。
+
+【2026-09-04 F-SEALED-EMPTY-SWEEP 销账 + F-KV-CLIENT-30K 补上机制假说】
+  **F-SEALED-EMPTY-SWEEP**：条目标题还写着【代码已就绪，未上线】，实际 `lib.rs:1501` 早就
+  spawn 了。逐条复核三项验收而不是信 Status 文本：单测 7 条绿（6 条谓词 + 1 条 sweep 回收）、
+  etcd 集成测试 `sealed_empty_sweep_etcd` 带 `--ignored` 跑过绿、chaos seed 603 与
+  769351064 各跑（769351064 连跑 3 次全绿）。三项都成立 ⇒ 按规则销账。
+
+  **F-KV-CLIENT-30K**：没测量，但纯读代码拿到一个能一次解释掉全部四个死胡同变量的机制假说
+  —— wipe 的 scan 返回 512 个**连续** key，连续 key 在**同一分区**，而 client 是
+  **每分区一条多路复用连接** ⇒ 每页的 delete_many 只打一个分区一条连接，与分区数无关，
+  加并发只是把队列排深。可证伪预测：跨页流水（不同页打不同分区）应线性 scale，页内加并发不会。
+  另外发现上表"并发 32→256"那行**今天无法复现**：扇出宽度是编译期常量 32，全仓没有任何
+  env/flag 能改它。
+  **本轮明确不测**：验收后半是延迟敏感的，而本机 2600 个 sglang/ray 进程、load 8+、
+  热核散布在高低两段，隔离不出干净核段 ⇒ 按 `feedback_perf_check_cpu_gate` 的纪律不产出
+  会被 caveat 成废话的数字。
 
 【2026-09-04 F-RECOVERY-PATH-SILENT：把信号扶正】
   改动三处：① `dispatch_recovery_task` 成功派发打 INFO（extent/executor/replacing/slot）；
@@ -172,57 +190,6 @@ Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD �
   （重启后是无 mark 路径，同样的 InDat verdict 直接删）。真实代价是"该 EN 进程剩余生命周期"，
   健康集群上是几个月。文档已按这个口径写。
 
-
-【2026-09-03 fuse 读 I/O 线程池：已实现并验收】
-  形状：N 个独立单线程 compio runtime，各自 `ClusterClient`，`futures::mpsc` 喂 `ReadJob`。
-  能这么切是因为 `prepare`/`execute` 早就分好了 —— `prepare` 那一半才要 `&mut FsState`，
-  仍然独占派发线程；`execute` 只拿 (key, 子区间, dest 偏移) 的计划。`ReadJob` 天然 Send
-  （`fuser::ReplyData` 因 `ReplySender: Send + Sync` 而 Send），client 不跨线程。
-  round-robin 派发（和 ino 哈希实测无可分辨差别，取不牺牲"多线程读同一大文件"的那个）；
-  派发不出去就把 job 原样还回来在本地跑。`--read-io-threads 0` = 回退到旧行为。
-  结果（8 个独立 1 GiB 文件，核对字节数，两轮同向）：p=8 2211 → 3705(t=2) → 4763~5396(t=4)，
-  t=4 达 CLI 5466 的 95%~99%。机制验过：p=8 的 per-thread jiffies 派发线程 435 → 7，
-  总量 435/427/412 几乎守恒 —— 同一份活摊开到多核。
-  验证：`cargo test -p autumn-fuse --lib` 54 绿（含 4 条 submit 路由单测）、core feature 单独
-  可编、workspace release 绿、`fuse_chaos.sh` 三次 PASS（77/78/78 文件；末次跑在默认的 4 线程上，日志确认 `threads=4`）。
-  fable 评审：无高危；采纳 4 条 —— ①"丢 job = 内核永久挂"是**夸大**（fuser 0.15.1 的
-  `ReplyRaw::Drop` 会答 EIO），注释已改准 ②`ready_rx.await` 无上限而 session 已挂载 ⇒
-  连不上的 worker 会卡住整个挂载点的系统调用，加 `READY_TIMEOUT` 20s ③threads=0 还打
-  "pool ready" 日志 ④clippy `manual_ok_err`。
-  **未覆盖**：UCX。默认二进制不带 ucx feature，本机只有 lo 有 IPv4（无 RoCE IP）、跨机不可用。
-  UCX worker 创建走宿主级 devx 自旋锁 + fuse 在 UCX 上崩过 daemon ⇒ 真跑 UCX mount 要先拿
-  `--read-io-threads 0` 对照。
-  默认取 4（用户定）：p=8 3705 → 4763~5396。代价里最大的一项不是连接而是**每线程的注册
-  缓冲池**（`REGPOOL_CAP_BYTES` per-thread 512 MiB，规则 `cap × threads < RLIMIT_MEMLOCK`），
-  容器侧补了 `AUTUMN_FUSE_READ_IO_THREADS` env→flag 翻译，受限 pod 能不换镜像调回 0。
-  **F-FUSE-READ-GAP 仍 `passes: false`**：验收线写的是"单流进到 CLI 的 80%"，而单流是每请求
-  延迟绑定的（内核对同步读者不并发下发；bdi read_ahead_kb 128→32768 实测完全无效），
-  线程池按定义改不了。聚合吞吐已追平 CLI。按规则不改写验收口径，只记状态。
-
-【2026-09-03 BUG-EMPTY-VP-CURSOR-PUNCH：复现 → 修复 → 消融，静默丢失已 ACK 写入】
-  这是本会话最重的一条，而且**不是本轮引入的**，是 shipped 代码里的潜伏类。
-  链条：恢复把写游标种成 committed tail，而刚 roll 出来的尾巴零字节 ⇒ 游标 = `(E, 0)`；
-  下一次 rotate 把它盖进 SST 和 meta checkpoint；E 离开尾巴位后就是 sealed-empty，
-  而 `gc_extent_punchable` 是 `sealed_length == 0 || pos < floor` —— **空的一律可回收，
-  重放下限保护不了它**；游标解析不到就跳过，若全部解析不到而 tables 非空 ⇒ `chosen_pos == MAX`
-  ⇒ 旧代码**一条 WAL 都不重放**。compaction 把输出 SST 统一盖成流位置最大的 vp_head，
-  所以"全都解析不到"是常态而非corner。
-  **复现**（`crates/manager/tests/system_empty_vp_cursor.rs`，真集群真重启）：修复前 `a-*`（已进 SST）
-  幸存、`c-*`（**已 ACK** 未 flush）**全部消失**，分区干净打开、无任何告警。
-  **修复**：`chosen_pos == usize::MAX && tables.is_empty()` → `chosen_pos == usize::MAX`。
-  红 → 绿 → 消融重新变红；215 单测 + 8 个恢复/重放系统测试全绿。
-  **fable 抓到我注释里一条 materially false 的话**（已核实并改）：我写"按来源区间去重"，
-  但那条路**不会执行** —— `records_meta` 每项都要 `first_pos_by_eid` 命中，而"全都不命中"正是
-  `chosen_pos == MAX` 的成因 ⇒ 必然走全局并集那条 legacy 路径。过度重放依然安全
-  （ts > 全局 max ≥ 任何已 flush 的 seq），但机制不是我写的那个；另有一个**欠重放**的窄 corner
-  （post-merge 多来源时可能跳过 ts ≤ victim max 的 survivor 记录），严格优于"全丢",已记在注释里。
-  另外补了：全量重放分支的 WARN（它会读整条日志，必须自报）、4 处仍把"不重放分支"当现状的陈旧注释。
-  **一条建议我没采纳并写明理由**：改用 `start_partition_server_stoppable` 会走优雅 drain 从而 flush，
-  把测试依赖的"未 flush 的 C"冲掉 ⇒ 测试会**假绿**。
-  **一处保真度缺口如实标注**：生产回收者是 PS 的 GC，但本 harness 里 AUTO_GC 什么都没收
-  （fable 查明是设计使然：非空 extent 的选择是 discard 驱动的，而本测试不删不覆盖 ⇒ discard=0；
-  且第二次 roll 之前 E 还是尾巴、本就被排除）。测试改用与 `run_gc` 空路径**逐字节相同**的
-  `MSG_STREAM_PUNCH_HOLES`，所以钉住的是"回收游标 extent 的后果"，不是"GC 就是回收者"。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
