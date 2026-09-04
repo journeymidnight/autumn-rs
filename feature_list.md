@@ -137,3 +137,33 @@
   修后在 py≥3.11 上 v1/v2 的 KV key 逐字节相同。
 - **Status**: `passes: false` (2026-09-04) — 既有缺陷，非本轮引入；当前唯一的消费者
   （FreeToken）不触发，故不阻塞 L3 上线。
+
+### F-RECOVERY-PROGRESS — extent recovery 不上报进度，卡死与缓慢无法区分
+- **Trigger** (2026-09-04，一次 fence 排干中发现，代价是整个诊断过程): 4 个 recovery
+  marker 卡了约 4 小时、**一个字节没搬**，而 `autumn-op ops list` 全程显示
+  `recovery running`，`recovery-stats` 显示 `4/64 在飞`，EN 进程健康、心跳正常。
+  从控制面看不出"在拷"和"拷不动"的区别。真相是靠 `kubectl exec` 到目标 EN 上
+  `df -B1 /data` 采样两次、发现 5.5 分钟零增长才暴露的，之后才去翻 EN 日志、读源码、
+  查 etcd（`only 0/4 shards available` 的错误本身也没说明原因，见 329fa75）。
+- **根因（已定位，非猜测）**: `update_progress` 全仓库只有一个真实调用点
+  （`rpc_handlers.rs:4901`），数据来自 **PS 负载心跳的 `active_maintenance`**，
+  所以只有 **PS 执行的 kind（gc / compact / forcegc）** 有进度。**recovery 是 EN 执行的**，
+  完成经 `DfResp.done_tasks` 回报，**中途不报任何东西**，于是 `OpRecord.progress_done/total`
+  恒为 0，`ops list` 无百分比可显示。
+  次要的一条：`seed_replay`（op_ledger.rs:486）重建 RUNNING 条目时只填 5 个字段、
+  其余 `..Default::default()`，所以 **manager 一重启，`attempts` 和 "rebuilding slot N
+  on node X" 就没了** —— 那些是 leader 本地活状态，etcd 的 marker 只存派工不存进度。
+- **Scope**: EN 侧的 `stream_ec_recovery_payload` 条带循环里**已经天然持有 `(offset, want)`**，
+  副本恢复的 `stream_extent_from_sources` 同理持有 `(copied, sealed_length)` —— 顺着现有的
+  `DfResp` 捎回去即可，**不需要新机制、不需要新 RPC 往返**（`node_health_loop` 是唯一的
+  df 调用者，2 s 一次，已有 `done_tasks` 这条通道）。manager 侧接到后调
+  `update_progress_by_extent(OP_KIND_RECOVERY, extent_id, done, total)`（函数已存在，
+  目前只有 EC-convert 的测试在用）。⚠️ 加字段到 `DfResp` 是 **wire 改动**（指纹变更 +
+  `MIN=MAX` 全停），所以要么攒到下一次 wire 升版一起做，要么想办法塞进现有字段。
+  按仓库既有约定，进度是**原始计数不是百分比**（消费者自己算比例），单位用字节。
+  `seed_replay` 那半可选：failover 后进度可以从下一次 df 自然回填，`attempts` 则确实丢了。
+- **Acceptance**: 一次真实的 EC 分片重建（分片 >1 GiB）中，`autumn-op ops list` 显示的
+  `progress_done` 随时间单调增长；把源端人为掐断后，进度**停止增长**且该状态在
+  `ops list` 上可见 —— 即"卡死"和"缓慢"在控制面上可区分，不必再 exec 到节点上量 `df`。
+- **Status**: `passes: false` (2026-09-04) — 不阻塞任何功能，但它是本次排查里最贵的一个
+  缺口：有它的话，"4 小时零字节"在第一分钟就摆在眼前，而不是要靠 `df` 采样才发现。
