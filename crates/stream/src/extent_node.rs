@@ -5843,7 +5843,8 @@ impl ExtentNode {
     // (`fetch_full_extent_from_sources` — the whole-extent buffering peer-copy —
     // was removed once the EC-convert path switched to the streaming
     // `stream_extent_from_sources` below; recovery / re_avali already used the
-    // streaming form. Its helper `copy_bytes_from_source` survives for the
+    // streaming form. The buffering helper that used to sit beside it is
+    // gone — the EC rebuild was its last caller and now reads per stripe.
     // `[offset, size)` range copy used by `handle_copy_extent`.)
 
     /// Stage C: stream the full sealed extent from a healthy peer straight
@@ -6296,9 +6297,25 @@ impl ExtentNode {
                         .await
                         .map_err(|e| format!("create rebuilt shard {}: {e}", task.extent_id))?,
                 );
-                let len = self
+                // A failure mid-rebuild used to be free: the old code produced
+                // the whole payload before touching the destination. Streaming
+                // writes as it goes, so an error now leaves a PARTIAL shard
+                // file. A retry truncates it and a reader rejects it by exact
+                // length, so it cannot serve wrong bytes — but after a restart
+                // `discover_shard_files` registers it at its partial length,
+                // which makes `holds_payload` and the `df` accounting lie until
+                // a reconcile unlinks it. Remove it on the way out.
+                let len = match self
                     .stream_ec_recovery_payload(&task, &extent_info, shard_index, &f)
-                    .await?;
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(f);
+                        let _ = compio::fs::remove_file(&path).await;
+                        return Err(e);
+                    }
+                };
                 f.sync_data().await.map_err(|e| e.to_string())?;
                 self.fsync_staging_dir(task.extent_id, &path).await.map_err(|(_, m)| m)?;
                 extent.note_shard_file(shard_index as u32, len);
@@ -6391,8 +6408,7 @@ impl ExtentNode {
 
 /// How many bytes one EC shard read should ask for.
 ///
-/// `0` means "read to end" and takes `copy_bytes_from_source`'s SINGLE-shot
-/// branch — one request for the whole shard. That is what this path used to
+/// `0` means "read to end" — one request for the whole shard. That is what this path used to
 /// pass, on the stated assumption that a shard is "well under the chunking
 /// threshold". It is not: a shard is `ceil(sealed_length / K)`, so a full
 /// 17 GiB extent at K=4 gives ~4 GiB against a `FILE_IO_CHUNK_BYTES` of
@@ -6451,7 +6467,39 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
     /// 64 MiB matches the stripe the EC CONVERSION already writes with
     /// (`stripe_bytes` in its 2PC prepare), so the read path now moves in the
     /// same units as the write path.
-    const EC_RECOVERY_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
+    /// Overridable so a test can drive several stripes without a >128 MiB
+    /// payload — the encode stripe has the same shape for the same reason.
+    fn ec_recovery_stripe_bytes() -> u64 {
+        static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            std::env::var("AUTUMN_EXTENT_EC_RECOVERY_STRIPE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(64 * 1024 * 1024)
+        })
+    }
+
+    /// The `(offset, span)` sequence a streaming rebuild walks.
+    ///
+    /// Pulled out of the loop so the arithmetic is testable without a peer: it
+    /// must cover `[0, want)` exactly once, contiguously, with the last stripe
+    /// carrying the misaligned tail. An off-by-one here does not fail loudly —
+    /// a stalled offset rewrites stripe 0 forever and a skipped one leaves a
+    /// hole — and the bytes still LOOK like a shard.
+    fn ec_stripe_plan(want: u64, stripe: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        if want == 0 || stripe == 0 {
+            return out;
+        }
+        let mut offset = 0u64;
+        while offset < want {
+            let span = stripe.min(want - offset);
+            out.push((offset, span));
+            offset += span;
+        }
+        out
+    }
 
     /// Rebuild an EC shard by streaming: for each stripe, read that byte range
     /// from `data_shards` healthy peers, reconstruct the missing range, write
@@ -6504,10 +6552,8 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         }
 
         let nodes = self.nodes_map_from_manager().await?;
-        let mut offset: u64 = 0;
 
-        while offset < want {
-            let span = Self::EC_RECOVERY_STRIPE_BYTES.min(want - offset);
+        for (offset, span) in Self::ec_stripe_plan(want, Self::ec_recovery_stripe_bytes()) {
             let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
             let mut collected = 0usize;
             // Per-peer failure reasons for THIS stripe. A bare `k/K` cannot say
@@ -6588,7 +6634,6 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             file_pwrite_chunked(dst.clone(), offset, Bytes::from(rebuilt))
                 .await
                 .map_err(|e| e.to_string())?;
-            offset += span;
         }
 
         Ok(want)
@@ -7228,7 +7273,7 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         };
 
         // Chunk pread to dodge the per-syscall INT_MAX cap on macOS /
-        // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
+        // 0x7ffff000 on Linux. Recovery sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
         // re-open on miss for an evicted sealed extent; a shard file is opened
@@ -11962,8 +12007,8 @@ mod recovery_idempotence_tests {
 mod ec_shard_read_len_tests {
     use super::{ExtentNode, FILE_IO_CHUNK_BYTES};
 
-    /// The bug this fixes. A `0` here takes `copy_bytes_from_source`'s
-    /// single-shot branch — one request for the whole shard, against a 30 s
+    /// The bug this fixes. A `0` here means read-to-end — one request for the
+    /// whole shard, against a 30 s
     /// timeout whose own comment sizes it for a 256 MiB chunk. On the live
     /// cluster that was a 4 GiB shard: every peer timed out, the rebuild
     /// reported `0/4 shards available`, and EC recovery could not repair a
@@ -12025,5 +12070,60 @@ mod ec_shard_read_len_tests {
     fn an_impossible_geometry_yields_the_zero_sentinel() {
         assert_eq!(ExtentNode::ec_shard_read_len(0, 4), 0);
         assert_eq!(ExtentNode::ec_shard_read_len(1000, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod ec_stripe_plan_tests {
+    use super::ExtentNode;
+
+    /// The plan must tile `[0, want)` exactly once, contiguously. Neither way
+    /// of getting this wrong fails loudly at runtime: a stalled offset
+    /// rewrites stripe 0 for the whole shard, a skipped one leaves a hole, and
+    /// the file still ends up the right LENGTH either way — the RS decoder
+    /// never sees it, and the reader's exact-length check passes.
+    #[test]
+    fn the_plan_tiles_the_shard_exactly_once() {
+        for &(want, stripe) in &[
+            (1u64, 4096u64),
+            (4096, 4096),
+            (4097, 4096),
+            (5 * 4096 + 37, 4096),
+            (4_294_996_716, 64 << 20), // the live 17 GiB extent at K=4
+            (100, 1),
+        ] {
+            let plan = ExtentNode::ec_stripe_plan(want, stripe);
+            assert!(!plan.is_empty(), "want={want} stripe={stripe}");
+            let mut cursor = 0u64;
+            for (off, span) in &plan {
+                assert_eq!(*off, cursor, "want={want} stripe={stripe}: gap or overlap");
+                assert!(*span > 0 && *span <= stripe, "want={want}: bad span {span}");
+                cursor += span;
+            }
+            assert_eq!(cursor, want, "want={want} stripe={stripe}: plan does not reach the end");
+            assert_eq!(
+                plan.len() as u64,
+                want.div_ceil(stripe),
+                "want={want} stripe={stripe}: wrong stripe count"
+            );
+        }
+    }
+
+    /// The tail is the misaligned one, and it is the only short stripe.
+    #[test]
+    fn only_the_last_stripe_is_short() {
+        let plan = ExtentNode::ec_stripe_plan(5 * 4096 + 37, 4096);
+        assert_eq!(plan.len(), 6);
+        for (_, span) in &plan[..5] {
+            assert_eq!(*span, 4096);
+        }
+        assert_eq!(plan[5].1, 37);
+    }
+
+    /// A degenerate geometry yields no work rather than an infinite loop.
+    #[test]
+    fn nothing_to_do_is_an_empty_plan() {
+        assert!(ExtentNode::ec_stripe_plan(0, 4096).is_empty());
+        assert!(ExtentNode::ec_stripe_plan(4096, 0).is_empty());
     }
 }
