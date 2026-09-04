@@ -5987,7 +5987,34 @@ impl AutumnManager {
                     .get(&node_id)
                     .map(|o| o.kind)
                     .unwrap_or(NODE_OVERRIDE_NONE);
-                if !avali || auto_byte != NODE_AUTO_STATE_ONLINE || ovr != NODE_OVERRIDE_NONE {
+                // `avali` only means anything once the extent is SEALED: it is
+                // the per-slot "this replica holds the sealed content, serve
+                // reads from it" bit. An OPEN extent is `avali = 0` by
+                // construction, so `sealed` is the guard.
+                //
+                // The bitmask is set at SEAL — all bits on the known-commit,
+                // split/merge CoW and EC-conversion paths; one per responding
+                // member on the probe path, and `compute_commit_seal`'s floor
+                // (>= 1) means never fewer than one. Bits are added back per
+                // slot afterwards as recovery / `re_avali` reconcile a laggard,
+                // and only ever CLEARED by corrupt-replica isolation, which
+                // refuses to clear the last one. So a sealed extent always
+                // carries at least one bit, and a missing bit is a real fault.
+                //
+                // (`extent_node.rs` notes a sealed-empty extent with `avali`
+                // possibly 0 — that is the EN's LOCAL meta, which derives the
+                // bit from `sealed_length > 0`. It is not the manager record
+                // this handler reads.)
+                //
+                // Without the guard every open tail reads as a fault. On the
+                // deployed cluster that was 21 of 21 reported extents — one open
+                // tail per stream, 7 partitions x 3 streams — so the command's
+                // entire output was false positives and a genuinely missing
+                // replica would have been invisible in the noise.
+                if (ex.sealed && !avali)
+                    || auto_byte != NODE_AUTO_STATE_ONLINE
+                    || ovr != NODE_OVERRIDE_NONE
+                {
                     any_unhealthy = true;
                 }
                 slots.push(ExtentSlotHealth {
@@ -7212,6 +7239,65 @@ mod selfheal_a5_tests {
                 ec_converted: false,
             },
         );
+    }
+
+    /// An OPEN extent is not a fault. `avali` is the per-slot "this replica
+    /// holds the SEALED content" bit, so it is 0 on every open tail by
+    /// construction; reporting that as unhealthy made the command's output on
+    /// the deployed cluster 21 false positives out of 21, which is worse than
+    /// no signal — a genuinely missing replica would have been indistinguishable.
+    #[test]
+    fn open_extent_is_not_reported_unhealthy() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = false;
+            ex.sealed_length = 0;
+            ex.avali = 0; // the normal state of an open extent
+        }
+        // `seed` places the slots on nodes 1/3/5, which are absent from
+        // `node_states` and carry no override — so they default to Online and
+        // the `avali` clause is the only thing under test here.
+        let req = ExtentHealthReq {
+            node_id_filter: vec![],
+            include_healthy: false,
+        };
+        let resp_bytes = run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
+        let resp: ExtentHealthResp = rkyv_decode(&resp_bytes).expect("decode");
+        assert_eq!(resp.code, CODE_OK);
+        assert!(
+            resp.extents.is_empty(),
+            "open extent reported as unhealthy: {:?}",
+            resp.extents
+        );
+    }
+
+    /// A GUARD, not a regression test for the sealed check: it passes against
+    /// the old predicate too. What it pins is the over-fix — deleting the
+    /// `avali` clause outright — because a SEALED extent whose slot lost its
+    /// bit (a corrupt replica isolated by `MSG_REPORT_CORRUPT_REPLICA`) is
+    /// exactly what this command exists to surface.
+    #[test]
+    fn sealed_extent_missing_a_replica_is_still_reported() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = true;
+            ex.avali = 0b011; // slot 2 isolated
+        }
+        let req = ExtentHealthReq {
+            node_id_filter: vec![],
+            include_healthy: false,
+        };
+        let resp_bytes = run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
+        let resp: ExtentHealthResp = rkyv_decode(&resp_bytes).expect("decode");
+        assert_eq!(resp.extents.len(), 1, "a sealed extent short a replica must report");
+        assert!(resp.extents[0].unhealthy);
+        assert!(!resp.extents[0].slots[2].avali, "slot 2 is the isolated one");
     }
 
     fn fire(

@@ -27,6 +27,16 @@ via the shared `ConnPool`. RPC families:
 - **Node lifecycle**: list_node_states, fence_node, set_node_maintenance,
   clear_node_override, remove_node, recovery_stats, query_audit_log,
   report_disk_failure, extent_health_report, list_ec_inflight_markers.
+
+`extent_health_report` calls a slot unhealthy when its node is Suspected /
+Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
+`sealed` qualifier is not a refinement: `avali` is the per-slot "holds the
+sealed content" bit, an OPEN extent carries none by construction, and without
+the guard every open tail reads as a fault — 21 of 21 reported extents on a
+7-partition cluster, which is no signal at all. The response carries
+`sealed_length`, not the `sealed` flag, so the state is only visible
+server-side; `autumn-op info --json --part P` prints an `open` flag per extent
+when an operator needs it.
 - **Identity/capacity**: get_cluster_id (`0x45`), get/bump_cluster_version,
   cluster_df, get_cluster_overview.
 - **Inode leases** (`0x46`–`0x49`): acquire/release/heartbeat_lease,

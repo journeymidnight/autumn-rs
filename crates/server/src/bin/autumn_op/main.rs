@@ -1002,7 +1002,12 @@ async fn cmd_extent_health(client: &ClusterClient, json: bool, node_filter: Vec<
         }
         for e in resp.extents {
             println!(
-                "extent {}  eversion={} sealed={} ec={} unhealthy={}",
+                // `sealed_len=`, not `sealed=`: this is the LENGTH, and a 0
+                // here is ambiguous between an open extent and an
+                // authoritatively sealed-empty one. Reading it as the state
+                // is what sent a diagnosis of 21 "unhealthy" extents into the
+                // source before the answer (they were open tails) turned up.
+                "extent {}  eversion={} sealed_len={} ec={} unhealthy={}",
                 e.extent_id, e.eversion, e.sealed_length, e.ec_converted, e.unhealthy
             );
             for s in e.slots {
@@ -2896,9 +2901,51 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                 if p.range_end.is_empty() { "+∞".into() } else { key_s(&p.range_end) },
             );
         }
+        // Node STATE is joined in client-side from `MSG_LIST_NODE_STATES`
+        // rather than read off `NodeOverview`, which carries only
+        // {node_id, address, extent_count}. Widening that struct is a wire
+        // layout change (fingerprint bump, MIN=MAX, stop-the-world) and this
+        // is a display fix; one extra RPC from a CLI costs nothing.
+        //
+        // Showing the override is not cosmetic. During a fence-drain the
+        // node's `extent_count` does NOT fall as the rebuild progresses --
+        // the slot is swapped only when a whole extent finishes -- so a
+        // draining node is indistinguishable here from an idle one, and an
+        // operator watching a flat number reads it as a stall. The moving
+        // number is the TARGET's count.
+        let mut state_of: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        if let Ok(b) = client
+            .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+            .await
+        {
+            if let Ok(ns) = rkyv_decode::<ListNodeStatesResp>(&b) {
+                for n in ns.nodes {
+                    state_of.insert(
+                        n.node_id,
+                        (
+                            auto_state_str(n.auto_state).to_string(),
+                            override_str(n.override_kind).to_string(),
+                        ),
+                    );
+                }
+            }
+        }
         println!("nodes:");
         for n in &resp.nodes {
-            println!("  node {:>4} {:<20} {} extent shards", n.node_id, n.address, n.extent_count);
+            let (auto, ovr) = state_of
+                .get(&n.node_id)
+                .cloned()
+                .unwrap_or_else(|| ("?".into(), "-".into()));
+            let note = if ovr == "Fenced" {
+                "  <- draining; count falls only as whole extents finish"
+            } else {
+                ""
+            };
+            println!(
+                "  node {:>4} {:<20} {:>3} extent shards  {:<9} {}{}",
+                n.node_id, n.address, n.extent_count, auto, ovr, note
+            );
         }
     }
     Ok(())

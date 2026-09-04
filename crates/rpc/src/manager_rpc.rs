@@ -1490,8 +1490,14 @@ pub struct ExtentHealth {
     pub sealed_length: u64,
     pub ec_converted: bool,
     pub slots: Vec<ExtentSlotHealth>,
-    /// True iff any slot has `avali == false` OR any slot's node is
-    /// Suspected / Fenced / Maintenance.
+    /// True iff any slot of a SEALED extent has `avali == false`, OR any
+    /// slot's node is Suspected / Fenced / Maintenance.
+    ///
+    /// The `sealed` qualifier is load-bearing: `avali` is the per-slot "holds
+    /// the sealed content" bit and an OPEN extent carries none by
+    /// construction, so an unqualified check reports every open tail as a
+    /// fault — on a 7-partition cluster that is 21 false positives and no
+    /// signal at all.
     pub unhealthy: bool,
 }
 
