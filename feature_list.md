@@ -167,3 +167,38 @@
   `ops list` 上可见 —— 即"卡死"和"缓慢"在控制面上可区分，不必再 exec 到节点上量 `df`。
 - **Status**: `passes: false` (2026-09-04) — 不阻塞任何功能，但它是本次排查里最贵的一个
   缺口：有它的话，"4 小时零字节"在第一分钟就摆在眼前，而不是要靠 `df` 采样才发现。
+
+### BUG-RECOVERY-MARKER-ORPHAN — unfence 不释放 marker，僵尸占着限流名额且完全不可见
+- **Trigger** (2026-09-04，一次 fence→unfence→再 fence 的排干中实测): fence node 5 创建了
+  4 个 recovery marker（`replace_id=5`）；**unfence 之后它们全部留存**，既完不成也不释放，
+  并且把限流器的名额占死（`per_source: node 5 → 4`、`per_target: 83→2 / 85→2`，
+  `global 4/64`）。同期一个**新**派的重建（extent 73）正常跑通、完成、释放——证明机制本身没坏，
+  坏的是这四个的生命周期。
+- **根因一：释放条件只看「执行者」，从不看「创建它的理由」。** 设计里 marker 的释放是
+  事件驱动的两点：`apply_recovery_done`（干完）与
+  `release_recovery_markers_for_dead_executors`（**钉定的执行者**不在/非 Online）。
+  fence 是**创建**它的理由，但 **unfence 不在任何一条释放路径上**，也没有 wall-clock TTL
+  （刻意如此，见 crates/manager/CLAUDE.md 的 Recovery 节，那个决定本身是对的）。
+  于是形成僵尸：`replace_id` 指的 slot 已经健康（实测 extent 69 的
+  `slot[0] node=5 avali=true auto=Online`），活没意义所以完不成；执行者 83/85 活着，
+  所以也不释放。
+- **根因二：空转完全不可见。** `redispatch_pinned_recovery`（recovery.rs:305-364）每 2 秒
+  重发一次，而它的**三条非成功路径全是 `tracing::debug!`**（refused / decode / unreachable），
+  `CODE_OK`（"已启动"和"已在跑"共用）则什么都不打印。manager 跑在 INFO ⇒
+  **一个每 2 秒空转的 marker 在日志上一行都没有**。排查时 manager 日志里"没有任何 recovery 派发"
+  被我读成了"没在派发"，实际是"发了但看不见"。
+- **Scope**: (a) 给 `release_recovery_markers_for_dead_executors` 加一个同形的**电平触发**
+  伙伴：每 tick 检查 marker 的 `replace_id`——若该节点 Online、无 override、且它在该 extent 的
+  `avali` 位已置——则释放 marker。保持"事件驱动、无 TTL"的既有形状，不引入超时语义。
+  (b) 把重发的 refused/unreachable 从 `debug!` 提到 `warn!`，或至少加一个"同一 marker 连续
+  N 次未推进"的计数并在 INFO 上说一次——一个永远重发、永不进展的 marker 必须能被看见。
+  ⚠️ 注意不要把 (a) 写成"只要不 fenced 就释放"：磁盘故障、`auto_disk` 门控、以及
+  corrupt-slot 强制派发都是不看 override 的合法来源，判据必须是**那个 slot 是否真的还需要重建**。
+- **Acceptance**: fence 一个节点 → 出现 marker → unfence → **下一个 tick 内 marker 被释放**，
+  `recovery-stats` 的 `global`/`per_source`/`per_target` 归零；重复 fence/unfence 十次不残留。
+  另：让重发对一个必然失败的目标空转，`autumn-op ops list` 或 manager 日志能在 INFO 上看出
+  它没有进展。
+- **Status**: `passes: false` (2026-09-04) — 不丢数据（僵尸描述的活是"把一个健康 slot 搬走"，
+  完不成反而是安全的），但它**吃掉恢复容量**且**完全不可观测**，两者叠加正是本次排查里
+  最误导人的一段：4 个名额被占、日志全静默、而我据此得出过"根本没在 recovery"的错误结论。
+  与 F-RECOVERY-PROGRESS 是同一处观测缺口的两个面。
