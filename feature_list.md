@@ -50,8 +50,24 @@
   要么当时旋的是别的东西。重测前先确认旋钮真的接到了扇出宽度上。
 - **2026-09-04 机制已实测确认，上面那条假说对了一半**：串行点确实在"单分区单连接"上，
   但真正的上限是那条连接的**在飞数**，而不是连接数本身：
-  `ps_conn_inflight_cap`(默认 **4**) ÷ WAL append **1.39 ms** = **2,878 ops/s**，
-  实测 2,722（109,086 key / 40.07 s），吻合 95%。
+  `ps_conn_inflight_cap`(默认 **4**) ÷ WAL append **1.39 ms** = **2,878 key/s**，
+  wipe 实测 2,722 key/s（109,086 key / 40.07 s），吻合 95%。
+  PS 日志同窗口 `ops_per_sec=2769 batches=893 avg_batch_size=3.10` 三者自洽
+  （893 append/s × 3.10 key = 2,768 key/s）。
+- **⚠️ 但本条标题的 "~30K" 与上面的 2.9K 至今无法调和，且原因是标题把两种操作混成了一个数**
+  （2026-09-04，先前版本把它们并排写成"吻合"，那是错的 —— 单位相同，都是 key/s，
+  11 倍差距是真的）：
+  | 操作 | 一个请求携带 | cap=4 时的上限 | 与标题 30K |
+  |---|---|---|---|
+  | **delete** | `delete_many` 每 key 一个 `MSG_DELETE`（`client/src/lib.rs:4003-4009`） | **~2.9K key/s（硬上限）** | **无法调和** |
+  | **put** | `put_many` 走 `MSG_BATCH_PUT`，每分区一帧装 N 个 key（`lib.rs:3567`） | 4 × N ÷ 1.39 ms | N≈10 即 ~29K（**推断，未测**） |
+  delete 侧要达到标题里的 28.5K（2M key / 68~70 s，还是单分区那一行）需要 ~40 个在飞，
+  而代码里是硬编码的 4 —— 既对不上代码也对不上任何实测。**delete 的 30K 标记为未调和。**
+  put 侧批量**可以**解释 30K，但 autumn-memory 的 ingest 批大小未知，是形状合理而非验证。
+  ⇒ 结论：cap 4 + 1.39 ms 同时兼容 "delete ~2.9K" 与 "put ~30K"，**标题把两者并成一个
+  "~30K" 本身就是这条账目最大的混淆源**，重测前先把两种操作拆开记。
+  **最便宜的验证**：跑一次 memory-mcp ingest 并开着 PS 日志，`partition write summary`
+  的 `avg_batch_size` 直接给出每 append 的 key 数。
   **那 1.39 ms 的 ~95% 是跨 AZ 复制，不是磁盘**：日志流三副本分处 cn-beijing-b/d/e，
   而 `apply_completion` 要求**每个副本都 ack、没有 quorum**⇒ 延迟 = max-of-3 次往返。
   同 AZ RTT 23 µs，跨 AZ 388–399 µs（17 倍，两组独立数据）。EN 侧 pwrite+fsync 实测
@@ -61,8 +77,15 @@
   **manager 全无 zone/rack 概念**（已 grep），所以三区分布是随机抽样结果，不是持久性设计。
   ⇒ **两条可动的杠杆**：(a) `ps_conn_inflight_cap` 4→32 —— `AUTUMN_PS_CONN_INFLIGHT_CAP`
   已在 `deploy/docker/entrypoint.sh` 的 `PS_TUNABLES` 表里，**不用改代码也不用换镜像**，
-  加环境变量 + 重启 PS 即可；预期**超线性**（EN 现在批大小≈1，每个 append 单独 fsync，
-  提高在飞数才让 group commit 生效，且 EN 只有 39% 忙）。(b) 把存储收进单个 AZ，
+  加环境变量 + 重启 PS 即可。**"批大小"有两个，别混**：(i) PS 的**每 append 的 key 数**
+  = 3.10（`avg_batch_size` 字段，实测），决定 key/s；(ii) EN 的**每 fsync 的 append 数**
+  ≈ 1（**推导非读数**：`avg_write_ms` 是每请求的，60 µs/请求 恰等于裸设备 fsync 的 59 µs
+  ⇒ 每个 append 各自 fsync），只关乎 fsync 摊薄、不进 key/s 的账。预期**超线性**正是因为
+  (ii)：提高在飞数才让 EN 侧 group commit 生效，而 EN 只有 39% 忙。
+  **但线性那一半是稳的**：cap 翻倍 = 在飞深度翻倍 = 吞吐翻倍，与上面 delete/put 的单位
+  争议无关。cap 4→8 预期干净的 2x（EN 到 ~78%，仍在余量内）；4→32 是 8 倍需求、
+  EN 会到 312%，**只有 (ii) 的 group commit 真的兑现才成立** —— 未验证。
+  (b) 把存储收进单个 AZ，
   1.39 ms → ~0.11 ms。**上一条假说里"先测跨页流水"的建议已被取代** —— 串行点找到了。
 - **Status**: `passes: false` (2026-09-02；2026-09-04 补机制假说；2026-09-04 机制已实测) —— 仍只立账，不阻塞任何东西：
   需要吞吐的消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
