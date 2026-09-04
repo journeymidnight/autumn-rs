@@ -1007,6 +1007,33 @@ pub async fn start_toxiproxy() -> (ToxiproxyGuard, String) {
     (ToxiproxyGuard { child: Some(child) }, admin_addr)
 }
 
+/// Read one proxy's enabled state out of piped `toxiproxy-cli list` output.
+///
+/// Piped (not a TTY) the CLI drops its decorated table and prints one
+/// tab-separated row per proxy — name, listen, upstream, `enabled`/`disabled`,
+/// toxic count — with no header. Split out from the shell-out so the field
+/// indexing is pinned by tests instead of by a live server.
+///
+/// Matching is on the WHOLE name field: `en-0` and `en-0-ctl` are different
+/// proxies, and a prefix match would answer for the wrong one.
+fn parse_list_state(txt: &str, name: &str) -> Result<bool, String> {
+    for line in txt.lines() {
+        let mut fields = line.split('\t').map(str::trim);
+        if fields.next() != Some(name) {
+            continue;
+        }
+        // name consumed above; skip listen + upstream, take the state.
+        return match fields.nth(2) {
+            Some("enabled") => Ok(true),
+            Some("disabled") => Ok(false),
+            other => Err(format!(
+                "proxy {name}: cannot read its state from `list` (got {other:?})"
+            )),
+        };
+    }
+    Err(format!("proxy {name}: not present in `list`"))
+}
+
 /// Thin shell-out wrapper around `toxiproxy-cli`. All methods block via
 /// `std::process::Command`; that's fine because they each invoke a
 /// fast (<10ms) admin HTTP call.
@@ -1068,39 +1095,64 @@ impl ToxiproxyCli {
         Ok(())
     }
 
-    /// Set proxy enabled state explicitly. Polls `inspect` until state matches.
+    /// Set proxy enabled state explicitly, and CONFIRM it took.
+    ///
+    /// `toggle` flips whatever the current state is, so acting on a misread
+    /// state moves the proxy the wrong way — and a failure-injection helper that
+    /// reports success while the proxy stayed put does not weaken the test, it
+    /// inverts it: the nemesis believes the fault was repaired, `partitioned` is
+    /// cleared so `healthy_count` counts the node again, and everything
+    /// downstream is measured against a cluster that is still broken. So the
+    /// state is re-read after the toggle and a mismatch is an error.
     pub fn set_enabled(&self, name: &str, want: bool) -> Result<(), String> {
         if self.is_enabled(name)? == want {
             return Ok(());
         }
         self.toggle(name)?;
-        Ok(())
+        for _ in 0..50 {
+            if self.is_enabled(name)? == want {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(format!(
+            "proxy {name}: toggle reported success but the state is still {}",
+            if want { "disabled" } else { "enabled" }
+        ))
     }
 
-    /// `toxiproxy-cli inspect NAME` — parse the `Enabled:` line.
+    /// Whether the proxy is passing traffic, from `toxiproxy-cli list`.
+    ///
+    /// NOT from `inspect`: piped, 2.12.0 prints no state line there at all — an
+    /// empty stdout with exit 0 for a proxy with no toxics, and only toxic rows
+    /// when it has some. A parser looking for `Enabled:` therefore never
+    /// matched on ANY proxy in ANY state, and this used to answer "enabled" on
+    /// that miss, which made `set_enabled(name, true)` a silent no-op: a
+    /// `NetworkPartition` cut a node and the repair did nothing.
+    ///
+    /// (What that produced was not "every partition is permanent" — the victim
+    /// is picked deterministically, so the NEXT partition on the same node
+    /// toggled its already-disabled proxy back ON, healing the first cut and
+    /// injecting nothing. A node's reachability was the PARITY of the partition
+    /// events that hit it, which is what made the resulting failures ~50%
+    /// flaky rather than certain.)
+    ///
+    /// An unparseable answer is an ERROR, never a default. Guessing here is
+    /// what turned a broken proxy into a healthy-looking one.
     pub fn is_enabled(&self, name: &str) -> Result<bool, String> {
         let out = self
             .cmd()
             .stdout(std::process::Stdio::piped())
-            .arg("inspect")
-            .arg(name)
+            .arg("list")
             .output()
             .map_err(|e| format!("spawn: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "inspect proxy {name}: {}",
+                "list proxies: {}",
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
-        let txt = String::from_utf8_lossy(&out.stdout);
-        for line in txt.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("Enabled:") {
-                return Ok(rest.trim().eq_ignore_ascii_case("true"));
-            }
-        }
-        // Default to "enabled" — that's the post-create state.
-        Ok(true)
+        parse_list_state(&String::from_utf8_lossy(&out.stdout), name)
     }
 
     /// `toxiproxy-cli toxic add -t TYPE -a key=val ... [-n NAME] PROXY`
@@ -1317,4 +1369,43 @@ pub fn start_extent_node_with_manager(
         });
     });
     std::thread::sleep(Duration::from_millis(200));
+}
+
+#[cfg(test)]
+mod toxiproxy_list_tests {
+    use super::parse_list_state;
+
+    /// Verbatim piped output from toxiproxy-cli 2.12.0.
+    const LIST: &str = "en-0\t127.0.0.1:29771\t127.0.0.1:4830\tenabled\t0\n\
+                        en-0-ctl\t127.0.0.1:30771\t127.0.0.1:5830\tdisabled\t0\n\
+                        en-1\t127.0.0.1:29501\t127.0.0.1:8454\tenabled\t1\n";
+
+    #[test]
+    fn reads_each_proxys_own_state() {
+        assert_eq!(parse_list_state(LIST, "en-0"), Ok(true));
+        assert_eq!(parse_list_state(LIST, "en-1"), Ok(true), "a toxic count of 1 is not a state");
+    }
+
+    /// The sibling control proxy's name has the data proxy's name as a prefix.
+    /// Answering for the wrong one silently cuts or restores the wrong plane.
+    #[test]
+    fn a_name_that_prefixes_another_is_not_confused_for_it() {
+        assert_eq!(parse_list_state(LIST, "en-0-ctl"), Ok(false));
+    }
+
+    /// Both failure shapes are errors, never a default — a helper that guesses
+    /// "enabled" here is the whole bug this parser replaced.
+    #[test]
+    fn an_unknown_proxy_or_an_unreadable_row_is_an_error() {
+        assert!(parse_list_state(LIST, "en-9").is_err(), "absent proxy");
+        assert!(parse_list_state("", "en-0").is_err(), "empty output (no proxies)");
+        assert!(
+            parse_list_state("en-0\t127.0.0.1:1\t127.0.0.1:2\n", "en-0").is_err(),
+            "a row too short to carry a state must not read as enabled"
+        );
+        assert!(
+            parse_list_state("Name\tListen\tUpstream\tEnabled\tToxics\n", "en-0").is_err(),
+            "a header-only listing has no proxy in it"
+        );
+    }
 }

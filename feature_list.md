@@ -201,89 +201,22 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
-### BUG-EC-CONVERT-STALL-HEALTHY-COORD — EC 转换在协调者健康的情况下永不完成，卡住该 extent 的 GC【已复现，未修】
-- **Trigger** (2026-09-03, 给 F-SEALED-EMPTY-SWEEP 补 chaos 验收时撞上)：chaos verify 的
-  in-flight 阶段报 `op ... kind=7 target=0/12 still ACTIVE (state=1) after quiesce —
-  attempts=0 last_error=""; EC marker on extent 12 still pinned after quiesce (age 44s) with a
-  HEALTHY coordinator (node N) — nothing is stopping this conversion from progressing, and the
-  extent's GC is blocked until it drains`。chaos 自己的判词是 **"NO fail-loud marker in any EN log
-  —— the invariant broke SILENTLY"**。
-- **复现配方**（本机可复现，非推断）：
-  `RUST_LOG=autumn_manager=info AUTUMN_CHAOS_SEED=603 AUTUMN_CHAOS_DURATION_SECS=45 \
-   AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 cargo test -p autumn-manager --test system_chaos \
-   chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored`
-  **约 50% 的 flake**（seed 603 实测 8 轮 4 过 4 挂），**与 `RUST_LOG` 无关**。
-  所以判定它是否修好必须**连跑多轮**，单轮绿说明不了任何事。
-- **归因已做一半**：同样的失败在 **sweep 关闭时逐字复现**（同 kind、同 extent、同措辞），
-  所以与 F-SEALED-EMPTY-SWEEP 无关。**归因已补完 (2026-09-03)，用单变量隔离**：在 `db19c86`
-  （重放修复之前）的独立 worktree 上跑 seed 603，**修复前 3/8 失败**；同一 worktree 只加那一行
-  重放修复，**4/8 失败**。两者无可辨别差异 ⇒ **这个 stall 早于 84545c9，与重放修复无关**。
-  ⚠️ **过程中我差点得出相反的结论**：头 4 轮修复前全过、加修复后 3/4 挂，看起来就是我引入的回归；
-  继续采样到 8 轮才看出那是运气（0.5⁴≈6%）。**判定这条是否被修好，单次或四次运行都不够。**
-  cross-ref memory `project_ec_frozen_owner_epoch_wedge`（曾修的 owner_epoch 永久 fence 两半）与
-  `project_chaos_coverage_gaps_20260619`（"EC apply-fail 吞→wedge" 早被列为覆盖缺口）。
-- **诊断进展 (2026-09-03)，把方向掐掉了一半**：原假设是"候选被派发循环静默过滤掉"。
-  给 `collect_ec_dispatch_candidates` 的三个静默 `continue` 都加了诊断（recovery 持有 / 协调者不可
-  派发 / **没有任何带 EC 形状的 stream 列出该 extent**，最后这条是 WARN，因为它不是"下次再试"而是
-  永久卡死）后复跑：**一条都没触发**。真相在日志里：`EC convert accepted by coordinator
-  extent_id=12` 出现 **9 次** —— 它每 5 秒被重新派发、每次都被协调者**接受**、然后永不完成。
-  所以问题**不在 manager 的候选选择**，而在"accept-ACK 之后"：节点侧要么没做完，要么做完了没让
-  marker 落地（`finalize_ec_dispatch_after_convert` 没跑或失败）。`attempts=0` 也说明重新派发这条
-  路径根本不计数，这本身让"卡了多久/试了几次"不可观测。
-- **根因已定 (2026-09-03)，证据在 EN 日志里**：
-  `EC convert failed (will be re-dispatched): WriteShard to 127.0.0.1:15009 shard 1 @ 0:
-   Connection refused (os error 111) extent_id=12` —— **每 5 秒一次，9 次全同**。
-  转换不是没跑、也不是跑完丢了回报：它**每次都真的失败**，卡在向某个**参与者**写分片上。
-  链条因此闭合：EN 的 `CODE_OK` 语义是"已接受"（且已有转换在飞时直接回 `CODE_OK("already
-  running")`），失败只写进 EN 自己的日志 ⇒ manager 的 marker 永远是 `attempts=0 / last_error=""`
-  ⇒ 没有任何东西重新选目标或把它报出来 ⇒ 该 extent 的 GC 被永久挡住。
-  **频率实测约 50%**（seed 603 跑 8 轮 4 过 4 挂）；**与 `RUST_LOG` 无关**——我先前写的
-  "加 RUST_LOG 必现"是两个样本的过度概括，已作废。
-  **chaos 的断言本身误导**：它只查协调者却写着 "nothing is stopping this conversion from
-  progressing"。已改成点明它不看参与者、并指向 EN 日志里的 `EC convert failed`。
-  查到这一步用掉的时间，一半花在被那句话引开。
-- **① 观测：已做 (2026-09-03)**。EN 记住每个 extent 上次转换失败的原因，并在下一次 `CODE_OK`
-  的**消息**里带回（响应本来就有 message 字段，不动 wire）；op_ledger 补 `note_ec_dispatch` /
-  `record_ec_failure`；dispatch 的 `CODE_OK` 分支同时记 attempt 与带回的原因。
-  **端到端实测**：marker 从 `attempts=0 last_error=""` 变成
-  `attempts=9 last_error="WriteShard to 127.0.0.1:32463 shard 1 @ 0: Connection refused (os error 111)"`。
-  评审改掉两处我做错的：**(a)** attempts 原本数的是 manager 的 ping（EC 每 5s 重发、"已在跑"
-  也回 CODE_OK）⇒ 一次健康的多 GiB 转换会以每分钟 ~12 虚增；现在只在**新转换真的开始**时计数。
-  **(b)** 响应最长 60s 才回来，期间若 fence 关掉了条目，这个 CODE_OK 会**凭空重建 RUNNING 条目
-  而 marker 已没**，且永不关闭 ⇒ 之后 `force-ec-convert` 全部 attach-dedup 成静默空操作；
-  现在 marker 不在就只刷新不新建。两条都有单测且消融验证。
-  **已知的呈现瑕疵（有意保留）**：`ec_last_error` 只在成功时清除，所以一次健康的长转换期间，
-  ledger 会一直显示上一次的失败原因。改成"开始时清除"会让"在飞时卡死"重新变成瞎子，更糟。
-- **② 行为：已做 (2026-09-03，用户定"选 B：放弃并释放")**。连续
-  `EC_ABANDON_AFTER_CONSECUTIVE_FAILURES = 24` 次失败（约 2 分钟）后，走与 fence 路径**同一个**
-  txn 放弃 marker（`abandon_ec_marker`，已把 fence sweep 也改成调它，不留第二条释放路径），
-  并把 ledger 上的 op 完成为 FAILED。extent 随即解封，GC 可以进行。
-  **评审抓到一条会让特性反转的 bug（已修）**：`ec_last_error` 只在成功时清除，两种 CODE_OK 消息
-  都会一直引用它 ⇒ 一次"早先失败过一次、之后健康跑很久"的转换，每 5 秒被重复计一次失败，
-  任何超过阈值时长的转换都会**在健康运行中被放弃**。改成只在 `started_new`（真的开了新一次尝试）
-  时计数，已抽成 `ec_accept_started_new` 并有消融验证的单测。
-  **安全性论证已写进代码**（它与 `extent_inflight.rs` 里"自动释放正是 rich marker 要防的失败模式"
-  那条既有不变量冲突，所以必须显式论证而不是绕过）：EN 侧**没有 commit 阶段**（分片是按索引追加的
-  staging，`.dat` 不动，唯一 commit 点是 manager 那次 nonce 校验的 flip）；nonce 不匹配的完成报告被
-  `DifferentAttempt` 拒绝、无 marker 的报告被忽略；参与者 staging 由 `claim_ec_staging` 按 nonce 定序。
-  该不变量的注释已补上"若将来重新引入 EN 侧 commit、或让 flip 接受不匹配 nonce 的报告，本例外作废"。
-  **三处如实标注的边界**：
-  ① **阈值没有端到端覆盖** —— 24 次×5s ≈ 2 分钟，而 chaos 整场 45 秒，够不到；所以 chaos seed 603
-     那个约 50% 的失败**不会**被这条消除（它在 quiesce 时是 `attempts=9`）。
-  ② **"policy 会重新提名"成立**（我一度写成"默认关闭"，那是**只看二进制默认值的误判**，已更正）：
-     两条部署路径都默认 `AUTUMN_AUTO_POLICY_DEFAULT:-balanced`（`deploy/docker/entrypoint.sh`、
-     `deploy/baremetal/autumn-deploy`）且 seeded **Armed**，而 `balanced` 的开关是
-     `[split=false, **ec=true**, compact=true, gc=true, merge=false, rebalance=true]` —— EC 是开的。
-     二进制默认 Off 只影响 cluster.sh / chaos / perf。
-     **但重发的目标集合只有 extras 是新的**：目标从 `ex.replicates` 起算，死掉的副本持有者每次都会
-     被重新选中，除非 recovery 先把 extent 从它上面挪走 —— 于是"转换→失败→放弃"会按轮重复，
-     代价是每轮一次编码尝试，而不是 GC 被永久挡住。
-  ③ **协调者自己不可达那一形态不受本条覆盖** —— 那走 `rpc_ok = false`，不带回原因、不计数，
-     留给 fence sweep 处理。
-  剩余的 staging 清理拆成 [F-EC-STAGING-RECLAIM]（用户定"分开做、分开评审"）。
-- **Acceptance**: 上面那条复现配方连跑 5 次全绿（in-flight verify errors=0）；且能说明是哪一处
-  让它停止派发的（不是"加了重试就好了"）。
-- **Status**: `passes: false` (2026-09-03) — 已复现，未修，未归因到具体代码点。
+### BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS — chaos 的 KillThenFence nemesis 在默认配置下永远不会执行
+- **Trigger** (2026-09-04, 查 EC stall 时顺带发现，fable 评审确认): `do_kill_then_fence` 的预算门是
+  `min_healthy = (K+M).max(3) + 1`，默认 K=3/M=1 ⇒ 5；而集群规模
+  `num_ens = ((K+M).max(3)+1).max(5)` 也是 5，`healthy_count()` 上限就是 5。
+  于是 `5 <= 5` 恒成立 ⇒ 每一轮都 `KillThenFence skipped — healthy=5 ≤ min=5`。
+  **实测 13/13 轮全部跳过**（本轮所有 seed 603 日志）。
+- **它盖住的是什么**: KillThenFence 是唯一一个"杀掉节点后再 fence 它（运维宣告永久下线）"的注入，
+  也就是唯一驱动 **fence-gated recovery 派发**（`AUTUMN_MGR_RECOVERY_GATE=fenced_only` 的默认路径）
+  的 nemesis。它从没跑过 ⇒ chaos 从未覆盖过 fence→recovery→apply_recovery_done 这条主线。
+- **不要顺手把门槛调低**: 该门存在是为了不把集群压到 K+M 以下。正确的修法要么是这个动作跑在更大的
+  集群上（提高 `num_ens` 而不是降低 `min_healthy`），要么是让它在杀之前先确认 fence 后仍有 K+M 存活。
+  先确认改完之后 chaos 仍然稳定，再谈覆盖。
+- **Acceptance**: 默认配置下 KillThenFence 至少能真正执行（日志出现 `KillThenFence OK`），
+  且连跑 5 轮 chaos 全绿；断言 fence 后该 extent 的 recovery 真的被派发并 apply。
+- **Status**: `passes: false` (2026-09-04) — 已确认（代码 + 13/13 日志），未修。
+
 
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB

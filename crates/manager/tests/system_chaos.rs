@@ -245,8 +245,11 @@ fn binary_path(name: &str) -> PathBuf {
 /// toxiproxy pair binds the data proxy at `p` and the control proxy at
 /// `p + 1000` (the manager derives `control_address = advertise + 1000`,
 /// so the control proxy's listen port is forced, not free-choice).
-/// Unlike `pick_stable_port_pair` this need not dodge the ephemeral
-/// range: proxies live for the whole run and are never re-bound.
+/// These CAN land in the ephemeral range. A proxy's listener is unbound and
+/// rebound across a NetworkPartition disable/enable, so a re-enable can in
+/// principle lose the port to an ephemeral source port taken meanwhile — which
+/// now fails loudly through `set_enabled` rather than silently leaving the node
+/// dark.
 fn pick_proxy_port_pair() -> u16 {
     for _ in 0..1000 {
         let p = pick_addr().port();
@@ -850,6 +853,16 @@ struct NemesisCtx {
     partitioned: RefCell<Vec<String>>,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
+    /// Failed toxiproxy operations, counted apart from `nemesis_errors`.
+    ///
+    /// A nemesis action that declines (no candidate, budget guard) is normal and
+    /// lands in `nemesis_errors`; a proxy op that FAILS means the harness could
+    /// not inject or could not repair a fault, and the run measured something
+    /// other than what it claims to. Asserted zero at verify, because the
+    /// alternative is what this counter exists to prevent: a broken proxy helper
+    /// makes every partition a no-op and the suite passes green with that whole
+    /// dimension silently uncovered.
+    proxy_faults: Arc<AtomicU64>,
     ec_k: u32,
     ec_m: u32,
 }
@@ -1239,22 +1252,49 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
             None => return Err("no candidate".into()),
         }
     };
-    ctx.toxi
-        .set_enabled(&victim_proxy, false)
-        .map_err(|e| format!("toxiproxy disable: {e}"))?;
-    // A real partition cuts BOTH planes — the control proxy (df/health)
-    // goes down with the data proxy. Best-effort: the ctl proxy exists
-    // for every EN bootstrapped via bootstrap_en step 1b.
-    let _ = ctx.toxi.set_enabled(&format!("{victim_proxy}-ctl"), false);
+    // Book the victim BEFORE touching the proxy, not after. A disable that
+    // succeeds and then fails to CONFIRM leaves the node dark; recording it only
+    // on the success path would leave that dark node untracked — invisible to
+    // `healthy_count` and skipped by the end-of-run repair, which is exactly the
+    // shape this whole helper exists to prevent.
+    let ctl = format!("{victim_proxy}-ctl");
     ctx.partitioned.borrow_mut().push(victim_proxy.clone());
+    if let Err(e) = ctx.toxi.set_enabled(&victim_proxy, false) {
+        ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+        return Err(format!("toxiproxy disable: {e}"));
+    }
+    // A real partition cuts BOTH planes — the control proxy (df/health)
+    // goes down with the data proxy. The ctl proxy exists for every EN
+    // bootstrapped via bootstrap_en step 1b.
+    if let Err(e) = ctx.toxi.set_enabled(&ctl, false) {
+        ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+        eprintln!("nemesis: WARNING could not cut the control plane of {ctl}: {e}");
+    }
     eprintln!("nemesis: NetworkPartition {victim_proxy} (node {victim_node_id}) — disabled");
 
     compio::time::sleep(Duration::from_millis(3000)).await;
 
-    ctx.toxi
-        .set_enabled(&victim_proxy, true)
-        .map_err(|e| format!("toxiproxy enable: {e}"))?;
-    let _ = ctx.toxi.set_enabled(&format!("{victim_proxy}-ctl"), true);
+    // REPAIR IS THE LOAD-BEARING HALF. A partition reported healed but still
+    // standing leaves the node unreachable for the rest of the run while
+    // `healthy_count` counts it as fine. BOTH planes must come back before the
+    // victim leaves `partitioned` — a dark control proxy black-holes df, which
+    // is the only channel that drains an EN's recovery completions.
+    let data_ok = ctx.toxi.set_enabled(&victim_proxy, true);
+    let ctl_ok = ctx.toxi.set_enabled(&ctl, true);
+    for (plane, r) in [("data", &data_ok), ("control", &ctl_ok)] {
+        if let Err(e) = r {
+            ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "nemesis: WARNING the {plane} plane of node {victim_node_id} did not come \
+                 back ({e}) — it stays booked as partitioned"
+            );
+        }
+    }
+    if data_ok.is_err() || ctl_ok.is_err() {
+        return Err(format!(
+            "network partition node {victim_node_id}: injected but NOT repaired"
+        ));
+    }
     ctx.partitioned.borrow_mut().retain(|p| p != &victim_proxy);
     Ok(format!("network partition node {victim_node_id} (3s)"))
 }
@@ -1292,9 +1332,16 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
 
     compio::time::sleep(Duration::from_millis(4000)).await;
 
-    // Best-effort remove. If toxic was already cleared (shouldn't be
-    // possible in this single-nemesis test, but defensive), ignore.
-    let _ = ctx.toxi.remove_toxic(&victim_proxy, &toxic_name);
+    // A toxic that fails to come off is a PERMANENT 500 ms on that node for the
+    // rest of the run, and `healthy_count` cannot see it — the same untracked
+    // shape as an unhealed partition, just slower. Say so.
+    if let Err(e) = ctx.toxi.remove_toxic(&victim_proxy, &toxic_name) {
+        ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+        return Err(format!(
+            "latency spike node {victim_node_id}: toxic {toxic_name} could not be removed \
+             ({e}) — that node stays slowed for the rest of the run"
+        ));
+    }
     Ok(format!("latency spike node {victim_node_id} (4s)"))
 }
 
@@ -1589,12 +1636,15 @@ async fn verify_no_ec_markers_pinned(mgr: &RpcClient) -> Vec<String> {
         errors.push(format!(
             "EC marker on extent {} still pinned after quiesce (age {}s); its \
              COORDINATOR (node {}) is healthy, and the extent's GC is blocked \
-             until it drains. This check does NOT look at the PARTICIPANTS, and \
-             a conversion that keeps failing on one of them looks exactly like \
-             this — the marker carries attempts=0 and no error because the \
-             coordinator's failure never reaches the manager, so the only record \
-             is that EN's own log. Grep the coordinator's log for \
-             'EC convert failed' before concluding nothing is wrong downstream.",
+             until it drains. This check does NOT look at the PARTICIPANTS — a \
+             conversion failing on one of them looks exactly like this, and this \
+             marker does not carry the reason. The op-ledger error for the same \
+             extent does (`attempts` / `last_error`); if it is not beside this \
+             one, read the coordinator EN's log. When the reason names an \
+             address, check whether anything is LISTENING on it before \
+             suspecting the conversion: an unreachable participant has been a \
+             harness fault (a network partition reported healed whose proxy \
+             never came back) as well as a product one.",
             m.extent_id, m.age_secs, m.coord_node_id
         ));
     }
@@ -2871,6 +2921,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let reads_miss = Arc::new(AtomicU64::new(0));
         let nemesis_events = Arc::new(AtomicU64::new(0));
         let nemesis_errors = Arc::new(AtomicU64::new(0));
+        let proxy_faults = Arc::new(AtomicU64::new(0));
 
         // -------- Spawn workload --------
         let w1 = compio::runtime::spawn({
@@ -2947,6 +2998,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             partitioned: RefCell::new(Vec::new()),
             nemesis_events: nemesis_events.clone(),
             nemesis_errors: nemesis_errors.clone(),
+            proxy_faults: proxy_faults.clone(),
             ec_k: cfg.ec_k,
             ec_m: cfg.ec_m,
         });
@@ -2993,10 +3045,20 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 }
             }
         }
-        // Re-enable any proxies left disabled by NetworkPartition.
+        // Re-enable any proxies left disabled by NetworkPartition. A failure
+        // here means the verify phase below runs against a node nothing can
+        // reach, which shows up as an unexplained stall — say so instead.
         let partitioned_snapshot: Vec<String> = nemesis_ctx.partitioned.borrow().clone();
         for p in partitioned_snapshot {
-            let _ = nemesis_ctx.toxi.set_enabled(&p, true);
+            for name in [p.clone(), format!("{p}-ctl")] {
+                if let Err(e) = nemesis_ctx.toxi.set_enabled(&name, true) {
+                    nemesis_ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "chaos: WARNING proxy {name} could not be re-enabled before verify \
+                         ({e}) — that node is unreachable for everything below"
+                    );
+                }
+            }
         }
 
         eprintln!("chaos: settle 10 s before verify");
@@ -3144,6 +3206,20 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             }
         }
         let mut workload_errors: Vec<String> = Vec::new();
+        // A harness that cannot work its own proxies did not run the test it
+        // reports. This is not a cluster invariant — it is the precondition for
+        // trusting every invariant below, and it has to be an ASSERTION rather
+        // than a printed counter: the failure it guards against is a proxy
+        // helper that silently no-ops, which makes every partition injection
+        // vanish and leaves the suite green with that dimension uncovered.
+        let proxy_faults_total = proxy_faults.load(Ordering::Relaxed);
+        if proxy_faults_total > 0 {
+            workload_errors.push(format!(
+                "{proxy_faults_total} toxiproxy operation(s) FAILED — a fault this run \
+                 claims to have injected or repaired did not happen, so the cluster under \
+                 test is not the one described above (see the nemesis WARNING lines)"
+            ));
+        }
         if acked_total == 0 {
             workload_errors.push(format!(
                 "WORKLOAD ACKED NOTHING — 0 writes accepted, {failed_total} failed. Every \

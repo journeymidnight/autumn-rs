@@ -1,8 +1,57 @@
 Date: 2026-09-04
 TaskStatus: completed
-Task scope: F-EC-STAGING-RECLAIM —— 被放弃/失败的 EC 转换在参与者上留下的 staging
-  分片（`extent-{id}.shard{N}`）现在由普通 reconcile 回收。用户定「分开做、分开评审」，
-  与上一轮的"放弃 marker"配套但独立提交、独立评审。
+Task scope: ① F-EC-STAGING-RECLAIM（放弃的 EC 转换留下的 staging 分片由 reconcile 回收）；
+  ② BUG-EC-CONVERT-STALL-HEALTHY-COORD 归因收口 —— **它是 chaos harness 的故障，不是产品 bug**，
+  修 harness 后 13/13 绿，账本条目已销；③ 顺带确认并立账 KillThenFence nemesis 从未执行过。
+
+【2026-09-04 BUG-EC-CONVERT-STALL 定谳：toxiproxy 修复"上报成功但没生效"】
+  **结论：产品没坏，harness 坏了。** 而且坏的方式正是我一直在别处防的那一类——静默的默认值。
+  `ToxiproxyCli::is_enabled` 解析 `toxiproxy-cli inspect` 找 `Enabled:` 行，找不到就
+  `Ok(true)` 兜底。实测（我在本机起了一个 toxiproxy 亲自复现）：**2.12.0 的 inspect 在管道里
+  什么都不打印**（stdout 空、stderr 空、exit 0），带 toxic 时也只打 toxic 行、依然没有状态行。
+  所以 `is_enabled` **在任何状态下都返回 true**。后果不对称：
+  `set_enabled(x,false)` 能工作（true≠false → toggle），`set_enabled(x,true)` **静默空操作**。
+  **不是"每次 partition 都变永久"（我第一版这么写，错了，fable 纠正）**：受害节点是
+  `.find()` 确定性选的、且 `partitioned` 每次都被清空，所以**同一节点的第二次 partition
+  会把已 disabled 的代理 toggle 回 enabled** —— 治好了上一刀、这一刀什么也没注入。
+  节点的可达性 = 命中它的 partition 事件的**奇偶性**。这才解释得了为什么是 ~50% flake 而不是必挂。
+
+  **证据链（都是量出来的，不是推的）**：① marker 现在带
+  `attempts=9 last_error="WriteShard to 127.0.0.1:29771 ... Connection refused"`；
+  ② 那个 EN 自己的日志显示它在第一次被拒**之前 6 秒**就重启完并在监听；
+  ③ 外部 `ss -ltn` 每 500ms 采样：该代理端口 01:54:49 消失后**再没回来**，正好盖住整个派发窗口；
+  ④ nemesis 事件打时间戳：01:54:48.80 disable（与端口消失同秒）、01:54:51.89 报告 "OK"；
+  ⑤ CLI 层直接复现 inspect 空输出。
+  **修复**：`is_enabled` 改成解析 `list`（管道下是 tab 分隔：name/listen/upstream/enabled|disabled/toxics），
+  解析不了就**报错，绝不兜底**；`set_enabled` toggle 后回读确认。
+  **数据**：修复前 4 挂/9 轮；修复后 **13/13 全绿**（含评审修改后再跑的 5 轮，proxy 故障计数 0）；
+  消融（把 `is_enabled` 强行改回恒 true）4 轮挂 1。纯函数 `parse_list_state` 有 3 条单测，消融红。
+
+  **fable 评审又救了三处**（都已修）：① 失败注入报错只进一个**从没被断言过**的计数器 ⇒
+  以后 CLI 换版本会导致每次 partition 都失败、而整套测试照样绿、那个维度悄悄没了覆盖
+  ⇒ 加 `proxy_faults` 并在 verify 里断言为 0；② disable 成功但确认失败时会 `?` 提前返回，
+  **在入账之前** ⇒ 又是一个没人跟踪的黑代理，改成先入账再动代理；③ ctl 面恢复失败只 warn
+  且受害者已被移出 `partitioned` ⇒ 收尾修复不会重试它，而 ctl 面黑掉会堵住 df（唯一排空
+  recovery 完成报告的通道），改成两个面都好了才出账。顺手把 `do_latency_spike` 里
+  `let _ = remove_toxic` 也改成报错（同一类：摘不掉的 toxic = 永久 500ms，且不可见）。
+
+  **对历史结论的影响（重要）**：这个 harness bug 在场时，NetworkPartition 之后
+  `ctx.partitioned` 被清空 ⇒ `healthy_count()` 把不可达节点算成健康 ⇒ nemesis 预算门
+  （唯一防止把集群压到 K+M 以下的东西）失效，`do_kill_en` 可能在真实健康数=4 时再杀一台。
+  所以**凡是"NetworkPartition 之后观察到的"chaos 结论都要打问号**，包括账本里那次
+  "修复前 3/8 vs 加修复后 4/8"的单变量隔离——两臂量的都是奇偶噪声，*结论*（stall 早于该 commit）
+  因为两臂都在挂而侥幸成立，但那两个比率本身没有意义。不受影响：跨机 chaos（shell 脚本、
+  另一条注入路径）、lazyfs G2、perf 基线、decommission 根因（那是 ctl 代理**缺失**，另一个 bug）。
+
+  **产品侧不是"完全无辜"，别这么写进账本**：harness 制造的"参与者永久不可达"在生产里是真实场景
+  （节点被摘、分区不自愈），而 marker 的目标集合创建时钉死、不会重选 ⇒ 无限重派发 + 该 extent
+  GC 永久被堵 + （在观测改动之前）零线索。所以已发的两个 commit（观测、放弃）各自成立，保留。
+  仍然没覆盖的形态：协调者自己不可达（走 `rpc_ok=false`，不带回原因、不计数）。
+
+  **顺带查实并立账**：`do_kill_then_fence` 的预算门 `(K+M).max(3)+1 = 5`，而默认集群就是 5 台、
+  `healthy_count()` 上限 5 ⇒ `5<=5` 恒成立 ⇒ **13/13 轮全部 skipped**。KillThenFence 是唯一驱动
+  fence-gated recovery 的注入，也就是说 chaos 从没覆盖过那条主线。见 BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS。
+
 
 【2026-09-04 F-EC-STAGING-RECLAIM：已实现并验收，账本条目已销】
   **没有按账本里写的 Scope 做，理由要留下**：Scope 写的是给 `ExtentPlacement` 加一位
