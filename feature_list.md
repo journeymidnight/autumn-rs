@@ -202,3 +202,32 @@
   完不成反而是安全的），但它**吃掉恢复容量**且**完全不可观测**，两者叠加正是本次排查里
   最误导人的一段：4 个名额被占、日志全静默、而我据此得出过"根本没在 recovery"的错误结论。
   与 F-RECOVERY-PROGRESS 是同一处观测缺口的两个面。
+
+### F-EC-RECOVERY-RESUME — EC 分片重建中断后从零重来，而进度本可以直接读出来
+- **Trigger** (2026-09-04，用户在排查 EC 重建卡死时提出): 一个 4.25 GiB 的分片在 90% 处失败，
+  当前行为是**丢弃全部、从 0 重来**（失败路径删残片 + 清条目，非 EC 的 `Incomplete` 分支同样是
+  "Drop the stub and rebuild"）。extent 满容量是 17 GiB，K=4 ⇒ 分片 4.25 GiB，重来一次的
+  代价随 extent 大小线性增长。
+- **为什么现在做得到**: 流式重建（cf1ce53）把分片**按偏移顺序写**，所以**文件长度本身就是进度**，
+  恢复点 = `len` 向下取整到 `ec_recovery_stripe_bytes()` 边界（最后一个条带可能被写到一半，重做它）。
+  权威总长是 `ec_shard_read_len` = `erasure::shard_size(sealed_length, K)`，已经存在。
+- **缺的是"定年"，不是进度**: `try_adopt_completed_recovery` 对 EC 一律返回 `Unknown`，而它的
+  注释自陈原因 —— "EC-shard adopt needs a `shard_size` comparison"。非 EC 路径**已经**在比
+  `local_ev`/`local_len` 判 Complete/Incomplete；EC 只差这个比较。补上之后：
+  `len == shard_size && eversion 相符` → Complete（直接上报完成）；
+  `len < shard_size && eversion 相符` → **Incomplete → resume**；eversion 不符 → 丢弃。
+- **分层的边界（必须写清，否则会做错）**: `run_recovery_task` **最后才写 `.meta`**（刻意如此：
+  崩溃后残片重载成 open extent，一眼可辨不完整）。所以
+  **同进程内重试**（EN 的 10 次 × 10 秒循环，覆盖绝大多数情况）条目还在内存、带着 eversion ⇒ 可 resume；
+  **跨 EN 重启**残片没有 `.meta`、无从定年 ⇒ 只能丢弃重来。要让跨重启也能续，需要一份持久化的
+  进度记录（eversion + shard_index + 已完成字节）—— 与 F-RECOVERY-PROGRESS 是**同一份状态**，
+  两个需求应当一起设计，不要各做一份。
+- **⚠️ 一个不能忽略的风险**: 没有 per-shard 内容校验和（见 F-STREAM-ATREST-CKSUM），所以
+  resume 无法验证已完成的前缀是否完好 —— 早先某个 peer 返回的坏字节会被继续沿用。
+  每条带的精确长度检查（0434135）只挡长度错，不挡内容错。跨重启的 resume 尤其应当等
+  校验和落地后再做；同进程 resume 风险低得多（那些字节是本进程刚写的）。
+- **Acceptance**: 人为在第 N 个条带打断一次 EC 重建（同进程），下一次尝试从第 N 个条带继续、
+  **不重读已完成的部分**（以 peer 侧 `read_bytes` 的请求偏移为证），最终分片与未打断时逐字节相同。
+  eversion 在打断期间被 bump 时，必须丢弃重来而不是续。
+- **Status**: `passes: false` (2026-09-04) — 不影响正确性（重来是安全的），是效率与恢复时间问题；
+  extent 越大越贵，而本集群的常态就是 17 GiB。
