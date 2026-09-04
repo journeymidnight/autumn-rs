@@ -535,7 +535,7 @@ impl AutumnManager {
                         tracing::warn!(
                             extent_id = extent.extent_id,
                             error = %e,
-                            "could not release the marker after a refusal; it stays pinned \
+                            "could not release the marker after an undecodable response; it stays pinned \
                              to that candidate until the node goes offline"
                         );
                     }
@@ -730,11 +730,26 @@ impl AutumnManager {
         //    stays loud even though the ledger is empty.
         //  - a completion for a DIFFERENT live assignment: loud.
         let pinned_recovery = self.extent_inflight_payload_recovery(task.extent_id);
+        // BOTH halves, and the second is the load-bearing one. "The reporter is
+        // a member" alone is not evidence its rebuild landed — an EC conversion
+        // assigning it a parity slot produces exactly that, and the guard below
+        // names that as the TYPICAL layout change. Reading membership alone put
+        // the released-attempt hazard back into the quiet branch whenever the
+        // reporter happened to hold any slot. An apply also REMOVES the node it
+        // replaced, so requiring that is what distinguishes the two.
+        //
+        // The residual it cannot settle, stated plainly rather than papered
+        // over: if the conversion ALSO dropped `replace_id` (plausible — it was
+        // Suspected, so placement may well have excluded it), both cases present
+        // the identical layout, and no read of the layout can separate them.
+        // That corner reads as an echo. Closing it needs attempt identity to
+        // outlive the marker, which is a bigger change than a log level.
         let already_applied = {
             let s = self.store.inner.borrow();
-            s.extents
-                .get(&task.extent_id)
-                .is_some_and(|ex| Self::extent_slot(ex, task.node_id).is_some())
+            s.extents.get(&task.extent_id).is_some_and(|ex| {
+                Self::extent_slot(ex, task.node_id).is_some()
+                    && Self::extent_slot(ex, task.replace_id).is_none()
+            })
         };
         match pinned_recovery {
             Some(pinned)

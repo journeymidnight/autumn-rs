@@ -274,8 +274,10 @@ fn an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile() {
         );
 
         // And the extent is untouched: the payload the cluster is actually
-        // pointed at still reads back byte-exact, through the node that just
-        // had a file deleted under it.
+        // pointed at still reads back byte-exact. With RF3 a sibling may serve
+        // this read, so it is the `.dat`-survives assert above that carries the
+        // proof about THIS node; the read adds that the extent as a whole is
+        // still intact.
         let (got, _) = client
             .read_committed_bytes_from_extent(extent_id, 0, payload.len() as u64)
             .await

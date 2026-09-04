@@ -7416,10 +7416,25 @@ mod tests {
             // and node 9 is nowhere in the layout. Same empty ledger.
             m.store.inner.borrow_mut().extents.insert(extent_id, ex(vec![1, 3, 5]));
             assert!(m.apply_recovery_done(done(9)).await.is_ok());
+
+            // RELEASED ATTEMPT, WITH THE REPORTER ALREADY A MEMBER. Same
+            // hazard, but an EC conversion has meanwhile given node 9 a PARITY
+            // slot — which the guard's own neighbour calls the typical layout
+            // change. Nothing applied: node 1 still holds the slot this report
+            // wants to replace. Reading "is the reporter a member?" alone calls
+            // this an echo and goes quiet, which is how the hazard escaped a
+            // second time, one conditional deeper than the first.
+            {
+                let mut st = m.store.inner.borrow_mut();
+                let mut e = ex(vec![1, 3, 5]);
+                e.parity = vec![9];
+                st.extents.insert(extent_id, e);
+            }
+            assert!(m.apply_recovery_done(done(9)).await.is_ok());
         });
 
         let got = events.lock().unwrap().clone();
-        assert_eq!(got.len(), 2, "expected one event per refusal, got {got:?}");
+        assert_eq!(got.len(), 3, "expected one event per refusal, got {got:?}");
         assert_eq!(
             got[0].0,
             Level::DEBUG,
@@ -7431,6 +7446,13 @@ mod tests {
             Level::WARN,
             "an attempt whose marker was released while it kept working must stay loud: {}",
             got[1].1
+        );
+        assert_eq!(
+            got[2].0,
+            Level::WARN,
+            "the reporter holding an unrelated (parity) slot is not evidence its rebuild \
+             landed — the slot it was replacing is still there: {}",
+            got[2].1
         );
     }
 

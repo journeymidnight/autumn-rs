@@ -1406,14 +1406,19 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
         }
     };
     let toxic_name = format!("chaos-lat-{victim_node_id}");
-    ctx.toxi
-        .add_toxic(
-            &victim_proxy,
-            "latency",
-            &toxic_name,
-            &[("latency", "500"), ("jitter", "100")],
-        )
-        .map_err(|e| format!("toxic add: {e}"))?;
+    // A failed INJECTION is a proxy fault too, exactly like the failed removal
+    // below: the run goes on to measure a cluster that never got the fault it
+    // reports. Letting this one land in the generic decline bucket while its
+    // twin five lines down counts would be the same asymmetry twice.
+    if let Err(e) = ctx.toxi.add_toxic(
+        &victim_proxy,
+        "latency",
+        &toxic_name,
+        &[("latency", "500"), ("jitter", "100")],
+    ) {
+        ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
+        return Err(format!("toxic add: {e}"));
+    }
     eprintln!("nemesis: LatencySpike {victim_proxy} (node {victim_node_id}) — +500ms±100");
 
     compio::time::sleep(Duration::from_millis(4000)).await;
@@ -1791,6 +1796,15 @@ const FAIL_LOUD_MARKERS: &[&str] = &[
 mod nemesis_budget_tests {
     use super::{strictest_nemesis_min_healthy, ChaosConfig};
 
+    /// `ChaosConfig::from_env` reads process-wide env, and the tests below both
+    /// read it while one of them WRITES it. `#[test]`s in a binary run on
+    /// parallel threads by default, so without this the writer's temporary
+    /// `EC_K` can be observed by the reader — which does not corrupt memory
+    /// (std locks the env internally) but does let the default-sizing pin
+    /// silently take its skip path. A test that sometimes verifies nothing is
+    /// the exact shape this whole commit is about.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The default cluster must be able to satisfy EVERY nemesis budget.
     ///
     /// This is the regression that made `KillThenFence` dead code for the life
@@ -1805,6 +1819,7 @@ mod nemesis_budget_tests {
     /// a test that derives both sides itself proves only that arithmetic works.
     #[test]
     fn the_default_cluster_can_satisfy_every_nemesis_budget() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // A shell that exports these (both maintained chaos scripts export
         // NUM_ENS) is configuring something else on purpose — skip rather than
         // fail, since this test pins the DEFAULT.
@@ -1829,14 +1844,17 @@ mod nemesis_budget_tests {
     /// through the env vars that feed it.
     #[test]
     fn the_sizing_clears_the_budget_for_other_shapes() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         if std::env::var("AUTUMN_CHAOS_NUM_ENS").is_ok() {
             eprintln!("skipping: AUTUMN_CHAOS_NUM_ENS is set, which overrides the sizing");
             return;
         }
+        let prior_k = std::env::var("AUTUMN_CHAOS_EC_K").ok();
+        let prior_m = std::env::var("AUTUMN_CHAOS_EC_M").ok();
         // `from_env` reads process env, so these run one at a time in-process.
         for (k, m) in [(2u32, 1u32), (3, 1), (4, 2), (6, 3)] {
-            // SAFETY: the chaos harness is single-threaded at this point and no
-            // other test in this binary reads these vars concurrently.
+            // SAFETY: `ENV` above serialises this against the only sibling that
+            // reads these vars, so no other thread observes a torn value.
             unsafe {
                 std::env::set_var("AUTUMN_CHAOS_EC_K", k.to_string());
                 std::env::set_var("AUTUMN_CHAOS_EC_M", m.to_string());
@@ -1849,9 +1867,17 @@ mod nemesis_budget_tests {
                 cfg.num_ens
             );
         }
+        // Put the environment back the way it was found. Removing outright
+        // would clobber a shell that had legitimately exported a shape.
         unsafe {
-            std::env::remove_var("AUTUMN_CHAOS_EC_K");
-            std::env::remove_var("AUTUMN_CHAOS_EC_M");
+            match prior_k {
+                Some(v) => std::env::set_var("AUTUMN_CHAOS_EC_K", v),
+                None => std::env::remove_var("AUTUMN_CHAOS_EC_K"),
+            }
+            match prior_m {
+                Some(v) => std::env::set_var("AUTUMN_CHAOS_EC_M", v),
+                None => std::env::remove_var("AUTUMN_CHAOS_EC_M"),
+            }
         }
     }
 }
@@ -1868,8 +1894,18 @@ mod nemesis_budget_tests {
 ///
 /// Only asserted for rounds where a fence actually stranded a SEALED extent —
 /// recovery's only business — since a round with nothing to repair legitimately
-/// produces no op. The ledger is a leader-local ring of 256, so this reads what
-/// is still in it, not a total.
+/// produces no op.
+///
+/// Three honest limits, none of which make it worthless but all of which should
+/// be read before believing a failure here:
+///  - it can still FALSE-FAIL: a stranded extent occupied by a delete or a
+///    conversion for the whole round dispatches nothing, and the 256-entry
+///    ledger ring is shared across kinds, so a busy round can evict the op
+///    before this reads it;
+///  - it can FALSE-PASS: any recovery op satisfies it, including one a
+///    corrupt slot or an ordinary kill drove, so what it really asserts is
+///    "some recovery ran", not "the fence drove one";
+///  - it reads what is still in the ring, not a total.
 async fn verify_fence_drove_a_recovery(mgr: &RpcClient, stranded: usize) -> Vec<String> {
     let resp = match mgr
         .call(

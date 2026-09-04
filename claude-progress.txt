@@ -6,6 +6,42 @@ Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD �
   ⑤ F-SEALED-EMPTY-SWEEP 逐条复核后销账（它早已上线，只是标题陈旧）。五条账本条目全销。
   剩余 backlog 12 条，绝大多数等用户定夺或缺容器/安静机器，见文末。
 
+【2026-09-04 补评审：四次评审的"修复动作"本身从没被评审过，这一轮补上，抓到一条真的】
+  本会话 5 个 commit，4 个有代码、每个提交前都派了 fable —— 但**每次按评审意见改的东西
+  本身没有再评审**，而那正是新错误最容易钻进来的地方。补派一轮，范围 `96cad52..HEAD`
+  全量，并明确告诉它哪些是已评审、哪些是评审后新加的（后者才是重点）。
+
+  **F1（MEDIUM，真的，已修）——我对"分支搞反了"的修复，自己也搞反了一层。**
+  686fa8f 里我用 `extent_slot(ex, task.node_id).is_some()` 当作"这次重建已经应用"的证据。
+  但**上报者成为成员的原因不止一种**：EC 转换给它分了 parity 槽位就会这样，而紧邻的注释
+  自己就把这称作"典型的布局变化"。评审在临时 worktree 里实证：
+  `replicates:[1,3,5] parity:[9]`、无 marker、完成报告 `{node_id:9, replace_id:1}`
+  —— 什么都没应用、node 1 还占着那个槽位 —— 被判成 DEBUG "benign 回声"。
+  **正是这个守卫存在的那个事故，又一次静音了，只是比第一版深了一个条件。**
+  修法：`already_applied` 必须**两个条件**——上报者在成员里 **且** 它要替换的
+  `replace_id` **已经不在**（真正应用过必然把被替换的节点摘掉）。
+  已加第三个断言进 `the_echo_is_quiet_and_the_released_attempt_is_loud`（就用评审那组构造），
+  消融回 686fa8f 的"只看成员身份"版本 ⇒ 精确变红。
+  **残留如实写进注释而不是糊过去**：若那次转换**同时**把 `replace_id` 也摘了
+  （它当时是 Suspected，放置很可能就排除了它），两种情形的布局**完全一样**，
+  读布局无法区分，那个角落仍会被当成回声。要关掉它需要 attempt 身份活得比 marker 久，
+  那是比调日志级别大得多的改动。
+
+  **另外修的（都是评审指出）**：② dispatch 那两个互相写反的 drain 原因我只改对了 3/4，
+  解码失败那支的内层 warn 仍写着"after a refusal"；③ 两条 budget 单测通过 env 互相打架
+  （`#[test]` 默认并行，SAFETY 注释写的"没有并发读"是假的），加了 mutex 串行化并在结束时
+  **还原**而不是删除原有 env；④ `do_latency_spike` 的 **注入** 失败不计 proxy_faults，
+  而五行之下的**移除**失败计——同一个不对称犯两次；⑤ `ec_staging_reclaim.rs` 里
+  "through the node that just had a file deleted under it" 是夸大（RF3 下可能由兄弟节点服务，
+  真正的证据是上面那条 `.dat` 存活断言）。
+  **记录但不修**（评审判为 harness flake、非产品）：`verify_fence_drove_a_recovery`
+  既可能误报（被 delete/转换占住的 extent、256 环被挤掉）又可能漏报（任何 recovery op 都算数，
+  所以它真正断言的是"跑过某个 recovery"），三条限制已写进该函数的文档注释。
+  **一处无法更正**：686fa8f 的 commit message 写"six echoes"，实际账本记的是 4/0/4=8。历史不改。
+
+  验证：manager lib 318 绿、chaos 单测 11 绿、`ec_staging_reclaim` 绿、clippy 干净；
+  活集群 seed 604 复跑 `dispatched=2 applied=2 echo=2 warn=0` —— 更严的判据没有把真回声变成假警报。
+
 【2026-09-04 F-SEALED-EMPTY-SWEEP 销账 + F-KV-CLIENT-30K 补上机制假说】
   **F-SEALED-EMPTY-SWEEP**：条目标题还写着【代码已就绪，未上线】，实际 `lib.rs:1501` 早就
   spawn 了。逐条复核三项验收而不是信 Status 文本：单测 7 条绿（6 条谓词 + 1 条 sweep 回收）、
