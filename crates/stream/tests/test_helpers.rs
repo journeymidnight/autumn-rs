@@ -132,6 +132,24 @@ impl TestConn {
             .await
     }
 
+    /// `read_bytes` that surfaces a REFUSAL instead of panicking. A read the
+    /// node declines (a failed content checksum, a pread error) comes back as
+    /// an error frame, not a response code, so a caller asserting on refusal
+    /// needs the `Result`.
+    pub async fn read_bytes_result(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<ReadBytesResp, String> {
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, PayloadRef::in_dat());
+        match self.pool.call(&self.addr, MSG_READ_BYTES, req.encode()).await {
+            Ok(resp) => Ok(ReadBytesResp::decode(resp).expect("decode ReadBytesResp")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// `read_bytes` naming a specific payload file.
     pub async fn read_bytes_from(
         &self,

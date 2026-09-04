@@ -1,4 +1,5 @@
 use crate::conn_pool::parse_addr;
+use crate::extent_cksum;
 use crate::extent_rpc::*;
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
@@ -491,6 +492,15 @@ impl DiskFS {
         self.extent_file_path(extent_id, "meta")
     }
 
+    /// `extent-{id}.ck` — per-block content checksums for a SEALED extent.
+    ///
+    /// Absent is legal and means "no evidence": an extent sealed before this
+    /// existed verifies as unknown, never as corrupt, which is what lets the
+    /// sidecar arrive with no migration.
+    fn ck_path(&self, extent_id: u64) -> PathBuf {
+        self.extent_file_path(extent_id, "ck")
+    }
+
         /// `extent-{id}.shard{i}` — this node's EC shard as an ADDITIVE file, so a
     /// conversion never has to modify or replace the `.dat` it is derived from.
     /// The index is in the NAME: a shard staged for one index can then never be
@@ -540,6 +550,7 @@ impl DiskFS {
         let mut paths = vec![
             self.extent_path(extent_id),
             self.meta_path(extent_id),
+            self.ck_path(extent_id),
             self.ec_prepared_marker_path(extent_id),
         ];
         for idx in self.shard_indices_for(extent_id).await {
@@ -1050,6 +1061,8 @@ pub(crate) struct ExtentEntry {
     /// ABSENT `.meta` (fresh extent, or crash between `.dat` create and first
     /// `.meta` write) is NOT quarantined — only present-but-corrupt is.
     pub(crate) corrupt_meta: AtomicBool,
+    /// Cached `.ck` for this extent; see `CachedChecksums`.
+    content_ck: RefCell<CachedChecksums>,
 }
 
 impl ExtentEntry {
@@ -1104,6 +1117,21 @@ impl ExtentEntry {
     /// `handle_convert_to_ec` dispatches at a higher level (so two
     /// converts don't race on the staging file), but is no longer
     /// load-bearing for memory safety of the replace itself.
+    /// Record that `len` durable bytes were installed out of band — by a
+    /// peer copy or a recovery rebuild, both of which fsync before installing.
+    ///
+    /// The coalescer's watermarks are otherwise advanced only by the append
+    /// paths, which never run on a repaired replica. Leaving them behind makes
+    /// the extent read as permanently un-synced to everything that asks —
+    /// including the content checksum, which then refuses to describe exactly
+    /// the copy that was just rebuilt. One definition, so a future repair path
+    /// cannot forget half of it.
+    pub(crate) fn note_durable_install(&self, len: u64) {
+        self.len.store(len, Ordering::SeqCst);
+        self.coalescer.last_synced.fetch_max(len, Ordering::SeqCst);
+        self.coalescer.pending_fsync.fetch_max(len, Ordering::SeqCst);
+    }
+
     pub(crate) fn replace_file(&self, new_file: CompioFile) {
         // replacing installs a fresh resident fd (EC-commit /
         // recovery writeback). Sets `Some` — the extent is pinned resident.
@@ -2308,7 +2336,10 @@ async fn process_frames_backpressured(
                     continue;
                 }
             };
-            inflight.push(build_read_future(extent, file_rc, slots, false));
+            // Resolve the content checksums beside the fd — same reason, same
+            // place: every slot in this batch names the same file.
+            let content_ck = node.cached_content_checksums(anchor_extent, &extent).await;
+            inflight.push(build_read_future(extent, content_ck, file_rc, slots, false));
         } else if msg_type == MSG_READ_BYTES_BULK {
             // zero-copy read grouping — mirrors MSG_READ_BYTES but every
             // response (ok + error) is bulk-shaped (`bulk_read_head` + value Bytes)
@@ -2387,7 +2418,10 @@ async fn process_frames_backpressured(
                     continue;
                 }
             };
-            inflight.push(build_read_future(extent, file_rc, slots, true));
+            // Resolve the content checksums beside the fd — same reason, same
+            // place: every slot in this batch names the same file.
+            let content_ck = node.cached_content_checksums(anchor_extent, &extent).await;
+            inflight.push(build_read_future(extent, content_ck, file_rc, slots, true));
         } else {
             // Control RPC — no hot-path grouping. Build a future that
             // dispatches and encodes one response frame.
@@ -3157,8 +3191,86 @@ fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
     autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_READ_BYTES_BULK, code, msg, value_len)
 }
 
+/// A sealed extent's `.ck`, resolved at most once per extent.
+///
+/// Reads are the hot path and the sidecar is immutable for the life of the
+/// seal, so loading it per read would add an open+read+close to every one. The
+/// three states are distinct on purpose: "not looked at yet" must not be
+/// confused with "looked at, and there is nothing" — the second is the common
+/// steady state for extents sealed before this existed, and re-probing the
+/// filesystem for them on every read is exactly the cost this avoids.
+#[derive(Clone)]
+enum CachedChecksums {
+    NotLoaded,
+    Absent,
+    Present(Rc<extent_cksum::ExtentChecksums>),
+}
+
+/// Check a read's bytes against the extent's content checksums.
+///
+/// `Some(reason)` means the bytes must NOT be served. Serving them with a
+/// success code is the one outcome a caller cannot defend against: it has no
+/// way to tell them from correct ones. Refusing routes around the damage
+/// through the failover the client already performs for a failed read.
+///
+/// Only `InDat` payloads are described — a shard file's content is not covered
+/// by this sidecar — and only blocks the read fully covers are examined.
+fn verify_read_content(
+    content_ck: &Option<Rc<extent_cksum::ExtentChecksums>>,
+    req: &ReadBytesReq,
+    read_offset: u64,
+    data: &[u8],
+) -> Option<String> {
+    let ck = content_ck.as_ref()?;
+    if req.payload_ref().location != PayloadLocation::InDat {
+        return None;
+    }
+    if !read_covers_a_full_block(ck, read_offset, data.len() as u64) {
+        return None;
+    }
+    match ck.verify_read(read_offset, data) {
+        Ok(_) => None,
+        Err(bad) => {
+            tracing::error!(
+                extent_id = req.extent_id,
+                block = bad.block,
+                block_offset = bad.offset,
+                expected = bad.expected,
+                found = bad.found,
+                "CONTENT CHECKSUM MISMATCH on a sealed extent — these bytes differ from \
+                 what was hashed at seal; refusing to serve them"
+            );
+            Some(format!(
+                "extent {} block {} fails its content checksum",
+                req.extent_id, bad.block
+            ))
+        }
+    }
+}
+
+/// Does `[offset, offset+len)` fully contain at least one checksummed block?
+///
+/// Checked BEFORE the sidecar is consulted so a sub-block read — the hot 4 KiB
+/// case — pays nothing. Verifying one of those would mean reading and hashing
+/// its whole 1 MiB block, a 256x amplification the scrub exists to avoid.
+fn read_covers_a_full_block(
+    ck: &extent_cksum::ExtentChecksums,
+    offset: u64,
+    len: u64,
+) -> bool {
+    let end = offset.saturating_add(len);
+    let first = offset.div_ceil(ck.block_bytes);
+    let (b_start, b_end) = extent_cksum::block_range(first as usize, ck.block_bytes, ck.sealed_length);
+    b_start >= offset && b_end <= end && b_end > b_start
+}
+
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
+    // Resolved once per batch at the call site, for the same reason the fd is:
+    // this is a free fn with no node handle. `None` = this extent has no
+    // content checksums, which is the steady state for anything sealed before
+    // they existed.
+    content_ck: Option<Rc<extent_cksum::ExtentChecksums>>,
     // the fd is resolved ONCE at the call site (which has the
     // `ExtentNode` + can re-open an evicted sealed extent via `extent_file`) and
     // passed in; this boxed future is a free fn with no node handle, and holding
@@ -3250,8 +3362,14 @@ fn build_read_future(
                 match result {
                     Ok(_) => {
                         let value = Bytes::from_owner(pb);
-                        out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
-                        out.push(value);
+                        if let Some(why) =
+                            verify_read_content(&content_ck, &req, read_offset, &value)
+                        {
+                            out.push(bulk_read_head(slot.req_id, CODE_ERROR, &why, 0));
+                        } else {
+                            out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
+                            out.push(value);
+                        }
                     }
                     Err(_e) => {
                         out.push(bulk_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
@@ -3277,6 +3395,17 @@ fn build_read_future(
                         // and regressed batched reads 2-5% (extent_bench d=16/64).
                         // Zero-copy only pays off once the value memcpy dominates
                         // (>= 64 KiB), which is exactly the UCX `bulk` branch above.
+                        if let Some(why) =
+                            verify_read_content(&content_ck, &req, read_offset, &buf)
+                        {
+                            out.push(err_bytes(
+                                slot.req_id,
+                                MSG_READ_BYTES,
+                                StatusCode::Internal,
+                                &why,
+                            ));
+                            continue;
+                        }
                         use bytes::BufMut;
                         out.push(Frame::encode_response_with(
                             slot.req_id,
@@ -4510,7 +4639,8 @@ impl ExtentNode {
                         coalescer: Coalescer::new(len),
                         owner: RefCell::new(OwnerMailbox::default()),
                         corrupt_meta: AtomicBool::new(corrupt_meta),
-                    }),
+                        content_ck: RefCell::new(CachedChecksums::NotLoaded),
+                        }),
                 );
                 tracing::info!(
                     "loaded extent {extent_id} from disk {}: len={len}, sealed_length={sealed_length}, eversion={eversion}",
@@ -4608,6 +4738,7 @@ impl ExtentNode {
                     coalescer: Coalescer::new(0),
                     owner: RefCell::new(OwnerMailbox::default()),
                     corrupt_meta: AtomicBool::new(corrupt_meta),
+                    content_ck: RefCell::new(CachedChecksums::NotLoaded),
                 });
                 entry.note_shard_file(shard_index, shard_len);
                 self.extents.insert(extent_id, entry);
@@ -5177,6 +5308,7 @@ impl ExtentNode {
                 coalescer: Coalescer::new(len),
                 owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
+                content_ck: RefCell::new(CachedChecksums::NotLoaded),
             }),
         );
         self.extents
@@ -5347,6 +5479,32 @@ impl ExtentNode {
                     ));
                 }
             }
+            // Describe the sealed content while it is durable and immutable.
+            // BEFORE `.meta`, so a crash between the two leaves an extent that
+            // reloads unsealed and is re-sealed on the manager's next contact —
+            // the reverse order would leave a sealed extent whose sidecar never
+            // arrived until something happened to call this again.
+            //
+            // A failure here is a WARNING, not an error. The seal is the
+            // load-bearing operation and integrity metadata is an addition to
+            // it; failing the seal because a sidecar could not be written would
+            // turn a hardening feature into an availability risk. This method
+            // is idempotent and re-runs on every manager contact, so a missing
+            // sidecar is retried rather than lost.
+            if !ex.ec_converted {
+                if let Err(e) = self
+                    .write_extent_checksums(extent_id, extent, ex.sealed_length)
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id,
+                        sealed_length = ex.sealed_length,
+                        error = %e,
+                        "could not write the content checksum sidecar; this extent verifies \
+                         as unknown until a later seal-apply retries it"
+                    );
+                }
+            }
             // P0-A: a save_meta failure must likewise not be swallowed — the
             // seal is not durable, so flag the disk for recovery + propagate.
             if let Err(e) = self.save_meta(extent_id, extent).await {
@@ -5363,6 +5521,197 @@ impl ExtentNode {
             }
         }
         Ok(sealed_changed)
+    }
+
+    /// Hash a sealed extent's `.dat` and persist the per-block checksums.
+    ///
+    /// Skipped when a sidecar already describes this exact `sealed_length`.
+    /// That check is what keeps the cost at once-per-seal: the caller re-runs on
+    /// every manager contact (append-refresh, re_avali, reconcile), and
+    /// re-hashing a multi-GiB extent each time would make routine control
+    /// traffic proportional to stored bytes.
+    ///
+    /// Blocks are read one at a time so peak memory is one block regardless of
+    /// extent size, and each read is an await, so a long hash yields to the
+    /// runtime instead of stalling the shard.
+    async fn write_extent_checksums(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+        sealed_length: u64,
+    ) -> Result<(), String> {
+        let disk = self.disk_for(entry.disk_id)?;
+        let path = disk.ck_path(extent_id);
+        if let Ok(existing) = compio::fs::read(&path).await {
+            if let Some(ck) = extent_cksum::ExtentChecksums::decode(&existing, extent_id) {
+                if ck.sealed_length == sealed_length {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Hash only bytes that are DURABLE, not merely reserved. The append
+        // prologue advances `entry.len` before its pwritev is even submitted,
+        // so `len >= sealed_length` (what the seal guard above tests) does not
+        // mean the disk holds them; `last_synced` is the coalescer's fsync
+        // high-water. (`fd_evictable` compares it against `pending_fsync`, not
+        // against `sealed_length`, so it is a different question — every writer
+        // that installs durable bytes must advance this watermark or the extent
+        // reads as permanently un-synced here.) Hashing
+        // over an in-flight write would record a checksum of bytes that never
+        // existed, and skip-if-exists would keep it forever — turning every
+        // whole-block read of a HEALTHY replica into a refusal. That is worse
+        // than the rot this guards against, so it is the one case to fail
+        // closed on.
+        let durable = entry.coalescer.last_synced.load(Ordering::SeqCst);
+        if durable < sealed_length {
+            return Err(format!(
+                "extent {extent_id}: only {durable} of {sealed_length} bytes are durable; \
+                 not hashing content that is still in flight"
+            ));
+        }
+        let block_bytes = extent_cksum::CK_BLOCK_BYTES;
+        let n = extent_cksum::block_count_for(sealed_length, block_bytes);
+        if n == 0 {
+            // A sealed-empty extent describes no content; do not reopen an
+            // evicted fd to hash nothing.
+            let ck = extent_cksum::ExtentChecksums {
+                sealed_length,
+                block_bytes,
+                blocks: Vec::new(),
+            };
+            self.persist_checksums(extent_id, &path, &ck).await?;
+            *entry.content_ck.borrow_mut() = CachedChecksums::Present(Rc::new(ck));
+            return Ok(());
+        }
+        let file = self.extent_file(entry).await?;
+        let mut blocks = Vec::with_capacity(n);
+        for i in 0..n {
+            let (start, end) = extent_cksum::block_range(i, block_bytes, sealed_length);
+            let buf = file_pread(Rc::clone(&file), start, (end - start) as usize)
+                .await
+                .map_err(|e| format!("read block {i} of extent {extent_id}: {e}"))?;
+            blocks.push(crc32c::crc32c(&buf));
+        }
+        let ck = extent_cksum::ExtentChecksums {
+            sealed_length,
+            block_bytes,
+            blocks,
+        };
+        self.persist_checksums(extent_id, &path, &ck).await?;
+        // Refresh the read-side cache. The extent is marked sealed in memory
+        // BEFORE any of this I/O runs, so a read batch arriving in that window
+        // asks for the sidecar, does not find it, and caches `Absent` — which
+        // nothing else ever resets. That window is not a corner: a log extent
+        // seals at roll while readers are on its tail. Without this the very
+        // extents that just got a checksum are the ones that never use it.
+        *entry.content_ck.borrow_mut() = CachedChecksums::Present(Rc::new(ck));
+        Ok(())
+    }
+
+    /// Write a sidecar durably: tmp → fsync → rename → parent-dir fsync, the
+    /// same discipline `.meta` uses. A torn sidecar fails its own trailer CRC
+    /// and reads as absent, so this is about not leaving one behind rather than
+    /// about correctness.
+    async fn persist_checksums(
+        &self,
+        extent_id: u64,
+        path: &std::path::Path,
+        ck: &extent_cksum::ExtentChecksums,
+    ) -> Result<(), String> {
+        let buf = ck.encode(extent_id);
+        let mut tmp = path.to_path_buf().into_os_string();
+        tmp.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp);
+        let mut f = compio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| format!("open ck tmp for extent {extent_id}: {e}"))?;
+        let BufResult(result, _) = f.write_all_at(buf, 0).await;
+        result.map_err(|e| format!("write ck tmp for extent {extent_id}: {e}"))?;
+        f.sync_data()
+            .await
+            .map_err(|e| format!("sync ck tmp for extent {extent_id}: {e}"))?;
+        drop(f);
+        compio::fs::rename(&tmp_path, path)
+            .await
+            .map_err(|e| format!("rename ck for extent {extent_id}: {e}"))?;
+        if let Some(dir) = path.parent() {
+            let d = compio::fs::File::open(dir)
+                .await
+                .map_err(|e| format!("open ck dir for extent {extent_id}: {e}"))?;
+            d.sync_all()
+                .await
+                .map_err(|e| format!("fsync ck dir for extent {extent_id}: {e}"))?;
+        }
+        tracing::debug!(
+            extent_id,
+            sealed_length = ck.sealed_length,
+            blocks = ck.blocks.len(),
+            "wrote the content checksum sidecar for a sealed extent"
+        );
+        Ok(())
+    }
+
+    /// The cached `.ck` for a sealed extent, loading it at most once.
+    ///
+    /// Only sealed extents have one, and the seal is immutable, so a single
+    /// load serves every later read. `Absent` is cached as deliberately as
+    /// `Present`: extents sealed before this existed are the common case and
+    /// must not cost a filesystem probe per read.
+    async fn cached_content_checksums(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+    ) -> Option<Rc<extent_cksum::ExtentChecksums>> {
+        if !entry.sealed.load(Ordering::SeqCst) {
+            return None;
+        }
+        match &*entry.content_ck.borrow() {
+            CachedChecksums::Present(ck) => return Some(Rc::clone(ck)),
+            CachedChecksums::Absent => return None,
+            CachedChecksums::NotLoaded => {}
+        }
+        let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+        let loaded = self
+            .load_extent_checksums(extent_id, entry, sealed_length)
+            .await
+            .map(Rc::new);
+        *entry.content_ck.borrow_mut() = match &loaded {
+            Some(ck) => CachedChecksums::Present(Rc::clone(ck)),
+            None => CachedChecksums::Absent,
+        };
+        loaded
+    }
+
+    /// The sidecar for `extent_id`, or `None` when there is no evidence.
+    ///
+    /// Absent, unreadable, mismatched, or describing a different length all
+    /// collapse to `None`. A sidecar that disagrees with the extent's seal
+    /// describes different content — a crash between the two writes — and is
+    /// not evidence about these bytes.
+    async fn load_extent_checksums(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+        sealed_length: u64,
+    ) -> Option<extent_cksum::ExtentChecksums> {
+        let disk = self.disk_for(entry.disk_id).ok()?;
+        let raw = compio::fs::read(disk.ck_path(extent_id)).await.ok()?;
+        let ck = extent_cksum::ExtentChecksums::decode(&raw, extent_id)?;
+        if ck.sealed_length != sealed_length {
+            tracing::warn!(
+                extent_id,
+                sidecar_length = ck.sealed_length,
+                sealed_length,
+                "content checksum sidecar describes a different length; ignoring it"
+            );
+            return None;
+        }
+        Some(ck)
     }
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u64) -> Result<(), String> {
@@ -6028,7 +6377,7 @@ impl ExtentNode {
             ));
         }
 
-        extent.len.store(payload_len, Ordering::SeqCst);
+        extent.note_durable_install(payload_len);
         // Use fetch_max instead of store for eversion/sealed_length/avali so
         // that any concurrent atomic update that landed between the check and
         // these stores cannot be rolled back. Monotonic progress is guaranteed
@@ -6846,6 +7195,20 @@ impl ExtentNode {
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
+        // Same policy body as the batched path, deliberately. This handler is
+        // unreachable over the wire (`process_frames_backpressured` intercepts
+        // both read types before `dispatch`), and it is kept only as the twin
+        // that `read_plan` is shared with — so it must not grow a second,
+        // drifting answer to the same question.
+        if let Some(why) = verify_read_content(
+            &self.cached_content_checksums(req.extent_id, &extent).await,
+            &req,
+            read_offset,
+            &data,
+        ) {
+            return Err((StatusCode::Internal, why));
+        }
+
         Ok(ReadBytesResp {
             code: CODE_OK,
             end,
@@ -7257,6 +7620,7 @@ impl ExtentNode {
                 coalescer: Coalescer::new(len),
                 owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
+                content_ck: RefCell::new(CachedChecksums::NotLoaded),
             }),
         );
 
@@ -8221,7 +8585,7 @@ impl ExtentNode {
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
         entry.replace_file(new_file);
-        entry.len.store(len, Ordering::SeqCst);
+        entry.note_durable_install(len);
         Ok(())
     }
 
@@ -8939,6 +9303,33 @@ impl ExtentNode {
         self.save_meta(extent_id, &entry).await
     }
 
+    /// Seal through the REAL durable applier, for tests that need the side
+    /// effects a seal actually has (the `.meta` persist AND the content
+    /// checksum sidecar) rather than `test_seal_local`'s direct state poke.
+    pub async fn test_seal_durable(
+        &self,
+        extent_id: u64,
+        sealed_length: u64,
+        eversion: u64,
+    ) -> std::result::Result<(), String> {
+        let entry = self.get_extent(extent_id).await.map_err(|(_, m)| m)?;
+        entry
+            .coalescer
+            .last_synced
+            .fetch_max(sealed_length, Ordering::SeqCst);
+        let ex = ExtentInfo {
+            extent_id,
+            sealed: true,
+            sealed_length,
+            eversion,
+            avali: 1,
+            ..Default::default()
+        };
+        self.apply_extent_meta_durable(extent_id, &entry, &ex)
+            .await
+            .map(|_| ())
+    }
+
     /// Run ONE reconcile round against the manager, for integration tests that
     /// need the production path — including where the staging tick is sampled —
     /// rather than the applier alone. The real trigger is a 5-minute sweep.
@@ -9292,6 +9683,343 @@ mod sealed_append_guard_tests {
                 "still a shard-only holder after reload"
             );
         }
+    }
+
+    /// Sealing writes a sidecar that describes the sealed content, and a
+    /// later bit flip in the `.dat` is caught by it.
+    ///
+    /// The `.meta` CRC cannot do this: it covers its own 48 metadata bytes, so
+    /// it still validates perfectly while the value region rots underneath it.
+    #[compio::test]
+    async fn sealing_records_content_checksums_that_catch_a_later_flip() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5150u64;
+        let content: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.len.store(content.len() as u64, Ordering::SeqCst);
+        entry.has_dat.store(true, Ordering::SeqCst);
+        // The write above IS on disk, so the coalescer's fsync high-water must
+        // say so — the hash refuses to describe bytes it cannot prove durable.
+        entry
+            .coalescer
+            .last_synced
+            .store(content.len() as u64, Ordering::SeqCst);
+
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
+
+        let ck = node
+            .load_extent_checksums(eid, &entry, content.len() as u64)
+            .await
+            .expect("sealing must leave a sidecar describing the sealed content");
+        assert_eq!(ck.verify_read(0, &content), Ok(1), "clean content verifies");
+
+        // The same read, one byte different, is caught — and the block index
+        // points at where it happened rather than just saying "somewhere".
+        let mut rotted = content.clone();
+        rotted[12_345] ^= 0x01;
+        let bad = ck
+            .verify_read(0, &rotted)
+            .expect_err("a flipped byte must not verify");
+        assert_eq!(bad.block, 0);
+        assert_eq!(bad.offset, 0);
+    }
+
+    /// A read whose blocks fail their checksum must NOT be answered with the
+    /// bytes. Serving them with `CODE_OK` is the one outcome a caller cannot
+    /// defend against — it has no way to tell those bytes from correct ones.
+    ///
+    /// Failing instead is what routes around the damage: it is the same error
+    /// shape a pread failure already returns, so the client's existing replica
+    /// rotation carries the read to a healthy copy.
+    #[compio::test]
+    async fn a_sealed_read_that_fails_its_checksum_is_refused_not_served() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5152u64;
+        let content: Vec<u8> = (0..30_000u32).map(|i| (i % 241) as u8).collect();
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.len.store(content.len() as u64, Ordering::SeqCst);
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry
+            .coalescer
+            .last_synced
+            .store(content.len() as u64, Ordering::SeqCst);
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+
+        let whole = |ev: u64| {
+            ReadBytesReq::new(eid, ev, 0, content.len() as u64, PayloadRef::in_dat()).encode()
+        };
+        // Clean: the read is served and the bytes are right.
+        let resp = node.handle_read_bytes(whole(2)).await.expect("clean read");
+        let decoded = ReadBytesResp::decode(resp).expect("decode");
+        assert_eq!(decoded.code, CODE_OK);
+        assert_eq!(decoded.payload.as_ref(), &content[..]);
+
+        // Now the disk rots underneath a sealed, immutable extent.
+        let disk = node.disk_for(entry.disk_id).expect("disk");
+        let mut rotted = content.clone();
+        rotted[17_000] ^= 0x01;
+        std::fs::write(disk.extent_path(eid), &rotted).expect("rot");
+        node.fd_lru.forget(eid);
+        *entry.file.borrow_mut() = None;
+
+        let err = node
+            .handle_read_bytes(whole(2))
+            .await
+            .expect_err("a read failing its content checksum must not return bytes");
+        assert!(
+            err.1.contains("content checksum"),
+            "refused for the wrong reason: {}",
+            err.1
+        );
+    }
+
+    /// Content that is not yet DURABLE must not be hashed.
+    ///
+    /// The append prologue advances `entry.len` before its write is even
+    /// submitted, so "len covers sealed_length" does not mean the disk does.
+    /// Hashing over an in-flight write would record a checksum of bytes that
+    /// may never land, and skip-if-exists would keep it forever — every
+    /// whole-block read of a HEALTHY replica would then be refused.
+    ///
+    /// The state below is a PARTIALLY synced extent, which is what an in-flight
+    /// append actually looks like. An earlier version of this test used
+    /// `last_synced == 0` with fully durable bytes and called that
+    /// "not durable" — but that is byte-for-byte the state of a healthy
+    /// RECOVERED replica, so it asserted that repaired copies must never be
+    /// checksummed. `note_durable_install` is what keeps those two apart.
+    #[compio::test]
+    async fn content_that_is_not_durable_yet_is_not_hashed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5153u64;
+        let content = vec![3u8; 4096];
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.len.store(content.len() as u64, Ordering::SeqCst);
+        entry.has_dat.store(true, Ordering::SeqCst);
+        // Half the extent is acknowledged durable; the rest is still in flight.
+        entry.coalescer.last_synced.store(2048, Ordering::SeqCst);
+
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        // The seal itself still succeeds — integrity metadata must never be
+        // able to fail a seal.
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        assert!(
+            node.load_extent_checksums(eid, &entry, content.len() as u64)
+                .await
+                .is_none(),
+            "hashed content the coalescer had not reported durable"
+        );
+
+        // Once the tail lands, a later apply records it.
+        entry
+            .coalescer
+            .last_synced
+            .store(content.len() as u64, Ordering::SeqCst);
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("re-seal");
+        assert!(
+            node.load_extent_checksums(eid, &entry, content.len() as u64)
+                .await
+                .is_some(),
+            "durable content must eventually be described"
+        );
+    }
+
+    /// A replica whose bytes arrived by REPAIR must be describable without a
+    /// restart.
+    ///
+    /// Peer copy and recovery rebuild fsync and then install the file; neither
+    /// runs the append path, so neither advances the coalescer watermarks that
+    /// the checksum gate reads. Left alone, the extent looks permanently
+    /// un-synced and the rebuilt copy — the one most in need of a checksum —
+    /// never gets one until the process restarts and the watermark re-seeds
+    /// from the file size.
+    #[compio::test]
+    async fn a_repaired_replica_is_describable_without_a_restart() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5154u64;
+        let content = vec![0x5Au8; 8192];
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        // Exactly what peer_copy / run_recovery_task do after their fsync.
+        entry.note_durable_install(content.len() as u64);
+
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 3,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        assert!(
+            node.load_extent_checksums(eid, &entry, content.len() as u64)
+                .await
+                .is_some(),
+            "a repaired replica was denied a content checksum"
+        );
+    }
+
+    /// Sealing must refresh the read-side cache, not just the file.
+    ///
+    /// The extent is marked sealed in memory BEFORE the sidecar is written, so
+    /// a read arriving in that window finds no `.ck` and caches "absent" — and
+    /// nothing else ever resets that. The window is not a corner: a log extent
+    /// seals at roll while readers are on its tail. Without the refresh the
+    /// extents that just got a checksum are the ones that never use it.
+    #[compio::test]
+    async fn sealing_refreshes_a_read_cache_that_already_saw_no_sidecar() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5155u64;
+        let content = vec![0x11u8; 4096];
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry.note_durable_install(content.len() as u64);
+
+        // A reader gets here first: sealed in memory, sidecar not written yet.
+        entry.sealed.store(true, Ordering::SeqCst);
+        entry
+            .sealed_length
+            .store(content.len() as u64, Ordering::SeqCst);
+        assert!(
+            node.cached_content_checksums(eid, &entry).await.is_none(),
+            "precondition: no sidecar exists yet"
+        );
+
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        assert!(
+            node.cached_content_checksums(eid, &entry).await.is_some(),
+            "the read cache still says this extent has no checksums, so every \
+             later read of it goes unverified for the life of the process"
+        );
+    }
+
+    /// A repeat seal-apply must NOT re-hash — and the reason is correctness,    /// A repeat seal-apply must NOT re-hash — and the reason is correctness,
+    /// not just cost.
+    ///
+    /// The applier runs on every manager contact (append-refresh, re_avali,
+    /// reconcile). If it re-hashed each time, then any rot that appeared after
+    /// the seal would be blessed into a fresh checksum on the next contact, and
+    /// the corrupt bytes would verify perfectly forever after. The checksum has
+    /// to keep describing the content as it was when the extent sealed, or it
+    /// describes nothing worth knowing.
+    #[compio::test]
+    async fn a_repeat_seal_apply_does_not_re_bless_rotted_content() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5151u64;
+        let content = vec![9u8; 1000];
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.len.store(content.len() as u64, Ordering::SeqCst);
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry
+            .coalescer
+            .last_synced
+            .store(content.len() as u64, Ordering::SeqCst);
+
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+
+        // Rot appears after the seal.
+        let mut rotted = content.clone();
+        rotted[500] ^= 0x01;
+        let disk = node.disk_for(entry.disk_id).expect("disk");
+        std::fs::write(disk.extent_path(eid), &rotted).expect("rot the .dat");
+
+        // The manager contacts this node again, as it routinely does.
+        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("re-seal");
+
+        let ck = node
+            .load_extent_checksums(eid, &entry, content.len() as u64)
+            .await
+            .expect("sidecar");
+        assert!(
+            ck.verify_read(0, &rotted).is_err(),
+            "the re-seal re-hashed the rotted bytes and blessed them; the checksum \
+             must keep describing the content as it was at seal"
+        );
+        assert_eq!(ck.verify_read(0, &content), Ok(1), "and still matches the real content");
     }
 
     /// META-FAILCLOSED (coco prod-audit #1): a corrupt `.meta` (CRC mismatch

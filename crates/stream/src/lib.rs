@@ -2,6 +2,7 @@ pub mod client;
 pub mod conn_pool;
 pub mod erasure;
 pub mod extent_node;
+mod extent_cksum;
 /// extent_rpc relocated to autumn-rpc (joins manager_rpc /
 /// partition_rpc as the single wire-schema home). Re-exported here so all
 /// existing `autumn_stream::extent_rpc::*` / `crate::extent_rpc::*` paths

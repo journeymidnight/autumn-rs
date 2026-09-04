@@ -364,3 +364,54 @@ async fn shards_of_one_node_share_their_completion_queue() {
         "shard 0 serves the node's df, so it must drain what shard 1 completed"
     );
 }
+
+/// The verification must sit on the path production reads actually take.
+///
+/// `MSG_READ_BYTES` is intercepted in `handle_connection` and answered by
+/// `build_read_future`; the `dispatch` arm that calls `handle_read_bytes` is
+/// dead over the wire. A check placed there passes its own unit test and
+/// protects nothing — so this test goes over a real socket, which is the only
+/// way to tell the two apart.
+#[compio::test]
+async fn a_rotted_sealed_extent_is_refused_over_the_wire() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+    let eid = 8801u64;
+    let content: Vec<u8> = (0..(2 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, content.clone()).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    node.test_seal_durable(eid, content.len() as u64, 2)
+        .await
+        .expect("seal");
+
+    // Clean: served over the wire, byte-exact.
+    let r = conn.read_bytes(eid, 2, 0, content.len() as u64).await;
+    assert_eq!(r.code, autumn_stream::extent_rpc::CODE_OK, "clean read must serve");
+    assert_eq!(r.payload.as_ref(), &content[..], "clean bytes");
+
+    // Rot one byte inside the first block, behind the node's back. `fs::write`
+    // truncates the SAME inode, so the node's open fd sees the new bytes — no
+    // cache to invalidate, which is what makes this a faithful stand-in for
+    // media rot under a live process.
+    let path = extent_dir(d.path(), eid).join(format!("extent-{eid}.dat"));
+    let mut rotted = content.clone();
+    rotted[123_456] ^= 0x01;
+    std::fs::write(&path, &rotted).expect("rot");
+
+    let Err(err) = conn.read_bytes_result(eid, 2, 0, content.len() as u64).await else {
+        panic!("a rotted sealed extent was served over the wire with a success code");
+    };
+    assert!(
+        err.contains("content checksum"),
+        "refused for the wrong reason: {err}"
+    );
+}

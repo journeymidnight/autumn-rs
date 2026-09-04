@@ -1,93 +1,60 @@
 Date: 2026-09-04
-TaskStatus: completed
-Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD 定谳为 harness 故障并修复；
-  ③ BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS 修复（那条 nemesis 从来没执行过）；
-  ④ F-RECOVERY-PATH-SILENT 修复（recovery 派发/应用可见，重复上报不再 WARN）；
-  ⑤ F-SEALED-EMPTY-SWEEP 逐条复核后销账（它早已上线，只是标题陈旧）。五条账本条目全销。
-  剩余 backlog 12 条，绝大多数等用户定夺或缺容器/安静机器，见文末。
+TaskStatus: not_completed
+Task scope: F-STREAM-ATREST-CKSUM（bitrot / stream 层 at-rest 内容校验）。
+  **增量 1 已落地**（格式 + seal 时写 + 读时验），**增量 2（scrub）在做**，所以 not_completed。
+  另按用户逐条指示关掉 8 条 backlog：12 → 4。
 
-【2026-09-04 补评审：四次评审的"修复动作"本身从没被评审过，这一轮补上，抓到一条真的】
-  本会话 5 个 commit，4 个有代码、每个提交前都派了 fable —— 但**每次按评审意见改的东西
-  本身没有再评审**，而那正是新错误最容易钻进来的地方。补派一轮，范围 `96cad52..HEAD`
-  全量，并明确告诉它哪些是已评审、哪些是评审后新加的（后者才是重点）。
+【2026-09-04 bitrot 增量 1：设计先行，两轮评审各抓到一条 HIGH】
+  **先出设计再动手（用户要求）**：`docs/autumn_integrity_plan.md`，每条现状对着代码核过。
+  查清的关键事实：**每个"拥有字节格式"的层都做了校验**（WAL 记录 CRC 含 value、SST block
+  CRC 且每读必比、frame CRC 覆盖头部），而 **stream 层不拥有格式**，`.meta` 的 CRC 只盖 48
+  字节元数据。更要命的是**两条修复路径都跑在有校验的那一层之下**：recovery 的
+  verify-after-fetch 只比 length + eversion（翻位两个都不变 ⇒ 重建出来逐字节相同），
+  EC 协调者直接拿本地 `.dat` 编 parity（腐化变成整条 stripe 的 canonical）。
+  加上读侧副本轮转是 `(extent_id, offset)` 的确定性 SplitMix64 ⇒ 坏副本被**一致**命中。
 
-  **F1（MEDIUM，真的，已修）——我对"分支搞反了"的修复，自己也搞反了一层。**
-  686fa8f 里我用 `extent_slot(ex, task.node_id).is_some()` 当作"这次重建已经应用"的证据。
-  但**上报者成为成员的原因不止一种**：EC 转换给它分了 parity 槽位就会这样，而紧邻的注释
-  自己就把这称作"典型的布局变化"。评审在临时 worktree 里实证：
-  `replicates:[1,3,5] parity:[9]`、无 marker、完成报告 `{node_id:9, replace_id:1}`
-  —— 什么都没应用、node 1 还占着那个槽位 —— 被判成 DEBUG "benign 回声"。
-  **正是这个守卫存在的那个事故，又一次静音了，只是比第一版深了一个条件。**
-  修法：`already_applied` 必须**两个条件**——上报者在成员里 **且** 它要替换的
-  `replace_id` **已经不在**（真正应用过必然把被替换的节点摘掉）。
-  已加第三个断言进 `the_echo_is_quiet_and_the_released_attempt_is_loud`（就用评审那组构造），
-  消融回 686fa8f 的"只看成员身份"版本 ⇒ 精确变红。
-  **残留如实写进注释而不是糊过去**：若那次转换**同时**把 `replace_id` 也摘了
-  （它当时是 Suspected，放置很可能就排除了它），两种情形的布局**完全一样**，
-  读布局无法区分，那个角落仍会被当成回声。要关掉它需要 attempt 身份活得比 marker 久，
-  那是比调日志级别大得多的改动。
+  **落地**：`extent-{id}.ck` sidecar（magic + extent_id + sealed_length + block_bytes +
+  block_count + 每 1 MiB 一个 CRC32C + 尾部 CRC）。缺失/解不开/长度不符 = **"没有证据"**，
+  永远不等于"腐化" —— 这是零迁移的关键，也是不会因为 4 KiB sidecar 烂掉就去重建一个健康
+  的多 GiB 副本的关键。逐块而非整 extent：整体校验和只能全量读时验，scrub 也没法指出哪段坏。
 
-  **另外修的（都是评审指出）**：② dispatch 那两个互相写反的 drain 原因我只改对了 3/4，
-  解码失败那支的内层 warn 仍写着"after a refusal"；③ 两条 budget 单测通过 env 互相打架
-  （`#[test]` 默认并行，SAFETY 注释写的"没有并发读"是假的），加了 mutex 串行化并在结束时
-  **还原**而不是删除原有 env；④ `do_latency_spike` 的 **注入** 失败不计 proxy_faults，
-  而五行之下的**移除**失败计——同一个不对称犯两次；⑤ `ec_staging_reclaim.rs` 里
-  "through the node that just had a file deleted under it" 是夸大（RF3 下可能由兄弟节点服务，
-  真正的证据是上面那条 `.dat` 存活断言）。
-  **记录但不修**（评审判为 harness flake、非产品）：`verify_fence_drove_a_recovery`
-  既可能误报（被 delete/转换占住的 extent、256 环被挤掉）又可能漏报（任何 recovery op 都算数，
-  所以它真正断言的是"跑过某个 recovery"），三条限制已写进该函数的文档注释。
-  **一处无法更正**：686fa8f 的 commit message 写"six echoes"，实际账本记的是 4/0/4=8。历史不改。
+  **第一轮评审抓到的 HIGH：我的读校验挂在一条死路上。** `MSG_READ_BYTES` 在
+  `handle_connection` 就被拦截交给 `build_read_future`，走到 `handle_read_bytes` 的
+  dispatch 分支**线上到不了** —— 而 `build_read_future` 自己的注释就写着这句话，我从旁边
+  读过去没看见。我的消融"通过"了，因为它证明的是**函数**能工作、不是**路径**会执行。
+  已移到 `build_read_future`（bulk + 非 bulk 两条臂），并加 `a_rotted_sealed_extent_is_
+  refused_over_the_wire` 走**真 socket** 当守卫 —— 那是唯一能区分函数对和路径对的办法。
+  同轮还抓到：哈希用的是**预留** `len` 而不是**已落盘**长度，一旦在飞行中的写上面算了校验和，
+  skip-if-exists 会永远留着 ⇒ 此后这个**健康**副本每次整块读都被拒。改成看 `last_synced`。
 
-  验证：manager lib 318 绿、chaos 单测 11 绿、`ec_staging_reclaim` 绿、clippy 干净；
-  活集群 seed 604 复跑 `dispatched=2 applied=2 echo=2 warn=0` —— 更严的判据没有把真回声变成假警报。
+  **第二轮评审（专审"按第一轮意见改的东西"）又抓到两条 HIGH，方向相反**：不是误报，是
+  **静默地把覆盖面从最需要的那批身上拿走**。
+  ① `last_synced` 只有 append 路径会推进，**peer-copy 和 recovery 重建都不碰** ⇒ 修复出来的
+     副本永远看起来"未落盘"、永远拿不到校验和，直到进程重启才从文件大小重新播种。
+     **而我新写的那条测试正好把这个 bug 断言成了正确行为**（len=4096 / last_synced=0 +
+     字节其实durable，那正是健康recovered副本的状态）。已抽出 `note_durable_install` 作为
+     "带外装入durable字节"的唯一定义，两条修复路径都走它；测试改成表达真正的危险
+     （部分已同步 = 真正在飞的 append）。
+  ② `Absent` 会被**永久缓存**，而 seal 是**先**在内存里置 sealed、**后**写 sidecar ⇒ 那个窗口
+     里来的读会把"没有校验和"钉死一辈子。而且这不是边角：log extent 在 roll 时 seal，
+     而读者正压在它尾巴上。已改成写完 sidecar 就刷新缓存。
+  两条都有消融验证的回归测试。
 
-【2026-09-04 F-SEALED-EMPTY-SWEEP 销账 + F-KV-CLIENT-30K 补上机制假说】
-  **F-SEALED-EMPTY-SWEEP**：条目标题还写着【代码已就绪，未上线】，实际 `lib.rs:1501` 早就
-  spawn 了。逐条复核三项验收而不是信 Status 文本：单测 7 条绿（6 条谓词 + 1 条 sweep 回收）、
-  etcd 集成测试 `sealed_empty_sweep_etcd` 带 `--ignored` 跑过绿、chaos seed 603 与
-  769351064 各跑（769351064 连跑 3 次全绿）。三项都成立 ⇒ 按规则销账。
+  **我在设计文档里写错并被代码打脸三次**（都已改）：①"seal 是唯一写入者"——EN 上根本没有
+  seal 事件；②"recovery 源读继承这个检查"——handler 找错了；③"探测器以下什么都不用新建"
+  ——`ReportCorruptReplicaReq` 是 PS 形状的（CAS 分区 owner_epoch、按 log_stream_id 限定范围、
+  契约要求"已确认另一个副本干净"），**EN 三样都没有**。正确通道是 `DfResp`（EN→manager 那条
+  已在运 done_tasks / ec_done 的心跳）；自报比他报不需要 fencing，因为一个节点说"我这份坏了"
+  只可能坑到自己。这是一次 wire 改动，归增量 2。
 
-  **F-KV-CLIENT-30K**：没测量，但纯读代码拿到一个能一次解释掉全部四个死胡同变量的机制假说
-  —— wipe 的 scan 返回 512 个**连续** key，连续 key 在**同一分区**，而 client 是
-  **每分区一条多路复用连接** ⇒ 每页的 delete_many 只打一个分区一条连接，与分区数无关，
-  加并发只是把队列排深。可证伪预测：跨页流水（不同页打不同分区）应线性 scale，页内加并发不会。
-  另外发现上表"并发 32→256"那行**今天无法复现**：扇出宽度是编译期常量 32，全仓没有任何
-  env/flag 能改它。
-  **本轮明确不测**：验收后半是延迟敏感的，而本机 2600 个 sglang/ray 进程、load 8+、
-  热核散布在高低两段，隔离不出干净核段 ⇒ 按 `feedback_perf_check_cpu_gate` 的纪律不产出
-  会被 caveat 成废话的数字。
+  验证：stream 142 单测 + 全部集成二进制绿；clippy 在改动文件内干净；
+  seal 时写 / 读时验 / durability gate / 缓存刷新 / 修复路径水位 五处消融各自精准变红。
+  **harness 三条腿仍绿**，如实记：EN 上没有 seal 事件 ⇒ 那条流程不写 sidecar ⇒ 没东西可验。
+  增量 2 的 scrub 同时负责**回填**和**探测**，回填对已在盘上的内容是 trust-on-first-use。
 
-【2026-09-04 F-RECOVERY-PATH-SILENT：把信号扶正】
-  改动三处：① `dispatch_recovery_task` 成功派发打 INFO（extent/executor/replacing/slot）；
-  ② `apply_recovery_done` 成功打 INFO（换掉哪个槽位、新 eversion）；
-  ③ 把 marker 校验的失败按**证据**分支，不是按 marker 在不在。
-  **评审在这里救了我一次**：我第一版是"没有 marker ⇒ DEBUG benign"，而这个守卫真正要防的
-  那个事故（marker 被 df 抖动释放 → extent 被 EC 转换 → 旧执行者晚到的整份 .dat 完成把槽位
-  换到布局没描述的副本上）**恰恰也落在"没有 marker"这一支** —— 我等于把唯一的告警灭了。
-  改成再问一次**布局**：已应用的重建会把该槽位挪到 `task.node_id` 上，没应用的不会。
-  于是三支 —— 回声（槽位已是它 ⇒ 可验证的重复 ⇒ DEBUG）、被释放的晚到完成（槽位还没动
-  ⇒ WARN）、指向另一个在飞 assignment（WARN）。DEBUG 那条也不再宣称 "no inflight marker"
-  （ledger 位可能被 Delete 占着），改成报出实际占用的 op 种类。
-  验收（真集群日志，按顺序读得出来）：seed 604/605/607 三轮
-  `dispatched=5/2/4  applied=5/2/4  benign=4/0/4  REFUSING=0`。
-  也就是说：每一次派发都应用了，过去会刷 WARN 的重复现在走 benign，而假警报归零。
-  单测四条：重复只应用一次、指向别的 assignment 被拒（且 marker 必须留存）、
-  以及**直接钉住日志级别本身**的 `the_echo_is_quiet_and_the_released_attempt_is_loud`
-  （前三条把两个 tracing 宏对调也照样绿 —— 交付物本身没被钉住，评审指出的）。
-  消融：去掉身份守卫 ⇒ 三条 marker 测试全红；对调两个宏 ⇒ 级别测试红在"回声不该是警告"；
-  去掉布局判据 ⇒ 红在"被释放的晚到完成必须响"。
-  顺手修了同一函数里两个**互相写反**的 drain 原因（解码失败那支写着"目标拒绝了"，
-  目标拒绝那支写着"响应无法解码"）—— 本轮的主题就是让日志能讲清楚派发的故事。
-
-【2026-09-04 我上一轮 ship 了一条会误报的断言（当轮发现并修好）】
-  上一个 commit 里的 `verify_fence_drove_a_recovery` 断言"KillThenFence 跑过 ⇒ ledger 里必须有
-  recovery op"。第一次带 `RUST_LOG=info` 复跑就红了 —— 而且是**误报**：recovery 只管 SEALED
-  extent，45 秒一轮里被 fence 的那台**可能一个 sealed 槽位都没持有**（实测 seed 603/606 stranded=0）。
-  修法不是删断言，是补上它的前提：在 fence **还立着的时候**从 etcd 数一下受害节点占了几个
-  sealed 槽位（`sealed_extents_naming`，读失败返回 0 ⇒ 只会漏报不会误报），只有 >0 才断言。
-  实测 seed 603 stranded=0 跳过、604 stranded=3 ⇒ 4 条 op、605 stranded=1 ⇒ 1 条、606 stranded=0 跳过。
-  **教训：断言的前提要和被测机制的定义域对齐**（recovery 的定义域是 sealed extent，不是"动作跑过"）。
+  **未测量、欠一次**（评审的推断，不当结论）：bulk ZC 读路径上整值 CRC 是在 shard 事件循环里
+  同步跑的，8 MiB 大约 0.3~0.8 ms 阻塞。今天因为有 sidecar 的 extent 还很少所以看不出来，
+  **scrub 回填之后必须按 perf-check 矩阵实测 8M 读**再下结论。
 
 
 【2026-09-04 KillThenFence 从未执行：修复 + 把"跑没跑过"变成可见】
