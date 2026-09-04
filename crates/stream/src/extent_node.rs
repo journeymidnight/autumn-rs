@@ -5781,57 +5781,12 @@ impl ExtentNode {
         Self::truncate_to_commit(extent, commit).await
     }
 
-    /// Copy the full extent data from a remote source node using autumn-rpc.
-    /// fetch a source replica's extent in 256 MiB chunks.
+    /// The RESPONSE size is the bound that matters here: the frame encoder
+    /// casts the payload length to u32 without a guard, so a single reply
+    /// carrying >= 4 GiB wraps its header and the reader fails the CRC. Every
+    /// caller must bound what it asks for in ONE request — `length == 0`
+    /// (read-to-end) is only safe on a payload known to be small.
     ///
-    /// This previously issued ONE `MSG_READ_BYTES` with `length: 0`
-    /// (read-to-end). On a multi-GB sealed extent that trips the
-    /// >2 GiB per-syscall pread ceiling on the source EN (macOS
-    /// > INT_MAX / Linux 0x7ffff000) and oversized rpc frames — exactly
-    /// > what the chunked paths chunk every OTHER full-extent path for. The raw
-    /// > recovery fetch bypassed all of it, so replicated-extent recovery
-    /// > of any >2 GiB extent failed with "no source replica available
-    /// > for copy" (10 retries, source nodes logged nothing — the read
-    /// > died at rpc framing before the handler). `total_len` is the
-    /// > extent's `sealed_length`; recovery only ever targets sealed
-    /// > extents, so it is known. `total_len == 0` falls back to a single
-    /// > to-end read (open-extent / unknown-length callers).
-    ///
-    /// NOTE: `ReadBytesReq.offset` is u32, so this covers extents up to
-    /// 4 GiB. `max_extent_size` keeps extents well under that; a wider
-    /// wire offset would be a separate change if extents ever exceed it.
-    async fn copy_bytes_from_source(
-        addr: &str,
-        extent_id: u64,
-        eversion: u64,
-        total_len: u64,
-        payload: PayloadRef,
-    ) -> Result<Vec<u8>, String> {
-        let sock: std::net::SocketAddr = parse_addr(addr).map_err(|e| e.to_string())?;
-        if total_len == 0 {
-            return Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0, payload).await;
-        }
-        let chunk = FILE_IO_CHUNK_BYTES as u64;
-        let mut out: Vec<u8> = Vec::with_capacity(total_len as usize);
-        let mut offset: u64 = 0;
-        while offset < total_len {
-            let want = chunk.min(total_len - offset);
-            let got =
-                Self::read_bytes_chunk(sock, addr, extent_id, eversion, offset, want, payload)
-                    .await?;
-            if got.is_empty() {
-                break;
-            }
-            let got_len = got.len() as u64;
-            out.extend_from_slice(&got);
-            offset += got_len;
-            if got_len < want {
-                break; // short read — source has no more data
-            }
-        }
-        Ok(out)
-    }
-
     /// One `MSG_READ_BYTES` round-trip. `length == 0` means read-to-end
     /// (legacy single-shot path); otherwise reads exactly `[offset,
     /// offset+length)`.
@@ -6308,13 +6263,12 @@ impl ExtentNode {
             self.stream_extent_from_sources(&extent_info, &[task.node_id, task.replace_id], &extent)
                 .await?
         } else {
-            // EC recovery: read individual shards from healthy peers and
-            // reconstruct the missing shard for this node's slot. Shard-sized
-            // buffering (≈ sealed_length / K), not full-extent; a streaming RS
-            // decode would be a further optimization.
-            let (payload, shard_index) =
-                self.run_ec_recovery_payload(&task, &extent_info).await?;
-            let len = payload.len() as u64;
+            // EC recovery: reconstruct the missing shard stripe by stripe,
+            // writing each stripe as it is produced. The destination file is
+            // opened FIRST — which is why the shard index is computed here
+            // rather than inside the rebuild: the layout decides which file
+            // gets the bytes, and the rebuild needs somewhere to put them.
+            //
             // The rebuilt shard goes back into the file the layout NAMES. On an
             // extent converted under the CoW scheme that is
             // `extent-{id}.shard{i}` — writing it into `.dat` would leave this
@@ -6322,11 +6276,12 @@ impl ExtentNode {
             // value, and leave the shard the layout points at missing. A
             // legacy converted extent (shard renamed over `.dat`) keeps its
             // old shape.
+            let shard_index = Self::ec_shard_index(&extent_info, task.replace_id)?;
             if PayloadLocation::from_byte(extent_info.payload_location)
                 == PayloadLocation::InShardFile
             {
                 let disk = self.disk_for(extent.disk_id)?;
-                let path = disk.shard_path(task.extent_id, shard_index);
+                let path = disk.shard_path(task.extent_id, shard_index as u32);
                 if let Some(parent) = path.parent() {
                     compio::fs::create_dir_all(parent)
                         .await
@@ -6341,20 +6296,19 @@ impl ExtentNode {
                         .await
                         .map_err(|e| format!("create rebuilt shard {}: {e}", task.extent_id))?,
                 );
-                file_pwrite_chunked(f.clone(), 0, Bytes::from(payload))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let len = self
+                    .stream_ec_recovery_payload(&task, &extent_info, shard_index, &f)
+                    .await?;
                 f.sync_data().await.map_err(|e| e.to_string())?;
                 self.fsync_staging_dir(task.extent_id, &path).await.map_err(|(_, m)| m)?;
-                extent.note_shard_file(shard_index, len);
+                extent.note_shard_file(shard_index as u32, len);
                 wrote_shard_file = true;
+                len
             } else {
                 rf.set_len(0).await.map_err(|e| e.to_string())?;
-                file_pwrite_chunked(rf.clone(), 0, Bytes::from(payload))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                self.stream_ec_recovery_payload(&task, &extent_info, shard_index, &rf)
+                    .await?
             }
-            len
         };
         // The shard file was already synced by name; `.dat` is not this
         // extent's payload in that case and must not be truncated or synced.
@@ -6469,18 +6423,66 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
     crate::erasure::shard_size(sealed_length as usize, data_shards) as u64
 }
 
-    /// For an EC extent: copy one shard from each of the `data_shards` healthy peers,
-    /// then reconstruct the shard that belongs to the recovering node's slot.
-    async fn run_ec_recovery_payload(
+    /// Which shard slot this recovery is rebuilding.
+    ///
+    /// Split out of the reconstruct so the caller can pick the destination
+    /// FILE before any bytes are read — the streaming rebuild writes each
+    /// stripe as it is produced, so the file has to exist first, and which
+    /// file it is depends on this index.
+    fn ec_shard_index(extent_info: &ExtentInfo, replace_id: u64) -> Result<usize, String> {
+        extent_info
+            .replicates
+            .iter()
+            .chain(extent_info.parity.iter())
+            .position(|&id| id == replace_id)
+            .ok_or_else(|| format!("replace_id {replace_id} not found in the extent's node list"))
+    }
+
+    /// Per-shard bytes reconstructed per round.
+    ///
+    /// Peak memory is `(K + 1) * this` — K stripes read from peers plus the
+    /// one rebuilt — instead of `(K + 1) * shard_size`, which on a full 17 GiB
+    /// extent at K=4 is ~20 GiB against an EN pod that requests 1 GiB. RS over
+    /// GF(256) is byte-wise per offset, so a stripe reconstructs from the SAME
+    /// byte range of its peers with no dependence on the rest of the shard —
+    /// `ec_encode_stripe_matches_whole` is the proof of that for the encode
+    /// direction, and `ec_reconstruct_shard` is length-agnostic.
+    ///
+    /// 64 MiB matches the stripe the EC CONVERSION already writes with
+    /// (`stripe_bytes` in its 2PC prepare), so the read path now moves in the
+    /// same units as the write path.
+    const EC_RECOVERY_STRIPE_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Rebuild an EC shard by streaming: for each stripe, read that byte range
+    /// from `data_shards` healthy peers, reconstruct the missing range, write
+    /// it, drop it.
+    ///
+    /// It used to collect every peer's WHOLE shard into memory, reconstruct
+    /// once and hand the result back for the caller to write. Peak was
+    /// `(K + 1) * shard_size` — ~20 GiB on a full 17 GiB extent at K=4, times
+    /// `--recovery-parallelism`, on an EN pod that requests 1 GiB. Streaming
+    /// makes it `(K + 1) * EC_RECOVERY_STRIPE_BYTES`.
+    ///
+    /// This is sound because RS over GF(256) is byte-wise per offset: a
+    /// stripe's reconstruction depends only on the SAME byte range of its
+    /// peers. `ec_encode_stripe_matches_whole` pins that for the encode
+    /// direction and `ec_reconstruct_shard` is length-agnostic — it takes
+    /// whatever equal-length slices it is given.
+    ///
+    /// Peer selection is per stripe, not once up front, so a peer that dies
+    /// mid-rebuild is routed around exactly as it would have been on the first
+    /// stripe, rather than failing the whole shard.
+    async fn stream_ec_recovery_payload(
         &self,
         task: &crate::extent_rpc::RecoveryTask,
         extent_info: &ExtentInfo,
-    ) -> Result<(Vec<u8>, u32), String> {
+        shard_index: usize,
+        dst: &Rc<compio::fs::File>,
+    ) -> Result<u64, String> {
         let data_shards = extent_info.replicates.len();
         let parity_shards = extent_info.parity.len();
         let n = data_shards + parity_shards;
 
-        // Build ordered list of all node IDs (data shards first, then parity shards).
         let all_node_ids: Vec<u64> = extent_info
             .replicates
             .iter()
@@ -6488,33 +6490,10 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             .copied()
             .collect();
 
-        // Determine which shard index this recovery is rebuilding.
-        // `replace_id` is the failed node that needs to be replaced.
-        let replacing_index = all_node_ids
-            .iter()
-            .position(|&id| id == task.replace_id)
-            .ok_or_else(|| {
-                format!(
-                    "replace_id {} not found in extent {} node list",
-                    task.replace_id, task.extent_id
-                )
-            })?;
-
-        let nodes = self.nodes_map_from_manager().await?;
-
-        // Copy the shard stored at each peer into the corresponding slot.
-        // Skip the failed node (replace_id) and ourselves (node_id / disk_id).
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
-        let mut collected = 0usize;
-        // Per-peer failure reasons, folded into the final error.
-        let mut why: Vec<String> = Vec::new();
-
-        // Exact shard length, and the reader's expectation of every peer.
-        // `0` cannot happen for a converted extent (convert refuses an
-        // unsealed one, and the manager sets `ec_converted` only with K >= 1),
-        // so it means the manager's record and this extent disagree — fail
-        // loudly rather than fall back to an unbounded read with no length to
-        // check the answer against.
+        // Exact shard length, and the reader's expectation of every peer. `0`
+        // cannot happen for a converted extent (convert refuses an unsealed
+        // one, and the manager sets `ec_converted` only with K >= 1), so it
+        // means the manager's record and this extent disagree.
         let want = Self::ec_shard_read_len(extent_info.sealed_length, data_shards);
         if want == 0 {
             return Err(format!(
@@ -6524,104 +6503,95 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             ));
         }
 
-        for (i, &node_id) in all_node_ids.iter().enumerate() {
-            if i == replacing_index {
-                // This is the missing shard slot — leave as None.
-                continue;
-            }
-            if node_id == task.node_id {
-                // Skip ourselves.
-                continue;
-            }
-            let Some(addr) = nodes.get(&node_id) else {
-                why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
-                continue;
-            };
-            // EC shard read — each peer holds a shard of size
-            // The read is CHUNKED, by exact shard length. It used to pass
-            // total_len=0 (read-to-end) because a shard was assumed "well
-            // under the chunking threshold"; a shard is ceil(sealed_length/K),
-            // which on a full extent is gigabytes.
-            //
-            // Peer `i` is asked for shard `i` BY NAME. Before the payload file
-            // was named, this asked each peer for "the extent" and relied on
-            // that peer's `.dat` happening to be its own shard — true only
-            // because the pre-CoW scheme renamed the shard over `.dat`. Under a
-            // layout where the shard is a separate file, an unnamed read would
-            // return whatever `.dat` still held and feed it to the RS decode.
-            match Self::copy_bytes_from_source(
-                addr,
-                task.extent_id,
-                extent_info.eversion,
-                want,
-                PayloadRef::for_extent(extent_info.payload_location, i as u32),
-            )
-            .await
-            {
-                Ok(shard_bytes) => {
-                    // EXACT length, not a trim. The old trim (to sealed_length)
-                    // was dead — a shard is ceil(L/K) <= L — and the read path
-                    // answers a short read with CODE_OK: `copy_bytes_from_source`
-                    // stops at the short chunk and returns Ok(partial). K shards
-                    // short by the SAME amount then reconstruct happily, and a
-                    // silently truncated shard is written back as authoritative.
-                    // The RS decoder only catches shards of DIFFERING length.
-                    if shard_bytes.len() as u64 != want {
-                        why.push(format!(
-                            "shard {i} (node {node_id} at {addr}): got {} of {want} bytes",
-                            shard_bytes.len()
-                        ));
-                        continue;
-                    }
-                    shards[i] = Some(shard_bytes);
-                    collected += 1;
-                    if collected >= data_shards {
-                        break; // Enough shards to reconstruct.
-                    }
-                }
-                // Record WHY, do not just count. A bare `0/K` says the
-                // rebuild is impossible without saying whether the peer was
-                // unreachable, rejected the eversion, or timed out mid-copy —
-                // and those want opposite fixes. This path burned an operator
-                // drain: 10 attempts on four extents, every one reporting
-                // 0/4, with the shards present on disk, the layout correct and
-                // every peer reachable.
-                Err(e) => {
-                    why.push(format!("shard {i} (node {node_id} at {addr}): {e}"));
+        let nodes = self.nodes_map_from_manager().await?;
+        let mut offset: u64 = 0;
+
+        while offset < want {
+            let span = Self::EC_RECOVERY_STRIPE_BYTES.min(want - offset);
+            let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+            let mut collected = 0usize;
+            // Per-peer failure reasons for THIS stripe. A bare `k/K` cannot say
+            // whether a peer was unreachable, rejected the eversion, or
+            // answered short, and those want opposite fixes.
+            let mut why: Vec<String> = Vec::new();
+
+            for (i, &node_id) in all_node_ids.iter().enumerate() {
+                if i == shard_index || node_id == task.node_id {
                     continue;
                 }
+                let Some(addr) = nodes.get(&node_id) else {
+                    why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
+                    continue;
+                };
+                let sock = match parse_addr(addr) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        why.push(format!("shard {i} (node {node_id} at {addr}): {e}"));
+                        continue;
+                    }
+                };
+                match Self::read_bytes_chunk(
+                    sock,
+                    addr,
+                    task.extent_id,
+                    extent_info.eversion,
+                    offset,
+                    span,
+                    PayloadRef::for_extent(extent_info.payload_location, i as u32),
+                )
+                .await
+                {
+                    // EXACT length. A short read is not loud on this path: the
+                    // server answers CODE_OK short, and K stripes short by the
+                    // SAME amount reconstruct without complaint — the RS
+                    // decoder only rejects shards of DIFFERING length — so a
+                    // truncated stripe would be written back as authoritative.
+                    Ok(b) if b.len() as u64 == span => {
+                        shards[i] = Some(b);
+                        collected += 1;
+                        if collected >= data_shards {
+                            break;
+                        }
+                    }
+                    Ok(b) => why.push(format!(
+                        "shard {i} (node {node_id} at {addr}): got {} of {span} bytes",
+                        b.len()
+                    )),
+                    Err(e) => why.push(format!("shard {i} (node {node_id} at {addr}): {e}")),
+                }
             }
+
+            if collected < data_shards {
+                return Err(format!(
+                    "EC recovery: only {collected}/{data_shards} shards available for extent {} \
+                     at [{offset}, {}) of {want}: {}",
+                    task.extent_id,
+                    offset + span,
+                    if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
+                ));
+            }
+
+            let rebuilt = compio::runtime::spawn_blocking(move || {
+                crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, shard_index)
+            })
+            .await
+            .map_err(|_| "EC reconstruct task panicked".to_string())?
+            .map_err(|e| format!("EC reconstruct failed: {e}"))?;
+
+            if rebuilt.len() as u64 != span {
+                return Err(format!(
+                    "EC recovery: reconstructed {} bytes for a {span}-byte stripe of extent {}",
+                    rebuilt.len(),
+                    task.extent_id
+                ));
+            }
+            file_pwrite_chunked(dst.clone(), offset, Bytes::from(rebuilt))
+                .await
+                .map_err(|e| e.to_string())?;
+            offset += span;
         }
 
-        if collected < data_shards {
-            // The per-shard size is in the message because shard geometry is
-            // what made this fail: the read is chunked BY that length, and a
-            // peer disagreeing about it is now reported per peer above.
-            let per_shard = want;
-            return Err(format!(
-                "EC recovery: only {collected}/{data_shards} shards available for extent {} \
-                 (per-shard ~{:.2} GiB): {}",
-                task.extent_id,
-                per_shard as f64 / (1u64 << 30) as f64,
-                if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
-            ));
-        }
-
-        // offload RS reconstruct (CPU-bound, GF(256) polynomial math
-        // over up-to-data_shards × per-shard MiB) to the blocking pool so
-        // recovery doesn't stall the extent-node compio runtime.
-        let rebuilt = compio::runtime::spawn_blocking(move || {
-            crate::erasure::ec_reconstruct_shard(
-                shards,
-                data_shards,
-                parity_shards,
-                replacing_index,
-            )
-        })
-        .await
-        .map_err(|_| "EC reconstruct task panicked".to_string())?
-        .map_err(|e| format!("EC reconstruct failed: {e}"))?;
-        Ok((rebuilt, replacing_index as u32))
+        Ok(want)
     }
 
     /// 2PC Phase 1 (prepare): write a single EC shard to a staging file
