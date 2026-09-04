@@ -6472,6 +6472,8 @@ impl ExtentNode {
         // Skip the failed node (replace_id) and ourselves (node_id / disk_id).
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
         let mut collected = 0usize;
+        // Per-peer failure reasons, folded into the final error.
+        let mut why: Vec<String> = Vec::new();
 
         for (i, &node_id) in all_node_ids.iter().enumerate() {
             if i == replacing_index {
@@ -6483,6 +6485,7 @@ impl ExtentNode {
                 continue;
             }
             let Some(addr) = nodes.get(&node_id) else {
+                why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
                 continue;
             };
             // EC shard read — each peer holds a shard of size
@@ -6520,14 +6523,33 @@ impl ExtentNode {
                         break; // Enough shards to reconstruct.
                     }
                 }
-                Err(_) => continue, // Unavailable peer — try next.
+                // Record WHY, do not just count. A bare `0/K` says the
+                // rebuild is impossible without saying whether the peer was
+                // unreachable, rejected the eversion, or timed out mid-copy —
+                // and those want opposite fixes. This path burned an operator
+                // drain: 10 attempts on four extents, every one reporting
+                // 0/4, with the shards present on disk, the layout correct and
+                // every peer reachable.
+                Err(e) => {
+                    why.push(format!("shard {i} (node {node_id} at {addr}): {e}"));
+                    continue;
+                }
             }
         }
 
         if collected < data_shards {
+            // The per-shard size is in the message because the read is a
+            // SINGLE unchunked request (`total_len = 0`) on the assumption that
+            // a shard is "well under the chunking threshold" — which is
+            // sealed_length / K, and on a full 17 GiB extent that is ~4.3 GiB
+            // against a FILE_IO_CHUNK_BYTES of 256 MiB.
+            let per_shard = extent_info.sealed_length / data_shards.max(1) as u64;
             return Err(format!(
-                "EC recovery: only {collected}/{data_shards} shards available for extent {}",
-                task.extent_id
+                "EC recovery: only {collected}/{data_shards} shards available for extent {} \
+                 (per-shard ~{:.2} GiB, single unchunked read): {}",
+                task.extent_id,
+                per_shard as f64 / (1u64 << 30) as f64,
+                if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
             ));
         }
 
