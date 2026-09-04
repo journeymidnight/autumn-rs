@@ -1871,6 +1871,43 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   (`xxd -s 41 -l 1 <disk>/<hash>/extent-<id>.meta`), restart that EN, and
 #   confirm the boot log reports it sealed. Unit-level equivalent:
 #   `cargo test -p autumn-stream --lib the_ec_staging_seal_survives_a_restart`.
+# A given-up conversion's staging is reclaimed by the reconcile sweep
+# What to expect: when a conversion fails or is abandoned the layout still says
+#   `.dat`, so the shards its participants already staged are named by nothing.
+#   The next reconcile round on each holder (immediately at boot, then every
+#   5 min) unlinks them — EN log `reconcile: dropped a shard file this node
+#   should not hold` with `extent_id` / `shard_index`. `df` stops counting the
+#   bytes in the same step. The `.dat` is untouched and the extent stays
+#   readable; a later conversion attempt simply stages afresh. (Before this,
+#   the residue was reclaimed only by RESTARTING the EN — the marker that held
+#   cleanup off is in memory — so a long-lived node kept it for months.)
+#   Staging under a marker the manager still holds is not touched: it gives no
+#   verdict at all while an op is in flight, and a node skips a verdict asked
+#   for before its staging arrived (`reconcile: skipping cleanup — this verdict
+#   says .dat while an attempt has staged shards here` at DEBUG). So residue
+#   that survives one round is normal only if a conversion is running;
+#   `extent-<id>.shard<N>` files still present on a quiet extent after two
+#   rounds mean the node is not reconciling — check that it registered
+#   (`reconcile: cannot identify the reporting node` on the manager).
+#   ONE EXPECTED ERROR: the give-up releases the marker on the tick where the
+#   coordinator has just started a FRESH attempt, so a reclaim can land while
+#   that attempt is still streaming. Its next stripe then logs
+#   `write_shard <id>/<n>: staging file vanished before stripe @<off> — this
+#   attempt's staging was clobbered; refusing to recreate it with holes` at
+#   ERROR. Beside an `abandoning the marker` line for the same extent that is
+#   BENIGN and is the system working: the refusal is what stops a zero-holed
+#   shard being built, and an abandoned attempt could not have committed anyway.
+#   The same ERROR with NO abandon for that extent is a real problem — something
+#   deleted staging out from under a live conversion.
+#   A parity target that staged but never became a member gets no placement at
+#   all (placements are member-only), so its residue is collected by the
+#   non-member garbage leg after its three-round grace (~15 min), not the next
+#   round.
+# Manual check: `find <disk> -name 'extent-<id>.shard*'` on a participant after
+#   a conversion you let fail (e.g. stop one target until the coordinator gives
+#   up), then again after the node's next sweep — the file must be gone and
+#   `autumn-client` must still read the extent. Unit-level equivalent:
+#   `cargo test -p autumn-stream --test placement_cleanup`.
 # op observability: live progress + durable history
 # Two questions, two sources. `autumn-op ops list --active` reads the LEADER's
 #   in-memory ledger — the only place a running op's progress exists, and it

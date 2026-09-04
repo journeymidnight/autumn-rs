@@ -112,7 +112,8 @@ fn start_extent_node_with_cmds(
             loop {
                 match rx.try_recv() {
                     Ok(NodeCmd::ApplyPlacements(placements, done)) => {
-                        node.test_apply_placements(&placements).await;
+                        node.test_apply_placements(&placements, node.test_staging_tick())
+                            .await;
                         let _ = done.send(());
                     }
                     Err(TryRecvError::Empty) => {

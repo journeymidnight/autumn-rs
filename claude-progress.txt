@@ -1,11 +1,53 @@
-Date: 2026-09-03
+Date: 2026-09-04
 TaskStatus: completed
-Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 实现完成但**故意未上线**
-  （评审挖出的重放游标类阻塞它，已立 BUG-EMPTY-VP-CURSOR-PUNCH）；
-  ① fuse 读的 I/O 线程池（`--read-io-threads`，默认 4）—— 把 F-FUSE-READ-GAP 的
-  根因（守护进程单个 compio 线程 CPU 饱和）实际修掉；② 两条 EC 测试从"钉管道"改成"能变红"；
-  ③ 复核 BUG-KVC-MM-ALIAS 的触发门槛（未过，维持不做）；④ 本文件按规则 12 清理
-  （736 行 → 262 行，删掉已完成工作的叙述——git 历史是它们的记录）。
+Task scope: F-EC-STAGING-RECLAIM —— 被放弃/失败的 EC 转换在参与者上留下的 staging
+  分片（`extent-{id}.shard{N}`）现在由普通 reconcile 回收。用户定「分开做、分开评审」，
+  与上一轮的"放弃 marker"配套但独立提交、独立评审。
+
+【2026-09-04 F-EC-STAGING-RECLAIM：已实现并验收，账本条目已销】
+  **没有按账本里写的 Scope 做，理由要留下**：Scope 写的是给 `ExtentPlacement` 加一位
+  "当前无转换在飞"、bump wire。查代码发现那一位（a）恒为真——`handle_reconcile_extents`
+  在 `extent_inflight_op(eid).is_some()` 时**整条 verdict 都不发**，所以能收到 placement
+  就已经意味着答题那一刻没有 marker；（b）就算加了也**堵不住真正的洞**：它和它所在的
+  placement 一样是答题时算的，一样会过期。缺的从来不是权威，是**新鲜度**。
+  所以改成：`ec_stage_tick`（节点级单调计数，每次接受 staging claim +1），reconcile
+  在**发请求之前**采样，`apply_placements` 只在 mark.tick <= 采样值时才清理。不动 wire，
+  不 bump WIRE_VERSION。`ec_stage_nonce` 的值从 u64 改成 `EcStageMark{nonce, tick}`，
+  所有写入走 `stamp_stage_mark`（含 nonce-0 直通：保持"不排序"，但必须留下 tick）。
+
+  **安全论证的准确版本（评审逼出来的，第一版是错的）**：
+  「有 placement + tick 在采样值以下」证明的是**答题时没有 marker**，
+  **不是**"没有 attempt 在写"。反例就是本功能的配套改动自己：重复失败放弃是在
+  「协调者刚开了一次新 attempt」那一拍触发的（计数只认 started_new），所以 marker 释放时
+  stripe 还在流。参与者确实会删掉正在写的 staging。之所以无害靠两个本 sweep 之外的机制，
+  它们现在是本功能的前提：① 后续 stripe 发现 staging 文件没了会**拒绝**而不是在原 offset
+  重建（否则前面 stripe 的位置留下零洞，flip 会把它当成该节点的分片发布）；
+  ② marker 已放弃的 attempt 本来就提交不了（`ec_done` 找不到 marker 直接 ignore）。
+  已加 `a_reclaim_that_lands_mid_attempt_is_refused_by_the_next_stripe` 钉住①，消融变红。
+
+  另外查清（都是代码里读到的，不是推断）：`replay_from_etcd` 在 `set_leader(true)` **之前**
+  跑，所以新 leader 不会拿着没重建的 ledger 答 reconcile；stale sweep 对 ConvertToEc
+  **只 WARN 不自动释放**，所以 marker 不会被 TTL 悄悄放掉。
+
+  验收：5 条消融各只红一条测试 —— 去掉 tick 比较（退回旧行为）红
+  `an_abandoned_attempts_real_staging_is_reclaimed`；去掉整个 guard 红
+  `a_stale_placement_must_not_delete_a_shard_being_staged`；去掉 manager 侧 inflight 检查红
+  `reconcile_withholds_the_placement_while_a_conversion_is_in_flight`；去掉 tick 比较红
+  端到端的 `an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile`；
+  去掉 vanished-file 守卫红上面那条 mid-attempt 测试。去掉 nonce-0 stamp 红
+  `ec_staging_claim_orders_attempts` 新加的断言。
+  全绿：stream lib 127 + 全部 15 个集成二进制、manager lib 315、
+  ec_replay_selfheal / ec_participant_meta_seal / offline_reconcile / ec_staging_reclaim。
+  clippy 在两个 crate 内干净（余下告警在 fuse/transport/dashboard，早于本轮）。
+
+  **踩过的坑，下次直接抄**：端到端测试一开始 2/5 flaky，因为我用 `node_id - 1` 当数组下标
+  ——manager 分配的 node_id 不是启动顺序（实测出现过 5）。改成"扫哪个 data dir 有 .dat"
+  来选受害节点，8/8 稳。跑一次绿说明不了任何事，这个教训又验证了一遍。
+
+  **修正我自己**：曾说这份 residue "一直占着"。不对——mark 只在内存里，**重启就回收了**
+  （重启后是无 mark 路径，同样的 InDat verdict 直接删）。真实代价是"该 EN 进程剩余生命周期"，
+  健康集群上是几个月。文档已按这个口径写。
+
 
 【2026-09-03 fuse 读 I/O 线程池：已实现并验收】
   形状：N 个独立单线程 compio runtime，各自 `ClusterClient`，`futures::mpsc` 喂 `ReadJob`。
@@ -33,49 +75,6 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   延迟绑定的（内核对同步读者不并发下发；bdi read_ahead_kb 128→32768 实测完全无效），
   线程池按定义改不了。聚合吞吐已追平 CLI。按规则不改写验收口径，只记状态。
 
-【2026-09-03 两条 EC 测试改造：验收达成，账本条目已销】
-  BUG-EC-PARTICIPANT-UNSEALED —— 本体早被 2b8e488 修掉（在 HEAD，测试今天跑仍绿），
-  原测试只覆盖验收三句里的第一句。补齐另外两句时**我差点自己造一条假测试**：对重启后的
-  参与者发 MSG_APPEND，消融下照样返回 CODE_PRECONDITION。原因是 append 在 seal 闸门**之前**
-  发现 `local_eversion < req.eversion` 会先去 manager 拉一次并在内存里自愈。我据此写下
-  "没有任何 eversion 值能区分两种状态"——**fable 实测推翻了它**：`MSG_PROBE_EXTENT` 只读本地
-  原子量、无 fence、不问 manager，修复下报 8192、消融下报 0。现在钉住缺陷的是这条 probe 断言
-  （我自己复跑消融确认变红），append 那条降级为契约检查并在注释里写明。
-  **顺带修正爆炸半径**：seal 没落盘时，带重载 eversion 的 append 能过 eversion/seal/fence
-  三道闸门，拦住字节落盘的是已被回收的 `.dat`——而 flip 的清扫对 unlink 失败是"容忍并重试"，
-  所以存在 `.dat` 幸存的崩溃窗口。不是"只是一个一直失败的 heal"。
-  F-EC-RETRY-TESTS —— 把两个判决点从网络驱动的方法里抽出来（`read_retry_action` 与
-  `ec_gather_collect`，后者收 `Stream` 所以"凑够 K 就提前返回"留在被测函数内），行为不变
-  （抖动公式、哪一类才 sleep 都逐行核过）。验收要求的两条消融都变红；原有 4 条哨兵测试在
-  两次消融下全绿——正是账本的指控。评审又指出剩下的一条缝：把 `EcGatherOneShort` 换成普通
-  `anyhow!`，126 个测试全绿而重试静默失效；挂哨兵处已抽成 `one_short_error` 并补了走完
-  "判决→造错误→分类"整条链的测试，消融验证变红。
-
-【2026-09-03 BUG-KVC-MM-ALIAS 复核：门槛未过，维持不做】
-  账本对这条的规定是"真要动之前先复核触发条件是否已在线上出现过"。触发条件等价于部署在用的
-  vLLM 不再通过 connector 读的那两个名字暴露 mm hash。实测 `vllm-env` = **vLLM 0.28.0**，
-  `MultiModalFeatureSpec` 字段含 `identifier` 与 `mm_hash` 两者，而 `_request_extra_keys`
-  取的正是这两个 ⇒ fail-open 分支在当前部署上够不着。代码未动，复核方法已写进账本条目。
-
-【2026-09-03 F-SEALED-EMPTY-SWEEP：写完、测完、评审完，然后决定不上线】
-  目标形态是那次 10.4 TB / 222 GB（47×）泄漏留下的残余：`sealed=true, sealed_length=0`、refs≥1、
-  非尾巴的 stream 成员。实现刻意复用 punch-holes 的变更路径（只加"挑选"的新方式，不加第二条删除路径），
-  选择逻辑抽成纯谓词 + 6 单测，三条消融各自咬住不同断言，308 测试绿。
-  **fable 对抗性安全评审推翻了安全论证的一半**（我自己复核了四条链接，全部属实）：
-  "sealed-at-zero ⇒ 没人引用它"对**字节**成立（seal ≥ acked 在三条封口分支上都成立），
-  对**重放游标**不成立 —— PS 会**故意**造出指向零字节 extent 的 `(E,0)` 游标，而
-  `gc_extent_punchable` 是 `sealed_length == 0 || pos < floor`，空的一律可 punch、绕过重放下限；
-  游标解析不到就被跳过，若全部解析不到而 SST 非空 ⇒ `chosen_pos == usize::MAX` ⇒ **一条 WAL 都不重放**，
-  仓库自己的注释就管这叫 "the acked-but-un-flushed WAL tail is lost"。
-  ⇒ **代码留在树里、测试留着、`start_runtime_tasks` 里不 spawn**（附不 spawn 的理由与死代码豁免），
-  阻塞项立成 BUG-EMPTY-VP-CURSOR-PUNCH（**不是本轮引入的**：GC 与客户端 reclaim 今天就在这么删）。
-  主评审另抓到 6 条，全部核实并修：`inflight_snapshot_ec_recovery` 返回 `(ec, rec)` 而我是全仓唯一写反的；
-  ledger 快照跨 await 不复查（改成每 plan 重读）；重复成员会 under-decrement refs（改成拒绝 + ERROR）；
-  "reuses punch-holes exactly"夸大（它没继承那些守卫）；"drains over minutes"实为 ~10.4 小时；
-  文档块又一次被焊到上一个函数的 doc 上。
-  **两条诚实标注**：内存模式下 `mirror_stream_extent_mutation` 是彻底 no-op ⇒ 两条"集成测试"覆盖的是
-  选择与内存态 apply，不是 CAS 耦合；inflight 重检查进程内开不出窗口，消融全绿，已标为未覆盖。
-
 【2026-09-03 BUG-EMPTY-VP-CURSOR-PUNCH：复现 → 修复 → 消融，静默丢失已 ACK 写入】
   这是本会话最重的一条，而且**不是本轮引入的**，是 shipped 代码里的潜伏类。
   链条：恢复把写游标种成 committed tail，而刚 roll 出来的尾巴零字节 ⇒ 游标 = `(E, 0)`；
@@ -101,22 +100,6 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   且第二次 roll 之前 E 还是尾巴、本就被排除）。测试改用与 `run_gc` 空路径**逐字节相同**的
   `MSG_STREAM_PUNCH_HOLES`，所以钉住的是"回收游标 extent 的后果"，不是"GC 就是回收者"。
 
-【2026-09-03 F-SEALED-EMPTY-SWEEP 上线 + 撞出一条既有 EC bug】
-  阻塞（重放游标类）解除后补齐验收：新增 `sealed_empty_sweep_etcd.rs`，真 etcd + aux 客户端直查，
-  场景就是"writer roll 完尾巴就死、从没 punch"；消融掉持久化那步精确变红。之后 spawn 了它。
-  **fable 给了一条能推翻我的检查(chaos 绿 ≠ sweep 跑过,因为泄漏形态本身账目干净),我照做了,
-  然后我自己的结论又被下一轮日志推翻**：第一轮 grep 得 0 次，我据此写下"chaos 从不造出这个形态"
-  并提交了 —— 那是**单轮样本的过度概括**。后一轮同 seed 里它触发了两次
-  （`stream_id=13 count=1`、`stream_id=20 count=1`），账目校验同时全绿。
-  最终结论是"**覆盖但不可靠**"：确实会命中，但每 60s 才一 tick、chaos 只跑约 92s，
-  所以不能当稳定回归守卫。账本已改正。教训与今天另外两次同型：**单轮 grep 的阴性结果，
-  和"这条路径不存在"长得一模一样**。
-  **顺带撞出 BUG-EC-CONVERT-STALL-HEALTHY-COORD**（已立账、已复现）：EC 转换 quiesce 后仍 ACTIVE、
-  attempts=0、last_error 空、协调者健康，该 extent 的 GC 被卡住；chaos 判词是
-  "the invariant broke SILENTLY"。**归因做了一半**：同样失败在 sweep 关闭时逐字复现 ⇒ 与本条无关；
-  未单独对照重放修复之前的版本（机制不相干）。时序敏感：加 `RUST_LOG=autumn_manager=info` 后
-  必现，不加时曾两次通过 —— 判定修好必须多次跑带 RUST_LOG 的那条配方。
-
 【2026-09-03 BUG-EC-CONVERT-STALL-HEALTHY-COORD 诊断进展：方向掐掉一半】
   原假设：候选被 `collect_ec_dispatch_candidates` 静默过滤。给它三个静默 `continue` 都加了诊断
   （recovery 持有 / 协调者不可派发 / 没有带 EC 形状的 stream 列出该 extent —— 最后一条是 WARN，
@@ -137,17 +120,6 @@ Task scope: ⑤ F-EC-REPLAY-SELFHEAL 已修并销账；⑥ F-SEALED-EMPTY-SWEEP 
   每分钟 ~12）；以及响应迟到 60s 时会凭空重建一个没有 marker 的 RUNNING 条目，导致之后
   force-ec-convert 全部静默空操作。两条都改了、都有消融验证的单测。
   **行为那半仍未做**（参与者不可达 = 重选目标还是判失败），涉及 2PC 安全性，不凭推断动。
-
-【2026-09-03 一次被自己撤回的改动：chaos 里调快 sweep 间隔】
-  动机是我自己标出的缺口（sweep 的 chaos 覆盖靠运气）。加了可调间隔（`Rc<Cell<Duration>>` +
-  setter，仿 `set_policy_config`），chaos 设 5s。评审指出**这会让 chaos 变弱**：
-  `verify_gc_reclaim` 只在 `total_reclaimed == 0 && any_protected` 报错，而 `total_reclaimed`
-  是 extent 集合的任意收缩 —— sweep 在那约 20s 窗口里 tick 4~6 次，一次回收就把它顶成 1，
-  掩盖掉"回收卡死"这个守卫。**撤回 chaos 侧的 5s**，旋钮留给 fast-mode（加 1s 下限防自旋）。
-  顺带把那个先前就存在的掩盖通道补强：`any_protected` 时改看 `gc_reclaimed`（force-GC 派发之后
-  起算）。seed 583 ×3、603 ×2 无误报。
-  教训记一条：**为了让一个守卫更容易触发而削弱另一个守卫，是坏交易**——尤其当被加强的那个
-  已经有单测和集成测试覆盖时。
 
 【2026-09-03 EC stall 归因补完 —— 以及一次差点发出去的错误结论】
   用独立 worktree 在 `db19c86`（重放修复之前）做单变量隔离，seed 603：
@@ -302,34 +274,6 @@ Next steps:
   两次都是"失败伪装成成功",而这正是我当天一直在别处指出的模式。
   `2>/dev/null` 之于 dd,等同于 `e.to_string()` 之于 PS 的错误链:**都丢掉了区分失败与缺席的通道**。
 
-【2026-09-02 EC 加固 R1-R4 实施结果】
-  R1 已做(2d57ca8): 重建时把缺失分片的节点也加入并行竞速。前提已由代码保证
-     (client.rs 的 `missing_shard_idx >= data_shards` 直接拒绝),所以它必是数据分片,
-     答上来就直接返回、跳过 RS。零墙钟成本。
-  R2 已做(1e3ca75): EcGatherOneShort 类型化 sentinel + 顶层一次重试(带 jitter,
-     先 invalidate 再重取 ExtentInfo)。**只在 success == K-1 时重试** —— 两个及以上短缺
-     说明真的凑不齐 K,重试只会把响亮的失败拖成缓慢的失败。3 个回归测试锁住边界。
-  R3 已做(a0ddecc): CODE_PAYLOAD_NOT_HERE 类型化,走刷新布局的重试(无 pause)。
-     此前客户端**一处都没引用过这个码**,服务端契约的另一半从来没实现。
-  R4(a)(b) 已做(2d57ca8),但**当时漏了第三条、也是最持久的一条入口**(2026-09-02 评审发现,
-     已补): 进入 needs_reconstruct 有三条臂 —— 短读、读错误、**以及 Suspected 预过滤**,
-     第三条在任何尝试之前就把分片转去重建,而它完全静默。一个长期 Suspected 的死节点
-     因此每次读都无声走 RS,正是"看不见地耗着冗余"。现已加 WARN(extent/shard/node)。
-     两处静默降级加 WARN(带 extent/shard/完整错误链);
-     shortfall 消息带 extent_id;PS 的 map_storage_error 改 `{e:#}` 保留错误链
-     (此前只送最外层 Display,把"哪个 peer 因为什么失败"这半截丢在了 wire 边界上)。
-
-  **R4(c) 不做,理由比原先记的更硬(2026-09-02 评审更正)**: 反复失败的分片走 corrupt-replica
-  通道让 manager 重建 —— **这条路根本走不通**: manager 的 `handle_report_corrupt_replica`
-  对 EC extent **直接拒绝**(manager/src/rpc_handlers.rs:1148-1156,"replicated corrupt-replica
-  isolation does not apply (EC shard repair routes through recovery)")。
-  ⚠️ 原先记的理由是**错的**,留在这里作为反例:曾写"隔离一个槽 ⇒ 4+1 只剩 4 而 RS 正好要 4,
-  冗余归零",但那个危害**无法经该 RPC 发生**,manager 已经 fail-close 了;清 avali 只存在于
-  复制模式那条臂,而它需要读路径根本没有的 partition-owner epoch 围栏与 stream 成员范围。
-  写错的代价是会让后来人以为"只差一个策略决定就能做"。
-  真正缺的便宜东西是**每 (extent,shard) 退化的计数器**(op 可观测性重设计里已有位置),
-  而不是自动隔离。R4(a)(b) 已经让退化分片可见。
-
 【2026-09-02 更正:FreeToken 从未挂起 —— 我的第三次同型仪器错误】
   事实: MiniMax 的加载**成功完成了**。串行专家构建 09:28:39 开始、09:49:38 打出
   "Free memory after initialization: 1.84 GiB" —— 21 分钟,慢但正常。
@@ -347,26 +291,6 @@ Next steps:
   可操作的教训: 断言"什么都没发生"之前,先问这个仪器**能不能看见**要找的东西。
   具体到本仓库: 进程级 I/O 用 `rchar` 不用 `read_bytes`(FUSE 不走块设备),
   但两者都看不见 mmap —— 那要看 `minflt/majflt`。
-
-【2026-09-02 R4(c) 客户端上报分片损坏：评估后否决，不做】
-  结论写进 crates/stream/CLAUDE.md 的 Programming Note 33，此处只记决定。
-  否决理由不是当初推迟时说的"4+1 上隔离一个 slot 只剩 K、误判代价大"——那条其实
-  走不到：`handle_report_corrupt_replica` 对 `ec_converted` 本来就返回 CODE_PRECONDITION。
-  真正的理由更根本：**真正的位腐坏根本不会让分片读失败**。分片写入没有内容校验和
-  （`WriteShardReq` 只有 extent_id/shard_index/sealed_length/eversion/owner_epoch/
-  shard_offset/attempt_nonce/payload），`.meta` 的 CRC 只覆盖 52 字节 sidecar，批量读的
-  CRC 是 EN 读取时从磁盘字节现算的（只保证传输完整性）。烂掉的分片会干净地读回来，
-  gather 照样成功 —— 这个上报器能抓到的实际损坏是零。它能看到的全是拥塞超时、
-  PAYLOAD_NOT_HERE、以及 EN 隔离时**故意伪装成 EversionStale** 的拒绝（好让客户端
-  故障转移），客户端在原理上无法区分。管道成本反而很便宜（owner_epoch /
-  reporter_part_id 已在 StreamClient 上，不需要 wire bump）——特此点明：否决是因为
-  证据不成立，不是因为成本。
-  **顺带查出一个真缺口**：默认 `fenced_only` 门控下，`recovery.rs` 的 gate 检查之前
-  就 `continue` 了，所以磁盘离线派发 / re_avali 自愈 / 存活探测全都够不着 —— 一个节点
-  健康、但分片文件真丢了或持有者被隔离的 EC extent，今天没有任何自动修复，只能人工
-  fence。正确解法是 EN 侧的一等证据（staging 时写分片校验和 + 后台巡检走 df 通道上报），
-  不是客户端推断；manager 侧的 corrupt-slot 位图和 gate 旁路本来就是 slot 泛型的，
-  等那个存在时只需给上报入口加一个 EC 感知的变体。
 
 【2026-09-03 --direct-read 已重测（早先那批数字曾被判作废）】
   作废的是 a83a1be（EC 尚不支持直读）上的数字：false 76 MiB/s vs true 22，慢 3.5 倍。

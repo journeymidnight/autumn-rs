@@ -17,6 +17,20 @@ use std::time::{Duration, Instant};
 /// refused by `claim_ec_staging`.
 const EC_STAGING_SEALED: u64 = u64::MAX;
 
+/// What this node knows about EC staging for one extent.
+///
+/// The nonce orders two attempts against each other. The tick answers a
+/// different question — *when* did this node last accept staging for it — and
+/// that is what lets a reconcile verdict be judged for freshness: a verdict
+/// asked for before the staging arrived cannot be describing it.
+#[derive(Clone, Copy)]
+struct EcStageMark {
+    /// The claiming attempt's nonce, or `EC_STAGING_SEALED`.
+    nonce: u64,
+    /// The node's staging tick at the moment this mark was written.
+    tick: u64,
+}
+
 fn mgr_to_local_extent(e: &MgrExtentInfo, payload_location: u8) -> ExtentInfo {
     ExtentInfo {
         extent_id: e.extent_id,
@@ -43,7 +57,7 @@ use compio::BufResult;
 use dashmap::DashMap;
 #[allow(unused_imports)]
 use libc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 // ─── Per-extent fallocate prealloc (opt-in) ──────────────────────────────────
@@ -1483,7 +1497,15 @@ pub struct ExtentNode {
     /// In-memory only: it guards a race between two live coordinators, which
     /// is bounded by this process's lifetime. A restart forgets it, and the
     /// stripe-0 truncate plus the `owner_epoch` fence remain the defence there.
-    ec_stage_nonce: Rc<DashMap<u64, u64>>,
+    ec_stage_nonce: Rc<DashMap<u64, EcStageMark>>,
+    /// How many staging claims this node has accepted, over all extents.
+    ///
+    /// A reconcile snapshots it BEFORE it asks the manager what to hold, and
+    /// compares the answer against it: a mark stamped after the snapshot
+    /// belongs to an attempt the manager had not yet been asked about. Counted
+    /// node-wide rather than per-extent because the snapshot has to cover
+    /// extents that carried no mark at all when it was taken.
+    ec_stage_tick: Rc<Cell<u64>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     /// shard_idx / shard_count for per-shard extent ownership.
@@ -1560,6 +1582,7 @@ impl Clone for ExtentNode {
             ec_last_error: self.ec_last_error.clone(),
             op_progress: self.op_progress.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
+            ec_stage_tick: self.ec_stage_tick.clone(),
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
@@ -3399,6 +3422,7 @@ impl ExtentNode {
             ec_last_error: Rc::new(DashMap::new()),
             op_progress: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
+            ec_stage_tick: Rc::new(Cell::new(0)),
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
@@ -3556,6 +3580,10 @@ impl ExtentNode {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(()),
         };
+        // Sampled BEFORE the request goes out, so any staging that lands while
+        // the manager is answering is stamped above it and the answer is known
+        // not to be about that attempt.
+        let staging_tick_at_ask = self.ec_stage_tick.get();
         let extent_ids: Vec<u64> = self
             .extents
             .iter()
@@ -3598,7 +3626,8 @@ impl ExtentNode {
                 resp.message,
             ));
         }
-        self.apply_placements(&resp.placements).await;
+        self.apply_placements(&resp.placements, staging_tick_at_ask)
+            .await;
         if resp.garbage.is_empty() {
             return Ok(());
         }
@@ -3671,7 +3700,15 @@ impl ExtentNode {
     ///    the node never infers from what it happens to hold. A node with a
     ///    complete shard beside a complete `.dat` cannot tell which one the
     ///    cluster is pointed at — only the layout knows.
-    async fn apply_placements(&self, placements: &[manager_rpc::ExtentPlacement]) {
+    /// 4. **The verdict must be newer than the staging it condemns.**
+    ///    `staging_tick_at_ask` is the node's staging tick sampled before the
+    ///    question was asked; a mark stamped after it belongs to an attempt the
+    ///    manager had not been asked about, so its answer cannot be about it.
+    async fn apply_placements(
+        &self,
+        placements: &[manager_rpc::ExtentPlacement],
+        staging_tick_at_ask: u64,
+    ) {
         for p in placements {
             let want = PayloadRef::for_extent(p.payload_location, p.shard_index);
             let Some(entry) = self.extents.get(&p.extent_id).map(|e| Rc::clone(e.value())) else {
@@ -3694,9 +3731,10 @@ impl ExtentNode {
             let _op_guard = op_lock.lock().await;
             // The dangerous shape is a verdict that CONTRADICTS live staging:
             // it says the payload is still in `.dat` (so every shard here is
-            // residue) while an attempt has staged shards on this node. That
-            // combination means the verdict predates the attempt, and acting on
-            // it deletes a shard the coordinator is still writing.
+            // residue) while an attempt has staged shards on this node. Acting
+            // on such a verdict deletes a shard the coordinator may still be
+            // writing — so the question is whether the verdict is old enough to
+            // predate the staging, and that is what the tick answers.
             //
             // A verdict of `InShardFile` cannot be stale in that way — the
             // manager only publishes it by flipping the layout, which happens
@@ -3704,18 +3742,19 @@ impl ExtentNode {
             // the stage marker there is what lets cleanup run at all.
             // SEALED is not staging — it is the opposite — so it must not make
             // this look like a live attempt and block cleanup forever.
-            let staged_here = self
+            let staged = self
                 .ec_stage_nonce
                 .get(&p.extent_id)
                 .map(|v| *v)
-                .is_some_and(|n| n != EC_STAGING_SEALED);
+                .filter(|m| m.nonce != EC_STAGING_SEALED);
             match want.location {
-                PayloadLocation::InDat if staged_here => {
-                    // Cannot tell locally whether that attempt is live or
-                    // abandoned — only the manager knows, and its answer is the
-                    // stale thing. Leaving a shard costs space; deleting a live
-                    // one costs the shard. Wait for a fresher verdict (or a
-                    // restart, which clears this map).
+                PayloadLocation::InDat
+                    if staged.is_some_and(|m| m.tick > staging_tick_at_ask) =>
+                {
+                    // The staging arrived after the question went out, so this
+                    // answer is not about it. Leaving a shard costs space;
+                    // deleting a live one costs the shard. Wait for a verdict
+                    // asked for after the attempt was already visible.
                     tracing::debug!(
                         extent_id = p.extent_id,
                         "reconcile: skipping cleanup — this verdict says .dat while an \
@@ -3823,7 +3862,29 @@ impl ExtentNode {
                         }
                     }
                 }
-                PayloadLocation::InDat => {}
+                PayloadLocation::InDat => {
+                    // `.dat` is the payload AND the staging here (if any) is
+                    // older than the question. Two facts narrow what the
+                    // verdict can be describing: the manager gives no placement
+                    // at all while an op is in flight, so answering means no
+                    // MARKER was held when it answered; and the tick says
+                    // nothing staged here since. The shards below are reclaimed
+                    // like any other file the layout does not name.
+                    //
+                    // That is NOT "no attempt is writing". The abandon this
+                    // reclaim exists for fires on the dispatch tick where the
+                    // coordinator has just started a fresh attempt, so stripes
+                    // can still be streaming when the marker goes. Deleting
+                    // under one is survivable because of two things outside this
+                    // sweep, and both must keep holding: a later stripe whose
+                    // staging file has vanished is REFUSED rather than recreated
+                    // at its offset (`write_shard_stripe_local`), so no holey
+                    // shard can be built; and an attempt whose marker was
+                    // abandoned could never commit anyway — its completion
+                    // report finds no marker and is ignored — so the bytes were
+                    // already dead. Pinned by
+                    // `a_reclaim_that_lands_mid_attempt_is_refused_by_the_next_stripe`.
+                }
             }
             if !entry.holds_payload(want) {
                 // The file we are told to keep is not here yet. Never delete
@@ -6193,7 +6254,7 @@ impl ExtentNode {
     /// Callers must hold this extent's op lock so compare-and-record is atomic
     /// against a concurrent stripe.
     fn claim_ec_staging(&self, extent_id: u64, attempt_nonce: u64) -> bool {
-        let seen = self.ec_stage_nonce.get(&extent_id).map(|v| *v);
+        let seen = self.ec_stage_nonce.get(&extent_id).map(|v| v.nonce);
         // SEALED wins over everything, including the nonce-0 pass-through: once
         // the layout is flipped the staged file IS the live shard, so there is
         // no such thing as a legitimate stripe for it any more.
@@ -6201,6 +6262,15 @@ impl ExtentNode {
             return false;
         }
         if attempt_nonce == 0 {
+            // A pre-nonce peer is left UNORDERED — but it is still staging, and
+            // the reconcile guard reads the mark's TICK, not its nonce. Stamp
+            // one so this staging is visible as recent, carrying whatever floor
+            // a nonced attempt already established so the pass-through cannot
+            // lower it. Without the stamp a nonce-0 attempt that starts after a
+            // verdict was asked for looks like it never staged at all.
+            let floor = seen.unwrap_or(0);
+            self.ec_stage_nonce
+                .insert(extent_id, self.stamp_stage_mark(floor));
             return true;
         }
         if let Some(seen) = seen {
@@ -6208,14 +6278,26 @@ impl ExtentNode {
                 return false;
             }
         }
-        self.ec_stage_nonce.insert(extent_id, attempt_nonce);
+        self.ec_stage_nonce.insert(extent_id, self.stamp_stage_mark(attempt_nonce));
         true
+    }
+
+    /// Stamp a staging mark with the next tick.
+    ///
+    /// Every write to `ec_stage_nonce` goes through here, because a mark that
+    /// kept an older tick would read as "staged long ago" and could let a
+    /// reconcile verdict delete a shard an attempt is writing right now.
+    fn stamp_stage_mark(&self, nonce: u64) -> EcStageMark {
+        let tick = self.ec_stage_tick.get() + 1;
+        self.ec_stage_tick.set(tick);
+        EcStageMark { nonce, tick }
     }
 
     /// Mark this extent's staging CLOSED: the manager flipped the layout, so
     /// the file every attempt was staging into is now live data.
     fn seal_ec_staging(&self, extent_id: u64) {
-        self.ec_stage_nonce.insert(extent_id, EC_STAGING_SEALED);
+        self.ec_stage_nonce
+            .insert(extent_id, self.stamp_stage_mark(EC_STAGING_SEALED));
     }
 
     async fn write_shard_stripe_local(
@@ -8857,10 +8939,34 @@ impl ExtentNode {
         self.save_meta(extent_id, &entry).await
     }
 
+    /// Run ONE reconcile round against the manager, for integration tests that
+    /// need the production path — including where the staging tick is sampled —
+    /// rather than the applier alone. The real trigger is a 5-minute sweep.
+    /// A failure is logged the way the sweep logs it and swallowed here; the
+    /// caller asserts on what happened to the files.
+    pub async fn test_reconcile_once(&self) {
+        if let Err(e) = self.reconcile_orphans_with_manager().await {
+            tracing::warn!(error = %e, "test_reconcile_once: reconcile failed");
+        }
+    }
+
+    /// The node's staging tick — what a reconcile samples before it asks the
+    /// manager for a verdict. Integration tests take it at the point their
+    /// simulated question goes out, so a verdict can be made to predate a
+    /// staging (or not) on purpose.
+    pub fn test_staging_tick(&self) -> u64 {
+        self.ec_stage_tick.get()
+    }
+
     /// Run the placement-cleanup pass directly, for integration tests that
     /// exercise the destructive half without standing up a manager to answer a
-    /// reconcile. `(extent_id, payload_location, shard_index)` per placement.
-    pub async fn test_apply_placements(&self, placements: &[(u64, u8, u32)]) {
+    /// reconcile. `(extent_id, payload_location, shard_index)` per placement,
+    /// with the staging tick the question was asked at.
+    pub async fn test_apply_placements(
+        &self,
+        placements: &[(u64, u8, u32)],
+        staging_tick_at_ask: u64,
+    ) {
         let ps: Vec<manager_rpc::ExtentPlacement> = placements
             .iter()
             .map(|(extent_id, payload_location, shard_index)| manager_rpc::ExtentPlacement {
@@ -8869,7 +8975,7 @@ impl ExtentNode {
                 shard_index: *shard_index,
             })
             .collect();
-        self.apply_placements(&ps).await;
+        self.apply_placements(&ps, staging_tick_at_ask).await;
     }
 
     /// Expose the recovery_inflight map for integration tests. The Rc clone
@@ -10760,6 +10866,15 @@ mod recovery_idempotence_tests {
                 !node.claim_ec_staging(eid, 100),
                 "the nonce-0 pass-through must not lower the floor"
             );
+            // Unordered, but not INVISIBLE: the reconcile guard reads the tick,
+            // so a pre-nonce peer's staging must still stamp one or a verdict
+            // asked for before it would delete the shard it is writing.
+            let before = node.ec_stage_tick.get();
+            assert!(node.claim_ec_staging(eid, 0), "nonce 0 still stages");
+            assert!(
+                node.ec_stage_tick.get() > before,
+                "a nonce-0 staging left no tick — it is invisible to the freshness guard"
+            );
 
             // Once the layout is flipped the file is live: nothing may write it
             // again — not a newer attempt, and not a pre-nonce peer either.
@@ -10818,11 +10933,14 @@ mod recovery_idempotence_tests {
         );
 
         // The manager flips the layout: this file is now the live shard.
-        node.apply_placements(&[manager_rpc::ExtentPlacement {
-            extent_id: eid,
-            payload_location: PayloadLocation::InShardFile.as_byte(),
-            shard_index: 0,
-        }])
+        node.apply_placements(
+            &[manager_rpc::ExtentPlacement {
+                extent_id: eid,
+                payload_location: PayloadLocation::InShardFile.as_byte(),
+                shard_index: 0,
+            }],
+            node.ec_stage_tick.get(),
+        )
         .await;
 
         // A coordinator superseded BEFORE the flip retries its stripe.
@@ -10931,11 +11049,14 @@ mod recovery_idempotence_tests {
                 CODE_OK,
                 "the winning attempt must be able to stage"
             );
-            node.apply_placements(&[manager_rpc::ExtentPlacement {
-                extent_id: eid,
-                payload_location: PayloadLocation::InShardFile.as_byte(),
-                shard_index: 0,
-            }])
+            node.apply_placements(
+                &[manager_rpc::ExtentPlacement {
+                    extent_id: eid,
+                    payload_location: PayloadLocation::InShardFile.as_byte(),
+                    shard_index: 0,
+                }],
+                node.ec_stage_tick.get(),
+            )
             .await;
             let entry = node.ensure_extent(eid).await.expect("entry");
             node.disk_for(entry.disk_id).expect("disk").shard_path(eid, 0)

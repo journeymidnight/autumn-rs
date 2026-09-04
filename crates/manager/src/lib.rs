@@ -5453,6 +5453,70 @@ mod tests {
         }
     }
 
+    /// The node-side reclaim of an abandoned attempt's staging rests on ONE
+    /// property of this handler: a placement is emitted only when nothing is in
+    /// flight on the extent. The node cannot check that for itself — a
+    /// PARTICIPANT staging a shard sets no local marker, only the coordinator
+    /// does — so if the manager ever answered `InDat` while a conversion was
+    /// live, the participant would delete a shard being written into.
+    #[test]
+    fn reconcile_withholds_the_placement_while_a_conversion_is_in_flight() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let mut ex = test_extent(5, 1, 0);
+            ex.replicates = vec![1, 7, 3]; // node 7 IS a member
+            s.extents.insert(5, ex);
+        }
+        let ask = || -> ReconcileExtentsResp {
+            rkyv_decode::<ReconcileExtentsResp>(&run(async {
+                m.handle_reconcile_extents(rkyv_encode(&ReconcileExtentsReq {
+                    node_id: 7,
+                    node_uuid: String::new(),
+                    shard_idx: 0,
+                    extent_ids: vec![5],
+                }))
+                .await
+                .unwrap()
+            }))
+            .unwrap()
+        };
+
+        // Quiet extent: the node is told where the payload lives, and that is
+        // what authorises it to drop everything else it holds for this extent.
+        let resp = ask();
+        assert_eq!(resp.placements.len(), 1, "a member gets a verdict");
+        assert_eq!(resp.placements[0].extent_id, 5);
+        assert_eq!(
+            resp.placements[0].payload_location,
+            autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT
+        );
+
+        // Conversion in flight: NO verdict at all — not garbage, and no
+        // placement either. Silence is what keeps a participant's hands off a
+        // staging file the coordinator is still filling.
+        m._test_mark_ec_inflight(5);
+        let resp = ask();
+        assert!(
+            resp.placements.is_empty(),
+            "answering while a conversion is in flight lets a participant \
+             delete the shard it is staging"
+        );
+        assert!(resp.garbage.is_empty(), "a member must never be condemned");
+
+        // Given up: the marker is released WITHOUT a layout flip, so the
+        // verdict is `InDat` again — the one that reclaims the staging the
+        // abandoned attempt left behind.
+        m._test_clear_inflight(5);
+        let resp = ask();
+        assert_eq!(resp.placements.len(), 1, "the verdict must resume once nothing is in flight");
+        assert_eq!(
+            resp.placements[0].payload_location,
+            autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT
+        );
+    }
+
     /// A recovery TARGET is a non-member by construction — it is building the
     /// copy that will make it one. Listing it would delete the recovery out from
     /// under itself, so an in-flight marker suppresses collection entirely.

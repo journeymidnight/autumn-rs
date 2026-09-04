@@ -256,4 +256,34 @@ impl TestConn {
         WriteShardResp::decode(resp).expect("decode WriteShardResp")
     }
 
+    /// A stripe at an explicit offset, surfacing a REFUSAL instead of panicking.
+    /// The interesting answers on this path arrive as error frames rather than
+    /// response codes, so the refusal text is what a caller asserts on.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_shard_stripe(
+        &self,
+        extent_id: u64,
+        shard_index: u32,
+        sealed_length: u64,
+        eversion: u64,
+        attempt_nonce: u64,
+        shard_offset: u64,
+        payload: Vec<u8>,
+    ) -> Result<WriteShardResp, String> {
+        let req = WriteShardReq {
+            extent_id,
+            shard_index,
+            sealed_length,
+            eversion,
+            owner_epoch: 0,
+            shard_offset,
+            attempt_nonce,
+            payload: Bytes::from(payload),
+        };
+        match self.pool.call(&self.addr, MSG_WRITE_SHARD, req.encode()).await {
+            Ok(resp) => Ok(WriteShardResp::decode(resp).expect("decode WriteShardResp")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
 }

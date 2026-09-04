@@ -201,31 +201,6 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
-### F-EC-STAGING-RECLAIM — 放弃/失败的 EC 转换在参与者上留下的 `.ec.dat` staging 无人清理
-- **Trigger** (2026-09-03, 做 EC "重试到头就放弃 marker" 时发现的配套缺口): 一次失败的转换会把
-  已经写成功的分片留成 `.ec.dat` staging。今天清理它的只有两条路，都覆盖不到本情形：
-  ① `remove_extent_files`——要等该 extent 整体被删（refs→0）；
-  ② orphan reconcile 的第二条腿——只处理 `.dat` 已经没了而 `.ec.dat` 还在。
-  而放弃 marker 之后，extent **仍然活着**（复制形态），`.dat` 在、`.ec.dat` 也在 ⇒ 两条都不管。
-  下一次转换会重写它，所以不是无界泄漏；但若 policy 因为尺寸/配置不再提名它，就一直占着。
-- **形状（用户定 2026-09-03：由 EN 的 reconcile 清理）**: reconcile 的 wire 契约已经是对的形状——
-  EN 上报持有的 extent，manager 回 `garbage`（整删）与 `placements`（该是 `InDatFile` 还是
-  `InShardFile`），EN 已按 `placements` 翻转布局。只差一步：判定为 `InDatFile`（没转换、也没转换
-  在飞）时，该节点上的 `.ec.dat` 就是陈旧的。
-- **⚠️ 判据必须来自 manager，不能让 EN 本地猜（已核实）**: `ec_convert_inflight` **只在协调者上设**
-  （全仓仅一处 `insert`，在 `handle_convert_to_ec`）。参与者收的是 `WriteShard`，**它自己不知道有
-  转换正在进行**。所以若让 EN 用"本地有没有在飞"来决定，协调者上对、**参与者上永远是"没有在飞"**
-  ⇒ 会在 `WriteShard` 写到一半时删掉 staging，破坏进行中的 2PC——正是本子系统历史上出过静默损坏
-  的地方。只有 manager 知道 marker 在不在，判据必须随 verdict 下发。
-- **Scope**: `ExtentPlacement` 增加一个"该 extent 当前没有 EC 转换在飞"的位；EN 仅在收到
-  `InDatFile` **且**该位为真时 unlink `.ec.dat`。**这是改 wire**（指纹变 ⇒ `WIRE_VERSION` 要 bump，
-  按全停全启纪律走）。
-- **Acceptance**: 单测 —— 参与者收到 `InDatFile` + 无转换在飞 ⇒ staging 被删；**转换在飞时同样的
-  verdict 不得删**（消融：去掉那个位的检查必须变红）。集成 —— 让一次转换因参与者不可达而被放弃，
-  断言其 staging 在下一轮 reconcile 后消失，且 extent 仍可正常读。
-- **Status**: `passes: false` (2026-09-03) — 与 BUG-EC-CONVERT-STALL 的"放弃 marker"配套，
-  用户定「分开做、分开评审」。
-
 ### BUG-EC-CONVERT-STALL-HEALTHY-COORD — EC 转换在协调者健康的情况下永不完成，卡住该 extent 的 GC【已复现，未修】
 - **Trigger** (2026-09-03, 给 F-SEALED-EMPTY-SWEEP 补 chaos 验收时撞上)：chaos verify 的
   in-flight 阶段报 `op ... kind=7 target=0/12 still ACTIVE (state=1) after quiesce —

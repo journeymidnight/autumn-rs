@@ -524,6 +524,53 @@ mid-change: a participant staging a shard for a not-yet-flipped conversion holds
 a file the current layout does not name, and the node-side `ec_convert_inflight`
 guard only sees conversions THIS node coordinates.
 
+**A verdict must also be newer than the staging it condemns.** The manager's
+silence covers a conversion whose marker was already held when it answered; the
+node's `ec_stage_tick` covers one that staged after. It is a node-wide monotone
+count of accepted staging claims, sampled BEFORE the reconcile request goes out
+and compared against each extent's `EcStageMark.tick`: a mark stamped above the
+sample belongs to an attempt the manager had not been asked about, so its answer
+cannot be describing it and cleanup is skipped until a later round. Below the
+sample, the staged shards are reclaimed like any other file the layout does not
+name. Every write to `ec_stage_nonce` goes through `stamp_stage_mark`, including
+the nonce-0 pass-through — which stays UNORDERED, carrying the existing floor
+forward, but must not be invisible to the tick — so a mark cannot keep a stale
+tick and read as "staged long ago".
+
+**What the bracket does NOT prove is that no attempt is writing**, and the
+difference matters. The repeated-failure abandon fires on the dispatch tick where
+the coordinator has just STARTED a fresh attempt — the tally counts only a
+dispatch that started one — so the marker is released while stripes are still
+streaming, and placements resume at once. A participant whose question went out
+after that attempt's first stripe will delete staging that is being written. Two
+mechanisms outside this sweep make that survivable, and this reclaim is now a
+reason they must keep holding: a later stripe whose staging file has vanished is
+REFUSED rather than recreated at its offset (`write_shard_stripe_local`), so no
+zero-holed shard can be built and published; and an attempt whose marker was
+abandoned can never commit anyway, because its `ec_done` report finds no marker
+and is ignored. The bytes deleted were already dead.
+
+Reclaiming them closes a gap no other sweep reaches while the node stays up:
+`remove_extent_files` waits for the whole extent to be deleted, and the orphan
+reconcile's second leg only fires once the `.dat` is already gone, while an
+abandoned attempt leaves the extent alive with BOTH files present. A RESTART
+already collected it — the mark is in memory only, so a rebooted node sees an
+unmarked shard file and the same `InDat` verdict drops it — which is exactly why
+the hold was easy to miss: it lasted for the remaining life of the EN process,
+which on a healthy cluster is months. A parity target that staged but is not yet
+a member gets no placement at all (placements are member-only); its residue goes
+through the non-member garbage leg's three-round grace instead.
+
+Tests, all ablation-verified red:
+`an_abandoned_attempts_real_staging_is_reclaimed` and
+`a_stale_placement_must_not_delete_a_shard_being_staged` pin the two directions
+of the tick guard; `a_reclaim_that_lands_mid_attempt_is_refused_by_the_next_stripe`
+pins the vanished-file backstop against the window above (stream, integration);
+`reconcile_withholds_the_placement_while_a_conversion_is_in_flight` (manager,
+unit) pins the manager half the node cannot check for itself; and
+`an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile` (manager,
+integration) drives the whole splice, including where the tick is sampled.
+
 Deleting a payload file is destructive, so `apply_placements` gates it three
 ways: **the keeper must already be here** (`.dat` is dropped only once the named
 shard is actually held — otherwise a placement arriving before staging finishes
