@@ -201,22 +201,40 @@
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
 - **Status**: `passes: false` (2026-08-04) — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
 
-### BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS — chaos 的 KillThenFence nemesis 在默认配置下永远不会执行
-- **Trigger** (2026-09-04, 查 EC stall 时顺带发现，fable 评审确认): `do_kill_then_fence` 的预算门是
-  `min_healthy = (K+M).max(3) + 1`，默认 K=3/M=1 ⇒ 5；而集群规模
-  `num_ens = ((K+M).max(3)+1).max(5)` 也是 5，`healthy_count()` 上限就是 5。
-  于是 `5 <= 5` 恒成立 ⇒ 每一轮都 `KillThenFence skipped — healthy=5 ≤ min=5`。
-  **实测 13/13 轮全部跳过**（本轮所有 seed 603 日志）。
-- **它盖住的是什么**: KillThenFence 是唯一一个"杀掉节点后再 fence 它（运维宣告永久下线）"的注入，
-  也就是唯一驱动 **fence-gated recovery 派发**（`AUTUMN_MGR_RECOVERY_GATE=fenced_only` 的默认路径）
-  的 nemesis。它从没跑过 ⇒ chaos 从未覆盖过 fence→recovery→apply_recovery_done 这条主线。
-- **不要顺手把门槛调低**: 该门存在是为了不把集群压到 K+M 以下。正确的修法要么是这个动作跑在更大的
-  集群上（提高 `num_ens` 而不是降低 `min_healthy`），要么是让它在杀之前先确认 fence 后仍有 K+M 存活。
-  先确认改完之后 chaos 仍然稳定，再谈覆盖。
-- **Acceptance**: 默认配置下 KillThenFence 至少能真正执行（日志出现 `KillThenFence OK`），
-  且连跑 5 轮 chaos 全绿；断言 fence 后该 extent 的 recovery 真的被派发并 apply。
-- **Status**: `passes: false` (2026-09-04) — 已确认（代码 + 13/13 日志），未修。
-
+### F-RECOVERY-PATH-SILENT — recovery 的派发与 apply 成功路径都不打日志，而良性的重复上报是 WARN
+- **Trigger** (2026-09-04, 修好 KillThenFence 覆盖洞、那条路第一次真正跑起来之后看到):
+  manager 打出 `recovery completion does not match the live marker — REFUSING to apply
+  (a released attempt finishing late, or a report for another assignment)
+  extent_id=14 reported_node=3 reported_replace=1 pinned=None`。
+  只在 KillThenFence 真的跑了的轮次出现（它从没跑起来的 5 份日志里 0 次），**但不是必现**：
+  实测 8 轮里 5 轮有、3 轮没有，是时序相关。
+- **良性已证实（不是推断）**: 同一轮的 op ledger 里 recovery op 是 `state=2`（SUCCEEDED），
+  而 `complete_recovery` 全仓**只有一个调用点** —— `apply_recovery_done` 的成功尾部。
+  所以第一次上报确实 apply 成功并释放了 marker，后到的那份才落到 `pinned=None`。
+- **重复是谁产生的（代码里读到的）**: **不是 EN 重发**。EN 的 df 交接是 at-most-once
+  （`DoneQueues::take_recovery` 是 `mem::take`，`extent_node.rs` 注释写明"df 响应丢了完成就永远丢了"）。
+  真正的来源是 **manager 每 2 秒的常驻指令重发**（`resend_pinned_recovery_markers` →
+  `redispatch_pinned_recovery`）：重建已经完成、但下一次 df 还没把队列排空时重发到达，
+  `handle_require_recovery` 发现本地副本已完整，`try_adopt_completed_recovery` **再压一份**
+  完成记录并打 INFO `require_recovery: local copy already complete — adopting
+  (lost-completion re-dispatch)`（EN 日志里已实测到这条）。于是一批 df 里多份完成同时到达，
+  第一份 apply、其余撞 `pinned=None`。**这条路是设计使然，会常态触发，不是边角情况。**
+- **缺陷在于信号是反的**: 正常事件（派发成功、apply 成功）**一条日志都没有**
+  （`dispatch_recovery_task` 与 `apply_recovery_done` 成功路径只写 op ledger，不 tracing；
+  `RUST_LOG=...=debug` 也没有），而良性的重复上报是 WARN + "REFUSING to apply"。
+  EC 侧同样的情形是 `tracing::debug!("ec_done for an extent with no inflight marker; ignoring")`
+  并注释 "Benign"。而且 `REFUSING to apply` 就在 chaos 的 `FAIL_LOUD_MARKERS` 名单里
+  （虽然那个扫描只读 EN 日志、读不到 manager 日志）。
+  cross-ref memory `project_ec_frozen_owner_epoch_wedge`：
+  "相邻守卫一个 WARN 一个静默 = 排查黑洞"。
+- **Scope**: ① `dispatch_recovery_task` 成功派发打一条 INFO/DEBUG（extent、executor、replace 槽位）；
+  ② `apply_recovery_done` 成功时打一条 INFO（换掉了哪个槽位、新 eversion）；
+  ③ 把"没有 marker"这一支与"marker 存在但 node/replace 不符"分开：前者是重发-adopt 的常态产物，
+  按 EC 的先例降到 DEBUG 并写明 benign；后者保持 WARN。**不要**把两支合并成一条消息。
+- **Acceptance**: KillThenFence 那轮的日志能按顺序读出"派发 → 应用 → （可能的）重复上报被忽略"；
+  重复上报不再是 WARN；真正的不匹配仍然 WARN。单测：两次相同完成上报，第一次 apply 成功、
+  第二次走 benign 分支。
+- **Status**: `passes: false` (2026-09-04) — 现象与良性判定都已用数据坐实（见上），未修。
 
 ### F-SEALED-EMPTY-SWEEP — manager backstop sweep for leaked sealed-empty non-tail stream members【代码已就绪，未上线】
 - **Trigger** (2026-07-14, BUG-FLUSH-TIMEOUT-LEAK follow-up): 线上 5 节点 wedge 泄漏 10.4 TB / 222 GB

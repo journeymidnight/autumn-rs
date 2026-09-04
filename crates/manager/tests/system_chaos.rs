@@ -34,7 +34,8 @@
 //!   - AUTUMN_CHAOS_EC_K (default 3)  — data shards
 //!   - AUTUMN_CHAOS_EC_M (default 1)  — parity shards (0 = pure replication)
 //!   - AUTUMN_CHAOS_SEED (default = system time millis)
-//!   - AUTUMN_CHAOS_NUM_ENS (default = max(K+M+1, 5)) — at least one spare
+//!   - AUTUMN_CHAOS_NUM_ENS (default = one ABOVE the strictest nemesis budget,
+//!     i.e. (K+M).max(3) + 2; a cluster sized AT a budget can never satisfy it)
 //!
 //! Run:
 //!     cargo build --workspace
@@ -130,8 +131,17 @@ impl ChaosConfig {
     fn from_env() -> Self {
         let ec_k = env_u32("AUTUMN_CHAOS_EC_K", 3);
         let ec_m = env_u32("AUTUMN_CHAOS_EC_M", 1);
-        let min_ens = (ec_k + ec_m).max(3) + 1;
-        let num_ens = env_u32("AUTUMN_CHAOS_NUM_ENS", min_ens.max(5));
+        // One ABOVE the strictest budget, or the action guarding on it never
+        // runs (see `strictest_nemesis_min_healthy`).
+        let min_ens = strictest_nemesis_min_healthy(ec_k, ec_m) as u32 + 1;
+        let num_ens = env_u32("AUTUMN_CHAOS_NUM_ENS", min_ens);
+        if (num_ens as usize) <= strictest_nemesis_min_healthy(ec_k, ec_m) {
+            eprintln!(
+                "chaos: WARNING NUM_ENS={num_ens} is at or below the strictest nemesis \
+                 budget ({}), so KillThenFence can never run in this configuration",
+                strictest_nemesis_min_healthy(ec_k, ec_m)
+            );
+        }
         assert!(
             num_ens >= ec_k + ec_m,
             "AUTUMN_CHAOS_NUM_ENS ({num_ens}) must be ≥ K+M ({}+{})",
@@ -820,6 +830,23 @@ enum Action {
     LatencySpike,
 }
 
+/// The healthy-node count the STRICTEST nemesis insists on before it will act.
+///
+/// `KillThenFence` does not just stop a process, it declares the node
+/// permanently down — so it reserves one node more than the actions that only
+/// kill and restart. The cluster is SIZED from this, one above it, because a
+/// cluster sized to exactly the number an action refuses at can never run that
+/// action: `healthy_count()` starts at the cluster size and only ever goes
+/// down. That is not a skip, it is silent absence — the run reports the action
+/// as "skipped" in the same words it uses for a real decline, and the suite
+/// passes green having never once exercised it.
+///
+/// Both the guard and the sizing read THIS function, so the two cannot drift
+/// apart again; `the_cluster_can_satisfy_every_nemesis_budget` pins it.
+fn strictest_nemesis_min_healthy(ec_k: u32, ec_m: u32) -> usize {
+    (ec_k + ec_m).max(3) as usize + 1
+}
+
 const ALL_ACTIONS: &[Action] = &[
     Action::Split,
     Action::Merge,
@@ -853,6 +880,13 @@ struct NemesisCtx {
     partitioned: RefCell<Vec<String>>,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
+    /// Per action: how many times it was chosen, and how many times it acted.
+    ///
+    /// `skipped` in the log reads the same whether an action declined once or
+    /// has never once run in the suite's history, which is how a permanently
+    /// unsatisfiable budget hid for as long as it did. The tally makes the
+    /// difference visible in every run's summary.
+    action_tally: RefCell<std::collections::BTreeMap<String, (u64, u64)>>,
     /// Failed toxiproxy operations, counted apart from `nemesis_errors`.
     ///
     /// A nemesis action that declines (no candidate, budget guard) is normal and
@@ -1142,7 +1176,7 @@ async fn do_kill_en(ctx: &NemesisCtx) -> Result<String, String> {
 /// permanently down → recovery dispatches). Restart later so the
 /// cluster ends with a healthy node back.
 async fn do_kill_then_fence(ctx: &NemesisCtx) -> Result<String, String> {
-    let min_healthy = (ctx.ec_k + ctx.ec_m).max(3) as usize + 1;
+    let min_healthy = strictest_nemesis_min_healthy(ctx.ec_k, ctx.ec_m);
     if ctx.healthy_count() <= min_healthy {
         return Err(format!(
             "healthy={} ≤ min={min_healthy}",
@@ -1199,8 +1233,12 @@ async fn do_kill_then_fence(ctx: &NemesisCtx) -> Result<String, String> {
     // Hold long enough for recovery to dispatch (every 2 s tick).
     compio::time::sleep(Duration::from_millis(5000)).await;
 
-    // Unfence + restart so we don't deplete the cluster.
-    let _ = ctx
+    // Unfence + restart so we don't deplete the cluster. A fence that fails to
+    // clear is permanent: the node stays excluded from placement for the rest of
+    // the run, every later budget guard is computed against a cluster one node
+    // smaller than the summary claims, and nothing else ever clears it. Keep it
+    // booked as fenced when the clear fails, so `healthy_count` stays honest.
+    let cleared = ctx
         .mgr
         .call(
             MSG_CLEAR_NODE_OVERRIDE,
@@ -1209,7 +1247,28 @@ async fn do_kill_then_fence(ctx: &NemesisCtx) -> Result<String, String> {
                 set_by: "chaos".into(),
             }),
         )
-        .await;
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|resp| {
+            rkyv_decode::<CodeResp>(&resp)
+                .map_err(|e| format!("decode: {e}"))
+                .and_then(|r| {
+                    if r.code == CODE_OK {
+                        Ok(())
+                    } else {
+                        Err(format!("code {}: {}", r.code, r.message))
+                    }
+                })
+        });
+    if let Err(e) = cleared {
+        let mut ens = ctx.ens.borrow_mut();
+        ens[idx].restart(&ctx.en_binary, &ctx.manager_addr);
+        ctx.dead.borrow_mut().retain(|id| *id != victim_node_id);
+        return Err(format!(
+            "node {victim_node_id} was fenced but the fence could NOT be cleared ({e}) — \
+             it stays excluded from placement for the rest of this run"
+        ));
+    }
     ctx.fenced.borrow_mut().retain(|id| *id != victim_node_id);
 
     {
@@ -1345,11 +1404,19 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
     Ok(format!("latency spike node {victim_node_id} (4s)"))
 }
 
+/// Fan a maintenance op at every partition.
+///
+/// Per-partition failures are tolerated — a PS mid-reopen legitimately refuses
+/// — but reaching NONE of them is not "the action ran". The run summary counts
+/// an `Ok` return as coverage, so returning `Ok` after every call failed would
+/// report `Flush 1/1` for a round in which nothing was flushed.
 async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String, String> {
     let parts = ctx.topo.snapshot();
+    let mut delivered = 0usize;
+    let mut last_err = String::new();
     for (_, _, pid) in &parts {
         let client = ctx.router.client_for(*pid).await;
-        let _ = client
+        match client
             .call(
                 partition_rpc::MSG_MAINTENANCE,
                 partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
@@ -1363,9 +1430,19 @@ async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String,
                     op_id: 0,
                 }),
             )
-            .await;
+            .await
+        {
+            Ok(_) => delivered += 1,
+            Err(e) => last_err = e.to_string(),
+        }
     }
-    Ok(format!("{label} × {}", parts.len()))
+    if delivered == 0 {
+        return Err(format!(
+            "{label}: reached none of the {} partition(s) (last: {last_err})",
+            parts.len()
+        ));
+    }
+    Ok(format!("{label} × {delivered}/{}", parts.len()))
 }
 
 /// FORCE GC on every partition's sealed log_stream extents — the maximal stress
@@ -1504,6 +1581,14 @@ async fn nemesis_loop(
             )),
         };
         ctx.nemesis_events.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut tally = ctx.action_tally.borrow_mut();
+            let e = tally.entry(format!("{action:?}")).or_insert((0, 0));
+            e.0 += 1;
+            if result.is_ok() {
+                e.1 += 1;
+            }
+        }
         match result {
             Ok(msg) => eprintln!("nemesis: {action:?} OK — {msg}"),
             Err(msg) => {
@@ -1674,6 +1759,155 @@ const FAIL_LOUD_MARKERS: &[&str] = &[
     "bg_loop",                            // a supervised loop panicked and restarted
     "panicked",
 ];
+
+#[cfg(test)]
+mod nemesis_budget_tests {
+    use super::{strictest_nemesis_min_healthy, ChaosConfig};
+
+    /// The default cluster must be able to satisfy EVERY nemesis budget.
+    ///
+    /// This is the regression that made `KillThenFence` dead code for the life
+    /// of the suite: the cluster was sized to exactly the count that action
+    /// refuses AT (`healthy <= min` declines), so `healthy_count()` — which
+    /// starts at the cluster size — could never exceed it. 13 consecutive runs
+    /// logged `KillThenFence skipped — healthy=5 ≤ min=5` and nobody read it as
+    /// "this has never run", because a decline and an impossibility print the
+    /// same word.
+    ///
+    /// Goes through `ChaosConfig::from_env` rather than recomputing the sizing:
+    /// a test that derives both sides itself proves only that arithmetic works.
+    #[test]
+    fn the_default_cluster_can_satisfy_every_nemesis_budget() {
+        // A shell that exports these (both maintained chaos scripts export
+        // NUM_ENS) is configuring something else on purpose — skip rather than
+        // fail, since this test pins the DEFAULT.
+        for k in ["AUTUMN_CHAOS_EC_K", "AUTUMN_CHAOS_EC_M", "AUTUMN_CHAOS_NUM_ENS"] {
+            if std::env::var(k).is_ok() {
+                eprintln!("skipping: {k} is set, and this test pins the default sizing");
+                return;
+            }
+        }
+        let cfg = ChaosConfig::from_env();
+        let strictest = strictest_nemesis_min_healthy(cfg.ec_k, cfg.ec_m);
+        assert!(
+            (cfg.num_ens as usize) > strictest,
+            "the default cluster is {} EN(s) but the strictest nemesis declines at \
+             healthy <= {strictest}, so it can never run",
+            cfg.num_ens
+        );
+    }
+
+    /// And for K/M shapes other than the default, so a future change to either
+    /// side cannot re-open the gap. Also reads the sizing from `from_env`,
+    /// through the env vars that feed it.
+    #[test]
+    fn the_sizing_clears_the_budget_for_other_shapes() {
+        if std::env::var("AUTUMN_CHAOS_NUM_ENS").is_ok() {
+            eprintln!("skipping: AUTUMN_CHAOS_NUM_ENS is set, which overrides the sizing");
+            return;
+        }
+        // `from_env` reads process env, so these run one at a time in-process.
+        for (k, m) in [(2u32, 1u32), (3, 1), (4, 2), (6, 3)] {
+            // SAFETY: the chaos harness is single-threaded at this point and no
+            // other test in this binary reads these vars concurrently.
+            unsafe {
+                std::env::set_var("AUTUMN_CHAOS_EC_K", k.to_string());
+                std::env::set_var("AUTUMN_CHAOS_EC_M", m.to_string());
+            }
+            let cfg = ChaosConfig::from_env();
+            let strictest = strictest_nemesis_min_healthy(cfg.ec_k, cfg.ec_m);
+            assert!(
+                (cfg.num_ens as usize) > strictest,
+                "K={k} M={m}: sizing {} does not clear the budget {strictest}",
+                cfg.num_ens
+            );
+        }
+        unsafe {
+            std::env::remove_var("AUTUMN_CHAOS_EC_K");
+            std::env::remove_var("AUTUMN_CHAOS_EC_M");
+        }
+    }
+}
+
+/// Did the fence actually drive a repair?
+///
+/// `KillThenFence` is the only nemesis that declares a node permanently down,
+/// which is what makes the manager rebuild that node's slots elsewhere. Nothing
+/// else in this file asserts that happened: `verify_no_ops_left_in_flight` only
+/// says nothing is still ACTIVE, which a run with zero recoveries passes just as
+/// happily. So if fence-gated dispatch silently stopped working, the suite would
+/// stay green and the tally would still report `KillThenFence 1/1` — the same
+/// "green while uncovered" shape this round was opened to close, one layer down.
+///
+/// Only asserted for rounds where the action actually ran. The ledger is a
+/// leader-local ring of 256, so this reads what is still in it, not a total.
+async fn verify_fence_drove_a_recovery(mgr: &RpcClient) -> Vec<String> {
+    let resp = match mgr
+        .call(
+            MSG_OP_QUERY,
+            rkyv_encode(&OpQueryReq {
+                op_id: 0,
+                active_only: false,
+                kind_filter: OP_KIND_RECOVERY,
+                limit: 256,
+            }),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return vec![format!("recovery-op query failed: {e:?}")],
+    };
+    let resp: OpQueryResp = match rkyv_decode(&resp) {
+        Ok(r) => r,
+        Err(e) => return vec![format!("recovery-op query undecodable: {e}")],
+    };
+    if resp.ops.is_empty() {
+        return vec![
+            "KillThenFence ran, but the op ledger holds NO recovery op at all — the fence \
+             never drove a rebuild. Either dispatch is not firing for a fenced node, or the \
+             extents it held needed none; the first is a product regression this suite is \
+             supposed to catch and would otherwise pass green"
+                .to_string(),
+        ];
+    }
+    eprintln!(
+        "chaos: fence drove {} recovery op(s): {}",
+        resp.ops.len(),
+        resp.ops
+            .iter()
+            .map(|o| format!("extent {} state={}", o.secondary_id, o.state))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Vec::new()
+}
+
+/// EN log files with no content at all.
+///
+/// `scan_en_fail_loud` can only report what the ENs actually wrote, and an
+/// empty file is indistinguishable in its output from a node that had nothing
+/// to say. Every EN writes at least one line as it starts (the chaos harness
+/// pins `--cpuset 0`, which the EN warns about unconditionally), so empty here
+/// means the log channel is off — the scan is vacuous and must say so instead
+/// of reporting a clean result.
+fn en_log_files_that_are_empty(log_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return Vec::new();
+    };
+    let mut empty: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("en-") || !name.ends_with(".log") {
+                return None;
+            }
+            let len = e.metadata().ok()?.len();
+            (len == 0).then_some(name)
+        })
+        .collect();
+    empty.sort();
+    empty
+}
 
 /// Grep the EN subprocess logs for fail-loud markers.
 ///
@@ -2999,6 +3233,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             nemesis_events: nemesis_events.clone(),
             nemesis_errors: nemesis_errors.clone(),
             proxy_faults: proxy_faults.clone(),
+            action_tally: RefCell::new(Default::default()),
             ec_k: cfg.ec_k,
             ec_m: cfg.ec_m,
         });
@@ -3024,10 +3259,15 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let _ = r2.await;
         let _ = n.await;
 
-        // Cleanup: unfence everyone and ensure ENs are alive for verify.
+        let mut cleanup_faults: Vec<String> = Vec::new();
+        // Cleanup: unfence everyone and ensure ENs are alive for verify. A fence
+        // that will not clear leaves that node excluded from placement for the
+        // whole verify phase — the same untracked-fault shape as an unhealed
+        // proxy ten lines below, so it is reported the same way rather than
+        // dropped on the floor.
         let fenced_snapshot: Vec<u64> = nemesis_ctx.fenced.borrow().clone();
         for nid in fenced_snapshot {
-            let _ = mgr
+            let cleared = mgr
                 .call(
                     MSG_CLEAR_NODE_OVERRIDE,
                     rkyv_encode(&ClearNodeOverrideReq {
@@ -3035,7 +3275,25 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                         set_by: "chaos-cleanup".into(),
                     }),
                 )
-                .await;
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|resp| {
+                    rkyv_decode::<CodeResp>(&resp)
+                        .map_err(|e| format!("decode: {e}"))
+                        .and_then(|r| {
+                            if r.code == CODE_OK {
+                                Ok(())
+                            } else {
+                                Err(format!("code {}: {}", r.code, r.message))
+                            }
+                        })
+                });
+            if let Err(e) = cleared {
+                cleanup_faults.push(format!(
+                    "node {nid} could not be unfenced before verify ({e}) — it stays \
+                     excluded from placement for everything below"
+                ));
+            }
         }
         {
             let mut ens = nemesis_ctx.ens.borrow_mut();
@@ -3053,10 +3311,10 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             for name in [p.clone(), format!("{p}-ctl")] {
                 if let Err(e) = nemesis_ctx.toxi.set_enabled(&name, true) {
                     nemesis_ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "chaos: WARNING proxy {name} could not be re-enabled before verify \
-                         ({e}) — that node is unreachable for everything below"
-                    );
+                    cleanup_faults.push(format!(
+                        "proxy {name} could not be re-enabled before verify ({e}) — that \
+                         node is unreachable for everything below"
+                    ));
                 }
             }
         }
@@ -3091,6 +3349,39 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             nemesis_events.load(Ordering::Relaxed),
             nemesis_errors.load(Ordering::Relaxed),
         );
+        // WHAT ACTUALLY RAN. `skipped` in the lines above cannot distinguish an
+        // action that declined once from one the cluster can never satisfy, so
+        // name the never-ran ones here rather than leaving them to be inferred
+        // from their absence. Scoped to the CONFIGURED action set: an action
+        // switched off by `AUTUMN_CHAOS_ACTIONS` was never chosen, and calling
+        // that "never ran" would report a deliberate choice as a coverage gap.
+        {
+            let tally = nemesis_ctx.action_tally.borrow();
+            let rendered: Vec<String> = cfg
+                .actions
+                .iter()
+                .map(|a| {
+                    let k = format!("{a:?}");
+                    let (tried, ok) = tally.get(&k).copied().unwrap_or((0, 0));
+                    format!("{k} {ok}/{tried}")
+                })
+                .collect();
+            eprintln!("chaos: nemesis actions (ran/chosen): {}", rendered.join(" | "));
+            let never: Vec<String> = cfg
+                .actions
+                .iter()
+                .map(|a| format!("{a:?}"))
+                .filter(|k| tally.get(k).is_none_or(|(_, ok)| *ok == 0))
+                .collect();
+            if !never.is_empty() {
+                eprintln!(
+                    "chaos: NOTE these enabled actions never ran this round: {}. \
+One round proves nothing (a decline is per-tick), but an action that never \
+runs ACROSS rounds is uncovered, not unlucky.",
+                    never.join(", ")
+                );
+            }
+        }
 
         let expected_snapshot = expected.borrow().clone();
         eprintln!("chaos: verifying {} acked keys (per-key)", expected_snapshot.len());
@@ -3182,6 +3473,14 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         eprintln!("chaos: verifying nothing is left in flight (op ledger + EC markers)");
         let mut inflight_errors = verify_no_ops_left_in_flight(&mgr).await;
         inflight_errors.extend(verify_no_ec_markers_pinned(&mgr).await);
+        let fence_ran = nemesis_ctx
+            .action_tally
+            .borrow()
+            .get("KillThenFence")
+            .is_some_and(|(_, ok)| *ok > 0);
+        if fence_ran {
+            inflight_errors.extend(verify_fence_drove_a_recovery(&mgr).await);
+        }
         eprintln!(
             "chaos: in-flight verify: errors={}",
             inflight_errors.len()
@@ -3212,6 +3511,27 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // than a printed counter: the failure it guards against is a proxy
         // helper that silently no-ops, which makes every partition injection
         // vanish and leaves the suite green with that dimension uncovered.
+        for f in &cleanup_faults {
+            workload_errors.push(format!("CLEANUP DID NOT COMPLETE: {f}"));
+        }
+        // The fail-loud scan below reads the EN subprocess logs. If those are
+        // EMPTY the scan cannot find anything, and it prints "no fail-loud
+        // markers in any EN log" — which reads exactly like a clean run. That
+        // is how a `RUST_LOG` scoped to one crate silently disables the check:
+        // the ENs inherit the variable and their own default filter goes off.
+        // Every EN emits at least one line at startup, so an empty log means
+        // the channel is off, not that the node was quiet.
+        let silent_en_logs = en_log_files_that_are_empty(&log_dir);
+        if !silent_en_logs.is_empty() {
+            workload_errors.push(format!(
+                "{} EN log(s) are EMPTY ({}) — the fail-loud scan below reads those files, \
+                 so it verified NOTHING this run. Almost always a `RUST_LOG` scoped to one \
+                 crate (the EN subprocesses inherit it and their own default filter turns \
+                 off); use `RUST_LOG=info` or leave it unset",
+                silent_en_logs.len(),
+                silent_en_logs.join(", ")
+            ));
+        }
         let proxy_faults_total = proxy_faults.load(Ordering::Relaxed);
         if proxy_faults_total > 0 {
             workload_errors.push(format!(

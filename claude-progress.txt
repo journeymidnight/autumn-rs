@@ -1,8 +1,51 @@
 Date: 2026-09-04
 TaskStatus: completed
-Task scope: ① F-EC-STAGING-RECLAIM（放弃的 EC 转换留下的 staging 分片由 reconcile 回收）；
-  ② BUG-EC-CONVERT-STALL-HEALTHY-COORD 归因收口 —— **它是 chaos harness 的故障，不是产品 bug**，
-  修 harness 后 13/13 绿，账本条目已销；③ 顺带确认并立账 KillThenFence nemesis 从未执行过。
+Task scope: ① F-EC-STAGING-RECLAIM；② BUG-EC-CONVERT-STALL-HEALTHY-COORD 定谳为 harness 故障并修复；
+  ③ BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS 修复 —— 那条 nemesis 从来没执行过，现在每轮都跑，
+  并补上"fence 确实驱动了 recovery"的断言（该条账本条目已销）；④ 立账 F-RECOVERY-PATH-SILENT。
+
+【2026-09-04 KillThenFence 从未执行：修复 + 把"跑没跑过"变成可见】
+  预算门 `min_healthy = (K+M).max(3)+1 = 5`，而集群就是按 5 台起的、`healthy_count()` 上限 5
+  ⇒ `5<=5` 恒成立 ⇒ **13/13 轮全部 skipped**，而"拒绝一次"和"永远不可能"打印的是同一个词。
+  修法不是调常数：抽出 `strictest_nemesis_min_healthy(k,m)`，**门和集群规模读同一个函数**，
+  规模取它 +1（默认 5→6 台），两边不可能再各走各的。单测走 `ChaosConfig::from_env` 验证，
+  消融（改回旧表达式）两条都变红。
+  结果：`KillThenFence OK` 在 5 轮 / 3 个 seed 上**每轮都出现**，全绿，12 个动作里 11 个真的跑
+  （只有 Merge 因分区不足合理拒绝）。
+
+  **补上账本自己写的第三条验收**（评审指出我漏了）：新增 `verify_fence_drove_a_recovery` ——
+  KillThenFence 真跑过的轮次，断言 op ledger 里至少有一条 recovery op。
+  实测每轮 1~4 条，`state=2`(SUCCEEDED)。没有这条断言的话，fence-gated 派发哪天悄悄坏掉，
+  chaos 依然全绿、tally 依然显示 `KillThenFence 1/1` —— 正是这轮要消灭的"绿着但没覆盖"形状。
+
+  **顺手修的同类问题**：解 fence 的 RPC（动作内 + 收尾两处）都是 `let _ =`；一个清不掉的 fence
+  是永久的（该节点整轮被排除出放置、`healthy_count` 虚高、没有别的东西会清它）。
+  `do_maintenance` 也把每个分区的 RPC 失败吞掉后无条件返回 Ok ⇒ 一次一个分区都没打到的 Flush
+  会被 tally 记成 `Flush 1/1` 的"覆盖"。都改成显式报错。
+
+  **我自己的测量错误（评审抓到，必须记）**：那 8 轮"全绿"是带着
+  `RUST_LOG=autumn_manager=info` 跑的 —— EN 子进程**继承了这个变量**，它们自己的默认 info
+  过滤器因此关掉，**8 轮的 en-*.log 全是 0 字节**。于是 `scan_en_fail_loud` 在空文件上扫描，
+  每轮都打印"no fail-loud markers in any EN log"，读起来和干净通过一模一样。
+  这正是本轮在消灭的那个形状，我自己踩了一遍。已加检查：EN 日志为空 ⇒ 直接算 run 错误
+  （每个 EN 启动必打至少一行）。重测（不带 crate-scoped RUST_LOG）：en 日志 62~78 KB，5 轮全绿。
+  **教训：给子进程留的 RUST_LOG 必须是 `RUST_LOG=info` 或不设，不能只给一个 crate 开。**
+
+  **评审还纠正了两处我写进账本的话**：① `the_sizing_stays_above_the_budget_for_other_shapes`
+  当时在本地自己算 `sized = strictest + 1` 再断言 `sized > strictest` —— 恒真的同义反复，
+  什么也钉不住；已改成走 `from_env`，消融变红。② F-RECOVERY-PATH-SILENT 里我写的机制是错的
+  （见该条目）。
+
+【2026-09-04 F-RECOVERY-PATH-SILENT 的事实澄清（我第一版写错了）】
+  我写"EN 按设计重复上报"——**错**。EN 的 df 交接是 at-most-once（`mem::take`），丢了就没了。
+  真正的重复来自 **manager 每 2s 的常驻指令重发**：重建已完成但 df 还没排空时重发到达，
+  EN 的 `try_adopt_completed_recovery` 再压一份完成记录（EN 日志里那行
+  `adopting (lost-completion re-dispatch)` 已实测到）。
+  我还写了"无从判断第一次 apply 有没有成功"——**也不对**：op ledger 里 recovery op 是
+  `state=2`(SUCCEEDED)，而 `complete_recovery` 全仓只有 `apply_recovery_done` 成功尾部一个调用点，
+  所以是可判定的，只是**日志里看不到**。以及"必现"是假的：8 轮里 5 轮有、3 轮没有。
+  结论（良性）不变，但三处论据都换成了实测。
+
 
 【2026-09-04 BUG-EC-CONVERT-STALL 定谳：toxiproxy 修复"上报成功但没生效"】
   **结论：产品没坏，harness 坏了。** 而且坏的方式正是我一直在别处防的那一类——静默的默认值。
@@ -148,37 +191,6 @@ Task scope: ① F-EC-STAGING-RECLAIM（放弃的 EC 转换留下的 staging 分�
   （fable 查明是设计使然：非空 extent 的选择是 discard 驱动的，而本测试不删不覆盖 ⇒ discard=0；
   且第二次 roll 之前 E 还是尾巴、本就被排除）。测试改用与 `run_gc` 空路径**逐字节相同**的
   `MSG_STREAM_PUNCH_HOLES`，所以钉住的是"回收游标 extent 的后果"，不是"GC 就是回收者"。
-
-【2026-09-03 BUG-EC-CONVERT-STALL-HEALTHY-COORD 诊断进展：方向掐掉一半】
-  原假设：候选被 `collect_ec_dispatch_candidates` 静默过滤。给它三个静默 `continue` 都加了诊断
-  （recovery 持有 / 协调者不可派发 / 没有带 EC 形状的 stream 列出该 extent —— 最后一条是 WARN，
-  因为它是永久卡死而非"下次再试"）后复跑：**一条都没触发**，假设被否掉。
-  真相在既有日志里：`EC convert accepted by coordinator extent_id=12` 出现 **9 次** ——
-  每 5s 重新派发、每次被协调者**接受**、然后永不完成。所以问题在 accept-ACK **之后**，
-  不在 manager 的候选选择。`attempts=0` 同时说明重新派发不计数，"卡多久/试几次"本身不可观测。
-  诊断代码保留（覆盖的是真实的静默丢弃路径），但如实记明这次复现里它们没触发。
-  **根因随后定死在 EN 日志里**：`EC convert failed: WriteShard to 127.0.0.1:15009 shard 1 @ 0:
-  Connection refused` —— 每 5s 一次、9 次全同。转换**每次都真的失败**，卡在写某个**参与者**分片上；
-  失败只进 EN 自己的日志，manager 的 marker 永远 `attempts=0 / last_error=""` ⇒ 无人重选目标、
-  无人报警、该 extent 的 GC 被永久挡住。EN 的 `CODE_OK` 同时是"已接受"和"已在跑"，manager 分不清。
-  **两处自我纠正**：① "加 RUST_LOG 必现"是两样本外推，实测 8 轮 4 过 4 挂、与 RUST_LOG 无关；
-  ② chaos 断言写着"nothing is stopping this conversion"，但它**只查协调者不查参与者** ——
-  这句话把我引开了大半程，已改成点明它的盲区并指向 EN 日志。
-  **观测那半随后做完并端到端验证**：marker 现在是 `attempts=9 last_error="WriteShard ... refused"`。
-  评审又抓到我两处做错的：attempts 原本数的是 manager 的 ping 而非真实尝试（健康的长转换会虚增
-  每分钟 ~12）；以及响应迟到 60s 时会凭空重建一个没有 marker 的 RUNNING 条目，导致之后
-  force-ec-convert 全部静默空操作。两条都改了、都有消融验证的单测。
-  **行为那半仍未做**（参与者不可达 = 重选目标还是判失败），涉及 2PC 安全性，不凭推断动。
-
-【2026-09-03 EC stall 归因补完 —— 以及一次差点发出去的错误结论】
-  用独立 worktree 在 `db19c86`（重放修复之前）做单变量隔离，seed 603：
-  **修复前 3/8 失败;同一 worktree 只加那一行重放修复 4/8 失败** ⇒ 无差异，
-  **stall 早于 84545c9**，账本里那个"未单独对照"的空洞闭合。
-  **但过程值得记**：头两批各 4 轮给出的是 0/4 vs 3/4，看上去就是"我引入了回归"，我当时已经准备
-  据此报告。继续采到 8 轮才发现头一批的 0/4 是运气（0.5⁴≈6%）。这是今天**第四次**同型错误
-  （单轮 grep 阴性、两样本外推 RUST_LOG、窄 grep 漏掉 9 条结果行、以及这次），
-  唯一的区别是这次我没有停在那个戏剧性的结果上。
-  **操作教训**：这类 ~50% 的 flake，任何 ≤4 轮的对照都不足以支持因果结论。
 
 【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
   `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
