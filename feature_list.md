@@ -74,8 +74,29 @@
   两者在代码和集群里都不存在。**最后一个候选解释也已排除**：cap 4→16 的 bump 与回退
   （`d6aa298` / `3f5d3a9`）都在 2026-05-21，比那次测量早几个月，当时 cap 就是 4。
   ⇒ **该数字的出处需要查证**；在此之前标题的 "~30K" 只对 put 成立。
+- **2026-09-05 杠杆 (a) 已实测验证，倍数比预测更好**：EN 全部收拢到可用区 C 之后，
+  用同口径对照（两边 `avg_batch_size` 都是 1.0，同集群同代码，只差 PS 与 EN 是否同区）：
+  | PS | 可用区 | 样本 | `avg_phase2_ms`（WAL 复制） | end-to-end |
+  |---|---|---|---|---|
+  | ps-0 → part 17 | b（跨区） | n=1×2 | **1.603** | 1.65 |
+  | ps-1 → part 44 | **c（与 EN 同区）** | **n=39** | **0.190** | 0.193 |
+  **8.4×**，且 0.190 ms 与预测的 ~0.11 ms 同量级。（首个样本 0.545 ms 是冷启动，
+  被 39 个样本推翻——n=1 的数不要用。）
+  按实测有效在飞数 ~1.2 推算：append/s 从 ~750 升到 ~6,300，配 ~31 key/append 的批量 put
+  ⇒ 单进程 key/s 由 ~23K 升到 ~195K 量级。**注意这是外推，不是端到端实测吞吐。**
+- **⚠️ 但收益目前只覆盖 7 个分区里的 2 个**：迁移只搬了 EN，**PS 没搬**——
+  ps-0 在 b、ps-2 在 d，只有 ps-1 在 c。所以只有落在 ps-1 上的 part 36/44 走到了同区路径。
+  **下一步是把 PS 也搬到 zone c**，否则大部分分区仍在付 1.6 ms。
+- **⚠️ perf-check / ycsb 在开了 authz 的集群上不可用（2026-09-05 实测）**：
+  两者都硬编码 `ClusterClient::connect(&mgr, BENCH_SCOPE)`——**匿名连接，忽略
+  `--credential-file`**（`crates/server/src/bin/autumn_client/main.rs:301/352/530`）。
+  匿名连不上 PS，而每次写的错误又在 `.is_ok()` 处被丢掉，于是唯一的症状是
+  `write phase produced no keys — is the cluster running?`——一个把**认证失败**
+  伪装成**集群故障**的错误信息，PS 侧连一条拒绝日志都没有（连接根本没建立）。
+  要用它压测必须先改成 `connect_with_credential`。本轮的测量因此改用
+  `autumn-client put` 逐条写 + 读 PS 的 `partition write summary`。
 - **三条杠杆，按该做的顺序**：
-  **(a) AZ 收拢 —— 先做这个。** append 1.39 ms → ~0.11 ms 会把 append/s 从 950 抬约一个
+  **(a) AZ 收拢 —— 已做，见上。** append 1.39 ms → ~0.11 ms 会把 append/s 从 950 抬约一个
   量级，delete 不改协议就能追平 put 今天的水平，**一行 wire 都不用动**。
   **(b) `ps_conn_inflight_cap` 4→8。** `AUTUMN_PS_CONN_INFLIGHT_CAP` 已在
   `deploy/docker/entrypoint.sh` 的 `PS_TUNABLES` 表里，**不用改代码也不用换镜像**。
