@@ -1,4 +1,4 @@
-use crate::conn_pool::parse_addr;
+use crate::conn_pool::{parse_addr, shard_addr_for_extent};
 use crate::extent_cksum;
 use crate::extent_rpc::*;
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
@@ -5905,7 +5905,7 @@ impl ExtentNode {
             if exclude_node_ids.contains(node_id) {
                 continue;
             }
-            let Some(addr) = nodes.get(node_id) else {
+            let Some((base, shard_ports)) = nodes.get(node_id) else {
                 unverified += 1;
                 tracing::warn!(
                     extent_id = extent.extent_id,
@@ -5914,6 +5914,11 @@ impl ExtentNode {
                 );
                 continue;
             };
+            // The OWNING shard, not the base port: a peer refuses a hot-path
+            // read addressed to the wrong shard, and with shard_count=4 only
+            // the extents that hash to shard 0 would have worked.
+            let routed = shard_addr_for_extent(base, shard_ports, extent.extent_id);
+            let addr = &routed;
             let Ok(sock) = parse_addr(addr) else {
                 unverified += 1;
                 tracing::warn!(
@@ -6157,7 +6162,17 @@ impl ExtentNode {
         Ok(resp.extent.map(|e| mgr_to_local_extent(&e, loc)))
     }
 
-    async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, String>, String> {
+    /// `node_id -> (base address, per-shard listener ports)`.
+    ///
+    /// The ports are NOT decoration. An EN runs `shard_count` listeners and a
+    /// hot-path RPC must reach the shard that OWNS the extent
+    /// (`autumn_rpc::shard_for_extent`, a hashed map — not `id % count`, which
+    /// aliased bootstrap's contiguous ids onto shard 0). A read sent to the
+    /// base address always lands on shard 0 and is refused with
+    /// "extent N belongs to shard M not shard 0".
+    async fn nodes_map_from_manager(
+        &self,
+    ) -> Result<HashMap<u64, (String, Vec<u16>)>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Err("no manager endpoint configured".to_string()),
@@ -6181,7 +6196,7 @@ impl ExtentNode {
         Ok(resp
             .nodes
             .into_iter()
-            .map(|(id, n)| (id, n.address))
+            .map(|(id, n)| (id, (n.address, n.shard_ports)))
             .collect())
     }
 
@@ -6313,6 +6328,19 @@ impl ExtentNode {
                     Err(e) => {
                         drop(f);
                         let _ = compio::fs::remove_file(&path).await;
+                        // The ENTRY is deliberately NOT dropped here, though
+                        // leaving it is what wedges this (node, extent) pair:
+                        // `require_recovery` refuses whenever an entry exists
+                        // that it cannot classify, and for an ec_converted
+                        // extent `try_adopt_completed_recovery` answers Unknown
+                        // every time. Dropping it is still the wrong cure —
+                        // `handle_write_shard` shares this entry, so an EC
+                        // conversion that assigned this node as parity mid-
+                        // rebuild (a case the manager documents) would lose the
+                        // shard it just recorded, and `ec_stage_nonce` is the
+                        // guard that refuses a superseded coordinator's write.
+                        // Unwedging needs the EC arm of
+                        // `try_adopt_completed_recovery` — see the ledger.
                         return Err(e);
                     }
                 };
@@ -6565,10 +6593,16 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 if i == shard_index || node_id == task.node_id {
                     continue;
                 }
-                let Some(addr) = nodes.get(&node_id) else {
+                let Some((base, shard_ports)) = nodes.get(&node_id) else {
                     why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
                     continue;
                 };
+                // Route to the shard that OWNS the extent. Addressing the base
+                // port sends every read to shard 0, which the peer refuses with
+                // "belongs to shard M not shard 0" -- the whole rebuild then
+                // reports 0/K with every peer healthy and the shards on disk.
+                let routed = shard_addr_for_extent(base, shard_ports, task.extent_id);
+                let addr = &routed;
                 let sock = match parse_addr(addr) {
                     Ok(v) => v,
                     Err(e) => {
@@ -8575,9 +8609,11 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 })?;
             let tmp_rc = Rc::new(tmp_file);
             for node_id in mgr_info.replicates.iter().chain(mgr_info.parity.iter()) {
-                let Some(addr) = nodes.get(node_id) else {
+                let Some((base, shard_ports)) = nodes.get(node_id) else {
                     continue;
                 };
+                let routed = shard_addr_for_extent(base, shard_ports, extent_id);
+                let addr = &routed;
                 let Ok(sock) = parse_addr(addr) else {
                     continue;
                 };
@@ -12125,5 +12161,33 @@ mod ec_stripe_plan_tests {
     fn nothing_to_do_is_an_empty_plan() {
         assert!(ExtentNode::ec_stripe_plan(0, 4096).is_empty());
         assert!(ExtentNode::ec_stripe_plan(4096, 0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shard_routing_tests {
+    /// The extent->shard map must stay the HASH, not `extent_id % k`.
+    ///
+    /// This is the ONLY thing worth asserting here that
+    /// `tests/shards.rs::client_routes_by_extent_hash` does not already cover:
+    /// that the two maps genuinely disagree. The modulo form is the trap —
+    /// bootstrap hands out contiguous extent ids, so on a fresh cluster it
+    /// aliases most of them onto shard 0 and looks correct, then misroutes on a
+    /// real one. Nothing here tests the CALL SITES, which is where the bug was:
+    /// the arithmetic was always right, `nodes_map_from_manager` just dropped
+    /// `shard_ports` on the floor.
+    #[test]
+    fn the_extent_to_shard_map_is_the_hash_not_the_modulo() {
+        let mut differ = 0;
+        for id in 0u64..256 {
+            if autumn_rpc::shard_for_extent(id, 4) as u64 != id % 4 {
+                differ += 1;
+            }
+        }
+        assert!(
+            differ > 100,
+            "hash and modulo should disagree on most ids; got {differ} of 256 \
+             — has the map been swapped back to modulo?"
+        );
     }
 }

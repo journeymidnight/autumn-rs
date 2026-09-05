@@ -506,3 +506,82 @@ fn recovery_per_shard() {
     // And make sure the Rc::<ConnPool> from phase 1 doesn't sit idle.
     let _phase1_rc = Rc::new(addrs_phase1);
 }
+
+/// A peer read addressed to the WRONG shard is refused — which is the contract
+/// every peer-copy path depends on, and the one they all quietly broke.
+///
+/// `nodes_map_from_manager` used to return only a node's base address, so
+/// `stream_ec_recovery_payload`, `stream_extent_from_sources` and the
+/// `handle_copy_extent` peercopy loop all read from port 9101 regardless of
+/// which shard owned the extent. With four shards that is right about a quarter
+/// of the time by luck; the rest are refused with "belongs to shard M not shard
+/// N", and an EC rebuild reports `0/K shards available` with every peer
+/// healthy, every shard on disk and the layout correct.
+///
+/// This pins the refusal itself, not those call sites: it is what makes routing
+/// mandatory rather than an optimisation. If the ownership check ever softened
+/// into a silent forward, a mis-routed read would start "working" and the bug
+/// would come back invisible.
+#[test]
+fn a_read_addressed_to_the_wrong_shard_is_refused() {
+    use autumn_rpc::shard_for_extent;
+    use autumn_stream::extent_rpc::{ReadBytesReq, ReadBytesResp, PayloadRef, MSG_READ_BYTES};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let addrs = spawn_sharded_node(tmp.path(), 3, 2);
+    let shard_ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
+    let base = format!("127.0.0.1:{}", shard_ports[0]);
+
+    // An extent the BASE address does NOT own — the case that was failing.
+    let id = (1u64..).find(|&i| shard_for_extent(i, 2) != 0).expect("some id on shard 1");
+    let routed = shard_addr_for_extent(&base, &shard_ports, id);
+    assert_ne!(routed, base, "the test needs an extent off shard 0");
+
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let pool = ConnPool::new();
+        let r = pool
+            .call(&routed, MSG_ALLOC_EXTENT, rkyv_encode(&AllocExtentReq { extent_id: id }))
+            .await
+            .expect("alloc on the owning shard");
+        let _: AllocExtentResp = rkyv_decode(&r).expect("decode alloc");
+        let payload = b"bytes-that-live-on-shard-one";
+        let r = pool
+            .call(
+                &routed,
+                MSG_APPEND,
+                AppendReq {
+                    extent_id: id,
+                    eversion: 1,
+                    commit: 0,
+                    owner_epoch: 1,
+                    payload: Bytes::copy_from_slice(payload),
+                }
+                .encode(),
+            )
+            .await
+            .expect("append on the owning shard");
+        let _ = AppendResp::decode(r).expect("decode append");
+
+        let req = ReadBytesReq::new(id, 1, 0, payload.len() as u64, PayloadRef::in_dat());
+
+        // The routed address serves it.
+        let ok = pool.call(&routed, MSG_READ_BYTES, req.encode()).await.expect("routed read");
+        let ok = ReadBytesResp::decode(ok).expect("decode routed");
+        assert_eq!(ok.code, autumn_stream::extent_rpc::CODE_OK);
+        assert_eq!(&ok.payload[..], &payload[..], "the owning shard served the bytes");
+
+        // The base address does not. The refusal is an RPC-level error, not a
+        // ReadBytesResp — which is why a mis-routed caller sees a transport
+        // failure and not a short read.
+        let err = pool
+            .call(&base, MSG_READ_BYTES, req.encode())
+            .await
+            .expect_err("a read to the non-owning shard must be REFUSED, not served");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("belongs to shard"),
+            "the refusal must name the owning shard so a mis-routed caller can \
+             be diagnosed; got {msg:?}"
+        );
+    });
+}

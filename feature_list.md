@@ -231,3 +231,33 @@
   eversion 在打断期间被 bump 时，必须丢弃重来而不是续。
 - **Status**: `passes: false` (2026-09-04) — 不影响正确性（重来是安全的），是效率与恢复时间问题；
   extent 越大越贵，而本集群的常态就是 17 GiB。
+
+### BUG-EC-RECOVERY-WEDGE — 一次失败的 EC 重建把 (节点, extent) 永久毒死
+- **Trigger** (2026-09-04，实测): EC 重建失败后，`ensure_extent` 建的本地条目留在原地；
+  下一次派发走到 `require_recovery` → `try_adopt_completed_recovery` → 对 `ec_converted`
+  **一律返回 `Unknown`** → `CODE_PRECONDITION "extent N already exists"` → 永久拒绝。
+  manager 侧 marker 是常驻指令、每 2 秒重发一次，于是**双方都永不放弃**，而 marker 还占着
+  限流名额（实测 4 个僵尸把 `recovery-stats` 的名额占满，`every candidate rate-limited`
+  挡住了一长串真正该重建的 extent）。
+- **代码作者预见到了这个楔子，但 EC 落在唯一没有防护的分支**：非 EC 的 `Incomplete` 分支
+  明写 "Refusing here poisons this (node, extent) pair forever … Drop the stub and rebuild"；
+  而 `try_adopt_completed_recovery` 的注释自陈无法判断 EC —— "EC-shard adopt needs a
+  `shard_size` comparison"。
+- **⚠️ "失败时把条目删掉"是错的解法（已试过并撤回，见评审）**: (a) `handle_write_shard`
+  与重建**共用同一个 entry**，EC 转换可能在重建期间把本节点指派为 parity（manager 在
+  `recovery.rs:805-840` 把这个状态记为真实生产情形，而 `redispatch_pinned_recovery`
+  不重查 occupancy），删条目会让刚写好的 parity 分片从 `holds_payload`/df 账目里消失；
+  (b) `ec_stage_nonce` 是拒绝过期协调者 `write_shard` 的守卫，一并删掉会重新打开那扇门；
+  (c) `ensure_extent` 建的 0 字节 `.dat` 若不一并清掉，`scan_extents` 无长度过滤，
+  **重启后条目重新注册、楔子复活**；(d) 而用 `remove_extent_files` 清又会删掉该节点持有的
+  **其它** shard，正是 (a) 的危害。
+- **Scope（正确的方向）**: 补上 `try_adopt_completed_recovery` 的 EC 分支——权威长度是
+  `erasure::shard_size(sealed_length, K)`，与 `eversion` 一起就能判：
+  `len == shard_size` → Complete（上报完成）；`len < shard_size` → Incomplete
+  （按 F-EC-RECOVERY-RESUME 续传，或至少安全地重来）；eversion 不符 → 丢弃。
+  这同时解掉楔子和 resume，且不必碰共享的 entry。
+- **Acceptance**: 人为让一次 EC 重建失败 → 下一次派发**不返回 "already exists"**；
+  重复失败十次后 marker 仍能被正常执行；全程 `holds_payload`/df 对该节点其它 shard 的
+  记账不变；EN 重启后不复活楔子。
+- **Status**: `passes: false` (2026-09-04) — 当前靠"重建不再失败"(shard 路由已修) 绕开，
+  但只要有任何一次失败（网络、磁盘、被 fence 打断），这个楔子仍会出现。

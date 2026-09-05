@@ -347,10 +347,18 @@ impl AutumnManager {
             Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
                 // CODE_OK covers both "started it" and "already running it".
                 Ok(r) if r.code == CODE_OK => {}
-                Ok(r) => tracing::debug!(
+                // WARN, not debug. A refusal means the standing instruction
+                // cannot be carried out, and the re-send will repeat it every
+                // tick forever while the marker holds a rate-limiter slot. At
+                // debug it is invisible on a manager at INFO: a wedged drain
+                // reads as "no dispatch at all" in the log, which is how one
+                // stayed hidden for hours while four markers blocked every
+                // other candidate with "every candidate rate-limited".
+                Ok(r) => tracing::warn!(
                     extent_id,
                     node_id,
-                    "recovery re-dispatch refused: {}",
+                    "recovery re-dispatch refused: {} (marker retained; it will \
+                     be re-sent every tick and holds a rate-limiter slot)",
                     r.message
                 ),
                 Err(e) => tracing::debug!(extent_id, "recovery re-dispatch decode: {e}"),
