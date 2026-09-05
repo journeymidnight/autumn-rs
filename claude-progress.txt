@@ -1,6 +1,8 @@
 Date: 2026-09-05
 TaskStatus: completed
-Task scope: EC recovery 修复线，三条改动全部落地并**在生产验证**:
+Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产验证**；
+  (2) AZ 迁移完成——7 个 EN 全部收敛到可用区 C。两件都已收尾，故 completed。
+  EC recovery 部分:
   facd61e 分片端口寻址、715c30a 丢弃分片时同步销账、25c22fe EC 分片判定（解楔子）。
   镜像 15995c1 已滚到全部 7 台 EN + manager；线上卡了三小时的 4 个 extent 全部自愈，
   五个 recovery op 全部 succeeded，活跃队列清空，extent-health 无不健康 extent。
@@ -21,6 +23,32 @@ Task scope: EC recovery 修复线，三条改动全部落地并**在生产验证
   用 `-p` 重跑后结论相反也更准确:当前定义里确实没有明文 token（凭据是
   `serviceConnectionId` 引用），明文只存在于 **run 的 spec 快照**里——是运行时解析出来的。
   即用户说的是对的，我基于 run 快照下的"至少两个 token 泄露"是错误推断，已撤回。
+
+【2026-09-05 AZ 迁移完成：7 个 EN 全部收敛到可用区 C】
+  终态: node 9/83/85/102/104/106/108，共 233 个分片，extent-health 干净。
+  四台旧机（zone d/e/b/b）已在控制台下线；跑 ps-0/ps-2/etcd-0 的 192.168.0.142 与
+  192.168.2.30 **原样未动**（manager/etcd 不迁移）。
+
+  **关键判断一：不能逐台 fence。** recovery 的目标选择是
+  `all.sort_by_key(|n| n.node_id)` 后取第一个过限流的——**小 ID 优先、无 shuffle**
+  （与分配路径 `select_nodes` 的 shuffle 不是一回事）。要下线的 1/3/5/7 恰好是全场最小 ID，
+  于是逐台做会把数据一路推回还没下线的机器: 实测排空 node 5 的 27 个分片，**12 个搬进了
+  node 1 和 3**，而新加的四台空节点**一个都没接到**。改成四台**一起 fence**
+  （fenced 进 hard_excluded，从候选里彻底剔除）后立刻扭转: 新节点 0→37 分片、并发 4→12，
+  105 个分片 5 分钟搬完（≈1.4 GiB/s）。已归档为 F-EXTENT-PLACEMENT（含手动分配 +
+  extent 级 rebalance 的 scope）。fence≠不可读，重建的源不看 fence 状态，所以一起 fence 安全。
+
+  **关键判断二：没有删那四个 PVC。** 删了 en-1~en-4 会重新调度到 zone c，而 7 台机器已各有
+  一个 EN ⇒ **一台机器跑两个 EN**。manager 的放置连可用区都不认（更不认物理机），
+  同一 extent 的两个 slot 可能落在同一台机器上 ⇒ 该机一坏丢 2 个 slot，而 4+1 只容忍 1 个。
+  所以让它们停在 Pending。
+
+  **收尾决定（用户选 A）**: 那 4 个 Pending pod **就放着**，不清理。
+  理由: StatefulSet 只能从最大序号缩容，`scale --replicas=7` 会删掉 en-7~en-10——
+  正是新机器上持有数据的那四个。另外两条路（删 PVC 重调度 / 重建 StatefulSet）要么
+  拿容错度换整洁，要么再搬一遍 233 个分片。Pending pod 不消耗资源，集群 7 成员正常。
+
+  遗留（未处理，不影响运行）: local-path 的 ~90 个 `Released` PV 是历次换机的垃圾。
 
 【2026-09-04/05 EC recovery：两处修复 + 线上楔子已定位到可删的桩】
   **facd61e（已提交）**：peer 读寻址到**基础端口**而不是拥有该 extent 的分片端口。
