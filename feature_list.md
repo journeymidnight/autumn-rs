@@ -156,8 +156,23 @@
   迁移前的 30K 出处是 memory-mcp 的批量 put（31 key/append），与 perf-check 的单键 put
   不同负载。改进是在**机制的支配量**（append 延迟）上测到的，端到端的那一半是推论。
   标题里 delete 的 30K 仍然无法调和（见上），关闭时它依然是个**出处存疑的数字**。
-  剩下的两条杠杆：(b) 已证否；(c) `MSG_BATCH_DELETE` 的动机**仍然成立但要改述**——
-  它的价值在 EN 负载（delete 的 append 数是 put 的 ~10 倍），不能再指望 cap 这条线。
+  剩下的两条杠杆：(b) 已证否；(c) `MSG_BATCH_DELETE` **已实现（`d6a8b73`），但未部署**——
+  见下面的 BUG-WIRE36-UNDEPLOYED。它的价值在 EN 负载（delete 的 append 数是 put 的
+  ~10 倍），不能再指望 cap 这条线。
+
+### BUG-WIRE36-UNDEPLOYED — main 上有一个未部署的破坏性 wire 版本
+- **状态** (2026-09-05): `d6a8b73` 把 `WIRE_VERSION` 抬到 **36 且 `MIN = MAX`**
+  （`MSG_BATCH_DELETE` 是纯加法的 opcode，但本树握手不保存协商结果供调用点门控，
+  所以只能 MIN=MAX）。**代码已入库、线上仍是 35。**
+- **⚠️ 这是个陷阱，不是待办**：CP 流水线是从 **main 分支**构建的
+  （`sources: branch: main`，`cloneDepth: 1`）。所以在这个 commit 之后，**任何一次
+  例行构建产出的镜像都无法加入正在运行的 v35 集群**——握手会以
+  "wire-version mismatch" 拒绝。这不会悄悄坏掉（拒绝是响亮的），但会让一次
+  本以为无关的构建变成一次意外的停机。
+- **部署它需要**: 全部组件同 commit 停机升级 + **重建每一个内嵌 autumn 客户端的镜像**
+  （freetoken-l3、hermes-webui、memory-mcp）。
+- **在部署之前**，若需要用 CP 构建任何镜像，必须先确认构建的是 `d6a8b73` 之前的 commit，
+  或接受这次构建就是那次停机升级。
 - **原 Status**（保留）: `passes: false` (2026-09-02；2026-09-04 补机制假说；2026-09-04 机制已实测) —— 仍只立账，不阻塞任何东西：
   需要吞吐的消费者（perf-check / ycsb）本来就多线程，单进程 30K 只影响一次性批量作业的墙钟。
   **本轮没有测量**：验收后半（"改动后吞吐提升可复现"）是延迟敏感的，而本机当时有 2600 个
