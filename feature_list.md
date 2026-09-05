@@ -84,17 +84,34 @@
   被 39 个样本推翻——n=1 的数不要用。）
   按实测有效在飞数 ~1.2 推算：append/s 从 ~750 升到 ~6,300，配 ~31 key/append 的批量 put
   ⇒ 单进程 key/s 由 ~23K 升到 ~195K 量级。**注意这是外推，不是端到端实测吞吐。**
-- **⚠️ 但收益目前只覆盖 7 个分区里的 2 个**：迁移只搬了 EN，**PS 没搬**——
-  ps-0 在 b、ps-2 在 d，只有 ps-1 在 c。所以只有落在 ps-1 上的 part 36/44 走到了同区路径。
-  **下一步是把 PS 也搬到 zone c**，否则大部分分区仍在付 1.6 ms。
+- **2026-09-05 PS 也已迁到 zone c，7/7 分区走同区路径**：PS **没有任何本地卷**
+  （无 PVC / hostPath / emptyDir，状态全在 stream 层与 etcd），所以迁移是干净的——
+  给 StatefulSet 加 `topology.kubernetes.io/zone: cn-beijing-c` 的 nodeSelector 钉住，
+  再**并行删除**三个 pod（不用滚动：滚动会把每台的分区推给幸存者且不推回，最后挤在一台）。
+  分区接管约 3.5 分钟。同一个分区 part 17 迁移前后：**1.603 ms → 0.300 ms**；
+  暖机后稳定在 **0.185 ms**（n=40）。
+  ⚠️ **教训**：PS 重启后的第一个样本是 **1.16 ms**（`ops=1`），看上去像"迁移没用甚至更慢"。
+  与上面 0.545 那次同一形状——**n=1 是冷启动读数**。灌了 100 次写暖机后才是真值。
+  这个会话里同型错误已出现 6 次，共同点是**仪器/样本对目标现象不成立时，读数和真值长得一样**。
 - **⚠️ perf-check / ycsb 在开了 authz 的集群上不可用（2026-09-05 实测）**：
   两者都硬编码 `ClusterClient::connect(&mgr, BENCH_SCOPE)`——**匿名连接，忽略
   `--credential-file`**（`crates/server/src/bin/autumn_client/main.rs:301/352/530`）。
   匿名连不上 PS，而每次写的错误又在 `.is_ok()` 处被丢掉，于是唯一的症状是
   `write phase produced no keys — is the cluster running?`——一个把**认证失败**
   伪装成**集群故障**的错误信息，PS 侧连一条拒绝日志都没有（连接根本没建立）。
-  要用它压测必须先改成 `connect_with_credential`。本轮的测量因此改用
-  `autumn-client put` 逐条写 + 读 PS 的 `partition write summary`。
+  **已修（`6999ed1`）**：加 `bench_connect`，四个 worker 线程改走
+  `connect_with_credential`；凭据在所有网络 I/O 之前读一次，并补上空 principal 守卫。
+  评审纠正了我一处**说反的因果**：worker 的 `connect` **只联系 manager、连接是成功的**，
+  失败发生在 PS 侧——连接上没有 AUTH_HELLO，`authz_check` 以**错误帧**拒绝且**不打日志**，
+  所以"PS 无日志"不是"请求没到达"的证据。注意 bench principal 的 grant 必须覆盖
+  `bench/perf/`——perf-check/ycsb **不看 `--namespace`**。
+  本轮的延迟测量因此改用 `autumn-client put` 逐条写 + 读 PS 的 `partition write summary`。
+- **⚠️ 逐条 put 测不出 `ps_conn_inflight_cap` 的效果**：cap 管的是**在飞深度**，
+  而每次 put 是一个新进程、一个操作，在飞深度恒为 1 ⇒ cap 4 还是 8 都一样。
+  用它测只会得到"没变化"，那是**方法的产物，不是结论**。cap 的 A/B 必须等修好的
+  perf-check 进镜像。cap=8 的配置链已逐段验证：`AUTUMN_PS_CONN_INFLIGHT_CAP=8` →
+  `entrypoint.sh:241` → `--conn-inflight-cap 8`（已在 `/proc/1/cmdline` 确认）→
+  `set_ps_conn_inflight_cap`。
 - **三条杠杆，按该做的顺序**：
   **(a) AZ 收拢 —— 已做，见上。** append 1.39 ms → ~0.11 ms 会把 append/s 从 950 抬约一个
   量级，delete 不改协议就能追平 put 今天的水平，**一行 wire 都不用动**。
