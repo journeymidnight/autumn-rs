@@ -378,3 +378,49 @@
 - **Scope**: 要么把 `note_shard_file` 提到 fsync 之前（记录"文件存在"本就不依赖它是否已持久），
   要么在这两个 `?` 上改成先记账再返回错误。注意别和失败重建臂的 discard 语义打架。
 - **Status**: `passes: false` (2026-09-04) — 既有缺陷，未修。
+
+### F-EXTENT-PLACEMENT — extent 分片放到哪台，两条路径两套策略，且都不看均衡
+- **Trigger** (2026-09-05，AZ 迁移实测暴露): 迁移中发现"逐台下线"会让数据**回流到还没下线的
+  机器上**。查证后发现根因不是迁移顺序，而是**同一个问题在代码里有两套互不相干的答案**。
+- **事实（已核对代码，非推断）**:
+  - **分配路径** `select_nodes`（`manager/src/lib.rs:3752`）: 三层回退
+    spacious（healthy 且不在 `space_low` 里）→ healthy（Online 且至少一块 online 盘）→ all，
+    **每层都 `pool.shuffle(&mut rng)` 后 `take(count)`** ⇒ 均匀随机。
+  - **恢复路径** `dispatch_recovery_task`（`manager/src/recovery.rs:406`）: 过滤掉
+    `occupied`（该 extent 现有成员）与 `hard_excluded`（fenced/maintenance/suspected）之后
+    **`all.sort_by_key(|n| n.node_id)`**，然后 `for candidate in &candidates` **顺序取第一个
+    过限流的** ⇒ **小 node_id 优先、首个命中即用，没有 shuffle**。
+  - 两者都**不看已用容量、不看分片数**。`space_low` 只是一个二值的"快满了"信号，
+    不是负载度量。
+  - **没有 extent 级的再平衡**。`autumn-op rebalance` 搬的是 **partition 在 PS 之间**的分布，
+    与 extent 分片在 EN 之间的分布无关。所以一旦倾斜，只有 fence 才会重新洗牌。
+- **实测代价（本次迁移，数字真实）**:
+  - 稳态倾斜: 全是同规格 i3s.3xlarge（3.5T），却是 node 3=45 / node 83=12，**3.75 倍**。
+  - 排空 node 5 的 27 个分片时，**12 个搬到了 node 1 和 3 上——那正是接下来要下线的两台**；
+    而 4 台全新的空节点（102/104/106/108）**一个都没接到**。
+    机制: 要下线的旧节点 ID 最小（1/3/5/7）＜ 保留节点（9/83/85/102+），
+    首个命中即用 ⇒ 旧节点永远优先中签；`per_target<=2` 的限流是唯一让它溢出到高 ID 的力量，
+    这也解释了 83/85 为什么能分到一些而 102+ 完全分不到。
+  - 把四台**一起 fence**（fenced 进 `hard_excluded`，从候选里彻底剔除）之后立刻改观:
+    新四台 0 → 37 个分片，并发 4 → 12（7 个目标各自吃到 `per_target<=2` 的额度）。
+- **Scope**:
+  1. **两条路径统一到一个放置策略上**。至少要看"该节点已持有多少分片 / 已用多少字节"，
+     让选择偏向轻载节点。随机能避免系统性偏置但**不收敛**（balls-in-bins 的方差是固有的）；
+     升序 ID 则是**主动的系统性偏置**，比随机更糟。
+  2. **手动放置**: 允许运维指定某个 extent 的某个 slot 落到哪个节点，
+     形如 `autumn-op place-shard <extent_id> --slot N --node M`（走 admin token）。
+     用途是迁移、腾机器、绕开坏节点——现在这些都只能靠 fence 间接影响，粒度太粗。
+  3. **extent 级 rebalance**: `autumn-op rebalance-extents [--max-moves N]`，
+     把分片从重载节点搬到轻载节点。缺了它，扩容之后新机器只能靠"等别人 fence"才会被用起来。
+- **⚠️ 设计约束（不要绕过）**: 放置必须继续尊重 `occupied`（同一 extent 的两个 slot 不能落在
+  同一节点上，否则 K+M 的容错度直接下降）、`hard_excluded`，以及 EC 的
+  `K+M` 个不同节点的下限。手动放置尤其要在**服务端**校验这些，不能只靠调用方自觉。
+- **Acceptance**:
+  - 造一个倾斜集群（N 台空 + M 台满），触发一批 recovery，断言分片流向轻载节点，
+    且最终各节点分片数极差 ≤ 某个阈值；**消融: 换回 `sort_by_key(node_id)` 该断言变红**。
+  - `place-shard` 指定一个合法目标 → 分片确实落在该节点；指定一个已持有该 extent 其它 slot
+    的节点 → **服务端拒绝**并说明原因。
+  - `rebalance-extents` 在一个人为倾斜的集群上收敛，且过程中 `extent-health` 始终干净。
+- **Status**: `passes: false` (2026-09-05) — 未实现。当前可用的替代手段是
+  **把要腾空的节点全部一次性 fence**，靠 `hard_excluded` 把它们从候选里剔除，
+  从而避免数据回流；这次迁移就是这么做的，有效但粒度粗，且解决不了稳态倾斜。
